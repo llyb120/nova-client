@@ -906,9 +906,7 @@ fn config(app: &AppHandle) -> Option<RemoteConfig> {
             &s.devin_proxy,
             &s.codex_proxy,
             &s.codebuddy_proxy,
-            &s.claudecode_proxy,
             &s.cursor_proxy,
-            &s.opencode_proxy,
         ]
         .into_iter()
         .map(|p| p.trim())
@@ -1008,10 +1006,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         AgentKind::Kimi,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
-        AgentKind::ClaudeCode,
         AgentKind::Cursor,
-        AgentKind::OpenCode,
-        AgentKind::OpenCodePlus,
     ] {
         if !state.agent_enabled(&kind) {
             continue;
@@ -1032,9 +1027,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
             AgentKind::Kimi => state.kimi.get_model_options(),
             AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.get_model_options(),
-            AgentKind::ClaudeCode => state.claudeplus.get_model_options(),
             AgentKind::Cursor => state.cursorplus.get_model_options(),
-            AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.get_model_options(),
         }
         .unwrap_or_else(|| json!({ "configOptions": [], "modes": null }));
         out.insert(kind.as_str().to_string(), value);
@@ -1335,9 +1328,9 @@ mod tests {
     fn model_signature_does_not_depend_on_hashmap_order() {
         let mut left = HashMap::new();
         left.insert("codex".to_string(), json!({ "models": ["gpt-5"] }));
-        left.insert("opencode".to_string(), json!({ "models": ["kimi"] }));
+        left.insert("cursor".to_string(), json!({ "models": ["kimi"] }));
         let mut right = HashMap::new();
-        right.insert("opencode".to_string(), json!({ "models": ["kimi"] }));
+        right.insert("cursor".to_string(), json!({ "models": ["kimi"] }));
         right.insert("codex".to_string(), json!({ "models": ["gpt-5"] }));
 
         assert_eq!(model_signature_for(&left), model_signature_for(&right));
@@ -2001,11 +1994,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
                 state.codebuddy.forget_session_of_thread(&cmd.thread_id)
             }
-            AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-                state.opencodeplus.forget_session_of_thread(&cmd.thread_id)
-            }
             AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
         }
         if let Some(item) = switched_item {
@@ -2028,11 +2017,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
                 state.codebuddy.forget_session_of_thread(&cmd.thread_id)
             }
-            AgentKind::ClaudeCode => state.claudeplus.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-                state.opencodeplus.forget_session_of_thread(&cmd.thread_id)
-            }
         }
     }
     Ok(())
@@ -2069,19 +2054,9 @@ async fn respond_remote_permission(
             .codebuddy
             .respond_permission(request_key, option_id)
             .await
-    } else if request_key.starts_with("clp-") {
-        state
-            .claudeplus
-            .respond_permission(request_key, option_id)
-            .await
     } else if request_key.starts_with("cup-") {
         state
             .cursorplus
-            .respond_permission(request_key, option_id)
-            .await
-    } else if request_key.starts_with("ocp-") {
-        state
-            .opencodeplus
             .respond_permission(request_key, option_id)
             .await
     } else if request_key.starts_with("codex-") {
@@ -2642,9 +2617,7 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         AgentKind::Kimi => state.kimi.cancel(thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.cancel(thread_id).await,
-        AgentKind::ClaudeCode => state.claudeplus.cancel(thread_id).await,
         AgentKind::Cursor => state.cursorplus.cancel(thread_id).await,
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => state.opencodeplus.cancel(thread_id).await,
     };
     Ok(())
 }

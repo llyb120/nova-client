@@ -42,16 +42,12 @@ pub fn selection_label(model: &str) -> &'static str {
 pub async fn resolve_auto_model(
     selected: &str,
     options: &Value,
-    open_code: bool,
 ) -> Result<ResolvedAutoModel, String> {
     if !is_auto_model(selected) {
         return Ok(ResolvedAutoModel {
             value: selected.to_string(),
             label: selected.to_string(),
         });
-    }
-    if open_code && !has_gpt_model(options) {
-        return Err("OpenCode 尚未配置 GPT 模型，Auto 路由未生效".into());
     }
 
     let client = reqwest::Client::builder()
@@ -76,7 +72,7 @@ pub async fn resolve_auto_model(
             latest_value_winner(&entries, &homepage)?
         }
     };
-    let value = match_available_model(options, &winner, open_code).ok_or_else(|| {
+    let value = match_available_model(options, &winner).ok_or_else(|| {
         format!(
             "Codex 雷达当前第一名 {} · {}，但本机没有对应模型/推理档位",
             winner.model, winner.effort
@@ -248,7 +244,7 @@ fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     rest.split_once('"').map(|value| value.0)
 }
 
-fn match_available_model(options: &Value, winner: &RadarModel, open_code: bool) -> Option<String> {
+fn match_available_model(options: &Value, winner: &RadarModel) -> Option<String> {
     model_options(options)
         .filter_map(|option| {
             option
@@ -258,11 +254,7 @@ fn match_available_model(options: &Value, winner: &RadarModel, open_code: bool) 
         })
         .filter(|(_, value)| !is_auto_model(value))
         .find_map(|(option, value)| {
-            if open_code {
-                matches_opencode(value, winner).then(|| value.to_string())
-            } else {
-                matches_codex(option, value, winner).then(|| value.to_string())
-            }
+            matches_codex(option, value, winner).then(|| value.to_string())
         })
 }
 
@@ -277,15 +269,6 @@ fn model_options(options: &Value) -> impl Iterator<Item = &Value> {
         .flatten()
 }
 
-fn has_gpt_model(options: &Value) -> bool {
-    model_options(options).any(|option| {
-        option
-            .get("value")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value.to_ascii_lowercase().contains("gpt"))
-    })
-}
-
 fn matches_codex(option: &Value, value: &str, winner: &RadarModel) -> bool {
     let effort = option
         .pointer("/_meta/codex.ai/effort")
@@ -295,32 +278,6 @@ fn matches_codex(option: &Value, value: &str, winner: &RadarModel) -> bool {
         .and_then(|effort| value.strip_suffix(&format!(":{effort}")))
         .unwrap_or(value);
     same_model(model, &winner.model) && effort == Some(winner.effort.as_str())
-}
-
-fn matches_opencode(value: &str, winner: &RadarModel) -> bool {
-    if !value.to_ascii_lowercase().contains("gpt") {
-        return false;
-    }
-    let (base, effort) = value
-        .rsplit_once("/variant/")
-        .map(|parts| (parts.0, Some(parts.1)))
-        .unwrap_or((value, None));
-    let model = base.split_once('/').map(|parts| parts.1).unwrap_or(base);
-    if let Some(effort) = effort {
-        return same_model(model, &winner.model) && effort == winner.effort;
-    }
-
-    // Some OpenCode providers expose Codex models as one flat id instead of a
-    // model plus `/variant/<effort>`, for example:
-    //   Codex:    gpt-5.6-sol + max
-    //   OpenCode: windsurf/gpt-5-6-sol-max
-    // Normalize punctuation, peel off the effort suffix, then compare the model
-    // part so both representations resolve to the same locally available model.
-    let model = normalize_key(model);
-    let effort_suffix = format!("_{}", normalize_key(&winner.effort));
-    model
-        .strip_suffix(&effort_suffix)
-        .is_some_and(|model| same_model(model, &winner.model))
 }
 
 fn same_model(available: &str, radar: &str) -> bool {
@@ -405,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_codex_and_opencode_effort_variants() {
+    fn matches_codex_effort_variants() {
         let winner = RadarModel {
             key: "x".into(),
             model: "gpt-5.6-terra".into(),
@@ -414,57 +371,9 @@ mod tests {
             iq: 1.0,
         };
         let codex = json!({"configOptions":[{"id":"model","options":[{"value":"gpt-5.6-terra:high","_meta":{"codex.ai/effort":"high"}}]}]});
-        let opencode = json!({"configOptions":[{"id":"model","options":[{"value":"openai/gpt-5.6-terra/variant/high"}]}]});
         assert_eq!(
-            match_available_model(&codex, &winner, false).as_deref(),
+            match_available_model(&codex, &winner).as_deref(),
             Some("gpt-5.6-terra:high")
-        );
-        assert_eq!(
-            match_available_model(&opencode, &winner, true).as_deref(),
-            Some("openai/gpt-5.6-terra/variant/high")
-        );
-    }
-
-    #[test]
-    fn does_not_map_radar_max_to_opencode_xhigh_variant() {
-        let winner = RadarModel {
-            key: "x".into(),
-            model: "gpt-5.6-terra".into(),
-            effort: "max".into(),
-            date: "x".into(),
-            iq: 1.0,
-        };
-        let opencode = json!({"configOptions":[{"id":"model","options":[
-            {"value":"codex/gpt-5.6-terra/variant/xhigh"}
-        ]}]});
-        assert_eq!(match_available_model(&opencode, &winner, true), None);
-
-        let opencode = json!({"configOptions":[{"id":"model","options":[
-            {"value":"codex/gpt-5.6-terra/variant/xhigh"},
-            {"value":"codex/gpt-5.6-terra/variant/max"}
-        ]}]});
-        assert_eq!(
-            match_available_model(&opencode, &winner, true).as_deref(),
-            Some("codex/gpt-5.6-terra/variant/max")
-        );
-    }
-
-    #[test]
-    fn matches_opencode_flat_model_ids_with_embedded_effort() {
-        let winner = RadarModel {
-            key: "x".into(),
-            model: "gpt-5.6-sol".into(),
-            effort: "max".into(),
-            date: "x".into(),
-            iq: 1.0,
-        };
-        let opencode = json!({"configOptions":[{"id":"model","options":[
-            {"value":"windsurf/gpt-5-6-sol-max"},
-            {"value":"windsurf/gpt-5-6-sol-max-priority"}
-        ]}]});
-        assert_eq!(
-            match_available_model(&opencode, &winner, true).as_deref(),
-            Some("windsurf/gpt-5-6-sol-max")
         );
     }
 }

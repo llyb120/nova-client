@@ -96,14 +96,6 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
             install_command: "npm install -g @tencent-ai/codebuddy-code@latest".into(),
             proxy: settings.codebuddy_proxy.clone(),
         },
-        AgentKind::ClaudeCode => CliSpec {
-            kind: kind.clone(),
-            cli_name: "claude-code-cli",
-            program: "claude".into(),
-            version_args: vec!["--version".into()],
-            install_command: "npm install -g @anthropic-ai/claude-code@latest".into(),
-            proxy: settings.claudecode_proxy.clone(),
-        },
         AgentKind::Cursor => CliSpec {
             kind: kind.clone(),
             cli_name: "cursor-sdk",
@@ -111,14 +103,6 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
             version_args: vec!["--version".into()],
             install_command: String::new(),
             proxy: settings.cursor_proxy.clone(),
-        },
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => CliSpec {
-            kind: kind.clone(),
-            cli_name: "opencode-cli",
-            program: configured_cli_program(&settings.opencode_path, &["opencode"], "opencode"),
-            version_args: vec!["--version".into()],
-            install_command: "npm install -g opencode-ai@latest".into(),
-            proxy: settings.opencode_proxy.clone(),
         },
     }
 }
@@ -129,8 +113,6 @@ fn all_specs(settings: &Settings) -> Vec<CliSpec> {
         AgentKind::Devin,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
-        AgentKind::ClaudeCode,
-        AgentKind::OpenCode,
     ]
     .iter()
     .map(|kind| spec_for(kind, settings))
@@ -297,8 +279,6 @@ mod tests {
             AgentKind::Devin,
             AgentKind::Codex,
             AgentKind::CodeBuddy,
-            AgentKind::ClaudeCode,
-            AgentKind::OpenCode,
         ] {
             assert!(!install_command(&kind, &settings).is_empty());
         }

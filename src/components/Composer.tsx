@@ -184,10 +184,8 @@ export function Composer() {
     state.agentKind === "codex" ||
     state.agentKind === "codebuddy" ||
     state.agentKind === "devin";
-  // 打断当前轮后以新 turn 继续：Cursor（Agent.create + slim memory）、OpenCode。
-  const supportsInterruptSteer = () =>
-    state.agentKind === "cursor" ||
-    state.agentKind === "opencode";
+  // 打断当前轮后以新 turn 继续：Cursor（Agent.create + slim memory）。
+  const supportsInterruptSteer = () => state.agentKind === "cursor";
   const supportsSteer = () => supportsLiveSteer() || supportsInterruptSteer();
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
   const activeClue = createMemo(() => {

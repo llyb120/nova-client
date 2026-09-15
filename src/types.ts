@@ -1,6 +1,6 @@
 import type { WorkflowDef } from "./workflow/types";
 
-export type AgentKind = "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "claudecode" | "cursor" | "opencode";
+export type AgentKind = "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "cursor";
 
 export interface SlashCommand {
   name: string;
@@ -431,10 +431,6 @@ export interface Settings {
   /** CodeBuddy CLI 可执行文件 */
   codebuddyPath: string;
   codebuddyProxy: string;
-  /** Claude Code CLI 可执行文件 */
-  claudecodePath: string;
-  claudecodeProxy: string;
-  claudecodeSdkApiKey: string;
   cursorProxy: string;
   /** 兼容旧配置；Cursor 后端仅使用官方 SDK，不再依赖本机 CLI */
   cursorPath: string;
@@ -445,9 +441,6 @@ export interface Settings {
   cursorModelContexts: CursorModelContextRule[];
   /** Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */
   cursorContextMode: "default" | "super";
-  /** OpenCode CLI 可执行文件，默认 opencode 依赖 PATH */
-  opencodePath: string;
-  opencodeProxy: string;
   codexPath: string;
   codexProxy: string;
   /** Lyra provider 代理地址 */
@@ -498,14 +491,10 @@ export interface Settings {
   lyraEnabled: boolean;
   codexEnabled: boolean;
   codebuddyEnabled: boolean;
-  claudecodeEnabled: boolean;
   cursorEnabled: boolean;
-  opencodeEnabled: boolean;
   codexIntegration: "app-server";
   codebuddyIntegration: "sdk" | "acp";
-  claudecodeIntegration: "sdk";
   cursorIntegration: "sdk";
-  opencodeIntegration: "sdk";
   /** worktree 工作目录根（空 = 应用数据目录下 worktrees/） */
   worktreeDir: string;
   /** 更新通道：正式版或预发布版。 */

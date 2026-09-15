@@ -349,7 +349,7 @@ impl SdkManager {
                         return;
                     }
                 };
-                let resolved = codex_radar::resolve_auto_model(&selection, &options, false).await;
+                let resolved = codex_radar::resolve_auto_model(&selection, &options).await;
                 if !self.is_current_run(&thread_id, run_epoch) {
                     return;
                 }
@@ -2210,9 +2210,7 @@ mod tests {
         is_codex_model_resume_warning, normalize_title, parse_bridge_output, resolve_codex_model,
         text_snapshot_change, tool_call, TextSnapshotChange, TOOL_OUTPUT_LIMIT,
     };
-    use crate::sdk_adapters::{
-        ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter, SdkAdapter,
-    };
+    use crate::sdk_adapters::{CodexAdapter, CursorAdapter, LyraAdapter, SdkAdapter};
     use crate::threads::{now_ms, AgentKind, CodexUsageSnapshot, Item, Thread, ToolCall};
     use serde_json::json;
 
@@ -2384,31 +2382,6 @@ mod tests {
                 "cacheWriteTokens": 40
             }))
         );
-    }
-
-    #[test]
-    fn claude_style_usage_includes_cached_input_and_rejects_partial_data() {
-        let raw = json!({
-            "input_tokens": 100,
-            "output_tokens": 20,
-            "cache_read_input_tokens": 300,
-            "cache_creation_input_tokens": 40
-        });
-        let (usage, _) = ClaudeAdapter.normalize_usage(Some(&raw), None, None);
-        assert_eq!(
-            usage,
-            Some(json!({
-                "inputTokens": 440,
-                "outputTokens": 20,
-                "totalTokens": 460,
-                "cacheReadTokens": 300,
-                "cacheWriteTokens": 40
-            }))
-        );
-
-        let partial = json!({ "input_tokens": 100 });
-        let (usage, _) = ClaudeAdapter.normalize_usage(Some(&partial), None, None);
-        assert!(usage.is_none());
     }
 
     #[test]

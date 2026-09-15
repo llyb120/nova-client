@@ -6,7 +6,7 @@ Nova Web 的远程控制。服务器只发起出站 HTTPS 连接（普通 HTTP �
 ## 依赖
 
 - `xvfb`（Nova 自动创建私有虚拟显示，窗口始终不可见）
-- 至少一个已安装并登录的 Agent CLI（Codex、Claude Code、OpenCode、Devin 等）
+- 至少一个已安装并登录的 Agent CLI（Codex、Devin、Cursor 等）
 - 可访问的 Nova Relay/Web 服务、身份 Token
 
 Ubuntu/Debian 安装运行依赖：

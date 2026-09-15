@@ -1087,9 +1087,6 @@ fn training_prompt(config: &ExperienceExpertConfig, existing: &str, conversation
 fn training_agent(settings: &Settings) -> Result<AgentKind, String> {
     let agent: AgentKind = serde_json::from_value(json!(settings.experience_training_agent.trim()))
         .map_err(|_| format!("不支持的训练后端：{}", settings.experience_training_agent))?;
-    if matches!(agent, AgentKind::OpenCode | AgentKind::OpenCodePlus) {
-        return Err(format!("{} 暂不支持经验训练", agent.label()));
-    }
     Ok(agent)
 }
 
@@ -1136,13 +1133,6 @@ async fn run_training_turn(
                     .run_prompt(thread_id.into(), prompt, Vec::new())
                     .await
             }
-            AgentKind::ClaudeCode => {
-                state
-                    .claudeplus
-                    .clone()
-                    .run_prompt(thread_id.into(), prompt, Vec::new())
-                    .await
-            }
             AgentKind::Cursor => {
                 state
                     .cursorplus
@@ -1163,12 +1153,6 @@ async fn run_training_turn(
                     .clone()
                     .run_prompt(thread_id.into(), prompt, Vec::new())
                     .await
-            }
-            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-                return Err(format!(
-                    "{} 暂不支持经验训练，请选择 Lyra、Devin、Codex、CodeBuddy、Claude 或 Cursor",
-                    agent.label()
-                ))
             }
         }
     }
@@ -1977,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn training_agent_accepts_devin_and_rejects_opencode() {
+    fn training_agent_accepts_devin_and_rejects_unknown() {
         let mut settings = Settings::default();
         settings.experience_training_agent = "devin".into();
         assert_eq!(training_agent(&settings).unwrap(), AgentKind::Devin);
@@ -1985,7 +1969,7 @@ mod tests {
         settings.experience_training_agent = "opencode".into();
         assert!(training_agent(&settings)
             .unwrap_err()
-            .contains("暂不支持经验训练"));
+            .contains("不支持的训练后端"));
     }
 
     #[test]

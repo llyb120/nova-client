@@ -233,9 +233,7 @@ export const [state, setState] = createStore<AppStore>({
     kimi: null,
     codex: null,
     codebuddy: null,
-    claudecode: null,
     cursor: null,
-    opencode: null,
   },
   logs: [],
   loadingThread: false,
@@ -251,9 +249,7 @@ export const [state, setState] = createStore<AppStore>({
     kimi: [],
     codex: [],
     codebuddy: [],
-    claudecode: [],
     cursor: [],
-    opencode: [],
   },
   updateProgress: null,
   relay: { enabled: false, connected: false },
@@ -348,23 +344,7 @@ export function modelChoices(
   const opts = (source !== undefined ? source : state.modelOptions[agentKind])?.configOptions;
   if (!opts) return [];
   const model = opts.find((o) => o.id === "model");
-  const choices = (model?.options as ModelChoice[]) ?? [];
-  if (agentKind !== "opencode") return choices;
-  // OpenCode 的 Auto 只能路由到 GPT；未配置任何 GPT 时不展示，避免产生无效入口。
-  if (
-    agentKind === "opencode" &&
-    !choices.some((choice) => choice.value.toLowerCase().includes("gpt"))
-  ) {
-    return choices;
-  }
-  const auto: ModelChoice[] = [
-    {
-      value: "__nova_auto_community__",
-      name: "Auto（按社区评分）",
-      description: "新会话首次发送前获取近 24 小时社区体感分第一名（排除 ultra），后续固定复用；数据来自 Codex 雷达 codexradar.com",
-    },
-  ];
-  return [...auto, ...choices.filter((choice) => !choice.value.startsWith("__nova_auto_"))];
+  return (model?.options as ModelChoice[]) ?? [];
 }
 
 /** 在可选列表中解析应使用的模型。
@@ -509,9 +489,7 @@ export const ALL_AGENT_KINDS: AgentKind[] = [
   "kimi",
   "codex",
   "codebuddy",
-  "claudecode",
   "cursor",
-  "opencode",
 ];
 
 /** 某后端在设置里是否启用。缺字段（老版本 settings）按启用处理（!== false）。 */
@@ -527,12 +505,8 @@ function agentEnabled(s: Settings, k: AgentKind): boolean {
       return s.codexEnabled !== false;
     case "codebuddy":
       return s.codebuddyEnabled !== false;
-    case "claudecode":
-      return s.claudecodeEnabled !== false;
     case "cursor":
       return s.cursorEnabled !== false;
-    case "opencode":
-      return s.opencodeEnabled !== false;
   }
 }
 

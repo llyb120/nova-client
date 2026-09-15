@@ -255,7 +255,7 @@
         <p><strong>选项目</strong>：点输入框下方工具条左侧的「项目」胶囊按钮，弹出列表里挑一个最近项目；也可以点列表底部的「使用现有文件夹…」浏览任意目录；或选最上方的「临时会话（不使用项目）」在系统临时目录建一个空工作区。</p>
       </div></div>
       <div class="step"><div class="num">4</div><div class="body">
-        <p><strong>选后端和模型</strong>：点项目胶囊右边的「模型」胶囊。如果只启用了一个后端，弹出二级面板：左栏列厂商（如 OpenAI、Anthropic），右栏列该厂商的模型，鼠标移到左栏某项右栏跟着切换。如果启用了多个后端，弹出三级面板：最左栏列后端（Devin、Codex、Claude Code 等），中栏列厂商，最右栏列模型。顶部有搜索框可直接搜模型名。模型右侧会显示单价（如 <code>$5/$25</code>）和支持图片的眼睛图标。点模型即选中。</p>
+        <p><strong>选后端和模型</strong>：点项目胶囊右边的「模型」胶囊。如果只启用了一个后端，弹出二级面板：左栏列厂商（如 OpenAI、Anthropic），右栏列该厂商的模型，鼠标移到左栏某项右栏跟着切换。如果启用了多个后端，弹出三级面板：最左栏列后端（Devin、Codex、Cursor 等），中栏列厂商，最右栏列模型。顶部有搜索框可直接搜模型名。模型右侧会显示单价（如 <code>$5/$25</code>）和支持图片的眼睛图标。点模型即选中。</p>
       </div></div>
       <div class="step"><div class="num">5</div><div class="body">
         <p><strong>输入任务，回车发送</strong>。界面立即切到会话视图，AI 开始干活，过程实时滚动显示。任务跑完会弹系统通知（如果窗口不在前台）。</p>
@@ -307,7 +307,7 @@
     <p>回车会把新提示词加入「待发送队列」，输入框上方出现队列条目（带序号、文本预览、附件数）。每条右边两个按钮：</p>
     <ul>
       <li><strong>撤回</strong>（撤销图标）：把这条拿回输入框，可改后再发。</li>
-      <li><strong>发送</strong>（纸飞机图标）：立即作为引导发送。支持引导的后端（Lyra、Codex、Devin、Cursor、OpenCode）可在运行中直接插入；不支持的按钮会置灰。</li>
+      <li><strong>发送</strong>（纸飞机图标）：立即作为引导发送。支持引导的后端（Lyra、Codex、Devin、Cursor）可在运行中直接插入；不支持的按钮会置灰。</li>
     </ul>
     <p>队列头部提示「当前任务结束后自动发送」或「已停止，可手动发送或撤回」。空输入框按 <kbd>Enter</kbd> 也会立即发送队列第一条作为引导。</p>
 
@@ -591,10 +591,8 @@
         <tr><td><strong>Lyra</strong></td><td>启用勾选 · 代理 · 「刷新配置」按钮（修改 <code>~/.nova/alkaid/config.jsonc</code> 后点此重载模型列表）；Rust 原生 agent，不经 Node bridge</td></tr>
         <tr><td><strong>Devin</strong></td><td>启用勾选 · CLI 管理器（查看状态/升级）· 可执行文件 · 启动参数 · 代理 · 额度（日/周百分比 + 积分，可刷新）</td></tr>
         <tr><td><strong>CodeBuddy</strong></td><td>启用勾选 · CLI 管理器 · 可执行文件 · 代理</td></tr>
-        <tr><td><strong>Claude Code</strong></td><td>启用勾选 · CLI 管理器 · 可执行文件 · Anthropic API Key · 代理</td></tr>
         <tr><td><strong>Codex</strong></td><td>启用勾选 · CLI 管理器 · 可执行文件 · 代理</td></tr>
         <tr><td><strong>Cursor</strong></td><td>启用勾选 · CLI 管理器 · Cursor API Key · 代理 · 按模型 ID 自定义上下文窗口</td></tr>
-        <tr><td><strong>OpenCode</strong></td><td>启用勾选 · CLI 管理器 · 可执行文件 · 代理</td></tr>
       </tbody>
     </table>
     <p>每个 SDK 后端的 CLI 管理器显示：CLI 名称、版本（未安装标红）、状态消息、升级按钮（升级时显示进度和输出）。</p>
@@ -630,7 +628,7 @@
     </ul>
 
     <h3 id="s-skills">Skills</h3>
-    <p>Skill 统一放在 <code>~/.nova/skills</code>，启动各后端时会以软链接/目录联接同步到 Codex / Claude Code / Cursor / OpenCode / agents 的全局 skills 目录，不拷贝文件。</p>
+    <p>Skill 统一放在 <code>~/.nova/skills</code>，启动各后端时会以软链接/目录联接同步到 Codex / Cursor / agents 的全局 skills 目录，不拷贝文件。</p>
     <ul>
       <li>顶部：集中目录路径（只读）+「打开」按钮（在文件管理器打开）+「同步」按钮（重新同步到各后端）。</li>
       <li>拖放区：拖入 zip 或 skill 文件夹安装（每个 skill 需含 <code>SKILL.md</code>）。也可「上传 zip…」「选择文件夹…」「刷新」。</li>

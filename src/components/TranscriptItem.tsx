@@ -21,13 +21,6 @@ function attachmentSrc(img: PromptImage): string {
   return convertFileSrc(attachmentPath(img) ?? "");
 }
 
-function normalizeThoughtMarkdown(text: string): string {
-  // Older OpenCode sessions joined adjacent reasoning parts as **A****B**.
-  return state.agentKind === "opencode"
-    ? text.replace(/(\S)\*{4}(?=\S)/g, "$1**\n\n**")
-    : text;
-}
-
 function isCodexModelResumeWarning(item: Item): boolean {
   if (item.type !== "system" || item.level !== "error") return false;
   return (
@@ -197,9 +190,7 @@ export function TranscriptItem(props: { item: Item; active?: boolean }) {
               <Show when={thoughtOpen()}>
                 <div class="thought-body">
                   <Markdown
-                    text={normalizeThoughtMarkdown(
-                      (props.item as Extract<Item, { type: "thought" }>).text,
-                    )}
+                    text={(props.item as Extract<Item, { type: "thought" }>).text}
                   />
                 </div>
               </Show>

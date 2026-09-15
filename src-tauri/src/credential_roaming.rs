@@ -4,8 +4,7 @@
 //! 后端进程通过 CODEX_HOME / CURSOR_CONFIG_DIR / XDG_* 等环境变量读取，不覆盖本机账号。
 
 use crate::acp::AcpManager;
-use crate::opencode_sdk::OpenCodeSdkManager;
-use crate::sdk_adapters::{ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter};
+use crate::sdk_adapters::{CodexAdapter, CursorAdapter, LyraAdapter};
 use crate::sdk_runtime::SdkManager;
 use crate::threads::AgentKind;
 use crate::AppState;
@@ -55,7 +54,6 @@ pub struct EncryptedGrant {
 pub enum BorrowedManager {
     Acp(Arc<AcpManager>),
     Sdk(Arc<SdkManager>),
-    OpenCode(Arc<OpenCodeSdkManager>),
 }
 
 #[derive(Clone)]
@@ -69,7 +67,6 @@ impl BorrowedRuntime {
         match &self.manager {
             BorrowedManager::Acp(manager) => manager.is_running(thread_id),
             BorrowedManager::Sdk(manager) => manager.is_running(thread_id),
-            BorrowedManager::OpenCode(manager) => manager.is_running(thread_id),
         }
     }
 
@@ -77,7 +74,6 @@ impl BorrowedRuntime {
         match &self.manager {
             BorrowedManager::Acp(manager) => manager.has_pending_permission(request_key),
             BorrowedManager::Sdk(manager) => manager.has_pending_permission(request_key),
-            BorrowedManager::OpenCode(manager) => manager.has_pending_permission(request_key),
         }
     }
 
@@ -93,9 +89,6 @@ impl BorrowedRuntime {
             BorrowedManager::Sdk(manager) => {
                 manager.respond_permission(request_key, option_id).await
             }
-            BorrowedManager::OpenCode(manager) => {
-                manager.respond_permission(request_key, option_id).await
-            }
         }
     }
 
@@ -103,7 +96,6 @@ impl BorrowedRuntime {
         match &self.manager {
             BorrowedManager::Acp(manager) => manager.kill_conn().await,
             BorrowedManager::Sdk(manager) => manager.shutdown(),
-            BorrowedManager::OpenCode(manager) => manager.shutdown(),
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
@@ -210,7 +202,6 @@ fn derive_key(
 pub fn collect_credentials(
     app: &AppHandle,
     agent_kind: AgentKind,
-    model: &str,
     lyra_config: Option<&str>,
 ) -> Result<CredentialBundle, String> {
     let mut files = Vec::new();
@@ -252,17 +243,6 @@ pub fn collect_credentials(
                 &mut files,
             )?;
         }
-        AgentKind::ClaudeCode => {
-            let configured = app
-                .state::<AppState>()
-                .settings
-                .lock()
-                .unwrap()
-                .claudecode_sdk_api_key
-                .clone();
-            collect_secret_env("ANTHROPIC_API_KEY", &configured, &mut env);
-            collect_secret_env("CLAUDE_CODE_OAUTH_TOKEN", "", &mut env);
-        }
         AgentKind::Cursor => {
             let configured = app
                 .state::<AppState>()
@@ -272,20 +252,6 @@ pub fn collect_credentials(
                 .cursor_sdk_api_key
                 .clone();
             collect_secret_env("CURSOR_API_KEY", &configured, &mut env);
-        }
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-            let data = configured_home("XDG_DATA_HOME", ".local/share");
-            let provider = model
-                .split('/')
-                .next()
-                .filter(|value| !value.is_empty())
-                .ok_or("OpenCode 共享模型缺少 Provider 标识")?;
-            collect_json_entry(
-                &data.join("opencode").join("auth.json"),
-                "opencode-data/opencode/auth.json",
-                provider,
-                &mut files,
-            )?;
         }
     }
     if files.is_empty() && env.is_empty() {
@@ -401,14 +367,8 @@ pub fn materialize_runtime(
                 format!("quota-{thread_id}-cbp-"),
             ))
         }
-        AgentKind::ClaudeCode => {
-            BorrowedManager::Sdk(SdkManager::new_with_env(app, ClaudeAdapter, launch_env))
-        }
         AgentKind::Cursor => {
             BorrowedManager::Sdk(SdkManager::new_with_env(app, CursorAdapter, launch_env))
-        }
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-            BorrowedManager::OpenCode(OpenCodeSdkManager::new_with_env(app, launch_env))
         }
     };
     Ok(BorrowedRuntime { manager, root })
@@ -467,31 +427,11 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
             env.insert("APPDATA".into(), as_string(roaming));
             env.insert("CODEBUDDY_CONFIG_DIR".into(), as_string(config));
         }
-        AgentKind::ClaudeCode => {
-            let config = root.join("claude");
-            std::fs::create_dir_all(&config).map_err(|e| e.to_string())?;
-            env.insert("CLAUDE_CONFIG_DIR".into(), as_string(config.clone()));
-            env.insert("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), as_string(config));
-        }
         AgentKind::Cursor => {
             let config = root.join("cursor");
             std::fs::create_dir_all(&config).map_err(|e| e.to_string())?;
             env.insert("CURSOR_CONFIG_DIR".into(), as_string(config.clone()));
             env.insert("CURSOR_DATA_DIR".into(), as_string(config));
-        }
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-            let profile = root.join("profile");
-            let config = root.join("opencode-config");
-            let data = root.join("opencode-data");
-            let cache = root.join("opencode-cache");
-            for dir in [&profile, &config, &data, &cache] {
-                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            }
-            env.insert("USERPROFILE".into(), as_string(profile.clone()));
-            env.insert("HOME".into(), as_string(profile));
-            env.insert("XDG_CONFIG_HOME".into(), as_string(config));
-            env.insert("XDG_DATA_HOME".into(), as_string(data));
-            env.insert("XDG_CACHE_HOME".into(), as_string(cache));
         }
     }
     env.insert("NOVA_QUOTA_BORROWED".into(), "1".into());
@@ -518,18 +458,10 @@ fn stage_local_skills(
             .get("CODEBUDDY_CONFIG_DIR")
             .map(PathBuf::from)
             .map(|path| path.join("skills")),
-        AgentKind::ClaudeCode => env
-            .get("CLAUDE_CONFIG_DIR")
-            .map(PathBuf::from)
-            .map(|path| path.join("skills")),
         AgentKind::Cursor => env
             .get("CURSOR_CONFIG_DIR")
             .map(PathBuf::from)
             .map(|path| path.join("skills")),
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => env
-            .get("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .map(|path| path.join("opencode").join("skills")),
     };
     if let Some(root) = root {
         crate::skills::copy_skills_to_runtime(&crate::nova_data_dir(app), &root)?;
@@ -570,17 +502,12 @@ fn credential_path_allowed(kind: &AgentKind, raw: &str) -> bool {
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => path
             .strip_prefix("profile/AppData/Local/CodeBuddyExtension/Data/Public/auth/")
             .is_some_and(|name| !name.is_empty() && !name.contains('/')),
-        AgentKind::Kimi | AgentKind::ClaudeCode | AgentKind::Cursor => false,
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => path == "opencode-data/opencode/auth.json",
+        AgentKind::Kimi | AgentKind::Cursor => false,
     }
 }
 
 fn credential_env_allowed(kind: &AgentKind, name: &str) -> bool {
     match kind {
-        AgentKind::ClaudeCode => matches!(
-            name,
-            "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN" | "CLAUDE_CODE_OAUTH_TOKEN"
-        ),
         AgentKind::Cursor => name == "CURSOR_API_KEY",
         _ => false,
     }
@@ -699,34 +626,6 @@ fn collect_file(path: &Path, target: &str, files: &mut Vec<CredentialFile>) -> R
     Ok(())
 }
 
-fn collect_json_entry(
-    path: &Path,
-    target: &str,
-    key: &str,
-    files: &mut Vec<CredentialFile>,
-) -> Result<(), String> {
-    let data = std::fs::read(path).map_err(|_| {
-        format!(
-            "未找到 {} 登录凭证，请先在额度提供方完成登录",
-            path.display()
-        )
-    })?;
-    let value: serde_json::Value = serde_json::from_slice(&data)
-        .map_err(|_| format!("登录凭证格式无效：{}", path.display()))?;
-    let credential = value
-        .get(key)
-        .cloned()
-        .ok_or_else(|| format!("OpenCode Provider {key} 尚未登录，无法共享该模型额度"))?;
-    let mut filtered = serde_json::Map::new();
-    filtered.insert(key.to_string(), credential);
-    let filtered = serde_json::to_vec(&filtered).map_err(|e| format!("凭证序列化失败：{e}"))?;
-    files.push(CredentialFile {
-        path: target.into(),
-        data: base64::engine::general_purpose::STANDARD.encode(filtered),
-    });
-    Ok(())
-}
-
 fn collect_secret_env(name: &str, configured: &str, env: &mut HashMap<String, String>) {
     let value = if configured.trim().is_empty() {
         std::env::var(name).unwrap_or_default()
@@ -808,13 +707,10 @@ mod tests {
             "codex-home/config.toml"
         ));
         assert!(credential_env_allowed(
-            &AgentKind::ClaudeCode,
-            "ANTHROPIC_API_KEY"
+            &AgentKind::Cursor,
+            "CURSOR_API_KEY"
         ));
-        assert!(!credential_env_allowed(
-            &AgentKind::ClaudeCode,
-            "NODE_OPTIONS"
-        ));
+        assert!(!credential_env_allowed(&AgentKind::Cursor, "NODE_OPTIONS"));
     }
 
     #[test]
@@ -836,32 +732,6 @@ mod tests {
             &AgentKind::Lyra,
             "alkaid/sessions/a.json"
         ));
-    }
-
-    #[test]
-    fn opencode_credentials_only_include_requested_provider() {
-        let root = std::env::temp_dir().join(format!(
-            "nova-opencode-credential-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let auth = root.join("auth.json");
-        std::fs::write(
-            &auth,
-            br#"{"anthropic":{"token":"a"},"openai":{"token":"b"}}"#,
-        )
-        .unwrap();
-
-        let mut files = Vec::new();
-        collect_json_entry(&auth, "opencode/auth.json", "openai", &mut files).unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(files[0].data.as_bytes())
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert!(value.get("openai").is_some());
-        assert!(value.get("anthropic").is_none());
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

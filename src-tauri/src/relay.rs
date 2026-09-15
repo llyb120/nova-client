@@ -104,30 +104,15 @@ struct PendingQuotaClient {
 struct QuotaLeaseKey {
     peer: String,
     agent_kind: AgentKind,
-    auth_scope: String,
 }
 
 impl QuotaLeaseKey {
-    fn new(peer: String, agent_kind: AgentKind, model: &str) -> Result<Self, String> {
+    fn new(peer: String, agent_kind: AgentKind) -> Result<Self, String> {
         let peer = peer.trim().to_string();
         if peer.is_empty() {
             return Err("额度租约必须指定队友".into());
         }
-        let auth_scope = if matches!(agent_kind, AgentKind::OpenCode | AgentKind::OpenCodePlus) {
-            model.split('/').next().unwrap_or_default().to_string()
-        } else {
-            String::new()
-        };
-        if matches!(agent_kind, AgentKind::OpenCode | AgentKind::OpenCodePlus)
-            && auth_scope.is_empty()
-        {
-            return Err("OpenCode 额度租约缺少 Provider 标识".into());
-        }
-        Ok(Self {
-            peer,
-            agent_kind,
-            auth_scope,
-        })
+        Ok(Self { peer, agent_kind })
     }
 }
 
@@ -204,10 +189,7 @@ fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
         | AgentKind::CodexPlus
         | AgentKind::CodeBuddy
         | AgentKind::CodeBuddyPlus
-        | AgentKind::ClaudeCode
-        | AgentKind::Cursor
-        | AgentKind::OpenCode
-        | AgentKind::OpenCodePlus => Ok(()),
+        | AgentKind::Cursor => Ok(()),
     }
 }
 
@@ -235,7 +217,7 @@ fn shared_quota_leases(peer: &str, shared_options: &Value) -> HashMap<QuotaLease
             let Some(value) = model["value"].as_str().filter(|value| !value.is_empty()) else {
                 continue;
             };
-            if let Ok(key) = QuotaLeaseKey::new(peer.to_string(), kind.clone(), value) {
+            if let Ok(key) = QuotaLeaseKey::new(peer.to_string(), kind.clone()) {
                 leases.entry(key).or_insert_with(|| value.to_string());
             }
         }
@@ -245,7 +227,7 @@ fn shared_quota_leases(peer: &str, shared_options: &Value) -> HashMap<QuotaLease
 
 /// 对端公布的全部共享模型键（`<agentKind>:<modelId>`）：租约按账号/Provider 复用去重后
 /// 会丢失同租约键下的其余模型，需要从原始 shared_options 独立提取完整名单。
-fn shared_model_keys(peer: &str, shared_options: &Value) -> HashSet<String> {
+fn shared_model_keys(shared_options: &Value) -> HashSet<String> {
     let mut keys = HashSet::new();
     for (kind, options) in shared_options.as_object().into_iter().flatten() {
         let Some(kind) = AgentKind::from_str(kind) else {
@@ -277,10 +259,7 @@ fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> 
         AgentKind::CodexPlus => settings.codex_enabled,
         AgentKind::CodeBuddy => settings.codebuddy_enabled,
         AgentKind::CodeBuddyPlus => settings.codebuddy_enabled,
-        AgentKind::ClaudeCode => settings.claudecode_enabled,
         AgentKind::Cursor => settings.cursor_enabled,
-        AgentKind::OpenCode => settings.opencode_enabled,
-        AgentKind::OpenCodePlus => settings.opencode_enabled,
     };
     enabled
         && !model.is_empty()
@@ -1812,20 +1791,8 @@ impl RelayManager {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
             }
-            AgentKind::ClaudeCode => {
-                let mgr = state.claudeplus.clone();
-                tauri::async_runtime::spawn(async move {
-                    mgr.run_prompt(run_id, seed, vec![]).await;
-                });
-            }
             AgentKind::Cursor => {
                 let mgr = state.cursorplus.clone();
-                tauri::async_runtime::spawn(async move {
-                    mgr.run_prompt(run_id, seed, vec![]).await;
-                });
-            }
-            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-                let mgr = state.opencodeplus.clone();
                 tauri::async_runtime::spawn(async move {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
@@ -1890,7 +1857,7 @@ impl RelayManager {
             (peer, thread.agent_kind.clone(), model)
         };
         ensure_quota_backend_supported(&agent_kind)?;
-        let key = QuotaLeaseKey::new(peer, agent_kind.clone(), &model)?;
+        let key = QuotaLeaseKey::new(peer, agent_kind.clone())?;
         let bundle = self.acquire_quota_lease(key, model, None).await?;
         let runtime = crate::credential_roaming::materialize_runtime(
             self.app.clone(),
@@ -1931,7 +1898,7 @@ impl RelayManager {
         if model.is_empty() {
             return Err("额度租约必须指定共享模型".into());
         }
-        let key = QuotaLeaseKey::new(peer_token, agent_kind, &model)?;
+        let key = QuotaLeaseKey::new(peer_token, agent_kind)?;
         self.acquire_quota_lease(key, model, None).await?;
         Ok(())
     }
@@ -1941,7 +1908,7 @@ impl RelayManager {
     }
 
     /// 本机是否已持有该队友/后端所需凭证，且该具体模型仍在队友最近公布的共享名单中。
-    /// 非 OpenCode 租约按账号复用，不能只看租约键，否则同后端任意未共享模型也会误通过。
+    /// 租约按账号复用，不能只看租约键，否则同后端任意未共享模型也会误通过。
     pub fn can_switch_quota_model(
         &self,
         peer: &str,
@@ -1954,7 +1921,7 @@ impl RelayManager {
             .unwrap()
             .get(peer)
             .is_some_and(|models| models.contains(&model_key))
-            && QuotaLeaseKey::new(peer.to_string(), agent_kind.clone(), model)
+            && QuotaLeaseKey::new(peer.to_string(), agent_kind.clone())
                 .is_ok_and(|key| self.quota_lease_ready(&key))
     }
 
@@ -2165,7 +2132,7 @@ impl RelayManager {
         let model = model
             .filter(|value| !value.trim().is_empty())
             .ok_or("额度漫游必须选择对方明确共享的模型")?;
-        let lease_key = QuotaLeaseKey::new(peer_token.clone(), agent_kind.clone(), &model)?;
+        let lease_key = QuotaLeaseKey::new(peer_token.clone(), agent_kind.clone())?;
         let lease_ready = self.quota_lease_ready(&lease_key);
         if lease_ready {
             self.emit_quota_progress(operation_id, "preparing", "正在复用已预热的额度租约…");
@@ -2333,7 +2300,6 @@ impl RelayManager {
                 let result = crate::credential_roaming::collect_credentials(
                     &app,
                     agent_kind,
-                    &model,
                     lyra_config.as_deref(),
                 )
                 .and_then(|bundle| {
@@ -2716,7 +2682,7 @@ impl RelayManager {
     }
 
     /// host：收到模型请求，收集本机「已启用且检测可用」后端的模型/模式列表回给对端。
-    /// 顺序与前端 ALL_AGENT_KINDS 保持一致（lyra → devin → codex → codebuddy → claudecode → cursor → opencode）。
+    /// 顺序与前端 ALL_AGENT_KINDS 保持一致（lyra → devin → codex → codebuddy → cursor）。
     /// 所有 host 子会话共用父会话的授权，但各自拥有独立的 guest 镜像和事件路由。
     pub fn inherit_roaming_stage(&self, thread: &mut Thread) -> Result<(), String> {
         let Some(parent_id) = thread.parent_thread_id.clone() else { return Ok(()); };
@@ -2845,10 +2811,7 @@ impl RelayManager {
                     (AgentKind::Kimi, s.kimi_enabled),
                     (AgentKind::Codex, s.codex_enabled),
                     (AgentKind::CodeBuddy, s.codebuddy_enabled),
-                    (AgentKind::ClaudeCode, s.claudecode_enabled),
                     (AgentKind::Cursor, s.cursor_enabled),
-                    (AgentKind::OpenCode, s.opencode_enabled),
-                    (AgentKind::OpenCodePlus, s.opencodeplus_enabled),
                 ]
                 .into_iter()
                 // 可用性未检测完（map 为空/无该键）时按可用处理，避免误伤
@@ -2864,12 +2827,6 @@ impl RelayManager {
                 backends.push(kind.as_str());
                 let fetched = match kind {
                     AgentKind::Lyra => app.state::<AppState>().lyra.ensure_model_options().await,
-                    AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-                        app.state::<AppState>()
-                            .opencodeplus
-                            .ensure_model_options()
-                            .await
-                    }
                     AgentKind::Codex | AgentKind::CodexPlus => {
                         app.state::<AppState>()
                             .codexplus
@@ -2879,12 +2836,6 @@ impl RelayManager {
                     AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
                         app.state::<AppState>()
                             .codebuddy
-                            .ensure_model_options()
-                            .await
-                    }
-                    AgentKind::ClaudeCode => {
-                        app.state::<AppState>()
-                            .claudeplus
                             .ensure_model_options()
                             .await
                     }
@@ -2925,7 +2876,7 @@ impl RelayManager {
         self.quota_shared_models
             .lock()
             .unwrap()
-            .insert(env.from.clone(), shared_model_keys(&env.from, shared_options));
+            .insert(env.from.clone(), shared_model_keys(shared_options));
         self.retain_shared_quota_leases(&env.from, shared_options);
         for (key, model) in leases {
             if self.quota_lease_ready(&key) {
@@ -3417,9 +3368,7 @@ impl RelayManager {
         state.codex.forget_session_of_thread(&host_thread_id);
         state.codexplus.forget_session_of_thread(&host_thread_id);
         state.codebuddy.forget_session_of_thread(&host_thread_id);
-        state.claudeplus.forget_session_of_thread(&host_thread_id);
         state.cursorplus.forget_session_of_thread(&host_thread_id);
-        state.opencodeplus.forget_session_of_thread(&host_thread_id);
     }
 
     fn on_roaming_prompt(&self, env: &InEnvelope) {
@@ -3526,14 +3475,6 @@ impl RelayManager {
                     }
                 });
             }
-            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-                let mgr = state.opencodeplus.clone();
-                tauri::async_runtime::spawn(async move {
-                    if host_prompt_is_current(&prompt_epoch) {
-                        mgr.run_prompt(host_thread_id, text, images).await;
-                    }
-                });
-            }
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
                 let mgr = state.codebuddy.clone();
                 tauri::async_runtime::spawn(async move {
@@ -3571,14 +3512,6 @@ impl RelayManager {
             }
             AgentKind::Kimi => {
                 let mgr = state.kimi.clone();
-                tauri::async_runtime::spawn(async move {
-                    if host_prompt_is_current(&prompt_epoch) {
-                        mgr.run_prompt(host_thread_id, text, images).await;
-                    }
-                });
-            }
-            AgentKind::ClaudeCode => {
-                let mgr = state.claudeplus.clone();
                 tauri::async_runtime::spawn(async move {
                     if host_prompt_is_current(&prompt_epoch) {
                         mgr.run_prompt(host_thread_id, text, images).await;
@@ -3659,16 +3592,8 @@ impl RelayManager {
                 let mgr = state.codebuddy.clone();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
-            AgentKind::ClaudeCode => {
-                let mgr = state.claudeplus.clone();
-                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
-            }
             AgentKind::Cursor => {
                 let mgr = state.cursorplus.clone();
-                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
-            }
-            AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-                let mgr = state.opencodeplus.clone();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
         };
@@ -3751,16 +3676,6 @@ impl RelayManager {
             });
         } else if request_key.starts_with("cbp-") {
             let mgr = state.codebuddy.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        } else if request_key.starts_with("clp-") {
-            let mgr = state.claudeplus.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        } else if request_key.starts_with("ocp-") {
-            let mgr = state.opencodeplus.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = mgr.respond_permission(&request_key, &option_id).await;
             });
@@ -5040,27 +4955,11 @@ mod tests {
 
     #[test]
     fn quota_lease_key_is_per_peer_and_backend() {
-        let cursor =
-            QuotaLeaseKey::new("peer-a".into(), AgentKind::Cursor, "cursor-small").unwrap();
-        let codex = QuotaLeaseKey::new("peer-a".into(), AgentKind::Codex, "gpt-5").unwrap();
+        let cursor = QuotaLeaseKey::new("peer-a".into(), AgentKind::Cursor).unwrap();
+        let codex = QuotaLeaseKey::new("peer-a".into(), AgentKind::Codex).unwrap();
 
         assert_ne!(cursor, codex);
-        assert!(QuotaLeaseKey::new("".into(), AgentKind::Cursor, "cursor-small").is_err());
-    }
-
-    #[test]
-    fn opencode_quota_lease_is_scoped_to_provider() {
-        let anthropic = QuotaLeaseKey::new(
-            "peer-a".into(),
-            AgentKind::OpenCode,
-            "anthropic/claude-sonnet-4",
-        )
-        .unwrap();
-        let openai =
-            QuotaLeaseKey::new("peer-a".into(), AgentKind::OpenCode, "openai/gpt-5").unwrap();
-
-        assert_ne!(anthropic, openai);
-        assert_eq!(anthropic.auth_scope, "anthropic");
+        assert!(QuotaLeaseKey::new("".into(), AgentKind::Cursor).is_err());
     }
 
     #[test]
@@ -5070,9 +4969,7 @@ mod tests {
             AgentKind::Devin,
             AgentKind::Codex,
             AgentKind::CodeBuddy,
-            AgentKind::ClaudeCode,
             AgentKind::Cursor,
-            AgentKind::OpenCode,
         ] {
             assert!(ensure_quota_backend_supported(&kind).is_ok());
         }
@@ -5092,33 +4989,31 @@ mod tests {
                         ]
                     }]
                 },
-                "opencode": {
+                "codex": {
                     "configOptions": [{
                         "id": "model",
                         "options": [
-                            { "value": "anthropic/sonnet" },
-                            { "value": "openai/gpt-5" }
+                            { "value": "gpt-5" }
                         ]
                     }]
                 }
             }),
         );
 
-        assert_eq!(shared.len(), 3);
+        assert_eq!(shared.len(), 2);
         assert!(shared.contains_key(
-            &QuotaLeaseKey::new("peer-a".into(), AgentKind::Cursor, "cursor-small").unwrap()
+            &QuotaLeaseKey::new("peer-a".into(), AgentKind::Cursor).unwrap()
         ));
         assert!(shared.contains_key(
-            &QuotaLeaseKey::new("peer-a".into(), AgentKind::OpenCode, "anthropic/sonnet").unwrap()
+            &QuotaLeaseKey::new("peer-a".into(), AgentKind::Codex).unwrap()
         ));
         assert!(!shared.contains_key(
-            &QuotaLeaseKey::new("peer-b".into(), AgentKind::Cursor, "cursor-small").unwrap()
+            &QuotaLeaseKey::new("peer-b".into(), AgentKind::Cursor).unwrap()
         ));
 
         // Cursor 等后端的凭证按账号复用，两个模型映射到同一租约；具体模型是否共享
         // 必须另存完整模型键（shared_model_keys 从原始 shared_options 提取），不能仅凭租约键判断。
         let cursor_models = shared_model_keys(
-            "peer-a",
             &json!({
                 "cursor": {
                     "configOptions": [{

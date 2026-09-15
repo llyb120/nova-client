@@ -61,12 +61,9 @@ const HELP: &str = r#"Nova Headless Server
 可配置键：
   relay-server, token, groups, name, proxy, default-mode
   context（none / fast / super，默认 super）
-  devin-path, codex-path, codex-args, codebuddy-path, claude-path,
-  cursor-path, opencode-path
-  lyra-proxy, devin-proxy, codex-proxy, codebuddy-proxy, claude-proxy,
-  cursor-proxy, opencode-proxy
-  lyra-enabled, devin-enabled, codex-enabled, codebuddy-enabled, claude-enabled,
-  cursor-enabled, opencode-enabled
+  devin-path, codex-path, codex-args, codebuddy-path, cursor-path
+  lyra-proxy, devin-proxy, codex-proxy, codebuddy-proxy, cursor-proxy
+  lyra-enabled, devin-enabled, codex-enabled, codebuddy-enabled, cursor-enabled
   env.<NAME>（例如 config.toml 中自定义 provider 的 env_key）
 
 环境变量：NOVA_SERVER_RELAY_URL、NOVA_SERVER_TOKEN、NOVA_SERVER_NAME、
@@ -301,9 +298,7 @@ fn show_config(show_token: bool) -> Result<(), String> {
             "devin": { "enabled": settings.devin_enabled, "path": settings.devin_path, "proxy": settings.devin_proxy },
             "codex": { "enabled": settings.codex_enabled, "path": settings.codex_path, "args": settings.codex_args, "proxy": settings.codex_proxy },
             "codebuddy": { "enabled": settings.codebuddy_enabled, "path": settings.codebuddy_path, "proxy": settings.codebuddy_proxy },
-            "claude": { "enabled": settings.claudecode_enabled, "path": settings.claudecode_path, "proxy": settings.claudecode_proxy },
-            "cursor": { "enabled": settings.cursor_enabled, "path": settings.cursor_path, "proxy": settings.cursor_proxy },
-            "opencode": { "enabled": settings.opencode_enabled, "path": settings.opencode_path, "proxy": settings.opencode_proxy }
+            "cursor": { "enabled": settings.cursor_enabled, "path": settings.cursor_path, "proxy": settings.cursor_proxy }
         }
     });
     println!(
@@ -353,23 +348,17 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
             "codex-path" => settings.codex_path = value.into(),
             "codex-args" => settings.codex_args = value.into(),
             "codebuddy-path" => settings.codebuddy_path = value.into(),
-            "claude-path" => settings.claudecode_path = value.into(),
             "cursor-path" => settings.cursor_path = value.into(),
-            "opencode-path" => settings.opencode_path = value.into(),
             "lyra-proxy" | "vega-proxy" => settings.lyra_proxy = value.into(),
             "devin-proxy" => settings.devin_proxy = value.into(),
             "codex-proxy" => settings.codex_proxy = value.into(),
             "codebuddy-proxy" => settings.codebuddy_proxy = value.into(),
-            "claude-proxy" => settings.claudecode_proxy = value.into(),
             "cursor-proxy" => settings.cursor_proxy = value.into(),
-            "opencode-proxy" => settings.opencode_proxy = value.into(),
             "lyra-enabled" | "vega-enabled" => settings.lyra_enabled = parse_bool(value)?,
             "devin-enabled" => settings.devin_enabled = parse_bool(value)?,
             "codex-enabled" => settings.codex_enabled = parse_bool(value)?,
             "codebuddy-enabled" => settings.codebuddy_enabled = parse_bool(value)?,
-            "claude-enabled" => settings.claudecode_enabled = parse_bool(value)?,
             "cursor-enabled" => settings.cursor_enabled = parse_bool(value)?,
-            "opencode-enabled" => settings.opencode_enabled = parse_bool(value)?,
             unknown => return Err(format!("未知配置键：{unknown}\n\n{HELP}")),
         }
     }
