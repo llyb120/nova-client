@@ -1103,6 +1103,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   // 挤出，导致每次切回都把全部已闭合分组从头重排（measureText + 布局 + 光栅化），
   // 这正是"会话都已加载、来回切换仍卡"的来源。调大到能容纳典型 stage 链。
   const prefixLayoutCaches = new LruMap<string, PrefixLayoutCache>(8);
+  // 用户提示词在流式输出期间不变；按消息弱引用缓存，随消息释放。
+  const userTextLayouts = new WeakMap<UserItem, {
+    text: string; width: number; font: string; lines: string[]; seps: string[]; textW: number;
+  }>();
   // groupItems 会保留已闭合分组的对象身份；缓存其内容签名，避免每个流式 token
   // 都重新遍历整段历史文本。展开状态变化时会整体换新此 WeakMap。
   let closedGroupSigCache = new WeakMap<Group, string>();
@@ -1366,16 +1370,17 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH, imgMaxW } =
             layoutBubbleImages(item.images, maxBubble - 32, loadImage);
           // Size to content like DOM (no artificial min-width that leaves empty bubble space).
-          // Re-wrap at the final inner width so height matches painted lines.
           const lh = 14 * 1.6;
-          let textLines = item.text ? wrapText(item.text, maxBubble - 34, 14, p.sans) : [];
-          let textW = textLines.reduce((m, l) => Math.max(m, measure(l, 14, p.sans)), 0);
-          let bubbleW = Math.min(maxBubble, Math.max(textW + 34, imgUsedW + 32, imgH ? 72 : 34));
-          if (item.text) {
-            textLines = wrapText(item.text, Math.max(1, bubbleW - 34), 14, p.sans);
-            textW = textLines.reduce((m, l) => Math.max(m, measure(l, 14, p.sans)), 0);
-            bubbleW = Math.min(maxBubble, Math.max(textW + 34, imgUsedW + 32, imgH ? 72 : 34));
+          let textLayout = userTextLayouts.get(item);
+          if (!textLayout || textLayout.text !== item.text || textLayout.width !== maxBubble || textLayout.font !== p.sans) {
+            const full = item.text ? wrapTextFull(item.text, maxBubble - 34, 14, p.sans) : { lines: [], seps: [] };
+            textLayout = { text: item.text, width: maxBubble, font: p.sans, ...full,
+              textW: full.lines.reduce((m, l) => Math.max(m, measure(l, 14, p.sans)), 0) };
+            userTextLayouts.set(item, textLayout);
           }
+          const textLines = textLayout.lines;
+          // 最宽的已换行文本决定气泡宽度，缩小外框无需再次换行。
+          const bubbleW = Math.min(maxBubble, Math.max(textLayout.textW + 34, imgUsedW + 32, imgH ? 72 : 34));
           const textH = textLines.length * lh;
           const bubbleH = Math.max(30, textH + imgH + 20); // padding 10*2
           const bx = side + contentW - bubbleW;
@@ -1388,6 +1393,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             borderRadius: [14, 14, 6, 14], fontSize: 14, lineHeight: 1.6, font: p.sans,
             selectable: true, hoverKey: `user-${item.id}`,
             _lines: textLines,
+            _lineSeps: textLayout.seps,
             data: { images: item.images, editItem: item, imageLayouts, imgMaxW } });
 
           // .user-edit-btn: padding 5px, margin 0 2px 4px 0, align-self flex-end
@@ -2194,7 +2200,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         }
       }
       b.textLines = b._textLines;
-      for (let i = 0; i < lines.length; i++) {
+      // 长提示词可能占数万行；屏幕外的 fillText 仍会触发整形/光栅化。
+      const textTop = by + 10 + imgOffset;
+      const firstLine = Math.max(0, Math.floor((-10 - textTop) / lh));
+      const lastLine = Math.min(lines.length, Math.ceil((viewH + 10 - textTop) / lh));
+      for (let i = firstLine; i < lastLine; i++) {
         fillTextCrisp(ctx, lines[i], bx + 16, by + 10 + imgOffset + i * lh + halfLead);
       }
     }

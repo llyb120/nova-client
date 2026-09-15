@@ -7,6 +7,51 @@ const source = readFileSync(new URL("../src/components/CanvasTranscript.tsx", im
 const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start) + start.length));
 const js = (code) => transformSync(code, { loader: "ts", target: "esnext" }).code;
 
+test("长提示词流式重排复用换行，绘制数量仅随视口高度增长", () => {
+  let wraps = 0;
+  const draws = [];
+  const measure = (text) => text.length * 7;
+  const wrap = new Function("measure", `
+    ${js(section("function pushTrimmedLine(", "function wrapStyledTextIndexed("))}
+    return wrapTextFull;
+  `)(measure);
+  const wrapTextFull = (...args) => { wraps++; return wrap(...args); };
+  const layout = new Function("wrapTextFull", "measure", "layoutBubbleImages", `
+    const userTextLayouts = new WeakMap();
+    return (item, contentW = 800, font = 'sans') => {
+      const p = { sans: font }, result = [], side = 0, y = 20, gi = 0, loadImage = () => null;
+      ${js(section("          const maxBubble = contentW * 0.85;", "          // .user-edit-btn:"))}
+      return result[0];
+    };
+  `)(wrapTextFull, measure, () => ({ layouts: [], usedW: 0, stackH: 0, imgMaxW: 240 }));
+  const item = { id: 1, text: "启动提示词 😀 keep all text\n".repeat(20000) };
+  let block = layout(item);
+  assert.equal(wraps, 1);
+  for (let frame = 0; frame < 60; frame++) block = layout(item);
+  assert.equal(wraps, 1, "模型每次输出不应重新测量完整提示词");
+  assert.equal(block._lines.length, 20000);
+  assert.ok(block._lineSeps.every(sep => sep === "\n"));
+  layout(item, 600);
+  layout(item, 600, "other font");
+  item.text = item.text.replace("启动", "修改");
+  block = layout(item, 600, "other font");
+  assert.equal(wraps, 4, "宽度、字体和编辑变化必须失效");
+
+  const paint = new Function("measure", "wrapTextFull", "fillTextCrisp", `
+    const viewH = 600, BUBBLE_IMG_MAX_W = 240;
+    ${js(section("  function paintUserBubble(", "  function "))}
+    return paintUserBubble;
+  `)(measure, wrapTextFull, (...args) => draws.push(args));
+  const ctx = {};
+  for (const by of [20, -200000, -block.h + 600]) {
+    draws.length = 0;
+    paint(ctx, block, 0, by, {}, false);
+    assert.ok(draws.length > 0 && draws.length < 32, `${draws.length} draws at ${by}`);
+    assert.equal(block.textLines.length, 20000, "选区/复制仍保留完整消息");
+  }
+  assert.equal(wraps, 4, "绘制不得再次换行");
+});
+
 test("冷加载图片更新闭合分组签名，重排后暖切换复用稳定布局", () => {
   const imgCache = new Map();
   const functions = new Function("imgCache", "promptImageSrc", "state", `
