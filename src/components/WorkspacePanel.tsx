@@ -4,6 +4,7 @@ import DOMPurify from "dompurify";
 import { marked } from "marked";
 import { EditorView } from "@codemirror/view";
 import WorkspaceCode from "./WorkspaceCode";
+import WorkspaceGit from "./WorkspaceGit";
 import { api } from "../ipc";
 import { state } from "../store";
 import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
@@ -36,7 +37,9 @@ function FileIcon(props: { path: string; directory?: boolean }) {
 }
 export default function WorkspacePanel(props: { threadId: string; request: { path: string; line?: number } | null; onClose: () => void }) {
   const threadId = props.threadId;
+  const [mode, setMode] = createSignal<"files" | "artifacts" | "git">("files");
   const [artifacts, setArtifacts] = createSignal<string[]>([]);
+  const [artifactFilter, setArtifactFilter] = createSignal("");
   const [tabs, setTabs] = createSignal<FileTab[]>([]);
   const [expanded, setExpanded] = createSignal(new Set<string>());
   const [treeRevision, setTreeRevision] = createSignal(0);
@@ -97,6 +100,8 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   onCleanup(() => { request++; cancelAnimationFrame(frame); });
   const dismissPicker = (event: PointerEvent) => {
     if (!(event.target as HTMLElement).closest('.workspace-picker, .workspace-picker-toggle')) setBrowse(false);
+    const actions = panel.querySelector<HTMLDetailsElement>('.workspace-actions[open]');
+    if (actions && !actions.contains(event.target as Node)) actions.open = false;
   };
   onMount(() => document.addEventListener('pointerdown', dismissPicker));
   onCleanup(() => document.removeEventListener('pointerdown', dismissPicker));
@@ -113,8 +118,8 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       seen.add(key); return true;
     }));
   };
-  // Only subscribe to turn completion, never to streaming text deltas.
-  createEffect(() => { if (!state.running[props.threadId]) refreshArtifacts(); });
+  // Restore artifacts when the history snapshot arrives, without subscribing to text deltas.
+  createEffect(() => { state.items; state.items.length; state.loadingThread; if (!state.running[props.threadId]) refreshArtifacts(); });
   refreshArtifacts();
   const snapshot = () => {
     const file = preview();
@@ -139,6 +144,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   };
   const selectTab = (path: string) => {
     if (saving()) return;
+    if (mode() === "git") setMode("files");
     ++request; snapshot();
     const tab = tabs().find(tab => tab.file.path === path);
     if (tab) activate(tab);
@@ -206,6 +212,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       drafts.delete(draftKey(file.path));
       setOriginal(text);
       setSaved(true);
+      setArtifacts(all => [...new Set([file.path, ...all])]);
     } catch (e) { setError(String(e)); }
     finally { setSaving(false); }
   };
@@ -256,7 +263,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       </>}</Show>
     </div>;
   }
-  createEffect(() => { const target = props.request; if (target) untrack(() => void open(target.path, false, target.line)); });
+  createEffect(() => { const target = props.request; if (target) untrack(() => { setMode("files"); void open(target.path, false, target.line); }); });
   const markdown = createMemo(() => {
     const file = preview();
     if (file?.kind !== "markdown" || source() || editing()) return "";
@@ -284,7 +291,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     setWorkspaceLayout({ widthRatio: next / available });
   };
   return <aside ref={panel} class="workspace-panel" style={{ width: `${width()}px` }} aria-label="产物与项目文件"
-    onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); void save(); } }}>
+    onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
     <div class="workspace-resize" role="separator" aria-label="调整文件面板宽度" aria-orientation="vertical" tabindex="0"
       aria-valuenow={width()} onKeyDown={e => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); resize(width() + (e.key === "ArrowLeft" ? 24 : -24)); } }}
       onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); }}
@@ -293,7 +300,14 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         const value = panel.getBoundingClientRect().right - e.clientX;
         cancelAnimationFrame(frame); frame = requestAnimationFrame(() => resize(value));
       }} />
+    <nav class="workspace-toolbar workspace-modes" aria-label="文件来源">
+      <button class="workspace-picker-toggle" aria-pressed={mode() === "files"} onClick={() => { setMode("files"); setBrowse(true); }}>文件</button>
+      <button aria-pressed={mode() === "artifacts"} onClick={() => { setMode("artifacts"); setBrowse(false); refreshArtifacts(); }}>产物 · {artifacts().length}</button>
+      <button aria-pressed={mode() === "git"} onClick={() => { setMode("git"); setBrowse(false); }}>Git 变动</button>
+      <button class="workspace-panel-close" aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={props.onClose}><IconX size={14} /></button>
+    </nav>
     <header class="workspace-toolbar workspace-tabbar">
+      <span class="workspace-open-label">已打开</span>
       <div class="workspace-tabs" role="tablist" aria-label="已打开文件" onKeyDown={e => {
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
         const all = tabs(); if (!all.length) return;
@@ -312,9 +326,10 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
           <button class="workspace-tab-close" aria-label={`关闭 ${label(tab.file.path)}`} disabled={saving()} onClick={() => closeTab(tab.file.path)}><IconX size={12} /></button>
         </div>}</For>
       </div>
-      <button class="workspace-picker-toggle" aria-label="打开文件" aria-expanded={browse()} title="从目录树打开文件" onClick={() => { setBrowse(v => !v); refreshArtifacts(); }}>＋</button>
-      <button aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={props.onClose}><IconX size={14} /></button>
+      <button class="workspace-picker-toggle" aria-label="打开文件" aria-expanded={browse()} title="从目录树打开文件" onClick={() => { setMode("files"); setBrowse(v => !v); refreshArtifacts(); }}>＋</button>
     </header>
+    <Show when={mode() === "git"}><WorkspaceGit threadId={threadId} onOpen={(path, line) => { setMode("files"); void open(path, false, line); }} /></Show>
+    <div class="workspace-file-view" style={{ display: mode() === "git" ? "none" : undefined }}>
     <div class="workspace-toolbar workspace-location">
       <button class="workspace-picker-toggle workspace-breadcrumb" aria-label="选择项目文件" aria-expanded={browse()} onClick={() => { setBrowse(v => !v); refreshArtifacts(); }}>
         <IconFolder size={16} /><span class="workspace-breadcrumb-text">{label(state.cwd)} › {preview() ? label(preview()!.path) : '选择文件'}</span><IconChevron size={14} open={browse()} />
@@ -323,9 +338,13 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         <button aria-pressed={editing()} onClick={() => setEditing(v => !v)}>{editing() ? '预览' : '编辑'}</button>
         <button disabled={!dirty() || saving()} onClick={() => void save()} title="保存 (Ctrl/Cmd+S)">{saving() ? '保存中' : saved() ? '已保存' : '保存'}</button>
       </Show>
-      <Show when={preview()}>{file => <details class="workspace-actions">
+      <Show when={preview()}>{file => <details class="workspace-actions" onKeyDown={e => {
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.currentTarget.open = false; e.currentTarget.querySelector('summary')?.focus(); }
+      }}>
         <summary aria-label="更多文件操作" title="更多文件操作">···</summary>
-        <div>
+        <div onClick={e => {
+          if ((e.target as HTMLElement).closest('button')) (e.currentTarget.parentElement as HTMLDetailsElement).open = false;
+        }}>
           <Show when={!editing() && (file().kind === "markdown" || file().kind === "html")}><button onClick={() => setSource(v => !v)}>{source() ? "查看预览" : "查看源码"}</button></Show>
           <button onClick={() => report(api.openInEditor(props.threadId, file().path))}><IconTerminal size={14} />外部编辑器</button>
           <button onClick={() => report(api.openFileDefault(props.threadId, file().path))}><IconBrowser size={14} />系统打开</button>
@@ -359,12 +378,12 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         </Show>
       </div>
     </Show>
-    <section class="workspace-artifact-strip" aria-label="会话产物">
-      <span class="workspace-artifact-label">产物 {artifacts().length}</span>
-      <div><For each={artifacts()}>{path => <button title={path} onClick={() => void open(path)} onContextMenu={e => menu.open(e, path)}><FileIcon path={path} /><span>{label(path)}</span></button>}</For>
+    <Show when={mode() === "artifacts"}><section class="workspace-artifact-strip" aria-label="会话产物">
+      <input aria-label="筛选会话产物" placeholder={`筛选本会话产物（${artifacts().length}）…`} value={artifactFilter()} onInput={e => setArtifactFilter(e.currentTarget.value)} />
+      <div><For each={artifacts().filter(path => path.toLowerCase().includes(artifactFilter().toLowerCase()))}>{path => <button title={path} onClick={() => void open(path)} onContextMenu={e => menu.open(e, path)}><FileIcon path={path} /><span>{label(path)}</span><small aria-hidden="true">{path}</small></button>}</For>
         <Show when={!artifacts().length}><span class="workspace-artifact-empty">本会话尚无产物</span></Show>
       </div>
-    </section>
+    </section></Show>
     <Show when={error()}><p class="workspace-error" role="alert">{error()}</p></Show>
     <Show when={loading()}><p role="status">正在读取文件…</p></Show>
     <Show when={preview()} keyed>{file => <>
@@ -386,6 +405,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <footer class="workspace-status"><span>{dirty() ? "未保存 · 草稿保留至应用退出" : saved() ? "已保存到文件" : ""}</span><span>{Math.ceil((file.text !== null ? new TextEncoder().encode(original()).length : file.size) / 1024)} KB{file.text !== null ? " · UTF-8" : ""}</span></footer>
     </>}</Show>
     <Show when={!preview() && !loading()}><div class="workspace-empty">选择文件以查看预览</div></Show>
+    </div>
     <menu.Menu />
   </aside>;
 }

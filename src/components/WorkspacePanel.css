@@ -17,7 +17,8 @@
 .workspace-type-icon.web { color: #dd9570; }
 .workspace-type-icon.table { color: #78bc91; }
 .workspace-panel p { margin: 4px 0; padding: 6px 8px; overflow-wrap: anywhere; }
-.workspace-location { min-height: 26px; font-size: 11px; }
+.workspace-location { min-height: 26px; font-size: 11px; color: var(--text-muted); }
+.workspace-panel .workspace-location button { font-size: 12px; }
 .workspace-preview { flex: 1; min-height: 0; overflow: auto; padding: 10px; user-select: text; }
 .workspace-preview pre { margin: 0; font-size: 12px; tab-size: 4; }
 .workspace-image { display: block; max-width: 100%; height: auto; margin: auto; }
@@ -30,10 +31,12 @@
 .workspace-resize { position: absolute; top: 0; bottom: 0; left: -4px; width: 7px; cursor: col-resize; touch-action: none; z-index: 2; }
 .workspace-resize:hover, .workspace-resize:focus-visible { background: var(--accent, #6b9df5); }
 @media (max-width: 900px) { .chat-shell { position: relative; } .workspace-panel { position: absolute; right: 0; top: 0; bottom: 0; max-width: 100%; min-width: 0; width: min(480px, 100%) !important; z-index: 15; box-shadow: -8px 0 24px #0002; } .workspace-resize { display: none; } }
-.workspace-tabbar { gap: 2px; padding: 2px 4px; }
+.workspace-tabbar { gap: 6px; padding: 3px 8px; background: color-mix(in srgb, var(--bg) 94%, var(--text) 6%); }
+.workspace-open-label { flex-shrink: 0; font-size: 11px; color: var(--text-muted); }
+.workspace-panel .workspace-tab > button { font-size: 12px; }
 .workspace-tabs { display: flex; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: thin; gap: 3px; }
 .workspace-tab { display: flex; flex: 0 0 auto; align-items: center; max-width: 200px; border: 1px solid transparent; border-radius: 5px; }
-.workspace-tab.active { background: var(--hover); border-color: var(--border); }
+.workspace-tab.active { background: var(--bg); border-color: var(--border); box-shadow: inset 0 -2px var(--accent); }
 .workspace-tab > [role=tab] { min-width: 0; padding-right: 1px; }
 .workspace-tab > [role=tab] > span:not(.workspace-type-icon) { overflow: hidden; text-overflow: ellipsis; }
 .workspace-panel .workspace-tab-close { padding: 2px; min-height: 22px; margin-right: 3px; }
@@ -78,7 +81,7 @@
 .workspace-code .cm-editor { height: 100%; background: transparent; color: var(--text); }
 .workspace-code .cm-scroller { overflow-y: auto; overflow-x: hidden; font-family: var(--mono); font-size: 14px; line-height: 1.65; }
 .workspace-code.workspace-code-nowrap .cm-scroller { overflow-x: auto; }
-.workspace-code .cm-content { padding: 10px 0; caret-color: var(--text); }
+.workspace-code .cm-content { padding: 10px 0; caret-color: var(--text); user-select: text; -webkit-user-select: text; }
 .workspace-code .cm-line { padding: 0 10px; }
 .workspace-code .cm-gutters { background: color-mix(in srgb, var(--bg) 70%, transparent); color: var(--text-muted); border-right: 1px solid var(--border); }
 .workspace-code .cm-activeLine, .workspace-code .cm-activeLineGutter { background: var(--bg-hover); }
@@ -86,3 +89,29 @@
 .workspace-code .cm-editor > .cm-scroller > .cm-selectionLayer .cm-selectionBackground,
 .workspace-code .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground { background: color-mix(in srgb, var(--accent) 24%, transparent); }
 .workspace-code .cm-panels { background: var(--bg-panel); color: var(--text); }
+.workspace-file-view, .workspace-git { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+.workspace-picker { top: 110px; max-height: min(460px, calc(100% - 120px)); }
+.workspace-modes { gap: 6px; padding: 6px 8px; background: var(--bg); border-bottom-color: color-mix(in srgb, var(--accent) 30%, var(--border)); }
+.workspace-modes > button { flex: 1; min-height: 32px; font-weight: 600; color: var(--text-muted); border-radius: 6px; }
+.workspace-panel .workspace-modes > button[aria-pressed=true] { color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, var(--bg)); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); box-shadow: inset 0 -2px var(--accent); }
+.workspace-modes > .workspace-panel-close { flex: 0 0 26px; min-height: 26px; padding: 2px; }
+.workspace-artifact-strip { align-items: stretch; flex-direction: column; max-height: 30%; overflow: auto; padding: 6px; }
+.workspace-artifact-strip > div { flex-direction: column; overflow: visible; }
+.workspace-artifact-strip button { max-width: none; justify-content: flex-start; }
+.workspace-artifact-strip input { width: 100%; flex: none; box-sizing: border-box; }
+.workspace-artifact-strip button > span { white-space: nowrap; }
+.workspace-artifact-strip small { margin-left: auto; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.workspace-git-files { flex-shrink: 0; max-height: 32%; overflow: auto; border-bottom: 1px solid var(--border); }
+.workspace-git-files summary { padding: 6px 10px; cursor: pointer; color: var(--text-muted); }
+.workspace-git-files strong { width: 18px; flex-shrink: 0; color: var(--accent); }
+.workspace-diff-toolbar { flex-wrap: wrap; }
+.workspace-diff-toolbar > span:first-child { flex: 1; min-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-diff-count { white-space: nowrap; color: var(--text-muted); }
+.workspace-diff { flex: 1; min-height: 0; overflow: auto; font: 12px/1.65 var(--mono, monospace); user-select: text; }
+.workspace-diff-line { display: flex; min-width: max-content; white-space: pre; padding-right: 10px; }
+.workspace-diff-line.add { background: color-mix(in srgb, #38a169 16%, transparent); }
+.workspace-diff-line.del { background: color-mix(in srgb, #e05252 16%, transparent); }
+.workspace-diff-line.meta { color: var(--text-muted); }
+.workspace-diff-number { width: 4em; flex-shrink: 0; text-align: right; padding-right: 8px; color: var(--text-muted); user-select: none; }
+.workspace-diff-sign { width: 1.5em; flex-shrink: 0; user-select: none; }
+.workspace-panel .workspace-diff-fold { display: block; width: 100%; border-block: 1px solid var(--border); border-radius: 0; color: var(--accent); background: var(--hover); }

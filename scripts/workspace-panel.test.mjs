@@ -30,6 +30,9 @@ window.showLayoutSettings = () => {
 };
 window.testLayout = () => ({...workspaceLayout});
 window.testCode = () => EditorView.findFromDOM(document.querySelector('.cm-editor'));
+window.loadHistory = () => setState('items', [{type:'tool',id:2,ts:0,status:'completed',kind:'edit',locations:[{path:'generated.ts'}],content:[]}]);
+api.workspaceGitStatus = async () => ({repo:'D:/demo',files:[{path:'src/main.ts',oldPath:null,index:'M',worktree:'M'},{path:'new.ts',oldPath:null,index:'?',worktree:'?'}]});
+api.workspaceGitDiff = async (_id, path, staged) => 'diff --git a/' + path + ' b/' + path + '\\n@@ -1,22 +1,22 @@\\n' + Array.from({length:20}, (_, i) => ' context ' + i).join('\\n') + '\\n-old\\n+' + (staged ? 'staged' : 'unstaged') + '\\n';
 import './src/app.css';
 let disk = '# Hello\\r\\n';
 const files = new Map([['D:/demo/src/main.ts', 'const value = 1;\\n']]);
@@ -93,6 +96,20 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   await page.getByRole('button', {name:'预览',exact:true}).click();
   await page.getByRole('heading', {name:'Hello'}).waitFor();
   console.log('preview loaded');
+  const actions = page.locator('.workspace-actions');
+  const actionToggle = page.getByLabel('更多文件操作');
+  await actionToggle.click();
+  assert.equal(await actions.evaluate(el => el.open), true);
+  await page.locator('main').click({position:{x:300,y:200}});
+  assert.equal(await actions.evaluate(el => el.open), false, 'outside click dismisses file actions');
+  await actionToggle.click();
+  await page.getByRole('button', {name:'查看源码',exact:true}).click();
+  assert.equal(await actions.evaluate(el => el.open), false, 'choosing an action dismisses the menu');
+  await actionToggle.click();
+  await page.getByRole('button', {name:'查看预览',exact:true}).click();
+  await actionToggle.click();
+  await actionToggle.press('Escape');
+  assert.equal(await actions.evaluate(el => el.open), false, 'Escape dismisses file actions');
   assert.equal(await page.locator('.workspace-picker').count(), 0, 'file picker collapses after selecting');
   assert.deepEqual(await page.evaluate(() => window.testDirectories()), [''], 'only load root initially');
   const bounds = await page.locator('.workspace-preview').boundingBox();
@@ -101,7 +118,8 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   assert.ok(arrow.y >= breadcrumb.y && arrow.y + arrow.height <= breadcrumb.y + breadcrumb.height, 'chevron stays in breadcrumb row');
   assert.equal(await page.locator('.workspace-preview .markdown').evaluate(el => getComputedStyle(el).fontSize), '15px');
   assert.ok(bounds.height > 650, 'content should occupy most of an 800px window');
-  assert.equal(await page.getByRole('region', {name:'会话产物'}).getByRole('button', {name:'README.md'}).count(), 1, 'artifacts remain visible outside picker');
+  await page.getByRole('button', {name:/^产物 ·/}).click();
+  assert.equal(await page.getByRole('region', {name:'会话产物'}).getByRole('button', {name:'README.md'}).count(), 1);
   await page.getByRole('button', {name:'选择项目文件',exact:true}).click();
   await page.getByRole('textbox', {name:'按文件名搜索项目'}).fill('hidden-result');
   await page.locator('.workspace-search-results').getByRole('button', {name:/hidden-result.md/}).waitFor();
@@ -154,6 +172,7 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   await page.getByRole('button', {name:'关闭 main.ts',exact:true}).click();
   await page.getByRole('button', {name:'关闭文件面板'}).click();
   await page.getByRole('button', {name:'打开面板'}).click();
+  await page.getByRole('button', {name:/^产物 ·/}).click();
   await page.getByRole('region', {name:'会话产物'}).getByRole('button', {name:'README.md'}).click();
   assert.equal(await page.evaluate(() => window.testCode().state.doc.toString()), '# Draft\n');
   console.log('draft restored');
@@ -174,6 +193,32 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   assert.equal(await page.evaluate(() => window.testCode().state.doc.lines), 5001);
   const wrapped = await page.locator('.cm-line').first().evaluate(el => ({height:el.getBoundingClientRect().height,lineHeight:parseFloat(getComputedStyle(el).lineHeight)}));
   assert.ok(wrapped.height > wrapped.lineHeight * 2, 'long source line soft-wraps');
+  // Select from the second visual row into the third, then verify the actual copied text.
+  const points = await page.evaluate(() => {
+    const view = window.testCode();
+    const top = view.coordsAtPos(0).top;
+    const positions = [];
+    for (let i = 1; i < view.state.doc.line(1).to; i++) {
+      const box = view.coordsAtPos(i);
+      if (box && box.top > top + view.defaultLineHeight / 2 && (!positions.length || box.top > positions[0].top + view.defaultLineHeight / 2)) positions.push({pos:i,x:box.left,y:(box.top+box.bottom)/2,top:box.top});
+      if (positions.length === 2) break;
+    }
+    return positions;
+  });
+  assert.equal(points.length, 2);
+  await page.mouse.move(points[0].x, points[0].y);
+  await page.mouse.down();
+  await page.mouse.move(points[1].x, points[1].y, {steps:12});
+  await page.mouse.up();
+  const selected = await page.evaluate(() => {
+    const view = window.testCode(); const range = view.state.selection.main;
+    const data = new DataTransfer(); view.contentDOM.dispatchEvent(new ClipboardEvent('copy', {clipboardData:data,bubbles:true,cancelable:true}));
+    return {from:range.from,to:range.to,copied:data.getData('text/plain'),text:view.state.sliceDoc(range.from,range.to),userSelect:getComputedStyle(view.contentDOM).userSelect};
+  });
+  assert.equal(selected.from, points[0].pos, JSON.stringify(selected));
+  assert.equal(selected.to, points[1].pos, JSON.stringify(selected));
+  assert.equal(selected.copied, selected.text);
+  assert.equal(selected.userSelect, 'text', 'editor must not inherit the app shell selection lock');
   assert.equal(await page.evaluate(() => window.testCode().state.doc.lines), 5001, 'soft wrap does not insert newlines');
   assert.ok(await page.locator('.cm-line span').evaluateAll(spans => spans.some(el => getComputedStyle(el).color !== getComputedStyle(el.closest('.cm-content')).color)), 'Rust syntax is colored');
   const minimap = page.locator('[aria-label="代码缩略图"]');
@@ -308,6 +353,26 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   assert.equal(await page.getByRole('checkbox', {name:'记住窗口大小、位置及最大化状态'}).isChecked(), true);
   if (process.env.TEST_SCREENSHOT) await page.screenshot({path:process.env.TEST_SCREENSHOT.replace('.png','-settings.png')});
   await page.evaluate(() => window.hideLayoutSettings());
+  await page.getByRole('button', {name:/^产物 ·/}).click();
+  await page.evaluate(() => window.loadHistory());
+  await page.getByRole('region', {name:'会话产物'}).getByRole('button', {name:'generated.ts'}).waitFor();
+  await page.getByRole('button', {name:'Git 变动',exact:true}).click();
+  await page.locator('.workspace-git-files').getByRole('button', {name:'M src/main.ts',exact:true}).first().click();
+  await page.getByLabel('文件差异').getByText('unstaged', {exact:true}).waitFor();
+  const fold = page.getByRole('button', {name:'展开 14 行未变动内容'});
+  await fold.click();
+  await page.getByLabel('文件差异').getByText('context 10', {exact:true}).waitFor();
+  await page.getByRole('button', {name:'折叠 14 行未变动内容'}).click();
+  assert.equal(await page.getByLabel('文件差异').getByText('context 10', {exact:true}).count(), 0);
+  await page.locator('.workspace-git-files').getByRole('button', {name:'M src/main.ts',exact:true}).last().click();
+  await page.getByLabel('文件差异').getByText('staged', {exact:true}).waitFor();
+  await page.getByRole('button', {name:'展开全部',exact:true}).click();
+  await page.getByLabel('文件差异').getByText('context 10', {exact:true}).waitFor();
+  if (process.env.TEST_SCREENSHOT) await page.screenshot({path:process.env.TEST_SCREENSHOT.replace('.png','-git.png')});
+  const draftBeforeGitClose = await page.evaluate(() => window.testCode().state.doc.toString());
+  await page.getByRole('tab', {name:/large.rs/}).click();
+  await page.getByRole('textbox', {name:'文件内容编辑'}).waitFor();
+  assert.equal(await page.evaluate(() => window.testCode().state.doc.toString()), draftBeforeGitClose, 'Git browsing preserves the open file draft');
   assert.deepEqual(errors, []);
   console.log('Workspace panel: virtualized Rust editor, highlighting, line numbers, soft wrap, minimap, line reveal, multi-tab drafts, explicit save and conflict passed');
 } finally {
