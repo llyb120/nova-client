@@ -15,9 +15,25 @@ import { api } from './src/ipc';
 import { setState } from './src/store';
 import WorkspacePanel from './src/components/WorkspacePanel';
 import { Markdown } from './src/components/Markdown';
+import { EditorView } from '@codemirror/view';
+import AppearanceLayoutSettings from './src/components/AppearanceLayoutSettings';
+import { workspaceLayout } from './src/workspaceLayout';
+let windowLayout = {width:1280,height:820,maximized:false,remember:true};
+api.getWindowLayout = async () => ({...windowLayout});
+api.setWindowLayout = async patch => { windowLayout = patch.reset ? {width:1280,height:820,maximized:false,remember:true} : {...windowLayout,...patch}; };
+window.showLayoutSettings = () => {
+  const host = document.createElement('div');
+  host.className = 'settings-modal'; host.style.cssText = 'position:fixed;inset:20px 20px 20px auto;width:500px;overflow:auto;z-index:1000;padding:20px;background:var(--bg-panel)';
+  document.body.append(host);
+  const dispose = render(() => <AppearanceLayoutSettings />, host);
+  window.hideLayoutSettings = () => { dispose(); host.remove(); };
+};
+window.testLayout = () => ({...workspaceLayout});
+window.testCode = () => EditorView.findFromDOM(document.querySelector('.cm-editor'));
 import './src/app.css';
 let disk = '# Hello\\r\\n';
 const files = new Map([['D:/demo/src/main.ts', 'const value = 1;\\n']]);
+files.set('D:/demo/large.rs', '// ' + 'soft wrap '.repeat(80) + '\\n' + Array.from({length: 5000}, (_, i) => 'fn line_' + i + '() { let value = "hello"; }').join('\\n'));
 const reads = []; const directories = [];
 window.testReads = () => reads;
 window.testDirectories = () => directories;
@@ -31,7 +47,7 @@ api.previewWorkspaceFile = async (_id, path) => {
   reads.push(path);
   if (path.endsWith('slow.md')) await new Promise(resolve => setTimeout(resolve, 250));
   const text = path.endsWith('README.md') ? disk : files.get(path) ?? '# slow';
-  return { path, text, kind: path.endsWith('.ts') ? 'text' : 'markdown', size: text.length };
+  return { path, text, kind: /\.(ts|rs)$/.test(path) ? 'text' : 'markdown', size: text.length };
 };
 api.listWorkspaceDirectory = async (_id, path) => { directories.push(path); return { entries: path === 'src' ? [
  { name:'main.ts',path:'D:/demo/src/main.ts',directory:false },
@@ -73,6 +89,8 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   assert.deepEqual(await page.evaluate(() => window.testDirectories()), [], 'opening panel does not read directories');
   await page.getByRole('button', {name:'选择项目文件',exact:true}).click();
   await page.locator('.workspace-file').first().click();
+  await page.getByRole('textbox', {name:'文件内容编辑'}).waitFor();
+  await page.getByRole('button', {name:'预览',exact:true}).click();
   await page.getByRole('heading', {name:'Hello'}).waitFor();
   console.log('preview loaded');
   assert.equal(await page.locator('.workspace-picker').count(), 0, 'file picker collapses after selecting');
@@ -93,6 +111,7 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   await page.getByRole('button', {name:'选择项目文件',exact:true}).click();
   await page.getByRole('button', {name:'编辑',exact:true}).click();
   await page.getByRole('textbox', {name:'文件内容编辑'}).fill('# Edited\n');
+  assert.equal(await page.evaluate(() => window.testDisk()), '# Hello\r\n', 'typing must not save');
   await page.getByRole('textbox', {name:'文件内容编辑'}).press('Control+s');
   await page.getByRole('button', {name:'已保存',exact:true}).waitFor();
   console.log('saved');
@@ -107,12 +126,11 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   assert.deepEqual(await page.evaluate(() => window.testDirectories()), ['', 'src'], 'expand loads only selected directory and reuses root cache');
   await page.getByRole('treeitem', {name:'main.ts',exact:true}).click();
   assert.equal(await page.getByRole('tab').count(), 2);
-  await page.getByRole('button', {name:'编辑',exact:true}).click();
   await page.getByRole('textbox', {name:'文件内容编辑'}).fill('const changed = 2;\n');
   await page.getByRole('tab', {name:/README.md/}).click();
   await page.getByRole('heading', {name:'Draft'}).waitFor();
   await page.getByRole('tab', {name:/main.ts/}).click();
-  assert.equal(await page.getByRole('textbox', {name:'文件内容编辑'}).inputValue(), 'const changed = 2;\n');
+  assert.equal(await page.evaluate(() => window.testCode().state.doc.toString()), 'const changed = 2;\n');
   const readsBefore = await page.evaluate(() => window.testReads().length);
   await page.getByRole('button', {name:'选择项目文件',exact:true}).click();
   await page.getByRole('treeitem', {name:'main.ts',exact:true}).click();
@@ -137,22 +155,161 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   await page.getByRole('button', {name:'关闭文件面板'}).click();
   await page.getByRole('button', {name:'打开面板'}).click();
   await page.getByRole('region', {name:'会话产物'}).getByRole('button', {name:'README.md'}).click();
-  assert.equal(await page.getByRole('textbox', {name:'文件内容编辑'}).inputValue(), '# Draft\n');
+  assert.equal(await page.evaluate(() => window.testCode().state.doc.toString()), '# Draft\n');
   console.log('draft restored');
   await page.evaluate(() => window.changeDisk());
   await page.getByRole('button', {name:'保存',exact:true}).click();
   await page.getByRole('alert').filter({hasText:'外部修改'}).waitFor();
   console.log('conflict protected');
-  assert.equal(await page.getByRole('textbox', {name:'文件内容编辑'}).inputValue(), '# Draft\n');
+  assert.equal(await page.evaluate(() => window.testCode().state.doc.toString()), '# Draft\n');
   assert.equal(await page.evaluate(() => window.testDisk()), '# external\r\n');
   await page.getByRole('button', {name:'选择项目文件',exact:true}).click();
   await page.locator('.workspace-tree .workspace-type-icon.folder').waitFor();
   await page.locator('.workspace-tree .workspace-type-icon.image').waitFor();
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('nova:preview-file', {detail: {path:'large.rs'}})));
+  await page.getByRole('tab', {name:'large.rs',exact:true}).waitFor();
+  await page.waitForFunction(() => document.querySelector('.cm-line span'));
+  assert.ok(await page.locator('.cm-line').count() < 200, 'long files render only the viewport');
+  assert.ok(await page.locator('.cm-lineNumbers .cm-gutterElement').count() > 1, 'line numbers are visible');
+  assert.equal(await page.evaluate(() => window.testCode().state.doc.lines), 5001);
+  const wrapped = await page.locator('.cm-line').first().evaluate(el => ({height:el.getBoundingClientRect().height,lineHeight:parseFloat(getComputedStyle(el).lineHeight)}));
+  assert.ok(wrapped.height > wrapped.lineHeight * 2, 'long source line soft-wraps');
+  assert.equal(await page.evaluate(() => window.testCode().state.doc.lines), 5001, 'soft wrap does not insert newlines');
+  assert.ok(await page.locator('.cm-line span').evaluateAll(spans => spans.some(el => getComputedStyle(el).color !== getComputedStyle(el.closest('.cm-content')).color)), 'Rust syntax is colored');
+  const minimap = page.locator('[aria-label="代码缩略图"]');
+  await minimap.waitFor();
+  await page.waitForFunction(() => {
+    const canvas = document.querySelector('.workspace-minimap canvas');
+    if (!canvas || canvas.height < 100) return false;
+    const {width, height} = canvas;
+    const pixels = canvas.getContext('2d').getImageData(0, 0, width, height).data;
+    let blankRows = 0;
+    for (let y = 0; y < height; y++) {
+      let painted = false;
+      for (let x = 0; x < width; x++) if (pixels[(y * width + x) * 4 + 3]) { painted = true; break; }
+      if (!painted) blankRows++;
+    }
+    return blankRows > height * .35 && blankRows < height * .9;
+  });
+  const mapBounds = await minimap.boundingBox();
+  await minimap.click({position:{x:mapBounds.width / 2,y:mapBounds.height * .8}});
+  await page.waitForFunction(() => window.testCode().scrollDOM.scrollTop > 0);
+  for (const fraction of [.2, .85, .45]) {
+    await minimap.click({position:{x:mapBounds.width / 2,y:mapBounds.height * fraction}});
+    await page.waitForFunction(fraction => {
+      const view = window.testCode();
+      const target = view.state.doc.line(Math.floor(fraction * view.state.doc.lines) + 1);
+      if (Math.abs(view.state.doc.lineAt(view.state.selection.main.head).number - target.number) > 1) return false;
+      const position = view.coordsAtPos(target.from);
+      const bounds = view.scrollDOM.getBoundingClientRect();
+      return position && Math.abs((position.top + position.bottom - bounds.top - bounds.bottom) / 2) < view.defaultLineHeight * 4;
+    }, fraction);
+  }
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('nova:preview-file', {detail: {path:'large.rs',line:4900}})));
+  await page.waitForFunction(() => window.testCode().state.doc.lineAt(window.testCode().state.selection.main.head).number === 4900);
+  await page.waitForFunction(() => [...document.querySelectorAll('.cm-line')].some(el => el.textContent.includes('fn line_4898')));
+  assert.ok(await page.locator('.cm-line').count() < 200, 'line reveal remains virtualized');
+  await page.waitForFunction(() => [...document.querySelectorAll('.cm-line span')].some(el => el.textContent === 'fn'));
+  if (process.env.TEST_SCREENSHOT) await page.screenshot({ path: process.env.TEST_SCREENSHOT });
   await page.setViewportSize({width:700,height:800});
+  assert.ok(await page.locator('.cm-scroller').evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'narrow editor has no horizontal overflow');
   const panel = await page.locator('.workspace-panel').boundingBox();
   assert.ok(panel.x >= 0 && panel.x + panel.width <= 701);
+  // A medium file previously occupied only the top half of the fixed-scale minimap.
+  await page.evaluate(() => {
+    const view = window.testCode();
+    view.dispatch({changes: {from:0,to:view.state.doc.length,insert:Array.from({length:120}, (_, i) => `fn medium_${i}() { let value = "hello"; }`).join('\n')}});
+  });
+  await page.setViewportSize({width:700,height:1000});
+  await page.waitForFunction(() => {
+    const canvas = document.querySelector('.workspace-minimap canvas');
+    if (!canvas || Math.abs(canvas.height - canvas.clientHeight * devicePixelRatio) > 1) return false;
+    const pixels = canvas.getContext('2d').getImageData(0, Math.floor(canvas.height * .99), canvas.width, Math.max(1, Math.floor(canvas.height * .01))).data;
+    return pixels.some((value, index) => index % 4 === 3 && value > 0);
+  });
+  const fullMapBounds = await minimap.boundingBox();
+  await minimap.click({position:{x:fullMapBounds.width / 2,y:fullMapBounds.height * .98}});
+  await page.waitForFunction(() => {
+    const scroll = window.testCode().scrollDOM;
+    return scroll.scrollTop >= (scroll.scrollHeight - scroll.clientHeight) * .95;
+  });
+  await minimap.press('Home');
+  await page.waitForFunction(() => window.testCode().scrollDOM.scrollTop === 0);
+  await minimap.press('End');
+  await page.waitForFunction(() => {
+    const map = document.querySelector('.workspace-minimap').getBoundingClientRect();
+    const overlay = document.querySelector('.workspace-minimap-viewport').getBoundingClientRect();
+    return Math.abs(map.bottom - overlay.bottom) < 3;
+  });
+  if (process.env.TEST_SCREENSHOT) await page.screenshot({path:process.env.TEST_SCREENSHOT});
+  await page.evaluate(() => {
+    const view = window.testCode();
+    view.dispatch({changes:{from:0,to:view.state.doc.length,insert:Array.from({length:600}, (_, i) => `// line ${i} ` + 'wrapped '.repeat(i % 7 === 0 ? 100 : 3)).join('\n')}});
+  });
+  const jumpBounds = await minimap.boundingBox();
+  for (const fraction of [.15, .8, .35]) {
+    await minimap.click({position:{x:jumpBounds.width / 2,y:jumpBounds.height * fraction}});
+    await page.waitForFunction(fraction => {
+      const view = window.testCode();
+      const line = view.state.doc.lineAt(view.state.selection.main.head);
+      if (Math.abs(line.number - (Math.floor(fraction * view.state.doc.lines) + 1)) > 1) return false;
+      const position = view.coordsAtPos(line.from);
+      const bounds = view.scrollDOM.getBoundingClientRect();
+      return position && Math.abs((position.top + position.bottom - bounds.top - bounds.bottom) / 2) < view.defaultLineHeight * 3;
+    }, fraction);
+  }
+  for (const theme of ['ink-dark', 'ink-light']) {
+    await page.evaluate(theme => {
+      document.documentElement.dataset.theme = theme;
+      const view = window.testCode();
+      const from = view.state.selection.main.head;
+      view.dispatch({selection:{anchor:from,head:view.state.doc.line(view.state.doc.lineAt(from).number + 3).to}});
+      view.focus();
+    }, theme);
+    await page.locator('.cm-selectionBackground').first().waitFor();
+    const colors = await page.locator('.cm-selectionBackground').first().evaluate(el => {
+      const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1;
+      const ctx = canvas.getContext('2d');
+      const rgba = color => {ctx.clearRect(0,0,1,1);ctx.fillStyle=color;ctx.fillRect(0,0,1,1);return [...ctx.getImageData(0,0,1,1).data];};
+      return {selection:rgba(getComputedStyle(el).backgroundColor),panel:rgba(getComputedStyle(document.querySelector('.workspace-panel')).backgroundColor),editor:rgba(getComputedStyle(document.querySelector('.cm-editor')).backgroundColor)};
+    });
+    assert.ok(colors.selection[3] > 40 && colors.selection[3] < 90, `${theme}: selection uses translucent theme accent, not opaque default`);
+    assert.ok(colors.panel[3] > 195 && colors.panel[3] < 225, 'panel retains a subtle backdrop');
+    assert.equal(colors.editor[3], 0, 'editor must not obscure the translucent panel');
+    if (process.env.TEST_SCREENSHOT) await page.screenshot({path:process.env.TEST_SCREENSHOT.replace('.png', `-${theme}.png`)});
+  }
   assert.deepEqual(errors, []);
-  console.log('Workspace panel: lazy tree, cached navigation, multi-tab drafts, duplicate open, close protection, stale requests, save and conflict passed');
+  await page.evaluate(() => {
+    const view = window.testCode();
+    view.dispatch({changes:{from:0,to:view.state.doc.length,insert:'fn short() {}'}});
+  });
+  await page.waitForFunction(() => getComputedStyle(document.querySelector('.workspace-minimap')).display === 'none');
+  await page.setViewportSize({width:1280,height:820});
+  const divider = page.getByRole('separator', {name:'调整文件面板宽度'});
+  await divider.press('ArrowLeft');
+  const rememberedRatio = await page.evaluate(() => window.testLayout().widthRatio);
+  await page.getByRole('button', {name:'关闭文件面板'}).click();
+  await page.getByRole('button', {name:'打开面板'}).click();
+  assert.equal(await page.evaluate(() => window.testLayout().widthRatio), rememberedRatio);
+  await page.setViewportSize({width:1600,height:900});
+  await page.waitForFunction(ratio => Math.abs(document.querySelector('.workspace-panel').clientWidth - document.querySelector('.workspace-panel').parentElement.clientWidth * ratio) < 3, rememberedRatio);
+  await page.evaluate(() => window.showLayoutSettings());
+  await page.getByRole('checkbox', {name:'代码软换行',exact:true}).uncheck();
+  await page.getByRole('checkbox', {name:'超过一屏时显示代码缩略图'}).uncheck();
+  await page.getByRole('slider', {name:'侧栏宽度比例'}).fill('60');
+  await page.getByRole('spinbutton', {name:'窗口宽度',exact:true}).fill('1400');
+  await page.getByRole('button', {name:'应用窗口尺寸'}).click();
+  await page.getByRole('checkbox', {name:'最大化窗口',exact:true}).check();
+  await page.getByRole('checkbox', {name:'记住窗口大小、位置及最大化状态'}).uncheck();
+  assert.equal(await page.evaluate(() => window.testLayout().widthRatio), .6);
+  await page.getByRole('button', {name:'重置布局'}).click();
+  await page.waitForFunction(() => window.testLayout().widthRatio === null && window.testLayout().softWrap && window.testLayout().minimap && !window.testLayout().open);
+  assert.equal(await page.getByRole('spinbutton', {name:'窗口宽度',exact:true}).inputValue(), '1280');
+  assert.equal(await page.getByRole('checkbox', {name:'记住窗口大小、位置及最大化状态'}).isChecked(), true);
+  if (process.env.TEST_SCREENSHOT) await page.screenshot({path:process.env.TEST_SCREENSHOT.replace('.png','-settings.png')});
+  await page.evaluate(() => window.hideLayoutSettings());
+  assert.deepEqual(errors, []);
+  console.log('Workspace panel: virtualized Rust editor, highlighting, line numbers, soft wrap, minimap, line reveal, multi-tab drafts, explicit save and conflict passed');
 } finally {
   await browser?.close();
   server?.kill();

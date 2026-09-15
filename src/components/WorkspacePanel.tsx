@@ -2,8 +2,11 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { batch, createEffect, createMemo, createSignal, For, Match, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
+import { EditorView } from "@codemirror/view";
+import WorkspaceCode from "./WorkspaceCode";
 import { api } from "../ipc";
 import { state } from "../store";
+import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
 import { collectWorkspaceArtifacts } from "../workspaceArtifacts";
 import { absolutePath, createFileContextMenu } from "./FileContextMenu";
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconX, IconCopy, IconBrowser, IconGear, IconTerminal } from "./icons";
@@ -79,7 +82,18 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   let request = 0;
   let frame = 0;
   let panel!: HTMLElement;
+  let codeView: EditorView | undefined;
   let picker!: HTMLDivElement;
+  onMount(() => {
+    const restoreWidth = () => {
+      const available = panel.parentElement!.clientWidth;
+      setWidth(Math.min(available * .7, Math.max(300, workspaceLayout.widthRatio === null ? 480 : available * workspaceLayout.widthRatio)));
+    };
+    createEffect(restoreWidth);
+    const observer = new ResizeObserver(restoreWidth);
+    observer.observe(panel.parentElement!);
+    onCleanup(() => observer.disconnect());
+  });
   onCleanup(() => { request++; cancelAnimationFrame(frame); });
   const dismissPicker = (event: PointerEvent) => {
     if (!(event.target as HTMLElement).closest('.workspace-picker, .workspace-picker-toggle')) setBrowse(false);
@@ -105,11 +119,10 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const snapshot = () => {
     const file = preview();
     if (!file) return;
-    const editor = panel.querySelector<HTMLTextAreaElement>('.workspace-editor');
-    const scroll = editor ?? panel.querySelector<HTMLElement>('.workspace-preview');
+    const scroll = codeView?.scrollDOM ?? panel.querySelector<HTMLElement>('.workspace-preview');
     setTabs(all => all.map(tab => tab.file.path === file.path ? {
       file, original: original(), draft: draft(), editing: editing(), source: source(), saved: saved(), error: error(),
-      scroll: scroll?.scrollTop ?? 0, start: editor?.selectionStart ?? 0, end: editor?.selectionEnd ?? 0,
+      scroll: scroll?.scrollTop ?? 0, start: codeView?.state.selection.main.anchor ?? 0, end: codeView?.state.selection.main.head ?? 0,
     } : tab));
   };
   const activate = (tab: FileTab) => {
@@ -119,10 +132,9 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     });
     queueMicrotask(() => {
       if (preview()?.path !== tab.file.path) return;
-      const editor = panel.querySelector<HTMLTextAreaElement>('.workspace-editor');
-      const scroll = editor ?? panel.querySelector<HTMLElement>('.workspace-preview');
+      const scroll = codeView?.scrollDOM ?? panel.querySelector<HTMLElement>('.workspace-preview');
+      codeView?.dispatch({ selection: { anchor: tab.start, head: tab.end } });
       if (scroll) scroll.scrollTop = tab.scroll;
-      if (editor) editor.setSelectionRange(tab.start, tab.end);
     });
   };
   const selectTab = (path: string) => {
@@ -152,14 +164,9 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     if (!Number.isSafeInteger(line) || line! < 1 || !preview()?.text) return;
     setSource(true);
     queueMicrotask(() => {
-      const editor = panel.querySelector<HTMLTextAreaElement>('.workspace-editor');
-      const scroll = editor ?? panel.querySelector<HTMLElement>('.workspace-preview');
-      if (!scroll) return;
-      const lines = draft().split('\n');
-      const index = Math.min(line! - 1, lines.length - 1);
-      if (editor) { const offset = lines.slice(0, index).reduce((sum, text) => sum + text.length + 1, 0); editor.setSelectionRange(offset, offset + lines[index].length); }
-      const content = editor ?? scroll.querySelector('pre') ?? scroll;
-      scroll.scrollTop = index * (parseFloat(getComputedStyle(content).lineHeight) || 22);
+      if (!codeView) return;
+      const target = codeView.state.doc.line(Math.min(line!, codeView.state.doc.lines));
+      codeView.dispatch({ selection: { anchor: target.from, head: target.to }, effects: EditorView.scrollIntoView(target.from, { y: 'start' }) });
     });
   };
   const open = async (path: string, reload = false, line?: number) => {
@@ -180,7 +187,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         if (duplicate && !reload) { activate(duplicate); revealLine(line); return; }
         const buffer = drafts.get(draftKey(result.path));
         const tab: FileTab = { file: buffer?.file ?? result, original: buffer?.file.text ?? result.text ?? '',
-          draft: buffer?.text ?? normalized(result.text ?? ''), editing: !!buffer, source: false, saved: false, error: '', scroll: 0, start: 0, end: 0 };
+          draft: buffer?.text ?? normalized(result.text ?? ''), editing: result.text != null, source: false, saved: false, error: '', scroll: 0, start: 0, end: 0 };
         setTabs(all => duplicate ? all.map(item => item === duplicate ? tab : item) : [...all, tab]);
         activate(tab);
         revealLine(line);
@@ -269,7 +276,13 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     return `${preview()!.path.replace(/[\\/][^\\/]*$/, "")}/${path}`;
   }
   const label = (path: string) => path.split(/[\\/]/).pop() || path;
-  const resize = (value: number) => setWidth(Math.max(300, Math.min(value, panel.parentElement!.clientWidth * 0.7)));
+  const resize = (value: number) => {
+    const available = panel.parentElement!.clientWidth;
+    if (!available) return;
+    const next = Math.min(available * .7, Math.max(300, value));
+    setWidth(next);
+    setWorkspaceLayout({ widthRatio: next / available });
+  };
   return <aside ref={panel} class="workspace-panel" style={{ width: `${width()}px` }} aria-label="产物与项目文件"
     onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); void save(); } }}>
     <div class="workspace-resize" role="separator" aria-label="调整文件面板宽度" aria-orientation="vertical" tabindex="0"
@@ -365,10 +378,10 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
             else if (href && !/^(?:#|[a-z][a-z\d+.-]*:)/i.test(href)) void open(relative(href));
           }} /></Match>
           <Match when={file.kind === "html" && !source()}><iframe title={label(file.path)} sandbox="allow-scripts" referrerpolicy="no-referrer" srcdoc={`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; form-action 'none';">${draft()}`} /></Match>
-          <Match when={file.text !== null}><pre>{draft()}</pre></Match>
+          <Match when={file.text !== null}><WorkspaceCode path={file.path} text={draft()} readOnly onChange={changeDraft} onView={view => { codeView = view; }} /></Match>
         </Switch>
       </div>}>
-        <textarea class="workspace-editor" aria-label="文件内容编辑" value={draft()} readOnly={saving()} spellcheck={false} wrap="off" onInput={e => changeDraft(e.currentTarget.value)} />
+        <WorkspaceCode path={file.path} text={draft()} readOnly={saving()} onChange={changeDraft} onView={view => { codeView = view; }} />
       </Show>
       <footer class="workspace-status"><span>{dirty() ? "未保存 · 草稿保留至应用退出" : saved() ? "已保存到文件" : ""}</span><span>{Math.ceil((file.text !== null ? new TextEncoder().encode(original()).length : file.size) / 1024)} KB{file.text !== null ? " · UTF-8" : ""}</span></footer>
     </>}</Show>

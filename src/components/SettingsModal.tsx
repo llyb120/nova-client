@@ -4,6 +4,7 @@ import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog"
 import * as QRCode from "qrcode";
 import { createEffect, createMemo, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
+import AppearanceLayoutSettings from './AppearanceLayoutSettings';
 import {
   ALL_AGENT_KINDS,
   checkAndStageUpdate,
@@ -2056,6 +2057,7 @@ export function SettingsModal(props: { onClose: () => void }) {
               </div>
               <span class="field-hint">明暗两套主题互为镜像、即点即换，选择会自动记住。</span>
             </div>
+            <AppearanceLayoutSettings />
           </Show>
 
           {/* ===== 团队 ===== */}

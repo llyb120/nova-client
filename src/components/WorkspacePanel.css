@@ -51,7 +51,7 @@
 .workspace-actions > div { position: absolute; right: 0; top: 100%; z-index: 6; min-width: 140px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 5px 20px #0003; padding: 4px; }
 .workspace-actions > div > button { display: flex; width: 100%; justify-content: flex-start; }
 /* Explicit flex sizing prevents global button/span styles from wrapping the chevron. */
-.workspace-panel { font-size: 13px; }
+.workspace-panel { font-size: 13px; background: color-mix(in srgb, var(--bg) 82%, transparent); }
 .workspace-panel button { font-size: 13px; line-height: 20px; }
 .workspace-panel .workspace-breadcrumb { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; }
 .workspace-breadcrumb > svg { display: block; flex: 0 0 auto; }
@@ -67,3 +67,22 @@
 .workspace-artifact-strip button { flex-shrink: 0; max-width: 180px; }
 .workspace-artifact-strip button > span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .workspace-artifact-empty { color: var(--text-muted); font-size: 12px; }
+.workspace-code { display: flex; flex: 1; min-height: 0; min-width: 0; overflow: hidden; --code-keyword: #c792ea; --code-string: #a3ce91; --code-number: #e6b17e; --code-type: #78c6d0; --code-function: #8bb9ef; }
+.workspace-code-editor { flex: 1; min-width: 0; min-height: 0; }
+.workspace-minimap { position: relative; flex: 0 0 72px; overflow: hidden; color: var(--text-muted); border-left: 1px solid var(--border); cursor: pointer; touch-action: none; }
+.workspace-minimap canvas { display: block; width: 100%; height: 100%; position: absolute; inset: 0; }
+.workspace-minimap-viewport { position: absolute; left: 0; right: 0; background: color-mix(in srgb, var(--accent) 18%, transparent); border: 1px solid var(--accent); pointer-events: none; }
+.workspace-minimap:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+:root[data-theme="ink-light"] .workspace-code { --code-keyword: #8041ad; --code-string: #28703b; --code-number: #a04b12; --code-type: #147580; --code-function: #225ca5; }
+.workspace-preview:has(> .workspace-code) { display: flex; overflow: hidden; padding: 0; }
+.workspace-code .cm-editor { height: 100%; background: transparent; color: var(--text); }
+.workspace-code .cm-scroller { overflow-y: auto; overflow-x: hidden; font-family: var(--mono); font-size: 14px; line-height: 1.65; }
+.workspace-code.workspace-code-nowrap .cm-scroller { overflow-x: auto; }
+.workspace-code .cm-content { padding: 10px 0; caret-color: var(--text); }
+.workspace-code .cm-line { padding: 0 10px; }
+.workspace-code .cm-gutters { background: color-mix(in srgb, var(--bg) 70%, transparent); color: var(--text-muted); border-right: 1px solid var(--border); }
+.workspace-code .cm-activeLine, .workspace-code .cm-activeLineGutter { background: var(--bg-hover); }
+.workspace-code .cm-cursor { border-left-color: var(--text); }
+.workspace-code .cm-editor > .cm-scroller > .cm-selectionLayer .cm-selectionBackground,
+.workspace-code .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground { background: color-mix(in srgb, var(--accent) 24%, transparent); }
+.workspace-code .cm-panels { background: var(--bg-panel); color: var(--text); }

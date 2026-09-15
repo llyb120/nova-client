@@ -2,6 +2,7 @@ import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, lazy, onCleanup, onMount, Show, Suspense, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
 import { api } from "../ipc";
+import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
 import { buildTimeNotesPrompt } from "../builtinPrompts";
 import {
   compactThread,
@@ -226,9 +227,10 @@ function TranscriptSegment(props: TranscriptSegmentProps) {
 }
 
 export function ChatView() {
-  const [workspaceOpen, setWorkspaceOpen] = createSignal(false);
+  const workspaceOpen = () => workspaceLayout.open;
+  const setWorkspaceOpen = (open: boolean) => setWorkspaceLayout({ open });
   const [workspaceRequest, setWorkspaceRequest] = createSignal<{ path: string; line?: number } | null>(null);
-  createEffect(() => { state.currentId; setWorkspaceRequest(null); setWorkspaceOpen(false); });
+  createEffect(() => { state.currentId; setWorkspaceRequest(null); });
   const previewFile = (event: Event) => {
     const detail = (event as CustomEvent<string | { path: string; line?: number }>).detail;
     const target = typeof detail === 'string' ? { path: detail } : detail;
