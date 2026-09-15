@@ -34,6 +34,7 @@ mod sys_notify;
 mod threads;
 mod time_machine;
 mod updater;
+mod workspace_files;
 #[cfg(windows)]
 mod windows_shell_shim;
 
@@ -6013,6 +6014,10 @@ pub fn run() {
             delete_project_threads,
             open_in_editor,
             open_file_default,
+            workspace_files::list_workspace_directory,
+            workspace_files::preview_workspace_file,
+            workspace_files::save_workspace_file,
+            workspace_files::search_workspace_files,
             open_clue_attachment,
             read_local_attachment,
             save_clue_attachment,

@@ -3,6 +3,7 @@ import { marked } from "marked";
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createSignal, onCleanup, untrack } from "solid-js";
 import { api } from "../ipc";
+import { linkedFile, openWorkspaceFile } from "../workspaceLinks";
 import { state } from "../store";
 import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { advanceStreamText, STREAM_PREBUFFER_MS } from "../streamReveal";
@@ -140,8 +141,8 @@ function withFileReferences(html: string): string {
   for (const link of template.content.querySelectorAll<HTMLAnchorElement>("a[href]")) {
     const href = link.getAttribute("href") ?? "";
     if (/^(?:https?:|mailto:|#)/i.test(href)) continue;
-    const path = decodeURIComponent(href.replace(/^file:\/+/i, ""));
-    if (WHOLE_FILE_REFERENCE_RE.test(path)) link.replaceWith(fileReference(path));
+    const file = linkedFile(href);
+    if (file && WHOLE_FILE_REFERENCE_RE.test(file.path)) link.replaceWith(fileReference(file.path + (file.line ? `:${file.line}` : "")));
   }
 
   const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
@@ -319,7 +320,7 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
     const target = e.target as HTMLElement;
     const imagePath = target.closest<HTMLImageElement>("img[data-image-path]")?.dataset.imagePath;
     if (imagePath && state.currentId) {
-      void api.openFileDefault(state.currentId, imagePath).catch((err) => void message(String(err), { kind: "error" }));
+      openWorkspaceFile(imagePath);
       return;
     }
     const btn = target.closest<HTMLButtonElement>(".code-copy");
@@ -337,21 +338,23 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
     }
 
     const link = target.closest<HTMLAnchorElement>("a[href]");
-    const href = link?.href;
+    const href = link?.getAttribute("href");
     if (href && /^https?:\/\//i.test(href)) {
       e.preventDefault();
       void api.openUrl(href).catch((err) => console.error("open url failed", err));
       return;
     }
 
+    if (href) {
+      const file = linkedFile(href);
+      if (file) { e.preventDefault(); openWorkspaceFile(file.path, file.line); return; }
+    }
+
     const file = target.closest<HTMLButtonElement>(".md-file-ref");
     const path = file?.dataset.path;
     const id = state.currentId;
     if (!path || !id) return;
-    const action = IMAGE_FILE_RE.test(path)
-      ? api.openFileDefault(id, path)
-      : api.openInEditor(id, path, file.dataset.line ? Number(file.dataset.line) : undefined);
-    void action.catch((err) => void message(String(err), { kind: "error" }));
+    openWorkspaceFile(path, file.dataset.line ? Number(file.dataset.line) : undefined);
   };
 
   // md-seg 为 display:contents（不产生盒子），布局与单容器完全一致。

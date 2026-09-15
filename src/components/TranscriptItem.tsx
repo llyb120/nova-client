@@ -1,4 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { openWorkspaceFile } from "../workspaceLinks";
 import { createSignal, For, Match, Show, Switch } from "solid-js";
 import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
 import type { Item, PromptImage } from "../types";
@@ -126,6 +127,10 @@ function UserMessage(props: { item: Extract<Item, { type: "user" }> }) {
                     fallback={
                       <span
                         class="bubble-file"
+                        role="button"
+                        tabindex="0"
+                        onClick={() => { const path = attachmentPath(img); if (path) openWorkspaceFile(path); }}
+                        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); const path = attachmentPath(img); if (path) openWorkspaceFile(path); } }}
                         title={img.name}
                         onContextMenu={(event) => openAttachmentMenu(event, img)}
                       >
@@ -136,6 +141,7 @@ function UserMessage(props: { item: Extract<Item, { type: "user" }> }) {
                   >
                     <img
                       src={attachmentSrc(img)}
+                      onClick={() => { const path = attachmentPath(img); if (path) openWorkspaceFile(path); }}
                       alt={img.name}
                       title={img.name}
                       onContextMenu={(event) => openAttachmentMenu(event, img)}

@@ -6,6 +6,7 @@ import {
 import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { api } from "../ipc";
+import { linkedFile, openWorkspaceFile as openInEditor } from "../workspaceLinks";
 import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { LruMap } from "../lruMap";
@@ -521,8 +522,8 @@ function tokenizeInline(text: string): TextSegment[] {
     // 且闭合定界符后不接词字符。
     m = preOk && prevCh !== "_" ? rest.match(/^(?!__)_([^_\s](?:[^_]*[^_\s])?)_(?![\w_])/) : null;
     if (m) { flush(); tokens.push({ text: m[1], italic: true }); i += m[0].length; continue; }
-    m = rest.match(/^\[([^\]]+)\]\(([^)\s]+)\)/);
-    if (m) { flush(); tokens.push({ text: m[1], link: m[2] }); i += m[0].length; continue; }
+    m = rest.match(/^\[([^\]]+)\]\((?:<([^>]+)>|([^\s()]*(?:\([^()]*\)[^\s()]*)*))\)/);
+    if (m) { flush(); tokens.push({ text: m[1].replace(/`([^`]+)`/g, "$1"), link: m[2] ?? m[3] }); i += m[0].length; continue; }
     buf += text[i]; i++;
   }
   flush();
@@ -665,22 +666,28 @@ function layoutMdTable(
   }
   const cellLines: string[][][] = [];
   const cellSeps: string[][][] = [];
+  const cellLinks: (string | undefined)[][][][] = [];
   const rowHeights: number[] = [];
   for (let r = 0; r < rows.length; r++) {
     const fw = r === 0 ? "600" : "400";
     const linesPerCell: string[][] = [];
     const sepsPerCell: string[][] = [];
+    const linksPerCell: (string | undefined)[][][] = [];
     let maxLines = 1;
     for (let c = 0; c < colCount; c++) {
       const plain = segmentsPlainText(rows[r][c]?.segments || []);
       const maxW = Math.max(1, colWidths[c] - TABLE_PAD_X * 2);
       const { lines, seps } = wrapTextFull(plain, maxW, fs, p.sans, fw);
+      const styles = segmentCharStyles(rows[r][c]?.segments || []);
+      const wrapped = wrapTextIndexed(plain, maxW, fs, p.sans, fw);
+      linksPerCell.push(wrapped.map((line) => line.offsets.map((offset) => styles[offset]?.link)));
       linesPerCell.push(lines);
       sepsPerCell.push(seps);
       maxLines = Math.max(maxLines, lines.length);
     }
     cellLines.push(linesPerCell);
     cellSeps.push(sepsPerCell);
+    cellLinks.push(linksPerCell);
     rowHeights.push(maxLines * fs * TABLE_LH + TABLE_PAD_Y * 2);
   }
   const tableH = rowHeights.reduce((a, b) => a + b, 0);
@@ -690,7 +697,7 @@ function layoutMdTable(
     kind: "md-table", id: itemId, groupIdx: gi,
     x, y, w: tableW, h: tableH,
     text: plain, color, fontSize: fs, font: p.sans, selectable: true,
-    data: { rows, aligns, colWidths, cellLines, cellSeps, rowHeights, border: p.border },
+    data: { rows, aligns, colWidths, cellLines, cellSeps, cellLinks, rowHeights, border: p.border },
   });
   return y + tableH + 10;
 }
@@ -787,7 +794,7 @@ function drawToolIcon(ctx: CanvasRenderingContext2D, kind: string, x: number, y:
 
 // ─── Block types ─────────────────────────────────────────────────────────────
 
-interface TextLine { text: string; x: number; y: number; w: number; offset: number; fs: number; lh: number; bold?: boolean; italic?: boolean; code?: boolean; link?: string; charX?: number[]; sepAfter?: string;
+interface TextLine { text: string; x: number; y: number; w: number; offset: number; fs: number; lh: number; bold?: boolean; italic?: boolean; code?: boolean; link?: string; charX?: number[]; charLinks?: (string | undefined)[]; sepAfter?: string;
   /** markdown 表格单元格坐标（行/列）：复制时按可视行重组成表格结构 */
   tRow?: number; tCol?: number; }
 interface Block {
@@ -962,11 +969,6 @@ function lineAtOffset(b: Block, offset: number): TextLine | null {
 }
 
 /** 在配置的编辑器中打开文件（带可选行号），失败弹错误（对齐 DOM ToolCallCard） */
-function openInEditor(path: string, line?: number) {
-  const id = state.currentId;
-  if (!id || !path) return;
-  void api.openInEditor(id, path, line).catch((e) => void message(String(e), { kind: "error" }));
-}
 
 // ─── Main component ──────────────────────────────────────────────────────────
 
@@ -1678,7 +1680,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               x, y, w: Math.min(proseW, 480), h: 300, title: segmentsPlainText(mb.segments),
               data: { src, filePath: path }, cursor: path ? "pointer" : undefined,
               clickAction: path ? () => {
-                if (props.threadId) void api.openFileDefault(props.threadId, path).catch((e) => void message(String(e), { kind: "error" }));
+                if (props.threadId) openInEditor(path);
               } : undefined });
             y += 310;
           }
@@ -1847,7 +1849,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             text: name, color: p.blue, fontSize: 11.5, font: p.mono,
             bg: p.panel, hoverBg: p.hover, borderRadius: 20, cursor: "pointer",
             selectable: false,
-            title: `在编辑器中打开 ${locPath}`,
+            title: `在侧栏中打开 ${locPath}`,
             data: { padX: 9, padY: 2, underlineOnHover: true, filePath: locPath },
             clickAction: () => openInEditor(locPath, loc.line ?? undefined) });
           lx += chipW + 6;
@@ -1866,7 +1868,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             text: relPath(diff.path), color: p.blue, fontSize: 11.5, lineHeight: 1.2, font: p.mono,
             bg: p.panel, border: p.border, borderRadius: [7, 7, 0, 0], hoverBg: p.hover,
             cursor: "pointer", selectable: false,
-            title: `在编辑器中打开 ${diff.path}`,
+            title: `在侧栏中打开 ${diff.path}`,
             data: { padX: 10, padY: 6, underlineOnHover: true, filePath: diff.path },
             clickAction: () => openInEditor(diff.path) });
           by += 26;
@@ -2534,6 +2536,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const charX = cachedCharXs[li];
       const lineW = cachedLineWidths![li];
       const lineEntry: TextLine = { text: line, x: startX, y: ty + scrollY, w: lineW, offset: globalOffset, fs, lh, charX,
+        charLinks: offsets.map((offset) => styleAt(offset).link),
         sepAfter: wrapped[li].hardBreak ? "\n" : wrapped[li].spaceBreak ? " " : "" };
       b.textLines.push(lineEntry);
 
@@ -2634,6 +2637,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const colWidths = (b.data?.colWidths as number[]) || [];
     const cellLines = (b.data?.cellLines as string[][][]) || [];
     const cellSeps = (b.data?.cellSeps as string[][][]) || [];
+    const cellLinks = (b.data?.cellLinks as (string | undefined)[][][][]) || [];
     const rowHeights = (b.data?.rowHeights as number[]) || [];
     const aligns = (b.data?.aligns as Array<"left" | "center" | "right">) || [];
     const border = (b.data?.border as string) || p.border;
@@ -2674,6 +2678,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               fs,
               lh: lineH,
               charX,
+              charLinks: cellLinks[r]?.[c]?.[li],
               sepAfter: cellSeps[r]?.[c]?.[li] ?? "\n",
               tRow: r,
               tCol: c,
@@ -2747,6 +2752,20 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             if (align === "center") tx = cellX + (cw - tw) / 2;
             else if (align === "right") tx = cellX + cw - TABLE_PAD_X - tw;
             fillTextCrisp(ctx, line, tx, textTop + li * lineH + halfLead);
+            const links = cellLinks[r]?.[c]?.[li] ?? [];
+            for (let start = 0; start < line.length;) {
+              let end = start + 1;
+              while (end < line.length && links[end] === links[start]) end++;
+              if (links[start]) {
+                const lx = tx + measure(line.slice(0, start), fs, ff, fw);
+                const ly = textTop + li * lineH + halfLead;
+                ctx.fillStyle = p.blue;
+                fillTextCrisp(ctx, line.slice(start, end), lx, ly);
+                ctx.fillRect(lx, ly + fs + 1, measure(line.slice(start, end), fs, ff, fw), 1);
+                ctx.fillStyle = b.color || p.text;
+              }
+              start = end;
+            }
           }
         }
         cellX += cw;
@@ -3009,6 +3028,21 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     return -1;
   }
 
+  function hitLink(clientX: number, clientY: number): string | undefined {
+    const idx = hitTest(clientX, clientY);
+    if (idx < 0) return;
+    const b = blocks[idx];
+    const rect = canvasEl.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top + scrollY + (b.data?.clipped ? blockScrolls.get(blockScrollKey(b)) || 0 : 0);
+    for (const line of b.textLines ?? []) {
+      if (y < line.y || y >= line.y + line.lh || !line.charX) continue;
+      for (let i = 0; i < line.text.length; i++) {
+        if (x >= line.x + line.charX[i] && x < line.x + line.charX[i + 1]) return line.charLinks?.[i];
+      }
+    }
+  }
+
   /**
    * 命中最近的文本位置（对齐 DOM 选区行为）：不要求指针精确落在行内，
    * 垂直方向取最近行、水平方向越界时收敛到行首/行尾，
@@ -3096,6 +3130,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       canvasEl.title = b?.title ?? "";
       requestPaint();
     }
+    const href = hitLink(e.clientX, e.clientY);
+    const b = idx >= 0 ? blocks[idx] : null;
+    canvasEl.style.cursor = href ? "pointer" : b?.cursor || (b?.selectable || !b?.clickAction ? "text" : "default");
+    canvasEl.title = href ?? b?.title ?? "";
   }
 
   function endScrollDrag() {
@@ -3281,6 +3319,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       selMoved = false;
       return;
     }
+    const href = hitLink(e.clientX, e.clientY);
+    if (href) {
+      if (/^https?:\/\//i.test(href)) {
+        void api.openUrl(href).catch((err) => void message(String(err), { kind: "error" }));
+      } else {
+        const file = linkedFile(href);
+        if (file && props.threadId) {
+          openInEditor(file.path, file.line);
+        }
+      }
+      return;
+    }
     const idx = hitTest(e.clientX, e.clientY);
     const b = idx >= 0 ? blocks[idx] : null;
     if (b?.clickAction && !selecting) {
@@ -3299,7 +3349,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   function onContextMenu(e: MouseEvent) {
     e.preventDefault();
     const idx = hitTest(e.clientX, e.clientY);
-    const path = idx >= 0 ? (blocks[idx].data?.filePath as string | undefined) : undefined;
+    const href = hitLink(e.clientX, e.clientY);
+    const path = (href ? linkedFile(href)?.path : undefined)
+      ?? (idx >= 0 ? (blocks[idx].data?.filePath as string | undefined) : undefined);
     if (path) fileMenu.open(e, path);
   }
 

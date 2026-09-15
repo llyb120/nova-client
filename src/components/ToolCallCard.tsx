@@ -1,7 +1,7 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { diffLines } from "diff";
 import { createEffect, createMemo, createSignal, For, Index, Match, onCleanup, Show, Switch } from "solid-js";
-import { api } from "../ipc";
+import { openWorkspaceFile as openInEditor } from "../workspaceLinks";
 import { isExpanded, state, toggleExpanded } from "../store";
 import type { ToolContent, ToolItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
@@ -9,12 +9,6 @@ import { createFileContextMenu } from "./FileContextMenu";
 import { relPath } from "./EditedFilesCard";
 import { IconCheck, IconChevron, IconCopy, toolIcon } from "./icons";
 
-/** 在配置的编辑器中打开文件（带可选行号），失败弹错误 */
-function openInEditor(path: string, line?: number) {
-  const id = state.currentId;
-  if (!id || !path) return;
-  void api.openInEditor(id, path, line).catch((e) => void message(String(e), { kind: "error" }));
-}
 
 const toolScrollPositions = new Map<string, number>();
 
@@ -181,7 +175,7 @@ function DiffView(props: {
         class="diff-path clickable"
         onClick={() => openInEditor(props.path)}
         onContextMenu={(event) => props.onFileContextMenu(event, props.path)}
-        title={`在编辑器中打开 ${props.path}`}
+        title={`在侧栏中打开 ${props.path}`}
       >
         {relPath(props.path)}
       </button>
@@ -362,7 +356,7 @@ export function ToolCallCard(props: { item: ToolItem; active?: boolean }) {
                 {(loc) => (
                   <button
                     class="loc-chip clickable"
-                    title={`在编辑器中打开 ${loc.path ?? ""}`}
+                    title={`在侧栏中打开 ${loc.path ?? ""}`}
                     onClick={() => openInEditor(loc.path ?? "", loc.line ?? undefined)}
                     onContextMenu={(event) => loc.path && fileMenu.open(event, loc.path)}
                   >

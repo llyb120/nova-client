@@ -1,5 +1,5 @@
 import { confirm, message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, For, lazy, onCleanup, onMount, Show, Suspense, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
 import { api } from "../ipc";
 import { buildTimeNotesPrompt } from "../builtinPrompts";
@@ -24,13 +24,15 @@ import type { AgentKind, Item, Thread, ThreadMeta, TimeMachineCheckpoint, TimeMa
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
-import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconStopwatch } from "./icons";
+import { IconBroadcast, IconCompress, IconDownload, IconFile, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { ShareModal } from "./ShareModal";
 import { TimeNotesModal } from "./TimeNotesModal";
 import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
+
+const WorkspacePanel = lazy(() => import("./WorkspacePanel"));
 
 interface VirtualObserverPool {
   intersectionObserver: IntersectionObserver;
@@ -224,6 +226,18 @@ function TranscriptSegment(props: TranscriptSegmentProps) {
 }
 
 export function ChatView() {
+  const [workspaceOpen, setWorkspaceOpen] = createSignal(false);
+  const [workspaceRequest, setWorkspaceRequest] = createSignal<{ path: string; line?: number } | null>(null);
+  createEffect(() => { state.currentId; setWorkspaceRequest(null); setWorkspaceOpen(false); });
+  const previewFile = (event: Event) => {
+    const detail = (event as CustomEvent<string | { path: string; line?: number }>).detail;
+    const target = typeof detail === 'string' ? { path: detail } : detail;
+    if (!target || typeof target.path !== "string" || !state.currentId) return;
+    setWorkspaceRequest(target);
+    setWorkspaceOpen(true);
+  };
+  onMount(() => window.addEventListener("nova:preview-file", previewFile));
+  onCleanup(() => window.removeEventListener("nova:preview-file", previewFile));
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
   let transcriptRef: CanvasTranscriptHandle | undefined;
@@ -1324,6 +1338,9 @@ export function ChatView() {
       </Show>
 
       <div class="chat-shell">
+        <Show when={state.currentId && roamingRole() !== "guest" && !workspaceOpen()}>
+          <button class="workspace-float-toggle" aria-label="打开文件与产物" title="文件与产物" onClick={() => setWorkspaceOpen(true)}><IconFile size={18} /></button>
+        </Show>
         <div class="chat-primary">
       <div class="chat-body">
         <Show
@@ -1405,7 +1422,12 @@ export function ChatView() {
       </footer>
         </div>
 
-      <Show when={showTimeMachine()}>
+      <Show when={workspaceOpen() && roamingRole() !== "guest"}>
+        <Show keyed when={state.currentId}>
+          {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
+        </Show>
+      </Show>
+      <Show when={showTimeMachine() && !workspaceOpen()}>
         <aside
           class="repo-time-machine"
           classList={{ collapsed: !timeMachineExpanded(), expanded: timeMachineExpanded() }}

@@ -2,6 +2,7 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { diffLines } from "diff";
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { api } from "../ipc";
+import { openWorkspaceFile as openFile } from "../workspaceLinks";
 import { isExpanded, state, toggleExpanded } from "../store";
 import type { Item, RevertChange, ToolContent } from "../types";
 import { createFileContextMenu } from "./FileContextMenu";
@@ -52,7 +53,7 @@ export function relPath(p: string): string {
   return p;
 }
 
-/** codex 风格「已编辑 N 个文件」卡片：路径点击用编辑器打开，支持撤销整轮改动 */
+/** codex 风格「已编辑 N 个文件」卡片：路径点击在侧栏打开，支持撤销整轮改动 */
 export function EditedFilesCard(props: { body: Item[]; undoneKey: string }) {
   const edits = createMemo(() => collectEdits(props.body));
   const fileMenu = createFileContextMenu();
@@ -70,11 +71,6 @@ export function EditedFilesCard(props: { body: Item[]; undoneKey: string }) {
     return { add, del };
   });
 
-  const openFile = (path: string) => {
-    const id = state.currentId;
-    if (!id) return;
-    void api.openInEditor(id, path).catch((e) => void message(String(e), { kind: "error" }));
-  };
 
   const revert = async () => {
     const id = state.currentId;
@@ -123,7 +119,7 @@ export function EditedFilesCard(props: { body: Item[]; undoneKey: string }) {
               class="files-row"
               onClick={() => openFile(e.path)}
               onContextMenu={(event) => fileMenu.open(event, e.path)}
-              title={`在编辑器中打开 ${e.path}`}
+              title={`在侧栏中打开 ${e.path}`}
             >
               <span class="files-path">{relPath(e.path)}</span>
               <span class="tool-stats">
