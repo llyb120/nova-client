@@ -93,7 +93,6 @@ impl AcpPrewarm {
         slot: &StdMutex<Option<Arc<Self>>>,
         cwd: &str,
         read_only: bool,
-        kind: &AgentKind,
     ) -> Option<Arc<AcpConn>> {
         let entry = {
             let slot = slot.lock().unwrap();
@@ -101,20 +100,18 @@ impl AcpPrewarm {
                 .filter(|s| s.cwd == cwd && s.read_only == read_only)?
                 .clone()
         };
-        // CodeBuddy 冷启动会重做 bundle/激活/初始化，不能用 250ms 截断已有进度。
-        // 等待任务自身的 ping、activate、initialize 超时结束；失败后仍可冷启动。
-        let ready = if *kind == AgentKind::CodeBuddy {
-            Ok(entry.conn.lock().await)
-        } else {
-            timeout(Duration::from_millis(250), entry.conn.lock()).await
-        };
+        // 冷启动要重做 spawn/initialize（CodeBuddy 还有 bundle/activate），短等截断会把
+        // 将就绪的预热进程杀掉再立刻重做同样的工作，比不预热更慢。等待任务自身的
+        // ping、activate、initialize 超时结束；预热失败释放锁后仍可回退冷启动。
+        let mut ready = entry.conn.lock().await;
         let mut slot = slot.lock().unwrap();
         if !slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, &entry)) {
             return None;
         }
         slot.take();
-        let conn = ready.ok()?.take();
-        conn.filter(|conn| conn.alive.load(Ordering::SeqCst))
+        ready
+            .take()
+            .filter(|conn| conn.alive.load(Ordering::SeqCst))
     }
 }
 
@@ -1202,13 +1199,7 @@ impl AcpManager {
         };
         let read_only = self.thread_is_read_only(conn_key);
         let warmed = if conn_key.starts_with("thread:") {
-            AcpPrewarm::take(
-                &self.prewarmed,
-                want_cwd.unwrap_or_default(),
-                read_only,
-                &self.kind,
-            )
-            .await
+            AcpPrewarm::take(&self.prewarmed, want_cwd.unwrap_or_default(), read_only).await
         } else {
             None
         };
@@ -5711,7 +5702,7 @@ mod acp_prewarm_tests {
     use super::*;
 
     #[tokio::test]
-    async fn prewarm_claim_is_matched_bounded_and_one_shot() {
+    async fn prewarm_claim_waits_inflight_matches_and_is_one_shot() {
         fn entry(cwd: &str, read_only: bool, alive: bool) -> Arc<AcpPrewarm> {
             let (tx, _rx) = mpsc::unbounded_channel();
             Arc::new(AcpPrewarm {
@@ -5733,64 +5724,23 @@ mod acp_prewarm_tests {
         }
         let first = entry("A", true, true);
         let slot = StdMutex::new(Some(first.clone()));
-        assert!(AcpPrewarm::take(&slot, "B", true, &AgentKind::Devin)
-            .await
-            .is_none());
-        assert!(AcpPrewarm::take(&slot, "A", false, &AgentKind::Devin)
-            .await
-            .is_none());
+        assert!(AcpPrewarm::take(&slot, "B", true).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
         assert!(slot.lock().unwrap().is_some());
-        assert!(AcpPrewarm::take(&slot, "A", true, &AgentKind::Devin)
-            .await
-            .is_some());
-        assert!(AcpPrewarm::take(&slot, "A", true, &AgentKind::Devin)
-            .await
-            .is_none());
+        assert!(AcpPrewarm::take(&slot, "A", true).await.is_some());
+        assert!(AcpPrewarm::take(&slot, "A", true).await.is_none());
 
         *slot.lock().unwrap() = Some(entry("A", false, false));
-        assert!(AcpPrewarm::take(&slot, "A", false, &AgentKind::Devin)
-            .await
-            .is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
         assert!(slot.lock().unwrap().is_none());
 
+        // 在飞预热晚于旧的 250ms 阈值才就绪，仍要等待并认领原连接，不能丢弃后冷启动。
         let pending = entry("A", false, true);
         let held = pending.conn.lock().await;
-        *slot.lock().unwrap() = Some(pending.clone());
-        assert!(timeout(
-            Duration::from_secs(2),
-            AcpPrewarm::take(&slot, "A", false, &AgentKind::Devin)
-        )
-        .await
-        .unwrap()
-        .is_none());
-        assert!(slot.lock().unwrap().is_none());
-        drop(held);
-
-        // 旧目录的等待结束时不能认领或清空后来发布的新目录。
-        let held = pending.conn.lock().await;
-        *slot.lock().unwrap() = Some(pending.clone());
-        let next = entry("B", false, true);
-        let (claimed, ()) = tokio::join!(
-            AcpPrewarm::take(&slot, "A", false, &AgentKind::Devin),
-            async {
-                sleep(Duration::from_millis(10)).await;
-                *slot.lock().unwrap() = Some(next.clone());
-                drop(held);
-            }
-        );
-        assert!(claimed.is_none());
-        assert!(Arc::ptr_eq(slot.lock().unwrap().as_ref().unwrap(), &next));
-        assert!(AcpPrewarm::take(&slot, "B", false, &AgentKind::Devin)
-            .await
-            .is_some());
-
-        // CodeBuddy 初始化晚于旧的 250ms 阈值，仍认领原连接，不能丢掉后冷启动。
-        let delayed = entry("A", false, true);
-        let held = delayed.conn.lock().await;
         let expected = held.as_ref().unwrap().clone();
-        *slot.lock().unwrap() = Some(delayed.clone());
+        *slot.lock().unwrap() = Some(pending.clone());
         let (claimed, ()) = tokio::join!(
-            AcpPrewarm::take(&slot, "A", false, &AgentKind::CodeBuddy),
+            AcpPrewarm::take(&slot, "A", false),
             async {
                 sleep(Duration::from_millis(350)).await;
                 drop(held);
@@ -5800,13 +5750,27 @@ mod acp_prewarm_tests {
         assert!(expected.alive.load(Ordering::SeqCst));
         assert!(slot.lock().unwrap().is_none());
 
+        // 旧目录的等待结束时不能认领或清空后来发布的新目录。
+        let held = pending.conn.lock().await;
+        *slot.lock().unwrap() = Some(pending.clone());
+        let next = entry("B", false, true);
+        let (claimed, ()) = tokio::join!(
+            AcpPrewarm::take(&slot, "A", false),
+            async {
+                sleep(Duration::from_millis(10)).await;
+                *slot.lock().unwrap() = Some(next.clone());
+                drop(held);
+            }
+        );
+        assert!(claimed.is_none());
+        assert!(Arc::ptr_eq(slot.lock().unwrap().as_ref().unwrap(), &next));
+        assert!(AcpPrewarm::take(&slot, "B", false).await.is_some());
+
         // 预热失败时释放等待并允许调用方回退，不返回空槽或死亡连接。
         let failed = entry("A", false, true);
         failed.conn.lock().await.take();
         *slot.lock().unwrap() = Some(failed);
-        assert!(AcpPrewarm::take(&slot, "A", false, &AgentKind::CodeBuddy)
-            .await
-            .is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
 
         // 槽替换/关闭即便撞上预热完成，最后一个条目引用释放时仍要杀掉未认领连接。
         let unused = entry("C", false, true);
@@ -5816,8 +5780,8 @@ mod acp_prewarm_tests {
 
         *slot.lock().unwrap() = Some(entry("D", false, true));
         let (a, b) = tokio::join!(
-            AcpPrewarm::take(&slot, "D", false, &AgentKind::Devin),
-            AcpPrewarm::take(&slot, "D", false, &AgentKind::Devin)
+            AcpPrewarm::take(&slot, "D", false),
+            AcpPrewarm::take(&slot, "D", false)
         );
         assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
     }
