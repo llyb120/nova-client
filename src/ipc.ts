@@ -44,6 +44,10 @@ function fileUriPath(uri: string) {
 }
 
 export const api = {
+  workspaceGitStatus: (threadId: string) =>
+    invoke<{ repo: string; files: { path: string; oldPath: string | null; index: string; worktree: string }[] }>("workspace_git_status", { threadId }),
+  workspaceGitDiff: (threadId: string, path: string, staged: boolean) =>
+    invoke<string>("workspace_git_diff", { threadId, path, staged }),
   listWorkspaceDirectory: (threadId: string, path: string) =>
     invoke<{ entries: { name: string; path: string; directory: boolean }[]; truncated: boolean }>("list_workspace_directory", { threadId, path }),
   searchWorkspaceFiles: (threadId: string, query: string) =>

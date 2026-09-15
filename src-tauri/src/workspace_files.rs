@@ -5,10 +5,129 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-use tauri::State;
+use tauri::{Emitter, State};
 
 const TEXT_LIMIT: u64 = 256 * 1024;
 const ENTRY_LIMIT: usize = 500;
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GitEntry {
+    path: String,
+    old_path: Option<String>,
+    index: String,
+    worktree: String,
+}
+
+fn git_entries(repo: &str) -> Result<Vec<GitEntry>, String> {
+    let status = crate::gitwt::run_raw(
+        repo,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    let mut records = status.split('\0').filter(|s| !s.is_empty());
+    let mut entries = Vec::new();
+    while let Some(record) = records.next() {
+        if record.len() < 4 || !record.is_char_boundary(3) {
+            return Err("Git 状态格式无效".into());
+        }
+        let index = &record[..1];
+        let worktree = &record[1..2];
+        let old_path = if matches!(index, "R" | "C") || matches!(worktree, "R" | "C") {
+            Some(records.next().ok_or("Git 重命名记录不完整")?.to_string())
+        } else {
+            None
+        };
+        entries.push(GitEntry {
+            path: record[3..].into(),
+            old_path,
+            index: index.into(),
+            worktree: worktree.into(),
+        });
+    }
+    Ok(entries)
+}
+
+#[tauri::command]
+pub async fn workspace_git_status(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<serde_json::Value, String> {
+    let cwd = root(&state, &thread_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repo = crate::gitwt::run(
+            cwd.to_str().ok_or("路径编码无效")?,
+            &["rev-parse", "--show-toplevel"],
+        )?;
+        Ok(serde_json::json!({ "repo": repo, "files": git_entries(&repo)? }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn git_patch(repo: &str, path: &str, staged: bool) -> Result<String, String> {
+    // Validate against Git's own inventory, including deleted paths that cannot be canonicalized.
+    let entry = git_entries(repo)?
+        .into_iter()
+        .find(|e| e.path == path)
+        .ok_or("文件已不在 Git 变动列表中，请刷新")?;
+    if entry.index == "?" {
+        if staged {
+            return Err("未跟踪文件没有暂存差异".into());
+        }
+        let preview = read_preview(Path::new(repo), path)?;
+        return Ok(match preview.text {
+            Some(text) => format!(
+                "--- /dev/null\n+++ {}\n@@ -0,0 +1,{} @@\n{}",
+                path,
+                text.lines().count(),
+                text.split_inclusive('\n')
+                    .map(|line| format!("+{line}"))
+                    .collect::<String>()
+            ),
+            None => "二进制文件或文件超过预览上限，请打开文件查看".into(),
+        });
+    }
+    let mut args = vec![
+        "--literal-pathspecs",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--unified=1000000",
+    ];
+    if staged {
+        args.push("--cached");
+    }
+    args.extend(["--", path]);
+    if let Some(old) = entry.old_path.as_deref() {
+        args.push(old);
+    }
+    let patch = crate::gitwt::run_raw(repo, &args)?;
+    // ponytail: 单文件完整上下文最多 2 MB；更大差异改用按 hunk 分页。
+    if patch.len() > 2 * 1024 * 1024 {
+        return Err("差异超过 2 MB，请在外部编辑器查看".into());
+    }
+    Ok(patch)
+}
+
+#[tauri::command]
+pub async fn workspace_git_diff(
+    state: State<'_, AppState>,
+    thread_id: String,
+    path: String,
+    staged: bool,
+) -> Result<String, String> {
+    let cwd = root(&state, &thread_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repo = crate::gitwt::run(
+            cwd.to_str().ok_or("路径编码无效")?,
+            &["rev-parse", "--show-toplevel"],
+        )?;
+        git_patch(&repo, &path, staged)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 fn root(state: &AppState, id: &str) -> Result<PathBuf, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
@@ -308,6 +427,61 @@ pub async fn save_workspace_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn git_index_worktree_and_untracked_diffs() {
+        let dir = std::env::temp_dir().join(format!("nova-git-preview-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let repo = dir.to_str().unwrap();
+        crate::gitwt::run(repo, &["init"]).unwrap();
+        fs::write(dir.join("中文 file.txt"), "base\n").unwrap();
+        crate::gitwt::run(repo, &["add", "."]).unwrap();
+        assert!(git_patch(repo, "中文 file.txt", true)
+            .unwrap()
+            .contains("+base"));
+        crate::gitwt::run(
+            repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+        )
+        .unwrap();
+        fs::write(dir.join("中文 file.txt"), "staged\n").unwrap();
+        crate::gitwt::run(repo, &["add", "."]).unwrap();
+        fs::write(dir.join("中文 file.txt"), "working\n").unwrap();
+        fs::write(dir.join("new.txt"), "new\n").unwrap();
+        let entries = git_entries(repo).unwrap();
+        assert!(entries
+            .iter()
+            .any(|e| e.path == "中文 file.txt" && e.index == "M" && e.worktree == "M"));
+        let staged = git_patch(repo, "中文 file.txt", true).unwrap();
+        assert!(staged.contains("-base\n+staged\n"));
+        let working = git_patch(repo, "中文 file.txt", false).unwrap();
+        assert!(working.contains("-staged\n+working\n"));
+        assert!(git_patch(repo, "new.txt", false)
+            .unwrap()
+            .contains("+new\n"));
+        assert!(git_patch(repo, "../outside", false).is_err());
+        crate::gitwt::run(repo, &["restore", "--staged", "中文 file.txt"]).unwrap();
+        crate::gitwt::run(repo, &["mv", "中文 file.txt", "renamed.txt"]).unwrap();
+        assert!(git_entries(repo)
+            .unwrap()
+            .iter()
+            .any(|e| e.path == "renamed.txt" && e.old_path.as_deref() == Some("中文 file.txt")));
+        fs::remove_file(dir.join("renamed.txt")).unwrap();
+        assert!(git_patch(repo, "renamed.txt", true)
+            .unwrap()
+            .contains("rename to renamed.txt"));
+        assert!(git_patch(repo, "renamed.txt", false)
+            .unwrap()
+            .contains("-base"));
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn bounded_preview_and_workspace_boundary() {
         let root = std::env::temp_dir().join(format!("nova-preview-{}", uuid::Uuid::new_v4()));
