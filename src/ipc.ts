@@ -52,7 +52,7 @@ export const api = {
     invoke<{ path: string; kind: string; text: string | null; size: number }>("preview_workspace_file", { threadId, path }),
   saveWorkspaceFile: (threadId: string, path: string, original: string, text: string) =>
     invoke<void>("save_workspace_file", { threadId, path, original, text }),
-  imageCommandContext: (configured: boolean, images: PromptImage[] = []) => invoke<{ configPath: string; executable: string; models: string[]; referenceImages: string[] }>("image_command_context", { configured, images }),
+  imageCommandContext: (configured: boolean, images: PromptImage[] = []) => invoke<{ configPath: string; models: string[]; referenceImages: string[] }>("image_command_context", { configured, images }),
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
   loadThreads: () => invoke<[ThreadMeta[], Thread[]]>("load_threads"),
   getThread: (threadId: string) => invoke<Thread>("get_thread", { threadId }),

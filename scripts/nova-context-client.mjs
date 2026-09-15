@@ -28,7 +28,7 @@ async function requestOnce(config, method, root, params) {
       if (error) reject(error);
       else resolveResult(value);
     };
-    const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), CALL_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), ["generate_image", "edit_image"].includes(method) ? 610_000 : CALL_TIMEOUT_MS);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ token: config.token, method, root: resolve(root), params: params ?? {} })}\n`);
@@ -63,6 +63,7 @@ export async function callGlobalContextTool(method, root, params) {
     try {
       return await requestOnce(config, method, root, requestParams);
     } catch (error) {
+      if (["generate_image", "edit_image"].includes(method)) throw error;
       const code = error?.code;
       if (Date.now() >= deadline || !["ENOENT", "ECONNREFUSED", "EPIPE"].includes(code)) throw error;
       await wait(CONNECT_RETRY_MS);

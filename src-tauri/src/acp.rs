@@ -4227,7 +4227,7 @@ impl AcpManager {
         // browser 和目录切换均独立于上下文检索开关。
         if !browser_debug
             && !auto_change_project
-            && !state.settings.lock().unwrap().context_tools_enabled()
+            && state.context_service.endpoint().is_empty()
         {
             return Ok(json!([]));
         }
@@ -5051,6 +5051,10 @@ fn codebuddy_nova_tools_mcp_server_value(
     } else {
         meta["tools"] = json!({ "polaris": { "defer_loading": false } });
     }
+    if !read_only {
+        meta["tools"]["generate_image"] = json!({ "defer_loading": false });
+        meta["tools"]["edit_image"] = json!({ "defer_loading": false });
+    }
     json!({
         "name": "nova-tools",
         "command": node,
@@ -5326,6 +5330,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
     if polaris {
         tool_names.extend(["polaris"]);
     }
+    if !read_only { tool_names.extend(["generate_image", "edit_image"]); }
     if tool_names.is_empty() {
         let mut lines = vec![
             "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."
@@ -5337,9 +5342,10 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
         return lines.join("\n");
     }
     let tools = tool_names.join(", ");
-    let example =
-        r#"{"server_name":"nova-tools","tool_name":"polaris","arguments":{"query":"cursor"}}"#;
-    let call_example_name = "polaris";
+    let example = if polaris {
+        r#"{"server_name":"nova-tools","tool_name":"polaris","arguments":{"query":"cursor"}}"#
+    } else { r#"{"server_name":"nova-tools","tool_name":"generate_image","arguments":{"prompt":"图片描述"}}"# };
+    let call_example_name = if polaris { "polaris" } else { "generate_image" };
     let nova_tools_phrase = format!(
         "You have Nova MCP endpoints from server nova-tools ({tools}) plus Devin built-in tools. In this Devin version, {tools} are remote MCP tool names, NOT top-level callable Devin tools."
     );

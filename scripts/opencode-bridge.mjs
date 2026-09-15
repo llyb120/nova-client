@@ -378,7 +378,18 @@ async function main() {
   let opencode;
   try {
     const request = await readRequest(lines);
-    opencode = await createOpencode({ hostname: "127.0.0.1", port: 0, timeout: 10_000 });
+    const mcp = request.action === "prompt" && process.env.NOVA_EXECUTABLE && process.env.NOVA_CONTEXT_SERVICE_ENDPOINT
+      ? { "nova-tools": {
+        type: "local", command: [process.env.NOVA_EXECUTABLE, "__codex-mcp"], timeout: 610_000,
+        environment: {
+          NOVA_CONTEXT_SERVICE_ENDPOINT: process.env.NOVA_CONTEXT_SERVICE_ENDPOINT,
+          NOVA_CONTEXT_SERVICE_TOKEN: process.env.NOVA_CONTEXT_SERVICE_TOKEN,
+          NOVA_TOOLS_CWD: request.cwd,
+          NOVA_TOOLS_READ_ONLY: request.mode === "plan" ? "1" : "0",
+          NOVA_FAST_CONTEXT: process.env.NOVA_FAST_CONTEXT ?? "1",
+        },
+      } } : undefined;
+    opencode = await createOpencode({ hostname: "127.0.0.1", port: 0, timeout: 10_000, config: mcp ? { mcp } : undefined });
     const { client } = opencode;
     if (request.action === "prompt") {
       await runPrompt(client, lines, request);

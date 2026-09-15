@@ -56,7 +56,7 @@ fn thread_options(request: &Value, options: &Options) -> Value {
     if let Some(mcp) = mcp.as_mut() {
         mcp["env"]["NOVA_TOOLS_CWD"] = request["cwd"].clone();
         mcp["env"]["NOVA_TOOLS_READ_ONLY"] = json!(if read_only { "1" } else { "0" });
-        guidance.push(POLARIS_GUIDANCE);
+        if mcp["env"]["NOVA_FAST_CONTEXT"] != "0" { guidance.push(POLARIS_GUIDANCE); }
     }
     if !title {
         if !rtk.is_empty() {

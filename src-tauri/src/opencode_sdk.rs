@@ -604,6 +604,13 @@ impl OpenCodeSdkManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         command.env("NOVA_PONYTAIL", if ponytail { "1" } else { "0" });
+        {
+            let state = self.app.state::<AppState>();
+            command.env("NOVA_EXECUTABLE", std::env::current_exe().map_err(|e| e.to_string())?)
+                .env("NOVA_CONTEXT_SERVICE_ENDPOINT", state.context_service.endpoint())
+                .env("NOVA_CONTEXT_SERVICE_TOKEN", state.context_service.token())
+                .env("NOVA_FAST_CONTEXT", if state.settings.lock().unwrap().context_tools_enabled() { "1" } else { "0" });
+        }
         if !self.launch_env.is_empty() {
             crate::credential_roaming::isolate_borrowed_command(&mut command);
             command.envs(&self.launch_env);

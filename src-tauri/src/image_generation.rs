@@ -26,10 +26,11 @@ fn load_config(path: &Path) -> Result<Config, String> {
 /// 只向会话提供路径和模型列表，不把 Token 放入提示词。
 #[tauri::command]
 pub fn image_command_context(app: tauri::AppHandle, configured: bool, images: Option<Vec<crate::threads::PromptImage>>) -> Result<Value, String> {
-    let path = crate::nova_data_dir(&app).join("image-generation.json");
+    let dir = crate::nova_data_dir(&app);
+    let path = dir.join("image-generation.json");
     let models = if configured { load_config(&path)?.models } else { Vec::new() };
     let reference_images = reference_image_paths(&images.unwrap_or_default())?;
-    Ok(json!({ "configPath": path, "executable": std::env::current_exe().map_err(|e| e.to_string())?, "models": models, "referenceImages": reference_images }))
+    Ok(json!({ "configPath": path, "models": models, "referenceImages": reference_images }))
 }
 
 fn reference_image_paths(images: &[crate::threads::PromptImage]) -> Result<Vec<String>, String> {
@@ -49,7 +50,7 @@ fn reference_image_paths(images: &[crate::threads::PromptImage]) -> Result<Vec<S
     }).collect()
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Request {
     prompt: String,
@@ -62,6 +63,39 @@ struct Request {
 }
 
 fn auto_size() -> String { "auto".into() }
+
+pub fn tool_definitions() -> Vec<Value> {
+    serde_json::from_str(include_str!("../../scripts/image-tools.json")).expect("valid image tool schemas")
+}
+
+fn tool_request(root: &Path, name: &str, args: &Value, config: &Config) -> Result<Request, String> {
+    if !matches!(name, "generate_image" | "edit_image") { return Err("未知图片工具".into()); }
+    let mut args = args.as_object().cloned().ok_or("图片工具参数必须是对象")?;
+    if args.keys().any(|key| !["prompt", "model", "size", "outputDir", "referenceImages"].contains(&key.as_str())) {
+        return Err("图片工具含不支持的参数".into());
+    }
+    args.entry("model").or_insert_with(|| json!(config.models[0]));
+    args.entry("outputDir").or_insert_with(|| json!(root));
+    let mut request: Request = serde_json::from_value(Value::Object(args)).map_err(|_| "图片工具参数格式无效，请按工具 schema 提供 prompt 和图片路径")?;
+    if name == "edit_image" && request.reference_images.is_empty() {
+        return Err("edit_image 必须提供原图，referenceImages 首项为待编辑图片".into());
+    }
+    if request.output_dir.is_relative() { request.output_dir = root.join(&request.output_dir); }
+    for path in &mut request.reference_images {
+        if path.is_relative() { *path = root.join(&*path); }
+    }
+    Ok(request)
+}
+
+pub async fn execute_tool(config_dir: &Path, root: &Path, name: &str, args: &Value) -> Result<Value, String> {
+    let config = load_config(&config_dir.join("image-generation.json"))?;
+    let request = tool_request(root, name, args, &config)?;
+    let http = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(600)).build().map_err(|e| e.to_string())?;
+    let path = generate(&http, &config, &request).await?;
+    let path = path.to_string_lossy().trim_start_matches(r"\\?\").replace('\\', "/");
+    Ok(json!({ "path": path, "model": request.model, "markdown": format!("![图片](<{path}>)") }))
+}
 
 async fn generate(http: &reqwest::Client, config: &Config, request: &Request) -> Result<PathBuf, String> {
     if request.prompt.trim().is_empty() || request.prompt.len() > 32_000 {
@@ -105,17 +139,22 @@ async fn generate(http: &reqwest::Client, config: &Config, request: &Request) ->
         }
         http.post(format!("{base_url}/images/edits")).multipart(form)
     };
+    let started = std::time::Instant::now();
     let mut response = call.bearer_auth(&config.api_key).send().await
         .map_err(|e| format!("图片请求失败：{}", e.without_url()))?;
     let status = response.status();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| "图片响应读取失败")? {
-        if bytes.len() + chunk.len() > 64 * 1024 * 1024 { return Err("图片响应超过 64 MiB".into()); }
-        bytes.extend_from_slice(&chunk);
-    }
     if !status.is_success() {
         // 不回显上游原文，避免兼容网关在错误消息中反射凭据。
         return Err(format!("图片 API 返回 HTTP {status}，请检查 Token、模型和接口配置"));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        let reason = if error.is_timeout() { "读取超时" } else { "传输中断或响应解码失败" };
+        format!("图片响应读取失败：{reason}（HTTP {status}，耗时 {:.1}s，已接收 {} 字节）：{}；HTTP 成功不代表图片数据接收完整，未自动重试，请先检查服务端结果以免重复计费",
+            started.elapsed().as_secs_f64(), bytes.len(), error.without_url())
+    })? {
+        if bytes.len() + chunk.len() > 64 * 1024 * 1024 { return Err("图片响应超过 64 MiB".into()); }
+        bytes.extend_from_slice(&chunk);
     }
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| "图片 API 未返回有效 JSON")?;
     let data = value.pointer("/data/0/b64_json").and_then(Value::as_str).ok_or("接口未返回 Base64 图片，请确认支持 OpenAI Images API")?;
@@ -155,6 +194,24 @@ pub fn maybe_run() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_tools_default_model_and_require_original_for_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config { base_url: "http://localhost/v1".into(), api_key: "secret".into(), models: vec!["default-image".into()] };
+        let request = tool_request(root.path(), "generate_image", &json!({ "prompt": "cat" }), &config).unwrap();
+        assert_eq!(request.model, "default-image");
+        assert_eq!(request.output_dir, root.path());
+        for args in [json!({ "prompt": "cat" }), json!({ "prompt": "cat", "referenceImages": [] })] {
+            assert!(tool_request(root.path(), "edit_image", &args, &config).unwrap_err().contains("原图"));
+        }
+        let request = tool_request(root.path(), "edit_image", &json!({ "prompt": "blue background", "referenceImages": ["original.png"], "outputDir": "assets" }), &config).unwrap();
+        assert_eq!(request.reference_images, vec![root.path().join("original.png")]);
+        assert_eq!(request.output_dir, root.path().join("assets"));
+        assert!(tool_request(root.path(), "generate_image", &json!({ "prompt": "cat", "apiKey": "leak" }), &config).is_err());
+        let tools = tool_definitions();
+        assert_eq!(tools[1]["inputSchema"]["properties"]["referenceImages"]["minItems"], 1);
+    }
 
     #[tokio::test]
     async fn image_generation_validates_model_and_saves_only_valid_output() {
@@ -222,16 +279,74 @@ mod tests {
                 std::fs::write(&path, &png).unwrap();
                 request.reference_images.push(path);
             }
-            let result = generate(&http, &config, &request).await;
+            let settings = tempfile::tempdir().unwrap();
+            std::fs::write(settings.path().join("image-generation.json"), json!({ "baseURL": config.base_url, "apiKey": config.api_key, "models": ["second-image", "first-image"] }).to_string()).unwrap();
+            let result = execute_tool(settings.path(), root.path(), if reference_count == 0 { "generate_image" } else { "edit_image" }, &json!({
+                "prompt": request.prompt, "referenceImages": request.reference_images,
+            })).await;
             server.join().unwrap();
             assert_eq!(result.is_ok(), success);
             match result {
-                Ok(path) => assert_eq!(std::fs::read(path).unwrap(), png),
+                Ok(value) => {
+                    let path = value["path"].as_str().unwrap();
+                    assert_eq!(std::fs::read(path).unwrap(), png);
+                    assert_eq!(value["model"], "second-image");
+                    assert_eq!(value["markdown"], format!("![图片](<{path}>)"));
+                    assert!(!value.to_string().contains("secret-token"));
+                }
                 Err(error) => {
                     assert!(!error.contains("secret-token"));
                     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn image_response_errors_distinguish_http_truncation_and_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, stall, expected) in [
+            ("200 OK", false, "传输中断或响应解码失败"),
+            ("200 OK", true, "读取超时"),
+            ("502 Bad Gateway", false, "图片 API 返回 HTTP 502"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                let end = loop {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = request.windows(4).position(|v| v == b"\r\n\r\n") { break i + 4; }
+                };
+                let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                let length: usize = headers.lines().find_map(|v| v.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                while request.len() < end + length {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 1000\r\nConnection: close\r\n\r\nsecret-token").as_bytes()).await.unwrap();
+                if stall { std::future::pending::<()>().await; }
+            });
+            let config = Config { base_url: format!("http://{address}/v1"), api_key: "secret-token".into(), models: vec!["image".into()] };
+            let request = Request { prompt: "test".into(), model: "image".into(), size: "auto".into(), output_dir: root.path().into(), reference_images: vec![] };
+            let http = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(2)).build().unwrap();
+            let error = generate(&http, &config, &request).await.unwrap_err();
+            if stall { server.abort(); } else { server.await.unwrap(); }
+            assert!(error.contains(expected), "{error}");
+            if status == "200 OK" {
+                for detail in ["HTTP 200", "耗时", "已接收", "未自动重试"] {
+                    assert!(error.contains(detail), "{error}");
+                }
+            }
+            assert!(!error.contains("secret-token"), "{error}");
+            assert!(!error.contains(&address.to_string()), "{error}");
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         }
     }
 

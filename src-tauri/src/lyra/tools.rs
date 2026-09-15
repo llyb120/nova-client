@@ -135,6 +135,13 @@ pub fn tool_set(
         });
     }
     if !read_only {
+        for definition in crate::image_generation::tool_definitions() {
+            tools.push(Tool {
+                name: if definition["name"] == "edit_image" { "edit_image" } else { "generate_image" },
+                description: definition["description"].as_str().unwrap().into(),
+                parameters: schema(definition["inputSchema"].clone()),
+            });
+        }
         tools.push(Tool {
             name: "bash",
             description: BASH_DESCRIPTION.into(),
@@ -581,6 +588,13 @@ async fn execute_inner(
     screenshot_dir: Option<&Path>,
 ) -> ToolOutcome {
     match name {
+        "generate_image" | "edit_image" => {
+            if shell.is_none() { return ToolOutcome::error("当前为只读模式，图片工具不可用"); }
+            match crate::image_generation::execute_tool(&crate::lyra::config::nova_root(), root, name, args).await {
+                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
         "polaris" => {
             let code_root = root.to_path_buf();
             let memory_root = root.to_path_buf();
@@ -928,6 +942,20 @@ mod embedded_rtk_tests {
     };
     use crate::lyra::prompt::{ShellConfig, ShellKind};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn image_tools_work_without_polaris_and_are_blocked_in_read_only_mode() {
+        for read_only in [false, true] {
+            let tools = tool_set(read_only, false, false, false, false);
+            for name in ["generate_image", "edit_image"] {
+                assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, None, None).await;
+        assert!(result.is_error);
+        assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
+    }
 
     #[test]
     fn browser_rejects_non_http_schemes() {

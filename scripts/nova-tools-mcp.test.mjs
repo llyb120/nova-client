@@ -34,13 +34,17 @@ test("createNovaBatchTools exposes context tools only with the native service", 
     if (previousToken !== undefined) process.env.NOVA_CONTEXT_SERVICE_TOKEN = previousToken;
   }
   const tools = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }));
-  assert.deepEqual(Object.keys(tools).sort(), ["polaris"]);
+  assert.deepEqual(Object.keys(tools).sort(), ["edit_image", "generate_image", "polaris"]);
 });
 
 test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
   const previous = process.env.NOVA_FAST_CONTEXT;
   process.env.NOVA_FAST_CONTEXT = "0";
-  try { assert.deepEqual(createNovaBatchTools(process.cwd()), {}); }
+  try {
+    const tools = withContextService(() => createNovaBatchTools(process.cwd()));
+    assert.deepEqual(Object.keys(tools).sort(), ["edit_image", "generate_image"]);
+    assert.deepEqual(withContextService(() => createNovaBatchTools(process.cwd(), { readOnly: true })), {});
+  }
   finally {
     if (previous === undefined) delete process.env.NOVA_FAST_CONTEXT;
     else process.env.NOVA_FAST_CONTEXT = previous;
@@ -97,10 +101,11 @@ test("directory switching is session scoped, works without polaris, and updates 
       if (!line.includes("\n")) return;
       const request = JSON.parse(line.trim());
       calls.push(request);
+      if (request.params.prompt === "lost response") { socket.destroy(); return; }
       const rejected = request.params.path === "missing";
       socket.end(JSON.stringify(rejected
         ? { ok: false, error: "directory missing" }
-        : { ok: true, result: request.method === "polaris" ? "context" : { cwd: target, changed: true } }) + "\n");
+        : { ok: true, result: request.method === "polaris" ? "context" : request.method.endsWith("_image") ? { path: "C:/images/result.png" } : { cwd: target, changed: true } }) + "\n");
     });
   });
   try {
@@ -121,6 +126,14 @@ test("directory switching is session scoped, works without polaris, and updates 
     assert.deepEqual(calls.at(-1).params, { scope: "session-A", path: "../new project" });
     await tools.polaris.execute({ query: "Widget" });
     assert.equal(calls.at(-1).root, target);
+    const args = { prompt: "blue background", referenceImages: ["original.png"] };
+    assert.deepEqual(JSON.parse(await tools.edit_image.execute(args)), { path: "C:/images/result.png" });
+    assert.equal(calls.at(-1).method, "edit_image");
+    assert.equal(calls.at(-1).root, target);
+    assert.deepEqual(calls.at(-1).params, args);
+    const before = calls.length;
+    await assert.rejects(tools.generate_image.execute({ prompt: "lost response" }));
+    assert.equal(calls.length, before + 1);
   } finally {
     for (const key of ["NOVA_CONTEXT_SERVICE_ENDPOINT", "NOVA_CONTEXT_SERVICE_TOKEN", "NOVA_CWD_CHANGE_SCOPE"]) {
       if (previous[key] === undefined) delete process.env[key];

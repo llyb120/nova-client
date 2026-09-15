@@ -138,6 +138,14 @@ fn dispatch(
         ));
     }
     let mut params = request.params;
+    if matches!(request.method.as_str(), "generate_image" | "edit_image") {
+        // dispatch 已在阻塞工作线程运行；图片请求不阻塞常驻服务的其它连接。
+        return tokio::runtime::Builder::new_current_thread().enable_all().build()
+            .map_err(|e| e.to_string())?
+            .block_on(crate::image_generation::execute_tool(
+                &crate::lyra::config::nova_root(), root, &request.method, &params,
+            ));
+    }
     if request.method == "polaris" {
         if let Some(object) = params.as_object_mut() {
             object.insert("_contextMode".into(), Value::String("fast".into()));

@@ -1,3 +1,4 @@
+import imageTools from "./image-tools.json" with { type: "json" };
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
@@ -111,12 +112,19 @@ export function normalizePolarisArgs(params = {}) {
 export function createNovaBatchTools(cwd, options = {}) {
   const fastContext = fastContextEnabled(options);
   const browserDebug = browserDebugEnabled(options);
-  readOnlyEnabled(options);
+  const readOnly = readOnlyEnabled(options);
   let root = resolve(cwd);
   const browserSessionId = `nova-mcp-${process.pid}`;
 
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
   const tools = {};
+  if (!readOnly && globalContextServiceConfigured()) {
+    for (const definition of imageTools) {
+      tools[definition.name] = { ...definition,
+        execute: async (params) => JSON.stringify(await callGlobalContextTool(definition.name, root, params)),
+      };
+    }
+  }
 
   const cwdScope = process.env.NOVA_CWD_CHANGE_SCOPE;
   if (cwdScope && globalContextServiceConfigured()) {
@@ -203,16 +211,17 @@ export function novaDevinBatchToolPolicy(options = {}) {
   const fastContext = fastContextEnabled(options);
   const toolNames = [];
   if (fastContext) toolNames.push("polaris");
+  if (!readOnly && globalContextServiceConfigured()) toolNames.push("generate_image", "edit_image");
   if (toolNames.length === 0) {
     const lines = ["Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."];
     if (readOnly) lines.push("Current mode is plan/read-only: analyze only; do not modify files.");
     return lines.join("\n");
   }
-  const example = '{"server_name":"nova-tools","tool_name":"polaris","arguments":{"query":"cursor"}}';
+  const example = JSON.stringify({ server_name: "nova-tools", tool_name: fastContext ? "polaris" : "generate_image", arguments: fastContext ? { query: "cursor" } : { prompt: "图片描述" } });
   const novaToolsPhrase = toolNames.length
     ? `You have Nova MCP endpoints from server nova-tools (${toolNames.join(", ")}) plus Devin built-in tools. In this Devin version, ${toolNames.join(", ")} are remote MCP tool names, NOT top-level callable Devin tools.`
     : "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools.";
-  const callExampleName = "polaris";
+  const callExampleName = fastContext ? "polaris" : "generate_image";
   const lines = [
     `ROUTING RULE — before choosing any tool: Nova endpoints must NEVER be selected as direct tool calls. Select Devin's top-level mcp_call_tool first, then pass server_name="nova-tools" and the endpoint name in tool_name. ${novaToolsPhrase} Never select or invoke any of those names directly, even after mcp_list_tools lists them; a direct invocation produces \`Unknown tool ... This tool is not available.\` Your only valid execution path for a Nova tool is Devin's generic mcp_call_tool wrapper. Set server_name to the top-level string "nova-tools" (never omit it or put it inside arguments), and put only the selected Nova tool's inputs in arguments. Example: ${example}. Follow the wrapper's declared tool-name field if its schema uses a different spelling. The available Nova tools are already stated above; do not call mcp_list_tools merely to discover them. In every rule below, wording such as \`use/call ${callExampleName}\` means \`call mcp_call_tool with server_name nova-tools and tool_name ${callExampleName}\`; it never authorizes a direct tool call. If a direct call reports \`Unknown tool\`, retry once through mcp_call_tool. If parsing reports missing field \`server_name\`, correct the wrapper call once. Never repeat a malformed call unchanged. The following tool-selection rules are hard constraints.`,
     "Prefer minimal reads via Devin native read: when line ranges are known, read only those segments; expand nearby context only as needed. "

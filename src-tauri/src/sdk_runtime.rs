@@ -1531,17 +1531,18 @@ impl SdkManager {
             crate::windows_shell_shim::apply(&self.app, &mut command, &self.launch_env)
                 .map_err(|e| format!("应用 Windows shell shim 失败：{e}"))?;
         }
-        let polaris = if !title && settings.context_tools_enabled() {
+        let polaris = if !title {
             if state.context_service.endpoint().is_empty()
                 || state.context_service.token().is_empty()
             {
-                return Err("Polaris 已开启，但 Rust 上下文服务不可用".into());
+                return Err("Nova 工具服务不可用".into());
             }
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
             Some(
-                json!({"command":exe,"args":["__codex-mcp"],"required":true,"enabled":true,"env":{
+                json!({"command":exe,"args":["__codex-mcp"],"tool_timeout_sec":610,"required":true,"enabled":true,"env":{
                     "NOVA_CONTEXT_SERVICE_ENDPOINT":state.context_service.endpoint(),
-                    "NOVA_CONTEXT_SERVICE_TOKEN":state.context_service.token()
+                    "NOVA_CONTEXT_SERVICE_TOKEN":state.context_service.token(),
+                    "NOVA_FAST_CONTEXT":if settings.context_tools_enabled() { "1" } else { "0" }
                 }}),
             )
         } else {

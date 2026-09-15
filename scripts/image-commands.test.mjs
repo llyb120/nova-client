@@ -38,9 +38,9 @@ test("image commands are available to every backend and keep credentials out of 
     assert.ok(commands.includes("/generate-image"));
     assert.ok(commands.includes("/edit-image"));
   }
-  const prompt = prompts.buildGenerateImagePrompt("画一只猫", { configPath: "D:/My Data/image.json", executable: "D:/My Apps/Nova.exe", models: ["one", "two"], apiKey: "secret-token" });
-  assert.ok(prompt.includes('__generate_image'));
-  assert.ok(prompt.includes('["one","two"]'));
+  const prompt = prompts.buildGenerateImagePrompt("画一只猫", { models: ["one", "two"], apiKey: "secret-token" });
+  assert.ok(prompt.includes("generate_image"));
+  assert.ok(!prompt.includes("__generate_image"));
   assert.ok(!prompt.includes("secret-token"));
   assert.ok(prompts.buildSetupImagePrompt("", "D:/image.json").includes("/images/generations"));
 });
@@ -67,7 +67,7 @@ test("generate-image forwards reference attachments and includes their paths in 
   assert.doesNotThrow(() => assertBuiltinPrompt("/edit-image 修改上一张图的背景", []));
   assert.throws(() => assertBuiltinPrompt("/edit-image", images), /修改要求/);
   assert.throws(() => assertBuiltinPrompt("/edit-image test", [{ mimeType: "text/plain" }]), /PNG/);
-  const context = { configPath: "D:/config.json", executable: "D:/Nova.exe", models: ["image"], referenceImages: ["D:/My Images/参考.png"] };
+  const context = { configPath: "D:/config.json", models: ["image"], referenceImages: ["D:/My Images/参考.png"] };
   let delivered;
   const body = source.slice(source.indexOf("async function tryBuiltinPrompt("), source.indexOf("  const stage = parseStageInput(builtInInput);", source.indexOf("async function tryBuiltinPrompt("))) + "return false; }";
   const deps = { ...prompts, assertBuiltinPrompt, api: { imageCommandContext: async (configured, attachments) => {
@@ -79,23 +79,16 @@ test("generate-image forwards reference attachments and includes their paths in 
   assert.equal(await tryBuiltinPrompt("thread", "/generate-image 改成水彩", images), true);
   assert.deepEqual(delivered[2], images);
   assert.ok(delivered[1].includes(JSON.stringify(context.referenceImages)));
-  assert.ok(delivered[1].includes("/images/edits"));
-  assert.ok(delivered[1].includes("不能丢弃参考图退回文生图"));
-  assert.ok(delivered[1].includes("任务是生成新图"));
-  assert.ok(delivered[1].includes("不默认保留原图全部内容"));
-  assert.ok(!delivered[1].includes("任务是编辑原图"));
+  assert.ok(delivered[1].includes("generate_image"));
+  assert.ok(!delivered[1].includes("edit_image"));
   assert.equal(await tryBuiltinPrompt("thread", "/EDIT-IMAGE 把背景改为蓝色", images), true);
   assert.deepEqual(delivered[2], images);
   assert.ok(delivered[1].includes("目标：把背景改为蓝色"));
-  assert.ok(delivered[1].includes("任务是编辑原图"));
-  assert.ok(delivered[1].includes("只修改用户要求的部分"));
-  assert.ok(delivered[1].includes("修改项和保留项明确写入"));
-  assert.ok(delivered[1].includes("referenceImages 首项"));
-  assert.ok(delivered[1].includes("referenceImages 必须非空"));
-  assert.ok(!delivered[1].includes("任务是生成新图"));
+  assert.ok(delivered[1].includes("edit_image"));
+  assert.ok(!delivered[1].includes("generate_image"));
   const editWithoutAttachment = prompts.buildGenerateImagePrompt("修改上一张图", { ...context, referenceImages: [] }, "edit");
-  assert.ok(editWithoutAttachment.includes("没有可用原图时请用户提供，不得发起请求"));
-  assert.ok(!editWithoutAttachment.includes("没有参考图时 referenceImages 留空"));
+  assert.ok(editWithoutAttachment.includes("edit_image"));
+  assert.ok(editWithoutAttachment.includes("[]"));
 });
 
 test("canvas recognizes generated image blocks without swallowing them into prose or code", () => {

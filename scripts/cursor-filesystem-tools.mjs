@@ -1,3 +1,4 @@
+import { createNovaBatchTools } from "./nova-batch-tools.mjs";
 import { resolve } from "node:path";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
 import { callGlobalContextTool, globalContextServiceConfigured } from "./nova-context-client.mjs";
@@ -8,11 +9,13 @@ import { ponytailPrompt } from "./ponytail-prompt.mjs";
  * Exposes polaris; filesystem operations use Cursor built-ins.
  */
 export function createCursorFilesystemTools(cwd, options = {}) {
-  void options;
+  const { generate_image, edit_image } = createNovaBatchTools(cwd, { ...options, fastContext: false });
+  const images = generate_image ? { generate_image, edit_image } : {};
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0" && globalContextServiceConfigured();
   const root = resolve(cwd);
-  if (!fastContext) return {};
+  if (!fastContext) return images;
   return {
+    ...images,
     polaris: {
       description: POLARIS_DESCRIPTION,
       inputSchema: {
