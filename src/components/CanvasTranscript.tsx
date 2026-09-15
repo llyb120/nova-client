@@ -168,13 +168,23 @@ function pushTrimmedLine(lines: WrappedLine[], text: string, offsets: number[]) 
  * (e.g. first char of each `code` falls outside the pill).
  */
 function wrapTextIndexed(
+  text: string, maxW: number, fs: number, ff: string, fw = "400", customMeasure?: LineMeasurer,
+): WrappedLine[] {
+  const steps = wrapTextSteps(text, maxW, fs, ff, fw, customMeasure);
+  let step = steps.next();
+  while (!step.done) step = steps.next();
+  return step.value;
+}
+
+// 同步调用方和可让帧的用户提示词排版共用同一套换行/复制语义。
+function* wrapTextSteps(
   text: string,
   maxW: number,
   fs: number,
   ff: string,
   fw = "400",
   customMeasure?: LineMeasurer,
-): WrappedLine[] {
+): Generator<void, WrappedLine[]> {
   const lines: WrappedLine[] = [];
   const safeMax = Math.max(1, maxW);
   const lineWidth: LineMeasurer = customMeasure || ((value) => measure(value, fs, ff, fw));
@@ -182,6 +192,7 @@ function wrapTextIndexed(
   const paras = normalized.split("\n");
   let base = 0;
   for (let pi = 0; pi < paras.length; pi++) {
+    yield;
     const para = paras[pi];
     const paraLineStart = lines.length;
     // Keep intentional empty paragraphs as a single blank line.
@@ -190,20 +201,12 @@ function wrapTextIndexed(
       if (pi < paras.length - 1) base += 1; // consume the separating `\n`
       continue;
     }
-    const tokens: { start: number; text: string }[] = [];
-    const re = /(\s+)/g;
-    let last = 0;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(para)) !== null) {
-      if (m.index > last) tokens.push({ start: base + last, text: para.slice(last, m.index) });
-      tokens.push({ start: base + m.index, text: m[0] });
-      last = m.index + m[0].length;
-    }
-    if (last < para.length) tokens.push({ start: base + last, text: para.slice(last) });
-    if (!tokens.length) tokens.push({ start: base, text: para });
-
-    let cur = "", curOffs: number[] = [], curW = 0;
-    for (const token of tokens) {
+    let cur = "", curOffs: number[] = [];
+    // 不先整形整个无空格段落，也不为它构建全长 offsets / Array.from。
+    // u 保证批次边界不会切开 emoji 的代理对。
+    for (const match of para.matchAll(/\s{1,256}|[^\s]{1,256}/gu)) {
+      yield;
+      const token = { start: base + match.index, text: match[0] };
       // Don't start a line with whitespace — matches typical pre-wrap soft-wrap feel.
       if (!cur && /^\s+$/.test(token.text)) continue;
       const tokenOffs = Array.from({ length: token.text.length }, (_, ci) => token.start + ci);
@@ -213,7 +216,6 @@ function wrapTextIndexed(
       if (joinedW <= safeMax) {
         cur = joined;
         curOffs = joinedOffs;
-        curW = joinedW;
         continue;
       }
       // Word won't fit: fill remaining space on this line char-by-char first
@@ -223,12 +225,13 @@ function wrapTextIndexed(
           pushTrimmedLine(lines, cur, curOffs);
           // 折行发生在空白处：复制时应还原为一个空格，而不是换行或直接拼接
           lines[lines.length - 1].spaceBreak = true;
-          cur = ""; curOffs = []; curW = 0;
+          cur = ""; curOffs = [];
         }
         continue;
       }
       let ci = 0;
-      for (const ch of Array.from(token.text)) {
+      for (const ch of token.text) {
+        yield;
         const off = token.start + ci;
         const chOffs = Array.from({ length: ch.length }, (_, k) => off + k);
         const candidate = cur + ch;
@@ -238,11 +241,9 @@ function wrapTextIndexed(
           lines.push({ text: cur, offsets: curOffs });
           cur = ch;
           curOffs = chOffs;
-          curW = lineWidth(ch, chOffs);
         } else {
           cur = candidate;
           curOffs = candidateOffs;
-          curW = candidateW;
         }
         ci += ch.length;
       }
@@ -256,8 +257,9 @@ function wrapTextIndexed(
     if (pi < paras.length - 1) base += 1; // skip `\n` — not present in any line
   }
   while (lines.length > 1 && lines[lines.length - 1].text === "") lines.pop();
-  while (lines.length > 1 && lines[0].text === "") lines.shift();
-  return lines.length ? lines : [{ text: "", offsets: [] }];
+  let first = 0;
+  while (first < lines.length - 1 && lines[first].text === "") first++;
+  return lines.length ? lines.slice(first) : [{ text: "", offsets: [] }];
 }
 
 function wrapText(text: string, maxW: number, fs: number, ff: string, fw = "400"): string[] {
@@ -272,6 +274,35 @@ function wrappedLineSeps(wrapped: WrappedLine[]): string[] {
 function wrapTextFull(text: string, maxW: number, fs: number, ff: string, fw = "400"): { lines: string[]; seps: string[] } {
   const wrapped = wrapTextIndexed(text, maxW, fs, ff, fw);
   return { lines: wrapped.map((l) => l.text), seps: wrappedLineSeps(wrapped) };
+}
+
+async function wrapUserText(text: string, maxW: number, font: string, cancelled: () => boolean) {
+  const steps = wrapTextSteps(text, maxW, 14, font);
+  let started = performance.now();
+  let step = steps.next();
+  while (!step.done) {
+    if (performance.now() - started >= 4) {
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      if (cancelled()) return null;
+      started = performance.now();
+    }
+    step = steps.next();
+  }
+  const lines: string[] = [], seps: string[] = [], widths: number[] = [];
+  let textW = 0;
+  for (const line of text ? step.value : []) {
+    if (performance.now() - started >= 4) {
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      if (cancelled()) return null;
+      started = performance.now();
+    }
+    const width = measure(line.text, 14, font);
+    lines.push(line.text);
+    seps.push(line.hardBreak ? "\n" : line.spaceBreak ? " " : "");
+    widths.push(width);
+    textW = Math.max(textW, width);
+  }
+  return { lines, seps, widths, textW };
 }
 
 const CODE_TAB_SIZE = 4;
@@ -1105,7 +1136,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   const prefixLayoutCaches = new LruMap<string, PrefixLayoutCache>(8);
   // 用户提示词在流式输出期间不变；按消息弱引用缓存，随消息释放。
   const userTextLayouts = new WeakMap<UserItem, {
-    text: string; width: number; font: string; lines: string[]; seps: string[]; textW: number;
+    text: string; width: number; viewWidth: number; font: string; threadId: string | null;
+    layout: ReturnType<typeof wrapUserText>;
   }>();
   // groupItems 会保留已闭合分组的对象身份；缓存其内容签名，避免每个流式 token
   // 都重新遍历整段历史文本。展开状态变化时会整体换新此 WeakMap。
@@ -1247,7 +1279,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       ? !!(state.expanded[foldKey] ?? bodyExpandedFor(g.body))
       : false;
     const parts = [
-      g.user ? `u:${g.user.id}:${textSig(g.user.text)}` : "-",
+      g.user ? `u:${g.user.id}:${textSig(g.user.text)}:${!!state.expanded[`user-text-${g.user.id}`]}` : "-",
       g.turn
         ? `t:${g.turn.id}:${g.turn.durationMs}:${g.turn.totalTokens ?? ""}:${g.turn.actualModel ?? ""}:${foldOpen}`
         : "-",
@@ -1366,35 +1398,76 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         gapBefore(20); // top margin (collapses with previous bottom)
         if (item.id !== editing()?.id) {
           const maxBubble = contentW * 0.85;
+          const foldKey = `user-text-${item.id}`;
+          const longText = item.text.length > 4000;
+          const open = !!state.expanded[foldKey];
+          const sourceText = item.text;
+          // 先显示有界预览；不能为了首屏等待数十万字的隐藏内容排版。
+          const text = longText && !open
+            ? sourceText.slice(0, 1000).replace(/[\uD800-\uDBFF]$/, "") + "…"
+            : sourceText;
           // DOM .bubble-images: flex-wrap, img max 240×180, gap 6, margin-bottom 6
           const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH, imgMaxW } =
             layoutBubbleImages(item.images, maxBubble - 32, loadImage);
           // Size to content like DOM (no artificial min-width that leaves empty bubble space).
           const lh = 14 * 1.6;
           let textLayout = userTextLayouts.get(item);
-          if (!textLayout || textLayout.text !== item.text || textLayout.width !== maxBubble || textLayout.font !== p.sans) {
-            const full = item.text ? wrapTextFull(item.text, maxBubble - 34, 14, p.sans) : { lines: [], seps: [] };
-            textLayout = { text: item.text, width: maxBubble, font: p.sans, ...full,
-              textW: full.lines.reduce((m, l) => Math.max(m, measure(l, 14, p.sans)), 0) };
+          if (!textLayout || textLayout.text !== text || textLayout.width !== maxBubble || textLayout.viewWidth !== W || textLayout.font !== p.sans || textLayout.threadId !== threadId) {
+            textLayout = { text, width: maxBubble, viewWidth: W, font: p.sans, threadId,
+              // 流式重排共享进行中的排版，不能每个 delta 都取消重来。
+              layout: wrapUserText(text, maxBubble - 34, p.sans,
+                () => disposed || props.threadId !== threadId || viewW !== W || item.text !== sourceText || pal.sans !== p.sans || !!state.expanded[foldKey] !== open) };
             userTextLayouts.set(item, textLayout);
           }
-          const textLines = textLayout.lines;
+          const full = await textLayout.layout;
+          if (!full) {
+            if (userTextLayouts.get(item) === textLayout) userTextLayouts.delete(item);
+            return false;
+          }
+          if (generation !== layoutGeneration || props.threadId !== threadId || disposed) return false;
+          const textLines = full.lines;
           // 最宽的已换行文本决定气泡宽度，缩小外框无需再次换行。
-          const bubbleW = Math.min(maxBubble, Math.max(textLayout.textW + 34, imgUsedW + 32, imgH ? 72 : 34));
+          const bubbleW = Math.min(maxBubble, Math.max(full.textW + 34, imgUsedW + 32, imgH ? 72 : 34));
           const textH = textLines.length * lh;
           const bubbleH = Math.max(30, textH + imgH + 20); // padding 10*2
           const bx = side + contentW - bubbleW;
 
           result.push({ kind: "user-bubble", id: item.id, groupIdx: gi,
             x: bx, y, w: bubbleW, h: bubbleH,
-            text: item.text, color: p.text, bg: p.accentDim,
+            text, color: p.text, bg: p.accentDim,
             border: `color-mix(in srgb, ${p.accent} 26%, transparent)`,
             // border-radius: 14px; border-bottom-right-radius: 6px
             borderRadius: [14, 14, 6, 14], fontSize: 14, lineHeight: 1.6, font: p.sans,
             selectable: true, hoverKey: `user-${item.id}`,
             _lines: textLines,
-            _lineSeps: textLayout.seps,
+            _lineSeps: full.seps,
+            _lineWidths: full.widths,
             data: { images: item.images, editItem: item, imageLayouts, imgMaxW } });
+
+          if (longText) {
+            const toggle: Block = { kind: "fold", id: item.id, groupIdx: gi,
+              x: bx, y: y + bubbleH + 4, w: Math.max(1, bubbleW - 32), h: 28,
+              text: open ? "收起长提示词" : `展开完整提示词（${fmtTokens(sourceText.length)} 字符）`,
+              color: p.dim, fontSize: 13, font: p.sans, cursor: "pointer",
+              hoverBg: p.hover, borderRadius: 6, data: { open, foldKey, userText: true },
+              clickAction: () => {
+                const next = !state.expanded[foldKey];
+                toggle.text = next ? "正在展开…（点击取消）" : `展开完整提示词（${fmtTokens(sourceText.length)} 字符）`;
+                requestPaint();
+                toggleExpanded(foldKey, next);
+              } };
+            result.push(toggle);
+            result.push({ kind: "code-copy-btn", id: item.id, groupIdx: gi,
+              x: bx + bubbleW - 24, y: y + bubbleH + 6, w: 24, h: 24, hoverKey: `user-${item.id}`,
+              data: { alwaysVisible: true },
+              cursor: "pointer", title: "复制完整提示词", hoverBg: p.hover, borderRadius: 6,
+              clickAction: () => {
+                void navigator.clipboard.writeText(item.text).then(() => {
+                  copiedCodeUntil.set(`user-${item.id}`, performance.now() + 1200);
+                  requestPaint();
+                }).catch(error => void message(String(error), { kind: "error" }));
+              } });
+          }
 
           // .user-edit-btn: padding 5px, margin 0 2px 4px 0, align-self flex-end
           // 世界线预览是静态快照，即使当前主线仍在运行，也应允许从历史消息编辑并分叉。
@@ -1416,7 +1489,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
                 setEditing(item);
               } });
           }
-          y += bubbleH;
+          y += bubbleH + (longText ? 36 : 0);
           setBottom(16); // bottom margin
         } else {
           editLayoutY = y;
@@ -2035,7 +2108,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           break;
         case "code-copy-btn": {
           const copied = (copiedCodeUntil.get(b.hoverKey || "") || 0) > performance.now();
-          if (isHover || copied) {
+          if (isHover || copied || b.data?.alwaysVisible) {
             const btnHover = i === hoverBlockIdx;
             const color = copied ? p.accent : (btnHover ? p.text : p.faint);
             if (copied) paintCheckIcon(ctx, bx + 5.5, by + 5.5, 13, color);
@@ -2195,7 +2268,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         let offset = 0;
         for (let i = 0; i < lines.length; i++) {
           const ty = b.y + 10 + imgOffset + i * lh; // 绝对坐标（= 屏幕 ty + scrollY）
-          b._textLines.push({ text: lines[i], x: b.x + 16, y: ty, w: measure(lines[i], fs, ff), offset, fs, lh, sepAfter: seps[i] });
+          b._textLines.push({ text: lines[i], x: b.x + 16, y: ty, w: b._lineWidths?.[i] ?? measure(lines[i], fs, ff), offset, fs, lh, sepAfter: seps[i] });
           offset += lines[i].length;
         }
       }
@@ -3262,6 +3335,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       keepBottom = false;
       props.onBrowseDetail?.();
     }
+    // 操作按钮不应落入最近文本的选区/双击分词逻辑，否则再次点击会吞掉动作。
+    if (pressed?.clickAction && !pressed.selectable) {
+      selecting = false;
+      selMoved = false;
+      selection = null;
+      clearCanvasChatSelection();
+      requestPaint();
+      return;
+    }
 
     // 与 DOM 一致：任意位置（含空白、行距、块间距）按下都允许发起文本选区；
     // 不拖动的点击仍由 click 事件触发 clickAction（靠 selMoved 区分点选与拖选）
@@ -3350,6 +3432,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (b.kind === "fold" || b.kind === "thought-toggle" || b.kind === "tool-header") {
         keepBottom = false;
         scrollLock = { kind: b.kind, id: b.id, viewOffset: b.y - scrollY };
+        if (b.data?.userText && !state.expanded[String(b.data.foldKey)]) {
+          const bubble = blocks.find(block => block.kind === "user-bubble" && block.id === b.id);
+          if (bubble) scrollLock = { kind: bubble.kind, id: bubble.id, viewOffset: Math.max(16, bubble.y - scrollY) };
+        }
       }
       b.clickAction();
     }
@@ -3450,9 +3536,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const generation = ++layoutGeneration;
     pal = readPalette();
     const oldScroll = scrollY;
+    if (!await computeLayout(generation)) return;
+    // 被后续重排取代的异步任务不能消费点击锚点；只由真正提交的布局使用。
     const lock = scrollLock;
     scrollLock = null;
-    if (!await computeLayout(generation)) return;
     // blocks are replaced during layout; an index from the previous block array may now
     // identify an unrelated block (often the first tool), producing a phantom hover card.
     hoverBlockIdx = -1;
@@ -3697,6 +3784,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (switchedThread) {
       renderedThreadId = threadId;
       layoutGeneration++;
+      scrollLock = null;
       shownText.clear();
       targetText.clear();
       revealReadyAt.clear();
