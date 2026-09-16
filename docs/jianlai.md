@@ -41,6 +41,7 @@
 - Windows：普通桌面；系统安全桌面/UAC及高权限程序可能阻止输入或截图，不自动提权。
 - macOS：需授予 Nova 屏幕录制与辅助功能权限。
 - Linux：输入仅支持 X11，需支持 EWMH 的窗口管理器；Wayland 输入明确拒绝，不回退到只能控制部分窗口的 XWayland。
+- Linux 官方构建基线为 Ubuntu 24.04（glibc 2.39）；产物不保证兼容 Ubuntu 22.04。XCap 使用的 libspa 0.10 与 Ubuntu 22.04 自带的 PipeWire 0.3.48 头文件不兼容，不能只安装同名开发包解决。
 - Linux 新增原生构建依赖（Debian/Ubuntu）：`libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev`，以及原有 Tauri GTK/WebKit 构建依赖。
 
 截图保存到 Nova 配置目录的 `desktop-shots` 下的会话隔离目录，可能含敏感屏幕内容；旧图仍保留供按需回看，按需手动清理。升级前平铺保存的图片不支持新的recall入口，但原文件不删除。模型必须支持图像输入才能闭环操作。

@@ -52,7 +52,8 @@ jobs:
             os: macos-latest
             target: x86_64-apple-darwin
           - name: linux
-            os: ubuntu-22.04
+            # xcap / libspa 0.10 requires newer PipeWire headers than Jammy's 0.3.48.
+            os: ubuntu-24.04
             target: ""
     runs-on: ${{ matrix.os }}
     steps:
