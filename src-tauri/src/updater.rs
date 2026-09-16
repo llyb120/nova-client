@@ -671,9 +671,9 @@ pub fn take_restore_thread(app: &AppHandle) -> Option<String> {
 }
 
 /// 取主窗口（label 固定为 "main"；兜底取任意一个窗口，避免 label 变化导致取不到）。
-fn main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
-    app.get_webview_window("main")
-        .or_else(|| app.webview_windows().into_values().next())
+fn main_window(app: &AppHandle) -> Option<tauri::Window> {
+    app.get_window("main")
+        .or_else(|| app.windows().into_values().next())
 }
 
 /// 读取窗口恢复状态并从标记里摘除（保留 thread_id 供前端后续恢复会话）。
@@ -693,7 +693,7 @@ fn take_restore_window(app: &AppHandle) -> Option<WindowState> {
     ws
 }
 
-fn apply_window_state(win: &tauri::WebviewWindow, ws: &WindowState) {
+fn apply_window_state(win: &tauri::Window, ws: &WindowState) {
     // 先还原几何：最大化优先，否则按保存的全局坐标+大小（全局坐标天然支持多屏）
     if ws.maximized {
         let _ = win.maximize();
@@ -777,7 +777,7 @@ impl SavedWindowPlacement {
 }
 
 #[cfg(windows)]
-fn restore_window_layout(win: &tauri::WebviewWindow) -> bool {
+fn restore_window_layout(win: &tauri::Window) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPlacement;
     let path = crate::nova_data_dir(win.app_handle()).join("window-layout.json");
     if !REMEMBER_WINDOW_LAYOUT.load(std::sync::atomic::Ordering::SeqCst) { return false; }

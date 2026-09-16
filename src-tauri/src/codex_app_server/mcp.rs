@@ -28,6 +28,7 @@ fn available_tools() -> Vec<Value> {
     if std::env::var("NOVA_FAST_CONTEXT").as_deref() != Ok("0") { tools.push(tool()); }
     if std::env::var("NOVA_TOOLS_READ_ONLY").as_deref() != Ok("1") {
         tools.extend(crate::image_generation::tool_definitions());
+        tools.push(crate::native_browser::tool_definition());
     }
     tools
 }
@@ -133,6 +134,30 @@ fn error(id: Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }
 
+async fn tool_result(name: &str, result: Result<Value, String>) -> Value {
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => return json!({"isError":true,"content":[{"type":"text","text":error}]}),
+    };
+    let text = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
+    let mut content = vec![json!({"type":"text","text":text})];
+    if name == "webview" {
+        use base64::Engine;
+        if let Some(images) = value["images"].as_array() {
+            // Paths originate from the authenticated native service, not the caller or page text.
+            for image in images.iter().take(4) {
+                if let Some(path) = image["path"].as_str() {
+                    match tokio::fs::read(path).await {
+                        Ok(data) => content.push(json!({"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(data)})),
+                        Err(_) => content.push(json!({"type":"text","text":format!("图片加载失败，可读取截图文件：{path}")})),
+                    }
+                }
+            }
+        }
+    }
+    json!({"content":content})
+}
+
 pub(super) async fn serve<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: R,
     mut writer: W,
@@ -166,8 +191,7 @@ pub(super) async fn serve<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             tasks.spawn(async move {
                                 let name = params["name"].as_str().unwrap_or_default();
                                 let result = if available_tools().iter().any(|tool| tool["name"] == name) { call(config, name, params.get("arguments").cloned().unwrap_or_else(|| json!({}))).await } else { Err("Unknown tool".into()) };
-                                let (text, failed) = match result { Ok(value) => (value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()), false), Err(error) => (error, true) };
-                                response(id, json!({"isError":failed,"content":[{"type":"text","text":text}]}))
+                                response(id, tool_result(name, result).await)
                             });
                             None
                         }
@@ -218,6 +242,17 @@ pub(crate) fn maybe_run() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn webview_screenshot_is_an_image_block_and_keeps_action_status() {
+        let path = std::env::temp_dir().join(format!("nova-mcp-{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"image-bytes").unwrap();
+        let result = tool_result("webview", Ok(json!({"status":"executed","images":[{"path":path}]}))).await;
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"][1]["data"], "aW1hZ2UtYnl0ZXM=");
+        assert_eq!(serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap()["status"], "executed");
+        assert_eq!(tool_result("webview", Err("stopped".into())).await["isError"], true);
+    }
     #[tokio::test]
     async fn native_mcp_forwards_image_arguments_and_result() {
         let (client, server) = tokio::io::duplex(8192);

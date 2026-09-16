@@ -138,6 +138,9 @@ fn dispatch(
         ));
     }
     let mut params = request.params;
+    if request.method == "webview" {
+        return tauri::async_runtime::block_on(crate::native_browser::execute(root, &params));
+    }
     if matches!(request.method.as_str(), "generate_image" | "edit_image") {
         // dispatch 已在阻塞工作线程运行；图片请求不阻塞常驻服务的其它连接。
         return tokio::runtime::Builder::new_current_thread().enable_all().build()

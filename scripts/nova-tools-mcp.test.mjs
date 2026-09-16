@@ -3,6 +3,8 @@ import { test } from "node:test";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { webviewMcpResult } from './webview-mcp-result.mjs';
 import {
   createNovaBatchTools,
   normalizePolarisArgs,
@@ -23,6 +25,23 @@ function withContextService(run) {
   }
 }
 
+test('webview sends native MCP images without putting base64 in text; failures preserve action status', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'nova-mcp-image-'));
+  try {
+    const path = join(dir, 'shot.png');
+    const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZioAAAAASUVORK5CYII=', 'base64');
+    await writeFile(path, bytes);
+    const text = JSON.stringify({status:'executed',snapshotId:'fresh',images:[{path},{path:join(dir,'missing.png')}]});
+    const result = await webviewMcpResult(text);
+    assert.equal(result.content[0].text,text);
+    assert.equal(result.content[1].type,'image');
+    assert.deepEqual(Buffer.from(result.content[1].data,'base64'),bytes);
+    assert.match(result.content[2].text,/图片加载失败/);
+    assert.equal(JSON.parse(result.content[0].text).status,'executed');
+    assert.deepEqual(await webviewMcpResult('not ready'),{content:[{type:'text',text:'not ready'}]});
+  } finally { await rm(dir,{recursive:true,force:true}); }
+});
+
 test("createNovaBatchTools exposes context tools only with the native service", () => {
   const previousEndpoint = process.env.NOVA_CONTEXT_SERVICE_ENDPOINT;
   const previousToken = process.env.NOVA_CONTEXT_SERVICE_TOKEN;
@@ -34,7 +53,7 @@ test("createNovaBatchTools exposes context tools only with the native service", 
     if (previousToken !== undefined) process.env.NOVA_CONTEXT_SERVICE_TOKEN = previousToken;
   }
   const tools = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }));
-  assert.deepEqual(Object.keys(tools).sort(), ["edit_image", "generate_image", "polaris"]);
+  assert.deepEqual(Object.keys(tools).sort(), ["edit_image", "generate_image", "polaris", "webview"]);
 });
 
 test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
@@ -42,7 +61,7 @@ test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
   process.env.NOVA_FAST_CONTEXT = "0";
   try {
     const tools = withContextService(() => createNovaBatchTools(process.cwd()));
-    assert.deepEqual(Object.keys(tools).sort(), ["edit_image", "generate_image"]);
+    assert.deepEqual(Object.keys(tools).sort(), ["edit_image", "generate_image", "webview"]);
     assert.deepEqual(withContextService(() => createNovaBatchTools(process.cwd(), { readOnly: true })), {});
   }
   finally {
@@ -101,7 +120,7 @@ test("directory switching is session scoped, works without polaris, and updates 
       if (!line.includes("\n")) return;
       const request = JSON.parse(line.trim());
       calls.push(request);
-      if (request.params.prompt === "lost response") { socket.destroy(); return; }
+      if (request.params.prompt === "lost response" || request.method === "webview") { socket.destroy(); return; }
       const rejected = request.params.path === "missing";
       socket.end(JSON.stringify(rejected
         ? { ok: false, error: "directory missing" }
@@ -134,6 +153,11 @@ test("directory switching is session scoped, works without polaris, and updates 
     const before = calls.length;
     await assert.rejects(tools.generate_image.execute({ prompt: "lost response" }));
     assert.equal(calls.length, before + 1);
+    const webviewArgs = { operation: "act", browserId: "test-browser", snapshotId: "test-snapshot", action: { action: "press", key: "Enter" } };
+    await assert.rejects(tools.webview.execute(webviewArgs));
+    assert.equal(calls.length, before + 2, "browser mutations must not retry a lost response");
+    assert.equal(calls.at(-1).method, "webview");
+    assert.deepEqual(calls.at(-1).params, webviewArgs);
   } finally {
     for (const key of ["NOVA_CONTEXT_SERVICE_ENDPOINT", "NOVA_CONTEXT_SERVICE_TOKEN", "NOVA_CWD_CHANGE_SCOPE"]) {
       if (previous[key] === undefined) delete process.env[key];

@@ -22,8 +22,8 @@ pub fn set_prompt_queue_pending(thread_id: &str, pending: bool) {
 /// 聚焦主窗口（显示、取消最小化、请求注意、尽量设为前台）。
 pub fn focus_main_window(app: &AppHandle) {
     if let Some(w) = app
-        .get_webview_window("main")
-        .or_else(|| app.webview_windows().into_values().next())
+        .get_window("main")
+        .or_else(|| app.windows().into_values().next())
     {
         let _ = w.unminimize();
         let _ = w.show();
@@ -33,7 +33,7 @@ pub fn focus_main_window(app: &AppHandle) {
 }
 
 fn main_window_focused(app: &AppHandle) -> bool {
-    app.get_webview_window("main")
+    app.get_window("main")
         .and_then(|w| w.is_focused().ok())
         .unwrap_or(false)
 }

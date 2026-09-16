@@ -1,4 +1,5 @@
 import imageTools from "./image-tools.json" with { type: "json" };
+import webviewTool from "./webview-tool.json" with { type: "json" };
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
@@ -119,6 +120,9 @@ export function createNovaBatchTools(cwd, options = {}) {
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
   const tools = {};
   if (!readOnly && globalContextServiceConfigured()) {
+    tools.webview = { ...webviewTool,
+      execute: async params => JSON.stringify(await callGlobalContextTool("webview", root, params)),
+    };
     for (const definition of imageTools) {
       tools[definition.name] = { ...definition,
         execute: async (params) => JSON.stringify(await callGlobalContextTool(definition.name, root, params)),

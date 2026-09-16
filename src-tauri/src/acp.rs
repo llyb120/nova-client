@@ -5054,6 +5054,7 @@ fn codebuddy_nova_tools_mcp_server_value(
     if !read_only {
         meta["tools"]["generate_image"] = json!({ "defer_loading": false });
         meta["tools"]["edit_image"] = json!({ "defer_loading": false });
+        meta["tools"]["webview"] = json!({ "defer_loading": false });
     }
     json!({
         "name": "nova-tools",

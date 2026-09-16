@@ -51,6 +51,8 @@ libc = "0.2"
 tauri-plugin-global-shortcut = "2.3.2"
 
 [target.'cfg(windows)'.dependencies]
+webview2-com = "0.38.2"
+windows = "0.61"
 tauri-winrt-notification = "0.7"
 winreg = "0.55"
 windows-sys = { version = "0.61", features = [

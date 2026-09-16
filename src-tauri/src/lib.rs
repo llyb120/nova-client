@@ -14,6 +14,7 @@ mod experience;
 mod gitwt;
 mod http_stream;
 pub mod image_generation;
+mod native_browser;
 mod lyra;
 mod lyra_complete;
 mod model_cache;
@@ -751,8 +752,8 @@ fn spawn_single_instance_focus_listener(app: &tauri::AppHandle) {
                 break;
             }
             if let Some(win) = app
-                .get_webview_window("main")
-                .or_else(|| app.webview_windows().into_values().next())
+                .get_window("main")
+                .or_else(|| app.windows().into_values().next())
             {
                 let _ = win.show();
                 let _ = win.unminimize();
@@ -814,8 +815,8 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
                     // minimized. Bring it back before delivering the event so the user can see
                     // the newly opened session page.
                     if let Some(window) = app
-                        .get_webview_window("main")
-                        .or_else(|| app.webview_windows().into_values().next())
+                        .get_window("main")
+                        .or_else(|| app.windows().into_values().next())
                     {
                         let _ = window.show();
                         let _ = window.unminimize();
@@ -5533,6 +5534,7 @@ pub fn run() {
                 browser: browser::BrowserManager::new(),
                 browser_agent: browser_agent::BrowserAgentState::new(),
             });
+            native_browser::init(app.handle());
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             sync_global_session_shortcuts(app.handle());
@@ -5773,6 +5775,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            native_browser::native_browser_ui,
             image_generation::image_command_context,
             list_threads,
             load_threads,
