@@ -227,7 +227,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     if (!(await commitSheet())) return;
     snapshot();
     const existing = tabs().find(tab => tab.file.path === (aliases.get(path) ?? path));
-    if (existing && !reload) { selectTab(existing.file.path); revealLine(line); return; }
+    if (existing && !reload) { await selectTab(existing.file.path); revealLine(line); return; }
     // ponytail: 最多 24 个打开的文本缓冲，只有当前面板挂载 DOM；更多文件先关闭标签。
     if (!existing && tabs().length >= 24) { setError('最多打开 24 个文件，请先关闭不需要的标签'); return; }
     const token = ++request;
