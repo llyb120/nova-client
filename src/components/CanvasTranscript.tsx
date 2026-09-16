@@ -12,7 +12,7 @@ import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
-import { resolveScrollAfterLayout, resolveUserScrollStick } from "../scrollStick";
+import { resolveExpandScroll, resolveScrollAfterLayout, resolveUserScrollStick } from "../scrollStick";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
 import { relPath } from "./EditedFilesCard";
@@ -1018,7 +1018,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let dpr = devicePixelRatio || 1;
   let keepBottom = true;
   /** Expand/collapse near bottom: keep the clicked header fixed in view instead of stick-to-bottom. */
-  let scrollLock: { kind: string; id: number; viewOffset: number } | null = null;
+  let scrollLock: { kind: string; id: number; viewOffset: number; pin?: boolean } | null = null;
 
   // hover state
   let hoverBlockIdx = -1;
@@ -3461,10 +3461,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       // the header upward — lock the header's viewport offset instead.
       if (b.kind === "fold" || b.kind === "thought-toggle" || b.kind === "tool-header") {
         keepBottom = false;
-        scrollLock = { kind: b.kind, id: b.id, viewOffset: b.y - scrollY };
+        // 吸底时的展开：若展开后头行仍在新布局的最后一屏内，钉住新底部让新内容
+        // 进入视野（头行仍在屏内）；展开量更大才退回头行锚定。
+        const pin = !b.data?.open && maxScroll - scrollY <= 2;
+        scrollLock = { kind: b.kind, id: b.id, viewOffset: b.y - scrollY, pin };
         if (b.data?.userText && !state.expanded[String(b.data.foldKey)]) {
           const bubble = blocks.find(block => block.kind === "user-bubble" && block.id === b.id);
-          if (bubble) scrollLock = { kind: bubble.kind, id: bubble.id, viewOffset: Math.max(16, bubble.y - scrollY) };
+          if (bubble) scrollLock = { kind: bubble.kind, id: bubble.id, viewOffset: Math.max(16, bubble.y - scrollY), pin };
         }
       }
       b.clickAction();
@@ -3600,8 +3603,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       maxScroll = settled.maxScroll;
       if (lock) {
         const match = blocks.find((x) => x.kind === lock.kind && x.id === lock.id);
-        const y = match?.y ?? oldScroll + lock.viewOffset;
-        scrollY = Math.max(0, Math.min(maxScroll, y - lock.viewOffset));
+        scrollY = resolveExpandScroll({
+          headerTop: match?.y,
+          viewOffset: lock.viewOffset,
+          scrollBefore: oldScroll,
+          maxScroll,
+          pin: !!lock.pin,
+        });
+        // 落点贴底（钉底分支或锚定恰到底）即恢复吸底跟随，否则流式更新会让
+        // 视图停在底部却不再跟随。
+        if (scrollY >= maxScroll) keepBottom = true;
       } else {
         scrollY = settled.scrollY;
       }

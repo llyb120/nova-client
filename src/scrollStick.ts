@@ -25,6 +25,36 @@ export function resolveScrollAfterLayout(opts: {
 }
 
 /**
+ * 吸底时点开「展开」后的滚动落点。
+ *
+ * 展开把新内容插在头行下方：若头行仍在新布局的最后一屏内，钉住新底部——
+ * 展开内容全部进入视野、滚动条留在底部；展开量把头行顶出屏外时退回头行
+ * 锚定，避免头行飞出视口。收起不走此函数：直接锚定头行即可。
+ * DOM 版（ChatView.handleTranscriptClick）的锚定等于 scrollTop 不动，
+ * 只需同一条件 docTop >= maxScrollTop 判定是否钉底。
+ */
+export function resolveExpandScroll(opts: {
+  /** 头行在新布局中的文档位置；元素已被移除时传 undefined 走兜底。 */
+  headerTop: number | undefined;
+  /** 点击瞬间头行距视口顶部的偏移。 */
+  viewOffset: number;
+  /** 布局提交前的滚动位置：头行缺失时 +viewOffset 反推出原位置。 */
+  scrollBefore: number;
+  /** 本次布局产出的最大滚动量。 */
+  maxScroll: number;
+  /** 是否允许钉底（点击时处于吸底且本次为展开）。 */
+  pin: boolean;
+}): number {
+  const anchorTop = opts.headerTop ?? opts.scrollBefore + opts.viewOffset;
+  const pin =
+    opts.pin && opts.headerTop !== undefined && opts.headerTop >= opts.maxScroll;
+  return Math.max(
+    0,
+    Math.min(opts.maxScroll, pin ? opts.maxScroll : anchorTop - opts.viewOffset),
+  );
+}
+
+/**
  * 用户手动滚动后的吸底判定（canvas 与 ChatView 共用，语义对齐 DOM 版 wheel：
  * 上滚 cancelBottomFollow、下滚到底 enableBottomFollow）：上滚（位置变小）立即
  * 解除吸底；下滚贴底 2px 内才恢复。

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { resolveScrollAfterLayout, resolveUserScrollStick } from "../src/scrollStick.ts";
+import { resolveExpandScroll, resolveScrollAfterLayout, resolveUserScrollStick } from "../src/scrollStick.ts";
 
 test("layout 期间用户滚离底部后不被拽回（切会话冷布局窗口的钉死回归）", () => {
   // await 前在底部（scrollY=maxScroll=1000）；布局让帧期间用户滚轮到 700，
@@ -30,6 +30,38 @@ test("内容收缩后滚动位置收敛到新 maxScroll", () => {
   });
   assert.equal(r.maxScroll, 0);
   assert.equal(r.scrollY, 0);
+});
+
+test("吸底展开：头行仍在新底部一屏内时钉住新底部，展开内容全部入视野", () => {
+  // 吸底 scrollY=maxScroll=1200（totalHeight=2000, viewH=800），头行视口偏移 700。
+  // 展开 +300 → 新 maxScroll=1500；头行 y=1900 ≥ 1500，钉底后头行落在屏内 400。
+  const r = resolveExpandScroll({
+    headerTop: 1900, viewOffset: 700, scrollBefore: 1200, maxScroll: 1500, pin: true,
+  });
+  assert.equal(r, 1500);
+});
+
+test("吸底展开量把头行顶出最后一屏：退回锚定，头行固定在原视口位置", () => {
+  // 展开 +1500 → 新 maxScroll=2700；头行 y=1900 < 2700，钉底会让头行飞出屏外，
+  // 锚定回 1900-700=1200（滚动条上移但头行不动）。
+  const r = resolveExpandScroll({
+    headerTop: 1900, viewOffset: 700, scrollBefore: 1200, maxScroll: 2700, pin: true,
+  });
+  assert.equal(r, 1200);
+});
+
+test("非吸底按下或收起（pin=false）：永远锚定头行", () => {
+  const r = resolveExpandScroll({
+    headerTop: 1900, viewOffset: 700, scrollBefore: 1200, maxScroll: 1500, pin: false,
+  });
+  assert.equal(r, 1200);
+});
+
+test("头行在重排后被移除：按按下时位置兜底锚定", () => {
+  const r = resolveExpandScroll({
+    headerTop: undefined, viewOffset: 700, scrollBefore: 1200, maxScroll: 1500, pin: true,
+  });
+  assert.equal(r, 1200);
 });
 
 test("用户上滚即解除吸底，含慢扫 1-2px（流式钉回吞滚动回归）", () => {
