@@ -1455,11 +1455,6 @@ export function ChatView() {
       </footer>
         </div>
 
-      <Show when={workspaceOpen() && roamingRole() !== "guest"}>
-        <Show keyed when={state.currentId}>
-          {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
-        </Show>
-      </Show>
       <Show when={showTimeMachine() && !workspaceOpen()}>
         <aside
           class="repo-time-machine"
@@ -1636,6 +1631,12 @@ export function ChatView() {
             )}
           </For>
         </aside>
+      </Show>
+      {/* 文件/产物侧栏排在 Stage 导航右边：聊天 → 世界线 → Stage → 侧边栏。 */}
+      <Show when={workspaceOpen() && roamingRole() !== "guest"}>
+        <Show keyed when={state.currentId}>
+          {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
+        </Show>
       </Show>
       <Portal>
         <Show when={stageContextMenu()} keyed>
