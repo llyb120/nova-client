@@ -2782,18 +2782,13 @@ button {
 }
 
 .prompt-queue {
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: calc(100% + 8px);
-  z-index: 6;
+  margin: -4px 0 10px;
   max-height: min(210px, 30vh);
   overflow-y: auto;
   overscroll-behavior: contain;
   border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border-light));
   border-radius: var(--r-md);
   background: color-mix(in srgb, var(--bg-float) 94%, var(--accent) 6%);
-  box-shadow: var(--shadow-md);
 }
 .prompt-queue-head {
   position: sticky;
