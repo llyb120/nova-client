@@ -53,7 +53,7 @@ test("createNovaBatchTools exposes context tools only with the native service", 
     if (previousToken !== undefined) process.env.NOVA_CONTEXT_SERVICE_TOKEN = previousToken;
   }
   const tools = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }));
-  assert.deepEqual(Object.keys(tools).sort(), ["edit_image", "generate_image", "polaris", "webview"]);
+  assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "polaris", "webview"]);
 });
 
 test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
@@ -61,7 +61,7 @@ test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
   process.env.NOVA_FAST_CONTEXT = "0";
   try {
     const tools = withContextService(() => createNovaBatchTools(process.cwd()));
-    assert.deepEqual(Object.keys(tools).sort(), ["edit_image", "generate_image", "webview"]);
+    assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "webview"]);
     assert.deepEqual(withContextService(() => createNovaBatchTools(process.cwd(), { readOnly: true })), {});
   }
   finally {
@@ -120,7 +120,7 @@ test("directory switching is session scoped, works without polaris, and updates 
       if (!line.includes("\n")) return;
       const request = JSON.parse(line.trim());
       calls.push(request);
-      if (request.params.prompt === "lost response" || request.method === "webview") { socket.destroy(); return; }
+      if (request.params.prompt === "lost response" || ["webview", "chrome"].includes(request.method)) { socket.destroy(); return; }
       const rejected = request.params.path === "missing";
       socket.end(JSON.stringify(rejected
         ? { ok: false, error: "directory missing" }
@@ -158,6 +158,11 @@ test("directory switching is session scoped, works without polaris, and updates 
     assert.equal(calls.length, before + 2, "browser mutations must not retry a lost response");
     assert.equal(calls.at(-1).method, "webview");
     assert.deepEqual(calls.at(-1).params, webviewArgs);
+    const chromeArgs = { operation: "act", tabTag: "C1-test", snapshotId: "test-snapshot", action: { action: "press", key: "Enter" } };
+    await assert.rejects(tools.chrome.execute(chromeArgs));
+    assert.equal(calls.length, before + 3, "Chrome mutations must not retry a lost response");
+    assert.equal(calls.at(-1).method, "chrome");
+    assert.deepEqual(calls.at(-1).params, chromeArgs);
   } finally {
     for (const key of ["NOVA_CONTEXT_SERVICE_ENDPOINT", "NOVA_CONTEXT_SERVICE_TOKEN", "NOVA_CWD_CHANGE_SCOPE"]) {
       if (previous[key] === undefined) delete process.env[key];

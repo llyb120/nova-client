@@ -29,6 +29,7 @@ fn available_tools() -> Vec<Value> {
     if std::env::var("NOVA_TOOLS_READ_ONLY").as_deref() != Ok("1") {
         tools.extend(crate::image_generation::tool_definitions());
         tools.push(crate::native_browser::tool_definition());
+        tools.push(crate::chrome_browser::tool_definition());
     }
     tools
 }
@@ -141,7 +142,7 @@ async fn tool_result(name: &str, result: Result<Value, String>) -> Value {
     };
     let text = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
     let mut content = vec![json!({"type":"text","text":text})];
-    if name == "webview" {
+    if matches!(name, "webview" | "chrome") {
         use base64::Engine;
         if let Some(images) = value["images"].as_array() {
             // Paths originate from the authenticated native service, not the caller or page text.

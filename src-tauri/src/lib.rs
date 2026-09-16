@@ -15,6 +15,7 @@ mod gitwt;
 mod http_stream;
 pub mod image_generation;
 mod native_browser;
+mod chrome_browser;
 mod lyra;
 mod lyra_complete;
 mod model_cache;
@@ -5776,6 +5777,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             native_browser::native_browser_ui,
+            chrome_browser::chrome_browser_ui,
             image_generation::image_command_context,
             list_threads,
             load_threads,

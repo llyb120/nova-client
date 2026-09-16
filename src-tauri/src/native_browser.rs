@@ -327,6 +327,7 @@ async fn change_tab(
 
 pub(crate) fn init(app: &AppHandle) {
     app.manage(BrowserState::default());
+    crate::chrome_browser::init(app);
     let _ = APP.set(app.clone());
 }
 
@@ -361,6 +362,13 @@ fn check(app: &AppHandle, current: &Session) -> Result<(), String> {
         .lock()
         .unwrap()
         .clone();
+    if current.browser_id == "chrome" {
+        return if active.as_deref() == Some(&current.thread_id) {
+            Ok(())
+        } else {
+            Err("已切换会话，停止 Chrome 操作；页面状态保留".into())
+        };
+    }
     let latest = session(app, &current.browser_id)?;
     if !latest.visible || active.as_deref() != Some(&current.thread_id) {
         return Err("浏览器不在当前可见会话中，已停止操作".into());
@@ -554,8 +562,34 @@ pub async fn native_browser_ui(
     }
 }
 
-#[cfg(windows)]
 async fn cdp(
+    app: &AppHandle,
+    method: &str,
+    params: Value,
+    session_id: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<Value, String> {
+    if cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    {
+        return Err("已停止".into());
+    }
+    let label = active_label(app)?;
+    if label.starts_with("chrome:") {
+        let tag = label.rsplit(':').next().ok_or("缺少 Chrome tabTag")?;
+        return crate::chrome_browser::request(
+            app,
+            "cdp",
+            json!({"tabTag":tag,"method":method,"params":params,"sessionId":session_id}),
+        )
+        .await;
+    }
+    native_cdp(app, method, params, session_id, cancel).await
+}
+
+#[cfg(windows)]
+async fn native_cdp(
     app: &AppHandle,
     method: &str,
     params: Value,
@@ -625,7 +659,7 @@ async fn cdp(
 }
 
 #[cfg(not(windows))]
-async fn cdp(
+async fn native_cdp(
     _: &AppHandle,
     _: &str,
     _: Value,
@@ -1318,18 +1352,33 @@ async fn control(
     operation: &str,
     args: &Value,
 ) -> Result<Value, String> {
+    control_session(app, session(app, id)?, operation, args).await
+}
+
+async fn control_session(
+    app: &AppHandle,
+    mut s: Session,
+    operation: &str,
+    args: &Value,
+) -> Result<Value, String> {
     let state = app.state::<BrowserState>();
     let _guard = state.gate.try_lock().map_err(|_| "浏览器正在执行任务")?;
     let started = std::time::Instant::now();
-    let mut s = session(app, id)?;
-    s.cancel = Arc::new(AtomicBool::new(false));
+    let chrome = s.browser_id == "chrome";
+    s.cancel = if chrome {
+        crate::chrome_browser::begin(app, s.active_tab.rsplit(':').next().unwrap())
+    } else {
+        Arc::new(AtomicBool::new(false))
+    };
     check(app, &s)?;
-    update_session(app, &s.thread_id, |current| {
-        current.cancel = s.cancel.clone();
-        current.busy = true;
-        current.status = "正在操作网页".into();
-    });
-    emit(app);
+    if !chrome {
+        update_session(app, &s.thread_id, |current| {
+            current.cancel = s.cancel.clone();
+            current.busy = true;
+            current.status = "正在操作网页".into();
+        });
+        emit(app);
+    }
     let mut completed_action = None;
     let task=CONTROL_TAB.scope(s.active_tab.clone(),async {
         if operation!="act" {return Ok(snapshot(app,operation=="screenshot",args).await?.1);}
@@ -1409,20 +1458,22 @@ async fn control(
             }
         }
     }
-    update_session(app, &s.thread_id, |current| {
-        if Arc::ptr_eq(&current.cancel, &s.cancel) {
-            current.busy = false;
-            current.status = "就绪".into();
-        }
-    });
-    emit(app);
+    if !chrome {
+        update_session(app, &s.thread_id, |current| {
+            if Arc::ptr_eq(&current.cancel, &s.cancel) {
+                current.busy = false;
+                current.status = "就绪".into();
+            }
+        });
+        emit(app);
+    }
     if let Ok(value) = &mut result {
         value["durationMs"] = json!(started.elapsed().as_millis());
     }
     result
 }
 
-pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> {
+fn current_context(root: &Path) -> Result<(&'static AppHandle, String), String> {
     let app = APP.get().ok_or("webview 仅在 Nova 桌面应用内可用")?;
     let state = app.state::<AppState>();
     let thread_id = state
@@ -1445,6 +1496,11 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> 
     {
         return Err("工具工作目录与前台会话不同，请切到对应会话后使用浏览器".into());
     }
+    Ok((app, thread_id))
+}
+
+pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> {
+    let (app, thread_id) = current_context(root)?;
     let operation = args["operation"].as_str().unwrap_or_default();
     if operation == "open" {
         let url = normalized_url(args["url"].as_str().unwrap_or_default())?;
@@ -1482,6 +1538,74 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> 
         "inspect" | "screenshot" | "act" => control(app, id, operation, args).await,
         _ => Err("未知 webview 操作".into()),
     }
+}
+
+pub(crate) async fn execute_chrome(root: &Path, args: &Value) -> Result<Value, String> {
+    let (app, thread_id) = current_context(root)?;
+    let operation = args["operation"].as_str().unwrap_or_default();
+    let connection = crate::chrome_browser::connect(app).await?;
+    if matches!(operation, "connect" | "status") {
+        return Ok(connection);
+    }
+    if matches!(operation, "tabs" | "open" | "new_tab") {
+        let mut params = args.clone();
+        if let Some(url) = args["url"].as_str() {
+            params["url"] = json!(normalized_url(url)?.to_string());
+        }
+        return crate::chrome_browser::request(app, operation, params).await;
+    }
+    let tag = args["tabTag"]
+        .as_str()
+        .filter(|tag| {
+            tag.len() <= 80
+                && tag.starts_with('C')
+                && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        .ok_or("缺少有效 tabTag；请先 chrome.tabs，不会默认操作当前激活标签")?;
+    if operation == "stop" {
+        crate::chrome_browser::stop(app, tag);
+    }
+    if matches!(
+        operation,
+        "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop"
+    ) {
+        let mut params = args.clone();
+        if operation == "goto" {
+            params["url"] =
+                json!(normalized_url(args["url"].as_str().unwrap_or_default())?.to_string());
+        }
+        let value = crate::chrome_browser::request(app, operation, params).await?;
+        if matches!(
+            operation,
+            "close_tab" | "goto" | "back" | "forward" | "reload" | "stop"
+        ) {
+            app.state::<BrowserState>()
+                .observations
+                .lock()
+                .unwrap()
+                .retain(|key, _| !key.ends_with(&format!(":{tag}")));
+        }
+        return Ok(value);
+    }
+    if !matches!(operation, "inspect" | "screenshot" | "act") {
+        return Err("未知 chrome 操作".into());
+    }
+    let s = Session {
+        browser_id: "chrome".into(),
+        thread_id: thread_id.clone(),
+        url: String::new(),
+        visible: true,
+        busy: false,
+        status: String::new(),
+        active_tab: format!("chrome:{thread_id}:{tag}"),
+        tabs: Vec::new(),
+        bounds: None,
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+    let mut value = control_session(app, s, operation, args).await?;
+    value["tabTag"] = json!(tag);
+    value["browser"] = json!("chrome");
+    Ok(value)
 }
 
 fn state_dir(app: &AppHandle) -> std::path::PathBuf {

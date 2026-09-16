@@ -137,6 +137,8 @@ pub fn tool_set(
     if !read_only {
         let webview = crate::native_browser::tool_definition();
         tools.push(Tool { name: "webview", description: webview["description"].as_str().unwrap().into(), parameters: schema(webview["inputSchema"].clone()) });
+        let chrome = crate::chrome_browser::tool_definition();
+        tools.push(Tool { name: "chrome", description: chrome["description"].as_str().unwrap().into(), parameters: schema(chrome["inputSchema"].clone()) });
         for definition in crate::image_generation::tool_definitions() {
             tools.push(Tool {
                 name: if definition["name"] == "edit_image" { "edit_image" } else { "generate_image" },
@@ -593,6 +595,13 @@ async fn execute_inner(
         "webview" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，网页控制不可用"); }
             match crate::native_browser::execute(root, args).await {
+                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
+        "chrome" => {
+            if shell.is_none() { return ToolOutcome::error("当前为只读模式，Chrome 控制不可用"); }
+            match crate::native_browser::execute_chrome(root, args).await {
                 Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
                 Err(error) => ToolOutcome::error(error),
             }
