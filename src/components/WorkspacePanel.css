@@ -98,7 +98,8 @@
 .workspace-code .cm-content { padding: 10px 0; caret-color: var(--text); user-select: text; -webkit-user-select: text; }
 .workspace-code .cm-line { padding: 0 10px; }
 .workspace-code .cm-gutters { background: color-mix(in srgb, var(--bg) 70%, transparent); color: var(--text-muted); border-right: 1px solid var(--border); }
-.workspace-code .cm-activeLine, .workspace-code .cm-activeLineGutter { background: var(--bg-hover); }
+/* 半透明底色：CM 选区层 z-index 为负、画在行背景之下，不透明 activeLine 会把选区高亮整个盖住。 */
+.workspace-code .cm-activeLine, .workspace-code .cm-activeLineGutter { background: color-mix(in srgb, var(--bg-active) 55%, transparent); }
 .workspace-code .cm-cursor { border-left-color: var(--text); }
 .workspace-code .cm-editor > .cm-scroller > .cm-selectionLayer .cm-selectionBackground,
 .workspace-code .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground { background: color-mix(in srgb, var(--accent) 24%, transparent); }
