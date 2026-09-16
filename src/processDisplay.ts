@@ -15,10 +15,17 @@ export function processSegments(items: Item[]): ProcessSegment[] {
   return segments;
 }
 
+const ACTION_LABEL: Record<string, string> = { read: "读取文件", edit: "修改文件", delete: "删除文件", search: "搜索文件与资料", execute: "执行命令", think: "分析思路", fetch: "获取资料" };
+
+/** 折叠行摘要：同类动作带上次数（执行命令 ×3），否则不同段只报类目、看不出做了多少 */
 export function processSummary(items: ProcessItem[]): string {
-  const labels: Record<string, string> = { read: "读取文件", edit: "修改文件", delete: "删除文件", search: "搜索文件与资料", execute: "执行命令", think: "分析思路", fetch: "获取资料" };
   const tools = items.filter((item): item is ToolItem => item.type === "tool");
-  const actions = [...new Set(tools.map(item => labels[item.kind] ?? "调用工具"))];
+  const counts = new Map<string, number>();
+  for (const tool of tools) {
+    const label = ACTION_LABEL[tool.kind] ?? "调用工具";
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const actions = [...counts].map(([label, n]) => `${label} ×${n}`);
   const failed = tools.filter(item => item.status === "failed").length;
   return (actions.join("、") || "分析思路") + (failed ? `（${failed} 项失败）` : "");
 }

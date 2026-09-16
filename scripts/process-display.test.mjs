@@ -7,8 +7,10 @@ const items = [thought(1), tool(2, "read"), tool(3, "edit"), { type: "assistant"
 const segments = processSegments(items);
 assert.deepEqual(segments.map(s => [s.type, s.id]), [["process", 1], ["item", 4], ["process", 5]]);
 assert.deepEqual(segments.flatMap(s => s.type === "process" ? s.items : [s.item]), items);
-assert.equal(processSummary(segments[0].items), "读取文件、修改文件");
-assert.equal(processSummary([tool(1, "read"), tool(2, "read", "failed")]), "读取文件（1 项失败）");
+assert.equal(processSummary(segments[0].items), "读取文件 ×1、修改文件 ×1");
+assert.equal(processSummary([tool(1, "read"), tool(2, "read", "failed")]), "读取文件 ×2（1 项失败）");
+assert.equal(processSummary([tool(1, "execute"), tool(2, "execute"), tool(3, "execute")]), "执行命令 ×3");
+assert.equal(processSummary([tool(1, "execute"), tool(2, "read"), tool(3, "execute")]), "执行命令 ×2、读取文件 ×1");
 assert.equal(processSummary([thought(1)]), "分析思路");
 assert.deepEqual(processLiveLines(segments[0].items), ["已完成 · read file.ts", "已完成 · edit file.ts"]);
 assert.deepEqual(processLiveLines([thought(1), tool(2, "search", "in_progress")]), ["下一步", "进行中 · search file.ts"]);

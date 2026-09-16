@@ -145,7 +145,7 @@ function ProcessBody(props: { items: Item[]; active: boolean }) {
     return <div class="process-block">
       <button type="button" class="process-toggle" aria-expanded={open()} onClick={() => toggleExpanded(key())}>
         <IconChevron size={12} open={open()} />
-        <span class="process-lines" classList={{ "process-lines-live": live() }}><span>{lines().join("\n")}</span></span>
+        <span class="process-lines" classList={{ "process-lines-live": live() }}><span title={lines().join("\n")}>{lines().join("\n")}</span></span>
       </button>
       <Show when={open()}><div class="turn-process"><For each={segment.items}>{item => <TranscriptItem item={item} />}</For></div></Show>
     </div>;
