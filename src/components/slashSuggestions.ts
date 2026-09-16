@@ -72,12 +72,6 @@ export function getSlashSuggestions(
       kind: "Nova",
       input: "/run ",
     },
-    {
-      name: "train",
-      description: "立即用大熊座配置的模型训练一次经验库",
-      kind: "Nova",
-      input: "/train",
-    },
     ...(agentKind === "lyra" ? [
       {
         name: "browser",

@@ -15,7 +15,6 @@ import {
   openNewSession,
   openThread,
   setUnreadTurns,
-  setTrainingProject,
   setView,
   state,
   virgoHiddenThreads,
@@ -100,27 +99,16 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "browser" | "virgo") => {
     setView(view);
     closeThread();
   };
   const openHome = () => openNewSession();
   const openClues = () => switchView("clues");
-  const openTraining = () => {
-    const recent = state.threads.find((thread) => !thread.experienceThread);
-    const cwd = recent?.worktree?.repo || recent?.cwd || state.projects[0]?.worktree?.repo || state.projects[0]?.path || "";
-    if (!cwd) {
-      void message("请先创建或选择一个项目，再打开大熊座。", { kind: "info" });
-      return;
-    }
-    setTrainingProject(cwd);
-    switchView("training");
-  };
   const openWorkflows = () => switchView("workflows");
   const openBrowser = () => switchView("browser");
   const openVirgo = () => switchView("virgo");
 
-  const isTrainingView = () => state.view === "training";
   const isBrowserView = () => state.view === "browser";
   // 减少焦虑（高级设置开启）：运行中的任务链移入室女座，普通模式不再显示，结束后自动移回。
   // 未开启时室女座仍是手动收纳位：快捷键收起的会话放在这里，tab 随收纳内容出现/隐藏。
@@ -155,17 +143,7 @@ export function Sidebar(props: {
   const threadOf = (id: string) => state.threads.find((item) => item.id === id);
   const openHistoryThread = async (id: string) => {
     const thread = state.threads.find((item) => item.id === id);
-    // 大熊座、双子座会话各自保持对应 tab；减少焦虑模式下运行中的普通会话留在室女座，其余回到普通模式。
-    if (thread?.experienceThread) setTrainingProject(thread.worktree?.repo || thread.cwd);
-    setView(
-      thread?.experienceThread
-        ? "training"
-        : thread?.browserThread
-          ? "browser"
-          : thread && zenMode() && inRunningChain(thread)
-            ? "virgo"
-            : "home",
-    );
+    setView(thread?.browserThread ? "browser" : thread && zenMode() && inRunningChain(thread) ? "virgo" : "home");
     // 打开时若链上仍有其它阶段未读，仅消费一条未读（聚合徽标 -1）；本 stage 自身清零。
     if (state.unreadTurns[id] && chainUnreadTurns(threadOf(id)) > 1) {
       setUnreadTurns(id, Math.max((state.unreadTurns[id] ?? 1) - 1, 0));
@@ -198,9 +176,7 @@ export function Sidebar(props: {
   };
 
   const currentGroups = createMemo(() => {
-    const threads = isTrainingView()
-      ? state.threads.filter((t) => t.experienceThread)
-      : isBrowserView()
+    const threads = isBrowserView()
         ? state.threads.filter((t) => t.browserThread)
         : isVirgoView()
           ? state.threads.filter((t) => !t.experienceThread && !t.browserThread && inRunningChain(t))
@@ -689,14 +665,6 @@ export function Sidebar(props: {
             </button>
           </div>
           <div class="mode-seg secondary">
-            <button
-              class="mode-seg-btn"
-              classList={{ active: state.view === "training" }}
-              onClick={openTraining}
-              title="大熊座：查看隔离的训练记录、北斗七星专家经验，并进行点赞点踩"
-            >
-              大熊座
-            </button>
             <Show when={virgoVisible()}>
               <button
                 id="virgo-tab"
@@ -739,9 +707,7 @@ export function Sidebar(props: {
           when={currentGroups().length > 0}
           fallback={
             <div class="thread-empty">
-              {isTrainingView()
-                ? "还没有训练会话。点击右侧“立即训练”开始。"
-                : isVirgoView()
+              {isVirgoView()
                   ? "没有正在运行的会话。运行中的会话会暂时移到这里，结束后自动回到普通模式。"
                   : isBrowserView()
                     ? "还没有双子座执行会话。运行一个片段后会显示在这里。"

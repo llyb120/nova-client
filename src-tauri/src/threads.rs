@@ -546,7 +546,7 @@ pub struct Thread {
     /// 非 None：本会话在独立 git worktree 中执行（cwd 已指向该 worktree 工作目录）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
-    /// 猎户座训练会话：仅在猎户座左侧历史展示，与普通会话隔离。
+    /// 旧版本训练记录标记：仅为保持本地隔离而兼容，不再创建此类会话。
     #[serde(default)]
     pub experience_thread: bool,
     /// 双子座浏览器计划执行会话：仅在双子座左侧历史展示。
@@ -891,7 +891,7 @@ pub struct ThreadMeta {
     /// 非 None：该会话在独立 git worktree 中执行（前端据此显示分支标记）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
-    /// 猎户座训练会话：只在猎户座左侧历史展示。
+    /// 兼容旧版本训练记录，避免混入普通历史。
     #[serde(default)]
     pub experience_thread: bool,
     /// 双子座浏览器执行会话：只在双子座左侧历史展示。

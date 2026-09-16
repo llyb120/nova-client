@@ -21,13 +21,8 @@ pub struct BrowserTools {
     pub session_id: String,
 }
 
-const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，并自动使用 task（缺省时回退 keywords）检索相关的猎户座经验、记忆与守则，一并返回。目标行段已明确时直接 read。";
+const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，一并返回。目标行段已明确时直接 read。";
 
-fn render_trained_knowledge(project_root: &str, activated: &Value, rendered: &str) -> String {
-    format!(
-        "\n\n# TRAINED KNOWLEDGE\nprojectRoot={project_root}\nactivatedExperts={activated}\n{rendered}"
-    )
-}
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。禁止无排除的递归搜索（grep -r 等）。";
@@ -48,7 +43,6 @@ fn schema(value: Value) -> Value {
 pub fn tool_set(
     read_only: bool,
     polaris: bool,
-    memory_enabled: bool,
     auto_change_project: bool,
     browser: bool,
 ) -> Vec<Tool> {
@@ -195,9 +189,6 @@ pub fn tool_set(
             })),
         });
     }
-
-    // feedback_memory 暂时禁用：内部记账调用会打断转录的结论切分，且闭环提醒会多跑一次模型。
-    let _ = memory_enabled;
 
     tools
 }
@@ -615,7 +606,6 @@ async fn execute_inner(
         }
         "polaris" => {
             let code_root = root.to_path_buf();
-            let memory_root = root.to_path_buf();
             let mut args = args.clone();
             if let Some(object) = args.as_object_mut() {
                 let raw = object.get("keywords").cloned().unwrap_or(Value::Null);
@@ -634,100 +624,15 @@ async fn execute_inner(
                     .collect();
                 object.insert("keywords".into(), Value::Array(keywords));
             }
-            let memory_query = args
-                .get("task")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .or_else(|| {
-                    args.get("keywords")
-                        .and_then(Value::as_array)
-                        .map(|values| {
-                            values
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                })
-                .unwrap_or_default();
-            let memory_enabled = std::env::var("NOVA_EXPERIENCE_TOOLS")
-                .map(|value| value == "1")
-                .unwrap_or(false);
-            // 两侧并行但返回仍等待较慢一侧；分别计时以定位知识召回/工作线程排队。
             let started = std::time::Instant::now();
             let code_job = tokio::task::spawn_blocking(move || {
                 let result = crate::nova_tools_native::context::polaris(&code_root, args);
                 eprintln!("[nova-tools-profile] polaris.code_with_queue: {:.2}ms", started.elapsed().as_secs_f64() * 1000.0);
                 result
             });
-            let memory_job = tokio::task::spawn_blocking(move || {
-                if !memory_enabled || memory_query.is_empty() {
-                    None
-                } else {
-                    let result = crate::experience::load_trained_memory(
-                        &memory_root.to_string_lossy(), &memory_query, 8,
-                    );
-                    eprintln!("[nova-tools-profile] polaris.memory_with_queue: {:.2}ms", started.elapsed().as_secs_f64() * 1000.0);
-                    if let Err(error) = &result { eprintln!("[polaris] knowledge recall failed: {error}"); }
-                    result.ok()
-                }
-            });
-            let (code_result, memory_result) = tokio::join!(code_job, memory_job);
-            match code_result {
+            match code_job.await {
                 Ok(Ok(text)) => {
-                    let mut text = clamp_tool_output_text(&text);
-                    let memory = memory_result.ok().flatten();
-                    if let Some(rows) = memory
-                        .as_ref()
-                        .and_then(|value| value.get("experiences"))
-                        .and_then(Value::as_array)
-                        .filter(|rows| !rows.is_empty())
-                    {
-                        let rendered = rows
-                            .iter()
-                            .map(|item| {
-                                let id = item.get("id").and_then(Value::as_str).unwrap_or("");
-                                let kind = item
-                                    .get("kind")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("experience");
-                                let knowledge_scope = item
-                                    .get("knowledgeScope")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("project");
-                                let scope_label = if knowledge_scope == "universal" {
-                                    "泛用"
-                                } else {
-                                    "项目独有"
-                                };
-                                let trigger =
-                                    item.get("trigger").and_then(Value::as_str).unwrap_or("");
-                                let action =
-                                    item.get("action").and_then(Value::as_str).unwrap_or("");
-                                format!(
-                                    "- [{scope_label}/{kind}] id={id} 条件/上下文：{trigger}\n  内容：{action}"
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let activated = memory
-                            .as_ref()
-                            .and_then(|value| value.get("activatedExperts"))
-                            .cloned()
-                            .unwrap_or_else(|| json!([]));
-                        let project_root = memory
-                            .as_ref()
-                            .and_then(|value| value.get("projectRoot"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        text.push_str(&render_trained_knowledge(
-                            project_root,
-                            &activated,
-                            &rendered,
-                        ));
-                    }
+                    let text = clamp_tool_output_text(&text);
                     ToolOutcome::text(text.clone())
                         .with_details(json!({ "polaris": text }))
                 }
@@ -947,7 +852,6 @@ async fn execute_inner(
                 _ => ToolOutcome::error(format!("工作目录不存在或不是目录：{}", next.display())),
             }
         }
-        "feedback_memory" => ToolOutcome::error("feedback_memory 已暂时禁用"),
         other => ToolOutcome::error(format!("未知工具：{other}")),
     }
 }
@@ -955,7 +859,7 @@ async fn execute_inner(
 #[cfg(test)]
 mod embedded_rtk_tests {
     use super::{
-        browser_url_allowed, capture_bash_pipe, drain_bash_pipes, render_trained_knowledge,
+        browser_url_allowed, capture_bash_pipe, drain_bash_pipes,
         rewrite_with_embedded_rtk, tool_set,
     };
     use crate::lyra::prompt::{ShellConfig, ShellKind};
@@ -964,7 +868,7 @@ mod embedded_rtk_tests {
     #[tokio::test]
     async fn image_tools_work_without_polaris_and_are_blocked_in_read_only_mode() {
         for read_only in [false, true] {
-            let tools = tool_set(read_only, false, false, false, false);
+            let tools = tool_set(read_only, false, false, false);
             for name in ["generate_image", "edit_image"] {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
@@ -984,19 +888,17 @@ mod embedded_rtk_tests {
     }
 
     #[test]
-    fn disabled_feedback_memory_is_not_advertised() {
-        let tools = tool_set(false, true, true, false, false);
+    fn removed_memory_tools_are_not_advertised() {
+        let tools = tool_set(false, true, false, false);
         assert!(tools.iter().all(|tool| tool.name != "feedback_memory"));
         assert!(tools.iter().all(|tool| tool.name != "browser"));
-        assert!(tool_set(false, true, true, false, true)
+        assert!(tool_set(false, true, false, true)
             .iter()
             .any(|tool| tool.name == "browser"));
         let polaris = tools.iter().find(|tool| tool.name == "polaris").unwrap();
         assert!(!polaris.description.contains("feedback_memory"));
 
-        let knowledge = render_trained_knowledge("/tmp/project", &json!(["expert"]), "memory");
-        assert!(!knowledge.contains("feedback_memory"));
-        assert!(!knowledge.contains("FEEDBACK REQUIRED"));
+        assert!(!polaris.description.contains("训练"));
     }
 
     #[test]

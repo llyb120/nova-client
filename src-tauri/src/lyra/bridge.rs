@@ -337,7 +337,6 @@ async fn handle_prompt(
 
     let agent_instructions = load_agent_instructions(roots);
     let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
-    let memory_enabled = settings.experience_training_enabled;
     let auto_change_project = settings.auto_change_project_enabled;
     let ponytail = settings.ponytail_enabled;
     let shell = (!read_only).then(prompt::detect_shell);
@@ -346,7 +345,6 @@ async fn handle_prompt(
         cwd: cwd_path.display().to_string(),
         read_only,
         fast_context,
-        memory_enabled,
         auto_change_project,
         browser: browser_enabled,
         shell: shell.clone(),
@@ -434,7 +432,6 @@ async fn handle_prompt(
     let agent_tools = tool_set(
         read_only,
         fast_context,
-        memory_enabled,
         auto_change_project,
         browser_enabled,
     );

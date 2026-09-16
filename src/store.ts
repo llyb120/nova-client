@@ -145,8 +145,6 @@ interface AppStore {
   /** Plan 模式产出的 proposed plan：非空时展示「实施此计划」选项 */
   proposedPlan: string | null;
   cwd: string;
-  /** 大熊座当前项目；切换视图时保留，worktree 由后端归一到主仓库。 */
-  trainingCwd: string;
   title: string;
   /** 当前线程的模型/模式（"" = 默认） */
   agentKind: AgentKind;
@@ -192,7 +190,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关）；virgo = 室女座（减少焦虑） */
-  view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo";
+  view: "home" | "clues" | "workflows" | "browser" | "virgo";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -214,7 +212,6 @@ export const [state, setState] = createStore<AppStore>({
   plan: null,
   proposedPlan: null,
   cwd: "",
-  trainingCwd: "",
   title: "",
   agentKind: "devin",
   model: "",
@@ -759,12 +756,8 @@ export async function refreshRoamingFolders() {
   }
 }
 
-export function setView(view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo") {
+export function setView(view: "home" | "clues" | "workflows" | "browser" | "virgo") {
   setState("view", view);
-}
-
-export function setTrainingProject(cwd: string) {
-  setState("trainingCwd", cwd);
 }
 
 export function clueCurrentVersion(card: ClueCard) {
@@ -1994,14 +1987,6 @@ export async function sendPrompt(
 ) {
   let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
-  // /train 是 Nova 内置命令：不写入当前会话，也不发送给模型。
-  if (text.trim() === "/train" && images.length === 0) {
-    const cwd = state.threads.find((thread) => thread.id === id)?.worktree?.repo || state.cwd;
-    if (!cwd) throw new Error("请先选择一个项目再训练");
-    setTrainingProject(cwd);
-    await api.trainExperience(cwd);
-    return;
-  }
   // 内置命令优先于工作流触发器，避免 /fire、/hard 等被当成普通内容。
   if (await tryBuiltinPrompt(id, text, images)) return;
   // 在历史分支预览中追加提示词时才发生时间跳跃：先恢复该分支，再把新提示词

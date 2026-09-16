@@ -496,7 +496,6 @@ pub fn system_prompt_fingerprint(options: &SystemPromptOptions) -> String {
         "cwd": options.cwd.trim_start_matches(r"\\?\").replace('\\', "/"),
         "readOnly": options.read_only,
         "fastContext": options.fast_context,
-        "memoryEnabled": options.memory_enabled,
         "autoChangeProject": options.auto_change_project,
         "browser": options.browser,
         "shell": shell,
@@ -545,8 +544,6 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     .into_iter()
     .flatten()
     .collect();
-    // feedback_memory 暂时禁用，不再出现在工具清单与提示词里。
-    let _ = options.memory_enabled;
     let mut stable: Vec<String> = vec![
         "你是 Lyra：高效、简单、面向软件工程结果。".into(),
         format!("Available tools:\n{}", tool_lines.join("\n")),
@@ -564,7 +561,6 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         }
         .into(),
         if options.auto_change_project { "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。" } else { "" }.into(),
-        if options.memory_enabled { "polaris 会用 task 自动附带相关训练知识（task 为空时回退 keywords）。若结果含 TRAINED KNOWLEDGE，当前会话新事实优先；rule 是强约束，memory 是可核验事实，experience 仅在条件匹配时适用。" } else { "" }.into(),
         "先理解再修改，保持改动聚焦。".into(),
         if options.ponytail { PONYTAIL_RULES.into() } else { String::new() },
         "最终回复采用例外汇报，而不是完整工作报告。先直接给出用户可感知的结果；只有信息会影响结果判断、下一步行动、风险认知或可信度时，才写入最终回复。默认省略文件/函数/行号清单、搜索和工具调用过程、常规实现细节、具体测试命令、成功步骤清单、无实际影响的注意事项、泛化建议、‘无风险’声明，以及对同一结果的重复总结。正常成功时用 1～3 句话，不强制使用标题或列表；存在失败、未验证、行为变化、兼容性风险或用户必须操作的事项时，只围绕这些例外按需展开。用户明确询问实现细节时才提供详细报告。".into(),
@@ -608,7 +604,6 @@ pub struct SystemPromptOptions {
     pub cwd: String,
     pub read_only: bool,
     pub fast_context: bool,
-    pub memory_enabled: bool,
     pub auto_change_project: bool,
     pub browser: bool,
     pub shell: Option<ShellConfig>,
@@ -627,7 +622,6 @@ mod tests {
             cwd: "/tmp/project".into(),
             read_only: false,
             fast_context: false,
-            memory_enabled: false,
             auto_change_project: false,
             browser: false,
             shell: None,
