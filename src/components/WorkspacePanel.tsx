@@ -385,7 +385,14 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     </nav>
     <header class="workspace-toolbar workspace-tabbar">
       <span class="workspace-open-label">已打开</span>
-      <div class="workspace-tabs" role="tablist" aria-label="已打开文件" onKeyDown={e => {
+      <div class="workspace-tabs" role="tablist" aria-label="已打开文件" onWheel={e => {
+        const el = e.currentTarget;
+        if (el.scrollWidth <= el.clientWidth) return;
+        const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+        if (!delta) return;
+        e.preventDefault();
+        el.scrollLeft += e.deltaMode === 1 ? delta * 16 : delta;
+      }} onKeyDown={e => {
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
         const all = tabs(); if (!all.length) return;
         e.preventDefault();
