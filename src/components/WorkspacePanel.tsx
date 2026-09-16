@@ -66,6 +66,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const [saving, setSaving] = createSignal(false);
   const [browse, setBrowse] = createSignal(false);
   const [saved, setSaved] = createSignal(false);
+  const [closing, setClosing] = createSignal<string>();
   const dirty = () => (preview()?.text != null || preview()?.kind === "spreadsheet") && draft() !== normalized(original());
   const draftKey = (path: string) => `${props.threadId}\0${path}`;
   const changeDraft = (text: string) => {
@@ -195,13 +196,8 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     const tab = tabs().find(tab => tab.file.path === path);
     if (tab) activate(tab);
   };
-  const closeTab = async (path: string) => {
-    if (saving()) return;
-    if (!(await commitSheet())) return;
-    snapshot();
-    const tab = tabs().find(tab => tab.file.path === path);
-    if (!tab) return;
-    if (tab.draft !== normalized(tab.original) && !window.confirm(`关闭 ${label(path)} 并放弃未保存修改？`)) return;
+  const finishClose = (tab: FileTab) => {
+    const path = tab.file.path;
     drafts.delete(draftKey(path));
     const index = tabs().indexOf(tab);
     const remaining = tabs().filter(tab => tab.file.path !== path);
@@ -212,6 +208,47 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       if (next) activate(next);
       else { setPreview(undefined); setLoading(false); setError(''); setBrowse(false); }
     }
+  };
+  // 直接按标签页数据写盘，无需先激活——对未激活的脏标签同样适用（含表格）。
+  const saveTab = async (tab: FileTab) => {
+    setSaving(true); setError("");
+    try {
+      let file = tab.file;
+      let diskOriginal = tab.draft;
+      if (file.kind === "spreadsheet") {
+        const { exportSpreadsheet } = await import("../workspaceSpreadsheet");
+        const data = await exportSpreadsheet(JSON.parse(tab.draft));
+        await api.saveWorkspaceFile(props.threadId, file.path, file.data!, data);
+        file = { ...file, data, sheet: tab.draft, size: Math.floor(data.length * 3 / 4) };
+        if (preview()?.path === file.path) setPreview(file);
+      } else {
+        diskOriginal = tab.original.includes("\r\n") ? tab.draft.replace(/\n/g, "\r\n") : tab.draft;
+        await api.saveWorkspaceFile(props.threadId, file.path, tab.original, diskOriginal);
+      }
+      drafts.delete(draftKey(file.path));
+      setTabs(all => all.map(item => item === tab ? { ...item, file, original: diskOriginal, saved: true } : item));
+      if (preview()?.path === file.path) { setOriginal(diskOriginal); setSaved(true); }
+      setArtifacts(all => [...new Set([file.path, ...all])]);
+      return true;
+    } catch (e) { setError(String(e)); return false; }
+    finally { setSaving(false); }
+  };
+  const closeTab = async (path: string) => {
+    if (saving()) return;
+    if (!(await commitSheet())) return;
+    snapshot();
+    const tab = tabs().find(tab => tab.file.path === path);
+    if (!tab) return;
+    if (tab.draft !== normalized(tab.original)) { setClosing(path); return; }
+    finishClose(tab);
+  };
+  const resolveClose = async (saveFirst: boolean) => {
+    const path = closing();
+    setClosing(undefined);
+    const tab = path && tabs().find(tab => tab.file.path === path);
+    if (!tab) return;
+    if (saveFirst && !(await saveTab(tab))) return;
+    finishClose(tab);
   };
   const revealLine = (line?: number) => {
     if (!Number.isSafeInteger(line) || line! < 1 || !preview()?.text) return;
@@ -501,5 +538,20 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     <Show when={!preview() && !loading()}><div class="workspace-empty">选择文件以查看预览</div></Show>
     </div>
     <menu.Menu />
+    <Show when={closing()}>{path => (
+      <div class="modal-backdrop" onClick={() => setClosing(undefined)}>
+        <div class="modal workspace-close-modal" role="alertdialog" aria-modal="true" aria-label="关闭未保存的文件" onClick={e => e.stopPropagation()}>
+          <div class="modal-head"><span>未保存的修改</span>
+            <button class="icon-btn" aria-label="取消" onClick={() => setClosing(undefined)}><IconX size={16} /></button>
+          </div>
+          <div class="modal-body"><p>{label(path())} 有未保存的修改，关闭前要保存吗？</p></div>
+          <div class="modal-foot">
+            <button class="btn secondary" onClick={() => setClosing(undefined)}>取消</button>
+            <button class="btn secondary" onClick={() => void resolveClose(false)}>不保存</button>
+            <button class="btn primary" onClick={() => void resolveClose(true)}>保存</button>
+          </div>
+        </div>
+      </div>
+    )}</Show>
   </aside>;
 }

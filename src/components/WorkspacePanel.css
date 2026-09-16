@@ -122,3 +122,4 @@
 .workspace-diff-number { width: 4em; flex-shrink: 0; text-align: right; padding-right: 8px; color: var(--text-muted); user-select: none; }
 .workspace-diff-sign { width: 1.5em; flex-shrink: 0; user-select: none; }
 .workspace-panel .workspace-diff-fold { display: block; width: 100%; border-block: 1px solid var(--border); border-radius: 0; color: var(--accent); background: var(--hover); }
+.workspace-close-modal { width: min(380px, 92vw); }
