@@ -1852,7 +1852,7 @@ button {
 
 /* assistant：直接正文，无标签 */
 .msg-assistant {
-  margin: 14px 0;
+  margin: 6px 0;
   line-height: 1.7;
 }
 

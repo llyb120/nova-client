@@ -1549,7 +1549,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const lines = isLive
             ? processLiveLines(segment.items, text => wrapText(text, Math.max(1, width - 40), 12, p.sans))
             : [processSummary(segment.items)];
-          py += 4 + (isLive ? (2 - lines.length) * 24 : 0);
+          py += 4;
           for (const [lineIndex, line] of lines.entries()) {
             result.push({ kind: "fold", id: segment.id, groupIdx: gi,
               x: side + xOffset, y: py, w: width, h: 24,
@@ -1773,8 +1773,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       const trimmed = text.trim();
       // Skip empty / placeholder replies so they don't leave blank gaps between user prompts.
       if (!trimmed || trimmed === "None") return y;
-      // .msg-assistant: margin 14px 0; line-height 1.7
-      y += 14;
+      // .msg-assistant: margin 6px 0; line-height 1.7
+      y += 6;
       const mdBlocks = parseMarkdownBlocks(text);
       for (let mi = 0; mi < mdBlocks.length; mi++) {
         const mb = mdBlocks[mi];
@@ -1862,7 +1862,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         }
       }
       if (mdBlocks.length && mdBlocks[mdBlocks.length - 1].type === "paragraph") y -= 10;
-      return y + 14;
+      return y + 6;
     }
 
     if (item.type === "system") {

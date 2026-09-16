@@ -4,5 +4,5 @@
 .process-toggle > svg { flex-shrink: 0; }
 .process-lines { display: block; min-width: 0; }
 .process-lines > span { display: block; line-height: 24px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.process-lines-live { display: flex; flex: 1; flex-direction: column; justify-content: flex-end; height: 48px; overflow: hidden; }
+.process-lines-live { display: flex; flex: 1; flex-direction: column; justify-content: flex-end; max-height: 48px; overflow: hidden; }
 .process-lines-live > span { flex-shrink: 0; white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
