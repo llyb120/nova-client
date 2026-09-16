@@ -18,8 +18,12 @@ import type { SheetEditor } from "./WorkspaceSheet";
 
 type Preview = Awaited<ReturnType<typeof api.previewWorkspaceFile>>;
 type FileTab = { file: Preview; original: string; draft: string; editing: boolean; source: boolean; saved: boolean; error: string; scroll: number; start: number; end: number };
+type PanelSnapshot = { mode: "files" | "artifacts" | "git"; tabs: FileTab[]; activePath?: string; browse: boolean; expanded: string[]; filter: string; artifactFilter: string };
 // Keep unsaved buffers when ChatView unmounts on a thread switch; never evict user edits.
 const drafts = new Map<string, { file: Preview; text: string }>();
+// ChatView remounts the panel on every thread switch; remember each thread's
+// mode/tabs/picker state so the side bar is restored exactly as it was left.
+const panels = new Map<string, PanelSnapshot>();
 const normalized = (text: string) => text.replace(/\r\n/g, "\n");
 function FileIcon(props: { path: string; directory?: boolean }) {
   const ext = () => props.path.split(".").pop()?.toLowerCase() ?? "";
@@ -40,11 +44,12 @@ function FileIcon(props: { path: string; directory?: boolean }) {
 }
 export default function WorkspacePanel(props: { threadId: string; request: { path: string; line?: number } | null; onClose: () => void }) {
   const threadId = props.threadId;
-  const [mode, setMode] = createSignal<"files" | "artifacts" | "git">("files");
+  const remembered = panels.get(threadId);
+  const [mode, setMode] = createSignal<"files" | "artifacts" | "git">(remembered?.mode ?? "files");
   const [artifacts, setArtifacts] = createSignal<string[]>([]);
-  const [artifactFilter, setArtifactFilter] = createSignal("");
-  const [tabs, setTabs] = createSignal<FileTab[]>([]);
-  const [expanded, setExpanded] = createSignal(new Set<string>());
+  const [artifactFilter, setArtifactFilter] = createSignal(remembered?.artifactFilter ?? "");
+  const [tabs, setTabs] = createSignal<FileTab[]>(remembered?.tabs ?? []);
+  const [expanded, setExpanded] = createSignal(new Set<string>(remembered?.expanded));
   const [treeRevision, setTreeRevision] = createSignal(0);
   type Listing = Awaited<ReturnType<typeof api.listWorkspaceDirectory>>;
   const directories = new Map<string, Promise<Listing>>();
@@ -68,7 +73,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     if (dirty()) drafts.set(draftKey(file.path), { file: file.kind === "spreadsheet" ? { ...file, sheet: original() } : { ...file, text: original() }, text });
     else drafts.delete(draftKey(file.path));
   };
-  const [filter, setFilter] = createSignal("");
+  const [filter, setFilter] = createSignal(remembered?.filter ?? "");
   const [search, setSearch] = createSignal<Listing>();
   const [searching, setSearching] = createSignal(false);
   const [searchError, setSearchError] = createSignal('');
@@ -105,7 +110,14 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     observer.observe(panel.parentElement!);
     onCleanup(() => observer.disconnect());
   });
-  onCleanup(() => { request++; cancelAnimationFrame(frame); });
+  onCleanup(() => {
+    request++; cancelAnimationFrame(frame);
+    snapshot();
+    panels.delete(threadId);
+    panels.set(threadId, { mode: mode(), tabs: tabs(), activePath: preview()?.path, browse: browse(), expanded: [...expanded()], filter: filter(), artifactFilter: artifactFilter() });
+    // ponytail: 最多记住 16 个会话的侧栏状态，更早的丢弃；未保存草稿仍由 drafts 兜底。
+    while (panels.size > 16) panels.delete(panels.keys().next().value!);
+  });
   const dismissPicker = (event: PointerEvent) => {
     if (!(event.target as HTMLElement).closest('.workspace-picker, .workspace-picker-toggle')) setBrowse(false);
     const actions = panel.querySelector<HTMLDetailsElement>('.workspace-actions[open]');
@@ -325,6 +337,11 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     setWidth(next);
     setWorkspaceLayout({ widthRatio: next / available });
   };
+  if (remembered) {
+    const tab = remembered.tabs.find(tab => tab.file.path === remembered.activePath);
+    if (tab) activate(tab);
+    if (remembered.browse) setBrowse(true);
+  }
   return <aside ref={panel} class="workspace-panel" style={{ width: `${width()}px` }} aria-label="产物与项目文件"
     onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
     <div class="workspace-resize" role="separator" aria-label="调整文件面板宽度" aria-orientation="vertical" tabindex="0"
