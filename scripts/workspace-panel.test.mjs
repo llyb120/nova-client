@@ -154,9 +154,9 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   await page.getByRole('treeitem', {name:'main.ts',exact:true}).click();
   assert.equal(await page.getByRole('tab').count(), 2, 'opening same file selects existing tab');
   assert.equal(await page.evaluate(() => window.testReads().length), readsBefore, 'tab switch does not reread disk');
-  page.once('dialog', dialog => dialog.dismiss());
-  await page.getByRole('button', {name:'关闭 main.ts',exact:true}).click();
-  assert.equal(await page.getByRole('tab').count(), 2, 'cancel closing dirty tab retains it');
+    await page.getByRole('button', {name:'关闭 main.ts',exact:true}).click();
+    await page.locator('.workspace-close-modal .modal-foot').getByRole('button', {name:'取消',exact:true}).click();
+    assert.equal(await page.getByRole('tab').count(), 2, 'cancel closing dirty tab retains it');
   await page.getByRole('button', {name:'选择项目文件',exact:true}).click();
   if (process.env.TEST_SCREENSHOT) await page.screenshot({ path: process.env.TEST_SCREENSHOT });
   await page.getByRole('treeitem', {name:'slow.md',exact:true}).click();
@@ -164,9 +164,9 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   await page.waitForTimeout(350);
   assert.equal(await page.getByRole('tab').count(), 2, 'late file response cannot steal active tab');
   await page.getByRole('heading', {name:'Draft'}).waitFor();
-  page.once('dialog', dialog => dialog.accept());
-  await page.getByRole('button', {name:'关闭 main.ts',exact:true}).click();
-  assert.equal(await page.getByRole('tab').count(), 1);
+    await page.getByRole('button', {name:'关闭 main.ts',exact:true}).click();
+    await page.locator('.workspace-close-modal .modal-foot').getByRole('button', {name:'不保存',exact:true}).click();
+    assert.equal(await page.getByRole('tab').count(), 1);
   await page.locator('.md-file-ref').click();
   await page.getByRole('tab', {name:'main.ts',exact:true}).waitFor();
   await page.getByRole('button', {name:'关闭 main.ts',exact:true}).click();
