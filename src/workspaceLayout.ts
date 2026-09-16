@@ -1,9 +1,9 @@
 import { createStore } from 'solid-js/store';
 
-export type WorkspaceMode = 'files' | 'artifacts' | 'git';
+export type WorkspaceMode = 'files' | 'artifacts' | 'git' | 'browser';
 export const defaultWorkspaceLayout = { open: false, widthRatio: null as number | null, minimap: true, softWrap: true, mode: 'files' as WorkspaceMode };
 const key = 'fd:workspaceLayout';
-const isMode = (value: unknown): value is WorkspaceMode => value === 'files' || value === 'artifacts' || value === 'git';
+const isMode = (value: unknown): value is WorkspaceMode => value === 'files' || value === 'artifacts' || value === 'git' || value === 'browser';
 function validated(value: Partial<typeof defaultWorkspaceLayout>): typeof defaultWorkspaceLayout {
   return {
     open: value.open === true,

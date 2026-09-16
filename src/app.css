@@ -214,7 +214,10 @@ button {
 /* ===== 侧边栏 ===== */
 .sidebar {
   position: relative;
-  width: clamp(248px, 20vw, 292px);
+  /* 宽度只随窗口变、不随主区域视图变：flex:none 挡住主区（如双子座里 width:100% 的浏览器视图）
+     按比例挤压侧栏，否则切到双子座时侧栏会被压窄几十像素。 */
+  flex: none;
+  width: clamp(248px, 20vw, 256px);
   min-width: 248px;
   background: var(--sidebar-veil);
   border-right: 1px solid var(--border);
