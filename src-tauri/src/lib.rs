@@ -5812,6 +5812,7 @@ pub fn run() {
             workspace_files::preview_workspace_file,
             workspace_files::workspace_git_status,
             workspace_files::workspace_git_diff,
+            workspace_files::workspace_git_image,
             workspace_files::save_workspace_file,
             workspace_files::search_workspace_files,
             open_clue_attachment,

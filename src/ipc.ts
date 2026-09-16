@@ -48,6 +48,9 @@ export const api = {
     invoke<{ repo: string; files: { path: string; oldPath: string | null; index: string; worktree: string }[] }>("workspace_git_status", { threadId }),
   workspaceGitDiff: (threadId: string, path: string, staged: boolean) =>
     invoke<string>("workspace_git_diff", { threadId, path, staged }),
+  /** 图片变动的新旧两份内容（base64 data URI），用于直接看图对比。 */
+  workspaceGitImage: (threadId: string, path: string, staged: boolean) =>
+    invoke<{ before: string | null; after: string | null }>("workspace_git_image", { threadId, path, staged }),
   listWorkspaceDirectory: (threadId: string, path: string) =>
     invoke<{ entries: { name: string; path: string; directory: boolean }[]; truncated: boolean }>("list_workspace_directory", { threadId, path }),
   searchWorkspaceFiles: (threadId: string, query: string) =>

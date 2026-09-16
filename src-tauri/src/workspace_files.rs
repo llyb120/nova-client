@@ -10,6 +10,7 @@ use tauri::{Emitter, State};
 
 const TEXT_LIMIT: u64 = 256 * 1024;
 const SHEET_LIMIT: u64 = 16 * 1024 * 1024;
+const IMAGE_LIMIT: u64 = 8 * 1024 * 1024;
 
 // 仅原生拖放事件可授予目录外文件访问；授权精确到文件，随应用退出清空。
 static DROPPED_FILES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
@@ -126,6 +127,54 @@ fn git_patch(repo: &str, path: &str, staged: bool) -> Result<String, String> {
     Ok(patch)
 }
 
+/// 图片扩展名对应的 MIME；非图片返回 None。
+fn image_mime(path: &str) -> Option<&'static str> {
+    Some(match Path::new(path).extension()?.to_str()?.to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        _ => return None,
+    })
+}
+
+/// 图片变动的两份内容（base64 data URI），供源码管理内联对比。
+/// before：暂存差异取 HEAD 版本，工作区差异取索引版本；after：索引版本 / 工作区文件。
+fn git_image(repo: &str, path: &str, staged: bool) -> Result<serde_json::Value, String> {
+    let entry = git_entries(repo)?
+        .into_iter()
+        .find(|e| e.path == path)
+        .ok_or("文件已不在 Git 变动列表中，请刷新")?;
+    let mime = image_mime(path).ok_or("只有图片支持内联对比")?;
+    // 缺失的版本（新增/删除/未跟踪）以及超限的图都留空，由前端标注。
+    let blob = |spec: &str| -> Option<Vec<u8>> {
+        crate::gitwt::run_bytes(repo, &["show", spec])
+            .ok()
+            .filter(|bytes| bytes.len() as u64 <= IMAGE_LIMIT)
+    };
+    let index = format!(":{path}");
+    let (before, after) = if staged {
+        (
+            blob(&format!("HEAD:{}", entry.old_path.as_deref().unwrap_or(path))),
+            blob(&index),
+        )
+    } else {
+        let working = resolve(Path::new(repo), path)
+            .ok()
+            .and_then(|p| fs::read(p).ok())
+            .filter(|bytes| bytes.len() as u64 <= IMAGE_LIMIT);
+        (blob(&index), working)
+    };
+    let data_uri = |bytes: Option<Vec<u8>>| {
+        bytes.map(|b| format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(b)))
+    };
+    Ok(serde_json::json!({ "before": data_uri(before), "after": data_uri(after) }))
+}
+
 #[tauri::command]
 pub async fn workspace_git_diff(
     state: State<'_, AppState>,
@@ -140,6 +189,26 @@ pub async fn workspace_git_diff(
             &["rev-parse", "--show-toplevel"],
         )?;
         git_patch(&repo, &path, staged)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 图片文件的新旧两份内容（base64 data URI），让源码管理里直接看到图而不是「Binary files differ」。
+#[tauri::command]
+pub async fn workspace_git_image(
+    state: State<'_, AppState>,
+    thread_id: String,
+    path: String,
+    staged: bool,
+) -> Result<serde_json::Value, String> {
+    let cwd = root(&state, &thread_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repo = crate::gitwt::run(
+            cwd.to_str().ok_or("路径编码无效")?,
+            &["rev-parse", "--show-toplevel"],
+        )?;
+        git_image(&repo, &path, staged)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -583,6 +652,55 @@ mod tests {
         assert!(git_patch(repo, "renamed.txt", false)
             .unwrap()
             .contains("-base"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn git_image_returns_before_and_after_data_uris() {
+        let dir = std::env::temp_dir().join(format!("nova-git-image-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let repo = dir.to_str().unwrap();
+        crate::gitwt::run(repo, &["init"]).unwrap();
+        let encode = |bytes: &[u8]| {
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        };
+        let old = b"\x89PNG\r\n\x1a\nold";
+        let new = b"\x89PNG\r\n\x1a\nnew";
+        fs::write(dir.join("icon.png"), old).unwrap();
+        fs::write(dir.join("readme.txt"), "text\n").unwrap();
+        crate::gitwt::run(repo, &["add", "."]).unwrap();
+        // 工作区差异：before = 索引版本，after = 工作区文件。
+        fs::write(dir.join("icon.png"), new).unwrap();
+        let working = git_image(repo, "icon.png", false).unwrap();
+        assert_eq!(working["before"], encode(old));
+        assert_eq!(working["after"], encode(new));
+        assert!(git_image(repo, "readme.txt", false).is_err());
+        // 暂存差异：before = HEAD 版本，after = 索引版本。
+        crate::gitwt::run(repo, &["add", "."]).unwrap();
+        crate::gitwt::run(
+            repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "icon",
+            ],
+        )
+        .unwrap();
+        fs::write(dir.join("icon.png"), b"\x89PNG\r\n\x1a\nstaged").unwrap();
+        crate::gitwt::run(repo, &["add", "."]).unwrap();
+        fs::write(dir.join("icon.png"), b"\x89PNG\r\n\x1a\nlater").unwrap();
+        let staged = git_image(repo, "icon.png", true).unwrap();
+        assert_eq!(staged["before"], encode(new));
+        assert_eq!(staged["after"], encode(b"\x89PNG\r\n\x1a\nstaged"));
+        // 新增的未跟踪文件没有旧版本。
+        fs::write(dir.join("fresh.svg"), "<svg/>").unwrap();
+        assert!(git_image(repo, "fresh.svg", false).unwrap()["before"].is_null());
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

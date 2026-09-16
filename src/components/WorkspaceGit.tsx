@@ -4,11 +4,14 @@ import { state } from "../store";
 import { workspaceDiffRows, type DiffRow } from "../workspaceDiff";
 import { IconRefresh } from "./icons";
 
+const IMAGE_PATH = /\.(png|jpe?g|gif|webp|bmp|ico|avif|svg)$/i;
+
 export default function WorkspaceGit(props: { threadId: string; onOpen: (path: string, line?: number) => void }) {
   type Status = Awaited<ReturnType<typeof api.workspaceGitStatus>>;
   const [status, setStatus] = createSignal<Status>();
   const [selection, setSelection] = createSignal<{ path: string; staged: boolean }>();
   const [patch, setPatch] = createSignal("");
+  const [images, setImages] = createSignal<{ before: string | null; after: string | null }>();
   const [error, setError] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [loadingDiff, setLoadingDiff] = createSignal(false);
@@ -33,14 +36,21 @@ export default function WorkspaceGit(props: { threadId: string; onOpen: (path: s
   onCleanup(() => { ++request; window.removeEventListener("focus", refresh); });
   createEffect(() => {
     const chosen = selection(); revision();
-    setPatch(""); setLoadingDiff(false);
+    setPatch(""); setImages(undefined); setLoadingDiff(false);
     if (!chosen) return;
     let disposed = false;
     onCleanup(() => { disposed = true; });
     setLoadingDiff(true); setError("");
+    const failed = (error: unknown) => { if (!disposed) setError(String(error)); };
+    const done = () => { if (!disposed) setLoadingDiff(false); };
+    if (IMAGE_PATH.test(chosen.path)) {
+      void api.workspaceGitImage(props.threadId, chosen.path, chosen.staged)
+        .then(pair => { if (!disposed) setImages(pair); }, failed).finally(done);
+      return;
+    }
     void api.workspaceGitDiff(props.threadId, chosen.path, chosen.staged).then(text => {
       if (!disposed) setPatch(text);
-    }, error => { if (!disposed) setError(String(error)); }).finally(() => { if (!disposed) setLoadingDiff(false); });
+    }, failed).finally(done);
   });
   const groups = createMemo(() => workspaceDiffRows(patch()));
   const stats = createMemo(() => {
@@ -80,11 +90,15 @@ export default function WorkspaceGit(props: { threadId: string; onOpen: (path: s
     <Show when={status() && !status()!.files.length}><p>工作区干净，没有 Git 变动</p></Show>
     <Show when={selection()}>{chosen => <>
       <div class="workspace-toolbar workspace-diff-toolbar"><span title={chosen().path}>{chosen().path} · {chosen().staged ? "已暂存" : "未暂存"}</span>
-        <span class="workspace-diff-count">+{stats().add} −{stats().del}</span>
-        <button aria-pressed={expandAll()} onClick={() => setExpandAll(v => !v)}>{expandAll() ? "折叠未变动" : "展开全部"}</button>
+        <Show when={!images()}><span class="workspace-diff-count">+{stats().add} −{stats().del}</span>
+          <button aria-pressed={expandAll()} onClick={() => setExpandAll(v => !v)}>{expandAll() ? "折叠未变动" : "展开全部"}</button></Show>
         <button onClick={() => props.onOpen(`${status()!.repo}/${chosen().path}`)}>打开文件</button>
       </div>
-      <Show when={loadingDiff()} fallback={<div class="workspace-diff" aria-label="文件差异"><For each={groups()}>{rows => <Group rows={rows} />}</For><Show when={!patch()}><p>没有文本差异</p></Show></div>}><p role="status">正在读取差异…</p></Show>
+      <Show when={loadingDiff()} fallback={<Show when={images()} fallback={<div class="workspace-diff" aria-label="文件差异"><For each={groups()}>{rows => <Group rows={rows} />}</For><Show when={!patch()}><p>没有文本差异</p></Show></div>}>{pair =>
+        <div class="workspace-diff workspace-image-diff" aria-label="图片差异">
+          <figure><figcaption>修改前</figcaption><Show when={pair().before} fallback={<p>没有旧版本</p>}>{src => <img src={src()} alt="修改前的图片" />}</Show></figure>
+          <figure><figcaption>修改后</figcaption><Show when={pair().after} fallback={<p>已删除</p>}>{src => <img src={src()} alt="修改后的图片" />}</Show></figure>
+        </div>}</Show>}><p role="status">正在读取差异…</p></Show>
     </>}</Show>
     <Show when={!selection() && status()?.files.length}><div class="workspace-empty">选择文件查看差异</div></Show>
   </section>;

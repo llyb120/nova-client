@@ -122,4 +122,8 @@
 .workspace-diff-number { width: 4em; flex-shrink: 0; text-align: right; padding-right: 8px; color: var(--text-muted); user-select: none; }
 .workspace-diff-sign { width: 1.5em; flex-shrink: 0; user-select: none; }
 .workspace-panel .workspace-diff-fold { display: block; width: 100%; border-block: 1px solid var(--border); border-radius: 0; color: var(--accent); background: var(--hover); }
+.workspace-image-diff { display: flex; flex-wrap: wrap; gap: 10px; align-content: flex-start; padding: 10px; font: inherit; }
+.workspace-image-diff figure { flex: 1 1 220px; min-width: 0; margin: 0; }
+.workspace-image-diff figcaption { margin-bottom: 4px; color: var(--text-muted); }
+.workspace-image-diff img { display: block; max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 6px; background: repeating-conic-gradient(color-mix(in srgb, var(--text) 6%, transparent) 0% 25%, transparent 0% 50%) 50% / 16px 16px; }
 .workspace-close-modal { width: min(380px, 92vw); }
