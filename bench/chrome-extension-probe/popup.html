@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>Nova Chrome 验证助手</title>
+<style>body{width:340px;padding:16px;font:14px system-ui;color:#182230}h1{font-size:18px;margin:0 0 12px}button,a{display:inline-block;padding:9px 12px;margin:4px 6px 4px 0}button{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f5f7;padding:12px;border-radius:8px;font:13px system-ui}small{color:#586575}</style>
+<h1>Nova Chrome 验证助手</h1>
+<p>先打开测试页，再运行验证。结果会自动回传给本机，供助手核查。</p>
+<a id="fixture" target="_blank" rel="noopener">打开测试页</a><button id="run">运行验证</button>
+<button id="retry" hidden>仅重试报告回传</button>
+<pre id="status" role="status" aria-live="polite">正在读取状态…</pre>
+<small>仅操作指定的本地测试页。测试会输入文字、截图和打开临时标签。完成后自动断开调试连接。</small>
+<script src="popup.js"></script></html>
