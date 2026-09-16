@@ -1,0 +1,98 @@
+[
+  {
+    "name": "generate_image",
+    "description": "使用 Nova 图片服务生成新图或项目视觉素材；agent 可按任务需要自主调用。先查看参考图，在 prompt 中说明借鉴特征，上传 referenceImages，不默认保留原图所有内容。Nova 负责模型选择、凭据、请求和保存，返回新 PNG 路径与 Markdown。未配置时提示 /setup-image，失败不要自动重试。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32000,
+          "description": "完整视觉提示词：主体、构图、风格、文字及参考图片用途"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "可选，已配置的图片模型 ID；省略由 Nova 使用默认模型"
+        },
+        "size": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "1024x1024",
+            "1024x1536",
+            "1536x1024"
+          ]
+        },
+        "outputDir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "可选，已存在的输出目录；相对当前工作目录，默认当前目录"
+        },
+        "referenceImages": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "真实本地图片路径（相对当前工作目录或绝对路径），PNG/JPEG/WebP；单张最多25 MiB、合计64 MiB"
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "edit_image",
+    "description": "使用 Nova 图片服务编辑已有图片。先查看原图，在 prompt 中明确修改项与保留项；referenceImages 必须非空且首项是原图，其余为辅助参考。只改用户要求的部分，结果另存新 PNG，不覆盖原图。返回路径与 Markdown；失败不要自动重试。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32000,
+          "description": "完整视觉提示词：主体、构图、风格、文字及参考图片用途"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "可选，已配置的图片模型 ID；省略由 Nova 使用默认模型"
+        },
+        "size": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "1024x1024",
+            "1024x1536",
+            "1536x1024"
+          ]
+        },
+        "outputDir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "可选，已存在的输出目录；相对当前工作目录，默认当前目录"
+        },
+        "referenceImages": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "真实本地图片路径（相对当前工作目录或绝对路径），PNG/JPEG/WebP；单张最多25 MiB、合计64 MiB",
+          "minItems": 1
+        }
+      },
+      "required": [
+        "prompt",
+        "referenceImages"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

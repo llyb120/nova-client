@@ -1,0 +1,28 @@
+import assert from "node:assert/strict";
+import { processSegments, processSummary, processLiveLines } from "../src/processDisplay.ts";
+
+const thought = (id, text = "分析\n下一步") => ({ type: "thought", id, text });
+const tool = (id, kind, status = "completed") => ({ type: "tool", id, kind, status, title: `${kind}\nfile.ts` });
+const items = [thought(1), tool(2, "read"), tool(3, "edit"), { type: "assistant", id: 4, text: "进展" }, thought(5)];
+const segments = processSegments(items);
+assert.deepEqual(segments.map(s => [s.type, s.id]), [["process", 1], ["item", 4], ["process", 5]]);
+assert.deepEqual(segments.flatMap(s => s.type === "process" ? s.items : [s.item]), items);
+assert.equal(processSummary(segments[0].items), "读取文件 ×1、修改文件 ×1");
+assert.equal(processSummary([tool(1, "read"), tool(2, "read", "failed")]), "读取文件 ×2（1 项失败）");
+assert.equal(processSummary([tool(1, "execute"), tool(2, "execute"), tool(3, "execute")]), "执行命令 ×3");
+assert.equal(processSummary([tool(1, "execute"), tool(2, "read"), tool(3, "execute")]), "执行命令 ×2、读取文件 ×1");
+assert.equal(processSummary([thought(1)]), "分析思路");
+assert.deepEqual(processLiveLines(segments[0].items), ["已完成 · read file.ts", "已完成 · edit file.ts"]);
+assert.deepEqual(processLiveLines([thought(1), tool(2, "search", "in_progress")]), ["下一步", "进行中 · search file.ts"]);
+assert.deepEqual(processLiveLines([tool(1, "read"), thought(2, "开始思考")]), ["已完成 · read file.ts", "开始思考"]);
+assert.deepEqual(processLiveLines([tool(1, "read"), thought(2, "开始思考\n继续分析")]), ["开始思考", "继续分析"]);
+assert.deepEqual(processLiveLines([thought(1, "上一段"), thought(2, "新段落")]), ["上一段", "新段落"]);
+const wrapThree = text => text.match(/.{1,3}/gu) ?? [];
+assert.deepEqual(processLiveLines([tool(1, "read"), thought(2, "abc")], wrapThree), [".ts", "abc"]);
+assert.deepEqual(processLiveLines([tool(1, "read"), thought(2, "abcd")], wrapThree), ["abc", "d"]);
+assert.deepEqual(processLiveLines([tool(1, "read"), thought(2, "旧行\n最新第一行\n最新第二行\n")]), ["最新第一行", "最新第二行"]);
+assert.deepEqual(processLiveLines([thought(1, "abcdef")], text => text.match(/.{1,2}/gu)), ["cd", "ef"]);
+assert.deepEqual(processLiveLines([thought(1, "abcdefg")], text => text.match(/.{1,2}/gu)), ["ef", "g"]);
+assert.deepEqual(processLiveLines([]), []);
+assert.deepEqual(processSegments([]), []);
+console.log("process display checks passed");

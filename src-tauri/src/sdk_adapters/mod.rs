@@ -1,9 +1,7 @@
-mod claude;
 mod codex;
 mod cursor;
 mod lyra;
 
-pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
 pub use lyra::LyraAdapter;

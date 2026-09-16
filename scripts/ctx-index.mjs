@@ -46,7 +46,7 @@ const SIG_MAX_CHARS = 120;
 
 // Keep in lockstep with native context.rs CACHE_VERSION. Shared versioning prevents one backend
 // from ranking stale symbols after scanner/query changes while the other rebuilt its own cache.
-export const INDEX_CACHE_VERSION = 14;
+export const INDEX_CACHE_VERSION = 15;
 const INDEX_CACHE_NAME = 'cache.json';
 const INDEX_DIR_NAME = 'codemap';
 const INDEX_MAX_BYTES = 20 * 1024 * 1024;
@@ -267,21 +267,28 @@ const CTRL = new Set([
   'const', 'var', 'import', 'export', 'require', 'super', 'this', 'self', 'and', 'or', 'not',
 ]);
 
-function blockEnd(i, d, code, depthAfter, limit) {
+function blockEnd(i, d, code, depthAfter, limit, kind) {
+  const callable = kind === 'fn' || kind === 'method';
   const self = code[i].trimEnd();
-  if (depthAfter[i] <= d && /[;,]\s*$/.test(self)) return i;
+  if (depthAfter[i] <= d && self.endsWith(';')) return i;
   let open = -1;
-  const lookahead = Math.min(limit, i + 14);
+  let delimiters = 0;
+  // ponytail: signatures are bounded to 256 lines; use a syntax parser for larger/complex syntax.
+  const lookahead = Math.min(limit, i + (callable ? 256 : 14));
   for (let j = i; j < lookahead; j++) {
+    for (const ch of code[j]) {
+      if (ch === '(' || ch === '[') delimiters++;
+      else if (ch === ')' || ch === ']') delimiters = Math.max(0, delimiters - 1);
+    }
+    // Parameter commas, blank lines, array semicolons and object types are not declaration ends.
+    if (delimiters > 0) continue;
     if (depthAfter[j] > d) {
       open = j;
       break;
     }
-    if (j > i) {
-      const t = code[j].trimEnd();
-      if (/[;,]\s*$/.test(t)) return j;
-      if (t.trim() === '') return j - 1;
-    }
+    const t = code[j].trimEnd();
+    if (t.endsWith(';') || (!callable && t.endsWith(','))) return j;
+    if (j > i && !callable && t.trim() === '') return j - 1;
   }
   if (open < 0) return i;
   for (let j = open; j < limit; j++) if (depthAfter[j] <= d) return j;
@@ -426,7 +433,7 @@ export function scanSource(text, file = '') {
       }
     }
     if (!name) continue;
-    const end = blockEnd(i, d, code, depthAfter, total);
+    const end = blockEnd(i, d, code, depthAfter, total, kind);
     if (end < i) continue;
     // prop/method 单行 (无块体) 无分析价值
     if ((kind === 'prop' || kind === 'method') && end === i && !/[({]\s*$/.test(code[i].trimEnd())) continue;

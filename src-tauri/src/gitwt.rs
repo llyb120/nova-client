@@ -21,6 +21,11 @@ pub fn run_raw(repo: &str, args: &[&str]) -> Result<String, String> {
 
 /// 在 repo 目录执行一条 git 子命令，成功返回 stdout，失败返回 stderr。
 fn git_stdout(repo: &str, args: &[&str]) -> Result<String, String> {
+    Ok(String::from_utf8_lossy(&run_bytes(repo, args)?).into_owned())
+}
+
+/// 同 run_raw，但保留原始字节：图片等二进制内容不能经过 UTF-8 转码。
+pub fn run_bytes(repo: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args(args);
     #[cfg(windows)]
@@ -35,7 +40,7 @@ fn git_stdout(repo: &str, args: &[&str]) -> Result<String, String> {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("git {}：{}", args.join(" "), err.trim()));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
 }
 
 /// 目录是否位于某个 git 工作树内

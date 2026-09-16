@@ -1,7 +1,8 @@
 import { confirm, message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, For, lazy, onCleanup, onMount, Show, Suspense, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
 import { api } from "../ipc";
+import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
 import { buildTimeNotesPrompt } from "../builtinPrompts";
 import {
   compactThread,
@@ -24,13 +25,15 @@ import type { AgentKind, Item, Thread, ThreadMeta, TimeMachineCheckpoint, TimeMa
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
-import { IconBroadcast, IconCompress, IconDownload, IconShare, IconStar, IconStopwatch } from "./icons";
+import { IconBroadcast, IconCompress, IconDownload, IconFile, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { ShareModal } from "./ShareModal";
 import { TimeNotesModal } from "./TimeNotesModal";
 import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
+
+const WorkspacePanel = lazy(() => import("./WorkspacePanel"));
 
 interface VirtualObserverPool {
   intersectionObserver: IntersectionObserver;
@@ -224,6 +227,19 @@ function TranscriptSegment(props: TranscriptSegmentProps) {
 }
 
 export function ChatView() {
+  const workspaceOpen = () => workspaceLayout.open;
+  const setWorkspaceOpen = (open: boolean) => setWorkspaceLayout({ open });
+  const [workspaceRequest, setWorkspaceRequest] = createSignal<{ path: string; line?: number } | null>(null);
+  createEffect(() => { state.currentId; setWorkspaceRequest(null); });
+  const previewFile = (event: Event) => {
+    const detail = (event as CustomEvent<string | { path: string; line?: number }>).detail;
+    const target = typeof detail === 'string' ? { path: detail } : detail;
+    if (!target || typeof target.path !== "string" || !state.currentId) return;
+    setWorkspaceRequest(target);
+    setWorkspaceOpen(true);
+  };
+  onMount(() => window.addEventListener("nova:preview-file", previewFile));
+  onCleanup(() => window.removeEventListener("nova:preview-file", previewFile));
   let scrollRef: HTMLDivElement | undefined;
   let innerRef: HTMLDivElement | undefined;
   let transcriptRef: CanvasTranscriptHandle | undefined;
@@ -252,6 +268,9 @@ export function ChatView() {
   let lastScrollTop = 0;
   let lastVirtualMountTop = Number.NaN;
   let pointerActive = false;
+  let pressToggle: HTMLElement | null = null;
+  let pressWasAtBottom = false;
+  let pressScrollHeight = 0;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -401,17 +420,44 @@ export function ChatView() {
 
   const handlePointerDown = (event: PointerEvent) => {
     if (useAnyCanvas()) return;
+    pressToggle = null;
     if (isToolDetailScroll(event.target)) return;
     pointerActive = true;
+    pressToggle = event.target instanceof Element
+      ? event.target.closest<HTMLElement>(".tool-line, .thought-toggle, .turn-fold, .process-toggle, .raw-toggle")
+      : null;
+    pressWasAtBottom = isAtBottom();
+    pressScrollHeight = scrollRef?.scrollHeight ?? 0;
     // 折叠/思考/工具头开合会改变文档高度：若仍在吸底，pointerup 的钉底微任务和
     // 运行中新内容触发的钉底会在 click 前移动滚动位置，吞掉首次点击（表现为
     // 先滚到最底、要再点一次）；展开后又会被新内容拉回最底。按下即退出吸底，
     // 对齐 Canvas 版 onBrowseDetail 的行为。
-    if (
-      event.target instanceof Element &&
-      event.target.closest(".tool-line, .thought-toggle, .turn-fold")
-    ) {
-      cancelBottomFollow();
+    if (pressToggle) cancelBottomFollow();
+  };
+
+  // 吸底时开合头行：按下已退出吸底。展开后与 Canvas resolveExpandScroll 同一
+  // 规则——头行仍在新文档最后一屏内就钉回底部（展开内容入视野、滚动条不上
+  // 移），展开量把头行顶出屏外时保持头行锚定（scrollTop 不动即锚定）。收起
+  // 后仍贴底则恢复吸底。
+  const handleTranscriptClick = () => {
+    const el = pressToggle;
+    const wasAtBottom = pressWasAtBottom;
+    const heightBefore = pressScrollHeight;
+    pressToggle = null;
+    if (useAnyCanvas() || !scrollRef || !el?.isConnected || !wasAtBottom) return;
+    const grew = scrollRef.scrollHeight > heightBefore;
+    if (!grew) {
+      if (isAtBottom()) {
+        setStickToBottom(true);
+        pinBottom();
+      }
+      return;
+    }
+    const docTop =
+      el.getBoundingClientRect().top - scrollRef.getBoundingClientRect().top + scrollRef.scrollTop;
+    if (docTop >= maxScrollTop()) {
+      setStickToBottom(true);
+      pinBottom();
     }
   };
 
@@ -1324,6 +1370,9 @@ export function ChatView() {
       </Show>
 
       <div class="chat-shell">
+        <Show when={state.currentId && roamingRole() !== "guest" && !workspaceOpen()}>
+          <button class="workspace-float-toggle" aria-label="打开文件与产物" title="文件与产物" onClick={() => setWorkspaceOpen(true)}><IconFile size={18} /></button>
+        </Show>
         <div class="chat-primary">
       <div class="chat-body">
         <Show
@@ -1336,6 +1385,7 @@ export function ChatView() {
               onScroll={handleTranscriptScroll}
               onWheel={handleWheel}
               onPointerDown={handlePointerDown}
+              onClick={handleTranscriptClick}
             >
               <div class="transcript-inner" ref={innerRef}>
                 <Show when={previewCheckpointId()}>
@@ -1405,7 +1455,7 @@ export function ChatView() {
       </footer>
         </div>
 
-      <Show when={showTimeMachine()}>
+      <Show when={showTimeMachine() && !workspaceOpen()}>
         <aside
           class="repo-time-machine"
           classList={{ collapsed: !timeMachineExpanded(), expanded: timeMachineExpanded() }}
@@ -1581,6 +1631,12 @@ export function ChatView() {
             )}
           </For>
         </aside>
+      </Show>
+      {/* 文件/产物侧栏排在 Stage 导航右边：聊天 → 世界线 → Stage → 侧边栏。 */}
+      <Show when={workspaceOpen() && roamingRole() !== "guest"}>
+        <Show keyed when={state.currentId}>
+          {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
+        </Show>
       </Show>
       <Portal>
         <Show when={stageContextMenu()} keyed>

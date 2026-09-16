@@ -29,6 +29,7 @@ import {
   enabledAgentKinds,
   ensureModelOptions,
   ensurePeerModels,
+  getOutputRate,
   openClueCard,
   pickThreadModel,
   refreshSlashCommands,
@@ -51,7 +52,6 @@ import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentS
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
-import { fmtTokens } from "./TurnGroup";
 
 export function Composer() {
   const [text, setText] = createSignal("");
@@ -119,27 +119,6 @@ export function Composer() {
   const attach = createImageAttachments({ enableFileDrop: true });
 
   const running = () => !!(state.currentId && state.running[state.currentId]);
-  const contextUsedTokens = () => {
-    if (state.liveUsage?.contextTokens) return state.liveUsage.contextTokens;
-    if (state.liveUsage?.inputTokens) return state.liveUsage.inputTokens;
-    for (let index = state.items.length - 1; index >= 0; index--) {
-      const item = state.items[index];
-      if (item.type === "turn" && item.contextTokens) return item.contextTokens;
-      if (item.type === "turn" && item.inputTokens) return item.inputTokens;
-    }
-    return 0;
-  };
-  const contextWindow = () => {
-    const model = state.modelOptions[state.agentKind]?.configOptions
-      ?.find((option) => option.id === "model")
-      ?.options?.find((option) => option.value === state.model);
-    const value = Number(
-      model?._meta?.contextWindow ??
-      model?._meta?.context_window ??
-      model?._meta?.["codex.ai/contextWindow"],
-    );
-    return Number.isFinite(value) && value >= 2_000 ? value : null;
-  };
   const [runClock, setRunClock] = createSignal(Date.now());
   // 从会话尾部向前找本轮 user 项作为计时起点。找不到返回 null 的两种情形：
   // - 尾部已是收尾的 turn（轮次未开始/已结束）；
@@ -172,18 +151,19 @@ export function Composer() {
       ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
       : `${minutes}:${String(remainder).padStart(2, "0")}`;
   };
+  // 共享采样器定时刷新，停顿时也会归零。
+  const tokenSpeed = () => getOutputRate(state.currentId);
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
-  // 原生注入当前轮：Lyra / Codex / Devin。
+  // 原生注入当前轮：Lyra / Codex / Devin / CodeBuddy。
   const supportsLiveSteer = () =>
     state.agentKind === "lyra" ||
     state.agentKind === "codex" ||
+    state.agentKind === "codebuddy" ||
     state.agentKind === "devin";
-  // 打断当前轮后以新 turn 继续：Cursor（Agent.create + slim memory）、OpenCode。
-  const supportsInterruptSteer = () =>
-    state.agentKind === "cursor" ||
-    state.agentKind === "opencode";
+  // 打断当前轮后以新 turn 继续：Cursor（Agent.create + slim memory）。
+  const supportsInterruptSteer = () => state.agentKind === "cursor";
   const supportsSteer = () => supportsLiveSteer() || supportsInterruptSteer();
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
   const activeClue = createMemo(() => {
@@ -815,17 +795,12 @@ export function Composer() {
           favorites
         />
         <Show when={running()}>
-          <span
-            class="composer-run-stats"
-            title={contextWindow()
-              ? `本轮已运行 ${runElapsed()}\n上下文 ${fmtTokens(contextUsedTokens())} / ${fmtTokens(contextWindow()!)} tokens`
-              : `本轮已运行 ${runElapsed()}\n当前模型未提供上下文窗口`}
-          >
+          <span class="composer-run-stats" title={`本轮已运行 ${runElapsed()}`}>
             <span class="composer-run-dot" aria-hidden="true" />
             <span>{runElapsed()}</span>
             <span class="composer-run-sep">·</span>
-            <span>
-              上下文 {fmtTokens(contextUsedTokens())} / {contextWindow() ? fmtTokens(contextWindow()!) : "--"}
+            <span title="实时输出速度（估算）：回答、思考及工具参数按约 4 字符/token 统计，不含工具结果。未提供参数增量的后端在参数到达时更新。">
+              ≈{tokenSpeed()} tok/s
             </span>
           </span>
         </Show>

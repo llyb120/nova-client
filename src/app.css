@@ -214,7 +214,10 @@ button {
 /* ===== 侧边栏 ===== */
 .sidebar {
   position: relative;
-  width: clamp(248px, 20vw, 292px);
+  /* 宽度只随窗口变、不随主区域视图变：flex:none 挡住主区（如双子座里 width:100% 的浏览器视图）
+     按比例挤压侧栏，否则切到双子座时侧栏会被压窄几十像素。 */
+  flex: none;
+  width: clamp(248px, 20vw, 256px);
   min-width: 248px;
   background: var(--sidebar-veil);
   border-right: 1px solid var(--border);
@@ -698,32 +701,11 @@ button {
   background: color-mix(in srgb, var(--yellow) 13%, transparent);
 }
 
-.thread-agent.claudecode,
-.agent-badge.claudecode {
-  color: var(--seal);
-  border-color: color-mix(in srgb, var(--seal) 36%, transparent);
-  background: color-mix(in srgb, var(--seal) 13%, transparent);
-}
-
 .thread-agent.cursor,
 .agent-badge.cursor {
   color: var(--violet);
   border-color: color-mix(in srgb, var(--violet) 36%, transparent);
   background: color-mix(in srgb, var(--violet) 13%, transparent);
-}
-
-.thread-agent.opencode,
-.agent-badge.opencode {
-  color: var(--green);
-  border-color: color-mix(in srgb, var(--green) 36%, transparent);
-  background: color-mix(in srgb, var(--green) 13%, transparent);
-}
-
-.thread-agent.opencodeplus,
-.agent-badge.opencodeplus {
-  color: #f0a35b;
-  border-color: color-mix(in srgb, #f0a35b 45%, transparent);
-  background: color-mix(in srgb, #f0a35b 12%, transparent);
 }
 
 .thread-ephemeral {
@@ -1626,7 +1608,7 @@ button {
   overflow-y: auto;
   padding: 18px 10px 18px 0;
   border-left: 1px solid var(--border-light);
-  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  background: var(--sidebar-veil);
 }
 .stage-rail-count {
   padding: 0 7px 8px;
@@ -1753,6 +1735,61 @@ button {
   font-size: 12px;
 }
 
+/* ===== 新会话灰原哀气泡 =====
+   锚定输入框（.home-composer）右上角上方悬浮，尖角指向输入框右上角。
+   作为 .home-composer 的绝对定位子元素，随 HomeView 挂载出现。 */
+.haibara-bubble {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 14px);
+  max-width: 320px;
+  background: var(--bg-float);
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  padding: 10px 12px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  z-index: 5;
+}
+.haibara-bubble::after {
+  content: "";
+  position: absolute;
+  right: 26px;
+  bottom: -7px;
+  width: 12px;
+  height: 12px;
+  background: var(--bg-float);
+  border-right: 1px solid var(--border-light);
+  border-bottom: 1px solid var(--border-light);
+  transform: rotate(45deg);
+}
+.haibara-bubble-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 1;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.haibara-bubble-close:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+.haibara-bubble-text {
+  position: relative;
+  z-index: 1;
+  margin: 0;
+  padding-right: 20px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+
 /* ===== 轮次折叠（codex 风格） ===== */
 .turn-fold {
   display: flex;
@@ -1818,7 +1855,7 @@ button {
 
 /* assistant：直接正文，无标签 */
 .msg-assistant {
-  margin: 14px 0;
+  margin: 6px 0;
   line-height: 1.7;
 }
 
@@ -2745,18 +2782,13 @@ button {
 }
 
 .prompt-queue {
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: calc(100% + 8px);
-  z-index: 6;
+  margin: -4px 0 10px;
   max-height: min(210px, 30vh);
   overflow-y: auto;
   overscroll-behavior: contain;
   border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border-light));
   border-radius: var(--r-md);
   background: color-mix(in srgb, var(--bg-float) 94%, var(--accent) 6%);
-  box-shadow: var(--shadow-md);
 }
 .prompt-queue-head {
   position: sticky;
@@ -3345,11 +3377,11 @@ button {
   /* 不换行：空间不足时 pill 文本内部省略，避免发送按钮被挤到下一行 */
   flex-wrap: nowrap;
 }
-/* 签名浮到右下角后不再占位：目录/模型选择器等分剩余宽度并各自拉满。 */
+/* 选择器按内容取宽，空间不足时允许收缩。 */
 .composer-bar .sel,
 .composer-bar .proj-picker {
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 0 1 auto;
 }
 .composer-bar .proj-picker .pill {
   width: 100%;
@@ -3400,9 +3432,9 @@ button {
   0%, 100% { opacity: .45; }
   50% { opacity: 1; }
 }
-/* 模型选择器与目录选择器一同拉长，吃掉签名腾出的宽度。 */
+/* 模型选择器按内容取宽，不限制长名称的自然宽度。 */
 .composer-bar .sel.wide {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   max-width: none;
 }
@@ -3425,7 +3457,7 @@ button {
   flex-wrap: wrap;
 }
 .composer .composer-bar .sel.wide {
-  flex: 1 1 max-content;
+  flex: 0 1 max-content;
   max-width: 100%;
 }
 .composer .composer-bar .sel.wide .pill-text {
@@ -7918,7 +7950,10 @@ button:focus-visible {
   }
 }
 
-/* 工程手稿保留清晰细线，轻覆底色降低背景对比度。 */
+/* 手稿铺满视口、保比例居中裁切。素材是为"铺满且图元不放大"专门加宽的 4800×2600 手稿：
+   左右两组图元 1:1 原样摆在画布两端，上下与中间的空隙用纸面补齐（原图 3840×2160 在 1920 窗口下
+   缩到 40% 只有 1536 宽，铺满就必须放大 1.25 倍，图元会变粗）。
+   cover 在 1920×1040 下正好 0.4 倍 —— 与固定 1536×864 那版的图元大小相同，这是关键，别换回窄画布。 */
 .dawn-backdrop {
   display: none;
   position: fixed;
@@ -7927,6 +7962,9 @@ button:focus-visible {
   pointer-events: none;
   background: linear-gradient(rgba(245, 247, 250, 0.3), rgba(245, 247, 250, 0.3)),
     url("./assets/engineering-sketch.webp") center / cover no-repeat;
+  mask-image: linear-gradient(to right, transparent, #000 64px, #000 calc(100% - 64px), transparent),
+    linear-gradient(to bottom, transparent, #000 64px, #000 calc(100% - 64px), transparent);
+  mask-composite: intersect;
 }
 :root[data-theme="ink-light"] .sky-backdrop { visibility: hidden; }
 :root[data-theme="ink-light"] .dawn-backdrop { display: block; }
@@ -7944,3 +7982,9 @@ button:focus-visible {
 @media (max-height: 600px) {
   .composer .composer-input { min-height: 90px; }
 }
+/* File entry floats immediately above the existing world-line clock. */
+.chat-shell { position: relative; }
+.workspace-float-toggle { position: absolute; z-index: 9; top: 22px; right: 0; width: 38px; height: 38px; display: grid; place-items: center; padding: 0; border: 1px solid var(--border-strong); border-right: 0; border-radius: 999px 0 0 999px; color: var(--text-muted); background: var(--bg-panel); box-shadow: -4px 5px 14px #0001; cursor: pointer; }
+.workspace-float-toggle:hover, .workspace-float-toggle:focus-visible { color: var(--accent); }
+.chat-shell .repo-time-toggle { top: 68px; }
+.chat-shell .repo-time-machine.expanded .repo-time-machine-label { padding-top: 58px; }

@@ -76,7 +76,7 @@ fn init_windows_process_path() {
 #[cfg(any(windows, test))]
 fn fallback_windows_path(home: Option<PathBuf>) -> Option<OsString> {
     let home = home?;
-    std::env::join_paths([home.join(".local/bin"), home.join(".opencode/bin")]).ok()
+    std::env::join_paths([home.join(".local/bin")]).ok()
 }
 
 #[cfg(windows)]
@@ -424,14 +424,11 @@ mod tests {
     }
 
     #[test]
-    fn windows_fallback_includes_claude_and_opencode_native_bins() {
+    fn windows_fallback_includes_local_bin() {
         let home = PathBuf::from("C:/Users/professor");
         let fallback = fallback_windows_path(Some(home.clone())).unwrap();
         let paths: Vec<PathBuf> = std::env::split_paths(&fallback).collect();
 
-        assert_eq!(
-            paths,
-            vec![home.join(".local/bin"), home.join(".opencode/bin")]
-        );
+        assert_eq!(paths, vec![home.join(".local/bin")]);
     }
 }

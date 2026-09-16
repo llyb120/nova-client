@@ -55,6 +55,7 @@ pub struct PendingPermission {
 /// 已挂载到 devin 进程上的 session → 线程路由与已应用的配置
 struct Route {
     thread_id: String,
+    text_items: HashMap<(String, String, bool), usize>,
     applied_model: Option<String>,
     applied_mode: Option<String>,
     applied_effort: Option<String>,
@@ -79,6 +80,47 @@ struct CodeBuddyPrewarm {
     id: String,
     cwd: String,
     child: Child,
+}
+
+struct AcpPrewarm {
+    cwd: String,
+    read_only: bool,
+    conn: TokioMutex<Option<Arc<AcpConn>>>,
+}
+
+impl AcpPrewarm {
+    async fn take(
+        slot: &StdMutex<Option<Arc<Self>>>,
+        cwd: &str,
+        read_only: bool,
+    ) -> Option<Arc<AcpConn>> {
+        let entry = {
+            let slot = slot.lock().unwrap();
+            slot.as_ref()
+                .filter(|s| s.cwd == cwd && s.read_only == read_only)?
+                .clone()
+        };
+        // 冷启动要重做 spawn/initialize（CodeBuddy 还有 bundle/activate），短等截断会把
+        // 将就绪的预热进程杀掉再立刻重做同样的工作，比不预热更慢。等待任务自身的
+        // ping、activate、initialize 超时结束；预热失败释放锁后仍可回退冷启动。
+        let mut ready = entry.conn.lock().await;
+        let mut slot = slot.lock().unwrap();
+        if !slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, &entry)) {
+            return None;
+        }
+        slot.take();
+        ready
+            .take()
+            .filter(|conn| conn.alive.load(Ordering::SeqCst))
+    }
+}
+
+impl Drop for AcpPrewarm {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.get_mut().take() {
+            conn.kill();
+        }
+    }
 }
 
 impl CodeBuddyPrewarm {
@@ -339,7 +381,7 @@ fn keep_known_model_options(fresh: Value, known: Option<&Value>) -> Value {
 
 pub struct AcpConn {
     /// 该连接在连接池中的键；用户线程独立，辅助任务使用 SHARED。
-    key: String,
+    key: StdMutex<String>,
     read_only: bool,
     label: &'static str,
     transport: AcpTransport,
@@ -606,9 +648,61 @@ struct SteerTurnState {
     deferred_finish: Option<(String, Option<Value>)>,
 }
 
+// CodeBuddy 的 usage 通知是单次模型消息快照；重复通知覆盖，同轮多次模型调用累加。
+#[derive(Default)]
+struct CodeBuddyTurnUsage {
+    messages: HashMap<String, (u64, u64)>,
+}
+
+#[test]
+fn codebuddy_turn_usage_deduplicates_model_messages() {
+    let mut usage = CodeBuddyTurnUsage::default();
+    assert!(CodeBuddyTurnUsage::default().finish().is_none());
+    let update = json!({"used": 25310, "_meta": {
+        "codebuddy.ai/messageId": "message-1",
+        "usage": {"prompt_tokens": 25310, "completion_tokens": 211, "total_tokens": 25521}
+    }});
+    usage.update(&update);
+    usage.update(&update);
+    // 后续上下文通知和无效计数不会抹掉/伪造输出统计。
+    usage.update(&json!({"used": 26000, "_meta": {"codebuddy.ai/messageId": "message-1"}}));
+    usage.update(&json!({"_meta": {"codebuddy.ai/messageId": "bad", "usage": {
+        "prompt_tokens": 100, "completion_tokens": -1
+    }}}));
+    let mut next = update.clone();
+    next["_meta"]["codebuddy.ai/messageId"] = json!("message-2");
+    next["_meta"]["usage"]["completion_tokens"] = json!(229);
+    usage.update(&next);
+    let mut thread = Thread::new(String::new(), AgentKind::CodeBuddy, None, None, None, false);
+    let turn = serde_json::to_value(thread.push_turn(22_000, usage.finish().as_ref(), "end_turn")).unwrap();
+    assert_eq!(turn["outputTokens"], 440);
+    assert_eq!(turn["totalTokens"], 51060);
+    assert_eq!(turn["durationMs"], 22_000);
+}
+
+impl CodeBuddyTurnUsage {
+    fn update(&mut self, update: &Value) {
+        let Some(meta) = update.get("_meta") else { return };
+        let Some(id) = meta.get("codebuddy.ai/messageId").and_then(Value::as_str).filter(|id| !id.is_empty()) else { return };
+        let Some(usage) = meta.get("usage") else { return };
+        // used 是上下文占用量，不能当成输出 token；缺少完整计数的通知不覆盖已有快照。
+        let Some(input) = usage.get("prompt_tokens").and_then(Value::as_u64) else { return };
+        let Some(output) = usage.get("completion_tokens").and_then(Value::as_u64) else { return };
+        self.messages.insert(id.to_string(), (input, output));
+    }
+
+    fn finish(self) -> Option<Value> {
+        if self.messages.is_empty() { return None; }
+        let (input, output) = self.messages.values().fold((0u64, 0u64), |(input, output), (i, o)| {
+            (input.saturating_add(*i), output.saturating_add(*o))
+        });
+        Some(json!({ "inputTokens": input, "outputTokens": output, "totalTokens": input.saturating_add(output) }))
+    }
+}
+
 pub struct AcpManager {
     pub app: AppHandle,
-    /// 保留 agent 类型供现有路由和事件载荷使用；ACP 实现仅支持 Devin。
+    /// ACP 后端类型，用于启动配置、路由和事件载荷。
     pub kind: AgentKind,
     /// 额度租借实例使用的独立凭证环境；普通全局实例为空。
     launch_env: HashMap<String, String>,
@@ -618,8 +712,8 @@ pub struct AcpManager {
     slots: StdMutex<HashMap<String, Arc<TokioMutex<Option<Arc<AcpConn>>>>>>,
     /// 热连接 LRU 单调时钟：每次连接被取用时 +1 写入 conn.last_used。
     lru_clock: AtomicU64,
-    /// CodeBuddy 官方 one-shot 预热槽：草稿页启动，首个匹配目录的用户连接消费。
-    codebuddy_prewarm: TokioMutex<Option<CodeBuddyPrewarm>>,
+    /// ponytail: 单个草稿预热槽；多项目预热需求出现后再扩为有界池。
+    prewarmed: StdMutex<Option<Arc<AcpPrewarm>>>,
     /// 存活连接计数：spawn 成功 +1、连接关闭 -1；用于 connected() 与断连广播（归零才广播）。
     alive_conns: AtomicU64,
     routes: StdMutex<HashMap<String, Route>>,
@@ -631,6 +725,7 @@ pub struct AcpManager {
     steer_turns: StdMutex<HashMap<String, SteerTurnState>>,
     /// 轮次开始时间，用于结束时计算耗时
     turn_started: StdMutex<HashMap<String, std::time::Instant>>,
+    codebuddy_turn_usage: StdMutex<HashMap<String, CodeBuddyTurnUsage>>,
     /// 诊断：session/prompt 发出时刻 → 用于测量「首响应延迟」(session_id)
     prompt_sent_at: StdMutex<HashMap<String, std::time::Instant>>,
     pending_permissions: StdMutex<HashMap<String, PendingPermission>>,
@@ -666,13 +761,14 @@ impl AcpManager {
             permission_scope,
             slots: StdMutex::new(HashMap::new()),
             lru_clock: AtomicU64::new(0),
-            codebuddy_prewarm: TokioMutex::new(None),
+            prewarmed: StdMutex::new(None),
             alive_conns: AtomicU64::new(0),
             routes: StdMutex::new(HashMap::new()),
             loading_sessions: StdMutex::new(HashSet::new()),
             running_threads: StdMutex::new(HashSet::new()),
             steer_turns: StdMutex::new(HashMap::new()),
             turn_started: StdMutex::new(HashMap::new()),
+            codebuddy_turn_usage: StdMutex::new(HashMap::new()),
             prompt_sent_at: StdMutex::new(HashMap::new()),
             pending_permissions: StdMutex::new(HashMap::new()),
             thread_locks: StdMutex::new(HashMap::new()),
@@ -882,7 +978,10 @@ impl AcpManager {
     /// 界面只暴露两种模式：build（放开全部权限执行，等价原 Bypass Permissions）与
     /// plan（只规划不执行）。旧数据里的 bypass 视同 build；其余值（历史会话存的
     /// 后端原生模式，如 accept-edits / ask）原样透传，交由可用列表校验兜底。
-    fn backend_mode_id(&self, mode: &str) -> String {
+    fn backend_mode_id(kind: &AgentKind, mode: &str) -> String {
+        if *kind == AgentKind::Kimi && matches!(mode, "build" | "bypass") {
+            return "yolo".into();
+        }
         match mode {
             "build" | "bypass" => "bypass".into(),
             "plan" => "plan".into(),
@@ -893,6 +992,7 @@ impl AcpManager {
     /// 该后端在设置里配置的代理地址（空 = 不代理）
     fn proxy_of<'a>(&self, settings: &'a Settings) -> &'a str {
         match self.kind {
+            AgentKind::Kimi => &settings.kimi_proxy,
             AgentKind::CodeBuddy => &settings.codebuddy_proxy,
             _ => &settings.devin_proxy,
         }
@@ -998,9 +1098,8 @@ impl AcpManager {
     /// 杀掉全部 Devin 连接并清空全局路由。
     /// 用于「重启 agent」「改配置」「应用退出」等需要彻底重置的场景。
     pub async fn kill_conn(&self) {
-        if let Some(prewarm) = self.codebuddy_prewarm.lock().await.take() {
-            prewarm.kill();
-        }
+        // 就绪连接由 Drop 清理；飞行中的旧任务完成后检查归属并销毁。
+        self.prewarmed.lock().unwrap().take();
         let slots: Vec<_> = self.slots.lock().unwrap().drain().map(|(_, v)| v).collect();
         for slot in slots {
             if let Some(conn) = slot.lock().await.take() {
@@ -1098,7 +1197,20 @@ impl AcpManager {
             let s = state.settings.lock().unwrap().clone();
             s
         };
-        let conn = self.spawn_conn(&settings, conn_key, want_cwd).await?;
+        let read_only = self.thread_is_read_only(conn_key);
+        let warmed = if conn_key.starts_with("thread:") {
+            AcpPrewarm::take(&self.prewarmed, want_cwd.unwrap_or_default(), read_only).await
+        } else {
+            None
+        };
+        let conn = match warmed {
+            Some(conn) => {
+                *conn.key.lock().unwrap() = conn_key.to_string();
+                self.push_log(format!("[nova] {} 命中 ACP 预热连接", self.kind.label()));
+                conn
+            }
+            None => self.spawn_conn(&settings, conn_key, want_cwd, read_only).await?,
+        };
         self.touch_conn(&conn);
         *guard = Some(conn.clone());
         if conn_key.starts_with("thread:") {
@@ -1122,8 +1234,9 @@ impl AcpManager {
         settings: &Settings,
         conn_key: &str,
         want_cwd: Option<&str>,
+        read_only: bool,
     ) -> Result<Arc<AcpConn>, String> {
-        // CodeBuddy 走官方 ACP stdio；优先消费官方 one-shot prewarm，失败时冷启动。
+        // 未命中预热时，CodeBuddy 走官方 ACP stdio 冷启动。
         if self.kind == AgentKind::CodeBuddy {
             self.push_log(format!(
                 "[nova] CodeBuddy 正在启动 ACP stdio（key={conn_key}）"
@@ -1133,7 +1246,11 @@ impl AcpManager {
                 .await;
         }
         // Devin 走自己的可执行文件与 acp_args。
-        let (program, args_str) = (settings.devin_path.clone(), settings.acp_args.clone());
+        let (program, args_str) = if self.kind == AgentKind::Kimi {
+            (settings.kimi_path.clone(), "acp".to_string())
+        } else {
+            (settings.devin_path.clone(), settings.acp_args.clone())
+        };
         #[cfg(windows)]
         let mut cmd = build_acp_command(&program, &args_str);
         #[cfg(not(windows))]
@@ -1144,14 +1261,19 @@ impl AcpManager {
         };
         // Devin 的项目级 MCP 配置需要绑定到线程连接的启动目录；CodeBuddy 在
         // session/new 时按标准 ACP mcpServers 注入，进程无需按目录分裂。
+        if self.kind == AgentKind::Kimi {
+            if let Some(cwd) = want_cwd {
+                cmd.current_dir(cwd);
+            }
+        }
         if self.kind == AgentKind::Devin {
-            if let Some(cwd) = want_cwd.filter(|_| conn_key.starts_with("thread:")) {
+            if let Some(cwd) = want_cwd {
                 let launch_dir = prepare_devin_nova_tools_config(
                     &self.app,
                     conn_key,
                     cwd,
                     settings.context_retrieval_mode.as_str(),
-                    self.thread_is_read_only(conn_key),
+                    read_only,
                 )?;
                 cmd.current_dir(&launch_dir);
                 self.push_log(format!(
@@ -1211,7 +1333,7 @@ impl AcpManager {
         // 兜底：挂进 KILL_ON_JOB_CLOSE 的 Job，Nova 无论如何退出都不会残留 agent 孤儿进程
         assign_to_agent_job(&child);
 
-        self.finish_stdio_conn(conn_key, child, false).await
+        self.finish_stdio_conn(conn_key, child, false, read_only).await
     }
 
     async fn finish_stdio_conn(
@@ -1219,6 +1341,7 @@ impl AcpManager {
         conn_key: &str,
         mut child: Child,
         from_prewarm: bool,
+        read_only: bool,
     ) -> Result<Arc<AcpConn>, String> {
         let stdin = child.stdin.take().ok_or("无法获取 agent stdin")?;
         let stdout = child.stdout.take().ok_or("无法获取 agent stdout")?;
@@ -1226,8 +1349,8 @@ impl AcpManager {
 
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
         let conn = Arc::new(AcpConn {
-            key: conn_key.to_string(),
-            read_only: self.thread_is_read_only(conn_key),
+            key: StdMutex::new(conn_key.to_string()),
+            read_only,
             label: self.kind.label(),
             transport: AcpTransport::Stdio(stdin_tx),
             pending: StdMutex::new(HashMap::new()),
@@ -1311,7 +1434,7 @@ impl AcpManager {
         }
     }
 
-    /// CodeBuddy 官方 ACP stdio：优先消费匹配目录的 one-shot prewarm，否则冷启动。
+    /// CodeBuddy 官方 ACP stdio 冷启动（预热认领统一由 ensure_conn_for 完成）。
     async fn spawn_codebuddy_stdio_conn(
         self: &Arc<Self>,
         settings: &Settings,
@@ -1319,31 +1442,6 @@ impl AcpManager {
         want_cwd: Option<&str>,
     ) -> Result<Arc<AcpConn>, String> {
         crate::skills::sync_skills_from_home();
-
-        if let Some(cwd) = want_cwd {
-            let (prewarm, stale) = {
-                let mut slot = self.codebuddy_prewarm.lock().await;
-                if slot.as_ref().is_some_and(|prewarm| prewarm.cwd == cwd) {
-                    (slot.take(), None)
-                } else {
-                    (None, slot.take())
-                }
-            };
-            if let Some(stale) = stale {
-                stale.kill();
-            }
-            if let Some(prewarm) = prewarm {
-                match self
-                    .activate_codebuddy_prewarm(settings, conn_key, prewarm)
-                    .await
-                {
-                    Ok(conn) => return Ok(conn),
-                    Err(error) => self.push_log(format!(
-                        "[nova] CodeBuddy 预热激活失败，回退 ACP 冷启动：{error}"
-                    )),
-                }
-            }
-        }
 
         let (program, mut cmd) = codebuddy_command(&settings.codebuddy_path, &CODEBUDDY_ACP_ARGS);
         if let Some(cwd) = want_cwd {
@@ -1358,7 +1456,7 @@ impl AcpManager {
         #[cfg(unix)]
         cmd.process_group(0);
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
-        cmd.envs(&self.launch_env);
+        cmd.envs(codebuddy_activation_env(&self.launch_env));
         #[cfg(windows)]
         cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
         {
@@ -1386,7 +1484,7 @@ impl AcpManager {
             .spawn()
             .map_err(|error| format!("无法启动 CodeBuddy ACP（{program}）：{error}"))?;
         assign_to_agent_job(&child);
-        self.finish_stdio_conn(conn_key, child, false).await
+        self.finish_stdio_conn(conn_key, child, false, false).await
     }
 
     async fn activate_codebuddy_prewarm(
@@ -1478,7 +1576,7 @@ impl AcpManager {
         self.push_log(format!(
             "[nova] CodeBuddy 已消费官方预热进程 {id}，切换到 ACP stdio"
         ));
-        self.finish_stdio_conn(conn_key, prewarm.child, true).await
+        self.finish_stdio_conn(conn_key, prewarm.child, true, false).await
     }
 
     async fn on_conn_closed(&self, conn: &Arc<AcpConn>) {
@@ -1493,7 +1591,7 @@ impl AcpManager {
         for (_, tx) in pending {
             let _ = tx.send(Err(format!("{} 进程已退出", self.kind.label())));
         }
-        let key = conn.key.clone();
+        let key = conn.key.lock().unwrap().clone();
         // stale 判定：若该键的槽已换成别的连接（如切目录重启被主动替换的旧连接），本回调只失败
         // pending、不做会话清理，避免误伤新连接。是自己才把槽置空并继续清理本连接的会话。
         let is_current = if let Some(slot) = self.slot_opt(&key) {
@@ -1592,7 +1690,11 @@ impl AcpManager {
             let tx = conn.pending.lock().unwrap().remove(&id);
             if let Some(tx) = tx {
                 if let Some(err) = msg.get("error") {
-                    let text = err["message"].as_str().unwrap_or("未知错误").to_string();
+                    let text = if self.kind == AgentKind::Kimi && err["code"].as_i64() == Some(-32000) {
+                        "Kimi Code 尚未登录：请在终端运行 kimi，通过 /login 登录后重试。".to_string()
+                    } else {
+                        err["message"].as_str().unwrap_or("未知错误").to_string()
+                    };
                     let _ = tx.send(Err(text));
                 } else {
                     let _ = tx.send(Ok(msg["result"].clone()));
@@ -1631,7 +1733,8 @@ impl AcpManager {
                         .map(|m| is_full_permission_mode(&m))
                         .unwrap_or(false)
                 };
-                if is_build {
+                // Kimi 同一通道也承载问题提问，必须交给用户选择。
+                if is_build && self.kind != AgentKind::Kimi {
                     let allow = params
                         .get("options")
                         .and_then(|o| o.as_array())
@@ -1760,6 +1863,10 @@ impl AcpManager {
             self.capture_commands(update);
             return;
         }
+        if kind == "config_option_update" && self.kind == AgentKind::Kimi {
+            self.capture_options(update, true);
+            return;
+        }
 
         // 诊断：从 session/prompt 发出到首个响应（含 devin 推理时延）
         if let Some(t0) = self.prompt_sent_at.lock().unwrap().remove(session_id) {
@@ -1791,8 +1898,13 @@ impl AcpManager {
             };
 
             match kind {
+                "usage_update" if self.kind == AgentKind::CodeBuddy => {
+                    if let Some(usage) = self.codebuddy_turn_usage.lock().unwrap().get_mut(&thread_id) {
+                        usage.update(update);
+                    }
+                }
                 "agent_message_chunk" | "agent_thought_chunk" => {
-                    for item in complete_pending_tools(thread, None) {
+                    for item in complete_pending_tools_on_update(thread, None) {
                         self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
                     }
                     let text = extract_text(&update["content"]);
@@ -1800,10 +1912,17 @@ impl AcpManager {
                         return;
                     }
                     let is_thought = kind == "agent_thought_chunk";
+                    let target = if self.kind == AgentKind::CodeBuddy {
+                        let mut routes = self.routes.lock().unwrap();
+                        let Some(route) = routes.get_mut(session_id) else { return };
+                        acp_text_target(&thread.items, update, &mut route.text_items)
+                    } else {
+                        thread.items.len().checked_sub(1)
+                    };
                     // devin 在工具调用间隙会泄漏内容恰为 "None" 的独立消息块（上游 bug），
                     // 仅在「将创建新条目」时丢弃，正常长文本中的 None 字样不受影响
-                    if text.trim() == "None" {
-                        let continues_last = match thread.items.last() {
+                    if self.kind == AgentKind::Devin && text.trim() == "None" {
+                        let continues_last = match target.and_then(|i| thread.items.get(i)) {
                             Some(Item::Assistant { .. }) => !is_thought,
                             Some(Item::Thought { .. }) => is_thought,
                             _ => false,
@@ -1812,7 +1931,7 @@ impl AcpManager {
                             return;
                         }
                     }
-                    let appended = match thread.items.last_mut() {
+                    let appended = match target.and_then(|i| thread.items.get_mut(i)) {
                         Some(Item::Assistant { id, text: t, .. }) if !is_thought => {
                             t.push_str(&text);
                             Some((*id, text.clone()))
@@ -1877,7 +1996,7 @@ impl AcpManager {
                         }
                     }
                     if !found {
-                        for item in complete_pending_tools(thread, Some(&tc_id)) {
+                        for item in complete_pending_tools_on_update(thread, Some(&tc_id)) {
                             self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
                         }
                         let call = tool_call_from_update(&tc_id, update);
@@ -1909,7 +2028,11 @@ impl AcpManager {
                     // 以前若只改了后端 session、UI 事件被 active_thread 门控丢掉，就会出现
                     // 「已进 Plan 并停住，但前端仍显示 Build、也没有实施按钮」。
                     if let Some(mode) = update["currentModeId"].as_str() {
-                        let reported = unify_mode_id(mode);
+                        let reported = if self.kind == AgentKind::Kimi && mode == "yolo" {
+                            "build".to_string()
+                        } else {
+                            unify_mode_id(mode)
+                        };
                         if let Some(r) = self.routes.lock().unwrap().get_mut(session_id) {
                             r.applied_mode = Some(reported.clone());
                         }
@@ -1995,6 +2118,14 @@ impl AcpManager {
     }
 
     fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<String>) {
+        if self.kind == AgentKind::CodeBuddy {
+            let mut usage = self.codebuddy_turn_usage.lock().unwrap();
+            if running {
+                usage.insert(thread_id.to_string(), CodeBuddyTurnUsage::default());
+            } else {
+                usage.remove(thread_id);
+            }
+        }
         self.app
             .state::<AppState>()
             .sleep_inhibitor
@@ -2019,6 +2150,8 @@ impl AcpManager {
 
     /// 轮次收尾：写入 turn item（耗时 + token 用量）并结束 running 状态
     fn finish_turn(&self, thread_id: &str, stop_reason: String, usage: Option<Value>) {
+        let usage = self.codebuddy_turn_usage.lock().unwrap().remove(thread_id)
+            .and_then(CodeBuddyTurnUsage::finish).or(usage);
         self.steer_turns.lock().unwrap().remove(thread_id);
         let duration_ms = self
             .turn_started
@@ -2031,6 +2164,9 @@ impl AcpManager {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             if let Some(thread) = store.get_mut(thread_id) {
+                for route in self.routes.lock().unwrap().values_mut().filter(|r| r.thread_id == thread_id) {
+                    route.text_items.clear();
+                }
                 for item in complete_pending_tools(thread, None) {
                     self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
                 }
@@ -2293,30 +2429,82 @@ impl AcpManager {
         );
     }
 
-    /// CodeBuddy 官方预热：后台完成 bundle / DI / 配置 / MCP discovery，首条消息时
-    /// 通过 cbc-prewarm activate 绑定项目，并在原进程管道上切换为 ACP stdio。
-    pub async fn prewarm(self: &Arc<Self>, cwd: String) {
-        if self.kind != AgentKind::CodeBuddy {
+    /// 草稿页提前启动并完成 ACP initialize；CodeBuddy 的官方 activate 也在后台完成。
+    /// 不创建 session，发送时仍按真实线程注入 MCP 并设置模型/模式。
+    pub async fn prewarm(self: &Arc<Self>, cwd: String, mode: Option<String>) {
+        if !matches!(self.kind, AgentKind::Devin | AgentKind::CodeBuddy) {
             return;
         }
-        // 持槽锁完成替换，保证用户快速切换 A→B 项目时旧 A 的迟到结果不会覆盖 B。
-        let mut slot = self.codebuddy_prewarm.lock().await;
-        if slot.as_ref().is_some_and(|prewarm| prewarm.cwd == cwd) {
-            return;
-        }
+        let read_only = self.kind == AgentKind::Devin
+            && mode.as_deref().map(unify_mode_id).as_deref() == Some("plan");
+        let entry = Arc::new(AcpPrewarm {
+            cwd: cwd.clone(),
+            read_only,
+            conn: TokioMutex::new(None),
+        });
+        // 先锁新条目再发布，发送路径看到它时就能等待正在进行的初始化。
+        let mut ready = entry.conn.lock().await;
+        let old = {
+            let mut slot = self.prewarmed.lock().unwrap();
+            if let Some(current) = slot.as_ref() {
+                if current.cwd == cwd && current.read_only == read_only {
+                    match current.conn.try_lock() {
+                        Err(_) => return,
+                        Ok(conn)
+                            if conn
+                                .as_ref()
+                                .is_some_and(|c| c.alive.load(Ordering::SeqCst)) =>
+                        {
+                            return
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            slot.replace(entry.clone())
+        };
+        drop(old);
         let settings = {
             let state = self.app.state::<AppState>();
             let settings = state.settings.lock().unwrap().clone();
             settings
         };
-        match self.spawn_codebuddy_prewarm(&settings, cwd.clone()).await {
-            Ok(prewarm) => {
-                if let Some(old) = slot.replace(prewarm) {
-                    old.kill();
+        crate::skills::sync_skills_from_home();
+        let started = std::time::Instant::now();
+        let key = format!("prewarm-{}", uuid::Uuid::new_v4().simple());
+        let result = if self.kind == AgentKind::CodeBuddy {
+            match self.spawn_codebuddy_prewarm(&settings, cwd.clone()).await {
+                Ok(process) => {
+                    self.activate_codebuddy_prewarm(&settings, &key, process)
+                        .await
                 }
-                self.push_log(format!("[nova] CodeBuddy 预热已就绪：{cwd}"));
+                Err(error) => Err(error),
             }
-            Err(error) => self.push_log(format!("[nova] CodeBuddy 预热失败：{error}")),
+        } else {
+            self.spawn_conn(&settings, &key, Some(&cwd), read_only)
+                .await
+        };
+        let mut slot = self.prewarmed.lock().unwrap();
+        let current = slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, &entry));
+        match result {
+            Ok(conn) if current => {
+                *ready = Some(conn);
+                self.push_log(format!(
+                    "[nova] {} ACP 预热已就绪：{cwd}（{}ms）",
+                    self.kind.label(),
+                    started.elapsed().as_millis()
+                ));
+            }
+            Ok(conn) => conn.kill(),
+            Err(error) => {
+                if current {
+                    slot.take();
+                }
+                self.push_log(format!(
+                    "[nova] {} ACP 预热失败：{error}",
+                    self.kind.label()
+                ));
+            }
         }
     }
 
@@ -2340,7 +2528,7 @@ impl AcpManager {
         #[cfg(unix)]
         cmd.process_group(0);
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
-        cmd.envs(&self.launch_env);
+        cmd.envs(codebuddy_activation_env(&self.launch_env));
         #[cfg(windows)]
         cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
         {
@@ -2392,7 +2580,11 @@ impl AcpManager {
     }
 
     /// 确保线程的 ACP session 就绪（按需建立/恢复），返回 sessionId
-    async fn ensure_session(self: &Arc<Self>, thread_id: &str) -> Result<String, String> {
+    async fn ensure_session(
+        self: &Arc<Self>,
+        thread_id: &str,
+        require_restore: bool,
+    ) -> Result<String, String> {
         let lock = self.thread_lock(thread_id);
         let _guard = lock.lock().await;
 
@@ -2423,6 +2615,7 @@ impl AcpManager {
                     sid.clone(),
                     Route {
                         thread_id: thread_id.to_string(),
+                        text_items: HashMap::new(),
                         applied_model: None,
                         applied_mode: None,
                         applied_effort: None,
@@ -2460,12 +2653,18 @@ impl AcpManager {
                 }
                 self.loading_sessions.lock().unwrap().remove(&sid);
                 match loaded {
-                    Ok(_) => {
+                    Ok(result) => {
+                        self.capture_options(&result, !conn.from_prewarm);
                         // session/load 成功，继续复用该会话。
                         sid
                     }
                     Err(e) => {
                         self.routes.lock().unwrap().remove(&sid);
+                        if require_restore {
+                            return Err(format!(
+                                "工作目录已切换，但原会话恢复失败：{e}。历史会话已保留，请重试。"
+                            ));
+                        }
                         self.push_log(format!("[nova] session/load 失败，转为新建会话：{e}"));
                         let new_sid = self
                             .new_session_for(&conn, &key, thread_id, &cwd, &mcp_servers)
@@ -2486,6 +2685,9 @@ impl AcpManager {
                 }
             }
             None => {
+                if require_restore {
+                    return Err("工作目录已切换，但原会话标识已失效，无法自动续接".into());
+                }
                 let sid = self
                     .new_session_for(&conn, &key, thread_id, &cwd, &mcp_servers)
                     .await?;
@@ -2536,7 +2738,7 @@ impl AcpManager {
         // 翻译结果不在可用列表时：先找语义等价 fallback（Build→其它全权限 id）；
         // 没有 fallback 仍尝试下发，避免以前「直接标成已应用」导致 UI 显示 Build、
         // session 实际停在默认 Plan、也没有「实施」按钮。
-        let mut mode_to_send = need_mode.clone().map(|m| self.backend_mode_id(&m));
+        let mut mode_to_send = need_mode.clone().map(|m| Self::backend_mode_id(&self.kind, &m));
         if let (Some(m), Some(target)) = (need_mode.clone(), mode_to_send.clone()) {
             if self
                 .known_mode_ids()
@@ -2837,7 +3039,8 @@ impl AcpManager {
             }
             self.slots.lock().unwrap().remove(&key);
             self.push_log(format!(
-                "[nova] Devin 模式读写权限变化，已重启线程连接以刷新 nova-tools（thread={thread_id}）"
+                "[nova] {} 模式读写权限变化，已重启线程连接以刷新 nova-tools（thread={thread_id}）",
+                self.kind.label()
             ));
             return;
         }
@@ -2924,6 +3127,7 @@ impl AcpManager {
             sid.clone(),
             Route {
                 thread_id: thread_id.to_string(),
+                text_items: HashMap::new(),
                 applied_model: None,
                 applied_mode: None,
                 applied_effort: None,
@@ -2939,6 +3143,17 @@ impl AcpManager {
         text: String,
         images: Vec<PromptImage>,
     ) {
+        // ACP 不提供并发 prompt 注入；桌面输入沿用提示词队列，其它入口明确报忙。
+        if self.kind == AgentKind::Kimi && self.is_running(&thread_id) {
+            crate::append_thread_error(&self.app, &thread_id,
+                "Kimi Code 正在工作，请将消息加入队列或停止后重试".into());
+            return;
+        }
+        // 漫游和额度入口也会直接调用 run_prompt；追加消息统一走 CodeBuddy 原生引导。
+        if self.kind == AgentKind::CodeBuddy && self.is_running(&thread_id) {
+            Box::pin(self.steer_prompt(thread_id, text, images)).await;
+            return;
+        }
         // 新会话的 Paper Trail / 跨 agent 接力上下文，在真实用户输入前隐式注入。
         let handoff = {
             let state = self.app.state::<AppState>();
@@ -3034,13 +3249,59 @@ impl AcpManager {
         } else {
             text
         };
-        let outcome = self
-            .drive_prompt(&thread_id, &text, &images, handoff.as_deref())
+        let mut cwd_changes = self
+            .app
+            .state::<AppState>()
+            .context_service
+            .subscribe_cwd_changes(self.cwd_change_scope(&thread_id));
+        let mut outcome = self
+            .drive_prompt(
+                &thread_id,
+                &text,
+                &images,
+                handoff.as_deref(),
+                false,
+                &mut cwd_changes,
+            )
             .await;
+        let mut resumed_after_cwd_change = false;
+        while matches!(&outcome, Ok((stop, _)) if stop == "nova_cwd_changed")
+            && self.is_running(&thread_id)
+            && cwd_changes.is_current()
+        {
+            resumed_after_cwd_change = true;
+            // CodeBuddy may not persist the interrupted turn, even when session/load
+            // succeeds. Reuse Nova's bounded handoff transcript to retain the task.
+            let handoff = {
+                let state = self.app.state::<AppState>();
+                let store = state.store.lock().unwrap();
+                store.get(&thread_id).and_then(|thread| {
+                    crate::threads::render_handoff_context(
+                        &thread.items,
+                        thread.plan.as_ref(),
+                        self.kind.label(),
+                        self.kind.label(),
+                    )
+                })
+            };
+            outcome = self.drive_prompt(
+                &thread_id,
+                "Nova 已完成 change_working_directory，已在新的工作目录重启工具进程并恢复会话。此前目录切换工具即使显示取消也无需重试；请按最新工作目录继续完成用户尚未完成的任务。",
+                &[], handoff.as_deref(), true, &mut cwd_changes,
+            ).await;
+        }
 
-        // 轮次已被强制结束（看门狗/重启 devin），丢弃迟到的结果
-        if !self.is_running(&thread_id) {
+        // 轮次已被强制结束或已开启新轮次，丢弃迟到的结果。
+        if !self.is_running(&thread_id) || !cwd_changes.is_current() {
             return;
+        }
+        if resumed_after_cwd_change && outcome.is_ok() {
+            let state = self.app.state::<AppState>();
+            let mut store = state.store.lock().unwrap();
+            if let Some(thread) = store.get_mut(&thread_id) {
+                thread.handoff_from = None;
+            }
+            store.save_thread(&thread_id);
         }
 
         let (stop_reason, usage) = match outcome {
@@ -3157,6 +3418,14 @@ impl AcpManager {
     ) -> Vec<Value> {
         let mut prompt = Self::build_prompt_blocks(text, images);
         let mut guidance = Vec::new();
+        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi) {
+            // ponytail: ACP has no system-prompt setter; repeat rules per turn so resumed
+            // sessions and setting changes work. Use session-level instructions if ACP adds them.
+            guidance.push(crate::codex_app_server::rtk_guidance());
+            if self.app.state::<AppState>().settings.lock().unwrap().ponytail_enabled {
+                guidance.push(crate::lyra::PONYTAIL_RULES.to_string());
+            }
+        }
         if include_runtime_guidance {
             let (context_tools, read_only) = {
                 let state = self.app.state::<AppState>();
@@ -3204,6 +3473,18 @@ impl AcpManager {
         if let Some(runtime) = runtime_guidance {
             guidance.push(runtime);
         }
+        if self.kind == AgentKind::CodeBuddy
+            && self
+                .app
+                .state::<AppState>()
+                .settings
+                .lock()
+                .unwrap()
+                .auto_change_project_enabled
+            && !self.app.state::<AppState>().context_service.endpoint().is_empty()
+        {
+            guidance.push("需要更换工作目录/项目时，单独调用 nova-tools 的 change_working_directory(path)，不要与其它工具并行。Nova 会在新目录恢复本会话并自动继续；普通 cd 不能更改 Nova 会话目录。".into());
+        }
         if !guidance.is_empty() {
             let guidance = guidance.join("\n\n");
             if self.kind == AgentKind::CodeBuddy {
@@ -3223,7 +3504,7 @@ impl AcpManager {
         prompt
     }
 
-    /// 运行中追加提示（引导）：向当前活跃 session 直接注入新的 session/prompt。
+    /// 运行中追加提示：CodeBuddy 使用 session/steer，Devin 使用并发 session/prompt。
     /// devin 会把它合并进当前轮次（实测：注入请求与主请求在轮次结束时返回同一结果），
     /// 因此这里只落库用户消息并发出请求，轮次收尾仍由主 drive 负责。
     pub async fn steer_prompt(
@@ -3324,30 +3605,46 @@ impl AcpManager {
         } else {
             text
         };
-        let prompt = Self::build_prompt_blocks(&text, &images);
+        let prompt = self.build_user_prompt_blocks(&thread_id, &text, &images, false);
+        let codebuddy = self.kind == AgentKind::CodeBuddy;
         let mgr = self.clone();
         let tid = thread_id.clone();
-        // 该请求要到轮次结束才返回（与主 prompt 一同返回），结果由主 drive 收尾，这里只记录失败
+        // Devin 随主 prompt 返回；CodeBuddy 立即确认注入，当前轮仍由主 drive 收尾。
         tauri::async_runtime::spawn(async move {
             let result = conn
                 .request(
-                    "session/prompt",
-                    json!({ "sessionId": session_id, "prompt": prompt }),
+                    if codebuddy { "session/steer" } else { "session/prompt" },
+                    if codebuddy {
+                        json!({ "sessionId": session_id, "contentBlocks": prompt })
+                    } else {
+                        json!({ "sessionId": session_id, "prompt": prompt })
+                    },
                     None,
                 )
-                .await;
+                .await
+                .and_then(|result| {
+                    if codebuddy && result.get("steered").and_then(Value::as_bool) != Some(true) {
+                        Err(format!("CodeBuddy 未接受引导：{}", result.get("reason").and_then(Value::as_str).unwrap_or("unknown")))
+                    } else {
+                        Ok(result)
+                    }
+                });
             // 必须先释放引导占位；若主请求已经返回，这一步会完成被延后的轮次收尾。
             mgr.complete_steer(&tid);
             if let Err(e) = result {
                 mgr.push_log(format!("[nova] 引导消息发送失败 {tid}: {e}"));
                 // 注入随轮次一起夭折（如注入后用户立刻停止/连接被杀）：轮次已结束的话，
                 // 这条消息不会再有任何回应，明确提示用户重发，避免看起来「发出去但没反应」。
-                if !mgr.is_running(&tid) {
+                if codebuddy || !mgr.is_running(&tid) {
                     let state = mgr.app.state::<AppState>();
                     let mut store = state.store.lock().unwrap();
                     if let Some(thread) = store.get_mut(&tid) {
                         let item = thread.push_system(
-                            "上一条消息随已停止的任务一起中断了，未被处理，请重新发送。".into(),
+                            if codebuddy {
+                                format!("引导失败：{e}。请重新发送；若接口不受支持，请升级 CodeBuddy CLI。")
+                            } else {
+                                "上一条消息随已停止的任务一起中断了，未被处理，请重新发送。".into()
+                            },
                             "warn",
                         );
                         store.save_thread(&tid);
@@ -3364,6 +3661,8 @@ impl AcpManager {
         text: &str,
         images: &[PromptImage],
         handoff: Option<&str>,
+        require_restore: bool,
+        cwd_changes: &mut crate::context_service::CwdChangeSubscription,
     ) -> Result<(String, Option<Value>), String> {
         let include_runtime_guidance = {
             let state = self.app.state::<AppState>();
@@ -3373,8 +3672,8 @@ impl AcpManager {
             sid.is_none()
         };
         let t_ensure = std::time::Instant::now();
-        let mut session_id = self.ensure_session(thread_id).await?;
-        if !self.is_running(thread_id) {
+        let mut session_id = self.ensure_session(thread_id, require_restore).await?;
+        if !self.is_running(thread_id) || !cwd_changes.is_current() {
             return Err("任务已停止".into());
         }
         self.push_log(format!(
@@ -3385,9 +3684,18 @@ impl AcpManager {
         let conn_key = self.conn_key_for_thread(thread_id);
         // ensure_session 返回后进程可能恰好退出；交给下面的重建分支恢复。
         let mut conn = self.conn_for_key(&conn_key).await;
-        let mut prompt =
-            self.build_user_prompt_blocks(thread_id, text, images, include_runtime_guidance);
-        if let Some(ctx) = handoff {
+        // CodeBuddy treats the final text block as the current message; keep the
+        // handoff and continuation together so interrupted user messages survive.
+        let codebuddy_text = handoff
+            .filter(|_| self.kind == AgentKind::CodeBuddy)
+            .map(|context| format!("{context}\n\n{text}"));
+        let mut prompt = self.build_user_prompt_blocks(
+            thread_id,
+            codebuddy_text.as_deref().unwrap_or(text),
+            images,
+            include_runtime_guidance,
+        );
+        if let Some(ctx) = handoff.filter(|_| self.kind != AgentKind::CodeBuddy) {
             prompt.insert(0, json!({ "type": "text", "text": ctx }));
         }
         let items_at_prompt = {
@@ -3402,9 +3710,9 @@ impl AcpManager {
             String::new()
         };
         // 上一次失败是「假死」而非崩溃：重建连接时保留 sessionId，用 session/load 找回上下文。
-        let mut keep_session_on_rebuild = false;
+        let mut keep_session_on_rebuild = require_restore;
         for attempt in 1..=max_attempts {
-            if !self.is_running(thread_id) {
+            if !self.is_running(thread_id) || !cwd_changes.is_current() {
                 return Err("任务已停止".into());
             }
             let needs_rebuild = prompt_conn_needs_rebuild(
@@ -3437,7 +3745,7 @@ impl AcpManager {
                 } else {
                     self.clear_thread_session_for_respawn(thread_id);
                 }
-                session_id = self.ensure_session(thread_id).await?;
+                session_id = self.ensure_session(thread_id, require_restore).await?;
                 conn = self.conn_for_key(&conn_key).await;
                 if conn.is_none() {
                     last_err = format!("{} 未连接", self.kind.label());
@@ -3478,7 +3786,15 @@ impl AcpManager {
                 .unwrap()
                 .insert(session_id.clone(), std::time::Instant::now());
             match self
-                .prompt_with_stall_guard(conn, &session_id, &prompt, attempt, max_attempts)
+                .prompt_with_cwd_changes(
+                    thread_id,
+                    conn,
+                    &session_id,
+                    &prompt,
+                    attempt,
+                    max_attempts,
+                    cwd_changes,
+                )
                 .await
             {
                 Ok(resp) => {
@@ -3490,12 +3806,13 @@ impl AcpManager {
                     return Ok((stop, usage));
                 }
                 Err(failure) => {
-                    keep_session_on_rebuild = matches!(failure, PromptFailure::Stalled(_));
+                    keep_session_on_rebuild =
+                        require_restore || matches!(failure, PromptFailure::Stalled(_));
                     last_err = failure.into_message();
                     // 用户已经停止本轮：结果作废，不重试也不再往会话里补任何提示。
                     // force_finish 已经收尾并落了 system/turn 条目，若继续往下走，
                     // 那些条目会被算成「本轮已有输出」，误报一条「云端连接短暂中断」。
-                    if !self.is_running(thread_id) {
+                    if !self.is_running(thread_id) || !cwd_changes.is_current() {
                         return Err("任务已停止".into());
                     }
                     let dead =
@@ -3543,6 +3860,138 @@ impl AcpManager {
             }
         }
         Err(last_err)
+    }
+
+    fn cwd_change_scope(&self, thread_id: &str) -> String {
+        format!(
+            "{}:{}:{thread_id}",
+            self.kind.label(),
+            self.permission_scope
+        )
+    }
+
+    async fn prompt_with_cwd_changes(
+        self: &Arc<Self>,
+        thread_id: &str,
+        conn: &Arc<AcpConn>,
+        session_id: &str,
+        prompt: &[Value],
+        attempt: u32,
+        max_attempts: u32,
+        changes: &mut crate::context_service::CwdChangeSubscription,
+    ) -> Result<Value, PromptFailure> {
+        let request = self.prompt_with_stall_guard(conn, session_id, prompt, attempt, max_attempts);
+        tokio::pin!(request);
+        loop {
+            let change = tokio::select! {
+                result = &mut request => return result,
+                Some(change) = changes.receiver.recv() => change,
+            };
+            let target = (|| {
+                let state = self.app.state::<AppState>();
+                if self.kind != AgentKind::CodeBuddy
+                    || !state.settings.lock().unwrap().auto_change_project_enabled
+                    || !self.is_running(thread_id)
+                    || !changes.is_current()
+                {
+                    return Err("当前会话不允许切换工作目录".to_string());
+                }
+                let store = state.store.lock().unwrap();
+                let thread = store.get(thread_id).ok_or("会话不存在")?;
+                let cwd = resolve_changed_working_directory(&thread.cwd, &change.path)?;
+                let current = resolve_changed_working_directory(&thread.cwd, ".")
+                    .unwrap_or_else(|_| thread.cwd.clone());
+                Ok((cwd, current))
+            })();
+            let (cwd, current) = match target {
+                Ok(target) => target,
+                Err(error) => {
+                    let _ = change.reply.send(Err(error));
+                    continue;
+                }
+            };
+            if cwd == current {
+                let _ = change
+                    .reply
+                    .send(Ok(json!({ "cwd": cwd, "changed": false })));
+                continue;
+            }
+            // Queue cancellation before acknowledging the switch, so CodeBuddy cannot
+            // treat the MCP result as permission to keep working in its old process.
+            if let Err(error) = conn.send_raw(json!({
+                "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session_id }
+            })) {
+                let _ = change.reply.send(Err(error.clone()));
+                return Err(PromptFailure::Rpc(error));
+            }
+            if change
+                .reply
+                .send(Ok(json!({
+                    "cwd": cwd, "changed": true,
+                    "message": "Nova 正在切换工作目录，将自动恢复会话并继续任务。请勿再执行工具。"
+                })))
+                .is_err()
+            {
+                continue;
+            }
+            // CodeBuddy ignores cwd in session/load and has no live cwd setter. Cancel
+            // before replacing its process; MCP chdir alone leaves native tools in the old root.
+            let permission_keys: Vec<_> = self
+                .pending_permissions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, permission)| permission.session_id == session_id)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in permission_keys {
+                let _ = self.respond_permission(&key, "").await;
+            }
+            let settled = timeout(Duration::from_secs(10), &mut request).await;
+            if !self.is_running(thread_id) || !changes.is_current() {
+                return Err(PromptFailure::Rpc("任务已停止".into()));
+            }
+            let key = self.conn_key_for_thread(thread_id);
+            if let Some(slot) = self.slot_opt(&key) {
+                let mut active = slot.lock().await;
+                if active
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, conn))
+                {
+                    active.take();
+                } else {
+                    return Err(PromptFailure::Rpc("切换目录时会话连接已失效".into()));
+                }
+            }
+            self.unmount_thread_sessions(thread_id);
+            conn.kill();
+            self.prompt_sent_at.lock().unwrap().remove(session_id);
+            let state = self.app.state::<AppState>();
+            {
+                let mut store = state.store.lock().unwrap();
+                let thread = store
+                    .get_mut(thread_id)
+                    .ok_or_else(|| PromptFailure::Rpc("会话不存在".into()))?;
+                thread.cwd = cwd.clone();
+                // Retain this marker if loading/continuing fails, for the next retry.
+                thread.handoff_from = Some(self.kind.clone());
+                for item in complete_pending_tools(thread, None) {
+                    self.emit_update(thread_id, json!({ "t": "upsert", "item": item }));
+                }
+                store.save_thread(thread_id);
+            }
+            state.projects.lock().unwrap().touch(&cwd);
+            let _ = self.app.emit("projects:changed", json!({}));
+            let _ = self.app.emit(
+                "thread:cwd-changed",
+                json!({ "threadId": thread_id, "cwd": cwd }),
+            );
+            let _ = self.app.emit(EV_THREADS, json!({}));
+            if !matches!(settled, Ok(Ok(_))) {
+                self.push_log("[nova] 目录切换：旧执行未正常结束，将尝试恢复已保存的会话".into());
+            }
+            return Ok(json!({ "stopReason": "nova_cwd_changed" }));
+        }
     }
 
     /// 发出 session/prompt 并看住「首个响应」：agent 收下请求后可能再不回任何通知与响应
@@ -3713,7 +4162,9 @@ impl AcpManager {
     /// 该连接需要自动代答的权限请求作用域：Devin 与 CodeBuddy 的递增 RPC id
     /// 都在同一前端路由表里，CodeBuddy 加 cbp- 前缀避免键碰撞。
     fn permission_scope_prefix(&self) -> String {
-        if self.permission_scope.is_empty() && self.kind == AgentKind::CodeBuddy {
+        if self.permission_scope.is_empty() && self.kind == AgentKind::Kimi {
+            "kimi-".to_string()
+        } else if self.permission_scope.is_empty() && self.kind == AgentKind::CodeBuddy {
             "cbp-".to_string()
         } else {
             self.permission_scope.clone()
@@ -3723,8 +4174,8 @@ impl AcpManager {
     /// Devin 保持无前缀的 perm- key；CodeBuddy 每线程一条连接、RPC id 各自递增，
     /// 必须把连接键纳入作用域，避免两个并发会话的权限请求互相覆盖。
     fn permission_key(&self, conn: &AcpConn, id: &Value) -> String {
-        let scope = if self.kind == AgentKind::CodeBuddy {
-            format!("{}{}-", self.permission_scope_prefix(), conn.key)
+        let scope = if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi) {
+            format!("{}{}-", self.permission_scope_prefix(), conn.key.lock().unwrap())
         } else {
             self.permission_scope_prefix()
         };
@@ -3755,7 +4206,7 @@ impl AcpManager {
         read_only: bool,
         thread_id: &str,
     ) -> Result<Value, String> {
-        if self.kind != AgentKind::CodeBuddy {
+        if !matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi) {
             return Ok(json!([]));
         }
         let state = self.app.state::<AppState>();
@@ -3770,11 +4221,17 @@ impl AcpManager {
             let settings = state.settings.lock().unwrap();
             settings.context_retrieval_mode.as_str().to_string()
         };
-        // browser 独立于上下文检索；关闭 polaris 时仍需挂载只包含 browser 的 nova-tools。
-        if !browser_debug && !state.settings.lock().unwrap().context_tools_enabled() {
+        let auto_change_project = self.kind == AgentKind::CodeBuddy
+            && state.settings.lock().unwrap().auto_change_project_enabled
+            && !state.context_service.endpoint().is_empty();
+        // browser 和目录切换均独立于上下文检索开关。
+        if !browser_debug
+            && !auto_change_project
+            && state.context_service.endpoint().is_empty()
+        {
             return Ok(json!([]));
         }
-        let server = codebuddy_nova_tools_mcp_server(
+        let mut server = codebuddy_nova_tools_mcp_server(
             &self.app,
             cwd,
             &context_mode,
@@ -3784,8 +4241,16 @@ impl AcpManager {
             browser_debug,
             &state.config_dir,
         )?;
+        if auto_change_project {
+            server["env"].as_array_mut().unwrap().push(json!({
+                "name": "NOVA_CWD_CHANGE_SCOPE", "value": self.cwd_change_scope(thread_id)
+            }));
+            server["_meta"]["tools"]["change_working_directory"] =
+                json!({ "defer_loading": false });
+        }
         self.push_log(format!(
-            "[nova] CodeBuddy 已为 {cwd} 注入 nova-tools{}",
+            "[nova] {} 已为 {cwd} 注入 nova-tools{}",
+            self.kind.label(),
             if browser_debug { "/browser" } else { "" }
         ));
         Ok(json!([server]))
@@ -3878,7 +4343,9 @@ fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::C
         }
         None => tokio::process::Command::new(program),
     };
-    cmd.args(args).env("CODEBUDDY_DEFER_TOOL_LOADING", "0");
+    cmd.args(args)
+        .env("CODEBUDDY_DEFER_TOOL_LOADING", "0")
+        .env("DISABLE_AUTOUPDATER", "1");
     (program.to_string(), cmd)
 }
 
@@ -3886,7 +4353,9 @@ fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::C
 #[cfg(not(windows))]
 fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::Command) {
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args).env("CODEBUDDY_DEFER_TOOL_LOADING", "0");
+    cmd.args(args)
+        .env("CODEBUDDY_DEFER_TOOL_LOADING", "0")
+        .env("DISABLE_AUTOUPDATER", "1");
     (program.to_string(), cmd)
 }
 
@@ -3950,6 +4419,10 @@ fn merge_codebuddy_activation_env(
         );
     }
     env.extend(launch_env.clone());
+    // Nova kills managed process trees on eviction/exit. An interrupted npm self-update can
+    // leave global CLI shims renamed to temporary backups; keep updates outside this lifecycle.
+    // Prewarm activation replaces the environment, so explicitly carry this policy across it.
+    env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
     env
 }
 
@@ -3961,6 +4434,20 @@ fn codebuddy_activation_env(
 
 #[cfg(test)]
 mod codebuddy_acp_tests {
+    #[test]
+    fn kimi_acp_configuration_contract() {
+        let settings: crate::settings::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.kimi_path, "kimi");
+        assert!(!settings.kimi_enabled);
+        assert_eq!(super::AgentKind::from_str("kimi"), Some(super::AgentKind::Kimi));
+        assert_eq!(serde_json::to_string(&super::AgentKind::Kimi).unwrap(), "\"kimi\"");
+        for (mode, expected) in [("build", "yolo"), ("bypass", "yolo"), ("plan", "plan"), ("default", "default")] {
+            assert_eq!(super::AcpManager::backend_mode_id(&super::AgentKind::Kimi, mode), expected);
+        }
+        assert_eq!(super::AcpManager::backend_mode_id(&super::AgentKind::Devin, "build"), "bypass");
+        assert_eq!(super::AcpManager::backend_mode_id(&super::AgentKind::CodeBuddy, "build"), "bypass");
+    }
+
     use super::{
         codebuddy_command, codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
         is_process_exit_error, is_retriable_rpc_error, keep_known_model_options, lru_evict_keys,
@@ -3982,6 +4469,9 @@ mod codebuddy_acp_tests {
             codebuddy_command("codebuddy", &["--acp", "--cwd", "D:/repo with spaces"]);
         assert!(command.as_std().get_envs().any(|(key, value)| {
             key == "CODEBUDDY_DEFER_TOOL_LOADING" && value == Some(std::ffi::OsStr::new("0"))
+        }));
+        assert!(command.as_std().get_envs().any(|(key, value)| {
+            key == "DISABLE_AUTOUPDATER" && value == Some(std::ffi::OsStr::new("1"))
         }));
         assert!(command
             .as_std()
@@ -4149,13 +4639,16 @@ mod codebuddy_acp_tests {
             Some("local-secret")
         );
         assert!(!local.contains_key("OTHER_KEY"));
+        assert_eq!(local["DISABLE_AUTOUPDATER"], "1");
 
         let borrowed = HashMap::from([
             ("NOVA_QUOTA_BORROWED".into(), "1".into()),
             ("CODEBUDDY_CONFIG_DIR".into(), "isolated".into()),
+            ("DISABLE_AUTOUPDATER".into(), "0".into()),
         ]);
         let isolated = merge_codebuddy_activation_env(&borrowed, inherited);
         assert!(!isolated.contains_key("CODEBUDDY_API_KEY"));
+        assert_eq!(isolated["DISABLE_AUTOUPDATER"], "1");
         assert_eq!(
             isolated.get("CODEBUDDY_CONFIG_DIR").map(String::as_str),
             Some("isolated")
@@ -4253,6 +4746,19 @@ mod codebuddy_acp_tests {
         assert!(body.contains("<system-reminder>"));
         assert!(body.contains("block[\"text\"]"));
         assert!(!body.contains("AgentKind::CodeBuddy => prompt.insert(0"));
+        let rules = body.split("if include_runtime_guidance {").next().unwrap();
+        assert!(rules.contains("AgentKind::CodeBuddy | AgentKind::Kimi"));
+        assert!(rules.contains("crate::codex_app_server::rtk_guidance()"));
+        assert!(rules.contains("ponytail_enabled"));
+        assert!(rules.contains("crate::lyra::PONYTAIL_RULES"));
+        let steer = source.split("pub async fn steer_prompt(").nth(1).unwrap()
+            .split("async fn drive_prompt(").next().unwrap();
+        assert!(steer.contains("self.build_user_prompt_blocks(&thread_id, &text, &images, false)"));
+        let rtk = crate::codex_app_server::rtk_guidance();
+        assert!(rtk.contains("__rtk"));
+        assert!(rtk.contains("PowerShell:") && rtk.contains("Bash/sh:"));
+        assert!(rtk.contains("exact/raw output") && rtk.contains("approval/sandbox"));
+        assert!(!rtk.contains("Codex's"));
     }
 }
 
@@ -4428,6 +4934,49 @@ fn codebuddy_runtime_guidance(cwd: &str) -> Option<String> {
     ))
 }
 
+fn resolve_changed_working_directory(current: &str, path: &str) -> Result<String, String> {
+    if path.trim().is_empty() {
+        return Err("change_working_directory 缺少 path".into());
+    }
+    let path = std::path::Path::new(current).join(path);
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|error| format!("无法访问工作目录 {}：{error}", path.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("工作目录不是文件夹：{}", path.display()));
+    }
+    Ok(crate::sdk_runtime::display_working_directory(&canonical))
+}
+
+#[cfg(test)]
+mod cwd_change_tests {
+    use super::resolve_changed_working_directory;
+
+    #[test]
+    fn directory_change_resolves_relative_paths_and_rejects_files() {
+        let root = std::env::temp_dir().join(format!("nova-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("子目录 with spaces")).unwrap();
+        std::fs::write(root.join("file.txt"), "test").unwrap();
+        let current = root.to_str().unwrap();
+        let expected = resolve_changed_working_directory(current, "子目录 with spaces").unwrap();
+        assert_eq!(
+            resolve_changed_working_directory(current, &expected).unwrap(),
+            expected
+        );
+        assert_eq!(
+            resolve_changed_working_directory(&expected, "..").unwrap(),
+            resolve_changed_working_directory(current, ".").unwrap()
+        );
+        for path in ["", "  ", "missing", "file.txt"] {
+            assert!(
+                resolve_changed_working_directory(current, path).is_err(),
+                "{path}"
+            );
+        }
+        assert!(!expected.starts_with(r"\\?\"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[cfg(not(windows))]
 fn codebuddy_runtime_guidance(cwd: &str) -> Option<String> {
     Some(format!(
@@ -4501,6 +5050,12 @@ fn codebuddy_nova_tools_mcp_server_value(
         });
     } else {
         meta["tools"] = json!({ "polaris": { "defer_loading": false } });
+    }
+    if !read_only {
+        meta["tools"]["generate_image"] = json!({ "defer_loading": false });
+        meta["tools"]["edit_image"] = json!({ "defer_loading": false });
+        meta["tools"]["webview"] = json!({ "defer_loading": false });
+        meta["tools"]["chrome"] = json!({ "defer_loading": false });
     }
     json!({
         "name": "nova-tools",
@@ -4777,6 +5332,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
     if polaris {
         tool_names.extend(["polaris"]);
     }
+    if !read_only { tool_names.extend(["generate_image", "edit_image"]); }
     if tool_names.is_empty() {
         let mut lines = vec![
             "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."
@@ -4788,9 +5344,10 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
         return lines.join("\n");
     }
     let tools = tool_names.join(", ");
-    let example =
-        r#"{"server_name":"nova-tools","tool_name":"polaris","arguments":{"query":"cursor"}}"#;
-    let call_example_name = "polaris";
+    let example = if polaris {
+        r#"{"server_name":"nova-tools","tool_name":"polaris","arguments":{"query":"cursor"}}"#
+    } else { r#"{"server_name":"nova-tools","tool_name":"generate_image","arguments":{"prompt":"图片描述"}}"# };
+    let call_example_name = if polaris { "polaris" } else { "generate_image" };
     let nova_tools_phrase = format!(
         "You have Nova MCP endpoints from server nova-tools ({tools}) plus Devin built-in tools. In this Devin version, {tools} are remote MCP tool names, NOT top-level callable Devin tools."
     );
@@ -4929,6 +5486,37 @@ fn derive_title(text: &str, has_images: bool) -> String {
     }
 }
 
+// CodeBuddy 并行模型共享 session，按模型消息、父工具及正文/思考分别续写。
+fn acp_text_target(
+    items: &[Item],
+    update: &Value,
+    ids: &mut HashMap<(String, String, bool), usize>,
+) -> Option<usize> {
+    let meta = &update["_meta"];
+    let message = [
+        &meta["codebuddy.ai/modelRequestId"],
+        &meta["codebuddy.ai/llmMessageId"],
+        &update["messageId"],
+        &meta["codebuddy.ai/messageId"],
+    ].into_iter().filter_map(Value::as_str).find(|id| !id.is_empty());
+    let Some(message) = message else { return items.len().checked_sub(1) };
+    let thought = update["sessionUpdate"] == "agent_thought_chunk";
+    let key = (
+        meta["codebuddy.ai/parentToolCallId"].as_str().unwrap_or_default().to_string(),
+        message.to_string(),
+        thought,
+    );
+    if let Some(&index) = ids.get(&key) {
+        if matches!(items.get(index), Some(Item::Thought { .. }) if thought)
+            || matches!(items.get(index), Some(Item::Assistant { .. }) if !thought)
+        {
+            return Some(index);
+        }
+    }
+    ids.insert(key, items.len());
+    None
+}
+
 fn extract_text(content: &Value) -> String {
     match content["type"].as_str() {
         Some("text") => content["text"].as_str().unwrap_or_default().to_string(),
@@ -5044,6 +5632,60 @@ fn set_tool_duration(call: &mut ToolCall, duration_ms: u64) {
     }
 }
 
+fn complete_pending_tools_on_update(thread: &mut Thread, except_tool_call_id: Option<&str>) -> Vec<Item> {
+    // 并行消息/工具开始不代表其它工具已结束；CodeBuddy 会上报终态。
+    if matches!(thread.agent_kind, AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus) {
+        return Vec::new();
+    }
+    complete_pending_tools(thread, except_tool_call_id)
+}
+
+#[test]
+fn codebuddy_parallel_text_streams_keep_their_items() {
+    let mut thread = Thread::new(String::new(), AgentKind::CodeBuddy, None, None, None, false);
+    let mut ids = HashMap::new();
+    // 同一 messageId 下的并行模型、正文/思考和父工具均须隔离。
+    for (model, parent, thought, text) in [
+        ("a", "", false, "正文"),
+        ("b", "task", true, "思考"),
+        ("a", "", false, "继续"),
+        ("b", "task", true, "继续"),
+        ("b", "task", false, "结果"),
+        ("b", "other", false, "另一任务"),
+        ("c", "", false, "下一消息"),
+    ] {
+        let update = json!({"sessionUpdate": if thought { "agent_thought_chunk" } else { "agent_message_chunk" },
+            "messageId": "shared", "_meta": {"codebuddy.ai/modelRequestId": model,
+            "codebuddy.ai/parentToolCallId": parent}});
+        if let Some(index) = acp_text_target(&thread.items, &update, &mut ids) {
+            match &mut thread.items[index] {
+                Item::Assistant { text: value, .. } | Item::Thought { text: value, .. } => value.push_str(text),
+                _ => panic!("text stream targeted a non-text item"),
+            }
+        } else {
+            let id = thread.next_item_id();
+            thread.items.push(if thought {
+                Item::Thought { id, text: text.into(), ts: 0 }
+            } else {
+                Item::Assistant { id, text: text.into(), ts: 0 }
+            });
+        }
+    }
+    let texts: Vec<_> = thread.items.iter().map(|item| match item {
+        Item::Assistant { text, .. } | Item::Thought { text, .. } => text.as_str(),
+        _ => unreachable!(),
+    }).collect();
+    assert_eq!(texts, ["正文继续", "思考继续", "结果", "另一任务", "下一消息"]);
+    assert_eq!(acp_text_target(&thread.items, &json!({}), &mut ids), Some(4));
+    for update in [json!({"messageId": "fresh"}), json!({"_meta": {"codebuddy.ai/messageId": "fresh"}})] {
+        assert_eq!(acp_text_target(&thread.items, &update, &mut ids), None);
+    }
+    thread.items.push(Item::Tool { id: 6, ts: now_ms(), call: tool_call_from_update("tool", &json!({"status": "in_progress"})) });
+    assert!(complete_pending_tools_on_update(&mut thread, None).is_empty());
+    assert!(complete_pending_tools_on_update(&mut thread, Some("other")).is_empty());
+    assert_eq!(complete_pending_tools(&mut thread, None).len(), 1);
+}
+
 fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>) -> Vec<Item> {
     let mut changed = Vec::new();
     let finished_at = now_ms();
@@ -5061,4 +5703,94 @@ fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod acp_prewarm_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prewarm_claim_waits_inflight_matches_and_is_one_shot() {
+        fn entry(cwd: &str, read_only: bool, alive: bool) -> Arc<AcpPrewarm> {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            Arc::new(AcpPrewarm {
+                cwd: cwd.into(),
+                read_only,
+                conn: TokioMutex::new(Some(Arc::new(AcpConn {
+                    key: StdMutex::new("prewarm-test".into()),
+                    read_only,
+                    label: "test",
+                    transport: AcpTransport::Stdio(tx),
+                    pending: StdMutex::new(HashMap::new()),
+                    next_id: AtomicU64::new(1),
+                    alive: AtomicBool::new(alive),
+                    child: StdMutex::new(None),
+                    last_used: AtomicU64::new(0),
+                    from_prewarm: false,
+                }))),
+            })
+        }
+        let first = entry("A", true, true);
+        let slot = StdMutex::new(Some(first.clone()));
+        assert!(AcpPrewarm::take(&slot, "B", true).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+        assert!(slot.lock().unwrap().is_some());
+        assert!(AcpPrewarm::take(&slot, "A", true).await.is_some());
+        assert!(AcpPrewarm::take(&slot, "A", true).await.is_none());
+
+        *slot.lock().unwrap() = Some(entry("A", false, false));
+        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+        assert!(slot.lock().unwrap().is_none());
+
+        // 在飞预热晚于旧的 250ms 阈值才就绪，仍要等待并认领原连接，不能丢弃后冷启动。
+        let pending = entry("A", false, true);
+        let held = pending.conn.lock().await;
+        let expected = held.as_ref().unwrap().clone();
+        *slot.lock().unwrap() = Some(pending.clone());
+        let (claimed, ()) = tokio::join!(
+            AcpPrewarm::take(&slot, "A", false),
+            async {
+                sleep(Duration::from_millis(350)).await;
+                drop(held);
+            }
+        );
+        assert!(Arc::ptr_eq(&claimed.unwrap(), &expected));
+        assert!(expected.alive.load(Ordering::SeqCst));
+        assert!(slot.lock().unwrap().is_none());
+
+        // 旧目录的等待结束时不能认领或清空后来发布的新目录。
+        let held = pending.conn.lock().await;
+        *slot.lock().unwrap() = Some(pending.clone());
+        let next = entry("B", false, true);
+        let (claimed, ()) = tokio::join!(
+            AcpPrewarm::take(&slot, "A", false),
+            async {
+                sleep(Duration::from_millis(10)).await;
+                *slot.lock().unwrap() = Some(next.clone());
+                drop(held);
+            }
+        );
+        assert!(claimed.is_none());
+        assert!(Arc::ptr_eq(slot.lock().unwrap().as_ref().unwrap(), &next));
+        assert!(AcpPrewarm::take(&slot, "B", false).await.is_some());
+
+        // 预热失败时释放等待并允许调用方回退，不返回空槽或死亡连接。
+        let failed = entry("A", false, true);
+        failed.conn.lock().await.take();
+        *slot.lock().unwrap() = Some(failed);
+        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+
+        // 槽替换/关闭即便撞上预热完成，最后一个条目引用释放时仍要杀掉未认领连接。
+        let unused = entry("C", false, true);
+        let conn = unused.conn.lock().await.as_ref().unwrap().clone();
+        drop(unused);
+        assert!(!conn.alive.load(Ordering::SeqCst));
+
+        *slot.lock().unwrap() = Some(entry("D", false, true));
+        let (a, b) = tokio::join!(
+            AcpPrewarm::take(&slot, "D", false),
+            AcpPrewarm::take(&slot, "D", false)
+        );
+        assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
+    }
 }

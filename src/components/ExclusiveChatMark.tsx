@@ -1,5 +1,6 @@
 import { Show } from "solid-js";
-import { EngravedNumberMark } from "./EngravedNumberMark";
+import { SignatureWriting } from "./SignatureWriting";
+import "./EngravedNumberMark.css";
 import { signatureProgress, signatureVisible } from "./signatureOverlay";
 
 /** token 前缀对应的会话背景身份，按声明顺序匹配。 */
@@ -34,13 +35,6 @@ export function exclusiveNumberForToken(token: string): string | undefined {
 
 export function ExclusiveChatMark(props: { token: string }) {
   const identity = () => exclusiveIdentityForToken(props.token);
-  /** 启动签名进度 → 斜边软刷遮罩：前沿带柔边，水印像被笔尖扫过一样从左到右显出。 */
-  const revealMask = () => {
-    const p = signatureProgress();
-    if (p === null) return undefined;
-    const edge = p * 118;
-    return `linear-gradient(100deg, #000 ${(edge - 18).toFixed(1)}%, transparent ${edge.toFixed(1)}%)`;
-  };
 
   return (
     <Show when={identity()}>
@@ -52,23 +46,15 @@ export function ExclusiveChatMark(props: { token: string }) {
               signing: signatureProgress() !== null,
             }}
             aria-hidden="true"
-            style={
-              revealMask()
-                ? {
-                    "mask-image": revealMask()!,
-                    "-webkit-mask-image": revealMask()!,
-                    // 默认按边框盒裁剪会切掉花体溢出笔画；no-clip 保留完整字迹。
-                    "mask-clip": "no-clip",
-                    "-webkit-mask-clip": "no-clip",
-                  }
-                : undefined
-            }
           >
-            <EngravedNumberMark
-              username={value().username}
-              number={value().number}
-              class="composer-engraved-mark"
-            />
+            <span class="composer-engraved-mark engraved-number-mark">
+              <span class="engraved-number-mark-serial" style={{ opacity: signatureProgress() === null ? 1 : Math.min(1, signatureProgress()! * 5) }}>
+                No. {value().number}
+              </span>
+              <Show keyed when={value().username.toLowerCase()}>
+                {(username) => <SignatureWriting username={username} />}
+              </Show>
+            </span>
           </div>
       )}
     </Show>

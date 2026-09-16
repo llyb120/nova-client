@@ -8,19 +8,22 @@ import {
   signatureProgress,
 } from "./signatureOverlay";
 import "./SignatureSplash.css";
+import { signatureFrame } from "./signaturePaths";
 
 /** 描笔时长；之后稍作停留再固化。 */
 const REVEAL_MS = 2600;
 const SETTLE_HOLD_MS = 500;
 
 /**
- * 启动签名：在输入框水印原位置、原样式上描笔——水印本体被斜边软刷从左到右揭开，
- * 笔尖光点沿基线游走；签完进度置回 null，水印就地固化。颜色与位置即水印本身。
+ * 启动签名：按手绘 SVG 中心线的笔顺描笔，光点跟随实际路径。
+ * 签完进度置回 null，保留同一份 SVG 字迹。
  * 升级重启会先恢复之前的会话：等恢复有结论后，在最终显示的输入框水印上签。
  */
 export function SignatureSplash() {
   let markEl: HTMLElement | null = null;
-  let nameEl: Element | null = null;
+  let disposed = false;
+  let paths: SVGPathElement[] = [];
+  let lengths: number[] = [];
   let raf = 0;
   let holdTimer: number | undefined;
   let waitInterval: number | undefined;
@@ -58,8 +61,13 @@ export function SignatureSplash() {
       const r = mark?.getBoundingClientRect();
       if (mark && r && r.width > 0 && r.height > 0) {
         markEl = mark;
-        nameEl = mark.querySelector(".engraved-number-mark-name");
-        beginStroke();
+        paths = Array.from(mark.querySelectorAll<SVGPathElement>(".signature-writing path"));
+        lengths = paths.map((path) => path.getTotalLength());
+        if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+          setSignatureVisible(true);
+        } else {
+          beginStroke();
+        }
         return;
       }
       if (attempts > 0) {
@@ -75,6 +83,7 @@ export function SignatureSplash() {
     void api
       .signaturePending()
       .then((value) => {
+        if (disposed) return;
         if (!value) {
           setSignatureVisible(true);
           return;
@@ -90,22 +99,19 @@ export function SignatureSplash() {
       .catch(() => setSignatureVisible(true));
   });
 
-  onCleanup(stop);
+  onCleanup(() => { disposed = true; stop(); });
 
-  /**
-   * 笔尖位置：跟随描笔前沿，纵向带轻微手抖的正弦起伏。
-   * 每帧实时量水印位置——首页内容加载会引起布局位移，缓存坐标会跑偏。
-   */
+  /** 使用 SVG 到屏幕的矩阵，缩放和窗口尺寸变化后笔尖仍贴合笔画；抬笔期间隐藏。 */
   const pen = () => {
     const p = signatureProgress();
     if (p === null || !markEl || !markEl.isConnected) return null;
-    const r = markEl.getBoundingClientRect();
-    const nr = (nameEl ?? markEl).getBoundingClientRect();
-    return {
-      x: r.left + p * r.width,
-      y: nr.top + nr.height * 0.52 + Math.sin(p * Math.PI * 5) * nr.height * 0.14,
-      done: p >= 1,
-    };
+    const frame = signatureFrame(lengths, p);
+    const index = frame.findIndex((stroke) => stroke.active);
+    const path = paths[index];
+    const matrix = path?.isConnected ? path.getScreenCTM() : null;
+    if (!path || !matrix || p >= 1) return null;
+    const point = path.getPointAtLength(frame[index].drawn).matrixTransform(matrix);
+    return { x: point.x, y: point.y, done: false };
   };
 
   return (

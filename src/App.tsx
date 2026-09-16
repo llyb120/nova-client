@@ -20,6 +20,7 @@ import "./training-ground.css";
 import { selectedChatText } from "./chatSelection";
 import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
 import { mountSessionShortcuts } from "./sessionShortcuts";
+import { setWorkspaceLayout } from "./workspaceLayout";
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
   return (
@@ -180,6 +181,9 @@ export default function App() {
       });
     onGlobalShortcut("session-shortcut:new-session", () => openNewSession(selectedChatText()));
     onGlobalShortcut("session-shortcut:open-unread", () => void openNextUnreadThread());
+    void listen<{ threadId: string }>("native-browser:open", event => {
+      if (event.payload.threadId === state.currentId) setWorkspaceLayout({ open: true, mode: "browser" });
+    }).then(remove => { if (disposed) remove(); else unlistens.push(remove); });
     onCleanup(() => {
       disposed = true;
       for (const unlisten of unlistens) unlisten();

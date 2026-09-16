@@ -2,6 +2,7 @@ import type { AgentKind, ToolContent, ToolItem } from "./types";
 
 /** agent 展示名（徽标 / 标题 / 提示文案统一用） */
 export function agentLabel(kind: AgentKind): string {
+  if (kind === "kimi") return "Kimi Code";
   switch (kind) {
     case "lyra":
       return "Lyra";
@@ -9,20 +10,17 @@ export function agentLabel(kind: AgentKind): string {
       return "Codex";
     case "codebuddy":
       return "CodeBuddy";
-    case "claudecode":
-      return "Claude Code";
     case "cursor":
       return "Cursor";
-    case "opencode":
-      return "OpenCode";
     default:
       return "Devin";
   }
 }
 
 /** agent 单字徽标（侧边栏紧凑展示）：Lyra=L / Devin=D / Codex=C / CodeBuddy=B /
- *  Claude Code=CC / Cursor=CS / OpenCode=OC */
+ *  Cursor=CS */
 export function agentShort(kind: AgentKind): string {
+  if (kind === "kimi") return "K";
   switch (kind) {
     case "lyra":
       return "L";
@@ -30,12 +28,8 @@ export function agentShort(kind: AgentKind): string {
       return "C";
     case "codebuddy":
       return "B";
-    case "claudecode":
-      return "CC";
     case "cursor":
       return "CS";
-    case "opencode":
-      return "OC";
     default:
       return "D";
   }
@@ -124,4 +118,9 @@ export function setFileDropBlocked(blocked: boolean) {
 }
 export function isFileDropBlocked() {
   return fileDropBlocked;
+}
+
+/** Tauri 拖放坐标为物理像素；按最上层命中元素分流到文件面板，避免聊天附件重复接收。 */
+export function workspaceFileDropTarget(position: { x: number; y: number }): Element | null {
+  return document.elementFromPoint(position.x / window.devicePixelRatio, position.y / window.devicePixelRatio)?.closest('.workspace-panel') ?? null;
 }

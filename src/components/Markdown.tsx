@@ -3,11 +3,22 @@ import { marked } from "marked";
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createSignal, onCleanup, untrack } from "solid-js";
 import { api } from "../ipc";
+import { linkedFile, openWorkspaceFile } from "../workspaceLinks";
 import { state } from "../store";
+import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { advanceStreamText, STREAM_PREBUFFER_MS } from "../streamReveal";
 import { createFileContextMenu } from "./FileContextMenu";
 
 marked.setOptions({ gfm: true, breaks: true });
+marked.use({ renderer: {
+  image({ href, text }) {
+    const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const src = transcriptImageSrc(href);
+    if (!src) return escape(text);
+    const path = localImagePath(href);
+    return `<img src="${escape(src)}" alt="${escape(text || "生成图片")}"${path ? ` data-image-path="${escape(path)}" title="点击打开原图"` : ""} style="display:block;max-width:100%;max-height:360px;object-fit:contain" />`;
+  },
+} });
 
 // 流式输出时 props.text 持续增长，若每个 delta 都重新 parse 整段 Markdown 并替换
 // 整棵 innerHTML，长消息会明显卡顿（开销随长度增长）。三层优化：
@@ -130,8 +141,8 @@ function withFileReferences(html: string): string {
   for (const link of template.content.querySelectorAll<HTMLAnchorElement>("a[href]")) {
     const href = link.getAttribute("href") ?? "";
     if (/^(?:https?:|mailto:|#)/i.test(href)) continue;
-    const path = decodeURIComponent(href.replace(/^file:\/+/i, ""));
-    if (WHOLE_FILE_REFERENCE_RE.test(path)) link.replaceWith(fileReference(path));
+    const file = linkedFile(href);
+    if (file && WHOLE_FILE_REFERENCE_RE.test(file.path)) link.replaceWith(fileReference(file.path + (file.line ? `:${file.line}` : "")));
   }
 
   const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
@@ -299,13 +310,19 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
   });
 
   const onContextMenu = (e: MouseEvent) => {
-    const file = (e.target as HTMLElement).closest<HTMLButtonElement>(".md-file-ref");
-    const path = file?.dataset.path;
+    const target = e.target as HTMLElement;
+    const path = target.closest<HTMLImageElement>("img[data-image-path]")?.dataset.imagePath
+      ?? target.closest<HTMLButtonElement>(".md-file-ref")?.dataset.path;
     if (path) fileMenu.open(e, path);
   };
 
   const onClick = (e: MouseEvent) => {
     const target = e.target as HTMLElement;
+    const imagePath = target.closest<HTMLImageElement>("img[data-image-path]")?.dataset.imagePath;
+    if (imagePath && state.currentId) {
+      openWorkspaceFile(imagePath);
+      return;
+    }
     const btn = target.closest<HTMLButtonElement>(".code-copy");
     if (btn) {
       const pre = btn.parentElement?.querySelector("pre");
@@ -321,21 +338,23 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
     }
 
     const link = target.closest<HTMLAnchorElement>("a[href]");
-    const href = link?.href;
+    const href = link?.getAttribute("href");
     if (href && /^https?:\/\//i.test(href)) {
       e.preventDefault();
       void api.openUrl(href).catch((err) => console.error("open url failed", err));
       return;
     }
 
+    if (href) {
+      const file = linkedFile(href);
+      if (file) { e.preventDefault(); openWorkspaceFile(file.path, file.line); return; }
+    }
+
     const file = target.closest<HTMLButtonElement>(".md-file-ref");
     const path = file?.dataset.path;
     const id = state.currentId;
     if (!path || !id) return;
-    const action = IMAGE_FILE_RE.test(path)
-      ? api.openFileDefault(id, path)
-      : api.openInEditor(id, path, file.dataset.line ? Number(file.dataset.line) : undefined);
-    void action.catch((err) => void message(String(err), { kind: "error" }));
+    openWorkspaceFile(path, file.dataset.line ? Number(file.dataset.line) : undefined);
   };
 
   // md-seg 为 display:contents（不产生盒子），布局与单容器完全一致。

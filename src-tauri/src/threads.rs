@@ -50,15 +50,13 @@ pub fn session_cleanup_is_expired(timestamp: i64, now: i64, hours: u32) -> bool 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
+    Kimi,
     Devin,
     Codex,
     CodexPlus,
     CodeBuddy,
     CodeBuddyPlus,
-    ClaudeCode,
     Cursor,
-    OpenCode,
-    OpenCodePlus,
     Lyra,
 }
 
@@ -80,15 +78,13 @@ impl<'de> Deserialize<'de> for AgentKind {
 impl AgentKind {
     pub fn as_str(&self) -> &'static str {
         match self {
+            AgentKind::Kimi => "kimi",
             AgentKind::Devin => "devin",
             AgentKind::Codex => "codex",
             AgentKind::CodexPlus => "codexplus",
             AgentKind::CodeBuddy => "codebuddy",
             AgentKind::CodeBuddyPlus => "codebuddyplus",
-            AgentKind::ClaudeCode => "claudecode",
             AgentKind::Cursor => "cursor",
-            AgentKind::OpenCode => "opencode",
-            AgentKind::OpenCodePlus => "opencodeplus",
             AgentKind::Lyra => "lyra",
         }
     }
@@ -96,6 +92,7 @@ impl AgentKind {
     /// 从字符串解析后端标识（大小写不敏感）；无法识别返回 None。
     pub fn from_str(s: &str) -> Option<AgentKind> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "kimi" => Some(AgentKind::Kimi),
             // Vega 已移除：旧的 alkaid 标识一律映射到 Lyra。
             "alkaid" => Some(AgentKind::Lyra),
             "devin" => Some(AgentKind::Devin),
@@ -103,10 +100,7 @@ impl AgentKind {
             "codexplus" => Some(AgentKind::CodexPlus),
             "codebuddy" => Some(AgentKind::CodeBuddy),
             "codebuddyplus" => Some(AgentKind::CodeBuddyPlus),
-            "claudecode" => Some(AgentKind::ClaudeCode),
             "cursor" => Some(AgentKind::Cursor),
-            "opencode" => Some(AgentKind::OpenCode),
-            "opencodeplus" => Some(AgentKind::OpenCodePlus),
             "lyra" => Some(AgentKind::Lyra),
             _ => None,
         }
@@ -115,15 +109,13 @@ impl AgentKind {
     /// 展示用名称（注入接力上下文 / 系统提示用）
     pub fn label(&self) -> &'static str {
         match self {
+            AgentKind::Kimi => "Kimi Code",
             AgentKind::Devin => "Devin",
             AgentKind::Codex => "Codex",
             AgentKind::CodexPlus => "Codex",
             AgentKind::CodeBuddy => "CodeBuddy",
             AgentKind::CodeBuddyPlus => "CodeBuddy",
-            AgentKind::ClaudeCode => "Claude Code",
             AgentKind::Cursor => "Cursor",
-            AgentKind::OpenCode => "OpenCode",
-            AgentKind::OpenCodePlus => "OpenCode",
             AgentKind::Lyra => "Lyra",
         }
     }
@@ -516,7 +508,7 @@ pub struct Thread {
     /// 支持历史节点分叉的 SDK 后端在每轮完成后记录的远端位置。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_checkpoints: Vec<ProviderCheckpoint>,
-    /// Claude / CodeBuddy 在下一条 prompt 启动时执行的原生分叉位置。
+    /// CodeBuddy 在下一条 prompt 启动时执行的原生分叉位置。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_native_restore: Option<PendingNativeRestore>,
     /// Codex app-server 返回会话累计量；保留上次快照以换算本轮增量。
@@ -1993,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_to_opencode_preserves_history_once() {
+    fn handoff_to_cursor_preserves_history_once() {
         let mut thread = Thread::new(
             "D:/project".into(),
             AgentKind::Devin,
@@ -2008,19 +2000,19 @@ mod tests {
             text: "已经定位到旧会话状态。".into(),
             ts: now_ms(),
         });
-        thread.agent_kind = AgentKind::OpenCode;
+        thread.agent_kind = AgentKind::Cursor;
         thread.acp_session_id = None;
         thread.handoff_from = Some(AgentKind::Devin);
 
         let context = thread
-            .take_prompt_context("OpenCode")
-            .expect("跨后端切换应把已有历史交给 OpenCode");
+            .take_prompt_context("Cursor")
+            .expect("跨后端切换应把已有历史交给 Cursor");
 
-        assert!(context.contains("此前由 Devin 处理，现在改由你（OpenCode）接手"));
+        assert!(context.contains("此前由 Devin 处理，现在改由你（Cursor）接手"));
         assert!(context.contains("用户：\n请修复这个问题"));
         assert!(context.contains("Devin：\n已经定位到旧会话状态。"));
         assert_eq!(thread.handoff_from, None);
-        assert!(thread.take_prompt_context("OpenCode").is_none());
+        assert!(thread.take_prompt_context("Cursor").is_none());
     }
 
     #[test]
@@ -2130,10 +2122,10 @@ mod tests {
     }
 
     #[test]
-    fn edited_opencode_prompt_replays_retained_history_once() {
+    fn edited_cursor_prompt_replays_retained_history_once() {
         let mut thread = Thread::new(
             "D:/project".into(),
-            AgentKind::OpenCode,
+            AgentKind::Cursor,
             None,
             None,
             None,
@@ -2145,26 +2137,26 @@ mod tests {
             text: "问题位于会话恢复逻辑。".into(),
             ts: now_ms(),
         });
-        thread.handoff_from = Some(AgentKind::OpenCode);
+        thread.handoff_from = Some(AgentKind::Cursor);
 
         let context = thread
-            .take_prompt_context("OpenCode")
-            .expect("重编辑后应把截断点前的历史交给新的 OpenCode 会话");
+            .take_prompt_context("Cursor")
+            .expect("重编辑后应把截断点前的历史交给新的 Cursor 会话");
 
         assert!(context.contains("用户：\n先定位问题"));
-        assert!(context.contains("OpenCode：\n问题位于会话恢复逻辑。"));
-        assert!(thread.take_prompt_context("OpenCode").is_none());
+        assert!(context.contains("Cursor：\n问题位于会话恢复逻辑。"));
+        assert!(thread.take_prompt_context("Cursor").is_none());
 
         thread.items.clear();
         thread.handoff_from = None;
-        assert!(thread.take_prompt_context("OpenCode").is_none());
+        assert!(thread.take_prompt_context("Cursor").is_none());
     }
 
     #[test]
     fn checkpoint_before_uses_latest_position_from_current_backend() {
         let mut thread = Thread::new(
             "D:/project".into(),
-            AgentKind::OpenCode,
+            AgentKind::Cursor,
             None,
             None,
             None,
@@ -2172,15 +2164,15 @@ mod tests {
         );
         thread.record_provider_checkpoint(1, "open-session".into(), "message-1".into());
         thread.record_provider_checkpoint(5, "open-session".into(), "message-5".into());
-        thread.agent_kind = AgentKind::ClaudeCode;
-        thread.record_provider_checkpoint(3, "claude-session".into(), "message-3".into());
+        thread.agent_kind = AgentKind::CodeBuddy;
+        thread.record_provider_checkpoint(3, "buddy-session".into(), "message-3".into());
 
         assert_eq!(
             thread.checkpoint_before(5),
             Some(ProviderCheckpoint {
                 user_item_id: 3,
-                agent_kind: AgentKind::ClaudeCode,
-                session_id: "claude-session".into(),
+                agent_kind: AgentKind::CodeBuddy,
+                session_id: "buddy-session".into(),
                 position: "message-3".into(),
             })
         );

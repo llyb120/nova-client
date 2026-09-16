@@ -87,6 +87,20 @@ test("scanSource: Rust 生命周期/原始串/跨行串不破坏扫描", () => {
   assert.equal(m.depth, 1);
 });
 
+test("scanSource: multiline signatures retain bodies and stop at bodyless declarations", () => {
+  const cases = [
+    ["a.rs", "pub fn target(\n    values: [u8; 4],\n\n    // ) ignored\n    callback: fn(\n        u8,\n    ),\n)\nwhere\n    T: Copy,\n{\n    callback(values[0]);\n}\n", 13],
+    ["a.rs", "trait Example {\n    fn target(\n        &self,\n        value: u8,\n    );\n    fn next(&self);\n}\n", 5],
+    ["a.ts", "export function target(\n    options: {\n        value: number,\n    },\n\n    callback: (value: number) => void,\n) {\n    callback(options.value);\n}\n", 9],
+    ["a.ts", "export const target = 1,\n    next = 2;\n", 1],
+    ["a.rs", `pub fn target(\n${"    arg: u8,\n".repeat(20)}) {\n    work();\n}\n`, 24],
+  ];
+  for (const [file, text, end] of cases) {
+    const symbol = scanSource(text, file).syms.find((symbol) => symbol.name === "target");
+    assert.equal(symbol?.end, end, `${file}: ${text}`);
+  }
+});
+
 test("scanSource: Python 按缩进定界", () => {
   const { syms } = scanSource(
     [

@@ -2,13 +2,49 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { transformSync } from "esbuild";
-import { createMemo, createRoot, createSignal } from "solid-js/dist/solid.js";
+import { createEffect, createMemo, createRoot, createSignal } from "solid-js/dist/solid.js";
 import { createStore, reconcile } from "solid-js/store/dist/store.js";
 import { virgoChains } from "../src/virgoChains.ts";
 
 const store = readFileSync(new URL("../src/store.ts", import.meta.url), "utf8");
 const sidebar = readFileSync(new URL("../src/components/Sidebar.tsx", import.meta.url), "utf8");
 const js = (source) => transformSync(source, { loader: "ts", target: "esnext" }).code;
+
+test("文件面板开关跨会话保持，重新挂载恢复全局偏好", () => {
+  const chat = readFileSync(new URL("../src/components/ChatView.tsx", import.meta.url), "utf8");
+  const source = chat.slice(chat.indexOf("  const workspaceOpen ="), chat.indexOf("  const previewFile ="));
+  const saved = new Map();
+  const storage = { getItem: key => saved.get(key), setItem: (key, value) => saved.set(key, value) };
+  const layoutSource = readFileSync(new URL('../src/workspaceLayout.ts', import.meta.url), 'utf8').replace(/^import .*;\r?\n/gm, '').replace(/export /g, '');
+  const loadLayout = () => new Function('createStore', 'localStorage', `${js(layoutSource)}; return {workspaceLayout, setWorkspaceLayout, defaultWorkspaceLayout};`)(createStore, storage);
+  let layout = loadLayout();
+  const [currentId, setCurrentId] = createSignal('a');
+  const state = { get currentId() { return currentId(); } };
+  const mount = () => createRoot(dispose => ({ dispose, ...new Function('createSignal', 'createEffect', 'state', 'workspaceLayout', 'setWorkspaceLayout', `${js(source)}; return {workspaceOpen, setWorkspaceOpen, workspaceRequest, setWorkspaceRequest};`)(createSignal, createEffect, state, layout.workspaceLayout, layout.setWorkspaceLayout) }));
+  let panel = mount();
+  try {
+    assert.equal(panel.workspaceOpen(), false);
+    panel.setWorkspaceOpen(true);
+    panel.setWorkspaceRequest({path:'a.rs'});
+    setCurrentId('b');
+    assert.equal(panel.workspaceOpen(), true);
+    assert.equal(panel.workspaceRequest(), null, 'do not carry a file request to another session');
+    panel.dispose(); layout = loadLayout(); panel = mount();
+    assert.equal(panel.workspaceOpen(), true, 'reopening chat restores global open preference');
+    panel.setWorkspaceOpen(false);
+    setCurrentId('a');
+    assert.equal(panel.workspaceOpen(), false);
+    panel.dispose(); layout = loadLayout(); panel = mount();
+    assert.equal(panel.workspaceOpen(), false, 'closed preference survives remount too');
+    layout.setWorkspaceLayout({open:true,widthRatio:.6,minimap:false,softWrap:false});
+    assert.equal(panel.workspaceOpen(), true, 'appearance settings update the open chat immediately');
+    assert.equal(loadLayout().workspaceLayout.widthRatio, .6);
+    layout.setWorkspaceLayout(layout.defaultWorkspaceLayout);
+    assert.equal(panel.workspaceOpen(), false);
+    assert.equal(loadLayout().workspaceLayout.widthRatio, null);
+    assert.equal(loadLayout().workspaceLayout.minimap, true);
+  } finally { panel.dispose(); }
+});
 
 test("缓存切换跳过加载帧并取消流式节流，首次加载仍允许先绘制提示", () => {
   const canvas = readFileSync(new URL("../src/components/CanvasTranscript.tsx", import.meta.url), "utf8");

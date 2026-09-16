@@ -4,6 +4,7 @@ import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { LruMap } from "./lruMap";
 import { api } from "./ipc";
+import { rememberPromptDraft } from "./promptDraft";
 import type {
   Achievement,
   AgentKind,
@@ -65,7 +66,8 @@ import {
 } from "./workflow/storage";
 import { latestFireStage } from "./threadDisplay";
 import { normalizeGeneratedWorkflow } from "./workflow/types";
-import { buildEasyPrompt, buildHardDesignPrompt, buildIntegrateModelPrompt, buildPlanPrompt } from "./builtinPrompts";
+import { initRoamingWorkflows, setPeerWorkflows } from "./workflow/roaming";
+import { buildEasyPrompt, buildHardDesignPrompt, buildIntegrateModelPrompt, buildPlanPrompt, buildSetupImagePrompt, buildGenerateImagePrompt } from "./builtinPrompts";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
@@ -228,11 +230,10 @@ export const [state, setState] = createStore<AppStore>({
   modelOptions: {
     lyra: null,
     devin: null,
+    kimi: null,
     codex: null,
     codebuddy: null,
-    claudecode: null,
     cursor: null,
-    opencode: null,
   },
   logs: [],
   loadingThread: false,
@@ -245,11 +246,10 @@ export const [state, setState] = createStore<AppStore>({
   slashCommands: {
     lyra: [],
     devin: [],
+    kimi: [],
     codex: [],
     codebuddy: [],
-    claudecode: [],
     cursor: [],
-    opencode: [],
   },
   updateProgress: null,
   relay: { enabled: false, connected: false },
@@ -344,23 +344,7 @@ export function modelChoices(
   const opts = (source !== undefined ? source : state.modelOptions[agentKind])?.configOptions;
   if (!opts) return [];
   const model = opts.find((o) => o.id === "model");
-  const choices = (model?.options as ModelChoice[]) ?? [];
-  if (agentKind !== "opencode") return choices;
-  // OpenCode 的 Auto 只能路由到 GPT；未配置任何 GPT 时不展示，避免产生无效入口。
-  if (
-    agentKind === "opencode" &&
-    !choices.some((choice) => choice.value.toLowerCase().includes("gpt"))
-  ) {
-    return choices;
-  }
-  const auto: ModelChoice[] = [
-    {
-      value: "__nova_auto_community__",
-      name: "Auto（按社区评分）",
-      description: "新会话首次发送前获取近 24 小时社区体感分第一名（排除 ultra），后续固定复用；数据来自 Codex 雷达 codexradar.com",
-    },
-  ];
-  return [...auto, ...choices.filter((choice) => !choice.value.startsWith("__nova_auto_"))];
+  return (model?.options as ModelChoice[]) ?? [];
 }
 
 /** 在可选列表中解析应使用的模型。
@@ -502,11 +486,10 @@ export async function ensureModelOptions(agentKind: AgentKind) {
 export const ALL_AGENT_KINDS: AgentKind[] = [
   "lyra",
   "devin",
+  "kimi",
   "codex",
   "codebuddy",
-  "claudecode",
   "cursor",
-  "opencode",
 ];
 
 /** 某后端在设置里是否启用。缺字段（老版本 settings）按启用处理（!== false）。 */
@@ -514,18 +497,16 @@ function agentEnabled(s: Settings, k: AgentKind): boolean {
   switch (k) {
     case "lyra":
       return s.lyraEnabled !== false;
+    case "kimi":
+      return s.kimiEnabled === true;
     case "devin":
       return s.devinEnabled !== false;
     case "codex":
       return s.codexEnabled !== false;
     case "codebuddy":
       return s.codebuddyEnabled !== false;
-    case "claudecode":
-      return s.claudecodeEnabled !== false;
     case "cursor":
       return s.cursorEnabled !== false;
-    case "opencode":
-      return s.opencodeEnabled !== false;
   }
 }
 
@@ -965,6 +946,11 @@ export function quotaPeers(): Peer[] {
 export function ensurePeerModels(token: string, force = false) {
   if (!token) return;
   if (!force && state.peerModels[token]) return;
+  if (force) setPeerWorkflows((previous) => {
+    const next = { ...previous };
+    delete next[token];
+    return next;
+  });
   void api.requestPeerModels(token).catch(() => {
     // 对端离线/未连接时静默失败，选择器回退为空，用户可稍后重试
   });
@@ -1514,7 +1500,7 @@ const VIRGO_MANUAL_KEY = "fd:virgoManualHidden:v1";
 
 /**
  * 快捷键手动收进室女座的会话链根 id：整条父子接力链一起收纳，重启后仍保留，
- * 再次打开链上任一会话时自动解纳（unhideVirgoThread）回到普通列表。
+ * 整条任务链结束或再次打开链上任一会话时自动解纳回到普通列表。
  */
 const virgoManualRoots = new Set<string>(readVirgoManualRoots());
 const [virgoManualVersion, setVirgoManualVersion] = createSignal(0);
@@ -1576,7 +1562,16 @@ function virgoChainIds(roots: string[]): Set<string> {
 
 /** 手动收进室女座的会话 id（未开启减少焦虑时的收纳口径）。 */
 function virgoManualHidden(): Set<string> {
-  return virgoChainIds(virgoManualRootsSnapshot());
+  const roots = virgoManualRootsSnapshot();
+  const active = zenRunningChains().hidden;
+  const knownIds = new Set(state.threads.map((thread) => thread.id));
+  const finished = roots.filter((root) => knownIds.has(root) && !active.has(root));
+  if (finished.length > 0) {
+    for (const root of finished) virgoManualRoots.delete(root);
+    setVirgoManualVersion((version) => version + 1);
+    persistVirgoManualRoots();
+  }
+  return virgoChainIds(roots.filter((root) => active.has(root)));
 }
 
 /**
@@ -1609,7 +1604,7 @@ export function hideCurrentThreadToVirgo(): boolean {
     // 当前页面属于被收起的会话链时回到首页。
     setView("home");
   }
-  showToast("会话已移入室女座，打开即回到普通会话");
+  showToast("会话已移入室女座，结束后自动移回，也可手动打开");
   return true;
 }
 
@@ -1763,6 +1758,7 @@ export function createThreadOptimistic(
     bumpChatScrollToBottom();
   }
   void (async () => {
+    let createdId: string | null = null;
     try {
       const t = await api.createThread(
         cwd,
@@ -1777,6 +1773,7 @@ export function createThreadOptimistic(
         clueCardId || null,
         null,
       );
+      createdId = t.id;
       rememberThreadSnapshot(t);
       const storedAgentKind = t.agentKind ?? agentKind;
       lastUsed.setMode(storedAgentKind, t.mode ?? "");
@@ -1810,14 +1807,17 @@ export function createThreadOptimistic(
       void refreshProjects();
       void ensureModelOptions(storedAgentKind);
     } catch (error) {
-      if (state.currentId === pendingId) {
-        setState("items", (items) => items.filter((item) => item.id >= 0));
+      if (createdId) {
+        setState("running", createdId, false);
+        optimisticRunningThreads.delete(createdId);
+      }
+      if (state.currentId === pendingId || (createdId && state.currentId === createdId)) {
+        rememberPromptDraft(text, images);
+        setState("items", []);
         setState("currentId", null);
         setView("home");
-      } else if (zenModeOn()) {
-        // 减少焦虑下用户只看到气泡飞走，创建失败必须显式告知，否则提示词静默丢失。
-        showToast("会话创建失败，请重试");
       }
+      showToast(`${createdId ? "消息发送失败" : "会话创建失败"}：${String(error)}`);
       console.error("optimistic create_thread failed", error);
     }
   })();
@@ -2181,6 +2181,15 @@ async function tryBuiltinPrompt(
   images: PromptImage[],
 ): Promise<boolean> {
   const builtInInput = text.trim();
+  if (/^\/(?:setup-image|generate-image|edit-image)(?:\s|$)/i.test(builtInInput)) {
+    assertBuiltinPrompt(text, images);
+    const setup = /^\/setup-image(?:\s|$)/i.test(builtInInput);
+    const edit = /^\/edit-image(?:\s|$)/i.test(builtInInput);
+    const goal = builtInInput.replace(/^\/(?:setup-image|generate-image|edit-image)\s*/i, "").trim();
+    const context = await api.imageCommandContext(!setup, images);
+    await deliverPrompt(threadId, setup ? buildSetupImagePrompt(goal, context.configPath) : buildGenerateImagePrompt(goal, context, edit ? "edit" : "generate"), images);
+    return true;
+  }
   const stage = parseStageInput(builtInInput);
   if (stage) {
     if (images.length > 0) throw new Error("/stage 暂不支持附件");
@@ -2235,7 +2244,10 @@ async function tryBuiltinPrompt(
     return true;
   }
   // 触发条件：提示词命中某工作流的 slash/contains/regex 触发器时自动启动。
-  const triggered = findTriggeredWorkflow(builtInInput);
+  // 漫游会话的普通补充消息不能被本机工作流触发器抢走。
+  const roamingRole = state.threads.find((thread) => thread.id === threadId)?.roamingRole
+    ?? getThreadSnapshot(threadId)?.roamingRole;
+  const triggered = roamingRole === "guest" ? null : findTriggeredWorkflow(builtInInput);
   if (triggered) {
     await startWorkflow(triggered.id, { goal: triggered.goal }, threadId, images);
     return true;
@@ -2281,6 +2293,13 @@ function parseRunInput(input: string): { workflowId: string; vars: Record<string
 /** 创建会话 / 暂存前提前校验内置命令，避免 worktree 建完才发现 /fire 非法。 */
 export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   const builtInInput = text.trim();
+  if (/^\/(?:setup-image|generate-image|edit-image)(?:\s|$)/i.test(builtInInput)) {
+    if (/^\/setup-image(?:\s|$)/i.test(builtInInput) && images.length > 0) throw new Error("/setup-image 不支持附件，请用 /generate-image 或 /edit-image 提交参考图");
+    if (images.some((image) => !["image/png", "image/jpeg", "image/webp"].includes(image.mimeType))) throw new Error("参考图仅支持 PNG、JPEG 和 WebP");
+    if (/^\/generate-image\s*$/i.test(builtInInput)) throw new Error("请在 /generate-image 后输入图片描述");
+    if (/^\/edit-image\s*$/i.test(builtInInput)) throw new Error("请在 /edit-image 后输入修改要求，并附上或指定要编辑的原图");
+    return;
+  }
   const stage = parseStageInput(builtInInput);
   if (stage) {
     if (images.length > 0) throw new Error("/stage 暂不支持附件");
@@ -2914,14 +2933,17 @@ export async function respondPermission(requestKey: string, optionId: string) {
 
 const pendingDeltas = new Map<number, string>();
 
-/* —— 侧栏标题跳动速度：按流式 delta 字符吞吐粗估输出速率 ——
-   1 token ≈ 4 字符只用于驱动动画节奏，无需精确；约 0.5s 一个采样窗口并做平滑。 */
+/* ponytail: 参照 Claude Code 2.0.76 spinner，以输出字符数 / 4 估算；
+   包含回答、思考和工具参数。中文/tokenizer 及未推送的参数流会有偏差，
+   精确速率需要 provider 提供逐块 token 计数。 */
 const RATE_WINDOW_MS = 500;
 const rateWindows = new Map<string, { chars: number; since: number; tokensPerSec: number }>();
+const rateUpdatedAt = new Map<string, number>();
 export const [outputRates, setOutputRates] = createSignal<Record<string, number>>({});
 
 function trackDeltaRate(threadId: string, chars: number) {
   const now = performance.now();
+  if (chars > 0) rateUpdatedAt.set(threadId, now);
   let w = rateWindows.get(threadId);
   if (!w) {
     w = { chars: 0, since: now, tokensPerSec: 0 };
@@ -2929,7 +2951,13 @@ function trackDeltaRate(threadId: string, chars: number) {
   }
   if (now - w.since >= RATE_WINDOW_MS) {
     const inst = w.chars / 4 / ((now - w.since) / 1000);
-    w.tokensPerSec = w.tokensPerSec ? w.tokensPerSec * 0.4 + inst * 0.6 : inst;
+    // 短段输出之间的空窗口保留上次采样，真正停顿才归零。
+    // 归零也必须写 signal，不能在 getter 中用非响应式时钟临时返回 0。
+    if (w.chars > 0) {
+      w.tokensPerSec = w.tokensPerSec ? w.tokensPerSec * 0.4 + inst * 0.6 : inst;
+    } else if (now - (rateUpdatedAt.get(threadId) ?? now) >= 1_500) {
+      w.tokensPerSec = 0;
+    }
     w.chars = 0;
     w.since = now;
     const rounded = Math.round(w.tokensPerSec);
@@ -2940,7 +2968,15 @@ function trackDeltaRate(threadId: string, chars: number) {
   w.chars += chars;
 }
 
+/* 实时输出速度（tok/s）：共享采样器负责发布速度及停顿归零。 */
+export function getOutputRate(threadId: string | null | undefined): number {
+  const rates = outputRates();
+  if (!threadId) return 0;
+  return rates[threadId] ?? 0;
+}
+
 function clearDeltaRate(threadId: string) {
+  rateUpdatedAt.delete(threadId);
   if (!rateWindows.delete(threadId)) return;
   setOutputRates((rates) => {
     if (!(threadId in rates)) return rates;
@@ -3026,6 +3062,19 @@ function applyUpsert(item: Item) {
     if (optimistic >= 0) setState("items", (items) => items.filter((_, i) => i !== optimistic));
   }
   const idx = state.items.findIndex((current) => current.id === item.id);
+  // 完整快照只统计新增输出；工具参数属于模型输出，工具结果/日志不属于。
+  if (state.currentId && state.running[state.currentId]) {
+    const outputLength = (value: Item | undefined): number => {
+      if (value?.type === "assistant" || value?.type === "thought") {
+        return value.text === "思考中…" ? 0 : value.text.length;
+      }
+      if (value?.type !== "tool" || value.rawInput == null) return 0;
+      return (typeof value.rawInput === "string" ? value.rawInput : JSON.stringify(value.rawInput))?.length ?? 0;
+    };
+    const previous = idx >= 0 ? state.items[idx] : undefined;
+    const added = Math.max(0, outputLength(item) - outputLength(previous));
+    if (added) trackDeltaRate(state.currentId, added);
+  }
   if (idx >= 0) setState("items", idx, reconcile(item));
   else setState("items", state.items.length, item);
 }
@@ -3173,6 +3222,14 @@ export const [restoreSettled, setRestoreSettled] = createSignal(false);
 export async function initStore() {
   if (initialized) return;
   initialized = true;
+  await initRoamingWorkflows();
+  // 无新消息也结算采样窗口：首块及时显示，工具执行/等待期间归零。
+  setInterval(() => {
+    for (const threadId of rateWindows.keys()) {
+      if (state.running[threadId]) trackDeltaRate(threadId, 0);
+      else clearDeltaRate(threadId);
+    }
+  }, RATE_WINDOW_MS);
 
   // 必须先监听模型更新，再读取 settings 触发 ensureModelOptions；否则缓存命中后的后台
   // 重验可能在其余监听串行注册期间完成，磁盘已更新但当前窗口仍停在旧列表。
@@ -3222,189 +3279,337 @@ export async function initStore() {
     void api.showMainWindow().catch(() => {});
     return { error };
   });
-
-  await listen<{ threadId: string; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
-    const ops = e.payload.ops ?? (e.payload.op ? [e.payload.op] : []);
-    // 后台会话的 usage 也要保留；否则切回运行中的会话会先显示 0，直到下一次上报。
-    for (const op of ops) {
-      if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
-      else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text.length);
-    }
-    if (e.payload.threadId !== state.currentId) {
-      if (threadSnapshots.has(e.payload.threadId)) staleThreadSnapshots.add(e.payload.threadId);
-      return;
-    }
-    // 切换会话加载快照期间忽略增量：此刻 items 还是旧会话的，getThread 快照会包含
-    // 已落库的全部内容，加载完成（loadingThread=false）后再应用后续实时增量。
-    // mode / proposed_plan / plan 是低频关键状态，加载中也要应用，否则 agent 切到 Plan
-    // 时选择器与「实施此计划」按钮会对不齐。
-    const apply = (op: UpdateOp) => {
-      if (snapshotToolUpdates?.threadId === e.payload.threadId && op.t === "upsert"
-        && op.item.type === "tool" && op.item.status !== "pending" && op.item.status !== "in_progress") {
-        snapshotToolUpdates.items.set(op.item.id, op.item);
+  // 各监听互不依赖：并发注册，全部就绪后再读取会话快照，避免遗漏状态事件。
+  await Promise.all([
+    listen<{ threadId: string; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
+      const ops = e.payload.ops ?? (e.payload.op ? [e.payload.op] : []);
+      // 后台会话的 usage 也要保留；否则切回运行中的会话会先显示 0，直到下一次上报。
+      for (const op of ops) {
+        if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
+        else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text.length);
       }
-      if (
-        state.loadingThread &&
-        op.t !== "mode" &&
-        op.t !== "proposed_plan" &&
-        op.t !== "plan"
-      ) {
+      if (e.payload.threadId !== state.currentId) {
+        if (threadSnapshots.has(e.payload.threadId)) staleThreadSnapshots.add(e.payload.threadId);
         return;
       }
-      applyOp(op);
-    };
-    if (ops.length > 1) {
-      batch(() => {
-        for (const op of ops) apply(op);
-      });
-    } else if (ops[0]) {
-      apply(ops[0]);
-    }
-  });
+      // 切换会话加载快照期间忽略增量：此刻 items 还是旧会话的，getThread 快照会包含
+      // 已落库的全部内容，加载完成（loadingThread=false）后再应用后续实时增量。
+      // mode / proposed_plan / plan 是低频关键状态，加载中也要应用，否则 agent 切到 Plan
+      // 时选择器与「实施此计划」按钮会对不齐。
+      const apply = (op: UpdateOp) => {
+        if (snapshotToolUpdates?.threadId === e.payload.threadId && op.t === "upsert"
+          && op.item.type === "tool" && op.item.status !== "pending" && op.item.status !== "in_progress") {
+          snapshotToolUpdates.items.set(op.item.id, op.item);
+        }
+        if (
+          state.loadingThread &&
+          op.t !== "mode" &&
+          op.t !== "proposed_plan" &&
+          op.t !== "plan"
+        ) {
+          return;
+        }
+        applyOp(op);
+      };
+      if (ops.length > 1) {
+        batch(() => {
+          for (const op of ops) apply(op);
+        });
+      } else if (ops[0]) {
+        apply(ops[0]);
+      }
+    }),
 
-  await listen<{ threadId: string; cwd: string }>("thread:cwd-changed", (e) => {
-    const { threadId, cwd } = e.payload;
-    const cached = threadSnapshots.peek(threadId);
-    if (cached) rememberThreadSnapshot({ ...cached, cwd });
-    setState("threads", (thread) => thread.id === threadId, "cwd", cwd);
-    if (state.currentId === threadId) setState("cwd", cwd);
-  });
+    listen<{ threadId: string; cwd: string }>("thread:cwd-changed", (e) => {
+      const { threadId, cwd } = e.payload;
+      const cached = threadSnapshots.peek(threadId);
+      if (cached) rememberThreadSnapshot({ ...cached, cwd });
+      setState("threads", (thread) => thread.id === threadId, "cwd", cwd);
+      if (state.currentId === threadId) setState("cwd", cwd);
+    }),
 
-  await listen<TurnEvent>("acp:turn", (e) => {
-    const threadId = e.payload.threadId;
-    const wasRunning = !!state.running[threadId];
-    runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
-    optimisticRunningThreads.delete(threadId);
-    zenHoldThreads.delete(threadId);
-    setState("running", threadId, e.payload.running);
-    if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
-      staleThreadSnapshots.add(threadId);
-    }
-    if (e.payload.running) {
-      // 只在新一轮开始时丢弃上一轮残留；重复 running 事件不能覆盖本轮已收到的 usage。
-      if (!wasRunning) {
+    listen<TurnEvent>("acp:turn", (e) => {
+      const threadId = e.payload.threadId;
+      const wasRunning = !!state.running[threadId];
+      runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
+      optimisticRunningThreads.delete(threadId);
+      zenHoldThreads.delete(threadId);
+      setState("running", threadId, e.payload.running);
+      if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
+        staleThreadSnapshots.add(threadId);
+      }
+      if (e.payload.running) {
+        // 只在新一轮开始时丢弃上一轮残留；重复 running 事件不能覆盖本轮已收到的 usage。
+        if (!wasRunning) {
+          liveUsageByThread.delete(threadId);
+          clearDeltaRate(threadId);
+          if (threadId === state.currentId) setState("liveUsage", null);
+        }
+        // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
+        resumeFireRelay(e.payload.threadId);
+        handleWorkflowTurnStart(e.payload.threadId);
+      } else {
+        // 轮次收尾（正常或出错）且该会话未打开 → 标记未读，提醒回看结论或错误；
+        // 与后端 notify_done 的分类一致，只有用户主动取消不算未读。
+        const manuallyInterrupted =
+          e.payload.stopReason === "cancelled" || e.payload.stopReason === "force_cancelled";
+        if (!manuallyInterrupted && threadId !== state.currentId) {
+          setUnreadTurns(threadId, (state.unreadTurns[threadId] ?? 0) + 1);
+        }
+        // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
         liveUsageByThread.delete(threadId);
         clearDeltaRate(threadId);
         if (threadId === state.currentId) setState("liveUsage", null);
-      }
-      // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
-      resumeFireRelay(e.payload.threadId);
-      handleWorkflowTurnStart(e.payload.threadId);
-    } else {
-      // 轮次收尾（正常或出错）且该会话未打开 → 标记未读，提醒回看结论或错误；
-      // 与后端 notify_done 的分类一致，只有用户主动取消不算未读。
-      const manuallyInterrupted =
-        e.payload.stopReason === "cancelled" || e.payload.stopReason === "force_cancelled";
-      if (!manuallyInterrupted && threadId !== state.currentId) {
-        setUnreadTurns(threadId, (state.unreadTurns[threadId] ?? 0) + 1);
-      }
-      // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
-      liveUsageByThread.delete(threadId);
-      clearDeltaRate(threadId);
-      if (threadId === state.currentId) setState("liveUsage", null);
-      if (pendingSetupConfigRefresh.delete(threadId)) {
-        void api.refreshLyraConfig().catch((error) =>
-          console.error("Refresh Lyra config after /setup failed", error),
-        );
-      }
-      if (fireRelaySteps.has(e.payload.threadId)) {
-        const reason = e.payload.stopReason;
-        const manuallyInterrupted = reason === "cancelled" || reason === "force_cancelled";
-        const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
-        // 只有明确正常收尾才进入判断。网络、进程或模型错误均暂停在当前阶段，
-        // 用户补充提示或发送“继续”后，会从这一阶段恢复完整 Fire 流程。
-        const action = completedNormally
-          ? advanceFireRelay(e.payload.threadId)
-          : suspendFireRelay(e.payload.threadId, manuallyInterrupted);
-        void action.catch((error) => console.error("Fire relay failed", error));
-      }
-      // 通用工作流（/run）与 Fire 互斥：非 Fire 会话才会被其接管。
-      handleWorkflowTurnEnd(e.payload.threadId, e.payload.stopReason);
-      if (pendingHardDesign.has(threadId)) {
-        const reason = e.payload.stopReason;
-        const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
-        if (completedNormally) {
-          void finalizeHardDesign(threadId).catch((error) =>
-            console.error("Hard workflow design failed", error),
+        if (pendingSetupConfigRefresh.delete(threadId)) {
+          void api.refreshLyraConfig().catch((error) =>
+            console.error("Refresh Lyra config after /setup failed", error),
           );
         }
+        if (fireRelaySteps.has(e.payload.threadId)) {
+          const reason = e.payload.stopReason;
+          const manuallyInterrupted = reason === "cancelled" || reason === "force_cancelled";
+          const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
+          // 只有明确正常收尾才进入判断。网络、进程或模型错误均暂停在当前阶段，
+          // 用户补充提示或发送“继续”后，会从这一阶段恢复完整 Fire 流程。
+          const action = completedNormally
+            ? advanceFireRelay(e.payload.threadId)
+            : suspendFireRelay(e.payload.threadId, manuallyInterrupted);
+          void action.catch((error) => console.error("Fire relay failed", error));
+        }
+        // 通用工作流（/run）与 Fire 互斥：非 Fire 会话才会被其接管。
+        handleWorkflowTurnEnd(e.payload.threadId, e.payload.stopReason);
+        if (pendingHardDesign.has(threadId)) {
+          const reason = e.payload.stopReason;
+          const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
+          if (completedNormally) {
+            void finalizeHardDesign(threadId).catch((error) =>
+              console.error("Hard workflow design failed", error),
+            );
+          }
+        }
+        if (
+          e.payload.threadId === state.currentId &&
+          state.items.some((item) => item.id < 0)
+        ) {
+          // 后台 restore 被取消或自动重发失败：清掉尚未落库的乐观消息。
+          void openThread(e.payload.threadId);
+        }
       }
-      if (
-        e.payload.threadId === state.currentId &&
-        state.items.some((item) => item.id < 0)
-      ) {
-        // 后台 restore 被取消或自动重发失败：清掉尚未落库的乐观消息。
-        void openThread(e.payload.threadId);
-      }
-    }
-  });
+    }),
 
-  await listen<{ threadId: string; text: string }>("fire:start", (e) => {
-    void handleFireStart(e.payload.threadId, e.payload.text).catch((error) =>
-      console.error("Fire start failed", error),
-    );
-  });
-
-  await listen<{ threadId: string; text: string; images?: PromptImage[] }>(
-    "remote-prompt:dispatch",
-    (e) => {
-      void sendPromptTo(e.payload.threadId, e.payload.text, e.payload.images ?? []).catch((error) =>
-        console.error("Remote prompt dispatch failed", error),
+    listen<{ threadId: string; text: string }>("fire:start", (e) => {
+      void handleFireStart(e.payload.threadId, e.payload.text).catch((error) =>
+        console.error("Fire start failed", error),
       );
-    },
-  );
+    }),
 
-  await listen<PermissionRequest>("acp:permission", (e) => {
-    setState("permissions", state.permissions.length, e.payload);
-  });
+    listen<{ threadId: string; text: string; images?: PromptImage[] }>(
+      "remote-prompt:dispatch",
+      (e) => {
+        void sendPromptTo(e.payload.threadId, e.payload.text, e.payload.images ?? []).catch((error) =>
+          console.error("Remote prompt dispatch failed", error),
+        );
+      },
+    ),
 
-  await listen<{ requestKey: string }>("acp:permission-resolved", (e) => {
-    setState(
-      "permissions",
-      state.permissions.filter((p) => p.requestKey !== e.payload.requestKey),
-    );
-  });
+    listen<PermissionRequest>("acp:permission", (e) => {
+      setState("permissions", state.permissions.length, e.payload);
+    }),
 
-  await listen<Status>("acp:status", (e) => {
-    setState({ connected: e.payload.connected, agent: e.payload.agent });
-  });
+    listen<{ requestKey: string }>("acp:permission-resolved", (e) => {
+      setState(
+        "permissions",
+        state.permissions.filter((p) => p.requestKey !== e.payload.requestKey),
+      );
+    }),
 
-  await listen<CommandsEvent>("acp:commands", (e) => {
-    setState("slashCommands", e.payload.agentKind, normalizeSlashCommands(e.payload.commands));
-  });
+    listen<Status>("acp:status", (e) => {
+      setState({ connected: e.payload.connected, agent: e.payload.agent });
+    }),
 
-  // 后端可用性只用于设置页的 CLI 缺失提示；选择器是否展示完全由启用开关决定。
-  await listen<{ availability: Record<string, boolean> }>("backends:availability", (e) => {
-    setState("backendAvailability", reconcile(e.payload.availability ?? {}));
-  });
+    listen<CommandsEvent>("acp:commands", (e) => {
+      setState("slashCommands", e.payload.agentKind, normalizeSlashCommands(e.payload.commands));
+    }),
 
-  await listen<string>("acp:log", (e) => {
-    setState(
-      "logs",
-      produce((logs) => {
-        logs.push(e.payload);
-        if (logs.length > 500) logs.splice(0, logs.length - 500);
-      }),
-    );
-  });
+    // 后端可用性只用于设置页的 CLI 缺失提示；选择器是否展示完全由启用开关决定。
+    listen<{ availability: Record<string, boolean> }>("backends:availability", (e) => {
+      setState("backendAvailability", reconcile(e.payload.availability ?? {}));
+    }),
 
-  // 自动更新：检测 + 静默下载暂存改由后端 tokio 定时器负责（每 10 分钟，不只启动时），
-  // 避免 WebView 计时器在窗口最小化/隐藏时被节流，导致「只有启动才检测、角标不出现」。
-  // 前端只负责响应事件并展示角标。
-  await listen<UpdateProgress>("update:progress", (e) => {
-    setState("updateProgress", e.payload);
-  });
-  // 后端暂存就绪 → 显示左上角「可更新」角标，并填充更新弹窗信息
-  await listen<UpdateInfo>("update:available", (e) => {
-    setState("update", { ...e.payload, staged: true });
-    setState("updateStaging", false);
-  });
-  // 空闲（无会话/无任务）+ 新版本已下载好 → 后端主动请求弹窗，让用户选择是否现在更新
-  await listen<UpdateInfo>("update:prompt", (e) => {
-    setState("update", { ...e.payload, staged: true });
-    setState("updateStaging", false);
-    setState("updatePromptAt", Date.now());
-  });
+    listen<string>("acp:log", (e) => {
+      setState(
+        "logs",
+        produce((logs) => {
+          logs.push(e.payload);
+          if (logs.length > 500) logs.splice(0, logs.length - 500);
+        }),
+      );
+    }),
+
+    // 自动更新：检测 + 静默下载暂存改由后端 tokio 定时器负责（每 10 分钟，不只启动时），
+    // 避免 WebView 计时器在窗口最小化/隐藏时被节流，导致「只有启动才检测、角标不出现」。
+    // 前端只负责响应事件并展示角标。
+    listen<UpdateProgress>("update:progress", (e) => {
+      setState("updateProgress", e.payload);
+    }),
+    // 后端暂存就绪 → 显示左上角「可更新」角标，并填充更新弹窗信息
+    listen<UpdateInfo>("update:available", (e) => {
+      setState("update", { ...e.payload, staged: true });
+      setState("updateStaging", false);
+    }),
+    // 空闲（无会话/无任务）+ 新版本已下载好 → 后端主动请求弹窗，让用户选择是否现在更新
+    listen<UpdateInfo>("update:prompt", (e) => {
+      setState("update", { ...e.payload, staged: true });
+      setState("updateStaging", false);
+      setState("updatePromptAt", Date.now());
+    }),
+
+    listen<{ threadId: string }>("threads:title-generated", (e) => {
+      const id = e.payload.threadId;
+      setState("titleTyping", id, true);
+      window.setTimeout(() => {
+        setState("titleTyping", id, false);
+      }, 3000);
+    }),
+
+    listen("threads:changed", () => {
+      // 标题可能由首条消息生成：直接用列表 meta 同步，不再 getThread 全量拉当前会话
+      // （那会把整段历史 items 走一遍 IPC 序列化，长会话时每轮结束都白搬几 MB）
+      void refreshThreads().then(() => {
+        const id = state.currentId;
+        if (!id) return;
+        const meta = state.threads.find((t) => t.id === id);
+        if (meta && meta.title !== state.title) setState("title", meta.title);
+      });
+      // 项目列表由后端合并会话目录生成，会话增删后同步刷新
+      void refreshProjects();
+    }),
+
+    // worktree 删除等操作导致项目列表变化
+    listen("projects:changed", () => {
+      void refreshProjects();
+    }),
+
+    listen("clues:changed", () => {
+      void refreshClueGroups();
+    }),
+
+    listen<{ cardId: string }>("clues:mention-open", (e) => {
+      openClueCard(e.payload.cardId);
+    }),
+
+    listen<{ cardId: string }>("clues:mentioned", (e) => {
+      const cardId = e.payload.cardId;
+      if (!cardId || state.unreadClueMentions.includes(cardId)) return;
+      setUnreadClueMentions([...state.unreadClueMentions, cardId]);
+    }),
+
+    // 系统通知点击：跳转到对应会话
+    listen<{ threadId: string }>("acp:notify-open", (e) => {
+      void openThread(e.payload.threadId);
+    }),
+
+    // 漫游快照重同步（重连/轮次结束自愈）：用 reconcile 按 id 合并，保留未变条目的
+    // DOM 与滚动位置、思考/工具展开状态，避免整段重渲染导致的闪烁与跳动。
+    listen<{ threadId: string }>("acp:reload", (e) => {
+      const id = e.payload.threadId;
+      if (state.currentId !== id) return;
+      void api.getThread(id).then((t) => {
+        if (state.currentId !== id) return;
+        flushPendingStreamUpdates();
+        setState("items", reconcile(t.items, { key: "id" }));
+        setState({
+          plan: (t.plan as PlanEntry[] | null) ?? null,
+          title: t.title,
+        });
+      });
+    }),
+
+    // 团队/漫游中转站事件
+    listen<RelayStatus>("relay:status", (e) => {
+      setState("relay", e.payload);
+      if (e.payload.connected) {
+        void refreshInbox();
+        void refreshWorkflowInbox();
+        // 重连后强制校准：离线期间对端可能已调整共享模型，旧 peerModels 不能继续复用。
+        preloadPeerModels(true);
+      }
+    }),
+    listen<{ peers: Peer[] } | Peer[]>("relay:peers", (e) => {
+      setState("peers", normalizePeers(e.payload));
+      // 名单变化（有人上线/重连）即强制刷新，避免继续复用该成员断线前的旧模型列表。
+      preloadPeerModels(true);
+    }),
+    // 漫游：对端回传其可选模型/模式，按 token 缓存供选择器使用
+    listen<{
+      peer: string;
+      backends: AgentKind[];
+      options: PeerModels["options"];
+      sharedOptions: PeerModels["sharedOptions"];
+    }>(
+      "relay:peer-models",
+      (e) => {
+        const { peer, backends, options, sharedOptions } = e.payload;
+        if (!peer) return;
+        setState("peerModels", peer, {
+          backends: Array.isArray(backends) ? backends : [],
+          options: options ?? {},
+          sharedOptions: sharedOptions ?? {},
+        });
+      },
+    ),
+    // 漫游：对端回传某目录的本地分支列表，按「token+目录」缓存供 worktree 下拉使用
+    listen<{ peer: string; folder: string; current: string; branches: string[] }>(
+      "relay:peer-branches",
+      (e) => {
+        const { peer, folder, current, branches } = e.payload;
+        if (!peer) return;
+        setState("peerBranches", peerBranchKey(peer, folder), {
+          current: current ?? "",
+          branches: Array.isArray(branches) ? branches : [],
+        });
+      },
+    ),
+    listen<IncomingShare[]>("relay:inbox", (e) => {
+      // 漫游召回的快照到达时自动弹出收件箱，用户直接选项目接收
+      const known = new Set(state.inbox.map((s) => s.id));
+      const hasNewRecall = e.payload.some((s) => s.recall && !known.has(s.id));
+      setState("inbox", e.payload);
+      if (hasNewRecall) setState("inboxPromptAt", Date.now());
+    }),
+    // 队友分享的工作流到达：进入工作流收件箱，在「工作流」页接收
+    listen<IncomingWorkflowShare[]>("relay:workflow-inbox", (e) => {
+      setState("workflowInbox", e.payload);
+    }),
+    // 本地 worktree 后台创建就绪：切到 worktree 的 cwd 已由后端回写，这里补发暂存的首条提示词
+    listen<{ threadId: string }>("acp:worktree-ready", (e) => {
+      const id = e.payload.threadId;
+      void refreshThreads();
+      if (state.currentId === id) {
+        void api.getThread(id).then((t) => {
+          if (state.currentId === id) setState("cwd", t.cwd);
+        });
+      }
+      flushWorktreePrompt(id);
+    }),
+    // 本地 worktree 后台创建失败：丢弃暂存提示词（会话里已有错误系统消息）
+    listen<{ threadId: string; error?: string }>("acp:worktree-failed", (e) => {
+      pendingWorktreePrompts.delete(e.payload.threadId);
+      // 首页发起时占位到室女座的会话，worktree 没建起来就没后续轮次事件了，在这里收回。
+      zenUnhold(e.payload.threadId);
+      void refreshThreads();
+    }),
+    // host 侧：收到漫游请求，入队等本机用户在弹框里确认
+    listen<IncomingRoamRequest>("relay:roam-request", (e) => {
+      setState("incomingRoams", (prev) => [
+        ...prev.filter((r) => r.reqId !== e.payload.reqId),
+        e.payload,
+      ]);
+    }),
+    listen<QuotaRoamingProgress>("relay:quota-progress", (e) => {
+      setState("quotaRoamingProgress", e.payload);
+    }),
+  ]);
   // 启动即反映「已暂存好」的更新，让角标立刻出现（新版本的下载交给后端静默处理）
   void api
     .checkUpdate()
@@ -3414,152 +3619,6 @@ export async function initStore() {
     .catch(() => {
       // 网络不可用等场景静默失败，后端定时器会按周期重试
     });
-
-  await listen<{ threadId: string }>("threads:title-generated", (e) => {
-    const id = e.payload.threadId;
-    setState("titleTyping", id, true);
-    window.setTimeout(() => {
-      setState("titleTyping", id, false);
-    }, 3000);
-  });
-
-  await listen("threads:changed", () => {
-    // 标题可能由首条消息生成：直接用列表 meta 同步，不再 getThread 全量拉当前会话
-    // （那会把整段历史 items 走一遍 IPC 序列化，长会话时每轮结束都白搬几 MB）
-    void refreshThreads().then(() => {
-      const id = state.currentId;
-      if (!id) return;
-      const meta = state.threads.find((t) => t.id === id);
-      if (meta && meta.title !== state.title) setState("title", meta.title);
-    });
-    // 项目列表由后端合并会话目录生成，会话增删后同步刷新
-    void refreshProjects();
-  });
-
-  // worktree 删除等操作导致项目列表变化
-  await listen("projects:changed", () => {
-    void refreshProjects();
-  });
-
-  await listen("clues:changed", () => {
-    void refreshClueGroups();
-  });
-
-  await listen<{ cardId: string }>("clues:mention-open", (e) => {
-    openClueCard(e.payload.cardId);
-  });
-
-  await listen<{ cardId: string }>("clues:mentioned", (e) => {
-    const cardId = e.payload.cardId;
-    if (!cardId || state.unreadClueMentions.includes(cardId)) return;
-    setUnreadClueMentions([...state.unreadClueMentions, cardId]);
-  });
-
-  // 系统通知点击：跳转到对应会话
-  await listen<{ threadId: string }>("acp:notify-open", (e) => {
-    void openThread(e.payload.threadId);
-  });
-
-  // 漫游快照重同步（重连/轮次结束自愈）：用 reconcile 按 id 合并，保留未变条目的
-  // DOM 与滚动位置、思考/工具展开状态，避免整段重渲染导致的闪烁与跳动。
-  await listen<{ threadId: string }>("acp:reload", (e) => {
-    const id = e.payload.threadId;
-    if (state.currentId !== id) return;
-    void api.getThread(id).then((t) => {
-      if (state.currentId !== id) return;
-      flushPendingStreamUpdates();
-      setState("items", reconcile(t.items, { key: "id" }));
-      setState({
-        plan: (t.plan as PlanEntry[] | null) ?? null,
-        title: t.title,
-      });
-    });
-  });
-
-  // 团队/漫游中转站事件
-  await listen<RelayStatus>("relay:status", (e) => {
-    setState("relay", e.payload);
-    if (e.payload.connected) {
-      void refreshInbox();
-      void refreshWorkflowInbox();
-      // 重连后强制校准：离线期间对端可能已调整共享模型，旧 peerModels 不能继续复用。
-      preloadPeerModels(true);
-    }
-  });
-  await listen<{ peers: Peer[] } | Peer[]>("relay:peers", (e) => {
-    setState("peers", normalizePeers(e.payload));
-    // 名单变化（有人上线/重连）即强制刷新，避免继续复用该成员断线前的旧模型列表。
-    preloadPeerModels(true);
-  });
-  // 漫游：对端回传其可选模型/模式，按 token 缓存供选择器使用
-  await listen<{
-    peer: string;
-    backends: AgentKind[];
-    options: PeerModels["options"];
-    sharedOptions: PeerModels["sharedOptions"];
-  }>(
-    "relay:peer-models",
-    (e) => {
-      const { peer, backends, options, sharedOptions } = e.payload;
-      if (!peer) return;
-      setState("peerModels", peer, {
-        backends: Array.isArray(backends) ? backends : [],
-        options: options ?? {},
-        sharedOptions: sharedOptions ?? {},
-      });
-    },
-  );
-  // 漫游：对端回传某目录的本地分支列表，按「token+目录」缓存供 worktree 下拉使用
-  await listen<{ peer: string; folder: string; current: string; branches: string[] }>(
-    "relay:peer-branches",
-    (e) => {
-      const { peer, folder, current, branches } = e.payload;
-      if (!peer) return;
-      setState("peerBranches", peerBranchKey(peer, folder), {
-        current: current ?? "",
-        branches: Array.isArray(branches) ? branches : [],
-      });
-    },
-  );
-  await listen<IncomingShare[]>("relay:inbox", (e) => {
-    // 漫游召回的快照到达时自动弹出收件箱，用户直接选项目接收
-    const known = new Set(state.inbox.map((s) => s.id));
-    const hasNewRecall = e.payload.some((s) => s.recall && !known.has(s.id));
-    setState("inbox", e.payload);
-    if (hasNewRecall) setState("inboxPromptAt", Date.now());
-  });
-  // 队友分享的工作流到达：进入工作流收件箱，在「工作流」页接收
-  await listen<IncomingWorkflowShare[]>("relay:workflow-inbox", (e) => {
-    setState("workflowInbox", e.payload);
-  });
-  // 本地 worktree 后台创建就绪：切到 worktree 的 cwd 已由后端回写，这里补发暂存的首条提示词
-  await listen<{ threadId: string }>("acp:worktree-ready", (e) => {
-    const id = e.payload.threadId;
-    void refreshThreads();
-    if (state.currentId === id) {
-      void api.getThread(id).then((t) => {
-        if (state.currentId === id) setState("cwd", t.cwd);
-      });
-    }
-    flushWorktreePrompt(id);
-  });
-  // 本地 worktree 后台创建失败：丢弃暂存提示词（会话里已有错误系统消息）
-  await listen<{ threadId: string; error?: string }>("acp:worktree-failed", (e) => {
-    pendingWorktreePrompts.delete(e.payload.threadId);
-    // 首页发起时占位到室女座的会话，worktree 没建起来就没后续轮次事件了，在这里收回。
-    zenUnhold(e.payload.threadId);
-    void refreshThreads();
-  });
-  // host 侧：收到漫游请求，入队等本机用户在弹框里确认
-  await listen<IncomingRoamRequest>("relay:roam-request", (e) => {
-    setState("incomingRoams", (prev) => [
-      ...prev.filter((r) => r.reqId !== e.payload.reqId),
-      e.payload,
-    ]);
-  });
-  await listen<QuotaRoamingProgress>("relay:quota-progress", (e) => {
-    setState("quotaRoamingProgress", e.payload);
-  });
 
   // settingsReady 在 initStore 开头已经启动并会尽快 setState；这里 await 只是拿到值供后续
   // 主题迁移、团队刷新、模型预拉等初始化步骤继续使用。

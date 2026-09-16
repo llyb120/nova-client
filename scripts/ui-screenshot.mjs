@@ -50,17 +50,17 @@ const threadMeta = {
 
 const mockSettings = {
   devinPath: "", acpArgs: "", devinProxy: "", codebuddyPath: "", codebuddyProxy: "",
-  claudecodePath: "", claudecodeProxy: "", claudecodeSdkApiKey: "", cursorProxy: "",
-  cursorPath: "", cursorSdkApiKey: "", cursorDisableSubagents: false, opencodePath: "", opencodeProxy: "",
+  cursorProxy: "",
+  cursorPath: "", cursorSdkApiKey: "", cursorDisableSubagents: false,
     autoChangeProjectEnabled: true,
   codexPath: "", codexProxy: "", lyraProxy: "", windowsShellShimEnabled: false,
   defaultMode: "build", lightweightModelAgent: "lyra", lightweightModel: "",
   editor: "cursor", theme: "", historyDisplayMode: "project", chatViewRender: "canvas",
   relayServer: "", relayToken: "", relayGroups: "", remoteControlEnabled: false,
   quotaSharedModels: [], devinEnabled: true, codexEnabled: true,
-  codebuddyEnabled: false, claudecodeEnabled: false, cursorEnabled: false,
-  opencodeEnabled: false, codexIntegration: "app-server", codebuddyIntegration: "sdk",
-  claudecodeIntegration: "sdk", cursorIntegration: "sdk", opencodeIntegration: "sdk",
+  codebuddyEnabled: false, cursorEnabled: false,
+  codexIntegration: "app-server", codebuddyIntegration: "sdk",
+  cursorIntegration: "sdk",
   worktreeDir: "", sessionAutoCleanupEnabled: false, sessionAutoCleanupHours: 720,
   semanticEnabled: false, embedEndpoint: "", embedModel: "", embedApiKey: "",
 };

@@ -165,7 +165,7 @@ fn lyra_tool_call(value: &Value) -> ToolCall {
             status,
             content: text_content(output),
             locations: Vec::new(),
-            raw_input: arguments,
+            raw_input: arguments.or_else(|| Some(json!({ "command": command }))),
             raw_output: result,
         };
     }
@@ -309,6 +309,7 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(bash.kind, "execute");
+        assert_eq!(bash.raw_input.as_ref().unwrap()["command"], "ls");
         assert_eq!(bash.content[0]["content"]["text"], "a.rs");
     }
 }

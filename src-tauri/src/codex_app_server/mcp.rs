@@ -23,6 +23,17 @@ fn tool() -> Value {
         },"anyOf":[{"required":["keywords"]},{"required":["query"]},{"required":["task"]},{"required":["files"]}],"additionalProperties":false}})
 }
 
+fn available_tools() -> Vec<Value> {
+    let mut tools = Vec::new();
+    if std::env::var("NOVA_FAST_CONTEXT").as_deref() != Ok("0") { tools.push(tool()); }
+    if std::env::var("NOVA_TOOLS_READ_ONLY").as_deref() != Ok("1") {
+        tools.extend(crate::image_generation::tool_definitions());
+        tools.push(crate::native_browser::tool_definition());
+        tools.push(crate::chrome_browser::tool_definition());
+    }
+    tools
+}
+
 fn normalize(mut args: Value) -> Result<Value, String> {
     if !args.is_object() {
         return Err("Polaris arguments must be an object".into());
@@ -71,9 +82,10 @@ fn normalize(mut args: Value) -> Result<Value, String> {
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     config: &Config,
+    name: &str,
     args: Value,
 ) -> Result<Value, String> {
-    let message = json!({"token":config.token,"method":"polaris","root":config.root,"params":args});
+    let message = json!({"token":config.token,"method":name,"root":config.root,"params":args});
     stream
         .write_all(format!("{message}\n").as_bytes())
         .await
@@ -93,9 +105,9 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(value["result"].clone())
 }
 
-async fn call(config: Config, args: Value) -> Result<Value, String> {
-    let args = normalize(args)?;
-    tokio::time::timeout(Duration::from_secs(120), async {
+async fn call(config: Config, name: &str, args: Value) -> Result<Value, String> {
+    let args = if name == "polaris" { normalize(args)? } else { args };
+    tokio::time::timeout(Duration::from_secs(if name == "polaris" { 120 } else { 610 }), async {
         let until = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             #[cfg(windows)]
@@ -104,7 +116,7 @@ async fn call(config: Config, args: Value) -> Result<Value, String> {
             #[cfg(unix)]
             let stream = tokio::net::UnixStream::connect(&config.endpoint).await;
             match stream {
-                Ok(stream) => return exchange(stream, &config, args).await,
+                Ok(stream) => return exchange(stream, &config, name, args).await,
                 Err(error) if tokio::time::Instant::now() >= until => {
                     return Err(format!("连接 Rust 上下文服务失败：{error}"))
                 }
@@ -113,7 +125,7 @@ async fn call(config: Config, args: Value) -> Result<Value, String> {
         }
     })
     .await
-    .map_err(|_| "Polaris request timed out".to_string())?
+    .map_err(|_| format!("{name} request timed out; do not automatically repeat image requests"))?
 }
 
 fn response(id: Value, result: Value) -> Value {
@@ -121,6 +133,30 @@ fn response(id: Value, result: Value) -> Value {
 }
 fn error(id: Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+}
+
+async fn tool_result(name: &str, result: Result<Value, String>) -> Value {
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => return json!({"isError":true,"content":[{"type":"text","text":error}]}),
+    };
+    let text = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
+    let mut content = vec![json!({"type":"text","text":text})];
+    if matches!(name, "webview" | "chrome") {
+        use base64::Engine;
+        if let Some(images) = value["images"].as_array() {
+            // Paths originate from the authenticated native service, not the caller or page text.
+            for image in images.iter().take(4) {
+                if let Some(path) = image["path"].as_str() {
+                    match tokio::fs::read(path).await {
+                        Ok(data) => content.push(json!({"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(data)})),
+                        Err(_) => content.push(json!({"type":"text","text":format!("图片加载失败，可读取截图文件：{path}")})),
+                    }
+                }
+            }
+        }
+    }
+    json!({"content":content})
 }
 
 pub(super) async fn serve<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -148,15 +184,15 @@ pub(super) async fn serve<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         Some(response(id, json!({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"nova-tools","version":env!("CARGO_PKG_VERSION")}})))
                     }
                     "ping" => Some(response(id, json!({}))),
-                    "tools/list" => Some(response(id, json!({"tools":[tool()]}))),
+                    "tools/list" => Some(response(id, json!({"tools":available_tools()}))),
                     "tools/call" => {
                         if tasks.len() >= 16 { Some(error(id, -32000, "Too many concurrent tool calls")) }
                         else {
                             let config = config.clone(); let params = message["params"].clone();
                             tasks.spawn(async move {
-                                let result = if params["name"] == "polaris" { call(config, params.get("arguments").cloned().unwrap_or_else(|| json!({}))).await } else { Err("Unknown tool".into()) };
-                                let (text, failed) = match result { Ok(value) => (value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()), false), Err(error) => (error, true) };
-                                response(id, json!({"isError":failed,"content":[{"type":"text","text":text}]}))
+                                let name = params["name"].as_str().unwrap_or_default();
+                                let result = if available_tools().iter().any(|tool| tool["name"] == name) { call(config, name, params.get("arguments").cloned().unwrap_or_else(|| json!({}))).await } else { Err("Unknown tool".into()) };
+                                response(id, tool_result(name, result).await)
                             });
                             None
                         }
@@ -207,6 +243,35 @@ pub(crate) fn maybe_run() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn webview_screenshot_is_an_image_block_and_keeps_action_status() {
+        let path = std::env::temp_dir().join(format!("nova-mcp-{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"image-bytes").unwrap();
+        let result = tool_result("webview", Ok(json!({"status":"executed","images":[{"path":path}]}))).await;
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"][1]["data"], "aW1hZ2UtYnl0ZXM=");
+        assert_eq!(serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap()["status"], "executed");
+        assert_eq!(tool_result("webview", Err("stopped".into())).await["isError"], true);
+    }
+    #[tokio::test]
+    async fn native_mcp_forwards_image_arguments_and_result() {
+        let (client, server) = tokio::io::duplex(8192);
+        let config = Config { endpoint: "unused".into(), token: "test".into(), root: "workspace".into() };
+        let args = json!({ "prompt": "blue background", "referenceImages": ["original.png"] });
+        let expected_args = args.clone();
+        let worker = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let mut line = String::new();
+            server.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "edit_image");
+            assert_eq!(request["params"], expected_args);
+            server.get_mut().write_all(b"{\"ok\":true,\"result\":{\"path\":\"result.png\"}}\n").await.unwrap();
+        });
+        assert_eq!(exchange(client, &config, "edit_image", args).await.unwrap()["path"], "result.png");
+        worker.await.unwrap();
+    }
     #[tokio::test]
     async fn native_mcp_negotiates_lists_tools_and_reports_errors() {
         let (client, server) = tokio::io::duplex(65536);

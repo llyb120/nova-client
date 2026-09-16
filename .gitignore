@@ -67,6 +67,10 @@ release/
 # 界面走查截图等临时产物
 tmp/
 
+# generate-image 运行时产物
+.nova-image-request.json
+nova-image-*.png
+
 .libnode/
 
 # bench scratch

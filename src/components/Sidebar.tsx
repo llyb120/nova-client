@@ -187,7 +187,9 @@ export function Sidebar(props: {
     // 锚点必须一路取到最高祖先（chainGroupAnchor），只看直接父级会让多级
     // stage 链里 cwd 被中途切换的孙子会话裂到另一组、被当作链根单独显示。
     for (const t of threads) {
-      const key = rawKey(chainGroupAnchor(threads, t));
+      const key = rawKey(chainGroupAnchor(threads, t))
+        .replace(/^\\\\\?\\UNC\\/i, "\\\\")
+        .replace(/^\\\\\?\\/, "");
       const list = map.get(key) ?? [];
       if (list.length === 0) map.set(key, list);
       list.push(t);
@@ -454,15 +456,13 @@ export function Sidebar(props: {
         onPointerDown={() => markThreadSwitchPointerDown()}
         onClick={() =>
           void openHistoryThread(
-            // 工作流链：直接用运行时记录的链尖，接力空档/等待补充时也不会落到旧阶段。
-            liveWorkflowStage(t.id) ??
             latestFireStage(
               state.threads,
-              activeThread(),
-              // 与本行转圈口径一致：阶段接力空档里没有任何会话 running，
-              // 但整条链仍在推进（busy），点击同样要直达链上最新的阶段。
-              (id) => !!state.running[id] || chainInfo().busy.has(id),
+              t,
+              (id) => !!state.running[id],
               (id) => state.unreadTurns[id] ?? 0,
+              "running",
+              liveWorkflowStage(t.id),
             )?.id ?? activeThread().id,
           )
         }

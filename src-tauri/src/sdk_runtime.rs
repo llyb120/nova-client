@@ -349,7 +349,7 @@ impl SdkManager {
                         return;
                     }
                 };
-                let resolved = codex_radar::resolve_auto_model(&selection, &options, false).await;
+                let resolved = codex_radar::resolve_auto_model(&selection, &options).await;
                 if !self.is_current_run(&thread_id, run_epoch) {
                     return;
                 }
@@ -1531,17 +1531,18 @@ impl SdkManager {
             crate::windows_shell_shim::apply(&self.app, &mut command, &self.launch_env)
                 .map_err(|e| format!("应用 Windows shell shim 失败：{e}"))?;
         }
-        let polaris = if !title && settings.context_tools_enabled() {
+        let polaris = if !title {
             if state.context_service.endpoint().is_empty()
                 || state.context_service.token().is_empty()
             {
-                return Err("Polaris 已开启，但 Rust 上下文服务不可用".into());
+                return Err("Nova 工具服务不可用".into());
             }
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
             Some(
-                json!({"command":exe,"args":["__codex-mcp"],"required":true,"enabled":true,"env":{
+                json!({"command":exe,"args":["__codex-mcp"],"tool_timeout_sec":610,"required":true,"enabled":true,"env":{
                     "NOVA_CONTEXT_SERVICE_ENDPOINT":state.context_service.endpoint(),
-                    "NOVA_CONTEXT_SERVICE_TOKEN":state.context_service.token()
+                    "NOVA_CONTEXT_SERVICE_TOKEN":state.context_service.token(),
+                    "NOVA_FAST_CONTEXT":if settings.context_tools_enabled() { "1" } else { "0" }
                 }}),
             )
         } else {
@@ -2034,7 +2035,7 @@ fn parse_bridge_output(output: &str, label: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("{label} bridge 响应缺少 data"))
 }
 
-fn display_working_directory(path: &std::path::Path) -> String {
+pub(crate) fn display_working_directory(path: &std::path::Path) -> String {
     let value = path.to_string_lossy();
     if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -2209,9 +2210,7 @@ mod tests {
         is_codex_model_resume_warning, normalize_title, parse_bridge_output, resolve_codex_model,
         text_snapshot_change, tool_call, TextSnapshotChange, TOOL_OUTPUT_LIMIT,
     };
-    use crate::sdk_adapters::{
-        ClaudeAdapter, CodexAdapter, CursorAdapter, LyraAdapter, SdkAdapter,
-    };
+    use crate::sdk_adapters::{CodexAdapter, CursorAdapter, LyraAdapter, SdkAdapter};
     use crate::threads::{now_ms, AgentKind, CodexUsageSnapshot, Item, Thread, ToolCall};
     use serde_json::json;
 
@@ -2383,31 +2382,6 @@ mod tests {
                 "cacheWriteTokens": 40
             }))
         );
-    }
-
-    #[test]
-    fn claude_style_usage_includes_cached_input_and_rejects_partial_data() {
-        let raw = json!({
-            "input_tokens": 100,
-            "output_tokens": 20,
-            "cache_read_input_tokens": 300,
-            "cache_creation_input_tokens": 40
-        });
-        let (usage, _) = ClaudeAdapter.normalize_usage(Some(&raw), None, None);
-        assert_eq!(
-            usage,
-            Some(json!({
-                "inputTokens": 440,
-                "outputTokens": 20,
-                "totalTokens": 460,
-                "cacheReadTokens": 300,
-                "cacheWriteTokens": 40
-            }))
-        );
-
-        let partial = json!({ "input_tokens": 100 });
-        let (usage, _) = ClaudeAdapter.normalize_usage(Some(&partial), None, None);
-        assert!(usage.is_none());
     }
 
     #[test]

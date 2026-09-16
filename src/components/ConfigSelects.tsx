@@ -38,7 +38,7 @@ const PROVIDER_LABEL: Record<string, string> = {
 /** 厂商分组：优先用后端 provider 字段，缺失时按命名启发式归类 */
 function groupOf(value: string, name: string, cost?: ModelCost): string {
   // Codex Radar Auto ultimately selects a GPT model, so keep it alongside the
-  // GPT choices for both Codex and OpenCode instead of creating a separate group.
+  // GPT choices instead of creating a separate group.
   if (value.startsWith("__nova_auto_")) return "GPT";
   const byProvider = cost?.provider && PROVIDER_LABEL[cost.provider];
   if (byProvider) return byProvider;
@@ -51,6 +51,9 @@ function groupOf(value: string, name: string, cost?: ModelCost): string {
   if (v.includes("swe") || v.includes("adaptive") || v.includes("windsurf")) return "Windsurf";
   if (v.includes("kimi")) return "Kimi";
   if (v.includes("glm")) return "GLM";
+  if (v.includes("qwen") || v.includes("tongyi")) return "Qwen";
+  // Meta Muse Spark 系列（含 meta/ 前缀的中转模型名），避免落进「其他」分组
+  if (v.includes("muse") || v.includes("meta/")) return "Meta";
   if (v.includes("deepseek")) return "DeepSeek";
   if (v.includes("grok")) return "Grok";
   if (v.includes("minimax")) return "MiniMax";
@@ -184,7 +187,7 @@ export function groupedModelOptions(
 /** 单独的「模型（含后端）」下拉——与新会话完全一致的选择器。
  *  - 单后端：二级（厂商 → 模型）。
  *  - 多后端（已启用 >1）：三级菜单（后端 → 厂商 → 模型），选中即同时提交后端与模型。
- *  Codex 思考强度与 OpenCode variants 已并入模型选项。工作模型与巡查/心跳模型共用此组件。 */
+ *  Codex 思考强度已并入模型选项。工作模型与巡查/心跳模型共用此组件。 */
 export function ModelPicker(props: {
   agentKind: AgentKind;
   agentKinds?: AgentKind[];

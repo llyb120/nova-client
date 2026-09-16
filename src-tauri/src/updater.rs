@@ -671,9 +671,9 @@ pub fn take_restore_thread(app: &AppHandle) -> Option<String> {
 }
 
 /// 取主窗口（label 固定为 "main"；兜底取任意一个窗口，避免 label 变化导致取不到）。
-fn main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
-    app.get_webview_window("main")
-        .or_else(|| app.webview_windows().into_values().next())
+fn main_window(app: &AppHandle) -> Option<tauri::Window> {
+    app.get_window("main")
+        .or_else(|| app.windows().into_values().next())
 }
 
 /// 读取窗口恢复状态并从标记里摘除（保留 thread_id 供前端后续恢复会话）。
@@ -693,7 +693,7 @@ fn take_restore_window(app: &AppHandle) -> Option<WindowState> {
     ws
 }
 
-fn apply_window_state(win: &tauri::WebviewWindow, ws: &WindowState) {
+fn apply_window_state(win: &tauri::Window, ws: &WindowState) {
     // 先还原几何：最大化优先，否则按保存的全局坐标+大小（全局坐标天然支持多屏）
     if ws.maximized {
         let _ = win.maximize();
@@ -728,12 +728,167 @@ pub fn restore_window_on_launch(app: &AppHandle) {
     let Some(win) = main_window(app) else {
         return;
     };
+    let remember = std::fs::read_to_string(crate::nova_data_dir(app).join("window-layout-enabled")).ok().as_deref() != Some("false");
+    REMEMBER_WINDOW_LAYOUT.store(remember, std::sync::atomic::Ordering::SeqCst);
     match take_restore_window(app) {
         Some(ws) => apply_window_state(&win, &ws),
         None => {
+            #[cfg(windows)]
+            if restore_window_layout(&win) {
+                WINDOW_LAYOUT_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
             let _ = win.show();
             let _ = win.set_focus();
         }
+    }
+    #[cfg(windows)]
+    WINDOW_LAYOUT_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(windows)]
+static WINDOW_LAYOUT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static WINDOW_LAYOUT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REMEMBER_WINDOW_LAYOUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+// Windows 的 normalPosition 在最大化/最小化期间仍保留还原后的尺寸，避免保存成整屏大小。
+#[cfg(windows)]
+#[derive(Serialize, Deserialize)]
+struct SavedWindowPlacement {
+    flags: u32,
+    show_cmd: u32,
+    normal_position: [i32; 4],
+}
+
+#[cfg(windows)]
+impl SavedWindowPlacement {
+    fn native(&self) -> Option<windows_sys::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT;
+        let [left, top, right, bottom] = self.normal_position;
+        if right <= left || bottom <= top || !matches!(self.show_cmd, 1 | 2 | 3) { return None; }
+        let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+        placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        placement.flags = self.flags;
+        placement.showCmd = self.show_cmd;
+        placement.rcNormalPosition = windows_sys::Win32::Foundation::RECT { left, top, right, bottom };
+        Some(placement)
+    }
+}
+
+#[cfg(windows)]
+fn restore_window_layout(win: &tauri::Window) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPlacement;
+    let path = crate::nova_data_dir(win.app_handle()).join("window-layout.json");
+    if !REMEMBER_WINDOW_LAYOUT.load(std::sync::atomic::Ordering::SeqCst) { return false; }
+    let saved = std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<SavedWindowPlacement>(&bytes).ok());
+    let Some(saved) = saved else { return false; };
+    let Some(placement) = saved.native() else { return false; };
+    let Ok(hwnd) = win.hwnd() else { return false; };
+    // SetWindowPlacement 负责最大化还原尺寸、工作区坐标及屏幕变化后的可见位置。
+    if unsafe { SetWindowPlacement(hwnd.0 as _, &placement) } == 0 { return false; }
+    if saved.show_cmd != 2 { let _ = win.set_focus(); }
+    true
+}
+
+#[cfg(windows)]
+fn save_window_layout(app: &AppHandle) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, WINDOWPLACEMENT};
+    let Some(win) = main_window(app) else { return; };
+    let Ok(hwnd) = win.hwnd() else { return; };
+    let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    if unsafe { GetWindowPlacement(hwnd.0 as _, &mut placement) } == 0 { return; }
+    let rect = placement.rcNormalPosition;
+    let saved = SavedWindowPlacement { flags: placement.flags, show_cmd: placement.showCmd, normal_position: [rect.left, rect.top, rect.right, rect.bottom] };
+    let Ok(bytes) = serde_json::to_vec(&saved) else { return; };
+    let dir = crate::nova_data_dir(app);
+    let _ = std::fs::create_dir_all(&dir);
+    let temp = dir.join("window-layout.json.tmp");
+    if std::fs::write(&temp, bytes).is_ok() { let _ = std::fs::rename(temp, dir.join("window-layout.json")); }
+}
+
+#[cfg(windows)]
+pub fn remember_window_layout(app: &AppHandle, flush: bool) {
+    use std::sync::atomic::Ordering;
+    if !WINDOW_LAYOUT_READY.load(Ordering::SeqCst) || !REMEMBER_WINDOW_LAYOUT.load(Ordering::SeqCst) { return; }
+    let revision = WINDOW_LAYOUT_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
+    if flush { save_window_layout(app); return; }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let capture = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if WINDOW_LAYOUT_REVISION.load(Ordering::SeqCst) == revision && REMEMBER_WINDOW_LAYOUT.load(Ordering::SeqCst) { save_window_layout(&capture); }
+        });
+    });
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowLayoutSettings {
+    width: f64,
+    height: f64,
+    maximized: bool,
+    remember: bool,
+}
+
+#[tauri::command]
+pub fn get_window_layout(app: AppHandle) -> Result<WindowLayoutSettings, String> {
+    let win = main_window(&app).ok_or("主窗口不可用")?;
+    let scale = win.scale_factor().map_err(|e| e.to_string())?;
+    let size = win.inner_size().map_err(|e| e.to_string())?.to_logical::<f64>(scale);
+    Ok(WindowLayoutSettings { width: size.width.round(), height: size.height.round(), maximized: win.is_maximized().unwrap_or(false), remember: REMEMBER_WINDOW_LAYOUT.load(std::sync::atomic::Ordering::SeqCst) })
+}
+
+#[tauri::command]
+pub fn set_window_layout(app: AppHandle, width: Option<f64>, height: Option<f64>, maximized: Option<bool>, remember: Option<bool>, reset: Option<bool>) -> Result<(), String> {
+    if width.is_some_and(|v| !v.is_finite() || !(960.0..=16384.0).contains(&v)) || height.is_some_and(|v| !v.is_finite() || !(600.0..=16384.0).contains(&v)) {
+        return Err("窗口宽度至少 960，高度至少 600，且不能超过 16384".into());
+    }
+    let win = main_window(&app).ok_or("主窗口不可用")?;
+    let reset = reset.unwrap_or(false);
+    if reset || width.is_some() || height.is_some() || maximized == Some(false) {
+        win.unminimize().map_err(|e| e.to_string())?;
+        win.unmaximize().map_err(|e| e.to_string())?;
+    }
+    if reset || width.is_some() || height.is_some() {
+        let defaults = &app.config().app.windows[0];
+        let current = get_window_layout(app.clone())?;
+        win.set_size(Size::Logical(tauri::LogicalSize { width: if reset { defaults.width } else { width.unwrap_or(current.width) }, height: if reset { defaults.height } else { height.unwrap_or(current.height) } })).map_err(|e| e.to_string())?;
+    }
+    if reset { win.center().map_err(|e| e.to_string())?; }
+    else if maximized == Some(true) { win.maximize().map_err(|e| e.to_string())?; }
+    if let Some(remember) = if reset { Some(true) } else { remember } {
+        let dir = crate::nova_data_dir(&app);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("window-layout-enabled"), remember.to_string()).map_err(|e| e.to_string())?;
+        REMEMBER_WINDOW_LAYOUT.store(remember, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(windows)]
+    remember_window_layout(&app, false);
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod window_layout_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_placement_keeps_restore_bounds_and_window_mode() {
+        for show_cmd in [1, 2, 3] {
+            let saved = SavedWindowPlacement { flags: 2, show_cmd, normal_position: [-1600, 80, -320, 900] };
+            let bytes = serde_json::to_vec(&saved).unwrap();
+            let restored: SavedWindowPlacement = serde_json::from_slice(&bytes).unwrap();
+            let native = restored.native().unwrap();
+            assert_eq!(native.showCmd, show_cmd);
+            assert_eq!(native.flags, 2);
+            assert_eq!(native.rcNormalPosition.left, -1600);
+            assert_eq!(native.rcNormalPosition.right - native.rcNormalPosition.left, 1280);
+            assert_eq!(native.rcNormalPosition.bottom - native.rcNormalPosition.top, 820);
+        }
+        assert!(SavedWindowPlacement { flags: 0, show_cmd: 0, normal_position: [0, 0, 1280, 820] }.native().is_none());
+        assert!(SavedWindowPlacement { flags: 0, show_cmd: 1, normal_position: [0, 0, 0, 820] }.native().is_none());
     }
 }
 

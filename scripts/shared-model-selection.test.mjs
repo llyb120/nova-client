@@ -23,7 +23,7 @@ assert.equal(units.length, names.size);
 const code = ts.transpileModule(units.join("\n").replace(/export function/g, "function"), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
-const kinds = ["lyra", "devin", "codex", "codebuddy", "claudecode", "cursor", "opencode"];
+const kinds = ["lyra", "devin", "codex", "codebuddy", "cursor"];
 const select = new Function("props", "sharedOnly", "ALL_AGENT_KINDS", `
   const createMemo = f => f;
   const state = {};

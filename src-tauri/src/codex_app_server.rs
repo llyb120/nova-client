@@ -31,11 +31,11 @@ pub(super) fn rtk_guidance() -> String {
     };
     let powershell = format!("& '{}' __rtk", path.replace('\'', "''"));
     let bash = format!("'{}' __rtk", path.replace('\'', "'\\''"));
-    // ponytail: instruction-based like upstream RTK's Codex integration; enforcing every
-    // command requires a Codex pre-execution rewrite hook when that API is available.
+    // ponytail: instruction-based for Codex and ACP agents; enforcing every command
+    // requires a backend pre-execution rewrite hook when that API is available.
     format!(
         "Nova includes RTK for compact shell output; no separate rtk installation is needed. \
-         Invoke it through Codex's native shell tool using the prefix for that shell:\n\
+         Invoke it through your native shell tool using the prefix for that shell:\n\
          PowerShell: {powershell}\nBash/sh: {bash}\n\
          For supported commands whose output you are reading, use this prefix, e.g. \
          `<prefix> git status`, `<prefix> git diff`, `<prefix> git log -5`, `<prefix> cargo test`. \
@@ -56,7 +56,7 @@ fn thread_options(request: &Value, options: &Options) -> Value {
     if let Some(mcp) = mcp.as_mut() {
         mcp["env"]["NOVA_TOOLS_CWD"] = request["cwd"].clone();
         mcp["env"]["NOVA_TOOLS_READ_ONLY"] = json!(if read_only { "1" } else { "0" });
-        guidance.push(POLARIS_GUIDANCE);
+        if mcp["env"]["NOVA_FAST_CONTEXT"] != "0" { guidance.push(POLARIS_GUIDANCE); }
     }
     if !title {
         if !rtk.is_empty() {

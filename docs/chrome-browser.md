@@ -1,0 +1,34 @@
+# Nova Chrome 独立扩展
+
+扩展独立安装和发布，右侧浏览器始终是 WebView。Agent 使用 webview 操作内置页面，使用 chrome 操作 Chrome，两者可同时使用。
+
+## 安装
+
+1. 解压发布 ZIP。
+2. 打开 chrome://extensions，开启开发者模式，点击「加载已解压的扩展程序」，选择含 manifest.json 的目录。
+3. 启动支持 chrome 工具的 Nova，扩展自动连接，无需地址、配置文件或密钥。
+4. 点击 Nova Chrome 扩展图标，只显示当前激活页的 tag，点击「复制 tag」后发给 Agent。所有标签默认允许操作，无需逐页授权。
+
+发布 ZIP 不含用户凭据和本机配置。商店发布需保持 manifest key 对应的扩展身份；改变扩展 ID 时需同步 Nova 接收端允许的 ID。
+
+## 操作
+
+标签 tag 在导航、切换激活页、后台重启时保持稳定，关闭标签或重启 Chrome 后失效。操作必须明确指定 tabTag。
+
+支持整页 DOM、iframe、滚动区域、整页分片截图、点击、填写、键盘、滚动、拖动、等待、多标签和导航。act 返回最新观察供验证并继续。无辅助模型，不使用 Playwright。切换 Nova 会话保留 Chrome 页面。
+
+需要停止操作时使用 chrome 的 stop 操作。断线、超时不自动重放操作，应先观察确认结果。
+
+## 自动连接
+
+Nova 启动时监听 127.0.0.1:47653。扩展自动握手，接收端验证固定扩展 Origin，再使用本机令牌传输命令。断线每 30 秒尝试重连，打开扩展弹窗也会尝试重连。
+
+同一时间只连接一个 Nova 实例。同时启动开发版和正式版时，端口由先启动的实例使用；WebView 不依赖此端口。
+
+## 验证
+
+运行 node --test extensions/nova-chrome/worker.test.mjs scripts/nova-tools-mcp.test.mjs。
+Rust 检查使用 cargo test 的 chrome_browser::tests。
+集成脚本 node scripts/native-browser-smoke.mjs 使用独立 Nova/WebView2 与模拟扩展，验证握手和共享操作引擎。真实 Chrome 端到端验证需加载扩展后进行。
+
+0.1.2 修复 Chrome 扩展 auto-attach-only 模式下直接发现/附加 Target 返回 Not allowed 的问题，改用 Target.setAutoAttach 和子会话事件，支持嵌套 iframe。Chrome 自身限制的内部页面仍受浏览器限制。

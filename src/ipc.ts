@@ -44,6 +44,22 @@ function fileUriPath(uri: string) {
 }
 
 export const api = {
+  workspaceGitStatus: (threadId: string) =>
+    invoke<{ repo: string; files: { path: string; oldPath: string | null; index: string; worktree: string }[] }>("workspace_git_status", { threadId }),
+  workspaceGitDiff: (threadId: string, path: string, staged: boolean) =>
+    invoke<string>("workspace_git_diff", { threadId, path, staged }),
+  /** 图片变动的新旧两份内容（base64 data URI），用于直接看图对比。 */
+  workspaceGitImage: (threadId: string, path: string, staged: boolean) =>
+    invoke<{ before: string | null; after: string | null }>("workspace_git_image", { threadId, path, staged }),
+  listWorkspaceDirectory: (threadId: string, path: string) =>
+    invoke<{ entries: { name: string; path: string; directory: boolean }[]; truncated: boolean }>("list_workspace_directory", { threadId, path }),
+  searchWorkspaceFiles: (threadId: string, query: string) =>
+    invoke<{ entries: { name: string; path: string; directory: boolean }[]; truncated: boolean }>("search_workspace_files", { threadId, query }),
+  previewWorkspaceFile: (threadId: string, path: string) =>
+    invoke<{ path: string; kind: string; text: string | null; size: number; data: string | null; sheet?: string }>("preview_workspace_file", { threadId, path }),
+  saveWorkspaceFile: (threadId: string, path: string, original: string, text: string) =>
+    invoke<void>("save_workspace_file", { threadId, path, original, text }),
+  imageCommandContext: (configured: boolean, images: PromptImage[] = []) => invoke<{ configPath: string; models: string[]; referenceImages: string[] }>("image_command_context", { configured, images }),
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
   loadThreads: () => invoke<[ThreadMeta[], Thread[]]>("load_threads"),
   getThread: (threadId: string) => invoke<Thread>("get_thread", { threadId }),
@@ -247,6 +263,8 @@ export const api = {
   respondPermission: (requestKey: string, optionId: string) =>
     invoke<void>("respond_permission", { requestKey, optionId }),
   getSettings: () => invoke<Settings>("get_settings"),
+  getWindowLayout: () => invoke<{width: number; height: number; maximized: boolean; remember: boolean}>("get_window_layout"),
+  setWindowLayout: (layout: {width?: number; height?: number; maximized?: boolean; remember?: boolean; reset?: boolean}) => invoke<void>("set_window_layout", layout),
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
   refreshEnvironmentVariables: () => invoke<number>("refresh_environment_variables"),
   getGlobalAgentInstructions: () =>
@@ -368,6 +386,12 @@ export const api = {
     invoke<void>("recall_roaming_thread", { threadId }),
   requestPeerModels: (peerToken: string) =>
     invoke<void>("request_peer_models", { peerToken }),
+  replyRoamingWorkflows: (peer: string, workflows: { id: string; name: string; stageCount: number }[]) =>
+    invoke<void>("reply_roaming_workflows", { peer, workflows }),
+  checkRoamingWorkflow: (threadId: string) =>
+    invoke<void>("check_roaming_workflow", { threadId }),
+  failRoamingWorkflow: (threadId: string, error: string) =>
+    invoke<void>("fail_roaming_workflow", { threadId, error }),
 
   // worktree（独立工作目录执行）
   isGitRepo: (path: string) => invoke<boolean>("is_git_repo", { path }),

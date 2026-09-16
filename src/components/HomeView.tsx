@@ -47,10 +47,13 @@ import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFil
 import type { AgentKind, Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
 import { enabledWorkflows } from "../workflow/storage";
+import { peerWorkflows } from "../workflow/roaming";
+import { roamingWorkflowPrompt } from "../workflow/roamingProtocol";
 import type { WorkflowDef } from "../workflow/types";
 import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
 import { IconClue, IconFile, IconFolder, IconLogo, IconMerge, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
+import { HaibaraBubble } from "./HaibaraBubble";
 import { createNoteFlow } from "./NoteFlow";
 import { ProjectPicker } from "./ProjectPicker";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
@@ -79,26 +82,31 @@ export function HomeView() {
   const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(agentKind()));
   const [mode, setMode] = createSignal("build");
   const [busy, setBusy] = createSignal(false);
-  // 工作流：新会话页选定后，发送时以输入内容为 goal、本会话为根启动流程（等效 /run）。
-  // 只对本地普通会话生效，与漫游/额度互斥。
+  const [roam, setRoam] = createSignal<{ peer: Peer; folder: string } | null>(null);
+  const [quotaPeer, setQuotaPeer] = createSignal<Peer | null>(null);
+  // 漫游选择对端工作流，只发送标识和目标，由对端读取定义并执行。
   const [workflowMenuOpen, setWorkflowMenuOpen] = createSignal(false);
   const [selectedWorkflowId, setSelectedWorkflowId] = createSignal<string | null>(null);
   const selectedWorkflow = createMemo<WorkflowDef | null>(() => {
     const id = selectedWorkflowId();
-    if (!id) return null;
+    if (!id || roam()) return null;
     // 已停用的工作流不展示也不可选：一旦在别处被停用，这里的选中自动失效。
     return enabledWorkflows().find((workflow) => workflow.id === id) ?? null;
   });
   // 每次打开菜单都重新读取 localStorage，保证工作流编辑器改动后列表最新；只列启用的。
-  const workflowChoices = createMemo<WorkflowDef[]>(() => {
+  const workflowChoices = createMemo(() => {
     workflowMenuOpen();
-    return enabledWorkflows();
+    const target = roam();
+    if (target) return (peerWorkflows()[target.peer.token] ?? []).map((workflow) => ({
+      ...workflow, sharedBy: target.peer.name, builtin: false,
+    }));
+    return enabledWorkflows().map((workflow) => ({ ...workflow, stageCount: workflow.stages.length }));
   });
+  const selectedPeerWorkflow = () => roam()
+    ? peerWorkflows()[roam()!.peer.token]?.find((workflow) => workflow.id === selectedWorkflowId())
+    : undefined;
+  const selectedWorkflowName = () => selectedPeerWorkflow()?.name ?? selectedWorkflow()?.name;
   const [quotaCancelling, setQuotaCancelling] = createSignal(false);
-  // 漫游目标：选中队友目录后在对方机器上执行，本机只接收
-  const [roam, setRoam] = createSignal<{ peer: Peer; folder: string } | null>(null);
-  // 额度租借目标：代码仍在 A 的本地目录执行，只临时使用所选队友的后端凭证/额度。
-  const [quotaPeer, setQuotaPeer] = createSignal<Peer | null>(null);
   // worktree：在独立 git worktree（分支 + 工作目录）中执行，不干扰主工作区正在进行的任务。
   // 通过 Alt+Enter 或工具条按钮弹窗填分支名后创建（不占用输入行空间）。
   const [cwdIsRepo, setCwdIsRepo] = createSignal(false);
@@ -116,6 +124,7 @@ export function HomeView() {
   // 漫游首次同步时优先保留从当前会话继承的模型。
   let preferSeedModelOnRoamSync = !!sessionSeed?.roam && !!sessionSeed.model;
   let lastPrewarmKey = "";
+  let lastPrewarmAt = 0;
   let lastRoamModelSyncKey = "";
   let scratchLoading = false;
   let submittingPrompt = false;
@@ -142,7 +151,10 @@ export function HomeView() {
   };
 
   createEffect(() => {
-    if (roam() || quotaPeer()) setWorkflowMenuOpen(false);
+    roam()?.peer.token;
+    quotaPeer();
+    setWorkflowMenuOpen(false);
+    setSelectedWorkflowId(null);
   });
 
   onMount(() => {
@@ -250,19 +262,23 @@ export function HomeView() {
   });
 
   const prewarmCurrent = (target: PrewarmTarget = {}) => {
-    if (roam() || quotaPeer()) return;
+    if (!state.settings || roam() || quotaPeer()) return;
     const p = target.cwd ?? cwd();
     if (!p) return;
     const nextAgentKind = target.agentKind ?? agentKind();
     const nextModel = target.model ?? model();
     const nextMode = target.mode ?? mode();
     const key = `${nextAgentKind}\n${p}\n${nextModel}\n${nextMode}`;
-    if (key === lastPrewarmKey) return;
+    if (key === lastPrewarmKey && Date.now() - lastPrewarmAt < 15_000) return;
     lastPrewarmKey = key;
+    lastPrewarmAt = Date.now();
     const shouldRestoreFocus = document.activeElement === textareaRef;
     const selectionStart = textareaRef?.selectionStart ?? null;
     const selectionEnd = textareaRef?.selectionEnd ?? null;
-    void api.prewarm(p, nextAgentKind, nextModel || null, nextMode || null).finally(() => {
+    void api.prewarm(p, nextAgentKind, nextModel || null, nextMode || null).catch((error) => {
+      if (lastPrewarmKey === key) lastPrewarmKey = "";
+      console.warn("prewarm failed", error);
+    }).finally(() => {
       if (!shouldRestoreFocus || !textareaRef) return;
       textareaRef.focus();
       if (selectionStart !== null && selectionEnd !== null) {
@@ -271,10 +287,18 @@ export function HomeView() {
     });
   };
 
+  // 恢复项目/草稿和切换模式也要预热，把用户阅读、输入的时间用于启动 ACP。
+  createEffect(() => {
+    if (!state.settings || roam() || quotaPeer()) return;
+    const target = { cwd: cwd(), agentKind: agentKind(), model: model(), mode: mode() };
+    if (!target.cwd) return;
+    const timer = setTimeout(() => prewarmCurrent(target), 150);
+    onCleanup(() => clearTimeout(timer));
+  });
+
   const pickModel = (v: string) => {
     setModel(v);
     lastUsed.setModel(agentKind(), v);
-    prewarmCurrent({ model: v });
   };
   const pickModelAgent = (next: AgentKind) => {
     if (next === agentKind()) return;
@@ -286,7 +310,6 @@ export function HomeView() {
       void ensureModelOptions(next);
       void refreshSlashCommands(next);
     }
-    prewarmCurrent({ agentKind: next, model: nextModel, mode: "build" });
   };
   // 三级菜单一次性提交「后端 + 模型」：跨后端时切后端，同后端时仅换模型
   const pickModelCombined = (next: AgentKind, m: string, borrowed?: QuotaModelPeer | null) => {
@@ -315,7 +338,6 @@ export function HomeView() {
       void refreshSlashCommands(next);
     }
     setModel(m);
-    prewarmCurrent({ agentKind: next, model: m, mode: "build" });
   };
 
   // ===== 漫游：用对端（host）的模型列表，而不是本机的（本机模型对方可能没有）=====
@@ -424,12 +446,11 @@ export function HomeView() {
     });
   });
 
-  const selectProject = (p: string, warm = false) => {
+  const selectProject = (p: string) => {
     setRoam(null); // 选了本地项目就退出漫游
     setCwd(p);
     if (isScratch(p)) localStorage.removeItem(LAST_NEW_THREAD_PROJECT_KEY);
     else localStorage.setItem(LAST_NEW_THREAD_PROJECT_KEY, p);
-    if (warm) prewarmCurrent({ cwd: p });
   };
 
   const insertShortcutText = (snippet: string, mayFocus: boolean): boolean => {
@@ -494,7 +515,7 @@ export function HomeView() {
         } catch {
           // 目录校验不可用时仍尝试切换。
         }
-        selectProject(path, true);
+        selectProject(path);
       })();
     },
     onSelectModel: (next, modelId, quotaPeer) => {
@@ -643,21 +664,25 @@ export function HomeView() {
     setBusy(true);
     try {
       if (target) {
-        // 漫游：worktree 由 host 后台创建，首条提示词走后端排队机制，正常发送即可
-        await createRoamingThread(
+        const remoteWorkflow = selectedPeerWorkflow();
+        if (selectedWorkflowId() && !remoteWorkflow) throw new Error("对方工作流列表已失效，请重新选择");
+        const outbound = remoteWorkflow ? roamingWorkflowPrompt(remoteWorkflow, prompt) : prompt;
+        // 选定远端工作流时直接走 IPC，不能让本机的同名工作流或触发器抢先执行。
+        const threadId = await createRoamingThread(
           target.peer,
           target.folder,
           agentKind(),
           model(),
           mode(),
-          prompt,
+          outbound,
           clue?.id ?? "",
           wtOn,
           branch,
           base,
         );
         if (clue) clearPendingClueCard();
-        await sendPrompt(prompt, images);
+        if (remoteWorkflow) await api.sendPrompt(threadId, outbound, images);
+        else await sendPrompt(prompt, images);
       } else if (quota) {
         await createQuotaThread(quota, cwd(), agentKind(), model(), mode(), clue?.id ?? "");
         if (clue) clearPendingClueCard();
@@ -1015,6 +1040,7 @@ export function HomeView() {
           class="home-composer"
           classList={{ "is-dragging": attach.dragging() }}
         >
+          <HaibaraBubble />
           <noteFlow.Notes />
           <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
           <Show when={quote()}>
@@ -1160,11 +1186,14 @@ export function HomeView() {
               />
             </Show>
             <div class="composer-actions">
-              <Show when={!roam() && !quotaPeer()}>
+              <Show when={!quotaPeer()}>
                 <div ref={workflowPickerRef} class="composer-workflow-picker">
                   <Show when={workflowMenuOpen()}>
                     <div class="composer-workflow-menu">
-                      <div class="composer-workflow-head">本次会话运行的工作流</div>
+                      <div class="composer-workflow-head">{roam() ? `${roam()!.peer.name} 的工作流` : "本次会话运行的工作流"}</div>
+                      <Show when={roam() && !workflowChoices().length}>
+                        <div class="composer-workflow-head">{peerWorkflows()[roam()!.peer.token] ? "对方暂无已启用的工作流" : "等待对方工作流列表（需双方升级）"}</div>
+                      </Show>
                       <button
                         type="button"
                         classList={{
@@ -1193,7 +1222,7 @@ export function HomeView() {
                                 ? `团队 · ${wf.sharedBy}`
                                 : wf.builtin
                                   ? "内置"
-                                  : "自定义"} · {wf.stages.length} 个节点
+                                  : "自定义"} · {wf.stageCount} 个节点
                             </small>
                           </button>
                         )}
@@ -1203,11 +1232,14 @@ export function HomeView() {
                   <button
                     type="button"
                     class="composer-btn workflow"
-                    classList={{ active: !!selectedWorkflow() }}
-                    onClick={() => setWorkflowMenuOpen((open) => !open)}
+                    classList={{ active: !!selectedWorkflowName() }}
+                    onClick={() => {
+                      if (!workflowMenuOpen() && roam()) ensurePeerModels(roam()!.peer.token, true);
+                      setWorkflowMenuOpen((open) => !open);
+                    }}
                     title={
-                      selectedWorkflow()
-                        ? `工作流：${selectedWorkflow()!.name}`
+                      selectedWorkflowName()
+                        ? `工作流：${selectedWorkflowName()}`
                         : "选择用哪个工作流运行本次任务"
                     }
                   >
@@ -1252,12 +1284,13 @@ export function HomeView() {
                   onClick={() =>
                     void openThread(
                       // 与侧栏同口径：任务链运行中时直达当前进行到的阶段，而不是回到根会话。
-                      liveWorkflowStage(t.id) ??
                       latestFireStage(
                         state.threads,
                         t,
-                        (id) => !!state.running[id] || zenRunningChains().busy.has(id),
+                        (id) => !!state.running[id],
                         (id) => state.unreadTurns[id] ?? 0,
+                        "running",
+                        liveWorkflowStage(t.id),
                       )?.id ?? t.id,
                     )
                   }

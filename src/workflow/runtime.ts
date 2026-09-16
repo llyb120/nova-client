@@ -181,6 +181,7 @@ async function createStageThread(
 ): Promise<void> {
   const h = requireHost();
   const root = await api.getThread(run.rootId);
+  if (root.roamingRole === "host") await api.checkRoamingWorkflow(originThreadId ?? root.id);
   // 节点可覆盖后端/模型：「跟随会话」跟随启动工作流时用户选择的会话（首节点覆盖前的锚点），
   // 而不是上一个节点/首节点的会话；配置了后端但未配模型时用该后端默认模型。
   const followAgentKind = (run.followAgentKind as AgentKind | undefined) ?? root.agentKind;
@@ -202,7 +203,7 @@ async function createStageThread(
     null,
     null,
     null,
-    run.rootId,
+    root.roamingRole === "host" ? (originThreadId ?? run.rootId) : run.rootId,
   );
   await api.renameThread(thread.id, title);
   // 会话标题交给模型按节点任务生成（异步，[WF] 前缀由后端保留）；失败则保持上面的兜底标题。
@@ -292,8 +293,21 @@ async function advanceWorkflow(threadId: string): Promise<void> {
   // 处于 running，减少焦虑模式若只看 running 会把没跑完的工作流弹回普通模式。
   advancingRoots.add(run.rootId);
   persistRuns();
+  const previous = { ...run, attempts: { ...run.attempts } };
   try {
     await doAdvance(threadId, run);
+  } catch (error) {
+    if (latestThreadByRoot.get(run.rootId) === threadId) {
+      Object.assign(run, previous);
+      suspendedRuns.set(threadId, run);
+      persistRuns();
+    }
+    const thread = await api.getThread(threadId);
+    if (thread.roamingRole === "host") {
+      await api.pushSystemItem(threadId, `工作流接力失败：${String(error)}`, "error");
+      await api.failRoamingWorkflow(threadId, String(error));
+    }
+    throw error;
   } finally {
     advancingRoots.delete(run.rootId);
   }
@@ -471,10 +485,11 @@ export function startWorkflow(
 
   return (async () => {
     const root = await api.getThread(rootId);
-    // 漫游/额度会话的执行位置不在本机，无法由本地工作流驱动。
-    if (root.roamingRole || root.quotaPeerName) {
-      throw new Error("工作流仅支持本地会话");
+    // guest 只展示；工作流由持有定义和实际工作目录的 host 驱动。
+    if (root.roamingRole === "guest" || root.quotaPeerName) {
+      throw new Error("请在执行端启动工作流");
     }
+    if (root.roamingRole === "host") await api.checkRoamingWorkflow(rootId);
     if (h.isRunning(rootId)) throw new Error("请等待当前会话结束后再启动工作流");
     // 「跟随会话」锚点：优先用调用方传入的用户原始选择，否则用首节点覆盖前的 root 值。
     const followAgentKind = followFrom?.agentKind ?? root.agentKind;
@@ -488,6 +503,7 @@ export function startWorkflow(
     } catch {
       // 设置读取失败不打断工作流，仅用流程变量替换。
     }
+    if (root.roamingRole === "host") await applyStageConfig(rootId, entry);
     const run: WorkflowRunStep = {
       rootId,
       workflowId,
@@ -506,6 +522,7 @@ export function startWorkflow(
     persistRuns();
 
     const ctx = runContext(run, "");
+    if (root.roamingRole === "host") await api.renameThread(rootId, resolveTitle(def, entry, ctx));
     // 先占运行态再刷新列表：首节点提示词还没跑起来时，减少焦虑模式下新会话不会
     // 先在普通列表闪现一下才进室女座。
     h.setRunning(rootId, true);
@@ -543,7 +560,7 @@ async function applyStageConfig(rootId: string, config: WorkflowStageConfig): Pr
   if (!agentKind && !model) return;
   const root = await api.getThread(rootId);
   if (agentKind && agentKind !== root.agentKind) {
-    await api.setThreadAgent(rootId, agentKind as AgentKind, model || null, null, null);
+    await api.setThreadAgent(rootId, agentKind as AgentKind, model || null, root.mode ?? null, null);
   } else if (model && model !== (root.model ?? "")) {
     await api.setThreadModel(rootId, model);
   }

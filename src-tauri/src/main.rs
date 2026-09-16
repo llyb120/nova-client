@@ -206,6 +206,7 @@ fn main() {
     }
 
     // MCP stdio must run before GUI setup and single-instance enforcement.
+    if nova_lib::image_generation::maybe_run() { return; }
     if nova_lib::maybe_run_codex_mcp() {
         return;
     }

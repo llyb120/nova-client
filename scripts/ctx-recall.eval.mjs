@@ -133,7 +133,7 @@ const CASES = [
       keywords: ["ThreadTitleGenerator", "derive title"],
       task: "会话标题生成逻辑调整",
     },
-    expect: ["derive_title", "src-tauri/src/opencode_sdk.rs"],
+    expect: ["derive_title", "src-tauri/src/sdk_runtime.rs"],
     min: 0.5,
   },
   {

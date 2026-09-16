@@ -4,6 +4,7 @@ import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog"
 import * as QRCode from "qrcode";
 import { createEffect, createMemo, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
+import AppearanceLayoutSettings from './AppearanceLayoutSettings';
 import {
   ALL_AGENT_KINDS,
   checkAndStageUpdate,
@@ -246,11 +247,12 @@ const TABS: { id: SettingsTab; name: string }[] = [
 export function SettingsModal(props: { onClose: () => void }) {
   const s = state.settings;
   const [tab, setTab] = createSignal<SettingsTab>("general");
+  const [kimiPath, setKimiPath] = createSignal(s?.kimiPath ?? "kimi");
+  const [kimiProxy, setKimiProxy] = createSignal(s?.kimiProxy ?? "");
+  const [kimiEnabled, setKimiEnabled] = createSignal(s?.kimiEnabled === true);
   const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
   const [acpArgs, setAcpArgs] = createSignal(s?.acpArgs ?? "acp");
   const [codebuddyPath, setCodebuddyPath] = createSignal(s?.codebuddyPath ?? "codebuddy");
-  const [claudecodePath, setClaudecodePath] = createSignal(s?.claudecodePath ?? "claude");
-  const [opencodePath, setOpencodePath] = createSignal(s?.opencodePath ?? "opencode");
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
   const [lyraProxy, setLyraProxy] = createSignal(s?.lyraProxy ?? "");
@@ -273,8 +275,6 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
-  const [claudecodeProxy, setClaudecodeProxy] = createSignal(s?.claudecodeProxy ?? "");
-  const [claudecodeSdkApiKey, setClaudecodeSdkApiKey] = createSignal(s?.claudecodeSdkApiKey ?? "");
   const [cursorProxy, setCursorProxy] = createSignal(s?.cursorProxy ?? "");
   const [cursorSdkApiKey, setCursorSdkApiKey] = createSignal(s?.cursorSdkApiKey ?? "");
   const [cursorDisableSubagents, setCursorDisableSubagents] = createSignal(
@@ -291,7 +291,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
     s?.cursorContextMode === "super" ? "super" : "default",
   );
-  const [opencodeProxy, setOpencodeProxy] = createSignal(s?.opencodeProxy ?? "");
   const [customEnvVars, setCustomEnvVars] = createSignal<{ name: string; value: string }[]>(
     Object.entries(s?.customEnvVars ?? {}).map(([name, value]) => ({ name, value })),
   );
@@ -299,9 +298,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
   const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
-  const [claudecodeEnabled, setClaudecodeEnabled] = createSignal(s?.claudecodeEnabled !== false);
   const [cursorEnabled, setCursorEnabled] = createSignal(s?.cursorEnabled !== false);
-  const [opencodeEnabled, setOpencodeEnabled] = createSignal(s?.opencodeEnabled !== false);
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
   const [lightweightAgent, setLightweightAgent] = createSignal<AgentKind>(
     (s?.lightweightModelAgent as AgentKind) || "lyra",
@@ -421,12 +418,11 @@ export function SettingsModal(props: { onClose: () => void }) {
   const enabledCount = () =>
     [
       devinEnabled(),
+      kimiEnabled(),
       lyraEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
-      claudecodeEnabled(),
       cursorEnabled(),
-      opencodeEnabled(),
     ].filter(Boolean).length;
 
   const quotaShareKinds = createMemo<AgentKind[]>(() => {
@@ -435,13 +431,11 @@ export function SettingsModal(props: { onClose: () => void }) {
     if (devinEnabled()) kinds.push("devin");
     if (codexEnabled()) kinds.push("codex");
     if (codebuddyEnabled()) kinds.push("codebuddy");
-    if (claudecodeEnabled()) kinds.push("claudecode");
     if (cursorEnabled()) kinds.push("cursor");
-    if (opencodeEnabled()) kinds.push("opencode");
     return kinds;
   });
   const titleAgentKinds = createMemo(() =>
-    enabledAgentKinds().filter((kind) => kind === "devin" || kind === "codex" || kind === "opencode"),
+    enabledAgentKinds().filter((kind) => kind === "devin" || kind === "codex"),
   );
 
   const quotaShareKey = (kind: AgentKind, model: string) => `${kind}:${model}`;
@@ -697,13 +691,14 @@ export function SettingsModal(props: { onClose: () => void }) {
   };
 
   const draftSettings = (): Settings => ({
+    kimiPath: kimiPath().trim() || "kimi",
+    kimiProxy: kimiProxy().trim(),
+    kimiEnabled: kimiEnabled(),
     devinPath: devinPath().trim() || "devin",
     acpArgs: acpArgs().trim() || "acp",
     codebuddyPath: codebuddyPath().trim() || "codebuddy",
-    claudecodePath: claudecodePath().trim() || "claude",
     // Cursor 仅走官方 SDK，不再依赖本机 cursor-agent；保留字段兼容旧配置。
     cursorPath: s?.cursorPath?.trim() || "cursor-agent",
-    opencodePath: opencodePath().trim() || "opencode",
     codexPath: codexPath().trim() || "codex",
     codexProxy: codexProxy().trim(),
     lyraProxy: lyraProxy().trim(),
@@ -716,8 +711,6 @@ export function SettingsModal(props: { onClose: () => void }) {
 
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
-    claudecodeProxy: claudecodeProxy().trim(),
-    claudecodeSdkApiKey: claudecodeSdkApiKey().trim(),
     cursorProxy: cursorProxy().trim(),
     cursorSdkApiKey: cursorSdkApiKey().trim(),
     cursorDisableSubagents: cursorDisableSubagents(),
@@ -725,7 +718,6 @@ export function SettingsModal(props: { onClose: () => void }) {
       .map((rule) => ({ prefix: rule.prefix.trim(), contextWindow: rule.contextWindow }))
       .filter((rule) => rule.prefix.length > 0),
     cursorContextMode: cursorContextMode(),
-    opencodeProxy: opencodeProxy().trim(),
     defaultMode: "build",
     lightweightModelAgent: lightweightAgent(),
     lightweightModel: lightweightModel().trim(),
@@ -745,14 +737,10 @@ export function SettingsModal(props: { onClose: () => void }) {
     lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),
-    claudecodeEnabled: claudecodeEnabled(),
     cursorEnabled: cursorEnabled(),
-    opencodeEnabled: opencodeEnabled(),
     codexIntegration: "app-server",
     codebuddyIntegration: "acp",
-    claudecodeIntegration: "sdk",
     cursorIntegration: "sdk",
-    opencodeIntegration: "sdk",
     worktreeDir: worktreeDir().trim(),
     updateChannel: updateChannel(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
@@ -849,7 +837,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [skillsDragging, setSkillsDragging] = createSignal(false);
   const [skillsMsg, setSkillsMsg] = createSignal("");
   const [experienceTrainingEnabled, setExperienceTrainingEnabled] = createSignal(s?.experienceTrainingEnabled ?? false);
-  const trainingAgentKinds = () => enabledAgentKinds().filter((kind) => kind !== "opencode");
+  const trainingAgentKinds = () => enabledAgentKinds();
   const [experienceTrainingAgent, setExperienceTrainingAgent] = createSignal<AgentKind>(s?.experienceTrainingAgent ?? "lyra");
   const [experienceTrainingModel, setExperienceTrainingModel] = createSignal(s?.experienceTrainingModel ?? "");
   const [experienceTrainingIntervalMinutes, setExperienceTrainingIntervalMinutes] = createSignal(s?.experienceTrainingIntervalMinutes ?? 60);
@@ -1562,7 +1550,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  默认开启。关闭后 Lyra 不再提���切换工作目录/项目的工具，也不会注入对应提示词。
+                  默认开启，支持 Lyra 和 CodeBuddy。切换后会更新会话目录及所属项目；CodeBuddy 会恢复会话并继续任务。关闭后不提供目录切换工具。
                 </span>
               </div>
               <div class="field">
@@ -1711,6 +1699,27 @@ export function SettingsModal(props: { onClose: () => void }) {
 
             <div class="backend-card">
               <div class="backend-card-head">
+                <span class="agent-badge kimi">Kimi Code</span>
+                <span class="fixed-integration">ACP</span>
+                <Show when={backendMissing("kimi")}><span class="backend-missing">未检测到 CLI</span></Show>
+                <label class="backend-switch">
+                  <input type="checkbox" checked={kimiEnabled()} disabled={kimiEnabled() && enabledCount() === 1} onChange={(e) => setKimiEnabled(e.currentTarget.checked)} />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager status={cliStatuses().kimi} loading={cliLoading()} />
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">可执行文件</span>
+                  <input class="field-input" value={kimiPath()} onInput={(e) => setKimiPath(e.currentTarget.value)} placeholder="kimi" />
+                </label>
+              </div>
+              <ProxyField value={kimiProxy()} onInput={setKimiProxy} />
+              <p class="field-hint">安装后先在终端运行 kimi，通过 /login 登录，再启用并保存。Windows 需要 Git for Windows；自定义 Git Bash 路径可在环境变量中设置 KIMI_SHELL_PATH。</p>
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
                 <span class={`agent-badge devin`}>{agentLabel("devin")}</span>
                 <span class="fixed-integration">ACP</span>
                 <Show when={backendMissing("devin")}>
@@ -1790,37 +1799,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </label>
               </div>
               <ProxyField value={codebuddyProxy()} onInput={setCodebuddyProxy} />
-            </div>
-
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class={`agent-badge claudecode`}>{agentLabel("claudecode")}</span>
-                <span class="fixed-integration">SDK</span>
-                <Show when={backendMissing("claudecode")}>
-                  <span class="backend-missing">未检测到 CLI</span>
-                </Show>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={claudecodeEnabled()}
-                    disabled={claudecodeEnabled() && enabledCount() === 1}
-                    onChange={(e) => setClaudecodeEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-              </div>
-              <CliManager status={cliStatuses().claudecode} loading={cliLoading()} />
-              <div class="backend-fields">
-                <label class="backend-field">
-                  <span class="field-label">可执行文件</span>
-                  <input class="field-input" value={claudecodePath()} onInput={(e) => setClaudecodePath(e.currentTarget.value)} placeholder="claude" />
-                </label>
-                <label class="backend-field backend-field-wide">
-                  <span class="field-label">Anthropic API Key</span>
-                  <input class="field-input" value={claudecodeSdkApiKey()} onInput={(e) => setClaudecodeSdkApiKey(e.currentTarget.value)} placeholder="留空使用环境/provider 凭据" />
-                </label>
-              </div>
-              <ProxyField value={claudecodeProxy()} onInput={setClaudecodeProxy} />
             </div>
 
             <div class="backend-card">
@@ -1933,33 +1911,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                   </div>
                 </Show>
               </div>
-            </div>
-
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class={`agent-badge opencode`}>{agentLabel("opencode")}</span>
-                <span class="fixed-integration">SDK</span>
-                <Show when={backendMissing("opencode")}>
-                  <span class="backend-missing">未检测到 CLI</span>
-                </Show>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={opencodeEnabled()}
-                    disabled={opencodeEnabled() && enabledCount() === 1}
-                    onChange={(e) => setOpencodeEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-              </div>
-              <CliManager status={cliStatuses().opencode} loading={cliLoading()} />
-              <div class="backend-fields">
-                <label class="backend-field">
-                  <span class="field-label">可执行文件</span>
-                  <input class="field-input" value={opencodePath()} onInput={(e) => setOpencodePath(e.currentTarget.value)} placeholder="opencode" />
-                </label>
-              </div>
-              <ProxyField value={opencodeProxy()} onInput={setOpencodeProxy} />
             </div>
 
             <p class="field-hint">
@@ -2106,6 +2057,7 @@ export function SettingsModal(props: { onClose: () => void }) {
               </div>
               <span class="field-hint">明暗两套主题互为镜像、即点即换，选择会自动记住。</span>
             </div>
+            <AppearanceLayoutSettings />
           </Show>
 
           {/* ===== 团队 ===== */}
@@ -2504,7 +2456,7 @@ export function SettingsModal(props: { onClose: () => void }) {
               </div>
               <span class="field-hint">
                 Skill 统一放在 <code>~/.nova/skills</code>。启动各后端时会以软链接（macOS/Linux）或目录联接（Windows）同步到
-                Codex / Claude Code / Cursor / OpenCode / agents 的全局 skills 目录，不拷贝文件。
+                Codex / Cursor / agents 的全局 skills 目录，不拷贝文件。
               </span>
             </div>
 

@@ -187,11 +187,10 @@ fn normal_targets(config_dir: &Path) -> Result<Vec<Target>, String> {
     [
         AgentKind::Lyra,
         AgentKind::Devin,
+        AgentKind::Kimi,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
-        AgentKind::ClaudeCode,
         AgentKind::Cursor,
-        AgentKind::OpenCode,
     ]
     .iter()
     .map(|kind| target_for(kind, &env))
@@ -204,6 +203,13 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
         .or_else(user_home_dir)
         .ok_or("无法确定用户主目录")?;
     let (label, path, format) = match kind {
+        AgentKind::Kimi => (
+            kind.label(),
+            configured_dir(overrides, "KIMI_CODE_HOME")
+                .unwrap_or_else(|| home.join(".kimi-code"))
+                .join("AGENTS.md"),
+            TargetFormat::Markdown,
+        ),
         // Lyra 沿用旧 Vega 数据目录与 AGENTS.md。
         AgentKind::Lyra => (
             "Lyra",
@@ -241,15 +247,6 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
                 TargetFormat::Markdown,
             )
         }
-        AgentKind::ClaudeCode => {
-            let root = configured_dir(overrides, "CLAUDE_CONFIG_DIR")
-                .unwrap_or_else(|| home.join(".claude"));
-            (
-                "Claude Code",
-                root.join("CLAUDE.md"),
-                TargetFormat::Markdown,
-            )
-        }
         AgentKind::Cursor => {
             let root = configured_dir(overrides, "CURSOR_CONFIG_DIR")
                 .unwrap_or_else(|| home.join(".cursor"));
@@ -257,15 +254,6 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
                 "Cursor",
                 root.join("rules").join("nova-global.mdc"),
                 TargetFormat::CursorRule,
-            )
-        }
-        AgentKind::OpenCode | AgentKind::OpenCodePlus => {
-            let root = configured_dir(overrides, "XDG_CONFIG_HOME")
-                .unwrap_or_else(|| home.join(".config"));
-            (
-                kind.label(),
-                root.join("opencode").join("AGENTS.md"),
-                TargetFormat::Markdown,
             )
         }
     };
