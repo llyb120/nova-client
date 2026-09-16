@@ -7952,15 +7952,22 @@ button:focus-visible {
   }
 }
 
-/* 工程手稿保留清晰细线，轻覆底色降低背景对比度。 */
+/* 手稿保持固定尺寸；大窗口露出更多底色，边缘渐隐避免图片边界。 */
 .dawn-backdrop {
   display: none;
   position: fixed;
-  inset: 0;
+  left: 50%;
+  top: 50%;
+  width: 1536px;
+  height: 864px;
+  transform: translate(-50%, -50%);
   z-index: -1;
   pointer-events: none;
   background: linear-gradient(rgba(245, 247, 250, 0.3), rgba(245, 247, 250, 0.3)),
-    url("./assets/engineering-sketch.webp") center / cover no-repeat;
+    url("./assets/engineering-sketch.webp") center / 1536px 864px no-repeat;
+  mask-image: linear-gradient(to right, transparent, #000 64px, #000 calc(100% - 64px), transparent),
+    linear-gradient(to bottom, transparent, #000 64px, #000 calc(100% - 64px), transparent);
+  mask-composite: intersect;
 }
 :root[data-theme="ink-light"] .sky-backdrop { visibility: hidden; }
 :root[data-theme="ink-light"] .dawn-backdrop { display: block; }
