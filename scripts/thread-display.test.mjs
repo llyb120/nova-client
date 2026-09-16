@@ -65,6 +65,15 @@ test("链运行中：点击直达正在运行的 stage，即使旧 stage 有未�
   assert.equal(latestFireStage(runningChain, runningChain[0], isRunning, unreadOf)?.id, "s2");
 });
 
+test("进入会话时按实际运行节点跳转，覆盖无标记的 stage、根阶段和工作流链尖", () => {
+  const chain = runningChain.map((thread) => ({ ...thread, title: "普通标题", stageSourceThreadId: undefined }));
+  assert.equal(latestFireStage(chain, chain[0], (id) => id === "s1")?.id, "s1");
+  assert.equal(latestFireStage(runningChain, runningChain[0], (id) => id === "s1", unreadOf, "running", "s2")?.id, "s1");
+  assert.equal(latestFireStage(runningChain, runningChain[0], (id) => id === "root", unreadOf, "running", "s2")?.id, "root");
+  assert.equal(latestFireStage(runningChain, runningChain[0], () => false, unreadOf, "running", "s2")?.id, "s2");
+  assert.equal(latestFireStage(runningChain, runningChain[0], isRunning, unreadOf, "unread", "s2")?.id, "s1");
+});
+
 test("链空闲时保持原行为：未读优先，其次最新 stage", () => {
   const idle = latestFireStage(runningChain, runningChain[0], () => false, unreadOf);
   assert.equal(idle?.id, "s1");

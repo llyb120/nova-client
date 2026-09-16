@@ -1284,12 +1284,13 @@ export function HomeView() {
                   onClick={() =>
                     void openThread(
                       // 与侧栏同口径：任务链运行中时直达当前进行到的阶段，而不是回到根会话。
-                      liveWorkflowStage(t.id) ??
                       latestFireStage(
                         state.threads,
                         t,
-                        (id) => !!state.running[id] || zenRunningChains().busy.has(id),
+                        (id) => !!state.running[id],
                         (id) => state.unreadTurns[id] ?? 0,
+                        "running",
+                        liveWorkflowStage(t.id),
                       )?.id ?? t.id,
                     )
                   }

@@ -35,7 +35,8 @@ export function chainGroupAnchor(
 /**
  * Fire 任务链与 /stage 链在侧栏只显示根会话，但用户真正关心的是当前进行到的阶段：
  * 点击时优先直达链上正在运行的阶段会话（多个取最新创建的）——链运行中时旧阶段
- * 的未读不应把点击劫持到已完成的环节；没有运行中的阶段时再优先有未读的
+ * 的未读不应把点击劫持到已完成的环节；运行判断覆盖导航栏里的所有父子节点。
+ * 没有运行中的阶段时优先工作流记录的链尖（接力空档/等待审核），再优先有未读的
  * （多个取最早创建的），都没有时回退到最新创建的阶段会话，
  * 而不是回到最初的目标会话。
  * 「打开未读消息」快捷键（openNextUnreadThread）语义相反：prefer 传 "unread"
@@ -48,9 +49,10 @@ export function latestFireStage(
   isRunning?: (id: string) => boolean,
   unreadOf?: (id: string) => number,
   prefer: "running" | "unread" = "running",
+  workflowStageId?: string,
 ): ThreadMeta | undefined {
   let latest = root;
-  let running: ThreadMeta | undefined;
+  let running = isRunning?.(root.id) ? root : undefined;
   let unread: ThreadMeta | undefined;
   let hasStage = false;
   const pending = [root.id];
@@ -61,20 +63,21 @@ export function latestFireStage(
       if (thread.parentThreadId !== parentId || seen.has(thread.id)) continue;
       seen.add(thread.id);
       pending.push(thread.id);
-      if (!isStageThread(thread)) continue;
-      hasStage = true;
-      if (thread.createdAt > latest.createdAt) latest = thread;
       if (isRunning?.(thread.id) && (!running || thread.createdAt > running.createdAt)) {
         running = thread;
       }
+      if (!isStageThread(thread)) continue;
+      hasStage = true;
+      if (thread.createdAt > latest.createdAt) latest = thread;
       if ((unreadOf?.(thread.id) ?? 0) > 0 && (!unread || thread.createdAt < unread.createdAt)) {
         unread = thread;
       }
     }
   }
-  // 链上没有任何 stage 节点（如预检→开发子会话）时保持原行为：打开被点击的会话本身。
-  if (!isFireThread(root) && !hasStage) return undefined;
+  // 没有运行节点、工作流链尖和 stage 标记时，保留调用方原来的打开目标。
+  const workflowStage = threads.find((thread) => thread.id === workflowStageId && seen.has(thread.id));
+  if (!isFireThread(root) && !hasStage && !running && !workflowStage) return undefined;
   const target =
-    prefer === "unread" ? unread ?? running ?? latest : running ?? unread ?? latest;
-  return target === root ? undefined : target;
+    prefer === "unread" ? unread ?? running ?? workflowStage ?? latest : running ?? workflowStage ?? unread ?? latest;
+  return target === root && !running ? undefined : target;
 }
