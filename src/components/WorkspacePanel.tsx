@@ -9,7 +9,7 @@ import WorkspaceGit from "./WorkspaceGit";
 import { api } from "../ipc";
 import { state } from "../store";
 import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
-import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
+import { workspaceLayout, setWorkspaceLayout, type WorkspaceMode } from "../workspaceLayout";
 import { collectWorkspaceArtifacts } from "../workspaceArtifacts";
 import { absolutePath, createFileContextMenu } from "./FileContextMenu";
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconX, IconCopy, IconBrowser, IconGear, IconTerminal } from "./icons";
@@ -20,11 +20,11 @@ import type { SheetEditor } from "./WorkspaceSheet";
 
 type Preview = Awaited<ReturnType<typeof api.previewWorkspaceFile>>;
 type FileTab = { file: Preview; original: string; draft: string; editing: boolean; source: boolean; saved: boolean; error: string; scroll: number; start: number; end: number };
-type PanelSnapshot = { mode: "files" | "artifacts" | "git"; tabs: FileTab[]; activePath?: string; browse: boolean; expanded: string[]; filter: string; artifactFilter: string };
+type PanelSnapshot = { tabs: FileTab[]; activePath?: string; browse: boolean; expanded: string[]; filter: string; artifactFilter: string };
 // Keep unsaved buffers when ChatView unmounts on a thread switch; never evict user edits.
 const drafts = new Map<string, { file: Preview; text: string }>();
 // ChatView remounts the panel on every thread switch; remember each thread's
-// mode/tabs/picker state so the side bar is restored exactly as it was left.
+// tabs/picker state so the side bar is restored exactly as it was left.
 const panels = new Map<string, PanelSnapshot>();
 const normalized = (text: string) => text.replace(/\r\n/g, "\n");
 function FileIcon(props: { path: string; directory?: boolean }) {
@@ -47,7 +47,9 @@ function FileIcon(props: { path: string; directory?: boolean }) {
 export default function WorkspacePanel(props: { threadId: string; request: { path: string; line?: number } | null; onClose: () => void }) {
   const threadId = props.threadId;
   const remembered = panels.get(threadId);
-  const [mode, setMode] = createSignal<"files" | "artifacts" | "git">(remembered?.mode ?? "files");
+  // 视图选择是全局偏好：在一个会话里切到 Git，别的会话也默认停在 Git。
+  const mode = () => workspaceLayout.mode;
+  const setMode = (mode: WorkspaceMode) => setWorkspaceLayout({ mode });
   const [artifacts, setArtifacts] = createSignal<string[]>([]);
   const [artifactFilter, setArtifactFilter] = createSignal(remembered?.artifactFilter ?? "");
   const [tabs, setTabs] = createSignal<FileTab[]>(remembered?.tabs ?? []);
@@ -140,7 +142,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     request++; cancelAnimationFrame(frame);
     snapshot();
     panels.delete(threadId);
-    panels.set(threadId, { mode: mode(), tabs: tabs(), activePath: preview()?.path, browse: browse(), expanded: [...expanded()], filter: filter(), artifactFilter: artifactFilter() });
+    panels.set(threadId, { tabs: tabs(), activePath: preview()?.path, browse: browse(), expanded: [...expanded()], filter: filter(), artifactFilter: artifactFilter() });
     // ponytail: 最多记住 16 个会话的侧栏状态，更早的丢弃；未保存草稿仍由 drafts 兜底。
     while (panels.size > 16) panels.delete(panels.keys().next().value!);
   });
