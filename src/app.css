@@ -2781,7 +2781,7 @@ button {
 }
 
 .prompt-queue {
-  margin: -4px 0 10px;
+  margin: 0 0 10px;
   max-height: min(210px, 30vh);
   overflow-y: auto;
   overscroll-behavior: contain;
