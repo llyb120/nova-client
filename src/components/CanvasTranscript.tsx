@@ -1551,8 +1551,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             : [processSummary(segment.items)];
           py += 4;
           for (const [lineIndex, line] of lines.entries()) {
+            // 与 .turn-fold 同法：整块左移一个内边距，让文字与正文左对齐；hover 底板仍铺满正文区。
+            // 过程行文字已是 muted 色，靠颜色区分即可，不再额外缩进。
             result.push({ kind: "fold", id: segment.id, groupIdx: gi,
-              x: side + xOffset, y: py, w: width, h: 24,
+              x: side + xOffset - 8, y: py, w: width + 8, h: 24,
               text: ellipsize(line, Math.max(1, width - 40), 12, p.sans), title: line, color: p.muted, fontSize: 12, font: p.sans,
               hoverBg: p.hover, borderRadius: 6, cursor: "pointer", data: { open, foldKey, hideChevron: lineIndex < lines.length - 1 },
               clickAction: () => toggleExpanded(foldKey) });
