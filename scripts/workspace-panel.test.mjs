@@ -31,7 +31,8 @@ window.showLayoutSettings = () => {
 window.testLayout = () => ({...workspaceLayout});
 window.testCode = () => EditorView.findFromDOM(document.querySelector('.cm-editor'));
 window.loadHistory = () => setState('items', [{type:'tool',id:2,ts:0,status:'completed',kind:'edit',locations:[{path:'generated.ts'}],content:[]}]);
-api.workspaceGitStatus = async () => ({repo:'D:/demo',files:[{path:'src/main.ts',oldPath:null,index:'M',worktree:'M'},{path:'new.ts',oldPath:null,index:'?',worktree:'?'}]});
+api.workspaceGitStatus = async () => ({repo:'D:/demo',files:[{path:'src/main.ts',oldPath:null,index:'M',worktree:'M'},{path:'new.ts',oldPath:null,index:'?',worktree:'?'},{path:'app-icon.png',oldPath:null,index:'M',worktree:'M'}]});
+api.workspaceGitImage = async (_id, path, staged) => ({before:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', after:staged ? null : 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='});
 api.workspaceGitDiff = async (_id, path, staged) => 'diff --git a/' + path + ' b/' + path + '\\n@@ -1,22 +1,22 @@\\n' + Array.from({length:20}, (_, i) => ' context ' + i).join('\\n') + '\\n-old\\n+' + (staged ? 'staged' : 'unstaged') + '\\n-long "' + 'x'.repeat(300) + '";\\n';
 import './src/app.css';
 let disk = '# Hello\\r\\n';
@@ -372,6 +373,23 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   const longRow = page.locator('.workspace-diff-line').filter({hasText:'long "'}).last();
   assert.ok(await longRow.evaluate(el => el.getBoundingClientRect().height > parseFloat(getComputedStyle(el).lineHeight) * 2), '超长差异行折行显示');
   if (process.env.TEST_SCREENSHOT) await page.screenshot({path:process.env.TEST_SCREENSHOT.replace('.png','-git.png')});
+  const imageDiff = page.getByLabel('图片差异');
+  await page.locator('.workspace-git-files').getByRole('button', {name:'M app-icon.png',exact:true}).first().click();
+  await imageDiff.locator('img').first().waitFor();
+  const imageSources = await imageDiff.locator('img').evaluateAll(imgs => imgs.map(img => img.getAttribute('src')));
+  assert.equal(imageSources.length, 2, '未暂存图片并排显示新旧两版');
+  assert.ok(imageSources.every(src => src.startsWith('data:image/png;base64,')), '图片直接内联显示，不回落到二进制差异文本');
+  assert.equal(await imageDiff.getByText('修改前', {exact:true}).count(), 1);
+  assert.equal(await page.locator('.workspace-diff-line').count(), 0, '图片不再渲染 Binary files differ 一类的文本差异');
+  assert.equal(await page.locator('.workspace-diff-count').count(), 0, '图片对比不显示文本行数统计');
+  await page.waitForFunction(() => {
+    const imgs = [...document.querySelectorAll('.workspace-image-diff img')];
+    return imgs.length === 2 && imgs.every(img => img.complete && img.naturalWidth === 1);
+  });
+  await page.locator('.workspace-git-files').getByRole('button', {name:'M app-icon.png',exact:true}).last().click();
+  await imageDiff.getByText('已删除', {exact:true}).waitFor();
+  assert.equal(await imageDiff.locator('img').count(), 1, '暂存后工作区图缺失时只显示旧版本');
+  if (process.env.TEST_SCREENSHOT) await page.screenshot({path:process.env.TEST_SCREENSHOT.replace('.png','-git-image.png')});
   const draftBeforeGitClose = await page.evaluate(() => window.testCode().state.doc.toString());
   await page.getByRole('tab', {name:/large.rs/}).click();
   await page.getByRole('textbox', {name:'文件内容编辑'}).waitFor();
