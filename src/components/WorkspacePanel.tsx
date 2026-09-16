@@ -1,5 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { batch, createEffect, createMemo, createSignal, For, Match, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
+import { batch, createEffect, createMemo, createSignal, ErrorBoundary, For, lazy, Match, onCleanup, onMount, Show, Suspense, Switch, untrack } from "solid-js";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
 import { EditorView } from "@codemirror/view";
@@ -12,6 +12,9 @@ import { collectWorkspaceArtifacts } from "../workspaceArtifacts";
 import { absolutePath, createFileContextMenu } from "./FileContextMenu";
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconX, IconCopy, IconBrowser, IconGear, IconTerminal } from "./icons";
 import "./WorkspacePanel.css";
+
+const WorkspaceSheet = lazy(() => import("./WorkspaceSheet"));
+import type { SheetEditor } from "./WorkspaceSheet";
 
 type Preview = Awaited<ReturnType<typeof api.previewWorkspaceFile>>;
 type FileTab = { file: Preview; original: string; draft: string; editing: boolean; source: boolean; saved: boolean; error: string; scroll: number; start: number; end: number };
@@ -56,13 +59,13 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const [saving, setSaving] = createSignal(false);
   const [browse, setBrowse] = createSignal(false);
   const [saved, setSaved] = createSignal(false);
-  const dirty = () => preview()?.text != null && draft() !== normalized(original());
+  const dirty = () => (preview()?.text != null || preview()?.kind === "spreadsheet") && draft() !== normalized(original());
   const draftKey = (path: string) => `${props.threadId}\0${path}`;
   const changeDraft = (text: string) => {
     setDraft(text); setSaved(false);
     const file = preview();
     if (!file) return;
-    if (dirty()) drafts.set(draftKey(file.path), { file: { ...file, text: original() }, text });
+    if (dirty()) drafts.set(draftKey(file.path), { file: file.kind === "spreadsheet" ? { ...file, sheet: original() } : { ...file, text: original() }, text });
     else drafts.delete(draftKey(file.path));
   };
   const [filter, setFilter] = createSignal("");
@@ -86,6 +89,11 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   let frame = 0;
   let panel!: HTMLElement;
   let codeView: EditorView | undefined;
+  let sheetEditor: SheetEditor | undefined;
+  const commitSheet = async () => {
+    try { await sheetEditor?.flush(); return true; }
+    catch (e) { setError(String(e)); return false; }
+  };
   let picker!: HTMLDivElement;
   onMount(() => {
     const restoreWidth = () => {
@@ -142,15 +150,17 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       if (scroll) scroll.scrollTop = tab.scroll;
     });
   };
-  const selectTab = (path: string) => {
+  const selectTab = async (path: string) => {
     if (saving()) return;
+    if (!(await commitSheet())) return;
     if (mode() === "git") setMode("files");
     ++request; snapshot();
     const tab = tabs().find(tab => tab.file.path === path);
     if (tab) activate(tab);
   };
-  const closeTab = (path: string) => {
+  const closeTab = async (path: string) => {
     if (saving()) return;
+    if (!(await commitSheet())) return;
     snapshot();
     const tab = tabs().find(tab => tab.file.path === path);
     if (!tab) return;
@@ -177,6 +187,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   };
   const open = async (path: string, reload = false, line?: number) => {
     if (saving()) return;
+    if (!(await commitSheet())) return;
     snapshot();
     const existing = tabs().find(tab => tab.file.path === (aliases.get(path) ?? path));
     if (existing && !reload) { selectTab(existing.file.path); revealLine(line); return; }
@@ -186,14 +197,18 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     setLoading(true); setError("");
     try {
       const result = await api.previewWorkspaceFile(props.threadId, path);
+      if (result.kind === "spreadsheet" && result.data) {
+        const { importSpreadsheet } = await import("../workspaceSpreadsheet");
+        result.sheet = JSON.stringify(await importSpreadsheet(result.data, label(result.path)));
+      }
       if (token === request) {
         snapshot();
         aliases.set(path, result.path);
         const duplicate = tabs().find(tab => tab.file.path === result.path);
         if (duplicate && !reload) { activate(duplicate); revealLine(line); return; }
         const buffer = drafts.get(draftKey(result.path));
-        const tab: FileTab = { file: buffer?.file ?? result, original: buffer?.file.text ?? result.text ?? '',
-          draft: buffer?.text ?? normalized(result.text ?? ''), editing: result.text != null, source: false, saved: false, error: '', scroll: 0, start: 0, end: 0 };
+        const tab: FileTab = { file: buffer?.file ?? result, original: buffer?.file.sheet ?? buffer?.file.text ?? result.sheet ?? result.text ?? '',
+          draft: buffer?.text ?? normalized(result.sheet ?? result.text ?? ''), editing: result.text != null, source: false, saved: false, error: '', scroll: 0, start: 0, end: 0 };
         setTabs(all => duplicate ? all.map(item => item === duplicate ? tab : item) : [...all, tab]);
         activate(tab);
         revealLine(line);
@@ -203,7 +218,9 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   };
   const save = async () => {
     const file = preview();
-    if (!file || file.text === null || !dirty() || saving()) return;
+    if (!file || saving()) return;
+    if (file.kind === "spreadsheet") { await saveSheet(file); return; }
+    if (file.text === null || !dirty()) return;
     ++request; setLoading(false);
     const text = original().includes("\r\n") ? draft().replace(/\n/g, "\r\n") : draft();
     setSaving(true); setError("");
@@ -216,8 +233,26 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     } catch (e) { setError(String(e)); }
     finally { setSaving(false); }
   };
-  const reload = () => {
+  const saveSheet = async (file: Preview) => {
+    if (!sheetEditor) return;
+    setSaving(true); setError("");
+    try {
+      await sheetEditor.flush();
+      if (!dirty()) return;
+      const text = draft();
+      const { exportSpreadsheet } = await import("../workspaceSpreadsheet");
+      const data = await exportSpreadsheet(JSON.parse(text));
+      await api.saveWorkspaceFile(props.threadId, file.path, file.data!, data);
+      drafts.delete(draftKey(file.path));
+      setOriginal(text); setSaved(true);
+      setPreview({ ...file, data, sheet: text, size: Math.floor(data.length * 3 / 4) });
+      snapshot();
+    } catch (e) { setError(String(e)); }
+    finally { setSaving(false); }
+  };
+  const reload = async () => {
     if (saving()) return;
+    if (!(await commitSheet())) return;
     if (dirty() && !window.confirm("放弃此文件的未保存修改并重新读取？")) return;
     if (preview()) { drafts.delete(draftKey(preview()!.path)); void open(preview()!.path, true); }
     refreshArtifacts();
@@ -304,7 +339,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <button class="workspace-picker-toggle" aria-pressed={mode() === "files"} onClick={() => { setMode("files"); setBrowse(true); }}>文件</button>
       <button aria-pressed={mode() === "artifacts"} onClick={() => { setMode("artifacts"); setBrowse(false); refreshArtifacts(); }}>产物 · {artifacts().length}</button>
       <button aria-pressed={mode() === "git"} onClick={() => { setMode("git"); setBrowse(false); }}>Git 变动</button>
-      <button class="workspace-panel-close" aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={props.onClose}><IconX size={14} /></button>
+      <button class="workspace-panel-close" aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={async () => { if (await commitSheet()) props.onClose(); }}><IconX size={14} /></button>
     </nav>
     <header class="workspace-toolbar workspace-tabbar">
       <span class="workspace-open-label">已打开</span>
@@ -337,6 +372,9 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <Show when={preview()?.text != null}>
         <button aria-pressed={editing()} onClick={() => setEditing(v => !v)}>{editing() ? '预览' : '编辑'}</button>
         <button disabled={!dirty() || saving()} onClick={() => void save()} title="保存 (Ctrl/Cmd+S)">{saving() ? '保存中' : saved() ? '已保存' : '保存'}</button>
+      </Show>
+      <Show when={preview()?.kind === "spreadsheet"}>
+        <button disabled={saving()} onClick={() => void save()} title="保存表格 (Ctrl/Cmd+S)">{saving() ? '保存中' : saved() ? '已保存' : '保存表格'}</button>
       </Show>
       <Show when={preview()}>{file => <details class="workspace-actions" onKeyDown={e => {
         if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); e.currentTarget.open = false; e.currentTarget.querySelector('summary')?.focus(); }
@@ -397,6 +435,13 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
             else if (href && !/^(?:#|[a-z][a-z\d+.-]*:)/i.test(href)) void open(relative(href));
           }} /></Match>
           <Match when={file.kind === "html" && !source()}><iframe title={label(file.path)} sandbox="allow-scripts" referrerpolicy="no-referrer" srcdoc={`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; form-action 'none';">${draft()}`} /></Match>
+          <Match when={file.kind === "spreadsheet"}>
+            <ErrorBoundary fallback={error => <p role="alert">表格加载失败：{String(error)}，请刷新重试或使用系统打开。</p>}>
+              <Suspense fallback={<p role="status">正在加载表格编辑器…</p>}><WorkspaceSheet text={draft()} readOnly={saving()}
+                onReady={text => { if (!dirty()) { setOriginal(text); setDraft(text); } }}
+                onChange={text => { if (preview() === file) changeDraft(text); }} onEditor={editor => { sheetEditor = editor; }} /></Suspense>
+            </ErrorBoundary>
+          </Match>
           <Match when={file.text !== null}><WorkspaceCode path={file.path} text={draft()} readOnly onChange={changeDraft} onView={view => { codeView = view; }} /></Match>
         </Switch>
       </div>}>

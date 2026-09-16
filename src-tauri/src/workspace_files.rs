@@ -1,4 +1,5 @@
 use crate::AppState;
+use base64::Engine;
 use serde::Serialize;
 use std::{
     fs,
@@ -8,6 +9,7 @@ use std::{
 use tauri::{Emitter, State};
 
 const TEXT_LIMIT: u64 = 256 * 1024;
+const SHEET_LIMIT: u64 = 16 * 1024 * 1024;
 const ENTRY_LIMIT: usize = 500;
 
 #[derive(Serialize, Clone)]
@@ -129,7 +131,7 @@ pub async fn workspace_git_diff(
     .map_err(|e| e.to_string())?
 }
 
-fn root(state: &AppState, id: &str) -> Result<PathBuf, String> {
+pub(crate) fn root(state: &AppState, id: &str) -> Result<PathBuf, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     let thread = store.get(id).ok_or("会话不存在")?;
     if thread.roaming_role.as_deref() == Some("guest") {
@@ -138,7 +140,7 @@ fn root(state: &AppState, id: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(&thread.cwd))
 }
 
-fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let path = root.join(path).canonicalize().map_err(|e| e.to_string())?;
     if !path.starts_with(&root) {
@@ -201,6 +203,7 @@ pub struct Preview {
     kind: &'static str,
     text: Option<String>,
     size: u64,
+    data: Option<String>,
 }
 
 fn search_names(root: &Path, query: &str) -> Result<Listing, String> {
@@ -294,6 +297,7 @@ fn read_preview(root: &Path, path: &str) -> Result<Preview, String> {
         kind: "external",
         text: None,
         size: meta.len(),
+        data: None,
     };
     if matches!(
         ext.as_str(),
@@ -302,6 +306,20 @@ fn read_preview(root: &Path, path: &str) -> Result<Preview, String> {
         if meta.len() <= 16 * 1024 * 1024 {
             result.kind = "image";
         }
+        return Ok(result);
+    }
+    // Univer 在 WebView 内编辑；旧 Office 格式继续交给系统打开。
+    if ext == "xlsx" {
+        if meta.len() > SHEET_LIMIT {
+            return Err("表格超过 16 MB，请使用系统打开".into());
+        }
+        let mut bytes = Vec::new();
+        (&mut file).take(SHEET_LIMIT + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > SHEET_LIMIT {
+            return Err("表格超过 16 MB，请使用系统打开".into());
+        }
+        result.kind = "spreadsheet";
+        result.data = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
         return Ok(result);
     }
     if meta.len() > TEXT_LIMIT {
@@ -339,15 +357,39 @@ pub async fn preview_workspace_file(
 }
 
 fn save_text(root: &Path, path: &str, original: &str, text: &str) -> Result<(), String> {
+    let resolved = resolve(root, path)?;
+    if resolved.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("xlsx")) {
+        if original.len() as u64 > SHEET_LIMIT * 4 / 3 + 4 || text.len() as u64 > SHEET_LIMIT * 4 / 3 + 4 {
+            return Err("表格超过 16 MB，无法保存".into());
+        }
+        let decode = |value: &str| base64::engine::general_purpose::STANDARD.decode(value).map_err(|e| e.to_string());
+        let original = decode(original)?;
+        let bytes = decode(text)?;
+        if bytes.len() as u64 > SHEET_LIMIT || !bytes.starts_with(b"PK\x03\x04") {
+            return Err("无效或过大的 XLSX 文件".into());
+        }
+        return save_bytes(&resolved, &original, &bytes, SHEET_LIMIT);
+    }
     if text.len() as u64 > TEXT_LIMIT || text.contains('\0') {
         return Err("保存内容必须为不超过 256 KB 的文本".into());
     }
+    if read_preview(root, path)?.text.as_deref() != Some(original) {
+        return Err("文件已被外部修改或不支持编辑。草稿已保留，请重新读取文件后合并修改。".into());
+    }
+    save_bytes(&resolved, original.as_bytes(), text.as_bytes(), TEXT_LIMIT)
+}
+
+fn save_bytes(path: &Path, original: &[u8], bytes: &[u8], limit: u64) -> Result<(), String> {
     // ponytail: 串行化 Nova 内的保存；外部编辑器采用写入前内容校验，不提供跨进程事务。
     static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = SAVE_LOCK.lock().map_err(|e| e.to_string())?;
-    let path = resolve(root, path)?;
-    let current = read_preview(root, path.to_str().ok_or("文件路径编码无效")?)?;
-    if current.text.as_deref() != Some(original) {
+    let unchanged = || -> Result<bool, String> {
+        let mut current = Vec::new();
+        fs::File::open(path).map_err(|e| e.to_string())?.take(limit + 1)
+            .read_to_end(&mut current).map_err(|e| e.to_string())?;
+        Ok(current == original)
+    };
+    if !unchanged()? {
         return Err("文件已被外部修改或不支持编辑。草稿已保留，请重新读取文件后合并修改。".into());
     }
     let permissions = fs::metadata(&path)
@@ -363,16 +405,21 @@ fn save_text(root: &Path, path: &str, original: &str, text: &str) -> Result<(), 
             .create_new(true)
             .open(&temp)
             .map_err(|e| e.to_string())?;
-        file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        file.write_all(bytes).map_err(|e| e.to_string())?;
         fs::set_permissions(&temp, permissions).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
-        if read_preview(root, path.to_str().ok_or("文件路径编码无效")?)?
-            .text
-            .as_deref()
-            != Some(original)
-        {
+        if !unchanged()? {
             return Err("保存期间文件发生变化，草稿已保留".into());
+        }
+        // XLSX 转换不承诺保留图表等高级对象；原文件始终留一份可恢复的副本。
+        if limit == SHEET_LIMIT {
+            let backup = path.with_file_name(format!(".{}.nova-backup-{}.xlsx", path.file_stem().unwrap_or_default().to_string_lossy(), uuid::Uuid::new_v4()));
+            let mut backup_file = fs::OpenOptions::new().write(true).create_new(true).open(backup).map_err(|e| format!("备份失败，未覆盖原文件：{e}"))?;
+            backup_file.write_all(original).and_then(|_| backup_file.sync_all()).map_err(|e| format!("备份失败，未覆盖原文件：{e}"))?;
+            if !unchanged()? {
+                return Err("备份期间文件发生变化，草稿已保留".into());
+            }
         }
         // 同目录替换，不先删除原文件；写入/替换失败时原文件保持完整。
         fs::rename(&temp, &path).map_err(|e| format!("保存失败：{e}"))
@@ -427,6 +474,30 @@ pub async fn save_workspace_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spreadsheet_save_preserves_backup_and_rejects_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let old = b"PK\x03\x04original";
+        let new = b"PK\x03\x04edited";
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        fs::write(root.join("table.xlsx"), old).unwrap();
+        let preview = read_preview(root, "table.xlsx").unwrap();
+        assert_eq!(preview.data.as_deref(), Some(encode(old).as_str()));
+        assert!(preview.text.is_none());
+        save_text(root, "table.xlsx", &encode(old), &encode(new)).unwrap();
+        assert_eq!(fs::read(root.join("table.xlsx")).unwrap(), new);
+        let backups: Vec<_> = fs::read_dir(root).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("nova-backup")).collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(backups[0].path()).unwrap(), old);
+        assert!(save_text(root, "table.xlsx", &encode(old), &encode(new)).is_err());
+        assert!(save_text(root, "table.xlsx", &encode(new), "bad").is_err());
+        assert!(save_text(root, "table.xlsx", &encode(new), &encode(b"plain text")).is_err());
+        assert_eq!(fs::read(root.join("table.xlsx")).unwrap(), new);
+        let large = fs::File::create(root.join("large.xlsx")).unwrap();
+        large.set_len(SHEET_LIMIT + 1).unwrap();
+        assert!(read_preview(root, "large.xlsx").is_err());
+    }
     #[test]
     fn git_index_worktree_and_untracked_diffs() {
         let dir = std::env::temp_dir().join(format!("nova-git-preview-{}", uuid::Uuid::new_v4()));
@@ -492,6 +563,8 @@ mod tests {
         assert_eq!(read_preview(&root, "large.txt").unwrap().kind, "external");
         fs::write(root.join("binary"), [0, 1, 2]).unwrap();
         assert_eq!(read_preview(&root, "binary").unwrap().kind, "external");
+        fs::write(root.join("table.xlsx"), [0x50, 0x4B, 3, 4]).unwrap();
+        assert_eq!(read_preview(&root, "table.xlsx").unwrap().kind, "spreadsheet");
         assert!(resolve(&root, "..").is_err());
         assert!(read_preview(&root, "missing").is_err());
         save_text(&root, "readme.md", "# hello", "中文\r\n").unwrap();
@@ -511,7 +584,7 @@ mod tests {
             fs::read_to_string(root.join("readme.md")).unwrap(),
             "中文\r\n"
         );
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 4);
         fs::create_dir(root.join("nested")).unwrap();
         fs::write(root.join("nested/Result.md"), "ok").unwrap();
         fs::write(root.join(".gitignore"), "hidden-result.md\n").unwrap();

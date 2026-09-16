@@ -1,10 +1,10 @@
 .workspace-panel { position: relative; flex: 0 0 auto; max-width: 70%; min-width: 280px; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px; }
 .workspace-toolbar { display: flex; align-items: center; gap: 3px; padding: 3px 6px; min-height: 30px; flex-shrink: 0; border-bottom: 1px solid var(--border); }
-.workspace-panel button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; color: inherit; cursor: pointer; border-radius: 4px; min-height: 26px; padding: 3px 6px; background: transparent; border: 1px solid transparent; white-space: nowrap; }
-.workspace-panel button:hover, .workspace-panel button[aria-pressed=true] { background: var(--hover); border-color: var(--border); }
-.workspace-panel button:disabled { opacity: .4; cursor: default; }
-.workspace-panel button:focus-visible, .workspace-panel input:focus-visible, .workspace-editor:focus-visible { outline: 1px solid var(--accent, #6b9df5); outline-offset: -1px; }
-.workspace-panel input { min-width: 40px; width: 70px; flex: 1; background: var(--bg); color: inherit; border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; }
+.workspace-panel button:not(:where(.workspace-sheet-host *)) { display: inline-flex; align-items: center; justify-content: center; gap: 5px; color: inherit; cursor: pointer; border-radius: 4px; min-height: 26px; padding: 3px 6px; background: transparent; border: 1px solid transparent; white-space: nowrap; }
+.workspace-panel button:not(:where(.workspace-sheet-host *)):hover, .workspace-panel button:not(:where(.workspace-sheet-host *))[aria-pressed=true] { background: var(--hover); border-color: var(--border); }
+.workspace-panel button:not(:where(.workspace-sheet-host *)):disabled { opacity: .4; cursor: default; }
+.workspace-panel button:not(:where(.workspace-sheet-host *)):focus-visible, .workspace-panel input:not(:where(.workspace-sheet-host *)):focus-visible, .workspace-editor:focus-visible { outline: 1px solid var(--accent, #6b9df5); outline-offset: -1px; }
+.workspace-panel input:not(:where(.workspace-sheet-host *)) { min-width: 40px; width: 70px; flex: 1; background: var(--bg); color: inherit; border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; }
 .workspace-file > span:not(.workspace-type-icon) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-dirty { color: var(--accent, #6b9df5); }
 .workspace-panel .workspace-file { display: flex; justify-content: flex-start; text-align: left; width: 100%; min-height: 26px; padding: 3px 8px; }
@@ -55,7 +55,7 @@
 .workspace-actions > div > button { display: flex; width: 100%; justify-content: flex-start; }
 /* Explicit flex sizing prevents global button/span styles from wrapping the chevron. */
 .workspace-panel { font-size: 13px; background: color-mix(in srgb, var(--bg) 82%, transparent); }
-.workspace-panel button { font-size: 13px; line-height: 20px; }
+.workspace-panel button:not(:where(.workspace-sheet-host *)) { font-size: 13px; line-height: 20px; }
 .workspace-panel .workspace-breadcrumb { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; }
 .workspace-breadcrumb > svg { display: block; flex: 0 0 auto; }
 .workspace-breadcrumb > .workspace-breadcrumb-text { display: block; min-width: 0; flex: 1; text-align: left; }
@@ -78,6 +78,10 @@
 .workspace-minimap:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
 :root[data-theme="ink-light"] .workspace-code { --code-keyword: #8041ad; --code-string: #28703b; --code-number: #a04b12; --code-type: #147580; --code-function: #225ca5; }
 .workspace-preview:has(> .workspace-code) { display: flex; overflow: hidden; padding: 0; }
+.workspace-preview:has(> .workspace-sheet-host) { display: flex; overflow: hidden; padding: 0; }
+/* Univer 直接在 WebView 中渲染。 */
+.workspace-sheet-host { position: relative; isolation: isolate; flex: 1; min-width: 0; min-height: 0; overflow: hidden; color: #1f2329; background: white; }
+.workspace-sheet-host input { color: #1f2329; background: transparent; }
 .workspace-code .cm-editor { height: 100%; background: transparent; color: var(--text); }
 .workspace-code .cm-scroller { overflow-y: auto; overflow-x: hidden; font-family: var(--mono); font-size: 14px; line-height: 1.65; }
 .workspace-code.workspace-code-nowrap .cm-scroller { overflow-x: auto; }

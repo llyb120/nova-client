@@ -53,7 +53,7 @@ export const api = {
   searchWorkspaceFiles: (threadId: string, query: string) =>
     invoke<{ entries: { name: string; path: string; directory: boolean }[]; truncated: boolean }>("search_workspace_files", { threadId, query }),
   previewWorkspaceFile: (threadId: string, path: string) =>
-    invoke<{ path: string; kind: string; text: string | null; size: number }>("preview_workspace_file", { threadId, path }),
+    invoke<{ path: string; kind: string; text: string | null; size: number; data: string | null; sheet?: string }>("preview_workspace_file", { threadId, path }),
   saveWorkspaceFile: (threadId: string, path: string, original: string, text: string) =>
     invoke<void>("save_workspace_file", { threadId, path, original, text }),
   imageCommandContext: (configured: boolean, images: PromptImage[] = []) => invoke<{ configPath: string; models: string[]; referenceImages: string[] }>("image_command_context", { configured, images }),
