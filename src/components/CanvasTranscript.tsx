@@ -1561,7 +1561,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             py += 24;
           }
           if (open) for (const item of segment.items) {
-            py = layoutItem(item, result, gi, side, xOffset + 12, width - 12, width - 12, py, false);
+            // 摘要行已与正文左对齐（上面 -8），子项再叠 12 就深了一截；只留 4px，
+            // 让工具图标的墨迹落在摘要文字右侧 12px，和改版前的观感一致。
+            py = layoutItem(item, result, gi, side, xOffset + 4, width - 4, width - 4, py, false);
           }
           py += 4;
         }
