@@ -7952,19 +7952,16 @@ button:focus-visible {
   }
 }
 
-/* 手稿保持固定尺寸；大窗口露出更多底色，边缘渐隐避免图片边界。 */
+/* 手稿随视口铺满（cover 保比例、超出居中裁切）；源图 3840×2160，正常窗口只会缩小不会放大。
+   边缘渐隐避免图片边界；别再钉成固定尺寸，大窗口会只剩中间一小块手稿。 */
 .dawn-backdrop {
   display: none;
   position: fixed;
-  left: 50%;
-  top: 50%;
-  width: 1536px;
-  height: 864px;
-  transform: translate(-50%, -50%);
+  inset: 0;
   z-index: -1;
   pointer-events: none;
   background: linear-gradient(rgba(245, 247, 250, 0.3), rgba(245, 247, 250, 0.3)),
-    url("./assets/engineering-sketch.webp") center / 1536px 864px no-repeat;
+    url("./assets/engineering-sketch.webp") center / cover no-repeat;
   mask-image: linear-gradient(to right, transparent, #000 64px, #000 calc(100% - 64px), transparent),
     linear-gradient(to bottom, transparent, #000 64px, #000 calc(100% - 64px), transparent);
   mask-composite: intersect;
