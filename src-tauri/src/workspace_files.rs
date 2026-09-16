@@ -10,6 +10,20 @@ use tauri::{Emitter, State};
 
 const TEXT_LIMIT: u64 = 256 * 1024;
 const SHEET_LIMIT: u64 = 16 * 1024 * 1024;
+
+// 仅原生拖放事件可授予目录外文件访问；授权精确到文件，随应用退出清空。
+static DROPPED_FILES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+pub(crate) fn allow_dropped_files(paths: &[PathBuf]) {
+    if let Ok(mut allowed) = DROPPED_FILES.lock() {
+        for path in paths {
+            if let Ok(path) = path.canonicalize() {
+                if path.is_file() { allowed.insert(path); }
+            }
+        }
+    }
+}
 const ENTRY_LIMIT: usize = 500;
 
 #[derive(Serialize, Clone)]
@@ -143,7 +157,7 @@ pub(crate) fn root(state: &AppState, id: &str) -> Result<PathBuf, String> {
 pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let path = root.join(path).canonicalize().map_err(|e| e.to_string())?;
-    if !path.starts_with(&root) {
+    if !path.starts_with(&root) && (!path.is_file() || !DROPPED_FILES.lock().map_err(|e| e.to_string())?.contains(&path)) {
         return Err("只能操作当前工作目录内的文件".into());
     }
     Ok(path)
@@ -474,6 +488,24 @@ pub async fn save_workspace_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dropped_files_allow_only_explicit_files_outside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let file = external.path().join("dropped.txt");
+        let sibling = external.path().join("private.txt");
+        fs::write(&file, "original").unwrap();
+        fs::write(&sibling, "private").unwrap();
+        let path = file.to_str().unwrap();
+        assert!(read_preview(workspace.path(), path).is_err());
+        allow_dropped_files(&[file.clone(), external.path().to_path_buf()]);
+        assert_eq!(read_preview(workspace.path(), path).unwrap().text.as_deref(), Some("original"));
+        save_text(workspace.path(), path, "original", "edited").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "edited");
+        assert!(save_text(workspace.path(), path, "original", "stale").is_err());
+        assert!(read_preview(workspace.path(), sibling.to_str().unwrap()).is_err());
+        assert!(resolve(workspace.path(), external.path().to_str().unwrap()).is_err());
+    }
     #[test]
     fn spreadsheet_save_preserves_backup_and_rejects_conflicts() {
         let dir = tempfile::tempdir().unwrap();

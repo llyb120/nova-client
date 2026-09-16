@@ -4,7 +4,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import type { PromptImage } from "../types";
-import { isFileDropBlocked } from "../utils";
+import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
 import { IconFile, IconX } from "./icons";
 
 function fileToAttachment(f: File): Promise<PromptImage> {
@@ -134,6 +134,10 @@ export function createImageAttachments(
     try {
       void getCurrentWebview()
         .onDragDropEvent((event) => {
+          if (!options.dropIgnoresBlock && event.payload.type !== "leave" && workspaceFileDropTarget(event.payload.position)) {
+            setDragging(false);
+            return;
+          }
           if (isFileDropBlocked() && !options.dropIgnoresBlock) {
             if (event.payload.type === "drop" || event.payload.type === "leave") {
               setDragging(false);

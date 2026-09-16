@@ -1,4 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { batch, createEffect, createMemo, createSignal, ErrorBoundary, For, lazy, Match, onCleanup, onMount, Show, Suspense, Switch, untrack } from "solid-js";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
@@ -7,6 +8,7 @@ import WorkspaceCode from "./WorkspaceCode";
 import WorkspaceGit from "./WorkspaceGit";
 import { api } from "../ipc";
 import { state } from "../store";
+import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
 import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
 import { collectWorkspaceArtifacts } from "../workspaceArtifacts";
 import { absolutePath, createFileContextMenu } from "./FileContextMenu";
@@ -89,6 +91,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     onCleanup(() => { disposed = true; clearTimeout(timer); });
   });
   const [width, setWidth] = createSignal(480);
+  const [dragging, setDragging] = createSignal(false);
   const menu = createFileContextMenu();
   let request = 0;
   let frame = 0;
@@ -100,6 +103,28 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     catch (e) { setError(String(e)); return false; }
   };
   let picker!: HTMLDivElement;
+  onMount(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    try {
+      void getCurrentWebview().onDragDropEvent(event => {
+        const payload = event.payload;
+        const hit = payload.type !== 'leave' && !isFileDropBlocked() && !saving() && workspaceFileDropTarget(payload.position) === panel;
+        setDragging(hit && payload.type !== 'drop');
+        if (hit && payload.type === 'drop') {
+          setMode('files');
+          void (async () => {
+            for (const path of [...new Set(payload.paths)]) {
+              if (disposed) break;
+              await open(path);
+              if (error()) break;
+            }
+          })();
+        }
+      }).then(remove => { if (disposed) remove(); else unlisten = remove; }).catch(() => setDragging(false));
+    } catch { setDragging(false); }
+    onCleanup(() => { disposed = true; unlisten?.(); });
+  });
   onMount(() => {
     const restoreWidth = () => {
       const available = panel.parentElement!.clientWidth;
@@ -342,7 +367,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     if (tab) activate(tab);
     if (remembered.browse) setBrowse(true);
   }
-  return <aside ref={panel} class="workspace-panel" style={{ width: `${width()}px` }} aria-label="产物与项目文件"
+  return <aside ref={panel} class="workspace-panel" classList={{ 'is-dragging': dragging() }} style={{ width: `${width()}px` }} aria-label="产物与项目文件"
     onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
     <div class="workspace-resize" role="separator" aria-label="调整文件面板宽度" aria-orientation="vertical" tabindex="0"
       aria-valuenow={width()} onKeyDown={e => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); resize(width() + (e.key === "ArrowLeft" ? 24 : -24)); } }}

@@ -5924,6 +5924,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Nova 启动失败")
         .run(|app, event| {
+            if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }), .. }
+                | tauri::RunEvent::WebviewEvent { label, event: tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }), .. } = &event {
+                if label == "main" { workspace_files::allow_dropped_files(paths); }
+            }
             #[cfg(windows)]
             if let tauri::RunEvent::WindowEvent { label, event, .. } = &event {
                 if label == "main" {
