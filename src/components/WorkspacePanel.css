@@ -68,7 +68,6 @@
 .workspace-artifact-label { flex-shrink: 0; font-size: 12px; color: var(--text-muted); }
 .workspace-artifact-strip > div { display: flex; gap: 4px; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
 .workspace-artifact-strip button { flex-shrink: 0; max-width: 180px; }
-.workspace-artifact-strip button > span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .workspace-artifact-empty { color: var(--text-muted); font-size: 12px; }
 .workspace-code { display: flex; flex: 1; min-height: 0; min-width: 0; overflow: hidden; --code-keyword: #c792ea; --code-string: #a3ce91; --code-number: #e6b17e; --code-type: #78c6d0; --code-function: #8bb9ef; }
 .workspace-code-editor { flex: 1; min-width: 0; min-height: 0; }
@@ -99,11 +98,11 @@
 .workspace-modes > button { flex: 1; min-height: 32px; font-weight: 600; color: var(--text-muted); border-radius: 6px; }
 .workspace-panel .workspace-modes > button[aria-pressed=true] { color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, var(--bg)); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); box-shadow: inset 0 -2px var(--accent); }
 .workspace-modes > .workspace-panel-close { flex: 0 0 26px; min-height: 26px; padding: 2px; }
-.workspace-artifact-strip { align-items: stretch; flex-direction: column; max-height: 30%; overflow: auto; padding: 6px; }
+.workspace-artifact-strip { align-items: stretch; flex-direction: column; max-height: 30%; overflow-y: auto; overflow-x: hidden; padding: 6px; }
 .workspace-artifact-strip > div { flex-direction: column; overflow: visible; }
-.workspace-artifact-strip button { max-width: none; justify-content: flex-start; }
+.workspace-artifact-strip button { max-width: none; min-width: 0; justify-content: flex-start; }
 .workspace-artifact-strip input { width: 100%; flex: none; box-sizing: border-box; }
-.workspace-artifact-strip button > span { white-space: nowrap; }
+.workspace-artifact-strip button > span:not(.workspace-type-icon) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .workspace-artifact-strip small { margin-left: auto; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .workspace-git-files { flex-shrink: 0; max-height: 32%; overflow: auto; border-bottom: 1px solid var(--border); }
 .workspace-git-files summary { padding: 6px 10px; cursor: pointer; color: var(--text-muted); }
