@@ -1473,8 +1473,8 @@ async fn control_session(
     result
 }
 
-fn current_context(root: &Path) -> Result<(&'static AppHandle, String), String> {
-    let app = APP.get().ok_or("webview 仅在 Nova 桌面应用内可用")?;
+pub(crate) fn current_context(root: &Path) -> Result<(&'static AppHandle, String), String> {
+    let app = APP.get().ok_or("电脑/网页工具仅在 Nova 桌面应用内可用")?;
     let state = app.state::<AppState>();
     let thread_id = state
         .active_thread
@@ -1494,7 +1494,7 @@ fn current_context(root: &Path) -> Result<(&'static AppHandle, String), String> 
         .zip(std::fs::canonicalize(&cwd).ok())
         .is_none_or(|(a, b)| a != b)
     {
-        return Err("工具工作目录与前台会话不同，请切到对应会话后使用浏览器".into());
+        return Err("工具工作目录与前台会话不同，请切到对应会话后使用电脑/网页工具".into());
     }
     Ok((app, thread_id))
 }

@@ -1,0 +1,585 @@
+//! 剑来: native desktop input and screenshot observations. No browser automation.
+use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::{
+    path::Path,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+use xcap::{Monitor, Window};
+
+type Result<T> = std::result::Result<T, String>;
+fn err(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+// ponytail: one desktop, one outstanding observation and a global try-lock; use a desktop broker if independent seats are needed.
+static DESKTOP: Mutex<Option<Snapshot>> = Mutex::new(None);
+
+pub(crate) fn tool_definition() -> Value {
+    serde_json::from_str(include_str!("../../scripts/jianlai-tool.json")).unwrap()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Surface {
+    id: u32,
+    pid: Option<u32>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+#[derive(Clone)]
+struct Shot {
+    image_id: String,
+    surface: Surface,
+    pixels: (u32, u32),
+}
+struct Snapshot {
+    id: String,
+    owner: String,
+    taken: Instant,
+    window: Option<u32>,
+    foreground: Option<(u32, u32)>,
+    shots: Vec<Shot>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Request {
+    operation: String,
+    window_id: Option<u32>,
+    snapshot_id: Option<String>,
+    image_id: Option<String>,
+    feedback: Option<String>,
+    actions: Option<Vec<Action>>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Action {
+    action: String,
+    x: Option<i32>,
+    y: Option<i32>,
+    to_x: Option<i32>,
+    to_y: Option<i32>,
+    button: Option<String>,
+    text: Option<String>,
+    key: Option<String>,
+    delta: Option<i32>,
+    axis: Option<String>,
+    ms: Option<u64>,
+}
+
+fn window_surface(w: &Window) -> Result<Surface> {
+    Ok(Surface {
+        id: w.id().map_err(err)?,
+        pid: Some(w.pid().map_err(err)?),
+        x: w.x().map_err(err)?,
+        y: w.y().map_err(err)?,
+        width: w.width().map_err(err)?,
+        height: w.height().map_err(err)?,
+    })
+}
+fn monitor_surface(m: &Monitor) -> Result<Surface> {
+    // XCap exposes Linux monitor geometry in logical coordinates; X11 input uses physical pixels.
+    let scale = if cfg!(target_os = "linux") {
+        m.scale_factor().map_err(err)? as f64
+    } else {
+        1.0
+    };
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("无效屏幕缩放比例".into());
+    }
+    Ok(Surface {
+        id: m.id().map_err(err)?,
+        pid: None,
+        x: (m.x().map_err(err)? as f64 * scale).round() as i32,
+        y: (m.y().map_err(err)? as f64 * scale).round() as i32,
+        width: (m.width().map_err(err)? as f64 * scale).round() as u32,
+        height: (m.height().map_err(err)? as f64 * scale).round() as u32,
+    })
+}
+fn window(id: u32) -> Result<Window> {
+    Window::all()
+        .map_err(err)?
+        .into_iter()
+        .find(|w| w.id().ok() == Some(id))
+        .ok_or_else(|| "程序窗口已关闭，请重新 windows".into())
+}
+fn foreground() -> Result<Option<(u32, u32)>> {
+    for w in Window::all().map_err(err)? {
+        if w.is_focused().map_err(err)? {
+            return Ok(Some((w.id().map_err(err)?, w.pid().map_err(err)?)));
+        }
+    }
+    Ok(None)
+}
+fn windows() -> Result<Value> {
+    let mut rows = Vec::new();
+    for w in Window::all().map_err(err)? {
+        rows.push(
+            json!({"windowId":w.id().map_err(err)?,"pid":w.pid().map_err(err)?,
+            "app":w.app_name().map_err(err)?,"title":w.title().map_err(err)?,
+            "focused":w.is_focused().map_err(err)?,"minimized":w.is_minimized().map_err(err)?}),
+        );
+    }
+    Ok(json!({"windows":rows}))
+}
+fn capture(owner: &str, window_id: Option<u32>, state: &mut Option<Snapshot>) -> Result<Value> {
+    *state = None;
+    let id = uuid::Uuid::new_v4().to_string();
+    let folder = crate::lyra::config::nova_root().join("desktop-shots");
+    std::fs::create_dir_all(&folder).map_err(err)?;
+    let before = foreground()?;
+    let mut shots = Vec::new();
+    let mut images = Vec::new();
+    let mut save = |surface: Surface, image: xcap::image::RgbaImage| -> Result<()> {
+        if surface.width == 0 || surface.height == 0 || image.width() == 0 || image.height() == 0 {
+            return Err("截图范围为空".into());
+        }
+        let image_id = format!(
+            "{}-{}",
+            if window_id.is_some() {
+                "window"
+            } else {
+                "monitor"
+            },
+            surface.id
+        );
+        let path = folder.join(format!("{id}-{image_id}.png"));
+        image.save(&path).map_err(err)?;
+        images.push(json!({"imageId":image_id,"path":path,"width":image.width(),"height":image.height(),
+            "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}}));
+        shots.push(Shot {
+            image_id,
+            surface,
+            pixels: image.dimensions(),
+        });
+        Ok(())
+    };
+    if let Some(wid) = window_id {
+        let w = window(wid)?;
+        if w.is_minimized().map_err(err)? {
+            return Err("窗口已最小化，请先通过桌面恢复窗口".into());
+        }
+        let surface = window_surface(&w)?;
+        let image = w.capture_image().map_err(err)?;
+        if window_surface(&w)? != surface {
+            return Err("截图期间窗口移动，请重新截图".into());
+        }
+        save(surface, image)?;
+    } else {
+        let monitors = Monitor::all().map_err(err)?;
+        if monitors.is_empty() || monitors.len() > 16 {
+            return Err("需要1至16个可截图显示器".into());
+        }
+        for m in monitors {
+            save(monitor_surface(&m)?, m.capture_image().map_err(err)?)?;
+        }
+    }
+    if foreground()? != before {
+        return Err("截图期间焦点改变，请重新截图".into());
+    }
+    *state = Some(Snapshot {
+        id: id.clone(),
+        owner: owner.into(),
+        taken: Instant::now(),
+        window: window_id,
+        foreground: before,
+        shots,
+    });
+    Ok(
+        json!({"snapshotId":id,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000}),
+    )
+}
+
+fn point(shot: &Shot, x: Option<i32>, y: Option<i32>) -> Result<(i32, i32)> {
+    let (x, y) = (x.ok_or("缺少x坐标")?, y.ok_or("缺少y坐标")?);
+    let (pw, ph) = shot.pixels;
+    if x < 0 || y < 0 || x as u32 >= pw || y as u32 >= ph || pw == 0 || ph == 0 {
+        return Err("坐标超出原始截图范围".into());
+    }
+    let s = &shot.surface;
+    let px = s.x as i64 + x as i64 * s.width as i64 / pw as i64;
+    let py = s.y as i64 + y as i64 * s.height as i64 / ph as i64;
+    Ok((
+        i32::try_from(px).map_err(err)?,
+        i32::try_from(py).map_err(err)?,
+    ))
+}
+fn keys(raw: &str) -> Result<Vec<Key>> {
+    let keys = raw
+        .split('+')
+        .map(|s| match s.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => Ok(Key::Control),
+            "alt" | "option" => Ok(Key::Alt),
+            "shift" => Ok(Key::Shift),
+            "meta" | "super" | "cmd" | "win" => Ok(Key::Meta),
+            "enter" | "return" => Ok(Key::Return),
+            "tab" => Ok(Key::Tab),
+            "escape" | "esc" => Ok(Key::Escape),
+            "space" => Ok(Key::Space),
+            "backspace" => Ok(Key::Backspace),
+            "delete" => Ok(Key::Delete),
+            "left" => Ok(Key::LeftArrow),
+            "right" => Ok(Key::RightArrow),
+            "up" => Ok(Key::UpArrow),
+            "down" => Ok(Key::DownArrow),
+            "home" => Ok(Key::Home),
+            "end" => Ok(Key::End),
+            "pageup" => Ok(Key::PageUp),
+            "pagedown" => Ok(Key::PageDown),
+            "f1" => Ok(Key::F1),
+            "f2" => Ok(Key::F2),
+            "f3" => Ok(Key::F3),
+            "f4" => Ok(Key::F4),
+            "f5" => Ok(Key::F5),
+            "f6" => Ok(Key::F6),
+            "f7" => Ok(Key::F7),
+            "f8" => Ok(Key::F8),
+            "f9" => Ok(Key::F9),
+            "f10" => Ok(Key::F10),
+            "f11" => Ok(Key::F11),
+            "f12" => Ok(Key::F12),
+            _ if s.chars().count() == 1 => Ok(Key::Unicode(s.chars().next().unwrap())),
+            _ => Err(format!("不支持的按键：{s}")),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if keys.len() > 4 {
+        return Err("组合键最多4键".into());
+    }
+    Ok(keys)
+}
+fn validate(a: &Action, shot: &Shot) -> Result<()> {
+    if !matches!(
+        a.action.as_str(),
+        "click" | "double_click" | "move" | "drag" | "type" | "press" | "scroll" | "wait"
+    ) {
+        return Err("未知剑来动作".into());
+    }
+    if a.button
+        .as_deref()
+        .is_some_and(|b| !matches!(b, "left" | "right" | "middle"))
+        || a.axis
+            .as_deref()
+            .is_some_and(|v| !matches!(v, "vertical" | "horizontal"))
+        || a.ms.unwrap_or(0) > 2000
+    {
+        return Err("无效按钮、滚动轴或等待时间".into());
+    }
+    if matches!(
+        a.action.as_str(),
+        "click" | "double_click" | "move" | "drag" | "scroll"
+    ) {
+        point(shot, a.x, a.y)?;
+    }
+    if a.action == "drag" {
+        point(shot, a.to_x, a.to_y)?;
+    }
+    if a.action == "press" {
+        keys(a.key.as_deref().ok_or("press 缺少key")?)?;
+    }
+    if a.action == "type" {
+        let text = a.text.as_deref().ok_or("type 缺少text")?;
+        if text.chars().count() > 10000 || text.contains('\0') {
+            return Err("文本过长或含NUL".into());
+        }
+    }
+    if a.action == "scroll" && !(-100..=100).contains(&a.delta.ok_or("scroll 缺少delta")?) {
+        return Err("滚动刻度必须在-100至100之间".into());
+    }
+    Ok(())
+}
+fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
+    if snap.taken.elapsed() > Duration::from_secs(180) {
+        return Err("截图已过期".into());
+    }
+    if foreground()? != snap.foreground {
+        return Err("前台程序已改变，请重新截图".into());
+    }
+    if let Some(id) = snap.window {
+        let w = window(id)?;
+        if !w.is_focused().map_err(err)?
+            || w.is_minimized().map_err(err)?
+            || window_surface(&w)? != shot.surface
+        {
+            return Err("目标窗口失焦、移动或尺寸改变，请重新截图".into());
+        }
+        // Reject an overlapping higher window before coordinate input; window screenshots may include occluded content.
+        if a.x.is_some() {
+            let p = point(shot, a.x, a.y)?;
+            let end = if a.action == "drag" {
+                point(shot, a.to_x, a.to_y)?
+            } else {
+                p
+            };
+            for other in Window::all().map_err(err)? {
+                if other.id().map_err(err)? == id {
+                    break;
+                }
+                if other.is_minimized().map_err(err)? {
+                    continue;
+                }
+                let r = window_surface(&other)?;
+                if [p, end].iter().any(|&(x, y)| {
+                    x as i64 >= r.x as i64
+                        && y as i64 >= r.y as i64
+                        && (x as i64) < r.x as i64 + r.width as i64
+                        && (y as i64) < r.y as i64 + r.height as i64
+                }) {
+                    return Err("目标坐标被其它窗口遮挡，请使用桌面截图".into());
+                }
+            }
+        }
+    } else {
+        let monitors = Monitor::all().map_err(err)?;
+        let current = monitors
+            .iter()
+            .map(monitor_surface)
+            .collect::<Result<Vec<_>>>()?;
+        if current.len() != snap.shots.len()
+            || snap.shots.iter().any(|s| !current.contains(&s.surface))
+        {
+            return Err("显示器布局已改变，请重新截图".into());
+        }
+    }
+    Ok(())
+}
+fn input(enigo: &mut Enigo, shot: &Shot, a: &Action) -> Result<()> {
+    let button = match a.button.as_deref() {
+        Some("right") => Button::Right,
+        Some("middle") => Button::Middle,
+        _ => Button::Left,
+    };
+    if matches!(
+        a.action.as_str(),
+        "click" | "double_click" | "move" | "drag" | "scroll"
+    ) {
+        let (x, y) = point(shot, a.x, a.y)?;
+        enigo.move_mouse(x, y, Coordinate::Abs).map_err(err)?;
+    }
+    match a.action.as_str() {
+        "click" => enigo.button(button, Direction::Click).map_err(err)?,
+        "double_click" => {
+            enigo.button(button, Direction::Click).map_err(err)?;
+            std::thread::sleep(Duration::from_millis(70));
+            enigo.button(button, Direction::Click).map_err(err)?;
+        }
+        "drag" => {
+            let (x, y) = point(shot, a.x, a.y)?;
+            let (tx, ty) = point(shot, a.to_x, a.to_y)?;
+            enigo.button(button, Direction::Press).map_err(err)?;
+            let moved = (1..=12).try_for_each(|i| {
+                enigo
+                    .move_mouse(
+                        (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
+                        (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
+                        Coordinate::Abs,
+                    )
+                    .map_err(err)?;
+                std::thread::sleep(Duration::from_millis(16));
+                Ok::<_, String>(())
+            });
+            let released = enigo.button(button, Direction::Release).map_err(err);
+            moved?;
+            released?;
+        }
+        "type" => enigo.text(a.text.as_deref().unwrap()).map_err(err)?,
+        "press" => {
+            let keys = keys(a.key.as_deref().unwrap())?;
+            let pressed = keys
+                .iter()
+                .try_for_each(|k| enigo.key(*k, Direction::Press).map_err(err));
+            let mut release_error = None;
+            for k in keys.iter().rev() {
+                if let Err(e) = enigo.key(*k, Direction::Release) {
+                    release_error = Some(err(e));
+                }
+            }
+            pressed?;
+            if let Some(e) = release_error {
+                return Err(e);
+            }
+        }
+        "scroll" => enigo
+            .scroll(
+                a.delta.unwrap(),
+                if a.axis.as_deref() == Some("horizontal") {
+                    Axis::Horizontal
+                } else {
+                    Axis::Vertical
+                },
+            )
+            .map_err(err)?,
+        "wait" => std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))),
+        "move" => (),
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn run(owner: String, args: Value) -> Result<Value> {
+    let request: Request = serde_json::from_value(args).map_err(err)?;
+    if request
+        .feedback
+        .as_deref()
+        .is_some_and(|s| !matches!(s, "screenshot" | "none"))
+    {
+        return Err("无效feedback".into());
+    }
+    let mut state = DESKTOP
+        .try_lock()
+        .map_err(|_| "剑来正在操作桌面，请勿并行调用")?;
+    match request.operation.as_str() {
+        "windows" => windows(),
+        "screenshot" => capture(&owner, request.window_id, &mut state),
+        "act" => {
+            if cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                return Err(
+                    "剑来 Linux 输入当前仅支持 X11；Wayland 不会静默使用 XWayland 操作".into(),
+                );
+            }
+            let snap = state.as_ref().ok_or("请先截图")?;
+            if snap.owner != owner
+                || Some(&snap.id) != request.snapshot_id.as_ref()
+                || snap.taken.elapsed() > Duration::from_secs(180)
+            {
+                return Err("快照无效或已过期，请重新截图；不能重放动作".into());
+            }
+            if request.window_id.is_some() && request.window_id != snap.window {
+                return Err("windowId与截图不符".into());
+            }
+            let shot = snap
+                .shots
+                .iter()
+                .find(|s| Some(&s.image_id) == request.image_id.as_ref())
+                .cloned()
+                .ok_or("imageId不属于此截图")?;
+            let actions = request.actions.ok_or("缺少actions")?;
+            if actions.is_empty() || actions.len() > 8 {
+                return Err("每次需要1至8个动作".into());
+            }
+            for a in &actions {
+                validate(a, &shot)?;
+            }
+            check_target(snap, &shot, &actions[0])?;
+            let mut enigo = Enigo::new(&Settings::default()).map_err(err)?;
+            // Consume before the first OS event; all later failures are explicitly non-retryable.
+            let mut snap = state.take().unwrap();
+            let mut completed = 0;
+            let mut failure = None;
+            for a in &actions {
+                let result =
+                    check_target(&snap, &shot, a).and_then(|_| input(&mut enigo, &shot, a));
+                if let Err(e) = result {
+                    failure = Some(e);
+                    break;
+                }
+                completed += 1;
+                std::thread::sleep(Duration::from_millis(80));
+                match foreground() {
+                    Ok(f) => snap.foreground = f,
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            let mut result = json!({"status":if failure.is_some(){"needs_review"}else{"executed"},"completedActions":completed,"error":failure});
+            if request.feedback.as_deref() != Some("none") {
+                match capture(&owner, snap.window, &mut state) {
+                    Ok(observation) => result
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(observation.as_object().unwrap().clone()),
+                    Err(e) => {
+                        result["observationError"] = json!(e);
+                    }
+                }
+            }
+            Ok(result)
+        }
+        _ => Err("未知剑来操作".into()),
+    }
+}
+pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value> {
+    let (_, owner) = crate::native_browser::current_context(root)?;
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || run(owner, args))
+        .await
+        .map_err(err)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn coordinates_keys_and_validation() {
+        let shot = Shot {
+            image_id: "test".into(),
+            surface: Surface {
+                id: 1,
+                pid: None,
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            pixels: (3840, 2160),
+        };
+        assert_eq!(point(&shot, Some(1920), Some(1080)).unwrap(), (-960, 540));
+        assert!(point(&shot, Some(3840), Some(0)).is_err());
+        assert!(point(&shot, Some(-1), Some(0)).is_err());
+        assert!(point(&shot, None, Some(0)).is_err());
+        assert_eq!(keys("Ctrl+Shift+S").unwrap().len(), 3);
+        assert!(keys("Ctrl+unknown").is_err());
+        assert!(keys("Ctrl+Shift+Alt+Meta+S").is_err());
+        for value in [
+            json!({"action":"scroll","x":1,"y":1,"delta":101}),
+            json!({"action":"wait","ms":2001}),
+            json!({"action":"drag","x":1,"y":1}),
+        ] {
+            assert!(validate(&serde_json::from_value(value).unwrap(), &shot).is_err());
+        }
+    }
+    // Opt-in real desktop smoke test: captures and moves only the pointer; never clicks/types into user applications.
+    #[test]
+    #[ignore]
+    fn desktop_smoke() {
+        let shot = run("test".into(), json!({"operation":"screenshot"})).unwrap();
+        assert!(!shot["images"].as_array().unwrap().is_empty());
+        let args = json!({"operation":"act","snapshotId":shot["snapshotId"],"imageId":shot["images"][0]["imageId"],"actions":[{"action":"move","x":10,"y":10}]});
+        let result = run("test".into(), args.clone()).unwrap();
+        assert_eq!(result["status"], "executed");
+        assert!(!result["images"].as_array().unwrap().is_empty());
+        assert!(run("test".into(), args).is_err());
+        if let Ok(id) = std::env::var("NOVA_JIANLAI_TEST_WINDOW") {
+            // Only target an explicitly supplied disposable test window; never type into an arbitrary desktop app.
+            let id: u32 = id.parse().unwrap();
+            let frame = run(
+                "test".into(),
+                json!({"operation":"screenshot","windowId":id}),
+            )
+            .unwrap();
+            let input = run(
+                "test".into(),
+                json!({"operation":"act","snapshotId":frame["snapshotId"],
+                "imageId":frame["images"][0]["imageId"],"actions":[{"action":"click","x":40,"y":40},
+                    {"action":"type","text":"jianlai"},{"action":"press","key":"Enter"}]}),
+            )
+            .unwrap();
+            assert_eq!(input["status"], "executed", "{input}");
+            assert_eq!(input["completedActions"], 3);
+            assert!(input["images"].as_array().is_some());
+            for result in [frame, input] {
+                for img in result["images"].as_array().unwrap() {
+                    let _ = std::fs::remove_file(img["path"].as_str().unwrap());
+                }
+            }
+        }
+        for result in [shot, result] {
+            for img in result["images"].as_array().unwrap() {
+                let _ = std::fs::remove_file(img["path"].as_str().unwrap());
+            }
+        }
+    }
+}

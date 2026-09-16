@@ -63,7 +63,7 @@ export async function callGlobalContextTool(method, root, params) {
     try {
       return await requestOnce(config, method, root, requestParams);
     } catch (error) {
-      if (["generate_image", "edit_image", "webview", "chrome"].includes(method)) throw error;
+      if (["generate_image", "edit_image", "webview", "chrome", "jianlai"].includes(method)) throw error;
       const code = error?.code;
       if (Date.now() >= deadline || !["ENOENT", "ECONNREFUSED", "EPIPE"].includes(code)) throw error;
       await wait(CONNECT_RETRY_MS);

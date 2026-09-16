@@ -4629,7 +4629,7 @@ mod codebuddy_acp_tests {
         assert!(env
             .iter()
             .any(|item| { item["name"] == "NOVA_FAST_CONTEXT" && item["value"] == "0" }));
-        assert_eq!(server["_meta"]["tools"]["webview"]["defer_loading"], false);
+        assert_eq!(server["_meta"]["tools"]["jianlai"]["defer_loading"], false);
     }
 
     #[test]
@@ -4945,6 +4945,7 @@ fn codebuddy_nova_tools_mcp_server_value(
         meta["tools"]["edit_image"] = json!({ "defer_loading": false });
         meta["tools"]["webview"] = json!({ "defer_loading": false });
         meta["tools"]["chrome"] = json!({ "defer_loading": false });
+        meta["tools"]["jianlai"] = json!({ "defer_loading": false });
     }
     json!({
         "name": "nova-tools",

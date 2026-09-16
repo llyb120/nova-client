@@ -92,10 +92,10 @@ fn tool_result_images(message: &Value, model: &ResolvedModel) -> Vec<Value> {
         .filter(|part| part.get("type").and_then(Value::as_str) == Some("image"))
         .cloned()
         .collect();
-    if let Some(path) = message
-        .pointer("/details/imagePath")
-        .and_then(Value::as_str)
-    {
+    let paths = message.pointer("/details/images").and_then(Value::as_array)
+        .into_iter().flatten().filter_map(|image| image["path"].as_str())
+        .chain(message.pointer("/details/imagePath").and_then(Value::as_str));
+    for path in paths.take(16) {
         if let Ok(data) = std::fs::read(path) {
             images.push(json!({
                 "type": "image",

@@ -141,6 +141,9 @@ fn dispatch(
     if request.method == "webview" {
         return tauri::async_runtime::block_on(crate::native_browser::execute(root, &params));
     }
+    if request.method == "jianlai" {
+        return tauri::async_runtime::block_on(crate::jianlai::execute(root, &params));
+    }
     if request.method == "chrome" {
         return tauri::async_runtime::block_on(crate::native_browser::execute_chrome(root, &params));
     }

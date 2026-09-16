@@ -482,6 +482,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目",
         ),
         Some("- read: 读取单个文件"),
+        (!read_only).then_some("- jianlai（剑来）: 通过真实鼠标键盘操作电脑，支持程序窗口或整个桌面截图"),
         if read_only {
             None
         } else {

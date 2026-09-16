@@ -5,7 +5,7 @@ export async function webviewMcpResult(text) {
   const content = [{ type: 'text', text }];
   let result;
   try { result = JSON.parse(text); } catch { return { content }; }
-  for (const image of (result.images ?? []).slice(0, 4)) {
+  for (const image of (result.images ?? []).slice(0, 16)) {
     try {
       const data = await readFile(image.path);
       content.push({ type: 'image', mimeType: 'image/png', data: data.toString('base64') });

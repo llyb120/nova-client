@@ -1,5 +1,6 @@
 mod acp;
 mod agent_config;
+mod jianlai;
 mod cli_manager;
 mod clipboard;
 mod clues;

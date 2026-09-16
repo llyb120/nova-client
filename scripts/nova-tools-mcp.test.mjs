@@ -39,6 +39,8 @@ test('webview sends native MCP images without putting base64 in text; failures p
     assert.match(result.content[2].text,/图片加载失败/);
     assert.equal(JSON.parse(result.content[0].text).status,'executed');
     assert.deepEqual(await webviewMcpResult('not ready'),{content:[{type:'text',text:'not ready'}]});
+    const desktop = await webviewMcpResult(JSON.stringify({images:Array.from({length:16},(_,i)=>({path,imageId:`monitor-${i}`}))}));
+    assert.equal(desktop.content.filter(part=>part.type==='image').length,16);
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
 
@@ -53,7 +55,7 @@ test("createNovaBatchTools exposes context tools only with the native service", 
     if (previousToken !== undefined) process.env.NOVA_CONTEXT_SERVICE_TOKEN = previousToken;
   }
   const tools = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }));
-  assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "polaris", "webview"]);
+  assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "jianlai", "polaris", "webview"]);
 });
 
 test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
@@ -61,7 +63,7 @@ test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
   process.env.NOVA_FAST_CONTEXT = "0";
   try {
     const tools = withContextService(() => createNovaBatchTools(process.cwd()));
-    assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "webview"]);
+    assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "jianlai", "webview"]);
     assert.deepEqual(withContextService(() => createNovaBatchTools(process.cwd(), { readOnly: true })), {});
   }
   finally {
@@ -120,7 +122,7 @@ test("directory switching is session scoped, works without polaris, and updates 
       if (!line.includes("\n")) return;
       const request = JSON.parse(line.trim());
       calls.push(request);
-      if (request.params.prompt === "lost response" || ["webview", "chrome"].includes(request.method)) { socket.destroy(); return; }
+      if (request.params.prompt === "lost response" || ["webview", "chrome", "jianlai"].includes(request.method)) { socket.destroy(); return; }
       const rejected = request.params.path === "missing";
       socket.end(JSON.stringify(rejected
         ? { ok: false, error: "directory missing" }
@@ -163,6 +165,11 @@ test("directory switching is session scoped, works without polaris, and updates 
     assert.equal(calls.length, before + 3, "Chrome mutations must not retry a lost response");
     assert.equal(calls.at(-1).method, "chrome");
     assert.deepEqual(calls.at(-1).params, chromeArgs);
+    const desktopArgs = {operation:'act',snapshotId:'test-snapshot',imageId:'monitor-1',actions:[{action:'press',key:'Enter'}]};
+    await assert.rejects(tools.jianlai.execute(desktopArgs));
+    assert.equal(calls.length,before+4,'desktop input must never retry a lost response');
+    assert.equal(calls.at(-1).method,'jianlai');
+    assert.deepEqual(calls.at(-1).params,desktopArgs);
   } finally {
     for (const key of ["NOVA_CONTEXT_SERVICE_ENDPOINT", "NOVA_CONTEXT_SERVICE_TOKEN", "NOVA_CWD_CHANGE_SCOPE"]) {
       if (previous[key] === undefined) delete process.env[key];
