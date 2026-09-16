@@ -3374,6 +3374,12 @@ impl AcpManager {
             // ponytail: ACP has no system-prompt setter; repeat rules per turn so resumed
             // sessions and setting changes work. Use session-level instructions if ACP adds them.
             guidance.push(crate::codex_app_server::rtk_guidance());
+            let state = self.app.state::<AppState>();
+            let read_only = state.store.lock().unwrap().get(thread_id)
+                .and_then(|t| t.mode.as_deref()).map(unify_mode_id).as_deref() == Some("plan");
+            if !read_only && !state.context_service.endpoint().is_empty() {
+                guidance.push(direct_desktop_guidance().into());
+            }
             if self.app.state::<AppState>().settings.lock().unwrap().ponytail_enabled {
                 guidance.push(crate::lyra::PONYTAIL_RULES.to_string());
             }
@@ -3393,7 +3399,9 @@ impl AcpManager {
                 };
                 (context_tools, read_only)
             };
-            guidance.push(nova_tools_prompt_guidance(context_tools, read_only));
+            if self.kind == AgentKind::Devin {
+                guidance.push(nova_tools_prompt_guidance(context_tools, read_only));
+            }
         }
         // CodeBuddy 的工作目录契约逐轮附在用户文本末尾。其 CLI 会把同一条 ACP
         // prompt 中最后一个 text block 当成最新指令；若 guidance 放在最前面，模型可能
@@ -5222,7 +5230,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
     if polaris {
         tool_names.extend(["polaris"]);
     }
-    if !read_only { tool_names.extend(["generate_image", "edit_image"]); }
+    if !read_only { tool_names.extend(["generate_image", "edit_image", "webview", "chrome", "jianlai"]); }
     if tool_names.is_empty() {
         let mut lines = vec![
             "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."
@@ -5264,10 +5272,38 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
             "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.".into()
         },
     ];
+    if !read_only {
+        lines.push("Desktop routing: 剑来 means the jianlai desktop mouse/keyboard/screenshot tool, not a shell command. When the user requests 剑来/jianlai, start with mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"jianlai\",\"arguments\":{\"operation\":\"windows\"}}, then inspect the target window and follow the tool schema. Do not substitute shell/config-file searches for the requested desktop interaction. If the endpoint is missing, report the MCP error rather than silently switching methods. webview controls Nova's sidebar browser; chrome controls the user's Chrome.".into());
+    }
     if read_only {
         lines.push("Current mode is plan/read-only: analyze only; do not modify files.".into());
     }
     lines.join("\n")
+}
+
+fn direct_desktop_guidance() -> &'static str {
+    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、webview（侧栏浏览器）、chrome（用户Chrome）。用户指定剑来时，直接调用工具列表中来自 nova-tools 的 jianlai，先 operation=windows 再截图；不要用 shell/配置文件搜索替代。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
+}
+
+#[cfg(test)]
+mod desktop_prompt_tests {
+    #[test]
+    fn devin_discovers_desktop_tools_without_polaris() {
+        assert!(super::direct_desktop_guidance().contains("直接调用"));
+        assert!(super::direct_desktop_guidance().contains("jianlai"));
+        let source = include_str!("acp.rs").replace("\r\n", "\n");
+        assert!(source.contains("if self.kind == AgentKind::Devin {\n                guidance.push(nova_tools_prompt_guidance"));
+        for polaris in [true, false] {
+            let prompt = super::nova_tools_prompt_guidance(polaris, false);
+            for tool in ["jianlai", "chrome", "webview"] {
+                assert!(prompt.contains(tool));
+                assert!(!super::nova_tools_prompt_guidance(polaris, true).contains(tool));
+            }
+            assert!(prompt.contains("剑来"));
+            assert!(prompt.contains(r#""tool_name":"jianlai""#));
+            assert!(prompt.contains(r#""operation":"windows""#));
+        }
+    }
 }
 
 #[cfg(windows)]

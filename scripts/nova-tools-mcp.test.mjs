@@ -101,6 +101,33 @@ test("CodeBuddy direct mode describes polaris as a direct tool", () => {
   }
 });
 
+test("desktop optimizations are shared by custom tools and MCP, not Lyra-only", async () => {
+  const { jianlai } = withContextService(() => createNovaBatchTools(process.cwd()));
+  assert(jianlai.inputSchema.properties.operation.enum.includes('recall'));
+  assert.equal(jianlai.inputSchema.properties.actions.items.properties.ms.maximum, 2000);
+  assert.match(jianlai.description, /notes/);
+  assert.match(jianlai.description, /先.*触发测试/);
+  const dir = await mkdtemp(join(tmpdir(), 'nova-desktop-mcp-'));
+  try {
+    const path = join(dir, 'shot.png');
+    await writeFile(path, Buffer.from('PNG'));
+    const result = await webviewMcpResult(JSON.stringify({ source: 'jianlai', status: 'not_executed',
+      error: '前台程序已改变', snapshotId: 'new', notes: '已读第1页，测速未确认',
+      images: [{ path }] }));
+    const text = JSON.parse(result.content[0].text);
+    assert.equal(text.status, 'not_executed');
+    assert.equal(text.snapshotId, 'new');
+    assert.equal(text.notes, '已读第1页，测速未确认');
+    assert.equal(text.imageHistoryPolicy, undefined);
+    assert(!jianlai.description.includes('最近2次'));
+    assert.equal(text.images[0].path, path);
+    assert.equal(result.content[1].type, 'image');
+    assert.equal(text.deliveredImageBytes, 3);
+    assert(text.deliveryTimingsMs.total >= 0);
+    assert(!result.content[0].text.includes('UE5H'));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("devin policy routes context through MCP when the native service exists", () => {
   const policy = withContextService(() => novaDevinBatchToolPolicy({ fastContext: true }));
   assert.match(policy, /mcp_call_tool/);

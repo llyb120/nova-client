@@ -30,6 +30,7 @@ fn available_tools() -> Vec<Value> {
         tools.extend(crate::image_generation::tool_definitions());
         tools.push(crate::native_browser::tool_definition());
         tools.push(crate::chrome_browser::tool_definition());
+        tools.push(crate::jianlai::tool_definition());
     }
     tools
 }
@@ -128,6 +129,26 @@ async fn call(config: Config, name: &str, args: Value) -> Result<Value, String> 
     .map_err(|_| format!("{name} request timed out; do not automatically repeat image requests"))?
 }
 
+#[cfg(test)]
+mod desktop_tests {
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn desktop_results_include_all_monitor_images_and_status() {
+        let path = std::env::temp_dir().join(format!("nova-mcp-desktop-{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"PNG").unwrap();
+        let value = json!({"status":"not_executed","images":vec![json!({"path":path}); 16]});
+        let result = super::tool_result("jianlai", Ok(value)).await;
+        assert_eq!(result["content"].as_array().unwrap().len(), 17);
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("not_executed"));
+        assert_eq!(result["content"][1]["type"], "image");
+        if std::env::var("NOVA_TOOLS_READ_ONLY").as_deref() != Ok("1") {
+            assert!(super::available_tools().iter().any(|t| t["name"] == "jianlai"));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 fn response(id: Value, result: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"result":result})
 }
@@ -142,11 +163,11 @@ async fn tool_result(name: &str, result: Result<Value, String>) -> Value {
     };
     let text = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
     let mut content = vec![json!({"type":"text","text":text})];
-    if matches!(name, "webview" | "chrome") {
+    if matches!(name, "webview" | "chrome" | "jianlai") {
         use base64::Engine;
         if let Some(images) = value["images"].as_array() {
             // Paths originate from the authenticated native service, not the caller or page text.
-            for image in images.iter().take(4) {
+            for image in images.iter().take(if name == "jianlai" { 16 } else { 4 }) {
                 if let Some(path) = image["path"].as_str() {
                     match tokio::fs::read(path).await {
                         Ok(data) => content.push(json!({"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(data)})),

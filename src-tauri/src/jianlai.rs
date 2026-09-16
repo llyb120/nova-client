@@ -40,6 +40,7 @@ struct Snapshot {
     owner: String,
     taken: Instant,
     window: Option<u32>,
+    max_edge: u32,
     foreground: Option<(u32, u32)>,
     shots: Vec<Shot>,
 }
@@ -52,6 +53,9 @@ struct Request {
     image_id: Option<String>,
     feedback: Option<String>,
     actions: Option<Vec<Action>>,
+    max_edge: Option<u32>,
+    image_path: Option<String>,
+    notes: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -124,10 +128,21 @@ fn windows() -> Result<Value> {
     }
     Ok(json!({"windows":rows}))
 }
-fn capture(owner: &str, window_id: Option<u32>, state: &mut Option<Snapshot>) -> Result<Value> {
+fn shot_folder(owner: &str) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    owner.hash(&mut hash);
+    crate::lyra::config::nova_root().join("desktop-shots").join(format!("{:016x}", hash.finish()))
+}
+
+fn capture(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Option<Snapshot>) -> Result<Value> {
+    let started = Instant::now();
+    let mut capture_ms = 0;
+    let mut resize_ms = 0;
+    let mut encode_ms = 0;
     *state = None;
     let id = uuid::Uuid::new_v4().to_string();
-    let folder = crate::lyra::config::nova_root().join("desktop-shots");
+    let folder = shot_folder(owner);
     std::fs::create_dir_all(&folder).map_err(err)?;
     let before = foreground()?;
     let mut shots = Vec::new();
@@ -145,9 +160,22 @@ fn capture(owner: &str, window_id: Option<u32>, state: &mut Option<Snapshot>) ->
             },
             surface.id
         );
+        let original_pixels = image.dimensions();
+        let resize_started = Instant::now();
+        let image = if max_edge > 0 && image.width().max(image.height()) > max_edge {
+            let scale = max_edge as f64 / image.width().max(image.height()) as f64;
+            xcap::image::imageops::resize(&image,
+                (image.width() as f64 * scale).round().max(1.0) as u32,
+                (image.height() as f64 * scale).round().max(1.0) as u32,
+                xcap::image::imageops::FilterType::Triangle)
+        } else { image };
+        resize_ms += resize_started.elapsed().as_millis();
         let path = folder.join(format!("{id}-{image_id}.png"));
+        let encode_started = Instant::now();
         image.save(&path).map_err(err)?;
+        encode_ms += encode_started.elapsed().as_millis();
         images.push(json!({"imageId":image_id,"path":path,"width":image.width(),"height":image.height(),
+            "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
             "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}}));
         shots.push(Shot {
             image_id,
@@ -162,7 +190,9 @@ fn capture(owner: &str, window_id: Option<u32>, state: &mut Option<Snapshot>) ->
             return Err("窗口已最小化，请先通过桌面恢复窗口".into());
         }
         let surface = window_surface(&w)?;
+        let capture_started = Instant::now();
         let image = w.capture_image().map_err(err)?;
+        capture_ms += capture_started.elapsed().as_millis();
         if window_surface(&w)? != surface {
             return Err("截图期间窗口移动，请重新截图".into());
         }
@@ -173,7 +203,11 @@ fn capture(owner: &str, window_id: Option<u32>, state: &mut Option<Snapshot>) ->
             return Err("需要1至16个可截图显示器".into());
         }
         for m in monitors {
-            save(monitor_surface(&m)?, m.capture_image().map_err(err)?)?;
+            let surface = monitor_surface(&m)?;
+            let capture_started = Instant::now();
+            let image = m.capture_image().map_err(err)?;
+            capture_ms += capture_started.elapsed().as_millis();
+            save(surface, image)?;
         }
     }
     if foreground()? != before {
@@ -184,11 +218,16 @@ fn capture(owner: &str, window_id: Option<u32>, state: &mut Option<Snapshot>) ->
         owner: owner.into(),
         taken: Instant::now(),
         window: window_id,
+        max_edge,
         foreground: before,
         shots,
     });
     Ok(
-        json!({"snapshotId":id,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000}),
+        json!({"snapshotId":id,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,
+            "foreground":before,"maxEdge":max_edge,
+            "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
+                "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
+                "total":started.elapsed().as_millis()}}),
     )
 }
 
@@ -262,9 +301,11 @@ fn validate(a: &Action, shot: &Shot) -> Result<()> {
         || a.axis
             .as_deref()
             .is_some_and(|v| !matches!(v, "vertical" | "horizontal"))
-        || a.ms.unwrap_or(0) > 2000
     {
-        return Err("无效按钮、滚动轴或等待时间".into());
+        return Err("button仅允许left/right/middle；axis仅允许vertical/horizontal".into());
+    }
+    if a.ms.unwrap_or(0) > 2000 {
+        return Err(format!("ms={}，允许范围为 0–2000", a.ms.unwrap()));
     }
     if matches!(
         a.action.as_str(),
@@ -418,7 +459,36 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action) -> Result<()> {
 }
 
 fn run(owner: String, args: Value) -> Result<Value> {
-    let request: Request = serde_json::from_value(args).map_err(err)?;
+    let is_act = args["operation"] == "act";
+    let notes = args.get("notes").cloned();
+    let result = run_inner(owner, args);
+    let mut result = match result {
+        Err(e) if is_act => json!({"status":"not_executed","completedActions":0,
+            "error":format!("{e}；本批次尚未执行")}),
+        other => other?,
+    };
+    result["source"] = json!("jianlai");
+    if let Some(notes) = notes.filter(|v| v.as_str().is_some_and(|s| s.chars().count() <= 12000)) {
+        result["notes"] = notes;
+    }
+    Ok(result)
+}
+
+fn run_inner(owner: String, args: Value) -> Result<Value> {
+    let is_act = args["operation"] == "act";
+    let request: Request = match serde_json::from_value(args) {
+        Ok(request) => request,
+        Err(e) if is_act => return Ok(json!({"status":"not_executed","completedActions":0,
+            "error":format!("参数无效：{e}；本批次尚未执行")})),
+        Err(e) => return Err(err(e)),
+    };
+    let max_edge = request.max_edge.unwrap_or(1600);
+    if max_edge != 0 && !(640..=3840).contains(&max_edge) {
+        return Err("maxEdge允许0（原分辨率）或640–3840；本批次尚未执行".into());
+    }
+    if request.notes.as_ref().is_some_and(|s| s.chars().count() > 12000) {
+        return Err("notes最多12000字符；本批次尚未执行".into());
+    }
     if request
         .feedback
         .as_deref()
@@ -431,7 +501,20 @@ fn run(owner: String, args: Value) -> Result<Value> {
         .map_err(|_| "剑来正在操作桌面，请勿并行调用")?;
     match request.operation.as_str() {
         "windows" => windows(),
-        "screenshot" => capture(&owner, request.window_id, &mut state),
+        "screenshot" => {
+            let mut result = capture(&owner, request.window_id, max_edge, &mut state)?;
+            result["notes"] = json!(request.notes);
+            Ok(result)
+        }
+        "recall" => {
+            let path = std::fs::canonicalize(request.image_path.ok_or("recall缺少imagePath")?).map_err(err)?;
+            let folder = std::fs::canonicalize(shot_folder(&owner)).map_err(err)?;
+            if !path.starts_with(folder) || path.extension().and_then(|s| s.to_str()) != Some("png") {
+                return Err("只能回看本会话的桌面截图".into());
+            }
+            Ok(json!({"images":[{"path":path}],"historical":true,
+                "notice":"历史截图仅供阅读，不产生可操作快照；操作前请使用当前截图"}))
+        }
         "act" => {
             if cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some() {
                 return Err(
@@ -441,7 +524,6 @@ fn run(owner: String, args: Value) -> Result<Value> {
             let snap = state.as_ref().ok_or("请先截图")?;
             if snap.owner != owner
                 || Some(&snap.id) != request.snapshot_id.as_ref()
-                || snap.taken.elapsed() > Duration::from_secs(180)
             {
                 return Err("快照无效或已过期，请重新截图；不能重放动作".into());
             }
@@ -458,19 +540,32 @@ fn run(owner: String, args: Value) -> Result<Value> {
             if actions.is_empty() || actions.len() > 8 {
                 return Err("每次需要1至8个动作".into());
             }
-            for a in &actions {
-                validate(a, &shot)?;
+            for (index, a) in actions.iter().enumerate() {
+                if let Err(e) = validate(a, &shot) {
+                    return Ok(json!({"status":"not_executed","completedActions":0,
+                        "error":format!("actions[{index}].{e}；本批次尚未执行")}));
+                }
             }
-            check_target(snap, &shot, &actions[0])?;
+            let max_edge = request.max_edge.unwrap_or(snap.max_edge);
+            if let Err(e) = check_target(snap, &shot, &actions[0]) {
+                let window_id = snap.window;
+                let mut result = json!({"status":"not_executed","completedActions":0,"error":e});
+                observe(&owner, window_id, max_edge, &mut state, &mut result);
+                return Ok(result);
+            }
             let mut enigo = Enigo::new(&Settings::default()).map_err(err)?;
             // Consume before the first OS event; all later failures are explicitly non-retryable.
             let mut snap = state.take().unwrap();
             let mut completed = 0;
             let mut failure = None;
+            let mut attempted = false;
             for a in &actions {
-                let result =
-                    check_target(&snap, &shot, a).and_then(|_| input(&mut enigo, &shot, a));
-                if let Err(e) = result {
+                if let Err(e) = check_target(&snap, &shot, a) {
+                    failure = Some(e);
+                    break;
+                }
+                attempted = true;
+                if let Err(e) = input(&mut enigo, &shot, a) {
                     failure = Some(e);
                     break;
                 }
@@ -484,23 +579,28 @@ fn run(owner: String, args: Value) -> Result<Value> {
                     }
                 }
             }
-            let mut result = json!({"status":if failure.is_some(){"needs_review"}else{"executed"},"completedActions":completed,"error":failure});
-            if request.feedback.as_deref() != Some("none") {
-                match capture(&owner, snap.window, &mut state) {
-                    Ok(observation) => result
-                        .as_object_mut()
-                        .unwrap()
-                        .extend(observation.as_object().unwrap().clone()),
-                    Err(e) => {
-                        result["observationError"] = json!(e);
-                    }
-                }
+            let mut result = json!({"status":if failure.is_some(){if attempted {"needs_review"} else {"not_executed"}}else{"executed"},"completedActions":completed,"error":failure,"notes":request.notes});
+            if failure.is_some() || request.feedback.as_deref() != Some("none") {
+                observe(&owner, snap.window, max_edge, &mut state, &mut result);
             }
             Ok(result)
         }
         _ => Err("未知剑来操作".into()),
     }
 }
+// Observation never retries input. A closed/minimized window falls back to the desktop.
+fn observe(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Option<Snapshot>, result: &mut Value) {
+    let observation = capture(owner, window_id, max_edge, state).or_else(|e| {
+        if window_id.is_none() { return Err(e); }
+        result["windowObservationError"] = json!(e);
+        capture(owner, None, max_edge, state)
+    });
+    match observation {
+        Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
+        Err(e) => result["observationError"] = json!(e),
+    }
+}
+
 pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value> {
     let (_, owner) = crate::native_browser::current_context(root)?;
     let args = args.clone();
@@ -530,6 +630,12 @@ mod tests {
         assert!(point(&shot, Some(3840), Some(0)).is_err());
         assert!(point(&shot, Some(-1), Some(0)).is_err());
         assert!(point(&shot, None, Some(0)).is_err());
+        let scaled = Shot { pixels: (960, 540), ..shot.clone() };
+        assert_eq!(point(&scaled, Some(480), Some(270)).unwrap(), (-960, 540));
+        assert_eq!(point(&scaled, Some(959), Some(539)).unwrap(), (-2, 1078));
+        let wait: Action = serde_json::from_value(json!({"action":"wait","ms":8000})).unwrap();
+        assert_eq!(validate(&wait, &shot).unwrap_err(), "ms=8000，允许范围为 0–2000");
+        assert!(validate(&serde_json::from_value(json!({"action":"wait","ms":2000})).unwrap(), &shot).is_ok());
         assert_eq!(keys("Ctrl+Shift+S").unwrap().len(), 3);
         assert!(keys("Ctrl+unknown").is_err());
         assert!(keys("Ctrl+Shift+Alt+Meta+S").is_err());
@@ -541,6 +647,22 @@ mod tests {
             assert!(validate(&serde_json::from_value(value).unwrap(), &shot).is_err());
         }
     }
+    #[test]
+    fn invalid_wait_rejects_whole_batch_before_input() {
+        let shot = Shot { image_id:"monitor-1".into(),
+            surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100) };
+        *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
+            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot]});
+        let result = run("validation".into(), json!({"operation":"act","snapshotId":"validation",
+            "imageId":"monitor-1","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":8000}]})).unwrap();
+        assert_eq!(result["status"], "not_executed");
+        assert_eq!(result["completedActions"], 0);
+        assert!(result["error"].as_str().unwrap().contains("actions[1].ms=8000"));
+        assert!(DESKTOP.lock().unwrap().take().is_some());
+        let invalid = run("validation".into(), json!({"operation":"act","actions":[{"action":"wait","ms":-1}]})).unwrap();
+        assert_eq!(invalid["status"], "not_executed");
+    }
+
     // Opt-in real desktop smoke test: captures and moves only the pointer; never clicks/types into user applications.
     #[test]
     #[ignore]
@@ -551,7 +673,16 @@ mod tests {
         let result = run("test".into(), args.clone()).unwrap();
         assert_eq!(result["status"], "executed");
         assert!(!result["images"].as_array().unwrap().is_empty());
-        assert!(run("test".into(), args).is_err());
+        assert_eq!(run("test".into(), args).unwrap()["status"], "not_executed");
+        // Simulate a stale foreground identity without actually changing the user's focus.
+        DESKTOP.lock().unwrap().as_mut().unwrap().foreground = Some((u32::MAX, u32::MAX));
+        let recovered = run("test".into(), json!({"operation":"act","snapshotId":result["snapshotId"],
+            "imageId":result["images"][0]["imageId"],"feedback":"none",
+            "actions":[{"action":"move","x":10,"y":10}]})).unwrap();
+        assert_eq!(recovered["status"], "not_executed");
+        assert_eq!(recovered["completedActions"], 0);
+        assert_ne!(recovered["snapshotId"], result["snapshotId"]);
+        assert!(!recovered["images"].as_array().unwrap().is_empty());
         if let Ok(id) = std::env::var("NOVA_JIANLAI_TEST_WINDOW") {
             // Only target an explicitly supplied disposable test window; never type into an arbitrary desktop app.
             let id: u32 = id.parse().unwrap();
@@ -576,7 +707,7 @@ mod tests {
                 }
             }
         }
-        for result in [shot, result] {
+        for result in [shot, result, recovered] {
             for img in result["images"].as_array().unwrap() {
                 let _ = std::fs::remove_file(img["path"].as_str().unwrap());
             }
