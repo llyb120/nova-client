@@ -3,7 +3,7 @@
 use crate::lyra::config::Resolved;
 use crate::lyra::prompt::ShellConfig;
 use crate::lyra::provider::{stream_chat, StreamEvent};
-use crate::lyra::tools::{execute, BrowserTools, Tool, ToolOutcome};
+use crate::lyra::tools::{execute, Tool, ToolOutcome};
 use crate::lyra::watchdog::{arm_idle_watchdog, DiagnosticLog, IdleWatchdog};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -73,7 +73,6 @@ pub struct Agent {
     pub session_id: String,
     pub archive_dir: Option<PathBuf>,
     pub shell: Option<ShellConfig>,
-    pub browser: Option<BrowserTools>,
     pub cancelled: Arc<AtomicBool>,
     pub steering: Arc<Mutex<VecDeque<Value>>>,
     /// 投机缓存：本条消息内工具调用序号 → 预执行句柄（每条消息流开始前清空）。
@@ -172,7 +171,6 @@ fn maybe_speculate(spec: &SpecContext, index: usize, name: &str, fragment: &str)
             &call_id,
             // 投机句柄随缓存失效显式中止，不随会话取消标志提前退出：
             // 无副作用只读工具，跑完即可供命中。
-            None,
             None,
         )
         .await
@@ -424,7 +422,6 @@ impl Agent {
                 .collect();
             if !tool_calls.is_empty() {
                 self.execute_tools(tool_calls, on_event).await;
-                // feedback_memory 已暂时禁用，闭环提醒不再注入。
                 // Reasonix：每个模型/工具回合后、下一次 provider 请求前维护上下文。
                 mid_turn(&mut self.messages, &message);
                 // 中途压缩/rebase 改写了消息，同步一次中断轨迹。
@@ -556,7 +553,6 @@ impl Agent {
                             self.archive_dir.as_deref(),
                             &call.id,
                             Some(&self.cancelled),
-                            self.browser.as_ref(),
                         ))
                     }
                     None => Box::pin(execute(
@@ -567,7 +563,6 @@ impl Agent {
                         self.archive_dir.as_deref(),
                         &call.id,
                         Some(&self.cancelled),
-                        self.browser.as_ref(),
                     )),
                 }
             })

@@ -31,12 +31,6 @@ const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
 /// session/prompt 发出后允许「零通知」的最长静默；超过即判定连接假死（见 prompt_with_stall_guard）。
 const PROMPT_FIRST_RESPONSE_STALL: Duration = Duration::from_secs(90);
 
-/// ACP 后端（Devin / CodeBuddy）支持 `/browser` 进入持续浏览器调试模式；
-/// 工具通过注入 nova-tools MCP 提供。
-fn acp_supports_browser_debug(kind: &AgentKind) -> bool {
-    matches!(kind, AgentKind::Devin | AgentKind::CodeBuddy)
-}
-
 /// 模型探测、命令探测和标题生成共用的辅助连接。
 const SHARED_KEY: &str = "__shared__";
 const CODEBUDDY_ACP_ARGS: [&str; 3] = ["--acp", "--acp-transport", "stdio"];
@@ -2271,10 +2265,6 @@ impl AcpManager {
                 None => return,
             }
         };
-        // 大熊座训练/演进会话静默完成，不弹系统通知。
-        if title.starts_with("经验训练") || title.starts_with("世代演进") {
-            return;
-        }
         let body = match stop_reason {
             "end_turn" | "max_turn_requests" => "任务已完成，点击查看结果",
             "cancelled" | "force_cancelled" => "任务已停止",
@@ -3172,37 +3162,6 @@ impl AcpManager {
             }
             ctx
         };
-        // `/browser` 进入持续浏览器调试模式：本轮起 nova-tools MCP 附带 browser 工具，
-        // 模式跨轮次保留直到 /browser-exit。
-        let browser_command =
-            acp_supports_browser_debug(&self.kind) && crate::lyra::is_browser_command(&text);
-        let browser_exit_command =
-            acp_supports_browser_debug(&self.kind) && crate::lyra::is_browser_exit_command(&text);
-        if browser_command || browser_exit_command {
-            let state = self.app.state::<AppState>();
-            let mut store = state.store.lock().unwrap();
-            if let Some(thread) = store.get_mut(&thread_id) {
-                thread.browser_debug_mode = browser_command;
-            }
-            store.save_thread(&thread_id);
-            let _ = self.app.emit(EV_THREADS, json!({}));
-        }
-        // Browser 准备与 CodeBuddy/Devin 的连接、session 创建并行，避免首次工具调用再串行
-        // 安装运行时、启动录制进程和等待执行端口。
-        if browser_command {
-            let app = self.app.clone();
-            tauri::async_runtime::spawn(async move {
-                let bridge = crate::browser::ensure_mcp_bridge(&app);
-                let recorder = crate::browser::ensure_exec_port(&app);
-                let (bridge_result, recorder_result) = tokio::join!(bridge, recorder);
-                if let Err(error) = bridge_result {
-                    eprintln!("[browser] 启动 MCP 中转失败：{error}");
-                }
-                if let Err(error) = recorder_result {
-                    eprintln!("[browser] 预热 Playwright 失败：{error}");
-                }
-            });
-        }
         // 1. 本地先落用户消息
         let mut title_job: Option<(String, String)> = None;
         {
@@ -3242,13 +3201,6 @@ impl AcpManager {
             store.get(&thread_id).map(|t| t.items.len()).unwrap_or(0)
         };
 
-        let text = if acp_supports_browser_debug(&self.kind) {
-            crate::lyra::expand_browser_command(&text)
-                .or_else(|| crate::lyra::expand_browser_exit_command(&text))
-                .unwrap_or(text)
-        } else {
-            text
-        };
         let mut cwd_changes = self
             .app
             .state::<AppState>()
@@ -3579,32 +3531,6 @@ impl AcpManager {
         self.mark_plan_interrupted(&thread_id, "interrupted", false);
         self.emit_proposed_plan(&thread_id, None);
         let _ = self.app.emit(EV_THREADS, json!({}));
-        // 浏览器调试模式下，引导消息同样要带模式上下文。
-        let text = if acp_supports_browser_debug(&self.kind) {
-            let browser_debug_mode = {
-                let state = self.app.state::<AppState>();
-                let store = state.store.lock().unwrap();
-                store
-                    .get(&thread_id)
-                    .map(|thread| thread.browser_debug_mode)
-                    .unwrap_or(false)
-            };
-            let expanded = crate::lyra::expand_browser_command(&text)
-                .or_else(|| crate::lyra::expand_browser_exit_command(&text))
-                .unwrap_or(text);
-            if browser_debug_mode
-                && !crate::lyra::is_browser_command(&expanded)
-                && !crate::lyra::is_browser_exit_command(&expanded)
-            {
-                format!(
-                    "{expanded}\n\n（当前处于浏览器调试模式，可使用 browser 工具打开页面、查看 Console/错误并截图联合作业。）"
-                )
-            } else {
-                expanded
-            }
-        } else {
-            text
-        };
         let prompt = self.build_user_prompt_blocks(&thread_id, &text, &images, false);
         let codebuddy = self.kind == AgentKind::CodeBuddy;
         let mgr = self.clone();
@@ -4199,7 +4125,7 @@ impl AcpManager {
     }
 
     /// session/new 与 session/load 携带的 MCP server 列表。
-    /// Devin 靠进程启动目录的本地 MCP 配置；CodeBuddy 按 ACP mcpServers 注入 polaris / browser。
+    /// Devin 靠进程启动目录的本地 MCP 配置；CodeBuddy 按 ACP mcpServers 注入 Nova 工具。
     fn session_mcp_servers(
         &self,
         cwd: &str,
@@ -4210,13 +4136,6 @@ impl AcpManager {
             return Ok(json!([]));
         }
         let state = self.app.state::<AppState>();
-        let browser_debug = {
-            let store = state.store.lock().unwrap();
-            store
-                .get(thread_id)
-                .map(|thread| thread.browser_debug_mode)
-                .unwrap_or(false)
-        };
         let context_mode = {
             let settings = state.settings.lock().unwrap();
             settings.context_retrieval_mode.as_str().to_string()
@@ -4224,10 +4143,7 @@ impl AcpManager {
         let auto_change_project = self.kind == AgentKind::CodeBuddy
             && state.settings.lock().unwrap().auto_change_project_enabled
             && !state.context_service.endpoint().is_empty();
-        // browser 和目录切换均独立于上下文检索开关。
-        if !browser_debug
-            && !auto_change_project
-            && state.context_service.endpoint().is_empty()
+        if !auto_change_project && state.context_service.endpoint().is_empty()
         {
             return Ok(json!([]));
         }
@@ -4238,8 +4154,6 @@ impl AcpManager {
             read_only,
             state.context_service.endpoint(),
             state.context_service.token(),
-            browser_debug,
-            &state.config_dir,
         )?;
         if auto_change_project {
             server["env"].as_array_mut().unwrap().push(json!({
@@ -4249,9 +4163,8 @@ impl AcpManager {
                 json!({ "defer_loading": false });
         }
         self.push_log(format!(
-            "[nova] {} 已为 {cwd} 注入 nova-tools{}",
-            self.kind.label(),
-            if browser_debug { "/browser" } else { "" }
+            "[nova] {} 已为 {cwd} 注入 nova-tools",
+            self.kind.label()
         ));
         Ok(json!([server]))
     }
@@ -4675,8 +4588,6 @@ mod codebuddy_acp_tests {
             true,
             "http://127.0.0.1:1234",
             "secret",
-            false,
-            std::path::Path::new("C:/nova-config"),
         );
         assert_eq!(server["name"], "nova-tools");
         assert_eq!(server["command"], "C:/node.exe");
@@ -4704,7 +4615,7 @@ mod codebuddy_acp_tests {
     }
 
     #[test]
-    fn browser_only_server_does_not_reenable_disabled_context_tools() {
+    fn desktop_tools_do_not_reenable_disabled_context_tools() {
         let server = codebuddy_nova_tools_mcp_server_value(
             "C:/node.exe",
             "C:/nova-tools.mjs",
@@ -4713,14 +4624,12 @@ mod codebuddy_acp_tests {
             false,
             "http://127.0.0.1:1234",
             "secret",
-            true,
-            std::path::Path::new("C:/nova-config"),
         );
         let env = server["env"].as_array().unwrap();
         assert!(env
             .iter()
             .any(|item| { item["name"] == "NOVA_FAST_CONTEXT" && item["value"] == "0" }));
-        assert!(env.iter().any(|item| item["name"] == "NOVA_BROWSER_DEBUG"));
+        assert_eq!(server["_meta"]["tools"]["webview"]["defer_loading"], false);
     }
 
     #[test]
@@ -4991,8 +4900,6 @@ fn codebuddy_nova_tools_mcp_server(
     read_only: bool,
     context_endpoint: &str,
     context_token: &str,
-    browser_debug: bool,
-    config_dir: &std::path::Path,
 ) -> Result<Value, String> {
     let script = materialize_nova_tools_mcp(app)?;
     let node = resolve_program_on_path("node")
@@ -5005,8 +4912,6 @@ fn codebuddy_nova_tools_mcp_server(
         read_only,
         context_endpoint,
         context_token,
-        browser_debug,
-        config_dir,
     ))
 }
 
@@ -5018,8 +4923,6 @@ fn codebuddy_nova_tools_mcp_server_value(
     read_only: bool,
     context_endpoint: &str,
     context_token: &str,
-    browser_debug: bool,
-    config_dir: &std::path::Path,
 ) -> Value {
     let mut env = vec![
         json!({ "name": "NOVA_TOOLS_CWD", "value": cwd }),
@@ -5032,25 +4935,11 @@ fn codebuddy_nova_tools_mcp_server_value(
     if read_only {
         env.push(json!({ "name": "NOVA_TOOLS_READ_ONLY", "value": "1" }));
     }
-    if browser_debug {
-        env.push(json!({ "name": "NOVA_BROWSER_DEBUG", "value": "1" }));
-        env.push(json!({
-            "name": "NOVA_BROWSER_MCP_PORT_FILE",
-            "value": crate::browser::mcp_port_file(config_dir).to_string_lossy(),
-        }));
-    }
     // CodeBuddy 从 `_meta` 读取 defer_loading / tools（见 AcpUtils.convertAcpMcpServersToDynamic），
     // 顶层同名字段会被丢弃，工具就退回内置默认（MCP 工具默认延迟加载，走 ToolSearch/Defer 检索）。
-    // 服务器级 + 工具级都显式置 false，确保 polaris / browser 作为顶层工具直接进模型工具列表。
+    // 服务器级 + 工具级都显式置 false，确保 Nova 工具直接进模型工具列表。
     let mut meta = json!({ "defer_loading": false });
-    if browser_debug {
-        meta["tools"] = json!({
-            "polaris": { "defer_loading": false },
-            "browser": { "defer_loading": false },
-        });
-    } else {
-        meta["tools"] = json!({ "polaris": { "defer_loading": false } });
-    }
+    meta["tools"] = json!({ "polaris": { "defer_loading": false } });
     if !read_only {
         meta["tools"]["generate_image"] = json!({ "defer_loading": false });
         meta["tools"]["edit_image"] = json!({ "defer_loading": false });

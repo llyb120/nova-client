@@ -133,16 +133,12 @@ export interface ThreadMeta {
   worktree?: Worktree | null;
   /** 兼容旧版本训练记录，仅用于保持历史隔离。 */
   experienceThread?: boolean;
-  /** 双子座浏览器执行会话：仅在双子座历史展示 */
-  browserThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** 普通 /stage 引用的源会话；用于导航显示 Stage 自己的会话名。 */
   stageSourceThreadId?: string | null;
   /** 当前会话在证据链中的线索位置 */
   activeClueCardId?: string | null;
-  /** 已进入 Lyra Playwright 前端调试模式 */
-  browserDebugMode?: boolean;
 }
 
 /** 用户随 prompt 带上的附件。图片可带 base64，普通文件走 file:// resource_link。 */
@@ -293,15 +289,11 @@ export interface Thread {
   worktree?: Worktree | null;
   /** 兼容旧版本训练记录，仅用于保持历史隔离。 */
   experienceThread?: boolean;
-  /** 双子座浏览器执行会话：仅在双子座历史展示 */
-  browserThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** Stage 会话动态引用的源会话。 */
   stageSourceThreadId?: string | null;
   activeClueCardId?: string | null;
-  /** 已进入 Lyra Playwright 前端调试模式 */
-  browserDebugMode?: boolean;
   clueContext?: ClueContextSnapshot | null;
   createdAt: number;
   updatedAt: number;

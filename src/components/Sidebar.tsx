@@ -27,7 +27,6 @@ import {
   IconCheck,
   IconChevron,
   IconClue,
-  IconBrowser,
   IconDownload,
   IconFolder,
   IconGear,
@@ -99,17 +98,15 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "browser" | "virgo") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "virgo") => {
     setView(view);
     closeThread();
   };
   const openHome = () => openNewSession();
   const openClues = () => switchView("clues");
   const openWorkflows = () => switchView("workflows");
-  const openBrowser = () => switchView("browser");
   const openVirgo = () => switchView("virgo");
 
-  const isBrowserView = () => state.view === "browser";
   // 减少焦虑（高级设置开启）：运行中的任务链移入室女座，普通模式不再显示，结束后自动移回。
   // 未开启时室女座仍是手动收纳位：快捷键收起的会话放在这里，tab 随收纳内容出现/隐藏。
   const zenMode = () => !!state.settings?.zenModeEnabled;
@@ -143,7 +140,7 @@ export function Sidebar(props: {
   const threadOf = (id: string) => state.threads.find((item) => item.id === id);
   const openHistoryThread = async (id: string) => {
     const thread = state.threads.find((item) => item.id === id);
-    setView(thread?.browserThread ? "browser" : thread && zenMode() && inRunningChain(thread) ? "virgo" : "home");
+    setView(thread && zenMode() && inRunningChain(thread) ? "virgo" : "home");
     // 打开时若链上仍有其它阶段未读，仅消费一条未读（聚合徽标 -1）；本 stage 自身清零。
     if (state.unreadTurns[id] && chainUnreadTurns(threadOf(id)) > 1) {
       setUnreadTurns(id, Math.max((state.unreadTurns[id] ?? 1) - 1, 0));
@@ -176,11 +173,9 @@ export function Sidebar(props: {
   };
 
   const currentGroups = createMemo(() => {
-    const threads = isBrowserView()
-        ? state.threads.filter((t) => t.browserThread)
-        : isVirgoView()
-          ? state.threads.filter((t) => !t.experienceThread && !t.browserThread && inRunningChain(t))
-          : state.threads.filter((t) => !t.experienceThread && !t.browserThread && !inRunningChain(t));
+    const threads = isVirgoView()
+        ? state.threads.filter((t) => !t.experienceThread && inRunningChain(t))
+        : state.threads.filter((t) => !t.experienceThread && !inRunningChain(t));
     return groupByCwd(threads);
   });
 
@@ -225,7 +220,7 @@ export function Sidebar(props: {
     rows.sort((a, b) => b.chainUpdatedAt - a.chainUpdatedAt);
     return rows;
   };
-  const showHistoryByTime = () => isBrowserView() || state.settings?.historyDisplayMode === "time";
+  const showHistoryByTime = () => state.settings?.historyDisplayMode === "time";
   const timeRows = createMemo(() => {
     const effectiveUpdatedAt = (row: ThreadTreeRow) =>
       row.chainUpdatedAt ?? Math.max(row.thread.updatedAt, row.mergedChild?.updatedAt ?? 0);
@@ -688,15 +683,6 @@ export function Sidebar(props: {
                 </Show>
               </button>
             </Show>
-            <button
-              class="mode-seg-btn"
-              classList={{ active: state.view === "browser" }}
-              onClick={openBrowser}
-              title="内嵌浏览器：录制操作、框选标记并编排为 Playwright 计划"
-            >
-              <IconBrowser size={14} />
-              双子座
-            </button>
           </div>
 
         </div>
@@ -709,9 +695,7 @@ export function Sidebar(props: {
             <div class="thread-empty">
               {isVirgoView()
                   ? "没有正在运行的会话。运行中的会话会暂时移到这里，结束后自动回到普通模式。"
-                  : isBrowserView()
-                    ? "还没有双子座执行会话。运行一个片段后会显示在这里。"
-                    : "还没有会话。在右侧输入任务开始。"}
+                  : "还没有会话。在右侧输入任务开始。"}
             </div>
           }
         >

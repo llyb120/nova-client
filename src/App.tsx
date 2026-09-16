@@ -6,7 +6,6 @@ import { SkyBackdrop } from "./components/SkyBackdrop";
 import { EvidenceChainView } from "./components/EvidenceChainView";
 import { HomeView } from "./components/HomeView";
 import { ExclusiveChatMark } from "./components/ExclusiveChatMark";
-import BrowserView from "./components/BrowserView";
 import { RoamRequestModal } from "./components/RoamRequestModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { ShareInboxModal } from "./components/ShareInboxModal";
@@ -221,9 +220,7 @@ export default function App() {
         fallback={
           <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
-          <Show when={state.view === "browser"} fallback={<HomeView />}>
-            <BrowserView />
-          </Show>
+            <HomeView />
           }>
             <EvidenceChainView />
           </Show>
