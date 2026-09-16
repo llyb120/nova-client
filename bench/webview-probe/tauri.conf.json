@@ -1,0 +1,8 @@
+{
+  "productName": "Nova WebView Probe",
+  "version": "0.1.0",
+  "identifier": "com.nova.webview-probe",
+  "build": { "frontendDist": "assets" },
+  "app": { "windows": [], "security": { "capabilities": [] } },
+  "bundle": { "active": false, "icon": ["../../src-tauri/icons/icon.ico"] }
+}
