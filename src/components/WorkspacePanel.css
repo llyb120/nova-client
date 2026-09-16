@@ -114,8 +114,9 @@
 .workspace-diff-toolbar { flex-wrap: wrap; }
 .workspace-diff-toolbar > span:first-child { flex: 1; min-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-diff-count { white-space: nowrap; color: var(--text-muted); }
-.workspace-diff { flex: 1; min-height: 0; overflow: auto; font: 12px/1.65 var(--mono, monospace); user-select: text; }
-.workspace-diff-line { display: flex; min-width: max-content; white-space: pre; padding-right: 10px; }
+.workspace-diff { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; font: 12px/1.65 var(--mono, monospace); user-select: text; }
+.workspace-diff-line { display: flex; white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 10px; }
+.workspace-diff-line > span:last-child { flex: 1; min-width: 0; }
 .workspace-diff-line.add { background: color-mix(in srgb, #38a169 16%, transparent); }
 .workspace-diff-line.del { background: color-mix(in srgb, #e05252 16%, transparent); }
 .workspace-diff-line.meta { color: var(--text-muted); }

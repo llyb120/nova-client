@@ -32,7 +32,7 @@ window.testLayout = () => ({...workspaceLayout});
 window.testCode = () => EditorView.findFromDOM(document.querySelector('.cm-editor'));
 window.loadHistory = () => setState('items', [{type:'tool',id:2,ts:0,status:'completed',kind:'edit',locations:[{path:'generated.ts'}],content:[]}]);
 api.workspaceGitStatus = async () => ({repo:'D:/demo',files:[{path:'src/main.ts',oldPath:null,index:'M',worktree:'M'},{path:'new.ts',oldPath:null,index:'?',worktree:'?'}]});
-api.workspaceGitDiff = async (_id, path, staged) => 'diff --git a/' + path + ' b/' + path + '\\n@@ -1,22 +1,22 @@\\n' + Array.from({length:20}, (_, i) => ' context ' + i).join('\\n') + '\\n-old\\n+' + (staged ? 'staged' : 'unstaged') + '\\n';
+api.workspaceGitDiff = async (_id, path, staged) => 'diff --git a/' + path + ' b/' + path + '\\n@@ -1,22 +1,22 @@\\n' + Array.from({length:20}, (_, i) => ' context ' + i).join('\\n') + '\\n-old\\n+' + (staged ? 'staged' : 'unstaged') + '\\n-long "' + 'x'.repeat(300) + '";\\n';
 import './src/app.css';
 let disk = '# Hello\\r\\n';
 const files = new Map([['D:/demo/src/main.ts', 'const value = 1;\\n']]);
@@ -368,6 +368,9 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   await page.getByLabel('文件差异').getByText('staged', {exact:true}).waitFor();
   await page.getByRole('button', {name:'展开全部',exact:true}).click();
   await page.getByLabel('文件差异').getByText('context 10', {exact:true}).waitFor();
+  assert.ok(await page.locator('.workspace-diff').evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'Git 差异区自动换行，不出现横向滚动条');
+  const longRow = page.locator('.workspace-diff-line').filter({hasText:'long "'}).last();
+  assert.ok(await longRow.evaluate(el => el.getBoundingClientRect().height > parseFloat(getComputedStyle(el).lineHeight) * 2), '超长差异行折行显示');
   if (process.env.TEST_SCREENSHOT) await page.screenshot({path:process.env.TEST_SCREENSHOT.replace('.png','-git.png')});
   const draftBeforeGitClose = await page.evaluate(() => window.testCode().state.doc.toString());
   await page.getByRole('tab', {name:/large.rs/}).click();
