@@ -23,7 +23,7 @@ await writeFile(join(profile,'settings.json'),JSON.stringify({relayServer:'',rel
 const portServer = createServer(); await new Promise(r => portServer.listen(0, '127.0.0.1', r));
 const debugPort = portServer.address().port; await new Promise(r => portServer.close(r));
 // Keep the isolated test renderer visible when another desktop window covers it during the 31s delay checks.
-const child = spawn(executable, [], { cwd: root, windowsHide: true, env: { ...process.env, NOVA_DATA_DIR: profile, WEBVIEW2_USER_DATA_FOLDER: join(profile,'webview-runtime'), WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort} --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion` }, stdio: ['ignore', 'ignore', 'pipe'] });
+const child = spawn(executable, [], { cwd: root, windowsHide: true, env: { ...process.env, NOVA_CHROME_PORT: "0", NOVA_DATA_DIR: profile, WEBVIEW2_USER_DATA_FOLDER: join(profile,'webview-runtime'), WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort} --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion` }, stdio: ['ignore', 'ignore', 'pipe'] });
 let stderr = ''; child.stderr.on('data', d => { stderr += d; });
 const sockets = [];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -39,7 +39,7 @@ async function attach(target) {
     const m = JSON.parse(data); const job = pending.get(m.id); if (!job) return;
     clearTimeout(job.timer); pending.delete(m.id); m.error ? job.reject(Error(JSON.stringify(m.error))) : job.resolve(m.result);
   });
-  const call = (method, params = {}) => new Promise((resolve,reject) => { const id=++sequence; const timer=setTimeout(()=>{pending.delete(id);reject(Error(`${method} timed out`));},120000); pending.set(id,{resolve,reject,timer}); socket.send(JSON.stringify({id,method,params})); });
+  const call = (method, params = {}, sessionId) => new Promise((resolve,reject) => { const id=++sequence; const timer=setTimeout(()=>{pending.delete(id);reject(Error(`${method} timed out`));},120000); pending.set(id,{resolve,reject,timer}); socket.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})})); });
   const evaluate = async expression => { const v=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true}); if(v.exceptionDetails)throw Error(JSON.stringify(v.exceptionDetails)); return v.result.value; };
   return { call, evaluate };
 }
@@ -66,6 +66,12 @@ try {
   await until(()=>page.evaluate('!!document.querySelector("input")'),'loaded');
   const timings=[];
   const act=async(action,snapshot)=>{
+    // The isolated window may be occluded while the user works during the 31s delays.
+    // Restore only the fixture surface; explicit UI hide/restore checks run separately below.
+    if(!(await ui('status')).visible){
+      const bounds=await main.evaluate('(()=>{const r=document.querySelector(".workspace-browser-surface").getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height}})()');
+      await ui('layout',{visible:true,...bounds});
+    }
     snapshot??=await ui('inspect');const start=performance.now();
     const result=await ui('act',{snapshotId:snapshot.snapshotId,action});timings.push(Math.round(performance.now()-start));return result;
   };
@@ -163,6 +169,47 @@ try {
   const delayed=await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/delayed')),'delayed target'));
   assert.equal(await delayed.evaluate('!!window.opener'),true);
   await ui('close_tab',{tabId:(await ui('status')).activeTab});assert.equal((await ui('status')).activeTab,firstTab);
+  // Exercise the real Chrome transport + shared engine with an emulated extension.
+  // This is not a real Chrome extension end-to-end test.
+  const chromeUi=(operation,args={})=>invoke('chrome_browser_ui',{operation,args});
+  const connection=await chromeUi('connect');
+  const pairing=await fetch(connection.origin+'/pair',{method:'POST',headers:{Origin:`chrome-extension://${connection.extensionId}`}});
+  assert.equal(pairing.status,200);
+  const config={origin:connection.origin,...await pairing.json()};
+  const abort=new AbortController();
+  const tag='C1-smoketest';
+  const post=async(route,body)=>{
+    const response=await fetch(config.origin+route,{method:'POST',headers:{'Content-Type':'application/json',Origin:`chrome-extension://${connection.extensionId}`,Authorization:`Bearer ${config.token}`},body:JSON.stringify({clientId:'12345678-1234-4234-8234-123456789abc',...body}),signal:abort.signal});
+    assert.equal(response.status,200);return response.json();
+  };
+  const polling=(async()=>{
+    while(!abort.signal.aborted){
+      const {command}=await post('/poll',{});if(!command)continue;
+      let reply;
+      try {
+        let result;
+        if(command.operation==='tabs')result={tabs:[{tag,allowed:true,controllable:true,title:'Fixture'}]};
+        else {assert.equal(command.args.tabTag,tag);assert.equal(command.operation,'cdp');result=await page.call(command.args.method,command.args.params,command.args.sessionId);}
+        reply={id:command.id,result};
+      }catch(error){reply={id:command.id,error:String(error)};}
+      await post('/reply',reply);
+    }
+  })();
+  let pollingError;polling.catch(error=>{if(!abort.signal.aborted)pollingError=error;});
+  try {
+    await until(async()=>(await chromeUi('status')).connected,'Chrome bridge');
+    assert.equal((await chromeUi('tabs')).tabs[0].tag,tag);
+    await assert.rejects(chromeUi('inspect'),/tabTag/);
+    const chromeObs=await chromeUi('inspect',{tabTag:tag});
+    const changed=await chromeUi('act',{tabTag:tag,snapshotId:chromeObs.snapshotId,action:{action:'fill',...find(chromeObs,'订单号'),text:'Chrome桥接验证'}});
+    assert.equal(changed.status,'executed');assert.ok(changed.snapshotId);
+    assert.equal(await page.evaluate('document.querySelector("input").value'),'Chrome桥接验证');
+    const screenshot=await chromeUi('screenshot',{tabTag:tag,fullPage:false});
+    assert.ok(screenshot.images.length);assert.equal(screenshot.browser,'chrome');
+    if(pollingError)throw pollingError;
+    assert.equal(await main.evaluate('!!document.querySelector("[aria-label=浏览器来源]")'),false);
+    assert.equal(await main.evaluate('!!document.querySelector(".workspace-browser-surface")'),true);
+  }finally{abort.abort();await polling.catch(()=>{});}
   const pageShot=await page.call('Page.captureScreenshot',{format:'png'});await writeFile(join(output,'page.png'),Buffer.from(pageShot.data,'base64'));
   const compactShot=await main.call('Page.captureScreenshot',{format:'png'});await writeFile(join(output,'browser-ui.png'),Buffer.from(compactShot.data,'base64'));
   await main.evaluate(`Array.from(document.querySelectorAll('.workspace-modes button')).find(b=>b.textContent==='文件').click()`);
@@ -173,7 +220,7 @@ try {
   await until(async()=> !(await ui('status')).visible,'hide for settings');
   assert.equal(await main.evaluate('document.body.textContent.includes("辅助控制模型")'),false);
   await writeFile(join(output,'report.json'),JSON.stringify({passed:true,modelCalls:0,actionWithFeedbackMs:timings,optimization:{domRefAfter31Seconds:true,coordinateAfter31Seconds:true,chainedFeedback:true,replacedElementRejected:true,menuStateAndHref:true,screenshotFeedback:true,summaryBytes},fullPageEvidence,screenshot:observation.path,profile},null,2));
-  console.log('PASS native browser full-document/full-page/tiles/document-coordinates/DOM/native-input/popups/session-state/stop; no model calls: '+output);
+  console.log('PASS native browser full-document/full-page/tiles/document-coordinates/DOM/native-input/popups/session-state/stop + Chrome emulated transport/engine; no model calls: '+output);
 } finally {
   for (const socket of sockets) socket.close();
   if (child.exitCode === null && child.pid) spawnSync('taskkill',['/PID',String(child.pid),'/T','/F'],{windowsHide:true,stdio:'ignore'});
