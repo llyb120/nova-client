@@ -34,6 +34,21 @@ struct Shot {
     image_id: String,
     surface: Surface,
     pixels: (u32, u32),
+    source_pixels: (u32, u32),
+    region: Option<Region>,
+}
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Region { x: u32, y: u32, width: u32, height: u32 }
+impl Region {
+    fn validate(self, pixels: (u32, u32)) -> Result<()> {
+        if self.width == 0 || self.height == 0
+            || self.x.checked_add(self.width).is_none_or(|v| v > pixels.0)
+            || self.y.checked_add(self.height).is_none_or(|v| v > pixels.1) {
+            return Err("region超出原始窗口截图范围，必须使用originalWidth/originalHeight像素坐标".into());
+        }
+        Ok(())
+    }
 }
 struct Snapshot {
     id: String,
@@ -49,6 +64,8 @@ struct Snapshot {
 struct Request {
     operation: String,
     window_id: Option<u32>,
+    monitor_id: Option<u32>,
+    region: Option<Region>,
     snapshot_id: Option<String>,
     image_id: Option<String>,
     feedback: Option<String>,
@@ -135,6 +152,8 @@ fn windows() -> Result<Value> {
     for w in Window::all().map_err(err)? {
         rows.push(
             json!({"windowId":w.id().map_err(err)?,"pid":w.pid().map_err(err)?,
+            "monitorId":w.current_monitor().and_then(|m| m.id()).ok(),
+            "width":w.width().ok(),"height":w.height().ok(),
             "app":w.app_name().map_err(err)?,"title":w.title().map_err(err)?,
             "focused":w.is_focused().map_err(err)?,"minimized":w.is_minimized().map_err(err)?}),
         );
@@ -148,7 +167,7 @@ fn shot_folder(owner: &str) -> std::path::PathBuf {
     crate::lyra::config::nova_root().join("desktop-shots").join(format!("{:016x}", hash.finish()))
 }
 
-fn capture(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Option<Snapshot>) -> Result<Value> {
+fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, state: &mut Option<Snapshot>) -> Result<Value> {
     let started = Instant::now();
     let mut capture_ms = 0;
     let mut resize_ms = 0;
@@ -164,7 +183,7 @@ fn capture(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Optio
         if surface.width == 0 || surface.height == 0 || image.width() == 0 || image.height() == 0 {
             return Err("截图范围为空".into());
         }
-        let image_id = format!(
+        let mut image_id = format!(
             "{}-{}",
             if window_id.is_some() {
                 "window"
@@ -173,7 +192,14 @@ fn capture(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Optio
             },
             surface.id
         );
+        if let Some(r) = region {
+            image_id.push_str(&format!("-region-{}-{}-{}-{}", r.x, r.y, r.width, r.height));
+        }
         let original_pixels = image.dimensions();
+        let image = if let Some(r) = region {
+            r.validate(original_pixels)?;
+            xcap::image::imageops::crop_imm(&image, r.x, r.y, r.width, r.height).to_image()
+        } else { image };
         let resize_started = Instant::now();
         let image = if max_edge > 0 && image.width().max(image.height()) > max_edge {
             let scale = max_edge as f64 / image.width().max(image.height()) as f64;
@@ -189,11 +215,14 @@ fn capture(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Optio
         encode_ms += encode_started.elapsed().as_millis();
         images.push(json!({"imageId":image_id,"path":path,"width":image.width(),"height":image.height(),
             "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
+            "region":region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height})),
             "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}}));
         shots.push(Shot {
             image_id,
             surface,
             pixels: image.dimensions(),
+            source_pixels: original_pixels,
+            region,
         });
         Ok(())
     };
@@ -204,6 +233,16 @@ fn capture(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Optio
         }
         let surface = window_surface(&w)?;
         let capture_started = Instant::now();
+        // PrintWindow omits separate popup windows (e.g. recipient suggestions).
+        // Foreground input must observe the pixels that will actually receive it.
+        #[cfg(windows)]
+        let image = if before == Some((surface.id, surface.pid.unwrap())) {
+            let monitor = w.current_monitor().map_err(err)?;
+            let bounds = monitor_surface(&monitor)?;
+            let image = monitor.capture_image().map_err(err)?;
+            visible_window_crop(&surface, &bounds, &image)?
+        } else { w.capture_image().map_err(err)? };
+        #[cfg(not(windows))]
         let image = w.capture_image().map_err(err)?;
         capture_ms += capture_started.elapsed().as_millis();
         if window_surface(&w)? != surface {
@@ -217,11 +256,13 @@ fn capture(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Optio
         }
         for m in monitors {
             let surface = monitor_surface(&m)?;
+            if monitor_id.is_some_and(|id| id != surface.id) { continue; }
             let capture_started = Instant::now();
             let image = m.capture_image().map_err(err)?;
             capture_ms += capture_started.elapsed().as_millis();
             save(surface, image)?;
         }
+        if shots.is_empty() { return Err("显示器不存在，请重新截图".into()); }
     }
     if foreground()? != before {
         return Err("截图期间焦点改变，请重新截图".into());
@@ -244,15 +285,32 @@ fn capture(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Optio
     )
 }
 
+#[cfg(windows)]
+fn visible_window_crop(window: &Surface, monitor: &Surface, image: &xcap::image::RgbaImage) -> Result<xcap::image::RgbaImage> {
+    let x = window.x as i64 - monitor.x as i64;
+    let y = window.y as i64 - monitor.y as i64;
+    if image.dimensions() != (monitor.width, monitor.height)
+        || x < 0 || y < 0 || window.width == 0 || window.height == 0
+        || x + window.width as i64 > monitor.width as i64
+        || y + window.height as i64 > monitor.height as i64 {
+        return Err("窗口跨屏、部分离屏或屏幕像素比例不一致，请使用monitorId截图定位".into());
+    }
+    Ok(xcap::image::imageops::crop_imm(image, x as u32, y as u32, window.width, window.height).to_image())
+}
+
 fn point(shot: &Shot, x: Option<i32>, y: Option<i32>) -> Result<(i32, i32)> {
     let (x, y) = (x.ok_or("缺少x坐标")?, y.ok_or("缺少y坐标")?);
     let (pw, ph) = shot.pixels;
-    if x < 0 || y < 0 || x as u32 >= pw || y as u32 >= ph || pw == 0 || ph == 0 {
+    if x < 0 || y < 0 || x as u32 >= pw || y as u32 >= ph || pw == 0 || ph == 0
+        || shot.source_pixels.0 == 0 || shot.source_pixels.1 == 0 {
         return Err("坐标超出原始截图范围".into());
     }
     let s = &shot.surface;
-    let px = s.x as i64 + x as i64 * s.width as i64 / pw as i64;
-    let py = s.y as i64 + y as i64 * s.height as i64 / ph as i64;
+    let r = shot.region.unwrap_or(Region { x:0, y:0, width:shot.source_pixels.0, height:shot.source_pixels.1 });
+    let px = s.x as i128 + (r.x as i128 * pw as i128 + x as i128 * r.width as i128)
+        * s.width as i128 / (pw as i128 * shot.source_pixels.0 as i128);
+    let py = s.y as i128 + (r.y as i128 * ph as i128 + y as i128 * r.height as i128)
+        * s.height as i128 / (ph as i128 * shot.source_pixels.1 as i128);
     Ok((
         i32::try_from(px).map_err(err)?,
         i32::try_from(py).map_err(err)?,
@@ -292,6 +350,11 @@ fn keys(raw: &str) -> Result<Vec<Key>> {
             "f10" => Ok(Key::F10),
             "f11" => Ok(Key::F11),
             "f12" => Ok(Key::F12),
+            // Enigo 0.6 passes VkKeyScanExW's shift-state high byte through as VK.
+            // Shortcuts use physical letter/digit VKs; text still uses enigo.text.
+            #[cfg(windows)]
+            _ if s.len() == 1 && s.as_bytes()[0].is_ascii_alphanumeric() =>
+                Ok(Key::Other(s.as_bytes()[0].to_ascii_uppercase() as u32)),
             _ if s.chars().count() == 1 => Ok(Key::Unicode(s.chars().next().unwrap())),
             _ => Err(format!("不支持的按键：{s}")),
         })
@@ -390,13 +453,19 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
             .iter()
             .map(monitor_surface)
             .collect::<Result<Vec<_>>>()?;
-        if current.len() != snap.shots.len()
-            || snap.shots.iter().any(|s| !current.contains(&s.surface))
+        if snap.shots.iter().any(|s| !current.contains(&s.surface))
         {
             return Err("显示器布局已改变，请重新截图".into());
         }
     }
     Ok(())
+}
+
+fn action_delay(actions: &[Action], index: usize) -> Duration {
+    // Explicit waits already provide settling time; pointer motion needs no extra delay.
+    let redundant = matches!(actions[index].action.as_str(), "wait" | "move")
+        || actions.get(index + 1).is_some_and(|a| a.action == "wait");
+    Duration::from_millis(if redundant { 0 } else { 80 })
 }
 fn input(enigo: &mut Enigo, shot: &Shot, a: &Action) -> Result<()> {
     let button = match a.button.as_deref() {
@@ -496,6 +565,12 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
         Err(e) => return Err(err(e)),
     };
     let max_edge = request.max_edge.unwrap_or(1600);
+    if request.region.is_some() && (request.operation != "screenshot" || request.window_id.is_none()) {
+        return Err("region仅用于screenshot且必须指定windowId".into());
+    }
+    if request.monitor_id.is_some() && request.operation != "screenshot" {
+        return Err("monitorId仅用于screenshot；act由imageId选择屏幕".into());
+    }
     if max_edge != 0 && !(640..=3840).contains(&max_edge) {
         return Err("maxEdge允许0（原分辨率）或640–3840；本批次尚未执行".into());
     }
@@ -505,7 +580,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
     if request
         .feedback
         .as_deref()
-        .is_some_and(|s| !matches!(s, "screenshot" | "none"))
+            .is_some_and(|s| !matches!(s, "screenshot" | "desktop" | "none"))
     {
         return Err("无效feedback".into());
     }
@@ -515,7 +590,10 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
     match request.operation.as_str() {
         "windows" => windows(),
         "screenshot" => {
-            let mut result = capture(&owner, request.window_id, max_edge, &mut state)?;
+            if request.window_id.is_some() && request.monitor_id.is_some() {
+                return Err("windowId和monitorId不能同时用于截图".into());
+            }
+            let mut result = capture(&owner, request.window_id, request.monitor_id, request.region, max_edge, &mut state)?;
             result["notes"] = json!(request.notes);
             Ok(result)
         }
@@ -534,13 +612,24 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                     "剑来 Linux 输入当前仅支持 X11；Wayland 不会静默使用 XWayland 操作".into(),
                 );
             }
-            let snap = state.as_ref().ok_or("请先截图")?;
-            if snap.owner != owner
-                || Some(&snap.id) != request.snapshot_id.as_ref()
-            {
+            if state.is_none() {
+                let mut result = json!({"status":"not_executed","completedActions":0,"error":"没有可用快照，附当前观察；基于新图重新决策"});
+                observe(&owner, request.window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
+                return Ok(result);
+            }
+            let snap = state.as_ref().unwrap();
+            if snap.owner != owner {
                 return Err("快照无效或已过期，请重新截图；不能重放动作".into());
             }
-            if request.window_id.is_some() && request.window_id != snap.window {
+            if Some(&snap.id) != request.snapshot_id.as_ref() {
+                let window_id = snap.window;
+                let max_edge = snap.max_edge;
+                let mut result = json!({"status":"not_executed","completedActions":0,
+                    "error":"旧snapshotId已失效，附当前观察；请基于新图重新决策，不自动重放"});
+                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
+                return Ok(result);
+            }
+            if snap.window.is_some() && request.window_id.is_some() && request.window_id != snap.window {
                 return Err("windowId与截图不符".into());
             }
             let shot = snap
@@ -560,10 +649,11 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 }
             }
             let max_edge = request.max_edge.unwrap_or(snap.max_edge);
+            let feedback_window = request.window_id.or(snap.window);
+            let monitor_id = snap.window.is_none().then_some(shot.surface.id);
             if let Err(e) = check_target(snap, &shot, &actions[0]) {
-                let window_id = snap.window;
                 let mut result = json!({"status":"not_executed","completedActions":0,"error":e});
-                observe(&owner, window_id, max_edge, &mut state, &mut result);
+                observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
                 return Ok(result);
             }
             let mut enigo = Enigo::new(&Settings::default()).map_err(err)?;
@@ -572,10 +662,12 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let mut completed = 0;
             let mut failure = None;
             let mut attempted = false;
-            for a in &actions {
-                if let Err(e) = check_target(&snap, &shot, a) {
-                    failure = Some(e);
-                    break;
+            for (index, a) in actions.iter().enumerate() {
+                if a.action != "wait" {
+                    if let Err(e) = check_target(&snap, &shot, a) {
+                        failure = Some(e);
+                        break;
+                    }
                 }
                 attempted = true;
                 if let Err(e) = input(&mut enigo, &shot, a) {
@@ -583,9 +675,17 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                     break;
                 }
                 completed += 1;
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(action_delay(&actions, index));
+                // Let an explicit wait finish before observing a click/key's focus transition.
+                if actions.get(index + 1).is_some_and(|a| a.action == "wait") { continue; }
                 match foreground() {
-                    Ok(f) => snap.foreground = f,
+                    Ok(f) => {
+                        if f != snap.foreground && actions[index + 1..].iter().any(|a| a.action != "wait") {
+                            failure = Some("动作后前台窗口改变，已停止后续输入；请根据新截图继续，不要重放整批".into());
+                            break;
+                        }
+                        snap.foreground = f;
+                    }
                     Err(e) => {
                         failure = Some(e);
                         break;
@@ -593,29 +693,34 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 }
             }
             let mut result = json!({"status":if failure.is_some(){if attempted {"needs_review"} else {"not_executed"}}else{"executed"},"completedActions":completed,"error":failure,"notes":request.notes});
+            if shot.region.is_some() {
+                result["coordinateNotice"] = json!("局部操作后的反馈恢复完整窗口；使用新的imageId和完整图片坐标，不沿用局部坐标");
+            }
             if failure.is_some() || request.feedback.as_deref() != Some("none") {
-                observe(&owner, snap.window, max_edge, &mut state, &mut result);
+                observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
             }
             Ok(result)
         }
         _ => Err("未知剑来操作".into()),
     }
 }
-// Observation never retries input. An unfocused/closed/minimized window falls back to the desktop.
-fn observe(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Option<Snapshot>, result: &mut Value) {
-    // A window capture can show an occluded app. After a switch, observe the actual
-    // desktop instead of repeatedly returning a background image that cannot receive input.
-    let window_id = match window_id {
-        Some(id) if !foreground().ok().flatten().is_some_and(|(focused, _)| focused == id) => {
-            result["windowObservationError"] = json!("目标窗口不在前台，改用桌面截图");
-            None
-        }
-        id => id,
-    };
-    let observation = capture(owner, window_id, max_edge, state).or_else(|e| {
-        if window_id.is_none() { return Err(e); }
+// Observation never retries input; follow the foreground and fall back to desktop if needed.
+fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, desktop: bool, max_edge: u32, state: &mut Option<Snapshot>, result: &mut Value) {
+    // Follow the actual foreground after opening a compose window/dialog, never activate it.
+    // Shell task view and hidden helper windows must stay in desktop scope.
+    let focused = foreground().ok().flatten().and_then(|(id, _)| window(id).ok())
+        .filter(|w| w.width().unwrap_or(0) > 32 && w.height().unwrap_or(0) > 32
+            && !w.is_minimized().unwrap_or(true));
+    let monitor_id = monitor_id.or_else(|| focused.as_ref()?.current_monitor().ok()?.id().ok());
+    let window_id = if desktop { None } else { focused.as_ref().and_then(|w| w.id().ok()) };
+    if window_id != previous_window {
+        result["observationScopeChanged"] = json!(true);
+        result["coordinateNotice"] = json!("截图范围已变化，必须使用本次imageId和图片内坐标，不沿用上一张图坐标");
+    }
+    let observation = capture(owner, window_id, if window_id.is_some() { None } else { monitor_id }, None, max_edge, state).or_else(|e| {
+        if window_id.is_none() && monitor_id.is_none() { return Err(e); }
         result["windowObservationError"] = json!(e);
-        capture(owner, None, max_edge, state)
+        capture(owner, None, monitor_id, None, max_edge, state)
     });
     match observation {
         Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
@@ -634,6 +739,40 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn windows_shortcuts_and_visible_crop() {
+        for letter in b'a'..=b'z' {
+            let lower = keys(&format!("Ctrl+{}", letter as char)).unwrap();
+            let upper = keys(&format!("Ctrl+{}", letter.to_ascii_uppercase() as char)).unwrap();
+            assert_eq!(lower, upper);
+            assert_eq!(upper, vec![Key::Control, Key::Other(letter.to_ascii_uppercase() as u32)]);
+        }
+        assert_eq!(keys("Ctrl+Shift+S").unwrap(), vec![Key::Control, Key::Shift, Key::Other(0x53)]);
+        assert_eq!(keys("Win+1").unwrap(), vec![Key::Meta, Key::Other(0x31)]);
+        let monitor = Surface { id:1, pid:None, x:-100, y:20, width:100, height:80 };
+        let window = Surface { x:-80, y:30, width:40, height:30, ..monitor.clone() };
+        let image = xcap::image::RgbaImage::from_fn(100, 80, |x, y| xcap::image::Rgba([x as u8, y as u8, 0, 255]));
+        let crop = visible_window_crop(&window, &monitor, &image).unwrap();
+        assert_eq!(crop.dimensions(), (40,30));
+        assert_eq!(crop.get_pixel(0,0), image.get_pixel(20,10));
+        assert_eq!(crop.get_pixel(39,29), image.get_pixel(59,39));
+        assert!(visible_window_crop(&Surface { x:-101, ..window.clone() }, &monitor, &image).is_err());
+        assert!(visible_window_crop(&Surface { x:-10, ..window }, &monitor, &image).is_err());
+        assert!(visible_window_crop(&monitor, &monitor, &crop).is_err());
+    }
+    #[test]
+    fn waits_are_not_paid_twice() {
+        let actions: Vec<Action> = serde_json::from_value(json!([
+            {"action":"click","x":10,"y":10}, {"action":"wait","ms":400},
+            {"action":"type","text":"test"}, {"action":"wait","ms":500},
+            {"action":"move","x":20,"y":20}, {"action":"click","x":20,"y":20},
+            {"action":"type","text":"next"}
+        ])).unwrap();
+        let delays: Vec<_> = (0..actions.len()).map(|i| action_delay(&actions, i).as_millis()).collect();
+        assert_eq!(delays, [0, 0, 0, 0, 0, 80, 80]);
+        assert!(run("validation".into(), json!({"operation":"screenshot","windowId":1,"monitorId":2})).is_err());
+    }
     #[test]
     fn coordinates_keys_and_validation() {
         let shot = Shot {
@@ -647,6 +786,7 @@ mod tests {
                 height: 1080,
             },
             pixels: (3840, 2160),
+            source_pixels: (3840, 2160), region: None,
         };
         assert_eq!(point(&shot, Some(1920), Some(1080)).unwrap(), (-960, 540));
         assert!(point(&shot, Some(3840), Some(0)).is_err());
@@ -655,6 +795,19 @@ mod tests {
         let scaled = Shot { pixels: (960, 540), ..shot.clone() };
         assert_eq!(point(&scaled, Some(480), Some(270)).unwrap(), (-960, 540));
         assert_eq!(point(&scaled, Some(959), Some(539)).unwrap(), (-2, 1078));
+        let desktop = Shot { surface: Surface { x:0, y:0, ..shot.surface.clone() }, pixels:(1600,900), ..shot.clone() };
+        // The reported click was on the toolbar in the source image, not a DPI offset.
+        assert_eq!(point(&desktop, Some(860), Some(520)).unwrap(), (1032, 624));
+        let region = Region { x:200, y:100, width:800, height:400 };
+        region.validate(shot.source_pixels).unwrap();
+        let cropped = Shot { region:Some(region), pixels:(400,200), ..shot.clone() };
+        assert_eq!(point(&cropped, Some(0), Some(0)).unwrap(), (-1820,50));
+        assert_eq!(point(&cropped, Some(200), Some(100)).unwrap(), (-1620,150));
+        assert!(point(&cropped, Some(400), Some(0)).is_err());
+        assert_eq!(cropped.surface, shot.surface); // Geometry checks still cover the whole window.
+        assert!(Region { x:u32::MAX, ..region }.validate(shot.source_pixels).is_err());
+        assert!(Region { width:0, ..region }.validate(shot.source_pixels).is_err());
+        assert!(Region { y:2100, ..region }.validate(shot.source_pixels).is_err());
         let wait: Action = serde_json::from_value(json!({"action":"wait","ms":8000})).unwrap();
         assert_eq!(validate(&wait, &shot).unwrap_err(), "ms=8000，允许范围为 0–2000");
         assert!(validate(&serde_json::from_value(json!({"action":"wait","ms":2000})).unwrap(), &shot).is_ok());
@@ -672,9 +825,13 @@ mod tests {
     #[test]
     fn invalid_wait_rejects_whole_batch_before_input() {
         let shot = Shot { image_id:"monitor-1".into(),
-            surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100) };
+            surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
             taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot]});
+        let foreign = run("other-owner".into(), json!({"operation":"act","snapshotId":"old"})).unwrap();
+        assert_eq!(foreign["completedActions"], 0);
+        assert!(foreign.get("images").is_none());
+        assert_eq!(DESKTOP.lock().unwrap().as_ref().unwrap().id, "validation");
         let result = run("validation".into(), json!({"operation":"act","snapshotId":"validation",
             "imageId":"monitor-1","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":8000}]})).unwrap();
         assert_eq!(result["status"], "not_executed");
@@ -691,25 +848,46 @@ mod tests {
     fn desktop_smoke() {
         #[cfg(windows)]
         {
+            let before = foreground().unwrap();
             let expected = Window::all().unwrap().into_iter()
                 .find(|w| w.is_focused().unwrap_or(false))
                 .map(|w| (w.id().unwrap(), w.pid().unwrap()));
-            assert_eq!(foreground().unwrap(), expected);
+            let after = foreground().unwrap();
+            // Shell surfaces may be focused but excluded by XCap's application-window filter.
+            if expected.is_some() && before == after { assert_eq!(after, expected); }
         }
         // A departed target must yield an actionable desktop, not its old window image.
         let mut observation = json!({});
         let mut snapshot = None;
-        observe("test", Some(u32::MAX), 1600, &mut snapshot, &mut observation);
+        observe("test", Some(u32::MAX), None, true, 1600, &mut snapshot, &mut observation);
         assert!(observation["windowId"].is_null());
         assert!(snapshot.is_some(), "{observation}");
         assert!(snapshot.unwrap().window.is_none());
+        let mut focused_result = json!({});
+        let mut focused_snapshot = None;
+        observe("test", None, None, false, 1600, &mut focused_snapshot, &mut focused_result);
+        assert!(focused_snapshot.is_some(), "{focused_result}");
+        if let Some(id) = focused_result["windowId"].as_u64() {
+            assert_eq!(focused_result["foreground"][0], id);
+            let cropped = run("test".into(), json!({"operation":"screenshot","windowId":id,
+                "maxEdge":0,"region":{"x":0,"y":0,"width":32,"height":32}})).unwrap();
+            assert_eq!(cropped["images"][0]["width"], 32);
+            assert_eq!(cropped["images"][0]["height"], 32);
+            let _ = std::fs::remove_file(cropped["images"][0]["path"].as_str().unwrap());
+        }
         let shot = run("test".into(), json!({"operation":"screenshot"})).unwrap();
         assert!(!shot["images"].as_array().unwrap().is_empty());
-        let args = json!({"operation":"act","snapshotId":shot["snapshotId"],"imageId":shot["images"][0]["imageId"],"actions":[{"action":"move","x":10,"y":10}]});
+        let args = json!({"operation":"act","snapshotId":shot["snapshotId"],"imageId":shot["images"][0]["imageId"],"feedback":"desktop","actions":[{"action":"move","x":10,"y":10}]});
         let result = run("test".into(), args.clone()).unwrap();
         assert_eq!(result["status"], "executed");
-        assert!(!result["images"].as_array().unwrap().is_empty());
-        assert_eq!(run("test".into(), args).unwrap()["status"], "not_executed");
+        assert_eq!(result["images"].as_array().unwrap().len(), 1);
+        assert_eq!(result["images"][0]["imageId"], shot["images"][0]["imageId"]);
+        eprintln!("single-screen feedback timings: {}", result["timingsMs"]);
+        let stale = run("test".into(), args).unwrap();
+        assert_eq!(stale["status"], "not_executed");
+        assert_eq!(stale["completedActions"], 0);
+        assert!(stale["images"].as_array().is_some());
+        assert_ne!(stale["snapshotId"], result["snapshotId"]);
         // Simulate a stale foreground identity without actually changing the user's focus.
         DESKTOP.lock().unwrap().as_mut().unwrap().foreground = Some((u32::MAX, u32::MAX));
         let recovered = run("test".into(), json!({"operation":"act","snapshotId":result["snapshotId"],
@@ -743,7 +921,7 @@ mod tests {
                 }
             }
         }
-        for result in [observation, shot, result, recovered] {
+        for result in [observation, focused_result, shot, result, stale, recovered] {
             for img in result["images"].as_array().unwrap() {
                 let _ = std::fs::remove_file(img["path"].as_str().unwrap());
             }

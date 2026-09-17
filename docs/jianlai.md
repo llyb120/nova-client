@@ -2,9 +2,9 @@
 
 系统级桌面工具，和 `chrome` / `webview` 并存。通过 Enigo 注入原生鼠标键盘事件，通过 XCap 获取程序窗口和显示器截图；不使用 Playwright、DOM 或辅助模型。
 
-- `windows`：列出程序名称、窗口标题、PID、windowId。
-- `screenshot`：优先传 windowId 截目标窗口；省略则返回全部显示器独立图片（最多16屏）。默认长边最多1600像素；`maxEdge: 0` 使用原分辨率，否则允许640–3840。
-- `act`：传 snapshotId、imageId 和 actions（1–8项），默认立即返回同范围的新截图。`feedback: "none"` 可省略截图，但下次操作前必须重新截图。
+- `windows`：列出程序名称、窗口标题、PID、windowId、尺寸及monitorId；1x1等辅助窗口不适合交互。
+- `screenshot`：优先传 windowId 截目标窗口；省略则返回全部显示器独立图片（最多16屏）；已知monitorId时可只截一屏，不能同时传windowId。默认长边最多1600像素；`maxEdge: 0` 使用原分辨率，否则允许640–3840。
+- `act`：传 snapshotId、imageId 和 actions（1–8项），默认返回实际前台应用窗口的新截图，自动跟随新窗口/弹窗；任务视图等不可独立捕获的系统界面回退桌面。feedback=desktop可保留操作屏幕以观察窗口外菜单。返回imageId/坐标范围可能变化，下一步必须使用新图坐标。`feedback: "none"` 可省略截图，但下次操作前必须重新截图。
 - 点击、双击、移动、拖拽、Unicode文本输入、组合键、双轴滚动和有界等待均为真实系统输入。坐标以**实际返回的图片像素**为准，服务端同步映射缩放、负坐标屏幕和Retina坐标；act继承快照的maxEdge。
 - `wait.ms` 仅允许0–2000，默认250。整批预校验：`actions[1].ms=8000，允许范围为 0–2000；本批次尚未执行` 意味着前面的点击也没执行。
 - `recall(imagePath)` 回看本会话历史结果的图片，不创建可操作快照，也不改变当前快照。旧图仅用于阅读，操作必须绑定当前观察。
@@ -18,9 +18,9 @@
 {"operation":"act","snapshotId":"上次返回值","imageId":"window-123","actions":[{"action":"click","x":180,"y":90},{"action":"type","text":"你好"}]}
 ```
 
-窗口输入要求目标在前台；后台窗口可以截图，但不能盲目操作。窗口截图不会激活窗口。先截桌面，Windows用Win+Tab加wait 250ms显示任务视图，根据返回图点击目标，或点击可见任务栏图标；确认成功后再截窗口。不要盲目循环切窗或猜应用热键，同一路径连续失败两次应报告阻碍。用户指定剑来时，整个桌面任务只用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation及终端脚本操控应用。窗口位置/尺寸、焦点、显示器布局发生变化会拒绝旧坐标。快照180秒过期、仅消费一次，并绑定当前Nova会话。全局锁防止剑来并行操作同一桌面。批量动作只用于已确定的连续步骤；需要根据画面判断时拆分调用。用户同时移动窗口/输入仍可能产生竞态，请操作时避免争用桌面。
+窗口输入要求目标在前台；后台窗口可以截图，但不能盲目操作。窗口截图不会激活窗口。先截桌面，Windows用Win+Tab加wait 250ms显示任务视图，根据返回图点击目标，或点击可见任务栏图标；确认成功后再截窗口。不要盲目循环切窗或猜应用热键，同一路径连续失败两次应报告阻碍。用户指定剑来时，整个桌面任务只用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation及终端脚本操控应用。窗口位置/尺寸、焦点、显示器布局发生变化会拒绝旧坐标。快照180秒过期、仅消费一次，并绑定当前Nova会话。全局锁防止剑来并行操作同一桌面。批量动作只用于已确定的连续步骤；需要根据画面判断时拆分调用。批次内焦点改变且仍有后续输入时停止并返回新图，不把剩余键盘输入送进未知窗口。用户同时移动窗口/输入仍可能产生竞态，请操作时避免争用桌面。
 
-`not_executed` 表示尚未发送输入。焦点、窗口几何或快照过期等目标校验失败会直接附带当前截图、新snapshotId、foreground与desktopBounds（即使feedback=none），不自动重放；窗口失焦、关闭或最小化时改为桌面观察，原因保留在windowObservationError。不能根据焦点变化猜测是哪一个程序抢焦点。
+`not_executed` 表示尚未发送输入。焦点、窗口几何或快照过期等目标校验失败会直接附带当前截图、新snapshotId、foreground与desktopBounds（即使feedback=none），不自动重放；窗口失焦、关闭或最小化时跟随实际前台窗口，无法捕获时改为桌面观察，原因保留在windowObservationError。不能根据焦点变化猜测是哪一个程序抢焦点。
 
 `executed` 表示输入已发送，不表示应用任务成功；`needs_review` 表示可能部分执行，检查completedActions/error和随附新图，禁止重放整个批次。观察失败会单独返回observationError，不掩盖执行状态。
 
@@ -51,3 +51,19 @@
 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai` 验证坐标、按键与参数边界。
 
 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::desktop_smoke -- --ignored` 在真实桌面验证截图→鼠标移动→截图及拒绝重放（只移动指针，不点击或输入）。请在可被操作的测试桌面执行。
+
+## 操作调度与定位
+
+普通点击、输入和滚动保留80ms基础处理时间；显式wait前后不叠加80ms，move后不额外等待。无需每个动作都追加400–900ms等待；只有已观察到加载或动画时再加短等待。scroll必须直接提供x/y/delta，自带鼠标定位，无需先move。相同已确认输入区的点击与输入可合批，跨页面、弹窗、对象确认仍拆分观察。输入框点击编辑区内部，避开工具栏；不清楚时先用窗口图定位，不盲点。窗口切换后的windowId仅选择反馈范围，不会通过系统API激活窗口。
+
+## 局部定位与失效快照恢复
+
+Windows前台窗口从所在显示器的实际画面裁剪，保留窗口范围内独立弹出的候选框，避免PrintWindow截图遗漏浮层。窗口外菜单仍用feedback=desktop；跨屏、部分离屏或像素比例不一致时窗口裁剪拒绝执行，自动反馈回退桌面，显式screenshot可改用monitorId。后台窗口仍可独立截图，不能据此操作被遮挡内容。
+
+Windows的press字母/数字按虚拟键发送，Ctrl+A与Ctrl+a等价；大小写文本使用type，组合键的大写由显式Shift控制，避免Enigo将大写字符的修饰位误当成键码。
+
+`screenshot`指定windowId时可加`region:{x,y,width,height}`，区域以原始窗口图片originalWidth/originalHeight像素为准，先裁剪再按maxEdge缩放。返回图可直接用局部图片坐标act，工具负责偏移、缩放与负屏幕坐标映射；窗口几何校验仍检查完整窗口。act后的反馈恢复完整前台窗口，必须按新图重新定位。局部截图不读取DOM、UIAutomation或其它语义控件接口。
+
+同会话旧snapshotId失效或当前没有快照时，act返回not_executed并尽量附当前观察；不执行旧输入，也不自动重试。另一会话持有的快照仍拒绝访问，不覆盖它。只允许最新截图操作，查看其它窗口会替换当前快照；旧图回看使用recall。
+
+窄输入栏或地址看不清时先局部截图；一次误点后不要继续猜坐标。联系人以完整地址和已提交标签核实，红色错误标签不算成功；下拉列表变化后重新定位。正文在确认焦点后整段输入，误输入先确定内容和选区，不靠盲目Backspace试错。用户要求只准备草稿时，禁止发送和发送快捷键。
