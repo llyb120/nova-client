@@ -12,7 +12,7 @@ const TEXT_LIMIT: u64 = 256 * 1024;
 const SHEET_LIMIT: u64 = 16 * 1024 * 1024;
 const IMAGE_LIMIT: u64 = 8 * 1024 * 1024;
 
-// 仅原生拖放事件可授予目录外文件访问；授权精确到文件，随应用退出清空。
+// 用户拖入或在侧栏打开的文件；授权精确到文件，随应用退出清空。
 static DROPPED_FILES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
@@ -434,9 +434,17 @@ pub async fn preview_workspace_file(
     path: String,
 ) -> Result<Preview, String> {
     let root = root(&state, &thread_id)?;
-    tauri::async_runtime::spawn_blocking(move || read_preview(&root, &path))
+    tauri::async_runtime::spawn_blocking(move || open_preview(&root, &path))
         .await
         .map_err(|e| e.to_string())?
+}
+
+fn open_preview(root: &Path, path: &str) -> Result<Preview, String> {
+    // 与系统打开一致，用户点击的绝对路径可以位于工作区外；不放开目录遍历。
+    if Path::new(path).is_absolute() {
+        allow_dropped_files(&[PathBuf::from(path)]);
+    }
+    read_preview(root, path)
 }
 
 fn save_text(root: &Path, path: &str, original: &str, text: &str) -> Result<(), String> {
@@ -557,6 +565,21 @@ pub async fn save_workspace_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clicked_external_file_can_be_previewed_without_allowing_its_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let file = external.path().join("修复包 0.1.4.zip");
+        fs::write(&file, b"PK\x03\x04\0").unwrap();
+        let sibling = external.path().join("private.txt");
+        fs::write(&sibling, "private").unwrap();
+        let preview = open_preview(workspace.path(), file.to_str().unwrap()).unwrap();
+        assert_eq!(preview.kind, "external");
+        assert_eq!(PathBuf::from(preview.path), file.canonicalize().unwrap());
+        assert!(read_preview(workspace.path(), sibling.to_str().unwrap()).is_err());
+        assert!(open_preview(workspace.path(), external.path().to_str().unwrap()).is_err());
+    }
+
     #[test]
     fn dropped_files_allow_only_explicit_files_outside_workspace() {
         let workspace = tempfile::tempdir().unwrap();

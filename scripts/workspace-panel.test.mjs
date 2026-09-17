@@ -40,6 +40,7 @@ const files = new Map([['D:/demo/src/main.ts', 'const value = 1;\\n']]);
 files.set('D:/demo/large.rs', '// ' + 'soft wrap '.repeat(80) + '\\n' + Array.from({length: 5000}, (_, i) => 'fn line_' + i + '() { let value = "hello"; }').join('\\n'));
 const reads = []; const directories = [];
 window.testReads = () => reads;
+api.openInExplorer = async path => { window.exploredPath = path; };
 window.testDirectories = () => directories;
 const searches = [];
 window.testSearches = () => searches;
@@ -66,7 +67,7 @@ setState({ currentId:'check', cwd:'D:/demo', items:[{type:'assistant',id:1,ts:0,
 const [visible, setVisible] = createSignal(true);
 const [fileRequest, setFileRequest] = createSignal(null);
 window.addEventListener('nova:preview-file', event => { setFileRequest(event.detail); setVisible(true); });
-render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button onClick={() => setVisible(true)}>打开面板</button><Markdown text="[会话中的文件](src/main.ts)" markFiles /></main><Show when={visible()}><WorkspacePanel threadId="check" request={fileRequest()} onClose={() => setVisible(false)}/></Show></div>, document.getElementById('root')!);
+render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button onClick={() => setVisible(true)}>打开面板</button><Markdown text="[下载修复包](/C:/Users/测试/修复包%200.1.4.zip)" /><Markdown text="[会话中的文件](src/main.ts)" markFiles /></main><Show when={visible()}><WorkspacePanel threadId="check" request={fileRequest()} onClose={() => setVisible(false)}/></Show></div>, document.getElementById('root')!);
 `);
   const port = 14000 + process.pid % 1000;
   // Vite colors the banner even when piped, which splits the literal "Local:".
@@ -88,6 +89,9 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   await page.goto(`http://127.0.0.1:${port}/${name}.html`, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.evaluate(() => document.documentElement.dataset.theme = 'ink-light');
   console.log('panel loaded');
+  await page.getByRole('link', {name:'下载修复包'}).click({button:'right'});
+  await page.getByRole('button', {name:'打开所在目录',exact:true}).click();
+  assert.equal(await page.evaluate(() => window.exploredPath), 'C:/Users/测试/修复包 0.1.4.zip');
   await page.getByRole('button', {name:'选择项目文件',exact:true}).waitFor();
   assert.equal(await page.locator('.workspace-picker').count(), 0, 'opening panel does not show picker');
   assert.deepEqual(await page.evaluate(() => window.testDirectories()), [], 'opening panel does not read directories');
