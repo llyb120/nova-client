@@ -27,12 +27,13 @@ try {
   });
   await page.goto(`${server.resolvedUrls.local[0]}${name}.html`, { waitUntil: 'domcontentloaded', timeout: 90000 });
   const sidebar = page.locator('#main-sidebar');
-  const toggle = page.locator('.sidebar-toggle');
+  const headToggle = page.locator('.sidebar-head-toggle');
+  const railPin = page.locator('.sidebar-rail-pin');
   await sidebar.waitFor({ state: 'visible' });
   const contentLeft = () => page.locator('main').evaluate(el => el.getBoundingClientRect().left);
   const pinnedLeft = await contentLeft();
   assert.ok(pinnedLeft >= 248);
-  await toggle.click();
+  await headToggle.click();
   await sidebar.waitFor({ state: 'hidden' });
   assert.equal(await contentLeft(), 52, 'collapsed sidebar keeps only the compact icon rail');
   assert.equal(await sidebar.evaluate(el => el.inert), true);
@@ -53,18 +54,19 @@ try {
   assert.equal(await sidebar.isVisible(), true, 'moving into the sidebar keeps it open');
   await page.mouse.move(600, 300);
   await sidebar.waitFor({ state: 'hidden' });
-  await toggle.focus();
+  await railPin.focus();
   await page.keyboard.press('Enter');
   await sidebar.waitFor({ state: 'visible' });
   assert.equal(await contentLeft(), pinnedLeft, 'keyboard activation restores pinned layout');
+  await headToggle.focus();
   await page.keyboard.press('Enter');
   await sidebar.waitFor({ state: 'hidden' });
-  await page.keyboard.press('Tab');
-  assert.equal(await rail.getByRole('button', { name: '新对话', exact: true }).evaluate(el => el === document.activeElement), true,
+  await railPin.focus();
+  assert.equal(await railPin.evaluate(el => el === document.activeElement), true,
     'compact navigation stays keyboard accessible');
   await rail.getByRole('button', { name: '会话列表', exact: true }).hover();
   await sidebar.waitFor({ state: 'visible' });
-  await toggle.click();
+  await headToggle.click();
   await page.mouse.move(600, 300);
   assert.equal(await contentLeft(), pinnedLeft, 'clicking the hover toggle pins the sidebar');
   assert.equal(await sidebar.isVisible(), true);

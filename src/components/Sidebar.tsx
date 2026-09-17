@@ -20,6 +20,7 @@ import {
   virgoHiddenThreads,
   zenRunningChains,
 } from "../store";
+import { sidebarLayout, setSidebarLayout } from "../sidebarLayout";
 import { agentLabel, agentShort, isScratch, scratchParent } from "../utils";
 import {
   IconBell,
@@ -66,7 +67,9 @@ export function Sidebar(props: {
   onOpenUpdate: () => void;
   onOpenInbox: () => void;
 }) {
-  const [collapsed, setCollapsed] = createSignal(false);
+  // 收起态与右侧文件栏同口径：全局持久化，重启后保持。
+  const collapsed = () => sidebarLayout.collapsed;
+  const setCollapsed = (value: boolean) => setSidebarLayout({ collapsed: value });
   const [hovered, setHovered] = createSignal(false);
   const [keyboardFocus, setKeyboardFocus] = createSignal(false);
   const sidebarOpen = () => !collapsed() || hovered() || keyboardFocus() || !!menu() || !!tmenu() || !!mergeFor();
@@ -552,24 +555,22 @@ export function Sidebar(props: {
       onPointerLeave={() => setHovered(false)}
     >
       <div class="sidebar-hover-edge" aria-hidden="true" onPointerEnter={() => setHovered(true)} />
-      <button
-        type="button"
-        class="sidebar-toggle"
-        title={collapsed() ? "固定展开侧边栏" : "收起为图标栏"}
-        aria-label={collapsed() ? "固定展开侧边栏" : "收起侧边栏"}
-        aria-controls="main-sidebar"
-        aria-expanded={sidebarOpen()}
-        onClick={() => {
-          setCollapsed(!collapsed());
-          setHovered(false);
-          setKeyboardFocus(false);
-        }}
-      >
-        <IconChevron size={16} />
-      </button>
       <Show when={collapsed()}>
         <nav class="sidebar-rail" aria-label="快捷导航">
-          <span class="sidebar-rail-brand" title="Nova"><IconLogo size={20} /></span>
+          <button
+            class="sidebar-rail-pin"
+            title="固定展开侧边栏"
+            aria-label="固定展开侧边栏"
+            aria-controls="main-sidebar"
+            aria-expanded={sidebarOpen()}
+            onClick={() => {
+              setCollapsed(false);
+              setHovered(false);
+              setKeyboardFocus(false);
+            }}
+          >
+            <IconChevron size={18} />
+          </button>
           <button title="新对话" aria-label="新对话" onClick={openHome}><IconPlus size={18} /></button>
           <button title="会话列表（悬停展开）" aria-label="会话列表" aria-controls="main-sidebar"
             aria-expanded={sidebarOpen()} onPointerEnter={() => setHovered(true)} onClick={() => setHovered(true)}>
@@ -618,17 +619,19 @@ export function Sidebar(props: {
       <div class="sidebar-head">
         <div class="brand">
           <IconLogo size={20} class="brand-icon" />
-          <span class="brand-name">Nova</span>
-          <Show when={version()}>
-            <button
-              type="button"
-              class="brand-version"
-              title="点击静默检查更新"
-              onClick={checkUpdateSilently}
-            >
-              v{version()}
-            </button>
-          </Show>
+          <div class="brand-text">
+            <span class="brand-name">Nova</span>
+            <Show when={version()}>
+              <button
+                type="button"
+                class="brand-version"
+                title="点击静默检查更新"
+                onClick={checkUpdateSilently}
+              >
+                v{version()}
+              </button>
+            </Show>
+          </div>
           <span class="brand-spacer" />
           <Show when={state.relay.enabled}>
             <div class="relay-badge-wrap">
@@ -687,6 +690,21 @@ export function Sidebar(props: {
               </Show>
             </button>
           </Show>
+          <button
+            type="button"
+            class="sidebar-head-toggle"
+            title={collapsed() ? "固定展开侧边栏" : "收起为图标栏"}
+            aria-label={collapsed() ? "固定展开侧边栏" : "收起侧边栏"}
+            aria-controls="main-sidebar"
+            aria-expanded={sidebarOpen()}
+            onClick={() => {
+              setCollapsed(!collapsed());
+              setHovered(false);
+              setKeyboardFocus(false);
+            }}
+          >
+            <IconChevron size={14} />
+          </button>
         </div>
         <button class="new-thread-btn" onClick={openHome}>
           <IconPlus size={15} />

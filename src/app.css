@@ -240,29 +240,25 @@ button {
   z-index: 20;
 }
 .sidebar-shell.collapsed .sidebar-hover-edge { display: block; }
-.sidebar-toggle {
-  position: absolute;
-  z-index: 21;
-  top: 22px;
-  left: 0;
-  width: 28px;
-  height: 38px;
-  display: grid;
-  place-items: center;
+/* 收起按钮并入 brand 行尾，与中继/更新徽标同高同行，不再悬浮于角落。 */
+.sidebar-head-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
   padding: 0;
-  border: 1px solid var(--border-strong);
-  border-left: 0;
-  border-radius: 0 999px 999px 0;
-  color: var(--text-muted);
-  background: var(--bg-panel);
-  box-shadow: 4px 5px 14px #0001;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-faint);
+  background: transparent;
 }
-.sidebar-shell.is-open .sidebar-toggle { left: var(--sidebar-width); }
-.sidebar-shell.collapsed .sidebar-toggle { left: var(--sidebar-rail-width); }
-.sidebar-shell.collapsed.is-open .sidebar-toggle { left: calc(var(--sidebar-rail-width) + var(--sidebar-width)); }
-.sidebar-shell:not(.collapsed) .sidebar-toggle svg { transform: rotate(180deg); }
-.sidebar-toggle:hover { color: var(--accent); }
-.sidebar-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sidebar-head-toggle:hover { color: var(--text); background: var(--bg-hover); }
+.sidebar-head-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sidebar-head-toggle svg { transition: transform .18s ease; }
+.sidebar-shell:not(.collapsed) .sidebar-head-toggle svg { transform: rotate(180deg); }
+.sidebar-rail-pin { margin-bottom: 12px; }
 
 .sidebar-rail {
   display: flex;
@@ -275,7 +271,6 @@ button {
   background: var(--sidebar-veil);
   border-right: 1px solid var(--border);
 }
-.sidebar-rail-brand { display: grid; place-items: center; height: 38px; margin-bottom: 12px; color: var(--accent); flex: none; }
 .sidebar-rail button {
   position: relative;
   display: grid;
@@ -310,7 +305,7 @@ button {
 .brand {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   padding: 0 2px 24px;
 }
 
@@ -319,17 +314,30 @@ button {
   flex: none;
 }
 
+/* 名称+版本号上下两行，给右侧徽标簇留出固定空间，有更新/收件箱时不再溢出。 */
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+}
+
 .brand-name {
   font-weight: 600;
   font-size: 19px;
   letter-spacing: -0.03em;
+  line-height: 1.2;
 }
 
 .brand-version {
-  padding: 2px 0 0;
+  padding: 1px 0 0;
   color: var(--text-faint);
   font-size: 10px;
-  line-height: 1;
+  line-height: 1.2;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .brand-version:hover {
   color: var(--text-dim);
@@ -3065,6 +3073,7 @@ button {
   }
   .brand-name,
   .brand-version,
+  .sidebar-head-toggle,
   .group-label span,
   .thread-title,
   .thread-history-meta,
@@ -5564,10 +5573,11 @@ body,
   align-items: center;
   gap: 3px;
   height: 22px;
-  padding: 0 6px;
+  padding: 0 4px;
   border-radius: 6px;
   color: var(--text-dim);
   position: relative;
+  flex: none;
 }
 .head-badge > svg {
   display: block;
