@@ -167,6 +167,41 @@ fn shot_folder(owner: &str) -> std::path::PathBuf {
     crate::lyra::config::nova_root().join("desktop-shots").join(format!("{:016x}", hash.finish()))
 }
 
+fn cursor_position() -> Option<(i32, i32)> {
+    #[cfg(windows)]
+    {
+        let mut p = windows_sys::Win32::Foundation::POINT { x:0, y:0 };
+        if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p) } != 0 {
+            return Some((p.x, p.y));
+        }
+    }
+    None
+}
+
+fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u32, u32), region: Option<Region>, position: (i32, i32)) -> Option<(u32, u32)> {
+    if surface.width == 0 || surface.height == 0 || source.0 == 0 || source.1 == 0 { return None; }
+    let r = region.unwrap_or(Region { x:0, y:0, width:source.0, height:source.1 });
+    if r.validate(source).is_err() { return None; }
+    let x = (position.0 as i128 - surface.x as i128) * source.0 as i128 - r.x as i128 * surface.width as i128;
+    let y = (position.1 as i128 - surface.y as i128) * source.1 as i128 - r.y as i128 * surface.height as i128;
+    let width = r.width as i128 * surface.width as i128;
+    let height = r.height as i128 * surface.height as i128;
+    if x < 0 || y < 0 || x >= width || y >= height { return None; }
+    let (x, y) = ((x * image.width() as i128 / width) as i32, (y * image.height() as i128 / height) as i32);
+    // Hollow high-contrast ring: preserve the target pixels at the hotspot.
+    for dy in -12i32..=12 {
+        for dx in -12i32..=12 {
+            let d = dx * dx + dy * dy;
+            if !(64..=144).contains(&d) { continue; }
+            let (px, py) = (x + dx, y + dy);
+            if px >= 0 && py >= 0 && px < image.width() as i32 && py < image.height() as i32 {
+                image.put_pixel(px as u32, py as u32, xcap::image::Rgba(if (81..=121).contains(&d) { [255,0,180,255] } else { [0,0,0,255] }));
+            }
+        }
+    }
+    Some((x as u32, y as u32))
+}
+
 fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, state: &mut Option<Snapshot>) -> Result<Value> {
     let started = Instant::now();
     let mut capture_ms = 0;
@@ -177,6 +212,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let folder = shot_folder(owner);
     std::fs::create_dir_all(&folder).map_err(err)?;
     let before = foreground()?;
+    let cursor_before = cursor_position();
     let mut shots = Vec::new();
     let mut images = Vec::new();
     let mut save = |surface: Surface, image: xcap::image::RgbaImage| -> Result<()> {
@@ -201,7 +237,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             xcap::image::imageops::crop_imm(&image, r.x, r.y, r.width, r.height).to_image()
         } else { image };
         let resize_started = Instant::now();
-        let image = if max_edge > 0 && image.width().max(image.height()) > max_edge {
+        let mut image = if max_edge > 0 && image.width().max(image.height()) > max_edge {
             let scale = max_edge as f64 / image.width().max(image.height()) as f64;
             let (width, height) = image.dimensions();
             xcap::image::DynamicImage::ImageRgba8(image).resize_exact(
@@ -210,12 +246,16 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
                 xcap::image::imageops::FilterType::Triangle).into_rgba8()
         } else { image };
         resize_ms += resize_started.elapsed().as_millis();
+        let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
+            .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
+            .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
         let path = folder.join(format!("{id}-{image_id}.png"));
         let encode_started = Instant::now();
         image.save(&path).map_err(err)?;
         encode_ms += encode_started.elapsed().as_millis();
         images.push(json!({"imageId":image_id,"path":path,"width":image.width(),"height":image.height(),
             "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
+            "cursor":cursor.map(|(x,y)| json!({"x":x,"y":y,"marker":"magenta-ring","source":"system-pointer"})),
             "region":region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height})),
             "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}}));
         shots.push(Shot {
@@ -743,6 +783,21 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cursor_marker_tracks_actual_position_in_scaled_regions() {
+        let surface = Surface { id:1, pid:None, x:-1920, y:-100, width:1920, height:1080 };
+        let region = Region { x:200, y:100, width:800, height:400 };
+        let original = xcap::image::RgbaImage::from_pixel(400, 200, xcap::image::Rgba([255,255,255,255]));
+        let mut image = original.clone();
+        assert_eq!(mark_cursor(&mut image, &surface, (3840,2160), Some(region), (-1620,50)), Some((200,100)));
+        assert_eq!(image.get_pixel(200,100), original.get_pixel(200,100));
+        assert_eq!(image.get_pixel(210,100).0, [255,0,180,255]);
+        assert_eq!(mark_cursor(&mut image, &surface, (3840,2160), Some(region), (-1820,-50)), Some((0,0)));
+        let unchanged = image.clone();
+        assert_eq!(mark_cursor(&mut image, &surface, (3840,2160), Some(region), (-1821,-50)), None);
+        assert_eq!(mark_cursor(&mut image, &surface, (3840,2160), Some(region), (-1420,-50)), None);
+        assert_eq!(image, unchanged);
+    }
     // Deterministic screenshot pipeline benchmark; no desktop input or live capture.
     #[test]
     #[ignore]
@@ -909,6 +964,12 @@ mod tests {
         assert_eq!(result["status"], "executed");
         assert_eq!(result["images"].as_array().unwrap().len(), 1);
         assert_eq!(result["images"][0]["imageId"], shot["images"][0]["imageId"]);
+        #[cfg(windows)]
+        {
+            let cursor = &result["images"][0]["cursor"];
+            assert!((cursor["x"].as_i64().expect("stationary system cursor") - 10).abs() <= 1);
+            assert!((cursor["y"].as_i64().unwrap() - 10).abs() <= 1);
+        }
         eprintln!("single-screen feedback timings: {}", result["timingsMs"]);
         let stale = run("test".into(), args).unwrap();
         assert_eq!(stale["status"], "not_executed");
