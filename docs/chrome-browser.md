@@ -1,5 +1,7 @@
 # Nova Chrome 独立扩展
 
+支持按任务检索、成功后提炼和复用反馈的本机[操作经验](tool-experiences.md)：`experience_search` / `experience_save` / `experience_feedback`。
+
 扩展独立安装和发布，右侧浏览器始终是 WebView。Agent 使用 webview 操作内置页面，使用 chrome 操作 Chrome，两者可同时使用。
 
 ## 安装

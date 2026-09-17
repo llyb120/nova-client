@@ -1552,6 +1552,22 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
     let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
     let thread_id = tool_owner(root, owner)?;
     let operation = args["operation"].as_str().unwrap_or_default();
+    if crate::tool_experience::is_operation(args) {
+        let observed = if operation == "experience_search" { None } else {
+            let tag = args["tabTag"].as_str().ok_or("经验保存/反馈需tabTag")?;
+            let state = app.state::<BrowserState>();
+            let observations = state.observations.lock().unwrap();
+            let observation = observations.get(&format!("chrome:{thread_id}:{tag}"))
+                .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
+                .ok_or("保存/反馈经验前需本会话该标签最新inspect/screenshot（180秒内）")?;
+            let url = tauri::Url::parse(observation.pages["pages"][0]["url"].as_str().ok_or("观察缺少网站URL")?).map_err(|e| e.to_string())?;
+            Some(url.origin().ascii_serialization())
+        };
+        let args = args.clone();
+        return tokio::task::spawn_blocking(move || crate::tool_experience::execute(
+            &crate::lyra::config::nova_root().join("tool-experiences"), "chrome", &thread_id, &args, observed.as_deref()))
+            .await.map_err(|e| e.to_string())?;
+    }
     let connection = crate::chrome_browser::connect(app).await?;
     if matches!(operation, "connect" | "status") {
         return Ok(connection);

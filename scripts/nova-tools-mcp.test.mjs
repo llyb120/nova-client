@@ -103,6 +103,15 @@ test("CodeBuddy direct mode describes polaris as a direct tool", () => {
 
 test("desktop optimizations are shared by custom tools and MCP, not Lyra-only", async () => {
   const { jianlai } = withContextService(() => createNovaBatchTools(process.cwd()));
+  for (const name of ["jianlai", "chrome"]) {
+    const tool = withContextService(() => createNovaBatchTools(process.cwd()))[name];
+    for (const operation of ["experience_search", "experience_save", "experience_feedback"]) {
+      assert(tool.inputSchema.properties.operation.enum.includes(operation));
+    }
+    assert.deepEqual(tool.inputSchema.properties.experience.required, ["scope", "task"]);
+    assert.match(tool.description, /首次观察后核对conditions/);
+    assert.match(tool.description, /executed不代表业务成功/);
+  }
   assert(jianlai.inputSchema.properties.operation.enum.includes('recall'));
   assert.equal(jianlai.inputSchema.properties.actions.items.properties.ms.maximum, 2000);
   assert.match(jianlai.description, /notes/);

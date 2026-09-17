@@ -847,7 +847,19 @@ fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, d
 pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
     let owner = crate::native_browser::tool_owner(root, owner)?;
     let args = args.clone();
-    tokio::task::spawn_blocking(move || run(owner, args))
+    tokio::task::spawn_blocking(move || {
+        if crate::tool_experience::is_operation(&args) {
+            let observed = if args["operation"] == "experience_search" { None } else {
+                let state = DESKTOP.try_lock().map_err(|_| "剑来正在操作桌面")?;
+                let snap = state.as_ref().filter(|s| s.owner == owner && args["snapshotId"].as_str() == Some(&s.id)
+                    && s.taken.elapsed() <= Duration::from_secs(180)).ok_or("保存/反馈经验前需本会话最新截图（180秒内）")?;
+                let id = snap.window.or(snap.foreground.map(|(id, _)| id)).ok_or("请截目标应用窗口后记录经验")?;
+                Some(crate::tool_experience::scope("jianlai", &window(id)?.app_name().map_err(err)?)?)
+            };
+            return crate::tool_experience::execute(&crate::lyra::config::nova_root().join("tool-experiences"), "jianlai", &owner, &args, observed.as_deref());
+        }
+        run(owner, args)
+    })
         .await
         .map_err(err)?
 }
