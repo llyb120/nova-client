@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nova Chrome",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "minimum_chrome_version": "125",
   "description": "自动连接 Nova，用稳定 tag 操作 Chrome，快捷复制当前标签页标识。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqMZEUPIx7tjeXzypowLUcZaBlPmdtv0vjPyY+1/MwRFjosUOj2hTz6kJbOqKZIkk25wJx02e4G35RpFdee/NguisDpW4iC3vc8quXoKksIzctgTGuOZGEizpIweSiEACQ37wBfZgKYKpNUjRHcsezdFwgSuQk+7F1mQSMWGNmefuYyuV4ffns7AmsOf3cJdY4Sn+XgQUnSLj+GSY6oWnNQ+IwDdlWx7lYbECxl+BseDRM/5qt0Xb543DHbgZt3P4VoakwT31JMoYPyq1iOdnfvXpwMxhVfXHZChartauvQGzVoTvXf1Vx66XF2JRkzWVBl5WYbOX5rCCP92IEclpKwIDAQAB",

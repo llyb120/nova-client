@@ -39,6 +39,17 @@ async function detach(tabId) {
   frameTargets.delete(tabId);
   if (attached.delete(tabId)) await chrome.debugger.detach({tabId}).catch(()=>{});
 }
+async function debuggerCall(command, invoke) {
+  const remaining = Math.min(3000, command.expiresAt - Date.now());
+  if (!(remaining > 0)) throw Error('命令已过期，未执行');
+  let timer;
+  try {
+    return await Promise.race([
+      invoke(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Chrome 调试命令响应超时；结果可能已执行，请先观察，不要重放动作')), remaining); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
 async function execute(command) {
   const {operation, args} = command;
   if (Date.now() > command.expiresAt) throw Error('命令已过期，未执行');
@@ -59,7 +70,7 @@ async function execute(command) {
     case 'stop': await detach(tab.id); break;
     case 'cdp': {
       if (!attached.has(tab.id)) {
-        await chrome.debugger.attach({tabId:tab.id},'1.3'); attached.add(tab.id);
+        await debuggerCall(command,()=>chrome.debugger.attach({tabId:tab.id},'1.3')); attached.add(tab.id);
       }
       // Recheck the tab after the asynchronous attach.
       await resolveTag(args.tabTag);
@@ -67,13 +78,13 @@ async function execute(command) {
       // Extension debugger sessions are auto-attach-only: direct target discovery/attach is forbidden.
       if(args.method==='Target.getTargets') {
         const params={autoAttach:true,waitForDebuggerOnStart:false,flatten:true};
-        await chrome.debugger.sendCommand({tabId:tab.id},'Target.setAutoAttach',params);
+        await debuggerCall(command,()=>chrome.debugger.sendCommand({tabId:tab.id},'Target.setAutoAttach',params));
         const visited=new Set();
         for(;;){
           const child=[...(frameTargets.get(tab.id)?.values() || [])].find(value=>!visited.has(value.sessionId));
           if(!child || visited.size>=12)break;
           visited.add(child.sessionId);
-          await chrome.debugger.sendCommand({tabId:tab.id,sessionId:child.sessionId},'Target.setAutoAttach',params);
+          await debuggerCall(command,()=>chrome.debugger.sendCommand({tabId:tab.id,sessionId:child.sessionId},'Target.setAutoAttach',params));
         }
         return {targetInfos:[...(frameTargets.get(tab.id)?.values() || [])].map(value=>value.targetInfo)};
       }
@@ -82,7 +93,7 @@ async function execute(command) {
         if(!child)throw Error('子框架已变化，请重新观察');
         return {sessionId:child.sessionId};
       }
-      try {return await chrome.debugger.sendCommand({tabId:tab.id,...(args.sessionId ? {sessionId:args.sessionId} : {})},args.method,args.params || {});} catch(error){throw Error(`${args.method}: ${error?.message || error}`);}
+      try {return await debuggerCall(command,()=>chrome.debugger.sendCommand({tabId:tab.id,...(args.sessionId ? {sessionId:args.sessionId} : {})},args.method,args.params || {}));} catch(error){throw Error(`${args.method}: ${error?.message || error}`);}
     }
     default: throw Error('未知 Chrome 操作');
   }

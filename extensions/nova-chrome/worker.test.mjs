@@ -4,6 +4,39 @@ import {readFile} from 'node:fs/promises';
 import {runInNewContext} from 'node:vm';
 import {webcrypto} from 'node:crypto';
 
+test('a stuck debugger command times out, polling resumes and late results are not replayed',async()=>{
+  const event=()=>({addListener(){}});
+  const replies=[]; let polls=0, calls=0, finishCommand;
+  const chrome={
+    storage:{session:{get:async()=>({}),set:async()=>{}}},
+    tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event()},
+    debugger:{attach:async()=>{},sendCommand:()=>{calls++;return new Promise(resolve=>{finishCommand=resolve;});},onDetach:event(),onEvent:event()},
+    runtime:{id:'test',onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()},
+  };
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async(url,options)=>{
+    const endpoint=new URL(url);
+    if(endpoint.port!=='47653')throw Error('offline');
+    if(endpoint.pathname==='/pair')return {ok:true,json:async()=>({token:'t'.repeat(32)})};
+    if(endpoint.pathname==='/reply'){replies.push(JSON.parse(options.body));return {ok:true};}
+    if(polls++>=2)return new Promise(()=>{});
+    const [tab]=await scope.api.inventory();
+    const command=polls===1
+      ? {id:'stuck',operation:'cdp',args:{tabTag:tab.tag,method:'Runtime.evaluate'},expiresAt:Date.now()+50}
+      : {id:'next',operation:'tabs',args:{},expiresAt:Date.now()+3000};
+    return {ok:true,json:async()=>({command})};
+  }};
+  const source=await readFile(new URL('./worker.js',import.meta.url),'utf8');
+  runInNewContext(source+'\nglobalThis.api={inventory};',scope);
+  for(let i=0;i<100 && replies.length<2;i++)await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(replies.length,2,'a hung debugger must not stop polling or block the shared queue');
+  assert.match(replies[0].error,/响应超时.*不要重放/);
+  assert.equal(replies[1].result.tabs.length,1);
+  finishCommand({late:true});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(calls,1);
+  assert.equal(replies.length,2,'late completion cannot send another reply');
+});
+
 test('stable tags, default access, auto-attached frames, expiry and worker restart',async()=>{
   const persisted={};let nativeCalls=[];const discovery=[];
   let tabs=[{id:11,url:'https://example.com/a',title:'A',active:true},{id:22,url:'https://example.org/b',title:'B',active:false}];
@@ -24,7 +57,7 @@ test('stable tags, default access, auto-attached frames, expiry and worker resta
   };
   const source=await readFile(new URL('./worker.js',import.meta.url),'utf8');
   const start=()=>{
-    const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,fetch:async url=>{discovery.push(url);throw Error('offline');}};
+    const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async url=>{discovery.push(url);throw Error('offline');}};
     runInNewContext(source+'\nglobalThis.api={inventory,execute,resolveTag};',scope);return scope.api;
   };
   const api=start();const initial=await api.inventory();
@@ -72,7 +105,7 @@ test('multiple Nova instances route replies independently, serialize commands an
     },onDetach:event(),onEvent:event()},
     runtime:{id:'test',onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()},
   };
-  const scope={chrome,crypto:webcrypto,URL,AbortSignal,fetch:async(url,options)=>{
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async(url,options)=>{
     const endpoint=new URL(url),port=Number(endpoint.port);
     if(!available.has(port))throw Error('offline');
     if(endpoint.pathname==='/pair'){
