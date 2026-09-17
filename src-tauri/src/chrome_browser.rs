@@ -89,6 +89,25 @@ pub(crate) fn tool_definition() -> Value {
         .expect("chrome tool schema")
 }
 
+async fn bind_listener(
+    ports: std::ops::RangeInclusive<u16>,
+) -> Result<tokio::net::TcpListener, String> {
+    let mut last_error = None;
+    for port in ports.clone() {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => last_error = Some(error),
+            Err(error) => return Err(format!("Chrome 本机端口 {port} 无法启动：{error}")),
+        }
+    }
+    Err(format!(
+        "Chrome 本机端口 {}–{} 均被占用：{}",
+        ports.start(),
+        ports.end(),
+        last_error.unwrap()
+    ))
+}
+
 pub(crate) async fn connect(app: &AppHandle) -> Result<Value, String> {
     let state = bridge(app);
     let _start = state.start.lock().await;
@@ -99,30 +118,18 @@ pub(crate) async fn connect(app: &AppHandle) -> Result<Value, String> {
             .join("chrome-extension");
         std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
         let path = directory.join("config.json");
-        let previous = match std::fs::read(&path) {
-            Ok(data) => Some(serde_json::from_slice::<Value>(&data).map_err(|e| e.to_string())?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.to_string()),
-        };
-        let port = std::env::var("NOVA_CHROME_PORT")
+        let ports = std::env::var("NOVA_CHROME_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(47653);
-        let token = previous
-            .as_ref()
-            .and_then(|v| v["token"].as_str())
-            .filter(|s| s.len() >= 32)
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!(
-                    "{}{}",
-                    uuid::Uuid::new_v4().simple(),
-                    uuid::Uuid::new_v4().simple()
-                )
-            });
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-            .await
-            .map_err(|e| format!("Chrome 本机端口无法启动（可能另一 Nova 实例正在使用）：{e}"))?;
+            .map(|port| port..=port)
+            .unwrap_or(47653..=47662);
+        // Pairing is automatic; each process owns its token, even when sharing a data directory.
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let listener = bind_listener(ports).await?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         std::fs::write(
             path,
@@ -359,12 +366,26 @@ pub async fn chrome_browser_ui(
         .ok_or("会话不存在")?;
     let mut args = args;
     args["operation"] = json!(operation);
-    crate::native_browser::execute_chrome(&root, &args).await
+    crate::native_browser::execute_chrome(&root, &args, &format!("ui:{id}")).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn occupied_port_falls_back_and_exhaustion_is_reported() {
+        let occupied = bind_listener(0..=0).await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let error = bind_listener(port..=port).await.unwrap_err();
+        assert!(error.contains("均被占用"));
+        // Ephemeral ports can include 65535; keep the fallback range non-empty.
+        if port < u16::MAX {
+            let next = bind_listener(port..=u16::MAX).await.unwrap();
+            assert_ne!(next.local_addr().unwrap().port(), port);
+            assert!(next.local_addr().unwrap().ip().is_loopback());
+        }
+    }
+
     #[tokio::test]
     async fn authenticated_bridge_roundtrip_and_cancelled_commands_are_not_replayed() {
         let state = Arc::new(ChromeBridge::new());

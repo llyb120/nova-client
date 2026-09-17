@@ -173,8 +173,6 @@ export function Composer() {
     const version = card ? clueCurrentVersion(card) : undefined;
     return { id: cardId, title: version?.title || "未命名线索" };
   });
-  const browserDebugMode = () =>
-    !!state.threads.find((item) => item.id === state.currentId)?.browserDebugMode;
   const openEvidenceChain = () => {
     const clue = activeClue();
     if (clue) {
@@ -599,18 +597,57 @@ export function Composer() {
   };
 
   return (
+    <>
+      <Show when={currentQueuedPrompts().length > 0}>
+        <div class="prompt-queue" aria-label="待发送提示词">
+          <div class="prompt-queue-head">
+            <span>待发送</span>
+            <small>{currentQueueHeld() ? "已停止，可手动发送或撤回" : "当前任务结束后自动发送"}</small>
+          </div>
+          <For each={currentQueuedPrompts()}>
+            {(item, index) => (
+              <div
+                class="prompt-queue-item"
+                classList={{ failed: failedQueueIds().has(item.id) }}
+              >
+                <span class="prompt-queue-index">{index() + 1}</span>
+                <span class="prompt-queue-text" title={item.text}>{item.text || "附件"}</span>
+                <Show when={item.images.length > 0}>
+                  <span class="prompt-history-attach" title={`${item.images.length} 个附件`}>
+                    <IconFile size={12} />
+                    {item.images.length}
+                  </span>
+                </Show>
+                <button
+                  type="button"
+                  class="prompt-queue-action"
+                  disabled={dispatchingQueueIds().has(item.id)}
+                  onClick={() => withdrawQueuedPrompt(item)}
+                  title="撤回到输入框"
+                >
+                  <IconUndo size={13} />
+                  撤回
+                </button>
+                <button
+                  type="button"
+                  class="prompt-queue-action send-now"
+                  disabled={dispatchingQueueIds().has(item.id) || (running() && !supportsSteer())}
+                  onClick={() => sendQueuedPromptNow(item, true)}
+                  title={failedQueueIds().has(item.id) ? "重试发送" : "立即作为引导发送"}
+                >
+                  <IconSend size={13} />
+                  {dispatchingQueueIds().has(item.id) ? "发送中" : "发送"}
+                </button>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
     <div
       class="composer"
       classList={{ "is-dragging": attach.dragging() }}
     >
       <noteFlow.Notes />
-      <Show when={browserDebugMode()}>
-        <div class="clue-context-chip" title="后续轮次持续携带 Playwright browser 工具；发送 /browser-exit 退出">
-          <span class="clue-context-label">浏览器调试模式</span>
-          <span class="clue-context-separator" aria-hidden="true" />
-          <span class="clue-context-title">/browser-exit 退出</span>
-        </div>
-      </Show>
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
       <Show when={manualReview()}>
         {(review) => (
@@ -660,51 +697,6 @@ export function Composer() {
             <span class="clue-context-title">{clue().title}</span>
           </div>
         )}
-      </Show>
-      <Show when={currentQueuedPrompts().length > 0}>
-        <div class="prompt-queue" aria-label="待发送提示词">
-          <div class="prompt-queue-head">
-            <span>待发送</span>
-            <small>{currentQueueHeld() ? "已停止，可手动发送或撤回" : "当前任务结束后自动发送"}</small>
-          </div>
-          <For each={currentQueuedPrompts()}>
-            {(item, index) => (
-              <div
-                class="prompt-queue-item"
-                classList={{ failed: failedQueueIds().has(item.id) }}
-              >
-                <span class="prompt-queue-index">{index() + 1}</span>
-                <span class="prompt-queue-text" title={item.text}>{item.text || "附件"}</span>
-                <Show when={item.images.length > 0}>
-                  <span class="prompt-history-attach" title={`${item.images.length} 个附件`}>
-                    <IconFile size={12} />
-                    {item.images.length}
-                  </span>
-                </Show>
-                <button
-                  type="button"
-                  class="prompt-queue-action"
-                  disabled={dispatchingQueueIds().has(item.id)}
-                  onClick={() => withdrawQueuedPrompt(item)}
-                  title="撤回到输入框"
-                >
-                  <IconUndo size={13} />
-                  撤回
-                </button>
-                <button
-                  type="button"
-                  class="prompt-queue-action send-now"
-                  disabled={dispatchingQueueIds().has(item.id) || (running() && !supportsSteer())}
-                  onClick={() => sendQueuedPromptNow(item, true)}
-                  title={failedQueueIds().has(item.id) ? "重试发送" : "立即作为引导发送"}
-                >
-                  <IconSend size={13} />
-                  {dispatchingQueueIds().has(item.id) ? "发送中" : "发送"}
-                </button>
-              </div>
-            )}
-          </For>
-        </div>
       </Show>
       <Show when={slashQuery() !== null}>
         <div ref={slashMenuRef} class="slash-menu">
@@ -835,5 +827,6 @@ export function Composer() {
         </div>
       </div>
     </div>
+    </>
   );
 }

@@ -1,4 +1,4 @@
-import { processSegments, processSummary, processLiveLines } from "../processDisplay";
+import { processSegments, processSummary, processLiveLines, splitTurnBody } from "../processDisplay";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { message } from "@tauri-apps/plugin-dialog";
 import {
@@ -1515,22 +1515,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         y += 18; // -8 top absorbed + 8 bottom + content ~18
       }
 
-      // Match DOM (TurnGroup): only split conclusion after the turn is finalized.
-      // Mid-stream progress assistant/system lines must stay in original order.
-      let process = g.body;
-      let conclusion: typeof g.body = [];
-      if (g.turn) {
-        const lastConc = g.body.findLastIndex(it => it.type === "assistant" || it.type === "system");
-        let firstConc = lastConc;
-        if (firstConc >= 0) {
-          while (firstConc > 0 && (g.body[firstConc - 1].type === "assistant" || g.body[firstConc - 1].type === "system"))
-            firstConc--;
-        }
-        if (firstConc >= 0) {
-          process = [...g.body.slice(0, firstConc), ...g.body.slice(lastConc + 1)];
-          conclusion = g.body.slice(firstConc, lastConc + 1);
-        }
-      }
+      const { process, conclusion } = splitTurnBody(g.body, !!g.turn);
 
       // Body content follows: commit user bottom margin (don't defer past fold/assistant).
       if ((g.turn && process.length) || process.length > 0 || conclusion.length > 0) flushBottom();

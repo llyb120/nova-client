@@ -6,17 +6,14 @@ import { SkyBackdrop } from "./components/SkyBackdrop";
 import { EvidenceChainView } from "./components/EvidenceChainView";
 import { HomeView } from "./components/HomeView";
 import { ExclusiveChatMark } from "./components/ExclusiveChatMark";
-import BrowserView from "./components/BrowserView";
 import { RoamRequestModal } from "./components/RoamRequestModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { ShareInboxModal } from "./components/ShareInboxModal";
 import { Sidebar } from "./components/Sidebar";
 import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
-import { TrainingGroundView } from "./components/TrainingGroundView";
 import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
-import "./training-ground.css";
 import { selectedChatText } from "./chatSelection";
 import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
 import { mountSessionShortcuts } from "./sessionShortcuts";
@@ -223,13 +220,7 @@ export default function App() {
         fallback={
           <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
-          <Show when={state.view === "browser"} fallback={
-            <Show when={state.view === "training"} fallback={<HomeView />}>
-              <TrainingGroundView />
-            </Show>
-          }>
-            <BrowserView />
-          </Show>
+            <HomeView />
           }>
             <EvidenceChainView />
           </Show>

@@ -15,12 +15,12 @@ import {
   openNewSession,
   openThread,
   setUnreadTurns,
-  setTrainingProject,
   setView,
   state,
   virgoHiddenThreads,
   zenRunningChains,
 } from "../store";
+import { sidebarLayout, setSidebarLayout } from "../sidebarLayout";
 import { agentLabel, agentShort, isScratch, scratchParent } from "../utils";
 import {
   IconBell,
@@ -28,7 +28,6 @@ import {
   IconCheck,
   IconChevron,
   IconClue,
-  IconBrowser,
   IconDownload,
   IconFolder,
   IconGear,
@@ -68,6 +67,25 @@ export function Sidebar(props: {
   onOpenUpdate: () => void;
   onOpenInbox: () => void;
 }) {
+  // 收起态与右侧文件栏同口径：全局持久化，重启后保持。
+  const collapsed = () => sidebarLayout.collapsed;
+  const setCollapsed = (value: boolean) => setSidebarLayout({ collapsed: value });
+  const [hovered, setHovered] = createSignal(false);
+  let hoverTimer: number | undefined;
+  const cancelHover = () => {
+    window.clearTimeout(hoverTimer);
+    hoverTimer = undefined;
+  };
+  const scheduleHover = () => {
+    if (!collapsed() || hovered() || hoverTimer !== undefined) return;
+    hoverTimer = window.setTimeout(() => {
+      hoverTimer = undefined;
+      setHovered(true);
+    }, 180);
+  };
+  onCleanup(cancelHover);
+  const [keyboardFocus, setKeyboardFocus] = createSignal(false);
+  const sidebarOpen = () => !collapsed() || hovered() || keyboardFocus() || !!menu() || !!tmenu() || !!mergeFor();
   const [version, setVersion] = createSignal("");
   let updateCheckTimer: number | undefined;
   let updateCheckClick = 0;
@@ -100,28 +118,15 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "virgo") => {
     setView(view);
     closeThread();
   };
   const openHome = () => openNewSession();
   const openClues = () => switchView("clues");
-  const openTraining = () => {
-    const recent = state.threads.find((thread) => !thread.experienceThread);
-    const cwd = recent?.worktree?.repo || recent?.cwd || state.projects[0]?.worktree?.repo || state.projects[0]?.path || "";
-    if (!cwd) {
-      void message("请先创建或选择一个项目，再打开大熊座。", { kind: "info" });
-      return;
-    }
-    setTrainingProject(cwd);
-    switchView("training");
-  };
   const openWorkflows = () => switchView("workflows");
-  const openBrowser = () => switchView("browser");
   const openVirgo = () => switchView("virgo");
 
-  const isTrainingView = () => state.view === "training";
-  const isBrowserView = () => state.view === "browser";
   // 减少焦虑（高级设置开启）：运行中的任务链移入室女座，普通模式不再显示，结束后自动移回。
   // 未开启时室女座仍是手动收纳位：快捷键收起的会话放在这里，tab 随收纳内容出现/隐藏。
   const zenMode = () => !!state.settings?.zenModeEnabled;
@@ -155,17 +160,7 @@ export function Sidebar(props: {
   const threadOf = (id: string) => state.threads.find((item) => item.id === id);
   const openHistoryThread = async (id: string) => {
     const thread = state.threads.find((item) => item.id === id);
-    // 大熊座、双子座会话各自保持对应 tab；减少焦虑模式下运行中的普通会话留在室女座，其余回到普通模式。
-    if (thread?.experienceThread) setTrainingProject(thread.worktree?.repo || thread.cwd);
-    setView(
-      thread?.experienceThread
-        ? "training"
-        : thread?.browserThread
-          ? "browser"
-          : thread && zenMode() && inRunningChain(thread)
-            ? "virgo"
-            : "home",
-    );
+    setView(thread && zenMode() && inRunningChain(thread) ? "virgo" : "home");
     // 打开时若链上仍有其它阶段未读，仅消费一条未读（聚合徽标 -1）；本 stage 自身清零。
     if (state.unreadTurns[id] && chainUnreadTurns(threadOf(id)) > 1) {
       setUnreadTurns(id, Math.max((state.unreadTurns[id] ?? 1) - 1, 0));
@@ -198,13 +193,9 @@ export function Sidebar(props: {
   };
 
   const currentGroups = createMemo(() => {
-    const threads = isTrainingView()
-      ? state.threads.filter((t) => t.experienceThread)
-      : isBrowserView()
-        ? state.threads.filter((t) => t.browserThread)
-        : isVirgoView()
-          ? state.threads.filter((t) => !t.experienceThread && !t.browserThread && inRunningChain(t))
-          : state.threads.filter((t) => !t.experienceThread && !t.browserThread && !inRunningChain(t));
+    const threads = isVirgoView()
+        ? state.threads.filter((t) => !t.experienceThread && inRunningChain(t))
+        : state.threads.filter((t) => !t.experienceThread && !inRunningChain(t));
     return groupByCwd(threads);
   });
 
@@ -249,7 +240,7 @@ export function Sidebar(props: {
     rows.sort((a, b) => b.chainUpdatedAt - a.chainUpdatedAt);
     return rows;
   };
-  const showHistoryByTime = () => isBrowserView() || state.settings?.historyDisplayMode === "time";
+  const showHistoryByTime = () => state.settings?.historyDisplayMode === "time";
   const timeRows = createMemo(() => {
     const effectiveUpdatedAt = (row: ThreadTreeRow) =>
       row.chainUpdatedAt ?? Math.max(row.thread.updatedAt, row.mergedChild?.updatedAt ?? 0);
@@ -571,21 +562,95 @@ export function Sidebar(props: {
   };
 
   return (
-    <aside class="sidebar">
+    <div
+      class="sidebar-shell"
+      classList={{ collapsed: collapsed(), "is-open": sidebarOpen() }}
+      onPointerLeave={() => { cancelHover(); setHovered(false); }}
+    >
+      <Show when={collapsed()}>
+        <nav class="sidebar-rail" aria-label="快捷导航"
+          onPointerMove={(e) => {
+            // 快速移入可能跳过窄边；空白区域都可展开，快捷按钮仍独立操作。
+            const button = (e.target as Element).closest("button");
+            if (!button || button.classList.contains("sidebar-rail-list")) scheduleHover();
+            else cancelHover();
+          }}>
+          <button
+            class="sidebar-rail-pin"
+            title="固定展开侧边栏"
+            aria-label="固定展开侧边栏"
+            aria-controls="main-sidebar"
+            aria-expanded={sidebarOpen()}
+            onClick={() => {
+              cancelHover();
+              setCollapsed(false);
+              setHovered(false);
+              setKeyboardFocus(false);
+            }}
+          >
+            <IconChevron size={18} />
+          </button>
+          <button title="新对话" aria-label="新对话" onClick={openHome}><IconPlus size={18} /></button>
+          <button class="sidebar-rail-list" title="会话列表（悬停展开）" aria-label="会话列表" aria-controls="main-sidebar"
+            aria-expanded={sidebarOpen()} onClick={() => { cancelHover(); setHovered(true); }}>
+            <IconFolder size={18} />
+          </button>
+          <button title="工作流" aria-label="工作流" classList={{ active: state.view === "workflows" }} onClick={openWorkflows}>
+            <IconMerge size={18} />
+            <Show when={state.workflowInbox.length > 0}><span class="sidebar-rail-dot" /></Show>
+          </button>
+          <button title="证据链" aria-label="证据链" classList={{ active: state.view === "clues" }} onClick={openClues}>
+            <IconClue size={18} />
+            <Show when={state.unreadClueMentions.length > 0}><span class="sidebar-rail-dot" /></Show>
+          </button>
+          <Show when={virgoVisible()}>
+            <button title="室女座" aria-label="室女座" classList={{ active: state.view === "virgo" }} onClick={openVirgo}>
+              <IconLogo size={18} />
+              <Show when={virgoChainCount() > 0}><span class="sidebar-rail-dot" /></Show>
+            </button>
+          </Show>
+          <div class="sidebar-rail-spacer" />
+          <Show when={state.inbox.length > 0}>
+            <button title="收件箱" aria-label="收件箱" onClick={props.onOpenInbox}>
+              <IconBell size={18} /><span class="sidebar-rail-dot" />
+            </button>
+          </Show>
+          <Show when={state.update?.staged || state.updateStaging}>
+            <button title="版本更新" aria-label="版本更新" onClick={props.onOpenUpdate}><IconDownload size={18} /></button>
+          </Show>
+          <button title="成就" aria-label="成就" onClick={props.onOpenAchievements}>
+            <IconTrophy size={18} />
+            <Show when={state.unseenAchievementIds.length > 0}><span class="sidebar-rail-dot" /></Show>
+          </button>
+          <button title="设置" aria-label="设置" onClick={props.onOpenSettings}><IconGear size={18} /></button>
+        </nav>
+      </Show>
+    <aside
+      id="main-sidebar"
+      class="sidebar"
+      inert={!sidebarOpen()}
+      onPointerEnter={() => setHovered(true)}
+      onFocusIn={(e) => setKeyboardFocus(e.target.matches(":focus-visible"))}
+      onFocusOut={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setKeyboardFocus(false);
+      }}
+    >
       <div class="sidebar-head">
         <div class="brand">
           <IconLogo size={20} class="brand-icon" />
-          <span class="brand-name">Nova</span>
-          <Show when={version()}>
-            <button
-              type="button"
-              class="brand-version"
-              title="点击静默检查更新"
-              onClick={checkUpdateSilently}
-            >
-              v{version()}
-            </button>
-          </Show>
+          <div class="brand-text">
+            <span class="brand-name">Nova</span>
+            <Show when={version()}>
+              <button
+                type="button"
+                class="brand-version"
+                title="点击静默检查更新"
+                onClick={checkUpdateSilently}
+              >
+                v{version()}
+              </button>
+            </Show>
+          </div>
           <span class="brand-spacer" />
           <Show when={state.relay.enabled}>
             <div class="relay-badge-wrap">
@@ -644,6 +709,22 @@ export function Sidebar(props: {
               </Show>
             </button>
           </Show>
+          <button
+            type="button"
+            class="sidebar-head-toggle"
+            title={collapsed() ? "固定展开侧边栏" : "收起为图标栏"}
+            aria-label={collapsed() ? "固定展开侧边栏" : "收起侧边栏"}
+            aria-controls="main-sidebar"
+            aria-expanded={sidebarOpen()}
+            onClick={() => {
+              cancelHover();
+              setCollapsed(!collapsed());
+              setHovered(false);
+              setKeyboardFocus(false);
+            }}
+          >
+            <IconChevron size={14} />
+          </button>
         </div>
         <button class="new-thread-btn" onClick={openHome}>
           <IconPlus size={15} />
@@ -689,14 +770,6 @@ export function Sidebar(props: {
             </button>
           </div>
           <div class="mode-seg secondary">
-            <button
-              class="mode-seg-btn"
-              classList={{ active: state.view === "training" }}
-              onClick={openTraining}
-              title="大熊座：查看隔离的训练记录、北斗七星专家经验，并进行点赞点踩"
-            >
-              大熊座
-            </button>
             <Show when={virgoVisible()}>
               <button
                 id="virgo-tab"
@@ -720,15 +793,6 @@ export function Sidebar(props: {
                 </Show>
               </button>
             </Show>
-            <button
-              class="mode-seg-btn"
-              classList={{ active: state.view === "browser" }}
-              onClick={openBrowser}
-              title="内嵌浏览器：录制操作、框选标记并编排为 Playwright 计划"
-            >
-              <IconBrowser size={14} />
-              双子座
-            </button>
           </div>
 
         </div>
@@ -739,13 +803,9 @@ export function Sidebar(props: {
           when={currentGroups().length > 0}
           fallback={
             <div class="thread-empty">
-              {isTrainingView()
-                ? "还没有训练会话。点击右侧“立即训练”开始。"
-                : isVirgoView()
+              {isVirgoView()
                   ? "没有正在运行的会话。运行中的会话会暂时移到这里，结束后自动回到普通模式。"
-                  : isBrowserView()
-                    ? "还没有双子座执行会话。运行一个片段后会显示在这里。"
-                    : "还没有会话。在右侧输入任务开始。"}
+                  : "还没有会话。在右侧输入任务开始。"}
             </div>
           }
         >
@@ -986,5 +1046,6 @@ export function Sidebar(props: {
         </div>
       </Show>
     </aside>
+    </div>
   );
 }

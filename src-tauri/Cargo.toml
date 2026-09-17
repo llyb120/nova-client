@@ -22,6 +22,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 base64 = "0.22"
+enigo = "0.6.1"
+xcap = "0.9.8"
 flate2 = "1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "native-tls", "blocking", "system-proxy", "socks", "stream", "multipart"] }
@@ -75,3 +77,16 @@ tempfile = "3"
 [profile.release]
 strip = true
 lto = true
+
+# Keep screenshot resize/PNG processing fast in NovaDev without optimizing app code.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3

@@ -73,26 +73,6 @@ export function getSlashSuggestions(
       input: "/run ",
     },
     {
-      name: "train",
-      description: "立即用大熊座配置的模型训练一次经验库",
-      kind: "Nova",
-      input: "/train",
-    },
-    ...(agentKind === "lyra" ? [
-      {
-        name: "browser",
-        description: "进入持续的 Playwright 前端调试模式：/browser 网址和任务",
-        kind: "Nova",
-        input: "/browser ",
-      },
-      {
-        name: "browser-exit",
-        description: "退出 Playwright 前端调试模式",
-        kind: "Nova",
-        input: "/browser-exit",
-      },
-    ] : []),
-    {
       name: "setup",
       description: "把一个模型 / provider 接入 Lyra：/setup 模型名",
       kind: "Nova",

@@ -10,7 +10,6 @@ import type {
   ClueAttachment,
   ClueContextSnapshot,
   ClueNodeGroup,
-  ExperienceOverview,
   GlobalAgentInstructions,
   IncomingShare,
   IncomingWorkflowShare,
@@ -404,15 +403,6 @@ export const api = {
   /** 把 worktree 会话的分支合并到目标分支；返回 "merged" 或 "conflict"（冲突已交给该会话的 AI 解决） */
   mergeWorktreeThread: (threadId: string, targetBranch: string) =>
     invoke<"merged" | "conflict">("merge_worktree_thread", { threadId, targetBranch }),
-
-  // 猎户座（经验训练会话与普通会话隔离）
-  listExperiences: (cwd: string) => invoke<ExperienceOverview>("list_experiences", { cwd }),
-  feedbackExperience: (cwd: string, experienceId: string, reward: number) =>
-    invoke<{ updated: number; reward: number }>("feedback_experience", { cwd, experienceId, reward }),
-  deleteExperience: (cwd: string, experienceId: string) =>
-    invoke<{ deleted: number }>("delete_experience", { cwd, experienceId }),
-  evolveExperiences: (cwd: string) => invoke<{ generation: number; created: number; reviewed: number; rejected: number; crossed: number; mutated: number; migrated: number; quarantined: number }>("evolve_experiences", { cwd }),
-  trainExperience: (cwd: string) => invoke<{ trained: boolean; learned?: number; reason?: string; sessionId?: string }>("train_experience", { cwd }),
 
   // Skills（集中管理 ~/.nova/skills，启动后端时软链接到各 agent 全局目录）
   listSkills: () => invoke<SkillInfo[]>("list_skills"),

@@ -38,7 +38,7 @@ server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
   }
   try {
     const text = await tool.execute(params.arguments ?? {});
-    if (["webview", "chrome"].includes(params.name)) return await webviewMcpResult(String(text ?? ""));
+    if (["webview", "chrome", "jianlai"].includes(params.name)) return await webviewMcpResult(String(text ?? ""));
     return { content: [{ type: "text", text: String(text ?? "") }] };
   } catch (error) {
     return {

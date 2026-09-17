@@ -32,7 +32,6 @@ import {
   quotaPeers,
   roamingPeers,
   sendPrompt,
-  setTrainingProject,
   setView,
   state,
   stashWorktreePrompt,
@@ -628,25 +627,6 @@ export function HomeView() {
     const quota = quotaPeer();
     const workflow = !target && !quota ? selectedWorkflow() : null;
     const clue = state.pendingClueCard;
-    if (t === "/train" && images.length === 0) {
-      if (busy()) return;
-      setBusy(true);
-      try {
-        setTrainingProject(cwd());
-        const result = await api.trainExperience(cwd());
-        setText("");
-        setSlashStart(null);
-        // 大熊座训练静默进行：成功/无新会话均不弹窗，错误仍提示；
-        // 训练完成会切换到训练视图，用户可在那里看到最新结果。
-        if (!result.trained && result.reason === "noNewSessions") return;
-        setView("training");
-      } catch (error) {
-        await message(String(error), { kind: "error" });
-      } finally {
-        setBusy(false);
-      }
-      return;
-    }
     if (
       (!t && images.length === 0) ||
       busy() ||
@@ -1018,7 +998,7 @@ export function HomeView() {
     }
   };
 
-  // 训练与世代演进会话只在训练视图展示，不进入首页最近会话；
+  // 旧版本训练记录继续隔离，不进入首页最近会话；
   // 减少焦虑模式下运行中的任务链、以及快捷键手动收进室女座的会话都不再出现在最近会话。
   const recent = createMemo(() => {
     const hidden = virgoHiddenThreads();

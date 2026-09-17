@@ -131,18 +131,14 @@ export interface ThreadMeta {
   quotaPeerName?: string | null;
   /** 非空：该会话在独立 git worktree 中执行 */
   worktree?: Worktree | null;
-  /** 猎户座训练会话：仅在猎户座历史展示 */
+  /** 兼容旧版本训练记录，仅用于保持历史隔离。 */
   experienceThread?: boolean;
-  /** 双子座浏览器执行会话：仅在双子座历史展示 */
-  browserThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** 普通 /stage 引用的源会话；用于导航显示 Stage 自己的会话名。 */
   stageSourceThreadId?: string | null;
   /** 当前会话在证据链中的线索位置 */
   activeClueCardId?: string | null;
-  /** 已进入 Lyra Playwright 前端调试模式 */
-  browserDebugMode?: boolean;
 }
 
 /** 用户随 prompt 带上的附件。图片可带 base64，普通文件走 file:// resource_link。 */
@@ -291,17 +287,13 @@ export interface Thread {
   quotaPeerName?: string | null;
   /** 非空：该会话在独立 git worktree 中执行（cwd 已指向该 worktree 工作目录） */
   worktree?: Worktree | null;
-  /** 猎户座训练会话：仅在猎户座历史展示 */
+  /** 兼容旧版本训练记录，仅用于保持历史隔离。 */
   experienceThread?: boolean;
-  /** 双子座浏览器执行会话：仅在双子座历史展示 */
-  browserThread?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** Stage 会话动态引用的源会话。 */
   stageSourceThreadId?: string | null;
   activeClueCardId?: string | null;
-  /** 已进入 Lyra Playwright 前端调试模式 */
-  browserDebugMode?: boolean;
   clueContext?: ClueContextSnapshot | null;
   createdAt: number;
   updatedAt: number;
@@ -505,84 +497,8 @@ export interface Settings {
   sessionAutoCleanupHours: number;
   /** 减少焦虑（室女座）：运行中的会话只在室女座显示，结束后自动回到普通模式 */
   zenModeEnabled: boolean;
-  /** 独立经验库训练；经验不同于客观记忆和必须遵守的守则。开启后 Lyra polaris 也会并行召回训练知识。 */
-  experienceTrainingEnabled: boolean;
-  experienceTrainingAgent: AgentKind;
-  experienceTrainingModel: string;
-  experienceTrainingIntervalMinutes: number;
-  experienceEvolutionIntervalMinutes: number;
-  experienceExperts: ExperienceExpertConfig[];
   /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程并供工作流 {{xx}} 替换。 */
   customEnvVars: Record<string, string>;
-}
-
-export interface ExperienceEntry {
-  id: string;
-  expertId: string;
-  kind: "experience" | "memory" | "rule";
-  /** 产生该知识的项目标识；按 Git 仓库根归一，同仓库目录和 worktree 相同。 */
-  projectId: string;
-  /** 产生该知识的 Git 仓库根路径，用于展示和审计。 */
-  projectRoot: string;
-  /** universal = 泛用；project = 仅当前项目。 */
-  knowledgeScope: "universal" | "project";
-  trigger: string;
-  action: string;
-  avoid: string;
-  scope: string[];
-  sourceThreadIds: string[];
-  confidence: number;
-  utility: number;
-  positiveCount: number;
-  negativeCount: number;
-  /** 当前用户单票评价；模型反馈仍可累计到计数。 */
-  userFeedback: -1 | 0 | 1;
-  hitCount: number;
-  updatedAt: number;
-  status: string;
-}
-
-export interface ExperienceTrainingSession {
-  id: string;
-  createdAt: number;
-  agentKind: string;
-  model: string;
-  expertId: string;
-  sourceThreadIds: string[];
-  conversation: string;
-  output: string;
-  status: string;
-  error: string;
-}
-
-export interface ExperienceExpertRef {
-  id: string;
-  name: string;
-}
-
-export interface ExperienceOverview {
-  /** 当前项目根；同一 Git 仓库的 worktree 会归一到主工作树。 */
-  projectRoot: string;
-  experiences: ExperienceEntry[];
-  /** 全部已配置专家；即使尚未产出知识也会返回。 */
-  experts: ExperienceExpertRef[];
-  lastTrainAt: number;
-  trainingCycles: number;
-  evolutionGeneration: number;
-  training: boolean;
-}
-
-export interface ExperienceExpertConfig {
-  id: string;
-  name: string;
-  writeRate: number;
-  valueLearningRate: number;
-  forgetRate: number;
-  mutationRate: number;
-  migrationRate: number;
-  abstractionLevel: number;
-  noveltyPreference: number;
-  negativeSensitivity: number;
 }
 
 export interface AgentInstructionTarget {

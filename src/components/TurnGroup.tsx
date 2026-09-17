@@ -1,6 +1,6 @@
 import "./ProcessBlock.css";
 import { createMemo, For, Show } from "solid-js";
-import { processSegments, processSummary, processLiveLines } from "../processDisplay";
+import { processSegments, processSummary, processLiveLines, splitTurnBody } from "../processDisplay";
 import { state, toggleExpanded } from "../store";
 import type { Item, TurnItem, UserItem } from "../types";
 import { EditedFilesCard } from "./EditedFilesCard";
@@ -175,26 +175,7 @@ export function TurnGroup(props: { group: Group; active: boolean }) {
   // 仅在轮次真正结束（有 turn 标记）后才拆结论区。运行中即使本分组不是
   // active（后面又跟了引导提示开了新组），也不能按 !active 抽结论，否则上一截
   // 会像已收束，看起来会话停了。
-  const split = createMemo(() => {
-    const body = props.group.body;
-    if (!props.group.turn) return { process: body, conclusion: [] };
-    const lastConclusion = body.findLastIndex(
-      (item) => item.type === "assistant" || item.type === "system",
-    );
-    if (lastConclusion < 0) return { process: body, conclusion: [] };
-    let firstConclusion = lastConclusion;
-    while (
-      firstConclusion > 0 &&
-      (body[firstConclusion - 1].type === "assistant" ||
-        body[firstConclusion - 1].type === "system")
-    ) {
-      firstConclusion--;
-    }
-    return {
-      process: [...body.slice(0, firstConclusion), ...body.slice(lastConclusion + 1)],
-      conclusion: body.slice(firstConclusion, lastConclusion + 1),
-    };
-  });
+  const split = createMemo(() => splitTurnBody(props.group.body, !!props.group.turn));
 
   const foldLabel = () => {
     const t = props.group.turn;

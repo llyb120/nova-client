@@ -941,8 +941,7 @@ async fn sync(transport: &RemoteTransport, value: &Value) -> Result<ServerRespon
 
 fn eligible(t: &Thread) -> bool {
     t.roaming_role.is_none()
-        // 猎户座的经验训练与世代演进会话只在本地训练视图展示，
-        // 不进入网页端最近会话，也不上传目录、元数据或会话内容。
+        // 旧版本的训练记录继续保持本地隔离，不因功能移除而上传。
         && !t.experience_thread
         && crate::server::path_allowed(&t.cwd)
 }

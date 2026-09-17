@@ -390,42 +390,6 @@ pub fn format_skills_prompt(skills: &[Skill]) -> String {
 }
 
 /// 展开 /skill:<name> 调用：替换为技能文件路径提示。
-pub fn is_browser_command(text: &str) -> bool {
-    text.trim_start()
-        .strip_prefix("/browser")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-}
-
-pub fn is_browser_exit_command(text: &str) -> bool {
-    text.trim().eq_ignore_ascii_case("/browser-exit")
-}
-
-pub fn expand_browser_command(text: &str) -> Option<String> {
-    let rest = text.trim_start().strip_prefix("/browser")?;
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|character| !character.is_whitespace())
-    {
-        return None;
-    }
-    let task = rest.trim();
-    let mut expanded = "用户已进入持续的浏览器调试模式。首个动作优先直接调用 browser open 打开用户给出的网址，不要在页面打开前扫描代码仓库；页面打开后先简短反馈已就绪。只有用户同时给了明确调试目标时，才继续结合代码工具与 browser 工具形成修改代码 → 观察页面/错误 → 截图验收的调试闭环。浏览器标签页会跨后续轮次保留，不要在每轮结束时关闭；只有用户发送 /browser-exit 或明确要求关闭时才 close。".to_string();
-    if task.is_empty() {
-        expanded.push_str("如果用户尚未提供网址或调试目标，先询问用户。");
-    } else {
-        expanded.push_str(&format!("\n\n任务：{task}"));
-    }
-    Some(expanded)
-}
-
-pub fn expand_browser_exit_command(text: &str) -> Option<String> {
-    is_browser_exit_command(text).then(|| {
-        "用户已退出浏览器调试模式。请关闭当前 browser 标签页，并确认后续轮次不再使用 Playwright 工具。"
-            .to_string()
-    })
-}
-
 pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
     let Some(rest) = text.trim_start().strip_prefix("/skill:") else {
         return text.to_string();
@@ -496,9 +460,7 @@ pub fn system_prompt_fingerprint(options: &SystemPromptOptions) -> String {
         "cwd": options.cwd.trim_start_matches(r"\\?\").replace('\\', "/"),
         "readOnly": options.read_only,
         "fastContext": options.fast_context,
-        "memoryEnabled": options.memory_enabled,
         "autoChangeProject": options.auto_change_project,
-        "browser": options.browser,
         "shell": shell,
         "skills": options.skills_text,
         "customInstructions": options.custom_instructions,
@@ -520,9 +482,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目",
         ),
         Some("- read: 读取单个文件"),
-        options
-            .browser
-            .then_some("- browser: 通过 Playwright 打开并调试网站、交互、查看前端错误与截图描述"),
+        (!read_only).then_some("- jianlai（剑来）: 通过真实鼠标键盘操作电脑，支持程序窗口或整个桌面截图"),
         if read_only {
             None
         } else {
@@ -545,8 +505,6 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     .into_iter()
     .flatten()
     .collect();
-    // feedback_memory 暂时禁用，不再出现在工具清单与提示词里。
-    let _ = options.memory_enabled;
     let mut stable: Vec<String> = vec![
         "你是 Lyra：高效、简单、面向软件工程结果。".into(),
         format!("Available tools:\n{}", tool_lines.join("\n")),
@@ -564,7 +522,6 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         }
         .into(),
         if options.auto_change_project { "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。" } else { "" }.into(),
-        if options.memory_enabled { "polaris 会用 task 自动附带相关训练知识（task 为空时回退 keywords）。若结果含 TRAINED KNOWLEDGE，当前会话新事实优先；rule 是强约束，memory 是可核验事实，experience 仅在条件匹配时适用。" } else { "" }.into(),
         "先理解再修改，保持改动聚焦。".into(),
         if options.ponytail { PONYTAIL_RULES.into() } else { String::new() },
         "最终回复采用例外汇报，而不是完整工作报告。先直接给出用户可感知的结果；只有信息会影响结果判断、下一步行动、风险认知或可信度时，才写入最终回复。默认省略文件/函数/行号清单、搜索和工具调用过程、常规实现细节、具体测试命令、成功步骤清单、无实际影响的注意事项、泛化建议、‘无风险’声明，以及对同一结果的重复总结。正常成功时用 1～3 句话，不强制使用标题或列表；存在失败、未验证、行为变化、兼容性风险或用户必须操作的事项时，只围绕这些例外按需展开。用户明确询问实现细节时才提供详细报告。".into(),
@@ -584,9 +541,6 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     stable.retain(|part| !part.is_empty());
 
     let mut dynamic: Vec<String> = Vec::new();
-    if options.browser {
-        dynamic.push("当前处于持续的浏览器调试模式：browser 工具与代码工具可联合使用，Playwright 标签页跨轮次保留。默认继续在现有页面调试，不要在每轮结束时 close；仅在用户发送 /browser-exit 或明确要求时关闭。".into());
-    }
     if read_only {
         dynamic.push("当前为计划模式：只读分析，不得修改文件。".into());
     }
@@ -608,9 +562,7 @@ pub struct SystemPromptOptions {
     pub cwd: String,
     pub read_only: bool,
     pub fast_context: bool,
-    pub memory_enabled: bool,
     pub auto_change_project: bool,
-    pub browser: bool,
     pub shell: Option<ShellConfig>,
     pub skills_text: String,
     pub custom_instructions: String,
@@ -627,9 +579,7 @@ mod tests {
             cwd: "/tmp/project".into(),
             read_only: false,
             fast_context: false,
-            memory_enabled: false,
             auto_change_project: false,
-            browser: false,
             shell: None,
             skills_text: String::new(),
             custom_instructions: String::new(),
@@ -684,17 +634,6 @@ mod tests {
         assert!(!is_retryable_provider_error("invalid api key"));
     }
 
-    #[test]
-    fn expands_browser_command_only_when_explicitly_invoked() {
-        let expanded = expand_browser_command("/browser http://localhost:5173 检查登录页").unwrap();
-        assert!(expanded.contains("browser open"));
-        assert!(expanded.contains("不要在页面打开前扫描代码仓库"));
-        assert!(expanded.contains("http://localhost:5173 检查登录页"));
-        assert!(expand_browser_command("普通前端开发任务").is_none());
-        assert!(expand_browser_command("/browsering test").is_none());
-        assert!(is_browser_exit_command("/browser-exit"));
-        assert!(!is_browser_exit_command("/browser-exit later"));
-    }
 
     #[test]
     fn expands_skill_command() {

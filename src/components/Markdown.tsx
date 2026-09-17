@@ -312,7 +312,8 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
   const onContextMenu = (e: MouseEvent) => {
     const target = e.target as HTMLElement;
     const path = target.closest<HTMLImageElement>("img[data-image-path]")?.dataset.imagePath
-      ?? target.closest<HTMLButtonElement>(".md-file-ref")?.dataset.path;
+      ?? target.closest<HTMLButtonElement>(".md-file-ref")?.dataset.path
+      ?? linkedFile(target.closest<HTMLAnchorElement>("a[href]")?.getAttribute("href") ?? "")?.path;
     if (path) fileMenu.open(e, path);
   };
 

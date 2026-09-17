@@ -1,7 +1,7 @@
 mod acp;
 mod agent_config;
-mod browser;
-mod browser_agent;
+mod jianlai;
+mod tool_experience;
 mod cli_manager;
 mod clipboard;
 mod clues;
@@ -10,7 +10,6 @@ mod codex_radar;
 mod codex_app_server;
 mod context_service;
 mod credential_roaming;
-mod experience;
 mod gitwt;
 mod http_stream;
 pub mod image_generation;
@@ -115,10 +114,6 @@ pub struct AppState {
     pub remote_permissions: Mutex<HashMap<String, Value>>,
     /// 有会话运行时阻止系统因空闲自动休眠；最后一个会话结束后自动释放。
     pub sleep_inhibitor: sleep_inhibitor::SleepInhibitor,
-    /// 内嵌浏览器（Playwright 录制进程）状态。
-    pub browser: browser::BrowserManager,
-    /// 截图分析临时会话与计划运行管理。
-    pub browser_agent: browser_agent::BrowserAgentState,
 }
 
 impl AppState {
@@ -316,101 +311,12 @@ fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
     session_cleanup_is_expired(updated_at, now, hours)
 }
 
-const EXPERIENCE_THREAD_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
-
-fn experience_thread_is_expired(thread: &Thread, now: i64) -> bool {
-    thread.experience_thread
-        && thread.updated_at < now.saturating_sub(EXPERIENCE_THREAD_RETENTION_MS)
-}
-
-fn run_experience_thread_cleanup(app: &tauri::AppHandle) -> usize {
-    let state = app.state::<AppState>();
-    let now = now_ms();
-    let candidates: Vec<String> = {
-        let store = state.store.lock().unwrap();
-        let mut ids: Vec<String> = store
-            .threads
-            .iter()
-            .filter(|thread| experience_thread_is_expired(thread, now))
-            .map(|thread| thread.id.clone())
-            .collect();
-        // 训练与世代演进为同一批内容在多个时点各开一条会话；只保留每个时点组
-        // 里最新的一条，其余无论是否到 24h 都清掉，避免列表被同批次会话刷屏。
-        ids.extend(stale_experience_run_thread_ids(&store));
-        ids
-    };
-    let deletable = candidates
-        .into_iter()
-        .filter(|id| !running_by_id(&state, id))
-        .collect::<Vec<_>>();
-    if deletable.is_empty() {
-        return 0;
-    }
-    remove_threads(app, &state, deletable).len()
-}
-
-/// 一次训练/演进批次 = 首个会话（无 parent）+ 其后代（parent 指向它）。
-/// 返回除每批最新一条外的所有会话 id，保持训练视图只剩最近时点。
-fn stale_experience_run_thread_ids(store: &crate::threads::ThreadStore) -> Vec<String> {
-    let experience: Vec<&Thread> = store
-        .threads
-        .iter()
-        .filter(|thread| thread.experience_thread)
-        .collect();
-    let mut child_parent: HashMap<&str, &str> = HashMap::new();
-    for thread in &experience {
-        if let Some(parent) = thread
-            .parent_thread_id
-            .as_deref()
-            .filter(|parent| experience.iter().any(|t| t.id == *parent))
-        {
-            child_parent.insert(thread.id.as_str(), parent);
-        }
-    }
-    let root_of = |thread: &Thread| -> String {
-        child_parent
-            .get(thread.id.as_str())
-            .map(|parent| (*parent).to_string())
-            .unwrap_or_else(|| thread.id.clone())
-    };
-    // 演进审核会话没有 parent，但按「同项目同标题前缀」聚成一组，同样只留最新。
-    let mut groups: HashMap<String, Vec<&Thread>> = HashMap::new();
-    for thread in &experience {
-        let parent = child_parent.get(thread.id.as_str());
-        let key = if parent.is_some() {
-            format!("run:{}", root_of(thread))
-        } else if thread.title.starts_with("世代演进审核") {
-            format!("evolve:{}:{}", thread.cwd, thread.title)
-        } else {
-            format!("run:{}", root_of(thread))
-        };
-        groups.entry(key).or_default().push(*thread);
-    }
-    let mut stale = Vec::new();
-    for (_, members) in groups {
-        if members.len() <= 1 {
-            continue;
-        }
-        let newest = members
-            .iter()
-            .max_by_key(|thread| thread.updated_at)
-            .map(|thread| thread.id.as_str());
-        for member in members {
-            if Some(member.id.as_str()) != newest {
-                stale.push(member.id.clone());
-            }
-        }
-    }
-    stale
-}
-
 fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
-    let experience_removed = run_experience_thread_cleanup(app);
     let state = app.state::<AppState>();
     let hours = {
         let settings = state.settings.lock().unwrap();
         if !settings.session_auto_cleanup_enabled {
-            return experience_removed;
+            return 0;
         }
         settings.session_auto_cleanup_hours
     };
@@ -466,7 +372,7 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
             .collect()
     };
     if threads.is_empty() {
-        return experience_removed;
+        return 0;
     }
     if let Err(error) = state
         .thread_trash
@@ -475,9 +381,9 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
         .move_to_trash(threads, now)
     {
         eprintln!("[session-cleanup] 移入回收站失败：{error}");
-        return experience_removed;
+        return 0;
     }
-    experience_removed + remove_threads(app, &state, deletable).len()
+    remove_threads(app, &state, deletable).len()
 }
 
 static SESSION_CLEANUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -546,26 +452,12 @@ fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
 #[cfg(test)]
 mod session_auto_cleanup_tests {
     use super::{
-        cleanup_lyra_session_files, experience_thread_is_expired,
+        cleanup_lyra_session_files,
         is_normal_thread_for_auto_cleanup, is_starrable_thread, now_ms,
         sweep_orphan_lyra_session_files, thread_is_expired, tree_contains_starred_thread,
-        AgentKind, Thread, EXPERIENCE_THREAD_RETENTION_MS,
+        AgentKind, Thread,
     };
     use std::collections::HashSet;
-
-    #[test]
-    fn experience_threads_expire_after_24_continuous_hours_only() {
-        let now = 100 * 60 * 60 * 1000;
-        let mut training = Thread::new(String::new(), AgentKind::Devin, None, None, None, false);
-        training.experience_thread = true;
-        training.updated_at = now - EXPERIENCE_THREAD_RETENTION_MS;
-        assert!(!experience_thread_is_expired(&training, now));
-
-        training.updated_at -= 1;
-        assert!(experience_thread_is_expired(&training, now));
-        training.experience_thread = false;
-        assert!(!experience_thread_is_expired(&training, now));
-    }
 
     #[test]
     fn thread_is_expired_only_after_the_configured_retention() {
@@ -981,8 +873,6 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
                 .clone()
                 .or_else(|| wt_by_path.get(&t.cwd).cloned()),
             experience_thread: t.experience_thread,
-            browser_thread: t.browser_thread,
-            browser_debug_mode: t.browser_debug_mode,
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             active_clue_card_id: t.active_clue_card_id.clone(),
@@ -2933,9 +2823,31 @@ fn revert_file_changes(
     Ok(json!({ "reverted": reverted, "conflicts": conflicts, "errors": errors }))
 }
 
+/// Explorer 不接受 Rust canonicalize 返回的扩展路径前缀。
+#[cfg(windows)]
+fn explorer_path(path: &str) -> String {
+    let path = path.replace('/', "\\");
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn explorer_paths_use_shell_compatible_separators() {
+    assert_eq!(explorer_path("C:/Users/测试/修复包 0.1.4.zip"), r"C:\Users\测试\修复包 0.1.4.zip");
+    assert_eq!(explorer_path(r"\\?\C:\work\file.zip"), r"C:\work\file.zip");
+    assert_eq!(explorer_path(r"\\?\UNC\server\share\file.zip"), r"\\server\share\file.zip");
+    assert_eq!(explorer_path("//server/share/file.zip"), r"\\server\share\file.zip");
+}
+
 /// 在资源管理器 / Finder 中打开目录，或在目录中选中文件
 #[tauri::command]
 fn open_in_explorer(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    let path = explorer_path(&path);
     let path = std::path::PathBuf::from(path);
     #[cfg(windows)]
     {
@@ -2947,8 +2859,10 @@ fn open_in_explorer(path: String) -> Result<(), String> {
             return Ok(());
         }
         if path.is_file() {
+            use std::os::windows::process::CommandExt;
+            // Explorer 要求 /select, 在引号外，不能让 Command 把整个参数一起加引号。
             std::process::Command::new("explorer")
-                .arg(format!("/select,{}", path.to_string_lossy()))
+                .raw_arg(format!("/select,\"{}\"", path.to_string_lossy()))
                 .spawn()
                 .map_err(|e| format!("打开资源管理器失败：{e}"))?;
             return Ok(());
@@ -3684,13 +3598,6 @@ fn set_thread_agent(
                 _ => {}
             }
         }
-        if old_kind == AgentKind::Lyra && agent_kind != AgentKind::Lyra {
-            let mut store = state.store.lock().unwrap();
-            if let Some(thread) = store.get_mut(&thread_id) {
-                thread.browser_debug_mode = false;
-            }
-            store.save_thread(&thread_id);
-        }
         if let Some(item) = switched_item {
             let _ = app.emit(
                 acp::EV_UPDATE,
@@ -3755,44 +3662,6 @@ async fn get_slash_commands(
         AgentKind::Codex | AgentKind::CodexPlus => Ok(list_codex_skill_commands(&state.config_dir)),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::Cursor => Ok(Vec::new()),
     }
-}
-
-#[tauri::command]
-fn list_experiences(state: State<'_, AppState>, cwd: String) -> Result<Value, String> {
-    let configs = state.settings.lock().unwrap().experience_experts.clone();
-    experience::list_memory(&cwd, &configs)
-}
-
-#[tauri::command]
-fn feedback_experience(
-    state: State<'_, AppState>,
-    cwd: String,
-    experience_id: String,
-    reward: f64,
-) -> Result<Value, String> {
-    let settings = state.settings.lock().unwrap().clone();
-    let requested = if reward > 0.0 { 1 } else { -1 };
-    experience::set_user_feedback(
-        &cwd,
-        &experience_id,
-        requested,
-        &settings.experience_experts,
-    )
-}
-
-#[tauri::command]
-fn delete_experience(cwd: String, experience_id: String) -> Result<Value, String> {
-    experience::delete_memory(&cwd, &experience_id)
-}
-
-#[tauri::command]
-async fn evolve_experiences(app: tauri::AppHandle, cwd: String) -> Result<Value, String> {
-    experience::evolve_memory(&app, None, &cwd).await
-}
-
-#[tauri::command]
-async fn train_experience(app: tauri::AppHandle, cwd: String) -> Result<Value, String> {
-    experience::train(&app, &cwd, true).await
 }
 
 #[tauri::command]
@@ -3871,7 +3740,6 @@ pub(crate) fn dispatch_prompt(
         )
     };
     // Stage 引用不是一次性快照：每次投递都从源会话最新 items 重建。
-    // 猎户座知识不在这里自动注入；只有 Lyra 可通过 load_trained_memory 显式调用。
     {
         let mut store = state.store.lock().unwrap();
         let source_id = store
@@ -4430,14 +4298,11 @@ async fn apply_runtime_settings(
 
         let auto_change_project_changed =
             s.auto_change_project_enabled != settings.auto_change_project_enabled;
-        let experience_tools_changed =
-            s.experience_training_enabled != settings.experience_training_enabled;
-        if context_runtime_changed || experience_tools_changed {
+        if context_runtime_changed {
             settings.apply_context_retrieval_environment();
         }
         let restart_lyra = restart_all_agents
             || context_runtime_changed
-            || experience_tools_changed
             || auto_change_project_changed
             || custom_env_changed
             || s.lyra_proxy != settings.lyra_proxy
@@ -5483,7 +5348,6 @@ pub fn run() {
             let _ = skills::sync_skills_to_backends(&dir);
             let roaming = RoamingStore::load(&dir);
             let worktrees = WorktreeStore::load(&dir);
-            experience::init(&dir);
             settings.apply_context_retrieval_environment();
             // 查询时按需 mmap 加载索引；启动不遍历历史项目/worktree，也不为闲置仓库启动索引轮询。
             let context_service =
@@ -5532,8 +5396,6 @@ pub fn run() {
                 time_machine_lock: Mutex::new(()),
                 remote_permissions: Mutex::new(HashMap::new()),
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
-                browser: browser::BrowserManager::new(),
-                browser_agent: browser_agent::BrowserAgentState::new(),
             });
             native_browser::init(app.handle());
 
@@ -5693,18 +5555,6 @@ pub fn run() {
             // 无需重启即可同步设置、环境变量与项目白名单。
             start_headless_config_watcher(app.handle().clone());
 
-            // 经验训练调度无需跟随 5 秒员工心跳；每分钟检查一次是否达到用户配置的训练间隔。
-            // 手动 /train 不受该检查频率限制。
-            let experience_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use tokio::time::{sleep, Duration};
-                sleep(Duration::from_secs(60)).await;
-                loop {
-                    experience::tick(&experience_app);
-                    sleep(Duration::from_secs(60)).await;
-                }
-            });
-
             // 自动更新：桌面端和无头模式都由后端 tokio 定时检测并静默下载暂存（每 10 分钟）。
             // 放后端而非前端 setInterval：WebView 计时器在窗口最小化/隐藏时会被严重节流甚至暂停；
             // 无头模式则根本没有前端。桌面端下载就绪后额外发事件显示可更新角标。
@@ -5848,11 +5698,6 @@ pub fn run() {
             get_model_options,
             refresh_lyra_config,
             get_slash_commands,
-            list_experiences,
-            feedback_experience,
-            delete_experience,
-            evolve_experiences,
-            train_experience,
             send_prompt,
             truncate_thread,
             cancel_turn,
@@ -5911,21 +5756,7 @@ pub fn run() {
             get_skills_dir,
             install_skill,
             remove_skill,
-            sync_skills,
-            browser::browser_open,
-            browser::browser_close,
-            browser::browser_navigate,
-            browser::browser_info,
-            browser::browser_record_start,
-            browser::browser_record_stop,
-            browser::browser_record_pause,
-            browser::browser_record_resume,
-            browser::browser_events,
-            browser::browser_capture_screenshot,
-            browser::browser_capture_region,
-            browser::browser_save_shot,
-            browser_agent::analyze_screenshot,
-            browser_agent::run_plan_with_agent
+            sync_skills
         ])
         .build(tauri::generate_context!())
         .expect("Nova 启动失败")

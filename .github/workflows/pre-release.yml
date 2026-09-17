@@ -36,7 +36,8 @@ jobs:
           - { name: windows, os: windows-latest, target: "" }
           - { name: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
           - { name: macos-x86_64, os: macos-latest, target: x86_64-apple-darwin }
-          - { name: linux, os: ubuntu-22.04, target: "" }
+          # xcap / libspa 0.10 requires newer PipeWire headers than Jammy's 0.3.48.
+          - { name: linux, os: ubuntu-24.04, target: "" }
     runs-on: ${{ matrix.os }}
     env:
       NOVA_BUILD_CHANNEL: pre-release
@@ -66,7 +67,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xvfb
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xvfb libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev
       - shell: bash
         run: python3 scripts/package.py --version "${{ needs.prepare.outputs.version }}" --bump-only
       - if: runner.os == 'Windows'

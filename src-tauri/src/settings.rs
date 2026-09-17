@@ -55,107 +55,12 @@ impl ContextRetrievalMode {
     }
 }
 
-fn default_experience_training_interval_minutes() -> u32 {
-    60
-}
 fn default_true() -> bool {
     true
 }
 fn default_powershell_utf8() -> bool {
     true
 }
-fn default_experience_evolution_interval_minutes() -> u32 {
-    720
-}
-fn default_experience_training_agent() -> String {
-    "lyra".into()
-}
-fn default_experience_experts() -> Vec<ExperienceExpertConfig> {
-    vec![
-        ExperienceExpertConfig::new(
-            "fast", "天枢", 0.90, 0.50, 0.08, 0.25, 0.05, 0.35, 0.40, 1.0,
-        ),
-        ExperienceExpertConfig::new(
-            "concrete", "天璇", 0.70, 0.30, 0.03, 0.10, 0.10, 0.20, 0.30, 1.0,
-        ),
-        ExperienceExpertConfig::new(
-            "balanced", "天玑", 0.55, 0.25, 0.02, 0.12, 0.08, 0.50, 0.50, 1.0,
-        ),
-        ExperienceExpertConfig::new(
-            "abstract", "天权", 0.50, 0.20, 0.015, 0.12, 0.10, 0.85, 0.45, 0.8,
-        ),
-        ExperienceExpertConfig::new(
-            "negative", "玉衡", 0.60, 0.45, 0.04, 0.15, 0.08, 0.45, 0.35, 1.5,
-        ),
-        ExperienceExpertConfig::new(
-            "novel", "开阳", 0.80, 0.35, 0.06, 0.40, 0.05, 0.60, 0.85, 1.0,
-        ),
-        ExperienceExpertConfig::new(
-            "slow", "摇光", 0.30, 0.10, 0.005, 0.03, 0.05, 0.55, 0.20, 0.7,
-        ),
-    ]
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ExperienceExpertConfig {
-    pub id: String,
-    pub name: String,
-    pub write_rate: f64,
-    pub value_learning_rate: f64,
-    pub forget_rate: f64,
-    pub mutation_rate: f64,
-    pub migration_rate: f64,
-    pub abstraction_level: f64,
-    pub novelty_preference: f64,
-    pub negative_sensitivity: f64,
-}
-
-impl ExperienceExpertConfig {
-    fn new(
-        id: &str,
-        name: &str,
-        write_rate: f64,
-        value_learning_rate: f64,
-        forget_rate: f64,
-        mutation_rate: f64,
-        migration_rate: f64,
-        abstraction_level: f64,
-        novelty_preference: f64,
-        negative_sensitivity: f64,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            name: name.into(),
-            write_rate,
-            value_learning_rate,
-            forget_rate,
-            mutation_rate,
-            migration_rate,
-            abstraction_level,
-            novelty_preference,
-            negative_sensitivity,
-        }
-    }
-}
-
-impl Default for ExperienceExpertConfig {
-    fn default() -> Self {
-        Self::new(
-            "expert",
-            "无名观测者",
-            0.5,
-            0.2,
-            0.02,
-            0.1,
-            0.1,
-            0.5,
-            0.5,
-            1.0,
-        )
-    }
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -276,17 +181,6 @@ pub struct Settings {
     /// 上下文检索：none / fast。旧配置中的 super 会在加载时迁移为 fast。
     pub context_retrieval_mode: ContextRetrievalMode,
 
-    /// 是否周期性从会话中训练独立知识库。开启后 Lyra polaris 也会并行召回训练知识。
-    pub experience_training_enabled: bool,
-    #[serde(default = "default_experience_training_agent")]
-    pub experience_training_agent: String,
-    pub experience_training_model: String,
-    #[serde(default = "default_experience_training_interval_minutes")]
-    pub experience_training_interval_minutes: u32,
-    #[serde(default = "default_experience_evolution_interval_minutes")]
-    pub experience_evolution_interval_minutes: u32,
-    #[serde(default = "default_experience_experts")]
-    pub experience_experts: Vec<ExperienceExpertConfig>,
     /// 用户自定义追加的环境变量（覆盖同名用户/系统变量），
     /// 注入所有 agent 子进程，并作为工作流模板 {{xx}} 的替换来源。
     #[serde(default)]
@@ -353,12 +247,6 @@ impl Default for Settings {
             session_auto_cleanup_hours: 24 * 30,
             zen_mode_enabled: false,
             context_retrieval_mode: ContextRetrievalMode::Fast,
-            experience_training_enabled: false,
-            experience_training_agent: default_experience_training_agent(),
-            experience_training_model: String::new(),
-            experience_training_interval_minutes: default_experience_training_interval_minutes(),
-            experience_evolution_interval_minutes: default_experience_evolution_interval_minutes(),
-            experience_experts: default_experience_experts(),
             custom_env_vars: std::collections::HashMap::new(),
         }
     }
@@ -539,7 +427,6 @@ mod tests {
         settings.vega_enabled = true;
         settings.lyra_enabled = false;
         settings.lightweight_model_agent = "alkaid".into();
-        settings.experience_training_agent = "alkaid".into();
         settings.stage_models.push(StageModelTarget {
             agent_kind: "alkaid".into(),
             model: "p/m".into(),
@@ -556,7 +443,6 @@ mod tests {
         assert!(settings.lyra_enabled);
         assert!(!settings.vega_enabled);
         assert_eq!(settings.lightweight_model_agent, "lyra");
-        assert_eq!(settings.experience_training_agent, "lyra");
         assert_eq!(settings.stage_models[0].agent_kind, "lyra");
         assert_eq!(settings.quota_shared_models[0], "lyra:p/m");
         assert_eq!(settings.model_favorites[0], "lyra:p/m");
@@ -695,9 +581,6 @@ impl Settings {
         if self.lightweight_model_agent.trim() == "alkaid" {
             self.lightweight_model_agent = "lyra".into();
         }
-        if self.experience_training_agent.trim() == "alkaid" {
-            self.experience_training_agent = "lyra".into();
-        }
         for target in &mut self.stage_models {
             if target.agent_kind.trim() == "alkaid" {
                 target.agent_kind = "lyra".into();
@@ -757,59 +640,6 @@ impl Settings {
         if settings.cursor_context_mode != "super" {
             settings.cursor_context_mode = "default".into();
         }
-        // 内置专家升级为北斗七星：保留已有专家的学习参数，只迁移历代内置名称；
-        // 仅当完整的旧六星阵仍在时补入天玑，避免改动用户自行增删的专家阵容。
-        let baseline = default_experience_experts();
-        let builtin_ids = ["fast", "concrete", "abstract", "negative", "novel", "slow"];
-        let legacy_six = settings.experience_experts.len() == builtin_ids.len()
-            && builtin_ids.iter().all(|id| {
-                settings
-                    .experience_experts
-                    .iter()
-                    .any(|expert| expert.id == *id)
-            });
-        for expert in &mut settings.experience_experts {
-            let default_name = baseline
-                .iter()
-                .find(|item| item.id == expert.id)
-                .map(|item| item.name.clone())
-                .unwrap_or_else(|| "无名观测者".into());
-            let legacy_name = matches!(
-                expert.name.as_str(),
-                "参宿一"
-                    | "参宿二"
-                    | "参宿四"
-                    | "参宿五"
-                    | "参宿六"
-                    | "参宿七"
-                    | "绯红瞬学者"
-                    | "永夜守忆者"
-                    | "万象刻印师"
-                    | "虚空演绎者"
-                    | "灾厄审判官"
-                    | "混沌启示录"
-                    | "流星信使"
-                    | "恒星守望者"
-                    | "星图记录者"
-                    | "星云推演者"
-                    | "蚀影校准者"
-                    | "远星探路者"
-                    | "星驰"
-                    | "辰守"
-                    | "星图"
-                    | "云衍"
-                    | "蚀鉴"
-                    | "远航"
-            );
-            if expert.name.trim().is_empty() || legacy_name {
-                expert.name = default_name;
-            }
-        }
-        if legacy_six {
-            if let Some(expert) = baseline.into_iter().find(|expert| expert.id == "balanced") {
-                settings.experience_experts.insert(2, expert);
-            }
-        }
         settings
     }
 
@@ -821,14 +651,6 @@ impl Settings {
         std::env::set_var(
             "NOVA_CONTEXT_RETRIEVAL_MODE",
             self.context_retrieval_mode.as_str(),
-        );
-        std::env::set_var(
-            "NOVA_EXPERIENCE_TOOLS",
-            if self.experience_training_enabled {
-                "1"
-            } else {
-                "0"
-            },
         );
     }
 

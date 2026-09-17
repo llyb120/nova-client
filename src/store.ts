@@ -145,8 +145,6 @@ interface AppStore {
   /** Plan 模式产出的 proposed plan：非空时展示「实施此计划」选项 */
   proposedPlan: string | null;
   cwd: string;
-  /** 大熊座当前项目；切换视图时保留，worktree 由后端归一到主仓库。 */
-  trainingCwd: string;
   title: string;
   /** 当前线程的模型/模式（"" = 默认） */
   agentKind: AgentKind;
@@ -192,7 +190,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关）；virgo = 室女座（减少焦虑） */
-  view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo";
+  view: "home" | "clues" | "workflows" | "virgo";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -214,7 +212,6 @@ export const [state, setState] = createStore<AppStore>({
   plan: null,
   proposedPlan: null,
   cwd: "",
-  trainingCwd: "",
   title: "",
   agentKind: "devin",
   model: "",
@@ -759,12 +756,8 @@ export async function refreshRoamingFolders() {
   }
 }
 
-export function setView(view: "home" | "clues" | "workflows" | "training" | "browser" | "virgo") {
+export function setView(view: "home" | "clues" | "workflows" | "virgo") {
   setState("view", view);
-}
-
-export function setTrainingProject(cwd: string) {
-  setState("trainingCwd", cwd);
 }
 
 export function clueCurrentVersion(card: ClueCard) {
@@ -1671,13 +1664,13 @@ export function chainUnreadTurns(thread: ThreadMeta | undefined): number {
 
 /**
  * 「打开未读消息」快捷键（含全局触发）：循环打开普通模式下有未读轮次的会话链。
- * 口径与侧栏普通模式列表一致：排除大熊座/双子座会话；减少焦虑模式下排除室女座运行链。
+ * 口径与侧栏普通模式列表一致：排除训练会话；减少焦虑模式下排除室女座运行链。
  */
 export async function openNextUnreadThread(): Promise<void> {
-  // 口径与侧栏普通模式列表一致：排除大熊座/双子座会话，以及室女座收起的会话（含快捷键手动收纳）。
+  // 口径与侧栏普通模式列表一致：排除训练会话，以及室女座收起的会话。
   const hidden = virgoHiddenThreads();
   const visible = state.threads.filter(
-    (t) => !t.experienceThread && !t.browserThread && !hidden.has(t.id),
+    (t) => !t.experienceThread && !hidden.has(t.id),
   );
   const visibleIds = new Set(visible.map((t) => t.id));
   const unreadRoots = visible.filter(
@@ -1994,14 +1987,6 @@ export async function sendPrompt(
 ) {
   let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
-  // /train 是 Nova 内置命令：不写入当前会话，也不发送给模型。
-  if (text.trim() === "/train" && images.length === 0) {
-    const cwd = state.threads.find((thread) => thread.id === id)?.worktree?.repo || state.cwd;
-    if (!cwd) throw new Error("请先选择一个项目再训练");
-    setTrainingProject(cwd);
-    await api.trainExperience(cwd);
-    return;
-  }
   // 内置命令优先于工作流触发器，避免 /fire、/hard 等被当成普通内容。
   if (await tryBuiltinPrompt(id, text, images)) return;
   // 在历史分支预览中追加提示词时才发生时间跳跃：先恢复该分支，再把新提示词
@@ -2324,15 +2309,6 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
     if (images.length > 0) throw new Error("/fire 暂不支持附件");
     parseFireInput(builtInInput);
-    return;
-  }
-  if (/^\/browser(?:\s|$)/i.test(builtInInput)) {
-    const goal = builtInInput.replace(/^\/browser(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
-    if (!goal) throw new Error("请在 /browser 后输入网址和调试目标，例如 /browser localhost:5173 检查登录页");
-    return;
-  }
-  if (/^\/browser-exit(?:\s|$)/i.test(builtInInput)) {
-    if (!/^\/browser-exit\s*$/i.test(builtInInput)) throw new Error("/browser-exit 后不需要附加内容");
     return;
   }
   if (/^\/setup(?:\s|$)/i.test(builtInInput)) {
@@ -3195,21 +3171,10 @@ function normalizeSlashCommands(commands: unknown): SlashCommand[] {
     .filter((c): c is SlashCommand => !!c);
 }
 
-const BROWSER_SLASH_COMMANDS: SlashCommand[] = [
-  { name: "browser", description: "进入持续浏览器调试模式（Playwright）", kind: "builtin", input: "/browser " },
-  { name: "browser-exit", description: "退出浏览器调试模式", kind: "builtin", input: "/browser-exit" },
-];
-
 export async function refreshSlashCommands(agentKind: AgentKind) {
   try {
     const commands = await api.getSlashCommands(agentKind);
     const list = normalizeSlashCommands(commands);
-    // 内置 /browser 调试命令对 Lyra 与 ACP 后端可用（后端支持 MCP 注入时生效）。
-    if (["lyra", "devin", "codebuddy"].includes(agentKind)) {
-      for (const cmd of BROWSER_SLASH_COMMANDS) {
-        if (!list.some((c) => c.name === cmd.name)) list.push(cmd);
-      }
-    }
     setState("slashCommands", agentKind, list);
   } catch (err) {
     console.warn(`拉取 ${agentKind} 斜杠命令失败`, err);
