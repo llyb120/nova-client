@@ -24,6 +24,16 @@
 
 `executed` 表示输入已发送，不表示应用任务成功；`needs_review` 表示可能部分执行，检查completedActions/error和随附新图，禁止重放整个批次。观察失败会单独返回observationError，不掩盖执行状态。
 
+## 观察与结果验证
+
+纯 move 定位反馈直接返回单帧（not_checked），不增加稳定等待；需等待悬停菜单/提示时使用 move + wait。包含其他动作或执行状态为 needs_review 的反馈仍做稳定取样。稳定取样在编码前每隔约150ms取样，至少观察600ms，并要求连续450ms画面近似稳定；2秒取样预算耗尽返回最后一帧及 images[].stability.status=timeout。单次系统抓屏耗时无法中断，失败后的桌面回退另有一次预算。中间帧不落盘、不发送；主动 screenshot 和未执行输入的恢复截图保持单帧，标记 not_checked。feedback=none 仍不取图。
+
+比较使用原始像素、忽略透明度，允许0.05%的像素发生明显颜色变化，以容忍光标闪烁和微小噪声。此启发式可能漏掉很小的更新，也可能被持续动画拖到超时；stable 不代表网络请求结束。必须继续核对目标、选中项/筛选条件与正文一致，无法确认时只重新观察，不重放操作。
+
+新图通过 snapshotId 标识一次观察，observationSequence 是进程内递增序号（重启重置）；每张图附 snapshotId、capturedAt（UTC）和稳定取样统计，窗口/屏幕范围沿用 windowId、imageId 与 desktopBounds。operation 标明来源，操作结果的 basedOnSnapshotId 指向输入依据。historical=false 仅表示本次新采集，并非永远有效；recall 仍标记 historical=true，不伪造原图采集时间或新快照。
+
+所有操作结果均为 verification=unverified：工具能确认输入执行状态，业务目标需模型依据最新图验证。结论须绑定截图及可见证据；未检查完整范围不能声称“全部”或“不存在”。notes 仍原样返回，须记录来源snapshotId和页面范围，不能跨页面混用；工具不验证笔记内容。本改动不删除、裁剪或压缩任何宿主的历史上下文。
+
 ## 上下文机制与适用范围
 
 缩放、坐标映射、校验与恢复、回看、notes以及截图耗时均在共享jianlai服务层实现，Lyra、Cursor自定义工具和MCP调用使用同一套契约与策略说明。

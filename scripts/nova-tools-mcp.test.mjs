@@ -113,10 +113,20 @@ test("desktop optimizations are shared by custom tools and MCP, not Lyra-only", 
     await writeFile(path, Buffer.from('PNG'));
     const result = await webviewMcpResult(JSON.stringify({ source: 'jianlai', status: 'not_executed',
       error: '前台程序已改变', snapshotId: 'new', notes: '已读第1页，测速未确认',
-      images: [{ path }] }));
+      operation: 'act', basedOnSnapshotId: 'old', observationSequence: 2, historical: false,
+      verification: 'unverified',
+      images: [{ path, snapshotId: 'new', capturedAt: '2026-09-17T00:00:00Z', stability: { status: 'not_checked', samples: 1 } }] }));
     const text = JSON.parse(result.content[0].text);
     assert.equal(text.status, 'not_executed');
     assert.equal(text.snapshotId, 'new');
+    assert.equal(text.basedOnSnapshotId, 'old');
+    assert.equal(text.operation, 'act');
+    assert.equal(text.observationSequence, 2);
+    assert.equal(text.historical, false);
+    assert.equal(text.verification, 'unverified');
+    assert.equal(text.images[0].snapshotId, 'new');
+    assert.equal(text.images[0].capturedAt, '2026-09-17T00:00:00Z');
+    assert.deepEqual(text.images[0].stability, { status: 'not_checked', samples: 1 });
     assert.equal(text.notes, '已读第1页，测速未确认');
     assert.equal(text.imageHistoryPolicy, undefined);
     assert(!jianlai.description.includes('最近2次'));
