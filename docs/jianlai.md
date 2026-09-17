@@ -34,6 +34,8 @@
 
 ## 耗时诊断
 
+NovaDev对image、png及压缩依赖启用优化编译；缩放通过DynamicImage进入依赖内的优化实现，保留Triangle算法和相同像素尺寸。目标校验复用同一次窗口枚举完成几何与遮挡检查，不缓存到下一动作。纯图像基准可运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::screenshot_pipeline_benchmark -- --ignored --nocapture`，输出缩放/编码耗时，并验证与原缩放实现及PNG解码结果逐像素一致；此测试不操作桌面。
+
 截图返回timingsMs：capture（系统捕获）、resize、encodeAndSave（PNG编码及落盘）、other（窗口枚举、焦点校验等）和total。MCP传输适配另返回deliveryTimingsMs（read/base64/total）及deliveredImageBytes；不包含网络及模型耗时。Windows前台身份检查直接读取窗口句柄与PID，避免每个动作多次枚举所有窗口及其元数据；这是只读状态检查，不负责激活。先比较这些分段数据，再决定是否换捕获后端/编码器，不据单次总耗时猜测瓶颈。
 
 ## 平台与构建

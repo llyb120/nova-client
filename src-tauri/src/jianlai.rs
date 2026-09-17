@@ -203,10 +203,11 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         let resize_started = Instant::now();
         let image = if max_edge > 0 && image.width().max(image.height()) > max_edge {
             let scale = max_edge as f64 / image.width().max(image.height()) as f64;
-            xcap::image::imageops::resize(&image,
-                (image.width() as f64 * scale).round().max(1.0) as u32,
-                (image.height() as f64 * scale).round().max(1.0) as u32,
-                xcap::image::imageops::FilterType::Triangle)
+            let (width, height) = image.dimensions();
+            xcap::image::DynamicImage::ImageRgba8(image).resize_exact(
+                (width as f64 * scale).round().max(1.0) as u32,
+                (height as f64 * scale).round().max(1.0) as u32,
+                xcap::image::imageops::FilterType::Triangle).into_rgba8()
         } else { image };
         resize_ms += resize_started.elapsed().as_millis();
         let path = folder.join(format!("{id}-{image_id}.png"));
@@ -414,10 +415,13 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
         return Err("前台程序已改变，请重新截图".into());
     }
     if let Some(id) = snap.window {
-        let w = window(id)?;
+        // Reuse one Z-order enumeration for geometry and occlusion checks.
+        let windows = Window::all().map_err(err)?;
+        let w = windows.iter().find(|w| w.id().ok() == Some(id))
+            .ok_or("程序窗口已关闭，请重新 windows")?;
         if !w.is_focused().map_err(err)?
             || w.is_minimized().map_err(err)?
-            || window_surface(&w)? != shot.surface
+            || window_surface(w)? != shot.surface
         {
             return Err("目标窗口失焦、移动或尺寸改变，请重新截图".into());
         }
@@ -429,14 +433,14 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
             } else {
                 p
             };
-            for other in Window::all().map_err(err)? {
+            for other in &windows {
                 if other.id().map_err(err)? == id {
                     break;
                 }
                 if other.is_minimized().map_err(err)? {
                     continue;
                 }
-                let r = window_surface(&other)?;
+                let r = window_surface(other)?;
                 if [p, end].iter().any(|&(x, y)| {
                     x as i64 >= r.x as i64
                         && y as i64 >= r.y as i64
@@ -739,6 +743,29 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Deterministic screenshot pipeline benchmark; no desktop input or live capture.
+    #[test]
+    #[ignore]
+    fn screenshot_pipeline_benchmark() {
+        let source = xcap::image::RgbaImage::from_fn(1920, 1080, |x, y| {
+            let v = if (x / 120 + y / 24) % 2 == 0 { 245 } else { 45 };
+            xcap::image::Rgba([v, v, v, 255])
+        });
+        let expected = xcap::image::imageops::resize(&source, 1600, 900, xcap::image::imageops::FilterType::Triangle);
+        for _ in 0..3 {
+            let started = Instant::now();
+            let resized = xcap::image::DynamicImage::ImageRgba8(source.clone())
+                .resize_exact(1600, 900, xcap::image::imageops::FilterType::Triangle).into_rgba8();
+            let resize_ms = started.elapsed().as_millis();
+            assert_eq!(resized, expected);
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            let started = Instant::now();
+            resized.write_to(&mut encoded, xcap::image::ImageFormat::Png).unwrap();
+            let encode_ms = started.elapsed().as_millis();
+            assert_eq!(xcap::image::load_from_memory(encoded.get_ref()).unwrap().to_rgba8(), resized);
+            eprintln!("screenshot pipeline: resize={resize_ms}ms encode={encode_ms}ms bytes={}", encoded.get_ref().len());
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn windows_shortcuts_and_visible_crop() {
