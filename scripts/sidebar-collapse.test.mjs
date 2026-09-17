@@ -54,6 +54,25 @@ try {
   assert.equal(await sidebar.isVisible(), true, 'moving into the sidebar keeps it open');
   await page.mouse.move(600, 300);
   await sidebar.waitFor({ state: 'hidden' });
+  const listBox = await rail.getByRole('button', { name: '会话列表', exact: true }).boundingBox();
+  for (const [x, y] of [[26, 300], [listBox.x + listBox.width / 2, listBox.y + listBox.height / 2]]) {
+    await page.mouse.move(x, y);
+    assert.equal(await sidebar.isVisible(), false, 'passing over the rail must not open immediately');
+    await page.mouse.move(-10, 300);
+    await page.waitForTimeout(250);
+    assert.equal(await sidebar.isVisible(), false, 'leaving the window cancels pending hover expansion');
+    await page.mouse.move(600, 300);
+  }
+  for (const [x, y] of [[26, 300], [1, 400], [43, 500], [51, 600]]) {
+    // 单步移入，确保不依赖途中恰好命中原来的 8px 窄边。
+    await page.mouse.move(x, y);
+    await sidebar.waitFor({ state: 'visible' });
+    assert.equal(await contentLeft(), 52, 'blank rail hover overlays without shifting content');
+    await page.mouse.move(120, y);
+    assert.equal(await sidebar.isVisible(), true, 'rail-to-panel movement keeps the sidebar open');
+    await page.mouse.move(600, y);
+    await sidebar.waitFor({ state: 'hidden' });
+  }
   await railPin.focus();
   await page.keyboard.press('Enter');
   await sidebar.waitFor({ state: 'visible' });

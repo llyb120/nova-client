@@ -71,6 +71,19 @@ export function Sidebar(props: {
   const collapsed = () => sidebarLayout.collapsed;
   const setCollapsed = (value: boolean) => setSidebarLayout({ collapsed: value });
   const [hovered, setHovered] = createSignal(false);
+  let hoverTimer: number | undefined;
+  const cancelHover = () => {
+    window.clearTimeout(hoverTimer);
+    hoverTimer = undefined;
+  };
+  const scheduleHover = () => {
+    if (!collapsed() || hovered() || hoverTimer !== undefined) return;
+    hoverTimer = window.setTimeout(() => {
+      hoverTimer = undefined;
+      setHovered(true);
+    }, 180);
+  };
+  onCleanup(cancelHover);
   const [keyboardFocus, setKeyboardFocus] = createSignal(false);
   const sidebarOpen = () => !collapsed() || hovered() || keyboardFocus() || !!menu() || !!tmenu() || !!mergeFor();
   const [version, setVersion] = createSignal("");
@@ -552,11 +565,16 @@ export function Sidebar(props: {
     <div
       class="sidebar-shell"
       classList={{ collapsed: collapsed(), "is-open": sidebarOpen() }}
-      onPointerLeave={() => setHovered(false)}
+      onPointerLeave={() => { cancelHover(); setHovered(false); }}
     >
-      <div class="sidebar-hover-edge" aria-hidden="true" onPointerEnter={() => setHovered(true)} />
       <Show when={collapsed()}>
-        <nav class="sidebar-rail" aria-label="快捷导航">
+        <nav class="sidebar-rail" aria-label="快捷导航"
+          onPointerMove={(e) => {
+            // 快速移入可能跳过窄边；空白区域都可展开，快捷按钮仍独立操作。
+            const button = (e.target as Element).closest("button");
+            if (!button || button.classList.contains("sidebar-rail-list")) scheduleHover();
+            else cancelHover();
+          }}>
           <button
             class="sidebar-rail-pin"
             title="固定展开侧边栏"
@@ -564,6 +582,7 @@ export function Sidebar(props: {
             aria-controls="main-sidebar"
             aria-expanded={sidebarOpen()}
             onClick={() => {
+              cancelHover();
               setCollapsed(false);
               setHovered(false);
               setKeyboardFocus(false);
@@ -572,8 +591,8 @@ export function Sidebar(props: {
             <IconChevron size={18} />
           </button>
           <button title="新对话" aria-label="新对话" onClick={openHome}><IconPlus size={18} /></button>
-          <button title="会话列表（悬停展开）" aria-label="会话列表" aria-controls="main-sidebar"
-            aria-expanded={sidebarOpen()} onPointerEnter={() => setHovered(true)} onClick={() => setHovered(true)}>
+          <button class="sidebar-rail-list" title="会话列表（悬停展开）" aria-label="会话列表" aria-controls="main-sidebar"
+            aria-expanded={sidebarOpen()} onClick={() => { cancelHover(); setHovered(true); }}>
             <IconFolder size={18} />
           </button>
           <button title="工作流" aria-label="工作流" classList={{ active: state.view === "workflows" }} onClick={openWorkflows}>
@@ -698,6 +717,7 @@ export function Sidebar(props: {
             aria-controls="main-sidebar"
             aria-expanded={sidebarOpen()}
             onClick={() => {
+              cancelHover();
               setCollapsed(!collapsed());
               setHovered(false);
               setKeyboardFocus(false);

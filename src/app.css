@@ -232,14 +232,6 @@ button {
   box-shadow: var(--shadow-lg);
 }
 .sidebar-shell:not(.is-open) > .sidebar { visibility: hidden; }
-.sidebar-hover-edge {
-  display: none;
-  position: absolute;
-  inset: 0 0 0 auto;
-  width: 8px;
-  z-index: 20;
-}
-.sidebar-shell.collapsed .sidebar-hover-edge { display: block; }
 /* 收起按钮并入 brand 行尾，与中继/更新徽标同高同行，不再悬浮于角落。 */
 .sidebar-head-toggle {
   display: inline-flex;
