@@ -25,7 +25,7 @@ import type { AgentKind, Item, Thread, ThreadMeta, TimeMachineCheckpoint, TimeMa
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
-import { IconBroadcast, IconCompress, IconDownload, IconFile, IconShare, IconStar, IconStopwatch } from "./icons";
+import { IconBroadcast, IconCompress, IconDownload, IconFile, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { ShareModal } from "./ShareModal";
@@ -1357,6 +1357,36 @@ export function ChatView() {
             {recalling() ? "召回中…" : "召回"}
           </button>
         </Show>
+        <Show when={showTimeMachine() && !workspaceOpen()}>
+          <button
+            type="button"
+            class="chat-time-machine-btn"
+            classList={{ active: timeMachineExpanded() }}
+            title={timeMachineExpanded() ? "收起世界线" : "展开世界线"}
+            aria-label={timeMachineExpanded() ? "收起世界线" : "展开世界线"}
+            aria-expanded={timeMachineExpanded()}
+            onClick={() => setTimeMachineExpanded(!timeMachineExpanded())}
+          >
+            <span class="repo-time-toggle-clock" aria-hidden="true">
+              <IconStopwatch size={15} />
+              <Show keyed when={!timeMachineExpanded() && timeMachineHintTurn()}>
+                <span class="repo-time-toggle-hand" />
+              </Show>
+            </span>
+          </button>
+        </Show>
+        <Show when={!!state.currentId && roamingRole() !== "guest"}>
+          <button
+            type="button"
+            class="chat-files-btn"
+            classList={{ active: workspaceOpen() }}
+            title="文件与产物"
+            aria-label="文件与产物"
+            onClick={() => setWorkspaceOpen(!workspaceOpen())}
+          >
+            <IconFile size={15} />
+          </button>
+        </Show>
       </header>
       <Show when={showShare() && state.currentId}>
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
@@ -1370,9 +1400,6 @@ export function ChatView() {
       </Show>
 
       <div class="chat-shell">
-        <Show when={state.currentId && roamingRole() !== "guest" && !workspaceOpen()}>
-          <button class="workspace-float-toggle" aria-label="打开文件与产物" title="文件与产物" onClick={() => setWorkspaceOpen(true)}><IconFile size={18} /></button>
-        </Show>
         <div class="chat-primary">
       <div class="chat-body">
         <Show
@@ -1461,30 +1488,16 @@ export function ChatView() {
           classList={{ collapsed: !timeMachineExpanded(), expanded: timeMachineExpanded() }}
           aria-label="会话与工作目录分支时间线"
         >
-          <button
-            type="button"
-            class="repo-time-toggle"
-            aria-expanded={timeMachineExpanded()}
-            title="展开世界线"
-            onClick={() => setTimeMachineExpanded(true)}
-          >
-            <span class="repo-time-toggle-clock" aria-hidden="true">
-              <IconStopwatch size={17} />
-              <Show keyed when={!timeMachineExpanded() && timeMachineHintTurn()}>
-                <span class="repo-time-toggle-hand" />
-              </Show>
-            </span>
-            <span class="repo-time-toggle-label">世界线</span>
-          </button>
           <div class="repo-time-machine-label" aria-hidden={!timeMachineExpanded()}>
             <button
               type="button"
               class="repo-time-notes"
-              title="把这条世界线的经验沉淀为一个 skill：新开一个训练会话自行阅读并逐级分析"
+              aria-label="时光笔记"
+              title="时光笔记：把这条世界线的经验沉淀为一个 skill"
               disabled={!!restoringCheckpoint() || !timeMachineExpanded()}
               onClick={() => setShowTimeNotes(true)}
             >
-              时光笔记
+              <IconPencil size={16} />
             </button>
             <button
               type="button"
@@ -1499,7 +1512,7 @@ export function ChatView() {
                 <span class="repo-time-clock-hand" />
               </span>
             </button>
-            <span>{restoringCheckpoint() ? "跳转中…" : "世界线"}</span>
+            <Show when={restoringCheckpoint()}><span class="repo-time-toggle-label" role="status">跳转中…</span></Show>
           </div>
           <div class="repo-time-machine-track">
             <div
