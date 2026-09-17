@@ -1,6 +1,53 @@
 import type { Item, ThoughtItem, ToolItem } from "./types";
 
 type ProcessItem = ThoughtItem | ToolItem;
+
+function memoryTool(item: ToolItem): "read" | "write" | null {
+  if (item.status !== "completed") return null;
+  // Only explicit memory tools / known memory files; never infer from prose or shell commands.
+  const name = item.title.trim().toLowerCase();
+  if (/^(?:mcp__\w+__)?(?:write_memory|save_memory|update_memory|memory_write|memory_update)$/.test(name)) return "write";
+  const input = item.rawInput && typeof item.rawInput === "object" ? item.rawInput as Record<string, unknown> : {};
+  const paths = [...(item.locations ?? []).map(l => l.path), ...["path", "file_path", "filePath", "filename"].map(k => input[k])]
+    .filter((p): p is string => typeof p === "string" && !!p.trim());
+  const isMemoryPath = (path: string) => {
+    const p = path.replace(/\\/g, "/").toLowerCase();
+    return /(?:^|\/)memory\.md$/.test(p) || /(?:^|\/)\.(?:codebuddy|claude)\/(?:[^/]+\/)*memor(?:y|ies)\//.test(p);
+  };
+  if (!paths.length || !paths.every(isMemoryPath)) return null;
+  if (["edit", "write"].includes(item.kind)) return "write";
+  return item.kind === "read" ? "read" : null;
+}
+
+/** Preserve the usual final-block folding, except for a short acknowledgement after memory maintenance. */
+export function splitTurnBody(body: Item[], finished: boolean): { process: Item[]; conclusion: Item[] } {
+  if (!finished) return { process: body, conclusion: [] };
+  const isText = (item: Item) => item.type === "assistant" || item.type === "system";
+  const last = body.findLastIndex(isText);
+  if (last < 0) return { process: body, conclusion: [] };
+  let first = last;
+  while (first > 0 && isText(body[first - 1])) first--;
+  const selected = new Set(body.slice(first, last + 1));
+  const tail = body.slice(first, last + 1);
+  const shortAck = tail.every(it => it.type === "assistant") && tail.map(it => "text" in it ? it.text : "").join("\n").length <= 400;
+  // ponytail: a conservative 400-character acknowledgement ceiling; use explicit provider metadata if available later.
+  if (shortAck && body.slice(last + 1).every(it => it.type === "thought" || (it.type === "tool" && memoryTool(it)))) {
+    let start = first;
+    let wrote = false;
+    while (start > 0) {
+      const item = body[start - 1];
+      if (item.type === "thought") { start--; continue; }
+      const kind = item.type === "tool" ? memoryTool(item) : null;
+      if (!kind) break;
+      wrote ||= kind === "write";
+      start--;
+    }
+    if (wrote) {
+      while (start > 0 && isText(body[start - 1])) selected.add(body[--start]);
+    }
+  }
+  return { process: body.filter(it => !selected.has(it)), conclusion: body.filter(it => selected.has(it)) };
+}
 export type ProcessSegment = { type: "process"; id: number; items: ProcessItem[] } | { type: "item"; id: number; item: Item };
 
 export function processSegments(items: Item[]): ProcessSegment[] {

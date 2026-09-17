@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { processSegments, processSummary, processLiveLines } from "../src/processDisplay.ts";
+import { processSegments, processSummary, processLiveLines, splitTurnBody } from "../src/processDisplay.ts";
 
 const thought = (id, text = "分析\n下一步") => ({ type: "thought", id, text });
 const tool = (id, kind, status = "completed") => ({ type: "tool", id, kind, status, title: `${kind}\nfile.ts` });
@@ -25,4 +25,23 @@ assert.deepEqual(processLiveLines([thought(1, "abcdef")], text => text.match(/.{
 assert.deepEqual(processLiveLines([thought(1, "abcdefg")], text => text.match(/.{1,2}/gu)), ["ef", "g"]);
 assert.deepEqual(processLiveLines([]), []);
 assert.deepEqual(processSegments([]), []);
+const reply = (id, text) => ({type: "assistant", id, text});
+const memory = (id, kind = "edit", path = "C:\\Users\\test\\.codebuddy\\memories\\iterations.md") =>
+  ({...tool(id, kind), rawInput: {file_path: path}, locations: []});
+const body = [reply(10, "我来查询"), tool(11, "read"), reply(12, "| 需求 | 优先级 |\n|---|---|\n| A | P1 |"),
+  thought(13), memory(14, "read"), memory(15), reply(16, "备忘已记好。")];
+assert.deepEqual(splitTurnBody(body, true).conclusion.map(it => it.id), [12, 16]);
+assert.deepEqual(splitTurnBody(body, true).process.map(it => it.id), [10, 11, 13, 14, 15]);
+assert.deepEqual(splitTurnBody(body, false), {process: body, conclusion: []});
+for (const middle of [tool(15, "edit"), memory(15, "read"), {...memory(15), status: "failed"},
+  memory(15, "execute"), {...memory(15), locations: [{path: "src/app.ts"}]}]) {
+  assert.deepEqual(splitTurnBody([body[2], middle, body.at(-1)], true).conclusion.map(it => it.id), [16]);
+}
+assert.deepEqual(splitTurnBody([body[2], memory(15), tool(17, "read"), body.at(-1)], true).conclusion.map(it => it.id), [16]);
+assert.deepEqual(splitTurnBody([body[2], memory(15), body.at(-1), tool(17, "edit")], true).conclusion.map(it => it.id), [16]);
+assert.deepEqual(splitTurnBody([body[2], memory(15), reply(16, "详细的新结果".repeat(100))], true).conclusion.map(it => it.id), [16]);
+assert.deepEqual(splitTurnBody([reply(1, "结果"), reply(2, "补充")], true).conclusion.map(it => it.id), [1, 2]);
+assert.deepEqual(splitTurnBody([body[2], memory(15)], true).conclusion.map(it => it.id), [12]);
+assert.deepEqual(splitTurnBody([body[2], {...tool(15, "other"), title: "save_memory"}, body.at(-1)], true).conclusion.map(it => it.id), [12, 16]);
+assert.deepEqual(splitTurnBody([], true), {process: [], conclusion: []});
 console.log("process display checks passed");
