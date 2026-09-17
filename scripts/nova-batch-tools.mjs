@@ -3,6 +3,7 @@ import webviewTool from "./webview-tool.json" with { type: "json" };
 import chromeTool from "./chrome-tool.json" with { type: "json" };
 import jianlaiTool from "./jianlai-tool.json" with { type: "json" };
 import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
 import { callGlobalContextTool, globalContextServiceConfigured } from "./nova-context-client.mjs";
 
@@ -44,6 +45,7 @@ export function normalizePolarisArgs(params = {}) {
  * @param {{ readOnly?: boolean, fastContext?: boolean }} [options]
  */
 export function createNovaBatchTools(cwd, options = {}) {
+  const owner = randomUUID();
   const fastContext = fastContextEnabled(options);
   const readOnly = readOnlyEnabled(options);
   let root = resolve(cwd);
@@ -55,10 +57,10 @@ export function createNovaBatchTools(cwd, options = {}) {
       execute: async params => JSON.stringify(await callGlobalContextTool("webview", root, params)),
     };
     tools.jianlai = { ...jianlaiTool,
-      execute: async params => JSON.stringify(await callGlobalContextTool("jianlai", root, params)),
+      execute: async params => JSON.stringify(await callGlobalContextTool("jianlai", root, params, owner)),
     };
     tools.chrome = { ...chromeTool,
-      execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params)),
+      execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params, owner)),
     };
     for (const definition of imageTools) {
       tools[definition.name] = { ...definition,

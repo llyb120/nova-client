@@ -366,7 +366,7 @@ pub async fn chrome_browser_ui(
         .ok_or("会话不存在")?;
     let mut args = args;
     args["operation"] = json!(operation);
-    crate::native_browser::execute_chrome(&root, &args).await
+    crate::native_browser::execute_chrome(&root, &args, &format!("ui:{id}")).await
 }
 
 #[cfg(test)]

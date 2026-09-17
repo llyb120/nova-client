@@ -1,5 +1,9 @@
 import { connect } from "node:net";
 import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+
+// Stable for this tool client, even when another Nova conversation becomes visible.
+const owner = randomUUID();
 
 const CONNECT_RETRY_MS = 50;
 const CONNECT_TIMEOUT_MS = 3000;
@@ -15,7 +19,7 @@ function wait(ms) {
   return new Promise((done) => setTimeout(done, ms));
 }
 
-async function requestOnce(config, method, root, params) {
+async function requestOnce(config, method, root, params, clientOwner) {
   return new Promise((resolveResult, reject) => {
     const socket = connect(config.endpoint);
     let response = "";
@@ -31,7 +35,7 @@ async function requestOnce(config, method, root, params) {
     const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), ["webview", "chrome"].includes(method) ? 45_000 : ["generate_image", "edit_image"].includes(method) ? 610_000 : CALL_TIMEOUT_MS);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ token: config.token, method, root: resolve(root), params: params ?? {} })}\n`);
+      socket.write(`${JSON.stringify({ token: config.token, method, root: resolve(root), owner: clientOwner, params: params ?? {} })}\n`);
     });
     socket.on("data", (chunk) => { response += chunk; });
     socket.on("end", () => {
@@ -51,7 +55,7 @@ export function globalContextServiceConfigured() {
   return serviceConfig() !== null;
 }
 
-export async function callGlobalContextTool(method, root, params) {
+export async function callGlobalContextTool(method, root, params, clientOwner = owner) {
   const config = serviceConfig();
   if (!config) throw new Error("global context service is not configured");
   const mode = "fast";
@@ -61,7 +65,7 @@ export async function callGlobalContextTool(method, root, params) {
   const deadline = Date.now() + CONNECT_TIMEOUT_MS;
   for (;;) {
     try {
-      return await requestOnce(config, method, root, requestParams);
+      return await requestOnce(config, method, root, requestParams, clientOwner);
     } catch (error) {
       if (["generate_image", "edit_image", "webview", "chrome", "jianlai"].includes(method)) throw error;
       const code = error?.code;

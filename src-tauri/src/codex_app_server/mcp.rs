@@ -86,7 +86,9 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     name: &str,
     args: Value,
 ) -> Result<Value, String> {
-    let message = json!({"token":config.token,"method":name,"root":config.root,"params":args});
+    static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let owner = OWNER.get_or_init(|| uuid::Uuid::new_v4().to_string());
+    let message = json!({"token":config.token,"method":name,"root":config.root,"owner":owner,"params":args});
     stream
         .write_all(format!("{message}\n").as_bytes())
         .await
@@ -287,6 +289,7 @@ mod tests {
             server.read_line(&mut line).await.unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(request["method"], "edit_image");
+            assert!(uuid::Uuid::parse_str(request["owner"].as_str().unwrap()).is_ok());
             assert_eq!(request["params"], expected_args);
             server.get_mut().write_all(b"{\"ok\":true,\"result\":{\"path\":\"result.png\"}}\n").await.unwrap();
         });

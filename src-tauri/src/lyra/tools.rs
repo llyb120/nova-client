@@ -522,7 +522,8 @@ pub async fn execute(
     call_id: &str,
     cancelled: Option<&Arc<AtomicBool>>,
 ) -> ToolOutcome {
-    let outcome = execute_inner(root, name, args, shell, cancelled).await;
+    let owner = archive_dir.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
+    let outcome = execute_inner(root, name, args, shell, cancelled, &owner).await;
     govern(outcome, name, call_id, archive_dir)
 }
 
@@ -532,6 +533,7 @@ async fn execute_inner(
     args: &Value,
     shell: Option<&crate::lyra::prompt::ShellConfig>,
     cancelled: Option<&Arc<AtomicBool>>,
+    owner: &str,
 ) -> ToolOutcome {
     match name {
         "webview" => {
@@ -543,14 +545,14 @@ async fn execute_inner(
         }
         "chrome" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，Chrome 控制不可用"); }
-            match crate::native_browser::execute_chrome(root, args).await {
+            match crate::native_browser::execute_chrome(root, args, owner).await {
                 Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
                 Err(error) => ToolOutcome::error(error),
             }
         }
         "jianlai" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，剑来不可用"); }
-            match crate::jianlai::execute(root, args).await {
+            match crate::jianlai::execute(root, args, owner).await {
                 Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
                 Err(error) => ToolOutcome::error(error),
             }
@@ -734,7 +736,7 @@ mod embedded_rtk_tests {
             }
         }
         let root = tempfile::tempdir().unwrap();
-        let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None).await;
+        let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, "test").await;
         assert!(result.is_error);
         assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
     }

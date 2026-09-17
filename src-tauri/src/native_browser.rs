@@ -356,19 +356,16 @@ fn check(app: &AppHandle, current: &Session) -> Result<(), String> {
     if current.cancel.load(Ordering::SeqCst) {
         return Err("已停止浏览器控制".into());
     }
+    // Chrome targets an explicitly authorized tab, independently of Nova's visible thread.
+    if current.browser_id == "chrome" {
+        return Ok(());
+    }
     let active = app
         .state::<AppState>()
         .active_thread
         .lock()
         .unwrap()
         .clone();
-    if current.browser_id == "chrome" {
-        return if active.as_deref() == Some(&current.thread_id) {
-            Ok(())
-        } else {
-            Err("已切换会话，停止 Chrome 操作；页面状态保留".into())
-        };
-    }
     let latest = session(app, &current.browser_id)?;
     if !latest.visible || active.as_deref() != Some(&current.thread_id) {
         return Err("浏览器不在当前可见会话中，已停止操作".into());
@@ -1540,8 +1537,20 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> 
     }
 }
 
-pub(crate) async fn execute_chrome(root: &Path, args: &Value) -> Result<Value, String> {
-    let (app, thread_id) = current_context(root)?;
+pub(crate) fn tool_owner(root: &Path, owner: &str) -> Result<String, String> {
+    if owner.trim().is_empty() || owner.len() > 4096 {
+        return Err("缺少有效工具客户端标识，请重启工具客户端".into());
+    }
+    let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    if !root.is_dir() {
+        return Err("工具工作目录不存在".into());
+    }
+    Ok(format!("{owner}:{}", root.display()))
+}
+
+pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
+    let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
+    let thread_id = tool_owner(root, owner)?;
     let operation = args["operation"].as_str().unwrap_or_default();
     let connection = crate::chrome_browser::connect(app).await?;
     if matches!(operation, "connect" | "status") {
@@ -1615,6 +1624,18 @@ fn state_dir(app: &AppHandle) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn background_tool_owners_are_stable_and_isolated() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let owner = tool_owner(root.path(), "client-a").unwrap();
+        assert_eq!(owner, tool_owner(&root.path().join("."), "client-a").unwrap());
+        assert_ne!(owner, tool_owner(root.path(), "client-b").unwrap());
+        assert_ne!(owner, tool_owner(other.path(), "client-a").unwrap());
+        assert!(tool_owner(root.path(), "").is_err());
+        assert!(tool_owner(&root.path().join("missing"), "client-a").is_err());
+    }
+
     #[test]
     fn native_browser_rejects_unsafe_urls_and_unstructured_actions() {
         assert_eq!(normalized_url("localhost:5173").unwrap().scheme(), "http");

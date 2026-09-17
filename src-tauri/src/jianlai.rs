@@ -844,8 +844,8 @@ fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, d
     }
 }
 
-pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value> {
-    let (_, owner) = crate::native_browser::current_context(root)?;
+pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
+    let owner = crate::native_browser::tool_owner(root, owner)?;
     let args = args.clone();
     tokio::task::spawn_blocking(move || run(owner, args))
         .await
