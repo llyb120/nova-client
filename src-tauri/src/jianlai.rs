@@ -109,6 +109,19 @@ fn window(id: u32) -> Result<Window> {
         .find(|w| w.id().ok() == Some(id))
         .ok_or_else(|| "程序窗口已关闭，请重新 windows".into())
 }
+#[cfg(windows)]
+fn foreground() -> Result<Option<(u32, u32)>> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    // Read only: switching windows remains a mouse/keyboard operation.
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() { return Ok(None); }
+    let mut pid = 0;
+    if unsafe { GetWindowThreadProcessId(hwnd, &mut pid) } == 0 {
+        return Err("无法读取前台窗口身份".into());
+    }
+    Ok(Some((hwnd as usize as u32, pid)))
+}
+#[cfg(not(windows))]
 fn foreground() -> Result<Option<(u32, u32)>> {
     for w in Window::all().map_err(err)? {
         if w.is_focused().map_err(err)? {
@@ -588,8 +601,17 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
         _ => Err("未知剑来操作".into()),
     }
 }
-// Observation never retries input. A closed/minimized window falls back to the desktop.
+// Observation never retries input. An unfocused/closed/minimized window falls back to the desktop.
 fn observe(owner: &str, window_id: Option<u32>, max_edge: u32, state: &mut Option<Snapshot>, result: &mut Value) {
+    // A window capture can show an occluded app. After a switch, observe the actual
+    // desktop instead of repeatedly returning a background image that cannot receive input.
+    let window_id = match window_id {
+        Some(id) if !foreground().ok().flatten().is_some_and(|(focused, _)| focused == id) => {
+            result["windowObservationError"] = json!("目标窗口不在前台，改用桌面截图");
+            None
+        }
+        id => id,
+    };
     let observation = capture(owner, window_id, max_edge, state).or_else(|e| {
         if window_id.is_none() { return Err(e); }
         result["windowObservationError"] = json!(e);
@@ -667,6 +689,20 @@ mod tests {
     #[test]
     #[ignore]
     fn desktop_smoke() {
+        #[cfg(windows)]
+        {
+            let expected = Window::all().unwrap().into_iter()
+                .find(|w| w.is_focused().unwrap_or(false))
+                .map(|w| (w.id().unwrap(), w.pid().unwrap()));
+            assert_eq!(foreground().unwrap(), expected);
+        }
+        // A departed target must yield an actionable desktop, not its old window image.
+        let mut observation = json!({});
+        let mut snapshot = None;
+        observe("test", Some(u32::MAX), 1600, &mut snapshot, &mut observation);
+        assert!(observation["windowId"].is_null());
+        assert!(snapshot.is_some(), "{observation}");
+        assert!(snapshot.unwrap().window.is_none());
         let shot = run("test".into(), json!({"operation":"screenshot"})).unwrap();
         assert!(!shot["images"].as_array().unwrap().is_empty());
         let args = json!({"operation":"act","snapshotId":shot["snapshotId"],"imageId":shot["images"][0]["imageId"],"actions":[{"action":"move","x":10,"y":10}]});
@@ -707,7 +743,7 @@ mod tests {
                 }
             }
         }
-        for result in [shot, result, recovered] {
+        for result in [observation, shot, result, recovered] {
             for img in result["images"].as_array().unwrap() {
                 let _ = std::fs::remove_file(img["path"].as_str().unwrap());
             }

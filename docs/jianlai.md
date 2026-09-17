@@ -18,9 +18,9 @@
 {"operation":"act","snapshotId":"上次返回值","imageId":"window-123","actions":[{"action":"click","x":180,"y":90},{"action":"type","text":"你好"}]}
 ```
 
-窗口输入要求目标在前台；后台窗口可以截图，但不能盲目操作。先用全屏截图点击目标使其激活，再重新截窗口。窗口位置/尺寸、焦点、显示器布局发生变化会拒绝旧坐标。快照180秒过期、仅消费一次，并绑定当前Nova会话。全局锁防止剑来并行操作同一桌面。批量动作只用于已确定的连续步骤；需要根据画面判断时拆分调用。用户同时移动窗口/输入仍可能产生竞态，请操作时避免争用桌面。
+窗口输入要求目标在前台；后台窗口可以截图，但不能盲目操作。窗口截图不会激活窗口。先截桌面，Windows用Win+Tab加wait 250ms显示任务视图，根据返回图点击目标，或点击可见任务栏图标；确认成功后再截窗口。不要盲目循环切窗或猜应用热键，同一路径连续失败两次应报告阻碍。用户指定剑来时，整个桌面任务只用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation及终端脚本操控应用。窗口位置/尺寸、焦点、显示器布局发生变化会拒绝旧坐标。快照180秒过期、仅消费一次，并绑定当前Nova会话。全局锁防止剑来并行操作同一桌面。批量动作只用于已确定的连续步骤；需要根据画面判断时拆分调用。用户同时移动窗口/输入仍可能产生竞态，请操作时避免争用桌面。
 
-`not_executed` 表示尚未发送输入。焦点、窗口几何或快照过期等目标校验失败会直接附带当前截图、新snapshotId、foreground与desktopBounds（即使feedback=none），不自动重放；窗口关闭/最小化时尝试桌面观察，原因保留在windowObservationError。不能根据焦点变化猜测是哪一个程序抢焦点。
+`not_executed` 表示尚未发送输入。焦点、窗口几何或快照过期等目标校验失败会直接附带当前截图、新snapshotId、foreground与desktopBounds（即使feedback=none），不自动重放；窗口失焦、关闭或最小化时改为桌面观察，原因保留在windowObservationError。不能根据焦点变化猜测是哪一个程序抢焦点。
 
 `executed` 表示输入已发送，不表示应用任务成功；`needs_review` 表示可能部分执行，检查completedActions/error和随附新图，禁止重放整个批次。观察失败会单独返回observationError，不掩盖执行状态。
 
@@ -34,7 +34,7 @@
 
 ## 耗时诊断
 
-截图返回timingsMs：capture（系统捕获）、resize、encodeAndSave（PNG编码及落盘）、other（窗口枚举、焦点校验等）和total。MCP传输适配另返回deliveryTimingsMs（read/base64/total）及deliveredImageBytes；不包含网络及模型耗时。先比较这些分段数据，再决定是否换捕获后端/编码器，不据单次总耗时猜测瓶颈。
+截图返回timingsMs：capture（系统捕获）、resize、encodeAndSave（PNG编码及落盘）、other（窗口枚举、焦点校验等）和total。MCP传输适配另返回deliveryTimingsMs（read/base64/total）及deliveredImageBytes；不包含网络及模型耗时。Windows前台身份检查直接读取窗口句柄与PID，避免每个动作多次枚举所有窗口及其元数据；这是只读状态检查，不负责激活。先比较这些分段数据，再决定是否换捕获后端/编码器，不据单次总耗时猜测瓶颈。
 
 ## 平台与构建
 

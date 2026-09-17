@@ -5273,7 +5273,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
         },
     ];
     if !read_only {
-        lines.push("Desktop routing: 剑来 means the jianlai desktop mouse/keyboard/screenshot tool, not a shell command. When the user requests 剑来/jianlai, start with mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"jianlai\",\"arguments\":{\"operation\":\"windows\"}}, then inspect the target window and follow the tool schema. Do not substitute shell/config-file searches for the requested desktop interaction. If the endpoint is missing, report the MCP error rather than silently switching methods. webview controls Nova's sidebar browser; chrome controls the user's Chrome.".into());
+        lines.push("Desktop routing: 剑来 means the jianlai desktop mouse/keyboard/screenshot tool, not a shell command. When the user requests 剑来/jianlai, start with mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"jianlai\",\"arguments\":{\"operation\":\"windows\"}}, then inspect the target window and follow the tool schema. Use only jianlai mouse/keyboard/screenshot throughout the desktop task; never use shell, COM, PowerShell, P/Invoke, UIAutomation or scripts to activate/control apps. For background windows, inspect the desktop and use Win+Tab task view or a visible taskbar icon; do not blindly cycle windows. If the endpoint is missing, report the MCP error rather than silently switching methods. webview controls Nova's sidebar browser; chrome controls the user's Chrome.".into());
     }
     if read_only {
         lines.push("Current mode is plan/read-only: analyze only; do not modify files.".into());
@@ -5282,7 +5282,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
 }
 
 fn direct_desktop_guidance() -> &'static str {
-    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、webview（侧栏浏览器）、chrome（用户Chrome）。用户指定剑来时，直接调用工具列表中来自 nova-tools 的 jianlai，先 operation=windows 再截图；不要用 shell/配置文件搜索替代。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
+    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、webview（侧栏浏览器）、chrome（用户Chrome）。用户指定剑来时，直接调用工具列表中来自 nova-tools 的 jianlai，先 operation=windows 再截图；整个桌面任务仅用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation或脚本激活窗口。后台窗口先截桌面，用Win+Tab任务视图或可见任务栏入口切窗，不要盲目循环切换。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
 }
 
 #[cfg(test)]
