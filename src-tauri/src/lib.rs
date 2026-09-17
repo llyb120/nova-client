@@ -2823,9 +2823,31 @@ fn revert_file_changes(
     Ok(json!({ "reverted": reverted, "conflicts": conflicts, "errors": errors }))
 }
 
+/// Explorer 不接受 Rust canonicalize 返回的扩展路径前缀。
+#[cfg(windows)]
+fn explorer_path(path: &str) -> String {
+    let path = path.replace('/', "\\");
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn explorer_paths_use_shell_compatible_separators() {
+    assert_eq!(explorer_path("C:/Users/测试/修复包 0.1.4.zip"), r"C:\Users\测试\修复包 0.1.4.zip");
+    assert_eq!(explorer_path(r"\\?\C:\work\file.zip"), r"C:\work\file.zip");
+    assert_eq!(explorer_path(r"\\?\UNC\server\share\file.zip"), r"\\server\share\file.zip");
+    assert_eq!(explorer_path("//server/share/file.zip"), r"\\server\share\file.zip");
+}
+
 /// 在资源管理器 / Finder 中打开目录，或在目录中选中文件
 #[tauri::command]
 fn open_in_explorer(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    let path = explorer_path(&path);
     let path = std::path::PathBuf::from(path);
     #[cfg(windows)]
     {
@@ -2837,8 +2859,10 @@ fn open_in_explorer(path: String) -> Result<(), String> {
             return Ok(());
         }
         if path.is_file() {
+            use std::os::windows::process::CommandExt;
+            // Explorer 要求 /select, 在引号外，不能让 Command 把整个参数一起加引号。
             std::process::Command::new("explorer")
-                .arg(format!("/select,{}", path.to_string_lossy()))
+                .raw_arg(format!("/select,\"{}\"", path.to_string_lossy()))
                 .spawn()
                 .map_err(|e| format!("打开资源管理器失败：{e}"))?;
             return Ok(());
