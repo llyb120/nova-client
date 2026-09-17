@@ -212,6 +212,85 @@ button {
 }
 
 /* ===== 侧边栏 ===== */
+.sidebar-shell {
+  --sidebar-width: clamp(248px, 20vw, 256px);
+  --sidebar-rail-width: 52px;
+  position: relative;
+  flex: none;
+  width: var(--sidebar-width);
+}
+.sidebar-shell.collapsed { width: var(--sidebar-rail-width); }
+.sidebar-shell > .sidebar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--sidebar-width);
+  z-index: 20;
+}
+.sidebar-shell.collapsed > .sidebar {
+  left: var(--sidebar-rail-width);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-lg);
+}
+.sidebar-shell:not(.is-open) > .sidebar { visibility: hidden; }
+.sidebar-hover-edge {
+  display: none;
+  position: absolute;
+  inset: 0 0 0 auto;
+  width: 8px;
+  z-index: 20;
+}
+.sidebar-shell.collapsed .sidebar-hover-edge { display: block; }
+.sidebar-toggle {
+  position: absolute;
+  z-index: 21;
+  top: 22px;
+  left: 0;
+  width: 28px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-left: 0;
+  border-radius: 0 999px 999px 0;
+  color: var(--text-muted);
+  background: var(--bg-panel);
+  box-shadow: 4px 5px 14px #0001;
+}
+.sidebar-shell.is-open .sidebar-toggle { left: var(--sidebar-width); }
+.sidebar-shell.collapsed .sidebar-toggle { left: var(--sidebar-rail-width); }
+.sidebar-shell.collapsed.is-open .sidebar-toggle { left: calc(var(--sidebar-rail-width) + var(--sidebar-width)); }
+.sidebar-shell:not(.collapsed) .sidebar-toggle svg { transform: rotate(180deg); }
+.sidebar-toggle:hover { color: var(--accent); }
+.sidebar-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.sidebar-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  height: 100%;
+  padding: 22px 0 14px;
+  overflow-y: auto;
+  background: var(--sidebar-veil);
+  border-right: 1px solid var(--border);
+}
+.sidebar-rail-brand { display: grid; place-items: center; height: 38px; margin-bottom: 12px; color: var(--accent); flex: none; }
+.sidebar-rail button {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  border-radius: 8px;
+  color: var(--text-muted);
+}
+.sidebar-rail button:hover, .sidebar-rail button.active { color: var(--accent); background: var(--bg-hover); }
+.sidebar-rail button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.sidebar-rail-spacer { flex: 1; }
+.sidebar-rail-dot { position: absolute; top: 5px; right: 5px; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+
 .sidebar {
   position: relative;
   /* 侧栏宽度只随窗口变，不被主区域视图按比例挤压。 */

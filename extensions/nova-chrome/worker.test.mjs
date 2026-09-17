@@ -54,5 +54,59 @@ test('stable tags, default access, auto-attached frames, expiry and worker resta
   tabs=tabs.filter(t=>t.id!==11);await restarted.inventory();
   await assert.rejects(restarted.execute(command(initial[0].tag)),/失效/);
   assert.ok(discovery.length>0,'Discover Nova without a bundled config or user setup');
-  assert.ok(discovery.every(url=>url==='http://127.0.0.1:47653/pair'));
+  assert.deepEqual([...new Set(discovery)].sort(),Array.from({length:10},(_,i)=>`http://127.0.0.1:${47653+i}/pair`));
+});
+
+test('multiple Nova instances route replies independently, serialize commands and reconnect without replay',async()=>{
+  const event=()=>({addListener(){}});
+  const replies=[], pairs=new Map(), polls=new Map();
+  const available=new Set([47653,47654]);
+  let active=0, peak=0, attaches=0;
+  const chrome={
+    storage:{session:{get:async()=>({}),set:async()=>{}}},
+    tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event()},
+    debugger:{attach:async()=>{attaches++;},sendCommand:async(_target,_method,params)=>{
+      peak=Math.max(peak,++active);
+      await new Promise(resolve=>setImmediate(resolve));
+      active--; return {text:params.text};
+    },onDetach:event(),onEvent:event()},
+    runtime:{id:'test',onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()},
+  };
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,fetch:async(url,options)=>{
+    const endpoint=new URL(url),port=Number(endpoint.port);
+    if(!available.has(port))throw Error('offline');
+    if(endpoint.pathname==='/pair'){
+      pairs.set(port,(pairs.get(port)||0)+1);
+      return {ok:true,json:async()=>({token:String(port).repeat(8),origin:'http://127.0.0.1:1'})};
+    }
+    assert.equal(options.headers.Authorization,`Bearer ${String(port).repeat(8)}`);
+    if(endpoint.pathname==='/poll'){
+      const count=polls.get(port)||0;polls.set(port,count+1);
+      if(count)return new Promise(()=>{});
+      const [tab]=await scope.api.inventory();
+      return {ok:true,json:async()=>({command:{id:'same-id',operation:'cdp',args:{tabTag:tab.tag,method:'Input.insertText',params:{text:String(port)}},expiresAt:Date.now()+3000}})};
+    }
+    const reply=JSON.parse(options.body);
+    replies.push({port,reply});
+    if(port===47653)throw Error('reply connection lost');
+    return {ok:true};
+  }};
+  const source=await readFile(new URL('./worker.js',import.meta.url),'utf8');
+  runInNewContext(source+'\nglobalThis.api={inventory,loop,connections};',scope);
+  const waitFor=async predicate=>{
+    for(let i=0;i<100 && !predicate();i++)await new Promise(resolve=>setTimeout(resolve,5));
+    assert.ok(predicate());
+  };
+  await waitFor(()=>replies.length===2 && scope.api.connections.size===1);
+  for(const {port,reply} of replies){assert.equal(reply.result.text,String(port));assert.equal(reply.id,'same-id');}
+  assert.equal(attaches,1,'shared tab is attached once');
+  assert.equal(peak,1,'commands from separate instances cannot race a debugger attachment');
+  assert.ok(scope.api.connections.has('http://127.0.0.1:47654'),'a failed instance does not disconnect the other');
+  available.add(47655);
+  scope.api.loop();scope.api.loop();
+  await waitFor(()=>replies.length===3);
+  assert.equal(pairs.get(47653),2,'failed instance is discovered again');
+  assert.equal(pairs.get(47654),1,'live poll is not duplicated');
+  assert.equal(pairs.get(47655),1,'new instance is discovered while another is connected');
+  assert.equal(replies.filter(value=>value.port===47653).length,1,'failed delivery is never replayed');
 });

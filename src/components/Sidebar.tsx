@@ -66,6 +66,10 @@ export function Sidebar(props: {
   onOpenUpdate: () => void;
   onOpenInbox: () => void;
 }) {
+  const [collapsed, setCollapsed] = createSignal(false);
+  const [hovered, setHovered] = createSignal(false);
+  const [keyboardFocus, setKeyboardFocus] = createSignal(false);
+  const sidebarOpen = () => !collapsed() || hovered() || keyboardFocus() || !!menu() || !!tmenu() || !!mergeFor();
   const [version, setVersion] = createSignal("");
   let updateCheckTimer: number | undefined;
   let updateCheckClick = 0;
@@ -542,7 +546,75 @@ export function Sidebar(props: {
   };
 
   return (
-    <aside class="sidebar">
+    <div
+      class="sidebar-shell"
+      classList={{ collapsed: collapsed(), "is-open": sidebarOpen() }}
+      onPointerLeave={() => setHovered(false)}
+    >
+      <div class="sidebar-hover-edge" aria-hidden="true" onPointerEnter={() => setHovered(true)} />
+      <button
+        type="button"
+        class="sidebar-toggle"
+        title={collapsed() ? "固定展开侧边栏" : "收起为图标栏"}
+        aria-label={collapsed() ? "固定展开侧边栏" : "收起侧边栏"}
+        aria-controls="main-sidebar"
+        aria-expanded={sidebarOpen()}
+        onClick={() => {
+          setCollapsed(!collapsed());
+          setHovered(false);
+          setKeyboardFocus(false);
+        }}
+      >
+        <IconChevron size={16} />
+      </button>
+      <Show when={collapsed()}>
+        <nav class="sidebar-rail" aria-label="快捷导航">
+          <span class="sidebar-rail-brand" title="Nova"><IconLogo size={20} /></span>
+          <button title="新对话" aria-label="新对话" onClick={openHome}><IconPlus size={18} /></button>
+          <button title="会话列表（悬停展开）" aria-label="会话列表" aria-controls="main-sidebar"
+            aria-expanded={sidebarOpen()} onPointerEnter={() => setHovered(true)} onClick={() => setHovered(true)}>
+            <IconFolder size={18} />
+          </button>
+          <button title="工作流" aria-label="工作流" classList={{ active: state.view === "workflows" }} onClick={openWorkflows}>
+            <IconMerge size={18} />
+            <Show when={state.workflowInbox.length > 0}><span class="sidebar-rail-dot" /></Show>
+          </button>
+          <button title="证据链" aria-label="证据链" classList={{ active: state.view === "clues" }} onClick={openClues}>
+            <IconClue size={18} />
+            <Show when={state.unreadClueMentions.length > 0}><span class="sidebar-rail-dot" /></Show>
+          </button>
+          <Show when={virgoVisible()}>
+            <button title="室女座" aria-label="室女座" classList={{ active: state.view === "virgo" }} onClick={openVirgo}>
+              <IconLogo size={18} />
+              <Show when={virgoChainCount() > 0}><span class="sidebar-rail-dot" /></Show>
+            </button>
+          </Show>
+          <div class="sidebar-rail-spacer" />
+          <Show when={state.inbox.length > 0}>
+            <button title="收件箱" aria-label="收件箱" onClick={props.onOpenInbox}>
+              <IconBell size={18} /><span class="sidebar-rail-dot" />
+            </button>
+          </Show>
+          <Show when={state.update?.staged || state.updateStaging}>
+            <button title="版本更新" aria-label="版本更新" onClick={props.onOpenUpdate}><IconDownload size={18} /></button>
+          </Show>
+          <button title="成就" aria-label="成就" onClick={props.onOpenAchievements}>
+            <IconTrophy size={18} />
+            <Show when={state.unseenAchievementIds.length > 0}><span class="sidebar-rail-dot" /></Show>
+          </button>
+          <button title="设置" aria-label="设置" onClick={props.onOpenSettings}><IconGear size={18} /></button>
+        </nav>
+      </Show>
+    <aside
+      id="main-sidebar"
+      class="sidebar"
+      inert={!sidebarOpen()}
+      onPointerEnter={() => setHovered(true)}
+      onFocusIn={(e) => setKeyboardFocus(e.target.matches(":focus-visible"))}
+      onFocusOut={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setKeyboardFocus(false);
+      }}
+    >
       <div class="sidebar-head">
         <div class="brand">
           <IconLogo size={20} class="brand-icon" />
@@ -936,5 +1008,6 @@ export function Sidebar(props: {
         </div>
       </Show>
     </aside>
+    </div>
   );
 }

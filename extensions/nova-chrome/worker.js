@@ -1,5 +1,8 @@
 // Only Nova's authenticated loopback receiver supplies commands. Never infer a target from the active tab.
-let model, loading, loopRunning = false;
+let model, loading;
+const loops = new Set(), connections = new Set();
+// ponytail: serialize individual browser commands across instances; use per-tab queues if contention grows.
+let commands = Promise.resolve();
 const attached = new Set();
 const frameTargets = new Map();
 const ready = () => loading ??= chrome.storage.session.get('model').then(({model: saved}) => {
@@ -85,34 +88,38 @@ async function execute(command) {
   }
   return {tabTag:args.tabTag,tabs:await inventory()};
 }
-async function loop() {
-  if (loopRunning) return;
-  loopRunning=true;
+function loop() {
+  for (let port=47653; port<=47662; port++) void connect(`http://127.0.0.1:${port}`);
+}
+async function connect(origin) {
+  if (loops.has(origin)) return;
+  loops.add(origin);
   try {
     await ready(); await inventory();
-    const origin='http://127.0.0.1:47653';
     const paired=await fetch(`${origin}/pair`,{method:'POST',signal:AbortSignal.timeout(3000)});
     if(!paired.ok)throw Error(`Nova 连接失败 HTTP ${paired.status}`);
-    const config={origin,...await paired.json()};
-    const endpoint = new URL(config.origin);
-    if(endpoint.protocol!=='http:' || endpoint.hostname!=='127.0.0.1' || !endpoint.port)throw Error('无效的本机连接配置');
+    const {token}=await paired.json();
+    if(typeof token!=='string' || token.length<32)throw Error('无效的本机连接令牌');
+    const config={origin,token};
     const post = (path,body) => fetch(`${config.origin}${path}`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${config.token}`},body:JSON.stringify({...body,clientId:model.clientId}),signal:AbortSignal.timeout(25000)});
     for (;;) {
       const response = await post('/poll',{});
       if (!response.ok) throw Error(`连接被拒绝 HTTP ${response.status}；检查是否连接了另一个 Chrome 实例`);
-      await chrome.storage.local.set({connection:{connected:true,updatedAt:Date.now()}});
+      connections.add(origin);
       const {command} = await response.json();
       if (!command) continue;
       let reply;
-      try { reply={id:command.id,result:await execute(command)}; }
+      const result = commands.then(()=>execute(command));
+      commands = result.catch(()=>{});
+      try { reply={id:command.id,result:await result}; }
       catch(error){reply={id:command.id,error:String(error?.message || error)};}
       // Never repeat a command if delivery of its result fails.
       const delivered = await post('/reply',reply);
       if(!delivered.ok)throw Error(`结果回传失败 HTTP ${delivered.status}；不重放操作`);
     }
-  } catch(error) {
-    await chrome.storage.local.set({connection:{connected:false,error:String(error?.message || error),updatedAt:Date.now()}});
-  } finally { loopRunning=false; }
+  } catch {
+    // Retry discovery on the next alarm; never replay a command after a failed reply.
+  } finally { connections.delete(origin); loops.delete(origin); }
 }
 chrome.debugger.onEvent.addListener((source,method,params)=>{
   if(method==='Target.attachedToTarget' && params.targetInfo?.type==='iframe') {
@@ -136,7 +143,7 @@ chrome.runtime.onMessage.addListener((message,sender,reply)=>{
     void loop();
     const tabs=await inventory();
     const [active]=await chrome.tabs.query({active:true,lastFocusedWindow:true});
-    return {tab:active ? tabs.find(tab=>tab.tag===model.tabs[active.id]?.tag) : null,connection:(await chrome.storage.local.get('connection')).connection};
+    return {tab:active ? tabs.find(tab=>tab.tag===model.tabs[active.id]?.tag) : null,connection:{connected:connections.size>0,count:connections.size}};
   };
   task().then(reply,error=>reply({error:String(error?.message || error)}));return true;
 });
