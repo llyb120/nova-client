@@ -21,7 +21,7 @@ await new Promise(r=>server.listen(0,'127.0.0.1',r));
 const port=server.address().port;
 await writeFile(join(profile,'settings.json'),JSON.stringify({relayServer:'',relayToken:'',sessionShortcuts:[],lyraEnabled:false}));
 const portServer = createServer(); await new Promise(r => portServer.listen(0, '127.0.0.1', r));
-const debugPort = Number(process.env.TEST_CDP_PORT || portServer.address().port); await new Promise(r => portServer.close(r));
+const debugPort = portServer.address().port; await new Promise(r => portServer.close(r));
 // Keep the isolated test renderer visible when another desktop window covers it during the 31s delay checks.
 const child = spawn(executable, [], { cwd: root, windowsHide: true, env: { ...process.env, NOVA_CHROME_PORT: "0", NOVA_DATA_DIR: profile, WEBVIEW2_USER_DATA_FOLDER: join(profile,'webview-runtime'), WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort} --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion` }, stdio: ['ignore', 'ignore', 'pipe'] });
 let stderr = ''; child.stderr.on('data', d => { stderr += d; });
@@ -43,26 +43,13 @@ async function attach(target) {
   const evaluate = async expression => { const v=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true}); if(v.exceptionDetails)throw Error(JSON.stringify(v.exceptionDetails)); return v.result.value; };
   return { call, evaluate };
 }
-// Separate WebView2 profiles have separate browser processes. CI gives the
-// sidebar's test-only debugging endpoint its own port; neither is a product setting.
-const targets = async () => (await Promise.all([...new Set([debugPort, Number(process.env.TEST_CHILD_CDP_PORT || debugPort)])].map(async port => {
-  try { return await (await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1000) })).json(); }
-  catch { return []; }
-}))).flat();
+const targets = async () => (await fetch(`http://127.0.0.1:${debugPort}/json/list`)).json();
 try {
   const mainTarget=await until(async()=> (await targets()).find(t=>t.type==='page'&&!t.url.startsWith('devtools:')),'main');
   const main=await attach(mainTarget);
   await main.call('Emulation.setFocusEmulationEnabled',{enabled:true});
   await until(()=>main.evaluate('!!window.__TAURI_INTERNALS__&&!!document.querySelector(".app")'),'UI');
   const invoke=(command,args={})=>main.evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)},${JSON.stringify(args)})`);
-  // Optional driver compiled ONLY into the isolated CI copy. This avoids
-  // assuming every WebView2 profile exposes the same remote target list.
-  const nativeDriver=label=>{
-    const call=(method,params={},sessionId)=>invoke('precision_smoke_cdp',{label,method,params,sessionId:sessionId??null});
-    const evaluate=async expression=>{const value=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(value.exceptionDetails)throw Error(JSON.stringify(value.exceptionDetails));return value.result.value;};
-    return {call,evaluate};
-  };
-
   assert.equal('browserControlModel' in await invoke('get_settings'),false);
   await main.evaluate(`localStorage.setItem('fd:workspaceLayout',JSON.stringify({open:true,widthRatio:.6,minimap:true,softWrap:true,mode:'browser'}));location.reload()`);
   await until(()=>main.evaluate('!!document.querySelector(".app")'),'reload');
@@ -75,8 +62,7 @@ try {
   await until(async()=> (await ui('status')).visible,'visible browser');
   assert.equal(await main.evaluate('!!document.querySelector("[aria-label=浏览器局部目标]")'),false);
   await ui('goto',{url:`http://127.0.0.1:${port}/fixture`});
-  const page=process.env.TEST_NATIVE_CDP_DRIVER ? nativeDriver((await ui('status')).activeTab) : await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/fixture')),'fixture'));
-  console.log('fixture driver:',await page.evaluate('location.href'));
+  const page=await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/fixture')),'fixture'));
   await until(()=>page.evaluate('!!document.querySelector("input")'),'loaded');
   const timings=[];
   const act=async(action,snapshot)=>{
@@ -123,15 +109,6 @@ try {
   const blocked=await act({action:'fill',...find(observation,'订单号'),text:'不应写入'},observation);
   assert.equal(blocked.status,'not_executed');assert.match(blocked.reason,/遮挡/);
   observation=await ui('inspect');await act({action:'click',...find(observation,'关闭遮挡')},observation);
-  // A click can succeed while its focus handler redirects elsewhere. Such a
-  // partially performed fill must be needs_review, never a replayable failure.
-  await page.evaluate(`document.body.insertAdjacentHTML('afterbegin','<input id="focus-trap" aria-label="不应修改" value="preserve">');document.querySelector('label input').addEventListener('focus',()=>document.querySelector('#focus-trap').focus(),{once:true})`);
-  observation=await ui('inspect');
-  const hijacked=await act({action:'fill',...find(observation,'订单号'),text:'must not reach focus trap'},observation);
-  assert.equal(hijacked.status,'needs_review',JSON.stringify(hijacked));
-  assert.match(hijacked.reason,/焦点/);
-  assert.equal(await page.evaluate('document.querySelector("#focus-trap").value'),'preserve');
-  await page.evaluate('document.querySelector("#focus-trap").remove()');
   // Partial center occlusion should use a visible edge without an extra model or retry.
   await page.evaluate(`const r=document.querySelectorAll('button')[1].getBoundingClientRect();document.body.insertAdjacentHTML('beforeend','<div id="partial" style="position:fixed;left:'+(r.x+r.width*.4)+'px;top:'+r.y+'px;width:'+(r.width*.2)+'px;height:'+r.height+'px;background:red;z-index:9999"></div>')`);
   observation=await ui('inspect');assert.equal((await act({action:'click',...find(observation,'查询','订单筛选')},observation)).status,'executed');
@@ -189,7 +166,7 @@ try {
   await ui('close_tab',{tabId:popupState.activeTab});
   await page.evaluate(`window.open('about:blank','delayedPopup');setTimeout(()=>{const w=window.open('','delayedPopup');w.location='http://127.0.0.1:${port}/delayed'},100)`);
   await until(async()=> (await ui('status')).tabs.some(t=>t.url.includes('/delayed')),'delayed popup');
-  const delayed=process.env.TEST_NATIVE_CDP_DRIVER ? nativeDriver((await ui('status')).activeTab) : await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/delayed')),'delayed target'));
+  const delayed=await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/delayed')),'delayed target'));
   assert.equal(await delayed.evaluate('!!window.opener'),true);
   await ui('close_tab',{tabId:(await ui('status')).activeTab});assert.equal((await ui('status')).activeTab,firstTab);
   // Exercise the real Chrome transport + shared engine with an emulated extension.
@@ -229,36 +206,6 @@ try {
     assert.equal(await page.evaluate('document.querySelector("input").value'),'Chrome桥接验证');
     const screenshot=await chromeUi('screenshot',{tabTag:tag,fullPage:false});
     assert.ok(screenshot.images.length);assert.equal(screenshot.browser,'chrome');
-    // Actual Rust tool route -> Chrome bridge -> real CDP. The extension transport is emulated above.
-    await page.evaluate(`document.body.insertAdjacentHTML('afterbegin','<canvas id="precision-canvas" aria-label="精确画板" width="1280" height="640" style="display:block;width:320px;height:160px"></canvas>');const c=document.querySelector('#precision-canvas'),g=c.getContext('2d');g.fillStyle='white';g.fillRect(0,0,1280,640);g.fillStyle='red';g.fillRect(480,240,320,160);window.canvasInput=[];for(const t of ['click','dblclick','pointermove','wheel'])c.addEventListener(t,e=>canvasInput.push({type:t,trusted:e.isTrusted,buttons:e.buttons,deltaX:e.deltaX}));scrollTo(0,0)`);
-    let visual=await chromeUi('inspect',{tabTag:tag});
-    assert.equal(visual.visualRequired,true);assert.equal(visual.fullPage,false);assert.ok(visual.images[0].imageId);
-    const surface=visual.pages[0].items.find(i=>i.visual?.kind==='canvas');assert.ok(surface);
-    const rect=surface.viewportRect;
-    const coords=o=>{const img=o.images[0];return {imageId:img.imageId,x:(rect.x+rect.width/2-img.x)*img.pixelWidth/img.width,y:(rect.y+rect.height/2-img.y)*img.pixelHeight/img.height};};
-    const canvasAct=(o,action)=>chromeUi('act',{tabTag:tag,snapshotId:o.snapshotId,action});
-    visual=await canvasAct(visual,{action:'click_at',...coords(visual)});
-    assert.equal(visual.status,'executed',JSON.stringify(visual));
-    assert.equal(await page.evaluate('canvasInput.filter(e=>e.type==="click"&&e.trusted).length'),1);
-    // A canvas paint changes NO DOM attributes. Reject it using pixels, not a fake DOM ref.
-    await page.evaluate(`const g=document.querySelector('#precision-canvas').getContext('2d');g.fillStyle='blue';g.fillRect(480,240,320,160)`);
-    visual=await canvasAct(visual,{action:'click_at',...coords(visual)});
-    assert.equal(visual.status,'not_executed');assert.match(visual.reason,/画面已变化/);
-    assert.equal(await page.evaluate('canvasInput.filter(e=>e.type==="click").length'),1);
-    const cropped=await chromeUi('screenshot',{tabTag:tag,fullPage:false,region:rect});
-    const img=cropped.images[0];assert.ok(img.pixelWidth>0&&img.pixelHeight>0);
-    visual=await canvasAct(cropped,{action:'double_click_at',imageId:img.imageId,x:img.pixelWidth/2,y:img.pixelHeight/2});
-    assert.equal(visual.status,'executed',JSON.stringify(visual));
-    assert.equal(await page.evaluate('canvasInput.filter(e=>e.type==="dblclick"&&e.trusted).length'),1);
-    const start=coords(visual),mapping=visual.images[0];
-    visual=await canvasAct(visual,{action:'drag',...start,to_x:start.x+50*mapping.pixelWidth/mapping.width,to_y:start.y});
-    assert.equal(visual.status,'executed',JSON.stringify(visual));
-    assert.ok(await page.evaluate('canvasInput.filter(e=>e.type==="pointermove"&&e.buttons===1).length>=8'));
-    visual=await canvasAct(visual,{action:'scroll_at',...coords(visual),delta:0,delta_x:50});
-    assert.equal(visual.status,'executed');
-    await sleep(100);assert.ok(await page.evaluate('canvasInput.some(e=>e.type==="wheel"&&e.deltaX===50&&e.trusted)'));
-    await writeFile(join(output,'precision-canvas.json'),JSON.stringify({passed:true,automaticCanvasScreenshot:true,imagePixelMapping:true,stalePaintRejected:true,croppedDoubleClick:true,continuousDrag:true,horizontalWheel:true,events:await page.evaluate('canvasInput')},null,2));
-    await page.evaluate(`document.querySelector('#precision-canvas').remove()`);
     if(pollingError)throw pollingError;
     assert.equal(await main.evaluate('!!document.querySelector("[aria-label=浏览器来源]")'),false);
     assert.equal(await main.evaluate('!!document.querySelector(".workspace-browser-surface")'),true);

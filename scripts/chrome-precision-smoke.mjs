@@ -24,6 +24,13 @@ try{
   const nova=spawn(resolve(process.argv[2]||'src-tauri/target/debug/nova.exe'),[],{env:{...process.env,NOVA_CHROME_PORT:'0',NOVA_DATA_DIR:join(profile,'nova'),WEBVIEW2_USER_DATA_FOLDER:join(profile,'webview')},stdio:['ignore','ignore','pipe']});processes.push(nova);nova.stderr.on('data',d=>{appLog+=d;});
   const main=await attach(appPort,t=>!t.url.startsWith('devtools:'));
   await until(()=>main.evaluate('!!window.__TAURI_INTERNALS__ && !!document.querySelector(".app")'),'Nova UI');
+  await main.call('Emulation.setFocusEmulationEnabled',{enabled:true});
+  const native=(command,args={})=>main.evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)},${JSON.stringify(args)})`);
+  // Exercise the UI entry point under a real local thread, without starting an agent.
+  const thread=await native('create_thread',{cwd:process.cwd(),agentKind:'lyra',model:'',mode:'build',ephemeral:false});
+  await until(()=>main.evaluate('!!document.querySelector(".thread-item")'),'fixture thread');
+  await main.evaluate('document.querySelector(".thread-item").click()');
+  await native('report_activity',{threadId:thread.id});
   const invoke=(operation,args={})=>main.evaluate(`window.__TAURI_INTERNALS__.invoke('chrome_browser_ui',${JSON.stringify({operation,args})})`);
   const page=await attach(browserPort);const version=await page.call('Browser.getVersion');
   await page.call('Page.navigate',{url:`http://127.0.0.1:${server.address().port}/fixture`});
@@ -44,7 +51,7 @@ try{
   let o=await inspect();o=await act(o,{action:'fill',...find(o,'订单号'),text:'订单-123'});expect(o,'executed');assert.equal(await page.evaluate('document.querySelector("#order").value'),'订单-123');assert.equal(await page.evaluate('window.inputTrusted'),true);
   o=await act(o,{action:'click',...find(o,'查询','订单筛选')});expect(o,'executed');assert.equal(await page.evaluate('document.querySelector("output").textContent'),'订单-123 已发货');assert.notEqual(await page.evaluate('window.wrong'),true);check('trusted fill and same-name button disambiguation');
   o=await inspect();const deletion=find(o,'删除');await page.evaluate('document.querySelector("#row span").textContent="订单 B"');o=await act(o,{action:'click',...deletion});expect(o,'not_executed');assert.notEqual(await page.evaluate('window.deleted'),true);check('recycled data-row reference rejected before click');
-  o=await inspect();const hover=find(o,'查询','订单筛选');await page.evaluate('document.querySelector("#run").onmouseenter=function(){this.style.transform="translateX(120px)"}');o=await act(o,{action:'click',...hover});expect(o,'not_executed');await page.evaluate('document.querySelector("#run").onmouseenter=null;document.querySelector("#run").style.transform=""');check('hover-induced movement rejected');
+  await page.call('Input.dispatchMouseEvent',{type:'mouseMoved',x:0,y:0});o=await inspect();const hover=find(o,'查询','订单筛选');await page.evaluate('document.querySelector("#run").onmouseenter=function(){this.style.transform="translateX(120px)"}');o=await act(o,{action:'click',...hover});expect(o,'not_executed');await page.evaluate('document.querySelector("#run").onmouseenter=null;document.querySelector("#run").style.transform=""');check('hover-induced movement rejected');
   await page.evaluate('document.querySelector("#order").addEventListener("focus",()=>document.querySelector("#trap").focus(),{once:true})');o=await inspect();o=await act(o,{action:'fill',...find(o,'订单号'),text:'must not reach trap'});expect(o,'needs_review');assert.equal(await page.evaluate('document.querySelector("#trap").value'),'preserve');check('focus theft classified needs_review without typing into wrong input');
   o=await inspect();const wait=find(o,'等待启用');await page.evaluate('setTimeout(()=>document.querySelector("fieldset").disabled=false,100)');o=await act(o,{action:'wait_for',...wait,state:'enabled',ms:1000});expect(o,'executed');check('condition wait');
   o=await until(async()=>{const v=await inspect({query:'框架按钮'});return v.pages.some(p=>p.items.some(i=>i.name==='框架按钮'))&&v;},'iframe');o=await act(o,{action:'click',...find(o,'框架按钮')});expect(o,'executed');assert.ok(JSON.stringify(o).includes('框架成功'));check('scaled cross-origin iframe native click');
