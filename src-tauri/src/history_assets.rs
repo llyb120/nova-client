@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, io::{Cursor, Write}, path::{Path, PathBuf}};
-use xcap::image::{ImageFormat, ImageReader, Limits};
+use image::{ImageFormat, ImageReader, Limits};
 
 pub(crate) fn hash(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 pub(crate) fn valid_hash(id: &str) -> bool { id.len()==64 && id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)) }
@@ -56,7 +56,7 @@ impl AssetStore {
         let id=hash(bytes);let raw=self.original(&id);
         // Content-addressing is also a correctness check, not just deduplication.
         if fs::read(&raw).ok().as_deref().map(hash).as_deref()!=Some(&id) {atomic_write(&raw,bytes)?;}
-        let ext=match mime {"image/png"=>"png","image/jpeg"=>"jpg","image/webp"=>"webp","image/gif"=>"gif","image/bmp"=>"bmp",_=>"bin"};
+        let ext=match mime {"image/png"=>"png","image/jpeg"=>"jpg","image/webp"=>"webp","image/gif"=>"gif","image/bmp"=>"bmp","image/svg+xml"=>"svg",_=>"bin"};
         let path=self.root.join(format!("{id}.{ext}"));
         // Named original is usable by existing native providers and asset protocol.
         // Hard link when possible; fallback remains a byte-for-byte durable copy.
@@ -111,6 +111,9 @@ impl AssetStore {
     pub fn image_metadata(&self,image:&PromptImage)->Option<AssetInfo> { self.info(&self.id_from_uri(image.uri.as_deref()?)?).ok() }
     pub fn thumbnail(&self,id:&str,max_edge:u32)->Result<AssetInfo,String> {
         let mut info=self.info(id)?;
+        // SVG keeps its original browser-supported source. The frontend still
+        // bounds its retained bitmap; the native raster decoder does not parse SVG.
+        if info.width.is_none() && info.uri.ends_with(".svg") {return Ok(info);}
         let edge=match max_edge {0..=480=>480,481..=960=>960,_=>1536};
         let target=self.root.join(format!("{id}-thumb-{edge}.png"));
         if !target.exists() {
@@ -168,4 +171,30 @@ mod tests {
         let mut image=PromptImage{name:"file".into(),mime_type:"image/png".into(),data:Some("aGVsbG8=".into()),uri:None,size:None};
         assert!(assets.externalize(&mut image).is_err());assert_eq!(image.data.as_deref(),Some("aGVsbG8="));
     }
+    #[test]
+    fn common_image_codecs_preserve_originals_and_generate_bounded_thumbnails() {
+        let dir=tempfile::tempdir().unwrap();let assets=AssetStore::new(dir.path());
+        let image=image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(960,640,image::Rgb([35,110,180])));
+        for (format,mime) in [(ImageFormat::Png,"image/png"),(ImageFormat::Jpeg,"image/jpeg"),(ImageFormat::WebP,"image/webp"),(ImageFormat::Gif,"image/gif"),(ImageFormat::Bmp,"image/bmp")] {
+            let mut bytes=Cursor::new(Vec::new());image.write_to(&mut bytes,format).unwrap();let bytes=bytes.into_inner();
+            let info=assets.store(&bytes,mime).unwrap();
+            assert_eq!((info.width,info.height),(Some(960),Some(640)),"{mime}");
+            assert_eq!(fs::read(file_uri_to_local_path(&info.uri).unwrap()).unwrap(),bytes,"{mime}");
+            let thumb=assets.thumbnail(&info.attachment_id,480).unwrap();
+            let path=file_uri_to_local_path(thumb.thumbnail_uri.as_deref().unwrap()).unwrap();
+            assert_eq!(ImageReader::open(path).unwrap().into_dimensions().unwrap(),(480,320),"{mime}");
+            assert_eq!(thumb.attachment_id,hash(&bytes));
+        }
+    }
+    #[test]
+    fn vector_images_keep_a_browser_supported_original_source() {
+        let dir=tempfile::tempdir().unwrap();let assets=AssetStore::new(dir.path());
+        let bytes=br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="red"/></svg>"#;
+        let info=assets.store(bytes,"image/svg+xml").unwrap();
+        assert!(info.uri.ends_with(".svg"));
+        let preview=assets.thumbnail(&info.attachment_id,480).unwrap();
+        assert_eq!(preview.uri,info.uri);assert!(preview.thumbnail_uri.is_none());
+        assert_eq!(fs::read(file_uri_to_local_path(&preview.uri).unwrap()).unwrap(),bytes);
+    }
+
 }

@@ -24,6 +24,8 @@ anyhow = "1"
 base64 = "0.22"
 enigo = "0.6.1"
 xcap = "0.9.8"
+# xcap enables PNG only; chat attachments also need these common codecs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 flate2 = "1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "native-tls", "blocking", "system-proxy", "socks", "stream", "multipart"] }
