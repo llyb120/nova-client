@@ -1,4 +1,4 @@
-name: Precision tools final acceptance
+name: Precision native COM acceptance
 on:
   push:
     branches: [work/terminal-build-20260918]
@@ -14,58 +14,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: d1f0c27b15e27186b2b16eb40d573be7b8f3da18
+          ref: a3ff4f2d987a5249348ff3b47b8382f61c6dfcf3
           path: staging
       - uses: actions/checkout@v4
         with:
-          ref: 52246f088035d68db08cf699275756ca91d89a77
+          ref: 2b2a80bdb3a2f4d13e02dd18b7aec9c9fd68c0da
           path: source
-      - name: Keep Canvas visible to query-based inspection
+      - name: Prepare isolated test driver
         working-directory: source
-        run: python ../staging/.github/precision-tools/canvas-query.py
-      - name: Commit candidate
+        run: python ../staging/.github/precision-tools/native-driver.py
+      - name: Commit test support only
         id: commit
         working-directory: source
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add scripts/browser-targeting.test.mjs src-tauri/src/native_browser_page.js
+          git add scripts/native-browser-smoke.mjs
           git diff --cached --check
-          git commit -m 'fix(chrome): preserve Canvas visual feedback when DOM query has no match'
+          git commit -m 'test(browser): allow isolated native COM fixture inspection'
           git push origin HEAD:fix/precision-tools-20260918
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-  frontend:
-    needs: prepare
-    runs-on: ubuntu-24.04
-    timeout-minutes: 12
-    env:
-      TEST_BROWSER: /usr/bin/google-chrome
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.revision }}
-          fetch-depth: 8
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - run: npm ci --no-audit --no-fund
-      - run: npm run check
-      - name: Browser targeting and paired performance measurement
-        shell: bash
-        run: |
-          git show 9798b86d66b8b7b8822c3d26a92cf838d6efb03d:src-tauri/src/native_browser_page.js > /tmp/browser-page-before.js
-          BROWSER_BASELINE=/tmp/browser-page-before.js node scripts/browser-targeting.test.mjs 2>&1 | tee browser-targeting.log
-      - name: Extension and MCP regressions
-        run: node --test extensions/nova-chrome/worker.test.mjs scripts/nova-tools-mcp.test.mjs
-      - run: npm run build
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: precision-browser-regression
-          path: |
-            browser-targeting-report.json
-            browser-targeting.log
   native:
     needs: prepare
     runs-on: windows-latest
@@ -95,7 +63,7 @@ jobs:
           cache: npm
       - run: npm ci --no-audit --no-fund
       - run: npm run build:sdk-bridges:release
-      - name: Enable separate debug drivers in isolated Windows build only
+      - name: Instrument isolated CI build only
         run: |
           python - <<'PY'
           import json
@@ -103,19 +71,23 @@ jobs:
           p=Path('src-tauri/tauri.conf.json');config=json.loads(p.read_text(encoding='utf-8'))
           config['app']['windows'][0]['additionalBrowserArgs']='--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion'
           p.write_text(json.dumps(config,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
-          p=Path('src-tauri/src/native_browser.rs');s=p.read_text(encoding='utf-8')
-          old='.data_directory(state_dir(app).join("native-browser-profile"))'
-          assert s.count(old)==1
-          s=s.replace(old,old+'\n        .additional_browser_args("--remote-debugging-port=9223 --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion")')
+          p=Path('src-tauri/src/native_browser.rs')
+          s=p.read_text(encoding='utf-8')
+          s+='\n#[tauri::command]\npub async fn precision_smoke_cdp(app:AppHandle,label:String,method:String,params:Value,session_id:Option<String>)->Result<Value,String>{\n CONTROL_TAB.scope(label,native_cdp(&app,&method,params,session_id.as_deref(),None)).await\n}\n'
           p.write_text(s,encoding='utf-8')
+          p=Path('src-tauri/src/lib.rs');s=p.read_text(encoding='utf-8')
+          old='native_browser::native_browser_ui,'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,old+'\n            native_browser::precision_smoke_cdp,'),encoding='utf-8')
           PY
       - name: Windows native executable
         run: cargo build --manifest-path src-tauri/Cargo.toml --bin nova 2>&1 | tee native-browser-build.log
-      - name: Real Windows WebView2 and Chrome-transport integration
+      - name: Real WebView2 and Chrome-transport integration
         env:
           TEST_CDP_PORT: '9222'
-          TEST_CHILD_CDP_PORT: '9223'
+          TEST_NATIVE_CDP_DRIVER: '1'
         run: |
+          node --check scripts/native-browser-smoke.mjs
           node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5173 --strictPort > vite.log 2>&1 &
           node scripts/native-browser-smoke.mjs src-tauri/target/debug/nova.exe 2>&1 | tee native-browser-smoke.log
       - uses: actions/upload-artifact@v4
