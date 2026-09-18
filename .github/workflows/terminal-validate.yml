@@ -1,11 +1,51 @@
-name: Chrome precision native acceptance
+name: Chrome precision complete acceptance
 on:
   push:
     branches: [work/terminal-build-20260918]
 permissions:
   contents: read
 jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      revision: ${{ steps.commit.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ae82e9b0139596d6adc12c7f6875381fa7219706
+          path: staging
+      - uses: actions/checkout@v4
+        with:
+          ref: 8c96f0036f58a448f78c287b241bc89ae69d341e
+          path: source
+      - name: Initialize Chrome fixture and retain the original WebView smoke driver
+        working-directory: source
+        run: |
+          python ../staging/.github/precision-tools/chrome-smoke-setup.py
+          git fetch --depth=1 origin 9798b86d66b8b7b8822c3d26a92cf838d6efb03d
+          git restore --source=FETCH_HEAD -- scripts/native-browser-smoke.mjs
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('.github/workflows/tool-precision.yml');s=p.read_text()
+          s=s.replace("      - 'scripts/browser-targeting.test.mjs'", "      - 'scripts/browser-targeting.test.mjs'\n      - 'scripts/chrome-precision-smoke.mjs'")
+          s=s.replace('      - run: npm run check','      - run: npm run check\n      - run: node --check scripts/chrome-precision-smoke.mjs')
+          p.write_text(s)
+          PY
+      - name: Commit test preparation
+        id: commit
+        working-directory: source
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/chrome-precision-smoke.mjs scripts/native-browser-smoke.mjs .github/workflows/tool-precision.yml
+          git diff --cached --check
+          git commit -m 'test(chrome): initialize fixture thread and preserve existing WebView driver'
+          git push origin HEAD:fix/precision-tools-20260918
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   chrome:
+    needs: prepare
     runs-on: windows-latest
     timeout-minutes: 18
     defaults:
@@ -18,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 223ee459e720316a9befb2a55fa1b7b884d37e9d
+          ref: ${{ needs.prepare.outputs.revision }}
           submodules: recursive
       - name: Use crates.io
         run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
