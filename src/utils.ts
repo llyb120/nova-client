@@ -50,7 +50,7 @@ export function displayToolTitle(title: string): string {
   return title.replace(/^(?:Alkaid|Vega)(\s*\/)/, "Lyra$1");
 }
 
-// ─── 工具调用摘要展示（DOM ToolCallCard 与 canvas 渲染共用） ─────────────────
+// ─── 工具调用摘要展示（canvas 工具行使用） ───────────────────────────────────
 
 function isRecordValue(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);

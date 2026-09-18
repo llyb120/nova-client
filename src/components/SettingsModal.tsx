@@ -317,9 +317,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
   );
-  const [chatViewRender, setChatViewRender] = createSignal<"dom" | "canvas">(
-    s?.chatViewRender === "dom" ? "dom" : "canvas",
-  );
   // server 留空回退默认地址；这里也预填，避免误存成空导致团队/漫游被静默关闭
   const [relayServer, setRelayServer] = createSignal(s?.relayServer || DEFAULT_RELAY_SERVER);
   const [relayToken, setRelayToken] = createSignal(s?.relayToken ?? "");
@@ -744,7 +741,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
     zenModeEnabled: zenModeEnabled(),
     historyDisplayMode: historyDisplayMode(),
-    chatViewRender: chatViewRender(),
     customEnvVars: Object.fromEntries(
       customEnvVars()
         .map((item) => [item.name.trim(), item.value] as const)
@@ -1541,25 +1537,6 @@ export function SettingsModal(props: { onClose: () => void }) {
               </div>
             </section>
 
-            <section class="settings-group">
-              <h3 class="settings-group-title">聊天视图</h3>
-              <label class="field">
-                <span class="field-label">渲染方式</span>
-                <select
-                  class="field-input"
-                  value={chatViewRender()}
-                  onChange={(e) => {
-                    setChatViewRender(e.currentTarget.value === "dom" ? "dom" : "canvas");
-                  }}
-                >
-                  <option value="canvas">Canvas（默认）</option>
-                  <option value="dom">DOM</option>
-                </select>
-                <span class="field-hint">
-                  Canvas 在超长会话时更省 DOM 节点、滚动更轻；DOM 选区/复制更可靠。可随时切换，保存后立即生效。
-                </span>
-              </label>
-            </section>
 
             <section class="settings-group">
               <h3 class="settings-group-title">减少焦虑</h3>

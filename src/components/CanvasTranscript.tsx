@@ -4,18 +4,21 @@ import { message } from "@tauri-apps/plugin-dialog";
 import {
   readBackdropTheme,
 } from "../canvasTranscript/base";
-import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { api } from "../ipc";
+import { Portal } from "solid-js/web";
+import { WorkflowPreview } from "./WorkflowPreview";
+import type { WorkflowDef } from "../workflow/types";
 import { linkedFile, openWorkspaceFile as openInEditor } from "../workspaceLinks";
 import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
+import { visibleGroupRange, groupAtY } from "../transcriptViewport";
 import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import { resolveExpandScroll, resolveScrollAfterLayout, resolveUserScrollStick } from "../scrollStick";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
-import { relPath } from "./EditedFilesCard";
 import { createFileContextMenu } from "./FileContextMenu";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
@@ -1000,11 +1003,22 @@ function lineAtOffset(b: Block, offset: number): TextLine | null {
   return offset < lines[0].offset ? lines[0] : lines[lines.length - 1];
 }
 
-/** 在配置的编辑器中打开文件（带可选行号），失败弹错误（对齐 DOM ToolCallCard） */
+/** 在配置的编辑器中打开文件（带可选行号），失败弹错误 */
 
 // ─── Main component ──────────────────────────────────────────────────────────
 
+/** 文件路径相对线程工作目录显示（不在其下则原样） */
+function relPath(p: string): string {
+  const cwd = state.cwd;
+  if (!cwd) return p;
+  const norm = (s: string) => s.replace(/\//g, "\\").toLowerCase();
+  const base = cwd.endsWith("\\") || cwd.endsWith("/") ? cwd : cwd + "\\";
+  if (norm(p).startsWith(norm(base))) return p.slice(base.length);
+  return p;
+}
+
 export function CanvasTranscript(props: CanvasTranscriptProps) {
+  const [workflowPreview, setWorkflowPreview] = createSignal<WorkflowDef | null>(null);
   let canvasEl!: HTMLCanvasElement;
   let hostEl!: HTMLDivElement;
 
@@ -1119,30 +1133,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let lastRebuildAt = 0;
   // 流式事件可能高于屏幕刷新率；Markdown 解析/换行无需跟着每个 token 同步执行。
   const STREAM_LAYOUT_INTERVAL_MS = 80;
-  interface PrefixLayoutCache {
-    /** 宽度+配色签名：任一变化则整份缓存作废 */
-    meta: string;
-    /** 每个已闭合分组的签名（同 closedGroupSig），用于求最长可复用前缀 */
-    sigs: string[];
-    blocks: Block[];
-    height: number;
-    groupYs: number[];
-    until: number;
-  }
-  // 与 transcript 快照保持同一小窗口；每份缓存都持有完整 Block 树，按会话数放大后
-  // 会抵消快照 LRU 的内存收益，并让运行越久后的 GC 停顿重新拖慢会话切换。
-  // 与 threadSnapshots 同理：stage 链 > 3 个节点来回切换时，3 格前缀布局缓存互相
-  // 挤出，导致每次切回都把全部已闭合分组从头重排（measureText + 布局 + 光栅化），
-  // 这正是"会话都已加载、来回切换仍卡"的来源。调大到能容纳典型 stage 链。
-  const prefixLayoutCaches = new LruMap<string, PrefixLayoutCache>(8);
-  // 用户提示词在流式输出期间不变；按消息弱引用缓存，随消息释放。
-  const userTextLayouts = new WeakMap<UserItem, {
+  // 只缓存高度，不持有屏外 Block/逐字符样式树。宽度变化后重新测量可见组。
+  let groupHeights = new WeakMap<Group, number>();
+  let heightWidth = 0;
+  let laidOutStart = 0, laidOutEnd = 0;
+  let jumpGroup: number | null = null;
+  // 流式输出复用提示词换行；限制已访问消息数，避免保留所有历史展开文本。
+  const userTextLayouts = new LruMap<UserItem, {
     text: string; width: number; viewWidth: number; font: string; threadId: string | null;
     layout: ReturnType<typeof wrapUserText>;
-  }>();
-  // groupItems 会保留已闭合分组的对象身份；缓存其内容签名，避免每个流式 token
-  // 都重新遍历整段历史文本。展开状态变化时会整体换新此 WeakMap。
-  let closedGroupSigCache = new WeakMap<Group, string>();
+  }>(16);
   let layoutGeneration = 0;
   let renderedThreadId = props.threadId;
   let waitingForInitialSnapshot = props.loading && props.groups.length === 0;
@@ -1235,81 +1235,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     setEditing(null);
   }
 
-  function userImagesSig(images: PromptImage[] | undefined): string {
-    if (!images?.length) return "0";
-    return images.map((img) => {
-      if (!img.mimeType.startsWith("image/")) return `file:${img.name}`;
-      const el = imgCache.get(promptImageSrc(img));
-      const loaded = !!(el as unknown as { _loaded?: boolean } | undefined)?._loaded;
-      if (!el || !loaded || !el.naturalWidth || !el.naturalHeight) return "pending";
-      // Include natural size so layout cache invalidates when aspect-correct size is known.
-      return `${el.naturalWidth}x${el.naturalHeight}`;
-    }).join(",");
-  }
-
-  function textSig(text: string): string {
-    // Keep cache checks bounded: scanning every character here blocks session switches
-    // before the chunked layout has a chance to yield to the browser.
-    let hash = 2166136261;
-    const sampleCount = Math.min(64, text.length);
-    for (let i = 0; i < sampleCount; i++) {
-      const index = sampleCount === text.length
-        ? i
-        : Math.floor(i * (text.length - 1) / Math.max(1, sampleCount - 1));
-      hash ^= text.charCodeAt(index);
-      hash = Math.imul(hash, 16777619);
-    }
-    return `${text.length}:${hash >>> 0}`;
-  }
-
   function bodyExpandedFor(items: Item[]): boolean {
     return items.some((it) => {
       if (it.type === "tool") return !!state.expanded[`tool-${it.id}`];
       if (it.type === "thought") return !!state.expanded[`thought-${it.id}`];
       return !!state.expanded[String(it.id)];
     });
-  }
-
-  function closedGroupSig(g: Group): string {
-    // foldKey / open must match layout — a narrower key or ignoring bodyExpanded
-    // lets prefix cache reuse an expanded fold after the user collapsed it.
-    const foldKey = g.turn
-      ? `turn-${g.turn.id ?? g.user?.id ?? g.body[0]?.id ?? 0}`
-      : "";
-    const foldOpen = foldKey
-      ? !!(state.expanded[foldKey] ?? bodyExpandedFor(g.body))
-      : false;
-    const parts = [
-      g.user ? `u:${g.user.id}:${textSig(g.user.text)}:${!!state.expanded[`user-text-${g.user.id}`]}` : "-",
-      g.turn
-        ? `t:${g.turn.id}:${g.turn.durationMs}:${g.turn.totalTokens ?? ""}:${g.turn.actualModel ?? ""}:${foldOpen}`
-        : "-",
-    ];
-    for (const item of g.body) {
-      parts.push(`process:${item.id}:${!!state.expanded[`process-${item.id}-done`]}`);
-      if (item.type === "tool") {
-        parts.push(
-          `tool:${item.id}:${item.status}:${item.title}:${item.content.length}:${item.locations.length}:${item.rawInput !== undefined}:${item.rawOutput !== undefined}:${!!state.expanded[`tool-${item.id}`]}`,
-        );
-      } else if ("text" in item) {
-        parts.push(
-          `${item.type}:${item.id}:${textSig((item as { text: string }).text)}:${!!state.expanded[`thought-${item.id}`]}`,
-        );
-      } else {
-        parts.push(`${item.type}:${item.id}`);
-      }
-    }
-    return parts.join("|");
-  }
-
-  function cachedClosedGroupSig(g: Group): string {
-    let sig = closedGroupSigCache.get(g);
-    if (sig === undefined) {
-      sig = closedGroupSig(g);
-      closedGroupSigCache.set(g, sig);
-    }
-    // 图片异步加载不会改变 Group 身份，尺寸签名不能跟随文本一起缓存。
-    return `${sig}|${userImagesSig(g.user?.images)}`;
   }
 
   async function computeLayout(generation: number): Promise<boolean> {
@@ -1355,43 +1286,36 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       return true;
     }
 
-    // 已闭合轮次布局缓存：流式输出时只重算尾部，大幅降低每帧布局成本。
-    // 编辑中的用户消息所在组及其之后不能复用缓存，否则会叠画旧气泡且占位高度不准。
-    let closedUntil = 0;
-    const closedSigs: string[] = [];
-    const editingId = editing()?.id ?? null;
-    for (let i = 0; i < groups.length; i++) {
-      if (!groups[i].turn) break;
-      if (editingId != null && groups[i].user?.id === editingId) break;
-      closedSigs.push(cachedClosedGroupSig(groups[i]));
-      closedUntil = i + 1;
+    if (heightWidth !== W) {
+      groupHeights = new WeakMap();
+      heightWidth = W;
     }
-    // 逐组比对签名，取最长连续匹配前缀复用：展开/收起中间某个工具不再整份作废，
-    // 只从该分组起重排（此前签名是全量拼接、一处变化全部重排，展开后长时间卡顿）
-    const metaSig = `${Math.round(W)}|${p.bg}|${p.text}|${running}`;
-    const cacheKey = threadId ?? "";
-    const prefixCache = prefixLayoutCaches.get(cacheKey);
-    let reuseUntil = 0;
-    if (prefixCache && prefixCache.meta === metaSig) {
-      const n = Math.min(closedUntil, prefixCache.sigs.length);
-      while (reuseUntil < n && prefixCache.sigs[reuseUntil] === closedSigs[reuseUntil]) {
-        reuseUntil++;
+    // ponytail: 未访问组使用 240px 估高；滚动时实测并保留锚点，需精确滚动条时可持久化高度。
+    const offsets = [24];
+    for (const group of groups) offsets.push(offsets.at(-1)! + (groupHeights.get(group) ?? 240));
+    const anchor = Math.min(groups.length - 1, jumpGroup ?? groupAtY(groupYs.length ? groupYs : offsets, scrollY + 32));
+    const anchorOffset = jumpGroup != null ? -20 : scrollY - (groupYs[anchor] ?? offsets[anchor]);
+    const top = keepBottom ? Math.max(0, offsets.at(-1)! + 16 - viewH)
+      : offsets[anchor] + Math.min(anchorOffset, offsets[anchor + 1] - offsets[anchor] - 1);
+    const range = visibleGroupRange(offsets, top, viewH);
+    // ponytail: 显式跨屏选区保留所选轮次以完整复制；超大选区可升级为源文本偏移索引。
+    for (const index of [selection?.startBlock, selection?.endBlock, selecting ? selStart?.block : undefined]) {
+      const group = index == null ? undefined : blocks[index]?.groupIdx;
+      if (group != null && group < groups.length) {
+        range.start = Math.min(range.start, group);
+        range.end = Math.max(range.end, group + 1);
       }
     }
-    let gi = 0;
-    if (reuseUntil > 0 && prefixCache) {
-      for (const b of prefixCache.blocks) {
-        if (b.groupIdx >= reuseUntil) break;
-        result.push(b);
-      }
-      nextGroupYs.push(...prefixCache.groupYs.slice(0, reuseUntil));
-      y = prefixCache.groupYs[reuseUntil] ?? prefixCache.height;
-      gi = reuseUntil;
-    }
-
-    for (; gi < groups.length; gi++) {
+    const scrollBefore = scrollY;
+    const measured: [Group, number][] = [];
+    for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi];
       nextGroupYs.push(y);
+      if (gi < range.start || gi >= range.end) {
+        y += groupHeights.get(g) ?? 240;
+        continue;
+      }
+      const groupStart = y;
       const active = running && !g.turn;
 
       // user message: .msg-user margin 20px 0 16px; bubble max-width 85%
@@ -1604,30 +1528,60 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         y = layoutItem(item, result, gi, side, proseOff, contentW, proseW, y, false);
       }
 
+      flushBottom();
+      y = Math.max(y, groupStart + 1);
+      measured.push([g, y - groupStart]);
       // Keep each frame responsive while laying out a previously unseen long thread.
       if (gi + 1 < groups.length && performance.now() - chunkStartedAt >= 8) {
         await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-        if (generation !== layoutGeneration || props.threadId !== threadId) return false;
+        if (disposed || generation !== layoutGeneration || props.threadId !== threadId) return false;
         chunkStartedAt = performance.now();
       }
     }
 
     flushBottom();
-    if (generation !== layoutGeneration || props.threadId !== threadId) return false;
+    if (disposed || generation !== layoutGeneration || props.threadId !== threadId) return false;
     groupYs = nextGroupYs;
+    // 虚拟窗口前移后 block 下标变化，选区按组内位置迁移，不能误复制另一轮的文字。
+    const remapBlock = (index: number) => {
+      const old = blocks[index];
+      if (!old) return -1;
+      const start = result.findIndex(block => block.groupIdx === old.groupIdx);
+      if (start < 0) return -1;
+      const next = start + index - blocks.findIndex(block => block.groupIdx === old.groupIdx);
+      return result[next]?.id === old.id && result[next]?.kind === old.kind ? next : -1;
+    };
+    if (selection) {
+      const startBlock = remapBlock(selection.startBlock), endBlock = remapBlock(selection.endBlock);
+      selection = startBlock < 0 || endBlock < 0 ? null : { ...selection, startBlock, endBlock };
+      if (!selection) clearCanvasChatSelection();
+    }
+    if (selStart) {
+      const block = remapBlock(selStart.block);
+      selStart = block < 0 ? null : { ...selStart, block };
+    }
     blocks = result;
     totalHeight = y + 16;
-
-    if (closedUntil > 0 && reuseUntil < closedUntil && cacheKey) {
-      prefixLayoutCaches.set(cacheKey, {
-        meta: metaSig,
-        sigs: closedSigs,
-        until: closedUntil,
-        blocks: result.filter((b) => b.groupIdx < closedUntil),
-        groupYs: nextGroupYs.slice(0, closedUntil),
-        height: closedUntil < groups.length ? nextGroupYs[closedUntil] : y,
-      });
+    // 已离开缓冲区的图片不再占用解码内存；同屏图片数不设硬上限，避免 LRU 反复加载。
+    const imageSources = new Set<string>();
+    for (const block of result) {
+      if (block.kind === "generated-image") imageSources.add(String(block.data?.src));
+      if (block.kind === "user-bubble") {
+        for (const image of (block.data?.images as PromptImage[] | undefined) ?? []) {
+          if (image.mimeType.startsWith("image/")) imageSources.add(promptImageSrc(image));
+        }
+      }
     }
+    for (const source of imgCache.keys()) if (!imageSources.has(source)) imgCache.delete(source);
+
+    for (const [group, height] of measured) groupHeights.set(group, height);
+    if (!keepBottom && scrollY === scrollBefore && nextGroupYs[anchor] != null) {
+      const height = (nextGroupYs[anchor + 1] ?? y) - nextGroupYs[anchor];
+      scrollY = Math.max(0, nextGroupYs[anchor] + Math.min(anchorOffset, height - 1));
+      jumpGroup = null;
+    }
+    laidOutStart = range.start;
+    laidOutEnd = range.end;
     return true;
   }
 
@@ -1855,6 +1809,21 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
 
     if (item.type === "system") {
+      if (item.level === "workflow") {
+        let workflow: WorkflowDef | undefined;
+        try {
+          const value = JSON.parse(item.text);
+          if (typeof value?.name === "string" && Array.isArray(value.stages)) workflow = value;
+        } catch { /* 损坏的预览保留错误提示，不能中止整条会话布局。 */ }
+        const definition = workflow;
+        result.push({ kind: "fold", id: item.id, groupIdx: gi,
+          x, y: y + 10, w: proseW, h: 32,
+          text: definition ? `工作流 · ${definition.name}（${definition.stages.length} 阶段） · 点击查看` : "工作流数据无法解析",
+          color: p.dim, fontSize: 13, font: p.sans, hoverBg: p.hover, borderRadius: 6,
+          cursor: definition ? "pointer" : undefined,
+          clickAction: definition ? () => setWorkflowPreview(definition) : undefined });
+        return y + 52;
+      }
       const important = item.level === "error" || item.level === "warn" || item.level === "info";
       const color = item.level === "error" ? p.red : item.level === "warn" ? p.yellow
         : item.level === "info" ? `color-mix(in srgb, ${p.accent} 80%, ${p.text})` : p.faint;
@@ -1881,7 +1850,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const busy = item.status === "pending" || item.status === "in_progress";
     const defaultOpen = active || busy;
     const open = isExpanded(key, defaultOpen);
-    // 摘要展示优化仅对 Devin 生效（对齐 DOM ToolCallCard）
+    // 摘要展示优化仅对 Devin 生效
     const isDevin = state.agentKind === "devin";
     const contentBlocks = isDevin
       ? item.content.filter((block) => !isTrivialToolOutput(item, block))
@@ -2039,7 +2008,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function paintAll() {
     const canvas = canvasEl;
-    if (!canvas) return;
+    if (!canvas || disposed) return;
+    // 所有滚动入口（滚轮、滚动条、时间线、钉底）都经过这里；按需唤醒屏外组。
+    if (groupYs.length) {
+      const first = groupAtY(groupYs, scrollY);
+      const last = groupAtY(groupYs, scrollY + viewH);
+      if (first < laidOutStart || last >= laidOutEnd) scheduleRebuild(false, true);
+    }
     // 前景保持透明，只清空并重绘正文；星图背景由下层 canvas 保留，不再随滚动反复拷贝。
     const ctx = canvas.getContext("2d")!;
     const p = pal;
@@ -3094,6 +3069,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function applyScrollY(next: number, user: boolean) {
+    jumpGroup = null;
     const prev = scrollY;
     scrollY = Math.max(0, Math.min(maxScroll, next));
     // 用户滚动按方向判定（上滚即解除吸底）；非用户滚动保持纯阈值。
@@ -3546,7 +3522,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (el) return (el as unknown as { _loaded?: boolean })._loaded ? el : null;
     el = new Image();
     (el as unknown as { _loaded?: boolean })._loaded = false;
-    el.onload = () => { (el as unknown as { _loaded?: boolean })._loaded = true; scheduleRebuild(); };
+    el.onload = () => { (el as unknown as { _loaded?: boolean })._loaded = true; if (!disposed && imgCache.get(src) === el) scheduleRebuild(); };
     el.src = src;
     imgCache.set(src, el);
     return null;
@@ -3558,7 +3534,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let layoutPending = false;
   async function rebuild() {
     pal = readPalette();
-    const key = `${props.threadId}|${viewW}|${viewH}|${pal.bg}|${pal.text}|${props.running}|${expandedRevision()}|${editing()?.id ?? ""}`;
+    const key = `${props.threadId}|${viewW}|${viewH}|${pal.bg}|${pal.text}|${props.running}|${expandedRevision()}|${editing()?.id ?? ""}|${keepBottom ? "bottom" : scrollY}`;
     // 流式 delta/reveal 合并到下一次排版，不能反复取消尚未完成的历史重排。
     // 切会话、改宽度、主题和用户开合仍立即取代旧任务。
     if (activeLayout?.key === key && activeLayout.generation === layoutGeneration) {
@@ -3588,7 +3564,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         if (!liveKeys.has(key)) blockScrolls.delete(key);
       }
       // 布局让帧期间用户可能已滚离底部：吸底判定取提交时实时状态，不能用 await 前快照。
-      const settled = resolveScrollAfterLayout({ keepBottom, scrollY, maxScrollBefore: maxScroll, totalHeight, viewH });
+      const settled = resolveScrollAfterLayout({ keepBottom, scrollY, maxScrollBefore: keepBottom ? maxScroll : Infinity, totalHeight, viewH });
       maxScroll = settled.maxScroll;
       if (lock) {
         const match = blocks.find((x) => x.kind === lock.kind && x.id === lock.id);
@@ -3758,13 +3734,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     canvasEl.addEventListener("copy", onCopy);
 
     props.ref?.({
-      scrollToBottom() { keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
-      scrollToGroup(idx) { if (groupYs[idx] != null) { scrollY = Math.max(0, Math.min(maxScroll, groupYs[idx] - 20)); keepBottom = false; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); } },
+      scrollToBottom() { jumpGroup = null; keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
+      scrollToGroup(idx) { if (props.groups[idx]) { jumpGroup = idx; scrollY = Math.max(0, Math.min(maxScroll, (groupYs[idx] ?? 24 + idx * 240) - 20)); keepBottom = false; applyEditStyle(); paintAll(); scheduleRebuild(false, true); props.onScroll?.(scrollY, maxScroll, false); } },
       scrollBy(delta) { applyScrollY(scrollY + delta, true); },
       isAtBottom() { return maxScroll - scrollY <= 2; },
       scrollTop() { return scrollY; },
       maxScrollTop() { return maxScroll; },
-      activeGroup() { let a = -1; for (let i = 0; i < groupYs.length; i++) { if (groupYs[i] <= scrollY + 32) a = i; } return a; },
+      activeGroup() { return groupYs.length ? groupAtY(groupYs, scrollY + 32) : -1; },
       hasFocusedInput() {
         if (editing()) return true;
         const el = document.activeElement;
@@ -3826,7 +3802,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     void props.emptyHint;
     void editing()?.id;
     const switchedThread = threadId !== renderedThreadId;
-    const warmSwitch = switchedThread && groups.length > 0 && prefixLayoutCaches.has(threadId ?? "");
+    const warmSwitch = switchedThread && groups.length > 0;
     if (switchedThread) waitingForInitialSnapshot = groups.length === 0;
     // 缓存未命中时会先以空 items 进入 loading，再在同一 threadId 下提交快照；
     // 这次首个非空快照也属于已有内容，不能按新 delta 从空串重放。
@@ -3841,8 +3817,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       revealReadyAt.clear();
       revealRemainders.clear();
       clearEditing();
+      setWorkflowPreview(null);
       selection = null;
+      selecting = false;
+      selStart = null;
       groupYs = [];
+      imgCache.clear();
+      laidOutStart = laidOutEnd = 0;
+      jumpGroup = null;
+      keepBottom = true;
+      clearCanvasChatSelection();
       scrollY = 0;
       maxScroll = 0;
       blocks = [{
@@ -3864,12 +3848,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let expandedEffectThreadId = props.threadId;
   let expandedEffectReady = false;
   createEffect(() => {
-    // 展开态参与闭合分组签名；仅在它变化时废弃签名缓存，而不是流式时反复哈希历史。
     // 用户主动开合必须立即重排（immediate）：不能被套在流式 80ms 节流里，
     // 否则 click 设置的 scrollLock 来不及生效、开合看似失效。
     expandedRevision();
     const threadId = props.threadId;
-    closedGroupSigCache = new WeakMap<Group, string>();
     // openThread 重置 expanded 与 thread 切换属于同一批更新，主 effect 已负责 rebuild。
     if (!expandedEffectReady || threadId !== expandedEffectThreadId) {
       expandedEffectReady = true;
@@ -3891,6 +3873,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   return (
     <div class="canvas-transcript-host" ref={hostEl}>
       <fileMenu.Menu />
+      <Show when={workflowPreview()}>{workflow => <Portal>
+        <div class="modal-backdrop" onClick={() => setWorkflowPreview(null)}>
+          <div class="modal" style={{ width: "90vw", "max-width": "1200px" }} onClick={e => e.stopPropagation()}>
+            <button class="btn secondary small" onClick={() => setWorkflowPreview(null)}>关闭工作流预览</button>
+            <WorkflowPreview workflow={workflow()} />
+          </div>
+        </div>
+      </Portal>}</Show>
       <canvas ref={canvasEl} class="transcript-canvas-only" tabindex="0" aria-label="会话记录" />
       {editing() && (
         <div class="canvas-prompt-editor" style={editStyle()} ref={bindEditHost}>

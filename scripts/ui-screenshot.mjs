@@ -55,7 +55,7 @@ const mockSettings = {
     autoChangeProjectEnabled: true,
   codexPath: "", codexProxy: "", lyraProxy: "", windowsShellShimEnabled: false,
   defaultMode: "build", lightweightModelAgent: "lyra", lightweightModel: "",
-  editor: "cursor", theme: "", historyDisplayMode: "project", chatViewRender: "canvas",
+  editor: "cursor", theme: "", historyDisplayMode: "project",
   relayServer: "", relayToken: "", relayGroups: "", remoteControlEnabled: false,
   quotaSharedModels: [], devinEnabled: true, codexEnabled: true,
   codebuddyEnabled: false, cursorEnabled: false,
