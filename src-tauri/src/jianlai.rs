@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 use xcap::{Monitor, Window};
+#[path = "visual_guard.rs"]
+mod visual_guard;
 
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
@@ -37,6 +39,8 @@ struct Shot {
     pixels: (u32, u32),
     source_pixels: (u32, u32),
     region: Option<Region>,
+    // Unannotated pixels, bounded independently of requested output resolution.
+    guard: Option<std::sync::Arc<xcap::image::RgbaImage>>,
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -290,6 +294,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
                 xcap::image::imageops::FilterType::Triangle).into_rgba8()
         } else { image };
         resize_ms += resize_started.elapsed().as_millis();
+        let guard=std::sync::Arc::new(visual_guard::bounded(&image));
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
@@ -309,6 +314,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             pixels: image.dimensions(),
             source_pixels: original_pixels,
             region,
+            guard: Some(guard),
         });
         Ok(())
     };
@@ -376,6 +382,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     Ok(
         json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,
             "foreground":before,"maxEdge":max_edge,
+            "precisionNotice":"小目标请用 region 局部原分辨率图；act 在落点附近检查截图后画面变化，并校验实际鼠标位置。此检查不识别控件、不证明任务成功。",
             "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
                 "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
                 "total":started.elapsed().as_millis()}}),
@@ -561,6 +568,44 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
     Ok(())
 }
 
+// Called only for input that lands on pixels (not pure observation/move/type/wait).
+// A spinning widget elsewhere cannot invalidate a still-unchanged target patch.
+fn check_pixels(snap: &Snapshot, shot: &Shot, action: &Action) -> Result<()> {
+    if !matches!(action.action.as_str(),"click"|"double_click"|"drag"|"scroll") { return Ok(()); }
+    let guard=shot.guard.as_ref().ok_or("缺少目标画面校验数据，请重新截图")?;
+    let mut image=if snap.window.is_some() {
+        let w=window(shot.surface.id)?;
+        #[cfg(windows)]
+        let image={
+            let monitor=w.current_monitor().map_err(err)?;
+            visible_window_crop(&shot.surface,&monitor_surface(&monitor)?,&monitor.capture_image().map_err(err)?)?
+        };
+        #[cfg(not(windows))]
+        let image=w.capture_image().map_err(err)?;
+        if window_surface(&w)?!=shot.surface { return Err("目标窗口移动，请重新截图".into()); }
+        image
+    } else {
+        let monitor=Monitor::all().map_err(err)?.into_iter().find(|m|m.id().ok()==Some(shot.surface.id)).ok_or("显示器不存在")?;
+        if monitor_surface(&monitor)?!=shot.surface { return Err("显示器布局已变化".into()); }
+        monitor.capture_image().map_err(err)?
+    };
+    if image.dimensions()!=shot.source_pixels || foreground()?!=snap.foreground { return Err("截图范围或前台已变化，请重新截图".into()); }
+    if let Some(r)=shot.region { r.validate(image.dimensions())?; image=xcap::image::imageops::crop_imm(&image,r.x,r.y,r.width,r.height).to_image(); }
+    // Reproduce the displayed resize before applying the guard's independent size bound.
+    if image.dimensions()!=shot.pixels {
+        image=xcap::image::DynamicImage::ImageRgba8(image).resize_exact(shot.pixels.0,shot.pixels.1,xcap::image::imageops::FilterType::Triangle).into_rgba8();
+    }
+    let current=visual_guard::bounded(&image);
+    let endpoints=if action.action=="drag" {vec![(action.x,action.y),(action.to_x,action.to_y)]} else {vec![(action.x,action.y)]};
+    for (x,y) in endpoints {
+        let (x,y)=(x.ok_or("缺少x")? as u32,y.ok_or("缺少y")? as u32);
+        let gx=(x as u64*guard.width() as u64/shot.pixels.0 as u64) as u32;
+        let gy=(y as u64*guard.height() as u64/shot.pixels.1 as u64) as u32;
+        if !visual_guard::matches(guard,&current,gx,gy) { return Err("落点附近画面已变化，停止旧坐标输入；请根据新图重新定位，不要重放整批".into()); }
+    }
+    Ok(())
+}
+
 fn action_delay(actions: &[Action], index: usize) -> Duration {
     // Explicit waits already provide settling time; pointer motion needs no extra delay.
     let redundant = matches!(actions[index].action.as_str(), "wait" | "move")
@@ -584,6 +629,12 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action) -> Result<()> {
     ) {
         let (x, y) = point(shot, a.x, a.y)?;
         enigo.move_mouse(x, y, Coordinate::Abs).map_err(err)?;
+        if a.action != "move" {
+            let actual=cursor_position().or_else(||enigo.location().ok()).ok_or("无法校验鼠标实际位置，停止点击")?;
+            if (actual.0 as i64-x as i64).abs()>1 || (actual.1 as i64-y as i64).abs()>1 {
+                return Err(format!("鼠标落点偏差：期望({x},{y})，实际{actual:?}；未按下鼠标，请局部重截"));
+            }
+        }
     }
     match a.action.as_str() {
         "click" => enigo.button(button, Direction::Click).map_err(err)?,
@@ -680,8 +731,8 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
         Err(e) => return Err(err(e)),
     };
     let max_edge = request.max_edge.unwrap_or(1600);
-    if request.region.is_some() && (request.operation != "screenshot" || request.window_id.is_none()) {
-        return Err("region仅用于screenshot且必须指定windowId".into());
+    if request.region.is_some() && (request.operation != "screenshot" || (request.window_id.is_none() && request.monitor_id.is_none())) {
+        return Err("region仅用于screenshot且必须指定windowId或monitorId".into());
     }
     if request.monitor_id.is_some() && request.operation != "screenshot" {
         return Err("monitorId仅用于screenshot；act由imageId选择屏幕".into());
@@ -771,6 +822,11 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, false, &mut state, &mut result);
                 return Ok(result);
             }
+            if let Err(e)=check_pixels(snap,&shot,&actions[0]) {
+                let mut result=json!({"status":"not_executed","completedActions":0,"error":e});
+                observe(&owner,feedback_window,monitor_id,request.feedback.as_deref()==Some("desktop"),max_edge,false,&mut state,&mut result);
+                return Ok(result);
+            }
             let mut enigo = Enigo::new(&Settings::default()).map_err(err)?;
             // Consume before the first OS event; all later failures are explicitly non-retryable.
             let mut snap = state.take().unwrap();
@@ -778,8 +834,8 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let mut failure = None;
             let mut attempted = false;
             for (index, a) in actions.iter().enumerate() {
-                if a.action != "wait" {
-                    if let Err(e) = check_target(&snap, &shot, a) {
+                if index > 0 && a.action != "wait" {
+                    if let Err(e) = check_target(&snap, &shot, a).and_then(|_|check_pixels(&snap,&shot,a)) {
                         failure = Some(e);
                         break;
                     }
@@ -790,7 +846,9 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                     break;
                 }
                 completed += 1;
-                std::thread::sleep(action_delay(&actions, index));
+                if index+1 < actions.len() || request.feedback.as_deref()==Some("none") {
+                    std::thread::sleep(action_delay(&actions, index));
+                }
                 // Let an explicit wait finish before observing a click/key's focus transition.
                 if actions.get(index + 1).is_some_and(|a| a.action == "wait") { continue; }
                 match foreground() {
@@ -1000,7 +1058,7 @@ mod tests {
                 height: 1080,
             },
             pixels: (3840, 2160),
-            source_pixels: (3840, 2160), region: None,
+            source_pixels: (3840, 2160), region: None, guard: None,
         };
         assert_eq!(point(&shot, Some(1920), Some(1080)).unwrap(), (-960, 540));
         assert!(point(&shot, Some(3840), Some(0)).is_err());
@@ -1039,7 +1097,7 @@ mod tests {
     #[test]
     fn invalid_wait_rejects_whole_batch_before_input() {
         let shot = Shot { image_id:"monitor-1".into(),
-            surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
+            surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None, guard:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
             taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot]});
         let foreign = run("other-owner".into(), json!({"operation":"act","snapshotId":"old"})).unwrap();

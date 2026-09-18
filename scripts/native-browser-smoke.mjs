@@ -21,7 +21,7 @@ await new Promise(r=>server.listen(0,'127.0.0.1',r));
 const port=server.address().port;
 await writeFile(join(profile,'settings.json'),JSON.stringify({relayServer:'',relayToken:'',sessionShortcuts:[],lyraEnabled:false}));
 const portServer = createServer(); await new Promise(r => portServer.listen(0, '127.0.0.1', r));
-const debugPort = portServer.address().port; await new Promise(r => portServer.close(r));
+const debugPort = Number(process.env.TEST_CDP_PORT || portServer.address().port); await new Promise(r => portServer.close(r));
 // Keep the isolated test renderer visible when another desktop window covers it during the 31s delay checks.
 const child = spawn(executable, [], { cwd: root, windowsHide: true, env: { ...process.env, NOVA_CHROME_PORT: "0", NOVA_DATA_DIR: profile, WEBVIEW2_USER_DATA_FOLDER: join(profile,'webview-runtime'), WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort} --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion` }, stdio: ['ignore', 'ignore', 'pipe'] });
 let stderr = ''; child.stderr.on('data', d => { stderr += d; });
@@ -206,6 +206,36 @@ try {
     assert.equal(await page.evaluate('document.querySelector("input").value'),'Chrome桥接验证');
     const screenshot=await chromeUi('screenshot',{tabTag:tag,fullPage:false});
     assert.ok(screenshot.images.length);assert.equal(screenshot.browser,'chrome');
+    // Actual Rust tool route -> Chrome bridge -> real CDP. The extension transport is emulated above.
+    await page.evaluate(`document.body.insertAdjacentHTML('afterbegin','<canvas id="precision-canvas" aria-label="精确画板" width="1280" height="640" style="display:block;width:320px;height:160px"></canvas>');const c=document.querySelector('#precision-canvas'),g=c.getContext('2d');g.fillStyle='white';g.fillRect(0,0,1280,640);g.fillStyle='red';g.fillRect(480,240,320,160);window.canvasInput=[];for(const t of ['click','dblclick','pointermove','wheel'])c.addEventListener(t,e=>canvasInput.push({type:t,trusted:e.isTrusted,buttons:e.buttons,deltaX:e.deltaX}));scrollTo(0,0)`);
+    let visual=await chromeUi('inspect',{tabTag:tag});
+    assert.equal(visual.visualRequired,true);assert.equal(visual.fullPage,false);assert.ok(visual.images[0].imageId);
+    const surface=visual.pages[0].items.find(i=>i.visual?.kind==='canvas');assert.ok(surface);
+    const rect=surface.viewportRect;
+    const coords=o=>{const img=o.images[0];return {imageId:img.imageId,x:(rect.x+rect.width/2-img.x)*img.pixelWidth/img.width,y:(rect.y+rect.height/2-img.y)*img.pixelHeight/img.height};};
+    const canvasAct=(o,action)=>chromeUi('act',{tabTag:tag,snapshotId:o.snapshotId,action});
+    visual=await canvasAct(visual,{action:'click_at',...coords(visual)});
+    assert.equal(visual.status,'executed',JSON.stringify(visual));
+    assert.equal(await page.evaluate('canvasInput.filter(e=>e.type==="click"&&e.trusted).length'),1);
+    // A canvas paint changes NO DOM attributes. Reject it using pixels, not a fake DOM ref.
+    await page.evaluate(`const g=document.querySelector('#precision-canvas').getContext('2d');g.fillStyle='blue';g.fillRect(480,240,320,160)`);
+    visual=await canvasAct(visual,{action:'click_at',...coords(visual)});
+    assert.equal(visual.status,'not_executed');assert.match(visual.reason,/画面已变化/);
+    assert.equal(await page.evaluate('canvasInput.filter(e=>e.type==="click").length'),1);
+    const cropped=await chromeUi('screenshot',{tabTag:tag,fullPage:false,region:rect});
+    const img=cropped.images[0];assert.ok(img.pixelWidth>0&&img.pixelHeight>0);
+    visual=await canvasAct(cropped,{action:'double_click_at',imageId:img.imageId,x:img.pixelWidth/2,y:img.pixelHeight/2});
+    assert.equal(visual.status,'executed',JSON.stringify(visual));
+    assert.equal(await page.evaluate('canvasInput.filter(e=>e.type==="dblclick"&&e.trusted).length'),1);
+    const start=coords(visual),mapping=visual.images[0];
+    visual=await canvasAct(visual,{action:'drag',...start,to_x:start.x+50*mapping.pixelWidth/mapping.width,to_y:start.y});
+    assert.equal(visual.status,'executed',JSON.stringify(visual));
+    assert.ok(await page.evaluate('canvasInput.filter(e=>e.type==="pointermove"&&e.buttons===1).length>=8'));
+    visual=await canvasAct(visual,{action:'scroll_at',...coords(visual),delta:0,delta_x:50});
+    assert.equal(visual.status,'executed');
+    await sleep(100);assert.ok(await page.evaluate('canvasInput.some(e=>e.type==="wheel"&&e.deltaX===50&&e.trusted)'));
+    await writeFile(join(output,'precision-canvas.json'),JSON.stringify({passed:true,automaticCanvasScreenshot:true,imagePixelMapping:true,stalePaintRejected:true,croppedDoubleClick:true,continuousDrag:true,horizontalWheel:true,events:await page.evaluate('canvasInput')},null,2));
+    await page.evaluate(`document.querySelector('#precision-canvas').remove()`);
     if(pollingError)throw pollingError;
     assert.equal(await main.evaluate('!!document.querySelector("[aria-label=浏览器来源]")'),false);
     assert.equal(await main.evaluate('!!document.querySelector(".workspace-browser-surface")'),true);

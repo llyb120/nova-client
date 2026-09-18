@@ -14,6 +14,10 @@ use tauri::{AppHandle, Emitter, Manager};
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
 tokio::task_local! { static CONTROL_TAB: String; }
+tokio::task_local! { static INPUT_TRACE: Arc<Mutex<InputTrace>>; }
+#[derive(Default)]
+struct InputTrace { sent: bool, calls: usize, mouse: Option<Value>, key: Option<Value> }
+
 #[cfg(windows)]
 struct Popup {
     args: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2NewWindowRequestedEventArgs,
@@ -31,6 +35,11 @@ impl Drop for Popup {
 #[cfg(windows)]
 thread_local! { static POPUPS: std::cell::RefCell<std::collections::HashMap<String,Popup>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
 const PAGE_SCRIPT: &str = include_str!("native_browser_page.js");
+#[path = "browser_pixels.rs"]
+mod browser_pixels;
+use browser_pixels::{Crop, ImageMap};
+#[path = "visual_guard.rs"]
+mod visual_guard;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -572,17 +581,29 @@ async fn cdp(
     {
         return Err("已停止".into());
     }
+    let _=INPUT_TRACE.try_with(|trace| {
+        let mut trace=trace.lock().unwrap(); trace.calls+=1;
+        match (method,params["type"].as_str().unwrap_or("")) {
+            ("Input.dispatchMouseEvent","mousePressed") => { trace.sent=true; trace.mouse=Some(params.clone()); },
+            ("Input.dispatchMouseEvent","mouseMoved") => { if let Some(p)=trace.mouse.as_mut() {p["x"]=params["x"].clone();p["y"]=params["y"].clone();} },
+            ("Input.dispatchMouseEvent","mouseWheel") | ("Input.insertText",_) => trace.sent=true,
+            ("Input.dispatchKeyEvent","keyDown"|"rawKeyDown") => {trace.sent=true;trace.key=Some(params.clone());},
+            _ => (),
+        }
+    });
     let label = active_label(app)?;
-    if label.starts_with("chrome:") {
+    let result=if label.starts_with("chrome:") {
         let tag = label.rsplit(':').next().ok_or("缺少 Chrome tabTag")?;
-        return crate::chrome_browser::request(
-            app,
-            "cdp",
-            json!({"tabTag":tag,"method":method,"params":params,"sessionId":session_id}),
-        )
-        .await;
+        crate::chrome_browser::request(app,"cdp",json!({"tabTag":tag,"method":method,"params":params,"sessionId":session_id})).await
+    } else { native_cdp(app, method, params.clone(), session_id, cancel).await };
+    if result.is_ok() {
+        let _=INPUT_TRACE.try_with(|trace| {
+            let mut trace=trace.lock().unwrap();
+            if method=="Input.dispatchMouseEvent" && params["type"]=="mouseReleased" {trace.mouse=None;}
+            if method=="Input.dispatchKeyEvent" && params["type"]=="keyUp" {trace.key=None;}
+        });
     }
-    native_cdp(app, method, params, session_id, cancel).await
+    result
 }
 
 #[cfg(windows)]
@@ -693,9 +714,10 @@ struct Observation {
     captured: std::time::Instant,
     screenshot: bool,
     full_page: bool,
+    images: Vec<ImageMap>,
 }
 
-async fn observe(app: &AppHandle) -> Result<Observation, String> {
+async fn observe(app: &AppHandle, query: &str) -> Result<Observation, String> {
     fn collect(tree: &Value, session: Option<String>, frames: &mut Vec<Frame>) {
         if let Some(id) = tree["frame"]["id"].as_str() {
             frames.push(Frame {
@@ -805,12 +827,11 @@ async fn observe(app: &AppHandle) -> Result<Observation, String> {
             frame.context = world["executionContextId"]
                 .as_i64()
                 .ok_or("无效页面上下文")?;
-            evaluate(app, &frame, PAGE_SCRIPT.into()).await?;
             let nonce = uuid::Uuid::new_v4().simple().to_string();
             evaluate(
                 app,
                 &frame,
-                format!("__novaWebview.observe({})", json!(nonce)),
+                format!("{PAGE_SCRIPT};__novaWebview.observe({},20000,{})", json!(nonce),json!(query)),
             )
             .await
         }
@@ -821,6 +842,7 @@ async fn observe(app: &AppHandle) -> Result<Observation, String> {
                 pages.push(page);
                 ready.push(frame);
             }
+            Err(error) if frame.parent.is_none() => return Err(format!("主页面尚未就绪：{error}")),
             Err(error) => gaps.push(error),
         }
     }
@@ -834,6 +856,7 @@ async fn observe(app: &AppHandle) -> Result<Observation, String> {
         captured: std::time::Instant::now(),
         screenshot: false,
         full_page: false,
+        images: Vec::new(),
     })
 }
 
@@ -843,12 +866,25 @@ enum Action {
     ClickAt {
         x: f64,
         y: f64,
+        #[serde(rename = "imageId")]
+        image_id: Option<String>,
     },
     Move {
         x: f64,
         y: f64,
+        #[serde(rename = "imageId")]
+        image_id: Option<String>,
     },
+    DoubleClickAt {
+        x: f64,
+        y: f64,
+        #[serde(rename = "imageId")]
+        image_id: Option<String>,
+    },
+    WaitFor { frame: usize, r#ref: String, state: String, text: Option<String>, ms: Option<u64> },
     Drag {
+        #[serde(rename = "imageId")]
+        image_id: Option<String>,
         x: f64,
         y: f64,
         to_x: f64,
@@ -861,6 +897,10 @@ enum Action {
         x: f64,
         y: f64,
         delta: i32,
+        #[serde(default)]
+        delta_x: i32,
+        #[serde(rename = "imageId")]
+        image_id: Option<String>,
     },
     Click {
         frame: usize,
@@ -900,6 +940,7 @@ async fn point(
     observation: &Observation,
     index: usize,
     reference: &str,
+    for_scroll: bool,
 ) -> Result<Value, String> {
     let frame = observation
         .frames
@@ -940,28 +981,37 @@ async fn point(
             return Err("框架嵌套过深".into());
         }
     }
-    for (parent, object) in chain.iter().rev() {
-        cdp(app, "Runtime.callFunctionOn", json!({"objectId":object,"functionDeclaration":"async function(){this.scrollIntoView({block:'center',behavior:'instant'});await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))}","awaitPromise":true}), parent.session.as_deref(), None).await?;
-    }
-    let mut value = evaluate(
-        app,
-        frame,
-        format!("__novaWebview.prepare({})", json!(reference)),
-    )
-    .await?;
-    for (parent, object) in &chain {
-        let result = cdp(app, "Runtime.callFunctionOn", json!({"objectId":object,"returnByValue":true,"arguments":[{"value":value}],"functionDeclaration":"function(p){const r=this.getBoundingClientRect();if(getComputedStyle(this).transform!=='none'||Math.abs(r.width-this.offsetWidth)>1)throw Error('暂不支持变换后的框架');const x=r.x+this.clientLeft+p.x,y=r.y+this.clientTop+p.y;if(this.ownerDocument.elementFromPoint(x,y)!==this)throw Error('框架被遮挡');return {x,y}}"}), parent.session.as_deref(), None).await?;
-        if result.get("exceptionDetails").is_some() {
-            return Err("框架坐标无法安全映射".into());
+    let result = async {
+        for (parent, object) in chain.iter().rev() {
+            let moved = cdp(app, "Runtime.callFunctionOn", json!({"objectId":object,"functionDeclaration":"async function(){const r=this.getBoundingClientRect();if(r.left<0||r.top<0||r.right>innerWidth||r.bottom>innerHeight){this.scrollIntoView({block:'nearest',inline:'nearest',behavior:'instant'});await new Promise(r=>setTimeout(r,32));}}","awaitPromise":true}), parent.session.as_deref(), None).await?;
+            if moved.get("exceptionDetails").is_some() { return Err("框架坐标无法安全映射".into()); }
         }
-        value["x"] = json!(result["result"]["value"]["x"]
-            .as_f64()
-            .ok_or("无效框架坐标")?);
-        value["y"] = json!(result["result"]["value"]["y"]
-            .as_f64()
-            .ok_or("无效框架坐标")?);
+        let local = evaluate(app, frame, format!("__novaWebview.prepare({},{})", json!(reference),for_scroll)).await?;
+        let map = |initial: Value| async {
+            let mut value = initial;
+            for (parent, object) in &chain {
+                let result = cdp(app, "Runtime.callFunctionOn", json!({"objectId":object,"returnByValue":true,"awaitPromise":true,"arguments":[{"value":value}],"functionDeclaration":"function(p){return __novaWebview.frameOwner(this,p)}"}), parent.session.as_deref(), None).await?;
+                if result.get("exceptionDetails").is_some() { return Err("框架坐标无法安全映射".to_string()); }
+                value["x"] = result["result"]["value"]["x"].clone();
+                value["y"] = result["result"]["value"]["y"].clone();
+                if value["x"].as_f64().is_none() || value["y"].as_f64().is_none() { return Err("框架坐标无法安全映射".into()); }
+            }
+            Ok(value)
+        };
+        let value = map(local.clone()).await?;
+        cdp(app, "Input.dispatchMouseEvent", json!({"type":"mouseMoved","x":value["x"],"y":value["y"]}), None, None).await?;
+        // Hover handlers can insert an overlay or move the control. Do not click stale geometry.
+        evaluate(app, frame, format!("__novaWebview.validate({},{})", json!(reference), local)).await?;
+        let checked = map(local).await?;
+        if ["x","y"].iter().any(|k| (checked[k].as_f64().unwrap()-value[k].as_f64().unwrap()).abs()>.5) {
+            return Err("目标在准备期间已变化：父框架移动".into());
+        }
+        Ok(value)
+    }.await;
+    for (parent, object) in &chain {
+        let _ = cdp(app, "Runtime.releaseObject", json!({"objectId":object}), parent.session.as_deref(), None).await;
     }
-    Ok(value)
+    result
 }
 
 async fn mouse(app: &AppHandle, s: &Session, p: &Value) -> Result<(), String> {
@@ -1020,52 +1070,60 @@ async fn apply(
 ) -> Result<(), String> {
     check(app, s)?;
     match action {
-        Action::ClickAt { x, y }
-        | Action::Move { x, y }
-        | Action::Drag { x, y, .. }
-        | Action::ScrollAt { x, y, .. } => {
+        Action::ClickAt { x, y, image_id }
+        | Action::DoubleClickAt { x, y, image_id }
+        | Action::Move { x, y, image_id }
+        | Action::Drag { x, y, image_id, .. }
+        | Action::ScrollAt { x, y, image_id, .. } => {
             if observation.full_page && matches!(action, Action::Drag { .. }) {
                 return Err("拖动请使用 fullPage=false 的视口截图，避免拖动过程中滚动页面".into());
             }
-            let p = coordinate(app, observation, *x, *y).await?;
+            let (x, y) = image_point(observation, image_id.as_deref(), *x, *y)?;
+            let p = coordinate(app, observation, x, y).await?;
+            if !matches!(action,Action::Move{..}) {check_image_pixels(app,observation,x,y,&p).await?;}
+            cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseMoved","x":p["x"],"y":p["y"]}),None,Some(s.cancel.clone())).await?;
+            evaluate(app,&observation.frames[0],"__novaWebview.validateCoordinate()".into()).await?;
             match action {
                 Action::ClickAt { .. } => mouse(app, s, &p).await?,
-                Action::Move { .. } => {
-                    cdp(
-                        app,
-                        "Input.dispatchMouseEvent",
-                        json!({"type":"mouseMoved","x":p["x"],"y":p["y"]}),
-                        None,
-                        Some(s.cancel.clone()),
-                    )
-                    .await?;
+                Action::DoubleClickAt { .. } => {
+                    mouse(app, s, &p).await?;
+                    for event in ["mousePressed","mouseReleased"] {
+                        cdp(app,"Input.dispatchMouseEvent",json!({"type":event,"x":p["x"],"y":p["y"],"button":"left","clickCount":2}),None,(event=="mousePressed").then(||s.cancel.clone())).await?;
+                    }
                 }
-                Action::ScrollAt { delta, .. } => {
-                    if delta.unsigned_abs() > 1200 {
+                Action::Move { .. } => (),
+                Action::ScrollAt { delta, delta_x, .. } => {
+                    if delta.unsigned_abs() > 1200 || delta_x.unsigned_abs() > 1200 {
                         return Err("单次滚动不能超过1200像素".into());
                     }
                     cdp(
                         app,
                         "Input.dispatchMouseEvent",
-                        json!({"type":"mouseWheel","x":p["x"],"y":p["y"],"deltaX":0,"deltaY":delta}),
+                        json!({"type":"mouseWheel","x":p["x"],"y":p["y"],"deltaX":delta_x,"deltaY":delta}),
                         None,
                         Some(s.cancel.clone()),
                     )
                     .await?;
                 }
                 Action::Drag { to_x, to_y, .. } => {
-                    coordinate(app, observation, *to_x, *to_y).await?;
-                    cdp(app,"Input.dispatchMouseEvent",json!({"type":"mousePressed","x":x,"y":y,"button":"left","buttons":1,"clickCount":1}),None,Some(s.cancel.clone())).await?;
-                    let moved = cdp(
-                        app,
-                        "Input.dispatchMouseEvent",
-                        json!({"type":"mouseMoved","x":to_x,"y":to_y,"button":"left","buttons":1}),
-                        None,
-                        Some(s.cancel.clone()),
-                    )
-                    .await;
-                    cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseReleased","x":to_x,"y":to_y,"button":"left","clickCount":1}),None,None).await?;
-                    moved?;
+                    let (to_x,to_y) = image_point(observation,image_id.as_deref(),*to_x,*to_y)?;
+                    let end = coordinate(app, observation, to_x, to_y).await?;
+                    check_image_pixels(app,observation,to_x,to_y,&end).await?;
+                    let (px,py)=(p["x"].as_f64().ok_or("无效拖动坐标")?,p["y"].as_f64().ok_or("无效拖动坐标")?);
+                    let (tx,ty)=(end["x"].as_f64().ok_or("无效拖动坐标")?,end["y"].as_f64().ok_or("无效拖动坐标")?);
+                    cdp(app,"Input.dispatchMouseEvent",json!({"type":"mousePressed","x":px,"y":py,"button":"left","buttons":1,"clickCount":1}),None,Some(s.cancel.clone())).await?;
+                    // Intermediate trusted pointer events trigger canvas drag thresholds and drawing paths.
+                    let mut last=(px,py);
+                    let moved=async {
+                        for step in 1..=8 {
+                            last=(px+(tx-px)*step as f64/8.,py+(ty-py)*step as f64/8.);
+                            cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseMoved","x":last.0,"y":last.1,"button":"left","buttons":1}),None,Some(s.cancel.clone())).await?;
+                            tokio::time::sleep(Duration::from_millis(8)).await;
+                        }
+                        Ok::<_,String>(())
+                    }.await;
+                    let released=cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseReleased","x":last.0,"y":last.1,"button":"left","buttons":0,"clickCount":1}),None,None).await;
+                    moved?; released?;
                 }
                 _ => unreachable!(),
             }
@@ -1091,13 +1149,16 @@ async fn apply(
             .await?;
         }
         Action::Click { frame, r#ref } | Action::Fill { frame, r#ref, .. } => {
-            let p = point(app, observation, *frame, r#ref).await?;
+            let p = point(app, observation, *frame, r#ref, false).await?;
             if let Action::Fill { text, .. } = action {
                 if p["editable"] != true || p["password"] == true || text.len() > 16000 {
                     return Err("目标不是可填写字段或需要手动输入密码".into());
                 }
                 mouse(app, s, &p).await?;
+                let target=&observation.frames[*frame];
+                evaluate(app,target,format!("__novaWebview.focused({})",json!(r#ref))).await?;
                 key(app, s, "Control+A").await?;
+                evaluate(app,target,format!("__novaWebview.focused({})",json!(r#ref))).await?;
                 check(app, s)?;
                 cdp(
                     app,
@@ -1120,8 +1181,9 @@ async fn apply(
             if delta.unsigned_abs() > 1200 {
                 return Err("单次滚动不能超过 1200 像素".into());
             }
+            if *frame != 0 && r#ref.is_none() { return Err("iframe 滚动需要明确滚动容器的 frame/ref".into()); }
             let p = if let Some(reference) = r#ref {
-                point(app, observation, *frame, reference).await?
+                point(app, observation, *frame, reference, true).await?
             } else {
                 json!({"x":observation.pages["pages"][0]["viewport"]["width"].as_f64().unwrap_or(400.0)/2.0,"y":observation.pages["pages"][0]["viewport"]["height"].as_f64().unwrap_or(400.0)/2.0})
             };
@@ -1135,9 +1197,24 @@ async fn apply(
             )
             .await?;
         }
+        Action::WaitFor { frame, r#ref, state, text, ms } => {
+            let target=observation.frames.get(*frame).ok_or("模型选择了不存在的 frame")?;
+            let ms=ms.unwrap_or(1500);
+            if ms>2000 || !["visible","hidden","enabled","text"].contains(&state.as_str()) { return Err("无效的等待条件".into()); }
+            if state=="text" && text.as_deref().is_none_or(|v|v.is_empty()) { return Err("等待文本不能为空".into()); }
+            evaluate(app,target,format!("__novaWebview.waitFor({},{},{},{})",json!(r#ref),json!(state),json!(text.as_deref().unwrap_or("")),ms)).await?;
+        }
         Action::Wait { ms } => tokio::time::sleep(Duration::from_millis((*ms).min(2000))).await,
     }
     check(app, s)
+}
+
+fn image_point(observation: &Observation, id: Option<&str>, x: f64, y: f64) -> Result<(f64,f64),String> {
+    match id {
+        Some(id) => observation.images.iter().find(|m|m.id==id).ok_or("imageId 不属于当前截图")?.point(x,y),
+        None if x.is_finite() && y.is_finite() => Ok((x,y)),
+        None => Err("坐标必须是有限数字".into()),
+    }
 }
 
 async fn coordinate(
@@ -1172,12 +1249,51 @@ async fn coordinate(
     .await
 }
 
+async fn check_image_pixels(app:&AppHandle, observation:&Observation, x:f64, y:f64, point:&Value) -> Result<(),String> {
+    use base64::Engine;
+    let map=observation.images.iter().find(|m|x>=m.rect.x && y>=m.rect.y && x<m.rect.x+m.rect.width && y<m.rect.y+m.rect.height)
+        .ok_or("坐标没有对应的已观察截图区域，请重新截图")?;
+    let (px,py)=(point["x"].as_f64().ok_or("无效坐标")?,point["y"].as_f64().ok_or("无效坐标")?);
+    let viewport=&observation.pages["pages"][0]["viewport"];
+    let left=24f64.min(x-map.rect.x).min(px).floor();
+    let top=24f64.min(y-map.rect.y).min(py).floor();
+    let right=24f64.min(map.rect.x+map.rect.width-x).min(viewport["width"].as_f64().unwrap_or(0.)-px).floor();
+    let bottom=24f64.min(map.rect.y+map.rect.height-y).min(viewport["height"].as_f64().unwrap_or(0.)-py).floor();
+    if left+right<2. || top+bottom<2. {return Err("落点贴近截图边缘，请局部重截后定位".into());}
+    let origin=evaluate(app,&observation.frames[0],"({x:scrollX,y:scrollY})".into()).await?;
+    let shot=cdp(app,"Page.captureScreenshot",json!({"format":"png","fromSurface":true,"captureBeyondViewport":false,"optimizeForSpeed":true,
+        "clip":{"x":origin["x"].as_f64().unwrap_or(0.)+px-left,"y":origin["y"].as_f64().unwrap_or(0.)+py-top,"width":left+right,"height":top+bottom,"scale":1}}),None,None).await?;
+    let bytes=base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str().ok_or("落点截图为空")?).map_err(|e|e.to_string())?;
+    let current=xcap::image::load_from_memory(&bytes).map_err(|e|e.to_string())?.to_rgba8();
+    let original=xcap::image::open(&map.path).map_err(|e|e.to_string())?.to_rgba8();
+    let sx=map.pixels.0 as f64/map.rect.width;let sy=map.pixels.1 as f64/map.rect.height;
+    let bx=((x-left-map.rect.x)*sx).round().max(0.) as u32;
+    let by=((y-top-map.rect.y)*sy).round().max(0.) as u32;
+    let bw=((left+right)*sx).round().max(1.) as u32;let bh=((top+bottom)*sy).round().max(1.) as u32;
+    if bx+bw>original.width() || by+bh>original.height() {return Err("落点截图比例已变化，请重新截图".into());}
+    let previous=xcap::image::imageops::crop_imm(&original,bx,by,bw,bh).to_image();
+    let resize=|image:xcap::image::RgbaImage| xcap::image::DynamicImage::ImageRgba8(image).resize_exact(32,32,xcap::image::imageops::FilterType::Triangle).into_rgba8();
+    let (previous,current)=(resize(previous),resize(current));
+    let gx=(left/(left+right)*32.).floor().min(31.) as u32;
+    let gy=(top/(top+bottom)*32.).floor().min(31.) as u32;
+    if !visual_guard::matches(&previous,&current,gx,gy) {return Err("落点附近画面已变化（Canvas 重绘、滚动或遮挡）；未点击，请使用新截图重新定位".into());}
+    Ok(())
+}
+
+fn screenshot_map(path:std::path::PathBuf,id:String,rect:Crop) -> Result<ImageMap,String> {
+    let pixels=xcap::image::ImageReader::open(&path).map_err(|e|e.to_string())?.into_dimensions().map_err(|e|e.to_string())?;
+    if pixels.0==0 || pixels.1==0 || (pixels.0 as u64)*(pixels.1 as u64)>64*1024*1024 { return Err("截图像素过大，请使用视口或局部 region".into()); }
+    Ok(ImageMap{id,path,rect,pixels})
+}
+
 async fn snapshot(
     app: &AppHandle,
     with_image: bool,
     args: &Value,
 ) -> Result<(Observation, Value), String> {
-    let mut observation = observe(app).await?;
+    let mut observation = observe(app,args["query"].as_str().unwrap_or("")).await?;
+    let visual_required = observation.pages["pages"].as_array().is_some_and(|pages|pages.iter().any(|p|p["visualRequired"]==true));
+    let with_image = with_image || (visual_required && args["includeVisual"] != false);
     let dir = state_dir(app).join("browser-shots");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let document_path = dir.join(format!("{}.json", observation.id));
@@ -1241,10 +1357,13 @@ async fn snapshot(
     }
     result["snapshotId"] = json!(observation.id);
     result["documentPath"] = json!(document_path);
-    result["scope"]=json!("整页已加载DOM，包含屏幕外和内部滚动区域；documentPath保留完整文本、元素和引用。inlineTruncated仅代表工具回复摘要被截短；truncated/coverageGaps表示采集本身不完整。");
+    result["scope"]=json!("整页已加载DOM，包含屏幕外和内部滚动区域；documentPath保留完整已采集文本、元素和引用（query存在时仅采集匹配元素）。inlineTruncated仅代表工具回复摘要被截短；truncated/coverageGaps表示采集本身不完整。");
+    result["visualRequired"] = json!(visual_required);
     if with_image {
         use base64::Engine;
-        observation.full_page = args["fullPage"] != false;
+        // Canvas observations automatically include the viewport, never a huge full-document image.
+        observation.full_page = args["region"].is_null() && args["fullPage"] != false && args["operation"] != "inspect";
+        if visual_required && args["operation"] != "screenshot" && args["fullPage"].is_null() { observation.full_page=false; }
         let mut images = Vec::new();
         if observation.full_page {
             // Retain the root world for cleanup even if capture is cancelled or times out.
@@ -1295,7 +1414,9 @@ async fn snapshot(
                         .map_err(|e| e.to_string())?,
                 )
                 .map_err(|e| e.to_string())?;
-                images.push(json!({"path":path,"tile":tile,"x":x,"y":y,"width":w,"height":h}));
+                let map = screenshot_map(path, format!("{}:{tile}",observation.id), Crop{x,y,width:w,height:h})?;
+                let mut meta=map.metadata(); meta["tile"]=json!(tile);
+                images.push(meta); observation.images.push(map);
             }
             let next = offset + images.len() as u64;
             result["documentSize"] = json!({"width":width,"height":height});
@@ -1309,26 +1430,24 @@ async fn snapshot(
             result["coordinateSpace"]=json!("CSS document pixels. Image coordinate -> tile.x + pixelX*tile.width/imagePixelWidth, tile.y + pixelY*tile.height/imagePixelHeight. click_at/move/scroll_at auto-scroll to the document point. Prefer DOM ref for offscreen elements; drag requires fullPage=false.");
             result["screenshotScope"]=json!("主文档整页；内部滚动区域/iframe的屏幕外内容用整页DOM读取。未加载图片或虚拟数据可能仍需定向滚动。");
         } else {
-            let shot = cdp(
-                app,
-                "Page.captureScreenshot",
-                json!({"format":"png","captureBeyondViewport":false}),
-                None,
-                None,
-            )
-            .await?;
-            let path = dir.join(format!("{}.png", observation.id));
-            std::fs::write(
-                &path,
-                base64::engine::general_purpose::STANDARD
-                    .decode(shot["data"].as_str().ok_or("截图为空")?)
-                    .map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-            images.push(json!({"path":path,"x":0,"y":0,"width":observation.pages["pages"][0]["viewport"]["width"],"height":observation.pages["pages"][0]["viewport"]["height"]}));
+            let viewport = &observation.pages["pages"][0]["viewport"];
+            let (width,height)=(viewport["width"].as_f64().ok_or("无效视口")?,viewport["height"].as_f64().ok_or("无效视口")?);
+            let crop:Crop=if args["region"].is_null() { Crop{x:0.,y:0.,width,height} } else { serde_json::from_value(args["region"].clone()).map_err(|e|format!("无效 region：{e}"))? };
+            crop.validate(width,height)?;
+            let mut params=json!({"format":"png","fromSurface":true,"captureBeyondViewport":false,"optimizeForSpeed":true});
+            if !args["region"].is_null() {
+                params["clip"]=json!({"x":crop.x+viewport["scrollX"].as_f64().unwrap_or(0.),"y":crop.y+viewport["scrollY"].as_f64().unwrap_or(0.),"width":crop.width,"height":crop.height,"scale":1});
+            }
+            let shot=cdp(app,"Page.captureScreenshot",params,None,None).await?;
+            let path=dir.join(format!("{}.png",observation.id));
+            std::fs::write(&path,base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str().ok_or("截图为空")?).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+            let map=screenshot_map(path,format!("{}:0",observation.id),crop)?;
+            images.push(map.metadata()); observation.images.push(map);
             result["coordinateSpace"] =
-                json!("CSS viewport pixels; use pages[0].viewport, not image physical pixels");
+                json!("Recommended: action.imageId + coordinates in that image's actual pixels; the tool maps crop offset and DPI. Without imageId: CSS viewport pixels (legacy).");
         }
+        let after=evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?;
+        if after != observation.pages["pages"][0]["stamp"] { return Err("截图期间视口已变化，请重新观察".into()); }
         result["path"] = images[0]["path"].clone();
         result["images"] = json!(images);
         result["fullPage"] = json!(observation.full_page);
@@ -1377,8 +1496,9 @@ async fn control_session(
         emit(app);
     }
     let mut completed_action = None;
-    let task=CONTROL_TAB.scope(s.active_tab.clone(),async {
-        if operation!="act" {return Ok(snapshot(app,operation=="screenshot",args).await?.1);}
+    let trace=Arc::new(Mutex::new(InputTrace::default()));
+    let task=INPUT_TRACE.scope(trace.clone(),CONTROL_TAB.scope(s.active_tab.clone(),async {
+        if operation!="act" {let mut request=args.clone();request["operation"]=json!(operation);return Ok(snapshot(app,operation=="screenshot",&request).await?.1);}
         let observation=state.observations.lock().unwrap().get(&s.active_tab).cloned().ok_or("请先 inspect 或 screenshot")?;
         if args["snapshotId"].as_str()!=Some(&observation.id) { return Err("观察已失效：snapshotId 不是最新观察或已执行；使用最近返回的 snapshotId，不要重放动作".into()); }
         let action=parse_action(&args["action"].to_string())?;
@@ -1389,7 +1509,8 @@ async fn control_session(
         state.observations.lock().unwrap().remove(&s.active_tab);
         let mut result = match apply(app,&s,&observation,&action).await {
             Err(error) => {
-                let not_executed=["目标引用已失效","目标在准备期间已变化","目标被遮挡","目标不可用","模型选择了不存在的 frame","截图视口已变化","截图已过期","坐标超出视口","坐标超出文档","拖动请使用","坐标操作需要","框架坐标无法安全映射","目标不是可填写","密码请手动输入"].iter().any(|e|error.contains(e));
+                // Status follows actual dispatch, not substrings in an error (focus may fail AFTER a click).
+                let not_executed=!trace.lock().unwrap().sent;
                 json!({"status":if not_executed {"not_executed"} else {"needs_review"},"reason":error.lines().next().unwrap_or(&error)})
             },
             Ok(()) => json!({"status":"executed"}),
@@ -1400,6 +1521,7 @@ async fn control_session(
         if args["feedback"] != "none" && !s.cancel.load(Ordering::SeqCst) {
             let mut feedback_args = args.clone();
             feedback_args["fullPage"] = json!(false);
+            feedback_args["region"] = Value::Null;
             // Feedback failure must never turn a completed mutation into a retryable action failure.
             match tokio::time::timeout(Duration::from_secs(3), snapshot(app,args["feedback"]=="screenshot",&feedback_args)).await {
                 Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
@@ -1408,7 +1530,7 @@ async fn control_session(
             }
         }
         Ok(result)
-    });
+    }));
     let mut result = tokio::select! {
         r=tokio::time::timeout(Duration::from_secs(15),task)=>r.map_err(|_|"浏览器操作15秒超时，已停止；请重新观察确认结果".to_string()).and_then(|r|r),
         _=async {while !s.cancel.load(Ordering::SeqCst) {tokio::time::sleep(Duration::from_millis(30)).await;}}=>Err("已停止浏览器操作，请检查页面确认结果".into()),
@@ -1416,6 +1538,21 @@ async fn control_session(
     if let (Err(error), Some(mut completed)) = (&result, completed_action) {
         completed["observationError"] = json!(error);
         result = Ok(completed);
+    }
+    if result.is_err() && trace.lock().unwrap().sent {
+        result=Ok(json!({"status":"needs_review","reason":result.as_ref().err(),"verification":"unverified","next":"输入可能已经发送；重新观察，禁止自动重放"}));
+    }
+    // Cancellation may drop a future between down/up. Release only what THIS operation held.
+    let (pending_mouse,pending_key)={let mut t=trace.lock().unwrap();(t.mouse.take(),t.key.take())};
+    let cleanup=CONTROL_TAB.scope(s.active_tab.clone(),async {
+        let mut errors=Vec::new();
+        if let Some(mut p)=pending_mouse {p["type"]=json!("mouseReleased");p["buttons"]=json!(0);if let Err(e)=cdp(app,"Input.dispatchMouseEvent",p,None,None).await {errors.push(e);}}
+        if let Some(mut p)=pending_key {p["type"]=json!("keyUp");if let Err(e)=cdp(app,"Input.dispatchKeyEvent",p,None,None).await {errors.push(e);}}
+        errors
+    }).await;
+    if let Ok(value)=&mut result {
+        value["cdpCalls"]=json!(trace.lock().unwrap().calls);
+        if !cleanup.is_empty() {value["releaseErrors"]=json!(cleanup);value["status"]=json!("needs_review");}
     }
     s.cancel.store(true, Ordering::SeqCst);
     if operation == "screenshot" && args["fullPage"] != false {
