@@ -1003,7 +1003,7 @@ async fn point(
         // Hover handlers can insert an overlay or move the control. Do not click stale geometry.
         evaluate(app, frame, format!("__novaWebview.validate({},{})", json!(reference), local)).await?;
         let checked = map(local).await?;
-        if ["x","y"].iter().any(|k| (checked[k].as_f64().unwrap()-value[k].as_f64().unwrap()).abs()>.5) {
+        if ["x","y"].iter().any(|k| (checked[k].as_f64().unwrap()-value[k].as_f64().unwrap()).abs()>0.5) {
             return Err("目标在准备期间已变化：父框架移动".into());
         }
         Ok(value)
@@ -1291,6 +1291,9 @@ async fn snapshot(
     with_image: bool,
     args: &Value,
 ) -> Result<(Observation, Value), String> {
+    if args["fullPage"] == true && !args["region"].is_null() {
+        return Err("局部 region 只能与 fullPage=false 一起使用".into());
+    }
     let mut observation = observe(app,args["query"].as_str().unwrap_or("")).await?;
     let visual_required = observation.pages["pages"].as_array().is_some_and(|pages|pages.iter().any(|p|p["visualRequired"]==true));
     let with_image = with_image || (visual_required && args["includeVisual"] != false);

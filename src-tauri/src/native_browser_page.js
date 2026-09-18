@@ -25,7 +25,9 @@
   const fingerprint = (e, name = label(e)) => JSON.stringify([e.tagName, name, e.id, e.getAttribute('name'), e.getAttribute('type'),
     e.getAttribute('href'), e.getAttribute('role'), rowIdentity(e)]);
   const unavailable = e => !!ancestor(e, n => n.matches(':disabled,[aria-disabled=true],[inert]'));
-  const editable = e => !e.readOnly && (e.isContentEditable || e.matches('textarea,input:not([type=button]):not([type=submit]):not([type=checkbox]):not([type=radio]):not([type=file]):not([type=hidden])'));
+  const editable = e => !e.readOnly && (e.isContentEditable || e.tagName==='TEXTAREA'
+    || (e.tagName==='INPUT' && ['text','search','tel','url','email','number','password'].includes(e.type)));
+  const perceptible = e => !ancestor(e,n=>{const s=getComputedStyle(n);return s.display==='none' || s.visibility==='hidden' || s.visibility==='collapse' || Number(s.opacity)===0;});
   const hitAt = (x, y) => {
     let hit = document.elementFromPoint(x, y);
     while (hit?.shadowRoot) {
@@ -74,7 +76,7 @@
   };
   const readyTarget = ref => {
     const entry = entryFor(ref);
-    if (unavailable(entry.e)) throw Error('目标不可用');
+    if (unavailable(entry.e) || !perceptible(entry.e)) throw Error('目标不可用或不可见');
     return entry.e;
   };
   const api = {
@@ -129,7 +131,7 @@
         const name=label(e),region=regionOf(e);
         if(search && !`${name} ${region} ${e.href || ''}`.toLocaleLowerCase().includes(search)) continue;
         const r = e.getBoundingClientRect(), style = getComputedStyle(e);
-        if (!r.width || !r.height || style.visibility === 'hidden' || style.visibility === 'collapse' || style.display === 'none') continue;
+        if (!r.width || !r.height || style.visibility === 'hidden' || style.visibility === 'collapse' || style.display === 'none' || Number(style.opacity)===0) continue;
         total++; if (items.length >= limit) continue;
         const ref = `${nonce}:${items.length}`, disabled=unavailable(e);
         const inView = r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth;
@@ -195,11 +197,12 @@
     async waitFor(ref, state, text, ms = 1500) {
       if (!['visible','hidden','enabled','text'].includes(state) || !Number.isFinite(ms) || ms<0 || ms>2000)
         throw Error('无效的等待条件');
+      if (!entries.has(ref)) throw Error('等待目标引用不存在，请重新观察');
       const deadline = performance.now()+ms;
       do {
         const entry = entries.get(ref), e = entry?.e;
         const exists = !!e?.isConnected;
-        const visible = exists && !!clickable(e);
+        const visible = exists && perceptible(e) && !!clickable(e);
         if (state==='hidden' && !visible) return {matched:true,state};
         if (exists) {
           if (state==='text') { if (String(e.innerText || e.value || '').includes(String(text))) return {matched:true,state}; }
@@ -225,7 +228,7 @@
       }
       if (x>=innerWidth || y>=innerHeight || x<0 || y<0) throw Error('坐标超出视口');
       const e = hitAt(x,y);
-      if (!e || unavailable(e)) throw Error('目标不可用');
+      if (!e || unavailable(e) || !perceptible(e)) throw Error('目标不可用或不可见');
       // A full-page document coordinate may be covered by a sticky header after scrolling.
       if (fullPage && !original && ancestor(e,n=>['fixed','sticky'].includes(getComputedStyle(n).position)))
         throw Error('目标被遮挡：整页坐标落入固定/粘性元素，请用视口截图');
@@ -234,7 +237,7 @@
     },
     validateCoordinate() {
       const t = api.coordinateTarget;
-      if (!t || !t.e.isConnected || hitAt(t.x,t.y)!==t.e || fingerprint(t.e)!==t.fingerprint || !sameRect(t.rect,geometry(t.e)))
+      if (!t || !t.e.isConnected || unavailable(t.e) || !perceptible(t.e) || hitAt(t.x,t.y)!==t.e || fingerprint(t.e)!==t.fingerprint || !sameRect(t.rect,geometry(t.e)))
         throw Error('目标在准备期间已变化，请重新截图');
       return true;
     },

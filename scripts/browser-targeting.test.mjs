@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import { chromium } from 'playwright-core';
 const source = await readFile('src-tauri/src/native_browser_page.js','utf8');
-const baseline = process.env.BROWSER_BASELINE ? await readFile(process.env.BROWSER_BASELINE,'utf8') : null;
+const baselinePath = process.env.BROWSER_BASELINE || process.env.BROWSER_PAGE_BASELINE;
+const baseline = baselinePath ? await readFile(baselinePath,'utf8') : null;
 const browser = await chromium.launch({executablePath:process.env.TEST_BROWSER || '/usr/bin/chromium',headless:true,args:['--no-sandbox']});
 const reports=[];
 try {
@@ -81,6 +82,22 @@ try {
     assert.ok(events.some(e=>e.type==='dblclick'));assert.ok(events.filter(e=>e.type==='pointermove'&&e.buttons===1).length>=8);assert.ok(events.every(e=>e.trusted));assert.ok(events.some(e=>e.type==='wheel'&&e.deltaX===40));
     await page.evaluate(()=>{document.body.style.height='4000px';scrollTo(0,100);});
     await assert.rejects(evaluate(`__novaWebview.coordinate(${x},${y},${JSON.stringify(obs.stamp)},false)`),/视口已变化/);
+    await page.evaluate(()=>{scrollTo(0,0);document.body.insertAdjacentHTML('beforeend',`<div id="extra" style="position:fixed;inset:0;z-index:20;background:white"><div id="transparent"><button id="hidden-target">隐藏按钮</button></div><input readonly aria-label="只读字段"><input type="range" aria-label="滑动数值"><iframe id="scaled-frame" style="position:absolute;left:50px;top:250px;width:200px;height:100px;border:4px solid;transform-origin:0 0;transform:scale(1.5,1.25)"></iframe></div>`);});
+    obs=await observe();
+    const hidden=item('隐藏按钮');
+    await page.evaluate(()=>document.querySelector('#transparent').style.opacity='0');
+    await assert.rejects(prepare(hidden.ref),/不可见/);
+    assert.equal((await prepare(item('只读字段').ref)).editable,false);
+    assert.equal((await prepare(item('滑动数值').ref)).editable,false);
+    await assert.rejects(evaluate("__novaWebview.waitFor('invented','hidden','',0)"),/引用不存在/);
+    let mapped=await evaluate("__novaWebview.frameOwner(document.querySelector('#scaled-frame'),{x:100,y:50})");
+    assert.deepEqual(mapped,{x:206,y:317.5});
+    await page.evaluate(()=>document.querySelector('#scaled-frame').style.transform='rotate(5deg)');
+    await assert.rejects(evaluate("__novaWebview.frameOwner(document.querySelector('#scaled-frame'),{x:100,y:50})"),/旋转/);
+    await page.evaluate(()=>document.querySelector('#scaled-frame').style.transform='scale(1.5,1.25)');
+    await page.evaluate(()=>document.querySelector('#extra').insertAdjacentHTML('beforeend','<div style="position:absolute;left:150px;top:300px;width:150px;height:70px;background:red"></div>'));
+    await assert.rejects(evaluate("__novaWebview.frameOwner(document.querySelector('#scaled-frame'),{x:100,y:50})"),/遮挡/);
+    await page.evaluate(()=>document.querySelector('#extra').remove());
     reports.push({dpr,checks:'labels,disabled,shadow,nested-scroll,recycled-row,hover-move,focus-theft,wait-condition,canvas-doubleclick-drag-wheel',canvasPixels:[pixelWidth,pixelHeight],trustedCanvasEvents:events.length});
     await context.close();
   }
