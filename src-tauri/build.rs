@@ -45,11 +45,20 @@ fn main() {
     tauri_build::build();
     build_windows_shell_shim();
 
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
-        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
-    {
-        let resource =
-            std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("libresource.a");
-        println!("cargo:rustc-link-arg={}", resource.display());
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            // tauri-winres links its resource to application binaries, but not
+            // the libtest executable. Tao/rfd also use Common Controls v6 there.
+            // Without activation, Windows loads v5 and aborts before any test
+            // with STATUS_ENTRYPOINT_NOT_FOUND (e.g. TaskDialogIndirect).
+            // Generic link args cover libtest as well as the normal app; leave
+            // the existing Tauri manifest/icon/version resource in place.
+            println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+            println!("cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
+        } else if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+            let resource =
+                std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("libresource.a");
+            println!("cargo:rustc-link-arg={}", resource.display());
+        }
     }
 }
