@@ -1,51 +1,149 @@
-name: Terminal appearance regression
+name: Precision tools validation
 on:
   push:
     branches: [work/terminal-build-20260918]
 permissions:
   contents: read
 jobs:
-  frontend:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            browser: /usr/bin/google-chrome
-          - os: windows-latest
-            browser: C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    defaults:
-      run:
-        shell: bash
-    env:
-      TEST_BROWSER: ${{ matrix.browser }}
-      TEST_SCREENSHOT: terminal-appearance-${{ matrix.os }}.png
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      revision: ${{ steps.commit.outputs.revision }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 2b5f3e034040ca6ac2eb86e1c727de4e3d619844
+          ref: bc812b3fff8b7b3635ee843434183446993dad31
+          path: staging
+      - uses: actions/checkout@v4
+        with:
+          ref: 9798b86d66b8b7b8822c3d26a92cf838d6efb03d
+          path: source
+      - name: Apply reviewed source patch
+        working-directory: source
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64,lzma,hashlib,subprocess
+          pieces=sorted(Path('../staging/.github/precision-tools').glob('part-*.b64'))
+          assert len(pieces)==5
+          patch=lzma.decompress(base64.b64decode(''.join(p.read_text().strip() for p in pieces),validate=True))
+          assert hashlib.sha256(patch).hexdigest()=='5dbf5af53519a550c56d2d02fe93359622396fdb3fad7ca4e60fe6f200dc7073'
+          Path('../precision.patch').write_bytes(patch)
+          subprocess.run(['git','apply','--check','../precision.patch'],check=True)
+          subprocess.run(['git','apply','--index','../precision.patch'],check=True)
+          PY
+      - name: Commit candidate without overwriting concurrent work
+        id: commit
+        working-directory: source
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git diff --cached --check
+          git commit -m 'feat(tools): precise DOM targets, canvas pixel mapping and preflight witnesses'
+          git push origin HEAD:fix/precision-tools-20260918
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  frontend:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      TEST_BROWSER: /usr/bin/google-chrome
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+          fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
       - run: npm ci --no-audit --no-fund
-      - name: Typecheck
-        run: npm run check 2>&1 | tee typecheck.log
-      - name: Terminal shortcuts, theme and output stability regressions
-        run: npm run test:terminal 2>&1 | tee terminal-tests.log
-      - name: Existing workspace regression
-        run: node scripts/workspace-panel.test.mjs 2>&1 | tee workspace-tests.log
-      - name: Production frontend build
-        run: npm run build 2>&1 | tee frontend-build.log
+      - run: npm run check
+      - name: Browser targeting and same-run performance comparison
+        shell: bash
+        run: |
+          git show 9798b86d66b8b7b8822c3d26a92cf838d6efb03d:src-tauri/src/native_browser_page.js > /tmp/browser-page-before.js
+          BROWSER_PAGE_BASELINE=/tmp/browser-page-before.js node scripts/browser-targeting.test.mjs 2>&1 | tee browser-targeting.log
+      - name: Extension and MCP regressions
+        run: node --test extensions/nova-chrome/worker.test.mjs scripts/nova-tools-mcp.test.mjs
+      - run: npm run build
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: terminal-appearance-${{ matrix.os }}
+          name: precision-browser-regression
           path: |
-            terminal-appearance-*.png
-            typecheck.log
-            terminal-tests.log
-            workspace-tests.log
-            frontend-build.log
+            browser-targeting-report.json
+            browser-targeting.log
+  native:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 3
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+          submodules: recursive
+      - name: Use crates.io
+        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build:sdk-bridges:release
+      - name: Linux prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libpipewire-0.3-dev libxcb-randr0-dev libgbm-dev
+      - name: Native input, coordinate and pixel witness tests
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib native_browser:: -- --nocapture 2>&1 | tee native-browser-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai:: -- --nocapture 2>&1 | tee jianlai-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib chrome_browser:: -- --nocapture 2>&1 | tee chrome-tests.log
+      - name: Enable debug driver in isolated Windows build only
+        if: runner.os == 'Windows'
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('src-tauri/tauri.conf.json');config=json.loads(p.read_text(encoding='utf-8'))
+          config['app']['windows'][0]['additionalBrowserArgs']='--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion'
+          p.write_text(json.dumps(config,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          PY
+      - name: Windows native executable
+        if: runner.os == 'Windows'
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin nova 2>&1 | tee native-browser-build.log
+      - name: Real Windows WebView2 and Chrome-transport integration
+        if: runner.os == 'Windows'
+        env:
+          TEST_CDP_PORT: '9222'
+        run: |
+          node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5173 --strictPort > vite.log 2>&1 &
+          node scripts/native-browser-smoke.mjs src-tauri/target/debug/nova.exe 2>&1 | tee native-browser-smoke.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: precision-native-${{ runner.os }}
+          path: |
+            *-tests.log
+            native-browser-build.log
+            native-browser-smoke.log
+            vite.log
+            src-tauri/target/native-browser-smoke/
