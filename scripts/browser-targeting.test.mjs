@@ -42,6 +42,11 @@ try {
     assert.equal(item('不可用').disabled,true);
     await assert.rejects(prepare(item('不可用').ref),/不可用/);
     assert.equal(item('画布工作区').visual.bitmapWidth,1600);assert.equal(obs.visualRequired,true);
+    const visualQuery=await evaluate("__novaWebview.observe('canvas-query',20000,'only painted pixels')");
+    assert.equal(visualQuery.items.length,0);
+    assert.equal(visualQuery.visualRequired,true,'query must not hide Canvas visual feedback');
+    assert.equal(visualQuery.visualRegions[0].bitmapWidth,1600);
+    obs=await observe();
     await click(item('阴影按钮').ref);
     assert.ok(await page.evaluate(()=>clicks.at(-1).trusted));
     await click(item('滚动内目标').ref);

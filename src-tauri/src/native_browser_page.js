@@ -107,7 +107,7 @@
       const search=String(query).trim().toLocaleLowerCase();
       const regionCache=new WeakMap();
       const regionOf=e=>{const root=ancestor(e,e=>e.matches('form,section,[role=dialog],tr,nav'));if(!root)return '';if(!regionCache.has(root))regionCache.set(root,compact(root.innerText,160));return regionCache.get(root);};
-      const items = [], headings = [], declaredRows = [], shadowText = [], candidates = [];
+      const items = [], headings = [], declaredRows = [], shadowText = [], candidates = [], visualRegions = [];
       const containers = new Set(); let total = 0, scanned = 0, lazyImages = 0, scanTruncated = false;
       const queue = [document];
       // One composed-tree pass replaces repeated querySelectorAll('*') / shadow-root scans.
@@ -129,6 +129,14 @@
       }
       for (const e of candidates) {
         const name=label(e),region=regionOf(e);
+        // Canvas pixels are not searchable DOM text. A query for a drawn label
+        // must still return an image, even when no DOM candidate matches it.
+        if (e.tagName === 'CANVAS' && visualRegions.length < 128) {
+          const rect=geometry(e);
+          if (rect.width>0 && rect.height>0 && rect.x<innerWidth && rect.y<innerHeight
+            && rect.x+rect.width>0 && rect.y+rect.height>0 && perceptible(e))
+            visualRegions.push({kind:'canvas',name,viewportRect:rect,bitmapWidth:e.width,bitmapHeight:e.height});
+        }
         if(search && !`${name} ${region} ${e.href || ''}`.toLocaleLowerCase().includes(search)) continue;
         const r = e.getBoundingClientRect(), style = getComputedStyle(e);
         if (!r.width || !r.height || style.visibility === 'hidden' || style.visibility === 'collapse' || style.display === 'none' || Number(style.opacity)===0) continue;
@@ -151,9 +159,9 @@
           blockedBy:blocker ? compact(label(blocker) || blocker.tagName,180) : undefined});
       }
       const fullText = [document.body?.innerText || '', ...shadowText].join('\n');
-      const visualRequired = items.some(i => i.visual && i.inView && i.viewportRect.width>=96 && i.viewportRect.height>=48);
+      const visualRequired = visualRegions.some(i => i.viewportRect.width>=96 && i.viewportRect.height>=48);
       return {url:location.href,title:document.title,version,stamp:stamp(),text:fullText.slice(0,1000000),textLength:fullText.length,
-        items,totalItems:total,headings:headings.slice(0,1000),visualRequired,
+        items,totalItems:total,headings:headings.slice(0,1000),visualRequired,visualRegions,
         truncated:scanTruncated || total>items.length || fullText.length>1000000 || headings.length>1000,
         coverage:{query:search || undefined,scope:search?'query-matching loaded DOM, open shadow roots and nested scroll containers':'loaded DOM, open shadow roots and nested scroll containers',lazyImages,declaredRows:declaredRows.slice(0,1000),scanTruncated,
           note:'Canvas/WebGL pixels, closed shadow roots and unloaded virtual content are not DOM targets. Use returned screenshots and fresh imageId; do not invent refs.'},
