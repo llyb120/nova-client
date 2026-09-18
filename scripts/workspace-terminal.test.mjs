@@ -3,7 +3,7 @@ import { access, writeFile, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { chromium } from 'playwright-core';
 const name=`workspace-terminal-check-${process.pid}`;
-let server,browser;
+let server,browser,page;
 try {
   await writeFile(`${name}.html`,`<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
@@ -57,7 +57,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
   let executablePath;
   for(const path of [process.env.TEST_BROWSER,'/usr/bin/google-chrome','/usr/bin/chromium','C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'].filter(Boolean)){try{await access(path);executablePath=path;break;}catch{}}
   browser=await chromium.launch({executablePath,headless:true,args:['--no-sandbox']});
-  const page=await browser.newPage({viewport:{width:1280,height:800}});
+  page=await browser.newPage({viewport:{width:1280,height:800}});
   const errors=[];page.on('pageerror',error=>{errors.push(error.message);console.error(error.message);});
   page.setDefaultTimeout(15000);
   await page.goto(`http://127.0.0.1:${port}/${name}.html`,{waitUntil:'domcontentloaded'});
@@ -116,12 +116,13 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.getByRole('alert').getByText('test: shell not found',{exact:false}).waitFor();
   assert.equal(await page.evaluate(()=>window.termTest.status()),'error');
   await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
+  const beforeResize=await page.evaluate(()=>({count:window.termTest.resized.length,id:window.termTest.id(),last:window.termTest.resized.filter(s=>s.id===window.termTest.id()).at(-1)}));
   await page.setViewportSize({width:1000,height:640});
-  await page.waitForFunction(()=>window.termTest.resized.length>5);
+  await page.waitForFunction(before=>window.termTest.resized.slice(before.count).some(s=>s.id===before.id&&(s.cols!==before.last.cols||s.rows!==before.last.rows)),beforeResize);
   assert.ok(await page.evaluate(()=>window.termTest.resized.every(s=>s.cols>0&&s.rows>0)));
   if(process.env.TEST_SCREENSHOT)await page.screenshot({path:process.env.TEST_SCREENSHOT});
   await page.evaluate(()=>window.termTest.closeAll());
   await page.waitForFunction(()=>window.termTest.closed.length===window.termTest.created.length);
   assert.deepEqual(errors,[]);
   console.log('Workspace terminal: UTF-8, control keys, tabs, hide/remount, conversation retention, paste, spawn/close races, errors and resize passed');
-} finally { await browser?.close();server?.kill();await Promise.all([`${name}.html`,`${name}.tsx`].map(path=>rm(path,{force:true}))); }
+} catch(error) { if(process.env.TEST_SCREENSHOT&&page)await page.screenshot({path:process.env.TEST_SCREENSHOT}).catch(()=>{}); throw error; } finally { await browser?.close();server?.kill();await Promise.all([`${name}.html`,`${name}.tsx`].map(path=>rm(path,{force:true}))); }

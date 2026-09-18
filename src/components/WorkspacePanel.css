@@ -136,3 +136,7 @@
 .workspace-image-diff figcaption { margin-bottom: 4px; color: var(--text-muted); }
 .workspace-image-diff img { display: block; max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 6px; background: repeating-conic-gradient(color-mix(in srgb, var(--text) 6%, transparent) 0% 25%, transparent 0% 50%) 50% / 16px 16px; }
 .workspace-close-modal { width: min(380px, 92vw); }
+
+.workspace-panel .workspace-modes { flex-wrap:nowrap; }
+.workspace-panel .workspace-modes > button { flex:1 1 0; min-width:0; padding-inline:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.workspace-panel .workspace-modes > .workspace-panel-close { flex:0 0 26px; }

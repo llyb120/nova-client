@@ -8,8 +8,5 @@
 .workspace-terminal-status { display:flex; justify-content:space-between; gap:8px; min-height:24px; padding:3px 8px; border-top:1px solid var(--border); font-size:11px; color:var(--text-muted); }
 .workspace-terminal-status > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .workspace-terminal-status > span:first-child { flex:1; min-width:0; }
-.workspace-panel .workspace-modes { flex-wrap:nowrap; }
-.workspace-panel .workspace-modes > button { flex:1 1 0; min-width:0; padding-inline:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.workspace-panel .workspace-modes > .workspace-panel-close { flex:0 0 26px; }
 .home-terminal-panel { width:38%; max-width:70%; z-index:15; }
 @media (max-width:900px) { .home-terminal-panel { max-width:100%; } }

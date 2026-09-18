@@ -179,6 +179,9 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   await page.getByRole('button', {name:'打开面板'}).click();
   await page.getByRole('button', {name:/^产物 ·/}).click();
   await page.getByRole('region', {name:'会话产物'}).getByRole('button', {name:'README.md'}).click();
+  await page.getByRole('heading', {name:'Draft'}).waitFor();
+  await page.getByRole('button', {name:'编辑',exact:true}).click();
+  await page.getByRole('textbox', {name:'文件内容编辑'}).waitFor();
   assert.equal(await page.evaluate(() => window.testCode().state.doc.toString()), '# Draft\n');
   console.log('draft restored');
   await page.evaluate(() => window.changeDisk());
