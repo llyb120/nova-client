@@ -1,4 +1,4 @@
-name: Windows terminal runtime validation
+name: Windows terminal loader diagnosis
 on:
   push:
     branches: [work/terminal-build-20260918]
@@ -7,7 +7,7 @@ permissions:
 jobs:
   native:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     env:
       CARGO_BUILD_JOBS: 3
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 00327bfd57c1a94b50073f1ef8be082ba3054e97
+          ref: 29fc11fb6dc09589630da85c2af932f75cd279e6
           submodules: recursive
       - name: Use crates.io
         shell: bash
@@ -31,30 +31,47 @@ jobs:
           cache: npm
       - run: npm ci --no-audit --no-fund
       - run: npm run build:sdk-bridges:release
-      - name: Compile native terminal tests
+      - name: Compile unmodified native tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib workspace_terminal::tests --no-run
-      - name: Use matching MSVC runtime beside the test executable
+      - name: Compare identical executable before and after manifest embedding
         shell: pwsh
         run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products '*' -property installationPath
-          $redistRoot = Join-Path $vs 'VC\Redist\MSVC'
-          $crt = Get-ChildItem $redistRoot -Directory -Recurse | Where-Object { $_.Name -match '^Microsoft\.VC.*\.CRT$' -and $_.Parent.Name -eq 'x64' } | Sort-Object FullName -Descending | Select-Object -First 1
-          if (!$crt) { throw "MSVC x64 CRT not found under $redistRoot" }
-          Write-Host "Using CRT from $($crt.FullName)"
-          $destinations = @('src-tauri/target/debug/deps', 'src-tauri/target/debug')
-          foreach ($destination in $destinations) {
-            New-Item -ItemType Directory -Force $destination | Out-Null
-            Get-ChildItem $crt.FullName -Filter '*.dll' | ForEach-Object {
-              Write-Host "$($_.Name) $($_.VersionInfo.FileVersion) -> $destination"
-              Copy-Item $_.FullName $destination -Force
-            }
-          }
-      - name: Real PTY lifecycle tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib workspace_terminal::tests -- --nocapture
-      - name: Loader diagnostics on failure
-        if: failure()
-        shell: pwsh
-        run: |
-          Get-ChildItem src-tauri/target/debug/deps -Filter '*.dll' | ForEach-Object { Write-Host "$($_.Name) $($_.VersionInfo.FileVersion)" }
-          Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-20); Level=2} -ErrorAction SilentlyContinue | Select-Object -First 6 TimeCreated,Id,Message | Format-List
+          $ErrorActionPreference = 'Stop'
+          $exe = (Get-ChildItem src-tauri/target/debug/deps/nova_lib-*.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+          $mt = (Get-ChildItem '${{ runner.temp }}' -Filter 'not-used' -ErrorAction SilentlyContinue)
+          $mt = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter mt.exe -Recurse | Where-Object { $_.Directory.Name -eq 'x64' } | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (!$mt -or !$exe) { throw 'Missing test executable or mt.exe' }
+          $env:PROBE_EXE = $exe
+          $env:PROBE_MT = $mt
+          @'
+          import os, pathlib, subprocess, json
+          exe, mt = os.environ['PROBE_EXE'], os.environ['PROBE_MT']
+          results = []
+          def probe(label, args, timeout=60):
+              try:
+                  p = subprocess.run([exe, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+                  text = p.stdout.decode('utf-8', errors='replace')
+                  result = dict(label=label, code=p.returncode, hex=hex(p.returncode & 0xffffffff), output=text)
+              except subprocess.TimeoutExpired as e:
+                  result = dict(label=label, code='timeout', output=(e.stdout or b'').decode('utf-8', errors='replace'))
+              results.append(result)
+              print(json.dumps(result, ensure_ascii=False), flush=True)
+              pathlib.Path('windows-terminal-diagnosis.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+              return result['code'] == 0
+          probe('before-manifest', ['--list'], 15)
+          manifest = pathlib.Path('terminal-test.manifest')
+          manifest.write_text('''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+          <dependency><dependentAssembly><assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/></dependentAssembly></dependency>
+          </assembly>''', encoding='utf-8')
+          subprocess.run([mt, '-nologo', '-manifest', str(manifest), '-outputresource:' + exe + ';#1'], check=True)
+          ok = probe('after-manifest', ['--list'], 15)
+          for test in ['dimensions_and_arguments', 'real_pty_output_resize_and_exit', 'closing_a_running_terminal_releases_the_process_and_reader']:
+              ok = probe(test, ['workspace_terminal::tests::' + test, '--exact', '--nocapture'], 60) and ok
+          raise SystemExit(0 if ok else 1)
+          '@ | python -u -
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-terminal-diagnosis
+          path: windows-terminal-diagnosis.json
