@@ -20,14 +20,18 @@ let callback=0;
 window.__TAURI_INTERNALS__={transformCallback:()=>++callback};
 const created=[],closed=[],writes=[],resized=[],acknowledged=[];
 const channels=new Map(),pending=new Map();
-let deferred=false,fail=false,stops=0;
+let deferred=false,fail=false,stops=0,gatedResize=false;
+const resizeGates=new Map();
 terminalApi.create=async (id,threadId,cwd,cols,rows,channel)=>{
   created.push({id,threadId,cwd,cols,rows});channels.set(id,channel);
   if(fail){fail=false;throw Error('test: shell not found');}
   if(deferred){deferred=false;await new Promise(resolve=>pending.set(id,resolve));}
 };
 terminalApi.write=async(id,data)=>{writes.push({id,data});};
-terminalApi.resize=async(id,cols,rows)=>{resized.push({id,cols,rows});};
+terminalApi.resize=async(id,cols,rows)=>{
+  resized.push({id,cols,rows});
+  if(gatedResize){gatedResize=false;await new Promise(resolve=>resizeGates.set(id,resolve));}
+};
 terminalApi.ack=async(id,bytes)=>{acknowledged.push({id,bytes});};
 terminalApi.close=async id=>{closed.push(id);};
 api.listWorkspaceDirectory=async()=>({entries:[],truncated:false});
@@ -43,6 +47,8 @@ window.termTest={created,closed,writes,resized,acknowledged,
  switch:id=>{setState({currentId:id,cwd:'/project/'+id});setThread(id);},
  defer:()=>{deferred=true;},fail:()=>{fail=true;},resolve:id=>{pending.get(id)();pending.delete(id);},
  paste:text=>active().terminal.paste(text),stopCount:()=>stops,
+ gateResize:()=>{gatedResize=true;},hasResizeGate:id=>resizeGates.has(id),
+ releaseResize:id=>{resizeGates.get(id)?.();resizeGates.delete(id);},
  closeAll:async()=>{for(const id of ['a','b']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
 };
 function Fixture(){
@@ -126,6 +132,18 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.setViewportSize({width:1000,height:640});
   await page.waitForFunction(before=>window.termTest.resized.slice(before.count).some(s=>s.id===before.id&&(s.cols!==before.last.cols||s.rows!==before.last.rows)),beforeResize);
   assert.ok(await page.evaluate(()=>window.termTest.resized.every(s=>s.cols>0&&s.rows>0)));
+  // Windows can wait for a cursor response inside the first resize. Input
+  // and close must remain usable while that native resize is unresolved.
+  await page.evaluate(()=>window.termTest.gateResize());
+  await page.getByRole('button',{name:'新建终端',exact:true}).click();
+  await page.waitForFunction(()=>window.termTest.hasResizeGate(window.termTest.id()));
+  const gated=await page.evaluate(()=>window.termTest.id());
+  const beforeGatedQuery=await page.evaluate(()=>window.termTest.writes.length);
+  await page.evaluate(id=>window.termTest.send(id,{type:'data',data:[27,91,54,110]}),gated);
+  await page.waitForFunction(before=>window.termTest.writes.slice(before).some(w=>w.data.at(-1)===82),beforeGatedQuery);
+  await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
+  await page.waitForFunction(id=>window.termTest.closed.includes(id),gated);
+  await page.evaluate(id=>window.termTest.releaseResize(id),gated);
   if(process.env.TEST_SCREENSHOT)await page.screenshot({path:process.env.TEST_SCREENSHOT});
   await page.evaluate(()=>window.termTest.closeAll());
   await page.waitForFunction(()=>window.termTest.closed.length===window.termTest.created.length);

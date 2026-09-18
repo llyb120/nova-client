@@ -55,9 +55,12 @@ fn main() {
             // the existing Tauri manifest/icon/version resource in place.
             println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
             println!("cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
+            // Normal binaries already contain Tauri's RT_MANIFEST resource.
+            // Do not generate a second resource with the same ID for them.
+            println!("cargo:rustc-link-arg-bins=/MANIFEST:NO");
         } else if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
-            let resource =
-                std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("libresource.a");
+            let resource = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap())
+                .join("libresource.a");
             println!("cargo:rustc-link-arg={}", resource.display());
         }
     }
