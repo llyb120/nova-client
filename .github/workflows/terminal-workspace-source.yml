@@ -1,0 +1,22 @@
+name: Terminal workspace source snapshot
+on:
+  push:
+    branches: [work/terminal-sidebar-20260918]
+    paths: [.github/workflows/terminal-workspace-source.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive tracked source only
+        run: git archive --format=tar.gz --output="$RUNNER_TEMP/nova-source.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-source
+          path: ${{ runner.temp }}/nova-source.tar.gz
+          retention-days: 1
