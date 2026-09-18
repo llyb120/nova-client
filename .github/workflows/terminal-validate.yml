@@ -1,4 +1,4 @@
-name: Precision tools acceptance
+name: Precision tools full acceptance
 on:
   push:
     branches: [work/terminal-build-20260918]
@@ -14,24 +14,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a2c99152343588ccbc73e62774aea321b375850a
+          ref: 32b502baa6c1948f18fb0a760e92a9d324021d8b
           path: staging
       - uses: actions/checkout@v4
         with:
-          ref: cc46ac6e2edfe43e84414b73bf84c0c98868bb1f
+          ref: 3bb760c652a450424a8e0b64e0d97fd2bbef1378
           path: source
-      - name: Apply reviewed refinements
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply reviewed acceptance checks
         working-directory: source
-        run: python ../staging/.github/precision-tools/refine.py
+        run: |
+          python ../staging/.github/precision-tools/finalize.py
+          rustfmt --edition 2021 src-tauri/src/browser_pixels.rs src-tauri/src/visual_guard.rs
       - name: Commit candidate
         id: commit
         working-directory: source
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src-tauri/src/native_browser.rs src-tauri/src/native_browser_page.js scripts/browser-targeting.test.mjs
+          git add scripts/native-browser-smoke.mjs scripts/chrome-tool.json scripts/webview-tool.json src-tauri/src/jianlai.rs src-tauri/src/native_browser.rs src-tauri/src/browser_pixels.rs src-tauri/src/visual_guard.rs
           git diff --cached --check
-          git commit -m 'fix(tools): reject invisible targets and verify scaled iframe boundaries'
+          git commit -m 'test(tools): verify focus-safety and real desktop pixel witnesses'
           git push origin HEAD:fix/precision-tools-20260918
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   frontend:
@@ -44,7 +49,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.revision }}
-          fetch-depth: 3
+          fetch-depth: 4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -107,7 +112,10 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml --lib native_browser:: -- --nocapture 2>&1 | tee native-browser-tests.log
           cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai:: -- --nocapture 2>&1 | tee jianlai-tests.log
           cargo test --manifest-path src-tauri/Cargo.toml --lib chrome_browser:: -- --nocapture 2>&1 | tee chrome-tests.log
-      - name: Enable debug driver in isolated Windows build only
+      - name: Real Jianlai monitor crop and mouse-position guards
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::desktop_smoke -- --ignored --exact --nocapture 2>&1 | tee jianlai-desktop-tests.log
+      - name: Enable separate debug drivers in isolated Windows build only
         if: runner.os == 'Windows'
         run: |
           python - <<'PY'
@@ -116,6 +124,11 @@ jobs:
           p=Path('src-tauri/tauri.conf.json');config=json.loads(p.read_text(encoding='utf-8'))
           config['app']['windows'][0]['additionalBrowserArgs']='--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion'
           p.write_text(json.dumps(config,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          p=Path('src-tauri/src/native_browser.rs');s=p.read_text(encoding='utf-8')
+          old='.data_directory(state_dir(app).join("native-browser-profile"))'
+          assert s.count(old)==1
+          s=s.replace(old,old+'\n        .additional_browser_args("--remote-debugging-port=9223 --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion")')
+          p.write_text(s,encoding='utf-8')
           PY
       - name: Windows native executable
         if: runner.os == 'Windows'
@@ -124,6 +137,7 @@ jobs:
         if: runner.os == 'Windows'
         env:
           TEST_CDP_PORT: '9222'
+          TEST_CHILD_CDP_PORT: '9223'
         run: |
           node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5173 --strictPort > vite.log 2>&1 &
           node scripts/native-browser-smoke.mjs src-tauri/target/debug/nova.exe 2>&1 | tee native-browser-smoke.log
