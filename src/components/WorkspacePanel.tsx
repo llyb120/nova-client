@@ -11,7 +11,7 @@ import { api } from "../ipc";
 import { state } from "../store";
 import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
 import { workspaceLayout, setWorkspaceLayout, type WorkspaceMode } from "../workspaceLayout";
-import { collectWorkspaceArtifacts } from "../workspaceArtifacts";
+import { collectWorkspaceArtifacts, normalizeWorkspaceArtifacts } from "../workspaceArtifacts";
 import { absolutePath, createFileContextMenu } from "./FileContextMenu";
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconX, IconCopy, IconBrowser, IconGear, IconTerminal } from "./icons";
 import "./WorkspacePanel.css";
@@ -53,6 +53,10 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const mode = () => workspaceLayout.mode;
   const setMode = (mode: WorkspaceMode) => setWorkspaceLayout({ mode });
   const [artifacts, setArtifacts] = createSignal<string[]>([]);
+  const [artifactHistory, setArtifactHistory] = createSignal<string[]>([]);
+  const [artifactNotice, setArtifactNotice] = createSignal("");
+  let artifactRequest = 0;
+  onCleanup(() => { artifactRequest++; });
   const [artifactFilter, setArtifactFilter] = createSignal(remembered?.artifactFilter ?? "");
   const [tabs, setTabs] = createSignal<FileTab[]>(remembered?.tabs ?? []);
   const [expanded, setExpanded] = createSignal(new Set<string>(remembered?.expanded));
@@ -161,6 +165,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     setArtifacts([
     ...[...drafts].filter(([key]) => key.startsWith(`${props.threadId}\0`)).map(([, value]) => value.file.path),
     ...untrack(() => collectWorkspaceArtifacts(state.items)),
+    ...untrack(artifactHistory),
     ].filter(path => {
       let key = absolutePath(path).replace(/\\/g, '/').replace(/^\/\/\?\//, '');
       if (/^[a-z]:/i.test(key) || key.startsWith('//')) key = key.toLowerCase();
@@ -171,6 +176,23 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   // Restore artifacts when the history snapshot arrives, without subscribing to text deltas.
   createEffect(() => { state.items; state.items.length; state.loadingThread; if (!state.running[props.threadId]) refreshArtifacts(); });
   refreshArtifacts();
+  const loadArtifactHistory = async () => {
+    if (!state.history || mode() !== "artifacts") return;
+    const request = ++artifactRequest;
+    setArtifactNotice("正在读取历史产物索引…");
+    try {
+      const result = await api.getThreadArtifacts(props.threadId);
+      if (request !== artifactRequest || state.currentId !== props.threadId) return;
+      setArtifactHistory(normalizeWorkspaceArtifacts(result.paths)); refreshArtifacts();
+      setArtifactNotice(result.truncated ? "产物索引较大，仅显示最近的有界结果；其余仍可在历史记录中打开。" : "");
+    } catch (error) { if (request === artifactRequest) setArtifactNotice(String(error)); }
+  };
+  createEffect(() => {
+    const enabled = mode() === "artifacts";
+    const generation = state.history?.generation, turns = state.history?.stats.turns;
+    const running = state.running[props.threadId];
+    if (enabled && generation && !running) untrack(() => { void loadArtifactHistory(); });
+  });
   const snapshot = () => {
     const file = preview();
     if (!file) return;
@@ -511,6 +533,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       </div>
     </Show>
     <Show when={mode() === "artifacts"}><section class="workspace-artifact-strip" aria-label="会话产物">
+      <Show when={artifactNotice()}><span role="status">{artifactNotice()} <button onClick={() => void loadArtifactHistory()}>刷新历史产物</button></span></Show>
       <input aria-label="筛选会话产物" placeholder={`筛选本会话产物（${artifacts().length}）…`} value={artifactFilter()} onInput={e => setArtifactFilter(e.currentTarget.value)} />
       <div><For each={artifacts().filter(path => path.toLowerCase().includes(artifactFilter().toLowerCase()))}>{path => <button title={path} onClick={() => void open(path)} onContextMenu={e => menu.open(e, path)}><FileIcon path={path} /><span>{label(path)}</span><small aria-hidden="true">{path}</small></button>}</For>
         <Show when={!artifacts().length}><span class="workspace-artifact-empty">本会话尚无产物</span></Show>

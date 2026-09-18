@@ -50,3 +50,9 @@ export function collectWorkspaceArtifacts(items: readonly Item[]): string[] {
   }
   return [...paths];
 }
+
+/** Normalize a path-only native index through the same rules as visible items. */
+export function normalizeWorkspaceArtifacts(paths: readonly string[]): string[] {
+  return collectWorkspaceArtifacts([{ type: "tool", id: 0, ts: 0, status: "completed", kind: "write",
+    toolCallId: "history-artifacts", title: "", content: [], locations: paths.map(path => ({ path })) }]);
+}

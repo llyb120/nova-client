@@ -72,17 +72,29 @@ fn display_text(thread:&Thread,id:u64,text:&str,limit:usize)->String {
 /// A bounded, allocation-limited JSON display copy. It never serializes large
 /// raw values first merely to discover they exceed the UI budget.
 fn display_value(value:&Value,budget:&mut usize,depth:usize,deferred:&mut bool)->Value {
-    if *budget<64 || depth>12 {*deferred=true;return json!("[详情按需加载]");}
+    display_value_at(value,budget,depth,deferred,None,false)
+}
+fn display_value_at(value:&Value,budget:&mut usize,depth:usize,deferred:&mut bool,picture:Option<(&Thread,u64,&str)>,full:bool)->Value {
+    if *budget<64 || (!full && depth>12) {*deferred=true;return json!("[详情按需加载]");}
     *budget-=32;
     match value {
-        Value::String(s)=>{let text=bounded(s,(*budget).min(VALUE_BYTES));*deferred|=text.len()!=s.len();*budget=budget.saturating_sub(text.len());json!(text)},
-        Value::Array(a)=>{let mut out=Vec::new();for v in a {if *budget<64 {*deferred=true;break;}out.push(display_value(v,budget,depth+1,deferred));}Value::Array(out)},
+        Value::String(s)=>{let text=bounded(s,if full{*budget}else{(*budget).min(VALUE_BYTES)});*deferred|=text.len()!=s.len();*budget=budget.saturating_sub(text.len());json!(text)},
+        Value::Array(a)=>{let mut out=Vec::new();for (index,v) in a.iter().enumerate() {if *budget<64 {*deferred=true;break;}
+            let path=picture.map(|(_,_,path)|format!("{path}/{index}"));
+            out.push(display_value_at(v,budget,depth+1,deferred,picture.zip(path.as_deref()).map(|((t,id,_),path)|(t,id,path)),full));}Value::Array(out)},
         Value::Object(o)=>{
-            if o.get("type").and_then(Value::as_str)==Some("image") && o.get("data").and_then(Value::as_str).is_some() {
+            if o.get("type").and_then(Value::as_str)==Some("image")
+                && (o.get("data").and_then(Value::as_str).is_some() || o.get("uri").and_then(Value::as_str).is_some_and(|s|s.starts_with("file://"))) {
+                if let Some((thread,id,path))=picture {
+                    let source=base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path);
+                    return json!({"type":"image","mimeType":o.get("mimeType").or_else(||o.get("mime_type")).and_then(Value::as_str).unwrap_or("image/png"),
+                        "uri":format!("nova-history://{}/{}/{id}/p/{source}",thread.id,thread.items.generation())});
+                }
                 *deferred=true;return json!({"type":"text","text":"[原图保留，展开详情查看图片]"});
             }
             let mut out=serde_json::Map::new();for (key,v) in o {if *budget<64 {*deferred=true;break;}if key.len()>256 {*deferred=true;continue;}
-                *budget=budget.saturating_sub(key.len());out.insert(key.clone(),display_value(v,budget,depth+1,deferred));}Value::Object(out)
+                *budget=budget.saturating_sub(key.len());let path=picture.map(|(_,_,path)|format!("{path}/{}",key.replace('~',"~0").replace('/',"~1")));
+                out.insert(key.clone(),display_value_at(v,budget,depth+1,deferred,picture.zip(path.as_deref()).map(|((t,id,_),path)|(t,id,path)),full));}Value::Object(out)
         },_=>value.clone(),
     }
 }
@@ -107,13 +119,13 @@ pub fn project_item(thread:&Thread,item:&Item,index:usize,full:bool)->Value {
         Item::Turn{..}=>serde_json::to_value(item).expect("serializable turn"),
         Item::Tool{id,ts,call}=>{
             let mut budget=if full {usize::MAX} else {VALUE_BYTES};
-            let content:Vec<Value>=call.content.iter().take(if full{usize::MAX}else{128}).map(|v|display_value(v,&mut budget,0,&mut deferred)).collect();
+            let content:Vec<Value>=call.content.iter().take(if full{usize::MAX}else{128}).enumerate().map(|(i,v)|display_value_at(v,&mut budget,0,&mut deferred,Some((thread,*id,&format!("content/{i}"))),full)).collect();
             deferred|=content.len()!=call.content.len();
-            let locations:Vec<Value>=call.locations.iter().take(128).map(|v|display_value(v,&mut budget,0,&mut deferred)).collect();
+            let locations:Vec<Value>=call.locations.iter().take(if full{usize::MAX}else{128}).enumerate().map(|(i,v)|display_value_at(v,&mut budget,0,&mut deferred,Some((thread,*id,&format!("locations/{i}"))),full)).collect();
             deferred|=locations.len()!=call.locations.len();
-            let raw_input=call.raw_input.as_ref().map(|v|display_value(v,&mut budget,0,&mut deferred));
-            let raw_output=call.raw_output.as_ref().map(|v|display_value(v,&mut budget,0,&mut deferred));
-            json!({"type":"tool","id":id,"ts":ts,"toolCallId":call.tool_call_id,"title":bounded(&call.title,2048),"kind":call.kind,
+            let raw_input=call.raw_input.as_ref().map(|v|display_value_at(v,&mut budget,0,&mut deferred,Some((thread,*id,"rawInput")),full));
+            let raw_output=call.raw_output.as_ref().map(|v|display_value_at(v,&mut budget,0,&mut deferred,Some((thread,*id,"rawOutput")),full));
+            json!({"type":"tool","id":id,"ts":ts,"toolCallId":call.tool_call_id,"title":bounded(&call.title,if full{usize::MAX}else{2048}),"kind":call.kind,
                 "status":call.status,"content":content,"locations":locations,"rawInput":raw_input,"rawOutput":raw_output})
         },
     };
@@ -147,7 +159,8 @@ pub fn page(thread:&Thread,request:PageRequest)->Result<HistoryPage,String> {
     if !matches!(direction,"before"|"after"){return Err("历史分页方向无效".into());}
     let around=match request.around_id {Some(id)=>Some(thread.items.iter().position(|i|i.id()==id).ok_or("消息不存在或已恢复")?),None=>None};
     if around.is_some()&&request.cursor.is_some(){return Err("aroundId 与 cursor 不能同时使用".into());}
-    let boundary=if let Some(index)=around {(index+limit/2).min(len)} else if let Some(c)=&request.cursor {parse_cursor(&thread.items,c)?} else {len};
+    // An aroundId request ends at the target, so byte limits can never exclude it.
+    let boundary=if let Some(index)=around {index+1} else if let Some(c)=&request.cursor {parse_cursor(&thread.items,c)?} else {len};
     let (mut start,mut end)=(boundary,boundary);let mut bytes=0;let mut selected=Vec::new();
     for i in 0..limit {
         let index=if direction=="after" && around.is_none() {boundary+i} else {let Some(index)=boundary.checked_sub(i+1)else{break};index};
@@ -160,6 +173,15 @@ pub fn page(thread:&Thread,request:PageRequest)->Result<HistoryPage,String> {
             if let Some(images)=value.get_mut("images").and_then(Value::as_array_mut){images.truncate(4);}
             for key in ["text","content","rawInput","rawOutput","locations"] {if value.get(key).is_some(){value[key]=match key {"text"=>json!(bounded(value[key].as_str().unwrap_or(""),512)),"content"|"locations"=>json!([]),_=>Value::Null};}}
             value["detailDeferred"]=json!(true);size=serde_json::to_vec(&value).map_err(|e|e.to_string())?.len();
+            if size>budget {
+                // Pathological names, MIME strings and structured metadata must
+                // not produce an empty, non-advancing page at the minimum budget.
+                if let Some(object)=value.as_object_mut(){for (key,field) in object.iter_mut(){match field {
+                    Value::String(text)=>*text=bounded(text,if key=="text"{256}else{128}),
+                    Value::Array(values)=>values.clear(), Value::Object(values)=>values.clear(),_=>{},
+                }}}
+                size=serde_json::to_vec(&value).map_err(|e|e.to_string())?.len();
+            }
         }
         if bytes+size>budget {break;}
         bytes+=size;selected.push(value);start=start.min(index);end=end.max(index+1);
@@ -188,7 +210,7 @@ pub async fn get_thread_display_items(app:AppHandle,thread_id:String,ids:Vec<u64
         let wanted:std::collections::HashSet<u64>=ids.into_iter().collect();let mut result=Vec::new();
         // Most streaming updates are in the last chunk; scan from the tail and
         // stop as soon as all requested identities have been found.
-        for (index,item) in thread.items.iter().enumerate().rev() {
+        for (index,item) in thread.items.iter().enumerate().rev().take(if wanted.is_empty(){0}else{usize::MAX}) {
             if wanted.contains(&item.id()){result.push(project_item(&thread,item,index,false));if result.len()==wanted.len(){break;}}
         }
         result.sort_by_key(|v|v["historyIndex"].as_u64().unwrap_or(0));
@@ -196,14 +218,14 @@ pub async fn get_thread_display_items(app:AppHandle,thread_id:String,ids:Vec<u64
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]
-pub async fn get_thread_item_detail(app:AppHandle,thread_id:String,item_id:u64)->Result<Value,String> {
+pub async fn get_thread_item_detail(app:AppHandle,thread_id:String,item_id:u64,generation:Option<String>)->Result<Value,String> {
     tauri::async_runtime::spawn_blocking(move||{
         let thread=snapshot(&app,&thread_id)?;
+        if generation.as_deref().is_some_and(|g|g!=thread.items.generation()){return Err("HISTORY_CHANGED: 历史已恢复或编辑，请重新打开详情".into());}
         let (index,item)=thread.items.iter().enumerate().find(|(_,i)|i.id()==item_id).ok_or("消息不存在")?;
         // Explicit details are lossless text/JSON. User originals are addressed
         // by refs so opening a text editor does not decode every attachment.
-        let mut value=serde_json::to_value(item).map_err(|e|e.to_string())?;
-        if let Item::User{..}=item {value=project_item(&thread,item,index,true);}
+        let mut value=project_item(&thread,item,index,true);
         value["historyIndex"]=json!(index);Ok(value)
     }).await.map_err(|e|e.to_string())?
 }
@@ -215,14 +237,86 @@ pub async fn get_thread_outline(app:AppHandle,thread_id:String)->Result<Value,St
         Ok(json!({"generation":thread.items.generation(),"prompts":prompts,"stats":thread.items.stats()}))
     }).await.map_err(|e|e.to_string())?
 }
+
+struct ArtifactIndex { paths: Vec<String>, seen: std::collections::HashSet<String>, bytes: usize, truncated: bool }
+impl ArtifactIndex {
+    fn add(&mut self, value: Option<&str>) {
+        let Some(path)=value else{return};
+        if path.is_empty() || path.starts_with("data:") || path.starts_with("http:") || path.starts_with("https:") || path.starts_with('#') {return;}
+        if self.paths.len()>=5000 || path.len()>8192 || self.bytes+path.len()>512*1024 {self.truncated=true;return;}
+        if self.seen.insert(path.to_owned()) {self.paths.push(path.to_owned());self.bytes+=path.len();}
+    }
+    fn generated(&mut self,value:&Value,depth:usize) {
+        if depth>6 {return;}
+        match value {
+            Value::String(text)=>{
+                let text=text.trim();
+                if text.starts_with('{') || text.starts_with('[') {
+                    if text.len()>1024*1024 {self.truncated=true;return;}
+                    if let Ok(value)=serde_json::from_str::<Value>(text){self.generated(&value,depth+1);}
+                }
+            },
+            Value::Array(items)=>for item in items {self.generated(item,depth+1);},
+            Value::Object(map)=>{
+                if map.get("markdown").and_then(Value::as_str).is_some_and(|s|s.contains("![")) {self.add(map.get("path").and_then(Value::as_str));}
+                for (key,value) in map {if key!="data" {self.generated(value,depth+1);}}
+            },_=>{},
+        }
+    }
+}
+fn artifact_index(thread:&Thread)->Value {
+    static LINKS:OnceLock<regex::Regex>=OnceLock::new();
+    let links=LINKS.get_or_init(||regex::Regex::new(r"!?\[[^\]]*\]\((?:<([^>]+)>|([^\s()]*(?:\([^()]*\)[^\s()]*)*))\)").unwrap());
+    let mut index=ArtifactIndex {paths:Vec::new(),seen:std::collections::HashSet::new(),bytes:0,truncated:false};
+    for item in thread.items.iter().rev() {
+        if index.paths.len()>=5000 || index.bytes>=512*1024 {index.truncated=true;break;}
+        match item {
+            Item::Assistant{text,..}=>for capture in links.captures_iter(text) {index.add(capture.get(1).or_else(||capture.get(2)).map(|s|s.as_str()));},
+            Item::Tool{call,..} if call.status=="completed"=>{
+                for value in &call.content {if value["type"]=="diff" {index.add(value["path"].as_str());}index.generated(value,0);}
+                if let Some(value)=&call.raw_output {index.generated(value,0);}
+                if matches!(call.kind.as_str(),"edit"|"write"|"create"|"file_change") {
+                    for location in &call.locations {index.add(location["path"].as_str());}
+                    if let Some(input)=&call.raw_input {
+                        index.add(input.get("path").or_else(||input.get("file_path")).or_else(||input.get("filePath")).and_then(Value::as_str));
+                        if let Some(files)=input["files"].as_array() {for file in files {index.add(file.get("path").or_else(||file.get("file_path")).and_then(Value::as_str));}}
+                    }
+                }
+            },_=>{},
+        }
+    }
+    json!({"generation":thread.items.generation(),"paths":index.paths,"truncated":index.truncated})
+}
+#[tauri::command]
+pub async fn get_thread_artifacts(app:AppHandle,thread_id:String)->Result<Value,String> {
+    tauri::async_runtime::spawn_blocking(move||{let thread=snapshot(&app,&thread_id)?;Ok(artifact_index(&thread))}).await.map_err(|e|e.to_string())?
+}
 fn resolve_picture(app:&AppHandle,reference:&str)->Result<PromptImage,String> {
     let parts:Vec<&str>=reference.strip_prefix("nova-history://").ok_or("附件引用无效")?.split('/').collect();
     if parts.len()!=5 {return Err("附件引用无效".into());}
     let thread=snapshot(app,parts[0])?;
     if thread.items.generation()!=parts[1]{return Err("历史已变化，请重新打开图片".into());}
     let id:u64=parts[2].parse().map_err(|_|"附件消息ID无效")?;
-    let index:usize=parts[4].parse().map_err(|_|"附件序号无效")?;
     let item=thread.items.iter().find(|i|i.id()==id).ok_or("图片所属消息不存在")?;
+    if parts[3]=="p" {
+        if parts[4].len()>12000 {return Err("图片路径过长".into());}
+        let bytes=base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[4]).map_err(|_|"图片路径编码无效")?;
+        if bytes.len()>8192 {return Err("图片路径过长".into());}
+        let path=std::str::from_utf8(&bytes).map_err(|_|"图片路径编码无效")?;
+        let Item::Tool{call,..}=item else{return Err("消息不是工具结果".into());};
+        let (field,tail)=path.split_once('/').unwrap_or((path,""));
+        let (root,tail)=match field {
+            "content"|"locations"=>{let (index,rest)=tail.split_once('/').unwrap_or((tail,""));let index:usize=index.parse().map_err(|_|"图片路径无效")?;
+                ((if field=="content"{&call.content}else{&call.locations}).get(index),rest)},
+            "rawInput"=>(call.raw_input.as_ref(),tail),"rawOutput"=>(call.raw_output.as_ref(),tail),_=>return Err("图片路径无效".into()),
+        };
+        let root=root.ok_or("图片结果已变化")?;
+        let image=if tail.is_empty(){Some(root)}else{root.pointer(&format!("/{tail}"))}.ok_or("图片结果已变化")?;
+        if image["type"]!="image" {return Err("引用不是图片".into());}
+        return Ok(PromptImage{name:"工具图片".into(),mime_type:image.get("mimeType").or_else(||image.get("mime_type")).and_then(Value::as_str).unwrap_or("image/png").into(),
+            data:image.get("data").and_then(Value::as_str).map(str::to_owned),uri:image.get("uri").and_then(Value::as_str).map(str::to_owned),size:None});
+    }
+    let index:usize=parts[4].parse().map_err(|_|"附件序号无效")?;
     if parts[3]=="u" {if let Item::User{images,..}=item {return images.get(index).cloned().ok_or_else(||"附件不存在".into());}}
     if parts[3]=="m" {
         let text=match item {Item::Assistant{text,..}|Item::Thought{text,..}=>text,_=>return Err("消息不是图片来源".into())};
@@ -276,9 +370,41 @@ mod tests {
         assert_eq!(p.thread["items"][0]["detailDeferred"],true);assert!(p.thread["items"][0]["images"][0].get("data").is_none());
         assert_eq!(t.items.stats().inline_asset_bytes,10_000_000);
     }
+    #[test] fn artifact_index_covers_offscreen_history_without_shipping_image_data() {
+        let mut t=thread(0);
+        t.items.push(Item::Assistant{id:1,text:"[old report](old/report.md) ![photo](data:image/png;base64,AAAA)".into(),ts:0});
+        t.items.push(serde_json::from_value(json!({"type":"tool","id":2,"ts":0,"toolCallId":"artifact","kind":"write","status":"completed","content":[{"type":"diff","path":"src/result.rs"},{"type":"image","data":"A".repeat(2000000)}],"locations":[{"path":"out.json"}]})).unwrap());
+        let result=artifact_index(&t);
+        assert_eq!(result["paths"],json!(["src/result.rs","out.json","old/report.md"]));
+        assert!(serde_json::to_vec(&result).unwrap().len()<512);
+    }
     #[test] fn append_keeps_cursor_restore_invalidates_it() {
         let mut t=thread(300);let before=page(&t,PageRequest::default()).unwrap().before_cursor;
         t.items.push(Item::Assistant{id:301,text:"new".into(),ts:0});assert!(page(&t,PageRequest{cursor:before.clone(),..Default::default()}).is_ok());
         t.items.truncate(250);assert!(page(&t,PageRequest{cursor:before,..Default::default()}).unwrap_err().contains("HISTORY_CHANGED"));
+    }
+    #[test]
+    fn around_target_survives_a_tiny_budget_and_pathological_attachment_metadata() {
+        let mut t=Thread::new("test".into(),AgentKind::Lyra,None,None,None,false);
+        for id in 0..100 {t.items.push(Item::Assistant{id,text:"x".repeat(50000),ts:0});}
+        let p=page(&t,PageRequest{around_id:Some(10),byte_limit:Some(4096),..Default::default()}).unwrap();
+        assert!(p.thread["items"].as_array().unwrap().iter().any(|i|i["id"]==10));
+        assert!(p.start<p.end); assert!(p.payload_bytes<=4096);
+        t.items.push(Item::User{id:101,text:"large attachments".into(),images:vec![PromptImage{name:"名".repeat(50000),mime_type:"image/png".repeat(50000),data:Some("AAA".repeat(100000)),uri:None,size:None}],ts:0});
+        let p=page(&t,PageRequest{byte_limit:Some(4096),..Default::default()}).unwrap();
+        assert_eq!(p.thread["items"][0]["id"],101);assert!(p.payload_bytes<=4096);
+    }
+    #[test]
+    fn tool_pictures_are_lazy_refs_and_explicit_text_details_are_not_clipped() {
+        let t=Thread::new("test".into(),AgentKind::Lyra,None,None,None,false);
+        let input="原始参数".repeat(15000);
+        let item:Item=serde_json::from_value(json!({"type":"tool","id":5,"toolCallId":"call","title":"Screenshot","kind":"read","status":"completed","ts":0,
+            "content":[{"type":"content","content":{"type":"image","data":"A".repeat(2000000),"mimeType":"image/png"}}],"locations":[],"rawInput":input})).unwrap();
+        let display=project_item(&t,&item,0,false);
+        assert!(display["content"][0]["content"]["uri"].as_str().unwrap().starts_with("nova-history://"));
+        assert!(display["content"][0]["content"].get("data").is_none());assert_eq!(display["detailDeferred"],true);
+        let full=project_item(&t,&item,0,true);assert_eq!(full["rawInput"],input);
+        assert!(full["content"][0]["content"].get("data").is_none());
+        let Item::Tool{call,..}=item else{panic!()};assert_eq!(call.content[0]["content"]["data"].as_str().unwrap().len(),2000000);
     }
 }

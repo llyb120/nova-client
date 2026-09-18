@@ -3113,12 +3113,15 @@ fn create_time_machine_checkpoint(
 }
 
 #[tauri::command]
-fn get_time_machine_timeline(
-    state: State<'_, AppState>,
+async fn get_time_machine_timeline(
+    app: tauri::AppHandle,
     thread_id: String,
 ) -> Result<Option<time_machine::TimelineView>, String> {
-    let _guard = state.time_machine_lock.lock().unwrap();
-    time_machine::get_timeline(&state.config_dir, &thread_id)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _guard = state.time_machine_lock.lock().unwrap();
+        time_machine::get_timeline(&state.config_dir, &thread_id)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -3937,6 +3940,8 @@ fn truncate_thread(
     if running_by_id(&state, &thread_id) {
         return Err("会话正在运行，请先停止".into());
     }
+    // Resolve UI attachment references before truncation invalidates their generation.
+    let images = crate::history_page::resolve_images(&app, images.unwrap_or_default())?;
     // 与手动恢复保持相同的锁顺序，保证编辑分叉和恢复不会交叉写时间线或项目文件。
     let _time_machine_guard = state.time_machine_lock.lock().unwrap();
     let capture_workspace = state.settings.lock().unwrap().checkpoint_enabled;
@@ -4026,7 +4031,6 @@ fn truncate_thread(
     }
 
     let _ = app.emit(acp::EV_THREADS, json!({}));
-    let images = images.unwrap_or_default();
     let prompt_text = text.unwrap_or_default().trim().to_string();
     let prompt = (!prompt_text.is_empty() || !images.is_empty()).then_some(prompt_text);
     if prompt.is_some() {
@@ -5666,6 +5670,7 @@ pub fn run() {
             history_page::get_thread_display_items,
             history_page::get_thread_item_detail,
             history_page::get_thread_outline,
+            history_page::get_thread_artifacts,
             history_page::get_history_image,
             list_clue_groups,
             get_clue_context,

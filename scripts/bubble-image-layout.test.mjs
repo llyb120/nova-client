@@ -42,7 +42,7 @@ test("长提示词流式重排复用换行，绘制数量仅随视口高度增�
   const copied = [];
   const layout = new Function("wrapUserText", "measure", "layoutBubbleImages", "navigator", `
     const userTextLayouts = new WeakMap();
-    const copiedCodeUntil = new Map(), requestPaint = () => {};
+    const copiedCodeUntil = new Map(), requestPaint = () => {}, fullUserItem = async item => item;
     return async (item, contentW = 800, font = 'sans', open = true) => {
       const p = { sans: font }, result = [], side = 0, gi = 0, loadImage = () => null;
       let y = 20;
@@ -90,6 +90,7 @@ test("长提示词流式重排复用换行，绘制数量仅随视口高度增�
   assert.equal(preview.actions.length, 2);
   for (const action of preview.actions) assert.ok(action.y >= preview.y + preview.h, '展开与复制均在气泡下方');
   preview.copyFullText();
+  await new Promise(resolve => setTimeout(resolve, 0));
   assert.deepEqual(copied, [item.text], '折叠状态仍能复制完整原文');
   assert.equal(preview.data.editItem, item, '编辑/重发保留原始消息');
 });
@@ -125,6 +126,7 @@ test("图片完成加载但气泡尚未重排时不使用旧位置绘制新尺�
   const draws = [];
   let rebuilds = 0;
   const paint = new Function("loadImage", "scheduleRebuild", "roundRect", `
+    const viewH = 600;
     ${js(section("const BUBBLE_IMG_MAX_W", "function promptImageSrc("))}
     ${js(section("function bubbleImageSize(", "interface BubbleImageLayout"))}
     ${js(section("  function paintUserBubble(", "  function ").replace(/\s+$/, ""))}

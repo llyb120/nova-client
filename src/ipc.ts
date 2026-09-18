@@ -1,3 +1,4 @@
+import type { HistoryPage, HistoryPageRequest, HistoryDisplayUpdate, HistoryOutline, HistoryAsset } from "./historyTypes";
 import { invoke } from "@tauri-apps/api/core";
 import type { ExclusiveChatIdentity } from "./components/ExclusiveChatMark";
 import type {
@@ -61,7 +62,18 @@ export const api = {
   imageCommandContext: (configured: boolean, images: PromptImage[] = []) => invoke<{ configPath: string; models: string[]; referenceImages: string[] }>("image_command_context", { configured, images }),
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
   loadThreads: () => invoke<[ThreadMeta[], Thread[]]>("load_threads"),
+  /** Full history is reserved for explicit export/context operations, not chat rendering. */
   getThread: (threadId: string) => invoke<Thread>("get_thread", { threadId }),
+  getThreadPage: (threadId: string, request: HistoryPageRequest = {}) =>
+    invoke<HistoryPage>("get_thread_page", { threadId, request }),
+  getThreadDisplayItems: (threadId: string, generation: string, ids: number[]) =>
+    invoke<HistoryDisplayUpdate>("get_thread_display_items", { threadId, generation, ids }),
+  getThreadItemDetail: (threadId: string, itemId: number, generation?: string) =>
+    invoke<import('./types').Item>("get_thread_item_detail", { threadId, itemId, generation }),
+  getThreadArtifacts: (threadId: string) => invoke<{ generation: string; paths: string[]; truncated: boolean }>("get_thread_artifacts", { threadId }),
+  getThreadOutline: (threadId: string) => invoke<HistoryOutline>("get_thread_outline", { threadId }),
+  getHistoryImage: (reference: string, maxEdge = 480, original = false) =>
+    invoke<HistoryAsset>("get_history_image", { reference, maxEdge, original }),
   createTimeMachineCheckpoint: (threadId: string) =>
     invoke<TimeMachineTimeline>("create_time_machine_checkpoint", { threadId }),
   getTimeMachineTimeline: (threadId: string) =>
