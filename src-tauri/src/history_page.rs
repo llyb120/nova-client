@@ -177,7 +177,7 @@ pub fn page(thread:&Thread,request:PageRequest)->Result<HistoryPage,String> {
                 // Pathological names, MIME strings and structured metadata must
                 // not produce an empty, non-advancing page at the minimum budget.
                 if let Some(object)=value.as_object_mut(){for (key,field) in object.iter_mut(){match field {
-                    Value::String(text)=>*text=bounded(text,if key=="text"{256}else{128}),
+                    Value::String(text)=>*text=bounded(text,if key=="text"{256}else{128}).to_owned(),
                     Value::Array(values)=>values.clear(), Value::Object(values)=>values.clear(),_=>{},
                 }}}
                 size=serde_json::to_vec(&value).map_err(|e|e.to_string())?.len();
@@ -385,7 +385,7 @@ mod tests {
     }
     #[test]
     fn around_target_survives_a_tiny_budget_and_pathological_attachment_metadata() {
-        let mut t=Thread::new("test".into(),AgentKind::Lyra,None,None,None,false);
+        let mut t=Thread::new("test".into(),crate::threads::AgentKind::Lyra,None,None,None,false);
         for id in 0..100 {t.items.push(Item::Assistant{id,text:"x".repeat(50000),ts:0});}
         let p=page(&t,PageRequest{around_id:Some(10),byte_limit:Some(4096),..Default::default()}).unwrap();
         assert!(p.thread["items"].as_array().unwrap().iter().any(|i|i["id"]==10));
@@ -396,7 +396,7 @@ mod tests {
     }
     #[test]
     fn tool_pictures_are_lazy_refs_and_explicit_text_details_are_not_clipped() {
-        let t=Thread::new("test".into(),AgentKind::Lyra,None,None,None,false);
+        let t=Thread::new("test".into(),crate::threads::AgentKind::Lyra,None,None,None,false);
         let input="原始参数".repeat(15000);
         let item:Item=serde_json::from_value(json!({"type":"tool","id":5,"toolCallId":"call","title":"Screenshot","kind":"read","status":"completed","ts":0,
             "content":[{"type":"content","content":{"type":"image","data":"A".repeat(2000000),"mimeType":"image/png"}}],"locations":[],"rawInput":input})).unwrap();
