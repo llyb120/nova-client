@@ -1,4 +1,7 @@
-// Windows-only end-to-end test. Build the debug app first; no IPC or PTY mocks.
+// Windows-only end-to-end test; no IPC or PTY mocks.
+// Build a debug test copy with app.windows[0].additionalBrowserArgs set to
+// "--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1".
+// Never enable that debugging port in distributed builds.
 // Usage: node scripts/windows-terminal-smoke.mjs [src-tauri/target/debug/nova.exe]
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -16,11 +19,12 @@ await access(executable);
 const root = await mkdtemp(path.join(tmpdir(), 'nova-terminal-smoke-'));
 const project = path.join(root, 'project with spaces 中文');
 await mkdir(project);
-const marker = `nova-native-${randomUUID()}`;
+// A short random sentinel still proves real shell output without depending on column width.
+const marker = `nova-native-${randomUUID().slice(0, 8)}`;
 const port = Number(process.env.TEST_CDP_PORT || 9222);
 const report = [];
 const appLogs = [];
-let server, app, browser, page;
+let server, app, browser, page, connectionError;
 const bounded = (promise, message, milliseconds = 45000) => {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => {
@@ -42,10 +46,10 @@ try {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1000) });
       if (response.ok) { browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`); break; }
-    } catch { /* WebView2 is still starting. */ }
+    } catch (error) { connectionError = String(error); }
     await delay(500);
   }
-  assert.ok(browser, 'WebView2 did not start its debugging endpoint');
+  assert.ok(browser, 'WebView2 debugging connection failed: ' + connectionError);
   const context = browser.contexts()[0];
   page = context.pages()[0] || await context.waitForEvent('page');
   page.setDefaultTimeout(30000);
