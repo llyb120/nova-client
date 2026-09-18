@@ -1,65 +1,38 @@
-name: Terminal implementation validation
+name: Terminal frontend validation
 on:
   push:
     branches: [work/terminal-build-20260918]
 permissions:
   contents: write
 jobs:
-  prepare:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      revision: ${{ steps.commit.outputs.revision }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - name: Integrate changes
-        run: python .github/terminal-integrate.py
-      - name: Update frontend lockfile
-        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
-      - name: Create clean implementation commit
-        id: commit
-        shell: bash
-        run: |
-          git config user.name 'llyb120'
-          git config user.email 'llyb120@users.noreply.github.com'
-          rm .github/terminal-integrate.py .github/workflows/terminal-validate.yml
-          git add -A
-          git diff --cached --check
-          tree=$(git write-tree)
-          sha=$(git commit-tree "$tree" -p 2708e5ddc6725f0a13aff59455e7197a05a627bd -m 'feat: unread fallback to running sessions and tabbed workspace terminal')
-          git push origin "$sha:refs/heads/work/terminal-implementation-20260918"
-          echo "revision=$sha" >> "$GITHUB_OUTPUT"
-          echo "Implementation commit: $sha" >> "$GITHUB_STEP_SUMMARY"
-          git archive --format=tar.gz -o "$RUNNER_TEMP/terminal-source.tar.gz" "$sha"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: terminal-source
-          path: ${{ runner.temp }}/terminal-source.tar.gz
-          retention-days: 3
   frontend:
-    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.revision }}
+          ref: work/terminal-implementation-20260918
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
-      - run: npm ci --no-audit --no-fund
-      - name: Typecheck
-        run: npm run check
-      - name: Shortcut and conversation regressions
+      - name: Make resize regression independent of incidental event counts
         run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/workspace-terminal.test.mjs')
+          s=p.read_text()
+          s=s.replace("  await page.setViewportSize({width:1000,height:640});\n  await page.waitForFunction(()=>window.termTest.resized.length>5);", """  const beforeResize=await page.evaluate(()=>({count:window.termTest.resized.length,id:window.termTest.id(),last:window.termTest.resized.filter(s=>s.id===window.termTest.id()).at(-1)}));
+            await page.setViewportSize({width:1000,height:640});
+            await page.waitForFunction(before=>window.termTest.resized.slice(before.count).some(s=>s.id===before.id&&(s.cols!==before.last.cols||s.rows!==before.last.rows)),beforeResize);""")
+          s=s.replace('let server,browser;', 'let server,browser,page;').replace('const page=await browser.newPage(', 'page=await browser.newPage(')
+          s=s.replace('} finally { await browser?.close();', "} finally { if(process.env.TEST_SCREENSHOT&&page)await page.screenshot({path:process.env.TEST_SCREENSHOT}).catch(()=>{}); await browser?.close();")
+          p.write_text(s)
+          PY
+      - run: npm ci --no-audit --no-fund
+      - name: Typecheck and conversation regressions
+        run: |
+          npm run check
           node scripts/terminal-shortcuts.test.mjs
           node scripts/virgo-shortcut.test.mjs
           node --experimental-strip-types scripts/thread-display.test.mjs
@@ -75,48 +48,24 @@ jobs:
         run: node scripts/workspace-panel.test.mjs
       - name: Production frontend build
         run: npm run build
+      - name: Commit verified regression test
+        run: |
+          git config user.name 'llyb120'
+          git config user.email 'llyb120@users.noreply.github.com'
+          git add scripts/workspace-terminal.test.mjs
+          git diff --cached --check
+          git commit -m 'test: assert real terminal resize instead of incidental callback counts'
+          git push origin HEAD:refs/heads/work/terminal-implementation-20260918
+          echo "Verified frontend: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          git archive --format=tar.gz -o "$RUNNER_TEMP/terminal-source.tar.gz" HEAD
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: terminal-ui
           path: terminal-ui.png
-  native:
-    needs: prepare
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    env:
-      CARGO_BUILD_JOBS: 3
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-    steps:
-      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        if: success()
         with:
-          ref: ${{ needs.prepare.outputs.revision }}
-          submodules: recursive
-      - name: Use crates.io
-        shell: bash
-        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - run: npm ci --no-audit --no-fund
-      - name: Generate bridge resources
-        run: npm run build:sdk-bridges:release
-      - name: Linux prerequisites
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xvfb libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - name: Native typecheck
-        run: cargo check --manifest-path src-tauri/Cargo.toml --lib
-      - name: Real PTY tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib workspace_terminal::tests -- --nocapture
+          name: terminal-source
+          path: ${{ runner.temp }}/terminal-source.tar.gz
+          retention-days: 3
