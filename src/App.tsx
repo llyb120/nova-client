@@ -17,7 +17,7 @@ import "./promptQueue";
 import { selectedChatText } from "./chatSelection";
 import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
 import { mountSessionShortcuts } from "./sessionShortcuts";
-import { setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
+import { createHomeTerminalState, setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
 const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
@@ -79,7 +79,7 @@ function ZenDropChip(props: { text: string }) {
       const u = 1 - e;
       const x = u * u * start.x + 2 * u * e * ctrl.x + e * e * end.x;
       const y = u * u * start.y + 2 * u * e * ctrl.y + e * e * end.y;
-      // 起步轻弹放大，中段巡航，末段缩小「被吸进去」；标签在中途逐渐消散。
+      // 起步轻弹放大，中段巡航，末段缩小「被吸进去」；标签在途中逐渐消散。
       const scale =
         t < 0.14
           ? 0.4 + 0.6 * (t / 0.14)
@@ -161,6 +161,11 @@ function AppToastChip(props: { text: string }) {
 }
 
 export default function App() {
+  const homeTerminal = createHomeTerminalState(() => ({
+    currentId: state.currentId,
+    view: state.view,
+    homeComposerFocusAt: state.homeComposerFocusAt,
+  }));
   const [showSettings, setShowSettings] = createSignal(false);
   const [showAchievements, setShowAchievements] = createSignal(false);
   const [showUpdate, setShowUpdate] = createSignal(false);
@@ -194,6 +199,7 @@ export default function App() {
     onOpenUnread: () => void openNextUnreadThread(),
     onHideToVirgo: hideCurrentThreadToVirgo,
     onToggleTerminal: () => {
+      if (!state.currentId) { homeTerminal.toggle(); return; }
       if (state.threads.find(thread => thread.id === state.currentId)?.roamingRole === "guest") return;
       setWorkspaceLayout({ open: !(workspaceLayout.open && workspaceLayout.mode === "terminal"), mode: "terminal" });
     },
@@ -236,8 +242,8 @@ export default function App() {
       >
         <ChatView />
       </Show>
-      <Show when={!state.currentId && workspaceLayout.open && workspaceLayout.mode === "terminal"}>
-        <Suspense><HomeTerminalPanel /></Suspense>
+      <Show when={homeTerminal.open()}>
+        <Suspense><HomeTerminalPanel onClose={homeTerminal.close} /></Suspense>
       </Show>
       <Show when={showSettings()}>
         <Show
