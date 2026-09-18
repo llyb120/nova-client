@@ -26,20 +26,13 @@ jobs:
           python ../staging/.github/precision-tools/chrome-smoke-setup.py
           git fetch --depth=1 origin 9798b86d66b8b7b8822c3d26a92cf838d6efb03d
           git restore --source=FETCH_HEAD -- scripts/native-browser-smoke.mjs
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('.github/workflows/tool-precision.yml');s=p.read_text()
-          s=s.replace("      - 'scripts/browser-targeting.test.mjs'", "      - 'scripts/browser-targeting.test.mjs'\n      - 'scripts/chrome-precision-smoke.mjs'")
-          s=s.replace('      - run: npm run check','      - run: npm run check\n      - run: node --check scripts/chrome-precision-smoke.mjs')
-          p.write_text(s)
-          PY
       - name: Commit test preparation
         id: commit
         working-directory: source
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add scripts/chrome-precision-smoke.mjs scripts/native-browser-smoke.mjs .github/workflows/tool-precision.yml
+          git add scripts/chrome-precision-smoke.mjs scripts/native-browser-smoke.mjs
           git diff --cached --check
           git commit -m 'test(chrome): initialize fixture thread and preserve existing WebView driver'
           git push origin HEAD:fix/precision-tools-20260918
