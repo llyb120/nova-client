@@ -1,138 +1,13 @@
-name: Terminal handshake validation
+name: Windows terminal runtime validation
 on:
   push:
     branches: [work/terminal-build-20260918]
 permissions:
-  contents: write
+  contents: read
 jobs:
-  prepare:
-    runs-on: ubuntu-24.04
-    outputs:
-      revision: ${{ steps.commit.outputs.revision }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: work/terminal-implementation-20260918
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Complete native test terminal emulation and verify xterm response
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('src-tauri/src/workspace_terminal.rs');s=p.read_text()
-          start=s.index('    fn collect_events(')
-          end=s.index('    #[test]',start)
-          replacement='''    fn collect_events(
-              manager: &TerminalManager,
-              id: &str,
-              rx: &std::sync::mpsc::Receiver<TerminalEvent>,
-          ) -> (String, Option<u32>) {
-              let mut output = Vec::new();
-              loop {
-                  let event = rx.recv_timeout(std::time::Duration::from_secs(20));
-                  if event.is_err() {
-                      if let Ok(session) = manager.get(id) {
-                          let flow = session.flow.lock().unwrap();
-                          eprintln!("PTY timeout: closed={}, reaped={}, output={:?}", flow.closed, flow.reaped, String::from_utf8_lossy(&output));
-                      }
-                      manager.close(id).unwrap();
-                  }
-                  match event.expect("terminal did not exit and release its PTY") {
-                      TerminalEvent::Data { data } => {
-                          if let Ok(session) = manager.get(id) { session.acknowledge(data.len()); }
-                          let previous_len = output.len();
-                          output.extend(data);
-                          // ConPTY requests the inherited cursor position. xterm answers
-                          // this in the app; a read-only collector would stall cmd.exe.
-                          // Retain the tail to handle queries split across PTY reads.
-                          let queries = output[previous_len.saturating_sub(3)..].windows(4)
-                              .filter(|bytes| *bytes == b"\\x1b[6n").count();
-                          if queries > 0 {
-                              if let Ok(session) = manager.get(id) {
-                                  let mut writer = session.writer.lock().unwrap();
-                                  for _ in 0..queries { writer.write_all(b"\\x1b[1;1R").unwrap(); }
-                                  writer.flush().unwrap();
-                              }
-                          }
-                      }
-                      TerminalEvent::Error { message } => panic!("{message}"),
-                      TerminalEvent::Exit { code } => return (String::from_utf8_lossy(&output).into_owned(), code),
-                  }
-              }
-          }
-          '''
-          p.write_text(s[:start]+replacement+s[end:])
-          p=Path('scripts/workspace-terminal.test.mjs');s=p.read_text()
-          needle='  await page.waitForFunction(()=>window.termTest.acknowledged.length>5);'
-          addition='''
-            // xterm must respond to ConPTY DSR through the same IPC input queue.
-            const beforeQuery=await page.evaluate(()=>window.termTest.writes.length);
-            await page.evaluate(id=>window.termTest.send(id,{type:'data',data:[27,91,54,110]}),first);
-            await page.waitForFunction(before=>/\\x1b\\[\\d+;\\d+R/.test(String.fromCharCode(...window.termTest.writes.slice(before).flatMap(w=>w.data))),beforeQuery);
-          '''
-          assert needle in s;s=s.replace(needle,needle+'\n'+addition);p.write_text(s)
-          PY
-          rustfmt --edition 2021 src-tauri/src/workspace_terminal.rs
-      - name: Commit candidate
-        id: commit
-        run: |
-          git config user.name 'llyb120'
-          git config user.email 'llyb120@users.noreply.github.com'
-          git add src-tauri/src/workspace_terminal.rs scripts/workspace-terminal.test.mjs
-          git diff --cached --check
-          git commit -m 'test(terminal): answer ConPTY cursor query and verify xterm response path'
-          git push origin HEAD:refs/heads/work/terminal-implementation-20260918
-          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          git archive --format=tar.gz -o "$RUNNER_TEMP/terminal-source.tar.gz" HEAD
-      - uses: actions/upload-artifact@v4
-        with:
-          name: terminal-source
-          path: ${{ runner.temp }}/terminal-source.tar.gz
-          retention-days: 3
-  frontend:
-    needs: prepare
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.revision }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - run: npm ci --no-audit --no-fund
-      - name: Typecheck and regressions
-        run: |
-          npm run check
-          node scripts/terminal-shortcuts.test.mjs
-          node scripts/virgo-shortcut.test.mjs
-          node --experimental-strip-types scripts/thread-display.test.mjs
-          node --experimental-strip-types scripts/virgo-chains.test.mjs
-      - name: Terminal and workspace interaction
-        env:
-          TEST_BROWSER: /usr/bin/google-chrome
-          TEST_SCREENSHOT: terminal-ui.png
-        run: |
-          node scripts/workspace-terminal.test.mjs
-          node scripts/workspace-panel.test.mjs
-      - name: Production build
-        if: ${{ !cancelled() }}
-        run: npm run build
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: terminal-ui
-          path: terminal-ui.png
   native:
-    needs: prepare
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    runs-on: windows-latest
+    timeout-minutes: 20
     env:
       CARGO_BUILD_JOBS: 3
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -140,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.revision }}
+          ref: 00327bfd57c1a94b50073f1ef8be082ba3054e97
           submodules: recursive
       - name: Use crates.io
         shell: bash
@@ -156,12 +31,30 @@ jobs:
           cache: npm
       - run: npm ci --no-audit --no-fund
       - run: npm run build:sdk-bridges:release
-      - name: Linux prerequisites
-        if: runner.os == 'Linux'
+      - name: Compile native terminal tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib workspace_terminal::tests --no-run
+      - name: Use matching MSVC runtime beside the test executable
+        shell: pwsh
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xvfb libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - name: Native typecheck
-        run: cargo check --manifest-path src-tauri/Cargo.toml --lib
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -property installationPath
+          $redistRoot = Join-Path $vs 'VC\Redist\MSVC'
+          $crt = Get-ChildItem $redistRoot -Directory -Recurse | Where-Object { $_.Name -match '^Microsoft\.VC.*\.CRT$' -and $_.Parent.Name -eq 'x64' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$crt) { throw "MSVC x64 CRT not found under $redistRoot" }
+          Write-Host "Using CRT from $($crt.FullName)"
+          $destinations = @('src-tauri/target/debug/deps', 'src-tauri/target/debug')
+          foreach ($destination in $destinations) {
+            New-Item -ItemType Directory -Force $destination | Out-Null
+            Get-ChildItem $crt.FullName -Filter '*.dll' | ForEach-Object {
+              Write-Host "$($_.Name) $($_.VersionInfo.FileVersion) -> $destination"
+              Copy-Item $_.FullName $destination -Force
+            }
+          }
       - name: Real PTY lifecycle tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib workspace_terminal::tests -- --nocapture
+      - name: Loader diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem src-tauri/target/debug/deps -Filter '*.dll' | ForEach-Object { Write-Host "$($_.Name) $($_.VersionInfo.FileVersion)" }
+          Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-20); Level=2} -ErrorAction SilentlyContinue | Select-Object -First 6 TimeCreated,Id,Message | Format-List
