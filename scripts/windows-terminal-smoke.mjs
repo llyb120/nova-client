@@ -89,7 +89,10 @@ try {
     assert.equal(await page.evaluate(() => window.nativeTerminalSmoke.active().status()), 'running',
       `${shell.name}: ${await page.evaluate(() => window.nativeTerminalSmoke.active()?.error())}`);
     const id = await page.evaluate(() => window.nativeTerminalSmoke.active().id);
-    await page.evaluate(command => window.nativeTerminalSmoke.active().terminal.paste(command + '\r'), shell.command);
+    await page.waitForFunction(() => window.nativeTerminalSmoke.buffer().trim().endsWith('>'));
+    await page.evaluate(command => window.nativeTerminalSmoke.active().terminal.paste(command), shell.command);
+    await page.locator('.xterm-helper-textarea').focus();
+    await page.keyboard.press('Enter');
     await page.waitForFunction(text => window.nativeTerminalSmoke.buffer().includes(text), marker);
     await page.keyboard.press('Control+Backquote');
     await page.getByRole('region', { name: '交互式终端' }).waitFor({ state: 'hidden' });
@@ -98,11 +101,14 @@ try {
     assert.equal(await page.evaluate(() => window.nativeTerminalSmoke.active().id), id);
     await page.getByRole('button', { name: '新建终端', exact: true }).click();
     await page.waitForFunction(() => window.nativeTerminalSmoke.group().tabs().length === 2 && window.nativeTerminalSmoke.active()?.status() === 'running');
-    await page.getByRole('tab', { name: /终端 1/ }).click();
+    await page.getByRole('region', { name: '交互式终端' }).getByRole('tab').nth(0).click();
     assert.equal(await page.evaluate(() => window.nativeTerminalSmoke.active().id), id);
     assert.ok((await page.evaluate(() => window.nativeTerminalSmoke.buffer())).includes(marker));
+    assert.equal(await page.evaluate(() => window.nativeTerminalSmoke.active().error()), '', `${shell.name}: terminal displays an error`);
     await page.screenshot({ path: `windows-terminal-${shell.name}.png` });
-    await page.evaluate(() => window.nativeTerminalSmoke.active().terminal.paste('exit\r'));
+    await page.evaluate(() => window.nativeTerminalSmoke.active().terminal.paste('exit'));
+    await page.locator('.xterm-helper-textarea').focus();
+    await page.keyboard.press('Enter');
     await page.waitForFunction(() => window.nativeTerminalSmoke.active()?.status() === 'exited');
     await bounded(page.evaluate(async () => {
       const test = window.nativeTerminalSmoke, group = test.group();
@@ -113,6 +119,11 @@ try {
   }
 } catch (error) {
   report.push({ result: 'failed', error: String(error.stack || error) });
+  if (process.env.TEST_WINDOWS_DIAGNOSTICS && app?.pid) {
+    const diagnostic = spawnSync('powershell.exe', ['-NoProfile', '-File', process.env.TEST_WINDOWS_DIAGNOSTICS, String(app.pid)], { encoding: 'utf8', timeout: 15000 });
+    appLogs.push(diagnostic.stdout || '', diagnostic.stderr || '');
+    console.error(diagnostic.stdout, diagnostic.stderr);
+  }
   if (page) {
     await page.screenshot({ path: 'windows-terminal-failure.png' }).catch(() => {});
     console.error(await page.evaluate(() => ({ url: location.href, body: document.body.innerText,
