@@ -1,4 +1,4 @@
-import { createSignal } from "solid-js";
+import { createEffect, createSignal, on } from "solid-js";
 import { createStore } from 'solid-js/store';
 
 export type WorkspaceMode = 'files' | 'artifacts' | 'git' | 'browser' | 'terminal';
@@ -29,3 +29,25 @@ export function setWorkspaceLayout(patch: Partial<typeof defaultWorkspaceLayout>
 }
 
 export const [homeTerminalCwd, setHomeTerminalCwd] = createSignal("");
+
+/** Home never inherits a saved/chat panel-open flag. Only an explicit shortcut
+ * opens it for the current visit; leaving/re-entering or requesting a new
+ * session closes the panel without disposing the retained terminal group. */
+export function createHomeTerminalState(context: () => {
+  currentId: string | null;
+  view: string;
+  homeComposerFocusAt: number;
+}) {
+  const [opened, setOpened] = createSignal(false);
+  const available = () => {
+    const { currentId, view } = context();
+    return !currentId && view !== "clues" && view !== "workflows";
+  };
+  // Track navigation/new-session requests only, never the opened signal.
+  createEffect(on(context, () => setOpened(false)));
+  return {
+    open: () => available() && opened(),
+    toggle: () => { if (available()) setOpened(value => !value); },
+    close: () => setOpened(false),
+  };
+}

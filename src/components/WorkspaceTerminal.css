@@ -1,5 +1,9 @@
 .workspace-terminal { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; overflow:hidden; }
 .workspace-terminal-surface { flex:1; min-width:0; min-height:0; overflow:hidden; padding:4px; background:#000; color-scheme:dark; }
+/* Keep one dark xterm palette, including ANSI-256 and truecolor output.
+ * In light mode invert only the final terminal surface, with hue compensation.
+ * Do not filter tabs/status/toolbars, change PTY colors or recreate terminals. */
+:root[data-theme="ink-light"] .workspace-terminal-surface { filter:invert(1) hue-rotate(180deg); }
 .workspace-terminal-instance, .workspace-terminal-instance > .xterm { height:100%; width:100%; }
 .workspace-terminal .xterm { padding:0; }
 .workspace-terminal .xterm-viewport { overflow-y:auto; }
