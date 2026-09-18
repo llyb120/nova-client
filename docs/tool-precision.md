@@ -12,7 +12,7 @@ Chrome 与右侧 webview 共用页面定位引擎，但会话、标签和传输�
 
 ## Canvas：看图 + 图片坐标，不伪造内部控件
 
-inspect 默认在发现足够大的可见 Canvas 时附带当前视口图，包括 Canvas 承载的 WebGL 页面。返回 visualRequired、Canvas 的 viewportRect、位图尺寸和视觉定位提示。Canvas 内的图形/表格单元格没有自动生成的 DOM ref，仍需模型根据图片识别。
+inspect 默认在发现足够大的可见 Canvas 时附带当前视口图，包括 Canvas 承载的 WebGL 页面。返回 visualRequired、visualRegions 中的 Canvas 视口范围、位图尺寸和视觉定位提示。即使 query 搜索绘制的文字、没有任何匹配 DOM，也保留 Canvas 视觉反馈。Canvas 内的图形/表格单元格没有自动生成的 DOM ref，仍需模型根据图片识别。
 
 小目标先局部截图，例如：
 
@@ -66,8 +66,19 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib chrome_browser::
 
 浏览器回归使用真实 Chromium/CDP 和页面脚本，包含多种 DPR、标签命名、嵌套滚动、Shadow DOM、虚拟行复用、悬停位移、焦点转移、缩放 iframe、遮挡、Canvas 双击/轨迹/滚轮。原生测试覆盖坐标映射、裁剪、局部像素变化、输入格式及连接归属。
 
-Windows 的 scripts/native-browser-smoke.mjs 驱动真实 Nova/WebView2。Chrome 桥接部分用本机测试轮询器模拟扩展传输，执行的仍是真实 Rust 工具入口和 CDP 输入；不能将其描述为安装版 Chrome 扩展的端到端验收。独立 WebView2 profile 的测试驱动可使用 TEST_CDP_PORT 与 TEST_CHILD_CDP_PORT；调试端口只用于隔离测试副本，不能写入发布配置。
+`scripts/chrome-precision-smoke.mjs` 在隔离 Windows 桌面启动真实 Nova 和独立 Chromium。经由真实 chrome_browser_ui、Rust 定位引擎和 CDP 发送输入；扩展的认证 poll/reply 传输由本机测试轮询器模拟，不模拟 DOM、鼠标、键盘或截图。此项与安装版 Chrome 扩展的完整端到端验收不同。报告保存浏览器版本、通过的检查、截图以及失败信息。
+
+该脚本需要在隔离测试副本的 app.windows[0].additionalBrowserArgs 中设置 `--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1`，启动 Vite 后运行 `node scripts/chrome-precision-smoke.mjs src-tauri/target/debug/nova.exe`。也可用 TEST_CDP_PORT 和 TEST_CHROME_PORT 指定测试端口。**这些调试参数不能提交到产品配置或用于发布构建。**
+
+右侧内嵌 WebView2 有独立 profile 和 COM 传输。该链路的完整桌面自动化曾因目标发现超时及 `channel closed` 未能进入用例；不能以外部 Chrome 的验证替代其验收。页面定位引擎有共享单元和 Chromium 回归，但本次不宣称所有内嵌 WebView2 场景均已端到端通过。
 
 剑来 desktop_smoke 是显式 opt-in 测试，仅在隔离桌面使用：默认只截图、移动鼠标和检查像素见证，不向用户应用点击/输入。它也模拟改变保存的见证，验证旧目标被拒绝；不是所有业务应用的点击成功率测量。
 
-性能必须使用同机同页面测量。BROWSER_BASELINE 可指向旧 native_browser_page.js，测试报告保留每次样本。2026-09-18 的 10,000 按钮固定页面对照中，旧全量采集中位 212.1ms，新全量 199.9ms，新目标 query 61.6ms；query 路径相对旧全量约 3.44 倍，但全量仅约 5.8% 改善。这是页面采集耗时，不包含模型推理、网络加载或截图开销，也不能外推为所有任务的速度或准确率。
+性能必须使用同机同页面测量。BROWSER_BASELINE 可指向旧 native_browser_page.js，测试报告保留每次样本。2026-09-18 两轮 10,000 按钮固定页面对照的中位耗时如下：
+
+| CI 对照轮次 | 旧全量采集 | 新全量采集 | 新目标 query |
+| --- | --- | --- | --- |
+| 35315216316 | 212.1ms | 199.9ms | 61.6ms |
+| 35316245800（含 Canvas query 回归） | 121.2ms | 120.3ms | 34.8ms |
+
+目标 query 路径相对旧全量约 3.4–3.5 倍；全量采集改善约 0.7%–5.8%，不能宣称同等提速。两轮机器环境不同，只比较每一行内同机样本。这是页面采集耗时，不包含模型推理、网络加载或截图开销，也不能外推为所有任务的速度或准确率。
