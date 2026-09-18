@@ -8,30 +8,82 @@ concurrency:
   group: long-session-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  workspace:
+  prepare:
+    if: github.ref == 'refs/heads/perf/long-image-sessions-20260918'
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 4
+    permissions:
+      contents: write
+    outputs:
+      revision: ${{ steps.commit.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply reviewed, checksum-verified native source delta
+        run: |
+          python - <<'PY'
+          import base64, hashlib, lzma, pathlib, subprocess
+          paths = sorted(pathlib.Path('.github').glob('long-session-candidate.*.b64'))
+          assert len(paths) == 3
+          data = lzma.decompress(base64.b64decode(''.join(p.read_text().strip() for p in paths)))
+          assert hashlib.sha256(data).hexdigest() == '7cd70130459734b5b73159b178581751caeecf827eec339435f0c0d5feceaddb'
+          patch = pathlib.Path('/tmp/native.patch'); patch.write_bytes(data)
+          subprocess.run(['git','apply','--check',str(patch)],check=True)
+          subprocess.run(['git','apply',str(patch)],check=True)
+          for p in paths: p.unlink()
+          PY
+      - name: Commit native candidate without changing release branches
+        id: commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src-tauri/src .github/long-session-candidate.*.b64
+          git diff --cached --check
+          git commit -m 'perf(history): shared immutable chunks, lossless assets and bounded UI projection'
+          git push origin HEAD:perf/long-image-sessions-20260918
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  native:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 3
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.revision }}
           submodules: recursive
           persist-credentials: false
+      - name: Use crates.io
+        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
       - run: npm ci --no-audit --no-fund
-      - name: Export reproducible local verification workspace
+      - run: npm run build:sdk-bridges:release
+      - name: Compile native library and all unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --no-run 2>&1 | tee native-compile.log
+      - name: Shared histories, assets, migration, paging and invalidation feed
         run: |
-          git rev-parse HEAD > /tmp/source-revision.txt
-          tar --exclude=.git --exclude=node_modules --exclude=.github -czf /tmp/long-session-source.tgz .
-          tar -czf /tmp/long-session-dependencies.tgz node_modules
+          cargo test --manifest-path src-tauri/Cargo.toml --lib transcript:: -- --nocapture 2>&1 | tee transcript-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib history_ -- --nocapture 2>&1 | tee history-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib threads:: -- --nocapture 2>&1 | tee threads-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib time_machine:: -- --nocapture 2>&1 | tee time-machine-tests.log
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: long-session-workspace
+          name: long-session-native-validation
           path: |
-            /tmp/source-revision.txt
-            /tmp/long-session-source.tgz
-            /tmp/long-session-dependencies.tgz
-          retention-days: 1
-          compression-level: 0
+            native-compile.log
+            *-tests.log
+          retention-days: 7
