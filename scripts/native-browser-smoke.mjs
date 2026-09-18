@@ -55,6 +55,14 @@ try {
   await main.call('Emulation.setFocusEmulationEnabled',{enabled:true});
   await until(()=>main.evaluate('!!window.__TAURI_INTERNALS__&&!!document.querySelector(".app")'),'UI');
   const invoke=(command,args={})=>main.evaluate(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)},${JSON.stringify(args)})`);
+  // Optional driver compiled ONLY into the isolated CI copy. This avoids
+  // assuming every WebView2 profile exposes the same remote target list.
+  const nativeDriver=label=>{
+    const call=(method,params={},sessionId)=>invoke('precision_smoke_cdp',{label,method,params,sessionId:sessionId??null});
+    const evaluate=async expression=>{const value=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(value.exceptionDetails)throw Error(JSON.stringify(value.exceptionDetails));return value.result.value;};
+    return {call,evaluate};
+  };
+
   assert.equal('browserControlModel' in await invoke('get_settings'),false);
   await main.evaluate(`localStorage.setItem('fd:workspaceLayout',JSON.stringify({open:true,widthRatio:.6,minimap:true,softWrap:true,mode:'browser'}));location.reload()`);
   await until(()=>main.evaluate('!!document.querySelector(".app")'),'reload');
@@ -67,7 +75,8 @@ try {
   await until(async()=> (await ui('status')).visible,'visible browser');
   assert.equal(await main.evaluate('!!document.querySelector("[aria-label=浏览器局部目标]")'),false);
   await ui('goto',{url:`http://127.0.0.1:${port}/fixture`});
-  const page=await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/fixture')),'fixture'));
+  const page=process.env.TEST_NATIVE_CDP_DRIVER ? nativeDriver((await ui('status')).activeTab) : await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/fixture')),'fixture'));
+  console.log('fixture driver:',await page.evaluate('location.href'));
   await until(()=>page.evaluate('!!document.querySelector("input")'),'loaded');
   const timings=[];
   const act=async(action,snapshot)=>{
@@ -180,7 +189,7 @@ try {
   await ui('close_tab',{tabId:popupState.activeTab});
   await page.evaluate(`window.open('about:blank','delayedPopup');setTimeout(()=>{const w=window.open('','delayedPopup');w.location='http://127.0.0.1:${port}/delayed'},100)`);
   await until(async()=> (await ui('status')).tabs.some(t=>t.url.includes('/delayed')),'delayed popup');
-  const delayed=await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/delayed')),'delayed target'));
+  const delayed=process.env.TEST_NATIVE_CDP_DRIVER ? nativeDriver((await ui('status')).activeTab) : await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/delayed')),'delayed target'));
   assert.equal(await delayed.evaluate('!!window.opener'),true);
   await ui('close_tab',{tabId:(await ui('status')).activeTab});assert.equal((await ui('status')).activeTab,firstTab);
   // Exercise the real Chrome transport + shared engine with an emulated extension.
