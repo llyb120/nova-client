@@ -28,15 +28,18 @@ export function getTerminalGroup(key: string): TerminalGroup {
   return group;
 }
 function makeTab(threadId: string | null, cwd: string, name: string) {
-  const [title, setTitle] = createSignal(name);
+  // A stable label keeps shell OSC title/progress updates out of the tab bar.
+  const title = () => name;
   const [status, setStatus] = createSignal<"starting" | "running" | "exited" | "error">("starting");
   const [error, setError] = createSignal("");
   const terminal = new Terminal({ cursorBlink: true, fontSize: 13, lineHeight: 1.2,
-    fontFamily: '"JetBrains Mono Variable", Consolas, monospace', scrollback: 5000, screenReaderMode: true });
+    fontFamily: '"JetBrains Mono Variable", Consolas, monospace', scrollback: 5000, screenReaderMode: true,
+    // Apply before open(): neither the initial frame nor retained tabs inherit the app theme.
+    theme: { background: "#000000", foreground: "#d4d8df", cursor: "#d4d8df", cursorAccent: "#000000", selectionBackground: "#344d70" } });
   const fit = new FitAddon(); terminal.loadAddon(fit);
   const tab = {
     id: crypto.randomUUID(), threadId, cwd, terminal, fit, host: document.createElement("div"),
-    title, setTitle, status, setStatus, error, setError,
+    title, status, setStatus, error, setError,
     opened: false, disposed: false, ready: undefined as Promise<void> | undefined,
     channel: undefined as Channel<TerminalEvent> | undefined, input: Promise.resolve(), queuedInput: 0,
   };
@@ -55,7 +58,6 @@ function makeTab(threadId: string | null, cwd: string, name: string) {
   };
   terminal.onData(data => send(new TextEncoder().encode(data)));
   terminal.onBinary(data => send(Uint8Array.from(data, char => char.charCodeAt(0))));
-  terminal.onTitleChange(value => setTitle(value.trim().slice(0, 120) || name));
   terminal.onResize(({ cols, rows }) => {
     void tab.ready?.then(() => {
       if (!tab.disposed && status() === "running") return terminalApi.resize(tab.id, cols, rows);

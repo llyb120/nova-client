@@ -4,6 +4,52 @@ import { spawn } from 'node:child_process';
 import { chromium } from 'playwright-core';
 const name=`workspace-terminal-check-${process.pid}`;
 let server,browser,page;
+async function assertBlackTerminal() {
+  const colors=await page.evaluate(()=>{
+    const tab=window.termTest.tab(window.termTest.id());
+    return {
+      theme:tab.terminal.options.theme,
+      surface:getComputedStyle(document.querySelector('.workspace-terminal-surface')).backgroundColor,
+      viewport:getComputedStyle(document.querySelector('.xterm-viewport')).backgroundColor,
+    };
+  });
+  assert.equal(colors.theme.background,'#000000');
+  assert.equal(colors.theme.foreground,'#d4d8df');
+  assert.equal(colors.theme.cursor,'#d4d8df');
+  assert.equal(colors.surface,'rgb(0, 0, 0)');
+  assert.equal(colors.viewport,'rgb(0, 0, 0)');
+}
+async function assertStableTabsDuringOutput(id) {
+  const result=await page.evaluate(async id=>{
+    const test=window.termTest,terminal=test.tab(id).terminal;
+    const bar=document.querySelector('[aria-label="终端标签页"]');
+    const button=bar.querySelector('[role=tab]');
+    const markup=bar.innerHTML,rect=bar.getBoundingClientRect(),activeId=test.id();
+    let mutations=0,titleEvents=0;
+    const observer=new MutationObserver(records=>{mutations+=records.length;});
+    observer.observe(bar,{childList:true,characterData:true,attributes:true,subtree:true});
+    // Prove real OSC 0/2 sequences reached xterm, rather than bypassing its parser.
+    const listener=terminal.onTitleChange(()=>{titleEvents++;});
+    try {
+      for(let i=0;i<60;i++) {
+        const end=i%2?'\x07':'\x1b\\';
+        const data=new TextEncoder().encode(`\x1b]${i%2?0:2};C:\\Windows\\system32\\cmd.exe - progress ${i}${end}\x1b[32moutput ${i}\x1b[0m\r\n`);
+        test.send(id,{type:'data',data:Array.from(data.subarray(0,3))});
+        test.send(id,{type:'data',data:Array.from(data.subarray(3))});
+      }
+      await new Promise(resolve=>terminal.write('',resolve));
+      mutations+=observer.takeRecords().length;
+      const after=bar.getBoundingClientRect();
+      return {mutations,titleEvents,unchanged:bar.innerHTML===markup,
+        sameNode:bar.querySelector('[role=tab]')===button,
+        sameSize:rect.width===after.width&&rect.height===after.height,
+        sameActive:test.id()===activeId};
+    } finally { observer.disconnect();listener.dispose(); }
+  },id);
+  assert.equal(result.titleEvents,60,'OSC titles must be parsed by the real terminal');
+  assert.equal(result.mutations,0,'output and shell titles must not mutate the tab bar');
+  assert.ok(result.unchanged&&result.sameNode&&result.sameSize&&result.sameActive);
+}
 try {
   await writeFile(`${name}.html`,`<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
@@ -41,7 +87,8 @@ const [thread,setThread]=createSignal('a');
 const group=()=>getTerminalGroup('thread:'+thread());
 const active=()=>group().tabs().find(tab=>tab.id===group().activeId());
 window.termTest={created,closed,writes,resized,acknowledged,
- id:()=>active()?.id,status:()=>active()?.status(),
+ id:()=>active()?.id,status:()=>active()?.status(),tab:id=>group().tabs().find(tab=>tab.id===id),
+ setTheme:theme=>{setState('theme',theme);document.documentElement.dataset.theme=theme;},
  buffer:()=>{const b=active().terminal.buffer.active;return Array.from({length:b.length},(_,i)=>b.getLine(i)?.translateToString(true)??'').join('\\n');},
  send:(id,event)=>channels.get(id).onmessage(event),
  switch:id=>{setState({currentId:id,cwd:'/project/'+id});setThread(id);},
@@ -73,6 +120,14 @@ render(()=><Fixture/>,document.getElementById('root')!);
   assert.equal(await page.evaluate(()=>window.termTest.created[0].cwd),'/project/a');
   assert.equal(await page.locator('.workspace-file-view').isVisible(),false);
   assert.ok((await page.getByRole('tabpanel').boundingBox()).height>500);
+  for(const theme of ['ink-light','ink-dark','ink-light']) {
+    await page.evaluate(theme=>window.termTest.setTheme(theme),theme);
+    await assertBlackTerminal();
+  }
+  assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1']);
+  assert.equal(await page.locator('.workspace-terminal-state').textContent(),'运行中');
+  await assertStableTabsDuringOutput(first);
+  await page.getByRole('button',{name:'清空终端显示',exact:true}).click();
   await page.evaluate(id=>{for(const byte of new TextEncoder().encode('中文🙂 output\r\n'))window.termTest.send(id,{type:'data',data:[byte]});},first);
   await page.waitForFunction(()=>window.termTest.buffer().includes('中文🙂 output'));
   await page.waitForFunction(()=>window.termTest.acknowledged.length>5);
@@ -93,9 +148,15 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.waitForFunction(()=>!!document.querySelector('.xterm-helper-textarea'));
   assert.equal(await page.evaluate(()=>window.termTest.created.length),1);
   assert.match(await page.evaluate(()=>window.termTest.buffer()),/中文🙂 output/);
+  await assertBlackTerminal();
+  assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1']);
+  await page.evaluate(()=>window.termTest.setTheme('ink-dark'));
   await page.getByRole('button',{name:'新建终端',exact:true}).click();
   await page.waitForFunction(()=>window.termTest.created.length===2&&window.termTest.status()==='running');
   const second=await page.evaluate(()=>window.termTest.id());
+  await assertBlackTerminal();
+  assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1','终端 2']);
+  await assertStableTabsDuringOutput(first); // An inactive tab must stay quiet too.
   await page.getByRole('tab',{name:'终端 1',exact:true}).click();
   assert.equal(await page.evaluate(()=>window.termTest.id()),first);
   await page.evaluate(()=>window.termTest.switch('b'));
@@ -103,6 +164,8 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.evaluate(()=>window.termTest.switch('a'));
   await page.waitForFunction(id=>window.termTest.id()===id,first);
   assert.equal(await page.getByRole('tab',{name:/终端/}).count(),2);
+  await page.evaluate(()=>window.termTest.setTheme('ink-light'));
+  await assertBlackTerminal();
   assert.deepEqual(await page.evaluate(()=>window.termTest.closed),[]);
   await page.evaluate(()=>window.termTest.paste('x'.repeat(70000)));
   await page.waitForFunction(()=>window.termTest.writes.reduce((n,w)=>n+w.data.filter(b=>b===120).length,0)===70000);
@@ -113,6 +176,8 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.getByRole('button',{name:'新建终端',exact:true}).click();
   await page.waitForFunction(()=>window.termTest.created.length===4);
   const pending=await page.evaluate(()=>window.termTest.id());
+  assert.equal(await page.locator('.workspace-terminal-state').textContent(),'启动中');
+  assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1','终端 2']);
   await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
   assert.equal(await page.evaluate(id=>window.termTest.closed.includes(id),pending),false);
   await page.evaluate(id=>window.termTest.resolve(id),pending);
@@ -122,11 +187,14 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.waitForFunction(()=>window.termTest.created.length===5);
   await page.evaluate(()=>{const t=window.termTest;t.send(t.id(),{type:'exit',code:0});t.resolve(t.id());});
   await page.waitForFunction(()=>window.termTest.status()==='exited');
+  assert.equal(await page.locator('.workspace-terminal-state').textContent(),'已退出');
+  assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1','终端 2']);
   await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
   await page.evaluate(()=>window.termTest.fail());
   await page.getByRole('button',{name:'新建终端',exact:true}).click();
   await page.getByRole('alert').getByText('test: shell not found',{exact:false}).waitFor();
   assert.equal(await page.evaluate(()=>window.termTest.status()),'error');
+  assert.equal(await page.locator('.workspace-terminal-state').textContent(),'启动失败');
   await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
   const beforeResize=await page.evaluate(()=>({count:window.termTest.resized.length,id:window.termTest.id(),last:window.termTest.resized.filter(s=>s.id===window.termTest.id()).at(-1)}));
   await page.setViewportSize({width:1000,height:640});
@@ -148,5 +216,5 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.evaluate(()=>window.termTest.closeAll());
   await page.waitForFunction(()=>window.termTest.closed.length===window.termTest.created.length);
   assert.deepEqual(errors,[]);
-  console.log('Workspace terminal: UTF-8, control keys, tabs, hide/remount, conversation retention, paste, spawn/close races, errors and resize passed');
+  console.log('Workspace terminal: fixed black theme, stable OSC titles/tab DOM, footer status, UTF-8, control keys, tabs, hide/remount, conversation retention, paste, spawn/close races, errors and resize passed');
 } catch(error) { if(process.env.TEST_SCREENSHOT&&page)await page.screenshot({path:process.env.TEST_SCREENSHOT}).catch(()=>{}); throw error; } finally { await browser?.close();server?.kill();await Promise.all([`${name}.html`,`${name}.tsx`].map(path=>rm(path,{force:true}))); }
