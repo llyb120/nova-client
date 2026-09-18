@@ -1015,7 +1015,7 @@ fn item_type_tag(item: &Item) -> &'static str {
 
 /// 父子快照的最长公共前缀长度；前缀之后的条目即该分支相对父节点的新增轨迹。
 /// 历史分叉会复用 item id，因此同时比对 id 与条目类型。
-fn common_prefix_len(parent: &[Item], child: &[Item]) -> usize {
+fn common_prefix_len(parent: &crate::transcript::TranscriptItems, child: &crate::transcript::TranscriptItems) -> usize {
     parent
         .iter()
         .zip(child.iter())
@@ -1166,15 +1166,14 @@ pub fn timeline_training_digest(
                 )
             })
             .unwrap_or(0);
-        let edge = &checkpoint.thread_snapshot.items
-            [edge_start.min(checkpoint.thread_snapshot.items.len())..];
+        let edge = checkpoint.thread_snapshot.items.range(edge_start, checkpoint.thread_snapshot.items.len());
         out.push_str(&format!(
             "\n### #{} 「{}」{}\n",
             short_id(&checkpoint.id),
             checkpoint.title.trim(),
             outcome_label(&checkpoint.outcome),
         ));
-        if edge.is_empty() {
+        if edge.len() == 0 {
             out.push_str("- （无新增轨迹）\n");
             continue;
         }
