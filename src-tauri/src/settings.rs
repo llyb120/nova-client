@@ -129,6 +129,8 @@ pub struct Settings {
     pub stage_models: Vec<StageModelTarget>,
     /// 打开文件用的编辑器命令（cursor / code / zed / windsurf 等，依赖 PATH）
     pub editor: String,
+    pub terminal_shell: String,
+    pub terminal_args: Vec<String>,
     /// 界面皮肤（ink-dark / ink-light，空 = 未设置，由前端 localStorage 迁移）
     pub theme: String,
     /// 会话历史展示方式（project / time）。
@@ -218,6 +220,8 @@ impl Default for Settings {
             lightweight_model: String::new(),
             stage_models: Vec::new(),
             editor: "code".into(),
+            terminal_shell: String::new(),
+            terminal_args: Vec::new(),
             theme: String::new(),
             history_display_mode: "project".into(),
             relay_server: DEFAULT_RELAY_SERVER.into(),

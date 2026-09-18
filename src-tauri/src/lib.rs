@@ -35,6 +35,7 @@ mod threads;
 mod time_machine;
 mod updater;
 mod workspace_files;
+mod workspace_terminal;
 #[cfg(windows)]
 mod windows_shell_shim;
 
@@ -5273,7 +5274,8 @@ pub fn maybe_run_update_helper() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init())
+        .manage(workspace_terminal::TerminalManager::default());
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
@@ -5626,6 +5628,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            workspace_terminal::terminal_create,
+            workspace_terminal::terminal_write,
+            workspace_terminal::terminal_resize,
+            workspace_terminal::terminal_ack,
+            workspace_terminal::terminal_close,
             native_browser::native_browser_ui,
             chrome_browser::chrome_browser_ui,
             image_generation::image_command_context,
@@ -5775,7 +5782,11 @@ pub fn run() {
                     }
                 }
             }
+            if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } = &event {
+                if label == "main" { app.state::<workspace_terminal::TerminalManager>().close_all(); }
+            }
             if let tauri::RunEvent::Exit = event {
+                app.state::<workspace_terminal::TerminalManager>().close_all();
                 let state = app.state::<AppState>();
                 // 临时会话随程序关闭一并删除，并清理其临时工作目录。
                 // save 已改为后台节流、每会话独立落盘；退出时必须无条件同步 save_now，

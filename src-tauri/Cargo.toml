@@ -43,6 +43,7 @@ unicode-normalization = "0.1"
 aho-corasick = "1"
 ignore = "0.4"
 wait-timeout = "0.2"
+portable-pty = "0.9"
 rtk = { path = "../vendor/rtk" }
 
 [target.'cfg(unix)'.dependencies]

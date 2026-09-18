@@ -379,8 +379,10 @@ export type SessionShortcutAction =
   | "selectProject"
   | "selectModel"
   | "newSession"
-  /** 循环打开普通模式下有未读轮次的会话；无 target。可注册为全局快捷键（最小化也生效）。 */
+  /** 优先未读；无未读时循环打开进行中的会话；无 target。可注册为全局快捷键（最小化也生效）。 */
   | "openUnread"
+  /** 打开 / 收起右侧终端，仅应用内生效。 */
+  | "toggleTerminal"
   | "insertText"
   /** 选中新会话页要运行的工作流；target 为工作流 id。仅新会话页生效。 */
   | "selectWorkflow"
@@ -458,6 +460,10 @@ export interface Settings {
   stageModels: StageModelTarget[];
   /** 打开文件用的编辑器命令（cursor / code / zed 等） */
   editor: string;
+  /** 内嵌终端程序，空为系统默认 shell。 */
+  terminalShell: string;
+  /** 每项是一个独立的启动参数。 */
+  terminalArgs: string[];
   /** 界面皮肤（ink-dark / ink-light，空 = 未设置） */
   theme: string;
   /** 会话历史展示方式（按项目 / 按时间） */

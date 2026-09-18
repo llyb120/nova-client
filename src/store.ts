@@ -1,3 +1,4 @@
+import { nextRunningThread } from "./nextRunningThread";
 import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
 import { batch, createSignal } from "solid-js";
@@ -1664,7 +1665,7 @@ export function chainUnreadTurns(thread: ThreadMeta | undefined): number {
 
 /**
  * 「打开未读消息」快捷键（含全局触发）：循环打开普通模式下有未读轮次的会话链。
- * 口径与侧栏普通模式列表一致：排除训练会话；减少焦虑模式下排除室女座运行链。
+ * 未读沿用侧栏普通列表口径；无未读时循环进行中的普通会话（含室女座）。
  */
 export async function openNextUnreadThread(): Promise<void> {
   // 口径与侧栏普通模式列表一致：排除训练会话，以及室女座收起的会话。
@@ -1676,7 +1677,13 @@ export async function openNextUnreadThread(): Promise<void> {
   const unreadRoots = visible.filter(
     (t) => (!t.parentThreadId || !visibleIds.has(t.parentThreadId)) && chainUnreadTurns(t) > 0,
   );
-  if (unreadRoots.length === 0) return;
+  if (unreadRoots.length === 0) {
+    const target = nextRunningThread(
+      state.threads.filter(thread => !isPendingThreadId(thread.id)), state.currentId, state.running,
+    );
+    if (target) { setView("home"); await openThread(target.id); }
+    return;
+  }
   // 当前打开的会话在某条未读链上时取下一组，循环轮转；否则从第一组开始
   const currentIndex = unreadRoots.findIndex((root) => {
     let node = state.threads.find((t) => t.id === state.currentId);
