@@ -104,7 +104,9 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
       if (event.type === "data") {
         // xterm's streaming decoder preserves UTF-8 characters split across reads.
         tab.terminal.write(Uint8Array.from(event.data), () => {
-          if (!tab.disposed) void terminalApi.ack(tab.id, event.data.length).catch(error => tab.setError(String(error)));
+          if (!tab.disposed && tab.status() !== "exited") void terminalApi.ack(tab.id, event.data.length).catch(error => {
+            if (!tab.disposed && tab.status() !== "exited") tab.setError(String(error));
+          });
         });
       } else if (event.type === "exit") {
         tab.setStatus("exited"); tab.terminal.options.disableStdin = true;
@@ -114,7 +116,11 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
     tab.ready = terminalApi.create(tab.id, tab.threadId, tab.cwd, tab.terminal.cols, tab.terminal.rows, channel).then(() => {
       if (tab.disposed || tab.status() === "exited") return;
       tab.setStatus("running");
-      return terminalApi.resize(tab.id, tab.terminal.cols, tab.terminal.rows).catch(error => { if (tab.status() !== "exited") throw error; });
+      // Creation, not resize, gates input. ConPTY may need xterm's cursor
+      // response to finish a resize; putting resize in ready deadlocks input.
+      void terminalApi.resize(tab.id, tab.terminal.cols, tab.terminal.rows).catch(error => {
+        if (!tab.disposed && tab.status() !== "exited") tab.setError(String(error));
+      });
     }).catch(error => {
       if (!tab.disposed) { tab.setError(String(error)); tab.setStatus("error"); tab.terminal.options.disableStdin = true; }
       throw error;
