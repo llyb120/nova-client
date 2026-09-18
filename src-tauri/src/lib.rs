@@ -1,3 +1,4 @@
+mod visual_guard;
 mod acp;
 mod agent_config;
 mod jianlai;

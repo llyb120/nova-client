@@ -37,6 +37,7 @@ struct Shot {
     pixels: (u32, u32),
     source_pixels: (u32, u32),
     region: Option<Region>,
+    guard: Option<crate::visual_guard::VisualGuard>,
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +68,7 @@ struct Request {
     window_id: Option<u32>,
     monitor_id: Option<u32>,
     region: Option<Region>,
+    region_space: Option<String>,
     snapshot_id: Option<String>,
     image_id: Option<String>,
     feedback: Option<String>,
@@ -276,6 +278,8 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             image_id.push_str(&format!("-region-{}-{}-{}-{}", r.x, r.y, r.width, r.height));
         }
         let original_pixels = image.dimensions();
+        // Retain bounded unannotated pixel samples, never the cursor ring or a guessed target.
+        let guard = Some(crate::visual_guard::VisualGuard::new(&image));
         let image = if let Some(r) = region {
             r.validate(original_pixels)?;
             xcap::image::imageops::crop_imm(&image, r.x, r.y, r.width, r.height).to_image()
@@ -309,6 +313,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             pixels: image.dimensions(),
             source_pixels: original_pixels,
             region,
+            guard,
         });
         Ok(())
     };
@@ -503,6 +508,32 @@ fn validate(a: &Action, shot: &Shot) -> Result<()> {
     }
     Ok(())
 }
+fn source_point(shot: &Shot, x: i32, y: i32) -> (f64, f64) {
+    let r=shot.region.unwrap_or(Region{x:0,y:0,width:shot.source_pixels.0,height:shot.source_pixels.1});
+    (r.x as f64+x as f64*r.width as f64/shot.pixels.0 as f64,
+     r.y as f64+y as f64*r.height as f64/shot.pixels.1 as f64)
+}
+fn image_region(shot: &Shot, region: Region) -> Result<Region> {
+    region.validate(shot.pixels)?;
+    let (x,y)=source_point(shot,region.x as i32,region.y as i32);
+    let (right,bottom)=source_point(shot,(region.x+region.width) as i32,(region.y+region.height) as i32);
+    let crop=Region{x:x.floor() as u32,y:y.floor() as u32,width:right.ceil() as u32-x.floor() as u32,height:bottom.ceil() as u32-y.floor() as u32};
+    crop.validate(shot.source_pixels)?;
+    Ok(crop)
+}
+fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage) -> Result<()> {
+    let Some(guard)=&shot.guard else {return Ok(());};
+    let mut points=vec![source_point(shot,action.x.unwrap(),action.y.unwrap())];
+    if action.action=="drag" {points.push(source_point(shot,action.to_x.unwrap(),action.to_y.unwrap()));}
+    if points.iter().any(|&(x,y)|guard.changed_near(image,x,y)) {
+        return Err("落点附近画面已变化，停止旧坐标输入；请用返回的新图重新定位，细小目标使用 regionSpace=image 局部截图".into());
+    }
+    Ok(())
+}
+fn guarded_pointer(action:&Action) -> bool {matches!(action.action.as_str(),"click"|"double_click"|"drag"|"scroll")}
+fn pointer_matches(expected:(i32,i32),actual:(i32,i32)) -> bool {
+    (expected.0 as i64-actual.0 as i64).abs()<=1 && (expected.1 as i64-actual.1 as i64).abs()<=1
+}
 fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
     if snap.taken.elapsed() > Duration::from_secs(180) {
         return Err("截图已过期".into());
@@ -547,6 +578,17 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
                 }
             }
         }
+        if guarded_pointer(a) && shot.guard.is_some() {
+            #[cfg(windows)]
+            let image = {
+                let monitor=w.current_monitor().map_err(err)?;
+                visible_window_crop(&shot.surface,&monitor_surface(&monitor)?,&monitor.capture_image().map_err(err)?)?
+            };
+            #[cfg(not(windows))]
+            let image=w.capture_image().map_err(err)?;
+            guard_target(shot,a,&image)?;
+            if foreground()?!=snap.foreground || window_surface(w)?!=shot.surface {return Err("落点校验期间窗口或焦点改变，请重新观察".into());}
+        }
     } else {
         let monitors = Monitor::all().map_err(err)?;
         let current = monitors
@@ -557,13 +599,18 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
         {
             return Err("显示器布局已改变，请重新截图".into());
         }
+        if guarded_pointer(a) && shot.guard.is_some() {
+            let monitor=monitors.iter().find(|m|m.id().ok()==Some(shot.surface.id)).ok_or("显示器已改变")?;
+            guard_target(shot,a,&monitor.capture_image().map_err(err)?)?;
+            if foreground()?!=snap.foreground || monitor_surface(monitor)?!=shot.surface {return Err("落点校验期间屏幕或焦点改变，请重新观察".into());}
+        }
     }
     Ok(())
 }
 
 fn action_delay(actions: &[Action], index: usize) -> Duration {
     // Explicit waits already provide settling time; pointer motion needs no extra delay.
-    let redundant = matches!(actions[index].action.as_str(), "wait" | "move")
+    let redundant = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "wait" | "move")
         || actions.get(index + 1).is_some_and(|a| a.action == "wait");
     Duration::from_millis(if redundant { 0 } else { 80 })
 }
@@ -572,7 +619,16 @@ fn needs_stable_feedback(actions: &[Action], needs_review: bool) -> bool {
     // Pure positioning gets an immediate frame; hover-dependent UI must use move + wait.
     needs_review || actions.iter().any(|a| a.action != "move")
 }
-fn input(enigo: &mut Enigo, shot: &Shot, a: &Action) -> Result<()> {
+fn click_button(enigo: &mut Enigo, button: Button) -> Result<()> {
+    // Keep the native down/up pair together on the successful fast path.
+    // A failed reply can still mean partial input: release, but never replay.
+    if let Err(error) = enigo.button(button, Direction::Click) {
+        let _ = enigo.button(button, Direction::Release);
+        return Err(err(error));
+    }
+    Ok(())
+}
+fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option<(u32,u32)>) -> Result<()> {
     let button = match a.button.as_deref() {
         Some("right") => Button::Right,
         Some("middle") => Button::Middle,
@@ -584,19 +640,30 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action) -> Result<()> {
     ) {
         let (x, y) = point(shot, a.x, a.y)?;
         enigo.move_mouse(x, y, Coordinate::Abs).map_err(err)?;
+        // Read back the actual native pointer. A wrong-DPI/clamped/injected location
+        // must not be followed by a button press. No speculative correction/replay.
+        let actual=enigo.location().map_err(err)?;
+        if !pointer_matches((x,y),actual) {return Err(format!("系统鼠标落点与请求不符（请求{x},{y}，实际{},{}），未按下按钮；请根据新图继续",actual.0,actual.1));}
     }
+    if a.action!="wait" && foreground()?!=expected_foreground {return Err("鼠标移动后前台改变，停止后续输入".into());}
     match a.action.as_str() {
-        "click" => enigo.button(button, Direction::Click).map_err(err)?,
+        "click" => click_button(enigo,button)?,
         "double_click" => {
-            enigo.button(button, Direction::Click).map_err(err)?;
+            click_button(enigo,button)?;
             std::thread::sleep(Duration::from_millis(70));
-            enigo.button(button, Direction::Click).map_err(err)?;
+            if foreground()? != expected_foreground {
+                return Err("第一次点击后前台改变，停止第二次点击，请核对新图".into());
+            }
+            click_button(enigo,button)?;
         }
         "drag" => {
             let (x, y) = point(shot, a.x, a.y)?;
             let (tx, ty) = point(shot, a.to_x, a.to_y)?;
-            enigo.button(button, Direction::Press).map_err(err)?;
+            if let Err(error)=enigo.button(button,Direction::Press) {
+                let _=enigo.button(button,Direction::Release);return Err(err(error));
+            }
             let moved = (1..=12).try_for_each(|i| {
+                if foreground()?!=expected_foreground {return Err("拖动期间前台改变，释放按钮并停止".into());}
                 enigo
                     .move_mouse(
                         (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
@@ -680,9 +747,9 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
         Err(e) => return Err(err(e)),
     };
     let max_edge = request.max_edge.unwrap_or(1600);
-    if request.region.is_some() && (request.operation != "screenshot" || request.window_id.is_none()) {
-        return Err("region仅用于screenshot且必须指定windowId".into());
-    }
+    if request.region.is_some() && request.operation != "screenshot" {return Err("region仅用于screenshot".into());}
+    if request.region_space.as_deref().is_some_and(|s|!matches!(s,"source"|"image")) {return Err("regionSpace必须是source或image".into());}
+    if request.region_space.as_deref()==Some("image") && request.region.is_none() {return Err("regionSpace=image需要region及最新snapshotId/imageId".into());}
     if request.monitor_id.is_some() && request.operation != "screenshot" {
         return Err("monitorId仅用于screenshot；act由imageId选择屏幕".into());
     }
@@ -708,7 +775,18 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             if request.window_id.is_some() && request.monitor_id.is_some() {
                 return Err("windowId和monitorId不能同时用于截图".into());
             }
-            let mut result = capture(&owner, request.window_id, request.monitor_id, request.region, max_edge, false, &mut state)?;
+            let (wid,mid,region)=if request.region_space.as_deref()==Some("image") {
+                let snap=state.as_ref().filter(|s|s.owner==owner && Some(&s.id)==request.snapshot_id.as_ref() && s.taken.elapsed()<=Duration::from_secs(180)).ok_or("局部截图依据已失效，请先重新截图")?;
+                let shot=snap.shots.iter().find(|s|Some(&s.image_id)==request.image_id.as_ref()).ok_or("imageId不属于最新截图")?;
+                let action:Action=serde_json::from_value(json!({"action":"move","x":0,"y":0})).map_err(err)?;
+                check_target(snap,shot,&action)?;
+                if request.window_id.is_some_and(|id|Some(id)!=snap.window) || request.monitor_id.is_some_and(|id|snap.window.is_some()||id!=shot.surface.id) {return Err("局部截图目标与snapshotId/imageId不一致".into());}
+                (snap.window, snap.window.is_none().then_some(shot.surface.id), Some(image_region(shot,request.region.unwrap())?))
+            } else {
+                if request.region.is_some() && request.window_id.is_none() && request.monitor_id.is_none() {return Err("原始像素region需要windowId或monitorId".into());}
+                (request.window_id,request.monitor_id,request.region)
+            };
+            let mut result = capture(&owner, wid, mid, region, max_edge, false, &mut state)?;
             result["notes"] = json!(request.notes);
             Ok(result)
         }
@@ -766,11 +844,6 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let max_edge = request.max_edge.unwrap_or(snap.max_edge);
             let feedback_window = request.window_id.or(snap.window);
             let monitor_id = snap.window.is_none().then_some(shot.surface.id);
-            if let Err(e) = check_target(snap, &shot, &actions[0]) {
-                let mut result = json!({"status":"not_executed","completedActions":0,"error":e});
-                observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, false, &mut state, &mut result);
-                return Ok(result);
-            }
             let mut enigo = Enigo::new(&Settings::default()).map_err(err)?;
             // Consume before the first OS event; all later failures are explicitly non-retryable.
             let mut snap = state.take().unwrap();
@@ -785,7 +858,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                     }
                 }
                 attempted = true;
-                if let Err(e) = input(&mut enigo, &shot, a) {
+                if let Err(e) = input(&mut enigo, &shot, a, snap.foreground) {
                     failure = Some(e);
                     break;
                 }
@@ -812,7 +885,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 result["coordinateNotice"] = json!("局部操作后的反馈恢复完整窗口；使用新的imageId和完整图片坐标，不沿用局部坐标");
             }
             if failure.is_some() || request.feedback.as_deref() != Some("none") {
-                let settle = needs_stable_feedback(&actions[..completed], result["status"] == "needs_review");
+                let settle = attempted && needs_stable_feedback(&actions[..completed], result["status"] == "needs_review");
                 observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, settle, &mut state, &mut result);
             }
             Ok(result)
@@ -867,6 +940,25 @@ pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_image_regions_and_actual_pointer_validation() {
+        let shot=Shot {image_id:"crop".into(),surface:Surface{id:1,pid:None,x:-1920,y:-100,width:1920,height:1080},
+            pixels:(400,200),source_pixels:(3840,2160),region:Some(Region{x:200,y:100,width:800,height:400}),guard:None};
+        let region=image_region(&shot,Region{x:50,y:25,width:100,height:50}).unwrap();
+        assert_eq!((region.x,region.y,region.width,region.height),(300,150,200,100));
+        assert!(image_region(&shot,Region{x:399,y:0,width:2,height:1}).is_err());
+        assert!(pointer_matches((-1920,-100),(-1919,-99)));
+        assert!(!pointer_matches((-1920,-100),(-1918,-100)));
+        assert!(!pointer_matches((i32::MIN,0),(i32::MAX,0)));
+        let original=xcap::image::RgbaImage::from_pixel(200,100,xcap::image::Rgba([20,20,20,255]));
+        let guarded=Shot{pixels:(200,100),source_pixels:(200,100),region:None,guard:Some(crate::visual_guard::VisualGuard::new(&original)),..shot};
+        let action:Action=serde_json::from_value(json!({"action":"click","x":80,"y":60})).unwrap();
+        assert!(guard_target(&guarded,&action,&original).is_ok());
+        let changed=xcap::image::RgbaImage::from_pixel(200,100,xcap::image::Rgba([200,200,200,255]));
+        assert!(guard_target(&guarded,&action,&changed).is_err());
+        let bad=run("test".into(),json!({"operation":"act","regionSpace":"unknown"})).unwrap();
+        assert_eq!(bad["status"],"not_executed");
+    }
     #[test]
     fn observation_waits_for_delayed_content_and_bounds_animation() {
         use xcap::image::{Rgba, RgbaImage};
@@ -975,7 +1067,7 @@ mod tests {
             {"action":"type","text":"next"}
         ])).unwrap();
         let delays: Vec<_> = (0..actions.len()).map(|i| action_delay(&actions, i).as_millis()).collect();
-        assert_eq!(delays, [0, 0, 0, 0, 0, 80, 80]);
+        assert_eq!(delays, [0, 0, 0, 0, 0, 80, 0]);
         assert!(!needs_stable_feedback(&[], false));
         assert!(!needs_stable_feedback(&actions[4..5], false));
         assert!(needs_stable_feedback(&actions[4..5], true));
@@ -989,7 +1081,7 @@ mod tests {
     }
     #[test]
     fn coordinates_keys_and_validation() {
-        let shot = Shot {
+        let shot = Shot { guard: None,
             image_id: "test".into(),
             surface: Surface {
                 id: 1,
@@ -1006,15 +1098,15 @@ mod tests {
         assert!(point(&shot, Some(3840), Some(0)).is_err());
         assert!(point(&shot, Some(-1), Some(0)).is_err());
         assert!(point(&shot, None, Some(0)).is_err());
-        let scaled = Shot { pixels: (960, 540), ..shot.clone() };
+        let scaled = Shot { guard: None, pixels: (960, 540), ..shot.clone() };
         assert_eq!(point(&scaled, Some(480), Some(270)).unwrap(), (-960, 540));
         assert_eq!(point(&scaled, Some(959), Some(539)).unwrap(), (-2, 1078));
-        let desktop = Shot { surface: Surface { x:0, y:0, ..shot.surface.clone() }, pixels:(1600,900), ..shot.clone() };
+        let desktop = Shot { guard: None, surface: Surface { x:0, y:0, ..shot.surface.clone() }, pixels:(1600,900), ..shot.clone() };
         // The reported click was on the toolbar in the source image, not a DPI offset.
         assert_eq!(point(&desktop, Some(860), Some(520)).unwrap(), (1032, 624));
         let region = Region { x:200, y:100, width:800, height:400 };
         region.validate(shot.source_pixels).unwrap();
-        let cropped = Shot { region:Some(region), pixels:(400,200), ..shot.clone() };
+        let cropped = Shot { guard: None, region:Some(region), pixels:(400,200), ..shot.clone() };
         assert_eq!(point(&cropped, Some(0), Some(0)).unwrap(), (-1820,50));
         assert_eq!(point(&cropped, Some(200), Some(100)).unwrap(), (-1620,150));
         assert!(point(&cropped, Some(400), Some(0)).is_err());
@@ -1038,7 +1130,7 @@ mod tests {
     }
     #[test]
     fn invalid_wait_rejects_whole_batch_before_input() {
-        let shot = Shot { image_id:"monitor-1".into(),
+        let shot = Shot { guard: None, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
             taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot]});
