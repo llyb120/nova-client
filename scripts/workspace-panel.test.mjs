@@ -84,6 +84,20 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   browser = await chromium.launch({ executablePath, headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   page.setDefaultTimeout(10000);
+  // CodeMirror owns selection state; DOM-level contenteditable fill can race
+  // its async language configuration and insert before the original document.
+  // Drive actual select-all input, verify that selection, then insert once.
+  const replaceEditorText = async text => {
+    const editor = page.getByRole('textbox', {name:'文件内容编辑'});
+    await editor.click();
+    await editor.press('Control+a');
+    await page.waitForFunction(() => {
+      const view = window.testCode(), range = view?.state.selection.main;
+      return view?.hasFocus && range.from === 0 && range.to === view.state.doc.length;
+    });
+    await page.keyboard.insertText(text);
+    await page.waitForFunction(text => window.testCode().state.doc.toString() === text, text);
+  };
   const errors = [];
   page.on("pageerror", e => { errors.push(e.message); console.error(e.message); });
   await page.goto(`http://127.0.0.1:${port}/${name}.html`, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -133,14 +147,14 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   await page.getByRole('textbox', {name:'按文件名搜索项目'}).fill('');
   await page.getByRole('button', {name:'选择项目文件',exact:true}).click();
   await page.getByRole('button', {name:'编辑',exact:true}).click();
-  await page.getByRole('textbox', {name:'文件内容编辑'}).fill('# Edited\n');
+  await replaceEditorText('# Edited\n');
   assert.equal(await page.evaluate(() => window.testDisk()), '# Hello\r\n', 'typing must not save');
   await page.getByRole('textbox', {name:'文件内容编辑'}).press('Control+s');
   await page.getByRole('button', {name:'已保存',exact:true}).waitFor();
   console.log('saved');
   assert.equal(await page.evaluate(() => window.testDisk()), '# Edited\r\n', 'preserve CRLF');
   assert.equal(await page.getByRole('textbox', {name:'文件内容编辑'}).evaluate(el => el === document.activeElement), true, 'saving retains focus');
-  await page.getByRole('textbox', {name:'文件内容编辑'}).fill('# Draft\n');
+  await replaceEditorText('# Draft\n');
   await page.getByRole('button', {name:'预览',exact:true}).click();
   await page.getByRole('heading', {name:'Draft'}).waitFor();
   await page.getByRole('button', {name:'选择项目文件',exact:true}).click();
@@ -149,7 +163,7 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   assert.deepEqual(await page.evaluate(() => window.testDirectories()), ['', 'src'], 'expand loads only selected directory and reuses root cache');
   await page.getByRole('treeitem', {name:'main.ts',exact:true}).click();
   assert.equal(await page.getByRole('tab').count(), 2);
-  await page.getByRole('textbox', {name:'文件内容编辑'}).fill('const changed = 2;\n');
+  await replaceEditorText('const changed = 2;\n');
   await page.getByRole('tab', {name:/README.md/}).click();
   await page.getByRole('heading', {name:'Draft'}).waitFor();
   await page.getByRole('tab', {name:/main.ts/}).click();
