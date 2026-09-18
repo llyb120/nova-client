@@ -1,0 +1,37 @@
+name: Long-session regression
+on:
+  push:
+    branches: [perf/long-image-sessions-20260918]
+permissions:
+  contents: read
+concurrency:
+  group: long-session-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Export reproducible local verification workspace
+        run: |
+          git rev-parse HEAD > /tmp/source-revision.txt
+          tar --exclude=.git --exclude=node_modules --exclude=.github -czf /tmp/long-session-source.tgz .
+          tar -czf /tmp/long-session-dependencies.tgz node_modules
+      - uses: actions/upload-artifact@v4
+        with:
+          name: long-session-workspace
+          path: |
+            /tmp/source-revision.txt
+            /tmp/long-session-source.tgz
+            /tmp/long-session-dependencies.tgz
+          retention-days: 1
+          compression-level: 0
