@@ -431,6 +431,15 @@ mod tests {
         loop {
             let event = rx.recv_timeout(std::time::Duration::from_secs(20));
             if event.is_err() {
+                if let Ok(session) = manager.get(id) {
+                    let flow = session.flow.lock().unwrap();
+                    eprintln!(
+                        "PTY timeout: closed={}, reaped={}, output={:?}",
+                        flow.closed,
+                        flow.reaped,
+                        String::from_utf8_lossy(&output)
+                    );
+                }
                 manager.close(id).unwrap();
             }
             match event.expect("terminal did not exit and release its PTY") {
@@ -438,7 +447,24 @@ mod tests {
                     if let Ok(session) = manager.get(id) {
                         session.acknowledge(data.len());
                     }
+                    let previous_len = output.len();
                     output.extend(data);
+                    // ConPTY requests the inherited cursor position. xterm answers
+                    // this in the app; a read-only collector would stall cmd.exe.
+                    // Retain the tail to handle queries split across PTY reads.
+                    let queries = output[previous_len.saturating_sub(3)..]
+                        .windows(4)
+                        .filter(|bytes| *bytes == b"\x1b[6n")
+                        .count();
+                    if queries > 0 {
+                        if let Ok(session) = manager.get(id) {
+                            let mut writer = session.writer.lock().unwrap();
+                            for _ in 0..queries {
+                                writer.write_all(b"\x1b[1;1R").unwrap();
+                            }
+                            writer.flush().unwrap();
+                        }
+                    }
                 }
                 TerminalEvent::Error { message } => panic!("{message}"),
                 TerminalEvent::Exit { code } => {

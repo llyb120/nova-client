@@ -70,6 +70,12 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.evaluate(id=>{for(const byte of new TextEncoder().encode('中文🙂 output\r\n'))window.termTest.send(id,{type:'data',data:[byte]});},first);
   await page.waitForFunction(()=>window.termTest.buffer().includes('中文🙂 output'));
   await page.waitForFunction(()=>window.termTest.acknowledged.length>5);
+
+  // xterm must respond to ConPTY DSR through the same IPC input queue.
+  const beforeQuery=await page.evaluate(()=>window.termTest.writes.length);
+  await page.evaluate(id=>window.termTest.send(id,{type:'data',data:[27,91,54,110]}),first);
+  await page.waitForFunction(before=>/\x1b\[\d+;\d+R/.test(String.fromCharCode(...window.termTest.writes.slice(before).flatMap(w=>w.data))),beforeQuery);
+
   await page.locator('.xterm-helper-textarea').focus();
   await page.keyboard.press('Escape');await page.keyboard.press('Control+c');await page.keyboard.press('Control+s');
   await page.waitForFunction(()=>[3,19,27].every(byte=>window.termTest.writes.some(write=>write.data.includes(byte))));
