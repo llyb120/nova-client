@@ -136,7 +136,7 @@
         "type": "integer",
         "minimum": 1,
         "maximum": 2000,
-        "description": "回复最多元素数，默认60；优先可见未遮挡元素。documentPath保存全部，query搜索全页"
+        "description": "回复最多元素数，默认60；优先可见未遮挡元素。documentPath保存全部已采集元素，query存在时仅保存匹配元素。"
       },
       "maxTextChars": {
         "type": "integer",

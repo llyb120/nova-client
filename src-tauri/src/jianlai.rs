@@ -50,7 +50,7 @@ impl Region {
         if self.width == 0 || self.height == 0
             || self.x.checked_add(self.width).is_none_or(|v| v > pixels.0)
             || self.y.checked_add(self.height).is_none_or(|v| v > pixels.1) {
-            return Err("region超出原始窗口截图范围，必须使用originalWidth/originalHeight像素坐标".into());
+            return Err("region超出原始截图范围，必须使用originalWidth/originalHeight像素坐标".into());
         }
         Ok(())
     }
@@ -1166,6 +1166,32 @@ mod tests {
         assert_eq!(stale["completedActions"], 0);
         assert!(stale["images"].as_array().is_some());
         assert_ne!(stale["snapshotId"], result["snapshotId"]);
+        // Exercise a real monitor crop and preflight without sending a click.
+        // Only the saved witness is changed to simulate stale target pixels.
+        let monitor = Monitor::all().unwrap().remove(0);
+        let cropped = run("test".into(), json!({"operation":"screenshot","monitorId":monitor.id().unwrap(),
+            "maxEdge":0,"region":{"x":0,"y":0,"width":128,"height":128}})).unwrap();
+        assert_eq!(cropped["images"][0]["width"],128);
+        let click: Action = serde_json::from_value(json!({"action":"click","x":64,"y":64})).unwrap();
+        {
+            let snapshot = DESKTOP.lock().unwrap();
+            let snapshot = snapshot.as_ref().unwrap();
+            let original = &snapshot.shots[0];
+            check_target(snapshot,original,&click).unwrap();
+            check_pixels(snapshot,original,&click).unwrap();
+            let mut changed = original.clone();
+            let mut pixels = changed.guard.as_ref().unwrap().as_ref().clone();
+            for y in 57..72 { for x in 57..72 {
+                let p=pixels.get_pixel_mut(x,y);
+                for c in 0..3 {p[c]=255-p[c];}
+            }}
+            changed.guard=Some(std::sync::Arc::new(pixels));
+            assert!(check_pixels(snapshot,&changed,&click).unwrap_err().contains("画面已变化"));
+        }
+        let _=std::fs::remove_file(cropped["images"][0]["path"].as_str().unwrap());
+        eprintln!("desktop guard: real monitor crop + unchanged target accepted + stale witness rejected; no click sent");
+        // Restore the feedback snapshot used by the stale-focus test below.
+        let result = run("test".into(),json!({"operation":"screenshot"})).unwrap();
         // Simulate a stale foreground identity without actually changing the user's focus.
         DESKTOP.lock().unwrap().as_mut().unwrap().foreground = Some((u32::MAX, u32::MAX));
         let recovered = run("test".into(), json!({"operation":"act","snapshotId":result["snapshotId"],

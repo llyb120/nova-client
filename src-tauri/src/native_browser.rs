@@ -1807,5 +1807,12 @@ mod tests {
             parse_action(r#"{"action":"click","frame":0,"ref":"v1:0","selector":"body"}"#).is_err()
         );
         assert!(parse_action(r#"{"action":"eval","code":"alert(1)"}"#).is_err());
+        for action in [
+            r#"{"action":"click_at","imageId":"image-1","x":1.25,"y":2.5}"#,
+            r#"{"action":"double_click_at","imageId":"image-1","x":1,"y":2}"#,
+            r#"{"action":"drag","imageId":"image-1","x":1,"y":2,"to_x":3,"to_y":4}"#,
+            r#"{"action":"scroll_at","imageId":"image-1","x":1,"y":2,"delta":0,"delta_x":40}"#,
+            r#"{"action":"wait_for","frame":0,"ref":"v1:0","state":"enabled","ms":500}"#,
+        ] { assert!(parse_action(action).is_ok(), "{action}"); }
     }
 }

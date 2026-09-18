@@ -43,7 +43,12 @@ async function attach(target) {
   const evaluate = async expression => { const v=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true}); if(v.exceptionDetails)throw Error(JSON.stringify(v.exceptionDetails)); return v.result.value; };
   return { call, evaluate };
 }
-const targets = async () => (await fetch(`http://127.0.0.1:${debugPort}/json/list`)).json();
+// Separate WebView2 profiles have separate browser processes. CI gives the
+// sidebar's test-only debugging endpoint its own port; neither is a product setting.
+const targets = async () => (await Promise.all([...new Set([debugPort, Number(process.env.TEST_CHILD_CDP_PORT || debugPort)])].map(async port => {
+  try { return await (await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1000) })).json(); }
+  catch { return []; }
+}))).flat();
 try {
   const mainTarget=await until(async()=> (await targets()).find(t=>t.type==='page'&&!t.url.startsWith('devtools:')),'main');
   const main=await attach(mainTarget);
@@ -109,6 +114,15 @@ try {
   const blocked=await act({action:'fill',...find(observation,'订单号'),text:'不应写入'},observation);
   assert.equal(blocked.status,'not_executed');assert.match(blocked.reason,/遮挡/);
   observation=await ui('inspect');await act({action:'click',...find(observation,'关闭遮挡')},observation);
+  // A click can succeed while its focus handler redirects elsewhere. Such a
+  // partially performed fill must be needs_review, never a replayable failure.
+  await page.evaluate(`document.body.insertAdjacentHTML('afterbegin','<input id="focus-trap" aria-label="不应修改" value="preserve">');document.querySelector('label input').addEventListener('focus',()=>document.querySelector('#focus-trap').focus(),{once:true})`);
+  observation=await ui('inspect');
+  const hijacked=await act({action:'fill',...find(observation,'订单号'),text:'must not reach focus trap'},observation);
+  assert.equal(hijacked.status,'needs_review',JSON.stringify(hijacked));
+  assert.match(hijacked.reason,/焦点/);
+  assert.equal(await page.evaluate('document.querySelector("#focus-trap").value'),'preserve');
+  await page.evaluate('document.querySelector("#focus-trap").remove()');
   // Partial center occlusion should use a visible edge without an extra model or retry.
   await page.evaluate(`const r=document.querySelectorAll('button')[1].getBoundingClientRect();document.body.insertAdjacentHTML('beforeend','<div id="partial" style="position:fixed;left:'+(r.x+r.width*.4)+'px;top:'+r.y+'px;width:'+(r.width*.2)+'px;height:'+r.height+'px;background:red;z-index:9999"></div>')`);
   observation=await ui('inspect');assert.equal((await act({action:'click',...find(observation,'查询','订单筛选')},observation)).status,'executed');
