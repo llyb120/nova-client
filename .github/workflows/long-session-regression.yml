@@ -1,53 +1,110 @@
-name: Long-session reviewed source preparation
+name: Long-session regression
 on:
-  push:
-    branches: [perf/long-image-sessions-20260918]
+  pull_request:
+    branches: [pre-release]
+    paths:
+      - 'src/**'
+      - 'src-tauri/src/**'
+      - 'scripts/**history**'
+      - 'scripts/fixtures/history-ui-fixture.tsx'
+      - 'scripts/lib/browser-fixture.mjs'
+      - '.github/workflows/long-session-regression.yml'
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: long-session-${{ github.ref }}
+  group: long-session-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
-  prepare:
+  frontend:
     runs-on: ubuntu-24.04
-    timeout-minutes: 4
-    permissions:
-      contents: write
+    timeout-minutes: 15
+    env:
+      TEST_BROWSER: /usr/bin/google-chrome
+      TEST_REPORT_DIR: history-ui-results
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Apply reviewed source without changing workflow permissions or definitions
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - name: Paging, bitmap budgets, timeline identities and image layout
+        run: node --experimental-strip-types --test scripts/history-window.test.mjs scripts/history-images.test.mjs scripts/bubble-image-layout.test.mjs
+      - name: Complete ChatView with 10,000 image-heavy rounds and control races
+        run: node scripts/history-ui.test.mjs
+      - name: Existing virtualized history, prompt and workspace regressions
+        run: |
+          node scripts/long-session-render.test.mjs
+          node scripts/long-prompt-render.test.mjs
+          node scripts/workspace-panel.test.mjs
+      - run: npm run test:terminal
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: long-history-ui
+          path: history-ui-results/
+          retention-days: 7
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 3
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      TEST_REPORT_DIR: history-native-results
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Use crates.io on CI
+        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build:sdk-bridges:release
+      - name: Compile native library and all unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --no-run 2>&1 | tee native-compile.log
+      - name: Shared histories, assets, migration, paging and worldline regressions
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib transcript:: -- --nocapture 2>&1 | tee transcript-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib history_ -- --nocapture 2>&1 | tee history-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib threads:: -- --nocapture 2>&1 | tee threads-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib time_machine:: -- --nocapture 2>&1 | tee time-machine-tests.log
+      - name: Enable loopback driver only in the disposable debug build
         run: |
           python - <<'PY'
-          import base64,hashlib,lzma,pathlib,subprocess
-          base='0967813f8e5f56f26f72e448b9927d1f535d9ee2'
-          wf='.github/workflows/long-session-regression.yml'
-          changed=subprocess.check_output(['git','diff','--name-only',base,'HEAD'],text=True).splitlines()
-          assert all(p==wf or p.startswith('.github/history-transfer/') for p in changed),changed
-          paths=sorted(pathlib.Path('.github/history-transfer').glob('part-*.b64'))
-          assert len(paths)==4
-          data=lzma.decompress(base64.b64decode(''.join(p.read_text().strip() for p in paths)))
-          assert hashlib.sha256(data).hexdigest()=='148a72bc0dce3c51676fa695c99c8485c514cffe6020b74f27ee0353134b4081'
-          workflow=pathlib.Path(wf)
-          workflow.write_bytes(subprocess.check_output(['git','show',base+':'+wf]))
-          patch=pathlib.Path('/tmp/history-ui.patch');patch.write_bytes(data)
-          subprocess.run(['git','apply','--check',str(patch)],check=True)
-          subprocess.run(['git','apply',str(patch)],check=True)
-          # GITHUB_TOKEN cannot update workflow files. Leave this file unchanged;
-          # the authorized connector will separately install the final read-only CI.
-          workflow.write_bytes(subprocess.check_output(['git','show','HEAD:'+wf]))
-          for path in paths:path.unlink()
-          subprocess.run(['git','add','-A'],check=True)
-          staged=subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines()
-          assert not any(p.startswith('.github/workflows/') for p in staged)
-          subprocess.run(['git','diff','--cached','--check'],check=True)
-          print('Verified source patch; no workflow updates in this commit.')
+          import json
+          from pathlib import Path
+          p=Path('src-tauri/tauri.conf.json'); v=json.loads(p.read_text(encoding='utf-8'))
+          v['app']['windows'][0]['additionalBrowserArgs']='--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion'
+          p.write_text(json.dumps(v,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
           PY
-      - name: Publish source once to the existing development branch
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'perf(chat): bounded history UI, thumbnail budgets, lazy worldline and responsive controls'
-          git push origin HEAD:perf/long-image-sessions-20260918
-          echo "Final source: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build actual desktop executable
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin nova 2>&1 | tee native-build.log
+      - name: Real WebView2 history, thumbnail, migration and restart checks
+        run: node scripts/history-native-smoke.mjs 2>&1 | tee native-smoke.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: long-history-native
+          path: |
+            native-*.log
+            *-tests.log
+            history-native-results/
+          retention-days: 7
