@@ -1,0 +1,57 @@
+name: Tool precision regression
+on:
+  pull_request:
+    branches: [pre-release]
+    paths:
+      - 'src-tauri/src/native_browser*'
+      - 'src-tauri/src/browser_pixels.rs'
+      - 'src-tauri/src/visual_guard.rs'
+      - 'src-tauri/src/jianlai.rs'
+      - 'scripts/*-tool.json'
+      - 'scripts/browser-targeting.test.mjs'
+      - 'scripts/nova-tools-mcp*'
+      - 'extensions/nova-chrome/**'
+      - 'package*.json'
+      - '.github/workflows/tool-precision.yml'
+  push:
+    branches: [pre-release]
+    paths:
+      - 'src-tauri/src/native_browser*'
+      - 'src-tauri/src/browser_pixels.rs'
+      - 'src-tauri/src/visual_guard.rs'
+      - 'src-tauri/src/jianlai.rs'
+      - 'scripts/*-tool.json'
+      - 'scripts/browser-targeting.test.mjs'
+      - 'scripts/nova-tools-mcp*'
+      - 'extensions/nova-chrome/**'
+      - 'package*.json'
+      - '.github/workflows/tool-precision.yml'
+permissions:
+  contents: read
+concurrency:
+  group: tool-precision-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      TEST_BROWSER: /usr/bin/google-chrome
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - name: Real browser targeting and Canvas input
+        run: node scripts/browser-targeting.test.mjs
+      - name: Chrome extension and MCP integration boundaries
+        run: node --test extensions/nova-chrome/worker.test.mjs scripts/nova-tools-mcp.test.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tool-precision-report
+          path: browser-targeting-report.json
+          if-no-files-found: ignore
