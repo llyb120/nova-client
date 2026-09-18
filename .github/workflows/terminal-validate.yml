@@ -1,34 +1,76 @@
-name: Terminal frontend validation
+name: Terminal final validation
 on:
   push:
     branches: [work/terminal-build-20260918]
 permissions:
   contents: write
 jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      revision: ${{ steps.commit.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: work/terminal-implementation-20260918
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Finalize deterministic regressions and shared navigation styling
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src-tauri/src/workspace_terminal.rs');s=p.read_text()
+          s=s.replace('self.sessions.lock().map_err(|e| e.into_inner())?.remove(id)', 'self.sessions.lock().map_err(|e| e.to_string())?.remove(id)')
+          p.write_text(s)
+          p=Path('scripts/workspace-terminal.test.mjs');s=p.read_text()
+          old="  await page.setViewportSize({width:1000,height:640});\n  await page.waitForFunction(()=>window.termTest.resized.length>5);"
+          new="""  const beforeResize=await page.evaluate(()=>({count:window.termTest.resized.length,id:window.termTest.id(),last:window.termTest.resized.filter(s=>s.id===window.termTest.id()).at(-1)}));
+            await page.setViewportSize({width:1000,height:640});
+            await page.waitForFunction(before=>window.termTest.resized.slice(before.count).some(s=>s.id===before.id&&(s.cols!==before.last.cols||s.rows!==before.last.rows)),beforeResize);"""
+          assert old in s;s=s.replace(old,new)
+          s=s.replace('let server,browser;', 'let server,browser,page;').replace('const page=await browser.newPage(', 'page=await browser.newPage(')
+          s=s.replace('} finally { await browser?.close();', "} catch(error) { if(process.env.TEST_SCREENSHOT&&page)await page.screenshot({path:process.env.TEST_SCREENSHOT}).catch(()=>{}); throw error; } finally { await browser?.close();")
+          p.write_text(s)
+          p=Path('scripts/workspace-panel.test.mjs');s=p.read_text()
+          old="  await page.getByRole('region', {name:'会话产物'}).getByRole('button', {name:'README.md'}).click();\n  assert.equal(await page.evaluate(() => window.testCode().state.doc.toString()), '# Draft\\n');"
+          new="  await page.getByRole('region', {name:'会话产物'}).getByRole('button', {name:'README.md'}).click();\n  await page.getByRole('heading', {name:'Draft'}).waitFor();\n  await page.getByRole('button', {name:'编辑',exact:true}).click();\n  await page.getByRole('textbox', {name:'文件内容编辑'}).waitFor();\n  assert.equal(await page.evaluate(() => window.testCode().state.doc.toString()), '# Draft\\n');"
+          assert old in s;s=s.replace(old,new);p.write_text(s)
+          p=Path('src/components/WorkspaceTerminal.css');lines=p.read_text().splitlines()
+          nav=[line for line in lines if line.startswith('.workspace-panel .workspace-modes')]
+          p.write_text('\n'.join(line for line in lines if line not in nav)+'\n')
+          p=Path('src/components/WorkspacePanel.css');p.write_text(p.read_text()+'\n'+'\n'.join(nav)+'\n')
+          PY
+          rustfmt --edition 2021 src-tauri/src/workspace_terminal.rs
+      - name: Commit validation candidate
+        id: commit
+        run: |
+          git config user.name 'llyb120'
+          git config user.email 'llyb120@users.noreply.github.com'
+          git add src-tauri/src/workspace_terminal.rs src/components/WorkspaceTerminal.css src/components/WorkspacePanel.css scripts/workspace-terminal.test.mjs scripts/workspace-panel.test.mjs
+          git diff --cached --check
+          git commit -m 'test: cover native terminal teardown and deterministic workspace interactions'
+          git push origin HEAD:refs/heads/work/terminal-implementation-20260918
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git archive --format=tar.gz -o "$RUNNER_TEMP/terminal-source.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terminal-source
+          path: ${{ runner.temp }}/terminal-source.tar.gz
+          retention-days: 3
   frontend:
+    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: work/terminal-implementation-20260918
+          ref: ${{ needs.prepare.outputs.revision }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
-      - name: Make resize regression independent of incidental event counts
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('scripts/workspace-terminal.test.mjs')
-          s=p.read_text()
-          s=s.replace("  await page.setViewportSize({width:1000,height:640});\n  await page.waitForFunction(()=>window.termTest.resized.length>5);", """  const beforeResize=await page.evaluate(()=>({count:window.termTest.resized.length,id:window.termTest.id(),last:window.termTest.resized.filter(s=>s.id===window.termTest.id()).at(-1)}));
-            await page.setViewportSize({width:1000,height:640});
-            await page.waitForFunction(before=>window.termTest.resized.slice(before.count).some(s=>s.id===before.id&&(s.cols!==before.last.cols||s.rows!==before.last.rows)),beforeResize);""")
-          s=s.replace('let server,browser;', 'let server,browser,page;').replace('const page=await browser.newPage(', 'page=await browser.newPage(')
-          s=s.replace('} finally { await browser?.close();', "} finally { if(process.env.TEST_SCREENSHOT&&page)await page.screenshot({path:process.env.TEST_SCREENSHOT}).catch(()=>{}); await browser?.close();")
-          p.write_text(s)
-          PY
       - run: npm ci --no-audit --no-fund
       - name: Typecheck and conversation regressions
         run: |
@@ -47,25 +89,51 @@ jobs:
           TEST_BROWSER: /usr/bin/google-chrome
         run: node scripts/workspace-panel.test.mjs
       - name: Production frontend build
+        if: ${{ !cancelled() }}
         run: npm run build
-      - name: Commit verified regression test
-        run: |
-          git config user.name 'llyb120'
-          git config user.email 'llyb120@users.noreply.github.com'
-          git add scripts/workspace-terminal.test.mjs
-          git diff --cached --check
-          git commit -m 'test: assert real terminal resize instead of incidental callback counts'
-          git push origin HEAD:refs/heads/work/terminal-implementation-20260918
-          echo "Verified frontend: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
-          git archive --format=tar.gz -o "$RUNNER_TEMP/terminal-source.tar.gz" HEAD
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: terminal-ui
           path: terminal-ui.png
-      - uses: actions/upload-artifact@v4
-        if: success()
+  native:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 3
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
         with:
-          name: terminal-source
-          path: ${{ runner.temp }}/terminal-source.tar.gz
-          retention-days: 3
+          ref: ${{ needs.prepare.outputs.revision }}
+          submodules: recursive
+      - name: Use crates.io
+        shell: bash
+        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Generate bridge resources
+        run: npm run build:sdk-bridges:release
+      - name: Linux prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xvfb libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Native typecheck
+        run: cargo check --manifest-path src-tauri/Cargo.toml --lib
+      - name: Real PTY lifecycle tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib workspace_terminal::tests -- --nocapture
