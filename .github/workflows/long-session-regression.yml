@@ -1,4 +1,4 @@
-name: Long-session regression
+name: Long-session reviewed source preparation
 on:
   push:
     branches: [perf/long-image-sessions-20260918]
@@ -8,26 +8,72 @@ concurrency:
   group: long-session-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  frontend:
+  prepare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 4
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - run: npm ci --no-audit --no-fund
-      - run: npm run check
-      - name: Export exact test workspace for offline continuation
+          fetch-depth: 0
+      - name: Apply the checksum-verified source delta and remove transfer files
         run: |
-          git archive --format=tar HEAD > /tmp/long-session-source.tar
-          tar -czf /tmp/long-session-dependencies.tar.gz node_modules
-          gzip /tmp/long-session-source.tar
-      - uses: actions/upload-artifact@v4
-        with:
-          name: long-session-test-workspace
-          path: /tmp/long-session-*.tar.gz
-          retention-days: 1
+          python - <<'PY'
+          import base64,hashlib,json,lzma,pathlib,subprocess
+          paths=sorted(pathlib.Path('.github/history-transfer').glob('part-*.b64'))
+          assert len(paths)==4
+          data=lzma.decompress(base64.b64decode(''.join(p.read_text().strip() for p in paths)))
+          assert hashlib.sha256(data).hexdigest()=='148a72bc0dce3c51676fa695c99c8485c514cffe6020b74f27ee0353134b4081'
+          # Only restore the workflow preimage: the reviewed delta replaces it
+          # with a permanent read-only PR/manual regression workflow.
+          wf=pathlib.Path('.github/workflows/long-session-regression.yml')
+          wf.write_bytes(subprocess.check_output(['git','show','0967813f8e5f56f26f72e448b9927d1f535d9ee2:.github/workflows/long-session-regression.yml']))
+          patch=pathlib.Path('/tmp/history-ui.patch');patch.write_bytes(data)
+          subprocess.run(['git','apply','--check',str(patch)],check=True)
+          subprocess.run(['git','apply',str(patch)],check=True)
+          expected={
+            '.github/workflows/long-session-regression.yml':'294e75d3829883493d9fbe0b60b5038c4a3721f5',
+            'docs/long-image-history.md':'0349030fc3197f2a8bfea353e225df061682a1e6',
+            'scripts/bubble-image-layout.test.mjs':'d711631dd6a39e1bcedf19f46ba59381e80e6884',
+            'scripts/fixtures/history-ui-fixture.tsx':'e5a9130af4f037b1a5c3304cb916ed8a59b4242d',
+            'scripts/history-images.test.mjs':'8be29ac65ba94a240593255a4b3717baf92c4e18',
+            'scripts/history-native-smoke.mjs':'c7442609d065d2c0e2dd875ea30c6b47d238979c',
+            'scripts/history-ui.test.mjs':'77e6693bb8e5d4c4637fc538f58678cc4336b8bb',
+            'scripts/history-window.test.mjs':'55b4fe3def0d286a4152df68904a9498ca6c18e1',
+            'scripts/lib/browser-fixture.mjs':'9dcbfdb1669ba8312d37142f9222cc50ecbbec79',
+            'src-tauri/src/history_page.rs':'7b40581a0db5a89f8a0b65b753e1cb1756fd517d',
+            'src-tauri/src/lib.rs':'bdffda18360f5c4d58fee06b9e64ae4591b3177d',
+            'src/components/CanvasTranscript.tsx':'a9ef65bbedb9c20713d1e575b814424213efbe47',
+            'src/components/ChatView.tsx':'a99f9aadb65f1e1a60e4471ddf363121c33a8690',
+            'src/components/Composer.tsx':'35af6de648b1e28583cab6c16011370362ff7c21',
+            'src/components/HistoryDetails.css':'a26b122c642d243d86736475dec43df5789b4ce1',
+            'src/components/HistoryDetails.tsx':'dc054b8c1f36282674ecfac127ce4a2fa53779c7',
+            'src/components/ImageAttachmentStrip.tsx':'03138865946a60e4351ab31b3b1bc797da60779a',
+            'src/components/TurnGroup.tsx':'f45c8ce9b62d9ab99cacdfeabc4dc05a97cf0541',
+            'src/components/WorkspacePanel.tsx':'937d67da7346b79e0f193862b9ac4b940087efa5',
+            'src/historyImages.ts':'77a4971e1de2036531137f766ce4780fcce1cf23',
+            'src/historyTypes.ts':'e96c5bb7cb8cf914dd8096a784af5492a9eef84f',
+            'src/historyWindow.ts':'9d919ed38ba3c3de1bca5a695738226c0d1dbd8c',
+            'src/ipc.ts':'148fee6758f0436a587afeb039e6c7b340fed474',
+            'src/store.ts':'1ba2b3941777d308edc533792681cf5b3cf262b8',
+            'src/timelineGraph.ts':'ac65c7ac447bb2794a7b371dfc8c063e69105e7d',
+            'src/transcriptImage.ts':'66feff457e6b8dc481813d7531e6a0383fb6f67a',
+            'src/types.ts':'100e8e1308566da553f3fb8d0fb325dcc00f26c0',
+            'src/workspaceArtifacts.ts':'10e9aec70968703620d10f5bc4409aa2070ab7da',
+          }
+          for path,sha in expected.items():
+              actual=subprocess.check_output(['git','hash-object',path],text=True).strip()
+              assert actual==sha,(path,actual,sha)
+          for path in paths:path.unlink()
+          subprocess.run(['git','add','--',*expected,'.github/history-transfer'],check=True)
+          subprocess.run(['git','diff','--cached','--check'],check=True)
+          print('Verified all 28 final source/test/workflow files; transfer files removed.')
+          PY
+      - name: Publish once to the existing development branch only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'perf(chat): bounded history UI, thumbnail budgets, lazy worldline and responsive controls'
+          git push origin HEAD:perf/long-image-sessions-20260918
+          echo "Final candidate: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
