@@ -45,7 +45,7 @@ export function ChatView() {
     const target = typeof detail === 'string' ? { path: detail } : detail;
     if (!target || typeof target.path !== "string" || !state.currentId) return;
     setWorkspaceRequest(target);
-    setWorkspaceOpen(true);
+    setWorkspaceLayout({ open: true, mode: "files" });
   };
   onMount(() => window.addEventListener("nova:preview-file", previewFile));
   onCleanup(() => window.removeEventListener("nova:preview-file", previewFile));
@@ -1170,7 +1170,7 @@ export function ChatView() {
       {/* 文件/产物侧栏排在 Stage 导航右边：聊天 → 世界线 → Stage → 侧边栏。 */}
       <Show when={workspaceOpen() && roamingRole() !== "guest"}>
         <Show keyed when={state.currentId}>
-          {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
+          {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceLayout.mode === "terminal" ? null : workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
         </Show>
       </Show>
       <Portal>

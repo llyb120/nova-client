@@ -25,12 +25,18 @@ export const BUILTIN_STOP_SESSION_SHORTCUT: SessionShortcut = {
   target: "",
 };
 
-/** 运行时合并内置 Esc 终止；剥离历史配置里的 stopSession。 */
+export const DEFAULT_TERMINAL_SHORTCUT: SessionShortcut = {
+  id: "default-toggle-terminal", keys: "Ctrl+`", action: "toggleTerminal", target: "",
+};
+/** 默认终端按键和 Esc；已配置同动作或占用同按键时尊重用户设置。 */
 export function withDefaultSessionShortcuts(
   shortcuts: SessionShortcut[],
 ): SessionShortcut[] {
   return [
     ...shortcuts.filter((item) => item.action !== "stopSession"),
+    ...(!shortcuts.some(item => item.action === "toggleTerminal" ||
+      ["ctrl+`", "ctrl+~", "ctrl+shift+~", "ctrl+shift+`"].includes(item.keys.trim().toLowerCase()))
+      ? [{ ...DEFAULT_TERMINAL_SHORTCUT }] : []),
     { ...BUILTIN_STOP_SESSION_SHORTCUT },
   ];
 }
@@ -138,7 +144,15 @@ export function findSessionShortcut(
   const formatted = formatShortcutKeys(event);
   if (!formatted) return null;
   const needle = normalizeShortcutKeys(formatted);
-  return shortcuts.find((item) => normalizeShortcutKeys(item.keys) === needle) ?? null;
+  const exact = shortcuts.find((item) => normalizeShortcutKeys(item.keys) === needle);
+  if (exact) return exact;
+  // The ~ keycap is commonly used to describe Ctrl+Backquote, with or without Shift.
+  if (event.ctrlKey && !event.altKey && !event.metaKey &&
+      (event.code === "Backquote" || event.key === "`" || event.key === "~")) {
+    return shortcuts.find(item => item.id === DEFAULT_TERMINAL_SHORTCUT.id &&
+      item.action === "toggleTerminal" && item.keys === DEFAULT_TERMINAL_SHORTCUT.keys) ?? null;
+  }
+  return null;
 }
 
 /** 在组件 setup 阶段调用：挂全局 capture keydown，按 allowedActions 执行回调。 */
@@ -156,6 +170,7 @@ export function mountSessionShortcuts(options: {
   onNewSession?: () => void;
   /** 循环打开普通模式下有未读轮次的会话。 */
   onOpenUnread?: () => void;
+  onToggleTerminal?: () => void;
   /** 新会话页选择工作流；工作流已停用或不存在时由调用方提示。 */
   onSelectWorkflow?: (workflowId: string) => void;
   /**
@@ -179,9 +194,12 @@ export function mountSessionShortcuts(options: {
     const hit = findSessionShortcut(event, shortcuts);
     if (!hit?.keys) return;
     if (!allowed.has(hit.action)) return;
+    if (event.target instanceof HTMLElement && event.target.closest(".workspace-terminal") &&
+        !["toggleTerminal", "openUnread", "newSession"].includes(hit.action)) return;
     if (
       hit.action !== "newSession" &&
       hit.action !== "openUnread" &&
+      hit.action !== "toggleTerminal" &&
       hit.action !== "hideToVirgo" &&
       hit.action !== "stopSession" &&
       !hit.target
@@ -226,6 +244,9 @@ export function mountSessionShortcuts(options: {
       event.stopPropagation();
       options.onNewSession?.();
       return;
+    }
+    if (hit.action === "toggleTerminal") {
+      event.preventDefault(); event.stopPropagation(); options.onToggleTerminal?.(); return;
     }
     if (hit.action === "openUnread") {
       event.preventDefault();

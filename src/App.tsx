@@ -1,4 +1,4 @@
-import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, lazy, onCleanup, onMount, Show, Suspense } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
 import { AchievementsModal } from "./components/AchievementsModal";
 import { ChatView } from "./components/ChatView";
@@ -17,7 +17,8 @@ import "./promptQueue";
 import { selectedChatText } from "./chatSelection";
 import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
 import { mountSessionShortcuts } from "./sessionShortcuts";
-import { setWorkspaceLayout } from "./workspaceLayout";
+import { setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
+const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
   return (
@@ -189,9 +190,13 @@ export default function App() {
 
   // 「打开未读消息」在应用聚焦时的按键处理；全局注册（Rust 侧）覆盖最小化/失焦场景。
   mountSessionShortcuts({
-    allowedActions: ["openUnread", "hideToVirgo"],
+    allowedActions: ["openUnread", "hideToVirgo", "toggleTerminal"],
     onOpenUnread: () => void openNextUnreadThread(),
     onHideToVirgo: hideCurrentThreadToVirgo,
+    onToggleTerminal: () => {
+      if (state.threads.find(thread => thread.id === state.currentId)?.roamingRole === "guest") return;
+      setWorkspaceLayout({ open: !(workspaceLayout.open && workspaceLayout.mode === "terminal"), mode: "terminal" });
+    },
   });
 
   // 空闲时后端请求更新（update:prompt）→ 自动弹出更新对话框，由用户选择是否现在更新。
@@ -230,6 +235,9 @@ export default function App() {
         }
       >
         <ChatView />
+      </Show>
+      <Show when={!state.currentId && workspaceLayout.open && workspaceLayout.mode === "terminal"}>
+        <Suspense><HomeTerminalPanel /></Suspense>
       </Show>
       <Show when={showSettings()}>
         <Show

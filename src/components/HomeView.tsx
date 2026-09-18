@@ -42,6 +42,7 @@ import {
   zenRunningChains,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
+import { setHomeTerminalCwd } from "../workspaceLayout";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import type { AgentKind, Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
@@ -74,6 +75,7 @@ export function HomeView() {
   const [cwd, setCwd] = createSignal(
     sessionSeed && !sessionSeed.roam ? sessionSeed.cwd : "",
   );
+  createEffect(() => setHomeTerminalCwd(cwd()));
   const [agentKind, setAgentKind] = createSignal<AgentKind>(
     resolveEnabledAgentKind(sessionSeed?.agentKind ?? lastUsed.agentKind()),
   );

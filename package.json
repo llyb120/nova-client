@@ -20,7 +20,8 @@
     "test:nova-tools-native": "cargo test --manifest-path src-tauri/Cargo.toml nova_tools_native",
     "test:context-parity": "node scripts/cursor-context-super.test.mjs",
     "eval:context-recall": "node scripts/ctx-recall.eval.mjs",
-    "eval:context-invoke": "node scripts/ctx-invoke.eval.mjs"
+    "eval:context-invoke": "node scripts/ctx-invoke.eval.mjs",
+    "test:terminal": "node scripts/terminal-shortcuts.test.mjs && node scripts/workspace-terminal.test.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.2",
@@ -54,6 +55,8 @@
     "marked": "^18.0.5",
     "qrcode": "^1.5.4",
     "solid-js": "^1.9.13",
-    "typebox": "^1.1.38"
+    "typebox": "^1.1.38",
+    "@xterm/xterm": "^5.5.0",
+    "@xterm/addon-fit": "^0.10.0"
   }
 }
