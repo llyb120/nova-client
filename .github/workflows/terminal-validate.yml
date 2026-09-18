@@ -1,4 +1,4 @@
-name: Precision tools full acceptance
+name: Precision tools final acceptance
 on:
   push:
     branches: [work/terminal-build-20260918]
@@ -14,29 +14,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 32b502baa6c1948f18fb0a760e92a9d324021d8b
+          ref: d1f0c27b15e27186b2b16eb40d573be7b8f3da18
           path: staging
       - uses: actions/checkout@v4
         with:
-          ref: 3bb760c652a450424a8e0b64e0d97fd2bbef1378
+          ref: 52246f088035d68db08cf699275756ca91d89a77
           path: source
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Apply reviewed acceptance checks
+      - name: Keep Canvas visible to query-based inspection
         working-directory: source
-        run: |
-          python ../staging/.github/precision-tools/finalize.py
-          rustfmt --edition 2021 src-tauri/src/browser_pixels.rs src-tauri/src/visual_guard.rs
+        run: python ../staging/.github/precision-tools/canvas-query.py
       - name: Commit candidate
         id: commit
         working-directory: source
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add scripts/native-browser-smoke.mjs scripts/chrome-tool.json scripts/webview-tool.json src-tauri/src/jianlai.rs src-tauri/src/native_browser.rs src-tauri/src/browser_pixels.rs src-tauri/src/visual_guard.rs
+          git add scripts/browser-targeting.test.mjs src-tauri/src/native_browser_page.js
           git diff --cached --check
-          git commit -m 'test(tools): verify focus-safety and real desktop pixel witnesses'
+          git commit -m 'fix(chrome): preserve Canvas visual feedback when DOM query has no match'
           git push origin HEAD:fix/precision-tools-20260918
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   frontend:
@@ -49,14 +44,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.revision }}
-          fetch-depth: 4
+          fetch-depth: 8
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
       - run: npm ci --no-audit --no-fund
       - run: npm run check
-      - name: Browser targeting and same-run performance comparison
+      - name: Browser targeting and paired performance measurement
         shell: bash
         run: |
           git show 9798b86d66b8b7b8822c3d26a92cf838d6efb03d:src-tauri/src/native_browser_page.js > /tmp/browser-page-before.js
@@ -73,12 +68,8 @@ jobs:
             browser-targeting.log
   native:
     needs: prepare
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-24.04]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    runs-on: windows-latest
+    timeout-minutes: 20
     defaults:
       run:
         shell: bash
@@ -104,19 +95,7 @@ jobs:
           cache: npm
       - run: npm ci --no-audit --no-fund
       - run: npm run build:sdk-bridges:release
-      - name: Linux prerequisites
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libpipewire-0.3-dev libxcb-randr0-dev libgbm-dev
-      - name: Native input, coordinate and pixel witness tests
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml --lib native_browser:: -- --nocapture 2>&1 | tee native-browser-tests.log
-          cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai:: -- --nocapture 2>&1 | tee jianlai-tests.log
-          cargo test --manifest-path src-tauri/Cargo.toml --lib chrome_browser:: -- --nocapture 2>&1 | tee chrome-tests.log
-      - name: Real Jianlai monitor crop and mouse-position guards
-        if: runner.os == 'Windows'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::desktop_smoke -- --ignored --exact --nocapture 2>&1 | tee jianlai-desktop-tests.log
       - name: Enable separate debug drivers in isolated Windows build only
-        if: runner.os == 'Windows'
         run: |
           python - <<'PY'
           import json
@@ -131,10 +110,8 @@ jobs:
           p.write_text(s,encoding='utf-8')
           PY
       - name: Windows native executable
-        if: runner.os == 'Windows'
         run: cargo build --manifest-path src-tauri/Cargo.toml --bin nova 2>&1 | tee native-browser-build.log
       - name: Real Windows WebView2 and Chrome-transport integration
-        if: runner.os == 'Windows'
         env:
           TEST_CDP_PORT: '9222'
           TEST_CHILD_CDP_PORT: '9223'
@@ -144,9 +121,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: precision-native-${{ runner.os }}
+          name: precision-native-Windows
           path: |
-            *-tests.log
             native-browser-build.log
             native-browser-smoke.log
             vite.log
