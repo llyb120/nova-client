@@ -1,4 +1,4 @@
-name: Precision tools validation
+name: Precision tools acceptance
 on:
   push:
     branches: [work/terminal-build-20260918]
@@ -14,34 +14,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: bc812b3fff8b7b3635ee843434183446993dad31
+          ref: a2c99152343588ccbc73e62774aea321b375850a
           path: staging
       - uses: actions/checkout@v4
         with:
-          ref: 9798b86d66b8b7b8822c3d26a92cf838d6efb03d
+          ref: cc46ac6e2edfe43e84414b73bf84c0c98868bb1f
           path: source
-      - name: Apply reviewed source patch
+      - name: Apply reviewed refinements
         working-directory: source
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          import base64,lzma,hashlib,subprocess
-          pieces=sorted(Path('../staging/.github/precision-tools').glob('part-*.b64'))
-          assert len(pieces)==5
-          patch=lzma.decompress(base64.b64decode(''.join(p.read_text().strip() for p in pieces),validate=True))
-          assert hashlib.sha256(patch).hexdigest()=='5dbf5af53519a550c56d2d02fe93359622396fdb3fad7ca4e60fe6f200dc7073'
-          Path('../precision.patch').write_bytes(patch)
-          subprocess.run(['git','apply','--check','../precision.patch'],check=True)
-          subprocess.run(['git','apply','--index','../precision.patch'],check=True)
-          PY
-      - name: Commit candidate without overwriting concurrent work
+        run: python ../staging/.github/precision-tools/refine.py
+      - name: Commit candidate
         id: commit
         working-directory: source
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src-tauri/src/native_browser.rs src-tauri/src/native_browser_page.js scripts/browser-targeting.test.mjs
           git diff --cached --check
-          git commit -m 'feat(tools): precise DOM targets, canvas pixel mapping and preflight witnesses'
+          git commit -m 'fix(tools): reject invisible targets and verify scaled iframe boundaries'
           git push origin HEAD:fix/precision-tools-20260918
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   frontend:
@@ -54,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.revision }}
-          fetch-depth: 2
+          fetch-depth: 3
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -65,7 +55,7 @@ jobs:
         shell: bash
         run: |
           git show 9798b86d66b8b7b8822c3d26a92cf838d6efb03d:src-tauri/src/native_browser_page.js > /tmp/browser-page-before.js
-          BROWSER_PAGE_BASELINE=/tmp/browser-page-before.js node scripts/browser-targeting.test.mjs 2>&1 | tee browser-targeting.log
+          BROWSER_BASELINE=/tmp/browser-page-before.js node scripts/browser-targeting.test.mjs 2>&1 | tee browser-targeting.log
       - name: Extension and MCP regressions
         run: node --test extensions/nova-chrome/worker.test.mjs scripts/nova-tools-mcp.test.mjs
       - run: npm run build
