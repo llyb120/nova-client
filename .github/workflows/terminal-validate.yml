@@ -1,4 +1,4 @@
-name: Terminal runtime regression and Windows desktop
+name: Terminal platform acceptance
 on:
   push:
     branches: [work/terminal-build-20260918]
@@ -14,44 +14,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: cdc49a09d3ef034934bf1ff61764c8ca1409c22a
+          ref: 4a26f50f32357d76b9b124fd2be9204c65ae1947
           path: ci
       - uses: actions/checkout@v4
         with:
-          ref: 0b07b5b41a049e0939598338072ef0eac2dfc94c
+          ref: a5feaddb5ad77d301c8420b2664cb843db6967b6
           path: source
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Apply reviewed runtime fixes
+      - name: Refine native shell smoke assertions
         working-directory: source
-        run: |
-          python ../ci/.github/terminal-runtime-fix.py
-          rustfmt --edition 2021 src-tauri/build.rs src-tauri/src/workspace_terminal.rs
-      - name: Commit fix candidate
+        run: python ../ci/.github/terminal-smoke-fix.py
+      - name: Commit candidate
         id: commit
         working-directory: source
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src-tauri/build.rs src-tauri/src/workspace_terminal.rs src/terminalSessions.ts scripts/workspace-terminal.test.mjs
+          git add scripts/windows-terminal-smoke.mjs
           git diff --cached --check
-          git commit -m 'fix(terminal): decouple input readiness and complete ConPTY shutdown handshake'
+          git commit -m 'test(terminal): use real Enter input and shell-independent tab selectors'
           git push origin HEAD:fix/windows-terminal-20260918
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: terminal-fix-source
-          path: |
-            source/src-tauri/build.rs
-            source/src-tauri/src/workspace_terminal.rs
-            source/src/terminalSessions.ts
-            source/scripts/workspace-terminal.test.mjs
-            source/scripts/windows-terminal-smoke.mjs
   frontend:
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      TEST_BROWSER: /usr/bin/google-chrome
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,15 +52,8 @@ jobs:
       - run: npm run check
       - run: node scripts/terminal-shortcuts.test.mjs
       - run: node scripts/workspace-terminal.test.mjs
-        env:
-          TEST_SCREENSHOT: terminal-regression.png
       - run: node scripts/workspace-panel.test.mjs
       - run: npm run build
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: terminal-frontend-regression
-          path: terminal-regression.png
   native:
     needs: prepare
     strategy:
@@ -90,6 +71,11 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.revision }}
           submodules: recursive
+      - uses: actions/checkout@v4
+        if: runner.os == 'Windows'
+        with:
+          ref: 4a26f50f32357d76b9b124fd2be9204c65ae1947
+          path: _ci
       - name: Use crates.io
         shell: bash
         run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
@@ -106,19 +92,30 @@ jobs:
       - run: npm run build:sdk-bridges:release
       - name: Linux prerequisites
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libpipewire-0.3-dev libxcb-randr0-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libpipewire-0.3-dev libxcb-randr0-dev libgbm-dev
       - name: Native terminal tests
         id: tests
         continue-on-error: true
         shell: bash
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib workspace_terminal::tests -- --nocapture 2>&1 | tee native-terminal-tests.log
-      - name: Build real desktop executable
+      - name: Build desktop executable
         if: runner.os == 'Windows'
         shell: bash
         run: cargo build --manifest-path src-tauri/Cargo.toml --bin nova 2>&1 | tee windows-terminal-build.log
+      - name: Inspect executable manifest and installed runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $mt = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter mt.exe -Recurse | Where-Object { $_.Directory.Name -eq 'x64' } | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          & $mt -nologo '-inputresource:src-tauri/target/debug/nova.exe;#1' '-out:windows-terminal-app.manifest'
+          Get-Content windows-terminal-app.manifest
+          foreach ($root in @("${env:ProgramFiles(x86)}\Microsoft\EdgeWebView\Application", "$env:LOCALAPPDATA\Microsoft\EdgeWebView\Application")) { Get-ChildItem $root -Directory -ErrorAction SilentlyContinue | Select-Object FullName }
+          exit 0
       - name: Real WebView2 terminal interaction
         if: runner.os == 'Windows'
         shell: bash
+        env:
+          TEST_WINDOWS_DIAGNOSTICS: _ci/.github/windows-terminal-diagnostics.ps1
         run: node scripts/windows-terminal-smoke.mjs 2>&1 | tee windows-terminal-smoke.log
       - uses: actions/upload-artifact@v4
         if: always()
@@ -129,6 +126,7 @@ jobs:
             windows-terminal-*.json
             windows-terminal-*.log
             windows-terminal-*.png
+            windows-terminal-*.manifest
       - name: Require native tests to pass
         if: always() && steps.tests.outcome != 'success'
         shell: bash
