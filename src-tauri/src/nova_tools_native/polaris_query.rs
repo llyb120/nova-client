@@ -75,7 +75,7 @@ impl Query {
         if task.is_empty(){task=anchors.iter().filter(|s|!identifier(s)).cloned().collect::<Vec<_>>().join(" ");}
         anchors.retain(|s|identifier(s));anchors.truncate(5);
         let files=strings(&params["files"],6);
-        for f in &files {if Path::new(f).is_absolute()||f.contains('\\')||f.split('/').any(|s|s==".."||s==".")||f.contains(':'){return Err("files 必须是仓库内相对路径".into());}}
+        for f in &files {if f.starts_with('/')||Path::new(f).is_absolute()||f.contains('\\')||f.split('/').any(|s|s==".."||s==".")||f.contains(':'){return Err("files 必须是仓库内相对路径".into());}}
         if task.is_empty()&&anchors.is_empty()&&files.is_empty(){return Err("需要 query / task / keywords / files 至少其一".into());}
         let mut terms=Vec::new();let mut seen=HashSet::new();
         for t in tokens(&format!("{} {}",task,anchors.join(" "))){if seen.insert(t.clone()){terms.push((t,1.0));}if terms.len()>=64{break;}}
