@@ -1,0 +1,55 @@
+name: One-time Command Code live A-B
+on:
+  push:
+    branches: [work/operator-commandcode-ab-20260919]
+    paths: [.github/workflows/operator-commandcode-live.yml]
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test provider transport without secrets
+        run: node --test scripts/operator-commandcode-ab.test.mjs
+      - name: Generate cases using unchanged production projector
+        run: |
+          mkdir -p validation
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          cargo run --quiet --manifest-path bench/operator-commandcode-harness/Cargo.toml > validation/operator-cases.json
+          git rev-parse HEAD > validation/tested-commit.txt
+          sha256sum src-tauri/src/operator/core.rs src-tauri/src/lyra/reasonix.rs scripts/cursor-context-reasonix.mjs > validation/production-source-hashes.txt
+      - name: Prepare ephemeral recipient (private key remains on runner)
+        run: node scripts/operator-ci-envelope.mjs prepare
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operator-public-recipient
+          path: operator-public-recipient.json
+          retention-days: 1
+      - name: Receive encrypted credential and execute bounded live A-B
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/operator-ci-envelope.mjs run
+      - name: Validate responses with production Decision parser and guards
+        if: always()
+        run: |
+          if [ -f validation/operator-commandcode-ab.json ]; then
+            cargo run --quiet --manifest-path bench/operator-commandcode-harness/Cargo.toml -- --validate validation/operator-commandcode-ab.json
+            node scripts/operator-commandcode-ab.mjs --summarize --out validation/operator-commandcode-ab.json
+          fi
+      - name: Destroy ephemeral private key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/operator-one-time-recipient"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-commandcode-live-results
+          path: validation/
+          retention-days: 7
