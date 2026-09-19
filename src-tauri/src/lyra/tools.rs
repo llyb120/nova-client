@@ -536,6 +536,16 @@ async fn execute_inner(
     owner: &str,
 ) -> ToolOutcome {
     match name {
+        "operate" => {
+            if shell.is_none() { return ToolOutcome::error("只读模式不可执行 Operator"); }
+            let Some(scope) = crate::operator::scope_for_alias(owner) else {
+                return ToolOutcome::error("Operator 缺少当前会话绑定，不能选择替代模型");
+            };
+            match crate::operator::execute(&scope, root, args).await {
+                Ok(value) => ToolOutcome::text(value.to_string()), // No imagePath/details reattachment.
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
         "webview" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，网页控制不可用"); }
             match crate::native_browser::execute(root, args).await {

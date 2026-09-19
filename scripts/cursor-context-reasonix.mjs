@@ -710,7 +710,7 @@ async function recoverTimedOutAgent(
     model: modelSelection(request.model),
     local: {
       cwd: request.cwd,
-      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan", operatorScope: request.operatorScope }),
     },
   };
   return {
@@ -781,7 +781,7 @@ function agentFingerprint(request) {
   const model = String(request?.model ?? "");
   const cwd = String(request?.cwd ?? "");
   const mode = request?.mode === "plan" ? "plan" : "agent";
-  return `${model}\0${cwd}\0${mode}`;
+  return `${model}\0${cwd}\0${mode}${request?.operatorScope ? `\0${request.operatorScope}` : ""}`;
 }
 
 function canReuseAgentSession(agent, session, request, sessionKey) {
@@ -792,7 +792,7 @@ function canReuseAgentSession(agent, session, request, sessionKey) {
 }
 
 function cursorToolShape(request) {
-  const tools = createCursorFilesystemTools(request?.cwd, { readOnly: request?.mode === "plan" });
+  const tools = createCursorFilesystemTools(request?.cwd, { readOnly: request?.mode === "plan", operatorScope: request?.operatorScope });
   return Object.entries(tools).map(([name, tool]) => ({
     name,
     description: tool.description ?? "",
@@ -808,7 +808,7 @@ function agentCreateOptions(request) {
     local: {
       cwd: request?.cwd,
       // Vega-style batch FS tools; inlined via SDK (unlike hooks, which are file-only).
-      customTools: createCursorFilesystemTools(request?.cwd, { readOnly }),
+      customTools: createCursorFilesystemTools(request?.cwd, { readOnly, operatorScope: request?.operatorScope }),
     },
   };
 }

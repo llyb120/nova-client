@@ -918,6 +918,7 @@ fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, d
 }
 
 pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
+    crate::operator::check_access(owner)?;
     let owner = crate::native_browser::tool_owner(root, owner)?;
     let args = args.clone();
     tokio::task::spawn_blocking(move || {

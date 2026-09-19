@@ -2645,6 +2645,7 @@ impl AcpManager {
                 match loaded {
                     Ok(result) => {
                         self.capture_options(&result, !conn.from_prewarm);
+                        self.remember_operator_model(&sid, &result);
                         // session/load 成功，继续复用该会话。
                         sid
                     }
@@ -3123,6 +3124,7 @@ impl AcpManager {
                 applied_effort: None,
             },
         );
+        self.remember_operator_model(&sid, &resp);
         Ok(sid)
     }
 
@@ -3607,6 +3609,7 @@ impl AcpManager {
         };
         let t_ensure = std::time::Instant::now();
         let mut session_id = self.ensure_session(thread_id, require_restore).await?;
+        let _operator_registration = self.register_operator(thread_id, &session_id);
         if !self.is_running(thread_id) || !cwd_changes.is_current() {
             return Err("任务已停止".into());
         }
@@ -3794,6 +3797,66 @@ impl AcpManager {
             }
         }
         Err(last_err)
+    }
+
+    fn remember_operator_model(&self, sid: &str, response: &Value) {
+        if self.kind != AgentKind::CodeBuddy { return; }
+        let options = &response["configOptions"];
+        let current = model_config_option(options).and_then(|o| o["currentValue"].as_str());
+        let (model, embedded_effort) = split_model_effort(current);
+        let effort = options.as_array().and_then(|a| a.iter().find(|o| o["id"] == "thought_level"))
+            .and_then(|o| o["currentValue"].as_str()).map(str::to_owned).or(embedded_effort);
+        if let Some(route) = self.routes.lock().unwrap().get_mut(sid) {
+            if model.is_some() { route.applied_model = model; }
+            if effort.is_some() { route.applied_effort = effort; }
+        }
+    }
+
+    fn register_operator(self: &Arc<Self>, thread_id: &str, sid: &str) -> Option<crate::operator::Registration> {
+        if self.kind != AgentKind::CodeBuddy { return None; }
+        let (cwd, readonly) = {
+            let state = self.app.state::<AppState>(); let store = state.store.lock().unwrap();
+            let thread = store.get(thread_id)?;
+            (thread.cwd.clone(), thread.mode.as_deref().map(unify_mode_id).as_deref() == Some("plan"))
+        };
+        if readonly { return None; }
+        // Use successful, session-specific applied state, never the UI/global model cache.
+        let (model, effort) = {
+            let routes = self.routes.lock().unwrap(); let route = routes.get(sid)?;
+            (route.applied_model.clone()?, route.applied_effort.clone())
+        };
+        let inherited_model = model.clone(); let inherited_effort = effort.clone();
+        let weak = Arc::downgrade(self);
+        let registration = crate::operator::register(
+            &format!("operator:{}", self.cwd_change_scope(thread_id)),
+            PathBuf::from(cwd), nova_data_dir(&self.app),
+            crate::operator::core::ModelIdentity { agent: "codebuddy".into(), model, reasoning_effort: effort },
+            Arc::new(move |input| {
+                let weak = weak.clone(); let model = inherited_model.clone(); let effort = inherited_effort.clone();
+                Box::pin(async move {
+                    let manager = weak.upgrade().ok_or("Parent runtime stopped")?;
+                    let scratch = crate::operator::executors::Scratch::new()?;
+                    let command = manager.operator_command(&scratch.0)?;
+                    crate::operator::executors::codebuddy(command, model, effort, input, scratch).await
+                })
+            }),
+        );
+        let weak = Arc::downgrade(self);
+        let id = thread_id.to_string();
+        let start = self.turn_started.lock().unwrap().get(thread_id).copied();
+        crate::operator::set_parent_alive(&registration.scope, Arc::new(move || weak.upgrade().is_some_and(|m| {
+            m.is_running(&id) && m.turn_started.lock().unwrap().get(&id).copied() == start
+        })));
+        Some(registration)
+    }
+
+    fn operator_command(&self, cwd: &std::path::Path) -> Result<tokio::process::Command, String> {
+        let state = self.app.state::<AppState>(); let settings = state.settings.lock().unwrap();
+        let (_, mut command) = codebuddy_command(&settings.codebuddy_path, &CODEBUDDY_ACP_ARGS);
+        command.args(["--tools", "", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--no-session-persistence", "--system-prompt", crate::operator::SYSTEM]);
+        command.current_dir(cwd).envs(codebuddy_activation_env(&self.launch_env));
+        apply_proxy_env(&mut command, self.proxy_of(&settings));
+        Ok(command)
     }
 
     fn cwd_change_scope(&self, thread_id: &str) -> String {
@@ -4163,6 +4226,12 @@ impl AcpManager {
             state.context_service.endpoint(),
             state.context_service.token(),
         )?;
+        if self.kind == AgentKind::CodeBuddy && !read_only {
+            server["env"].as_array_mut().unwrap().push(json!({
+                "name": "NOVA_OPERATOR_SCOPE", "value": crate::operator::scope_for(&format!("operator:{}", self.cwd_change_scope(thread_id)))
+            }));
+            server["_meta"]["tools"]["operate"] = json!({ "defer_loading": false });
+        }
         if auto_change_project {
             server["env"].as_array_mut().unwrap().push(json!({
                 "name": "NOVA_CWD_CHANGE_SCOPE", "value": self.cwd_change_scope(thread_id)

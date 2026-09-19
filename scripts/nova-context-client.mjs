@@ -19,7 +19,7 @@ function wait(ms) {
   return new Promise((done) => setTimeout(done, ms));
 }
 
-async function requestOnce(config, method, root, params, clientOwner) {
+async function requestOnce(config, method, root, params, clientOwner, operatorScope) {
   return new Promise((resolveResult, reject) => {
     const socket = connect(config.endpoint);
     let response = "";
@@ -35,7 +35,7 @@ async function requestOnce(config, method, root, params, clientOwner) {
     const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), ["webview", "chrome"].includes(method) ? 45_000 : ["generate_image", "edit_image"].includes(method) ? 610_000 : CALL_TIMEOUT_MS);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ token: config.token, method, root: resolve(root), owner: clientOwner, params: params ?? {} })}\n`);
+      socket.write(`${JSON.stringify({ token: config.token, method, root: resolve(root), owner: clientOwner, operatorScope, params: params ?? {} })}\n`);
     });
     socket.on("data", (chunk) => { response += chunk; });
     socket.on("end", () => {
@@ -55,7 +55,7 @@ export function globalContextServiceConfigured() {
   return serviceConfig() !== null;
 }
 
-export async function callGlobalContextTool(method, root, params, clientOwner = owner) {
+export async function callGlobalContextTool(method, root, params, clientOwner = owner, operatorScope) {
   const config = serviceConfig();
   if (!config) throw new Error("global context service is not configured");
   const mode = "fast";
@@ -65,9 +65,9 @@ export async function callGlobalContextTool(method, root, params, clientOwner = 
   const deadline = Date.now() + CONNECT_TIMEOUT_MS;
   for (;;) {
     try {
-      return await requestOnce(config, method, root, requestParams, clientOwner);
+      return await requestOnce(config, method, root, requestParams, clientOwner, operatorScope);
     } catch (error) {
-      if (["generate_image", "edit_image", "webview", "chrome", "jianlai"].includes(method)) throw error;
+      if (["generate_image", "edit_image", "webview", "chrome", "jianlai", "operate"].includes(method)) throw error;
       const code = error?.code;
       if (Date.now() >= deadline || !["ENOENT", "ECONNREFUSED", "EPIPE"].includes(code)) throw error;
       await wait(CONNECT_RETRY_MS);
