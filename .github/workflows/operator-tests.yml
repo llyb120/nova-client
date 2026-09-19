@@ -1,0 +1,41 @@
+name: Operator tests
+
+on:
+  push:
+    branches: [work/operator-context-20260919]
+  pull_request:
+    branches: [pre-release]
+    paths:
+      - '**/*operator*'
+      - '.github/workflows/operator-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: operator-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: Reproducible source snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git archive --format=tar HEAD | gzip > operator-source.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operator-source
+          path: operator-source.tar.gz
+          retention-days: 1
+  test:
+    name: Node regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: node --test scripts/nova-tools-mcp.test.mjs scripts/ctx-core.test.mjs
