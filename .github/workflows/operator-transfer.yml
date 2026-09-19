@@ -5,6 +5,9 @@ on:
     paths: [.operator-transfer.b64]
 permissions:
   contents: write
+defaults:
+  run:
+    shell: bash
 jobs:
   apply:
     runs-on: ubuntu-latest
@@ -15,8 +18,10 @@ jobs:
       - name: Apply reviewed transfer patch
         run: |
           python3 - <<'PY'
-          import base64,gzip,pathlib,subprocess
-          patch=gzip.decompress(base64.b64decode(pathlib.Path('.operator-transfer.b64').read_text(),validate=True))
+          import base64,lzma,pathlib,subprocess,hashlib
+          encoded=''.join(p.read_text().strip() for p in sorted(pathlib.Path('.').glob('.operator-part-*.b64')))
+          patch=lzma.decompress(base64.b64decode(encoded,validate=True))
+          assert hashlib.sha256(patch).hexdigest()==pathlib.Path('.operator-transfer.b64').read_text().strip()
           for line in patch.decode().splitlines():
               if line.startswith('+++ b/'):
                   path=line[6:]
@@ -30,7 +35,7 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git rm .operator-transfer.b64
+          git rm .operator-transfer.b64 .operator-part-*.b64
           git add src-tauri/src scripts bench/operator-harness
           test ! -d docs/operator || git add docs/operator
           git commit -m 'feat: isolate Operator context and inherit active session model without settings'
