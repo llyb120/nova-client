@@ -39,10 +39,11 @@ if(process.argv[2]==='prepare'){
     if(value.runId!==runId||value.nonce!==recipient.nonce||Date.now()>recipient.expiresAt)throw new Error('Invalid or expired credential binding');
     apiKey=value.apiKey;value.apiKey=null;
     if(typeof apiKey!=='string'||!/^user_[A-Za-z0-9_-]{16,300}$/.test(apiKey))throw new Error('Credential format rejected');
-    // GitHub workflow command, not a normal log line. Never interpolate secrets in YAML or argv.
     process.stdout.write(`::add-mask::${apiKey}\n`);
     await unlink(keyPath);plain.fill(0);
-    const report=await runBenchmark({apiKey,fixturesPath:'validation/operator-cases.json',outPath:'validation/operator-commandcode-ab.json',repeats:2});
+    const report=process.env.OPERATOR_IMAGE_PROBE==='1'
+      ? await (await import('./operator-commandcode-image-probe.mjs')).runProbe({apiKey,fixturesPath:'bench/operator-commandcode-harness/image-fixtures.json',outPath:'validation/operator-image-probe.json'})
+      : await runBenchmark({apiKey,fixturesPath:'validation/operator-cases.json',outPath:'validation/operator-commandcode-ab.json',repeats:2});
     console.log(JSON.stringify({status:report.status,modelCallsAttempted:report.modelCallsAttempted,modelCallsSucceeded:report.modelCallsSucceeded}));
     if(report.status==='blocked')process.exitCode=1;
   }finally{plain?.fill(0);apiKey=null;await unlink(keyPath).catch(()=>{});}
