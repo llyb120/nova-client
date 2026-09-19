@@ -3,6 +3,7 @@ use super::*;
 mod query {include!("polaris_query.rs");}
 mod index {include!("polaris_index.rs");}
 mod vectors {include!("polaris_vectors.rs");}
+mod rank {include!("polaris_rank.rs");}
 use query::Query;
 use index::CodeUnit;
 
@@ -34,6 +35,7 @@ fn identity(u:&CodeUnit)->(String,String,usize){(u.file.clone(),u.name.clone(),u
 fn related(a:&CodeUnit,b:&CodeUnit,files:&HashSet<String>)->Option<&'static str>{
     if identity(a)==identity(b)||b.name=="<module>"||b.name.len()<3{return None;}
     let calls=|from:&CodeUnit,to:&CodeUnit|{
+        rank::qualified_call(from,to,files)||
         (from.file==to.file&&from.calls.contains(&to.name))||from.imports.iter().any(|i|{
             (i.orig.as_deref().unwrap_or(&i.name)==to.name&&from.calls.contains(&i.name)||from.members.iter().any(|(object,member)|object==&i.name&&member==&to.name))
                 &&resolve_specifier(&i.from,&from.file,files).as_deref()==Some(&to.file)
@@ -68,7 +70,8 @@ fn retrieve_attempt(root:&Path,q:&Query,started:Instant,retried:bool)->Result<St
     for (i,u) in units.iter().enumerate(){if q.files.contains(&u.file)||q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&u.name)){*scores.entry(i).or_default()+=1.0;}}
     let mut ranked=scores.into_iter().collect::<Vec<_>>();ranked.sort_by(|a,b|b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     // De-duplicate snippets of the same function before the expensive second stage.
-    let mut seen=HashSet::new();ranked.retain(|(i,_)|seen.insert(identity(&units[*i])));ranked.truncate(24);
+    let mut seen=HashSet::new();ranked.retain(|(i,_)|seen.insert(identity(&units[*i])));
+    rank::refine_forwarders(&mut ranked,&units,q);ranked.truncate(24);
     // An in-flight edit invalidates old semantic results as well as lexical evidence.
     let stale=ranked.iter().filter(|(i,_)|!index::verified(&root,&units[*i])).map(|(i,_)|units[*i].file.clone()).collect::<HashSet<_>>();
     if !stale.is_empty(){index::invalidate(&root,&stale);if !retried&&Instant::now()<deadline{return retrieve_attempt(&root,q,started,true);}}

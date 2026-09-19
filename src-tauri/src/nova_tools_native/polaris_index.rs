@@ -24,14 +24,16 @@ fn file_role(file:&str)->&'static str {
     if l.ends_with(".md"){"documentation"}else if l.contains("/tests/")||l.contains("/test/")||l.contains(".test.")||l.contains(".spec.")||l.ends_with("/tests.rs")||l.starts_with("bench/")||l.starts_with("tests/")||l.starts_with("test/"){"test"}else{"implementation"}
 }
 fn references(text:&str)->(HashSet<String>,Vec<(String,String)>,HashSet<String>,Vec<(String,String)>){
-    static CALLS:OnceLock<Regex>=OnceLock::new();static EVENTS:OnceLock<Regex>=OnceLock::new();static MEMBERS:OnceLock<Regex>=OnceLock::new();
+    static CALLS:OnceLock<Regex>=OnceLock::new();static EVENTS:OnceLock<Regex>=OnceLock::new();static MEMBERS:OnceLock<Regex>=OnceLock::new();static RUST_CALLS:OnceLock<Regex>=OnceLock::new();
     let bounded=text.chars().take(20000).collect::<String>();
     let calls=CALLS.get_or_init(||Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^;{}]{0,100}>)?\s*\(").unwrap()).captures_iter(&bounded).take(256).map(|c|c[1].to_string()).collect();
     let mut commands=HashSet::new();let mut events=Vec::new();
     for c in EVENTS.get_or_init(||Regex::new(r#"\b(emit|listen|on|invoke)\s*(?:<[^;{}]{0,100}>)?\s*\(\s*["']([A-Za-z0-9_:/.-]{4,128})["']"#).unwrap()).captures_iter(&bounded).take(64){
         if &c[1]=="invoke"{commands.insert(c[2].to_string());}else{events.push((c[1].to_string(),c[2].to_string()));}
     }
-    let members=MEMBERS.get_or_init(||Regex::new(r"\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*(?:<[^;{}]{0,100}>)?\s*\(").unwrap()).captures_iter(&bounded).take(128).map(|c|(c[1].to_string(),c[2].to_string())).collect();
+    let mut members:Vec<(String,String)>=MEMBERS.get_or_init(||Regex::new(r"\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*(?:<[^;{}]{0,100}>)?\s*\(").unwrap()).captures_iter(&bounded).take(128).map(|c|(c[1].to_string(),c[2].to_string())).collect();
+    members.extend(RUST_CALLS.get_or_init(||Regex::new(r"\b((?:crate|self|super)(?:::[A-Za-z_][\w]*)+)::([A-Za-z_][\w]*)\s*\(").unwrap())
+        .captures_iter(&bounded).take(64).map(|c|(c[1].to_string(),c[2].to_string())));
     (calls,events,commands,members)
 }
 fn is_retrieval_unit(symbol:&Symbol,lines:&[String])->bool {
@@ -48,7 +50,7 @@ fn is_retrieval_unit(symbol:&Symbol,lines:&[String])->bool {
             let last=symbol.end.min(first+16).min(lines.len());
             let header=lines[first..last].join("\n");
             if header.trim_start().starts_with("def ")||header.trim_start().starts_with("async def "){return true;}
-            METHOD_BODY.get_or_init(||Regex::new(r"(?s)^\s*(?:(?:public|private|protected|readonly|static|async|get|set|override|abstract)\s+)*\*?\s*[A-Za-z_$][\w$]*\s*(?:<[^>]*>)?\s*\([^;]*\)\s*(?::[^=;{}]+)?\s*\{").unwrap()).is_match(&header)
+            METHOD_BODY.get_or_init(||Regex::new(r"(?s)^\s*(?:(?:public|private|protected|readonly|static|async|get|set|override|abstract)\s+)*\*?\s*[A-Za-z_$][\w$]*\s*(?:<[^>]*>)?\s*\([^;{}]*\)\s*(?::[^=;{}]+)?\s*\{").unwrap()).is_match(&header)
         },_=>false
     }
 }
@@ -68,8 +70,10 @@ fn identifier_aliases(text:&str)->Vec<String> {
         }
         for word in variants {if seen.insert(word.clone()){words.push(word);}}
     }
-    let Ok(q)=query::Query::parse(serde_json::json!({"task":words.join(" ")})) else{return Vec::new();};
-    q.terms.into_iter().filter(|(_,weight)|*weight<1.0).map(|(word,_)|word).collect()
+    let seed=words.join(" ");
+    let original=query::tokens(&seed).into_iter().collect::<HashSet<_>>();
+    let Ok(q)=query::Query::parse(serde_json::json!({"task":seed})) else{return Vec::new();};
+    q.terms.into_iter().filter(|(word,_)|!original.contains(word)).map(|(word,_)|word).collect()
 }
 fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
     let entry=scan_source(text,file);let source=Arc::new(text.lines().map(str::to_owned).collect::<Vec<_>>());
