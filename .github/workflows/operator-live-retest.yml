@@ -1,0 +1,180 @@
+name: Operator live post-fix A/B
+
+on:
+  push:
+    branches: [work/operator-context-20260919]
+    paths: [.github/workflows/operator-live-retest.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: operator-live-post-fix-ab
+  cancel-in-progress: false
+
+env:
+  OPERATOR_SOURCE_SHA: a4509e1dd01dd34002a58ca1853d965256083d0d
+  OPERATOR_FIXTURE_SHA: 3d7ac249129e3f25c703fb03a1dd5617c3560a7a
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Require a securely configured model credential
+        env:
+          COMMAND_CODE_API_KEY: ${{ secrets.COMMAND_CODE_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${COMMAND_CODE_API_KEY:-}" =~ ^user_[A-Za-z0-9_-]{16,300}$ ]]; then
+            echo '::error::Live A/B blocked: COMMAND_CODE_API_KEY is missing or invalid. Configure a rotated repository Actions secret, then rerun this job.'
+            echo '## Live A/B blocked' >> "$GITHUB_STEP_SUMMARY"
+            echo 'No model requests were made. No speed, task-success, or token-saving result is available. Configure the repository Actions secret COMMAND_CODE_API_KEY; do not commit or paste the credential into logs.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.OPERATOR_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.OPERATOR_FIXTURE_SHA }}
+          path: _fixture
+          persist-credentials: false
+      - name: Stage the pinned live fixture without changing production
+        run: |
+          set -euo pipefail
+          mkdir -p validation .cargo
+          test "$(git rev-parse HEAD)" = "$OPERATOR_SOURCE_SHA"
+          git rev-parse HEAD > validation/tested-commit.txt
+          cp -r _fixture/bench/operator-gui-harness bench/
+          cp _fixture/scripts/operator-native-gui-ab.mjs scripts/
+          cp _fixture/scripts/operator-real-json-transport.mjs scripts/
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          printf '\n[dev-dependencies]\ntempfile = "3"\n' >> bench/operator-gui-harness/Cargo.toml
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/operator-native-gui-ab.mjs')
+          s = p.read_text()
+          old = "productionBaseline:'517cb2d43c54acb89d38c33b9d89095362394a8b'"
+          assert s.count(old) == 1
+          s = s.replace(old, 'productionBaseline:process.env.OPERATOR_SOURCE_SHA')
+          # An unresolved native request must not overlap the next test page.
+          old = "}catch(e){row.status='error';row.error=redact(e.message,apiKey);}"
+          assert s.count(old) == 1
+          s = s.replace(old, "}catch(e){row.status='error';row.error=redact(e.message,apiKey);if(e.message.includes(' timeout'))throw e;}")
+          p.write_text(s)
+          PY
+          sha256sum src-tauri/src/operator/{core,contract,runtime}.rs src-tauri/src/jianlai.rs src-tauri/src/lyra/reasonix.rs > validation/tested-hashes.txt
+          git diff --exit-code -- src-tauri/src
+          cat > scripts/operator-post-fix-run.mjs <<'JS'
+          import {mkdir,writeFile,appendFile} from 'node:fs/promises';
+          import {runGui} from './operator-native-gui-ab.mjs';
+          import {installDecisionTransport,preflight,correction,transportAudit} from './operator-real-json-transport.mjs';
+          let key=process.env.COMMAND_CODE_API_KEY;
+          delete process.env.COMMAND_CODE_API_KEY;
+          delete process.env.GITHUB_TOKEN;
+          delete process.env.GH_TOKEN;
+          if(!/^user_[A-Za-z0-9_-]{16,300}$/.test(key??''))throw Error('Missing model credential');
+          const clean=s=>String(s).split(key).join('[REDACTED]').replace(/user_[A-Za-z0-9_-]{16,}/g,'[REDACTED]');
+          const save=(path,value)=>writeFile(path,clean(JSON.stringify(value,null,2)),{mode:0o600});
+          const sum=values=>values.reduce((a,b)=>a+b,0);
+          const percentile=(values,p)=>{const a=values.filter(Number.isFinite).sort((a,b)=>a-b);if(!a.length)return null;const x=(a.length-1)*p;return a[Math.floor(x)]+(a[Math.ceil(x)]-a[Math.floor(x)])*(x-Math.floor(x));};
+          await mkdir('validation',{recursive:true});
+          const restore=installDecisionTransport();
+          try {
+            await preflight(key,'validation');
+            const preflightAttempts=transportAudit.length;
+            const g=await runGui({apiKey:key,outDir:'validation/gui'});
+            g.sourceCommit=process.env.OPERATOR_SOURCE_SHA;
+            g.workflowCommit=process.env.GITHUB_SHA;
+            g.fixtureCommit=process.env.OPERATOR_FIXTURE_SHA;
+            g.effectiveTransport=correction;
+            await save('validation/gui/report.json',g);
+            await save('validation/transport-audit.json',transportAudit);
+            const audit=transportAudit.slice(preflightAttempts);
+            const transportClean=audit.length===g.decisions.length&&audit.every(a=>a.status===200&&a.attempt===0);
+            const summary={status:g.status,sourceCommit:g.sourceCommit,fixtureCommit:g.fixtureCommit,model:g.model,plannedTasks:12,attemptedTasks:g.runs.length,success:g.businessSuccess,falseCompletions:g.falseCompletions,transportAttempts:audit.length,arms:{},pairedSuccessfulTasks:[],scope:g.scope,limitations:['A is the same fixed runtime with accumulated observation history; it is not an untouched CodeBuddy CLI.','One paired run per channel/task; no statistical significance claim.','End-to-end time includes decisions, observations, actions and recovery, but excludes fixture/browser setup.','Token totals come from provider usage, not characters or an invoice. Transport failures/retries make complete-usage metrics unavailable.','Both arms use the same retained JSON API test adapter; this is not the full Nova client/provider integration.']};
+            for(const arm of ['A','B']){
+              const rows=g.runs.filter(r=>r.arm===arm),ids=new Set(rows.map(r=>r.id));
+              const calls=g.decisions.filter(d=>ids.has(d.run));
+              const usageComplete=transportClean&&calls.length>0&&calls.every(d=>!d.error&&Number.isFinite(d.usage?.prompt_tokens)&&Number.isFinite(d.usage?.completion_tokens));
+              const prompt=sum(calls.map(d=>d.usage?.prompt_tokens).filter(Number.isFinite));
+              const completion=sum(calls.map(d=>d.usage?.completion_tokens).filter(Number.isFinite));
+              const successes=rows.filter(r=>r.actualTaskSuccess);
+              summary.arms[arm]={plannedTasks:6,attemptedTasks:rows.length,successes:successes.length,falseCompletions:rows.filter(r=>r.falseCompletion).length,modelCalls:calls.length,usageComplete,observedPromptTokens:prompt,observedCompletionTokens:completion,promptTokens:usageComplete?prompt:null,completionTokens:usageComplete?completion:null,totalTokens:usageComplete?prompt+completion:null,allAttemptedTaskMs:sum(rows.map(r=>r.elapsedMs).filter(Number.isFinite)),medianAttemptMs:percentile(rows.map(r=>r.elapsedMs),.5),p95AttemptMs:percentile(rows.map(r=>r.elapsedMs),.95),medianSuccessfulTaskMs:percentile(successes.map(r=>r.elapsedMs),.5),allAttemptTokensPerSuccess:usageComplete&&successes.length?(prompt+completion)/successes.length:null};
+            }
+            for(const a of g.runs.filter(r=>r.arm==='A'&&r.actualTaskSuccess)){
+              const b=g.runs.find(r=>r.arm==='B'&&r.channel===a.channel&&r.case===a.case&&r.actualTaskSuccess);
+              if(b)summary.pairedSuccessfulTasks.push({channel:a.channel,case:a.case,Ams:a.elapsedMs,Bms:b.elapsedMs});
+            }
+            await save('validation/summary.json',summary);
+            console.log(clean(JSON.stringify(summary,null,2)));
+            if(process.env.GITHUB_STEP_SUMMARY)await appendFile(process.env.GITHUB_STEP_SUMMARY,'## Post-fix real GUI A/B\n\n```json\n'+clean(JSON.stringify(summary,null,2))+'\n```\n');
+            if(g.status!=='completed'||g.runs.length!==12||g.businessSuccess!==12)process.exitCode=1;
+          } catch(e) {
+            console.error(clean(e.message));
+            await save('validation/blocked.json',{status:'blocked',reason:clean(e.message),sourceCommit:process.env.OPERATOR_SOURCE_SHA});
+            await save('validation/transport-audit.json',transportAudit);
+            process.exitCode=1;
+          } finally {restore();key=null;}
+          JS
+          node --check scripts/operator-post-fix-run.mjs
+          node --check scripts/operator-native-gui-ab.mjs
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: bench/operator-gui-harness -> target
+          cache-on-failure: true
+      - name: Install the isolated GUI test environment
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev libxdo-dev libxtst-dev xvfb openbox dbus-x11
+          npm install --prefix bench/operator-gui-deps --no-package-lock --ignore-scripts playwright@1.55.1 pngjs@7.0.0
+          bench/operator-gui-deps/node_modules/.bin/playwright install --with-deps chromium
+      - name: Compile the fixed production modules
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path bench/operator-gui-harness/Cargo.toml 2>&1 | tee validation/native-build.txt
+          git diff --exit-code -- src-tauri/src
+      - name: Run twelve real-model GUI tasks with identical A/B transport
+        env:
+          COMMAND_CODE_API_KEY: ${{ secrets.COMMAND_CODE_API_KEY }}
+          OPERATOR_GUI_EXE: bench/operator-gui-harness/target/debug/nova-operator-gui-harness
+        run: |
+          set -euo pipefail
+          dbus-run-session -- xvfb-run -a -s '-screen 0 1280x960x24' bash -c 'openbox >/tmp/operator-live-openbox.log 2>&1 & node scripts/operator-post-fix-run.mjs' 2>&1 | tee validation/live-progress.txt
+      - name: Remove any credential text from retained reports
+        if: always()
+        env:
+          COMMAND_CODE_API_KEY: ${{ secrets.COMMAND_CODE_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os,re
+          from pathlib import Path
+          key=os.environ.get('COMMAND_CODE_API_KEY','')
+          for p in Path('validation').rglob('*'):
+              if not p.is_file() or p.suffix.lower() not in {'.json','.jsonl','.txt','.log','.md'}:
+                  continue
+              text=p.read_text(errors='replace')
+              if key: text=text.replace(key,'[REDACTED]')
+              p.write_text(re.sub(r'user_[A-Za-z0-9_-]{16,}','[REDACTED]',text))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: operator-live-post-fix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: validation/
+          retention-days: 7
+          if-no-files-found: ignore
