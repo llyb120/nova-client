@@ -1,0 +1,27 @@
+name: Operator optimization source
+on:
+  push:
+    branches: [work/operator-context-20260919]
+    paths: [.github/workflows/operator-opt-source.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 5c10b1f3197537ec73419d9030f7dd96140fb201
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export tracked source and original GUI fixture
+        run: |
+          mkdir -p /tmp/operator-opt-source
+          git archive HEAD | gzip > /tmp/operator-opt-source/source.tar.gz
+          git archive 3d7ac249129e3f25c703fb03a1dd5617c3560a7a | gzip > /tmp/operator-opt-source/fixture-source.tar.gz
+          git archive 30994aad80200b2e77256d1d9ea17f00772854f7 .github/workflows scripts bench | gzip > /tmp/operator-opt-source/retest-source.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operator-opt-source
+          path: /tmp/operator-opt-source/
+          retention-days: 1
