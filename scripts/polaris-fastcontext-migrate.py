@@ -33,7 +33,7 @@ p,s=load('polaris.rs','a12a12b625f13ebfb58a3fce0facb7de041dd073')
 s=replace(s,'let deadline=started+Duration::from_millis(3500);','let deadline=started+Duration::from_millis(900);')
 s=replace(s,'let corpus=index::corpus(&root,started+Duration::from_millis(2200))?;', 'let (corpus,demand)=index::demand_corpus(&root,q,started+Duration::from_millis(600))?;')
 s=replace(s,'let partial=corpus.partial||!gaps.is_empty()', 'let partial=corpus.partial||(evidence.is_empty()&&demand.candidate_files_omitted>0)||!gaps.is_empty()')
-s=replace(s,'"files":corpus.files,"units":units.len()', '"searchScope":"bounded_candidate_files","demand":demand,"files":corpus.files,"units":units.len()')
+s=replace(s,'"files":corpus.files,"units":units.len(),"changedFiles":corpus.changed', '"searchScope":"bounded_candidate_files","demand":demand,"files":corpus.files,"units":units.len(),"changedFiles":corpus.changed')
 # Avoid re-reading/hash-checking the same large file for every overlapping candidate slice.
 s=replace(s,'let stale=ranked.iter().filter(|(i,_)|!index::verified(&root,&units[*i])).map(|(i,_)|units[*i].file.clone()).collect::<HashSet<_>>();', '''let mut verified=HashMap::<String,bool>::new();
     let stale=ranked.iter().filter(|(i,_)|!*verified.entry(units[*i].file.clone()).or_insert_with(||index::verified(&root,&units[*i]))).map(|(i,_)|units[*i].file.clone()).collect::<HashSet<_>>();''')
