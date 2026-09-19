@@ -1,0 +1,26 @@
+[package]
+name = "nova-operator-gui-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+tauri = { version = "2", features = ["unstable", "protocol-asset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+enigo = "0.6.1"
+xcap = "0.9.8"
+
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
