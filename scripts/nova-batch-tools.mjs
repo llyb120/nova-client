@@ -4,7 +4,7 @@ import chromeTool from "./chrome-tool.json" with { type: "json" };
 import jianlaiTool from "./jianlai-tool.json" with { type: "json" };
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
+import { POLARIS_DESCRIPTION } from "./polaris-query.mjs";
 import { callGlobalContextTool, globalContextServiceConfigured } from "./nova-context-client.mjs";
 
 function fastContextEnabled(options = {}) {
@@ -19,25 +19,8 @@ function readOnlyEnabled(options = {}) {
   return process.env.NOVA_TOOLS_READ_ONLY === "1";
 }
 
-function stringList(value) {
-  const list = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
-  return [...new Set(list.map((item) => String(item ?? "").trim()).filter(Boolean))];
-}
-
-export function normalizePolarisArgs(params = {}) {
-  const query = String(params.query ?? "").trim();
-  const keywords = stringList(params.keywords).slice(0, 5);
-  const task = String(params.task ?? "").trim() || (query.includes(" ") ? query : "");
-  if (!keywords.length && query && !task) keywords.push(query);
-  const files = stringList(params.files).slice(0, 6);
-  return {
-    ...params,
-    keywords,
-    task,
-    files,
-  };
-}
-
+import { normalizePolarisArgs } from "./polaris-query.mjs";
+export { normalizePolarisArgs } from "./polaris-query.mjs";
 
 /**
  * Shared Nova context tools for Cursor customTools and Devin ACP MCP.
@@ -107,12 +90,12 @@ export function createNovaBatchTools(cwd, options = {}) {
             ],
             description: "关键词或符号名；字符串自动转单项数组，超过 5 项默认取前 5 项",
           },
-          query: { type: "string", minLength: 1, description: "简短检索词；兼容单字符串调用，如 cursor" },
-          task: { type: "string", minLength: 1, description: "自然语言任务描述，将自动提取检索词" },
+          query: { type: "string", minLength: 1, description: "符号名或完整自然语言问题，中文无需空格；不要猜造函数名" },
+          task: { type: "string", minLength: 1, description: "自然语言任务描述；内部混合检索并验证源码，语义模型未配置时明确降级" },
           files: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "明确要纳入上下文的仓库相对文件路径" },
-          maxChars: { type: "integer", minimum: 4000, maximum: 80000, description: "输出字符预算，通常无需设置" },
-          budget: { type: "integer", minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，通常无需设置" },
-          coupling: { type: "boolean", description: "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" },
+          maxChars: { type: "integer", minimum: 4000, maximum: 80000, description: "输出预算兼容别名；自然语言路径按 UTF-8 字节限制，通常无需设置" },
+          budget: { type: "integer", minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，自然语言路径最高 1200 行" },
+          coupling: { type: "boolean", description: "精确符号路径可附 git 共改提示；自然语言路径返回有界源码引用关系" },
         },
         anyOf: [
           { required: ["keywords"] },
@@ -160,7 +143,7 @@ export function novaDevinBatchToolPolicy(options = {}) {
       + "Do not dump large files blindly."
       + " For edits, use Devin native edit tools. Multiple edits for the same file must be merged into one native edit call.",
     (fastContext
-      ? "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only polaris (packs definition bodies + 1-hop neighbors + coverage; internal rg, honors `.gitignore`). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with Devin native read. After polaris, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep—rg is already inside polaris. External rg/grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that polaris did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
+      ? "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only polaris (packs definition bodies, bounded reference neighbors and coverage; honors `.gitignore`). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with Devin native read. After polaris, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep. External rg/grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that polaris did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
       : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")
       + "Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];
