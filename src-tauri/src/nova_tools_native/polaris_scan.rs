@@ -54,6 +54,17 @@ fn scan_source(text: &str, file: &str) -> FileEntry {
                     let end = (node.end_position().row + 1).min(lines.len());
                     if !name.is_empty() && name.len() <= 200 && start <= end {
                         let line = lines.get(start - 1).copied().unwrap_or("");
+                        // A top-level external Rust module is an explicit
+                        // namespace binding, not a guess from a matching filename.
+                        if kind == "mod" && node.child_by_field_name("body").is_none()
+                            && node.parent().is_some_and(|n|n.kind()=="source_file")
+                            && !lines[start.saturating_sub(4)..start-1].iter().any(|s|s.contains("#[path")) {
+                            let leaf=file.rsplit('/').next().unwrap_or(file);
+                            let spec=if matches!(leaf,"lib.rs"|"main.rs"|"mod.rs") {
+                                format!("./{name}")
+                            }else {format!("./{}/{name}",leaf.trim_end_matches(".rs"))};
+                            result.imports.push(ImportRef{name:name.into(),from:spec,orig:None});
+                        }
                         result.syms.push(Symbol { ln: start, end, depth: if kind == "const" { 0 } else { depth },
                             kind: kind.into(), name: name.into(), sig: signature(line),
                             exp: line.trim_start().starts_with("pub") || line.trim_start().starts_with("export") });

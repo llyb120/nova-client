@@ -33,6 +33,30 @@ fn forwarding(unit:&CodeUnit)->bool {
 /// The wrapper remains available as caller evidence. This is a bounded graph
 /// refinement, not a guessed symbol or an expansion to arbitrary similarly named code.
 pub(super) fn refine_forwarders(ranked:&mut Vec<(usize,f64)>,units:&[Arc<CodeUnit>],q:&Query){
+    let facets=q.facets();
+    if !facets.is_empty() {
+        let predicates=facets.iter().filter(|group|group.split('|').any(|word|
+            q.terms.iter().any(|(term,weight)|term==word&&*weight>1.0))).collect::<Vec<_>>();
+        for (id,score) in ranked.iter_mut() {
+            let u=&units[*id];
+            if q.files.contains(&u.file)||q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&u.name)){continue;}
+            let covered=facets.iter().filter(|group|group.split('|').any(|word|u.terms.contains_key(word))).count();
+            let fraction=covered as f64/facets.len() as f64;
+            // Keep a nonzero semantic-only path while preferring evidence that
+            // covers both the requested operation AND its object/constraints.
+            *score*=0.30+0.70*fraction*fraction;
+            // An encrypted *input type* is not an encryption operation. Require
+            // support in a defined name, a called operation, or original CJK
+            // source/comment text, rather than the signature's dictionary aliases.
+            let operation=predicates.is_empty()||predicates.iter().any(|group|group.split('|').any(|word|
+                u.name_terms.contains(word)
+                ||u.calls.iter().any(|call|query::tokens(call).iter().any(|term|term==word))
+                ||(!word.is_ascii()&&u.source[u.start-1..u.end].iter().any(|line|line.contains(word)))));
+            if !operation{*score*=0.40;}
+
+        }
+        ranked.sort_by(|a,b|b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    }
     let files=units.iter().map(|u|u.file.clone()).collect::<HashSet<_>>();
     let mut by_name=HashMap::<&str,Vec<usize>>::new();
     for (i,u) in units.iter().enumerate(){by_name.entry(&u.name).or_default().push(i);}
@@ -82,4 +106,15 @@ mod tests {
         let c=index::corpus(dir.path(),Instant::now()+Duration::from_secs(5)).unwrap();
         assert!(c.units.iter().all(|u|!forwarding(u)));
     }
+    #[test] fn declared_module_namespace_is_not_an_unrelated_same_name() {
+        let dir=tempfile::tempdir().unwrap();fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"),"mod system;\npub fn paths() -> Vec<String> { system::read_paths() }\n").unwrap();
+        fs::write(dir.path().join("src/system.rs"),"pub fn read_paths() -> Vec<String> { read_native() }\n").unwrap();
+        let c=index::corpus(dir.path(),Instant::now()+Duration::from_secs(5)).unwrap();
+        let files=c.units.iter().map(|u|u.file.clone()).collect::<HashSet<_>>();
+        let wrapper=c.units.iter().find(|u|u.name=="paths").unwrap();
+        let implementation=c.units.iter().find(|u|u.name=="read_paths").unwrap();
+        assert_eq!(related(wrapper,implementation,&files),Some("callee-reference"));
+    }
+
 }

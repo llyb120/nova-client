@@ -69,6 +69,12 @@ const CONCEPTS: &[&str]=&[
     "错误|报错|失败|error|failure|exception", "模型|提供商|model|provider", "计费|用量|统计|usage|cost|stats",
 ];
 impl Query {
+    /// Distinct concepts are coverage constraints; eight aliases of one verb
+    /// must not count as eight independently satisfied parts of a request.
+    pub(super) fn facets(&self) -> Vec<&'static str> {
+        CONCEPTS.iter().copied().filter(|group| group.split('|').any(|word|
+            self.terms.iter().any(|(term,weight)|term==word&&*weight>=1.0))).collect()
+    }
     pub fn parse(mut params: Value) -> Result<Self,String> {
         if !params.is_object(){return Err("polaris 参数必须是对象".into());}
         let query=params["query"].as_str().unwrap_or("").trim().chars().take(1024).collect::<String>();

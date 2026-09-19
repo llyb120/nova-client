@@ -31,7 +31,7 @@ fn references(text:&str)->(HashSet<String>,Vec<(String,String)>,HashSet<String>,
     for c in EVENTS.get_or_init(||Regex::new(r#"\b(emit|listen|on|invoke)\s*(?:<[^;{}]{0,100}>)?\s*\(\s*["']([A-Za-z0-9_:/.-]{4,128})["']"#).unwrap()).captures_iter(&bounded).take(64){
         if &c[1]=="invoke"{commands.insert(c[2].to_string());}else{events.push((c[1].to_string(),c[2].to_string()));}
     }
-    let mut members:Vec<(String,String)>=MEMBERS.get_or_init(||Regex::new(r"\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*(?:<[^;{}]{0,100}>)?\s*\(").unwrap()).captures_iter(&bounded).take(128).map(|c|(c[1].to_string(),c[2].to_string())).collect();
+    let mut members:Vec<(String,String)>=MEMBERS.get_or_init(||Regex::new(r"\b([A-Za-z_$][\w$]*)(?:\.|::)([A-Za-z_$][\w$]*)\s*(?:<[^;{}]{0,100}>)?\s*\(").unwrap()).captures_iter(&bounded).take(128).map(|c|(c[1].to_string(),c[2].to_string())).collect();
     members.extend(RUST_CALLS.get_or_init(||Regex::new(r"\b((?:crate|self|super)(?:::[A-Za-z_][\w]*)+)::([A-Za-z_][\w]*)\s*\(").unwrap())
         .captures_iter(&bounded).take(64).map(|c|(c[1].to_string(),c[2].to_string())));
     (calls,events,commands,members)
@@ -86,7 +86,7 @@ fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
         let begin=begin.max(1);let finish=finish.min(source.len()).max(begin);
         if begin>source.len(){continue;}
         let mut comment=begin-1;
-        while comment>0&&begin-comment<=8 {let s=source[comment-1].trim();if s.starts_with("//")||s.starts_with('#')||s.starts_with('*')||s.is_empty(){comment-=1}else{break;}}
+        while comment>0&&begin-comment<=8 {let s=source[comment-1].trim();if s.starts_with("//")||s.starts_with("/*")||s.starts_with('#')||s.starts_with('*')||s.is_empty(){comment-=1}else{break;}}
         let role=if tests.iter().any(|(a,b)|begin>=*a&&begin<=*b){"test"}else{file_role(file)};
         let callable=matches!(kind.as_str(),"fn"|"method"|"prop");
         let names=if callable{identifier_aliases(&name)}else{Vec::new()};
@@ -100,7 +100,7 @@ fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
             let body=source[start-1..end].join("\n");
             let words=query::tokens(&name);let mut name_terms=words.iter().cloned().collect::<HashSet<_>>();
             name_terms.extend(names.iter().cloned());
-            let comments=body.lines().filter(|l|{let l=l.trim();l.starts_with("//")||l.starts_with('#')||l.starts_with('*')}).collect::<Vec<_>>().join("\n");
+            let comments=body.lines().filter(|l|{let l=l.trim();l.starts_with("//")||l.starts_with("/*")||l.starts_with('#')||l.starts_with('*')}).collect::<Vec<_>>().join("\n");
             let passage=format!("File: {file}\nDefined {kind}: {name} ({})\nIdentifier glossary (dictionary, not a behavior summary): {glossary}\n{}\n{}\nCode:\n{}",words.join(" "),prefix.chars().take(350).collect::<String>(),comments.chars().take(600).collect::<String>(),body.chars().take(1600).collect::<String>()).chars().take(3000).collect::<String>();
             let hash=digest(passage.as_bytes());let mut terms=HashMap::<String,f64>::new();
             for (field,weight) in [(name.as_str(),4.0),(file,1.5),(prefix.as_str(),2.0),(body.as_str(),1.0)]{
@@ -192,4 +192,13 @@ mod glossary_tests {
         assert_eq!(unit.source.join("\n"),src.trim_end());
         assert_eq!(unit.file_hash,digest(src.as_bytes()));
     }
+    #[test]
+    fn first_line_of_block_documentation_is_not_dropped() {
+        let source="/** Configuration never inherits another workspace.\n * Explicit changes remain local. */\nexport function isolated() { return false; }\n";
+        let units=make_units("src/state.ts",source);
+        let unit=units.iter().find(|u|u.name=="isolated").unwrap();
+        assert!(unit.passage.contains("never inherits another workspace"));
+        assert_eq!(unit.source.join("\n"),source.trim_end());
+    }
+
 }
