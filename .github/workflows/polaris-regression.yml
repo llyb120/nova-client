@@ -1,0 +1,55 @@
+name: Polaris retrieval regression
+on:
+  pull_request:
+    branches: [pre-release]
+    paths:
+      - 'src-tauri/src/nova_tools_native/**'
+      - 'scripts/polaris-*'
+      - 'scripts/nova-batch-tools.mjs'
+      - 'bench/polaris-harness/**'
+      - '.github/workflows/polaris-regression.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: polaris-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  retrieval:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Use crates.io on CI
+        shell: bash
+        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/polaris-harness -> target
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test scripts/polaris-query.test.mjs
+      - name: Compile and test exact production Rust retrieval modules
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee polaris-tests.log
+          cargo build --release --manifest-path bench/polaris-harness/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-${{ matrix.os }}
+          path: |
+            polaris-tests.log
+            bench/polaris-harness/target/release/polaris-harness
+            bench/polaris-harness/target/release/polaris-harness.exe
+          retention-days: 7
