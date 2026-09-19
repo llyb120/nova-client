@@ -1,0 +1,111 @@
+name: Actual native GUI and real-session replay
+on:
+  push:
+    branches: [test/operator-native-gui-20260919]
+    paths: [.github/workflows/operator-native-live.yml]
+permissions:
+  contents: read
+  actions: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Require successful production native build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 50); do
+            data=$(curl --fail --silent -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/llyb120/nova-client/actions/runs/35446241430)
+            status=$(printf '%s' "$data" | jq -r .status)
+            if [ "$status" = completed ]; then
+              test "$(printf '%s' "$data" | jq -r .conclusion)" = success
+              exit $?
+            fi
+            sleep 10
+          done
+          exit 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: operator-native-build
+          path: native-build
+          run-id: 35446241430
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-ubuntu-24.04
+          path: polaris-build
+          run-id: 35434961064
+          github-token: ${{ github.token }}
+      - name: Install isolated headed browser and desktop dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libwebkit2gtk-4.1-0 libayatana-appindicator3-1 librsvg2-2 libpipewire-0.3-0 libgbm1 libxdo3 libxtst6 xvfb openbox dbus-x11
+          npm install --prefix bench/operator-gui-deps --no-package-lock --ignore-scripts playwright@1.55.1
+          bench/operator-gui-deps/node_modules/.bin/playwright install --with-deps chromium
+          chmod +x native-build/nova-operator-gui-harness polaris-build/bench/polaris-harness/target/release/polaris-harness
+          echo "OPERATOR_GUI_EXE=$GITHUB_WORKSPACE/native-build/nova-operator-gui-harness" >> "$GITHUB_ENV"
+          echo "POLARIS_REPLAY_BINARY=$GITHUB_WORKSPACE/polaris-build/bench/polaris-harness/target/release/polaris-harness" >> "$GITHUB_ENV"
+      - name: Freeze pre-report source snapshot and exclude evaluation leakage
+        run: |
+          mkdir -p validation
+          git clone --quiet --filter=blob:none https://github.com/llyb120/nova-client.git "$RUNNER_TEMP/polaris-source"
+          cd "$RUNNER_TEMP/polaris-source"
+          snapshot=$(git rev-list -1 --before='2026-08-11T06:54:24.853Z' 3da28d30f1adfd0da3b993813a47aa3fff20fdeb)
+          test -n "$snapshot"
+          git checkout --quiet --detach "$snapshot"
+          echo "OPERATOR_REPLAY_CORPUS=$PWD" >> "$GITHUB_ENV"
+          git show -s --format=fuller HEAD > "$GITHUB_WORKSPACE/validation/replay-snapshot.txt"
+          python3 - <<'PY'
+          import pathlib,re
+          removed=[]
+          for p in pathlib.Path('.').rglob('*'):
+              if '.git' in p.parts or not p.is_file(): continue
+              if p.parts[0] in ('bench','.github') or re.search(r'report|eval|replay|ab-results|cases\.json',str(p),re.I):
+                  removed.append(str(p));p.unlink()
+          pathlib.Path('/tmp/replay-excluded.txt').write_text('\n'.join(removed))
+          PY
+          cp /tmp/replay-excluded.txt "$GITHUB_WORKSPACE/validation/replay-excluded.txt"
+      - name: Verify real native bridge and screenshot before spending model tokens
+        env:
+          OPERATOR_GUI_OUT: validation/setup
+        run: |
+          node --check scripts/operator-native-gui-ab.mjs
+          node --check scripts/polaris-session-replay.mjs
+          dbus-run-session -- xvfb-run -a -s '-screen 0 1280x960x24' bash -c 'openbox >/tmp/openbox-setup.log 2>&1 & node scripts/operator-native-gui-ab.mjs --setup-only'
+      - name: Prepare one-time encrypted credential receiver
+        run: node scripts/operator-native-credential.mjs prepare
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operator-native-public-recipient
+          path: operator-native-public-recipient.json
+          retention-days: 1
+      - name: Real model controls first, actual-prefix replay second
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          dbus-run-session -- xvfb-run -a -s '-screen 0 1280x960x24' bash -c 'openbox >/tmp/openbox-live.log 2>&1 & node scripts/operator-native-credential.mjs run' 2>&1 | tee validation/live-progress.log
+      - name: Record evidence and destroy ephemeral private key
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/operator-native-credential"
+          mkdir -p validation
+          git rev-parse HEAD > validation/tested-commit.txt
+          sha256sum src-tauri/src/operator/core.rs src-tauri/src/operator/runtime.rs src-tauri/src/native_browser.rs src-tauri/src/jianlai.rs src-tauri/src/lyra/reasonix.rs > validation/production-hashes.txt
+          cp scripts/operator-native-gui-ab.mjs scripts/polaris-session-replay.mjs validation/
+          cp native-build/native-build.log validation/ || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: actual-native-gui-and-polaris-results
+          path: validation/
+          retention-days: 7
