@@ -86,3 +86,32 @@ test('all native GUI entry points enforce Operator ownership without changing to
     const text=await readFile(new URL(`../src-tauri/src/${name}`,import.meta.url),'utf8');assert.match(text,/crate::operator::check_access\(owner\)\?/);
   }
 });
+
+
+test('Cursor worker uses inherited selection with no tools or parent history',async()=>{
+  const {cursorDecision}=await import('./operator-cursor.mjs');let options,prompt,closed=0;
+  const sdk={create:async value=>{options=value;return {send:async value=>{prompt=value;return {wait:async()=>({status:'completed',result:'{"kind":"blocked"}'})};},close:async()=>closed++};}};
+  const request={model:'model-id::effort=high',cwd:'/isolated',system:'operator-system',context:{goal:'task'},images:[{data:'fixture',mimeType:'image/png'}]};
+  assert.equal(await cursorDecision(request,sdk,id=>({id})), '{"kind":"blocked"}');
+  assert.deepEqual(options.model,{id:request.model});assert.deepEqual(options.tools,[]);
+  assert.deepEqual(options.mcpServers,{});assert.deepEqual(options.local.settingSources,[]);
+  assert.equal(options.local.cwd,'/isolated');assert.deepEqual(prompt.images,request.images);
+  assert.equal(prompt.text,JSON.stringify(request.context));assert.equal(closed,1);
+});
+
+test('Cursor worker rejects Auto and closes after inference errors',async()=>{
+  const {cursorDecision}=await import('./operator-cursor.mjs');let created=0,closed=0;
+  const sdk={create:async()=>{created++;return {send:async()=>{throw new Error('fixture failure');},close:async()=>closed++};}};
+  await assert.rejects(cursorDecision({model:'__cursor_auto__'},sdk,id=>({id})),/resolved parent model/);assert.equal(created,0);
+  await assert.rejects(cursorDecision({model:'same',context:{}},sdk,id=>({id})),/fixture failure/);assert.equal(closed,1);
+});
+
+
+test('ACP desktop guidance prefers delegation only when operate is present',async()=>{
+  const source=await readFile(new URL('../src-tauri/src/acp.rs',import.meta.url),'utf8');
+  const guidance=source.match(/fn direct_desktop_guidance\(\) -> &'static str \{([\s\S]*?)\n\}/)[1];
+  assert.ok(guidance.includes('如果工具列表包含 operate'));
+  assert.ok(guidance.includes('channel=jianlai'));
+  assert.ok(guidance.includes('用户明确要求单步操作'));
+  assert.ok(guidance.includes('needs_review 不得自动重放'));
+});

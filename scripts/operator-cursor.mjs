@@ -1,13 +1,13 @@
 // A tool-less single-decision executor. No Reasonix, parent history, user/project
 // MCP configuration or native Task tool is loaded into this agent.
-import { Agent } from '@cursor/sdk';
-import { modelSelection } from './cursor-bridge-common.mjs';
 
-export async function cursorDecision(request, sdk = Agent) {
+export async function cursorDecision(request, sdk, parseModel) {
   if (typeof request.model !== 'string' || !request.model.trim() || request.model === '__cursor_auto__') {
     throw new Error('Operator needs a resolved parent model; Auto cannot guarantee the same model');
   }
-  const model = modelSelection(request.model);
+  sdk ??= (await import('@cursor/sdk')).Agent;
+  parseModel ??= (await import('./cursor-bridge-common.mjs')).modelSelection;
+  const model = parseModel(request.model);
   const agent = await sdk.create({
     apiKey: process.env.CURSOR_API_KEY,
     model,

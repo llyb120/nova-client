@@ -5351,7 +5351,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
 }
 
 fn direct_desktop_guidance() -> &'static str {
-    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、webview（侧栏浏览器）、chrome（用户Chrome）。用户指定剑来时，直接调用工具列表中来自 nova-tools 的 jianlai，先 operation=windows 再截图；整个桌面任务仅用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation或脚本激活窗口。后台窗口先截桌面，用Win+Tab任务视图或可见任务栏入口切窗，不要盲目循环切换。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
+    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、webview（侧栏浏览器）、chrome（用户Chrome）。如果工具列表包含 operate，多步 Chrome/剑来任务优先委派给 operate：传目标、约束和验收条件，用户指定剑来则 channel=jianlai；不要同时调用底层交互工具，needs_review 不得自动重放。只有工具列表不包含 operate 或用户明确要求单步操作时，直接调用工具列表中来自 nova-tools 的 jianlai，先 operation=windows 再截图；整个桌面任务仅用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation或脚本激活窗口。后台窗口先截桌面，用Win+Tab任务视图或可见任务栏入口切窗，不要盲目循环切换。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
 }
 
 #[cfg(test)]

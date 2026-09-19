@@ -8,6 +8,7 @@ const owner = randomUUID();
 const CONNECT_RETRY_MS = 50;
 const CONNECT_TIMEOUT_MS = 3000;
 const CALL_TIMEOUT_MS = 120_000;
+const OPERATOR_TIMEOUT_MS = 180_000; // A 90s decision phase may finish an in-flight native action.
 
 function serviceConfig() {
   const endpoint = String(process.env.NOVA_CONTEXT_SERVICE_ENDPOINT ?? "").trim();
@@ -32,7 +33,7 @@ async function requestOnce(config, method, root, params, clientOwner, operatorSc
       if (error) reject(error);
       else resolveResult(value);
     };
-    const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), ["webview", "chrome"].includes(method) ? 45_000 : ["generate_image", "edit_image"].includes(method) ? 610_000 : CALL_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), method === "operate" ? OPERATOR_TIMEOUT_MS : ["webview", "chrome"].includes(method) ? 45_000 : ["generate_image", "edit_image"].includes(method) ? 610_000 : CALL_TIMEOUT_MS);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ token: config.token, method, root: resolve(root), owner: clientOwner, operatorScope, params: params ?? {} })}\n`);
