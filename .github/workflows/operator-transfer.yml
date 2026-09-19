@@ -15,6 +15,7 @@ jobs:
       sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Apply reviewed transfer patch
         run: |
           python3 - <<'PY'
@@ -30,15 +31,15 @@ jobs:
           subprocess.run(['git','apply','--check','/tmp/operator.patch'],check=True)
           subprocess.run(['git','apply','/tmp/operator.patch'],check=True)
           PY
+          rustfmt --edition 2021 src-tauri/src/operator/*.rs bench/operator-harness/src/main.rs
       - name: Commit feature changes
         id: commit
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git rm .operator-transfer.b64 .operator-part-*.b64
-          git add src-tauri/src scripts bench/operator-harness
-          test ! -d docs/operator || git add docs/operator
-          git commit -m 'feat: isolate Operator context and inherit active session model without settings'
+          git add src-tauri/src scripts bench/operator-harness docs/operator
+          git commit -m 'test: harden Operator cancellation, persistence and same-model A/B harness'
           git push origin HEAD:work/operator-context-20260919
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   unit:
@@ -56,21 +57,20 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - run: |
-          mkdir -p .cargo
+          mkdir -p .cargo validation
           printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
-          mkdir -p validation
       - name: Node regression tests
         run: node --test scripts/operator.test.mjs scripts/nova-tools-mcp.test.mjs scripts/ctx-core.test.mjs | tee validation/node-tests.tap
       - name: Compile production state machine and runtime, run fixtures
         run: cargo test --manifest-path bench/operator-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
       - name: Deterministic footprint A/B (not a real-model benchmark)
         run: cargo run --quiet --manifest-path bench/operator-harness/Cargo.toml > validation/operator-ab.json
-      - name: Source format check
+      - name: Live-model harness self-test (no model calls)
+        run: node scripts/operator-live-ab.mjs --self-test --out validation/operator-live-self-test.json
+      - name: Save tested source
         if: always()
         run: |
-          rustfmt --edition 2021 src-tauri/src/operator/*.rs
-          git diff -- src-tauri/src/operator > validation/operator-format.patch
-          cp "$(rustup which rustfmt)" validation/rustfmt
+          git archive --format=tar HEAD | gzip > validation/operator-tested-source.tar.gz
           git rev-parse HEAD > validation/tested-commit.txt
       - uses: actions/upload-artifact@v4
         if: always()
