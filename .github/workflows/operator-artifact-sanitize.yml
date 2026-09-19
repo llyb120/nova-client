@@ -1,0 +1,74 @@
+name: Sanitize isolated Operator test artifacts
+on:
+  push:
+    branches: [test/operator-native-gui-20260919]
+    paths: [.github/workflows/operator-artifact-sanitize.yml]
+permissions:
+  actions: write
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  sanitize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Delete only the two affected test artifacts and sanitize local copies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import os,json,time,urllib.request,subprocess,zipfile,re,pathlib
+          repo='llyb120/nova-client';root='https://api.github.com/repos/'+repo
+          headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'}
+          def api(path,method='GET'):
+              req=urllib.request.Request(root+path,headers=headers,method=method)
+              with urllib.request.urlopen(req,timeout=30) as r:
+                  b=r.read();return json.loads(b) if b else None
+          targets={35446616489:'actual-native-gui-and-polaris-results',35447590732:'actual-native-gui-and-polaris-retest-results'}
+          pending=dict(targets);audit=[];out=pathlib.Path('sanitized');out.mkdir()
+          for _ in range(120):
+              for run,name in list(pending.items()):
+                  found=api(f'/actions/runs/{run}/artifacts')['artifacts']
+                  hit=next((a for a in found if a['name']==name),None)
+                  if hit is None:
+                      status=api(f'/actions/runs/{run}')['status']
+                      if status=='completed':
+                          audit.append({'run':run,'originalArtifact':None,'status':'no-matching-artifact'});del pending[run]
+                      continue
+                  ident=hit['id'];temp=pathlib.Path(os.environ['RUNNER_TEMP'])/f'{ident}.zip'
+                  # No model credential is passed to this workflow. Archive download is authenticated only to GitHub.
+                  subprocess.run(['curl','--fail','--silent','--show-error','--location','-H','Authorization: Bearer '+os.environ['GH_TOKEN'],root+f'/actions/artifacts/{ident}/zip','-o',str(temp)],check=True)
+                  api(f'/actions/artifacts/{ident}','DELETE')
+                  remaining=api(f'/actions/runs/{run}/artifacts')['artifacts']
+                  assert not any(a['id']==ident for a in remaining),'Original artifact still listed'
+                  changed=[];excluded=[];dest=out/str(run);dest.mkdir()
+                  with zipfile.ZipFile(temp) as z:
+                      for item in z.infolist():
+                          p=pathlib.PurePosixPath(item.filename)
+                          if item.is_dir():continue
+                          assert not p.is_absolute() and '..' not in p.parts
+                          if 'cache' in p.parts or p.name=='live-progress.log':excluded.append(str(p));continue
+                          b=z.read(item)
+                          if p.suffix in ('.json','.txt','.mjs','.md','.log','.rs','.html','.yml','.toml'):
+                              safe,n=re.subn(rb'user_[A-Za-z0-9_-]{16,}',b'[REDACTED]',b)
+                              if n:changed.append({'file':str(p),'redactions':n})
+                              b=safe
+                              assert b'-----BEGIN PRIVATE KEY-----' not in b
+                          path=dest.joinpath(*p.parts);path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b)
+                  temp.unlink()
+                  audit.append({'run':run,'deletedArtifactId':ident,'status':'original-deleted-sanitized-copy-only','redactedFiles':changed,'excludedFiles':excluded})
+                  print(f'Deleted affected artifact {ident} for run {run}; retained sanitized evidence only.')
+                  del pending[run]
+              if not pending:break
+              time.sleep(10)
+          (out/'sanitization-audit.json').write_text(json.dumps(audit,indent=2))
+          assert not pending,'Cleanup timed out; pending run IDs: '+str(list(pending))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sanitized-native-gui-replay-results
+          path: sanitized/
+          retention-days: 7
