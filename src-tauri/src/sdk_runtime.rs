@@ -388,7 +388,33 @@ impl SdkManager {
         } else {
             None
         };
+        let operator_registration = if self.adapter.agent_kind() == AgentKind::Cursor && mode.as_deref() != Some("plan") {
+            model.as_ref().filter(|m| !m.is_empty() && m.as_str() != "__cursor_auto__").map(|selected| {
+                let inherited_model = selected.clone();
+                let inherited_effort = reasoning_effort.clone();
+                let manager = Arc::downgrade(&self);
+                crate::operator::register(
+                    &format!("cursor:{}:{thread_id}", nova_data_dir(&self.app).display()),
+                    PathBuf::from(&cwd), nova_data_dir(&self.app),
+                    crate::operator::core::ModelIdentity { agent: "cursor".into(), model: inherited_model.clone(), reasoning_effort: inherited_effort.clone() },
+                    Arc::new(move |input| {
+                        let manager = manager.clone(); let model = inherited_model.clone(); let effort = inherited_effort.clone();
+                        Box::pin(async move {
+                            let manager = manager.upgrade().ok_or("Parent runtime stopped")?;
+                            let scratch = crate::operator::executors::Scratch::new()?;
+                            let child = manager.spawn_operator_bridge(&scratch.0.to_string_lossy())?;
+                            crate::operator::executors::cursor(child, model, effort, input, scratch).await
+                        })
+                    }),
+                )
+            })
+        } else { None };
+        if let Some(registration) = &operator_registration {
+            let weak = Arc::downgrade(&self); let id = thread_id.clone();
+            crate::operator::set_parent_alive(&registration.scope, Arc::new(move || weak.upgrade().is_some_and(|m| m.is_running(&id) && m.is_current_run(&id, run_epoch))));
+        }
         let mut request = json!({
+            "operatorScope": operator_registration.as_ref().map(|r| &r.scope),
             "action": "prompt",
             "threadId": thread_id,
             "cwd": cwd,
@@ -1361,7 +1387,11 @@ impl SdkManager {
         Err(format!("{} bridge 意外退出", self.adapter.label()))
     }
 
-    fn spawn_bridge(&self, cwd: &str) -> Result<Child, String> {
+    fn spawn_bridge(&self, cwd: &str) -> Result<Child, String> { self.spawn_bridge_mode(cwd, false) }
+
+    fn spawn_operator_bridge(&self, cwd: &str) -> Result<Child, String> { self.spawn_bridge_mode(cwd, true) }
+
+    fn spawn_bridge_mode(&self, cwd: &str, operator: bool) -> Result<Child, String> {
         let launch = {
             let state = self.app.state::<AppState>();
             let settings = state.settings.lock().unwrap();
@@ -1433,6 +1463,12 @@ impl SdkManager {
         }
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
+        if operator {
+            command.env("NOVA_OPERATOR_DECISION", "1")
+                .env_remove("NOVA_CONTEXT_SERVICE_ENDPOINT").env_remove("NOVA_CONTEXT_SERVICE_TOKEN")
+                .env_remove("NOVA_OPERATOR_SCOPE").kill_on_drop(true);
+            #[cfg(unix)] command.process_group(0);
+        } else { command.env_remove("NOVA_OPERATOR_DECISION"); }
         command.spawn().map_err(|e| {
             if native_subcommand.is_some() {
                 format!("启动 {} 原生进程失败：{e}", self.adapter.label())

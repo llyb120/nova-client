@@ -1,0 +1,20 @@
+{
+  "name": "operate",
+  "description": "多步 Chrome 或剑来操作优先使用此工具，在独立上下文中完成一个交互阶段，自动继承当前会话 agent、模型与推理强度；不复制主会话历史，不修改源码或 Reasonix。传明确目标、约束和验收条件，不传逐步截图。只返回紧凑结果和证据引用。run 必须有唯一 requestKey；重复 run 只取已有状态，不重复执行；yielded 后用 resume。needs_review 表示操作不确定或需要审批，禁止自动重放/自动新建替代任务。检测到发送、提交、删除等不可逆操作时暂停；风险识别依赖模型，不能代替用户监督。不要与其他桌面/Chrome操作并行。模型无法继承或后端不支持隔离时明确报错，绝不回退到另一模型。",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "op": {"type":"string","enum":["run","resume","status","result","cancel"]},
+      "taskId": {"type":"string"},
+      "requestKey": {"type":"string","minLength":1,"maxLength":160},
+      "goal": {"type":"string","minLength":1,"maxLength":8000},
+      "channel": {"type":"string","enum":["chrome","jianlai"]},
+      "target": {"type":"object","description":"限定对象，例如 Chrome 的 tabTag；不能放模型或凭证"},
+      "inputs": {"type":"object","description":"本阶段必要业务输入，不要复制主会话历史"},
+      "constraints": {"type":"array","items":{"type":"string"},"maxItems":30},
+      "acceptance": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":30}
+    },
+    "required":["op"],
+    "additionalProperties":false
+  }
+}

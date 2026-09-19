@@ -1,0 +1,62 @@
+{
+  "baseline": "append-only fixture observations, not an unmodified CodeBuddy runtime",
+  "benchmark": "deterministic-production-projector-ab",
+  "cases": [
+    {
+      "A": {
+        "inputTextBytes": 609441,
+        "referencedImageCount": 55
+      },
+      "B": {
+        "inputTextBytes": 219922,
+        "referencedImageCount": 10
+      },
+      "imageReferenceReductionPercent": 81.81818181818181,
+      "steps": 10,
+      "textByteReductionPercent": 63.914144273194616
+    },
+    {
+      "A": {
+        "inputTextBytes": 4425851,
+        "referencedImageCount": 465
+      },
+      "B": {
+        "inputTextBytes": 659882,
+        "referencedImageCount": 30
+      },
+      "imageReferenceReductionPercent": 93.5483870967742,
+      "steps": 30,
+      "textByteReductionPercent": 85.09027981285406
+    },
+    {
+      "A": {
+        "inputTextBytes": 16644737,
+        "referencedImageCount": 1830
+      },
+      "B": {
+        "inputTextBytes": 1319843,
+        "referencedImageCount": 60
+      },
+      "imageReferenceReductionPercent": 96.72131147540983,
+      "steps": 60,
+      "textByteReductionPercent": 92.0705085337185
+    },
+    {
+      "A": {
+        "inputTextBytes": 64462561,
+        "referencedImageCount": 7260
+      },
+      "B": {
+        "inputTextBytes": 2639908,
+        "referencedImageCount": 120
+      },
+      "imageReferenceReductionPercent": 98.34710743801654,
+      "steps": 120,
+      "textByteReductionPercent": 95.90474228909397
+    }
+  ],
+  "measures": "cumulative text bytes and image references only; not model cost, latency or success rate",
+  "modelCalls": 0,
+  "realGuiActions": 0,
+  "tokenEstimates": false
+}

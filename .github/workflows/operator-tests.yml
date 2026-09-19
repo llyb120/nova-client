@@ -1,0 +1,93 @@
+name: Operator tests
+on:
+  push:
+    branches: [work/operator-context-20260919]
+  pull_request:
+    branches: [pre-release]
+    paths:
+      - 'src-tauri/src/**'
+      - 'scripts/**'
+      - 'bench/operator-harness/**'
+      - 'docs/operator/**'
+      - '.github/workflows/operator-tests.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: operator-tests-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+jobs:
+  unit:
+    name: Operator regressions (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          mkdir -p validation
+      - name: Node routing and Reasonix regression checks
+        run: node --test scripts/operator.test.mjs scripts/nova-tools-mcp.test.mjs scripts/ctx-core.test.mjs | tee validation/node-tests.tap
+      - name: Production core and runtime tests with fixtures
+        run: cargo test --manifest-path bench/operator-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
+      - name: Deterministic A/B (not real-model speed or accuracy)
+        run: cargo run --quiet --manifest-path bench/operator-harness/Cargo.toml > validation/operator-ab.json
+      - name: Live harness plumbing only (zero model calls)
+        run: node scripts/operator-live-ab.mjs --self-test --out validation/operator-live-self-test.json
+      - name: Record tested commit
+        if: always()
+        run: git rev-parse HEAD > validation/tested-commit.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-validation-${{ matrix.os }}
+          path: validation/
+          retention-days: 14
+  compile:
+    name: Native and SDK check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev
+      - run: npm ci
+      - name: Build SDK bridges and typecheck
+        run: npm run build:sdk-bridges && npm run check
+      - name: Compile application library
+        run: cargo check --manifest-path src-tauri/Cargo.toml --lib 2>&1 | tee native-compile.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-native-compile-${{ matrix.os }}
+          path: native-compile.txt
+          retention-days: 14

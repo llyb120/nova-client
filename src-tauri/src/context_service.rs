@@ -59,6 +59,8 @@ struct ContextRequest {
     root: String,
     #[serde(default)]
     owner: String,
+    #[serde(default, rename = "operatorScope")]
+    operator_scope: String,
     #[serde(default)]
     params: Value,
 }
@@ -138,6 +140,9 @@ fn dispatch(
             "workspace root is not a directory: {}",
             request.root
         ));
+    }
+    if request.method == "operate" {
+        return tauri::async_runtime::block_on(crate::operator::execute(&request.operator_scope, root, &request.params));
     }
     let mut params = request.params;
     if request.method == "webview" {
@@ -449,6 +454,7 @@ mod tests {
             method: "change_working_directory".into(),
             root: String::new(),
             owner: String::new(),
+            operator_scope: String::new(),
             params: serde_json::json!({ "scope": scope, "path": "../new project" }),
         };
         assert!(dispatch(request("session-B"), "secret", &changes).is_err());

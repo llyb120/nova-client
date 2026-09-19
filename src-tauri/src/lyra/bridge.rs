@@ -286,6 +286,20 @@ async fn handle_prompt(
         .filter(|value| !value.is_empty())
         .and_then(|selection| config::resolve_model(&config_value, Some(selection), &env).ok());
     let read_only = ctx.mode == "plan";
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let operator_registration = if !read_only && app.is_some() {
+        let inherited = resolved.clone();
+        let operator_http = http.clone();
+        Some(crate::operator::register(
+            &format!("lyra:{}:{}", roots.nova().display(), ctx.session_id),
+            cwd_path.clone(), roots.nova().to_path_buf(),
+            crate::operator::core::ModelIdentity {
+                agent: "lyra".into(), model: format!("{}/{}", resolved.model.provider, resolved.model.id),
+                reasoning_effort: resolved.thinking_level.clone(),
+            },
+            Arc::new(move |input| Box::pin(crate::operator::executors::lyra(operator_http.clone(), inherited.clone(), input))),
+        ))
+    } else { None };
 
     let (mut text, images) = prompt_input(
         request
@@ -414,7 +428,14 @@ async fn handle_prompt(
     } else {
         build_system_prompt(&prompt_options)
     };
-    let agent_tools = tool_set(read_only, fast_context, auto_change_project);
+    let mut agent_tools = tool_set(read_only, fast_context, auto_change_project);
+    if operator_registration.is_some() {
+        let definition = crate::operator::tool_definition();
+        agent_tools.push(crate::lyra::tools::Tool {
+            name: "operate", description: definition["description"].as_str().unwrap().into(),
+            parameters: definition["inputSchema"].clone(),
+        });
+    }
     let system_prompt_hash = stable_hash(system_prompt.as_bytes());
     let tool_shape = serde_json::to_string(
         &agent_tools
@@ -461,7 +482,10 @@ async fn handle_prompt(
         "historyHash": history_hash,
     }));
     let archive_dir = Some(roots.data().join("tool-results").join(&ctx.session_id));
-    let cancelled = Arc::new(AtomicBool::new(false));
+    if let Some(registration) = &operator_registration {
+        crate::operator::alias(&archive_dir.as_ref().unwrap().to_string_lossy(), &registration.scope);
+        crate::operator::set_parent_cancelled(&registration.scope, cancelled.clone());
+    }
     let steering = Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let mut agent = Agent {
         model: resolved.clone(),

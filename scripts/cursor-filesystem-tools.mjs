@@ -9,8 +9,8 @@ import { ponytailPrompt } from "./ponytail-prompt.mjs";
  * Exposes polaris; filesystem operations use Cursor built-ins.
  */
 export function createCursorFilesystemTools(cwd, options = {}) {
-  const { generate_image, edit_image } = createNovaBatchTools(cwd, { ...options, fastContext: false });
-  const images = generate_image ? { generate_image, edit_image } : {};
+  const { generate_image, edit_image, operate } = createNovaBatchTools(cwd, { ...options, fastContext: false });
+  const images = { ...(generate_image ? { generate_image, edit_image } : {}), ...(operate ? { operate } : {}) };
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0" && globalContextServiceConfigured();
   const root = resolve(cwd);
   if (!fastContext) return images;

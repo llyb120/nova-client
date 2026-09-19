@@ -1,0 +1,5 @@
+{
+  "src-tauri/src/lyra/reasonix.rs": "011dcad69bda5714d2634a1035ee01623c6e1737ff8f218c4ac50f9afa3ce536",
+  "scripts/cursor-context-reasonix.mjs": "1288d5674ecfbe8c1fa42712a1b8db35f14964135ece03eae579055b9d8fb38c",
+  "scripts/cursor-context-super.mjs": "c174d779203c8598ebe1d69fac05fe0d56b73f29d02ed1d0a7bc12ed2146caa9"
+}

@@ -662,7 +662,7 @@ async function recoverTimedOutAgent(
     model: modelSelection(request.model),
     local: {
       cwd: request.cwd,
-      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan", operatorScope: request.operatorScope }),
     },
   };
   // Slim-memory mode prefers a fresh agent so poisoned checkpoints are never resumed.
@@ -740,7 +740,7 @@ async function sendPromptWithRecovery(
     model: modelSelection(request.model),
     local: {
       cwd: request.cwd,
-      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan", operatorScope: request.operatorScope }),
     },
   });
   emitTiming("agent_resume", resumeStartedAt);
@@ -754,7 +754,7 @@ function agentFingerprint(request) {
   const model = String(request?.model ?? "");
   const cwd = String(request?.cwd ?? "");
   const mode = request?.mode === "plan" ? "plan" : "agent";
-  return `${model}\0${cwd}\0${mode}`;
+  return `${model}\0${cwd}\0${mode}${request?.operatorScope ? `\0${request.operatorScope}` : ""}`;
 }
 
 function agentCreateOptions(request) {
@@ -765,7 +765,7 @@ function agentCreateOptions(request) {
     local: {
       cwd: request?.cwd,
       // Vega-style batch FS tools; inlined via SDK (unlike hooks, which are file-only).
-      customTools: createCursorFilesystemTools(request?.cwd, { readOnly }),
+      customTools: createCursorFilesystemTools(request?.cwd, { readOnly, operatorScope: request?.operatorScope }),
     },
   };
 }
