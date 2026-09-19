@@ -1,0 +1,97 @@
+name: Polaris query-first validation
+on:
+  push:
+    branches: [perf/polaris-semantic-20260919]
+    paths: [.github/workflows/polaris-fastcontext.yml, scripts/polaris-fastcontext-migrate.py, scripts/polaris-fastcontext-ab.py, src-tauri/src/nova_tools_native/polaris_demand.rs]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: polaris-query-first-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 1da9211b2f23b0df0c28f2c781a4a18c9869854b
+          path: _previous
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 3da28d30f1adfd0da3b993813a47aa3fff20fdeb
+          path: _corpus
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 22e3cf0fb55537ca6c93b68126c2c737794d783d
+          path: _replay
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: sanitized-native-gui-replay-results
+          path: _report
+          run-id: 35448033036
+          github-token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/polaris-harness -> target
+          cache-on-failure: true
+      - name: Build frozen PR11 production engine
+        run: |
+          set -euo pipefail
+          mkdir -p validation/bin .cargo
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          cp .cargo/config.toml _previous/.cargo/config.toml
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/bench/polaris-harness/target"
+          cargo build --release --manifest-path _previous/bench/polaris-harness/Cargo.toml
+          cp "$CARGO_TARGET_DIR/release/polaris-harness" validation/bin/previous
+      - name: Apply source-reviewed migration, preserve actual diff
+        run: |
+          set -euo pipefail
+          python3 scripts/polaris-fastcontext-migrate.py
+          git diff -- src-tauri/src/nova_tools_native > validation/production.patch
+          git rev-parse HEAD > validation/base-commit.txt
+          mkdir -p validation/source
+          cp src-tauri/src/nova_tools_native/polaris*.rs validation/source/
+          sha256sum src-tauri/src/nova_tools_native/{context,polaris,polaris_index,polaris_query,polaris_demand}.rs src-tauri/src/lyra/reasonix.rs > validation/source-hashes.txt
+      - name: Production regression tests and release build
+        run: |
+          set -euo pipefail
+          cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
+          node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs 2>&1 | tee validation/node-tests.txt
+          cargo build --release --manifest-path bench/polaris-harness/Cargo.toml
+          cp bench/polaris-harness/target/release/polaris-harness validation/bin/candidate
+      - name: Freeze replay exclusion rules; do not alter gold or main corpus
+        run: |
+          python3 - <<'PY'
+          import pathlib,re
+          root=pathlib.Path('_replay')
+          for p in root.rglob('*'):
+              rel=p.relative_to(root)
+              if '.git' in rel.parts or not p.is_file():continue
+              if rel.parts[0] in ('bench','.github') or re.search(r'report|eval|replay|ab-results|cases\.json',str(rel),re.I):p.unlink()
+          PY
+      - name: No warmup first-use and equal-budget context completeness A-B
+        run: |
+          set -euo pipefail
+          python3 scripts/polaris-fastcontext-ab.py --previous "$GITHUB_WORKSPACE/validation/bin/previous" --candidate "$GITHUB_WORKSPACE/validation/bin/candidate" --corpus _corpus --replay-corpus _replay --replay-report _report/35447590732/polaris/report.json | tee validation/progress.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-query-first-results
+          path: validation/
+          retention-days: 7
