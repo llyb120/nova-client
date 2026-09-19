@@ -1,6 +1,7 @@
 """Quality gates for the frozen, external-label A/B, not merely a successful process exit.
 Thresholds apply to the default learned hybrid, not the opt-in experimental reranker.
-The reserved set is not used for tuning; a gate failure keeps the PR in draft.
+The split still named heldout is now a regression set: failures have been inspected.
+Thresholds are unchanged; a gate failure keeps the PR in draft.
 """
 from __future__ import annotations
 import json
