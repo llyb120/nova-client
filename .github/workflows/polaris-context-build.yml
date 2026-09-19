@@ -1,0 +1,61 @@
+name: Polaris working-set build
+on:
+  push:
+    branches: [perf/polaris-semantic-20260919]
+    paths: [.github/workflows/polaris-context-build.yml, scripts/polaris-context-*.py]
+permissions:
+  contents: read
+concurrency:
+  group: polaris-context-build-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/polaris-harness -> target
+          cache-on-failure: true
+      - name: Apply reviewed plain source changes
+        run: |
+          set -euo pipefail
+          mkdir -p validation/source validation/scripts validation/bin .cargo
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          python3 scripts/polaris-one-shot-migrate.py
+          python3 scripts/polaris-one-shot-refine.py
+          python3 scripts/polaris-context-closure.py
+          git rev-parse HEAD > validation/base-commit.txt
+          git diff -- src-tauri/src/nova_tools_native > validation/production.patch
+          cp src-tauri/src/nova_tools_native/polaris*.rs validation/source/
+          cp scripts/polaris-one-shot-*.py scripts/polaris-context-*.py scripts/polaris-ab.py validation/scripts/
+          sha256sum src-tauri/src/nova_tools_native/polaris*.rs src-tauri/src/lyra/reasonix.rs > validation/source-hashes.txt
+      - name: Compile actual production modules and run regressions
+        run: |
+          set -euo pipefail
+          cargo clean --release --manifest-path bench/polaris-harness/Cargo.toml -p polaris-harness
+          cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
+          node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs 2>&1 | tee validation/node-tests.txt
+          cargo build --release --manifest-path bench/polaris-harness/Cargo.toml
+          cp bench/polaris-harness/target/release/polaris-harness validation/bin/candidate
+          sha256sum validation/bin/candidate > validation/binary-hash.txt
+      - name: One context request then compile and fix, no source rereads
+        run: |
+          set -euo pipefail
+          python3 scripts/polaris-one-shot-edit.py --binary validation/bin/candidate | tee validation/context-edit-progress.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-context-build
+          path: validation/
+          retention-days: 7
