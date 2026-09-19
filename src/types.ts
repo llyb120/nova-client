@@ -1,3 +1,4 @@
+import type { HistoryWindow } from "./historyTypes";
 import type { WorkflowDef } from "./workflow/types";
 
 export type AgentKind = "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "cursor";
@@ -181,12 +182,22 @@ export interface TimeMachineRestoreResult {
 export interface PromptImage {
   name: string;
   mimeType: string;
+  width?: number;
+  height?: number;
+  attachmentId?: string;
+  thumbnailUri?: string;
   data?: string;
   uri?: string;
   size?: number;
 }
 
-export interface UserItem {
+/** Bounded display metadata; originals remain in the native history store. */
+export interface HistoryItemMeta {
+  historyIndex?: number;
+  detailDeferred?: boolean;
+  sourceBytes?: number;
+}
+export interface UserItem extends HistoryItemMeta {
   type: "user";
   id: number;
   text: string;
@@ -194,21 +205,21 @@ export interface UserItem {
   images?: PromptImage[];
 }
 
-export interface AssistantItem {
+export interface AssistantItem extends HistoryItemMeta {
   type: "assistant";
   id: number;
   text: string;
   ts: number;
 }
 
-export interface ThoughtItem {
+export interface ThoughtItem extends HistoryItemMeta {
   type: "thought";
   id: number;
   text: string;
   ts: number;
 }
 
-export interface ToolItem {
+export interface ToolItem extends HistoryItemMeta {
   type: "tool";
   id: number;
   ts: number;
@@ -222,7 +233,7 @@ export interface ToolItem {
   rawOutput?: unknown;
 }
 
-export interface SystemItem {
+export interface SystemItem extends HistoryItemMeta {
   type: "system";
   id: number;
   text: string;
@@ -231,7 +242,7 @@ export interface SystemItem {
 }
 
 /** 轮次结束标记：耗时 + token 用量 */
-export interface TurnItem {
+export interface TurnItem extends HistoryItemMeta {
   type: "turn";
   id: number;
   ts: number;
@@ -263,6 +274,7 @@ export interface PlanEntry {
 }
 
 export interface Thread {
+  history?: HistoryWindow;
   id: string;
   title: string;
   cwd: string;

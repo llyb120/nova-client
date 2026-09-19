@@ -1512,7 +1512,7 @@ impl RelayManager {
         } else {
             share.title.clone()
         };
-        thread.items = items;
+        thread.items = items.into();
         thread.plan = if share.plan.is_null() {
             None
         } else {
@@ -3350,7 +3350,7 @@ impl RelayManager {
             {
                 return;
             }
-            thread.items = retained_items;
+            thread.items = retained_items.into();
             thread.plan = None;
             thread.acp_session_id = None;
             thread.pending_native_restore = None;
@@ -4353,7 +4353,7 @@ impl RelayManager {
                 for leftover in local_users.into_iter().skip(li) {
                     merged.push(leftover);
                 }
-                t.items = merged;
+                t.items = merged.into();
                 t.plan = if plan.is_null() { None } else { Some(plan) };
                 if let Some(metadata) = env.data.get("metadata").filter(|value| value.is_object()) {
                     if let Some(title) = metadata["title"].as_str() { t.title = title.to_string(); }
@@ -4446,7 +4446,7 @@ fn apply_op_to_thread(thread: &mut Thread, op: &Value) {
         Some("upsert") => {
             if let Ok(item) = serde_json::from_value::<Item>(op["item"].clone()) {
                 let id = item.id();
-                if let Some(slot) = thread.items.iter_mut().find(|i| i.id() == id) {
+                if let Some(slot) = thread.items.iter().position(|i| i.id() == id).and_then(|index| thread.items.get_mut(index)) {
                     *slot = item;
                 } else {
                     thread.items.push(item);
@@ -4568,7 +4568,7 @@ fn coalesce_outbound(batch: Vec<(String, String, Value)>) -> Vec<(String, String
 }
 
 /// 把会话条目拼成纯文本，用于高级分享 / 线索 AI 总结时喂给模型
-pub(crate) fn build_transcript(items: &[Item]) -> String {
+pub(crate) fn build_transcript<'a>(items: impl IntoIterator<Item = &'a Item>) -> String {
     let mut out = String::new();
     for it in items {
         match it {

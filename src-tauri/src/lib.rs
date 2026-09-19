@@ -33,6 +33,11 @@ mod skills;
 mod sleep_inhibitor;
 mod sys_notify;
 mod threads;
+mod transcript;
+mod history_assets;
+mod history_disk;
+mod history_page;
+mod history_feed;
 mod time_machine;
 mod updater;
 mod workspace_files;
@@ -1094,12 +1099,14 @@ fn load_threads(state: State<'_, AppState>) -> (Vec<ThreadMeta>, Vec<Thread>) {
 }
 
 #[tauri::command]
-fn get_thread(state: State<'_, AppState>, thread_id: String) -> Result<Thread, String> {
-    let store = state.store.lock().unwrap();
-    store
-        .get(&thread_id)
-        .cloned()
-        .ok_or_else(|| "线程不存在".into())
+async fn get_thread(app: tauri::AppHandle, thread_id: String) -> Result<Thread, String> {
+    // Full history remains available for export/context/explicit editing. The
+    // transcript UI uses get_thread_page instead. Never run heavy IPC on the UI thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let store = state.store.lock().unwrap();
+        store.get(&thread_id).cloned().ok_or_else(|| "线程不存在".into())
+    }).await.map_err(|e| e.to_string())?
 }
 
 /// 项目选择器里的一条最近项目。worktree 非空表示该目录其实是某次会话创建的
@@ -3106,12 +3113,15 @@ fn create_time_machine_checkpoint(
 }
 
 #[tauri::command]
-fn get_time_machine_timeline(
-    state: State<'_, AppState>,
+async fn get_time_machine_timeline(
+    app: tauri::AppHandle,
     thread_id: String,
 ) -> Result<Option<time_machine::TimelineView>, String> {
-    let _guard = state.time_machine_lock.lock().unwrap();
-    time_machine::get_timeline(&state.config_dir, &thread_id)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _guard = state.time_machine_lock.lock().unwrap();
+        time_machine::get_timeline(&state.config_dir, &thread_id)
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -3694,13 +3704,15 @@ fn sync_skills(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn send_prompt(
+async fn send_prompt(
     app: tauri::AppHandle,
     thread_id: String,
     text: String,
     images: Option<Vec<PromptImage>>,
 ) -> Result<(), String> {
-    dispatch_prompt(&app, thread_id, text, images.unwrap_or_default())
+    tauri::async_runtime::spawn_blocking(move || {
+        dispatch_prompt(&app, thread_id, text, images.unwrap_or_default())
+    }).await.map_err(|e| e.to_string())?
 }
 
 fn append_thread_error(app: &tauri::AppHandle, thread_id: &str, error: String) {
@@ -3723,6 +3735,13 @@ pub(crate) fn dispatch_prompt(
     images: Vec<PromptImage>,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let mut images = crate::history_page::resolve_images(app, images)?;
+    // Lossless originals go to disk once; providers keep using their supported
+    // original-file/base64 paths. UI thumbnails never enter model context.
+    let assets = crate::history_assets::AssetStore::new(&crate::nova_data_dir(app));
+    for image in &mut images { if let Err(error) = assets.externalize(image) {
+        eprintln!("[attachments] keeping original inline data: {error}");
+    }}
     let text = text.trim().to_string();
     if text.is_empty() && images.is_empty() {
         return Err("内容不能为空".into());
@@ -3921,6 +3940,8 @@ fn truncate_thread(
     if running_by_id(&state, &thread_id) {
         return Err("会话正在运行，请先停止".into());
     }
+    // Resolve UI attachment references before truncation invalidates their generation.
+    let images = crate::history_page::resolve_images(&app, images.unwrap_or_default())?;
     // 与手动恢复保持相同的锁顺序，保证编辑分叉和恢复不会交叉写时间线或项目文件。
     let _time_machine_guard = state.time_machine_lock.lock().unwrap();
     let capture_workspace = state.settings.lock().unwrap().checkpoint_enabled;
@@ -4010,7 +4031,6 @@ fn truncate_thread(
     }
 
     let _ = app.emit(acp::EV_THREADS, json!({}));
-    let images = images.unwrap_or_default();
     let prompt_text = text.unwrap_or_default().trim().to_string();
     let prompt = (!prompt_text.is_empty() || !images.is_empty()).then_some(prompt_text);
     if prompt.is_some() {
@@ -4123,16 +4143,8 @@ async fn cancel_turn(
         );
         return Ok(());
     }
-    let (is_guest, is_quota) = {
-        let store = state.store.lock().unwrap();
-        store
-            .get(&thread_id)
-            .map(|t| (t.is_roaming_guest(), t.is_quota_borrowed()))
-            .unwrap_or((false, false))
-    };
-    if is_guest {
-        return state.relay.guest_cancel(&thread_id);
-    }
+    // Running registries are independent of the history mutex. Borrowed tasks
+    // retain their original routing/authorization; never infer a new backend.
     if let Some(runtime) = state.borrowed_runtime(&thread_id) {
         match runtime.manager {
             BorrowedManager::Acp(manager) => manager.cancel(&thread_id).await,
@@ -4140,6 +4152,17 @@ async fn cancel_turn(
         }
         return Ok(());
     }
+    if state.lyra.is_running(&thread_id) { state.lyra.cancel(&thread_id).await; return Ok(()); }
+    if state.acp.is_running(&thread_id) { state.acp.cancel(&thread_id).await; return Ok(()); }
+    if state.kimi.is_running(&thread_id) { state.kimi.cancel(&thread_id).await; return Ok(()); }
+    if state.codexplus.is_running(&thread_id) { state.codexplus.cancel(&thread_id).await; return Ok(()); }
+    if state.codebuddy.is_running(&thread_id) { state.codebuddy.cancel(&thread_id).await; return Ok(()); }
+    if state.cursorplus.is_running(&thread_id) { state.cursorplus.cancel(&thread_id).await; return Ok(()); }
+    let (is_guest, is_quota) = {
+        let store = state.store.lock().unwrap();
+        store.get(&thread_id).map(|t| (t.is_roaming_guest(), t.is_quota_borrowed())).unwrap_or((false, false))
+    };
+    if is_guest { return state.relay.guest_cancel(&thread_id); }
     if is_quota {
         return Err("额度凭证已过期，请重新发起租借".into());
     }
@@ -5525,7 +5548,9 @@ pub fn run() {
                             })
                             .await;
                             match result {
-                                Ok((_, Ok(()))) => {}
+                                Ok((snapshot, Ok(()))) => {
+                                    flush_app.state::<AppState>().store.lock().unwrap().install_persisted_assets(&snapshot);
+                                }
                                 Ok((snapshot, Err(error))) => {
                                     eprintln!("[threads] 后台保存会话失败：{error}");
                                     let state = flush_app.state::<AppState>();
@@ -5549,6 +5574,7 @@ pub fn run() {
 
             // 漫游 host：把本机被漫游会话的更新/轮次/权限事件转发给 guest
             register_roaming_forwarders(app.handle(), relay.clone());
+            history_feed::register(app.handle());
             register_remote_permission_capture(app.handle());
             // 连接中转站（未配置 token 时内部直接返回）
             relay.restart();
@@ -5640,6 +5666,12 @@ pub fn run() {
             list_threads,
             load_threads,
             get_thread,
+            history_page::get_thread_page,
+            history_page::get_thread_display_items,
+            history_page::get_thread_item_detail,
+            history_page::get_thread_outline,
+            history_page::get_thread_artifacts,
+            history_page::get_history_image,
             list_clue_groups,
             get_clue_context,
             capture_clue,

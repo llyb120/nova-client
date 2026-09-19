@@ -1,0 +1,110 @@
+name: Long-session regression
+on:
+  pull_request:
+    branches: [pre-release]
+    paths:
+      - 'src/**'
+      - 'src-tauri/src/**'
+      - 'scripts/**history**'
+      - 'scripts/fixtures/history-ui-fixture.tsx'
+      - 'scripts/lib/browser-fixture.mjs'
+      - '.github/workflows/long-session-regression.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: long-session-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      TEST_BROWSER: /usr/bin/google-chrome
+      TEST_REPORT_DIR: history-ui-results
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - name: Paging, bitmap budgets, timeline identities and image layout
+        run: node --experimental-strip-types --test scripts/history-window.test.mjs scripts/history-images.test.mjs scripts/bubble-image-layout.test.mjs
+      - name: Complete ChatView with 10,000 image-heavy rounds and control races
+        run: node scripts/history-ui.test.mjs
+      - name: Existing virtualized history, prompt and workspace regressions
+        run: |
+          node scripts/long-session-render.test.mjs
+          node scripts/long-prompt-render.test.mjs
+          node scripts/workspace-panel.test.mjs
+      - run: npm run test:terminal
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: long-history-ui
+          path: history-ui-results/
+          retention-days: 7
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 3
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      TEST_REPORT_DIR: history-native-results
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Use crates.io on CI
+        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build:sdk-bridges:release
+      - name: Compile native library and all unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --no-run 2>&1 | tee native-compile.log
+      - name: Shared histories, assets, migration, paging and worldline regressions
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib transcript:: -- --nocapture 2>&1 | tee transcript-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib history_ -- --nocapture 2>&1 | tee history-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib threads:: -- --nocapture 2>&1 | tee threads-tests.log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib time_machine:: -- --nocapture 2>&1 | tee time-machine-tests.log
+      - name: Enable loopback driver only in the disposable debug build
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('src-tauri/tauri.conf.json'); v=json.loads(p.read_text(encoding='utf-8'))
+          v['app']['windows'][0]['additionalBrowserArgs']='--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --disable-features=CalculateNativeWinOcclusion'
+          p.write_text(json.dumps(v,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          PY
+      - name: Build actual desktop executable
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin nova 2>&1 | tee native-build.log
+      - name: Real WebView2 history, thumbnail, migration and restart checks
+        run: node scripts/history-native-smoke.mjs 2>&1 | tee native-smoke.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: long-history-native
+          path: |
+            native-*.log
+            *-tests.log
+            history-native-results/
+          retention-days: 7

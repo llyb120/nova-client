@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 use crate::clues::ClueContextSnapshot;
+use crate::transcript::TranscriptItems;
 
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -312,10 +313,15 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 /// 给一组会话条目里的用户附件内嵌内容（用于分享跨机器传输）。
-pub fn embed_items_attachments(items: &mut [Item]) {
-    for it in items.iter_mut() {
-        if let Item::User { images, .. } = it {
-            embed_attachment_data(images);
+pub fn embed_items_attachments<'a>(items: impl IntoIterator<Item = &'a mut Item>) {
+    for it in items {
+        match it {
+            Item::User { images, .. } => embed_attachment_data(images),
+            Item::Tool { call, .. } => {
+                for value in &mut call.content { crate::history_assets::embed_tool_images(value); }
+                if let Some(value) = &mut call.raw_output { crate::history_assets::embed_tool_images(value); }
+            }
+            _ => {}
         }
     }
 }
@@ -567,7 +573,7 @@ pub struct Thread {
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default)]
-    pub items: Vec<Item>,
+    pub items: TranscriptItems,
     #[serde(default)]
     pub plan: Option<Value>,
 }
@@ -628,7 +634,7 @@ impl Thread {
             clue_context: None,
             created_at: now,
             updated_at: now,
-            items: Vec::new(),
+            items: TranscriptItems::default(),
             plan: None,
         }
     }
@@ -643,7 +649,7 @@ impl Thread {
     }
 
     pub fn next_item_id(&self) -> u64 {
-        self.items.iter().map(|i| i.id()).max().unwrap_or(0) + 1
+        self.items.stats().max_id + 1
     }
 
     /// guest 漫游会话本地乐观插入的条目 id 专用高位区间。host 转发来的条目 id 是
@@ -1189,7 +1195,13 @@ struct DirtyThreads {
 
 /// 一次后台持久化的不可变会话快照。快照在 ThreadStore 锁内只做必要 clone，
 /// JSON 序列化与文件 IO 均在锁外的 blocking worker 完成。
+#[derive(Default)]
+struct PersistState { written: u64 }
+
 pub struct ThreadPersistSnapshot {
+    original_items: Vec<(String, TranscriptItems)>,
+    sequence: u64,
+    writer: Arc<Mutex<PersistState>>,
     dir: PathBuf,
     threads: Vec<Thread>,
     requested_ids: HashSet<String>,
@@ -1197,6 +1209,8 @@ pub struct ThreadPersistSnapshot {
 }
 
 pub struct ThreadStore {
+    writer: Arc<Mutex<PersistState>>,
+    sequence: std::sync::atomic::AtomicU64,
     dir: PathBuf,
     pub threads: Vec<Thread>,
     /// 待落盘会话。普通会话更新只登记对应 id；结构变化（迁移/删除）登记 full。
@@ -1247,15 +1261,17 @@ impl ThreadStore {
             Self::load_split_threads(&dir)
         };
         let mut store = ThreadStore {
+            writer: Arc::new(Mutex::new(PersistState::default())),
+            sequence: std::sync::atomic::AtomicU64::new(1),
             dir,
             threads,
             dirty: Arc::new(Mutex::new(DirtyThreads::default())),
             save_notify: Arc::new(Notify::new()),
         };
         // 上次进程未正常退出时残留的临时会话，启动时一并清掉
-        if !store.purge_ephemeral().is_empty() {
-            store.save();
-        }
+        let purged = !store.purge_ephemeral().is_empty();
+        // Normalize legacy inline attachments on the background flusher, not startup/UI.
+        if purged || store.threads.iter().any(|t| t.items.stats().inline_asset_bytes > 0) { store.save(); }
         store
     }
 
@@ -1263,23 +1279,15 @@ impl ThreadStore {
         let Ok(entries) = fs::read_dir(dir) else {
             return Vec::new();
         };
-        let mut threads: Vec<Thread> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                if path.extension() != Some(OsStr::new("json")) {
-                    return None;
-                }
-                fs::read_to_string(&path).ok().and_then(|text| {
-                    serde_json::from_str::<Thread>(&text)
-                        .ok()
-                        .map(|mut thread| {
-                            deduplicate_thread_outputs(&mut thread);
-                            thread
-                        })
-                })
-            })
-            .collect();
+        let mut cache = std::collections::HashMap::new();
+        let mut threads: Vec<Thread> = entries.flatten().filter_map(|entry| {
+            let path = entry.path();
+            if path.extension() != Some(OsStr::new("json")) { return None; }
+            match crate::history_disk::read_cached(&path, &mut cache) {
+                Ok(thread) => Some(thread),
+                Err(error) => { eprintln!("[threads] 无法读取 {}，保留文件等待恢复：{error}", path.display()); None }
+            }
+        }).collect();
         threads.sort_by_key(|thread| thread.created_at);
         threads
     }
@@ -1361,7 +1369,7 @@ impl ThreadStore {
             let ids = std::mem::take(&mut dirty.ids);
             (full, ids)
         };
-        let threads = if full {
+        let threads: Vec<Thread> = if full {
             self.threads.clone()
         } else {
             self.threads
@@ -1371,6 +1379,9 @@ impl ThreadStore {
                 .collect()
         };
         Some(ThreadPersistSnapshot {
+            original_items: threads.iter().map(|t|(t.id.clone(),t.items.clone())).collect(),
+            sequence: self.sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            writer: self.writer.clone(),
             dir: self.dir.clone(),
             threads,
             requested_ids,
@@ -1454,13 +1465,38 @@ impl ThreadStore {
 
     /// 在 ThreadStore 锁外序列化并原子写入一次快照。
     pub fn write_persist_snapshot(snapshot: &mut ThreadPersistSnapshot) -> Result<(), String> {
-        let files = Self::serialize_threads(&snapshot.dir, &mut snapshot.threads)?;
-        Self::write_file_batch(
-            &snapshot.dir,
-            &files,
-            snapshot.full,
-            &snapshot.requested_ids,
-        )
+        let mut writer = snapshot.writer.lock().map_err(|_| "历史写入锁损坏")?;
+        if snapshot.sequence <= writer.written { return Ok(()); }
+        fs::create_dir_all(&snapshot.dir).map_err(|e|e.to_string())?;
+        let mut expected = HashSet::new();
+        for thread in &mut snapshot.threads {
+            let path = snapshot.dir.join(Self::thread_file_name(&thread.id));
+            crate::history_disk::write_thread(&snapshot.dir, &path, thread)?;
+            expected.insert(path);
+        }
+        if snapshot.full {
+            for entry in fs::read_dir(&snapshot.dir).map_err(|e|e.to_string())?.flatten() {
+                let path=entry.path();
+                // Never erase an unreadable history file during cleanup.
+                if path.extension()==Some(OsStr::new("json")) && !expected.contains(&path)
+                    && crate::history_disk::read_thread(&path).is_ok() {
+                    crate::history_disk::remove_thread_files(&path)?;
+                }
+            }
+        } else {
+            for id in &snapshot.requested_ids {
+                let path=snapshot.dir.join(Self::thread_file_name(id));
+                if !expected.contains(&path) { crate::history_disk::remove_thread_files(&path)?; }
+            }
+        }
+        writer.written=snapshot.sequence;
+        Ok(())
+    }
+
+    pub fn install_persisted_assets(&mut self, snapshot: &ThreadPersistSnapshot) {
+        for ((id, original), normalized) in snapshot.original_items.iter().zip(&snapshot.threads) {
+            if let Some(thread)=self.get_mut(id) { thread.items.install_unchanged(original, &normalized.items); }
+        }
     }
 
     /// 原子写入全量会话快照，并删除已不在快照中的旧会话文件。
@@ -1470,10 +1506,11 @@ impl ThreadStore {
 
     /// 立即同步落盘（进程退出/升级重启前的最终保存），并清除脏标记
     pub fn save_now(&mut self) {
-        *self.dirty.lock().unwrap() = DirtyThreads::default();
-        if let Some(files) = self.serialize_files() {
-            if let Err(error) = Self::write_files(&self.dir, &files) {
-                eprintln!("[threads] 保存会话失败：{error}");
+        self.save();
+        if let Some(mut snapshot)=self.take_persist_snapshot() {
+            match Self::write_persist_snapshot(&mut snapshot) {
+                Ok(()) => self.install_persisted_assets(&snapshot),
+                Err(error) => { self.retry_persist_snapshot(&snapshot); eprintln!("[threads] 保存会话失败：{error}"); }
             }
         }
     }
@@ -1516,12 +1553,13 @@ const HANDOFF_CONTEXT_THRESHOLD: usize = HANDOFF_TOTAL_BUDGET * 4 / 5;
 
 /// 跨 agent 切换时，把按时间排列的会话条目 + 计划进度渲染成一段上下文文本，
 /// 供新 agent 接续。无可用内容时返回 None。
-pub fn render_handoff_context(
-    items: &[Item],
+pub fn render_handoff_context<'a>(
+    items: impl IntoIterator<Item = &'a Item>,
     plan: Option<&Value>,
     from_label: &str,
     to_label: &str,
 ) -> Option<String> {
+    let items: Vec<&Item> = items.into_iter().collect();
     let mut blocks: Vec<String> = Vec::new();
     let mut slim_blocks: Vec<String> = Vec::new();
     let mut turn_users: Vec<String> = Vec::new();

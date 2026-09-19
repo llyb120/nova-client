@@ -78,8 +78,10 @@ export function groupItems(items: Item[], prev: Group[] = []): Group[] {
   }
 
   // 重建出的尾部分组若内容与旧对象一致，复用旧对象身份，避免Canvas 重复排版。
+  const previousByFirstId = new Map(prev.map(group => [group.user?.id ?? group.body[0]?.id ?? group.turn?.id, group]));
   for (let j = rebuiltStart; j < result.length; j++) {
-    const prevGroup = prev[j];
+    const group = result[j];
+    const prevGroup = previousByFirstId.get(group.user?.id ?? group.body[0]?.id ?? group.turn?.id);
     if (prevGroup && sameGroup(result[j], prevGroup)) result[j] = prevGroup;
   }
   return result;

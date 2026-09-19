@@ -2744,7 +2744,12 @@ fn normalize_plan_status(status: &str) -> &'static str {
 
 fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>) -> Vec<Item> {
     let mut changed = Vec::new();
-    for item in &mut thread.items {
+    // Inspect immutable history first: completing one live tool must not copy
+    // every historical chunk merely because iter_mut visited it.
+    let pending: Vec<usize> = thread.items.iter().enumerate().filter_map(|(index,item)|
+        matches!(item, Item::Tool { call, .. } if call.status == "pending" || call.status == "in_progress").then_some(index)).collect();
+    for index in pending {
+        let item = &mut thread.items[index];
         let Item::Tool { call, .. } = item else {
             continue;
         };

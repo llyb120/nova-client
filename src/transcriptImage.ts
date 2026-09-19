@@ -7,6 +7,7 @@ export function localImagePath(href: string): string | null {
 }
 
 export function transcriptImageSrc(href: string): string {
+  if (href.startsWith("nova-history://")) return href;
   const path = localImagePath(href);
   if (path) return convertFileSrc(path);
   return /^(?:https?:\/\/|data:image\/(?:png|jpeg|webp|gif);base64,)/i.test(href) ? href : "";

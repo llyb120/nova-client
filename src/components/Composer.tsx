@@ -1,3 +1,4 @@
+import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
 import {
@@ -185,7 +186,7 @@ export function Composer() {
   };
   const requestStop = () => {
     holdPromptQueue(state.currentId);
-    void cancelTurn();
+    void cancelTurn().catch(error => { void message(String(error), { kind: "error" }); });
   };
 
   mountSessionShortcuts({
@@ -199,7 +200,8 @@ export function Composer() {
     },
   });
 
-  const stopShortcutLabel = () => "停止 (Esc)";
+  const stopping = () => !!(state.currentId && state.stopping[state.currentId]);
+  const stopShortcutLabel = () => stopping() ? "正在停止…" : "停止 (Esc)";
 
   // 进行中 / 漫游会话不开放跨后端切换，退回当前后端单选；否则可在已启用后端间切换
   const isGuest = () =>
@@ -287,7 +289,9 @@ export function Composer() {
       // 不再让每个流式 item 追加都全量遍历越来越长的 transcript。
       if (!currentId || loadingThread) return;
       for (const item of state.items) {
-        if (item.type === "user") {
+        // A display stub is not the original prompt. Never put truncated text
+        // into the reusable prompt menu; explicit details/copy still load it.
+        if (item.type === "user" && !item.detailDeferred) {
           rememberPromptHistory(item.text, item.images ?? [], item.ts, `${currentId}:item:${item.id}`);
         }
       }
@@ -811,9 +815,11 @@ export function Composer() {
               class="composer-btn stop"
               onClick={requestStop}
               title={running() ? stopShortcutLabel() : "停止"}
-              disabled={!running()}
+              aria-label={stopping() ? "正在停止" : "停止会话"}
+              aria-busy={stopping()}
+              disabled={!running() || stopping()}
             >
-              <IconStop size={16} />
+              <Show when={stopping()} fallback={<IconStop size={16} />}><span>…</span></Show>
             </button>
           </span>
           <button

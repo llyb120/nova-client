@@ -1,3 +1,5 @@
+import type { HistoryWindow, HistoryNotice, HistoryPageRequest } from "./historyTypes";
+import { pageThread, mergeHistoryPage, mergeHistoryUpdate, preserveOptimistic, HISTORY_PAGE_ITEMS, HISTORY_PAGE_BYTES } from "./historyWindow";
 import { nextRunningThread } from "./nextRunningThread";
 import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
@@ -142,6 +144,12 @@ interface AppStore {
   currentId: string | null;
   /** 当前打开线程的 transcript */
   items: Item[];
+  /** Only this bounded display window lives in the UI; model/export history stays native. */
+  history: HistoryWindow | null;
+  historyFollowing: boolean;
+  historyLoading: boolean;
+  historyError: string;
+  stopping: Record<string, boolean>;
   plan: PlanEntry[] | null;
   /** Plan 模式产出的 proposed plan：非空时展示「实施此计划」选项 */
   proposedPlan: string | null;
@@ -210,6 +218,11 @@ export const [state, setState] = createStore<AppStore>({
   projects: [],
   currentId: null,
   items: [],
+  history: null,
+  historyFollowing: true,
+  historyLoading: false,
+  historyError: "",
+  stopping: {},
   plan: null,
   proposedPlan: null,
   cwd: "",
@@ -1060,10 +1073,13 @@ export async function createRoamingThread(
     worktreeBase.trim() || null,
   );
   rememberThreadSnapshot(t);
+  ++openThreadRequest; ++historyNavigation; historyNotices.clear();
   setState("expanded", reconcile({}));
   setState({
+    historyLoading: false, historyError: "", historyFollowing: true,
     currentId: t.id,
     items: t.items,
+    history: null,
     plan: (t.plan as PlanEntry[] | null) ?? null,
     proposedPlan: null,
     cwd: t.cwd,
@@ -1121,6 +1137,7 @@ export async function createQuotaThread(
   setState({
     currentId: t.id,
     items: t.items,
+    history: null,
     plan: (t.plan as PlanEntry[] | null) ?? null,
     proposedPlan: null,
     cwd: t.cwd,
@@ -1179,6 +1196,7 @@ function rememberCurrentThreadSnapshot() {
     reasoningEffort: state.reasoningEffort || null,
     // Solid store 的 raw 数组本就驻留内存；保留引用即可，切换时不深拷贝整段 transcript。
     items: unwrap(state.items),
+    history: state.history ? unwrap(state.history) : undefined,
     plan: state.plan ? unwrap(state.plan) : null,
   });
 }
@@ -1191,6 +1209,8 @@ function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileIte
     }
     setState({
       currentId: thread.id,
+      history: thread.history ?? null,
+      historyError: "",
       ...(!reconcileItems ? { items: thread.items } : {}),
       plan: (thread.plan as PlanEntry[] | null) ?? null,
       proposedPlan: recoverProposedPlan(thread),
@@ -1218,7 +1238,8 @@ function recoverProposedPlan(_thread: Thread): string | null {
 }
 
 let openThreadRequest = 0;
-let snapshotToolUpdates: { threadId: string; items: Map<number, ToolItem> } | undefined;
+const historyEdits = new Set<string>();
+export const [historyResetRevision, setHistoryResetRevision] = createSignal(0);
 
 /** 切换会话耗时自测：仅在总耗时超阈值时写一行 agent 日志，release 包也能定位卡点。 */
 let switchTraceStart = 0;
@@ -1282,7 +1303,10 @@ export async function openThread(id: string) {
   unhideVirgoThread(id);
   if (state.unreadTurns[id]) setUnreadTurns(id, 0);
   const switching = state.currentId !== id;
-  const request = switching ? ++openThreadRequest : openThreadRequest;
+  const request = ++openThreadRequest;
+  historyNavigation++;
+  historyNotices.clear();
+  setState({ historyFollowing: true, historyLoading: false, historyError: "" });
   const previousId = state.currentId;
   if (switching && !switchTraceStart) markThreadSwitchStart();
   flushPendingStreamUpdates();
@@ -1312,6 +1336,7 @@ export async function openThread(id: string) {
       setState({
         currentId: id,
         items: [],
+        history: null,
         plan: null,
         proposedPlan: null,
         cwd: meta?.cwd ?? "",
@@ -1333,15 +1358,13 @@ export async function openThread(id: string) {
     if (request !== openThreadRequest || state.currentId !== id) return;
   }
 
-  const toolUpdates = { threadId: id, items: new Map<number, ToolItem>() };
-  snapshotToolUpdates = toolUpdates;
   try {
     // 先接通前台推流再取快照，避免工具在快照之后、active_thread 切换之前完成而漏报。
     // 缓存仍在 await 前显示；只让后台校准等待这次交接。
     await api.reportActivity(id);
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
-    if (cached && switching && !staleThreadSnapshots.has(id)) {
+    if (cached?.history && !cached.history.afterCursor && switching && !staleThreadSnapshots.has(id)) {
       const agentKind = cached.agentKind ?? "devin";
       const roamingPeer =
         cached.roamingRole === "guest" ? cached.roamingPeer ?? null : cached.quotaPeer ?? null;
@@ -1349,8 +1372,8 @@ export async function openThread(id: string) {
       else void ensureModelOptions(agentKind);
       return;
     }
-    const t = await api.getThread(id);
-    traceThreadSwitch(id, "getThread(IPC) 返回");
+    const t = pageThread(await api.getThreadPage(id, { limit: HISTORY_PAGE_ITEMS, byteLimit: HISTORY_PAGE_BYTES }));
+    traceThreadSwitch(id, "getThreadPage(IPC) 返回");
     if (request !== openThreadRequest) return;
     rememberThreadSnapshot(t);
     const agentKind = t.agentKind ?? "devin";
@@ -1361,24 +1384,25 @@ export async function openThread(id: string) {
       commitSnapshot(t, false);
       if (request !== openThreadRequest || state.currentId !== id) return;
     }
-    // IPC 返回途中收到的终态可能比快照更新，冷加载不能丢，暖加载不能被旧快照覆盖。
-    batch(() => {
-      for (const item of toolUpdates.items.values()) applyOp({ t: "upsert", item });
-    });
     const roamingPeer =
       t.roamingRole === "guest" ? t.roamingPeer ?? null : t.quotaPeer ?? null;
     if (roamingPeer) ensurePeerModels(roamingPeer);
     else void ensureModelOptions(agentKind);
-  } catch {
-    if (state.currentId === id) setState({ loadingThread: false });
+  } catch (error) {
+    if (state.currentId === id && request === openThreadRequest)
+      setState({ loadingThread: false, historyError: String(error) });
   } finally {
-    if (snapshotToolUpdates === toolUpdates) snapshotToolUpdates = undefined;
+    scheduleHistoryRefresh();
   }
 }
 
 export function closeThread() {
+  openThreadRequest++;
+  historyNavigation++;
+  historyNotices.clear();
   flushPendingStreamUpdates();
   rememberCurrentThreadSnapshot();
+  setState({ history: null, historyLoading: false, historyError: "" });
   discardPendingStreamUpdates();
   resetExpanded();
   const agentKind = lastUsed.agentKind();
@@ -1441,6 +1465,7 @@ export async function createThread(
   setState({
     currentId: t.id,
     items: t.items,
+    history: null,
     plan: (t.plan as PlanEntry[] | null) ?? null,
     proposedPlan: null,
     cwd: t.cwd,
@@ -1734,8 +1759,10 @@ export function createThreadOptimistic(
     zenDropPrompt(text);
   } else {
     setState("expanded", reconcile({}));
+    ++openThreadRequest; ++historyNavigation; historyNotices.clear();
     setState({
       currentId: pendingId,
+      history: null, historyLoading: false, historyError: "", historyFollowing: true,
       items: [],
       plan: null,
       proposedPlan: null,
@@ -1785,6 +1812,7 @@ export function createThreadOptimistic(
         setState({
           currentId: t.id,
           items: t.items,
+    history: null,
           plan: (t.plan as PlanEntry[] | null) ?? null,
           proposedPlan: null,
           cwd: t.cwd,
@@ -2807,8 +2835,8 @@ export function stashWorktreePrompt(
   // create_thread 可能直接复用已就绪的 worktree，或后台 ready 事件可能先于 invoke 返回。
   // 主动核对持久化状态，避免首条提示词永远留在暂存 Map。
   void api
-    .getThread(threadId)
-    .then((thread) => {
+    .getThreadPage(threadId, { limit: 1 })
+    .then(({ thread }) => {
       if (thread.worktree && thread.cwd === thread.worktree.path) flushWorktreePrompt(threadId);
     })
     .catch((error) => console.error("getThread after worktree creation failed", error));
@@ -2839,54 +2867,86 @@ export async function editUserMessage(itemId: number, text: string, images: Prom
     await openThread(restored.threadId);
     id = restored.threadId;
   }
-  const targetIndex = state.items.findIndex((item) => item.id === itemId);
-  const retained = targetIndex < 0 ? state.items : state.items.slice(0, targetIndex);
-  // 临时 id 只存在于前端；后端 restore 完成、发出真实 user item 后由快照/事件替换。
-  const optimisticId = -Date.now();
-  setState({
-    items: [
-      ...retained,
-      { type: "user", id: optimisticId, text, images, ts: Date.now() } as Item,
-    ],
-    plan: null,
-    proposedPlan: null,
-  });
-  setState("expanded", reconcile({}));
-  setState("running", id, true);
-  // 先置 running 再解挂：停止留下的 hold 否则会挡住本轮结束后的队列自动投递。
-  // 必须在 running=true 之后释放，避免解挂瞬间把仍停留在队列里的条目立刻发出。
-  // 动态导入避免 store ↔ promptQueue 循环依赖。
-  const { releasePromptQueue } = await import("./promptQueue");
-  releasePromptQueue(id);
-  bumpChatScrollToBottom();
-  // 「停止 → 立刻编辑重发」的竞态：后端 cancel 可能尚未完成，truncate 会被
-  // 「会话正在运行」校验拒绝，直接抛错会让这次编辑静默丢失（表现为第一次发送失败）。
-  // 短暂重试等 cancel 落地，仍失败才抛出。
-  for (let attempt = 0; ; attempt++) {
-    try {
-      await api.truncateThread(id, itemId, text, images);
-      setTimeMachineChangedTick((n) => n + 1);
-      break;
-    } catch (e) {
-      if (attempt >= 10) {
-        setState("running", id, false);
-        if (state.currentId === id) await openThread(id);
-        throw e;
+  if (historyEdits.has(id)) return;
+  historyEdits.add(id);
+  ++openThreadRequest;
+  ++historyNavigation;
+  historyNotices.delete(id);
+  if (historyRefreshTimer !== undefined) clearTimeout(historyRefreshTimer);
+  historyRefreshTimer = undefined;
+  // A resend is a new transcript revision even when the thread and item IDs
+  // are reused. Old pages, refreshes and canvas layouts must not commit to it.
+  try {
+    batch(() => {
+      setState({ loadingThread: false, historyLoading: false, historyFollowing: true, historyError: "" });
+      setHistoryResetRevision(n => n + 1);
+      const targetIndex = state.items.findIndex((item) => item.id === itemId);
+      const retained = targetIndex < 0 ? state.items : state.items.slice(0, targetIndex);
+      // 临时 id 只存在于前端；后端 restore 完成、发出真实 user item 后由快照/事件替换。
+      const optimisticId = -Date.now();
+      setState({
+        items: [
+          ...retained,
+          { type: "user", id: optimisticId, text, images, ts: Date.now() } as Item,
+        ],
+        plan: null,
+        proposedPlan: null,
+    });
+    setState("expanded", reconcile({}));
+    setState("running", id!, true);
+    });
+    // 先置 running 再解挂：停止留下的 hold 否则会挡住本轮结束后的队列自动投递。
+    // 必须在 running=true 之后释放，避免解挂瞬间把仍停留在队列里的条目立刻发出。
+    // 动态导入避免 store ↔ promptQueue 循环依赖。
+    const { releasePromptQueue } = await import("./promptQueue");
+    releasePromptQueue(id);
+    bumpChatScrollToBottom();
+    // 「停止 → 立刻编辑重发」的竞态：后端 cancel 可能尚未完成，truncate 会被
+    // 「会话正在运行」校验拒绝，直接抛错会让这次编辑静默丢失（表现为第一次发送失败）。
+    // 短暂重试等 cancel 落地，仍失败才抛出。
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await api.truncateThread(id, itemId, text, images);
+        setTimeMachineChangedTick((n) => n + 1);
+        break;
+      } catch (e) {
+        // Only the documented preflight running-state rejection is retryable.
+        // Storage/restore errors may follow side effects and must never be replayed.
+        if (attempt >= 10 || !String(e).includes("会话正在运行")) {
+          setState("running", id, false);
+          if (state.currentId === id) await openThread(id);
+          throw e;
+        }
+        await new Promise((r) => setTimeout(r, 300));
+        if (state.currentId !== id) return;
       }
-      await new Promise((r) => setTimeout(r, 300));
-      if (state.currentId !== id) return;
     }
+  } finally {
+    historyEdits.delete(id);
+    // Only after truncate/restore has settled may the authoritative generation
+    // replace the optimistic branch. This also recovers cleanly after errors.
+    requestHistoryRefresh(id, [], true);
   }
 }
 
+const stopRequests = new Map<string, Promise<void>>();
 export async function cancelTurn(stopReason?: string, deleteWork = false) {
   const id = state.currentId;
   if (!id) return;
+  if (stopRequests.has(id)) return stopRequests.get(id);
+  // Publish feedback before doing any history work. Acknowledgement is not a
+  // fabricated end-of-turn: only backend events/status may clear running.
+  setState("stopping", id, true);
   optimisticRunningThreads.delete(id);
-  await api.cancelTurn(id, stopReason, deleteWork);
-  // 部分后端的取消调用会先返回，结束事件稍后才到；主动释放前端忙碌态，
-  // 避免停止成功后历史消息仍被 running 门控，必须切换会话才能编辑。
-  setState("running", id, false);
+  const operation = api.cancelTurn(id, stopReason, deleteWork).then(() => {
+    void refreshThreads();
+    requestHistoryRefresh(id, [], true);
+  }).finally(() => {
+    stopRequests.delete(id);
+    setState("stopping", id, false);
+  });
+  stopRequests.set(id, operation);
+  return operation;
 }
 
 /** 手动压缩当前会话上下文（仅 Codex）：把长历史浓缩为摘要，加快后续响应。
@@ -2911,6 +2971,155 @@ export async function respondPermission(requestKey: string, optionId: string) {
       "permissions",
       state.permissions.filter((p) => p.requestKey !== requestKey),
     );
+  }
+}
+
+// ─── Bounded history window / authoritative invalidation feed ──────────────
+let historyNavigation = 0;
+let historyRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+let historyFetchToken = 0;
+let activeHistoryFetch: { id: string; epoch: number; token: number } | undefined;
+const historyNotices = new Map<string, { ids: Set<number>; reset: boolean }>();
+
+function currentDisplayThread(): Thread | undefined {
+  const id = state.currentId;
+  if (!id) return;
+  const cached = threadSnapshots.peek(id);
+  const meta = state.threads.find(t => t.id === id);
+  return {
+    ...(cached ?? { id, createdAt: meta?.createdAt ?? 0, updatedAt: meta?.updatedAt ?? 0 }),
+    title: state.title, cwd: state.cwd, agentKind: state.agentKind,
+    model: state.model, mode: state.mode, reasoningEffort: state.reasoningEffort,
+    items: unwrap(state.items), history: state.history ? unwrap(state.history) : undefined,
+  };
+}
+function commitHistoryThread(thread: Thread) {
+  rememberThreadSnapshot(thread);
+  batch(() => {
+    setState("items", reconcile(thread.items, { key: "id" }));
+    setState({ history: thread.history ?? null, loadingThread: false, historyError: "" });
+  });
+}
+export function requestHistoryRefresh(threadId: string, ids: number[] = [], reset = false) {
+  if (threadId !== state.currentId) {
+    if (threadSnapshots.has(threadId)) staleThreadSnapshots.add(threadId);
+    return;
+  }
+  let notice = historyNotices.get(threadId);
+  if (!notice) { notice = { ids: new Set(), reset: false }; historyNotices.set(threadId, notice); }
+  notice.reset ||= reset;
+  for (const id of ids) notice.ids.add(id);
+  if (notice.ids.size > 128) { notice.ids.clear(); notice.reset = true; }
+  scheduleHistoryRefresh();
+}
+export function receiveHistoryNotice(event: HistoryNotice) {
+  if (event.resync) {
+    for (const id of threadSnapshots.keys()) staleThreadSnapshots.add(id);
+    if (state.currentId) requestHistoryRefresh(state.currentId, [], true);
+    return;
+  }
+  const { threadId, notice } = event;
+  if (!threadId || !notice) return;
+  if (notice.chars) trackDeltaRate(threadId, notice.chars);
+  for (const op of notice.ops) {
+    if (op.t === "usage") liveUsageByThread.set(threadId, op.usage);
+    if (threadId === state.currentId) applyOp(op);
+  }
+  requestHistoryRefresh(threadId, notice.ids, notice.reset || notice.removed.length > 0);
+}
+function scheduleHistoryRefresh() {
+  const id = state.currentId;
+  if (!id || historyEdits.has(id) || state.loadingThread || state.historyLoading || !historyNotices.has(id)) return;
+  if (historyRefreshTimer !== undefined) return;
+  if (activeHistoryFetch?.id === id && activeHistoryFetch.epoch === openThreadRequest) return;
+  historyRefreshTimer = setTimeout(() => { historyRefreshTimer = undefined; void flushHistoryRefresh(); }, 50);
+}
+async function flushHistoryRefresh() {
+  const id = state.currentId;
+  if (!id || historyEdits.has(id) || state.loadingThread || state.historyLoading) return;
+  const notice = historyNotices.get(id);
+  if (!notice) return;
+  historyNotices.delete(id);
+  const epoch = openThreadRequest, navigation = historyNavigation, token = ++historyFetchToken;
+  activeHistoryFetch = { id, epoch, token };
+  const current = currentDisplayThread();
+  try {
+    let next: Thread;
+    if (!current?.history) {
+      next = pageThread(await api.getThreadPage(id));
+    } else {
+      // A reset refreshes the retained window, not just the newest page. Even a
+      // window containing the tail may currently be scrolled to its older end.
+      const ids = notice.reset ? current.items.filter(i => i.id >= 0).map(i => i.id) : [...notice.ids];
+      let working = current;
+      let gap = false;
+      for (let offset = 0; offset < Math.max(1, ids.length); offset += 16) {
+        const response = await api.getThreadDisplayItems(id, current.history.generation, ids.slice(offset, offset + 16));
+        if (state.currentId !== id || epoch !== openThreadRequest) return;
+        if (navigation !== historyNavigation) { requestHistoryRefresh(id, [...notice.ids], notice.reset); return; }
+        const merged = mergeHistoryUpdate(working, response, !notice.reset && state.historyFollowing);
+        working = merged.thread; gap ||= merged.gap;
+      }
+      // One batch may have contained only some new IDs. When following the tail,
+      // reconcile a contiguous page once instead of replaying missing deltas.
+      if (state.historyFollowing && !current.history.afterCursor && (gap || working.history!.end < working.history!.totalItems)) {
+        const page = await api.getThreadPage(id);
+        next = page.start <= working.history!.end ? mergeHistoryPage(working, page, "after") : pageThread(page);
+      } else next = working;
+    }
+    if (state.currentId !== id || epoch !== openThreadRequest) return;
+    if (navigation !== historyNavigation) { requestHistoryRefresh(id, [...notice.ids], notice.reset); return; }
+    next = preserveOptimistic(currentDisplayThread(), next);
+    if ((next.history?.stats.turns ?? 0) > (current?.history?.stats.turns ?? 0)) {
+      liveUsageByThread.delete(id); setState("liveUsage", null);
+    }
+    commitHistoryThread(next);
+  } catch (error) {
+    if (state.currentId === id && epoch === openThreadRequest && navigation === historyNavigation) {
+      if (String(error).includes("HISTORY_CHANGED")) {
+        await openThread(id);
+      } else setState("historyError", String(error));
+    }
+  } finally {
+    if (activeHistoryFetch?.token === token) activeHistoryFetch = undefined;
+    // No automatic error retry loop. Only queued/new authoritative notices retry.
+    scheduleHistoryRefresh();
+  }
+}
+
+export async function loadHistoryPage(
+  direction: "before" | "after" | "latest", aroundId?: number,
+  viewport?: () => { itemId: number; lastItemId?: number } | null,
+): Promise<boolean> {
+  const current = currentDisplayThread(), id = state.currentId;
+  if (!id || historyEdits.has(id) || !current?.history || (state.historyLoading && direction !== "latest")) return false;
+  const meta = current.history;
+  const cursor = direction === "before" ? meta.beforeCursor : meta.afterCursor;
+  if (direction !== "latest" && aroundId == null && !cursor) return false;
+  const epoch = openThreadRequest, navigation = ++historyNavigation;
+  setState({ historyFollowing: direction === "latest" && aroundId == null, historyLoading: true, historyError: "" });
+  const request: HistoryPageRequest = aroundId != null ? { aroundId }
+    : direction === "latest" ? {} : { cursor: cursor!, direction };
+  try {
+    const page = await api.getThreadPage(id, request);
+    if (state.currentId !== id || openThreadRequest !== epoch || navigation !== historyNavigation) return false;
+    // Read the viewport AFTER the await: the user may have kept scrolling or
+    // reversed direction while the page was on its way.
+    const anchor = viewport?.();
+    const next = direction === "latest" || aroundId != null ? pageThread(page)
+      : mergeHistoryPage(currentDisplayThread()!, page, direction,
+          anchor ? [anchor.itemId, anchor.lastItemId ?? anchor.itemId] : undefined);
+    commitHistoryThread(preserveOptimistic(currentDisplayThread(), next));
+    return true;
+  } catch (error) {
+    if (state.currentId === id && epoch === openThreadRequest && navigation === historyNavigation) {
+      if (String(error).includes("HISTORY_CHANGED")) await openThread(id);
+      else setState("historyError", String(error));
+    }
+    return false;
+  } finally {
+    if (state.currentId === id && navigation === historyNavigation) setState("historyLoading", false);
+    scheduleHistoryRefresh();
   }
 }
 
@@ -3253,44 +3462,9 @@ export async function initStore() {
   });
   // 各监听互不依赖：并发注册，全部就绪后再读取会话快照，避免遗漏状态事件。
   await Promise.all([
-    listen<{ threadId: string; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
-      const ops = e.payload.ops ?? (e.payload.op ? [e.payload.op] : []);
-      // 后台会话的 usage 也要保留；否则切回运行中的会话会先显示 0，直到下一次上报。
-      for (const op of ops) {
-        if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
-        else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text.length);
-      }
-      if (e.payload.threadId !== state.currentId) {
-        if (threadSnapshots.has(e.payload.threadId)) staleThreadSnapshots.add(e.payload.threadId);
-        return;
-      }
-      // 切换会话加载快照期间忽略增量：此刻 items 还是旧会话的，getThread 快照会包含
-      // 已落库的全部内容，加载完成（loadingThread=false）后再应用后续实时增量。
-      // mode / proposed_plan / plan 是低频关键状态，加载中也要应用，否则 agent 切到 Plan
-      // 时选择器与「实施此计划」按钮会对不齐。
-      const apply = (op: UpdateOp) => {
-        if (snapshotToolUpdates?.threadId === e.payload.threadId && op.t === "upsert"
-          && op.item.type === "tool" && op.item.status !== "pending" && op.item.status !== "in_progress") {
-          snapshotToolUpdates.items.set(op.item.id, op.item);
-        }
-        if (
-          state.loadingThread &&
-          op.t !== "mode" &&
-          op.t !== "proposed_plan" &&
-          op.t !== "plan"
-        ) {
-          return;
-        }
-        applyOp(op);
-      };
-      if (ops.length > 1) {
-        batch(() => {
-          for (const op of ops) apply(op);
-        });
-      } else if (ops[0]) {
-        apply(ops[0]);
-      }
-    }),
+    // No acp:update listener in the UI: raw events may contain megabytes of
+    // base64/tool output. The native coalescer sends IDs and lightweight state.
+    listen<HistoryNotice>("acp:history", e => receiveHistoryNotice(e.payload)),
 
     listen<{ threadId: string; cwd: string }>("thread:cwd-changed", (e) => {
       const { threadId, cwd } = e.payload;
@@ -3307,6 +3481,8 @@ export async function initStore() {
       optimisticRunningThreads.delete(threadId);
       zenHoldThreads.delete(threadId);
       setState("running", threadId, e.payload.running);
+      if (!e.payload.running) setState("stopping", threadId, false);
+      requestHistoryRefresh(threadId, [], true);
       if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
         staleThreadSnapshots.add(threadId);
       }
@@ -3485,16 +3661,10 @@ export async function initStore() {
     // DOM 与滚动位置、思考/工具展开状态，避免整段重渲染导致的闪烁与跳动。
     listen<{ threadId: string }>("acp:reload", (e) => {
       const id = e.payload.threadId;
-      if (state.currentId !== id) return;
-      void api.getThread(id).then((t) => {
-        if (state.currentId !== id) return;
-        flushPendingStreamUpdates();
-        setState("items", reconcile(t.items, { key: "id" }));
-        setState({
-          plan: (t.plan as PlanEntry[] | null) ?? null,
-          title: t.title,
-        });
-      });
+      requestHistoryRefresh(id, [], true);
+      // A roaming reload replaces the authoritative generation. The projection
+      // refresh will reopen if needed; never ship its full image history to JS.
+      void refreshThreads();
     }),
 
     // 团队/漫游中转站事件
@@ -3558,9 +3728,9 @@ export async function initStore() {
       const id = e.payload.threadId;
       void refreshThreads();
       if (state.currentId === id) {
-        void api.getThread(id).then((t) => {
-          if (state.currentId === id) setState("cwd", t.cwd);
-        });
+        void api.getThreadPage(id, { limit: 1 }).then(({ thread }) => {
+          if (state.currentId === id) setState("cwd", thread.cwd);
+        }).catch(() => {});
       }
       flushWorktreePrompt(id);
     }),
