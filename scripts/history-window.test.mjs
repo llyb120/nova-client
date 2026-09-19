@@ -56,3 +56,20 @@ test('same prompt id with edited local text is a distinct branch; exact paths st
  const current=[{id:1,text:'start'},{id:2,text:'new'}];const graph=buildTimelineGraph([{id:'old',prompts:[current[0],{id:2,text:'old'}]}],current);
  assert.equal(graph.nodes.length,3);assert.equal(graph.nodes.filter(n=>n.onCurrentPath).length,2);assert.equal(graph.laneCount,2);assert.ok(graph.nodes.find(n=>n.title==='old').previewCheckpoint);
 });
+
+
+test('an in-flight prepend cannot evict a viewport after the reader reverses direction',()=>{
+ const current=pageThread(page(400,640));
+ const next=mergeHistoryPage(current,page(320,400),'before',[621,640]);
+ assert.ok(next.items.length<=240);assert.ok(windowBytes(next.items)<=HISTORY_WINDOW_BYTES);
+ for(let id=621;id<=640;id++)assert.ok(next.items.some(i=>i.id===id));
+ assert.ok(next.items.every((v,i,a)=>!i||v.historyIndex===a[i-1].historyIndex+1));
+ assert.equal(next.history.turnOffset,Math.ceil(next.history.start/3));
+});
+test('an in-flight append cannot evict the viewport at the older edge',()=>{
+ const current=pageThread(page(400,640));
+ const next=mergeHistoryPage(current,page(640,720),'after',[401,420]);
+ assert.ok(next.items.length<=240);assert.ok(windowBytes(next.items)<=HISTORY_WINDOW_BYTES);
+ for(let id=401;id<=420;id++)assert.ok(next.items.some(i=>i.id===id));
+ assert.ok(next.items.every((v,i,a)=>!i||v.historyIndex===a[i-1].historyIndex+1));
+});

@@ -15,12 +15,20 @@ function index(item: Item): number { return item.historyIndex ?? -1; }
 export function displayBytes(item: Item): number { return JSON.stringify(item).length * 3; }
 export function windowBytes(items: readonly Item[]): number { return items.reduce((n, item) => n + displayBytes(item), 0); }
 
-function trim(items: Item[], meta: HistoryWindow, keep: 'start' | 'end'): { items: Item[]; history: HistoryWindow } {
+function trim(items: Item[], meta: HistoryWindow, keep: 'start' | 'end', protectedIds?: readonly number[]): { items: Item[]; history: HistoryWindow } {
   let start = 0, end = items.length, bytes = windowBytes(items);
+  const protectedIndices = items.flatMap((item, i) => protectedIds?.includes(item.id) ? [i] : []);
+  const protectedStart = Math.min(...protectedIndices), protectedEnd = Math.max(...protectedIndices);
   while (end - start > 1 && (end - start > HISTORY_WINDOW_ITEMS || bytes > HISTORY_WINDOW_BYTES)) {
-    const removed = keep === 'end' ? items[start++] : items[--end];
+    let fromStart = keep === 'end';
+    const startProtected = start >= protectedStart && start <= protectedEnd;
+    const endProtected = end - 1 >= protectedStart && end - 1 <= protectedEnd;
+    if (startProtected && endProtected) break;
+    if (fromStart && startProtected) fromStart = false;
+    else if (!fromStart && endProtected) fromStart = true;
+    const removed = fromStart ? items[start++] : items[--end];
     bytes -= displayBytes(removed);
-    if (keep === 'end' && removed.type === 'user' && removed.id >= 0) meta.turnOffset++;
+    if (fromStart && removed.type === 'user' && removed.id >= 0) meta.turnOffset++;
   }
   const result = items.slice(start, end);
   const persisted = result.filter(item => item.id >= 0 && index(item) >= 0);
@@ -33,7 +41,7 @@ function trim(items: Item[], meta: HistoryWindow, keep: 'start' | 'end'): { item
 }
 
 /** Merge adjacent pages, de-duplicate overlap, retain only a bounded moving window. */
-export function mergeHistoryPage(current: Thread, page: HistoryPage, direction: 'before' | 'after'): Thread {
+export function mergeHistoryPage(current: Thread, page: HistoryPage, direction: 'before' | 'after', protectedIds?: readonly number[]): Thread {
   const old = current.history;
   if (!old || old.generation !== page.generation) throw new Error('HISTORY_CHANGED');
   if (page.end < old.start || page.start > old.end) throw new Error('HISTORY_GAP');
@@ -47,7 +55,12 @@ export function mergeHistoryPage(current: Thread, page: HistoryPage, direction: 
     turnOffset: page.start < old.start ? page.turnOffset : old.turnOffset,
     stats: page.totalItems >= old.totalItems ? page.stats : old.stats,
   };
-  return { ...current, ...trim(items, meta, direction === 'before' ? 'start' : 'end') };
+  const bounded = trim(items, meta, direction === 'before' ? 'start' : 'end', protectedIds);
+  // A pathological viewport cannot justify unbounded allocation or dropping
+  // visible content. Keep the current window; a later user scroll can retry.
+  if (bounded.items.length > HISTORY_WINDOW_ITEMS ||
+      (bounded.items.length > 1 && windowBytes(bounded.items) > HISTORY_WINDOW_BYTES)) return current;
+  return { ...current, ...bounded };
 }
 
 /** IDs are authoritative replacements, not deltas: a snapshot handover cannot double-append text. */

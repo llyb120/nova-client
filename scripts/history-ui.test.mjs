@@ -22,14 +22,14 @@ try {
   results.push({name:'cold-open-metrics',...metrics});
  });
  await check('pagination keeps a contiguous 240-item/1.5MiB window and does not request originals',async()=>{
-  for(let i=0;i<5;i++){await page.getByRole('button',{name:'加载更早记录',exact:true}).click();await page.waitForFunction(()=>!window.perfTest.state.historyLoading);}
+  for(let i=0;i<5;i++){await page.evaluate(()=>{void window.perfTest.page('before');});await page.waitForFunction(()=>!window.perfTest.state.historyLoading);}
   const data=await page.evaluate(()=>({ids:window.perfTest.state.items.map(i=>i.historyIndex),h:window.perfTest.metadata(),m:window.perfTest.metrics()}));
   assert.ok(data.m.items<=240);assert.ok(data.m.bytes<1536*1024);assert.ok(data.ids.every((id,i,a)=>!i||id===a[i-1]+1));assert.ok(data.h.beforeCursor&&data.h.afterCursor);
   assert.equal(await page.evaluate(()=>window.perfTest.images.filter(i=>i.original).length),0);
  });
  await check('stop reaches native IPC even while a historical page is outstanding; acknowledgement is not fake completion',async()=>{
   await page.evaluate(()=>{window.perfTest.run(true);window.perfTest.gate();});
-  await page.getByRole('button',{name:'加载更早记录',exact:true}).click();
+  await page.evaluate(()=>{void window.perfTest.page('before');});
   await page.waitForFunction(()=>window.perfTest.state.historyLoading);
   await page.getByRole('button',{name:'停止会话',exact:true}).click();
   await page.waitForFunction(()=>window.perfTest.calls.some(c=>c.command==='cancel_turn'));
@@ -69,7 +69,7 @@ try {
   await page.evaluate(()=>window.perfTest.open('small'));await page.evaluate(()=>window.perfTest.release());await page.waitForTimeout(120);
   assert.equal(await page.evaluate(()=>window.perfTest.state.currentId),'small');assert.equal(await page.evaluate(()=>window.perfTest.state.items.length),12);
   await page.evaluate(()=>window.perfTest.open('big'));const before=await page.evaluate(()=>window.perfTest.state.items.map(i=>i.id));
-  await page.evaluate(()=>window.perfTest.fail());await page.getByRole('button',{name:'加载更早记录',exact:true}).click();
+  await page.evaluate(()=>window.perfTest.fail());await page.evaluate(()=>{void window.perfTest.page('before');});
   await page.getByRole('alert').getByText('fixture: disk failure',{exact:false}).waitFor();
   assert.deepEqual(await page.evaluate(()=>window.perfTest.state.items.map(i=>i.id)),before);
  });
@@ -113,3 +113,6 @@ try {
  assert.deepEqual(errors,[]);await page.screenshot({path:`${reportDir}/history-ui.png`});
 } catch(error) {results.push({name:'failure',error:String(error.stack||error),errors});console.error(errors);console.error(await page.evaluate(()=>({body:document.body.innerText.slice(-3000),metrics:window.perfTest?.metrics(),h:window.perfTest?.metadata(),calls:window.perfTest?.calls.slice(-15)})));await page.screenshot({path:`${reportDir}/failure.png`}).catch(()=>{});throw error;}
 finally {await writeFile(`${reportDir}/report.json`,JSON.stringify({mode:process.env.TEST_OFFLINE==='1'?'offline-bundled':'real-browser-http',results,errors},null,2));await close();}
+
+// Keep the original CI entrypoint running the new real-wheel/resend regressions.
+await import('./history-seamless.test.mjs');

@@ -1238,6 +1238,8 @@ function recoverProposedPlan(_thread: Thread): string | null {
 }
 
 let openThreadRequest = 0;
+const historyEdits = new Set<string>();
+export const [historyResetRevision, setHistoryResetRevision] = createSignal(0);
 
 /** 切换会话耗时自测：仅在总耗时超阈值时写一行 agent 日志，release 包也能定位卡点。 */
 let switchTraceStart = 0;
@@ -2865,45 +2867,65 @@ export async function editUserMessage(itemId: number, text: string, images: Prom
     await openThread(restored.threadId);
     id = restored.threadId;
   }
-  const targetIndex = state.items.findIndex((item) => item.id === itemId);
-  const retained = targetIndex < 0 ? state.items : state.items.slice(0, targetIndex);
-  // 临时 id 只存在于前端；后端 restore 完成、发出真实 user item 后由快照/事件替换。
-  const optimisticId = -Date.now();
-  setState({
-    items: [
-      ...retained,
-      { type: "user", id: optimisticId, text, images, ts: Date.now() } as Item,
-    ],
-    plan: null,
-    proposedPlan: null,
-  });
-  setState("expanded", reconcile({}));
-  setState("running", id, true);
-  // 先置 running 再解挂：停止留下的 hold 否则会挡住本轮结束后的队列自动投递。
-  // 必须在 running=true 之后释放，避免解挂瞬间把仍停留在队列里的条目立刻发出。
-  // 动态导入避免 store ↔ promptQueue 循环依赖。
-  const { releasePromptQueue } = await import("./promptQueue");
-  releasePromptQueue(id);
-  bumpChatScrollToBottom();
-  // 「停止 → 立刻编辑重发」的竞态：后端 cancel 可能尚未完成，truncate 会被
-  // 「会话正在运行」校验拒绝，直接抛错会让这次编辑静默丢失（表现为第一次发送失败）。
-  // 短暂重试等 cancel 落地，仍失败才抛出。
-  for (let attempt = 0; ; attempt++) {
-    try {
-      await api.truncateThread(id, itemId, text, images);
-      setTimeMachineChangedTick((n) => n + 1);
-      break;
-    } catch (e) {
-      // Only the documented preflight running-state rejection is retryable.
-      // Storage/restore errors may follow side effects and must never be replayed.
-      if (attempt >= 10 || !String(e).includes("会话正在运行")) {
-        setState("running", id, false);
-        if (state.currentId === id) await openThread(id);
-        throw e;
+  if (historyEdits.has(id)) return;
+  historyEdits.add(id);
+  ++openThreadRequest;
+  ++historyNavigation;
+  historyNotices.delete(id);
+  if (historyRefreshTimer !== undefined) clearTimeout(historyRefreshTimer);
+  historyRefreshTimer = undefined;
+  // A resend is a new transcript revision even when the thread and item IDs
+  // are reused. Old pages, refreshes and canvas layouts must not commit to it.
+  try {
+    batch(() => {
+      setState({ loadingThread: false, historyLoading: false, historyFollowing: true, historyError: "" });
+      setHistoryResetRevision(n => n + 1);
+      const targetIndex = state.items.findIndex((item) => item.id === itemId);
+      const retained = targetIndex < 0 ? state.items : state.items.slice(0, targetIndex);
+      // 临时 id 只存在于前端；后端 restore 完成、发出真实 user item 后由快照/事件替换。
+      const optimisticId = -Date.now();
+      setState({
+        items: [
+          ...retained,
+          { type: "user", id: optimisticId, text, images, ts: Date.now() } as Item,
+        ],
+        plan: null,
+        proposedPlan: null,
+    });
+    setState("expanded", reconcile({}));
+    setState("running", id!, true);
+    });
+    // 先置 running 再解挂：停止留下的 hold 否则会挡住本轮结束后的队列自动投递。
+    // 必须在 running=true 之后释放，避免解挂瞬间把仍停留在队列里的条目立刻发出。
+    // 动态导入避免 store ↔ promptQueue 循环依赖。
+    const { releasePromptQueue } = await import("./promptQueue");
+    releasePromptQueue(id);
+    bumpChatScrollToBottom();
+    // 「停止 → 立刻编辑重发」的竞态：后端 cancel 可能尚未完成，truncate 会被
+    // 「会话正在运行」校验拒绝，直接抛错会让这次编辑静默丢失（表现为第一次发送失败）。
+    // 短暂重试等 cancel 落地，仍失败才抛出。
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await api.truncateThread(id, itemId, text, images);
+        setTimeMachineChangedTick((n) => n + 1);
+        break;
+      } catch (e) {
+        // Only the documented preflight running-state rejection is retryable.
+        // Storage/restore errors may follow side effects and must never be replayed.
+        if (attempt >= 10 || !String(e).includes("会话正在运行")) {
+          setState("running", id, false);
+          if (state.currentId === id) await openThread(id);
+          throw e;
+        }
+        await new Promise((r) => setTimeout(r, 300));
+        if (state.currentId !== id) return;
       }
-      await new Promise((r) => setTimeout(r, 300));
-      if (state.currentId !== id) return;
     }
+  } finally {
+    historyEdits.delete(id);
+    // Only after truncate/restore has settled may the authoritative generation
+    // replace the optimistic branch. This also recovers cleanly after errors.
+    requestHistoryRefresh(id, [], true);
   }
 }
 
@@ -3007,14 +3029,14 @@ export function receiveHistoryNotice(event: HistoryNotice) {
 }
 function scheduleHistoryRefresh() {
   const id = state.currentId;
-  if (!id || state.loadingThread || state.historyLoading || !historyNotices.has(id)) return;
+  if (!id || historyEdits.has(id) || state.loadingThread || state.historyLoading || !historyNotices.has(id)) return;
   if (historyRefreshTimer !== undefined) return;
   if (activeHistoryFetch?.id === id && activeHistoryFetch.epoch === openThreadRequest) return;
   historyRefreshTimer = setTimeout(() => { historyRefreshTimer = undefined; void flushHistoryRefresh(); }, 50);
 }
 async function flushHistoryRefresh() {
   const id = state.currentId;
-  if (!id || state.loadingThread || state.historyLoading) return;
+  if (!id || historyEdits.has(id) || state.loadingThread || state.historyLoading) return;
   const notice = historyNotices.get(id);
   if (!notice) return;
   historyNotices.delete(id);
@@ -3053,7 +3075,7 @@ async function flushHistoryRefresh() {
     }
     commitHistoryThread(next);
   } catch (error) {
-    if (state.currentId === id && epoch === openThreadRequest) {
+    if (state.currentId === id && epoch === openThreadRequest && navigation === historyNavigation) {
       if (String(error).includes("HISTORY_CHANGED")) {
         await openThread(id);
       } else setState("historyError", String(error));
@@ -3065,9 +3087,12 @@ async function flushHistoryRefresh() {
   }
 }
 
-export async function loadHistoryPage(direction: "before" | "after" | "latest", aroundId?: number): Promise<boolean> {
+export async function loadHistoryPage(
+  direction: "before" | "after" | "latest", aroundId?: number,
+  viewport?: () => { itemId: number; lastItemId?: number } | null,
+): Promise<boolean> {
   const current = currentDisplayThread(), id = state.currentId;
-  if (!id || !current?.history || (state.historyLoading && direction !== "latest")) return false;
+  if (!id || historyEdits.has(id) || !current?.history || (state.historyLoading && direction !== "latest")) return false;
   const meta = current.history;
   const cursor = direction === "before" ? meta.beforeCursor : meta.afterCursor;
   if (direction !== "latest" && aroundId == null && !cursor) return false;
@@ -3078,12 +3103,16 @@ export async function loadHistoryPage(direction: "before" | "after" | "latest", 
   try {
     const page = await api.getThreadPage(id, request);
     if (state.currentId !== id || openThreadRequest !== epoch || navigation !== historyNavigation) return false;
+    // Read the viewport AFTER the await: the user may have kept scrolling or
+    // reversed direction while the page was on its way.
+    const anchor = viewport?.();
     const next = direction === "latest" || aroundId != null ? pageThread(page)
-      : mergeHistoryPage(currentDisplayThread()!, page, direction);
+      : mergeHistoryPage(currentDisplayThread()!, page, direction,
+          anchor ? [anchor.itemId, anchor.lastItemId ?? anchor.itemId] : undefined);
     commitHistoryThread(preserveOptimistic(currentDisplayThread(), next));
     return true;
   } catch (error) {
-    if (state.currentId === id && epoch === openThreadRequest) {
+    if (state.currentId === id && epoch === openThreadRequest && navigation === historyNavigation) {
       if (String(error).includes("HISTORY_CHANGED")) await openThread(id);
       else setState("historyError", String(error));
     }

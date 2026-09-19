@@ -27,7 +27,7 @@ import { fmtDuration, fmtTokens, turnAvgTokensPerSec, turnTokenTitle } from "./T
 
 // ─── Public interface ────────────────────────────────────────────────────────
 
-export interface TranscriptAnchor { itemId: number; kind: string; offset: number }
+export interface TranscriptAnchor { itemId: number; kind: string; offset: number; groupOffset?: number; lastItemId?: number; occurrence?: number }
 export interface CanvasTranscriptHandle {
   captureAnchor(): TranscriptAnchor | null;
   restoreAnchor(anchor: TranscriptAnchor): void;
@@ -43,6 +43,8 @@ export interface CanvasTranscriptHandle {
 }
 
 interface CanvasTranscriptProps {
+  /** Changes on branch replacement/resend even when item IDs are reused. */
+  revision?: string;
   threadId: string | null;
   groups: Group[];
   permissions: PermissionRequest[];
@@ -1149,6 +1151,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }>(16);
   let layoutGeneration = 0;
   let renderedThreadId = props.threadId;
+  let renderedRevision = props.revision;
+  let renderedGroups = props.groups;
   let waitingForInitialSnapshot = props.loading && props.groups.length === 0;
 
   // selection state
@@ -1183,6 +1187,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // group Y positions for scrollToGroup
   let groupYs: number[] = [];
+
+  function captureVisibleAnchor(): TranscriptAnchor | null {
+    const visible = blocks.filter(b => b.id >= 0 && b.y + b.h > scrollY && b.y < scrollY + viewH);
+    const first = visible[0];
+    return first ? { itemId: first.id, kind: first.kind, offset: scrollY - first.y,
+      groupOffset: scrollY - (groupYs[first.groupIdx] ?? first.y), lastItemId: visible.at(-1)!.id,
+      occurrence: blocks.slice(0, blocks.indexOf(first)).filter(b => b.id === first.id && b.kind === first.kind).length } : null;
+  }
 
   // images cache
   const images = new TranscriptImages(dimensionsChanged => {
@@ -1306,7 +1318,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const anchor = Math.min(groups.length - 1, pendingGroup >= 0 ? pendingGroup : jumpGroup ?? groupAtY(groupYs.length ? groupYs : offsets, scrollY + 32));
     // Prepending changes group indices: old groupYs[anchor] describes a
     // different message. Lay out the requested group before restoring its block.
-    const anchorOffset = pendingGroup >= 0 ? 0 : jumpGroup != null ? -20 : scrollY - (groupYs[anchor] ?? offsets[anchor]);
+    const anchorOffset = pendingGroup >= 0 ? pendingAnchor!.groupOffset ?? 0 : jumpGroup != null ? -20 : scrollY - (groupYs[anchor] ?? offsets[anchor]);
     const top = keepBottom ? Math.max(0, offsets.at(-1)! + 16 - viewH)
       : offsets[anchor] + Math.min(anchorOffset, offsets[anchor + 1] - offsets[anchor] - 1);
     const range = visibleGroupRange(offsets, top, viewH);
@@ -1418,9 +1430,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
               hoverKey: `user-${item.id}`, title: "原样重发此消息",
               clickAction: () => {
-                const threadId = props.threadId;
+                const threadId = props.threadId, revision = props.revision;
                 void fullUserItem(item).then(value => {
-                  if (props.threadId === threadId) return editUserMessage(value.id, value.text, value.images ?? []);
+                  if (!disposed && props.threadId === threadId && props.revision === revision)
+                    return editUserMessage(value.id, value.text, value.images ?? []);
                 }).catch(error => void message(String(error), { kind: "error" }));
               } });
             result.push({ kind: "edit-btn", id: item.id, groupIdx: gi,
@@ -1428,9 +1441,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
               hoverKey: `user-${item.id}`,
               clickAction: () => {
-                const threadId = props.threadId;
+                const threadId = props.threadId, revision = props.revision;
                 void fullUserItem(item).then(value => {
-                  if (props.threadId !== threadId || disposed) return;
+                  if (props.threadId !== threadId || props.revision !== revision || disposed) return;
                   setDraft(value.text);
                   editAttachments.set(value.images ?? []);
                   editLayoutH = estimateEditHeight(value.text, value.images?.length ?? 0);
@@ -1564,15 +1577,21 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     flushBottom();
     if (disposed || generation !== layoutGeneration || props.threadId !== threadId) return false;
+    if (pendingAnchor && scrollY !== scrollBefore) {
+      // The user moved during an async layout. Keep their CURRENT anchor and
+      // retry, rather than snapping back to the pre-layout reading position.
+      pendingAnchor = captureVisibleAnchor();
+      layoutPending = true;
+      return false;
+    }
     groupYs = nextGroupYs;
     // 虚拟窗口前移后 block 下标变化，选区按组内位置迁移，不能误复制另一轮的文字。
     const remapBlock = (index: number) => {
       const old = blocks[index];
       if (!old) return -1;
-      const start = result.findIndex(block => block.groupIdx === old.groupIdx);
-      if (start < 0) return -1;
-      const next = start + index - blocks.findIndex(block => block.groupIdx === old.groupIdx);
-      return result[next]?.id === old.id && result[next]?.kind === old.kind ? next : -1;
+      const occurrence = blocks.slice(0, index).filter(block => block.id === old.id && block.kind === old.kind).length;
+      let seen = 0;
+      return result.findIndex(block => block.id === old.id && block.kind === old.kind && seen++ === occurrence);
     };
     if (selection) {
       const startBlock = remapBlock(selection.startBlock), endBlock = remapBlock(selection.endBlock);
@@ -1593,7 +1612,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       jumpGroup = null;
     }
     if (pendingAnchor) {
-      const block = result.find(b => b.id === pendingAnchor!.itemId && b.kind === pendingAnchor!.kind)
+      const candidates = result.filter(b => b.id === pendingAnchor!.itemId && b.kind === pendingAnchor!.kind);
+      const block = candidates[pendingAnchor.occurrence ?? 0] ?? candidates[0]
         ?? result.find(b => b.id === pendingAnchor!.itemId);
       if (block) scrollY = Math.max(0, block.y + pendingAnchor.offset);
       pendingAnchor = null;
@@ -3572,7 +3592,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let layoutPending = false;
   async function rebuild() {
     pal = readPalette();
-    const key = `${props.threadId}|${viewW}|${viewH}|${pal.bg}|${pal.text}|${props.running}|${expandedRevision()}|${editing()?.id ?? ""}|${keepBottom ? "bottom" : scrollY}`;
+    const key = `${props.threadId}|${props.revision ?? ""}|${viewW}|${viewH}|${pal.bg}|${pal.text}|${props.running}|${expandedRevision()}|${editing()?.id ?? ""}|${keepBottom ? "bottom" : scrollY}`;
     // 流式 delta/reveal 合并到下一次排版，不能反复取消尚未完成的历史重排。
     // 切会话、改宽度、主题和用户开合仍立即取代旧任务。
     if (activeLayout?.key === key && activeLayout.generation === layoutGeneration) {
@@ -3772,16 +3792,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     canvasEl.addEventListener("copy", onCopy);
 
     props.ref?.({
-      captureAnchor() {
-        const visible = blocks.find(b => b.y + b.h > scrollY && b.y < scrollY + viewH && b.id >= 0);
-        return visible ? { itemId: visible.id, kind: visible.kind, offset: scrollY - visible.y } : null;
-      },
+      captureAnchor: captureVisibleAnchor,
       restoreAnchor(anchor) {
         pendingAnchor = anchor; keepBottom = false; jumpGroup = null;
+        ++layoutGeneration;
         scheduleRebuild(false, true);
       },
       imageStats() { return images.stats(); },
-      scrollToBottom() { jumpGroup = null; keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
+      scrollToBottom() { pendingAnchor = null; jumpGroup = null; keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
       scrollToGroup(idx) { if (props.groups[idx]) { jumpGroup = idx; scrollY = Math.max(0, Math.min(maxScroll, (groupYs[idx] ?? 24 + idx * 240) - 20)); keepBottom = false; applyEditStyle(); paintAll(); scheduleRebuild(false, true); props.onScroll?.(scrollY, maxScroll, false); } },
       scrollBy(delta) { applyScrollY(scrollY + delta, true); },
       isAtBottom() { return maxScroll - scrollY <= 2; },
@@ -3850,15 +3868,26 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     void props.emptyHint;
     void editing()?.id;
     const switchedThread = threadId !== renderedThreadId;
-    const warmSwitch = switchedThread && groups.length > 0;
+    const resetContent = switchedThread || props.revision !== renderedRevision;
+    const firstId = (values: Group[]) => values[0]?.user?.id ?? values[0]?.body[0]?.id ?? values[0]?.turn?.id;
+    const windowMoved = !resetContent && firstId(groups) !== firstId(renderedGroups);
+    if (!resetContent && groups !== renderedGroups && !keepBottom && !scrollLock && jumpGroup == null && !pendingAnchor)
+      pendingAnchor = captureVisibleAnchor();
+    if (windowMoved) ++layoutGeneration;
+    renderedGroups = groups;
+    const warmSwitch = resetContent && groups.length > 0;
     if (switchedThread) waitingForInitialSnapshot = groups.length === 0;
     // 缓存未命中时会先以空 items 进入 loading，再在同一 threadId 下提交快照；
     // 这次首个非空快照也属于已有内容，不能按新 delta 从空串重放。
     const loadedInitialSnapshot = waitingForInitialSnapshot && groups.length > 0;
     if (loadedInitialSnapshot) waitingForInitialSnapshot = false;
-    if (switchedThread) {
+    if (resetContent) {
       renderedThreadId = threadId;
+      renderedRevision = props.revision;
       layoutGeneration++;
+      groupHeights = new WeakMap();
+      for (const key of userTextLayouts.keys()) userTextLayouts.delete(key);
+      blockScrolls.clear();
       scrollLock = null;
       shownText.clear();
       targetText.clear();
@@ -3889,9 +3918,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       // hit testing already uses the cleared blocks, so old content is not interactive.
       if (canvasEl && !warmSwitch) paintAll();
     }
-    syncRevealTargets(switchedThread || loadedInitialSnapshot || !revealsInitialized);
+    syncRevealTargets(resetContent || windowMoved || loadedInitialSnapshot || !revealsInitialized);
     revealsInitialized = true;
-    scheduleRebuild(switchedThread && !warmSwitch, switchedThread || loadedInitialSnapshot);
+    scheduleRebuild(resetContent && !warmSwitch, resetContent || windowMoved || loadedInitialSnapshot);
   });
 
   let expandedEffectThreadId = props.threadId;

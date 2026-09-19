@@ -3,7 +3,7 @@ import { createMemo, createSignal, Show } from 'solid-js';
 import { ChatView } from '../../src/components/ChatView';
 import { CanvasTranscript } from '../../src/components/CanvasTranscript';
 import { groupItems } from '../../src/components/TurnGroup';
-import { state, setState, openThread, closeThread, loadHistoryPage, receiveHistoryNotice, requestHistoryRefresh } from '../../src/store';
+import { state, setState, openThread, closeThread, loadHistoryPage, receiveHistoryNotice, requestHistoryRefresh, editUserMessage } from '../../src/store';
 import { setWorkspaceLayout } from '../../src/workspaceLayout';
 import { pageThread, mergeHistoryPage, windowBytes } from '../../src/historyWindow';
 import '../../src/app.css';
@@ -20,12 +20,21 @@ ctx.fillStyle = '#14558a'; ctx.fillRect(0, 0, 480, 270); ctx.fillStyle = '#fff';
 const thumbUrl = thumb.toDataURL();
 const [mode, setMode] = createSignal('chat');
 const [canvasThread, setCanvasThread] = createSignal<any>(null);
+const [canvasRevision, setCanvasRevision] = createSignal('initial');
+const canvasFrames = new WeakMap<HTMLCanvasElement, { text: string; x: number; y: number }[]>();
+const originalClear = CanvasRenderingContext2D.prototype.clearRect;
+CanvasRenderingContext2D.prototype.clearRect = function(...args: Parameters<typeof originalClear>) {
+  canvasFrames.set(this.canvas, []);
+  return originalClear.apply(this, args);
+};
 const canvasGroups = createMemo(previous => groupItems(canvasThread()?.items ?? [], previous), []);
 let handle: any;
 const tick = (now: number) => { maxFrameGap = Math.max(maxFrameGap, now - lastFrame); lastFrame = now; requestAnimationFrame(tick); };
 requestAnimationFrame(tick);
 const draw = CanvasRenderingContext2D.prototype.fillText;
 CanvasRenderingContext2D.prototype.fillText = function (...args: Parameters<typeof draw>) {
+  const frame = canvasFrames.get(this.canvas);
+  frame?.push({ text: String(args[0]), x: args[1], y: args[2] });
   paints++; if (started && !firstPaint && /(?:prompt-|reply-)/.test(String(args[0]))) firstPaint = performance.now() - started;
   return draw.apply(this, args);
 };
@@ -93,6 +102,17 @@ async function invoke(command: string, args: any = {}) {
     await new Promise<void>((resolve,reject)=>{holdCancel=()=>cancelShouldFail?reject(Error('fixture: cancel failed')):resolve();});
     return;
   }
+  if(command==='truncate_thread') {
+    const r=records.get(args.threadId), index=r.items.findIndex((item:any)=>item.id===args.itemId);
+    if(index<0) throw Error('fixture: missing resend target');
+    r.items=r.items.slice(0,index);r.generation+='-resent';
+    r.items.push({type:'user',id:args.itemId,text:args.text,images:args.images??[],ts:Date.now()});
+    r.users=r.items.filter((item:any)=>item.type==='user').length;
+    r.turns=r.items.filter((item:any)=>item.type==='turn').length;
+    r.running=true;
+    requestHistoryRefresh(r.id,[],true);
+    return;
+  }
   if(command==='send_prompt') {
     const r=records.get(args.threadId);r.running=true;
     const id=(r.items.at(-1)?.id??0)+1;r.items.push({type:'user',id,text:args.text,images:args.images??[],ts:Date.now()});r.users++;
@@ -105,16 +125,22 @@ async function invoke(command: string, args: any = {}) {
   if(command==='plugin:event|listen')return calls.length;
   if(command==='plugin:dialog|message'){w.lastDialog=args;return;}
   if(command==='plugin:webview|internal_toggle_devtools')return;
-  if(['report_activity','set_thread_mode','set_thread_unread','plugin:event|unlisten'].includes(command))return;
+  if(['report_activity','set_thread_mode','set_thread_unread','set_prompt_queue_pending','plugin:event|unlisten'].includes(command))return;
   throw Error('Unexpected native IPC in fixture: '+command);
 }
 w.__TAURI_INTERNALS__={invoke,metadata:{currentWindow:{label:'main'},currentWebview:{label:'main'}},transformCallback:()=>calls.length+1,convertFileSrc:(path:string)=>path};
 setWorkspaceLayout({open:false});
 setState({currentId:null,items:[],threads:[...records.values()].map(meta),agentKind:'devin',model:'fixture-model',mode:'build',theme:'ink-light'});
 document.documentElement.dataset.theme='ink-light';
-render(()=><div class="app"><Show when={mode()==='chat'} fallback={<div style="width:100%;height:700px;display:flex"><CanvasTranscript ref={value=>handle=value} threadId={canvasThread()?.id??null} groups={canvasGroups()} running={false} loading={false} permissions={[]} preview={false} onReturnToCurrent={()=>{}} emptyHint="fixture"/></div>}><ChatView/></Show></div>,document.getElementById('root')!);
+render(()=><div class="app"><Show when={mode()==='chat'} fallback={<div style="width:100%;height:700px;display:flex"><CanvasTranscript ref={value=>handle=value} threadId={canvasThread()?.id??null} revision={canvasRevision()} groups={canvasGroups()} running={false} loading={false} permissions={[]} preview={false} onReturnToCurrent={()=>{}} emptyHint="fixture"/></div>}><ChatView/></Show></div>,document.getElementById('root')!);
 w.perfTest={
  calls,images,details,state,
+ visibleText:()=>canvasFrames.get(document.querySelector('canvas.transcript-canvas-only') as HTMLCanvasElement)??[],
+ resend:(id:number,text='resent prompt')=>editUserMessage(id,text,[]),
+ canvasScroll:(delta:number)=>handle.scrollBy(delta),
+ canvasReplace:(text:string)=>{setCanvasThread((t:any)=>({...t,items:[{type:'user',id:1,text,ts:1},{type:'assistant',id:2,text:'replacement-answer',ts:2}]}));setCanvasRevision(value=>value+'r');},
+ canvasPageWithoutRestore:(direction:'before'|'after')=>{const t=canvasThread();const cursor=direction==='before'?t.history.beforeCursor:t.history.afterCursor;
+   setCanvasThread(mergeHistoryPage(t,pageFor(t.id,{cursor,direction}),direction));},
  open:async(id:string)=>{started=performance.now();firstPaint=0;paints=0;maxFrameGap=0;lastFrame=started;await openThread(id);},
  close:closeThread,
  metadata:()=>state.history,

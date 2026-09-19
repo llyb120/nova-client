@@ -15,6 +15,7 @@ import {
   markThreadSwitchPointerDown,
   openThread,
   loadHistoryPage,
+  historyResetRevision,
   pickThreadModel,
   refreshThreads,
   sendPrompt,
@@ -68,6 +69,7 @@ export function ChatView() {
   });
   let scrollQueued = false;
   let lastScrollTop = 0;
+  let historyScrollDirection: "before" | "after" | null = null;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -109,12 +111,14 @@ export function ChatView() {
   };
 
   const travelTo = (index: number) => {
+    historyScrollDirection = null;
     cancelBottomFollow();
     transcriptRef?.scrollToGroup(index);
     syncTimeCursor();
   };
 
   const returnToNow = () => {
+    historyScrollDirection = null;
     setState("historyFollowing", true);
     if (!previewItems() && state.history?.afterCursor) {
       void loadHistoryPage("latest").then(ok => { if (ok) { enableBottomFollow(); setActiveTimeIndex(latestTimeIndex()); } });
@@ -263,6 +267,7 @@ export function ChatView() {
   createEffect((prevId: string | null | undefined) => {
     const id = state.currentId;
     if (id !== prevId) {
+      historyScrollDirection = null;
       enableBottomFollow();
       setActiveTimeIndex(latestTimeIndex());
     }
@@ -693,9 +698,14 @@ export function ChatView() {
   onCleanup(() => window.removeEventListener("nova:history-image", imageRequest));
   const navigateHistory = async (direction: "before" | "after") => {
     if (previewItems() || state.historyLoading) return;
-    const threadId = state.currentId, anchor = transcriptRef?.captureAnchor();
+    const threadId = state.currentId;
+    const start = state.history?.start, end = state.history?.end;
     cancelBottomFollow();
-    if (await loadHistoryPage(direction) && threadId === state.currentId && anchor) transcriptRef?.restoreAnchor(anchor);
+    const loaded = await loadHistoryPage(direction, undefined, () => transcriptRef?.captureAnchor() ?? null);
+    if (threadId === state.currentId && (!loaded ||
+        (state.history?.start === start && state.history?.end === end))) historyScrollDirection = null;
+    // Canvas captures/restores the live message anchor when the new window
+    // arrives. Never restore an anchor captured before the asynchronous read.
   };
   return (
     <main class="chat" style={`--time-width:${timeMachineWidth()}px`}>
@@ -881,19 +891,11 @@ export function ChatView() {
       <div class="chat-shell">
         <div class="chat-primary">
       <div class="chat-body history-body">
-          <Show when={!previewItems() && state.history && (state.history.beforeCursor || state.history.afterCursor)}>
-            <nav class="history-pager" aria-label="会话历史分页">
-              <span>第 {(state.history?.start ?? 0) + 1}–{state.history?.end} 项 / {state.history?.totalItems} 项</span>
-              <button disabled={state.historyLoading || !state.history?.beforeCursor} onClick={() => void navigateHistory("before")}>加载更早记录</button>
-              <button disabled={state.historyLoading || !state.history?.afterCursor} onClick={() => void navigateHistory("after")}>加载较新记录</button>
-              <button disabled={state.historyLoading || !state.history?.afterCursor} onClick={returnToNow}>回到最新消息</button>
-            </nav>
-          </Show>
-          <Show when={state.historyLoading}><div class="history-load-error" role="status">正在读取历史片段…</div></Show>
           <Show when={state.historyError}><div class="history-load-error" role="alert">{state.historyError} <button onClick={() => state.currentId && void openThread(state.currentId)}>重新加载</button></div></Show>
           <CanvasTranscript
             ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
             threadId={state.currentId}
+            revision={`${previewCheckpointId() ?? state.history?.generation ?? ""}:${historyResetRevision()}`}
             groups={groups()}
             permissions={permissions()}
             running={isRunning() && !previewItems()}
@@ -901,11 +903,9 @@ export function ChatView() {
             preview={!!previewCheckpointId()}
             onReturnToCurrent={returnToCurrentTimeline}
             onScroll={(top, max, user) => {
-              if (user && !previewItems() && !state.historyLoading) {
-                if (top < 120 && top < lastScrollTop && state.history?.beforeCursor) void navigateHistory("before");
-                else if (max - top < 120 && top > lastScrollTop && state.history?.afterCursor) void navigateHistory("after");
-              }
               if (user) {
+                if (top < lastScrollTop) historyScrollDirection = "before";
+                else if (top > lastScrollTop) historyScrollDirection = "after";
                 // 与 canvas 内部判定共用方向语义：上滚即解除吸底，下滚贴底才恢复。
                 const following = resolveUserScrollStick(lastScrollTop, top, max);
                 setStickToBottom(following);
@@ -915,6 +915,15 @@ export function ChatView() {
               // 否则下一次上滚的方向判定拿旧基准会误判为下滚。
               lastScrollTop = top;
               syncTimeCursor();
+              // Fetch several screens ahead, and re-check after a committed
+              // layout so a held wheel/key does not need a second gesture.
+              const lead = Math.max(600, window.innerHeight * 3);
+              if (!previewItems() && !state.historyLoading && !state.historyError) {
+                if (historyScrollDirection === "before" && top < lead && state.history?.beforeCursor)
+                  void navigateHistory("before");
+                else if (historyScrollDirection === "after" && max - top < lead && state.history?.afterCursor)
+                  void navigateHistory("after");
+              }
             }}
             onInspectItem={setDetailItem}
             onOpenImage={setImageSource}
