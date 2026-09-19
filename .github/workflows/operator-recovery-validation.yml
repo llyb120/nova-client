@@ -1,0 +1,46 @@
+name: Operator recovery validation
+on:
+  push:
+    branches: [work/operator-context-20260919]
+    paths:
+      - .github/workflows/operator-recovery-validation.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: operator
+      - uses: actions/checkout@v4
+        with:
+          ref: test/operator-native-gui-20260919
+          persist-credentials: false
+          path: native-tests
+      - uses: actions/checkout@v4
+        with:
+          ref: 2e9efb0f1aa47233f4ea24fc077f91c35ad843e0
+          persist-credentials: false
+          path: polaris
+      - name: Export only source and test files, never credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir snapshot
+          for repo in operator native-tests polaris; do
+            mkdir -p "snapshot/$repo"
+            git -C "$repo" rev-parse HEAD > "snapshot/$repo/revision.txt"
+            git -C "$repo" archive HEAD src-tauri/src scripts bench .github/workflows docs/polaris-semantic.md 2>/dev/null | tar -x -C "snapshot/$repo" || {
+              git -C "$repo" archive HEAD src-tauri/src scripts bench .github/workflows | tar -x -C "snapshot/$repo"
+            }
+          done
+          find snapshot -type f \( -iname '*envelope*' -o -iname '*credential*' -o -iname '*secret*' \) -delete
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operator-recovery-source-snapshot
+          path: snapshot/
+          retention-days: 2
