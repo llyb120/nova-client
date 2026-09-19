@@ -14,7 +14,7 @@ if(process.argv[2]==='prepare'){
  await writeFile(publicPath,JSON.stringify({version:1,runId,repository:repo,sourceCommit:process.env.GITHUB_SHA,nonce:randomBytes(16).toString('hex'),expiresAt:Date.now()+15*60*1000,algorithm:'RSA-OAEP-SHA256',allowedHost:'api.commandcode.ai',publicKey:pair.publicKey},null,2));
  console.log('Ephemeral public recipient ready; no API credential present.');
 }else if(process.argv[2]==='run'){
- const recipient=JSON.parse(await readFile(publicPath,'utf8'));let apiKey,plain;
+ const recipient=JSON.parse(await readFile(publicPath,'utf8'));let apiKey,plain,restore;
  try{
   let envelope;
   while(Date.now()<recipient.expiresAt){
@@ -31,14 +31,20 @@ if(process.argv[2]==='prepare'){
   apiKey=value.apiKey;value.apiKey=null;
   if(!/^user_[A-Za-z0-9_-]{16,300}$/.test(apiKey??''))throw Error('Credential format rejected');
   process.stdout.write(`::add-mask::${apiKey}\n`);plain.fill(0);await unlink(keyPath);
+  const {installDecisionTransport,preflight,correction}=await import('./operator-real-json-transport.mjs');
+  restore=installDecisionTransport();await preflight(apiKey);
   const {runGui}=await import('./operator-native-gui-ab.mjs');
   const gui=await runGui({apiKey,outDir:'validation/gui'});
+  gui.effectiveTransport=correction;gui.originalFailedRun=35446616489;
+  await writeFile('validation/gui/report.json',JSON.stringify(gui,null,2),{mode:0o600});
   console.log(JSON.stringify({phase:'real-gui',status:gui.status,passed:gui.businessSuccess,total:gui.runs.length,actualNativeActions:gui.nativeActionCalls}));
   if(process.env.OPERATOR_REPLAY_CORPUS){
    const {runReplay}=await import('./polaris-session-replay.mjs');
    const replay=await runReplay({apiKey,outDir:'validation/polaris',corpus:process.env.OPERATOR_REPLAY_CORPUS,binary:process.env.POLARIS_REPLAY_BINARY});
-   console.log(JSON.stringify({phase:'polaris-real-prefix',status:replay.status,runs:replay.runs.length}));
+   replay.effectiveTransport=correction;replay.originalFailedRun=35446616489;
+   await writeFile('validation/polaris/report.json',JSON.stringify(replay,null,2),{mode:0o600});
+   console.log(JSON.stringify({phase:'polaris-real-prefix',status:replay.status,runs:replay.runs.length,completed:replay.runs.filter(r=>r.status==='completed').length}));
   }
-  if(gui.status==='blocked')process.exitCode=1;
- }finally{plain?.fill(0);apiKey=null;await unlink(keyPath).catch(()=>{});}
+  if(gui.status==='blocked'||gui.nativeActionCalls===0||gui.businessSuccess===0)process.exitCode=1;
+ }finally{restore?.();plain?.fill(0);apiKey=null;await unlink(keyPath).catch(()=>{});}
 }else throw Error('Expected prepare or run');
