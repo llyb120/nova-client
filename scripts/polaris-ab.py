@@ -3,6 +3,7 @@ Gold cases live OUTSIDE the indexed checkout. Do not point --corpus at the PR wo
 """
 from __future__ import annotations
 import argparse
+from collections import Counter
 import hashlib
 import json
 import os
@@ -11,10 +12,12 @@ import platform
 import queue
 import re
 import secrets
+import shutil
 import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 from threading import Thread
 import time
 import urllib.request
@@ -29,8 +32,8 @@ class Engine:
         def reader():
             for line in self.p.stdout:
                 try: self.responses.put(json.loads(line))
-                except ValueError: self.responses.put({'ok':False,'error':'non-JSON harness output','raw':line})
-            self.responses.put({'ok':False,'error':'harness exited'})
+                except ValueError: self.responses.put({'ok':False,'error':'non-JSON harness output','raw':line,'ms':0})
+            self.responses.put({'ok':False,'error':'harness exited','ms':0})
         Thread(target=reader,daemon=True).start()
     def ask(self, request: dict, timeout=90):
         start=time.perf_counter()
@@ -77,6 +80,10 @@ def sections(text):
 
 def matched(section,gold):
     if section['file']!=gold['file']:return False
+    # Mentioning a function in another function is NOT its implementation.
+    name=re.escape(gold['symbol'])
+    definition=re.compile(r'(?:\bfn\s+|\bfunction\s+)' + name + r'\s*(?:<[^>]*>)?\s*\(|(?:\bconst\s+|\blet\s+)' + name + r'\s*=')
+    if not definition.search(section['body']):return False
     body=re.sub(r'\s+','',section['body'])
     return all(re.sub(r'\s+','',needle) in body for needle in gold['needles'])
 
@@ -93,11 +100,10 @@ def assess(case,text):
             'correctAbstention':not parsed if not case['primary'] else None}
 
 def download_models(out:Path):
-    from huggingface_hub import HfApi,snapshot_download
+    # Explicit setup downloads public pinned weights, never uploads source.
+    from huggingface_hub import snapshot_download
     config=[];start=time.perf_counter()
-    for repo in ['intfloat/multilingual-e5-small','cross-encoder/mmarco-mMiniLMv2-L12-H384-v1']:
-        sha=HfApi().model_info(repo).sha
-        if not re.fullmatch(r'[0-9a-f]{40}',sha):raise RuntimeError('model revision was not resolved')
+    for repo,sha in [('intfloat/multilingual-e5-small','614241f622f53c4eeff9890bdc4f31cfecc418b3'),('cross-encoder/mmarco-mMiniLMv2-L12-H384-v1','1427fd652930e4ba29e8149678df786c240d8825')]:
         location=Path(snapshot_download(repo,revision=sha,allow_patterns=['*.json','*.safetensors','*.model','vocab.txt'],ignore_patterns=['onnx/*','openvino/*','*.bin'],max_workers=2))
         weights=sorted(location.glob('*.safetensors'))
         if not weights:raise RuntimeError('safe tensor weights are required')
@@ -120,6 +126,7 @@ def main():
     parser.add_argument('--rounds',type=int,default=4)
     parser.add_argument('--split',choices=['dev','all'],default='all')
     args=parser.parse_args();out=args.out.resolve();out.mkdir(parents=True,exist_ok=True)
+    if not 2<=args.rounds<=10:parser.error('rounds must be 2..10')
     corpus=args.corpus.resolve();binary=args.binary.resolve();labels=json.loads(args.cases.read_text());cases=labels['cases']
     if args.split=='dev':cases=[c for c in cases if c['split']=='dev']
     if corpus==Path.cwd().resolve() or args.cases.resolve().is_relative_to(corpus):raise RuntimeError('labels must be outside corpus')
@@ -134,12 +141,14 @@ def main():
             if not all(re.sub(r'\s+','',n) in body for n in gold['needles']):raise RuntimeError('invalid label '+case['id'])
     env={k:v for k,v in os.environ.items() if not k.startswith('NOVA_POLARIS_')}
     processes={};model_process=None;model_log=None;raw=[]
+    cache_root=Path(tempfile.mkdtemp(prefix='polaris-ab-cache-'))
     report={'baseline':BASE,'binarySha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'casesSha256':hashlib.sha256(args.cases.read_bytes()).hexdigest(),
+      'candidateRevision':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
       'platform':platform.platform(),'python':sys.version,'cpuCount':os.cpu_count(),'rounds':args.rounds,'firstPass':[],'runs':raw,
-      'method':'Same clean release corpus, labels external, release production modules. Rotating arm order; round 0 separate first pass, rounds 1..N warm. Disk/page caches not flushed; not strict OS-cold latency. Top1 ranks primary code bodies/files, never metadata. Hand labels incomplete: file fraction is not a universal precision/noise judgment.'}
+      'method':'Same clean release corpus, labels external, release production modules. Rotating arm order; round 0 separate first pass, rounds 1..N warm. Disk/page caches not flushed; not strict OS-cold latency. Top1 ranks primary code bodies/files, never metadata. Hand labels incomplete: file fraction is not a universal precision/noise judgment; empty support labels measure core-body coverage, not whole-task completion.'}
     try:
         for arm in ['A_query','A_task','B_lexical']:
-            processes[arm]=Engine(binary,env,out/(arm+'.log'))
+            processes[arm]=Engine(binary,{**env,'NOVA_DATA_DIR':str(cache_root/arm)},out/(arm+'.log'))
         if args.models:
             models=download_models(out);report['models']=models
             token=secrets.token_urlsafe(32)
@@ -155,7 +164,7 @@ def main():
                 except Exception:time.sleep(1)
             else:raise RuntimeError('model startup timeout')
             for arm in ['C_semantic','D_rerank']:
-                processes[arm]=Engine(binary,{**semantic_env,'NOVA_POLARIS_RERANK':'1' if arm=='D_rerank' else '0'},out/(arm+'.log'))
+                processes[arm]=Engine(binary,{**semantic_env,'NOVA_DATA_DIR':str(cache_root/'semantic'),'NOVA_POLARIS_RERANK':'1' if arm=='D_rerank' else '0'},out/(arm+'.log'))
                 prep=processes[arm].ask({'root':str(corpus),'mode':'prepare'},timeout=1500)
                 report[arm+'Preparation']=prep
                 if not prep['ok']:raise RuntimeError('learned indexing did not complete: '+str(prep))
@@ -173,6 +182,9 @@ def main():
                     if not response['ok']:item['error']=response.get('error')
                     meta=next((s[len('# retrieval: '):] for s in text.splitlines() if s.startswith('# retrieval: ')),None)
                     if meta:item['retrieval']=json.loads(meta)
+                    if arm in ['C_semantic','D_rerank'] and case['kind']=='natural':
+                        item['learnedReady']=item.get('retrieval',{}).get('backend')=='hybrid'
+                        item['rerankUsed']=item.get('retrieval',{}).get('reranked',False)
                     target=out/'raw'/case['id'];target.mkdir(parents=True,exist_ok=True);(target/f'{arm}-{round}.txt').write_text(text,encoding='utf-8')
                     (report['firstPass'] if round==0 else raw).append(item)
                     (out/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
@@ -189,6 +201,8 @@ def main():
                 summary[split][arm].update(samples=len(items),p50Ms=statistics.median(values),p95Ms=values[min(len(values)-1,int(len(values)*.95))],errors=sum(not r['ok'] for r in items))
                 if split=='negative':summary[split][arm]['abstention']=statistics.mean(float(r['metrics']['correctAbstention']) for r in items)
         report['summary']=summary
+        report['backendCounts']={arm:dict(Counter(r.get('retrieval',{}).get('backend','exact-legacy') for r in raw if r['arm']==arm)) for arm in processes}
+        report['rerankCounts']={arm:sum(r.get('rerankUsed',False) for r in raw if r['arm']==arm) for arm in processes}
         if args.models:report['workerFinal']=request(url,token)
         report['sourceUnchanged']=not subprocess.check_output(['git','-C',str(corpus),'status','--porcelain'],text=True).strip()
         if not report['sourceUnchanged']:raise RuntimeError('benchmark modified corpus')
@@ -201,5 +215,6 @@ def main():
             try:model_process.wait(10)
             except subprocess.TimeoutExpired:model_process.kill();model_process.wait()
         if model_log:model_log.close()
+        shutil.rmtree(cache_root)
 
 if __name__=='__main__':main()

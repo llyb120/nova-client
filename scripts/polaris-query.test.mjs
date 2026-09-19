@@ -20,3 +20,8 @@ test('de-duplicates, bounds and rejects non-object requests',()=>{
   assert.throws(()=>normalize(null));assert.throws(()=>normalize([]));
   assert.equal([...normalize({query:'词'.repeat(9000)}).task].length,1024);
 });
+test('file names retain case and natural-language keyword tasks are bounded',()=>{
+  assert.deepEqual(normalize({files:['Foo.ts','foo.ts']}).files,['Foo.ts','foo.ts']);
+  assert.deepEqual(normalize({files:['src\\job.rs']}).files,['src/job.rs']);
+  assert.equal([...normalize({keywords:['词'.repeat(1000),'字'.repeat(1000)]}).task].length,1024);
+});

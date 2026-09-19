@@ -13,10 +13,10 @@ pub(super) struct Query {
     pub hard: usize,
     pub lines: usize,
 }
-fn strings(value: &Value, max: usize) -> Vec<String> {
+fn strings(value: &Value, max: usize, fold: bool) -> Vec<String> {
     let raw: Vec<&str> = match value {Value::String(s)=>vec![s],Value::Array(v)=>v.iter().filter_map(Value::as_str).collect(),_=>vec![]};
     let mut seen=HashSet::new();
-    raw.into_iter().map(str::trim).filter(|s|!s.is_empty()&&s.len()<=4096&&seen.insert(s.to_lowercase())).take(max).map(str::to_owned).collect()
+    raw.into_iter().map(str::trim).filter(|s|!s.is_empty()&&s.len()<=4096&&seen.insert(if fold{s.to_lowercase()}else{(*s).to_string()})).take(max).map(str::to_owned).collect()
 }
 pub(super) fn identifier(s: &str) -> bool {
     !s.is_empty() && s.len()<=200 && s.chars().next().is_some_and(|c|c.is_ascii_alphabetic()||c=='_'||c=='$')
@@ -49,7 +49,7 @@ const CONCEPTS: &[&str]=&[
     "发送|提交|send|submit|prompt", "生成|流式|输出|generation|stream|output|delta",
     "图片|图像|截图|image|picture|screenshot|capture", "缓存|复用|cache|memo|reuse",
     "磁盘|保存|落盘|持久化|persist|save|disk|storage", "历史|记录|history|transcript|record",
-    "加载|读取|打开|load|read|open", "切换|跳转|switch|navigate|select", "终端|命令行|terminal|shell|pty",
+    "加载|读取|打开|load|read|open", "切换|跳转|switch|navigate|select|open", "终端|命令行|terminal|shell|pty",
     "首页|新建|home|new|create", "主题|亮色|暗色|theme|light|dark|palette", "快捷键|热键|shortcut|hotkey|keybinding",
     "未读|标记|unread|badge|mark", "重试|超时|retry|timeout|deadline", "重复|幂等|去重|duplicate|dedup|idempotent",
     "并发|排队|队列|concurrent|queue|semaphore", "锁|阻塞|lock|mutex|blocking", "滚动|视口|懒加载|scroll|viewport|lazy",
@@ -58,11 +58,14 @@ const CONCEPTS: &[&str]=&[
     "后台|任务|进程|background|task|process|runtime", "断线|重连|disconnect|reconnect|connection",
     "浏览器|页面|网页|browser|webview|chrome", "定位|点击|坐标|click|coordinate|target|pointer",
     "窗口|焦点|window|focus|foreground", "校验|过期|失效|verify|validate|stale|invalidate",
-    "恢复|回滚|检查点|restore|rollback|checkpoint", "世界线|时间线|timeline|branch",
+    "恢复|还原|restore|recover", "回滚|rollback", "检查点|checkpoint", "世界线|时间线|timeline|branch",
     "删除|清理|移除|delete|remove|cleanup", "索引|检索|搜索|index|search|retrieval",
     "语义|向量|semantic|embedding|vector", "复制|粘贴|剪贴板|copy|paste|clipboard",
     "配置|默认|设置|config|default|settings", "漫游|共享|远程|roaming|share|remote|relay",
-    "更新|升级|下载|update|upgrade|download", "加密|签名|encrypt|signature|crypto",
+    "更新|升级|下载|update|upgrade|download", "加密|encrypt|encryption", "解密|decrypt|decryption", "签名|signature|sign", "绑定|bind|binding",
+    "文件|file|files", "路径|path|paths", "目录|文件夹|directory|folder", "资源管理器|文件管理器|explorer|finder",
+    "展开|expand|open", "收起|collapse|close", "继承|inherit", "记住|记忆|remember", "状态|state|status", "请求|request",
+    "拒绝|deny|reject|forbidden", "代理|proxy", "立即|immediate", "尺寸|大小|size|dimension",
     "错误|报错|失败|error|failure|exception", "模型|提供商|model|provider", "计费|用量|统计|usage|cost|stats",
 ];
 impl Query {
@@ -70,12 +73,13 @@ impl Query {
         if !params.is_object(){return Err("polaris 参数必须是对象".into());}
         let query=params["query"].as_str().unwrap_or("").trim().chars().take(1024).collect::<String>();
         let mut task=params["task"].as_str().unwrap_or("").trim().chars().take(1024).collect::<String>();
-        let mut anchors=strings(&params["keywords"],5);
+        let mut anchors=strings(&params["keywords"],5,true);
         if !query.is_empty(){if identifier(&query){if !anchors.iter().any(|s|s.eq_ignore_ascii_case(&query)){anchors.push(query.clone());}}else if task.is_empty(){task=query;}}
         if task.is_empty(){task=anchors.iter().filter(|s|!identifier(s)).cloned().collect::<Vec<_>>().join(" ");}
+        task=task.chars().take(1024).collect();
         anchors.retain(|s|identifier(s));anchors.truncate(5);
-        let files=strings(&params["files"],6);
-        for f in &files {if f.starts_with('/')||Path::new(f).is_absolute()||f.contains('\\')||f.split('/').any(|s|s==".."||s==".")||f.contains(':'){return Err("files 必须是仓库内相对路径".into());}}
+        let files=strings(&params["files"],6,false).into_iter().map(|f|f.replace('\\',"/")).collect::<Vec<_>>();
+        for f in &files {if f.starts_with('/')||Path::new(f).is_absolute()||f.split('/').any(|s|s==".."||s==".")||f.contains(':'){return Err("files 必须是仓库内相对路径".into());}}
         if task.is_empty()&&anchors.is_empty()&&files.is_empty(){return Err("需要 query / task / keywords / files 至少其一".into());}
         let mut terms=Vec::new();let mut seen=HashSet::new();
         for t in tokens(&format!("{} {}",task,anchors.join(" "))){if seen.insert(t.clone()){terms.push((t,1.0));}if terms.len()>=64{break;}}
