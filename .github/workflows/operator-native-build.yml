@@ -1,0 +1,44 @@
+name: Operator real native build
+on:
+  push:
+    branches: [test/operator-native-gui-20260919]
+    paths:
+      - 'bench/operator-gui-harness/**'
+      - '.github/workflows/operator-native-build.yml'
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/operator-gui-harness -> target
+      - name: Native libraries
+        run: |
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          sudo apt-get update -qq
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev libxdo-dev libxtst-dev
+      - name: Compile real production control modules
+        run: cargo build --manifest-path bench/operator-gui-harness/Cargo.toml 2>&1 | tee native-build.log
+      - name: Stage reproducible evidence
+        if: always()
+        run: |
+          mkdir -p validation
+          cp native-build.log validation/ || true
+          test ! -f bench/operator-gui-harness/target/debug/nova-operator-gui-harness || cp bench/operator-gui-harness/target/debug/nova-operator-gui-harness validation/
+          git archive --format=tar HEAD | gzip > validation/operator-source.tar.gz
+          git rev-parse HEAD > validation/tested-commit.txt
+          curl --fail --location --silent https://api.github.com/repos/llyb120/nova-client/tarball/2e9efb0f1aa47233f4ea24fc077f91c35ad843e0 -o validation/polaris-pr11-source.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-native-build
+          path: validation/
+          retention-days: 7
