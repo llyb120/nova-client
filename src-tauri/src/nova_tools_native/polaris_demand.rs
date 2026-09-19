@@ -1,143 +1,98 @@
-// Query-first discovery. Text/AST metadata are cheap; indexed passages are built
-// only for selected declarations and actual source-linked dependencies.
-const INITIAL_FILES: usize = 24;
-const MAX_PARSED_FILES: usize = 40;
+// Query-first retrieval: no repository-wide AST/unit/vector build on the online path.
+// Included inside index so the existing parser, identity and source verification remain shared.
+const INITIAL_FILES: usize = 16;
+const MAX_PARSED_FILES: usize = 32;
 const MAX_DISCOVERY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PARSE_BYTES: usize = 8 * 1024 * 1024;
-#[derive(Clone)]
-struct LightFile {
-    hash:String, entry:FileEntry, source:Arc<Vec<String>>,
-    names:HashMap<usize,HashSet<String>>, built:BTreeMap<usize,Vec<Arc<CodeUnit>>>,
-}
 #[derive(Default)]
-struct DemandCache { entries:BTreeMap<String,LightFile>, bytes:usize }
-static DEMAND:OnceLock<Mutex<BTreeMap<String,Arc<Mutex<DemandCache>>>>>=OnceLock::new();
-struct Candidate { file:String,text:String,hash:String,hits:Vec<usize>,score:f64 }
-#[derive(Default,Serialize)]
+struct DemandCache { entries: BTreeMap<String, (String, Vec<Arc<CodeUnit>>)>, bytes: usize }
+static DEMAND: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<DemandCache>>>>> = OnceLock::new();
+struct Candidate { file: String, text: String, hash: String, hits: Vec<usize>, score: f64 }
+#[derive(Default, Serialize)]
 #[serde(rename_all="camelCase")]
 pub(super) struct DemandStats {
-    pub scanned_files:usize,pub scanned_bytes:u64,pub parsed_files:usize,
-    pub parsed_bytes:usize,pub reparsed_files:usize,pub candidate_files_omitted:usize,
-    pub discovery_ms:f64,pub parse_ms:f64,pub dependency_rounds:usize,
-    pub candidate_declarations:usize,pub materialized_declarations:usize,
+    pub scanned_files: usize, pub scanned_bytes: u64, pub parsed_files: usize,
+    pub parsed_bytes: usize, pub reparsed_files: usize, pub candidate_files_omitted: usize,
+    pub discovery_ms: f64, pub parse_ms: f64, pub dependency_rounds: usize,
 }
-fn subset(units:Vec<Arc<CodeUnit>>,files:usize,changed:usize,partial:bool)->Corpus {
-    let mut df=HashMap::new();
-    for u in &units {for term in u.terms.keys(){*df.entry(term.clone()).or_default()+=1;}}
-    let average=(units.iter().map(|u|u.length).sum::<f64>()/units.len().max(1) as f64).max(1.0);
-    Corpus{units:Arc::new(units),df:Arc::new(df),average,partial,files,changed}
+fn subset(units: Vec<Arc<CodeUnit>>, files: usize, changed: usize, partial: bool) -> Corpus {
+    let mut df = HashMap::new();
+    for u in &units { for term in u.terms.keys() { *df.entry(term.clone()).or_default() += 1; } }
+    let average = (units.iter().map(|u|u.length).sum::<f64>() / units.len().max(1) as f64).max(1.0);
+    Corpus { units: Arc::new(units), df: Arc::new(df), average, partial, files, changed }
 }
-fn demand_slot(root:&Path)->Result<Arc<Mutex<DemandCache>>,String>{
-    let key=normalize_root(root);let mut roots=DEMAND.get_or_init(Default::default).lock().map_err(|_|"candidate cache lock poisoned")?;
-    if !roots.contains_key(&key)&&roots.len()>=2 {if let Some(old)=roots.keys().next().cloned(){roots.remove(&old);}}
+fn demand_slot(root: &Path) -> Result<Arc<Mutex<DemandCache>>,String> {
+    let key=normalize_root(root);
+    let mut roots=DEMAND.get_or_init(Default::default).lock().map_err(|_|"candidate cache lock poisoned")?;
+    if !roots.contains_key(&key) && roots.len()>=2 { if let Some(old)=roots.keys().next().cloned(){roots.remove(&old);} }
     Ok(roots.entry(key).or_default().clone())
 }
-fn declarations(rows:&[Candidate],wanted:&[usize],cache:&mut DemandCache,parsed:&mut HashSet<usize>,stats:&mut DemandStats,deadline:Instant)->bool{
-    let started=Instant::now();let mut partial=false;
+fn parse_candidates(rows: &[Candidate], wanted: &[usize], cache: &mut DemandCache,
+    parsed: &mut HashSet<usize>, units: &mut Vec<Arc<CodeUnit>>, stats: &mut DemandStats,
+    q: &query::Query, deadline: Instant) -> bool {
+    let started=Instant::now(); let mut partial=false;
     for &id in wanted {
         if parsed.contains(&id){continue;}
-        if Instant::now()>=deadline||parsed.len()>=MAX_PARSED_FILES{partial=true;break;}
-        let row=&rows[id];if stats.parsed_bytes+row.text.len()>MAX_PARSE_BYTES{partial=true;continue;}
-        if cache.entries.get(&row.file).is_none_or(|e|e.hash!=row.hash){
-            let entry=scan_source(&row.text,&row.file);let source=Arc::new(row.text.lines().map(str::to_owned).collect::<Vec<_>>());
-            let names=entry.syms.iter().filter(|s|is_retrieval_unit(s,&source)).map(|s|{
-                let mut terms=query::tokens(&s.name).into_iter().collect::<HashSet<_>>();
-                terms.extend(identifier_aliases(&s.name));(s.ln,terms)
-            }).collect();
-            cache.entries.insert(row.file.clone(),LightFile{hash:row.hash.clone(),entry,source,names,built:BTreeMap::new()});
+        if Instant::now()>=deadline || parsed.len()>=MAX_PARSED_FILES {partial=true;break;}
+        let row=&rows[id];
+        if stats.parsed_bytes+row.text.len()>MAX_PARSE_BYTES {partial=true;continue;}
+        if cache.entries.get(&row.file).is_none_or(|(hash,_)|hash!=&row.hash) {
+            let built=make_units(&row.file,&row.text);
+            cache.entries.insert(row.file.clone(),(row.hash.clone(),built));
             stats.reparsed_files+=1;
+        }
+        if let Some((_,built))=cache.entries.get(&row.file) {
+            units.extend(built.iter().filter(|u|u.role=="implementation" ||
+                (q.test_intent&&u.role=="test") || (q.doc_intent&&u.role=="documentation") ||
+                q.files.contains(&u.file)).cloned());
         }
         parsed.insert(id);stats.parsed_files+=1;stats.parsed_bytes+=row.text.len();
     }
-    stats.parse_ms+=started.elapsed().as_secs_f64()*1000.0;partial
+    stats.parse_ms+=started.elapsed().as_secs_f64()*1000.0;
+    partial
 }
-fn role_allowed(file:&str,s:&Symbol,q:&query::Query)->bool{
-    let test=s.kind.starts_with("test:")||file_role(file)=="test";
-    (!test||q.test_intent||q.files.iter().any(|f|f==file))&&
-        (file_role(file)!="documentation"||q.doc_intent||q.files.iter().any(|f|f==file))
-}
-fn select_spans(rows:&[Candidate],ids:&[usize],cache:&DemandCache,q:&query::Query,
-    matcher:&regex::RegexSet,terms:&[(String,f64)],idf:&[f64],names:&HashSet<String>,caller_names:&HashSet<String>,cap:usize)->Vec<(usize,usize)>{
-    let mut ranked=Vec::new();
-    for &id in ids {
-        let row=&rows[id];let Some(file)=cache.entries.get(&row.file)else{continue;};
-        for s in &file.entry.syms {
-            if !file.names.contains_key(&s.ln)||!role_allowed(&row.file,s,q){continue;}
-            let first=s.ln.saturating_sub(1);let end=s.end.min(file.source.len());if first>=end{continue;}
-            let body=file.source[first..end.min(first+320)].join("\n");
-            let header=file.source[first.saturating_sub(4)..(first+4).min(end)].join("\n");
-            let matched=matcher.matches(&body);let head=matcher.matches(&header);
-            let mut score=0.0;
-            for (i,(term,weight)) in terms.iter().enumerate(){
-                if file.names[&s.ln].contains(term){score+=weight*idf[i]*6.0;}
-                if head.matched(i){score+=weight*idf[i]*2.0;}
-                if matched.matched(i){score+=weight*idf[i];}
-            }
-            if names.contains(&s.name){score+=10000.0;}
-            if q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&s.name)){score+=20000.0;}
-            if caller_names.iter().any(|name|body.contains(name)){score+=100.0;}
-            if score>0.0 {ranked.push((id,s.ln,score/(1.0+0.04*((end-first) as f64/80.0).ln_1p())));}
-        }
-        if file.names.is_empty()&&!file.source.is_empty(){ranked.push((id,1,row.score));}
-    }
-    ranked.sort_by(|a,b|b.2.total_cmp(&a.2).then(rows[a.0].file.cmp(&rows[b.0].file)).then(a.1.cmp(&b.1)));
-    // Preserve file diversity before precise source-backed ranking.
-    let mut selected=Vec::new();let mut seen=HashSet::new();
-    for &(id,line,_) in &ranked {if seen.insert(id){selected.push((id,line));if selected.len()>=cap{break;}}}
-    for &(id,line,_) in &ranked {if selected.len()>=cap{break;}if !selected.contains(&(id,line)){selected.push((id,line));}}
-    selected
-}
-fn materialize(rows:&[Candidate],wanted:&[(usize,usize)],cache:&mut DemandCache,
-    selected:&mut HashSet<(usize,usize)>,units:&mut Vec<Arc<CodeUnit>>,stats:&mut DemandStats,deadline:Instant)->bool {
-    let started=Instant::now();let mut grouped=BTreeMap::<usize,HashSet<usize>>::new();let mut partial=false;
-    for &(id,line) in wanted {if !selected.contains(&(id,line)){grouped.entry(id).or_default().insert(line);}}
-    for (id,lines) in grouped {
-        if Instant::now()>=deadline{partial=true;break;}
-        let row=&rows[id];let file=cache.entries.get_mut(&row.file).unwrap();
-        let missing=lines.iter().filter(|line|!file.built.contains_key(line)).copied().collect::<HashSet<_>>();
-        if !missing.is_empty(){
-            for u in make_units_selected(&row.file,&row.text,&file.entry,file.source.clone(),Some(&missing)){
-                file.built.entry(u.owner_start).or_default().push(u);
-            }
-        }
-        for line in lines {if selected.insert((id,line)){if let Some(built)=file.built.get(&line){units.extend(built.iter().cloned());stats.materialized_declarations+=1;}}}
-    }
-    stats.parse_ms+=started.elapsed().as_secs_f64()*1000.0;partial
-}
+/// A fresh bounded text scan finds new files and same-mtime edits without a startup index.
+/// Only the highest-scoring files and source-linked neighbours receive expensive parsing.
+/// File recall is deliberately bounded; its omissions are reported separately from body coverage.
 pub(super) fn demand_corpus(root:&Path,q:&query::Query,deadline:Instant)->Result<(Corpus,DemandStats),String>{
     let started=Instant::now();let root=root.canonicalize().map_err(|e|e.to_string())?;
-    let mut walker=ignore::WalkBuilder::new(&root);walker.hidden(false).require_git(false).follow_links(false);
-    walker.filter_entry(|e|!e.file_type().is_some_and(|f|f.is_dir())||!matches!(e.file_name().to_str(),Some(".git"|"node_modules"|"target"|"dist"|"vendor"|".venv"|"coverage"|".codegraph")));
-    let terms=q.terms.iter().filter(|(t,_)|!t.is_ascii()||t.len()>=3).cloned().collect::<Vec<_>>();
-    let matcher=regex::RegexSetBuilder::new(terms.iter().map(|(t,_)|regex::escape(t))).case_insensitive(true).size_limit(4*1024*1024).build().map_err(|e|e.to_string())?;
+    let mut walker=ignore::WalkBuilder::new(&root);
+    walker.hidden(false).require_git(false).follow_links(false);
+    walker.filter_entry(|e| !e.file_type().is_some_and(|f|f.is_dir()) || !matches!(e.file_name().to_str(),Some(".git"|"node_modules"|"target"|"dist"|"vendor"|".venv"|"coverage"|".codegraph")));
+    let terms=q.terms.iter().filter(|(term,_)|!term.is_ascii()||term.len()>=3).cloned().collect::<Vec<_>>();
+    let matcher=regex::RegexSetBuilder::new(terms.iter().map(|(term,_)|regex::escape(term)))
+        .case_insensitive(true).size_limit(4*1024*1024).build().map_err(|e|e.to_string())?;
     let mut paths=Vec::new();let mut partial=false;let mut stats=DemandStats::default();
-    for item in walker.build(){
-        if Instant::now()>=deadline{partial=true;break;}
-        let item=match item{Ok(e)=>e,Err(_)=>{partial=true;continue;}};
-        if !item.file_type().is_some_and(|f|f.is_file()){continue;}
+    for item in walker.build() {
+        if Instant::now()>=deadline {partial=true;break;}
+        let item=match item{Ok(item)=>item,Err(_)=>{partial=true;continue;}};
+        if !item.file_type().is_some_and(|t|t.is_file()){continue;}
         let Some(file)=item.path().strip_prefix(&root).ok().and_then(|p|p.to_str()).map(|p|p.replace('\\',"/"))else{continue;};
         let role=file_role(&file);
-        if is_searchable_implementation_file(&file)&&(role=="implementation"||(q.test_intent&&role=="test")||(q.doc_intent&&role=="documentation")){
-            paths.push(file);if paths.len()>=8000{partial=true;break;}
+        if is_searchable_implementation_file(&file) && (role=="implementation"||(q.test_intent&&role=="test")||(q.doc_intent&&role=="documentation")) {
+            paths.push(file);if paths.len()>=8000 {partial=true;break;}
         }
     }
-    paths.extend(q.files.iter().cloned());paths.sort();paths.dedup();let mut rows=Vec::new();let mut df=vec![0usize;terms.len()];
-    for file in paths{
-        if Instant::now()>=deadline{partial=true;break;}
+    paths.extend(q.files.iter().cloned());paths.sort();paths.dedup();
+    let mut rows=Vec::new();let mut df=vec![0usize;terms.len()];
+    for file in paths {
+        if Instant::now()>=deadline {partial=true;break;}
         if !safe_file(&root,&file){partial=true;continue;}
         let path=root.join(&file);let Some(stamp)=metadata_stamp(&path)else{partial=true;continue;};
-        if stamp.0>2*1024*1024||stats.scanned_bytes+stamp.0>MAX_DISCOVERY_BYTES{partial=true;continue;}
-        let text=match fs::read_to_string(&path){Ok(t)=>t,Err(_)=>{partial=true;continue;}};
+        if stamp.0>2*1024*1024 || stats.scanned_bytes+stamp.0>MAX_DISCOVERY_BYTES {partial=true;continue;}
+        let text=match fs::read_to_string(&path){Ok(text)=>text,Err(_)=>{partial=true;continue;}};
         if metadata_stamp(&path)!=Some(stamp){partial=true;continue;}
         stats.scanned_files+=1;stats.scanned_bytes+=text.len() as u64;
-        let mut hits=matcher.matches(&text).into_iter().collect::<Vec<_>>();hits.extend(matcher.matches(&file));hits.sort_unstable();hits.dedup();for &hit in &hits{df[hit]+=1;}
+        let mut hits=matcher.matches(&text).into_iter().collect::<Vec<_>>();
+        hits.extend(matcher.matches(&file));hits.sort_unstable();hits.dedup();
+        for &hit in &hits {df[hit]+=1;}
         rows.push(Candidate{hash:digest(text.as_bytes()),file,text,hits,score:0.0});
     }
-    let n=rows.len().max(1) as f64;let idf=df.iter().map(|d|(1.0+n/(*d).max(1) as f64).ln()).collect::<Vec<_>>();
-    for row in &mut rows{
+    let n=rows.len().max(1) as f64;
+    for row in &mut rows {
         let path_hits=matcher.matches(&row.file);
-        for &i in &row.hits{row.score+=terms[i].1*idf[i]*if path_hits.matched(i){3.0}else{1.0};}
-        row.score/=1.0+0.25*(1.0+row.text.len() as f64/16000.0).ln();
+        for &id in &row.hits {row.score+=terms[id].1*(1.0+n/(df[id].max(1) as f64)).ln()*(if path_hits.matched(id){3.0}else{1.0});}
+        row.score/=1.0+0.15*(1.0+row.text.len() as f64/16000.0).ln();
         if q.files.contains(&row.file){row.score+=10000.0;}
         if q.anchors.iter().any(|a|row.text.contains(a)){row.score+=1000.0;}
     }
@@ -145,42 +100,57 @@ pub(super) fn demand_corpus(root:&Path,q:&query::Query,deadline:Instant)->Result
     order.sort_by(|&a,&b|rows[b].score.total_cmp(&rows[a].score).then(rows[a].file.cmp(&rows[b].file)));
     stats.discovery_ms=started.elapsed().as_secs_f64()*1000.0;
     let slot=demand_slot(&root)?;let mut cache=slot.try_lock().map_err(|_|"same repository candidate parsing is busy")?;
-    let valid=rows.iter().map(|r|r.file.as_str()).collect::<HashSet<_>>();cache.entries.retain(|file,_|valid.contains(file.as_str()));
-    if cache.bytes>MAX_PARSE_BYTES*2{cache.entries.clear();cache.bytes=0;}
-    let mut parsed=HashSet::new();let initial=order.iter().copied().take(INITIAL_FILES).collect::<Vec<_>>();
-    partial|=declarations(&rows,&initial,&mut cache,&mut parsed,&mut stats,deadline);
-    let mut ids=parsed.iter().copied().collect::<Vec<_>>();ids.sort_unstable();
-    let wanted=select_spans(&rows,&ids,&cache,q,&matcher,&terms,&idf,&HashSet::new(),&HashSet::new(),96);
-    let mut selected=HashSet::new();let mut units=Vec::new();
-    partial|=materialize(&rows,&wanted,&mut cache,&mut selected,&mut units,&mut stats,deadline);
+    let valid=rows.iter().map(|r|r.file.as_str()).collect::<HashSet<_>>();
+    cache.entries.retain(|file,_|valid.contains(file.as_str()));
+    if cache.bytes>MAX_PARSE_BYTES*2 {cache.entries.clear();cache.bytes=0;}
+    let mut parsed=HashSet::new();let mut units=Vec::new();
+    let initial=order.iter().copied().take(INITIAL_FILES).collect::<Vec<_>>();
+    partial|=parse_candidates(&rows,&initial,&mut cache,&mut parsed,&mut units,&mut stats,q,deadline);
     let files=rows.iter().map(|r|r.file.clone()).collect::<HashSet<_>>();
-    for _ in 0..2{
-        if units.is_empty()||Instant::now()>=deadline{break;}
+    for _ in 0..2 {
+        if units.is_empty()||Instant::now()>=deadline||parsed.len()>=MAX_PARSED_FILES {break;}
         let c=subset(units.clone(),parsed.len(),stats.reparsed_files,partial);
-        let seeds=super::lexical_rank(&c,&units,q);
-        let mut direct=HashSet::new();let mut names=HashSet::new();let mut callers=HashSet::new();
-        for &(id,_) in seeds.iter().take(6){
-            let u=&units[id];direct.insert(u.file.clone());callers.insert(u.name.clone());
-            names.extend(u.calls.iter().filter(|s|s.len()>=4).cloned());names.extend(u.commands.iter().cloned());
-            for import in u.imports.iter(){if u.calls.contains(&import.name)||u.members.iter().any(|(o,_)|o==&import.name){if let Some(f)=resolve_specifier(&import.from,&u.file,&files){direct.insert(f);names.insert(import.orig.clone().unwrap_or_else(||import.name.clone()));}}}
-            for (object,member) in &u.members{if let Some(suffix)=object.strip_prefix("crate::"){names.insert(member.clone());if let Some(pos)=u.file.rfind("src/"){let prefix=&u.file[..pos+4];let module=suffix.replace("::","/");for f in [format!("{prefix}{module}.rs"),format!("{prefix}{module}/mod.rs")]{if files.contains(&f){direct.insert(f);}}}}}
+        let lexical=super::lexical_rank(&c,&units,q);
+        let seeds=rank::fuse(&lexical,&[],&units,q);
+        let mut direct=HashSet::new();let mut names=HashSet::new();let mut events=HashSet::new();
+        for &(id,_) in seeds.iter().take(4) {
+            let u=&units[id];
+            if u.name.len()>=4 {names.insert(u.name.clone());}
+            names.extend(u.commands.iter().filter(|s|s.len()>=4).cloned());
+            for (_,event) in &u.events {events.insert(event.clone());}
+            for import in u.imports.iter() {
+                if u.calls.contains(&import.name)||u.members.iter().any(|(object,_)|object==&import.name) {
+                    if let Some(file)=resolve_specifier(&import.from,&u.file,&files){direct.insert(file);}
+                }
+            }
+            for (object,member) in &u.members {
+                if !object.contains("::"){continue;}
+                names.insert(member.clone());
+                if let Some(suffix)=object.strip_prefix("crate::") {
+                    if let Some(pos)=u.file.rfind("src/") {
+                        let prefix=&u.file[..pos+4];let module=suffix.replace("::","/");
+                        for path in [format!("{prefix}{module}.rs"),format!("{prefix}{module}/mod.rs")] {if files.contains(&path){direct.insert(path);}}
+                    }
+                }
+            }
         }
-        let mut neighbours=rows.iter().enumerate().filter(|(i,_)|!parsed.contains(i)).filter_map(|(i,r)|{
-            let explicit=direct.contains(&r.file);let caller=callers.iter().any(|s|r.text.contains(s));
-            (explicit||caller).then_some((i,if explicit{10000.0+r.score}else{r.score}))
-        }).collect::<Vec<_>>();
+        let mut neighbours=Vec::new();
+        for (i,row) in rows.iter().enumerate().filter(|(i,_)|!parsed.contains(i)) {
+            let direct_hit=direct.contains(&row.file);
+            let event_hit=events.iter().any(|s|row.text.contains(s));
+            let name_hits=names.iter().filter(|name|row.text.contains(name.as_str())).count();
+            if direct_hit||event_hit||name_hits>0 {neighbours.push((i,(if direct_hit{10000.0}else{0.0})+(if event_hit{1000.0}else{0.0})+name_hits.min(8) as f64*10.0+row.score));}
+        }
         neighbours.sort_by(|a,b|b.1.total_cmp(&a.1).then(rows[a.0].file.cmp(&rows[b.0].file)));
-        let extra=neighbours.iter().take(8).map(|x|x.0).collect::<Vec<_>>();
-        partial|=declarations(&rows,&extra,&mut cache,&mut parsed,&mut stats,deadline);
-        let mut ids=parsed.iter().copied().collect::<Vec<_>>();ids.sort_unstable();
-        let linked=select_spans(&rows,&ids,&cache,q,&matcher,&terms,&idf,&names,&callers,48);
-        let before=selected.len();partial|=materialize(&rows,&linked,&mut cache,&mut selected,&mut units,&mut stats,deadline);
-        stats.dependency_rounds+=1;if selected.len()==before&&extra.is_empty(){break;}
+        let wanted=neighbours.iter().take(8).map(|&(i,_)|i).collect::<Vec<_>>();
+        if wanted.is_empty(){break;}
+        stats.dependency_rounds+=1;
+        partial|=parse_candidates(&rows,&wanted,&mut cache,&mut parsed,&mut units,&mut stats,q,deadline);
     }
     stats.candidate_files_omitted=order.iter().filter(|i|!parsed.contains(i)).count();
-    stats.candidate_declarations=parsed.iter().filter_map(|i|cache.entries.get(&rows[*i].file)).map(|f|f.names.len()).sum();
-    cache.bytes=cache.entries.values().map(|e|e.source.iter().map(|s|s.len()+1).sum::<usize>()).sum();
-    let c=subset(units,parsed.len(),stats.reparsed_files,partial);Ok((c,stats))
+    cache.bytes=cache.entries.values().map(|(_,units)|units.first().map(|u|u.source.iter().map(|s|s.len()+1).sum::<usize>()).unwrap_or(0)).sum();
+    let result=subset(units,parsed.len(),stats.reparsed_files,partial);
+    Ok((result,stats))
 }
 #[cfg(test)]
 mod demand_tests {
