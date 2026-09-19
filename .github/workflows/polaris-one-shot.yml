@@ -2,7 +2,7 @@ name: Polaris one-shot working sets
 on:
   push:
     branches: [perf/polaris-semantic-20260919]
-    paths: [.github/workflows/polaris-one-shot.yml, scripts/polaris-one-shot-migrate.py, src-tauri/src/nova_tools_native/polaris_demand_v2.rs, src-tauri/src/nova_tools_native/polaris_packet.rs]
+    paths: [.github/workflows/polaris-one-shot.yml, scripts/polaris-one-shot-*.py, src-tauri/src/nova_tools_native/polaris_demand_v2.rs, src-tauri/src/nova_tools_native/polaris_packet.rs]
   workflow_dispatch:
 permissions:
   contents: read
@@ -61,13 +61,15 @@ jobs:
           chmod +x validation/bin/previous
           echo 'ef1896343d43926775c4c28923ffd0e981584069b327b750b04c8144502e6537  validation/bin/previous' | sha256sum --check
           python3 scripts/polaris-one-shot-migrate.py
+          python3 scripts/polaris-one-shot-refine.py
           git diff -- src-tauri/src/nova_tools_native > validation/production.patch
           git rev-parse HEAD > validation/base-commit.txt
           cp src-tauri/src/nova_tools_native/polaris*.rs validation/source/
-          cp scripts/polaris-fastcontext-*.py scripts/polaris-one-shot-migrate.py scripts/polaris-ab.py validation/scripts/
+          cp scripts/polaris-fastcontext-*.py scripts/polaris-one-shot-*.py scripts/polaris-ab.py validation/scripts/
           sha256sum src-tauri/src/nova_tools_native/{context,polaris,polaris_index,polaris_query,polaris_rank,polaris_demand_v2,polaris_packet}.rs src-tauri/src/lyra/reasonix.rs > validation/source-hashes.txt
           git -C _corpus archive HEAD src src-tauri/src scripts .gitignore | gzip > validation/corpus-source.tar.gz
       - name: Production regression tests and fresh release build
+        id: build
         run: |
           set -euo pipefail
           cargo clean --release --manifest-path bench/polaris-harness/Cargo.toml -p polaris-harness
@@ -87,11 +89,18 @@ jobs:
               if '.git' in rel.parts or not p.is_file():continue
               if rel.parts[0] in ('bench','.github') or re.search(r'report|eval|replay|ab-results|cases\.json',str(rel),re.I):p.unlink()
           PY
+      - name: One context call then compile and edit, without supplemental reads
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 scripts/polaris-one-shot-edit.py --binary validation/bin/candidate | tee validation/context-only-edit-progress.txt
       - name: Cold start and equal-budget implementation plus dependency coverage
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           set -euo pipefail
           python3 scripts/polaris-fastcontext-ab.py --previous "$GITHUB_WORKSPACE/validation/bin/previous" --candidate "$GITHUB_WORKSPACE/validation/bin/candidate" --corpus _corpus --replay-corpus _replay --replay-report _report/35447590732/polaris/report.json | tee validation/progress.txt
       - name: Scaling and identical-mtime freshness
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           set -euo pipefail
           python3 scripts/polaris-fastcontext-scale.py --previous "$GITHUB_WORKSPACE/validation/bin/previous" --candidate "$GITHUB_WORKSPACE/validation/bin/candidate" | tee validation/scale-progress.txt
