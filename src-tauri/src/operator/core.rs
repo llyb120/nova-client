@@ -1,4 +1,6 @@
 //! Provider-independent interaction state. No imports from Lyra or Reasonix.
+#[path = "contract.rs"]
+mod contract;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -184,7 +186,8 @@ impl Task {
             input_images: 0,
         }
     }
-    pub fn project(&self, tool_schema: &Value) -> Value {
+    pub fn project(&self, _tool_schema: &Value) -> Value {
+        let tool_schema = contract::schema(self.contract.channel.as_deref().unwrap_or("chrome"));
         // NEVER copy the parent transcript or the full observation archive here.
         // All references from older observations are evidence, not actionable locators.
         json!({"contract":self.contract,"checkpoint":self.checkpoint,
@@ -196,6 +199,11 @@ impl Task {
     pub fn validate_decision(&self, d: &Decision) -> Result<(), String> {
         if d.kind == "blocked" {
             return Ok(());
+        }
+        if matches!(d.kind.as_str(), "act" | "finish")
+            && d.evidence_id.as_deref().is_none_or(|s| s.trim().is_empty())
+        {
+            return Err("Missing top-level evidenceId: copy currentObservation.evidenceId beside kind and params, not inside params".into());
         }
         if d.kind == "finish" {
             let observation = self
@@ -224,6 +232,10 @@ impl Task {
             }
             return Ok(());
         }
+        contract::validate(
+            self.contract.channel.as_deref().unwrap_or("chrome"),
+            &d.params,
+        )?;
         let op = d.params["operation"]
             .as_str()
             .ok_or("Native operation is required")?;

@@ -419,8 +419,13 @@ fn point(shot: &Shot, x: Option<i32>, y: Option<i32>) -> Result<(i32, i32)> {
     ))
 }
 fn keys(raw: &str) -> Result<Vec<Key>> {
+    // Shortcut letters name a key, not uppercase text. Preserve explicit Shift.
+    // Unicode('A') can synthesize an implicit Shift on X11; Ctrl+A then fails.
+    let shortcut = raw.split('+').map(str::trim).any(|s| matches!(s.to_ascii_lowercase().as_str(),
+        "ctrl" | "control" | "alt" | "option" | "shift" | "meta" | "super" | "cmd" | "win"));
     let keys = raw
         .split('+')
+        .map(str::trim)
         .map(|s| match s.to_ascii_lowercase().as_str() {
             "ctrl" | "control" => Ok(Key::Control),
             "alt" | "option" => Ok(Key::Alt),
@@ -457,6 +462,8 @@ fn keys(raw: &str) -> Result<Vec<Key>> {
             #[cfg(windows)]
             _ if s.len() == 1 && s.as_bytes()[0].is_ascii_alphanumeric() =>
                 Ok(Key::Other(s.as_bytes()[0].to_ascii_uppercase() as u32)),
+            _ if shortcut && s.len() == 1 && s.as_bytes()[0].is_ascii_alphabetic() =>
+                Ok(Key::Unicode(s.as_bytes()[0].to_ascii_lowercase() as char)),
             _ if s.chars().count() == 1 => Ok(Key::Unicode(s.chars().next().unwrap())),
             _ => Err(format!("不支持的按键：{s}")),
         })
@@ -1239,5 +1246,20 @@ mod tests {
                 let _ = std::fs::remove_file(img["path"].as_str().unwrap());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod shortcut_case_regression {
+    use super::*;
+    #[test]
+    fn shortcut_case_does_not_add_an_implicit_shift() {
+        assert_eq!(keys("Ctrl+A").unwrap(), keys("Ctrl+a").unwrap());
+        assert_eq!(keys("Ctrl+Shift+A").unwrap(), keys("Ctrl+Shift+a").unwrap());
+        assert_eq!(keys(" Ctrl + A ").unwrap(), keys("Ctrl+a").unwrap());
+        #[cfg(not(windows))]
+        assert_eq!(keys("A").unwrap(), vec![Key::Unicode('A')]);
+        assert!(keys("Ctrl++A").is_err());
+        assert!(keys("UnknownKey").is_err());
     }
 }
