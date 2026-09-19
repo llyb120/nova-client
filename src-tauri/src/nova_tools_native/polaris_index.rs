@@ -21,7 +21,7 @@ pub(super) fn cache_file(root:&Path)->PathBuf {cache_path(root).with_file_name("
 fn safe_file(root:&Path,rel:&str)->bool {root.join(rel).canonicalize().ok().is_some_and(|p|p.starts_with(root))}
 fn file_role(file:&str)->&'static str {
     let l=file.to_ascii_lowercase();
-    if l.ends_with(".md"){"documentation"}else if l.contains("/tests/")||l.contains("/test/")||l.contains(".test.")||l.contains(".spec.")||l.starts_with("bench/")||l.starts_with("tests/")||l.starts_with("test/"){"test"}else{"implementation"}
+    if l.ends_with(".md"){"documentation"}else if l.contains("/tests/")||l.contains("/test/")||l.contains(".test.")||l.contains(".spec.")||l.ends_with("/tests.rs")||l.starts_with("bench/")||l.starts_with("tests/")||l.starts_with("test/"){"test"}else{"implementation"}
 }
 fn references(text:&str)->(HashSet<String>,Vec<(String,String)>,HashSet<String>,Vec<(String,String)>){
     static CALLS:OnceLock<Regex>=OnceLock::new();static EVENTS:OnceLock<Regex>=OnceLock::new();static MEMBERS:OnceLock<Regex>=OnceLock::new();
@@ -43,8 +43,6 @@ fn is_retrieval_unit(symbol:&Symbol,lines:&[String])->bool {
             let header=lines[first..end].join("\n");header.contains("=>")||header.contains("function")
         },
         "method"=>{
-            // The shared heuristic scanner also discovers call sites. Only
-            // declaration-shaped methods become dense retrieval documents.
             static METHOD_BODY:OnceLock<Regex>=OnceLock::new();
             let first=symbol.ln.saturating_sub(1).min(lines.len());
             let last=symbol.end.min(first+16).min(lines.len());
@@ -54,33 +52,58 @@ fn is_retrieval_unit(symbol:&Symbol,lines:&[String])->bool {
         },_=>false
     }
 }
+/// Reuse the query's generic software vocabulary in the opposite direction.
+/// These are dictionary aliases of actual identifiers, NOT generated summaries
+/// or claims that a function implements an inferred behavior. No query labels,
+/// project-specific symbol names, or repository paths occur in this expansion.
+fn identifier_aliases(text:&str)->Vec<String> {
+    let mut words=Vec::new();let mut seen=HashSet::new();
+    for token in query::tokens(text).into_iter().filter(|s|s.is_ascii()).take(24) {
+        let mut variants=vec![token.clone()];
+        for suffix in ["s","es","d","ed","ing"] {
+            if let Some(stem)=token.strip_suffix(suffix).filter(|s|s.len()>=3) {
+                variants.push(stem.to_string());
+                if suffix=="ing" {variants.push(format!("{stem}e"));}
+            }
+        }
+        for word in variants {if seen.insert(word.clone()){words.push(word);}}
+    }
+    let Ok(q)=query::Query::parse(serde_json::json!({"task":words.join(" ")})) else{return Vec::new();};
+    q.terms.into_iter().filter(|(_,weight)|*weight<1.0).map(|(word,_)|word).collect()
+}
 fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
     let entry=scan_source(text,file);let source=Arc::new(text.lines().map(str::to_owned).collect::<Vec<_>>());
     let imports=Arc::new(entry.imports);let file_hash=digest(text.as_bytes());
     let tests=entry.syms.iter().filter(|s|s.kind=="mod"&&s.name=="tests").map(|s|(s.ln,s.end)).collect::<Vec<_>>();
-    let mut spans=entry.syms.iter().filter(|s|is_retrieval_unit(s,&source)).map(|s|(s.name.clone(),s.ln,s.end)).collect::<Vec<_>>();
-    if spans.is_empty()&&!source.is_empty(){spans.push(("<module>".into(),1,source.len()));}
+    let mut spans=entry.syms.iter().filter(|s|is_retrieval_unit(s,&source)).map(|s|(s.name.clone(),s.ln,s.end,s.kind.clone())).collect::<Vec<_>>();
+    if spans.is_empty()&&!source.is_empty(){spans.push(("<module>".into(),1,source.len(),"module".into()));}
     let mut out=Vec::new();
-    for (name,begin,finish) in spans {
+    for (name,begin,finish,kind) in spans {
         let begin=begin.max(1);let finish=finish.min(source.len()).max(begin);
         if begin>source.len(){continue;}
         let mut comment=begin-1;
         while comment>0&&begin-comment<=8 {let s=source[comment-1].trim();if s.starts_with("//")||s.starts_with('#')||s.starts_with('*')||s.is_empty(){comment-=1}else{break;}}
         let role=if tests.iter().any(|(a,b)|begin>=*a&&begin<=*b){"test"}else{file_role(file)};
+        let callable=matches!(kind.as_str(),"fn"|"method"|"prop");
+        let names=if callable{identifier_aliases(&name)}else{Vec::new()};
+        let signature=source[begin-1..(begin+11).min(finish)].join("\n");
+        let signature=signature.split('{').next().unwrap_or("").chars().take(700).collect::<String>();
+        let signature_aliases=if callable{identifier_aliases(&signature)}else{Vec::new()};
+        let glossary=names.iter().chain(signature_aliases.iter()).filter(|s|!s.is_ascii()).take(36).cloned().collect::<Vec<_>>().join(" / ");
         for offset in (begin..=finish).step_by(64) {
             let end=(offset+79).min(finish);let start=if offset==begin{comment+1}else{offset};
             let prefix=source[comment..begin].join("\n");
             let body=source[start-1..end].join("\n");
-            // Plain identifier words and actual comments bridge natural language to
-            // code without inventing a model-generated description. Prioritize intent
-            // comments over boilerplate before the encoder's token budget.
-            let words=query::tokens(&name);let name_terms=words.iter().cloned().collect::<HashSet<_>>();
+            let words=query::tokens(&name);let mut name_terms=words.iter().cloned().collect::<HashSet<_>>();
+            name_terms.extend(names.iter().cloned());
             let comments=body.lines().filter(|l|{let l=l.trim();l.starts_with("//")||l.starts_with('#')||l.starts_with('*')}).collect::<Vec<_>>().join("\n");
-            let passage=format!("File: {file}\nSymbol: {name} ({})\n{}\n{}\nCode:\n{}",words.join(" "),prefix.chars().take(350).collect::<String>(),comments.chars().take(700).collect::<String>(),body.chars().take(1600).collect::<String>()).chars().take(3000).collect::<String>();
+            let passage=format!("File: {file}\nDefined {kind}: {name} ({})\nIdentifier glossary (dictionary, not a behavior summary): {glossary}\n{}\n{}\nCode:\n{}",words.join(" "),prefix.chars().take(350).collect::<String>(),comments.chars().take(600).collect::<String>(),body.chars().take(1600).collect::<String>()).chars().take(3000).collect::<String>();
             let hash=digest(passage.as_bytes());let mut terms=HashMap::<String,f64>::new();
             for (field,weight) in [(name.as_str(),4.0),(file,1.5),(prefix.as_str(),2.0),(body.as_str(),1.0)]{
                 for term in query::tokens(&field.chars().take(6000).collect::<String>()){if terms.len()<2048||terms.contains_key(&term){*terms.entry(term).or_default()+=weight;}}
             }
+            for term in &names {*terms.entry(term.clone()).or_default()+=4.0;}
+            for term in &signature_aliases {*terms.entry(term.clone()).or_default()+=1.25;}
             for tf in terms.values_mut(){*tf=(*tf).min(12.0);}
             let length=terms.values().sum::<f64>().max(1.0);
             let (calls,events,commands,members)=references(&body);
@@ -127,10 +150,8 @@ pub(super) fn corpus(root:&Path,deadline:Instant)->Result<Corpus,String>{
     cache.snapshot=Some(out.clone());Ok(out)
 }
 pub(super) fn verified(root:&Path,u:&CodeUnit)->bool {safe_file(root,&u.file)&&fs::read(root.join(&u.file)).ok().is_some_and(|b|digest(&b)==u.file_hash)}
-/// Final evidence can detect same-size/same-mtime edits missed by the metadata fast path.
-/// Evict those entries, then let the caller do at most one bounded fresh recall.
-/// An explicitly named file may be configuration or deliberately ignored. This
-/// is a targeted read, never an implicit expansion outside the repository.
+/// An explicitly named file may be configuration or deliberately ignored.
+/// This is a targeted read, never an expansion outside the repository.
 pub(super) fn explicit_units(root:&Path,files:&[String],known:&HashSet<String>,deadline:Instant)->Vec<Arc<CodeUnit>> {
     let mut out=Vec::new();
     for file in files {
@@ -143,4 +164,28 @@ pub(super) fn explicit_units(root:&Path,files:&[String],known:&HashSet<String>,d
 pub(super) fn invalidate(root:&Path, files:&HashSet<String>){
     let slot=CORPORA.get().and_then(|roots|roots.lock().ok().and_then(|all|all.get(&normalize_root(root)).cloned()));
     if let Some(slot)=slot {if let Ok(mut c)=slot.lock(){c.entries.retain(|f,_|!files.contains(f));c.snapshot=None;}}
+}
+
+#[cfg(test)]
+mod glossary_tests {
+    use super::*;
+    #[test]
+    fn generic_identifier_glossary_does_not_confuse_opposite_operations() {
+        let encrypt=identifier_aliases("encryptPayload");
+        assert!(encrypt.contains(&"加密".into()));assert!(!encrypt.contains(&"解密".into()));
+        let decrypt=identifier_aliases("decryptPayload");
+        assert!(decrypt.contains(&"解密".into()));assert!(!decrypt.contains(&"加密".into()));
+        let queue=identifier_aliases("removeQueuedPrompts");
+        assert!(queue.contains(&"队列".into()));assert!(queue.contains(&"发送".into()));
+    }
+    #[test]
+    fn glossary_is_metadata_and_never_changes_original_source() {
+        let src="pub fn encrypt_payload(request_id: &str) { encrypt(request_id); }\n";
+        let units=make_units("src/crypto.rs",src);
+        let unit=units.iter().find(|u|u.name=="encrypt_payload").unwrap();
+        assert!(unit.passage.contains("Identifier glossary"));
+        assert!(unit.name_terms.contains("加密"));
+        assert_eq!(unit.source.join("\n"),src.trim_end());
+        assert_eq!(unit.file_hash,digest(src.as_bytes()));
+    }
 }

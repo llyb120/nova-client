@@ -27,6 +27,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Archive exact candidate source for reproducibility
+        if: runner.os == 'Linux'
+        run: git archive --format=tar.gz -o "$RUNNER_TEMP/polaris-candidate.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: polaris-candidate-source
+          path: ${{ runner.temp }}/polaris-candidate.tar.gz
+          retention-days: 1
       - name: Use crates.io on CI
         shell: bash
         run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
