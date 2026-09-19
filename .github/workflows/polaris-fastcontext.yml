@@ -2,7 +2,7 @@ name: Polaris query-first validation
 on:
   push:
     branches: [perf/polaris-semantic-20260919]
-    paths: [.github/workflows/polaris-fastcontext.yml, scripts/polaris-fastcontext-migrate.py, scripts/polaris-fastcontext-ab.py, src-tauri/src/nova_tools_native/polaris_demand.rs]
+    paths: [.github/workflows/polaris-fastcontext.yml, scripts/polaris-fastcontext-migrate.py, scripts/polaris-fastcontext-ab.py, scripts/polaris-fastcontext-scale.py, src-tauri/src/nova_tools_native/polaris_demand.rs]
   workflow_dispatch:
 permissions:
   contents: read
@@ -23,11 +23,6 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 1da9211b2f23b0df0c28f2c781a4a18c9869854b
-          path: _previous
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
           ref: 3da28d30f1adfd0da3b993813a47aa3fff20fdeb
           path: _corpus
           persist-credentials: false
@@ -42,6 +37,12 @@ jobs:
           path: _report
           run-id: 35448033036
           github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-ubuntu-24.04
+          path: _oldbin
+          run-id: 35434961064
+          github-token: ${{ github.token }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
@@ -50,16 +51,15 @@ jobs:
         with:
           workspaces: bench/polaris-harness -> target
           cache-on-failure: true
-      - name: Build frozen PR11 production engine
+      - name: Authenticate frozen baseline; install required search executable
         run: |
           set -euo pipefail
           sudo apt-get update -qq && sudo apt-get install -y ripgrep
           mkdir -p validation/bin .cargo
           printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
-          cp .cargo/config.toml _previous/.cargo/config.toml
-          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/bench/polaris-harness/target"
-          cargo build --release --manifest-path _previous/bench/polaris-harness/Cargo.toml
-          cp "$CARGO_TARGET_DIR/release/polaris-harness" validation/bin/previous
+          cp _oldbin/bench/polaris-harness/target/release/polaris-harness validation/bin/previous
+          chmod +x validation/bin/previous
+          echo 'ef1896343d43926775c4c28923ffd0e981584069b327b750b04c8144502e6537  validation/bin/previous' | sha256sum --check
       - name: Apply source-reviewed migration, preserve actual diff
         run: |
           set -euo pipefail
@@ -71,13 +71,16 @@ jobs:
           cp scripts/polaris-fastcontext-*.py scripts/polaris-ab.py validation/scripts/
           sha256sum src-tauri/src/nova_tools_native/{context,polaris,polaris_index,polaris_query,polaris_demand}.rs src-tauri/src/lyra/reasonix.rs > validation/source-hashes.txt
           git -C _corpus archive HEAD src src-tauri/src scripts .gitignore | gzip > validation/corpus-source.tar.gz
-      - name: Production regression tests and release build
+      - name: Fresh production regression tests and release build
         run: |
           set -euo pipefail
+          cargo clean --release --manifest-path bench/polaris-harness/Cargo.toml -p polaris-harness
           cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
           node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs 2>&1 | tee validation/node-tests.txt
           cargo build --release --manifest-path bench/polaris-harness/Cargo.toml
           cp bench/polaris-harness/target/release/polaris-harness validation/bin/candidate
+          sha256sum validation/bin/* > validation/binary-hashes.txt
+          ! cmp -s validation/bin/previous validation/bin/candidate
       - name: Freeze replay exclusion rules; do not alter gold or main corpus
         run: |
           python3 - <<'PY'
@@ -92,6 +95,10 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/polaris-fastcontext-ab.py --previous "$GITHUB_WORKSPACE/validation/bin/previous" --candidate "$GITHUB_WORKSPACE/validation/bin/candidate" --corpus _corpus --replay-corpus _replay --replay-report _report/35447590732/polaris/report.json | tee validation/progress.txt
+      - name: Synthetic scaling and same-mtime source freshness
+        run: |
+          set -euo pipefail
+          python3 scripts/polaris-fastcontext-scale.py --previous "$GITHUB_WORKSPACE/validation/bin/previous" --candidate "$GITHUB_WORKSPACE/validation/bin/candidate" | tee validation/scale-progress.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
