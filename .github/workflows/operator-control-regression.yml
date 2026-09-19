@@ -1,0 +1,114 @@
+name: Operator control recovery and Polaris residency
+on:
+  push:
+    branches: [test/operator-native-gui-20260919]
+    paths: [.github/workflows/operator-control-regression.yml]
+permissions:
+  contents: read
+  actions: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  control:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            bench/operator-gui-harness -> target
+            bench/operator-harness -> target
+          cache-on-failure: true
+      - name: Apply reviewed candidate; record exact production diff
+        run: |
+          mkdir -p validation
+          python3 scripts/operator-control-hardening.py
+          rustfmt --edition 2021 src-tauri/src/operator/runtime.rs
+          git diff -- src-tauri/src/operator/runtime.rs > validation/operator-recovery.patch
+          sha256sum src-tauri/src/operator/runtime.rs src-tauri/src/lyra/reasonix.rs > validation/tested-hashes.txt
+          git rev-parse HEAD > validation/base-commit.txt
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+      - name: Production runtime and rejection safety tests
+        run: cargo test --manifest-path bench/operator-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/runtime-tests.txt
+      - name: Install actual native GUI dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev libxdo-dev libxtst-dev xvfb openbox dbus-x11
+          npm install --prefix bench/operator-gui-deps --no-package-lock --ignore-scripts playwright@1.55.1
+          bench/operator-gui-deps/node_modules/.bin/playwright install --with-deps chromium
+      - name: Build candidate native harness
+        run: cargo build --manifest-path bench/operator-gui-harness/Cargo.toml 2>&1 | tee validation/native-build.txt
+      - name: Actual native inputs; no provider or credentials
+        env:
+          OPERATOR_GUI_EXE: bench/operator-gui-harness/target/debug/nova-operator-gui-harness
+        run: dbus-run-session -- xvfb-run -a -s '-screen 0 1280x960x24' bash -c 'openbox >/tmp/control-openbox.log 2>&1 & node scripts/operator-native-regression.mjs' 2>&1 | tee validation/native-progress.txt
+      - name: Stage candidate source and reject accidental secrets
+        if: always()
+        run: |
+          cp src-tauri/src/operator/runtime.rs validation/runtime.rs
+          python3 - <<'PY'
+          import pathlib,re
+          for p in pathlib.Path('validation').rglob('*'):
+              if p.is_file():
+                  b=p.read_bytes()
+                  assert not re.search(rb'user_[A-Za-z0-9_-]{16,}',b),str(p)
+                  assert b'-----BEGIN PRIVATE KEY-----' not in b,str(p)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: control-recovery-validation
+          path: validation/
+          retention-days: 7
+  residency:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-ubuntu-24.04
+          path: polaris-build
+          run-id: 35434961064
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: sanitized-native-gui-replay-results
+          path: previous
+          run-id: 35448033036
+          github-token: ${{ github.token }}
+      - name: Freeze identical source and exclude report leakage
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y ripgrep
+          git clone --quiet --filter=blob:none https://github.com/llyb120/nova-client.git "$RUNNER_TEMP/replay-corpus"
+          git -C "$RUNNER_TEMP/replay-corpus" checkout --quiet --detach 22e3cf0fb55537ca6c93b68126c2c737794d783d
+          echo "OPERATOR_REPLAY_CORPUS=$RUNNER_TEMP/replay-corpus" >> "$GITHUB_ENV"
+          echo "POLARIS_REPLAY_BINARY=$GITHUB_WORKSPACE/polaris-build/bench/polaris-harness/target/release/polaris-harness" >> "$GITHUB_ENV"
+          echo "POLARIS_REPLAY_REPORT=$GITHUB_WORKSPACE/previous/35447590732/polaris/report.json" >> "$GITHUB_ENV"
+          chmod +x polaris-build/bench/polaris-harness/target/release/polaris-harness
+          python3 - <<'PY'
+          import pathlib,os,re
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'replay-corpus'
+          for p in root.rglob('*'):
+              rel=p.relative_to(root)
+              if '.git' in rel.parts or not p.is_file():continue
+              if rel.parts[0] in ('bench','.github') or re.search(r'report|eval|replay|ab-results|cases\.json',str(rel),re.I):p.unlink()
+          PY
+      - name: Identical query cold and resident A-B
+        run: python3 scripts/polaris-cold-warm-control.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-residency-control
+          path: validation/polaris-control/report.json
+          retention-days: 7
