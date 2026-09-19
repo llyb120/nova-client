@@ -53,6 +53,7 @@ jobs:
       - name: Build frozen PR11 production engine
         run: |
           set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y ripgrep
           mkdir -p validation/bin .cargo
           printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
           cp .cargo/config.toml _previous/.cargo/config.toml
@@ -65,9 +66,11 @@ jobs:
           python3 scripts/polaris-fastcontext-migrate.py
           git diff -- src-tauri/src/nova_tools_native > validation/production.patch
           git rev-parse HEAD > validation/base-commit.txt
-          mkdir -p validation/source
+          mkdir -p validation/source validation/scripts
           cp src-tauri/src/nova_tools_native/polaris*.rs validation/source/
+          cp scripts/polaris-fastcontext-*.py scripts/polaris-ab.py validation/scripts/
           sha256sum src-tauri/src/nova_tools_native/{context,polaris,polaris_index,polaris_query,polaris_demand}.rs src-tauri/src/lyra/reasonix.rs > validation/source-hashes.txt
+          git -C _corpus archive HEAD src src-tauri/src scripts .gitignore | gzip > validation/corpus-source.tar.gz
       - name: Production regression tests and release build
         run: |
           set -euo pipefail
