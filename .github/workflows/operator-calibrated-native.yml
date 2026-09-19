@@ -37,6 +37,8 @@ jobs:
           cp native-build/tested-commit.txt validation/native-binary-source.txt
           sha256sum native-build/nova-operator-gui-harness > validation/native-binary-sha256.txt
           git rev-parse HEAD > validation/driver-commit.txt
+          python3 scripts/operator-calibrated-pixel-check.py
+          cp scripts/operator-native-regression.mjs validation/executed-test-driver.mjs
       - name: Run actual native controls; fail on any case failure
         env:
           OPERATOR_GUI_EXE: native-build/nova-operator-gui-harness
