@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>Nova Native Control Test</title>
+<style>
+*{box-sizing:border-box}body{font:18px Arial,sans-serif;margin:0;background:#f3f5f8;color:#172334}header{background:#172334;color:white;padding:20px 34px}main{padding:28px 36px;max-width:1040px}h1{font-size:26px;margin:0}h2{font-size:23px}label{display:block;margin:22px 0 8px;font-weight:bold}input,select,textarea,button{font:19px Arial;padding:12px;border:1px solid #8693a3;border-radius:5px}input,textarea{width:650px}textarea{height:130px}button{cursor:pointer;background:white;margin:8px 12px 8px 0}button:disabled{color:#8b929b}table{border-collapse:collapse;background:white;width:760px}td,th{padding:17px;text-align:left;border:1px solid #c0c8d1}.badge{padding:10px 16px;background:#d8f4e3;display:inline-block;margin-top:16px}canvas{background:white;border:2px solid #263d59;touch-action:none}.spacer{height:510px;border-left:3px solid #dae1e9;margin:24px 0}.muted{color:#626e7e;font-size:16px}
+</style>
+<header><h1>Nova Native Control Test</h1></header><main id="main"></main>
+<script>
+const scenario=new URL(location).searchParams.get('case')||'form';
+const state={scenario,events:[],title:'Old draft',priority:'Normal',notes:'Old notes',page:1,filter:'all',pagesVisited:[],canvas:{x:100,y:110,dragged:false},loading:false};
+const main=document.querySelector('#main');
+const record=e=>{if(state.events.length<1000)state.events.push({type:e.type,trusted:e.isTrusted,target:e.target.id||e.target.tagName,time:performance.now(),...(e.type==='wheel'?{dy:e.deltaY}:{})});};
+for(const type of ['click','input','change','keydown','pointerdown','pointerup','wheel'])document.addEventListener(type,record,true);
+window.__oracle=()=>JSON.parse(JSON.stringify(state)); // Test driver only, never included in model requests.
+if(scenario==='form'){
+ main.innerHTML='<h2>Local draft editor</h2><p class="muted">Changes are saved locally as you type. Nothing is sent to anyone.</p><label for="title">Title</label><input id="title" value="Old draft"><label for="priority">Priority</label><select id="priority"><option>Normal</option><option>High</option><option>Low</option></select><div class="spacer"><p class="muted">Scroll down for Notes</p></div><label for="notes">Notes</label><textarea id="notes">Old notes</textarea><p id="saved" class="badge">Local draft ready</p><div style="height:90px"></div>';
+ for(const name of ['title','priority','notes'])document.getElementById(name).addEventListener(name==='priority'?'change':'input',e=>{state[name]=e.target.value;localStorage.setItem('draft',JSON.stringify({title:state.title,priority:state.priority,notes:state.notes}));document.getElementById('saved').textContent='Saved locally';});
+}else if(scenario==='orders'){
+ const rows=[{id:'A101',status:'Pending',amount:'12.50'},{id:'A102',status:'Done',amount:'70.00'},{id:'A103',status:'Pending',amount:'25.00'},{id:'A104',status:'Done',amount:'40.00'},{id:'A105',status:'Pending',amount:'9.75'},{id:'A106',status:'Pending',amount:'18.25'},{id:'A107',status:'Done',amount:'11.00'},{id:'A108',status:'Pending',amount:'31.00'},{id:'A109',status:'Pending',amount:'16.50'}];
+ main.innerHTML='<h2>Orders</h2><label for="filter">Status filter</label><select id="filter"><option value="all">All</option><option value="pending">Pending</option></select><button id="apply">Apply filter</button><p id="caption"></p><table><thead><tr><th>Order</th><th>Status</th><th>Amount</th></tr></thead><tbody id="rows"></tbody></table><p><button id="prev">Previous</button><button id="next">Next</button></p><p id="coverage" class="muted"></p>';
+ function draw(){const filtered=rows.filter(r=>state.filter==='all'||r.status==='Pending');const count=Math.ceil(filtered.length/3);document.getElementById('rows').innerHTML=filtered.slice((state.page-1)*3,state.page*3).map(r=>`<tr><td>${r.id}</td><td>${r.status}</td><td>${r.amount}</td></tr>`).join('');document.getElementById('caption').textContent=`Page ${state.page} of ${count} — ${filtered.length} orders — Filter: ${state.filter}`;document.getElementById('prev').disabled=state.page===1;document.getElementById('next').disabled=state.page===count;document.getElementById('coverage').textContent=state.page===count?'End of results':'More results on next page';state.pagesVisited.push({filter:state.filter,page:state.page});}
+ function update(fn){state.loading=true;document.getElementById('caption').textContent='Loading…';setTimeout(()=>{fn();state.loading=false;draw()},280)}
+ document.getElementById('apply').onclick=()=>update(()=>{state.filter=document.getElementById('filter').value;state.page=1});document.getElementById('next').onclick=()=>update(()=>state.page++);document.getElementById('prev').onclick=()=>update(()=>state.page--);draw();
+}else if(scenario==='canvas'){
+ main.innerHTML='<h2>Canvas board</h2><p>Drag the blue NOVA card into the dashed DROP ZONE.</p><canvas id="board" width="850" height="420"></canvas><p id="alignment" class="badge">Not aligned</p>';
+ const c=document.getElementById('board'),ctx=c.getContext('2d');let dragging=false,offset={x:0,y:0};
+ function draw(){ctx.clearRect(0,0,850,420);ctx.setLineDash([9,6]);ctx.strokeStyle='#397943';ctx.lineWidth=3;ctx.strokeRect(590,245,185,110);ctx.setLineDash([]);ctx.fillStyle='#244c2b';ctx.font='bold 20px Arial';ctx.fillText('DROP ZONE',614,307);ctx.fillStyle='#2671b8';ctx.fillRect(state.canvas.x,state.canvas.y,130,65);ctx.fillStyle='white';ctx.font='bold 24px Arial';ctx.fillText('NOVA',state.canvas.x+30,state.canvas.y+40);}
+ const point=e=>{const r=c.getBoundingClientRect();return{x:(e.clientX-r.left)*c.width/r.width,y:(e.clientY-r.top)*c.height/r.height}};
+ c.onpointerdown=e=>{const p=point(e),o=state.canvas;if(p.x>=o.x&&p.x<=o.x+130&&p.y>=o.y&&p.y<=o.y+65){dragging=true;offset={x:p.x-o.x,y:p.y-o.y};c.setPointerCapture(e.pointerId)}};
+ c.onpointermove=e=>{if(dragging){const p=point(e);state.canvas.x=p.x-offset.x;state.canvas.y=p.y-offset.y;draw()}};
+ c.onpointerup=e=>{if(dragging){dragging=false;state.canvas.dragged=true;const o=state.canvas;o.aligned=o.x>=585&&o.x+130<=780&&o.y>=240&&o.y+65<=360;document.getElementById('alignment').textContent=o.aligned?'Aligned — task complete':'Not aligned';draw()}};draw();
+}
+</script>
