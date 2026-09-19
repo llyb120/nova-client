@@ -1,0 +1,47 @@
+name: One-time DeepSeek image capability probe
+on:
+  push:
+    branches: [work/operator-commandcode-ab-20260919]
+    paths: [.github/workflows/operator-commandcode-image.yml]
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Check transport and source without credentials
+        run: |
+          node --test scripts/operator-commandcode-ab.test.mjs
+          node --check scripts/operator-commandcode-image-probe.mjs
+          mkdir -p validation
+          git rev-parse HEAD > validation/tested-commit.txt
+          cp bench/operator-commandcode-harness/image-fixtures.json validation/image-fixtures.json
+      - name: Prepare ephemeral recipient
+        run: node scripts/operator-ci-envelope.mjs prepare
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: operator-image-public-recipient
+          path: operator-public-recipient.json
+          retention-days: 1
+      - name: Probe only the selected model
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OPERATOR_IMAGE_PROBE: '1'
+        run: node scripts/operator-ci-envelope.mjs run
+      - name: Destroy ephemeral private key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/operator-one-time-recipient"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: operator-commandcode-image-results
+          path: validation/
+          retention-days: 7
