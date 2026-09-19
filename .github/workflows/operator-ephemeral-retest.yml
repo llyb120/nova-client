@@ -97,7 +97,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --manifest-path bench/operator-gui-harness/Cargo.toml 2>&1 | tee validation/native-build.txt
-          cargo test --manifest-path bench/operator-gui-harness/Cargo.toml 2>&1 | tee validation/native-unit-tests.txt
+          # These tests intentionally share the single global interactive-resource lease.
+          cargo test --manifest-path bench/operator-gui-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/native-unit-tests.txt
           git diff --exit-code -- src-tauri/src
       - name: Consume one-use encrypted envelope and run real-model GUI A/B
         env:
