@@ -25,7 +25,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           for i in $(seq 1 50); do
-            data=$(curl --fail --silent -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/llyb120/nova-client/actions/runs/35446241430)
+            data=$(curl --fail --silent -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/llyb120/nova-client/actions/runs/35446578925)
             status=$(printf '%s' "$data" | jq -r .status)
             if [ "$status" = completed ]; then
               test "$(printf '%s' "$data" | jq -r .conclusion)" = success
@@ -38,7 +38,7 @@ jobs:
         with:
           name: operator-native-build
           path: native-build
-          run-id: 35446241430
+          run-id: 35446578925
           github-token: ${{ github.token }}
       - uses: actions/download-artifact@v4
         with:
