@@ -1,0 +1,60 @@
+name: Calibrated actual native input regression
+on:
+  push:
+    branches: [test/operator-native-gui-20260919]
+    paths: [.github/workflows/operator-calibrated-native.yml]
+permissions:
+  contents: read
+  actions: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          name: operator-native-build
+          path: native-build
+          run-id: 35446578925
+          github-token: ${{ github.token }}
+      - name: Install actual GUI dependencies without credentials
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libwebkit2gtk-4.1-0 libayatana-appindicator3-1 librsvg2-2 libpipewire-0.3-0 libgbm1 libxdo3 libxtst6 xvfb openbox dbus-x11
+          npm install --prefix bench/operator-gui-deps --no-package-lock --ignore-scripts playwright@1.55.1 pngjs@7.0.0
+          bench/operator-gui-deps/node_modules/.bin/playwright install --with-deps chromium
+          chmod +x native-build/nova-operator-gui-harness
+          mkdir -p validation
+          cp native-build/tested-commit.txt validation/native-binary-source.txt
+          sha256sum native-build/nova-operator-gui-harness > validation/native-binary-sha256.txt
+          git rev-parse HEAD > validation/driver-commit.txt
+      - name: Run actual native controls; fail on any case failure
+        env:
+          OPERATOR_GUI_EXE: native-build/nova-operator-gui-harness
+        run: dbus-run-session -- xvfb-run -a -s '-screen 0 1280x960x24' bash -c 'openbox >/tmp/calibrated-openbox.log 2>&1 & node scripts/operator-native-regression.mjs' 2>&1 | tee validation/native-progress.txt
+      - name: Verify evidence has no credential material
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import pathlib,re
+          for p in pathlib.Path('validation').rglob('*'):
+              if p.is_file():
+                  b=p.read_bytes()
+                  assert not re.search(rb'user_[A-Za-z0-9_-]{16,}',b),str(p)
+                  assert b'-----BEGIN PRIVATE KEY-----' not in b,str(p)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: calibrated-native-regression
+          path: validation/
+          retention-days: 7
