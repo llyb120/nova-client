@@ -57,7 +57,7 @@ const CONCEPTS: &[&str]=&[
     "权限|授权|permission|authorization|allow", "认证|登录|凭证|auth|login|credential|token",
     "后台|任务|进程|background|task|process|runtime", "断线|重连|disconnect|reconnect|connection",
     "浏览器|页面|网页|browser|webview|chrome", "定位|点击|坐标|click|coordinate|target|pointer",
-    "窗口|焦点|window|focus|foreground", "校验|过期|失效|verify|validate|stale|invalidate",
+    "窗口|焦点|window|focus|foreground", "标签|页签|tab|tabs", "侧边栏|面板|工具栏|sidebar|panel|toolbar", "校验|过期|失效|verify|validate|stale|invalidate",
     "恢复|还原|restore|recover", "回滚|rollback", "检查点|checkpoint", "世界线|时间线|timeline|branch",
     "删除|清理|移除|delete|remove|cleanup", "索引|检索|搜索|index|search|retrieval",
     "语义|向量|semantic|embedding|vector", "复制|粘贴|剪贴板|copy|paste|clipboard",

@@ -1,3 +1,5 @@
+include!("polaris_test_scope.rs");
+
 /// Parse actual Rust/TypeScript/JavaScript declarations. In particular, a call
 /// followed by an unrelated block must never masquerade as a method definition.
 /// The original scanner/engine remains unchanged for exact queries and A/B.
@@ -66,7 +68,7 @@ fn scan_source(text: &str, file: &str) -> FileEntry {
                             result.imports.push(ImportRef{name:name.into(),from:spec,orig:None});
                         }
                         result.syms.push(Symbol { ln: start, end, depth: if kind == "const" { 0 } else { depth },
-                            kind: kind.into(), name: name.into(), sig: signature(line),
+                            kind: if file.ends_with(".rs") && rust_test_scope(node, text.as_bytes()) { format!("test:{kind}") } else { kind.into() }, name: name.into(), sig: signature(line),
                             exp: line.trim_start().starts_with("pub") || line.trim_start().starts_with("export") });
                     }
                 }

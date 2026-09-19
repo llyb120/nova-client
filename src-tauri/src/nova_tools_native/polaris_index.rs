@@ -41,7 +41,7 @@ fn references(text:&str)->(HashSet<String>,Vec<(String,String)>,HashSet<String>,
     (calls,events,commands,members)
 }
 fn is_retrieval_unit(symbol:&Symbol,lines:&[String])->bool {
-    match symbol.kind.as_str() {
+    match symbol.kind.strip_prefix("test:").unwrap_or(&symbol.kind) {
         "fn"|"class"|"type"=>true,
         "const"=>symbol.depth==0||(symbol.depth==1&&lines.get(symbol.ln.saturating_sub(1)).is_some_and(|l|l.contains("=>")||l.contains("function"))),
         "prop"=>{
@@ -97,8 +97,9 @@ fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
         if begin>source.len(){continue;}
         let mut comment=begin-1;
         while comment>0&&begin-comment<=8 {let s=source[comment-1].trim();if s.starts_with("//")||s.starts_with("/*")||s.starts_with('#')||s.starts_with('*')||s.is_empty(){comment-=1}else{break;}}
-        let role=if tests.iter().any(|(a,b)|begin>=*a&&begin<=*b){"test"}else{file_role(file)};
-        let callable=matches!(kind.as_str(),"fn"|"method"|"prop");
+        let role=if kind.starts_with("test:")||tests.iter().any(|(a,b)|begin>=*a&&begin<=*b){"test"}else{file_role(file)};
+        let kind=kind.strip_prefix("test:").unwrap_or(&kind);
+        let callable=matches!(kind,"fn"|"method"|"prop");
         let names=if callable{identifier_aliases(&name)}else{Vec::new()};
         let signature=source[begin-1..(begin+11).min(finish)].join("\n");
         let signature=signature.split('{').next().unwrap_or("").chars().take(700).collect::<String>();

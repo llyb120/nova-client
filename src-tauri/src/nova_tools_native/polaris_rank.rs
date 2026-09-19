@@ -15,18 +15,28 @@ pub(super) fn fuse(lexical:&[(usize,f64)],dense:&[(usize,f64)],units:&[Arc<CodeU
     // the later duplicate-removal silently discards half of the evidence.
     let mut scores=HashMap::<(String,String,usize),(usize,f64)>::new();
     for (rows,weight) in [(&lexical,0.7),(&dense,0.3)] {
-        for (rank,(id,_)) in rows.iter().enumerate() {
+        // The source checks above produce meaningful score margins. Replacing
+        // those margins by another reciprocal rank discards operation/constraint
+        // evidence and lets a broad semantic match overrule a concrete body.
+        let maximum=rows.first().map(|(_,score)|*score).unwrap_or(1.0).max(f64::EPSILON);
+        for (id,score) in rows.iter() {
             let entry=scores.entry(identity(&units[*id])).or_insert((*id,0.0));
-            entry.1+=weight/(12.0+rank as f64);
+            entry.1+=weight*(score/maximum).clamp(0.0,1.0);
         }
     }
     for (i,u) in units.iter().enumerate() {
         if q.files.contains(&u.file)||q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&u.name)) {
-            scores.entry(identity(u)).or_insert((i,0.0)).1=1.0;
+            scores.entry(identity(u)).or_insert((i,0.0)).1=2.0;
         }
     }
     let mut out=scores.into_values().collect::<Vec<_>>();
     out.sort_by(|a,b|b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    if std::env::var_os("NOVA_POLARIS_TRACE_RANK").is_some() {
+        let rows=|channel:&[(usize,f64)]|channel.iter().take(32).map(|(i,s)|serde_json::json!({
+            "file":units[*i].file,"symbol":units[*i].name,"start":units[*i].owner_start,"score":s
+        })).collect::<Vec<_>>();
+        eprintln!("[polaris-rank] {}",serde_json::json!({"query":q.task,"lexical":rows(&lexical),"semantic":rows(&dense),"fused":rows(&out)}));
+    }
     out
 }
 

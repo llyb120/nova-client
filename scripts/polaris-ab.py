@@ -140,12 +140,13 @@ def main():
             body=re.sub(r'\s+','',(corpus/gold['file']).read_text())
             if not all(re.sub(r'\s+','',n) in body for n in gold['needles']):raise RuntimeError('invalid label '+case['id'])
     env={k:v for k,v in os.environ.items() if not k.startswith('NOVA_POLARIS_')}
+    env['NOVA_POLARIS_TRACE_RANK']='1' # Only the explicit A/B records score diagnostics; not enabled for normal users.
     processes={};model_process=None;model_log=None;raw=[]
     cache_root=Path(tempfile.mkdtemp(prefix='polaris-ab-cache-'))
     report={'baseline':BASE,'binarySha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'casesSha256':hashlib.sha256(args.cases.read_bytes()).hexdigest(),
       'candidateRevision':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
       'platform':platform.platform(),'python':sys.version,'cpuCount':os.cpu_count(),'rounds':args.rounds,'firstPass':[],'runs':raw,
-      'method':'Same clean release corpus, labels external, release production modules. Rotating arm order; round 0 separate first pass, rounds 1..N warm. Disk/page caches not flushed; not strict OS-cold latency. Top1 ranks primary code bodies/files, never metadata. Hand labels incomplete: file fraction is not a universal precision/noise judgment; empty support labels measure core-body coverage, not whole-task completion.'}
+      'method':'Same clean release corpus, labels external, release production modules. Rotating arm order; round 0 separate first pass, rounds 1..N warm. Disk/page caches not flushed; not strict OS-cold latency. Top1 ranks primary code bodies/files, never metadata. The split formerly named heldout has been inspected during debugging and is now a regression split, not a blind holdout. Hand labels incomplete: file fraction is not a universal precision/noise judgment; empty support labels measure core-body coverage, not whole-task completion.'}
     try:
         for arm in ['A_query','A_task','B_lexical']:
             processes[arm]=Engine(binary,{**env,'NOVA_DATA_DIR':str(cache_root/arm)},out/(arm+'.log'))
