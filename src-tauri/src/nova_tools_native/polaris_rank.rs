@@ -1,6 +1,35 @@
 // Source-backed refinement, independent of query examples or expected answers.
 use super::*;
 
+/// Refine source-backed retrieval channels independently, then combine ranks.
+/// Precise lexical evidence is retained without turning semantic-only matches off.
+pub(super) fn fuse(lexical:&[(usize,f64)],dense:&[(usize,f64)],units:&[Arc<CodeUnit>],q:&Query)->Vec<(usize,f64)> {
+    let channel=|rows:&[(usize,f64)]| {
+        let mut seen=HashSet::new();
+        let mut ranked=rows.iter().enumerate().filter_map(|(r,(i,_))|seen.insert(identity(&units[*i])).then_some((*i,1.0/(20.0+r as f64)))).collect::<Vec<_>>();
+        refine_forwarders(&mut ranked,units,q);ranked
+    };
+    let lexical=channel(lexical);let dense=channel(dense);
+    // Channels may select different slices of the SAME function. Accumulate
+    // at the owner identity, not at the slice index, or its votes get split and
+    // the later duplicate-removal silently discards half of the evidence.
+    let mut scores=HashMap::<(String,String,usize),(usize,f64)>::new();
+    for (rows,weight) in [(&lexical,0.7),(&dense,0.3)] {
+        for (rank,(id,_)) in rows.iter().enumerate() {
+            let entry=scores.entry(identity(&units[*id])).or_insert((*id,0.0));
+            entry.1+=weight/(12.0+rank as f64);
+        }
+    }
+    for (i,u) in units.iter().enumerate() {
+        if q.files.contains(&u.file)||q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&u.name)) {
+            scores.entry(identity(u)).or_insert((i,0.0)).1=1.0;
+        }
+    }
+    let mut out=scores.into_values().collect::<Vec<_>>();
+    out.sort_by(|a,b|b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
 /// Resolve only an explicit crate/self/super Rust function path to an existing
 /// source module. Never join unrelated functions just because their names match.
 pub(super) fn qualified_call(from:&CodeUnit,to:&CodeUnit,files:&HashSet<String>)->bool {
@@ -61,6 +90,12 @@ pub(super) fn refine_forwarders(ranked:&mut Vec<(usize,f64)>,units:&[Arc<CodeUni
                 ||u.calls.iter().any(|call|query::tokens(call).iter().any(|term|term==word))
                 ||(!word.is_ascii()&&u.source[u.start-1..u.end].iter().any(|line|line.contains(word)))));
             if !operation{*score*=0.40;}
+            let name_operation=predicates.iter().any(|group|group.split('|').any(|word|u.name_terms.contains(word)));
+            if name_operation {*score*=1.3;}
+            // The user-facing command is the behavior dispatcher, unless it
+            // merely forwards (the next stage then resolves its concrete callee).
+            if ["按钮","点击","按下"].iter().any(|word|q.task.contains(word)) && name_operation
+                && u.source[u.owner_start.saturating_sub(4)..u.owner_start].iter().any(|line|line.contains("#[tauri::command")) {*score*=1.3;}
 
         }
         ranked.sort_by(|a,b|b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -144,6 +179,24 @@ mod tests {
         let run=c.units.iter().find(|u|u.name=="run").unwrap();
         let converter=c.units.iter().find(|u|u.name=="convert").unwrap();
         assert_eq!(related(run,converter,&files),Some("callee-reference"));
+    }
+
+    #[test] fn slices_of_one_function_share_fusion_votes() {
+        let dir=tempfile::tempdir().unwrap();
+        let mut text=String::new();
+        for n in 0..8 {text.push_str(&format!("fn other{n}() {{ let x = 1; consume(x); }}\n"));}
+        text.push_str("fn target() {\n");
+        for _ in 0..150 {text.push_str("let x = 1;\n");}
+        text.push_str("}\n");fs::write(dir.path().join("logic.rs"),text).unwrap();
+        let c=index::corpus(dir.path(),Instant::now()+Duration::from_secs(5)).unwrap();
+        let parts=c.units.iter().enumerate().filter(|(_,u)|u.name=="target").map(|(i,_)|i).collect::<Vec<_>>();
+        assert!(parts.len()>1);
+        let mut lexical=c.units.iter().enumerate().filter(|(_,u)|u.name!="target").map(|(i,_)|(i,1.0)).collect::<Vec<_>>();
+        lexical.push((parts[0],1.0));
+        let q=Query::parse(serde_json::json!({"task":"特定的约定"})).unwrap();
+        let fused=fuse(&lexical,&[(parts[1],1.0)],&c.units,&q);
+        assert_eq!(c.units[fused[0].0].name,"target");
+        assert_eq!(fused.iter().filter(|(i,_)|c.units[*i].name=="target").count(),1);
     }
 
 }

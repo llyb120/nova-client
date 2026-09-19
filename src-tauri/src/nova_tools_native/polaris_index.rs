@@ -74,6 +74,9 @@ fn identifier_aliases(text:&str)->Vec<String> {
         }
         for word in variants {if seen.insert(word.clone()){words.push(word);}}
     }
+    // A source name like bytesToString states a conversion; annotate that
+    // naming convention without inventing either input or output identifiers.
+    if words.iter().any(|w|w=="to") {words.push("convert".into());}
     let seed=words.join(" ");
     let original=query::tokens(&seed).into_iter().collect::<HashSet<_>>();
     let Ok(q)=query::Query::parse(serde_json::json!({"task":seed})) else{return Vec::new();};
@@ -85,6 +88,9 @@ fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
     let tests=entry.syms.iter().filter(|s|s.kind=="mod"&&s.name=="tests").map(|s|(s.ln,s.end)).collect::<Vec<_>>();
     let mut spans=entry.syms.iter().filter(|s|is_retrieval_unit(s,&source)).map(|s|(s.name.clone(),s.ln,s.end,s.kind.clone())).collect::<Vec<_>>();
     if spans.is_empty()&&!source.is_empty(){spans.push(("<module>".into(),1,source.len(),"module".into()));}
+    let module_doc=source.iter().take(16).filter(|s|s.trim_start().starts_with("//!"))
+        .map(|s|s.trim_start().trim_start_matches("//!").trim()).collect::<Vec<_>>().join(" ");
+    let module_doc=module_doc.chars().take(240).collect::<String>();
     let mut out=Vec::new();
     for (name,begin,finish,kind) in spans {
         let begin=begin.max(1);let finish=finish.min(source.len()).max(begin);
@@ -97,7 +103,6 @@ fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
         let signature=source[begin-1..(begin+11).min(finish)].join("\n");
         let signature=signature.split('{').next().unwrap_or("").chars().take(700).collect::<String>();
         let signature_aliases=if callable{identifier_aliases(&signature)}else{Vec::new()};
-        let glossary=names.iter().chain(signature_aliases.iter()).filter(|s|!s.is_ascii()).take(36).cloned().collect::<Vec<_>>().join(" / ");
         for offset in (begin..=finish).step_by(64) {
             let end=(offset+79).min(finish);let start=if offset==begin{comment+1}else{offset};
             let prefix=source[comment..begin].join("\n");
@@ -105,10 +110,19 @@ fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
             let words=query::tokens(&name);let mut name_terms=words.iter().cloned().collect::<HashSet<_>>();
             name_terms.extend(names.iter().cloned());
             let comments=body.lines().filter(|l|{let l=l.trim();l.starts_with("//")||l.starts_with("/*")||l.starts_with('#')||l.starts_with('*')}).collect::<Vec<_>>().join("\n");
-            let passage=format!("File: {file}\nDefined {kind}: {name} ({})\nIdentifier glossary (dictionary, not a behavior summary): {glossary}\n{}\n{}\nCode:\n{}",words.join(" "),prefix.chars().take(350).collect::<String>(),comments.chars().take(600).collect::<String>(),body.chars().take(1600).collect::<String>()).chars().take(3000).collect::<String>();
+            // Do not let a long dictionary glossary/path consume the encoder's
+            // token budget before it sees the actual behavior and source comments.
+            let passage=format!("Defined {kind}: {name} ({})\n{}\n{}\n{}\nCode:\n{}\nFile: {file}",
+                words.join(" "),prefix.chars().take(250).collect::<String>(),module_doc,
+                comments.chars().take(350).collect::<String>(),body.chars().take(2200).collect::<String>()).chars().take(3400).collect::<String>();
             let hash=digest(passage.as_bytes());let mut terms=HashMap::<String,f64>::new();
-            for (field,weight) in [(name.as_str(),4.0),(file,1.5),(prefix.as_str(),2.0),(body.as_str(),1.0)]{
+            for (field,weight) in [(name.as_str(),4.0),(file,1.5),(prefix.as_str(),2.0),(module_doc.as_str(),1.0),(body.as_str(),1.0)]{
                 for term in query::tokens(&field.chars().take(6000).collect::<String>()){if terms.len()<2048||terms.contains_key(&term){*terms.entry(term).or_default()+=weight;}}
+            }
+            // Recognized source-level fallback idioms carry default semantics
+            // even when a developer did not spell the word default in a comment.
+            if ["unwrap_or(","unwrap_or_else(","unwrap_or_default("," ?? "].iter().any(|s|body.contains(s)) {
+                for term in ["default","fallback","默认","缺省"] {*terms.entry(term.into()).or_default()+=1.5;}
             }
             for term in &names {*terms.entry(term.clone()).or_default()+=4.0;}
             for term in &signature_aliases {*terms.entry(term.clone()).or_default()+=1.25;}
@@ -191,7 +205,7 @@ mod glossary_tests {
         let src="pub fn encrypt_payload(request_id: &str) { encrypt(request_id); }\n";
         let units=make_units("src/crypto.rs",src);
         let unit=units.iter().find(|u|u.name=="encrypt_payload").unwrap();
-        assert!(unit.passage.contains("Identifier glossary"));
+        assert!(unit.passage.contains("Defined fn: encrypt_payload"));
         assert!(unit.name_terms.contains("加密"));
         assert_eq!(unit.source.join("\n"),src.trim_end());
         assert_eq!(unit.file_hash,digest(src.as_bytes()));

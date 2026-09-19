@@ -55,23 +55,19 @@ fn retrieve_attempt(root:&Path,q:&Query,started:Instant,retried:bool)->Result<St
     let mut units=corpus.units.iter().filter(|u|u.role=="implementation"||(q.test_intent&&u.role=="test")||(q.doc_intent&&u.role=="documentation")||q.files.contains(&u.file)).cloned().collect::<Vec<_>>();
     let known=units.iter().map(|u|u.file.clone()).collect::<HashSet<_>>();
     units.extend(index::explicit_units(&root,&q.files,&known,deadline));
+    let semantic_query=q.semantic_query();
     let (lexical,dense)=thread::scope(|scope| {
         if std::env::var_os("NOVA_POLARIS_SEMANTIC_URL").is_some() {
-            let pending=scope.spawn(||vectors::search(&root,&units,&q.task,deadline));
+            let pending=scope.spawn(||vectors::search(&root,&units,&semantic_query,deadline));
             let lexical=lexical_rank(&corpus,&units,q);
             let dense=pending.join().unwrap_or_else(|_|vectors::Dense{mode:"lexical".into(),note:Some("semantic worker failed; lexical evidence retained".into()),..Default::default()});
             (lexical,dense)
-        } else {(lexical_rank(&corpus,&units,q),vectors::search(&root,&units,&q.task,deadline))}
+        } else {(lexical_rank(&corpus,&units,q),vectors::search(&root,&units,&semantic_query,deadline))}
     });
-    let mut scores=HashMap::<usize,f64>::new();
-    // Reciprocal-rank fusion: raw BM25 and cosine scores are not commensurable.
-    for (rank,(id,_)) in lexical.iter().enumerate(){*scores.entry(*id).or_default()+=1.0/(40.0+rank as f64);}
-    for (rank,(id,_)) in dense.scores.iter().enumerate(){*scores.entry(*id).or_default()+=1.0/(40.0+rank as f64);}
-    for (i,u) in units.iter().enumerate(){if q.files.contains(&u.file)||q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&u.name)){*scores.entry(i).or_default()+=1.0;}}
-    let mut ranked=scores.into_iter().collect::<Vec<_>>();ranked.sort_by(|a,b|b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    // De-duplicate snippets of the same function before the expensive second stage.
-    let mut seen=HashSet::new();ranked.retain(|(i,_)|seen.insert(identity(&units[*i])));
-    rank::refine_forwarders(&mut ranked,&units,q);ranked.truncate(24);
+    // Refine each recall channel independently before fusion. Otherwise a
+    // semantically popular wrapper can erase the lexical channel's concrete body.
+    let mut ranked=rank::fuse(&lexical,&dense.scores,&units,q);
+    ranked.truncate(32);
     // An in-flight edit invalidates old semantic results as well as lexical evidence.
     let stale=ranked.iter().filter(|(i,_)|!index::verified(&root,&units[*i])).map(|(i,_)|units[*i].file.clone()).collect::<HashSet<_>>();
     if !stale.is_empty(){index::invalidate(&root,&stale);if !retried&&Instant::now()<deadline{return retrieve_attempt(&root,q,started,true);}}
