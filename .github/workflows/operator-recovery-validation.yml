@@ -2,7 +2,14 @@ name: Operator recovery validation
 on:
   push:
     branches: [work/operator-context-20260919]
-    paths: [.github/workflows/operator-recovery-validation.yml]
+    paths:
+      - .github/workflows/operator-recovery-validation.yml
+      - src-tauri/src/operator/**
+      - src-tauri/src/jianlai.rs
+  pull_request:
+    paths:
+      - src-tauri/src/operator/**
+      - src-tauri/src/jianlai.rs
   workflow_dispatch:
 permissions:
   contents: read
@@ -13,12 +20,10 @@ jobs:
   core:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
@@ -26,47 +31,14 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: bench/operator-harness -> target
-      - name: Verify reviewed patch checksum before applying
-        run: |
-          set -euo pipefail
-          mkdir -p validation
-          python3 - <<'PY'
-          import pathlib,json,base64,zlib,hashlib,subprocess
-          manifest=pathlib.Path('scripts/operator-recovery-patch.json')
-          if manifest.exists():
-              m=json.loads(manifest.read_text())
-              raw=zlib.decompress(base64.b64decode(''.join(pathlib.Path(p).read_text().strip() for p in m['parts']),validate=True))
-              assert hashlib.sha256(raw).hexdigest()==m['sha256'],'Patch transport checksum mismatch'
-              pathlib.Path('validation/reviewed.patch').write_bytes(raw)
-              subprocess.run(['git','apply','--check','validation/reviewed.patch'],check=True)
-              subprocess.run(['git','apply','validation/reviewed.patch'],check=True)
-          PY
-          rustfmt --edition 2021 src-tauri/src/operator/core.rs src-tauri/src/operator/contract.rs src-tauri/src/operator/runtime.rs
       - name: Production core, runtime and Node regression tests
         run: |
           set -euo pipefail
+          mkdir -p validation
+          git rev-parse HEAD > validation/tested-commit.txt
           cargo test --manifest-path bench/operator-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
           node --test scripts/operator.test.mjs 2>&1 | tee validation/node-tests.txt
           sha256sum src-tauri/src/operator/{core,contract,runtime}.rs src-tauri/src/jianlai.rs src-tauri/src/lyra/reasonix.rs > validation/tested-hashes.txt
-      - name: Commit only tested production files; remove temporary transport
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REF_NAME" = work/operator-context-20260919
-          remote=$(git ls-remote origin refs/heads/work/operator-context-20260919 | cut -f1)
-          test "$remote" = "$GITHUB_SHA" || { echo 'Branch advanced; refusing overwrite'; exit 1; }
-          git add src-tauri/src/operator/core.rs src-tauri/src/operator/contract.rs src-tauri/src/operator/runtime.rs src-tauri/src/jianlai.rs
-          if test -f scripts/operator-recovery-patch.json; then
-            git rm scripts/operator-recovery-patch.json scripts/operator-recovery-part-{0,1,2,3}.txt
-          fi
-          if ! git diff --cached --quiet; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'fix(operator): recover bounded decisions, enforce native contracts and normalize shortcuts'
-            git push origin HEAD:work/operator-context-20260919
-          fi
-          git rev-parse HEAD > validation/production-commit.txt
-          mkdir -p validation/source
-          cp src-tauri/src/operator/{core,contract,runtime}.rs src-tauri/src/jianlai.rs validation/source/
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -79,7 +51,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
@@ -94,25 +65,15 @@ jobs:
         with:
           workspaces: bench/operator-gui-harness -> target
           cache-on-failure: true
-      - name: Apply identical reviewed production changes and native fixture
+      - name: Stage pinned fixture against unchanged current production source
         run: |
           set -euo pipefail
           mkdir -p validation .cargo
-          python3 - <<'PY'
-          import pathlib,json,base64,zlib,hashlib,subprocess
-          manifest=pathlib.Path('scripts/operator-recovery-patch.json')
-          if manifest.exists():
-              m=json.loads(manifest.read_text())
-              raw=zlib.decompress(base64.b64decode(''.join(pathlib.Path(p).read_text().strip() for p in m['parts']),validate=True))
-              assert hashlib.sha256(raw).hexdigest()==m['sha256']
-              pathlib.Path('validation/reviewed.patch').write_bytes(raw)
-              subprocess.run(['git','apply','--check','validation/reviewed.patch'],check=True)
-              subprocess.run(['git','apply','validation/reviewed.patch'],check=True)
-          PY
-          rustfmt --edition 2021 src-tauri/src/operator/core.rs src-tauri/src/operator/contract.rs src-tauri/src/operator/runtime.rs
+          git rev-parse HEAD > validation/tested-commit.txt
           cp -r _fixture/bench/operator-gui-harness bench/
           cp _fixture/scripts/operator-native-regression.mjs scripts/operator-native-recovery-regression.mjs
           printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          printf '\n[dev-dependencies]\ntempfile = "3"\n' >> bench/operator-gui-harness/Cargo.toml
           python3 - <<'PY'
           from pathlib import Path
           p=Path('scripts/operator-native-recovery-regression.mjs');s=p.read_text()
