@@ -103,11 +103,18 @@ jobs:
         run: |
           set -o pipefail
           cargo test --manifest-path src-tauri/Cargo.toml --lib --no-run 2>&1 | tee polaris-native-compile.log
+      - name: Run semantic retrieval tests inside the actual Windows library
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --manifest-path src-tauri/Cargo.toml --lib nova_tools_native::lexical::semantic -- --test-threads=1 2>&1 | tee polaris-native-tests.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: polaris-native-compile
-          path: polaris-native-compile.log
+          path: |
+            polaris-native-compile.log
+            polaris-native-tests.log
           retention-days: 7
   ab:
     needs: retrieval
@@ -136,6 +143,7 @@ jobs:
       - name: Check evaluator and export the exact frozen source corpus
         run: |
           python scripts/polaris-eval.test.py
+          python scripts/polaris-acceptance.test.py
           git -C _corpus archive --format=tar.gz -o "$RUNNER_TEMP/polaris-baseline.tar.gz" HEAD
       - uses: actions/upload-artifact@v4
         with:
@@ -150,8 +158,10 @@ jobs:
           mkdir -p polaris-ab-results
           python -m pip freeze > polaris-ab-results/python-environment.txt
           chmod +x _binary/bench/polaris-harness/target/release/polaris-harness
-      - name: Development-only paired A/B with real local embeddings and reranking
-        run: python scripts/polaris-ab.py --binary _binary/bench/polaris-harness/target/release/polaris-harness --corpus _corpus --out polaris-ab-results --models --rounds 3 --split dev
+      - name: Frozen development, reserved, exact and no-answer A/B
+        run: python scripts/polaris-ab.py --binary _binary/bench/polaris-harness/target/release/polaris-harness --corpus _corpus --out polaris-ab-results --models --rounds 3 --split all
+      - name: Require retrieval quality, exact compatibility and real semantic coverage
+        run: python scripts/polaris-acceptance.py polaris-ab-results/report.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

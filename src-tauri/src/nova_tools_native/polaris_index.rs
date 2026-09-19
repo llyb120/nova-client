@@ -24,9 +24,13 @@ fn file_role(file:&str)->&'static str {
     if l.ends_with(".md"){"documentation"}else if l.contains("/tests/")||l.contains("/test/")||l.contains(".test.")||l.contains(".spec.")||l.ends_with("/tests.rs")||l.starts_with("bench/")||l.starts_with("tests/")||l.starts_with("test/"){"test"}else{"implementation"}
 }
 fn references(text:&str)->(HashSet<String>,Vec<(String,String)>,HashSet<String>,Vec<(String,String)>){
-    static CALLS:OnceLock<Regex>=OnceLock::new();static EVENTS:OnceLock<Regex>=OnceLock::new();static MEMBERS:OnceLock<Regex>=OnceLock::new();static RUST_CALLS:OnceLock<Regex>=OnceLock::new();
+    static CALLS:OnceLock<Regex>=OnceLock::new();static EVENTS:OnceLock<Regex>=OnceLock::new();static MEMBERS:OnceLock<Regex>=OnceLock::new();static RUST_CALLS:OnceLock<Regex>=OnceLock::new();static CALLBACKS:OnceLock<Regex>=OnceLock::new();
     let bounded=text.chars().take(20000).collect::<String>();
-    let calls=CALLS.get_or_init(||Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^;{}]{0,100}>)?\s*\(").unwrap()).captures_iter(&bounded).take(256).map(|c|c[1].to_string()).collect();
+    let mut calls:HashSet<String>=CALLS.get_or_init(||Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^;{}]{0,100}>)?\s*\(").unwrap()).captures_iter(&bounded).take(256).map(|c|c[1].to_string()).collect();
+    // Passing a declared function to a standard higher-order operation is a
+    // source reference too: rows.map(convert) must reach convert's body.
+    calls.extend(CALLBACKS.get_or_init(||Regex::new(r"\b(?:map|flatMap|filter|forEach|then|catch)\s*\(\s*([A-Za-z_$][\w$]*)\s*[,)]").unwrap())
+        .captures_iter(&bounded).take(64).map(|c|c[1].to_string()));
     let mut commands=HashSet::new();let mut events=Vec::new();
     for c in EVENTS.get_or_init(||Regex::new(r#"\b(emit|listen|on|invoke)\s*(?:<[^;{}]{0,100}>)?\s*\(\s*["']([A-Za-z0-9_:/.-]{4,128})["']"#).unwrap()).captures_iter(&bounded).take(64){
         if &c[1]=="invoke"{commands.insert(c[2].to_string());}else{events.push((c[1].to_string(),c[2].to_string()));}

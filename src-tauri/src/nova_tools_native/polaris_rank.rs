@@ -24,7 +24,15 @@ pub(super) fn qualified_call(from:&CodeUnit,to:&CodeUnit,files:&HashSet<String>)
 fn forwarding(unit:&CodeUnit)->bool {
     if unit.owner_end.saturating_sub(unit.owner_start)>18{return false;}
     let text=unit.source[unit.owner_start-1..unit.owner_end].join("\n");
-    let Some((_,body))=text.split_once('{')else{return false;};
+    // Expression-bodied arrows are common IPC and functional wrappers; they
+    // have no body brace, or only a later brace for an argument object.
+    let start=match (text.find("=>"),text.find('{')) {
+        (Some(a),Some(b)) if a<b=>a+2,
+        (Some(a),None)=>a+2,
+        (_,Some(b))=>b+1,
+        _=>return false,
+    };
+    let body=&text[start..];
     // Small predicates and stateful handlers are real behavior, not forwarding.
     if ["let ","const ","if ","match ","for ","while ","&&","||","==","!=",".push(",".insert("].iter().any(|s|body.contains(s)){return false;}
     !unit.calls.is_empty()
@@ -61,13 +69,13 @@ pub(super) fn refine_forwarders(ranked:&mut Vec<(usize,f64)>,units:&[Arc<CodeUni
     let mut by_name=HashMap::<&str,Vec<usize>>::new();
     for (i,u) in units.iter().enumerate(){by_name.entry(&u.name).or_default().push(i);}
     let mut handled=HashSet::new();
-    for _ in 0..2 {
+    for _ in 0..4 {
         let batch=ranked.iter().take(12).copied().collect::<Vec<_>>();
         for (id,score) in batch {
             let u=&units[id];
             if !forwarding(u)||!handled.insert(identity(u))||q.files.contains(&u.file)||q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&u.name)){continue;}
             let mut seen=HashSet::new();let mut targets=Vec::new();
-            for call in &u.calls {
+            for call in u.calls.iter().chain(u.commands.iter()) {
                 for &other in by_name.get(call.as_str()).into_iter().flatten(){
                     let v=&units[other];
                     if identity(v)==identity(u)||!seen.insert(identity(v)){continue;}
@@ -115,6 +123,27 @@ mod tests {
         let wrapper=c.units.iter().find(|u|u.name=="paths").unwrap();
         let implementation=c.units.iter().find(|u|u.name=="read_paths").unwrap();
         assert_eq!(related(wrapper,implementation,&files),Some("callee-reference"));
+    }
+
+    #[test] fn expression_arrows_and_native_wrappers_reach_the_concrete_body() {
+        let dir=tempfile::tempdir().unwrap();fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/api.ts"),"export const api = {\n list: () => invoke('native_list'),\n};\n").unwrap();
+        fs::write(dir.path().join("src/lib.rs"),"mod disk;\n#[tauri::command]\npub fn native_list() -> Vec<String> { disk::paths() }\n").unwrap();
+        fs::write(dir.path().join("src/disk.rs"),"pub fn paths() -> Vec<String> { enumerate() }\nfn enumerate() -> Vec<String> { let entries = read_directory(); entries }\n").unwrap();
+        let c=index::corpus(dir.path(),Instant::now()+Duration::from_secs(5)).unwrap();
+        let mut rows=vec![(c.units.iter().position(|u|u.name=="list").unwrap(),1.0)];
+        let q=Query::parse(serde_json::json!({"task":"读取文件列表"})).unwrap();
+        refine_forwarders(&mut rows,&c.units,&q);
+        assert_eq!(c.units[rows[0].0].name,"enumerate");
+    }
+    #[test] fn function_values_passed_as_callbacks_link_only_to_real_source() {
+        let dir=tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("pipeline.ts"),"function convert(row: string) { return row.toUpperCase(); }\nexport function run(rows: string[]) { return rows.map(convert); }\n").unwrap();
+        let c=index::corpus(dir.path(),Instant::now()+Duration::from_secs(5)).unwrap();
+        let files=c.units.iter().map(|u|u.file.clone()).collect();
+        let run=c.units.iter().find(|u|u.name=="run").unwrap();
+        let converter=c.units.iter().find(|u|u.name=="convert").unwrap();
+        assert_eq!(related(run,converter,&files),Some("callee-reference"));
     }
 
 }
