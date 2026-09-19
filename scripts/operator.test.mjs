@@ -58,10 +58,10 @@ test('MCP child inherits scope from its own environment; other client has a diff
   });
 });
 
-test('Reasonix algorithm and storage are byte-identical after removing explicit tool-routing additions',async()=>{
+test('Reasonix algorithm and storage match after checkout EOL normalization and explicit tool-routing additions',async()=>{
   const golden=JSON.parse(await readFile(new URL('./operator-reasonix-baseline.json',import.meta.url),'utf8'));
   for(const [file,expected] of Object.entries(golden)){
-    let text=await readFile(new URL(`../${file}`,import.meta.url),'utf8');
+    let text=(await readFile(new URL(`../${file}`,import.meta.url),'utf8')).replaceAll('\r\n','\n');
     if(file.endsWith('.mjs')) {
       text=text.replaceAll(', operatorScope: request.operatorScope','').replaceAll(', operatorScope: request?.operatorScope','');
       text=text.replace('${request?.operatorScope ? `\\0${request.operatorScope}` : ""}','');
