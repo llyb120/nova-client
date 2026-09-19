@@ -1,0 +1,90 @@
+name: Native GUI and session replay corrected adapter
+on:
+  push:
+    branches: [test/operator-native-gui-20260919]
+    paths: [.github/workflows/operator-native-retest.yml]
+permissions:
+  contents: read
+  actions: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          name: operator-native-build
+          path: native-build
+          run-id: 35446578925
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-ubuntu-24.04
+          path: polaris-build
+          run-id: 35434961064
+          github-token: ${{ github.token }}
+      - name: Install isolated actual GUI dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libwebkit2gtk-4.1-0 libayatana-appindicator3-1 librsvg2-2 libpipewire-0.3-0 libgbm1 libxdo3 libxtst6 xvfb openbox dbus-x11
+          npm install --prefix bench/operator-gui-deps --no-package-lock --ignore-scripts playwright@1.55.1
+          bench/operator-gui-deps/node_modules/.bin/playwright install --with-deps chromium
+          chmod +x native-build/nova-operator-gui-harness polaris-build/bench/polaris-harness/target/release/polaris-harness
+          echo "OPERATOR_GUI_EXE=$GITHUB_WORKSPACE/native-build/nova-operator-gui-harness" >> "$GITHUB_ENV"
+          echo "POLARIS_REPLAY_BINARY=$GITHUB_WORKSPACE/polaris-build/bench/polaris-harness/target/release/polaris-harness" >> "$GITHUB_ENV"
+      - name: Restore the identical historical source corpus without evaluation reports
+        run: |
+          mkdir -p validation
+          git clone --quiet --filter=blob:none https://github.com/llyb120/nova-client.git "$RUNNER_TEMP/polaris-source"
+          cd "$RUNNER_TEMP/polaris-source"
+          git checkout --quiet --detach 22e3cf0fb55537ca6c93b68126c2c737794d783d
+          echo "OPERATOR_REPLAY_CORPUS=$PWD" >> "$GITHUB_ENV"
+          git show -s --format=fuller HEAD > "$GITHUB_WORKSPACE/validation/replay-snapshot.txt"
+          python3 - <<'PY'
+          import pathlib,re
+          removed=[]
+          for p in pathlib.Path('.').rglob('*'):
+              if '.git' in p.parts or not p.is_file():continue
+              if p.parts[0] in ('bench','.github') or re.search(r'report|eval|replay|ab-results|cases\.json',str(p),re.I):
+                  removed.append(str(p));p.unlink()
+          pathlib.Path('/tmp/replay-excluded.txt').write_text('\n'.join(removed))
+          PY
+          cp /tmp/replay-excluded.txt "$GITHUB_WORKSPACE/validation/replay-excluded.txt"
+      - name: Check test adapters and stage ephemeral credential receiver
+        run: |
+          node --check scripts/operator-real-json-transport.mjs
+          node --check scripts/operator-native-credential.mjs
+          node scripts/operator-native-credential.mjs prepare
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operator-native-retest-public-recipient
+          path: operator-native-public-recipient.json
+          retention-days: 1
+      - name: Execute real controls, then original session prefix replay
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          dbus-run-session -- xvfb-run -a -s '-screen 0 1280x960x24' bash -c 'openbox >/tmp/openbox-retest.log 2>&1 & node scripts/operator-native-credential.mjs run' 2>&1 | tee validation/live-progress.log
+      - name: Verify metadata and destroy ephemeral secret material
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/operator-native-credential"
+          mkdir -p validation
+          git rev-parse HEAD > validation/tested-commit.txt
+          sha256sum src-tauri/src/operator/core.rs src-tauri/src/operator/runtime.rs src-tauri/src/native_browser.rs src-tauri/src/jianlai.rs src-tauri/src/lyra/reasonix.rs > validation/production-hashes.txt
+          cp scripts/operator-native-gui-ab.mjs scripts/polaris-session-replay.mjs scripts/operator-real-json-transport.mjs validation/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: actual-native-gui-and-polaris-retest-results
+          path: validation/
+          retention-days: 7
