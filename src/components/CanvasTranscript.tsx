@@ -1,3 +1,4 @@
+import { TranscriptImages, promptImageSource, type ImageDimensions } from "../historyImages";
 import { processSegments, processSummary, processLiveLines, splitTurnBody } from "../processDisplay";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { message } from "@tauri-apps/plugin-dialog";
@@ -26,7 +27,11 @@ import { fmtDuration, fmtTokens, turnAvgTokensPerSec, turnTokenTitle } from "./T
 
 // ─── Public interface ────────────────────────────────────────────────────────
 
+export interface TranscriptAnchor { itemId: number; kind: string; offset: number; groupOffset?: number; lastItemId?: number; occurrence?: number }
 export interface CanvasTranscriptHandle {
+  captureAnchor(): TranscriptAnchor | null;
+  restoreAnchor(anchor: TranscriptAnchor): void;
+  imageStats(): ReturnType<TranscriptImages['stats']>;
   scrollToBottom(): void;
   scrollToGroup(index: number): void;
   scrollBy(delta: number): void;
@@ -38,6 +43,8 @@ export interface CanvasTranscriptHandle {
 }
 
 interface CanvasTranscriptProps {
+  /** Changes on branch replacement/resend even when item IDs are reused. */
+  revision?: string;
   threadId: string | null;
   groups: Group[];
   permissions: PermissionRequest[];
@@ -49,6 +56,8 @@ interface CanvasTranscriptProps {
   onScroll?: (top: number, max: number, user: boolean) => void;
   /** 详情开合从 pointerup 吸底流程中退出，避免 click 前滚动导致命中项变化。 */
   onBrowseDetail?: () => void;
+  onInspectItem?: (item: Item) => void;
+  onOpenImage?: (source: string) => void;
   ref?: (handle: CanvasTranscriptHandle) => void;
 }
 
@@ -428,13 +437,9 @@ const BUBBLE_IMG_MAX_H = 180;
 const BUBBLE_IMG_GAP = 6;
 const BUBBLE_IMG_MARGIN_BOTTOM = 6;
 
-function promptImageSrc(img: PromptImage): string {
-  return img.data
-    ? `data:${img.mimeType};base64,${img.data}`
-    : convertFileSrc(decodeURI((img.uri ?? "").replace(/^file:\/\/+/, "")));
-}
+function promptImageSrc(img: PromptImage): string { return promptImageSource(img); }
 
-function bubbleImageSize(el: HTMLImageElement | null | undefined, maxW = BUBBLE_IMG_MAX_W): { w: number; h: number } {
+function bubbleImageSize(el: ImageDimensions | null | undefined, maxW = BUBBLE_IMG_MAX_W): { w: number; h: number } {
   const nw = el?.naturalWidth ?? 0;
   const nh = el?.naturalHeight ?? 0;
   if (!nw || !nh) return { w: Math.min(160, Math.round(maxW)), h: 120 };
@@ -450,7 +455,7 @@ interface BubbleImageLayout {
 function layoutBubbleImages(
   images: PromptImage[] | undefined,
   maxInnerW: number,
-  load: (img: PromptImage) => HTMLImageElement | null,
+  load: (img: PromptImage) => ImageDimensions | null,
 ): { layouts: BubbleImageLayout[]; usedW: number; stackH: number; imgMaxW: number } {
   const layouts: BubbleImageLayout[] = [];
   let usedW = 0;
@@ -1138,6 +1143,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let heightWidth = 0;
   let laidOutStart = 0, laidOutEnd = 0;
   let jumpGroup: number | null = null;
+  let pendingAnchor: TranscriptAnchor | null = null;
   // 流式输出复用提示词换行；限制已访问消息数，避免保留所有历史展开文本。
   const userTextLayouts = new LruMap<UserItem, {
     text: string; width: number; viewWidth: number; font: string; threadId: string | null;
@@ -1145,6 +1151,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }>(16);
   let layoutGeneration = 0;
   let renderedThreadId = props.threadId;
+  let renderedRevision = props.revision;
+  let renderedGroups = props.groups;
   let waitingForInitialSnapshot = props.loading && props.groups.length === 0;
 
   // selection state
@@ -1180,8 +1188,20 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   // group Y positions for scrollToGroup
   let groupYs: number[] = [];
 
+  function captureVisibleAnchor(): TranscriptAnchor | null {
+    const visible = blocks.filter(b => b.id >= 0 && b.y + b.h > scrollY && b.y < scrollY + viewH);
+    const first = visible[0];
+    return first ? { itemId: first.id, kind: first.kind, offset: scrollY - first.y,
+      groupOffset: scrollY - (groupYs[first.groupIdx] ?? first.y), lastItemId: visible.at(-1)!.id,
+      occurrence: blocks.slice(0, blocks.indexOf(first)).filter(b => b.id === first.id && b.kind === first.kind).length } : null;
+  }
+
   // images cache
-  const imgCache = new Map<string, HTMLImageElement>();
+  const images = new TranscriptImages(dimensionsChanged => {
+    if (disposed) return;
+    if (dimensionsChanged) scheduleRebuild();
+    else requestPaint();
+  });
 
   // ─── Layout ────────────────────────────────────────────────────────────────
 
@@ -1293,8 +1313,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     // ponytail: 未访问组使用 240px 估高；滚动时实测并保留锚点，需精确滚动条时可持久化高度。
     const offsets = [24];
     for (const group of groups) offsets.push(offsets.at(-1)! + (groupHeights.get(group) ?? 240));
-    const anchor = Math.min(groups.length - 1, jumpGroup ?? groupAtY(groupYs.length ? groupYs : offsets, scrollY + 32));
-    const anchorOffset = jumpGroup != null ? -20 : scrollY - (groupYs[anchor] ?? offsets[anchor]);
+    const pendingGroup = pendingAnchor ? groups.findIndex(g =>
+      g.user?.id === pendingAnchor!.itemId || g.turn?.id === pendingAnchor!.itemId || g.body.some(i => i.id === pendingAnchor!.itemId)) : -1;
+    const anchor = Math.min(groups.length - 1, pendingGroup >= 0 ? pendingGroup : jumpGroup ?? groupAtY(groupYs.length ? groupYs : offsets, scrollY + 32));
+    // Prepending changes group indices: old groupYs[anchor] describes a
+    // different message. Lay out the requested group before restoring its block.
+    const anchorOffset = pendingGroup >= 0 ? pendingAnchor!.groupOffset ?? 0 : jumpGroup != null ? -20 : scrollY - (groupYs[anchor] ?? offsets[anchor]);
     const top = keepBottom ? Math.max(0, offsets.at(-1)! + 16 - viewH)
       : offsets[anchor] + Math.min(anchorOffset, offsets[anchor + 1] - offsets[anchor] - 1);
     const range = visibleGroupRange(offsets, top, viewH);
@@ -1334,7 +1358,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             : sourceText;
           // DOM .bubble-images: flex-wrap, img max 240×180, gap 6, margin-bottom 6
           const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH, imgMaxW } =
-            layoutBubbleImages(item.images, maxBubble - 32, loadImage);
+            layoutBubbleImages(item.images, maxBubble - 32,
+              image => images.dimensions(promptImageSrc(image)));
           // Size to content like DOM (no artificial min-width that leaves empty bubble space).
           const lh = 14 * 1.6;
           let textLayout = userTextLayouts.get(item);
@@ -1370,13 +1395,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             _lineWidths: full.widths,
             data: { images: item.images, editItem: item, imageLayouts, imgMaxW } });
 
-          if (longText) {
+          if (longText || item.detailDeferred) {
             const toggle: Block = { kind: "fold", id: item.id, groupIdx: gi,
               x: bx, y: y + bubbleH + 4, w: Math.max(1, bubbleW - 32), h: 28,
-              text: open ? "收起长提示词" : `展开完整提示词（${fmtTokens(sourceText.length)} 字符）`,
+              text: item.detailDeferred ? "预览已截断 · 查看完整提示词" : open ? "收起长提示词" : `展开完整提示词（${fmtTokens(sourceText.length)} 字符）`,
               color: p.dim, fontSize: 13, font: p.sans, cursor: "pointer",
               hoverBg: p.hover, borderRadius: 6, data: { open, foldKey, userText: true },
               clickAction: () => {
+                if (item.detailDeferred) { props.onInspectItem?.(item); return; }
                 const next = !state.expanded[foldKey];
                 toggle.text = next ? "正在展开…（点击取消）" : `展开完整提示词（${fmtTokens(sourceText.length)} 字符）`;
                 requestPaint();
@@ -1388,7 +1414,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               data: { alwaysVisible: true },
               cursor: "pointer", title: "复制完整提示词", hoverBg: p.hover, borderRadius: 6,
               clickAction: () => {
-                void navigator.clipboard.writeText(item.text).then(() => {
+                void fullUserItem(item).then(value => navigator.clipboard.writeText(value.text)).then(() => {
                   copiedCodeUntil.set(`user-${item.id}`, performance.now() + 1200);
                   requestPaint();
                 }).catch(error => void message(String(error), { kind: "error" }));
@@ -1403,19 +1429,29 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               x: bx - 52, y: y + bubbleH - 26 - 4, w: 24, h: 24,
               hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
               hoverKey: `user-${item.id}`, title: "原样重发此消息",
-              clickAction: () => { void editUserMessage(item.id, item.text, item.images ?? []); } });
+              clickAction: () => {
+                const threadId = props.threadId, revision = props.revision;
+                void fullUserItem(item).then(value => {
+                  if (!disposed && props.threadId === threadId && props.revision === revision)
+                    return editUserMessage(value.id, value.text, value.images ?? []);
+                }).catch(error => void message(String(error), { kind: "error" }));
+              } });
             result.push({ kind: "edit-btn", id: item.id, groupIdx: gi,
               x: bx - 28, y: y + bubbleH - 26 - 4, w: 24, h: 24,
               hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
               hoverKey: `user-${item.id}`,
               clickAction: () => {
-                setDraft(item.text);
-                editAttachments.set(item.images ?? []);
-                editLayoutH = estimateEditHeight(item.text, item.images?.length ?? 0);
-                setEditing(item);
+                const threadId = props.threadId, revision = props.revision;
+                void fullUserItem(item).then(value => {
+                  if (props.threadId !== threadId || props.revision !== revision || disposed) return;
+                  setDraft(value.text);
+                  editAttachments.set(value.images ?? []);
+                  editLayoutH = estimateEditHeight(value.text, value.images?.length ?? 0);
+                  setEditing(value);
+                }).catch(error => void message(String(error), { kind: "error" }));
               } });
           }
-          y += bubbleH + (longText ? 36 : 0);
+          y += bubbleH + (longText || item.detailDeferred ? 36 : 0);
           setBottom(16); // bottom margin
         } else {
           editLayoutY = y;
@@ -1541,15 +1577,21 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     flushBottom();
     if (disposed || generation !== layoutGeneration || props.threadId !== threadId) return false;
+    if (pendingAnchor && scrollY !== scrollBefore) {
+      // The user moved during an async layout. Keep their CURRENT anchor and
+      // retry, rather than snapping back to the pre-layout reading position.
+      pendingAnchor = captureVisibleAnchor();
+      layoutPending = true;
+      return false;
+    }
     groupYs = nextGroupYs;
     // 虚拟窗口前移后 block 下标变化，选区按组内位置迁移，不能误复制另一轮的文字。
     const remapBlock = (index: number) => {
       const old = blocks[index];
       if (!old) return -1;
-      const start = result.findIndex(block => block.groupIdx === old.groupIdx);
-      if (start < 0) return -1;
-      const next = start + index - blocks.findIndex(block => block.groupIdx === old.groupIdx);
-      return result[next]?.id === old.id && result[next]?.kind === old.kind ? next : -1;
+      const occurrence = blocks.slice(0, index).filter(block => block.id === old.id && block.kind === old.kind).length;
+      let seen = 0;
+      return result.findIndex(block => block.id === old.id && block.kind === old.kind && seen++ === occurrence);
     };
     if (selection) {
       const startBlock = remapBlock(selection.startBlock), endBlock = remapBlock(selection.endBlock);
@@ -1562,23 +1604,19 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
     blocks = result;
     totalHeight = y + 16;
-    // 已离开缓冲区的图片不再占用解码内存；同屏图片数不设硬上限，避免 LRU 反复加载。
-    const imageSources = new Set<string>();
-    for (const block of result) {
-      if (block.kind === "generated-image") imageSources.add(String(block.data?.src));
-      if (block.kind === "user-bubble") {
-        for (const image of (block.data?.images as PromptImage[] | undefined) ?? []) {
-          if (image.mimeType.startsWith("image/")) imageSources.add(promptImageSrc(image));
-        }
-      }
-    }
-    for (const source of imgCache.keys()) if (!imageSources.has(source)) imgCache.delete(source);
 
     for (const [group, height] of measured) groupHeights.set(group, height);
     if (!keepBottom && scrollY === scrollBefore && nextGroupYs[anchor] != null) {
       const height = (nextGroupYs[anchor + 1] ?? y) - nextGroupYs[anchor];
       scrollY = Math.max(0, nextGroupYs[anchor] + Math.min(anchorOffset, height - 1));
       jumpGroup = null;
+    }
+    if (pendingAnchor) {
+      const candidates = result.filter(b => b.id === pendingAnchor!.itemId && b.kind === pendingAnchor!.kind);
+      const block = candidates[pendingAnchor.occurrence ?? 0] ?? candidates[0]
+        ?? result.find(b => b.id === pendingAnchor!.itemId);
+      if (block) scrollY = Math.max(0, block.y + pendingAnchor.offset);
+      pendingAnchor = null;
     }
     laidOutStart = range.start;
     laidOutEnd = range.end;
@@ -1640,6 +1678,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     proseOff: number, contentW: number, proseW: number, y: number, active: boolean): number {
     const p = pal;
     const x = pad + proseOff;
+    if (item.detailDeferred) {
+      result.push({ kind: "hint", id: item.id, groupIdx: gi, x, y, w: proseW, h: 28,
+        text: "预览已截断 · 查看完整消息", color: p.accent, fontSize: 12, font: p.sans,
+        cursor: "pointer", hoverBg: p.hover, borderRadius: 5,
+        clickAction: () => props.onInspectItem?.(item) });
+      y += 32;
+    }
 
     if (item.type === "thought") {
       // .msg-thought: margin 6px 0
@@ -1725,13 +1770,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const src = transcriptImageSrc(mb.raw ?? "");
           const path = localImagePath(mb.raw ?? "");
           if (src) {
-            loadImageSource(src);
             result.push({ kind: "generated-image", id: item.id, groupIdx: gi,
               x, y, w: Math.min(proseW, 480), h: 300, title: segmentsPlainText(mb.segments),
-              data: { src, filePath: path }, cursor: path ? "pointer" : undefined,
-              clickAction: path ? () => {
-                if (props.threadId) openInEditor(path);
-              } : undefined });
+              data: { src, filePath: path }, cursor: "pointer",
+              clickAction: () => {
+                if (props.onOpenImage) props.onOpenImage(src);
+                else if (path && props.threadId) openInEditor(path);
+              } });
             y += 310;
           }
         } else if (mb.type === "hr") {
@@ -1925,7 +1970,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
       // content: .tool-output padding 10px; line-height 1.55; max-height 320
       for (const content of contentBlocks) {
-        if (content.type === "diff") {
+        const image = content.type === "content" ? (content as { content?: { type?: string; uri?: string; data?: string; mimeType?: string } }).content : content;
+        if (image?.type === "image" && (typeof image.uri === "string" || typeof image.data === "string")) {
+          const src = typeof image.uri === "string" ? image.uri : `data:${image.mimeType || "image/png"};base64,${image.data}`;
+          result.push({ kind: "generated-image", id: item.id, groupIdx: gi,
+            x: contentX, y: by, w: Math.min(contentW, 480), h: 300, data: { src }, cursor: "pointer",
+            clickAction: () => props.onOpenImage?.(src) });
+          by += 310;
+        } else if (content.type === "diff") {
           const diff = content as { type: "diff"; path: string; oldText?: string | null; newText: string };
           // 与 DOM DiffView 一致：diff 上方显示文件路径，点击打开编辑器、右键弹文件菜单
           result.push({ kind: "tool-diff-path", id: item.id, groupIdx: gi,
@@ -2025,6 +2077,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.textRendering = "optimizeLegibility";
     ctx.fontKerning = "normal";
 
+    images.beginFrame();
     const visTop = scrollY - 50;
     const visBot = scrollY + viewH + 50;
     spinPhase = (performance.now() / 800) % 1;
@@ -2120,7 +2173,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const image = loadImageSource(String(b.data?.src ?? ""));
           if (image) {
             const scale = Math.min(b.w / image.naturalWidth, b.h / image.naturalHeight, 1);
-            ctx.drawImage(image, bx, by, image.naturalWidth * scale, image.naturalHeight * scale);
+            ctx.drawImage(image.drawable, bx, by, image.naturalWidth * scale, image.naturalHeight * scale);
           } else {
             ctx.font = `14px ${p.sans}`;
             ctx.fillStyle = p.dim;
@@ -2175,6 +2228,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     // scrollbar
     if (maxScroll > 0) paintScrollbar(ctx);
 
+    images.endFrame();
     scheduleBusyPaint();
   }
 
@@ -2217,6 +2271,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const imageLayouts = (b.data?.imageLayouts as BubbleImageLayout[] | undefined) ?? [];
     const imgMaxW = (b.data?.imgMaxW as number | undefined) ?? BUBBLE_IMG_MAX_W;
     for (const layout of imageLayouts) {
+      // A huge multi-image bubble is one visible group, but only the actual
+      // visible image rectangles may enter the decode queue.
+      if (by + layout.dy + layout.h < -80 || by + layout.dy > viewH + 80) continue;
       const cached = loadImage(layout.img);
       if (!cached) continue;
       // 旧占位布局不能混用真实尺寸；等气泡、换行和文字位置一起重排后再绘制。
@@ -2230,7 +2287,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       ctx.save();
       roundRect(ctx, ix, iy, size.w, size.h, 10);
       ctx.clip();
-      ctx.drawImage(cached, ix, iy, size.w, size.h);
+      ctx.drawImage(cached.drawable, ix, iy, size.w, size.h);
       ctx.restore();
     }
 
@@ -3420,6 +3477,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
     const idx = hitTest(e.clientX, e.clientY);
     const b = idx >= 0 ? blocks[idx] : null;
+    if (b?.kind === "user-bubble" && props.onOpenImage) {
+      const rect = canvasEl.getBoundingClientRect();
+      const x = e.clientX - rect.left - b.x, y = e.clientY - rect.top + scrollY - b.y;
+      const image = ((b.data?.imageLayouts as BubbleImageLayout[]) ?? []).find(i => x >= i.dx && x <= i.dx + i.w && y >= i.dy && y <= i.dy + i.h);
+      if (image) { props.onOpenImage(promptImageSrc(image.img)); return; }
+    }
+
     if (b?.clickAction && !selecting) {
       // Fold / thought / tool expands insert content below the header. If we were
       // stick-to-bottom, rebuild would pin scrollY to the new maxScroll and shove
@@ -3513,19 +3577,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // ─── Image loading ─────────────────────────────────────────────────────────
 
-  function loadImage(img: PromptImage): HTMLImageElement | null {
-    return loadImageSource(promptImageSrc(img));
-  }
-
-  function loadImageSource(src: string): HTMLImageElement | null {
-    let el = imgCache.get(src);
-    if (el) return (el as unknown as { _loaded?: boolean })._loaded ? el : null;
-    el = new Image();
-    (el as unknown as { _loaded?: boolean })._loaded = false;
-    el.onload = () => { (el as unknown as { _loaded?: boolean })._loaded = true; if (!disposed && imgCache.get(src) === el) scheduleRebuild(); };
-    el.src = src;
-    imgCache.set(src, el);
-    return null;
+  function loadImage(img: PromptImage) { return images.request(promptImageSrc(img)); }
+  function loadImageSource(src: string) { return images.request(src); }
+  async function fullUserItem(item: UserItem): Promise<UserItem> {
+    if (!item.detailDeferred || !props.threadId) return item;
+    const value = await api.getThreadItemDetail(props.threadId, item.id, state.history?.generation);
+    if (value.type !== "user") throw new Error("消息已变化，请重新打开会话");
+    return value;
   }
 
   // ─── Rebuild / effects ─────────────────────────────────────────────────────
@@ -3534,7 +3592,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let layoutPending = false;
   async function rebuild() {
     pal = readPalette();
-    const key = `${props.threadId}|${viewW}|${viewH}|${pal.bg}|${pal.text}|${props.running}|${expandedRevision()}|${editing()?.id ?? ""}|${keepBottom ? "bottom" : scrollY}`;
+    const key = `${props.threadId}|${props.revision ?? ""}|${viewW}|${viewH}|${pal.bg}|${pal.text}|${props.running}|${expandedRevision()}|${editing()?.id ?? ""}|${keepBottom ? "bottom" : scrollY}`;
     // 流式 delta/reveal 合并到下一次排版，不能反复取消尚未完成的历史重排。
     // 切会话、改宽度、主题和用户开合仍立即取代旧任务。
     if (activeLayout?.key === key && activeLayout.generation === layoutGeneration) {
@@ -3734,7 +3792,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     canvasEl.addEventListener("copy", onCopy);
 
     props.ref?.({
-      scrollToBottom() { jumpGroup = null; keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
+      captureAnchor: captureVisibleAnchor,
+      restoreAnchor(anchor) {
+        pendingAnchor = anchor; keepBottom = false; jumpGroup = null;
+        ++layoutGeneration;
+        scheduleRebuild(false, true);
+      },
+      imageStats() { return images.stats(); },
+      scrollToBottom() { pendingAnchor = null; jumpGroup = null; keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
       scrollToGroup(idx) { if (props.groups[idx]) { jumpGroup = idx; scrollY = Math.max(0, Math.min(maxScroll, (groupYs[idx] ?? 24 + idx * 240) - 20)); keepBottom = false; applyEditStyle(); paintAll(); scheduleRebuild(false, true); props.onScroll?.(scrollY, maxScroll, false); } },
       scrollBy(delta) { applyScrollY(scrollY + delta, true); },
       isAtBottom() { return maxScroll - scrollY <= 2; },
@@ -3750,6 +3815,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     onCleanup(() => {
       disposed = true;
+      images.clear();
       ro.disconnect();
       mo.disconnect();
       if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
@@ -3802,15 +3868,26 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     void props.emptyHint;
     void editing()?.id;
     const switchedThread = threadId !== renderedThreadId;
-    const warmSwitch = switchedThread && groups.length > 0;
+    const resetContent = switchedThread || props.revision !== renderedRevision;
+    const firstId = (values: Group[]) => values[0]?.user?.id ?? values[0]?.body[0]?.id ?? values[0]?.turn?.id;
+    const windowMoved = !resetContent && firstId(groups) !== firstId(renderedGroups);
+    if (!resetContent && groups !== renderedGroups && !keepBottom && !scrollLock && jumpGroup == null && !pendingAnchor)
+      pendingAnchor = captureVisibleAnchor();
+    if (windowMoved) ++layoutGeneration;
+    renderedGroups = groups;
+    const warmSwitch = resetContent && groups.length > 0;
     if (switchedThread) waitingForInitialSnapshot = groups.length === 0;
     // 缓存未命中时会先以空 items 进入 loading，再在同一 threadId 下提交快照；
     // 这次首个非空快照也属于已有内容，不能按新 delta 从空串重放。
     const loadedInitialSnapshot = waitingForInitialSnapshot && groups.length > 0;
     if (loadedInitialSnapshot) waitingForInitialSnapshot = false;
-    if (switchedThread) {
+    if (resetContent) {
       renderedThreadId = threadId;
+      renderedRevision = props.revision;
       layoutGeneration++;
+      groupHeights = new WeakMap();
+      for (const key of userTextLayouts.keys()) userTextLayouts.delete(key);
+      blockScrolls.clear();
       scrollLock = null;
       shownText.clear();
       targetText.clear();
@@ -3822,7 +3899,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       selecting = false;
       selStart = null;
       groupYs = [];
-      imgCache.clear();
+      images.clear();
+      pendingAnchor = null;
       laidOutStart = laidOutEnd = 0;
       jumpGroup = null;
       keepBottom = true;
@@ -3840,9 +3918,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       // hit testing already uses the cleared blocks, so old content is not interactive.
       if (canvasEl && !warmSwitch) paintAll();
     }
-    syncRevealTargets(switchedThread || loadedInitialSnapshot || !revealsInitialized);
+    syncRevealTargets(resetContent || windowMoved || loadedInitialSnapshot || !revealsInitialized);
     revealsInitialized = true;
-    scheduleRebuild(switchedThread && !warmSwitch, switchedThread || loadedInitialSnapshot);
+    scheduleRebuild(resetContent && !warmSwitch, resetContent || windowMoved || loadedInitialSnapshot);
   });
 
   let expandedEffectThreadId = props.threadId;

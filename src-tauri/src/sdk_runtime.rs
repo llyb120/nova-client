@@ -454,9 +454,8 @@ impl SdkManager {
     }
 
     pub async fn cancel(&self, thread_id: &str) {
-        if self.is_running(thread_id) {
-            self.push_system(thread_id, "已停止当前任务。".into(), "warn");
-        }
+        let was_running = self.is_running(thread_id);
+        // Signal the live task before touching history or emitting a log item.
         let bridge = self
             .running_children
             .lock()
@@ -503,6 +502,7 @@ impl SdkManager {
                 store.save_thread(&thread_id);
             }
         }
+        if was_running { self.push_system(thread_id, "已停止当前任务。".into(), "warn"); }
         self.finish_turn(thread_id, "cancelled", None);
     }
 
@@ -1648,10 +1648,8 @@ impl SdkManager {
         };
         let mut update = Some(json!({ "t": "upsert", "item": item }));
         if existing.is_some() {
-            if let Some(slot) = thread
-                .items
-                .iter_mut()
-                .find(|candidate| candidate.id() == id)
+            if let Some(slot) = thread.items.iter().position(|candidate| candidate.id() == id)
+                .and_then(|index| thread.items.get_mut(index))
             {
                 let mut item = item;
                 if let (Item::Tool { ts: started_at, .. }, Item::Tool { ts, call, .. }) =
@@ -2072,7 +2070,12 @@ fn set_tool_duration(call: &mut ToolCall, duration_ms: u64) {
 fn complete_pending_tools(thread: &mut crate::threads::Thread) -> Vec<Item> {
     let mut changed = Vec::new();
     let finished_at = now_ms();
-    for item in &mut thread.items {
+    // Inspect immutable history first: completing one live tool must not copy
+    // every historical chunk merely because iter_mut visited it.
+    let pending: Vec<usize> = thread.items.iter().enumerate().filter_map(|(index,item)|
+        matches!(item, Item::Tool { call, .. } if call.status == "pending" || call.status == "in_progress").then_some(index)).collect();
+    for index in pending {
+        let item = &mut thread.items[index];
         let Item::Tool { ts, call, .. } = item else {
             continue;
         };

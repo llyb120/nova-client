@@ -1,3 +1,6 @@
+import { buildTimelineGraph, EMPTY_TIMELINE, visibleTimeline, type TimelineNode } from "../timelineGraph";
+import type { HistoryOutline } from "../historyTypes";
+import { HistoryDetails, HistoryImagePreview } from "./HistoryDetails";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, lazy, onCleanup, onMount, Show, Suspense, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
@@ -11,6 +14,8 @@ import {
   deleteThread,
   markThreadSwitchPointerDown,
   openThread,
+  loadHistoryPage,
+  historyResetRevision,
   pickThreadModel,
   refreshThreads,
   sendPrompt,
@@ -64,6 +69,7 @@ export function ChatView() {
   });
   let scrollQueued = false;
   let lastScrollTop = 0;
+  let historyScrollDirection: "before" | "after" | null = null;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -80,7 +86,7 @@ export function ChatView() {
   );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
   const timeStops = createMemo(() => {
-    let turn = 0;
+    let turn = previewItems() ? 0 : state.history?.turnOffset ?? 0;
     return groups().flatMap((group, index) => {
       if (!group.user) return [];
       turn++;
@@ -105,14 +111,18 @@ export function ChatView() {
   };
 
   const travelTo = (index: number) => {
+    historyScrollDirection = null;
     cancelBottomFollow();
     transcriptRef?.scrollToGroup(index);
     syncTimeCursor();
   };
 
   const returnToNow = () => {
-    enableBottomFollow();
-    setActiveTimeIndex(latestTimeIndex());
+    historyScrollDirection = null;
+    setState("historyFollowing", true);
+    if (!previewItems() && state.history?.afterCursor) {
+      void loadHistoryPage("latest").then(ok => { if (ok) { enableBottomFollow(); setActiveTimeIndex(latestTimeIndex()); } });
+    } else { enableBottomFollow(); setActiveTimeIndex(latestTimeIndex()); }
   };
 
   const isAtBottom = () => transcriptRef?.isAtBottom() ?? true;
@@ -141,6 +151,9 @@ export function ChatView() {
   // 覆盖落位，求和天然不会重复累计；世界线预览（previewItems）或恢复切换后
   // items 被整体替换，总量随之指向所预览/所在的那条分支。
   const tokenStats = createMemo(() => {
+    const stats = !previewItems() ? state.history?.stats : null;
+    if (stats) return { total: stats.totalTokens, read: Math.max(0, stats.inputTokens - stats.cacheReadTokens - stats.cacheWriteTokens),
+      output: stats.outputTokens, cacheRead: stats.cacheReadTokens, cacheWrite: stats.cacheWriteTokens };
     let total = 0;
     let read = 0;
     let output = 0;
@@ -254,6 +267,7 @@ export function ChatView() {
   createEffect((prevId: string | null | undefined) => {
     const id = state.currentId;
     if (id !== prevId) {
+      historyScrollDirection = null;
       enableBottomFollow();
       setActiveTimeIndex(latestTimeIndex());
     }
@@ -270,7 +284,12 @@ export function ChatView() {
   createEffect(() => {
     const tick = chatScrollToBottomSignal();
     if (tick === 0) return;
-    enableBottomFollow();
+    // Only a new send signal authorizes jumping to the latest page. Do not
+    // subscribe this effect to pagination metadata after the first send.
+    untrack(() => {
+      if (state.history?.afterCursor) returnToNow();
+      else enableBottomFollow();
+    });
   });
 
   const [editing, setEditing] = createSignal(false);
@@ -297,17 +316,39 @@ export function ChatView() {
   });
 
 
+  const [outline, setOutline] = createSignal<HistoryOutline | null>(null);
+  const [timelineError, setTimelineError] = createSignal("");
+  let timelineRequest = 0, outlineRequest = 0, timelineLoadedKey = "", outlineLoadedKey = "";
   createEffect(() => {
+    state.currentId;
+    setTimeline(null); setOutline(null); setTimelineError("");
+    setPreviewItems(null); setPreviewCheckpointId(null); setTimeMachineEditTarget(null);
+    timelineLoadedKey = outlineLoadedKey = "";
+    timelineRequest++; outlineRequest++;
+  });
+  createEffect(() => {
+    if (!timeMachineExpanded() || workspaceOpen()) return;
     const threadId = state.currentId;
-    void timeMachineChangedSignal();
-    setTimeline(null);
-    setPreviewItems(null);
-    setPreviewCheckpointId(null);
-    setTimeMachineEditTarget(null);
     if (!threadId) return;
-    void api.getTimeMachineTimeline(threadId).then((value) => {
-      if (state.currentId === threadId) setTimeline(value);
-    }).catch(() => {});
+    const key = `${threadId}:${timeMachineChangedSignal()}`;
+    if (key === timelineLoadedKey) return;
+    const request = ++timelineRequest;
+    void api.getTimeMachineTimeline(threadId).then(value => {
+      if (state.currentId !== threadId || request !== timelineRequest) return;
+      timelineLoadedKey = key; setTimeline(value);
+    }).catch(error => { if (request === timelineRequest) setTimelineError(String(error)); });
+  });
+  createEffect(() => {
+    if (!timeMachineExpanded() || workspaceOpen()) return;
+    const threadId = state.currentId;
+    if (!threadId) return;
+    const key = `${threadId}:${state.history?.generation ?? "initial"}:${state.history?.stats.users ?? 0}:${timeMachineChangedSignal()}`;
+    if (key === outlineLoadedKey) return;
+    const request = ++outlineRequest;
+    void api.getThreadOutline(threadId).then(value => {
+      if (state.currentId !== threadId || request !== outlineRequest) return;
+      outlineLoadedKey = key; setOutline(value);
+    }).catch(error => { if (request === outlineRequest) setTimelineError(String(error)); });
   });
 
   const currentMeta = createMemo(() =>
@@ -453,153 +494,16 @@ export function ChatView() {
     setEditing(true);
   };
 
-  type GraphNode = {
-    id: string;
-    checkpoint: TimeMachineCheckpoint | null;
-    previewCheckpoint: TimeMachineCheckpoint | null;
-    promptCount: number;
-    currentPromptIndex: number | null;
-    branchPrompts: TimeMachinePrompt[];
-    title: string;
-    x: number;
-    y: number;
-    current: boolean;
-    onCurrentPath: boolean;
-  };
-  type PromptTreeNode = Omit<GraphNode, "x" | "y"> & { children: PromptTreeNode[] };
+  type GraphNode = TimelineNode;
   type ContextDeleteMode = "to-start" | "up" | "self" | "down" | "to-end";
   const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number; node: GraphNode } | null>(null);
   const timelineGraph = createMemo(() => {
-    const checkpoints = timeline()?.checkpoints ?? [];
-    const root: PromptTreeNode = {
-      id: "__time_root__",
-      checkpoint: null,
-      previewCheckpoint: null,
-      promptCount: 0,
-      currentPromptIndex: null,
-      branchPrompts: [],
-      title: "会话开始",
-      current: false,
-      onCurrentPath: true,
-      children: [],
-    };
-    const insertPath = (
-      prompts: Array<{ id: number; text: string }>,
-      checkpoint: TimeMachineCheckpoint | null,
-      current: boolean,
-    ): PromptTreeNode => {
-      let parent = root;
-      if (prompts.length === 0 && checkpoint) {
-        root.checkpoint = checkpoint;
-        root.previewCheckpoint = checkpoint;
-      }
-      prompts.forEach((prompt, index) => {
-        const key = `${prompt.id}:${prompt.text}`;
-        let node = parent.children.find((child) => child.id === `${parent.id}/${key}`);
-        if (!node) {
-          node = {
-            id: `${parent.id}/${key}`,
-            checkpoint: null,
-            previewCheckpoint: checkpoint,
-            promptCount: index + 1,
-            currentPromptIndex: null,
-            branchPrompts: prompts,
-            title: prompt.text.trim() || `第 ${index + 1} 条提示词`,
-            current: false,
-            onCurrentPath: false,
-            children: [],
-          };
-          parent.children.push(node);
-        }
-        if (!node.previewCheckpoint && checkpoint) node.previewCheckpoint = checkpoint;
-        if (checkpoint && !current) node.branchPrompts = prompts;
-        if (current) {
-          node.onCurrentPath = true;
-          node.currentPromptIndex = index;
-          node.branchPrompts = prompts;
-        }
-        parent = node;
-      });
-      if (checkpoint && prompts.length > 0) parent.checkpoint = checkpoint;
-      return parent;
-    };
-    for (const checkpoint of checkpoints) insertPath(checkpoint.prompts, checkpoint, false);
-    const currentPrompts = state.items.flatMap((item) =>
-      item.type === "user" ? [{ id: item.id, text: item.text }] : [],
-    );
-    const currentEnd = insertPath(currentPrompts, null, true);
-    currentEnd.current = true;
-
-    // 当前时间线固定占最左一列；旁支在分叉时申请列，行区间不重叠的旁支复用同一列。
-    const nodes: GraphNode[] = [];
-    const edgeIds: Array<{ from: string; to: string }> = [];
-    let maxPromptCount = currentPrompts.length;
-    const sortedChildren = (node: PromptTreeNode) =>
-      [...node.children].sort(
-        (left, right) => Number(right.onCurrentPath) - Number(left.onCurrentPath),
-      );
-    // 旁支的“主脊”：沿首个子节点一路向下的链；该列被占用的行区间即 [起点行, 主脊末端行]。
-    const spineEndRow = (node: PromptTreeNode): number => {
-      let end = node.promptCount;
-      let cursor = node;
-      for (;;) {
-        const next = sortedChildren(cursor).find((child) => !child.onCurrentPath);
-        if (!next) return end;
-        end = next.promptCount;
-        cursor = next;
-      }
-    };
-    // laneIntervals[lane] = 该列已占用的行区间；相邻区间至少空一行，避免上下分支首尾相接看似相连。
-    const laneIntervals: Array<Array<[number, number]>> = [[]];
-    const forkLane = (node: PromptTreeNode): number => {
-      const start = node.promptCount;
-      const end = spineEndRow(node);
-      for (let lane = 1; lane < laneIntervals.length; lane++) {
-        if (laneIntervals[lane].every(([s, e]) => start > e + 1 || end < s - 1)) {
-          laneIntervals[lane].push([start, end]);
-          return lane;
-        }
-      }
-      laneIntervals.push([[start, end]]);
-      return laneIntervals.length - 1;
-    };
-    const place = (node: PromptTreeNode, lane: number) => {
-      const nodeLane = node.onCurrentPath ? 0 : lane;
-      maxPromptCount = Math.max(maxPromptCount, node.promptCount);
-      nodes.push({ ...node, x: 18 + nodeLane * 26, y: 20 + (node.promptCount - 1) * 32 });
-
-      let continuedBranch = false;
-      for (const child of sortedChildren(node)) {
-        edgeIds.push({ from: node.id, to: child.id });
-        if (child.onCurrentPath) {
-          place(child, 0);
-        } else if (!node.onCurrentPath && !continuedBranch) {
-          continuedBranch = true;
-          place(child, nodeLane);
-        } else {
-          place(child, forkLane(child));
-        }
-      }
-    };
-    for (const node of sortedChildren(root)) place(node, node.onCurrentPath ? 0 : forkLane(node));
-
-    const positions = new Map(nodes.map((node) => [node.id, node]));
-    const nowY = 20 + Math.max(1, maxPromptCount) * 32;
-    const laneCount = Math.max(1, laneIntervals.length);
-    return {
-      nodes,
-      edges: edgeIds.flatMap((edge) => {
-        const from = positions.get(edge.from);
-        const to = positions.get(edge.to);
-        return from && to ? [{ from, to, current: from.onCurrentPath && to.onCurrentPath }] : [];
-      }),
-      laneCount,
-      // 左右各留约 8px（节点中心 18、半宽 10），避免图内容偏左、右侧多出一截空白
-      width: 36 + (laneCount - 1) * 26,
-      height: nowY + 28,
-    };
+    if (!timeMachineExpanded() || workspaceOpen()) return EMPTY_TIMELINE;
+    return buildTimelineGraph(timeline()?.checkpoints ?? [], outline()?.prompts ?? []);
   });
-  const timeMachineWidth = () => Math.max(64, 38 + Math.min(5, timelineGraph().laneCount) * 26);
+  const [timelineScroll, setTimelineScroll] = createSignal({ top: 0, height: 800 });
+  const timelineVisible = createMemo(() => visibleTimeline(timelineGraph(), timelineScroll().top, timelineScroll().height));
+  const timeMachineWidth = () => timeMachineExpanded() ? Math.max(64, 38 + Math.min(5, timelineGraph().laneCount) * 26) : 64;
   const switchPreview = (items: Item[] | null, checkpointId: string | null) => {
     if (previewTimer) clearTimeout(previewTimer);
     previewTimer = setTimeout(() => {
@@ -621,7 +525,7 @@ export function ChatView() {
     const threadId = state.currentId;
     if (!threadId || restoringCheckpoint()) return;
     if (node.onCurrentPath) {
-      switchPreview(itemsThroughPrompt(state.items as Item[], node.promptCount), node.id);
+      if (node.currentPromptIndex !== null) scrollToCurrentPrompt(node.currentPromptIndex);
       return;
     }
     const checkpoint = node.previewCheckpoint;
@@ -637,9 +541,14 @@ export function ChatView() {
     }
   };
   const scrollToCurrentPrompt = (promptIndex: number) => {
-    const scroll = () => {
-      const stop = timeStops()[promptIndex];
-      if (stop) travelTo(stop.index);
+    const scroll = async () => {
+      const threadId = state.currentId, prompt = outline()?.prompts[promptIndex];
+      if (!threadId || !prompt) return;
+      if (!state.items.some(item => item.id === prompt.id)) {
+        if (!await loadHistoryPage("latest", prompt.id) || state.currentId !== threadId) return;
+      }
+      const index = groups().findIndex(group => group.user?.id === prompt.id);
+      if (index >= 0) travelTo(index);
     };
     // 选择当前时间线时必须立即取消尚未完成的旁支预览。此前只有 previewItems 已经
     // 落地后才清理 target；若用户在 90ms 预览延迟内点回主线，旧请求仍会完成，
@@ -781,6 +690,23 @@ export function ChatView() {
     setState("title", title);
   };
 
+  const [detailItem, setDetailItem] = createSignal<Item | null>(null);
+  const [imageSource, setImageSource] = createSignal("");
+  createEffect(() => { state.currentId; setDetailItem(null); setImageSource(""); });
+  const imageRequest = (event: Event) => setImageSource(String((event as CustomEvent).detail || ""));
+  onMount(() => window.addEventListener("nova:history-image", imageRequest));
+  onCleanup(() => window.removeEventListener("nova:history-image", imageRequest));
+  const navigateHistory = async (direction: "before" | "after") => {
+    if (previewItems() || state.historyLoading) return;
+    const threadId = state.currentId;
+    const start = state.history?.start, end = state.history?.end;
+    cancelBottomFollow();
+    const loaded = await loadHistoryPage(direction, undefined, () => transcriptRef?.captureAnchor() ?? null);
+    if (threadId === state.currentId && (!loaded ||
+        (state.history?.start === start && state.history?.end === end))) historyScrollDirection = null;
+    // Canvas captures/restores the live message anchor when the new window
+    // arrives. Never restore an anchor captured before the asynchronous read.
+  };
   return (
     <main class="chat" style={`--time-width:${timeMachineWidth()}px`}>
       <header class="chat-head">
@@ -964,10 +890,12 @@ export function ChatView() {
 
       <div class="chat-shell">
         <div class="chat-primary">
-      <div class="chat-body">
+      <div class="chat-body history-body">
+          <Show when={state.historyError}><div class="history-load-error" role="alert">{state.historyError} <button onClick={() => state.currentId && void openThread(state.currentId)}>重新加载</button></div></Show>
           <CanvasTranscript
             ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
             threadId={state.currentId}
+            revision={`${previewCheckpointId() ?? state.history?.generation ?? ""}:${historyResetRevision()}`}
             groups={groups()}
             permissions={permissions()}
             running={isRunning() && !previewItems()}
@@ -976,14 +904,29 @@ export function ChatView() {
             onReturnToCurrent={returnToCurrentTimeline}
             onScroll={(top, max, user) => {
               if (user) {
+                if (top < lastScrollTop) historyScrollDirection = "before";
+                else if (top > lastScrollTop) historyScrollDirection = "after";
                 // 与 canvas 内部判定共用方向语义：上滚即解除吸底，下滚贴底才恢复。
-                setStickToBottom(resolveUserScrollStick(lastScrollTop, top, max));
+                const following = resolveUserScrollStick(lastScrollTop, top, max);
+                setStickToBottom(following);
+                setState("historyFollowing", following && !state.history?.afterCursor);
               }
               // user=false（rebuild 钉底/钳位）也要同步基准位置，
               // 否则下一次上滚的方向判定拿旧基准会误判为下滚。
               lastScrollTop = top;
               syncTimeCursor();
+              // Fetch several screens ahead, and re-check after a committed
+              // layout so a held wheel/key does not need a second gesture.
+              const lead = Math.max(600, window.innerHeight * 3);
+              if (!previewItems() && !state.historyLoading && !state.historyError) {
+                if (historyScrollDirection === "before" && top < lead && state.history?.beforeCursor)
+                  void navigateHistory("before");
+                else if (historyScrollDirection === "after" && max - top < lead && state.history?.afterCursor)
+                  void navigateHistory("after");
+              }
             }}
+            onInspectItem={setDetailItem}
+            onOpenImage={setImageSource}
             onBrowseDetail={cancelBottomFollow}
             emptyHint={`在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
           />
@@ -1036,13 +979,15 @@ export function ChatView() {
             </button>
             <Show when={restoringCheckpoint()}><span class="repo-time-toggle-label" role="status">跳转中…</span></Show>
           </div>
-          <div class="repo-time-machine-track">
+          <div class="repo-time-machine-track" onScroll={event => setTimelineScroll({ top: event.currentTarget.scrollTop, height: event.currentTarget.clientHeight })}>
+            <Show when={timeMachineExpanded()}>
+            <Show when={timelineError()}><p role="alert">{timelineError()}</p></Show>
             <div
               class="repo-time-graph"
               style={{ width: `${timelineGraph().width}px`, height: `${timelineGraph().height}px` }}
             >
               <svg class="repo-time-edges" width={timelineGraph().width} height={timelineGraph().height} aria-hidden="true">
-                <For each={timelineGraph().edges}>
+                <For each={timelineVisible().edges}>
                   {(edge) => (
                     <path
                       classList={{ current: edge.current }}
@@ -1051,7 +996,7 @@ export function ChatView() {
                   )}
                 </For>
               </svg>
-              <For each={timelineGraph().nodes}>
+              <For each={timelineVisible().nodes}>
                 {(node) => (
                   <button
                     type="button"
@@ -1102,9 +1047,12 @@ export function ChatView() {
                 现在
               </button>
             </div>
+            </Show>
           </div>
         </aside>
       </Show>
+      <Show when={detailItem()} keyed>{item => <HistoryDetails threadId={state.currentId!} item={item} generation={state.history?.generation} onClose={() => setDetailItem(null)} />}</Show>
+      <Show when={imageSource()} keyed>{source => <HistoryImagePreview source={source} onClose={() => setImageSource("")} />}</Show>
       <Portal>
         <Show when={contextMenu()} keyed>
           {(menu) => (

@@ -1,8 +1,9 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
+import { assetUrl } from "../historyImages";
 import type { PromptImage } from "../types";
 import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
 import { IconFile, IconX } from "./icons";
@@ -190,6 +191,29 @@ export function createImageAttachments(
   return { images, dragging, onPaste, remove, clear, set, pickFiles };
 }
 
+function AttachmentThumbnail(props: { image: PromptImage }) {
+  const [visible, setVisible] = createSignal(false);
+  let host!: HTMLSpanElement;
+  onMount(() => {
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) { setVisible(true); observer.disconnect(); }
+    }, { rootMargin: "80px" });
+    observer.observe(host); onCleanup(() => observer.disconnect());
+  });
+  const [src] = createResource(() => visible() ? props.image : null, async image => {
+    try {
+      if (!image.uri?.startsWith("nova-history://")) return { url: attachmentPreviewSrc(image), error: "" };
+      const info = await api.getHistoryImage(image.uri, 480);
+      return { url: assetUrl(info.thumbnailUri ?? info.uri), error: "" };
+    } catch (error) { return { url: "", error: String(error) }; }
+  });
+  return <span ref={host} style="display:inline-flex;min-width:40px;min-height:40px">
+    <Show when={src()?.url} fallback={<span title={src()?.error || "图片预览待加载"}>图片</span>}>
+      {url => <img src={url()} alt={props.image.name} draggable={false} decoding="async" />}
+    </Show>
+  </span>;
+}
+
 export function ImageAttachmentStrip(props: {
   images: PromptImage[];
   onRemove: (index: number) => void;
@@ -209,11 +233,7 @@ export function ImageAttachmentStrip(props: {
                   </>
                 }
               >
-                <img
-                  src={attachmentPreviewSrc(image)}
-                  alt={image.name}
-                  draggable={false}
-                />
+                <AttachmentThumbnail image={image} />
               </Show>
               <button
                 class="image-remove"

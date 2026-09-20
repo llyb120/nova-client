@@ -4017,11 +4017,11 @@ impl AcpManager {
         }
 
         let conn_key = self.conn_key_for_thread(thread_id);
-        let session_id = {
-            let state = self.app.state::<AppState>();
-            let store = state.store.lock().unwrap();
-            store.get(thread_id).and_then(|t| t.acp_session_id.clone())
-        };
+        // Control routing must not wait behind history snapshots/persistence.
+        // Only the live connection's route can own a cancellable session.
+        let session_id = self.routes.lock().unwrap().iter()
+            .find(|(_, route)| route.thread_id == thread_id)
+            .map(|(session_id, _)| session_id.clone());
 
         // 该会话所有未决权限请求回 cancelled（用收到它的那条连接回复，多连接下不能假设「当前连接」）
         if let Some(sid) = &session_id {
@@ -5414,7 +5414,7 @@ fn derive_title(text: &str, has_images: bool) -> String {
 
 // CodeBuddy 并行模型共享 session，按模型消息、父工具及正文/思考分别续写。
 fn acp_text_target(
-    items: &[Item],
+    items: &crate::transcript::TranscriptItems,
     update: &Value,
     ids: &mut HashMap<(String, String, bool), usize>,
 ) -> Option<usize> {
@@ -5615,7 +5615,12 @@ fn codebuddy_parallel_text_streams_keep_their_items() {
 fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>) -> Vec<Item> {
     let mut changed = Vec::new();
     let finished_at = now_ms();
-    for item in &mut thread.items {
+    // Inspect immutable history first: completing one live tool must not copy
+    // every historical chunk merely because iter_mut visited it.
+    let pending: Vec<usize> = thread.items.iter().enumerate().filter_map(|(index,item)|
+        matches!(item, Item::Tool { call, .. } if call.status == "pending" || call.status == "in_progress").then_some(index)).collect();
+    for index in pending {
+        let item = &mut thread.items[index];
         let Item::Tool { ts, call, .. } = item else {
             continue;
         };

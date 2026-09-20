@@ -1,0 +1,13 @@
+.history-pager { display:flex; align-items:center; gap:8px; flex-shrink:0; padding:4px 14px; min-height:28px; color:var(--text-muted); font-size:12px; border-bottom:1px solid var(--border); }
+.history-pager > span:first-child { flex:1; }
+.history-pager button { color:var(--text); background:var(--bg-panel); border:1px solid var(--border); border-radius:5px; padding:3px 7px; cursor:pointer; }
+.history-pager button:disabled { opacity:.5; cursor:default; }
+.chat-body.history-body { flex-direction:column; }
+.history-load-error { color:var(--red); padding:4px 14px; font-size:12px; }
+.history-overlay { position:fixed; inset:0; z-index:1000; background:#0008; display:flex; align-items:center; justify-content:center; }
+.history-dialog { color:var(--text); background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:16px; width:min(900px,90vw); max-height:86vh; overflow:auto; box-shadow:0 16px 60px #0008; }
+.history-dialog header { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+.history-dialog button { cursor:pointer; padding:5px 10px; color:var(--text); background:var(--bg-hover); border:1px solid var(--border); border-radius:5px; }
+.history-dialog pre { white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; font:13px/1.6 var(--mono,monospace); }
+.history-attachments { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.history-image-dialog img { display:block; max-width:100%; height:auto; }
