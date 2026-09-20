@@ -1,6 +1,6 @@
-"""Give leading candidate files enough declaration depth before broad file diversity.
-This fixes a structural beam-search failure: the right file was already found, but only
-its first matching nested/member declaration was materialized. No labels or repo names.
+"""Balance natural-language behavioral constraints before code ranking.
+The baseline is the accepted literal-recall production source. This does not
+change output budgets, dependency expansion, model defaults, or Reasonix.
 """
 from pathlib import Path
 import hashlib
@@ -11,79 +11,76 @@ def load(name,expected):
     assert got==expected,(name,got)
     return p,b.decode("utf-8")
 def sub(s,a,b):
-    assert s.count(a)==1,a[:140]
+    assert s.count(a)==1,a[:160]
     return s.replace(a,b)
 
-p,s=load("polaris_demand_v2.rs","82626c7fa9538fd54011cb08b5163a15d92f07fb")
-old='''    for &(id,line,_) in &ranked {if seen.insert(id){selected.push((id,line));if selected.len()>=cap{break;}}}
-    for &(id,line,_) in &ranked {if selected.len()>=cap{break;}if !selected.contains(&(id,line)){selected.push((id,line));}}
-    selected
-}'''
-new='''    // The old diversity-first beam picked only one declaration per file until
-    // nearly the whole cap was consumed. A correct file could therefore be
-    // parsed but its actual implementation (the second declaration in that
-    // file) never materialized. Keep bounded breadth, but reserve declaration
-    // depth for the strongest files before broadening.
-    let mut file_order=Vec::new();let mut file_seen=HashSet::new();
-    for &(id,_,_) in &ranked {if file_seen.insert(id){file_order.push(id);}}
-    let depth_files=file_order.iter().copied().take(12).collect::<HashSet<_>>();
-    let mut per_file=HashMap::<usize,usize>::new();
-    // First beam: up to two declarations from each of the leading files.
-    for &(id,line,_) in &ranked {
-        if selected.len()>=cap{break;}
-        if !depth_files.contains(&id)||selected.contains(&(id,line)){continue;}
-        let count=per_file.entry(id).or_default();
-        if *count>=2{continue;}
-        selected.push((id,line));*count+=1;seen.insert(id);
+p,s=load("polaris_query.rs","9c6c6d25774e5838c24c023b7ab5818be183d64d")
+# "reuse existing" and "restart" are behaviorally different from generic cache/start.
+s=sub(s,
+    '"缓存|复用|cache|memo|reuse",',
+    '"缓存|复用|cache|memo|reuse|remount",')
+s=sub(s,
+    '"启动|重启|start|launch|startup|restart",',
+    '"启动|start|launch|startup", "重新启动|重启|restart",')
+# Behavioral constraints should not be outvoted by generic object names.
+s=sub(s,
+    '''let strong = ["cancel", "encrypt", "decrypt", "retry", "dedup", "delete", "restore", "persist", "copy", "paste", "close", "hold", "convert", "remember"];''',
+    '''let strong = ["cancel", "encrypt", "decrypt", "retry", "dedup", "delete", "restore", "persist", "copy", "paste", "close", "hold", "convert", "remember",
+            "inherit", "expand", "hide", "reuse", "remount", "retain", "preserve", "restart", "pause", "resume"];''')
+# Negative/contrast language is especially discriminative: "not restart" is
+# not equivalent to "start". Boost only the matched concept group, never names.
+needle='''        let predicates = CONCEPTS.iter().filter(|group| {
+            group.split('|').any(|s| original.contains(s)) && group.split('|').any(|s| strong.contains(&s))
+        }).collect::<Vec<_>>();
+        for (term, weight) in &mut terms {
+            if predicates.iter().any(|group| group.split('|').any(|s| s == term.as_str())) { *weight *= 3.0; }
+            else if !predicates.is_empty() && ["click", "coordinate", "pointer", "点击", "坐标"].contains(&term.as_str()) { *weight *= 0.5; }
+        }'''
+replacement='''        let predicates = CONCEPTS.iter().filter(|group| {
+            group.split('|').any(|s| original.contains(s)) && group.split('|').any(|s| strong.contains(&s))
+        }).collect::<Vec<_>>();
+        let lower_task=task.to_lowercase();
+        let constrained = CONCEPTS.iter().filter(|group| {
+            group.split('|').any(|alias| {
+                let positions=lower_task.match_indices(&alias.to_lowercase()).map(|(i,_)|i);
+                positions.into_iter().any(|pos| {
+                    let start=lower_task.floor_char_boundary(pos.saturating_sub(24));
+                    let before=&lower_task[start..pos];
+                    ["不","未","没","无","避免","防止","禁止","不能","不会","不要","而不是","instead of","without","never"," not "]
+                        .iter().any(|marker|before.contains(marker))
+                })
+            })
+        }).collect::<Vec<_>>();
+        for (term, weight) in &mut terms {
+            if constrained.iter().any(|group| group.split('|').any(|s| s == term.as_str())) { *weight *= 4.0; }
+            else if predicates.iter().any(|group| group.split('|').any(|s| s == term.as_str())) { *weight *= 3.0; }
+            else if (!predicates.is_empty()||!constrained.is_empty()) && ["click", "coordinate", "pointer", "点击", "坐标"].contains(&term.as_str()) { *weight *= 0.5; }
+        }'''
+s=sub(s,needle,replacement)
+# Generic tests for contrast semantics, not repository functions.
+anchor='''    #[test] fn encryption_direction_is_not_a_generic_credentials_getter() {'''
+tests='''    #[test] fn reuse_and_restart_are_distinct_constraints() {
+        let q=Query::parse(serde_json::json!({"task":"收起后复用原进程，而不是重新启动"})).unwrap();
+        let w=|term:&str|q.terms.iter().find(|(s,_)|s==term).map(|(_,w)|*w).unwrap_or(0.0);
+        assert!(w("reuse")>1.0);assert!(w("remount")>1.0);
+        assert!(w("restart")>w("start"),"restart={} start={}",w("restart"),w("start"));
     }
-    // Breadth beam: one declaration from every other parsed candidate file.
-    for &(id,line,_) in &ranked {
-        if selected.len()>=cap{break;}
-        if selected.contains(&(id,line)){continue;}
-        if per_file.get(&id).copied().unwrap_or(0)>0{continue;}
-        selected.push((id,line));per_file.insert(id,1);seen.insert(id);
+    #[test] fn negative_inheritance_is_a_behavioral_constraint() {
+        let q=Query::parse(serde_json::json!({"task":"新建页面不会继承上次展开状态"})).unwrap();
+        let w=|term:&str|q.terms.iter().find(|(s,_)|s==term).map(|(_,w)|*w).unwrap_or(0.0);
+        assert!(w("inherit")>w("state"));assert!(w("expand")>1.0);
     }
-    // Remaining budget is score-ordered with a small per-file cap. This keeps
-    // helpers/nested members available without letting a huge file monopolize.
-    for &(id,line,_) in &ranked {
-        if selected.len()>=cap{break;}
-        if selected.contains(&(id,line)){continue;}
-        let count=per_file.entry(id).or_default();
-        if *count>=3{continue;}
-        selected.push((id,line));*count+=1;
-    }
-    selected
-}'''
-s=sub(s,old,new)
-# Generic regression: correct file is known, but the relevant function is not
-# its first lexical declaration and many other files compete for diversity.
-anchor='''#[cfg(test)]
-mod demand_tests {'''
-tests='''#[cfg(test)] mod declaration_beam_tests {
-    use super::*;
-    #[test] fn relevant_second_declaration_survives_file_diversity() {
-        let d=tempfile::tempdir().unwrap();
-        for n in 0..45 {fs::write(d.path().join(format!("noise_{n}.ts")),
-            format!("// 会话终端\\nexport function noise{n}() {{ createSession(); }}\\n")).unwrap();}
-        fs::write(d.path().join("state.ts"),
-            "// 会话终端\\nexport function genericOpen() { return true; }\\n// 新建会话页面不继承上次展开状态\\nexport function resetVisitState() { setOpened(false); }\\n").unwrap();
-        let q=query::Query::parse(serde_json::json!({"task":"进入新建会话页面后，终端不会继承上次展开状态","maxBytes":12000})).unwrap();
-        let (c,_)=demand_corpus(d.path(),&q,Instant::now()+Duration::from_secs(3)).unwrap();
-        assert!(c.units.iter().any(|u|u.name=="resetVisitState"),"{:?}",c.units.iter().map(|u|u.name.clone()).collect::<Vec<_>>());
-    }
-    #[test] fn relevant_second_behavior_is_kept_with_many_terminal_files() {
-        let d=tempfile::tempdir().unwrap();
-        for n in 0..35 {fs::write(d.path().join(format!("panel_{n}.ts")),
-            format!("// 终端面板\\nexport function panel{n}() {{ showTerminal(); }}\\n")).unwrap();}
-        fs::write(d.path().join("session.ts"),
-            "// 终端标签\\nexport function createTab() { startShell(); }\\n// 收起再打开复用原进程，不重新启动\\nexport function attachExisting() { if (!ready) mountHost(); }\\n").unwrap();
-        let q=query::Query::parse(serde_json::json!({"task":"收起侧边栏再打开时复用原来的命令行进程，不重新启动","maxBytes":12000})).unwrap();
-        let (c,_)=demand_corpus(d.path(),&q,Instant::now()+Duration::from_secs(3)).unwrap();
-        assert!(c.units.iter().any(|u|u.name=="attachExisting"),"{:?}",c.units.iter().map(|u|u.name.clone()).collect::<Vec<_>>());
-    }
-}
-
 '''
 s=sub(s,anchor,tests+anchor)
 p.write_text(s,encoding="utf-8")
-print("Applied bounded two-declaration beam for leading natural-language candidate files.")
+
+p,s=load("polaris_rank.rs","84888371cb7c02fa4040e3e5bf1147feef495f2b")
+old='''            *score*=0.30+0.70*fraction*fraction;'''
+new='''            // Distinct requested behaviors matter more than repeated generic
+            // names. Keep a floor for sparse evidence, but reward balanced
+            // multi-facet coverage much more strongly on complex questions.
+            *score*=if facets.len()>=3 {0.16+0.84*fraction*fraction*fraction}
+                else {0.30+0.70*fraction*fraction};'''
+s=sub(s,old,new)
+p.write_text(s,encoding="utf-8")
+print("Applied generic behavioral-constraint weighting and balanced facet coverage.")
