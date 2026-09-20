@@ -71,6 +71,8 @@ pub struct Agent {
     pub tools: Vec<Tool>,
     pub cwd: PathBuf,
     pub session_id: String,
+    /// Nova 父会话 id；仅用于在执行 operator 时绑定独立子会话，绝不暴露给模型参数。
+    pub thread_id: Option<String>,
     pub archive_dir: Option<PathBuf>,
     pub shell: Option<ShellConfig>,
     pub cancelled: Arc<AtomicBool>,
@@ -468,8 +470,13 @@ impl Agent {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let args = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let mut args = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
             let raw_args = args.clone();
+            if name == "operator" {
+                if let Some(thread_id) = self.thread_id.as_deref() {
+                    args["__parentThreadId"] = json!(thread_id);
+                }
+            }
             on_event(AgentEvent::ToolStart {
                 id: id.clone(),
                 name: name.clone(),
