@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 env:
   BASELINE_SHA: 5c10b1f3197537ec73419d9030f7dd96140fb201
-  OPTIMIZED_SHA: 4304b8acfaa8e17aa19818f3d0ef63a5b192db18
+  OPTIMIZED_SHA: 913851feeb96b1e870795871626d17623907b644
   FIXTURE_SHA: 3d7ac249129e3f25c703fb03a1dd5617c3560a7a
 defaults:
   run:
@@ -70,6 +70,7 @@ jobs:
           sha256sum src-tauri/src/operator/{core,runtime,progress}.rs src-tauri/src/lyra/reasonix.rs > validation/optimized-source-hashes.txt
           sha256sum _baseline/src-tauri/src/operator/{core,runtime}.rs > validation/baseline-source-hashes.txt
           node --check scripts/operator-optimization-ab.mjs
+          node scripts/operator-optimization-ab.mjs --prepare-only
       - name: Install test dependencies before receiving the model credential
         run: |
           set -euo pipefail

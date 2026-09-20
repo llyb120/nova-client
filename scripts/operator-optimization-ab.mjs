@@ -6,7 +6,7 @@ const out='validation/optimization';
 await mkdir(out,{recursive:true});
 let key=process.env.COMMAND_CODE_API_KEY;
 delete process.env.COMMAND_CODE_API_KEY;delete process.env.GITHUB_TOKEN;delete process.env.GH_TOKEN;
-if(!/^user_[A-Za-z0-9_-]{16,300}$/.test(key??''))throw Error('Missing test credential');
+if(!process.argv.includes('--prepare-only')&&!/^user_[A-Za-z0-9_-]{16,300}$/.test(key??''))throw Error('Missing test credential');
 const clean=s=>String(s).split(key).join('[REDACTED]').replace(/user_[A-Za-z0-9_-]{16,}/g,'[REDACTED]');
 const save=(p,v)=>writeFile(p,clean(JSON.stringify(v,null,2)),{mode:0o600});
 function replaceOnce(s,a,b){if(s.split(a).length!==2)throw Error('Pinned fixture changed: '+a.slice(0,70));return s.replace(a,b);}
@@ -17,7 +17,10 @@ fixture=replaceOnce(fixture,"}catch(e){row.status='error';row.error=redact(e.mes
 await writeFile('scripts/operator-optimization-fixture.mjs',fixture);
 let wire=await readFile('_fixture/scripts/operator-real-json-transport.mjs','utf8');
 wire=replaceOnce(wire,"?GUI:REPLAY","?(system.content.includes('Prefer checkpointPatch')?GUI.replace('params, checkpoint, result','params, checkpoint, checkpointPatch, verified, result'):GUI):REPLAY");
+// The connectivity probe receives an explicit native parameter schema, as real GUI requests do.
+wire=replaceOnce(wire,'No observation exists. Return an observe decision to take a Jianlai screenshot, reason one sentence, requiresConfirmation false. Do not invent evidence.','No observation exists. Return an observe decision to take a Jianlai screenshot, reason one sentence, requiresConfirmation false. Do not invent evidence. Available native params schema for this probe: {type:object,properties:{operation:{const:screenshot}},required:[operation],additionalProperties:false}. The decision kind is observe, whereas params.operation is screenshot. No native input is executed by this connectivity probe.');
 await writeFile('scripts/operator-optimization-transport.mjs',wire);
+if(process.argv.includes('--prepare-only')){console.log('Pinned fixture adaptation validated; zero API requests.');process.exit(0);}
 const {runGui}=await import(pathToFileURL(resolve('scripts/operator-optimization-fixture.mjs')));
 const {installDecisionTransport,preflight,correction,transportAudit}=await import(pathToFileURL(resolve('scripts/operator-optimization-transport.mjs')));
 const plan=[['chrome','canvas'],['jianlai','form'],['chrome','orders'],['jianlai','canvas'],['chrome','form'],['jianlai','orders'],['chrome','orders'],['chrome','canvas'],['jianlai','form']].map(([channel,test],i)=>({pair:i+1,channel,test,order:i%2?['optimized','baseline']:['baseline','optimized']}));
