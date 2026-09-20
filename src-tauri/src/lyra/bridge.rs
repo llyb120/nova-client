@@ -11,7 +11,7 @@ use crate::lyra::prompt::{
 };
 use crate::lyra::provider::{stream_chat, StreamEvent};
 use crate::lyra::reasonix::{self, context_tokens_from_messages, load_legacy_messages, SlimMemory};
-use crate::lyra::tools::tool_set;
+use crate::lyra::tools::{operator_tool_set, tool_set};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
@@ -409,12 +409,22 @@ async fn handle_prompt(
     memory.pending_messages = native_messages.clone();
 
     // ---- Agent 构建 ----
-    let system_prompt = if !memory.system_prompt_snapshot.is_empty() && !system_changed {
+    let operator_mode = request
+        .get("operatorMode")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let system_prompt = if operator_mode {
+        crate::operator::SYSTEM_PROMPT.to_string()
+    } else if !memory.system_prompt_snapshot.is_empty() && !system_changed {
         memory.system_prompt_snapshot.clone()
     } else {
         build_system_prompt(&prompt_options)
     };
-    let agent_tools = tool_set(read_only, fast_context, auto_change_project);
+    let agent_tools = if operator_mode {
+        operator_tool_set()
+    } else {
+        tool_set(read_only, fast_context, auto_change_project)
+    };
     let system_prompt_hash = stable_hash(system_prompt.as_bytes());
     let tool_shape = serde_json::to_string(
         &agent_tools
@@ -470,6 +480,7 @@ async fn handle_prompt(
         tools: agent_tools,
         cwd: cwd_path.clone(),
         session_id: ctx.session_id.clone(),
+        thread_id: request.get("threadId").and_then(Value::as_str).map(str::to_string),
         archive_dir,
         shell,
         cancelled: cancelled.clone(),
