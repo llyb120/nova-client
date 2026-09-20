@@ -355,9 +355,11 @@ pub(crate) async fn run_with_resolved(
         Ok(Err(error)) => ("error", "error".to_string(), Some(error)),
         Ok(Ok(turn)) if turn.cancelled => ("cancelled", turn.stop_reason, turn.error),
         Ok(Ok(turn)) if turn.error.is_some() => ("error", turn.stop_reason, turn.error),
-        Ok(Ok(turn)) => ("completed", turn.stop_reason, turn.error),
+        Ok(Ok(turn)) => ("finished", turn.stop_reason, turn.error),
     };
 
+    // Run status is transport/control-flow state, not a claim that the user's business goal succeeded.
+    // The parent must use the operator's result/evidence for that conclusion.
     Ok(json!({
         "status": status,
         "result": result_text,
