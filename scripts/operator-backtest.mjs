@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import chromeTool from "./chrome-tool.json" with { type: "json" };
 import jianlaiTool from "./jianlai-tool.json" with { type: "json" };
 
@@ -9,7 +10,17 @@ function stripDescriptions(value) {
     .map(([key, child]) => [key, stripDescriptions(child)]));
 }
 
-const fullSchemaChars = JSON.stringify([chromeTool, jianlaiTool]).length;
+const BASE_SHA = "3da28d30f1adfd0da3b993813a47aa3fff20fdeb";
+function baselineTool(path, fallback) {
+  try {
+    return JSON.parse(execFileSync("git", ["show", `${BASE_SHA}:${path}`], { encoding: "utf8" }));
+  } catch {
+    return fallback;
+  }
+}
+const baselineChrome = baselineTool("scripts/chrome-tool.json", chromeTool);
+const baselineJianlai = baselineTool("scripts/jianlai-tool.json", jianlaiTool);
+const fullSchemaChars = JSON.stringify([baselineChrome, baselineJianlai]).length;
 const compactSchemaChars = JSON.stringify([
   { name: "chrome", inputSchema: stripDescriptions(chromeTool.inputSchema) },
   { name: "jianlai", inputSchema: stripDescriptions(jianlaiTool.inputSchema) },
