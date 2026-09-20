@@ -47,12 +47,13 @@ for case in cases:
         packet=response.get('result',{}).get('text','');(folder/'packet.txt').write_text(packet);row['retrievalOk']=response['ok'];row['bytes']=len(packet.encode());row['ms']=response['ms']
         # From here the editor uses packet text only. It never opens root/task.rs.
         source_lines={}
-        for section in ab.sections(packet):
-            if section['file']!='task.rs':continue
-            for ln in section['body'].splitlines():
-                m=re.match(r'^(\d+): (.*)$',ln)
-                if m:
-                    n=int(m[1]);assert n not in source_lines or source_lines[n]==m[2];source_lines[n]=m[2]
+        in_file=False
+        for ln in packet.splitlines():
+            if ln.startswith('### '):in_file=bool(re.match(r'^### task\.rs:\d+-\d+ ',ln))
+            if not in_file:continue
+            m=re.match(r'^(\d+): (.*)$',ln)
+            if m:
+                n=int(m[1]);assert n not in source_lines or source_lines[n]==m[2];source_lines[n]=m[2]
         reconstructed='\n'.join(source_lines[n] for n in sorted(source_lines))+'\n'
         row['returnedLines']=len(source_lines)
         row['before']=test_source(reconstructed+case['tests'],folder,'packet-before')

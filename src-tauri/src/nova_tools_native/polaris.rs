@@ -4,6 +4,7 @@ mod query {include!("polaris_query.rs");}
 mod index {include!("polaris_index.rs");}
 mod vectors {include!("polaris_vectors.rs");}
 mod rank {include!("polaris_rank.rs");}
+mod packet {include!("polaris_packet.rs");}
 use query::Query;
 use index::CodeUnit;
 
@@ -15,9 +16,12 @@ pub fn polaris(root:&Path,params:Value)->Result<String,String>{
     let output=retrieve(root,&q,started)?;
     eprintln!("[nova-tools-profile] polaris.hybrid: {:.2}ms",started.elapsed().as_secs_f64()*1000.0);Ok(output)
 }
+fn focus_source(q:&Query,u:&CodeUnit)->f64 {
+    q.focus.score(std::iter::once(u.file.as_str()).chain(u.source.iter().take(5).map(String::as_str)).chain(u.source[u.owner_start-1..u.owner_end].iter().map(String::as_str)))
+}
 fn lexical_rank(corpus:&index::Corpus,units:&[Arc<CodeUnit>],q:&Query)->Vec<(usize,f64)>{
     let n=corpus.units.len().max(1) as f64;
-    let mut rows=Vec::new();
+    let mut rows=Vec::new();let mut focus=HashMap::new();
     for (i,u) in units.iter().enumerate(){
         let mut score=0.0;let mut covered=0;
         for (term,weight) in &q.terms {if let Some(tf)=u.terms.get(term){let df=*corpus.df.get(term).unwrap_or(&1) as f64;let idf=(1.0+(n-df+0.5)/(df+0.5)).ln();score+=weight*idf*tf*2.2/(tf+1.2*(0.25+0.75*u.length/corpus.average));if *weight==1.0 {covered+=1;}}}
@@ -28,6 +32,7 @@ fn lexical_rank(corpus:&index::Corpus,units:&[Arc<CodeUnit>],q:&Query)->Vec<(usi
         let exact=q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&u.name));
         let explicit=q.files.iter().any(|f|f==&u.file);
         if exact{score+=40.0;}if explicit{score+=30.0;}
+        score*=*focus.entry(identity(u)).or_insert_with(||focus_source(q,u));
         if score>0.0 {rows.push((i,score*(1.0+(covered.min(12) as f64)*0.025)));}
     }rows.sort_by(|a,b|b.1.total_cmp(&a.1).then_with(||units[a.0].file.cmp(&units[b.0].file)).then(units[a.0].start.cmp(&units[b.0].start)));rows.truncate(96);rows
 }
@@ -50,9 +55,9 @@ fn related(a:&CodeUnit,b:&CodeUnit,files:&HashSet<String>)->Option<&'static str>
 fn retrieve(root:&Path,q:&Query,started:Instant)->Result<String,String>{retrieve_attempt(root,q,started,false)}
 fn retrieve_attempt(root:&Path,q:&Query,started:Instant,retried:bool)->Result<String,String>{
     let root=root.canonicalize().map_err(|e|e.to_string())?;
-    let deadline=started+Duration::from_millis(3500);
-    let corpus=index::corpus(&root,started+Duration::from_millis(2200))?;
-    let mut units=corpus.units.iter().filter(|u|u.role=="implementation"||(q.test_intent&&u.role=="test")||(q.doc_intent&&u.role=="documentation")||q.files.contains(&u.file)).cloned().collect::<Vec<_>>();
+    let deadline=started+Duration::from_millis(900);
+    let (corpus,demand)=index::demand_corpus(&root,q,started+Duration::from_millis(600))?;
+    let mut units=corpus.units.iter().filter(|u|u.role=="implementation"||(q.test_intent&&u.role=="test")||(q.doc_intent&&u.role=="documentation")||q.anchors.iter().any(|a|a==&u.name)||(q.files.contains(&u.file)&&index::file_role_for_query(&u.file)!="implementation")).cloned().collect::<Vec<_>>();
     let known=units.iter().map(|u|u.file.clone()).collect::<HashSet<_>>();
     units.extend(index::explicit_units(&root,&q.files,&known,deadline));
     let semantic_query=q.semantic_query();
@@ -69,7 +74,8 @@ fn retrieve_attempt(root:&Path,q:&Query,started:Instant,retried:bool)->Result<St
     let mut ranked=rank::fuse(&lexical,&dense.scores,&units,q);
     ranked.truncate(32);
     // An in-flight edit invalidates old semantic results as well as lexical evidence.
-    let stale=ranked.iter().filter(|(i,_)|!index::verified(&root,&units[*i])).map(|(i,_)|units[*i].file.clone()).collect::<HashSet<_>>();
+    let mut verified=HashMap::<String,bool>::new();
+    let stale=ranked.iter().filter(|(i,_)|!*verified.entry(units[*i].file.clone()).or_insert_with(||index::verified(&root,&units[*i]))).map(|(i,_)|units[*i].file.clone()).collect::<HashSet<_>>();
     if !stale.is_empty(){index::invalidate(&root,&stale);if !retried&&Instant::now()<deadline{return retrieve_attempt(&root,q,started,true);}}
     ranked.retain(|(i,_)|!stale.contains(&units[*i].file));
     let mut rerank_note=None;let mut reranked=false;
@@ -81,60 +87,21 @@ fn retrieve_attempt(root:&Path,q:&Query,started:Instant,retried:bool)->Result<St
         ranked[..limit].sort_by(|a,b|b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));reranked=true;
     },Ok(None)=>{},Err(e)=>rerank_note=Some(e)}}
     let missing=q.anchors.iter().filter(|a|!units.iter().any(|u|u.name.eq_ignore_ascii_case(a))).cloned().collect::<Vec<_>>();
-    let mut chosen=Vec::<(usize,&str)>::new();let mut names=HashSet::new();let mut counts=HashMap::<String,usize>::new();
-    // Primary implementations always get body budget before helpers and file limits.
-    for (i,_) in &ranked {
-        let u=&units[*i];if *counts.get(&u.file).unwrap_or(&0)>=2{continue;}
-        if !index::verified(&root,u){continue;}
-        chosen.push((*i,"primary"));names.insert(identity(u));*counts.entry(u.file.clone()).or_default()+=1;
-        if chosen.len()==4{break;}
-    }
-    let files=units.iter().map(|u|u.file.clone()).collect::<HashSet<_>>();
-    let mut frontier=chosen.iter().take(2).map(|(i,_)|(*i,0)).collect::<std::collections::VecDeque<_>>();
-    let mut links=Vec::new();
-    while let Some((parent,depth))=frontier.pop_front() {
-        if depth>=2||chosen.len()>=9||Instant::now()>deadline{continue;}
-        let mut neighbours=Vec::new();
-        for (i,u) in units.iter().enumerate(){if Instant::now()>deadline{break;}if names.contains(&identity(u)){continue;}
-            if let Some(role)=related(&units[parent],u,&files){let value=lexical.iter().find(|(j,_)|*j==i).map(|(_,v)|*v).unwrap_or(0.0);neighbours.push((i,role,value));}}
-        neighbours.sort_by(|a,b|b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
-        for (i,role,_) in neighbours.into_iter().take(2){if chosen.len()>=9{break;}if names.insert(identity(&units[i]))&&index::verified(&root,&units[i]){
-            chosen.push((i,role));frontier.push_back((i,depth+1));
-            links.push(serde_json::json!({"from":format!("{}:{}",units[parent].file,units[parent].name),"to":format!("{}:{}",units[i].file,units[i].name),"kind":role}));
-        }}
-    }
-    let mut body=String::new();let mut gaps=Vec::new();let mut evidence=Vec::new();let mut lines_left=q.lines;
-    for (id,relation) in chosen{
-        let u=&units[id];let source=&u.source;
-        let full_start=if u.start<=u.owner_start{u.start}else{u.owner_start};
-        let full_fit=u.owner_end-full_start+1<=lines_left && source[full_start-1..u.owner_end].iter().map(|s|s.len()+1).sum::<usize>()+body.len()+2048<q.hard;
-        let (start,mut end)=if full_fit{(full_start,u.owner_end)}else{(u.start,u.end)};
-        // Include whole lines only; a pathological one-line literal is a deferred read.
-        while end>=start && (source[start-1..end].iter().enumerate().map(|(n,s)|s.len()+format!("{}: ",start+n).len()+1).sum::<usize>()+body.len()+4096>q.hard || end-start+1>lines_left) {
-            if end==start {end=start-1;break;} end-=1;
-        }
-        if end<start{gaps.push(serde_json::json!({"file":u.file,"start":u.owner_start,"end":u.owner_end,"reason":"line-exceeds-budget"}));continue;}
-        let full_fit=full_fit&&end==u.owner_end;
-        let snippet=source[start-1..end].iter().enumerate().map(|(n,s)|format!("{}: {}\n",start+n,s)).collect::<String>();
-        let section=format!("\n### {}:{}-{} [{} {}]\ncoverage: {} {}:{}-{}\n```\n{snippet}```\n",u.file,start,end,relation,u.name,if full_fit{"BODY"}else{"PARTIAL"},u.file,start,end);
-        if body.len()+section.len()+2048>q.hard||end-start+1>lines_left{gaps.push(serde_json::json!({"file":u.file,"start":u.owner_start,"end":u.owner_end,"reason":"budget"}));continue;}
-        lines_left-=end-start+1;body.push_str(&section);
-        evidence.push(serde_json::json!({"file":u.file,"symbol":u.name,"start":start,"end":end,"role":u.role,"relation":relation,"sourceHash":u.file_hash,"complete":full_fit}));
-        if !full_fit{gaps.push(serde_json::json!({"file":u.file,"start":u.owner_start,"end":u.owner_end,"reason":"large-unit"}));}
-    }
+    let packet=packet::pack(&root,&units,&ranked,q,deadline);
+    let body=packet.body;let gaps=packet.gaps;let evidence=packet.evidence;let links=packet.links;
     let time_budget_reached=Instant::now()>deadline;
-    let partial=corpus.partial||!gaps.is_empty()||dense.mode.contains("partial")||dense.mode.contains("warming")||time_budget_reached;
+    let partial=corpus.partial||(evidence.is_empty()&&demand.candidate_files_omitted>0)||!gaps.is_empty()||dense.mode.contains("partial")||dense.mode.contains("warming")||time_budget_reached;
     let status=if partial{"PARTIAL"}else if evidence.is_empty(){"MISS"}else{"CANDIDATES"};
     let unresolved_files=q.files.iter().filter(|f|!units.iter().any(|u|&u.file==*f)).cloned().collect::<Vec<_>>();
     let meta=serde_json::json!({"backend":dense.mode,"reranked":reranked,"semanticReady":dense.ready,"semanticTotal":dense.total,"note":dense.note,"rerankNote":rerank_note,
-        "files":corpus.files,"units":units.len(),"changedFiles":corpus.changed,"indexPartial":corpus.partial,"timeBudgetReached":time_budget_reached,"refreshedAfterEdit":retried,"unresolvedAnchors":missing,"unresolvedFiles":unresolved_files,"links":links,
+        "searchScope":"bounded_candidate_files","workingSet":"source_linked_not_root_cause_proof","demand":demand,"files":corpus.files,"units":units.len(),"changedFiles":corpus.changed,"indexPartial":corpus.partial,"timeBudgetReached":time_budget_reached,"refreshedAfterEdit":retried,"unresolvedAnchors":missing,"unresolvedFiles":unresolved_files,"links":links,
         "couplingNote":if q.params["coupling"].as_bool()==Some(true){Some("natural-language results use source references; git co-change hints require an exact-symbol query")}else{None},"queryMs":started.elapsed().as_secs_f64()*1000.0,"evidence":evidence,"next_reads":gaps});
     let header=format!("# CTX {status}\n# retrieval: {meta}\n# Evidence is verified current source; relevance/one-hop references are candidates, not a proof of root cause.\n");
     let mut out=format!("{header}{body}");
     // Metadata is bounded too. Do not split a code body or lie about its coverage.
     if out.len()>q.hard {
         // Keep the verified source; trim diagnostic verbosity, never silently crop code.
-        let compact=serde_json::json!({"backend":meta["backend"],"indexPartial":meta["indexPartial"],"evidence":meta["evidence"],"next_reads":meta["next_reads"]});
+        let compact=serde_json::json!({"backend":meta["backend"],"searchScope":meta["searchScope"],"demand":meta["demand"],"indexPartial":meta["indexPartial"],"evidence":meta["evidence"],"next_reads":meta["next_reads"]});
         out=format!("# CTX PARTIAL\n# retrieval: {compact}\n{body}");
         if out.len()>q.hard {return Err("结果元数据超过预算，请限定 files".into());}
     }

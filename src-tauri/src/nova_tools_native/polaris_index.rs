@@ -1,3 +1,28 @@
+fn component_references(text:&str)->(HashSet<String>,Vec<(String,String)>) {
+    let mut calls=HashSet::new();let mut members=Vec::new();
+    if !text.contains('<'){return (calls,members);}
+    let mut parser=tree_sitter::Parser::new();
+    if parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()).is_err(){return (calls,members);}
+    #[allow(deprecated)] parser.set_timeout_micros(20_000);
+    let bounded=text.chars().take(20000).collect::<String>();
+    let Some(tree)=parser.parse(&bounded,None)else{return (calls,members);};
+    let mut cursor=tree.walk();let mut depth=0usize;
+    loop {
+        let node=cursor.node();
+        if matches!(node.kind(),"jsx_opening_element"|"jsx_self_closing_element") {
+            if let Some(name)=node.child_by_field_name("name").and_then(|n|n.utf8_text(bounded.as_bytes()).ok()) {
+                if name.chars().next().is_some_and(|c|c.is_ascii_uppercase()) {
+                    if let Some((object,member))=name.split_once('.') {calls.insert(object.into());members.push((object.into(),member.into()));}
+                    else {calls.insert(name.into());}
+                }
+            }
+            if calls.len()>=64{break;}
+        }
+        if cursor.goto_first_child(){depth+=1;continue;}
+        loop {if cursor.goto_next_sibling(){break;}if depth==0{return (calls,members);}cursor.goto_parent();depth-=1;}
+    }
+    (calls,members)
+}
 use super::*;
 use std::collections::BTreeMap;
 
@@ -79,12 +104,14 @@ fn identifier_aliases(text:&str)->Vec<String> {
     if words.iter().any(|w|w=="to") {words.push("convert".into());}
     let seed=words.join(" ");
     let original=query::tokens(&seed).into_iter().collect::<HashSet<_>>();
-    let Ok(q)=query::Query::parse(serde_json::json!({"task":seed})) else{return Vec::new();};
-    q.terms.into_iter().filter(|(word,_)|!original.contains(word)).map(|(word,_)|word).collect()
+    query::identifier_concepts(&original)
 }
 fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
     let entry=scan_source(text,file);let source=Arc::new(text.lines().map(str::to_owned).collect::<Vec<_>>());
-    let imports=Arc::new(entry.imports);let file_hash=digest(text.as_bytes());
+    make_units_selected(file,text,&entry,source,None)
+}
+fn make_units_selected(file:&str,text:&str,entry:&FileEntry,source:Arc<Vec<String>>,selected:Option<&HashSet<usize>>)->Vec<Arc<CodeUnit>> {
+    let imports=Arc::new(entry.imports.clone());let file_hash=digest(text.as_bytes());
     let tests=entry.syms.iter().filter(|s|s.kind=="mod"&&s.name=="tests").map(|s|(s.ln,s.end)).collect::<Vec<_>>();
     let mut spans=entry.syms.iter().filter(|s|is_retrieval_unit(s,&source)).map(|s|(s.name.clone(),s.ln,s.end,s.kind.clone())).collect::<Vec<_>>();
     if spans.is_empty()&&!source.is_empty(){spans.push(("<module>".into(),1,source.len(),"module".into()));}
@@ -93,6 +120,7 @@ fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
     let module_doc=module_doc.chars().take(240).collect::<String>();
     let mut out=Vec::new();
     for (name,begin,finish,kind) in spans {
+        if selected.is_some_and(|wanted|!wanted.contains(&begin)){continue;}
         let begin=begin.max(1);let finish=finish.min(source.len()).max(begin);
         if begin>source.len(){continue;}
         let mut comment=begin-1;
@@ -104,6 +132,12 @@ fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
         let signature=source[begin-1..(begin+11).min(finish)].join("\n");
         let signature=signature.split('{').next().unwrap_or("").chars().take(700).collect::<String>();
         let signature_aliases=if callable{identifier_aliases(&signature)}else{Vec::new()};
+        let owner_body=source[begin-1..finish].join("\n");
+        let mut owner_references=references(&owner_body);
+        if matches!(file.rsplit('.').next(),Some("tsx"|"jsx")) {
+            let (components,members)=component_references(&owner_body);
+            owner_references.0.extend(components);owner_references.3.extend(members);
+        }
         for offset in (begin..=finish).step_by(64) {
             let end=(offset+79).min(finish);let start=if offset==begin{comment+1}else{offset};
             let prefix=source[comment..begin].join("\n");
@@ -129,7 +163,7 @@ fn make_units(file:&str,text:&str)->Vec<Arc<CodeUnit>> {
             for term in &signature_aliases {*terms.entry(term.clone()).or_default()+=1.25;}
             for tf in terms.values_mut(){*tf=(*tf).min(12.0);}
             let length=terms.values().sum::<f64>().max(1.0);
-            let (calls,events,commands,members)=references(&body);
+            let (calls,events,commands,members)=owner_references.clone();
             out.push(Arc::new(CodeUnit{file:file.into(),name:name.clone(),start,end,owner_start:begin,owner_end:finish,hash,file_hash:file_hash.clone(),role,passage,terms,length,name_terms,members,calls,events,commands,source:source.clone(),imports:imports.clone()}));
             if end==finish{break;}
         }
@@ -221,3 +255,7 @@ mod glossary_tests {
     }
 
 }
+
+include!("polaris_demand_v2.rs");
+
+pub(super) fn file_role_for_query(file:&str)->&'static str {file_role(file)}

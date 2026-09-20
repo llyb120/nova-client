@@ -4,6 +4,7 @@ use super::*;
 #[derive(Clone, Debug)]
 pub(super) struct Query {
     pub params: Value,
+    pub focus: Focus,
     pub task: String,
     pub anchors: Vec<String>,
     pub files: Vec<String>,
@@ -41,7 +42,15 @@ pub(super) fn tokens(text: &str) -> Vec<String> {
     let flush_han=|s:&mut Vec<char>,out:&mut Vec<String>|{for size in 2..=4 {for slice in s.windows(size){out.push(slice.iter().collect());}}s.clear();};
     for c in text.chars(){if is_han(c){flush_ascii(&mut ascii,&mut out);han.push(c);}else if c.is_ascii_alphanumeric()||matches!(c,'_'|'$'|'-'|'.'|':'){flush_han(&mut han,&mut out);ascii.push(c);}else{flush_ascii(&mut ascii,&mut out);flush_han(&mut han,&mut out);}}
     flush_ascii(&mut ascii,&mut out);flush_han(&mut han,&mut out);
-    out.retain(|s|!noise(s));out
+    // Source prose uses inflected verbs. Retain the exact tokens and add
+    // bounded base-form alternatives, without modifying source evidence.
+    let mut stems=Vec::new();
+    for word in &out {if !word.is_ascii()||word.len()<5||!word.chars().all(|c|c.is_ascii_alphabetic()){continue;}
+        if let Some(base)=word.strip_suffix("ies"){if base.len()>=3{stems.push(format!("{base}y"));}}
+        else if !word.ends_with("ss")&&!word.ends_with("us")&&!word.ends_with("is") {if let Some(base)=word.strip_suffix('s'){stems.push(base.into());}}
+        for suffix in ["ed","ing"] {if let Some(base)=word.strip_suffix(suffix).filter(|b|b.len()>=3){stems.push(base.into());stems.push(format!("{base}e"));}}
+    }
+    out.extend(stems);out.retain(|s|!noise(s));out
 }
 // Generic bilingual software concepts. No repository paths, function names or eval answers.
 const CONCEPTS: &[&str]=&[
@@ -50,7 +59,7 @@ const CONCEPTS: &[&str]=&[
     "图片|图像|截图|image|picture|screenshot|capture", "缓存|复用|cache|memo|reuse",
     "磁盘|保存|落盘|持久化|persist|save|disk|storage", "历史|记录|history|transcript|record",
     "加载|读取|打开|load|read|open", "切换|跳转|switch|navigate|select|open", "终端|命令行|terminal|shell|pty",
-    "首页|新建|home|new|create", "主题|亮色|暗色|theme|light|dark|palette", "快捷键|热键|shortcut|hotkey|keybinding",
+    "桌面|desktop", "释放|松开|release|keyup", "解析|parse", "键盘|按键|组合键|keyboard|keypress|keystroke|chord|key", "首页|新建|home|new|create", "主题|亮色|暗色|theme|light|dark|palette", "快捷键|热键|shortcut|hotkey|keybinding",
     "未读|标记|unread|badge|mark", "重试|再试|超时|retry|timeout|deadline", "重复|幂等|去重|duplicate|dedup|idempotent",
     "并发|排队|队列|concurrent|queue|semaphore", "锁|阻塞|lock|mutex|blocking", "滚动|视口|懒加载|scroll|viewport|lazy",
     "分页|分块|page|chunk|cursor", "附件|上传|attachment|upload", "缩略图|解码|thumbnail|decode",
@@ -74,6 +83,18 @@ const CONCEPTS: &[&str]=&[
     "拒绝|禁止|deny|reject|forbidden", "代理|proxy", "立即|immediate", "尺寸|大小|size|dimension",
     "错误|报错|失败|error|failure|exception", "模型|提供商|model|provider", "计费|用量|统计|usage|cost|stats",
 ];
+// Dictionary expansion for names avoids reparsing thousands of synthetic queries.
+pub(super) fn identifier_concepts(original:&HashSet<String>)->Vec<String> {
+    static LOOKUP:OnceLock<HashMap<&'static str,Vec<usize>>>=OnceLock::new();
+    let lookup=LOOKUP.get_or_init(||{
+        let mut map=HashMap::<&'static str,Vec<usize>>::new();
+        for (i,group) in CONCEPTS.iter().enumerate(){for word in group.split('|'){map.entry(word).or_default().push(i);}}map
+    });
+    let mut groups=std::collections::BTreeSet::new();
+    for word in original {if let Some(ids)=lookup.get(word.as_str()){groups.extend(ids.iter().copied());}}
+    let mut seen=original.clone();let mut out=Vec::new();
+    for i in groups {for word in CONCEPTS[i].split('|'){if seen.insert(word.into()){out.push(word.into());}}}out
+}
 impl Query {
     /// Distinct concepts are coverage constraints; eight aliases of one verb
     /// must not count as eight independently satisfied parts of a request.
@@ -119,7 +140,13 @@ impl Query {
         for t in raw.iter().filter(|t|meaningful(t)).chain(raw.iter().filter(|t|!meaningful(t))) {
             if seen.insert(t.clone()){terms.push((t.clone(),1.0));}if terms.len()>=64{break;}
         }
-        for group in CONCEPTS {if group.split('|').any(|s|original.contains(s)){for s in group.split('|'){if terms.len()<112&&seen.insert(s.into()){terms.push((s.into(),0.55));}}}}
+        // Every recognized concept gets one English representative before
+        // any early noun consumes the remaining synonym budget.
+        let expansions=CONCEPTS.iter().filter(|group|group.split('|').any(|s|original.contains(s)))
+            .map(|g|g.split('|').filter(|w|w.is_ascii()).chain(g.split('|').filter(|w|!w.is_ascii())).collect::<Vec<_>>()).collect::<Vec<_>>();
+        for column in 0..expansions.iter().map(Vec::len).max().unwrap_or(0) {
+            for group in &expansions {if let Some(&word)=group.get(column){if terms.len()<112&&seen.insert(word.into()){terms.push((word.into(),0.55));}}}
+        }
         // Behavioral predicates must not be outvoted by generic nouns (a
         // credentials getter is not encryption; a pointer event is not cancel).
         // This changes query weights only, never fabricates a source symbol.
@@ -131,12 +158,18 @@ impl Query {
             if predicates.iter().any(|group| group.split('|').any(|s| s == term.as_str())) { *weight *= 3.0; }
             else if !predicates.is_empty() && ["click", "coordinate", "pointer", "点击", "坐标"].contains(&term.as_str()) { *weight *= 0.5; }
         }
+        if ["键盘","按键","组合键","keyboard","keystroke"].iter().any(|word|task.contains(word)) {
+            for (term,weight) in &mut terms {
+                if ["键盘","按键","组合键","keyboard","keypress","keystroke","chord","key"].contains(&term.as_str()){*weight*=5.0;}
+                if ["发送","提交","send","submit","prompt","dispatch","deliver"].contains(&term.as_str()){*weight*=0.5;}
+            }
+        }
         let test_intent=["测试用例","单元测试","回归测试","unit test","regression test"].iter().any(|s|task.to_lowercase().contains(s));
         let doc_intent=["文档","使用说明","readme","documentation"].iter().any(|s|task.to_lowercase().contains(s));
         let hard=params.get("maxBytes").or_else(||params.get("maxChars")).and_then(Value::as_u64).unwrap_or(32768).clamp(8192,65536) as usize;
         let lines=params["budget"].as_u64().unwrap_or(600).clamp(100,1200) as usize;
         params["task"]=Value::String(task.clone()); params["keywords"]=serde_json::json!(anchors);params["files"]=serde_json::json!(files);
-        Ok(Self{params,task,anchors,files,terms,test_intent,doc_intent,hard,lines})
+        Ok(Self{focus:Focus::new(&task)?,params,task,anchors,files,terms,test_intent,doc_intent,hard,lines})
     }
 }
 
@@ -176,5 +209,51 @@ mod domain_boundary_tests {
         let version=Query::parse(serde_json::json!({"task":"挑选预发布版本而不包含草稿"})).unwrap();
         for word in ["prerelease","draft"] {assert!(version.terms.iter().any(|(s,_)|s==word));}
         assert!(version.semantic_query().starts_with(&version.task));
+    }
+}
+
+// Generic entities distinguish a requested object from surrounding UI prose.
+// Match literal current source/module text, not generated concept aliases.
+#[derive(Clone,Debug)]
+pub(super) struct Focus { patterns:regex::RegexSet,weights:Vec<f64> }
+impl Focus {
+    fn new(task:&str)->Result<Self,String> {
+        const GROUPS:&[(&str,&str,f64)]=&[
+            ("终端|命令行|terminal|shell|pty","terminal|shell|pty|终端|命令行",3.0),
+            ("桌面|desktop","desktop|桌面",2.5),
+            ("键盘|按键|组合键|keyboard|keystroke","keyboard|key|press|键盘|按键|组合键",1.5),
+            ("释放|松开|release key|keyup","release|keyup|释放|松开",1.5),
+            ("附件|attachment","attachment|附件",2.0),
+            ("队列|排队|queue","queue|pending|队列|排队",2.0),
+            ("加密|encrypt","encrypt|cipher|加密",2.0),
+            ("解密|decrypt","decrypt|cipher|解密",2.0),
+            ("剪贴板|clipboard","clipboard|剪贴板",2.0),
+            ("窗口|window","window|窗口",1.5),
+            ("未读|unread","unread|未读",2.0),
+        ];
+        let task=task.to_lowercase();let active=GROUPS.iter().filter(|(trigger,_,_)|trigger.split('|').any(|t|task.contains(t))).collect::<Vec<_>>();
+        let patterns=regex::RegexSetBuilder::new(active.iter().map(|(_,aliases,_)|aliases.split('|').map(regex::escape).collect::<Vec<_>>().join("|"))).case_insensitive(true).build().map_err(|e|e.to_string())?;
+        Ok(Self{patterns,weights:active.iter().map(|(_,_,w)|*w).collect()})
+    }
+    pub(super) fn active(&self)->bool {!self.weights.is_empty()}
+    pub(super) fn score<'a>(&self,parts:impl IntoIterator<Item=&'a str>)->f64 {
+        if self.weights.is_empty(){return 1.0;}
+        let mut mask=0u32;
+        for part in parts {for i in self.patterns.matches(part){mask|=1<<i;}if mask.count_ones() as usize==self.weights.len(){return 1.0;}}
+        let total=self.weights.iter().sum::<f64>();let matched=self.weights.iter().enumerate().filter(|(i,_)|mask&(1<<i)!=0).map(|(_,w)|*w).sum::<f64>();
+        0.12+0.88*(matched/total)*(matched/total)
+    }
+}
+
+#[cfg(test)] mod balanced_expansion_tests {
+    use super::*;
+    #[test]fn late_constraints_get_english_terms_before_noun_synonyms() {
+        let q=Query::parse(serde_json::json!({"task":"新建会话页面终端不会继承上次展开状态"})).unwrap();
+        for word in ["terminal","inherit","expand","state"]{assert!(q.terms.iter().any(|(t,_)|t==word),"{word}");}
+    }
+    #[test]fn source_prose_retains_its_token_and_a_base_form(){
+        let words=tokens("inherits hiding restarts retained status");
+        for word in ["inherits","inherit","hide","restart","retain","status"]{assert!(words.contains(&word.into()),"{word}");}
+        assert!(!words.contains(&"statu".into()));
     }
 }

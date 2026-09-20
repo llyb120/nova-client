@@ -25,11 +25,12 @@ pub(super) fn fuse(lexical:&[(usize,f64)],dense:&[(usize,f64)],units:&[Arc<CodeU
         }
     }
     for (i,u) in units.iter().enumerate() {
-        if q.files.contains(&u.file)||q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&u.name)) {
+        if q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&u.name)) {
             scores.entry(identity(u)).or_insert((i,0.0)).1=2.0;
         }
     }
     let mut out=scores.into_values().collect::<Vec<_>>();
+    for (id,score) in &mut out {if !q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&units[*id].name)){*score*=focus_source(q,&units[*id]);}}
     out.sort_by(|a,b|b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     if std::env::var_os("NOVA_POLARIS_TRACE_RANK").is_some() {
         let rows=|channel:&[(usize,f64)]|channel.iter().take(32).map(|(i,s)|serde_json::json!({
@@ -87,6 +88,7 @@ pub(super) fn refine_forwarders(ranked:&mut Vec<(usize,f64)>,units:&[Arc<CodeUni
         for (id,score) in ranked.iter_mut() {
             let u=&units[*id];
             if q.files.contains(&u.file)||q.anchors.iter().any(|a|a.eq_ignore_ascii_case(&u.name)){continue;}
+            let call_terms=u.calls.iter().flat_map(|call|query::tokens(call)).collect::<HashSet<_>>();
             let covered=facets.iter().filter(|group|group.split('|').any(|word|u.terms.contains_key(word))).count();
             let fraction=covered as f64/facets.len() as f64;
             // Keep a nonzero semantic-only path while preferring evidence that
@@ -97,7 +99,7 @@ pub(super) fn refine_forwarders(ranked:&mut Vec<(usize,f64)>,units:&[Arc<CodeUni
             // source/comment text, rather than the signature's dictionary aliases.
             let operation=predicates.is_empty()||predicates.iter().any(|group|group.split('|').any(|word|
                 u.name_terms.contains(word)
-                ||u.calls.iter().any(|call|query::tokens(call).iter().any(|term|term==word))
+                ||call_terms.contains(word)
                 ||(!word.is_ascii()&&u.source[u.start-1..u.end].iter().any(|line|line.contains(word)))));
             if !operation{*score*=0.40;}
             let name_operation=predicates.iter().any(|group|group.split('|').any(|word|u.name_terms.contains(word)));

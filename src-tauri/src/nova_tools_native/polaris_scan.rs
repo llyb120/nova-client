@@ -74,7 +74,15 @@ fn scan_source(text: &str, file: &str) -> FileEntry {
                 }
             }
         }
-        if cursor.goto_first_child() { depth += 1; continue; }
+        // Tree-sitter still parses the file. This check only skips expression
+        // traversal when a Rust body has no possible nested declaration marker.
+        static NESTED:OnceLock<Regex>=OnceLock::new();
+        let skip=if kind=="function_item" {
+            node.child_by_field_name("body").and_then(|body|body.utf8_text(text.as_bytes()).ok()).is_some_and(|body|{
+                !NESTED.get_or_init(||Regex::new(r"\b(?:fn|struct|enum|trait|union|type|const|static|mod)\b").unwrap()).is_match(body)
+            })
+        }else{matches!(kind,"struct_item"|"enum_item"|"type_item")};
+        if !skip && cursor.goto_first_child() { depth += 1; continue; }
         loop {
             if cursor.goto_next_sibling() { break; }
             if !cursor.goto_parent() { result.syms.sort_by_key(|s| s.ln); return result; }
@@ -108,5 +116,15 @@ mod syntax_regressions {
         let e=scan_source(src,"View.tsx");
         assert_eq!(e.syms.iter().map(|s|s.name.as_str()).collect::<Vec<_>>(),["View"]);
         assert_eq!(e.syms[0].end,5);
+    }
+}
+
+#[cfg(test)] mod shallow_walk_regressions {
+    use super::*;
+    #[test]fn nested_declarations_survive_expression_skipping(){
+        let source="fn outer() {\n fn inner() { work(); }\n const CAP: usize = 3;\n inner();\n}\nfn plain() { work(); }\n";
+        let scanned=scan_source(source,"work.rs");
+        for name in ["outer","inner","CAP","plain"]{assert!(scanned.syms.iter().any(|s|s.name==name),"{name}");}
+        assert!(!scanned.syms.iter().any(|s|s.name=="work"));
     }
 }

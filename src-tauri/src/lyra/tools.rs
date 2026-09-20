@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，一并返回。目标行段已明确时直接 read。";
+const POLARIS_DESCRIPTION: &str = "代码位置未知或需要跨文件上下文时，先调用一次 Polaris。task/query 提供完整改动目标、对象和约束；不要拆成多轮猜函数名，已知符号或文件分别放 keywords/files。内部按问题筛选声明，返回当前源码的主实现、必要辅助函数、类型/常量及有界调用关系，不等待全仓索引。把返回的原文行段直接作为编辑上下文：足够开始修改时立即修改并验证，不要再 read/grep 已返回范围，也不要为阅读所有候选而反复检索。只有实际阻塞改动的缺失定义或源码已变化时，才针对那个缺口补读；next_reads 是截断或未覆盖的候选清单，不要求全部读取。CANDIDATES 不证明根因，PARTIAL 必须结合任务判断，不能假装缺失代码已验证。默认不调用向量模型、不上传源码。";
+
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。禁止无排除的递归搜索（grep -r 等）。";

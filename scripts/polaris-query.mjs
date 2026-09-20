@@ -21,4 +21,4 @@ export function normalizePolarisArgs(params = {}) {
   return { ...params, keywords, task, files: [...new Set(list(params.files, 6, false).map(f => f.replaceAll("\\", "/")))] };
 }
 
-export const POLARIS_DESCRIPTION = "代码位置未知或需跨文件分析时调用一次。query/task 可直接提供完整中文行为描述，不要猜造函数名；已知符号用 keywords，已知文件用 files。自然语言内部进行函数级词法/概念召回，显式配置的本地语义模型可补充向量召回和精排，默认不会上传代码。结果提供经过当前源码校验的主体、相关引用、coverage 与 next_reads；CANDIDATES 不是根因已确认，PARTIAL/缺口必须说明。已返回正文不要重复读取；关键证据不足时再按缺口读取，不保证任意问题一次命中。";
+export const POLARIS_DESCRIPTION = "代码位置未知或需要跨文件上下文时，先调用一次 Polaris。task/query 提供完整改动目标、对象和约束；不要拆成多轮猜函数名，已知符号或文件分别放 keywords/files。内部按问题筛选声明，返回当前源码的主实现、必要辅助函数、类型/常量及有界调用关系，不等待全仓索引。把返回的原文行段直接作为编辑上下文：足够开始修改时立即修改并验证，不要再 read/grep 已返回范围，也不要为阅读所有候选而反复检索。只有实际阻塞改动的缺失定义或源码已变化时，才针对那个缺口补读；next_reads 是截断或未覆盖的候选清单，不要求全部读取。CANDIDATES 不证明根因，PARTIAL 必须结合任务判断，不能假装缺失代码已验证。默认不调用向量模型、不上传源码。";
