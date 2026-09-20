@@ -55,7 +55,7 @@ test("createNovaBatchTools exposes context tools only with the native service", 
     if (previousToken !== undefined) process.env.NOVA_CONTEXT_SERVICE_TOKEN = previousToken;
   }
   const tools = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }));
-  assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "jianlai", "polaris", "webview"]);
+  assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "jianlai", "operator", "polaris", "webview"]);
 });
 
 test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
@@ -63,7 +63,7 @@ test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
   process.env.NOVA_FAST_CONTEXT = "0";
   try {
     const tools = withContextService(() => createNovaBatchTools(process.cwd()));
-    assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "jianlai", "webview"]);
+    assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "jianlai", "operator", "webview"]);
     assert.deepEqual(withContextService(() => createNovaBatchTools(process.cwd(), { readOnly: true })), {});
   }
   finally {
@@ -168,7 +168,7 @@ test("directory switching is session scoped, works without polaris, and updates 
       if (!line.includes("\n")) return;
       const request = JSON.parse(line.trim());
       calls.push(request);
-      if (request.params.prompt === "lost response" || ["webview", "chrome", "jianlai"].includes(request.method)) { socket.destroy(); return; }
+      if (request.params.prompt === "lost response" || ["webview", "chrome", "jianlai", "operator"].includes(request.method)) { socket.destroy(); return; }
       const rejected = request.params.path === "missing";
       socket.end(JSON.stringify(rejected
         ? { ok: false, error: "directory missing" }
@@ -216,6 +216,11 @@ test("directory switching is session scoped, works without polaris, and updates 
     assert.equal(calls.length,before+4,'desktop input must never retry a lost response');
     assert.equal(calls.at(-1).method,'jianlai');
     assert.deepEqual(calls.at(-1).params,desktopArgs);
+    const operatorArgs={goal:'finish the current UI task',maxSeconds:10};
+    await assert.rejects(tools.operator.execute(operatorArgs));
+    assert.equal(calls.length,before+5,'operator mutations must never retry a lost response');
+    assert.equal(calls.at(-1).method,'operator');
+    assert.deepEqual(calls.at(-1).params,operatorArgs);
   } finally {
     for (const key of ["NOVA_CONTEXT_SERVICE_ENDPOINT", "NOVA_CONTEXT_SERVICE_TOKEN", "NOVA_CWD_CHANGE_SCOPE"]) {
       if (previous[key] === undefined) delete process.env[key];
