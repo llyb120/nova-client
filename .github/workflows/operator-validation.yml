@@ -1,0 +1,53 @@
+name: Operator validation
+
+on:
+  push:
+    branches: [work/operator-adaptive-pre-release-20260920]
+  pull_request:
+    branches: [pre-release]
+    paths:
+      - 'src-tauri/src/operator/**'
+      - 'scripts/operator*'
+      - 'bench/operator*'
+      - '.github/workflows/operator-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: operator-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-and-node:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Archive tracked source for reproducible local validation
+        run: git archive --format=tar.gz HEAD > operator-source.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operator-source
+          path: operator-source.tar.gz
+          retention-days: 3
+      - name: Run operator contract tests when present
+        shell: bash
+        run: |
+          shopt -s nullglob
+          tests=(scripts/operator*.test.mjs)
+          if ((${#tests[@]})); then node --test "${tests[@]}"; fi
+      - name: Run three-way replay when present
+        shell: bash
+        run: |
+          if test -f bench/operator-ab.mjs; then node bench/operator-ab.mjs; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-report
+          path: bench/operator*.report.*
+          if-no-files-found: ignore
