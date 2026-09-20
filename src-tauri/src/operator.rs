@@ -40,16 +40,21 @@ pub(crate) fn tool_definition() -> Value {
 
 fn operator_tools() -> Vec<Tool> {
     [
-        ("chrome", crate::chrome_browser::tool_definition()),
-        ("jianlai", crate::jianlai::tool_definition()),
+        (
+            "chrome",
+            crate::chrome_browser::tool_definition(),
+            "Operate the user's existing Chrome with its logged-in state. Start from tabs/status or an already-known tabTag; use inspect for DOM state and act for 1-8 already-determined actions. Screenshot/coordinate actions are available for visual or Canvas targets. After navigation or uncertainty, observe again. executed/needs_review is not business success, and a timeout/lost reply must be verified before replaying a side effect. Experience lookup/save is optional.",
+        ),
+        (
+            "jianlai",
+            crate::jianlai::tool_definition(),
+            "Operate the real desktop with screenshots plus mouse/keyboard. Use windows/screenshot to establish the current target, then act with the latest snapshotId/imageId for 1-8 already-determined actions. Do not guess stale coordinates; focus/window changes require a new observation. not_executed/needs_review/executed describe input state, not business success. Experience lookup/save is optional.",
+        ),
     ]
     .into_iter()
-    .map(|(name, definition)| Tool {
+    .map(|(name, definition, description)| Tool {
         name,
-        description: definition["description"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
+        description: description.to_string(),
         parameters: definition["inputSchema"].clone(),
     })
     .collect()
