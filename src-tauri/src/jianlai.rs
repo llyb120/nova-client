@@ -16,6 +16,47 @@ fn err(e: impl std::fmt::Display) -> String {
 // ponytail: one desktop, one outstanding observation and a global try-lock; use a desktop broker if independent seats are needed.
 static DESKTOP: Mutex<Option<Snapshot>> = Mutex::new(None);
 static OBSERVATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+// One real screen: chrome tab/focus/navigation changes and jianlai input must never interleave.
+// The lease is a plain marker (no MutexGuard held across awaits) so chrome's async path can hold it.
+static INPUT_LEASE: Mutex<Option<(&'static str, Instant, u64)>> = Mutex::new(None);
+static INPUT_LEASE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+
+pub(crate) struct InputLease(u64);
+impl Drop for InputLease {
+    fn drop(&mut self) {
+        if let Ok(mut lease) = INPUT_LEASE.lock() {
+            if lease.is_some_and(|(_, _, id)| id == self.0) { *lease = None; }
+        }
+    }
+}
+/// Claim the desktop for one tool call. A concurrent claim by the other tool fails fast with a
+/// clear reason instead of racing keystrokes against a tab switch; cancellation/unwinding releases the lease through Drop.
+pub(crate) fn lease_input(tool: &'static str) -> Result<InputLease> {
+    let mut lease = INPUT_LEASE.lock().map_err(|_| "输入闸门不可用")?;
+    if let Some((holder, since, _)) = *lease {
+        // A live call may exceed 30s (16 waits alone can take 32s); only Drop releases it.
+        return Err(format!(
+            "{holder} 正在操作桌面/浏览器（已 {}ms），本次未执行；等待其结果返回后再调用，不要并行调用 chrome 与 jianlai",
+            since.elapsed().as_millis()
+        ));
+    }
+    let id = INPUT_LEASE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    *lease = Some((tool, Instant::now(), id));
+    Ok(InputLease(id))
+}
+/// Called by chrome after it changed what is on screen (tab switch, navigation, input). The stale
+/// desktop snapshot then fails explicitly with this reason and a fresh observation instead of
+/// tripping the foreground/pixel guards mid-batch. Returns whether a live snapshot was affected.
+pub(crate) fn invalidate_desktop(reason: &str) -> bool {
+    match DESKTOP.try_lock() {
+        Ok(mut state) => match state.as_mut() {
+            Some(snap) if snap.invalidated.is_none() => { snap.invalidated = Some(reason.to_string()); true }
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
 
 pub(crate) fn tool_definition() -> Value {
     serde_json::from_str(include_str!("../../scripts/jianlai-tool.json")).unwrap()
@@ -60,6 +101,7 @@ struct Snapshot {
     max_edge: u32,
     foreground: Option<(u32, u32)>,
     shots: Vec<Shot>,
+    invalidated: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -76,6 +118,8 @@ struct Request {
     max_edge: Option<u32>,
     image_path: Option<String>,
     notes: Option<String>,
+    query: Option<String>,
+    observe: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -377,6 +421,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         max_edge,
         foreground: before,
         shots,
+        invalidated: None,
     });
     Ok(
         json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,
@@ -398,6 +443,15 @@ fn visible_window_crop(window: &Surface, monitor: &Surface, image: &xcap::image:
         return Err("窗口跨屏、部分离屏或屏幕像素比例不一致，请使用monitorId截图定位".into());
     }
     Ok(xcap::image::imageops::crop_imm(image, x as u32, y as u32, window.width, window.height).to_image())
+}
+
+fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>, actions: &[Action]) -> Result<&'a Shot> {
+    if let Some(id) = image_id {
+        if let Some(shot) = shots.iter().find(|s| s.image_id == id) { return Ok(shot); }
+    } else if shots.len() == 1 && !actions.is_empty() && actions.iter().all(|a| matches!(a.action.as_str(), "press" | "type" | "wait")) {
+        return Ok(&shots[0]);
+    }
+    Err(format!("imageId缺失或不属于此截图；可用imageId：{}。沿用当前snapshotId并修正imageId，无需重新截图；裁剪图坐标从(0,0)开始，不加region偏移", shots.iter().map(|s| s.image_id.as_str()).collect::<Vec<_>>().join(", ")))
 }
 
 fn point(shot: &Shot, x: Option<i32>, y: Option<i32>) -> Result<(i32, i32)> {
@@ -766,11 +820,74 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
     {
         return Err("无效feedback".into());
     }
+    if (request.query.is_some() || request.observe.is_some()) && request.operation != "windows" {
+        return Err("query/observe仅用于windows".into());
+    }
     let mut state = DESKTOP
         .try_lock()
         .map_err(|_| "剑来正在操作桌面，请勿并行调用")?;
     match request.operation.as_str() {
-        "windows" => windows(),
+        "windows" => {
+            // One round-trip start: list windows and, on request, observe the bound target immediately.
+            let mut result = windows()?;
+            let all = result["windows"].as_array().cloned().unwrap_or_default();
+            let mut target = request.window_id;
+            if let Some(q) = request.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+                let q = q.to_lowercase();
+                let matched: Vec<Value> = all.iter().filter(|w| ["app", "title"].iter()
+                    .any(|k| w[*k].as_str().is_some_and(|s| s.to_lowercase().contains(&q)))).cloned().collect();
+                let usable: Vec<&Value> = matched.iter().filter(|w| w["minimized"] != true
+                    && w["width"].as_u64().unwrap_or(0) > 32 && w["height"].as_u64().unwrap_or(0) > 32).collect();
+                result["totalWindows"] = json!(all.len());
+                result["query"] = json!(q);
+                match usable.as_slice() {
+                    [one] if target.is_none() => target = one["windowId"].as_u64().map(|id| id as u32),
+                    [] => result["next"] = json!("没有可见窗口匹配query（最小化窗口需先在桌面恢复）；核对完整列表或换关键词"),
+                    _ if target.is_none() => result["next"] = json!("query匹配到多个窗口，请指定windowId后再screenshot/windows(observe)"),
+                    _ => (),
+                }
+                result["windows"] = json!(matched);
+            }
+            if request.observe == Some(true) {
+                // Background windows capture via PrintWindow; the fallback is the focused window, then the desktop.
+                let focused = all.iter().find(|w| w["focused"] == true && w["minimized"] != true)
+                    .and_then(|w| w["windowId"].as_u64()).map(|id| id as u32);
+                let window_id = target.or(focused);
+                match capture(&owner, window_id, None, None, max_edge, false, &mut state) {
+                    Ok(observed) => {
+                        result.as_object_mut().unwrap().extend(observed.as_object().unwrap().clone());
+                        result["observedWindowId"] = json!(window_id);
+                        result["observedBy"] = json!(if target.is_some() {"query/windowId"} else if focused.is_some() {"foreground"} else {"desktop"});
+                    }
+                    Err(e) => result["observationError"] = json!(e),
+                }
+            }
+            Ok(result)
+        }
+        "activate" => {
+            let id = request.window_id.ok_or("activate需要windows返回的windowId（不是pid）")?;
+            let target = window(id)?;
+            let _lease = lease_input("jianlai")?;
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindow, SetForegroundWindow, SW_RESTORE};
+                let hwnd = id as usize as windows_sys::Win32::Foundation::HWND;
+                *state = None;
+                unsafe {
+                    if IsIconic(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
+                    SetForegroundWindow(hwnd);
+                }
+                std::thread::sleep(Duration::from_millis(150));
+                if foreground()? != Some((id, target.pid().map_err(err)?)) {
+                    return Err("系统未允许激活该窗口；请观察当前桌面，不要重复激活或发送按键".into());
+                }
+                let mut result = capture(&owner, Some(id), None, None, max_edge, false, &mut state)?;
+                result["activated"] = json!(true);
+                Ok(result)
+            }
+            #[cfg(not(windows))]
+            { let _ = target; Err("activate当前仅支持Windows，请通过桌面可见入口切窗".into()) }
+        }
         "screenshot" => {
             if request.window_id.is_some() && request.monitor_id.is_some() {
                 return Err("windowId和monitorId不能同时用于截图".into());
@@ -788,6 +905,9 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             };
             let mut result = capture(&owner, wid, mid, region, max_edge, false, &mut state)?;
             result["notes"] = json!(request.notes);
+            if region.is_some() {
+                result["coordinateNotice"] = json!("这是新裁剪图：act坐标从此图左上角(0,0)开始，禁止加region偏移或使用显示放大后的坐标；按images中的width/height定位。新snapshotId/imageId替换旧图，act反馈恢复完整窗口。");
+            }
             Ok(result)
         }
         "recall" => {
@@ -822,6 +942,15 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, false, &mut state, &mut result);
                 return Ok(result);
             }
+            if let Some(reason) = snap.invalidated.clone() {
+                let window_id = snap.window;
+                let max_edge = snap.max_edge;
+                let mut result = json!({"status":"not_executed","completedActions":0,
+                    "error":format!("快照在截图后被其它工具改变的画面作废：{reason}；附当前观察，请基于新图重新决策")});
+                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, false, &mut state, &mut result);
+                return Ok(result);
+            }
+            let _lease = lease_input("jianlai")?;
             if snap.window.is_some() && request.window_id.is_some() && request.window_id != snap.window {
                 return Err("windowId与截图不符".into());
             }
@@ -832,8 +961,8 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 .cloned()
                 .ok_or("imageId不属于此截图")?;
             let actions = request.actions.ok_or("缺少actions")?;
-            if actions.is_empty() || actions.len() > 8 {
-                return Err("每次需要1至8个动作".into());
+            if actions.is_empty() || actions.len() > 16 {
+                return Err("每次需要1至16个动作".into());
             }
             for (index, a) in actions.iter().enumerate() {
                 if let Err(e) = validate(a, &shot) {
@@ -1094,6 +1223,14 @@ mod tests {
             pixels: (3840, 2160),
             source_pixels: (3840, 2160), region: None,
         };
+        let keyboard: Vec<Action> = serde_json::from_value(json!([{"action":"press","key":"Alt+Tab"}])).unwrap();
+        let shots = vec![shot.clone()];
+        assert_eq!(action_shot(&shots, None, &keyboard).unwrap().image_id, "test");
+        assert!(action_shot(&shots, Some("wrong"), &keyboard).is_err());
+        assert!(action_shot(&[shot.clone(), shot.clone()], None, &keyboard).is_err());
+        let click: Vec<Action> = serde_json::from_value(json!([{"action":"click","x":1,"y":1}])).unwrap();
+        assert!(action_shot(&shots, None, &click).is_err());
+        assert!(action_shot(&shots, Some("test"), &click).is_ok());
         assert_eq!(point(&shot, Some(1920), Some(1080)).unwrap(), (-960, 540));
         assert!(point(&shot, Some(3840), Some(0)).is_err());
         assert!(point(&shot, Some(-1), Some(0)).is_err());
@@ -1133,7 +1270,7 @@ mod tests {
         let shot = Shot { guard: None, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
-            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot]});
+            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None});
         let foreign = run("other-owner".into(), json!({"operation":"act","snapshotId":"old"})).unwrap();
         assert_eq!(foreign["completedActions"], 0);
         assert!(foreign.get("images").is_none());
@@ -1143,6 +1280,18 @@ mod tests {
         assert_eq!(result["status"], "not_executed");
         assert_eq!(result["completedActions"], 0);
         assert!(result["error"].as_str().unwrap().contains("actions[1].ms=8000"));
+        let mut actions = vec![json!({"action":"wait","ms":0});16];
+        actions[15] = json!({"action":"wait","ms":8000});
+        let result = run("validation".into(), json!({"operation":"act","snapshotId":"validation",
+            "imageId":"monitor-1","actions":actions})).unwrap();
+        assert_eq!(result["completedActions"], 0);
+        assert!(result["error"].as_str().unwrap().contains("actions[15].ms=8000"));
+        actions.push(json!({"action":"wait","ms":0}));
+        let result = run("validation".into(), json!({"operation":"act","snapshotId":"validation",
+            "imageId":"monitor-1","actions":actions})).unwrap();
+        assert_eq!(result["status"], "not_executed");
+        assert_eq!(result["completedActions"], 0);
+        assert!(result["error"].as_str().unwrap().contains("1至16"));
         assert!(DESKTOP.lock().unwrap().take().is_some());
         let invalid = run("validation".into(), json!({"operation":"act","actions":[{"action":"wait","ms":-1}]})).unwrap();
         assert_eq!(invalid["status"], "not_executed");
