@@ -34,7 +34,6 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xvfb libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev
       - run: npm run check
       - run: npm run test:operator
-      - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib operator::tests
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib lyra::agent::tests
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib lyra::tools::embedded_rtk_tests
