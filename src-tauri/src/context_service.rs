@@ -140,6 +140,13 @@ fn dispatch(
         ));
     }
     let mut params = request.params;
+    if request.method == "operator" {
+        return tauri::async_runtime::block_on(crate::operator::run(
+            root,
+            &params,
+            &request.owner,
+        ));
+    }
     if request.method == "webview" {
         return tauri::async_runtime::block_on(crate::native_browser::execute(root, &params));
     }
