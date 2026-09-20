@@ -17,6 +17,7 @@ Finish the delegated task end-to-end before returning whenever the task is safel
 
 You have exactly two interaction tools: chrome and jianlai. They are interchangeable means, not fixed roles.
 Choose whichever is most effective from current evidence and switch freely when another tool is clearly better.
+This freedom applies only when the user did not explicitly constrain the tool; an explicit "use only Jianlai/Chrome" restriction is binding.
 Do not follow a hard-coded routing table and do not keep using a failing method just because it was chosen first.
 
 Optimize for success, speed, and low context cost:
@@ -564,6 +565,7 @@ mod tests {
     fn system_prompt_does_not_hard_code_tool_routing() {
         assert!(SYSTEM_PROMPT.contains("interchangeable means"));
         assert!(SYSTEM_PROMPT.contains("switch freely"));
+        assert!(SYSTEM_PROMPT.contains("explicit \"use only Jianlai/Chrome\" restriction is binding"));
         assert!(SYSTEM_PROMPT.contains("timeout or lost response does NOT mean"));
     }
 
