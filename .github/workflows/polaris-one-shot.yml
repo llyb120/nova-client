@@ -68,12 +68,13 @@ jobs:
           python3 scripts/polaris-coverage-balance.py
           python3 scripts/polaris-source-edges.py
           python3 scripts/polaris-working-set-guidance.py
+          python3 scripts/polaris-connected-packet.py
           git diff -- src-tauri/src/nova_tools_native src-tauri/src/lyra/tools.rs scripts/ctx-core.mjs scripts/polaris-query.mjs scripts/polaris-one-shot-edit.py > validation/production.patch
           git diff --exit-code -- src-tauri/src/lyra/reasonix.rs
           git rev-parse HEAD > validation/base-commit.txt
           cp src-tauri/src/nova_tools_native/polaris*.rs validation/source/
           cp src-tauri/src/lyra/tools.rs validation/source/lyra-tools.rs
-          cp scripts/polaris-fastcontext-*.py scripts/polaris-one-shot-*.py scripts/polaris-context-*.py scripts/polaris-shallow-closure.py scripts/polaris-precision-budget.py scripts/polaris-coverage-balance.py scripts/polaris-source-edges.py scripts/polaris-working-set-guidance.py scripts/polaris-ab.py scripts/polaris-query.mjs scripts/ctx-core.mjs validation/scripts/
+          cp scripts/polaris-fastcontext-*.py scripts/polaris-one-shot-*.py scripts/polaris-context-*.py scripts/polaris-shallow-closure.py scripts/polaris-precision-budget.py scripts/polaris-coverage-balance.py scripts/polaris-source-edges.py scripts/polaris-working-set-guidance.py scripts/polaris-connected-packet.py scripts/polaris-ab.py scripts/polaris-query.mjs scripts/ctx-core.mjs validation/scripts/
           sha256sum src-tauri/src/nova_tools_native/polaris*.rs src-tauri/src/nova_tools_native/context.rs src-tauri/src/lyra/reasonix.rs src-tauri/src/lyra/tools.rs scripts/polaris-query.mjs scripts/ctx-core.mjs > validation/source-hashes.txt
           git -C _corpus archive HEAD src src-tauri/src scripts .gitignore | gzip > validation/corpus-source.tar.gz
       - name: Production regression tests and fresh release build
@@ -112,6 +113,28 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/polaris-fastcontext-scale.py --previous "$GITHUB_WORKSPACE/validation/bin/previous" --candidate "$GITHUB_WORKSPACE/validation/bin/candidate" | tee validation/scale-progress.txt
+      - name: Explicit coverage and latency acceptance, not only process exit codes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import json,pathlib
+          root=pathlib.Path('validation')
+          r=json.loads((root/'fastcontext/report.json').read_text())
+          edit=json.loads((root/'context-only-edit/report.json').read_text())
+          summary=r['summary'];b=summary['regression']['pr11'];c=summary['regression']['demand'];closure=summary['closure']['demand']['cold']
+          checks={
+            'all_queries_returned':all(row['ok'] for row in r['rows']),
+            'fixed_core_coverage_no_regression':c['cold']['coreBody']>=b['cold']['coreBody'],
+            'fixed_top1_no_regression':c['cold']['top1']>=b['cold']['top1'],
+            'four_required_closures':closure['allRequired']==4,
+            'four_context_only_edits':edit['passed']==edit['total']==4,
+            'cold_p50_under_650ms':c['cold']['p50Ms']<=650,
+            'warm_p50_under_80ms':c['warm']['p50Ms']<=80,
+          }
+          report={'passed':all(checks.values()),'checks':checks,'scope':'Known regression corpus and deterministic edits; not general LLM accuracy.'}
+          (root/'acceptance.json').write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
+          raise SystemExit(0 if report['passed'] else 1)
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
