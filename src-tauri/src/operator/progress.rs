@@ -40,7 +40,7 @@ impl Progress {
             .last()
             .is_some_and(|last| self.recent_checks.iter().filter(|v| *v == last).count() >= 3)
         {
-            v["repeatWarning"] = json!("Repeated check without recorded progress. Consult acceptanceFacts/checkpoint, name the missing evidence, and avoid the same check. This warning is not proof of completion or unchanged UI.");
+            v["repeatWarning"] = json!("Repeated semantically equivalent operation without objective progress. Do not keep toggling the same control. Consult acceptanceFacts/checkpoint and switch strategy. For an unreadable native SELECT/dropdown popup, focus it once, use keyboard navigation or first-letter selection plus Enter, then verify the closed selected value. This warning is advisory, not proof of completion or unchanged UI.");
         }
         v
     }
@@ -146,6 +146,61 @@ fn merge_patch(base: &mut Value, patch: &Value, depth: usize) -> Result<(), Stri
 fn digest(v: &Value) -> String {
     format!("{:x}", Sha256::digest(v.to_string().as_bytes()))
 }
+
+// Loop detection must not treat rewritten prose as progress. Keep objective
+// counters/booleans/array growth, while ignoring free-form checkpoint strings.
+fn checkpoint_progress_signal(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let out = map
+                .iter()
+                .filter_map(|(key, value)| {
+                    let signal = checkpoint_progress_signal(value);
+                    let empty = signal.is_null()
+                        || signal.as_object().is_some_and(|m| m.is_empty())
+                        || signal.as_array().is_some_and(|a| a.is_empty());
+                    (!empty).then(|| (key.clone(), signal))
+                })
+                .collect();
+            Value::Object(out)
+        }
+        Value::Array(items) => {
+            let values = items
+                .iter()
+                .map(checkpoint_progress_signal)
+                .filter(|v| !v.is_null())
+                .collect::<Vec<_>>();
+            json!({"len":items.len(),"values":values})
+        }
+        Value::Number(_) | Value::Bool(_) => value.clone(),
+        Value::String(text) => text
+            .parse::<u64>()
+            .ok()
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+        Value::Null => Value::Null,
+    }
+}
+
+fn decision_progress_key(d: &Decision, checkpoint: &Value, facts: &BTreeMap<usize, Fact>) -> String {
+    let mut params = d.params.clone();
+    if let Some(map) = params.as_object_mut() {
+        // Snapshot/image IDs are intentionally fresh, and notes are model prose;
+        // none of them make a repeated native operation new work.
+        for key in ["snapshotId", "imageId", "notes"] {
+            map.remove(key);
+        }
+    }
+    let fact_state = facts
+        .values()
+        .map(|f| json!([f.claim.criterion, f.stale]))
+        .collect::<Vec<_>>();
+    digest(&json!([
+        params,
+        checkpoint_progress_signal(checkpoint),
+        fact_state
+    ]))
+}
 impl Task {
     fn next_checkpoint(&self, d: &Decision) -> Result<Value, String> {
         if d.checkpoint.is_some() && d.checkpoint_patch.is_some() {
@@ -216,18 +271,7 @@ impl Task {
             );
         }
         if matches!(d.kind.as_str(), "observe" | "act") {
-            let mut params = d.params.clone();
-            if let Some(m) = params.as_object_mut() {
-                m.remove("snapshotId");
-                m.remove("imageId");
-            }
-            let facts: Vec<_> = self
-                .progress
-                .facts
-                .values()
-                .map(|f| json!([f.claim.criterion, f.claim.detail, f.stale]))
-                .collect();
-            let key = digest(&json!([params, self.checkpoint, facts]));
+            let key = decision_progress_key(d, &self.checkpoint, &self.progress.facts);
             self.progress.recent_checks.push(key);
             if self.progress.recent_checks.len() > 8 {
                 self.progress.recent_checks.remove(0);
@@ -435,6 +479,46 @@ mod tests {
         .unwrap();
         assert!(t.progress.context().get("repeatWarning").is_none());
     }
+    #[test]
+    fn checkpoint_prose_churn_does_not_hide_a_repeated_native_loop() {
+        let mut t = task();
+        for i in 0..3 {
+            let d = decision(json!({
+                "kind":"act",
+                "params":{
+                    "operation":"act",
+                    "snapshotId":format!("s{i}"),
+                    "imageId":format!("i{i}"),
+                    "actions":[{"action":"click","x":92,"y":495}],
+                    "notes":format!("attempt {i}: visually inspect the popup again")
+                },
+                "checkpointPatch":{
+                    "notes":format!("narrative rewrite {i}"),
+                    "coverage":format!("same control, wording {i}")
+                }
+            }));
+            t.apply_progress(&d).unwrap();
+        }
+        assert!(t.progress.context().get("repeatWarning").is_some());
+    }
+
+    #[test]
+    fn objective_numeric_checkpoint_progress_breaks_the_repeat_key() {
+        let mut t = task();
+        let d = decision(json!({"kind":"observe","params":{"operation":"inspect","tabTag":"t1"}}));
+        for _ in 0..3 {
+            t.apply_progress(&d).unwrap();
+        }
+        assert!(t.progress.context().get("repeatWarning").is_some());
+        t.apply_progress(&decision(json!({
+            "kind":"observe",
+            "params":d.params,
+            "checkpointPatch":{"page":2}
+        })))
+        .unwrap();
+        assert!(t.progress.context().get("repeatWarning").is_none());
+    }
+
     #[test]
     fn older_persisted_tasks_default_to_empty_progress() {
         let t = task();
