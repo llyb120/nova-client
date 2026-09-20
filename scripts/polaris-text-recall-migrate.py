@@ -67,5 +67,14 @@ s=sub(s,'let start = hit.saturating_sub(8); let end = (hit + 48).min(source.len(
                 if b<=hit { start=start.max(b); }
                 if a>hit { end=end.min(a); }
             }''')
+s=sub(s,'    let query = LiteralQuery::new(q)?;', '''    // Behavior-to-implementation queries retain structural ranking. Literal
+    // payload requests (not filename whitelists) opt into direct-text priority;
+    // empty structural recall always has the raw fallback in this same call.
+    let words=query::tokens(&format!("{} {}",q.task,q.anchors.join(" ")));
+    let payload=q.doc_intent||words.iter().any(|w|matches!(w.as_str(),
+        "sql"|"xml"|"yaml"|"yml"|"json"|"toml"|"properties"|"ini"|"markdown"))
+        ||["查询语句","配置内容","模板内容","字符串常量","字面量","报错原文","错误原文"].iter().any(|w|q.task.contains(w));
+    if !payload && !units.is_empty(){return Ok((Vec::new(),false));}
+    let query = LiteralQuery::new(q)?;''')
 p.write_text(s,encoding='utf-8')
 print('Restored source-text recall in one request; no global index or API call.')
