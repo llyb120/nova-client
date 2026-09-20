@@ -3369,6 +3369,19 @@ impl AcpManager {
         include_runtime_guidance: bool,
     ) -> Vec<Value> {
         let mut prompt = Self::build_prompt_blocks(text, images);
+        let operator_mode = {
+            let state = self.app.state::<AppState>();
+            let store = state.store.lock().unwrap();
+            store.get(thread_id).is_some_and(|thread| thread.operator_thread)
+        };
+        if operator_mode {
+            if self.kind == AgentKind::Devin {
+                prompt.insert(0, json!({ "type": "text", "text":
+                    "Operator child: only use nova-tools chrome/jianlai. Invoke them through mcp_call_tool with server_name=\"nova-tools\"; choose or switch between them freely. Do not use coding/shell tools for GUI control."
+                }));
+            }
+            return prompt;
+        }
         let mut guidance = Vec::new();
         if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi) {
             // ponytail: ACP has no system-prompt setter; repeat rules per turn so resumed
@@ -4144,11 +4157,19 @@ impl AcpManager {
             return Ok(json!([]));
         }
         let state = self.app.state::<AppState>();
-        let context_mode = {
+        let operator_mode = state
+            .store
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .is_some_and(|thread| thread.operator_thread);
+        let context_mode = if operator_mode {
+            "none".to_string()
+        } else {
             let settings = state.settings.lock().unwrap();
             settings.context_retrieval_mode.as_str().to_string()
         };
-        let auto_change_project = self.kind == AgentKind::CodeBuddy
+        let auto_change_project = !operator_mode && self.kind == AgentKind::CodeBuddy
             && state.settings.lock().unwrap().auto_change_project_enabled
             && !state.context_service.endpoint().is_empty();
         if !auto_change_project && state.context_service.endpoint().is_empty()
@@ -4163,6 +4184,14 @@ impl AcpManager {
             state.context_service.endpoint(),
             state.context_service.token(),
         )?;
+        server["env"].as_array_mut().unwrap().push(json!({
+            "name": "NOVA_PARENT_THREAD_ID", "value": thread_id
+        }));
+        if operator_mode {
+            server["env"].as_array_mut().unwrap().push(json!({
+                "name": "NOVA_OPERATOR_CHILD", "value": "1"
+            }));
+        }
         if auto_change_project {
             server["env"].as_array_mut().unwrap().push(json!({
                 "name": "NOVA_CWD_CHANGE_SCOPE", "value": self.cwd_change_scope(thread_id)
@@ -4954,6 +4983,7 @@ fn codebuddy_nova_tools_mcp_server_value(
         meta["tools"]["webview"] = json!({ "defer_loading": false });
         meta["tools"]["chrome"] = json!({ "defer_loading": false });
         meta["tools"]["jianlai"] = json!({ "defer_loading": false });
+        meta["tools"]["operator"] = json!({ "defer_loading": false });
     }
     json!({
         "name": "nova-tools",
@@ -5049,7 +5079,7 @@ fn prepare_devin_nova_tools_config(
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("创建 Devin MCP 配置目录失败：{e}"))?;
     let state = app.state::<AppState>();
-    let config = devin_nova_tools_config(
+    let mut config = devin_nova_tools_config(
         &node,
         &script,
         cwd,
@@ -5058,6 +5088,22 @@ fn prepare_devin_nova_tools_config(
         state.context_service.endpoint(),
         state.context_service.token(),
     );
+    if let Some(thread_id) = conn_key.strip_prefix("thread:") {
+        config["mcpServers"]["nova-tools"]["env"]["NOVA_PARENT_THREAD_ID"] =
+            Value::String(thread_id.to_string());
+        if state
+            .store
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .is_some_and(|thread| thread.operator_thread)
+        {
+            config["mcpServers"]["nova-tools"]["env"]["NOVA_OPERATOR_CHILD"] =
+                Value::String("1".into());
+            config["mcpServers"]["nova-tools"]["env"]["NOVA_FAST_CONTEXT"] =
+                Value::String("0".into());
+        }
+    }
     let bytes = serde_json::to_vec_pretty(&config)
         .map_err(|e| format!("序列化 Devin MCP 配置失败：{e}"))?;
     let path = config_dir.join("config.local.json");
@@ -5230,7 +5276,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
     if polaris {
         tool_names.extend(["polaris"]);
     }
-    if !read_only { tool_names.extend(["generate_image", "edit_image", "webview", "chrome", "jianlai"]); }
+    if !read_only { tool_names.extend(["generate_image", "edit_image", "webview", "chrome", "jianlai", "operator"]); }
     if tool_names.is_empty() {
         let mut lines = vec![
             "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."
@@ -5250,6 +5296,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
         "You have Nova MCP endpoints from server nova-tools ({tools}) plus Devin built-in tools. In this Devin version, {tools} are remote MCP tool names, NOT top-level callable Devin tools."
     );
     let mut lines = vec![
+        "For a complete multi-step GUI/desktop task, prefer one operator call with the end goal and necessary constraints. Operator chooses or switches chrome/jianlai itself; use the raw tools directly only for a truly atomic action or when Operator returns blocked/needs_input.".to_string(),
         format!(
             "ROUTING RULE — before choosing any tool: Nova endpoints must NEVER be selected as direct tool calls. Select Devin's top-level mcp_call_tool first, then pass server_name=\"nova-tools\" and the endpoint name in tool_name. {nova_tools_phrase} Never select or invoke any of those names directly, even after mcp_list_tools lists them; a direct invocation produces `Unknown tool ... This tool is not available.` Your only valid execution path for a Nova tool is Devin's generic mcp_call_tool wrapper. Set server_name to the top-level string \"nova-tools\" (never omit it or put it inside arguments), and put only the selected Nova tool's inputs in arguments. Example: {example}. Follow the wrapper's declared tool-name field if its schema uses a different spelling. The available Nova tools are already stated above; do not call mcp_list_tools merely to discover them. In every rule below, wording such as `use/call {call_example_name}` means `call mcp_call_tool with server_name nova-tools and tool_name {call_example_name}`; it never authorizes a direct tool call. If a direct call reports `Unknown tool`, retry once through mcp_call_tool. If parsing reports missing field `server_name`, correct the wrapper call once. Never repeat a malformed call unchanged. The following tool-selection rules are hard constraints."
         ),
