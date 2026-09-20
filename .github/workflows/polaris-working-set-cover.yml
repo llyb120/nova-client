@@ -56,7 +56,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y ripgrep
           mkdir -p validation .cargo
           printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
-          python scripts/polaris-dependency-prune-migrate.py
+          python scripts/polaris-initial-beam-migrate.py
           git diff -- src-tauri/src/nova_tools_native > validation/production.patch
           git diff --exit-code -- src-tauri/src/lyra/reasonix.rs src-tauri/src/nova_tools_native/context.rs
           git rev-parse HEAD > validation/tested-base.txt
@@ -115,7 +115,7 @@ jobs:
           set -euo pipefail
           mkdir -p validation .cargo
           printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
-          python scripts/polaris-dependency-prune-migrate.py
+          python scripts/polaris-initial-beam-migrate.py
           cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
           node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs scripts/ctx-core.test.mjs 2>&1 | tee validation/node-tests.txt
           sha256sum src-tauri/src/nova_tools_native/polaris*.rs src-tauri/src/lyra/reasonix.rs > validation/source-hashes.txt
@@ -161,10 +161,10 @@ jobs:
           subprocess.run(['git','apply',str(patch)],check=True)
           subprocess.run(['git','add','--',*sorted(paths)],check=True)
           PY
-          git rm scripts/polaris-dependency-prune-migrate.py
+          git rm scripts/polaris-initial-beam-migrate.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'perf(polaris): skip impossible dependency files before syntax parsing'
+          git commit -m 'perf(polaris): reduce initial syntax parse beam without losing working-set coverage'
           git push origin HEAD:perf/polaris-semantic-20260919
           mkdir -p validation
           git rev-parse HEAD > validation/landed-commit.txt
