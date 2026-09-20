@@ -1,0 +1,35 @@
+{
+  "name": "operator",
+  "description": "把一个完整的 GUI / 桌面任务交给独立上下文的 Operator 一次完成。Operator 会根据现场自主选择、组合或切换 chrome 与 jianlai，不固定路线；已经确定的连续步骤尽量一次完成，只有出现新的不确定信息时才重新观察和判断。适合多步骤、跨 Chrome/桌面、或主会话历史很多的交互任务。简单单步操作可直接使用原工具。不要把目标拆成鼠标级步骤。",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "goal": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4000,
+        "description": "完整任务目标，说明最终要完成什么，而不是下一次点击什么"
+      },
+      "facts": {
+        "type": "array",
+        "maxItems": 20,
+        "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "description": "完成任务确实需要、且已知为真的当前事实；只传必要内容"
+      },
+      "constraints": {
+        "type": "array",
+        "maxItems": 20,
+        "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "description": "用户限制、不能做的事或授权边界"
+      },
+      "successCriteria": {
+        "type": "array",
+        "maxItems": 20,
+        "items": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "description": "可观察、可核实的完成条件"
+      }
+    },
+    "required": ["goal"],
+    "additionalProperties": false
+  }
+}
