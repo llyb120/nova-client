@@ -647,6 +647,7 @@ struct SteerTurnState {
 // CodeBuddy 的 usage 通知是单次模型消息快照；重复通知覆盖，同轮多次模型调用累加。
 #[derive(Default)]
 struct CodeBuddyTurnUsage {
+    incomplete: bool,
     messages: HashMap<String, (u64, u64)>,
 }
 
@@ -677,6 +678,14 @@ fn codebuddy_turn_usage_deduplicates_model_messages() {
 }
 
 impl CodeBuddyTurnUsage {
+    fn add_operator(&mut self, run_id: &str, metrics: &Value) {
+        let complete = metrics["usageComplete"] == true;
+        let usage = if complete { &metrics["usage"] } else { &metrics["knownUsage"] };
+        if let (Some(input), Some(output)) = (usage["inputTokens"].as_u64(), usage["outputTokens"].as_u64()) {
+            self.messages.insert(format!("nova-operator:{run_id}"), (input, output));
+        } else { self.incomplete = true; }
+        if !complete { self.incomplete = true; }
+    }
     fn update(&mut self, update: &Value) {
         let Some(meta) = update.get("_meta") else { return };
         let Some(id) = meta.get("codebuddy.ai/messageId").and_then(Value::as_str).filter(|id| !id.is_empty()) else { return };
@@ -688,10 +697,11 @@ impl CodeBuddyTurnUsage {
     }
 
     fn finish(self) -> Option<Value> {
-        if self.messages.is_empty() { return None; }
+        if self.messages.is_empty() && !self.incomplete { return None; }
         let (input, output) = self.messages.values().fold((0u64, 0u64), |(input, output), (i, o)| {
             (input.saturating_add(*i), output.saturating_add(*o))
         });
+        if self.incomplete { return Some(json!({"usageComplete":false,"knownUsage":{"inputTokens":input,"outputTokens":output}})); }
         Some(json!({ "inputTokens": input, "outputTokens": output, "totalTokens": input.saturating_add(output) }))
     }
 }
@@ -3633,7 +3643,7 @@ impl AcpManager {
         };
         let t_ensure = std::time::Instant::now();
         let mut session_id = self.ensure_session(thread_id, require_restore).await?;
-        let _operator_registration=operator::bind(self,thread_id,&session_id);
+        let mut _operator_registration=operator::bind(self,thread_id,&session_id);
         if !self.is_running(thread_id) || !cwd_changes.is_current() {
             return Err("任务已停止".into());
         }
@@ -3707,6 +3717,7 @@ impl AcpManager {
                     self.clear_thread_session_for_respawn(thread_id);
                 }
                 session_id = self.ensure_session(thread_id, require_restore).await?;
+                _operator_registration=operator::bind(self,thread_id,&session_id);
                 conn = self.conn_for_key(&conn_key).await;
                 if conn.is_none() {
                     last_err = format!("{} 未连接", self.kind.label());

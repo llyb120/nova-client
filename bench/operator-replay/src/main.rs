@@ -10,17 +10,15 @@ fn main(){
     let jianlai:Value=serde_json::from_str(include_str!("../../../scripts/jianlai-tool.json")).unwrap();
     let full_contracts=json!({"chrome":chrome,"jianlai":jianlai});
     let mut compact_contracts=full_contracts.clone();
-    // Keep exactly the production native schemas; capability-description difference
-    // is separated from history-only savings in the reported native-schema bytes.
-    for tool in ["chrome","jianlai"]{compact_contracts[tool]["description"]=json!("Native input contract; choose tool freely, validate current target, do not replay uncertain inputs.");}
+    for tool in [Tool::Chrome,Tool::Jianlai]{compact_contracts[tool.name()]["description"]=json!(core::capability_description(tool));}
     let cases=[("single-step",2,0),("form",6,0),("cross-app-otp",10,32*1024),("long-history",24,128*1024),("long-table",30,32*1024),("canvas",12,16*1024),("tool-switches",20,64*1024),("navigation",16,16*1024),("same-name-targets",8,32*1024),("stale-observation",18,64*1024)];
     let mut rows=Vec::new();
     for (name,rounds,noise) in cases{
         for (label,mode) in [("A-reference-envelope",Mode::Original),("B-isolated",Mode::Isolated),("C-adaptive",Mode::Adaptive)]{
-            let mut latencies=Vec::new();let mut total_bytes=0;let mut peak_bytes=0;let mut count=0;
+            let mut latencies=Vec::new();let mut total_bytes=0;let mut peak_bytes=0;let mut count=0;let mut total_history_bytes=0;
             for _ in 0..25{
                 let task:Task=serde_json::from_value(json!({"goal":name,"constraints":["do not submit twice"],"successCriteria":["fixture result visible"]})).unwrap();
-                let mut s=State::new(task,mode).unwrap();let mut original_messages=Vec::new();let started=Instant::now();let mut bytes=0;let mut peak=0;
+                let mut s=State::new(task,mode).unwrap();let mut original_messages=Vec::new();let started=Instant::now();let mut bytes=0;let mut peak=0;let mut history_bytes=0;
                 for n in 0..rounds{
                     let tool=if n%3==0{Tool::Jianlai}else{Tool::Chrome};
                     let args=json!({"operation":if tool==Tool::Chrome{"inspect"}else{"screenshot"}});
@@ -31,13 +29,14 @@ fn main(){
                     let request=if mode==Mode::Original{json!({"parentHistory":"unrelated history ".repeat(noise/18),"nativeTools":full_contracts,"messages":original_messages,"task":name})}
                         else{let mut f=s.frame(None).unwrap();f["nativeTools"]=if mode==Mode::Adaptive{compact_contracts.clone()}else{full_contracts.clone()};f};
                     let len=serde_json::to_vec(&request).unwrap().len();bytes+=len;peak=peak.max(len);
+                    let mut history=request.clone();history.as_object_mut().unwrap().remove("nativeTools");history_bytes+=serde_json::to_vec(&history).unwrap().len();
                 }
-                latencies.push(started.elapsed().as_secs_f64()*1000.);total_bytes=bytes;peak_bytes=peak;count=rounds;
+                latencies.push(started.elapsed().as_secs_f64()*1000.);total_bytes=bytes;peak_bytes=peak;count=rounds;total_history_bytes=history_bytes;
             }
             latencies.sort_by(f64::total_cmp);
-            rows.push(json!({"case":name,"profile":label,"fixtureRounds":count,"repeats":25,"serializedInputBytesTotal":total_bytes,"peakSerializedInputBytes":peak_bytes,"assemblyMedianMs":latencies[12],"assemblyP95Ms":latencies[23],"actualModelCalls":null,"inputTokens":null,"outputTokens":null,"businessSuccess":null,"guiElapsedMs":null}));
+            rows.push(json!({"case":name,"profile":label,"fixtureRounds":count,"repeats":25,"serializedInputBytesTotal":total_bytes,"peakSerializedInputBytes":peak_bytes,"historyOnlyInputBytesTotal":total_history_bytes,"assemblyMedianMs":latencies[12],"assemblyP95Ms":latencies[23],"actualModelCalls":null,"inputTokens":null,"outputTokens":null,"businessSuccess":null,"guiElapsedMs":null}));
         }
     }
-    let report=json!({"kind":"synthetic-contract-context-replay","baselineCommit":"3da28d30f1adfd0da3b993813a47aa3fff20fdeb","sourceCommit":option_env!("GITHUB_SHA"),"nativeBatchLimitAllProfiles":8,"scope":"Same synthetic receipts in all profiles. A reconstructs a reference raw-tool envelope; it is NOT execution of the original Agent. B/C exercise the production State. No model or browser/desktop is invoked. Byte counts are NOT token counts. Assembly CPU time is NOT task latency. C replay uses a short capability placeholder, not the full production system prompt; isolated history-only byte counts should be used for stronger attribution.","rows":rows});
+    let report=json!({"kind":"synthetic-contract-context-replay","baselineCommit":"3da28d30f1adfd0da3b993813a47aa3fff20fdeb","sourceCommit":option_env!("GITHUB_SHA"),"nativeBatchLimitAllProfiles":8,"scope":"Same synthetic receipts in all profiles. A reconstructs a reference raw-tool envelope; it is NOT execution of the original Agent. B/C exercise the production State. No model or browser/desktop is invoked. Byte counts are NOT token counts. Assembly CPU time is NOT task latency. Native schemas and C capability descriptions are identical to production. All profile bytes exclude model protocol encoding, images and system prompts; history-only totals additionally exclude native tool definitions. B/C history policy comparison is not a behavioral or end-to-end A/B test.","rows":rows});
     let path=std::env::args().nth(1).unwrap_or("bench/operator-context.report.json".into());std::fs::write(&path,serde_json::to_vec_pretty(&report).unwrap()).unwrap();println!("wrote {path}: {} case/profile rows, 25 repetitions each; live metrics not measured",rows.len());
 }

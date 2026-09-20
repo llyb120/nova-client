@@ -48,11 +48,14 @@ pub(super) fn bind(parent:&Arc<AcpManager>, thread:&str, sid:&str) -> Option<Reg
          route.applied_effort.clone().or_else(||current_option(&config,"thought_level")))
     };
     let parent=parent.clone();let scope=parent.cwd_change_scope(thread);
-    let factory:Factory=Arc::new(move||Box::new(CodeBuddyModel::new(&parent,model.clone(),effort.clone())));
+    let thread=thread.to_owned();
+    let factory:Factory=Arc::new(move||Box::new(CodeBuddyModel::new(&parent,thread.clone(),model.clone(),effort.clone())));
     Some(crate::operator::register(scope,root,Arc::new(AtomicBool::new(false)),factory))
 }
 
 struct CodeBuddyModel {
+    parent: std::sync::Weak<AcpManager>,
+    parent_thread: String,
     manager: Arc<AcpManager>,
     settings: Settings,
     model: Option<String>,
@@ -63,11 +66,11 @@ struct CodeBuddyModel {
     directory: PathBuf,
 }
 impl CodeBuddyModel {
-    fn new(parent:&Arc<AcpManager>,model:Option<String>,effort:Option<String>)->Self {
+    fn new(parent:&Arc<AcpManager>,parent_thread:String,model:Option<String>,effort:Option<String>)->Self {
         let manager=AcpManager::new_with_env(parent.app.clone(),parent.kind.clone(),parent.launch_env.clone(),format!("operator-{}",uuid::Uuid::new_v4()));
         manager.operator_only.store(true,Ordering::SeqCst);
         let settings=parent.app.state::<AppState>().settings.lock().unwrap().clone();
-        Self{manager,settings,model,effort,conn:None,sid:String::new(),epoch:0,directory:std::env::temp_dir().join(format!("nova-operator-{}",uuid::Uuid::new_v4()))}
+        Self{parent:Arc::downgrade(parent),parent_thread,manager,settings,model,effort,conn:None,sid:String::new(),epoch:0,directory:std::env::temp_dir().join(format!("nova-operator-{}",uuid::Uuid::new_v4()))}
     }
     async fn open(&mut self)->Result<(),String>{
         let model=self.model.as_deref().filter(|s|!s.is_empty()).ok_or("Operator 无法核实主会话实际模型；请明确选择模型后重试")?;
@@ -86,6 +89,12 @@ impl CodeBuddyModel {
 }
 impl Drop for CodeBuddyModel {fn drop(&mut self){if let Some(conn)=self.conn.take(){conn.kill();}let _=std::fs::remove_dir_all(&self.directory);}}
 impl Model for CodeBuddyModel {
+    fn account_usage(&self,run_id:&str,metrics:&Value){
+        let Some(parent)=self.parent.upgrade() else{return};
+        let mut turns=parent.codebuddy_turn_usage.lock().unwrap();
+        let Some(turn)=turns.get_mut(&self.parent_thread) else{return};
+        turn.add_operator(run_id, metrics);
+    }
     fn identity(&self)->Value{json!({"agent":"codebuddy","transport":"isolated-acp","model":self.model,"reasoningEffort":self.effort,"inherited":self.model.is_some()&&self.effort.is_some()})}
     fn decide<'a>(&'a mut self,frame:&'a Value,schema:&'a Value,epoch:usize,cancel:&'a Arc<AtomicBool>)->ModelFuture<'a>{Box::pin(async move{
         let reset=self.conn.is_none()||epoch!=self.epoch;
@@ -118,6 +127,23 @@ impl Model for CodeBuddyModel {
 }
 
 #[cfg(test)]mod tests{
+    #[test]fn operator_usage_is_counted_once_with_parent(){
+        let mut u=super::CodeBuddyTurnUsage::default();
+        u.messages.insert("parent".into(),(40,5));
+        let child=serde_json::json!({"usageComplete":true,"usage":{"inputTokens":100,"outputTokens":20}});
+        u.add_operator("child-a",&child);u.add_operator("child-a",&child);
+        assert_eq!(u.finish().unwrap()["totalTokens"],165);
+    }
+    #[test]fn operator_unknown_usage_preserves_known_counts_without_fabricating_total(){
+        let mut u=super::CodeBuddyTurnUsage::default();
+        u.messages.insert("parent".into(),(40,5));
+        u.add_operator("child-a",&serde_json::json!({"usageComplete":false,"usage":null,"knownUsage":{"inputTokens":100,"outputTokens":20}}));
+        let v=u.finish().unwrap();assert_eq!(v["usageComplete"],false);assert!(v.get("totalTokens").is_none());assert_eq!(v["knownUsage"]["inputTokens"],140);
+    }
+    #[test]fn operator_unknown_usage_does_not_fall_back_to_parent_only_total(){
+        let mut u=super::CodeBuddyTurnUsage::default();u.add_operator("child-a",&serde_json::json!({}));
+        let v=u.finish().unwrap();assert_eq!(v["usageComplete"],false);assert!(v.get("totalTokens").is_none());
+    }
     use super::*;
     #[test]fn no_global_default_selection(){assert!(current_option(&json!({}),"model").is_none());assert_eq!(current_option(&json!({"configOptions":[{"id":"model","currentValue":"chosen"}]}),"model"),Some("chosen".into()));}
     #[test]fn capture_is_session_bound(){let mut c=Capture{sid:"mine".into(),..Default::default()};c.update(&json!({"sessionId":"other","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"secret"}}}));assert!(c.text.is_empty());c.update(&json!({"sessionId":"mine","update":{"sessionUpdate":"tool_call"}}));assert!(c.violation);}
