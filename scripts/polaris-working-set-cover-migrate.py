@@ -58,53 +58,31 @@ p.write_text(s,encoding="utf-8")
 
 # Stage 2: returned primary roots are also a working set, not four redundant top hits.
 p,s=load("polaris_packet.rs","6bb83220c054df5ec332d09da524a4fe1dc2a628")
-old='''    let scores=ranked.iter().copied().collect::<HashMap<_,_>>();
-    let mut roots=Vec::new();let mut owners=HashSet::new();let mut per_file=HashMap::<String,usize>::new();
+root_block='''    let mut roots=Vec::new();let mut owners=HashSet::new();let mut per_file=HashMap::<String,usize>::new();
     for &(id,_) in ranked{
         let u=&units[id];if *per_file.get(&u.file).unwrap_or(&0)>=2||!owners.insert(identity(u)){continue;}
         roots.push(id);*per_file.entry(u.file.clone()).or_default()+=1;if roots.len()>=4{break;}
     }
-    // One representative per declaration, not every overlapping slice.
-    let mut unique=Vec::new();let mut seen=HashSet::new();
-    for &(i,_) in ranked{if seen.insert(identity(&units[i])){unique.push(i);}}
-    for (i,u) in units.iter().enumerate(){if seen.insert(identity(u)){unique.push(i);}}
-    // Score the complete owner once. A parser's name may match strongly while
-    // the execution/cleanup branch is in a longer caller and a different slice.
-    let facets=q.facets();
-    let coverage=unique.iter().map(|&id| {
-        let u=&units[id];
-        let mut words=query::tokens(&u.source[u.owner_start-1..u.owner_end].join("\n")).into_iter().collect::<HashSet<_>>();
-        words.extend(u.name_terms.iter().cloned());
-        let mask=facets.iter().enumerate().filter_map(|(n,g)|g.split('|').any(|w|words.contains(w)).then_some(n)).collect::<HashSet<_>>();
-        (identity(u),mask)
-    }).collect::<HashMap<_,_>>();
-    let gains=|from:usize,to:usize|coverage[&identity(&units[to])].difference(&coverage[&identity(&units[from])]).count();'''
-new='''    let scores=ranked.iter().copied().collect::<HashMap<_,_>>();
-    // One representative per declaration, not every overlapping slice.
-    let mut unique=Vec::new();let mut seen=HashSet::new();
-    for &(i,_) in ranked{if seen.insert(identity(&units[i])){unique.push(i);}}
-    for (i,u) in units.iter().enumerate(){if seen.insert(identity(u)){unique.push(i);}}
-    // Score the complete owner once. A parser's name may match strongly while
-    // the execution/cleanup branch is in a longer caller and a different slice.
-    let facets=q.facets();
+'''
+s=sub(s,root_block,"")
+facet_line='''    let facets=q.facets();
+    let coverage=unique.iter().map(|&id| {'''
+s=sub(s,facet_line,'''    let facets=q.facets();
     let facet_weights=facets.iter().map(|group|group.split('|').filter_map(|word|
         q.terms.iter().find(|(term,_)|term==word).map(|(_,weight)|*weight)
     ).fold(1.0_f64,f64::max)).collect::<Vec<_>>();
-    let coverage=unique.iter().map(|&id| {
-        let u=&units[id];
-        let mut words=query::tokens(&u.source[u.owner_start-1..u.owner_end].join("\n")).into_iter().collect::<HashSet<_>>();
-        words.extend(u.name_terms.iter().cloned());
-        let mask=facets.iter().enumerate().filter_map(|(n,g)|g.split('|').any(|w|words.contains(w)).then_some(n)).collect::<HashSet<_>>();
-        (identity(u),mask)
-    }).collect::<HashMap<_,_>>();
-    let gains=|from:usize,to:usize|coverage[&identity(&units[to])].difference(&coverage[&identity(&units[from])]).count();
+    let coverage=unique.iter().map(|&id| {''')
+gain_line='''    let gains=|from:usize,to:usize|coverage[&identity(&units[to])].difference(&coverage[&identity(&units[from])]).count();
+    let mut execution_callers=HashSet::new();'''
+root_select='''    let gains=|from:usize,to:usize|coverage[&identity(&units[to])].difference(&coverage[&identity(&units[from])]).count();
 
-    // Preserve the strongest root, then spend the remaining three root slots
-    // on marginal user-goal coverage before redundant high-rank alternatives.
-    // This changes packet composition only; ranking and source evidence remain.
+    // Preserve the strongest root, then spend the remaining three slots on
+    // marginal user-goal coverage. This is set cover over already materialized
+    // source; it does not add a search pass or repository-specific knowledge.
     let mut roots=Vec::new();let mut owners=HashSet::new();let mut per_file=HashMap::<String,usize>::new();let mut root_covered=HashSet::new();
-    if let Some(&(first,_))=ranked.iter().find(|(id,_)|owners.insert(identity(&units[*id]))) {
-        roots.push(first);*per_file.entry(units[first].file.clone()).or_default()+=1;
+    if let Some(&(first,_))=ranked.first() {
+        owners.insert(identity(&units[first]));roots.push(first);
+        *per_file.entry(units[first].file.clone()).or_default()+=1;
         root_covered.extend(coverage[&identity(&units[first])].iter().copied());
     }
     while roots.len()<4 {
@@ -120,19 +98,18 @@ new='''    let scores=ranked.iter().copied().collect::<HashMap<_,_>>();
             va.0.total_cmp(&vb.0).then(va.1.total_cmp(&vb.1)).then_with(||b.cmp(a))
         });
         let Some(id)=best else{break;};
-        let adds=coverage[&identity(&units[id])].iter().any(|facet|!root_covered.contains(facet));
-        if !adds{break;}
-        owners.insert(identity(&units[id]));roots.push(id);*per_file.entry(units[id].file.clone()).or_default()+=1;
+        if !coverage[&identity(&units[id])].iter().any(|facet|!root_covered.contains(facet)){break;}
+        owners.insert(identity(&units[id]));roots.push(id);
+        *per_file.entry(units[id].file.clone()).or_default()+=1;
         root_covered.extend(coverage[&identity(&units[id])].iter().copied());
     }
     for &(id,_) in ranked {
         if roots.len()>=4{break;}let u=&units[id];
         if *per_file.get(&u.file).unwrap_or(&0)>=2||!owners.insert(identity(u)){continue;}
         roots.push(id);*per_file.entry(u.file.clone()).or_default()+=1;
-    }'''
-s=sub(s,old,new)
-# Add generic tests: many repeated generic matches must not crowd out a file/function
-# that covers the other stated parts of a natural-language request.
+    }
+    let mut execution_callers=HashSet::new();'''
+s=sub(s,gain_line,root_select)
 anchor='''#[cfg(test)]
 mod packet_tests{'''
 tests='''#[cfg(test)] mod marginal_coverage_tests {
