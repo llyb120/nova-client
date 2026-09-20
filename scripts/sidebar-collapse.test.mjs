@@ -10,6 +10,8 @@ try {
   await writeFile(`${name}.tsx`, `
     import { render } from 'solid-js/web';
     import { Sidebar } from './src/components/Sidebar';
+    import { setState } from './src/store';
+    window.setSidebarState = setState;
     import './src/app.css';
     window.settingsOpened = 0;
     render(() => <div class="app"><Sidebar onOpenSettings={() => { window.settingsOpened++; }}
@@ -38,6 +40,31 @@ try {
   assert.equal(await contentLeft(), 52, 'collapsed sidebar keeps only the compact icon rail');
   assert.equal(await sidebar.evaluate(el => el.inert), true);
   const rail = page.getByRole('navigation', { name: '快捷导航' });
+  const runningBadge = rail.locator('.sidebar-rail-count.running');
+  const unreadBadge = rail.locator('.sidebar-rail-count.unread');
+  assert.equal(await rail.locator('.sidebar-rail-count').count(), 0);
+  await page.evaluate(() => {
+    const thread = (id, parentThreadId) => ({ id, parentThreadId, title: id, cwd: 'D:/project',
+      agentKind: 'codex', createdAt: 1, updatedAt: 1, running: false, starred: false, unreadTurns: 0 });
+    window.setSidebarState('threads', [thread('root'), thread('child', 'root'), thread('done'),
+      { ...thread('legacy'), experienceThread: true }]);
+    window.setSidebarState('running', { root: true, child: true });
+    window.setSidebarState('unreadTurns', { root: 4, child: 2, done: 3, legacy: 5, deleted: 8 });
+  });
+  assert.equal(await runningBadge.textContent(), '1', 'parent and child count as one running task');
+  assert.equal(await unreadBadge.textContent(), '3', 'only completed visible threads contribute unread turns');
+  await page.evaluate(() => window.setSidebarState('running', { root: false, child: false }));
+  assert.equal(await runningBadge.count(), 0);
+  assert.equal(await unreadBadge.textContent(), '9', 'completion moves unread turns into the badge');
+  await page.evaluate(() => window.setSidebarState('unreadTurns', { root: 0, child: 0, done: 120 }));
+  assert.equal(await unreadBadge.textContent(), '99+');
+  assert.equal(await unreadBadge.getAttribute('aria-label'), '已完成未读：120');
+  await page.evaluate(() => window.setSidebarState('currentId', 'done'));
+  assert.equal(await unreadBadge.count(), 0, 'currently read conversation is excluded');
+  await page.evaluate(() => {
+    window.setSidebarState('currentId', null);
+    window.setSidebarState('threads', []);
+  });
   await rail.getByRole('button', { name: '工作流', exact: true }).click();
   assert.equal(await rail.getByRole('button', { name: '工作流', exact: true }).evaluate(el => el.classList.contains('active')), true);
   assert.equal(await sidebar.isVisible(), false, 'routine icon actions do not force the full sidebar open');
