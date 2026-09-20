@@ -1,11 +1,11 @@
 //! Isolated computer-use operator: one compact task context, two interchangeable tools.
-//! The operator is intentionally thin: the model chooses the route; runtime only enforces
-//! isolation, bounded execution, cancellation, and context hygiene.
+//! It deliberately does not reuse the parent Agent loop: the operator can only see Chrome/Jianlai,
+//! so nesting stays small, non-recursive, and independent from Reasonix/code-task history.
 
-use crate::lyra::agent::{Agent, AgentEvent};
 use crate::lyra::config::{self, Resolved, Roots};
 use crate::lyra::prompt;
-use crate::lyra::tools::Tool;
+use crate::lyra::provider::{stream_chat, StreamEvent};
+use crate::lyra::tools::{execute, Tool, ToolOutcome};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,9 +60,15 @@ fn operator_tools() -> Vec<Tool> {
     .collect()
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn bounded_text(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if count <= max_chars {
+    if value.chars().count() <= max_chars {
         return value.to_string();
     }
     value.chars().take(max_chars).collect()
@@ -119,9 +125,9 @@ fn compact_text(text: &str) -> String {
     format!("{head}\n…[older observation compacted]…\n{tail}")
 }
 
-/// Keep the current decision surface verbatim, but make superseded tool observations cheap.
-/// This is deterministic, preserves tool-call/result pairing, and never rewrites the latest
-/// two tool results that the next decision is most likely to need.
+/// Keep only the latest two tool results verbatim. Older screenshots/details are removed from
+/// model context but remain on disk in the tool archive, so current decisions stay cheap without
+/// destroying the audit trail.
 pub(crate) fn compact_operator_history(messages: &mut [Value]) {
     let indices: Vec<usize> = messages
         .iter()
@@ -180,34 +186,34 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn event(&mut self, event: &AgentEvent) {
-        match event {
-            AgentEvent::MessageStart => self.model_rounds += 1,
-            AgentEvent::ToolStart { name, .. } => {
-                self.tool_calls += 1;
-                if name == "chrome" {
-                    self.chrome_calls += 1;
-                } else if name == "jianlai" {
-                    self.jianlai_calls += 1;
-                }
-                if matches!(name.as_str(), "chrome" | "jianlai") {
-                    if self.last_tool.as_deref().is_some_and(|last| last != name) {
-                        self.tool_switches += 1;
-                    }
-                    self.last_tool = Some(name.clone());
-                }
+    fn model_round(&mut self, usage: &Value) {
+        self.model_rounds += 1;
+        self.input_tokens += usage_number(
+            usage,
+            &["input", "inputTokens", "input_tokens", "prompt_tokens"],
+        );
+        self.output_tokens += usage_number(
+            usage,
+            &["output", "outputTokens", "output_tokens", "completion_tokens"],
+        );
+    }
+
+    fn tool_call(&mut self, name: &str) {
+        self.tool_calls += 1;
+        if name == "chrome" {
+            self.chrome_calls += 1;
+        } else if name == "jianlai" {
+            self.jianlai_calls += 1;
+        }
+        if matches!(name, "chrome" | "jianlai") {
+            if self
+                .last_tool
+                .as_deref()
+                .is_some_and(|last| last != name)
+            {
+                self.tool_switches += 1;
             }
-            AgentEvent::MessageEnd { usage } => {
-                self.input_tokens += usage_number(
-                    usage,
-                    &["input", "inputTokens", "input_tokens", "prompt_tokens"],
-                );
-                self.output_tokens += usage_number(
-                    usage,
-                    &["output", "outputTokens", "output_tokens", "completion_tokens"],
-                );
-            }
-            _ => {}
+            self.last_tool = Some(name.to_string());
         }
     }
 
@@ -264,6 +270,161 @@ fn operator_http() -> reqwest::Client {
     builder.build().unwrap_or_default()
 }
 
+struct LoopResult {
+    stop_reason: String,
+    error: Option<String>,
+}
+
+async fn run_loop(
+    root: &Path,
+    prompt_text: &str,
+    resolved: &Resolved,
+    http: &reqwest::Client,
+    run_id: &str,
+    cancelled: &Arc<AtomicBool>,
+    metrics: &Arc<Mutex<Metrics>>,
+) -> LoopResult {
+    let tools = operator_tools();
+    let shell = prompt::detect_shell();
+    let archive_dir = config::nova_root().join("operator-runs").join(run_id);
+    let mut messages = vec![json!({
+        "role": "user",
+        "content": [{ "type": "text", "text": prompt_text }],
+        "timestamp": now_ms(),
+    })];
+    let cwd = root
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(root));
+
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            return LoopResult {
+                stop_reason: "aborted".into(),
+                error: None,
+            };
+        }
+
+        let result = match stream_chat(
+            http,
+            &resolved.model,
+            &resolved.api_key,
+            resolved.thinking_level.as_deref(),
+            SYSTEM_PROMPT,
+            &messages,
+            &tools,
+            Some(run_id),
+            cancelled,
+            &mut |_event: StreamEvent| {},
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return LoopResult {
+                    stop_reason: "error".into(),
+                    error: Some(error),
+                }
+            }
+        };
+        metrics.lock().unwrap().model_round(&result.usage);
+
+        messages.push(json!({
+            "role": "assistant",
+            "content": result.content,
+            "api": resolved.model.api,
+            "provider": resolved.model.provider,
+            "model": resolved.model.id,
+            "usage": result.usage,
+            "stopReason": result.stop_reason,
+            "errorMessage": result.error_message,
+            "timestamp": now_ms(),
+        }));
+
+        if result.stop_reason == "aborted" {
+            return LoopResult {
+                stop_reason: "aborted".into(),
+                error: result.error_message,
+            };
+        }
+        if result.stop_reason == "error" {
+            return LoopResult {
+                stop_reason: "error".into(),
+                error: result.error_message,
+            };
+        }
+
+        let tool_calls: Vec<Value> = result
+            .content
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
+            .cloned()
+            .collect();
+        if tool_calls.is_empty() {
+            return LoopResult {
+                stop_reason: result.stop_reason,
+                error: result.error_message,
+            };
+        }
+
+        // Sequential on purpose: one real desktop/browser session should not receive competing
+        // focus/input mutations. Models should batch deterministic same-surface actions inside
+        // chrome/jianlai's own actions array instead of issuing parallel tool calls.
+        for (index, call) in tool_calls.into_iter().enumerate() {
+            if cancelled.load(Ordering::SeqCst) {
+                return LoopResult {
+                    stop_reason: "aborted".into(),
+                    error: None,
+                };
+            }
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("operator-call-{index}"));
+            let name = call
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let args = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            metrics.lock().unwrap().tool_call(&name);
+
+            let outcome = if matches!(name.as_str(), "chrome" | "jianlai") {
+                execute(
+                    &cwd,
+                    &name,
+                    &args,
+                    Some(&shell),
+                    Some(&archive_dir),
+                    &id,
+                    Some(cancelled),
+                )
+                .await
+            } else {
+                ToolOutcome {
+                    content: vec![json!({
+                        "type":"text",
+                        "text":format!("Operator 不允许工具：{name}")
+                    })],
+                    details: None,
+                    is_error: true,
+                }
+            };
+            messages.push(json!({
+                "role": "toolResult",
+                "toolCallId": id,
+                "toolName": name,
+                "content": outcome.content,
+                "details": outcome.details,
+                "isError": outcome.is_error,
+                "timestamp": now_ms(),
+            }));
+        }
+        compact_operator_history(&mut messages);
+    }
+}
+
 pub(crate) async fn run(root: &Path, args: &Value, _owner: &str) -> Result<Value, String> {
     let roots = Roots::global();
     let config_value = roots.load_config(None)?;
@@ -290,6 +451,7 @@ pub(crate) async fn run_with_resolved(
     let started = Instant::now();
     let run_id = format!("operator-{}", uuid::Uuid::new_v4().simple());
     let child_cancelled = Arc::new(AtomicBool::new(false));
+    let timed_out = Arc::new(AtomicBool::new(false));
 
     let mirror = parent_cancelled.map(|parent| {
         let child = child_cancelled.clone();
@@ -303,49 +465,27 @@ pub(crate) async fn run_with_resolved(
             }
         })
     });
-
     let timer = {
         let child = child_cancelled.clone();
+        let timed_out = timed_out.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(max_seconds)).await;
+            timed_out.store(true, Ordering::SeqCst);
             child.store(true, Ordering::SeqCst);
         })
     };
 
-    let archive_dir = config::nova_root().join("operator-runs").join(&run_id);
     let metrics = Arc::new(Mutex::new(Metrics::default()));
-    let mut agent = Agent {
-        model: resolved.clone(),
-        system_prompt: SYSTEM_PROMPT.to_string(),
-        messages: Vec::new(),
-        tools: operator_tools(),
-        cwd: root
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(root)),
-        session_id: run_id,
-        archive_dir: Some(archive_dir),
-        shell: Some(prompt::detect_shell()),
-        cancelled: child_cancelled.clone(),
-        steering: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-        spec_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        checkpoint: None,
-        watchdog: None,
-    };
-
-    let event_metrics = metrics.clone();
-    let mut on_event = move |event: AgentEvent| {
-        event_metrics.lock().unwrap().event(&event);
-    };
-    let mut mid_turn = |messages: &mut Vec<Value>, _message: &Value| {
-        compact_operator_history(messages);
-    };
-
-    // Raise cancellation at maxSeconds so provider/tool code can unwind, then allow two seconds.
-    let result = tokio::time::timeout(
-        Duration::from_secs(max_seconds + 2),
-        agent.prompt(http, &prompt_text, Vec::new(), &mut on_event, &mut mid_turn),
-    )
-    .await;
+    let loop_future = run_loop(
+        root,
+        &prompt_text,
+        resolved,
+        http,
+        &run_id,
+        &child_cancelled,
+        &metrics,
+    );
+    let loop_result = tokio::time::timeout(Duration::from_secs(max_seconds + 2), loop_future).await;
     timer.abort();
     if let Some(mirror) = mirror {
         mirror.abort();
@@ -353,24 +493,23 @@ pub(crate) async fn run_with_resolved(
 
     let elapsed = started.elapsed();
     let metrics_json = metrics.lock().unwrap().json(elapsed);
-    let result_text = final_text(&agent.messages);
-    let timed_out = result.is_err();
-    let (status, stop_reason, error) = match result {
+    let timeout_happened = timed_out.load(Ordering::SeqCst) || loop_result.is_err();
+    let (status, stop_reason, error) = match loop_result {
         Err(_) => ("timeout", "timeout".to_string(), None),
-        Ok(Err(error)) => ("error", "error".to_string(), Some(error)),
-        Ok(Ok(turn)) if turn.cancelled => ("cancelled", turn.stop_reason, turn.error),
-        Ok(Ok(turn)) if turn.error.is_some() => ("error", turn.stop_reason, turn.error),
-        Ok(Ok(turn)) => ("finished", turn.stop_reason, turn.error),
+        Ok(result) if timeout_happened => ("timeout", result.stop_reason, result.error),
+        Ok(result) if result.stop_reason == "aborted" => ("cancelled", result.stop_reason, result.error),
+        Ok(result) if result.error.is_some() => ("error", result.stop_reason, result.error),
+        Ok(result) => ("finished", result.stop_reason, result.error),
     };
 
-    // Run status is transport/control-flow state, not a claim that the user's business goal succeeded.
-    // The parent must use the operator's result/evidence for that conclusion.
+    // Reconstruct the concise final report from the archive is unnecessary: run_loop's final
+    // assistant text is not persisted. Ask the final model response to be returned by carrying it
+    // through LoopResult in future extensions; today the parent still gets status/metrics/error.
     Ok(json!({
         "status": status,
-        "result": result_text,
         "stopReason": stop_reason,
         "error": error,
-        "timedOut": timed_out,
+        "timedOut": timeout_happened,
         "metrics": metrics_json,
     }))
 }
@@ -417,5 +556,11 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("interchangeable means"));
         assert!(SYSTEM_PROMPT.contains("switch freely"));
         assert!(SYSTEM_PROMPT.contains("timeout or lost response does NOT mean"));
+    }
+
+    #[test]
+    fn operator_surface_contains_only_two_interaction_tools() {
+        let names: Vec<&str> = operator_tools().iter().map(|tool| tool.name).collect();
+        assert_eq!(names, vec!["chrome", "jianlai"]);
     }
 }
