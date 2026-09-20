@@ -25,6 +25,21 @@ function stringList(value) {
   return [...new Set(list.map((item) => String(item ?? "").trim()).filter(Boolean))];
 }
 
+function compactOperatorTool(definition, description) {
+  const inputSchema = JSON.parse(JSON.stringify(definition.inputSchema));
+  const strip = value => {
+    if (Array.isArray(value)) {
+      for (const child of value) strip(child);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    delete value.description;
+    for (const child of Object.values(value)) strip(child);
+  };
+  strip(inputSchema);
+  return { ...definition, description, inputSchema };
+}
+
 export function normalizePolarisArgs(params = {}) {
   const query = String(params.query ?? "").trim();
   const keywords = stringList(params.keywords).slice(0, 5);
@@ -56,10 +71,16 @@ export function createNovaBatchTools(cwd, options = {}) {
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
   const tools = {};
   if (!readOnly && globalContextServiceConfigured()) {
-    tools.jianlai = { ...jianlaiTool,
+    const desktopDefinition = operatorChild
+      ? compactOperatorTool(jianlaiTool, "真实桌面截图+鼠标键盘。先观察，再用最新 snapshotId/imageId 图片像素操作；actions 可合批1–8个确定动作。not_executed可重试，executed/needs_review或结果不明先观察核对，禁止盲目重放；窗口/焦点变化后旧坐标失效。")
+      : jianlaiTool;
+    const chromeDefinition = operatorChild
+      ? compactOperatorTool(chromeTool, "控制用户Chrome。先tabs绑定明确tabTag；inspect/screenshot取得当前snapshotId，优先DOM ref，必要时按最新图片坐标操作；actions可合批1–8个确定动作。snapshot单次消费；executed/needs_review或超时结果不明先核对页面，禁止盲目重放。")
+      : chromeTool;
+    tools.jianlai = { ...desktopDefinition,
       execute: async params => JSON.stringify(await callGlobalContextTool("jianlai", root, params, owner)),
     };
-    tools.chrome = { ...chromeTool,
+    tools.chrome = { ...chromeDefinition,
       execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params, owner)),
     };
     if (!operatorChild) {
