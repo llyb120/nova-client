@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with: { persist-credentials: false }
+        with:\n          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           ref: 3da28d30f1adfd0da3b993813a47aa3fff20fdeb
@@ -43,7 +43,7 @@ jobs:
           path: _accepted
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
-        with: { node-version: '22' }
+        with:\n          node-version: '22'
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: bench/polaris-harness -> target
@@ -117,10 +117,10 @@ jobs:
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
-        with: { persist-credentials: false }
+        with:\n          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
-        with: { node-version: '22' }
+        with:\n          node-version: '22'
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: bench/polaris-harness -> target
