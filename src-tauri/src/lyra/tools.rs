@@ -154,21 +154,42 @@ pub fn tool_set(
     tools
 }
 
-/// Operator 子会话只看到两个 GUI 执行通道。路线由模型按现场选择，
-/// 但不会再递归创建 Operator，也不会把代码/搜索工具带进独立交互上下文。
+fn strip_schema_descriptions(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("description");
+            for child in object.values_mut() {
+                strip_schema_descriptions(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                strip_schema_descriptions(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Operator 子会话只看到两个 GUI 执行通道。复用完整类型/枚举契约，但移除冗长的
+/// 字段说明；关键安全语义收敛到短顶层说明，避免每轮为两份超长 schema 付 token。
 pub fn operator_tool_set() -> Vec<Tool> {
     let desktop = crate::jianlai::tool_definition();
     let chrome = crate::chrome_browser::tool_definition();
+    let mut desktop_schema = desktop["inputSchema"].clone();
+    let mut chrome_schema = chrome["inputSchema"].clone();
+    strip_schema_descriptions(&mut desktop_schema);
+    strip_schema_descriptions(&mut chrome_schema);
     vec![
         Tool {
             name: "jianlai",
-            description: desktop["description"].as_str().unwrap().into(),
-            parameters: schema(desktop["inputSchema"].clone()),
+            description: "真实桌面截图+鼠标键盘。先观察，再用最新 snapshotId/imageId 的图片像素操作；actions 可合批 1–8 个确定动作。not_executed 可重试，executed/needs_review 或结果不明时先观察核对，禁止盲目重放。窗口/焦点/截图变化后旧坐标失效。".into(),
+            parameters: schema(desktop_schema),
         },
         Tool {
             name: "chrome",
-            description: chrome["description"].as_str().unwrap().into(),
-            parameters: schema(chrome["inputSchema"].clone()),
+            description: "控制用户 Chrome。先 tabs 绑定明确 tabTag；inspect/screenshot 获取当前 snapshotId，优先 DOM ref，必要时按最新图片坐标操作；actions 可合批 1–8 个确定动作。snapshot 单次消费；executed/needs_review 或超时结果不明时先检查实际页面，禁止盲目重放。".into(),
+            parameters: schema(chrome_schema),
         },
     ]
 }
@@ -780,6 +801,9 @@ mod embedded_rtk_tests {
     fn operator_child_only_sees_gui_channels() {
         let names: Vec<_> = super::operator_tool_set().into_iter().map(|tool| tool.name).collect();
         assert_eq!(names, vec!["jianlai", "chrome"]);
+        let tools = super::operator_tool_set();
+        let encoded = serde_json::to_string(&tools[0].parameters).unwrap();
+        assert!(!encoded.contains("\"description\""));
     }
 
     #[test]
