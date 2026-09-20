@@ -26,7 +26,7 @@ s=sub(s,'for &hit in &hits{df[hit]+=1;}','if structural_candidate(&file,q){for &
 s=sub(s,'let n=rows.len().max(1) as f64;','let n=rows.iter().filter(|r|structural_candidate(&r.file,q)).count().max(1) as f64;')
 s=sub(s,'let mut order=(0..rows.len()).filter(|&i|rows[i].score>0.0).collect::<Vec<_>>();','let mut order=(0..rows.len()).filter(|&i|rows[i].score>0.0&&structural_candidate(&rows[i].file,q)).collect::<Vec<_>>();')
 s=sub(s,'(explicit||caller).then_some((i,if explicit{10000.0+r.score}else{r.score}))','((explicit||caller)&&structural_candidate(&r.file,q)).then_some((i,if explicit{10000.0+r.score}else{r.score}))')
-s=sub(s,'    let c=subset(units,parsed.len(),stats.reparsed_files,partial);','''    let (literal,literal_partial)=literal_units(&rows,&units,q,deadline)?;
+s=sub(s,'    let c=subset(units,parsed.len(),stats.reparsed_files,partial);','''    let (literal,literal_partial)=literal_units(&rows,&units,&cache,q,deadline)?;
     stats.literal_ranges=literal.len();partial|=literal_partial;units.extend(literal);
     let c=subset(units,parsed.len(),stats.reparsed_files,partial);''')
 p.write_text(s,encoding='utf-8')
@@ -37,12 +37,35 @@ p.write_text(s,encoding='utf-8')
 p,s=load('polaris_packet.rs','2c25309b0a6c2f77762ed74c5aec492dbb8a05b9')
 s=sub(s,'let complete=start<=u.owner_start&&end>=u.owner_end;', 'let complete=start<=u.owner_start&&end>=u.owner_end&&(u.role!="source-text"||(start==1&&end==u.source.len()));')
 s=sub(s,'if complete{"BODY"}else{"PARTIAL"}', 'if u.role=="source-text"{"SOURCE_RANGE"}else if complete{"BODY"}else{"PARTIAL"}')
-s=sub(s,'"sourceHash":u.file_hash,"complete":complete', '"sourceHash":u.file_hash,"complete":complete,"sourceRange":u.role=="source-text"')
 s=sub(s,'"reason":"large-unit"', '"reason":if u.role=="source-text"{"source-range-only"}else{"large-unit"}')
 p.write_text(s,encoding='utf-8')
 p=root/'polaris_text.rs';s=p.read_text(encoding='utf-8')
 s=sub(s,'start:start+1,end,owner_start:1,owner_end:source.len()', 'start:start+1,end,owner_start:start+1,owner_end:end')
 s=sub(s,'let mut selected = Vec::new(); let mut partial = false;', 'let mut selected = Vec::new(); let mut partial = candidates.len()>16;')
 s=sub(s,'    selected.truncate(4);', '    partial |= selected.len()>4;\n    selected.truncate(4);')
+s=sub(s,'units: &[Arc<CodeUnit>], q: &query::Query,\n    deadline:', 'units: &[Arc<CodeUnit>], cache: &DemandCache, q: &query::Query,\n    deadline:')
+s=sub(s,'        let mut hits = Vec::new();', '''        // Literal recall must not bypass cfg(test), including a test module in
+        // an otherwise production file. Reuse shallow declarations when present.
+        let parsed = if is_code_file(&row.file) && !q.test_intent {
+            Some(cache.entries.get(&row.file).map(|c|c.entry.clone())
+                .unwrap_or_else(||scan_source(&row.text,&row.file)))
+        } else { None };
+        let blocked = parsed.iter().flat_map(|e|e.syms.iter())
+            .filter(|s|s.kind.starts_with("test:")||(s.kind=="mod"&&s.name=="tests"))
+            .map(|s|{
+                let mut start=s.ln.saturating_sub(1);
+                while start>0 && s.ln-start<=8 {
+                    let line=source[start-1].trim();
+                    if line.starts_with("#[")||line.starts_with("//")||line.is_empty(){start-=1;}else{break;}
+                }
+                (start,s.end.min(source.len()))
+            }).collect::<Vec<_>>();
+        let mut hits = Vec::new();''')
+s=sub(s,'let start = hit.saturating_sub(8); let end = (hit + 48).min(source.len());', '''if blocked.iter().any(|&(a,b)|a<=hit&&hit<b){continue;}
+            let mut start = hit.saturating_sub(8); let mut end = (hit + 48).min(source.len());
+            for &(a,b) in &blocked {
+                if b<=hit { start=start.max(b); }
+                if a>hit { end=end.min(a); }
+            }''')
 p.write_text(s,encoding='utf-8')
 print('Restored source-text recall in one request; no global index or API call.')
