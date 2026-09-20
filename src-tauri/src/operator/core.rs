@@ -1,6 +1,9 @@
 //! Provider-independent interaction state. No imports from Lyra or Reasonix.
 #[path = "contract.rs"]
 mod contract;
+#[path = "progress.rs"]
+mod progress;
+use progress::{FactClaim, Progress};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -79,6 +82,10 @@ pub struct Decision {
     #[serde(default)]
     pub checkpoint: Option<Value>,
     #[serde(default)]
+    pub checkpoint_patch: Option<Value>,
+    #[serde(default)]
+    pub verified: Vec<FactClaim>,
+    #[serde(default)]
     pub evidence_id: Option<String>,
     #[serde(default)]
     pub result: Value,
@@ -147,6 +154,8 @@ pub struct Task {
     pub contract: Request,
     pub status: String,
     pub checkpoint: Value,
+    #[serde(default)]
+    pub progress: Progress,
     pub current: Option<Observation>,
     #[serde(default)]
     pub last_evidence_id: Option<String>,
@@ -175,6 +184,7 @@ impl Task {
             contract,
             status: "yielded".into(),
             checkpoint: json!({}),
+            progress: Progress::default(),
             current: None,
             last_evidence_id: None,
             actions: vec![],
@@ -191,12 +201,17 @@ impl Task {
         // NEVER copy the parent transcript or the full observation archive here.
         // All references from older observations are evidence, not actionable locators.
         json!({"contract":self.contract,"checkpoint":self.checkpoint,
+            "progress":self.progress.context(),
+            "observationCapabilities":self.observation_capabilities(),
             "recentActions":self.actions.iter().rev().take(RECENT_ACTIONS).collect::<Vec<_>>(),
             "currentObservation":self.current.as_ref().map(|o| json!({"evidenceId":o.evidence_id,"data":without_blobs(&o.payload)})),
             "tool":tool_schema,
-            "decisionFormat":{"kind":"observe|act|finish|blocked","params":"native tool arguments","checkpoint":"bounded cumulative facts, sources, coverage and unresolved items","evidenceId":"current observation evidence ID","result":"finish only","reason":"reason / blocked explanation","requiresConfirmation":"true for sending/submitting/purchasing/deleting or other irreversible changes"}})
+            "decisionFormat":{"kind":"observe|act|finish|blocked","params":"native tool arguments","checkpoint":"legacy full replacement; omit if unchanged",
+                "checkpointPatch":"preferred object merge patch: changed facts only, arrays replace, null deletes; never combine with checkpoint",
+                "verified":"optional [{criterion: zero-based acceptance index, detail: observed fact, evidenceId: current evidence}]; historical agent observations, NOT backend verification","evidenceId":"current observation evidence ID","result":"finish only","reason":"reason / blocked explanation","requiresConfirmation":"true for sending/submitting/purchasing/deleting or other irreversible changes"}})
     }
     pub fn validate_decision(&self, d: &Decision) -> Result<(), String> {
+        self.validate_progress(d)?;
         if d.kind == "blocked" {
             return Ok(());
         }
@@ -255,6 +270,7 @@ impl Task {
                 return Err("Operator only executes snapshot-guarded act operations".into());
             }
             let observation = self.current.as_ref().ok_or("Observe before acting")?;
+            self.validate_capabilities(d)?;
             if d.evidence_id.as_deref() != Some(&observation.evidence_id) {
                 return Err("Stale evidence ID".into());
             }
@@ -300,6 +316,7 @@ impl Task {
                     .into(),
             );
         }
+        self.progress.observe_scope(&payload);
         self.last_evidence_id = Some(evidence_id.clone());
         self.current = Some(Observation {
             evidence_id,
@@ -324,6 +341,7 @@ impl Task {
             self.status = "needs_review".into();
             self.reason = "Interrupted task: reconcile actual UI state before new work".into();
         }
+        self.progress.invalidate();
         self.current = None; // Restored evidence cannot authorize a new action.
     }
 }
