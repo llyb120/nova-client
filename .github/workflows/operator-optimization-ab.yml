@@ -1,0 +1,116 @@
+name: Operator production before-after GUI benchmark
+on:
+  push:
+    branches: [work/operator-context-20260919]
+    paths: [.github/workflows/operator-optimization-ab.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: operator-production-optimization-ab
+  cancel-in-progress: false
+env:
+  BASELINE_SHA: 5c10b1f3197537ec73419d9030f7dd96140fb201
+  OPTIMIZED_SHA: 4304b8acfaa8e17aa19818f3d0ef63a5b192db18
+  FIXTURE_SHA: 3d7ac249129e3f25c703fb03a1dd5617c3560a7a
+defaults:
+  run:
+    shell: bash
+jobs:
+  paired-gui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare one-use runner-owned credential recipient
+        env:
+          KEY_STAGE: prepare
+        run: python3 scripts/operator-one-use-credential.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operator-opt-recipient-${{ github.run_id }}
+          path: ${{ runner.temp }}/operator-key/public/
+          retention-days: 1
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASELINE_SHA }}
+          path: _baseline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FIXTURE_SHA }}
+          path: _fixture
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/operator-gui-harness -> target
+          cache-on-failure: true
+      - name: Stage identical isolated GUI harnesses and record source identity
+        run: |
+          set -euo pipefail
+          mkdir -p validation .cargo
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          git rev-parse HEAD > validation/workflow-commit.txt
+          test "$(git -C _baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          test "$(git -C _fixture rev-parse HEAD)" = "$FIXTURE_SHA"
+          git diff --exit-code "$OPTIMIZED_SHA" HEAD -- src-tauri/src extensions
+          for p in src-tauri/src/jianlai.rs src-tauri/src/chrome_browser.rs src-tauri/src/native_browser.rs src-tauri/src/visual_guard.rs src-tauri/src/lyra/reasonix.rs; do cmp "$p" "_baseline/$p"; done
+          for root in . _baseline; do
+            cp -r _fixture/bench/operator-gui-harness "$root/bench/"
+            printf '\n[dev-dependencies]\ntempfile = "3"\n' >> "$root/bench/operator-gui-harness/Cargo.toml"
+          done
+          sha256sum src-tauri/src/operator/{core,runtime,progress}.rs src-tauri/src/lyra/reasonix.rs > validation/optimized-source-hashes.txt
+          sha256sum _baseline/src-tauri/src/operator/{core,runtime}.rs > validation/baseline-source-hashes.txt
+          node --check scripts/operator-optimization-ab.mjs
+      - name: Install test dependencies before receiving the model credential
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev libxdo-dev libxtst-dev xvfb openbox dbus-x11
+          npm install --prefix bench/operator-gui-deps --no-package-lock --ignore-scripts playwright@1.55.1 pngjs@7.0.0
+          bench/operator-gui-deps/node_modules/.bin/playwright install --with-deps chromium
+      - name: Compile baseline then optimized modules against one dependency lock
+        run: |
+          set -euo pipefail
+          TARGET="$GITHUB_WORKSPACE/bench/operator-gui-harness/target"
+          cargo build --manifest-path _baseline/bench/operator-gui-harness/Cargo.toml --target-dir "$TARGET" 2>&1 | tee validation/baseline-build.txt
+          cp "$TARGET/debug/nova-operator-gui-harness" "$RUNNER_TEMP/operator-baseline"
+          cp _baseline/bench/operator-gui-harness/Cargo.lock bench/operator-gui-harness/Cargo.lock
+          cargo build --locked --manifest-path bench/operator-gui-harness/Cargo.toml --target-dir "$TARGET" 2>&1 | tee validation/optimized-build.txt
+          cp "$TARGET/debug/nova-operator-gui-harness" "$RUNNER_TEMP/operator-optimized"
+          sha256sum "$RUNNER_TEMP/operator-baseline" "$RUNNER_TEMP/operator-optimized" > validation/binary-hashes.txt
+          cp bench/operator-gui-harness/Cargo.lock validation/gui-Cargo.lock
+          git diff --exit-code -- src-tauri/src
+      - name: Execute the prespecified eighteen real-model native GUI tasks
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASELINE_EXE: ${{ runner.temp }}/operator-baseline
+          OPTIMIZED_EXE: ${{ runner.temp }}/operator-optimized
+        run: |
+          set -euo pipefail
+          python3 scripts/operator-one-use-credential.py 2>&1 | tee validation/live-progress.txt
+      - name: Clean private recipient and redact report text
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/operator-key/private.pem"
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          for p in Path('validation').rglob('*'):
+              if p.is_file() and p.suffix.lower() in {'.json','.jsonl','.txt','.log','.md'}:
+                  s=p.read_text(errors='replace')
+                  p.write_text(re.sub(r'user_[A-Za-z0-9_-]{16,}','[REDACTED]',s))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-optimization-ab-${{ github.run_id }}
+          path: validation/
+          retention-days: 7
