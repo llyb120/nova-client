@@ -329,7 +329,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             xcap::image::imageops::crop_imm(&image, r.x, r.y, r.width, r.height).to_image()
         } else { image };
         let resize_started = Instant::now();
-        let mut image = if max_edge > 0 && image.width().max(image.height()) > max_edge {
+        let mut image = if max_edge > 0 && (region.is_some() || image.width().max(image.height()) > max_edge) {
             let scale = max_edge as f64 / image.width().max(image.height()) as f64;
             let (width, height) = image.dimensions();
             xcap::image::DynamicImage::ImageRgba8(image).resize_exact(
@@ -443,6 +443,45 @@ fn visible_window_crop(window: &Surface, monitor: &Surface, image: &xcap::image:
         return Err("窗口跨屏、部分离屏或屏幕像素比例不一致，请使用monitorId截图定位".into());
     }
     Ok(xcap::image::imageops::crop_imm(image, x as u32, y as u32, window.width, window.height).to_image())
+}
+
+// ponytail: magnify the current feedback PNG (bounded by maxEdge); use a fresh native crop if more detail is needed.
+fn failure_detail(snap: &mut Snapshot, surface: &Surface, p: (i32, i32), result: &mut Value) -> Result<()> {
+    let Some(full) = snap.shots.iter().find(|s| &s.surface == surface && s.region.is_none()).cloned() else { return Ok(()); };
+    let Some(meta) = result["images"].as_array().and_then(|images| images.iter().find(|v| v["imageId"] == full.image_id)).cloned() else { return Ok(()); };
+    let x = (p.0 as i64 - surface.x as i64) * full.pixels.0 as i64 / surface.width as i64;
+    let y = (p.1 as i64 - surface.y as i64) * full.pixels.1 as i64 / surface.height as i64;
+    if x < 0 || y < 0 || x >= full.pixels.0 as i64 || y >= full.pixels.1 as i64 { return Ok(()); }
+    let region = detail_region(full.pixels, (x as u32, y as u32));
+    let source_region = image_region(&full, region)?;
+    let image = xcap::image::open(meta["path"].as_str().ok_or("反馈图片缺少path")?).map_err(err)?.into_rgba8();
+    let crop = xcap::image::imageops::crop_imm(&image, region.x, region.y, region.width, region.height).to_image();
+    let enlarged = xcap::image::imageops::resize(&crop, region.width * 3, region.height * 3, xcap::image::imageops::FilterType::Triangle);
+    let id = format!("{}-detail", full.image_id);
+    let path = shot_folder(&snap.owner).join(format!("{}-{id}.png", snap.id));
+    enlarged.save(&path).map_err(err)?;
+    let mut detail = meta;
+    detail["imageId"] = json!(id);
+    detail["path"] = json!(path);
+    detail["width"] = json!(enlarged.width());
+    detail["height"] = json!(enlarged.height());
+    detail["region"] = json!({"x":source_region.x,"y":source_region.y,"width":source_region.width,"height":source_region.height});
+    detail["attemptedPoint"] = json!({"x":(x as u32-region.x)*3,"y":(y as u32-region.y)*3});
+    detail["cursor"] = match (detail["cursor"]["x"].as_u64(), detail["cursor"]["y"].as_u64()) {
+        (Some(cx),Some(cy)) if cx >= region.x as u64 && cy >= region.y as u64 && cx < (region.x+region.width) as u64 && cy < (region.y+region.height) as u64 =>
+            json!({"x":(cx-region.x as u64)*3,"y":(cy-region.y as u64)*3,"marker":"magenta-ring","source":"system-pointer"}),
+        _ => Value::Null,
+    };
+    detail["purpose"] = json!("失败落点附近3倍放大图；attemptedPoint是请求落点，cursor是实际鼠标位置，均不是识别出的目标。按此图像素重新定位，不重放旧动作。");
+    snap.shots.push(Shot { image_id:id, pixels:enlarged.dimensions(), region:Some(source_region), ..full });
+    result["images"].as_array_mut().unwrap().push(detail);
+    Ok(())
+}
+
+fn detail_region(pixels: (u32,u32), p: (u32,u32)) -> Region {
+    let width = pixels.0.min(200);
+    let height = pixels.1.min(160);
+    Region { x:p.0.saturating_sub(width/2).min(pixels.0-width), y:p.1.saturating_sub(height/2).min(pixels.1-height), width, height }
 }
 
 fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>, actions: &[Action]) -> Result<&'a Shot> {
@@ -954,13 +993,8 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             if snap.window.is_some() && request.window_id.is_some() && request.window_id != snap.window {
                 return Err("windowId与截图不符".into());
             }
-            let shot = snap
-                .shots
-                .iter()
-                .find(|s| Some(&s.image_id) == request.image_id.as_ref())
-                .cloned()
-                .ok_or("imageId不属于此截图")?;
             let actions = request.actions.ok_or("缺少actions")?;
+            let shot = action_shot(&snap.shots, request.image_id.as_deref(), &actions)?.clone();
             if actions.is_empty() || actions.len() > 16 {
                 return Err("每次需要1至16个动作".into());
             }
@@ -979,15 +1013,18 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let mut completed = 0;
             let mut failure = None;
             let mut attempted = false;
+            let mut failed_point = None;
             for (index, a) in actions.iter().enumerate() {
                 if a.action != "wait" {
                     if let Err(e) = check_target(&snap, &shot, a) {
+                        failed_point = point(&shot, a.x, a.y).ok();
                         failure = Some(e);
                         break;
                     }
                 }
                 attempted = true;
                 if let Err(e) = input(&mut enigo, &shot, a, snap.foreground) {
+                    failed_point = point(&shot, a.x, a.y).ok();
                     failure = Some(e);
                     break;
                 }
@@ -1016,6 +1053,11 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             if failure.is_some() || request.feedback.as_deref() != Some("none") {
                 let settle = attempted && needs_stable_feedback(&actions[..completed], result["status"] == "needs_review");
                 observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, settle, &mut state, &mut result);
+            }
+            if let (Some(p), Some(current)) = (failed_point, state.as_mut().filter(|s| s.foreground == snap.foreground)) {
+                if let Err(error) = failure_detail(current, &shot.surface, p, &mut result) {
+                    result["detailError"] = json!(error);
+                }
             }
             Ok(result)
         }
@@ -1208,6 +1250,29 @@ mod tests {
         }
         assert!(run("validation".into(), json!({"operation":"screenshot","windowId":1,"monitorId":2})).is_err());
     }
+    #[test]
+    fn failure_detail_keeps_snapshot_and_maps_enlarged_coordinates() {
+        let owner = format!("detail-test-{}", uuid::Uuid::new_v4());
+        let folder = shot_folder(&owner);
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("full.png");
+        xcap::image::RgbaImage::from_pixel(400,300,xcap::image::Rgba([40,50,60,255])).save(&path).unwrap();
+        let surface = Surface { id:1, pid:None, x:-800, y:0, width:800, height:600 };
+        let full = Shot { image_id:"full".into(), surface:surface.clone(), pixels:(400,300), source_pixels:(800,600), region:None, guard:None };
+        let mut snap = Snapshot { id:"new".into(), owner, taken:Instant::now(), window:None, max_edge:1600, foreground:None, shots:vec![full], invalidated:None };
+        let mut result = json!({"snapshotId":"new","images":[{"imageId":"full","path":path,"snapshotId":"new","cursor":{"x":390,"y":290}}]});
+        failure_detail(&mut snap, &surface, (-20,580), &mut result).unwrap();
+        assert_eq!(result["images"].as_array().unwrap().len(),2);
+        assert_eq!(result["images"][1]["width"],600);
+        assert_eq!(result["images"][1]["height"],480);
+        assert_eq!(result["images"][1]["cursor"]["x"],570);
+        assert_eq!(point(&snap.shots[1],Some(570),Some(450)).unwrap(),(-20,580));
+        assert_eq!(snap.id,"new");
+        let r = detail_region((70,90),(0,0));
+        assert_eq!((r.x,r.y,r.width,r.height),(0,0,70,90));
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
     #[test]
     fn coordinates_keys_and_validation() {
         let shot = Shot { guard: None,

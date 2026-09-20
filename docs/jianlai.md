@@ -95,3 +95,7 @@ Windows的press字母/数字按虚拟键发送，Ctrl+A与Ctrl+a等价；大小�
 ### 切窗和裁剪恢复
 
 Windows 用 activate(windowId) 激活 windows 返回的窗口并取得新截图；windowId 不是 pid。系统拒绝激活时不会发送后续按键。单图快照的纯 press/type/wait 批次可以省略 imageId；坐标动作、多图和显式错误 ID 不做猜测。ID 错误返回当前可用 ID，无需额外截图。裁剪图坐标从左上角 (0,0) 开始，不加 region 偏移；以返回的 width/height 为准，操作后反馈恢复完整窗口。
+
+### 局部放大与失败反馈
+
+裁剪截图设置 maxEdge:1200 会等比放大到长边1200，maxEdge:0保留原像素；完整截图仍只缩小。工具自动映射放大图坐标。坐标校验或鼠标输入失败后，若新反馈保持相同窗口/屏幕几何，附一张落点附近的3倍图，沿用新snapshotId并提供独立imageId；attemptedPoint是请求位置，cursor为实际位置。窗口切换或移动时不套用旧落点。该图放大当前反馈像素，需更多原始细节时重新局部截图；不会自动判断业务目标是否点错或重放动作。
