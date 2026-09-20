@@ -5329,7 +5329,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
 }
 
 fn direct_desktop_guidance() -> &'static str {
-    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、webview（侧栏浏览器）、chrome（用户Chrome）。用户指定剑来时，直接调用工具列表中来自 nova-tools 的 jianlai，先 operation=windows 再截图；整个桌面任务仅用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation或脚本激活窗口。后台窗口先截桌面，用Win+Tab任务视图或可见任务栏入口切窗，不要盲目循环切换。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
+    "Nova MCP 提供 operator、jianlai（剑来：桌面鼠标、键盘、截图）、chrome（用户Chrome）和 webview。完整的多步骤 GUI/桌面任务优先把最终目标一次交给 operator，由它按现场自由选择或切换 chrome/jianlai；简单原子操作可直接用原工具。不要为了固定分工坚持某个工具，也不要用换工具绕过结果不明的写操作。用户明确限定只用剑来时遵守该限制。以实际工具名及 schema 为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
 }
 
 #[cfg(test)]
@@ -5342,13 +5342,12 @@ mod desktop_prompt_tests {
         assert!(source.contains("if self.kind == AgentKind::Devin {\n                guidance.push(nova_tools_prompt_guidance"));
         for polaris in [true, false] {
             let prompt = super::nova_tools_prompt_guidance(polaris, false);
-            for tool in ["jianlai", "chrome", "webview"] {
+            for tool in ["operator", "jianlai", "chrome", "webview"] {
                 assert!(prompt.contains(tool));
                 assert!(!super::nova_tools_prompt_guidance(polaris, true).contains(tool));
             }
-            assert!(prompt.contains("剑来"));
+            assert!(prompt.contains("operator"));
             assert!(prompt.contains(r#""tool_name":"jianlai""#));
-            assert!(prompt.contains(r#""operation":"windows""#));
         }
     }
 }
