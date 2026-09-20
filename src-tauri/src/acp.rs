@@ -5329,7 +5329,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
 }
 
 fn direct_desktop_guidance() -> &'static str {
-    "Nova MCP 提供 operator、jianlai（剑来：桌面鼠标、键盘、截图）、chrome（用户Chrome）和 webview。完整的多步骤 GUI/桌面任务优先把最终目标一次交给 operator，由它按现场自由选择或切换 chrome/jianlai；简单原子操作可直接用原工具。不要为了固定分工坚持某个工具，也不要用换工具绕过结果不明的写操作。用户明确限定只用剑来时遵守该限制。以实际工具名及 schema 为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
+    "Nova MCP 提供 operator、jianlai（剑来：桌面鼠标、键盘、截图）、chrome（用户Chrome）和 webview。完整的多步骤 GUI/桌面任务优先把最终目标一次交给 operator，由它按现场自由选择或切换 chrome/jianlai；简单原子操作可直接调用原工具。不要为了固定分工坚持某个工具，也不要用换工具绕过结果不明的写操作。用户明确限定只用剑来时遵守该限制。以实际工具名及 schema 为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
 }
 
 #[cfg(test)]
