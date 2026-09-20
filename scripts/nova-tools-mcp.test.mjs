@@ -109,8 +109,9 @@ test("desktop optimizations are shared by custom tools and MCP, not Lyra-only", 
       assert(tool.inputSchema.properties.operation.enum.includes(operation));
     }
     assert.deepEqual(tool.inputSchema.properties.experience.required, ["scope", "task"]);
-    assert.match(tool.description, /首次观察后核对conditions/);
-    assert.match(tool.description, /executed不代表业务成功/);
+    assert.match(tool.description, /操作经验是可选加速/);
+    assert.match(tool.description, /简单任务不要为了经验增加调用/);
+    assert.match(tool.description, /executed只表示输入/);
   }
   assert(jianlai.inputSchema.properties.operation.enum.includes('recall'));
   assert.equal(jianlai.inputSchema.properties.actions.items.properties.ms.maximum, 2000);

@@ -16,6 +16,7 @@ mod http_stream;
 pub mod image_generation;
 mod native_browser;
 mod chrome_browser;
+mod operator;
 mod lyra;
 mod lyra_complete;
 mod model_cache;
@@ -5400,6 +5401,7 @@ pub fn run() {
                 remote_permissions: Mutex::new(HashMap::new()),
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
             });
+            operator::init(app.handle());
             native_browser::init(app.handle());
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]

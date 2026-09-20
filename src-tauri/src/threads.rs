@@ -549,6 +549,9 @@ pub struct Thread {
     /// 旧版本训练记录标记：仅为保持本地隔离而兼容，不再创建此类会话。
     #[serde(default)]
     pub experience_thread: bool,
+    /// Operator 的隔离子会话。只在一次 GUI 任务期间存在，且禁止递归创建 Operator。
+    #[serde(default)]
+    pub operator_thread: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -621,6 +624,7 @@ impl Thread {
             quota_peer_name: None,
             worktree: None,
             experience_thread: false,
+            operator_thread: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
             pending_stage_context: None,
@@ -1306,6 +1310,7 @@ impl ThreadStore {
     ) -> Result<Vec<(PathBuf, String)>, String> {
         threads
             .iter_mut()
+            .filter(|thread| !thread.operator_thread)
             .map(|thread| {
                 deduplicate_thread_outputs(thread);
                 serde_json::to_string(thread)
@@ -1338,6 +1343,16 @@ impl ThreadStore {
     pub fn save_thread(&self, id: &str) {
         if id.is_empty() {
             self.save();
+            return;
+        }
+        // Operator lives only for one delegated GUI task. Its state is already in memory and
+        // is consumed by the parent on completion; writing every screenshot/tool event to disk
+        // would add latency and then immediately delete the file.
+        if self
+            .threads
+            .iter()
+            .any(|thread| thread.id == id && thread.operator_thread)
+        {
             return;
         }
         let mut dirty = self.dirty.lock().unwrap();

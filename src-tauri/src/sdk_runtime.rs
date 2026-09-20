@@ -236,6 +236,7 @@ impl SdkManager {
             native_restore,
             user_item_id,
             cached_auto_model,
+            operator_mode,
         ) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
@@ -273,6 +274,7 @@ impl SdkManager {
                     .model
                     .as_deref()
                     .and_then(|selection| thread.cached_auto_model(selection)),
+                thread.operator_thread,
             );
             store.save_thread(&thread_id);
             values
@@ -398,6 +400,7 @@ impl SdkManager {
             "mode": mode,
             "reasoningEffort": reasoning_effort,
             "lightweightModel": lightweight_model,
+            "operatorMode": operator_mode,
             "parts": parts
         });
         let mut outcome = self

@@ -50,15 +50,24 @@ pub(super) fn rtk_guidance() -> String {
 fn thread_options(request: &Value, options: &Options) -> Value {
     let title = request["action"] == "title";
     let read_only = title || request["mode"] == "plan";
+    let operator_mode = request["operatorMode"].as_bool().unwrap_or(false);
     let mut guidance = Vec::new();
     let rtk = rtk_guidance();
     let mut mcp = if title { None } else { options.polaris.clone() };
     if let Some(mcp) = mcp.as_mut() {
         mcp["env"]["NOVA_TOOLS_CWD"] = request["cwd"].clone();
         mcp["env"]["NOVA_TOOLS_READ_ONLY"] = json!(if read_only { "1" } else { "0" });
-        if mcp["env"]["NOVA_FAST_CONTEXT"] != "0" { guidance.push(POLARIS_GUIDANCE); }
+        mcp["env"]["NOVA_PARENT_THREAD_ID"] = request["threadId"].clone();
+        if operator_mode {
+            mcp["env"]["NOVA_OPERATOR_CHILD"] = json!("1");
+            mcp["env"]["NOVA_FAST_CONTEXT"] = json!("0");
+        } else if mcp["env"]["NOVA_FAST_CONTEXT"] != "0" {
+            guidance.push(POLARIS_GUIDANCE);
+        }
     }
-    if !title {
+    if operator_mode {
+        guidance.push(crate::operator::SYSTEM_PROMPT);
+    } else if !title {
         if !rtk.is_empty() {
             guidance.push(&rtk);
         }

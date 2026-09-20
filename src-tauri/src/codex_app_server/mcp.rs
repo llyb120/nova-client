@@ -23,14 +23,48 @@ fn tool() -> Value {
         },"anyOf":[{"required":["keywords"]},{"required":["query"]},{"required":["task"]},{"required":["files"]}],"additionalProperties":false}})
 }
 
+fn strip_descriptions(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("description");
+            for child in object.values_mut() { strip_descriptions(child); }
+        }
+        Value::Array(values) => {
+            for child in values { strip_descriptions(child); }
+        }
+        _ => {}
+    }
+}
+
+fn compact_gui_tool(mut definition: Value, description: &str) -> Value {
+    definition["description"] = Value::String(description.into());
+    strip_descriptions(&mut definition["inputSchema"]);
+    definition
+}
+
 fn available_tools() -> Vec<Value> {
     let mut tools = Vec::new();
+    let operator_child = std::env::var("NOVA_OPERATOR_CHILD").as_deref() == Ok("1");
+    if operator_child {
+        tools.push(compact_gui_tool(
+            crate::chrome_browser::tool_definition(),
+            "控制用户Chrome。先tabs绑定tabTag；用最新snapshotId操作，确定动作可合批1–8个；executed/needs_review或超时结果不明先核对页面，禁止盲目重放。",
+        ));
+        tools.push(compact_gui_tool(
+            crate::jianlai::tool_definition(),
+            "真实桌面截图+鼠标键盘。只用最新snapshotId/imageId图片像素；确定动作可合批1–8个；not_executed可重试，executed/needs_review或结果不明先观察核对，旧坐标随窗口变化失效。",
+        ));
+        return tools;
+    }
     if std::env::var("NOVA_FAST_CONTEXT").as_deref() != Ok("0") { tools.push(tool()); }
     if std::env::var("NOVA_TOOLS_READ_ONLY").as_deref() != Ok("1") {
         tools.extend(crate::image_generation::tool_definitions());
         tools.push(crate::native_browser::tool_definition());
         tools.push(crate::chrome_browser::tool_definition());
         tools.push(crate::jianlai::tool_definition());
+        if std::env::var("NOVA_PARENT_THREAD_ID").is_ok_and(|value| !value.trim().is_empty()) {
+            tools.push(crate::operator::tool_definition());
+        }
     }
     tools
 }
@@ -87,7 +121,10 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     args: Value,
 ) -> Result<Value, String> {
     static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let owner = OWNER.get_or_init(|| uuid::Uuid::new_v4().to_string());
+    let owner = std::env::var("NOVA_PARENT_THREAD_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| OWNER.get_or_init(|| uuid::Uuid::new_v4().to_string()).clone());
     let message = json!({"token":config.token,"method":name,"root":config.root,"owner":owner,"params":args});
     stream
         .write_all(format!("{message}\n").as_bytes())

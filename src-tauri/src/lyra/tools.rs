@@ -86,6 +86,8 @@ pub fn tool_set(
         })),
     });
     if !read_only {
+        let operator = crate::operator::tool_definition();
+        tools.push(Tool { name: "operator", description: operator["description"].as_str().unwrap().into(), parameters: schema(operator["inputSchema"].clone()) });
         let webview = crate::native_browser::tool_definition();
         tools.push(Tool { name: "webview", description: webview["description"].as_str().unwrap().into(), parameters: schema(webview["inputSchema"].clone()) });
         let desktop = crate::jianlai::tool_definition();
@@ -150,6 +152,46 @@ pub fn tool_set(
     }
 
     tools
+}
+
+fn strip_schema_descriptions(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("description");
+            for child in object.values_mut() {
+                strip_schema_descriptions(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                strip_schema_descriptions(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Operator 子会话只看到两个 GUI 执行通道。复用完整类型/枚举契约，但移除冗长的
+/// 字段说明；关键安全语义收敛到短顶层说明，避免每轮为两份超长 schema 付 token。
+pub fn operator_tool_set() -> Vec<Tool> {
+    let desktop = crate::jianlai::tool_definition();
+    let chrome = crate::chrome_browser::tool_definition();
+    let mut desktop_schema = desktop["inputSchema"].clone();
+    let mut chrome_schema = chrome["inputSchema"].clone();
+    strip_schema_descriptions(&mut desktop_schema);
+    strip_schema_descriptions(&mut chrome_schema);
+    vec![
+        Tool {
+            name: "jianlai",
+            description: "真实桌面截图+鼠标键盘。先观察，再用最新 snapshotId/imageId 的图片像素操作；actions 可合批 1–8 个确定动作。not_executed 可重试，executed/needs_review 或结果不明时先观察核对，禁止盲目重放。窗口/焦点/截图变化后旧坐标失效。".into(),
+            parameters: schema(desktop_schema),
+        },
+        Tool {
+            name: "chrome",
+            description: "控制用户 Chrome。先 tabs 绑定明确 tabTag；inspect/screenshot 获取当前 snapshotId，优先 DOM ref，必要时按最新图片坐标操作；actions 可合批 1–8 个确定动作。snapshot 单次消费；executed/needs_review 或超时结果不明时先检查实际页面，禁止盲目重放。".into(),
+            parameters: schema(chrome_schema),
+        },
+    ]
 }
 
 /// 工具执行结果：内容块列表 + details（归档信息等）。
@@ -536,6 +578,20 @@ async fn execute_inner(
     owner: &str,
 ) -> ToolOutcome {
     match name {
+        "operator" => {
+            if shell.is_none() { return ToolOutcome::error("当前为只读模式，Operator 不可用"); }
+            let Some(parent_thread_id) = args.get("__parentThreadId").and_then(Value::as_str) else {
+                return ToolOutcome::error("Operator 缺少父会话身份");
+            };
+            let mut public_args = args.clone();
+            if let Some(object) = public_args.as_object_mut() {
+                object.remove("__parentThreadId");
+            }
+            match crate::operator::run(root, &public_args, parent_thread_id).await {
+                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
         "webview" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，网页控制不可用"); }
             match crate::native_browser::execute(root, args).await {
@@ -731,7 +787,7 @@ mod embedded_rtk_tests {
     async fn image_tools_work_without_polaris_and_are_blocked_in_read_only_mode() {
         for read_only in [false, true] {
             let tools = tool_set(read_only, false, false);
-            for name in ["generate_image", "edit_image", "jianlai"] {
+            for name in ["generate_image", "edit_image", "jianlai", "operator"] {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
         }
@@ -739,6 +795,15 @@ mod embedded_rtk_tests {
         let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, "test").await;
         assert!(result.is_error);
         assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
+    }
+
+    #[test]
+    fn operator_child_only_sees_gui_channels() {
+        let names: Vec<_> = super::operator_tool_set().into_iter().map(|tool| tool.name).collect();
+        assert_eq!(names, vec!["jianlai", "chrome"]);
+        let tools = super::operator_tool_set();
+        let encoded = serde_json::to_string(&tools[0].parameters).unwrap();
+        assert!(!encoded.contains("\"description\""));
     }
 
     #[test]

@@ -2,6 +2,7 @@ import imageTools from "./image-tools.json" with { type: "json" };
 import webviewTool from "./webview-tool.json" with { type: "json" };
 import chromeTool from "./chrome-tool.json" with { type: "json" };
 import jianlaiTool from "./jianlai-tool.json" with { type: "json" };
+import operatorTool from "./operator-tool.json" with { type: "json" };
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
@@ -22,6 +23,21 @@ function readOnlyEnabled(options = {}) {
 function stringList(value) {
   const list = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
   return [...new Set(list.map((item) => String(item ?? "").trim()).filter(Boolean))];
+}
+
+function compactOperatorTool(definition, description) {
+  const inputSchema = JSON.parse(JSON.stringify(definition.inputSchema));
+  const strip = value => {
+    if (Array.isArray(value)) {
+      for (const child of value) strip(child);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    delete value.description;
+    for (const child of Object.values(value)) strip(child);
+  };
+  strip(inputSchema);
+  return { ...definition, description, inputSchema };
 }
 
 export function normalizePolarisArgs(params = {}) {
@@ -45,32 +61,47 @@ export function normalizePolarisArgs(params = {}) {
  * @param {{ readOnly?: boolean, fastContext?: boolean }} [options]
  */
 export function createNovaBatchTools(cwd, options = {}) {
-  const owner = randomUUID();
-  const fastContext = fastContextEnabled(options);
+  const parentThreadId = String(process.env.NOVA_PARENT_THREAD_ID ?? "").trim();
+  const owner = parentThreadId || randomUUID();
+  const operatorChild = process.env.NOVA_OPERATOR_CHILD === "1";
+  const fastContext = fastContextEnabled(options) && !operatorChild;
   const readOnly = readOnlyEnabled(options);
   let root = resolve(cwd);
 
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
   const tools = {};
   if (!readOnly && globalContextServiceConfigured()) {
-    tools.webview = { ...webviewTool,
-      execute: async params => JSON.stringify(await callGlobalContextTool("webview", root, params)),
-    };
-    tools.jianlai = { ...jianlaiTool,
+    const desktopDefinition = operatorChild
+      ? compactOperatorTool(jianlaiTool, "真实桌面截图+鼠标键盘。先观察，再用最新 snapshotId/imageId 图片像素操作；actions 可合批1–8个确定动作。not_executed可重试，executed/needs_review或结果不明先观察核对，禁止盲目重放；窗口/焦点变化后旧坐标失效。")
+      : jianlaiTool;
+    const chromeDefinition = operatorChild
+      ? compactOperatorTool(chromeTool, "控制用户Chrome。先tabs绑定明确tabTag；inspect/screenshot取得当前snapshotId，优先DOM ref，必要时按最新图片坐标操作；actions可合批1–8个确定动作。snapshot单次消费；executed/needs_review或超时结果不明先核对页面，禁止盲目重放。")
+      : chromeTool;
+    tools.jianlai = { ...desktopDefinition,
       execute: async params => JSON.stringify(await callGlobalContextTool("jianlai", root, params, owner)),
     };
-    tools.chrome = { ...chromeTool,
+    tools.chrome = { ...chromeDefinition,
       execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params, owner)),
     };
-    for (const definition of imageTools) {
-      tools[definition.name] = { ...definition,
-        execute: async (params) => JSON.stringify(await callGlobalContextTool(definition.name, root, params)),
+    if (!operatorChild) {
+      tools.webview = { ...webviewTool,
+        execute: async params => JSON.stringify(await callGlobalContextTool("webview", root, params)),
       };
+      if (parentThreadId) {
+        tools.operator = { ...operatorTool,
+          execute: async params => JSON.stringify(await callGlobalContextTool("operator", root, params, parentThreadId)),
+        };
+      }
+      for (const definition of imageTools) {
+        tools[definition.name] = { ...definition,
+          execute: async (params) => JSON.stringify(await callGlobalContextTool(definition.name, root, params)),
+        };
+      }
     }
   }
 
   const cwdScope = process.env.NOVA_CWD_CHANGE_SCOPE;
-  if (cwdScope && globalContextServiceConfigured()) {
+  if (!operatorChild && cwdScope && globalContextServiceConfigured()) {
     tools.change_working_directory = {
       description: "切换本会话的工作目录，并让 Nova 切换或创建对应项目。目录必须已存在，相对路径基于当前工作目录。必须单独调用，不要与其它工具并行；Nova 会停止当前执行，在新目录恢复会话并自动继续任务。",
       inputSchema: {
@@ -137,10 +168,18 @@ export function createNovaBatchTools(cwd, options = {}) {
  */
 export function novaDevinBatchToolPolicy(options = {}) {
   const readOnly = readOnlyEnabled(options);
-  const fastContext = fastContextEnabled(options);
+  const operatorChild = process.env.NOVA_OPERATOR_CHILD === "1";
+  const parentThreadId = String(process.env.NOVA_PARENT_THREAD_ID ?? "").trim();
+  const fastContext = fastContextEnabled(options) && !operatorChild;
   const toolNames = [];
   if (fastContext) toolNames.push("polaris");
-  if (!readOnly && globalContextServiceConfigured()) toolNames.push("generate_image", "edit_image", "webview", "chrome", "jianlai");
+  if (!readOnly && globalContextServiceConfigured()) {
+    toolNames.push("chrome", "jianlai");
+    if (!operatorChild) {
+      toolNames.push("generate_image", "edit_image", "webview");
+      if (parentThreadId) toolNames.push("operator");
+    }
+  }
   if (toolNames.length === 0) {
     const lines = ["Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."];
     if (readOnly) lines.push("Current mode is plan/read-only: analyze only; do not modify files.");
@@ -152,6 +191,7 @@ export function novaDevinBatchToolPolicy(options = {}) {
     : "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools.";
   const callExampleName = fastContext ? "polaris" : "generate_image";
   const lines = [
+    ...(!operatorChild && parentThreadId ? ["For a complete multi-step GUI/desktop task, prefer one operator call with the end goal and necessary constraints. Let Operator choose or switch chrome/jianlai itself; do not micromanage mouse-level steps unless the task is truly atomic or Operator returns blocked/needs_input."] : []),
     `ROUTING RULE — before choosing any tool: Nova endpoints must NEVER be selected as direct tool calls. Select Devin's top-level mcp_call_tool first, then pass server_name="nova-tools" and the endpoint name in tool_name. ${novaToolsPhrase} Never select or invoke any of those names directly, even after mcp_list_tools lists them; a direct invocation produces \`Unknown tool ... This tool is not available.\` Your only valid execution path for a Nova tool is Devin's generic mcp_call_tool wrapper. Set server_name to the top-level string "nova-tools" (never omit it or put it inside arguments), and put only the selected Nova tool's inputs in arguments. Example: ${example}. Follow the wrapper's declared tool-name field if its schema uses a different spelling. The available Nova tools are already stated above; do not call mcp_list_tools merely to discover them. In every rule below, wording such as \`use/call ${callExampleName}\` means \`call mcp_call_tool with server_name nova-tools and tool_name ${callExampleName}\`; it never authorizes a direct tool call. If a direct call reports \`Unknown tool\`, retry once through mcp_call_tool. If parsing reports missing field \`server_name\`, correct the wrapper call once. Never repeat a malformed call unchanged. The following tool-selection rules are hard constraints.`,
     "Prefer minimal reads via Devin native read: when line ranges are known, read only those segments; expand nearby context only as needed. "
       + (fastContext
