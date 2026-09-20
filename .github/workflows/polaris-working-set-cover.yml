@@ -1,0 +1,179 @@
+name: Polaris natural-language working-set cover
+on:
+  push:
+    branches: [perf/polaris-semantic-20260919]
+    paths:
+      - .github/workflows/polaris-working-set-cover.yml
+      - scripts/polaris-working-set-cover-*.py
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: polaris-working-set-cover-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+env:
+  PYTHONUTF8: '1'
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 3da28d30f1adfd0da3b993813a47aa3fff20fdeb
+          path: _corpus
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-text-recall-ubuntu-24.04
+          run-id: 35485881086
+          github-token: ${{ github.token }}
+          path: _current
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-one-shot-results
+          run-id: 35483102649
+          github-token: ${{ github.token }}
+          path: _accepted
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/polaris-harness -> target
+          cache-on-failure: true
+      - name: Install search dependency and apply exact candidate
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y ripgrep
+          mkdir -p validation .cargo
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          python scripts/polaris-working-set-cover-migrate.py
+          git diff -- src-tauri/src/nova_tools_native > validation/production.patch
+          git diff --exit-code -- src-tauri/src/lyra/reasonix.rs src-tauri/src/nova_tools_native/context.rs
+          git rev-parse HEAD > validation/tested-base.txt
+      - name: Production retrieval and routing tests
+        id: build
+        run: |
+          set -euo pipefail
+          cargo clean --release --manifest-path bench/polaris-harness/Cargo.toml -p polaris-harness
+          cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
+          node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs scripts/ctx-core.test.mjs 2>&1 | tee validation/node-tests.txt
+          cargo build --release --manifest-path bench/polaris-harness/Cargo.toml
+          mkdir -p validation/bin validation/source
+          cp bench/polaris-harness/target/release/polaris-harness validation/bin/candidate
+          cp src-tauri/src/nova_tools_native/polaris*.rs validation/source/
+          sha256sum validation/bin/candidate > validation/candidate-binary.sha256
+          sha256sum src-tauri/src/nova_tools_native/polaris*.rs src-tauri/src/lyra/reasonix.rs > validation/source-hashes.txt
+      - name: Natural-language coverage, closure and latency against current accepted engine
+        if: steps.build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          test "$(sha256sum _current/bin/polaris-harness | cut -d' ' -f1)" = "462e6ed7223ac058924b574c783dcd2b26d9d4df143a0b21521df19f70a6e53e"
+          chmod +x _current/bin/polaris-harness
+          python scripts/polaris-working-set-cover-ab.py             --current _current/bin/polaris-harness             --candidate validation/bin/candidate             --accepted _accepted             --corpus _corpus | tee validation/working-set-cover-progress.txt
+          python scripts/polaris-one-shot-edit.py --binary validation/bin/candidate | tee validation/context-only-edit.txt
+          python - <<'PY'
+          import json,pathlib
+          r=json.loads(pathlib.Path('validation/context-only-edit/report.json').read_text())
+          assert r['passed']==r['total']==4,r
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-working-set-cover-candidate
+          path: validation/
+          retention-days: 7
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/polaris-harness -> target
+          cache-on-failure: true
+      - name: Search dependency
+        run: choco install ripgrep -y --no-progress
+      - name: Apply and test same production source
+        run: |
+          set -euo pipefail
+          mkdir -p validation .cargo
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          python scripts/polaris-working-set-cover-migrate.py
+          cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
+          node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs scripts/ctx-core.test.mjs 2>&1 | tee validation/node-tests.txt
+          sha256sum src-tauri/src/nova_tools_native/polaris*.rs src-tauri/src/lyra/reasonix.rs > validation/source-hashes.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-working-set-cover-windows
+          path: validation/
+          retention-days: 7
+  land:
+    needs: [candidate, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-working-set-cover-candidate
+          path: _verified
+      - name: Land only exact verified production source
+        run: |
+          set -euo pipefail
+          remote=$(git ls-remote origin refs/heads/perf/polaris-semantic-20260919 | cut -f1)
+          test "$remote" = "$GITHUB_SHA" || { echo 'Branch changed; refusing overwrite'; exit 1; }
+          python - <<'PY'
+          import pathlib,json,hashlib,subprocess
+          r=pathlib.Path('_verified')
+          assert (r/'tested-base.txt').read_text().strip()==subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          report=json.loads((r/'working-set-cover/report.json').read_text())
+          assert report['passed'] is True
+          edits=json.loads((r/'context-only-edit/report.json').read_text())
+          assert edits['passed']==edits['total']==4
+          patch=r/'production.patch'
+          allowed={
+            'src-tauri/src/nova_tools_native/polaris_demand_v2.rs',
+            'src-tauri/src/nova_tools_native/polaris_packet.rs',
+          }
+          paths={line.split(' b/',1)[1] for line in patch.read_text().splitlines() if line.startswith('diff --git ')}
+          assert paths==allowed,(paths,allowed)
+          subprocess.run(['git','apply','--check',str(patch)],check=True)
+          subprocess.run(['git','apply',str(patch)],check=True)
+          subprocess.run(['git','add','--',*sorted(paths)],check=True)
+          PY
+          git rm scripts/polaris-working-set-cover-migrate.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'perf(polaris): maximize natural-language goal coverage in one working set'
+          git push origin HEAD:perf/polaris-semantic-20260919
+          mkdir -p validation
+          git rev-parse HEAD > validation/landed-commit.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-working-set-cover-landed
+          path: validation/
+          retention-days: 7
