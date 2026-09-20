@@ -1,0 +1,29 @@
+name: Operator CI
+
+on:
+  push:
+    branches: [work/operator-fast-tools]
+
+jobs:
+  operator:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - shell: bash
+        run: |
+          mkdir -p .cargo
+          printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci
+      - run: npm run check
+      - run: npm run test:operator
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib operator::tests lyra::agent::tests lyra::tools::embedded_rtk_tests
