@@ -2,6 +2,7 @@ import imageTools from "./image-tools.json" with { type: "json" };
 import webviewTool from "./webview-tool.json" with { type: "json" };
 import chromeTool from "./chrome-tool.json" with { type: "json" };
 import jianlaiTool from "./jianlai-tool.json" with { type: "json" };
+import operatorTool from "./operator-tool.json" with { type: "json" };
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
@@ -56,12 +57,16 @@ export function createNovaBatchTools(cwd, options = {}) {
     tools.webview = { ...webviewTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("webview", root, params)),
     };
+    if (process.env.NOVA_OPERATOR_SCOPE) {
+      tools.operator = { ...operatorTool, execute: async params => JSON.stringify(await callGlobalContextTool("operator", root, params, owner)) };
+    } else {
     tools.jianlai = { ...jianlaiTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("jianlai", root, params, owner)),
     };
     tools.chrome = { ...chromeTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params, owner)),
     };
+    }
     for (const definition of imageTools) {
       tools[definition.name] = { ...definition,
         execute: async (params) => JSON.stringify(await callGlobalContextTool(definition.name, root, params)),

@@ -88,10 +88,15 @@ pub fn tool_set(
     if !read_only {
         let webview = crate::native_browser::tool_definition();
         tools.push(Tool { name: "webview", description: webview["description"].as_str().unwrap().into(), parameters: schema(webview["inputSchema"].clone()) });
+        if crate::operator::enabled() {
+            let op=crate::operator::tool_definition();
+            tools.push(Tool { name:"operator", description:op["description"].as_str().unwrap().into(), parameters:schema(op["inputSchema"].clone()) });
+        } else {
         let desktop = crate::jianlai::tool_definition();
         tools.push(Tool { name: "jianlai", description: desktop["description"].as_str().unwrap().into(), parameters: schema(desktop["inputSchema"].clone()) });
         let chrome = crate::chrome_browser::tool_definition();
         tools.push(Tool { name: "chrome", description: chrome["description"].as_str().unwrap().into(), parameters: schema(chrome["inputSchema"].clone()) });
+        }
         for definition in crate::image_generation::tool_definitions() {
             tools.push(Tool {
                 name: if definition["name"] == "edit_image" { "edit_image" } else { "generate_image" },
@@ -543,6 +548,13 @@ async fn execute_inner(
                 Err(error) => ToolOutcome::error(error),
             }
         }
+        "operator" => {
+            if shell.is_none() { return ToolOutcome::error("read-only mode does not permit Operator"); }
+            match crate::operator::execute(root, args, owner).await {
+                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
+                Err(error) => ToolOutcome::error(error),
+            }
+        },
         "chrome" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，Chrome 控制不可用"); }
             match crate::native_browser::execute_chrome(root, args, owner).await {

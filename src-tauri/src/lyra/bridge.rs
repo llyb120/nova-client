@@ -462,6 +462,9 @@ async fn handle_prompt(
     }));
     let archive_dir = Some(roots.data().join("tool-results").join(&ctx.session_id));
     let cancelled = Arc::new(AtomicBool::new(false));
+    let _operator_registration = if !read_only && crate::operator::enabled() {
+        archive_dir.as_ref().map(|dir| crate::operator::register_native(dir.to_string_lossy().into_owned(),cwd_path.clone(),cancelled.clone(),http.clone(),resolved.clone()))
+    } else { None };
     let steering = Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let mut agent = Agent {
         model: resolved.clone(),
@@ -589,6 +592,7 @@ async fn handle_prompt(
     // ---- 事件 → 协议 items ----
     let mut total_usage = json!({});
     let mut last_context_tokens = 0u64;
+    let mut operator_usage_seen=std::collections::HashSet::new();
     let mut agent_message_index = 0u64;
     let mut current_text = String::new();
     let mut current_thinking = String::new();
@@ -631,6 +635,15 @@ async fn handle_prompt(
             emit(&json!({ "type": "item", "item": item }));
         }
         AgentEvent::ToolEnd { id, outcome, .. } => {
+            if let (Some(run),Some(u))=(outcome.pointer("/details/runId").and_then(Value::as_str),outcome.pointer("/details/metrics/usage").filter(|u|u.is_object())) {
+                if operator_usage_seen.insert(run.to_string()) {
+                    let read=u["cacheReadTokens"].as_u64().unwrap_or(0);
+                    let write=u["cacheWriteTokens"].as_u64().unwrap_or(0);
+                    merge_usage(&mut total_usage,&json!({"input":u["inputTokens"].as_u64().unwrap_or(0).saturating_sub(read).saturating_sub(write),"output":u["outputTokens"],"cacheRead":read,"cacheWrite":write}));
+                    total_usage["contextTokens"]=json!(last_context_tokens);
+                }
+            }
+
             let started = started_tools
                 .get(&id)
                 .cloned()

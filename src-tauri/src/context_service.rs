@@ -60,6 +60,8 @@ struct ContextRequest {
     #[serde(default)]
     owner: String,
     #[serde(default)]
+    operator_scope: String,
+    #[serde(default)]
     params: Value,
 }
 
@@ -140,6 +142,9 @@ fn dispatch(
         ));
     }
     let mut params = request.params;
+    if request.method == "operator" {
+        return tauri::async_runtime::block_on(crate::operator::execute(root, &params, &request.operator_scope));
+    }
     if request.method == "webview" {
         return tauri::async_runtime::block_on(crate::native_browser::execute(root, &params));
     }
@@ -449,6 +454,7 @@ mod tests {
             method: "change_working_directory".into(),
             root: String::new(),
             owner: String::new(),
+            operator_scope: String::new(),
             params: serde_json::json!({ "scope": scope, "path": "../new project" }),
         };
         assert!(dispatch(request("session-B"), "secret", &changes).is_err());

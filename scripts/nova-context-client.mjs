@@ -32,10 +32,10 @@ async function requestOnce(config, method, root, params, clientOwner) {
       if (error) reject(error);
       else resolveResult(value);
     };
-    const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), ["webview", "chrome"].includes(method) ? 45_000 : ["generate_image", "edit_image"].includes(method) ? 610_000 : CALL_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), ["webview", "chrome"].includes(method) ? 45_000 : ["generate_image", "edit_image", "operator"].includes(method) ? 610_000 : CALL_TIMEOUT_MS);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ token: config.token, method, root: resolve(root), owner: clientOwner, params: params ?? {} })}\n`);
+      socket.write(`${JSON.stringify({ token: config.token, method, root: resolve(root), owner: clientOwner, operator_scope: String(process.env.NOVA_OPERATOR_SCOPE ?? ""), params: params ?? {} })}\n`);
     });
     socket.on("data", (chunk) => { response += chunk; });
     socket.on("end", () => {
@@ -67,7 +67,7 @@ export async function callGlobalContextTool(method, root, params, clientOwner = 
     try {
       return await requestOnce(config, method, root, requestParams, clientOwner);
     } catch (error) {
-      if (["generate_image", "edit_image", "webview", "chrome", "jianlai"].includes(method)) throw error;
+      if (["generate_image", "edit_image", "webview", "chrome", "jianlai", "operator"].includes(method)) throw error;
       const code = error?.code;
       if (Date.now() >= deadline || !["ENOENT", "ECONNREFUSED", "EPIPE"].includes(code)) throw error;
       await wait(CONNECT_RETRY_MS);
