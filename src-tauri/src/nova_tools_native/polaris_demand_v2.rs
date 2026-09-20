@@ -1,3 +1,4 @@
+include!("polaris_text.rs");
 // Query-first discovery. Detailed passages are built only for selected declarations.
 const INITIAL_FILES: usize = 16;
 const MAX_PARSED_FILES: usize = 40;
@@ -20,6 +21,7 @@ pub(super) struct DemandStats {
     pub parsed_bytes:usize,pub reparsed_files:usize,pub candidate_files_omitted:usize,
     pub discovery_ms:f64,pub parse_ms:f64,pub dependency_rounds:usize,
     pub candidate_declarations:usize,pub materialized_declarations:usize,
+    pub literal_ranges:usize,
 }
 fn subset(units:Vec<Arc<CodeUnit>>,files:usize,changed:usize,partial:bool)->Corpus {
     let mut df=HashMap::new();
@@ -158,8 +160,7 @@ pub(super) fn demand_corpus(root:&Path,q:&query::Query,deadline:Instant)->Result
         let item=match item{Ok(e)=>e,Err(_)=>{partial=true;continue;}};
         if !item.file_type().is_some_and(|f|f.is_file()){continue;}
         let Some(file)=item.path().strip_prefix(&root).ok().and_then(|p|p.to_str()).map(|p|p.replace('\\',"/"))else{continue;};
-        let role=file_role(&file);
-        if is_searchable_implementation_file(&file)&&(role=="implementation"||(q.test_intent&&role=="test")||(q.doc_intent&&role=="documentation")){
+        if literal_candidate(&file,q){
             paths.push(file);if paths.len()>=8000{partial=true;break;}
         }
     }
@@ -169,13 +170,16 @@ pub(super) fn demand_corpus(root:&Path,q:&query::Query,deadline:Instant)->Result
         if !safe_file(&root,&file){partial=true;continue;}
         let path=root.join(&file);let Some(stamp)=metadata_stamp(&path)else{partial=true;continue;};
         if stamp.0>2*1024*1024||stats.scanned_bytes+stamp.0>MAX_DISCOVERY_BYTES{partial=true;continue;}
-        let text=match fs::read_to_string(&path){Ok(t)=>t,Err(_)=>{partial=true;continue;}};
+        let bytes=match fs::read(&path){Ok(b)=>b,Err(_)=>{partial=true;continue;}};
+        stats.scanned_bytes+=bytes.len() as u64;
+        if bytes.contains(&0){continue;}
+        let text=match String::from_utf8(bytes){Ok(t)=>t,Err(_)=>continue};
         if metadata_stamp(&path)!=Some(stamp){partial=true;continue;}
-        stats.scanned_files+=1;stats.scanned_bytes+=text.len() as u64;
-        let mut hits=matcher.matches(&text).into_iter().collect::<Vec<_>>();hits.extend(matcher.matches(&file));hits.sort_unstable();hits.dedup();for &hit in &hits{df[hit]+=1;}
+        stats.scanned_files+=1;
+        let mut hits=matcher.matches(&text).into_iter().collect::<Vec<_>>();hits.extend(matcher.matches(&file));hits.sort_unstable();hits.dedup();if structural_candidate(&file,q){for &hit in &hits{df[hit]+=1;}}
         rows.push(Candidate{hash:digest(text.as_bytes()),file,text,hits,score:0.0});
     }
-    let n=rows.len().max(1) as f64;let idf=df.iter().map(|d|(1.0+n/(*d).max(1) as f64).ln()).collect::<Vec<_>>();
+    let n=rows.iter().filter(|r|structural_candidate(&r.file,q)).count().max(1) as f64;let idf=df.iter().map(|d|(1.0+n/(*d).max(1) as f64).ln()).collect::<Vec<_>>();
     for row in &mut rows{
         let path_hits=matcher.matches(&row.file);
         for &i in &row.hits{row.score+=terms[i].1*idf[i]*if path_hits.matched(i){3.0}else{1.0};}
@@ -184,7 +188,7 @@ pub(super) fn demand_corpus(root:&Path,q:&query::Query,deadline:Instant)->Result
         if q.files.contains(&row.file){row.score+=10000.0;}
         if q.anchors.iter().any(|a|row.text.contains(a)){row.score+=1000.0;}
     }
-    let mut order=(0..rows.len()).filter(|&i|rows[i].score>0.0).collect::<Vec<_>>();
+    let mut order=(0..rows.len()).filter(|&i|rows[i].score>0.0&&structural_candidate(&rows[i].file,q)).collect::<Vec<_>>();
     order.sort_by(|&a,&b|rows[b].score.total_cmp(&rows[a].score).then(rows[a].file.cmp(&rows[b].file)));
     stats.discovery_ms=started.elapsed().as_secs_f64()*1000.0;
     let slot=demand_slot(&root)?;let mut cache=slot.try_lock().map_err(|_|"same repository candidate parsing is busy")?;
@@ -224,7 +228,7 @@ pub(super) fn demand_corpus(root:&Path,q:&query::Query,deadline:Instant)->Result
         required_names.extend(names.iter().cloned());
         let mut neighbours=rows.iter().enumerate().filter(|(i,_)|!parsed.contains(i)).filter_map(|(i,r)|{
             let explicit=direct.contains(&r.file);let caller=callers.iter().any(|(_,name)|r.text.contains(name));
-            (explicit||caller).then_some((i,if explicit{10000.0+r.score}else{r.score}))
+            ((explicit||caller)&&structural_candidate(&r.file,q)).then_some((i,if explicit{10000.0+r.score}else{r.score}))
         }).collect::<Vec<_>>();
         neighbours.sort_by(|a,b|b.1.total_cmp(&a.1).then(rows[a.0].file.cmp(&rows[b.0].file)));
         let extra=neighbours.iter().take(if expansion<2{8}else{4}).map(|x|x.0).collect::<Vec<_>>();
@@ -237,6 +241,8 @@ pub(super) fn demand_corpus(root:&Path,q:&query::Query,deadline:Instant)->Result
     stats.candidate_files_omitted=order.iter().filter(|i|!parsed.contains(i)).count();
     stats.candidate_declarations=parsed.iter().filter_map(|i|cache.entries.get(&rows[*i].file)).map(|f|f.names.len()).sum();
     cache.bytes=cache.entries.values().map(|e|e.source.iter().map(|s|s.len()+1).sum::<usize>()).sum();
+    let (literal,literal_partial)=literal_units(&rows,&units,&cache,q,deadline)?;
+    stats.literal_ranges=literal.len();partial|=literal_partial;units.extend(literal);
     let c=subset(units,parsed.len(),stats.reparsed_files,partial);
     if !partial {if cache.results.len()>=64 {cache.results.clear();}cache.results.insert(query_key,(fingerprint,c.clone(),stats.clone()));}
     Ok((c,stats))

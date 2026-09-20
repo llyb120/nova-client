@@ -126,12 +126,12 @@ pub(super) fn pack(root:&Path,units:&[Arc<CodeUnit>],ranked:&[(usize,f64)],q:&Qu
         let (start,mut end)=if full_cost<=cap&&u.owner_end-full_start+1<=lines_left{(full_start,u.owner_end)}else{(u.start,u.end)};
         while end>=start&&(source[start-1..end].iter().enumerate().map(|(n,s)|s.len()+format!("{}: ",start+n).len()+1).sum::<usize>()+180>cap||end-start+1>lines_left){end-=1;}
         if end<start{result.gaps.push(serde_json::json!({"file":u.file,"start":u.owner_start,"end":u.owner_end,"reason":"working-set-budget"}));continue;}
-        let complete=start<=u.owner_start&&end>=u.owner_end;
+        let complete=start<=u.owner_start&&end>=u.owner_end&&(u.role!="source-text"||(start==1&&end==u.source.len()));
         let snippet=source[start-1..end].iter().enumerate().map(|(n,s)|format!("{}: {}\n",start+n,s)).collect::<String>();
-        result.body.push_str(&format!("\n### {}:{}-{} [{} {}]\ncoverage: {} {}:{}-{}\n```\n{snippet}```\n",u.file,start,end,relation,u.name,if complete{"BODY"}else{"PARTIAL"},u.file,start,end));
+        result.body.push_str(&format!("\n### {}:{}-{} [{} {}]\ncoverage: {} {}:{}-{}\n```\n{snippet}```\n",u.file,start,end,relation,u.name,if u.role=="source-text"{"SOURCE_RANGE"}else if complete{"BODY"}else{"PARTIAL"},u.file,start,end));
         lines_left-=end-start+1;ranges.entry(u.file.clone()).or_default().push((start,end));
         result.evidence.push(serde_json::json!({"file":u.file,"symbol":u.name,"start":start,"end":end,"role":u.role,"relation":relation,"sourceHash":u.file_hash,"complete":complete}));
-        if !complete{result.gaps.push(serde_json::json!({"file":u.file,"start":u.owner_start,"end":u.owner_end,"reason":"large-unit"}));}
+        if !complete{result.gaps.push(serde_json::json!({"file":u.file,"start":u.owner_start,"end":u.owner_end,"reason":if u.role=="source-text"{"source-range-only"}else{"large-unit"}}));}
     }
     result
 }

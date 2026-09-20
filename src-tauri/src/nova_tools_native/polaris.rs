@@ -57,7 +57,7 @@ fn retrieve_attempt(root:&Path,q:&Query,started:Instant,retried:bool)->Result<St
     let root=root.canonicalize().map_err(|e|e.to_string())?;
     let deadline=started+Duration::from_millis(900);
     let (corpus,demand)=index::demand_corpus(&root,q,started+Duration::from_millis(600))?;
-    let mut units=corpus.units.iter().filter(|u|u.role=="implementation"||(q.test_intent&&u.role=="test")||(q.doc_intent&&u.role=="documentation")||q.anchors.iter().any(|a|a==&u.name)||(q.files.contains(&u.file)&&index::file_role_for_query(&u.file)!="implementation")).cloned().collect::<Vec<_>>();
+    let mut units=corpus.units.iter().filter(|u|matches!(u.role,"implementation"|"source-text")||(q.test_intent&&u.role=="test")||(q.doc_intent&&u.role=="documentation")||q.anchors.iter().any(|a|a==&u.name)||(q.files.contains(&u.file)&&index::file_role_for_query(&u.file)!="implementation")).cloned().collect::<Vec<_>>();
     let known=units.iter().map(|u|u.file.clone()).collect::<HashSet<_>>();
     units.extend(index::explicit_units(&root,&q.files,&known,deadline));
     let semantic_query=q.semantic_query();
@@ -72,6 +72,7 @@ fn retrieve_attempt(root:&Path,q:&Query,started:Instant,retried:bool)->Result<St
     // Refine each recall channel independently before fusion. Otherwise a
     // semantically popular wrapper can erase the lexical channel's concrete body.
     let mut ranked=rank::fuse(&lexical,&dense.scores,&units,q);
+    index::prioritize_literal(&mut ranked,&units,q);
     ranked.truncate(32);
     // An in-flight edit invalidates old semantic results as well as lexical evidence.
     let mut verified=HashMap::<String,bool>::new();

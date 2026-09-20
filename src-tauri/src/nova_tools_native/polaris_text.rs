@@ -34,8 +34,16 @@ impl LiteralQuery {
         matched.into_iter().map(|i| self.weights[i]).sum()
     }
 }
-fn literal_units(rows: &[Candidate], units: &[Arc<CodeUnit>], q: &query::Query,
+fn literal_units(rows: &[Candidate], units: &[Arc<CodeUnit>], cache: &DemandCache, q: &query::Query,
     deadline: Instant) -> Result<(Vec<Arc<CodeUnit>>, bool), String> {
+    // Behavior-to-implementation queries retain structural ranking. Literal
+    // payload requests (not filename whitelists) opt into direct-text priority;
+    // empty structural recall always has the raw fallback in this same call.
+    let words=query::tokens(&format!("{} {}",q.task,q.anchors.join(" ")));
+    let payload=q.doc_intent||words.iter().any(|w|matches!(w.as_str(),
+        "sql"|"xml"|"yaml"|"yml"|"json"|"toml"|"properties"|"ini"|"markdown"))
+        ||["查询语句","配置内容","模板内容","字符串常量","字面量","报错原文","错误原文"].iter().any(|w|q.task.contains(w));
+    if !payload && !units.is_empty(){return Ok((Vec::new(),false));}
     let query = LiteralQuery::new(q)?;
     // Do not let a broad whole-file term match displace real implementations.
     // Recover only a better, localized literal match missing from the already
@@ -48,13 +56,29 @@ fn literal_units(rows: &[Candidate], units: &[Arc<CodeUnit>], q: &query::Query,
         .map(|r| (r, query.score(&r.file, &r.text)))
         .filter(|(_, score)| *score > best).collect::<Vec<_>>();
     candidates.sort_by(|a,b| b.1.total_cmp(&a.1).then(a.0.file.cmp(&b.0.file)));
-    let mut selected = Vec::new(); let mut partial = false;
+    let mut selected = Vec::new(); let mut partial = candidates.len()>16;
     // Text-only documents need no AST, and no second walk, grep process, model
     // request, or source read is needed: discovery already owns these bytes.
     for (row, _) in candidates.into_iter().take(16) {
         if Instant::now() >= deadline { partial = true; break; }
         let source = Arc::new(row.text.lines().map(str::to_owned).collect::<Vec<_>>());
         if source.is_empty() { continue; }
+        // Literal recall must not bypass cfg(test), including a test module in
+        // an otherwise production file. Reuse shallow declarations when present.
+        let parsed = if is_code_file(&row.file) && !q.test_intent {
+            Some(cache.entries.get(&row.file).map(|c|c.entry.clone())
+                .unwrap_or_else(||scan_source(&row.text,&row.file)))
+        } else { None };
+        let blocked = parsed.iter().flat_map(|e|e.syms.iter())
+            .filter(|s|s.kind.starts_with("test:")||(s.kind=="mod"&&s.name=="tests"))
+            .map(|s|{
+                let mut start=s.ln.saturating_sub(1);
+                while start>0 && s.ln-start<=8 {
+                    let line=source[start-1].trim();
+                    if line.starts_with("#[")||line.starts_with("//")||line.is_empty(){start-=1;}else{break;}
+                }
+                (start,s.end.min(source.len()))
+            }).collect::<Vec<_>>();
         let mut hits = Vec::new();
         for (i, line) in source.iter().enumerate() {
             if i % 256 == 0 && Instant::now() >= deadline { partial = true; break; }
@@ -66,7 +90,12 @@ fn literal_units(rows: &[Candidate], units: &[Arc<CodeUnit>], q: &query::Query,
         let mut winner: Option<(usize, usize, f64)> = None;
         for &(hit, _) in &hits {
             if Instant::now() >= deadline { partial = true; break; }
-            let start = hit.saturating_sub(8); let end = (hit + 48).min(source.len());
+            if blocked.iter().any(|&(a,b)|a<=hit&&hit<b){continue;}
+            let mut start = hit.saturating_sub(8); let mut end = (hit + 48).min(source.len());
+            for &(a,b) in &blocked {
+                if b<=hit { start=start.max(b); }
+                if a>hit { end=end.min(a); }
+            }
             // Byte and line caps bound tokenization, including huge/minified lines.
             let text = source[start..end].join("\n");
             let score = query.score(&row.file, &text);
@@ -86,13 +115,14 @@ fn literal_units(rows: &[Candidate], units: &[Arc<CodeUnit>], q: &query::Query,
         let passage = format!("Original source range: {}:{}-{}\n{}",row.file,start+1,end,
             body.chars().take(3000).collect::<String>());
         let u = CodeUnit { file:row.file.clone(), name:"<source-range>".into(),
-            start:start+1,end,owner_start:1,owner_end:source.len(),hash:digest(passage.as_bytes()),
+            start:start+1,end,owner_start:start+1,owner_end:end,hash:digest(passage.as_bytes()),
             file_hash:row.hash.clone(),role:"source-text",passage,terms,length,
             name_terms:HashSet::new(),members:Vec::new(),calls:HashSet::new(),events:Vec::new(),
             commands:HashSet::new(),source,imports:Arc::new(Vec::new()) };
         selected.push((Arc::new(u),score));
     }
     selected.sort_by(|a,b| b.1.total_cmp(&a.1).then(a.0.file.cmp(&b.0.file)));
+    partial |= selected.len()>4;
     selected.truncate(4);
     Ok((selected.into_iter().map(|(u,_)|u).collect(),partial))
 }
