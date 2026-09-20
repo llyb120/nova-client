@@ -39,7 +39,7 @@ jobs:
       - name: Typecheck
         run: npm run check
       - name: Operator Node tests
-        run: node --test scripts/operator-tools.test.mjs scripts/nova-tools-mcp.test.mjs scripts/automation-schema.test.mjs
+        run: node --test scripts/operator-tools.test.mjs scripts/nova-tools-mcp.test.mjs scripts/automation-schema.test.mjs scripts/browser-precision.test.mjs extensions/nova-chrome/worker.test.mjs
       - name: Three-way architectural backtest
         run: node scripts/operator-backtest.mjs | tee operator-backtest.json
       - name: Rust operator tests
