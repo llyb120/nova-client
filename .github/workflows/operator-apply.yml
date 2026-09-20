@@ -14,28 +14,29 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Verify and apply exact reviewed patch
+      - name: Verify and apply exact six-file followup
         shell: bash
         run: |
           set -euo pipefail
           git merge-base --is-ancestor 3da28d30f1adfd0da3b993813a47aa3fff20fdeb HEAD
           python - <<'PY'
-          import base64, hashlib, pathlib, zlib
-          names = ['01.b64', '02.b64', '03a.b64', '03b.b64', '04a.b64', '04b.b64']
+          import base64, hashlib, pathlib, re, zlib
+          names = ['final-1.b64', 'final-2a.b64', 'final-2b.b64']
           text = ''.join((pathlib.Path('.operator-stage') / n).read_text().strip() for n in names)
-          # Correct a single transport transcription; the decompressed SHA below is authoritative.
-          text = text.replace('/323fnX/o7sF', '/23fnX/o7sF')
           patch = zlib.decompress(base64.b64decode(text, validate=True))
           actual = hashlib.sha256(patch).hexdigest()
-          assert actual == '5d3b25c9971d43d548d12c1944968d1d240cfa44635e7bf4368b8403629bed36', actual
-          pathlib.Path('/tmp/operator.patch').write_bytes(patch)
-          print('verified patch bytes:', len(patch), 'sha256:', actual)
+          assert actual == '88ca6f623f49237d2a4e79d762b63af5512f2e555e47ce87b18913c3344912e7', actual
+          expected = {'bench/operator-replay/src/main.rs', 'src-tauri/src/acp.rs', 'src-tauri/src/acp/operator.rs', 'src-tauri/src/lyra/bridge.rs', 'src-tauri/src/operator/core.rs', 'src-tauri/src/operator/mod.rs'}
+          assert set(re.findall(r'^\+\+\+ b/(.+)$', patch.decode(), re.M)) == expected
+          pathlib.Path('/tmp/operator-followup.patch').write_bytes(patch)
+          print('verified bytes:', len(patch), 'sha256:', actual)
           PY
-          git apply --check --exclude=.github/workflows/operator-validation.yml /tmp/operator.patch
-          git apply --exclude=.github/workflows/operator-validation.yml /tmp/operator.patch
+          git apply --check /tmp/operator-followup.patch
+          git apply /tmp/operator-followup.patch
           rm -rf .operator-stage
-          git add src-tauri scripts bench .operator-stage
+          git add src-tauri bench .operator-stage
+          git diff --cached --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'feat(operator): isolated adaptive interaction runtime with guarded native contracts and replay tests'
+          git commit -m 'fix(operator): account child usage exactly once and use production contracts in replay'
           git push origin HEAD:work/operator-adaptive-pre-release-20260920
