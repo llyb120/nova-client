@@ -1,6 +1,7 @@
-"""Reduce dependency fan-out after the landed 20/20 intent-champion selection.
-Keep all declaration selection behavior unchanged; only stop expanding dependencies from
-lower-ranked fifth/sixth seeds. Quality gates must remain 20/20 and 4/4 before landing.
+"""Reduce cold parsing cost without shrinking dependency closure or intent coverage.
+Keep the two strongest files exactly as ranked. Fill the remaining initial parse slots from the
+top lexical candidate pool using relevance per estimated parse cost. Dependency fan-out/depth
+and the landed 20/20 declaration champion are unchanged.
 """
 from pathlib import Path
 import hashlib
@@ -11,17 +12,29 @@ def load(name,expected):
     assert got==expected,(name,got)
     return p,b.decode("utf-8")
 def sub(s,a,b):
-    assert s.count(a)==1,a[:180]
+    assert s.count(a)==1,a[:200]
     return s.replace(a,b)
 
 p,s=load("polaris_demand_v2.rs","3c814ff3e30916e15b7e357bda2338a52c4aa341")
-old='''        let mut expand=seeds.iter().take(6).map(|(id,_)|*id).collect::<Vec<_>>();'''
-new='''        // Packet assembly exposes at most four primary roots. Expanding
-        // dependencies from lower-ranked fifth/sixth recall seeds adds parse
-        // work that cannot become a primary working-set root unless reached by
-        // a verified edge from a stronger seed. Keep five seed frontiers; direct
-        // dependencies still recurse for three bounded rounds below.
-        let mut expand=seeds.iter().take(5).map(|(id,_)|*id).collect::<Vec<_>>();'''
+old='''    let mut parsed=HashSet::new();let initial=order.iter().copied().take(INITIAL_FILES).collect::<Vec<_>>();
+    partial|=declarations(&rows,&initial,&mut cache,&mut parsed,&mut stats,deadline);'''
+new='''    let mut parsed=HashSet::new();
+    // Always retain the two strongest lexical files. For the remaining cold
+    // slots, prefer focused evidence that is cheaper to parse. This only changes
+    // scheduling among already-discovered candidates; it does not narrow the
+    // search surface, dependency frontier, or result budget.
+    let mut initial=order.iter().copied().take(2).collect::<Vec<_>>();
+    let fixed=initial.iter().copied().collect::<HashSet<_>>();
+    let mut efficient=order.iter().copied().take(96).filter(|id|!fixed.contains(id)).collect::<Vec<_>>();
+    efficient.sort_by(|a,b|{
+        let value=|id:usize|{
+            let kib=rows[id].text.len() as f64/65536.0;
+            rows[id].score/(1.0+kib.sqrt())
+        };
+        value(*b).total_cmp(&value(*a)).then(rows[*a].file.cmp(&rows[*b].file))
+    });
+    initial.extend(efficient.into_iter().take(INITIAL_FILES.saturating_sub(initial.len())));
+    partial|=declarations(&rows,&initial,&mut cache,&mut parsed,&mut stats,deadline);'''
 s=sub(s,old,new)
 p.write_text(s,encoding="utf-8")
-print("Dependency discovery fan-out reduced from six recall seeds to five; depth and closure unchanged.")
+print("Cold parse scheduling now keeps top-2 lexical files and fills remaining slots by relevance/parse-cost.")
