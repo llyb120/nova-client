@@ -51,14 +51,32 @@ fn declarations(rows:&[Candidate],wanted:&[usize],cache:&mut DemandCache,parsed:
         if cache.entries.get(&row.file).is_none_or(|e|e.hash!=row.hash){cache.entries.remove(&row.file);work.push(id);}
         parsed.insert(id);stats.parsed_files+=1;stats.parsed_bytes+=row.text.len();
     }
-    for batch in work.chunks(4){
-        if Instant::now()>=deadline{for &id in batch{parsed.remove(&id);}partial=true;continue;}
-        let built=thread::scope(|scope|{
-            let jobs=batch.iter().map(|&id|scope.spawn(move ||(id,build_light(&rows[id])))).collect::<Vec<_>>();
-            jobs.into_iter().filter_map(|job|job.join().ok()).collect::<Vec<_>>()
-        });
-        if built.len()!=batch.len(){partial=true;}
-        for (id,file) in built{cache.entries.insert(rows[id].file.clone(),file);stats.reparsed_files+=1;}
+    if !work.is_empty() {
+        if Instant::now()>=deadline {for &id in &work{parsed.remove(&id);}partial=true;}
+        else {
+            // One bounded pool removes the per-4-file barrier: a large file no
+            // longer prevents another worker from starting the next small file.
+            // Results are sorted before publication, so retrieval stays deterministic.
+            let workers=thread::available_parallelism().map(|n|n.get()).unwrap_or(4).clamp(1,8).min(work.len());
+            let cursor=std::sync::atomic::AtomicUsize::new(0);
+            let output=std::sync::Mutex::new(Vec::<(usize,LightFile)>::with_capacity(work.len()));
+            thread::scope(|scope|{
+                for _ in 0..workers {
+                    let output=&output;let cursor=&cursor;let work=&work;
+                    scope.spawn(move || loop {
+                        let n=cursor.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                        let Some(&id)=work.get(n)else{break;};
+                        if Instant::now()>=deadline{break;}
+                        let file=build_light(&rows[id]);
+                        output.lock().unwrap().push((id,file));
+                    });
+                }
+            });
+            let mut built=output.into_inner().unwrap_or_else(|poisoned|poisoned.into_inner());
+            built.sort_by_key(|(id,_)|*id);
+            if built.len()!=work.len(){partial=true;let done=built.iter().map(|(id,_)|*id).collect::<HashSet<_>>();for &id in &work{if !done.contains(&id){parsed.remove(&id);}}}
+            for (id,file) in built{cache.entries.insert(rows[id].file.clone(),file);stats.reparsed_files+=1;}
+        }
     }
     parsed.retain(|id|cache.entries.get(&rows[*id].file).is_some_and(|e|e.hash==rows[*id].hash));
     stats.parse_ms+=started.elapsed().as_secs_f64()*1000.0;partial
