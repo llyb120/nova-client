@@ -31,6 +31,7 @@ impl Drop for Popup {
 #[cfg(windows)]
 thread_local! { static POPUPS: std::cell::RefCell<std::collections::HashMap<String,Popup>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
 const PAGE_SCRIPT: &str = include_str!("native_browser_page.js");
+const MAX_CONTINUOUS_ACTIONS: usize = 24;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -973,7 +974,7 @@ fn validate_action(action: &Action) -> Result<(), String> {
 fn parse_actions(args: &Value) -> Result<Vec<Action>, String> {
     if !args["action"].is_null() && !args["actions"].is_null() { return Err("action 和 actions 不能同时提供".into()); }
     let values = if let Some(values)=args["actions"].as_array() { values.clone() } else { vec![args["action"].clone()] };
-    if values.is_empty() || values.len()>8 { return Err("每批需要1–8个确定动作".into()); }
+    if values.is_empty() || values.len() > MAX_CONTINUOUS_ACTIONS { return Err(format!("每批需要1–{MAX_CONTINUOUS_ACTIONS}个确定动作")); }
     values.into_iter().map(|value| { let action=parse_action(&value.to_string())?; validate_action(&action)?; Ok(action) }).collect()
 }
 
@@ -1562,7 +1563,7 @@ async fn control_session(
         let mut result=json!({"status":if failure.is_none(){"executed"}else if progress.attempted{"needs_review"}else{"not_executed"},
             "reason":failure,"inputAttempted":progress.attempted,"completedActions":progress.completed,"actionTimingsMs":action_timings,"basedOnSnapshotId":observation.id,"verification":"unverified"});
         result["actionMs"] = json!(started.elapsed().as_millis());
-        result["next"] = json!("根据返回的最新状态验证并继续；fill 一次完成聚焦和填写。executed/needs_review 不要直接重放。坐标操作需截图，DOM 操作使用最新 frame/ref。");
+        result["next"] = json!("只有下一步确实依赖动作后的新信息时才基于返回状态重新判断；当前观察已能确定的连续动作应放在同一 actions 批次。executed/needs_review 不要直接重放。");
         completed_action = Some(result.clone());
         if (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
             let mut feedback_args = args.clone();
@@ -1848,6 +1849,10 @@ mod tests {
         assert!(image.point(1200.,0.).is_err());assert!(image.point(-1.,0.).is_err());assert!(image.point(f64::NAN,0.).is_err());
         let small=ScreenshotImage{pixels:(300,200),..image};assert_eq!(small.point(100.,50.).unwrap(),(300.,400.));
         assert!(parse_actions(&json!({"actions":[{"action":"fill","frame":0,"ref":"a","text":"one"},{"action":"click","frame":0,"ref":"b","button":"right","click_count":2}]})).is_ok());
+        let max_batch = vec![json!({"action":"wait","ms":0}); MAX_CONTINUOUS_ACTIONS];
+        assert!(parse_actions(&json!({"actions":max_batch})).is_ok());
+        let oversized = vec![json!({"action":"wait","ms":0}); MAX_CONTINUOUS_ACTIONS + 1];
+        assert!(parse_actions(&json!({"actions":oversized})).is_err());
         for value in [json!({"actions":[]}),json!({"actions":[{"action":"click_at","x":1,"y":2,"button":"bad"}]}),
             json!({"action":{"action":"drag","x":1,"y":2,"to_x":3,"to_y":4,"duration_ms":99999}}),
             json!({"action":{"action":"wait","ms":3000}}),json!({"actions":[{"action":"press","key":"Enter"},{"action":"press","key":"bad"}]}),
