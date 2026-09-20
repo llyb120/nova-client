@@ -1,0 +1,41 @@
+name: Apply operator source patch
+on:
+  push:
+    branches: [work/operator-adaptive-pre-release-20260920]
+    paths: [.github/workflows/operator-apply.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.repository == 'llyb120/nova-client' && github.ref == 'refs/heads/work/operator-adaptive-pre-release-20260920'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and apply exact reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 3da28d30f1adfd0da3b993813a47aa3fff20fdeb HEAD
+          python - <<'PY'
+          import base64, hashlib, pathlib, zlib
+          names = ['01.b64', '02.b64', '03a.b64', '03b.b64', '04a.b64', '04b.b64']
+          text = ''.join((pathlib.Path('.operator-stage') / n).read_text().strip() for n in names)
+          # Correct a single transport transcription; the decompressed SHA below is authoritative.
+          text = text.replace('/323fnX/o7sF', '/23fnX/o7sF')
+          patch = zlib.decompress(base64.b64decode(text, validate=True))
+          actual = hashlib.sha256(patch).hexdigest()
+          assert actual == '5d3b25c9971d43d548d12c1944968d1d240cfa44635e7bf4368b8403629bed36', actual
+          pathlib.Path('/tmp/operator.patch').write_bytes(patch)
+          print('verified patch bytes:', len(patch), 'sha256:', actual)
+          PY
+          git apply --check --exclude=.github/workflows/operator-validation.yml /tmp/operator.patch
+          git apply --exclude=.github/workflows/operator-validation.yml /tmp/operator.patch
+          rm -rf .operator-stage
+          git add src-tauri scripts bench .operator-stage
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(operator): isolated adaptive interaction runtime with guarded native contracts and replay tests'
+          git push origin HEAD:work/operator-adaptive-pre-release-20260920
