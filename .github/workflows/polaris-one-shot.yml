@@ -2,7 +2,7 @@ name: Polaris one-shot working sets
 on:
   push:
     branches: [perf/polaris-semantic-20260919]
-    paths: [.github/workflows/polaris-one-shot.yml, scripts/polaris-connected-packet.py, scripts/polaris-required-callers.py]
+    paths: [.github/workflows/polaris-one-shot.yml, 'src-tauri/src/nova_tools_native/polaris*.rs', scripts/polaris-one-shot-edit.py]
   workflow_dispatch:
 permissions:
   contents: read
@@ -51,7 +51,7 @@ jobs:
         with:
           workspaces: bench/polaris-harness -> target
           cache-on-failure: true
-      - name: Authenticate frozen engine and apply reviewed candidate
+      - name: Authenticate frozen engine and record installed production source
         run: |
           set -euo pipefail
           sudo apt-get update -qq && sudo apt-get install -y ripgrep
@@ -60,11 +60,8 @@ jobs:
           cp _oldbin/bench/polaris-harness/target/release/polaris-harness validation/bin/previous
           chmod +x validation/bin/previous
           echo 'ef1896343d43926775c4c28923ffd0e981584069b327b750b04c8144502e6537  validation/bin/previous' | sha256sum --check
-          for script in polaris-one-shot-migrate polaris-one-shot-refine polaris-context-closure polaris-shallow-closure polaris-precision-budget polaris-coverage-balance polaris-source-edges polaris-working-set-guidance polaris-connected-packet polaris-required-callers; do
-            python3 "scripts/$script.py"
-          done
-          git diff -- src-tauri/src/nova_tools_native src-tauri/src/lyra/tools.rs scripts/ctx-core.mjs scripts/polaris-query.mjs scripts/polaris-one-shot-edit.py > validation/production.patch
-          git diff --exit-code -- src-tauri/src/lyra/reasonix.rs
+          grep -Fq 'mod packet {include!' src-tauri/src/nova_tools_native/polaris.rs
+          git diff --exit-code -- src-tauri/src/nova_tools_native src-tauri/src/lyra/reasonix.rs
           git rev-parse HEAD > validation/base-commit.txt
           cp src-tauri/src/nova_tools_native/polaris*.rs validation/source/
           cp src-tauri/src/lyra/tools.rs validation/source/lyra-tools.rs
