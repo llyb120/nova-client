@@ -1,3 +1,5 @@
+mod operator;
+
 use crate::model_cache;
 use crate::nova_data_dir;
 use crate::settings::Settings;
@@ -645,6 +647,7 @@ struct SteerTurnState {
 // CodeBuddy 的 usage 通知是单次模型消息快照；重复通知覆盖，同轮多次模型调用累加。
 #[derive(Default)]
 struct CodeBuddyTurnUsage {
+    incomplete: bool,
     messages: HashMap<String, (u64, u64)>,
 }
 
@@ -675,6 +678,14 @@ fn codebuddy_turn_usage_deduplicates_model_messages() {
 }
 
 impl CodeBuddyTurnUsage {
+    fn add_operator(&mut self, run_id: &str, metrics: &Value) {
+        let complete = metrics["usageComplete"] == true;
+        let usage = if complete { &metrics["usage"] } else { &metrics["knownUsage"] };
+        if let (Some(input), Some(output)) = (usage["inputTokens"].as_u64(), usage["outputTokens"].as_u64()) {
+            self.messages.insert(format!("nova-operator:{run_id}"), (input, output));
+        } else { self.incomplete = true; }
+        if !complete { self.incomplete = true; }
+    }
     fn update(&mut self, update: &Value) {
         let Some(meta) = update.get("_meta") else { return };
         let Some(id) = meta.get("codebuddy.ai/messageId").and_then(Value::as_str).filter(|id| !id.is_empty()) else { return };
@@ -686,16 +697,20 @@ impl CodeBuddyTurnUsage {
     }
 
     fn finish(self) -> Option<Value> {
-        if self.messages.is_empty() { return None; }
+        if self.messages.is_empty() && !self.incomplete { return None; }
         let (input, output) = self.messages.values().fold((0u64, 0u64), |(input, output), (i, o)| {
             (input.saturating_add(*i), output.saturating_add(*o))
         });
+        if self.incomplete { return Some(json!({"usageComplete":false,"knownUsage":{"inputTokens":input,"outputTokens":output}})); }
         Some(json!({ "inputTokens": input, "outputTokens": output, "totalTokens": input.saturating_add(output) }))
     }
 }
 
 pub struct AcpManager {
     pub app: AppHandle,
+    operator_only: AtomicBool,
+    operator_capture: StdMutex<operator::Capture>,
+    operator_configs: StdMutex<HashMap<String,Value>>,
     /// ACP 后端类型，用于启动配置、路由和事件载荷。
     pub kind: AgentKind,
     /// 额度租借实例使用的独立凭证环境；普通全局实例为空。
@@ -750,6 +765,9 @@ impl AcpManager {
     ) -> Arc<Self> {
         let mgr = Arc::new(AcpManager {
             app,
+            operator_only: AtomicBool::new(false),
+            operator_capture: StdMutex::new(Default::default()),
+            operator_configs: StdMutex::new(HashMap::new()),
             kind,
             launch_env,
             permission_scope,
@@ -1079,6 +1097,7 @@ impl AcpManager {
     }
 
     fn push_log(&self, line: String) {
+        if self.operator_only.load(Ordering::SeqCst) {return;}
         {
             let mut logs = self.logs.lock().unwrap();
             if logs.len() >= LOG_CAP {
@@ -1415,10 +1434,9 @@ impl AcpManager {
         match init {
             Ok(result) => {
                 *self.agent_info.lock().unwrap() = Some(result.clone());
-                let _ = self.app.emit(
-                    EV_STATUS,
-                    json!({ "connected": true, "agent": result.get("agentInfo").cloned() }),
-                );
+                if !self.operator_only.load(Ordering::SeqCst) {
+                    let _ = self.app.emit(EV_STATUS,json!({ "connected": true, "agent": result.get("agentInfo").cloned() }));
+                }
                 Ok(conn)
             }
             Err(error) => {
@@ -1435,9 +1453,12 @@ impl AcpManager {
         conn_key: &str,
         want_cwd: Option<&str>,
     ) -> Result<Arc<AcpConn>, String> {
-        crate::skills::sync_skills_from_home();
-
-        let (program, mut cmd) = codebuddy_command(&settings.codebuddy_path, &CODEBUDDY_ACP_ARGS);
+        if !self.operator_only.load(Ordering::SeqCst) {crate::skills::sync_skills_from_home();}
+        let mut args=CODEBUDDY_ACP_ARGS.to_vec();
+        if self.operator_only.load(Ordering::SeqCst) {
+            args.extend(["--tools","","--strict-mcp-config","--mcp-config",r#"{"mcpServers":{}}"#,"--setting-sources","","--no-session-persistence","--permission-mode","dontAsk","--system-prompt",crate::operator::core::SYSTEM]);
+        }
+        let (program, mut cmd) = codebuddy_command(&settings.codebuddy_path, &args);
         if let Some(cwd) = want_cwd {
             cmd.current_dir(cwd);
         }
@@ -1453,7 +1474,7 @@ impl AcpManager {
         cmd.envs(codebuddy_activation_env(&self.launch_env));
         #[cfg(windows)]
         cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
-        {
+        if !self.operator_only.load(Ordering::SeqCst) {
             let state = self.app.state::<AppState>();
             cmd.env(
                 "NOVA_CONTEXT_SERVICE_ENDPOINT",
@@ -1464,6 +1485,9 @@ impl AcpManager {
                 "NOVA_CONTEXT_RETRIEVAL_MODE",
                 settings.context_retrieval_mode.as_str(),
             );
+        }
+        if self.operator_only.load(Ordering::SeqCst) {
+            for key in ["NOVA_CONTEXT_SERVICE_ENDPOINT","NOVA_CONTEXT_SERVICE_TOKEN","NOVA_OPERATOR_SCOPE","NOVA_CWD_CHANGE_SCOPE"] {cmd.env_remove(key);}
         }
         #[cfg(windows)]
         if self.app.state::<AppState>().windows_shell_shim_enabled {
@@ -1643,6 +1667,7 @@ impl AcpManager {
 
     /// 所有连接都已关闭时才广播「未连接」并清掉 agent 信息（多连接下不能因单条退出就报未连接）。
     fn broadcast_if_all_closed(&self) {
+        if self.operator_only.load(Ordering::SeqCst) {return;}
         if self.alive_conns.load(Ordering::SeqCst) == 0 {
             *self.agent_info.lock().unwrap() = None;
             let _ = self
@@ -1698,6 +1723,13 @@ impl AcpManager {
     }
 
     fn handle_server_request(self: &Arc<Self>, conn: &Arc<AcpConn>, msg: &Value) {
+        if self.operator_only.load(Ordering::SeqCst) {
+            self.operator_capture.lock().unwrap().violation=true;
+            if msg["method"]=="session/request_permission" {conn.respond_ok(msg["id"].clone(),json!({"outcome":{"outcome":"cancelled"}}));}
+            else {conn.respond_err(msg["id"].clone(),-32601,"Operator decision transport has no filesystem/terminal/tool permissions".into());}
+            return;
+        }
+
         let method = msg["method"].as_str().unwrap_or_default().to_string();
         let id = msg["id"].clone();
         let params = msg["params"].clone();
@@ -1849,6 +1881,7 @@ impl AcpManager {
     }
 
     fn on_session_update(self: &Arc<Self>, params: &Value) {
+        if self.operator_only.load(Ordering::SeqCst) {self.operator_capture.lock().unwrap().update(params);return;}
         let session_id = params["sessionId"].as_str().unwrap_or_default();
         let update = &params["update"];
         let kind = update["sessionUpdate"].as_str().unwrap_or_default();
@@ -2644,6 +2677,7 @@ impl AcpManager {
                 self.loading_sessions.lock().unwrap().remove(&sid);
                 match loaded {
                     Ok(result) => {
+                        self.operator_configs.lock().unwrap().insert(sid.clone(),result.clone());
                         self.capture_options(&result, !conn.from_prewarm);
                         // session/load 成功，继续复用该会话。
                         sid
@@ -2996,6 +3030,7 @@ impl AcpManager {
 
     /// 线程的模型/模式/思考强度被修改后，若 session 已挂载则立即同步
     pub async fn sync_thread_config(self: &Arc<Self>, thread_id: &str) {
+        crate::operator::cancel_scope(&self.cwd_change_scope(thread_id));
         let (sid, model, mode, effort) = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
@@ -3108,6 +3143,7 @@ impl AcpManager {
             }
         }
         let resp = resp.ok_or_else(|| format!("创建会话失败：{last_err}"))?;
+        if let Some(sid)=resp["sessionId"].as_str() {self.operator_configs.lock().unwrap().insert(sid.into(),resp.clone());}
         self.capture_options(&resp, !conn.from_prewarm);
         let sid = resp["sessionId"]
             .as_str()
@@ -3607,6 +3643,7 @@ impl AcpManager {
         };
         let t_ensure = std::time::Instant::now();
         let mut session_id = self.ensure_session(thread_id, require_restore).await?;
+        let mut _operator_registration=operator::bind(self,thread_id,&session_id);
         if !self.is_running(thread_id) || !cwd_changes.is_current() {
             return Err("任务已停止".into());
         }
@@ -3680,6 +3717,7 @@ impl AcpManager {
                     self.clear_thread_session_for_respawn(thread_id);
                 }
                 session_id = self.ensure_session(thread_id, require_restore).await?;
+                _operator_registration=operator::bind(self,thread_id,&session_id);
                 conn = self.conn_for_key(&conn_key).await;
                 if conn.is_none() {
                     last_err = format!("{} 未连接", self.kind.label());
@@ -4012,6 +4050,7 @@ impl AcpManager {
     }
 
     pub async fn cancel(self: &Arc<Self>, thread_id: &str) {
+        crate::operator::cancel_scope(&self.cwd_change_scope(thread_id));
         if !self.is_running(thread_id) {
             return;
         }
@@ -4163,6 +4202,11 @@ impl AcpManager {
             state.context_service.endpoint(),
             state.context_service.token(),
         )?;
+        if self.kind==AgentKind::CodeBuddy && !read_only && crate::operator::enabled() {
+            server["env"].as_array_mut().unwrap().push(json!({"name":"NOVA_OPERATOR_SCOPE","value":self.cwd_change_scope(thread_id)}));
+            server["_meta"]["tools"]["operator"]=json!({"defer_loading":false});
+            if let Some(tools)=server["_meta"]["tools"].as_object_mut(){tools.remove("chrome");tools.remove("jianlai");}
+        }
         if auto_change_project {
             server["env"].as_array_mut().unwrap().push(json!({
                 "name": "NOVA_CWD_CHANGE_SCOPE", "value": self.cwd_change_scope(thread_id)

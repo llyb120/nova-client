@@ -18,7 +18,7 @@ mod prompt;
 pub(crate) mod provider;
 mod read;
 mod reasonix;
-mod tools;
+pub(crate) mod tools;
 mod watchdog;
 
 pub use prompt::{

@@ -15,6 +15,7 @@ mod gitwt;
 mod http_stream;
 pub mod image_generation;
 mod native_browser;
+mod operator;
 mod chrome_browser;
 mod lyra;
 mod lyra_complete;

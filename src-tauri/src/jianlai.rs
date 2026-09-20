@@ -851,6 +851,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let mut failure = None;
             let mut attempted = false;
             for (index, a) in actions.iter().enumerate() {
+                if crate::operator::owner_cancelled(&snap.owner) {failure=Some("Operator cancelled; remaining inputs not sent".into());break;}
                 if a.action != "wait" {
                     if let Err(e) = check_target(&snap, &shot, a) {
                         failure = Some(e);
@@ -918,9 +919,12 @@ fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, d
 }
 
 pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
+    let permit=crate::operator::raw_permit(owner)?;
+    if crate::operator::owner_cancelled(owner) {return Err("Operator cancelled before desktop operation".into());}
     let owner = crate::native_browser::tool_owner(root, owner)?;
     let args = args.clone();
     tokio::task::spawn_blocking(move || {
+        let _permit=permit;
         if crate::tool_experience::is_operation(&args) {
             let observed = if args["operation"] == "experience_search" { None } else {
                 let state = DESKTOP.try_lock().map_err(|_| "剑来正在操作桌面")?;

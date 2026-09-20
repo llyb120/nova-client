@@ -462,6 +462,9 @@ async fn handle_prompt(
     }));
     let archive_dir = Some(roots.data().join("tool-results").join(&ctx.session_id));
     let cancelled = Arc::new(AtomicBool::new(false));
+    let _operator_registration = if !read_only && crate::operator::enabled() {
+        archive_dir.as_ref().map(|dir| crate::operator::register_native(dir.to_string_lossy().into_owned(),cwd_path.clone(),cancelled.clone(),http.clone(),resolved.clone()))
+    } else { None };
     let steering = Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let mut agent = Agent {
         model: resolved.clone(),
@@ -589,6 +592,8 @@ async fn handle_prompt(
     // ---- 事件 → 协议 items ----
     let mut total_usage = json!({});
     let mut last_context_tokens = 0u64;
+    let mut operator_usage_seen=std::collections::HashSet::new();
+    let mut operator_usage_complete=true;
     let mut agent_message_index = 0u64;
     let mut current_text = String::new();
     let mut current_thinking = String::new();
@@ -607,7 +612,7 @@ async fn handle_prompt(
                 .as_object()
                 .is_some_and(|usage| !usage.is_empty())
             {
-                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+                emit(&json!({ "type": "usage", "usage": operator_usage_payload(&total_usage,operator_usage_complete), "estimated": false }));
             }
         }
         AgentEvent::TextDelta(delta) => {
@@ -631,6 +636,21 @@ async fn handle_prompt(
             emit(&json!({ "type": "item", "item": item }));
         }
         AgentEvent::ToolEnd { id, outcome, .. } => {
+            if let Some(run)=outcome.pointer("/details/runId").and_then(Value::as_str) {
+                if operator_usage_seen.insert(run.to_string()) {
+                    let metrics=&outcome["details"]["metrics"];
+                    let complete=metrics["usageComplete"]==true;
+                    operator_usage_complete &= complete;
+                    let u=if complete {&metrics["usage"]} else {&metrics["knownUsage"]};
+                    if let (Some(input),Some(output))=(u["inputTokens"].as_u64(),u["outputTokens"].as_u64()) {
+                        let read=u["cacheReadTokens"].as_u64().unwrap_or(0);
+                        let write=u["cacheWriteTokens"].as_u64().unwrap_or(0);
+                        merge_usage(&mut total_usage,&json!({"input":input.saturating_sub(read).saturating_sub(write),"output":output,"cacheRead":read,"cacheWrite":write}));
+                        total_usage["contextTokens"]=json!(last_context_tokens);
+                    } else {operator_usage_complete=false;}
+                }
+            }
+
             let started = started_tools
                 .get(&id)
                 .cloned()
@@ -653,7 +673,7 @@ async fn handle_prompt(
                 .as_object()
                 .is_some_and(|usage| !usage.is_empty())
             {
-                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+                emit(&json!({ "type": "usage", "usage": operator_usage_payload(&total_usage,operator_usage_complete), "estimated": false }));
             }
         }
         AgentEvent::MessageEnd { usage } => {
@@ -664,7 +684,7 @@ async fn handle_prompt(
             last_context_tokens = input.saturating_add(cache_read).saturating_add(cache_write);
             merge_usage(&mut total_usage, &usage);
             total_usage["contextTokens"] = json!(last_context_tokens);
-            emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+            emit(&json!({ "type": "usage", "usage": operator_usage_payload(&total_usage,operator_usage_complete), "estimated": false }));
         }
     };
 
@@ -909,10 +929,18 @@ async fn handle_prompt(
     }
     emit(&json!({
         "type": "done",
-        "usage": if total_usage.as_object().map(|o| o.is_empty()).unwrap_or(true) { Value::Null } else { total_usage },
+        "usage": operator_usage_payload(&total_usage,operator_usage_complete),
         "cancelled": outcome.cancelled,
     }));
     Ok(())
+}
+
+// Unknown child accounting must never masquerade as a complete parent-only total.
+fn operator_usage_payload(total: &Value, complete: bool) -> Value {
+    if !complete {
+        return json!({"usageComplete":false,"knownUsage":total,"contextTokens":total["contextTokens"]});
+    }
+    if total.as_object().is_none_or(|o|o.is_empty()) { Value::Null } else { total.clone() }
 }
 
 fn models_data(request: &Value, roots: &Roots) -> Result<Value, String> {
@@ -1154,6 +1182,15 @@ pub async fn run() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operator_missing_usage_is_explicit_not_parent_only() {
+        let known=serde_json::json!({"input":100,"output":20,"contextTokens":70});
+        let v=super::operator_usage_payload(&known,false);
+        assert_eq!(v["usageComplete"],false);assert_eq!(v["knownUsage"]["output"],20);
+        assert!(v.get("input").is_none());assert_eq!(v["contextTokens"],70);
+        assert_eq!(super::operator_usage_payload(&known,true),known);
+    }
+
 
     /// 借用额度运行时：进程内按隔离数据根加载凭证配置（不起子进程、不读全局配置）。
     #[tokio::test]

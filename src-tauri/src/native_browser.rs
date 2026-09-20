@@ -1551,6 +1551,7 @@ async fn control_session(
         let mut failure=None;
         let mut action_timings=Vec::new();
         for action in &actions {
+            if crate::operator::owner_cancelled(&s.thread_id) {failure=Some("Operator cancelled; remaining inputs not sent".into());break;}
             let began=std::time::Instant::now();
             let applied=apply(app,&s,&observation,action,args["imageId"].as_str(),&mut progress).await;
             action_timings.push(began.elapsed().as_millis());
@@ -1738,6 +1739,8 @@ pub(crate) fn tool_owner(root: &Path, owner: &str) -> Result<String, String> {
 }
 
 pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
+    let _operator_permit=crate::operator::raw_permit(owner)?;
+    if crate::operator::owner_cancelled(owner) {return Err("Operator cancelled before Chrome operation".into());}
     let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
     let thread_id = tool_owner(root, owner)?;
     let operation = args["operation"].as_str().unwrap_or_default();
