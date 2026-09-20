@@ -65,7 +65,7 @@ pub fn tool_set(
                     },
                     "task": { "type": "string", "description": "一句话任务描述，用于补充检索词和排序" },
                     "files": { "type": "array", "items": { "type": "string" }, "maxItems": 6, "description": "已知必看文件，可与 keywords/task 同用" },
-                    "budget": { "type": "integer", "minimum": 100, "maximum": 1200, "description": "完整代码单元行预算，默认 600" },
+                    "budget": { "type": "integer", "minimum": 100, "maximum": 1200, "description": "完整代码单元行预算；默认随 maxBytes 推导（32KB≈1024 行），一般不必传" },
                     "maxBytes": { "type": "integer", "minimum": 8192, "maximum": 65536, "description": "输出硬预算，默认 32768；仅按完整文件/单元边界收敛" },
                     "coupling": { "type": "boolean", "description": "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" }
                 }
