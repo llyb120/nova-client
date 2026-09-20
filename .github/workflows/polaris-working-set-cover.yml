@@ -4,7 +4,8 @@ on:
     branches: [perf/polaris-semantic-20260919]
     paths:
       - .github/workflows/polaris-working-set-cover.yml
-      - scripts/polaris-working-set-cover-*.py\n      - scripts/polaris-initial-beam-migrate.py
+      - scripts/polaris-working-set-cover-*.py
+      - scripts/polaris-initial-beam-migrate.py
   workflow_dispatch:
 permissions:
   contents: read
