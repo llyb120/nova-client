@@ -1,6 +1,6 @@
-"""Balance natural-language behavioral constraints before code ranking.
-The baseline is the accepted literal-recall production source. This does not
-change output budgets, dependency expansion, model defaults, or Reasonix.
+"""Use the same leading source comments for declaration selection that the
+final CodeUnit already preserves. The baseline is accepted literal-recall source.
+No query labels, repo names, output-budget changes, model calls, or Reasonix changes.
 """
 from pathlib import Path
 import hashlib
@@ -14,73 +14,69 @@ def sub(s,a,b):
     assert s.count(a)==1,a[:160]
     return s.replace(a,b)
 
-p,s=load("polaris_query.rs","9c6c6d25774e5838c24c023b7ab5818be183d64d")
-# "reuse existing" and "restart" are behaviorally different from generic cache/start.
-s=sub(s,
-    '"缓存|复用|cache|memo|reuse",',
-    '"缓存|复用|cache|memo|reuse|remount",')
-s=sub(s,
-    '"启动|重启|start|launch|startup|restart",',
-    '"启动|start|launch|startup", "重新启动|重启|restart",')
-# Behavioral constraints should not be outvoted by generic object names.
-s=sub(s,
-    '''let strong = ["cancel", "encrypt", "decrypt", "retry", "dedup", "delete", "restore", "persist", "copy", "paste", "close", "hold", "convert", "remember"];''',
-    '''let strong = ["cancel", "encrypt", "decrypt", "retry", "dedup", "delete", "restore", "persist", "copy", "paste", "close", "hold", "convert", "remember",
-            "inherit", "expand", "hide", "reuse", "remount", "retain", "preserve", "restart", "pause", "resume"];''')
-# Negative/contrast language is especially discriminative: "not restart" is
-# not equivalent to "start". Boost only the matched concept group, never names.
-needle='''        let predicates = CONCEPTS.iter().filter(|group| {
-            group.split('|').any(|s| original.contains(s)) && group.split('|').any(|s| strong.contains(&s))
-        }).collect::<Vec<_>>();
-        for (term, weight) in &mut terms {
-            if predicates.iter().any(|group| group.split('|').any(|s| s == term.as_str())) { *weight *= 3.0; }
-            else if !predicates.is_empty() && ["click", "coordinate", "pointer", "点击", "坐标"].contains(&term.as_str()) { *weight *= 0.5; }
-        }'''
-replacement='''        let predicates = CONCEPTS.iter().filter(|group| {
-            group.split('|').any(|s| original.contains(s)) && group.split('|').any(|s| strong.contains(&s))
-        }).collect::<Vec<_>>();
-        let lower_task=task.to_lowercase();
-        let constrained = CONCEPTS.iter().filter(|group| {
-            group.split('|').any(|alias| {
-                let alias_lower=alias.to_lowercase();
-                lower_task.match_indices(&alias_lower).map(|(i,_)|i).any(|pos| {
-                    let start=lower_task.floor_char_boundary(pos.saturating_sub(24));
-                    let before=&lower_task[start..pos];
-                    ["不","未","没","无","避免","防止","禁止","不能","不会","不要","而不是","instead of","without","never"," not "]
-                        .iter().any(|marker|before.contains(marker))
-                })
-            })
-        }).collect::<Vec<_>>();
-        for (term, weight) in &mut terms {
-            if constrained.iter().any(|group| group.split('|').any(|s| s == term.as_str())) { *weight *= 4.0; }
-            else if predicates.iter().any(|group| group.split('|').any(|s| s == term.as_str())) { *weight *= 3.0; }
-            else if (!predicates.is_empty()||!constrained.is_empty()) && ["click", "coordinate", "pointer", "点击", "坐标"].contains(&term.as_str()) { *weight *= 0.5; }
-        }'''
-s=sub(s,needle,replacement)
-# Generic tests for contrast semantics, not repository functions.
-anchor='''    #[test] fn encryption_direction_is_not_a_generic_credentials_getter() {'''
-tests='''    #[test] fn reuse_and_restart_are_distinct_constraints() {
-        let q=Query::parse(serde_json::json!({"task":"收起后复用原进程，而不是重新启动"})).unwrap();
-        let w=|term:&str|q.terms.iter().find(|(s,_)|s==term).map(|(_,w)|*w).unwrap_or(0.0);
-        assert!(w("reuse")>1.0);assert!(w("remount")>1.0);
-        assert!(w("restart")>w("start"),"restart={} start={}",w("restart"),w("start"));
+p,s=load("polaris_demand_v2.rs","82626c7fa9538fd54011cb08b5163a15d92f07fb")
+old='''            let first=s.ln.saturating_sub(1);let end=s.end.min(file.source.len());if first>=end{continue;}
+            let body=file.source[first..end.min(first+320)].join("\n");
+            let header=file.source[first.saturating_sub(4)..(first+4).min(end)].join("\n");
+            let matched=matcher.matches(&body);let head=matcher.matches(&header);
+            let mut score=0.0;
+            for (i,(term,weight)) in terms.iter().enumerate(){
+                if file.names[&s.ln].contains(term){score+=weight*idf[i]*6.0;}
+                if head.matched(i){score+=weight*idf[i]*2.0;}
+                if matched.matched(i){score+=weight*idf[i];}
+            }'''
+new='''            let first=s.ln.saturating_sub(1);let end=s.end.min(file.source.len());if first>=end{continue;}
+            // Natural-language intent is often documented immediately above a
+            // function while the implementation itself contains only generic
+            // API names. Final CodeUnits already preserve up to eight leading
+            // comment/attribute/blank lines; declaration selection must score
+            // the same evidence or it can parse the right file yet materialize
+            // the wrong neighboring function.
+            let mut context=first;
+            while context>0&&first-context<8 {
+                let line=file.source[context-1].trim();
+                if line.starts_with("//")||line.starts_with("/*")||line.starts_with('*')
+                    ||line.starts_with('#')||line.is_empty(){context-=1;}else{break;}
+            }
+            let body=file.source[first..end.min(first+320)].join("\n");
+            let leading=file.source[context..first].join("\n");
+            let header=file.source[context..(first+4).min(end)].join("\n");
+            let matched=matcher.matches(&body);let lead=matcher.matches(&leading);let head=matcher.matches(&header);
+            let mut score=0.0;
+            for (i,(term,weight)) in terms.iter().enumerate(){
+                if file.names[&s.ln].contains(term){score+=weight*idf[i]*6.0;}
+                if lead.matched(i){score+=weight*idf[i]*3.0;}
+                else if head.matched(i){score+=weight*idf[i]*2.0;}
+                if matched.matched(i){score+=weight*idf[i];}
+            }'''
+s=sub(s,old,new)
+# Generic regression: two neighboring functions in the same file; only the
+# leading comment disambiguates which behavior the natural-language request means.
+anchor='''#[cfg(test)]
+mod demand_tests {'''
+tests='''#[cfg(test)] mod comment_intent_selection_tests {
+    use super::*;
+    #[test] fn leading_comment_selects_the_behavior_not_generic_neighbor() {
+        let d=tempfile::tempdir().unwrap();
+        fs::write(d.path().join("panel.ts"),
+            "export function createPanel(){ return true; }\n/** Existing process is remounted; hiding the panel never restarts it. */\nexport function attachExisting(){ if (!ready) mountHost(); }\n").unwrap();
+        for n in 0..32 {fs::write(d.path().join(format!("noise_{n}.ts")),
+            format!("export function panel{n}(){{ createPanel(); }}\n")).unwrap();}
+        let q=query::Query::parse(serde_json::json!({"task":"收起面板再打开时复用原进程，不重新启动","maxBytes":12000})).unwrap();
+        let (c,_)=demand_corpus(d.path(),&q,Instant::now()+Duration::from_secs(3)).unwrap();
+        assert!(c.units.iter().any(|u|u.name=="attachExisting"),"{:?}",c.units.iter().map(|u|u.name.clone()).collect::<Vec<_>>());
     }
-    #[test] fn negative_inheritance_is_a_behavioral_constraint() {
-        let q=Query::parse(serde_json::json!({"task":"新建页面不会继承上次展开状态"})).unwrap();
-        let w=|term:&str|q.terms.iter().find(|(s,_)|s==term).map(|(_,w)|*w).unwrap_or(0.0);
-        assert!(w("inherit")>w("state"));assert!(w("expand")>1.0);
+    #[test] fn leading_comment_preserves_negative_state_intent() {
+        let d=tempfile::tempdir().unwrap();
+        fs::write(d.path().join("layout.ts"),
+            "export function open(){ return true; }\n/** New visits never inherit the previously opened state. */\nexport function freshState(){ setOpened(false); }\n").unwrap();
+        let q=query::Query::parse(serde_json::json!({"task":"新页面不会继承上次展开状态","maxBytes":12000})).unwrap();
+        let (c,_)=demand_corpus(d.path(),&q,Instant::now()+Duration::from_secs(3)).unwrap();
+        assert!(c.units.iter().any(|u|u.name=="freshState"),"{:?}",c.units.iter().map(|u|u.name.clone()).collect::<Vec<_>>());
     }
+}
+
 '''
 s=sub(s,anchor,tests+anchor)
 p.write_text(s,encoding="utf-8")
-
-p,s=load("polaris_rank.rs","84888371cb7c02fa4040e3e5bf1147feef495f2b")
-old='''            *score*=0.30+0.70*fraction*fraction;'''
-new='''            // Distinct requested behaviors matter more than repeated generic
-            // names. Keep a floor for sparse evidence, but reward balanced
-            // multi-facet coverage much more strongly on complex questions.
-            *score*=if facets.len()>=3 {0.16+0.84*fraction*fraction*fraction}
-                else {0.30+0.70*fraction*fraction};'''
-s=sub(s,old,new)
-p.write_text(s,encoding="utf-8")
-print("Applied generic behavioral-constraint weighting and balanced facet coverage.")
+print("Declaration selection now scores the same leading source comments preserved in final context.")
