@@ -2,7 +2,7 @@
 //! The model chooses Chrome/Jianlai dynamically; Nova only enforces isolation, recursion guards,
 //! compact handoff and cleanup.
 
-use crate::threads::{AgentKind, Item, PromptImage, Thread};
+use crate::threads::{AgentKind, Item, Thread};
 use crate::AppState;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -101,6 +101,16 @@ struct ChildSummary {
     tool_calls: usize,
 }
 
+fn clamp_result(text: &str) -> String {
+    const MAX_CHARS: usize = 4_000;
+    if text.chars().count() <= MAX_CHARS {
+        return text.to_string();
+    }
+    let mut value = text.chars().take(MAX_CHARS).collect::<String>();
+    value.push_str("\n…[Operator result truncated]");
+    value
+}
+
 fn parse_status(text: &str) -> String {
     let first = text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
     let status = first
@@ -124,7 +134,7 @@ fn summarize_child(thread: &Thread, elapsed: Duration) -> ChildSummary {
         .iter()
         .rev()
         .find_map(|item| match item {
-            Item::Assistant { text, .. } if !text.trim().is_empty() => Some(text.trim().to_string()),
+            Item::Assistant { text, .. } if !text.trim().is_empty() => Some(clamp_result(text.trim())),
             _ => None,
         })
         .unwrap_or_else(|| "STATUS: uncertain\nRESULT: Operator 未返回结论\nEVIDENCE: 无".into());
@@ -271,7 +281,6 @@ pub(crate) async fn run(root: &Path, args: &Value, parent_thread_id: &str) -> Re
         let child_id = child.id.clone();
         let kind = child.agent_kind.clone();
         store.threads.push(child);
-        store.save();
         (kind, child_id)
     };
 
@@ -311,7 +320,6 @@ pub(crate) async fn run(root: &Path, args: &Value, parent_thread_id: &str) -> Re
         let state = app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         store.threads.retain(|thread| thread.id != child_id);
-        store.save();
     }
 
     if timed_out {
@@ -410,7 +418,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_images_type_stays_linked() {
-        let _ = std::mem::size_of::<PromptImage>();
+    fn child_result_is_bounded_before_returning_to_parent() {
+        let text = format!("STATUS: success\nRESULT: {}", "x".repeat(10_000));
+        let bounded = clamp_result(&text);
+        assert!(bounded.chars().count() < 4_100);
+        assert!(bounded.contains("truncated"));
     }
 }
