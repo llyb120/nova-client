@@ -11,6 +11,6 @@ assert got=="0f5fe46653dd5248151468b0e32e536ce280681f",got
 s=b.decode("utf-8")
 old="const INITIAL_FILES: usize = 16;"
 assert s.count(old)==1
-s=s.replace(old,"const INITIAL_FILES: usize = 12;")
+s=s.replace(old,"const INITIAL_FILES: usize = 14;")
 p.write_text(s,encoding="utf-8")
-print("INITIAL_FILES: 16 -> 12; all other production behavior unchanged.")
+print("INITIAL_FILES: 16 -> 14; all other production behavior unchanged.")
