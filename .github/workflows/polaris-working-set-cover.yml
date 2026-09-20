@@ -154,10 +154,7 @@ jobs:
           edits=json.loads((r/'context-only-edit/report.json').read_text())
           assert edits['passed']==edits['total']==4
           patch=r/'production.patch'
-          allowed={
-            'src-tauri/src/nova_tools_native/polaris_demand_v2.rs',
-            'src-tauri/src/nova_tools_native/polaris_packet.rs',
-          }
+          allowed={'src-tauri/src/nova_tools_native/polaris_demand_v2.rs'}
           paths={line.split(' b/',1)[1] for line in patch.read_text().splitlines() if line.startswith('diff --git ')}
           assert paths==allowed,(paths,allowed)
           subprocess.run(['git','apply','--check',str(patch)],check=True)
