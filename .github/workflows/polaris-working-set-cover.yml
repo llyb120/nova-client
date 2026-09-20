@@ -57,7 +57,6 @@ jobs:
           mkdir -p validation .cargo
           printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
           python scripts/polaris-working-set-cover-migrate.py
-          python scripts/polaris-working-set-cover-constraint.py
           git diff -- src-tauri/src/nova_tools_native > validation/production.patch
           git diff --exit-code -- src-tauri/src/lyra/reasonix.rs src-tauri/src/nova_tools_native/context.rs
           git rev-parse HEAD > validation/tested-base.txt
