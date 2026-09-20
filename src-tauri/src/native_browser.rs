@@ -970,10 +970,10 @@ fn validate_action(action: &Action) -> Result<(), String> {
     if let Action::ScrollAt { delta_x:Some(x), .. } = action { if x.unsigned_abs()>1200 { return Err("delta_x 超过1200像素".into()); } }
     Ok(())
 }
-fn parse_actions(args: &Value) -> Result<Vec<Action>, String> {
+fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String> {
     if !args["action"].is_null() && !args["actions"].is_null() { return Err("action 和 actions 不能同时提供".into()); }
     let values = if let Some(values)=args["actions"].as_array() { values.clone() } else { vec![args["action"].clone()] };
-    if values.is_empty() || values.len()>8 { return Err("每批需要1–8个确定动作".into()); }
+    if values.is_empty() || values.len()>max_actions { return Err(format!("每批需要1–{max_actions}个确定动作")); }
     values.into_iter().map(|value| { let action=parse_action(&value.to_string())?; validate_action(&action)?; Ok(action) }).collect()
 }
 
@@ -1518,6 +1518,10 @@ async fn control_session(
     let started = std::time::Instant::now();
     if args["feedback"].as_str().is_some_and(|v|!matches!(v,"none"|"inspect"|"screenshot")) {return Err("feedback 无效".into());}
     if args["scope"].as_str().is_some_and(|v|!matches!(v,"all"|"viewport")) {return Err("scope 无效".into());}
+    let settle_ms = match args.get("settleMs").filter(|v|!v.is_null()) {
+        None => 1500,
+        Some(v) => v.as_u64().filter(|ms| *ms <= 4000).ok_or("settleMs 必须为 0–4000")?,
+    };
     let chrome = s.browser_id == "chrome";
     s.cancel = if chrome {
         crate::chrome_browser::begin(app, s.active_tab.rsplit(':').next().unwrap())
@@ -1539,7 +1543,7 @@ async fn control_session(
         if operation!="act" {return Ok(snapshot(app,operation=="screenshot",args).await?.1);}
         let observation=state.observations.lock().unwrap().get(&s.active_tab).cloned().ok_or("请先 inspect 或 screenshot")?;
         if args["snapshotId"].as_str()!=Some(&observation.id) { return Err("观察已失效：snapshotId 不是最新观察或已执行；使用最近返回的 snapshotId，不要重放动作".into()); }
-        let actions=parse_actions(args)?;
+        let actions=parse_actions(args, if chrome { 16 } else { 8 })?;
         let all_dom=actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
         if !all_dom && observation.captured.elapsed()>Duration::from_secs(180) {return Err("观察已过期，请重新观察后继续".into());}
         // Static validation for the WHOLE batch; revalidate the live node/focus
@@ -1564,6 +1568,14 @@ async fn control_session(
         result["actionMs"] = json!(started.elapsed().as_millis());
         result["next"] = json!("根据返回的最新状态验证并继续；fill 一次完成聚焦和填写。executed/needs_review 不要直接重放。坐标操作需截图，DOM 操作使用最新 frame/ref。");
         completed_action = Some(result.clone());
+        // A click/Enter often starts a navigation; feeding back the old DOM costs the model another
+        // inspect round-trip. Wait (bounded) for the tab to finish loading before observing.
+        if chrome && failure.is_none() && settle_ms > 0 && args["feedback"] != "none" && !s.cancel.load(Ordering::SeqCst)
+            && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::ClickAt{..} | Action::Press{..})) {
+            let tag = s.active_tab.rsplit(':').next().unwrap_or_default();
+            result["settle"] = wait_for_tab_load(app, tag, Duration::from_millis(settle_ms)).await;
+            completed_action = Some(result.clone());
+        }
         if (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
             let mut feedback_args = args.clone();
             feedback_args["fullPage"] = json!(false);
@@ -1759,14 +1771,75 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
     }
     let connection = crate::chrome_browser::connect(app).await?;
     if matches!(operation, "connect" | "status") {
+        let mut connection = connection;
+        if connection["connected"] == true {
+            match crate::chrome_browser::request(app, "status", json!({})).await {
+                Ok(capabilities) => connection["incognitoAllowed"] = capabilities["incognitoAllowed"].clone(),
+                Err(error) => connection["capabilityError"] = json!(format!("{error}；请重新加载Nova Chrome扩展")),
+            }
+        }
         return Ok(connection);
     }
+    let observe = match args["observe"].as_str() {
+        None => "inspect",
+        Some(mode @ ("inspect" | "screenshot" | "none")) => mode,
+        Some(_) => return Err("observe 必须为 inspect/screenshot/none".into()),
+    };
+    // Anything that changes the real screen or focus shares one lease with jianlai; the other
+    // tool's stale desktop snapshot is retired explicitly instead of failing mid-batch later.
+    let mutating = matches!(operation, "open" | "new_tab" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "act");
+    let _lease = if mutating {
+        match crate::jianlai::lease_input("chrome") {
+            Ok(lease) => Some(lease),
+            Err(error) if operation == "act" => return Ok(json!({"status":"not_executed","completedActions":0,"inputAttempted":false,
+                "reason":error,"basedOnSnapshotId":args["snapshotId"],"verification":"unverified","browser":"chrome","tabTag":args["tabTag"]})),
+            Err(error) => return Err(error),
+        }
+    } else { None };
+    let retire_desktop = |value: &mut Value| {
+        if crate::jianlai::invalidate_desktop(&format!("chrome {operation} 已改变屏幕内容")) {
+            value["desktopSnapshotInvalidated"] = json!(true);
+            value["desktopNotice"] = json!("剑来旧快照已作废；需要剑来时先重新截图");
+        }
+    };
     if matches!(operation, "tabs" | "open" | "new_tab") {
         let mut params = args.clone();
         if let Some(url) = args["url"].as_str() {
             params["url"] = json!(normalized_url(url)?.to_string());
         }
-        return crate::chrome_browser::request(app, operation, params).await;
+        strip_observe_keys(&mut params);
+        let mut value = crate::chrome_browser::request(app, operation, params).await?;
+        let mut observe_args = args.clone();
+        let mut target = None;
+        if operation == "tabs" {
+            // `query` binds deterministically when exactly one tab matches; no guessing the active tab.
+            if let Some(q) = args["query"].as_str().map(str::trim).filter(|q| !q.is_empty()) {
+                let q = q.to_lowercase();
+                let all = value["tabs"].as_array().cloned().unwrap_or_default();
+                let matched: Vec<Value> = all.iter().filter(|t| ["title", "url"].iter()
+                    .any(|k| t[*k].as_str().is_some_and(|s| s.to_lowercase().contains(&q)))).cloned().collect();
+                let controllable: Vec<&Value> = matched.iter().filter(|t| t["controllable"] != false).collect();
+                value["totalTabs"] = json!(all.len());
+                value["query"] = json!(q);
+                match controllable.as_slice() {
+                    [one] => { value["tabTag"] = one["tag"].clone(); target = one["tag"].as_str().map(str::to_owned); }
+                    [] => value["next"] = json!("没有可操作标签匹配 query；换关键词，或 open(url) 新开标签"),
+                    _ => value["next"] = json!("query 匹配到多个标签，请从 tabs 中选定 tabTag 后 inspect"),
+                }
+                value["tabs"] = json!(matched);
+                if let Some(a) = observe_args.as_object_mut() { a.remove("query"); }
+            }
+        } else {
+            retire_desktop(&mut value);
+            if args["url"].is_string() { target = value["tabTag"].as_str().map(str::to_owned); }
+        }
+        if let (Some(tag), false) = (target, observe == "none") {
+            let observed = observe_tab(app, &thread_id, &tag, &observe_args, observe, Duration::from_secs(8)).await;
+            value.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
+            value["tabTag"] = json!(tag);
+            value["browser"] = json!("chrome");
+        }
+        return Ok(value);
     }
     let tag = args["tabTag"]
         .as_str()
@@ -1775,7 +1848,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
                 && tag.starts_with('C')
                 && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
-        .ok_or("缺少有效 tabTag；请先 chrome.tabs，不会默认操作当前激活标签")?;
+        .ok_or("缺少有效 tabTag；请先 chrome.tabs（可带 query 唯一匹配直接绑定），不会默认操作当前激活标签")?;
     if operation == "stop" {
         crate::chrome_browser::stop(app, tag);
     }
@@ -1788,7 +1861,8 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
             params["url"] =
                 json!(normalized_url(args["url"].as_str().unwrap_or_default())?.to_string());
         }
-        let value = crate::chrome_browser::request(app, operation, params).await?;
+        strip_observe_keys(&mut params);
+        let mut value = crate::chrome_browser::request(app, operation, params).await?;
         if matches!(
             operation,
             "close_tab" | "goto" | "back" | "forward" | "reload" | "stop"
@@ -1799,14 +1873,39 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
                 .unwrap()
                 .retain(|key, _| !key.ends_with(&format!(":{tag}")));
         }
+        if mutating { retire_desktop(&mut value); }
+        // Navigation returns the loaded page directly: no separate inspect round-trip.
+        if matches!(operation, "select_tab" | "goto" | "back" | "forward" | "reload") && observe != "none" {
+            let observed = observe_tab(app, &thread_id, tag, args, observe, Duration::from_secs(8)).await;
+            value.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
+            value["tabTag"] = json!(tag);
+            value["browser"] = json!("chrome");
+        }
         return Ok(value);
     }
     if !matches!(operation, "inspect" | "screenshot" | "act") {
         return Err("未知 chrome 操作".into());
     }
-    let s = Session {
+    let mut value = control_session(app, chrome_session(&thread_id, tag), operation, args).await?;
+    if operation == "act" && value["status"] != "not_executed" { retire_desktop(&mut value); }
+    value["tabTag"] = json!(tag);
+    value["browser"] = json!("chrome");
+    Ok(value)
+}
+
+// Observation-only parameters ride along with navigation calls; the extension must not see them.
+fn strip_observe_keys(params: &mut Value) {
+    if let Some(object) = params.as_object_mut() {
+        for key in ["observe", "query", "scope", "maxItems", "maxTextChars", "maxEdge", "visual", "settleMs"] {
+            object.remove(key);
+        }
+    }
+}
+
+fn chrome_session(thread_id: &str, tag: &str) -> Session {
+    Session {
         browser_id: "chrome".into(),
-        thread_id: thread_id.clone(),
+        thread_id: thread_id.into(),
         url: String::new(),
         visible: true,
         busy: false,
@@ -1815,11 +1914,67 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
         tabs: Vec::new(),
         bounds: None,
         cancel: Arc::new(AtomicBool::new(false)),
-    };
-    let mut value = control_session(app, s, operation, args).await?;
-    value["tabTag"] = json!(tag);
-    value["browser"] = json!("chrome");
-    Ok(value)
+    }
+}
+
+/// Poll the extension's tab inventory until the tab finished loading (status complete, no
+/// pendingUrl). Bounded: a page that never settles still returns so the caller observes what is
+/// there; older extensions without `loading` report complete immediately.
+async fn wait_for_tab_load(app: &AppHandle, tag: &str, budget: Duration) -> Value {
+    let started = std::time::Instant::now();
+    // Let the navigation commit before trusting the previous page's "complete".
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let mut state = json!({"status":"unknown"});
+    loop {
+        match crate::chrome_browser::request(app, "tabs", json!({})).await {
+            Ok(value) => {
+                let Some(tab) = value["tabs"].as_array().and_then(|tabs| tabs.iter().find(|t| t["tag"] == tag)).cloned() else {
+                    state = json!({"status":"closed"});
+                    break;
+                };
+                let loading = tab["loading"] == true;
+                state = json!({"status": if loading {"loading"} else {"complete"}, "url": tab["url"], "title": tab["title"]});
+                if !loading { break; }
+            }
+            Err(error) => { state = json!({"status":"unknown","error":error}); break; }
+        }
+        if started.elapsed() >= budget { break; }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    state["waitedMs"] = json!(started.elapsed().as_millis());
+    state
+}
+
+/// Observe a tab right after a navigation-style operation so the caller gets snapshotId/DOM in
+/// the same reply. Load waits and "not ready" retries share one bounded budget; observation
+/// failure is reported alongside the completed operation, never as an operation failure.
+async fn observe_tab(app: &AppHandle, thread_id: &str, tag: &str, args: &Value, mode: &str, budget: Duration) -> Value {
+    let started = std::time::Instant::now();
+    let mut result = json!({"load": wait_for_tab_load(app, tag, budget).await});
+    if result["load"]["status"] == "closed" {
+        result["observationError"] = json!("标签已关闭，无法观察");
+        return result;
+    }
+    let mut observe_args = json!({"operation":mode,"tabTag":tag,"fullPage":false});
+    observe_args["scope"] = args.get("scope").filter(|v| !v.is_null()).cloned().unwrap_or(json!("viewport"));
+    for key in ["query", "maxItems", "maxTextChars", "maxEdge", "visual"] {
+        if let Some(value) = args.get(key).filter(|v| !v.is_null()) { observe_args[key] = value.clone(); }
+    }
+    loop {
+        match control_session(app, chrome_session(thread_id, tag), mode, &observe_args).await {
+            Ok(observed) => {
+                result.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
+                result["observed"] = json!(mode);
+                break;
+            }
+            Err(error) if error.contains("尚未就绪") && started.elapsed() < budget => tokio::time::sleep(Duration::from_millis(250)).await,
+            Err(error) => {
+                result["observationError"] = json!(format!("{error}；操作本身已完成，页面可能仍在加载，稍后 inspect"));
+                break;
+            }
+        }
+    }
+    result
 }
 
 fn state_dir(app: &AppHandle) -> std::path::PathBuf {
@@ -1847,11 +2002,14 @@ mod tests {
         assert_eq!(image.point(400.,200.).unwrap(),(300.,400.));
         assert!(image.point(1200.,0.).is_err());assert!(image.point(-1.,0.).is_err());assert!(image.point(f64::NAN,0.).is_err());
         let small=ScreenshotImage{pixels:(300,200),..image};assert_eq!(small.point(100.,50.).unwrap(),(300.,400.));
-        assert!(parse_actions(&json!({"actions":[{"action":"fill","frame":0,"ref":"a","text":"one"},{"action":"click","frame":0,"ref":"b","button":"right","click_count":2}]})).is_ok());
+        assert!(parse_actions(&json!({"actions":[{"action":"fill","frame":0,"ref":"a","text":"one"},{"action":"click","frame":0,"ref":"b","button":"right","click_count":2}]}), 8).is_ok());
         for value in [json!({"actions":[]}),json!({"actions":[{"action":"click_at","x":1,"y":2,"button":"bad"}]}),
             json!({"action":{"action":"drag","x":1,"y":2,"to_x":3,"to_y":4,"duration_ms":99999}}),
             json!({"action":{"action":"wait","ms":3000}}),json!({"actions":[{"action":"press","key":"Enter"},{"action":"press","key":"bad"}]}),
-            json!({"action":{"action":"wait","ms":1},"actions":[{"action":"wait","ms":1}]})] {assert!(parse_actions(&value).is_err(),"{value}");}
+            json!({"action":{"action":"wait","ms":1},"actions":[{"action":"wait","ms":1}]})] {assert!(parse_actions(&value, 8).is_err(),"{value}");}
+        assert!(parse_actions(&json!({"actions":vec![json!({"action":"wait","ms":0});16]}), 16).is_ok());
+        assert!(parse_actions(&json!({"actions":vec![json!({"action":"wait","ms":0});17]}), 16).is_err());
+        assert!(parse_actions(&json!({"actions":vec![json!({"action":"wait","ms":0});9]}), 8).is_err());
         let mut png=vec![0u8;24];png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");png[12..16].copy_from_slice(b"IHDR");
         png[16..20].copy_from_slice(&1200u32.to_be_bytes());png[20..24].copy_from_slice(&800u32.to_be_bytes());
         assert_eq!(png_dimensions(&png).unwrap(),(1200,800));assert!(png_dimensions(&png[..23]).is_err());

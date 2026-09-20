@@ -8,6 +8,7 @@ test('a stuck debugger command times out, polling resumes and late results are n
   const event=()=>({addListener(){}});
   const replies=[]; let polls=0, calls=0, finishCommand;
   const chrome={
+    extension:{isAllowedIncognitoAccess:async()=>false},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
     tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event()},
     debugger:{attach:async()=>{},sendCommand:()=>{calls++;return new Promise(resolve=>{finishCommand=resolve;});},onDetach:event(),onEvent:event()},
@@ -42,6 +43,7 @@ test('stable tags, default access, auto-attached frames, expiry and worker resta
   let tabs=[{id:11,url:'https://example.com/a',title:'A',active:true},{id:22,url:'https://example.org/b',title:'B',active:false}];
   const event=()=>({listeners:[],addListener(fn){this.listeners.push(fn);},emit(...args){for(const fn of this.listeners)fn(...args);}});
   const chrome={
+    extension:{isAllowedIncognitoAccess:async()=>false},
     storage:{session:{get:async()=>structuredClone(persisted),set:async v=>Object.assign(persisted,structuredClone(v))},local:{set:async()=>{},get:async()=>({})}},
     tabs:{query:async filter=>structuredClone(filter?.active?tabs.filter(t=>t.active):tabs),get:async id=>{const tab=tabs.find(t=>t.id===id);if(!tab)throw Error('closed');return tab;},onRemoved:event(),onReplaced:event()},
     debugger:{attach:async target=>nativeCalls.push(['attach',target.tabId]),detach:async()=>{},sendCommand:async(target,method)=>{
@@ -96,6 +98,7 @@ test('multiple Nova instances route replies independently, serialize commands an
   const available=new Set([47653,47654]);
   let active=0, peak=0, attaches=0;
   const chrome={
+    extension:{isAllowedIncognitoAccess:async()=>false},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
     tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event()},
     debugger:{attach:async()=>{attaches++;},sendCommand:async(_target,_method,params)=>{
@@ -142,4 +145,26 @@ test('multiple Nova instances route replies independently, serialize commands an
   assert.equal(pairs.get(47654),1,'live poll is not duplicated');
   assert.equal(pairs.get(47655),1,'new instance is discovered while another is connected');
   assert.equal(replies.filter(value=>value.port===47653).length,1,'failed delivery is never replayed');
+});
+
+test('incognito permission, window isolation and tab filtering',async()=>{
+  const event=()=>({addListener(){}});let allowed=false,created=[];
+  let tabs=[{id:1,windowId:10,url:'https://example.com',incognito:false}];
+  const chrome={extension:{isAllowedIncognitoAccess:async()=>allowed},
+    storage:{session:{get:async()=>({}),set:async()=>{}}},
+    tabs:{query:async()=>tabs,get:async id=>tabs.find(t=>t.id===id),create:async args=>{created.push(args);return tabs[0];},onRemoved:event(),onReplaced:event()},
+    windows:{getAll:async()=>[{id:20,incognito:true},{id:10,incognito:false}],create:async args=>{created.push(args);const tab={id:2,windowId:20,url:args.url,incognito:args.incognito};tabs.push(tab);return {id:20,tabs:[tab]};}},
+    debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={execute};',scope);
+  const run=(operation,args={})=>scope.api.execute({operation,args,expiresAt:Date.now()+3000});
+  assert.equal((await run('status')).incognitoAllowed,false);
+  await assert.rejects(run('open',{url:'https://example.com',incognito:true}),/允许在无痕/);
+  assert.equal(created.length,0);
+  allowed=true;
+  const opened=await run('open',{url:'https://example.com',incognito:true});
+  assert.ok(opened.tabTag);assert.equal(created[0].incognito,true);
+  const privateTabs=await run('tabs',{incognito:true});assert.equal(privateTabs.tabs.length,1);assert.equal(privateTabs.tabs[0].incognito,true);
+  await run('new_tab',{url:'https://example.org',incognito:false});assert.equal(created[1].windowId,10);
+  await assert.rejects(run('open',{incognito:'true'}),/boolean/);
 });

@@ -9,8 +9,10 @@ import {webviewMcpResult} from './webview-mcp-result.mjs';
 const tool = async name=>JSON.parse(await readFile(new URL(`./${name}-tool.json`,import.meta.url),'utf8'));
 test('Chrome and WebView share image coordinates, fast scope and bounded batch schemas',async()=>{
   const [chrome,webview]=await Promise.all(['chrome','webview'].map(tool));
-  for(const name of ['action','actions','imageId','scope','region','visual','maxEdge']) assert.deepEqual(chrome.inputSchema.properties[name],webview.inputSchema.properties[name]);
-  assert.equal(chrome.inputSchema.properties.actions.maxItems,8);
+  for(const name of ['action','imageId','scope','region','visual','maxEdge']) assert.deepEqual(chrome.inputSchema.properties[name],webview.inputSchema.properties[name]);
+  assert.deepEqual(chrome.inputSchema.properties.actions.items,webview.inputSchema.properties.actions.items);
+  assert.equal(chrome.inputSchema.properties.actions.maxItems,16);
+  assert.equal(chrome.inputSchema.properties.incognito.type,"boolean");
   assert.equal(chrome.inputSchema.properties.actions.items.properties.duration_ms.maximum,1500);
   const saved={endpoint:process.env.NOVA_CONTEXT_SERVICE_ENDPOINT,token:process.env.NOVA_CONTEXT_SERVICE_TOKEN};
   process.env.NOVA_CONTEXT_SERVICE_ENDPOINT='test-endpoint';process.env.NOVA_CONTEXT_SERVICE_TOKEN='test-token';
