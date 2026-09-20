@@ -13,6 +13,7 @@ const records = new Map<string, any>();
 const calls: any[] = [], images: any[] = [], details: any[] = [];
 let imageActive = 0, imageMax = 0, paints = 0, firstPaint = 0, started = 0, lastFrame = performance.now(), maxFrameGap = 0;
 let gate: (() => void) | null = null, gateNext = false, failNext = false, deferredId: string | null = null;
+let resetBeforeSendAckNext = false;
 let holdCancel: (() => void) | null = null, cancelShouldFail = false;
 const thumb = document.createElement('canvas'); thumb.width = 480; thumb.height = 270;
 const ctx = thumb.getContext('2d')!;
@@ -116,6 +117,9 @@ async function invoke(command: string, args: any = {}) {
   if(command==='send_prompt') {
     const r=records.get(args.threadId);r.running=true;
     const id=(r.items.at(-1)?.id??0)+1;r.items.push({type:'user',id,text:args.text,images:args.images??[],ts:Date.now()});r.users++;
+    // Reproduce the production race: acp:turn requests a reset while the
+    // coalesced user upsert is waiting to be fetched.
+    if(resetBeforeSendAckNext){resetBeforeSendAckNext=false;requestHistoryRefresh(r.id,[],true);}
     receiveHistoryNotice({threadId:r.id,notice:{ids:[id],removed:[],ops:[],chars:0,reset:false}});
     return;
   }
@@ -148,6 +152,7 @@ w.perfTest={
  gate:()=>{gateNext=true;},release:()=>{gate?.();gate=null;},defer:(id:string)=>{deferredId=id;},fail:()=>{failNext=true;},
  cancelAck:(fail=false)=>{cancelShouldFail=fail;holdCancel?.();holdCancel=null;},
  run:(running:boolean)=>{records.get(state.currentId!).running=running;setState('running',state.currentId!,running);},
+ resetBeforeNextSend:()=>{resetBeforeSendAckNext=true;},
  notice:(ids:number[]=[],reset=false)=>requestHistoryRefresh(state.currentId!,ids,reset),
  update:(id:number,text:string)=>{const r=records.get(state.currentId!);const i=r.items.find((i:any)=>i.id===id);i.text=text;requestHistoryRefresh(r.id,[id]);},
  restore:()=>{const r=records.get(state.currentId!);r.generation+='r';r.items=r.items.slice(0,40);r.users=r.turns=10;requestHistoryRefresh(r.id,[],true);},

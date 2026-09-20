@@ -48,6 +48,23 @@ try {
     assert.ok(Math.abs(after.y - before.y) < 3, JSON.stringify({ before, after }));
     assert.ok(await page.evaluate(() => window.perfTest.state.items.length <= 240));
   });
+  await check('turn reset racing the user acknowledgement never renders one prompt twice', async () => {
+    await page.evaluate(() => window.perfTest.open('small'));
+    const prompt = 'single-copy-after-reset-race';
+    await page.evaluate(() => window.perfTest.resetBeforeNextSend());
+    await page.locator('textarea.composer-input').fill(prompt);
+    await page.locator('.composer-btn.send').click();
+    await page.waitForFunction(text => window.perfTest.state.items.some(item => item.id > 0 && item.text === text), prompt);
+    await page.waitForTimeout(300);
+    const result = await page.evaluate(text => ({
+      matches: window.perfTest.state.items.filter(item => item.text === text).length,
+      optimistic: window.perfTest.state.items.filter(item => item.id < 0 && item.text === text).length,
+      ids: window.perfTest.state.items.filter(item => item.text === text).map(item => item.id),
+    }), prompt);
+    assert.equal(result.matches, 1, JSON.stringify(result));
+    assert.equal(result.optimistic, 0, JSON.stringify(result));
+    await page.evaluate(() => window.perfTest.run(false));
+  });
   await check('resending invalidates an outstanding old page even when the thread and IDs are reused', async () => {
     await page.evaluate(() => window.perfTest.open('anchor'));
     await page.waitForTimeout(200);

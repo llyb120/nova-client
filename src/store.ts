@@ -1238,6 +1238,11 @@ function recoverProposedPlan(_thread: Thread): string | null {
 }
 
 let openThreadRequest = 0;
+// Optimistic transcript IDs only live in this renderer process. Date.now() can
+// repeat within one millisecond, which is fatal for Solid's keyed reconcile and
+// can make two rapid prompts share one render identity.
+let optimisticItemId = -1;
+function nextOptimisticItemId(): number { return optimisticItemId--; }
 const historyEdits = new Set<string>();
 export const [historyResetRevision, setHistoryResetRevision] = createSignal(0);
 
@@ -1777,7 +1782,7 @@ export function createThreadOptimistic(
     // 用户消息立即上屏，与 deliverPrompt 的乐观项同一约定（负 id 临时项）。
     setState("items", 0, {
       type: "user",
-      id: -Date.now(),
+      id: nextOptimisticItemId(),
       text,
       images,
       ts: Date.now(),
@@ -2360,7 +2365,7 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
 async function deliverPrompt(threadId: string, text: string, images: PromptImage[]) {
   // 后端 user 事件到达前先把用户刚发送的内容上屏，避免首轮仍显示“请在下方输入”。
   // applyUpsert 收到真实 user item 后会移除这个负 id 临时项。
-  const optimisticId = state.currentId === threadId ? -Date.now() : null;
+  const optimisticId = state.currentId === threadId ? nextOptimisticItemId() : null;
   if (optimisticId !== null) {
     setState("items", state.items.length, {
       type: "user",
@@ -2883,7 +2888,7 @@ export async function editUserMessage(itemId: number, text: string, images: Prom
       const targetIndex = state.items.findIndex((item) => item.id === itemId);
       const retained = targetIndex < 0 ? state.items : state.items.slice(0, targetIndex);
       // 临时 id 只存在于前端；后端 restore 完成、发出真实 user item 后由快照/事件替换。
-      const optimisticId = -Date.now();
+      const optimisticId = nextOptimisticItemId();
       setState({
         items: [
           ...retained,

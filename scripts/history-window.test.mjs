@@ -44,6 +44,40 @@ test('scrolling into old users is not acknowledgement of an optimistic send',()=
  const replaced=mergeHistoryUpdate(t,{generation:'g',items:[item(102)],totalItems:1000,stats:stats(1000)}).thread;assert.equal(replaced.items.at(-1).id,-10);
  const acknowledged=preserveOptimistic(t,pageThread(page(923,1003,1003)));assert.equal(acknowledged.items.some(i=>i.id<0),false);
 });
+test('reset-first refresh cannot retain an optimistic copy after the canonical user reaches the tail',()=>{
+ const current=pageThread(page(920,1000));const users=current.history.stats.users;
+ current.items.push({type:'user',id:-1,text:'sent-once',ts:1});
+ const advanced={...stats(1001),users:users+1};
+ const statsOnly=mergeHistoryUpdate(current,{generation:'g',items:[],totalItems:1001,stats:advanced}).thread;
+ const tail=page(921,1001,1001);tail.stats=advanced;
+ tail.thread.items[tail.thread.items.length-1]={type:'user',id:1001,historyIndex:1000,text:'sent-once',ts:1000};
+ const merged=mergeHistoryPage(statsOnly,tail,'after');
+ const settled=preserveOptimistic(current,merged);
+ assert.equal(settled.items.filter(i=>i.text==='sent-once').length,1);
+ assert.equal(settled.items.some(i=>i.id<0),false);
+});
+test('authoritative user count acknowledges rapid optimistic sends one at a time',()=>{
+ const current=pageThread(page(920,1000));const users=current.history.stats.users;
+ current.items.push({type:'user',id:-1,text:'first-pending',ts:1},{type:'user',id:-2,text:'second-pending',ts:2});
+ const one={...current,items:current.items.filter(i=>i.id>=0),history:{...current.history,stats:{...current.history.stats,users:users+1}}};
+ one.items.push({type:'user',id:1001,historyIndex:1000,text:'first-pending',ts:3});
+ const afterOne=preserveOptimistic(current,one);
+ assert.deepEqual(afterOne.items.filter(i=>i.id<0).map(i=>i.text),['second-pending']);
+ const two={...afterOne,items:afterOne.items.filter(i=>i.id>=0),history:{...afterOne.history,stats:{...afterOne.history.stats,users:users+2}}};
+ two.items.push({type:'user',id:1002,historyIndex:1001,text:'second-pending',ts:4});
+ const afterTwo=preserveOptimistic(afterOne,two);
+ assert.equal(afterTwo.items.some(i=>i.id<0),false);
+ assert.equal(afterTwo.items.filter(i=>i.text==='first-pending').length,1);
+ assert.equal(afterTwo.items.filter(i=>i.text==='second-pending').length,1);
+});
+test('generation replacement never carries optimistic bubbles from the old branch',()=>{
+ const current=pageThread(page(920,1000));current.items.push({type:'user',id:-1,text:'old-branch-pending',ts:1});
+ const next=pageThread(page(920,1000,1000,'restored'));
+ const settled=preserveOptimistic(current,next);
+ assert.equal(settled.items.some(i=>i.id<0),false);
+ assert.equal(settled.items.some(i=>i.text==='old-branch-pending'),false);
+});
+
 test('10,000 timeline prompts use bounded IDs, iterative layout and a viewport-sized DOM model',()=>{
  const prompts=Array.from({length:10000},(_,id)=>({id,text:'记录 '+id+' 中'.repeat(100)}));
  const checkpoint={id:'c',prompts:prompts.slice(0,7000),title:'checkpoint',createdAt:0};

@@ -69,8 +69,10 @@ export function mergeHistoryUpdate(current: Thread, update: HistoryDisplayUpdate
   if (!old || old.generation !== update.generation) throw new Error('HISTORY_CHANGED');
   const atTail = followTail && !old.afterCursor;
   const lookup = new Map(update.items.map(item => [item.id, item]));
-  const incomingUser = update.items.some(item => item.type === 'user' && index(item) >= old.totalItems);
-  const items = current.items.filter(item => !(incomingUser && item.id < 0)).map(item => lookup.get(item.id) ?? item);
+  // Authoritative updates only replace persisted IDs. Negative IDs are local
+  // optimistic sends and are reconciled exactly once in preserveOptimistic().
+  // Removing them here would let one user upsert acknowledge every queued send.
+  const items = current.items.map(item => lookup.get(item.id) ?? item);
   const ids = new Set(items.map(item => item.id));
   let nextIndex = old.end, gap = false;
   if (atTail) {
@@ -86,10 +88,43 @@ export function mergeHistoryUpdate(current: Thread, update: HistoryDisplayUpdate
   return { thread: { ...current, ...trim(items, meta, atTail ? 'end' : 'start') }, gap };
 }
 
-/** A latest-page navigation may happen before send_prompt acknowledges the user's
- * optimistic bubble. Old users newly entering the viewport are NOT that ack. */
+function isOptimisticUser(item: Item): boolean {
+  return item.type === 'user' && item.id < 0;
+}
+function authoritativeUserCount(thread: Thread): number {
+  return thread.history?.stats.users
+    ?? thread.items.filter(item => item.type === 'user' && item.id >= 0).length;
+}
+
+/** Reconcile local sends against an authoritative snapshot/page.
+ *
+ * History pages can race the user upsert with a turn/reset notification. A page
+ * merge may therefore already contain both the persisted user item and its
+ * negative-ID optimistic bubble. Always strip optimistic items from `next`
+ * first, then consume exactly the number of sends that the authoritative global
+ * user count has acknowledged. This also keeps rapid multi-send correct: one
+ * persisted user removes one pending bubble, never all of them.
+ *
+ * A generation replacement (resend/restore) supersedes every optimistic item
+ * from the previous branch even when the persisted user count does not grow.
+ */
 export function preserveOptimistic(current: Thread | undefined, next: Thread): Thread {
-  if (!current || (next.history?.stats.users ?? 0) > (current.history?.stats.users ?? 0)) return next;
-  const optimistic = current.items.filter(i => i.id < 0 && !next.items.some(n => n.id === i.id));
-  return optimistic.length ? { ...next, items: [...next.items, ...optimistic] } : next;
+  const canonical = next.items.filter(item => !isOptimisticUser(item));
+  if (!current) {
+    return canonical.length === next.items.length ? next : { ...next, items: canonical };
+  }
+
+  const pending = current.items.filter(isOptimisticUser);
+  const generationChanged = !!current.history && !!next.history
+    && current.history.generation !== next.history.generation;
+  const acknowledged = generationChanged
+    ? pending.length
+    : Math.min(
+        pending.length,
+        Math.max(0, authoritativeUserCount(next) - authoritativeUserCount(current)),
+      );
+  const remaining = pending.slice(acknowledged);
+
+  if (remaining.length === 0 && canonical.length === next.items.length) return next;
+  return { ...next, items: [...canonical, ...remaining] };
 }
