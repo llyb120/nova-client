@@ -66,11 +66,15 @@ jobs:
           python3 scripts/polaris-shallow-closure.py
           python3 scripts/polaris-precision-budget.py
           python3 scripts/polaris-coverage-balance.py
-          git diff -- src-tauri/src/nova_tools_native > validation/production.patch
+          python3 scripts/polaris-source-edges.py
+          python3 scripts/polaris-working-set-guidance.py
+          git diff -- src-tauri/src/nova_tools_native src-tauri/src/lyra/tools.rs scripts/ctx-core.mjs scripts/polaris-query.mjs scripts/polaris-one-shot-edit.py > validation/production.patch
+          git diff --exit-code -- src-tauri/src/lyra/reasonix.rs
           git rev-parse HEAD > validation/base-commit.txt
           cp src-tauri/src/nova_tools_native/polaris*.rs validation/source/
-          cp scripts/polaris-fastcontext-*.py scripts/polaris-one-shot-*.py scripts/polaris-context-*.py scripts/polaris-shallow-closure.py scripts/polaris-precision-budget.py scripts/polaris-coverage-balance.py scripts/polaris-ab.py validation/scripts/
-          sha256sum src-tauri/src/nova_tools_native/polaris*.rs src-tauri/src/nova_tools_native/context.rs src-tauri/src/lyra/reasonix.rs > validation/source-hashes.txt
+          cp src-tauri/src/lyra/tools.rs validation/source/lyra-tools.rs
+          cp scripts/polaris-fastcontext-*.py scripts/polaris-one-shot-*.py scripts/polaris-context-*.py scripts/polaris-shallow-closure.py scripts/polaris-precision-budget.py scripts/polaris-coverage-balance.py scripts/polaris-source-edges.py scripts/polaris-working-set-guidance.py scripts/polaris-ab.py scripts/polaris-query.mjs scripts/ctx-core.mjs validation/scripts/
+          sha256sum src-tauri/src/nova_tools_native/polaris*.rs src-tauri/src/nova_tools_native/context.rs src-tauri/src/lyra/reasonix.rs src-tauri/src/lyra/tools.rs scripts/polaris-query.mjs scripts/ctx-core.mjs > validation/source-hashes.txt
           git -C _corpus archive HEAD src src-tauri/src scripts .gitignore | gzip > validation/corpus-source.tar.gz
       - name: Production regression tests and fresh release build
         id: build
@@ -78,7 +82,7 @@ jobs:
           set -euo pipefail
           cargo clean --release --manifest-path bench/polaris-harness/Cargo.toml -p polaris-harness
           cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
-          node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs 2>&1 | tee validation/node-tests.txt
+          node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs scripts/ctx-core.test.mjs 2>&1 | tee validation/node-tests.txt
           cargo build --release --manifest-path bench/polaris-harness/Cargo.toml
           cp bench/polaris-harness/target/release/polaris-harness validation/bin/candidate
           sha256sum validation/bin/* > validation/binary-hashes.txt
