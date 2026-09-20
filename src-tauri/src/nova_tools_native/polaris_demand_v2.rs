@@ -244,7 +244,7 @@ pub(super) fn demand_corpus(root:&Path,q:&query::Query,deadline:Instant)->Result
         let c=subset(units.clone(),parsed.len(),stats.reparsed_files,partial);
         let lexical=super::lexical_rank(&c,&units,q);
         let seeds=super::rank::fuse(&lexical,&[],&units,q);
-        let mut direct=HashSet::new();let mut names=HashSet::new();let callers=seeds.iter().take(2).map(|(i,_)|(units[*i].file.clone(),units[*i].name.clone())).collect::<HashSet<_>>();
+        let mut direct=HashSet::new();let mut direct_names=HashMap::<String,HashSet<String>>::new();let mut names=HashSet::new();let callers=seeds.iter().take(2).map(|(i,_)|(units[*i].file.clone(),units[*i].name.clone())).collect::<HashSet<_>>();
         let mut expand=seeds.iter().take(6).map(|(id,_)|*id).collect::<Vec<_>>();
         let mut identities=expand.iter().map(|i|super::identity(&units[*i])).collect::<HashSet<_>>();
         for (i,u) in units.iter().enumerate(){if required_names.contains(&u.name)&&identities.insert(super::identity(u)){expand.push(i);if expand.len()>=64{break;}}}
@@ -252,12 +252,34 @@ pub(super) fn demand_corpus(root:&Path,q:&query::Query,deadline:Instant)->Result
             let u=&units[id];direct.insert(u.file.clone());
             names.extend(u.calls.iter().filter(|s|s.len()>=3).cloned());
             names.extend(super::packet::dependency_names(u));names.extend(u.commands.iter().cloned());
-            for import in u.imports.iter(){if u.calls.contains(&import.name)||u.members.iter().any(|(o,_)|o==&import.name){if let Some(f)=resolve_specifier(&import.from,&u.file,&files){direct.insert(f);names.insert(import.orig.clone().unwrap_or_else(||import.name.clone()));}}}
-            for (object,member) in &u.members{if let Some(suffix)=object.strip_prefix("crate::"){names.insert(member.clone());if let Some(pos)=u.file.rfind("src/"){let prefix=&u.file[..pos+4];let module=suffix.replace("::","/");for f in [format!("{prefix}{module}.rs"),format!("{prefix}{module}/mod.rs")]{if files.contains(&f){direct.insert(f);}}}}}
+            for import in u.imports.iter(){
+                if u.calls.contains(&import.name)||u.members.iter().any(|(o,_)|o==&import.name){
+                    if let Some(f)=resolve_specifier(&import.from,&u.file,&files){
+                        let symbol=import.orig.clone().unwrap_or_else(||import.name.clone());
+                        direct.insert(f.clone());direct_names.entry(f).or_default().insert(symbol.clone());names.insert(symbol);
+                    }
+                }
+            }
+            for (object,member) in &u.members{
+                if let Some(suffix)=object.strip_prefix("crate::"){
+                    names.insert(member.clone());
+                    if let Some(pos)=u.file.rfind("src/"){
+                        let prefix=&u.file[..pos+4];let module=suffix.replace("::","/");
+                        for f in [format!("{prefix}{module}.rs"),format!("{prefix}{module}/mod.rs")]{
+                            if files.contains(&f){direct.insert(f.clone());direct_names.entry(f).or_default().insert(member.clone());}
+                        }
+                    }
+                }
+            }
         }
         required_names.extend(names.iter().cloned());
         let mut neighbours=rows.iter().enumerate().filter(|(i,_)|!parsed.contains(i)).filter_map(|(i,r)|{
-            let explicit=direct.contains(&r.file);let caller=callers.iter().any(|(_,name)|r.text.contains(name));
+            // A resolved dependency file is useful only if it still contains
+            // the source symbol that led us there. This rejects stale/re-export
+            // noise before tree-sitter, while callers keep the previous rule.
+            let explicit=direct.contains(&r.file)&&direct_names.get(&r.file)
+                .is_some_and(|wanted|wanted.iter().any(|name|name.len()>=2&&r.text.contains(name)));
+            let caller=callers.iter().any(|(_,name)|r.text.contains(name));
             ((explicit||caller)&&structural_candidate(&r.file,q)).then_some((i,if explicit{10000.0+r.score}else{r.score}))
         }).collect::<Vec<_>>();
         neighbours.sort_by(|a,b|b.1.total_cmp(&a.1).then(rows[a.0].file.cmp(&rows[b.0].file)));
@@ -299,6 +321,34 @@ pub(super) fn demand_corpus(root:&Path,q:&query::Query,deadline:Instant)->Result
         let q=query::Query::parse(serde_json::json!({"task":"收起面板再打开时复用原来的命令行进程而不是重新启动","maxBytes":12000})).unwrap();
         let (c,_)=demand_corpus(d.path(),&q,Instant::now()+Duration::from_secs(3)).unwrap();
         assert!(c.units.iter().any(|u|u.name=="attachExistingTerminal"),"{:?}",c.units.iter().map(|u|u.name.clone()).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)] mod dependency_prune_tests {
+    use super::*;
+    #[test] fn imported_exact_symbol_survives_dependency_pruning() {
+        let d=tempfile::tempdir().unwrap();fs::create_dir(d.path().join("src")).unwrap();
+        fs::write(d.path().join("src/ui.ts"),"import {attachExisting} from './terminal';
+// 复用终端进程
+export function restore(){ attachExisting(); }
+").unwrap();
+        fs::write(d.path().join("src/terminal.ts"),"export function attachExisting(){ return mountHost(); }
+").unwrap();
+        let q=query::Query::parse(serde_json::json!({"task":"复用终端进程","maxBytes":12000})).unwrap();
+        let (c,_)=demand_corpus(d.path(),&q,Instant::now()+Duration::from_secs(3)).unwrap();
+        for name in ["restore","attachExisting"]{assert!(c.units.iter().any(|u|u.name==name),"{name}");}
+    }
+    #[test] fn rust_qualified_member_survives_dependency_pruning() {
+        let d=tempfile::tempdir().unwrap();fs::create_dir_all(d.path().join("src/runtime")).unwrap();
+        fs::write(d.path().join("src/lib.rs"),"mod runtime;
+// 恢复任务
+pub fn restore(){ crate::runtime::resume_job(); }
+").unwrap();
+        fs::write(d.path().join("src/runtime/mod.rs"),"pub fn resume_job(){ run(); }
+").unwrap();
+        let q=query::Query::parse(serde_json::json!({"task":"恢复任务","maxBytes":12000})).unwrap();
+        let (c,_)=demand_corpus(d.path(),&q,Instant::now()+Duration::from_secs(3)).unwrap();
+        assert!(c.units.iter().any(|u|u.name=="resume_job"));
     }
 }
 
