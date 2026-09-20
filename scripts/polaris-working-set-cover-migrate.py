@@ -1,5 +1,5 @@
 """Reduce cold parsing cost without shrinking dependency closure or intent coverage.
-Keep the two strongest files exactly as ranked. Fill the remaining initial parse slots from the
+Keep the eight strongest files exactly as ranked. Fill the remaining eight initial parse slots from the
 top lexical candidate pool using relevance per estimated parse cost. Dependency fan-out/depth
 and the landed 20/20 declaration champion are unchanged.
 """
@@ -19,11 +19,11 @@ p,s=load("polaris_demand_v2.rs","3c814ff3e30916e15b7e357bda2338a52c4aa341")
 old='''    let mut parsed=HashSet::new();let initial=order.iter().copied().take(INITIAL_FILES).collect::<Vec<_>>();
     partial|=declarations(&rows,&initial,&mut cache,&mut parsed,&mut stats,deadline);'''
 new='''    let mut parsed=HashSet::new();
-    // Always retain the two strongest lexical files. For the remaining cold
+    // Always retain the eight strongest lexical files. For the remaining cold
     // slots, prefer focused evidence that is cheaper to parse. This only changes
     // scheduling among already-discovered candidates; it does not narrow the
     // search surface, dependency frontier, or result budget.
-    let mut initial=order.iter().copied().take(2).collect::<Vec<_>>();
+    let mut initial=order.iter().copied().take(8).collect::<Vec<_>>();
     let fixed=initial.iter().copied().collect::<HashSet<_>>();
     let mut efficient=order.iter().copied().take(96).filter(|id|!fixed.contains(id)).collect::<Vec<_>>();
     efficient.sort_by(|a,b|{
