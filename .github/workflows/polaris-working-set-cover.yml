@@ -32,8 +32,8 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: polaris-text-recall-ubuntu-24.04
-          run-id: 35485881086
+          name: polaris-working-set-cover-candidate
+          run-id: 35491881474
           github-token: ${{ github.token }}
           path: _current
       - uses: actions/download-artifact@v4
