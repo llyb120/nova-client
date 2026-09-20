@@ -19,9 +19,9 @@ old='''        let mut expand=seeds.iter().take(6).map(|(id,_)|*id).collect::<Ve
 new='''        // Packet assembly exposes at most four primary roots. Expanding
         // dependencies from lower-ranked fifth/sixth recall seeds adds parse
         // work that cannot become a primary working-set root unless reached by
-        // a verified edge from a stronger seed. Keep four seed frontiers; direct
+        // a verified edge from a stronger seed. Keep five seed frontiers; direct
         // dependencies still recurse for three bounded rounds below.
-        let mut expand=seeds.iter().take(4).map(|(id,_)|*id).collect::<Vec<_>>();'''
+        let mut expand=seeds.iter().take(5).map(|(id,_)|*id).collect::<Vec<_>>();'''
 s=sub(s,old,new)
 p.write_text(s,encoding="utf-8")
-print("Dependency discovery fan-out reduced from six recall seeds to four; depth and closure unchanged.")
+print("Dependency discovery fan-out reduced from six recall seeds to five; depth and closure unchanged.")
