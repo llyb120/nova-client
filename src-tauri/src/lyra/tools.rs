@@ -86,6 +86,12 @@ pub fn tool_set(
         })),
     });
     if !read_only {
+        let operator = crate::operator::tool_definition();
+        tools.push(Tool {
+            name: "operator",
+            description: operator["description"].as_str().unwrap().into(),
+            parameters: schema(operator["inputSchema"].clone()),
+        });
         let webview = crate::native_browser::tool_definition();
         tools.push(Tool { name: "webview", description: webview["description"].as_str().unwrap().into(), parameters: schema(webview["inputSchema"].clone()) });
         let desktop = crate::jianlai::tool_definition();
@@ -536,6 +542,9 @@ async fn execute_inner(
     owner: &str,
 ) -> ToolOutcome {
     match name {
+        "operator" => {
+            ToolOutcome::error("operator 必须由 agent 运行时直接调度，不能作为普通工具递归执行")
+        }
         "webview" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，网页控制不可用"); }
             match crate::native_browser::execute(root, args).await {
@@ -731,7 +740,7 @@ mod embedded_rtk_tests {
     async fn image_tools_work_without_polaris_and_are_blocked_in_read_only_mode() {
         for read_only in [false, true] {
             let tools = tool_set(read_only, false, false);
-            for name in ["generate_image", "edit_image", "jianlai"] {
+            for name in ["generate_image", "edit_image", "jianlai", "operator"] {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
         }
