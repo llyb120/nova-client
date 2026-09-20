@@ -7,7 +7,7 @@ import hashlib
 p=Path("src-tauri/src/nova_tools_native/polaris_demand_v2.rs")
 b=p.read_bytes()
 got=hashlib.sha1(b"blob "+str(len(b)).encode()+b"\0"+b).hexdigest()
-assert got=="3c814ff3e30916e15b7e357bda2338a52c4aa341",got
+assert got=="0f5fe46653dd5248151468b0e32e536ce280681f",got
 s=b.decode("utf-8")
 old="const INITIAL_FILES: usize = 16;"
 assert s.count(old)==1
