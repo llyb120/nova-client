@@ -71,6 +71,7 @@ new=r'''            let first=s.ln.saturating_sub(1);let end=s.end.min(file.sour
                 ranked.push((id,s.ln,score/(1.0+0.04*((end-first) as f64/80.0).ln_1p()),covered));
             }'''
 s=sub(s,old,new)
+s=sub(s,'''        if file.names.is_empty()&&!file.source.is_empty(){ranked.push((id,1,row.score));}''','''        if file.names.is_empty()&&!file.source.is_empty(){ranked.push((id,1,row.score,0));}''')
 s=sub(s,'''    ranked.sort_by(|a,b|b.2.total_cmp(&a.2).then(rows[a.0].file.cmp(&rows[b.0].file)).then(a.1.cmp(&b.1)));''','''    ranked.sort_by(|a,b|b.2.total_cmp(&a.2).then(rows[a.0].file.cmp(&rows[b.0].file)).then(a.1.cmp(&b.1)));''')
 # Adapt callers' relevance tuple lookup.
 s=sub(s,'''            let relevance=ranked.iter().find(|r|r.0==id&&r.1==symbol.ln).map(|r|r.2).unwrap_or(0.0);''','''            let relevance=ranked.iter().find(|r|r.0==id&&r.1==symbol.ln).map(|r|r.2).unwrap_or(0.0);''')
