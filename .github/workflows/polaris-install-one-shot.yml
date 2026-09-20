@@ -1,0 +1,162 @@
+name: Validate and land accepted Polaris working sets
+on:
+  push:
+    branches: [perf/polaris-semantic-20260919]
+    paths: [.github/workflows/polaris-install-one-shot.yml]
+permissions:
+  contents: read
+  actions: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 3
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-one-shot-results
+          run-id: 35483102649
+          github-token: ${{ github.token }}
+          path: _accepted
+      - name: Verify accepted identity and apply only the reviewed source patch
+        run: |
+          set -euo pipefail
+          mkdir -p validation .cargo
+          python - <<'PY'
+          import pathlib,json,hashlib,subprocess
+          root=pathlib.Path('_accepted')
+          assert (root/'base-commit.txt').read_text().strip()=='7e52dab64de62b7bccad2f5f5e6ca9b5e5d11b45'
+          assert json.loads((root/'acceptance.json').read_text())['passed'] is True
+          patch=root/'production.patch'
+          assert hashlib.sha256(patch.read_bytes()).hexdigest()=='999b47ca72854168750d018dacd7018ca7d365608b128e9197b0900906c43a25'
+          allowed={'scripts/ctx-core.mjs','scripts/polaris-one-shot-edit.py','scripts/polaris-query.mjs','src-tauri/src/lyra/tools.rs'}
+          allowed.update('src-tauri/src/nova_tools_native/'+n+'.rs' for n in ['polaris','polaris_demand_v2','polaris_index','polaris_packet','polaris_query','polaris_rank','polaris_scan'])
+          paths={line.split(' b/',1)[1] for line in patch.read_text().splitlines() if line.startswith('diff --git ')}
+          assert paths==allowed,(paths,allowed)
+          subprocess.run(['git','apply','--check',str(patch)],check=True)
+          subprocess.run(['git','apply',str(patch)],check=True)
+          checked={}
+          for line in (root/'source-hashes.txt').read_text().splitlines():
+              digest,name=line.split(None,1);p=pathlib.Path(name)
+              assert not p.is_absolute() and '..' not in p.parts
+              actual=hashlib.sha256(p.read_bytes()).hexdigest();assert actual==digest,name;checked[name]=actual
+          pathlib.Path('validation/source-hashes.json').write_text(json.dumps(checked,indent=2))
+          PY
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          git rev-parse HEAD > validation/base-commit.txt
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            bench/polaris-harness -> target
+            src-tauri -> target
+          cache-on-failure: true
+      - name: Linux search dependency
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y ripgrep
+      - name: Windows search dependency
+        if: runner.os == 'Windows'
+        run: choco install ripgrep -y --no-progress
+      - name: Compile and run the actual accepted retrieval source
+        run: |
+          set -euo pipefail
+          cargo clean --release --manifest-path bench/polaris-harness/Cargo.toml -p polaris-harness
+          cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
+          node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs scripts/ctx-core.test.mjs 2>&1 | tee validation/node-tests.txt
+      - name: Windows SDK and front-end typecheck
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run build:sdk-bridges 2>&1 | tee validation/sdk-build.txt
+          npm run check 2>&1 | tee validation/typecheck.txt
+      - name: Windows complete application library check
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          cargo check --manifest-path src-tauri/Cargo.toml --lib 2>&1 | tee validation/native-check.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-accepted-${{ matrix.os }}
+          path: validation/
+          retention-days: 7
+  land:
+    needs: verify
+    if: github.ref == 'refs/heads/perf/polaris-semantic-20260919' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-one-shot-results
+          run-id: 35483102649
+          github-token: ${{ github.token }}
+          path: _accepted
+      - name: Land exact tested files, with no force-push or release
+        run: |
+          set -euo pipefail
+          remote=$(git ls-remote origin refs/heads/perf/polaris-semantic-20260919 | cut -f1)
+          test "$remote" = "$GITHUB_SHA" || { echo 'Branch advanced; refusing to overwrite'; exit 1; }
+          python3 - <<'PY'
+          import pathlib,json,hashlib,subprocess
+          root=pathlib.Path('_accepted');patch=root/'production.patch'
+          assert (root/'base-commit.txt').read_text().strip()=='7e52dab64de62b7bccad2f5f5e6ca9b5e5d11b45'
+          assert json.loads((root/'acceptance.json').read_text())['passed'] is True
+          assert hashlib.sha256(patch.read_bytes()).hexdigest()=='999b47ca72854168750d018dacd7018ca7d365608b128e9197b0900906c43a25'
+          subprocess.run(['git','apply','--check',str(patch)],check=True)
+          subprocess.run(['git','apply',str(patch)],check=True)
+          for line in (root/'source-hashes.txt').read_text().splitlines():
+              digest,name=line.split(None,1);p=pathlib.Path(name)
+              assert not p.is_absolute() and '..' not in p.parts
+              assert hashlib.sha256(p.read_bytes()).hexdigest()==digest,name
+          # Subsequent read-only comparisons test installed source, not migrations.
+          p=pathlib.Path('.github/workflows/polaris-one-shot.yml');s=p.read_text()
+          a=s.index('          for script in ');b=s.index('          done\n',a)+len('          done\n')
+          block=s[a:b]
+          s=s[:a]+'''          if ! grep -Fq 'mod packet {include!' src-tauri/src/nova_tools_native/polaris.rs; then
+          '''+'\n'.join('  '+line for line in block.splitlines())+'\n          fi\n'+s[b:]
+          p.write_text(s)
+          paths=[line.split(' b/',1)[1] for line in patch.read_text().splitlines() if line.startswith('diff --git ')]
+          subprocess.run(['git','add','--',*paths,'.github/workflows/polaris-one-shot.yml'],check=True)
+          PY
+          git diff --exit-code -- src-tauri/src/lyra/reasonix.rs
+          git rm .github/workflows/polaris-install-one-shot.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'perf(polaris): deliver query-first editable working sets with bounded dependency closure'
+          git push origin HEAD:perf/polaris-semantic-20260919
+          mkdir -p validation
+          git rev-parse HEAD > validation/landed-commit.txt
+          git show --stat --oneline HEAD > validation/landed-files.txt
+          cp _accepted/source-hashes.txt validation/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-landed-source
+          path: validation/
+          retention-days: 7
