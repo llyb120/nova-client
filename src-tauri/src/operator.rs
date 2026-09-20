@@ -255,6 +255,12 @@ pub(crate) async fn run(root: &Path, args: &Value, parent_thread_id: &str) -> Re
         if parent.operator_thread {
             return Err("Operator 子会话不能递归创建 Operator".into());
         }
+        if parent.is_roaming_guest() {
+            return Err("漫游 guest 会话的真实执行在对端；请继续使用当前会话原生 GUI 工具".into());
+        }
+        if parent.is_quota_borrowed() {
+            return Err("额度租借会话必须保持独立租借凭证；请继续使用当前会话原生 GUI 工具".into());
+        }
         if !same_root(&parent.cwd, root) {
             return Err("operator 工作目录与父会话不一致，请在当前会话目录中调用".into());
         }
@@ -267,6 +273,10 @@ pub(crate) async fn run(root: &Path, args: &Value, parent_thread_id: &str) -> Re
             parent.reasoning_effort.clone(),
             true,
         );
+        // Reuse an already-resolved Auto route instead of paying for a second router lookup.
+        child.auto_route_selection = parent.auto_route_selection.clone();
+        child.auto_routed_model = parent.auto_routed_model.clone();
+        child.auto_routed_label = parent.auto_routed_label.clone();
         child.title = format!(
             "[Operator] {}",
             args.get("goal")
