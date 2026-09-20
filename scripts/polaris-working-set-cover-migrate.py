@@ -15,7 +15,7 @@ def sub(s,a,b):
     return s.replace(a,b)
 
 p,s=load("polaris_demand_v2.rs","82626c7fa9538fd54011cb08b5163a15d92f07fb")
-old='''            let first=s.ln.saturating_sub(1);let end=s.end.min(file.source.len());if first>=end{continue;}
+old=r'''            let first=s.ln.saturating_sub(1);let end=s.end.min(file.source.len());if first>=end{continue;}
             let body=file.source[first..end.min(first+320)].join("\n");
             let header=file.source[first.saturating_sub(4)..(first+4).min(end)].join("\n");
             let matched=matcher.matches(&body);let head=matcher.matches(&header);
@@ -25,7 +25,7 @@ old='''            let first=s.ln.saturating_sub(1);let end=s.end.min(file.sourc
                 if head.matched(i){score+=weight*idf[i]*2.0;}
                 if matched.matched(i){score+=weight*idf[i];}
             }'''
-new='''            let first=s.ln.saturating_sub(1);let end=s.end.min(file.source.len());if first>=end{continue;}
+new=r'''            let first=s.ln.saturating_sub(1);let end=s.end.min(file.source.len());if first>=end{continue;}
             // Natural-language intent is often documented immediately above a
             // function while the implementation itself contains only generic
             // API names. Final CodeUnits already preserve up to eight leading
@@ -54,7 +54,7 @@ s=sub(s,old,new)
 # leading comment disambiguates which behavior the natural-language request means.
 anchor='''#[cfg(test)]
 mod demand_tests {'''
-tests='''#[cfg(test)] mod comment_intent_selection_tests {
+tests=r'''#[cfg(test)] mod comment_intent_selection_tests {
     use super::*;
     #[test] fn leading_comment_selects_the_behavior_not_generic_neighbor() {
         let d=tempfile::tempdir().unwrap();
