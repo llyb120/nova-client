@@ -1,0 +1,151 @@
+name: Polaris text recall compatibility
+on:
+  push:
+    branches: [perf/polaris-semantic-20260919]
+    paths:
+      - .github/workflows/polaris-text-recall.yml
+      - scripts/polaris-text-recall-*.py
+      - src-tauri/src/nova_tools_native/polaris_text.rs
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: polaris-text-recall-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+env:
+  PYTHONUTF8: '1'
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        if: runner.os == 'Linux'
+        with:
+          ref: 3da28d30f1adfd0da3b993813a47aa3fff20fdeb
+          path: _corpus
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: polaris-one-shot-results
+          run-id: 35483102649
+          github-token: ${{ github.token }}
+          path: _accepted
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/polaris-harness -> target
+          cache-on-failure: true
+      - name: Search dependency (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y ripgrep
+      - name: Search dependency (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ripgrep -y --no-progress
+      - name: Apply exact candidate and record production patch
+        run: |
+          set -euo pipefail
+          mkdir -p validation .cargo
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          python scripts/polaris-text-recall-migrate.py
+          git diff -- src-tauri/src/nova_tools_native > validation/production.patch
+          git diff --exit-code -- src-tauri/src/lyra/reasonix.rs src-tauri/src/nova_tools_native/context.rs
+          git rev-parse HEAD > validation/tested-base.txt
+          python - <<'PY'
+          import pathlib,hashlib,json
+          files=list(pathlib.Path('src-tauri/src/nova_tools_native').glob('polaris*.rs'))
+          files.append(pathlib.Path('src-tauri/src/lyra/reasonix.rs'))
+          pathlib.Path('validation/source-hashes.json').write_text(json.dumps({str(p).replace('\\','/'):hashlib.sha256(p.read_bytes()).hexdigest() for p in files},indent=2))
+          PY
+      - name: All production retrieval and routing regressions
+        run: |
+          set -euo pipefail
+          cargo clean --release --manifest-path bench/polaris-harness/Cargo.toml -p polaris-harness
+          cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
+          node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs scripts/ctx-core.test.mjs 2>&1 | tee validation/node-tests.txt
+          cargo build --release --manifest-path bench/polaris-harness/Cargo.toml
+      - name: Same-query old-hit compatibility and unchanged code labels
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          python scripts/polaris-text-recall-ab.py --accepted _accepted --candidate bench/polaris-harness/target/release/polaris-harness --corpus _corpus | tee validation/compatibility.txt
+          python scripts/polaris-one-shot-edit.py --binary bench/polaris-harness/target/release/polaris-harness | tee validation/context-only-edit.txt
+      - name: Capture exact candidate source and binary
+        if: always()
+        run: |
+          mkdir -p validation/source validation/bin
+          cp src-tauri/src/nova_tools_native/polaris*.rs validation/source/
+          if test -f bench/polaris-harness/target/release/polaris-harness; then cp bench/polaris-harness/target/release/polaris-harness validation/bin/; fi
+          if test -f bench/polaris-harness/target/release/polaris-harness.exe; then cp bench/polaris-harness/target/release/polaris-harness.exe validation/bin/; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-text-recall-${{ matrix.os }}
+          path: validation/
+          retention-days: 7
+  land:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-text-recall-ubuntu-24.04
+          path: _verified
+      - name: Commit only verified source, never workflow or release files
+        run: |
+          set -euo pipefail
+          remote=$(git ls-remote origin refs/heads/perf/polaris-semantic-20260919 | cut -f1)
+          test "$remote" = "$GITHUB_SHA" || { echo 'Branch changed; refusing overwrite'; exit 1; }
+          python - <<'PY'
+          import pathlib,hashlib,json,subprocess
+          r=pathlib.Path('_verified')
+          assert (r/'tested-base.txt').read_text().strip()==subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          assert json.loads((r/'text-recall/report.json').read_text())['passed'] is True
+          patch=r/'production.patch'
+          allowed={'src-tauri/src/nova_tools_native/'+n+'.rs' for n in ['polaris','polaris_demand_v2','polaris_packet','polaris_text']}
+          paths={line.split(' b/',1)[1] for line in patch.read_text().splitlines() if line.startswith('diff --git ')}
+          assert paths==allowed,(paths,allowed)
+          subprocess.run(['git','apply','--check',str(patch)],check=True)
+          subprocess.run(['git','apply',str(patch)],check=True)
+          for name,digest in json.loads((r/'source-hashes.json').read_text()).items():
+              path=pathlib.Path(name);assert not path.is_absolute() and '..' not in path.parts
+              assert hashlib.sha256(path.read_bytes()).hexdigest()==digest,name
+          subprocess.run(['git','add','--',*sorted(paths)],check=True)
+          PY
+          git rm scripts/polaris-text-recall-migrate.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(polaris): restore literal SQL and non-declaration recall without extra agent turns'
+          git push origin HEAD:perf/polaris-semantic-20260919
+          mkdir -p validation
+          git rev-parse HEAD > validation/landed-commit.txt
+          cp _verified/source-hashes.json validation/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-text-recall-landed
+          path: validation/
+          retention-days: 7
