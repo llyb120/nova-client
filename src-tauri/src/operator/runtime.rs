@@ -597,8 +597,19 @@ async fn run_phase(
             if let Err(error) = &output {
                 if transient_observation(error) && observation_retries < 2 {
                     observation_retries += 1;
-                    pending_observation = Some(d.clone());
-                    live.task.lock().unwrap().current = None;
+                    // Progress was committed before the first read attempt. Retry
+                    // only the read, never claims tied to the now-cleared evidence.
+                    let mut retry = d.clone();
+                    retry.checkpoint = None;
+                    retry.checkpoint_patch = None;
+                    retry.verified.clear();
+                    retry.evidence_id = None;
+                    pending_observation = Some(retry);
+                    {
+                        let mut t = live.task.lock().unwrap();
+                        t.current = None;
+                        t.progress.invalidate();
+                    }
                     last_decision_error = Some("Read-only observation changed during capture; no input sent. Request a fresh observation.".into());
                     retry_delay(b, live, deadline, observation_retries).await?;
                     continue;

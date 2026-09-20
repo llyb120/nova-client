@@ -1,6 +1,10 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
-fn setup(decide: Decide, reads: Arc<AtomicUsize>, fail_first: bool) -> (PathBuf, Registration) {
+fn setup(
+    decide: Decide,
+    reads: Arc<AtomicUsize>,
+    fail_at: Option<usize>,
+) -> (PathBuf, Registration) {
     let root = std::env::temp_dir().join(format!("operator-latency-{}", Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
     let r = register(
@@ -20,7 +24,7 @@ fn setup(decide: Decide, reads: Arc<AtomicUsize>, fail_first: bool) -> (PathBuf,
                 let n = reads.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async move {
                     assert_ne!(p["operation"], "act");
-                    if fail_first && n == 0 {
+                    if fail_at == Some(n) {
                         return Err("viewport changed during capture".into());
                     }
                     Ok(json!({"snapshotId":"fresh","tabTag":"t1","dom":"expected"}))
@@ -50,7 +54,7 @@ async fn bound_target_is_observed_without_a_model_roundtrip() {
             })
         }),
         reads.clone(),
-        false,
+        None,
     );
     let result = execute(&r.scope, &root, &request()).await.unwrap();
     assert_eq!(result["status"], "completed");
@@ -70,10 +74,41 @@ async fn read_only_capture_retry_does_not_ask_model_to_retry() {
             })
         }),
         reads.clone(),
-        true,
+        Some(0),
     );
     let result = execute(&r.scope, &root, &request()).await.unwrap();
     assert_eq!(result["status"], "completed");
     assert_eq!(reads.load(Ordering::SeqCst), 2);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn read_retry_drops_already_applied_evidence_claims() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let model_calls = calls.clone();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (root, r) = setup(
+        Arc::new(move |i| {
+            let n = model_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let evidence = i.context["currentObservation"]["evidenceId"].clone();
+                if n == 0 {
+                    Ok(json!({"kind":"observe", "params":{"operation":"inspect", "tabTag":"t1"},
+                        "checkpointPatch":{"saved":"keep"},
+                        "verified":[{"criterion":0,"detail":"read before recapture","evidenceId":evidence}]
+                    }).to_string())
+                } else {
+                    assert_eq!(i.context["checkpoint"]["saved"], "keep");
+                    assert_eq!(i.context["progress"]["acceptanceFacts"][0]["stale"], true);
+                    Ok(json!({"kind":"finish","evidenceId":evidence,"result":{}}).to_string())
+                }
+            })
+        }),
+        reads.clone(),
+        Some(1),
+    );
+    let result = execute(&r.scope, &root, &request()).await.unwrap();
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(reads.load(Ordering::SeqCst), 3);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
