@@ -16,6 +16,7 @@ fn err(e: impl std::fmt::Display) -> String {
 // ponytail: one desktop, one outstanding observation and a global try-lock; use a desktop broker if independent seats are needed.
 static DESKTOP: Mutex<Option<Snapshot>> = Mutex::new(None);
 static OBSERVATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+const MAX_CONTINUOUS_ACTIONS: usize = 24;
 
 pub(crate) fn tool_definition() -> Value {
     serde_json::from_str(include_str!("../../scripts/jianlai-tool.json")).unwrap()
@@ -608,6 +609,13 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
     Ok(())
 }
 
+fn validate_action_count(count: usize) -> Result<()> {
+    if count == 0 || count > MAX_CONTINUOUS_ACTIONS {
+        return Err(format!("每次需要1至{MAX_CONTINUOUS_ACTIONS}个动作"));
+    }
+    Ok(())
+}
+
 fn action_delay(actions: &[Action], index: usize) -> Duration {
     // Explicit waits already provide settling time; pointer motion needs no extra delay.
     let redundant = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "wait" | "move")
@@ -832,9 +840,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 .cloned()
                 .ok_or("imageId不属于此截图")?;
             let actions = request.actions.ok_or("缺少actions")?;
-            if actions.is_empty() || actions.len() > 8 {
-                return Err("每次需要1至8个动作".into());
-            }
+            validate_action_count(actions.len())?;
             for (index, a) in actions.iter().enumerate() {
                 if let Err(e) = validate(a, &shot) {
                     return Ok(json!({"status":"not_executed","completedActions":0,
@@ -1077,6 +1083,8 @@ mod tests {
             let batch: Vec<Action> = serde_json::from_value(json!([{ "action": action }])).unwrap();
             assert!(needs_stable_feedback(&batch, false), "{action}");
         }
+        assert!(validate_action_count(MAX_CONTINUOUS_ACTIONS).is_ok());
+        assert!(validate_action_count(MAX_CONTINUOUS_ACTIONS + 1).is_err());
         assert!(run("validation".into(), json!({"operation":"screenshot","windowId":1,"monitorId":2})).is_err());
     }
     #[test]
