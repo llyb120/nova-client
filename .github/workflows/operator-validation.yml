@@ -1,53 +1,84 @@
 name: Operator validation
-
 on:
   push:
     branches: [work/operator-adaptive-pre-release-20260920]
   pull_request:
     branches: [pre-release]
-    paths:
-      - 'src-tauri/src/operator/**'
-      - 'scripts/operator*'
-      - 'bench/operator*'
-      - '.github/workflows/operator-validation.yml'
+    paths: ['src-tauri/src/operator/**', 'src-tauri/src/acp/operator.rs', 'scripts/operator*', 'bench/operator*/**', '.github/workflows/operator-validation.yml']
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: operator-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
-  source-and-node:
+  contracts-and-browser:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Archive tracked source for reproducible local validation
-        run: git archive --format=tar.gz HEAD > operator-source.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: operator-source
-          path: operator-source.tar.gz
-          retention-days: 3
-      - name: Run operator contract tests when present
+        with: {node-version: '22', cache: npm}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Use crates.io
+        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - name: Install Node dependencies
+        run: npm ci
+      - name: Production Operator state tests
         shell: bash
-        run: |
-          shopt -s nullglob
-          tests=(scripts/operator*.test.mjs)
-          if ((${#tests[@]})); then node --test "${tests[@]}"; fi
-      - name: Run three-way replay when present
+        run: set -o pipefail; cargo test --manifest-path bench/operator-replay/Cargo.toml -- --nocapture 2>&1 | tee bench/operator-state-tests.log
+      - name: Three profile synthetic context replay (not live model/GUI)
         shell: bash
-        run: |
-          if test -f bench/operator-ab.mjs; then node bench/operator-ab.mjs; fi
+        run: set -o pipefail; cargo run --release --manifest-path bench/operator-replay/Cargo.toml -- bench/operator-context.report.json 2>&1 | tee bench/operator-replay.log
+      - name: Node transport and baseline contract regressions
+        shell: bash
+        run: set -o pipefail; node --test scripts/operator*.test.mjs scripts/automation-schema.test.mjs scripts/nova-tools-mcp.test.mjs extensions/nova-chrome/worker.test.mjs 2>&1 | tee bench/operator-node-tests.log
+      - name: Real Chromium production page-engine regressions
+        shell: bash
+        env: {TEST_BROWSER: /usr/bin/google-chrome}
+        run: set -o pipefail; node scripts/browser-precision.test.mjs 2>&1 | tee bench/operator-browser-tests.log
+      - name: Frontend typecheck
+        run: npm run check
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: operator-report
-          path: bench/operator*.report.*
-          if-no-files-found: ignore
+          name: operator-contracts-and-browser
+          path: |
+            bench/operator*.log
+            bench/operator*.report.json
+            scripts/browser-precision*.json
+          retention-days: 7
+  windows-native:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: {submodules: recursive}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22', cache: npm}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with: {workspaces: src-tauri -> target}
+      - name: Use crates.io
+        shell: bash
+        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - run: npm ci
+      - run: npm run build
+      - name: Compile full application and test Operator adapters
+        shell: bash
+        run: set -o pipefail; cargo test --manifest-path src-tauri/Cargo.toml --lib operator -- --nocapture 2>&1 | tee bench/operator-windows-tests.log
+      - name: Native desktop guard unit regressions
+        shell: bash
+        run: set -o pipefail; cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai -- --nocapture 2>&1 | tee bench/operator-desktop-unit-tests.log
+      - name: Disposable CI desktop capture and pointer smoke (no clicks/typing)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::desktop_smoke -- --ignored --nocapture 2>&1 | tee bench/operator-ci-desktop-smoke.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-windows-validation
+          path: bench/operator*.log
+          retention-days: 7
