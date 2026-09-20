@@ -77,9 +77,9 @@ jobs:
         if: steps.build.outcome == 'success'
         run: |
           set -euo pipefail
-          test "$(sha256sum _current/bin/polaris-harness | cut -d' ' -f1)" = "462e6ed7223ac058924b574c783dcd2b26d9d4df143a0b21521df19f70a6e53e"
-          chmod +x _current/bin/polaris-harness
-          python scripts/polaris-working-set-cover-ab.py             --current _current/bin/polaris-harness             --candidate validation/bin/candidate             --accepted _accepted             --corpus _corpus | tee validation/working-set-cover-progress.txt
+          test "$(sha256sum _current/bin/candidate | cut -d' ' -f1)" = "b9a550f4c211e7d8b34dd5d3738be18ec2b987f29366f0f6c6f0f7d24258cf2c"
+          chmod +x _current/bin/candidate
+          python scripts/polaris-working-set-cover-ab.py             --current _current/bin/candidate             --candidate validation/bin/candidate             --accepted _accepted             --corpus _corpus | tee validation/working-set-cover-progress.txt
           python scripts/polaris-one-shot-edit.py --binary validation/bin/candidate | tee validation/context-only-edit.txt
           python - <<'PY'
           import json,pathlib
