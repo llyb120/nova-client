@@ -62,6 +62,7 @@ finally{
  await save(out+'/summary.json',report);await save(out+'/transport-audit.json',transportAudit);
  console.log('FINAL '+JSON.stringify({status:report.status,variants:report.variants}));
  if(process.env.GITHUB_STEP_SUMMARY)await appendFile(process.env.GITHUB_STEP_SUMMARY,'## Paired production before/after\n\n```json\n'+JSON.stringify({status:report.status,variants:report.variants},null,2)+'\n```\n');
- if(report.status!=='completed'||report.rows.length!==18||report.rows.some(r=>!r.success))process.exitCode=1;
+ const optimizedRows=report.rows.filter(r=>r.variant==='optimized');
+ if(report.status!=='completed'||report.rows.length!==18||optimizedRows.length!==9||optimizedRows.some(r=>!r.success||r.falseCompletion))process.exitCode=1;
  restore();key=null;
 }
