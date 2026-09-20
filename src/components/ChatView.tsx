@@ -20,6 +20,7 @@ import {
   timeMachineChangedSignal,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
+import { ensureHistoryItems } from "../store";
 import { resolveUserScrollStick } from "../scrollStick";
 import type { AgentKind, Item, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
@@ -621,6 +622,10 @@ export function ChatView() {
     const threadId = state.currentId;
     if (!threadId || restoringCheckpoint()) return;
     if (node.onCurrentPath) {
+      const request = ++previewRequest;
+      try { await ensureHistoryItems(itemsThroughPrompt(state.items as Item[], node.promptCount).map(item => item.id)); }
+      catch { return; }
+      if (request !== previewRequest || state.currentId !== threadId) return;
       switchPreview(itemsThroughPrompt(state.items as Item[], node.promptCount), node.id);
       return;
     }
@@ -969,6 +974,7 @@ export function ChatView() {
             ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
             threadId={state.currentId}
             groups={groups()}
+            loadItems={ensureHistoryItems}
             permissions={permissions()}
             running={isRunning() && !previewItems()}
             loading={state.loadingThread}

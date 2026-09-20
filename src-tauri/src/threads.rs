@@ -223,6 +223,100 @@ fn deduplicate_tool_output(call: &mut ToolCall) {
     }
 }
 
+/// 工具详情展示上限。CodeBuddy 等 SDK 后端的 read 结果可能携带整块大文件文本甚至
+/// 图片 base64，不经截断就进 ToolCall 会让前端详情渲染、画布布局签名和会话落盘全部卡死。
+pub(crate) const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// 超长文本保留尾部（与 acp.rs 的截断策略一致）。
+fn limit_display_text(text: &str) -> String {
+    // 先清除显示副本中的图片编码，再截尾；否则 JSON 的说明和路径全被挤掉。
+    static IMAGE_DATA: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let text = IMAGE_DATA
+        .get_or_init(|| {
+            regex::Regex::new(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=_-]+").unwrap()
+        })
+        .replace_all(text, "[base64 图片数据已省略]");
+    if text.len() <= TOOL_OUTPUT_LIMIT {
+        return text.to_string();
+    }
+    let mut start = text.len().saturating_sub(TOOL_OUTPUT_LIMIT);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "[输出过长，已省略前面内容，仅保留最后 {}KB]\n{}",
+        TOOL_OUTPUT_LIMIT / 1024,
+        &text[start..]
+    )
+}
+
+/// 递归压缩工具输入/输出：字符串限长；图片 base64 对详情展示无意义，整体换成占位说明。
+pub(crate) fn compact_tool_value(value: &Value) -> Value {
+    match value {
+        Value::String(s) => {
+            // ACP 还会把 MCP 图片块序列化进 text，先保留 JSON 结构中的有效元数据。
+            if (s.trim_start().starts_with('{') || s.trim_start().starts_with('['))
+                && s.contains("\"image\"")
+                && s.contains("\"data\"")
+            {
+                if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                    return Value::String(limit_display_text(
+                        &compact_tool_value(&parsed).to_string(),
+                    ));
+                }
+            }
+            Value::String(limit_display_text(s))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(compact_tool_value).collect()),
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("image") {
+                if let Some(data) = map.get("data").and_then(Value::as_str) {
+                    let mut out = map.clone();
+                    out.insert(
+                        "data".into(),
+                        serde_json::json!(format!(
+                            "[base64 图片数据已省略，共 {} 字符]",
+                            data.len()
+                        )),
+                    );
+                    return Value::Object(out);
+                }
+            }
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k.clone(), compact_tool_value(v));
+            }
+            Value::Object(out)
+        }
+        _ => value.clone(),
+    }
+}
+
+pub(crate) fn compact_tool_values(values: &[Value]) -> Vec<Value> {
+    values.iter().map(compact_tool_value).collect()
+}
+
+#[test]
+fn tool_images_are_compacted_before_text_is_truncated() {
+    let encoded = "A".repeat(TOOL_OUTPUT_LIMIT * 2);
+    let result = serde_json::json!([
+        {"type":"text", "text":"动作未执行，请重新截图", "path":"C:/shots/a.png"},
+        {"type":"image_url", "imageUrl":{"url":format!("data:image/png;base64,{encoded}")}},
+        {"type":"image", "data":encoded, "mimeType":"image/png"}
+    ]);
+    for input in [result.clone(), Value::String(result.to_string())] {
+        let output = compact_tool_value(&input).to_string();
+        assert!(output.len() < 1024);
+        assert!(output.contains("动作未执行，请重新截图"));
+        assert!(output.contains("C:/shots/a.png"));
+        assert!(output.contains("图片数据已省略"));
+        assert!(!output.contains("AAAA"));
+    }
+    let unicode = compact_tool_value(&Value::String("界".repeat(TOOL_OUTPUT_LIMIT)));
+    assert!(unicode.as_str().unwrap().ends_with('界'));
+    assert!(unicode.as_str().unwrap().len() < TOOL_OUTPUT_LIMIT + 128);
+}
+
 fn deduplicate_thread_outputs(thread: &mut Thread) {
     for item in &mut thread.items {
         if let Item::Tool { call, .. } = item {
@@ -1190,6 +1284,8 @@ struct DirtyThreads {
 /// 一次后台持久化的不可变会话快照。快照在 ThreadStore 锁内只做必要 clone，
 /// JSON 序列化与文件 IO 均在锁外的 blocking worker 完成。
 pub struct ThreadPersistSnapshot {
+    writer: Arc<Mutex<u64>>,
+    revision: u64,
     dir: PathBuf,
     threads: Vec<Thread>,
     requested_ids: HashSet<String>,
@@ -1197,6 +1293,8 @@ pub struct ThreadPersistSnapshot {
 }
 
 pub struct ThreadStore {
+    writer: Arc<Mutex<u64>>,
+    revision: std::sync::atomic::AtomicU64,
     dir: PathBuf,
     pub threads: Vec<Thread>,
     /// 待落盘会话。普通会话更新只登记对应 id；结构变化（迁移/删除）登记 full。
@@ -1209,49 +1307,70 @@ impl ThreadStore {
     pub fn load(data_dir: PathBuf) -> Self {
         let dir = data_dir.join("threads");
         let legacy_path = data_dir.join("threads.json");
-        let threads = if legacy_path.exists() {
+        let mut legacy = false;
+        let mut legacy_blocked = false;
+        let mut threads = Self::load_split_threads(&dir);
+        if legacy_path.exists() {
             match fs::read_to_string(&legacy_path)
-                .ok()
-                .and_then(|text| serde_json::from_str::<StoreFile>(&text).ok())
-            {
-                Some(mut file) => {
-                    match Self::serialize_threads(&dir, &mut file.threads)
-                        .and_then(|files| Self::write_files(&dir, &files))
-                    {
-                        Ok(()) => {
-                            let backup = legacy_path.with_extension("json.backup");
-                            if backup.exists() {
-                                let _ = fs::remove_file(&backup);
-                            }
-                            if let Err(error) = fs::rename(&legacy_path, &backup) {
+                .map_err(|e| e.to_string())
+                .and_then(|text| {
+                    serde_json::from_str::<StoreFile>(&text).map_err(|e| e.to_string())
+                }) {
+                Ok(file) => {
+                    legacy = true;
+                    // A partially completed migration may already have newer per-thread commits.
+                    for thread in file.threads {
+                        if !threads.iter().any(|existing| existing.id == thread.id) {
+                            if dir.join(Self::thread_file_name(&thread.id)).exists() {
+                                // An unreadable/newer-format live file is not permission to overwrite it.
+                                legacy_blocked = true;
                                 eprintln!(
-                                    "[threads] 已完成拆分，但备份旧 threads.json 失败：{error}"
+                                    "[threads] 保留旧集合及无法读取的同名会话：{}",
+                                    thread.id
                                 );
-                            } else {
-                                eprintln!(
-                                    "[threads] 已将 threads.json 迁移为每会话一文件，旧文件备份到 {}",
-                                    backup.display()
-                                );
+                                continue;
                             }
+                            threads.push(thread);
                         }
-                        Err(error) => eprintln!("[threads] 迁移 threads.json 失败：{error}"),
                     }
-                    file.threads
                 }
-                None => {
-                    eprintln!("[threads] 无法解析 threads.json，保留原文件并尝试读取拆分会话");
-                    Self::load_split_threads(&dir)
-                }
+                Err(error) => eprintln!("[threads] 无法读取旧会话，保留原文件：{error}"),
             }
-        } else {
-            Self::load_split_threads(&dir)
-        };
+        }
         let mut store = ThreadStore {
             dir,
             threads,
+            writer: Arc::new(Mutex::new(0)),
+            revision: std::sync::atomic::AtomicU64::new(0),
             dirty: Arc::new(Mutex::new(DirtyThreads::default())),
             save_notify: Arc::new(Notify::new()),
         };
+        // Migrate one conversation at a time, without cloning the entire historical store.
+        let mut migrated = !legacy_blocked;
+        let mut retry_ids = Vec::new();
+        for thread in &mut store.threads {
+            let path = store.dir.join(Self::thread_file_name(&thread.id));
+            if legacy || !crate::thread_storage::is_chunked(&path) {
+                if let Err(error) = crate::thread_storage::write(&path, thread) {
+                    eprintln!("[threads] 会话迁移失败，保留原数据：{error}");
+                    migrated = false;
+                    retry_ids.push(thread.id.clone());
+                }
+            }
+        }
+        for id in retry_ids {
+            store.save_thread(&id);
+        }
+        if legacy && migrated {
+            let backup = if legacy_path.with_extension("json.backup").exists() {
+                legacy_path.with_extension(format!("json.backup-{}", uuid::Uuid::new_v4()))
+            } else {
+                legacy_path.with_extension("json.backup")
+            };
+            if let Err(error) = fs::rename(&legacy_path, backup) {
+                eprintln!("[threads] 旧会话备份失败：{error}");
+            }
+        }
         // 上次进程未正常退出时残留的临时会话，启动时一并清掉
         if !store.purge_ephemeral().is_empty() {
             store.save();
@@ -1270,14 +1389,16 @@ impl ThreadStore {
                 if path.extension() != Some(OsStr::new("json")) {
                     return None;
                 }
-                fs::read_to_string(&path).ok().and_then(|text| {
-                    serde_json::from_str::<Thread>(&text)
-                        .ok()
-                        .map(|mut thread| {
-                            deduplicate_thread_outputs(&mut thread);
-                            thread
-                        })
-                })
+                match crate::thread_storage::read(&path) {
+                    Ok(mut thread) => {
+                        deduplicate_thread_outputs(&mut thread);
+                        Some(thread)
+                    }
+                    Err(error) => {
+                        eprintln!("[threads] 保留无法读取的会话 {}: {error}", path.display());
+                        None
+                    }
+                }
             })
             .collect();
         threads.sort_by_key(|thread| thread.created_at);
@@ -1298,21 +1419,6 @@ impl ThreadStore {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         format!("encoded-{encoded}.json")
-    }
-
-    fn serialize_threads(
-        dir: &Path,
-        threads: &mut [Thread],
-    ) -> Result<Vec<(PathBuf, String)>, String> {
-        threads
-            .iter_mut()
-            .map(|thread| {
-                deduplicate_thread_outputs(thread);
-                serde_json::to_string(thread)
-                    .map(|json| (dir.join(Self::thread_file_name(&thread.id)), json))
-                    .map_err(|error| error.to_string())
-            })
-            .collect()
     }
 
     /// 删除所有临时会话，返回被删掉的会话（调用方负责清理其工作目录等）
@@ -1371,6 +1477,11 @@ impl ThreadStore {
                 .collect()
         };
         Some(ThreadPersistSnapshot {
+            writer: self.writer.clone(),
+            revision: self
+                .revision
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1,
             dir: self.dir.clone(),
             threads,
             requested_ids,
@@ -1396,84 +1507,55 @@ impl ThreadStore {
         self.save_notify.clone()
     }
 
-    /// 序列化当前全部会话为独立的紧凑 JSON（同步退出/迁移路径）。
-    pub fn serialize_files(&mut self) -> Option<Vec<(PathBuf, String)>> {
-        Self::serialize_threads(&self.dir, &mut self.threads).ok()
-    }
-
-    fn write_file_batch(
-        dir: &Path,
-        files: &[(PathBuf, String)],
-        cleanup_all: bool,
-        requested_ids: &HashSet<String>,
-    ) -> Result<(), String> {
-        fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-        for (path, json) in files {
-            let tmp = path.with_extension("json.tmp");
-            fs::write(&tmp, json).map_err(|error| error.to_string())?;
-            if let Err(first_error) = fs::rename(&tmp, path) {
-                if path.exists() {
-                    fs::remove_file(path).map_err(|error| error.to_string())?;
-                    fs::rename(&tmp, path).map_err(|error| error.to_string())?;
-                } else {
-                    return Err(first_error.to_string());
-                }
-            }
+    /// Single writer plus monotonically increasing snapshots prevents a background save
+    /// from overwriting the newer synchronous exit/update snapshot.
+    pub fn write_persist_snapshot(snapshot: &mut ThreadPersistSnapshot) -> Result<(), String> {
+        let mut committed = snapshot.writer.lock().map_err(|e| e.to_string())?;
+        if snapshot.revision <= *committed {
+            return Ok(());
         }
-
-        if cleanup_all {
-            let expected: HashSet<&Path> = files.iter().map(|(path, _)| path.as_path()).collect();
-            for entry in fs::read_dir(dir)
-                .map_err(|error| error.to_string())?
-                .flatten()
-            {
-                let path = entry.path();
-                if path.extension() == Some(OsStr::new("json"))
-                    && !expected.contains(path.as_path())
-                {
-                    fs::remove_file(path).map_err(|error| error.to_string())?;
-                }
-            }
+        fs::create_dir_all(&snapshot.dir).map_err(|e| e.to_string())?;
+        let mut expected = HashSet::new();
+        for thread in &mut snapshot.threads {
+            deduplicate_thread_outputs(thread);
+            let path = snapshot.dir.join(Self::thread_file_name(&thread.id));
+            crate::thread_storage::write(&path, thread)?;
+            expected.insert(path);
+        }
+        let candidates: Vec<PathBuf> = if snapshot.full {
+            fs::read_dir(&snapshot.dir)
+                .map_err(|e| e.to_string())?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension() == Some(OsStr::new("json")))
+                .collect()
         } else {
-            let written = files
+            snapshot
+                .requested_ids
                 .iter()
-                .filter_map(|(path, _)| path.file_name())
-                .collect::<HashSet<_>>();
-            for id in requested_ids {
-                let file_name = Self::thread_file_name(id);
-                if !written.contains(OsStr::new(&file_name)) {
-                    let path = dir.join(file_name);
-                    if path.exists() {
-                        fs::remove_file(path).map_err(|error| error.to_string())?;
-                    }
-                }
+                .map(|id| snapshot.dir.join(Self::thread_file_name(id)))
+                .collect()
+        };
+        for path in candidates {
+            // Never delete an unreadable historical file that failed to enter the in-memory store.
+            if !expected.contains(&path)
+                && path.exists()
+                && crate::thread_storage::read(&path).is_ok()
+            {
+                fs::remove_file(&path).map_err(|e| e.to_string())?;
+                // Keep backups/assets for trash and recovery; the absent live index is the tombstone.
             }
         }
+        *committed = snapshot.revision;
         Ok(())
     }
 
-    /// 在 ThreadStore 锁外序列化并原子写入一次快照。
-    pub fn write_persist_snapshot(snapshot: &mut ThreadPersistSnapshot) -> Result<(), String> {
-        let files = Self::serialize_threads(&snapshot.dir, &mut snapshot.threads)?;
-        Self::write_file_batch(
-            &snapshot.dir,
-            &files,
-            snapshot.full,
-            &snapshot.requested_ids,
-        )
-    }
-
-    /// 原子写入全量会话快照，并删除已不在快照中的旧会话文件。
-    pub fn write_files(dir: &Path, files: &[(PathBuf, String)]) -> Result<(), String> {
-        Self::write_file_batch(dir, files, true, &HashSet::new())
-    }
-
-    /// 立即同步落盘（进程退出/升级重启前的最终保存），并清除脏标记
     pub fn save_now(&mut self) {
-        *self.dirty.lock().unwrap() = DirtyThreads::default();
-        if let Some(files) = self.serialize_files() {
-            if let Err(error) = Self::write_files(&self.dir, &files) {
+        self.save();
+        if let Some(mut snapshot) = self.take_persist_snapshot() {
+            if let Err(error) = Self::write_persist_snapshot(&mut snapshot) {
                 eprintln!("[threads] 保存会话失败：{error}");
+                self.retry_persist_snapshot(&snapshot);
             }
         }
     }

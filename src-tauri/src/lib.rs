@@ -33,6 +33,7 @@ mod skills;
 mod sleep_inhibitor;
 mod sys_notify;
 mod threads;
+mod thread_storage;
 mod time_machine;
 mod updater;
 mod workspace_files;
@@ -1100,6 +1101,28 @@ fn get_thread(state: State<'_, AppState>, thread_id: String) -> Result<Thread, S
         .get(&thread_id)
         .cloned()
         .ok_or_else(|| "线程不存在".into())
+}
+
+#[tauri::command]
+async fn get_thread_view(state: State<'_, AppState>, thread_id: String) -> Result<Value, String> {
+    let thread = state.store.lock().unwrap().get(&thread_id).cloned().ok_or("线程不存在")?;
+    let assets = state.config_dir.join("thread-assets");
+    tauri::async_runtime::spawn_blocking(move || thread_storage::view(thread, &assets))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_thread_items(state: State<'_, AppState>, thread_id: String, item_ids: Vec<u64>) -> Result<Vec<Value>, String> {
+    if item_ids.len() > 256 { return Err("一次最多读取 256 条历史记录".into()); }
+    let ids: HashSet<u64> = item_ids.into_iter().collect();
+    let items: Vec<Item> = {
+        let store = state.store.lock().unwrap();
+        let thread = store.get(&thread_id).ok_or("线程不存在")?;
+        thread.items.iter().filter(|item| ids.contains(&item.id())).cloned().collect()
+    };
+    let assets = state.config_dir.join("thread-assets");
+    tauri::async_runtime::spawn_blocking(move || items.into_iter().map(|item| thread_storage::view_item(item, &assets)).collect())
+        .await.map_err(|e| e.to_string())?
 }
 
 /// 项目选择器里的一条最近项目。worktree 非空表示该目录其实是某次会话创建的
@@ -5640,6 +5663,8 @@ pub fn run() {
             list_threads,
             load_threads,
             get_thread,
+            get_thread_view,
+            get_thread_items,
             list_clue_groups,
             get_clue_context,
             capture_clue,

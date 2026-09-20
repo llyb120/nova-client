@@ -16,7 +16,7 @@ test("文件面板开关跨会话保持，重新挂载恢复全局偏好", () =>
   const saved = new Map();
   const storage = { getItem: key => saved.get(key), setItem: (key, value) => saved.set(key, value) };
   const layoutSource = readFileSync(new URL('../src/workspaceLayout.ts', import.meta.url), 'utf8').replace(/^import .*;\r?\n/gm, '').replace(/export /g, '');
-  const loadLayout = () => new Function('createStore', 'localStorage', `${js(layoutSource)}; return {workspaceLayout, setWorkspaceLayout, defaultWorkspaceLayout};`)(createStore, storage);
+  const loadLayout = () => new Function('createStore', 'createSignal', 'localStorage', `${js(layoutSource)}; return {workspaceLayout, setWorkspaceLayout, defaultWorkspaceLayout};`)(createStore, createSignal, storage);
   let layout = loadLayout();
   const [currentId, setCurrentId] = createSignal('a');
   const state = { get currentId() { return currentId(); } };
@@ -126,7 +126,7 @@ test("多 stage 同链反复切换复用导航列表，新增阶段后更新，�
 
 test("队列镜像移除旧 key，清空或挂起后整条链退出室女座", () => {
   const [state, setState] = createStore({ promptQueued: {} });
-  const source = store.slice(store.indexOf("export function setPromptQueuedThreads("), store.indexOf("export async function openThread("));
+  const source = store.slice(store.indexOf("export function setPromptQueuedThreads("), store.indexOf("const historyLoads ="));
   const update = new Function("state", "setState", "reconcile", `${js(source.replace("export ", ""))}; return setPromptQueuedThreads;`)(state, setState, reconcile);
   update(new Set(["child"]));
   const hidden = () => virgoChains({

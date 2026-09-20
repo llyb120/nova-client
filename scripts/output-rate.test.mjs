@@ -69,9 +69,13 @@ dispose();
 // Replay the actual acp:update listener and stream batching, not just the sampler.
 const file = ts.createSourceFile("store.ts", source, ts.ScriptTarget.Latest, true);
 const init = file.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === "initStore");
-const listener = init.body.statements.find((node) => ts.isExpressionStatement(node)
-  && ts.isAwaitExpression(node.expression)
-  && node.expression.expression.arguments?.[0]?.text === "acp:update");
+let listener;
+function findListener(node) {
+  if (ts.isCallExpression(node) && node.expression.getText(file) === "listen"
+    && node.arguments?.[0]?.text === "acp:update") listener = node;
+  ts.forEachChild(node, findListener);
+}
+findListener(init);
 const timer = init.body.statements.find((node) => ts.isExpressionStatement(node)
   && node.expression.expression?.getText(file) === "setInterval");
 assert.ok(listener && timer);
@@ -93,7 +97,7 @@ for (const backend of ["lyra", "codebuddy"]) {
     snapshotToolUpdates: undefined,
   });
   const stream = source.slice(source.indexOf("const pendingDeltas ="), source.indexOf("let initialized ="));
-  const code = `${stream}\n${timer.getText(file)}\n(async () => { ${listener.getText(file)} })()`;
+  const code = `${stream}\n${timer.getText(file)}\n(async () => { await ${listener.getText(file)} })()`;
   await vm.runInContext(ts.transpile(code.replace(/export /g, ""), { target: ts.ScriptTarget.ES2022 }), runtime);
   let visibleRate = 0;
   const stop = createRoot((stop) => {

@@ -6,7 +6,7 @@ import {
 } from "../canvasTranscript/base";
 import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
-import { api } from "../ipc";
+import { api, fileUriPath } from "../ipc";
 import { Portal } from "solid-js/web";
 import { WorkflowPreview } from "./WorkflowPreview";
 import type { WorkflowDef } from "../workflow/types";
@@ -18,7 +18,7 @@ import { LruMap } from "../lruMap";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import { resolveExpandScroll, resolveScrollAfterLayout, resolveUserScrollStick } from "../scrollStick";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
-import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail } from "../utils";
+import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail, toolDisplayText } from "../utils";
 import { createFileContextMenu } from "./FileContextMenu";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
@@ -47,6 +47,7 @@ interface CanvasTranscriptProps {
   preview: boolean;
   onReturnToCurrent: () => void;
   onScroll?: (top: number, max: number, user: boolean) => void;
+  loadItems?: (ids: number[]) => Promise<void>;
   /** 详情开合从 pointerup 吸底流程中退出，避免 click 前滚动导致命中项变化。 */
   onBrowseDetail?: () => void;
   ref?: (handle: CanvasTranscriptHandle) => void;
@@ -428,13 +429,18 @@ const BUBBLE_IMG_MAX_H = 180;
 const BUBBLE_IMG_GAP = 6;
 const BUBBLE_IMG_MARGIN_BOTTOM = 6;
 
+const imageSourceCache = new WeakMap<PromptImage, { data?: string; uri?: string; mimeType: string; src: string }>();
 function promptImageSrc(img: PromptImage): string {
-  return img.data
+  const cached = imageSourceCache.get(img);
+  if (cached && cached.data === img.data && cached.uri === img.uri && cached.mimeType === img.mimeType) return cached.src;
+  const src = img.data
     ? `data:${img.mimeType};base64,${img.data}`
-    : convertFileSrc(decodeURI((img.uri ?? "").replace(/^file:\/\/+/, "")));
+    : convertFileSrc(fileUriPath(img.uri ?? ""));
+  imageSourceCache.set(img, { data: img.data, uri: img.uri, mimeType: img.mimeType, src });
+  return src;
 }
 
-function bubbleImageSize(el: HTMLImageElement | null | undefined, maxW = BUBBLE_IMG_MAX_W): { w: number; h: number } {
+function bubbleImageSize(el: Pick<HTMLImageElement, "naturalWidth" | "naturalHeight"> | null | undefined, maxW = BUBBLE_IMG_MAX_W): { w: number; h: number } {
   const nw = el?.naturalWidth ?? 0;
   const nh = el?.naturalHeight ?? 0;
   if (!nw || !nh) return { w: Math.min(160, Math.round(maxW)), h: 120 };
@@ -450,7 +456,7 @@ interface BubbleImageLayout {
 function layoutBubbleImages(
   images: PromptImage[] | undefined,
   maxInnerW: number,
-  load: (img: PromptImage) => HTMLImageElement | null,
+  load: (img: PromptImage) => Pick<HTMLImageElement, "naturalWidth" | "naturalHeight"> | null,
 ): { layouts: BubbleImageLayout[]; usedW: number; stackH: number; imgMaxW: number } {
   const layouts: BubbleImageLayout[] = [];
   let usedW = 0;
@@ -1182,6 +1188,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // images cache
   const imgCache = new Map<string, HTMLImageElement>();
+  const paintedImageSources = new Set<string>();
+  const imageSizes = new Map<string, Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">>();
+  const toolTextLayouts = new LruMap<string, { lines: string[]; seps: string[] }>(32);
 
   // ─── Layout ────────────────────────────────────────────────────────────────
 
@@ -1308,6 +1317,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
     const scrollBefore = scrollY;
     const measured: [Group, number][] = [];
+    const deferredIds = groups.slice(range.start, range.end).flatMap(group => group.body.filter(item => item.deferred).map(item => item.id));
+    if (deferredIds.length && props.loadItems) {
+      void props.loadItems(deferredIds).catch(() => { /* Visible placeholder offers retry. */ });
+    }
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi];
       nextGroupYs.push(y);
@@ -1317,6 +1330,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
       const groupStart = y;
       const active = running && !g.turn;
+      if (g.body.some(item => item.deferred)) {
+        result.push({ kind: "hint", id: g.body[0]?.id ?? 0, groupIdx: gi,
+          x: side, y, w: contentW, h: 60, text: "正在加载历史内容…（点击重试）",
+          color: p.faint, fontSize: 13, font: p.sans, cursor: "pointer", selectable: false,
+          clickAction: () => { void props.loadItems?.(g.body.filter(item => item.deferred).map(item => item.id)).catch(() => {}); } });
+        y += groupHeights.get(g) ?? 240;
+        continue;
+      }
 
       // user message: .msg-user margin 20px 0 16px; bubble max-width 85%
       if (g.user) {
@@ -1334,7 +1355,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             : sourceText;
           // DOM .bubble-images: flex-wrap, img max 240×180, gap 6, margin-bottom 6
           const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH, imgMaxW } =
-            layoutBubbleImages(item.images, maxBubble - 32, loadImage);
+            layoutBubbleImages(item.images, maxBubble - 32, img => imageSizes.get(promptImageSrc(img)) ?? null);
           // Size to content like DOM (no artificial min-width that leaves empty bubble space).
           const lh = 14 * 1.6;
           let textLayout = userTextLayouts.get(item);
@@ -1725,7 +1746,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const src = transcriptImageSrc(mb.raw ?? "");
           const path = localImagePath(mb.raw ?? "");
           if (src) {
-            loadImageSource(src);
             result.push({ kind: "generated-image", id: item.id, groupIdx: gi,
               x, y, w: Math.min(proseW, 480), h: 300, title: segmentsPlainText(mb.segments),
               data: { src, filePath: path }, cursor: path ? "pointer" : undefined,
@@ -1950,13 +1970,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         } else if (content.type === "content") {
           const inner = (content as { content: { type?: string; text?: string } }).content;
           if (inner?.type === "text" && inner.text?.trim()) {
-            const clean = stripAnsi(inner.text).trim();
-            const lines = wrapText(clean, contentW - 20, 12, p.mono);
+            const clean = toolDisplayText(inner.text);
+            const layoutKey = JSON.stringify([contentW, p.mono, clean]);
+            const full = toolTextLayouts.get(layoutKey) ?? wrapTextFull(clean, contentW - 20, 12, p.mono);
+            // 有界缓存，不保留逐字符 offsets；流式重排复用已完成的工具详情。
+            if (clean.length <= 65536) toolTextLayouts.set(layoutKey, full);
+            const { lines, seps } = full;
             const fullH = lines.length * 12 * 1.55 + 20;
             const h = Math.min(320, fullH);
             result.push({ kind: "tool-content", id: item.id, groupIdx: gi,
               x: contentX, y: by, w: contentW, h,
               text: clean, color: p.dim, fontSize: 12, lineHeight: 1.55, font: p.mono,
+              _lines: lines, _lineSeps: seps,
               bg: p.sidebar, border: p.border, borderRadius: 7, selectable: true,
               data: { padX: 10, padY: 10, fullH, clipped: fullH > 320 } });
             by += h + 8;
@@ -2029,6 +2054,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const visBot = scrollY + viewH + 50;
     spinPhase = (performance.now() / 800) % 1;
     busyBlockIndices.length = 0;
+    paintedImageSources.clear();
 
     for (let i = 0; i < blocks.length; i++) {
       const b = blocks[i];
@@ -2169,6 +2195,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       ctx.restore();
     }
 
+    // 离开视口的原图释放解码内存；保留轻量尺寸，回来时不会重新变成占位布局。
+    for (const [source, image] of imgCache) {
+      if (paintedImageSources.has(source)) continue;
+      image.onload = null;
+      image.src = "";
+      imgCache.delete(source);
+    }
+
     // selection overlay
     if (selection) paintSelection(ctx);
 
@@ -2217,6 +2251,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const imageLayouts = (b.data?.imageLayouts as BubbleImageLayout[] | undefined) ?? [];
     const imgMaxW = (b.data?.imgMaxW as number | undefined) ?? BUBBLE_IMG_MAX_W;
     for (const layout of imageLayouts) {
+      // 单条消息也可能有数百张截图；只解码视口内的图片，尺寸信息独立保留。
+      if (by + layout.dy + layout.h < -50 || by + layout.dy > viewH + 50) continue;
       const cached = loadImage(layout.img);
       if (!cached) continue;
       // 旧占位布局不能混用真实尺寸；等气泡、换行和文字位置一起重排后再绘制。
@@ -2473,7 +2509,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         }
       }
       b.textLines = b._textLines;
-      for (let i = 0; i < lines.length; i++) {
+      const textTop = by + padY - bScroll;
+      const firstLine = Math.max(0, Math.floor((Math.max(-10, by - 10) - textTop) / lh) - 1);
+      const lastLine = Math.min(lines.length, Math.ceil((Math.min(viewH + 10, by + b.h + 10) - textTop) / lh));
+      for (let i = firstLine; i < lastLine; i++) {
         const ty = by + padY + i * lh - bScroll;
         // 块窗口 + 视口双重裁剪，视口外只算坐标不绘制
         if (ty + lh > by - 10 && ty < by + b.h + 10 && ty + lh > -10 && ty < viewH + 10) {
@@ -3518,11 +3557,17 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function loadImageSource(src: string): HTMLImageElement | null {
+    paintedImageSources.add(src);
     let el = imgCache.get(src);
     if (el) return (el as unknown as { _loaded?: boolean })._loaded ? el : null;
     el = new Image();
     (el as unknown as { _loaded?: boolean })._loaded = false;
-    el.onload = () => { (el as unknown as { _loaded?: boolean })._loaded = true; if (!disposed && imgCache.get(src) === el) scheduleRebuild(); };
+    el.onload = () => {
+      if (disposed || imgCache.get(src) !== el) return;
+      (el as unknown as { _loaded?: boolean })._loaded = true;
+      imageSizes.set(src, { naturalWidth: el.naturalWidth, naturalHeight: el.naturalHeight });
+      scheduleRebuild();
+    };
     el.src = src;
     imgCache.set(src, el);
     return null;
@@ -3786,6 +3831,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         void g.user.images?.length;
       }
       for (const item of g.body) {
+        void item.deferred;
         if ("text" in item) void item.text;
         if (item.type === "tool") {
           void item.status;
@@ -3823,6 +3869,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       selStart = null;
       groupYs = [];
       imgCache.clear();
+      imageSizes.clear();
       laidOutStart = laidOutEnd = 0;
       jumpGroup = null;
       keepBottom = true;

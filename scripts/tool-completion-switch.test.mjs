@@ -21,6 +21,15 @@ for (const cached of [false, true]) {
     const thread = { id: "target", items: [running], agentKind: "codex" };
     const state = { currentId: "old", unreadTurns: {}, running: { target: true }, threads: [], items: [] };
     const applyOp = (op) => {
+      if (op.t === "delta") {
+        const item = state.items.find(item => item.id === op.itemId);
+        if (item) item.text += op.text;
+        return;
+      }
+      if (op.t === "remove") {
+        state.items = state.items.filter(item => item.id !== op.itemId);
+        return;
+      }
       const index = state.items.findIndex((item) => item.id === op.item.id);
       if (index < 0) state.items.push(op.item);
       else state.items[index] = op.item;
@@ -32,7 +41,8 @@ for (const cached of [false, true]) {
       state, applyOp, showThreadSnapshot,
       api: {
         reportActivity: () => { calls.push("activate"); return active.promise; },
-        getThread: () => { calls.push("snapshot"); return snapshot.promise; },
+        getThreadView: () => { calls.push("snapshot"); return snapshot.promise; },
+        getThreadItems: async () => [{id: 8, type: "assistant", text: "complete streamed answer", ts: 1000}],
       },
       getThreadSnapshot: () => cached ? structuredClone(thread) : undefined,
       setState: (value) => Object.assign(state, value),
@@ -61,10 +71,12 @@ for (const cached of [false, true]) {
     for (const [id, status] of [[6, "completed"], [7, "failed"]]) {
       receive({ t: "upsert", item: { ...running, id, status, rawOutput: { durationMs: 15535 } } });
     }
+    receive({t: "delta", itemId: 8, text: "streamed answer"});
     snapshot.resolve(structuredClone(thread)); // older in_progress snapshot arrives last
     await opened;
     assert.equal(state.loadingThread, false);
-    assert.deepEqual(state.items.map((item) => item.status), ["completed", "failed"]);
+    assert.deepEqual(state.items.filter(item => item.type === "tool").map((item) => item.status), ["completed", "failed"]);
+    assert.equal(state.items.find(item => item.id === 8)?.text, "complete streamed answer");
     assert.equal(state.items[0].rawOutput.durationMs, 15535);
   });
 }

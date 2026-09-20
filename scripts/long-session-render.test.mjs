@@ -16,6 +16,8 @@ import {CanvasTranscript} from './src/components/CanvasTranscript';
 import './src/app.css';
 const [session,setSession]=createSignal({id:'empty',groups:[]});
 let handle,totalChars=0,reads=new Set(),measures=0,paints=0,maxGap=0,last=performance.now(),frames=0;
+const decodedImages=[];
+window.Image=new Proxy(window.Image,{construct(target,args){const image=Reflect.construct(target,args);decodedImages.push(image);return image}});
 const measure=CanvasRenderingContext2D.prototype.measureText;
 CanvasRenderingContext2D.prototype.measureText=function(text){measures++;return measure.call(this,text)};
 const fill=CanvasRenderingContext2D.prototype.fillText;
@@ -33,9 +35,33 @@ window.load=(id,count)=>{
 };
 window.jump=i=>handle.scrollToGroup(i);
 window.bottom=()=>handle.scrollToBottom();
+window.loadImages=count=>{
+ const images=Array.from({length:count},(_,i)=>({name:'shot-'+i,mimeType:'image/svg+xml',
+  data:btoa('<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="600"><text x="20" y="30">shot '+i+'</text></svg>')}));
+ setSession({id:'screenshots',groups:[{user:{type:'user',id:1,text:'screenshots',images,ts:0},body:[],turn:{type:'turn',id:2,ts:0,stopReason:'end'}}]});
+};
+window.imageStats=()=>({created:decodedImages.length,live:decodedImages.filter(image=>image.getAttribute('src')).length});
+window.topImages=()=>handle.scrollBy(-handle.maxScrollTop());
+let pageReads=[];
+window.loadPaged=()=>{
+ pageReads=[];
+ setSession({id:'paged',groups:Array.from({length:1000},(_,i)=>({
+  user:{type:'user',id:i*3,text:'prompt '+i,ts:0},
+  body:[{type:'assistant',id:i*3+1,ts:0,text:i>970?'last answer':'',deferred:i<=970}],
+  turn:{type:'turn',id:i*3+2,ts:0,durationMs:1,stopReason:'end'}}))});
+};
+const loadItems=async ids=>{
+ const id=session().id; pageReads.push(...ids);
+ await new Promise(resolve=>setTimeout(resolve,40));
+ if(session().id!==id)return;
+ const selected=new Set(ids);
+ setSession(s=>({...s,groups:s.groups.map(g=>g.body.some(item=>selected.has(item.id))
+  ?{...g,body:g.body.map(item=>selected.has(item.id)?{...item,deferred:false,text:'hydrated '+item.id+' content '.repeat(100)}:item)}:g)}));
+};
+window.pageStats=()=>({reads:pageReads,remaining:session().groups.filter(g=>g.body.some(item=>item.deferred)).length});
 window.stats=()=>({totalChars,reads:[...reads],measures,paints,maxGap,frames,top:handle.scrollTop(),max:handle.maxScrollTop(),active:handle.activeGroup()});
 render(()=><div style="height:700px;display:flex"><CanvasTranscript ref={v=>handle=v} threadId={session().id}
- groups={session().groups} permissions={[]} running={false} loading={false} preview={false} onReturnToCurrent={()=>{}} emptyHint="ready"/></div>,document.getElementById('root'));
+ groups={session().groups} loadItems={loadItems} permissions={[]} running={false} loading={false} preview={false} onReturnToCurrent={()=>{}} emptyHint="ready"/></div>,document.getElementById('root'));
 `);
   const port = 15000 + process.pid % 1000;
   server = spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', String(port)], {
@@ -93,6 +119,24 @@ render(()=><div style="height:700px;display:flex"><CanvasTranscript ref={v=>hand
   assert.ok(await page.evaluate(()=>window.stats().active<3));
   await page.setViewportSize({width:1000,height:800});
   await page.waitForTimeout(250);
+  await page.evaluate(()=>window.loadImages(200));
+  await page.waitForTimeout(1000);
+  const bottomImages=await page.evaluate(()=>window.imageStats());
+  assert.ok(bottomImages.created>0&&bottomImages.created<80, 'A single round must not decode every screenshot: '+JSON.stringify(bottomImages));
+  assert.ok(bottomImages.live<30, 'Decoded image cache must follow viewport: '+JSON.stringify(bottomImages));
+  await page.evaluate(()=>window.topImages());
+  await page.waitForTimeout(1000);
+  const topImages=await page.evaluate(()=>window.imageStats());
+  assert.ok(topImages.created>bottomImages.created&&topImages.live<30, 'Scroll must load new screenshots and release old ones: '+JSON.stringify(topImages));
+  results.push({screenshots:200,bottomImages,topImages});
+  await page.evaluate(()=>window.loadPaged());
+  await page.waitForTimeout(200);
+  assert.equal((await page.evaluate(()=>window.pageStats())).reads.length,0,'Latest page must not load old bodies');
+  await page.evaluate(()=>window.jump(500));
+  await page.waitForFunction(()=>window.pageStats().reads.includes(1501)&&window.pageStats().remaining<971);
+  await page.waitForTimeout(300);
+  assert.equal(await page.evaluate(()=>window.stats().active),500,'Hydration must preserve timeline/scroll anchor');
+  assert.ok((await page.evaluate(()=>window.pageStats())).remaining>940,'Only viewport pages should load');
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify(results));
 } finally {

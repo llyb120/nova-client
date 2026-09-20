@@ -8,7 +8,7 @@ import WorkspaceCode from "./WorkspaceCode";
 import WorkspaceGit from "./WorkspaceGit";
 import WorkspaceBrowser from "./WorkspaceBrowser";
 import { api } from "../ipc";
-import { state } from "../store";
+import { state, ensureHistoryItems } from "../store";
 import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
 import { workspaceLayout, setWorkspaceLayout, type WorkspaceMode } from "../workspaceLayout";
 import { collectWorkspaceArtifacts } from "../workspaceArtifacts";
@@ -171,6 +171,12 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   // Restore artifacts when the history snapshot arrives, without subscribing to text deltas.
   createEffect(() => { state.items; state.items.length; state.loadingThread; if (!state.running[props.threadId]) refreshArtifacts(); });
   refreshArtifacts();
+  // Artifact discovery needs old tool bodies too, not only the visible transcript page.
+  createEffect(() => {
+    if (!state.loadingThread && state.currentId === props.threadId) {
+      untrack(() => { void ensureHistoryItems().then(refreshArtifacts).catch(e => setError(String(e))); });
+    }
+  });
   const snapshot = () => {
     const file = preview();
     if (!file) return;

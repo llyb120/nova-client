@@ -1,3 +1,4 @@
+use crate::threads::{compact_tool_value, compact_tool_values};
 use crate::model_cache;
 use crate::nova_data_dir;
 use crate::settings::Settings;
@@ -27,7 +28,6 @@ pub const EV_COMMANDS: &str = "acp:commands";
 pub const EV_NOTIFY_OPEN: &str = "acp:notify-open";
 
 const LOG_CAP: usize = 800;
-const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
 /// session/prompt 发出后允许「零通知」的最长静默；超过即判定连接假死（见 prompt_with_stall_guard）。
 const PROMPT_FIRST_RESPONSE_STALL: Duration = Duration::from_secs(90);
 
@@ -5497,39 +5497,7 @@ fn merge_tool_call(call: &mut ToolCall, update: &Value) {
     }
 }
 
-fn compact_tool_values(values: &[Value]) -> Vec<Value> {
-    values.iter().map(compact_tool_value).collect()
-}
 
-fn compact_tool_value(value: &Value) -> Value {
-    match value {
-        Value::String(s) => Value::String(limit_display_text(s)),
-        Value::Array(items) => Value::Array(items.iter().map(compact_tool_value).collect()),
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                out.insert(k.clone(), compact_tool_value(v));
-            }
-            Value::Object(out)
-        }
-        _ => value.clone(),
-    }
-}
-
-fn limit_display_text(text: &str) -> String {
-    if text.len() <= TOOL_OUTPUT_LIMIT {
-        return text.to_string();
-    }
-    let mut start = text.len().saturating_sub(TOOL_OUTPUT_LIMIT);
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    format!(
-        "[输出过长，已省略前面内容，仅保留最后 {}KB]\n{}",
-        TOOL_OUTPUT_LIMIT / 1024,
-        &text[start..]
-    )
-}
 
 fn normalize_generated_title(raw: &str, fallback: &str) -> String {
     let mut title = raw

@@ -44,7 +44,7 @@ test("长提示词流式重排复用换行，绘制数量仅随视口高度增�
     const userTextLayouts = new WeakMap();
     const copiedCodeUntil = new Map(), requestPaint = () => {};
     return async (item, contentW = 800, font = 'sans', open = true) => {
-      const p = { sans: font }, result = [], side = 0, gi = 0, loadImage = () => null;
+      const p = { sans: font }, result = [], side = 0, gi = 0, imageSizes = new Map(), promptImageSrc = img => img.uri;
       let y = 20;
       const state = { expanded: { ['user-text-'+item.id]: open } }, fmtTokens = String;
       const threadId = 'check', props = { threadId }, disposed = false, W = contentW, viewW = W, pal = p;
@@ -125,6 +125,7 @@ test("图片完成加载但气泡尚未重排时不使用旧位置绘制新尺�
   const draws = [];
   let rebuilds = 0;
   const paint = new Function("loadImage", "scheduleRebuild", "roundRect", `
+    const viewH = 600;
     ${js(section("const BUBBLE_IMG_MAX_W", "function promptImageSrc("))}
     ${js(section("function bubbleImageSize(", "interface BubbleImageLayout"))}
     ${js(section("  function paintUserBubble(", "  function ").replace(/\s+$/, ""))}
@@ -140,4 +141,7 @@ test("图片完成加载但气泡尚未重排时不使用旧位置绘制新尺�
   paint(ctx, block, 0, 0, {}, false);
   assert.equal(rebuilds, 1);
   assert.deepEqual(draws[0].slice(1), [16, 10, 240, 80]);
+  draws.length = 0;
+  paint(ctx, block, 0, -1000, {}, false);
+  assert.equal(draws.length, 0, "屏外图片不绘制");
 });

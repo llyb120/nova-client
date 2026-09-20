@@ -1,3 +1,6 @@
+use crate::threads::{compact_tool_value, compact_tool_values};
+#[cfg(test)]
+use crate::threads::TOOL_OUTPUT_LIMIT;
 use crate::acp::{
     apply_proxy_env, resolve_program_on_path, EV_LOG, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
 };
@@ -2508,56 +2511,6 @@ mod tests {
         // 未超限的字段原样保留
         assert_eq!(raw["content"][1]["mimeType"], "image/png");
     }
-}
-
-/// 工具详情展示上限。CodeBuddy 等 SDK 后端的 read 结果可能携带整块大文件文本甚至
-/// 图片 base64，不经截断就进 ToolCall 会让前端详情渲染、画布布局签名和会话落盘全部卡死。
-const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
-
-/// 超长文本保留尾部（与 acp.rs 的截断策略一致）。
-fn limit_display_text(text: &str) -> String {
-    if text.len() <= TOOL_OUTPUT_LIMIT {
-        return text.to_string();
-    }
-    let mut start = text.len().saturating_sub(TOOL_OUTPUT_LIMIT);
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    format!(
-        "[输出过长，已省略前面内容，仅保留最后 {}KB]\n{}",
-        TOOL_OUTPUT_LIMIT / 1024,
-        &text[start..]
-    )
-}
-
-/// 递归压缩工具输入/输出：字符串限长；图片 base64 对详情展示无意义，整体换成占位说明。
-fn compact_tool_value(value: &Value) -> Value {
-    match value {
-        Value::String(s) => Value::String(limit_display_text(s)),
-        Value::Array(items) => Value::Array(items.iter().map(compact_tool_value).collect()),
-        Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("image") {
-                if let Some(data) = map.get("data").and_then(Value::as_str) {
-                    let mut out = map.clone();
-                    out.insert(
-                        "data".into(),
-                        json!(format!("[base64 图片数据已省略，共 {} 字符]", data.len())),
-                    );
-                    return Value::Object(out);
-                }
-            }
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                out.insert(k.clone(), compact_tool_value(v));
-            }
-            Value::Object(out)
-        }
-        _ => value.clone(),
-    }
-}
-
-fn compact_tool_values(values: &[Value]) -> Vec<Value> {
-    values.iter().map(compact_tool_value).collect()
 }
 
 fn compact_tool_detail(value: &str) -> String {

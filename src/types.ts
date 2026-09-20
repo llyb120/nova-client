@@ -249,7 +249,7 @@ export interface TurnItem {
   stopReason: string;
 }
 
-export type Item = UserItem | AssistantItem | ThoughtItem | ToolItem | SystemItem | TurnItem;
+export type Item = (UserItem | AssistantItem | ThoughtItem | ToolItem | SystemItem | TurnItem) & { deferred?: boolean };
 
 export type ToolContent =
   | { type: "content"; content: { type: string; text?: string; [k: string]: unknown } }
