@@ -75,7 +75,7 @@ function pageFor(id: string, request: any = {}) {
     beforeCursor:start?`${r.generation}:${start}`:null,afterCursor:end<n?`${r.generation}:${end}`:null,stats:stats(r),payloadBytes:JSON.stringify(items).length,elapsedMs:1};
 }
 async function invoke(command: string, args: any = {}) {
-  calls.push({command,threadId:args.threadId,time:performance.now(),count:args.ids?.length,original:args.original});
+  calls.push({command,threadId:args.threadId,time:performance.now(),count:args.ids?.length,ids:args.ids?[...args.ids]:undefined,original:args.original});
   if(command==='get_thread')throw Error('Full-history IPC must not be used for normal rendering');
   if(command==='get_thread_page') {
     const page=pageFor(args.threadId,args.request);

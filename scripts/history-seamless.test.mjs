@@ -64,7 +64,7 @@ try {
         optimistic: ids.filter(id => id < 0).length,
         ids,
         fetchedCanonicalId: window.perfTest.calls.some(call =>
-          call.command === 'get_thread_display_items' && call.args?.ids?.includes(canonicalId)),
+          call.command === 'get_thread_display_items' && call.ids?.includes(canonicalId)),
       };
     }, prompt);
     assert.equal(result.matches, 1, JSON.stringify(result));
