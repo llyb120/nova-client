@@ -273,6 +273,7 @@ fn operator_http() -> reqwest::Client {
 struct LoopResult {
     stop_reason: String,
     error: Option<String>,
+    result: String,
 }
 
 async fn run_loop(
@@ -301,6 +302,7 @@ async fn run_loop(
             return LoopResult {
                 stop_reason: "aborted".into(),
                 error: None,
+                result: final_text(&messages),
             };
         }
 
@@ -323,46 +325,52 @@ async fn run_loop(
                 return LoopResult {
                     stop_reason: "error".into(),
                     error: Some(error),
+                    result: final_text(&messages),
                 }
             }
         };
         metrics.lock().unwrap().model_round(&result.usage);
+        let content = result.content.clone();
+        let stop_reason = result.stop_reason.clone();
+        let error_message = result.error_message.clone();
 
         messages.push(json!({
             "role": "assistant",
-            "content": result.content,
+            "content": content.clone(),
             "api": resolved.model.api,
             "provider": resolved.model.provider,
             "model": resolved.model.id,
             "usage": result.usage,
-            "stopReason": result.stop_reason,
-            "errorMessage": result.error_message,
+            "stopReason": stop_reason.clone(),
+            "errorMessage": error_message.clone(),
             "timestamp": now_ms(),
         }));
 
-        if result.stop_reason == "aborted" {
+        if stop_reason == "aborted" {
             return LoopResult {
-                stop_reason: "aborted".into(),
-                error: result.error_message,
+                stop_reason,
+                error: error_message,
+                result: final_text(&messages),
             };
         }
-        if result.stop_reason == "error" {
+        if stop_reason == "error" {
             return LoopResult {
-                stop_reason: "error".into(),
-                error: result.error_message,
+                stop_reason,
+                error: error_message,
+                result: final_text(&messages),
             };
         }
 
-        let tool_calls: Vec<Value> = result
-            .content
+        let tool_calls: Vec<Value> = content
             .iter()
             .filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
             .cloned()
             .collect();
         if tool_calls.is_empty() {
             return LoopResult {
-                stop_reason: result.stop_reason,
-                error: result.error_message,
+                stop_reason,
+                error: error_message,
+                result: final_text(&messages),
             };
         }
 
@@ -494,19 +502,19 @@ pub(crate) async fn run_with_resolved(
     let elapsed = started.elapsed();
     let metrics_json = metrics.lock().unwrap().json(elapsed);
     let timeout_happened = timed_out.load(Ordering::SeqCst) || loop_result.is_err();
-    let (status, stop_reason, error) = match loop_result {
-        Err(_) => ("timeout", "timeout".to_string(), None),
-        Ok(result) if timeout_happened => ("timeout", result.stop_reason, result.error),
-        Ok(result) if result.stop_reason == "aborted" => ("cancelled", result.stop_reason, result.error),
-        Ok(result) if result.error.is_some() => ("error", result.stop_reason, result.error),
-        Ok(result) => ("finished", result.stop_reason, result.error),
+    let (status, stop_reason, error, result_text) = match loop_result {
+        Err(_) => ("timeout", "timeout".to_string(), None, String::new()),
+        Ok(result) if timeout_happened => ("timeout", result.stop_reason, result.error, result.result),
+        Ok(result) if result.stop_reason == "aborted" => ("cancelled", result.stop_reason, result.error, result.result),
+        Ok(result) if result.error.is_some() => ("error", result.stop_reason, result.error, result.result),
+        Ok(result) => ("finished", result.stop_reason, result.error, result.result),
     };
 
-    // Reconstruct the concise final report from the archive is unnecessary: run_loop's final
-    // assistant text is not persisted. Ask the final model response to be returned by carrying it
-    // through LoopResult in future extensions; today the parent still gets status/metrics/error.
+    // Run status is control-flow state, not a claim that the user's business goal succeeded.
+    // The parent uses the operator's concise result/evidence for that conclusion.
     Ok(json!({
         "status": status,
+        "result": result_text,
         "stopReason": stop_reason,
         "error": error,
         "timedOut": timeout_happened,
