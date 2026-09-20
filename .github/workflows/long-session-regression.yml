@@ -35,7 +35,9 @@ jobs:
       - name: Paging, bitmap budgets, timeline identities and image layout
         run: node --experimental-strip-types --test scripts/history-window.test.mjs scripts/history-images.test.mjs scripts/bubble-image-layout.test.mjs
       - name: Complete ChatView with 10,000 image-heavy rounds and control races
-        run: node scripts/history-ui.test.mjs
+        run: |
+          node scripts/history-ui.test.mjs
+          node scripts/history-seamless.test.mjs
       - name: Existing virtualized history, prompt and workspace regressions
         run: |
           node scripts/long-session-render.test.mjs
