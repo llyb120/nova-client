@@ -26,4 +26,6 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run test:operator
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib operator::tests lyra::agent::tests lyra::tools::embedded_rtk_tests
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib operator::tests
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib lyra::agent::tests
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib lyra::tools::embedded_rtk_tests
