@@ -13,7 +13,7 @@ p.add_argument("--corpus",type=P,required=True)
 p.add_argument("--out",type=P,default=P("validation/working-set-cover"))
 a=p.parse_args();a.out.mkdir(parents=True,exist_ok=True)
 current=a.current.resolve();candidate=a.candidate.resolve()
-assert hashlib.sha256(current.read_bytes()).hexdigest()=="462e6ed7223ac058924b574c783dcd2b26d9d4df143a0b21521df19f70a6e53e"
+assert hashlib.sha256(current.read_bytes()).hexdigest()=="b9a550f4c211e7d8b34dd5d3738be18ec2b987f29366f0f6c6f0f7d24258cf2c"
 assert hashlib.sha256(candidate.read_bytes()).digest()!=hashlib.sha256(current.read_bytes()).digest()
 for b in (current,candidate): b.chmod(b.stat().st_mode|0o111)
 labels=json.loads((a.accepted/"fastcontext/labels-before-run.json").read_text(encoding="utf-8"))
