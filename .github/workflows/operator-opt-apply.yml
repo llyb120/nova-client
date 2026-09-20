@@ -1,0 +1,73 @@
+name: Operator latency implementation validation
+on:
+  push:
+    branches: [work/operator-context-20260919]
+    paths: [.github/workflows/operator-opt-apply.yml]
+permissions:
+  contents: write
+jobs:
+  validate-and-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/operator-harness -> target
+      - name: Validate and apply the reviewed four-file source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          python3 - <<'PY'
+          import json,base64,gzip,hashlib,re,subprocess
+          from pathlib import Path
+          o=json.loads(Path('scripts/operator-latency-payload.json').read_text())
+          assert subprocess.check_output(['git','rev-parse','HEAD^'],text=True).strip()==o['base']
+          p=gzip.decompress(base64.b64decode(o['gzipBase64'],validate=True))
+          assert len(p)<100000 and hashlib.sha256(p).hexdigest()==o['sha256']
+          names=re.findall(rb'^diff --git a/(\S+) b/(\S+)$',p,re.M)
+          allowed={b'src-tauri/src/operator/'+n for n in [b'core.rs',b'runtime.rs',b'progress.rs',b'latency_tests.rs']}
+          assert len(names)==4 and {a for a,b in names}==allowed and all(a==b for a,b in names)
+          Path('validation/reviewed.patch').write_bytes(p)
+          subprocess.run(['git','apply','--check','validation/reviewed.patch'],check=True)
+          subprocess.run(['git','apply','validation/reviewed.patch'],check=True)
+          PY
+          rustfmt --edition 2021 --config skip_children=true src-tauri/src/operator/{core,runtime,progress,latency_tests}.rs
+          git diff --check
+      - name: Test the actual modified production source before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path bench/operator-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
+          node --test scripts/operator.test.mjs scripts/nova-tools-mcp.test.mjs scripts/ctx-core.test.mjs | tee validation/node-tests.tap
+          cargo run --quiet --manifest-path bench/operator-harness/Cargo.toml > validation/footprint.json
+          node scripts/operator-live-ab.mjs --self-test --out validation/self-test.json
+      - name: Publish only the tested Operator changes to the same PR branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add src-tauri/src/operator/{core,runtime,progress,latency_tests}.rs
+          git rm scripts/operator-latency-payload.json .github/workflows/operator-opt-apply.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'perf(operator): retain bounded evidence and remove redundant observation decisions'
+          git push origin HEAD:refs/heads/work/operator-context-20260919
+          git rev-parse HEAD > validation/tested-commit.txt
+          git archive HEAD | gzip > validation/source.tar.gz
+          sha256sum src-tauri/src/operator/{core,runtime,progress,latency_tests}.rs src-tauri/src/lyra/reasonix.rs > validation/source-hashes.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-latency-implementation
+          path: validation/
+          retention-days: 7
