@@ -115,7 +115,12 @@ fn completions_messages(
     model: &ResolvedModel,
 ) -> Vec<Value> {
     let mut out = vec![json!({ "role": "system", "content": system_prompt })];
+    let mut screenshots = Vec::new();
     for message in messages {
+        // 截图是额外的 user 消息，不能打断同一轮连续的 tool 回复。
+        if message.get("role").and_then(Value::as_str) != Some("toolResult") {
+            out.append(&mut screenshots);
+        }
         match message.get("role").and_then(Value::as_str) {
             Some("user") => {
                 let mut parts = Vec::new();
@@ -214,12 +219,13 @@ fn completions_messages(
                             image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
                             image.get("data").and_then(Value::as_str).unwrap_or_default()) }
                     })));
-                    out.push(json!({ "role": "user", "content": parts }));
+                    screenshots.push(json!({ "role": "user", "content": parts }));
                 }
             }
             _ => {}
         }
     }
+    out.append(&mut screenshots);
     out
 }
 
@@ -1927,6 +1933,43 @@ mod tests {
         );
         assert_eq!(out[3]["role"], "tool");
         assert_eq!(out[3]["content"], "文件内容");
+    }
+
+    #[test]
+    fn completions_screenshots_follow_all_parallel_tool_results() {
+        let model = test_model("openai-completions");
+        for image_index in 0..3 {
+            for continued in [false, true] {
+                let mut messages = vec![json!({ "role": "assistant", "content":
+                    (0..3).map(|i| json!({
+                        "type": "toolCall", "id": format!("call-{i}"),
+                        "name": "browser", "arguments": {}
+                    })).collect::<Vec<_>>()
+                })];
+                for i in 0..3 {
+                    let mut content = vec![json!({ "type": "text", "text": format!("result-{i}") })];
+                    if i == image_index {
+                        content.push(json!({ "type": "image", "mimeType": "image/png", "data": "QUJD" }));
+                    }
+                    messages.push(json!({ "role": "toolResult", "toolCallId": format!("call-{i}"), "content": content }));
+                }
+                if continued {
+                    messages.push(json!({ "role": "user", "content": "继续" }));
+                }
+                let out = completions_messages("sys", &messages, &model);
+                for i in 0..3 {
+                    assert_eq!(out[i + 2]["role"], "tool", "image={image_index}, continued={continued}");
+                    assert_eq!(out[i + 2]["tool_call_id"], format!("call-{i}"));
+                    assert_eq!(out[i + 2]["content"], format!("result-{i}"));
+                }
+                assert_eq!(out[5]["role"], "user");
+                assert_eq!(out[5]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD");
+                assert_eq!(out.len(), if continued { 7 } else { 6 });
+                if continued {
+                    assert_eq!(out[6]["content"][0]["text"], "继续");
+                }
+            }
+        }
     }
 
     #[test]
