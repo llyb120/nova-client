@@ -421,7 +421,7 @@ impl Agent {
                 .cloned()
                 .collect();
             if !tool_calls.is_empty() {
-                self.execute_tools(tool_calls, on_event).await;
+                self.execute_tools(http, tool_calls, on_event).await;
                 // Reasonix：每个模型/工具回合后、下一次 provider 请求前维护上下文。
                 mid_turn(&mut self.messages, &message);
                 // 中途压缩/rebase 改写了消息，同步一次中断轨迹。
@@ -444,7 +444,12 @@ impl Agent {
     }
 
     /// 执行一轮工具调用：（投机缓存命中则复用）并行执行。
-    async fn execute_tools<F>(&mut self, tool_calls: Vec<Value>, on_event: &mut F)
+    async fn execute_tools<F>(
+        &mut self,
+        http: &reqwest::Client,
+        tool_calls: Vec<Value>,
+        on_event: &mut F,
+    )
     where
         F: FnMut(AgentEvent) + Send,
     {
@@ -482,6 +487,28 @@ impl Agent {
                 raw_args,
                 args,
             });
+        }
+        // operator owns an entire interactive task and must never race sibling tool calls.
+        // Reject the whole mixed round before any side effect is started.
+        if prepared.len() > 1 && prepared.iter().any(|call| call.name == "operator") {
+            for call in prepared {
+                let result_message = json!({
+                    "role": "toolResult",
+                    "toolCallId": call.id,
+                    "toolName": call.name,
+                    "content": [{ "type": "text", "text": "operator 必须单独调用，本轮未执行任何工具" }],
+                    "details": Value::Null,
+                    "isError": true,
+                    "timestamp": now_ms(),
+                });
+                on_event(AgentEvent::ToolEnd {
+                    id: call.id.clone(),
+                    outcome: result_message.clone(),
+                });
+                self.messages.push(result_message);
+                self.checkpoint_now();
+            }
+            return;
         }
         // 取消在准备阶段到达（模型回合顶检查之后、执行之前）：不启动任何执行，
         // 给每个 toolCall 补取消占位 toolResult，保持 assistant toolCall ↔ toolResult
@@ -532,10 +559,42 @@ impl Agent {
             })
             .collect();
         type ExecFuture<'a> = Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>>;
+        let operator_model = self.model.clone();
+        let operator_http = http.clone();
+        let operator_cancelled = self.cancelled.clone();
+        let operator_cwd = self.cwd.clone();
         let futures: Vec<ExecFuture> = prepared
             .iter()
             .zip(speculated)
             .map(|(call, spec)| -> ExecFuture {
+                if call.name == "operator" {
+                    if let Some(entry) = spec {
+                        entry.handle.abort();
+                    }
+                    let model = operator_model.clone();
+                    let http = operator_http.clone();
+                    let cancelled = operator_cancelled.clone();
+                    let cwd = operator_cwd.clone();
+                    let args = call.args.clone();
+                    return Box::pin(async move {
+                        match crate::operator::run_with_resolved(
+                            &cwd,
+                            &args,
+                            &model,
+                            &http,
+                            Some(cancelled),
+                        )
+                        .await
+                        {
+                            Ok(value) => ToolOutcome {
+                                content: vec![json!({ "type": "text", "text": value.to_string() })],
+                                details: Some(value),
+                                is_error: false,
+                            },
+                            Err(error) => error_outcome(error),
+                        }
+                    });
+                }
                 match spec {
                     Some(entry) if entry.args == call.raw_args => Box::pin(async move {
                         entry
