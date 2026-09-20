@@ -10,15 +10,15 @@
 //! 隔离。`nova lyra` 子命令保留作命令行调试入口，stdio JSONL 协议与 alkaid-bridge
 //! 完全兼容，两种载体的事件流完全一致。
 
-mod agent;
+pub(crate) mod agent;
 mod bridge;
 pub(crate) mod config;
 mod edit;
-mod prompt;
+pub(crate) mod prompt;
 pub(crate) mod provider;
 mod read;
 mod reasonix;
-mod tools;
+pub(crate) mod tools;
 mod watchdog;
 
 pub use prompt::{
