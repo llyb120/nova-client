@@ -1,0 +1,15 @@
+{
+  "name": "operator",
+  "description": "把一件完整的多步电脑操作交给隔离 Operator 一次完成。Operator 可自主组合、切换 chrome 与 jianlai，不写死工具路线；确定步骤会尽量合批，只有出现新的不确定性才重新观察和决策。工具不好用时可以换另一个，但结果不明的有副作用动作会先核查再决定是否重试。多步 UI 任务优先一次调用 operator；单个明确动作仍可直接用原工具。operator 必须单独调用，不要与其它交互工具并行。",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "goal": {"type":"string","minLength":1,"maxLength":8000,"description":"完整任务目标。说明最终要完成什么，而不是下一步点哪里。"},
+      "context": {"type":"string","maxLength":12000,"description":"仅提供完成任务真正需要的事实、限制或短期信息；不要复制整段会话历史。"},
+      "successCriteria": {"type":"array","maxItems":12,"items":{"type":"string","minLength":1,"maxLength":1000},"description":"可选的完成验收条件。"},
+      "maxSeconds": {"type":"integer","minimum":10,"maximum":300,"default":90,"description":"整个 Operator 任务的最长执行时间。"}
+    },
+    "required": ["goal"],
+    "additionalProperties": false
+  }
+}
