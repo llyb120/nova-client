@@ -2,7 +2,7 @@
 Synthetic format reproductions of the screenshot query, NOT the user's business repository.
 Frozen existing retrieval labels are reused unchanged, outside the searched corpus.
 """
-import argparse,hashlib,importlib.util,json,os,pathlib,statistics,tempfile,time
+import argparse,hashlib,importlib.util,json,os,pathlib,re,statistics,tempfile,time
 P=pathlib.Path
 spec=importlib.util.spec_from_file_location('ab',P('scripts/polaris-ab.py'));ab=importlib.util.module_from_spec(spec);spec.loader.exec_module(ab)
 p=argparse.ArgumentParser();p.add_argument('--accepted',type=P,required=True);p.add_argument('--candidate',type=P,required=True);p.add_argument('--corpus',type=P,required=True);p.add_argument('--out',type=P,default=P('validation/text-recall'));a=p.parse_args();a.out.mkdir(parents=True,exist_ok=True)
@@ -30,6 +30,20 @@ fixtures={
 report={'method':__doc__,'userQuery':query,'answerModelCalls':0,'budgetBytes':12000,'fixtureRows':[],'existingRows':[],'binaries':{'original':hashlib.sha256(previous.read_bytes()).hexdigest(),'before':hashlib.sha256(before.read_bytes()).hexdigest(),'after':hashlib.sha256(candidate.read_bytes()).hexdigest()}}
 root=a.out/'corpora';root.mkdir(exist_ok=True)
 def save():(a.out/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+def emitted_source(text):
+    # Legacy FULL is unfenced and length-delimited. Markdown/Python/YAML '# '
+    # headings/comments are actual source, not metadata boundaries.
+    if not text.startswith('# CTX '):
+        return '\n'.join(s['body'] for s in ab.sections(text))
+    lines=text.splitlines();bodies=[];i=0
+    while i<len(lines):
+        m=re.match(r'^### .+? \((\d+)L\) FULL$',lines[i])
+        if m:
+            n=int(m[1]);bodies.extend(lines[i+1:i+1+n]);i+=n+1
+        else:i+=1
+    return '\n'.join(bodies) if bodies else '\n'.join(s['body'] for s in ab.sections(text))
+assert 'FROM table_a' in emitted_source('# CTX task="x"\n### x.md (3L) FULL\n# actual source heading\nSELECT *\nFROM table_a\n## PROOF\nFROM not_source')
+assert 'not_source' not in emitted_source('# CTX task="x"\n### x.md (3L) FULL\n# actual source heading\nSELECT *\nFROM table_a\n## PROOF\nFROM not_source')
 engines={'original':(previous,'baseline'),'before':(before,'candidate'),'after':(candidate,'candidate')}
 env={k:v for k,v in os.environ.items() if not k.startswith('NOVA_POLARIS_')}
 def engine(arm,cache,tag):return ab.Engine(engines[arm][0],{**env,'NOVA_DATA_DIR':str(cache/tag)},a.out/(tag+'.log'))
@@ -49,7 +63,7 @@ with tempfile.TemporaryDirectory(prefix='polaris-text-recall-') as tmp:
     e=engine(arm,cache,f'{id}-{form}-{arm}')
     try:r,text=run(e,arm,corpus,request)
     finally:e.close()
-    bodies='\n'.join(s['body'] for s in ab.sections(text));ok=r.get('ok') and 'FROM mini_game_scores' in bodies
+    bodies=emitted_source(text);ok=r.get('ok') and 'FROM mini_game_scores' in bodies
     raw=a.out/'raw'/id;raw.mkdir(parents=True,exist_ok=True);(raw/f'{form}-{arm}.txt').write_text(text,encoding='utf-8')
     report['fixtureRows'].append({'id':id,'form':form,'arm':arm,'ok':bool(ok),'ms':r.get('ms'),'bytes':len(text.encode()),'error':r.get('error')});save()
  # Reuse previous fixed labels, not new labels chosen for this implementation.
