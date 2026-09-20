@@ -2,7 +2,7 @@ name: Polaris one-shot working sets
 on:
   push:
     branches: [perf/polaris-semantic-20260919]
-    paths: [.github/workflows/polaris-one-shot.yml]
+    paths: [.github/workflows/polaris-one-shot.yml, scripts/polaris-connected-packet.py, scripts/polaris-required-callers.py]
   workflow_dispatch:
 permissions:
   contents: read
@@ -60,21 +60,15 @@ jobs:
           cp _oldbin/bench/polaris-harness/target/release/polaris-harness validation/bin/previous
           chmod +x validation/bin/previous
           echo 'ef1896343d43926775c4c28923ffd0e981584069b327b750b04c8144502e6537  validation/bin/previous' | sha256sum --check
-          python3 scripts/polaris-one-shot-migrate.py
-          python3 scripts/polaris-one-shot-refine.py
-          python3 scripts/polaris-context-closure.py
-          python3 scripts/polaris-shallow-closure.py
-          python3 scripts/polaris-precision-budget.py
-          python3 scripts/polaris-coverage-balance.py
-          python3 scripts/polaris-source-edges.py
-          python3 scripts/polaris-working-set-guidance.py
-          python3 scripts/polaris-connected-packet.py
+          for script in polaris-one-shot-migrate polaris-one-shot-refine polaris-context-closure polaris-shallow-closure polaris-precision-budget polaris-coverage-balance polaris-source-edges polaris-working-set-guidance polaris-connected-packet polaris-required-callers; do
+            python3 "scripts/$script.py"
+          done
           git diff -- src-tauri/src/nova_tools_native src-tauri/src/lyra/tools.rs scripts/ctx-core.mjs scripts/polaris-query.mjs scripts/polaris-one-shot-edit.py > validation/production.patch
           git diff --exit-code -- src-tauri/src/lyra/reasonix.rs
           git rev-parse HEAD > validation/base-commit.txt
           cp src-tauri/src/nova_tools_native/polaris*.rs validation/source/
           cp src-tauri/src/lyra/tools.rs validation/source/lyra-tools.rs
-          cp scripts/polaris-fastcontext-*.py scripts/polaris-one-shot-*.py scripts/polaris-context-*.py scripts/polaris-shallow-closure.py scripts/polaris-precision-budget.py scripts/polaris-coverage-balance.py scripts/polaris-source-edges.py scripts/polaris-working-set-guidance.py scripts/polaris-connected-packet.py scripts/polaris-ab.py scripts/polaris-query.mjs scripts/ctx-core.mjs validation/scripts/
+          cp scripts/polaris-*.py scripts/polaris-query.mjs scripts/ctx-core.mjs validation/scripts/
           sha256sum src-tauri/src/nova_tools_native/polaris*.rs src-tauri/src/nova_tools_native/context.rs src-tauri/src/lyra/reasonix.rs src-tauri/src/lyra/tools.rs scripts/polaris-query.mjs scripts/ctx-core.mjs > validation/source-hashes.txt
           git -C _corpus archive HEAD src src-tauri/src scripts .gitignore | gzip > validation/corpus-source.tar.gz
       - name: Production regression tests and fresh release build
