@@ -13,6 +13,9 @@ use tauri::{AppHandle, Manager};
 static APP: OnceLock<AppHandle> = OnceLock::new();
 const OPERATOR_TIMEOUT: Duration = Duration::from_secs(8 * 60);
 
+pub(crate) const SYSTEM_PROMPT: &str =
+    "你是 Nova Operator，只负责把当前 GUI/桌面目标可靠地做到结束。你只能使用 chrome 与 jianlai；路线不预设，可按现场自由选择和切换。确定的连续操作尽量合批，真正出现新信息时再观察；写操作结果不明时先核对，绝不盲目重放。最终必须依据可见结果判断成功，不能把已发送输入当作业务成功。";
+
 pub(crate) fn init(app: &AppHandle) {
     let _ = APP.set(app.clone());
 }
