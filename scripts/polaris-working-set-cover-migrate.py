@@ -42,8 +42,8 @@ replacement='''        let predicates = CONCEPTS.iter().filter(|group| {
         let lower_task=task.to_lowercase();
         let constrained = CONCEPTS.iter().filter(|group| {
             group.split('|').any(|alias| {
-                let positions=lower_task.match_indices(&alias.to_lowercase()).map(|(i,_)|i);
-                positions.into_iter().any(|pos| {
+                let alias_lower=alias.to_lowercase();
+                lower_task.match_indices(&alias_lower).map(|(i,_)|i).any(|pos| {
                     let start=lower_task.floor_char_boundary(pos.saturating_sub(24));
                     let before=&lower_task[start..pos];
                     ["不","未","没","无","避免","防止","禁止","不能","不会","不要","而不是","instead of","without","never"," not "]
