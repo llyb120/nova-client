@@ -549,6 +549,9 @@ pub struct Thread {
     /// 旧版本训练记录标记：仅为保持本地隔离而兼容，不再创建此类会话。
     #[serde(default)]
     pub experience_thread: bool,
+    /// Operator 的隔离子会话。只在一次 GUI 任务期间存在，且禁止递归创建 Operator。
+    #[serde(default)]
+    pub operator_thread: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -621,6 +624,7 @@ impl Thread {
             quota_peer_name: None,
             worktree: None,
             experience_thread: false,
+            operator_thread: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
             pending_stage_context: None,
