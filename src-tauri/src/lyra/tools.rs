@@ -86,6 +86,8 @@ pub fn tool_set(
         })),
     });
     if !read_only {
+        let operator = crate::operator::tool_definition();
+        tools.push(Tool { name: "operator", description: operator["description"].as_str().unwrap().into(), parameters: schema(operator["inputSchema"].clone()) });
         let webview = crate::native_browser::tool_definition();
         tools.push(Tool { name: "webview", description: webview["description"].as_str().unwrap().into(), parameters: schema(webview["inputSchema"].clone()) });
         let desktop = crate::jianlai::tool_definition();
@@ -150,6 +152,25 @@ pub fn tool_set(
     }
 
     tools
+}
+
+/// Operator 子会话只看到两个 GUI 执行通道。路线由模型按现场选择，
+/// 但不会再递归创建 Operator，也不会把代码/搜索工具带进独立交互上下文。
+pub fn operator_tool_set() -> Vec<Tool> {
+    let desktop = crate::jianlai::tool_definition();
+    let chrome = crate::chrome_browser::tool_definition();
+    vec![
+        Tool {
+            name: "jianlai",
+            description: desktop["description"].as_str().unwrap().into(),
+            parameters: schema(desktop["inputSchema"].clone()),
+        },
+        Tool {
+            name: "chrome",
+            description: chrome["description"].as_str().unwrap().into(),
+            parameters: schema(chrome["inputSchema"].clone()),
+        },
+    ]
 }
 
 /// 工具执行结果：内容块列表 + details（归档信息等）。
@@ -536,6 +557,20 @@ async fn execute_inner(
     owner: &str,
 ) -> ToolOutcome {
     match name {
+        "operator" => {
+            if shell.is_none() { return ToolOutcome::error("当前为只读模式，Operator 不可用"); }
+            let Some(parent_thread_id) = args.get("__parentThreadId").and_then(Value::as_str) else {
+                return ToolOutcome::error("Operator 缺少父会话身份");
+            };
+            let mut public_args = args.clone();
+            if let Some(object) = public_args.as_object_mut() {
+                object.remove("__parentThreadId");
+            }
+            match crate::operator::run(root, &public_args, parent_thread_id).await {
+                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
         "webview" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，网页控制不可用"); }
             match crate::native_browser::execute(root, args).await {
@@ -731,7 +766,7 @@ mod embedded_rtk_tests {
     async fn image_tools_work_without_polaris_and_are_blocked_in_read_only_mode() {
         for read_only in [false, true] {
             let tools = tool_set(read_only, false, false);
-            for name in ["generate_image", "edit_image", "jianlai"] {
+            for name in ["generate_image", "edit_image", "jianlai", "operator"] {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
         }
@@ -739,6 +774,12 @@ mod embedded_rtk_tests {
         let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, "test").await;
         assert!(result.is_error);
         assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
+    }
+
+    #[test]
+    fn operator_child_only_sees_gui_channels() {
+        let names: Vec<_> = super::operator_tool_set().into_iter().map(|tool| tool.name).collect();
+        assert_eq!(names, vec!["jianlai", "chrome"]);
     }
 
     #[test]
