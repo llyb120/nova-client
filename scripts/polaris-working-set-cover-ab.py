@@ -75,14 +75,23 @@ missing=[r["id"] for r in report["rows"] if r["arm"]=="candidate" and r["phase"]
 c=report["summary"]["candidate"];b=report["summary"]["current"]
 checks={
  "all_requests_returned":all(r["ok"] for r in report["rows"]),
+ # Quality is non-negotiable: the optimization only lands when every fixed
+ # natural-language core and all dependency-closure cases are still present.
  "natural_core_20_of_20":c["coreBody"]==20,
  "top1_not_lower":c["top1"]>=b["top1"],
  "four_dependency_closures":c["closure"]==4,
  "fixed_budget":all(r["bytes"]<=12000 for r in report["rows"] if r["arm"]=="candidate"),
- "cold_p50_not_over_350ms":c["coldP50Ms"]<=350,
- "cold_p50_not_over_135pct_current":c["coldP50Ms"]<=b["coldP50Ms"]*1.35,
- "resident_new_question_p50_not_over_220ms":c["residentFirstP50Ms"]<=220,
+ # Hosted-runner absolute timings vary materially between runs (the unchanged
+ # current binary has measured ~280-390 ms P50). Compare on the SAME runner/run,
+ # while retaining hard ceilings so a proportionally-slow machine cannot hide
+ # an unacceptable implementation.
+ "cold_p50_under_450ms":c["coldP50Ms"]<=450,
+ "cold_p50_within_110pct_current":c["coldP50Ms"]<=b["coldP50Ms"]*1.10,
+ "cold_p95_within_112pct_current":c["coldP95Ms"]<=b["coldP95Ms"]*1.12,
+ "resident_new_question_under_220ms":c["residentFirstP50Ms"]<=220,
+ "resident_new_question_within_110pct_current":c["residentFirstP50Ms"]<=b["residentFirstP50Ms"]*1.10,
  "warm_p50_under_100ms":c["warmP50Ms"]<=100,
+ "warm_p50_within_115pct_current":c["warmP50Ms"]<=b["warmP50Ms"]*1.15,
 }
 report["missingNatural"]=missing;report["checks"]=checks;report["passed"]=all(checks.values());save()
 print(json.dumps({"summary":report["summary"],"missingNatural":missing,"checks":checks,"passed":report["passed"]},ensure_ascii=False,indent=2))
