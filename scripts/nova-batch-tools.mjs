@@ -2,6 +2,7 @@ import imageTools from "./image-tools.json" with { type: "json" };
 import webviewTool from "./webview-tool.json" with { type: "json" };
 import chromeTool from "./chrome-tool.json" with { type: "json" };
 import jianlaiTool from "./jianlai-tool.json" with { type: "json" };
+import operatorTool from "./operator-tool.json" with { type: "json" };
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
@@ -53,6 +54,9 @@ export function createNovaBatchTools(cwd, options = {}) {
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
   const tools = {};
   if (!readOnly && globalContextServiceConfigured()) {
+    tools.operator = { ...operatorTool,
+      execute: async params => JSON.stringify(await callGlobalContextTool("operator", root, params, owner)),
+    };
     tools.webview = { ...webviewTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("webview", root, params)),
     };
@@ -140,7 +144,7 @@ export function novaDevinBatchToolPolicy(options = {}) {
   const fastContext = fastContextEnabled(options);
   const toolNames = [];
   if (fastContext) toolNames.push("polaris");
-  if (!readOnly && globalContextServiceConfigured()) toolNames.push("generate_image", "edit_image", "webview", "chrome", "jianlai");
+  if (!readOnly && globalContextServiceConfigured()) toolNames.push("operator", "generate_image", "edit_image", "webview", "chrome", "jianlai");
   if (toolNames.length === 0) {
     const lines = ["Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."];
     if (readOnly) lines.push("Current mode is plan/read-only: analyze only; do not modify files.");
@@ -164,6 +168,9 @@ export function novaDevinBatchToolPolicy(options = {}) {
       : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")
       + "Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];
+  if (!readOnly && globalContextServiceConfigured()) {
+    lines.push("For a multi-step computer/UI task, prefer one operator call with the complete goal instead of making the parent agent micromanage chrome/jianlai step by step. The operator may switch between those tools itself. For one already-known UI action, direct chrome/jianlai is still appropriate. Never call operator in parallel with another interactive tool.");
+  }
   if (readOnly) {
     lines.push("Current mode is plan/read-only: analyze only; do not modify files.");
   }
