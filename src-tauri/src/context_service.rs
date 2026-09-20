@@ -149,6 +149,9 @@ fn dispatch(
     if request.method == "chrome" {
         return tauri::async_runtime::block_on(crate::native_browser::execute_chrome(root, &params, &request.owner));
     }
+    if request.method == "operator" {
+        return tauri::async_runtime::block_on(crate::operator::run(root, &params, &request.owner));
+    }
     if matches!(request.method.as_str(), "generate_image" | "edit_image") {
         // dispatch 已在阻塞工作线程运行；图片请求不阻塞常驻服务的其它连接。
         return tokio::runtime::Builder::new_current_thread().enable_all().build()
