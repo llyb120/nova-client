@@ -4,6 +4,10 @@ on:
   push:
     branches: [work/operator-fast-tools]
 
+concurrency:
+  group: operator-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   operator:
     runs-on: ubuntu-24.04
