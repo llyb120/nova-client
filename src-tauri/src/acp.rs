@@ -5230,7 +5230,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
     if polaris {
         tool_names.extend(["polaris"]);
     }
-    if !read_only { tool_names.extend(["generate_image", "edit_image", "webview", "chrome", "jianlai"]); }
+    if !read_only { tool_names.extend(["operator", "generate_image", "edit_image", "webview", "chrome", "jianlai"]); }
     if tool_names.is_empty() {
         let mut lines = vec![
             "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."
@@ -5273,7 +5273,8 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
         },
     ];
     if !read_only {
-        lines.push("Desktop routing: 剑来 means the jianlai desktop mouse/keyboard/screenshot tool, not a shell command. When the user requests 剑来/jianlai, start with mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"jianlai\",\"arguments\":{\"operation\":\"windows\"}}, then inspect the target window and follow the tool schema. Use only jianlai mouse/keyboard/screenshot throughout the desktop task; never use shell, COM, PowerShell, P/Invoke, UIAutomation or scripts to activate/control apps. For background windows, inspect the desktop and use Win+Tab task view or a visible taskbar icon; do not blindly cycle windows. If the endpoint is missing, report the MCP error rather than silently switching methods. webview controls Nova's sidebar browser; chrome controls the user's Chrome.".into());
+        lines.push("For a multi-step computer/UI task, prefer one operator call with the complete goal instead of micromanaging chrome/jianlai step by step. Operator may freely switch between chrome and jianlai when that produces a better path; do not pre-route it by app type. A single already-known UI action can still use the raw tool. Never call operator in parallel with another interactive tool.".into());
+        lines.push("Desktop routing: 剑来 means the jianlai desktop mouse/keyboard/screenshot tool, not a shell command. When the user explicitly requires 剑来/jianlai only, start with mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"jianlai\",\"arguments\":{\"operation\":\"windows\"}}, then inspect the target window and follow the tool schema. Use only jianlai mouse/keyboard/screenshot throughout that explicitly constrained desktop task; never use shell, COM, PowerShell, P/Invoke, UIAutomation or scripts to activate/control apps. For background windows, inspect the desktop and use Win+Tab task view or a visible taskbar icon; do not blindly cycle windows. If the endpoint is missing, report the MCP error rather than silently switching methods. webview controls Nova's sidebar browser; chrome controls the user's Chrome.".into());
     }
     if read_only {
         lines.push("Current mode is plan/read-only: analyze only; do not modify files.".into());
@@ -5282,7 +5283,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
 }
 
 fn direct_desktop_guidance() -> &'static str {
-    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、webview（侧栏浏览器）、chrome（用户Chrome）。用户指定剑来时，直接调用工具列表中来自 nova-tools 的 jianlai，先 operation=windows 再截图；整个桌面任务仅用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation或脚本激活窗口。后台窗口先截桌面，用Win+Tab任务视图或可见任务栏入口切窗，不要盲目循环切换。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
+    "Nova MCP 提供 operator（多步电脑任务的隔离执行器，可自主组合/切换 chrome 与 jianlai）、jianlai（剑来：桌面鼠标、键盘、截图）、webview（侧栏浏览器）、chrome（用户Chrome）。一般多步电脑任务优先一次调用 operator 并给完整目标，不要由主 Agent 看一步走一步；单个已确定动作可直接用原工具。用户明确指定只用剑来时，直接调用 nova-tools 的 jianlai，先 operation=windows 再截图；整个任务仅用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation或脚本激活窗口。后台窗口先截桌面，用Win+Tab任务视图或可见任务栏入口切窗，不要盲目循环切换。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
 }
 
 #[cfg(test)]
@@ -5295,13 +5296,14 @@ mod desktop_prompt_tests {
         assert!(source.contains("if self.kind == AgentKind::Devin {\n                guidance.push(nova_tools_prompt_guidance"));
         for polaris in [true, false] {
             let prompt = super::nova_tools_prompt_guidance(polaris, false);
-            for tool in ["jianlai", "chrome", "webview"] {
+            for tool in ["operator", "jianlai", "chrome", "webview"] {
                 assert!(prompt.contains(tool));
                 assert!(!super::nova_tools_prompt_guidance(polaris, true).contains(tool));
             }
             assert!(prompt.contains("剑来"));
             assert!(prompt.contains(r#""tool_name":"jianlai""#));
             assert!(prompt.contains(r#""operation":"windows""#));
+            assert!(prompt.contains("prefer one operator call"));
         }
     }
 }
