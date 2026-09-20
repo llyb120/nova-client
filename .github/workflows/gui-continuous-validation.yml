@@ -13,6 +13,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Use crates.io
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
 
       - uses: dtolnay/rust-toolchain@stable
 
