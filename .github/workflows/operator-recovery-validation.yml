@@ -1,0 +1,112 @@
+name: Operator recovery validation
+on:
+  push:
+    branches: [work/operator-context-20260919]
+    paths:
+      - .github/workflows/operator-recovery-validation.yml
+      - src-tauri/src/operator/**
+      - src-tauri/src/jianlai.rs
+  pull_request:
+    paths:
+      - src-tauri/src/operator/**
+      - src-tauri/src/jianlai.rs
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/operator-harness -> target
+      - name: Production core, runtime and Node regression tests
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          git rev-parse HEAD > validation/tested-commit.txt
+          cargo test --manifest-path bench/operator-harness/Cargo.toml -- --test-threads=1 2>&1 | tee validation/rust-tests.txt
+          node --test scripts/operator.test.mjs 2>&1 | tee validation/node-tests.txt
+          sha256sum src-tauri/src/operator/{core,contract,runtime}.rs src-tauri/src/jianlai.rs src-tauri/src/lyra/reasonix.rs > validation/tested-hashes.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-recovery-core-results
+          path: validation/
+          retention-days: 7
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 3d7ac249129e3f25c703fb03a1dd5617c3560a7a
+          path: _fixture
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/operator-gui-harness -> target
+          cache-on-failure: true
+      - name: Stage pinned fixture against unchanged current production source
+        run: |
+          set -euo pipefail
+          mkdir -p validation .cargo
+          git rev-parse HEAD > validation/tested-commit.txt
+          cp -r _fixture/bench/operator-gui-harness bench/
+          cp _fixture/scripts/operator-native-regression.mjs scripts/operator-native-recovery-regression.mjs
+          printf '[net]\ngit-fetch-with-cli = true\n' > .cargo/config.toml
+          printf '\n[dev-dependencies]\ntempfile = "3"\n' >> bench/operator-gui-harness/Cargo.toml
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/operator-native-recovery-regression.mjs');s=p.read_text()
+          s=s.replace('png.data[i]===251&&png.data[i+1]===17&&png.data[i+2]===241','png.data[i]>200&&png.data[i+1]<80&&png.data[i+2]>200')
+          extra=''' await test('chrome native SELECT uses click and keys, never fill',async r=>{await reset('form');const s=await native('chrome',{operation:'inspect',tabTag:tab});const item=s.pages.flatMap(p=>p.items.map(i=>({...i,frame:p.frame}))).find(i=>i.name==='Priority');assert.ok(item);const a=await native('chrome',{operation:'act',tabTag:tab,snapshotId:s.snapshotId,actions:[{action:'click',frame:item.frame,ref:item.ref},{action:'press',key:'Home'},{action:'press',key:'ArrowDown'},{action:'press',key:'Enter'}]});r.nativeStatus=a.status;r.priority=(await page.evaluate(()=>window.__oracle())).priority;assert.equal(a.status,'executed');assert.equal(r.priority,'High');});
+           await test('chrome unsupported press fields send zero inputs',async r=>{await reset('form');const s=await native('chrome',{operation:'inspect',tabTag:tab});const before=(await page.evaluate(()=>window.__oracle())).events.length;const a=await native('chrome',{operation:'act',tabTag:tab,snapshotId:s.snapshotId,action:{action:'press',key:'Enter',frame:0,ref:'invalid'}});r.nativeStatus=a.status;r.completedActions=a.completedActions;assert.equal(a.status,'not_executed');assert.equal(a.completedActions,0);assert.equal((await page.evaluate(()=>window.__oracle())).events.length,before);});
+          '''
+          needle=" for(const key of ['Ctrl+A','Ctrl+a'])"
+          assert needle in s;s=s.replace(needle,extra+needle).replace('report.passed!==5','report.passed!==7')
+          p.write_text(s)
+          PY
+          sha256sum src-tauri/src/operator/{core,contract,runtime}.rs src-tauri/src/jianlai.rs src-tauri/src/lyra/reasonix.rs > validation/tested-hashes.txt
+      - name: Install native GUI dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libclang-dev libxdo-dev libxtst-dev xvfb openbox dbus-x11
+          npm install --prefix bench/operator-gui-deps --no-package-lock --ignore-scripts playwright@1.55.1 pngjs@7.0.0
+          bench/operator-gui-deps/node_modules/.bin/playwright install --with-deps chromium
+      - name: Compile actual native modules and run shortcut unit tests
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path bench/operator-gui-harness/Cargo.toml shortcut_case_regression -- --test-threads=1 2>&1 | tee validation/shortcut-unit-tests.txt
+          cargo build --manifest-path bench/operator-gui-harness/Cargo.toml 2>&1 | tee validation/native-build.txt
+      - name: Real native inputs, no provider calls
+        env:
+          OPERATOR_GUI_EXE: bench/operator-gui-harness/target/debug/nova-operator-gui-harness
+        run: |
+          set -euo pipefail
+          dbus-run-session -- xvfb-run -a -s '-screen 0 1280x960x24' bash -c 'openbox >/tmp/recovery-openbox.log 2>&1 & node scripts/operator-native-recovery-regression.mjs' 2>&1 | tee validation/native-progress.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-recovery-native-results
+          path: validation/
+          retention-days: 7

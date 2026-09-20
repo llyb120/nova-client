@@ -1,3 +1,4 @@
+import operatorTool from "./operator-tool.json" with { type: "json" };
 import imageTools from "./image-tools.json" with { type: "json" };
 import webviewTool from "./webview-tool.json" with { type: "json" };
 import chromeTool from "./chrome-tool.json" with { type: "json" };
@@ -53,6 +54,11 @@ export function createNovaBatchTools(cwd, options = {}) {
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
   const tools = {};
   if (!readOnly && globalContextServiceConfigured()) {
+    const operatorScope = options.operatorScope || process.env.NOVA_OPERATOR_SCOPE;
+    if (operatorScope) {
+      tools.operate = { ...operatorTool, execute: async params => JSON.stringify(
+        await callGlobalContextTool("operate", root, params, owner, operatorScope)) };
+    }
     tools.webview = { ...webviewTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("webview", root, params)),
     };

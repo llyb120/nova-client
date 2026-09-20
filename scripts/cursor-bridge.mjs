@@ -1,10 +1,11 @@
+import { runOperatorDecision } from "./operator-cursor.mjs";
 import { runContextBridge as runReasonixContext } from "./cursor-context-reasonix.mjs";
 import { runContextBridge as runSuperContext } from "./cursor-context-super.mjs";
 
 export * from "./cursor-context-reasonix.mjs";
 
 if (process.env.NOVA_CURSOR_BRIDGE_TEST !== "1") {
-  const runContextBridge = process.env.NOVA_CONTEXT_MODE === "super"
+  const runContextBridge = process.env.NOVA_OPERATOR_DECISION === "1" ? runOperatorDecision : process.env.NOVA_CONTEXT_MODE === "super"
     ? runSuperContext
     : runReasonixContext;
   runContextBridge().catch((error) => {

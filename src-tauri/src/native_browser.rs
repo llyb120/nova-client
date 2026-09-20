@@ -1738,6 +1738,7 @@ pub(crate) fn tool_owner(root: &Path, owner: &str) -> Result<String, String> {
 }
 
 pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
+    crate::operator::check_access(owner)?;
     let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
     let thread_id = tool_owner(root, owner)?;
     let operation = args["operation"].as_str().unwrap_or_default();

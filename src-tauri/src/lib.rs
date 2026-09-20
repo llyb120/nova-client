@@ -10,6 +10,7 @@ mod codex;
 mod codex_radar;
 mod codex_app_server;
 mod context_service;
+mod operator;
 mod credential_roaming;
 mod gitwt;
 mod http_stream;
