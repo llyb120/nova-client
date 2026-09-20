@@ -16,6 +16,7 @@ mod http_stream;
 pub mod image_generation;
 mod native_browser;
 mod chrome_browser;
+mod operator;
 mod lyra;
 mod lyra_complete;
 mod model_cache;
