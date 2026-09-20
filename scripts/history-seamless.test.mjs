@@ -56,13 +56,20 @@ try {
     await page.locator('.composer-btn.send').click();
     await page.waitForFunction(text => window.perfTest.state.items.some(item => item.id > 0 && item.text === text), prompt);
     await page.waitForTimeout(300);
-    const result = await page.evaluate(text => ({
-      matches: window.perfTest.state.items.filter(item => item.text === text).length,
-      optimistic: window.perfTest.state.items.filter(item => item.id < 0 && item.text === text).length,
-      ids: window.perfTest.state.items.filter(item => item.text === text).map(item => item.id),
-    }), prompt);
+    const result = await page.evaluate(text => {
+      const ids = window.perfTest.state.items.filter(item => item.text === text).map(item => item.id);
+      const canonicalId = ids.find(id => id > 0);
+      return {
+        matches: ids.length,
+        optimistic: ids.filter(id => id < 0).length,
+        ids,
+        fetchedCanonicalId: window.perfTest.calls.some(call =>
+          call.command === 'get_thread_display_items' && call.args?.ids?.includes(canonicalId)),
+      };
+    }, prompt);
     assert.equal(result.matches, 1, JSON.stringify(result));
     assert.equal(result.optimistic, 0, JSON.stringify(result));
+    assert.equal(result.fetchedCanonicalId, true, JSON.stringify(result));
     await page.evaluate(() => window.perfTest.run(false));
   });
   await check('resending invalidates an outstanding old page even when the thread and IDs are reused', async () => {

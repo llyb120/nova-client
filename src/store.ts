@@ -3055,7 +3055,13 @@ async function flushHistoryRefresh() {
     } else {
       // A reset refreshes the retained window, not just the newest page. Even a
       // window containing the tail may currently be scrolled to its older end.
-      const ids = notice.reset ? current.items.filter(i => i.id >= 0).map(i => i.id) : [...notice.ids];
+      // A reset means refresh the retained window, not discard the IDs that
+      // triggered the same coalesced notice. In particular acp:turn(reset) can
+      // race the user upsert; dropping that new ID creates a stats-only handoff
+      // and leaves the optimistic bubble beside the later canonical page.
+      const ids = notice.reset
+        ? [...new Set([...current.items.filter(i => i.id >= 0).map(i => i.id), ...notice.ids])]
+        : [...notice.ids];
       let working = current;
       let gap = false;
       for (let offset = 0; offset < Math.max(1, ids.length); offset += 16) {
