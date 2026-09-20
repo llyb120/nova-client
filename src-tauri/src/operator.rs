@@ -382,6 +382,7 @@ async fn run_loop(
                 return LoopResult {
                     stop_reason: "aborted".into(),
                     error: None,
+                    result: final_text(&messages),
                 };
             }
             let id = call
