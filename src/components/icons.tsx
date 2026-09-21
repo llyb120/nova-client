@@ -1,4 +1,5 @@
 import type { JSX } from "solid-js";
+import appIcon from "../../app-icon.png";
 
 type P = { size?: number; class?: string };
 
@@ -109,17 +110,10 @@ export const IconUsers = (p: P) =>
   svg(<><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13A4 4 0 0 1 16 11" /></>, p);
 export const IconBroadcast = (p: P) =>
   svg(<><circle cx="12" cy="12" r="2" /><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14" /></>, p);
-// Nova：一枚四芒星（新星/闪耀），实心朱砂阴文，配一点小火花，寓意「新星」。
+// 与桌面应用共用图标源文件。
 export const IconLogo = (p: P) =>
   svg(
-    <>
-      <path
-        d="M12 2c.9 5.2 1.2 6.1 2.6 7.4 1.3 1.4 2.2 1.7 7.4 2.6-5.2.9-6.1 1.2-7.4 2.6-1.4 1.3-1.7 2.2-2.6 7.4-.9-5.2-1.2-6.1-2.6-7.4C8.1 12.8 7.2 12.5 2 12c5.2-.9 6.1-1.2 7.4-2.6C10.8 8.1 11.1 7.2 12 2Z"
-        fill="currentColor"
-        stroke="none"
-      />
-      <circle cx="18.7" cy="5.3" r="1.15" fill="currentColor" stroke="none" opacity="0.85" />
-    </>,
+    <image href={appIcon} width="24" height="24" />,
     p,
   );
 export const IconTrophy = (p: P) =>
