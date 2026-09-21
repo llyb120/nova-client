@@ -48,7 +48,7 @@ export default function WorkspaceGit(props: { threadId: string; onOpen: (path: s
         .then(pair => { if (!disposed) setImages(pair); }, failed).finally(done);
       return;
     }
-    void api.workspaceGitDiff(props.threadId, chosen.path, chosen.staged).then(text => {
+    void api.workspaceGitDiff(props.threadId, chosen.path, chosen.staged, expandAll()).then(text => {
       if (!disposed) setPatch(text);
     }, failed).finally(done);
   });

@@ -89,7 +89,7 @@ pub async fn workspace_git_status(
     .map_err(|e| e.to_string())?
 }
 
-fn git_patch(repo: &str, path: &str, staged: bool) -> Result<String, String> {
+fn git_patch(repo: &str, path: &str, staged: bool, full_context: bool) -> Result<String, String> {
     // Validate against Git's own inventory, including deleted paths that cannot be canonicalized.
     let entry = git_entries(repo)?
         .into_iter()
@@ -118,7 +118,7 @@ fn git_patch(repo: &str, path: &str, staged: bool) -> Result<String, String> {
         "--no-ext-diff",
         "--no-textconv",
         "--no-color",
-        "--unified=1000000",
+        if full_context { "--unified=1000000" } else { "--unified=3" },
     ];
     if staged {
         args.push("--cached");
@@ -189,6 +189,7 @@ pub async fn workspace_git_diff(
     thread_id: String,
     path: String,
     staged: bool,
+    full_context: Option<bool>,
 ) -> Result<String, String> {
     let cwd = root(&state, &thread_id)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -196,7 +197,7 @@ pub async fn workspace_git_diff(
             cwd.to_str().ok_or("路径编码无效")?,
             &["rev-parse", "--show-toplevel"],
         )?;
-        git_patch(&repo, &path, staged)
+        git_patch(&repo, &path, staged, full_context.unwrap_or(false))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -653,7 +654,7 @@ mod tests {
         crate::gitwt::run(repo, &["init"]).unwrap();
         fs::write(dir.join("中文 file.txt"), "base\n").unwrap();
         crate::gitwt::run(repo, &["add", "."]).unwrap();
-        assert!(git_patch(repo, "中文 file.txt", true)
+        assert!(git_patch(repo, "中文 file.txt", true, false)
             .unwrap()
             .contains("+base"));
         crate::gitwt::run(
@@ -677,14 +678,14 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.path == "中文 file.txt" && e.index == "M" && e.worktree == "M"));
-        let staged = git_patch(repo, "中文 file.txt", true).unwrap();
+        let staged = git_patch(repo, "中文 file.txt", true, false).unwrap();
         assert!(staged.contains("-base\n+staged\n"));
-        let working = git_patch(repo, "中文 file.txt", false).unwrap();
+        let working = git_patch(repo, "中文 file.txt", false, false).unwrap();
         assert!(working.contains("-staged\n+working\n"));
-        assert!(git_patch(repo, "new.txt", false)
+        assert!(git_patch(repo, "new.txt", false, false)
             .unwrap()
             .contains("+new\n"));
-        assert!(git_patch(repo, "../outside", false).is_err());
+        assert!(git_patch(repo, "../outside", false, false).is_err());
         crate::gitwt::run(repo, &["restore", "--staged", "中文 file.txt"]).unwrap();
         crate::gitwt::run(repo, &["mv", "中文 file.txt", "renamed.txt"]).unwrap();
         assert!(git_entries(repo)
@@ -692,13 +693,36 @@ mod tests {
             .iter()
             .any(|e| e.path == "renamed.txt" && e.old_path.as_deref() == Some("中文 file.txt")));
         fs::remove_file(dir.join("renamed.txt")).unwrap();
-        assert!(git_patch(repo, "renamed.txt", true)
+        assert!(git_patch(repo, "renamed.txt", true, false)
             .unwrap()
             .contains("rename to renamed.txt"));
-        assert!(git_patch(repo, "renamed.txt", false)
+        assert!(git_patch(repo, "renamed.txt", false, false)
             .unwrap()
             .contains("-base"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn git_patch_loads_full_context_only_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        crate::gitwt::run(repo, &["init"]).unwrap();
+        let original: String = (0..50_000).map(|i| format!("line {i}: unchanged content for diff preview\n")).collect();
+        fs::write(dir.path().join("large.txt"), &original).unwrap();
+        crate::gitwt::run(repo, &["add", "large.txt"]).unwrap();
+        fs::write(dir.path().join("large.txt"), original.replace("line 25000:", "edited 25000:")).unwrap();
+        let patch = git_patch(repo, "large.txt", false, false).unwrap();
+        assert!(patch.contains("-line 25000:") && patch.contains("+edited 25000:"));
+        assert!(patch.len() < 1_000, "small edits must not transfer the whole file");
+        // The full file exceeds the existing preview cap; collapsed diffs must still work.
+        assert!(git_patch(repo, "large.txt", false, true).unwrap_err().contains("2 MB"));
+        let smaller = original.lines().take(100).collect::<Vec<_>>().join("\n") + "\n";
+        fs::write(dir.path().join("large.txt"), &smaller).unwrap();
+        crate::gitwt::run(repo, &["add", "large.txt"]).unwrap();
+        fs::write(dir.path().join("large.txt"), smaller.replace("line 50:", "edited 50:")).unwrap();
+        let full = git_patch(repo, "large.txt", false, true).unwrap();
+        assert!(full.contains(" line 0:") && full.contains(" line 99:"));
+        assert!(full.contains("-line 50:") && full.contains("+edited 50:"));
     }
     #[test]
     fn git_image_returns_before_and_after_data_uris() {

@@ -47,8 +47,8 @@ export function fileUriPath(uri: string) {
 export const api = {
   workspaceGitStatus: (threadId: string) =>
     invoke<{ repo: string; files: { path: string; oldPath: string | null; index: string; worktree: string }[] }>("workspace_git_status", { threadId }),
-  workspaceGitDiff: (threadId: string, path: string, staged: boolean) =>
-    invoke<string>("workspace_git_diff", { threadId, path, staged }),
+  workspaceGitDiff: (threadId: string, path: string, staged: boolean, fullContext = false) =>
+    invoke<string>("workspace_git_diff", { threadId, path, staged, fullContext }),
   /** 图片变动的新旧两份内容（base64 data URI），用于直接看图对比。 */
   workspaceGitImage: (threadId: string, path: string, staged: boolean) =>
     invoke<{ before: string | null; after: string | null }>("workspace_git_image", { threadId, path, staged }),
