@@ -733,12 +733,35 @@ fn screenshot_bytes(data:&str, edge:u32) -> Result<(Vec<u8>,(u32,u32)),String> {
     if edge==0 || pixels.0.max(pixels.1)<=edge {return Ok((bytes,pixels));}
     // CDP implementations do not all produce the same pixel dimensions for
     // clip.scale=1. Enforce the budget against the actual PNG, not guessed DPR.
-    let decoded=xcap::image::load_from_memory(&bytes).map_err(|e|e.to_string())?;
-    let resized=decoded.resize(edge,edge,xcap::image::imageops::FilterType::Triangle);
-    let pixels=(resized.width(),resized.height());
+    encode_screenshot(xcap::image::load_from_memory(&bytes).map_err(|e|e.to_string())?,edge)
+}
+
+fn encode_screenshot(image:xcap::image::DynamicImage, edge:u32) -> Result<(Vec<u8>,(u32,u32)),String> {
+    let image=if edge>0 && image.width().max(image.height())>edge {
+        image.resize(edge,edge,xcap::image::imageops::FilterType::Triangle)
+    } else {image};
+    let pixels=(image.width(),image.height());
     let mut output=std::io::Cursor::new(Vec::new());
-    resized.write_to(&mut output,xcap::image::ImageFormat::Png).map_err(|e|e.to_string())?;
+    image.write_to(&mut output,xcap::image::ImageFormat::Png).map_err(|e|e.to_string())?;
     Ok((output.into_inner(),pixels))
+}
+
+async fn capture_viewport(app:&AppHandle, viewport:&Value, x:f64, y:f64, w:f64, h:f64) -> Result<xcap::image::DynamicImage,String> {
+    use base64::Engine;
+    // No CDP clip/scale: capture the existing surface without a temporary render
+    // size/scale override. Crop and downsample locally, also for pixel preflight.
+    let shot=cdp(app,"Page.captureScreenshot",json!({"format":"png","fromSurface":true,"captureBeyondViewport":false}),None,None).await?;
+    let bytes=base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str().ok_or("截图为空")?).map_err(|e|e.to_string())?;
+    let pixels=png_dimensions(&bytes)?;
+    let vw=viewport["width"].as_f64().filter(|v|*v>0.).ok_or("无效视口")?;
+    let vh=viewport["height"].as_f64().filter(|v|*v>0.).ok_or("无效视口")?;
+    let (sx,sy)=(pixels.0 as f64/vw,pixels.1 as f64/vh);
+    let left=(x*sx).round().clamp(0.,pixels.0 as f64) as u32;
+    let top=(y*sy).round().clamp(0.,pixels.1 as f64) as u32;
+    let right=((x+w)*sx).round().clamp(0.,pixels.0 as f64) as u32;
+    let bottom=((y+h)*sy).round().clamp(0.,pixels.1 as f64) as u32;
+    if right<=left || bottom<=top {return Err("截图范围为空".into());}
+    Ok(xcap::image::load_from_memory(&bytes).map_err(|e|e.to_string())?.crop_imm(left,top,right-left,bottom-top))
 }
 
 async fn observe(app: &AppHandle, scope: &str) -> Result<Observation, String> {
@@ -1155,7 +1178,12 @@ async fn apply(
             if matches!(action,Action::ClickAt{..}|Action::ScrollAt{..}|Action::Drag{..}) {
                 progress.attempted=true;
                 cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseMoved","x":p["x"],"y":p["y"]}),None,Some(s.cancel.clone())).await?;
-                guard_coordinate(app,observation,&p,*x,*y,image_id).await?;
+                if p["hoverTarget"]["ref"].is_string() {
+                    evaluate(app,&observation.frames[0],format!("__novaWebview.verifyPoint({},{},{},{})",p["hoverTarget"]["ref"],p["x"],p["y"],p["hoverTarget"]["rect"])).await?;
+                    if evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?!=p["stamp"] {return Err("悬停期间视口已变化，停止点击".into());}
+                } else {
+                    guard_coordinate(app,observation,&p,*x,*y,image_id).await?;
+                }
             }
             match action {
                 Action::ClickAt {button,click_count,..} => mouse(app,s,&p,button.as_deref().unwrap_or("left"),click_count.unwrap_or(1),progress).await?,
@@ -1250,7 +1278,6 @@ fn image_point(observation: &Observation, x:f64, y:f64, image_id:Option<&str>) -
     }
 }
 async fn guard_coordinate(app:&AppHandle, observation:&Observation, point:&Value, x:f64, y:f64, image_id:Option<&str>) -> Result<(),String> {
-    use base64::Engine;
     let (cx,cy)=image_point(observation,x,y,image_id)?;
     let image=observation.images.iter().find(|i| image_id.map_or(cx>=i.x&&cy>=i.y&&cx<i.x+i.width&&cy<i.y+i.height, |id| i.id==id)).ok_or("坐标不在已返回的截图分片内，请重新截图")?;
     let (px,py)=((cx-image.x)*image.pixels.0 as f64/image.width,(cy-image.y)*image.pixels.1 as f64/image.height);
@@ -1268,12 +1295,8 @@ async fn guard_coordinate(app:&AppHandle, observation:&Observation, point:&Value
     let (width,height)=(right-left,bottom-top);
     let expected=xcap::image::open(&image.path).map_err(|e|e.to_string())?.to_rgba8();
     let expected=xcap::image::imageops::crop_imm(&expected,left,top,width,height).to_image();
-    let page_x=point["pageX"].as_f64().ok_or("缺少文档落点")?+(left as f64-px)*sx;
-    let page_y=point["pageY"].as_f64().ok_or("缺少文档落点")?+(top as f64-py)*sy;
-    let shot=cdp(app,"Page.captureScreenshot",json!({"format":"png","captureBeyondViewport":false,"clip":{"x":page_x,"y":page_y,"width":width as f64*sx,"height":height as f64*sy,"scale":1}}),None,None).await?;
-    let bytes=base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str().ok_or("落点校验截图为空")?).map_err(|e|e.to_string())?;
-    png_dimensions(&bytes)?;
-    let actual=xcap::image::load_from_memory(&bytes).map_err(|e|e.to_string())?.to_rgba8();
+    let actual=capture_viewport(app,&observation.pages["pages"][0]["viewport"],
+        vx+(left as f64-px)*sx,vy+(top as f64-py)*sy,width as f64*sx,height as f64*sy).await?.to_rgba8();
     if crate::visual_guard::patch_changed(&expected,&actual) { return Err("落点附近画面已变化，未点击；请根据新截图重新定位".into()); }
     if evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?!=point["stamp"] {return Err("落点校验期间视口已变化，停止点击".into());}
     Ok(())
@@ -1471,11 +1494,8 @@ async fn snapshot(
                 if w<=0. || h<=0. || x>=vw || y>=vh || x+w<=0. || y+h<=0. {return Err("region 不在当前视口中".into());}
                 (x.max(0.),y.max(0.),(x+w).min(vw)-x.max(0.),(y+h).min(vh)-y.max(0.))
             } else {(0.,0.,vw,vh)};
-            let scale=if edge==0 {1.} else {(edge as f64/w.max(h)).min(1.)};
-            let shot=cdp(app,"Page.captureScreenshot",json!({"format":"png","fromSurface":true,"captureBeyondViewport":false,
-                "clip":{"x":x+viewport["scrollX"].as_f64().unwrap_or(0.),"y":y+viewport["scrollY"].as_f64().unwrap_or(0.),"width":w,"height":h,"scale":scale}}),None,None).await?;
             let path=dir.join(format!("{}.png",observation.id));
-            let (bytes,pixels)=screenshot_bytes(shot["data"].as_str().ok_or("截图为空")?,edge as u32)?;
+            let (bytes,pixels)=encode_screenshot(capture_viewport(app,viewport,x,y,w,h).await?,edge as u32)?;
             std::fs::write(&path,bytes).map_err(|e|e.to_string())?;
             let image_id=format!("{}-0",observation.id);
             observation.images.push(ScreenshotImage{id:image_id.clone(),path:path.clone(),x,y,width:w,height:h,pixels});

@@ -88,6 +88,41 @@ try {
     await cdp.send('Input.dispatchMouseEvent',{type:'mouseMoved',x:p.x,y:p.y});
     await assert.rejects(call('verifyPoint',item.ref,p.x,p.y,p.rect),/改变|遮挡/);
   });
+  await run('coordinate dropdown hover permits highlighting but refuses replacement, movement and overlays',async()=>{
+    for(const mutation of ['highlight','replace','move','overlay','rename','disabled']) {
+      const obs=await fixture('<style>#option{position:absolute;left:150px;top:180px;width:240px;height:32px}#option:hover{background:rgb(40,150,240)}</style><div id="option">Leave-Pay</div>');
+      await cdp.send('Input.dispatchMouseEvent',{type:'mouseMoved',x:10,y:10});
+      const p=await call('coordinate',220,196,obs.stamp,false);
+      assert.ok(p.hoverTarget,'unlabelled custom options still have a live hit target');
+      await page.evaluate(mutation=>{
+        const e=document.querySelector('#option');
+        e.onmouseenter=()=>{
+          if(mutation==='replace')e.outerHTML=e.outerHTML;
+          if(mutation==='move')e.style.left='450px';
+          if(mutation==='overlay')document.body.insertAdjacentHTML('beforeend','<div style="position:fixed;inset:0;z-index:99"></div>');
+          if(mutation==='rename')e.textContent='Delete';
+          if(mutation==='disabled')e.setAttribute('aria-disabled','true');
+        };
+        e.onclick=()=>window.optionClicked=true;
+      },mutation);
+      await cdp.send('Input.dispatchMouseEvent',{type:'mouseMoved',x:p.x,y:p.y});
+      const verify=()=>call('verifyPoint',p.hoverTarget.ref,p.x,p.y,p.hoverTarget.rect);
+      if(mutation==='highlight') {
+        await verify();
+        assert.equal(await page.locator('#option').evaluate(e=>getComputedStyle(e).backgroundColor),'rgb(40, 150, 240)');
+        for(const type of ['mousePressed','mouseReleased'])await cdp.send('Input.dispatchMouseEvent',{type,x:p.x,y:p.y,button:'left',clickCount:1});
+        assert.equal(await page.evaluate(()=>window.optionClicked),true);
+      } else await assert.rejects(verify(),/失效|改变|遮挡/);
+    }
+    const link=await fixture('<a href="/one" style="display:block;width:300px;height:40px"><span>链接</span></a>');
+    const hit=await call('coordinate',10,10,link.stamp,false);
+    await page.evaluate(()=>document.querySelector('a').setAttribute('href','/two'));
+    await assert.rejects(call('verifyPoint',hit.hoverTarget.ref,hit.x,hit.y,hit.hoverTarget.rect),/失效/);
+    for(const markup of ['<canvas width="500" height="400"></canvas>','<svg width="500" height="400"><rect width="500" height="400"/></svg>']) {
+      const obs=await fixture(markup);
+      assert.equal((await call('coordinate',100,100,obs.stamp,false)).hoverTarget,undefined,'visual surfaces retain pixel validation');
+    }
+  });
   await run('fill focus checks catch application redirection, including shadow inputs',async()=>{
     const obs=await fixture('<input aria-label="来源" onclick="document.querySelector(\'#other\').focus()"><input id="other" aria-label="禁止覆盖" value="保留">');
     const item=target(obs,'来源');await click(item);

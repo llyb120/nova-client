@@ -1,6 +1,6 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 2) return;
+  if (globalThis.__novaWebview?.apiVersion === 3) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   const parent = e => e?.assignedSlot || e?.parentElement || e?.getRootNode()?.host;
   const contains = (e, child) => { for (; child; child = parent(child)) if (child === e) return true; return false; };
@@ -114,7 +114,7 @@
     return entry;
   };
   const api = {
-    apiVersion: 2,
+    apiVersion: 3,
     stamp,
     inputState(ref) {
       const e = active();
@@ -257,7 +257,16 @@
       }
       if (x>=innerWidth||y>=innerHeight) throw Error('坐标超出视口');
       const e=hitAt(x,y);
-      return {x,y,stamp:stamp(),pageX:x+scrollX,pageY:y+scrollY,editable:!!e&&editable(e),password:e?.type==='password',canvas:e?.tagName==='CANVAS',hit:e?{tag:e.tagName.toLowerCase(),name:label(e)}:null};
+      // Reuse live-node validation after hover; CSS highlight is not a stale target.
+      // Pixel-only surfaces still need the second visual check.
+      let hoverTarget;
+      if (e && !ancestors(e).some(node=>node.matches('canvas,iframe,frame,video,img,svg'))) {
+        const target=ancestors(e).find(node=>node.matches('button,a[href],input,select,textarea,[role=button],[role=option],[role=menuitem],li'))||e;
+        const ref=`${version}:coordinate:${identity(target)}`;
+        entries.set(ref,{e:target,fingerprint:fingerprint(target)});
+        hoverTarget={ref,rect:rect(target)};
+      }
+      return {x,y,stamp:stamp(),pageX:x+scrollX,pageY:y+scrollY,editable:!!e&&editable(e),password:e?.type==='password',canvas:e?.tagName==='CANVAS',hit:e?{tag:e.tagName.toLowerCase(),name:label(e)}:null,hoverTarget};
     },
   };
   Object.defineProperty(globalThis,'__novaWebview',{value:api,configurable:true});
