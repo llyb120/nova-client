@@ -51,14 +51,30 @@ try {
     window.setSidebarState('running', { root: true, child: true });
     window.setSidebarState('unreadTurns', { root: 4, child: 2, done: 3, legacy: 5, deleted: 8 });
   });
-  assert.equal(await runningBadge.textContent(), '1', 'parent and child count as one running task');
-  assert.equal(await unreadBadge.textContent(), '3', 'only completed visible threads contribute unread turns');
+  assert.equal(await rail.locator('.sidebar-rail-count').count(), 1, 'running and unread share one badge');
+  assert.equal(await runningBadge.textContent(), '4', 'one running chain plus three completed unread turns');
+  assert.equal(await unreadBadge.getAttribute('aria-label'), '运行中：1，已完成未读：3');
+  const splitBackground = await runningBadge.evaluate(el => getComputedStyle(el).backgroundImage);
+  assert.match(splitBackground, /linear-gradient\(135deg, .* 50%, .* 50%\)/);
+  const numberStyle = await runningBadge.locator('.sidebar-rail-count-number').evaluate(el => {
+    const style = getComputedStyle(el);
+    return { background: style.backgroundImage, clip: style.backgroundClip, color: style.color };
+  });
+  assert.equal(numberStyle.background, 'none');
+  assert.equal(numberStyle.color, 'rgb(255, 255, 255)');
+  await page.evaluate(() => window.setSidebarState('unreadTurns', 'done', 0));
+  assert.equal(await runningBadge.textContent(), '1');
+  assert.equal(await unreadBadge.count(), 0);
+  assert.equal(await runningBadge.evaluate(el => getComputedStyle(el).backgroundImage), 'none');
+  assert.equal(await runningBadge.locator('.sidebar-rail-count-number').evaluate(el => getComputedStyle(el).color), 'rgb(255, 255, 255)');
+  await page.evaluate(() => window.setSidebarState('unreadTurns', 'done', 3));
   await page.evaluate(() => window.setSidebarState('running', { root: false, child: false }));
   assert.equal(await runningBadge.count(), 0);
   assert.equal(await unreadBadge.textContent(), '9', 'completion moves unread turns into the badge');
+  assert.equal(await unreadBadge.evaluate(el => getComputedStyle(el).backgroundImage), 'none');
   await page.evaluate(() => window.setSidebarState('unreadTurns', { root: 0, child: 0, done: 120 }));
   assert.equal(await unreadBadge.textContent(), '99+');
-  assert.equal(await unreadBadge.getAttribute('aria-label'), '已完成未读：120');
+  assert.equal(await unreadBadge.getAttribute('aria-label'), '运行中：0，已完成未读：120');
   await page.evaluate(() => window.setSidebarState('currentId', 'done'));
   assert.equal(await unreadBadge.count(), 0, 'currently read conversation is excluded');
   await page.evaluate(() => {

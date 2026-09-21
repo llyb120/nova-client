@@ -142,6 +142,7 @@ export function Sidebar(props: {
       sum + (!thread.experienceThread && !hidden.has(thread.id) && thread.id !== state.currentId
         ? (state.unreadTurns[thread.id] ?? 0) : 0), 0);
   });
+  const railCount = () => chainInfo().rootCount + completedUnreadCount();
   const inRunningChain = (t: ThreadMeta) => virgoHidden().has(t.id);
   // 室女座里的任务数：减少焦虑下按运行中任务链计，手动收纳下按收纳的会话链计。
   const virgoChainCount = createMemo(() => {
@@ -602,14 +603,11 @@ export function Sidebar(props: {
             aria-label="会话列表" aria-controls="main-sidebar"
             aria-expanded={sidebarOpen()} onClick={() => { cancelHover(); setHovered(true); }}>
             <IconFolder size={18} />
-            <Show when={chainInfo().rootCount > 0}>
-              <span class="sidebar-rail-count running" aria-label={`运行中：${chainInfo().rootCount}`}>
-                {chainInfo().rootCount > 99 ? "99+" : chainInfo().rootCount}
-              </span>
-            </Show>
-            <Show when={completedUnreadCount() > 0}>
-              <span class="sidebar-rail-count unread" aria-label={`已完成未读：${completedUnreadCount()}`}>
-                {completedUnreadCount() > 99 ? "99+" : completedUnreadCount()}
+            <Show when={railCount() > 0}>
+              <span class="sidebar-rail-count"
+                classList={{ running: chainInfo().rootCount > 0, unread: completedUnreadCount() > 0 }}
+                aria-label={`运行中：${chainInfo().rootCount}，已完成未读：${completedUnreadCount()}`}>
+                <span class="sidebar-rail-count-number">{railCount() > 99 ? "99+" : railCount()}</span>
               </span>
             </Show>
           </button>
