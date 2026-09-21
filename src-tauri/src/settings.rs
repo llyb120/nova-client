@@ -64,11 +64,6 @@ fn default_powershell_utf8() -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    pub tencent_asr_app_id: String,
-    pub tencent_asr_secret_id: String,
-    pub tencent_asr_secret_key: String,
-    pub tencent_asr_engine_model_type: String,
-    pub voice_input_enabled: bool,
     /// Kimi Code CLI，使用固定的 `acp` 子命令。
     pub kimi_path: String,
     pub kimi_proxy: String,
@@ -197,11 +192,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            tencent_asr_app_id: "".into(),
-            tencent_asr_secret_id: "".into(),
-            tencent_asr_secret_key: "".into(),
-            tencent_asr_engine_model_type: "16k_zh".into(),
-            voice_input_enabled: false,
             kimi_path: "kimi".into(),
             kimi_proxy: String::new(),
             kimi_enabled: false,

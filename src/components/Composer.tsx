@@ -1,7 +1,5 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { rememberPromptDraft, takePromptDraft, saveSessionDraft, takeSessionDraft } from "../promptDraft";
-import { createVoiceInput } from "../voiceInput";
-import { VoiceInputStatus } from "./VoiceInputStatus";
 import {
   promptHistory as globalPromptHistory,
   rememberPromptHistory,
@@ -66,11 +64,6 @@ export function Composer() {
   const [activeHistoryIndex, setActiveHistoryIndex] = createSignal(0);
   const [choosingWorkflowRoute, setChoosingWorkflowRoute] = createSignal(false);
   let textareaRef: HTMLTextAreaElement | undefined;
-  const voice = createVoiceInput({
-    element: () => textareaRef, text, setText,
-    context: () => state.currentId,
-    enabled: () => state.settings?.voiceInputEnabled === true,
-  });
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
   let resizeFrame: number | undefined;
@@ -403,7 +396,6 @@ export function Composer() {
 
   // 运行中第一次回车只排队；队列可立即引导，或在当前任务结束后自动发送。
   const submit = () => {
-    if (voice.busy()) return;
     const value = text().trim();
     if (empty()) return;
     const images = attach.images().map((image) => ({ ...image }));
@@ -774,10 +766,6 @@ export function Composer() {
         <textarea
           ref={textareaRef}
           class="composer-input"
-          readOnly={voice.busy()}
-          data-voice-active={voice.busy()}
-          onPointerDown={voice.onPointerDown}
-          onLostPointerCapture={() => void voice.finish()}
           placeholder={
             running()
               ? supportsSteer()
@@ -818,9 +806,6 @@ export function Composer() {
           </span>
         </Show>
         <div class="composer-actions">
-          <Show when={state.settings?.voiceInputEnabled}>
-            <VoiceInputStatus voice={voice} />
-          </Show>
           <button
             type="button"
             class="composer-btn clue"

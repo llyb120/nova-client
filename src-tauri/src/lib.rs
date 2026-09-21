@@ -36,7 +36,6 @@ mod threads;
 mod thread_storage;
 mod time_machine;
 mod updater;
-mod voice;
 mod workspace_files;
 mod workspace_terminal;
 #[cfg(windows)]
@@ -418,7 +417,6 @@ fn any_session_running(state: &AppState) -> bool {
 }
 
 pub(crate) async fn shutdown_agent_processes(state: &AppState) {
-    voice::shutdown().await;
     state.acp.kill_conn().await;
     state.kimi.kill_conn().await;
     state.codex.kill_conn().await;
@@ -5654,7 +5652,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            voice::voice_request,
             workspace_terminal::terminal_create,
             workspace_terminal::terminal_write,
             workspace_terminal::terminal_resize,

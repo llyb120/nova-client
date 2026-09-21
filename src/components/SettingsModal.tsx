@@ -5,7 +5,6 @@ import * as QRCode from "qrcode";
 import { createEffect, createMemo, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
 import { api } from "../ipc";
 import AppearanceLayoutSettings from './AppearanceLayoutSettings';
-import { AuxiliarySettings } from './AuxiliarySettings';
 import {
   ALL_AGENT_KINDS,
   checkAndStageUpdate,
@@ -219,7 +218,6 @@ function CliManager(props: {
 
 type SettingsTab =
   | "general"
-  | "auxiliary"
   | "advanced"
   | "backends"
   | "instructions"
@@ -232,7 +230,6 @@ type SettingsTab =
 
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
-  { id: "auxiliary", name: "辅助" },
   { id: "advanced", name: "高级" },
   { id: "backends", name: "模型后端" },
   { id: "instructions", name: "Agent 配置" },
@@ -247,11 +244,6 @@ const TABS: { id: SettingsTab; name: string }[] = [
 export function SettingsModal(props: { onClose: () => void }) {
   const s = state.settings;
   const [tab, setTab] = createSignal<SettingsTab>("general");
-  const [tencentAsrAppId, setTencentAsrAppId] = createSignal(s?.tencentAsrAppId ?? "");
-  const [tencentAsrSecretId, setTencentAsrSecretId] = createSignal(s?.tencentAsrSecretId ?? "");
-  const [tencentAsrSecretKey, setTencentAsrSecretKey] = createSignal(s?.tencentAsrSecretKey ?? "");
-  const [tencentAsrEngineModelType, setTencentAsrEngineModelType] = createSignal(s?.tencentAsrEngineModelType ?? "16k_zh");
-  const [voiceInputEnabled, setVoiceInputEnabled] = createSignal(s?.voiceInputEnabled ?? false);
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
   const [kimiPath, setKimiPath] = createSignal(s?.kimiPath ?? "kimi");
@@ -697,11 +689,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   };
 
   const draftSettings = (): Settings => ({
-    tencentAsrAppId: tencentAsrAppId().trim(),
-    tencentAsrSecretId: tencentAsrSecretId().trim(),
-    tencentAsrSecretKey: tencentAsrSecretKey().trim(),
-    tencentAsrEngineModelType: tencentAsrEngineModelType().trim(),
-    voiceInputEnabled: voiceInputEnabled(),
     kimiPath: kimiPath().trim() || "kimi",
     kimiProxy: kimiProxy().trim(),
     kimiEnabled: kimiEnabled(),
@@ -1117,13 +1104,6 @@ export function SettingsModal(props: { onClose: () => void }) {
         </div>
 
         <div class="modal-body">
-          <Show when={tab() === "auxiliary"}>
-            <AuxiliarySettings tencentAsrAppId={tencentAsrAppId()} onTencentAsrAppIdChange={setTencentAsrAppId}
-              tencentAsrSecretId={tencentAsrSecretId()} onTencentAsrSecretIdChange={setTencentAsrSecretId}
-              tencentAsrSecretKey={tencentAsrSecretKey()} onTencentAsrSecretKeyChange={setTencentAsrSecretKey}
-              tencentAsrEngineModelType={tencentAsrEngineModelType()} onTencentAsrEngineModelTypeChange={setTencentAsrEngineModelType}
-              enabled={voiceInputEnabled()} onChange={setVoiceInputEnabled} />
-          </Show>
           {/* ===== 通用 ===== */}
           <Show when={tab() === "general"}>
             <section class="settings-group">
