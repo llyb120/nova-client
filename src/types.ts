@@ -415,6 +415,11 @@ export interface PendingNewSessionSeed {
 }
 
 export interface Settings {
+  tencentAsrAppId?: string;
+  tencentAsrSecretId?: string;
+  tencentAsrSecretKey?: string;
+  tencentAsrEngineModelType?: string;
+  voiceInputEnabled: boolean;
   kimiPath: string;
   kimiProxy: string;
   kimiEnabled: boolean;

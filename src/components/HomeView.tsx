@@ -2,6 +2,8 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 
 import { api } from "../ipc";
+import { createVoiceInput } from "../voiceInput";
+import { VoiceInputStatus } from "./VoiceInputStatus";
 import { latestFireStage } from "../threadDisplay";
 import { rememberPromptDraft, takePromptDraft, saveSessionDraft, takeSessionDraft } from "../promptDraft";
 import {
@@ -132,6 +134,11 @@ export function HomeView() {
   let scratchLoading = false;
   let submittingPrompt = false;
   let textareaRef: HTMLTextAreaElement | undefined;
+  const voice = createVoiceInput({
+    element: () => textareaRef, text, setText,
+    context: () => `${cwd()}:${state.homeComposerFocusAt}`,
+    enabled: () => state.settings?.voiceInputEnabled === true,
+  });
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
   let workflowPickerRef: HTMLDivElement | undefined;
@@ -626,6 +633,7 @@ export function HomeView() {
   const submit = async (
     opts: { ephemeral?: boolean; worktree?: boolean; branch?: string; base?: string } = {},
   ) => {
+    if (voice.busy()) return;
     const t = text().trim();
     const quoted = quote().trim();
     const prompt = quoted ? `<nova_quote>\n${quoted}\n</nova_quote>\n\n${t}` : t;
@@ -1125,6 +1133,10 @@ export function HomeView() {
             <textarea
               ref={textareaRef}
               class="composer-input"
+              readOnly={voice.busy()}
+              data-voice-active={voice.busy()}
+              onPointerDown={voice.onPointerDown}
+              onLostPointerCapture={() => void voice.finish()}
               placeholder={composerPlaceholder()}
               rows={3}
               value={text()}
@@ -1173,6 +1185,9 @@ export function HomeView() {
               />
             </Show>
             <div class="composer-actions">
+              <Show when={state.settings?.voiceInputEnabled}>
+                <VoiceInputStatus voice={voice} />
+              </Show>
               <Show when={!quotaPeer()}>
                 <div ref={workflowPickerRef} class="composer-workflow-picker">
                   <Show when={workflowMenuOpen()}>
