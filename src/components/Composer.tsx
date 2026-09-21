@@ -1,5 +1,5 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
-import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
+import { rememberPromptDraft, takePromptDraft, saveSessionDraft, takeSessionDraft } from "../promptDraft";
 import {
   promptHistory as globalPromptHistory,
   rememberPromptHistory,
@@ -54,7 +54,9 @@ import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 
 export function Composer() {
-  const [text, setText] = createSignal("");
+  let draftThreadId = state.currentId;
+  const initialDraft = takeSessionDraft(draftThreadId);
+  const [text, setText] = createSignal(initialDraft?.text ?? "");
   const [cursor, setCursor] = createSignal(0);
   const [slashStart, setSlashStart] = createSignal<number | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = createSignal(0);
@@ -117,6 +119,7 @@ export function Composer() {
   });
 
   const attach = createImageAttachments({ enableFileDrop: true });
+  attach.set(initialDraft?.images ?? []);
 
   const running = () => !!(state.currentId && state.running[state.currentId]);
   const [runClock, setRunClock] = createSignal(Date.now());
@@ -335,18 +338,24 @@ export function Composer() {
     on(
       () => state.currentId,
       (currentId, previousId) => {
-        if (previousId === undefined || currentId === previousId) return;
+        if (!currentId || previousId === undefined || currentId === previousId) return;
+        saveSessionDraft(draftThreadId, text(), attach.images());
         rememberPromptDraft(text(), attach.images());
-        setText("");
-        setCursor(0);
+        draftThreadId = currentId;
+        const draft = takeSessionDraft(currentId);
+        setText(draft?.text ?? "");
+        setCursor(draft?.text.length ?? 0);
         setSlashStart(null);
         setHistoryOpen(false);
-        attach.clear();
+        attach.set(draft?.images ?? []);
       },
     ),
   );
 
-  onCleanup(() => rememberPromptDraft(text(), attach.images()));
+  onCleanup(() => {
+    saveSessionDraft(draftThreadId, text(), attach.images());
+    rememberPromptDraft(text(), attach.images());
+  });
 
   const currentQueuedPrompts = createMemo(() => {
     const currentId = state.currentId;

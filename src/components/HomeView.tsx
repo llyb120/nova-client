@@ -3,7 +3,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show }
 
 import { api } from "../ipc";
 import { latestFireStage } from "../threadDisplay";
-import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
+import { rememberPromptDraft, takePromptDraft, saveSessionDraft, takeSessionDraft } from "../promptDraft";
 import {
   promptHistory,
   rememberPromptHistory,
@@ -65,12 +65,14 @@ const LAST_NEW_THREAD_PROJECT_KEY = "fd:lastNewThreadProject";
 /** codex 风格草稿首页：输入任务 + 选择项目/模型/模式，回车即开干 */
 export function HomeView() {
   const sessionSeed = takePendingNewSessionSeed();
-  const [text, setText] = createSignal("");
+  const initialDraft = takeSessionDraft(null);
+  const [text, setText] = createSignal(initialDraft?.text ?? "");
   const [quote, setQuote] = createSignal(sessionSeed?.quote ?? "");
   const [cursor, setCursor] = createSignal(0);
   const [slashStart, setSlashStart] = createSignal<number | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = createSignal(0);
   const attach = createImageAttachments({ enableFileDrop: true });
+  attach.set(initialDraft?.images ?? []);
   const noteFlow = createNoteFlow();
   const [cwd, setCwd] = createSignal(
     sessionSeed && !sessionSeed.roam ? sessionSeed.cwd : "",
@@ -593,7 +595,10 @@ export function HomeView() {
     queueMicrotask(() => textareaRef?.focus());
   });
   onCleanup(() => {
-    if (!submittingPrompt) rememberPromptDraft(text(), attach.images());
+    if (!submittingPrompt) {
+      saveSessionDraft(null, text(), attach.images());
+      rememberPromptDraft(text(), attach.images());
+    }
   });
 
   const onInput = (e: InputEvent) => {
