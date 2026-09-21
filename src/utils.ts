@@ -45,12 +45,21 @@ export function stripAnsi(text: string): string {
   return text.replace(ANSI_RE, "").replace(BARE_SGR_RE, "");
 }
 
+/** 旧 ACP 记录可能只剩截断的图片编码；仅隐藏显示副本，不改会话原文。
+ * ponytail: 旧记录已丢类型，按截断标记和长编码串识别；新记录由后端按图片类型清理。 */
+export function toolDisplayText(text: string): string {
+  return stripAnsi(text)
+    .replace(/data:image\/[\w.+-]+;base64,[A-Za-z0-9+/=_-]+/g, "[图片编码已隐藏]")
+    .replace(/^(\[输出过长[^\n]*\]\n)[A-Za-z0-9+/]{4096,}={0,2}/, "$1[已截断的图片编码已隐藏]")
+    .trim();
+}
+
 /** 历史工具记录可能保留旧后端名；统一为当前品牌展示。 */
 export function displayToolTitle(title: string): string {
   return title.replace(/^(?:Alkaid|Vega)(\s*\/)/, "Lyra$1");
 }
 
-// ─── 工具调用摘要展示（DOM ToolCallCard 与 canvas 渲染共用） ─────────────────
+// ─── 工具调用摘要展示（canvas 工具行使用） ───────────────────────────────────
 
 function isRecordValue(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);

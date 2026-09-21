@@ -1,4 +1,4 @@
-import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, lazy, onCleanup, onMount, Show, Suspense } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
 import { AchievementsModal } from "./components/AchievementsModal";
 import { ChatView } from "./components/ChatView";
@@ -15,9 +15,11 @@ import { UpdateModal } from "./components/UpdateModal";
 import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
 import { selectedChatText } from "./chatSelection";
-import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
+import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
 import { mountSessionShortcuts } from "./sessionShortcuts";
-import { setWorkspaceLayout } from "./workspaceLayout";
+import { createHomeTerminalState, setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
+const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
+const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"));
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
   return (
@@ -78,7 +80,7 @@ function ZenDropChip(props: { text: string }) {
       const u = 1 - e;
       const x = u * u * start.x + 2 * u * e * ctrl.x + e * e * end.x;
       const y = u * u * start.y + 2 * u * e * ctrl.y + e * e * end.y;
-      // 起步轻弹放大，中段巡航，末段缩小「被吸进去」；标签在中途逐渐消散。
+      // 起步轻弹放大，中段巡航，末段缩小「被吸进去」；标签在途中逐渐消散。
       const scale =
         t < 0.14
           ? 0.4 + 0.6 * (t / 0.14)
@@ -160,10 +162,18 @@ function AppToastChip(props: { text: string }) {
 }
 
 export default function App() {
+  const homeTerminal = createHomeTerminalState(() => ({
+    currentId: state.currentId,
+    view: state.view,
+    homeComposerFocusAt: state.homeComposerFocusAt,
+  }));
   const [showSettings, setShowSettings] = createSignal(false);
   const [showAchievements, setShowAchievements] = createSignal(false);
   const [showUpdate, setShowUpdate] = createSignal(false);
   const [showInbox, setShowInbox] = createSignal(false);
+  createEffect(() => {
+    if (state.view === "knowledge" && !state.settings?.knowledgeGraphEnabled) setView("home");
+  });
 
   onMount(() => {
     void initStore();
@@ -189,9 +199,14 @@ export default function App() {
 
   // 「打开未读消息」在应用聚焦时的按键处理；全局注册（Rust 侧）覆盖最小化/失焦场景。
   mountSessionShortcuts({
-    allowedActions: ["openUnread", "hideToVirgo"],
+    allowedActions: ["openUnread", "hideToVirgo", "toggleTerminal"],
     onOpenUnread: () => void openNextUnreadThread(),
     onHideToVirgo: hideCurrentThreadToVirgo,
+    onToggleTerminal: () => {
+      if (!state.currentId) { homeTerminal.toggle(); return; }
+      if (state.threads.find(thread => thread.id === state.currentId)?.roamingRole === "guest") return;
+      setWorkspaceLayout({ open: !(workspaceLayout.open && workspaceLayout.mode === "terminal"), mode: "terminal" });
+    },
   });
 
   // 空闲时后端请求更新（update:prompt）→ 自动弹出更新对话框，由用户选择是否现在更新。
@@ -220,7 +235,9 @@ export default function App() {
         fallback={
           <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
-            <HomeView />
+            <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={<HomeView />}>
+              <Suspense><KnowledgeGraphView /></Suspense>
+            </Show>
           }>
             <EvidenceChainView />
           </Show>
@@ -230,6 +247,9 @@ export default function App() {
         }
       >
         <ChatView />
+      </Show>
+      <Show when={homeTerminal.open()}>
+        <Suspense><HomeTerminalPanel onClose={homeTerminal.close} /></Suspense>
       </Show>
       <Show when={showSettings()}>
         <Show

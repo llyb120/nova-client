@@ -38,3 +38,15 @@ Rust 检查使用 cargo test 的 chrome_browser::tests。
 集成脚本 node scripts/native-browser-smoke.mjs 使用独立 Nova/WebView2 与模拟扩展，验证握手和共享操作引擎。真实 Chrome 端到端验证需加载扩展后进行。
 
 0.1.2 修复 Chrome 扩展 auto-attach-only 模式下直接发现/附加 Target 返回 Not allowed 的问题，改用 Target.setAutoAttach 和子会话事件，支持嵌套 iframe。Chrome 自身限制的内部页面仍受浏览器限制。
+
+## 精准交互与 Canvas 增强
+
+共享操作引擎增加 `scope=viewport` 快路径、带原节点/所属行校验的稳定定位、悬停后复核及 `fill` 焦点和实际值校验。`act` 可传互斥的 `action` 或 1–16 项 `actions`；只合批已确认、不依赖中间画面判断的步骤。
+
+Canvas 观察包含显示尺寸和绘图尺寸；大面积 Canvas 的 `inspect` 默认自动附可操作视口图。小目标可按 `frame/ref` 或 `region` 裁剪。传回 `imageId` 后坐标以对应 PNG 的实际像素为准，服务端处理缩放和偏移；拖动、右键/双击、横向滚动以及落点附近画面变化检查共用原生 CDP 路径。没有新增生产 Playwright、辅助模型或扩展权限。
+
+接口例子、失败恢复和明确的测试范围见 [精准交互说明](automation-precision.md)。本轮浏览器层测试不等于 Rust/Tauri、真实扩展及 WebGL 桌面流程已经验收。
+
+### 无痕模式
+
+在 chrome://extensions → Nova Chrome → 详情开启“允许在无痕模式下运行”，更新扩展后点击重新加载。工具 status/tabs 返回 incognitoAllowed；open/new_tab 传 incognito:true 新建无痕窗口并返回 tabTag，后续 inspect/act 使用该标签。tabs(incognito:true) 仅列出无痕标签，每项包含 incognito。未授权会报错，不降级到普通窗口；省略 incognito 创建普通标签。扩展使用 spanning，共用连接和标签身份。无痕浏览不意味着 Nova 不记录会话和截图。

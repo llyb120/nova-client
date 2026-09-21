@@ -1,3 +1,4 @@
+import { nextRunningThread } from "./nextRunningThread";
 import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
 import { batch, createSignal } from "solid-js";
@@ -190,7 +191,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关）；virgo = 室女座（减少焦虑） */
-  view: "home" | "clues" | "workflows" | "virgo";
+  view: "home" | "clues" | "workflows" | "virgo" | "knowledge";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -756,7 +757,7 @@ export async function refreshRoamingFolders() {
   }
 }
 
-export function setView(view: "home" | "clues" | "workflows" | "virgo") {
+export function setView(view: "home" | "clues" | "workflows" | "virgo" | "knowledge") {
   setState("view", view);
 }
 
@@ -1217,7 +1218,9 @@ function recoverProposedPlan(_thread: Thread): string | null {
 }
 
 let openThreadRequest = 0;
-let snapshotToolUpdates: { threadId: string; items: Map<number, ToolItem> } | undefined;
+let snapshotToolUpdates: {
+  threadId: string; items: Map<number, Item>; deltaVersions: Map<number, number>; removed: Set<number>; version: number;
+} | undefined;
 
 /** 切换会话耗时自测：仅在总耗时超阈值时写一行 agent 日志，release 包也能定位卡点。 */
 let switchTraceStart = 0;
@@ -1276,12 +1279,60 @@ export function setPromptQueuedThreads(ids: ReadonlySet<string>) {
   setState("promptQueued", reconcile(next));
 }
 
+const historyLoads = new Map<string, Promise<void>>();
+
+/** Hydrate display placeholders without letting an old request overwrite live updates or a new branch. */
+export async function ensureHistoryItems(ids?: number[]) {
+  const id = state.currentId;
+  if (!id) return;
+  const request = openThreadRequest;
+  const wanted = ids ? new Set(ids) : undefined;
+  const deferred = unwrap(state.items).filter(item => item.deferred && (!wanted || wanted.has(item.id)));
+  for (let offset = 0; offset < deferred.length; offset += 256) {
+    if (state.currentId !== id || request !== openThreadRequest) return;
+    const page = deferred.slice(offset, offset + 256);
+    const key = `${id}:${request}:${page.map(item => item.id).join(",")}`;
+    let pending = historyLoads.get(key);
+    if (!pending) {
+      pending = (async () => {
+        const loaded = await api.getThreadItems(id, page.map(item => item.id));
+        if (state.currentId !== id || request !== openThreadRequest) return;
+        const originals = new Map(page.map(item => [item.id, item]));
+        const found = new Set(loaded.map(item => item.id));
+        if (page.some(item => !found.has(item.id))) {
+          // History was truncated/restored while the page was in flight.
+          staleThreadSnapshots.add(id);
+          await openThread(id);
+          return;
+        }
+        batch(() => {
+          const current = unwrap(state.items);
+          const positions = new Map(current.map((item, index) => [item.id, index]));
+          const replacements = new Map<number, Item>();
+          for (const item of loaded) {
+            const index = positions.get(item.id);
+            if (index == null || current[index] !== originals.get(item.id) || !current[index].deferred) continue;
+            replacements.set(item.id, item);
+          }
+          // Replace identity so closed group caches/layouts invalidate, too.
+          if (replacements.size) setState("items", current.map(item => replacements.get(item.id) ?? item));
+        });
+        rememberCurrentThreadSnapshot();
+      })().finally(() => historyLoads.delete(key));
+      historyLoads.set(key, pending);
+    }
+    await pending;
+    // Large explicit reads (timeline preview/artifact browser) yield between IPC pages.
+    if (offset + 256 < deferred.length) await new Promise<void>(resolve => setTimeout(resolve, 0));
+  }
+}
+
 export async function openThread(id: string) {
   // 手动收进室女座的会话一旦打开就回到普通列表，避免用户盯着一个看不见归属的会话。
   unhideVirgoThread(id);
   if (state.unreadTurns[id]) setUnreadTurns(id, 0);
   const switching = state.currentId !== id;
-  const request = switching ? ++openThreadRequest : openThreadRequest;
+  const request = ++openThreadRequest;
   const previousId = state.currentId;
   if (switching && !switchTraceStart) markThreadSwitchStart();
   flushPendingStreamUpdates();
@@ -1332,7 +1383,7 @@ export async function openThread(id: string) {
     if (request !== openThreadRequest || state.currentId !== id) return;
   }
 
-  const toolUpdates = { threadId: id, items: new Map<number, ToolItem>() };
+  const toolUpdates = { threadId: id, items: new Map<number, Item>(), deltaVersions: new Map<number, number>(), removed: new Set<number>(), version: 0 };
   snapshotToolUpdates = toolUpdates;
   try {
     // 先接通前台推流再取快照，避免工具在快照之后、active_thread 切换之前完成而漏报。
@@ -1348,7 +1399,7 @@ export async function openThread(id: string) {
       else void ensureModelOptions(agentKind);
       return;
     }
-    const t = await api.getThread(id);
+    const t = await api.getThreadView(id);
     traceThreadSwitch(id, "getThread(IPC) 返回");
     if (request !== openThreadRequest) return;
     rememberThreadSnapshot(t);
@@ -1363,7 +1414,25 @@ export async function openThread(id: string) {
     // IPC 返回途中收到的终态可能比快照更新，冷加载不能丢，暖加载不能被旧快照覆盖。
     batch(() => {
       for (const item of toolUpdates.items.values()) applyOp({ t: "upsert", item });
+      for (const itemId of toolUpdates.removed) applyOp({ t: "remove", itemId });
     });
+    // Image projection can outlast multiple streaming events. Deltas have no backend
+    // cursor, so fetch authoritative items and only commit a page if no newer delta
+    // arrived during that read. Never concatenate possibly already-included deltas.
+    while (toolUpdates.deltaVersions.size && request === openThreadRequest && state.currentId === id) {
+      const versions = new Map([...toolUpdates.deltaVersions].slice(0, 256));
+      const items = await api.getThreadItems(id, [...versions.keys()]);
+      if (request !== openThreadRequest || state.currentId !== id) return;
+      const byId = new Map(items.map(item => [item.id, item]));
+      batch(() => {
+        for (const [itemId, version] of versions) {
+          if (toolUpdates.deltaVersions.get(itemId) !== version) continue;
+          toolUpdates.deltaVersions.delete(itemId);
+          const item = byId.get(itemId);
+          applyOp(item ? { t: "upsert", item } : { t: "remove", itemId });
+        }
+      });
+    }
     const roamingPeer =
       t.roamingRole === "guest" ? t.roamingPeer ?? null : t.quotaPeer ?? null;
     if (roamingPeer) ensurePeerModels(roamingPeer);
@@ -1664,7 +1733,7 @@ export function chainUnreadTurns(thread: ThreadMeta | undefined): number {
 
 /**
  * 「打开未读消息」快捷键（含全局触发）：循环打开普通模式下有未读轮次的会话链。
- * 口径与侧栏普通模式列表一致：排除训练会话；减少焦虑模式下排除室女座运行链。
+ * 未读沿用侧栏普通列表口径；无未读时循环进行中的普通会话（含室女座）。
  */
 export async function openNextUnreadThread(): Promise<void> {
   // 口径与侧栏普通模式列表一致：排除训练会话，以及室女座收起的会话。
@@ -1676,7 +1745,13 @@ export async function openNextUnreadThread(): Promise<void> {
   const unreadRoots = visible.filter(
     (t) => (!t.parentThreadId || !visibleIds.has(t.parentThreadId)) && chainUnreadTurns(t) > 0,
   );
-  if (unreadRoots.length === 0) return;
+  if (unreadRoots.length === 0) {
+    const target = nextRunningThread(
+      state.threads.filter(thread => !isPendingThreadId(thread.id)), state.currentId, state.running,
+    );
+    if (target) { setView("home"); await openThread(target.id); }
+    return;
+  }
   // 当前打开的会话在某条未读链上时取下一组，循环轮转；否则从第一组开始
   const currentIndex = unreadRoots.findIndex((root) => {
     let node = state.threads.find((t) => t.id === state.currentId);
@@ -3025,6 +3100,26 @@ function queueDelta(op: Extract<UpdateOp, { t: "delta" }>) {
   deltaFlushTimer = window.setTimeout(flushPendingDeltas, wait);
 }
 
+const imageProjectionTickets = new WeakMap<Item, object>();
+function projectLiveImages(item: Item) {
+  const id = state.currentId;
+  if (!id) return;
+  const request = openThreadRequest;
+  const original = unwrap(state.items).find(current => current.id === item.id);
+  if (!original) return;
+  const ticket = {};
+  imageProjectionTickets.set(original, ticket);
+  if (item.type !== "user" || !item.images?.some(image => image.mimeType.startsWith("image/") && image.data)) return;
+  void api.getThreadItems(id, [item.id]).then(([projected]) => {
+    if (state.currentId !== id || request !== openThreadRequest || projected?.type !== "user") return;
+    const current = unwrap(state.items);
+    const index = current.findIndex(value => value.id === item.id);
+    if (index < 0 || current[index] !== original || imageProjectionTickets.get(original) !== ticket) return;
+    setState("items", current.map((value, i) => i === index ? projected : value));
+    rememberCurrentThreadSnapshot();
+  }).catch(error => console.error("Image display projection failed", error));
+}
+
 function applyUpsert(item: Item) {
   // Turn 落库意味着本轮用量已有终值，清掉进行中的实时值，防止短暂双计。
   if (item.type === "turn") {
@@ -3053,6 +3148,7 @@ function applyUpsert(item: Item) {
   }
   if (idx >= 0) setState("items", idx, reconcile(item));
   else setState("items", state.items.length, item);
+  if (item.type === "user") projectLiveImages(item);
 }
 
 function flushPendingToolUpserts() {
@@ -3262,9 +3358,19 @@ export async function initStore() {
       // mode / proposed_plan / plan 是低频关键状态，加载中也要应用，否则 agent 切到 Plan
       // 时选择器与「实施此计划」按钮会对不齐。
       const apply = (op: UpdateOp) => {
-        if (snapshotToolUpdates?.threadId === e.payload.threadId && op.t === "upsert"
-          && op.item.type === "tool" && op.item.status !== "pending" && op.item.status !== "in_progress") {
-          snapshotToolUpdates.items.set(op.item.id, op.item);
+        if (snapshotToolUpdates?.threadId === e.payload.threadId) {
+          if (op.t === "upsert") {
+            snapshotToolUpdates.items.set(op.item.id, op.item);
+            snapshotToolUpdates.deltaVersions.delete(op.item.id);
+            snapshotToolUpdates.removed.delete(op.item.id);
+          } else if (op.t === "delta") {
+            const versions = snapshotToolUpdates.deltaVersions;
+            versions.set(op.itemId, ++snapshotToolUpdates.version);
+          } else if (op.t === "remove") {
+            snapshotToolUpdates.removed.add(op.itemId);
+            snapshotToolUpdates.items.delete(op.itemId);
+            snapshotToolUpdates.deltaVersions.delete(op.itemId);
+          }
         }
         if (
           state.loadingThread &&

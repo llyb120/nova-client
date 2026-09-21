@@ -37,8 +37,10 @@ import type {
 } from "./types";
 import type { WorkflowDef } from "./workflow/types";
 
-function fileUriPath(uri: string) {
-  const path = decodeURI(uri.replace(/^file:\/\//, ""));
+export function fileUriPath(uri: string) {
+  const raw = uri.replace(/^file:\/\//, "");
+  let path = raw;
+  try { path = decodeURIComponent(raw); } catch { /* Legacy URIs may contain literal %. */ }
   return /^\/[A-Za-z]:\//.test(path) ? path.slice(1) : path;
 }
 
@@ -62,6 +64,9 @@ export const api = {
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
   loadThreads: () => invoke<[ThreadMeta[], Thread[]]>("load_threads"),
   getThread: (threadId: string) => invoke<Thread>("get_thread", { threadId }),
+  getThreadView: (threadId: string) => invoke<Thread>("get_thread_view", { threadId }),
+  getThreadItems: (threadId: string, itemIds: number[]) =>
+    invoke<Thread["items"]>("get_thread_items", { threadId, itemIds }),
   createTimeMachineCheckpoint: (threadId: string) =>
     invoke<TimeMachineTimeline>("create_time_machine_checkpoint", { threadId }),
   getTimeMachineTimeline: (threadId: string) =>

@@ -20,8 +20,9 @@ import {
   timeMachineChangedSignal,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
+import { ensureHistoryItems } from "../store";
 import { resolveUserScrollStick } from "../scrollStick";
-import type { AgentKind, Item, Thread, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
+import type { AgentKind, Item, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
@@ -31,200 +32,9 @@ import { PlanActionCard } from "./PlanActionCard";
 import { ShareModal } from "./ShareModal";
 import { TimeNotesModal } from "./TimeNotesModal";
 import { TypewriterText } from "./TypewriterText";
-import { fmtTokens, type Group, groupItems, TurnGroup } from "./TurnGroup";
+import { fmtTokens, groupItems } from "./TurnGroup";
 
 const WorkspacePanel = lazy(() => import("./WorkspacePanel"));
-
-interface VirtualObserverPool {
-  intersectionObserver: IntersectionObserver;
-  resizeObserver: ResizeObserver;
-  intersectionCallbacks: Map<Element, () => void>;
-  resizeCallbacks: Map<Element, () => void>;
-}
-
-const virtualObserverPools = new WeakMap<HTMLElement, VirtualObserverPool>();
-
-const virtualBuffer = (root: HTMLElement) => Math.max(1200, root.clientHeight * 2);
-
-/** 同一个滚动根只创建一组观察器；轮次再多也不新增 IO / ResizeObserver 实例。 */
-function observeVirtualGroup(
-  root: HTMLElement,
-  element: Element,
-  intersectionCallback: () => void,
-  resizeCallback: () => void,
-) {
-  let pool = virtualObserverPools.get(root);
-  if (!pool) {
-    const intersectionCallbacks = new Map<Element, () => void>();
-    const resizeCallbacks = new Map<Element, () => void>();
-    const intersectionObserver = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) intersectionCallbacks.get(entry.target)?.();
-      },
-      { root, rootMargin: `${virtualBuffer(root)}px 0px` },
-    );
-    const resizeObserver = new ResizeObserver((entries) => {
-      for (const entry of entries) resizeCallbacks.get(entry.target)?.();
-    });
-    pool = { intersectionObserver, resizeObserver, intersectionCallbacks, resizeCallbacks };
-    virtualObserverPools.set(root, pool);
-  }
-  pool.intersectionCallbacks.set(element, intersectionCallback);
-  pool.resizeCallbacks.set(element, resizeCallback);
-  pool.intersectionObserver.observe(element);
-  pool.resizeObserver.observe(element);
-  return () => {
-    pool!.intersectionObserver.unobserve(element);
-    pool!.resizeObserver.unobserve(element);
-    pool!.intersectionCallbacks.delete(element);
-    pool!.resizeCallbacks.delete(element);
-    if (pool!.intersectionCallbacks.size === 0) {
-      pool!.intersectionObserver.disconnect();
-      pool!.resizeObserver.disconnect();
-      virtualObserverPools.delete(root);
-    }
-  };
-}
-
-/**
- * transcript 虚拟化包裹层：长会话若把每一轮（含 Markdown 结论、工具卡片、diff）都常驻
- * DOM，节点数随会话线性增长，WebView2 渲染进程内存单调上涨直至崩溃。这里给每个轮次套一层
- * 轻量 wrapper（始终存在，成本仅一个 div），用 IntersectionObserver 判断是否临近视口：
- * 远离视口时卸载内部重内容、用等高占位撑住（滚动位置不跳），滚回来再挂载。
- * 正在流式输出的当前轮（active）与列表末组永不卸载，避免高度剧变 / 发送后钉底失效。
- */
-function VirtualGroup(props: {
-  group: Group;
-  index: number;
-  active: boolean;
-  /** 列表最后一组：始终挂载，保证新提示词有真实高度可供吸底 */
-  keepMounted?: boolean;
-  scrollEl: () => HTMLElement | undefined;
-  /** 已挂载内容在视口上方变高/变矮时补偿 scrollTop，保持正在阅读的内容不跳 */
-  compensateHeight: (delta: number) => void;
-}) {
-  let ref: VirtualGroupElement | undefined;
-  const [visible, setVisible] = createSignal(true);
-  const [height, setHeight] = createSignal(0);
-  const mounted = () => visible() || props.active || !!props.keepMounted;
-
-  const rememberHeight = () => {
-    if (!ref || !mounted()) return;
-    const h = ref.getBoundingClientRect().height;
-    const prev = height();
-    if (h <= 0 || Math.abs(prev - h) <= 0.5) return;
-
-    // 浏览器滚动锚定被禁用后，视口上方内容的真实尺寸变化必须由虚拟列表自己补偿。
-    // 首次测量时内容本来就在正常流里，不能重复补；只修正已有占位高度的差值。
-    const root = props.scrollEl();
-    const aboveViewport =
-      !!root && ref.getBoundingClientRect().bottom <= root.getBoundingClientRect().top;
-    setHeight(h);
-    if (prev > 0 && aboveViewport) props.compensateHeight(h - prev);
-  };
-
-  /** 挂回视口上方的占位时，立即补偿真实高度差，避免一次小滚动产生大幅跳跃。 */
-  const mountContent = () => {
-    if (!ref || visible()) return;
-    const root = props.scrollEl();
-    const before = ref.getBoundingClientRect();
-    const aboveViewport = !!root && before.bottom <= root.getBoundingClientRect().top;
-    setVisible(true);
-
-    const h = ref.getBoundingClientRect().height;
-    const prev = height();
-    if (h > 0 && Math.abs(h - prev) > 0.5) {
-      setHeight(h);
-      if (prev > 0 && aboveViewport) props.compensateHeight(h - prev);
-    }
-  };
-
-  /**
-   * 不直接信任 IntersectionObserver 传来的 entry：快速程序化滚动时，WebView2 可能在
-   * 回调执行前已经滚到了新位置，旧 entry 会把当前视口里的轮次误卸载成一整块空白。
-   * 每次都用当前几何位置复核，并由父级滚动 tick 再兜一层。
-   */
-  const syncMounted = () => {
-    if (!ref || props.active || props.keepMounted) {
-      mountContent();
-      return;
-    }
-    const root = props.scrollEl();
-    if (!root) {
-      // 找不到滚动根时宁可保留 DOM，不能把内容变成无法恢复的空占位。
-      setVisible(true);
-      return;
-    }
-    const rect = ref.getBoundingClientRect();
-    const rootRect = root.getBoundingClientRect();
-    const buffer = virtualBuffer(root);
-    const nearViewport =
-      rect.bottom >= rootRect.top - buffer && rect.top <= rootRect.bottom + buffer;
-    if (nearViewport) {
-      mountContent();
-    } else {
-      rememberHeight();
-      setVisible(false);
-    }
-  };
-
-  onMount(() => {
-    if (!ref) return;
-    const root = props.scrollEl();
-    if (!root) return;
-    const stopObserving = observeVirtualGroup(root, ref, syncMounted, rememberHeight);
-    // scroll 事件可以通过命中测试直接唤醒当前视口内的占位，并同步修正锚点。
-    ref.mountVirtualGroup = mountContent;
-    syncMounted();
-    onCleanup(() => {
-      stopObserving();
-      if (ref) delete ref.mountVirtualGroup;
-    });
-  });
-
-  // keepMounted / active 变为 true 时立即挂回；普通滚动交给 IO 和视口命中唤醒处理。
-  createEffect(() => {
-    if (props.active || props.keepMounted) mountContent();
-  });
-
-  return (
-    <div
-      ref={ref}
-      class="vgroup"
-      data-group-index={props.index}
-      // 仅卸载时使用缓存高度。挂载后必须恢复自然高度，否则内容折叠时旧 min-height
-      // 会反过来撑住观察目标，ResizeObserver 无法测到变矮后的真实尺寸。
-      style={height() > 0 && !mounted() ? { height: `${height()}px` } : undefined}
-    >
-      <Show when={mounted()}>
-        <TurnGroup group={props.group} active={props.active} />
-      </Show>
-    </div>
-  );
-}
-
-interface VirtualGroupElement extends HTMLDivElement {
-  mountVirtualGroup?: () => void;
-}
-
-interface TranscriptSegmentProps {
-  stage: "Wake" | "Do";
-  threadId: string;
-  agentKind: Thread["agentKind"];
-  model?: string | null;
-}
-
-function TranscriptSegment(props: TranscriptSegmentProps) {
-  return (
-    <div class="transcript-segment" data-thread-id={props.threadId}>
-      <span class={`agent-badge ${props.agentKind}`}>{props.stage}</span>
-      <span class="transcript-segment-agent">{agentLabel(props.agentKind)}</span>
-      <span class="transcript-segment-model" title={props.model || "默认模型"}>
-        {props.model || "默认模型"}
-      </span>
-    </div>
-  );
-}
 
 export function ChatView() {
   const workspaceOpen = () => workspaceLayout.open;
@@ -236,21 +46,11 @@ export function ChatView() {
     const target = typeof detail === 'string' ? { path: detail } : detail;
     if (!target || typeof target.path !== "string" || !state.currentId) return;
     setWorkspaceRequest(target);
-    setWorkspaceOpen(true);
+    setWorkspaceLayout({ open: true, mode: "files" });
   };
   onMount(() => window.addEventListener("nova:preview-file", previewFile));
   onCleanup(() => window.removeEventListener("nova:preview-file", previewFile));
-  let scrollRef: HTMLDivElement | undefined;
-  let innerRef: HTMLDivElement | undefined;
   let transcriptRef: CanvasTranscriptHandle | undefined;
-  const renderMode = () => state.settings?.chatViewRender ?? "canvas";
-  const hasWorkflowPreview = () => displayedItems().some(
-    (item) => item.type === "system" && item.level === "workflow",
-  );
-  /** 工作流设计图需要 SVG/DOM 渲染；包含预览时自动回退 DOM transcript。 */
-  const forceDomTranscript = () => hasWorkflowPreview();
-  const useCanvas = () => renderMode() === "canvas" && !forceDomTranscript();
-  const useAnyCanvas = useCanvas;
   const [stickToBottom, setStickToBottom] = createSignal(true);
 
   mountSessionShortcuts({
@@ -264,13 +64,7 @@ export function ChatView() {
     },
   });
   let scrollQueued = false;
-  let scrollFrame = 0;
   let lastScrollTop = 0;
-  let lastVirtualMountTop = Number.NaN;
-  let pointerActive = false;
-  let pressToggle: HTMLElement | null = null;
-  let pressWasAtBottom = false;
-  let pressScrollHeight = 0;
 
   const permissions = createMemo(() =>
     state.permissions.filter((p) => p.threadId === state.currentId),
@@ -278,7 +72,6 @@ export function ChatView() {
 
   const [previewItems, setPreviewItems] = createSignal<Item[] | null>(null);
   const [previewCheckpointId, setPreviewCheckpointId] = createSignal<string | null>(null);
-  const [previewFading, setPreviewFading] = createSignal(false);
   let previewRequest = 0;
   let previewTimer: ReturnType<typeof setTimeout> | undefined;
   const displayedItems = () => previewItems() ?? (state.items as Item[]);
@@ -287,13 +80,12 @@ export function ChatView() {
     [],
   );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
-  const lastGroupIndex = () => groups().length - 1;
   const timeStops = createMemo(() => {
     let turn = 0;
     return groups().flatMap((group, index) => {
       if (!group.user) return [];
       turn++;
-      const text = group.user.text.replace(/\s+/g, " ").trim();
+      const text = group.user.text.slice(0, 160).replace(/\s+/g, " ").trim();
       return [{ index, turn, label: text || `第 ${turn} 轮` }];
     });
   });
@@ -303,46 +95,20 @@ export function ChatView() {
   const syncTimeCursor = () => {
     const stops = timeStops();
     if (stops.length === 0) { setActiveTimeIndex(-1); return; }
-    if (useCanvas()) {
-      if (!transcriptRef) return;
-      const groupIndex = transcriptRef.activeGroup();
-      let best = 0;
-      for (let i = 0; i < stops.length; i++) {
-        if (stops[i].index <= groupIndex) best = stops[i].index;
-      }
-      setActiveTimeIndex(best);
-      return;
+    if (!transcriptRef) return;
+    const groupIndex = transcriptRef.activeGroup();
+    let best = 0;
+    for (const stop of stops) {
+      if (stop.index > groupIndex) break;
+      best = stop.index;
     }
-    if (!scrollRef || !innerRef) return;
-    const elements = innerRef.querySelectorAll<HTMLElement>(":scope > .vgroup");
-    const top = scrollRef.getBoundingClientRect().top + 32;
-    let low = 0;
-    let high = stops.length;
-    while (low < high) {
-      const middle = (low + high) >> 1;
-      const element = elements[stops[middle].index];
-      if (element && element.getBoundingClientRect().top <= top) low = middle + 1;
-      else high = middle;
-    }
-    setActiveTimeIndex(stops[Math.max(0, low - 1)].index);
+    setActiveTimeIndex(best);
   };
 
   const travelTo = (index: number) => {
     cancelBottomFollow();
-    if (useCanvas()) {
-      transcriptRef?.scrollToGroup(index);
-      syncTimeCursor();
-      return;
-    }
-    const element = innerRef?.querySelector<VirtualGroupElement>(
-      `.vgroup[data-group-index="${index}"]`,
-    );
-    if (!element) return;
-    element.mountVirtualGroup?.();
-    requestAnimationFrame(() => {
-      element.scrollIntoView({ block: "start" });
-      syncTimeCursor();
-    });
+    transcriptRef?.scrollToGroup(index);
+    syncTimeCursor();
   };
 
   const returnToNow = () => {
@@ -350,159 +116,12 @@ export function ChatView() {
     setActiveTimeIndex(latestTimeIndex());
   };
 
-  /**
-   * IO 回调是异步的，拖动滚动条跨很长距离时可能晚一帧。WebView2 的命中测试在合成器
-   * 快速滚动期间还可能停留在旧位置，因此不能依赖 elementFromPoint 找锚点。这里直接按
-   * wrapper 的当前几何位置二分出首个候选，再同步挂载视口和两屏缓冲区，避免工具详情占位
-   * 在快速滑动时整屏留白。
-   */
-  const mountVisibleVirtualGroups = (force = false) => {
-    if (useAnyCanvas() || !scrollRef || !innerRef) return;
-    const viewportHeight = scrollRef.clientHeight;
-    if (
-      !force &&
-      Number.isFinite(lastVirtualMountTop) &&
-      Math.abs(scrollRef.scrollTop - lastVirtualMountTop) < viewportHeight / 3
-    ) {
-      return;
-    }
-
-    const elements = innerRef.querySelectorAll<VirtualGroupElement>(":scope > .vgroup");
-    if (elements.length === 0) return;
-    lastVirtualMountTop = scrollRef.scrollTop;
-
-    const rootRect = scrollRef.getBoundingClientRect();
-    const top = rootRect.top - virtualBuffer(scrollRef);
-    const bottom = rootRect.bottom + virtualBuffer(scrollRef);
-
-    let low = 0;
-    let high = elements.length;
-    while (low < high) {
-      const middle = (low + high) >> 1;
-      if (elements[middle].getBoundingClientRect().bottom < top) low = middle + 1;
-      else high = middle;
-    }
-
-    for (let index = low; index < elements.length; index++) {
-      const element = elements[index];
-      if (element.getBoundingClientRect().top > bottom) break;
-      element.mountVirtualGroup?.();
-    }
-  };
-
-  const maxScrollTop = () =>
-    useCanvas()
-      ? (transcriptRef?.maxScrollTop() ?? 0)
-      : scrollRef
-        ? Math.max(0, scrollRef.scrollHeight - scrollRef.clientHeight)
-        : 0;
-
-  const isAtBottom = () =>
-    useCanvas()
-      ? (transcriptRef?.isAtBottom() ?? true)
-      : !scrollRef || maxScrollTop() - scrollRef.scrollTop <= 1;
-
+  const isAtBottom = () => transcriptRef?.isAtBottom() ?? true;
   const cancelBottomFollow = () => setStickToBottom(false);
-
-  const isToolDetailScroll = (target: EventTarget | null) =>
-    target instanceof Element && !!target.closest(".tool-output, .tool-raw");
-
-  const handleWheel = (event: WheelEvent) => {
-    if (useAnyCanvas()) return;
-    if (isToolDetailScroll(event.target)) return;
-    if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
-    if (event.deltaY > 0 && isAtBottom()) {
-      if (!stickToBottom()) enableBottomFollow();
-      return;
-    }
-    if (event.deltaY !== 0) cancelBottomFollow();
-  };
-
-  const handlePointerDown = (event: PointerEvent) => {
-    if (useAnyCanvas()) return;
-    pressToggle = null;
-    if (isToolDetailScroll(event.target)) return;
-    pointerActive = true;
-    pressToggle = event.target instanceof Element
-      ? event.target.closest<HTMLElement>(".tool-line, .thought-toggle, .turn-fold, .process-toggle, .raw-toggle")
-      : null;
-    pressWasAtBottom = isAtBottom();
-    pressScrollHeight = scrollRef?.scrollHeight ?? 0;
-    // 折叠/思考/工具头开合会改变文档高度：若仍在吸底，pointerup 的钉底微任务和
-    // 运行中新内容触发的钉底会在 click 前移动滚动位置，吞掉首次点击（表现为
-    // 先滚到最底、要再点一次）；展开后又会被新内容拉回最底。按下即退出吸底，
-    // 对齐 Canvas 版 onBrowseDetail 的行为。
-    if (pressToggle) cancelBottomFollow();
-  };
-
-  // 吸底时开合头行：按下已退出吸底。展开后与 Canvas resolveExpandScroll 同一
-  // 规则——头行仍在新文档最后一屏内就钉回底部（展开内容入视野、滚动条不上
-  // 移），展开量把头行顶出屏外时保持头行锚定（scrollTop 不动即锚定）。收起
-  // 后仍贴底则恢复吸底。
-  const handleTranscriptClick = () => {
-    const el = pressToggle;
-    const wasAtBottom = pressWasAtBottom;
-    const heightBefore = pressScrollHeight;
-    pressToggle = null;
-    if (useAnyCanvas() || !scrollRef || !el?.isConnected || !wasAtBottom) return;
-    const grew = scrollRef.scrollHeight > heightBefore;
-    if (!grew) {
-      if (isAtBottom()) {
-        setStickToBottom(true);
-        pinBottom();
-      }
-      return;
-    }
-    const docTop =
-      el.getBoundingClientRect().top - scrollRef.getBoundingClientRect().top + scrollRef.scrollTop;
-    if (docTop >= maxScrollTop()) {
-      setStickToBottom(true);
-      pinBottom();
-    }
-  };
-
-  const processTranscriptScroll = () => {
-    if (useAnyCanvas()) {
-      syncTimeCursor();
-      return;
-    }
-    mountVisibleVirtualGroups();
-    syncTimeCursor();
-    const currentTop = scrollRef?.scrollTop ?? 0;
-    const atBottom = isAtBottom();
-    if (stickToBottom()) {
-      if (pointerActive && !atBottom && currentTop !== lastScrollTop) cancelBottomFollow();
-    } else if (atBottom && currentTop > lastScrollTop) {
-      setStickToBottom(true);
-    }
-    lastScrollTop = currentTop;
-  };
-
-  const handleTranscriptScroll = () => {
-    if (scrollFrame) return;
-    scrollFrame = requestAnimationFrame(() => {
-      scrollFrame = 0;
-      processTranscriptScroll();
-    });
-  };
-
   const pinBottom = () => {
-    if (!stickToBottom() || pointerActive) return;
-    if (useCanvas()) {
-      transcriptRef?.scrollToBottom();
-      lastScrollTop = transcriptRef?.scrollTop() ?? 0;
-      return;
-    }
-    if (!scrollRef) return;
-    scrollRef.scrollTop = maxScrollTop();
-    lastScrollTop = scrollRef.scrollTop;
-    mountVisibleVirtualGroups(true);
-  };
-
-  const compensateVirtualHeight = (delta: number) => {
-    if (useAnyCanvas() || !scrollRef || Math.abs(delta) <= 0.5) return;
-    scrollRef.scrollTop += delta;
-    lastScrollTop = scrollRef.scrollTop;
+    if (!stickToBottom()) return;
+    transcriptRef?.scrollToBottom();
+    lastScrollTop = transcriptRef?.scrollTop() ?? 0;
   };
 
   const scheduleBottomPin = () => {
@@ -517,16 +136,6 @@ export function ChatView() {
   const enableBottomFollow = () => {
     setStickToBottom(true);
     scheduleBottomPin();
-  };
-
-  const finishPointerInteraction = () => {
-    if (!useAnyCanvas() && scrollFrame) {
-      cancelAnimationFrame(scrollFrame);
-      scrollFrame = 0;
-      processTranscriptScroll();
-    }
-    pointerActive = false;
-    if (stickToBottom()) scheduleBottomPin();
   };
 
   // 会话累计 token 用量：直接对当前展示的 turn 项求和。turn 项经 upsert 按 id
@@ -632,46 +241,14 @@ export function ChatView() {
       const scrollsDown = scrollDownKeys.has(event.key) || (event.key === " " && !event.shiftKey);
       if (event.altKey || event.ctrlKey || event.metaKey) return;
       if (!scrollsUp && !scrollsDown) return;
-      if (useCanvas()) {
-        if (transcriptRef?.hasFocusedInput()) return;
-        const delta = scrollsDown ? 100 : -100;
-        transcriptRef?.scrollBy(delta);
-        if (scrollsDown && isAtBottom() && !stickToBottom()) enableBottomFollow();
-        else if (!isAtBottom()) cancelBottomFollow();
-        return;
-      }
-      if (!scrollRef || scrollRef.scrollHeight <= scrollRef.clientHeight + 1) return;
-      const target = event.target;
-      if (target instanceof Node && target !== document.body && !scrollRef.contains(target)) return;
-      if (
-        target instanceof HTMLElement &&
-        (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
-      ) return;
-      if (isToolDetailScroll(target)) return;
-      if (scrollsDown) {
-        if (isAtBottom()) {
-          if (!stickToBottom()) enableBottomFollow();
-          return;
-        }
-      }
-      cancelBottomFollow();
+      if (transcriptRef?.hasFocusedInput()) return;
+      event.preventDefault();
+      transcriptRef?.scrollBy(scrollsDown ? 100 : -100);
+      if (scrollsDown && isAtBottom() && !stickToBottom()) enableBottomFollow();
+      else if (!isAtBottom()) cancelBottomFollow();
     };
-    let ro: ResizeObserver | undefined;
-    if (innerRef && scrollRef) {
-      ro = new ResizeObserver(() => { scheduleBottomPin(); });
-      ro.observe(innerRef);
-      ro.observe(scrollRef);
-    }
     window.addEventListener("keydown", handleScrollKey, true);
-    window.addEventListener("pointerup", finishPointerInteraction, true);
-    window.addEventListener("pointercancel", finishPointerInteraction, true);
-    onCleanup(() => {
-      ro?.disconnect();
-      if (scrollFrame) cancelAnimationFrame(scrollFrame);
-      window.removeEventListener("keydown", handleScrollKey, true);
-      window.removeEventListener("pointerup", finishPointerInteraction, true);
-      window.removeEventListener("pointercancel", finishPointerInteraction, true);
-    });
+    onCleanup(() => window.removeEventListener("keydown", handleScrollKey, true));
   });
 
   // 切换会话时从底部开始；后续尺寸变化由 ResizeObserver 持续对齐。
@@ -683,13 +260,6 @@ export function ChatView() {
     }
     return id;
   }, undefined);
-
-  // 切换 DOM / Canvas 渲染后重新吸底，避免滚动状态串到另一套视图。
-  createEffect((prevMode: string) => {
-    const mode = renderMode();
-    if (prevMode && prevMode !== mode) enableBottomFollow();
-    return mode;
-  }, "");
 
   // 会话加载和新增轮次后，让“现在”刻度跟随最新用户轮次；回看过去时不抢走光标。
   createEffect(() => {
@@ -1033,11 +603,9 @@ export function ChatView() {
   const timeMachineWidth = () => Math.max(64, 38 + Math.min(5, timelineGraph().laneCount) * 26);
   const switchPreview = (items: Item[] | null, checkpointId: string | null) => {
     if (previewTimer) clearTimeout(previewTimer);
-    setPreviewFading(true);
     previewTimer = setTimeout(() => {
       setPreviewItems(items);
       setPreviewCheckpointId(checkpointId);
-      requestAnimationFrame(() => setPreviewFading(false));
     }, 90);
   };
   const itemsThroughPrompt = (items: Item[], promptCount: number) => {
@@ -1054,6 +622,10 @@ export function ChatView() {
     const threadId = state.currentId;
     if (!threadId || restoringCheckpoint()) return;
     if (node.onCurrentPath) {
+      const request = ++previewRequest;
+      try { await ensureHistoryItems(itemsThroughPrompt(state.items as Item[], node.promptCount).map(item => item.id)); }
+      catch { return; }
+      if (request !== previewRequest || state.currentId !== threadId) return;
       switchPreview(itemsThroughPrompt(state.items as Item[], node.promptCount), node.id);
       return;
     }
@@ -1082,18 +654,15 @@ export function ChatView() {
     setTimeMachineEditTarget(null);
     if (!previewItems()) {
       setPreviewCheckpointId(null);
-      setPreviewFading(false);
       scroll();
       return;
     }
 
-    // 从旁支预览切回主线时，先恢复当前会话，再在新 DOM 中定位提示词。
-    setPreviewFading(true);
+    // 从旁支预览切回主线时，先恢复当前会话，再在 Canvas 新布局中定位提示词。
     previewTimer = setTimeout(() => {
       setPreviewItems(null);
       setPreviewCheckpointId(null);
       requestAnimationFrame(() => {
-        setPreviewFading(false);
         requestAnimationFrame(scroll);
       });
     }, 90);
@@ -1104,7 +673,6 @@ export function ChatView() {
     setTimeMachineEditTarget(null);
     setPreviewItems(null);
     setPreviewCheckpointId(null);
-    setPreviewFading(false);
     returnToNow();
   };
   const contextPrompts = (node: GraphNode, mode: ContextDeleteMode, count = 0) => {
@@ -1402,58 +970,11 @@ export function ChatView() {
       <div class="chat-shell">
         <div class="chat-primary">
       <div class="chat-body">
-        <Show
-          when={useAnyCanvas()}
-          fallback={
-            <div
-              class="transcript"
-              classList={{ "checkpoint-preview": !!previewItems(), "checkpoint-preview-fading": previewFading() }}
-              ref={scrollRef}
-              onScroll={handleTranscriptScroll}
-              onWheel={handleWheel}
-              onPointerDown={handlePointerDown}
-              onClick={handleTranscriptClick}
-            >
-              <div class="transcript-inner" ref={innerRef}>
-                <Show when={previewCheckpointId()}>
-                  <button
-                    type="button"
-                    class="checkpoint-preview-banner"
-                    title="回到当前时间线和最新消息"
-                    onClick={returnToCurrentTimeline}
-                  >
-                    回到当前时间线
-                  </button>
-                </Show>
-                <Show when={displayedItems().length === 0 && !state.loadingThread}>
-                  <div class="transcript-hint">
-                    在下方输入任务，{agentLabel(state.agentKind)} 将在{" "}
-                    <code>{cwdDisplay()}</code> 中工作。
-                  </div>
-                </Show>
-                <Show keyed when={state.currentId}>
-                  <For each={groups()}>
-                    {(g, i) => (
-                      <VirtualGroup
-                        group={g}
-                        index={i()}
-                        active={isRunning() && !g.turn}
-                        keepMounted={i() === lastGroupIndex()}
-                        scrollEl={() => scrollRef}
-                        compensateHeight={compensateVirtualHeight}
-                      />
-                    )}
-                  </For>
-                </Show>
-                <For each={permissions()}>{(req) => <PermissionCard req={req} />}</For>
-              </div>
-            </div>
-          }
-        >
           <CanvasTranscript
             ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
             threadId={state.currentId}
             groups={groups()}
+            loadItems={ensureHistoryItems}
             permissions={permissions()}
             running={isRunning() && !previewItems()}
             loading={state.loadingThread}
@@ -1472,10 +993,17 @@ export function ChatView() {
             onBrowseDetail={cancelBottomFollow}
             emptyHint={`在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
           />
-        </Show>
       </div>
 
       <footer class="chat-foot">
+        <Show when={previewCheckpointId()}>
+          <button class="checkpoint-preview-banner" onClick={returnToCurrentTimeline}>回到当前时间线</button>
+        </Show>
+        <Show when={permissions().length}>
+          <div style={{ "max-height": "35vh", overflow: "auto" }}>
+            <For each={permissions()}>{req => <PermissionCard req={req} />}</For>
+          </div>
+        </Show>
         {/* 暂时隐藏「计划」面板；内部 plan 状态与事件仍照常更新 */}
         <PlanActionCard />
         <Composer />
@@ -1648,7 +1176,7 @@ export function ChatView() {
       {/* 文件/产物侧栏排在 Stage 导航右边：聊天 → 世界线 → Stage → 侧边栏。 */}
       <Show when={workspaceOpen() && roamingRole() !== "guest"}>
         <Show keyed when={state.currentId}>
-          {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
+          {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceLayout.mode === "terminal" ? null : workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
         </Show>
       </Show>
       <Portal>

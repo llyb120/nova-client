@@ -8,7 +8,7 @@ import WorkspaceCode from "./WorkspaceCode";
 import WorkspaceGit from "./WorkspaceGit";
 import WorkspaceBrowser from "./WorkspaceBrowser";
 import { api } from "../ipc";
-import { state } from "../store";
+import { state, ensureHistoryItems } from "../store";
 import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
 import { workspaceLayout, setWorkspaceLayout, type WorkspaceMode } from "../workspaceLayout";
 import { collectWorkspaceArtifacts } from "../workspaceArtifacts";
@@ -16,6 +16,7 @@ import { absolutePath, createFileContextMenu } from "./FileContextMenu";
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconX, IconCopy, IconBrowser, IconGear, IconTerminal } from "./icons";
 import "./WorkspacePanel.css";
 
+const WorkspaceTerminal = lazy(() => import("./WorkspaceTerminal"));
 const WorkspaceSheet = lazy(() => import("./WorkspaceSheet"));
 import type { SheetEditor } from "./WorkspaceSheet";
 
@@ -170,6 +171,12 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   // Restore artifacts when the history snapshot arrives, without subscribing to text deltas.
   createEffect(() => { state.items; state.items.length; state.loadingThread; if (!state.running[props.threadId]) refreshArtifacts(); });
   refreshArtifacts();
+  // Artifact discovery needs old tool bodies too, not only the visible transcript page.
+  createEffect(() => {
+    if (!state.loadingThread && state.currentId === props.threadId) {
+      untrack(() => { void ensureHistoryItems().then(refreshArtifacts).catch(e => setError(String(e))); });
+    }
+  });
   const snapshot = () => {
     const file = preview();
     if (!file) return;
@@ -407,8 +414,8 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     if (tab) activate(tab);
     if (remembered.browse) setBrowse(true);
   }
-  return <aside ref={panel} class="workspace-panel" classList={{ 'is-dragging': dragging() }} style={{ width: `${width()}px` }} aria-label="产物与项目文件"
-    onKeyDown={e => { if (mode() !== "browser" && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
+  return <aside ref={panel} class="workspace-panel" classList={{ 'is-dragging': dragging() }} style={{ width: `${width()}px` }} aria-label="产物、项目文件与终端"
+    onKeyDown={e => { if (mode() !== "browser" && mode() !== "terminal" && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
     <div class="workspace-resize" role="separator" aria-label="调整文件面板宽度" aria-orientation="vertical" tabindex="0"
       aria-valuenow={width()} onKeyDown={e => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); resize(width() + (e.key === "ArrowLeft" ? 24 : -24)); } }}
       onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); }}
@@ -422,10 +429,12 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <button aria-pressed={mode() === "artifacts"} onClick={() => { setMode("artifacts"); setBrowse(false); refreshArtifacts(); }}>产物 · {artifacts().length}</button>
       <button aria-pressed={mode() === "git"} onClick={() => { setMode("git"); setBrowse(false); }}>Git 变动</button>
       <button aria-pressed={mode() === "browser"} onClick={() => { setMode("browser"); setBrowse(false); }}>浏览器</button>
+      <button aria-pressed={mode() === "terminal"} title="终端 (Ctrl+`)" onClick={() => { setMode("terminal"); setBrowse(false); }}>终端</button>
       <button class="workspace-panel-close" aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={async () => { if (await commitSheet()) props.onClose(); }}><IconX size={14} /></button>
     </nav>
     <Show when={mode() === "browser"}><WorkspaceBrowser threadId={threadId} /></Show>
-    <header class="workspace-toolbar workspace-tabbar" style={{ display: mode() === "browser" ? "none" : undefined }}>
+    <Show when={mode() === "terminal"}><Suspense fallback={<p role="status">正在加载终端…</p>}><WorkspaceTerminal threadId={threadId} cwd={state.cwd} /></Suspense></Show>
+    <header class="workspace-toolbar workspace-tabbar" style={{ display: mode() === "browser" || mode() === "terminal" ? "none" : undefined }}>
       <span class="workspace-open-label">已打开</span>
       <div class="workspace-tabs" role="tablist" aria-label="已打开文件" onWheel={e => {
         const el = e.currentTarget;
@@ -455,7 +464,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <button class="workspace-picker-toggle" aria-label="打开文件" aria-expanded={browse()} title="从目录树打开文件" onClick={() => { setMode("files"); setBrowse(v => !v); refreshArtifacts(); }}>＋</button>
     </header>
     <Show when={mode() === "git"}><WorkspaceGit threadId={threadId} onOpen={(path, line) => { setMode("files"); void open(path, false, line); }} /></Show>
-    <div class="workspace-file-view" style={{ display: mode() === "git" || mode() === "browser" ? "none" : undefined }}>
+    <div class="workspace-file-view" style={{ display: mode() === "git" || mode() === "browser" || mode() === "terminal" ? "none" : undefined }}>
     <div class="workspace-toolbar workspace-location">
       <button class="workspace-picker-toggle workspace-breadcrumb" aria-label="选择项目文件" aria-expanded={browse()} onClick={() => { setBrowse(v => !v); refreshArtifacts(); }}>
         <IconFolder size={16} /><span class="workspace-breadcrumb-text">{label(state.cwd)} › {preview() ? label(preview()!.path) : '选择文件'}</span><IconChevron size={14} open={browse()} />

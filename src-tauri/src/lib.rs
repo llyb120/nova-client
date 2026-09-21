@@ -1,3 +1,4 @@
+mod visual_guard;
 mod acp;
 mod agent_config;
 mod jianlai;
@@ -32,9 +33,11 @@ mod skills;
 mod sleep_inhibitor;
 mod sys_notify;
 mod threads;
+mod thread_storage;
 mod time_machine;
 mod updater;
 mod workspace_files;
+mod workspace_terminal;
 #[cfg(windows)]
 mod windows_shell_shim;
 
@@ -1098,6 +1101,28 @@ fn get_thread(state: State<'_, AppState>, thread_id: String) -> Result<Thread, S
         .get(&thread_id)
         .cloned()
         .ok_or_else(|| "线程不存在".into())
+}
+
+#[tauri::command]
+async fn get_thread_view(state: State<'_, AppState>, thread_id: String) -> Result<Value, String> {
+    let thread = state.store.lock().unwrap().get(&thread_id).cloned().ok_or("线程不存在")?;
+    let assets = state.config_dir.join("thread-assets");
+    tauri::async_runtime::spawn_blocking(move || thread_storage::view(thread, &assets))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_thread_items(state: State<'_, AppState>, thread_id: String, item_ids: Vec<u64>) -> Result<Vec<Value>, String> {
+    if item_ids.len() > 256 { return Err("一次最多读取 256 条历史记录".into()); }
+    let ids: HashSet<u64> = item_ids.into_iter().collect();
+    let items: Vec<Item> = {
+        let store = state.store.lock().unwrap();
+        let thread = store.get(&thread_id).ok_or("线程不存在")?;
+        thread.items.iter().filter(|item| ids.contains(&item.id())).cloned().collect()
+    };
+    let assets = state.config_dir.join("thread-assets");
+    tauri::async_runtime::spawn_blocking(move || items.into_iter().map(|item| thread_storage::view_item(item, &assets)).collect())
+        .await.map_err(|e| e.to_string())?
 }
 
 /// 项目选择器里的一条最近项目。worktree 非空表示该目录其实是某次会话创建的
@@ -5273,7 +5298,8 @@ pub fn maybe_run_update_helper() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init())
+        .manage(workspace_terminal::TerminalManager::default());
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
@@ -5626,12 +5652,20 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            workspace_terminal::terminal_create,
+            workspace_terminal::terminal_write,
+            workspace_terminal::terminal_resize,
+            workspace_terminal::terminal_ack,
+            workspace_terminal::terminal_close,
             native_browser::native_browser_ui,
             chrome_browser::chrome_browser_ui,
+            tool_experience::knowledge_graph,
             image_generation::image_command_context,
             list_threads,
             load_threads,
             get_thread,
+            get_thread_view,
+            get_thread_items,
             list_clue_groups,
             get_clue_context,
             capture_clue,
@@ -5775,7 +5809,11 @@ pub fn run() {
                     }
                 }
             }
+            if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } = &event {
+                if label == "main" { app.state::<workspace_terminal::TerminalManager>().close_all(); }
+            }
             if let tauri::RunEvent::Exit = event {
+                app.state::<workspace_terminal::TerminalManager>().close_all();
                 let state = app.state::<AppState>();
                 // 临时会话随程序关闭一并删除，并清理其临时工作目录。
                 // save 已改为后台节流、每会话独立落盘；退出时必须无条件同步 save_now，

@@ -244,6 +244,8 @@ const TABS: { id: SettingsTab; name: string }[] = [
 export function SettingsModal(props: { onClose: () => void }) {
   const s = state.settings;
   const [tab, setTab] = createSignal<SettingsTab>("general");
+  const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
+  const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
   const [kimiPath, setKimiPath] = createSignal(s?.kimiPath ?? "kimi");
   const [kimiProxy, setKimiProxy] = createSignal(s?.kimiProxy ?? "");
   const [kimiEnabled, setKimiEnabled] = createSignal(s?.kimiEnabled === true);
@@ -314,11 +316,9 @@ export function SettingsModal(props: { onClose: () => void }) {
     s?.sessionAutoCleanupHours ?? 24 * 30,
   );
   const [zenModeEnabled, setZenModeEnabled] = createSignal(s?.zenModeEnabled ?? false);
+  const [knowledgeGraphEnabled, setKnowledgeGraphEnabled] = createSignal(s?.knowledgeGraphEnabled ?? false);
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
-  );
-  const [chatViewRender, setChatViewRender] = createSignal<"dom" | "canvas">(
-    s?.chatViewRender === "dom" ? "dom" : "canvas",
   );
   // server 留空回退默认地址；这里也预填，避免误存成空导致团队/漫游被静默关闭
   const [relayServer, setRelayServer] = createSignal(s?.relayServer || DEFAULT_RELAY_SERVER);
@@ -523,6 +523,7 @@ export function SettingsModal(props: { onClose: () => void }) {
               ? "newSession"
               : item.action === "openUnread"
                 ? "openUnread"
+                : item.action === "toggleTerminal" ? "toggleTerminal"
                 : item.action === "insertText"
                 ? "insertText"
                 : item.action === "selectWorkflow"
@@ -535,7 +536,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       .filter((item) => {
         if (!item.keys) return false;
         if (item.action === "stopSession") return false;
-        if (item.action === "newSession" || item.action === "openUnread" || item.action === "hideToVirgo") return true;
+        if (item.action === "newSession" || item.action === "openUnread" || item.action === "toggleTerminal" || item.action === "hideToVirgo") return true;
         return item.target.length > 0;
       });
 
@@ -722,6 +723,8 @@ export function SettingsModal(props: { onClose: () => void }) {
       .map((target) => ({ agentKind: target.agentKind, model: target.model.trim() }))
       .filter((target) => target.model.length > 0),
     editor: editor().trim() || "code",
+    terminalShell: terminalShell().trim(),
+    terminalArgs: terminalArgs().split(/\r?\n/).filter(arg => arg.length > 0),
     theme: state.theme,
     relayServer: relayServer().trim(),
     relayToken: relayToken().trim(),
@@ -743,8 +746,8 @@ export function SettingsModal(props: { onClose: () => void }) {
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
     zenModeEnabled: zenModeEnabled(),
+    knowledgeGraphEnabled: knowledgeGraphEnabled(),
     historyDisplayMode: historyDisplayMode(),
-    chatViewRender: chatViewRender(),
     customEnvVars: Object.fromEntries(
       customEnvVars()
         .map((item) => [item.name.trim(), item.value] as const)
@@ -1136,6 +1139,16 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </span>
               </label>
 
+              <label class="field">
+                <span class="field-label">默认终端</span>
+                <input class="field-input" value={terminalShell()} onInput={e => setTerminalShell(e.currentTarget.value)} placeholder="系统默认（pwsh.exe / cmd.exe / /bin/bash 等）" />
+                <span class="field-hint">填写 shell 程序或绝对路径，不含参数或外层引号；留空使用系统默认。新标签在当前会话或首页已选项目目录启动，修改配置不影响已运行的标签。</span>
+              </label>
+              <label class="field">
+                <span class="field-label">终端启动参数（每行一个）</span>
+                <textarea class="field-input" rows={3} value={terminalArgs()} onInput={e => setTerminalArgs(e.currentTarget.value)} placeholder="例如 -NoLogo 或 -l" />
+                <span class="field-hint">每行原样作为一个参数，带空格的路径无需引号。配置的是 PowerShell、CMD、Bash、Zsh 等 shell，不是外部终端窗口程序。</span>
+              </label>
               <div class="field">
                 <span class="field-label">自动清理过期会话</span>
                 <label class="backend-switch">
@@ -1171,7 +1184,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型/工作流、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换、终止回合与隐藏到室女座有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发；「隐藏会话到室女座」仅在未开启减少焦虑（室女座）时可用，会话被收起期间侧栏会出现「室女座」tab，重新打开即回到普通会话。默认 Esc 终止当前回合。
+                      一键切换项目/模型/工作流、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换、终止回合与隐藏到室女座有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发；「隐藏会话到室女座」仅在未开启减少焦虑（室女座）时可用，会话被收起期间侧栏会出现「室女座」tab，重新打开即回到普通会话。默认 Esc 终止当前回合（终端获得焦点时交给终端）；默认 Ctrl+`（~ 键）打开或收起终端，可添加「打开 / 收起终端」动作修改按键。
                     </div>
                   </div>
                   <button
@@ -1217,6 +1230,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                                       ? "newSession"
                                       : action === "openUnread"
                                         ? "openUnread"
+                                        : action === "toggleTerminal" ? "toggleTerminal"
                                         : action === "insertText"
                                         ? "insertText"
                                   : action === "selectWorkflow"
@@ -1234,7 +1248,8 @@ export function SettingsModal(props: { onClose: () => void }) {
                               <option value="selectModel">选择模型</option>
                               <option value="selectProject">选择项目</option>
                               <option value="newSession">快速新会话</option>
-                              <option value="openUnread">打开未读消息</option>
+                              <option value="openUnread">未读 / 进行中会话</option>
+                              <option value="toggleTerminal">打开 / 收起终端</option>
                               <option value="selectWorkflow">选择工作流</option>
                               <option value="insertText">快捷输入</option>
                               <option value="hideToVirgo">隐藏会话到室女座</option>
@@ -1244,6 +1259,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                                 when={
                                   item().action === "newSession" ||
                                   item().action === "openUnread" ||
+                                  item().action === "toggleTerminal" ||
                                   item().action === "hideToVirgo"
                                 }
                                 fallback={
@@ -1314,7 +1330,8 @@ export function SettingsModal(props: { onClose: () => void }) {
                               >
                                 <div class="session-shortcut-target-none">
                                   {item().action === "openUnread"
-                                    ? "循环打开有未读轮次的普通会话"
+                                    ? "优先未读；无未读时循环切换进行中的会话"
+                                    : item().action === "toggleTerminal" ? "任意本地页 · 打开 / 收起右侧终端"
                                     : item().action === "hideToVirgo"
                                       ? "会话页生效 · 仅在未开启减少焦虑时可用"
                                       : "任意页 · 继承当前目录与模型"}
@@ -1459,6 +1476,14 @@ export function SettingsModal(props: { onClose: () => void }) {
           {/* ===== 高级 ===== */}
           <Show when={tab() === "advanced"}>
             <section class="settings-group">
+              <h3 class="settings-group-title">知识图谱</h3>
+              <label class="backend-switch">
+                <input type="checkbox" checked={knowledgeGraphEnabled()} onChange={(e) => setKnowledgeGraphEnabled(e.currentTarget.checked)} />
+                <span>显示知识图谱</span>
+              </label>
+              <p class="field-hint">默认关闭。开启后在室女座旁显示入口，以向四周展开的操作树查看已记录的路径、下一步分支和可完成的目标。</p>
+            </section>
+            <section class="settings-group">
               <h3 class="settings-group-title">上下文机制</h3>
               <label class="field">
                 <span class="field-label">Cursor 上下文</span>
@@ -1541,25 +1566,6 @@ export function SettingsModal(props: { onClose: () => void }) {
               </div>
             </section>
 
-            <section class="settings-group">
-              <h3 class="settings-group-title">聊天视图</h3>
-              <label class="field">
-                <span class="field-label">渲染方式</span>
-                <select
-                  class="field-input"
-                  value={chatViewRender()}
-                  onChange={(e) => {
-                    setChatViewRender(e.currentTarget.value === "dom" ? "dom" : "canvas");
-                  }}
-                >
-                  <option value="canvas">Canvas（默认）</option>
-                  <option value="dom">DOM</option>
-                </select>
-                <span class="field-hint">
-                  Canvas 在超长会话时更省 DOM 节点、滚动更轻；DOM 选区/复制更可靠。可随时切换，保存后立即生效。
-                </span>
-              </label>
-            </section>
 
             <section class="settings-group">
               <h3 class="settings-group-title">减少焦虑</h3>

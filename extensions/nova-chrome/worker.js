@@ -20,7 +20,8 @@ async function inventory() {
     model.tabs[tab.id] = {tag:`C${model.next++}-${model.clientId.replaceAll('-','').slice(0,16)}`};
   }
   await save();
-  return tabs.map(tab=>({tag:model.tabs[tab.id].tag,title:tab.title || '',url:tab.url || tab.pendingUrl || '',active:tab.active,windowId:tab.windowId,allowed:true,controllable:permittedUrl(tab.url || tab.pendingUrl),openerTag:model.tabs[tab.openerTabId]?.tag}));
+  // `loading` lets Nova wait for a navigation to settle instead of costing the model another inspect.
+  return tabs.map(tab=>({tag:model.tabs[tab.id].tag,title:tab.title || '',url:tab.url || tab.pendingUrl || '',active:tab.active,incognito:!!tab.incognito,windowId:tab.windowId,allowed:true,controllable:permittedUrl(tab.url || tab.pendingUrl),openerTag:model.tabs[tab.openerTabId]?.tag,status:tab.status || 'unknown',loading:tab.status!=='complete' || Boolean(tab.pendingUrl)}));
 }
 async function resolveTag(tag) {
   await ready();
@@ -53,9 +54,23 @@ async function debuggerCall(command, invoke) {
 async function execute(command) {
   const {operation, args} = command;
   if (Date.now() > command.expiresAt) throw Error('命令已过期，未执行');
-  if (operation === 'tabs') return {tabs:await inventory()};
+  if (operation === 'status') return {incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess()};
+  if (operation === 'tabs') return {tabs:(await inventory()).filter(tab=>args.incognito === undefined || tab.incognito === args.incognito),incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess()};
   if (operation === 'open' || operation === 'new_tab') {
-    const tab = await chrome.tabs.create({url:args.url ? checkUrl(args.url) : 'about:blank'});
+    if (args.incognito !== undefined && typeof args.incognito !== 'boolean') throw Error('incognito必须为boolean');
+    const url = args.url ? checkUrl(args.url) : 'about:blank';
+    let tab;
+    if (args.incognito === true) {
+      if (!await chrome.extension.isAllowedIncognitoAccess()) throw Error('请在 chrome://extensions 中打开 Nova Chrome 详情，开启“允许在无痕模式下运行”，然后重试；未创建普通窗口');
+      const created = await chrome.windows.create({url,incognito:true});
+      [tab] = created.tabs || await chrome.tabs.query({windowId:created.id});
+    } else {
+      // Bind a normal window explicitly: the last focused window may be incognito.
+      const normal = (await chrome.windows.getAll({windowTypes:['normal']})).find(w=>!w.incognito);
+      if (normal) tab = await chrome.tabs.create({url,windowId:normal.id});
+      else { const created = await chrome.windows.create({url,incognito:false}); [tab] = created.tabs || await chrome.tabs.query({windowId:created.id}); }
+    }
+    if (!tab) throw Error('窗口已创建但未取得标签，请tabs观察，不要重复创建');
     await inventory();
     return {tabTag:model.tabs[tab.id].tag,tabs:await inventory()};
   }

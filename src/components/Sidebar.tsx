@@ -118,7 +118,7 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "virgo") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "virgo" | "knowledge") => {
     setView(view);
     closeThread();
   };
@@ -136,6 +136,12 @@ export function Sidebar(props: {
 
   // 运行中任务链（含父子接力整条链）：整链的忙碌态与「正在运行的任务数」徽标沿用这套口径。
   const chainInfo = createMemo(() => zenRunningChains());
+  const completedUnreadCount = createMemo(() => {
+    const { hidden } = chainInfo();
+    return state.threads.reduce((sum, thread) =>
+      sum + (!thread.experienceThread && !hidden.has(thread.id) && thread.id !== state.currentId
+        ? (state.unreadTurns[thread.id] ?? 0) : 0), 0);
+  });
   const inRunningChain = (t: ThreadMeta) => virgoHidden().has(t.id);
   // 室女座里的任务数：减少焦虑下按运行中任务链计，手动收纳下按收纳的会话链计。
   const virgoChainCount = createMemo(() => {
@@ -591,9 +597,21 @@ export function Sidebar(props: {
             <IconChevron size={18} />
           </button>
           <button title="新对话" aria-label="新对话" onClick={openHome}><IconPlus size={18} /></button>
-          <button class="sidebar-rail-list" title="会话列表（悬停展开）" aria-label="会话列表" aria-controls="main-sidebar"
+          <button class="sidebar-rail-list"
+            title={`会话列表（悬停展开）\n运行中：${chainInfo().rootCount}\n已完成未读：${completedUnreadCount()}`}
+            aria-label="会话列表" aria-controls="main-sidebar"
             aria-expanded={sidebarOpen()} onClick={() => { cancelHover(); setHovered(true); }}>
             <IconFolder size={18} />
+            <Show when={chainInfo().rootCount > 0}>
+              <span class="sidebar-rail-count running" aria-label={`运行中：${chainInfo().rootCount}`}>
+                {chainInfo().rootCount > 99 ? "99+" : chainInfo().rootCount}
+              </span>
+            </Show>
+            <Show when={completedUnreadCount() > 0}>
+              <span class="sidebar-rail-count unread" aria-label={`已完成未读：${completedUnreadCount()}`}>
+                {completedUnreadCount() > 99 ? "99+" : completedUnreadCount()}
+              </span>
+            </Show>
           </button>
           <button title="工作流" aria-label="工作流" classList={{ active: state.view === "workflows" }} onClick={openWorkflows}>
             <IconMerge size={18} />
@@ -791,6 +809,12 @@ export function Sidebar(props: {
                     {virgoChainCount()}
                   </span>
                 </Show>
+              </button>
+            </Show>
+            <Show when={state.settings?.knowledgeGraphEnabled}>
+              <button class="mode-seg-btn" classList={{ active: state.view === "knowledge" }}
+                onClick={() => switchView("knowledge")} title="查看操作路径与下一步分支">
+                知识图谱
               </button>
             </Show>
           </div>

@@ -1,0 +1,59 @@
+name: Terminal UI regression
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [pre-release]
+    paths:
+      - 'src/App.tsx'
+      - 'src/workspaceLayout.ts'
+      - 'src/terminalSessions.ts'
+      - 'src/components/*Terminal*'
+      - 'scripts/*terminal*.mjs'
+      - '.github/workflows/terminal-ui.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terminal-ui-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            browser: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
+          - os: ubuntu-24.04
+            browser: /usr/bin/google-chrome
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      TEST_BROWSER: ${{ matrix.browser }}
+      TEST_OUTPUT_DIR: terminal-home-theme-results
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - run: node scripts/terminal-home-theme.test.mjs
+      - run: npm run test:terminal
+      - run: node scripts/workspace-panel.test.mjs
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terminal-ui-${{ matrix.os }}
+          path: terminal-home-theme-results/
+          retention-days: 7

@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 
 const root = process.cwd();
+const coordinateOnly = process.argv.includes('--coordinates-only');
 const executable = resolve(process.argv[2] || 'bench/webview-probe/target/debug/nova.exe');
 const profile = await mkdtemp(join(tmpdir(), 'nova-browser-smoke-'));
 const output = resolve('src-tauri/target/native-browser-smoke');
@@ -79,7 +80,9 @@ try {
     for(const page of observation.pages){const item=page.items.find(i=>i.name===name&&(!region||i.region.includes(region)));if(item)return {frame:page.frame,ref:item.ref};}
     throw Error('Missing '+name+': '+JSON.stringify(observation));
   };
-  let observation=await ui('inspect');
+  let observation,summaryBytes,fullPageEvidence;
+  if(!coordinateOnly) {
+  observation=await ui('inspect');
   // Real inference/read-image delay must not expire a still-valid DOM reference.
   await sleep(31000);
   observation=await act({action:'fill',...find(observation,'订单号'),text:'订单-123'},observation);
@@ -127,7 +130,7 @@ try {
   // Read the whole loaded DOM without scrolling, including nested overflow and targets beyond the old 80/160 cap.
   await page.evaluate(`const section=document.createElement('section');section.id='whole-page';section.innerHTML=Array.from({length:350},(_,i)=>'<button>目标'+i+'</button>').join('')+'<div style="height:5000px">整页长内容</div><button id="bottom" onclick="window.bottomClicked=true" style="background:lime">整页底部按钮</button>';document.body.append(section);document.querySelector('.scrollbox>div').innerHTML+='<p style="margin-top:200px">内部滚动区域末尾文本</p>';scrollTo(0,0)`);
   const full=await ui('inspect');
-  const summaryBytes=Buffer.byteLength(JSON.stringify(full));
+  summaryBytes=Buffer.byteLength(JSON.stringify(full));
   assert.ok(full.pages.reduce((n,p)=>n+p.items.length,0)<=60);assert.ok(summaryBytes<40000,`summary: ${summaryBytes} bytes`);
   assert.equal(await page.evaluate('scrollY'),0);assert.equal(full.pages[0].inlineTruncated,true);
   const document=JSON.parse(await readFile(full.documentPath,'utf8'));
@@ -142,7 +145,7 @@ try {
   await page.evaluate(`document.addEventListener('click',e=>window.lastClick={x:e.clientX,y:e.clientY,target:e.target.outerHTML.slice(0,300)},true)`);
   assert.equal((await act({action:'click_at',x:bottom.x+bottom.width/2,y:bottom.y+bottom.height/2},fullShot)).status,'executed');
   assert.equal(await page.evaluate('window.bottomClicked'),true,JSON.stringify(await page.evaluate('({scroll:scrollY,rect:document.querySelector("#bottom").getBoundingClientRect().toJSON(),click:window.lastClick})')));
-  const fullPageEvidence={items:document.pages[0].items.length,documentSize:fullShot.documentSize,images:fullShot.images};
+  fullPageEvidence={items:document.pages[0].items.length,documentSize:fullShot.documentSize,images:fullShot.images};
   await page.evaluate('document.querySelector("#whole-page").remove();scrollTo(0,0)');
   // Bound huge screenshots without silently dropping the tail; it remains available through nextTile.
   await page.evaluate(`document.body.insertAdjacentHTML('beforeend','<div id="huge" style="height:18000px">超长页面</div>')`);
@@ -169,6 +172,7 @@ try {
   const delayed=await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/delayed')),'delayed target'));
   assert.equal(await delayed.evaluate('!!window.opener'),true);
   await ui('close_tab',{tabId:(await ui('status')).activeTab});assert.equal((await ui('status')).activeTab,firstTab);
+  }
   // Exercise the real Chrome transport + shared engine with an emulated extension.
   // This is not a real Chrome extension end-to-end test.
   const chromeUi=(operation,args={})=>invoke('chrome_browser_ui',{operation,args});
@@ -178,6 +182,7 @@ try {
   const config={origin:connection.origin,...await pairing.json()};
   const abort=new AbortController();
   const tag='C1-smoketest';
+  const chromeCaptures=[];
   const post=async(route,body)=>{
     const response=await fetch(config.origin+route,{method:'POST',headers:{'Content-Type':'application/json',Origin:`chrome-extension://${connection.extensionId}`,Authorization:`Bearer ${config.token}`},body:JSON.stringify({clientId:'12345678-1234-4234-8234-123456789abc',...body}),signal:abort.signal});
     assert.equal(response.status,200);return response.json();
@@ -189,7 +194,7 @@ try {
       try {
         let result;
         if(command.operation==='tabs')result={tabs:[{tag,allowed:true,controllable:true,title:'Fixture'}]};
-        else {assert.equal(command.args.tabTag,tag);assert.equal(command.operation,'cdp');result=await page.call(command.args.method,command.args.params,command.args.sessionId);}
+        else {assert.equal(command.args.tabTag,tag);assert.equal(command.operation,'cdp');if(command.args.method==='Page.captureScreenshot')chromeCaptures.push(command.args.params);result=await page.call(command.args.method,command.args.params,command.args.sessionId);}
         reply={id:command.id,result};
       }catch(error){reply={id:command.id,error:String(error)};}
       await post('/reply',reply);
@@ -206,10 +211,39 @@ try {
     assert.equal(await page.evaluate('document.querySelector("input").value'),'Chrome桥接验证');
     const screenshot=await chromeUi('screenshot',{tabTag:tag,fullPage:false});
     assert.ok(screenshot.images.length);assert.equal(screenshot.browser,'chrome');
+    // Exercise the compiled pixel preflight, image mapping and post-hover checks.
+    await page.evaluate(`document.body.insertAdjacentHTML('beforeend','<style>#hover-option{position:fixed;left:300px;top:200px;width:200px;height:40px;background:white;z-index:99999}#hover-option:hover{background:rgb(40,150,240)}</style><div id="hover-option" onclick="window.optionClicked=(window.optionClicked||0)+1">Leave-Pay</div>')`);
+    for(const deviceScaleFactor of [1,1.25,2]) {
+    await page.call('Emulation.setDeviceMetricsOverride',{width:900,height:700,deviceScaleFactor,mobile:false});
+    for(const options of [{maxEdge:320},{maxEdge:0,region:{x:280.4,y:180.4,width:240.2,height:80.2}}]) {
+      await page.call('Input.dispatchMouseEvent',{type:'mouseMoved',x:10,y:10});
+      const geometry=await page.evaluate('document.querySelector("#hover-option").getBoundingClientRect().toJSON()');
+      const shot=await chromeUi('screenshot',{tabTag:tag,fullPage:false,...options});
+      assert.deepEqual(await page.evaluate('document.querySelector("#hover-option").getBoundingClientRect().toJSON()'),geometry);
+      const image=shot.images[0], count=chromeCaptures.length;
+      const clicked=await chromeUi('act',{tabTag:tag,snapshotId:shot.snapshotId,imageId:image.imageId,feedback:'screenshot',action:{action:'click_at',x:(340-image.x)*image.pixelWidth/image.width,y:(220-image.y)*image.pixelHeight/image.height}});
+      assert.equal(clicked.status,'executed',JSON.stringify(clicked));
+      assert.equal(chromeCaptures.length-count,2,'one preflight and one feedback; DOM hover does not need a second screenshot');
+    }
+    }
+    await page.call('Emulation.clearDeviceMetricsOverride');
+    assert.equal(await page.evaluate('window.optionClicked'),6);
+    assert.ok(chromeCaptures.every(params=>!params.clip && params.fromSurface===true && params.captureBeyondViewport===false),'viewport captures must not override the browser render scale/clip');
+    await page.call('Input.dispatchMouseEvent',{type:'mouseMoved',x:10,y:10});
+    const stale=await chromeUi('screenshot',{tabTag:tag,fullPage:false});
+    await page.evaluate('document.querySelector("#hover-option").style.background="black"');
+    const refused=await chromeUi('act',{tabTag:tag,snapshotId:stale.snapshotId,action:{action:'click_at',x:340,y:220}});
+    assert.equal(refused.status,'not_executed');assert.match(refused.reason,/画面已变化/);
+    assert.equal(await page.evaluate('window.optionClicked'),6,'pre-existing visual changes still block input');
+    await page.evaluate('document.querySelector("#hover-option").remove()');
     if(pollingError)throw pollingError;
     assert.equal(await main.evaluate('!!document.querySelector("[aria-label=浏览器来源]")'),false);
     assert.equal(await main.evaluate('!!document.querySelector(".workspace-browser-surface")'),true);
   }finally{abort.abort();await polling.catch(()=>{});}
+  if(coordinateOnly) {
+    await writeFile(join(output,'coordinate-report.json'),JSON.stringify({passed:true,modelCalls:0,coordinateHover:true,localCrop:true,stalePixels:true,chromeCaptures,profile},null,2));
+    console.log('PASS compiled coordinate hover, scaled/cropped screenshots, stale pixel rejection and clip-free capture via emulated Chrome transport');
+  } else {
   const pageShot=await page.call('Page.captureScreenshot',{format:'png'});await writeFile(join(output,'page.png'),Buffer.from(pageShot.data,'base64'));
   const compactShot=await main.call('Page.captureScreenshot',{format:'png'});await writeFile(join(output,'browser-ui.png'),Buffer.from(compactShot.data,'base64'));
   await main.evaluate(`Array.from(document.querySelectorAll('.workspace-modes button')).find(b=>b.textContent==='文件').click()`);
@@ -221,6 +255,7 @@ try {
   assert.equal(await main.evaluate('document.body.textContent.includes("辅助控制模型")'),false);
   await writeFile(join(output,'report.json'),JSON.stringify({passed:true,modelCalls:0,actionWithFeedbackMs:timings,optimization:{domRefAfter31Seconds:true,coordinateAfter31Seconds:true,chainedFeedback:true,replacedElementRejected:true,menuStateAndHref:true,screenshotFeedback:true,summaryBytes},fullPageEvidence,screenshot:observation.path,profile},null,2));
   console.log('PASS native browser full-document/full-page/tiles/document-coordinates/DOM/native-input/popups/session-state/stop + Chrome emulated transport/engine; no model calls: '+output);
+  }
 } finally {
   for (const socket of sockets) socket.close();
   if (child.exitCode === null && child.pid) spawnSync('taskkill',['/PID',String(child.pid),'/T','/F'],{windowsHide:true,stdio:'ignore'});

@@ -2,7 +2,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { api } from "../ipc";
+import { api, fileUriPath } from "../ipc";
 import type { PromptImage } from "../types";
 import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
 import { IconFile, IconX } from "./icons";
@@ -74,11 +74,6 @@ function pathToFileUri(path: string) {
   const normalized = path.replace(/\\/g, "/");
   const withSlash = normalized.startsWith("/") ? normalized : `/${normalized}`;
   return `file://${encodeURI(withSlash)}`;
-}
-
-export function fileUriPath(uri: string) {
-  const path = decodeURI(uri.replace(/^file:\/\//, ""));
-  return /^\/[A-Za-z]:\//.test(path) ? path.slice(1) : path;
 }
 
 export function attachmentPreviewSrc(image: PromptImage) {

@@ -78,3 +78,5 @@ bench/work/
 bench/results-*.json
 
 icon-work/**
+.nova-icon-build/
+nova-icon-transparent-corners.png

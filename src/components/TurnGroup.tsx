@@ -1,11 +1,4 @@
-import "./ProcessBlock.css";
-import { createMemo, For, Show } from "solid-js";
-import { processSegments, processSummary, processLiveLines, splitTurnBody } from "../processDisplay";
-import { state, toggleExpanded } from "../store";
 import type { Item, TurnItem, UserItem } from "../types";
-import { EditedFilesCard } from "./EditedFilesCard";
-import { IconChevron } from "./icons";
-import { TranscriptItem } from "./TranscriptItem";
 
 /** 一轮对话：用户消息 + 过程（思考/工具）+ 结论 + 轮次标记 */
 export interface Group {
@@ -84,8 +77,7 @@ export function groupItems(items: Item[], prev: Group[] = []): Group[] {
     }
   }
 
-  // 重建出的尾部分组若内容与旧对象一致，复用旧对象身份，避免下游 <For>/VirtualGroup
-  // 无谓重挂载（保留展开态、DOM、滚动位置）。
+  // 重建出的尾部分组若内容与旧对象一致，复用旧对象身份，避免Canvas 重复排版。
   for (let j = rebuiltStart; j < result.length; j++) {
     const prevGroup = prev[j];
     if (prevGroup && sameGroup(result[j], prevGroup)) result[j] = prevGroup;
@@ -106,7 +98,7 @@ export function fmtTokens(n: number): string {
   return String(n);
 }
 
-/** 轮次 token 悬浮明细（与 DOM turn-fold title 一致） */
+/** 轮次 token 悬浮明细 */
 export function turnTokenTitle(t: TurnItem | undefined | null): string | undefined {
   if (!t?.totalTokens) return undefined;
 
@@ -132,96 +124,4 @@ export function turnAvgTokensPerSec(t: TurnItem | undefined | null): number | nu
   const ms = t?.durationMs ?? 0;
   if (output == null || !Number.isFinite(output) || output < 0 || !Number.isFinite(ms) || ms < 1_000) return null;
   return Math.round(output / (ms / 1_000));
-}
-
-function ProcessBody(props: { items: Item[]; active: boolean }) {
-  const segments = createMemo(() => processSegments(props.items));
-  return <For each={segments()}>{segment => {
-    if (segment.type === "item") return <TranscriptItem item={segment.item} active={props.active && segment.id === props.items.at(-1)?.id} />;
-    const live = () => props.active && segment === segments().at(-1);
-    const key = () => `process-${segment.id}-${live() ? "live" : "done"}`;
-    const open = () => !!state.expanded[key()];
-    const lines = () => live() ? processLiveLines(segment.items) : [processSummary(segment.items)];
-    return <div class="process-block">
-      <button type="button" class="process-toggle" aria-expanded={open()} onClick={() => toggleExpanded(key())}>
-        <IconChevron size={12} open={open()} />
-        <span class="process-lines" classList={{ "process-lines-live": live() }}><span title={lines().join("\n")}>{lines().join("\n")}</span></span>
-      </button>
-      <Show when={open()}><div class="turn-process"><For each={segment.items}>{item => <TranscriptItem item={item} />}</For></div></Show>
-    </div>;
-  }}</For>;
-}
-
-/**
- * codex 风格轮次渲染：进行中过程实时展开；
- * 完成后过程折叠为「已处理 Xs · N tokens」行，与结论区分开
- */
-export function TurnGroup(props: { group: Group; active: boolean }) {
-  // 折叠状态放 store（按轮次内稳定的 item id），流式更新重建分组时不丢失
-  const foldKey = () =>
-    `turn-${props.group.turn?.id ?? props.group.user?.id ?? props.group.body[0]?.id ?? 0}`;
-  // 运行中用户手动展开过本轮的某个详情（工具/思考）时，结束后该轮保持展开；
-  // 未显式点过折叠行（undefined）才走这个自动判断，点过的以用户操作为准
-  // 与 ToolCallCard / thought 一致：工具用 tool-${id}，思考用 thought-${id}
-  const bodyExpanded = () =>
-    props.group.body.some((it) => {
-      if (it.type === "tool") return !!state.expanded[`tool-${it.id}`];
-      if (it.type === "thought") return !!state.expanded[`thought-${it.id}`];
-      return !!state.expanded[String(it.id)];
-    });
-  const open = () => state.expanded[foldKey()] ?? bodyExpanded();
-  const foldable = () => !!props.group.turn && !props.active;
-
-  // 仅在轮次真正结束（有 turn 标记）后才拆结论区。运行中即使本分组不是
-  // active（后面又跟了引导提示开了新组），也不能按 !active 抽结论，否则上一截
-  // 会像已收束，看起来会话停了。
-  const split = createMemo(() => splitTurnBody(props.group.body, !!props.group.turn));
-
-  const foldLabel = () => {
-    const t = props.group.turn;
-    const dur = t ? fmtDuration(t.durationMs) : "";
-    const tok = t?.totalTokens ? `${fmtTokens(t.totalTokens)} tokens` : "";
-    const avg = turnAvgTokensPerSec(t);
-    return ["已处理", dur, tok ? `· ${tok}` : "", avg != null ? `· 平均输出 ${fmtTokens(avg)} tok/s` : ""]
-      .filter(Boolean).join(" ");
-  };
-
-  const tokenTitle = () => turnTokenTitle(props.group.turn);
-
-  return (
-    <div class="turn-group">
-      <Show when={props.group.user}>
-        <TranscriptItem item={props.group.user!} />
-      </Show>
-      <Show when={props.group.turn?.actualModel}>
-        <div class="turn-actual-model">实际模型：{props.group.turn!.actualModel}</div>
-      </Show>
-      <Show when={split().process.length > 0}>
-        <Show
-          when={foldable()}
-          fallback={
-            <ProcessBody items={split().process} active={props.active} />
-          }
-        >
-          <button
-            class="turn-fold"
-            onClick={() => toggleExpanded(foldKey(), !open())}
-            title={tokenTitle()}
-          >
-            {foldLabel()}
-            <IconChevron size={12} open={open()} />
-          </button>
-          <Show when={open()}>
-            <div class="turn-process">
-              <ProcessBody items={split().process} active={false} />
-            </div>
-          </Show>
-        </Show>
-      </Show>
-      <For each={split().conclusion}>{(item) => <TranscriptItem item={item} />}</For>
-      <Show when={foldable()}>
-        <EditedFilesCard body={props.group.body} undoneKey={`undone-${foldKey()}`} />
-      </Show>
-    </div>
-  );
 }

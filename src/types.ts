@@ -249,7 +249,7 @@ export interface TurnItem {
   stopReason: string;
 }
 
-export type Item = UserItem | AssistantItem | ThoughtItem | ToolItem | SystemItem | TurnItem;
+export type Item = (UserItem | AssistantItem | ThoughtItem | ToolItem | SystemItem | TurnItem) & { deferred?: boolean };
 
 export type ToolContent =
   | { type: "content"; content: { type: string; text?: string; [k: string]: unknown } }
@@ -379,8 +379,10 @@ export type SessionShortcutAction =
   | "selectProject"
   | "selectModel"
   | "newSession"
-  /** 循环打开普通模式下有未读轮次的会话；无 target。可注册为全局快捷键（最小化也生效）。 */
+  /** 优先未读；无未读时循环打开进行中的会话；无 target。可注册为全局快捷键（最小化也生效）。 */
   | "openUnread"
+  /** 打开 / 收起右侧终端，仅应用内生效。 */
+  | "toggleTerminal"
   | "insertText"
   /** 选中新会话页要运行的工作流；target 为工作流 id。仅新会话页生效。 */
   | "selectWorkflow"
@@ -458,12 +460,14 @@ export interface Settings {
   stageModels: StageModelTarget[];
   /** 打开文件用的编辑器命令（cursor / code / zed 等） */
   editor: string;
+  /** 内嵌终端程序，空为系统默认 shell。 */
+  terminalShell: string;
+  /** 每项是一个独立的启动参数。 */
+  terminalArgs: string[];
   /** 界面皮肤（ink-dark / ink-light，空 = 未设置） */
   theme: string;
   /** 会话历史展示方式（按项目 / 按时间） */
   historyDisplayMode: "project" | "time";
-  /** 聊天视图渲染方式（dom / canvas；默认 canvas） */
-  chatViewRender: "dom" | "canvas";
   /** 团队/漫游中转服务地址（空 = 关闭团队/漫游） */
   relayServer: string;
   /** 团队/漫游身份 token（永久，用以区分每个人） */
@@ -497,6 +501,7 @@ export interface Settings {
   sessionAutoCleanupHours: number;
   /** 减少焦虑（室女座）：运行中的会话只在室女座显示，结束后自动回到普通模式 */
   zenModeEnabled: boolean;
+  knowledgeGraphEnabled: boolean;
   /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程并供工作流 {{xx}} 替换。 */
   customEnvVars: Record<string, string>;
 }
