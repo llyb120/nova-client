@@ -48,6 +48,8 @@ api.searchWorkspaceFiles = async (_id, query) => { searches.push(query); return 
 window.testDisk = () => disk;
 window.changeDisk = () => { disk = '# external\\r\\n'; };
 api.previewWorkspaceFile = async (_id, path) => {
+  if (path === 'images.md') return {path:${JSON.stringify(String.raw`\\?\C:\Users\测试\report.md`)}, text:'![evidence](evidence/chart%20one.png)', kind:'markdown', size:50};
+  if (path === 'report.html') return {path:'D:/demo/report.html', text:'<h1>HTML report</h1>', kind:'html', size:21};
   path = path.startsWith('D:/') ? path : 'D:/demo/' + path;
   reads.push(path);
   if (path.endsWith('slow.md')) await new Promise(resolve => setTimeout(resolve, 250));
@@ -85,6 +87,14 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   page.setDefaultTimeout(10000);
   const errors = [];
+  await page.addInitScript(() => {
+    window.__TAURI_INTERNALS__ = {convertFileSrc: path => 'http://asset.localhost/' + encodeURIComponent(path)};
+  });
+  await page.route('http://asset.localhost/**', route => {
+    const path = decodeURIComponent(new URL(route.request().url()).pathname.slice(1));
+    assert.equal(path, 'C:/Users/测试/evidence/chart one.png');
+    return route.fulfill({contentType:'image/png', body:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==','base64')});
+  });
   page.on("pageerror", e => { errors.push(e.message); console.error(e.message); });
   await page.goto(`http://127.0.0.1:${port}/${name}.html`, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.evaluate(() => document.documentElement.dataset.theme = 'ink-light');
@@ -97,9 +107,20 @@ render(() => <div style="display:flex;height:100vh"><main style="flex:1"><button
   assert.deepEqual(await page.evaluate(() => window.testDirectories()), [], 'opening panel does not read directories');
   await page.getByRole('button', {name:'选择项目文件',exact:true}).click();
   await page.locator('.workspace-file').first().click();
-  await page.getByRole('textbox', {name:'文件内容编辑'}).waitFor();
-  await page.getByRole('button', {name:'预览',exact:true}).click();
   await page.getByRole('heading', {name:'Hello'}).waitFor();
+  assert.equal(await page.getByRole('textbox', {name:'文件内容编辑'}).count(), 0, 'Markdown opens in preview');
+  for (const path of ['images.md', 'report.html']) {
+    await page.evaluate(path => window.dispatchEvent(new CustomEvent('nova:preview-file', {detail:{path}})), path);
+    if (path === 'images.md') {
+      await page.waitForFunction(() => document.querySelector('.workspace-preview .markdown img')?.naturalWidth === 1).catch(async error => { console.error(await page.locator('.workspace-preview').innerHTML()); throw error; });
+    } else {
+      await page.frameLocator('.workspace-preview iframe').getByRole('heading', {name:'HTML report'}).waitFor();
+    }
+    await page.getByRole('button', {name:'编辑',exact:true}).click();
+    await page.getByRole('textbox', {name:'文件内容编辑'}).waitFor();
+    await page.getByRole('button', {name:'预览',exact:true}).click();
+    await page.getByRole('button', {name: path === 'images.md' ? '关闭 report.md' : '关闭 report.html',exact:true}).click();
+  }
   console.log('preview loaded');
   const actions = page.locator('.workspace-actions');
   const actionToggle = page.getByLabel('更多文件操作');

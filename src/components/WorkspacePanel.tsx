@@ -12,6 +12,7 @@ import { state, ensureHistoryItems } from "../store";
 import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
 import { workspaceLayout, setWorkspaceLayout, type WorkspaceMode } from "../workspaceLayout";
 import { collectWorkspaceArtifacts } from "../workspaceArtifacts";
+import { localImagePath } from "../transcriptImage";
 import { absolutePath, createFileContextMenu } from "./FileContextMenu";
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconX, IconCopy, IconBrowser, IconGear, IconTerminal } from "./icons";
 import "./WorkspacePanel.css";
@@ -292,7 +293,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         if (duplicate && !reload) { activate(duplicate); revealLine(line); return; }
         const buffer = drafts.get(draftKey(result.path));
         const tab: FileTab = { file: buffer?.file ?? result, original: buffer?.file.sheet ?? buffer?.file.text ?? result.sheet ?? result.text ?? '',
-          draft: buffer?.text ?? normalized(result.sheet ?? result.text ?? ''), editing: result.text != null, source: false, saved: false, error: '', scroll: 0, start: 0, end: 0 };
+          draft: buffer?.text ?? normalized(result.sheet ?? result.text ?? ''), editing: result.text != null && (!!buffer || !['markdown', 'html'].includes(result.kind)), source: false, saved: false, error: '', scroll: 0, start: 0, end: 0 };
         setTabs(all => duplicate ? all.map(item => item === duplicate ? tab : item) : [...all, tab]);
         activate(tab);
         revealLine(line);
@@ -398,8 +399,11 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     return template.innerHTML;
   });
   function relative(path: string) {
+    // Canonical Windows paths use \\?\; mixing that prefix with URL slashes breaks asset loading.
+    const documentPath = localImagePath(preview()!.path) ?? preview()!.path;
+    try { path = decodeURIComponent(path); } catch { /* Keep literal malformed percent escapes. */ }
     if (/^(?:[a-z]:[\\/]|[\\/])/i.test(path)) return path;
-    return `${preview()!.path.replace(/[\\/][^\\/]*$/, "")}/${path}`;
+    return `${documentPath.replace(/[\\/][^\\/]*$/, "")}/${path}`;
   }
   const label = (path: string) => path.split(/[\\/]/).pop() || path;
   const resize = (value: number) => {
@@ -470,7 +474,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         <IconFolder size={16} /><span class="workspace-breadcrumb-text">{label(state.cwd)} › {preview() ? label(preview()!.path) : '选择文件'}</span><IconChevron size={14} open={browse()} />
       </button>
       <Show when={preview()?.text != null}>
-        <button aria-pressed={editing()} onClick={() => setEditing(v => !v)}>{editing() ? '预览' : '编辑'}</button>
+        <button aria-pressed={editing()} onClick={() => { setSource(false); setEditing(v => !v); }}>{editing() ? '预览' : '编辑'}</button>
         <button disabled={!dirty() || saving()} onClick={() => void save()} title="保存 (Ctrl/Cmd+S)">{saving() ? '保存中' : saved() ? '已保存' : '保存'}</button>
       </Show>
       <Show when={preview()?.kind === "spreadsheet"}>
@@ -526,7 +530,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     <Show when={loading()}><p role="status">正在读取文件…</p></Show>
     <Show when={preview()} keyed>{file => <>
       <Show when={editing() && file.text !== null} fallback={<div class="workspace-preview">
-        <Switch fallback={<p>此文件类型或大小不适合内嵌预览，请使用“系统打开”或“编辑”。文本上限 256 KB，图片上限 16 MB。</p>}>
+        <Switch fallback={<p>此文件类型或大小不适合内嵌预览，请使用“系统打开”。HTML、Markdown 和图片上限 16 MB，其他文本上限 256 KB。</p>}>
           <Match when={file.kind === "image"}><img class="workspace-image" src={convertFileSrc(file.path)} alt={label(file.path)} onError={() => setError("图片加载失败，请使用系统打开")} onContextMenu={e => menu.open(e, file.path)} /></Match>
           <Match when={file.kind === "markdown" && !source()}><div class="markdown" innerHTML={markdown()} onClick={e => {
             const link = (e.target as HTMLElement).closest("a"); if (!link) return;

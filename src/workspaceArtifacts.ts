@@ -1,4 +1,5 @@
 import type { Item } from "./types";
+import { marked } from "marked";
 
 export function collectWorkspaceArtifacts(items: readonly Item[]): string[] {
   const paths = new Set<string>();
@@ -8,6 +9,8 @@ export function collectWorkspaceArtifacts(items: readonly Item[]): string[] {
     try { path = decodeURIComponent(path); } catch { /* Literal percent in a filename. */ }
     path = path.replace(/^file:\/\/(?=\/|[a-z]:)/i, "").replace(/^\/([a-z]:[\\/])/i, "$1")
       .replace(/(?::\d+(?::\d+)?|#L\d+(?:-L?\d+)?)$/i, "");
+    if (!path.trim() || /^(?:[.\u2026]+|[\\/]+)$/.test(path)
+      || (/^[a-z][a-z\d+.-]*:/i.test(path) && !/^[a-z]:[\\/]/i.test(path))) return;
     paths.add(path);
   };
   // 图片生成等工具把产物路径放在结果 JSON（{path, markdown}）里：
@@ -45,7 +48,9 @@ export function collectWorkspaceArtifacts(items: readonly Item[]): string[] {
         }
       }
     } else if (item.type === "assistant") {
-      for (const match of item.text.matchAll(/!?\[[^\]]*\]\((?:<([^>]+)>|([^\s()]*(?:\([^()]*\)[^\s()]*)*))\)/g)) add(match[1] ?? match[2]);
+      marked.walkTokens(marked.lexer(item.text), token => {
+        if (token.type === "link" || token.type === "image") add(token.href);
+      });
     }
   }
   return [...paths];

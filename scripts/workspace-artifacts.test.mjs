@@ -29,4 +29,15 @@ assert.deepEqual(collectWorkspaceArtifacts([
   {type:'tool',kind:'other',status:'completed',content:[],
     rawOutput:{content:[{type:'text',text:imageResult}]}},
 ]), ['D:/w/nova-image-1.png']);
+// Markdown syntax examples are not artifacts; placeholders and non-file schemes are not paths.
+assert.deepEqual(collectWorkspaceArtifacts([{type:'assistant', text:[
+  '`![SC03](...)`',
+  '```markdown\n[example](fake.md)\n```',
+  '[placeholder](...) [encoded](%2E%2E%2E) [ellipsis](…) [empty](< >)',
+  '[mail](mailto:test@example.com) [command](javascript:alert)',
+  '[real](evidence/SC03.png "截图") [reference][report]',
+  '[report]: report.md',
+].join('\n\n')}]), ['evidence/SC03.png', 'report.md']);
+assert.deepEqual(collectWorkspaceArtifacts([{type:'tool',kind:'edit',status:'completed',
+  content:[],locations:[{path:'...'},{path:'README'},{path:'.gitignore'}]}]), ['README','.gitignore']);
 console.log("workspace artifacts checks passed");

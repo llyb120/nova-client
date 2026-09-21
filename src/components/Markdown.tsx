@@ -1,5 +1,5 @@
 import DOMPurify from "dompurify";
-import { marked } from "marked";
+import { Marked } from "marked";
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createSignal, onCleanup, untrack } from "solid-js";
 import { api } from "../ipc";
@@ -9,7 +9,7 @@ import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { advanceStreamText, STREAM_PREBUFFER_MS } from "../streamReveal";
 import { createFileContextMenu } from "./FileContextMenu";
 
-marked.setOptions({ gfm: true, breaks: true });
+const marked = new Marked({ gfm: true, breaks: true });
 marked.use({ renderer: {
   image({ href, text }) {
     const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

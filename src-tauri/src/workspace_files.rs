@@ -9,6 +9,14 @@ use std::{
 use tauri::{Emitter, State};
 
 const TEXT_LIMIT: u64 = 256 * 1024;
+const DOCUMENT_LIMIT: u64 = 16 * 1024 * 1024;
+
+fn text_limit(path: &Path) -> u64 {
+    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "md" | "markdown" | "html" | "htm" => DOCUMENT_LIMIT,
+        _ => TEXT_LIMIT,
+    }
+}
 const SHEET_LIMIT: u64 = 16 * 1024 * 1024;
 const IMAGE_LIMIT: u64 = 8 * 1024 * 1024;
 
@@ -405,15 +413,16 @@ fn read_preview(root: &Path, path: &str) -> Result<Preview, String> {
         result.data = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
         return Ok(result);
     }
-    if meta.len() > TEXT_LIMIT {
+    let limit = text_limit(&path);
+    if meta.len() > limit {
         return Ok(result);
     }
     let mut bytes = Vec::new();
     (&mut file)
-        .take(TEXT_LIMIT + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > TEXT_LIMIT || bytes.contains(&0) {
+    if bytes.len() as u64 > limit || bytes.contains(&0) {
         return Ok(result);
     }
     if let Ok(text) = String::from_utf8(bytes) {
@@ -461,13 +470,14 @@ fn save_text(root: &Path, path: &str, original: &str, text: &str) -> Result<(), 
         }
         return save_bytes(&resolved, &original, &bytes, SHEET_LIMIT);
     }
-    if text.len() as u64 > TEXT_LIMIT || text.contains('\0') {
-        return Err("保存内容必须为不超过 256 KB 的文本".into());
+    let limit = text_limit(&resolved);
+    if text.len() as u64 > limit || text.contains('\0') {
+        return Err(format!("保存内容必须为不超过 {} KB 的文本", limit / 1024));
     }
     if read_preview(root, path)?.text.as_deref() != Some(original) {
         return Err("文件已被外部修改或不支持编辑。草稿已保留，请重新读取文件后合并修改。".into());
     }
-    save_bytes(&resolved, original.as_bytes(), text.as_bytes(), TEXT_LIMIT)
+    save_bytes(&resolved, original.as_bytes(), text.as_bytes(), limit)
 }
 
 fn save_bytes(path: &Path, original: &[u8], bytes: &[u8], limit: u64) -> Result<(), String> {
@@ -565,6 +575,19 @@ pub async fn save_workspace_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn document_preview_and_save_share_the_larger_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "x".repeat(3 * 1024 * 1024);
+        for name in ["report.html", "report.HTM", "report.md", "report.markdown"] {
+            fs::write(dir.path().join(name), &text).unwrap();
+            assert_eq!(read_preview(dir.path(), name).unwrap().text.as_deref(), Some(text.as_str()));
+            save_text(dir.path(), name, &text, &(text.clone() + "edited")).unwrap();
+            assert!(save_text(dir.path(), name, &text, "stale").is_err());
+            fs::File::create(dir.path().join(name)).unwrap().set_len(DOCUMENT_LIMIT + 1).unwrap();
+            assert_eq!(read_preview(dir.path(), name).unwrap().kind, "external");
+        }
+    }
     #[test]
     fn clicked_external_file_can_be_previewed_without_allowing_its_directory() {
         let workspace = tempfile::tempdir().unwrap();
@@ -750,14 +773,14 @@ mod tests {
             &root,
             "readme.md",
             "中文\r\n",
-            &"x".repeat(TEXT_LIMIT as usize + 1)
+            &"x".repeat(DOCUMENT_LIMIT as usize + 1)
         )
         .is_err());
         assert_eq!(
             fs::read_to_string(root.join("readme.md")).unwrap(),
             "中文\r\n"
         );
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 4);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 5); // Four inputs plus the save backup.
         fs::create_dir(root.join("nested")).unwrap();
         fs::write(root.join("nested/Result.md"), "ok").unwrap();
         fs::write(root.join(".gitignore"), "hidden-result.md\n").unwrap();
