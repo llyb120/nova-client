@@ -5659,6 +5659,7 @@ pub fn run() {
             workspace_terminal::terminal_close,
             native_browser::native_browser_ui,
             chrome_browser::chrome_browser_ui,
+            tool_experience::knowledge_graph,
             image_generation::image_command_context,
             list_threads,
             load_threads,

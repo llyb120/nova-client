@@ -41,7 +41,7 @@ export function createHomeTerminalState(context: () => {
   const [opened, setOpened] = createSignal(false);
   const available = () => {
     const { currentId, view } = context();
-    return !currentId && view !== "clues" && view !== "workflows";
+    return !currentId && view !== "clues" && view !== "workflows" && view !== "knowledge";
   };
   // Track navigation/new-session requests only, never the opened signal.
   createEffect(on(context, () => setOpened(false)));

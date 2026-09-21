@@ -316,6 +316,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     s?.sessionAutoCleanupHours ?? 24 * 30,
   );
   const [zenModeEnabled, setZenModeEnabled] = createSignal(s?.zenModeEnabled ?? false);
+  const [knowledgeGraphEnabled, setKnowledgeGraphEnabled] = createSignal(s?.knowledgeGraphEnabled ?? false);
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
   );
@@ -745,6 +746,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
     zenModeEnabled: zenModeEnabled(),
+    knowledgeGraphEnabled: knowledgeGraphEnabled(),
     historyDisplayMode: historyDisplayMode(),
     customEnvVars: Object.fromEntries(
       customEnvVars()
@@ -1473,6 +1475,14 @@ export function SettingsModal(props: { onClose: () => void }) {
 
           {/* ===== 高级 ===== */}
           <Show when={tab() === "advanced"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">知识图谱</h3>
+              <label class="backend-switch">
+                <input type="checkbox" checked={knowledgeGraphEnabled()} onChange={(e) => setKnowledgeGraphEnabled(e.currentTarget.checked)} />
+                <span>显示知识图谱</span>
+              </label>
+              <p class="field-hint">默认关闭。开启后在室女座旁显示入口，以向四周展开的操作树查看已记录的路径、下一步分支和可完成的目标。</p>
+            </section>
             <section class="settings-group">
               <h3 class="settings-group-title">上下文机制</h3>
               <label class="field">

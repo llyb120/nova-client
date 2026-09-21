@@ -178,6 +178,8 @@ pub struct Settings {
     pub session_auto_cleanup_hours: u32,
     /// 禅意模式（室女座）：运行中的会话只在侧栏「室女座」中显示，结束后自动回到普通模式。
     pub zen_mode_enabled: bool,
+    /// 在室女座旁显示操作知识图谱，默认关闭。
+    pub knowledge_graph_enabled: bool,
     /// 上下文检索：none / fast。旧配置中的 super 会在加载时迁移为 fast。
     pub context_retrieval_mode: ContextRetrievalMode,
 
@@ -247,6 +249,7 @@ impl Default for Settings {
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,
             zen_mode_enabled: false,
+            knowledge_graph_enabled: false,
             context_retrieval_mode: ContextRetrievalMode::Fast,
             custom_env_vars: std::collections::HashMap::new(),
         }

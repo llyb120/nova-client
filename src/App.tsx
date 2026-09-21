@@ -15,10 +15,11 @@ import { UpdateModal } from "./components/UpdateModal";
 import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
 import { selectedChatText } from "./chatSelection";
-import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
+import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
 import { mountSessionShortcuts } from "./sessionShortcuts";
 import { createHomeTerminalState, setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
 const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
+const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"));
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
   return (
@@ -170,6 +171,9 @@ export default function App() {
   const [showAchievements, setShowAchievements] = createSignal(false);
   const [showUpdate, setShowUpdate] = createSignal(false);
   const [showInbox, setShowInbox] = createSignal(false);
+  createEffect(() => {
+    if (state.view === "knowledge" && !state.settings?.knowledgeGraphEnabled) setView("home");
+  });
 
   onMount(() => {
     void initStore();
@@ -231,7 +235,9 @@ export default function App() {
         fallback={
           <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
-            <HomeView />
+            <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={<HomeView />}>
+              <Suspense><KnowledgeGraphView /></Suspense>
+            </Show>
           }>
             <EvidenceChainView />
           </Show>

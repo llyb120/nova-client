@@ -118,7 +118,7 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "virgo") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "virgo" | "knowledge") => {
     setView(view);
     closeThread();
   };
@@ -809,6 +809,12 @@ export function Sidebar(props: {
                     {virgoChainCount()}
                   </span>
                 </Show>
+              </button>
+            </Show>
+            <Show when={state.settings?.knowledgeGraphEnabled}>
+              <button class="mode-seg-btn" classList={{ active: state.view === "knowledge" }}
+                onClick={() => switchView("knowledge")} title="查看操作路径与下一步分支">
+                知识图谱
               </button>
             </Show>
           </div>

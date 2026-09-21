@@ -123,6 +123,42 @@ fn graph(routes: &[&Entry]) -> Value {
     })).collect::<Vec<_>>(), "routes":routes.iter().map(|e| summary(e)).collect::<Vec<_>>()})
 }
 
+fn read_entries(dir: &Path) -> Result<(fs::File, Vec<Entry>)> {
+    fs::create_dir_all(dir).map_err(err)?;
+    // Cross-process lock also covers simultaneous Nova instances; never remove this lock file.
+    let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(dir.join("store.lock")).map_err(err)?;
+    lock.try_lock().map_err(|e| format!("经验库忙，请稍后重试：{e}"))?;
+    let path = dir.join("routes.json");
+    let entries: Vec<Entry> = match fs::File::open(&path) {
+        Ok(file) => {
+            let mut data = Vec::new();
+            file.take(8 * 1024 * 1024 + 1).read_to_end(&mut data).map_err(err)?;
+            if data.len() > 8 * 1024 * 1024 { return Err("经验库超过8MiB，请清理后重试".into()); }
+            serde_json::from_slice(&data).map_err(|e| format!("经验库损坏，保留原文件：{e}"))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(err(e)),
+    };
+    Ok((lock, entries))
+}
+
+fn library_graph(dir: &Path) -> Result<Value> {
+    let (_lock, entries) = read_entries(dir)?;
+    let groups: BTreeSet<_> = entries.iter().filter(|e| !e.disabled)
+        .map(|e| (&e.tool, &e.scope)).collect();
+    Ok(json!(groups.into_iter().map(|(tool, scope)| {
+        let routes: Vec<_> = entries.iter().filter(|e| !e.disabled && e.tool == *tool && e.scope == *scope).collect();
+        json!({"tool":tool,"scope":scope,"graph":graph(&routes)})
+    }).collect::<Vec<_>>()))
+}
+
+#[tauri::command]
+pub async fn knowledge_graph(webview: tauri::Webview) -> Result<Value> {
+    if webview.label() != "main" { return Err("仅 Nova 主界面可用".into()); }
+    tokio::task::spawn_blocking(|| library_graph(&crate::lyra::config::nova_root().join("tool-experiences")))
+        .await.map_err(err)?
+}
+
 pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observed_scope: Option<&str>) -> Result<Value> {
     let operation = args["operation"].as_str().unwrap_or_default();
     if !matches!(operation, "experience_search" | "experience_save" | "experience_feedback") {
@@ -146,21 +182,7 @@ pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observe
             return Err("反馈需reason及outcome=success/transient/precondition/invalid；超时用transient，确认路径失效才用invalid".into());
         }
     }
-    fs::create_dir_all(dir).map_err(err)?;
-    // Cross-process lock also covers simultaneous Nova instances; never remove this lock file.
-    let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(dir.join("store.lock")).map_err(err)?;
-    lock.try_lock().map_err(|e| format!("经验库忙，请稍后重试：{e}"))?;
-    let path = dir.join("routes.json");
-    let mut entries: Vec<Entry> = match fs::File::open(&path) {
-        Ok(file) => {
-            let mut data = Vec::new();
-            file.take(8 * 1024 * 1024 + 1).read_to_end(&mut data).map_err(err)?;
-            if data.len() > 8 * 1024 * 1024 { return Err("经验库超过8MiB，请清理后重试".into()); }
-            serde_json::from_slice(&data).map_err(|e| format!("经验库损坏，保留原文件：{e}"))?
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(err(e)),
-    };
+    let (_lock, mut entries) = read_entries(dir)?;
     if !writing {
         let query = terms(&request.task);
         // ponytail: exact-prefix trie + lexical scan of at most 300 routes; use a
@@ -221,7 +243,7 @@ pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observe
         file.write_all(&data)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temp, &path)
+        fs::rename(&temp, dir.join("routes.json"))
     })();
     if let Err(e) = save { let _ = fs::remove_file(&temp); return Err(format!("经验保存失败，原文件未删除：{e}")); }
     Ok(json!({"experience":result,"saved":true}))
@@ -230,6 +252,38 @@ pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observe
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn library_keeps_all_routes_isolated_and_preserves_bad_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(library_graph(dir.path()).unwrap(), json!([]));
+        for tool in ["jianlai", "chrome", "webview"] {
+            for i in 0..14 {
+                let args = json!({"operation":"experience_save","snapshotId":"fresh","experience":{
+                    "scope":"https://example.com","task":format!("目标{i}"),"conditions":["已登录"],
+                    "steps":["打开菜单",format!("操作{i}")],"checks":["结果可见"],
+                    "evidence":"结果可见","outcome":"success","redacted":true}});
+                execute(dir.path(), tool, "one", &args, Some("https://example.com")).unwrap();
+            }
+        }
+        let result = library_graph(dir.path()).unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 3);
+        for group in result.as_array().unwrap() {
+            assert_eq!(group["graph"]["routes"].as_array().unwrap().len(), 14);
+            assert_eq!(group["graph"]["roots"][0]["children"][0]["children"].as_array().unwrap().len(), 14);
+        }
+        let path = dir.path().join("routes.json");
+        let mut entries: Vec<Entry> = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        entries[0].disabled = true;
+        fs::write(&path, serde_json::to_vec(&entries).unwrap()).unwrap();
+        let result = library_graph(dir.path()).unwrap();
+        let jianlai = result.as_array().unwrap().iter().find(|g| g["tool"] == "jianlai").unwrap();
+        assert_eq!(jianlai["graph"]["routes"].as_array().unwrap().len(), 13);
+        fs::write(&path, b"broken").unwrap();
+        assert!(library_graph(dir.path()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"broken");
+        let settings: crate::settings::Settings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.knowledge_graph_enabled);
+    }
     #[test]
     fn lifecycle_is_scoped_verified_deduplicated_and_persistent() {
         let dir = tempfile::tempdir().unwrap();

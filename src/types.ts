@@ -501,6 +501,7 @@ export interface Settings {
   sessionAutoCleanupHours: number;
   /** 减少焦虑（室女座）：运行中的会话只在室女座显示，结束后自动回到普通模式 */
   zenModeEnabled: boolean;
+  knowledgeGraphEnabled: boolean;
   /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程并供工作流 {{xx}} 替换。 */
   customEnvVars: Record<string, string>;
 }
