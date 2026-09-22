@@ -30,6 +30,8 @@ test('JEV advice is available through both existing tool schemas with identical 
   const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));
   assert.deepEqual(chrome.inputSchema.properties.advice,jianlai.inputSchema.properties.advice);
   assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,8);
+  assert.deepEqual(chrome.inputSchema.properties.plan.required,['task','authorization','expectedText']);
+  assert.equal(chrome.inputSchema.properties.plan.properties.inputs.maxItems,8);
   assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.required,['action','name','role','expectedText']);
   for(const tool of [chrome,jianlai]) {
     assert(tool.inputSchema.properties.operation.enum.includes('advise'));
