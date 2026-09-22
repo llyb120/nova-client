@@ -54,6 +54,25 @@ async function debuggerCall(command, invoke) {
 async function execute(command) {
   const {operation, args} = command;
   if (Date.now() > command.expiresAt) throw Error('命令已过期，未执行');
+  if (operation === 'downloads') {
+    if (!chrome.downloads) throw Error('下载查询需要 Nova Chrome 0.1.6，请更新并重新加载扩展');
+    const query = {orderBy:['-startTime'],limit:100};
+    if (args.downloadId !== undefined) {
+      if (typeof args.downloadId !== 'string' || !/^\d+$/.test(args.downloadId) || !Number.isSafeInteger(Number(args.downloadId))) throw Error('downloadId 必须为下载查询返回的 ID');
+      query.id = Number(args.downloadId);
+    } else {
+      const since = args.since ?? Date.now()-600000;
+      if (!Number.isSafeInteger(since) || since < 0 || since > 8640000000000000) throw Error('since 必须为有效的 Unix 毫秒时间戳');
+      query.startedAfter = new Date(since).toISOString();
+    }
+    if (args.incognito !== undefined && typeof args.incognito !== 'boolean') throw Error('incognito必须为boolean');
+    const items = await chrome.downloads.search(query);
+    return {scope:'browser',queriedAt:Date.now(),limit:100,downloads:items.filter(d=>args.incognito === undefined || d.incognito === args.incognito).map(d=>({
+      id:String(d.id),url:d.url?.slice(0,4096),finalUrl:d.finalUrl?.slice(0,4096),urlTruncated:(d.url?.length || 0)>4096 || (d.finalUrl?.length || 0)>4096,path:d.filename,state:d.state,
+      bytesReceived:d.bytesReceived,totalBytes:d.totalBytes,startTime:d.startTime,endTime:d.endTime,
+      error:d.error || null,paused:d.paused,canResume:d.canResume,exists:d.exists,danger:d.danger,mime:d.mime,incognito:d.incognito,
+    })),notice:'Chrome 下载记录为浏览器范围，不能按 tabTag 归属；按时间、URL、文件名确认目标。空列表不代表导出失败，网页可能尚在生成文件。只有 state=complete 才表示下载完成。'};
+  }
   if (operation === 'status') return {incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess()};
   if (operation === 'tabs') return {tabs:(await inventory()).filter(tab=>args.incognito === undefined || tab.incognito === args.incognito),incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess()};
   if (operation === 'open' || operation === 'new_tab') {

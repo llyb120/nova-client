@@ -4,6 +4,34 @@ import {readFile} from 'node:fs/promises';
 import {runInNewContext} from 'node:vm';
 import {webcrypto} from 'node:crypto';
 
+test('native downloads expose progress, interruption and completion without tab guesses or replay',async()=>{
+  const event=()=>({addListener(){}});let query,calls=0;
+  let item={id:42,url:'blob:https://example.com/export',filename:'C:/Downloads/报告.csv',state:'in_progress',bytesReceived:0,totalBytes:-1,incognito:false};
+  const chrome={downloads:{search:async q=>{query=q;calls++;return [item];}},
+    storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>[],onRemoved:event(),onReplaced:event()},
+    debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.run=args=>execute({operation:"downloads",args,expiresAt:Date.now()+3000});',scope);
+  const first=await scope.run({since:0});
+  assert.equal(first.scope,'browser');assert.equal(first.downloads[0].state,'in_progress');assert.equal(first.downloads[0].totalBytes,-1);
+  assert.equal(query.startedAfter,'1970-01-01T00:00:00.000Z');assert.equal(query.limit,100);
+  item={...item,state:'interrupted',bytesReceived:512,error:'NETWORK_FAILED',canResume:true};
+  const failed=await scope.run({downloadId:'42',since:-1});
+  assert.equal(query.id,42);assert.equal(query.startedAfter,undefined);assert.equal(failed.downloads[0].error,'NETWORK_FAILED');
+  item={...item,state:'complete',bytesReceived:1024,totalBytes:1024,error:undefined,exists:true};
+  const done=await scope.run({downloadId:'42'});assert.equal(done.downloads[0].state,'complete');assert.equal(done.downloads[0].path,item.filename);assert.equal(done.downloads[0].error,null);
+  assert.equal((await scope.run({incognito:true})).downloads.length,0);
+  for(const args of [{since:-1},{since:'1'},{since:8640000000000001},{downloadId:'oops'},{downloadId:'9007199254740992'},{incognito:'true'}])await assert.rejects(scope.run(args));
+  assert.equal(calls,4,'invalid inputs must not query or trigger downloads');
+  delete chrome.downloads;await assert.rejects(scope.run({}),/0\.1\.6/);
+  for(const name of ['chrome','webview']) {
+    const schema=JSON.parse(await readFile(new URL(`../../scripts/${name}-tool.json`,import.meta.url),'utf8'));
+    assert.ok(schema.inputSchema.properties.operation.enum.includes('downloads'));
+    assert.equal(schema.inputSchema.properties.downloadId.type,'string');
+    assert.match(schema.description,/Page stable/);
+  }
+});
+
 test('a stuck debugger command times out, polling resumes and late results are not replayed',async()=>{
   const event=()=>({addListener(){}});
   const replies=[]; let polls=0, calls=0, finishCommand;

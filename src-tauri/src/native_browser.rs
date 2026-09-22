@@ -13,6 +13,76 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager};
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
+#[cfg(windows)]
+struct Download {
+    thread: String,
+    tab: String,
+    id: String,
+    started: i64,
+    operation: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2DownloadOperation,
+}
+// COM download objects stay on the UI apartment; queries marshal only JSON back.
+#[cfg(windows)]
+thread_local! { static DOWNLOADS: std::cell::RefCell<Vec<Download>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+async fn downloads(app: &AppHandle, thread: &str, args: &Value) -> Result<Value, String> {
+    let id = match args.get("downloadId") {
+        Some(value) => Some(value.as_str().filter(|v| !v.is_empty() && v.len() <= 80).ok_or("无效 downloadId")?.to_owned()),
+        None => None,
+    };
+    let since = match args.get("since").filter(|_| id.is_none()) {
+        Some(value) => value.as_i64().filter(|v| (0..=8_640_000_000_000_000).contains(v)).ok_or("since 必须为有效的 Unix 毫秒时间戳")?,
+        None => chrono::Utc::now().timestamp_millis() - 600_000,
+    };
+    #[cfg(not(windows))]
+    { let _ = (app, thread, since, id); Err("需要 Windows WebView2".into()) }
+    #[cfg(windows)]
+    {
+        use webview2_com::Microsoft::Web::WebView2::Win32::*;
+        let thread = thread.to_owned();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            let result = DOWNLOADS.with(|records| -> Result<Value, String> {
+                let records = records.borrow();
+                let mut items = Vec::new();
+                for record in records.iter().rev().filter(|d| d.thread == thread && id.as_ref().map_or(d.started >= since, |id| d.id == *id)).take(100) {
+                    let read = || -> windows::core::Result<Value> { unsafe {
+                        let op = &record.operation;
+                        let mut state = COREWEBVIEW2_DOWNLOAD_STATE::default();
+                        let mut reason = COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON::default();
+                        let (mut received, mut total) = (0, 0);
+                        op.State(&mut state)?;
+                        op.InterruptReason(&mut reason)?;
+                        op.BytesReceived(&mut received)?;
+                        op.TotalBytesToReceive(&mut total)?;
+                        let mut raw = windows::core::PWSTR::null();
+                        op.ResultFilePath(&mut raw)?;
+                        let path = webview2_com::take_pwstr(raw);
+                        op.Uri(&mut raw)?;
+                        let full_url = webview2_com::take_pwstr(raw);
+                        let url: String = full_url.chars().take(4096).collect();
+                        let state = if state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED { "complete" }
+                            else if state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED { "interrupted" } else { "in_progress" };
+                        Ok(json!({"id":record.id,"tabId":record.tab,"startTime":record.started,
+                            "url":url,"urlTruncated":url.len()!=full_url.len(),"path":path,"state":state,"bytesReceived":received,"totalBytes":total,
+                            "exists":Path::new(&path).is_file(),
+                            "error":if state == "interrupted" {
+                                let reasons = ["NONE", "FILE_FAILED", "FILE_ACCESS_DENIED", "FILE_NO_SPACE", "FILE_NAME_TOO_LONG", "FILE_TOO_LARGE", "FILE_MALICIOUS", "FILE_TRANSIENT_ERROR", "FILE_BLOCKED_BY_POLICY", "FILE_SECURITY_CHECK_FAILED", "FILE_TOO_SHORT", "FILE_HASH_MISMATCH", "NETWORK_FAILED", "NETWORK_TIMEOUT", "NETWORK_DISCONNECTED", "NETWORK_SERVER_DOWN", "NETWORK_INVALID_REQUEST", "SERVER_FAILED", "SERVER_NO_RANGE", "SERVER_BAD_CONTENT", "SERVER_UNAUTHORIZED", "SERVER_CERTIFICATE_PROBLEM", "SERVER_FORBIDDEN", "SERVER_UNEXPECTED_RESPONSE", "SERVER_CONTENT_LENGTH_MISMATCH", "SERVER_CROSS_ORIGIN_REDIRECT", "USER_CANCELED", "USER_SHUTDOWN", "USER_PAUSED", "DOWNLOAD_PROCESS_CRASHED"];
+                                Some(format!("{} ({})", reasons.get(reason.0 as usize).unwrap_or(&"UNKNOWN"), reason.0))
+                            } else { None }}))
+                    }};
+                    // Closing a tab may invalidate its COM object. Never report that as completion.
+                    items.push(read().unwrap_or_else(|e| json!({"id":record.id,"tabId":record.tab,"state":"unknown","error":e.to_string()})));
+                }
+                Ok(json!({"scope":"session","queriedAt":chrono::Utc::now().timestamp_millis(),"limit":100,"downloads":items,
+                    "notice":"仅保留本次应用运行最近 200 条下载。空列表不代表导出失败；页面稳定不代表下载完成。只有 state=complete 才表示完成，原生保存/安全提示仍需处理。"}))
+            });
+            let _ = tx.send(result);
+        }).map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(5), rx).await
+            .map_err(|_| "下载查询超时，请处理原生对话框后重新查询")?.map_err(|e| e.to_string())?
+    }
+}
 tokio::task_local! { static CONTROL_TAB: String; }
 #[cfg(windows)]
 struct Popup {
@@ -125,7 +195,7 @@ fn create_tab(
     let mut builder = tauri::WebviewBuilder::new(&id, tauri::WebviewUrl::External(url))
         .data_directory(state_dir(app).join("native-browser-profile"))
         .on_navigation(move |url| {
-            if !matches!(url.scheme(), "http" | "https" | "about") {
+            if !matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data") {
                 return false;
             }
             nav_app
@@ -172,10 +242,29 @@ fn create_tab(
     view.hide().map_err(|e| e.to_string())?;
     let popup_app = app.clone();
     let popup_thread = thread.to_owned();
+    let download_thread = thread.to_owned();
+    let download_tab = id.clone();
     view.with_webview(move |native| unsafe {
         let Ok(core) = native.controller().CoreWebView2() else {
             return;
         };
+        use windows::core::Interface;
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_4;
+        let registration = core.cast::<ICoreWebView2_4>().and_then(|core| core.add_DownloadStarting(
+            &webview2_com::DownloadStartingEventHandler::create(Box::new(move |_, args| {
+                if let Some(args) = args {
+                    let operation = args.DownloadOperation()?;
+                    DOWNLOADS.with(|records| {
+                        let mut records = records.borrow_mut();
+                        // ponytail: retain the latest 200 operations; use a persistent history if needed.
+                        if records.len() >= 200 { records.remove(0); }
+                        records.push(Download { thread: download_thread.clone(), tab: download_tab.clone(),
+                            id: uuid::Uuid::new_v4().to_string(), started: chrono::Utc::now().timestamp_millis(), operation });
+                    });
+                }
+                Ok(())
+            })), &mut 0));
+        if let Err(error) = registration { eprintln!("browser download handler: {error}"); }
         if let Some(key) = popup_id {
             if let Some(popup) = POPUPS.with(|p| p.borrow_mut().remove(&key)) {
                 if let Err(e) = popup.args.SetNewWindow(&core) {
@@ -198,7 +287,7 @@ fn create_tab(
                 args.Uri(&mut raw)?;
                 let url = webview2_com::take_pwstr(raw);
                 if !tauri::Url::parse(&url).is_ok_and(|u| {
-                    matches!(u.scheme(), "http" | "https") || u.as_str() == "about:blank"
+                    matches!(u.scheme(), "http" | "https" | "blob" | "data") || u.as_str() == "about:blank"
                 }) {
                     return Ok(());
                 }
@@ -532,9 +621,11 @@ pub async fn native_browser_ui(
         }
         "stop" => {
             s.cancel.store(true, Ordering::SeqCst);
+            state.observations.lock().unwrap().remove(&s.active_tab);
             Ok(json!({"stopped":true}))
         }
         "status" => Ok(json!(s)),
+        "downloads" => downloads(&app, &thread_id, &args).await,
         "goto" | "back" | "forward" | "reload" => {
             let _guard = state
                 .gate

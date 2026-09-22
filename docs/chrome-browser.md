@@ -31,6 +31,14 @@ Nova 启动时依次尝试 127.0.0.1:47653–47662，跳过已占用端口。扩
 
 0.1.4 为调试调用增加命令截止时间，避免页面调试命令不返回时阻塞轮询，导致扩展显示已连接但 Nova 判定断线。超时后恢复接收命令，不重放可能已经执行的动作；应先重新观察页面。
 
+## 下载（扩展 0.1.6）
+
+Nova 与扩展需一起更新，在 `chrome://extensions` 重新加载扩展以启用新增的 `downloads` 权限，并刷新 Agent 工具定义。
+点击网页导出后调用 `chrome({operation:"downloads",since:时间戳})`（Unix 毫秒，默认最近 10 分钟），后续用返回的 `downloadId` 精确查询。
+返回原生状态 `in_progress/complete/interrupted`、接收/总字节数（未知总量可能为 -1）、保存路径、错误、暂停及文件存在信息。
+Chrome API 不提供可靠的来源标签 ID，所以结果标记 `scope:browser`，无需 tabTag；按时间、URL、文件名确认目标，可用 `incognito` 过滤，最多返回最新 100 条。长 URL 截至 4096 字符并标记 `urlTruncated`。
+保留浏览器自身的保存提示和安全检查，不自动重试或绕过拦截。空列表可能是网站仍在生成导出，页面稳定或点击执行成功不能代替下载完成；完成后还应核对文件内容。
+
 ## 验证
 
 运行 node --test extensions/nova-chrome/worker.test.mjs scripts/nova-tools-mcp.test.mjs。
