@@ -26,14 +26,22 @@ test('Chrome and WebView share image coordinates, fast scope and bounded batch s
     }
   }
 });
-test('JEV advice is available through both existing tool schemas with identical bounded inputs', async()=>{
-  const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));
+test('JEV browser decisions share bounded plans; desktop remains advisory', async()=>{
+  const [chrome,webview,jianlai]=await Promise.all(['chrome','webview','jianlai'].map(tool));
+  assert.deepEqual(webview.inputSchema.properties.plan,chrome.inputSchema.properties.plan);
+  assert.deepEqual(webview.inputSchema.properties.experience,chrome.inputSchema.properties.experience);
+  assert.deepEqual(webview.inputSchema.properties.advice,chrome.inputSchema.properties.advice);
+  for (const browser of [chrome,webview]) {
+    assert.match(browser.description,/按情况选择/);
+    assert.match(browser.description,/知识图谱/);
+    assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
+  }
   assert.deepEqual(chrome.inputSchema.properties.advice,jianlai.inputSchema.properties.advice);
   assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,8);
   assert.deepEqual(chrome.inputSchema.properties.plan.required,['task','authorization','expectedText']);
   assert.equal(chrome.inputSchema.properties.plan.properties.inputs.maxItems,8);
   assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.required,['action','name','role','expectedText']);
-  for(const tool of [chrome,jianlai]) {
+  for(const tool of [chrome,webview,jianlai]) {
     assert(tool.inputSchema.properties.operation.enum.includes('advise'));
     assert(tool.inputSchema.properties.operation.enum.includes('run'));
     assert.deepEqual(tool.inputSchema.properties.advice.required,['task','state','choices']);
