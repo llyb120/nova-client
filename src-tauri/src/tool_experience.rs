@@ -51,11 +51,11 @@ pub(crate) fn is_operation(args: &Value) -> bool {
 pub(crate) fn scope(tool: &str, raw: &str) -> Result<String> {
     let raw = raw.trim();
     if raw.is_empty() || raw.chars().count() > 200 { return Err("scope需为1–200字符的应用名或网站origin".into()); }
-    if tool == "chrome" {
+    if matches!(tool, "chrome" | "webview") {
         let url = tauri::Url::parse(raw).map_err(err)?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
             || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
-            return Err("Chrome经验scope必须是不含凭据、查询参数的HTTP(S)网站origin".into());
+            return Err("浏览器经验scope必须是不含凭据、查询参数的HTTP(S)网站origin".into());
         }
         Ok(url.origin().ascii_serialization())
     } else { Ok(raw.to_lowercase()) }

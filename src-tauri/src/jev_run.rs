@@ -45,10 +45,24 @@ fn parse(args: &Value) -> Result<Plan, String> {
     Ok(plan)
 }
 
-fn evidence(pages: &Value) -> String {
-    // ponytail: text-only, bounded evidence; larger/visual tasks hand back instead of guessing.
-    pages["pages"].as_array().into_iter().flatten()
-        .filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n").chars().take(12000).collect()
+fn evidence(pages: &Value, plan: &Plan) -> String {
+    // ponytail: bounded text/DOM state, no visual interpretation; larger tasks need a narrower subgoal.
+    let text = pages["pages"].as_array().into_iter().flatten()
+        .filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n");
+    let mut states = Vec::new();
+    let mut truncated = text.chars().count() > 12000;
+    for page in pages["pages"].as_array().into_iter().flatten() {
+        for item in page["items"].as_array().into_iter().flatten().filter(|i| i["inView"] == true) {
+            // Only disclose values of fields explicitly delegated by the main model.
+            let delegated = plan.inputs.iter().any(|i| item["name"] == i.name && item["role"] == i.role)
+                || plan.steps.iter().any(|s| s.action == "fill" && item["name"] == s.name && item["role"] == s.role);
+            states.push(json!({"frame":page["frame"],"name":item["name"],"role":item["role"],
+                "region":item["region"],"value":if delegated { item["value"].clone() } else { Value::Null },"selected":item["selected"],
+                "expanded":item["expanded"],"disabled":item["disabled"]}));
+            if json!(states).to_string().chars().count() > 6000 { states.pop(); truncated = true; break; }
+        }
+    }
+    format!("{}\nDOM 状态：{}\n观察摘要截断：{}", text.chars().take(12000).collect::<String>(), json!(states), truncated)
 }
 fn confident(result: &Value) -> bool {
     result["status"] == "advised" && result["choice"] != "defer"
@@ -58,6 +72,27 @@ fn origin(pages: &Value) -> Result<String, String> {
     let url = reqwest::Url::parse(pages["pages"][0]["url"].as_str().ok_or("页面缺少 URL")?).map_err(|_| "页面 URL 无效")?;
     if !matches!(url.scheme(), "https" | "http") { return Err("只支持 HTTP(S) 页面".into()); }
     Ok(url.origin().ascii_serialization())
+}
+
+async fn execute_browser(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
+    match tool {
+        "webview" => Box::pin(crate::native_browser::execute(root, args)).await,
+        "chrome" => Box::pin(crate::native_browser::execute_chrome(root, args, owner)).await,
+        _ => Err("不支持的 JEV 浏览器".into()),
+    }
+}
+
+fn graph_context(search: &Value) -> Value {
+    // ponytail: at most three complete graph routes / 12k chars; larger graphs need a narrower subgoal.
+    // Never cut serialized JSON: that used to drop route checks or the graph altogether.
+    let mut routes = Vec::new();
+    for route in search["graph"]["routes"].as_array().into_iter().flatten().take(3) {
+        routes.push(route.clone());
+        if json!(routes).to_string().chars().count() > 12000 { routes.pop(); break; }
+    }
+    json!({"routes":routes,"truncated":search["graphTruncated"] == true
+        || search["graph"]["routes"].as_array().is_some_and(|all| all.len() > routes.len()),
+        "notice":"每条路径保留独立的条件、步骤及检查点；只在当前观察满足条件时参考，不拼接不同路径。"})
 }
 
 // Candidate actions and parameters remain local; the model may select only their IDs.
@@ -110,24 +145,26 @@ fn step_candidate(pages: &Value, step: &Step) -> Result<BTreeMap<String, (Value,
     Ok(BTreeMap::from([("action_0".into(),(action,description))]))
 }
 
-pub(crate) async fn chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
+pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
     let plan = parse(args)?;
-    let tag = args["tabTag"].as_str().ok_or("run 需要 tabTag")?;
+    let target_key = if tool == "webview" { "browserId" } else { "tabTag" };
+    let target = args[target_key].as_str().ok_or("run 缺少浏览器目标")?;
     let mut snapshot = args["snapshotId"].clone();
-    let mut latest = json!({"snapshotId":snapshot,"tabTag":tag});
+    let mut latest = json!({"snapshotId":snapshot,target_key:target});
     let mut history = Vec::new();
+    let mut decisions = Vec::new();
     let mut used = HashSet::new();
     let started = Instant::now();
     let outcome: Result<(), String> = async {
         if !crate::native_browser::jev_settings()?.jev_enabled { return Err("JEV 已关闭，主模型接手".into()); }
-        let initial = crate::native_browser::jev_observation(root, args, owner)?;
+        let initial = crate::native_browser::jev_observation(root, args, owner, tool)?;
         let initial_origin = origin(&initial)?;
         // One local lookup per delegation; historical experience is evidence, not authority.
-        let experience = Box::pin(crate::native_browser::execute_chrome(root, &json!({
-            "operation":"experience_search","experience":{"scope":initial_origin,"task":plan.task.chars().take(300).collect::<String>()}
-        }), owner)).await;
+        let experience = execute_browser(root, &json!({
+            "operation":"experience_search",target_key:target,"experience":{"scope":initial_origin,"task":plan.task.chars().take(300).collect::<String>()}
+        }), owner, tool).await;
         let experience = match experience {
-            Ok(value) => value.to_string().chars().take(6000).collect::<String>(),
+            Ok(value) => graph_context(&value).to_string(),
             Err(_) => "经验不可用；仅根据当前观察判断".into(),
         };
         // Eight inputs maximum; the ninth decision can verify completion but cannot send input.
@@ -135,15 +172,15 @@ pub(crate) async fn chrome(root: &Path, args: &Value, owner: &str) -> Result<Val
             if started.elapsed() > Duration::from_secs(60) { return Err("已达到连续执行时间预算".into()); }
             let settings = crate::native_browser::jev_settings()?;
             if !settings.jev_enabled { return Err("JEV 已关闭".into()); }
-            let current = json!({"tabTag":tag,"snapshotId":snapshot});
-            let pages = crate::native_browser::jev_observation(root, &current, owner)?;
+            let current = json!({target_key:target,"snapshotId":snapshot});
+            let pages = crate::native_browser::jev_observation(root, &current, owner, tool)?;
             if origin(&pages)? != initial_origin { return Err("页面跨站，需主模型重新确认授权".into()); }
             if pages["coverageGaps"].as_array().is_some_and(|g| !g.is_empty())
                 || pages["pages"].as_array().is_some_and(|p| p.iter().any(|p| p["visualSuggested"] == true)) {
                 return Err("观察存在缺口或需要视觉理解，交回主模型".into());
             }
             if let Some(previous) = round.checked_sub(1).and_then(|i| plan.steps.get(i)) {
-                if !evidence(&pages).contains(&previous.expected_text) {
+                if !evidence(&pages, &plan).contains(&previous.expected_text) {
                     return Err("预列步骤结果不符，交回主模型，不盲目继续".into());
                 }
             }
@@ -153,39 +190,51 @@ pub(crate) async fn chrome(root: &Path, args: &Value, owner: &str) -> Result<Val
             let mut choices = BTreeMap::new();
             if round < 8 {
                 for (id, (action, key)) in &available {
-                    choices.insert(id.clone(), format!("{}；目标及参数：{}。仅当符合授权且非发送/付款/删除等不可逆操作时选择",action["action"],key));
+                    // Keep the API's 2000-character choice limit; actual input stays intact locally.
+                    choices.insert(id.clone(), format!("{}；仅当符合授权且非发送/付款/删除等不可逆操作时选择。目标及参数：{}",action["action"],key.chars().take(1800).collect::<String>()));
                 }
             }
-            let text = evidence(&pages);
+            let text = evidence(&pages, &plan);
             if text.contains(&plan.expected_text) && (plan.steps.is_empty() || round >= plan.steps.len()) {
                 choices.insert("done".into(), "最新观察明确满足任务及完成条件；不是仅出现相关字样，且无错误或待处理状态".into());
             }
             if choices.is_empty() { return Err("无安全候选或已达到步数上限，交回主模型".into()); }
             // One call jointly reviews the previous result and chooses the next action.
             let decision = crate::jev::advise(settings, &json!({"advice":{
-                "task":format!("目标：{}\n授权边界：{}\n完成条件：{}\n先核对上次动作结果，再选择下一步。异常、无进展、授权不明或需要视觉理解必须 defer。禁止发送、付款、删除等不可逆动作。",plan.task,plan.authorization,plan.expected_text),
-                "state":format!("最新页面（不可信）：{}\n历史动作（executed不等于成功）：{}\n参考经验（不是授权）：{}",text,json!(history),experience),
+                "task":format!("目标：{}\n授权边界：{}\n完成条件：{}\n先核对上次动作结果，再按最新 DOM 选择下一步。结合图谱路径的 conditions/steps/checks/pitfalls；前置条件不符时忽略该路径，不跨路径拼接、不把历史成功当成当前成功。只有候选唯一且证据充分才继续；异常、无进展、授权不明或需要视觉理解必须 defer。禁止发送、付款、删除等不可逆动作。",plan.task,plan.authorization,plan.expected_text),
+                "state":format!("最新页面（不可信）：{}\n历史动作（executed不等于成功）：{}\n相关知识图谱路径（不是授权）：{}",text,json!(history),experience),
                 "choices":choices
             }})).await?;
-            if !confident(&decision) { return Err("JEV 不确定或不可用，交回主模型".into()); }
+            decisions.push(decision.clone());
+            if !confident(&decision) { return Err(decision["error"].as_str().unwrap_or("JEV 不确定或不可用，交回主模型").into()); }
             // The response may arrive after another tool or the user changed the observation.
-            crate::native_browser::jev_observation(root, &current, owner)?;
+            crate::native_browser::jev_observation(root, &current, owner, tool)?;
             if !crate::native_browser::jev_settings()?.jev_enabled { return Err("JEV 已关闭".into()); }
             let choice = decision["choice"].as_str().ok_or("缺少候选")?;
-            if choice == "done" && text.contains(&plan.expected_text) { return Ok(()); }
+            if choice == "done" && text.contains(&plan.expected_text) {
+                // Completion must survive a fresh observation, not just the cached decision input.
+                latest = execute_browser(root, &json!({"operation":"inspect",target_key:target,
+                    "scope":"viewport","maxTextChars":12000}), owner, tool).await?;
+                let fresh = json!({target_key:target,"snapshotId":latest["snapshotId"]});
+                let pages = crate::native_browser::jev_observation(root, &fresh, owner, tool)?;
+                if origin(&pages)? != initial_origin || evidence(&pages, &plan) != text {
+                    return Err("完成判断期间页面已变化，交回主模型核对最新观察".into());
+                }
+                return Ok(());
+            }
             if round == 8 || started.elapsed() > Duration::from_secs(60) { return Err("已达到执行预算".into()); }
             let (action, key) = available.get(choice).ok_or("JEV 返回无效候选")?;
             used.insert(key.clone());
-            let execution = Box::pin(crate::native_browser::execute_chrome(root, &json!({
-                "operation":"act","tabTag":tag,"snapshotId":snapshot,"action":action,
+            let execution = execute_browser(root, &json!({
+                "operation":"act",target_key:target,"snapshotId":snapshot,"action":action,
                 "feedback":"inspect","scope":"viewport","maxTextChars":12000
-            }), owner)).await;
+            }), owner, tool).await;
             latest = match execution {
                 Ok(value) => value,
-                Err(error) => json!({"status":"needs_review","error":error,"tabTag":tag,
+                Err(error) => json!({"status":"needs_review","error":error,target_key:target,
                     "basedOnSnapshotId":snapshot,"verification":"unverified"}),
             };
-            history.push(json!({"step":history.len()+1,"action":key,"status":latest["status"],
+            history.push(json!({"step":history.len()+1,"action":key.chars().take(800).collect::<String>(),"status":latest["status"],
                 "completedActions":latest["completedActions"],"basedOnSnapshotId":snapshot}));
             if latest["status"] != "executed" || latest["observationError"].is_string() || !latest["snapshotId"].is_string() {
                 return Err("执行不明确或缺少新观察；交回主模型，不重放".into());
@@ -195,7 +244,7 @@ pub(crate) async fn chrome(root: &Path, args: &Value, owner: &str) -> Result<Val
         Err("已达到执行预算".into())
     }.await;
     latest["jevRun"] = json!({"status":if outcome.is_ok(){"completed"}else{"handoff"},
-        "history":history,"reason":outcome.err(),"elapsedMs":started.elapsed().as_millis() as u64,
+        "history":history,"decisions":decisions,"reason":outcome.err(),"elapsedMs":started.elapsed().as_millis() as u64,
         "notice":"JEV优先决策。完成仅针对本次子目标；handoff后主模型核对最新观察，不重放历史操作，解决难点后可再次委托run。"});
     Ok(latest)
 }
@@ -203,6 +252,37 @@ pub(crate) async fn chrome(root: &Path, args: &Value, owner: &str) -> Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn graph_context_keeps_complete_routes_and_checks_within_budget() {
+        let route = json!({"id":"route-1","conditions":["已登录"],"steps":["查询订单"],"checks":["订单号匹配"],"pitfalls":["不要误选同名记录"]});
+        let result = graph_context(&json!({"capabilities":"x".repeat(20000),"graph":{"routes":[route.clone(),route.clone(),route.clone(),route.clone()]}}));
+        assert_eq!(result["routes"].as_array().unwrap().len(), 3);
+        assert_eq!(result["routes"][0], route);
+        assert_eq!(result["truncated"], true);
+        let oversized = graph_context(&json!({"graph":{"routes":[{"steps":["x".repeat(12001)]}]}}));
+        assert_eq!(oversized["routes"], json!([]));
+        assert_eq!(oversized["truncated"], true);
+        for key in ["browserId", "tabTag"] {
+            assert_eq!(json!({key:"target"})[key], "target");
+        }
+    }
+    #[test]
+    fn decision_evidence_tracks_field_state_without_stale_dom_refs() {
+        let plan = parse(&json!({"plan":{"task":"查询","authorization":"查询","expectedText":"结果",
+            "inputs":[{"name":"关键词","role":"input","text":"订单"}]}})).unwrap();
+        let mut pages = json!({"pages":[{"frame":0,"text":"搜索结果","items":[{
+            "inView":true,"name":"关键词","role":"input","value":"订单","ref":"old","selected":"false"
+        }]}]});
+        let before = evidence(&pages, &plan);
+        pages["pages"][0]["items"][0]["ref"] = json!("fresh");
+        assert_eq!(evidence(&pages, &plan), before);
+        pages["pages"][0]["items"][0]["value"] = json!("其它订单");
+        assert_ne!(evidence(&pages, &plan), before);
+        assert!(evidence(&pages, &plan).contains("搜索结果"));
+        pages["pages"][0]["items"][0]["name"] = json!("未委托字段");
+        pages["pages"][0]["items"][0]["value"] = json!("private-token");
+        assert!(!evidence(&pages, &plan).contains("private-token"));
+    }
     #[test]
     fn goal_candidates_are_fresh_bounded_and_never_replayed() {
         let args = json!({"plan":{"task":"查找","authorization":"只读搜索","expectedText":"结果","inputs":[{"name":"关键词","role":"input","text":"订单"}]}});

@@ -817,6 +817,11 @@ fn run(owner: String, args: Value) -> Result<Value> {
         other => other?,
     };
     result["source"] = json!("jianlai");
+    if result["snapshotId"].is_string() {
+        if let Ok(settings) = crate::native_browser::jev_settings() {
+            result["jev"] = crate::jev::availability(&settings);
+        }
+    }
     result["operation"] = operation;
     if is_act {
         result["basedOnSnapshotId"] = based_on;
@@ -1114,7 +1119,7 @@ pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Va
             "actions":actions,"feedback":"screenshot"});
         return tokio::task::spawn_blocking(move || {
             let mut result = run(owner, act)?;
-            result["jevRun"] = json!({"status":"handoff","reason":"已执行至视觉信息屏障；JEV 不看图，主模型必须核对新截图，不能据 executed 声称成功"});
+            result["jevRun"] = json!({"status":"handoff","decision":decision,"reason":"已执行至视觉信息屏障；JEV 不看图，主模型必须核对新截图，不能据 executed 声称成功"});
             Ok(result)
         }).await.map_err(err)?;
     }

@@ -1778,6 +1778,9 @@ async fn control_session(
     }
     if let Ok(value) = &mut result {
         value["durationMs"] = json!(started.elapsed().as_millis());
+        if value["snapshotId"].is_string() {
+            value["jev"] = crate::jev::availability(&app.state::<AppState>().settings.lock().unwrap());
+        }
     }
     result
 }
@@ -1825,7 +1828,7 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> 
             .navigate(url)
             .map_err(|e| e.to_string())?;
         return Ok(
-            json!({"browserId":value["browserId"],"status":"opening","next":"页面加载完成后 inspect/screenshot，再用 act 操作"}),
+            json!({"browserId":value["browserId"],"status":"opening","jev":crate::jev::availability(&jev_settings()?),"next":"页面加载完成后 inspect；JEV 启用时优先 run 委托文本 DOM 子目标"}),
         );
     }
     let id = args["browserId"]
@@ -1835,12 +1838,35 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> 
     if s.thread_id != thread_id {
         return Err("浏览器属于其它会话".into());
     }
+    if operation == "run" {
+        return Box::pin(crate::jev_run::browser(root, args, &thread_id, "webview")).await;
+    }
+    if operation == "advise" {
+        let settings = jev_settings()?;
+        if settings.jev_enabled { jev_observation(root, args, &thread_id, "webview")?; }
+        let mut result = crate::jev::advise(settings, args).await?;
+        result["basedOnSnapshotId"] = args["snapshotId"].clone();
+        return Ok(result);
+    }
+    if crate::tool_experience::is_operation(args) {
+        let observed = if operation == "experience_search" { None } else {
+            let pages = jev_observation(root, args, &thread_id, "webview")?;
+            let url = tauri::Url::parse(pages["pages"][0]["url"].as_str().ok_or("观察缺少网站 URL")?).map_err(|e| e.to_string())?;
+            Some(url.origin().ascii_serialization())
+        };
+        let args = args.clone();
+        return tokio::task::spawn_blocking(move || crate::tool_experience::execute(
+            &crate::lyra::config::nova_root().join("tool-experiences"), "webview", &thread_id, &args, observed.as_deref()))
+            .await.map_err(|e| e.to_string())?;
+    }
     match operation {
         "stop" => {
             s.cancel.store(true, Ordering::SeqCst);
+            app.state::<BrowserState>().observations.lock().unwrap().remove(&s.active_tab);
             Ok(json!({"stopped":true}))
         }
         "tabs" => Ok(json!(s)),
+        "downloads" => downloads(app, &thread_id, args).await,
         "new_tab" | "select_tab" | "close_tab" => {
             change_tab(app, &thread_id, operation, args.clone()).await
         }
@@ -1865,13 +1891,22 @@ pub(crate) fn jev_settings() -> Result<crate::settings::Settings, String> {
     Ok(app.state::<AppState>().settings.lock().unwrap().clone())
 }
 
-pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
+pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
     let app = APP.get().ok_or("仅 Nova 内可用")?;
-    let owner = tool_owner(root, owner)?;
-    let tag = args["tabTag"].as_str().ok_or("缺少 tabTag")?;
+    let key = if tool == "webview" {
+        let (_, thread_id) = current_context(root)?;
+        if thread_id != owner { return Err("会话已切换，停止 JEV 连续决策".into()); }
+        let s = session(app, args["browserId"].as_str().ok_or("缺少 browserId")?)?;
+        check(app, &s)?;
+        s.active_tab
+    } else {
+        let owner = tool_owner(root, owner)?;
+        let tag = args["tabTag"].as_str().ok_or("缺少 tabTag")?;
+        format!("chrome:{owner}:{tag}")
+    };
     let state = app.state::<BrowserState>();
     let observations = state.observations.lock().unwrap();
-    let observation = observations.get(&format!("chrome:{owner}:{tag}"))
+    let observation = observations.get(&key)
         .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
         .ok_or("观察已失效，交回主模型重新观察")?;
     Ok(observation.pages.clone())
@@ -1882,7 +1917,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
     let thread_id = tool_owner(root, owner)?;
     let operation = args["operation"].as_str().unwrap_or_default();
     if operation == "run" {
-        return Box::pin(crate::jev_run::chrome(root, args, owner)).await;
+        return Box::pin(crate::jev_run::browser(root, args, owner, "chrome")).await;
     }
     if operation == "advise" {
         let settings = jev_settings()?;
@@ -1915,8 +1950,13 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
             .await.map_err(|e| e.to_string())?;
     }
     let connection = crate::chrome_browser::connect(app).await?;
+    if operation == "downloads" {
+        return crate::chrome_browser::request(app, operation, args.clone()).await
+            .map_err(|e| format!("{e}；下载查询需要 Nova Chrome 0.1.6，请确认扩展已更新并重新加载"));
+    }
     if matches!(operation, "connect" | "status") {
         let mut connection = connection;
+        connection["jev"] = crate::jev::availability(&jev_settings()?);
         if connection["connected"] == true {
             match crate::chrome_browser::request(app, "status", json!({})).await {
                 Ok(capabilities) => connection["incognitoAllowed"] = capabilities["incognitoAllowed"].clone(),
@@ -1996,6 +2036,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
         .ok_or("缺少有效 tabTag；请先 chrome.tabs（可带 query 唯一匹配直接绑定），不会默认操作当前激活标签")?;
     if operation == "stop" {
         crate::chrome_browser::stop(app, tag);
+        app.state::<BrowserState>().observations.lock().unwrap().remove(&format!("chrome:{thread_id}:{tag}"));
     }
     if matches!(
         operation,

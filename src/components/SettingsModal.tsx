@@ -1127,7 +1127,7 @@ export function SettingsModal(props: { onClose: () => void }) {
               <h3 class="settings-group-title">JEV 辅助决策</h3>
               <label class="field">
                 <span><input type="checkbox" checked={jevEnabled()} onChange={e => setJevEnabled(e.currentTarget.checked)} /> 启用 JEV</span>
-                <span class="field-hint">保存后生效。固定使用 TypeSafe 官方接口和 jev-latest。主模型可按需咨询或委托明确步骤；不确定时交回，关闭后不发起新请求。</span>
+                <span class="field-hint">保存后生效。固定使用 TypeSafe 官方接口和 jev-latest，默认使用系统代理。用于浏览器/桌面工具的辅助判断和委托执行；仅实际调用 advise/run 时产生用量，普通对话和直接操作不会自动调用。不确定时交回主模型，关闭后不发起新请求。</span>
               </label>
               <label class="field">
                 <span class="field-label">API Key</span>

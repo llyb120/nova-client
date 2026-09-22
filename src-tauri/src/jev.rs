@@ -40,6 +40,13 @@ fn answer(body: &Value, response: &Value) -> Result<Value, String> {
         "notice":"仅为文本辅助判断，不是视觉定位、操作授权或成功证明。执行前核对最新观察并使用原工具校验；defer 时交回主模型。"}))
 }
 
+/// 在最新观察中公开实际启用状态，让主模型能选择已开启的委托入口。
+pub(crate) fn availability(settings: &Settings) -> Value {
+    json!({"enabled":settings.jev_enabled,"next":if settings.jev_enabled {
+        "JEV 已启用，按精准度需要选择：确定的简单动作直接 act；候选需判断时 advise；DOM 完整、目标及检查点明确的多步子目标才 run（浏览器目标 ID、最新 snapshotId、plan）。Chrome/WebView 的 run 结合知识图谱逐步观察决策，遇歧义交回。剑来由主模型看图定位，JEV 仅辅助；不为增加用量机械咨询或连续执行。"
+    } else { "JEV 已关闭，主模型继续处理。" }})
+}
+
 pub(crate) async fn advise(settings: Settings, args: &Value) -> Result<Value, String> {
     if !settings.jev_enabled {
         return Ok(json!({"status":"disabled","advisoryOnly":true,"next":"JEV 已关闭，主模型继续处理；可在设置中启用"}));
@@ -54,6 +61,7 @@ pub(crate) async fn advise(settings: Settings, args: &Value) -> Result<Value, St
     let body = request(&settings, args)?;
     let started = std::time::Instant::now();
     let result = async {
+        // JEV 独立沿用系统代理；不复用默认直连的后端客户端。
         // Reuse connections across advice calls; never follow redirects carrying credentials.
         static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> = std::sync::OnceLock::new();
         let client = CLIENT.get_or_init(|| reqwest::Client::builder()
@@ -115,6 +123,8 @@ mod tests {
     #[tokio::test]
     async fn disabled_and_choice_contract() {
         let settings = Settings::default();
+        assert_eq!(availability(&settings)["enabled"], false);
+        assert_eq!(availability(&Settings { jev_enabled: true, ..settings.clone() })["enabled"], true);
         assert_eq!(advise(settings.clone(), &json!({})).await.unwrap()["status"], "disabled");
         let args = json!({"advice":{"task":"找到订单","state":"两个结果","choices":{"open":"匹配的订单"}}});
         let body = request(&settings, &args).unwrap();
@@ -122,6 +132,8 @@ mod tests {
         assert!(body["questions"]["next"]["criteria"].get("defer").is_some());
         let mut response = json!({"answers":{"next":{"type":"choice","choice":"open","confidence":0.9}}});
         assert!(answer(&body, &response).is_ok());
+        response["usage"] = json!({"input_tokens":42,"output_tokens":3});
+        assert_eq!(answer(&body, &response).unwrap()["usage"], response["usage"]);
         response["answers"]["next"]["choice"] = json!("invented");
         assert!(answer(&body, &response).is_err());
         assert!(request(&settings, &json!({"advice":{"task":"x","state":"y","choices":{"defer":"override"}}})).is_err());
