@@ -152,6 +152,7 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "other side closed",
     "network connection lost",
     "upstream stream ended prematurely",
+    "upstream stream ended before terminal chunk",
     "safe to retry",
     "stream ended before a terminal response event",
     "stream ended without finish_reason",
@@ -621,6 +622,9 @@ mod tests {
         assert!(is_retryable_provider_error("connection error: ECONNRESET"));
         assert!(is_retryable_provider_error(
             "provider error: Upstream stream ended prematurely; safe to retry"
+        ));
+        assert!(is_retryable_provider_error(
+            "provider 错误：Upstream stream ended before terminal chunk"
         ));
         assert!(is_retryable_provider_error(
             "读取响应流失败：error decoding response body"
