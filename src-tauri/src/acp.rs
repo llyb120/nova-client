@@ -1288,9 +1288,9 @@ impl AcpManager {
             cmd.process_group(0);
         }
 
-        // 每个后端可单独配置代理：注入 HTTP(S)_PROXY 等环境变量到该子进程（空 = 不覆盖）
-        apply_proxy_env(&mut cmd, self.proxy_of(settings));
+        // 每个后端可单独配置代理：注入 HTTP(S)_PROXY 等环境变量到该子进程（空 = 直连）
         cmd.envs(&self.launch_env);
+        apply_proxy_env(&mut cmd, self.proxy_of(settings));
         #[cfg(windows)]
         if self.kind == AgentKind::CodeBuddy {
             // Windows 上 CodeBuddy 的 Bash 工具默认走 Git Bash；显式指定 PowerShell，
@@ -1449,8 +1449,8 @@ impl AcpManager {
         cmd.creation_flags(0x0800_0000);
         #[cfg(unix)]
         cmd.process_group(0);
-        apply_proxy_env(&mut cmd, self.proxy_of(settings));
         cmd.envs(codebuddy_activation_env(&self.launch_env));
+        apply_proxy_env(&mut cmd, self.proxy_of(settings));
         #[cfg(windows)]
         cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
         {
@@ -1500,11 +1500,11 @@ impl AcpManager {
         let retrieval_mode = settings.context_retrieval_mode.as_str().to_string();
         let proxy = self.proxy_of(settings).trim();
         let proxy = if proxy.is_empty() {
-            None
+            String::new()
         } else if proxy.contains("://") {
-            Some(proxy.to_string())
+            proxy.to_string()
         } else {
-            Some(format!("http://{proxy}"))
+            format!("http://{proxy}")
         };
         let mut args = vec![
             "activate".to_string(),
@@ -1528,10 +1528,11 @@ impl AcpManager {
         for (key, value) in activation_env {
             args.extend(["--env".into(), format!("{key}={value}")]);
         }
-        if let Some(proxy) = proxy {
-            for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
-                args.extend(["--env".into(), format!("{key}={proxy}")]);
-            }
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+            args.extend(["--env".into(), format!("{key}={proxy}")]);
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            args.extend(["--env".into(), format!("{key}={}", if proxy.is_empty() { "*" } else { "" })]);
         }
         args.push("--".into());
         args.extend(CODEBUDDY_ACP_ARGS.into_iter().map(str::to_string));
@@ -2517,8 +2518,8 @@ impl AcpManager {
         cmd.creation_flags(0x0800_0000);
         #[cfg(unix)]
         cmd.process_group(0);
-        apply_proxy_env(&mut cmd, self.proxy_of(settings));
         cmd.envs(codebuddy_activation_env(&self.launch_env));
+        apply_proxy_env(&mut cmd, self.proxy_of(settings));
         #[cfg(windows)]
         cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
         {
@@ -4356,6 +4357,20 @@ fn codebuddy_activation_env(
 #[cfg(test)]
 mod codebuddy_acp_tests {
     #[test]
+    fn backend_proxy_defaults_to_direct_and_explicit_proxy_wins() {
+        let mut cmd = tokio::process::Command::new("unused");
+        cmd.env("HTTP_PROXY", "http://inherited:8080");
+        super::apply_proxy_env(&mut cmd, " ");
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+            assert!(cmd.as_std().get_envs().any(|(name, value)| name.to_string_lossy().eq_ignore_ascii_case(key) && value.is_none()));
+        }
+        assert!(cmd.as_std().get_envs().any(|(name, value)| name.to_string_lossy().eq_ignore_ascii_case("NO_PROXY") && value == Some(std::ffi::OsStr::new("*"))));
+        super::apply_proxy_env(&mut cmd, "127.0.0.1:10808");
+        assert!(cmd.as_std().get_envs().any(|(name, value)| name.to_string_lossy().eq_ignore_ascii_case("HTTPS_PROXY") && value == Some(std::ffi::OsStr::new("http://127.0.0.1:10808"))));
+        assert!(cmd.as_std().get_envs().any(|(name, value)| name.to_string_lossy().eq_ignore_ascii_case("NO_PROXY") && value.is_none()));
+    }
+
+    #[test]
     fn kimi_acp_configuration_contract() {
         let settings: crate::settings::Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.kimi_path, "kimi");
@@ -4712,12 +4727,18 @@ fn build_acp_command(program: &str, args_str: &str) -> tokio::process::Command {
 }
 
 /// 给子进程注入代理环境变量（HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 及小写变体）。
-/// proxy 为空则不覆盖；无协议前缀时按 http 代理处理。
+/// proxy 为空则禁用继承的代理；无协议前缀时按 http 代理处理。
 pub(crate) fn apply_proxy_env(cmd: &mut tokio::process::Command, proxy: &str) {
     let proxy = proxy.trim();
     if proxy.is_empty() {
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+            cmd.env_remove(key);
+        }
+        // 也阻止使用系统代理的 SDK/HTTP 客户端从平台设置中恢复代理。
+        cmd.env("NO_PROXY", "*").env("no_proxy", "*");
         return;
     }
+    cmd.env_remove("NO_PROXY").env_remove("no_proxy");
     let proxy = if proxy.contains("://") {
         proxy.to_string()
     } else {

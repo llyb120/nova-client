@@ -585,8 +585,8 @@ impl CodexManager {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        crate::acp::apply_proxy_env(&mut cmd, &settings.codex_proxy);
         cmd.envs(&self.launch_env);
+        crate::acp::apply_proxy_env(&mut cmd, &settings.codex_proxy);
         #[cfg(windows)]
         if self.app.state::<AppState>().windows_shell_shim_enabled {
             if let Err(e) = crate::windows_shell_shim::apply(&self.app, &mut cmd, &self.launch_env)

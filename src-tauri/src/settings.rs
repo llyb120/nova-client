@@ -74,7 +74,7 @@ pub struct Settings {
     pub devin_path: String,
     /// Devin ACP 启动参数（空格分隔）。
     pub acp_args: String,
-    /// Devin 代理地址（空 = 不覆盖环境变量；下同：注入 HTTP(S)_PROXY 等到该后端子进程）
+    /// Devin 代理地址（空 = 直连，不继承系统代理；下同：注入 HTTP(S)_PROXY 等到该后端子进程）
     pub devin_proxy: String,
     /// CodeBuddy CLI 可执行文件路径（默认 codebuddy，依赖 PATH）
     pub codebuddy_path: String,
@@ -101,9 +101,9 @@ pub struct Settings {
     pub codex_path: String,
     /// Codex app-server 启动参数
     pub codex_args: String,
-    /// Codex 代理地址（空 = 不覆盖环境变量）
+    /// Codex 代理地址（空 = 直连，不继承系统代理）
     pub codex_proxy: String,
-    /// Lyra provider 代理地址（空 = 不覆盖环境变量）
+    /// Lyra provider 代理地址（空 = 直连，不继承系统代理）
     #[serde(alias = "vegaProxy")]
     pub lyra_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）

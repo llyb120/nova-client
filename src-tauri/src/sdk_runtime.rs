@@ -107,8 +107,6 @@ pub struct SdkManager {
     app: AppHandle,
     adapter: Arc<dyn SdkAdapter>,
     launch_env: HashMap<String, String>,
-    /// 补全直连 HTTP 复用连接池，避免每次冷建 TLS。
-    http: reqwest::Client,
     running_children: Mutex<HashMap<String, RunningBridge>>,
     idle_children: Mutex<HashMap<String, IdleBridge>>,
     /// 最新一次预热请求（后到覆盖先到）；持有 prewarm_gate 的循环负责逐个消化。
@@ -122,8 +120,6 @@ pub struct SdkManager {
     model_options_revalidated: AtomicBool,
     /// 本地 Lyra 配置变化代数，避免旧模型列表覆盖新配置结果。
     config_generation: AtomicU64,
-    /// 进程内原生 agent（Lyra）的 HTTP 连接池：按 lyra_proxy 设置构建一次并复用。
-    native_http: Mutex<Option<reqwest::Client>>,
     next_run_epoch: AtomicU64,
     run_epochs: Mutex<HashMap<String, u64>>,
 }
@@ -138,17 +134,10 @@ impl SdkManager {
         adapter: A,
         launch_env: HashMap<String, String>,
     ) -> Arc<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .pool_max_idle_per_host(4)
-            .tcp_keepalive(std::time::Duration::from_secs(20))
-            .build()
-            .unwrap_or_default();
         Arc::new(Self {
             app,
             adapter: Arc::new(adapter),
             launch_env,
-            http,
             running_children: Mutex::new(HashMap::new()),
             idle_children: Mutex::new(HashMap::new()),
             prewarm_pending: Mutex::new(None),
@@ -160,7 +149,6 @@ impl SdkManager {
             model_options_refreshing: AtomicBool::new(false),
             model_options_revalidated: AtomicBool::new(false),
             config_generation: AtomicU64::new(0),
-            native_http: Mutex::new(None),
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
         })
@@ -178,34 +166,14 @@ impl SdkManager {
         self.launch_env.get("NOVA_DATA_DIR").map(PathBuf::from)
     }
 
-    /// 进程内原生 agent 的 HTTP 连接池：按 lyra_proxy 设置构建一次复用，避免每轮冷建 TLS。
+    /// 按当前设置复用 provider 连接池；代理修改后下一次请求立即使用新配置。
     fn native_http(&self) -> reqwest::Client {
-        if let Some(client) = self.native_http.lock().unwrap().as_ref() {
-            return client.clone();
-        }
         let proxy = {
             let state = self.app.state::<AppState>();
             let proxy = state.settings.lock().unwrap().lyra_proxy.clone();
             proxy
         };
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .pool_max_idle_per_host(4)
-            .tcp_keepalive(std::time::Duration::from_secs(20));
-        let proxy = proxy.trim();
-        if !proxy.is_empty() {
-            let url = if proxy.contains("://") {
-                proxy.to_string()
-            } else {
-                format!("http://{proxy}")
-            };
-            if let Ok(proxy) = reqwest::Proxy::all(&url) {
-                builder = builder.proxy(proxy);
-            }
-        }
-        let client = builder.build().unwrap_or_default();
-        *self.native_http.lock().unwrap() = Some(client.clone());
-        client
+        crate::lyra::provider::client_for_proxy(proxy.trim())
     }
 
     pub fn is_running(&self, thread_id: &str) -> bool {
@@ -878,7 +846,7 @@ impl SdkManager {
             .borrowed_root()
             .unwrap_or_else(|| nova_data_dir(&self.app));
         match crate::lyra_complete::complete_direct(
-            &self.http,
+            &self.native_http(),
             &data_dir,
             &self.launch_env,
             model,
@@ -1420,8 +1388,8 @@ impl SdkManager {
             crate::credential_roaming::isolate_borrowed_command(&mut command);
             command.envs(&self.launch_env);
         }
-        apply_proxy_env(&mut command, &launch.proxy);
         command.envs(launch.extra_env);
+        apply_proxy_env(&mut command, &launch.proxy);
         if self.launch_env.is_empty() {
             if let Some((name, value)) = launch.api_key {
                 command.env(name, value);

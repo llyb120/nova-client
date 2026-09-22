@@ -169,7 +169,7 @@ function ProxyField(props: { value: string; onInput: (v: string) => void }) {
         class="field-input"
         value={props.value}
         onInput={(e) => props.onInput(e.currentTarget.value)}
-        placeholder="http://127.0.0.1:10808"
+        placeholder="留空直连；如 http://127.0.0.1:10808"
       />
     </label>
   );

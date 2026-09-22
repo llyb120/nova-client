@@ -1124,12 +1124,8 @@ async fn dispatch(http: &reqwest::Client, request: &Value) -> Result<(), String>
 
 pub async fn run() -> i32 {
     use tokio::io::AsyncBufReadExt;
-    let http = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .pool_max_idle_per_host(4)
-        .tcp_keepalive(std::time::Duration::from_secs(20))
-        .build()
-        .unwrap_or_default();
+    let settings = crate::settings::Settings::load(&config::nova_root());
+    let http = super::provider::client_for_proxy(settings.lyra_proxy.trim());
     let stdin = tokio::io::stdin();
     let mut lines = tokio::io::BufReader::new(stdin).lines();
     let first = match lines.next_line().await {

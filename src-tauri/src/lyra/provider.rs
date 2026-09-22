@@ -1252,13 +1252,14 @@ pub(crate) fn client_for_proxy(proxy: &str) -> reqwest::Client {
         format!("http://{proxy}")
     };
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(4)
         .tcp_keepalive(std::time::Duration::from_secs(20));
     if let Ok(parsed) = reqwest::Proxy::all(&url) {
         builder = builder.proxy(parsed);
     }
-    let client = builder.build().unwrap_or_default();
+    let client = builder.build().expect("Lyra HTTP client");
     clients.insert(proxy.to_string(), client.clone());
     client
 }
@@ -1780,6 +1781,51 @@ mod tests {
         let _ = client_for_proxy("http://127.0.0.1:10808"); // 命中缓存
         let _ = client_for_proxy("127.0.0.1:10809"); // 无协议前缀按 http 处理
         let _ = client_for_proxy("not a url"); // 无效代理退化为直连，不 panic
+    }
+
+    #[test]
+    fn backend_http_ignores_system_proxy_but_honors_explicit_proxy() {
+        const CHILD: &str = "NOVA_PROXY_POLICY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lyra::provider::tests::backend_http_ignores_system_proxy_but_honors_explicit_proxy", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HTTP_PROXY", "http://127.0.0.1:9")
+                .env("HTTPS_PROXY", "http://127.0.0.1:9")
+                .env("ALL_PROXY", "http://127.0.0.1:9")
+                .env("http_proxy", "http://127.0.0.1:9")
+                .env("https_proxy", "http://127.0.0.1:9")
+                .env("all_proxy", "http://127.0.0.1:9")
+                .env_remove("NO_PROXY").env_remove("no_proxy")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    requests.push(String::from_utf8_lossy(&buffer[..count]).into_owned());
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+                }
+                requests
+            });
+            let response = client_for_proxy("").get(format!("http://{address}/direct"))
+                .timeout(std::time::Duration::from_secs(3)).send().await.unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+            let response = client_for_proxy(&address.to_string()).get("http://nova-proxy-test.invalid/explicit")
+                .timeout(std::time::Duration::from_secs(3)).send().await.unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+            let requests = server.await.unwrap();
+            assert!(requests[0].starts_with("GET /direct "));
+            assert!(requests[1].starts_with("GET http://nova-proxy-test.invalid/explicit "));
+        });
     }
 
     #[test]
