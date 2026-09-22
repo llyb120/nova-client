@@ -2,6 +2,8 @@ mod visual_guard;
 mod acp;
 mod agent_config;
 mod jianlai;
+mod jev;
+mod jev_run;
 mod tool_experience;
 mod cli_manager;
 mod clipboard;
@@ -5738,6 +5740,7 @@ pub fn run() {
             compact_thread,
             respond_permission,
             get_settings,
+            jev::test_jev_connection,
             set_settings,
             refresh_environment_variables,
             get_global_agent_instructions,

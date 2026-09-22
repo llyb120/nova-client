@@ -415,6 +415,8 @@ export interface PendingNewSessionSeed {
 }
 
 export interface Settings {
+  jevEnabled: boolean;
+  jevApiKey: string;
   kimiPath: string;
   kimiProxy: string;
   kimiEnabled: boolean;

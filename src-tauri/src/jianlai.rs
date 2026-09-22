@@ -1090,6 +1090,46 @@ fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, d
 
 pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
     let owner = crate::native_browser::tool_owner(root, owner)?;
+    if args["operation"] == "run" {
+        let mut advice_args = args.clone();
+        advice_args["operation"] = json!("advise");
+        advice_args["advice"]["choices"] = json!({"continue":"执行主模型明确委托的这一批动作；遇到需要新视觉信息的位置必须停止"});
+        advice_args["advice"]["state"] = json!(format!("{}\n明确委托动作：{}", args["advice"]["state"].as_str().unwrap_or_default(), args["actions"]));
+        // Reuse snapshot ownership/age checks; only execute a batch already grounded by the main model.
+        let settings = crate::native_browser::jev_settings()?;
+        {
+            let state = DESKTOP.try_lock().map_err(|_| "剑来正在操作桌面")?;
+            state.as_ref().filter(|s| s.owner == owner && args["snapshotId"].as_str() == Some(&s.id)
+                && s.invalidated.is_none() && s.taken.elapsed() <= Duration::from_secs(180))
+                .ok_or("run 需本会话最新有效截图")?;
+        }
+        let decision = crate::jev::advise(settings, &advice_args).await?;
+        if decision["status"] != "advised" || decision["choice"] != "continue"
+            || !decision["confidence"].as_f64().is_some_and(|c| c >= 0.9)
+            || !crate::native_browser::jev_settings()?.jev_enabled {
+            return Ok(json!({"status":"not_executed","completedActions":0,"jevRun":{"status":"handoff","decision":decision}}));
+        }
+        let actions = args["actions"].as_array().filter(|a| !a.is_empty() && a.len() <= 16).ok_or("run 需1–16个已确认动作")?;
+        let act = json!({"operation":"act","snapshotId":args["snapshotId"],"imageId":args["imageId"],
+            "actions":actions,"feedback":"screenshot"});
+        return tokio::task::spawn_blocking(move || {
+            let mut result = run(owner, act)?;
+            result["jevRun"] = json!({"status":"handoff","reason":"已执行至视觉信息屏障；JEV 不看图，主模型必须核对新截图，不能据 executed 声称成功"});
+            Ok(result)
+        }).await.map_err(err)?;
+    }
+    if args["operation"] == "advise" {
+        let settings = crate::native_browser::jev_settings()?;
+        if settings.jev_enabled {
+            let state = DESKTOP.try_lock().map_err(|_| "剑来正在操作桌面")?;
+            state.as_ref().filter(|s| s.owner == owner && args["snapshotId"].as_str() == Some(&s.id)
+                && s.invalidated.is_none() && s.taken.elapsed() <= Duration::from_secs(180))
+                .ok_or("JEV 辅助判断需本会话最新有效截图（180秒内）")?;
+        }
+        let mut result = crate::jev::advise(settings, args).await?;
+        result["basedOnSnapshotId"] = args["snapshotId"].clone();
+        return Ok(result);
+    }
     let args = args.clone();
     tokio::task::spawn_blocking(move || {
         if crate::tool_experience::is_operation(&args) {

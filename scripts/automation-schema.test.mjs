@@ -26,6 +26,19 @@ test('Chrome and WebView share image coordinates, fast scope and bounded batch s
     }
   }
 });
+test('JEV advice is available through both existing tool schemas with identical bounded inputs', async()=>{
+  const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));
+  assert.deepEqual(chrome.inputSchema.properties.advice,jianlai.inputSchema.properties.advice);
+  assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,8);
+  assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.required,['action','name','role','expectedText']);
+  for(const tool of [chrome,jianlai]) {
+    assert(tool.inputSchema.properties.operation.enum.includes('advise'));
+    assert(tool.inputSchema.properties.operation.enum.includes('run'));
+    assert.deepEqual(tool.inputSchema.properties.advice.required,['task','state','choices']);
+    assert.equal(tool.inputSchema.properties.advice.properties.choices.maxProperties,32);
+    assert.match(tool.description,/不自动执行/);
+  }
+});
 test('inspect automatic Canvas images are delivered without losing imageId or partial-execution status',async()=>{
   const dir=await mkdtemp(join(tmpdir(),'nova-visual-schema-'));
   try {

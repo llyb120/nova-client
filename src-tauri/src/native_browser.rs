@@ -1769,10 +1769,44 @@ pub(crate) fn tool_owner(root: &Path, owner: &str) -> Result<String, String> {
     Ok(format!("{owner}:{}", root.display()))
 }
 
+pub(crate) fn jev_settings() -> Result<crate::settings::Settings, String> {
+    let app = APP.get().ok_or("JEV 仅在 Nova 桌面应用内可用")?;
+    Ok(app.state::<AppState>().settings.lock().unwrap().clone())
+}
+
+pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
+    let app = APP.get().ok_or("仅 Nova 内可用")?;
+    let owner = tool_owner(root, owner)?;
+    let tag = args["tabTag"].as_str().ok_or("缺少 tabTag")?;
+    let state = app.state::<BrowserState>();
+    let observations = state.observations.lock().unwrap();
+    let observation = observations.get(&format!("chrome:{owner}:{tag}"))
+        .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
+        .ok_or("观察已失效，交回主模型重新观察")?;
+    Ok(observation.pages.clone())
+}
+
 pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
     let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
     let thread_id = tool_owner(root, owner)?;
     let operation = args["operation"].as_str().unwrap_or_default();
+    if operation == "run" {
+        return Box::pin(crate::jev_run::chrome(root, args, owner)).await;
+    }
+    if operation == "advise" {
+        let settings = jev_settings()?;
+        if settings.jev_enabled {
+            let tag = args["tabTag"].as_str().ok_or("JEV 辅助判断需 tabTag")?;
+            let state = app.state::<BrowserState>();
+            let observations = state.observations.lock().unwrap();
+            observations.get(&format!("chrome:{thread_id}:{tag}"))
+                .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
+                .ok_or("JEV 辅助判断需本会话该标签最新观察（180秒内）")?;
+        }
+        let mut result = crate::jev::advise(settings, args).await?;
+        result["basedOnSnapshotId"] = args["snapshotId"].clone();
+        return Ok(result);
+    }
     if crate::tool_experience::is_operation(args) {
         let observed = if operation == "experience_search" { None } else {
             let tag = args["tabTag"].as_str().ok_or("经验保存/反馈需tabTag")?;

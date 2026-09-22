@@ -5433,8 +5433,10 @@ fn acp_text_target(
         thought,
     );
     if let Some(&index) = ids.get(&key) {
-        if matches!(items.get(index), Some(Item::Thought { .. }) if thought)
-            || matches!(items.get(index), Some(Item::Assistant { .. }) if !thought)
+        // 并行文本流可继续各自的条目，但不能跨工具调用回写到旧文本块。
+        if (matches!(items.get(index), Some(Item::Thought { .. }) if thought)
+            || matches!(items.get(index), Some(Item::Assistant { .. }) if !thought))
+            && !items[index + 1..].iter().any(|item| matches!(item, Item::Tool { .. }))
         {
             return Some(index);
         }
@@ -5578,6 +5580,21 @@ fn codebuddy_parallel_text_streams_keep_their_items() {
     assert!(complete_pending_tools_on_update(&mut thread, None).is_empty());
     assert!(complete_pending_tools_on_update(&mut thread, Some("other")).is_empty());
     assert_eq!(complete_pending_tools(&mut thread, None).len(), 1);
+
+    // 工具前后复用同一个模型请求 ID，也必须在工具之后新建文本块。
+    for (model, parent, thought) in [("b", "task", true), ("a", "", false)] {
+        let update = json!({"sessionUpdate": if thought { "agent_thought_chunk" } else { "agent_message_chunk" },
+            "_meta": {"codebuddy.ai/modelRequestId": model, "codebuddy.ai/parentToolCallId": parent}});
+        let index = thread.items.len();
+        assert_eq!(acp_text_target(&thread.items, &update, &mut ids), None);
+        let id = thread.next_item_id();
+        thread.items.push(if thought {
+            Item::Thought { id, text: "工具之后".into(), ts: 0 }
+        } else {
+            Item::Assistant { id, text: "工具之后".into(), ts: 0 }
+        });
+        assert_eq!(acp_text_target(&thread.items, &update, &mut ids), Some(index));
+    }
 }
 
 fn complete_pending_tools(thread: &mut Thread, except_tool_call_id: Option<&str>) -> Vec<Item> {

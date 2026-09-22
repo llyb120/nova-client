@@ -1,4 +1,5 @@
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog";
 import * as QRCode from "qrcode";
@@ -219,6 +220,7 @@ function CliManager(props: {
 type SettingsTab =
   | "general"
   | "advanced"
+  | "jev"
   | "backends"
   | "instructions"
   | "appearance"
@@ -231,6 +233,7 @@ type SettingsTab =
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
   { id: "advanced", name: "高级" },
+  { id: "jev", name: "JEV 辅助决策" },
   { id: "backends", name: "模型后端" },
   { id: "instructions", name: "Agent 配置" },
   { id: "appearance", name: "外观" },
@@ -243,6 +246,19 @@ const TABS: { id: SettingsTab; name: string }[] = [
 
 export function SettingsModal(props: { onClose: () => void }) {
   const s = state.settings;
+  const [jevEnabled, setJevEnabled] = createSignal(s?.jevEnabled ?? false);
+  const [jevTesting, setJevTesting] = createSignal(false);
+  const [jevTestResult, setJevTestResult] = createSignal("");
+  const testJev = async () => {
+    setJevTesting(true);
+    setJevTestResult("");
+    try {
+      const result = await invoke<{ elapsedMs: number }>("test_jev_connection", { apiKey: jevApiKey().trim() });
+      setJevTestResult(`官方接口测试通过，耗时 ${result.elapsedMs} ms（仅固定测试，不代表控制成功率）`);
+    } catch (error) { setJevTestResult(String(error)); }
+    finally { setJevTesting(false); }
+  };
+  const [jevApiKey, setJevApiKey] = createSignal(s?.jevApiKey ?? "");
   const [tab, setTab] = createSignal<SettingsTab>("general");
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
@@ -689,6 +705,8 @@ export function SettingsModal(props: { onClose: () => void }) {
   };
 
   const draftSettings = (): Settings => ({
+    jevEnabled: jevEnabled(),
+    jevApiKey: jevApiKey().trim(),
     kimiPath: kimiPath().trim() || "kimi",
     kimiProxy: kimiProxy().trim(),
     kimiEnabled: kimiEnabled(),
@@ -1104,6 +1122,23 @@ export function SettingsModal(props: { onClose: () => void }) {
         </div>
 
         <div class="modal-body">
+          <Show when={tab() === "jev"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">JEV 辅助决策</h3>
+              <label class="field">
+                <span><input type="checkbox" checked={jevEnabled()} onChange={e => setJevEnabled(e.currentTarget.checked)} /> 启用 JEV</span>
+                <span class="field-hint">保存后生效。固定使用 TypeSafe 官方接口和 jev-latest。主模型可按需咨询或委托明确步骤；不确定时交回，关闭后不发起新请求。</span>
+              </label>
+              <label class="field">
+                <span class="field-label">API Key</span>
+                <input class="field-input" type="password" autocomplete="off" value={jevApiKey()} onInput={e => setJevApiKey(e.currentTarget.value)} />
+                <span class="field-hint">密钥保存在本机设置文件中（非加密）；也可留空使用 NOVA_JEV_API_KEY 环境变量。调用时会向官方服务发送任务、观察摘要和候选项；连续执行还会发送相关页面文本与目标信息，不上传截图；请勿提交密码、令牌等敏感信息。JEV 不负责视觉定位。</span>
+              </label>
+              <button type="button" class="btn" disabled={jevTesting()} onClick={() => void testJev()}>{jevTesting() ? "测试中…" : "测试官方连接"}</button>
+              <p class="field-hint">使用当前填写的密钥发送固定测试，可能产生少量费用；无需先保存或启用。</p>
+              <p role="status" aria-live="polite">{jevTestResult()}</p>
+            </section>
+          </Show>
           {/* ===== 通用 ===== */}
           <Show when={tab() === "general"}>
             <section class="settings-group">

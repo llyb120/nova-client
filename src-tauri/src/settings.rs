@@ -64,6 +64,8 @@ fn default_powershell_utf8() -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
+    pub jev_enabled: bool,
+    pub jev_api_key: String,
     /// Kimi Code CLI，使用固定的 `acp` 子命令。
     pub kimi_path: String,
     pub kimi_proxy: String,
@@ -192,6 +194,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            jev_enabled: false,
+            jev_api_key: String::new(),
             kimi_path: "kimi".into(),
             kimi_proxy: String::new(),
             kimi_enabled: false,
