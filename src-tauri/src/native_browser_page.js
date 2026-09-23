@@ -1,6 +1,6 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 3) return;
+  if (globalThis.__novaWebview?.apiVersion === 12) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   const parent = e => e?.assignedSlot || e?.parentElement || e?.getRootNode()?.host;
   const contains = (e, child) => { for (; child; child = parent(child)) if (child === e) return true; return false; };
@@ -39,7 +39,7 @@
     }
     return {region:'',identity:''};
   };
-  const fingerprint = (e, name=label(e), context=contextInfo(e).identity) => JSON.stringify([e.tagName, name, ...['id','name','type','role','href','data-testid','aria-controls'].map(a => e.getAttribute(a)), context]);
+  const fingerprint = (e, name=label(e), context=contextInfo(e).identity) => JSON.stringify([e.tagName, name, ...['id','name','type','role','href','data-testid','aria-controls','aria-sort','data-column-key','data-field'].map(a => e.getAttribute(a)), context]);
   const disabled = e => !!e.disabled || e.matches(':disabled') || ancestors(e).some(p => p.inert || p.getAttribute('aria-disabled') === 'true');
   const editable = (e, isDisabled=disabled(e)) => (e.matches('textarea,input:not([type]),input[type=text],input[type=search],input[type=email],input[type=url],input[type=tel],input[type=number],input[type=password]') || e.isContentEditable)
     && !e.readOnly && !ancestors(e).some(p=>p.getAttribute('aria-readonly')==='true') && !isDisabled;
@@ -48,7 +48,7 @@
     for (let i = 0; i < result.length; i++) for (const e of result[i].querySelectorAll('*')) if (e.shadowRoot) result.push(e.shadowRoot);
     return result;
   };
-  let entries = new Map(), version = '', captureGutter, captureTimer;
+  let entries = new Map(), version = '', documentId, captureGutter, captureTimer;
   const semanticCache=new WeakMap(), rootObservers=new Map();
   let revision=0, layoutKey='';
   const trackRoots = allRoots => {
@@ -114,7 +114,7 @@
     return entry;
   };
   const api = {
-    apiVersion: 3,
+    apiVersion: 12,
     stamp,
     inputState(ref) {
       const e = active();
@@ -149,6 +149,7 @@
     observe(nonce, limit = 20000, scope = 'all') {
       const started=performance.now(), allRoots=roots();trackRoots(allRoots);
       entries = new Map(); version = nonce;
+      documentId ||= nonce;
       const items = [], canvases=[], contextCache=new WeakMap();
       let labelCache;
       const labels = () => {
@@ -161,10 +162,28 @@
         }
         return labelCache;
       }; let total=0, visualArea=0;
-      const selector='button,a[href],input:not([type=hidden]),textarea,select,canvas,[role=button],[role=tab],[role=checkbox],[role=combobox],[contenteditable=true],summary,[role=region],[role=radio],[role=menuitem],[role=option],[aria-haspopup],[aria-expanded],[tabindex],[onclick]';
-      const candidates=[], seen=new Set(), containers=new Set();
+      const controlSelector='button,a[href],input:not([type=hidden]),textarea,select,[role=button],[role=link],[role=tab],[role=checkbox],[role=combobox],[contenteditable=true],summary,[role=radio],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=option],[aria-haspopup],[onclick]';
+      const selector=controlSelector+',canvas,[role=region],[aria-expanded],[tabindex],th,[role=columnheader]';
+      const candidates=[], seen=new Set(), containers=new Set(), pointerTargets=new Set();
+      let pointerScanned=0,customTargetsTruncated=false;
       for (const root of allRoots) {
         for (const e of root.querySelectorAll(selector)) { if (!seen.has(e)) {seen.add(e);candidates.push(e);} }
+        // ponytail: O(n) geometry/visibility scan, at most 4000 visible custom nodes; huge DOMs need a spatial index.
+        for (const e of root.querySelectorAll('div,span,li,td,th')) {
+          if (e.matches(controlSelector)) continue;
+          const r=e.getBoundingClientRect();
+          if (!(r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth)) continue;
+          const style=getComputedStyle(e);
+          if (style.visibility==='hidden' || style.visibility==='collapse') continue;
+          if (++pointerScanned>4000) {customTargetsTruncated=true;break;}
+          // Vimium-style hints represent controls, not their inherited pointer-styled text children.
+          // Keep a cursor boundary as a fallback for framework widgets without roles or onclick attributes.
+          if (r.width*r.height<innerWidth*innerHeight*.25 && style.cursor==='pointer' && label(e)
+              && (e.tagName==='LI' || !parent(e) || getComputedStyle(parent(e)).cursor!=='pointer') && !e.querySelector(controlSelector+',li')
+              && !ancestors(parent(e)).some(a=>a.matches(controlSelector))) {
+            if (!seen.has(e)) {seen.add(e);candidates.push(e);} pointerTargets.add(e);
+          }
+        }
         for (const e of root.querySelectorAll('div,section,main,ul,ol,table,textarea')) {
           if (e.scrollHeight > e.clientHeight+1 && /auto|scroll/.test(getComputedStyle(e).overflowY)) {
             containers.add(e); if (!seen.has(e)) {seen.add(e);candidates.push(e);}
@@ -172,6 +191,8 @@
         }
       }
       for (const e of candidates) {
+        // A semantic span wrapping another control is a likely duplicate, as in Vimium's false-positive pass.
+        if (e.tagName==='SPAN' && e.querySelector(controlSelector)) continue;
         const r=e.getBoundingClientRect();
         const inView=r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth;
         if (scope==='viewport' && !inView) continue;
@@ -194,9 +215,20 @@
         // and geometry without probing client rects / hit-testing them twice.
         const candidates=inView ? points(e,true) : [], p=candidates.find(p=>receives(e,p.x,p.y));
         const center=candidates[0], blocker=center&&!p ? hitAt(center.x,center.y) : null;
-        const item={ref,role:e.getAttribute('role')||e.tagName.toLowerCase(),tag:e.tagName.toLowerCase(),name,
-          href:e.href||undefined,expanded:e.getAttribute('aria-expanded')??undefined,haspopup:e.getAttribute('aria-haspopup')??undefined,selected:e.getAttribute('aria-selected')??undefined,
-          region,value:e.type==='password'?undefined:compact(e.value,100),disabled:isDisabled,editable:editable(e,isDisabled),
+        const checkable=e.matches('input[type=checkbox],input[type=radio]');
+        const table=e.closest('table,[role=table],[role=grid],[role=treegrid]');
+        const header=e.closest('th,[role=columnheader]');
+        const column=header&&table&&header.closest('table,[role=table],[role=grid],[role=treegrid]')===table ? {
+          table:allRoots.flatMap(root=>Array.from(root.querySelectorAll('table,[role=table],[role=grid],[role=treegrid]'))).indexOf(table),
+          index:Array.from(table.querySelectorAll('th,[role=columnheader]')).indexOf(header),
+          row:header.closest('tr')?.rowIndex??null,colSpan:header.colSpan||1,rowSpan:header.rowSpan||1,
+          group:compact(header.getAttribute('aria-description')||header.getAttribute('title')||'',160)
+        }:undefined;
+        const item={ref,nodeId:`${documentId}:${identity(e)}`,role:e.getAttribute('role')||(checkable?e.type:e.tagName.toLowerCase()),tag:e.tagName.toLowerCase(),name,
+          href:e.href||undefined,expanded:e.getAttribute('aria-expanded')??undefined,haspopup:e.getAttribute('aria-haspopup')??undefined,selected:e.getAttribute('aria-selected')??e.getAttribute('aria-checked')??(checkable?e.checked:undefined),
+          column,sort:e.getAttribute('aria-sort')??undefined,columnKey:e.getAttribute('data-column-key')??e.getAttribute('data-field')??undefined,
+          actionable:e.hasAttribute('onclick') || !!e.onclick || pointerTargets.has(e),
+          region,tabIndex:e.tabIndex,value:e.type==='password'?undefined:compact(e.value,100),disabled:isDisabled,editable:editable(e,isDisabled),
           inView,point:p,viewportRect:{x:r.x,y:r.y,width:r.width,height:r.height},documentRect:{x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height},
           scroll:containers.has(e)?{top:e.scrollTop,height:e.scrollHeight,viewportHeight:e.clientHeight}:undefined,
           blockedBy:blocker?compact(label(blocker)||blocker.outerHTML,180):undefined};
@@ -210,9 +242,49 @@
       const fullText=[document.body?.innerText||'',...allRoots.slice(1).map(root=>Array.from(root.children).filter(e=>!['STYLE','SCRIPT'].includes(e.tagName)).map(e=>e.innerText||'').join('\n'))].join('\n');
       const headings=allRoots.flatMap(root=>Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6,[role=heading]')).map(e=>({level:e.getAttribute('aria-level')||e.tagName,text:compact(e.innerText,300)})));
       const declaredRows=allRoots.flatMap(root=>Array.from(root.querySelectorAll('[aria-rowcount],[aria-setsize]')).map(e=>({total:Number(e.getAttribute('aria-rowcount')||e.getAttribute('aria-setsize')),rendered:e.querySelectorAll('[role=row],[role=listitem]').length})));
+      // Only explicit pagination totals are evidence; a label such as "Metrics 4" is not a row count.
+      const paginationTotals=Array.from(fullText.matchAll(/(?:^|\n)\s*((?:\d{1,3}(?:,\d{3})+|\d+))\s+total\s+(?:items|records)\s*(?=\n|$)|(?:^|\n)\s*共\s*([\d,]+)\s*条(?:记录|数据)?\s*(?=\n|$)/gi),m=>({totalRows:Number((m[1]||m[2]).replaceAll(',','')),evidence:m[0].trim()}));
+      const tableSelector='table,[role=table],[role=grid],[role=treegrid]';
+      const tableNodes=allRoots.flatMap(root=>Array.from(root.querySelectorAll(tableSelector)))
+        .filter(e=>e.getBoundingClientRect().width>0 && !['hidden','collapse'].includes(getComputedStyle(e).visibility));
+      let cellBudget=24000;
+      // ponytail: preview at most 8 tables / 10 rows / 16 cells within 24k chars; use documentPath or query for more.
+      const tables=tableNodes.slice(0,8).map((table,index)=>{
+        const rows=Array.from(table.querySelectorAll('tr,[role=row]')).filter(r=>r.closest(tableSelector)===table
+          && r.getBoundingClientRect().height>0 && !['hidden','collapse'].includes(getComputedStyle(r).visibility));
+        const dataRows=rows.filter(r=>r.querySelector('td,[role=cell],[role=gridcell]'));
+        const headers=Array.from(table.querySelectorAll('th,[role=columnheader]')).filter(c=>c.closest(tableSelector)===table).slice(0,16).map(c=>compact(c.innerText,160));
+        const declared=Number(table.getAttribute('aria-rowcount'));
+        const hasDeclared=table.hasAttribute('aria-rowcount') && Number.isSafeInteger(declared) && declared>=0;
+        const pagination=tableNodes.length===1 && paginationTotals.length===1 ? paginationTotals[0] : null;
+        const totalRows=pagination?.totalRows ?? (hasDeclared ? Math.max(0,declared-(rows.length-dataRows.length)) : null);
+        let cellsTruncated=false;
+        const preview=[];
+        for(const row of dataRows.slice(0,10)) {
+          if(cellBudget<=0) break;
+          const cells=Array.from(row.querySelectorAll('td,th,[role=cell],[role=gridcell],[role=rowheader]')).filter(c=>c.closest('tr,[role=row]')===row);
+          const values=cells.slice(0,16).map(c=>{
+            const full=String(c.innerText||'').replace(/\s+/g,' ').trim();
+            const text=full.slice(0,Math.min(160,cellBudget));cellBudget-=text.length;
+            cellsTruncated ||= text.length<full.length;return text;
+          });
+          cellsTruncated ||= cells.length>values.length;
+          preview.push(values);
+        }
+        const columns=Array.from(table.querySelectorAll('th,[role=columnheader]')).filter(c=>c.closest(tableSelector)===table).slice(0,16).map((c,columnIndex)=>({
+          index:columnIndex,row:c.closest('tr')?.rowIndex??null,colSpan:c.colSpan||1,rowSpan:c.rowSpan||1,name:compact(c.innerText,160),sort:c.getAttribute('aria-sort'),key:c.getAttribute('data-column-key')||c.getAttribute('data-field'),
+          ref:items.find(i=>entries.get(i.ref)?.e===c)?.ref,group:compact(c.getAttribute('aria-description')||c.getAttribute('title')||'',160)}));
+        return {index,headers,columns,totalRows,totalRowsSource:pagination?.evidence||(hasDeclared?'aria-rowcount minus observed header rows':null),
+          loadedRows:dataRows.length,returnedRows:preview.length,rows:preview,
+          previewTruncated:preview.length<dataRows.length||cellsTruncated,
+          countMismatch:totalRows!==null&&totalRows<dataRows.length,
+          moreRows:totalRows===null||totalRows<dataRows.length?null:totalRows>dataRows.length,
+          next:'日期、区域和表格排序字段/方向必须分别验证；图表 Metrics 不代表表格排序，同名列需核对列索引/分组。Top N 必须读取足够的数据行并核对筛选及排序；不足时读取 documentPath、inspect(query) 或翻页/滚动后观察。Metrics 等标签数字不是总条数。'};
+      });
       return {url:location.href,title:document.title,version,stamp:stamp(),text:fullText.slice(0,1000000),textLength:fullText.length,
-        items,totalItems:total,headings:headings.slice(0,1000),canvases:canvases.slice(0,100),visualSuggested:visualArea>=innerWidth*innerHeight*.15,focus:api.inputState(),
-        truncated:total>items.length||fullText.length>1000000||headings.length>1000||canvases.length>100,
+        tables,tableCount:tableNodes.length,tablesTruncated:tableNodes.length>tables.length,paginationTotals,
+        items,totalItems:total,customTargetsTruncated,headings:headings.slice(0,1000),canvases:canvases.slice(0,100),visualSuggested:visualArea>=innerWidth*innerHeight*.15,focus:api.inputState(),
+        truncated:customTargetsTruncated||total>items.length||fullText.length>1000000||headings.length>1000||canvases.length>100,
         coverage:{lazyImages:allRoots.reduce((n,root)=>n+Array.from(root.querySelectorAll('img[loading=lazy]')).filter(e=>!e.complete||!e.naturalWidth).length,0),scope:scope==='viewport'?'viewport DOM only; use scope=all for offscreen targets':'loaded DOM including offscreen, open shadow roots and scroll containers',declaredRows,canvasCount:canvases.length,note:'Canvas/WebGL controls are pixels, not DOM targets. Use the imageId and image-pixel coordinates in the returned visual observation. Virtualized/unloaded content requires observation after scrolling.'},
         documentSize:{width:Math.max(document.documentElement.scrollWidth,document.body?.scrollWidth||0),height:Math.max(document.documentElement.scrollHeight,document.body?.scrollHeight||0)},
         viewport:{width:innerWidth,height:innerHeight,scrollX,scrollY,devicePixelRatio,scale:visualViewport?.scale||1},

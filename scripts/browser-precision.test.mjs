@@ -40,12 +40,103 @@ try {
     return call('observe',randomUUID());
   };
   const target=(obs,name)=> {const e=obs.items.find(e=>e.name===name);assert.ok(e,`missing ${name}`);return e;};
+  await run('custom menus and duplicate sortable columns retain independent evidence',async()=>{
+    const obs=await fixture('<nav><div style="cursor:pointer"><span>PC & Console</span></div></nav><div>Unrelated</div><div style="cursor:pointer">Custom option</div><div role="menu"><div style="cursor:pointer">United States</div></div><table><tr><th style="cursor:pointer" data-field="sourceA" aria-sort="descending">Digital Units</th><th style="cursor:pointer" data-field="sourceB" aria-sort="none">Digital Units</th><th>Revenue</th></tr><tr><td>100</td><td>50</td><td>99</td></tr></table>');
+    assert.equal(target(obs,'PC & Console').actionable,true);
+    assert.equal(target(obs,'United States').actionable,true);
+    assert.equal(target(obs,'Custom option').actionable,true);
+    assert.ok(!obs.items.some(i=>i.name==='Unrelated'));
+    const headers=obs.items.filter(i=>i.name==='Digital Units');assert.equal(headers.length,2);
+    assert.notDeepEqual(headers[0].column,headers[1].column);
+    assert.equal(headers[0].sort,'descending');assert.equal(headers[1].sort,'none');
+    assert.equal(obs.tables[0].columns[1].key,'sourceB');
+    assert.equal(obs.tables[0].columns[1].ref,headers[1].ref);
+    assert.equal(target(obs,'Revenue').actionable,false);
+    await page.evaluate(()=>document.querySelector('th').setAttribute('aria-sort','ascending'));
+    await assert.rejects(call('prepare',headers[0].ref),/失效/,'a changed sort state must invalidate the old target');
+  });
+  await run('DOM hint identities survive observations but not node replacement',async()=>{
+    const first=await fixture('<button>Open</button><button>Open</button><input aria-label="Name">');
+    const second=await call('observe',randomUUID());
+    assert.deepEqual(first.items.map(i=>i.nodeId),second.items.map(i=>i.nodeId));
+    assert.notEqual(first.items[0].ref,second.items[0].ref);
+    const twins=second.items.filter(i=>i.name==='Open');assert.equal(twins.length,2);
+    assert.notEqual(twins[0].nodeId,twins[1].nodeId);
+    await page.evaluate(()=>{const old=document.querySelector('button');old.replaceWith(old.cloneNode(true));});
+    const replaced=await call('observe',randomUUID());
+    assert.notEqual(replaced.items[0].nodeId,first.items[0].nodeId);
+    assert.equal(replaced.items[1].nodeId,first.items[1].nodeId);
+  });
+  await run('hidden and offscreen bulk DOM cannot exhaust visible custom menu hints',async()=>{
+    const bulk='<span>Cell</span>'.repeat(4100);
+    const invisible='<span style="position:fixed;top:0;visibility:hidden">Hidden</span>'.repeat(4100);
+    const obs=await fixture(`<div style="display:none">${bulk}</div><div style="position:absolute;top:1200px">${bulk}</div>${invisible}<div style="position:fixed;top:20px;left:20px;cursor:pointer">Last 26 Weeks</div>`);
+    assert.equal(target(obs,'Last 26 Weeks').actionable,true);
+    assert.equal(obs.customTargetsTruncated,false);
+  });
+  await run('control hints exclude inherited pointer labels and semantic wrappers',async()=>{
+    const obs=await fixture('<button style="cursor:pointer"><span>Save</span><span>Draft</span></button><div style="cursor:pointer"><span>Open</span><span>Menu</span></div><div style="cursor:pointer"><button>Submit</button></div><span role="button"><button>Nested</button></span><div tabindex="0">Focus region</div>');
+    const hints=obs.items.filter(i=>i.actionable || i.role==='button');
+    assert.deepEqual(hints.map(i=>i.name).sort(),['Nested','OpenMenu','SaveDraft','Submit'].sort());
+    assert.equal(target(obs,'Focus region').actionable,false);
+  });
+  await run('nested menus retain leaf choices instead of hinting their whole group',async()=>{
+    const obs=await fixture('<ul style="cursor:pointer"><li>Top Charts<ul><li><span>Mobile Games</span></li><li><span>PC &amp; Console Games</span></li></ul></li></ul>');
+    const hints=obs.items.filter(i=>i.actionable);
+    assert.deepEqual(hints.map(i=>i.name).sort(),['Mobile Games','PC & Console Games'].sort());
+    assert.ok(hints.every(i=>i.tag==='li'));
+  });
   const click=async item=>{
     const p=await call('prepare',item.ref);
     await cdp.send('Input.dispatchMouseEvent',{type:'mouseMoved',x:p.x,y:p.y});
     await call('verifyPoint',item.ref,p.x,p.y,p.rect);
     for (const type of ['mousePressed','mouseReleased'])await cdp.send('Input.dispatchMouseEvent',{type,x:p.x,y:p.y,button:'left',clickCount:1});
   };
+  await run('clickable children of duplicate headers retain their owning column',async()=>{
+    const obs=await fixture('<table><tr><th aria-description="Source A"><span style="cursor:pointer">Digital Units</span></th><th aria-description="Source B"><span style="cursor:pointer">Digital Units</span></th></tr></table>');
+    const children=obs.items.filter(i=>i.role==='span'&&i.name==='Digital Units');
+    assert.equal(children.length,2);
+    for(const child of children) {
+      assert.equal(child.actionable,true);
+      const header=obs.items.find(i=>i.role==='th'&&i.column.index===child.column.index);
+      assert.deepEqual(child.column,header.column);
+    }
+    assert.notDeepEqual(children[0].column,children[1].column);
+  });
+  await run('Top 5 survives Metrics 4, offscreen rows and explicit pagination totals',async()=>{
+    const names=['Fortnite','NBA 2K27','NBA 2K26','Grand Theft Auto VI','Tomodachi Life: Living the Dream'];
+    const obs=await fixture(`<p>United States · 2026-03-22 ~ 2026-09-19 · Digital Revenue descending</p><h3>Metrics 4</h3><table><tr><th>Rank</th><th>Game</th><th>Revenue</th></tr>${Array.from({length:50},(_,i)=>`<tr><td>${i+1}</td><td>${names[i]||'Game '+(i+1)}</td><td>${i===4?'145.6M':'100M'}</td></tr>`).join('')}</table><p>1691 total items</p>`);
+    const table=obs.tables[0];
+    assert.equal(table.totalRows,1691);assert.equal(table.loadedRows,50);assert.equal(table.returnedRows,10);
+    assert.equal(table.rows[4][1],names[4]);assert.equal(table.rows[4][2],'145.6M');
+    assert.equal(table.previewTruncated,true);assert.equal(table.moreRows,true);
+    await page.evaluate(()=>document.querySelector('p:last-child').remove());
+    assert.equal((await call('observe',randomUUID())).tables[0].totalRows,null,'Metrics 4 must never become a total');
+  });
+  await run('table previews exclude nested rows and do not assign ambiguous page totals',async()=>{
+    const obs=await fixture('<table><tr><td>Outer<table><tr><td>Inner</td></tr></table></td></tr></table><p>30 total items</p><div role="grid" aria-rowcount="101"><div role="row"><span role="columnheader">Name</span></div><div role="row"><span role="gridcell">Virtual row</span></div></div>');
+    assert.equal(obs.tables[0].loadedRows,1);assert.equal(obs.tables[0].totalRows,null);
+    assert.equal(obs.tables[2].totalRows,100);assert.equal(obs.tables[2].moreRows,true);
+    const hidden=await fixture('<table aria-rowcount="-1"><tr hidden><td>Old result</td></tr><tr><td>Current result</td></tr></table>');
+    assert.equal(hidden.tables[0].loadedRows,1);assert.equal(hidden.tables[0].rows[0][0],'Current result');
+    assert.equal(hidden.tables[0].totalRows,null);
+    assert.equal((await fixture('<table aria-rowcount="0" style="width:100px;height:10px"></table>')).tables[0].totalRows,0);
+    await evaluate('Object.defineProperty(globalThis,"__novaWebview",{value:{apiVersion:7},configurable:true}); true');
+    await evaluate(engine);
+    assert.equal(await evaluate('__novaWebview.apiVersion'),12,'Existing Chrome worlds must upgrade to control-level DOM hints');
+    assert.equal((await call('observe',randomUUID())).tables[0].totalRows,0);
+  });
+  await run('native and ARIA checkboxes expose role and current selection',async()=>{
+    const obs=await fixture('<label><input type="checkbox">United States</label><label><input type="radio" checked>收入</label><div role="checkbox" aria-label="仅已发布" aria-checked="mixed" tabindex="0">仅已发布</div>');
+    assert.equal(target(obs,'United States').role,'checkbox');
+    assert.equal(target(obs,'United States').selected,false);
+    assert.equal(target(obs,'收入').role,'radio');
+    assert.equal(target(obs,'收入').selected,true);
+    assert.equal(target(obs,'仅已发布').selected,'mixed');
+    assert.equal(target(obs,'仅已发布').tabIndex,0);
+    await click(target(obs,'United States'));
+    assert.equal(target(await call('observe',randomUUID()),'United States').selected,true);
+  });
   await run('accessible labels: aria-labelledby, multi-label fields, shadow roots',async()=>{
     const obs=await fixture('<span id="a">保存</span><span id="b">草稿</span><button aria-labelledby="a b" onclick="window.saved=event.isTrusted"></button><label for="field">客户</label><label for="field">地址</label><input id="field"><div id="host"></div>');
     assert.ok(target(obs,'客户 地址').editable);
