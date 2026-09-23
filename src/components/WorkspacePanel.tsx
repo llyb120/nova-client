@@ -69,7 +69,8 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const [draft, setDraft] = createSignal("");
   const [original, setOriginal] = createSignal("");
   const [saving, setSaving] = createSignal(false);
-  const [browse, setBrowse] = createSignal(false);
+  const [browse, setBrowse] = createSignal(remembered?.browse ?? true);
+  const [treeWidth, setTreeWidth] = createSignal(38);
   const [saved, setSaved] = createSignal(false);
   const [closing, setClosing] = createSignal<string>();
   const dirty = () => (preview()?.text != null || preview()?.kind === "spreadsheet") && draft() !== normalized(original());
@@ -149,13 +150,12 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     // ponytail: 最多记住 16 个会话的侧栏状态，更早的丢弃；未保存草稿仍由 drafts 兜底。
     while (panels.size > 16) panels.delete(panels.keys().next().value!);
   });
-  const dismissPicker = (event: PointerEvent) => {
-    if (!(event.target as HTMLElement).closest('.workspace-picker, .workspace-picker-toggle')) setBrowse(false);
+  const dismissActions = (event: PointerEvent) => {
     const actions = panel.querySelector<HTMLDetailsElement>('.workspace-actions[open]');
     if (actions && !actions.contains(event.target as Node)) actions.open = false;
   };
-  onMount(() => document.addEventListener('pointerdown', dismissPicker));
-  onCleanup(() => document.removeEventListener('pointerdown', dismissPicker));
+  onMount(() => document.addEventListener('pointerdown', dismissActions));
+  onCleanup(() => document.removeEventListener('pointerdown', dismissActions));
   const report = (action: Promise<unknown>) => { void action.catch(e => setError(String(e))); };
   const refreshArtifacts = () => {
     const seen = new Set<string>();
@@ -190,7 +190,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const activate = (tab: FileTab) => {
     batch(() => {
       setPreview(tab.file); setOriginal(tab.original); setDraft(tab.draft); setEditing(tab.editing);
-      setSource(tab.source); setSaved(tab.saved); setError(tab.error); setLoading(false); setBrowse(false);
+      setSource(tab.source); setSaved(tab.saved); setError(tab.error); setLoading(false);
     });
     queueMicrotask(() => {
       if (preview()?.path !== tab.file.path) return;
@@ -217,7 +217,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       ++request;
       const next = remaining[Math.min(index, remaining.length - 1)];
       if (next) activate(next);
-      else { setPreview(undefined); setLoading(false); setError(''); setBrowse(false); }
+      else { setPreview(undefined); setLoading(false); setError(''); }
     }
   };
   // 直接按标签页数据写盘，无需先激活——对未激活的脏标签同样适用（含表格）。
@@ -367,6 +367,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <Show when={listing()} fallback={<p role="status">{failure() || '正在读取目录…'}<Show when={failure()}><button onClick={() => setRetry(v => v + 1)}>重试</button></Show></p>}>{result => <>
         <For each={result().entries.filter(entry => entry.directory || entry.name.toLowerCase().includes(filter().toLowerCase()))}>{entry => <>
           <button class="workspace-file" role="treeitem" aria-level={props.depth + 1} aria-expanded={entry.directory ? expanded().has(entry.path) : undefined}
+            aria-selected={!entry.directory && preview()?.path === (aliases.get(entry.path) ?? entry.path)}
             style={{ 'padding-left': `${8 + props.depth * 16}px` }} title={entry.path} onContextMenu={e => menu.open(e, entry.path)}
             onKeyDown={e => {
               if (entry.directory && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
@@ -416,7 +417,6 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   if (remembered) {
     const tab = remembered.tabs.find(tab => tab.file.path === remembered.activePath);
     if (tab) activate(tab);
-    if (remembered.browse) setBrowse(true);
   }
   return <aside ref={panel} class="workspace-panel" classList={{ 'is-dragging': dragging() }} style={{ width: `${width()}px` }} aria-label="产物、项目文件与终端"
     onKeyDown={e => { if (mode() !== "browser" && mode() !== "terminal" && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
@@ -456,7 +456,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         selectTab(all[next].file.path);
         queueMicrotask(() => panel.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.focus());
       }}>
-        <For each={tabs()}>{tab => <div class="workspace-tab" classList={{ active: preview()?.path === tab.file.path }}>
+        <For each={tabs()}>{tab => <div class="workspace-tab" classList={{ active: preview()?.path === tab.file.path }} onContextMenu={e => menu.open(e, tab.file.path)}>
           <button role="tab" aria-selected={preview()?.path === tab.file.path} tabindex={preview()?.path === tab.file.path ? 0 : -1}
             title={tab.file.path} onClick={() => selectTab(tab.file.path)}>
             <FileIcon path={tab.file.path} /><span>{label(tab.file.path)}</span>
@@ -465,13 +465,13 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
           <button class="workspace-tab-close" aria-label={`关闭 ${label(tab.file.path)}`} disabled={saving()} onClick={() => closeTab(tab.file.path)}><IconX size={12} /></button>
         </div>}</For>
       </div>
-      <button class="workspace-picker-toggle" aria-label="打开文件" aria-expanded={browse()} title="从目录树打开文件" onClick={() => { setMode("files"); setBrowse(v => !v); refreshArtifacts(); }}>＋</button>
+      <button class="workspace-picker-toggle" aria-label="打开文件" title="从目录树打开文件" onClick={() => { setMode("files"); setBrowse(true); }}>＋</button>
     </header>
     <Show when={mode() === "git"}><WorkspaceGit threadId={threadId} onOpen={(path, line) => { setMode("files"); void open(path, false, line); }} /></Show>
     <div class="workspace-file-view" style={{ display: mode() === "git" || mode() === "browser" || mode() === "terminal" ? "none" : undefined }}>
-    <div class="workspace-toolbar workspace-location">
-      <button class="workspace-picker-toggle workspace-breadcrumb" aria-label="选择项目文件" aria-expanded={browse()} onClick={() => { setBrowse(v => !v); refreshArtifacts(); }}>
-        <IconFolder size={16} /><span class="workspace-breadcrumb-text">{label(state.cwd)} › {preview() ? label(preview()!.path) : '选择文件'}</span><IconChevron size={14} open={browse()} />
+    <div class="workspace-toolbar workspace-location" onContextMenu={e => menu.open(e, preview()?.path ?? state.cwd)}>
+      <button class="workspace-picker-toggle workspace-breadcrumb" aria-label="切换目录栏" aria-expanded={mode() === "files" && browse()} title={preview()?.path ?? state.cwd} onClick={() => { if (mode() !== "files") { setMode("files"); setBrowse(true); } else setBrowse(v => !v); }}>
+        <IconFolder size={16} /><span class="workspace-breadcrumb-text">{preview()?.path ?? state.cwd}</span><IconChevron size={14} open={mode() === "files" && browse()} />
       </button>
       <Show when={preview()?.text != null}>
         <button aria-pressed={editing()} onClick={() => { setSource(false); setEditing(v => !v); }}>{editing() ? '预览' : '编辑'}</button>
@@ -496,9 +496,10 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       </details>}</Show>
       <button aria-label="刷新文件" title="重新读取当前文件" disabled={saving()} onClick={reload}><IconRefresh size={14} /></button>
     </div>
-    <Show when={browse()}>
-      <div ref={picker} class="workspace-picker" aria-label="选择文件" onKeyDown={e => {
-        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setBrowse(false); panel.querySelector<HTMLButtonElement>('[aria-label="选择项目文件"]')?.focus(); }
+    <div class="workspace-explorer" style={{ '--tree-width': `${treeWidth()}%` }}>
+    <Show when={mode() === "files" && browse()}>
+      <div ref={picker} class="workspace-picker" aria-label="项目目录" onKeyDown={e => {
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); panel.querySelector<HTMLButtonElement>('[aria-label="切换目录栏"]')?.focus(); }
         if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key) && (e.target as HTMLElement).getAttribute('role') === 'treeitem') {
           e.preventDefault(); const rows = [...picker.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')];
           const index = rows.indexOf(e.target as HTMLButtonElement);
@@ -506,20 +507,33 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
           rows[next]?.focus();
         }
       }}>
-        <div class="workspace-toolbar"><input aria-label="按文件名搜索项目" placeholder="搜索项目文件名…" value={filter()} onInput={e => setFilter(e.currentTarget.value)} />
+        <div class="workspace-toolbar workspace-tree-heading"><IconFolder size={16} /><span title={state.cwd}>{label(state.cwd)}</span>
+          <button aria-label="折叠全部目录" title="折叠全部目录" onClick={() => setExpanded(new Set<string>())}>−</button>
+        </div>
+        <div class="workspace-toolbar"><input aria-label="按文件名搜索项目" placeholder="搜索文件名…" value={filter()} onInput={e => setFilter(e.currentTarget.value)} />
           <button aria-label="刷新目录树" title="刷新已展开目录" onClick={() => { directories.clear(); setTreeRevision(v => v + 1); refreshArtifacts(); }}><IconRefresh size={14} /></button>
         </div>
         <Show when={filter().trim()} fallback={<div class="workspace-tree" role="tree" aria-label="项目文件树"><Directory path="" depth={0} /></div>}>
           <div class="workspace-search-results" aria-label="文件搜索结果">
             <Show when={searching()}><p role="status">正在搜索项目…</p></Show>
             <Show when={searchError()}><p role="alert">{searchError()}</p></Show>
-            <For each={search()?.entries}>{entry => <button class="workspace-file" title={entry.path} onClick={() => void open(entry.path)} onContextMenu={e => menu.open(e, entry.path)}><FileIcon path={entry.path} /><span>{entry.name}</span><small>{entry.path}</small></button>}</For>
+            <For each={search()?.entries}>{entry => <button class="workspace-file" aria-pressed={preview()?.path === (aliases.get(entry.path) ?? entry.path)} title={entry.path} onClick={() => void open(entry.path)} onContextMenu={e => menu.open(e, entry.path)}><FileIcon path={entry.path} /><span>{entry.name}</span><small>{entry.path}</small></button>}</For>
             <Show when={search() && !search()!.entries.length}><p>没有匹配的文件</p></Show>
             <Show when={search()?.truncated}><p>已显示部分结果，请使用更精确的文件名</p></Show>
           </div>
         </Show>
       </div>
+      <div class="workspace-tree-resize" role="separator" aria-label="调整目录栏宽度" aria-orientation="vertical" tabindex="0"
+        aria-valuemin={25} aria-valuemax={60} aria-valuenow={treeWidth()}
+        onKeyDown={e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); setTreeWidth(v => Math.max(25, Math.min(60, v + (e.key === 'ArrowLeft' ? -2 : 2)))); } }}
+        onPointerDown={e => { e.preventDefault(); e.currentTarget.setPointerCapture(e.pointerId); }}
+        onPointerMove={e => {
+          if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
+          const rect = e.currentTarget.parentElement!.getBoundingClientRect();
+          if (rect.width) setTreeWidth(Math.max(25, Math.min(60, (e.clientX - rect.left) / rect.width * 100)));
+        }} />
     </Show>
+    <div class="workspace-file-content">
     <Show when={mode() === "artifacts"}><section class="workspace-artifact-strip" aria-label="会话产物">
       <input aria-label="筛选会话产物" placeholder={`筛选本会话产物（${artifacts().length}）…`} value={artifactFilter()} onInput={e => setArtifactFilter(e.currentTarget.value)} />
       <div><For each={artifacts().filter(path => path.toLowerCase().includes(artifactFilter().toLowerCase()))}>{path => <button title={path} onClick={() => void open(path)} onContextMenu={e => menu.open(e, path)}><FileIcon path={path} /><span>{label(path)}</span><small aria-hidden="true">{path}</small></button>}</For>
@@ -530,7 +544,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     <Show when={loading()}><p role="status">正在读取文件…</p></Show>
     <Show when={preview()} keyed>{file => <>
       <Show when={editing() && file.text !== null} fallback={<div class="workspace-preview">
-        <Switch fallback={<p>此文件类型或大小不适合内嵌预览，请使用“系统打开”。HTML、Markdown 和图片上限 16 MB，其他文本上限 256 KB。</p>}>
+        <Switch fallback={<p onContextMenu={e => menu.open(e, file.path)}>此文件类型或大小不适合内嵌预览，请使用“系统打开”。HTML、Markdown 和图片上限 16 MB，其他文本上限 256 KB。</p>}>
           <Match when={file.kind === "image"}><img class="workspace-image" src={convertFileSrc(file.path)} alt={label(file.path)} onError={() => setError("图片加载失败，请使用系统打开")} onContextMenu={e => menu.open(e, file.path)} /></Match>
           <Match when={file.kind === "markdown" && !source()}><div class="markdown" innerHTML={markdown()} onClick={e => {
             const link = (e.target as HTMLElement).closest("a"); if (!link) return;
@@ -554,6 +568,8 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <footer class="workspace-status"><span>{dirty() ? "未保存 · 草稿保留至应用退出" : saved() ? "已保存到文件" : ""}</span><span>{Math.ceil((file.text !== null ? new TextEncoder().encode(original()).length : file.size) / 1024)} KB{file.text !== null ? " · UTF-8" : ""}</span></footer>
     </>}</Show>
     <Show when={!preview() && !loading()}><div class="workspace-empty">选择文件以查看预览</div></Show>
+    </div>
+    </div>
     </div>
     <menu.Menu />
     <Show when={closing()}>{path => (

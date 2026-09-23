@@ -52,9 +52,14 @@
 .workspace-panel .workspace-tab-close { padding: 2px; min-height: 22px; margin-right: 3px; }
 .workspace-panel .workspace-breadcrumb { flex: 1; min-width: 0; justify-content: flex-start; }
 .workspace-breadcrumb > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.workspace-picker { position: absolute; z-index: 5; top: 66px; left: 6px; width: min(390px, calc(100% - 12px)); max-height: min(460px, calc(100% - 80px)); overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); box-shadow: 0 8px 28px #0003; }
-.workspace-picker > .workspace-toolbar { position: sticky; top: 0; background: var(--bg); z-index: 1; }
-.workspace-tree { padding: 4px 0; }
+.workspace-explorer { display: flex; flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
+.workspace-file-content { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+.workspace-picker { display: flex; flex-direction: column; flex: 0 0 var(--tree-width, 38%); min-width: 0; min-height: 0; overflow: hidden; background: var(--bg); }
+.workspace-tree-heading > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.workspace-tree, .workspace-search-results { flex: 1; min-height: 0; overflow: auto; padding: 4px 0; }
+.workspace-panel .workspace-file[aria-selected=true] { color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, var(--bg)); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+.workspace-tree-resize { flex: 0 0 4px; cursor: col-resize; touch-action: none; background: var(--border); }
+.workspace-tree-resize:hover, .workspace-tree-resize:focus-visible { background: var(--accent); outline: none; }
 .workspace-tree-chevron { flex: 0 0 12px; text-align: center; opacity: .7; }
 .workspace-tree [role=group] { min-width: 0; }
 .workspace-artifacts { border-top: 1px solid var(--border); }
@@ -105,7 +110,6 @@
 .workspace-code .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground { background: color-mix(in srgb, var(--accent) 24%, transparent); }
 .workspace-code .cm-panels { background: var(--bg-panel); color: var(--text); }
 .workspace-file-view, .workspace-git { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
-.workspace-picker { top: 110px; max-height: min(460px, calc(100% - 120px)); }
 .workspace-modes { gap: 6px; padding: 6px 8px; background: var(--bg); border-bottom-color: color-mix(in srgb, var(--accent) 30%, var(--border)); }
 .workspace-modes > button { flex: 1; min-height: 32px; font-weight: 600; color: var(--text-muted); border-radius: 6px; }
 .workspace-panel .workspace-modes > button[aria-pressed=true] { color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, var(--bg)); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); box-shadow: inset 0 -2px var(--accent); }
