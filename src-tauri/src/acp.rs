@@ -229,13 +229,16 @@ fn effort_display_name(effort: &str) -> String {
     .to_string()
 }
 
-/// CodeBuddy 没有独立的思考强度下拉：按 codex 的惯例把档位折进模型选项，一个模型展开成
+/// ACP 后端没有独立的思考强度下拉：把档位折进模型选项，一个模型展开成
 /// `<model>:<effort>` 若干条（如 `hy4-preview:high`），选中后由 apply_session_config
-/// 拆成 model + `thought_level` 分别下发。
-fn expand_codebuddy_effort_options(config_options: &Value) -> Value {
+/// 拆成 model + 对应的思考配置分别下发。
+fn expand_acp_effort_options(config_options: &Value, effort_config_id: &str) -> Value {
     let Some(options) = config_options.as_array() else {
         return config_options.clone();
     };
+    if !options.iter().any(|o| o.get("id").and_then(Value::as_str) == Some(effort_config_id)) {
+        return config_options.clone();
+    }
     let Some(model_opt) = options
         .iter()
         .find(|o| o.get("id").and_then(Value::as_str) == Some("model"))
@@ -245,10 +248,10 @@ fn expand_codebuddy_effort_options(config_options: &Value) -> Value {
     let Some(models) = model_opt.get("options").and_then(Value::as_array) else {
         return config_options.clone();
     };
-    // 进程当前档位来自 thought_level 的 currentValue（可能是 enabled 这类开关值）。
+    // Devin / CodeBuddy 用 thought_level，Kimi 用 thinking。
     let current_effort = options
         .iter()
-        .find(|o| o.get("id").and_then(Value::as_str) == Some("thought_level"))
+        .find(|o| o.get("id").and_then(Value::as_str) == Some(effort_config_id))
         .and_then(|o| o.get("currentValue"))
         .and_then(Value::as_str)
         .filter(|e| CODEBUDDY_EFFORT_LEVELS.contains(e))
@@ -908,7 +911,10 @@ impl AcpManager {
     }
 
     /// 启动时从磁盘缓存灌入内存（不广播；前端经 get_model_options 立刻拿到）。
-    pub fn seed_model_options(&self, v: Value) {
+    pub fn seed_model_options(&self, mut v: Value) {
+        if let (Some(id), Some(options)) = (self.effort_config_id(), v.get_mut("configOptions")) {
+            *options = expand_acp_effort_options(options, id);
+        }
         *self.model_options.lock().unwrap() = Some(v);
     }
 
@@ -2381,10 +2387,10 @@ impl AcpManager {
             self.spawn_revalidate_model_options();
             kept
         };
-        // CodeBuddy 的思考强度不单列下拉，按 codex 的惯例折进模型选项
+        // ACP 的思考强度不单列下拉，按 codex 的惯例折进模型选项
         // （`hy4-preview:high`），下发时再拆成 model + thought_level。
-        let config_options = if self.effort_config_id().is_some() {
-            expand_codebuddy_effort_options(&config_options)
+        let config_options = if let Some(id) = self.effort_config_id() {
+            expand_acp_effort_options(&config_options, id)
         } else {
             config_options
         };
@@ -2709,8 +2715,8 @@ impl AcpManager {
         mode: Option<String>,
         effort: Option<String>,
     ) {
-        // CodeBuddy 的模型选项带 `<model>:<effort>` 后缀：只把模型 id 交给后端，
-        // 档位走会话级 thought_level。模型里没带档位时退回线程上单独存的强度。
+        // 模型选项带 `<model>:<effort>` 后缀：只把模型 id 交给后端，
+        // 档位走后端对应的会话级配置。模型里没带档位时退回线程上单独存的强度。
         let (model_to_send, effort_from_model) = match self.effort_config_id() {
             Some(_) => split_model_effort(model.as_deref()),
             None => (model.clone(), None),
@@ -2963,11 +2969,11 @@ impl AcpManager {
         }
     }
 
-    /// 会话级推理强度在各后端 ACP 的 configId。CodeBuddy 用 `thought_level`
-    /// （`enabled` / `disabled` / 六个档位），其余后端暂不支持会话级下发。
+    /// 会话级推理强度在各后端 ACP 的 configId。
     fn effort_config_id(&self) -> Option<&'static str> {
         match self.kind {
-            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => Some("thought_level"),
+            AgentKind::Devin | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => Some("thought_level"),
+            AgentKind::Kimi => Some("thinking"),
             _ => None,
         }
     }
@@ -4356,6 +4362,32 @@ fn codebuddy_activation_env(
 
 #[cfg(test)]
 mod codebuddy_acp_tests {
+    #[test]
+    fn devin_and_kimi_effort_options_round_trip() {
+        for (id, model) in [("thought_level", "claude-opus-5-medium"), ("thinking", "kimi-code/k3")] {
+            let raw = serde_json::json!([
+                {"id": "model", "currentValue": model, "options": [
+                    {"value": model, "name": "Model", "_meta": {"cognition.ai/supportsImages": true}}
+                ]},
+                {"id": id, "currentValue": "max", "options": [
+                    {"value": "low"}, {"value": "high"}, {"value": "max"}
+                ]}
+            ]);
+            let expanded = super::expand_acp_effort_options(&raw, id);
+            assert_eq!(expanded[0]["currentValue"], format!("{model}:max"));
+            let choices = expanded[0]["options"].as_array().unwrap();
+            assert_eq!(choices.len(), 3);
+            for (choice, effort) in choices.iter().zip(["low", "high", "max"]) {
+                assert_eq!(super::split_model_effort(choice["value"].as_str()),
+                    (Some(model.to_string()), Some(effort.to_string())));
+                assert_eq!(choice["_meta"]["cognition.ai/supportsImages"], true);
+            }
+            assert_eq!(super::expand_acp_effort_options(&expanded, id), expanded);
+            let legacy = serde_json::json!([raw[0].clone()]);
+            assert_eq!(super::expand_acp_effort_options(&legacy, id), legacy);
+        }
+    }
+
     #[test]
     fn backend_proxy_defaults_to_direct_and_explicit_proxy_wins() {
         let mut cmd = tokio::process::Command::new("unused");
