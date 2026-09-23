@@ -286,6 +286,31 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
     }
 }
 
+// ponytail: byte counts conservatively bound text tokens; image cost is a heuristic
+// (8192 per image). Replace with provider token counting when available.
+fn request_input_budget(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => text.len() as u64,
+        Value::Array(items) => items.iter().map(request_input_budget).sum(),
+        Value::Object(fields) => {
+            if matches!(fields.get("type").and_then(Value::as_str),
+                Some("image" | "image_url" | "input_image")) {
+                return 8192;
+            }
+            fields.iter().map(|(key, value)| key.len() as u64 + request_input_budget(value) + 8).sum()
+        }
+        _ => 8,
+    }
+}
+
+fn budget_output_tokens(body: &mut Value, model: &ResolvedModel, field: &str) {
+    let requested = body[field].as_u64().unwrap_or(model.max_output_tokens);
+    let available = model.context_window
+        .saturating_sub(request_input_budget(body))
+        .saturating_sub(8192);
+    body[field] = json!(requested.min(available).max(16));
+}
+
 fn completions_body(
     model: &ResolvedModel,
     system_prompt: &str,
@@ -339,6 +364,7 @@ fn completions_body(
     if let Some(top_p) = model.top_p {
         body["top_p"] = json!(top_p);
     }
+    budget_output_tokens(&mut body, model, model.max_tokens_field);
     body
 }
 
@@ -516,6 +542,7 @@ fn responses_body(
     if let Some(top_p) = model.top_p {
         body["top_p"] = json!(top_p);
     }
+    budget_output_tokens(&mut body, model, "max_output_tokens");
     body
 }
 
@@ -1192,6 +1219,11 @@ fn is_retryable_stream_error(error: &str) -> bool {
         "http 502",
         "http 503",
         "http 504",
+        "http 520",
+        "http 521",
+        "http 522",
+        "http 523",
+        "http 524",
         "http2",
         "http/2",
     ]
@@ -1341,6 +1373,9 @@ pub async fn stream_chat(
 // ---------- anthropic-messages ----------
 
 fn anthropic_thinking_budget(level: Option<&str>, max_output_tokens: u64) -> Option<u64> {
+    if max_output_tokens <= 1024 {
+        return None;
+    }
     let budget = match level.unwrap_or("medium") {
         "off" | "none" => return None,
         "minimal" => 1024,
@@ -1488,8 +1523,9 @@ fn anthropic_body(
         }
         body["tools"] = Value::Array(tool_defs);
     }
+    budget_output_tokens(&mut body, model, "max_tokens");
     if model.reasoning {
-        if let Some(budget) = anthropic_thinking_budget(thinking_level, model.max_output_tokens) {
+        if let Some(budget) = anthropic_thinking_budget(thinking_level, body["max_tokens"].as_u64().unwrap()) {
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
     }
@@ -1761,6 +1797,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn output_budget_reserves_context_for_growing_tool_history() {
+        let mut model = test_model("openai-completions");
+        model.context_window = 1_048_576;
+        model.max_output_tokens = 943_718;
+        let messages = vec![json!({"role":"user", "content":"x".repeat(120_000)})];
+        for (body, field) in [
+            (completions_body(&model, "sys", &messages, &[], None, None), "max_completion_tokens"),
+            (responses_body(&model, "sys", &messages, &[], None, None), "max_output_tokens"),
+            (anthropic_body(&model, "sys", &messages, &[], Some("high")), "max_tokens"),
+        ] {
+            let output = body[field].as_u64().unwrap();
+            assert!(output < model.max_output_tokens);
+            assert!(output + request_input_budget(&body) < model.context_window);
+        }
+        let short = completions_body(&model, "sys", &[], &[], None, None);
+        assert_eq!(short["max_completion_tokens"], model.max_output_tokens);
+        // Base64 bytes are not text tokens, and must not exhaust the window.
+        assert_eq!(request_input_budget(&json!({"type":"input_image", "image_url":"x".repeat(1_000_000)})), 8192);
+        model.context_window = 100;
+        let small = anthropic_body(&model, "sys", &messages, &[], Some("high"));
+        assert_eq!(small["max_tokens"], 16);
+        assert!(small.get("thinking").is_none());
+    }
+
     fn test_model(api: &str) -> ResolvedModel {
         ResolvedModel {
             provider: "p".into(),
@@ -1854,6 +1915,7 @@ mod tests {
 
     #[test]
     fn transient_stream_decode_errors_are_retryable() {
+        assert!(is_retryable_stream_error("Lyra provider HTTP 520 upstream temporarily unavailable"));
         assert!(is_retryable_stream_error(
             "读取响应流失败：error decoding response body"
         ));
