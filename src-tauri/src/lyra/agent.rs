@@ -364,7 +364,7 @@ impl Agent {
                             );
                             event["event"] = json!("provider_network_timeout");
                             event["stage"] = json!(if error.contains("响应头") { "headers" } else { "sse" });
-                            event["timeoutMs"] = json!(if error.contains("响应头") { 60_000 } else { 90_000 });
+                            event["timeoutMs"] = json!(crate::lyra::watchdog::IDLE_TIMEOUT.as_millis() as u64);
                             diag.record(event);
                         }
                     }

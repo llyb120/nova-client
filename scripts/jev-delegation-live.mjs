@@ -11,6 +11,7 @@ import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 const root=process.cwd(),profile=await mkdtemp(join(tmpdir(),'nova-jev-live-'));
 const lyra=process.argv.includes('--lyra'),backend=lyra?'lyra':'codebuddy';
+const continuityOnly=process.argv.includes('--continuity-only');
 const model=lyra?'commandcode/qwen/qwen3.8-flash/variant/medium':'deepseek-v4.1-flash:high';
 const source=join(process.env.USERPROFILE,'.novadev');
 const settings=JSON.parse(await readFile(join(source,'settings.json'),'utf8'));
@@ -24,6 +25,23 @@ const steps=[['报表类型',['游戏收入','用户留存','设备分布']],['�
 const fixture=createServer((req,res)=>{
  const url=new URL(req.url,'http://localhost');
  if(url.pathname==='/favicon.ico'){res.writeHead(204);res.end();return}
+ if(url.pathname.startsWith('/continuity')) {
+  res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
+  const body=url.pathname.endsWith('/ambiguous')
+   ? '<h1>填写 GIT_BRANCH</h1><div>GIT_BRANCH<input></div><div>GIT_BRANCH<input></div>'
+   : url.pathname.endsWith('/stalled') ? '<h1>Loading… 正在加载表单，请稍候</h1>'
+   : url.pathname.endsWith('/sort') ? `<h1>表格排序验证</h1><output id="status">数据加载完成</output><section><table><tr><th><span id="definition" style="cursor:pointer">Digital Units</span><div id="sort" tabindex="0" style="display:inline-block;width:20px;height:20px">⋮</div></th></tr></table><table id="rows"><tr><td>20</td></tr><tr><td>30</td></tr><tr><td>10</td></tr></table></section><div id="menu"></div><div id="tooltip"></div><script>
+    let wrong=0;document.querySelector('#definition').addEventListener('click',()=>document.querySelector('#tooltip').textContent='销量指标释义 '+(++wrong));
+    document.querySelector('#sort').addEventListener('click',()=>setTimeout(()=>{document.querySelector('#menu').innerHTML='<h2>Sort By</h2><ul><li style="cursor:pointer">Digital Units</li></ul>';document.querySelector('li').onclick=()=>{const order=new URL(location.href).searchParams.get('order')==='desc'?'asc':'desc';history.replaceState(null,'','?sort_name=units&order='+order);document.querySelector('#rows').innerHTML=(order==='desc'?[30,20,10]:[10,20,30]).map(n=>'<tr><td>'+n+'</td></tr>').join('');document.querySelector('#menu').textContent='';};},350));
+    </script>`
+   : url.pathname.endsWith('/scroll') ? `<h1>滚轮验证：目标在结果列表右下方</h1><output id="status">尚未完成</output><aside aria-label="结果列表" style="width:360px;height:220px;overflow:auto"><div style="width:1100px;height:1000px;position:relative"><p>向下并向右滚动此列表查找完成按钮</p><button style="position:absolute;left:900px;top:850px" onclick="window.clicks=(window.clicks||0)+1;document.querySelector('#status').textContent='滚动验证通过，点击次数 '+window.clicks">完成滚动验证</button></div></aside>`
+   : `<h1>本地发布模拟</h1><main><button onmouseenter="this.outerHTML='<button onclick=&quot;openForm()&quot;>执行</button>'" onclick="openForm()">执行</button></main><script>
+     let submissions=0;const main=document.querySelector('main');
+     function openForm(){main.innerHTML='Loading… 正在加载表单';setTimeout(()=>{main.innerHTML='<div>描述说明<input value="manual"></div><div>GIT_BRANCH<div><input value="main" id="branch"></div></div><button onclick="submitForm()">提交执行</button>';},900);}
+     function submitForm(){submissions++;const branch=document.querySelector('#branch').value;main.innerHTML='正在提交，请勿重复提交';setTimeout(()=>{main.textContent='发布成功；分支 '+branch+'；提交次数 '+submissions;},900);}
+     </script>`;
+  res.end('<!doctype html><meta charset="utf-8"><title>JEV 连续执行回归</title>'+body);return;
+ }
  const path=url.pathname.split('/').filter(Boolean);const stage=path.length;
  visits.push({path:url.pathname,time:Date.now()});
  if(url.searchParams.has('incomplete')){res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});res.end('<h1>美国近半年游戏收入榜单</h1><p>当前只取得3条，数据尚未加载完毕，缺少第4和第5名。</p><table><tr><th>游戏</th><th>收入</th></tr><tr><td>Aurora</td><td>500</td></tr><tr><td>Beacon</td><td>420</td></tr><tr><td>Cedar</td><td>340</td></tr></table>');return;}
@@ -58,6 +76,52 @@ try{
  if(!status.connected)throw Error('Chrome extension did not connect to Dev');
  console.log(JSON.stringify({phase:'dev_connected',pid:child.pid,origin:status.origin}));
  report.threadId=thread.id;
+ if(continuityOnly) {
+  const page=await chrome('open',{url:fixtureUrl+'continuity'});
+  const result=await chrome('run',{tabTag:page.tabTag,snapshotId:page.snapshotId,plan:{
+   task:'在本地发布模拟页点击执行，填写 GIT_BRANCH 为 version/260924/main，保持描述说明不变，点击提交执行一次，核验发布成功、准确分支和提交次数1。',
+   authorization:'允许在此本地模拟页打开表单、填写分支和提交一次；禁止修改描述说明，禁止重复提交。',
+   expectedText:'发布成功；分支 version/260924/main；提交次数 1',
+   inputs:[{name:'GIT_BRANCH',text:'version/260924/main'}]}});
+  report.tests.push({case:'delayed_anonymous_form',result});
+  assert.equal(result.jevRun.status,'completed');assert.equal(result.jevRun.executedActions,3);
+  assert(result.jevRun.observationRefreshes>0);
+  assert(result.jevRun.preflightRecoveries>0,'hover replacement must recover inside run before any click');
+  const scrollPage=await chrome('open',{url:fixtureUrl+'continuity/scroll'});
+  const scrollRun=await chrome('run',{tabTag:scrollPage.tabTag,snapshotId:scrollPage.snapshotId,plan:{
+   task:'在结果列表中找到右下方的完成滚动验证按钮，点击一次，并核验滚动验证通过、点击次数1。',
+   authorization:'允许在此本地页面滚动结果列表、点击完成按钮一次；禁止其它操作。',
+   expectedText:'滚动验证通过，点击次数 1',controlNames:['完成滚动验证']}});
+  report.tests.push({case:'nested_two_axis_wheel',result:scrollRun});
+  assert.equal(scrollRun.jevRun.status,'completed');
+  assert(scrollRun.jevRun.decisions.some(d=>d.treePath?.[0]==='reveal'));
+  assert(scrollRun.jevRun.decisions.some(d=>d.treePath?.[0]==='interact'));
+  assert.equal(scrollRun.jevRun.decisionTree.selectedPath[0],'verify');
+  assert(scrollRun.jevRun.decisions.every((d,i)=>d.treeRevision===i+1));
+  const wheelActions=scrollRun.jevRun.history.map(h=>JSON.parse(h.action)).filter(a=>a.action==='scroll');
+  assert(wheelActions.some(a=>a.axis==='horizontal')&&wheelActions.some(a=>a.axis==='vertical'));
+  assert(scrollRun.jevRun.history.filter(h=>JSON.parse(h.action).action==='scroll').every(h=>h.scrollFeedback?.changed===true));
+  const sortPage=await chrome('open',{url:fixtureUrl+'continuity/sort'});
+  const sortRun=await chrome('run',{tabTag:sortPage.tabTag,snapshotId:sortPage.snapshotId,plan:{
+   task:'把表格 Digital Units 按降序排列，核验排序已应用。',authorization:'允许打开表格排序菜单并选择排序项。',expectedText:'Digital Units 降序且数据加载完成',maxActions:8}});
+  report.tests.push({case:'focusable_sort_menu',result:sortRun});
+  assert.equal(sortRun.jevRun.status,'completed');
+  assert.equal(new URL(sortRun.pages[0].url).searchParams.get('order'),'desc','must stop before toggling correct sorting back to ascending');
+  assert(sortRun.jevRun.executedActions<=3,'do not repeatedly click the definition tooltip');
+  for(const scenario of ['ambiguous','stalled']) {
+   const page=await chrome('open',{url:fixtureUrl+'continuity/'+scenario});
+   const result=await chrome('run',{tabTag:page.tabTag,snapshotId:page.snapshotId,plan:{
+    task:'在唯一明确的 GIT_BRANCH 字段填入 version/260924/main；如果正在加载则等待。不能猜测两个同名字段。',
+    authorization:'只允许填写唯一明确的分支字段，不允许其它操作。',expectedText:'正确字段已填写',
+    inputs:[{name:'GIT_BRANCH',text:'version/260924/main'}]}});
+   report.tests.push({case:scenario,result});
+   assert.equal(result.jevRun.status,'handoff');assert.equal(result.jevRun.executedActions,0);
+   if(scenario==='stalled') assert.match(result.jevRun.reason,/15秒/);
+   else assert(result.jevRun.decisions.some(d=>d.choice==='defer'));
+  }
+  report.completed=true;report.passed=true;
+  console.log(JSON.stringify({phase:'continuity_passed',tests:report.tests.map(t=>({case:t.case,run:t.result.jevRun}))}));
+ } else {
  // Deliberately exercise a noncompliant caller before asking a main model to work.
  const guard=await chrome('open',{url:fixtureUrl});
  const item=guard.pages.flatMap(p=>p.items.map(item=>({...item,frame:p.frame??0}))).find(i=>i.name==='游戏收入');
@@ -121,6 +185,7 @@ try{
  }
  report.passed=true;
  console.log(JSON.stringify({phase:'checks_passed',audit:report.audit,incomplete:report.incomplete.jevRun,judgments:report.judgments.map(x=>({name:x.name,choice:x.result.choice,elapsedMs:x.result.elapsedMs}))}));
+ }
 }catch(error){report.error=String(error);console.log(JSON.stringify({error:String(error)}));process.exitCode=1}
 finally{
  if(invoke&&report.threadId&&!report.completed)await invoke('cancel_turn',{threadId:report.threadId}).catch(()=>{});

@@ -1,6 +1,6 @@
 // Opt-in real-site A/B runner. Each invocation owns one Nova profile and one Chrome tab.
 // node scripts/jev-databrain-ab.mjs --run <label> <exe> <on|off> [--require-jev]
-import {readFile,writeFile,mkdtemp,mkdir} from 'node:fs/promises';
+import {readFile,writeFile,mkdtemp,mkdir,unlink} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {spawn} from 'node:child_process';
@@ -10,6 +10,8 @@ import {reportThread} from './jev-session-report.mjs';
 if(process.argv[2]!=='--run')throw Error('Explicit --run required for live model/site requests');
 const [label,exe,mode]=process.argv.slice(3);
 const requireJev=process.argv[6]==='--require-jev';
+const sortOnly=process.argv.includes('--sort-only');
+const regionRegression=process.argv.includes('--region-regression');
 if(!/^[a-z0-9-]+$/.test(label)||!exe||!['on','off'].includes(mode))throw Error('Invalid arguments');
 const root=process.cwd(),out=resolve('src-tauri/target/jev-ab',label);
 await mkdir(out,{recursive:true});
@@ -54,27 +56,49 @@ try {
   if(!status.connected)throw Error('Chrome extension did not connect');
   // ACP may materialize the embedded bundle only when the first prompt starts.
   report.connectionOrigin=status.origin;
-  const opened=await chrome('new_tab',{url:'http://databrain-test.intlgame.com/'});
+  const opened=await chrome('new_tab',{url:'http://databrain-test.intlgame.com/'+(sortOnly?'v2/intelligence/topCharts/pcConsoleGames/MetricsTable':'')});
   tag=opened.tabTag||opened.tag;if(!tag)throw Error('No owned test tab');report.tabTag=tag;
   await sleep(2500);
   report.initial=await chrome('inspect',{tabTag:tag,scope:'viewport',maxTextChars:4000});
   await writeFile(join(out,'initial.json'),JSON.stringify(report.initial,null,2));
   if(/login|sign.?in/i.test(report.initial.pages?.[0]?.url||''))throw Error('Test tab is not logged in');
   if(process.argv.includes('--dom-probe')) {
+    const filters=process.argv.includes('--filters')||regionRegression;
     report.testKind='direct_jev_navigation_only';report.startedAt=Date.now();report.probe=[];
     let observed=report.initial;
-    for(let attempt=0;attempt<4;attempt++) {
+    for(let attempt=0;attempt<(filters||sortOnly?1:4);attempt++) {
       const before=JSON.stringify(observed.pages?.map(p=>[p.url,p.text]));
       const result=await chrome('run',{tabTag:tag,snapshotId:observed.snapshotId,plan:{
-        task:'从首页进入 Intelligence 的 Top Charts 下 PC & Console Games 榜单（合并PC与Console的平台榜单）。',
-        authorization:'仅允许点击当前站点导航以进入指定榜单；不得修改筛选，不得提交或写入数据。',
-        expectedText:'PC & Console Games 榜单的 Metrics Table 和 Region 筛选已加载。',maxActions:12
+        task:filters?'进入 Intelligence / Top Charts / PC & Console Games 的 Metrics Table，日期选择 Last 26 Weeks（最新完整周为2026-09-19），Region选择United States并Confirm应用筛选，再把表格的Digital Units按降序排列（不是图表Metrics）。':'从首页进入 Intelligence 的 Top Charts 下 PC & Console Games 榜单（合并PC与Console的平台榜单）。',
+        authorization:filters?'允许导航、打开日期预设、选择地区、搜索United States、关闭菜单、Confirm应用查询筛选、滚动和表格排序；不得保存、导出或修改业务数据。':'仅允许点击当前站点导航以进入指定榜单；不得修改筛选，不得提交或写入数据。',
+        expectedText:filters?'PC & Console Games Metrics Table，日期2026-03-22~2026-09-19，Region United States，表格Digital Units降序且数据加载完成。':'PC & Console Games 榜单的 Metrics Table 和 Region 筛选已加载。',
+        inputs:filters?[{name:'Search',text:'United States'}]:[],maxActions:32,
+        ...(regionRegression?{task:'进入 Intelligence / Top Charts / PC & Console Games 的 Metrics Table，把 Region 从 Global 改为仅 United States，把 Week 开始和结束日期填写为2026-03-23和2026-09-23，点击 Confirm 应用。日期控件会按周归一化，允许最终为2026-03-22~2026-09-26；不要反复重填。不要选择整个地区分组。',
+          authorization:'允许导航、日期填写、地区筛选、滚动和 Confirm 应用查询；禁止修改其它筛选、排序、保存或导出。',
+          expectedText:'Region 仅 United States，Week 2026-03-22~2026-09-26，已 Confirm 应用且数据加载完成',
+          inputs:[{name:'Week ~ [field 1/2]',role:'input',text:'2026-03-23'},{name:'Week ~ [field 2/2]',role:'input',text:'2026-09-23'}]}:{}),
+        ...(sortOnly?{task:'将当前榜单表格的 MScience Digital Units（排序字段 units，不是 GSD 同名列 gsd_digitalUnits）按降序排列，不是图表Metrics。',
+          authorization:'允许滚动、打开表格排序菜单和选择排序项；禁止修改筛选、导出或保存。',
+          expectedText:'表格排序字段units、方向desc，数据加载完成；仅图表指标变化不算完成',inputs:[],maxActions:12}:{})
       }});
       report.probe.push(result.jevRun);await writeFile(join(out,`probe-${attempt}.json`),JSON.stringify(result,null,2));
       await sleep(1000);
       observed=await chrome('inspect',{tabTag:tag,scope:'viewport',visual:'none',maxTextChars:12000});
       const page=observed.pages?.[0];
       report.probePassed=!!page && new URL(page.url).pathname.endsWith('/intelligence/topCharts/pcConsoleGames/MetricsTable') && /Metrics Table/.test(page.text) && /Region/.test(page.text) && !/Loading\.\.\./.test(page.text);
+      if(filters&&!regionRegression)report.probePassed=report.probePassed && result.jevRun?.status==='completed'
+        && /United States/.test(page.text) && /2026-03-22/.test(page.text) && /2026-09-19/.test(page.text)
+        && new URL(page.url).searchParams.get('sort_name')==='units' && new URL(page.url).searchParams.get('order')==='desc';
+      if(regionRegression) {
+        const history=result.jevRun?.history||[];
+        const fills=history.filter(h=>h.action.includes('"action":"fill"'));
+        report.probePassed=report.probePassed && result.jevRun?.status==='completed'
+          && /Region\s+United States\s+Platform/.test(page.text)
+          && /2026-03-22/.test(page.text) && /2026-09-26/.test(page.text)
+          && history.some(h=>h.action.includes('"name":"Confirm"')) && fills.length===2;
+      }
+      if(sortOnly)report.probePassed=report.probePassed && result.jevRun?.status==='completed'
+        && new URL(page.url).searchParams.get('sort_name')==='units' && new URL(page.url).searchParams.get('order')==='desc';
       console.log(JSON.stringify({phase:'dom_probe',attempt,run:result.jevRun,passed:report.probePassed}));
       if(report.probePassed || JSON.stringify(observed.pages?.map(p=>[p.url,p.text]))===before)break;
     }
@@ -121,5 +145,6 @@ finally {
   if(invoke&&thread&&!report.completed)await invoke('cancel_turn',{threadId:thread.id}).catch(()=>{});
   if(invoke&&tag)await invoke('chrome_browser_ui',{operation:'close_tab',args:{tabTag:tag}}).catch(e=>report.cleanupError=String(e));
   await save();socket?.close();child.kill();child.unref();
+  await unlink(join(profile,'settings.json')).catch(()=>{});
   console.log(JSON.stringify({phase:'saved',label,out,profile}));
 }

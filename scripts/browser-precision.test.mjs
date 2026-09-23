@@ -40,6 +40,67 @@ try {
     return call('observe',randomUUID());
   };
   const target=(obs,name)=> {const e=obs.items.find(e=>e.name===name);assert.ok(e,`missing ${name}`);return e;};
+  await run('trusted wheel reaches nested button-filled panes on both axes and RTL',async()=>{
+    for(const horizontal of [false,true])for(const rtl of horizontal?[false,true]:[false]) {
+      const obs=await fixture(`<aside aria-label="Results pane" style="width:240px;height:160px;overflow:auto;direction:${rtl?'rtl':'ltr'}"><button style="box-sizing:border-box;width:${horizontal?"1200px":"100%"};height:${horizontal?"100%":"900px"}" onclick="window.clicks++">Records</button></aside><script>window.clicks=0</script>`);
+      const item=target(obs,'Results pane');
+      assert.ok(item.scroll[horizontal?'pointX':'pointY']);
+      assert.ok(item.blockedBy,'descendant button blocks a click, but not a wheel');
+      const p=await call('prepare',item.ref,horizontal?'scroll_x':'scroll_y');
+      await cdp.send('Input.dispatchMouseEvent',{type:'mouseWheel',x:p.x,y:p.y,deltaX:horizontal?(rtl?-180:180):0,deltaY:horizontal?0:180});
+      const feedback=await call('scrollFeedback',item.ref,p.scroll);
+      assert.equal(feedback.changed,true);
+      assert.ok(horizontal?(rtl?feedback.left<0:feedback.left>0):feedback.top>0);
+      assert.equal(await page.evaluate(()=>window.clicks),0);
+      if(rtl)assert.ok(item.scroll.minLeft<0 && item.scroll.maxLeft===0);
+    }
+    await fixture('<button style="display:block;width:100%;height:2000px">Page content</button>');
+    const p=await call('prepare',null,'scroll_y');
+    await cdp.send('Input.dispatchMouseEvent',{type:'mouseWheel',x:p.x,y:p.y,deltaX:0,deltaY:400});
+    assert.equal((await call('scrollFeedback',null,p.scroll)).changed,true);
+  });
+  await run('SPA loading text keeps delegation alive until navigation renders',async()=>{
+    const obs=await fixture('<nav><button>Home</button></nav><main>Loading...</main>');
+    assert.equal(obs.loading,true);
+    await page.evaluate(()=>document.querySelector('main').innerHTML='<li style="cursor:pointer">PC &amp; Console</li>');
+    const ready=await call('observe',randomUUID());
+    assert.equal(ready.loading,false);
+    assert.equal(target(ready,'PC & Console').actionable,true);
+  });
+  await run('framework date presets use clickable anchors without href',async()=>{
+    const obs=await fixture('<div><p style="cursor:pointer">Last 26 Weeks</p><a style="cursor:pointer">Last 12 Weeks</a><a>Plain text</a><div style="opacity:0">Invisible tooltip</div></div>');
+    assert.equal(target(obs,'Last 26 Weeks').actionable,true);
+    assert.equal(target(obs,'Last 12 Weeks').actionable,true);
+    assert.ok(!obs.visibleText.includes('Invisible tooltip'));
+    assert.ok(!obs.items.some(i=>i.name==='Plain text'));
+    const item=target(obs,'Last 26 Weeks');
+    const p=await call('prepare',item.ref);
+    assert.equal(await call('verifyPoint',item.ref,p.x,p.y,p.rect),true);
+  });
+  await run('anonymous fields carry local context without merging adjacent inputs',async()=>{
+    const obs=await fixture('<div><div>GIT_BRANCH<div><input value="main"></div></div><div>描述说明<input value="manual"></div></div><div>Ambiguous<input><input></div><div>Secret<input type="password" value="private"></div>');
+    const fields=obs.items.filter(i=>i.editable);
+    assert.equal(fields[0].name,'');assert.equal(fields[0].fieldContext,'GIT_BRANCH');
+    assert.equal(fields[1].fieldContext,'描述说明');
+    assert.equal(fields[2].fieldContext,'');assert.equal(fields[3].fieldContext,'');
+    assert.equal(fields[4].password,true);assert.equal(fields[4].value,undefined);
+    assert.equal(fields[4].fieldContext,undefined);assert.equal(obs.readyState,'complete');
+    await page.evaluate(()=>document.querySelector('input').parentElement.previousSibling.textContent='OTHER_FIELD');
+    await assert.rejects(call('prepare',fields[0].ref),/失效/,'semantic field context must be revalidated before input');
+  });
+  await run('date ranges retain Week versus Release Date context and endpoint identity',async()=>{
+    const range=title=>`<div><span>${title}</span><div><span><input placeholder="Select date" readonly></span> ~ <span><input placeholder="Select date" readonly></span></div></div>`;
+    const obs=await fixture(`<div>${range('Week')}${range('Release Date')}</div>`);
+    const fields=obs.items.filter(i=>i.role==='input');
+    assert.deepEqual(fields.map(i=>i.fieldContext),['Week ~ [field 1/2]','Week ~ [field 2/2]','Release Date ~ [field 1/2]','Release Date ~ [field 2/2]']);
+    assert(fields.every(i=>!i.editable));
+    assert(fields.every(i=>i.dateValue===''));
+    await page.evaluate(()=>{const fields=document.querySelectorAll('input');fields[0].value='2026-03-22';fields[1].value='private-token';});
+    const updated=(await call('observe',randomUUID())).items.filter(i=>i.role==='input');
+    assert.equal(updated[0].dateValue,'2026-03-22');assert.equal(updated[1].dateValue,undefined);
+    await page.evaluate(()=>document.querySelector('span').textContent='Release Date');
+    await assert.rejects(call('prepare',updated[0].ref),/失效/,'same placeholder must not conceal a changed field purpose');
+  });
   await run('custom menus and duplicate sortable columns retain independent evidence',async()=>{
     const obs=await fixture('<nav><div style="cursor:pointer"><span>PC & Console</span></div></nav><div>Unrelated</div><div style="cursor:pointer">Custom option</div><div role="menu"><div style="cursor:pointer">United States</div></div><table><tr><th style="cursor:pointer" data-field="sourceA" aria-sort="descending">Digital Units</th><th style="cursor:pointer" data-field="sourceB" aria-sort="none">Digital Units</th><th>Revenue</th></tr><tr><td>100</td><td>50</td><td>99</td></tr></table>');
     assert.equal(target(obs,'PC & Console').actionable,true);
@@ -123,7 +184,7 @@ try {
     assert.equal((await fixture('<table aria-rowcount="0" style="width:100px;height:10px"></table>')).tables[0].totalRows,0);
     await evaluate('Object.defineProperty(globalThis,"__novaWebview",{value:{apiVersion:7},configurable:true}); true');
     await evaluate(engine);
-    assert.equal(await evaluate('__novaWebview.apiVersion'),12,'Existing Chrome worlds must upgrade to control-level DOM hints');
+    assert.equal(await evaluate('__novaWebview.apiVersion'),19,'Existing Chrome worlds must upgrade to current DOM hints');
     assert.equal((await call('observe',randomUUID())).tables[0].totalRows,0);
   });
   await run('native and ARIA checkboxes expose role and current selection',async()=>{

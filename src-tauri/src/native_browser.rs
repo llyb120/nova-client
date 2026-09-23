@@ -1048,6 +1048,7 @@ enum Action {
         frame: usize,
         r#ref: Option<String>,
         delta: i32,
+        #[serde(default)] delta_x: Option<i32>,
     },
     Wait {
         ms: u64,
@@ -1084,7 +1085,7 @@ fn validate_action(action: &Action) -> Result<(), String> {
     if let Action::Drag { to_x,to_y,duration_ms,.. } = action {
         if !to_x.is_finite() || !to_y.is_finite() || *to_x<0. || *to_y<0. || duration_ms.is_some_and(|t| !(80..=1500).contains(&t)) { return Err("拖动终点或 duration_ms 无效".into()); }
     }
-    if let Action::ScrollAt { delta_x:Some(x), .. } = action { if x.unsigned_abs()>1200 { return Err("delta_x 超过1200像素".into()); } }
+    if let Action::ScrollAt { delta_x:Some(x), .. } | Action::Scroll { delta_x:Some(x), .. } = action { if x.unsigned_abs()>1200 { return Err("delta_x 超过1200像素".into()); } }
     Ok(())
 }
 fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String> {
@@ -1204,6 +1205,8 @@ async fn point(
 #[derive(Default)]
 struct InputProgress {
     attempted: bool,
+    dom_preflight: bool,
+    scroll_feedback: Option<Value>,
     completed: usize,
     held_mouse: Option<Value>,
     held_key: Option<Value>,
@@ -1331,6 +1334,7 @@ async fn apply(
             cdp(app,"Input.insertText",json!({"text":text}),None,Some(s.cancel.clone())).await?;
         }
         Action::Click{frame,r#ref,..} | Action::Fill{frame,r#ref,..} => {
+            progress.dom_preflight=true;
             let mode=if matches!(action,Action::Fill{..}) {"fill"} else {"click"};
             let p=point(app,observation,*frame,r#ref,mode).await?;
             // Hover is real input, then validate the same target again before pressing.
@@ -1343,6 +1347,7 @@ async fn apply(
                     return Err("框架在悬停后移动，已停止点击，请重新观察".into());
                 }
             }
+            progress.dom_preflight=false;
             if let Action::Fill{text,..}=action {
                 if p["password"]==true { return Err("密码请手动输入".into()); }
                 mouse(app,s,&p,"left",1,progress).await?;
@@ -1358,13 +1363,18 @@ async fn apply(
             }
         }
         Action::Press{key:name}=>key(app,s,name,progress).await?,
-        Action::Scroll{frame,r#ref,delta}=>{
-            let p=if let Some(reference)=r#ref {point(app,observation,*frame,reference,"click").await?} else {
+        Action::Scroll{frame,r#ref,delta,delta_x}=>{
+            progress.dom_preflight=true;
+            let mode=if delta_x.unwrap_or(0)!=0 {"scroll_x"} else {"scroll_y"};
+            let p=if let Some(reference)=r#ref {point(app,observation,*frame,reference,mode).await?} else {
                 if *frame!=0 {return Err("子框架滚动需要明确 ref".into());}
-                json!({"x":observation.pages["pages"][0]["viewport"]["width"].as_f64().unwrap_or(400.)/2.,"y":observation.pages["pages"][0]["viewport"]["height"].as_f64().unwrap_or(400.)/2.})
+                evaluate(app,&observation.frames[0],format!("__novaWebview.prepare(null,{})",json!(mode))).await?
             };
+            progress.dom_preflight=false;
             check(app,s)?; progress.attempted=true;
-            cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseWheel","x":p["x"],"y":p["y"],"deltaX":0,"deltaY":delta}),None,Some(s.cancel.clone())).await?;
+            cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseWheel","x":p["x"],"y":p["y"],"deltaX":delta_x.unwrap_or(0),"deltaY":delta}),None,Some(s.cancel.clone())).await?;
+            progress.scroll_feedback=Some(evaluate(app,&observation.frames[*frame],
+                format!("__novaWebview.scrollFeedback({},{})",json!(r#ref),p["scroll"])).await?);
         }
         Action::Wait{ms}=>tokio::time::sleep(Duration::from_millis(*ms)).await,
     }
@@ -1700,6 +1710,8 @@ async fn control_session(
             }
         }
         let mut result=json!({"status":if failure.is_none(){"executed"}else if progress.attempted{"needs_review"}else{"not_executed"},
+            "scrollFeedback":progress.scroll_feedback,
+            "canReobserve":failure.is_some() && progress.dom_preflight && progress.completed==0,
             "reason":failure,"inputAttempted":progress.attempted,"completedActions":progress.completed,"actionTimingsMs":action_timings,"basedOnSnapshotId":observation.id,"verification":"unverified"});
         result["actionMs"] = json!(started.elapsed().as_millis());
         result["next"] = json!("根据返回的最新状态验证并继续；fill 一次完成聚焦和填写。executed/needs_review 不要直接重放。坐标操作需截图，DOM 操作使用最新 frame/ref。");
@@ -1719,10 +1731,10 @@ async fn control_session(
             if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
             let visual=args["feedback"]=="screenshot" || (args["feedback"].is_null() && observation.screenshot);
             // Feedback failure must never turn a completed mutation into a retryable action failure.
-            match tokio::time::timeout(Duration::from_secs(3), snapshot(app,visual,&feedback_args)).await {
+            match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args)).await {
                 Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
                 Ok(Err(error)) => result["observationError"] = json!(error),
-                Err(_) => result["observationError"] = json!("动作后观察3秒超时；动作状态如上，请观察确认，不要重放"),
+                Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
             }
         }
         Ok(result)

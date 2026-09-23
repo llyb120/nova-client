@@ -56,11 +56,14 @@ impl ChromeBridge {
         let (send, receive) = oneshot::channel();
         self.pending.lock().unwrap().insert(id.clone(), send);
         let _pending = PendingCall(self.clone(), id.clone());
-        let expires = chrono::Utc::now().timestamp_millis() + 3000;
+        // A busy renderer can delay CDP while processing a large SPA; this is a
+        // deadline, not a sleep, and commands are still sent exactly once.
+        let timeout = Duration::from_secs(if operation == "cdp" { 10 } else { 3 });
+        let expires = chrono::Utc::now().timestamp_millis() + timeout.as_millis() as i64;
         self.sender
             .try_send(json!({"id":id,"operation":operation,"args":args,"expiresAt":expires}))
             .map_err(|_| "Chrome 命令队列已满")?;
-        tokio::time::timeout(Duration::from_secs(3), receive)
+        tokio::time::timeout(timeout, receive)
             .await
             .map_err(|_| "Chrome 响应超时；结果可能已执行，请先观察，不要重放动作")?
             .map_err(|_| "Chrome 连接中断，请重新观察")?
@@ -372,6 +375,19 @@ pub async fn chrome_browser_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cdp_waits_for_busy_renderer_without_resending() {
+        let state = Arc::new(ChromeBridge::new());
+        *state.client.lock().unwrap() = Some(("test".into(), Instant::now()));
+        let shared = state.clone();
+        let request = tokio::spawn(async move { shared.request("cdp", json!({"method":"Runtime.evaluate"})).await });
+        let command = state.receiver.lock().await.recv().await.unwrap();
+        assert!(command["expiresAt"].as_i64().unwrap() - chrono::Utc::now().timestamp_millis() > 8000);
+        tokio::time::sleep(Duration::from_millis(3100)).await;
+        state.pending.lock().unwrap().remove(command["id"].as_str().unwrap()).unwrap().send(Ok(json!({"ok":true}))).unwrap();
+        assert_eq!(request.await.unwrap().unwrap()["ok"], true);
+        assert!(state.receiver.lock().await.try_recv().is_err());
+    }
     #[tokio::test]
     async fn occupied_port_falls_back_and_exhaustion_is_reported() {
         let occupied = bind_listener(0..=0).await.unwrap();

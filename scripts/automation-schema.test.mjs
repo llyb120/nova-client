@@ -61,6 +61,8 @@ test('JEV browser decisions share bounded plans; desktop remains advisory', asyn
   assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.default,32);
   assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.maximum,64);
   assert.equal(chrome.inputSchema.properties.plan.properties.inputs.maxItems,8);
+  assert.deepEqual(chrome.inputSchema.properties.plan.properties.inputs.items.required,['name','text']);
+  assert.equal(chrome.inputSchema.properties.plan.properties.inputs.items.properties.name.minLength,0);
   assert.equal(chrome.inputSchema.properties.plan.properties.controlNames.maxItems,16);
   assert.equal(chrome.inputSchema.properties.plan.properties.useExperience.default,false);
   assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.required,['action','name','role','expectedText']);

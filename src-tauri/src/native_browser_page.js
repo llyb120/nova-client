@@ -1,6 +1,6 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 12) return;
+  if (globalThis.__novaWebview?.apiVersion === 19) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   const parent = e => e?.assignedSlot || e?.parentElement || e?.getRootNode()?.host;
   const contains = (e, child) => { for (; child; child = parent(child)) if (child === e) return true; return false; };
@@ -27,10 +27,10 @@
   };
   const contextInfo = (e, cache) => {
     for (let scope=parent(e); scope; scope=parent(scope)) {
-      if (!scope.matches('tr,[role=row],[role=listitem],li,form,[role=dialog],section,nav')) continue;
+      if (!scope.matches('tr,[role=row],[role=listitem],li,ul,ol,[role=menu],[role=listbox],form,[role=dialog],section,nav')) continue;
       if (cache?.has(scope)) return cache.get(scope);
       const key=['id','data-id','data-key','data-row-key','aria-rowindex','aria-label'].map(a=>scope.getAttribute(a)||'').join('|');
-      const text=compact(scope.innerText,300), row=scope.matches('tr,[role=row],[role=listitem],li');
+      const text=compact(scope.matches('ul,ol') ? `${scope.previousElementSibling?.innerText||''} ${scope.innerText}` : scope.innerText,300), row=scope.matches('tr,[role=row],[role=listitem],li');
       // A row's text identifies its record. A form's transient validation/status
       // text must not invalidate every other field in a safe fill batch.
       const heading=compact(scope.querySelector('legend,h1,h2,h3,[role=heading]')?.textContent,200);
@@ -39,7 +39,23 @@
     }
     return {region:'',identity:''};
   };
-  const fingerprint = (e, name=label(e), context=contextInfo(e).identity) => JSON.stringify([e.tagName, name, ...['id','name','type','role','href','data-testid','aria-controls','aria-sort','data-column-key','data-field'].map(a => e.getAttribute(a)), context]);
+  const fieldContext = e => {
+    // ponytail: six ancestors, single fields or a two-date range; other compound forms need real labels.
+    for (let scope=parent(e),depth=0; scope && depth<6; scope=parent(scope),depth++) {
+      const fields=Array.from(scope.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]),textarea,select,[contenteditable=true]'));
+      const text=compact(scope.innerText,300);
+      if (fields.length!==1) {
+        const range=fields.length===2 && fields.every(f=>f.matches('input') && (f.type==='date' || /date|日期/i.test(f.getAttribute('placeholder')||''))) && /[~～–—至]/.test(text);
+        if (!range) break;
+        if (text.replace(/[\s~～–—至]/g,'')) return `${text} [field ${fields.indexOf(e)+1}/2]`;
+        continue;
+      }
+      if (text) return text;
+    }
+    return '';
+  };
+  const fingerprint = (e, name=label(e), context=contextInfo(e).identity) => JSON.stringify([e.tagName, name, ...['id','name','type','role','href','data-testid','aria-controls','aria-sort','data-column-key','data-field'].map(a => e.getAttribute(a)), context,
+    e.type!=='password' && e.matches('input,textarea,select,[contenteditable=true]') ? fieldContext(e) : '']);
   const disabled = e => !!e.disabled || e.matches(':disabled') || ancestors(e).some(p => p.inert || p.getAttribute('aria-disabled') === 'true');
   const editable = (e, isDisabled=disabled(e)) => (e.matches('textarea,input:not([type]),input[type=text],input[type=search],input[type=email],input[type=url],input[type=tel],input[type=number],input[type=password]') || e.isContentEditable)
     && !e.readOnly && !ancestors(e).some(p=>p.getAttribute('aria-readonly')==='true') && !isDisabled;
@@ -100,6 +116,19 @@
     return result;
   };
   const clickable = e => points(e).find(p => receives(e, p.x, p.y));
+  const scrollable = (e, axis) => {
+    const horizontal=axis==='x';
+    if(!(horizontal?e.scrollWidth>e.clientWidth+1:e.scrollHeight>e.clientHeight+1))return false;
+    const style=getComputedStyle(e);
+    return e===document.scrollingElement || /auto|scroll|overlay/.test(horizontal?style.overflowX:style.overflowY);
+  };
+  const wheelPoint = (e, axis) => points(e).find(p=>{
+    const hit=hitAt(p.x,p.y);
+    if(!contains(e,hit))return false;
+    // A descendant button can receive a wheel; a nested scrolling pane must not steal it.
+    for(let node=hit;node && node!==e;node=parent(node))if(scrollable(node,axis))return false;
+    return true;
+  });
   const rect = e => { const r = e.getBoundingClientRect(); return {x:r.x,y:r.y,width:r.width,height:r.height}; };
   const sameRect = (a,b) => a && b && ['x','y','width','height'].every(k => Math.abs(a[k]-b[k]) < .5);
   const stamp = () => JSON.stringify([location.href,innerWidth,innerHeight,scrollX,scrollY,visualViewport?.scale,visualViewport?.offsetLeft,visualViewport?.offsetTop]);
@@ -114,7 +143,7 @@
     return entry;
   };
   const api = {
-    apiVersion: 12,
+    apiVersion: 19,
     stamp,
     inputState(ref) {
       const e = active();
@@ -169,7 +198,7 @@
       for (const root of allRoots) {
         for (const e of root.querySelectorAll(selector)) { if (!seen.has(e)) {seen.add(e);candidates.push(e);} }
         // ponytail: O(n) geometry/visibility scan, at most 4000 visible custom nodes; huge DOMs need a spatial index.
-        for (const e of root.querySelectorAll('div,span,li,td,th')) {
+        for (const e of root.querySelectorAll('*')) {
           if (e.matches(controlSelector)) continue;
           const r=e.getBoundingClientRect();
           if (!(r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth)) continue;
@@ -184,8 +213,8 @@
             if (!seen.has(e)) {seen.add(e);candidates.push(e);} pointerTargets.add(e);
           }
         }
-        for (const e of root.querySelectorAll('div,section,main,ul,ol,table,textarea')) {
-          if (e.scrollHeight > e.clientHeight+1 && /auto|scroll/.test(getComputedStyle(e).overflowY)) {
+        for (const e of root.querySelectorAll('*')) {
+          if (e!==document.scrollingElement && (scrollable(e,'y') || scrollable(e,'x'))) {
             containers.add(e); if (!seen.has(e)) {seen.add(e);candidates.push(e);}
           }
         }
@@ -220,17 +249,24 @@
         const header=e.closest('th,[role=columnheader]');
         const column=header&&table&&header.closest('table,[role=table],[role=grid],[role=treegrid]')===table ? {
           table:allRoots.flatMap(root=>Array.from(root.querySelectorAll('table,[role=table],[role=grid],[role=treegrid]'))).indexOf(table),
-          index:Array.from(table.querySelectorAll('th,[role=columnheader]')).indexOf(header),
+          index:Array.from(table.querySelectorAll('th,[role=columnheader]')).indexOf(header),name:compact(header.innerText,160),
           row:header.closest('tr')?.rowIndex??null,colSpan:header.colSpan||1,rowSpan:header.rowSpan||1,
           group:compact(header.getAttribute('aria-description')||header.getAttribute('title')||'',160)
         }:undefined;
+        const field=e.matches('input,textarea,select,[contenteditable=true]')&&e.type!=='password'?fieldContext(e):undefined;
         const item={ref,nodeId:`${documentId}:${identity(e)}`,role:e.getAttribute('role')||(checkable?e.type:e.tagName.toLowerCase()),tag:e.tagName.toLowerCase(),name,
           href:e.href||undefined,expanded:e.getAttribute('aria-expanded')??undefined,haspopup:e.getAttribute('aria-haspopup')??undefined,selected:e.getAttribute('aria-selected')??e.getAttribute('aria-checked')??(checkable?e.checked:undefined),
           column,sort:e.getAttribute('aria-sort')??undefined,columnKey:e.getAttribute('data-column-key')??e.getAttribute('data-field')??undefined,
           actionable:e.hasAttribute('onclick') || !!e.onclick || pointerTargets.has(e),
-          region,tabIndex:e.tabIndex,value:e.type==='password'?undefined:compact(e.value,100),disabled:isDisabled,editable:editable(e,isDisabled),
+          region,fieldContext:field,
+          dateValue:field?.match(/\[field [12]\/2\]$/) && /^(?:\d{4}-\d{2}-\d{2})?$/.test(e.value)?e.value:undefined,
+          password:e.type==='password',tabIndex:e.tabIndex,value:e.type==='password'?undefined:compact(e.value,100),disabled:isDisabled,editable:editable(e,isDisabled),
           inView,point:p,viewportRect:{x:r.x,y:r.y,width:r.width,height:r.height},documentRect:{x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height},
-          scroll:containers.has(e)?{top:e.scrollTop,height:e.scrollHeight,viewportHeight:e.clientHeight}:undefined,
+          scroll:containers.has(e)?{top:e.scrollTop,height:e.scrollHeight,viewportHeight:e.clientHeight,
+            left:e.scrollLeft,width:e.scrollWidth,viewportWidth:e.clientWidth,
+            minLeft:getComputedStyle(e).direction==='rtl'?Math.min(0,e.clientWidth-e.scrollWidth):0,
+            maxLeft:getComputedStyle(e).direction==='rtl'?0:Math.max(0,e.scrollWidth-e.clientWidth),
+            pointY:scrollable(e,'y')?wheelPoint(e,'y'):undefined,pointX:scrollable(e,'x')?wheelPoint(e,'x'):undefined}:undefined,
           blockedBy:blocker?compact(label(blocker)||blocker.outerHTML,180):undefined};
         if (e.tagName === 'CANVAS') {
           item.canvas={width:e.width,height:e.height,coordinateSpace:'CSS viewport, not backing-store pixels',content:'visual-only; DOM cannot enumerate drawn controls'};
@@ -240,6 +276,19 @@
         items.push(item);
       }
       const fullText=[document.body?.innerText||'',...allRoots.slice(1).map(root=>Array.from(root.children).filter(e=>!['STYLE','SCRIPT'].includes(e.tagName)).map(e=>e.innerText||'').join('\n'))].join('\n');
+      // ponytail: scan at most 20k text nodes / 12k visible characters; larger pages need scoped observation.
+      // Retain fullText for data extraction and completion checks.
+      const visibleLines=[];let visibleChars=0,scannedText=0;
+      for(const root of allRoots) {
+        const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);
+        for(let node; (node=walker.nextNode()) && scannedText++<20000 && visibleChars<12000;) {
+          const e=node.parentElement,text=compact(node.textContent,500);
+          if(!text || !e || e.closest('script,style,noscript') || e.checkVisibility?.({checkOpacity:true,checkVisibilityCSS:true})===false)continue;
+          const r=e.getBoundingClientRect();
+          if(r.bottom<=0 || r.top>=innerHeight || r.right<=0 || r.left>=innerWidth || !visible(e))continue;
+          visibleLines.push(text);visibleChars+=text.length;
+        }
+      }
       const headings=allRoots.flatMap(root=>Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6,[role=heading]')).map(e=>({level:e.getAttribute('aria-level')||e.tagName,text:compact(e.innerText,300)})));
       const declaredRows=allRoots.flatMap(root=>Array.from(root.querySelectorAll('[aria-rowcount],[aria-setsize]')).map(e=>({total:Number(e.getAttribute('aria-rowcount')||e.getAttribute('aria-setsize')),rendered:e.querySelectorAll('[role=row],[role=listitem]').length})));
       // Only explicit pagination totals are evidence; a label such as "Metrics 4" is not a row count.
@@ -281,35 +330,53 @@
           moreRows:totalRows===null||totalRows<dataRows.length?null:totalRows>dataRows.length,
           next:'日期、区域和表格排序字段/方向必须分别验证；图表 Metrics 不代表表格排序，同名列需核对列索引/分组。Top N 必须读取足够的数据行并核对筛选及排序；不足时读取 documentPath、inspect(query) 或翻页/滚动后观察。Metrics 等标签数字不是总条数。'};
       });
-      return {url:location.href,title:document.title,version,stamp:stamp(),text:fullText.slice(0,1000000),textLength:fullText.length,
+      const loading=document.readyState!=='complete'||visibleLines.some(text=>/^(?:loading|加载中)(?:\.{3}|…)?$/i.test(text))
+        ||allRoots.some(root=>Array.from(root.querySelectorAll('[aria-busy=true],[role=progressbar]')).some(visible));
+      return {url:location.href,title:document.title,readyState:document.readyState,loading,version,stamp:stamp(),text:fullText.slice(0,1000000),visibleText:visibleLines.join('\n'),textLength:fullText.length,
         tables,tableCount:tableNodes.length,tablesTruncated:tableNodes.length>tables.length,paginationTotals,
         items,totalItems:total,customTargetsTruncated,headings:headings.slice(0,1000),canvases:canvases.slice(0,100),visualSuggested:visualArea>=innerWidth*innerHeight*.15,focus:api.inputState(),
         truncated:customTargetsTruncated||total>items.length||fullText.length>1000000||headings.length>1000||canvases.length>100,
         coverage:{lazyImages:allRoots.reduce((n,root)=>n+Array.from(root.querySelectorAll('img[loading=lazy]')).filter(e=>!e.complete||!e.naturalWidth).length,0),scope:scope==='viewport'?'viewport DOM only; use scope=all for offscreen targets':'loaded DOM including offscreen, open shadow roots and scroll containers',declaredRows,canvasCount:canvases.length,note:'Canvas/WebGL controls are pixels, not DOM targets. Use the imageId and image-pixel coordinates in the returned visual observation. Virtualized/unloaded content requires observation after scrolling.'},
         documentSize:{width:Math.max(document.documentElement.scrollWidth,document.body?.scrollWidth||0),height:Math.max(document.documentElement.scrollHeight,document.body?.scrollHeight||0)},
-        viewport:{width:innerWidth,height:innerHeight,scrollX,scrollY,devicePixelRatio,scale:visualViewport?.scale||1},
+        viewport:{width:innerWidth,height:innerHeight,scrollX,scrollY,minScrollX:getComputedStyle(document.scrollingElement).direction==='rtl'?Math.min(0,innerWidth-document.scrollingElement.scrollWidth):0,devicePixelRatio,scale:visualViewport?.scale||1},
         timingsMs:{observe:performance.now()-started},scannedRoots:allRoots.length};
     },
     async prepare(ref, mode='click') {
-      const entry=entryFor(ref),e=entry.e,started=performance.now();
+      const wheel=mode==='scroll_x'||mode==='scroll_y';
+      const e=ref?entryFor(ref).e:wheel?document.scrollingElement:null,started=performance.now();
+      if(!e)throw Error('缺少目标引用');
       if (mode==='fill' && !editable(e)) throw Error('目标不是可填写字段或只读');
       let previous,stableFrames=0,scrolled=false,reason='目标正在移动';
       do {
-        entryFor(ref);
+        if(ref)entryFor(ref);
         if (disabled(e)) reason='目标不可用';
         else {
-          const p=clickable(e),r=rect(e);
+          const p=wheel?wheelPoint(e,mode==='scroll_x'?'x':'y'):clickable(e),r=rect(e);
           const moving=ancestors(e).some(node=>node.getAnimations?.().some(animation=>
             (animation.pending || animation.playState==='running') && animation.effect?.getKeyframes?.().some(frame=>
               Object.keys(frame).some(key=>/^(transform|translate|rotate|scale|left|right|top|bottom|width|height|offsetPath|fontSize|margin.*|padding.*)$/.test(key)))));
           stableFrames=p && !moving && sameRect(previous,r) ? stableFrames+1 : 0;
-          if (stableFrames>=2) return {...p,localX:p.x,localY:p.y,rect:r,editable:editable(e),password:e.type==='password',canvas:e.tagName==='CANVAS'};
-          if (!p && !scrolled) {e.scrollIntoView({block:'nearest',inline:'nearest',behavior:'instant'});scrolled=true;previous=undefined;}
+          if (stableFrames>=2) return {...p,localX:p.x,localY:p.y,rect:r,editable:editable(e),password:e.type==='password',canvas:e.tagName==='CANVAS',scroll:wheel?{left:e.scrollLeft,top:e.scrollTop}:undefined};
+          if (!p && !scrolled && !wheel) {e.scrollIntoView({block:'nearest',inline:'nearest',behavior:'instant'});scrolled=true;previous=undefined;}
           else {previous=r;reason=p?'目标正在移动':'目标被遮挡或在视口之外';}
         }
         await tick();
       } while (performance.now()-started<1200);
       throw Error(reason+'；有界等待后仍不可安全操作，请重新观察');
+    },
+    async scrollFeedback(ref, before) {
+      const e=ref?entries.get(ref)?.e:document.scrollingElement;
+      if(!e?.isConnected)return {changed:null,reason:'scroll container replaced'};
+      const started=performance.now();let last,quiet=0;
+      do {
+        await tick();
+        const now={left:e.scrollLeft,top:e.scrollTop};
+        const changed=now.left!==before.left || now.top!==before.top;
+        quiet=changed && last?.left===now.left && last?.top===now.top?quiet+1:0;
+        if(quiet>=2)return {...now,changed};
+        last=now;
+      } while(performance.now()-started<600);
+      return {...last,changed:last.left!==before.left || last.top!==before.top};
     },
     verifyPoint(ref,x,y,expectedRect,mode='click') {
       const e=entryFor(ref).e;

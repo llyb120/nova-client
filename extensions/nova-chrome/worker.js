@@ -41,7 +41,7 @@ async function detach(tabId) {
   if (attached.delete(tabId)) await chrome.debugger.detach({tabId}).catch(()=>{});
 }
 async function debuggerCall(command, invoke) {
-  const remaining = Math.min(3000, command.expiresAt - Date.now());
+  const remaining = Math.min(10000, command.expiresAt - Date.now());
   if (!(remaining > 0)) throw Error('命令已过期，未执行');
   let timer;
   try {

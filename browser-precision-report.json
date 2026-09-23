@@ -1,0 +1,210 @@
+{
+  "cases": [
+    {
+      "name": "trusted wheel reaches nested button-filled panes on both axes and RTL",
+      "passed": true,
+      "ms": 421.8
+    },
+    {
+      "name": "SPA loading text keeps delegation alive until navigation renders",
+      "passed": true,
+      "ms": 10.5
+    },
+    {
+      "name": "framework date presets use clickable anchors without href",
+      "passed": true,
+      "ms": 23.2
+    },
+    {
+      "name": "anonymous fields carry local context without merging adjacent inputs",
+      "passed": true,
+      "ms": 14.1
+    },
+    {
+      "name": "date ranges retain Week versus Release Date context and endpoint identity",
+      "passed": true,
+      "ms": 10.4
+    },
+    {
+      "name": "custom menus and duplicate sortable columns retain independent evidence",
+      "passed": true,
+      "ms": 10
+    },
+    {
+      "name": "DOM hint identities survive observations but not node replacement",
+      "passed": true,
+      "ms": 6.9
+    },
+    {
+      "name": "hidden and offscreen bulk DOM cannot exhaust visible custom menu hints",
+      "passed": true,
+      "ms": 186.7
+    },
+    {
+      "name": "control hints exclude inherited pointer labels and semantic wrappers",
+      "passed": true,
+      "ms": 11
+    },
+    {
+      "name": "nested menus retain leaf choices instead of hinting their whole group",
+      "passed": true,
+      "ms": 5.4
+    },
+    {
+      "name": "clickable children of duplicate headers retain their owning column",
+      "passed": true,
+      "ms": 6.3
+    },
+    {
+      "name": "Top 5 survives Metrics 4, offscreen rows and explicit pagination totals",
+      "passed": true,
+      "ms": 15.3
+    },
+    {
+      "name": "table previews exclude nested rows and do not assign ambiguous page totals",
+      "passed": true,
+      "ms": 18.9
+    },
+    {
+      "name": "native and ARIA checkboxes expose role and current selection",
+      "passed": true,
+      "ms": 49.9
+    },
+    {
+      "name": "accessible labels: aria-labelledby, multi-label fields, shadow roots",
+      "passed": true,
+      "ms": 116.7
+    },
+    {
+      "name": "virtualized recycled node cannot change row identity unnoticed",
+      "passed": true,
+      "ms": 20.6
+    },
+    {
+      "name": "detached / replaced same-name node is never silently retargeted",
+      "passed": true,
+      "ms": 5
+    },
+    {
+      "name": "fieldset disabled, inherited aria-disabled and readonly are refused",
+      "passed": true,
+      "ms": 6.3
+    },
+    {
+      "name": "partial occlusion chooses an exposed point; complete occlusion refuses",
+      "passed": true,
+      "ms": 1264.7
+    },
+    {
+      "name": "moving controls wait for geometry stability, without a fixed 600ms sleep",
+      "passed": true,
+      "ms": 318
+    },
+    {
+      "name": "hover replacement / overlay is rechecked before mouse down",
+      "passed": true,
+      "ms": 50
+    },
+    {
+      "name": "coordinate dropdown hover permits highlighting but refuses replacement, movement and overlays",
+      "passed": true,
+      "ms": 247.9
+    },
+    {
+      "name": "fill focus checks catch application redirection, including shadow inputs",
+      "passed": true,
+      "ms": 56.4
+    },
+    {
+      "name": "offscreen nested scroll target is reached without clicking its previous location",
+      "passed": true,
+      "ms": 80.6
+    },
+    {
+      "name": "Canvas metadata, scaled display and trusted pixel-coordinate pointer events",
+      "passed": true,
+      "ms": 65.6
+    },
+    {
+      "name": "isolated reference store survives page tampering; reinjection is idempotent",
+      "passed": true,
+      "ms": 33.2
+    },
+    {
+      "name": "readonly inheritance and exact post-fill value verification",
+      "passed": true,
+      "ms": 51.5
+    },
+    {
+      "name": "viewport fast path explicitly excludes offscreen references",
+      "passed": true,
+      "ms": 18
+    },
+    {
+      "name": "stale screenshot viewport refuses after scrolling",
+      "passed": true,
+      "ms": 7.3
+    },
+    {
+      "name": "production iframe transform mapping handles scale and refuses overlay / rotation",
+      "passed": true,
+      "ms": 61.1
+    },
+    {
+      "name": "Canvas crop offsets, multiple output scales and drag/wheel stay in CSS coordinates",
+      "passed": true,
+      "ms": 346.5
+    },
+    {
+      "name": "a form status update does not invalidate another identified field",
+      "passed": true,
+      "ms": 38.6
+    },
+    {
+      "name": "semantic cache invalidates synchronously for label / row mutations",
+      "passed": true,
+      "ms": 38.7
+    },
+    {
+      "name": "WebGL Canvas remains observable without reading its drawing implementation",
+      "passed": true,
+      "ms": 110.8
+    }
+  ],
+  "benchmarks": {
+    "after": {
+      "scope": "all",
+      "itemCount": 2000,
+      "coldMs": 110.80000001192093,
+      "medianMs": 48.29999998211861,
+      "samplesMs": [
+        44.400000005960464,
+        44.5,
+        46.900000005960464,
+        48.29999998211861,
+        48.400000005960464,
+        48.400000005960464,
+        53.29999998211861
+      ]
+    },
+    "viewport": {
+      "scope": "viewport",
+      "itemCount": 24,
+      "coldMs": 33.5,
+      "medianMs": 27.099999994039536,
+      "samplesMs": [
+        24.400000005960464,
+        24.80000001192093,
+        26.5,
+        27.099999994039536,
+        29.599999994039536,
+        30.599999994039536,
+        33
+      ]
+    }
+  },
+  "node": "v24.19.0",
+  "engineSha256": "6fea827ccf8ed4a2c9b6a01f5e1e5ba8d8109f4ca5c9fd3f75e45498804ef02b",
+  "scope": "Production page script and iframe mapping in real Chromium/CDP; not the compiled Rust/Tauri dispatch path.",
+  "browser": "153.0.4234.48"
+}

@@ -55,7 +55,7 @@ test('a stuck debugger command times out, polling resumes and late results are n
     return {ok:true,json:async()=>({command})};
   }};
   const source=await readFile(new URL('./worker.js',import.meta.url),'utf8');
-  runInNewContext(source+'\nglobalThis.api={inventory};',scope);
+  runInNewContext(source+'\nglobalThis.api={inventory,debuggerCall};',scope);
   for(let i=0;i<100 && replies.length<2;i++)await new Promise(resolve=>setTimeout(resolve,5));
   assert.equal(replies.length,2,'a hung debugger must not stop polling or block the shared queue');
   assert.match(replies[0].error,/响应超时.*不要重放/);
@@ -64,6 +64,11 @@ test('a stuck debugger command times out, polling resumes and late results are n
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(calls,1);
   assert.equal(replies.length,2,'late completion cannot send another reply');
+  let slowCalls=0;
+  assert.equal(await scope.api.debuggerCall({expiresAt:Date.now()+10000},async()=>{
+    slowCalls++;await new Promise(resolve=>setTimeout(resolve,3100));return 'ready';
+  }),'ready');
+  assert.equal(slowCalls,1,'a busy renderer reply must not require resending');
 });
 
 test('stable tags, default access, auto-attached frames, expiry and worker restart',async()=>{

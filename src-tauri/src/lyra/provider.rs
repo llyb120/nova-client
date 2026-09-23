@@ -550,8 +550,8 @@ fn responses_body(
 
 // PI/OpenAI SDK 的请求可由 AbortSignal 打断；Lyra 使用 reqwest 时必须显式把取消和
 // deadline 并入网络 future，否则代理接受连接后不发响应头/SSE 时会永久挂起。
-const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = crate::lyra::watchdog::IDLE_TIMEOUT;
+const SSE_IDLE_TIMEOUT: std::time::Duration = crate::lyra::watchdog::IDLE_TIMEOUT;
 const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 async fn wait_cancelled(cancel: &Arc<AtomicBool>) {
