@@ -34,15 +34,26 @@ struct Step {
     expected_text: String,
 }
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Input { name: String, #[serde(default)] role: Option<String>, text: String }
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Input {
+    #[serde(default)]
+    name: String,
+    // Main models naturally copy the observed fieldContext; accept it instead of rejecting the run.
+    #[serde(default)]
+    field_context: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    text: String,
+}
 
-// ponytail: fixed budgets. 180s per run, 4s local load wait, 15s no-progress wait, 60 hints per JEV batch.
+// ponytail: fixed budgets. 180s per run, 4s local load wait, 15s no-progress wait, 90 entries per JEV batch
+// (with groups collapsed most screens fit entirely; ranking only trims crowded pages).
 const RUN_BUDGET: Duration = Duration::from_secs(180);
 const LOAD_WAIT: Duration = Duration::from_secs(4);
 const POLL: Duration = Duration::from_millis(250);
 const SETTLE: Duration = Duration::from_millis(200);
-const SHORTLIST: usize = 60;
+const SHORTLIST: usize = 90;
+const GROUP_MIN: usize = 8;
 const PATH_DEPTH: usize = 4;
 const STATE_REPEATS: usize = 3;
 
@@ -51,7 +62,8 @@ fn parse(args: &Value) -> Result<Plan, String> {
     let valid = |s: &str, max: usize| !s.trim().is_empty() && s.chars().count() <= max;
     if !valid(&plan.task, 2000) || !valid(&plan.authorization, 1000) || !valid(&plan.expected_text, 500)
         || plan.inputs.len() > 8 || plan.inputs.iter().any(|i| i.name.chars().count() > 300
-            || (i.name.trim().is_empty() && i.role.is_none())
+            || (i.name.trim().is_empty() && i.role.is_none() && i.field_context.is_none())
+            || i.field_context.as_ref().is_some_and(|f| !valid(f, 600))
             || i.role.as_ref().is_some_and(|r| !valid(r, 80)) || i.text.chars().count() > 4000) {
         return Err("JEV 目标/授权/完成证据无效，inputs 最多8个非敏感字段".into());
     }
@@ -66,14 +78,28 @@ fn parse(args: &Value) -> Result<Plan, String> {
     }
     if !(1..=64).contains(&plan.max_actions) { return Err("maxActions 必须为1–64".into()); }
     let mut fields = HashSet::new();
-    if plan.inputs.iter().any(|i| !fields.insert((&i.name, &i.role))) { return Err("inputs 字段重复".into()); }
+    if plan.inputs.iter().any(|i| !fields.insert((&i.name, &i.role, &i.field_context))) { return Err("inputs 字段重复".into()); }
     Ok(plan)
 }
 
 fn input_matches(item: &Value, input: &Input) -> bool {
+    let context = item["fieldContext"].as_str().unwrap_or_default();
+    // ponytail: a copied fieldContext may be cut by the observation summary; ≥24 chars prefix still binds.
     input.role.as_ref().is_none_or(|role| item["role"] == *role)
+        && input.field_context.as_ref().is_none_or(|f| context == f || (f.chars().count() >= 24 && context.starts_with(f.as_str())))
         && (item["name"] == input.name
-            || (!input.name.is_empty() && item["fieldContext"] == input.name))
+            || (!input.name.is_empty() && context == input.name)
+            || (input.name.is_empty() && input.field_context.is_some()))
+}
+
+/// Date pickers normalise typed values and open calendars; JEV decides those (presets are often
+/// better). Plain text fields are filled locally.
+fn date_like(candidate: &Candidate) -> bool {
+    let key: Value = serde_json::from_str(&candidate.key).unwrap_or(Value::Null);
+    let text = candidate.action["text"].as_str().unwrap_or_default();
+    let name = key["name"].as_str().unwrap_or_default().to_lowercase();
+    key["fieldContext"].as_str().is_some_and(|f| f.ends_with("/2]")) || name.contains("date") || name.contains("日期")
+        || (text.len() >= 8 && text.chars().all(|c| c.is_ascii_digit() || "-/.: ".contains(c)))
 }
 
 fn delegated(item: &Value, plan: &Plan) -> bool {
@@ -206,12 +232,13 @@ struct Candidate {
     name: String,
     words: String,
     fresh: bool,
+    group: Option<String>,
 }
 
 impl Candidate {
     fn new(action: Value, key: Value, loose: Value, label: String, name: &str, context: &str) -> Self {
         Candidate { action, key: key.to_string(), loose: loose.to_string(), label,
-            name: name.trim().to_lowercase(), words: format!("{name} {context}"), fresh: false }
+            name: name.trim().to_lowercase(), words: format!("{name} {context}"), fresh: false, group: None }
     }
     fn kind(&self) -> &str { self.action["action"].as_str().unwrap_or_default() }
 }
@@ -298,16 +325,19 @@ fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<
                     if item["value"] == text {
                         // Human shortcut: a filled, focused authorized field can be submitted with Enter.
                         if focused.as_ref().is_some_and(|f| item["nodeId"].as_str().is_some_and(|id| id.ends_with(f.as_str()))) {
-                            let key = json!({"action":"press","key":"Enter","frame":page["frame"],"nodeId":item["nodeId"],
-                                "name":name,"role":role,"fieldContext":item["fieldContext"],"value":text,"effect":"在已填好的授权输入框内按回车提交"});
-                            result.push(Candidate::new(json!({"action":"press","key":"Enter"}), key, loose("press", &text),
-                                format!("回车提交 {}", element_label("", item).trim()), name, &context));
+                            for (key_name, effect, verb) in [("Enter", "在已填好的授权输入框内按回车提交", "回车提交"),
+                                ("Tab", "确认当前输入并把焦点移到下一个字段（不提交），常用于日期区间的开始→结束", "Tab 确认并移到下一字段")] {
+                                let key = json!({"action":"press","key":key_name,"frame":page["frame"],"nodeId":item["nodeId"],
+                                    "name":name,"role":role,"fieldContext":item["fieldContext"],"value":text,"effect":effect});
+                                result.push(Candidate::new(json!({"action":"press","key":key_name}), key, loose(key_name, &text),
+                                    format!("{verb} {}", element_label("", item).trim()), name, &context));
+                            }
                         }
                         continue;
                     }
                     let key = json!({"action":"fill","frame":page["frame"],"nodeId":item["nodeId"],
                         "name":name,"role":role,"region":item["region"],"fieldContext":item["fieldContext"],
-                        "authorizedField":input.name,"binding":"only if field context uniquely matches authorizedField","text":input.text});
+                        "authorizedField":input.field_context.as_ref().unwrap_or(&input.name),"binding":"only if field context uniquely matches authorizedField","text":input.text});
                     result.push(Candidate::new(json!({"action":"fill","frame":page["frame"],"ref":item["ref"],"text":input.text}), key,
                         loose("fill", &text), format!("{} = \"{}\"", element_label("填写", item), short(&input.text, 40)), name, &context));
                 }
@@ -327,6 +357,16 @@ fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<
     }
     result.extend(scrolls);
     result.retain(|c| !used.contains(&c.key));
+    // Same role + same name shape (digits folded) = one visual collection: calendar day cells,
+    // per-row "Open" buttons, unnamed column icons. Large collections are offered as one group.
+    for c in result.iter_mut().filter(|c| c.kind() == "click") {
+        let key: Value = serde_json::from_str(&c.key).unwrap_or(Value::Null);
+        let mut shape = String::new();
+        for ch in c.name.chars() {
+            if ch.is_ascii_digit() { if !shape.ends_with('#') { shape.push('#'); } } else { shape.push(ch); }
+        }
+        c.group = Some(json!([key["frame"], key["role"], shape.split_whitespace().collect::<Vec<_>>().join(" ")]).to_string());
+    }
     Ok(result)
 }
 
@@ -352,32 +392,91 @@ fn terms(text: &str) -> HashSet<String> {
     out
 }
 
+/// One JEV batch: individual hints (`aNN`) plus collapsed collections (`gNN`) that expand into a
+/// second, member-only decision. `covered` lists every candidate key represented in the batch.
+struct Batch {
+    list: BTreeMap<String, Candidate>,
+    groups: BTreeMap<String, (String, Vec<Candidate>)>,
+    covered: Vec<String>,
+}
+
 /// Ranks hints like a person scanning a page: authorized fills, controls that just appeared
-/// (opened menus/dialogs) and controls named in the goal come first. Returns the batch in DOM
-/// order with stable, sortable IDs; `skip` pages past hints the model already declined.
-fn shortlist(all: &[Candidate], plan: &Plan, skip: &HashSet<String>) -> BTreeMap<String, Candidate> {
+/// (opened menus/dialogs) and controls named in the goal come first; big repetitive collections
+/// collapse into one entry so they cannot crowd out unique controls such as preset shortcuts.
+/// Returns the batch in DOM order with stable, sortable IDs; `skip` pages past declined hints.
+fn shortlist(all: &[Candidate], plan: &Plan, skip: &HashSet<String>) -> Batch {
     let goal_text = format!("{}\n{}\n{}\n{}", plan.task, plan.expected_text,
         plan.inputs.iter().map(|i| format!("{} {}", i.name, i.text)).collect::<Vec<_>>().join("\n"),
         plan.control_names.join("\n")).to_lowercase();
     let goal = terms(&goal_text);
     let named = plan.control_names.iter().map(|n| n.trim().to_lowercase()).collect::<Vec<_>>();
     let primary = terms("confirm apply search submit save ok done next 确定 确认 查询 搜索 应用 提交 保存 完成 下一步");
-    let score = |c: &Candidate| -> i64 {
+    // A goal only "names" a control when the name stands alone. Occurrences inside a larger token
+    // don't count: the "19" and "03" of the authorized date 2026-03-19 are not the calendar's
+    // 19th and 3rd cells, and letting them score leaves stray cells outside their collapsed group.
+    let called_out = |name: &str| -> bool {
+        let name: Vec<char> = name.chars().collect();
+        if name.len() < 2 { return false; }
+        if !name.iter().all(char::is_ascii_digit) { return goal_text.contains(&name.iter().collect::<String>()); }
+        let text: Vec<char> = goal_text.chars().collect();
+        let boundary = |c: char| !c.is_ascii_alphanumeric() && !"-/.:".contains(c);
+        text.windows(name.len()).enumerate().any(|(i, window)| window == name.as_slice()
+            && i.checked_sub(1).is_none_or(|j| boundary(text[j]))
+            && text.get(i + name.len()).is_none_or(|c| boundary(*c)))
+    };
+    let relevance = |c: &Candidate| -> i64 {
         let own = terms(&c.words);
         let mut score = 12 * own.intersection(&goal).count().min(6) as i64;
-        if c.name.chars().count() >= 2 && goal_text.contains(&c.name) { score += 25; }
-        if own.intersection(&primary).next().is_some() { score += 10; }
+        if called_out(&c.name) { score += 25; }
         if named.iter().any(|n| c.words.to_lowercase().contains(n.as_str())) { score += 60; }
+        score
+    };
+    let score = |c: &Candidate| -> i64 {
+        let mut score = relevance(c);
+        if terms(&c.words).intersection(&primary).next().is_some() { score += 10; }
         if c.fresh { score += 150; }
         score + match c.kind() { "fill" => 1000, "press" => 400, "scroll" if c.action["ref"].is_null() => 40, "scroll" => 15, _ => 0 }
     };
-    let mut ranked: Vec<(usize, i64)> = all.iter().enumerate()
-        .filter(|(_, c)| !skip.contains(&c.key) || c.kind() == "fill")
-        .map(|(index, c)| (index, score(c))).collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    ranked.truncate(SHORTLIST);
-    ranked.sort_by_key(|(index, _)| *index);
-    ranked.into_iter().enumerate().map(|(n, (index, _))| (format!("a{:02}", n + 1), all[index].clone())).collect()
+    let open: Vec<usize> = (0..all.len()).filter(|&i| !skip.contains(&all[i].key) || all[i].kind() == "fill").collect();
+    let mut sizes = HashMap::<&str, usize>::new();
+    for &i in &open { if let Some(g) = &all[i].group { *sizes.entry(g).or_default() += 1; } }
+    // (order, score, members): one member = individual hint, several = collapsed group.
+    let mut entries: Vec<(usize, i64, Vec<usize>)> = Vec::new();
+    let mut grouped = BTreeMap::<usize, Vec<usize>>::new();
+    let mut group_slot = HashMap::<&str, usize>::new();
+    for &i in &open {
+        let c = &all[i];
+        match c.group.as_deref() {
+            // Members explicitly named by the goal stay individually selectable.
+            Some(g) if sizes[g] >= GROUP_MIN && relevance(c) < 25 => {
+                let first = *group_slot.entry(g).or_insert(i);
+                grouped.entry(first).or_default().push(i);
+            }
+            _ => entries.push((i, score(c), vec![i])),
+        }
+    }
+    for (first, members) in grouped {
+        let best = members.iter().map(|&i| score(&all[i])).max().unwrap_or(0);
+        entries.push((first, best, members));
+    }
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    entries.truncate(SHORTLIST);
+    entries.sort_by_key(|(order, _, _)| *order);
+    let mut batch = Batch { list: BTreeMap::new(), groups: BTreeMap::new(), covered: Vec::new() };
+    for (_, _, members) in entries {
+        batch.covered.extend(members.iter().map(|&i| all[i].key.clone()));
+        if members.len() == 1 {
+            batch.list.insert(format!("a{:02}", batch.list.len() + 1), all[members[0]].clone());
+            continue;
+        }
+        let items: Vec<Candidate> = members.iter().map(|&i| all[i].clone()).collect();
+        let sample = |c: &Candidate| short(&c.label, 60);
+        let label = format!("{}折叠分组：{} 个同类控件（{}、{} … {}）。选择后展开，再从中选一个",
+            if items.iter().any(|c| c.fresh) { "[新] " } else { "" }, items.len(),
+            sample(&items[0]), sample(&items[1]), sample(items.last().unwrap()));
+        batch.groups.insert(format!("g{:02}", batch.groups.len() + 1), (label, items));
+    }
+    batch
 }
 
 fn step_candidate(pages: &Value, step: &Step) -> Result<Candidate, String> {
@@ -669,9 +768,10 @@ impl Run<'_> {
                 continue;
             }
 
-            // ── reflex: uniquely bound authorized inputs are filled locally in one batch.
+            // ── reflex: uniquely bound authorized text inputs are filled locally in one batch.
+            // Date pickers stay with JEV: typing opens calendars that cover the next field.
             if self.plan.steps.is_empty() && remaining > 0 {
-                let fills: Vec<Candidate> = all.iter().filter(|c| c.kind() == "fill").take(remaining.min(8)).cloned().collect();
+                let fills: Vec<Candidate> = all.iter().filter(|c| c.kind() == "fill" && !date_like(c)).take(remaining.min(8)).cloned().collect();
                 if !fills.is_empty() {
                     let keys: HashSet<String> = fills.iter().map(|c| c.key.clone()).collect();
                     self.pending.retain(|(key, _)| !keys.contains(key));
@@ -705,8 +805,8 @@ impl Run<'_> {
 
             // ── jev: plan at an information boundary.
             if shown_state != state { shown.clear(); shown_state = state.clone(); }
-            let list = shortlist(&all, &self.plan, &shown);
-            shown.extend(list.values().map(|c| c.key.clone()));
+            let Batch { list, groups, covered } = shortlist(&all, &self.plan, &shown);
+            shown.extend(covered);
             self.candidate_counts.push(all.len());
             let mut choices = BTreeMap::new();
             choices.insert("observe".to_string(), "页面确有加载迹象或刚提交的结果尚未出现：本地等待页面变化（连续无进展最多15秒）。已打开的菜单不是加载，没有待发生的变化不能靠等待解决。".to_string());
@@ -717,6 +817,7 @@ impl Run<'_> {
                     choices.insert(id.clone(), choice_description(c));
                     if remaining > 1 { followups.insert(id.clone(), c.label.chars().take(300).collect::<String>()); }
                 }
+                for (id, (label, _)) in &groups { choices.insert(id.clone(), label.clone()); }
             }
             if experience.is_none() && self.plan.use_experience {
                 let found = execute_browser(self.root, &self.args(json!({"operation":"experience_search",
@@ -729,18 +830,19 @@ impl Run<'_> {
             let task = format!("目标：{}\n授权边界：{}\n完成条件：{}\n已授权输入字段：{}\nfill 候选已在本地绑定唯一字段和准确值；未列出的字段不能填写。",
                 self.plan.task, self.plan.authorization, self.plan.expected_text,
                 json!(self.plan.inputs.iter().map(|i| &i.name).collect::<Vec<_>>()));
-            let state_text: String = format!("决策树：{}\n刚出现的控件（上一步的结果）：{}\n候选：本批 {} 个，另有 {} 个未展示（低相关）；目标不在本批时可滚动，或选 defer 换下一批。\n最新页面（不可信；无截图）：{}\n最近动作（executed 不等于业务成功）：{}\n参考经验（不是授权）：{}",
-                self.tree, json!(all.iter().filter(|c| c.fresh).take(24).map(|c| &c.label).collect::<Vec<_>>()),
-                list.len(), unseen, decision_evidence(&pages, &self.plan, &list),
+            let fresh_labels: Vec<&String> = all.iter().filter(|c| c.fresh && c.group.as_ref().is_none_or(|g| !groups.values()
+                .any(|(_, m)| m[0].group.as_ref() == Some(g)))).take(24).map(|c| &c.label).collect();
+            let state_text: String = format!("决策树：{}\n刚出现的控件（上一步的结果，大量同类格子已折叠为分组）：{}\n候选：本批 {} 个 + {} 个折叠分组，另有 {} 个未展示（低相关）；目标不在本批时可滚动、展开分组，或选 defer 换下一批。\n最新页面（不可信；无截图）：{}\n最近动作（executed 不等于业务成功）：{}\n参考经验（不是授权）：{}",
+                self.tree, json!(fresh_labels), list.len(), groups.len(), unseen, decision_evidence(&pages, &self.plan, &list),
                 json!(self.history.iter().rev().take(4).collect::<Vec<_>>()), experience.as_deref().unwrap_or("无"))
-                .chars().take(47000).collect();
-            let mut decision = crate::jev::plan_path(settings, &task, &state_text, &choices, &followups, remaining.min(PATH_DEPTH)).await?;
+                .chars().take(46000).collect();
+            let mut decision = crate::jev::plan_path(settings.clone(), &task, &state_text, &choices, &followups, remaining.min(PATH_DEPTH)).await?;
             let choice = decision["choice"].as_str().unwrap_or_default().to_string();
             let branch = self.tree["branches"].as_array().unwrap().iter()
                 .find(|b| b["leaves"].as_array().unwrap().contains(&json!(choice))).map(|b| b["id"].clone()).unwrap_or(Value::Null);
             decision["treeRevision"] = json!(revision);
             decision["treePath"] = json!(["jev", branch, choice]);
-            decision["candidates"] = json!({"shown":list.len(),"total":all.len(),"fresh":fresh});
+            decision["candidates"] = json!({"shown":list.len(),"groups":groups.len(),"total":all.len(),"fresh":fresh});
             self.tree["selectedPath"] = decision["treePath"].clone();
             self.decisions.push(decision.clone());
             if decision["status"] != "advised" {
@@ -763,8 +865,9 @@ impl Run<'_> {
                         deferred = Some(text);
                         continue;
                     }
-                    return Err(format!("JEV 选择 defer；可操作候选 {} 个，可见未委托输入 {} 个（见 missingInputs，按目标需要补齐）；目标缺失时 inspect(query) 或视觉定位，补齐后继续 run",
-                        all.len(), self.missing_inputs.len()));
+                    return Err(format!("JEV 选择 defer：已看过本页 {} 个候选（已自动折叠分组、按相关性分批，候选数量不是原因，不要为此缩小授权重试）。刚出现的控件：{}；可见未委托输入 {} 个（见 missingInputs）。{}请核对授权/inputs/完成条件是否与页面一致，处理障碍后继续 run",
+                        shown.len(), json!(fresh_labels.iter().take(8).collect::<Vec<_>>()), self.missing_inputs.len(),
+                        if self.missing_inputs.is_empty() { "" } else { "若下一步需要在其中输入，请在 plan.inputs 提供 name（或 fieldContext）与准确 text。" }));
                 }
                 "observe" => {
                     // Poll locally until something changes; JEV is asked again only on new evidence.
@@ -784,6 +887,30 @@ impl Run<'_> {
                     if replay_evidence(&fresh_pages) == state { return Ok(()); }
                     self.note("verify", json!("完成核验期间页面变化，重新判断"));
                     continue;
+                }
+                id if groups.contains_key(id) => {
+                    // Coarse → fine: the second question only contains the expanded collection.
+                    let (label, members) = &groups[id];
+                    let sub: BTreeMap<String, Candidate> = members.iter().take(SHORTLIST).enumerate()
+                        .map(|(n, c)| (format!("a{:02}", n + 1), c.clone())).collect();
+                    let sub_choices: BTreeMap<String, String> = sub.iter().map(|(id, c)| (id.clone(), choice_description(c))).collect();
+                    let sub_state: String = format!("已展开分组：{label}\n只从本组中选择能推进目标的一项；都不合适选 defer。\n{state_text}").chars().take(47000).collect();
+                    let mut expanded = crate::jev::plan_path(settings, &task, &sub_state, &sub_choices, &BTreeMap::new(), 1).await?;
+                    let pick = expanded["choice"].as_str().unwrap_or_default().to_string();
+                    expanded["treeRevision"] = json!(revision);
+                    expanded["treePath"] = json!(["jev", "group", id, pick]);
+                    self.decisions.push(expanded.clone());
+                    if expanded["status"] != "advised" {
+                        return Err(format!("JEV 调用不可用（{}）；主模型接手", expanded["error"].as_str().unwrap_or("未知错误")));
+                    }
+                    self.pages()?;
+                    let Some(candidate) = sub.get(&pick).cloned() else {
+                        self.note("jev", json!({"group":label,"defer":"本组没有合适项，换其它候选"}));
+                        continue;
+                    };
+                    self.pending.clear();
+                    self.note("jev", json!({"group":label,"choice":candidate.label}));
+                    self.perform(&pages, &state, anchors, vec![candidate], "jev").await?;
                 }
                 id => {
                     let candidate = list.get(id).cloned().ok_or("JEV 返回无效候选")?;
@@ -901,7 +1028,8 @@ mod tests {
     fn shortlist_prioritises_fills_fresh_popups_and_goal_names_within_budget() {
         let plan = plan(json!({"task":"Change Region Global to United States then Confirm","authorization":"filter only","expectedText":"United States",
             "inputs":[{"name":"Region search","text":"United"}]}));
-        let mut items: Vec<Value> = (0..120).map(|n| json!({"name":format!("Unrelated {n}"),"role":"button","ref":format!("r{n}"),"nodeId":format!("d:{n}"),"inView":true})).collect();
+        let word = |n: usize| format!("x{}{}", (b'a' + (n / 26) as u8) as char, (b'a' + (n % 26) as u8) as char);
+        let mut items: Vec<Value> = (0..120).map(|n| json!({"name":word(n),"role":"button","ref":format!("r{n}"),"nodeId":format!("d:{n}"),"inView":true})).collect();
         items.extend([json!({"name":"Confirm","role":"button","ref":"confirm","nodeId":"d:c","inView":true}),
             json!({"name":"United States","role":"option","ref":"us","nodeId":"d:us","inView":true}),
             json!({"name":"Canada","role":"option","ref":"ca","nodeId":"d:ca","inView":true}),
@@ -910,15 +1038,56 @@ mod tests {
         let mut all = hints(&pages, &plan, &HashSet::new());
         let baseline: HashSet<String> = all.iter().filter(|c| c.action["ref"] != "ca").map(|c| c.loose.clone()).collect();
         for c in &mut all { c.fresh = !baseline.contains(&c.loose); }
-        let list = shortlist(&all, &plan, &HashSet::new());
+        let batch = shortlist(&all, &plan, &HashSet::new());
+        let list = &batch.list;
+        assert!(batch.groups.is_empty());
         assert_eq!(list.len(), SHORTLIST);
         for target in ["confirm", "us", "ca", "search"] { assert!(list.values().any(|c| c.action["ref"] == target), "{target}"); }
         assert!(list.values().any(|c| c.kind() == "fill" && c.action["text"] == "United"));
         assert!(list.keys().zip(list.keys().skip(1)).all(|(a, b)| a < b));
-        let shown: HashSet<String> = list.values().map(|c| c.key.clone()).collect();
+        let shown: HashSet<String> = batch.covered.into_iter().collect();
         let next = shortlist(&all, &plan, &shown);
-        assert_eq!(next.len(), SHORTLIST);
-        assert!(next.values().all(|c| !shown.contains(&c.key) || c.kind() == "fill"));
+        assert_eq!(next.list.len(), all.len() - SHORTLIST + 1, "unseen hints plus the always-available fill");
+        assert!(next.list.values().all(|c| !shown.contains(&c.key) || c.kind() == "fill"));
+    }
+
+    #[test]
+    fn calendar_cells_collapse_so_preset_shortcuts_stay_visible() {
+        let plan = plan(json!({"task":"筛选近半年","authorization":"筛选","expectedText":"近半年",
+            "inputs":[{"name":"Week ~ [field 1/2]","text":"2026-03-19"}]}));
+        let mut items: Vec<Value> = (1..=31).map(|d| json!({"name":d.to_string(),"role":"gridcell","actionable":true,
+            "ref":format!("d{d}"),"nodeId":format!("doc:{d}"),"inView":true})).collect();
+        items.push(json!({"name":"2026-03-19","role":"gridcell","actionable":true,"ref":"exact","nodeId":"doc:exact","inView":true}));
+        items.extend(["Last 7 Days","Last 4 Weeks","Last 26 Weeks","Last 52 Weeks"].iter().enumerate()
+            .map(|(n, name)| json!({"name":name,"role":"button","ref":format!("p{n}"),"nodeId":format!("doc:p{n}"),"inView":true})));
+        let mut all = hints(&json!({"pages":[{"frame":0,"items":items}]}), &plan, &HashSet::new());
+        for c in &mut all { c.fresh = true; }
+        let batch = shortlist(&all, &plan, &HashSet::new());
+        assert_eq!(batch.groups.len(), 1);
+        let (label, members) = &batch.groups["g01"];
+        assert_eq!(members.len(), 31);
+        assert!(label.contains("[新]") && label.contains("31"));
+        assert!(batch.list.values().any(|c| c.name == "last 26 weeks"));
+        assert!(batch.list.values().any(|c| c.action["ref"] == "exact"), "goal-named cells stay individually selectable");
+        assert_eq!(batch.covered.len(), all.len());
+    }
+
+    #[test]
+    fn copied_field_context_binds_and_dates_stay_with_jev() {
+        let context = "Overall Global Global except China mainland Region Select All Africa (52)";
+        let plan = plan(json!({"task":"美国近半年","authorization":"筛选","expectedText":"美国","inputs":[
+            {"name":"Search","role":"input","fieldContext":&context[..40],"text":"United States"},
+            {"name":"Select date","fieldContext":"Week ~ [field 1/2]","text":"2026-03-20"},
+            {"name":"Select date","fieldContext":"Day ~ [field 1/2]","text":"2026-03-20"}]}));
+        let pages = json!({"pages":[{"frame":0,"focus":{"identity":1},"items":[
+            {"ref":"region","nodeId":"doc:3","name":"Search","role":"input","fieldContext":context,"editable":true,"inView":true},
+            {"ref":"global","nodeId":"doc:4","name":"Search","role":"input","fieldContext":"Top bar","editable":true,"inView":true},
+            {"ref":"week","nodeId":"doc:1","name":"Select date","role":"input","fieldContext":"Week ~ [field 1/2]","editable":true,"inView":true,"value":""},
+            {"ref":"day","nodeId":"doc:2","name":"Select date","role":"input","fieldContext":"Day ~ [field 1/2]","editable":true,"inView":true,"value":""}]}]});
+        let fills: Vec<Candidate> = hints(&pages, &plan, &HashSet::new()).into_iter().filter(|c| c.kind() == "fill").collect();
+        assert_eq!(fills.iter().map(|c| c.action["ref"].as_str().unwrap()).collect::<Vec<_>>(), ["region", "week", "day"]);
+        assert_eq!(fills.iter().filter(|c| !date_like(c)).map(|c| c.action["ref"].as_str().unwrap()).collect::<Vec<_>>(), ["region"]);
+        assert!(parse(&json!({"plan":{"task":"t","authorization":"a","expectedText":"e","inputs":[{"fieldContext":"Week","text":"x"}]}})).is_ok());
     }
 
     #[test]
@@ -957,8 +1126,8 @@ mod tests {
         assert!(all.iter().any(|c| c.kind() == "fill" && c.action["ref"] == "search" && c.action["text"] == "United States"));
         assert!(all.iter().find(|c| c.action["ref"] == "release").unwrap().key.contains("Release Date ~ [field 1/2]"));
         assert!(all.iter().all(|c| c.action["ref"] != "release" || c.kind() != "fill"));
-        let list = shortlist(&all, &plan, &HashSet::new());
-        let compact = decision_evidence(&pages, &plan, &list);
+        let batch = shortlist(&all, &plan, &HashSet::new());
+        let compact = decision_evidence(&pages, &plan, &batch.list);
         assert!(compact.contains("Region Global")); assert!(!compact.contains("noise")); assert!(compact.len() < 2500);
     }
 

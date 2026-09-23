@@ -408,7 +408,7 @@
           "inputs": {
             "type": "array",
             "maxItems": 8,
-            "description": "准确的非敏感输入值；name必须原样复制唯一目标的DOM name或完整fieldContext。同名字段使用完整fieldContext区分；role可选且仅限制角色。无法匹配不会生成fill候选。",
+            "description": "准确的非敏感输入值；name必须原样复制唯一目标的DOM name或完整fieldContext。同名字段可在 fieldContext 属性中复制观察到的 fieldContext 区分；role可选且仅限制角色。无法匹配不会生成fill候选。",
             "items": {
               "type": "object",
               "additionalProperties": false,
@@ -418,6 +418,12 @@
                   "minLength": 0,
                   "maxLength": 300,
                   "description": "字段用途或名称；省略role时必须非空且足以唯一识别字段。精确绑定无名字段时允许空字符串。"
+                },
+                "fieldContext": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 600,
+                  "description": "可选：原样复制观察中目标输入框的 fieldContext（可为≥24字的开头部分），用于区分同名字段；与 name 同时提供时两者都需匹配。"
                 },
                 "role": {
                   "type": "string",
