@@ -1110,16 +1110,23 @@ pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Va
         }
         let decision = crate::jev::advise(settings, &advice_args).await?;
         if decision["status"] != "advised" || decision["choice"] != "continue"
-            || !decision["confidence"].as_f64().is_some_and(|c| c >= 0.9)
             || !crate::native_browser::jev_settings()?.jev_enabled {
-            return Ok(json!({"status":"not_executed","completedActions":0,"jevRun":{"status":"handoff","decision":decision}}));
+            return Ok(json!({"status":"not_executed","completedActions":0,"jevRun":{"status":"handoff",
+                "requestCount":usize::from(decision["requestAttempted"] == true),"executedActions":0,
+                "elapsedMs":decision["elapsedMs"],"verification":"unverified",
+                "reason":"JEV 未选择 continue、不可用或已关闭；主模型核对最新截图", "decision":decision}}));
         }
         let actions = args["actions"].as_array().filter(|a| !a.is_empty() && a.len() <= 16).ok_or("run 需1–16个已确认动作")?;
         let act = json!({"operation":"act","snapshotId":args["snapshotId"],"imageId":args["imageId"],
             "actions":actions,"feedback":"screenshot"});
         return tokio::task::spawn_blocking(move || {
             let mut result = run(owner, act)?;
-            result["jevRun"] = json!({"status":"handoff","decision":decision,"reason":"已执行至视觉信息屏障；JEV 不看图，主模型必须核对新截图，不能据 executed 声称成功"});
+            result["jev"] = json!({"status":"delegated","requestAttempted":decision["requestAttempted"],
+                "next":"本次委托结果见 jevRun；主模型必须核对新截图。"});
+            result["jevRun"] = json!({"status":"handoff",
+                "requestCount":usize::from(decision["requestAttempted"] == true),"executedActions":result["completedActions"],
+                "decisionElapsedMs":decision["elapsedMs"],"verification":"unverified",
+                "decision":decision,"reason":"已执行至视觉信息屏障；JEV 不看图，主模型必须核对新截图，不能据 executed 声称成功"});
             Ok(result)
         }).await.map_err(err)?;
     }

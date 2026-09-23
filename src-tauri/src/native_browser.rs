@@ -785,6 +785,8 @@ struct Observation {
     screenshot: bool,
     full_page: bool,
     images: Vec<ScreenshotImage>,
+    // A real run handoff permits one act on this owner/tab/snapshot only.
+    jev_fallback: bool,
 }
 
 #[derive(Clone)]
@@ -995,6 +997,7 @@ async fn observe(app: &AppHandle, scope: &str) -> Result<Observation, String> {
         screenshot: false,
         full_page: false,
         images: Vec::new(),
+        jev_fallback: false,
     })
 }
 
@@ -1059,7 +1062,7 @@ fn parse_action(text: &str) -> Result<Action, String> {
         .unwrap_or(text)
         .trim();
     let text = text.strip_suffix("```").unwrap_or(text).trim();
-    serde_json::from_str(text).map_err(|e| format!("动作 JSON 无效：{e}"))
+    serde_json::from_str(text).map_err(|e| format!("动作 JSON 无效：{e}。DOM 点击用 action={{\"action\":\"click\",\"frame\":0,\"ref\":\"最新引用\"}}；图片坐标点击用 action={{\"action\":\"click_at\",\"x\":100,\"y\":100}}，imageId 放在工具顶层且与 snapshotId 来自同次截图；按键仅用 action={{\"action\":\"press\",\"key\":\"Enter\"}}，不传 frame/ref。"))
 }
 
 fn validate_action(action: &Action) -> Result<(), String> {
@@ -1085,7 +1088,7 @@ fn validate_action(action: &Action) -> Result<(), String> {
     Ok(())
 }
 fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String> {
-    if !args["action"].is_null() && !args["actions"].is_null() { return Err("action 和 actions 不能同时提供".into()); }
+    if !args["action"].is_null() && !args["actions"].is_null() { return Err("action 和 actions 不能同时提供：单步仅传 action，多步仅传 actions；删除另一个字段。本批次未执行。".into()); }
     let values = if let Some(values)=args["actions"].as_array() { values.clone() } else { vec![args["action"].clone()] };
     if values.is_empty() || values.len()>max_actions { return Err(format!("每批需要1–{max_actions}个确定动作")); }
     values.into_iter().map(|value| { let action=parse_action(&value.to_string())?; validate_action(&action)?; Ok(action) }).collect()
@@ -1096,12 +1099,12 @@ fn preflight(observation:&Observation, action:&Action, image_id:Option<&str>) ->
         Action::Click{frame,r#ref,..}|Action::Fill{frame,r#ref,..}|Action::Scroll{frame,r#ref:Some(r#ref),..}=>{
             if *frame>=observation.frames.len() {return Err("frame 不属于当前快照".into());}
             if !observation.pages["pages"][*frame]["items"].as_array().is_some_and(|items|items.iter().any(|item|item["ref"].as_str()==Some(r#ref.as_str()))) {
-                return Err("ref 不属于当前快照的指定 frame".into());
+                return Err("ref 不属于当前快照的指定 frame；ref 必须原样复制该 frame 的 items[].ref，不能用 snapshotId 加序号拼造。这不等于快照过期；先核对已有观察中的真实 ref，不要直接重试或无故重新截图".into());
             }
         }
         Action::Scroll{frame,..} if *frame!=0=>return Err("子框架滚动需要明确 ref".into()),
         Action::ClickAt{x,y,..}|Action::Move{x,y}|Action::Drag{x,y,..}|Action::ScrollAt{x,y,..}=>{
-            if !observation.screenshot {return Err("坐标操作需要截图".into());}
+            if !observation.screenshot {return Err(format!("坐标操作需要截图：当前 snapshotId={} 没有图片。调用 screenshot 后同时使用它返回的新 snapshotId 和 imageId；不要将旧 imageId 与新 DOM 快照混用。", observation.id));}
             let (cx,cy)=image_point(observation,*x,*y,image_id)?;
             if !observation.images.iter().any(|image|cx>=image.x&&cy>=image.y&&cx<image.x+image.width&&cy<image.y+image.height) {return Err("坐标不在返回的图片中".into());}
             if let Action::Drag{to_x,to_y,..}=action {
@@ -1113,6 +1116,12 @@ fn preflight(observation:&Observation, action:&Action, image_id:Option<&str>) ->
         _=>(),
     }
     Ok(())
+}
+
+fn jev_requires_run(enabled: bool, delegated: bool, observation: &Observation, actions: &[Action]) -> bool {
+    enabled && !delegated
+        && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::Fill{..} | Action::Scroll{..}))
+        && !(observation.jev_fallback && actions.len() == 1 && observation.captured.elapsed() <= Duration::from_secs(180))
 }
 
 async fn point(
@@ -1500,6 +1509,11 @@ async fn snapshot(
             let kept: Vec<Value> = matches.into_iter().take(remaining_items).collect();
             remaining_items -= kept.len();
             page["inlineTruncated"] = json!(text_trimmed || total > kept.len());
+            page["returnedTextChars"] = json!(text.chars().count());
+            page["nextRead"] = if text_trimmed || total > kept.len() {
+                json!({"documentPath":document_path,"operation":"inspect","scope":"all",
+                    "notice":"这里只是摘要；完整已加载数据在 documentPath。按 tables.rows 核对 Top N；不足时读取完整文档或按 query 定位表格，不能据摘要断言全部/不存在/只有这些。"})
+            } else { Value::Null };
             page["matchingItems"] = json!(total);
             page["items"] = json!(kept);
             if let Some(headings) = page["headings"].as_array_mut() {
@@ -1655,12 +1669,23 @@ async fn control_session(
         let observation=state.observations.lock().unwrap().get(&s.active_tab).cloned().ok_or("请先 inspect 或 screenshot")?;
         if args["snapshotId"].as_str()!=Some(&observation.id) { return Err("观察已失效：snapshotId 不是最新观察或已执行；使用最近返回的 snapshotId，不要重放动作".into()); }
         let actions=parse_actions(args, if chrome { 16 } else { 8 })?;
+        if jev_requires_run(app.state::<AppState>().settings.lock().unwrap().jev_enabled, crate::jev_run::executing_browser_action(), &observation, &actions) {
+            return Ok(json!({"status":"not_executed","reason":"jev_run_required",
+                "inputAttempted":false,"completedActions":0,"snapshotId":observation.id,
+                "basedOnSnapshotId":observation.id,"verification":"unverified",
+                "next":"JEV 已启用，DOM click/fill/scroll 必须委托 run。本批次未执行，snapshotId 仍有效；用同一目标和 snapshotId 调用 run，提供 plan.task、authorization、expectedText 及所需 inputs，不需要预列 steps。真实 handoff 返回的快照仅允许一次单步 act 兜底，之后恢复 run。视觉操作仍由主模型决定。"}));
+        }
         let all_dom=actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
         if !all_dom && observation.captured.elapsed()>Duration::from_secs(180) {return Err("观察已过期，请重新观察后继续".into());}
         // Static validation for the WHOLE batch; revalidate the live node/focus
         // before every individual input. Never retarget by matching its label.
         for action in &actions {
             preflight(&observation,action,args["imageId"].as_str())?;
+        }
+        if chrome {
+            // Background tabs throttle animation/timer sampling, making stable DOM targets time out as "moving".
+            // Activate the explicitly bound tab before live checks; stale geometry/identity is still checked by apply.
+            crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
         }
         state.observations.lock().unwrap().remove(&s.active_tab);
         let mut failure=None;
@@ -1891,7 +1916,7 @@ pub(crate) fn jev_settings() -> Result<crate::settings::Settings, String> {
     Ok(app.state::<AppState>().settings.lock().unwrap().clone())
 }
 
-pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
+fn jev_observation_key(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<String, String> {
     let app = APP.get().ok_or("仅 Nova 内可用")?;
     let key = if tool == "webview" {
         let (_, thread_id) = current_context(root)?;
@@ -1904,11 +1929,26 @@ pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str, tool: &str
         let tag = args["tabTag"].as_str().ok_or("缺少 tabTag")?;
         format!("chrome:{owner}:{tag}")
     };
+    Ok(key)
+}
+
+pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
+    browser_observation(root, args, owner, tool, None)
+}
+
+pub(crate) fn jev_fallback(root: &Path, args: &Value, owner: &str, tool: &str, allow: bool) -> Result<Value, String> {
+    browser_observation(root, args, owner, tool, Some(allow))
+}
+
+fn browser_observation(root: &Path, args: &Value, owner: &str, tool: &str, fallback: Option<bool>) -> Result<Value, String> {
+    let app = APP.get().ok_or("仅 Nova 内可用")?;
+    let key = jev_observation_key(root, args, owner, tool)?;
     let state = app.state::<BrowserState>();
-    let observations = state.observations.lock().unwrap();
-    let observation = observations.get(&key)
+    let mut observations = state.observations.lock().unwrap();
+    let observation = observations.get_mut(&key)
         .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
         .ok_or("观察已失效，交回主模型重新观察")?;
+    if let Some(allow) = fallback { observation.jev_fallback = allow; }
     Ok(observation.pages.clone())
 }
 
@@ -2171,6 +2211,37 @@ fn state_dir(app: &AppHandle) -> std::path::PathBuf {
 mod tests {
     use super::*;
     #[test]
+    fn jev_policy_requires_delegation_and_bounds_handoff_to_one_fresh_action() {
+        let mut observation = Observation { frames: Vec::new(), pages: json!({}), id: "current".into(),
+            captured: std::time::Instant::now(), screenshot: true, full_page: false,
+            images: Vec::new(), jev_fallback: false };
+        let actions = |items: Value| parse_actions(&json!({"actions":items}), 16).unwrap();
+        for dom in [json!({"action":"click","frame":0,"ref":"a"}),
+            json!({"action":"fill","frame":0,"ref":"a","text":"x"}),
+            json!({"action":"scroll","frame":0,"delta":400}),
+            json!({"action":"scroll","frame":0,"ref":"a","delta":400})] {
+            let single = actions(json!([dom]));
+            assert!(jev_requires_run(true, false, &observation, &single));
+            assert!(!jev_requires_run(false, false, &observation, &single));
+            assert!(!jev_requires_run(true, true, &observation, &single));
+            for extra in [json!({"action":"click_at","x":10,"y":20}),
+                json!({"action":"press","key":"Enter"}), json!({"action":"wait","ms":1})] {
+                assert!(jev_requires_run(true, false, &observation, &actions(json!([extra,dom]))));
+            }
+            observation.jev_fallback = true;
+            assert!(!jev_requires_run(true, false, &observation, &single));
+            assert!(jev_requires_run(true, false, &observation, &actions(json!([dom,dom]))));
+            observation.captured -= Duration::from_secs(181);
+            assert!(jev_requires_run(true, false, &observation, &single));
+            observation.captured = std::time::Instant::now();
+            observation.jev_fallback = false;
+        }
+        assert!(!jev_requires_run(true, false, &observation, &actions(json!([
+            {"action":"click_at","x":10,"y":20},{"action":"type","text":"x"},
+            {"action":"press","key":"Enter"}]))));
+    }
+
+    #[test]
     fn background_tool_owners_are_stable_and_isolated() {
         let root = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
@@ -2232,5 +2303,9 @@ mod tests {
             parse_action(r#"{"action":"click","frame":0,"ref":"v1:0","selector":"body"}"#).is_err()
         );
         assert!(parse_action(r#"{"action":"eval","code":"alert(1)"}"#).is_err());
+        let error = parse_action(r#"{"action":"click","x":100,"y":100}"#).unwrap_err();
+        assert!(error.contains("click_at") && error.contains("imageId 放在工具顶层"));
+        let error = parse_action(r#"{"action":"press","key":"Enter","frame":0}"#).unwrap_err();
+        assert!(error.contains("不传 frame/ref"));
     }
 }

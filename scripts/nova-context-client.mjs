@@ -32,7 +32,7 @@ async function requestOnce(config, method, root, params, clientOwner) {
       if (error) reject(error);
       else resolveResult(value);
     };
-    const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), ["webview", "chrome"].includes(method) ? 45_000 : ["generate_image", "edit_image"].includes(method) ? 610_000 : CALL_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(new Error(`global context service timed out: ${method}`)), ["webview", "chrome"].includes(method) ? (params?.operation === "run" ? 210_000 : 45_000) : ["generate_image", "edit_image"].includes(method) ? 610_000 : CALL_TIMEOUT_MS);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ token: config.token, method, root: resolve(root), owner: clientOwner, params: params ?? {} })}\n`);
