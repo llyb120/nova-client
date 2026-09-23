@@ -212,6 +212,59 @@ fn text_of(value: &Value) -> String {
 }
 
 /// 应用 Reasonix 工具结果治理：超限归档 + 首尾截断 + OpenAI 硬上限。
+// Keep browser JSON parseable; shed repeated DOM detail before IDs and decisions.
+fn compact_browser_result(value: &Value, max_bytes: usize) -> String {
+    fn bounded(value: &Value, limit: usize, key: &str) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut out: serde_json::Map<String, Value> = map.iter().map(|(k,v)| (k.clone(), bounded(v,limit,k))).collect();
+                if let Some(rows) = out.get("rows").and_then(Value::as_array) {
+                    let count = rows.len();
+                    if map.get("rows").and_then(Value::as_array).is_some_and(|r| r.len() > count) {
+                        out.insert("returnedRows".into(), json!(count));
+                        out.insert("previewTruncated".into(), json!(true));
+                    }
+                }
+                if ["items","text","headings"].iter().any(|key| out.get(*key) != map.get(*key)) {
+                    out.insert("inlineTruncated".into(), json!(true));
+                }
+                Value::Object(out)
+            }
+            Value::Array(values) => {
+                let count = match key {
+                    "items" | "headings" | "canvases" => limit / 100,
+                    "rows" => (limit / 400).max(1),
+                    _ => values.len(),
+                };
+                Value::Array(values.iter().take(count).map(|v| bounded(v,limit,if key == "rows" { "cells" } else { key })).collect())
+            }
+            Value::String(text) if matches!(key,"text" | "name" | "region" | "action" | "evidence") && text.chars().count() > limit =>
+                json!(format!("{}…[compacted]",text.chars().take(limit).collect::<String>())),
+            _ => value.clone(),
+        }
+    }
+    let mut limit = 4000;
+    loop {
+        let mut compact = bounded(value,limit,"");
+        compact["contextCompacted"] = json!(true);
+        compact["nextRead"] = json!("Bounded preview: missing targets or rows are not absent. Use inspect(query), documentPath or archivedToolOutput for exact evidence. Verify date, region and table sort independently; chart metric selection is not table sorting.");
+        let text = compact.to_string();
+        if text.len() <= max_bytes { return text; }
+        if limit <= 125 {
+            // ponytail: exceptionally large metadata falls back to identifiers and run decisions;
+            // full evidence is archived, never represented as a complete observation.
+            let mut fallback = json!({"contextCompacted":true,"evidenceOmitted":true,
+                "nextRead":"Read archivedToolOutput/documentPath before judging task completion."});
+            for key in ["status","snapshotId","basedOnSnapshotId","documentPath","archivedToolOutput",
+                "images","coordinateSpace","tabTag","browserId","completedActions","verification","jev","jevRun"] {
+                if let Some(value) = compact.get(key) { fallback[key] = value.clone(); }
+            }
+            return fallback.to_string();
+        }
+        limit /= 2;
+    }
+}
+
 fn govern(
     outcome: ToolOutcome,
     name: &str,
@@ -227,8 +280,16 @@ fn govern(
     if text.len() <= max_bytes {
         return outcome;
     }
-    let (governed, archive_path, original_bytes) =
+    let (mut governed, archive_path, original_bytes) =
         govern_tool_text(&text, max_bytes, archive_dir, call_id, name);
+    if matches!(name, "chrome" | "webview" | "jianlai") {
+        if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
+            if value.is_object() {
+                value["archivedToolOutput"] = json!(archive_path);
+                governed = compact_browser_result(&value, max_bytes);
+            }
+        }
+    }
     let mut details = outcome.details.unwrap_or_else(|| json!({}));
     if let Some(path) = archive_path {
         details["archivedToolOutput"] = json!(path);
@@ -970,5 +1031,51 @@ mod tests {
             "取消后孙进程 {grandchild} 未被清理"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod browser_governance_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires NOVA_BROWSER_ARCHIVE_DIR with recorded browser results"]
+    fn browser_archive_replay() {
+        let dir=std::env::var("NOVA_BROWSER_ARCHIVE_DIR").expect("archive directory");
+        let mut count=0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path=entry.unwrap().path();
+            if !path.file_name().unwrap().to_string_lossy().ends_with("-chrome.txt") {continue;}
+            let value:Value=serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let text=compact_browser_result(&value,TOOL_OUTPUT_CONTEXT_MAX_BYTES);
+            assert!(text.len()<=TOOL_OUTPUT_CONTEXT_MAX_BYTES,"{}: {} bytes",path.display(),text.len());
+            let summary:Value=serde_json::from_str(&text).unwrap();
+            for key in ["snapshotId","status","images","jevRun"] {
+                assert_eq!(summary[key],value[key],"{}: {key}",path.display());
+            }
+            count+=1;
+        }
+        assert!(count>0);
+        println!("Replayed {count} browser archives: valid bounded JSON and preserved status, images, JEV decisions.");
+    }
+    #[test]
+    fn browser_governance_preserves_json_decisions_and_table_counts() {
+        let value = json!({"snapshotId":"s", "status":"executed", "images":[{"imageId":"s-0","pixelWidth":1600,"pixelHeight":719}],
+            "jevRun":{"requestCount":2,"executedActions":1,"decisions":[{"choice":"defer","requestAttempted":true}]},
+            "pages":[{"text":"美国 Units".repeat(10000),"items":(0..200).map(|n|json!({"ref":n,"name":"目标".repeat(200)})).collect::<Vec<_>>(),
+                "tables":[{"headers":["Units"],"returnedRows":10,"totalRows":100,"rows":vec![vec!["100";16];10]}]}]});
+        let dir=std::env::temp_dir().join(format!("nova-govern-{}",uuid::Uuid::new_v4()));
+        let result=govern(ToolOutcome::text(value.to_string()).with_details(value.clone()),"chrome","call-test",Some(&dir));
+        let text=result.content[0]["text"].as_str().unwrap();
+        assert!(text.len()<=TOOL_OUTPUT_CONTEXT_MAX_BYTES);
+        let summary:Value=serde_json::from_str(text).unwrap();
+        assert_eq!(summary["jevRun"],value["jevRun"]);
+        assert_eq!(summary["images"],value["images"]);
+        assert_eq!(summary["pages"][0]["tables"][0]["totalRows"],100);
+        let table=&summary["pages"][0]["tables"][0];
+        assert_eq!(table["returnedRows"].as_u64().unwrap() as usize,table["rows"].as_array().unwrap().len());
+        assert_eq!(summary["contextCompacted"],true);
+        let archive=result.details.unwrap()["archivedToolOutput"].as_str().unwrap().to_string();
+        assert_eq!(serde_json::from_str::<Value>(&std::fs::read_to_string(archive).unwrap()).unwrap(),value);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
