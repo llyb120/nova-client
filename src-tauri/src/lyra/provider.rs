@@ -80,6 +80,14 @@ fn tool_result_text(message: &Value) -> String {
     clamp_tool_output_text(&text)
 }
 
+fn screenshot_caption(message: &Value) -> String {
+    let details = &message["details"];
+    let images: Vec<Value> = details["images"].as_array().into_iter().flatten().take(16)
+        .map(|image| json!({"imageId":image["imageId"],"pixelWidth":image["pixelWidth"],"pixelHeight":image["pixelHeight"]})).collect();
+    format!("Browser screenshots for toolCallId={}, snapshotId={}; images in order: {}. With imageId, use coordinates measured directly on that returned image in image pixels. NEVER rescale using CSS viewport dimensions, DPI or crop offsets: the tool maps these automatically. Do not reuse coordinates from another image. {}",
+        message["toolCallId"], details["snapshotId"], json!(images), details["coordinateSpace"].as_str().unwrap_or_default())
+}
+
 fn tool_result_images(message: &Value, model: &ResolvedModel) -> Vec<Value> {
     if !model.supports_images {
         return Vec::new();
@@ -93,14 +101,16 @@ fn tool_result_images(message: &Value, model: &ResolvedModel) -> Vec<Value> {
         .cloned()
         .collect();
     let paths = message.pointer("/details/images").and_then(Value::as_array)
-        .into_iter().flatten().filter_map(|image| image["path"].as_str())
-        .chain(message.pointer("/details/imagePath").and_then(Value::as_str));
-    for path in paths.take(16) {
+        .into_iter().flatten().filter_map(|image| image["path"].as_str().map(|path| (path,image.clone())))
+        .chain(message.pointer("/details/imagePath").and_then(Value::as_str).map(|path| (path,json!({}))));
+    for (path, metadata) in paths.take(16) {
         if let Ok(data) = std::fs::read(path) {
             images.push(json!({
                 "type": "image",
                 "mimeType": "image/png",
                 "data": base64::engine::general_purpose::STANDARD.encode(data),
+                "caption":format!("This image: imageId={}, {}×{} image pixels; snapshotId={}. Use these image pixels directly with imageId, without CSS/DPI conversion.",
+                    metadata["imageId"],metadata["pixelWidth"],metadata["pixelHeight"],message["details"]["snapshotId"]),
             }));
         }
     }
@@ -210,15 +220,13 @@ fn completions_messages(
                 }));
                 let images = tool_result_images(message, model);
                 if !images.is_empty() {
-                    let mut parts = vec![
-                        json!({ "type": "text", "text": "Screenshot returned by the browser tool." }),
-                    ];
-                    parts.extend(images.into_iter().map(|image| json!({
+                    let mut parts = Vec::new();
+                    parts.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
                         "type": "image_url",
                         "image_url": { "url": format!("data:{};base64,{}",
                             image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
                             image.get("data").and_then(Value::as_str).unwrap_or_default()) }
-                    })));
+                    })]));
                     screenshots.push(json!({ "role": "user", "content": parts }));
                 }
             }
@@ -432,16 +440,13 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                 }));
                 let images = tool_result_images(message, model);
                 if !images.is_empty() {
-                    let mut content = vec![json!({
-                        "type": "input_text",
-                        "text": "Screenshot returned by the browser tool."
-                    })];
-                    content.extend(images.into_iter().map(|image| json!({
+                    let mut content = Vec::new();
+                    content.extend(images.into_iter().flat_map(|image| [json!({"type":"input_text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
                         "type": "input_image",
                         "image_url": format!("data:{};base64,{}",
                             image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
                             image.get("data").and_then(Value::as_str).unwrap_or_default())
-                    })));
+                    })]));
                     out.push(json!({ "type": "message", "role": "user", "content": content }));
                 }
             }
@@ -1428,18 +1433,15 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                 }));
                 let images = tool_result_images(message, model);
                 if !images.is_empty() {
-                    let mut content = vec![json!({
-                        "type": "text",
-                        "text": "Screenshot returned by the browser tool."
-                    })];
-                    content.extend(images.into_iter().map(|image| json!({
+                    let mut content = Vec::new();
+                    content.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
                         "type": "image",
                         "source": {
                             "type": "base64",
                             "media_type": image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
                             "data": image.get("data").and_then(Value::as_str).unwrap_or_default(),
                         }
-                    })));
+                    })]));
                     out.push(json!({ "role": "user", "content": content }));
                 }
             }
@@ -1747,6 +1749,17 @@ mod tests {
     use super::*;
     use crate::lyra::config::ResolvedModel;
     use serde_json::Map;
+
+    #[test]
+    fn screenshot_coordinates_stay_bound_in_all_provider_formats() {
+        let message=json!({"role":"toolResult","toolCallId":"call-shot","content":[{"type":"image","mimeType":"image/png","data":"AA=="}],
+            "details":{"snapshotId":"snap","images":[{"imageId":"snap-0","pixelWidth":1600,"pixelHeight":719}]}});
+        let model=test_model("openai-completions");
+        for output in [json!(completions_messages("",&[message.clone()],&model)),json!(responses_input(&[message.clone()],&model)),json!(anthropic_messages(&[message],&model))] {
+            let text=output.to_string();
+            for expected in ["snap-0","1600","719","NEVER rescale","call-shot"] { assert!(text.contains(expected),"{expected}: {text}"); }
+        }
+    }
 
     fn test_model(api: &str) -> ResolvedModel {
         ResolvedModel {
