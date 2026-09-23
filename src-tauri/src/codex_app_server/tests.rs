@@ -73,6 +73,11 @@ async fn stdio_stream_and_early_completion() {
     assert_eq!(calls[0]["method"], "initialize");
     assert_eq!(calls[1]["method"], "initialized");
     assert_eq!(calls[2]["method"], "thread/start");
+    assert_eq!(calls[2]["params"]["approvalPolicy"], "never");
+    assert_eq!(calls[2]["params"]["sandbox"], "danger-full-access");
+    assert_eq!(calls[2]["params"]["approvalsReviewer"], "user");
+    assert_eq!(calls[3]["params"]["approvalPolicy"], "never");
+    assert_eq!(calls[3]["params"]["sandboxPolicy"]["type"], "dangerFullAccess");
     assert!(calls[2]["params"]["developerInstructions"]
         .as_str()
         .unwrap()
@@ -98,6 +103,7 @@ async fn initialization_retains_cancel_and_resume_steer() {
     assert!(result.is_ok());
     assert!(calls.iter().any(|c| c["method"] == "thread/resume"
         && c["params"]["threadId"] == "previous"
+        && c["params"]["approvalsReviewer"] == "user"
         && c["params"]["developerInstructions"]
             .as_str()
             .unwrap()
@@ -135,6 +141,7 @@ async fn title_and_fork_use_native_transport() {
     let (result, _, calls) = exercise("stream", req, None).await;
     assert_eq!(result.unwrap(), "fork-1");
     assert_eq!(calls[3]["params"]["lastTurnId"], "second");
+    assert_eq!(calls[3]["params"]["approvalsReviewer"], "user");
     assert!(calls[3]["params"]["developerInstructions"]
         .as_str()
         .unwrap()

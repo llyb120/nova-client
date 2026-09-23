@@ -72,7 +72,7 @@ fn thread_options(request: &Value, options: &Options) -> Value {
     let mut value = json!({
         "cwd": request["cwd"], "model": optional_text(&request["model"]),
         "sandbox": if read_only { "read-only" } else { "danger-full-access" },
-        "approvalPolicy": "never", "developerInstructions": guidance.join("\n\n"),
+        "approvalPolicy": "never", "approvalsReviewer": "user", "developerInstructions": guidance.join("\n\n"),
         "config": {"mcp_servers.nova-tools": mcp.unwrap_or_else(|| json!({"command":"codex", "enabled":false}))}
     });
     if title {
