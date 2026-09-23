@@ -256,13 +256,11 @@ pub(crate) fn compact_tool_value(value: &Value) -> Value {
         Value::String(s) => {
             // ACP 还会把 MCP 图片块序列化进 text，先保留 JSON 结构中的有效元数据。
             if (s.trim_start().starts_with('{') || s.trim_start().starts_with('['))
-                && s.contains("\"image\"")
-                && s.contains("\"data\"")
             {
                 if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-                    return Value::String(limit_display_text(
-                        &compact_tool_value(&parsed).to_string(),
-                    ));
+                    // Unwrap nested ACP/MCP JSON before limiting any strings. Limiting the
+                    // serialized envelope loses status/snapshot/path fields and can leave only base64.
+                    return Value::String(compact_tool_value(&parsed).to_string());
                 }
             }
             Value::String(limit_display_text(s))
@@ -312,6 +310,12 @@ fn tool_images_are_compacted_before_text_is_truncated() {
         assert!(output.contains("图片数据已省略"));
         assert!(!output.contains("AAAA"));
     }
+    let nested = serde_json::json!({"content":[{"type":"text","text":result.to_string()}],
+        "status":"needs_review","snapshotId":"new","documentPath":"C:/shots/new.json"});
+    let output = compact_tool_value(&Value::String(nested.to_string())).to_string();
+    assert!(output.contains("needs_review") && output.contains("new.json"));
+    assert!(output.contains("动作未执行") && !output.contains("AAAA"));
+    assert!(output.len() < 2048);
     let unicode = compact_tool_value(&Value::String("界".repeat(TOOL_OUTPUT_LIMIT)));
     assert!(unicode.as_str().unwrap().ends_with('界'));
     assert!(unicode.as_str().unwrap().len() < TOOL_OUTPUT_LIMIT + 128);
