@@ -2897,6 +2897,7 @@ export async function sendPromptTo(threadId: string, text: string, images: Promp
 export async function editUserMessage(itemId: number, text: string, images: PromptImage[] = []) {
   let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
+  assertBuiltinPrompt(text, images);
   // 历史分支预览中发生编辑时，先恢复对应快照；随后的 truncate_thread 会自动
   // 从被编辑提示词处截断并创建新分支，无需用户先手动执行时间跳跃。
   if (timeMachineEditTarget?.threadId === id) {
@@ -3474,12 +3475,21 @@ export async function initStore() {
       );
     }),
 
-    listen<{ threadId: string; text: string; images?: PromptImage[] }>(
+    listen<{ threadId: string; text: string; images?: PromptImage[]; restored?: boolean }>(
       "remote-prompt:dispatch",
       (e) => {
-        void sendPromptTo(e.payload.threadId, e.payload.text, e.payload.images ?? []).catch((error) =>
-          console.error("Remote prompt dispatch failed", error),
-        );
+        const { threadId, text, images = [], restored } = e.payload;
+        // 编辑时已显示乐观消息；统一发送入口会重新创建，先移除旧项避免重复。
+        if (restored && state.currentId === threadId) {
+          setState("items", items => items.filter(item => item.id >= 0));
+        }
+        void sendPromptTo(threadId, text, images).catch((error) => {
+          if (restored) {
+            setState("running", threadId, false);
+            showToast(`编辑后重新发送失败：${String(error)}`);
+          }
+          console.error("Prompt dispatch failed", error);
+        });
       },
     ),
 

@@ -4105,8 +4105,16 @@ fn truncate_thread(
         }
         if should_send {
             let prompt = prompt.unwrap_or_default();
-            if let Err(error) = dispatch_prompt(&background_app, thread_id.clone(), prompt, images)
-            {
+            // 恢复完成后与 Composer 共用前端命令展开、模式设置及工作流续跑入口。
+            let result = if server::is_headless() {
+                dispatch_prompt(&background_app, thread_id.clone(), prompt, images)
+            } else {
+                background_app.emit(
+                    remote::EV_REMOTE_PROMPT_DISPATCH,
+                    json!({ "threadId": thread_id, "text": prompt, "images": images, "restored": true }),
+                ).map_err(|error| error.to_string())
+            };
+            if let Err(error) = result {
                 let state = background_app.state::<AppState>();
                 let mut store = state.store.lock().unwrap();
                 if let Some(thread) = store.get_mut(&thread_id) {
