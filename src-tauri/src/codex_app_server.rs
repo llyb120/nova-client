@@ -29,7 +29,9 @@ pub(super) fn rtk_guidance() -> String {
     } else {
         path.into_owned()
     };
-    let powershell = format!("& '{}' __rtk", path.replace('\'', "''"));
+    // A GUI-subsystem exe needs a pipeline for PowerShell to wait and capture output.
+    // Dot-sourcing keeps LASTEXITCODE in the caller; -Stream avoids buffering all output.
+    let powershell = format!(". {{ & '{}' @args | Out-String -Stream }} __rtk", path.replace('\'', "''"));
     let bash = format!("'{}' __rtk", path.replace('\'', "'\\''"));
     // ponytail: instruction-based for Codex and ACP agents; enforcing every command
     // requires a backend pre-execution rewrite hook when that API is available.

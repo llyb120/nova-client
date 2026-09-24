@@ -337,7 +337,8 @@ fn rewrite_with_embedded_rtk(command: &str, shell: &crate::lyra::prompt::ShellCo
     };
     let path = exe.to_string_lossy();
     let prefix = match shell.kind {
-        ShellKind::PowerShell => format!("& '{}' __rtk ", path.replace('\'', "''")),
+        // Match rtk_guidance: wait for the GUI exe and preserve the caller's LASTEXITCODE.
+        ShellKind::PowerShell => format!(". {{ & '{}' @args | Out-String -Stream }} __rtk ", path.replace('\'', "''")),
         ShellKind::Bash => format!("'{}' __rtk ", path.replace('\'', "'\\''")),
     };
     rewritten.replace("rtk ", &prefix)
@@ -839,6 +840,47 @@ mod embedded_rtk_tests {
             "npm install",
         ] {
             assert_eq!(rewrite_with_embedded_rtk(unsupported, &shell), unsupported);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_waits_for_gui_rtk_and_preserves_exit_code() {
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("gui.rs");
+        let exe = temp.path().join("GUI 中文 ' probe.exe");
+        std::fs::write(&source, r#"
+#![windows_subsystem = "windows"]
+fn main() {
+    assert_eq!(std::env::args().skip(1).collect::<Vec<_>>(), ["__rtk", "git", "status"]);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    println!("gui stdout");
+    eprintln!("gui stderr");
+    std::process::exit(7);
+}
+"#).unwrap();
+        let compiled = Command::new("rustc").arg(&source).arg("-o").arg(&exe).output().unwrap();
+        assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+
+        let shell = ShellConfig { program: "powershell.exe".into(), kind: ShellKind::PowerShell };
+        let current = std::env::current_exe().unwrap().to_string_lossy().replace('\'', "''");
+        let replacement = exe.to_string_lossy().replace('\'', "''");
+        let rewritten = rewrite_with_embedded_rtk("git status", &shell).replace(&current, &replacement);
+        let guidance = crate::codex_app_server::rtk_guidance();
+        let prefix = guidance.lines().find_map(|line| line.strip_prefix("PowerShell: ")).unwrap();
+        let guided = format!("{} git status", prefix.replace(
+            &current.trim_start_matches(r"\\?\").replace('\\', "/"), &replacement,
+        ));
+        for command in [rewritten, guided] {
+            let output = Command::new(&shell.program)
+                .args(["-NoProfile", "-NonInteractive", "-Command"])
+                .arg(format!("{command}; exit $LASTEXITCODE"))
+                .output().unwrap();
+            assert_eq!(output.status.code(), Some(7), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("gui stdout"), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("gui stderr"), "{output:?}");
         }
     }
 
