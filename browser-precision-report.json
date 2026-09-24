@@ -3,42 +3,42 @@
     {
       "name": "trusted wheel reaches nested button-filled panes on both axes and RTL",
       "passed": true,
-      "ms": 421.8
+      "ms": 444.6
     },
     {
       "name": "SPA loading text keeps delegation alive until navigation renders",
       "passed": true,
-      "ms": 10.5
+      "ms": 9.9
     },
     {
       "name": "framework date presets use clickable anchors without href",
       "passed": true,
-      "ms": 23.2
+      "ms": 42.1
     },
     {
       "name": "anonymous fields carry local context without merging adjacent inputs",
       "passed": true,
-      "ms": 14.1
+      "ms": 17.9
     },
     {
       "name": "date ranges retain Week versus Release Date context and endpoint identity",
       "passed": true,
-      "ms": 10.4
+      "ms": 10.9
     },
     {
       "name": "custom menus and duplicate sortable columns retain independent evidence",
       "passed": true,
-      "ms": 10
+      "ms": 14.4
     },
     {
       "name": "DOM hint identities survive observations but not node replacement",
       "passed": true,
-      "ms": 6.9
+      "ms": 9.1
     },
     {
       "name": "hidden and offscreen bulk DOM cannot exhaust visible custom menu hints",
       "passed": true,
-      "ms": 186.7
+      "ms": 207.1
     },
     {
       "name": "control hints exclude inherited pointer labels and semantic wrappers",
@@ -48,163 +48,163 @@
     {
       "name": "nested menus retain leaf choices instead of hinting their whole group",
       "passed": true,
-      "ms": 5.4
+      "ms": 4.9
     },
     {
       "name": "clickable children of duplicate headers retain their owning column",
       "passed": true,
-      "ms": 6.3
+      "ms": 5.8
     },
     {
       "name": "Top 5 survives Metrics 4, offscreen rows and explicit pagination totals",
       "passed": true,
-      "ms": 15.3
+      "ms": 14.7
     },
     {
       "name": "table previews exclude nested rows and do not assign ambiguous page totals",
       "passed": true,
-      "ms": 18.9
+      "ms": 20.6
     },
     {
       "name": "native and ARIA checkboxes expose role and current selection",
       "passed": true,
-      "ms": 49.9
+      "ms": 50.8
     },
     {
       "name": "accessible labels: aria-labelledby, multi-label fields, shadow roots",
       "passed": true,
-      "ms": 116.7
+      "ms": 115.1
     },
     {
       "name": "virtualized recycled node cannot change row identity unnoticed",
       "passed": true,
-      "ms": 20.6
+      "ms": 20
     },
     {
       "name": "detached / replaced same-name node is never silently retargeted",
       "passed": true,
-      "ms": 5
+      "ms": 8.5
     },
     {
       "name": "fieldset disabled, inherited aria-disabled and readonly are refused",
       "passed": true,
-      "ms": 6.3
+      "ms": 7.5
     },
     {
       "name": "partial occlusion chooses an exposed point; complete occlusion refuses",
       "passed": true,
-      "ms": 1264.7
+      "ms": 1261.1
     },
     {
       "name": "moving controls wait for geometry stability, without a fixed 600ms sleep",
       "passed": true,
-      "ms": 318
+      "ms": 317.8
     },
     {
       "name": "hover replacement / overlay is rechecked before mouse down",
       "passed": true,
-      "ms": 50
+      "ms": 49.7
     },
     {
       "name": "coordinate dropdown hover permits highlighting but refuses replacement, movement and overlays",
       "passed": true,
-      "ms": 247.9
+      "ms": 249.1
     },
     {
       "name": "fill focus checks catch application redirection, including shadow inputs",
       "passed": true,
-      "ms": 56.4
+      "ms": 55
     },
     {
       "name": "offscreen nested scroll target is reached without clicking its previous location",
       "passed": true,
-      "ms": 80.6
+      "ms": 81.3
     },
     {
       "name": "Canvas metadata, scaled display and trusted pixel-coordinate pointer events",
       "passed": true,
-      "ms": 65.6
+      "ms": 70
     },
     {
       "name": "isolated reference store survives page tampering; reinjection is idempotent",
       "passed": true,
-      "ms": 33.2
+      "ms": 28.4
     },
     {
       "name": "readonly inheritance and exact post-fill value verification",
       "passed": true,
-      "ms": 51.5
+      "ms": 52.4
     },
     {
       "name": "viewport fast path explicitly excludes offscreen references",
       "passed": true,
-      "ms": 18
+      "ms": 16.9
     },
     {
       "name": "stale screenshot viewport refuses after scrolling",
       "passed": true,
-      "ms": 7.3
+      "ms": 7.6
     },
     {
       "name": "production iframe transform mapping handles scale and refuses overlay / rotation",
       "passed": true,
-      "ms": 61.1
+      "ms": 61.5
     },
     {
       "name": "Canvas crop offsets, multiple output scales and drag/wheel stay in CSS coordinates",
       "passed": true,
-      "ms": 346.5
+      "ms": 363.1
     },
     {
       "name": "a form status update does not invalidate another identified field",
       "passed": true,
-      "ms": 38.6
+      "ms": 37.8
     },
     {
       "name": "semantic cache invalidates synchronously for label / row mutations",
       "passed": true,
-      "ms": 38.7
+      "ms": 37.9
     },
     {
       "name": "WebGL Canvas remains observable without reading its drawing implementation",
       "passed": true,
-      "ms": 110.8
+      "ms": 88.6
     }
   ],
   "benchmarks": {
     "after": {
       "scope": "all",
       "itemCount": 2000,
-      "coldMs": 110.80000001192093,
-      "medianMs": 48.29999998211861,
+      "coldMs": 102.10000000149012,
+      "medianMs": 48.100000001490116,
       "samplesMs": [
-        44.400000005960464,
-        44.5,
-        46.900000005960464,
-        48.29999998211861,
-        48.400000005960464,
-        48.400000005960464,
-        53.29999998211861
+        45.099999994039536,
+        45.30000000447035,
+        46.19999999552965,
+        48.100000001490116,
+        48.69999999552965,
+        48.80000000447035,
+        51.20000000298023
       ]
     },
     "viewport": {
       "scope": "viewport",
       "itemCount": 24,
-      "coldMs": 33.5,
-      "medianMs": 27.099999994039536,
+      "coldMs": 66,
+      "medianMs": 32.20000000298023,
       "samplesMs": [
-        24.400000005960464,
-        24.80000001192093,
+        25.600000001490116,
         26.5,
-        27.099999994039536,
-        29.599999994039536,
-        30.599999994039536,
-        33
+        31.5,
+        32.20000000298023,
+        33,
+        35.70000000298023,
+        36.599999994039536
       ]
     }
   },
   "node": "v24.19.0",
-  "engineSha256": "6fea827ccf8ed4a2c9b6a01f5e1e5ba8d8109f4ca5c9fd3f75e45498804ef02b",
+  "engineSha256": "69def482453c2e337bc5564e4f9316b3a9e2c5fa0709593f66a2f9ce9f99844d",
   "scope": "Production page script and iframe mapping in real Chromium/CDP; not the compiled Rust/Tauri dispatch path.",
   "browser": "153.0.4234.48"
 }

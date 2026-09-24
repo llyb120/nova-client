@@ -1,7 +1,16 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 19) return;
+  if (globalThis.__novaWebview?.apiVersion === 20) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+  // Icon-only controls (sort carets, filter funnels, close ×) carry their meaning in class names.
+  const iconHint = e => {
+    const words = new Set();
+    for (const n of [e, ...Array.from(e.querySelectorAll('*')).slice(0, 8)]) {
+      const source = `${n.getAttribute('class') || ''} ${n.getAttribute('data-icon') || ''} ${n.getAttribute('data-testid') || ''} ${n.getAttribute('aria-sort') || ''}`;
+      for (const m of source.matchAll(/sort|caret|arrow|chevron|filter|order|asc|desc|active|search|close|clear|calendar|expand|collapse|more|setting|delete|edit|info|question|help/gi)) words.add(m[0].toLowerCase());
+    }
+    return words.size ? [...words].slice(0, 8).join(' ') : undefined;
+  };
   const parent = e => e?.assignedSlot || e?.parentElement || e?.getRootNode()?.host;
   const contains = (e, child) => { for (; child; child = parent(child)) if (child === e) return true; return false; };
   const ancestors = e => { const result = []; for (; e; e = parent(e)) result.push(e); return result; };
@@ -143,7 +152,7 @@
     return entry;
   };
   const api = {
-    apiVersion: 19,
+    apiVersion: 20,
     stamp,
     inputState(ref) {
       const e = active();
@@ -207,8 +216,14 @@
           if (++pointerScanned>4000) {customTargetsTruncated=true;break;}
           // Vimium-style hints represent controls, not their inherited pointer-styled text children.
           // Keep a cursor boundary as a fallback for framework widgets without roles or onclick attributes.
-          if (r.width*r.height<innerWidth*innerHeight*.25 && style.cursor==='pointer' && label(e)
-              && (e.tagName==='LI' || !parent(e) || getComputedStyle(parent(e)).cursor!=='pointer') && !e.querySelector(controlSelector+',li')
+          if (style.cursor!=='pointer' || r.width*r.height>=innerWidth*innerHeight*.25) continue;
+          // Text-less pointer icons (e.g. a sort caret inside a clickable header) are separate targets;
+          // nested icon wrappers keep only the outermost small one.
+          const text=label(e), up=parent(e), upRect=up?.getBoundingClientRect();
+          const icon=!text && r.width<=48 && r.height<=48
+            && !(up && upRect.width<=48 && upRect.height<=48 && getComputedStyle(up).cursor==='pointer' && !label(up)) && iconHint(e);
+          if ((text || icon)
+              && (icon || e.tagName==='LI' || !up || getComputedStyle(up).cursor!=='pointer') && !e.querySelector(controlSelector+',li')
               && !ancestors(parent(e)).some(a=>a.matches(controlSelector))) {
             if (!seen.has(e)) {seen.add(e);candidates.push(e);} pointerTargets.add(e);
           }
@@ -258,6 +273,7 @@
           href:e.href||undefined,expanded:e.getAttribute('aria-expanded')??undefined,haspopup:e.getAttribute('aria-haspopup')??undefined,selected:e.getAttribute('aria-selected')??e.getAttribute('aria-checked')??(checkable?e.checked:undefined),
           column,sort:e.getAttribute('aria-sort')??undefined,columnKey:e.getAttribute('data-column-key')??e.getAttribute('data-field')??undefined,
           actionable:e.hasAttribute('onclick') || !!e.onclick || pointerTargets.has(e),
+          icon:!name || (r.width<=48 && r.height<=48) || header ? iconHint(e) : undefined,
           region,fieldContext:field,
           dateValue:field?.match(/\[field [12]\/2\]$/) && /^(?:\d{4}-\d{2}-\d{2})?$/.test(e.value)?e.value:undefined,
           password:e.type==='password',tabIndex:e.tabIndex,value:e.type==='password'?undefined:compact(e.value,100),disabled:isDisabled,editable:editable(e,isDisabled),
