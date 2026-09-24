@@ -1365,6 +1365,25 @@ pub async fn stream_chat(
                     return Ok(result);
                 }
             }
+            Ok(mut result) => {
+                // 三种协议共用出口：思考不是答复。交给 bridge 有限重试，
+                // 保留 usage 和原始内容，且不覆盖取消或 provider 的明确错误。
+                if !matches!(result.stop_reason.as_str(), "aborted" | "error")
+                    && result.error_message.is_none()
+                    && !result.content.iter().any(|part| match part["type"].as_str() {
+                        Some("text") => part["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
+                        Some("toolCall") => part["name"].as_str().is_some_and(|s| !s.trim().is_empty()),
+                        _ => false,
+                    })
+                {
+                    result.error_message = Some(format!(
+                        "provider returned no actionable output: 模型未返回正文或工具调用（可能仅有思考内容，stop_reason={}）",
+                        result.stop_reason
+                    ));
+                    result.stop_reason = "error".into();
+                }
+                return Ok(result);
+            }
             outcome => return outcome,
         }
     }
@@ -1785,6 +1804,61 @@ mod tests {
     use super::*;
     use crate::lyra::config::ResolvedModel;
     use serde_json::Map;
+
+    #[tokio::test]
+    async fn thinking_only_completion_is_retryable_without_masking_valid_output() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (delta, finish, expected) in [
+            (json!({"reasoning_content":"Still planning"}), json!("stop"), "error"),
+            (json!({"reasoning_content":"Still planning"}), Value::Null, "error"),
+            (json!({"reasoning_content":"Still planning"}), json!("other"), "error"),
+            (json!({"reasoning_content":"Still planning"}), json!("length"), "error"),
+            (json!({}), json!("stop"), "error"),
+            (json!({"content":" \n\t"}), json!("stop"), "error"),
+            (json!({"content":"Done"}), json!("stop"), "stop"),
+            (json!({"reasoning_content":"Planning", "tool_calls":[{
+                "index":0,"id":"call-1","function":{"name":"read","arguments":"{}"}
+            }]}), json!("tool_calls"), "toolUse"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let chunk = json!({"choices":[{"delta":delta,"finish_reason":finish}],
+                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}});
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    head.extend_from_slice(&buf[..n]);
+                }
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+            });
+            let mut model = test_model("openai-completions");
+            model.base_url = format!("http://{addr}/v1");
+            let result = stream_chat(
+                &reqwest::Client::builder().no_proxy().build().unwrap(),
+                &model, "key", None, "sys", &[], &[], None,
+                &Arc::new(AtomicBool::new(false)), &mut |_| {},
+            ).await.unwrap();
+            server.await.unwrap();
+            assert_eq!(result.stop_reason, expected, "delta={delta}, finish={finish}");
+            assert_eq!(result.usage["output"], 5);
+            if expected == "error" {
+                let error = result.error_message.unwrap();
+                assert!(crate::lyra::prompt::is_retryable_provider_error(&error));
+                assert!(!is_retryable_stream_error(&error), "retry only at bridge level");
+            } else {
+                assert!(result.error_message.is_none());
+            }
+        }
+    }
 
     #[test]
     fn screenshot_coordinates_stay_bound_in_all_provider_formats() {

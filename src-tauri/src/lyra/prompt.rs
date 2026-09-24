@@ -158,6 +158,7 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "stream ended without finish_reason",
     "provider finish_reason",
     "provider stop_reason",
+    "provider returned no actionable output",
     "error decoding response body",
     "idle timeout",
     "sse 连续",
