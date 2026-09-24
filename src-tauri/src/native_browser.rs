@@ -1712,6 +1712,8 @@ async fn control_session(
         let mut result=json!({"status":if failure.is_none(){"executed"}else if progress.attempted{"needs_review"}else{"not_executed"},
             "scrollFeedback":progress.scroll_feedback,
             "canReobserve":failure.is_some() && progress.dom_preflight && progress.completed==0,
+            // The failing action itself sent no input (DOM preflight); earlier batch actions did complete.
+            "failedAtPreflight":failure.is_some() && progress.dom_preflight,
             "reason":failure,"inputAttempted":progress.attempted,"completedActions":progress.completed,"actionTimingsMs":action_timings,"basedOnSnapshotId":observation.id,"verification":"unverified"});
         result["actionMs"] = json!(started.elapsed().as_millis());
         result["next"] = json!("根据返回的最新状态验证并继续；fill 一次完成聚焦和填写。executed/needs_review 不要直接重放。坐标操作需截图，DOM 操作使用最新 frame/ref。");

@@ -28,6 +28,12 @@
   - 撤回"defer 代价高、尽量不要 defer"的提示：没有授权输入值时 JEV 会乱点输入框、滚动、打开 My Filter 拖延 12 步。改为"需要输入但没有 fill 候选时立即 defer，由主模型补 inputs"。
   - `plan.inputs` 支持 `fieldContext` 属性（Schema 与 Rust 同步，≥24 字前缀可匹配）。此前主模型附带该字段，两次 run 在 1ms 内被 Schema 拒绝。
   - 每批候选上限 60→90。分组折叠后大多数页面能全量展示，排序只用于裁剪拥挤页面。
+- 2026-09-24 基于 dev 会话 913c790c 第二轮（8 次 run、多次交接）的修正：
+  - 智能搜索输入：任务文字里写明、页面上看不到的值（引号内文字或英文专名，如 `United States`），会成为搜索/筛选框的输入候选。前提是该值与该字段的上下文词（如 Region）出现在同一句里。候选标注"来自任务文字"，由 JEV 选择，不会自动填写；全站搜索框因上下文不匹配不会得到候选。主模型不必再为地区搜索补 `inputs`。
+  - 表头图标：页面脚本（apiVersion 20）从 class/data-icon 提取 `icon` 提示（sort/caret/filter…）；没有文字的 `cursor:pointer` 小图标也成为候选，嵌套图标只保留最外层。候选标注"无名表头图标 列=… 分组=… icon=…"，并说明点表头文字可能只弹出释义。
+  - 动作效果：`history[].effect` 记录每步的实际变化（`url` 跳转、`newControls` 新控件、`newText` 新文字、`changed` 状态变化）。点击后若看不到变化，300ms 后再看一次，确认无变化才提示"无效，换目标"。JEV 据此区分"已排序"和"只弹出了释义"。
+  - 候选标签带 href 路径（如 `→/intelligence/top-charts/pc`），用于区分导航入口。候选描述改成"标签 + 标签里没有的字段"，最多 700 字，请求体变小。
+  - 返回瘦身：run 内部的 inspect/act 摘要改为 2500 字、30 个元素（JEV 仍读取完整观察，不受影响）。`jevRun` 只保留结果、原因、每步效果和精简的决策记录，完整决策树只在交接时返回。此前 4 次 run 的返回过大被存成文件，主模型要用 shell 去读。
 - `observe` 在本地轮询直到页面有变化才再问 JEV，连续无进展 15 秒交回。
 - `done` 需在新观察中控件/URL/表格状态不变才算完成。
 - 输出新增 `jevRun.reflexActions`、`jevRun.trace`（树节点轨迹），`decisionTree` 为运行时树及当前 JEV 分支；`cachedActions` 统计按已校验路径执行、未请求 JEV 的动作。

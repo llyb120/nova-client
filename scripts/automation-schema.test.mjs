@@ -56,7 +56,7 @@ test('JEV browser decisions share bounded plans; desktop remains advisory', asyn
     assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
   }
   assert.deepEqual(chrome.inputSchema.properties.advice,jianlai.inputSchema.properties.advice);
-  assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,8);
+  assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,24);
   assert.deepEqual(chrome.inputSchema.properties.plan.required,['task','authorization','expectedText']);
   assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.default,32);
   assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.maximum,64);
@@ -65,7 +65,8 @@ test('JEV browser decisions share bounded plans; desktop remains advisory', asyn
   assert.equal(chrome.inputSchema.properties.plan.properties.inputs.items.properties.name.minLength,0);
   assert.equal(chrome.inputSchema.properties.plan.properties.controlNames.maxItems,16);
   assert.equal(chrome.inputSchema.properties.plan.properties.useExperience.default,false);
-  assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.required,['action','name','role','expectedText']);
+  assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.required,['action']);
+  assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.properties.action.enum,['click','fill','press','scroll']);
   for(const tool of [chrome,webview,jianlai]) {
     assert(tool.inputSchema.properties.operation.enum.includes('advise'));
     assert(tool.inputSchema.properties.operation.enum.includes('run'));

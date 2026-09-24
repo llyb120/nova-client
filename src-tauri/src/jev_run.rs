@@ -22,16 +22,58 @@ struct Plan {
     use_experience: bool,
     #[serde(default = "default_max_actions")]
     max_actions: usize,
+    /// Concrete values the main model wrote into the goal (e.g. "United States"); local only.
+    #[serde(skip)]
+    phrases: Vec<String>,
 }
 fn default_max_actions() -> usize { 32 }
+/// One step of the main model's plan. The main model decides *what* to do; the runner finds the
+/// control (locally, JEV only for ties), executes consecutive steps without round-trips, and
+/// checks `expect` before moving on.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Step {
     action: String,
-    name: String,
-    role: String,
+    /// Natural description of the control, e.g. "Top Charts 菜单下的 PC & Console Games".
+    #[serde(default)]
+    target: String,
+    /// Optional exact visible name / role / container text (region, field, column or group).
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    within: Option<String>,
+    #[serde(default)]
     text: Option<String>,
-    expected_text: String,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    direction: Option<String>,
+    /// Observable result that must hold before the next step (literal text first, then JEV yes/no).
+    #[serde(default)]
+    expect: Option<String>,
+    #[serde(default)]
+    expected_text: Option<String>,
+    /// Extra attempts of this step while `expect` is not yet met (e.g. sort toggles asc → desc).
+    #[serde(default)]
+    repeat: usize,
+    /// Skip instead of handing off when the target is absent (e.g. a cookie banner).
+    #[serde(default)]
+    optional: bool,
+}
+
+impl Step {
+    fn expect(&self) -> Option<&str> { self.expect.as_deref().or(self.expected_text.as_deref()).filter(|s| !s.trim().is_empty()) }
+    fn describe(&self) -> String {
+        let mut text = format!("{} {}", self.action, if self.target.is_empty() { self.name.as_deref().unwrap_or("页面") } else { &self.target });
+        if let Some(name) = self.name.as_deref().filter(|_| !self.target.is_empty()) { text += &format!(" (名称={name})"); }
+        if let Some(within) = &self.within { text += &format!(" 位于「{within}」"); }
+        if let Some(value) = &self.text { text += &format!(" 输入「{}」", short(value, 60)); }
+        if let Some(key) = &self.key { text += &format!(" 按键 {key}"); }
+        if let Some(expect) = self.expect() { text += &format!(" → 期望：{expect}"); }
+        text
+    }
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -58,7 +100,8 @@ const PATH_DEPTH: usize = 4;
 const STATE_REPEATS: usize = 3;
 
 fn parse(args: &Value) -> Result<Plan, String> {
-    let plan: Plan = serde_json::from_value(args["plan"].clone()).map_err(|_| "run 需要 task、authorization、expectedText，可选 inputs；不需要预列 steps")?;
+    let plan: Plan = serde_json::from_value(args["plan"].clone())
+        .map_err(|e| format!("plan 格式错误（{e}）；需要 task、authorization、expectedText，推荐 steps"))?;
     let valid = |s: &str, max: usize| !s.trim().is_empty() && s.chars().count() <= max;
     if !valid(&plan.task, 2000) || !valid(&plan.authorization, 1000) || !valid(&plan.expected_text, 500)
         || plan.inputs.len() > 8 || plan.inputs.iter().any(|i| i.name.chars().count() > 300
@@ -67,19 +110,77 @@ fn parse(args: &Value) -> Result<Plan, String> {
             || i.role.as_ref().is_some_and(|r| !valid(r, 80)) || i.text.chars().count() > 4000) {
         return Err("JEV 目标/授权/完成证据无效，inputs 最多8个非敏感字段".into());
     }
-    if plan.steps.len() > 8 || plan.steps.iter().any(|s|
-        !matches!(s.action.as_str(), "click" | "fill") || !valid(&s.name, 300) || !valid(&s.role, 80)
-        || !valid(&s.expected_text, 500) || (s.action == "fill" && s.text.is_none())
-        || (s.action == "click" && s.text.is_some()) || s.text.as_ref().is_some_and(|t| t.chars().count() > 4000)) {
-        return Err("steps 最多8步，需 action/name/role/expectedText，fill 需 text".into());
+    let optional = |v: &Option<String>, max: usize| v.as_ref().is_none_or(|s| valid(s, max));
+    if let Some((index, _)) = plan.steps.iter().enumerate().find(|(_, s)|
+        !matches!(s.action.as_str(), "click" | "fill" | "press" | "scroll")
+        || (matches!(s.action.as_str(), "click" | "fill") && !valid(&s.target, 300) && !optional(&s.name, 300))
+        || (matches!(s.action.as_str(), "click" | "fill") && s.target.trim().is_empty() && s.name.is_none())
+        || s.target.chars().count() > 300 || !optional(&s.name, 300) || !optional(&s.role, 80) || !optional(&s.within, 300)
+        || !optional(&s.expect, 500) || !optional(&s.expected_text, 500) || s.repeat > 3
+        || (s.action == "fill") != s.text.is_some() || s.text.as_ref().is_some_and(|t| t.chars().count() > 4000)
+        || (s.action == "press") != s.key.is_some()
+        || s.key.as_deref().is_some_and(|k| !matches!(k, "Enter" | "Tab" | "Escape" | "ArrowDown" | "ArrowUp" | "Space" | "Backspace"))
+        || s.direction.as_deref().is_some_and(|d| s.action != "scroll" || !matches!(d, "up" | "down" | "left" | "right"))) {
+        return Err(format!("steps[{index}] 无效：action 为 click/fill/press/scroll；click/fill 需 target（或 name）；fill 需 text；press 需 key（Enter/Tab/Escape/ArrowDown/ArrowUp/Space/Backspace）；scroll 可选 direction；repeat≤3"));
     }
+    if plan.steps.len() > 24 { return Err("steps 最多24步；更长的流程分段 run".into()); }
     if plan.control_names.len() > 16 || plan.control_names.iter().any(|n| !valid(n, 300)) {
         return Err("controlNames 最多16个非空控件名称片段".into());
     }
     if !(1..=64).contains(&plan.max_actions) { return Err("maxActions 必须为1–64".into()); }
     let mut fields = HashSet::new();
     if plan.inputs.iter().any(|i| !fields.insert((&i.name, &i.role, &i.field_context))) { return Err("inputs 字段重复".into()); }
+    let mut plan = plan;
+    plan.phrases = goal_phrases(&format!("{}\n{}\n{}", plan.task, plan.authorization, plan.expected_text));
     Ok(plan)
+}
+
+/// Concrete values a person would type into a search box: quoted text and Title-Case Latin
+/// phrases ("United States", "M Science"). Only the main model's own words are ever typed.
+fn goal_phrases(text: &str) -> Vec<String> {
+    static QUOTED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static TITLED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let quoted = QUOTED.get_or_init(|| regex::Regex::new(r#"[“"「『‘]([^“”"「」『』‘’\n]{2,40})[”"」』’]"#).unwrap());
+    // ASCII boundary on purpose: CJK characters are Unicode word characters, so `\b` would miss
+    // "改为United States".
+    let titled = TITLED.get_or_init(|| regex::Regex::new(r"(?:^|[^A-Za-z0-9.'\-])([A-Z][A-Za-z0-9.'\-]*(?:\s+(?:&\s+)?[A-Z0-9][A-Za-z0-9.'\-]*)*)").unwrap());
+    let mut out: Vec<String> = Vec::new();
+    for phrase in quoted.captures_iter(text).map(|c| c[1].trim().to_string())
+        .chain(titled.captures_iter(text).map(|c| c[1].trim().to_string())) {
+        if phrase.chars().count() >= 2 && phrase.chars().count() <= 40
+            && !out.iter().any(|p| p.eq_ignore_ascii_case(&phrase)) { out.push(phrase); }
+        // ponytail: 24 phrases per plan; longer goals should split into subgoals.
+        if out.len() >= 24 { break; }
+    }
+    out
+}
+
+fn search_like(item: &Value) -> bool {
+    matches!(item["role"].as_str(), Some("searchbox" | "combobox"))
+        || [&item["name"], &item["fieldContext"]].iter().any(|v| v.as_str().is_some_and(|s| {
+            let s = s.chars().take(80).collect::<String>().to_lowercase();
+            ["search", "filter", "find", "query", "keyword", "搜索", "查找", "筛选", "过滤", "检索"].iter().any(|k| s.contains(k))
+        }))
+}
+
+/// Goal phrases worth typing into this search box: stated in a clause that also mentions the
+/// field's context (e.g. "Region … United States"), and not already visible on the page.
+fn search_phrases(plan: &Plan, item: &Value, visible: &str) -> Vec<String> {
+    let context = format!("{} {}", item["name"].as_str().unwrap_or_default(),
+        item["fieldContext"].as_str().unwrap_or_default().chars().take(120).collect::<String>());
+    let context_lower = context.to_lowercase();
+    let generic = terms("search select all filter find query keyword 搜索 查找 筛选");
+    let anchors: HashSet<String> = terms(&context).difference(&generic).cloned().collect();
+    let goal = format!("{}\n{}", plan.task, plan.authorization);
+    let clauses: Vec<String> = goal.split(|c: char| "。；;\n，,、()（）".contains(c)).map(str::to_lowercase).collect();
+    let mut scored: Vec<(usize, &String)> = plan.phrases.iter().filter_map(|phrase| {
+        let lower = phrase.to_lowercase();
+        if visible.contains(&lower) || context_lower.contains(&lower) || item["value"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(phrase)) { return None; }
+        let score = clauses.iter().filter(|c| c.contains(&lower) && terms(c).intersection(&anchors).next().is_some()).count();
+        (score > 0).then_some((score, phrase))
+    }).collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().take(3).map(|(_, p)| p.clone()).collect()
 }
 
 fn input_matches(item: &Value, input: &Input) -> bool {
@@ -104,7 +205,7 @@ fn date_like(candidate: &Candidate) -> bool {
 
 fn delegated(item: &Value, plan: &Plan) -> bool {
     plan.inputs.iter().any(|i| input_matches(item, i))
-        || plan.steps.iter().any(|s| s.action == "fill" && item["name"] == s.name && item["role"] == s.role)
+        || plan.steps.iter().any(|s| s.action == "fill" && item["value"].as_str().is_some_and(|v| Some(v) == s.text.as_deref()))
 }
 
 fn short(text: &str, max: usize) -> String {
@@ -120,9 +221,12 @@ fn evidence(pages: &Value, plan: &Plan) -> String {
     let mut truncated = text.chars().count() > 12000;
     for page in pages["pages"].as_array().into_iter().flatten() {
         for item in page["items"].as_array().into_iter().flatten().filter(|i| i["inView"] == true) {
-            // Only disclose values of fields explicitly delegated by the main model.
+            // Only disclose values of fields explicitly delegated by the main model, or values that
+            // are the main model's own goal wording (typed into a search box).
+            let disclosed = delegated(item, plan)
+                || item["value"].as_str().is_some_and(|v| plan.phrases.iter().any(|p| v.eq_ignore_ascii_case(p)));
             states.push(json!({"frame":page["frame"],"name":item["name"],"role":item["role"],
-                "region":item["region"],"fieldContext":item["fieldContext"],"value":if delegated(item, plan) { item["value"].clone() } else { Value::Null },"selected":item["selected"],
+                "region":item["region"],"fieldContext":item["fieldContext"],"value":if disclosed { item["value"].clone() } else { Value::Null },"selected":item["selected"],
                 "expanded":item["expanded"],"sort":item["sort"],"columnKey":item["columnKey"],"disabled":item["disabled"],
                 "blockedBy":item["blockedBy"],"editable":item["editable"],"nodeId":item["nodeId"]}));
             if json!(states).to_string().chars().count() > 6000 { states.pop(); truncated = true; break; }
@@ -233,21 +337,36 @@ struct Candidate {
     words: String,
     fresh: bool,
     group: Option<String>,
+    /// Fill whose text comes from the goal wording rather than plan.inputs; never auto-filled.
+    derived: bool,
+    /// Click hint on a non-password editable control (guided fill steps bind here).
+    editable: bool,
 }
 
 impl Candidate {
     fn new(action: Value, key: Value, loose: Value, label: String, name: &str, context: &str) -> Self {
         Candidate { action, key: key.to_string(), loose: loose.to_string(), label,
-            name: name.trim().to_lowercase(), words: format!("{name} {context}"), fresh: false, group: None }
+            name: name.trim().to_lowercase(), words: format!("{name} {context}"), fresh: false, group: None, derived: false, editable: false }
     }
     fn kind(&self) -> &str { self.action["action"].as_str().unwrap_or_default() }
 }
 
 fn element_label(verb: &str, item: &Value) -> String {
-    let mut label = format!("{verb} \"{}\" [{}]", short(item["name"].as_str().unwrap_or_default(), 60), item["role"].as_str().unwrap_or_default());
+    let name = item["name"].as_str().unwrap_or_default();
+    let mut label = if name.is_empty() {
+        format!("{verb} 无名{}[{}]", if item["column"].is_object() { "表头图标" } else { "图标" }, item["role"].as_str().unwrap_or_default())
+    } else { format!("{verb} \"{}\" [{}]", short(name, 60), item["role"].as_str().unwrap_or_default()) };
+    if let Some(icon) = item["icon"].as_str() { label += &format!(" icon={icon}"); }
     if let Some(field) = item["fieldContext"].as_str().filter(|s| !s.is_empty()) { label += &format!(" 字段={}", short(field, 60)); }
-    else if let Some(column) = item["column"]["name"].as_str() { label += &format!(" 列={}#{}", short(column, 40), item["column"]["index"]); }
+    else if let Some(column) = item["column"]["name"].as_str() {
+        label += &format!(" 列={}#{}", short(column, 40), item["column"]["index"]);
+        if let Some(group) = item["column"]["group"].as_str().filter(|s| !s.is_empty()) { label += &format!(" 分组={}", short(group, 30)); }
+    }
     else if let Some(region) = item["region"].as_str().filter(|s| !s.is_empty()) { label += &format!(" @{}", short(region, 50)); }
+    // The URL path is the most reliable navigation evidence (…/top-charts/pc vs …/benchmark).
+    if let Some(path) = item["href"].as_str().and_then(|h| reqwest::Url::parse(h).ok()).map(|u| u.path().to_string()).filter(|p| p.len() > 1) {
+        label += &format!(" →{}", short(&path, 60));
+    }
     match item["selected"].as_bool().or_else(|| item["selected"].as_str().and_then(|s| s.parse().ok())) {
         Some(true) => label += " 已选中", Some(false) => label += " 未选中", None => (),
     }
@@ -297,6 +416,7 @@ fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<
             scrolls.extend(scroll_hints(page, None, true));
         }
         let focused = page["focus"]["identity"].as_u64().map(|id| format!(":{id}"));
+        let visible = page["visibleText"].as_str().or(page["text"].as_str()).unwrap_or_default().to_lowercase();
         for item in page["items"].as_array().ok_or("缺少 DOM 元素")? {
             let name = item["name"].as_str().unwrap_or_default();
             let role = item["role"].as_str().unwrap_or_default();
@@ -313,8 +433,10 @@ fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<
                 // Clicking an editable control can open a date picker or combobox without typing.
                 let key = json!({"action":"click","frame":page["frame"],"nodeId":item["nodeId"],
                     "name":name,"role":role,"region":item["region"],"fieldContext":item["fieldContext"],"expanded":item["expanded"]});
-                result.push(Candidate::new(json!({"action":"click","frame":page["frame"],"ref":item["ref"]}), key,
-                    loose("click", &Value::Null), element_label("点击", item), name, &context));
+                let mut click = Candidate::new(json!({"action":"click","frame":page["frame"],"ref":item["ref"]}), key,
+                    loose("click", &Value::Null), element_label("点击", item), name, &context);
+                click.editable = true;
+                result.push(click);
                 for input in &plan.inputs {
                     // Bind authorized text before presenting choices. A model must never
                     // be offered that text for unrelated fields, even when they have labels.
@@ -341,6 +463,19 @@ fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<
                     result.push(Candidate::new(json!({"action":"fill","frame":page["frame"],"ref":item["ref"],"text":input.text}), key,
                         loose("fill", &text), format!("{} = \"{}\"", element_label("填写", item), short(&input.text, 40)), name, &context));
                 }
+                // Like a person: the goal names a value that the list does not show → type it into the
+                // panel's search box. Only search/filter boxes, only the main model's own words.
+                if search_like(item) && !plan.inputs.iter().any(|input| input_matches(item, input)) {
+                    for phrase in search_phrases(plan, item, &visible) {
+                        let text = json!(phrase);
+                        let key = json!({"action":"fill","frame":page["frame"],"nodeId":item["nodeId"],"name":name,"role":role,
+                            "fieldContext":item["fieldContext"],"text":phrase,"derivedFrom":"任务文字中与该字段同句出现、页面上尚不可见的值；仅用于搜索/筛选"});
+                        let mut candidate = Candidate::new(json!({"action":"fill","frame":page["frame"],"ref":item["ref"],"text":phrase}), key,
+                            loose("fill", &text), format!("{} = \"{}\"（来自任务文字）", element_label("搜索框输入", item), short(&phrase, 40)), name, &context);
+                        candidate.derived = true;
+                        result.push(candidate);
+                    }
+                }
                 continue;
             }
             if !(matches!(role, "button" | "a" | "link" | "tab" | "menuitem" | "menuitemcheckbox" | "menuitemradio" | "option" | "radio" | "checkbox" | "combobox" | "summary")
@@ -350,7 +485,7 @@ fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<
                     && !item["scroll"].is_object())) { continue; }
             let key = json!({"action":"click","frame":page["frame"],"nodeId":item["nodeId"],
                 "name":name,"role":role,"region":item["region"],"fieldContext":item["fieldContext"],"href":item["href"],"text":Value::Null,
-                "column":item["column"],"sort":item["sort"],"selected":item["selected"],"expanded":item["expanded"]});
+                "column":item["column"],"sort":item["sort"],"icon":item["icon"],"selected":item["selected"],"expanded":item["expanded"]});
             result.push(Candidate::new(json!({"action":"click","frame":page["frame"],"ref":item["ref"]}), key,
                 loose("click", &Value::Null), element_label("点击", item), name, &context));
         }
@@ -435,7 +570,7 @@ fn shortlist(all: &[Candidate], plan: &Plan, skip: &HashSet<String>) -> Batch {
         let mut score = relevance(c);
         if terms(&c.words).intersection(&primary).next().is_some() { score += 10; }
         if c.fresh { score += 150; }
-        score + match c.kind() { "fill" => 1000, "press" => 400, "scroll" if c.action["ref"].is_null() => 40, "scroll" => 15, _ => 0 }
+        score + match c.kind() { "fill" if c.derived => 300, "fill" => 1000, "press" => 400, "scroll" if c.action["ref"].is_null() => 40, "scroll" => 15, _ => 0 }
     };
     let open: Vec<usize> = (0..all.len()).filter(|&i| !skip.contains(&all[i].key) || all[i].kind() == "fill").collect();
     let mut sizes = HashMap::<&str, usize>::new();
@@ -479,21 +614,226 @@ fn shortlist(all: &[Candidate], plan: &Plan, skip: &HashSet<String>) -> Batch {
     batch
 }
 
-fn step_candidate(pages: &Value, step: &Step) -> Result<Candidate, String> {
-    let matches: Vec<_> = pages["pages"].as_array().into_iter().flatten()
-        .flat_map(|p| p["items"].as_array().into_iter().flatten().map(move |i| (p, i)))
-        .filter(|(_, i)| i["name"] == step.name && i["role"] == step.role).collect();
-    if matches.len() != 1 { return Err("预列步骤目标缺失或不唯一".into()); }
-    let (page, item) = matches[0];
-    if item["inView"] != true || item["disabled"] == true || item["blockedBy"].is_string()
-        || !item["ref"].is_string() || !page["frame"].is_u64()
-        || (step.action == "fill" && item["editable"] != true) {
-        return Err("预列步骤目标当前不可操作".into());
+/// A control name mentioned only to be excluded ("…不是顶部的 Search…", "不要点…") must repel
+/// instead of attract. Short generic names ("search", "确认") are descriptive, not identifiers,
+/// so only specific names (long or multi-word) are treated as exclusions.
+fn negated_mention(target: &str, name: &str) -> bool {
+    if name.chars().count() < 8 && !name.contains(' ') { return false; }
+    const CUES: &[&str] = &["不是", "不要", "禁止", "别点", "别选", "勿", "避免", "而非", "而不是", "不用", "不需要", "无需", "不点", "排除"];
+    let mut found = false;
+    let mut idx = 0;
+    while let Some(pos) = target[idx..].find(name) {
+        found = true;
+        let before: String = target[..idx + pos].chars().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+        if !CUES.iter().any(|w| before.contains(w)) { return false; }
+        idx += pos + name.len();
     }
-    let mut action = json!({"action":step.action,"frame":page["frame"],"ref":item["ref"]});
-    if let Some(text) = &step.text { action["text"] = json!(text); }
-    let key = json!([step.action, step.name, step.role, step.text, step.expected_text]);
-    Ok(Candidate::new(action, key.clone(), key, element_label(if step.action == "fill" {"填写"} else {"点击"}, item), &step.name, ""))
+    found
+}
+
+/// How well a hint matches a guided step. Exact name, quoted text and container are decisive;
+/// description words, role words ("复选框", "排序图标"…) and freshness break ties.
+fn step_score(step: &Step, c: &Candidate) -> i64 {
+    let key: Value = serde_json::from_str(&c.key).unwrap_or(Value::Null);
+    match step.action.as_str() {
+        "fill" if !c.editable => return i64::MIN,
+        "click" if c.kind() != "click" => return i64::MIN,
+        "scroll" => {
+            if c.kind() != "scroll" || key["direction"] != step.direction.as_deref().unwrap_or("down") { return i64::MIN; }
+            if step.target.trim().is_empty() { return if c.action["ref"].is_null() { 60 } else { 1 }; }
+        }
+        _ => (),
+    }
+    let target = step.target.to_lowercase();
+    let label = c.label.to_lowercase();
+    let context = [&key["region"], &key["fieldContext"], &key["column"]["name"], &key["column"]["group"]].iter()
+        .filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ").to_lowercase();
+    let role = key["role"].as_str().unwrap_or_default();
+    let has = |words: &[&str]| words.iter().any(|w| target.contains(w));
+    let mut score = 0i64;
+    if let Some(name) = &step.name {
+        let name = name.trim().to_lowercase();
+        // `name` may identify the column/group rather than the control's own visible text:
+        // name "Digital Units" + target "…排序图标" means that column's icon, not the header text.
+        // Without this, the -60 nameless penalty buries the right icon under the header text.
+        let col = key["column"]["name"].as_str().unwrap_or_default().trim().to_lowercase();
+        let grp = key["column"]["group"].as_str().unwrap_or_default().trim().to_lowercase();
+        let col_hit = !col.is_empty() && col.chars().count() >= 2 && (col == name || col.contains(&name) || name.contains(&col));
+        let grp_hit = !grp.is_empty() && grp.chars().count() >= 2 && (grp == name || grp.contains(&name) || name.contains(&grp));
+        if col_hit {
+            score += if c.name.is_empty() { 60 } else if c.name == name { 100 } else { 25 };
+        } else if grp_hit {
+            score += 25;
+        } else {
+            score += if c.name == name { 100 } else if !c.name.is_empty() && (c.name.contains(&name) || name.contains(&c.name)) { 35 } else { -60 };
+        }
+    }
+    static QUOTED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let quoted = QUOTED.get_or_init(|| regex::Regex::new(r#"[“"「『‘]([^“”"「」『』‘’\n]{1,60})[”"」』’]"#).unwrap());
+    for q in quoted.captures_iter(&step.target) {
+        let q = q[1].trim().to_lowercase();
+        if negated_mention(&target, &q) { continue; }
+        if c.name == q { score += 80 } else if label.contains(&q) || context.contains(&q) { score += 25 }
+    }
+    // A control whose whole name appears in the description; longer names are more specific.
+    // A name mentioned only to be excluded ("不是…", "不要点…") repels instead of attracting.
+    if c.name.chars().count() >= 2 && target.contains(&c.name) {
+        score += if negated_mention(&target, &c.name) { -60 } else { 30 + c.name.chars().count().min(20) as i64 };
+    }
+    let generic = terms("点击 click 按钮 button 复选框 勾选 checkbox 输入框 文本框 input 图标 icon 排序 链接 link 菜单 menu 选项 option 下的 里的 中的 面板 panel 的 列 column");
+    let wanted: HashSet<String> = terms(&target).difference(&generic).cloned().collect();
+    let hit = wanted.intersection(&terms(&format!("{label} {context}"))).count();
+    score += 12 * hit as i64;
+    if !wanted.is_empty() && hit == wanted.len() { score += 15; }
+    let icon = key["icon"].as_str().unwrap_or_default();
+    if has(&["复选框", "勾选", "checkbox"]) && (matches!(role, "checkbox" | "menuitemcheckbox") || !key["selected"].is_null()) { score += 25; }
+    if has(&["搜索框", "输入框", "文本框", "input", "search box"]) && c.editable { score += 25; }
+    if has(&["图标", "icon"]) { score += if c.name.is_empty() { 25 } else { -30 }; }
+    if has(&["排序", "sort"]) && (["sort", "caret", "order", "asc", "desc"].iter().any(|k| icon.contains(k)) || !key["sort"].is_null()) { score += 25; }
+    if has(&["按钮", "button"]) && role == "button" { score += 10; }
+    if has(&["链接", "link", "菜单", "menu"]) && matches!(role, "a" | "link" | "menuitem" | "li") { score += 10; }
+    if has(&["选项", "option"]) && matches!(role, "option" | "menuitemcheckbox" | "menuitemradio" | "checkbox" | "radio") { score += 10; }
+    // Table disambiguation: a column/group named in the description is decisive, so the
+    // wrong column's icon cannot tie with the right one (sort icon vs header text vs sibling column).
+    if let Some(col) = key["column"]["name"].as_str() {
+        let col = col.trim().to_lowercase();
+        if col.chars().count() >= 2 && target.contains(&col) { score += 20; }
+    }
+    if let Some(group) = key["column"]["group"].as_str() {
+        let group = group.trim().to_lowercase();
+        if group.chars().count() >= 2 && target.contains(&group) { score += 10; }
+    }
+    if let Some(within) = &step.within {
+        let within = within.to_lowercase();
+        score += if context.contains(&within) || label.contains(&within) { 40 } else { -40 };
+    }
+    if let Some(wanted) = &step.role { score += if role.eq_ignore_ascii_case(wanted) { 30 } else { -30 }; }
+    if c.fresh { score += 15; }
+    score
+}
+
+/// Local certainty: a strong match clearly ahead of the runner-up. Anything closer goes to JEV.
+fn step_confident(best: i64, second: Option<i64>) -> bool {
+    best >= 40 && second.is_none_or(|s| best - s >= 25)
+}
+
+fn step_ranking<'a>(step: &Step, all: &'a [Candidate]) -> Vec<(i64, &'a Candidate)> {
+    let mut ranked: Vec<(i64, &Candidate)> = all.iter().map(|c| (step_score(step, c), c)).filter(|(s, _)| *s > 0).collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    ranked
+}
+
+/// A fill step carrying an input's exact text may only bind to that input's field (or a derived
+/// search candidate with the same text) — never to an unrelated box that happens to match the
+/// description. Steps with novel text keep legacy freedom.
+fn rank_for_step<'a>(step: &Step, plan: &Plan, all: &'a [Candidate]) -> Vec<(i64, &'a Candidate)> {
+    let mut ranked = step_ranking(step, all);
+    if step.action == "fill" {
+        if let Some(text) = step.text.as_deref() {
+            if plan.inputs.iter().any(|i| i.text == text) {
+                ranked.retain(|(_, c)| {
+                    let key: Value = serde_json::from_str(&c.key).unwrap_or(Value::Null);
+                    if key["text"].as_str() == Some(text) { return true; }
+                    // The clickable face of the authorized field (the fill action is built on bind).
+                    c.editable && plan.inputs.iter().any(|i| i.text == text && input_matches(
+                        &json!({"name":key["name"],"role":key["role"],"fieldContext":key["fieldContext"]}), &i))
+                });
+            }
+        }
+    }
+    ranked
+}
+
+/// The executable action for a step bound to a hint.
+fn bind_step(step: &Step, index: usize, c: &Candidate) -> Candidate {
+    let mut bound = c.clone();
+    if step.action == "fill" {
+        bound.action = json!({"action":"fill","frame":c.action["frame"],"ref":c.action["ref"],"text":step.text});
+        bound.label = format!("{} = \"{}\"", c.label.replacen("点击", "填写", 1), short(step.text.as_deref().unwrap_or_default(), 40));
+        bound.key = format!("{}|fill|{}", c.key, step.text.as_deref().unwrap_or_default());
+    }
+    bound.label = format!("第{}步 {}", index + 1, bound.label);
+    bound
+}
+
+/// Only steps that cannot change what the following targets mean may run back-to-back in one act:
+/// typing, Tab, and toggling a selection. Menus, links, submits and Enter end the batch.
+fn chains(step: &Step, bound: &Candidate) -> bool {
+    if step.expect().is_some() || step.repeat > 0 { return false; }
+    let key: Value = serde_json::from_str(&bound.key.split("|fill|").next().unwrap_or_default()).unwrap_or(Value::Null);
+    match step.action.as_str() {
+        "fill" => true,
+        "press" => step.key.as_deref() == Some("Tab"),
+        "click" => matches!(key["role"].as_str(), Some("checkbox" | "radio" | "option" | "menuitemcheckbox" | "menuitemradio"))
+            && key["haspopup"].is_null(),
+        _ => false,
+    }
+}
+
+fn literal_met(pages: &Value, expect: &str) -> bool {
+    let haystack = pages["pages"].as_array().into_iter().flatten()
+        .map(|p| format!("{} {} {}", p["url"].as_str().unwrap_or_default(),
+            p["visibleText"].as_str().or(p["text"].as_str()).unwrap_or_default(), p["title"].as_str().unwrap_or_default()))
+        .collect::<Vec<_>>().join("\n").to_lowercase();
+    expect.split(['|', '｜']).map(str::trim).filter(|s| !s.is_empty()).any(|s| haystack.contains(&s.to_lowercase()))
+}
+
+/// Panel selections usually need a commit step. Runs that changed a selection or filled a
+/// value but never clicked the panel's Confirm-like button report a precise failure: the literal
+/// completion text often matches already ("Germany" appears as selected), yet the filter is not
+/// applied. Triggers only when commit buttons were visibly offered while the panel was open — not
+/// merely present somewhere on the page — so pure read runs never see this error.
+fn needs_commit(plan: &Plan, history: &[Value], pages: &Value) -> Option<String> {
+    const COMMIT_WORDS: &[&str] = &["确认", "Apply", "apply", "Confirm", "confirm", "应用", "提交"];
+    if !COMMIT_WORDS.iter().any(|w| plan.authorization.contains(w) || plan.task.contains(w)) { return None; }
+    // The panel must actually have been interacted with: a fill, or a selection that flipped on.
+    let changed_selection = json!(history).to_string().contains("已选中");
+    let filled = history.iter().flat_map(|h| h["actions"].as_array().into_iter().flatten()).filter_map(Value::as_str)
+        .any(|a| a.contains("填写"));
+    if !changed_selection && !filled { return None; }
+    // "填写" alone only counts when it typed a filter value (option text / search phrase),
+    // not a date or other unrelated field.
+    if !changed_selection && filled {
+        let typed_filter_value = history.iter().flat_map(|h| h["actions"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str).any(|a| a.contains("填写") && {
+                let lower = a.to_lowercase();
+                plan.inputs.iter().any(|i| !i.text.trim().is_empty() && lower.contains(&i.text.trim().to_lowercase()))
+                    || plan.phrases.iter().any(|p| !p.is_empty() && lower.contains(&p.to_lowercase()))
+            });
+        if !typed_filter_value { return None; }
+    }
+    let actions: Vec<&str> = history.iter().flat_map(|h| h["actions"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str).collect();
+    const NAMES: &[&str] = &["confirm", "apply", "submit", "save", "确认", "确定", "应用", "提交", "保存"];
+    let commit = pages["pages"].as_array()?.iter()
+        .flat_map(|p| p["items"].as_array().into_iter().flatten())
+        .find(|i| i["inView"] == true && i["disabled"] != true && i["ref"].is_string()
+            && NAMES.iter().any(|n| i["name"].as_str().unwrap_or_default().trim().eq_ignore_ascii_case(n)))?;
+    let name = commit["name"].as_str().unwrap_or_default();
+    if actions.iter().any(|a| a.contains(name)) { return None; }
+    // Already applied? The value shows outside the option itself: a filter summary pill
+    // ("Country/Market Germany") or the URL. Selecting often applies immediately; only
+    // insist on the commit click when nothing shows the filter took effect.
+    let want = plan.expected_text.trim().to_lowercase();
+    if !want.is_empty() {
+        let applied = pages["pages"].as_array().into_iter().flatten().any(|p| {
+            p["url"].as_str().is_some_and(|u| u.to_lowercase().contains(&want))
+                || p["items"].as_array().into_iter().flatten().any(|i| i["inView"] == true
+                    && i["name"].as_str().is_some_and(|n| n.to_lowercase().contains(&want))
+                    && !matches!(i["role"].as_str(),
+                        Some("checkbox" | "radio" | "option" | "menuitem" | "menuitemcheckbox" | "menuitemradio" | "li")))
+        });
+        if applied { return None; }
+    }
+    // The commit button was a choice on an earlier screen only if its state survived a
+    // refresh (selection flips, panel search results) or it sits next to one.
+    let beside_panel = pages["pages"].as_array().into_iter().flatten()
+        .flat_map(|p| p["items"].as_array().into_iter().flatten())
+        .any(|i| i["selected"].is_boolean() || i["expanded"] == "true");
+    let panel_interaction = history.iter().flat_map(|h| h["actions"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str).any(|a| a.contains("面板") || a.contains("复选") || a.contains("panel") || a.contains("checkbox"));
+    if !changed_selection && !panel_interaction && !beside_panel { return None; }
+    Some(format!("本轮已勾选/填写，但「{name}」仍可点击且本轮未点，筛选可能尚未生效；请新起一次 run，只提交一步点击「{name}」(target 写明所在面板/筛选区)，然后核验「{}", plan.expected_text))
 }
 
 // ponytail: allow up to 15s without progress; long-running jobs need a separate monitoring goal.
@@ -558,6 +898,39 @@ fn decision_evidence(pages: &Value, plan: &Plan, list: &BTreeMap<String, Candida
     evidence(&view, plan)
 }
 
+/// Observable consequence of one action: navigation, newly surfaced controls, newly visible text
+/// (tooltips, validation, result counts) and changed control states. Empty = nothing happened.
+fn action_effect(before: &Value, after: &Value, plan: &Plan) -> Value {
+    let url = |pages: &Value| pages["pages"][0]["url"].as_str().unwrap_or_default().to_string();
+    let lines = |pages: &Value| -> Vec<String> {
+        pages["pages"].as_array().into_iter().flatten()
+            .flat_map(|p| p["visibleText"].as_str().or(p["text"].as_str()).unwrap_or_default().lines().map(str::trim).map(String::from).collect::<Vec<_>>())
+            .filter(|l| !l.is_empty()).collect()
+    };
+    let old_lines: HashSet<String> = lines(before).into_iter().collect();
+    let new_text: Vec<String> = lines(after).into_iter().filter(|l| !old_lines.contains(l)).take(4).map(|l| short(&l, 80)).collect();
+    let none = HashSet::new();
+    let old_controls: HashSet<String> = candidates(before, plan, &none).unwrap_or_default().into_iter().map(|c| c.loose).collect();
+    let new_controls: Vec<String> = candidates(after, plan, &none).unwrap_or_default().into_iter()
+        .filter(|c| c.kind() != "scroll" && !old_controls.contains(&c.loose)).map(|c| c.label).collect();
+    let states = |pages: &Value| -> HashMap<String, Value> {
+        pages["pages"].as_array().into_iter().flatten().flat_map(|p| p["items"].as_array().into_iter().flatten())
+            .filter_map(|i| Some((i["nodeId"].as_str()?.to_string(), json!([i["selected"], i["expanded"], i["sort"], i["icon"], i["name"]]))))
+            .collect()
+    };
+    let old_states = states(before);
+    let changed: Vec<String> = after["pages"].as_array().into_iter().flatten().flat_map(|p| p["items"].as_array().into_iter().flatten())
+        .filter(|i| i["nodeId"].as_str().and_then(|id| old_states.get(id))
+            .is_some_and(|old| old != &json!([i["selected"], i["expanded"], i["sort"], i["icon"], i["name"]])))
+        .take(6).map(|i| element_label("", i).trim().to_string()).collect();
+    let (from, to) = (url(before), url(after));
+    let nothing = from == to && new_text.is_empty() && new_controls.is_empty() && changed.is_empty();
+    json!({"url":if from != to { json!(to) } else { Value::Null },
+        "newControls":new_controls.iter().take(6).collect::<Vec<_>>(),"newControlCount":new_controls.len(),
+        "newText":new_text,"changed":changed,
+        "summary":if nothing { "页面没有可见变化：该动作可能无效，换目标或方法" } else { "" }})
+}
+
 fn fill_identity(pages: &Value, action: &Value) -> Option<String> {
     if action["action"] != "fill" { return None; }
     let page = pages["pages"].as_array()?.iter().find(|p| p["frame"] == action["frame"])?;
@@ -575,17 +948,32 @@ fn choice_description(candidate: &Candidate) -> String {
             None => "切换选择状态（不是展开）；当前选中状态不明确",
         });
     }
+    if description["action"] == "click" && ["confirm", "apply", "submit", "save", "确认", "确定", "应用", "提交", "保存"]
+        .iter().any(|n| description["name"].as_str().unwrap_or_default().trim().eq_ignore_ascii_case(n)) {
+        description["effect"] = json!("确认/应用按钮：面板内的勾选或填写通常要点它才真正生效；若本轮刚勾选/填写过，下一步通常是点它");
+    }
     if description["action"] == "scroll" {
         return format!("{fresh}{}；当前位置={}，内容长度={}，可见长度={}。用于寻找视口外的控件/表头，执行后检查实际位移。",
             candidate.label, description["position"], description["extent"], description["viewport"]);
     }
-    if let Some(fields) = description.as_object_mut() {
-        fields.retain(|k, v| !v.is_null() && k != "nodeId" && k != "binding");
-        if let Some(region) = fields.get("region").and_then(Value::as_str) {
-            fields.insert("region".into(), json!(region.chars().take(120).collect::<String>()));
-        }
+    if description["action"] == "click" && description["column"].is_object() {
+        let icon = description["icon"].as_str().unwrap_or_default();
+        description["effect"] = json!(if description["name"].as_str().is_some_and(|n| !n.is_empty()) {
+            "表头文字：可能只弹出释义浮层而不排序；若上一步点它只出现释义文字，改点同列的无名排序图标"
+        } else if ["sort", "caret", "order", "asc", "desc"].iter().any(|k| icon.contains(k)) {
+            "表头排序图标：切换该列排序（常见顺序 无→升序→降序）；先核对列名/分组，同名列看分组与序号"
+        } else { "表头内无名图标：通常是排序或筛选入口，看 icon 提示" });
     }
-    format!("{fresh}{} {}", candidate.kind(), description).chars().take(1200).collect()
+    // The label already carries name/role/context/icon/href/state; only keep fields it lacks.
+    let mut extra = serde_json::Map::new();
+    for key in ["effect", "text", "authorizedField", "derivedFrom", "expanded", "haspopup"] {
+        if let Some(value) = description.get(key).filter(|v| !v.is_null()) { extra.insert(key.into(), value.clone()); }
+    }
+    if let Some(region) = description["region"].as_str().filter(|r| !r.is_empty() && !candidate.label.contains(&short(r, 50))) {
+        extra.insert("region".into(), json!(short(region, 100)));
+    }
+    let extra = if extra.is_empty() { String::new() } else { format!(" {}", Value::Object(extra)) };
+    format!("{fresh}{}{extra}", candidate.label).chars().take(700).collect()
 }
 
 struct Run<'a> {
@@ -617,15 +1005,42 @@ struct Run<'a> {
     pending: VecDeque<(String, String)>,
     path_url: Value,
     loading_since: Option<Instant>,
+    // Guided mode (plan.steps): progress, how targets were bound, and expectation checks.
+    raw_steps: Value,
+    step_index: usize,
+    resolved_locally: usize,
+    resolved_by_jev: usize,
+    checks: Vec<Value>,
+    step_candidates: Vec<String>,
 }
+
+enum Resolution { Found(Candidate), Missing, Ambiguous(String) }
+
+fn press_candidate(step: &Step, index: usize) -> Candidate {
+    let key = step.key.as_deref().unwrap_or_default();
+    Candidate::new(json!({"action":"press","key":key}), json!({"action":"press","key":key,"step":index}),
+        json!(["press", key, index]), format!("第{}步 按键 {key}", index + 1), "", "")
+}
+
+const PICK_INSTRUCTIONS: &str = "主模型已经决定了这一步要做什么，你只负责从候选中找出这一步所指的那个控件。\
+依次核对：名称或含义（界面可能是英文，按语义匹配）、所在区域/字段/列与分组、图标类型、链接路径；\
+[新] 表示上一步刚出现（例如刚展开的菜单或面板），通常就是这一步要找的。\
+上一步点击后页面没有变化的控件不要再选；刚展开的菜单或面板中新出现的选项优先于背景里的同名控件。\
+只选完全对应的一个；都不对，或有两个同样符合时选 defer。";
+
+const CHECK_INSTRUCTIONS: &str = "只根据最新页面证据判断期望是否已经成立。排序看 sort/aria-sort、icon 状态、URL 参数和表格数据的实际顺序；\
+筛选看选中集合（selectionFields）与筛选区文字；日期看 dateFields；导航看 URL 和标题。\
+只出现释义/提示文字不算完成。证据不足选 defer。";
 
 impl Run<'_> {
     fn args(&self, mut value: Value) -> Value {
         value[self.target_key] = json!(self.target);
         value
     }
+    // JEV reads the full stored observation; the inline summary only goes back to the main model,
+    // so keep it small enough to never be truncated into a file the model has to read with a shell.
     fn inspect_args(&self) -> Value {
-        self.args(json!({"operation":"inspect","scope":"viewport","visual":"none","maxTextChars":12000}))
+        self.args(json!({"operation":"inspect","scope":"viewport","visual":"none","maxTextChars":2500,"maxItems":30}))
     }
     fn pages(&self) -> Result<Value, String> {
         crate::native_browser::jev_observation(self.root, &self.args(json!({"snapshotId":self.snapshot})), self.owner, self.tool)
@@ -644,8 +1059,9 @@ impl Run<'_> {
     }
 
     /// Executes one batch (a single hint, or several reflex fills) from the observed state.
-    /// Ok(false) means DOM preflight failed before any input: re-decide from fresh DOM.
-    async fn perform(&mut self, pages: &Value, state: &str, anchors: HashSet<String>, batch: Vec<Candidate>, node: &str) -> Result<bool, String> {
+    /// Ok(None): DOM preflight failed before any input — re-decide from fresh DOM.
+    /// Ok(Some(n)): the first n actions of the batch completed (the rest sent no input).
+    async fn perform(&mut self, pages: &Value, state: &str, anchors: HashSet<String>, batch: Vec<Candidate>, node: &str) -> Result<Option<usize>, String> {
         let repeats = self.state_actions.entry(state.to_string()).or_default();
         *repeats += 1;
         if *repeats > STATE_REPEATS { return Err("同一页面状态已多次操作仍未推进，疑似循环；交回主模型".into()); }
@@ -653,7 +1069,7 @@ impl Run<'_> {
         self.baseline = Some(anchors);
         let actions: Vec<Value> = batch.iter().map(|c| c.action.clone()).collect();
         let mut args = self.args(json!({"operation":"act","snapshotId":self.snapshot,
-            "feedback":"inspect","scope":"viewport","visual":"none","maxTextChars":12000}));
+            "feedback":"inspect","scope":"viewport","visual":"none","maxTextChars":2500,"maxItems":30}));
         if actions.len() == 1 { args["action"] = actions[0].clone(); } else { args["actions"] = json!(actions); }
         let result = match execute_browser(self.root, &args, self.owner, self.tool).await {
             Ok(value) => value,
@@ -680,11 +1096,11 @@ impl Run<'_> {
             self.pending.clear();
             if !result["snapshotId"].is_string() || result["observationError"].is_string() { self.refresh().await?; }
             else { self.snapshot = result["snapshotId"].clone(); }
-            return Ok(false);
+            return Ok(None);
         }
-        // A fill always selects all and replaces the value, so an interrupted fill batch is
-        // re-decided on fresh DOM (bounded by fill_attempts) instead of handing off.
-        let partial_fill = completed < batch.len() && batch.iter().all(|c| c.kind() == "fill");
+        // A fill always selects all and replaces the value, and a batch action that failed at DOM
+        // preflight sent no input: both are re-decided on fresh DOM instead of handing off.
+        let partial_fill = completed < batch.len() && (batch.iter().all(|c| c.kind() == "fill") || result["failedAtPreflight"] == true);
         if result["status"] != "executed" && !partial_fill {
             return Err(format!("执行不明确（{}）；交回主模型，不重放", result["reason"].as_str().or(result["error"].as_str()).unwrap_or("未知")));
         }
@@ -700,21 +1116,232 @@ impl Run<'_> {
         self.preflight = 0;
         self.loading_since = None;
         // Do not repeat an input in its immediate resulting state, including submit buttons.
-        let after = replay_evidence(&self.pages()?);
+        let fresh = self.pages()?;
+        let after = replay_evidence(&fresh);
         for c in batch.iter().take(completed) { self.used.insert((after.clone(), c.key.clone())); }
+        // What actually happened, so the next decision can tell "sorted" from "opened a tooltip".
+        let mut effect = action_effect(pages, &fresh, &self.plan);
+        if effect["summary"] != "" && batch.iter().any(|c| matches!(c.kind(), "click" | "press")) {
+            // SPA renders often land just after the input's feedback; glance once more before calling it a no-op.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let later = self.refresh().await?;
+            let later_state = replay_evidence(&later);
+            for c in batch.iter().take(completed) { self.used.insert((later_state.clone(), c.key.clone())); }
+            effect = action_effect(pages, &later, &self.plan);
+        }
+        if let Some(last) = self.history.last_mut() { last["effect"] = effect; }
         if partial_fill { self.pending.clear(); }
-        Ok(true)
+        Ok(Some(completed))
+    }
+
+    /// Binds a guided step to one control: confident local match first, otherwise one small JEV
+    /// multiple-choice question over the best ≤12 matches.
+    async fn resolve(&mut self, pages: &Value, all: &[Candidate], index: usize) -> Result<Resolution, String> {
+        let step = &self.plan.steps[index];
+        if step.action == "press" { return Ok(Resolution::Found(press_candidate(step, index))); }
+        let ranked = rank_for_step(step, &self.plan, all);
+        self.step_candidates = ranked.iter().take(6).map(|(score, c)| format!("{} (score {score})", c.label)).collect();
+        let Some(&(best, top)) = ranked.first() else { return Ok(Resolution::Missing) };
+        if step_confident(best, ranked.get(1).map(|r| r.0)) {
+            self.resolved_locally += 1;
+            return Ok(Resolution::Found(bind_step(step, index, top)));
+        }
+        let settings = crate::native_browser::jev_settings()?;
+        if !settings.jev_enabled { return Ok(Resolution::Ambiguous("多个相近候选且 JEV 未启用".into())); }
+        let options: Vec<&Candidate> = ranked.iter().take(12).map(|(_, c)| *c).collect();
+        let choices: BTreeMap<String, String> = options.iter().enumerate()
+            .map(|(n, c)| (format!("c{:02}", n + 1), choice_description(c))).collect();
+        let before: Vec<String> = self.plan.steps[..index].iter().rev().take(3).rev().map(Step::describe).collect();
+        let task = format!("整体目标：{}\n已完成的前几步：{}\n当前第{}/{}步：{}",
+            self.plan.task, json!(before), index + 1, self.plan.steps.len(), step.describe());
+        let visible: String = pages["pages"].as_array().into_iter().flatten()
+            .filter_map(|p| p["visibleText"].as_str().or(p["text"].as_str())).collect::<Vec<_>>().join("\n").chars().take(1500).collect();
+        let decision = crate::jev::choose(settings, &task, &format!("页面可见文字（节选）：{visible}"), &choices, PICK_INSTRUCTIONS).await?;
+        let choice = decision["choice"].as_str().unwrap_or_default().to_string();
+        self.decisions.push(json!({"choice":choice,"treePath":["pick", index + 1],"status":decision["status"],
+            "requestAttempted":decision["requestAttempted"],"elapsedMs":decision["elapsedMs"],"error":decision["error"]}));
+        let picked = choice.strip_prefix('c').and_then(|n| n.parse::<usize>().ok()).filter(|n| *n > 0).and_then(|n| options.get(n - 1));
+        match picked {
+            Some(c) if decision["status"] == "advised" => {
+                self.resolved_by_jev += 1;
+                Ok(Resolution::Found(bind_step(&self.plan.steps[index], index, c)))
+            }
+            _ => Ok(Resolution::Ambiguous(decision["error"].as_str().unwrap_or("JEV 无法在相近候选中确定").to_string())),
+        }
+    }
+
+    /// Asks JEV one yes/no question about the latest evidence. None = no usable answer.
+    async fn ask_met(&mut self, pages: &Value, expect: &str, step: usize) -> Result<Option<bool>, String> {
+        let settings = crate::native_browser::jev_settings()?;
+        if !settings.jev_enabled { return Ok(None); }
+        let choices = BTreeMap::from([("yes".to_string(), format!("已满足：{expect}")),
+            ("no".to_string(), "尚未满足：页面没变、只出现了释义/提示，或状态/数值与期望不符".to_string())]);
+        let done = self.plan.steps.get(step).map(Step::describe).unwrap_or_else(|| "全部步骤".into());
+        let task = format!("核验网页操作结果。整体目标：{}\n刚执行：{done}\n需要判断的期望：{expect}", self.plan.task);
+        let state: String = format!("最近动作及实际变化：{}\n最新页面：{}",
+            json!(self.history.iter().rev().take(2).collect::<Vec<_>>()), decision_evidence(pages, &self.plan, &BTreeMap::new()))
+            .chars().take(40000).collect();
+        let decision = crate::jev::choose(settings, &task, &state, &choices, CHECK_INSTRUCTIONS).await?;
+        let choice = decision["choice"].as_str().unwrap_or_default().to_string();
+        self.decisions.push(json!({"choice":choice,"treePath":["check", step + 1],"status":decision["status"],
+            "requestAttempted":decision["requestAttempted"],"elapsedMs":decision["elapsedMs"],"error":decision["error"]}));
+        Ok(match (decision["status"] == "advised", choice.as_str()) { (true, "yes") => Some(true), (true, "no") => Some(false), _ => None })
+    }
+
+    /// Waits (bounded) for an expectation: literal text/URL first — free and instant — then JEV
+    /// yes/no, asked at most twice so a slow render gets a second look.
+    async fn verify(&mut self, expect: &str, step: usize) -> Result<bool, String> {
+        let begun = Instant::now();
+        let mut asked = 0;
+        loop {
+            let pages = self.pages()?;
+            let loading = pages["pages"].as_array().into_iter().flatten().any(|p| p["loading"] == true);
+            let waited = begun.elapsed();
+            let mut verdict = (!loading && literal_met(&pages, expect)).then_some((true, "literal"));
+            if verdict.is_none() && !loading && ((asked == 0 && waited >= Duration::from_millis(800)) || (asked == 1 && waited >= Duration::from_millis(3500))) {
+                asked += 1;
+                verdict = match self.ask_met(&pages, expect, step).await? {
+                    Some(true) => Some((true, "jev")),
+                    Some(false) if asked == 2 => Some((false, "jev")),
+                    _ => None,
+                };
+            }
+            // ponytail: 6s per expectation; slower jobs need an explicit wait step or a new run.
+            if verdict.is_none() && waited >= Duration::from_secs(6) { verdict = Some((false, "timeout")); }
+            if let Some((met, by)) = verdict {
+                self.checks.push(json!({"step":step + 1,"expect":expect,"met":met,"by":by,"ms":waited.as_millis() as u64}));
+                return Ok(met);
+            }
+            tokio::time::sleep(POLL).await;
+            self.refresh().await?;
+        }
+    }
+
+    /// Guided mode: execute the main model's steps back-to-back. Steps that cannot change the
+    /// meaning of the next target (typing, Tab, toggling a selection) share one browser round-trip.
+    async fn drive_steps(&mut self, home: &str, started: Instant) -> Result<(), String> {
+        let total = self.plan.steps.len();
+        let (mut attempts, mut repeats, mut scrolled) = (0usize, 0usize, 0usize);
+        let mut step_started = Instant::now();
+        while self.step_index < total {
+            let index = self.step_index;
+            if started.elapsed() > RUN_BUDGET { return Err(format!("已达到连续执行时间预算（180秒），停在第{}步", index + 1)); }
+            if self.executed >= self.plan.max_actions { return Err(format!("已达到动作预算 maxActions，停在第{}步", index + 1)); }
+            let pages = self.pages()?;
+            if origin(&pages)? != home { return Err("页面跨站，需主模型重新确认授权".into()); }
+            if pages["pages"].as_array().into_iter().flatten().any(|p| p["loading"] == true) {
+                if self.loading_since.get_or_insert_with(Instant::now).elapsed() < LOAD_WAIT {
+                    tokio::time::sleep(POLL).await;
+                    self.refresh().await?;
+                    continue;
+                }
+            } else { self.loading_since = None; }
+            let state = replay_evidence(&pages);
+            // Same-state same-action never repeats: a control that just did nothing is excluded
+            // on retry (e.g. a header that only opened a tooltip), while toggles that changed
+            // state stay available. Mirrors goal mode.
+            let state_used: HashSet<String> = self.used.iter().filter(|(s, _)| s == &state).map(|(_, k)| k.clone()).collect();
+            let mut all = candidates(&pages, &self.plan, &state_used)?;
+            all.retain(|c| fill_identity(&pages, &c.action)
+                .is_none_or(|id| !self.filled.contains(&id) && self.fill_attempts.get(&id).is_none_or(|n| *n < 2)));
+            if let Some(base) = &self.baseline { for c in &mut all { c.fresh = c.kind() != "press" && !base.contains(&c.loose); } }
+            let anchors: HashSet<String> = all.iter().map(|c| c.loose.clone()).collect();
+            let first = match self.resolve(&pages, &all, index).await? {
+                Resolution::Found(c) => c,
+                Resolution::Ambiguous(why) => return Err(format!("第{}步目标不唯一（{why}）：{}；用 name/within 指定后从该步继续",
+                    index + 1, self.plan.steps[index].describe())),
+                Resolution::Missing => {
+                    // Late render after the previous step, then reveal by scrolling, then skip or hand off.
+                    if step_started.elapsed() < Duration::from_secs(3) {
+                        tokio::time::sleep(POLL).await;
+                        self.refresh().await?;
+                        continue;
+                    }
+                    if scrolled < 2 && self.plan.steps[index].action != "scroll" {
+                        if let Some(down) = all.iter().find(|c| c.kind() == "scroll" && c.action["ref"].is_null()
+                            && c.action["delta"].as_i64().is_some_and(|d| d > 0)).cloned() {
+                            scrolled += 1;
+                            self.note("reveal", json!(down.label));
+                            self.perform(&pages, &state, anchors, vec![down], "reveal").await?;
+                            continue;
+                        }
+                    }
+                    if self.plan.steps[index].optional {
+                        self.note("skip", json!(self.plan.steps[index].describe()));
+                        self.step_index += 1;
+                        (attempts, repeats, scrolled, step_started) = (0, 0, 0, Instant::now());
+                        continue;
+                    }
+                    return Err(format!("第{}步未找到目标：{}", index + 1, self.plan.steps[index].describe()));
+                }
+            };
+            let mut batch = vec![first];
+            while batch.len() < 8 && index + batch.len() < total && chains(&self.plan.steps[index + batch.len() - 1], batch.last().unwrap()) {
+                let next_index = index + batch.len();
+                let next = &self.plan.steps[next_index];
+                let bound = if next.action == "press" { press_candidate(next, next_index) } else {
+                    let ranked = rank_for_step(next, &self.plan, &all);
+                    match ranked.first() {
+                        Some(&(best, c)) if matches!(next.action.as_str(), "click" | "fill")
+                            && step_confident(best, ranked.get(1).map(|r| r.0))
+                            && !batch.iter().any(|b| b.action["ref"].is_string() && b.action["ref"] == c.action["ref"]) => {
+                            self.resolved_locally += 1;
+                            bind_step(next, next_index, c)
+                        }
+                        _ => break,
+                    }
+                };
+                batch.push(bound);
+            }
+            self.note("step", json!(batch.iter().map(|c| c.label.clone()).collect::<Vec<_>>()));
+            let Some(mut done) = self.perform(&pages, &state, anchors, batch, "step").await? else {
+                attempts += 1;
+                if attempts > 3 { return Err(format!("第{}步目标多次校验失败（被遮挡或仍在变化）", index + 1)); }
+                continue;
+            };
+            if done == 0 && self.plan.steps[index].action == "fill" && self.latest["reason"].as_str().is_some_and(|r| r.contains("实际值")) {
+                done = 1; // the page normalised the typed value (formatter/date widget); `expect` decides
+            }
+            if let Some(last) = self.history.last_mut() { last["steps"] = json!((index + 1..=index + done).collect::<Vec<_>>()); }
+            if done == 0 {
+                attempts += 1;
+                if attempts > 3 { return Err(format!("第{}步执行未成功：{}", index + 1, self.latest["reason"].as_str().unwrap_or("未知"))); }
+                continue;
+            }
+            let last = index + done - 1;
+            if let Some(expect) = self.plan.steps[last].expect().map(str::to_string) {
+                if !self.verify(&expect, last).await? {
+                    self.step_index = last;
+                    if repeats < self.plan.steps[last].repeat {
+                        repeats += 1;
+                        self.note("repeat", json!({"step":last + 1,"expect":expect}));
+                        (attempts, scrolled, step_started) = (0, 0, Instant::now());
+                        continue;
+                    }
+                    return Err(format!("第{}步已执行，但未达到期望「{expect}」（实际变化见 history[].effect）", last + 1));
+                }
+            }
+            self.step_index = index + done;
+            (attempts, repeats, scrolled, step_started) = (0, 0, 0, Instant::now());
+        }
+        // A panel selection without its commit step looks literally complete but is not applied.
+        if let Some(why) = needs_commit(&self.plan, &self.history, &self.pages()?) { return Err(why); }
+        // All steps done: the main model's completion condition must hold on fresh evidence.
+        let expected = self.plan.expected_text.clone();
+        if !self.verify(&expected, total).await? {
+            return Err(format!("步骤已全部执行，但完成条件「{expected}」未通过核验；请核对最新页面后补充步骤"));
+        }
+        Ok(())
     }
 
     async fn drive(&mut self, home: &str, started: Instant) -> Result<(), String> {
+        // Main-model-guided mode: the plan's steps are the decisions; JEV only settles ties/checks.
+        if !self.plan.steps.is_empty() { return self.drive_steps(home, started).await; }
         if !crate::native_browser::jev_settings()?.jev_enabled { return Err("JEV 已关闭，主模型接手".into()); }
         let mut experience: Option<String> = None;
         let mut shown = HashSet::<String>::new();
         let mut shown_state = String::new();
         let mut deferred: Option<String> = None;
-        let mut steps_done = 0usize;
-        let mut steps_verified = 0usize;
-        let mut step_wait: Option<Instant> = None;
         let mut revision = 0usize;
         loop {
             if started.elapsed() > RUN_BUDGET { return Err("已达到连续执行时间预算（180秒）".into()); }
@@ -749,29 +1376,10 @@ impl Run<'_> {
             let anchors: HashSet<String> = all.iter().map(|c| c.loose.clone()).collect();
             let fresh = all.iter().filter(|c| c.fresh).count();
 
-            // ── explicit steps (compatibility): deterministic, verified by expectedText.
-            if !self.plan.steps.is_empty() && steps_verified < self.plan.steps.len() {
-                if steps_verified < steps_done {
-                    if !transition_evidence(&pages, &self.plan).contains(&self.plan.steps[steps_done - 1].expected_text) {
-                        tokio::time::sleep(observation_delay(step_wait.get_or_insert_with(Instant::now).elapsed())?).await;
-                        self.refresh().await?;
-                        continue;
-                    }
-                    steps_verified = steps_done;
-                    step_wait = None;
-                    continue;
-                }
-                if remaining == 0 { return Err("已达到执行预算".into()); }
-                let candidate = step_candidate(&pages, &self.plan.steps[steps_done])?;
-                self.note("steps", json!(candidate.label));
-                if self.perform(&pages, &state, anchors, vec![candidate], "steps").await? { steps_done += 1; }
-                continue;
-            }
-
             // ── reflex: uniquely bound authorized text inputs are filled locally in one batch.
             // Date pickers stay with JEV: typing opens calendars that cover the next field.
-            if self.plan.steps.is_empty() && remaining > 0 {
-                let fills: Vec<Candidate> = all.iter().filter(|c| c.kind() == "fill" && !date_like(c)).take(remaining.min(8)).cloned().collect();
+            if remaining > 0 {
+                let fills: Vec<Candidate> = all.iter().filter(|c| c.kind() == "fill" && !c.derived && !date_like(c)).take(remaining.min(8)).cloned().collect();
                 if !fills.is_empty() {
                     let keys: HashSet<String> = fills.iter().map(|c| c.key.clone()).collect();
                     self.pending.retain(|(key, _)| !keys.contains(key));
@@ -791,7 +1399,7 @@ impl Run<'_> {
                     self.pending.pop_front();
                     self.cached += 1;
                     self.note("path", json!(label));
-                    if self.perform(&pages, &state, anchors, vec![candidate], "path").await? && !self.pending.is_empty() {
+                    if self.perform(&pages, &state, anchors, vec![candidate], "path").await?.is_some() && !self.pending.is_empty() {
                         // A person glances once more before the next click: late renders end the path.
                         let before = transition_evidence(&self.pages()?, &self.plan);
                         tokio::time::sleep(SETTLE).await;
@@ -918,7 +1526,7 @@ impl Run<'_> {
                         .filter_map(|id| list.get(id.as_str()?)).map(|c| (c.key.clone(), c.label.clone())).collect();
                     self.path_url = url;
                     self.note("jev", json!({"choice":candidate.label,"path":self.pending.iter().map(|(_, l)| l).collect::<Vec<_>>()}));
-                    if self.perform(&pages, &state, anchors, vec![candidate], "jev").await? && !self.pending.is_empty() {
+                    if self.perform(&pages, &state, anchors, vec![candidate], "jev").await?.is_some() && !self.pending.is_empty() {
                         let before = transition_evidence(&self.pages()?, &self.plan);
                         tokio::time::sleep(SETTLE).await;
                         if transition_evidence(&self.refresh().await?, &self.plan) != before { self.pending.clear(); }
@@ -946,6 +1554,8 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
         refreshes: 0, executed: 0, cached: 0, reflex: 0, preflight_recoveries: 0, preflight: 0,
         used: HashSet::new(), filled: HashSet::new(), fill_attempts: HashMap::new(), state_actions: HashMap::new(),
         baseline: None, pending: VecDeque::new(), path_url: Value::Null, loading_since: None,
+        raw_steps: args["plan"]["steps"].clone(), step_index: 0, resolved_locally: 0, resolved_by_jev: 0,
+        checks: Vec::new(), step_candidates: Vec::new(),
     };
     let started = Instant::now();
     let outcome = run.drive(&home, started).await;
@@ -967,20 +1577,41 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     latest["jev"] = json!({"status":if run.decisions.is_empty() && run.history.is_empty() {"not_delegated"} else {"delegated"},"requestAttempted":requests > 0,
         "next":if outcome.is_ok() { "本次子目标已核验；后续简单判断继续委托run，最终答案由主模型核对。" }
             else { "本次未完成。先按reason解决障碍；观察、输入和候选范围没有实质变化时不要重复run。主模型处理障碍后恢复run；仅视觉或委托无法处理的动作由主模型act兜底。ref必须原样复制当前items[].ref，禁止用snapshotId拼接。" }});
-    latest["jevRun"] = json!({"status":if outcome.is_ok(){"completed"}else{"handoff"},
+    // Compact by design: the main model needs outcome, evidence of what happened and what is missing,
+    // not the prompts. Oversized replies were archived to files and cost a shell round-trip each.
+    let mut nodes = BTreeMap::<String, usize>::new();
+    for h in &run.history { *nodes.entry(h["node"].as_str().unwrap_or("?").to_string()).or_default() += 1; }
+    let decisions: Vec<Value> = run.decisions.iter().map(|d| json!({"choice":d["choice"],"treePath":d["treePath"],
+        "path":d["path"],"status":d["status"],"requestAttempted":d["requestAttempted"],"elapsedMs":d["elapsedMs"],"error":d["error"]})).collect();
+    let handoff = outcome.is_err();
+    let total_steps = run.plan.steps.len();
+    let guided = if total_steps == 0 { Value::Null } else {
+        let resume = run.step_index.min(total_steps);
+        json!({"totalSteps":total_steps,"completedSteps":if handoff { resume } else { total_steps },
+            "failedStep":if handoff && resume < total_steps { json!(resume + 1) } else { Value::Null },
+            "remainingSteps":if handoff { json!(run.raw_steps.as_array().map(|s| s[resume..].to_vec()).unwrap_or_default()) } else { json!([]) },
+            "failedStepCandidates":if handoff && resume < total_steps { json!(run.step_candidates) } else { json!([]) },
+            "resolvedLocally":run.resolved_locally,"resolvedByJev":run.resolved_by_jev,"checks":run.checks,
+            "next":if handoff { "按 reason 修正 remainingSteps 的第一步（target/name/within/expect），只提交 remainingSteps 重新 run；已完成的步骤不要重放。" } else { "" }})
+    };
+    latest["jevRun"] = json!({"status":if handoff {"handoff"} else {"completed"},
+        "reason":outcome.err(),
+        "guided":guided,
         "fallback": {"allowed":fallback,"maxActions":1,"snapshotId":if fallback {latest["snapshotId"].clone()} else {Value::Null},
             "notice":"仅限本次 handoff 的同一目标和 snapshotId，180秒内一次单步 act；执行或重新观察后失效，之后恢复 run。视觉操作仍由主模型处理。"},
-        "requestCount":requests,
-        "decisionCount":run.decisions.len(),"cachedActions":run.cached,"reflexActions":run.reflex,
-        "observationRefreshes":run.refreshes,"maxActions":run.plan.max_actions,
-        "preflightRecoveries":run.preflight_recoveries,
-        "executedActions":run.executed,
-        "verification":if outcome.is_ok(){"subgoal_verified"}else{"unverified"},
-        "remainingGoal":run.plan.task,"missingInputs":run.missing_inputs,"candidateCounts":run.candidate_counts,"controlNames":run.plan.control_names,
-        "inputHint":"missingInputs 不代表都必须填写。plan.inputs.name 必须原样复制唯一目标的 name 或完整 fieldContext；同名字段用完整 fieldContext 区分。role 可选且仅限制角色，不替代字段匹配。自由描述无法匹配时请先 inspect 定位，不会为其它字段生成 fill 候选。",
-        "decisionTree":runtime_tree(&run.tree, &run.pending),"trace":run.trace,"history":run.history,"decisions":run.decisions,
-        "reason":outcome.err(),"elapsedMs":started.elapsed().as_millis() as u64,
-        "notice":"JEV决策树：本地等待/填写与已校验路径不请求模型，信息边界才请求JEV。完成仅针对本次子目标；handoff后主模型核对最新观察，不重放历史操作，解决难点后可再次委托run。"});
+        "verification":if handoff {"unverified"} else {"subgoal_verified"},
+        "executedActions":run.executed,"requestCount":requests,"decisionCount":run.decisions.len(),
+        "cachedActions":run.cached,"reflexActions":run.reflex,"nodes":nodes,
+        "observationRefreshes":run.refreshes,"preflightRecoveries":run.preflight_recoveries,"maxActions":run.plan.max_actions,
+        "elapsedMs":started.elapsed().as_millis() as u64,
+        "history":run.history,
+        "missingInputs":if handoff { json!(run.missing_inputs) } else { json!([]) },
+        "inputHint":if handoff && !run.missing_inputs.is_empty() {
+            json!("missingInputs 不代表都必须填写。需要输入时在 plan.inputs 提供 name（或 fieldContext）与准确 text；搜索词也可直接写进 task（如 Region 改为 \"United States\"），run 会用于同句提到的搜索框。") } else { Value::Null },
+        "candidateCounts":run.candidate_counts,"decisions":decisions,
+        "decisionTree":if handoff { runtime_tree(&json!({"obstacles":run.tree["obstacles"],"selectedPath":run.tree["selectedPath"]}), &run.pending) } else { Value::Null },
+        "trace":run.trace.iter().rev().take(12).rev().collect::<Vec<_>>(),
+        "notice":"JEV决策树：本地等待/填写与已校验路径不请求模型，信息边界才请求JEV。history[].effect 是每步的实际页面变化。handoff后主模型核对最新观察，不重放历史操作，解决难点后可再次委托run。"});
     Ok(latest)
 }
 
@@ -1088,6 +1719,60 @@ mod tests {
         assert_eq!(fills.iter().map(|c| c.action["ref"].as_str().unwrap()).collect::<Vec<_>>(), ["region", "week", "day"]);
         assert_eq!(fills.iter().filter(|c| !date_like(c)).map(|c| c.action["ref"].as_str().unwrap()).collect::<Vec<_>>(), ["region"]);
         assert!(parse(&json!({"plan":{"task":"t","authorization":"a","expectedText":"e","inputs":[{"fieldContext":"Week","text":"x"}]}})).is_ok());
+    }
+
+    #[test]
+    fn goal_values_become_search_input_only_for_the_panel_named_with_them() {
+        let phrases = goal_phrases("Region 改为 \"United States\"，数据源 M Science，按Digital Units降序");
+        for p in ["United States", "M Science", "Digital Units", "Region"] { assert!(phrases.iter().any(|x| x == p), "{p} in {phrases:?}"); }
+        let plan = plan(json!({"task":"2) Region 从当前 Global 改为 United States（美国）；3) 点 Confirm","authorization":"筛选","expectedText":"United States"}));
+        let pages = json!({"pages":[{"frame":0,"visibleText":"Region Global\nAfrica (52)\nNorth America (8)\nConfirm\nSearch any game or company","items":[
+            {"ref":"region","nodeId":"doc:1","name":"Search","role":"input","fieldContext":"Overall Global Region Select All Africa (52)","editable":true,"inView":true,"value":""},
+            {"ref":"global","nodeId":"doc:2","name":"Search any game or company","role":"input","editable":true,"inView":true,"value":""}]}]});
+        let all = hints(&pages, &plan, &HashSet::new());
+        let derived: Vec<&Candidate> = all.iter().filter(|c| c.derived).collect();
+        assert_eq!(derived.len(), 1, "only the Region panel box, never the site-wide search");
+        assert_eq!(derived[0].action["ref"], "region");
+        assert_eq!(derived[0].action["text"], "United States");
+        assert!(choice_description(derived[0]).contains("来自任务文字"));
+        let mut typed = pages.clone(); typed["pages"][0]["items"][0]["value"] = json!("United States");
+        assert!(hints(&typed, &plan, &HashSet::new()).iter().all(|c| !c.derived), "no re-typing once entered");
+        assert!(evidence(&typed, &plan).contains("\"value\":\"United States\""), "typed goal value is visible to JEV");
+        let mut listed = pages.clone(); listed["pages"][0]["visibleText"] = json!("Region Global\nUnited States\nConfirm");
+        assert!(hints(&listed, &plan, &HashSet::new()).iter().all(|c| !c.derived), "visible options are clicked, not searched");
+    }
+
+    #[test]
+    fn header_icons_are_labelled_as_sort_entries_and_text_as_tooltip() {
+        let plan = plan(json!({"task":"按 Digital Units 降序","authorization":"排序","expectedText":"降序"}));
+        let pages = json!({"pages":[{"frame":0,"items":[
+            {"ref":"text","nodeId":"doc:1","name":"Digital Units","role":"th","actionable":true,"inView":true,"column":{"name":"Digital Units","index":3,"group":"M Science"}},
+            {"ref":"icon","nodeId":"doc:2","name":"","role":"span","actionable":true,"inView":true,"icon":"sort caret","column":{"name":"Digital Units","index":3,"group":"M Science"}}]}]});
+        let all = hints(&pages, &plan, &HashSet::new());
+        let icon = all.iter().find(|c| c.action["ref"] == "icon").unwrap();
+        for part in ["无名表头图标", "icon=sort caret", "列=Digital Units#3", "分组=M Science"] { assert!(icon.label.contains(part), "{part}: {}", icon.label); }
+        assert!(choice_description(icon).contains("表头排序图标"));
+        assert!(choice_description(all.iter().find(|c| c.action["ref"] == "text").unwrap()).contains("释义"));
+    }
+
+    #[test]
+    fn action_effect_separates_tooltips_state_changes_and_no_ops() {
+        let plan = plan(json!({"task":"排序","authorization":"排序","expectedText":"降序"}));
+        let before = json!({"pages":[{"frame":0,"url":"https://x.test/a","visibleText":"Top Charts\nDigital Units","items":[
+            {"ref":"h","nodeId":"doc:1","name":"Digital Units","role":"th","actionable":true,"inView":true,"sort":"none"}]}]});
+        assert!(action_effect(&before, &before, &plan)["summary"].as_str().unwrap().contains("没有可见变化"));
+        let mut tooltip = before.clone();
+        tooltip["pages"][0]["visibleText"] = json!("Top Charts\nDigital Units\nDefinition: Game units made through online purchase");
+        let effect = action_effect(&before, &tooltip, &plan);
+        assert_eq!(effect["summary"], "");
+        assert!(effect["newText"][0].as_str().unwrap().starts_with("Definition"));
+        assert_eq!(effect["changed"], json!([]));
+        let mut sorted = before.clone();
+        sorted["pages"][0]["items"][0]["sort"] = json!("descending");
+        sorted["pages"][0]["url"] = json!("https://x.test/a?order=desc");
+        let effect = action_effect(&before, &sorted, &plan);
+        assert!(effect["changed"][0].as_str().unwrap().contains("sort=descending"));
+        assert_eq!(effect["url"], "https://x.test/a?order=desc");
     }
 
     #[test]
@@ -1262,14 +1947,133 @@ mod tests {
         assert_eq!(remaining[0].action["delta"], -480);
     }
 
+    fn bound(plan: &Plan, index: usize, pages: &Value) -> Option<Candidate> {
+        let all = hints(pages, plan, &HashSet::new());
+        let ranked = step_ranking(&plan.steps[index], &all);
+        let (best, top) = *ranked.first()?;
+        step_confident(best, ranked.get(1).map(|r| r.0)).then(|| bind_step(&plan.steps[index], index, top))
+    }
+
     #[test]
-    fn explicit_steps_rebind_fresh_refs() {
+    fn legacy_exact_steps_still_bind_to_fresh_refs() {
         let plan = plan(json!({"task":"查找","authorization":"只读搜索","expectedText":"结果",
             "steps":[{"action":"fill","name":"关键词","role":"input","text":"订单","expectedText":"结果"}]}));
-        let mut pages = json!({"pages":[{"frame":0,"items":[{"ref":"field","name":"关键词","role":"input","editable":true,"inView":true}]}]});
-        assert_eq!(step_candidate(&pages, &plan.steps[0]).unwrap().action["text"], "订单");
+        assert_eq!(plan.steps[0].expect(), Some("结果"));
+        let mut pages = json!({"pages":[{"frame":0,"items":[{"ref":"field","nodeId":"d:1","name":"关键词","role":"input","editable":true,"inView":true}]}]});
+        assert_eq!(bound(&plan, 0, &pages).unwrap().action, json!({"action":"fill","frame":0,"ref":"field","text":"订单"}));
         pages["pages"][0]["items"][0]["ref"] = json!("fresh-field");
-        assert_eq!(step_candidate(&pages, &plan.steps[0]).unwrap().action["ref"], "fresh-field");
+        assert_eq!(bound(&plan, 0, &pages).unwrap().action["ref"], "fresh-field");
+    }
+
+    #[test]
+    fn guided_steps_bind_natural_descriptions_to_the_right_control() {
+        let goal = plan(json!({"task":"榜单","authorization":"只读筛选","expectedText":"降序","steps":[
+            {"action":"click","target":"Top Charts 下的 PC & Console Games"},
+            {"action":"click","target":"M Science 分组下 Digital Units 列的排序图标","expect":"降序","repeat":2},
+            {"action":"click","target":"United States 复选框"}]}));
+        let nav = json!({"pages":[{"frame":0,"items":[
+            {"ref":"bench","nodeId":"d:1","name":"PC&Console: Explore Benchmark","role":"div","actionable":true,"inView":true,"region":"Home Dashboard Intelligence Opinions"},
+            {"ref":"chart","nodeId":"d:2","name":"PC & Console Games","role":"li","actionable":true,"inView":true,"region":"Top Charts Mobile Games NEW PC Games Console Games"}]}]});
+        assert_eq!(bound(&goal, 0, &nav).unwrap().action["ref"], "chart");
+        let header = json!({"pages":[{"frame":0,"items":[
+            {"ref":"text","nodeId":"d:3","name":"Digital Units","role":"th","actionable":true,"inView":true,"column":{"name":"Digital Units","index":3,"group":"M Science"}},
+            {"ref":"icon","nodeId":"d:4","name":"","role":"span","actionable":true,"inView":true,"icon":"sort caret","column":{"name":"Digital Units","index":3,"group":"M Science"}},
+            {"ref":"steam","nodeId":"d:5","name":"","role":"span","actionable":true,"inView":true,"icon":"sort caret","column":{"name":"Steam Units","index":6,"group":"Steam"}}]}]});
+        assert_eq!(bound(&goal, 1, &header).unwrap().action["ref"], "icon");
+        // name="…列" identifies the column for an icon step: the text header loses to the icon.
+        let made = plan(json!({"task":"榜单","authorization":"只读筛选","expectedText":"降序","steps":[
+            {"action":"click","target":"M Science 分组下那个列的排序图标","name":"Digital Units","expect":"降序","repeat":2}]}));
+        assert_eq!(bound(&made, 0, &header).unwrap().action["ref"], "icon");
+        let region = json!({"pages":[{"frame":0,"items":[
+            {"ref":"us","nodeId":"d:6","name":"United States","role":"checkbox","selected":false,"inView":true},
+            {"ref":"ca","nodeId":"d:7","name":"Canada","role":"checkbox","selected":false,"inView":true}]}]});
+        assert_eq!(bound(&goal, 2, &region).unwrap().action["ref"], "us");
+        // Ambiguity is never guessed locally: two equally named controls go to JEV / the main model.
+        let twins = json!({"pages":[{"frame":0,"items":[
+            {"ref":"a","nodeId":"d:8","name":"United States","role":"checkbox","inView":true,"region":"Record A"},
+            {"ref":"b","nodeId":"d:9","name":"United States","role":"checkbox","inView":true,"region":"Record B"}]}]});
+        assert!(bound(&goal, 2, &twins).is_none());
+    }
+
+    #[test]
+    fn excluded_names_repel_and_authorized_text_stays_on_its_field() {
+        let plan = plan(json!({"task":"选地区 Germany","authorization":"只读筛选","expectedText":"Germany",
+            "inputs":[{"name":"Search","role":"input","text":"Germany"}],
+            "steps":[{"action":"fill","target":"地区下拉面板内的搜索框（不是页面顶部的 Search any game or company）","text":"Germany"}]}));
+        assert!(negated_mention(&plan.steps[0].target.to_lowercase(), "search any game or company"));
+        assert!(!negated_mention(&plan.steps[0].target.to_lowercase(), "search"));
+        let pages = json!({"pages":[{"frame":0,"items":[
+            {"ref":"global","nodeId":"g:1","name":"Search any game or company","role":"input","editable":true,"inView":true},
+            {"ref":"panel","nodeId":"p:1","name":"Search","role":"input","editable":true,"inView":true,
+                "fieldContext":"Overall Global Global except China mainland Region Select All Africa (52)"}]}]});
+        let all = hints(&pages, &plan, &HashSet::new());
+        // The authorized text exists only on its own field: the global box is not even offered.
+        let ranked = rank_for_step(&plan.steps[0], &plan, &all);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].1.action["ref"], "panel");
+        // …and the excluded full name scores below, not above.
+        let global = all.iter().find(|c| c.action["ref"] == "global").unwrap();
+        let panel = all.iter().find(|c| c.action["ref"] == "panel").unwrap();
+        assert!(step_score(&plan.steps[0], global) < step_score(&plan.steps[0], panel));
+    }
+
+    #[test]
+    fn commit_step_is_flagged_before_literal_success_lies() {
+        let interagency = json!({"task":"选地区","authorization":"允许勾选 Germany；如有确认/Apply 按钮则点击它应用","expectedText":"Germany",
+            "steps":[{"action":"click","target":"Germany 选项"}]});
+        let history = vec![json!({"actions":["第1步 点击 \"Germany\" [checkbox] 未选中"],"status":"executed","completedActions":1,
+            "effect":{"changed":["\"Germany\" [checkbox] 已选中"]}})];
+        let pages = json!({"pages":[{"frame":0,"items":[
+            {"ref":"c","nodeId":"c:1","name":"Confirm","role":"button","inView":true},
+            {"ref":"g","nodeId":"g:1","name":"Germany","role":"checkbox","inView":true,"selected":true}]}]});
+        assert!(needs_commit(&plan(interagency), &history, &pages).is_some());
+        // Summary pill shows the filter applied → quiet even with the box still ticked.
+        let mut applied_pages = pages.clone();
+        applied_pages["pages"][0]["items"].as_array_mut().unwrap().push(
+            json!({"ref":"s","nodeId":"s:1","name":"Country/Market Germany","role":"div","inView":true}));
+        assert!(needs_commit(&plan(json!({"task":"选地区","authorization":"允许勾选 Germany；如有确认/Apply 按钮则点击它应用","expectedText":"Germany",
+            "steps":[{"action":"click","target":"Germany 选项"}]})), &history, &applied_pages).is_none());
+        // Clicked already → quiet.
+        let mut done = history.clone();
+        done.push(json!({"actions":["第2步 点击 \"Confirm\" [button]"],"status":"executed","completedActions":1,"effect":{}}));
+        assert!(needs_commit(&plan(json!({"task":"选地区","authorization":"允许勾选 Germany；如有确认/Apply 按钮则点击它应用","expectedText":"Germany",
+            "steps":[{"action":"click","target":"Germany 选项"}]})), &done, &pages).is_none());
+        // A date-only run with Confirm merely somewhere on the page stays quiet.
+        let date_run = json!({"task":"设时间","authorization":"允许填写日期；如有确认按钮则点它","expectedText":"2026-03-24",
+            "steps":[{"action":"fill","target":"Week 起始日期框","text":"2026-03-24"}]});
+        let date_history = vec![json!({"actions":["第1步 填写 \"Select date\" [input] = \"2026-03-24\""],"status":"executed",
+            "completedActions":1,"effect":{"newText":["2026-03-22 ~ 2026-09-26"]}})];
+        let date_pages = json!({"pages":[{"frame":0,"items":[
+            {"ref":"c","nodeId":"c:1","name":"Confirm","role":"button","inView":true},
+            {"ref":"d","nodeId":"d:1","name":"Select date","role":"input","inView":true,"editable":true}]}]});
+        assert!(needs_commit(&plan(date_run), &date_history, &date_pages).is_none());
+        // No mention in authorization → quiet.
+        let plain_value = json!({"task":"看一眼","authorization":"只读浏览","expectedText":"德国",
+            "steps":[{"action":"click","target":"Germany 选项"}]});
+        assert!(needs_commit(&plan(plain_value), &history, &pages).is_none());
+    }
+
+    #[test]
+    fn only_non_navigating_steps_chain_into_one_browser_round_trip() {
+        let plan = plan(json!({"task":"t","authorization":"a","expectedText":"e","steps":[
+            {"action":"fill","target":"搜索框","text":"United States"},
+            {"action":"click","target":"United States 复选框"},
+            {"action":"click","target":"Confirm 按钮"},
+            {"action":"press","key":"Enter"},
+            {"action":"click","target":"排序图标","expect":"降序"}]}));
+        let checkbox = Candidate::new(json!({"action":"click"}), json!({"role":"checkbox"}), json!(0), String::new(), "", "");
+        let button = Candidate::new(json!({"action":"click"}), json!({"role":"button"}), json!(0), String::new(), "", "");
+        assert!(chains(&plan.steps[0], &checkbox));
+        assert!(chains(&plan.steps[1], &checkbox));
+        assert!(!chains(&plan.steps[2], &button));
+        assert!(!chains(&plan.steps[3], &press_candidate(&plan.steps[3], 3)));
+        assert!(!chains(&plan.steps[4], &checkbox), "a step with an expectation is always checked before continuing");
+        for invalid in [json!({"action":"press"}), json!({"action":"fill","target":"x"}), json!({"action":"hover","target":"x"}),
+            json!({"action":"click"}), json!({"action":"click","target":"x","repeat":4}), json!({"action":"press","key":"F5"})] {
+            assert!(parse(&json!({"plan":{"task":"t","authorization":"a","expectedText":"e","steps":[invalid]}})).is_err());
+        }
+        let pages = json!({"pages":[{"url":"https://x.test/?order=desc","visibleText":"Region United States","title":"Top"}]});
+        assert!(literal_met(&pages, "美国|United States") && literal_met(&pages, "order=desc") && !literal_met(&pages, "Canada"));
     }
 
     #[test]
