@@ -1405,7 +1405,7 @@ fn anthropic_thinking_budget(level: Option<&str>, max_output_tokens: u64) -> Opt
         _ => 16384,
     };
     // Anthropic 要求 max_tokens > budget_tokens。
-    let cap = max_output_tokens.saturating_sub(1024).max(1024);
+    let cap = max_output_tokens.saturating_sub(1024).max(1024).min(max_output_tokens - 1);
     Some(budget.min(cap))
 }
 
@@ -1466,7 +1466,23 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                             "name": block.get("name").and_then(Value::as_str).unwrap_or_default(),
                             "input": block.get("arguments").cloned().unwrap_or_else(|| json!({})),
                         })),
-                        // thinking 缺签名无法回传，丢弃（Anthropic 允许历史里不带 thinking）
+                        Some("thinking") => {
+                            let text = block["thinking"].as_str().unwrap_or_default();
+                            let signature = block["thinkingSignature"].as_str().unwrap_or_default();
+                            // 与 pi 一致：仅同模型的签名可回放；跨模型或中断的思考降级为文本。
+                            let same_model = message["api"].as_str() == Some(model.api.as_str())
+                                && message["provider"].as_str() == Some(model.provider.as_str())
+                                && message["model"].as_str() == Some(model.id.as_str());
+                            if same_model && !signature.trim().is_empty() {
+                                parts.push(if block["redacted"] == true {
+                                    json!({ "type": "redacted_thinking", "data": signature })
+                                } else {
+                                    json!({ "type": "thinking", "thinking": text, "signature": signature })
+                                });
+                            } else if block["redacted"] != true && !text.trim().is_empty() {
+                                parts.push(json!({ "type": "text", "text": text }));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1542,11 +1558,61 @@ fn anthropic_body(
         }
         body["tools"] = Value::Array(tool_defs);
     }
+    // 与其它协议一致，厂商参数透传；显式 thinking/output_config 不被默认值覆盖。
+    for (key, value) in &model.extra_options {
+        body[key] = value.clone();
+    }
     budget_output_tokens(&mut body, model, "max_tokens");
-    if model.reasoning {
-        if let Some(budget) = anthropic_thinking_budget(thinking_level, body["max_tokens"].as_u64().unwrap()) {
+    if matches!(thinking_level, Some("off" | "none")) {
+        body["thinking"] = json!({ "type": "disabled" });
+    } else if model.reasoning && body.get("thinking").is_none() {
+        // ponytail: 无模型能力目录时仅识别已知 4.6 系列；新模型可显式配置 thinking.type。
+        let adaptive = model.id.contains("opus-4-6") || model.id.contains("opus-4.6")
+            || model.id.contains("sonnet-4-6") || model.id.contains("sonnet-4.6");
+        if adaptive {
+            body["thinking"] = json!({ "type": "adaptive" });
+        } else if let Some(budget) = anthropic_thinking_budget(thinking_level, body["max_tokens"].as_u64().unwrap()) {
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
+    }
+    if body["thinking"]["type"] == "adaptive" && body.pointer("/output_config/effort").is_none() {
+        let effort = match thinking_level.unwrap_or("high") {
+            "minimal" | "low" => "low",
+            "medium" => "medium",
+            "max" | "xhigh" if model.id.contains("opus") => "max",
+            _ => "high",
+        };
+        body["output_config"]["effort"] = json!(effort);
+    }
+    if body["thinking"]["type"] == "enabled" {
+        let max = body["max_tokens"].as_u64().unwrap();
+        if max <= 1024 {
+            body.as_object_mut().unwrap().remove("thinking");
+        } else if let Some(budget) = body["thinking"]["budget_tokens"].as_u64() {
+            body["thinking"]["budget_tokens"] = json!(budget.max(1024).min(max - 1));
+        }
+    }
+    let thinking = matches!(body["thinking"]["type"].as_str(), Some("enabled" | "adaptive"));
+    if thinking {
+        // pi 默认请求可见摘要；保留用户显式的 omitted，不展示加密签名。
+        if body["thinking"].get("display").is_none() {
+            body["thinking"]["display"] = json!("summarized");
+        }
+        // Anthropic extended thinking 不兼容采样参数，不能照搬 OpenAI 参数。
+        body.as_object_mut().unwrap().remove("temperature");
+        body.as_object_mut().unwrap().remove("top_p");
+        body.as_object_mut().unwrap().remove("top_k");
+    } else {
+        if let Some(temperature) = model.temperature {
+            body["temperature"] = json!(temperature);
+            body.as_object_mut().unwrap().remove("top_p");
+        } else if let Some(top_p) = model.top_p {
+            body["top_p"] = json!(top_p);
+        }
+    }
+    // OpenAI 的 flex/priority 不是 Anthropic 合法值，不能跨协议照搬。
+    if let Some(tier @ ("auto" | "standard_only")) = model.service_tier.as_deref() {
+        body["service_tier"] = json!(tier);
     }
     body
 }
@@ -1612,7 +1678,7 @@ async fn stream_anthropic(
         format!("{base}/v1/messages")
     };
     let oauth = api_key.starts_with("sk-ant-oat");
-    let thinking_enabled = body.get("thinking").is_some();
+    let thinking_enabled = body["thinking"]["type"] == "enabled";
     let mut request = http
         .post(&url)
         .header("content-type", "application/json")
@@ -1665,6 +1731,8 @@ async fn stream_anthropic(
     // block 索引 → 本条消息内工具调用序号（与最终 content 中 toolCall 顺序一致）
     let mut block_ordinals: std::collections::HashMap<u64, usize> =
         std::collections::HashMap::new();
+    let mut content_indices: HashMap<u64, usize> = HashMap::new();
+    let mut initial_inputs: HashMap<u64, Value> = HashMap::new();
     let mut stop_reason: Option<String> = None;
     let cancelled = read_sse(&mut response, cancel, |data| {
         if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
@@ -1680,7 +1748,31 @@ async fn stream_anthropic(
             Some("content_block_start") => {
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let block = &value["content_block"];
+                match block["type"].as_str() {
+                    Some("text" | "thinking" | "redacted_thinking") => {
+                        let redacted = block["type"] == "redacted_thinking";
+                        let thinking = block["type"] != "text";
+                        let field = if thinking { "thinking" } else { "text" };
+                        let text = if redacted { "[Reasoning redacted]" } else {
+                            block[field].as_str().unwrap_or_default()
+                        };
+                        let mut content = json!({ "type": field, field: text });
+                        if thinking {
+                            content["thinkingSignature"] = block[if redacted { "data" } else { "signature" }]
+                                .as_str().unwrap_or_default().into();
+                            if redacted { content["redacted"] = json!(true); }
+                        }
+                        content_indices.insert(index, result.content.len());
+                        result.content.push(content);
+                        if !text.is_empty() {
+                            on_event(if thinking { StreamEvent::ThinkingDelta(text.into()) }
+                                else { StreamEvent::TextDelta(text.into()) });
+                        }
+                    }
+                    _ => {}
+                }
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    initial_inputs.insert(index, block.get("input").cloned().unwrap_or_else(|| json!({})));
                     block_ordinals.insert(index, block_ordinals.len());
                     blocks.insert(
                         index,
@@ -1703,14 +1795,24 @@ async fn stream_anthropic(
             Some("content_block_delta") => {
                 let delta = &value["delta"];
                 match delta.get("type").and_then(Value::as_str) {
-                    Some("text_delta") => {
-                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                            push_delta(&mut result, "text", text, on_event);
-                        }
-                    }
-                    Some("thinking_delta") => {
-                        if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
-                            push_delta(&mut result, "thinking", text, on_event);
+                    Some("text_delta" | "thinking_delta" | "signature_delta") => {
+                        let index = value["index"].as_u64().unwrap_or(0);
+                        let (source, field) = match delta["type"].as_str() {
+                            Some("thinking_delta") => ("thinking", "thinking"),
+                            Some("signature_delta") => ("signature", "thinkingSignature"),
+                            _ => ("text", "text"),
+                        };
+                        if let Some(text) = delta[source].as_str() {
+                            if let Some(&position) = content_indices.get(&index) {
+                                let block = &mut result.content[position];
+                                let previous = block[field].as_str().unwrap_or_default();
+                                block[field] = json!(format!("{previous}{text}"));
+                                if field == "thinking" {
+                                    on_event(StreamEvent::ThinkingDelta(text.into()));
+                                } else if field == "text" {
+                                    on_event(StreamEvent::TextDelta(text.into()));
+                                }
+                            }
                         }
                     }
                     Some("input_json_delta") => {
@@ -1735,7 +1837,7 @@ async fn stream_anthropic(
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
                 if let Some((id, name, arguments)) = blocks.remove(&index) {
                     let args = if arguments.is_empty() {
-                        json!({})
+                        initial_inputs.remove(&index).unwrap_or_else(|| json!({}))
                     } else {
                         serde_json::from_str(&arguments)
                             .unwrap_or_else(|_| json!({ "__invalidJson": arguments }))
@@ -1776,8 +1878,12 @@ async fn stream_anthropic(
     // 流意外结束时仍落盘未闭合的 tool_use
     let mut pending: Vec<_> = blocks.into_iter().collect();
     pending.sort_by_key(|(index, _)| *index);
-    for (_, (id, name, arguments)) in pending {
-        let args = serde_json::from_str(&arguments).unwrap_or_else(|_| json!({}));
+    for (index, (id, name, arguments)) in pending {
+        let args = if arguments.is_empty() {
+            initial_inputs.remove(&index).unwrap_or_else(|| json!({}))
+        } else {
+            serde_json::from_str(&arguments).unwrap_or_else(|_| json!({ "__invalidJson": arguments }))
+        };
         result.content.push(json!({
             "type": "toolCall",
             "id": id,
@@ -2383,10 +2489,11 @@ mod tests {
         assert_eq!(body["thinking"]["budget_tokens"], 32768.min(32_000 - 1024));
         let out = &body["messages"];
         assert_eq!(out[0]["content"][1]["source"]["media_type"], "image/png");
-        // thinking 无签名，历史里丢弃
-        assert_eq!(out[1]["content"][0]["type"], "text");
-        assert_eq!(out[1]["content"][1]["type"], "tool_use");
-        assert_eq!(out[1]["content"][1]["input"]["path"], "a.rs");
+        // 与 pi 一致：无签名思考降级文本，不丢失上下文。
+        assert_eq!(out[1]["content"][0]["text"], "想一下");
+        assert_eq!(out[1]["content"][1]["type"], "text");
+        assert_eq!(out[1]["content"][2]["type"], "tool_use");
+        assert_eq!(out[1]["content"][2]["input"]["path"], "a.rs");
         assert_eq!(out[2]["content"][0]["type"], "tool_result");
         assert_eq!(out[2]["content"][0]["tool_use_id"], "toolu-1");
     }
@@ -2468,6 +2575,125 @@ mod tests {
         );
         assert_eq!(anthropic_thinking_budget(Some("xhigh"), 8_000), Some(6_976));
         assert_eq!(anthropic_thinking_budget(None, 32_000), Some(16384));
+    }
+
+    #[test]
+    fn anthropic_parameters_and_budget_boundaries() {
+        let mut model = test_model("anthropic-messages");
+        model.id = "claude-sonnet-4-6".into();
+        model.service_tier = Some("standard_only".into());
+        model.extra_options = serde_json::from_value(json!({
+            "metadata": {"user_id":"test"}, "tool_choice":{"type":"auto"},
+            "stop_sequences":["END"], "output_config":{"format":{"type":"json_schema"}},
+            "temperature":0.5, "top_k":10
+        })).unwrap();
+        let body = anthropic_body(&model, "", &[], &[], Some("max"));
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(body["metadata"]["user_id"], "test");
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["stop_sequences"][0], "END");
+        assert_eq!(body["service_tier"], "standard_only");
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("top_k").is_none());
+        let off = anthropic_body(&model, "", &[], &[], Some("off"));
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert_eq!(off["temperature"], 1.0);
+        model.reasoning = false;
+        model.extra_options.insert("thinking".into(), json!({"type":"adaptive","display":"summarized"}));
+        model.extra_options.insert("output_config".into(), json!({"effort":"low"}));
+        let explicit = anthropic_body(&model, "", &[], &[], None);
+        assert_eq!(explicit["thinking"]["display"], "summarized");
+        assert_eq!(explicit["output_config"]["effort"], "low");
+        model.extra_options.insert("thinking".into(), json!({"type":"adaptive","display":"omitted"}));
+        assert_eq!(anthropic_body(&model, "", &[], &[], None)["thinking"]["display"], "omitted");
+        for max in [1025, 1500, 2048, 32000] {
+            assert!(anthropic_thinking_budget(Some("high"), max).unwrap() < max);
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_thinking_signatures_and_tool_replay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"先想","signature":"a"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"一下"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"b"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":"c"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"d"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"redacted_thinking","data":"opaque"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"content_block_start","index":3,"content_block":{"type":"text","text":"开始"}}),
+            json!({"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"读取"}}),
+            json!({"type":"content_block_stop","index":3}),
+            json!({"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"a"}}}),
+            json!({"type":"content_block_stop","index":4}),
+            json!({"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"toolu_2","name":"read","input":{}}}),
+            json!({"type":"content_block_delta","index":5,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"b\"}"}}),
+            json!({"type":"content_block_stop","index":5}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}),
+            json!({"type":"message_stop"}),
+        ];
+        let payload: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers.lines().find_map(|line| {
+                        line.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|s| s.parse().ok())
+                    }).unwrap();
+                    if request.len() >= end + 4 + length { break; }
+                }
+            }
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}", payload.len()).as_bytes()).await.unwrap();
+        });
+        let mut model = test_model("anthropic-messages");
+        model.base_url = format!("http://{addr}");
+        let mut thinking = String::new();
+        let mut text = String::new();
+        let mut tool_args = Vec::new();
+        let result = stream_chat(&reqwest::Client::builder().no_proxy().build().unwrap(),
+            &model, "key", Some("high"), "", &[], &[], None,
+            &Arc::new(AtomicBool::new(false)), &mut |event| match event {
+                StreamEvent::ThinkingDelta(delta) => thinking.push_str(&delta),
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::ToolArgsDelta { index, args, .. } => tool_args.push((index, args)),
+                _ => {}
+            }).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(thinking, "先想一下[Reasoning redacted]");
+        assert_eq!(text, "开始读取");
+        assert_eq!(result.stop_reason, "toolUse");
+        assert_eq!(result.usage["totalTokens"], 30);
+        assert_eq!(result.content[0]["thinkingSignature"], "ab");
+        assert_eq!(result.content[1]["thinkingSignature"], "cd");
+        assert_eq!(result.content[4]["arguments"]["path"], "a");
+        assert_eq!(result.content[5]["arguments"]["path"], "b");
+        assert_eq!(tool_args, vec![(1, "{\"path\":\"b\"}".into())]);
+        let message = json!({"role":"assistant", "api":model.api, "provider":model.provider,
+            "model":model.id, "content":result.content});
+        let replay = anthropic_messages(&[message.clone()], &model);
+        assert_eq!(replay[0]["content"][0]["signature"], "ab");
+        assert_eq!(replay[0]["content"][1]["signature"], "cd");
+        assert_eq!(replay[0]["content"][2], json!({"type":"redacted_thinking","data":"opaque"}));
+        model.id = "other".into();
+        let cross_model = anthropic_messages(&[message], &model);
+        assert_eq!(cross_model[0]["content"][0], json!({"type":"text","text":"先想一下"}));
+        assert!(!cross_model[0]["content"].as_array().unwrap().iter().any(|b| b["type"] == "redacted_thinking"));
     }
 
     #[test]
