@@ -234,8 +234,15 @@ async fn send(settings: Settings, body: Result<Value, String>) -> Result<Value, 
             .connect_timeout(Duration::from_secs(3)).timeout(Duration::from_secs(8))
             .build().map_err(|_| "无法创建 JEV HTTP 客户端".to_string())).as_ref().map_err(Clone::clone)?;
         request_attempted = true;
-        let mut response = client.post(url).bearer_auth(key.trim()).json(&body).send().await
-            .map_err(|_| "JEV 请求失败或超时".to_string())?;
+        // Advice is read-only, so a transient overload is retried twice with backoff (as jev-ultrafast does).
+        let mut attempt = 0;
+        let mut response = loop {
+            let response = client.post(url).bearer_auth(key.trim()).json(&body).send().await
+                .map_err(|_| "JEV 请求失败或超时".to_string())?;
+            if !matches!(response.status().as_u16(), 429 | 503 | 529) || attempt >= 2 { break response; }
+            tokio::time::sleep(Duration::from_millis(500 << attempt)).await;
+            attempt += 1;
+        };
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let hint = match status {
