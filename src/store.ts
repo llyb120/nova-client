@@ -409,9 +409,8 @@ function selectedModelChoice(agentKind: AgentKind, model: string): ModelChoice |
   );
 }
 
-/** 只有 codex 走「单独的思考强度」这条路；CodeBuddy 的档位已折进模型选项
- *  （`hy4-preview:high`），不再单独下发，见后端 expand_codebuddy_effort_options。 */
-const EFFORT_AGENT_KINDS: AgentKind[] = ["codex", "claude"];
+/** Claude / CodeBuddy 等 ACP 后端的档位已折进模型选项，不再单独下发。 */
+const EFFORT_AGENT_KINDS: AgentKind[] = ["codex"];
 
 /** 建会话/切后端时随线程下发的思考强度；不支持的后端传 null。 */
 function threadEffort(agentKind: AgentKind, reasoningEffort: string): string | null {
