@@ -262,6 +262,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [tab, setTab] = createSignal<SettingsTab>("general");
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
+  const [claudePath, setClaudePath] = createSignal(s?.claudePath ?? "claude-agent-acp");
+  const [claudeProxy, setClaudeProxy] = createSignal(s?.claudeProxy ?? "");
+  const [claudeEnabled, setClaudeEnabled] = createSignal(s?.claudeEnabled === true);
   const [kimiPath, setKimiPath] = createSignal(s?.kimiPath ?? "kimi");
   const [kimiProxy, setKimiProxy] = createSignal(s?.kimiProxy ?? "");
   const [kimiEnabled, setKimiEnabled] = createSignal(s?.kimiEnabled === true);
@@ -432,6 +435,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     [
       devinEnabled(),
       kimiEnabled(),
+      claudeEnabled(),
       lyraEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
@@ -707,6 +711,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const draftSettings = (): Settings => ({
     jevEnabled: jevEnabled(),
     jevApiKey: jevApiKey().trim(),
+    claudePath: claudePath().trim() || "claude-agent-acp",
+    claudeProxy: claudeProxy().trim(),
+    claudeEnabled: claudeEnabled(),
     kimiPath: kimiPath().trim() || "kimi",
     kimiProxy: kimiProxy().trim(),
     kimiEnabled: kimiEnabled(),
@@ -1694,6 +1701,27 @@ export function SettingsModal(props: { onClose: () => void }) {
                   {lyraRefreshing() ? "刷新中…" : "刷新配置"}
                 </button>
               </div>
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class="agent-badge claude">Claude Code</span>
+                <span class="fixed-integration">ACP</span>
+                <Show when={backendMissing("claude")}><span class="backend-missing">未检测到 ACP adapter</span></Show>
+                <label class="backend-switch">
+                  <input type="checkbox" checked={claudeEnabled()} disabled={claudeEnabled() && enabledCount() === 1} onChange={(e) => setClaudeEnabled(e.currentTarget.checked)} />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager status={cliStatuses().claude} loading={cliLoading()} />
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">ACP 可执行文件</span>
+                  <input class="field-input" value={claudePath()} onInput={(e) => setClaudePath(e.currentTarget.value)} placeholder="claude-agent-acp" />
+                </label>
+              </div>
+              <ProxyField value={claudeProxy()} onInput={setClaudeProxy} />
+              <p class="field-hint">需要 Node.js 22+。安装 ACP adapter，并先通过 Claude Code 登录，或在环境变量中配置 ANTHROPIC_API_KEY；此处填写 claude-agent-acp，而不是 claude。Nova 工具通过会话 MCP 自动挂载。</p>
             </div>
 
             <div class="backend-card">

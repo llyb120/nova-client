@@ -233,6 +233,10 @@ fn effort_display_name(effort: &str) -> String {
 /// `<model>:<effort>` 若干条（如 `hy4-preview:high`），选中后由 apply_session_config
 /// 拆成 model + 对应的思考配置分别下发。
 fn expand_acp_effort_options(config_options: &Value, effort_config_id: &str) -> Value {
+    // Claude 的档位随当前模型变化，使用独立选择器，不制造其它模型不支持的组合。
+    if effort_config_id == "effort" {
+        return config_options.clone();
+    }
     let Some(options) = config_options.as_array() else {
         return config_options.clone();
     };
@@ -979,6 +983,9 @@ impl AcpManager {
     /// plan（只规划不执行）。旧数据里的 bypass 视同 build；其余值（历史会话存的
     /// 后端原生模式，如 accept-edits / ask）原样透传，交由可用列表校验兜底。
     fn backend_mode_id(kind: &AgentKind, mode: &str) -> String {
+        if *kind == AgentKind::Claude && matches!(mode, "build" | "bypass") {
+            return "bypassPermissions".into();
+        }
         if *kind == AgentKind::Kimi && matches!(mode, "build" | "bypass") {
             return "yolo".into();
         }
@@ -992,6 +999,7 @@ impl AcpManager {
     /// 该后端在设置里配置的代理地址（空 = 不代理）
     fn proxy_of<'a>(&self, settings: &'a Settings) -> &'a str {
         match self.kind {
+            AgentKind::Claude => &settings.claude_proxy,
             AgentKind::Kimi => &settings.kimi_proxy,
             AgentKind::CodeBuddy => &settings.codebuddy_proxy,
             _ => &settings.devin_proxy,
@@ -1246,10 +1254,10 @@ impl AcpManager {
                 .await;
         }
         // Devin 走自己的可执行文件与 acp_args。
-        let (program, args_str) = if self.kind == AgentKind::Kimi {
-            (settings.kimi_path.clone(), "acp".to_string())
-        } else {
-            (settings.devin_path.clone(), settings.acp_args.clone())
+        let (program, args_str) = match self.kind {
+            AgentKind::Claude => (settings.claude_path.clone(), String::new()),
+            AgentKind::Kimi => (settings.kimi_path.clone(), "acp".to_string()),
+            _ => (settings.devin_path.clone(), settings.acp_args.clone()),
         };
         #[cfg(windows)]
         let mut cmd = build_acp_command(&program, &args_str);
@@ -1261,7 +1269,7 @@ impl AcpManager {
         };
         // Devin 的项目级 MCP 配置需要绑定到线程连接的启动目录；CodeBuddy 在
         // session/new 时按标准 ACP mcpServers 注入，进程无需按目录分裂。
-        if self.kind == AgentKind::Kimi {
+        if matches!(self.kind, AgentKind::Kimi | AgentKind::Claude) {
             if let Some(cwd) = want_cwd {
                 cmd.current_dir(cwd);
             }
@@ -1295,6 +1303,15 @@ impl AcpManager {
         }
 
         // 每个后端可单独配置代理：注入 HTTP(S)_PROXY 等环境变量到该子进程（空 = 直连）
+        if self.kind == AgentKind::Claude {
+            cmd.env_remove("CLAUDECODE");
+            if !self.launch_env.is_empty() {
+                crate::credential_roaming::isolate_borrowed_command(&mut cmd);
+                for name in ["ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"] {
+                    cmd.env_remove(name);
+                }
+            }
+        }
         cmd.envs(&self.launch_env);
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
         #[cfg(windows)]
@@ -1735,7 +1752,7 @@ impl AcpManager {
                         .unwrap_or(false)
                 };
                 // Kimi 同一通道也承载问题提问，必须交给用户选择。
-                if is_build && self.kind != AgentKind::Kimi {
+                if is_build && !matches!(self.kind, AgentKind::Kimi | AgentKind::Claude) {
                     let allow = params
                         .get("options")
                         .and_then(|o| o.as_array())
@@ -1864,7 +1881,7 @@ impl AcpManager {
             self.capture_commands(update);
             return;
         }
-        if kind == "config_option_update" && self.kind == AgentKind::Kimi {
+        if kind == "config_option_update" && matches!(self.kind, AgentKind::Kimi | AgentKind::Claude) {
             self.capture_options(update, true);
             return;
         }
@@ -2707,7 +2724,7 @@ impl AcpManager {
 
     /// 按需把线程级模型/模式/思考强度同步到 session（只在变化时发请求）
     async fn apply_session_config(
-        &self,
+        self: &Arc<Self>,
         conn: &Arc<AcpConn>,
         _conn_key: &str,
         sid: &str,
@@ -2718,6 +2735,7 @@ impl AcpManager {
         // 模型选项带 `<model>:<effort>` 后缀：只把模型 id 交给后端，
         // 档位走后端对应的会话级配置。模型里没带档位时退回线程上单独存的强度。
         let (model_to_send, effort_from_model) = match self.effort_config_id() {
+            Some("effort") => (model.clone(), None),
             Some(_) => split_model_effort(model.as_deref()),
             None => (model.clone(), None),
         };
@@ -2771,7 +2789,10 @@ impl AcpManager {
                     .request(method, params, Some(Duration::from_secs(30)))
                     .await;
                 match r {
-                    Ok(_) => {
+                    Ok(result) => {
+                        if self.kind == AgentKind::Claude {
+                            self.capture_options(&result, true);
+                        }
                         if let Some(route) = self.routes.lock().unwrap().get_mut(sid) {
                             route.applied_model = Some(model);
                         }
@@ -2820,7 +2841,13 @@ impl AcpManager {
                 }
             }
         };
-        tokio::join!(model_fut, mode_fut, effort_fut);
+        if self.kind == AgentKind::Claude {
+            // 切换模型会重建 effort 配置，必须先完成模型变更再设置强度。
+            tokio::join!(model_fut, mode_fut);
+            effort_fut.await;
+        } else {
+            tokio::join!(model_fut, mode_fut, effort_fut);
+        }
         self.push_log(format!(
             "[nova][timing] apply_session_config {}ms",
             t_cfg.elapsed().as_millis()
@@ -2974,6 +3001,7 @@ impl AcpManager {
         match self.kind {
             AgentKind::Devin | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => Some("thought_level"),
             AgentKind::Kimi => Some("thinking"),
+            AgentKind::Claude => Some("effort"),
             _ => None,
         }
     }
@@ -2983,6 +3011,9 @@ impl AcpManager {
         let effort = effort?;
         if self.effort_config_id().is_none() {
             return None;
+        }
+        if self.kind == AgentKind::Claude {
+            return matches!(effort.as_str(), "default" | "low" | "medium" | "high" | "xhigh" | "max").then_some(effort);
         }
         if CODEBUDDY_EFFORT_LEVELS.contains(&effort.as_str()) {
             Some(effort)
@@ -3141,9 +3172,9 @@ impl AcpManager {
         images: Vec<PromptImage>,
     ) {
         // ACP 不提供并发 prompt 注入；桌面输入沿用提示词队列，其它入口明确报忙。
-        if self.kind == AgentKind::Kimi && self.is_running(&thread_id) {
+        if matches!(self.kind, AgentKind::Kimi | AgentKind::Claude) && self.is_running(&thread_id) {
             crate::append_thread_error(&self.app, &thread_id,
-                "Kimi Code 正在工作，请将消息加入队列或停止后重试".into());
+                format!("{} 正在工作，请将消息加入队列或停止后重试", self.kind.label()));
             return;
         }
         // 漫游和额度入口也会直接调用 run_prompt；追加消息统一走 CodeBuddy 原生引导。
@@ -3377,13 +3408,16 @@ impl AcpManager {
     ) -> Vec<Value> {
         let mut prompt = Self::build_prompt_blocks(text, images);
         let mut guidance = Vec::new();
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi) {
+        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi | AgentKind::Claude) {
             // ponytail: ACP has no system-prompt setter; repeat rules per turn so resumed
             // sessions and setting changes work. Use session-level instructions if ACP adds them.
             guidance.push(crate::codex_app_server::rtk_guidance());
             let state = self.app.state::<AppState>();
             let read_only = state.store.lock().unwrap().get(thread_id)
                 .and_then(|t| t.mode.as_deref()).map(unify_mode_id).as_deref() == Some("plan");
+            if self.kind == AgentKind::Claude && state.settings.lock().unwrap().context_tools_enabled() {
+                guidance.push("跨文件查找、分析修改位置或需要读取多个文件时，先直接调用 nova-tools 的 polaris；已知行段用原生 Read，修改用原生 Edit/Write。已展示上下文不要重复读取，搜索范围须有界。".into());
+            }
             if !read_only && !state.context_service.endpoint().is_empty() {
                 guidance.push(direct_desktop_guidance().into());
             }
@@ -3440,7 +3474,7 @@ impl AcpManager {
         if let Some(runtime) = runtime_guidance {
             guidance.push(runtime);
         }
-        if self.kind == AgentKind::CodeBuddy
+        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Claude)
             && self
                 .app
                 .state::<AppState>()
@@ -3830,7 +3864,7 @@ impl AcpManager {
             };
             let target = (|| {
                 let state = self.app.state::<AppState>();
-                if self.kind != AgentKind::CodeBuddy
+                if !matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Claude)
                     || !state.settings.lock().unwrap().auto_change_project_enabled
                     || !self.is_running(thread_id)
                     || !changes.is_current()
@@ -4103,7 +4137,9 @@ impl AcpManager {
     /// 该连接需要自动代答的权限请求作用域：Devin 与 CodeBuddy 的递增 RPC id
     /// 都在同一前端路由表里，CodeBuddy 加 cbp- 前缀避免键碰撞。
     fn permission_scope_prefix(&self) -> String {
-        if self.permission_scope.is_empty() && self.kind == AgentKind::Kimi {
+        if self.permission_scope.is_empty() && self.kind == AgentKind::Claude {
+            "claude-".to_string()
+        } else if self.permission_scope.is_empty() && self.kind == AgentKind::Kimi {
             "kimi-".to_string()
         } else if self.permission_scope.is_empty() && self.kind == AgentKind::CodeBuddy {
             "cbp-".to_string()
@@ -4115,7 +4151,7 @@ impl AcpManager {
     /// Devin 保持无前缀的 perm- key；CodeBuddy 每线程一条连接、RPC id 各自递增，
     /// 必须把连接键纳入作用域，避免两个并发会话的权限请求互相覆盖。
     fn permission_key(&self, conn: &AcpConn, id: &Value) -> String {
-        let scope = if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi) {
+        let scope = if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi | AgentKind::Claude) {
             format!("{}{}-", self.permission_scope_prefix(), conn.key.lock().unwrap())
         } else {
             self.permission_scope_prefix()
@@ -4147,7 +4183,7 @@ impl AcpManager {
         read_only: bool,
         thread_id: &str,
     ) -> Result<Value, String> {
-        if !matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi) {
+        if !matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi | AgentKind::Claude) {
             return Ok(json!([]));
         }
         let state = self.app.state::<AppState>();
@@ -4155,7 +4191,7 @@ impl AcpManager {
             let settings = state.settings.lock().unwrap();
             settings.context_retrieval_mode.as_str().to_string()
         };
-        let auto_change_project = self.kind == AgentKind::CodeBuddy
+        let auto_change_project = matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Claude)
             && state.settings.lock().unwrap().auto_change_project_enabled
             && !state.context_service.endpoint().is_empty();
         if !auto_change_project && state.context_service.endpoint().is_empty()
@@ -4400,6 +4436,28 @@ mod codebuddy_acp_tests {
         super::apply_proxy_env(&mut cmd, "127.0.0.1:10808");
         assert!(cmd.as_std().get_envs().any(|(name, value)| name.to_string_lossy().eq_ignore_ascii_case("HTTPS_PROXY") && value == Some(std::ffi::OsStr::new("http://127.0.0.1:10808"))));
         assert!(cmd.as_std().get_envs().any(|(name, value)| name.to_string_lossy().eq_ignore_ascii_case("NO_PROXY") && value.is_none()));
+    }
+
+    #[test]
+    fn claude_acp_configuration_contract() {
+        let settings: crate::settings::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.claude_path, "claude-agent-acp");
+        assert!(!settings.claude_enabled);
+        assert_eq!(super::AgentKind::from_str("Claude"), Some(super::AgentKind::Claude));
+        assert_eq!(serde_json::to_string(&super::AgentKind::Claude).unwrap(), "\"claude\"");
+        for (mode, expected) in [("build", "bypassPermissions"), ("plan", "plan")] {
+            assert_eq!(super::AcpManager::backend_mode_id(&super::AgentKind::Claude, mode), expected);
+        }
+        assert_eq!(super::unify_mode_id("bypassPermissions"), "build");
+        let options = json!([
+            {"id":"model","currentValue":"sonnet","options":[{"value":"sonnet","name":"Sonnet"}]},
+            {"id":"effort","currentValue":"medium","options":[{"value":"medium","name":"Medium"}]}
+        ]);
+        assert_eq!(super::expand_acp_effort_options(&options, "effort"), options);
+        let server = codebuddy_nova_tools_mcp_server_value("node", "nova-tools.mjs", "/repo", "fast", false, "endpoint", "token");
+        for tool in ["polaris", "webview", "chrome", "jianlai", "generate_image", "edit_image"] {
+            assert_eq!(server["_meta"]["tools"][tool]["defer_loading"], false);
+        }
     }
 
     #[test]
@@ -4854,7 +4912,7 @@ fn retriable_backoff_ms(attempt: u32) -> u64 {
 
 /// 是否「放开全部权限」语义的 Devin 模式。
 fn is_full_permission_mode(mode: &str) -> bool {
-    matches!(mode, "build" | "bypass")
+    matches!(mode, "build" | "bypass" | "bypassPermissions")
 }
 
 /// 后端原生模式 id → 统一模式 id（build / plan）。与 frontend `normalizeUnifiedMode` 对齐。

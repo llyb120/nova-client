@@ -188,6 +188,7 @@ fn normal_targets(config_dir: &Path) -> Result<Vec<Target>, String> {
         AgentKind::Lyra,
         AgentKind::Devin,
         AgentKind::Kimi,
+        AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
         AgentKind::Cursor,
@@ -203,6 +204,13 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
         .or_else(user_home_dir)
         .ok_or("无法确定用户主目录")?;
     let (label, path, format) = match kind {
+        AgentKind::Claude => (
+            kind.label(),
+            configured_dir(overrides, "CLAUDE_CONFIG_DIR")
+                .unwrap_or_else(|| home.join(".claude"))
+                .join("CLAUDE.md"),
+            TargetFormat::Markdown,
+        ),
         AgentKind::Kimi => (
             kind.label(),
             configured_dir(overrides, "KIMI_CODE_HOME")

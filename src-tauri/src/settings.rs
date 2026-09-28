@@ -68,6 +68,10 @@ pub struct Settings {
     pub jev_api_key: String,
     /// Kimi Code CLI，使用固定的 `acp` 子命令。
     pub kimi_path: String,
+    /// Claude Code 的 ACP adapter（不是 claude CLI 本身）。
+    pub claude_path: String,
+    pub claude_proxy: String,
+    pub claude_enabled: bool,
     pub kimi_proxy: String,
     pub kimi_enabled: bool,
     /// ACP agent 可执行文件路径（默认 devin，依赖 PATH）
@@ -197,6 +201,9 @@ impl Default for Settings {
             jev_enabled: false,
             jev_api_key: String::new(),
             kimi_path: "kimi".into(),
+            claude_path: "claude-agent-acp".into(),
+            claude_proxy: String::new(),
+            claude_enabled: false,
             kimi_proxy: String::new(),
             kimi_enabled: false,
             devin_path: "devin".into(),

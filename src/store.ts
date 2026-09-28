@@ -229,6 +229,7 @@ export const [state, setState] = createStore<AppStore>({
     lyra: null,
     devin: null,
     kimi: null,
+    claude: null,
     codex: null,
     codebuddy: null,
     cursor: null,
@@ -245,6 +246,7 @@ export const [state, setState] = createStore<AppStore>({
     lyra: [],
     devin: [],
     kimi: [],
+    claude: [],
     codex: [],
     codebuddy: [],
     cursor: [],
@@ -409,11 +411,11 @@ function selectedModelChoice(agentKind: AgentKind, model: string): ModelChoice |
 
 /** 只有 codex 走「单独的思考强度」这条路；CodeBuddy 的档位已折进模型选项
  *  （`hy4-preview:high`），不再单独下发，见后端 expand_codebuddy_effort_options。 */
-const EFFORT_AGENT_KINDS: AgentKind[] = ["codex"];
+const EFFORT_AGENT_KINDS: AgentKind[] = ["codex", "claude"];
 
 /** 建会话/切后端时随线程下发的思考强度；不支持的后端传 null。 */
 function threadEffort(agentKind: AgentKind, reasoningEffort: string): string | null {
-  return agentKind === "codex" ? reasoningEffort || null : null;
+  return EFFORT_AGENT_KINDS.includes(agentKind) ? reasoningEffort || null : null;
 }
 
 export function reasoningEffortChoices(
@@ -485,6 +487,7 @@ export const ALL_AGENT_KINDS: AgentKind[] = [
   "lyra",
   "devin",
   "kimi",
+  "claude",
   "codex",
   "codebuddy",
   "cursor",
@@ -497,6 +500,8 @@ function agentEnabled(s: Settings, k: AgentKind): boolean {
       return s.lyraEnabled !== false;
     case "kimi":
       return s.kimiEnabled === true;
+    case "claude":
+      return s.claudeEnabled === true;
     case "devin":
       return s.devinEnabled !== false;
     case "codex":

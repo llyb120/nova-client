@@ -1,6 +1,6 @@
 import type { WorkflowDef } from "./workflow/types";
 
-export type AgentKind = "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "cursor";
+export type AgentKind = "claude" | "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "cursor";
 
 export interface SlashCommand {
   name: string;
@@ -417,6 +417,9 @@ export interface PendingNewSessionSeed {
 export interface Settings {
   jevEnabled: boolean;
   jevApiKey: string;
+  claudePath: string;
+  claudeProxy: string;
+  claudeEnabled: boolean;
   kimiPath: string;
   kimiProxy: string;
   kimiEnabled: boolean;

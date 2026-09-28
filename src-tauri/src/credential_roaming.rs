@@ -207,6 +207,15 @@ pub fn collect_credentials(
     let mut files = Vec::new();
     let mut env = HashMap::new();
     match &agent_kind {
+        AgentKind::Claude => {
+            // 只共享显式密钥，不导出系统钥匙串或整份 Claude 用户配置。
+            for name in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL"] {
+                collect_secret_env(name, "", &mut env);
+            }
+            if !["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"].iter().any(|name| env.contains_key(*name)) {
+                return Err("Claude Code 额度租借需要显式 API Key / Token；本地登录凭证不自动导出".into());
+            }
+        }
         AgentKind::Kimi => return Err("Kimi Code 暂不支持额度租借".into()),
         AgentKind::Lyra => {
             // 出借方已导出合并后的生效配置（含解析后的密钥），直接打包。
@@ -346,6 +355,9 @@ pub fn materialize_runtime(
     )?;
     stage_local_skills(&app, expected_kind, &launch_env)?;
     let manager = match expected_kind {
+        AgentKind::Claude => BorrowedManager::Acp(AcpManager::new_with_env(
+            app, AgentKind::Claude, launch_env, format!("quota-{thread_id}-claude-"),
+        )),
         AgentKind::Kimi => return Err("Kimi Code 暂不支持额度租借".into()),
         AgentKind::Lyra => {
             BorrowedManager::Sdk(SdkManager::new_with_env(app, LyraAdapter, launch_env))
@@ -378,6 +390,14 @@ fn launch_env(kind: &AgentKind, root: &Path) -> Result<HashMap<String, String>, 
     let mut env = HashMap::new();
     let as_string = |path: PathBuf| path.to_string_lossy().to_string();
     match kind {
+        AgentKind::Claude => {
+            let profile = root.join("profile");
+            let config = profile.join(".claude");
+            std::fs::create_dir_all(&config).map_err(|e| e.to_string())?;
+            env.insert("HOME".into(), as_string(profile.clone()));
+            env.insert("USERPROFILE".into(), as_string(profile));
+            env.insert("CLAUDE_CONFIG_DIR".into(), as_string(config));
+        }
         AgentKind::Kimi => return Err("Kimi Code 暂不支持额度租借".into()),
         AgentKind::Lyra => {
             // 进程内运行时从 NOVA_DATA_DIR/alkaid/config.jsonc 读配置，指向隔离根目录即可
@@ -444,6 +464,7 @@ fn stage_local_skills(
     env: &HashMap<String, String>,
 ) -> Result<(), String> {
     let root = match kind {
+        AgentKind::Claude => env.get("CLAUDE_CONFIG_DIR").map(PathBuf::from).map(|path| path.join("skills")),
         AgentKind::Kimi => return Err("Kimi Code 暂不支持额度租借".into()),
         AgentKind::Lyra => env
             .get("NOVA_DATA_DIR")
@@ -502,12 +523,13 @@ fn credential_path_allowed(kind: &AgentKind, raw: &str) -> bool {
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => path
             .strip_prefix("profile/AppData/Local/CodeBuddyExtension/Data/Public/auth/")
             .is_some_and(|name| !name.is_empty() && !name.contains('/')),
-        AgentKind::Kimi | AgentKind::Cursor => false,
+        AgentKind::Claude | AgentKind::Kimi | AgentKind::Cursor => false,
     }
 }
 
 fn credential_env_allowed(kind: &AgentKind, name: &str) -> bool {
     match kind {
+        AgentKind::Claude => matches!(name, "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN" | "CLAUDE_CODE_OAUTH_TOKEN" | "ANTHROPIC_BASE_URL"),
         AgentKind::Cursor => name == "CURSOR_API_KEY",
         _ => false,
     }

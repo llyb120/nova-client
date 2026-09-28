@@ -33,6 +33,8 @@ import {
   openClueCard,
   pickThreadModel,
   refreshSlashCommands,
+  reasoningEffortChoices,
+  setThreadReasoningEffort,
   sendPrompt,
   setView,
   state,
@@ -795,6 +797,17 @@ export function Composer() {
           anchorTo=".composer"
           favorites
         />
+        <Show when={state.agentKind === "claude" && reasoningEffortChoices().length > 0 && !usesPeerModels()}>
+          <select
+            aria-label="Claude 思考强度"
+            title="Claude 思考强度（当前模型支持的档位）"
+            value={state.reasoningEffort || "default"}
+            disabled={running()}
+            onChange={(e) => void setThreadReasoningEffort(e.currentTarget.value)}
+          >
+            <For each={reasoningEffortChoices()}>{(choice) => <option value={choice.value}>{choice.name}</option>}</For>
+          </select>
+        </Show>
         <Show when={running()}>
           <span class="composer-run-stats" title={`本轮已运行 ${runElapsed()}`}>
             <span class="composer-run-dot" aria-hidden="true" />
