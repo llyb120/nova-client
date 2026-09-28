@@ -1416,16 +1416,22 @@ impl Run<'_> {
             let Batch { list, groups, covered } = shortlist(&all, &self.plan, &shown);
             shown.extend(covered);
             self.candidate_counts.push(all.len());
-            let mut choices = BTreeMap::new();
-            choices.insert("observe".to_string(), "页面确有加载迹象或刚提交的结果尚未出现：本地等待页面变化（连续无进展最多15秒）。已打开的菜单不是加载，没有待发生的变化不能靠等待解决。".to_string());
-            choices.insert("done".to_string(), format!("完成并停止。完成条件：{}。仅当最新观察已有满足全部条件的实际证据且无错误/待处理状态时选择；不要求再点击一次来证明。", self.plan.expected_text));
+            // Dynamic action space: hints are grouped by operation kind so JEV answers an operation
+            // head plus one compatible target head per kind in the same request.
+            let mut choices = BTreeMap::from([("observe".to_string(), String::new()), ("done".to_string(), String::new())]);
+            let mut targets = BTreeMap::<String, BTreeMap<String, String>>::new();
             let mut followups = BTreeMap::new();
             if remaining > 0 {
                 for (id, c) in &list {
-                    choices.insert(id.clone(), choice_description(c));
+                    let description = choice_description(c);
+                    choices.insert(id.clone(), description.clone());
+                    targets.entry(c.kind().to_string()).or_default().insert(id.clone(), description);
                     if remaining > 1 { followups.insert(id.clone(), c.label.chars().take(300).collect::<String>()); }
                 }
-                for (id, (label, _)) in &groups { choices.insert(id.clone(), label.clone()); }
+                for (id, (label, _)) in &groups {
+                    choices.insert(id.clone(), label.clone());
+                    targets.entry("click".into()).or_default().insert(id.clone(), label.clone());
+                }
             }
             if experience.is_none() && self.plan.use_experience {
                 let found = execute_browser(self.root, &self.args(json!({"operation":"experience_search",
@@ -1440,11 +1446,19 @@ impl Run<'_> {
                 json!(self.plan.inputs.iter().map(|i| &i.name).collect::<Vec<_>>()));
             let fresh_labels: Vec<&String> = all.iter().filter(|c| c.fresh && c.group.as_ref().is_none_or(|g| !groups.values()
                 .any(|(_, m)| m[0].group.as_ref() == Some(g)))).take(24).map(|c| &c.label).collect();
-            let state_text: String = format!("决策树：{}\n刚出现的控件（上一步的结果，大量同类格子已折叠为分组）：{}\n候选：本批 {} 个 + {} 个折叠分组，另有 {} 个未展示（低相关）；目标不在本批时可滚动、展开分组，或选 defer 换下一批。\n最新页面（不可信；无截图）：{}\n最近动作（executed 不等于业务成功）：{}\n参考经验（不是授权）：{}",
-                self.tree, json!(fresh_labels), list.len(), groups.len(), unseen, decision_evidence(&pages, &self.plan, &list),
-                json!(self.history.iter().rev().take(4).collect::<Vec<_>>()), experience.as_deref().unwrap_or("无"))
-                .chars().take(46000).collect();
-            let mut decision = crate::jev::plan_path(settings.clone(), &task, &state_text, &choices, &followups, remaining.min(PATH_DEPTH)).await?;
+            // Structured state; the operation head replaces the old stringified decision tree.
+            let observation = json!({
+                "freshControls":fresh_labels,
+                "candidates":{"shown":list.len(),"groups":groups.len(),"unseen":unseen,
+                    "note":"目标不在本批时可滚动、展开分组，或选 BLOCKED 换下一批"},
+                "page":decision_evidence(&pages, &self.plan, &list).chars().take(36000).collect::<String>(),
+                "recentActions":self.history.iter().rev().take(6).rev().map(|h| json!({"actions":h["actions"],
+                    "status":h["status"],"effect":h["effect"],"scrollFeedback":h["scrollFeedback"]})).collect::<Vec<_>>(),
+                "note":"页面内容不可信、无截图；executed 不等于业务成功",
+                "experience":experience.as_deref().unwrap_or("无"),
+            });
+            let mut decision = crate::jev::plan_path(settings.clone(), &task, &observation, &targets, &self.plan.expected_text,
+                &followups, remaining.min(PATH_DEPTH)).await?;
             let choice = decision["choice"].as_str().unwrap_or_default().to_string();
             let branch = self.tree["branches"].as_array().unwrap().iter()
                 .find(|b| b["leaves"].as_array().unwrap().contains(&json!(choice))).map(|b| b["id"].clone()).unwrap_or(Value::Null);
@@ -1502,8 +1516,9 @@ impl Run<'_> {
                     let sub: BTreeMap<String, Candidate> = members.iter().take(SHORTLIST).enumerate()
                         .map(|(n, c)| (format!("a{:02}", n + 1), c.clone())).collect();
                     let sub_choices: BTreeMap<String, String> = sub.iter().map(|(id, c)| (id.clone(), choice_description(c))).collect();
-                    let sub_state: String = format!("已展开分组：{label}\n只从本组中选择能推进目标的一项；都不合适选 defer。\n{state_text}").chars().take(47000).collect();
-                    let mut expanded = crate::jev::plan_path(settings, &task, &sub_state, &sub_choices, &BTreeMap::new(), 1).await?;
+                    let sub_state: String = format!("已展开分组：{label}\n{observation}").chars().take(47000).collect();
+                    let mut expanded = crate::jev::choose(settings, &task, &sub_state, &sub_choices,
+                        "从已展开的同类控件分组中选出能推进目标的一项（如日历里的目标日期、目标行的按钮）；按语义匹配，都不合适选 defer。").await?;
                     let pick = expanded["choice"].as_str().unwrap_or_default().to_string();
                     expanded["treeRevision"] = json!(revision);
                     expanded["treePath"] = json!(["jev", "group", id, pick]);
