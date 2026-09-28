@@ -21,6 +21,7 @@ function memoryTool(item: ToolItem): "read" | "write" | null {
 
 /** Preserve the usual final-block folding, except for a short acknowledgement after memory maintenance. */
 export function splitTurnBody(body: Item[], finished: boolean): { process: Item[]; conclusion: Item[] } {
+  body = body.filter(item => item.type !== "thought" || item.text.trim());
   if (!finished) return { process: body, conclusion: [] };
   const isText = (item: Item) => item.type === "assistant" || item.type === "system";
   const last = body.findLastIndex(isText);
@@ -53,6 +54,8 @@ export type ProcessSegment = { type: "process"; id: number; items: ProcessItem[]
 export function processSegments(items: Item[]): ProcessSegment[] {
   const segments: ProcessSegment[] = [];
   for (const item of items) {
+    // 与 pi 一致：签名仍留在原生会话中，历史空思考不生成折叠行。
+    if (item.type === "thought" && !item.text.trim()) continue;
     const last = segments.at(-1);
     if (item.type === "thought" || item.type === "tool") {
       if (last?.type === "process") last.items.push(item);

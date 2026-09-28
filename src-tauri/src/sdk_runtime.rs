@@ -1575,6 +1575,8 @@ impl SdkManager {
                 value
                     .get("text")
                     .and_then(Value::as_str)
+                    // 签名或空增量不代表可展示的思考；也不能清空已有摘要。
+                    .filter(|text| !text.trim().is_empty())
                     .map(|text| Item::Thought {
                         id,
                         text: text.into(),

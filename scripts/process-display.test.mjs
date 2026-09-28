@@ -25,6 +25,14 @@ assert.deepEqual(processLiveLines([thought(1, "abcdef")], text => text.match(/.{
 assert.deepEqual(processLiveLines([thought(1, "abcdefg")], text => text.match(/.{1,2}/gu)), ["ef", "g"]);
 assert.deepEqual(processLiveLines([]), []);
 assert.deepEqual(processSegments([]), []);
+assert.deepEqual(processSegments([thought(1, ""), thought(2, " \n\t")]), []);
+for (const finished of [false, true]) {
+  assert.deepEqual(splitTurnBody([thought(1, ""), thought(2, " \n\t")], finished), { process: [], conclusion: [] });
+}
+assert.deepEqual(processSegments([thought(1, ""), tool(2, "read"), thought(3, " \n"), tool(4, "edit")]),
+  [{ type: "process", id: 2, items: [tool(2, "read"), tool(4, "edit")] }]);
+assert.deepEqual(processSegments([thought(1, "思考中…"), thought(2, " 可见摘要 ")]),
+  [{ type: "process", id: 1, items: [thought(1, "思考中…"), thought(2, " 可见摘要 ")] }]);
 const reply = (id, text) => ({type: "assistant", id, text});
 const memory = (id, kind = "edit", path = "C:\\Users\\test\\.codebuddy\\memories\\iterations.md") =>
   ({...tool(id, kind), rawInput: {file_path: path}, locations: []});
