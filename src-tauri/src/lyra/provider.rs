@@ -345,7 +345,9 @@ fn completions_body(
     // 用户在 options 里配置的非内置字段直接附加到请求体顶层（tool_stream 等）。
     if let Some(object) = body.as_object_mut() {
         for (key, value) in &model.extra_options {
-            object.insert(key.clone(), value.clone());
+            if key != "cacheRetention" {
+                object.insert(key.clone(), value.clone());
+            }
         }
     }
     apply_reasoning_completions(&mut body, model, level);
@@ -511,7 +513,9 @@ fn responses_body(
         "max_output_tokens": model.max_output_tokens.max(16),
     });
     if let Some(object) = body.as_object_mut() {
-        object.extend(model.extra_options.clone());
+        object.extend(model.extra_options.iter()
+            .filter(|(key, _)| key.as_str() != "cacheRetention")
+            .map(|(key, value)| (key.clone(), value.clone())));
     }
     if !tool_defs.is_empty() {
         body["tools"] = Value::Array(tool_defs);
@@ -1535,15 +1539,13 @@ fn anthropic_body(
         "stream": true,
     });
     if !system_prompt.is_empty() {
-        // 系统提示做短暂缓存，降低多轮重复计费
         body["system"] = json!([{
             "type": "text",
             "text": system_prompt,
-            "cache_control": { "type": "ephemeral" },
         }]);
     }
     if !tools.is_empty() {
-        let mut tool_defs: Vec<Value> = tools
+        let tool_defs: Vec<Value> = tools
             .iter()
             .map(|tool| {
                 json!({
@@ -1553,14 +1555,42 @@ fn anthropic_body(
                 })
             })
             .collect();
-        if let Some(last) = tool_defs.last_mut() {
-            last["cache_control"] = json!({ "type": "ephemeral" });
-        }
         body["tools"] = Value::Array(tool_defs);
     }
     // 与其它协议一致，厂商参数透传；显式 thinking/output_config 不被默认值覆盖。
     for (key, value) in &model.extra_options {
         body[key] = value.clone();
+    }
+    // cacheRetention 是客户端策略，不是 Anthropic 请求字段。
+    let retention = body.as_object_mut().unwrap().remove("cacheRetention");
+    // 自动启用：支持长缓存的端点默认 1h，其它端点安全降级为短缓存。
+    let retention = retention.as_ref().and_then(Value::as_str).unwrap_or("long");
+    if retention != "none" {
+        let mut cache = json!({ "type": "ephemeral" });
+        let official = reqwest::Url::parse(&model.base_url).ok()
+            .is_some_and(|url| url.host_str() == Some("api.anthropic.com"));
+        if retention == "long" && (official || model.supports_long_cache_retention) {
+            cache["ttl"] = json!("1h");
+        }
+        if let Some(last) = body["system"].as_array_mut().and_then(|blocks| blocks.last_mut()) {
+            last["cache_control"] = cache.clone();
+        }
+        if let Some(last) = body["tools"].as_array_mut().and_then(|tools| tools.last_mut()) {
+            last["cache_control"] = cache.clone();
+        }
+        // 与 pi 一致：只在末条 user/system 的末块落断点，不改写 assistant 思考签名。
+        if let Some(last) = body["messages"].as_array_mut().and_then(|messages| messages.last_mut()) {
+            if matches!(last["role"].as_str(), Some("user" | "system")) {
+                if let Some(text) = last["content"].as_str() {
+                    last["content"] = json!([{ "type": "text", "text": text }]);
+                }
+                if let Some(block) = last["content"].as_array_mut().and_then(|blocks| blocks.last_mut()) {
+                    if matches!(block["type"].as_str(), Some("text" | "image" | "tool_result")) {
+                        block["cache_control"] = cache;
+                    }
+                }
+            }
+        }
     }
     budget_output_tokens(&mut body, model, "max_tokens");
     if matches!(thinking_level, Some("off" | "none")) {
@@ -2457,7 +2487,8 @@ mod tests {
 
     #[test]
     fn anthropic_body_converts_tool_flow_and_cache() {
-        let model = test_model("anthropic-messages");
+        let mut model = test_model("anthropic-messages");
+        model.supports_long_cache_retention = false;
         let tool = Tool {
             name: "read",
             description: "读文件".into(),
@@ -2496,6 +2527,60 @@ mod tests {
         assert_eq!(out[1]["content"][2]["input"]["path"], "a.rs");
         assert_eq!(out[2]["content"][0]["type"], "tool_result");
         assert_eq!(out[2]["content"][0]["tool_use_id"], "toolu-1");
+        assert_eq!(out[2]["content"][0]["cache_control"], json!({"type":"ephemeral"}));
+        assert!(out[0]["content"][1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn anthropic_cache_retention_and_history_breakpoints() {
+        let mut model = test_model("anthropic-messages");
+        model.supports_long_cache_retention = false;
+        let tools = [Tool { name: "read", description: "read".into(), parameters: json!({"type":"object"}) }];
+        let messages = [json!({"role":"user","content":[
+            {"type":"text","text":"question"},
+            {"type":"image","mimeType":"image/png","data":"QUJD"}
+        ]})];
+        // 不需要额外配置：官方默认 1h，未知兼容端点默认短缓存。
+        for (url, expected) in [
+            ("https://api.anthropic.com/v1", json!({"type":"ephemeral","ttl":"1h"})),
+            ("https://compatible.example/v1", json!({"type":"ephemeral"})),
+        ] {
+            model.base_url = url.into();
+            let body = anthropic_body(&model, "system", &messages, &tools, None);
+            assert_eq!(body["system"][0]["cache_control"], expected);
+            assert_eq!(body["tools"][0]["cache_control"], expected);
+            assert_eq!(body["messages"][0]["content"][1]["cache_control"], expected);
+        }
+        for (retention, supported, expected) in [
+            ("none", false, Value::Null),
+            ("short", true, json!({"type":"ephemeral"})),
+            ("long", false, json!({"type":"ephemeral"})),
+            ("long", true, json!({"type":"ephemeral","ttl":"1h"})),
+        ] {
+            model.supports_long_cache_retention = supported;
+            model.extra_options.insert("cacheRetention".into(), json!(retention));
+            let body = anthropic_body(&model, "system", &messages, &tools, None);
+            assert!(body.get("cacheRetention").is_none());
+            assert_eq!(body["system"][0]["cache_control"], expected);
+            assert_eq!(body["tools"][0]["cache_control"], expected);
+            assert_eq!(body["messages"][0]["content"][1]["cache_control"], expected);
+            assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
+        }
+        model.supports_long_cache_retention = false;
+        for (url, long) in [("https://api.anthropic.com/v1", true),
+            ("https://api.anthropic.com.example.org/v1", false)] {
+            model.base_url = url.into();
+            let body = anthropic_body(&model, "", &messages, &[], None);
+            assert_eq!(body["messages"][0]["content"][1]["cache_control"].get("ttl").is_some(), long);
+        }
+        let assistant = [json!({"role":"assistant","content":[{"type":"text","text":"prefill"}]})];
+        let body = anthropic_body(&model, "", &assistant, &[], None);
+        assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
+        let empty = anthropic_body(&model, "", &[], &[], None);
+        assert_eq!(empty["messages"], json!([]));
+        // provider 级配置在切换协议后也不能泄漏客户端字段。
+        assert!(completions_body(&model, "", &[], &[], None, None).get("cacheRetention").is_none());
+        assert!(responses_body(&model, "", &[], &[], None, None).get("cacheRetention").is_none());
     }
 
     #[test]
