@@ -25,6 +25,9 @@ pub enum StreamEvent {
         name: String,
         args: String,
     },
+    /// 某个工具调用的参数已完整（anthropic content_block_stop / responses output_item.done /
+    /// completions 下一个调用开始）：turn 据此提前派发只读工具。
+    ToolCallDone { id: String, name: String, arguments: Value },
 }
 
 #[derive(Debug, Default)]
@@ -918,6 +921,16 @@ async fn stream_completions(
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
                     let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    if index >= calls.len() {
+                        if let Some(done) = calls.last().filter(|c| !c.name.is_empty()) {
+                            on_event(StreamEvent::ToolCallDone {
+                                id: done.id.clone(),
+                                name: done.name.clone(),
+                                arguments: serde_json::from_str(&done.arguments)
+                                    .unwrap_or_else(|_| json!({ "__invalidJson": done.arguments })),
+                            });
+                        }
+                    }
                     while calls.len() <= index {
                         calls.push(ToolCallAccum {
                             id: String::new(),
@@ -1079,6 +1092,18 @@ async fn stream_responses(
                                 calls[index].name = name.to_string();
                             }
                         }
+                        // id 与 parse_responses_object 的最终 toolCall 保持一致（call_id|item_id）。
+                        let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or_default();
+                        let id = match item.get("id").and_then(Value::as_str) {
+                            Some(id) if id != call_id => format!("{call_id}|{id}"),
+                            _ => call_id.to_string(),
+                        };
+                        on_event(StreamEvent::ToolCallDone {
+                            id,
+                            name: calls[index].name.clone(),
+                            arguments: serde_json::from_str(&calls[index].arguments)
+                                .unwrap_or_else(|_| json!({ "__invalidJson": calls[index].arguments })),
+                        });
                     }
                 }
             }
@@ -1196,9 +1221,8 @@ fn parse_responses_object(
     }
 }
 
-const STREAM_RETRY_DELAYS_MS: [u64; 2] = [250, 750];
-
-fn is_retryable_stream_error(error: &str) -> bool {
+/// 传输层瞬时错误（与 prompt::is_retryable_provider_error 互补），turn 循环据此重试。
+pub(crate) fn is_retryable_stream_error(error: &str) -> bool {
     let message = error.to_ascii_lowercase();
     [
         "error decoding response body",
@@ -1305,8 +1329,7 @@ pub(crate) fn client_for_proxy(proxy: &str) -> reqwest::Client {
     client
 }
 
-/// 一次流式模型调用。网络/响应体解码错误会在尚未向调用方发送任何增量时静默重试；
-/// 已经发送增量后不重试，避免 UI、工具参数或会话内容重复。取消时返回 stop_reason = aborted。
+/// 一次流式模型调用，不在此重试：重试统一由 turn 循环按退避处理。取消时返回 stop_reason = aborted。
 pub async fn stream_chat(
     http: &reqwest::Client,
     model: &ResolvedModel,
@@ -1329,67 +1352,45 @@ pub async fn stream_chat(
         }
         None => http,
     };
-    let mut retry = 0;
-    loop {
-        let mut emitted = false;
-        let result = stream_chat_once(
-            http,
-            model,
-            api_key,
-            thinking_level,
-            system_prompt,
-            messages,
-            tools,
-            session_id,
-            cancel,
-            &mut |event| {
-                emitted |= !matches!(event, StreamEvent::Activity);
-                on_event(event);
-            },
-        )
-        .await;
-
-        match result {
-            Err(_) if cancel.load(Ordering::SeqCst) => {
-                let mut result = StreamResult::empty();
-                result.stop_reason = "aborted".into();
-                return Ok(result);
-            }
-            Err(error)
-                if !emitted
-                    && retry < STREAM_RETRY_DELAYS_MS.len()
-                    && is_retryable_stream_error(&error) =>
-            {
-                let delay = STREAM_RETRY_DELAYS_MS[retry];
-                retry += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                if cancel.load(Ordering::SeqCst) {
-                    let mut result = StreamResult::empty();
-                    result.stop_reason = "aborted".into();
-                    return Ok(result);
-                }
-            }
-            Ok(mut result) => {
-                // 三种协议共用出口：思考不是答复。交给 bridge 有限重试，
-                // 保留 usage 和原始内容，且不覆盖取消或 provider 的明确错误。
-                if !matches!(result.stop_reason.as_str(), "aborted" | "error")
-                    && result.error_message.is_none()
-                    && !result.content.iter().any(|part| match part["type"].as_str() {
-                        Some("text") => part["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
-                        Some("toolCall") => part["name"].as_str().is_some_and(|s| !s.trim().is_empty()),
-                        _ => false,
-                    })
-                {
-                    result.error_message = Some(format!(
-                        "provider returned no actionable output: 模型未返回正文或工具调用（可能仅有思考内容，stop_reason={}）",
-                        result.stop_reason
-                    ));
-                    result.stop_reason = "error".into();
-                }
-                return Ok(result);
-            }
-            outcome => return outcome,
+    let result = stream_chat_once(
+        http,
+        model,
+        api_key,
+        thinking_level,
+        system_prompt,
+        messages,
+        tools,
+        session_id,
+        cancel,
+        on_event,
+    )
+    .await;
+    match result {
+        Err(_) if cancel.load(Ordering::SeqCst) => {
+            let mut result = StreamResult::empty();
+            result.stop_reason = "aborted".into();
+            Ok(result)
         }
+        Ok(mut result) => {
+            // 三种协议共用出口：思考不是答复。交给 turn 有限重试，
+            // 保留 usage 和原始内容，且不覆盖取消或 provider 的明确错误。
+            if !matches!(result.stop_reason.as_str(), "aborted" | "error")
+                && result.error_message.is_none()
+                && !result.content.iter().any(|part| match part["type"].as_str() {
+                    Some("text") => part["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
+                    Some("toolCall") => part["name"].as_str().is_some_and(|s| !s.trim().is_empty()),
+                    _ => false,
+                })
+            {
+                result.error_message = Some(format!(
+                    "provider returned no actionable output: 模型未返回正文或工具调用（可能仅有思考内容，stop_reason={}）",
+                    result.stop_reason
+                ));
+                result.stop_reason = "error".into();
+            }
+            Ok(result)
+        }
+        outcome => outcome,
     }
 }
 
@@ -1872,6 +1873,7 @@ async fn stream_anthropic(
                         serde_json::from_str(&arguments)
                             .unwrap_or_else(|_| json!({ "__invalidJson": arguments }))
                     };
+                    on_event(StreamEvent::ToolCallDone { id: id.clone(), name: name.clone(), arguments: args.clone() });
                     result.content.push(json!({
                         "type": "toolCall",
                         "id": id,
@@ -1989,7 +1991,7 @@ mod tests {
             if expected == "error" {
                 let error = result.error_message.unwrap();
                 assert!(crate::lyra::prompt::is_retryable_provider_error(&error));
-                assert!(!is_retryable_stream_error(&error), "retry only at bridge level");
+                assert!(!is_retryable_stream_error(&error), "retry only at turn level");
             } else {
                 assert!(result.error_message.is_none());
             }

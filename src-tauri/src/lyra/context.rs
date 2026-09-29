@@ -2,8 +2,7 @@
 //! 发给模型的是「投影」——被折叠的前缀换成一条 `<compaction-summary>` 用户消息，
 //! 其后接规范历史未覆盖的尾部。投影与账本另存 `<id>.context.json`，校验失败即回退规范历史。
 
-use crate::lyra::agent::estimate_text_tokens;
-use crate::lyra::history::{now_ms, text_content};
+use crate::lyra::history::{estimate_text_tokens, now_ms, text_content};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -154,6 +153,10 @@ impl ContextWindow {
 
     pub fn window(&self) -> u64 {
         self.window
+    }
+
+    pub fn overhead(&self) -> u64 {
+        self.overhead
     }
 
     pub fn generation(&self) -> u64 {

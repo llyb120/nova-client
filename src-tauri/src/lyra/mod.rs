@@ -13,7 +13,7 @@
 mod agent;
 mod bridge;
 pub(crate) mod config;
-// 第 3 步由 turn.rs 接入前暂未使用。
+// 第 4 步由 bridge 接入前暂未使用。
 #[allow(dead_code)]
 mod context;
 mod edit;
@@ -23,7 +23,11 @@ pub(crate) mod provider;
 mod read;
 mod reasonix;
 mod rollout;
+#[allow(dead_code)]
+mod session;
 mod tools;
+#[allow(dead_code)]
+mod turn;
 mod watchdog;
 
 pub use prompt::{

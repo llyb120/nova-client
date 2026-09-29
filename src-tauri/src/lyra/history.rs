@@ -59,6 +59,23 @@ impl History {
     }
 }
 
+/// provider 尚未返回 usage 时的保守估算：ASCII 约 4 字符/token，非 ASCII 约 1 字符/token。
+pub(crate) fn estimate_text_tokens(text: &str) -> u64 {
+    let (ascii, non_ascii) = text
+        .chars()
+        .fold((0_u64, 0_u64), |(a, n), ch| if ch.is_ascii() { (a + 1, n) } else { (a, n + 1) });
+    ascii.div_ceil(4).saturating_add(non_ascii)
+}
+
+pub fn user_message(text: &str, images: &[Value]) -> Value {
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    parts.extend(images.iter().cloned());
+    json!({ "role": "user", "content": parts, "timestamp": now_ms() })
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

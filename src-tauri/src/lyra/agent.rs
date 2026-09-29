@@ -13,22 +13,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// provider 尚未返回 usage 时的保守估算：ASCII 约 4 字符/token，非 ASCII 约 1 字符/token。
-pub(crate) fn estimate_text_tokens(text: &str) -> u64 {
-    let (ascii, non_ascii) = count_text_chars(text);
-    ascii.div_ceil(4).saturating_add(non_ascii)
-}
-
-/// 增量 usage 估算使用：只扫描新到达的 delta，并由调用方累计两类字符。
-pub(crate) fn count_text_chars(text: &str) -> (u64, u64) {
-    text.chars().fold((0_u64, 0_u64), |(ascii, non_ascii), ch| {
-        if ch.is_ascii() {
-            (ascii + 1, non_ascii)
-        } else {
-            (ascii, non_ascii + 1)
-        }
-    })
-}
+pub(crate) use crate::lyra::history::{estimate_text_tokens, user_message};
 
 #[derive(Debug)]
 pub enum AgentEvent {
@@ -188,14 +173,6 @@ fn error_outcome(message: String) -> ToolOutcome {
     }
 }
 
-pub fn user_message(text: &str, images: &[Value]) -> Value {
-    let mut parts = Vec::new();
-    if !text.is_empty() {
-        parts.push(json!({ "type": "text", "text": text }));
-    }
-    parts.extend(images.iter().cloned());
-    json!({ "role": "user", "content": parts, "timestamp": now_ms() })
-}
 impl Agent {
     /// 每条消息入列后回调中断轨迹钩子（字段级拆分借用，避免与回调冲突）。
     fn checkpoint_now(&mut self) {
@@ -309,6 +286,7 @@ impl Agent {
                             StreamEvent::ToolArgsDelta { .. } => {
                                 w.activity.bump(crate::lyra::watchdog::DeltaKind::ToolArgs)
                             }
+                            StreamEvent::ToolCallDone { .. } => {}
                         }
                     }
                     match event {
@@ -320,6 +298,7 @@ impl Agent {
                         StreamEvent::ToolArgsDelta { index, name, args } => {
                             maybe_speculate(&spec, index, &name, &args);
                         }
+                        StreamEvent::ToolCallDone { .. } => {}
                     }
                 },
             )
