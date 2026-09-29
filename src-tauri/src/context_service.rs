@@ -146,6 +146,9 @@ fn dispatch(
     if request.method == "jianlai" {
         return tauri::async_runtime::block_on(crate::jianlai::execute(root, &params, &request.owner));
     }
+    if request.method == "employee" {
+        return crate::employee::execute_tool(&params);
+    }
     if request.method == "chrome" {
         return tauri::async_runtime::block_on(crate::native_browser::execute_chrome(root, &params, &request.owner));
     }

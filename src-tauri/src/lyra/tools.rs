@@ -90,6 +90,8 @@ pub fn tool_set(
         tools.push(Tool { name: "webview", description: webview["description"].as_str().unwrap().into(), parameters: schema(webview["inputSchema"].clone()) });
         let desktop = crate::jianlai::tool_definition();
         tools.push(Tool { name: "jianlai", description: desktop["description"].as_str().unwrap().into(), parameters: schema(desktop["inputSchema"].clone()) });
+        let employee = crate::employee::tool_definition();
+        tools.push(Tool { name: "employee", description: employee["description"].as_str().unwrap().into(), parameters: schema(employee["inputSchema"].clone()) });
         let chrome = crate::chrome_browser::tool_definition();
         tools.push(Tool { name: "chrome", description: chrome["description"].as_str().unwrap().into(), parameters: schema(chrome["inputSchema"].clone()) });
         for definition in crate::image_generation::tool_definitions() {
@@ -615,6 +617,13 @@ async fn execute_inner(
         "jianlai" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，剑来不可用"); }
             match crate::jianlai::execute(root, args, owner).await {
+                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
+        "employee" => {
+            if shell.is_none() { return ToolOutcome::error("当前为只读模式，员工工具不可用"); }
+            match crate::employee::execute_tool(args) {
                 Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
                 Err(error) => ToolOutcome::error(error),
             }

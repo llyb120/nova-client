@@ -2,6 +2,7 @@ mod visual_guard;
 mod acp;
 mod agent_config;
 mod jianlai;
+mod employee;
 mod jev;
 mod jev_run;
 mod tool_experience;
@@ -884,6 +885,7 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
                 .clone()
                 .or_else(|| wt_by_path.get(&t.cwd).cloned()),
             experience_thread: t.experience_thread,
+            employee_thread: t.employee_thread,
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             active_clue_card_id: t.active_clue_card_id.clone(),
@@ -5606,6 +5608,7 @@ pub fn run() {
             relay.restart();
             // server 侧远程会话：空闲只做命令长轮询；运行中按全量 + 增量同步。
             remote::start(app.handle().clone());
+            employee::start(app.handle().clone());
             // `Nova server config/project ...` 由独立管理进程写盘；运行实例监听提交标记，
             // 无需重启即可同步设置、环境变量与项目白名单。
             start_headless_config_watcher(app.handle().clone());
@@ -5681,6 +5684,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            employee::employee_get,
+            employee::employee_set,
+            employee::employee_do,
+            employee::employee_say,
             workspace_terminal::terminal_create,
             workspace_terminal::terminal_write,
             workspace_terminal::terminal_resize,

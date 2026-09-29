@@ -20,13 +20,18 @@ static OBSERVATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 // The lease is a plain marker (no MutexGuard held across awaits) so chrome's async path can hold it.
 static INPUT_LEASE: Mutex<Option<(&'static str, Instant, u64)>> = Mutex::new(None);
 static INPUT_LEASE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// 最近一次注入输入结束的时间；数字员工据此区分自己的注入与用户真实操作。
+static LAST_INJECTED: Mutex<Option<Instant>> = Mutex::new(None);
+pub(crate) fn input_activity() -> (Option<Instant>, bool) {
+    (*LAST_INJECTED.lock().unwrap(), INPUT_LEASE.lock().is_ok_and(|l| l.is_some()))
+}
 
 
 pub(crate) struct InputLease(u64);
 impl Drop for InputLease {
     fn drop(&mut self) {
         if let Ok(mut lease) = INPUT_LEASE.lock() {
-            if lease.is_some_and(|(_, _, id)| id == self.0) { *lease = None; }
+            if lease.is_some_and(|(_, _, id)| id == self.0) { *lease = None; *LAST_INJECTED.lock().unwrap() = Some(Instant::now()); }
         }
     }
 }

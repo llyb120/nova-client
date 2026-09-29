@@ -5480,7 +5480,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
     if polaris {
         tool_names.extend(["polaris"]);
     }
-    if !read_only { tool_names.extend(["generate_image", "edit_image", "webview", "chrome", "jianlai"]); }
+    if !read_only { tool_names.extend(["generate_image", "edit_image", "webview", "chrome", "jianlai", "employee"]); }
     if tool_names.is_empty() {
         let mut lines = vec![
             "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."

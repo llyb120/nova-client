@@ -118,7 +118,7 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "virgo" | "knowledge") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "virgo" | "knowledge" | "employee") => {
     setView(view);
     closeThread();
   };
@@ -139,7 +139,7 @@ export function Sidebar(props: {
   const completedUnreadCount = createMemo(() => {
     const { hidden } = chainInfo();
     return state.threads.reduce((sum, thread) =>
-      sum + (!thread.experienceThread && !hidden.has(thread.id) && thread.id !== state.currentId
+      sum + (!thread.experienceThread && !thread.employeeThread && !hidden.has(thread.id) && thread.id !== state.currentId
         ? (state.unreadTurns[thread.id] ?? 0) : 0), 0);
   });
   const railCount = () => chainInfo().rootCount + completedUnreadCount();
@@ -201,8 +201,8 @@ export function Sidebar(props: {
 
   const currentGroups = createMemo(() => {
     const threads = isVirgoView()
-        ? state.threads.filter((t) => !t.experienceThread && inRunningChain(t))
-        : state.threads.filter((t) => !t.experienceThread && !inRunningChain(t));
+        ? state.threads.filter((t) => !t.experienceThread && !t.employeeThread && inRunningChain(t))
+        : state.threads.filter((t) => !t.experienceThread && !t.employeeThread && !inRunningChain(t));
     return groupByCwd(threads);
   });
 
@@ -815,6 +815,10 @@ export function Sidebar(props: {
                 知识图谱
               </button>
             </Show>
+            <button class="mode-seg-btn" classList={{ active: state.view === "employee" }}
+              onClick={() => switchView("employee")} title="数字员工：空闲时按职责自动干活">
+              数字员工
+            </button>
           </div>
 
         </div>

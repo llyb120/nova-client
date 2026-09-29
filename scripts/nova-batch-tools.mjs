@@ -2,6 +2,7 @@ import imageTools from "./image-tools.json" with { type: "json" };
 import webviewTool from "./webview-tool.json" with { type: "json" };
 import chromeTool from "./chrome-tool.json" with { type: "json" };
 import jianlaiTool from "./jianlai-tool.json" with { type: "json" };
+import employeeTool from "./employee-tool.json" with { type: "json" };
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
@@ -58,6 +59,9 @@ export function createNovaBatchTools(cwd, options = {}) {
     };
     tools.jianlai = { ...jianlaiTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("jianlai", root, params, owner)),
+    };
+    tools.employee = { ...employeeTool,
+      execute: async params => JSON.stringify(await callGlobalContextTool("employee", root, params)),
     };
     tools.chrome = { ...chromeTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params, owner)),
@@ -140,7 +144,7 @@ export function novaDevinBatchToolPolicy(options = {}) {
   const fastContext = fastContextEnabled(options);
   const toolNames = [];
   if (fastContext) toolNames.push("polaris");
-  if (!readOnly && globalContextServiceConfigured()) toolNames.push("generate_image", "edit_image", "webview", "chrome", "jianlai");
+  if (!readOnly && globalContextServiceConfigured()) toolNames.push("generate_image", "edit_image", "webview", "chrome", "jianlai", "employee");
   if (toolNames.length === 0) {
     const lines = ["Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."];
     if (readOnly) lines.push("Current mode is plan/read-only: analyze only; do not modify files.");

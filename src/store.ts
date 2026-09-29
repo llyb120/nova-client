@@ -191,7 +191,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关）；virgo = 室女座（减少焦虑） */
-  view: "home" | "clues" | "workflows" | "virgo" | "knowledge";
+  view: "home" | "clues" | "workflows" | "virgo" | "knowledge" | "employee";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -761,7 +761,7 @@ export async function refreshRoamingFolders() {
   }
 }
 
-export function setView(view: "home" | "clues" | "workflows" | "virgo" | "knowledge") {
+export function setView(view: "home" | "clues" | "workflows" | "virgo" | "knowledge" | "employee") {
   setState("view", view);
 }
 
@@ -1743,7 +1743,7 @@ export async function openNextUnreadThread(): Promise<void> {
   // 口径与侧栏普通模式列表一致：排除训练会话，以及室女座收起的会话。
   const hidden = virgoHiddenThreads();
   const visible = state.threads.filter(
-    (t) => !t.experienceThread && !hidden.has(t.id),
+    (t) => !t.experienceThread && !t.employeeThread && !hidden.has(t.id),
   );
   const visibleIds = new Set(visible.map((t) => t.id));
   const unreadRoots = visible.filter(

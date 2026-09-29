@@ -1010,7 +1010,7 @@ export function HomeView() {
   const recent = createMemo(() => {
     const hidden = virgoHiddenThreads();
     return state.threads
-      .filter((t) => !t.experienceThread && !hidden.has(t.id))
+      .filter((t) => !t.experienceThread && !t.employeeThread && !hidden.has(t.id))
       .slice(0, 6);
   });
 

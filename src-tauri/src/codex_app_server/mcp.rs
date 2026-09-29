@@ -31,6 +31,7 @@ fn available_tools() -> Vec<Value> {
         tools.push(crate::native_browser::tool_definition());
         tools.push(crate::chrome_browser::tool_definition());
         tools.push(crate::jianlai::tool_definition());
+        tools.push(crate::employee::tool_definition());
     }
     tools
 }
