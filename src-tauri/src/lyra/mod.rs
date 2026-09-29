@@ -14,10 +14,12 @@ mod agent;
 mod bridge;
 pub(crate) mod config;
 mod edit;
+mod history;
 mod prompt;
 pub(crate) mod provider;
 mod read;
 mod reasonix;
+mod rollout;
 mod tools;
 mod watchdog;
 
