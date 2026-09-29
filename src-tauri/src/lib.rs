@@ -2342,6 +2342,9 @@ fn cleanup_lyra_session_files(
             format!("{id}.slim.json"),
             format!("{id}.pending.json"),
             format!("{id}.pending.pending.tmp"),
+            format!("{id}.jsonl"),
+            format!("{id}.context.json"),
+            format!("{id}.context.json.tmp"),
         ] {
             let path = session_root.join(file_name);
             if let Err(error) = std::fs::remove_file(&path) {
@@ -2368,7 +2371,15 @@ fn cleanup_lyra_session_files(
 /// 从 session 文件名还原 session id；只识别 Lyra 自己写的几类文件（含中断轨迹
 /// checkpoint 的原子写入临时文件），其余（logs/ 目录、未知文件）一律不动。
 fn lyra_session_file_id(name: &str) -> Option<&str> {
-    [".pending.pending.tmp", ".slim.json", ".pending.json", ".json"]
+    [
+        ".pending.pending.tmp",
+        ".slim.json",
+        ".pending.json",
+        ".context.json.tmp",
+        ".context.json",
+        ".jsonl",
+        ".json",
+    ]
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix))
         .filter(|id| valid_lyra_session_id(id))

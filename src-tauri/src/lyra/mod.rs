@@ -13,6 +13,9 @@
 mod agent;
 mod bridge;
 pub(crate) mod config;
+// 第 3 步由 turn.rs 接入前暂未使用。
+#[allow(dead_code)]
+mod context;
 mod edit;
 mod history;
 mod prompt;
