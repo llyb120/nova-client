@@ -20,10 +20,6 @@ impl History {
         &self.items
     }
 
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
     pub fn record(&mut self, message: Value) {
         if let Some(rollout) = self.rollout.as_mut() {
             rollout.append(&message);
@@ -305,45 +301,6 @@ pub fn repair_interrupted_tool_pairs(messages: &[Value]) -> Vec<Value> {
     out
 }
 
-/// 每个 assistant 请求都上报当时的上下文大小；取最大（最近一次），跨工具调用不求和。
-pub fn context_tokens_from_messages(messages: &[Value]) -> u64 {
-    let mut tokens = 0u64;
-    for message in messages {
-        if message.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let Some(usage) = message.get("usage") else {
-            continue;
-        };
-        let total = usage
-            .get("totalTokens")
-            .or_else(|| usage.get("total_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let output = usage
-            .get("output")
-            .or_else(|| usage.get("outputTokens"))
-            .or_else(|| usage.get("output_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let input = usage.get("input").and_then(Value::as_u64).unwrap_or(0);
-        let cached = usage
-            .get("cacheRead")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            .saturating_add(usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0));
-        // 有的 provider 把 cached 计入 input，有的单列。
-        let measured = if total > output {
-            total - output
-        } else if input >= cached {
-            input
-        } else {
-            input + cached
-        };
-        tokens = tokens.max(measured);
-    }
-    tokens
-}
 
 #[cfg(test)]
 mod tests {
@@ -389,7 +346,7 @@ mod tests {
         );
         history.close_pending_calls("aborted");
         history.close_pending_calls("aborted");
-        assert_eq!(history.len(), 3);
+        assert_eq!(history.items().len(), 3);
         assert_eq!(history.items()[2]["toolCallId"], "b");
     }
 }

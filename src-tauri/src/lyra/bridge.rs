@@ -1,17 +1,18 @@
 //! stdio JSONL 协议（与 alkaid-bridge 兼容）：首行为请求，prompt 期间后续行为
 //! cancel/steer；事件 ready/item/timing/done/{ok:false}。Reasonix 会话生命周期在此串联。
 
-use crate::lyra::agent::{estimate_text_tokens, user_message, Agent, AgentEvent};
 use crate::lyra::config::{self, Resolved, Roots};
+use crate::lyra::context::ContextWindow;
+use crate::lyra::history::{estimate_text_tokens, user_message, History};
 use crate::lyra::prompt::{
-    self, build_system_prompt,
-    expand_skill_command, format_skills_prompt, image_media_type, is_context_window_error,
-    is_retryable_provider_error, load_agent_instructions, load_skills, merge_usage,
-    system_prompt_fingerprint, SystemPromptOptions, PROVIDER_RETRY_DELAYS_MS,
+    self, build_system_prompt, expand_skill_command, format_skills_prompt, image_media_type,
+    load_agent_instructions, load_skills, merge_usage, SystemPromptOptions,
 };
 use crate::lyra::provider::{stream_chat, StreamEvent};
-use crate::lyra::reasonix::{self, context_tokens_from_messages, load_legacy_messages, SlimMemory};
+use crate::lyra::rollout::Rollout;
+use crate::lyra::session;
 use crate::lyra::tools::tool_set;
+use crate::lyra::turn::{context_tools, run_turn, Session, TurnEvent};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
@@ -38,14 +39,6 @@ fn stdout_emit() -> Emit {
     Arc::new(|value: &Value| send(value))
 }
 
-fn send_timing(emit: &Emit, phase: &str, start: Instant) {
-    emit(&json!({
-        "type": "timing",
-        "phase": phase,
-        "elapsedMs": start.elapsed().as_millis() as u64,
-    }));
-}
-
 fn stable_hash(value: impl AsRef<[u8]>) -> String {
     let digest = Sha256::digest(value.as_ref());
     format!("{digest:x}")[..16].to_string()
@@ -57,22 +50,6 @@ fn new_session_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("lyra-{:x}-{:x}", nanos, std::process::id())
-}
-
-fn truncate_at_restore(messages: Vec<Value>, restore_at: Option<&str>) -> Vec<Value> {
-    let Some(restore_at) = restore_at else {
-        return messages;
-    };
-    if restore_at.is_empty() {
-        return messages;
-    }
-    match messages
-        .iter()
-        .position(|m| m.get("timestamp").map(|t| t.to_string()).as_deref() == Some(restore_at))
-    {
-        Some(index) => messages[..=index].to_vec(),
-        None => messages,
-    }
 }
 
 /// provider 最后一轮结束与控制通道收取需要对齐：provider 最后一轮结束与控制通道收取
@@ -190,39 +167,6 @@ fn completed_tool_item(started: &Value, outcome: &Value) -> Value {
     item
 }
 
-async fn summarize_with_model(
-    http: &reqwest::Client,
-    resolved: &Resolved,
-    text: &str,
-) -> Result<String, String> {
-    let prompt = "把下面的工作过程压缩成一段简洁的延续摘要，覆盖目标、关键决定、已完成的修改、验证结果与后续事项。不要加入原文没有的信息。\n\n".to_string() + text;
-    let messages = vec![user_message(&prompt, &[])];
-    let mut result_text = String::new();
-    let result = stream_chat(
-        http,
-        &resolved.model,
-        &resolved.api_key,
-        None,
-        "你是代码助手。",
-        &messages,
-        &[],
-        None,
-        &Arc::new(AtomicBool::new(false)),
-        &mut |event| {
-            if let StreamEvent::TextDelta(delta) = event {
-                result_text.push_str(&delta);
-            }
-        },
-    )
-    .await?;
-    if result.stop_reason == "error" {
-        return Err(result
-            .error_message
-            .unwrap_or_else(|| "summarize failed".into()));
-    }
-    Ok(result_text)
-}
-
 struct PromptContext {
     session_id: String,
     cwd: String,
@@ -236,17 +180,17 @@ async fn handle_prompt(
     fast_context: bool,
     roots: &Roots,
     mut line_rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
-    app: Option<tauri::AppHandle>,
+    _app: Option<tauri::AppHandle>,
 ) -> Result<(), String> {
     let turn_started = Instant::now();
     let sessions_root = roots.sessions();
+    let requested_id = request
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let ctx = PromptContext {
-        session_id: request
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(new_session_id),
+        session_id: requested_id.clone().unwrap_or_else(new_session_id),
         cwd: request
             .get("cwd")
             .and_then(Value::as_str)
@@ -298,205 +242,67 @@ async fn handle_prompt(
     let skills = load_skills(roots);
     text = expand_skill_command(&text, &skills);
 
-    // ---- Reasonix：加载精简记忆 / 旧会话播种 / restoreAt 截断 ----
-    let mut memory = SlimMemory::load(&sessions_root, &ctx.session_id);
-    // 上一轮被强杀/panic/退出时轮末写盘没机会执行：增量 checkpoint 保留了中断轨迹。
-    // slim 已有 pendingMessages（优雅取消/失败已保存）时以 slim 为准，不覆盖。
-    if memory.pending_messages.is_empty() {
-        if let Some(pending) = reasonix::load_pending_checkpoint(&sessions_root, &ctx.session_id) {
-            memory.pending_messages = pending;
-        }
-    }
-    if memory.turns.is_empty()
-        && memory.digests.is_empty()
-        && memory.pending_messages.is_empty()
-        && request.get("sessionId").and_then(Value::as_str).is_some()
-    {
-        let legacy = truncate_at_restore(
-            load_legacy_messages(&sessions_root, &ctx.session_id),
-            request.get("restoreAt").and_then(Value::as_str),
-        );
-        if !legacy.is_empty() {
-            memory.seed_from_messages(&legacy);
-        }
-    }
-
     let agent_instructions = load_agent_instructions(roots);
     let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
     let auto_change_project = settings.auto_change_project_enabled;
-    let ponytail = settings.ponytail_enabled;
     let shell = (!read_only).then(prompt::detect_shell);
-    let skills_text = format_skills_prompt(&skills);
     let prompt_options = SystemPromptOptions {
         cwd: cwd_path.display().to_string(),
         read_only,
         fast_context,
         auto_change_project,
         shell: shell.clone(),
-        skills_text,
+        skills_text: format_skills_prompt(&skills),
         custom_instructions: agent_instructions,
-        ponytail,
+        ponytail: settings.ponytail_enabled,
     };
-    let fingerprint = system_prompt_fingerprint(&prompt_options);
-    let system_changed = memory.system_fingerprint != fingerprint;
-    if system_changed {
-        memory.system_fingerprint = fingerprint;
-        memory.system_prompt_snapshot.clear();
-        memory.system_prompt_hash.clear();
-        memory.last_shape_rewrite_version = 0;
-    }
-
-    let context_window = resolved.model.context_window;
-    let measured_tokens = memory
-        .pending_messages
-        .is_empty()
-        .then(|| context_tokens_from_messages(&memory.full_messages))
-        .unwrap_or_else(|| context_tokens_from_messages(&memory.pending_messages))
-        .max(memory.context_tokens);
-    let current_tier = reasonix::pressure_tier(measured_tokens, context_window);
-    memory.context_tier = current_tier.into();
-    let max_context_tokens = ((context_window as f64) * 0.75) as u64;
-    let force_context_tokens = ((context_window as f64) * 0.9) as u64;
-    let max_context_chars = force_context_tokens.saturating_mul(4) as usize;
-    let mut use_full_context =
-        reasonix::should_use_full_context(&memory, force_context_tokens, max_context_chars);
-    memory.append_turn(&text);
-    // 摘要容量判断基于重建后的 slim memory，而不是即将丢弃的
-    // 原生 reasoning/tool trajectory usage。
-    let rebuilt_context_tokens = estimate_text_tokens(&memory.format());
-    let summarize_model = lightweight.clone().unwrap_or_else(|| resolved.clone());
-    if memory
-        .compact(rebuilt_context_tokens, max_context_tokens, |earlier| {
-            let http = http.clone();
-            let model = summarize_model.clone();
-            async move { summarize_with_model(&http, &model, &earlier).await }
-        })
-        .await
-    {
-        memory.context_stage = "slim".into();
-        memory.context_tokens = 0;
-        memory.full_messages.clear();
-        use_full_context = false;
-    }
-    if !use_full_context && memory.context_stage == "full" {
-        memory.context_stage = "slim".into();
-        memory.context_tokens = 0;
-        memory.full_messages.clear();
-        memory.rewrite_version += 1;
-    }
-
-    let resumed_pending_turn = !memory.pending_messages.is_empty();
-    let mut native_messages: Vec<Value> = if resumed_pending_turn {
-        reasonix::repair_interrupted_tool_pairs(&std::mem::take(&mut memory.pending_messages))
-    } else if use_full_context {
-        memory.full_messages.clone()
-    } else {
-        Vec::new()
-    };
-    let strips_completed_reasoning =
-        resolved.model.api.starts_with("openai") || resolved.model.api == "azure-openai-responses";
-    if !resumed_pending_turn && strips_completed_reasoning {
-        native_messages = reasonix::strip_completed_openai_reasoning(&native_messages);
-    }
-
-    let active_turn_start = if resumed_pending_turn {
-        0
-    } else if native_messages.is_empty() {
-        -1
-    } else {
-        native_messages.len() as i64
-    };
-    memory.pending_messages = native_messages.clone();
-
-    // ---- Agent 构建 ----
-    let system_prompt = if !memory.system_prompt_snapshot.is_empty() && !system_changed {
-        memory.system_prompt_snapshot.clone()
-    } else {
-        build_system_prompt(&prompt_options)
-    };
-    let agent_tools = tool_set(read_only, fast_context, auto_change_project);
-    let system_prompt_hash = stable_hash(system_prompt.as_bytes());
+    let system_prompt = build_system_prompt(&prompt_options);
+    let mut tools = tool_set(read_only, fast_context, auto_change_project);
+    tools.extend(context_tools());
+    tools.extend(session::agent_tools());
     let tool_shape = serde_json::to_string(
-        &agent_tools
+        &tools
             .iter()
-            .map(|tool| {
-                json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                })
-            })
+            .map(|tool| json!({ "name": tool.name, "description": tool.description, "parameters": tool.parameters }))
             .collect::<Vec<_>>(),
     )
     .unwrap_or_default();
-    let tool_schema_hash = stable_hash(tool_shape.as_bytes());
-    let mut cache_miss_reasons = Vec::new();
-    if !memory.system_prompt_hash.is_empty() && memory.system_prompt_hash != system_prompt_hash {
-        cache_miss_reasons.push("system_changed");
-    }
-    if !memory.tool_schema_hash.is_empty() && memory.tool_schema_hash != tool_schema_hash {
-        cache_miss_reasons.push("tools_changed");
-    }
-    if memory.last_shape_rewrite_version != memory.rewrite_version {
-        cache_miss_reasons.push("history_rewritten");
-    }
-    memory.system_prompt_hash = system_prompt_hash.clone();
-    memory.tool_schema_hash = tool_schema_hash.clone();
-    memory.last_shape_rewrite_version = memory.rewrite_version;
-    let history_hash = stable_hash(
-        memory
-            .without_current(!memory.pending_messages.is_empty())
-            .format()
-            .as_bytes(),
-    );
+
+    // ---- 会话：jsonl 规范历史 + 上下文投影账本 ----
+    let (rollout, items) = Rollout::open(
+        &sessions_root,
+        &ctx.session_id,
+        requested_id.is_some(),
+        request.get("restoreAt").and_then(Value::as_str),
+    )?;
+    let overhead = estimate_text_tokens(&system_prompt) + estimate_text_tokens(&tool_shape);
+    let context = ContextWindow::load(&sessions_root, &ctx.session_id, resolved.model.context_window, overhead);
     emit(&json!({
         "type": "timing",
         "phase": "context_shape",
         "elapsedMs": 0,
-        "contextTier": memory.context_tier,
-        "rewriteVersion": memory.rewrite_version,
-        "cacheMissReasons": cache_miss_reasons,
-        "systemPromptHash": system_prompt_hash,
-        "toolSchemaHash": tool_schema_hash,
-        "historyHash": history_hash,
+        "rewriteVersion": context.generation(),
+        "systemPromptHash": stable_hash(system_prompt.as_bytes()),
+        "toolSchemaHash": stable_hash(tool_shape.as_bytes()),
     }));
-    let archive_dir = Some(roots.data().join("tool-results").join(&ctx.session_id));
     let cancelled = Arc::new(AtomicBool::new(false));
-    let steering = Arc::new(Mutex::new(std::collections::VecDeque::new()));
-    let mut agent = Agent {
-        model: resolved.clone(),
+    let steer = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let mut session = Session {
+        http: http.clone(),
+        summarizer: lightweight.unwrap_or_else(|| resolved.clone()),
+        model: resolved,
         system_prompt,
-        messages: native_messages.clone(),
-        tools: agent_tools,
-        cwd: cwd_path.clone(),
+        tools,
+        cwd: cwd_path,
         session_id: ctx.session_id.clone(),
-        archive_dir,
+        archive_dir: Some(roots.data().join("tool-results").join(&ctx.session_id)),
         shell,
+        history: History::new(items, Some(rollout)),
+        context,
         cancelled: cancelled.clone(),
-        steering: steering.clone(),
-        spec_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        checkpoint: None,
-        watchdog: Some((
-            crate::lyra::watchdog::IdleWatchdog::new(),
-            Arc::new(crate::lyra::watchdog::DiagnosticLog::new(Some(
-                sessions_root.clone(),
-            ))),
-        )),
+        steer: steer.clone(),
+        agents: Some(session::root_handle(&ctx.session_id)),
     };
-    // 后台单写者：Agent 热路径只更新最新 snapshot；300ms debounce 后由
-    // spawn_blocking 完成序列化与原子写盘，不阻塞 provider/tool 执行。
-    let checkpoint_writer = Arc::new(Mutex::new(Some(reasonix::PendingCheckpointWriter::spawn(
-        sessions_root.clone(),
-        ctx.session_id.clone(),
-    ))));
-    {
-        let writer = checkpoint_writer.clone();
-        agent.checkpoint = Some(Box::new(move |messages: &[Value]| {
-            if let Some(writer) = writer.lock().unwrap().as_ref() {
-                writer.checkpoint(messages);
-            }
-        }));
-    }
 
     emit(&json!({ "type": "ready", "sessionId": ctx.session_id }));
 
@@ -504,7 +310,7 @@ async fn handle_prompt(
     let command_busy = Arc::new(AtomicBool::new(false));
     let command_revision = Arc::new(AtomicU64::new(0));
     let line_consumer = {
-        let steering = steering.clone();
+        let steer = steer.clone();
         let cancelled = cancelled.clone();
         let command_busy = command_busy.clone();
         let command_revision = command_revision.clone();
@@ -524,10 +330,7 @@ async fn handle_prompt(
                                 .unwrap_or_default()
                                 .as_slice(),
                         );
-                        steering
-                            .lock()
-                            .unwrap()
-                            .push_back(user_message(&text, &images));
+                        steer.lock().unwrap().push_back(user_message(&text, &images));
                         command_revision.fetch_add(1, Ordering::SeqCst);
                         command_busy.store(false, Ordering::SeqCst);
                     }
@@ -537,109 +340,51 @@ async fn handle_prompt(
         })
     };
 
-    let prompt_text = if !resumed_pending_turn && !use_full_context {
-        reasonix::message_with_slim_memory(&text, &memory)
-    } else {
-        text
-    };
-
-    // ---- Reasonix 中途维护闭包 ----
-    let context_window_u = context_window;
-    let rebase_memory = memory.clone();
-    let mid_turn_state = Arc::new(Mutex::new((0_u64, 0_u64, String::new())));
-    let mut mid_turn = {
-        let mut last_rewrite_turn: usize = usize::MAX;
-        let mid_turn_state = mid_turn_state.clone();
-        move |messages: &mut Vec<Value>, assistant: &Value| {
-            let measured = reasonix::context_tokens_from_messages(std::slice::from_ref(assistant));
-            let measured = measured.max(reasonix::context_tokens_from_messages(messages));
-            let tier = reasonix::pressure_tier(measured, context_window_u);
-            if !matches!(tier, "normal" | "warn") {
-                let started = Instant::now();
-                let (next, changed) = reasonix::compact_native_tool_results(messages, tier);
-                let mut rewritten = false;
-                if changed {
-                    *messages = next;
-                    rewritten = true;
-                }
-                let turn_count = messages.len();
-                if tier == "force" && turn_count > 0 && last_rewrite_turn != turn_count {
-                    let (next, rebased) = reasonix::rebase_native_context(
-                        messages,
-                        active_turn_start,
-                        &rebase_memory,
-                    );
-                    if rebased {
-                        *messages = next;
-                        rewritten = true;
-                        last_rewrite_turn = turn_count;
-                    }
-                }
-                if rewritten {
-                    let mut state = mid_turn_state.lock().unwrap();
-                    state.0 += 1;
-                    state.1 = measured;
-                    state.2 = tier.into();
-                    send_timing(emit, "mid_turn_context_rewrite", started);
-                }
-            }
-        }
-    };
-
     // ---- 事件 → 协议 items ----
     let mut total_usage = json!({});
-    let mut last_context_tokens = 0u64;
     let mut agent_message_index = 0u64;
     let mut current_text = String::new();
     let mut current_thinking = String::new();
     let mut started_tools: std::collections::HashMap<String, Value> =
         std::collections::HashMap::new();
 
-    let mut on_event = |event: AgentEvent| match event {
-        AgentEvent::MessageStart => {
+    let mut on_event = |event: TurnEvent| match event {
+        TurnEvent::MessageStart => {
             agent_message_index += 1;
             emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
             current_text.clear();
             current_thinking.clear();
             // 快照刷新可能清掉前端的临时 liveUsage；下一次 request 开始时用此前
             // request 已返回的真实累计 usage 重发一次，不做任何 token 估算。
-            if total_usage
-                .as_object()
-                .is_some_and(|usage| !usage.is_empty())
-            {
+            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
                 emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
             }
         }
-        AgentEvent::TextDelta(delta) => {
+        TurnEvent::TextDelta(delta) => {
             current_text.push_str(&delta);
             emit(&json!({
                 "type": "item",
                 "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
             }));
         }
-        AgentEvent::ThinkingDelta(delta) => {
+        TurnEvent::ThinkingDelta(delta) => {
             current_thinking.push_str(&delta);
             emit(&json!({
                 "type": "item",
                 "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
             }));
         }
-
-        AgentEvent::ToolStart { id, name, args } => {
+        TurnEvent::ToolStart { id, name, args } => {
             let item = started_tool_item(&id, &name, &args);
             started_tools.insert(id, item.clone());
             emit(&json!({ "type": "item", "item": item }));
         }
-        AgentEvent::ToolEnd { id, outcome, .. } => {
+        TurnEvent::ToolEnd { id, outcome } => {
             let started = started_tools
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| json!({ "id": id, "type": "mcp_tool_call", "server": "Lyra" }));
-            let item = completed_tool_item(&started, &outcome);
-            emit(&json!({ "type": "item", "item": item }));
-            if outcome.get("specHit").and_then(Value::as_bool) == Some(true) {
-                emit(&json!({ "type": "timing", "phase": "spec_hit", "elapsedMs": 0 }));
-            }
+            emit(&json!({ "type": "item", "item": completed_tool_item(&started, &outcome) }));
             if let Some(cwd) = outcome
                 .get("details")
                 .and_then(|details| details.get("workingDirectory"))
@@ -649,244 +394,62 @@ async fn handle_prompt(
             }
             // 工具执行期间前端可能因运行态快照刷新而清空 liveUsage。在工具结束、
             // 下一次 provider request 之前重发上一 request 的真实累计值。
-            if total_usage
-                .as_object()
-                .is_some_and(|usage| !usage.is_empty())
-            {
+            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
                 emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
             }
         }
-        AgentEvent::MessageEnd { usage } => {
+        TurnEvent::MessageEnd { usage } => {
             // 费用字段按整轮累计；contextTokens 始终表示最后一次真实 provider 请求的输入上下文。
-            let input = usage.get("input").and_then(Value::as_u64).unwrap_or(0);
-            let cache_read = usage.get("cacheRead").and_then(Value::as_u64).unwrap_or(0);
-            let cache_write = usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0);
-            last_context_tokens = input.saturating_add(cache_read).saturating_add(cache_write);
+            let context_tokens: u64 = ["input", "cacheRead", "cacheWrite"]
+                .iter()
+                .map(|key| usage.get(key).and_then(Value::as_u64).unwrap_or(0))
+                .sum();
             merge_usage(&mut total_usage, &usage);
-            total_usage["contextTokens"] = json!(last_context_tokens);
+            total_usage["contextTokens"] = json!(context_tokens);
             emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+        }
+        TurnEvent::Retry { attempt, error, context_recovery } => {
+            emit(&json!({
+                "type": "timing",
+                "phase": if context_recovery { "context_overflow_recovery" } else { "provider_retry" },
+                "elapsedMs": turn_started.elapsed().as_millis() as u64,
+                "error": error,
+            }));
+            let mut ready = json!({ "type": "ready", "sessionId": ctx.session_id, "retry": attempt });
+            if context_recovery {
+                ready["contextRecovery"] = json!(true);
+            }
+            emit(&ready);
+        }
+        TurnEvent::Compacted(receipt) => {
+            emit(&json!({
+                "type": "timing",
+                "phase": "context_compaction",
+                "elapsedMs": turn_started.elapsed().as_millis() as u64,
+                "receipt": receipt,
+            }));
         }
     };
 
-    // ---- 带重试的执行 ----
-    let mut retries = 0usize;
-    let mut pending = Some((prompt_text, images));
-    let mut context_recovery_attempted = false;
+    let mut input = Some(user_message(&text, &images));
     let outcome = loop {
-        let attempt = if let Some((text, images)) = pending.take() {
-            agent
-                .prompt(http, &text, images, &mut on_event, &mut mid_turn)
-                .await
-        } else {
-            agent.continue_run(http, &mut on_event, &mut mid_turn).await
-        };
-        let outcome = match attempt {
-            Ok(outcome) => outcome,
-            Err(error) => crate::lyra::agent::TurnOutcome {
-                cancelled: false,
-                stop_reason: "error".into(),
-                error: Some(error),
-            },
-        };
-        let provider_error = outcome.error.clone().filter(|e| !e.is_empty());
-        if provider_error.is_none() || outcome.cancelled {
-            if !outcome.cancelled && !cancelled.load(Ordering::SeqCst) {
-                settle_pending_input(&command_busy, &command_revision).await;
-                if !steering.lock().unwrap().is_empty() {
-                    // steer 可能在 Agent 最后一次 drain 后才进入队列；保持同一 turn，
-                    // 从现有轨迹继续，不能静默结束并遗留用户的新指令。
-                    continue;
-                }
-            }
+        let outcome = run_turn(&mut session, input.take(), &mut on_event).await;
+        if outcome.cancelled || outcome.error.is_some() || cancelled.load(Ordering::SeqCst) {
             break outcome;
         }
-        let error = provider_error.unwrap();
-        let context_overflow = is_context_window_error(&error);
-        if context_overflow && !context_recovery_attempted && !cancelled.load(Ordering::SeqCst) {
-            // 失败 assistant 只是 provider 占位，不能带入下一次请求。
-            while agent
-                .messages
-                .last()
-                .and_then(|m| m.get("role"))
-                .and_then(Value::as_str)
-                == Some("assistant")
-            {
-                agent.messages.pop();
-            }
-            let (compacted, tools_changed) =
-                reasonix::compact_all_native_tool_results(&agent.messages);
-            agent.messages = compacted;
-            let (rebased, history_changed) =
-                reasonix::rebase_native_context(&agent.messages, active_turn_start, &memory);
-            if history_changed {
-                agent.messages = rebased;
-            }
-            // 中断恢复时 active_turn_start=0，若工具结果也无法再压，重试不会改变请求形状。
-            if !tools_changed && !history_changed {
-                break outcome;
-            }
-            context_recovery_attempted = true;
-            memory.context_stage = "slim".into();
-            memory.context_tier = "force".into();
-            memory.context_tokens = 0;
-            memory.full_messages.clear();
-            memory.pending_messages = agent.messages.clone();
-            memory.rewrite_version += 1;
-            let _ = memory.save(&sessions_root, &ctx.session_id);
-            send_timing(emit, "context_overflow_recovery", turn_started);
-            emit(&json!({
-                "type": "ready",
-                "sessionId": ctx.session_id,
-                "retry": retries + 1,
-                "contextRecovery": true,
-            }));
-            continue;
-        }
-        if retries >= PROVIDER_RETRY_DELAYS_MS.len()
-            || !is_retryable_provider_error(&error)
-            || cancelled.load(Ordering::SeqCst)
-        {
+        // steer 可能在 turn 最后一次 drain 后才进入队列：等控制通道安静后再判定结束，
+        // 否则用户的新指令会被静默遗留。
+        settle_pending_input(&command_busy, &command_revision).await;
+        if steer.lock().unwrap().is_empty() {
             break outcome;
-        }
-        // 去掉失败的 assistant 占位消息后重试。
-        while agent
-            .messages
-            .last()
-            .and_then(|m| m.get("role"))
-            .and_then(Value::as_str)
-            == Some("assistant")
-        {
-            agent.messages.pop();
-        }
-        send_timing(emit, "provider_retry", turn_started);
-        emit(&json!({
-            "type": "ready",
-            "sessionId": ctx.session_id,
-            "retry": retries + 1,
-        }));
-        tokio::time::sleep(std::time::Duration::from_millis(
-            PROVIDER_RETRY_DELAYS_MS[retries],
-        ))
-        .await;
-        retries += 1;
-        if cancelled.load(Ordering::SeqCst) {
-            break crate::lyra::agent::TurnOutcome {
-                cancelled: true,
-                stop_reason: "aborted".into(),
-                error: None,
-            };
         }
     };
     drop(on_event);
-    drop(mid_turn);
-    let (mid_turn_rewrite_count, mid_turn_context_tokens, mid_turn_context_tier) = {
-        let state = mid_turn_state.lock().unwrap();
-        (state.0, state.1, state.2.clone())
-    };
-    if mid_turn_rewrite_count > 0 {
-        memory.rewrite_version = memory
-            .rewrite_version
-            .saturating_add(mid_turn_rewrite_count);
-        memory.context_tokens = mid_turn_context_tokens;
-        memory.context_tier = mid_turn_context_tier;
-    }
     line_consumer.abort();
 
-    let failed = outcome
-        .error
-        .clone()
-        .filter(|e| !e.is_empty() && outcome.stop_reason == "error");
-
-    // ---- Reasonix：写回精简记忆 ----
-    if !outcome.cancelled && failed.is_none() {
-        let conclusions: Vec<Value> = agent
-            .messages
-            .iter()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-            .filter(|m| m.get("stopReason").and_then(Value::as_str) != Some("error"))
-            .cloned()
-            .collect();
-        if let Some(last) = conclusions.last() {
-            memory.set_latest_conclusion(last.get("content").unwrap_or(&Value::Null));
-        }
-        memory.pending_messages.clear();
-        let measured = context_tokens_from_messages(&agent.messages);
-        if memory.context_stage == "full" {
-            let base: Vec<Value> = native_messages
-                .iter()
-                .take(if active_turn_start >= 0 {
-                    active_turn_start as usize
-                } else {
-                    0
-                })
-                .cloned()
-                .collect();
-            let mut full: Vec<Value> = base;
-            // 合并本会话产生的新消息（用户提示及之后）
-            let prefix_len = active_turn_start.max(0) as usize;
-            let mut new_messages = agent.messages[prefix_len.min(agent.messages.len())..].to_vec();
-            full.append(&mut new_messages);
-            let pressure = reasonix::pressure_tier(measured, context_window);
-            let (compacted, changed) = reasonix::compact_native_tool_results(&full, pressure);
-            memory.full_messages = compacted;
-            memory.context_tokens = measured;
-            memory.context_tier = pressure.into();
-            if changed {
-                memory.rewrite_version += 1;
-            }
-            if !reasonix::should_use_full_context(&memory, force_context_tokens, max_context_chars)
-            {
-                memory.context_stage = "slim".into();
-                memory.context_tier = "force".into();
-                memory.context_tokens = 0;
-                memory.full_messages.clear();
-                memory.rewrite_version += 1;
-            }
-        } else {
-            // slim epoch 只保留用户原文、冻结摘要和结论；不能把已嵌入 slim memory 的
-            // prompt 再保存为 fullMessages，否则下一轮会重复重放压缩历史。
-            memory.context_tokens = measured;
-            memory.full_messages.clear();
-        }
-    } else {
-        // 取消或失败：中断轨迹作为 pendingMessages 保留，等待下一条提示恢复。
-        memory.pending_messages = agent.messages.clone();
-    }
-
-    // 取消/失败先 flush 最新活动轨迹，保证恢复语义；正常完成可丢弃尚未写出的
-    // 冗余 checkpoint，正式 slim memory 保存后再清理 sidecar。
-    agent.checkpoint = None;
-    let checkpoint_writer = checkpoint_writer.lock().unwrap().take();
-    if let Some(writer) = checkpoint_writer {
-        writer.close(outcome.cancelled || failed.is_some()).await;
-    }
-    if memory.system_prompt_snapshot.is_empty() && failed.is_none() {
-        memory.system_prompt_snapshot = agent.system_prompt.clone();
-    }
-    memory.normalize();
-    let memory_saved = match memory.save(&sessions_root, &ctx.session_id) {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!("lyra: 保存会话失败：{error}");
-            false
-        }
-    };
-    // 只有正式会话已可靠落盘才删除 checkpoint；保存失败时保留 sidecar，避免取消轨迹丢失。
-    if memory_saved {
-        reasonix::clear_pending_checkpoint(&sessions_root, &ctx.session_id);
-    }
-    let input_tokens = total_usage
-        .get("input")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cache_read_tokens = total_usage
-        .get("cacheRead")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cache_write_tokens = total_usage
-        .get("cacheWrite")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let usage_of = |key: &str| total_usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let (input_tokens, cache_read_tokens, cache_write_tokens) =
+        (usage_of("input"), usage_of("cacheRead"), usage_of("cacheWrite"));
     let cache_denominator = if input_tokens >= cache_read_tokens + cache_write_tokens {
         input_tokens
     } else {
@@ -900,10 +463,10 @@ async fn handle_prompt(
         "cacheReadTokens": cache_read_tokens,
         "cacheWriteTokens": cache_write_tokens,
         "cacheHitRate": if cache_denominator > 0 { cache_read_tokens as f64 / cache_denominator as f64 } else { 0.0 },
-        "rewriteVersion": memory.rewrite_version,
+        "rewriteVersion": session.context.generation(),
     }));
 
-    if let Some(error) = failed {
+    if let Some(error) = outcome.error.filter(|_| !outcome.cancelled) {
         emit(&json!({ "ok": false, "error": format!("Lyra provider 请求失败：{error}") }));
         return Ok(());
     }
@@ -1215,6 +778,46 @@ mod tests {
         assert_eq!(revision.load(Ordering::SeqCst), 1);
         assert!(!busy.load(Ordering::SeqCst));
     }
+    /// 端到端：spawn_prompt 事件流完整；带 sessionId 的第二次提示从 jsonl 恢复并把上一轮发给模型。
+    #[tokio::test]
+    async fn second_prompt_resumes_history_from_rollout() {
+        use crate::lyra::turn::tests::{capturing_server, text_reply};
+        let (url, bodies) = capturing_server(vec![text_reply("one"), text_reply("two")]).await;
+        let root = std::env::temp_dir().join(format!("nova-lyra-resume-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("alkaid")).unwrap();
+        let config = serde_json::json!({
+            "model": "local/m",
+            "provider": { "local": { "name": "Local", "api": "openai-completions",
+                "options": { "baseURL": url, "apiKey": "k" }, "models": { "m": { "name": "M" } } } }
+        });
+        std::fs::write(root.join("alkaid").join("config.jsonc"), config.to_string()).unwrap();
+        let prompt = |text: &str, session_id: Option<&str>| {
+            let mut request = serde_json::json!({ "action": "prompt", "cwd": root, "mode": "plan",
+                "parts": [{ "type": "text", "text": text }] });
+            if let Some(id) = session_id {
+                request["sessionId"] = serde_json::json!(id);
+            }
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let mut session = super::spawn_prompt(http, request, false, Some(root.clone()), None);
+            async move {
+                let mut events = Vec::new();
+                while let Some(line) = session.events.recv().await {
+                    events.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                }
+                events
+            }
+        };
+        let first = prompt("hi", None).await;
+        let session_id = first.iter().find_map(|e| e["sessionId"].as_str()).unwrap().to_string();
+        assert!(first.iter().any(|e| e["item"]["text"] == "one"), "{first:?}");
+        assert!(first.iter().any(|e| e["type"] == "done"), "{first:?}");
+        let second = prompt("again", Some(&session_id)).await;
+        assert!(second.iter().any(|e| e["type"] == "done"), "{second:?}");
+        let resumed = &bodies.lock().unwrap()[1];
+        assert!(resumed.contains("hi") && resumed.contains("one") && resumed.contains("again"), "{resumed}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// 手动端到端验证（需真实 provider 配置）：进程内 spawn_prompt 全事件流 + run_oneshot。
     #[tokio::test]
     #[ignore = "需要真实 provider 配置，手动验证用"]

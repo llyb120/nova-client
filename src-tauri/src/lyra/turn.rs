@@ -463,20 +463,42 @@ pub(crate) mod tests {
 
     /// 依次回放脚本化响应的本地 HTTP 服务；`None` 表示 HTTP 503。
     pub(crate) async fn scripted_server(responses: Vec<Option<Vec<Value>>>) -> String {
+        capturing_server(responses).await.0
+    }
+
+    /// 同 `scripted_server`，另返回收到的请求体（按到达顺序）。
+    pub(crate) async fn capturing_server(responses: Vec<Option<Vec<Value>>>) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured = bodies.clone();
         tokio::spawn(async move {
             for chunks in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut head = Vec::new();
+                let mut request = Vec::new();
                 let mut buf = [0u8; 8192];
-                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let body_start = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                    if n == 0 {
+                        break request.len();
+                    }
+                };
+                let length = String::from_utf8_lossy(&request[..body_start])
+                    .lines()
+                    .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|v| v.trim().parse().ok()))
+                    .unwrap_or(0);
+                while request.len() < body_start + length {
                     let n = socket.read(&mut buf).await.unwrap();
                     if n == 0 {
                         break;
                     }
-                    head.extend_from_slice(&buf[..n]);
+                    request.extend_from_slice(&buf[..n]);
                 }
+                captured.lock().unwrap().push(String::from_utf8_lossy(&request[body_start..]).into_owned());
                 let reply = match chunks {
                     Some(chunks) => {
                         let body: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect::<String>() + "data: [DONE]\n\n";
@@ -487,7 +509,7 @@ pub(crate) mod tests {
                 socket.write_all(reply.as_bytes()).await.unwrap();
             }
         });
-        format!("http://{addr}/v1")
+        (format!("http://{addr}/v1"), bodies)
     }
 
     pub(crate) fn text_reply(text: &str) -> Option<Vec<Value>> {

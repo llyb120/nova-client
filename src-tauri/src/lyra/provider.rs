@@ -18,13 +18,6 @@ pub enum StreamEvent {
     Activity,
     TextDelta(String),
     ThinkingDelta(String),
-    /// 工具调用参数的流式增量：index 为本条消息内工具调用序号，
-    /// args 为该调用迄今累积的参数 JSON 片段（供投机执行预解析）。
-    ToolArgsDelta {
-        index: usize,
-        name: String,
-        args: String,
-    },
     /// 某个工具调用的参数已完整（anthropic content_block_stop / responses output_item.done /
     /// completions 下一个调用开始）：turn 据此提前派发只读工具。
     ToolCallDone { id: String, name: String, arguments: Value },
@@ -557,8 +550,8 @@ fn responses_body(
 
 // PI/OpenAI SDK 的请求可由 AbortSignal 打断；Lyra 使用 reqwest 时必须显式把取消和
 // deadline 并入网络 future，否则代理接受连接后不发响应头/SSE 时会永久挂起。
-const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = crate::lyra::watchdog::IDLE_TIMEOUT;
-const SSE_IDLE_TIMEOUT: std::time::Duration = crate::lyra::watchdog::IDLE_TIMEOUT;
+const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const SSE_IDLE_TIMEOUT: std::time::Duration = RESPONSE_HEADERS_TIMEOUT;
 const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 async fn wait_cancelled(cancel: &Arc<AtomicBool>) {
@@ -948,11 +941,6 @@ async fn stream_completions(
                     if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str)
                     {
                         accum.arguments.push_str(args);
-                        on_event(StreamEvent::ToolArgsDelta {
-                            index,
-                            name: accum.name.clone(),
-                            args: accum.arguments.clone(),
-                        });
                     }
                 }
             }
@@ -1066,11 +1054,6 @@ async fn stream_responses(
                         } else {
                             calls[index].arguments.push_str(delta);
                         }
-                        on_event(StreamEvent::ToolArgsDelta {
-                            index,
-                            name: calls[index].name.clone(),
-                            args: calls[index].arguments.clone(),
-                        });
                     }
                 }
             }
@@ -1759,9 +1742,6 @@ async fn stream_anthropic(
     // 按 content block 索引聚合 tool_use 入参
     let mut blocks: std::collections::HashMap<u64, (String, String, String)> =
         std::collections::HashMap::new();
-    // block 索引 → 本条消息内工具调用序号（与最终 content 中 toolCall 顺序一致）
-    let mut block_ordinals: std::collections::HashMap<u64, usize> =
-        std::collections::HashMap::new();
     let mut content_indices: HashMap<u64, usize> = HashMap::new();
     let mut initial_inputs: HashMap<u64, Value> = HashMap::new();
     let mut stop_reason: Option<String> = None;
@@ -1804,7 +1784,6 @@ async fn stream_anthropic(
                 }
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     initial_inputs.insert(index, block.get("input").cloned().unwrap_or_else(|| json!({})));
-                    block_ordinals.insert(index, block_ordinals.len());
                     blocks.insert(
                         index,
                         (
@@ -1851,13 +1830,6 @@ async fn stream_anthropic(
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             if let Some(entry) = blocks.get_mut(&index) {
                                 entry.2.push_str(partial);
-                                if let Some(ordinal) = block_ordinals.get(&index) {
-                                    on_event(StreamEvent::ToolArgsDelta {
-                                        index: *ordinal,
-                                        name: entry.1.clone(),
-                                        args: entry.2.clone(),
-                                    });
-                                }
                             }
                         }
                     }
@@ -2412,14 +2384,9 @@ mod tests {
         });
         let mut model = test_model("openai-responses");
         model.base_url = format!("http://{address}");
-        let mut args = Vec::new();
         let result = stream_responses(&reqwest::Client::builder().no_proxy().build().unwrap(), &model, "", json!({}), None,
-            &Arc::new(AtomicBool::new(false)), &mut |event| {
-                if let StreamEvent::ToolArgsDelta { name, args: value, .. } = event { args.push((name, value)); }
-            }).await.unwrap();
+            &Arc::new(AtomicBool::new(false)), &mut |_| {}).await.unwrap();
         server.join().unwrap();
-        assert_eq!(args[0], ("read".into(), "{\"path\":\"a\"}".into()));
-        assert_eq!(args[1], ("bash".into(), "{\"command\":\"pwd\"}".into()));
         assert_eq!(result.stop_reason, "toolUse");
         assert_eq!(result.content.len(), 4);
         assert_eq!(result.content[1]["text"], "Reading");
@@ -2758,7 +2725,7 @@ mod tests {
             &Arc::new(AtomicBool::new(false)), &mut |event| match event {
                 StreamEvent::ThinkingDelta(delta) => thinking.push_str(&delta),
                 StreamEvent::TextDelta(delta) => text.push_str(&delta),
-                StreamEvent::ToolArgsDelta { index, args, .. } => tool_args.push((index, args)),
+                StreamEvent::ToolCallDone { id, arguments, .. } => tool_args.push((id, arguments)),
                 _ => {}
             }).await.unwrap();
         server.await.unwrap();
@@ -2770,7 +2737,7 @@ mod tests {
         assert_eq!(result.content[1]["thinkingSignature"], "cd");
         assert_eq!(result.content[4]["arguments"]["path"], "a");
         assert_eq!(result.content[5]["arguments"]["path"], "b");
-        assert_eq!(tool_args, vec![(1, "{\"path\":\"b\"}".into())]);
+        assert_eq!(tool_args, vec![("toolu_1".into(), json!({"path":"a"})), ("toolu_2".into(), json!({"path":"b"}))]);
         let message = json!({"role":"assistant", "api":model.api, "provider":model.provider,
             "model":model.id, "content":result.content});
         let replay = anthropic_messages(&[message.clone()], &model);
