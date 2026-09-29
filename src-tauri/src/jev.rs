@@ -215,7 +215,6 @@ async fn send(settings: Settings, body: Result<Value, String>) -> Result<Value, 
     if !settings.jev_enabled {
         return Ok(json!({"status":"disabled","advisoryOnly":true,"requestAttempted":false,"elapsedMs":0,"next":"JEV 已关闭，主模型继续处理；可在设置中启用"}));
     }
-    let url = "https://api.typesafe.ai/v1/systemone";
     let key = if settings.jev_api_key.trim().is_empty() {
         std::env::var("NOVA_JEV_API_KEY").unwrap_or_default()
     } else { settings.jev_api_key.clone() };
@@ -226,6 +225,13 @@ async fn send(settings: Settings, body: Result<Value, String>) -> Result<Value, 
             return Err("请在设置中填写 JEV API Key，或设置 NOVA_JEV_API_KEY".into());
         }
         let body = body?;
+        let address = settings.jev_api_url.trim();
+        let url = reqwest::Url::parse(if address.is_empty() { "https://api.typesafe.ai/v1/systemone" } else { address })
+            .map_err(|_| "JEV API 地址无效，请填写完整 HTTP(S) 地址".to_string())?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
+            || !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+            return Err("JEV API 地址需为完整 HTTP(S) 地址，不能包含用户名、密码或片段".into());
+        }
         // JEV 独立沿用系统代理；不复用默认直连的后端客户端。
         // Reuse connections across advice calls; never follow redirects carrying credentials.
         static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> = std::sync::OnceLock::new();
@@ -274,10 +280,12 @@ async fn send(settings: Settings, body: Result<Value, String>) -> Result<Value, 
 pub(crate) async fn test_jev_connection(
     webview: tauri::Webview,
     api_key: String,
+    api_url: Option<String>,
 ) -> Result<Value, String> {
     if webview.label() != "main" { return Err("仅 Nova 主界面可以测试 JEV".into()); }
     let settings = Settings {
         jev_enabled: true, jev_api_key: api_key,
+        jev_api_url: api_url.unwrap_or_default(),
         ..Settings::default()
     };
     let result = advise(settings, &json!({"advice":{
@@ -294,6 +302,55 @@ pub(crate) async fn test_jev_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn custom_endpoint_receives_jev_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}/custom/jev?route=test", listener.local_addr().unwrap());
+        let settings: Settings = serde_json::from_value(json!({
+            "jevEnabled":true, "jevApiKey":"test-key", "jevApiUrl":format!(" {address} ")
+        })).unwrap();
+        assert_eq!(serde_json::to_value(&settings).unwrap()["jevApiUrl"], format!(" {address} "));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let (header_end, length) = loop {
+                let mut buffer = [0u8; 4096];
+                let n = stream.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                    assert!(headers.starts_with("post /custom/jev?route=test http/1.1\r\n"));
+                    assert!(headers.contains("\r\nauthorization: bearer test-key\r\n"));
+                    let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                    break (end + 4, length);
+                }
+            };
+            while bytes.len() < header_end + length {
+                let mut buffer = [0u8; 4096];
+                let n = stream.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+            }
+            let body: Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+            assert_eq!(body["model"], "jev-latest");
+            assert_eq!(body["questions"]["next"]["type"], "choice");
+            let response = r#"{"answers":{"next":{"type":"choice","choice":"ready"}}}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+        });
+        let args = json!({"advice":{"task":"test", "state":"ready", "choices":{"ready":"ready"}}});
+        let result = advise(settings.clone(), &args).await.unwrap();
+        assert_eq!(result["status"], "advised", "{result}");
+        assert_eq!(result["requestAttempted"], true);
+        tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+        for address in ["invalid", "ftp://example.com/jev", "https://user:secret@example.com/jev", "https://example.com/jev#fragment"] {
+            let result = advise(Settings { jev_api_url: address.into(), ..settings.clone() }, &args).await.unwrap();
+            assert_eq!(result["status"], "unavailable");
+            assert_eq!(result["requestAttempted"], false);
+        }
+    }
+
     #[test]
     fn dom_path_contract_keeps_valid_prefix_without_replaying_or_inventing_hints() {
         let choices: std::collections::BTreeMap<_,_> = (0..83).map(|i|(format!("action_{i}"),format!("DOM hint {i}"))).collect();
@@ -381,6 +438,7 @@ mod tests {
         assert!(request(&settings, &json!({"advice":{"task":"x","state":"y","choices":{"defer":"override"}}})).is_err());
         let legacy: Settings = serde_json::from_str("{}").unwrap();
         assert!(!legacy.jev_enabled);
+        assert!(legacy.jev_api_url.is_empty());
         assert_eq!(body["model"], "jev-latest");
     }
 }

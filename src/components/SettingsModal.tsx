@@ -247,14 +247,15 @@ const TABS: { id: SettingsTab; name: string }[] = [
 export function SettingsModal(props: { onClose: () => void }) {
   const s = state.settings;
   const [jevEnabled, setJevEnabled] = createSignal(s?.jevEnabled ?? false);
+  const [jevApiUrl, setJevApiUrl] = createSignal(s?.jevApiUrl ?? "");
   const [jevTesting, setJevTesting] = createSignal(false);
   const [jevTestResult, setJevTestResult] = createSignal("");
   const testJev = async () => {
     setJevTesting(true);
     setJevTestResult("");
     try {
-      const result = await invoke<{ elapsedMs: number }>("test_jev_connection", { apiKey: jevApiKey().trim() });
-      setJevTestResult(`官方接口测试通过，耗时 ${result.elapsedMs} ms（仅固定测试，不代表控制成功率）`);
+      const result = await invoke<{ elapsedMs: number }>("test_jev_connection", { apiKey: jevApiKey().trim(), apiUrl: jevApiUrl().trim() });
+      setJevTestResult(`接口测试通过，耗时 ${result.elapsedMs} ms（仅固定测试，不代表控制成功率）`);
     } catch (error) { setJevTestResult(String(error)); }
     finally { setJevTesting(false); }
   };
@@ -711,6 +712,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const draftSettings = (): Settings => ({
     jevEnabled: jevEnabled(),
     jevApiKey: jevApiKey().trim(),
+    jevApiUrl: jevApiUrl().trim(),
     claudePath: claudePath().trim() || "claude-agent-acp",
     claudeProxy: claudeProxy().trim(),
     claudeEnabled: claudeEnabled(),
@@ -1134,15 +1136,20 @@ export function SettingsModal(props: { onClose: () => void }) {
               <h3 class="settings-group-title">JEV DOM 决策</h3>
               <label class="field">
                 <span><input type="checkbox" checked={jevEnabled()} onChange={e => setJevEnabled(e.currentTarget.checked)} /> 启用 JEV</span>
-                <span class="field-hint">保存后生效。固定使用 TypeSafe 官方接口和 jev-latest，默认使用系统代理。浏览器 DOM 操作默认委托 JEV，按元素编号规划并在每步后刷新 DOM；视觉操作由主模型负责，JEV 只辅助判断文字证据。仅实际调用 advise/run 时产生用量。不确定时交回主模型，关闭后不发起新请求。</span>
+                <span class="field-hint">保存后生效。使用 jev-latest，默认使用系统代理。浏览器 DOM 操作默认委托 JEV，按元素编号规划并在每步后刷新 DOM；视觉操作由主模型负责，JEV 只辅助判断文字证据。仅实际调用 advise/run 时产生用量。不确定时交回主模型，关闭后不发起新请求。</span>
+              </label>
+              <label class="field">
+                <span class="field-label">API 地址</span>
+                <input class="field-input" type="url" placeholder="https://api.typesafe.ai/v1/systemone" value={jevApiUrl()} onInput={e => setJevApiUrl(e.currentTarget.value)} />
+                <span class="field-hint">留空使用 TypeSafe 官方接口；第三方服务请填写兼容 SystemOne 协议的完整接口地址（含路径），并使用该服务的 API Key。</span>
               </label>
               <label class="field">
                 <span class="field-label">API Key</span>
                 <input class="field-input" type="password" autocomplete="off" value={jevApiKey()} onInput={e => setJevApiKey(e.currentTarget.value)} />
-                <span class="field-hint">密钥保存在本机设置文件中（非加密）；也可留空使用 NOVA_JEV_API_KEY 环境变量。调用时会向官方服务发送任务、观察摘要和候选项；连续执行还会发送相关页面文本与目标信息，不上传截图；请勿提交密码、令牌等敏感信息。JEV 不负责视觉定位。</span>
+                <span class="field-hint">密钥保存在本机设置文件中（非加密）；也可留空使用 NOVA_JEV_API_KEY 环境变量。调用时会向所配置的服务发送任务、观察摘要和候选项；连续执行还会发送相关页面文本与目标信息，不上传截图；请勿提交密码、令牌等敏感信息。JEV 不负责视觉定位。</span>
               </label>
-              <button type="button" class="btn" disabled={jevTesting()} onClick={() => void testJev()}>{jevTesting() ? "测试中…" : "测试官方连接"}</button>
-              <p class="field-hint">使用当前填写的密钥发送固定测试，可能产生少量费用；无需先保存或启用。</p>
+              <button type="button" class="btn" disabled={jevTesting()} onClick={() => void testJev()}>{jevTesting() ? "测试中…" : "测试连接"}</button>
+              <p class="field-hint">使用当前填写的地址和密钥发送固定测试，可能产生少量费用；无需先保存或启用。</p>
               <p role="status" aria-live="polite">{jevTestResult()}</p>
             </section>
           </Show>

@@ -421,6 +421,7 @@ export interface PendingNewSessionSeed {
 export interface Settings {
   jevEnabled: boolean;
   jevApiKey: string;
+  jevApiUrl: string;
   claudePath: string;
   claudeProxy: string;
   claudeEnabled: boolean;

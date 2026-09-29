@@ -18,7 +18,7 @@ await mkdir(out,{recursive:true});
 const profile=await mkdtemp(join(tmpdir(),'nova-databrain-ab-'));
 const source=JSON.parse(await readFile(join(process.env.USERPROFILE,'.novadev/settings.json'),'utf8'));
 await writeFile(join(profile,'settings.json'),JSON.stringify({
-  jevEnabled:mode==='on',jevApiKey:mode==='on'?source.jevApiKey:'',relayServer:'',relayToken:'',sessionShortcuts:[],
+  jevEnabled:mode==='on',jevApiKey:mode==='on'?source.jevApiKey:'',jevApiUrl:source.jevApiUrl,relayServer:'',relayToken:'',sessionShortcuts:[],
   lyraEnabled:false,codebuddyEnabled:true,codexEnabled:false,codebuddyPath:source.codebuddyPath,
   codebuddyArgs:source.codebuddyArgs,codebuddyProxy:source.codebuddyProxy,codebuddyIntegration:source.codebuddyIntegration,
 }));
