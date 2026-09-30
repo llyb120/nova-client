@@ -44,7 +44,10 @@ export default function EmployeeView() {
   });
 
   const run = async (command: string, args: Record<string, unknown>) => {
-    try { await invoke(command, args); } catch (error) { showToast(String(error)); }
+    try {
+      const out = await invoke(command, args);
+      if (typeof out === "string" && out) showToast(out);
+    } catch (error) { showToast(String(error)); }
     void refetch();
   };
   const act = (action: string, id?: string) => run("employee_do", { action, id: id ?? null });
@@ -98,23 +101,45 @@ export default function EmployeeView() {
                 <h2 id="employee-duties">职责</h2>
                 <Show when={e().duties.length} fallback={<p class="employee-empty">还没有职责，在下方对员工说一句，例如“每天 9 点检查未读邮件并汇总”。</p>}>
                   <ul class="employee-list">
-                    <For each={e().duties}>{(duty) => (
+                    <For each={e().duties}>{(duty) => {
+                      // 编辑草稿放本地信号，5s 轮询 reconcile 不会冲掉正在输入的内容。
+                      const [draft, setDraft] = createSignal<string | null>(null);
+                      const save = async () => {
+                        const text = draft()?.trim();
+                        if (!text) return;
+                        if (text !== duty.text) await run("employee_do", { action: "duty_edit", id: duty.id, text });
+                        setDraft(null);
+                      };
+                      return (
                       <li>
                         <input type="checkbox" checked={duty.enabled} aria-label={`启用职责：${duty.text}`}
                           onChange={() => void act("duty_toggle", duty.id)} />
                         <div class="employee-main">
-                          <div>{duty.text}</div>
+                          <Show when={draft() !== null} fallback={<div>{duty.text}</div>}>
+                            <textarea rows={2} maxLength={500} aria-label="编辑职责" value={draft() ?? ""} ref={(el) => queueMicrotask(() => el.focus())}
+                              onInput={(ev) => setDraft(ev.currentTarget.value)}
+                              onKeyDown={(ev) => {
+                                if (ev.key === "Escape") setDraft(null);
+                                else if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); void save(); }
+                              }} />
+                            <div>
+                              <button type="button" disabled={!draft()?.trim()} onClick={() => void save()}>保存</button>
+                              <button type="button" onClick={() => setDraft(null)}>取消</button>
+                            </div>
+                          </Show>
                           <small>上次 {time(duty.lastRunAt)}{duty.lastResult ? ` · ${duty.lastResult}` : ""}</small>
                         </div>
                         <details class="employee-more">
                           <summary aria-label="更多操作">⋯</summary>
                           <div>
+                            <button type="button" onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; setDraft(duty.text); }}>编辑</button>
                             <button type="button" onClick={() => void act("duty_run", duty.id)}>立即执行</button>
                             <button type="button" onClick={() => void act("duty_delete", duty.id)}>删除</button>
                           </div>
                         </details>
                       </li>
-                    )}</For>
+                      );
+                    }}</For>
                   </ul>
                 </Show>
               </section>

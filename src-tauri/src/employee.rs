@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const EV_EMPLOYEE: &str = "employee:changed";
-const HEARTBEAT: Duration = Duration::from_secs(15 * 60);
+/// 检查点对齐到整点后每 15 分钟（:00/:15/:30/:45）。
+const HEARTBEAT_MIN: u32 = 15;
 const MAX_DUTIES: usize = 50;
 const MAX_TEXT_CHARS: usize = 500;
 const MAX_NOTE_BYTES: usize = 1024;
@@ -165,8 +166,9 @@ struct Current {
 struct Runtime {
     current: Option<Current>,
     yielded: bool,
+    /// 最近一个待满足的检查点；过了点但用户在用或员工在忙时保持挂起，
+    /// 满足后才排下一个，错过的多个点合并为一次。手动检查不推迟它。
     next_check_at: i64,
-    force_check: bool,
 }
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
@@ -218,40 +220,63 @@ fn user_took_over(system_idle_ms: u64, since_start_ms: u64, since_injected_ms: O
     !injecting && system_idle_ms + 1500 < baseline
 }
 
+/// 严格晚于 now 的下一个整 15 分钟；落在工作时段外则顺延到下一次上班时间。
+fn next_slot(now: chrono::NaiveDateTime, start: &str, end: &str) -> chrono::NaiveDateTime {
+    use chrono::Timelike;
+    let step = HEARTBEAT_MIN as i64;
+    let minute = (now.hour() * 60 + now.minute()) as i64;
+    let add = step - minute % step;
+    let slot = now.with_second(0).and_then(|t| t.with_nanosecond(0)).unwrap() + chrono::TimeDelta::minutes(add);
+    let slot_minute = (minute + add) % 1440;
+    if in_work_hours(start, end, slot_minute as u32) {
+        return slot;
+    }
+    let to_start = parse_hm(start).map_or(0, |s| (s as i64 - slot_minute).rem_euclid(1440));
+    slot + chrono::TimeDelta::minutes(to_start)
+}
+
+fn reschedule(employee: &Employee) {
+    use chrono::TimeZone;
+    let slot = next_slot(chrono::Local::now().naive_local(), &employee.work_start, &employee.work_end);
+    let at = chrono::Local
+        .from_local_datetime(&slot)
+        .earliest()
+        .map_or(now_ms() + HEARTBEAT_MIN as i64 * 60_000, |t| t.timestamp_millis());
+    runtime(|rt| rt.next_check_at = at);
+}
+
 // ---------- 心跳 ----------
 
 pub fn start(app: AppHandle) {
     let _ = APP.set(app.clone());
-    runtime(|rt| rt.next_check_at = now_ms() + HEARTBEAT.as_millis() as i64);
+    if let Ok(employee) = load() {
+        reschedule(&employee);
+    }
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             watch(&app).await;
-            let (due, forced) = runtime(|rt| {
-                let due = rt.force_check || now_ms() >= rt.next_check_at;
-                if due {
-                    rt.next_check_at = now_ms() + HEARTBEAT.as_millis() as i64;
-                }
-                (due, std::mem::take(&mut rt.force_check))
-            });
-            if due && (forced || gates_open()) {
-                if let Err(error) = heartbeat(&app, forced).await {
-                    eprintln!("[employee] heartbeat failed: {error}");
-                }
+            if now_ms() < runtime(|rt| rt.next_check_at) {
+                continue;
+            }
+            let Ok(employee) = load() else { continue };
+            let now = chrono::Local::now();
+            use chrono::Timelike;
+            if !employee.enabled || !in_work_hours(&employee.work_start, &employee.work_end, now.hour() * 60 + now.minute()) {
+                // 未值班或已下班：这个点作废，排到下一个有效点。
+                reschedule(&employee);
+                continue;
+            }
+            let idle = system_idle_ms().is_some_and(|ms| ms >= employee.idle_minutes as u64 * 60_000);
+            if !idle || runtime(|rt| rt.current.is_some()) {
+                continue; // 挂起：等用户离开 / 当前会话结束再补上这一次
+            }
+            reschedule(&employee);
+            if let Err(error) = heartbeat(&app, false).await {
+                eprintln!("[employee] heartbeat failed: {error}");
             }
         }
     });
-}
-
-fn gates_open() -> bool {
-    let Ok(employee) = load() else { return false };
-    if !employee.enabled || runtime(|rt| rt.current.is_some()) {
-        return false;
-    }
-    let idle = system_idle_ms().is_some_and(|ms| ms >= employee.idle_minutes as u64 * 60_000);
-    let now = chrono::Local::now();
-    use chrono::Timelike;
-    idle && in_work_hours(&employee.work_start, &employee.work_end, now.hour() * 60 + now.minute())
 }
 
 enum Job {
@@ -259,16 +284,17 @@ enum Job {
     Inbox(Todo),
 }
 
-async fn heartbeat(app: &AppHandle, manual: bool) -> Result<(), String> {
+/// 返回结果说明，供手动检查提示。
+async fn heartbeat(app: &AppHandle, manual: bool) -> Result<String, String> {
     if runtime(|rt| rt.current.is_some()) {
-        return Ok(());
+        return Err("员工正在工作，请稍后".into());
     }
     runtime(|rt| rt.yielded = false);
     let employee = load()?;
     let duties: Vec<&Duty> = employee.duties.iter().filter(|d| d.enabled).collect();
     let todo = employee.inbox.iter().find(|t| !t.confirm).cloned();
     if duties.is_empty() && todo.is_none() {
-        return Ok(());
+        return Ok("没有启用的职责或待办".into());
     }
     let mut choices = BTreeMap::new();
     let mut state = format!("当前时间：{}\n职责：\n", chrono::Local::now().format("%Y-%m-%d %H:%M %A"));
@@ -307,10 +333,11 @@ async fn heartbeat(app: &AppHandle, manual: bool) -> Result<(), String> {
         None => None,
     };
     match job {
-        Some(Job::Duty(duty)) => run_duty(app, &duty, !manual),
+        Some(Job::Duty(duty)) => run_duty(app, &duty, !manual).map(|_| format!("已开始：{}", clip(&duty.text, 40))),
         Some(Job::Inbox(todo)) => launch(app, "inbox", &format!("待办：{}", clip(&todo.text, 40)),
-            &format!("处理一条待办（id={}）：\n{}\n完成后调用 employee action=done id={} 删除它。", todo.id, todo.text, todo.id), !manual),
-        None => Ok(()),
+            &format!("处理一条待办（id={}）：\n{}\n完成后调用 employee action=done id={} 删除它。", todo.id, todo.text, todo.id), !manual)
+            .map(|_| format!("已开始处理待办：{}", clip(&todo.text, 40))),
+        None => Ok("检查完毕：现在没有需要做的事".into()),
     }
 }
 
@@ -557,23 +584,33 @@ pub fn employee_set(patch: Value) -> Result<(), String> {
         Ok(())
     })?;
     runtime(|rt| rt.yielded = false);
+    // 改了时段等配置要重算检查点；已过点仍挂起的那一次保留，由心跳循环判定是否作废。
+    let employee = load()?;
+    if runtime(|rt| rt.next_check_at > now_ms()) {
+        reschedule(&employee);
+    }
     Ok(())
 }
 
-/// check / duty_toggle / duty_delete / duty_run / approve / dismiss
+/// check / duty_toggle / duty_edit / duty_delete / duty_run / approve / dismiss；check 返回结果说明。
 #[tauri::command]
-pub fn employee_do(app: AppHandle, action: String, id: Option<String>) -> Result<(), String> {
+pub async fn employee_do(app: AppHandle, action: String, id: Option<String>, text: Option<String>) -> Result<String, String> {
+    if action == "check" {
+        let out = heartbeat(&app, true).await?;
+        // 顺带满足已过点的挂起检查点，但不推迟未来的检查点。
+        if runtime(|rt| rt.next_check_at <= now_ms()) {
+            reschedule(&load()?);
+        }
+        return Ok(out);
+    }
     let id = id.unwrap_or_default();
     match action.as_str() {
-        "check" => {
-            runtime(|rt| rt.force_check = true);
-            Ok(())
-        }
         "duty_toggle" => update(|e| {
             let duty = e.duties.iter_mut().find(|d| d.id == id).ok_or("没有这条职责")?;
             duty.enabled = !duty.enabled;
             Ok(())
         }),
+        "duty_edit" => execute_tool(&json!({"action": "update", "id": id, "text": text.ok_or("缺少 text")?})).map(|_| ()),
         "duty_delete" | "dismiss" => execute_tool(&json!({"action": "done", "id": id})).map(|_| ()),
         "duty_run" => {
             let duty = load()?.duties.into_iter().find(|d| d.id == id).ok_or("没有这条职责")?;
@@ -587,6 +624,7 @@ pub fn employee_do(app: AppHandle, action: String, id: Option<String>) -> Result
         }
         _ => Err(format!("未知操作：{action}")),
     }
+    .map(|_| String::new())
 }
 
 /// “对员工说”：唯一的配置入口，走一个短会话由模型调 employee 工具改职责或派活。
@@ -614,6 +652,19 @@ mod tests {
         assert!(!in_work_hours("22:00", "06:00", 12 * 60));
         assert!(in_work_hours("00:00", "00:00", 12 * 60));
         assert!(!in_work_hours("bad", "18:00", 12 * 60));
+    }
+
+    #[test]
+    fn next_slot_aligns_to_quarter_and_skips_off_hours() {
+        let at = |mo: u32, d: u32, h: u32, m: u32, s: u32| {
+            chrono::NaiveDate::from_ymd_opt(2026, mo, d).unwrap().and_hms_opt(h, m, s).unwrap()
+        };
+        assert_eq!(next_slot(at(9, 30, 10, 7, 30), "09:00", "18:00"), at(9, 30, 10, 15, 0));
+        assert_eq!(next_slot(at(9, 30, 10, 15, 0), "09:00", "18:00"), at(9, 30, 10, 30, 0));
+        assert_eq!(next_slot(at(9, 30, 17, 50, 0), "09:00", "18:00"), at(10, 1, 9, 0, 0));
+        assert_eq!(next_slot(at(9, 30, 8, 50, 0), "09:10", "18:00"), at(9, 30, 9, 10, 0));
+        assert_eq!(next_slot(at(9, 30, 23, 50, 0), "22:00", "06:00"), at(10, 1, 0, 0, 0));
+        assert_eq!(next_slot(at(9, 30, 12, 0, 0), "22:00", "06:00"), at(9, 30, 22, 0, 0));
     }
 
     #[test]
