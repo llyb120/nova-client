@@ -315,14 +315,20 @@ async fn heartbeat(app: &AppHandle, manual: bool) -> Result<String, String> {
     let settings = app.state::<AppState>().settings.lock().unwrap().clone();
     let decision = crate::jev::choose(settings, "数字员工心跳：判断此刻最该做哪一件事，没有就选 idle", &state, &choices,
         "按职责原文里的时间/频率要求与上次执行时间判断是否该执行；有新待办优先处理；拿不准选 idle。").await;
-    let picked = match decision {
+    let inbox = || todo.as_ref().map(|_| "inbox".to_string());
+    // 没选中任何事时的原因，避免 JEV 不可用时也笼统报“没事可做”。
+    let (picked, why) = match decision {
         Ok(v) if v["status"] == "advised" => match v["confidence"].as_f64() {
-            Some(c) if c >= MIN_CONFIDENCE => Some(v["choice"].as_str().unwrap_or("idle").to_string()),
-            Some(_) => None,
-            None => todo.as_ref().map(|_| "inbox".to_string()),
+            Some(c) if c >= MIN_CONFIDENCE => (Some(v["choice"].as_str().unwrap_or("idle").to_string()),
+                "JEV 判断此刻没有到时候的职责".to_string()),
+            Some(c) => (None, format!("JEV 拿不准（置信度 {c:.2}），本次不执行")),
+            None => (inbox(), "JEV 未给出置信度，本次只处理待办".to_string()),
         },
         // JEV 不可用：保守规则，只有新待办才唤醒主模型。
-        _ => todo.as_ref().map(|_| "inbox".to_string()),
+        Ok(v) if v["status"] == "disabled" => (inbox(),
+            "JEV 未启用，心跳无法判断职责是否到点，只会处理待办；请在设置中启用 JEV，或在职责菜单里点“立即执行”".to_string()),
+        Ok(v) => (inbox(), format!("JEV 不可用（{}），心跳只会处理待办", v["error"].as_str().unwrap_or("未知错误"))),
+        Err(e) => (inbox(), format!("JEV 不可用（{e}），心跳只会处理待办")),
     };
     let job = match picked.as_deref() {
         Some("inbox") => todo.map(Job::Inbox),
@@ -337,7 +343,7 @@ async fn heartbeat(app: &AppHandle, manual: bool) -> Result<String, String> {
         Some(Job::Inbox(todo)) => launch(app, "inbox", &format!("待办：{}", clip(&todo.text, 40)),
             &format!("处理一条待办（id={}）：\n{}\n完成后调用 employee action=done id={} 删除它。", todo.id, todo.text, todo.id), !manual)
             .map(|_| format!("已开始处理待办：{}", clip(&todo.text, 40))),
-        None => Ok("检查完毕：现在没有需要做的事".into()),
+        None => Ok(format!("检查完毕：{why}")),
     }
 }
 
