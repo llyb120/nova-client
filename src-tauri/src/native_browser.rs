@@ -1740,6 +1740,15 @@ async fn control_session(
                 Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
             }
         }
+        // JEV runs save their own verified route; everything else feeds the turn's auto trail.
+        if !crate::jev_run::executing_browser_action() {
+            let before = &observation.pages["pages"][0];
+            let after = if result["pages"][0]["url"].is_string() { &result["pages"][0] } else { before };
+            crate::tool_experience::record(if chrome {"chrome"} else {"webview"}, &s.thread_id,
+                before["url"].as_str().unwrap_or_default(), after["url"].as_str().unwrap_or_default(),
+                after["title"].as_str().unwrap_or_default(),
+                actions[..progress.completed].iter().filter_map(|a| trail_step(&observation.pages, a)).collect());
+        }
         Ok(result)
     });
     let mut result = tokio::select! {
@@ -1852,6 +1861,36 @@ pub(crate) fn current_context(root: &Path) -> Result<(&'static AppHandle, String
 }
 
 pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> {
+    let result = execute_webview(root, args).await?;
+    Ok(with_experience_hint("webview", &current_context(root)?.1, result))
+}
+
+/// Semantic, value-free description of one completed act for the auto trail; coordinates and
+/// scrolls carry no reusable meaning and are skipped.
+fn trail_step(pages: &Value, action: &Action) -> Option<String> {
+    let target = |frame: &usize, r: &str| pages["pages"][*frame]["items"].as_array()?.iter().find(|i| i["ref"] == r).map(|i| {
+        let name = crate::tool_experience::step_name(i["name"].as_str().unwrap_or_default());
+        let role = i["role"].as_str().or(i["tag"].as_str()).unwrap_or("元素");
+        if name.is_empty() { role.to_string() } else { format!("{role}「{name}」") }
+    });
+    match action {
+        Action::Click { frame, r#ref, .. } => Some(format!("点击 {}", target(frame, r#ref)?)),
+        Action::Fill { frame, r#ref, .. } => Some(format!("填写 {}", target(frame, r#ref)?)),
+        Action::Press { key } => Some(format!("按 {key}")),
+        _ => None,
+    }
+}
+
+/// Attach verified routes the first time this session observes a site; see tool_experience::hint.
+fn with_experience_hint(tool: &str, owner: &str, mut result: Value) -> Value {
+    let origin = result["pages"][0]["url"].as_str().and_then(|u| tauri::Url::parse(u).ok()).map(|u| u.origin().ascii_serialization());
+    if let Some(hint) = origin.and_then(|o| crate::tool_experience::hint(&crate::tool_experience::dir(), tool, owner, &o)) {
+        result["experienceHint"] = hint;
+    }
+    result
+}
+
+async fn execute_webview(root: &Path, args: &Value) -> Result<Value, String> {
     let (app, thread_id) = current_context(root)?;
     let operation = args["operation"].as_str().unwrap_or_default();
     if operation == "open" {
@@ -1896,7 +1935,7 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> 
         };
         let args = args.clone();
         return tokio::task::spawn_blocking(move || crate::tool_experience::execute(
-            &crate::lyra::config::nova_root().join("tool-experiences"), "webview", &thread_id, &args, observed.as_deref()))
+            &crate::tool_experience::dir(), "webview", &thread_id, &args, observed.as_deref()))
             .await.map_err(|e| e.to_string())?;
     }
     match operation {
@@ -1968,6 +2007,11 @@ fn browser_observation(root: &Path, args: &Value, owner: &str, tool: &str, fallb
 }
 
 pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
+    let result = execute_chrome_inner(root, args, owner).await?;
+    Ok(with_experience_hint("chrome", &tool_owner(root, owner)?, result))
+}
+
+async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
     let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
     let thread_id = tool_owner(root, owner)?;
     let operation = args["operation"].as_str().unwrap_or_default();
@@ -2001,7 +2045,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
         };
         let args = args.clone();
         return tokio::task::spawn_blocking(move || crate::tool_experience::execute(
-            &crate::lyra::config::nova_root().join("tool-experiences"), "chrome", &thread_id, &args, observed.as_deref()))
+            &crate::tool_experience::dir(), "chrome", &thread_id, &args, observed.as_deref()))
             .await.map_err(|e| e.to_string())?;
     }
     let connection = crate::chrome_browser::connect(app).await?;

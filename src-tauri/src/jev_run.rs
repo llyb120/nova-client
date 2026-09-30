@@ -65,11 +65,13 @@ struct Step {
 
 impl Step {
     fn expect(&self) -> Option<&str> { self.expect.as_deref().or(self.expected_text.as_deref()).filter(|s| !s.trim().is_empty()) }
-    fn describe(&self) -> String {
+    fn describe(&self) -> String { self.describe_with(true) }
+    /// `values=false` keeps typed values out of saved routes (they are task data, not the path).
+    fn describe_with(&self, values: bool) -> String {
         let mut text = format!("{} {}", self.action, if self.target.is_empty() { self.name.as_deref().unwrap_or("页面") } else { &self.target });
         if let Some(name) = self.name.as_deref().filter(|_| !self.target.is_empty()) { text += &format!(" (名称={name})"); }
         if let Some(within) = &self.within { text += &format!(" 位于「{within}」"); }
-        if let Some(value) = &self.text { text += &format!(" 输入「{}」", short(value, 60)); }
+        if let Some(value) = self.text.as_ref().filter(|_| values) { text += &format!(" 输入「{}」", short(value, 60)); }
         if let Some(key) = &self.key { text += &format!(" 按键 {key}"); }
         if let Some(expect) = self.expect() { text += &format!(" → 期望：{expect}"); }
         text
@@ -309,6 +311,14 @@ async fn execute_browser(root: &Path, args: &Value, owner: &str, tool: &str) -> 
         "chrome" => Box::pin(crate::native_browser::execute_chrome(root, args, owner)).await,
         _ => Err("不支持的 JEV 浏览器".into()),
     }}).await
+}
+
+fn route_save(plan: &Plan, start: &Value, home: &str, snapshot: &str) -> Value {
+    let path = crate::tool_experience::entry_path(start["pages"][0]["url"].as_str().unwrap_or_default());
+    let steps = crate::tool_experience::fit_steps(&plan.steps.iter().map(|s| s.describe_with(false)).collect::<Vec<_>>());
+    json!({"operation":"experience_save","snapshotId":snapshot,"experience":{"scope":home,"task":short(&plan.task, 290),
+        "conditions":[format!("起始页面 {}", short(&path, 400))],"steps":steps,"checks":[short(&plan.expected_text, 480)],
+        "evidence":format!("JEV run 已核验完成条件：{}", short(&plan.expected_text, 400)),"outcome":"success","redacted":true}})
 }
 
 fn graph_context(search: &Value) -> Value {
@@ -1576,6 +1586,17 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     let started = Instant::now();
     let outcome = run.drive(&home, started).await;
     let mut latest = run.latest.clone();
+    // A guided run that passed its completion check is a verified route: record it so the next
+    // session gets it via experienceHint instead of relying on the model to call experience_save.
+    // One-step plans are obvious from the page itself; storing them only buries real routes.
+    let saved = if outcome.is_ok() && run.plan.steps.len() >= 2 {
+        let save = route_save(&run.plan, &initial, &home, latest["snapshotId"].as_str().unwrap_or("jev-run"));
+        let owner = crate::native_browser::tool_owner(root, owner).unwrap_or_else(|_| owner.into());
+        let (tool, scope) = (tool.to_string(), home.clone());
+        tokio::task::spawn_blocking(move || crate::tool_experience::execute(&crate::tool_experience::dir(), &tool, &owner, &save, Some(&scope)))
+            .await.map_err(|e| e.to_string()).and_then(|r| r)
+            .map(|v| json!({"saved":true,"id":v["experience"]["id"]})).unwrap_or_else(|e| json!({"saved":false,"error":e}))
+    } else { Value::Null };
     let mut fallback = false;
     if outcome.is_err() {
         // Return fresh evidence even when the first decision defers or an act lost feedback.
@@ -1624,7 +1645,7 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
         "missingInputs":if handoff { json!(run.missing_inputs) } else { json!([]) },
         "inputHint":if handoff && !run.missing_inputs.is_empty() {
             json!("missingInputs 不代表都必须填写。需要输入时在 plan.inputs 提供 name（或 fieldContext）与准确 text；搜索词也可直接写进 task（如 Region 改为 \"United States\"），run 会用于同句提到的搜索框。") } else { Value::Null },
-        "candidateCounts":run.candidate_counts,"decisions":decisions,
+        "candidateCounts":run.candidate_counts,"decisions":decisions,"experience":saved,
         "decisionTree":if handoff { runtime_tree(&json!({"obstacles":run.tree["obstacles"],"selectedPath":run.tree["selectedPath"]}), &run.pending) } else { Value::Null },
         "trace":run.trace.iter().rev().take(12).rev().collect::<Vec<_>>(),
         "notice":"JEV决策树：本地等待/填写与已校验路径不请求模型，信息边界才请求JEV。history[].effect 是每步的实际页面变化。handoff后主模型核对最新观察，不重放历史操作，解决难点后可再次委托run。"});
@@ -2110,6 +2131,15 @@ mod tests {
         assert_eq!(refs, HashSet::from(["r", "c", "p", "s", "custom"].map(String::from)));
     }
 
+    #[test]
+    fn route_save_is_storable_without_typed_values() {
+        let steps: Vec<Value> = (0..14).map(|i| json!({"action":"fill","target":format!("第{i}个框"),"text":"secret-value"})).collect();
+        let p = plan(json!({"task":"查询","authorization":"只读","expectedText":"出现结果","steps":steps}));
+        let save = route_save(&p, &json!({"pages":[{"url":"https://a.com/project/42/list?q=1"}]}), "https://a.com", "snap");
+        let e = &save["experience"];
+        assert_eq!((e["steps"].as_array().unwrap().len(), e["conditions"][0].clone()), (7, json!("起始页面 /project/*/list")));
+        assert!(!save.to_string().contains("secret-value"));
+    }
     #[test]
     fn graph_context_keeps_complete_routes_and_checks_within_budget() {
         let route = json!({"id":"route-1","conditions":["已登录"],"steps":["查询订单"],"checks":["订单号匹配"]});

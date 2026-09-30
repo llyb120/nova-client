@@ -5172,6 +5172,26 @@ fn get_logs(state: State<'_, AppState>) -> Vec<String> {
 
 /// 注册 Tauri 事件监听：本机 agent 产生的 update/turn/permission 事件，
 /// 若属于「被别人漫游」的会话，则原样转发给对应 guest。
+/// Browser acts of a turn become an auto-recorded route when the turn ends normally
+/// (see tool_experience::finish_turn); cancelled or failed turns only drop their trail.
+fn register_experience_trails(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    app.listen(acp::EV_TURN, move |e| {
+        let Ok(v) = serde_json::from_str::<Value>(e.payload()) else { return };
+        let Some(tid) = v["threadId"].as_str().map(str::to_owned) else { return };
+        if v["running"].as_bool().unwrap_or(false) { return; }
+        let keep = matches!(v["stopReason"].as_str(), Some("end_turn" | "max_turn_requests"));
+        let cwd = handle.state::<AppState>().store.lock().unwrap().get(&tid).map(|t| t.cwd.clone());
+        tauri::async_runtime::spawn_blocking(move || {
+            // Chrome owners are "<mcp client id>:<canonical cwd>". ponytail: two sessions running
+            // browser acts in the same directory at once share each other's trail.
+            let suffix = cwd.and_then(|c| std::fs::canonicalize(c).ok()).map(|c| format!(":{}", c.display()));
+            tool_experience::finish_turn(&tool_experience::dir(),
+                |o| o == tid || suffix.as_deref().is_some_and(|s| o.ends_with(s)), keep);
+        });
+    });
+}
+
 fn register_roaming_forwarders(app: &tauri::AppHandle, relay: Arc<RelayManager>) {
     let r = relay.clone();
     app.listen(acp::EV_UPDATE, move |e| {
@@ -5613,6 +5633,7 @@ pub fn run() {
             }
 
             // 漫游 host：把本机被漫游会话的更新/轮次/权限事件转发给 guest
+            register_experience_trails(app.handle());
             register_roaming_forwarders(app.handle(), relay.clone());
             register_remote_permission_capture(app.handle());
             // 连接中转站（未配置 token 时内部直接返回）

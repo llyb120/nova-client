@@ -117,6 +117,7 @@ test("desktop optimizations are shared by custom tools and MCP, not Lyra-only", 
     assert.match(tool.description, /普通成功操作无需保存或反馈/);
     assert.doesNotMatch(tool.description, /开始新任务或切换应用\/网站\/子任务时，先experience_search|在最终回复前调用experience_save/);
     assert.match(tool.description, /首次观察后核对conditions/);
+    assert.match(tool.description, /experienceHint/);
     assert.match(tool.description, /graph路径图谱辅助规划/);
     assert.equal(tool.inputSchema.properties.experience.properties.prefix.maxItems, 12);
     assert.match(tool.inputSchema.properties.experience.properties.task.description, /浏览可以做什么/);

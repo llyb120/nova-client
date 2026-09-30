@@ -571,7 +571,7 @@ fn validate(a: &Action, shot: &Shot) -> Result<()> {
         a.action.as_str(),
         "click" | "double_click" | "move" | "drag" | "type" | "press" | "scroll" | "wait"
     ) {
-        return Err("未知剑来动作".into());
+        return Err("未知剑来动作；可用：click/double_click/move/drag/type/press/scroll/wait，按键用press+key".into());
     }
     if a.button
         .as_deref()
@@ -654,7 +654,7 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
             || w.is_minimized().map_err(err)?
             || window_surface(w)? != shot.surface
         {
-            return Err("目标窗口失焦、移动或尺寸改变，请重新截图".into());
+            return Err(format!("目标窗口失焦、移动或尺寸改变；失焦时直接 activate(windowId={id}) 切到前台并返回新图，移动或尺寸改变时重新截图"));
         }
         // Reject an overlapping higher window before coordinate input; window screenshots may include occluded content.
         if a.x.is_some() {
@@ -923,12 +923,23 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let _lease = lease_input("jianlai")?;
             #[cfg(windows)]
             {
-                use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindow, SetForegroundWindow, SW_RESTORE};
+                use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+                use windows_sys::Win32::UI::WindowsAndMessaging::{BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, ShowWindow, SetForegroundWindow, SW_RESTORE};
                 let hwnd = id as usize as windows_sys::Win32::Foundation::HWND;
                 *state = None;
                 unsafe {
                     if IsIconic(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
-                    SetForegroundWindow(hwnd);
+                    if SetForegroundWindow(hwnd) == 0 {
+                        // Unattended runs start with another app in front; the foreground lock refuses background callers.
+                        // Sharing the foreground thread's input queue lifts it without injecting keys.
+                        let fg = GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
+                        let me = GetCurrentThreadId();
+                        if fg != 0 && fg != me && AttachThreadInput(me, fg, 1) != 0 {
+                            BringWindowToTop(hwnd);
+                            SetForegroundWindow(hwnd);
+                            AttachThreadInput(me, fg, 0);
+                        }
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(150));
                 if foreground()? != Some((id, target.pid().map_err(err)?)) {
@@ -1091,7 +1102,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             }
             Ok(result)
         }
-        _ => Err("未知剑来操作".into()),
+        _ => Err("未知剑来操作；可用：windows/screenshot/act/activate/recall/advise/run/experience_search/experience_save/experience_feedback，切窗用activate+windowId".into()),
     }
 }
 // Observation never retries input; follow the foreground and fall back to desktop if needed.
@@ -1155,9 +1166,18 @@ pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Va
                 let id = snap.window.or(snap.foreground.map(|(id, _)| id)).ok_or("请截目标应用窗口后记录经验")?;
                 Some(crate::tool_experience::scope("jianlai", &window(id)?.app_name().map_err(err)?)?)
             };
-            return crate::tool_experience::execute(&crate::lyra::config::nova_root().join("tool-experiences"), "jianlai", &owner, &args, observed.as_deref());
+            return crate::tool_experience::execute(&crate::tool_experience::dir(), "jianlai", &owner, &args, observed.as_deref());
         }
-        run(owner, args)
+        let entering = matches!(args["operation"].as_str(), Some("windows" | "screenshot" | "activate"));
+        let mut result = run(owner.clone(), args)?;
+        // Entering an app: surface its verified routes once per session (see tool_experience::hint).
+        let id = result["windowId"].as_u64().or(result["foreground"][0].as_u64());
+        if let Some(app) = id.filter(|_| entering).and_then(|id| window(id as u32).ok()?.app_name().ok()) {
+            if let Some(hint) = crate::tool_experience::hint(&crate::tool_experience::dir(), "jianlai", &owner, &app) {
+                result["experienceHint"] = hint;
+            }
+        }
+        Ok(result)
     })
         .await
         .map_err(err)?
