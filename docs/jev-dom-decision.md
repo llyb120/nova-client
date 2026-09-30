@@ -2,7 +2,7 @@
 
 浏览器 DOM 操作默认委托 JEV。主模型负责把用户目标、授权范围、准确输入值和完成条件交给 `run`，处理视觉与异常，并核对最终结果。JEV 不接收截图、不推测坐标；桌面和 Canvas 内的视觉操作仍由主模型决策。
 
-该规则在 Chrome/WebView 共用执行层落实，Lyra、CodeBuddy、Codex 等后端使用同一策略。JEV 开启后，主模型直接提交 DOM `click/fill/scroll`（含页面滚动和混合批次）会收到 `not_executed / jev_run_required`，整批未输入，原快照仍可用于 `run`。JEV 内部动作使用私有任务作用域，没有可通过工具 JSON 设置的绕过参数。
+该规则在 Chrome/WebView 共用执行层落实，Lyra、CodeBuddy、Codex 等后端使用同一策略。JEV 开启后，主模型直接提交 DOM `click/fill`（含混合批次）会收到 `not_executed / jev_run_required`，整批未输入，原快照仍可用于 `run`。纯滚动只暴露内容且可逆，可直接 `act`，不必为翻页付出一次 JEV 往返。JEV 内部动作使用私有任务作用域，没有可通过工具 JSON 设置的绕过参数。
 
 真实 `run` 交接时会刷新观察；只有 `jevRun.fallback.allowed=true` 才授予主模型一次单步 DOM 兜底，绑定同一会话、标签和返回的快照，180 秒有效。动作消耗快照，重新观察替换快照，都会取消该许可；之后恢复 `run`。无效计划或旧快照不会生成许可。视觉坐标、键盘等 JEV 不支持的操作仍由主模型完成，保留原有截图与焦点校验；关闭 JEV 时普通 `act` 不受限制。
 

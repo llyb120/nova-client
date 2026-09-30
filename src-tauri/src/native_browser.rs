@@ -1120,8 +1120,9 @@ fn preflight(observation:&Observation, action:&Action, image_id:Option<&str>) ->
 }
 
 fn jev_requires_run(enabled: bool, delegated: bool, observation: &Observation, actions: &[Action]) -> bool {
+    // Scrolling only reveals content and is reversible; delegating it cost a JEV round-trip per page.
     enabled && !delegated
-        && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::Fill{..} | Action::Scroll{..}))
+        && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::Fill{..}))
         && !(observation.jev_fallback && actions.len() == 1 && observation.captured.elapsed() <= Duration::from_secs(180))
 }
 
@@ -1683,7 +1684,7 @@ async fn control_session(
             return Ok(json!({"status":"not_executed","reason":"jev_run_required",
                 "inputAttempted":false,"completedActions":0,"snapshotId":observation.id,
                 "basedOnSnapshotId":observation.id,"verification":"unverified",
-                "next":"JEV 已启用，DOM click/fill/scroll 必须委托 run。本批次未执行，snapshotId 仍有效；用同一目标和 snapshotId 调用 run，提供 plan.task、authorization、expectedText 及所需 inputs，不需要预列 steps。真实 handoff 返回的快照仅允许一次单步 act 兜底，之后恢复 run。视觉操作仍由主模型决定。"}));
+                "next":"JEV 已启用，DOM click/fill 必须委托 run（纯滚动可直接 act）。本批次未执行，snapshotId 仍有效；用同一目标和 snapshotId 调用 run，提供 plan.task、authorization、expectedText 及所需 inputs，不需要预列 steps。真实 handoff 返回的快照仅允许一次单步 act 兜底，之后恢复 run。视觉操作仍由主模型决定。"}));
         }
         let all_dom=actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
         if !all_dom && observation.captured.elapsed()>Duration::from_secs(180) {return Err("观察已过期，请重新观察后继续".into());}
@@ -2231,9 +2232,7 @@ mod tests {
             images: Vec::new(), jev_fallback: false };
         let actions = |items: Value| parse_actions(&json!({"actions":items}), 16).unwrap();
         for dom in [json!({"action":"click","frame":0,"ref":"a"}),
-            json!({"action":"fill","frame":0,"ref":"a","text":"x"}),
-            json!({"action":"scroll","frame":0,"delta":400}),
-            json!({"action":"scroll","frame":0,"ref":"a","delta":400})] {
+            json!({"action":"fill","frame":0,"ref":"a","text":"x"})] {
             let single = actions(json!([dom]));
             assert!(jev_requires_run(true, false, &observation, &single));
             assert!(!jev_requires_run(false, false, &observation, &single));
@@ -2253,6 +2252,8 @@ mod tests {
         assert!(!jev_requires_run(true, false, &observation, &actions(json!([
             {"action":"click_at","x":10,"y":20},{"action":"type","text":"x"},
             {"action":"press","key":"Enter"}]))));
+        assert!(!jev_requires_run(true, false, &observation, &actions(json!([
+            {"action":"scroll","frame":0,"delta":400},{"action":"scroll","frame":0,"ref":"a","delta":400}]))));
     }
 
     #[test]

@@ -70,7 +70,7 @@ fn answer(body: &Value, response: &Value) -> Result<Value, String> {
 /// 在最新观察中公开实际启用状态，让主模型能选择已开启的委托入口。
 pub(crate) fn availability(settings: &Settings) -> Value {
     json!({"enabled":settings.jev_enabled,"requestAttempted":false,"status":"not_delegated","next":if settings.jev_enabled {
-        "JEV 已启用：拿到open/tabs/select_tab返回的snapshotId后，立即把完整筛选/查询目标交给一次run；不要先用shell读DOM、逐项inspect或坐标手动设置日期/地区。日期输入框可由JEV点击打开。主模型仅在实际handoff后排障。一次run交代完整可授权目标，不逐点击拆分。run内部是决策树：优先执行主模型 plan.steps（按顺序连续执行，本地绑定目标、连续动作一次发送，JEV 只做小范围判断：≤12选1定位歧义、expect 是否达成）；无 steps 时退化为 JEV 逐轮规划（慢且不稳，应避免）。inputs的name原样复制DOM name或完整fieldContext（也可用fieldContext属性），text为准确值；role可选且仅限制DOM角色。只用于搜索/筛选列表的值（如地区名）直接在task里写明英文原文（如 Region 改为 \"United States\"），run 会在同句提到的面板搜索框里输入，无需 inputs。DOM click/fill/scroll必须委托run，包括单步选择；直接act会返回jev_run_required且不执行。真实handoff的fallback.allowed=true时，仅用交接snapshotId在180秒内单步act兜底一次，重新观察或执行后失效；视觉操作由主模型处理。主模型负责视觉、失败兜底和最终核验；JEV不能读图或生成坐标。默认32步，maxActions可设1–64。候选按相关性分批提供，controlNames可提高指定控件优先级，默认省略，不强制预列steps。障碍未解决时不要重复run；解决后恢复委托。默认不查经验，按需useExperience=true。ref原样复制当前items[].ref，不能用snapshotId拼接。此字段仅表示可用，不代表已调用。"
+        "JEV 已启用：拿到open/tabs/select_tab返回的snapshotId后，立即把完整筛选/查询目标交给一次run；不要先用shell读DOM、逐项inspect或坐标手动设置日期/地区。日期输入框可由JEV点击打开。主模型仅在实际handoff后排障。一次run交代完整可授权目标，不逐点击拆分。run内部是决策树：优先执行主模型 plan.steps（按顺序连续执行，本地绑定目标、连续动作一次发送，JEV 只做小范围判断：≤12选1定位歧义、expect 是否达成）；无 steps 时退化为 JEV 逐轮规划（慢且不稳，应避免）。inputs的name原样复制DOM name或完整fieldContext（也可用fieldContext属性），text为准确值；role可选且仅限制DOM角色。只用于搜索/筛选列表的值（如地区名）直接在task里写明英文原文（如 Region 改为 \"United States\"），run 会在同句提到的面板搜索框里输入，无需 inputs。DOM click/fill必须委托run（纯滚动可直接act），包括单步选择；直接act会返回jev_run_required且不执行。真实handoff的fallback.allowed=true时，仅用交接snapshotId在180秒内单步act兜底一次，重新观察或执行后失效；视觉操作由主模型处理。主模型负责视觉、失败兜底和最终核验；JEV不能读图或生成坐标。默认32步，maxActions可设1–64。候选按相关性分批提供，controlNames可提高指定控件优先级，默认省略，不强制预列steps。障碍未解决时不要重复run；解决后恢复委托。默认不查经验，按需useExperience=true。ref原样复制当前items[].ref，不能用snapshotId拼接。此字段仅表示可用，不代表已调用。"
     } else { "JEV 已关闭，主模型继续处理。" }})
 }
 
@@ -243,7 +243,7 @@ async fn send(settings: Settings, body: Result<Value, String>) -> Result<Value, 
         // Advice is read-only, so a transient overload is retried twice with backoff (as jev-ultrafast does).
         let mut attempt = 0;
         let mut response = loop {
-            let response = client.post(url).bearer_auth(key.trim()).json(&body).send().await
+            let response = client.post(url.clone()).bearer_auth(key.trim()).json(&body).send().await
                 .map_err(|_| "JEV 请求失败或超时".to_string())?;
             if !matches!(response.status().as_u16(), 429 | 503 | 529) || attempt >= 2 { break response; }
             tokio::time::sleep(Duration::from_millis(500 << attempt)).await;

@@ -384,7 +384,8 @@ fn scroll_hints(page: &Value, item: Option<&Value>, horizontal: bool) -> Vec<Can
     let (Some(top), Some(height), Some(viewport)) = (top.as_f64(), height.as_f64(), viewport.as_f64()) else { return Vec::new(); };
     if viewport <= 0. || height <= viewport { return Vec::new(); }
     if item.is_some_and(|i| i["blockedBy"].is_string() && !i["scroll"][if horizontal {"pointX"} else {"pointY"}].is_object()) { return Vec::new(); }
-    let step = (viewport * 0.8).clamp(80., 640.).round() as i32;
+    // 80% keeps overlap for reading; cap only at the act delta limit so tall viewports still page in one step.
+    let step = (viewport * 0.8).clamp(80., 1200.).round() as i32;
     let null = Value::Null;
     let name = item.map_or(&null, |i| &i["name"]);
     let area = name.as_str().filter(|s| !s.is_empty()).map(|s| short(s, 40)).unwrap_or_else(|| "页面".into());

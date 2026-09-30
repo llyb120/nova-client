@@ -42,11 +42,11 @@
 
 **本次不实施历史图片裁剪，也不要求宿主淘汰旧图。** Reasonix的历史、请求组装、缓存策略、容量统计及压缩机制保持不变；其它SDK/MCP宿主仍按各自原有机制管理上下文。优化仅从新截图的尺寸、目标范围、调用策略和失败恢复入手，因此历史截图累计问题并未由本次改动解决。
 
-滚动阅读先写notes，未记录信息可recall回看。不会删除本地旧图或重开会话来伪装上下文优化。
+滚动阅读先写notes，未记录信息可recall回看。一批act里连放多个scroll时，每个非末尾scroll后自动附一张只读中间帧（`images[].frame`为该scroll的序号，附`framesNotice`），一次调用读完多屏；中间帧只供阅读，后续act仍只用顶层snapshotId与最后一张图的坐标。不会删除本地旧图或重开会话来伪装上下文优化。
 
 ## 耗时诊断
 
-NovaDev对image、png及压缩依赖启用优化编译；缩放通过DynamicImage进入依赖内的优化实现，保留Triangle算法和相同像素尺寸。目标校验复用同一次窗口枚举完成几何与遮挡检查，不缓存到下一动作。纯图像基准可运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::screenshot_pipeline_benchmark -- --ignored --nocapture`，输出缩放/编码耗时，并验证与原缩放实现及PNG解码结果逐像素一致；此测试不操作桌面。
+NovaDev对xcap、image、png及压缩依赖启用优化编译；稳定取样先做整帧字节相等比较，静止画面无需逐像素扫描；缩放通过DynamicImage进入依赖内的优化实现，保留Triangle算法和相同像素尺寸。目标校验复用同一次窗口枚举完成几何与遮挡检查，不缓存到下一动作。纯图像基准可运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::screenshot_pipeline_benchmark -- --ignored --nocapture`，输出缩放/编码耗时，并验证与原缩放实现及PNG解码结果逐像素一致；此测试不操作桌面。
 
 截图返回timingsMs：capture（系统捕获）、resize、encodeAndSave（PNG编码及落盘）、other（窗口枚举、焦点校验等）和total。MCP传输适配另返回deliveryTimingsMs（read/base64/total）及deliveredImageBytes；不包含网络及模型耗时。Windows前台身份检查直接读取窗口句柄与PID，避免每个动作多次枚举所有窗口及其元数据；这是只读状态检查，不负责激活。先比较这些分段数据，再决定是否换捕获后端/编码器，不据单次总耗时猜测瓶颈。
 
@@ -88,7 +88,7 @@ Windows的press字母/数字按虚拟键发送，Ctrl+A与Ctrl+a等价；大小�
 
 `regionSpace=image` 可按最新返回图片的像素给出局部裁剪区域，必须同时提供该图的 `snapshotId/imageId`；工具反算裁剪和缩放，重新采集细节图。默认 `regionSpace=source` 兼容原始图片坐标，需要 `windowId` 或 `monitorId`。局部图生成后旧快照失效。
 
-点击/双击/拖动/滚动前检查未绘制鼠标标记的原始落点邻域；鼠标移动后读取系统实际位置，超出 1 像素偏差则停止按钮输入，不做猜测补偿。前台改变时停止后续输入；第一次点击后前台变化也不继续双击第二次。保留原有反馈稳定检查。像素守卫是启发式，不是控件识别，不承诺捕获所有视觉变化或竞态。
+点击/双击/拖动前检查未绘制鼠标标记的原始落点邻域（滚动不检查：同一点连续滚动必然改变画面，且滚动可逆）；鼠标移动后读取系统实际位置，超出 1 像素偏差则停止按钮输入，不做猜测补偿。前台改变时停止后续输入，窗口快照的报错直接提示 activate(windowId)，无需先重新截图；第一次点击后前台变化也不继续双击第二次。保留原有反馈稳定检查。像素守卫是启发式，不是控件识别，不承诺捕获所有视觉变化或竞态。
 
 本轮未在 Windows 编译和执行原生输入链；新原生单元测试和验收入口见 [精准交互说明](automation-precision.md)。
 

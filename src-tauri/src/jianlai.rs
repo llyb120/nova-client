@@ -256,6 +256,8 @@ fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u
 
 fn visually_similar(a: &xcap::image::RgbaImage, b: &xcap::image::RgbaImage) -> bool {
     if a.dimensions() != b.dimensions() || a.is_empty() { return false; }
+    // memcmp fast path for truly static frames; the per-pixel scan is slow in unoptimized NovaDev builds.
+    if a.as_raw() == b.as_raw() { return true; }
     // ponytail: tolerate 0.05% changed pixels for caret/noise; this can miss tiny updates.
     // Visual quiet is not application readiness; use semantic result checks, not a looser threshold.
     let allowance = a.as_raw().len() / 4 / 2000;
@@ -628,7 +630,8 @@ fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage) -> Re
     }
     Ok(())
 }
-fn guarded_pointer(action:&Action) -> bool {matches!(action.action.as_str(),"click"|"double_click"|"drag"|"scroll")}
+// Scroll is excluded: a batch's earlier scroll always changes pixels under the same point, and scrolling is reversible.
+fn guarded_pointer(action:&Action) -> bool {matches!(action.action.as_str(),"click"|"double_click"|"drag")}
 fn pointer_matches(expected:(i32,i32),actual:(i32,i32)) -> bool {
     (expected.0 as i64-actual.0 as i64).abs()<=1 && (expected.1 as i64-actual.1 as i64).abs()<=1
 }
@@ -637,7 +640,10 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
         return Err("截图已过期".into());
     }
     if foreground()? != snap.foreground {
-        return Err("前台程序已改变，请重新截图".into());
+        return Err(match snap.window {
+            Some(id) => format!("前台程序已改变；目标窗口仍需操作时直接 activate(windowId={id})，它会返回新图，无需先重新截图"),
+            None => "前台程序已改变，请重新截图".into(),
+        });
     }
     if let Some(id) = snap.window {
         // Reuse one Z-order enumeration for geometry and occlusion checks.
@@ -793,16 +799,19 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
                 return Err(e);
             }
         }
-        "scroll" => enigo
-            .scroll(
-                a.delta.unwrap(),
-                if a.axis.as_deref() == Some("horizontal") {
-                    Axis::Horizontal
-                } else {
-                    Axis::Vertical
-                },
-            )
-            .map_err(err)?,
+        "scroll" => {
+            let axis = if a.axis.as_deref() == Some("horizontal") { Axis::Horizontal } else { Axis::Vertical };
+            let delta = a.delta.unwrap();
+            // One event of N*WHEEL_DELTA scrolls a single step in WeChat/Qt/DuiLib-style apps that count
+            // messages, not magnitude; one notch per event moves N steps everywhere.
+            for i in 0..delta.unsigned_abs() {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_millis(8));
+                    if foreground()? != expected_foreground {return Err("滚动期间前台改变，停止后续滚动".into());}
+                }
+                enigo.scroll(delta.signum(), axis).map_err(err)?;
+            }
+        }
         "wait" => std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))),
         "move" => (),
         _ => unreachable!(),
@@ -822,11 +831,6 @@ fn run(owner: String, args: Value) -> Result<Value> {
         other => other?,
     };
     result["source"] = json!("jianlai");
-    if result["snapshotId"].is_string() {
-        if let Ok(settings) = crate::native_browser::jev_settings() {
-            result["jev"] = crate::jev::availability(&settings);
-        }
-    }
     result["operation"] = operation;
     if is_act {
         result["basedOnSnapshotId"] = based_on;
@@ -1024,6 +1028,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let mut failure = None;
             let mut attempted = false;
             let mut failed_point = None;
+            let mut frames = Vec::new();
             for (index, a) in actions.iter().enumerate() {
                 if a.action != "wait" {
                     if let Err(e) = check_target(&snap, &shot, a) {
@@ -1040,6 +1045,15 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 }
                 completed += 1;
                 std::thread::sleep(action_delay(&actions, index));
+                // 一批多个 scroll 时逐屏附只读中间帧，模型一次调用读完整个列表，不必每滚一次往返一轮。
+                if a.action == "scroll" && index + 1 < actions.len() {
+                    let (mut frame, mut scratch) = (json!({}), None);
+                    observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, true, &mut scratch, &mut frame);
+                    for mut image in frame["images"].as_array().cloned().unwrap_or_default() {
+                        image["frame"] = json!(index);
+                        frames.push(image);
+                    }
+                }
                 // Let an explicit wait finish before observing a click/key's focus transition.
                 if actions.get(index + 1).is_some_and(|a| a.action == "wait") { continue; }
                 match foreground() {
@@ -1068,6 +1082,12 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 if let Err(error) = failure_detail(current, &shot.surface, p, &mut result) {
                     result["detailError"] = json!(error);
                 }
+            }
+            if !frames.is_empty() {
+                // 放在 failure_detail 之后：它按 imageId 找首张图，中间帧与最终帧 imageId 相同。
+                frames.extend(result["images"].as_array().cloned().unwrap_or_default());
+                result["images"] = json!(frames);
+                result["framesNotice"] = json!("images中带frame的是第frame个scroll后的只读中间帧，仅供阅读；act只用顶层snapshotId及最后一张图的坐标");
             }
             Ok(result)
         }
@@ -1101,37 +1121,15 @@ fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, d
 pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
     let owner = crate::native_browser::tool_owner(root, owner)?;
     if args["operation"] == "run" {
-        let mut advice_args = args.clone();
-        advice_args["operation"] = json!("advise");
-        advice_args["advice"]["choices"] = json!({"continue":"执行主模型明确委托的这一批动作；遇到需要新视觉信息的位置必须停止"});
-        advice_args["advice"]["state"] = json!(format!("{}\n明确委托动作：{}", args["advice"]["state"].as_str().unwrap_or_default(), args["actions"]));
-        // Reuse snapshot ownership/age checks; only execute a batch already grounded by the main model.
-        let settings = crate::native_browser::jev_settings()?;
-        {
-            let state = DESKTOP.try_lock().map_err(|_| "剑来正在操作桌面")?;
-            state.as_ref().filter(|s| s.owner == owner && args["snapshotId"].as_str() == Some(&s.id)
-                && s.invalidated.is_none() && s.taken.elapsed() <= Duration::from_secs(180))
-                .ok_or("run 需本会话最新有效截图")?;
-        }
-        let decision = crate::jev::advise(settings, &advice_args).await?;
-        if decision["status"] != "advised" || decision["choice"] != "continue"
-            || !crate::native_browser::jev_settings()?.jev_enabled {
-            return Ok(json!({"status":"not_executed","completedActions":0,"jevRun":{"status":"handoff",
-                "requestCount":usize::from(decision["requestAttempted"] == true),"executedActions":0,
-                "elapsedMs":decision["elapsedMs"],"verification":"unverified",
-                "reason":"JEV 未选择 continue、不可用或已关闭；主模型核对最新截图", "decision":decision}}));
-        }
+        // JEV cannot see the screen and desktop has no text candidates, so asking it to approve an
+        // already grounded batch only adds a network round-trip; run executes like act.
         let actions = args["actions"].as_array().filter(|a| !a.is_empty() && a.len() <= 16).ok_or("run 需1–16个已确认动作")?;
         let act = json!({"operation":"act","snapshotId":args["snapshotId"],"imageId":args["imageId"],
-            "actions":actions,"feedback":"screenshot"});
+            "actions":actions,"feedback":args.get("feedback").cloned().unwrap_or(json!("screenshot"))});
         return tokio::task::spawn_blocking(move || {
             let mut result = run(owner, act)?;
-            result["jev"] = json!({"status":"delegated","requestAttempted":decision["requestAttempted"],
-                "next":"本次委托结果见 jevRun；主模型必须核对新截图。"});
-            result["jevRun"] = json!({"status":"handoff",
-                "requestCount":usize::from(decision["requestAttempted"] == true),"executedActions":result["completedActions"],
-                "decisionElapsedMs":decision["elapsedMs"],"verification":"unverified",
-                "decision":decision,"reason":"已执行至视觉信息屏障；JEV 不看图，主模型必须核对新截图，不能据 executed 声称成功"});
+            result["jevRun"] = json!({"status":"handoff","requestCount":0,"executedActions":result["completedActions"],
+                "verification":"unverified","reason":"桌面 run 与 act 等价，未请求 JEV；主模型核对新截图"});
             Ok(result)
         }).await.map_err(err)?;
     }
@@ -1306,6 +1304,9 @@ mod tests {
             assert!(needs_stable_feedback(&batch, false), "{action}");
         }
         assert!(run("validation".into(), json!({"operation":"screenshot","windowId":1,"monitorId":2})).is_err());
+        // Consecutive scrolls at one point must not be blocked by the pre-batch pixel guard.
+        let scroll: Action = serde_json::from_value(json!({"action":"scroll","x":1,"y":1,"delta":3})).unwrap();
+        assert!(!guarded_pointer(&scroll) && guarded_pointer(&actions[0]));
     }
     #[test]
     fn failure_detail_keeps_snapshot_and_maps_enlarged_coordinates() {
