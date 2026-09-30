@@ -118,12 +118,7 @@ export function createNovaBatchTools(cwd, options = {}) {
           budget: { type: "integer", minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，通常无需设置" },
           coupling: { type: "boolean", description: "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" },
         },
-        anyOf: [
-          { required: ["keywords"] },
-          { required: ["query"] },
-          { required: ["task"] },
-          { required: ["files"] },
-        ],
+        // 不用顶层 anyOf 表达"至少其一"：Anthropic API 不接受，Claude Code 会直接丢弃该工具；由描述和服务端兜底。
         additionalProperties: false,
       },
       async execute(params) {

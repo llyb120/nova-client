@@ -82,7 +82,9 @@ test("polaris keywords normalize to top five", () => {
     normalizePolarisArgs({ keywords: ["a", "b", "a", "c", "d", "e", "f"] }).keywords,
     ["a", "b", "c", "d", "e"],
   );
-  const schema = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true })).polaris.inputSchema.properties.keywords;
+  const inputSchema = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true })).polaris.inputSchema;
+  for (const key of ["anyOf", "oneOf", "allOf"]) assert.equal(inputSchema[key], undefined, `top-level ${key} makes Claude Code drop polaris`);
+  const schema = inputSchema.properties.keywords;
   assert.equal(schema.maxItems, undefined);
   assert(schema.anyOf.some((option) => option.type === "string"));
 });
