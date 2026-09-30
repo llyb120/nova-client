@@ -1,7 +1,10 @@
-import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createStore, reconcile } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { lastUsed, openThread, showToast } from "../store";
+import { enabledAgentKinds, lastUsed, openThread, showToast } from "../store";
+import type { AgentKind } from "../types";
+import { ModelPicker } from "./ConfigSelects";
 import "./EmployeeView.css";
 
 type Duty = { id: string; text: string; enabled: boolean; note: string; lastRunAt: number; lastResult: string };
@@ -22,10 +25,15 @@ const STATUS = { working: "工作中", yielded: "已让出", duty: "值班中", 
 const time = (ms: number) => (ms ? new Date(ms).toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—");
 
 export default function EmployeeView() {
-  const [data, { refetch }] = createResource(() => invoke<Snapshot>("employee_get").catch((error) => {
-    showToast(`读取员工数据失败：${String(error)}`);
-    return undefined;
-  }));
+  // 不用 createResource：页面在 <Suspense> 里，轮询 refetch 会让整页切到 fallback 闪烁并丢失输入焦点；
+  // reconcile 保持行对象稳定，列表不重建，展开的菜单也不会被关掉。
+  const [store, setStore] = createStore<{ snap?: Snapshot }>({});
+  const data = () => store.snap;
+  const refetch = () => invoke<Snapshot>("employee_get").then(
+    (snap) => setStore("snap", reconcile(snap)),
+    (error) => showToast(`读取员工数据失败：${String(error)}`),
+  );
+  void refetch();
   const [say, setSay] = createSignal("");
   const [busy, setBusy] = createSignal(false);
 
@@ -74,8 +82,9 @@ export default function EmployeeView() {
                   – <input type="time" value={e().workEnd} onChange={(ev) => void set({ workEnd: ev.currentTarget.value })} /></label>
                 <label>空闲 <input type="number" min="1" max="1440" value={e().idleMinutes}
                   onChange={(ev) => void set({ idleMinutes: Number(ev.currentTarget.value) || 10 })} /> 分钟后接管</label>
-                <span title="员工会话使用的模型">模型 {e().agentKind ? `${e().agentKind}${e().model ? " · " + e().model : ""}` : "未设置"}
-                  <button type="button" onClick={() => void useCurrentModel()}>用当前模型</button></span>
+                <ModelPicker agentKind={(e().agentKind || lastUsed.agentKind()) as AgentKind} agentKinds={enabledAgentKinds()}
+                  model={e().model} onPickModel={(agentKind, model) => void set({ agentKind, model })}
+                  title="员工会话使用的模型" portal />
                 <Show when={snap().threadId}>
                   {(id) => <button type="button" onClick={() => void openThread(id())}>看当前会话</button>}
                 </Show>

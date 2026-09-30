@@ -21,7 +21,8 @@ function memoryTool(item: ToolItem): "read" | "write" | null {
 
 /** Preserve the usual final-block folding, except for a short acknowledgement after memory maintenance. */
 export function splitTurnBody(body: Item[], finished: boolean): { process: Item[]; conclusion: Item[] } {
-  body = body.filter(item => item.type !== "thought" || item.text.trim());
+  // 空思考与空/None 回复不渲染，却会切断过程折叠，导致连续工具被拆成多行“调用工具 ×1”。
+  body = body.filter(item => (item.type !== "thought" && item.type !== "assistant") || !["", "None"].includes(item.text.trim()));
   if (!finished) return { process: body, conclusion: [] };
   const isText = (item: Item) => item.type === "assistant" || item.type === "system";
   const last = body.findLastIndex(isText);

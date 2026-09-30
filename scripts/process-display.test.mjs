@@ -34,6 +34,11 @@ assert.deepEqual(processSegments([thought(1, ""), tool(2, "read"), thought(3, " 
 assert.deepEqual(processSegments([thought(1, "思考中…"), thought(2, " 可见摘要 ")]),
   [{ type: "process", id: 1, items: [thought(1, "思考中…"), thought(2, " 可见摘要 ")] }]);
 const reply = (id, text) => ({type: "assistant", id, text});
+// 空回复（""/"None"）与空思考同样不渲染，但不能切断过程折叠
+const withBlanks = [tool(1, "read"), reply(2, " \n"), tool(3, "read"), reply(4, "None"), tool(5, "read"), reply(6, "完成")];
+const folded = splitTurnBody(withBlanks, true);
+assert.deepEqual(processSegments(folded.process).map(s => s.items.length), [3]);
+assert.deepEqual(folded.conclusion.map(it => it.id), [6]);
 const memory = (id, kind = "edit", path = "C:\\Users\\test\\.codebuddy\\memories\\iterations.md") =>
   ({...tool(id, kind), rawInput: {file_path: path}, locations: []});
 const body = [reply(10, "我来查询"), tool(11, "read"), reply(12, "| 需求 | 优先级 |\n|---|---|\n| A | P1 |"),
