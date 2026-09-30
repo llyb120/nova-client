@@ -161,11 +161,12 @@ export function Composer() {
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
-  // 原生注入当前轮：Lyra / Codex / Devin / CodeBuddy。
+  // 原生注入当前轮：Lyra / Codex / Devin / CodeBuddy / Claude。
   const supportsLiveSteer = () =>
     state.agentKind === "lyra" ||
     state.agentKind === "codex" ||
     state.agentKind === "codebuddy" ||
+    state.agentKind === "claude" ||
     state.agentKind === "devin";
   // 打断当前轮后以新 turn 继续：Cursor（Agent.create + slim memory）。
   const supportsInterruptSteer = () => state.agentKind === "cursor";

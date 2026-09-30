@@ -3926,7 +3926,8 @@ pub(crate) fn dispatch_prompt(
         }
         AgentKind::Kimi | AgentKind::Claude => {
             let mgr = state.acp_for(&agent_kind).unwrap();
-            if mgr.is_running(&thread_id) {
+            // Claude 运行中由 run_prompt 转为 `_session/steering` 原生引导。
+            if agent_kind == AgentKind::Kimi && mgr.is_running(&thread_id) {
                 return Err(format!("{} 正在工作，请将消息加入队列或停止后重试", agent_kind.label()));
             }
             tauri::async_runtime::spawn(async move {

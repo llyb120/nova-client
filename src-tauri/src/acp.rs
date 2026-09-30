@@ -3271,13 +3271,13 @@ impl AcpManager {
         images: Vec<PromptImage>,
     ) {
         // ACP 不提供并发 prompt 注入；桌面输入沿用提示词队列，其它入口明确报忙。
-        if matches!(self.kind, AgentKind::Kimi | AgentKind::Claude) && self.is_running(&thread_id) {
+        if self.kind == AgentKind::Kimi && self.is_running(&thread_id) {
             crate::append_thread_error(&self.app, &thread_id,
                 format!("{} 正在工作，请将消息加入队列或停止后重试", self.kind.label()));
             return;
         }
-        // 漫游和额度入口也会直接调用 run_prompt；追加消息统一走 CodeBuddy 原生引导。
-        if self.kind == AgentKind::CodeBuddy && self.is_running(&thread_id) {
+        // 漫游和额度入口也会直接调用 run_prompt；追加消息统一走 CodeBuddy / Claude 原生引导。
+        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Claude) && self.is_running(&thread_id) {
             Box::pin(self.steer_prompt(thread_id, text, images)).await;
             return;
         }
@@ -3680,27 +3680,33 @@ impl AcpManager {
         self.emit_proposed_plan(&thread_id, None);
         let _ = self.app.emit(EV_THREADS, json!({}));
         let prompt = self.build_user_prompt_blocks(&thread_id, &text, &images, false);
-        let codebuddy = self.kind == AgentKind::CodeBuddy;
+        let kind = self.kind.clone();
+        let native = matches!(kind, AgentKind::CodeBuddy | AgentKind::Claude);
         let mgr = self.clone();
         let tid = thread_id.clone();
-        // Devin 随主 prompt 返回；CodeBuddy 立即确认注入，当前轮仍由主 drive 收尾。
+        // Devin 随主 prompt 返回；CodeBuddy / Claude 立即确认注入，当前轮仍由主 drive 收尾。
         tauri::async_runtime::spawn(async move {
+            let (method, params) = match kind {
+                AgentKind::CodeBuddy => ("session/steer", json!({ "sessionId": session_id, "contentBlocks": prompt })),
+                // promptRequired：轮次已结束时不让 agent 偷偷另起一轮（那轮输出 Nova 收不了尾）。
+                AgentKind::Claude => ("_session/steering", json!({ "sessionId": session_id, "prompt": prompt,
+                    "_meta": { "steering": { "idleBehavior": "promptRequired" } } })),
+                _ => ("session/prompt", json!({ "sessionId": session_id, "prompt": prompt })),
+            };
             let result = conn
-                .request(
-                    if codebuddy { "session/steer" } else { "session/prompt" },
-                    if codebuddy {
-                        json!({ "sessionId": session_id, "contentBlocks": prompt })
-                    } else {
-                        json!({ "sessionId": session_id, "prompt": prompt })
-                    },
-                    None,
-                )
+                .request(method, params, None)
                 .await
                 .and_then(|result| {
-                    if codebuddy && result.get("steered").and_then(Value::as_bool) != Some(true) {
-                        Err(format!("CodeBuddy 未接受引导：{}", result.get("reason").and_then(Value::as_str).unwrap_or("unknown")))
-                    } else {
+                    let accepted = match kind {
+                        AgentKind::CodeBuddy => result.get("steered").and_then(Value::as_bool) == Some(true),
+                        AgentKind::Claude => result.get("outcome").and_then(Value::as_str) == Some("injected"),
+                        _ => true,
+                    };
+                    if accepted {
                         Ok(result)
+                    } else {
+                        let reason = result.get("reason").or_else(|| result.get("outcome"));
+                        Err(format!("{} 未接受引导：{}", kind.label(), reason.and_then(Value::as_str).unwrap_or("unknown")))
                     }
                 });
             // 必须先释放引导占位；若主请求已经返回，这一步会完成被延后的轮次收尾。
@@ -3709,13 +3715,13 @@ impl AcpManager {
                 mgr.push_log(format!("[nova] 引导消息发送失败 {tid}: {e}"));
                 // 注入随轮次一起夭折（如注入后用户立刻停止/连接被杀）：轮次已结束的话，
                 // 这条消息不会再有任何回应，明确提示用户重发，避免看起来「发出去但没反应」。
-                if codebuddy || !mgr.is_running(&tid) {
+                if native || !mgr.is_running(&tid) {
                     let state = mgr.app.state::<AppState>();
                     let mut store = state.store.lock().unwrap();
                     if let Some(thread) = store.get_mut(&tid) {
                         let item = thread.push_system(
-                            if codebuddy {
-                                format!("引导失败：{e}。请重新发送；若接口不受支持，请升级 CodeBuddy CLI。")
+                            if native {
+                                format!("引导失败：{e}。请重新发送；若接口不受支持，请升级 {} CLI。", kind.label())
                             } else {
                                 "上一条消息随已停止的任务一起中断了，未被处理，请重新发送。".into()
                             },
