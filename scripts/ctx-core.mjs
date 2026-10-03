@@ -205,5 +205,4 @@ export async function codeMap(args = {}, root = repoRoot()) {
 
 // ---------------------------------------------------------------- 工具描述
 
-export const POLARIS_DESCRIPTION =
-  '任务涉及跨文件查找或修改（含分析要改哪里）、或需要阅读多个文件正文来理解/规划改动时，先调用一次：按 keywords+task+files 打包完整编辑单元、import/use 依赖定义与 IMPACT 调用方清单，一次调用通常替代 5–10 轮 rg+read 往返，比自行 rg/grep 往返更省 token。目标路径和行段都已明确且只需少量行段时直接 read；已定位但仍需阅读正文的多个文件，通过 files 传入一次打包，不要逐个 read。默认只传 keywords/task/files；调用后不要再用 rg/git grep 重复检索同一批关键词，已展示范围视为已读。返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要直接退回 rg/grep 逐个搜索。';
+export const POLARIS_DESCRIPTION = "代码位置未知或需要跨文件上下文时，先调用一次 Polaris。task/query 提供完整改动目标、对象和约束；不要拆成多轮猜函数名，已知符号或文件分别放 keywords/files。内部按问题筛选声明，返回当前源码的主实现、必要辅助函数、类型/常量及有界调用关系，不等待全仓索引。把返回的原文行段直接作为编辑上下文：足够开始修改时立即修改并验证，不要再 read/grep 已返回范围，也不要为阅读所有候选而反复检索。只有实际阻塞改动的缺失定义或源码已变化时，才针对那个缺口补读；next_reads 是截断或未覆盖的候选清单，不要求全部读取。CANDIDATES 不证明根因，PARTIAL 必须结合任务判断，不能假装缺失代码已验证。默认不调用向量模型、不上传源码。";

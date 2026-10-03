@@ -1,0 +1,70 @@
+name: Polaris real-query vector comparison
+on:
+  push:
+    branches: [perf/polaris-semantic-20260919]
+    paths: [.github/workflows/polaris-real-vector.yml, scripts/polaris-real-query-vector-ab.py]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  vector:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-ubuntu-24.04
+          path: polaris-build
+          run-id: 35434961064
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: sanitized-native-gui-replay-results
+          path: previous
+          run-id: 35448033036
+          github-token: ${{ github.token }}
+      - name: Local public model dependencies; no API keys or source upload
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y ripgrep
+          python -m pip install 'torch==2.6.0' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install 'transformers==4.51.3' 'huggingface-hub==0.30.2' 'sentencepiece==0.2.0' 'safetensors==0.5.3'
+      - name: Freeze original source and remove evaluation material
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none https://github.com/llyb120/nova-client.git "$RUNNER_TEMP/replay-corpus"
+          git -C "$RUNNER_TEMP/replay-corpus" checkout --quiet --detach 22e3cf0fb55537ca6c93b68126c2c737794d783d
+          echo "OPERATOR_REPLAY_CORPUS=$RUNNER_TEMP/replay-corpus" >> "$GITHUB_ENV"
+          echo "POLARIS_REPLAY_BINARY=$GITHUB_WORKSPACE/polaris-build/bench/polaris-harness/target/release/polaris-harness" >> "$GITHUB_ENV"
+          echo "POLARIS_REPLAY_REPORT=$GITHUB_WORKSPACE/previous/35447590732/polaris/report.json" >> "$GITHUB_ENV"
+          chmod +x polaris-build/bench/polaris-harness/target/release/polaris-harness
+          python - <<'PY'
+          import pathlib,os,re
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'replay-corpus'
+          for p in root.rglob('*'):
+              rel=p.relative_to(root)
+              if '.git' in rel.parts or not p.is_file():continue
+              if rel.parts[0] in ('bench','.github') or re.search(r'report|eval|replay|ab-results|cases\.json',str(rel),re.I):p.unlink()
+          PY
+      - name: Old versus default versus learned vectors
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          git rev-parse HEAD > validation/tested-commit.txt
+          python scripts/polaris-real-query-vector-ab.py | tee validation/vector-progress.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-real-query-vector-results
+          path: validation/
+          retention-days: 7

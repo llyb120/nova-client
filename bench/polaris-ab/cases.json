@@ -1,0 +1,32 @@
+{
+  "baseline":"3da28d30f1adfd0da3b993813a47aa3fff20fdeb",
+  "note":"Frozen before the first retrieval run. Hand-labeled symbol and body evidence, not exhaustive relevance judgments. Dev/heldout are reported separately; heldout is not used for tuning.",
+  "cases":[
+    {"id":"stop","split":"dev","kind":"natural","query":"点击停止后，要从哪里取消当前正在运行的会话任务？","primary":[{"file":"src-tauri/src/lib.rs","symbol":"cancel_turn","needles":["cancel_turn(","state.lyra.cancel"]}],"support":[]},
+    {"id":"switch","split":"dev","kind":"natural","query":"切换聊天时如何复用已经缓存的历史，避免再次获取所有消息？","primary":[{"file":"src/store.ts","symbol":"openThread","needles":["openThread(","getThreadSnapshot(id)"]}],"support":[]},
+    {"id":"clipboard","split":"dev","kind":"natural","query":"从文件管理器复制多个文件后，在哪里取出剪贴板中的本地路径？","primary":[{"file":"src-tauri/src/clipboard.rs","symbol":"windows_hdrop_paths","needles":["windows_hdrop_paths(","DragQueryFileW"]}],"support":[]},
+    {"id":"theme-home","split":"dev","kind":"natural","query":"进入新建会话页面后，终端为什么不会继承上次展开状态？","primary":[{"file":"src/workspaceLayout.ts","symbol":"createHomeTerminalState","needles":["createHomeTerminalState(","setOpened(false)"]}],"support":[]},
+    {"id":"retry-update","split":"dev","kind":"natural","query":"检查更新收到禁止访问时，在哪种条件下会绕开代理再试一次？","primary":[{"file":"src-tauri/src/updater.rs","symbol":"should_retry_update_without_proxy","needles":["should_retry_update_without_proxy(","FORBIDDEN"]}],"support":[]},
+    {"id":"queue-dedup","split":"dev","kind":"natural","query":"手动重新发送刚才排队的内容时，如何避免它随后又自动发送一次？","primary":[{"file":"src/promptQueue.ts","symbol":"dropQueuedPromptsMatching","needles":["dropQueuedPromptsMatching(","removeQueuedPrompt(queued.id)"]}],"support":[]},
+    {"id":"crypto","split":"dev","kind":"natural","query":"共享的凭证包在哪里加密，如何把密文绑定到这次请求？","primary":[{"file":"src-tauri/src/credential_roaming.rs","symbol":"encrypt_bundle","needles":["encrypt_bundle(","aad: request_id.as_bytes()"]}],"support":[]},
+    {"id":"img-base64","split":"dev","kind":"natural","query":"粘贴或上传的文件，在哪里变成消息附件中的内嵌图片数据？","primary":[{"file":"src/components/ImageAttachmentStrip.tsx","symbol":"fileToAttachment","needles":["fileToAttachment(","reader.readAsDataURL(f)"]}],"support":[]},
+    {"id":"unread","split":"heldout","kind":"natural","query":"没有未读消息的时候，怎样切换到仍在运行的对话？","primary":[{"file":"src/store.ts","symbol":"openNextUnreadThread","needles":["openNextUnreadThread(","nextRunningThread"]}],"support":[]},
+    {"id":"terminal-retain","split":"heldout","kind":"natural","query":"收起侧边栏再打开时，如何复用原来的命令行进程而不是重新启动？","primary":[{"file":"src/terminalSessions.ts","symbol":"attachTerminal","needles":["attachTerminal(","if (!tab.ready)"]}],"support":[]},
+    {"id":"terminal-shell","split":"heldout","kind":"natural","query":"用户没有配置默认终端程序时，Windows 和其他系统分别选用什么？","primary":[{"file":"src-tauri/src/workspace_terminal.rs","symbol":"shell_command","needles":["shell_command(","COMSPEC"]}],"support":[]},
+    {"id":"queue-hold","split":"heldout","kind":"natural","query":"主动停止生成以后，怎样暂时禁止后面的排队请求继续投递？","primary":[{"file":"src/promptQueue.ts","symbol":"holdPromptQueue","needles":["holdPromptQueue(","next.add(threadId)"]}],"support":[]},
+    {"id":"queue-dispatch","split":"heldout","kind":"natural","query":"一轮任务结束后，如何按先后顺序发送队列，并避免同一对话并发执行两条？","primary":[{"file":"src/promptQueue.ts","symbol":"startPromptQueueDispatcher","needles":["startPromptQueueDispatcher(","seenThreads.add(item.threadId)"]}],"support":[]},
+    {"id":"channel","split":"heldout","kind":"natural","query":"怎样从更新列表中挑出预发布版本，并跳过草稿？","primary":[{"file":"src-tauri/src/updater.rs","symbol":"select_release","needles":["select_release(","release[\"draft\"]"]}],"support":[]},
+    {"id":"restore-window","split":"heldout","kind":"natural","query":"程序重启后，哪里恢复窗口的大小和位置？","primary":[{"file":"src-tauri/src/updater.rs","symbol":"restore_window_on_launch","needles":["restore_window_on_launch(","apply_window_state"]}],"support":[]},
+    {"id":"decrypt","split":"heldout","kind":"natural","query":"收到队友共享的登录凭证后，如何解密并拒绝损坏的内容？","primary":[{"file":"src-tauri/src/credential_roaming.rs","symbol":"decrypt_bundle","needles":["decrypt_bundle(","凭证解密失败"]}],"support":[]},
+    {"id":"remote-img","split":"heldout","kind":"natural","query":"分享对话到另一台电脑之前，本地路径引用的附件如何携带实际内容？","primary":[{"file":"src-tauri/src/threads.rs","symbol":"embed_attachment_data","needles":["embed_attachment_data(","STANDARD.encode(&bytes)"]}],"support":[]},
+    {"id":"receive-img","split":"heldout","kind":"natural","query":"远程收到的内嵌附件在哪里写回本机临时文件，供模型读取？","primary":[{"file":"src-tauri/src/threads.rs","symbol":"save_attachment_to_temp","needles":["save_attachment_to_temp(","fs::write(&path, bytes)"]}],"support":[]},
+    {"id":"release-layout","split":"heldout","kind":"natural","query":"拖动或缩放窗口以后，哪里记录布局以便下次启动使用？","primary":[{"file":"src-tauri/src/updater.rs","symbol":"remember_window_layout","needles":["remember_window_layout(","flush"]}],"support":[]},
+    {"id":"terminal-close","split":"heldout","kind":"natural","query":"关闭正在创建的终端标签时，如何避免留下没有界面的进程？","primary":[{"file":"src/terminalSessions.ts","symbol":"closeTerminalTab","needles":["closeTerminalTab(","await terminalApi.close(tab.id)"]}],"support":[]},
+    {"id":"exact-cancel","split":"control","kind":"exact","query":"cancel_turn","primary":[{"file":"src-tauri/src/lib.rs","symbol":"cancel_turn","needles":["cancel_turn(","state.lyra.cancel"]}],"support":[]},
+    {"id":"exact-polaris","split":"control","kind":"exact","query":"polaris","primary":[{"file":"src-tauri/src/nova_tools_native/context.rs","symbol":"polaris","needles":["polaris(","fast_context_with_search"]}],"support":[]},
+    {"id":"exact-decrypt","split":"control","kind":"exact","query":"decrypt_bundle","primary":[{"file":"src-tauri/src/credential_roaming.rs","symbol":"decrypt_bundle","needles":["decrypt_bundle(","凭证解密失败"]}],"support":[]},
+    {"id":"exact-attach","split":"control","kind":"exact","query":"attachTerminal","primary":[{"file":"src/terminalSessions.ts","symbol":"attachTerminal","needles":["attachTerminal(","if (!tab.ready)"]}],"support":[]},
+    {"id":"nonexistentPolarisProbeX927","split":"negative","kind":"exact","query":"nonexistentPolarisProbeX927","primary":[],"support":[]},
+    {"id":"missingWorkflowInvokerY841","split":"negative","kind":"exact","query":"missingWorkflowInvokerY841","primary":[],"support":[]}
+  ]
+}

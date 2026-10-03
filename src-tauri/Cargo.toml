@@ -45,6 +45,10 @@ ignore = "0.4"
 wait-timeout = "0.2"
 portable-pty = "0.9"
 rtk = { path = "../vendor/rtk" }
+# Parse declarations independently from the preserved exact-search baseline.
+tree-sitter = "=0.25.10"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-typescript = "=0.23.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

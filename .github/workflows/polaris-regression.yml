@@ -1,0 +1,170 @@
+name: Polaris retrieval regression
+on:
+  pull_request:
+    branches: [pre-release]
+    paths:
+      - 'src-tauri/src/nova_tools_native/**'
+      - 'scripts/polaris-*'
+      - 'bench/polaris-ab/**'
+      - 'scripts/nova-batch-tools.mjs'
+      - 'bench/polaris-harness/**'
+      - '.github/workflows/polaris-regression.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: polaris-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  retrieval:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive exact candidate source for reproducibility
+        if: runner.os == 'Linux'
+        run: git archive --format=tar.gz -o "$RUNNER_TEMP/polaris-candidate.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: polaris-candidate-source
+          path: ${{ runner.temp }}/polaris-candidate.tar.gz
+          retention-days: 1
+      - name: Use crates.io on CI
+        shell: bash
+        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - name: Install ripgrep for unchanged engine tests
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y ripgrep
+      - name: Install ripgrep on Windows
+        if: runner.os == 'Windows'
+        run: choco install ripgrep -y --no-progress
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: bench/polaris-harness -> target
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test scripts/polaris-query.test.mjs scripts/nova-tools-mcp.test.mjs
+      - name: Compile and test exact production Rust retrieval modules
+        shell: bash
+        run: |
+          set -o pipefail
+          rustc --version
+          cargo test --release --manifest-path bench/polaris-harness/Cargo.toml -- --test-threads=1 2>&1 | tee polaris-tests.log
+          cargo build --release --manifest-path bench/polaris-harness/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-${{ matrix.os }}
+          path: |
+            polaris-tests.log
+            bench/polaris-harness/Cargo.lock
+            bench/polaris-harness/target/release/polaris-harness
+            bench/polaris-harness/target/release/polaris-harness.exe
+          retention-days: 7
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 3
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Use crates.io on CI
+        shell: bash
+        run: printf '%s\n' '[net]' 'git-fetch-with-cli = true' > .cargo/config.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - run: npm run build
+      - name: Compile full Tauri library and tool entry points
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --no-run 2>&1 | tee polaris-native-compile.log
+      - name: Run semantic retrieval tests inside the actual Windows library
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --manifest-path src-tauri/Cargo.toml --lib nova_tools_native::lexical::semantic -- --test-threads=1 2>&1 | tee polaris-native-tests.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-native-compile
+          path: |
+            polaris-native-compile.log
+            polaris-native-tests.log
+          retention-days: 7
+  ab:
+    needs: retrieval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_HUB_DISABLE_XET: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 3da28d30f1adfd0da3b993813a47aa3fff20fdeb
+          path: _corpus
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: polaris-ubuntu-24.04
+          path: _binary
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check evaluator and export the exact frozen source corpus
+        run: |
+          python scripts/polaris-eval.test.py
+          python scripts/polaris-acceptance.test.py
+          git -C _corpus archive --format=tar.gz -o "$RUNNER_TEMP/polaris-baseline.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: polaris-frozen-baseline
+          path: ${{ runner.temp }}/polaris-baseline.tar.gz
+          retention-days: 1
+      - name: Install local CPU model dependencies and ripgrep
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y ripgrep
+          python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install transformers==4.57.6 sentencepiece==0.2.0
+          mkdir -p polaris-ab-results
+          python -m pip freeze > polaris-ab-results/python-environment.txt
+          chmod +x _binary/bench/polaris-harness/target/release/polaris-harness
+      - name: Frozen development, reserved, exact and no-answer A/B
+        run: python scripts/polaris-ab.py --binary _binary/bench/polaris-harness/target/release/polaris-harness --corpus _corpus --out polaris-ab-results --models --rounds 3 --split all
+      - name: Require retrieval quality, exact compatibility and real semantic coverage
+        run: python scripts/polaris-acceptance.py polaris-ab-results/report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polaris-ab-results
+          path: polaris-ab-results/
+          retention-days: 7
