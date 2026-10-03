@@ -86,6 +86,16 @@ Canvas 支持连续鼠标拖动、右键、双击和横向滚动：
 
 WebGL 页面可以沿同样的截图/坐标路径处理，但本次执行环境不能创建 WebGL 上下文，对应用例明确跳过。不能据普通 Canvas 通过就宣称 WebGL 或所有 Canvas 应用已通过端到端验收。
 
+## Canvas 表格（腾讯文档 / 飞书 / WPS / Google 表格）
+
+单元格绘制在 Canvas 上，靠截图识别和点格子都不可靠。改用表格自身的键盘与剪贴板通道：
+
+- 定位：名称框（DOM 输入框）填 `B2` 或 `B2:F40` 后 `press Enter`；`Ctrl+Home`、`Ctrl+方向键` 跳数据边界，`Shift+方向键` 扩选。
+- 写入：`type` 后 `Enter`/`Tab` 提交；`F2` 编辑已有值。
+- 读取：选中区域后 `press Ctrl+C`。批次内系统剪贴板序号变化时，act 结果附 `clipboard:{text,truncated,rows}`（TSV，最多10万字符），只回传本批复制产生的内容，不读用户原有剪贴板。
+
+chrome/webview 的 `press` 支持 Ctrl/Shift/Alt/Meta 与字母、数字、F1–F12、命名键的组合；Ctrl+C/X/V 附带 CDP 编辑命令，否则合成按键不会触发浏览器复制粘贴。剑来按键同时接受 `ArrowDown` 与 `down`。剪贴板回传目前仅 Windows。
+
 ## 剑来：局部细看与实际落点校验
 
 `regionSpace=image` 接受上一张返回图片中的裁剪矩形，由工具反算到原始截图坐标并重新采集；支持已经裁剪和缩放过的图片，不要求模型自行计算 DPI、负屏幕坐标及二次偏移。

@@ -1217,21 +1217,42 @@ async fn mouse(app: &AppHandle, s: &Session, p: &Value, button: &str, count: u8,
     }
     Ok(())
 }
-fn key_spec(name: &str) -> Option<(&str,i32,i32)> {
-    Some(match name {
-        "Enter"=>("Enter",13,0),"Tab"=>("Tab",9,0),"Escape"=>("Escape",27,0),"Backspace"=>("Backspace",8,0),
-        "ArrowDown"=>("ArrowDown",40,0),"ArrowUp"=>("ArrowUp",38,0),"ArrowLeft"=>("ArrowLeft",37,0),"ArrowRight"=>("ArrowRight",39,0),
-        "Delete"=>("Delete",46,0),"Home"=>("Home",36,0),"End"=>("End",35,0),"PageDown"=>("PageDown",34,0),"PageUp"=>("PageUp",33,0),
-        "Shift+Tab"=>("Tab",9,8),"Control+A"|"Ctrl+A"=>("a",65,2),"Control+Z"|"Ctrl+Z"=>("z",90,2),
-        "Control+Shift+Z"|"Ctrl+Shift+Z"=>("Z",90,10),"Space"=>(" ",32,0),_=>return None,
-    })
+/// "Ctrl+Shift+ArrowDown" → (key, DOM code, virtual key, CDP modifiers, editing command).
+/// Canvas spreadsheets are keyboard-driven: range selection, edge jumps, F2 and clipboard shortcuts.
+fn key_spec(name: &str) -> Option<(String,String,i32,i32,Option<&'static str>)> {
+    let mut parts: Vec<&str> = name.split('+').collect();
+    let base = parts.pop()?;
+    let mut modifiers = 0;
+    for m in parts { modifiers |= match m { "Alt"=>1, "Control"|"Ctrl"=>2, "Meta"|"Cmd"=>4, "Shift"=>8, _=>return None }; }
+    let named = |k: &str, vk| Some((k.to_string(), k.to_string(), vk));
+    let (key, code, vk) = match base {
+        "Enter"=>named("Enter",13), "Tab"=>named("Tab",9), "Escape"=>named("Escape",27), "Backspace"=>named("Backspace",8),
+        "Delete"=>named("Delete",46), "Home"=>named("Home",36), "End"=>named("End",35), "PageUp"=>named("PageUp",33), "PageDown"=>named("PageDown",34),
+        "ArrowLeft"=>named("ArrowLeft",37), "ArrowUp"=>named("ArrowUp",38), "ArrowRight"=>named("ArrowRight",39), "ArrowDown"=>named("ArrowDown",40),
+        "Space"=>Some((" ".into(), "Space".into(), 32)),
+        f if f.len() <= 3 && f.starts_with('F') => { let n: i32 = f[1..].parse().ok().filter(|n| (1..=12).contains(n))?; named(f, 111 + n) }
+        // Bare printable characters belong to `type`: a keyDown without text inserts nothing.
+        c if c.len() == 1 && c.as_bytes()[0].is_ascii_alphanumeric() && modifiers & 7 != 0 => {
+            let upper = c.to_ascii_uppercase();
+            let key = if modifiers & 8 != 0 { upper.clone() } else { c.to_ascii_lowercase() };
+            let code = if upper.as_bytes()[0].is_ascii_digit() { format!("Digit{upper}") } else { format!("Key{upper}") };
+            Some((key, code, upper.as_bytes()[0] as i32))
+        }
+        _ => None,
+    }?;
+    // CDP key events do not trigger browser clipboard actions by themselves; the editing command does.
+    let command = if modifiers == 2 { match vk { 67=>Some("copy"), 88=>Some("cut"), 86=>Some("paste"), _=>None } } else { None };
+    Some((key, code, vk, modifiers, command))
 }
 async fn key(app: &AppHandle, s: &Session, name: &str, progress: &mut InputProgress) -> Result<(), String> {
-    let (key,code,modifiers)=key_spec(name).ok_or("不支持的按键")?;
+    let (key,code,vk,modifiers,command)=key_spec(name).ok_or("不支持的按键")?;
     check(app,s)?; progress.attempted=true;
-    progress.held_key=Some(json!({"type":"keyUp","key":key,"windowsVirtualKeyCode":code,"modifiers":modifiers}));
-    let down=cdp(app,"Input.dispatchKeyEvent",json!({"type":"keyDown","key":key,"windowsVirtualKeyCode":code,"modifiers":modifiers}),None,Some(s.cancel.clone())).await;
-    let up=cdp(app,"Input.dispatchKeyEvent",json!({"type":"keyUp","key":key,"windowsVirtualKeyCode":code,"modifiers":modifiers}),None,None).await;
+    let up=json!({"type":"keyUp","key":key,"code":code,"windowsVirtualKeyCode":vk,"modifiers":modifiers});
+    let mut down=up.clone(); down["type"]=json!("keyDown");
+    if let Some(command)=command {down["commands"]=json!([command]);}
+    progress.held_key=Some(up.clone());
+    let down=cdp(app,"Input.dispatchKeyEvent",down,None,Some(s.cancel.clone())).await;
+    let up=cdp(app,"Input.dispatchKeyEvent",up,None,None).await;
     if up.is_ok() {progress.held_key=None;}
     down?;up?;Ok(())
 }
@@ -1695,6 +1716,7 @@ async fn control_session(
         state.observations.lock().unwrap().remove(&s.active_tab);
         let mut failure=None;
         let mut action_timings=Vec::new();
+        let clipboard=crate::clipboard::sequence();
         for action in &actions {
             let began=std::time::Instant::now();
             let applied=apply(app,&s,&observation,action,args["imageId"].as_str(),&mut progress).await;
@@ -1734,6 +1756,8 @@ async fn control_session(
                 Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
             }
         }
+        // Read after feedback so pages that write the clipboard asynchronously have finished.
+        if let Some(copied)=crate::clipboard::copied_since(clipboard) {result["clipboard"]=copied;}
         // JEV runs save their own verified route; everything else feeds the turn's auto trail.
         if !crate::jev_run::executing_browser_action() {
             let before = &observation.pages["pages"][0];
@@ -2288,6 +2312,22 @@ fn state_dir(app: &AppHandle) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spreadsheet_shortcuts_parse_and_clipboard_keys_carry_commands() {
+        let k = |n| key_spec(n).map(|(key, code, vk, m, c)| (key, code, vk, m, c));
+        assert_eq!(k("Ctrl+A"), Some(("a".into(), "KeyA".into(), 65, 2, None)));
+        assert_eq!(k("Control+Shift+Z"), Some(("Z".into(), "KeyZ".into(), 90, 10, None)));
+        assert_eq!(k("Ctrl+C").unwrap().4, Some("copy"));
+        assert_eq!(k("Ctrl+V").unwrap().4, Some("paste"));
+        assert_eq!(k("Ctrl+Shift+V").unwrap().4, None);
+        assert_eq!(k("Shift+ArrowDown"), Some(("ArrowDown".into(), "ArrowDown".into(), 40, 8, None)));
+        assert_eq!(k("Ctrl+Home").unwrap().3, 2);
+        assert_eq!(k("F2").unwrap().2, 113);
+        assert_eq!(k("Ctrl+1").unwrap().1, "Digit1");
+        assert_eq!(k("Space").unwrap().0, " ");
+        for bad in ["a", "Shift+a", "F13", "Hyper+A", "Ctrl+", "Ctrl+Foo"] { assert!(key_spec(bad).is_none(), "{bad}"); }
+    }
+
     #[test]
     fn chrome_recovers_missing_target_only_from_unambiguous_owned_observations() {
         let observation = Observation { frames: Vec::new(), pages: json!({}), id: "current".into(),
