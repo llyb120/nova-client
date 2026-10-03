@@ -140,6 +140,7 @@ struct Action {
     delta: Option<i32>,
     axis: Option<String>,
     ms: Option<u64>,
+    glide: Option<bool>,
 }
 
 fn window_surface(w: &Window) -> Result<Surface> {
@@ -532,10 +533,10 @@ fn keys(raw: &str) -> Result<Vec<Key>> {
             "space" => Ok(Key::Space),
             "backspace" => Ok(Key::Backspace),
             "delete" => Ok(Key::Delete),
-            "left" => Ok(Key::LeftArrow),
-            "right" => Ok(Key::RightArrow),
-            "up" => Ok(Key::UpArrow),
-            "down" => Ok(Key::DownArrow),
+            "left" | "arrowleft" => Ok(Key::LeftArrow),
+            "right" | "arrowright" => Ok(Key::RightArrow),
+            "up" | "arrowup" => Ok(Key::UpArrow),
+            "down" | "arrowdown" => Ok(Key::DownArrow),
             "home" => Ok(Key::Home),
             "end" => Ok(Key::End),
             "pageup" => Ok(Key::PageUp),
@@ -581,6 +582,9 @@ fn validate(a: &Action, shot: &Shot) -> Result<()> {
             .is_some_and(|v| !matches!(v, "vertical" | "horizontal"))
     {
         return Err("button仅允许left/right/middle；axis仅允许vertical/horizontal".into());
+    }
+    if a.glide.is_some() && !matches!(a.action.as_str(), "click" | "double_click" | "move" | "drag") {
+        return Err("glide仅用于click/double_click/move/drag".into());
     }
     if a.ms.unwrap_or(0) > 2000 {
         return Err(format!("ms={}，允许范围为 0–2000", a.ms.unwrap()));
@@ -732,6 +736,36 @@ fn click_button(enigo: &mut Enigo, button: Button) -> Result<()> {
     }
     Ok(())
 }
+/// Opt-in human-like pointer motion: duration grows with distance (Fitts), minimum-jerk easing, slight arc.
+fn glide_ms(from: (i32, i32), to: (i32, i32)) -> f64 {
+    let d = ((to.0 - from.0) as f64).hypot((to.1 - from.1) as f64);
+    (80.0 + 60.0 * (1.0 + d / 24.0).log2()).min(400.0)
+}
+fn glide_at(from: (i32, i32), to: (i32, i32), bend: f64, t: f64) -> (i32, i32) {
+    let (fx, fy, dx, dy) = (from.0 as f64, from.1 as f64, (to.0 - from.0) as f64, (to.1 - from.1) as f64);
+    // Quadratic Bezier whose control point sits `bend`·distance off the midpoint, perpendicular to the line.
+    let (cx, cy) = (fx + dx / 2.0 - dy * bend, fy + dy / 2.0 + dx * bend);
+    let s = t * t * t * (10.0 - 15.0 * t + 6.0 * t * t);
+    let u = 1.0 - s;
+    (
+        (u * u * fx + 2.0 * u * s * cx + s * s * to.0 as f64).round() as i32,
+        (u * u * fy + 2.0 * u * s * cy + s * s * to.1 as f64).round() as i32,
+    )
+}
+fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32), expected_foreground: Option<(u32, u32)>) -> Result<()> {
+    use rand_core::{OsRng, RngCore};
+    let (ms, bend) = (glide_ms(from, to), (OsRng.next_u32() as f64 / u32::MAX as f64 - 0.5) * 0.2);
+    let started = Instant::now();
+    loop {
+        // Sample by elapsed time, not step count: coarse OS sleep granularity must not stretch the motion.
+        let t = (started.elapsed().as_secs_f64() * 1000.0 / ms).min(1.0);
+        if foreground()? != expected_foreground { return Err("轨迹移动期间前台改变，停止输入".into()); }
+        let (x, y) = glide_at(from, to, bend, t);
+        enigo.move_mouse(x, y, Coordinate::Abs).map_err(err)?;
+        if t >= 1.0 { return Ok(()); }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+}
 fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option<(u32,u32)>) -> Result<()> {
     let button = match a.button.as_deref() {
         Some("right") => Button::Right,
@@ -743,7 +777,11 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
         "click" | "double_click" | "move" | "drag" | "scroll"
     ) {
         let (x, y) = point(shot, a.x, a.y)?;
-        enigo.move_mouse(x, y, Coordinate::Abs).map_err(err)?;
+        if a.glide == Some(true) {
+            glide(enigo, enigo.location().map_err(err)?, (x, y), expected_foreground)?;
+        } else {
+            enigo.move_mouse(x, y, Coordinate::Abs).map_err(err)?;
+        }
         // Read back the actual native pointer. A wrong-DPI/clamped/injected location
         // must not be followed by a button press. No speculative correction/replay.
         let actual=enigo.location().map_err(err)?;
@@ -766,7 +804,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
             if let Err(error)=enigo.button(button,Direction::Press) {
                 let _=enigo.button(button,Direction::Release);return Err(err(error));
             }
-            let moved = (1..=12).try_for_each(|i| {
+            let moved = if a.glide == Some(true) { glide(enigo, (x, y), (tx, ty), expected_foreground) } else { (1..=12).try_for_each(|i| {
                 if foreground()?!=expected_foreground {return Err("拖动期间前台改变，释放按钮并停止".into());}
                 enigo
                     .move_mouse(
@@ -777,7 +815,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
                     .map_err(err)?;
                 std::thread::sleep(Duration::from_millis(16));
                 Ok::<_, String>(())
-            });
+            }) };
             let released = enigo.button(button, Direction::Release).map_err(err);
             moved?;
             released?;
@@ -1038,6 +1076,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let mut completed = 0;
             let mut failure = None;
             let mut attempted = false;
+            let clipboard = crate::clipboard::sequence();
             let mut failed_point = None;
             let mut frames = Vec::new();
             for (index, a) in actions.iter().enumerate() {
@@ -1089,6 +1128,8 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 let settle = attempted && needs_stable_feedback(&actions[..completed], result["status"] == "needs_review");
                 observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, settle, &mut state, &mut result);
             }
+            // Read after feedback settling so apps that write the clipboard asynchronously have finished.
+            if let Some(copied) = crate::clipboard::copied_since(clipboard) { result["clipboard"] = copied; }
             if let (Some(p), Some(current)) = (failed_point, state.as_mut().filter(|s| s.foreground == snap.foreground)) {
                 if let Err(error) = failure_detail(current, &shot.surface, p, &mut result) {
                     result["detailError"] = json!(error);
@@ -1305,6 +1346,21 @@ mod tests {
         assert!(visible_window_crop(&monitor, &monitor, &crop).is_err());
     }
     #[test]
+    fn glide_ends_exactly_and_stays_bounded() {
+        for (from, to, bend) in [((0, 0), (800, 300), 0.1), ((500, 500), (10, 20), -0.1), ((7, 7), (7, 7), 0.05)] {
+            assert_eq!(glide_at(from, to, bend, 0.0), from);
+            assert_eq!(glide_at(from, to, bend, 1.0), to);
+            let ms = glide_ms(from, to);
+            assert!((80.0..=400.0).contains(&ms));
+            let d = |p: (i32, i32)| ((to.0 - p.0) as f64).hypot((to.1 - p.1) as f64);
+            let path: Vec<_> = (0..=50).map(|i| glide_at(from, to, bend, i as f64 / 50.0)).collect();
+            // Approaches the target without overshooting or wandering back.
+            assert!(path.windows(2).all(|w| d(w[1]) <= d(w[0]) + 1.0), "{from:?}->{to:?}");
+        }
+        assert!(glide_ms((0, 0), (2000, 0)) > glide_ms((0, 0), (50, 0)));
+    }
+
+    #[test]
     fn waits_are_not_paid_twice() {
         let actions: Vec<Action> = serde_json::from_value(json!([
             {"action":"click","x":10,"y":10}, {"action":"wait","ms":400},
@@ -1397,6 +1453,7 @@ mod tests {
         let wait: Action = serde_json::from_value(json!({"action":"wait","ms":8000})).unwrap();
         assert_eq!(validate(&wait, &shot).unwrap_err(), "ms=8000，允许范围为 0–2000");
         assert!(validate(&serde_json::from_value(json!({"action":"wait","ms":2000})).unwrap(), &shot).is_ok());
+        assert!(validate(&serde_json::from_value(json!({"action":"drag","x":1,"y":1,"toX":2,"toY":2,"glide":true})).unwrap(), &shot).is_ok());
         assert_eq!(keys("Ctrl+Shift+S").unwrap().len(), 3);
         assert!(keys("Ctrl+unknown").is_err());
         assert!(keys("Ctrl+Shift+Alt+Meta+S").is_err());
@@ -1404,6 +1461,7 @@ mod tests {
             json!({"action":"scroll","x":1,"y":1,"delta":101}),
             json!({"action":"wait","ms":2001}),
             json!({"action":"drag","x":1,"y":1}),
+            json!({"action":"scroll","x":1,"y":1,"delta":1,"glide":true}),
         ] {
             assert!(validate(&serde_json::from_value(value).unwrap(), &shot).is_err());
         }
