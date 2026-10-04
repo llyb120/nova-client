@@ -103,7 +103,7 @@ const STATE_REPEATS: usize = 3;
 
 fn parse(args: &Value) -> Result<Plan, String> {
     let plan: Plan = serde_json::from_value(args["plan"].clone())
-        .map_err(|e| format!("plan 格式错误（{e}）；需要 task、authorization、expectedText，推荐 steps"))?;
+        .map_err(|e| format!("plan 格式错误（{e}）；需要 task、authorization、expectedText，steps 须为对象数组，如 [{{\"action\":\"click\",\"target\":\"顶部导航 Intelligence\",\"expect\":\"情报页\"}}]，不是字符串"))?;
     let valid = |s: &str, max: usize| !s.trim().is_empty() && s.chars().count() <= max;
     if !valid(&plan.task, 2000) || !valid(&plan.authorization, 1000) || !valid(&plan.expected_text, 500)
         || plan.inputs.len() > 8 || plan.inputs.iter().any(|i| i.name.chars().count() > 300

@@ -5353,6 +5353,16 @@ pub fn maybe_run_update_helper() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let mut context = tauri::generate_context!();
+    // 开发构建与正式构建共用同一 identifier 时会争抢同一个 WebView2 用户数据目录：
+    // 同一 UDF 下 EnvironmentOptions 不同的实例无法共存，后启动者创建 webview 会报
+    // 0x80010108。把开发构建的应用目录整体隔离到独立标识下，两者可同时运行。
+    #[cfg(debug_assertions)]
+    {
+        let identifier = context.config().identifier.clone();
+        context.config_mut().identifier = format!("{identifier}.dev");
+    }
+
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init())
         .manage(workspace_terminal::TerminalManager::default());
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -5862,7 +5872,7 @@ pub fn run() {
             remove_skill,
             sync_skills
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("Nova 启动失败")
         .run(|app, event| {
             if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }), .. }
