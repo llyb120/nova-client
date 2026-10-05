@@ -28,10 +28,15 @@ export interface SelectOption {
   vision?: boolean;
   /** 跨后端唯一的收藏标识；未提供时该选项不显示收藏按钮 */
   favoriteId?: string;
+  /** 下一级（思考强度）；选本项即用默认强度 */
+  efforts?: SelectOption[];
+  /** 在下一级列里的短名（如 "High"），label 保留完整名供触发器显示 */
+  short?: string;
 }
 
 /** 可搜索的下拉选择器（浮层向上弹出，适合放在 composer 工具条）。
- *  支持三种形态：扁平 / 二级（厂商→模型）/ 三级（后端→厂商→模型）。 */
+ *  支持三种形态：扁平 / 二级（厂商→模型）/ 三级（后端→厂商→模型）；
+ *  选项带 efforts 时在模型列右侧再多一列思考强度。 */
 export function SearchSelect(props: {
   value: string;
   options: SelectOption[];
@@ -66,6 +71,8 @@ export function SearchSelect(props: {
   const [activeGroup, setActiveGroup] = createSignal<string | null>(null);
   /** 三级面板当前悬停/选中的后端；null 表示跟随当前值所在后端 */
   const [activeBackend, setActiveBackend] = createSignal<string | null>(null);
+  /** 悬停的模型（父项 value），决定思考强度列展示谁的档位 */
+  const [activeModel, setActiveModel] = createSignal<string | null>(null);
   /** 弹层方向：空间不足时向下翻转 / 右对齐，避免溢出窗口 */
   const [place, setPlace] = createSignal({ down: false, right: false });
   /** portal 模式下的浮层 fixed 坐标（相对视口） */
@@ -90,7 +97,13 @@ export function SearchSelect(props: {
   /** 是否启用分组二级面板（搜索时退化为扁平列表） */
   const isGrouped = createMemo(() => props.options.some((o) => o.group));
 
-  const currentOption = createMemo(() => props.options.find((o) => o.value === props.value));
+  /** 含下一级强度项的全部可选值 */
+  const flatOptions = createMemo(() => props.options.flatMap((o) => [o, ...(o.efforts ?? [])]));
+  const currentOption = createMemo(() => flatOptions().find((o) => o.value === props.value));
+  const hasEfforts = createMemo(() => props.options.some((o) => o.efforts?.length));
+  /** 选项本身或其某个强度被选中 */
+  const isActive = (o: SelectOption) =>
+    o.value === activeValue() || !!o.efforts?.some((e) => e.value === activeValue());
 
   /** 高亮/选中的有效值：命中当前值则用它；值非空但未命中列表时保持原值（不高亮任何项），
    *  避免把列表第一项误标为已选；空值才允许「默认」或回退到第一项。 */
@@ -133,15 +146,20 @@ export function SearchSelect(props: {
         !o.isDefault &&
         (o.label.toLowerCase().includes(q) ||
           o.value.toLowerCase().includes(q) ||
+          !!o.efforts?.some((e) => e.label.toLowerCase().includes(q)) ||
           (o.backendLabel?.toLowerCase().includes(q) ?? false)),
     );
   });
 
+  // 旧版收藏的是带强度的项，父项任一强度被收藏也算收藏
+  const favoriteIdsOf = (o: SelectOption) =>
+    [o, ...(o.efforts ?? [])].flatMap((x) => (x.favoriteId ? [x.favoriteId] : []));
   const isFavorite = (o: SelectOption) =>
-    !!o.favoriteId && modelFavoriteIds().includes(o.favoriteId);
+    favoriteIdsOf(o).some((id) => modelFavoriteIds().includes(id));
   const toggleFavorite = (o: SelectOption) => {
     if (!o.favoriteId) return;
-    toggleModelFavorite(o.favoriteId);
+    const marked = favoriteIdsOf(o).filter((id) => modelFavoriteIds().includes(id));
+    for (const id of marked.length ? marked : [o.favoriteId]) toggleModelFavorite(id);
   };
 
   // ===== 二级（厂商→模型）=====
@@ -230,16 +248,31 @@ export function SearchSelect(props: {
     return providersOfBackend().find((g) => g.name === shownProvider())?.items ?? [];
   });
 
+  /** 当前可见的模型列 */
+  const visibleModels = createMemo(() => {
+    if (query().trim()) return filtered();
+    if (isThreeLevel()) return shownModels();
+    return isGrouped() ? shownItems() : filtered();
+  });
+  const effortModel = createMemo(() => {
+    const models = visibleModels();
+    return (
+      models.find((o) => o.value === activeModel()) ??
+      models.find((o) => o.efforts?.some((e) => e.value === props.value))
+    );
+  });
+
   const pick = (v: string) => {
     props.onChange(
       v,
-      props.options.find((o) => o.value === v),
+      flatOptions().find((o) => o.value === v),
     );
     setOpened(false);
     setQuery("");
   };
 
-  const popWidth = () => (isThreeLevel() ? 640 : isGrouped() ? 480 : 280);
+  const popWidth = () =>
+    (isThreeLevel() ? 640 : isGrouped() ? 480 : 280) + (hasEfforts() ? 120 : 0);
 
   /** anchorTo 隐含 portal：对齐容器的浮层必须脱离 overflow 祖先才能不被裁剪 */
   const usePortal = () => props.portal || !!props.anchorTo;
@@ -299,6 +332,7 @@ export function SearchSelect(props: {
       setQuery("");
       setActiveGroup(null);
       setActiveBackend(null);
+      setActiveModel(null);
       if (props.searchable) queueMicrotask(() => searchRef?.focus());
     }
   };
@@ -333,10 +367,11 @@ export function SearchSelect(props: {
 
   const itemRow = (o: SelectOption, showBackend = false) => (
     <div
-      class={`sel-item ${showBackend ? "with-source" : ""} ${
-        o.value === activeValue() ? "active" : ""
+      class={`sel-item ${showBackend ? "with-source" : ""} ${isActive(o) ? "active" : ""} ${
+        o.efforts?.length && effortModel() === o ? "open" : ""
       }`}
       onClick={() => pick(o.value)}
+      onMouseEnter={() => setActiveModel(o.value)}
       title={o.title ?? o.value}
     >
       <span class="sel-model-copy">
@@ -373,16 +408,45 @@ export function SearchSelect(props: {
           <IconStar size={14} filled={isFavorite(o)} />
         </button>
       </Show>
-      <Show when={!showBackend && o.value === activeValue()}>
+      <Show when={!showBackend && isActive(o)}>
+        <IconCheck size={13} />
+      </Show>
+      <Show when={o.efforts?.length}>
+        <IconChevron size={11} />
+      </Show>
+    </div>
+  );
+
+  /** 思考强度列：「默认」= 选模型本身（父项 value 已是某个档位时不重复列出） */
+  const effortRow = (value: string, label: string) => (
+    <div class={`sel-item ${value === activeValue() ? "active" : ""}`} onClick={() => pick(value)}>
+      <span class="sel-label">{label}</span>
+      <Show when={value === activeValue()}>
         <IconCheck size={13} />
       </Show>
     </div>
+  );
+  const effortPane = () => (
+    <Show when={hasEfforts()}>
+      <div class="sel-list sel-efforts">
+        <Show when={effortModel()} fallback={<div class="sel-empty">思考强度</div>}>
+          {(m) => (
+            <>
+              <Show when={!m().efforts!.some((e) => e.value === m().value)}>
+                {effortRow(m().value, "默认")}
+              </Show>
+              <For each={m().efforts}>{(e) => effortRow(e.value, e.short ?? e.label)}</For>
+            </>
+          )}
+        </Show>
+      </div>
+    </Show>
   );
 
   const renderPop = () => (
     <div
       ref={popRef}
-      class={`sel-pop ${isThreeLevel() ? "three" : ""} ${
+      class={`sel-pop ${isThreeLevel() ? "three" : ""} ${hasEfforts() ? "efforts" : ""} ${
         isGrouped() || isThreeLevel() ? "grouped" : ""
       } ${!usePortal() && place().down ? "down" : ""} ${
         !usePortal() && place().right ? "right" : ""
@@ -473,6 +537,7 @@ export function SearchSelect(props: {
                   <For each={shownModels()}>{(o) => itemRow(o, true)}</For>
                 </Show>
               </div>
+              {effortPane()}
             </div>
           </Show>
 
@@ -510,12 +575,14 @@ export function SearchSelect(props: {
               <div class="sel-list sel-models">
                 <For each={shownItems()}>{(o) => itemRow(o)}</For>
               </div>
+              {effortPane()}
             </div>
           </Show>
 
           {/* 扁平模式：未分组的下拉，或分组/三级下拉的搜索结果 */}
           <Show when={(!isGrouped() && !isThreeLevel()) || query().trim()}>
-            <div class="sel-list">
+            <div class={hasEfforts() ? "sel-panes" : ""}>
+            <div class={`sel-list ${hasEfforts() ? "sel-models" : ""}`}>
               <Show when={props.allowDefault && !query().trim()}>
                 <div
                   class={`sel-item ${props.value === "" ? "active" : ""}`}
@@ -531,6 +598,8 @@ export function SearchSelect(props: {
               <Show when={filtered().length === 0}>
                 <div class="sel-empty">无匹配项</div>
               </Show>
+            </div>
+            {effortPane()}
             </div>
           </Show>
     </div>

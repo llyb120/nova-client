@@ -3672,6 +3672,58 @@ fn refresh_lyra_config(state: State<'_, AppState>) {
     state.lyra.notify_config_changed();
 }
 
+/// 设置页图形化编辑：读取 config.jsonc（不存在时返回空配置）。
+#[tauri::command]
+fn get_lyra_config() -> Result<Value, String> {
+    let path = lyra::config::nova_root().join("alkaid").join("config.jsonc");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => lyra_complete::parse_jsonc(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({ "provider": {} })),
+        Err(error) => Err(format!("读取 Lyra 配置失败：{error}")),
+    }
+}
+
+/// 设置页的自适应 provider 预设列表。
+#[tauri::command]
+fn get_lyra_presets() -> Value {
+    lyra::presets::list()
+}
+
+/// 设置页「获取模型」：按编辑中的 provider（可未保存）立即拉取模型列表写入缓存并返回。
+#[tauri::command]
+async fn fetch_lyra_models(state: State<'_, AppState>, id: String, provider: Value) -> Result<Value, String> {
+    let proxy = state.settings.lock().unwrap().lyra_proxy.clone();
+    let http = lyra::provider::client_for_proxy(proxy.trim());
+    let root = lyra::config::nova_root();
+    lyra::presets::refresh(&http, &root, &json!({ "provider": { id.clone(): provider } }), true).await?;
+    // 已保存的 provider 立刻在模型选择器中可见。
+    state.lyra.notify_config_changed();
+    Ok(lyra::presets::cached_models(&root, &id))
+}
+
+/// 写回 config.jsonc 并立即重载。手写的 JSONC（含注释）首次被覆盖前备份为 config.jsonc.bak。
+#[tauri::command]
+fn save_lyra_config(state: State<'_, AppState>, config: Value) -> Result<(), String> {
+    if !config.get("provider").is_some_and(Value::is_object) {
+        return Err("Lyra 配置缺少 provider".into());
+    }
+    let dir = lyra::config::nova_root().join("alkaid");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 Lyra 配置目录失败：{e}"))?;
+    let path = dir.join("config.jsonc");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if serde_json::from_str::<Value>(&text).is_err() {
+            std::fs::write(dir.join("config.jsonc.bak"), text)
+                .map_err(|e| format!("备份 Lyra 配置失败：{e}"))?;
+        }
+    }
+    let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    let tmp = dir.join("config.jsonc.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("写入 Lyra 配置失败：{e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("写入 Lyra 配置失败：{e}"))?;
+    state.lyra.notify_config_changed();
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_slash_commands(
     state: State<'_, AppState>,
@@ -5810,6 +5862,10 @@ pub fn run() {
             set_thread_agent,
             get_model_options,
             refresh_lyra_config,
+            get_lyra_config,
+            get_lyra_presets,
+            fetch_lyra_models,
+            save_lyra_config,
             get_slash_commands,
             send_prompt,
             truncate_thread,

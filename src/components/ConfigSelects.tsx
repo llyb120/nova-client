@@ -9,6 +9,7 @@ import {
 } from "../store";
 import type { AgentKind, ModelCost, ModelOptions } from "../types";
 import { agentLabel } from "../utils";
+import { foldEfforts as foldModelEfforts } from "../modelEfforts";
 import { SearchSelect, type SelectOption } from "./SearchSelect";
 
 /** 模型/模式选项来源：漫游时返回对端（host）的列表；返回 undefined 表示用本机全局列表。 */
@@ -132,14 +133,18 @@ function detailTitle(agentKind: AgentKind, cost?: ModelCost): string | undefined
 }
 
 /** 把某后端的模型列表映射为下拉选项；merged 时附带后端信息并编码 value。
- *  source 显式传入时用它（漫游用对端列表），不传则用本机全局列表。 */
+ *  source 显式传入时用它（漫游用对端列表），不传则用本机全局列表。
+ *  foldEfforts：同一模型的各强度收成一项，强度放进 efforts 作为下一级；
+ *  直接选模型本身提交基础模型（后端默认强度，Claude 有 default 档时用它）。 */
 export function modelOptionsOf(
   agentKind: AgentKind,
   merged: boolean,
   source?: ModelOptions | null,
+  foldEfforts = false,
 ): SelectOption[] {
   const costs = state.modelCosts;
-  return modelChoices(agentKind, source).map((m) => {
+  const encode = (value: string) => (merged ? encodeModelValue(agentKind, value) : value);
+  const flat = modelChoices(agentKind, source).map((m): SelectOption => {
     const cost = costs?.[m.value];
     const metaVision =
       m._meta?.["cognition.ai/supportsImages"] ?? m._meta?.["codex.ai/supportsImages"];
@@ -148,7 +153,7 @@ export function modelOptionsOf(
     // CodeBuddy 无 windsurf 费用数据，改用模型 description 里的积分倍率
     const credits = creditsText(m.description);
     return {
-      value: merged ? encodeModelValue(agentKind, m.value) : m.value,
+      value: encode(m.value),
       label: m.name,
       title: m.value,
       group: groupOf(m.value, m.name, cost),
@@ -164,6 +169,8 @@ export function modelOptionsOf(
       favoriteId: `${agentKind}:${encodeURIComponent(m.value)}`,
     };
   });
+  if (!foldEfforts) return flat;
+  return foldModelEfforts(flat, agentKind === "lyra", encode, (v) => `${agentKind}:${encodeURIComponent(v)}`);
 }
 
 /** 把某后端的模型选项按厂商分组，供原生 <select><optgroup> 使用（弹窗里不被 overflow 裁剪） */
@@ -187,7 +194,7 @@ export function groupedModelOptions(
 /** 单独的「模型（含后端）」下拉——与新会话完全一致的选择器。
  *  - 单后端：二级（厂商 → 模型）。
  *  - 多后端（已启用 >1）：三级菜单（后端 → 厂商 → 模型），选中即同时提交后端与模型。
- *  Codex 思考强度已并入模型选项。工作模型与巡查/心跳模型共用此组件。 */
+ *  思考强度在模型之后再多一级（不选则用默认强度）。工作模型与巡查/心跳模型共用此组件。 */
 export function ModelPicker(props: {
   agentKind: AgentKind;
   agentKinds?: AgentKind[];
@@ -216,13 +223,18 @@ export function ModelPicker(props: {
   const sharedList = createMemo<SelectOption[]>(() =>
     (props.sharedModels ?? []).flatMap(({ peer, options }) =>
       (sharedOnly() ? [props.agentKind] : ALL_AGENT_KINDS).flatMap((kind) =>
-        modelOptionsOf(kind, false, options[kind] ?? null).map((option) => ({
-          ...option,
-          value: sharedOnly() ? option.value : encodeQuotaModelValue(peer.token, kind, option.value),
-          backend: sharedOnly() ? undefined : `quota:${peer.token}:${kind}`,
-          backendLabel: sharedOnly() ? undefined : `${peer.name}的${agentLabel(kind)}`,
-          favoriteId: `quota:${encodeURIComponent(peer.token)}:${kind}:${encodeURIComponent(option.value)}`,
-        })),
+        modelOptionsOf(kind, false, options[kind] ?? null, true).map(function quota(
+          option: SelectOption,
+        ): SelectOption {
+          return {
+            ...option,
+            value: sharedOnly() ? option.value : encodeQuotaModelValue(peer.token, kind, option.value),
+            backend: sharedOnly() ? undefined : `quota:${peer.token}:${kind}`,
+            backendLabel: sharedOnly() ? undefined : `${peer.name}的${agentLabel(kind)}`,
+            favoriteId: `quota:${encodeURIComponent(peer.token)}:${kind}:${encodeURIComponent(option.value)}`,
+            efforts: option.efforts?.map(quota),
+          };
+        }),
       ),
     ),
   );
@@ -243,9 +255,9 @@ export function ModelPicker(props: {
   const modelOptions = createMemo<SelectOption[]>(() => {
     if (sharedReady()) return sharedList();
     if (sharedOnly()) return [];
-    if (!merged()) return modelOptionsOf(props.agentKind, false, sourceOf(props.agentKind));
+    if (!merged()) return modelOptionsOf(props.agentKind, false, sourceOf(props.agentKind), true);
     return [
-      ...kinds().flatMap((k) => modelOptionsOf(k, true, sourceOf(k))),
+      ...kinds().flatMap((k) => modelOptionsOf(k, true, sourceOf(k), true)),
       ...sharedList(),
     ];
   });

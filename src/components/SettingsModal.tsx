@@ -23,6 +23,7 @@ import {
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { ModelPicker, type SharedModelSource } from "./ConfigSelects";
 import { IconPlus, IconX } from "./icons";
+import { LyraConfigPanel } from "./LyraConfigPanel";
 import { ProjectPicker } from "./ProjectPicker";
 import { WorkflowPicker } from "./WorkflowPicker";
 import {
@@ -221,6 +222,7 @@ type SettingsTab =
   | "general"
   | "advanced"
   | "jev"
+  | "lyra"
   | "backends"
   | "instructions"
   | "appearance"
@@ -234,6 +236,7 @@ const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
   { id: "advanced", name: "高级" },
   { id: "jev", name: "JEV 辅助决策" },
+  { id: "lyra", name: "Lyra" },
   { id: "backends", name: "模型后端" },
   { id: "instructions", name: "Agent 配置" },
   { id: "appearance", name: "外观" },
@@ -385,22 +388,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     }
   };
 
-  const [lyraRefreshing, setLyraRefreshing] = createSignal(false);
-  const [lyraRefreshMsg, setLyraRefreshMsg] = createSignal("");
-
-  const refreshLyraConfig = async () => {
-    setLyraRefreshing(true);
-    setLyraRefreshMsg("");
-    try {
-      await api.refreshLyraConfig();
-      setLyraRefreshMsg("已重载配置，模型列表刷新中…");
-      setTimeout(() => setLyraRefreshMsg(""), 4000);
-    } catch (e) {
-      setLyraRefreshMsg(`刷新失败：${String(e)}`);
-    } finally {
-      setLyraRefreshing(false);
-    }
-  };
 
   const restartAgents = async () => {
     setRestarting(true);
@@ -1028,6 +1015,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     });
   });
 
+  let saveLyraConfig: (() => Promise<void>) | undefined;
   const save = async () => {
     const draftedShortcuts = draftSessionShortcuts();
     const keyCounts = new Map<string, number>();
@@ -1050,6 +1038,8 @@ export function SettingsModal(props: { onClose: () => void }) {
     const shellShimChanged =
       settings.windowsShellShimEnabled !== (state.settings?.windowsShellShimEnabled ?? false);
     try {
+      // 先写 Lyra 配置：校验失败时整体中止，不会只保存一半。
+      await saveLyraConfig?.();
       await api.setSettings(settings);
       setState("settings", settings);
       // 只有设置成功持久化后才确认通道切换；检查与下载在后台进行，不阻塞保存或关闭弹窗。
@@ -1671,12 +1661,8 @@ export function SettingsModal(props: { onClose: () => void }) {
             </section>
           </Show>
 
-          {/* ===== 模型后端 ===== */}
-          <Show when={tab() === "backends"}>
-            <p class="field-hint">
-              每个后端可单独启用/关闭并配置启动方式。关闭的后端不会出现在新建/切换会话的后端列表里（历史会话仍可打开查看）。
-            </p>
-
+          {/* ===== Lyra（常驻挂载，切换 tab 不丢草稿） ===== */}
+          <div class="settings-tab-pane" hidden={tab() !== "lyra"}>
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge lyra`}>{agentLabel("lyra")}</span>
@@ -1693,22 +1679,16 @@ export function SettingsModal(props: { onClose: () => void }) {
               </div>
               <span class="field-hint">Rust 原生 agent，不经 Node bridge；复用本机模型 provider 配置与 Skills。</span>
               <ProxyField value={lyraProxy()} onInput={setLyraProxy} />
-              <div class="backend-quota-row">
-                <span class="field-label">本地配置</span>
-                <span class="field-hint">修改 ~/.nova/alkaid/config.jsonc 后点此按钮，立即重载模型列表、补全与预热配置。</span>
-                <Show when={lyraRefreshMsg()}>
-                  <span class="field-hint">{lyraRefreshMsg()}</span>
-                </Show>
-                <button
-                  type="button"
-                  class="link-btn backend-quota-refresh"
-                  disabled={lyraRefreshing()}
-                  onClick={() => void refreshLyraConfig()}
-                >
-                  {lyraRefreshing() ? "刷新中…" : "刷新配置"}
-                </button>
-              </div>
             </div>
+
+            <LyraConfigPanel onSaver={(fn) => (saveLyraConfig = fn)} />
+          </div>
+
+          {/* ===== 模型后端 ===== */}
+          <Show when={tab() === "backends"}>
+            <p class="field-hint">
+              每个后端可单独启用/关闭并配置启动方式。关闭的后端不会出现在新建/切换会话的后端列表里（历史会话仍可打开查看）。
+            </p>
 
             <div class="backend-card">
               <div class="backend-card-head">

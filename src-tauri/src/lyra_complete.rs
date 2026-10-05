@@ -33,7 +33,8 @@ struct ResolvedCompletionTarget {
 
 struct CachedConfig {
     path: PathBuf,
-    mtime: Option<SystemTime>,
+    /// config.jsonc 与预设模型缓存（models-cache.json）的修改时间
+    mtime: (Option<SystemTime>, Option<SystemTime>),
     config: Value,
 }
 
@@ -358,9 +359,10 @@ fn content_to_text(content: &Value) -> String {
 
 pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
     let path = data_dir.join("alkaid").join("config.jsonc");
-    let mtime = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok());
+    let mtime = (
+        std::fs::metadata(&path).ok().and_then(|m| m.modified().ok()),
+        crate::lyra::presets::cache_mtime(data_dir),
+    );
     {
         let cache = config_cache().lock().unwrap();
         if let Some(cached) = cache.as_ref() {
@@ -370,7 +372,7 @@ pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
         }
     }
 
-    let config = match std::fs::read_to_string(&path) {
+    let mut config = match std::fs::read_to_string(&path) {
         Ok(text) => parse_jsonc(&text)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!("未找到 Lyra 配置：{}", path.display()));
@@ -384,6 +386,7 @@ pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
     {
         return Err("Lyra 配置缺少 provider".into());
     }
+    crate::lyra::presets::expand(&mut config, data_dir);
     *config_cache().lock().unwrap() = Some(CachedConfig {
         path,
         mtime,
@@ -412,7 +415,8 @@ fn resolve_target(
         .pointer(&format!("/provider/{provider_id}"))
         .ok_or_else(|| format!("Lyra provider 不存在：{provider_id}"))?;
     let model = provider
-        .pointer(&format!("/models/{model_id}"))
+        .get("models")
+        .and_then(|models| models.get(model_id))
         .ok_or_else(|| format!("Lyra model 不存在：{base_selection}"))?;
     let options = provider
         .get("options")
@@ -436,7 +440,7 @@ fn resolve_target(
             .unwrap_or_default(),
         env,
     )?;
-    let api = provider_api(provider)?;
+    let api = model_api(model, provider)?;
     let variant = selection.rsplit_once(marker).map(|(_, value)| value);
     let variant_options = variant
         .and_then(|name| model.pointer(&format!("/variants/{name}")))
@@ -504,6 +508,14 @@ fn resolve_target(
         top_p,
         proxy: crate::lyra::config::resolve_proxy(model, provider, env)?,
     })
+}
+
+/// 模型级 api 覆盖 provider 级（同一网关下 Claude 走 messages、GPT 走 responses）。
+pub(crate) fn model_api(model: &Value, provider: &Value) -> Result<String, String> {
+    match model.get("api").and_then(Value::as_str) {
+        Some(api) => Ok(api.to_string()),
+        None => provider_api(provider),
+    }
 }
 
 pub(crate) fn provider_api(provider: &Value) -> Result<String, String> {

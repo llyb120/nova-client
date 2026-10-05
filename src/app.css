@@ -7263,3 +7263,35 @@ button:focus-visible {
 @media (max-height: 600px) {
   .composer .composer-input { min-height: 90px; }
 }
+
+/* 常驻挂载的设置页（如 Lyra），切换 tab 时仅隐藏以保留草稿 */
+.settings-tab-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.settings-tab-pane[hidden] {
+  display: none;
+}
+
+/* 模型右侧的思考强度列（第四级） */
+.sel-pop.grouped.efforts {
+  width: 600px;
+}
+.sel-pop.three.efforts {
+  width: 760px;
+}
+.sel-efforts {
+  width: 120px;
+  flex-shrink: 0;
+  max-height: none;
+  border-left: 1px solid var(--border-light);
+}
+.sel-item.open {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.sel-item.open.active {
+  color: var(--accent);
+}

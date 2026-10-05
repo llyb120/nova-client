@@ -16,6 +16,7 @@ pub(crate) mod config;
 mod context;
 mod edit;
 mod history;
+pub(crate) mod presets;
 mod prompt;
 pub(crate) mod provider;
 mod read;

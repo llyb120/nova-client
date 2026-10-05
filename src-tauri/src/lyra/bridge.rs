@@ -478,8 +478,20 @@ async fn handle_prompt(
     Ok(())
 }
 
-fn models_data(request: &Value, roots: &Roots) -> Result<Value, String> {
-    let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
+async fn models_data(
+    http: &reqwest::Client,
+    request: &Value,
+    roots: &Roots,
+) -> Result<Value, String> {
+    let mut config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
+    // 预设 provider（Command Code / OpenCode 等）按需拉取远端模型列表，更新后重新加载。
+    let refreshed = super::presets::refresh(http, roots.nova(), &config_value, false).await;
+    if refreshed.unwrap_or_else(|error| {
+        eprintln!("[lyra] {error}");
+        false
+    }) {
+        config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
+    }
     // 沿用旧 bridge的 configOptions 形状：前端与漫游/雷达都只认 id=="model" 的包裹结构，
     // 直接返回扁平选项列表会导致选择器永远为空。
     let current = config::default_model(&config_value)?; // 与 JS 一样先校验存在可用模型
@@ -582,7 +594,7 @@ pub async fn run_oneshot(
         .map(Roots::borrowed)
         .unwrap_or_else(Roots::global);
     match request.get("action").and_then(Value::as_str) {
-        Some("models") => models_data(request, &roots),
+        Some("models") => models_data(http, request, &roots).await,
         Some("title") => title_data(http, request, &roots).await,
         Some("complete") => complete_data(http, request, &roots).await,
         Some("export") => export_data(request, &roots),
@@ -661,7 +673,7 @@ async fn dispatch(http: &reqwest::Client, request: &Value) -> Result<(), String>
             handle_prompt(http, request, &emit, fast_context, &roots, line_rx, None).await
         }
         Some("models") => {
-            let data = models_data(request, &roots)?;
+            let data = models_data(http, request, &roots).await?;
             send(&json!({ "ok": true, "data": data }));
             Ok(())
         }
