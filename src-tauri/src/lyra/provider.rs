@@ -282,11 +282,12 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
     }
 }
 
-// ponytail: byte counts conservatively bound text tokens; image cost is a heuristic
-// (8192 per image). Replace with provider token counting when available.
+// ponytail: ~3 UTF-8 bytes per token conservatively bounds text tokens (CJK ≈ 3 bytes/char,
+// ASCII ≈ 4 bytes/token; raw byte counts overestimated 4x and starved long chats down to 16 output
+// tokens); image cost is a heuristic (8192 per image). Replace with provider token counting when available.
 fn request_input_budget(value: &Value) -> u64 {
     match value {
-        Value::String(text) => text.len() as u64,
+        Value::String(text) => (text.len() as u64).div_ceil(3),
         Value::Array(items) => items.iter().map(request_input_budget).sum(),
         Value::Object(fields) => {
             if matches!(fields.get("type").and_then(Value::as_str),
@@ -1996,6 +1997,12 @@ mod tests {
             assert!(output < model.max_output_tokens);
             assert!(output + request_input_budget(&body) < model.context_window);
         }
+        // A long CJK chat (~720KB, ~180k real tokens) must still get the full output budget.
+        let mut kimi = test_model("openai-completions");
+        kimi.context_window = 512_000;
+        kimi.max_output_tokens = 65_536;
+        let long = vec![json!({"role":"user", "content":"中".repeat(240_000)})];
+        assert_eq!(completions_body(&kimi, "sys", &long, &[], None, None)["max_completion_tokens"], 65_536);
         let short = completions_body(&model, "sys", &[], &[], None, None);
         assert_eq!(short["max_completion_tokens"], model.max_output_tokens);
         // Base64 bytes are not text tokens, and must not exhaust the window.
