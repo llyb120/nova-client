@@ -2721,21 +2721,15 @@ impl AcpManager {
                 );
                 let load_attempts: u32 = 2;
                 let mut loaded: Result<Value, String> = Err("session/load 未执行".into());
+                let mut params = json!({ "sessionId": sid, "cwd": cwd, "mcpServers": mcp_servers });
+                self.add_session_meta(&mut params, thread_id);
                 for attempt in 1..=load_attempts {
                     if !conn.alive.load(Ordering::SeqCst) {
                         loaded = Err(format!("{} 进程已退出", self.kind.label()));
                         break;
                     }
                     loaded = conn
-                        .request(
-                            "session/load",
-                            json!({
-                                "sessionId": sid,
-                                "cwd": cwd,
-                                "mcpServers": mcp_servers.clone()
-                            }),
-                            Some(Duration::from_secs(300)),
-                        )
+                        .request("session/load", params.clone(), Some(Duration::from_secs(300)))
                         .await;
                     match &loaded {
                         Ok(_) => break,
@@ -3190,6 +3184,8 @@ impl AcpManager {
         let mut last_err = String::new();
         let mut resp = None;
         let mut conn = conn.clone();
+        let mut params = json!({ "cwd": cwd, "mcpServers": mcp_servers });
+        self.add_session_meta(&mut params, thread_id);
         for attempt in 1..=max_attempts {
             if !conn.alive.load(Ordering::SeqCst) {
                 self.push_log(format!(
@@ -3210,14 +3206,7 @@ impl AcpManager {
                 }
             }
             match conn
-                .request(
-                    "session/new",
-                    json!({
-                        "cwd": cwd,
-                        "mcpServers": mcp_servers
-                    }),
-                    Some(Duration::from_secs(180)),
-                )
+                .request("session/new", params.clone(), Some(Duration::from_secs(180)))
                 .await
             {
                 Ok(r) => {
@@ -3361,7 +3350,9 @@ impl AcpManager {
             resumed_after_cwd_change = true;
             // CodeBuddy may not persist the interrupted turn, even when session/load
             // succeeds. Reuse Nova's bounded handoff transcript to retain the task.
-            let handoff = {
+            // Other agents restore native history via session/load (require_restore), so
+            // re-sending the transcript would duplicate the whole conversation.
+            let handoff = if self.kind != AgentKind::CodeBuddy { None } else {
                 let state = self.app.state::<AppState>();
                 let store = state.store.lock().unwrap();
                 store.get(&thread_id).and_then(|thread| {
@@ -3498,18 +3489,11 @@ impl AcpManager {
         prompt
     }
 
-    fn build_user_prompt_blocks(
-        &self,
-        thread_id: &str,
-        text: &str,
-        images: &[PromptImage],
-        include_runtime_guidance: bool,
-    ) -> Vec<Value> {
-        let mut prompt = Self::build_prompt_blocks(text, images);
+    /// Nova 的工具/工作流规则。Claude 经 session 级 system prompt 下发（见 add_session_meta），
+    /// CodeBuddy/Kimi 没有 system-prompt 入口，只能逐轮附在用户消息里。
+    fn nova_rules(&self, thread_id: &str) -> Vec<String> {
         let mut guidance = Vec::new();
         if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi | AgentKind::Claude) {
-            // ponytail: ACP has no system-prompt setter; repeat rules per turn so resumed
-            // sessions and setting changes work. Use session-level instructions if ACP adds them.
             guidance.push(crate::codex_app_server::rtk_guidance());
             let state = self.app.state::<AppState>();
             let read_only = state.store.lock().unwrap().get(thread_id)
@@ -3524,6 +3508,48 @@ impl AcpManager {
                 guidance.push(crate::lyra::PONYTAIL_RULES.to_string());
             }
         }
+        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Claude)
+            && self
+                .app
+                .state::<AppState>()
+                .settings
+                .lock()
+                .unwrap()
+                .auto_change_project_enabled
+            && !self.app.state::<AppState>().context_service.endpoint().is_empty()
+        {
+            guidance.push("需要更换工作目录/项目时，单独调用 nova-tools 的 change_working_directory(path)，不要与其它工具并行。Nova 会在新目录恢复本会话并自动继续；普通 cd 不能更改 Nova 会话目录。".into());
+        }
+        guidance
+    }
+
+    /// claude-agent-acp 的 session/new 与 session/load 共用 createSession，都读取
+    /// `_meta.systemPrompt.append`；规则进 system prompt，不再逐轮混进用户消息、撑大历史。
+    /// ponytail: 规则在建会话/load 时定型，会话中途改设置（ponytail、plan 模式）要到下次
+    /// session/load（重启或回收连接后）才生效；需要即时生效再改为设置变更时重建会话。
+    fn add_session_meta(&self, params: &mut Value, thread_id: &str) {
+        if self.kind != AgentKind::Claude {
+            return;
+        }
+        let rules = self.nova_rules(thread_id);
+        if !rules.is_empty() {
+            params["_meta"] = json!({ "systemPrompt": { "append": rules.join("\n\n") } });
+        }
+    }
+
+    fn build_user_prompt_blocks(
+        &self,
+        thread_id: &str,
+        text: &str,
+        images: &[PromptImage],
+        include_runtime_guidance: bool,
+    ) -> Vec<Value> {
+        let mut prompt = Self::build_prompt_blocks(text, images);
+        let mut guidance = if self.kind == AgentKind::Claude {
+            Vec::new()
+        } else {
+            self.nova_rules(thread_id)
+        };
         if include_runtime_guidance {
             let (context_tools, read_only) = {
                 let state = self.app.state::<AppState>();
@@ -3572,18 +3598,6 @@ impl AcpManager {
         };
         if let Some(runtime) = runtime_guidance {
             guidance.push(runtime);
-        }
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Claude)
-            && self
-                .app
-                .state::<AppState>()
-                .settings
-                .lock()
-                .unwrap()
-                .auto_change_project_enabled
-            && !self.app.state::<AppState>().context_service.endpoint().is_empty()
-        {
-            guidance.push("需要更换工作目录/项目时，单独调用 nova-tools 的 change_working_directory(path)，不要与其它工具并行。Nova 会在新目录恢复本会话并自动继续；普通 cd 不能更改 Nova 会话目录。".into());
         }
         if !guidance.is_empty() {
             let guidance = guidance.join("\n\n");
@@ -3776,6 +3790,8 @@ impl AcpManager {
             include_runtime_guidance,
         );
         if let Some(ctx) = handoff.filter(|_| self.kind != AgentKind::CodeBuddy) {
+            // 包上标签，免得模型把接力记录/线索当成用户本轮新说的话。
+            let ctx = format!("<nova-context>\n以下是 Nova 提供的背景上下文（此前的会话记录、线索等），不是用户本轮的新请求。\n\n{ctx}\n</nova-context>");
             prompt.insert(0, json!({ "type": "text", "text": ctx }));
         }
         let items_at_prompt = {
@@ -4913,7 +4929,16 @@ mod codebuddy_acp_tests {
         assert!(body.contains("<system-reminder>"));
         assert!(body.contains("block[\"text\"]"));
         assert!(!body.contains("AgentKind::CodeBuddy => prompt.insert(0"));
-        let rules = body.split("if include_runtime_guidance {").next().unwrap();
+        // Claude 的规则走 session 级 system prompt，不再逐轮前插进用户消息。
+        let per_turn = body.split("if include_runtime_guidance {").next().unwrap();
+        assert!(per_turn.contains("if self.kind == AgentKind::Claude {\n            Vec::new()"));
+        let meta = source.split("fn add_session_meta(").nth(1).unwrap()
+            .split("fn build_user_prompt_blocks(").next().unwrap();
+        assert!(meta.contains("\"systemPrompt\": { \"append\""));
+        assert!(source.contains(".request(\"session/new\", params.clone()"));
+        assert!(source.contains(".request(\"session/load\", params.clone()"));
+        let rules = source.split("fn nova_rules(").nth(1).unwrap()
+            .split("fn add_session_meta(").next().unwrap();
         assert!(rules.contains("AgentKind::CodeBuddy | AgentKind::Kimi"));
         assert!(rules.contains("crate::codex_app_server::rtk_guidance()"));
         assert!(rules.contains("ponytail_enabled"));
