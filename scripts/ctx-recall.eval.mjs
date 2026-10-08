@@ -94,7 +94,7 @@ const BACKFILL_FIXTURE = () => {
     const units = [`import { alphaTarget } from "./core";`, ""];
     for (let n = 0; n < 4; n += 1) {
       const pad = [];
-      for (let i = 0; i < 22; i += 1) pad.push(`  const pad${m}_${n}_${i} = "padding-value-${m}-${n}-${i}-aaaaaaaaaaaaaaaaaaaaaaaa";`);
+      for (let i = 0; i < 14; i += 1) pad.push(`  const pad${m}_${n}_${i} = "padding-value-${m}-${n}-${i}-aaaaaaaaaaaaaaaaaaaaaaaa";`);
       units.push(
         `export function useTarget${m}_${n}() {`,
         `  // block-${m}-${n}-marker`,
@@ -168,10 +168,11 @@ const CASES = [
     ],
   },
   {
-    // 特性 2：锚点 typo 自动更正重试。modeChoics → modeChoices（编辑距离 1）。
-    // 期望值用拼接避免本文件被 fast_context 当成命中源（自引用污染）。
+    // 特性 2：锚点 typo 自动更正重试。少一个 i 的 modeChoices（编辑距离 1）。
+    // 拼错的关键词和期望值都用拼接：它们只要在仓库里字面出现一次，检索就有命中，
+    // 不会触发更正（自引用污染）。
     name: "锚点 typo 自动更正",
-    args: { keywords: ["modeChoics"], task: "switch mode handling" },
+    args: { keywords: ["modeCho" + "ces"], task: "switch mode handling" },
     expect: ["锚点更" + "正", "modeChoices", "src/store.ts"],
     min: 1,
   },
@@ -194,12 +195,13 @@ const CASES = [
     min: 1,
   },
   {
-    // 特性 5：预算回填。shrink 删除 FULL 大文件后，用回填把高价值块补回预算。
+    // 特性 5：预算回填。12 个约 1KB 的完整单元，soft 顶（72%）最多放 5 块，
+    // 回填应在 8KB 硬顶内补到 6 块以上（只计完整单元，不靠表头片段凑数）。
     name: "预算回填（shrink 超调回补）",
     fixture: BACKFILL_FIXTURE,
     args: { keywords: ["alphaTarget"], maxBytes: 8192 },
-    expect: ["block-0-0-marker", "block-0-1-marker", "block-0-2-marker", "block-1-0-marker"],
-    min: 1,
+    expect: [0, 1, 2].flatMap((m) => [0, 1, 2, 3].map((n) => `block-${m}-${n}-` + "marker")),
+    min: 0.5,
   },
   {
     // 特性 4：git 共改耦合（可选开关）。真实仓库 git 历史应给出共改文件提示。
@@ -247,6 +249,21 @@ const CASES = [
   },
 ];
 
+const SELF_PATH = "scripts/ctx-recall.eval.mjs";
+
+/** 删掉输出里某文件的 `### path` 正文块（到下一个 `###`/`##` 标题为止）。 */
+function stripFileBlocks(out, path) {
+  let skip = false;
+  return out
+    .split("\n")
+    .filter((line) => {
+      if (line.startsWith("### ")) skip = line.slice(4).split(" ")[0] === path;
+      else if (line.startsWith("## ")) skip = false;
+      return !skip;
+    })
+    .join("\n");
+}
+
 async function main() {
   const root = repoRoot();
   const json = process.argv.includes("--json");
@@ -257,7 +274,9 @@ async function main() {
   for (const item of CASES) {
     const caseRoot = item.fixture ? item.fixture() : root;
     const started = performance.now();
-    const out = await callGlobalContextTool("polaris", caseRoot, item.args);
+    const raw = await callGlobalContextTool("polaris", caseRoot, item.args);
+    // 真实仓库用例里，本脚本自身就写着全部关键词和期望值：命中它不算召回。
+    const out = item.fixture ? raw : stripFileBlocks(raw, SELF_PATH);
     const ms = Math.round(performance.now() - started);
     const kb = Math.round(out.length / 102.4) / 10;
 
