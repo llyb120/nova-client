@@ -168,7 +168,6 @@ fn update<T>(f: impl FnOnce(&mut Employee) -> Result<T, String>) -> Result<T, St
 struct Current {
     thread_id: String,
     duty_id: String,
-    label: String,
     started: Instant,
     /// 心跳自动发起的才需要让出；用户手动触发时人就在电脑前。
     auto: bool,
@@ -439,7 +438,6 @@ fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool)
         rt.current = Some(Current {
             thread_id: thread.id.clone(),
             duty_id: duty_id.into(),
-            label: label.into(),
             started: Instant::now(),
             auto,
             seen_running: false,
@@ -497,7 +495,6 @@ async fn watch(app: &AppHandle) {
         let _ = crate::cancel_turn(app.clone(), app.state::<AppState>(), current.thread_id.clone(), None, None).await;
         runtime(|rt| rt.yielded = true);
         finish(app, &current, Some("已让出：检测到用户操作".into()));
-        crate::sys_notify::show(app, "数字员工已让出", &format!("检测到你在操作电脑，已停下：{}", current.label), false, None);
     }
 }
 
