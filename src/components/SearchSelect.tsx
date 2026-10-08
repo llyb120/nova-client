@@ -266,10 +266,11 @@ export function SearchSelect(props: {
   });
   const effortModel = createMemo(() => {
     const models = visibleModels();
-    return (
+    const m =
       models.find((o) => o.value === activeModel()) ??
-      models.find((o) => o.efforts?.some((e) => e.value === props.value))
-    );
+      models.find((o) => o.efforts?.some((e) => e.value === props.value));
+    // 悬停到无强度的模型时不能返回它：强度列里的 m().efforts! 会抛错，打断整个浮层的响应式
+    return m?.efforts?.length ? m : undefined;
   });
 
   /** 直接选模型时沿用该模型上次选的强度（仍在档位里才用），没有记录才用默认 */
