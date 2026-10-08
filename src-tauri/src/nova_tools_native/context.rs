@@ -90,7 +90,6 @@ const SEARCH_GIT_POLL_MS: u64 = 2_000;
 const SEARCH_COMPACT_INTERVAL_MS: u64 = 15 * 60 * 1_000;
 const SEARCH_COMPACT_CHANGED_FILES: usize = 256;
 const SEARCH_MAX_INCREMENTAL_FILES: usize = 2_000;
-const SEARCH_INDEX_MAX_CANDIDATES: usize = 512;
 const CO_CHANGE_DEADLINE_MS: u64 = 750;
 const CO_CHANGE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const CO_CHANGE_DEFAULT_HISTORY_DAYS: u64 = 730;
@@ -1304,57 +1303,47 @@ fn search_index_rows(
 }
 
 fn indexed_candidate_files_from(index: &SearchIndex, terms: &[String]) -> Option<Vec<String>> {
-    let mut scores = HashMap::<String, usize>::new();
-    let mut wide_candidates = HashSet::<String>::new();
-    let mut usable = false;
+    // 候选必须与 rg 回退路径同语义（子串匹配、不丢词），否则同一查询在索引建好前后
+    // 返回不同文件。倒排键是整 token（`this.transition`、`selectworkflow`），查询
+    // token 只要是某个键的子串，该键的文件就是候选。
+    // ponytail: 每个 token 线性扫全部键（3.6 万键约 2ms）；超大仓库可换 n-gram 倒排。
+    let mut by_token = HashMap::<String, HashSet<&str>>::new();
+    let mut scores = HashMap::<&str, usize>::new();
     for term in terms {
         let tokens = search_index_tokens(term).collect::<Vec<_>>();
         if tokens.is_empty() {
-            continue;
-        }
-        // 先交最短倒排表；借用其余表的字符串，避免每个 token 克隆文件路径。
-        // 增量快照的 postings 未必有序，不能直接 binary_search。
-        let mut postings = Vec::new();
-        for token in tokens {
-            let Some(files) = index.postings.get(&token) else {
-                postings.clear();
-                break;
-            };
-            postings.push(files);
-        }
-        postings.sort_by_key(|files| files.len());
-        let mut per_term = postings.first().map(|files| (***files).clone()).unwrap_or_default();
-        for files in postings.iter().skip(1) {
-            let membership = files.iter().collect::<HashSet<_>>();
-            per_term.retain(|file| membership.contains(file));
-            if per_term.is_empty() {
-                break;
+            // CJK/纯符号词切不出 token，倒排表答不了：全部文件都要逐行扫。
+            for file in index.contents.keys() {
+                scores.entry(file).or_default();
             }
-        }
-        // SQL/build/config 等超高频词不具备候选收敛能力。查询同时有 roblox 这类
-        // 稀有锚点时跳过泛词，避免一个泛词把候选重新膨胀到全仓。
-        if per_term.len() > SEARCH_INDEX_MAX_CANDIDATES {
-            wide_candidates.extend(per_term);
             continue;
         }
-        usable = true;
-        for file in per_term {
+        let mut per_term: Option<HashSet<&str>> = None;
+        for token in tokens {
+            let files = by_token.entry(token).or_insert_with_key(|token| {
+                index
+                    .postings
+                    .iter()
+                    .filter(|(key, _)| key.contains(token.as_str()))
+                    .flat_map(|(_, files)| files.iter().map(String::as_str))
+                    .collect()
+            });
+            per_term = Some(match per_term {
+                None => files.clone(),
+                Some(prev) => prev.intersection(files).copied().collect(),
+            });
+        }
+        for file in per_term.unwrap_or_default() {
             *scores.entry(file).or_default() += 1;
         }
     }
-    if !usable && !wide_candidates.is_empty() {
-        for file in wide_candidates {
-            scores.insert(file, 1);
-        }
-        usable = true;
-    }
-    if !usable || scores.is_empty() {
+    if scores.is_empty() {
         return None;
     }
+    // 命中词数多的文件先扫：触到 MAX_HIT_LINES 时保住的是最相关的行。
     let mut candidates = scores.into_iter().collect::<Vec<_>>();
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    candidates.truncate(SEARCH_INDEX_MAX_CANDIDATES);
-    Some(candidates.into_iter().map(|(file, _)| file).collect())
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    Some(candidates.into_iter().map(|(file, _)| file.to_string()).collect())
 }
 
 #[cfg(test)]
@@ -3703,6 +3692,10 @@ fn co_changed_files(
     revision: &str,
 ) -> CoChangeResult {
     if seed_files.is_empty() { return Some(Vec::new()); }
+    // 非 git 目录没有历史可查，是"零共改"而非"检索失败"；空仓库仍走 git log 判定。
+    if revision == "unknown" && git_value(root, &["rev-parse", "--is-inside-work-tree"]) != "true" {
+        return Some(Vec::new());
+    }
     let mut seeds = seed_files.iter().take(4).cloned().collect::<Vec<_>>();
     seeds.sort();
     seeds.dedup();
@@ -4572,10 +4565,21 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     }
     // 高频泛词（如 build/mode 命中数百行）不作为种子：其"定义"多半是无关同名函数，
     // 会经由 plannedTerms 二次检索把 build 脚本等噪声反馈回排名。
-    seed_terms
-        .retain(|term| term_freq.get(&term.to_lowercase()).copied().unwrap_or(0) <= SEED_FREQ_CAP);
+    // 例外：调用方显式给出、全仓仅 1-2 处全等导出定义的关键词（如被文档/提示词大量提及的
+    // 工具名 polaris）只按全等定义作种子；否则真实定义拿不到 strong seed，文档压制
+    // 不生效，文件名同主题的文档会占满展开槽位。只认导出定义：测试脚本里的局部
+    // `const workflow` 不是"workflow"这个泛词的定义，提成种子会挤掉真正的实现文件。
+    let frequent = |term: &str| term_freq.get(&term.to_lowercase()).copied().unwrap_or(0) > SEED_FREQ_CAP;
+    seed_terms.retain(|term| {
+        !frequent(term)
+            || (keywords.contains(term)
+                && index.defs.get(term).is_some_and(|defs| {
+                    (1..=2).contains(&defs.len()) && defs.iter().all(|def| def.symbol.exp)
+                }))
+    });
     for keyword in &seed_terms {
         let lower = keyword.to_lowercase();
+        let exact_only = frequent(keyword);
         for name in &def_names {
             let weight = if name == keyword {
                 3
@@ -4586,7 +4590,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
             } else {
                 0
             };
-            if weight == 0 {
+            if weight == 0 || (exact_only && weight < 3) {
                 continue;
             }
             for definition in index.defs.get(name).into_iter().flatten() {
@@ -6710,13 +6714,28 @@ mod tests {
         }
         fs::write(d.path().join("src/target.rs"),
             format!("pub fn polaris() {{\n{}\n}}\n{}", "    do_work();\n".repeat(100), "// padding\n".repeat(300))).unwrap();
-        let legacy = fast_context_run(d.path(), &serde_json::json!({
-            "keywords":["polaris"], "_legacyUnitOrder": true
-        })).unwrap();
-        assert!(!legacy.contains("pub fn polaris()"), "fixture must reproduce the old omission: {legacy}");
         let out = fast_context_run(d.path(), &serde_json::json!({"keywords":["polaris"]})).unwrap();
         assert!(out.contains("pub fn polaris()"), "{out}");
         assert!(out.len() <= DEFAULT_HARD_BYTES);
+    }
+
+    #[test]
+    fn frequent_keyword_with_unique_definition_still_seeds() {
+        // 工具名在实验文档里被大量提及（超 SEED_FREQ_CAP），文件名还同主题：
+        // 唯一真实定义仍须作为种子展开，不能被文档挤掉。
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("bench")).unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        for i in 0..10 {
+            fs::write(d.path().join(format!("bench/polaris-round{i}.md")),
+                "polaris 实验记录，延迟与召回对比。\n".repeat(30)).unwrap();
+        }
+        fs::write(d.path().join("src/context.rs"),
+            format!("pub fn polaris() {{\n{}}}\n", "    step();\n".repeat(40))).unwrap();
+        let out = fast_context_run(d.path(), &serde_json::json!({"keywords":["polaris"]})).unwrap();
+        assert!(out.contains("pub fn polaris()"), "{out}");
+        let first = out.lines().find(|line| line.starts_with("### ")).unwrap_or_default();
+        assert!(first.starts_with("### src/context.rs"), "definition must outrank docs: {out}");
     }
 
     #[test]
@@ -6975,14 +6994,16 @@ mod tests {
     }
 
     #[test]
-    fn indexed_candidates_ignore_wide_terms_when_a_rare_anchor_exists() {
+    fn indexed_candidates_match_substrings_and_rank_rare_anchor_first() {
         let root = tempdir().unwrap();
         // 全文索引只认 git 仓库：测试目录补一个 .git 占位。
         fs::create_dir(root.path().join(".git")).unwrap();
         fs::write(root.path().join("rare.go"), "roblox sql query").unwrap();
-        for index in 0..SEARCH_INDEX_MAX_CANDIDATES + 2 {
+        for index in 0..600 {
             fs::write(root.path().join(format!("wide-{index}.go")), "sql query").unwrap();
         }
+        // 整 token 是 `this.transition` / `usesqlpool`：子串语义下仍须是候选（与 rg 一致）。
+        fs::write(root.path().join("member.go"), "this.transition(usesqlpool)").unwrap();
         let files: Vec<String> = list_code_files(root.path()).iter().cloned().collect();
         let mut postings = HashMap::<String, Vec<String>>::new();
         let mut contents = HashMap::<String, String>::new();
@@ -7022,7 +7043,12 @@ mod tests {
 
         let candidates =
             indexed_candidate_files(root.path(), &["roblox".into(), "sql".into()]).unwrap();
-        assert_eq!(candidates, vec!["rare.go"]);
+        assert_eq!(candidates[0], "rare.go");
+        assert_eq!(candidates.len(), 602, "泛词不能被丢弃");
+        let candidates = indexed_candidate_files(root.path(), &["transition".into()]).unwrap();
+        assert_eq!(candidates, vec!["member.go"]);
+        let candidates = indexed_candidate_files(root.path(), &["工作流".into()]).unwrap();
+        assert_eq!(candidates.len(), 602, "切不出 token 的词要扫全部文件");
     }
 
     #[test]
@@ -7293,7 +7319,7 @@ mod tests {
         let d = tempdir().unwrap();
         fs::create_dir(d.path().join("src")).unwrap();
         for i in 0..8 {
-            let body = (0..35)
+            let body = (0..60)
                 .map(|n| format!("  const value_{i}_{n} = {n};"))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -7639,12 +7665,12 @@ mod tests {
             "export function alphaTarget(v) {\n  return v * 2;\n}\n",
         )
         .unwrap();
-        // 3 文件 × 4 调用函数：总量远超 8KB 硬顶，打包按 soft 封顶后暂缓一批，
-        // 回填应在硬顶内补回。文件数/每文件单元数都不触发结构性上限。
+        // 3 文件 × 4 调用函数（每块约 1KB）：总量远超 8KB 硬顶，打包按 soft（72%）
+        // 封顶最多放 5 块，回填应在硬顶内补回到 6 块以上。文件数/每文件单元数都不触发结构性上限。
         for m in 0..3 {
             let mut units = vec!["import { alphaTarget } from './core';\n".to_string()];
             for n in 0..4 {
-                let pad = (0..22)
+                let pad = (0..14)
                     .map(|i| format!("  const pad{m}_{n}_{i} = \"padding-value-{m}-{n}-{i}-aaaaaaaaaaaaaaaaaaaaaaaa\";"))
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -7667,7 +7693,7 @@ mod tests {
             .flat_map(|m| (0..4).map(move |n| (m, n)))
             .filter(|(m, n)| out.contains(&format!("block-{m}-{n}-marker")))
             .count();
-        assert!(markers >= 5, "markers={markers}\n{out}");
+        assert!(markers >= 6, "markers={markers}\n{out}");
     }
 
     #[test]
