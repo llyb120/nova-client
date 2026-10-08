@@ -28,23 +28,25 @@ function classify(item) {
   // 工具名只在 "·" 前缀段匹配；shell 命令正文里提到 polaris 不算调用
   const head = title.split("·")[0];
   const cmd = title.includes("·") ? title.split("·").slice(1).join("·").trim() : "";
-  if (/\bpolaris\b/.test(head)) return { tool: "polaris" };
-  if (/\b(edit|write)\b/.test(head) || /^修改 /.test(title)) {
-    // 单文件 edit：rawInput.path；批量：rawInput.files[].path
+  // 标题形如 "polaris"、"mcp__nova-tools__polaris"、"Lyra / fast_context"
+  if (item.kind !== "execute" && /(?:^|[\s_/])(polaris|fast_context)\b/.test(head)) return { tool: "polaris" };
+  if (item.kind === "edit" || /\b(edit|write)\b/i.test(head) || /^修改 /.test(title)) {
+    // 单文件 edit：rawInput.path / file_path；批量：rawInput.files[].path；兜底 locations
     const filesArr = Array.isArray(item.rawInput?.files) ? item.rawInput.files : null;
     const paths = filesArr?.map((f) => f.path).filter(Boolean);
     if (paths?.length) return { tool: "edit", paths };
-    const p = item.rawInput?.path || cmd;
+    const p = item.rawInput?.path || item.rawInput?.file_path || item.locations?.[0]?.path || cmd;
     return { tool: "edit", paths: p ? [p] : [] };
   }
   if (/\bread_files\b/.test(head)) {
     const paths = (item.rawInput?.paths || []).map((x) => x.path).filter(Boolean);
     return { tool: "read", n: Math.max(1, paths.length) };
   }
-  if (/\bread\b/.test(head)) return { tool: "read", n: 1 };
-  if (/\b(grep|glob|search)\b/.test(head) || item.kind === "search") return { tool: "search_cmd" };
-  if (/\b(shell|bash)\b/.test(head) || item.kind === "execute") {
-    if (SEARCH_CMD.test(cmd) || SEARCH_CMD.test(title)) return { tool: "search_cmd" };
+  if (item.kind === "read" || /\bread\b/i.test(head)) return { tool: "read", n: 1 };
+  if (/\b(grep|glob|search)\b/i.test(head) || item.kind === "search") return { tool: "search_cmd" };
+  if (/\b(shell|bash)\b/i.test(head) || item.kind === "execute") {
+    const command = item.rawInput?.command || cmd;
+    if (SEARCH_CMD.test(command) || SEARCH_CMD.test(title)) return { tool: "search_cmd" };
     return { tool: "bash_other" };
   }
   return { tool: "other" };
@@ -73,6 +75,15 @@ function filesInOutput(out) {
 }
 
 const key = (it) => it.id ?? it.ts ?? 0;
+
+// storageVersion 1：头文件只存 thread 元数据和 chunk 清单，items 分片在同名 .parts/ 目录
+function loadThread(path) {
+  const d = JSON.parse(readFileSync(path, "utf8"));
+  if (!d.storageVersion) return d;
+  const parts = path.replace(/\.json$/, ".parts");
+  const items = d.chunks.flatMap((c) => JSON.parse(readFileSync(join(parts, c), "utf8")).items);
+  return { ...d.thread, items };
+}
 
 function analyzeThread(d) {
   const cwd = d.cwd || "";
@@ -149,7 +160,7 @@ async function main() {
 
   const all = [];
   for (const f of files) {
-    try { all.push(analyzeThread(JSON.parse(readFileSync(join(dir, f), "utf8")))); } catch { /* 跳过损坏线程 */ }
+    try { all.push(analyzeThread(loadThread(join(dir, f)))); } catch { /* 跳过损坏线程 */ }
   }
   const turns = all.flatMap((t) => t.turns);
   const sc = turns.filter((t) => t.shouldCall);
