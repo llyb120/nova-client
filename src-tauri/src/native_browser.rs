@@ -1462,6 +1462,7 @@ async fn snapshot(
     app: &AppHandle,
     with_image: bool,
     args: &Value,
+    previous: Option<&Observation>,
 ) -> Result<(Observation, Value), String> {
     let mut region=args.get("region").filter(|v|!v.is_null()).cloned();
     if region.is_some() && args["ref"].is_string() {return Err("region 与 ref 裁剪不能同时提供".into());}
@@ -1637,12 +1638,30 @@ async fn snapshot(
         observation.screenshot = true;
     }
     observation.captured = std::time::Instant::now();
+    if let Some(ids) = carry_screenshot(&mut observation, previous) {
+        result["reusableImageIds"] = json!(ids);
+    }
     app.state::<BrowserState>()
         .observations
         .lock()
         .unwrap()
         .insert(active_label(app)?, observation.clone());
     Ok((observation, result))
+}
+
+/// A DOM-only refresh with the same URL/viewport/scroll/zoom stamp keeps the last screenshot usable:
+/// its coordinates still map 1:1 and every coordinate input re-checks the live pixels at the target.
+/// Without this, inspect or an act with DOM feedback forced another screenshot round-trip.
+fn carry_screenshot(observation: &mut Observation, previous: Option<&Observation>) -> Option<Vec<String>> {
+    let stamp = &observation.pages["pages"][0]["stamp"];
+    let previous = previous.filter(|p| !observation.screenshot && p.screenshot && stamp.is_string()
+        && p.pages["pages"][0]["stamp"] == *stamp && p.captured.elapsed() <= Duration::from_secs(180))?;
+    observation.screenshot = true;
+    observation.full_page = previous.full_page;
+    observation.images = previous.images.clone();
+    // Age stays the image's, so the 180s coordinate expiry is not extended by DOM refreshes.
+    observation.captured = previous.captured;
+    Some(observation.images.iter().map(|i| i.id.clone()).collect())
 }
 
 async fn control(
@@ -1687,18 +1706,18 @@ async fn control_session(
     let mut completed_action = None;
     let mut progress=InputProgress::default();
     let task=CONTROL_TAB.scope(s.active_tab.clone(),async {
-        if operation!="act" {return Ok(snapshot(app,operation=="screenshot",args).await?.1);}
+        let current=state.observations.lock().unwrap().get(&s.active_tab).cloned();
+        if operation!="act" {return Ok(snapshot(app,operation=="screenshot",args,current.as_ref()).await?.1);}
         let actions=parse_actions(args, if chrome { 16 } else { 8 })?;
         let all_dom=actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
-        let current=state.observations.lock().unwrap().get(&s.active_tab).cloned();
         let with_image=current.as_ref().is_some_and(|o|o.screenshot) || actions.iter().any(|a|matches!(a,Action::ClickAt{..}|Action::Move{..}|Action::Drag{..}|Action::ScrollAt{..}));
-        let Some(observation)=current.filter(|o|args["snapshotId"].as_str()==Some(&o.id) && (all_dom || o.captured.elapsed()<=Duration::from_secs(180))) else {
+        let Some(observation)=current.clone().filter(|o|args["snapshotId"].as_str()==Some(&o.id) && (all_dom || o.captured.elapsed()<=Duration::from_secs(180))) else {
             // Nothing was sent; attach a fresh observation so the model re-decides in this round-trip.
             let mut observe_args=args.clone();
             if let Some(a)=observe_args.as_object_mut() {for key in ["ref","frame","region"] {a.remove(key);}}
             observe_args["fullPage"]=json!(false);
             if with_image {observe_args["scope"]=json!("viewport");}
-            let mut fresh=snapshot(app,with_image,&observe_args).await?.1;
+            let mut fresh=snapshot(app,with_image,&observe_args,current.as_ref()).await?.1;
             fresh["status"]=json!("not_executed");fresh["completedActions"]=json!(0);fresh["inputAttempted"]=json!(false);
             fresh["reason"]=json!("snapshotId 不是该标签最新观察或观察已过期，本批次未执行；已附当前观察，用新的 snapshotId/ref/imageId 重新决策，不要重放");
             return Ok(fresh);
@@ -1750,7 +1769,7 @@ async fn control_session(
             if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
             let visual=args["feedback"]=="screenshot" || (args["feedback"].is_null() && observation.screenshot);
             // Feedback failure must never turn a completed mutation into a retryable action failure.
-            match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args)).await {
+            match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,Some(&observation))).await {
                 Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
                 Ok(Err(error)) => result["observationError"] = json!(error),
                 Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
@@ -2326,6 +2345,25 @@ mod tests {
         assert_eq!(k("Ctrl+1").unwrap().1, "Digit1");
         assert_eq!(k("Space").unwrap().0, " ");
         for bad in ["a", "Shift+a", "F13", "Hyper+A", "Ctrl+", "Ctrl+Foo"] { assert!(key_spec(bad).is_none(), "{bad}"); }
+    }
+
+    #[test]
+    fn dom_refresh_keeps_screenshot_only_for_the_same_viewport() {
+        let observed = |id: &str, stamp: Value, shot: bool| Observation { frames: Vec::new(), id: id.into(),
+            pages: json!({"pages":[{"stamp":stamp}]}), captured: std::time::Instant::now(), screenshot: shot, full_page: false,
+            images: if shot { vec![ScreenshotImage { id: format!("{id}-0"), path: "a.png".into(), x: 0., y: 0., width: 10., height: 10., pixels: (10, 10) }] } else { Vec::new() } };
+        let shot = observed("old", json!("[\"u\",0]"), true);
+        let mut same = observed("new", json!("[\"u\",0]"), false);
+        assert_eq!(carry_screenshot(&mut same, Some(&shot)), Some(vec!["old-0".to_string()]));
+        assert!(same.screenshot && same.captured == shot.captured && same.images[0].id == "old-0");
+        // Scrolled/navigated, unknown stamp, no prior image, or already a fresh screenshot: nothing carried.
+        for (mut next, previous) in [(observed("new", json!("[\"u\",9]"), false), Some(&shot)), (observed("new", Value::Null, false), Some(&observed("old", Value::Null, true))),
+            (observed("new", json!("[\"u\",0]"), false), Some(&observed("old", json!("[\"u\",0]"), false))), (observed("new", json!("[\"u\",0]"), true), Some(&shot)),
+            (observed("new", json!("[\"u\",0]"), false), None)] {
+            let had = next.screenshot;
+            assert_eq!(carry_screenshot(&mut next, previous), None);
+            assert_eq!(next.screenshot, had);
+        }
     }
 
     #[test]
