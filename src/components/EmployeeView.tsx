@@ -7,7 +7,7 @@ import type { AgentKind } from "../types";
 import { ModelPicker } from "./ConfigSelects";
 import "./EmployeeView.css";
 
-type Duty = { id: string; text: string; enabled: boolean; note: string; lastRunAt: number; lastResult: string };
+type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; lastRunAt: number; lastResult: string };
 type Todo = { id: string; text: string; confirm: boolean; createdAt: number; threadId?: string | null };
 type Run = { at: number; dutyId: string; result: string; threadId: string };
 type Snapshot = {
@@ -110,6 +110,12 @@ export default function EmployeeView() {
                         if (text !== duty.text) await run("employee_do", { action: "duty_edit", id: duty.id, text });
                         setDraft(null);
                       };
+                      const [noteDraft, setNoteDraft] = createSignal<string | null>(null);
+                      const saveNote = async () => {
+                        const note = noteDraft()?.trim() ?? "";
+                        if (note !== duty.note) await run("employee_do", { action: "duty_note", id: duty.id, text: note });
+                        setNoteDraft(null);
+                      };
                       return (
                       <li>
                         <input type="checkbox" checked={duty.enabled} aria-label={`启用职责：${duty.text}`}
@@ -127,12 +133,33 @@ export default function EmployeeView() {
                               <button type="button" onClick={() => setDraft(null)}>取消</button>
                             </div>
                           </Show>
-                          <small>上次 {time(duty.lastRunAt)}{duty.lastResult ? ` · ${duty.lastResult}` : ""}</small>
+                          <small>
+                            <label title="留空：按职责描述里的时间要求判断">每 <input type="number" min="0" max="10080" placeholder="—"
+                              value={duty.everyMinutes || ""} aria-label="执行间隔（分钟）"
+                              onChange={(ev) => void run("employee_do", { action: "duty_every", id: duty.id, text: ev.currentTarget.value })} /> 分钟 · </label>
+                            上次 {time(duty.lastRunAt)}{duty.lastResult ? ` · ${duty.lastResult}` : ""}
+                          </small>
+                          <Show when={noteDraft() !== null} fallback={<Show when={duty.note}>
+                            <small class="employee-note">备注：{duty.note}</small>
+                          </Show>}>
+                            <textarea rows={3} aria-label="编辑备注" placeholder="员工的备忘，留空即清除" value={noteDraft() ?? ""}
+                              ref={(el) => queueMicrotask(() => el.focus())}
+                              onInput={(ev) => setNoteDraft(ev.currentTarget.value)}
+                              onKeyDown={(ev) => {
+                                if (ev.key === "Escape") setNoteDraft(null);
+                                else if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); void saveNote(); }
+                              }} />
+                            <div>
+                              <button type="button" onClick={() => void saveNote()}>保存备注</button>
+                              <button type="button" onClick={() => setNoteDraft(null)}>取消</button>
+                            </div>
+                          </Show>
                         </div>
                         <details class="employee-more">
                           <summary aria-label="更多操作">⋯</summary>
                           <div>
                             <button type="button" onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; setDraft(duty.text); }}>编辑</button>
+                            <button type="button" onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; setNoteDraft(duty.note); }}>编辑备注</button>
                             <button type="button" onClick={() => void act("duty_run", duty.id)}>立即执行</button>
                             <button type="button" onClick={() => void act("duty_delete", duty.id)}>删除</button>
                           </div>

@@ -20,6 +20,7 @@ const MAX_NOTE_BYTES: usize = 1024;
 const MAX_INBOX: usize = 100;
 const MAX_RUNS: usize = 200;
 const MIN_CONFIDENCE: f64 = 0.6;
+const MAX_EVERY_MINUTES: u64 = 7 * 24 * 60;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
@@ -62,6 +63,8 @@ pub struct Duty {
     pub text: String,
     pub enabled: bool,
     pub note: String,
+    /// >0：固定每 N 分钟执行一次（距上次结束），不经 JEV；0：按原文由心跳判断。
+    pub every_minutes: u32,
     pub last_run_at: i64,
     pub last_result: String,
 }
@@ -84,6 +87,16 @@ pub struct Run {
     pub duty_id: String,
     pub result: String,
     pub thread_id: String,
+}
+
+impl Duty {
+    /// 备注是针对旧职责写的，留着会让员工继续按旧要求办事，改了文本就清空。
+    fn set_text(&mut self, text: String) {
+        if text != self.text {
+            self.text = text;
+            self.note.clear();
+        }
+    }
 }
 
 impl Employee {
@@ -245,6 +258,14 @@ fn reschedule(employee: &Employee) {
     runtime(|rt| rt.next_check_at = at);
 }
 
+/// 固定间隔职责里最早到点的一条及其到点时间（从未执行过的立即到点）。
+fn interval_next(employee: &Employee) -> Option<(i64, &Duty)> {
+    employee.duties.iter()
+        .filter(|d| d.enabled && d.every_minutes > 0)
+        .map(|d| (d.last_run_at + d.every_minutes as i64 * 60_000, d))
+        .min_by_key(|(at, _)| *at)
+}
+
 // ---------- 心跳 ----------
 
 pub fn start(app: AppHandle) {
@@ -256,22 +277,30 @@ pub fn start(app: AppHandle) {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             watch(&app).await;
-            if now_ms() < runtime(|rt| rt.next_check_at) {
+            // ponytail: 每秒读一次 employee.json（几 KB）；嫌开销再改为缓存最早到点时间。
+            let Ok(employee) = load() else { continue };
+            let slot_due = now_ms() >= runtime(|rt| rt.next_check_at);
+            let interval_due = interval_next(&employee).is_some_and(|(at, _)| at <= now_ms());
+            if !slot_due && !interval_due {
                 continue;
             }
-            let Ok(employee) = load() else { continue };
             let now = chrono::Local::now();
             use chrono::Timelike;
             if !employee.enabled || !in_work_hours(&employee.work_start, &employee.work_end, now.hour() * 60 + now.minute()) {
                 // 未值班或已下班：这个点作废，排到下一个有效点。
-                reschedule(&employee);
+                if slot_due {
+                    reschedule(&employee);
+                }
                 continue;
             }
             let idle = system_idle_ms().is_some_and(|ms| ms >= employee.idle_minutes as u64 * 60_000);
             if !idle || runtime(|rt| rt.current.is_some()) {
                 continue; // 挂起：等用户离开 / 当前会话结束再补上这一次
             }
-            reschedule(&employee);
+            // 间隔职责优先；检查点留着挂起，等它跑完再做 JEV 分诊。
+            if !interval_due {
+                reschedule(&employee);
+            }
             if let Err(error) = heartbeat(&app, false).await {
                 eprintln!("[employee] heartbeat failed: {error}");
             }
@@ -291,7 +320,21 @@ async fn heartbeat(app: &AppHandle, manual: bool) -> Result<String, String> {
     }
     runtime(|rt| rt.yielded = false);
     let employee = load()?;
-    let duties: Vec<&Duty> = employee.duties.iter().filter(|d| d.enabled).collect();
+    if let Some((_, duty)) = interval_next(&employee).filter(|(at, _)| *at <= now_ms()) {
+        let started = run_duty(app, duty, !manual);
+        if let Err(error) = &started {
+            // 记下这次失败，否则同一条职责会每秒重试。
+            let _ = update(|e| {
+                if let Some(d) = e.duties.iter_mut().find(|d| d.id == duty.id) {
+                    d.last_run_at = now_ms();
+                    d.last_result = clip(&format!("启动失败：{error}"), 120);
+                }
+                Ok(())
+            });
+        }
+        return started.map(|_| format!("已开始：{}", clip(&duty.text, 40)));
+    }
+    let duties: Vec<&Duty> = employee.duties.iter().filter(|d| d.enabled && d.every_minutes == 0).collect();
     let todo = employee.inbox.iter().find(|t| !t.confirm).cloned();
     if duties.is_empty() && todo.is_none() {
         return Ok("没有启用的职责或待办".into());
@@ -332,10 +375,11 @@ async fn heartbeat(app: &AppHandle, manual: bool) -> Result<String, String> {
     };
     let job = match picked.as_deref() {
         Some("inbox") => todo.map(Job::Inbox),
+        // JEV 要等几秒，期间职责可能被改/删/停用：按 id 重读最新的再执行。
         Some(choice) => choice
             .strip_prefix("duty_")
-            .and_then(|id| duties.iter().find(|d| d.id == id))
-            .map(|d| Job::Duty((*d).clone())),
+            .and_then(|id| load().ok()?.duties.into_iter().find(|d| d.id == id && d.enabled))
+            .map(Job::Duty),
         None => None,
     };
     match job {
@@ -348,9 +392,15 @@ async fn heartbeat(app: &AppHandle, manual: bool) -> Result<String, String> {
 }
 
 fn run_duty(app: &AppHandle, duty: &Duty, auto: bool) -> Result<(), String> {
-    let note = if duty.note.is_empty() { String::new() } else { format!("\n你上次留下的备注：\n{}", duty.note) };
+    let note = if duty.note.is_empty() { String::new() } else {
+        format!("\n你上次留下的备注（仅供参考；与上面的职责原文冲突时一律以职责原文为准，并改写备注）：\n{}", duty.note)
+    };
+    let every = if duty.every_minutes == 0 { String::new() } else {
+        format!("\n本职责当前每 {} 分钟执行一次；若频率明显不合适（如连续多次无变化可放慢、变化很快需加密），\
+                 可用 employee action=update id={} everyMinutes=… 自行调整，职责原文另有约束时以原文为准。", duty.every_minutes, duty.id)
+    };
     launch(app, &duty.id, &format!("职责：{}", clip(&duty.text, 40)),
-        &format!("执行职责（id={}）：\n{}{note}\n需要留给下次的备忘可用 employee action=update id={} note=… 覆盖写。", duty.id, duty.text, duty.id), auto)
+        &format!("执行职责（id={}）：\n{}{note}{every}\n需要留给下次的备忘可用 employee action=update id={} note=… 覆盖写。", duty.id, duty.text, duty.id), auto)
 }
 
 const RULES: &str = "你是 Nova 数字员工，正在无人值守地执行一件事。规则：\n\
@@ -500,6 +550,7 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
     let s = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
     let id = || s("id").ok_or("缺少 id");
     let text = || s("text").ok_or("缺少 text");
+    let every = || args["everyMinutes"].as_u64().map(|v| v.min(MAX_EVERY_MINUTES) as u32);
     match args["action"].as_str().unwrap_or_default() {
         "list" => {
             let e = load()?;
@@ -511,7 +562,7 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
             match args["kind"].as_str() {
                 Some("duty") => {
                     let id = e.new_id("d");
-                    e.duties.push(Duty { id: id.clone(), text, enabled: true, ..Default::default() });
+                    e.duties.push(Duty { id: id.clone(), text, enabled: true, every_minutes: every().unwrap_or(0), ..Default::default() });
                     Ok(json!({"ok": true, "id": id}))
                 }
                 Some("todo") => {
@@ -525,9 +576,10 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
         "update" => update(|e| {
             let id = id()?;
             let duty = e.duties.iter_mut().find(|d| d.id == id).ok_or("没有这条职责")?;
-            if let Some(text) = s("text") { duty.text = text; }
+            if let Some(text) = s("text") { duty.set_text(text); }
             if let Some(note) = args["note"].as_str() { duty.note = note.to_string(); }
             if let Some(enabled) = args["enabled"].as_bool() { duty.enabled = enabled; }
+            if let Some(v) = every() { duty.every_minutes = v; }
             Ok(json!({"ok": true}))
         }),
         "done" => update(|e| {
@@ -574,6 +626,10 @@ pub fn employee_get() -> Result<Value, String> {
         };
         (status, rt.current.as_ref().map(|c| c.thread_id.clone()), rt.next_check_at)
     });
+    let next_check_at = match interval_next(&employee) {
+        Some((at, _)) if employee.enabled => next_check_at.min(at.max(now_ms())),
+        _ => next_check_at,
+    };
     Ok(json!({"employee": employee, "status": status, "threadId": thread_id, "nextCheckAt": next_check_at,
         "idleSupported": cfg!(windows)}))
 }
@@ -617,6 +673,11 @@ pub async fn employee_do(app: AppHandle, action: String, id: Option<String>, tex
             Ok(())
         }),
         "duty_edit" => execute_tool(&json!({"action": "update", "id": id, "text": text.ok_or("缺少 text")?})).map(|_| ()),
+        "duty_note" => execute_tool(&json!({"action": "update", "id": id, "note": text.unwrap_or_default()})).map(|_| ()),
+        "duty_every" => {
+            let minutes: u64 = text.as_deref().map(str::trim).filter(|t| !t.is_empty()).unwrap_or("0").parse().map_err(|_| "间隔应为整数分钟")?;
+            execute_tool(&json!({"action": "update", "id": id, "everyMinutes": minutes})).map(|_| ())
+        }
         "duty_delete" | "dismiss" => execute_tool(&json!({"action": "done", "id": id})).map(|_| ()),
         "duty_run" => {
             let duty = load()?.duties.into_iter().find(|d| d.id == id).ok_or("没有这条职责")?;
@@ -642,7 +703,7 @@ pub fn employee_say(app: AppHandle, text: String) -> Result<(), String> {
     }
     launch(&app, "say", &format!("对员工说：{}", clip(text, 30)), &format!(
         "用户在数字员工页面对你说：\n{text}\n\n先用 employee action=list 看现状，再用 employee 工具增改职责、派发待办或回答问题。\
-         职责写成可独立执行的一句话，包含时间/频率要求与授权范围。除非用户要求立刻去做，否则只改配置不执行。"), false)
+         职责写成可独立执行的一句话，包含时间/频率要求与授权范围；“每隔 N 分钟/小时”这类不挑具体时刻的频率同时设 everyMinutes。除非用户要求立刻去做，否则只改配置不执行。"), false)
 }
 
 #[cfg(test)]
@@ -671,6 +732,27 @@ mod tests {
         assert_eq!(next_slot(at(9, 30, 8, 50, 0), "09:10", "18:00"), at(9, 30, 9, 10, 0));
         assert_eq!(next_slot(at(9, 30, 23, 50, 0), "22:00", "06:00"), at(10, 1, 0, 0, 0));
         assert_eq!(next_slot(at(9, 30, 12, 0, 0), "22:00", "06:00"), at(9, 30, 22, 0, 0));
+    }
+
+    #[test]
+    fn interval_next_picks_earliest_enabled_interval_duty() {
+        let duty = |id: &str, every, last, enabled| Duty { id: id.into(), text: "x".into(), enabled, every_minutes: every, last_run_at: last, ..Default::default() };
+        let mut e = Employee::default();
+        e.duties = vec![duty("a", 0, 0, true), duty("b", 5, 600_000, true), duty("c", 1, 0, false)];
+        assert_eq!(interval_next(&e).map(|(at, d)| (at, d.id.as_str())), Some((900_000, "b")));
+        e.duties = vec![duty("d", 30, 0, true)]; // 从未执行 → 立即到点
+        assert!(interval_next(&e).is_some_and(|(at, _)| at <= now_ms()));
+        e.duties[0].every_minutes = 0;
+        assert!(interval_next(&e).is_none());
+    }
+
+    #[test]
+    fn editing_duty_text_drops_stale_note() {
+        let mut d = Duty { id: "d1".into(), text: "每10分钟".into(), note: "旧备注".into(), ..Default::default() };
+        d.set_text("每10分钟".into());
+        assert_eq!(d.note, "旧备注");
+        d.set_text("每1分钟".into());
+        assert!(d.note.is_empty());
     }
 
     #[test]

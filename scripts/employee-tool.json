@@ -1,6 +1,6 @@
 {
   "name": "employee",
-  "description": "Nova 数字员工的职责与待办。用户在任何会话里说“交给员工：xxx”时，调用 add(kind=todo,text=xxx) 记下后告知用户已交给员工，不要自己去做。list 查看职责/待办/最近运行；add 新增职责(kind=duty)或待办(kind=todo)；update 修改职责 text/enabled 或覆盖写 note（≤1KB，员工自己的备忘）；done 删除已处理的待办/待确认，或移除职责；ask 把没有明确授权的不可逆操作（支付、删除、对外发送、提交审批等）记为待确认并通知用户，然后停止该操作。只能通过本工具修改员工数据。",
+  "description": "Nova 数字员工的职责与待办。用户在任何会话里说“交给员工：xxx”时，调用 add(kind=todo,text=xxx) 记下后告知用户已交给员工，不要自己去做。list 查看职责/待办/最近运行；add 新增职责(kind=duty)或待办(kind=todo)；“每隔 N 分钟/小时”这类不挑具体时刻的职责设 everyMinutes，到点即执行，员工可按实际情况自行调快调慢；update 修改职责 text/enabled/everyMinutes 或覆盖写 note（≤1KB，员工自己的备忘）；done 删除已处理的待办/待确认，或移除职责；ask 把没有明确授权的不可逆操作（支付、删除、对外发送、提交审批等）记为待确认并通知用户，然后停止该操作。只能通过本工具修改员工数据。",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -9,7 +9,8 @@
       "id": { "type": "string", "description": "update/done 的目标 id（来自 list）" },
       "text": { "type": "string", "minLength": 1, "maxLength": 500, "description": "add/ask 必填；update 可选" },
       "note": { "type": "string", "maxLength": 1024, "description": "update 可选，覆盖写职责备注" },
-      "enabled": { "type": "boolean", "description": "update 可选，启用/停用职责" }
+      "enabled": { "type": "boolean", "description": "update 可选，启用/停用职责" },
+      "everyMinutes": { "type": "integer", "minimum": 0, "maximum": 10080, "description": "职责 add/update 可选：每隔多少分钟执行一次（距上次结束）；0 表示按职责原文的时间要求由心跳判断" }
     },
     "required": ["action"],
     "additionalProperties": false
