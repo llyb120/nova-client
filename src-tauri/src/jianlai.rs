@@ -491,11 +491,12 @@ fn detail_region(pixels: (u32,u32), p: (u32,u32)) -> Region {
     Region { x:p.0.saturating_sub(width/2).min(pixels.0-width), y:p.1.saturating_sub(height/2).min(pixels.1-height), width, height }
 }
 
-fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>, actions: &[Action]) -> Result<&'a Shot> {
+fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>) -> Result<&'a Shot> {
     if let Some(id) = image_id {
         if let Some(shot) = shots.iter().find(|s| s.image_id == id) { return Ok(shot); }
-    } else if shots.len() == 1 && !actions.is_empty() && actions.iter().all(|a| matches!(a.action.as_str(), "press" | "type" | "wait")) {
-        return Ok(&shots[0]);
+    } else if let [only] = shots {
+        // snapshotId already pins this single image; demanding imageId only cost a retry.
+        return Ok(only);
     }
     Err(format!("imageId缺失或不属于此截图；可用imageId：{}。沿用当前snapshotId并修正imageId，无需重新截图；裁剪图坐标从(0,0)开始，不加region偏移", shots.iter().map(|s| s.image_id.as_str()).collect::<Vec<_>>().join(", ")))
 }
@@ -1019,7 +1020,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 return Err("windowId与截图不符".into());
             }
             let actions = request.actions.ok_or("缺少actions")?;
-            let shot = action_shot(&snap.shots, request.image_id.as_deref(), &actions)?.clone();
+            let shot = action_shot(&snap.shots, request.image_id.as_deref())?.clone();
             if actions.is_empty() || actions.len() > 16 {
                 return Err("每次需要1至16个动作".into());
             }
@@ -1366,14 +1367,11 @@ mod tests {
             pixels: (3840, 2160),
             source_pixels: (3840, 2160), region: None,
         };
-        let keyboard: Vec<Action> = serde_json::from_value(json!([{"action":"press","key":"Alt+Tab"}])).unwrap();
         let shots = vec![shot.clone()];
-        assert_eq!(action_shot(&shots, None, &keyboard).unwrap().image_id, "test");
-        assert!(action_shot(&shots, Some("wrong"), &keyboard).is_err());
-        assert!(action_shot(&[shot.clone(), shot.clone()], None, &keyboard).is_err());
-        let click: Vec<Action> = serde_json::from_value(json!([{"action":"click","x":1,"y":1}])).unwrap();
-        assert!(action_shot(&shots, None, &click).is_err());
-        assert!(action_shot(&shots, Some("test"), &click).is_ok());
+        assert_eq!(action_shot(&shots, None).unwrap().image_id, "test");
+        assert!(action_shot(&shots, Some("wrong")).is_err());
+        assert!(action_shot(&[shot.clone(), shot.clone()], None).is_err());
+        assert!(action_shot(&shots, Some("test")).is_ok());
         assert_eq!(point(&shot, Some(1920), Some(1080)).unwrap(), (-960, 540));
         assert!(point(&shot, Some(3840), Some(0)).is_err());
         assert!(point(&shot, Some(-1), Some(0)).is_err());

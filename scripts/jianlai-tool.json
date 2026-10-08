@@ -165,7 +165,7 @@
       },
       "imageId": {
         "type": "string",
-        "description": "act用最新图片imageId；只有一张图且全为press/type/wait时可省略"
+        "description": "act用最新图片imageId；只有一张图时可省略"
       },
       "feedback": {
         "type": "string",
