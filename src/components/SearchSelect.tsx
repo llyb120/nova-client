@@ -5,6 +5,16 @@ import { IconCheck, IconChevron, IconEye, IconStar } from "./icons";
 
 const FAVORITE_GROUP = "收藏";
 const FAVORITE_BACKEND = "__favorites__";
+/** 每个模型（父项 value）上次选的强度 value */
+const LAST_EFFORTS_KEY = "nova.modelLastEfforts";
+
+function readLastEfforts(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(LAST_EFFORTS_KEY) ?? "{}") ?? {};
+  } catch {
+    return {};
+  }
+}
 
 export interface SelectOption {
   value: string;
@@ -28,7 +38,7 @@ export interface SelectOption {
   vision?: boolean;
   /** 跨后端唯一的收藏标识；未提供时该选项不显示收藏按钮 */
   favoriteId?: string;
-  /** 下一级（思考强度）；选本项即用默认强度 */
+  /** 下一级（思考强度）；选本项沿用上次强度，没有记录才用默认 */
   efforts?: SelectOption[];
   /** 在下一级列里的短名（如 "High"），label 保留完整名供触发器显示 */
   short?: string;
@@ -262,7 +272,19 @@ export function SearchSelect(props: {
     );
   });
 
+  /** 直接选模型时沿用该模型上次选的强度（仍在档位里才用），没有记录才用默认 */
+  const pickModel = (o: SelectOption) => {
+    const last = o.efforts?.length ? readLastEfforts()[o.value] : undefined;
+    pick(last && o.efforts!.some((e) => e.value === last) ? last : o.value);
+  };
+
   const pick = (v: string) => {
+    const parent = props.options.find(
+      (o) => o.efforts?.length && (o.value === v || o.efforts.some((e) => e.value === v)),
+    );
+    if (parent) {
+      localStorage.setItem(LAST_EFFORTS_KEY, JSON.stringify({ ...readLastEfforts(), [parent.value]: v }));
+    }
     props.onChange(
       v,
       flatOptions().find((o) => o.value === v),
@@ -370,7 +392,7 @@ export function SearchSelect(props: {
       class={`sel-item ${showBackend ? "with-source" : ""} ${isActive(o) ? "active" : ""} ${
         o.efforts?.length && effortModel() === o ? "open" : ""
       }`}
-      onClick={() => pick(o.value)}
+      onClick={() => pickModel(o)}
       onMouseEnter={() => setActiveModel(o.value)}
       title={o.title ?? o.value}
     >
