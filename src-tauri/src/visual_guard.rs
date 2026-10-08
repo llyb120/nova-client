@@ -22,7 +22,9 @@ impl VisualGuard {
         Self { width, height, source: image.dimensions(), step, pixels: std::sync::Arc::new(pixels) }
     }
 
-    pub(crate) fn changed_near(&self, current: &RgbaImage, x: f64, y: f64) -> bool {
+    /// `core_only`: the batch's own earlier input legitimately changed the neighbourhood
+    /// (typed text, ticked checkbox); only an overlay or shift right under the target counts.
+    pub(crate) fn changed_near(&self, current: &RgbaImage, x: f64, y: f64, core_only: bool) -> bool {
         if current.dimensions() != self.source || !x.is_finite() || !y.is_finite()
             || x < 0. || y < 0. || x >= self.source.0 as f64 || y >= self.source.1 as f64 {
             return true;
@@ -44,7 +46,7 @@ impl VisualGuard {
         }
         // Ignore small anti-aliasing/caret noise and unrelated animation elsewhere.
         // A changed centre or substantially changed neighbourhood requires a new observation.
-        total == 0 || changed * 100 > total * 12 || core_changed * 100 > core * 35
+        total == 0 || (!core_only && changed * 100 > total * 12) || core_changed * 100 > core * 35
     }
 }
 
@@ -53,7 +55,7 @@ pub(crate) fn patch_changed(before: &RgbaImage, after: &RgbaImage) -> bool {
     let after = if before.dimensions() == after.dimensions() { after.clone() } else {
         xcap::image::imageops::resize(after, before.width(), before.height(), xcap::image::imageops::FilterType::Triangle)
     };
-    VisualGuard::new(before).changed_near(&after, before.width() as f64 / 2., before.height() as f64 / 2.)
+    VisualGuard::new(before).changed_near(&after, before.width() as f64 / 2., before.height() as f64 / 2., false)
 }
 
 #[cfg(test)]
@@ -66,21 +68,27 @@ mod tests {
         let guard = VisualGuard::new(&original);
         let mut current = original.clone();
         for y in 0..40 { for x in 180..240 { current.put_pixel(x,y,Rgba([255,0,0,255])); } }
-        assert!(!guard.changed_near(&current, 30., 60.));
+        assert!(!guard.changed_near(&current, 30., 60., false));
         for y in 52..68 { current.put_pixel(30,y,Rgba([255,255,255,255])); }
-        assert!(!guard.changed_near(&current, 30., 60.));
+        assert!(!guard.changed_near(&current, 30., 60., false));
+        // Typed text beside the target: stale for a fresh batch, fine after the batch's own input.
+        let mut typed = original.clone();
+        for y in 40..56 { for x in 10..60 { typed.put_pixel(x,y,Rgba([0,0,0,255])); } }
+        assert!(guard.changed_near(&typed, 30., 60., false));
+        assert!(!guard.changed_near(&typed, 30., 60., true));
         for y in 56..65 { for x in 26..35 { current.put_pixel(x,y,Rgba([0,255,0,255])); } }
-        assert!(guard.changed_near(&current, 30., 60.));
-        assert!(guard.changed_near(&current, f64::NAN, 60.));
-        assert!(guard.changed_near(&RgbaImage::new(240,141),30.,60.));
+        assert!(guard.changed_near(&current, 30., 60., false));
+        assert!(guard.changed_near(&current, 30., 60., true));
+        assert!(guard.changed_near(&current, f64::NAN, 60., false));
+        assert!(guard.changed_near(&RgbaImage::new(240,141),30.,60.,false));
     }
     #[test]
     fn high_dpi_and_image_boundaries_are_bounded() {
         let original=RgbaImage::from_pixel(3840,2160,Rgba([15,15,15,255]));
         let guard=VisualGuard::new(&original);
         assert!(guard.pixels.len() <= 1600 * 1600);
-        assert!(!guard.changed_near(&original,3839.,2159.));
-        assert!(guard.changed_near(&original,3840.,2159.));
+        assert!(!guard.changed_near(&original,3839.,2159.,false));
+        assert!(guard.changed_near(&original,3840.,2159.,false));
         let a=RgbaImage::from_pixel(48,48,Rgba([15,15,15,255]));
         let b=RgbaImage::from_pixel(96,96,Rgba([15,15,15,255]));
         assert!(!patch_changed(&a,&b));

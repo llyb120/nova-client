@@ -626,11 +626,12 @@ fn image_region(shot: &Shot, region: Region) -> Result<Region> {
     crop.validate(shot.source_pixels)?;
     Ok(crop)
 }
-fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage) -> Result<()> {
+// after_input: earlier actions of this batch already changed the screen, so only the target's core is compared.
+fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, after_input:bool) -> Result<()> {
     let Some(guard)=&shot.guard else {return Ok(());};
     let mut points=vec![source_point(shot,action.x.unwrap(),action.y.unwrap())];
     if action.action=="drag" {points.push(source_point(shot,action.to_x.unwrap(),action.to_y.unwrap()));}
-    if points.iter().any(|&(x,y)|guard.changed_near(image,x,y)) {
+    if points.iter().any(|&(x,y)|guard.changed_near(image,x,y,after_input)) {
         return Err("落点附近画面已变化，停止旧坐标输入；请用返回的新图重新定位，细小目标使用 regionSpace=image 局部截图".into());
     }
     Ok(())
@@ -640,7 +641,7 @@ fn guarded_pointer(action:&Action) -> bool {matches!(action.action.as_str(),"cli
 fn pointer_matches(expected:(i32,i32),actual:(i32,i32)) -> bool {
     (expected.0 as i64-actual.0 as i64).abs()<=1 && (expected.1 as i64-actual.1 as i64).abs()<=1
 }
-fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
+fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> Result<()> {
     if snap.taken.elapsed() > Duration::from_secs(180) {
         return Err("截图已过期".into());
     }
@@ -695,7 +696,7 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
             };
             #[cfg(not(windows))]
             let image=w.capture_image().map_err(err)?;
-            guard_target(shot,a,&image)?;
+            guard_target(shot,a,&image,after_input)?;
             if foreground()?!=snap.foreground || window_surface(w)?!=shot.surface {return Err("落点校验期间窗口或焦点改变，请重新观察".into());}
         }
     } else {
@@ -710,7 +711,7 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
         }
         if guarded_pointer(a) && shot.guard.is_some() {
             let monitor=monitors.iter().find(|m|m.id().ok()==Some(shot.surface.id)).ok_or("显示器已改变")?;
-            guard_target(shot,a,&monitor.capture_image().map_err(err)?)?;
+            guard_target(shot,a,&monitor.capture_image().map_err(err)?,after_input)?;
             if foreground()?!=snap.foreground || monitor_surface(monitor)?!=shot.surface {return Err("落点校验期间屏幕或焦点改变，请重新观察".into());}
         }
     }
@@ -999,7 +1000,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 let snap=state.as_ref().filter(|s|s.owner==owner && Some(&s.id)==request.snapshot_id.as_ref() && s.taken.elapsed()<=Duration::from_secs(180)).ok_or("局部截图依据已失效，请先重新截图")?;
                 let shot=snap.shots.iter().find(|s|Some(&s.image_id)==request.image_id.as_ref()).ok_or("imageId不属于最新截图")?;
                 let action:Action=serde_json::from_value(json!({"action":"move","x":0,"y":0})).map_err(err)?;
-                check_target(snap,shot,&action)?;
+                check_target(snap,shot,&action,false)?;
                 if request.window_id.is_some_and(|id|Some(id)!=snap.window) || request.monitor_id.is_some_and(|id|snap.window.is_some()||id!=shot.surface.id) {return Err("局部截图目标与snapshotId/imageId不一致".into());}
                 (snap.window, snap.window.is_none().then_some(shot.surface.id), Some(image_region(shot,request.region.unwrap())?))
             } else {
@@ -1082,7 +1083,9 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let mut frames = Vec::new();
             for (index, a) in actions.iter().enumerate() {
                 if a.action != "wait" {
-                    if let Err(e) = check_target(&snap, &shot, a) {
+                    // Earlier input (incl. hover from move) changes nearby pixels by design; relax to the target core.
+                    let after_input = actions[..index].iter().any(|p| p.action != "wait");
+                    if let Err(e) = check_target(&snap, &shot, a, after_input) {
                         failed_point = point(&shot, a.x, a.y).ok();
                         failure = Some(e);
                         break;
@@ -1241,9 +1244,10 @@ mod tests {
         let original=xcap::image::RgbaImage::from_pixel(200,100,xcap::image::Rgba([20,20,20,255]));
         let guarded=Shot{pixels:(200,100),source_pixels:(200,100),region:None,guard:Some(crate::visual_guard::VisualGuard::new(&original)),..shot};
         let action:Action=serde_json::from_value(json!({"action":"click","x":80,"y":60})).unwrap();
-        assert!(guard_target(&guarded,&action,&original).is_ok());
+        assert!(guard_target(&guarded,&action,&original,false).is_ok());
         let changed=xcap::image::RgbaImage::from_pixel(200,100,xcap::image::Rgba([200,200,200,255]));
-        assert!(guard_target(&guarded,&action,&changed).is_err());
+        assert!(guard_target(&guarded,&action,&changed,false).is_err());
+        assert!(guard_target(&guarded,&action,&changed,true).is_err());
         let bad=run("test".into(),json!({"operation":"act","regionSpace":"unknown"})).unwrap();
         assert_eq!(bad["status"],"not_executed");
     }
