@@ -785,8 +785,6 @@ struct Observation {
     screenshot: bool,
     full_page: bool,
     images: Vec<ScreenshotImage>,
-    // A real run handoff permits one act on this owner/tab/snapshot only.
-    jev_fallback: bool,
 }
 
 #[derive(Clone)]
@@ -997,7 +995,6 @@ async fn observe(app: &AppHandle, scope: &str) -> Result<Observation, String> {
         screenshot: false,
         full_page: false,
         images: Vec::new(),
-        jev_fallback: false,
     })
 }
 
@@ -1117,13 +1114,6 @@ fn preflight(observation:&Observation, action:&Action, image_id:Option<&str>) ->
         _=>(),
     }
     Ok(())
-}
-
-fn jev_requires_run(enabled: bool, delegated: bool, observation: &Observation, actions: &[Action]) -> bool {
-    // Scrolling only reveals content and is reversible; delegating it cost a JEV round-trip per page.
-    enabled && !delegated
-        && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::Fill{..}))
-        && !(observation.jev_fallback && actions.len() == 1 && observation.captured.elapsed() <= Duration::from_secs(180))
 }
 
 async fn point(
@@ -1677,17 +1667,21 @@ async fn control_session(
     let mut progress=InputProgress::default();
     let task=CONTROL_TAB.scope(s.active_tab.clone(),async {
         if operation!="act" {return Ok(snapshot(app,operation=="screenshot",args).await?.1);}
-        let observation=state.observations.lock().unwrap().get(&s.active_tab).cloned().ok_or("请先 inspect 或 screenshot")?;
-        if args["snapshotId"].as_str()!=Some(&observation.id) { return Err("观察已失效：snapshotId 不是最新观察或已执行；使用最近返回的 snapshotId，不要重放动作".into()); }
         let actions=parse_actions(args, if chrome { 16 } else { 8 })?;
-        if jev_requires_run(app.state::<AppState>().settings.lock().unwrap().jev_enabled, crate::jev_run::executing_browser_action(), &observation, &actions) {
-            return Ok(json!({"status":"not_executed","reason":"jev_run_required",
-                "inputAttempted":false,"completedActions":0,"snapshotId":observation.id,
-                "basedOnSnapshotId":observation.id,"verification":"unverified",
-                "next":"JEV 已启用，DOM click/fill 必须委托 run（纯滚动可直接 act）。本批次未执行，snapshotId 仍有效；用同一目标和 snapshotId 调用 run，提供 plan.task、authorization、expectedText 及所需 inputs，不需要预列 steps。真实 handoff 返回的快照仅允许一次单步 act 兜底，之后恢复 run。视觉操作仍由主模型决定。"}));
-        }
         let all_dom=actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
-        if !all_dom && observation.captured.elapsed()>Duration::from_secs(180) {return Err("观察已过期，请重新观察后继续".into());}
+        let current=state.observations.lock().unwrap().get(&s.active_tab).cloned();
+        let with_image=current.as_ref().is_some_and(|o|o.screenshot) || actions.iter().any(|a|matches!(a,Action::ClickAt{..}|Action::Move{..}|Action::Drag{..}|Action::ScrollAt{..}));
+        let Some(observation)=current.filter(|o|args["snapshotId"].as_str()==Some(&o.id) && (all_dom || o.captured.elapsed()<=Duration::from_secs(180))) else {
+            // Nothing was sent; attach a fresh observation so the model re-decides in this round-trip.
+            let mut observe_args=args.clone();
+            if let Some(a)=observe_args.as_object_mut() {for key in ["ref","frame","region"] {a.remove(key);}}
+            observe_args["fullPage"]=json!(false);
+            if with_image {observe_args["scope"]=json!("viewport");}
+            let mut fresh=snapshot(app,with_image,&observe_args).await?.1;
+            fresh["status"]=json!("not_executed");fresh["completedActions"]=json!(0);fresh["inputAttempted"]=json!(false);
+            fresh["reason"]=json!("snapshotId 不是该标签最新观察或观察已过期，本批次未执行；已附当前观察，用新的 snapshotId/ref/imageId 重新决策，不要重放");
+            return Ok(fresh);
+        };
         // Static validation for the WHOLE batch; revalidate the live node/focus
         // before every individual input. Never retarget by matching its label.
         for action in &actions {
@@ -1987,28 +1981,60 @@ fn jev_observation_key(root: &Path, args: &Value, owner: &str, tool: &str) -> Re
 }
 
 pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
-    browser_observation(root, args, owner, tool, None)
-}
-
-pub(crate) fn jev_fallback(root: &Path, args: &Value, owner: &str, tool: &str, allow: bool) -> Result<Value, String> {
-    browser_observation(root, args, owner, tool, Some(allow))
-}
-
-fn browser_observation(root: &Path, args: &Value, owner: &str, tool: &str, fallback: Option<bool>) -> Result<Value, String> {
     let app = APP.get().ok_or("仅 Nova 内可用")?;
     let key = jev_observation_key(root, args, owner, tool)?;
     let state = app.state::<BrowserState>();
-    let mut observations = state.observations.lock().unwrap();
-    let observation = observations.get_mut(&key)
+    let observations = state.observations.lock().unwrap();
+    let observation = observations.get(&key)
         .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
         .ok_or("观察已失效，交回主模型重新观察")?;
-    if let Some(allow) = fallback { observation.jev_fallback = allow; }
     Ok(observation.pages.clone())
 }
 
+fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashMap<String, Observation>) -> Result<Value, String> {
+    let mut args = args.as_object().cloned().ok_or("chrome 参数必须是对象")?;
+    match args.get("operation").and_then(Value::as_str).unwrap_or_default() {
+        "connect" | "status" | "tabs" | "open" | "new_tab" | "downloads" | "experience_search" => return Ok(Value::Object(args)),
+        "inspect" | "screenshot" | "act" | "run" | "advise" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
+        _ => return Err("缺少或无效 operation；先用 {\"operation\":\"tabs\"} 获取标签".into()),
+    }
+    let valid_tag = |tag: &str| tag.len() <= 80 && tag.starts_with('C')
+        && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if let Some(tag) = args.get("tabTag") {
+        if !tag.as_str().is_some_and(valid_tag) {
+            return Err("tabTag 无效；原样复制 tabs[].tag 或 open 返回的 tabTag（不是数字 tabId/browserId）".into());
+        }
+        return Ok(Value::Object(args));
+    }
+    if args.contains_key("tabId") || args.contains_key("browserId") {
+        return Err("Chrome 目标参数名是 tabTag；请复制 tabs[].tag 或 open 返回的 tabTag，不能使用 tabId/browserId".into());
+    }
+    // Reuse only this owner's observations, never Chrome's active tab or another client's target.
+    // ponytail: linear scan of live observations; index by owner if tab counts make this measurable.
+    let prefix = format!("chrome:{owner}:");
+    let mut matches = observations.iter().filter_map(|(key, observation)| {
+        let tag = key.strip_prefix(&prefix).filter(|tag| valid_tag(tag))?;
+        (observation.captured.elapsed() <= Duration::from_secs(180)
+            && args.get("snapshotId").is_none_or(|id| id.as_str() == Some(&observation.id)))
+            .then_some(tag)
+    });
+    let tag = matches.next().filter(|_| matches.next().is_none()).ok_or(
+        "缺少 tabTag，且无法从本会话 snapshotId 或唯一有效观察确定目标。请复制上次返回的 tabTag；没有则调用 {\"operation\":\"tabs\",\"query\":\"目标标题或URL片段\"}，再携带 tabTag 继续；act 还需最新 snapshotId 和 action/actions",
+    )?;
+    args.insert("tabTag".into(), json!(tag));
+    Ok(Value::Object(args))
+}
+
 pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
-    let result = execute_chrome_inner(root, args, owner).await?;
-    Ok(with_experience_hint("chrome", &tool_owner(root, owner)?, result))
+    let thread_id = tool_owner(root, owner)?;
+    let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
+    let normalized = chrome_args(args, &thread_id, &app.state::<BrowserState>().observations.lock().unwrap())?;
+    let mut result = execute_chrome_inner(root, &normalized, owner).await?;
+    if args.get("tabTag").is_none() && normalized["tabTag"].is_string() {
+        result["tabTag"] = normalized["tabTag"].clone();
+        result["targetResolvedFrom"] = json!(if args.get("snapshotId").is_some() { "snapshotId" } else { "sessionObservation" });
+    }
+    Ok(with_experience_hint("chrome", &thread_id, result))
 }
 
 async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
@@ -2125,14 +2151,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
         }
         return Ok(value);
     }
-    let tag = args["tabTag"]
-        .as_str()
-        .filter(|tag| {
-            tag.len() <= 80
-                && tag.starts_with('C')
-                && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
-        .ok_or("缺少有效 tabTag；请先 chrome.tabs（可带 query 唯一匹配直接绑定），不会默认操作当前激活标签")?;
+    let tag = args["tabTag"].as_str().ok_or("缺少 tabTag")?;
     if operation == "stop" {
         crate::chrome_browser::stop(app, tag);
         app.state::<BrowserState>().observations.lock().unwrap().remove(&format!("chrome:{thread_id}:{tag}"));
@@ -2270,34 +2289,54 @@ fn state_dir(app: &AppHandle) -> std::path::PathBuf {
 mod tests {
     use super::*;
     #[test]
-    fn jev_policy_requires_delegation_and_bounds_handoff_to_one_fresh_action() {
-        let mut observation = Observation { frames: Vec::new(), pages: json!({}), id: "current".into(),
+    fn chrome_recovers_missing_target_only_from_unambiguous_owned_observations() {
+        let observation = Observation { frames: Vec::new(), pages: json!({}), id: "current".into(),
             captured: std::time::Instant::now(), screenshot: true, full_page: false,
-            images: Vec::new(), jev_fallback: false };
-        let actions = |items: Value| parse_actions(&json!({"actions":items}), 16).unwrap();
-        for dom in [json!({"action":"click","frame":0,"ref":"a"}),
-            json!({"action":"fill","frame":0,"ref":"a","text":"x"})] {
-            let single = actions(json!([dom]));
-            assert!(jev_requires_run(true, false, &observation, &single));
-            assert!(!jev_requires_run(false, false, &observation, &single));
-            assert!(!jev_requires_run(true, true, &observation, &single));
-            for extra in [json!({"action":"click_at","x":10,"y":20}),
-                json!({"action":"press","key":"Enter"}), json!({"action":"wait","ms":1})] {
-                assert!(jev_requires_run(true, false, &observation, &actions(json!([extra,dom]))));
-            }
-            observation.jev_fallback = true;
-            assert!(!jev_requires_run(true, false, &observation, &single));
-            assert!(jev_requires_run(true, false, &observation, &actions(json!([dom,dom]))));
-            observation.captured -= Duration::from_secs(181);
-            assert!(jev_requires_run(true, false, &observation, &single));
-            observation.captured = std::time::Instant::now();
-            observation.jev_fallback = false;
+            images: Vec::new() };
+        let mut observations = std::collections::HashMap::new();
+        let inspect = json!({"operation":"inspect"});
+        assert!(chrome_args(&inspect, "owner", &observations).is_err());
+        observations.insert("chrome:other:C1-test".into(), observation.clone());
+        observations.insert("chrome:owner:another-root:C1-test".into(), observation.clone());
+        assert!(chrome_args(&inspect, "owner", &observations).is_err());
+        observations.insert("chrome:owner:C1-test".into(), observation.clone());
+        assert_eq!(chrome_args(&inspect, "owner", &observations).unwrap()["tabTag"], "C1-test");
+        let act = json!({"operation":"act","snapshotId":"current","action":{"action":"click","frame":0,"ref":"observed-ref"}});
+        let normalized = chrome_args(&act, "owner", &observations).unwrap();
+        assert_eq!(normalized["tabTag"], "C1-test");
+        assert_eq!(normalized["action"], act["action"]);
+        assert_eq!(normalized["snapshotId"], "current");
+        for key in ["tabId", "browserId"] {
+            let mut wrong_target = act.clone();
+            wrong_target[key] = json!("another-target");
+            assert!(chrome_args(&wrong_target, "owner", &observations).is_err());
         }
-        assert!(!jev_requires_run(true, false, &observation, &actions(json!([
-            {"action":"click_at","x":10,"y":20},{"action":"type","text":"x"},
-            {"action":"press","key":"Enter"}]))));
-        assert!(!jev_requires_run(true, false, &observation, &actions(json!([
-            {"action":"scroll","frame":0,"delta":400},{"action":"scroll","frame":0,"ref":"a","delta":400}]))));
+        let mut second = observation.clone();
+        second.id = "second".into();
+        observations.insert("chrome:owner:C2-test".into(), second);
+        assert!(chrome_args(&inspect, "owner", &observations).is_err());
+        assert_eq!(chrome_args(&act, "owner", &observations).unwrap()["tabTag"], "C1-test");
+        for operation in ["run", "advise", "experience_save", "experience_feedback", "goto", "close_tab"] {
+            let args = json!({"operation":operation,"snapshotId":"second"});
+            assert_eq!(chrome_args(&args, "owner", &observations).unwrap()["tabTag"], "C2-test");
+        }
+        for snapshot in [json!("stale"), json!(123), Value::Null] {
+            assert!(chrome_args(&json!({"operation":"act","snapshotId":snapshot}), "owner", &observations).is_err());
+        }
+        for tag in [json!(""), json!(123), json!("C1:other"), Value::Null] {
+            assert!(chrome_args(&json!({"operation":"run","tabTag":tag,"snapshotId":"current"}), "owner", &observations).is_err());
+        }
+        let explicit = json!({"operation":"inspect","tabTag":"C3-explicit"});
+        assert_eq!(chrome_args(&explicit, "owner", &observations).unwrap(), explicit);
+        observations.get_mut("chrome:owner:C1-test").unwrap().captured -= Duration::from_secs(181);
+        assert!(chrome_args(&act, "owner", &observations).is_err());
+        observations.remove("chrome:owner:C2-test");
+        assert!(chrome_args(&inspect, "owner", &observations).is_err());
+        for operation in ["connect", "status", "tabs", "open", "new_tab", "downloads", "experience_search"] {
+            let args = json!({"operation":operation});
+            assert_eq!(chrome_args(&args, "owner", &observations).unwrap(), args);
+        }
+        assert!(chrome_args(&json!({}), "owner", &observations).is_err());
     }
 
     #[test]

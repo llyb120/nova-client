@@ -122,19 +122,19 @@ try{
   report.completed=true;report.passed=true;
   console.log(JSON.stringify({phase:'continuity_passed',tests:report.tests.map(t=>({case:t.case,run:t.result.jevRun}))}));
  } else {
- // Deliberately exercise a noncompliant caller before asking a main model to work.
- const guard=await chrome('open',{url:fixtureUrl});
- const item=guard.pages.flatMap(p=>p.items.map(item=>({...item,frame:p.frame??0}))).find(i=>i.name==='游戏收入');
- assert(item,'fixture link must be observable');
- const action={action:'click',frame:item.frame,ref:item.ref};
- for(const actions of [[action],[{action:'wait',ms:1},action]]) {
-  const blocked=await chrome('act',{tabTag:guard.tabTag,snapshotId:guard.snapshotId,actions});
-  report.tests.push({case:'direct_dom_rejected',result:blocked});
-  assert.equal(blocked.reason,'jev_run_required');assert.equal(blocked.inputAttempted,false);
-  assert.equal(blocked.snapshotId,guard.snapshotId);assert.equal(blocked.completedActions,0);
+ // Clear observed actions remain executable with JEV enabled; snapshotId recovers omitted tabTag.
+ for(const mixed of [false,true]) {
+  const guard=await chrome('open',{url:fixtureUrl});
+  const item=guard.pages.flatMap(p=>p.items.map(item=>({...item,frame:p.frame??0}))).find(i=>i.name==='游戏收入');
+  assert(item,'fixture link must be observable');
+  const action={action:'click',frame:item.frame,ref:item.ref};
+  const executed=await chrome('act',{snapshotId:guard.snapshotId,actions:mixed?[{action:'wait',ms:1},action]:[action]});
+  report.tests.push({case:'direct_dom_executed',result:executed});
+  assert.equal(executed.status,'executed');assert.equal(executed.completedActions,mixed?2:1);
+  assert.equal(executed.tabTag,guard.tabTag);assert.equal(executed.targetResolvedFrom,'snapshotId');
+  await chrome('close_tab',{tabTag:guard.tabTag});
  }
- await chrome('close_tab',{tabTag:guard.tabTag});
- await invoke('send_prompt',{threadId:thread.id,text:`打开 Chrome 的测试报表中心 ${fixtureUrl}，查询美国近半年的游戏收入前5名，按收入降序，用完整榜单视图，最后告诉我五个游戏及收入。这是本地测试页面，允许导航和选择筛选。`});
+ await invoke('send_prompt',{threadId:thread.id,text:`打开 Chrome 的测试报表中心 ${fixtureUrl}，用run一次委托连续DOM流程：查询美国近半年的游戏收入前5名，按收入降序，用完整榜单视图，最后告诉我五个游戏及收入。这是本地测试页面，允许导航和选择筛选。`});
  console.log(JSON.stringify({phase:'prompt_sent',threadId:thread.id,profile}));
  let latest;
  for(let i=0;i<120;i++){
@@ -161,12 +161,12 @@ try{
  assert(report.incomplete.jevRun.decisions.some(d=>d.choice==='defer'),'incomplete evidence must select defer');
  assert(report.incomplete.jevRun.executedActions===0,'read-only check must not execute');
  assert.equal(report.incomplete.jevRun.fallback.allowed,true);
- const fallback=await chrome('act',{tabTag:incomplete.tabTag,snapshotId:report.incomplete.snapshotId,
+  let fallback=await chrome('act',{tabTag:incomplete.tabTag,snapshotId:report.incomplete.snapshotId,
   action:{action:'scroll',frame:0,delta:100},feedback:'inspect',visual:'none'});
  assert.equal(fallback.status,'executed');report.tests.push({case:'handoff_single_step',result:fallback});
- const blockedAgain=await chrome('act',{tabTag:incomplete.tabTag,snapshotId:fallback.snapshotId,
+  fallback=await chrome('act',{tabTag:incomplete.tabTag,snapshotId:fallback.snapshotId,
   action:{action:'scroll',frame:0,delta:100}});
- assert.equal(blockedAgain.reason,'jev_run_required');report.tests.push({case:'handoff_consumed',result:blockedAgain});
+  assert.equal(fallback.status,'executed');report.tests.push({case:'handoff_continues_with_fresh_snapshot',result:fallback});
  const cases=[
   ['region','选择美国地区','当前候选地区为 United Kingdom、United States、Japan',{uk:'选择 United Kingdom',us:'选择 United States',jp:'选择 Japan'},'us'],
   ['dates','查询截至2026-09-22的近半年数据，允许使用最新完整周','日期候选：2026-08-22~2026-09-19；2026-03-22~2026-09-19；2025-09-22~2026-09-19',{month:'2026-08-22~2026-09-19',half:'2026-03-22~2026-09-19',year:'2025-09-22~2026-09-19'},'half'],

@@ -298,7 +298,7 @@ fn origin(pages: &Value) -> Result<String, String> {
     Ok(url.origin().ascii_serialization())
 }
 
-// Only this module can open the trusted scope; tool JSON cannot opt out of JEV.
+// Distinguish delegated actions from the main model's actions for experience recording.
 tokio::task_local! { static BROWSER_ACTION: bool; }
 
 pub(crate) fn executing_browser_action() -> bool {
@@ -1567,14 +1567,26 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     let plan = parse(args)?;
     let target_key = if tool == "webview" { "browserId" } else { "tabTag" };
     let target = args[target_key].as_str().ok_or("run 缺少浏览器目标")?.to_string();
-    // Invalid plans/owners/stale observations must not manufacture a fallback grant.
-    let initial = crate::native_browser::jev_fallback(root, args, owner, tool, false)?;
+    let mut snapshot = args["snapshotId"].clone();
+    let initial = match crate::native_browser::jev_observation(root, args, owner, tool) {
+        Ok(pages) => pages,
+        // run decides from the live DOM, so a missing/stale snapshotId just means observing first
+        // instead of bouncing the model back for an inspect round-trip.
+        Err(_) => {
+            let mut inspect = json!({"operation":"inspect","scope":"viewport","visual":"none","maxTextChars":2500,"maxItems":30});
+            inspect[target_key] = json!(target);
+            snapshot = execute_browser(root, &inspect, owner, tool).await?["snapshotId"].clone();
+            let mut fresh = args.clone();
+            fresh["snapshotId"] = snapshot.clone();
+            crate::native_browser::jev_observation(root, &fresh, owner, tool)?
+        }
+    };
     let home = origin(&initial)?;
-    let mut latest = json!({"snapshotId":args["snapshotId"]});
+    let mut latest = json!({"snapshotId":snapshot});
     latest[target_key] = json!(target);
     let mut run = Run {
         root, owner, tool, target_key, target, plan,
-        snapshot: args["snapshotId"].clone(), latest,
+        snapshot, latest,
         history: Vec::new(), decisions: Vec::new(), trace: Vec::new(), tree: Value::Null,
         missing_inputs: Vec::new(), candidate_counts: Vec::new(),
         refreshes: 0, executed: 0, cached: 0, reflex: 0, preflight_recoveries: 0, preflight: 0,
@@ -1603,8 +1615,8 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
         match execute_browser(root, &run.inspect_args(), owner, tool).await {
             Ok(observed) => {
                 latest.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
-                fallback = crate::native_browser::jev_fallback(root,
-                    &run.args(json!({"snapshotId":latest["snapshotId"]})), owner, tool, true).is_ok();
+                fallback = crate::native_browser::jev_observation(root,
+                    &run.args(json!({"snapshotId":latest["snapshotId"]})), owner, tool).is_ok();
             }
             Err(error) => latest["observationError"] = json!(error),
         }
@@ -1612,8 +1624,8 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     let requests = run.decisions.iter().filter(|d| d["requestAttempted"] == true).count();
     // Inner act/inspect replies carry availability-only metadata; the outer run actually delegated.
     latest["jev"] = json!({"status":if run.decisions.is_empty() && run.history.is_empty() {"not_delegated"} else {"delegated"},"requestAttempted":requests > 0,
-        "next":if outcome.is_ok() { "本次子目标已核验；后续简单判断继续委托run，最终答案由主模型核对。" }
-            else { "本次未完成。先按reason解决障碍；观察、输入和候选范围没有实质变化时不要重复run。主模型处理障碍后恢复run；仅视觉或委托无法处理的动作由主模型act兜底。ref必须原样复制当前items[].ref，禁止用snapshotId拼接。" }});
+        "next":if outcome.is_ok() { "本次子目标已核验，最终答案由主模型核对。明确动作直接act；后续连续DOM流程可再次run。" }
+            else { "本次未完成。主模型先按reason解决障碍；观察、输入和候选范围没有实质变化时不要重复run。明确动作可直接act；具备连续执行条件后再委托剩余目标。ref必须原样复制当前items[].ref，禁止用snapshotId拼接。" }});
     // Compact by design: the main model needs outcome, evidence of what happened and what is missing,
     // not the prompts. Oversized replies were archived to files and cost a shell round-trip each.
     let mut nodes = BTreeMap::<String, usize>::new();
@@ -1634,8 +1646,8 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     latest["jevRun"] = json!({"status":if handoff {"handoff"} else {"completed"},
         "reason":outcome.err(),
         "guided":guided,
-        "fallback": {"allowed":fallback,"maxActions":1,"snapshotId":if fallback {latest["snapshotId"].clone()} else {Value::Null},
-            "notice":"仅限本次 handoff 的同一目标和 snapshotId，180秒内一次单步 act；执行或重新观察后失效，之后恢复 run。视觉操作仍由主模型处理。"},
+        "fallback": {"allowed":fallback,"maxActions":if tool == "chrome" {16} else {8},"snapshotId":if fallback {latest["snapshotId"].clone()} else {Value::Null},
+            "notice":"allowed表示已取得可供接手的最新观察，不是额外操作授权。主模型按最新snapshotId/ref排障，act仍校验目标、焦点和快照；不重放history中的已执行步骤。"},
         "verification":if handoff {"unverified"} else {"subgoal_verified"},
         "executedActions":run.executed,"requestCount":requests,"decisionCount":run.decisions.len(),
         "cachedActions":run.cached,"reflexActions":run.reflex,"nodes":nodes,

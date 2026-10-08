@@ -53,11 +53,16 @@ test('JEV browser decisions share bounded plans; desktop remains advisory', asyn
   for (const browser of [chrome,webview]) {
     assert.match(browser.description,/按情况选择/);
     assert.match(browser.description,/知识图谱/);
+    assert.match(browser.description,/不强制拦截act/);
+    assert.doesNotMatch(browser.description,/jev_run_required/);
+    assert.match(browser.inputSchema.properties.plan.description,/可省略steps/);
     assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
   }
   assert.deepEqual(chrome.inputSchema.properties.advice,jianlai.inputSchema.properties.advice);
   assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,24);
   assert.deepEqual(chrome.inputSchema.properties.plan.required,['task','authorization','expectedText']);
+  assert.match(chrome.inputSchema.properties.tabTag.description,/本会话snapshotId/);
+  for (const key of ['anyOf','oneOf','allOf']) assert.equal(chrome.inputSchema[key],undefined,'Keep the tool compatible with Claude Code');
   assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.default,32);
   assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.maximum,64);
   assert.equal(chrome.inputSchema.properties.plan.properties.inputs.maxItems,8);

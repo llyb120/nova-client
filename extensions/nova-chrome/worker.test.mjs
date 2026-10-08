@@ -28,7 +28,7 @@ test('native downloads expose progress, interruption and completion without tab 
     const schema=JSON.parse(await readFile(new URL(`../../scripts/${name}-tool.json`,import.meta.url),'utf8'));
     assert.ok(schema.inputSchema.properties.operation.enum.includes('downloads'));
     assert.equal(schema.inputSchema.properties.downloadId.type,'string');
-    assert.match(schema.description,/Page stable/);
+    assert.match(schema.description,/只有state=complete才算完成/);
   }
 });
 
