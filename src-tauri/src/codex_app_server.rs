@@ -29,7 +29,9 @@ pub(super) fn rtk_guidance() -> String {
     } else {
         path.into_owned()
     };
-    let powershell = format!("& '{}' __rtk", path.replace('\'', "''"));
+    // A GUI-subsystem exe needs a pipeline for PowerShell to wait and capture output.
+    // Dot-sourcing keeps LASTEXITCODE in the caller; -Stream avoids buffering all output.
+    let powershell = format!(". {{ & '{}' @args | Out-String -Stream }} __rtk", path.replace('\'', "''"));
     let bash = format!("'{}' __rtk", path.replace('\'', "'\\''"));
     // ponytail: instruction-based for Codex and ACP agents; enforcing every command
     // requires a backend pre-execution rewrite hook when that API is available.
@@ -72,7 +74,7 @@ fn thread_options(request: &Value, options: &Options) -> Value {
     let mut value = json!({
         "cwd": request["cwd"], "model": optional_text(&request["model"]),
         "sandbox": if read_only { "read-only" } else { "danger-full-access" },
-        "approvalPolicy": "never", "developerInstructions": guidance.join("\n\n"),
+        "approvalPolicy": "never", "approvalsReviewer": "user", "developerInstructions": guidance.join("\n\n"),
         "config": {"mcp_servers.nova-tools": mcp.unwrap_or_else(|| json!({"command":"codex", "enabled":false}))}
     });
     if title {

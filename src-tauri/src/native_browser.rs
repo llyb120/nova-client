@@ -13,6 +13,76 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager};
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
+#[cfg(windows)]
+struct Download {
+    thread: String,
+    tab: String,
+    id: String,
+    started: i64,
+    operation: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2DownloadOperation,
+}
+// COM download objects stay on the UI apartment; queries marshal only JSON back.
+#[cfg(windows)]
+thread_local! { static DOWNLOADS: std::cell::RefCell<Vec<Download>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+async fn downloads(app: &AppHandle, thread: &str, args: &Value) -> Result<Value, String> {
+    let id = match args.get("downloadId") {
+        Some(value) => Some(value.as_str().filter(|v| !v.is_empty() && v.len() <= 80).ok_or("无效 downloadId")?.to_owned()),
+        None => None,
+    };
+    let since = match args.get("since").filter(|_| id.is_none()) {
+        Some(value) => value.as_i64().filter(|v| (0..=8_640_000_000_000_000).contains(v)).ok_or("since 必须为有效的 Unix 毫秒时间戳")?,
+        None => chrono::Utc::now().timestamp_millis() - 600_000,
+    };
+    #[cfg(not(windows))]
+    { let _ = (app, thread, since, id); Err("需要 Windows WebView2".into()) }
+    #[cfg(windows)]
+    {
+        use webview2_com::Microsoft::Web::WebView2::Win32::*;
+        let thread = thread.to_owned();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            let result = DOWNLOADS.with(|records| -> Result<Value, String> {
+                let records = records.borrow();
+                let mut items = Vec::new();
+                for record in records.iter().rev().filter(|d| d.thread == thread && id.as_ref().map_or(d.started >= since, |id| d.id == *id)).take(100) {
+                    let read = || -> windows::core::Result<Value> { unsafe {
+                        let op = &record.operation;
+                        let mut state = COREWEBVIEW2_DOWNLOAD_STATE::default();
+                        let mut reason = COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON::default();
+                        let (mut received, mut total) = (0, 0);
+                        op.State(&mut state)?;
+                        op.InterruptReason(&mut reason)?;
+                        op.BytesReceived(&mut received)?;
+                        op.TotalBytesToReceive(&mut total)?;
+                        let mut raw = windows::core::PWSTR::null();
+                        op.ResultFilePath(&mut raw)?;
+                        let path = webview2_com::take_pwstr(raw);
+                        op.Uri(&mut raw)?;
+                        let full_url = webview2_com::take_pwstr(raw);
+                        let url: String = full_url.chars().take(4096).collect();
+                        let state = if state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED { "complete" }
+                            else if state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED { "interrupted" } else { "in_progress" };
+                        Ok(json!({"id":record.id,"tabId":record.tab,"startTime":record.started,
+                            "url":url,"urlTruncated":url.len()!=full_url.len(),"path":path,"state":state,"bytesReceived":received,"totalBytes":total,
+                            "exists":Path::new(&path).is_file(),
+                            "error":if state == "interrupted" {
+                                let reasons = ["NONE", "FILE_FAILED", "FILE_ACCESS_DENIED", "FILE_NO_SPACE", "FILE_NAME_TOO_LONG", "FILE_TOO_LARGE", "FILE_MALICIOUS", "FILE_TRANSIENT_ERROR", "FILE_BLOCKED_BY_POLICY", "FILE_SECURITY_CHECK_FAILED", "FILE_TOO_SHORT", "FILE_HASH_MISMATCH", "NETWORK_FAILED", "NETWORK_TIMEOUT", "NETWORK_DISCONNECTED", "NETWORK_SERVER_DOWN", "NETWORK_INVALID_REQUEST", "SERVER_FAILED", "SERVER_NO_RANGE", "SERVER_BAD_CONTENT", "SERVER_UNAUTHORIZED", "SERVER_CERTIFICATE_PROBLEM", "SERVER_FORBIDDEN", "SERVER_UNEXPECTED_RESPONSE", "SERVER_CONTENT_LENGTH_MISMATCH", "SERVER_CROSS_ORIGIN_REDIRECT", "USER_CANCELED", "USER_SHUTDOWN", "USER_PAUSED", "DOWNLOAD_PROCESS_CRASHED"];
+                                Some(format!("{} ({})", reasons.get(reason.0 as usize).unwrap_or(&"UNKNOWN"), reason.0))
+                            } else { None }}))
+                    }};
+                    // Closing a tab may invalidate its COM object. Never report that as completion.
+                    items.push(read().unwrap_or_else(|e| json!({"id":record.id,"tabId":record.tab,"state":"unknown","error":e.to_string()})));
+                }
+                Ok(json!({"scope":"session","queriedAt":chrono::Utc::now().timestamp_millis(),"limit":100,"downloads":items,
+                    "notice":"仅保留本次应用运行最近 200 条下载。空列表不代表导出失败；页面稳定不代表下载完成。只有 state=complete 才表示完成，原生保存/安全提示仍需处理。"}))
+            });
+            let _ = tx.send(result);
+        }).map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(5), rx).await
+            .map_err(|_| "下载查询超时，请处理原生对话框后重新查询")?.map_err(|e| e.to_string())?
+    }
+}
 tokio::task_local! { static CONTROL_TAB: String; }
 #[cfg(windows)]
 struct Popup {
@@ -125,7 +195,7 @@ fn create_tab(
     let mut builder = tauri::WebviewBuilder::new(&id, tauri::WebviewUrl::External(url))
         .data_directory(state_dir(app).join("native-browser-profile"))
         .on_navigation(move |url| {
-            if !matches!(url.scheme(), "http" | "https" | "about") {
+            if !matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data") {
                 return false;
             }
             nav_app
@@ -172,10 +242,29 @@ fn create_tab(
     view.hide().map_err(|e| e.to_string())?;
     let popup_app = app.clone();
     let popup_thread = thread.to_owned();
+    let download_thread = thread.to_owned();
+    let download_tab = id.clone();
     view.with_webview(move |native| unsafe {
         let Ok(core) = native.controller().CoreWebView2() else {
             return;
         };
+        use windows::core::Interface;
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_4;
+        let registration = core.cast::<ICoreWebView2_4>().and_then(|core| core.add_DownloadStarting(
+            &webview2_com::DownloadStartingEventHandler::create(Box::new(move |_, args| {
+                if let Some(args) = args {
+                    let operation = args.DownloadOperation()?;
+                    DOWNLOADS.with(|records| {
+                        let mut records = records.borrow_mut();
+                        // ponytail: retain the latest 200 operations; use a persistent history if needed.
+                        if records.len() >= 200 { records.remove(0); }
+                        records.push(Download { thread: download_thread.clone(), tab: download_tab.clone(),
+                            id: uuid::Uuid::new_v4().to_string(), started: chrono::Utc::now().timestamp_millis(), operation });
+                    });
+                }
+                Ok(())
+            })), &mut 0));
+        if let Err(error) = registration { eprintln!("browser download handler: {error}"); }
         if let Some(key) = popup_id {
             if let Some(popup) = POPUPS.with(|p| p.borrow_mut().remove(&key)) {
                 if let Err(e) = popup.args.SetNewWindow(&core) {
@@ -198,7 +287,7 @@ fn create_tab(
                 args.Uri(&mut raw)?;
                 let url = webview2_com::take_pwstr(raw);
                 if !tauri::Url::parse(&url).is_ok_and(|u| {
-                    matches!(u.scheme(), "http" | "https") || u.as_str() == "about:blank"
+                    matches!(u.scheme(), "http" | "https" | "blob" | "data") || u.as_str() == "about:blank"
                 }) {
                     return Ok(());
                 }
@@ -532,9 +621,11 @@ pub async fn native_browser_ui(
         }
         "stop" => {
             s.cancel.store(true, Ordering::SeqCst);
+            state.observations.lock().unwrap().remove(&s.active_tab);
             Ok(json!({"stopped":true}))
         }
         "status" => Ok(json!(s)),
+        "downloads" => downloads(&app, &thread_id, &args).await,
         "goto" | "back" | "forward" | "reload" => {
             let _guard = state
                 .gate
@@ -954,6 +1045,7 @@ enum Action {
         frame: usize,
         r#ref: Option<String>,
         delta: i32,
+        #[serde(default)] delta_x: Option<i32>,
     },
     Wait {
         ms: u64,
@@ -968,7 +1060,7 @@ fn parse_action(text: &str) -> Result<Action, String> {
         .unwrap_or(text)
         .trim();
     let text = text.strip_suffix("```").unwrap_or(text).trim();
-    serde_json::from_str(text).map_err(|e| format!("动作 JSON 无效：{e}"))
+    serde_json::from_str(text).map_err(|e| format!("动作 JSON 无效：{e}。DOM 点击用 action={{\"action\":\"click\",\"frame\":0,\"ref\":\"最新引用\"}}；图片坐标点击用 action={{\"action\":\"click_at\",\"x\":100,\"y\":100}}，imageId 放在工具顶层且与 snapshotId 来自同次截图；按键仅用 action={{\"action\":\"press\",\"key\":\"Enter\"}}，不传 frame/ref。"))
 }
 
 fn validate_action(action: &Action) -> Result<(), String> {
@@ -990,11 +1082,11 @@ fn validate_action(action: &Action) -> Result<(), String> {
     if let Action::Drag { to_x,to_y,duration_ms,.. } = action {
         if !to_x.is_finite() || !to_y.is_finite() || *to_x<0. || *to_y<0. || duration_ms.is_some_and(|t| !(80..=1500).contains(&t)) { return Err("拖动终点或 duration_ms 无效".into()); }
     }
-    if let Action::ScrollAt { delta_x:Some(x), .. } = action { if x.unsigned_abs()>1200 { return Err("delta_x 超过1200像素".into()); } }
+    if let Action::ScrollAt { delta_x:Some(x), .. } | Action::Scroll { delta_x:Some(x), .. } = action { if x.unsigned_abs()>1200 { return Err("delta_x 超过1200像素".into()); } }
     Ok(())
 }
 fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String> {
-    if !args["action"].is_null() && !args["actions"].is_null() { return Err("action 和 actions 不能同时提供".into()); }
+    if !args["action"].is_null() && !args["actions"].is_null() { return Err("action 和 actions 不能同时提供：单步仅传 action，多步仅传 actions；删除另一个字段。本批次未执行。".into()); }
     let values = if let Some(values)=args["actions"].as_array() { values.clone() } else { vec![args["action"].clone()] };
     if values.is_empty() || values.len()>max_actions { return Err(format!("每批需要1–{max_actions}个确定动作")); }
     values.into_iter().map(|value| { let action=parse_action(&value.to_string())?; validate_action(&action)?; Ok(action) }).collect()
@@ -1005,12 +1097,12 @@ fn preflight(observation:&Observation, action:&Action, image_id:Option<&str>) ->
         Action::Click{frame,r#ref,..}|Action::Fill{frame,r#ref,..}|Action::Scroll{frame,r#ref:Some(r#ref),..}=>{
             if *frame>=observation.frames.len() {return Err("frame 不属于当前快照".into());}
             if !observation.pages["pages"][*frame]["items"].as_array().is_some_and(|items|items.iter().any(|item|item["ref"].as_str()==Some(r#ref.as_str()))) {
-                return Err("ref 不属于当前快照的指定 frame".into());
+                return Err("ref 不属于当前快照的指定 frame；ref 必须原样复制该 frame 的 items[].ref，不能用 snapshotId 加序号拼造。这不等于快照过期；先核对已有观察中的真实 ref，不要直接重试或无故重新截图".into());
             }
         }
         Action::Scroll{frame,..} if *frame!=0=>return Err("子框架滚动需要明确 ref".into()),
         Action::ClickAt{x,y,..}|Action::Move{x,y}|Action::Drag{x,y,..}|Action::ScrollAt{x,y,..}=>{
-            if !observation.screenshot {return Err("坐标操作需要截图".into());}
+            if !observation.screenshot {return Err(format!("坐标操作需要截图：当前 snapshotId={} 没有图片。调用 screenshot 后同时使用它返回的新 snapshotId 和 imageId；不要将旧 imageId 与新 DOM 快照混用。", observation.id));}
             let (cx,cy)=image_point(observation,*x,*y,image_id)?;
             if !observation.images.iter().any(|image|cx>=image.x&&cy>=image.y&&cx<image.x+image.width&&cy<image.y+image.height) {return Err("坐标不在返回的图片中".into());}
             if let Action::Drag{to_x,to_y,..}=action {
@@ -1104,6 +1196,8 @@ async fn point(
 #[derive(Default)]
 struct InputProgress {
     attempted: bool,
+    dom_preflight: bool,
+    scroll_feedback: Option<Value>,
     completed: usize,
     held_mouse: Option<Value>,
     held_key: Option<Value>,
@@ -1231,6 +1325,7 @@ async fn apply(
             cdp(app,"Input.insertText",json!({"text":text}),None,Some(s.cancel.clone())).await?;
         }
         Action::Click{frame,r#ref,..} | Action::Fill{frame,r#ref,..} => {
+            progress.dom_preflight=true;
             let mode=if matches!(action,Action::Fill{..}) {"fill"} else {"click"};
             let p=point(app,observation,*frame,r#ref,mode).await?;
             // Hover is real input, then validate the same target again before pressing.
@@ -1243,6 +1338,7 @@ async fn apply(
                     return Err("框架在悬停后移动，已停止点击，请重新观察".into());
                 }
             }
+            progress.dom_preflight=false;
             if let Action::Fill{text,..}=action {
                 if p["password"]==true { return Err("密码请手动输入".into()); }
                 mouse(app,s,&p,"left",1,progress).await?;
@@ -1258,13 +1354,18 @@ async fn apply(
             }
         }
         Action::Press{key:name}=>key(app,s,name,progress).await?,
-        Action::Scroll{frame,r#ref,delta}=>{
-            let p=if let Some(reference)=r#ref {point(app,observation,*frame,reference,"click").await?} else {
+        Action::Scroll{frame,r#ref,delta,delta_x}=>{
+            progress.dom_preflight=true;
+            let mode=if delta_x.unwrap_or(0)!=0 {"scroll_x"} else {"scroll_y"};
+            let p=if let Some(reference)=r#ref {point(app,observation,*frame,reference,mode).await?} else {
                 if *frame!=0 {return Err("子框架滚动需要明确 ref".into());}
-                json!({"x":observation.pages["pages"][0]["viewport"]["width"].as_f64().unwrap_or(400.)/2.,"y":observation.pages["pages"][0]["viewport"]["height"].as_f64().unwrap_or(400.)/2.})
+                evaluate(app,&observation.frames[0],format!("__novaWebview.prepare(null,{})",json!(mode))).await?
             };
+            progress.dom_preflight=false;
             check(app,s)?; progress.attempted=true;
-            cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseWheel","x":p["x"],"y":p["y"],"deltaX":0,"deltaY":delta}),None,Some(s.cancel.clone())).await?;
+            cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseWheel","x":p["x"],"y":p["y"],"deltaX":delta_x.unwrap_or(0),"deltaY":delta}),None,Some(s.cancel.clone())).await?;
+            progress.scroll_feedback=Some(evaluate(app,&observation.frames[*frame],
+                format!("__novaWebview.scrollFeedback({},{})",json!(r#ref),p["scroll"])).await?);
         }
         Action::Wait{ms}=>tokio::time::sleep(Duration::from_millis(*ms)).await,
     }
@@ -1409,6 +1510,11 @@ async fn snapshot(
             let kept: Vec<Value> = matches.into_iter().take(remaining_items).collect();
             remaining_items -= kept.len();
             page["inlineTruncated"] = json!(text_trimmed || total > kept.len());
+            page["returnedTextChars"] = json!(text.chars().count());
+            page["nextRead"] = if text_trimmed || total > kept.len() {
+                json!({"documentPath":document_path,"operation":"inspect","scope":"all",
+                    "notice":"这里只是摘要；完整已加载数据在 documentPath。按 tables.rows 核对 Top N；不足时读取完整文档或按 query 定位表格，不能据摘要断言全部/不存在/只有这些。"})
+            } else { Value::Null };
             page["matchingItems"] = json!(total);
             page["items"] = json!(kept);
             if let Some(headings) = page["headings"].as_array_mut() {
@@ -1561,15 +1667,30 @@ async fn control_session(
     let mut progress=InputProgress::default();
     let task=CONTROL_TAB.scope(s.active_tab.clone(),async {
         if operation!="act" {return Ok(snapshot(app,operation=="screenshot",args).await?.1);}
-        let observation=state.observations.lock().unwrap().get(&s.active_tab).cloned().ok_or("请先 inspect 或 screenshot")?;
-        if args["snapshotId"].as_str()!=Some(&observation.id) { return Err("观察已失效：snapshotId 不是最新观察或已执行；使用最近返回的 snapshotId，不要重放动作".into()); }
         let actions=parse_actions(args, if chrome { 16 } else { 8 })?;
         let all_dom=actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
-        if !all_dom && observation.captured.elapsed()>Duration::from_secs(180) {return Err("观察已过期，请重新观察后继续".into());}
+        let current=state.observations.lock().unwrap().get(&s.active_tab).cloned();
+        let with_image=current.as_ref().is_some_and(|o|o.screenshot) || actions.iter().any(|a|matches!(a,Action::ClickAt{..}|Action::Move{..}|Action::Drag{..}|Action::ScrollAt{..}));
+        let Some(observation)=current.filter(|o|args["snapshotId"].as_str()==Some(&o.id) && (all_dom || o.captured.elapsed()<=Duration::from_secs(180))) else {
+            // Nothing was sent; attach a fresh observation so the model re-decides in this round-trip.
+            let mut observe_args=args.clone();
+            if let Some(a)=observe_args.as_object_mut() {for key in ["ref","frame","region"] {a.remove(key);}}
+            observe_args["fullPage"]=json!(false);
+            if with_image {observe_args["scope"]=json!("viewport");}
+            let mut fresh=snapshot(app,with_image,&observe_args).await?.1;
+            fresh["status"]=json!("not_executed");fresh["completedActions"]=json!(0);fresh["inputAttempted"]=json!(false);
+            fresh["reason"]=json!("snapshotId 不是该标签最新观察或观察已过期，本批次未执行；已附当前观察，用新的 snapshotId/ref/imageId 重新决策，不要重放");
+            return Ok(fresh);
+        };
         // Static validation for the WHOLE batch; revalidate the live node/focus
         // before every individual input. Never retarget by matching its label.
         for action in &actions {
             preflight(&observation,action,args["imageId"].as_str())?;
+        }
+        if chrome {
+            // Background tabs throttle animation/timer sampling, making stable DOM targets time out as "moving".
+            // Activate the explicitly bound tab before live checks; stale geometry/identity is still checked by apply.
+            crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
         }
         state.observations.lock().unwrap().remove(&s.active_tab);
         let mut failure=None;
@@ -1584,6 +1705,10 @@ async fn control_session(
             }
         }
         let mut result=json!({"status":if failure.is_none(){"executed"}else if progress.attempted{"needs_review"}else{"not_executed"},
+            "scrollFeedback":progress.scroll_feedback,
+            "canReobserve":failure.is_some() && progress.dom_preflight && progress.completed==0,
+            // The failing action itself sent no input (DOM preflight); earlier batch actions did complete.
+            "failedAtPreflight":failure.is_some() && progress.dom_preflight,
             "reason":failure,"inputAttempted":progress.attempted,"completedActions":progress.completed,"actionTimingsMs":action_timings,"basedOnSnapshotId":observation.id,"verification":"unverified"});
         result["actionMs"] = json!(started.elapsed().as_millis());
         result["next"] = json!("根据返回的最新状态验证并继续；fill 一次完成聚焦和填写。executed/needs_review 不要直接重放。坐标操作需截图，DOM 操作使用最新 frame/ref。");
@@ -1603,11 +1728,20 @@ async fn control_session(
             if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
             let visual=args["feedback"]=="screenshot" || (args["feedback"].is_null() && observation.screenshot);
             // Feedback failure must never turn a completed mutation into a retryable action failure.
-            match tokio::time::timeout(Duration::from_secs(3), snapshot(app,visual,&feedback_args)).await {
+            match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args)).await {
                 Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
                 Ok(Err(error)) => result["observationError"] = json!(error),
-                Err(_) => result["observationError"] = json!("动作后观察3秒超时；动作状态如上，请观察确认，不要重放"),
+                Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
             }
+        }
+        // JEV runs save their own verified route; everything else feeds the turn's auto trail.
+        if !crate::jev_run::executing_browser_action() {
+            let before = &observation.pages["pages"][0];
+            let after = if result["pages"][0]["url"].is_string() { &result["pages"][0] } else { before };
+            crate::tool_experience::record(if chrome {"chrome"} else {"webview"}, &s.thread_id,
+                before["url"].as_str().unwrap_or_default(), after["url"].as_str().unwrap_or_default(),
+                after["title"].as_str().unwrap_or_default(),
+                actions[..progress.completed].iter().filter_map(|a| trail_step(&observation.pages, a)).collect());
         }
         Ok(result)
     });
@@ -1687,6 +1821,9 @@ async fn control_session(
     }
     if let Ok(value) = &mut result {
         value["durationMs"] = json!(started.elapsed().as_millis());
+        if value["snapshotId"].is_string() {
+            value["jev"] = crate::jev::availability(&app.state::<AppState>().settings.lock().unwrap());
+        }
     }
     result
 }
@@ -1718,6 +1855,36 @@ pub(crate) fn current_context(root: &Path) -> Result<(&'static AppHandle, String
 }
 
 pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> {
+    let result = execute_webview(root, args).await?;
+    Ok(with_experience_hint("webview", &current_context(root)?.1, result))
+}
+
+/// Semantic, value-free description of one completed act for the auto trail; coordinates and
+/// scrolls carry no reusable meaning and are skipped.
+fn trail_step(pages: &Value, action: &Action) -> Option<String> {
+    let target = |frame: &usize, r: &str| pages["pages"][*frame]["items"].as_array()?.iter().find(|i| i["ref"] == r).map(|i| {
+        let name = crate::tool_experience::step_name(i["name"].as_str().unwrap_or_default());
+        let role = i["role"].as_str().or(i["tag"].as_str()).unwrap_or("元素");
+        if name.is_empty() { role.to_string() } else { format!("{role}「{name}」") }
+    });
+    match action {
+        Action::Click { frame, r#ref, .. } => Some(format!("点击 {}", target(frame, r#ref)?)),
+        Action::Fill { frame, r#ref, .. } => Some(format!("填写 {}", target(frame, r#ref)?)),
+        Action::Press { key } => Some(format!("按 {key}")),
+        _ => None,
+    }
+}
+
+/// Attach verified routes the first time this session observes a site; see tool_experience::hint.
+fn with_experience_hint(tool: &str, owner: &str, mut result: Value) -> Value {
+    let origin = result["pages"][0]["url"].as_str().and_then(|u| tauri::Url::parse(u).ok()).map(|u| u.origin().ascii_serialization());
+    if let Some(hint) = origin.and_then(|o| crate::tool_experience::hint(&crate::tool_experience::dir(), tool, owner, &o)) {
+        result["experienceHint"] = hint;
+    }
+    result
+}
+
+async fn execute_webview(root: &Path, args: &Value) -> Result<Value, String> {
     let (app, thread_id) = current_context(root)?;
     let operation = args["operation"].as_str().unwrap_or_default();
     if operation == "open" {
@@ -1734,7 +1901,7 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> 
             .navigate(url)
             .map_err(|e| e.to_string())?;
         return Ok(
-            json!({"browserId":value["browserId"],"status":"opening","next":"页面加载完成后 inspect/screenshot，再用 act 操作"}),
+            json!({"browserId":value["browserId"],"status":"opening","jev":crate::jev::availability(&jev_settings()?),"next":"页面加载完成后 inspect；JEV 启用时优先 run 委托文本 DOM 子目标"}),
         );
     }
     let id = args["browserId"]
@@ -1744,12 +1911,35 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> 
     if s.thread_id != thread_id {
         return Err("浏览器属于其它会话".into());
     }
+    if operation == "run" {
+        return Box::pin(crate::jev_run::browser(root, args, &thread_id, "webview")).await;
+    }
+    if operation == "advise" {
+        let settings = jev_settings()?;
+        if settings.jev_enabled { jev_observation(root, args, &thread_id, "webview")?; }
+        let mut result = crate::jev::advise(settings, args).await?;
+        result["basedOnSnapshotId"] = args["snapshotId"].clone();
+        return Ok(result);
+    }
+    if crate::tool_experience::is_operation(args) {
+        let observed = if operation == "experience_search" { None } else {
+            let pages = jev_observation(root, args, &thread_id, "webview")?;
+            let url = tauri::Url::parse(pages["pages"][0]["url"].as_str().ok_or("观察缺少网站 URL")?).map_err(|e| e.to_string())?;
+            Some(url.origin().ascii_serialization())
+        };
+        let args = args.clone();
+        return tokio::task::spawn_blocking(move || crate::tool_experience::execute(
+            &crate::tool_experience::dir(), "webview", &thread_id, &args, observed.as_deref()))
+            .await.map_err(|e| e.to_string())?;
+    }
     match operation {
         "stop" => {
             s.cancel.store(true, Ordering::SeqCst);
+            app.state::<BrowserState>().observations.lock().unwrap().remove(&s.active_tab);
             Ok(json!({"stopped":true}))
         }
         "tabs" => Ok(json!(s)),
+        "downloads" => downloads(app, &thread_id, args).await,
         "new_tab" | "select_tab" | "close_tab" => {
             change_tab(app, &thread_id, operation, args.clone()).await
         }
@@ -1769,10 +1959,105 @@ pub(crate) fn tool_owner(root: &Path, owner: &str) -> Result<String, String> {
     Ok(format!("{owner}:{}", root.display()))
 }
 
+pub(crate) fn jev_settings() -> Result<crate::settings::Settings, String> {
+    let app = APP.get().ok_or("JEV 仅在 Nova 桌面应用内可用")?;
+    Ok(app.state::<AppState>().settings.lock().unwrap().clone())
+}
+
+fn jev_observation_key(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<String, String> {
+    let app = APP.get().ok_or("仅 Nova 内可用")?;
+    let key = if tool == "webview" {
+        let (_, thread_id) = current_context(root)?;
+        if thread_id != owner { return Err("会话已切换，停止 JEV 连续决策".into()); }
+        let s = session(app, args["browserId"].as_str().ok_or("缺少 browserId")?)?;
+        check(app, &s)?;
+        s.active_tab
+    } else {
+        let owner = tool_owner(root, owner)?;
+        let tag = args["tabTag"].as_str().ok_or("缺少 tabTag")?;
+        format!("chrome:{owner}:{tag}")
+    };
+    Ok(key)
+}
+
+pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
+    let app = APP.get().ok_or("仅 Nova 内可用")?;
+    let key = jev_observation_key(root, args, owner, tool)?;
+    let state = app.state::<BrowserState>();
+    let observations = state.observations.lock().unwrap();
+    let observation = observations.get(&key)
+        .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
+        .ok_or("观察已失效，交回主模型重新观察")?;
+    Ok(observation.pages.clone())
+}
+
+fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashMap<String, Observation>) -> Result<Value, String> {
+    let mut args = args.as_object().cloned().ok_or("chrome 参数必须是对象")?;
+    match args.get("operation").and_then(Value::as_str).unwrap_or_default() {
+        "connect" | "status" | "tabs" | "open" | "new_tab" | "downloads" | "experience_search" => return Ok(Value::Object(args)),
+        "inspect" | "screenshot" | "act" | "run" | "advise" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
+        _ => return Err("缺少或无效 operation；先用 {\"operation\":\"tabs\"} 获取标签".into()),
+    }
+    let valid_tag = |tag: &str| tag.len() <= 80 && tag.starts_with('C')
+        && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if let Some(tag) = args.get("tabTag") {
+        if !tag.as_str().is_some_and(valid_tag) {
+            return Err("tabTag 无效；原样复制 tabs[].tag 或 open 返回的 tabTag（不是数字 tabId/browserId）".into());
+        }
+        return Ok(Value::Object(args));
+    }
+    if args.contains_key("tabId") || args.contains_key("browserId") {
+        return Err("Chrome 目标参数名是 tabTag；请复制 tabs[].tag 或 open 返回的 tabTag，不能使用 tabId/browserId".into());
+    }
+    // Reuse only this owner's observations, never Chrome's active tab or another client's target.
+    // ponytail: linear scan of live observations; index by owner if tab counts make this measurable.
+    let prefix = format!("chrome:{owner}:");
+    let mut matches = observations.iter().filter_map(|(key, observation)| {
+        let tag = key.strip_prefix(&prefix).filter(|tag| valid_tag(tag))?;
+        (observation.captured.elapsed() <= Duration::from_secs(180)
+            && args.get("snapshotId").is_none_or(|id| id.as_str() == Some(&observation.id)))
+            .then_some(tag)
+    });
+    let tag = matches.next().filter(|_| matches.next().is_none()).ok_or(
+        "缺少 tabTag，且无法从本会话 snapshotId 或唯一有效观察确定目标。请复制上次返回的 tabTag；没有则调用 {\"operation\":\"tabs\",\"query\":\"目标标题或URL片段\"}，再携带 tabTag 继续；act 还需最新 snapshotId 和 action/actions",
+    )?;
+    args.insert("tabTag".into(), json!(tag));
+    Ok(Value::Object(args))
+}
+
 pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
+    let thread_id = tool_owner(root, owner)?;
+    let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
+    let normalized = chrome_args(args, &thread_id, &app.state::<BrowserState>().observations.lock().unwrap())?;
+    let mut result = execute_chrome_inner(root, &normalized, owner).await?;
+    if args.get("tabTag").is_none() && normalized["tabTag"].is_string() {
+        result["tabTag"] = normalized["tabTag"].clone();
+        result["targetResolvedFrom"] = json!(if args.get("snapshotId").is_some() { "snapshotId" } else { "sessionObservation" });
+    }
+    Ok(with_experience_hint("chrome", &thread_id, result))
+}
+
+async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
     let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
     let thread_id = tool_owner(root, owner)?;
     let operation = args["operation"].as_str().unwrap_or_default();
+    if operation == "run" {
+        return Box::pin(crate::jev_run::browser(root, args, owner, "chrome")).await;
+    }
+    if operation == "advise" {
+        let settings = jev_settings()?;
+        if settings.jev_enabled {
+            let tag = args["tabTag"].as_str().ok_or("JEV 辅助判断需 tabTag")?;
+            let state = app.state::<BrowserState>();
+            let observations = state.observations.lock().unwrap();
+            observations.get(&format!("chrome:{thread_id}:{tag}"))
+                .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
+                .ok_or("JEV 辅助判断需本会话该标签最新观察（180秒内）")?;
+        }
+        let mut result = crate::jev::advise(settings, args).await?;
+        result["basedOnSnapshotId"] = args["snapshotId"].clone();
+        return Ok(result);
+    }
     if crate::tool_experience::is_operation(args) {
         let observed = if operation == "experience_search" { None } else {
             let tag = args["tabTag"].as_str().ok_or("经验保存/反馈需tabTag")?;
@@ -1786,12 +2071,17 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
         };
         let args = args.clone();
         return tokio::task::spawn_blocking(move || crate::tool_experience::execute(
-            &crate::lyra::config::nova_root().join("tool-experiences"), "chrome", &thread_id, &args, observed.as_deref()))
+            &crate::tool_experience::dir(), "chrome", &thread_id, &args, observed.as_deref()))
             .await.map_err(|e| e.to_string())?;
     }
     let connection = crate::chrome_browser::connect(app).await?;
+    if operation == "downloads" {
+        return crate::chrome_browser::request(app, operation, args.clone()).await
+            .map_err(|e| format!("{e}；下载查询需要 Nova Chrome 0.1.6，请确认扩展已更新并重新加载"));
+    }
     if matches!(operation, "connect" | "status") {
         let mut connection = connection;
+        connection["jev"] = crate::jev::availability(&jev_settings()?);
         if connection["connected"] == true {
             match crate::chrome_browser::request(app, "status", json!({})).await {
                 Ok(capabilities) => connection["incognitoAllowed"] = capabilities["incognitoAllowed"].clone(),
@@ -1861,16 +2151,10 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
         }
         return Ok(value);
     }
-    let tag = args["tabTag"]
-        .as_str()
-        .filter(|tag| {
-            tag.len() <= 80
-                && tag.starts_with('C')
-                && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
-        .ok_or("缺少有效 tabTag；请先 chrome.tabs（可带 query 唯一匹配直接绑定），不会默认操作当前激活标签")?;
+    let tag = args["tabTag"].as_str().ok_or("缺少 tabTag")?;
     if operation == "stop" {
         crate::chrome_browser::stop(app, tag);
+        app.state::<BrowserState>().observations.lock().unwrap().remove(&format!("chrome:{thread_id}:{tag}"));
     }
     if matches!(
         operation,
@@ -2005,6 +2289,57 @@ fn state_dir(app: &AppHandle) -> std::path::PathBuf {
 mod tests {
     use super::*;
     #[test]
+    fn chrome_recovers_missing_target_only_from_unambiguous_owned_observations() {
+        let observation = Observation { frames: Vec::new(), pages: json!({}), id: "current".into(),
+            captured: std::time::Instant::now(), screenshot: true, full_page: false,
+            images: Vec::new() };
+        let mut observations = std::collections::HashMap::new();
+        let inspect = json!({"operation":"inspect"});
+        assert!(chrome_args(&inspect, "owner", &observations).is_err());
+        observations.insert("chrome:other:C1-test".into(), observation.clone());
+        observations.insert("chrome:owner:another-root:C1-test".into(), observation.clone());
+        assert!(chrome_args(&inspect, "owner", &observations).is_err());
+        observations.insert("chrome:owner:C1-test".into(), observation.clone());
+        assert_eq!(chrome_args(&inspect, "owner", &observations).unwrap()["tabTag"], "C1-test");
+        let act = json!({"operation":"act","snapshotId":"current","action":{"action":"click","frame":0,"ref":"observed-ref"}});
+        let normalized = chrome_args(&act, "owner", &observations).unwrap();
+        assert_eq!(normalized["tabTag"], "C1-test");
+        assert_eq!(normalized["action"], act["action"]);
+        assert_eq!(normalized["snapshotId"], "current");
+        for key in ["tabId", "browserId"] {
+            let mut wrong_target = act.clone();
+            wrong_target[key] = json!("another-target");
+            assert!(chrome_args(&wrong_target, "owner", &observations).is_err());
+        }
+        let mut second = observation.clone();
+        second.id = "second".into();
+        observations.insert("chrome:owner:C2-test".into(), second);
+        assert!(chrome_args(&inspect, "owner", &observations).is_err());
+        assert_eq!(chrome_args(&act, "owner", &observations).unwrap()["tabTag"], "C1-test");
+        for operation in ["run", "advise", "experience_save", "experience_feedback", "goto", "close_tab"] {
+            let args = json!({"operation":operation,"snapshotId":"second"});
+            assert_eq!(chrome_args(&args, "owner", &observations).unwrap()["tabTag"], "C2-test");
+        }
+        for snapshot in [json!("stale"), json!(123), Value::Null] {
+            assert!(chrome_args(&json!({"operation":"act","snapshotId":snapshot}), "owner", &observations).is_err());
+        }
+        for tag in [json!(""), json!(123), json!("C1:other"), Value::Null] {
+            assert!(chrome_args(&json!({"operation":"run","tabTag":tag,"snapshotId":"current"}), "owner", &observations).is_err());
+        }
+        let explicit = json!({"operation":"inspect","tabTag":"C3-explicit"});
+        assert_eq!(chrome_args(&explicit, "owner", &observations).unwrap(), explicit);
+        observations.get_mut("chrome:owner:C1-test").unwrap().captured -= Duration::from_secs(181);
+        assert!(chrome_args(&act, "owner", &observations).is_err());
+        observations.remove("chrome:owner:C2-test");
+        assert!(chrome_args(&inspect, "owner", &observations).is_err());
+        for operation in ["connect", "status", "tabs", "open", "new_tab", "downloads", "experience_search"] {
+            let args = json!({"operation":operation});
+            assert_eq!(chrome_args(&args, "owner", &observations).unwrap(), args);
+        }
+        assert!(chrome_args(&json!({}), "owner", &observations).is_err());
+    }
+
+    #[test]
     fn background_tool_owners_are_stable_and_isolated() {
         let root = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
@@ -2066,5 +2401,9 @@ mod tests {
             parse_action(r#"{"action":"click","frame":0,"ref":"v1:0","selector":"body"}"#).is_err()
         );
         assert!(parse_action(r#"{"action":"eval","code":"alert(1)"}"#).is_err());
+        let error = parse_action(r#"{"action":"click","x":100,"y":100}"#).unwrap_err();
+        assert!(error.contains("click_at") && error.contains("imageId 放在工具顶层"));
+        let error = parse_action(r#"{"action":"press","key":"Enter","frame":0}"#).unwrap_err();
+        assert!(error.contains("不传 frame/ref"));
     }
 }

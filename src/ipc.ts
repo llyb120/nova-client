@@ -36,6 +36,7 @@ import type {
   WorktreeRecord,
 } from "./types";
 import type { WorkflowDef } from "./workflow/types";
+import type { Preset } from "./lyraConfig";
 
 export function fileUriPath(uri: string) {
   const raw = uri.replace(/^file:\/\//, "");
@@ -47,8 +48,8 @@ export function fileUriPath(uri: string) {
 export const api = {
   workspaceGitStatus: (threadId: string) =>
     invoke<{ repo: string; files: { path: string; oldPath: string | null; index: string; worktree: string }[] }>("workspace_git_status", { threadId }),
-  workspaceGitDiff: (threadId: string, path: string, staged: boolean) =>
-    invoke<string>("workspace_git_diff", { threadId, path, staged }),
+  workspaceGitDiff: (threadId: string, path: string, staged: boolean, fullContext = false) =>
+    invoke<string>("workspace_git_diff", { threadId, path, staged, fullContext }),
   /** 图片变动的新旧两份内容（base64 data URI），用于直接看图对比。 */
   workspaceGitImage: (threadId: string, path: string, staged: boolean) =>
     invoke<{ before: string | null; after: string | null }>("workspace_git_image", { threadId, path, staged }),
@@ -237,6 +238,14 @@ export const api = {
     invoke<ModelOptions | null>("get_model_options", { agentKind }),
   /** 设置页手动刷新 Lyra 本地配置：重读 config.jsonc 并后台重拉模型列表。 */
   refreshLyraConfig: () => invoke<void>("refresh_lyra_config"),
+  /** 设置页图形化编辑 Lyra config.jsonc；保存后后端立即重载。 */
+  getLyraConfig: () => invoke<Record<string, any>>("get_lyra_config"),
+  getLyraPresets: () => invoke<Preset[]>("get_lyra_presets"),
+  importLocalLyraProvider: (source: "codex" | "claude-code") =>
+    invoke<{ provider: Record<string, any>; model: string }>("import_local_lyra_provider", { source }),
+  fetchLyraModels: (id: string, provider: Record<string, any>) =>
+    invoke<Record<string, any>>("fetch_lyra_models", { id, provider }),
+  saveLyraConfig: (config: Record<string, any>) => invoke<void>("save_lyra_config", { config }),
   getSlashCommands: (agentKind: AgentKind) =>
     invoke<SlashCommand[]>("get_slash_commands", { agentKind }),
   renameThread: (threadId: string, title: string) =>

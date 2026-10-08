@@ -50,6 +50,7 @@ pub fn session_cleanup_is_expired(timestamp: i64, now: i64, hours: u32) -> bool 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
+    Claude,
     Kimi,
     Devin,
     Codex,
@@ -78,6 +79,7 @@ impl<'de> Deserialize<'de> for AgentKind {
 impl AgentKind {
     pub fn as_str(&self) -> &'static str {
         match self {
+            AgentKind::Claude => "claude",
             AgentKind::Kimi => "kimi",
             AgentKind::Devin => "devin",
             AgentKind::Codex => "codex",
@@ -92,6 +94,7 @@ impl AgentKind {
     /// 从字符串解析后端标识（大小写不敏感）；无法识别返回 None。
     pub fn from_str(s: &str) -> Option<AgentKind> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(AgentKind::Claude),
             "kimi" => Some(AgentKind::Kimi),
             // Vega 已移除：旧的 alkaid 标识一律映射到 Lyra。
             "alkaid" => Some(AgentKind::Lyra),
@@ -109,6 +112,7 @@ impl AgentKind {
     /// 展示用名称（注入接力上下文 / 系统提示用）
     pub fn label(&self) -> &'static str {
         match self {
+            AgentKind::Claude => "Claude Code",
             AgentKind::Kimi => "Kimi Code",
             AgentKind::Devin => "Devin",
             AgentKind::Codex => "Codex",
@@ -256,13 +260,11 @@ pub(crate) fn compact_tool_value(value: &Value) -> Value {
         Value::String(s) => {
             // ACP 还会把 MCP 图片块序列化进 text，先保留 JSON 结构中的有效元数据。
             if (s.trim_start().starts_with('{') || s.trim_start().starts_with('['))
-                && s.contains("\"image\"")
-                && s.contains("\"data\"")
             {
                 if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-                    return Value::String(limit_display_text(
-                        &compact_tool_value(&parsed).to_string(),
-                    ));
+                    // Unwrap nested ACP/MCP JSON before limiting any strings. Limiting the
+                    // serialized envelope loses status/snapshot/path fields and can leave only base64.
+                    return Value::String(compact_tool_value(&parsed).to_string());
                 }
             }
             Value::String(limit_display_text(s))
@@ -312,6 +314,12 @@ fn tool_images_are_compacted_before_text_is_truncated() {
         assert!(output.contains("图片数据已省略"));
         assert!(!output.contains("AAAA"));
     }
+    let nested = serde_json::json!({"content":[{"type":"text","text":result.to_string()}],
+        "status":"needs_review","snapshotId":"new","documentPath":"C:/shots/new.json"});
+    let output = compact_tool_value(&Value::String(nested.to_string())).to_string();
+    assert!(output.contains("needs_review") && output.contains("new.json"));
+    assert!(output.contains("动作未执行") && !output.contains("AAAA"));
+    assert!(output.len() < 2048);
     let unicode = compact_tool_value(&Value::String("界".repeat(TOOL_OUTPUT_LIMIT)));
     assert!(unicode.as_str().unwrap().ends_with('界'));
     assert!(unicode.as_str().unwrap().len() < TOOL_OUTPUT_LIMIT + 128);
@@ -643,6 +651,9 @@ pub struct Thread {
     /// 旧版本训练记录标记：仅为保持本地隔离而兼容，不再创建此类会话。
     #[serde(default)]
     pub experience_thread: bool,
+    /// 数字员工会话：不进普通会话列表，只在员工页「最近运行」里出现。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub employee_thread: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -715,6 +726,7 @@ impl Thread {
             quota_peer_name: None,
             worktree: None,
             experience_thread: false,
+            employee_thread: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
             pending_stage_context: None,
@@ -980,6 +992,9 @@ pub struct ThreadMeta {
     /// 兼容旧版本训练记录，避免混入普通历史。
     #[serde(default)]
     pub experience_thread: bool,
+    /// 数字员工会话：不进普通会话列表，只在员工页「最近运行」里出现。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub employee_thread: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,

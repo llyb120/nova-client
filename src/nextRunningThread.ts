@@ -5,7 +5,7 @@ export function nextRunningThread(
   threads: readonly ThreadMeta[], currentId: string | null,
   running: Readonly<Record<string, boolean>>,
 ): ThreadMeta | undefined {
-  const ordinary = threads.filter(t => !t.experienceThread);
+  const ordinary = threads.filter(t => !t.experienceThread && !t.employeeThread);
   const byId = new Map(ordinary.map(t => [t.id, t]));
   const rootOf = (thread: ThreadMeta) => {
     const seen = new Set([thread.id]);

@@ -2,7 +2,6 @@
 //! 工具结果治理（超限归档 + 首尾截断）、provider 重试判定与用量合并。
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Reasonix 风格的单工具上下文预算；超限文本先归档再截断。
@@ -152,11 +151,13 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "other side closed",
     "network connection lost",
     "upstream stream ended prematurely",
+    "upstream stream ended before terminal chunk",
     "safe to retry",
     "stream ended before a terminal response event",
     "stream ended without finish_reason",
     "provider finish_reason",
     "provider stop_reason",
+    "provider returned no actionable output",
     "error decoding response body",
     "idle timeout",
     "sse 连续",
@@ -450,28 +451,6 @@ Rules:
 
 Not lazy about: understanding the problem (read it fully and trace the real flow before picking a rung, a small diff you don't understand is just laziness dressed up as efficiency), input validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs (the platform is never the spec ideal, a clock drifts, a sensor reads off), anything explicitly requested. Lazy code without its check is unfinished: non-trivial logic leaves ONE runnable check behind, the smallest thing that fails if the logic breaks (an assert-based demo/self-check or one small test file; no frameworks, no fixtures). Trivial one-liners need no test."#;
 
-pub fn system_prompt_fingerprint(options: &SystemPromptOptions) -> String {
-    let shell = options
-        .shell
-        .as_ref()
-        .map(|shell| format!("{:?}:{}", shell.kind, shell.program))
-        .unwrap_or_default();
-    let shape = json!({
-        "cwd": options.cwd.trim_start_matches(r"\\?\").replace('\\', "/"),
-        "readOnly": options.read_only,
-        "fastContext": options.fast_context,
-        "autoChangeProject": options.auto_change_project,
-        "shell": shell,
-        "skills": options.skills_text,
-        "customInstructions": options.custom_instructions,
-        "ponytail": options.ponytail,
-
-        "editMode": std::env::var("LYRA_EDIT_MODE").unwrap_or_default(),
-    });
-    let digest = Sha256::digest(serde_json::to_vec(&shape).unwrap_or_default());
-    format!("{digest:x}")[..16].to_string()
-}
-
 /// 稳定段在前、动态段在后，配合 session 级 prompt_cache_key 最大化前缀缓存命中。
 pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     let polaris = options.fast_context;
@@ -621,6 +600,9 @@ mod tests {
         assert!(is_retryable_provider_error("connection error: ECONNRESET"));
         assert!(is_retryable_provider_error(
             "provider error: Upstream stream ended prematurely; safe to retry"
+        ));
+        assert!(is_retryable_provider_error(
+            "provider 错误：Upstream stream ended before terminal chunk"
         ));
         assert!(is_retryable_provider_error(
             "读取响应流失败：error decoding response body"

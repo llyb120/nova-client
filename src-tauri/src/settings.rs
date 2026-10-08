@@ -64,15 +64,22 @@ fn default_powershell_utf8() -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
+    pub jev_enabled: bool,
+    pub jev_api_key: String,
+    pub jev_api_url: String,
     /// Kimi Code CLI，使用固定的 `acp` 子命令。
     pub kimi_path: String,
+    /// Claude Code 的 ACP adapter（不是 claude CLI 本身）。
+    pub claude_path: String,
+    pub claude_proxy: String,
+    pub claude_enabled: bool,
     pub kimi_proxy: String,
     pub kimi_enabled: bool,
     /// ACP agent 可执行文件路径（默认 devin，依赖 PATH）
     pub devin_path: String,
     /// Devin ACP 启动参数（空格分隔）。
     pub acp_args: String,
-    /// Devin 代理地址（空 = 不覆盖环境变量；下同：注入 HTTP(S)_PROXY 等到该后端子进程）
+    /// Devin 代理地址（空 = 直连，不继承系统代理；下同：注入 HTTP(S)_PROXY 等到该后端子进程）
     pub devin_proxy: String,
     /// CodeBuddy CLI 可执行文件路径（默认 codebuddy，依赖 PATH）
     pub codebuddy_path: String,
@@ -99,9 +106,9 @@ pub struct Settings {
     pub codex_path: String,
     /// Codex app-server 启动参数
     pub codex_args: String,
-    /// Codex 代理地址（空 = 不覆盖环境变量）
+    /// Codex 代理地址（空 = 直连，不继承系统代理）
     pub codex_proxy: String,
-    /// Lyra provider 代理地址（空 = 不覆盖环境变量）
+    /// Lyra provider 代理地址（空 = 直连，不继承系统代理）
     #[serde(alias = "vegaProxy")]
     pub lyra_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
@@ -192,7 +199,13 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            jev_enabled: false,
+            jev_api_key: String::new(),
+            jev_api_url: String::new(),
             kimi_path: "kimi".into(),
+            claude_path: "claude-agent-acp".into(),
+            claude_proxy: String::new(),
+            claude_enabled: false,
             kimi_proxy: String::new(),
             kimi_enabled: false,
             devin_path: "devin".into(),

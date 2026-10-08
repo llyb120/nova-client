@@ -1,4 +1,5 @@
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog";
 import * as QRCode from "qrcode";
@@ -22,6 +23,7 @@ import {
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { ModelPicker, type SharedModelSource } from "./ConfigSelects";
 import { IconPlus, IconX } from "./icons";
+import { LyraConfigPanel } from "./LyraConfigPanel";
 import { ProjectPicker } from "./ProjectPicker";
 import { WorkflowPicker } from "./WorkflowPicker";
 import {
@@ -168,7 +170,7 @@ function ProxyField(props: { value: string; onInput: (v: string) => void }) {
         class="field-input"
         value={props.value}
         onInput={(e) => props.onInput(e.currentTarget.value)}
-        placeholder="http://127.0.0.1:10808"
+        placeholder="留空直连；如 http://127.0.0.1:10808"
       />
     </label>
   );
@@ -219,6 +221,8 @@ function CliManager(props: {
 type SettingsTab =
   | "general"
   | "advanced"
+  | "jev"
+  | "lyra"
   | "backends"
   | "instructions"
   | "appearance"
@@ -231,6 +235,8 @@ type SettingsTab =
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
   { id: "advanced", name: "高级" },
+  { id: "jev", name: "JEV 辅助决策" },
+  { id: "lyra", name: "Lyra" },
   { id: "backends", name: "模型后端" },
   { id: "instructions", name: "Agent 配置" },
   { id: "appearance", name: "外观" },
@@ -243,9 +249,26 @@ const TABS: { id: SettingsTab; name: string }[] = [
 
 export function SettingsModal(props: { onClose: () => void }) {
   const s = state.settings;
+  const [jevEnabled, setJevEnabled] = createSignal(s?.jevEnabled ?? false);
+  const [jevApiUrl, setJevApiUrl] = createSignal(s?.jevApiUrl ?? "");
+  const [jevTesting, setJevTesting] = createSignal(false);
+  const [jevTestResult, setJevTestResult] = createSignal("");
+  const testJev = async () => {
+    setJevTesting(true);
+    setJevTestResult("");
+    try {
+      const result = await invoke<{ elapsedMs: number }>("test_jev_connection", { apiKey: jevApiKey().trim(), apiUrl: jevApiUrl().trim() });
+      setJevTestResult(`接口测试通过，耗时 ${result.elapsedMs} ms（仅固定测试，不代表控制成功率）`);
+    } catch (error) { setJevTestResult(String(error)); }
+    finally { setJevTesting(false); }
+  };
+  const [jevApiKey, setJevApiKey] = createSignal(s?.jevApiKey ?? "");
   const [tab, setTab] = createSignal<SettingsTab>("general");
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
+  const [claudePath, setClaudePath] = createSignal(s?.claudePath ?? "claude-agent-acp");
+  const [claudeProxy, setClaudeProxy] = createSignal(s?.claudeProxy ?? "");
+  const [claudeEnabled, setClaudeEnabled] = createSignal(s?.claudeEnabled === true);
   const [kimiPath, setKimiPath] = createSignal(s?.kimiPath ?? "kimi");
   const [kimiProxy, setKimiProxy] = createSignal(s?.kimiProxy ?? "");
   const [kimiEnabled, setKimiEnabled] = createSignal(s?.kimiEnabled === true);
@@ -365,22 +388,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     }
   };
 
-  const [lyraRefreshing, setLyraRefreshing] = createSignal(false);
-  const [lyraRefreshMsg, setLyraRefreshMsg] = createSignal("");
-
-  const refreshLyraConfig = async () => {
-    setLyraRefreshing(true);
-    setLyraRefreshMsg("");
-    try {
-      await api.refreshLyraConfig();
-      setLyraRefreshMsg("已重载配置，模型列表刷新中…");
-      setTimeout(() => setLyraRefreshMsg(""), 4000);
-    } catch (e) {
-      setLyraRefreshMsg(`刷新失败：${String(e)}`);
-    } finally {
-      setLyraRefreshing(false);
-    }
-  };
 
   const restartAgents = async () => {
     setRestarting(true);
@@ -416,6 +423,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     [
       devinEnabled(),
       kimiEnabled(),
+      claudeEnabled(),
       lyraEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
@@ -689,6 +697,12 @@ export function SettingsModal(props: { onClose: () => void }) {
   };
 
   const draftSettings = (): Settings => ({
+    jevEnabled: jevEnabled(),
+    jevApiKey: jevApiKey().trim(),
+    jevApiUrl: jevApiUrl().trim(),
+    claudePath: claudePath().trim() || "claude-agent-acp",
+    claudeProxy: claudeProxy().trim(),
+    claudeEnabled: claudeEnabled(),
     kimiPath: kimiPath().trim() || "kimi",
     kimiProxy: kimiProxy().trim(),
     kimiEnabled: kimiEnabled(),
@@ -1001,6 +1015,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     });
   });
 
+  let saveLyraConfig: (() => Promise<void>) | undefined;
   const save = async () => {
     const draftedShortcuts = draftSessionShortcuts();
     const keyCounts = new Map<string, number>();
@@ -1023,6 +1038,8 @@ export function SettingsModal(props: { onClose: () => void }) {
     const shellShimChanged =
       settings.windowsShellShimEnabled !== (state.settings?.windowsShellShimEnabled ?? false);
     try {
+      // 先写 Lyra 配置：校验失败时整体中止，不会只保存一半。
+      await saveLyraConfig?.();
       await api.setSettings(settings);
       setState("settings", settings);
       // 只有设置成功持久化后才确认通道切换；检查与下载在后台进行，不阻塞保存或关闭弹窗。
@@ -1104,6 +1121,28 @@ export function SettingsModal(props: { onClose: () => void }) {
         </div>
 
         <div class="modal-body">
+          <Show when={tab() === "jev"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">JEV DOM 决策</h3>
+              <label class="field">
+                <span><input type="checkbox" checked={jevEnabled()} onChange={e => setJevEnabled(e.currentTarget.checked)} /> 启用 JEV</span>
+                <span class="field-hint">保存后生效。使用 jev-latest，默认使用系统代理。浏览器 DOM 操作默认委托 JEV，按元素编号规划并在每步后刷新 DOM；视觉操作由主模型负责，JEV 只辅助判断文字证据。仅实际调用 advise/run 时产生用量。不确定时交回主模型，关闭后不发起新请求。</span>
+              </label>
+              <label class="field">
+                <span class="field-label">API 地址</span>
+                <input class="field-input" type="url" placeholder="https://api.typesafe.ai/v1/systemone" value={jevApiUrl()} onInput={e => setJevApiUrl(e.currentTarget.value)} />
+                <span class="field-hint">留空使用 TypeSafe 官方接口；第三方服务请填写兼容 SystemOne 协议的完整接口地址（含路径），并使用该服务的 API Key。</span>
+              </label>
+              <label class="field">
+                <span class="field-label">API Key</span>
+                <input class="field-input" type="text" autocomplete="off" value={jevApiKey()} onInput={e => setJevApiKey(e.currentTarget.value)} />
+                <span class="field-hint">密钥保存在本机设置文件中（非加密）；也可留空使用 NOVA_JEV_API_KEY 环境变量。调用时会向所配置的服务发送任务、观察摘要和候选项；连续执行还会发送相关页面文本与目标信息，不上传截图；请勿提交密码、令牌等敏感信息。JEV 不负责视觉定位。</span>
+              </label>
+              <button type="button" class="btn" disabled={jevTesting()} onClick={() => void testJev()}>{jevTesting() ? "测试中…" : "测试连接"}</button>
+              <p class="field-hint">使用当前填写的地址和密钥发送固定测试，可能产生少量费用；无需先保存或启用。</p>
+              <p role="status" aria-live="polite">{jevTestResult()}</p>
+            </section>
+          </Show>
           {/* ===== 通用 ===== */}
           <Show when={tab() === "general"}>
             <section class="settings-group">
@@ -1622,12 +1661,8 @@ export function SettingsModal(props: { onClose: () => void }) {
             </section>
           </Show>
 
-          {/* ===== 模型后端 ===== */}
-          <Show when={tab() === "backends"}>
-            <p class="field-hint">
-              每个后端可单独启用/关闭并配置启动方式。关闭的后端不会出现在新建/切换会话的后端列表里（历史会话仍可打开查看）。
-            </p>
-
+          {/* ===== Lyra（常驻挂载，切换 tab 不丢草稿） ===== */}
+          <div class="settings-tab-pane" hidden={tab() !== "lyra"}>
             <div class="backend-card">
               <div class="backend-card-head">
                 <span class={`agent-badge lyra`}>{agentLabel("lyra")}</span>
@@ -1644,21 +1679,36 @@ export function SettingsModal(props: { onClose: () => void }) {
               </div>
               <span class="field-hint">Rust 原生 agent，不经 Node bridge；复用本机模型 provider 配置与 Skills。</span>
               <ProxyField value={lyraProxy()} onInput={setLyraProxy} />
-              <div class="backend-quota-row">
-                <span class="field-label">本地配置</span>
-                <span class="field-hint">修改 ~/.nova/alkaid/config.jsonc 后点此按钮，立即重载模型列表、补全与预热配置。</span>
-                <Show when={lyraRefreshMsg()}>
-                  <span class="field-hint">{lyraRefreshMsg()}</span>
-                </Show>
-                <button
-                  type="button"
-                  class="link-btn backend-quota-refresh"
-                  disabled={lyraRefreshing()}
-                  onClick={() => void refreshLyraConfig()}
-                >
-                  {lyraRefreshing() ? "刷新中…" : "刷新配置"}
-                </button>
+            </div>
+
+            <LyraConfigPanel onSaver={(fn) => (saveLyraConfig = fn)} />
+          </div>
+
+          {/* ===== 模型后端 ===== */}
+          <Show when={tab() === "backends"}>
+            <p class="field-hint">
+              每个后端可单独启用/关闭并配置启动方式。关闭的后端不会出现在新建/切换会话的后端列表里（历史会话仍可打开查看）。
+            </p>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class="agent-badge claude">Claude Code</span>
+                <span class="fixed-integration">ACP</span>
+                <Show when={backendMissing("claude")}><span class="backend-missing">未检测到 ACP adapter</span></Show>
+                <label class="backend-switch">
+                  <input type="checkbox" checked={claudeEnabled()} disabled={claudeEnabled() && enabledCount() === 1} onChange={(e) => setClaudeEnabled(e.currentTarget.checked)} />
+                  <span>启用</span>
+                </label>
               </div>
+              <CliManager status={cliStatuses().claude} loading={cliLoading()} />
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">ACP 可执行文件</span>
+                  <input class="field-input" value={claudePath()} onInput={(e) => setClaudePath(e.currentTarget.value)} placeholder="claude-agent-acp" />
+                </label>
+              </div>
+              <ProxyField value={claudeProxy()} onInput={setClaudeProxy} />
+              <p class="field-hint">需要 Node.js 22+。安装 ACP adapter，并先通过 Claude Code 登录，或在环境变量中配置 ANTHROPIC_API_KEY；此处填写 claude-agent-acp，而不是 claude。Nova 工具通过会话 MCP 自动挂载。</p>
             </div>
 
             <div class="backend-card">

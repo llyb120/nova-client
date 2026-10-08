@@ -18,13 +18,9 @@ pub enum StreamEvent {
     Activity,
     TextDelta(String),
     ThinkingDelta(String),
-    /// 工具调用参数的流式增量：index 为本条消息内工具调用序号，
-    /// args 为该调用迄今累积的参数 JSON 片段（供投机执行预解析）。
-    ToolArgsDelta {
-        index: usize,
-        name: String,
-        args: String,
-    },
+    /// 某个工具调用的参数已完整（anthropic content_block_stop / responses output_item.done /
+    /// completions 下一个调用开始）：turn 据此提前派发只读工具。
+    ToolCallDone { id: String, name: String, arguments: Value },
 }
 
 #[derive(Debug, Default)]
@@ -80,6 +76,14 @@ fn tool_result_text(message: &Value) -> String {
     clamp_tool_output_text(&text)
 }
 
+fn screenshot_caption(message: &Value) -> String {
+    let details = &message["details"];
+    let images: Vec<Value> = details["images"].as_array().into_iter().flatten().take(16)
+        .map(|image| json!({"imageId":image["imageId"],"pixelWidth":image["pixelWidth"],"pixelHeight":image["pixelHeight"]})).collect();
+    format!("Browser screenshots for toolCallId={}, snapshotId={}; images in order: {}. With imageId, use coordinates measured directly on that returned image in image pixels. NEVER rescale using CSS viewport dimensions, DPI or crop offsets: the tool maps these automatically. Do not reuse coordinates from another image. {}",
+        message["toolCallId"], details["snapshotId"], json!(images), details["coordinateSpace"].as_str().unwrap_or_default())
+}
+
 fn tool_result_images(message: &Value, model: &ResolvedModel) -> Vec<Value> {
     if !model.supports_images {
         return Vec::new();
@@ -93,14 +97,16 @@ fn tool_result_images(message: &Value, model: &ResolvedModel) -> Vec<Value> {
         .cloned()
         .collect();
     let paths = message.pointer("/details/images").and_then(Value::as_array)
-        .into_iter().flatten().filter_map(|image| image["path"].as_str())
-        .chain(message.pointer("/details/imagePath").and_then(Value::as_str));
-    for path in paths.take(16) {
+        .into_iter().flatten().filter_map(|image| image["path"].as_str().map(|path| (path,image.clone())))
+        .chain(message.pointer("/details/imagePath").and_then(Value::as_str).map(|path| (path,json!({}))));
+    for (path, metadata) in paths.take(16) {
         if let Ok(data) = std::fs::read(path) {
             images.push(json!({
                 "type": "image",
                 "mimeType": "image/png",
                 "data": base64::engine::general_purpose::STANDARD.encode(data),
+                "caption":format!("This image: imageId={}, {}×{} image pixels; snapshotId={}. Use these image pixels directly with imageId, without CSS/DPI conversion.",
+                    metadata["imageId"],metadata["pixelWidth"],metadata["pixelHeight"],message["details"]["snapshotId"]),
             }));
         }
     }
@@ -210,15 +216,13 @@ fn completions_messages(
                 }));
                 let images = tool_result_images(message, model);
                 if !images.is_empty() {
-                    let mut parts = vec![
-                        json!({ "type": "text", "text": "Screenshot returned by the browser tool." }),
-                    ];
-                    parts.extend(images.into_iter().map(|image| json!({
+                    let mut parts = Vec::new();
+                    parts.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
                         "type": "image_url",
                         "image_url": { "url": format!("data:{};base64,{}",
                             image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
                             image.get("data").and_then(Value::as_str).unwrap_or_default()) }
-                    })));
+                    })]));
                     screenshots.push(json!({ "role": "user", "content": parts }));
                 }
             }
@@ -278,6 +282,32 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
     }
 }
 
+// ponytail: ~3 UTF-8 bytes per token conservatively bounds text tokens (CJK ≈ 3 bytes/char,
+// ASCII ≈ 4 bytes/token; raw byte counts overestimated 4x and starved long chats down to 16 output
+// tokens); image cost is a heuristic (8192 per image). Replace with provider token counting when available.
+fn request_input_budget(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => (text.len() as u64).div_ceil(3),
+        Value::Array(items) => items.iter().map(request_input_budget).sum(),
+        Value::Object(fields) => {
+            if matches!(fields.get("type").and_then(Value::as_str),
+                Some("image" | "image_url" | "input_image")) {
+                return 8192;
+            }
+            fields.iter().map(|(key, value)| key.len() as u64 + request_input_budget(value) + 8).sum()
+        }
+        _ => 8,
+    }
+}
+
+fn budget_output_tokens(body: &mut Value, model: &ResolvedModel, field: &str) {
+    let requested = body[field].as_u64().unwrap_or(model.max_output_tokens);
+    let available = model.context_window
+        .saturating_sub(request_input_budget(body))
+        .saturating_sub(8192);
+    body[field] = json!(requested.min(available).max(16));
+}
+
 fn completions_body(
     model: &ResolvedModel,
     system_prompt: &str,
@@ -312,7 +342,9 @@ fn completions_body(
     // 用户在 options 里配置的非内置字段直接附加到请求体顶层（tool_stream 等）。
     if let Some(object) = body.as_object_mut() {
         for (key, value) in &model.extra_options {
-            object.insert(key.clone(), value.clone());
+            if key != "cacheRetention" {
+                object.insert(key.clone(), value.clone());
+            }
         }
     }
     apply_reasoning_completions(&mut body, model, level);
@@ -331,6 +363,7 @@ fn completions_body(
     if let Some(top_p) = model.top_p {
         body["top_p"] = json!(top_p);
     }
+    budget_output_tokens(&mut body, model, model.max_tokens_field);
     body
 }
 
@@ -432,16 +465,13 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                 }));
                 let images = tool_result_images(message, model);
                 if !images.is_empty() {
-                    let mut content = vec![json!({
-                        "type": "input_text",
-                        "text": "Screenshot returned by the browser tool."
-                    })];
-                    content.extend(images.into_iter().map(|image| json!({
+                    let mut content = Vec::new();
+                    content.extend(images.into_iter().flat_map(|image| [json!({"type":"input_text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
                         "type": "input_image",
                         "image_url": format!("data:{};base64,{}",
                             image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
                             image.get("data").and_then(Value::as_str).unwrap_or_default())
-                    })));
+                    })]));
                     out.push(json!({ "type": "message", "role": "user", "content": content }));
                 }
             }
@@ -480,7 +510,9 @@ fn responses_body(
         "max_output_tokens": model.max_output_tokens.max(16),
     });
     if let Some(object) = body.as_object_mut() {
-        object.extend(model.extra_options.clone());
+        object.extend(model.extra_options.iter()
+            .filter(|(key, _)| key.as_str() != "cacheRetention")
+            .map(|(key, value)| (key.clone(), value.clone())));
     }
     if !tool_defs.is_empty() {
         body["tools"] = Value::Array(tool_defs);
@@ -511,6 +543,7 @@ fn responses_body(
     if let Some(top_p) = model.top_p {
         body["top_p"] = json!(top_p);
     }
+    budget_output_tokens(&mut body, model, "max_output_tokens");
     body
 }
 
@@ -518,8 +551,8 @@ fn responses_body(
 
 // PI/OpenAI SDK 的请求可由 AbortSignal 打断；Lyra 使用 reqwest 时必须显式把取消和
 // deadline 并入网络 future，否则代理接受连接后不发响应头/SSE 时会永久挂起。
-const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const SSE_IDLE_TIMEOUT: std::time::Duration = RESPONSE_HEADERS_TIMEOUT;
 const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 async fn wait_cancelled(cancel: &Arc<AtomicBool>) {
@@ -882,6 +915,16 @@ async fn stream_completions(
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
                     let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    if index >= calls.len() {
+                        if let Some(done) = calls.last().filter(|c| !c.name.is_empty()) {
+                            on_event(StreamEvent::ToolCallDone {
+                                id: done.id.clone(),
+                                name: done.name.clone(),
+                                arguments: serde_json::from_str(&done.arguments)
+                                    .unwrap_or_else(|_| json!({ "__invalidJson": done.arguments })),
+                            });
+                        }
+                    }
                     while calls.len() <= index {
                         calls.push(ToolCallAccum {
                             id: String::new(),
@@ -899,11 +942,6 @@ async fn stream_completions(
                     if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str)
                     {
                         accum.arguments.push_str(args);
-                        on_event(StreamEvent::ToolArgsDelta {
-                            index,
-                            name: accum.name.clone(),
-                            args: accum.arguments.clone(),
-                        });
                     }
                 }
             }
@@ -1017,11 +1055,6 @@ async fn stream_responses(
                         } else {
                             calls[index].arguments.push_str(delta);
                         }
-                        on_event(StreamEvent::ToolArgsDelta {
-                            index,
-                            name: calls[index].name.clone(),
-                            args: calls[index].arguments.clone(),
-                        });
                     }
                 }
             }
@@ -1043,6 +1076,18 @@ async fn stream_responses(
                                 calls[index].name = name.to_string();
                             }
                         }
+                        // id 与 parse_responses_object 的最终 toolCall 保持一致（call_id|item_id）。
+                        let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or_default();
+                        let id = match item.get("id").and_then(Value::as_str) {
+                            Some(id) if id != call_id => format!("{call_id}|{id}"),
+                            _ => call_id.to_string(),
+                        };
+                        on_event(StreamEvent::ToolCallDone {
+                            id,
+                            name: calls[index].name.clone(),
+                            arguments: serde_json::from_str(&calls[index].arguments)
+                                .unwrap_or_else(|_| json!({ "__invalidJson": calls[index].arguments })),
+                        });
                     }
                 }
             }
@@ -1160,9 +1205,8 @@ fn parse_responses_object(
     }
 }
 
-const STREAM_RETRY_DELAYS_MS: [u64; 2] = [250, 750];
-
-fn is_retryable_stream_error(error: &str) -> bool {
+/// 传输层瞬时错误（与 prompt::is_retryable_provider_error 互补），turn 循环据此重试。
+pub(crate) fn is_retryable_stream_error(error: &str) -> bool {
     let message = error.to_ascii_lowercase();
     [
         "error decoding response body",
@@ -1187,6 +1231,11 @@ fn is_retryable_stream_error(error: &str) -> bool {
         "http 502",
         "http 503",
         "http 504",
+        "http 520",
+        "http 521",
+        "http 522",
+        "http 523",
+        "http 524",
         "http2",
         "http/2",
     ]
@@ -1252,19 +1301,19 @@ pub(crate) fn client_for_proxy(proxy: &str) -> reqwest::Client {
         format!("http://{proxy}")
     };
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(4)
         .tcp_keepalive(std::time::Duration::from_secs(20));
     if let Ok(parsed) = reqwest::Proxy::all(&url) {
         builder = builder.proxy(parsed);
     }
-    let client = builder.build().unwrap_or_default();
+    let client = builder.build().expect("Lyra HTTP client");
     clients.insert(proxy.to_string(), client.clone());
     client
 }
 
-/// 一次流式模型调用。网络/响应体解码错误会在尚未向调用方发送任何增量时静默重试；
-/// 已经发送增量后不重试，避免 UI、工具参数或会话内容重复。取消时返回 stop_reason = aborted。
+/// 一次流式模型调用，不在此重试：重试统一由 turn 循环按退避处理。取消时返回 stop_reason = aborted。
 pub async fn stream_chat(
     http: &reqwest::Client,
     model: &ResolvedModel,
@@ -1287,54 +1336,54 @@ pub async fn stream_chat(
         }
         None => http,
     };
-    let mut retry = 0;
-    loop {
-        let mut emitted = false;
-        let result = stream_chat_once(
-            http,
-            model,
-            api_key,
-            thinking_level,
-            system_prompt,
-            messages,
-            tools,
-            session_id,
-            cancel,
-            &mut |event| {
-                emitted |= !matches!(event, StreamEvent::Activity);
-                on_event(event);
-            },
-        )
-        .await;
-
-        match result {
-            Err(_) if cancel.load(Ordering::SeqCst) => {
-                let mut result = StreamResult::empty();
-                result.stop_reason = "aborted".into();
-                return Ok(result);
-            }
-            Err(error)
-                if !emitted
-                    && retry < STREAM_RETRY_DELAYS_MS.len()
-                    && is_retryable_stream_error(&error) =>
-            {
-                let delay = STREAM_RETRY_DELAYS_MS[retry];
-                retry += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                if cancel.load(Ordering::SeqCst) {
-                    let mut result = StreamResult::empty();
-                    result.stop_reason = "aborted".into();
-                    return Ok(result);
-                }
-            }
-            outcome => return outcome,
+    let result = stream_chat_once(
+        http,
+        model,
+        api_key,
+        thinking_level,
+        system_prompt,
+        messages,
+        tools,
+        session_id,
+        cancel,
+        on_event,
+    )
+    .await;
+    match result {
+        Err(_) if cancel.load(Ordering::SeqCst) => {
+            let mut result = StreamResult::empty();
+            result.stop_reason = "aborted".into();
+            Ok(result)
         }
+        Ok(mut result) => {
+            // 三种协议共用出口：思考不是答复。交给 turn 有限重试，
+            // 保留 usage 和原始内容，且不覆盖取消或 provider 的明确错误。
+            if !matches!(result.stop_reason.as_str(), "aborted" | "error")
+                && result.error_message.is_none()
+                && !result.content.iter().any(|part| match part["type"].as_str() {
+                    Some("text") => part["text"].as_str().is_some_and(|s| !s.trim().is_empty()),
+                    Some("toolCall") => part["name"].as_str().is_some_and(|s| !s.trim().is_empty()),
+                    _ => false,
+                })
+            {
+                result.error_message = Some(format!(
+                    "provider returned no actionable output: 模型未返回正文或工具调用（可能仅有思考内容，stop_reason={}）",
+                    result.stop_reason
+                ));
+                result.stop_reason = "error".into();
+            }
+            Ok(result)
+        }
+        outcome => outcome,
     }
 }
 
 // ---------- anthropic-messages ----------
 
 fn anthropic_thinking_budget(level: Option<&str>, max_output_tokens: u64) -> Option<u64> {
+    if max_output_tokens <= 1024 {
+        return None;
+    }
     let budget = match level.unwrap_or("medium") {
         "off" | "none" => return None,
         "minimal" => 1024,
@@ -1345,7 +1394,7 @@ fn anthropic_thinking_budget(level: Option<&str>, max_output_tokens: u64) -> Opt
         _ => 16384,
     };
     // Anthropic 要求 max_tokens > budget_tokens。
-    let cap = max_output_tokens.saturating_sub(1024).max(1024);
+    let cap = max_output_tokens.saturating_sub(1024).max(1024).min(max_output_tokens - 1);
     Some(budget.min(cap))
 }
 
@@ -1406,7 +1455,23 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                             "name": block.get("name").and_then(Value::as_str).unwrap_or_default(),
                             "input": block.get("arguments").cloned().unwrap_or_else(|| json!({})),
                         })),
-                        // thinking 缺签名无法回传，丢弃（Anthropic 允许历史里不带 thinking）
+                        Some("thinking") => {
+                            let text = block["thinking"].as_str().unwrap_or_default();
+                            let signature = block["thinkingSignature"].as_str().unwrap_or_default();
+                            // 与 pi 一致：仅同模型的签名可回放；跨模型或中断的思考降级为文本。
+                            let same_model = message["api"].as_str() == Some(model.api.as_str())
+                                && message["provider"].as_str() == Some(model.provider.as_str())
+                                && message["model"].as_str() == Some(model.id.as_str());
+                            if same_model && !signature.trim().is_empty() {
+                                parts.push(if block["redacted"] == true {
+                                    json!({ "type": "redacted_thinking", "data": signature })
+                                } else {
+                                    json!({ "type": "thinking", "thinking": text, "signature": signature })
+                                });
+                            } else if block["redacted"] != true && !text.trim().is_empty() {
+                                parts.push(json!({ "type": "text", "text": text }));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1427,18 +1492,15 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                 }));
                 let images = tool_result_images(message, model);
                 if !images.is_empty() {
-                    let mut content = vec![json!({
-                        "type": "text",
-                        "text": "Screenshot returned by the browser tool."
-                    })];
-                    content.extend(images.into_iter().map(|image| json!({
+                    let mut content = Vec::new();
+                    content.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
                         "type": "image",
                         "source": {
                             "type": "base64",
                             "media_type": image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
                             "data": image.get("data").and_then(Value::as_str).unwrap_or_default(),
                         }
-                    })));
+                    })]));
                     out.push(json!({ "role": "user", "content": content }));
                 }
             }
@@ -1462,15 +1524,13 @@ fn anthropic_body(
         "stream": true,
     });
     if !system_prompt.is_empty() {
-        // 系统提示做短暂缓存，降低多轮重复计费
         body["system"] = json!([{
             "type": "text",
             "text": system_prompt,
-            "cache_control": { "type": "ephemeral" },
         }]);
     }
     if !tools.is_empty() {
-        let mut tool_defs: Vec<Value> = tools
+        let tool_defs: Vec<Value> = tools
             .iter()
             .map(|tool| {
                 json!({
@@ -1480,15 +1540,94 @@ fn anthropic_body(
                 })
             })
             .collect();
-        if let Some(last) = tool_defs.last_mut() {
-            last["cache_control"] = json!({ "type": "ephemeral" });
-        }
         body["tools"] = Value::Array(tool_defs);
     }
-    if model.reasoning {
-        if let Some(budget) = anthropic_thinking_budget(thinking_level, model.max_output_tokens) {
+    // 与其它协议一致，厂商参数透传；显式 thinking/output_config 不被默认值覆盖。
+    for (key, value) in &model.extra_options {
+        body[key] = value.clone();
+    }
+    // cacheRetention 是客户端策略，不是 Anthropic 请求字段。
+    let retention = body.as_object_mut().unwrap().remove("cacheRetention");
+    // 自动启用：支持长缓存的端点默认 1h，其它端点安全降级为短缓存。
+    let retention = retention.as_ref().and_then(Value::as_str).unwrap_or("long");
+    if retention != "none" {
+        let mut cache = json!({ "type": "ephemeral" });
+        let official = reqwest::Url::parse(&model.base_url).ok()
+            .is_some_and(|url| url.host_str() == Some("api.anthropic.com"));
+        if retention == "long" && (official || model.supports_long_cache_retention) {
+            cache["ttl"] = json!("1h");
+        }
+        if let Some(last) = body["system"].as_array_mut().and_then(|blocks| blocks.last_mut()) {
+            last["cache_control"] = cache.clone();
+        }
+        if let Some(last) = body["tools"].as_array_mut().and_then(|tools| tools.last_mut()) {
+            last["cache_control"] = cache.clone();
+        }
+        // 与 pi 一致：只在末条 user/system 的末块落断点，不改写 assistant 思考签名。
+        if let Some(last) = body["messages"].as_array_mut().and_then(|messages| messages.last_mut()) {
+            if matches!(last["role"].as_str(), Some("user" | "system")) {
+                if let Some(text) = last["content"].as_str() {
+                    last["content"] = json!([{ "type": "text", "text": text }]);
+                }
+                if let Some(block) = last["content"].as_array_mut().and_then(|blocks| blocks.last_mut()) {
+                    if matches!(block["type"].as_str(), Some("text" | "image" | "tool_result")) {
+                        block["cache_control"] = cache;
+                    }
+                }
+            }
+        }
+    }
+    budget_output_tokens(&mut body, model, "max_tokens");
+    if matches!(thinking_level, Some("off" | "none")) {
+        body["thinking"] = json!({ "type": "disabled" });
+    } else if model.reasoning && body.get("thinking").is_none() {
+        // ponytail: 无模型能力目录时仅识别已知 4.6 系列；新模型可显式配置 thinking.type。
+        let adaptive = model.id.contains("opus-4-6") || model.id.contains("opus-4.6")
+            || model.id.contains("sonnet-4-6") || model.id.contains("sonnet-4.6");
+        if adaptive {
+            body["thinking"] = json!({ "type": "adaptive" });
+        } else if let Some(budget) = anthropic_thinking_budget(thinking_level, body["max_tokens"].as_u64().unwrap()) {
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
+    }
+    if body["thinking"]["type"] == "adaptive" && body.pointer("/output_config/effort").is_none() {
+        let effort = match thinking_level.unwrap_or("high") {
+            "minimal" | "low" => "low",
+            "medium" => "medium",
+            "max" | "xhigh" if model.id.contains("opus") => "max",
+            _ => "high",
+        };
+        body["output_config"]["effort"] = json!(effort);
+    }
+    if body["thinking"]["type"] == "enabled" {
+        let max = body["max_tokens"].as_u64().unwrap();
+        if max <= 1024 {
+            body.as_object_mut().unwrap().remove("thinking");
+        } else if let Some(budget) = body["thinking"]["budget_tokens"].as_u64() {
+            body["thinking"]["budget_tokens"] = json!(budget.max(1024).min(max - 1));
+        }
+    }
+    let thinking = matches!(body["thinking"]["type"].as_str(), Some("enabled" | "adaptive"));
+    if thinking {
+        // pi 默认请求可见摘要；保留用户显式的 omitted，不展示加密签名。
+        if body["thinking"].get("display").is_none() {
+            body["thinking"]["display"] = json!("summarized");
+        }
+        // Anthropic extended thinking 不兼容采样参数，不能照搬 OpenAI 参数。
+        body.as_object_mut().unwrap().remove("temperature");
+        body.as_object_mut().unwrap().remove("top_p");
+        body.as_object_mut().unwrap().remove("top_k");
+    } else {
+        if let Some(temperature) = model.temperature {
+            body["temperature"] = json!(temperature);
+            body.as_object_mut().unwrap().remove("top_p");
+        } else if let Some(top_p) = model.top_p {
+            body["top_p"] = json!(top_p);
+        }
+    }
+    // OpenAI 的 flex/priority 不是 Anthropic 合法值，不能跨协议照搬。
+    if let Some(tier @ ("auto" | "standard_only")) = model.service_tier.as_deref() {
+        body["service_tier"] = json!(tier);
     }
     body
 }
@@ -1554,7 +1693,7 @@ async fn stream_anthropic(
         format!("{base}/v1/messages")
     };
     let oauth = api_key.starts_with("sk-ant-oat");
-    let thinking_enabled = body.get("thinking").is_some();
+    let thinking_enabled = body["thinking"]["type"] == "enabled";
     let mut request = http
         .post(&url)
         .header("content-type", "application/json")
@@ -1604,9 +1743,8 @@ async fn stream_anthropic(
     // 按 content block 索引聚合 tool_use 入参
     let mut blocks: std::collections::HashMap<u64, (String, String, String)> =
         std::collections::HashMap::new();
-    // block 索引 → 本条消息内工具调用序号（与最终 content 中 toolCall 顺序一致）
-    let mut block_ordinals: std::collections::HashMap<u64, usize> =
-        std::collections::HashMap::new();
+    let mut content_indices: HashMap<u64, usize> = HashMap::new();
+    let mut initial_inputs: HashMap<u64, Value> = HashMap::new();
     let mut stop_reason: Option<String> = None;
     let cancelled = read_sse(&mut response, cancel, |data| {
         if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
@@ -1622,8 +1760,31 @@ async fn stream_anthropic(
             Some("content_block_start") => {
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let block = &value["content_block"];
+                match block["type"].as_str() {
+                    Some("text" | "thinking" | "redacted_thinking") => {
+                        let redacted = block["type"] == "redacted_thinking";
+                        let thinking = block["type"] != "text";
+                        let field = if thinking { "thinking" } else { "text" };
+                        let text = if redacted { "[Reasoning redacted]" } else {
+                            block[field].as_str().unwrap_or_default()
+                        };
+                        let mut content = json!({ "type": field, field: text });
+                        if thinking {
+                            content["thinkingSignature"] = block[if redacted { "data" } else { "signature" }]
+                                .as_str().unwrap_or_default().into();
+                            if redacted { content["redacted"] = json!(true); }
+                        }
+                        content_indices.insert(index, result.content.len());
+                        result.content.push(content);
+                        if !text.is_empty() {
+                            on_event(if thinking { StreamEvent::ThinkingDelta(text.into()) }
+                                else { StreamEvent::TextDelta(text.into()) });
+                        }
+                    }
+                    _ => {}
+                }
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    block_ordinals.insert(index, block_ordinals.len());
+                    initial_inputs.insert(index, block.get("input").cloned().unwrap_or_else(|| json!({})));
                     blocks.insert(
                         index,
                         (
@@ -1645,14 +1806,24 @@ async fn stream_anthropic(
             Some("content_block_delta") => {
                 let delta = &value["delta"];
                 match delta.get("type").and_then(Value::as_str) {
-                    Some("text_delta") => {
-                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                            push_delta(&mut result, "text", text, on_event);
-                        }
-                    }
-                    Some("thinking_delta") => {
-                        if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
-                            push_delta(&mut result, "thinking", text, on_event);
+                    Some("text_delta" | "thinking_delta" | "signature_delta") => {
+                        let index = value["index"].as_u64().unwrap_or(0);
+                        let (source, field) = match delta["type"].as_str() {
+                            Some("thinking_delta") => ("thinking", "thinking"),
+                            Some("signature_delta") => ("signature", "thinkingSignature"),
+                            _ => ("text", "text"),
+                        };
+                        if let Some(text) = delta[source].as_str() {
+                            if let Some(&position) = content_indices.get(&index) {
+                                let block = &mut result.content[position];
+                                let previous = block[field].as_str().unwrap_or_default();
+                                block[field] = json!(format!("{previous}{text}"));
+                                if field == "thinking" {
+                                    on_event(StreamEvent::ThinkingDelta(text.into()));
+                                } else if field == "text" {
+                                    on_event(StreamEvent::TextDelta(text.into()));
+                                }
+                            }
                         }
                     }
                     Some("input_json_delta") => {
@@ -1660,13 +1831,6 @@ async fn stream_anthropic(
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             if let Some(entry) = blocks.get_mut(&index) {
                                 entry.2.push_str(partial);
-                                if let Some(ordinal) = block_ordinals.get(&index) {
-                                    on_event(StreamEvent::ToolArgsDelta {
-                                        index: *ordinal,
-                                        name: entry.1.clone(),
-                                        args: entry.2.clone(),
-                                    });
-                                }
                             }
                         }
                     }
@@ -1677,11 +1841,12 @@ async fn stream_anthropic(
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
                 if let Some((id, name, arguments)) = blocks.remove(&index) {
                     let args = if arguments.is_empty() {
-                        json!({})
+                        initial_inputs.remove(&index).unwrap_or_else(|| json!({}))
                     } else {
                         serde_json::from_str(&arguments)
                             .unwrap_or_else(|_| json!({ "__invalidJson": arguments }))
                     };
+                    on_event(StreamEvent::ToolCallDone { id: id.clone(), name: name.clone(), arguments: args.clone() });
                     result.content.push(json!({
                         "type": "toolCall",
                         "id": id,
@@ -1718,8 +1883,12 @@ async fn stream_anthropic(
     // 流意外结束时仍落盘未闭合的 tool_use
     let mut pending: Vec<_> = blocks.into_iter().collect();
     pending.sort_by_key(|(index, _)| *index);
-    for (_, (id, name, arguments)) in pending {
-        let args = serde_json::from_str(&arguments).unwrap_or_else(|_| json!({}));
+    for (index, (id, name, arguments)) in pending {
+        let args = if arguments.is_empty() {
+            initial_inputs.remove(&index).unwrap_or_else(|| json!({}))
+        } else {
+            serde_json::from_str(&arguments).unwrap_or_else(|_| json!({ "__invalidJson": arguments }))
+        };
         result.content.push(json!({
             "type": "toolCall",
             "id": id,
@@ -1746,6 +1915,103 @@ mod tests {
     use super::*;
     use crate::lyra::config::ResolvedModel;
     use serde_json::Map;
+
+    #[tokio::test]
+    async fn thinking_only_completion_is_retryable_without_masking_valid_output() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (delta, finish, expected) in [
+            (json!({"reasoning_content":"Still planning"}), json!("stop"), "error"),
+            (json!({"reasoning_content":"Still planning"}), Value::Null, "error"),
+            (json!({"reasoning_content":"Still planning"}), json!("other"), "error"),
+            (json!({"reasoning_content":"Still planning"}), json!("length"), "error"),
+            (json!({}), json!("stop"), "error"),
+            (json!({"content":" \n\t"}), json!("stop"), "error"),
+            (json!({"content":"Done"}), json!("stop"), "stop"),
+            (json!({"reasoning_content":"Planning", "tool_calls":[{
+                "index":0,"id":"call-1","function":{"name":"read","arguments":"{}"}
+            }]}), json!("tool_calls"), "toolUse"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let chunk = json!({"choices":[{"delta":delta,"finish_reason":finish}],
+                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}});
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    head.extend_from_slice(&buf[..n]);
+                }
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+            });
+            let mut model = test_model("openai-completions");
+            model.base_url = format!("http://{addr}/v1");
+            let result = stream_chat(
+                &reqwest::Client::builder().no_proxy().build().unwrap(),
+                &model, "key", None, "sys", &[], &[], None,
+                &Arc::new(AtomicBool::new(false)), &mut |_| {},
+            ).await.unwrap();
+            server.await.unwrap();
+            assert_eq!(result.stop_reason, expected, "delta={delta}, finish={finish}");
+            assert_eq!(result.usage["output"], 5);
+            if expected == "error" {
+                let error = result.error_message.unwrap();
+                assert!(crate::lyra::prompt::is_retryable_provider_error(&error));
+                assert!(!is_retryable_stream_error(&error), "retry only at turn level");
+            } else {
+                assert!(result.error_message.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn screenshot_coordinates_stay_bound_in_all_provider_formats() {
+        let message=json!({"role":"toolResult","toolCallId":"call-shot","content":[{"type":"image","mimeType":"image/png","data":"AA=="}],
+            "details":{"snapshotId":"snap","images":[{"imageId":"snap-0","pixelWidth":1600,"pixelHeight":719}]}});
+        let model=test_model("openai-completions");
+        for output in [json!(completions_messages("",&[message.clone()],&model)),json!(responses_input(&[message.clone()],&model)),json!(anthropic_messages(&[message],&model))] {
+            let text=output.to_string();
+            for expected in ["snap-0","1600","719","NEVER rescale","call-shot"] { assert!(text.contains(expected),"{expected}: {text}"); }
+        }
+    }
+
+    #[test]
+    fn output_budget_reserves_context_for_growing_tool_history() {
+        let mut model = test_model("openai-completions");
+        model.context_window = 1_048_576;
+        model.max_output_tokens = 943_718;
+        let messages = vec![json!({"role":"user", "content":"x".repeat(120_000)})];
+        for (body, field) in [
+            (completions_body(&model, "sys", &messages, &[], None, None), "max_completion_tokens"),
+            (responses_body(&model, "sys", &messages, &[], None, None), "max_output_tokens"),
+            (anthropic_body(&model, "sys", &messages, &[], Some("high")), "max_tokens"),
+        ] {
+            let output = body[field].as_u64().unwrap();
+            assert!(output < model.max_output_tokens);
+            assert!(output + request_input_budget(&body) < model.context_window);
+        }
+        // A long CJK chat (~720KB, ~180k real tokens) must still get the full output budget.
+        let mut kimi = test_model("openai-completions");
+        kimi.context_window = 512_000;
+        kimi.max_output_tokens = 65_536;
+        let long = vec![json!({"role":"user", "content":"中".repeat(240_000)})];
+        assert_eq!(completions_body(&kimi, "sys", &long, &[], None, None)["max_completion_tokens"], 65_536);
+        let short = completions_body(&model, "sys", &[], &[], None, None);
+        assert_eq!(short["max_completion_tokens"], model.max_output_tokens);
+        // Base64 bytes are not text tokens, and must not exhaust the window.
+        assert_eq!(request_input_budget(&json!({"type":"input_image", "image_url":"x".repeat(1_000_000)})), 8192);
+        model.context_window = 100;
+        let small = anthropic_body(&model, "sys", &messages, &[], Some("high"));
+        assert_eq!(small["max_tokens"], 16);
+        assert!(small.get("thinking").is_none());
+    }
 
     fn test_model(api: &str) -> ResolvedModel {
         ResolvedModel {
@@ -1783,6 +2049,51 @@ mod tests {
     }
 
     #[test]
+    fn backend_http_ignores_system_proxy_but_honors_explicit_proxy() {
+        const CHILD: &str = "NOVA_PROXY_POLICY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lyra::provider::tests::backend_http_ignores_system_proxy_but_honors_explicit_proxy", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HTTP_PROXY", "http://127.0.0.1:9")
+                .env("HTTPS_PROXY", "http://127.0.0.1:9")
+                .env("ALL_PROXY", "http://127.0.0.1:9")
+                .env("http_proxy", "http://127.0.0.1:9")
+                .env("https_proxy", "http://127.0.0.1:9")
+                .env("all_proxy", "http://127.0.0.1:9")
+                .env_remove("NO_PROXY").env_remove("no_proxy")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    requests.push(String::from_utf8_lossy(&buffer[..count]).into_owned());
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+                }
+                requests
+            });
+            let response = client_for_proxy("").get(format!("http://{address}/direct"))
+                .timeout(std::time::Duration::from_secs(3)).send().await.unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+            let response = client_for_proxy(&address.to_string()).get("http://nova-proxy-test.invalid/explicit")
+                .timeout(std::time::Duration::from_secs(3)).send().await.unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+            let requests = server.await.unwrap();
+            assert!(requests[0].starts_with("GET /direct "));
+            assert!(requests[1].starts_with("GET http://nova-proxy-test.invalid/explicit "));
+        });
+    }
+
+    #[test]
     fn unknown_finish_reason_degrades_to_stop_when_content_exists() {
         assert_eq!(map_finish_reason(Some("other"), false, true).0, "stop");
         assert_eq!(map_finish_reason(Some("other"), true, true).0, "toolUse");
@@ -1795,6 +2106,7 @@ mod tests {
 
     #[test]
     fn transient_stream_decode_errors_are_retryable() {
+        assert!(is_retryable_stream_error("Lyra provider HTTP 520 upstream temporarily unavailable"));
         assert!(is_retryable_stream_error(
             "读取响应流失败：error decoding response body"
         ));
@@ -2079,14 +2391,9 @@ mod tests {
         });
         let mut model = test_model("openai-responses");
         model.base_url = format!("http://{address}");
-        let mut args = Vec::new();
         let result = stream_responses(&reqwest::Client::builder().no_proxy().build().unwrap(), &model, "", json!({}), None,
-            &Arc::new(AtomicBool::new(false)), &mut |event| {
-                if let StreamEvent::ToolArgsDelta { name, args: value, .. } = event { args.push((name, value)); }
-            }).await.unwrap();
+            &Arc::new(AtomicBool::new(false)), &mut |_| {}).await.unwrap();
         server.join().unwrap();
-        assert_eq!(args[0], ("read".into(), "{\"path\":\"a\"}".into()));
-        assert_eq!(args[1], ("bash".into(), "{\"command\":\"pwd\"}".into()));
         assert_eq!(result.stop_reason, "toolUse");
         assert_eq!(result.content.len(), 4);
         assert_eq!(result.content[1]["text"], "Reading");
@@ -2156,7 +2463,8 @@ mod tests {
 
     #[test]
     fn anthropic_body_converts_tool_flow_and_cache() {
-        let model = test_model("anthropic-messages");
+        let mut model = test_model("anthropic-messages");
+        model.supports_long_cache_retention = false;
         let tool = Tool {
             name: "read",
             description: "读文件".into(),
@@ -2188,12 +2496,67 @@ mod tests {
         assert_eq!(body["thinking"]["budget_tokens"], 32768.min(32_000 - 1024));
         let out = &body["messages"];
         assert_eq!(out[0]["content"][1]["source"]["media_type"], "image/png");
-        // thinking 无签名，历史里丢弃
-        assert_eq!(out[1]["content"][0]["type"], "text");
-        assert_eq!(out[1]["content"][1]["type"], "tool_use");
-        assert_eq!(out[1]["content"][1]["input"]["path"], "a.rs");
+        // 与 pi 一致：无签名思考降级文本，不丢失上下文。
+        assert_eq!(out[1]["content"][0]["text"], "想一下");
+        assert_eq!(out[1]["content"][1]["type"], "text");
+        assert_eq!(out[1]["content"][2]["type"], "tool_use");
+        assert_eq!(out[1]["content"][2]["input"]["path"], "a.rs");
         assert_eq!(out[2]["content"][0]["type"], "tool_result");
         assert_eq!(out[2]["content"][0]["tool_use_id"], "toolu-1");
+        assert_eq!(out[2]["content"][0]["cache_control"], json!({"type":"ephemeral"}));
+        assert!(out[0]["content"][1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn anthropic_cache_retention_and_history_breakpoints() {
+        let mut model = test_model("anthropic-messages");
+        model.supports_long_cache_retention = false;
+        let tools = [Tool { name: "read", description: "read".into(), parameters: json!({"type":"object"}) }];
+        let messages = [json!({"role":"user","content":[
+            {"type":"text","text":"question"},
+            {"type":"image","mimeType":"image/png","data":"QUJD"}
+        ]})];
+        // 不需要额外配置：官方默认 1h，未知兼容端点默认短缓存。
+        for (url, expected) in [
+            ("https://api.anthropic.com/v1", json!({"type":"ephemeral","ttl":"1h"})),
+            ("https://compatible.example/v1", json!({"type":"ephemeral"})),
+        ] {
+            model.base_url = url.into();
+            let body = anthropic_body(&model, "system", &messages, &tools, None);
+            assert_eq!(body["system"][0]["cache_control"], expected);
+            assert_eq!(body["tools"][0]["cache_control"], expected);
+            assert_eq!(body["messages"][0]["content"][1]["cache_control"], expected);
+        }
+        for (retention, supported, expected) in [
+            ("none", false, Value::Null),
+            ("short", true, json!({"type":"ephemeral"})),
+            ("long", false, json!({"type":"ephemeral"})),
+            ("long", true, json!({"type":"ephemeral","ttl":"1h"})),
+        ] {
+            model.supports_long_cache_retention = supported;
+            model.extra_options.insert("cacheRetention".into(), json!(retention));
+            let body = anthropic_body(&model, "system", &messages, &tools, None);
+            assert!(body.get("cacheRetention").is_none());
+            assert_eq!(body["system"][0]["cache_control"], expected);
+            assert_eq!(body["tools"][0]["cache_control"], expected);
+            assert_eq!(body["messages"][0]["content"][1]["cache_control"], expected);
+            assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
+        }
+        model.supports_long_cache_retention = false;
+        for (url, long) in [("https://api.anthropic.com/v1", true),
+            ("https://api.anthropic.com.example.org/v1", false)] {
+            model.base_url = url.into();
+            let body = anthropic_body(&model, "", &messages, &[], None);
+            assert_eq!(body["messages"][0]["content"][1]["cache_control"].get("ttl").is_some(), long);
+        }
+        let assistant = [json!({"role":"assistant","content":[{"type":"text","text":"prefill"}]})];
+        let body = anthropic_body(&model, "", &assistant, &[], None);
+        assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
+        let empty = anthropic_body(&model, "", &[], &[], None);
+        assert_eq!(empty["messages"], json!([]));
+        // provider 级配置在切换协议后也不能泄漏客户端字段。
+        assert!(completions_body(&model, "", &[], &[], None, None).get("cacheRetention").is_none());
+        assert!(responses_body(&model, "", &[], &[], None, None).get("cacheRetention").is_none());
     }
 
     #[test]
@@ -2273,6 +2636,125 @@ mod tests {
         );
         assert_eq!(anthropic_thinking_budget(Some("xhigh"), 8_000), Some(6_976));
         assert_eq!(anthropic_thinking_budget(None, 32_000), Some(16384));
+    }
+
+    #[test]
+    fn anthropic_parameters_and_budget_boundaries() {
+        let mut model = test_model("anthropic-messages");
+        model.id = "claude-sonnet-4-6".into();
+        model.service_tier = Some("standard_only".into());
+        model.extra_options = serde_json::from_value(json!({
+            "metadata": {"user_id":"test"}, "tool_choice":{"type":"auto"},
+            "stop_sequences":["END"], "output_config":{"format":{"type":"json_schema"}},
+            "temperature":0.5, "top_k":10
+        })).unwrap();
+        let body = anthropic_body(&model, "", &[], &[], Some("max"));
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(body["metadata"]["user_id"], "test");
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["stop_sequences"][0], "END");
+        assert_eq!(body["service_tier"], "standard_only");
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("top_k").is_none());
+        let off = anthropic_body(&model, "", &[], &[], Some("off"));
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert_eq!(off["temperature"], 1.0);
+        model.reasoning = false;
+        model.extra_options.insert("thinking".into(), json!({"type":"adaptive","display":"summarized"}));
+        model.extra_options.insert("output_config".into(), json!({"effort":"low"}));
+        let explicit = anthropic_body(&model, "", &[], &[], None);
+        assert_eq!(explicit["thinking"]["display"], "summarized");
+        assert_eq!(explicit["output_config"]["effort"], "low");
+        model.extra_options.insert("thinking".into(), json!({"type":"adaptive","display":"omitted"}));
+        assert_eq!(anthropic_body(&model, "", &[], &[], None)["thinking"]["display"], "omitted");
+        for max in [1025, 1500, 2048, 32000] {
+            assert!(anthropic_thinking_budget(Some("high"), max).unwrap() < max);
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_thinking_signatures_and_tool_replay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"先想","signature":"a"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"一下"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"b"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":"c"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"d"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"redacted_thinking","data":"opaque"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"content_block_start","index":3,"content_block":{"type":"text","text":"开始"}}),
+            json!({"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"读取"}}),
+            json!({"type":"content_block_stop","index":3}),
+            json!({"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"a"}}}),
+            json!({"type":"content_block_stop","index":4}),
+            json!({"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"toolu_2","name":"read","input":{}}}),
+            json!({"type":"content_block_delta","index":5,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"b\"}"}}),
+            json!({"type":"content_block_stop","index":5}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}),
+            json!({"type":"message_stop"}),
+        ];
+        let payload: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers.lines().find_map(|line| {
+                        line.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|s| s.parse().ok())
+                    }).unwrap();
+                    if request.len() >= end + 4 + length { break; }
+                }
+            }
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}", payload.len()).as_bytes()).await.unwrap();
+        });
+        let mut model = test_model("anthropic-messages");
+        model.base_url = format!("http://{addr}");
+        let mut thinking = String::new();
+        let mut text = String::new();
+        let mut tool_args = Vec::new();
+        let result = stream_chat(&reqwest::Client::builder().no_proxy().build().unwrap(),
+            &model, "key", Some("high"), "", &[], &[], None,
+            &Arc::new(AtomicBool::new(false)), &mut |event| match event {
+                StreamEvent::ThinkingDelta(delta) => thinking.push_str(&delta),
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::ToolCallDone { id, arguments, .. } => tool_args.push((id, arguments)),
+                _ => {}
+            }).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(thinking, "先想一下[Reasoning redacted]");
+        assert_eq!(text, "开始读取");
+        assert_eq!(result.stop_reason, "toolUse");
+        assert_eq!(result.usage["totalTokens"], 30);
+        assert_eq!(result.content[0]["thinkingSignature"], "ab");
+        assert_eq!(result.content[1]["thinkingSignature"], "cd");
+        assert_eq!(result.content[4]["arguments"]["path"], "a");
+        assert_eq!(result.content[5]["arguments"]["path"], "b");
+        assert_eq!(tool_args, vec![("toolu_1".into(), json!({"path":"a"})), ("toolu_2".into(), json!({"path":"b"}))]);
+        let message = json!({"role":"assistant", "api":model.api, "provider":model.provider,
+            "model":model.id, "content":result.content});
+        let replay = anthropic_messages(&[message.clone()], &model);
+        assert_eq!(replay[0]["content"][0]["signature"], "ab");
+        assert_eq!(replay[0]["content"][1]["signature"], "cd");
+        assert_eq!(replay[0]["content"][2], json!({"type":"redacted_thinking","data":"opaque"}));
+        model.id = "other".into();
+        let cross_model = anthropic_messages(&[message], &model);
+        assert_eq!(cross_model[0]["content"][0], json!({"type":"text","text":"先想一下"}));
+        assert!(!cross_model[0]["content"].as_array().unwrap().iter().any(|b| b["type"] == "redacted_thinking"));
     }
 
     #[test]

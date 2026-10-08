@@ -24,6 +24,14 @@ DOM 定位会检查多个可见点，避免仅中心被遮挡就失败。完全�
 
 单次动作/采集预算 15 秒，结束时恢复截图临时布局；底层网页响应超时 3 秒，避免长时间挂起；超时后先观察实际状态再决定下一步。密码、验证码手动处理。旧 Agent 会话可能需要重新启动以刷新工具定义。
 
+## 下载
+
+更新 Nova 并重启后，WebView 跟踪原生下载对象，允许页面触发的 Blob/data 导出导航及新窗口。网页工具的 open/goto 仍只接受 HTTP(S)。
+点击导出后使用 `webview({operation:"downloads",browserId,since:时间戳})` 查询；默认最近 10 分钟，Unix 毫秒。传 `downloadId` 可精确查询并忽略 since。
+返回所属会话的下载 ID、标签 ID、状态、字节数、保存路径和中断原因；保留本次进程最近 200 条记录，每次最多 100 条。关闭标签导致下载对象失效时返回 unknown，不误报完成。
+下载继续使用 WebView2 的原生保存位置、对话框和安全检查。只有 `state:complete` 表示完成，仍需核对文件内容；空列表、页面稳定或暂时没有字节增长都不足以认定失败。长 URL 会截短并标记 urlTruncated。
+原生回归检查：`node scripts/native-browser-smoke.mjs src-tauri/target/debug/nova.exe --downloads-only`，覆盖慢速 HTTP 下载进度、实际文件内容、Blob/data 和中文文件名；使用隔离配置，测试文件使用唯一名称，核对内容后清理。
+
 ## 验证
 
 运行 node scripts/native-browser-smoke.mjs。独立临时配置中的真实 Nova 使用测试专用 CDP，无辅助模型接口。覆盖 DOM/截图操作、遮挡提示及部分遮挡、中文原生输入、跨域 iframe、原生弹窗、多标签、会话切换保留状态、整页文本、超过摘要上限的屏幕外目标、长图分片续读、文档坐标点击及停止。

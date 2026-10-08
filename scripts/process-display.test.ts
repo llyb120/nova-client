@@ -1,0 +1,10 @@
+import assert from "node:assert";
+import { splitTurnBody, processSegments } from "../src/processDisplay.ts";
+const tool = (id: number) => ({ type: "tool", id, ts: 0, toolCallId: String(id), title: "t", kind: "other", status: "completed", content: [], locations: [] }) as any;
+const blank = (id: number, text: string) => ({ type: "assistant", id, ts: 0, text }) as any;
+const body = [tool(1), blank(2, " \n"), tool(3), blank(4, "None"), tool(5), blank(6, "完成")];
+const { process, conclusion } = splitTurnBody(body, true);
+const segs = processSegments(process);
+assert.equal(segs.length, 1); assert.equal((segs[0] as any).items.length, 3);
+assert.equal(conclusion.length, 1);
+console.log("ok");

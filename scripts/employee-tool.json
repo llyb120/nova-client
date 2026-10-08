@@ -1,0 +1,17 @@
+{
+  "name": "employee",
+  "description": "Nova 数字员工的职责与待办。用户在任何会话里说“交给员工：xxx”时，调用 add(kind=todo,text=xxx) 记下后告知用户已交给员工，不要自己去做。list 查看职责/待办/最近运行；add 新增职责(kind=duty)或待办(kind=todo)；update 修改职责 text/enabled 或覆盖写 note（≤1KB，员工自己的备忘）；done 删除已处理的待办/待确认，或移除职责；ask 把没有明确授权的不可逆操作（支付、删除、对外发送、提交审批等）记为待确认并通知用户，然后停止该操作。只能通过本工具修改员工数据。",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "action": { "type": "string", "enum": ["list", "add", "update", "done", "ask"] },
+      "kind": { "type": "string", "enum": ["duty", "todo"], "description": "add 必填" },
+      "id": { "type": "string", "description": "update/done 的目标 id（来自 list）" },
+      "text": { "type": "string", "minLength": 1, "maxLength": 500, "description": "add/ask 必填；update 可选" },
+      "note": { "type": "string", "maxLength": 1024, "description": "update 可选，覆盖写职责备注" },
+      "enabled": { "type": "boolean", "description": "update 可选，启用/停用职责" }
+    },
+    "required": ["action"],
+    "additionalProperties": false
+  }
+}

@@ -9,6 +9,14 @@ use std::{
 use tauri::{Emitter, State};
 
 const TEXT_LIMIT: u64 = 256 * 1024;
+const DOCUMENT_LIMIT: u64 = 16 * 1024 * 1024;
+
+fn text_limit(path: &Path) -> u64 {
+    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "md" | "markdown" | "html" | "htm" => DOCUMENT_LIMIT,
+        _ => TEXT_LIMIT,
+    }
+}
 const SHEET_LIMIT: u64 = 16 * 1024 * 1024;
 const IMAGE_LIMIT: u64 = 8 * 1024 * 1024;
 
@@ -81,7 +89,7 @@ pub async fn workspace_git_status(
     .map_err(|e| e.to_string())?
 }
 
-fn git_patch(repo: &str, path: &str, staged: bool) -> Result<String, String> {
+fn git_patch(repo: &str, path: &str, staged: bool, full_context: bool) -> Result<String, String> {
     // Validate against Git's own inventory, including deleted paths that cannot be canonicalized.
     let entry = git_entries(repo)?
         .into_iter()
@@ -110,7 +118,7 @@ fn git_patch(repo: &str, path: &str, staged: bool) -> Result<String, String> {
         "--no-ext-diff",
         "--no-textconv",
         "--no-color",
-        "--unified=1000000",
+        if full_context { "--unified=1000000" } else { "--unified=3" },
     ];
     if staged {
         args.push("--cached");
@@ -181,6 +189,7 @@ pub async fn workspace_git_diff(
     thread_id: String,
     path: String,
     staged: bool,
+    full_context: Option<bool>,
 ) -> Result<String, String> {
     let cwd = root(&state, &thread_id)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -188,7 +197,7 @@ pub async fn workspace_git_diff(
             cwd.to_str().ok_or("路径编码无效")?,
             &["rev-parse", "--show-toplevel"],
         )?;
-        git_patch(&repo, &path, staged)
+        git_patch(&repo, &path, staged, full_context.unwrap_or(false))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -405,15 +414,16 @@ fn read_preview(root: &Path, path: &str) -> Result<Preview, String> {
         result.data = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
         return Ok(result);
     }
-    if meta.len() > TEXT_LIMIT {
+    let limit = text_limit(&path);
+    if meta.len() > limit {
         return Ok(result);
     }
     let mut bytes = Vec::new();
     (&mut file)
-        .take(TEXT_LIMIT + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > TEXT_LIMIT || bytes.contains(&0) {
+    if bytes.len() as u64 > limit || bytes.contains(&0) {
         return Ok(result);
     }
     if let Ok(text) = String::from_utf8(bytes) {
@@ -461,13 +471,14 @@ fn save_text(root: &Path, path: &str, original: &str, text: &str) -> Result<(), 
         }
         return save_bytes(&resolved, &original, &bytes, SHEET_LIMIT);
     }
-    if text.len() as u64 > TEXT_LIMIT || text.contains('\0') {
-        return Err("保存内容必须为不超过 256 KB 的文本".into());
+    let limit = text_limit(&resolved);
+    if text.len() as u64 > limit || text.contains('\0') {
+        return Err(format!("保存内容必须为不超过 {} KB 的文本", limit / 1024));
     }
     if read_preview(root, path)?.text.as_deref() != Some(original) {
         return Err("文件已被外部修改或不支持编辑。草稿已保留，请重新读取文件后合并修改。".into());
     }
-    save_bytes(&resolved, original.as_bytes(), text.as_bytes(), TEXT_LIMIT)
+    save_bytes(&resolved, original.as_bytes(), text.as_bytes(), limit)
 }
 
 fn save_bytes(path: &Path, original: &[u8], bytes: &[u8], limit: u64) -> Result<(), String> {
@@ -566,6 +577,19 @@ pub async fn save_workspace_file(
 mod tests {
     use super::*;
     #[test]
+    fn document_preview_and_save_share_the_larger_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "x".repeat(3 * 1024 * 1024);
+        for name in ["report.html", "report.HTM", "report.md", "report.markdown"] {
+            fs::write(dir.path().join(name), &text).unwrap();
+            assert_eq!(read_preview(dir.path(), name).unwrap().text.as_deref(), Some(text.as_str()));
+            save_text(dir.path(), name, &text, &(text.clone() + "edited")).unwrap();
+            assert!(save_text(dir.path(), name, &text, "stale").is_err());
+            fs::File::create(dir.path().join(name)).unwrap().set_len(DOCUMENT_LIMIT + 1).unwrap();
+            assert_eq!(read_preview(dir.path(), name).unwrap().kind, "external");
+        }
+    }
+    #[test]
     fn clicked_external_file_can_be_previewed_without_allowing_its_directory() {
         let workspace = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
@@ -630,7 +654,7 @@ mod tests {
         crate::gitwt::run(repo, &["init"]).unwrap();
         fs::write(dir.join("中文 file.txt"), "base\n").unwrap();
         crate::gitwt::run(repo, &["add", "."]).unwrap();
-        assert!(git_patch(repo, "中文 file.txt", true)
+        assert!(git_patch(repo, "中文 file.txt", true, false)
             .unwrap()
             .contains("+base"));
         crate::gitwt::run(
@@ -654,14 +678,14 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.path == "中文 file.txt" && e.index == "M" && e.worktree == "M"));
-        let staged = git_patch(repo, "中文 file.txt", true).unwrap();
+        let staged = git_patch(repo, "中文 file.txt", true, false).unwrap();
         assert!(staged.contains("-base\n+staged\n"));
-        let working = git_patch(repo, "中文 file.txt", false).unwrap();
+        let working = git_patch(repo, "中文 file.txt", false, false).unwrap();
         assert!(working.contains("-staged\n+working\n"));
-        assert!(git_patch(repo, "new.txt", false)
+        assert!(git_patch(repo, "new.txt", false, false)
             .unwrap()
             .contains("+new\n"));
-        assert!(git_patch(repo, "../outside", false).is_err());
+        assert!(git_patch(repo, "../outside", false, false).is_err());
         crate::gitwt::run(repo, &["restore", "--staged", "中文 file.txt"]).unwrap();
         crate::gitwt::run(repo, &["mv", "中文 file.txt", "renamed.txt"]).unwrap();
         assert!(git_entries(repo)
@@ -669,13 +693,36 @@ mod tests {
             .iter()
             .any(|e| e.path == "renamed.txt" && e.old_path.as_deref() == Some("中文 file.txt")));
         fs::remove_file(dir.join("renamed.txt")).unwrap();
-        assert!(git_patch(repo, "renamed.txt", true)
+        assert!(git_patch(repo, "renamed.txt", true, false)
             .unwrap()
             .contains("rename to renamed.txt"));
-        assert!(git_patch(repo, "renamed.txt", false)
+        assert!(git_patch(repo, "renamed.txt", false, false)
             .unwrap()
             .contains("-base"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn git_patch_loads_full_context_only_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        crate::gitwt::run(repo, &["init"]).unwrap();
+        let original: String = (0..50_000).map(|i| format!("line {i}: unchanged content for diff preview\n")).collect();
+        fs::write(dir.path().join("large.txt"), &original).unwrap();
+        crate::gitwt::run(repo, &["add", "large.txt"]).unwrap();
+        fs::write(dir.path().join("large.txt"), original.replace("line 25000:", "edited 25000:")).unwrap();
+        let patch = git_patch(repo, "large.txt", false, false).unwrap();
+        assert!(patch.contains("-line 25000:") && patch.contains("+edited 25000:"));
+        assert!(patch.len() < 1_000, "small edits must not transfer the whole file");
+        // The full file exceeds the existing preview cap; collapsed diffs must still work.
+        assert!(git_patch(repo, "large.txt", false, true).unwrap_err().contains("2 MB"));
+        let smaller = original.lines().take(100).collect::<Vec<_>>().join("\n") + "\n";
+        fs::write(dir.path().join("large.txt"), &smaller).unwrap();
+        crate::gitwt::run(repo, &["add", "large.txt"]).unwrap();
+        fs::write(dir.path().join("large.txt"), smaller.replace("line 50:", "edited 50:")).unwrap();
+        let full = git_patch(repo, "large.txt", false, true).unwrap();
+        assert!(full.contains(" line 0:") && full.contains(" line 99:"));
+        assert!(full.contains("-line 50:") && full.contains("+edited 50:"));
     }
     #[test]
     fn git_image_returns_before_and_after_data_uris() {
@@ -750,14 +797,14 @@ mod tests {
             &root,
             "readme.md",
             "中文\r\n",
-            &"x".repeat(TEXT_LIMIT as usize + 1)
+            &"x".repeat(DOCUMENT_LIMIT as usize + 1)
         )
         .is_err());
         assert_eq!(
             fs::read_to_string(root.join("readme.md")).unwrap(),
             "中文\r\n"
         );
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 4);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 5); // Four inputs plus the save backup.
         fs::create_dir(root.join("nested")).unwrap();
         fs::write(root.join("nested/Result.md"), "ok").unwrap();
         fs::write(root.join(".gitignore"), "hidden-result.md\n").unwrap();

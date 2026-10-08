@@ -2,7 +2,7 @@
 //! 并解析其中的 {env:NAME} 占位符。
 
 use crate::lyra_complete::{
-    detect_max_tokens_field, detect_thinking_format, load_config, provider_api, resolve_env_string,
+    detect_max_tokens_field, detect_thinking_format, load_config, model_api, resolve_env_string,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -144,6 +144,7 @@ fn is_model_config(value: &Value) -> bool {
             "limit",
             "options",
             "variants",
+            "api",
         ]
         .iter()
         .any(|key| object.contains_key(*key))
@@ -270,6 +271,10 @@ pub fn shared_config(config: &Value, selections: &[String], selected: &str) -> R
         let provider = providers.entry(provider_id.to_string()).or_insert_with(|| {
             let mut provider = source.clone();
             provider["models"] = json!({});
+            // 借用方只用共享的模型，不再按预设自动拉取全部模型
+            if let Some(object) = provider.as_object_mut() {
+                object.remove("preset");
+            }
             provider
         });
         let models = provider["models"].as_object_mut().ok_or("Lyra models 配置无效")?;
@@ -306,7 +311,11 @@ pub fn default_model(config: &Value) -> Result<String, String> {
             selection = effort
                 .map(|effort| format!("{current}/variant/{effort}"))
                 .filter(|candidate| has(candidate))
-                .or(None);
+                // 自动获取的模型新增档位后仍选同一模型，避免退回整个列表的第一个。
+                .or_else(|| options.iter()
+                    .filter_map(|option| option.get("value").and_then(Value::as_str))
+                    .find(|value| value.starts_with(&format!("{current}/variant/")))
+                    .map(str::to_string));
         }
     }
     let selection = selection
@@ -477,7 +486,7 @@ pub fn resolve_model(
             .unwrap_or_default(),
         env,
     )?;
-    let api = provider_api(provider)?;
+    let api = model_api(model, provider)?;
     if !matches!(
         api.as_str(),
         "openai-completions" | "openai-responses" | "anthropic-messages"

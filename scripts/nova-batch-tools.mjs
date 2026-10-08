@@ -2,6 +2,7 @@ import imageTools from "./image-tools.json" with { type: "json" };
 import webviewTool from "./webview-tool.json" with { type: "json" };
 import chromeTool from "./chrome-tool.json" with { type: "json" };
 import jianlaiTool from "./jianlai-tool.json" with { type: "json" };
+import employeeTool from "./employee-tool.json" with { type: "json" };
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
@@ -59,6 +60,9 @@ export function createNovaBatchTools(cwd, options = {}) {
     tools.jianlai = { ...jianlaiTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("jianlai", root, params, owner)),
     };
+    tools.employee = { ...employeeTool,
+      execute: async params => JSON.stringify(await callGlobalContextTool("employee", root, params)),
+    };
     tools.chrome = { ...chromeTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params, owner)),
     };
@@ -114,12 +118,7 @@ export function createNovaBatchTools(cwd, options = {}) {
           budget: { type: "integer", minimum: 100, maximum: 4000, description: "兼容旧参数：行预算，通常无需设置" },
           coupling: { type: "boolean", description: "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" },
         },
-        anyOf: [
-          { required: ["keywords"] },
-          { required: ["query"] },
-          { required: ["task"] },
-          { required: ["files"] },
-        ],
+        // 不用顶层 anyOf 表达"至少其一"：Anthropic API 不接受，Claude Code 会直接丢弃该工具；由描述和服务端兜底。
         additionalProperties: false,
       },
       async execute(params) {
@@ -140,7 +139,7 @@ export function novaDevinBatchToolPolicy(options = {}) {
   const fastContext = fastContextEnabled(options);
   const toolNames = [];
   if (fastContext) toolNames.push("polaris");
-  if (!readOnly && globalContextServiceConfigured()) toolNames.push("generate_image", "edit_image", "webview", "chrome", "jianlai");
+  if (!readOnly && globalContextServiceConfigured()) toolNames.push("generate_image", "edit_image", "webview", "chrome", "jianlai", "employee");
   if (toolNames.length === 0) {
     const lines = ["Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."];
     if (readOnly) lines.push("Current mode is plan/read-only: analyze only; do not modify files.");

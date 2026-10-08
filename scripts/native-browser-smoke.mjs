@@ -3,17 +3,24 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 
 const root = process.cwd();
 const coordinateOnly = process.argv.includes('--coordinates-only');
+const downloadsOnly = process.argv.includes('--downloads-only');
 const executable = resolve(process.argv[2] || 'bench/webview-probe/target/debug/nova.exe');
 const profile = await mkdtemp(join(tmpdir(), 'nova-browser-smoke-'));
+const downloadName=`nova-download-check-${Date.now()}.txt`;
+const checkedDownloads=[];
 const output = resolve('src-tauri/target/native-browser-smoke');
 await mkdir(output, { recursive: true });
 const server = createServer((req,res)=>{
+  if(req.url==='/download') {
+    res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':`attachment; filename="${downloadName}"`,'Content-Length':2048});
+    res.write('a'.repeat(1024));setTimeout(()=>res.end('b'.repeat(1024)),1500);return;
+  }
   res.setHeader('Content-Type','text/html; charset=utf-8');
   if(req.url==='/frame') {res.end('<!doctype html><title>Frame fixture</title><button onclick="this.textContent=\'框架成功\'">框架按钮</button>');return;}
   res.end(`<!doctype html><meta charset="utf-8"><title>Browser fixture</title><style>body{font:16px system-ui;padding:20px}section{margin:20px 0;padding:12px;border:1px solid #888}input,button{padding:8px}::-webkit-scrollbar{width:16px}::-webkit-scrollbar-thumb{background:rgb(255,0,255)}.scrollbox{height:70px;overflow:scroll;scrollbar-gutter:stable}</style><h1>订单测试</h1><section><h2>客户筛选</h2><button onclick="window.wrong=true">查询</button></section><section><h2>订单筛选</h2><label>订单号<input oninput="window.trusted=event.isTrusted"></label><button onclick="document.querySelector('output').textContent=document.querySelector('input').value+' 已发货'">查询</button><output></output></section><div class="scrollbox"><div style="height:300px">滚动区域</div></div><div class="scrollbox" style="scrollbar-color:rgb(255,0,255) transparent"><div style="height:300px">标准滚动区域</div></div><iframe src="http://localhost:${server.address().port}/frame"></iframe><div style="height:600px">页尾</div>`);
@@ -65,6 +72,34 @@ try {
   await ui('goto',{url:`http://127.0.0.1:${port}/fixture`});
   const page=await attach(await until(async()=> (await targets()).find(t=>t.url.includes('/fixture')),'fixture'));
   await until(()=>page.evaluate('!!document.querySelector("input")'),'loaded');
+  if(downloadsOnly) {
+    // CDP download overrides bypass WebView2 DownloadStarting: exercise native handling instead.
+    const trigger=async expression=>{
+      const point=await page.evaluate(`(()=>{document.querySelector('#download-check')?.remove();const b=document.createElement('button');b.id='download-check';b.textContent='下载验证';b.style='position:fixed;left:20px;top:20px;z-index:99999';b.onclick=()=>{${expression}};document.body.append(b);const r=b.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+      await page.call('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
+      await page.call('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});
+    };
+    const since=Date.now();
+    assert.deepEqual((await ui('downloads',{since})).downloads,[]);
+    await trigger(`(()=>{const a=document.createElement('a');a.href='/download';a.click();})()`);
+    const pending=await until(async()=> (await ui('downloads',{since})).downloads.find(d=>d.state==='in_progress'),'native HTTP download begins');
+    assert.ok(pending.bytesReceived<2048);
+    const done=await until(async()=> (await ui('downloads',{downloadId:pending.id})).downloads.find(d=>d.state==='complete'),'native HTTP download completes');
+    assert.equal(done.bytesReceived,2048);assert.equal(done.exists,true);
+    assert.equal(await readFile(done.path,'utf8'),'a'.repeat(1024)+'b'.repeat(1024));
+    checkedDownloads.push(done.path);
+    for(const mode of ['data','blob']) {
+      const name=`nova-${mode}-中文-${Date.now()}.txt`;
+      await trigger(`(()=>{const a=document.createElement('a');a.download=${JSON.stringify(name)};a.href=${mode==='blob'?"URL.createObjectURL(new Blob(['Global 下载验证'],{type:'text/plain'}))":"'data:text/plain;charset=utf-8,'+encodeURIComponent('Global 下载验证')"};document.body.append(a);a.click();a.remove();})()`);
+      const item=await until(async()=> (await ui('downloads',{since})).downloads.find(d=>d.path?.endsWith(name)&&d.state==='complete'),mode+' download').catch(async error=>{throw Error(error.message+': '+JSON.stringify(await ui('downloads',{since})));});
+      assert.equal(await readFile(item.path,'utf8'),'Global 下载验证');
+      checkedDownloads.push(item.path);
+    }
+    await assert.rejects(ui('downloads',{since:-1}));
+    assert.deepEqual((await ui('downloads',{downloadId:'missing'})).downloads,[]);
+    await writeFile(join(output,'downloads-report.json'),JSON.stringify({passed:true,httpProgress:true,blob:true,data:true,profile},null,2));
+    console.log('PASS native download progress/completion/content, Blob/data and query validation');
+  } else {
   const timings=[];
   const act=async(action,snapshot)=>{
     // The isolated window may be occluded while the user works during the 31s delays.
@@ -256,7 +291,9 @@ try {
   await writeFile(join(output,'report.json'),JSON.stringify({passed:true,modelCalls:0,actionWithFeedbackMs:timings,optimization:{domRefAfter31Seconds:true,coordinateAfter31Seconds:true,chainedFeedback:true,replacedElementRejected:true,menuStateAndHref:true,screenshotFeedback:true,summaryBytes},fullPageEvidence,screenshot:observation.path,profile},null,2));
   console.log('PASS native browser full-document/full-page/tiles/document-coordinates/DOM/native-input/popups/session-state/stop + Chrome emulated transport/engine; no model calls: '+output);
   }
+  }
 } finally {
+  for(const path of checkedDownloads)await rm(path,{force:true});
   for (const socket of sockets) socket.close();
   if (child.exitCode === null && child.pid) spawnSync('taskkill',['/PID',String(child.pid),'/T','/F'],{windowsHide:true,stdio:'ignore'});
   server.closeAllConnections(); await new Promise(r=>server.close(r));

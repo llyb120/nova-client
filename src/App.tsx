@@ -20,6 +20,7 @@ import { mountSessionShortcuts } from "./sessionShortcuts";
 import { createHomeTerminalState, setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
 const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
 const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"));
+const EmployeeView = lazy(() => import("./components/EmployeeView"));
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
   return (
@@ -235,7 +236,11 @@ export default function App() {
         fallback={
           <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
-            <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={<HomeView />}>
+            <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={
+              <Show when={state.view === "employee"} fallback={<HomeView />}>
+                <Suspense><EmployeeView /></Suspense>
+              </Show>
+            }>
               <Suspense><KnowledgeGraphView /></Suspense>
             </Show>
           }>

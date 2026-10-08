@@ -191,7 +191,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关）；virgo = 室女座（减少焦虑） */
-  view: "home" | "clues" | "workflows" | "virgo" | "knowledge";
+  view: "home" | "clues" | "workflows" | "virgo" | "knowledge" | "employee";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -229,6 +229,7 @@ export const [state, setState] = createStore<AppStore>({
     lyra: null,
     devin: null,
     kimi: null,
+    claude: null,
     codex: null,
     codebuddy: null,
     cursor: null,
@@ -245,6 +246,7 @@ export const [state, setState] = createStore<AppStore>({
     lyra: [],
     devin: [],
     kimi: [],
+    claude: [],
     codex: [],
     codebuddy: [],
     cursor: [],
@@ -407,13 +409,12 @@ function selectedModelChoice(agentKind: AgentKind, model: string): ModelChoice |
   );
 }
 
-/** 只有 codex 走「单独的思考强度」这条路；CodeBuddy 的档位已折进模型选项
- *  （`hy4-preview:high`），不再单独下发，见后端 expand_codebuddy_effort_options。 */
+/** Claude / CodeBuddy 等 ACP 后端的档位已折进模型选项，不再单独下发。 */
 const EFFORT_AGENT_KINDS: AgentKind[] = ["codex"];
 
 /** 建会话/切后端时随线程下发的思考强度；不支持的后端传 null。 */
 function threadEffort(agentKind: AgentKind, reasoningEffort: string): string | null {
-  return agentKind === "codex" ? reasoningEffort || null : null;
+  return EFFORT_AGENT_KINDS.includes(agentKind) ? reasoningEffort || null : null;
 }
 
 export function reasoningEffortChoices(
@@ -485,6 +486,7 @@ export const ALL_AGENT_KINDS: AgentKind[] = [
   "lyra",
   "devin",
   "kimi",
+  "claude",
   "codex",
   "codebuddy",
   "cursor",
@@ -497,6 +499,8 @@ function agentEnabled(s: Settings, k: AgentKind): boolean {
       return s.lyraEnabled !== false;
     case "kimi":
       return s.kimiEnabled === true;
+    case "claude":
+      return s.claudeEnabled === true;
     case "devin":
       return s.devinEnabled !== false;
     case "codex":
@@ -757,7 +761,7 @@ export async function refreshRoamingFolders() {
   }
 }
 
-export function setView(view: "home" | "clues" | "workflows" | "virgo" | "knowledge") {
+export function setView(view: "home" | "clues" | "workflows" | "virgo" | "knowledge" | "employee") {
   setState("view", view);
 }
 
@@ -1739,7 +1743,7 @@ export async function openNextUnreadThread(): Promise<void> {
   // 口径与侧栏普通模式列表一致：排除训练会话，以及室女座收起的会话。
   const hidden = virgoHiddenThreads();
   const visible = state.threads.filter(
-    (t) => !t.experienceThread && !hidden.has(t.id),
+    (t) => !t.experienceThread && !t.employeeThread && !hidden.has(t.id),
   );
   const visibleIds = new Set(visible.map((t) => t.id));
   const unreadRoots = visible.filter(
@@ -2897,6 +2901,7 @@ export async function sendPromptTo(threadId: string, text: string, images: Promp
 export async function editUserMessage(itemId: number, text: string, images: PromptImage[] = []) {
   let id = state.currentId;
   if (!id || (!text.trim() && images.length === 0)) return;
+  assertBuiltinPrompt(text, images);
   // 历史分支预览中发生编辑时，先恢复对应快照；随后的 truncate_thread 会自动
   // 从被编辑提示词处截断并创建新分支，无需用户先手动执行时间跳跃。
   if (timeMachineEditTarget?.threadId === id) {
@@ -3474,12 +3479,21 @@ export async function initStore() {
       );
     }),
 
-    listen<{ threadId: string; text: string; images?: PromptImage[] }>(
+    listen<{ threadId: string; text: string; images?: PromptImage[]; restored?: boolean }>(
       "remote-prompt:dispatch",
       (e) => {
-        void sendPromptTo(e.payload.threadId, e.payload.text, e.payload.images ?? []).catch((error) =>
-          console.error("Remote prompt dispatch failed", error),
-        );
+        const { threadId, text, images = [], restored } = e.payload;
+        // 编辑时已显示乐观消息；统一发送入口会重新创建，先移除旧项避免重复。
+        if (restored && state.currentId === threadId) {
+          setState("items", items => items.filter(item => item.id >= 0));
+        }
+        void sendPromptTo(threadId, text, images).catch((error) => {
+          if (restored) {
+            setState("running", threadId, false);
+            showToast(`编辑后重新发送失败：${String(error)}`);
+          }
+          console.error("Prompt dispatch failed", error);
+        });
       },
     ),
 

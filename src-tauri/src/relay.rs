@@ -185,6 +185,7 @@ fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
         AgentKind::Kimi => Err("Kimi Code 暂不支持额度租借".into()),
         AgentKind::Lyra
         | AgentKind::Devin
+        | AgentKind::Claude
         | AgentKind::Codex
         | AgentKind::CodexPlus
         | AgentKind::CodeBuddy
@@ -255,6 +256,7 @@ fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> 
         AgentKind::Lyra => settings.lyra_enabled,
         AgentKind::Devin => settings.devin_enabled,
         AgentKind::Kimi => false,
+        AgentKind::Claude => settings.claude_enabled,
         AgentKind::Codex => settings.codex_enabled,
         AgentKind::CodexPlus => settings.codex_enabled,
         AgentKind::CodeBuddy => settings.codebuddy_enabled,
@@ -1773,8 +1775,8 @@ impl RelayManager {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
             }
-            AgentKind::Kimi => {
-                let mgr = state.kimi.clone();
+            AgentKind::Kimi | AgentKind::Claude => {
+                let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
@@ -2809,6 +2811,7 @@ impl RelayManager {
                     (AgentKind::Lyra, s.lyra_enabled),
                     (AgentKind::Devin, s.devin_enabled),
                     (AgentKind::Kimi, s.kimi_enabled),
+                    (AgentKind::Claude, s.claude_enabled),
                     (AgentKind::Codex, s.codex_enabled),
                     (AgentKind::CodeBuddy, s.codebuddy_enabled),
                     (AgentKind::Cursor, s.cursor_enabled),
@@ -2847,6 +2850,7 @@ impl RelayManager {
                     }
                     AgentKind::Devin => app.state::<AppState>().acp.fetch_model_options().await,
                     AgentKind::Kimi => app.state::<AppState>().kimi.fetch_model_options().await,
+                    AgentKind::Claude => app.state::<AppState>().claude.fetch_model_options().await,
                 };
                 if let Ok(v) = fetched {
                     if let Some(filtered) = shared_model_options(&kind, &v, &shared) {
@@ -3365,6 +3369,7 @@ impl RelayManager {
         // 远端原生会话已不再对应截断后的历史，下一条 prompt 必须从接力上下文启动。
         state.acp.forget_session_of_thread(&host_thread_id);
         state.kimi.forget_session_of_thread(&host_thread_id);
+        state.claude.forget_session_of_thread(&host_thread_id);
         state.codex.forget_session_of_thread(&host_thread_id);
         state.codexplus.forget_session_of_thread(&host_thread_id);
         state.codebuddy.forget_session_of_thread(&host_thread_id);
@@ -3510,8 +3515,8 @@ impl RelayManager {
                     });
                 }
             }
-            AgentKind::Kimi => {
-                let mgr = state.kimi.clone();
+            AgentKind::Kimi | AgentKind::Claude => {
+                let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move {
                     if host_prompt_is_current(&prompt_epoch) {
                         mgr.run_prompt(host_thread_id, text, images).await;
@@ -3580,8 +3585,8 @@ impl RelayManager {
                 let mgr = state.acp.clone();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
-            AgentKind::Kimi => {
-                let mgr = state.kimi.clone();
+            AgentKind::Kimi | AgentKind::Claude => {
+                let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
             AgentKind::Codex | AgentKind::CodexPlus => {
@@ -3669,7 +3674,12 @@ impl RelayManager {
             .unwrap_or_default()
             .to_string();
         let state = self.app.state::<AppState>();
-        if request_key.starts_with("kimi-") {
+        if request_key.starts_with("claude-") {
+            let mgr = state.claude.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = mgr.respond_permission(&request_key, &option_id).await;
+            });
+        } else if request_key.starts_with("kimi-") {
             let mgr = state.kimi.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = mgr.respond_permission(&request_key, &option_id).await;

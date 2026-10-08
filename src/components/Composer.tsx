@@ -1,5 +1,5 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
-import { rememberPromptDraft, takePromptDraft } from "../promptDraft";
+import { rememberPromptDraft, takePromptDraft, saveSessionDraft, takeSessionDraft } from "../promptDraft";
 import {
   promptHistory as globalPromptHistory,
   rememberPromptHistory,
@@ -33,6 +33,8 @@ import {
   openClueCard,
   pickThreadModel,
   refreshSlashCommands,
+  reasoningEffortChoices,
+  setThreadReasoningEffort,
   sendPrompt,
   setView,
   state,
@@ -54,7 +56,9 @@ import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 
 export function Composer() {
-  const [text, setText] = createSignal("");
+  let draftThreadId = state.currentId;
+  const initialDraft = takeSessionDraft(draftThreadId);
+  const [text, setText] = createSignal(initialDraft?.text ?? "");
   const [cursor, setCursor] = createSignal(0);
   const [slashStart, setSlashStart] = createSignal<number | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = createSignal(0);
@@ -117,6 +121,7 @@ export function Composer() {
   });
 
   const attach = createImageAttachments({ enableFileDrop: true });
+  attach.set(initialDraft?.images ?? []);
 
   const running = () => !!(state.currentId && state.running[state.currentId]);
   const [runClock, setRunClock] = createSignal(Date.now());
@@ -156,11 +161,12 @@ export function Composer() {
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
-  // 原生注入当前轮：Lyra / Codex / Devin / CodeBuddy。
+  // 原生注入当前轮：Lyra / Codex / Devin / CodeBuddy / Claude。
   const supportsLiveSteer = () =>
     state.agentKind === "lyra" ||
     state.agentKind === "codex" ||
     state.agentKind === "codebuddy" ||
+    state.agentKind === "claude" ||
     state.agentKind === "devin";
   // 打断当前轮后以新 turn 继续：Cursor（Agent.create + slim memory）。
   const supportsInterruptSteer = () => state.agentKind === "cursor";
@@ -335,18 +341,24 @@ export function Composer() {
     on(
       () => state.currentId,
       (currentId, previousId) => {
-        if (previousId === undefined || currentId === previousId) return;
+        if (!currentId || previousId === undefined || currentId === previousId) return;
+        saveSessionDraft(draftThreadId, text(), attach.images());
         rememberPromptDraft(text(), attach.images());
-        setText("");
-        setCursor(0);
+        draftThreadId = currentId;
+        const draft = takeSessionDraft(currentId);
+        setText(draft?.text ?? "");
+        setCursor(draft?.text.length ?? 0);
         setSlashStart(null);
         setHistoryOpen(false);
-        attach.clear();
+        attach.set(draft?.images ?? []);
       },
     ),
   );
 
-  onCleanup(() => rememberPromptDraft(text(), attach.images()));
+  onCleanup(() => {
+    saveSessionDraft(draftThreadId, text(), attach.images());
+    rememberPromptDraft(text(), attach.images());
+  });
 
   const currentQueuedPrompts = createMemo(() => {
     const currentId = state.currentId;
@@ -786,6 +798,17 @@ export function Composer() {
           anchorTo=".composer"
           favorites
         />
+        <Show when={state.agentKind === "claude" && reasoningEffortChoices().length > 0 && !usesPeerModels()}>
+          <select
+            aria-label="Claude 思考强度"
+            title="Claude 思考强度（当前模型支持的档位）"
+            value={state.reasoningEffort || "default"}
+            disabled={running()}
+            onChange={(e) => void setThreadReasoningEffort(e.currentTarget.value)}
+          >
+            <For each={reasoningEffortChoices()}>{(choice) => <option value={choice.value}>{choice.name}</option>}</For>
+          </select>
+        </Show>
         <Show when={running()}>
           <span class="composer-run-stats" title={`本轮已运行 ${runElapsed()}`}>
             <span class="composer-run-dot" aria-hidden="true" />

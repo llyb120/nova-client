@@ -2,6 +2,9 @@ mod visual_guard;
 mod acp;
 mod agent_config;
 mod jianlai;
+mod employee;
+mod jev;
+mod jev_run;
 mod tool_experience;
 mod cli_manager;
 mod clipboard;
@@ -88,6 +91,7 @@ pub struct AppState {
     pub(crate) context_service: context_service::ContextService,
     pub acp: Arc<AcpManager>,
     pub kimi: Arc<AcpManager>,
+    pub claude: Arc<AcpManager>,
     pub codex: Arc<CodexManager>,
     /// CodeBuddy 后端（官方 HTTP 传输：`codebuddy --serve` + /api/v1/acp JSON-RPC over SSE）。
     pub codebuddy: Arc<AcpManager>,
@@ -123,6 +127,7 @@ impl AppState {
     /// 使用公共 ACP 运行时的后端。
     pub fn acp_for(&self, kind: &AgentKind) -> Option<Arc<AcpManager>> {
         match kind {
+            AgentKind::Claude => Some(self.claude.clone()),
             AgentKind::Kimi => Some(self.kimi.clone()),
             AgentKind::Devin => Some(self.acp.clone()),
             _ => None,
@@ -143,6 +148,7 @@ impl AppState {
         match kind {
             AgentKind::Lyra => s.lyra_enabled,
             AgentKind::Devin => s.devin_enabled,
+            AgentKind::Claude => s.claude_enabled,
             AgentKind::Kimi => s.kimi_enabled,
             AgentKind::Codex => s.codex_enabled,
             AgentKind::CodexPlus => s.codexplus_enabled,
@@ -152,9 +158,9 @@ impl AppState {
         }
     }
 
-    /// ACP 标题生成只由 Devin 提供；Codex app-server 有自己的标题入口。
-    fn title_fallback_mgr(&self, _origin: &AgentKind) -> Arc<AcpManager> {
-        self.acp.clone()
+    /// ACP 后端优先使用自身凭证生成标题。
+    fn title_fallback_mgr(&self, origin: &AgentKind) -> Arc<AcpManager> {
+        self.acp_for(origin).unwrap_or_else(|| self.acp.clone())
     }
 
     /// 统一的会话标题生成入口：优先路由到设置里的轻量级模型。
@@ -284,6 +290,7 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
     match thread.agent_kind {
         AgentKind::Lyra => state.lyra.is_running(&thread.id),
         AgentKind::Devin => state.acp.is_running(&thread.id),
+        AgentKind::Claude => state.claude.is_running(&thread.id),
         AgentKind::Kimi => state.kimi.is_running(&thread.id),
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.is_running(&thread.id),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.is_running(&thread.id),
@@ -419,6 +426,7 @@ fn any_session_running(state: &AppState) -> bool {
 pub(crate) async fn shutdown_agent_processes(state: &AppState) {
     state.acp.kill_conn().await;
     state.kimi.kill_conn().await;
+    state.claude.kill_conn().await;
     state.codex.kill_conn().await;
     state.codexplus.shutdown();
     state.codebuddy.shutdown();
@@ -787,6 +795,7 @@ fn spawn_backend_availability_check(app: tauri::AppHandle) {
                 (AgentKind::Lyra, String::new()),
                 (AgentKind::Devin, s.devin_path.clone()),
                 (AgentKind::Kimi, s.kimi_path.clone()),
+                (AgentKind::Claude, s.claude_path.clone()),
                 (AgentKind::Codex, s.codex_path.clone()),
                 (AgentKind::CodeBuddy, s.codebuddy_path.clone()),
                 (AgentKind::Cursor, s.cursor_path.clone()),
@@ -876,6 +885,7 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
                 .clone()
                 .or_else(|| wt_by_path.get(&t.cwd).cloned()),
             experience_thread: t.experience_thread,
+            employee_thread: t.employee_thread,
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             active_clue_card_id: t.active_clue_card_id.clone(),
@@ -1312,15 +1322,9 @@ fn prewarm(
     };
     if matches!(
         agent_kind,
-        AgentKind::Devin | AgentKind::Kimi | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus
+        AgentKind::Devin | AgentKind::Kimi | AgentKind::Claude | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus
     ) {
-        let mgr = if agent_kind == AgentKind::Kimi {
-            state.kimi.clone()
-        } else if agent_kind == AgentKind::Devin {
-            state.acp.clone()
-        } else {
-            state.codebuddy.clone()
-        };
+        let mgr = state.acp_for(&agent_kind).unwrap_or_else(|| state.codebuddy.clone());
         tauri::async_runtime::spawn(async move {
             mgr.prewarm(cwd, mode).await;
         });
@@ -2150,8 +2154,8 @@ async fn merge_worktree_thread(
                         mgr.run_prompt(thread_id, prompt, vec![]).await;
                     });
                 }
-                AgentKind::Kimi => {
-                    let mgr = state.kimi.clone();
+                AgentKind::Kimi | AgentKind::Claude => {
+                    let mgr = state.acp_for(&agent_kind).unwrap();
                     tauri::async_runtime::spawn(async move {
                         mgr.run_prompt(thread_id, prompt, vec![]).await;
                     });
@@ -2338,6 +2342,9 @@ fn cleanup_lyra_session_files(
             format!("{id}.slim.json"),
             format!("{id}.pending.json"),
             format!("{id}.pending.pending.tmp"),
+            format!("{id}.jsonl"),
+            format!("{id}.context.json"),
+            format!("{id}.context.json.tmp"),
         ] {
             let path = session_root.join(file_name);
             if let Err(error) = std::fs::remove_file(&path) {
@@ -2364,7 +2371,15 @@ fn cleanup_lyra_session_files(
 /// 从 session 文件名还原 session id；只识别 Lyra 自己写的几类文件（含中断轨迹
 /// checkpoint 的原子写入临时文件），其余（logs/ 目录、未知文件）一律不动。
 fn lyra_session_file_id(name: &str) -> Option<&str> {
-    [".pending.pending.tmp", ".slim.json", ".pending.json", ".json"]
+    [
+        ".pending.pending.tmp",
+        ".slim.json",
+        ".pending.json",
+        ".context.json.tmp",
+        ".context.json",
+        ".jsonl",
+        ".json",
+    ]
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix))
         .filter(|id| valid_lyra_session_id(id))
@@ -2462,6 +2477,7 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
         let id = &thread.id;
         state.acp.forget_session_of_thread(id);
         state.kimi.forget_session_of_thread(id);
+        state.claude.forget_session_of_thread(id);
         state.codex.forget_session_of_thread(id);
         state.lyra.forget_session_of_thread(id);
         state.codexplus.forget_session_of_thread(id);
@@ -3265,6 +3281,7 @@ fn delete_time_machine_context(
         AgentKind::Lyra => state.lyra.forget_session_of_thread(&thread_id),
         AgentKind::Devin => state.acp.forget_session_of_thread(&thread_id),
         AgentKind::Kimi => state.kimi.forget_session_of_thread(&thread_id),
+        AgentKind::Claude => state.claude.forget_session_of_thread(&thread_id),
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codexplus.forget_session_of_thread(&thread_id)
         }
@@ -3389,16 +3406,10 @@ fn set_thread_model(
     } else if is_quota {
         // 重启后隔离运行时已丢、但本次已持有目标模型租约：新模型已落库，
         // 下一轮发送会走 restore_quota_runtime 重建，不能去动本机全局 manager。
-    } else if matches!(agent_kind, AgentKind::Devin | AgentKind::Kimi)
-        || matches!(agent_kind, AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus)
+    } else if matches!(agent_kind, AgentKind::Devin | AgentKind::Kimi | AgentKind::Claude
+        | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus)
     {
-        let mgr = if agent_kind == AgentKind::Kimi {
-            state.kimi.clone()
-        } else if agent_kind == AgentKind::Devin {
-            state.acp.clone()
-        } else {
-            state.codebuddy.clone()
-        };
+        let mgr = state.acp_for(&agent_kind).unwrap_or_else(|| state.codebuddy.clone());
         tauri::async_runtime::spawn(async move {
             mgr.sync_thread_config(&thread_id).await;
         });
@@ -3409,7 +3420,7 @@ fn set_thread_model(
                 state.codexplus.forget_session_of_thread(&thread_id)
             }
             AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&thread_id),
-            AgentKind::Devin | AgentKind::Kimi | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {}
+            AgentKind::Devin | AgentKind::Kimi | AgentKind::Claude | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {}
         }
     }
     Ok(())
@@ -3472,15 +3483,9 @@ fn set_thread_reasoning_effort(
     // `thought_level`），已挂载的会话要即时下发，否则要等下一次 ensure_session 才生效。
     if matches!(
         agent_kind,
-        AgentKind::Devin | AgentKind::Kimi | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus
+        AgentKind::Devin | AgentKind::Kimi | AgentKind::Claude | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus
     ) {
-        let mgr = if agent_kind == AgentKind::Kimi {
-            state.kimi.clone()
-        } else if agent_kind == AgentKind::Devin {
-            state.acp.clone()
-        } else {
-            state.codebuddy.clone()
-        };
+        let mgr = state.acp_for(&agent_kind).unwrap_or_else(|| state.codebuddy.clone());
         tauri::async_runtime::spawn(async move {
             mgr.sync_thread_config(&thread_id).await;
         });
@@ -3617,6 +3622,7 @@ fn set_thread_agent(
             match old_kind {
                 AgentKind::Devin => state.acp.forget_session_of_thread(&thread_id),
                 AgentKind::Kimi => state.kimi.forget_session_of_thread(&thread_id),
+                AgentKind::Claude => state.claude.forget_session_of_thread(&thread_id),
                 AgentKind::Codex => state.codexplus.forget_session_of_thread(&thread_id),
                 AgentKind::CodeBuddy => state.codebuddy.forget_session_of_thread(&thread_id),
                 AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&thread_id),
@@ -3647,6 +3653,7 @@ async fn get_model_options(
         AgentKind::Lyra => state.lyra.ensure_model_options().await.map(Some),
         AgentKind::Devin => state.acp.ensure_model_options().await.map(Some),
         AgentKind::Kimi => state.kimi.ensure_model_options().await.map(Some),
+        AgentKind::Claude => state.claude.ensure_model_options().await.map(Some),
         AgentKind::Codex | AgentKind::CodexPlus => {
             state.codex.ensure_model_options().await.map(Some)
         }
@@ -3665,6 +3672,65 @@ fn refresh_lyra_config(state: State<'_, AppState>) {
     state.lyra.notify_config_changed();
 }
 
+/// 设置页图形化编辑：读取 config.jsonc（不存在时返回空配置）。
+#[tauri::command]
+fn get_lyra_config() -> Result<Value, String> {
+    let path = lyra::config::nova_root().join("alkaid").join("config.jsonc");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => lyra_complete::parse_jsonc(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({ "provider": {} })),
+        Err(error) => Err(format!("读取 Lyra 配置失败：{error}")),
+    }
+}
+
+/// 设置页的自适应 provider 预设列表。
+#[tauri::command]
+fn get_lyra_presets() -> Value {
+    lyra::presets::list()
+}
+
+#[tauri::command]
+async fn import_local_lyra_provider(state: State<'_, AppState>, source: String) -> Result<Value, String> {
+    let proxy = state.settings.lock().unwrap().lyra_proxy.clone();
+    let http = lyra::provider::client_for_proxy(proxy.trim());
+    lyra::presets::import_local(&http, &source).await
+}
+
+/// 设置页「获取模型」：按编辑中的 provider（可未保存）立即拉取模型列表写入缓存并返回。
+#[tauri::command]
+async fn fetch_lyra_models(state: State<'_, AppState>, id: String, provider: Value) -> Result<Value, String> {
+    let proxy = state.settings.lock().unwrap().lyra_proxy.clone();
+    let http = lyra::provider::client_for_proxy(proxy.trim());
+    let root = lyra::config::nova_root();
+    lyra::presets::refresh(&http, &root, &json!({ "provider": { id.clone(): provider } }), true).await?;
+    // 已保存的 provider 立刻在模型选择器中可见。
+    state.lyra.notify_config_changed();
+    Ok(lyra::presets::cached_models(&root, &id))
+}
+
+/// 写回 config.jsonc 并立即重载。手写的 JSONC（含注释）首次被覆盖前备份为 config.jsonc.bak。
+#[tauri::command]
+fn save_lyra_config(state: State<'_, AppState>, config: Value) -> Result<(), String> {
+    if !config.get("provider").is_some_and(Value::is_object) {
+        return Err("Lyra 配置缺少 provider".into());
+    }
+    let dir = lyra::config::nova_root().join("alkaid");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建 Lyra 配置目录失败：{e}"))?;
+    let path = dir.join("config.jsonc");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if serde_json::from_str::<Value>(&text).is_err() {
+            std::fs::write(dir.join("config.jsonc.bak"), text)
+                .map_err(|e| format!("备份 Lyra 配置失败：{e}"))?;
+        }
+    }
+    let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    let tmp = dir.join("config.jsonc.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("写入 Lyra 配置失败：{e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("写入 Lyra 配置失败：{e}"))?;
+    state.lyra.notify_config_changed();
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_slash_commands(
     state: State<'_, AppState>,
@@ -3680,8 +3746,8 @@ async fn get_slash_commands(
             let commands = state.acp.fetch_commands().await?;
             Ok(commands.as_array().cloned().unwrap_or_default())
         }
-        AgentKind::Kimi => {
-            let commands = state.kimi.fetch_commands().await?;
+        AgentKind::Kimi | AgentKind::Claude => {
+            let commands = state.acp_for(&agent_kind).unwrap().fetch_commands().await?;
             Ok(commands.as_array().cloned().unwrap_or_default())
         }
         AgentKind::Codex | AgentKind::CodexPlus => Ok(list_codex_skill_commands(&state.config_dir)),
@@ -3917,10 +3983,11 @@ pub(crate) fn dispatch_prompt(
                 mgr.run_prompt(thread_id, text, images).await;
             });
         }
-        AgentKind::Kimi => {
-            let mgr = state.kimi.clone();
-            if mgr.is_running(&thread_id) {
-                return Err("Kimi Code 正在工作，请将消息加入队列或停止后重试".into());
+        AgentKind::Kimi | AgentKind::Claude => {
+            let mgr = state.acp_for(&agent_kind).unwrap();
+            // Claude 运行中由 run_prompt 转为 `_session/steering` 原生引导。
+            if agent_kind == AgentKind::Kimi && mgr.is_running(&thread_id) {
+                return Err(format!("{} 正在工作，请将消息加入队列或停止后重试", agent_kind.label()));
             }
             tauri::async_runtime::spawn(async move {
                 mgr.run_prompt(thread_id, text, images).await;
@@ -4021,6 +4088,7 @@ fn truncate_thread(
     }
     state.acp.forget_session_of_thread(&thread_id);
     state.kimi.forget_session_of_thread(&thread_id);
+    state.claude.forget_session_of_thread(&thread_id);
     state.codex.forget_session_of_thread(&thread_id);
     state.codexplus.forget_session_of_thread(&thread_id);
     state.codebuddy.forget_session_of_thread(&thread_id);
@@ -4103,8 +4171,16 @@ fn truncate_thread(
         }
         if should_send {
             let prompt = prompt.unwrap_or_default();
-            if let Err(error) = dispatch_prompt(&background_app, thread_id.clone(), prompt, images)
-            {
+            // 恢复完成后与 Composer 共用前端命令展开、模式设置及工作流续跑入口。
+            let result = if server::is_headless() {
+                dispatch_prompt(&background_app, thread_id.clone(), prompt, images)
+            } else {
+                background_app.emit(
+                    remote::EV_REMOTE_PROMPT_DISPATCH,
+                    json!({ "threadId": thread_id, "text": prompt, "images": images, "restored": true }),
+                ).map_err(|error| error.to_string())
+            };
+            if let Err(error) = result {
                 let state = background_app.state::<AppState>();
                 let mut store = state.store.lock().unwrap();
                 if let Some(thread) = store.get_mut(&thread_id) {
@@ -4171,6 +4247,7 @@ async fn cancel_turn(
         AgentKind::Lyra => state.lyra.cancel(&thread_id).await,
         AgentKind::Devin => state.acp.cancel(&thread_id).await,
         AgentKind::Kimi => state.kimi.cancel(&thread_id).await,
+        AgentKind::Claude => state.claude.cancel(&thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(&thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.cancel(&thread_id).await,
         AgentKind::Cursor => state.cursorplus.cancel(&thread_id).await,
@@ -4230,7 +4307,9 @@ async fn respond_permission(
     if let Some(runtime) = borrowed {
         return runtime.respond_permission(&request_key, &option_id).await;
     }
-    if request_key.starts_with("kimi-") {
+    if request_key.starts_with("claude-") {
+        state.claude.respond_permission(&request_key, &option_id).await
+    } else if request_key.starts_with("kimi-") {
         state.kimi.respond_permission(&request_key, &option_id).await
     } else if request_key.starts_with("cdp-") {
         state
@@ -4307,6 +4386,7 @@ async fn apply_runtime_settings(
     let (
         restart_lyra,
         restart_devin,
+        restart_claude,
         restart_kimi,
         restart_codebuddy,
         restart_cursor,
@@ -4332,6 +4412,13 @@ async fn apply_runtime_settings(
             || custom_env_changed
             || s.lyra_proxy != settings.lyra_proxy
             || s.lyra_enabled != settings.lyra_enabled;
+        let restart_claude = restart_all_agents
+            || custom_env_changed
+            || context_runtime_changed
+            || auto_change_project_changed
+            || s.claude_path != settings.claude_path
+            || s.claude_proxy != settings.claude_proxy
+            || s.claude_enabled != settings.claude_enabled;
         let restart_kimi = restart_all_agents
             || custom_env_changed
             || context_runtime_changed
@@ -4371,7 +4458,7 @@ async fn apply_runtime_settings(
             || s.relay_token != settings.relay_token
             || s.relay_groups != settings.relay_groups;
         // 任一后端的路径变化都可能影响「是否可用」，保存后重新并发检测
-        let recheck_availability = restart_kimi || restart_devin
+        let recheck_availability = restart_claude || restart_kimi || restart_devin
             || restart_codebuddy
             || restart_cursor
             || restart_codex;
@@ -4382,6 +4469,7 @@ async fn apply_runtime_settings(
         (
             restart_lyra,
             restart_devin,
+            restart_claude,
             restart_kimi,
             restart_codebuddy,
             restart_cursor,
@@ -4401,6 +4489,9 @@ async fn apply_runtime_settings(
     }
     if restart_kimi {
         state.kimi.restart().await;
+    }
+    if restart_claude {
+        state.claude.restart().await;
     }
     if restart_codebuddy {
         state.codebuddy.shutdown();
@@ -4564,12 +4655,8 @@ async fn run_auxiliary_prompt(
                 .run_prompt(thread_id, prompt, Vec::new())
                 .await
         }
-        AgentKind::Kimi => {
-            state
-                .kimi
-                .clone()
-                .run_prompt(thread_id, prompt, Vec::new())
-                .await
+        AgentKind::Kimi | AgentKind::Claude => {
+            state.acp_for(kind).unwrap().run_prompt(thread_id, prompt, Vec::new()).await
         }
         AgentKind::Codex | AgentKind::CodexPlus => {
             state
@@ -5107,6 +5194,12 @@ async fn get_status(state: State<'_, AppState>) -> Result<Value, String> {
         .unwrap()
         .as_ref()
         .and_then(|v| v.get("agentInfo").cloned());
+    if state.claude.connected().await {
+        connected = true;
+        if agent.is_none() {
+            agent = state.claude.agent_info.lock().unwrap().as_ref().and_then(|v| v.get("agentInfo").cloned());
+        }
+    }
     if state.kimi.connected().await {
         connected = true;
         if agent.is_none() {
@@ -5133,11 +5226,32 @@ fn get_logs(state: State<'_, AppState>) -> Vec<String> {
     let mut logs = state.acp.get_logs();
     logs.extend(state.codex.get_logs());
     logs.extend(state.kimi.get_logs());
+    logs.extend(state.claude.get_logs());
     logs
 }
 
 /// 注册 Tauri 事件监听：本机 agent 产生的 update/turn/permission 事件，
 /// 若属于「被别人漫游」的会话，则原样转发给对应 guest。
+/// Browser acts of a turn become an auto-recorded route when the turn ends normally
+/// (see tool_experience::finish_turn); cancelled or failed turns only drop their trail.
+fn register_experience_trails(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    app.listen(acp::EV_TURN, move |e| {
+        let Ok(v) = serde_json::from_str::<Value>(e.payload()) else { return };
+        let Some(tid) = v["threadId"].as_str().map(str::to_owned) else { return };
+        if v["running"].as_bool().unwrap_or(false) { return; }
+        let keep = matches!(v["stopReason"].as_str(), Some("end_turn" | "max_turn_requests"));
+        let cwd = handle.state::<AppState>().store.lock().unwrap().get(&tid).map(|t| t.cwd.clone());
+        tauri::async_runtime::spawn_blocking(move || {
+            // Chrome owners are "<mcp client id>:<canonical cwd>". ponytail: two sessions running
+            // browser acts in the same directory at once share each other's trail.
+            let suffix = cwd.and_then(|c| std::fs::canonicalize(c).ok()).map(|c| format!(":{}", c.display()));
+            tool_experience::finish_turn(&tool_experience::dir(),
+                |o| o == tid || suffix.as_deref().is_some_and(|s| o.ends_with(s)), keep);
+        });
+    });
+}
+
 fn register_roaming_forwarders(app: &tauri::AppHandle, relay: Arc<RelayManager>) {
     let r = relay.clone();
     app.listen(acp::EV_UPDATE, move |e| {
@@ -5298,6 +5412,16 @@ pub fn maybe_run_update_helper() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let mut context = tauri::generate_context!();
+    // 开发构建与正式构建共用同一 identifier 时会争抢同一个 WebView2 用户数据目录：
+    // 同一 UDF 下 EnvironmentOptions 不同的实例无法共存，后启动者创建 webview 会报
+    // 0x80010108。把开发构建的应用目录整体隔离到独立标识下，两者可同时运行。
+    #[cfg(debug_assertions)]
+    {
+        let identifier = context.config().identifier.clone();
+        context.config_mut().identifier = format!("{identifier}.dev");
+    }
+
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init())
         .manage(workspace_terminal::TerminalManager::default());
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -5383,6 +5507,7 @@ pub fn run() {
                 });
             let acp = AcpManager::new(app.handle().clone(), AgentKind::Devin);
             let kimi = AcpManager::new(app.handle().clone(), AgentKind::Kimi);
+            let claude = AcpManager::new(app.handle().clone(), AgentKind::Claude);
             let codebuddy_acp = AcpManager::new(app.handle().clone(), AgentKind::CodeBuddy);
             let codex = CodexManager::new(app.handle().clone());
             let lyra = SdkManager::new(app.handle().clone(), LyraAdapter);
@@ -5405,6 +5530,7 @@ pub fn run() {
                 context_service,
                 acp,
                 kimi,
+                claude,
                 codex,
                 codebuddy: codebuddy_acp,
                 lyra,
@@ -5449,6 +5575,12 @@ pub fn run() {
             {
                 let state = app.state::<AppState>();
                 let dir = state.config_dir.clone();
+                if let Some(v) = model_cache::load(&dir, "claude") {
+                    state.claude.seed_model_options(v);
+                }
+                if state.agent_enabled(&AgentKind::Claude) {
+                    state.claude.spawn_revalidate_model_options();
+                }
                 if let Some(v) = model_cache::load(&dir, "kimi") {
                     state.kimi.seed_model_options(v);
                 }
@@ -5571,12 +5703,14 @@ pub fn run() {
             }
 
             // 漫游 host：把本机被漫游会话的更新/轮次/权限事件转发给 guest
+            register_experience_trails(app.handle());
             register_roaming_forwarders(app.handle(), relay.clone());
             register_remote_permission_capture(app.handle());
             // 连接中转站（未配置 token 时内部直接返回）
             relay.restart();
             // server 侧远程会话：空闲只做命令长轮询；运行中按全量 + 增量同步。
             remote::start(app.handle().clone());
+            employee::start(app.handle().clone());
             // `Nova server config/project ...` 由独立管理进程写盘；运行实例监听提交标记，
             // 无需重启即可同步设置、环境变量与项目白名单。
             start_headless_config_watcher(app.handle().clone());
@@ -5652,6 +5786,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            employee::employee_get,
+            employee::employee_set,
+            employee::employee_do,
+            employee::employee_say,
             workspace_terminal::terminal_create,
             workspace_terminal::terminal_write,
             workspace_terminal::terminal_resize,
@@ -5731,6 +5869,11 @@ pub fn run() {
             set_thread_agent,
             get_model_options,
             refresh_lyra_config,
+            get_lyra_config,
+            get_lyra_presets,
+            import_local_lyra_provider,
+            fetch_lyra_models,
+            save_lyra_config,
             get_slash_commands,
             send_prompt,
             truncate_thread,
@@ -5738,6 +5881,7 @@ pub fn run() {
             compact_thread,
             respond_permission,
             get_settings,
+            jev::test_jev_connection,
             set_settings,
             refresh_environment_variables,
             get_global_agent_instructions,
@@ -5792,7 +5936,7 @@ pub fn run() {
             remove_skill,
             sync_skills
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("Nova 启动失败")
         .run(|app, event| {
             if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }), .. }

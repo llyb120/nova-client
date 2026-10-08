@@ -55,10 +55,17 @@ Codex 会话默认注入内置 RTK 的调用指令，使用 `nova __rtk` 压缩�
 Windsurf 已更名为 **Devin Desktop**（2026-06），其本地 agent Cascade 将于 **2026-07-01 EOL**，由 Devin Local 取代，且 Cascade 从未提供独立 CLI——所以无法也没必要接入。
 本应用使用的 `devin` CLI 正是 Cognition（Windsurf 母公司）官方的 agent 入口，与 Devin Desktop 共用同一后端与模型池（Claude / Gemini / GPT / SWE 系列）。
 
-如果想换其他 agent：任何实现 ACP 协议的 agent 都可以接入，在设置里改两项即可，例如 Claude Agent：
+## Claude Code（ACP）
 
-- 可执行文件：`npx`
-- ACP 启动参数：`-y @zed-industries/claude-code-acp`
+Claude Code 有独立后端，不需要占用 Devin 配置。需要 Node.js 22+：
+
+1. 安装 adapter：`npm install -g @agentclientprotocol/claude-agent-acp@latest`。
+2. 运行 `claude-agent-acp --cli` 完成 Claude Code 登录，或在 Nova 环境变量中配置 `ANTHROPIC_API_KEY`。
+3. 设置 → 后端 → Claude Code，启用并保存。默认可执行文件是 `claude-agent-acp`（不是 `claude`），支持自定义路径与独立代理。
+
+复用 ACP 的流式消息、工具展示、图片、权限审批、Build/Plan、模型与思考强度、恢复、取消、预热、标题、接力、漫游和历史编辑。Nova 的 Polaris、剑来、Chrome、WebView、图片生成/编辑及工作目录切换通过会话 MCP 自动挂载；Plan 模式不开放写入类 Nova 工具。全局指令同步到 `CLAUDE.md`，skills 同步到 Claude 配置目录。
+
+额度租借仅支持显式 API Key / Token，不自动导出系统钥匙串中的登录凭证。ACP 不提供通用运行中引导接口，Claude 忙碌时使用消息队列。
 
 ## 运行前提
 

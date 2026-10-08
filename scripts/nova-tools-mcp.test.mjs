@@ -55,7 +55,7 @@ test("createNovaBatchTools exposes context tools only with the native service", 
     if (previousToken !== undefined) process.env.NOVA_CONTEXT_SERVICE_TOKEN = previousToken;
   }
   const tools = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }));
-  assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "jianlai", "polaris", "webview"]);
+  assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "employee", "generate_image", "jianlai", "polaris", "webview"]);
 });
 
 test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
@@ -63,7 +63,7 @@ test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
   process.env.NOVA_FAST_CONTEXT = "0";
   try {
     const tools = withContextService(() => createNovaBatchTools(process.cwd()));
-    assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "generate_image", "jianlai", "webview"]);
+    assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "employee", "generate_image", "jianlai", "webview"]);
     assert.deepEqual(withContextService(() => createNovaBatchTools(process.cwd(), { readOnly: true })), {});
   }
   finally {
@@ -82,7 +82,9 @@ test("polaris keywords normalize to top five", () => {
     normalizePolarisArgs({ keywords: ["a", "b", "a", "c", "d", "e", "f"] }).keywords,
     ["a", "b", "c", "d", "e"],
   );
-  const schema = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true })).polaris.inputSchema.properties.keywords;
+  const inputSchema = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true })).polaris.inputSchema;
+  for (const key of ["anyOf", "oneOf", "allOf"]) assert.equal(inputSchema[key], undefined, `top-level ${key} makes Claude Code drop polaris`);
+  const schema = inputSchema.properties.keywords;
   assert.equal(schema.maxItems, undefined);
   assert(schema.anyOf.some((option) => option.type === "string"));
 });
@@ -115,6 +117,7 @@ test("desktop optimizations are shared by custom tools and MCP, not Lyra-only", 
     assert.match(tool.description, /普通成功操作无需保存或反馈/);
     assert.doesNotMatch(tool.description, /开始新任务或切换应用\/网站\/子任务时，先experience_search|在最终回复前调用experience_save/);
     assert.match(tool.description, /首次观察后核对conditions/);
+    assert.match(tool.description, /experienceHint/);
     assert.match(tool.description, /graph路径图谱辅助规划/);
     assert.equal(tool.inputSchema.properties.experience.properties.prefix.maxItems, 12);
     assert.match(tool.inputSchema.properties.experience.properties.task.description, /浏览可以做什么/);

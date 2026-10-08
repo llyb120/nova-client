@@ -1,6 +1,7 @@
 //! Lyra — Rust 原生自研 agent，实现 pi 系 agent 的核心机制：
 //! 基础工具（read/bash/edit/write + polaris 直连 nova_tools_native）、
-//! Reasonix 精简上下文（slim memory 冻结摘要 + 压力分层 + 中途重写）、
+//! Codex 式 turn 循环（只读工具提前派发、副作用串行、退避重试、多 agent）、
+//! Reasonix 式上下文投影（jsonl 规范历史只追加，折叠摘要 + 索引 + recall）、
 //! 缓存优化（稳定/动态系统提示分段、prompt_cache_key、service_tier、长缓存保持）、
 //! provider 兼容 OpenAI Completions 与 Responses。
 //!
@@ -10,16 +11,19 @@
 //! 隔离。`nova lyra` 子命令保留作命令行调试入口，stdio JSONL 协议与 alkaid-bridge
 //! 完全兼容，两种载体的事件流完全一致。
 
-mod agent;
 mod bridge;
 pub(crate) mod config;
+mod context;
 mod edit;
+mod history;
+pub(crate) mod presets;
 mod prompt;
 pub(crate) mod provider;
 mod read;
-mod reasonix;
+mod rollout;
+mod session;
 mod tools;
-mod watchdog;
+mod turn;
 
 pub use prompt::{
     is_retryable_provider_error, PROVIDER_RETRY_DELAYS_MS,

@@ -118,7 +118,7 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "virgo" | "knowledge") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "virgo" | "knowledge" | "employee") => {
     setView(view);
     closeThread();
   };
@@ -139,9 +139,10 @@ export function Sidebar(props: {
   const completedUnreadCount = createMemo(() => {
     const { hidden } = chainInfo();
     return state.threads.reduce((sum, thread) =>
-      sum + (!thread.experienceThread && !hidden.has(thread.id) && thread.id !== state.currentId
+      sum + (!thread.experienceThread && !thread.employeeThread && !hidden.has(thread.id) && thread.id !== state.currentId
         ? (state.unreadTurns[thread.id] ?? 0) : 0), 0);
   });
+  const railCount = () => chainInfo().rootCount + completedUnreadCount();
   const inRunningChain = (t: ThreadMeta) => virgoHidden().has(t.id);
   // 室女座里的任务数：减少焦虑下按运行中任务链计，手动收纳下按收纳的会话链计。
   const virgoChainCount = createMemo(() => {
@@ -200,8 +201,8 @@ export function Sidebar(props: {
 
   const currentGroups = createMemo(() => {
     const threads = isVirgoView()
-        ? state.threads.filter((t) => !t.experienceThread && inRunningChain(t))
-        : state.threads.filter((t) => !t.experienceThread && !inRunningChain(t));
+        ? state.threads.filter((t) => !t.experienceThread && !t.employeeThread && inRunningChain(t))
+        : state.threads.filter((t) => !t.experienceThread && !t.employeeThread && !inRunningChain(t));
     return groupByCwd(threads);
   });
 
@@ -602,14 +603,11 @@ export function Sidebar(props: {
             aria-label="会话列表" aria-controls="main-sidebar"
             aria-expanded={sidebarOpen()} onClick={() => { cancelHover(); setHovered(true); }}>
             <IconFolder size={18} />
-            <Show when={chainInfo().rootCount > 0}>
-              <span class="sidebar-rail-count running" aria-label={`运行中：${chainInfo().rootCount}`}>
-                {chainInfo().rootCount > 99 ? "99+" : chainInfo().rootCount}
-              </span>
-            </Show>
-            <Show when={completedUnreadCount() > 0}>
-              <span class="sidebar-rail-count unread" aria-label={`已完成未读：${completedUnreadCount()}`}>
-                {completedUnreadCount() > 99 ? "99+" : completedUnreadCount()}
+            <Show when={railCount() > 0}>
+              <span class="sidebar-rail-count"
+                classList={{ running: chainInfo().rootCount > 0, unread: completedUnreadCount() > 0 }}
+                aria-label={`运行中：${chainInfo().rootCount}，已完成未读：${completedUnreadCount()}`}>
+                <span class="sidebar-rail-count-number">{railCount() > 99 ? "99+" : railCount()}</span>
               </span>
             </Show>
           </button>
@@ -817,6 +815,10 @@ export function Sidebar(props: {
                 知识图谱
               </button>
             </Show>
+            <button class="mode-seg-btn" classList={{ active: state.view === "employee" }}
+              onClick={() => switchView("employee")} title="数字员工：空闲时按职责自动干活">
+              数字员工
+            </button>
           </div>
 
         </div>
