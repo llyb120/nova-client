@@ -2530,10 +2530,11 @@ impl AcpManager {
     /// 草稿页提前启动并完成 ACP initialize；CodeBuddy 的官方 activate 也在后台完成。
     /// 不创建 session，发送时仍按真实线程注入 MCP 并设置模型/模式。
     pub async fn prewarm(self: &Arc<Self>, cwd: String, mode: Option<String>) {
-        if !matches!(self.kind, AgentKind::Devin | AgentKind::CodeBuddy) {
+        if !matches!(self.kind, AgentKind::Devin | AgentKind::CodeBuddy | AgentKind::Claude) {
             return;
         }
-        let read_only = self.kind == AgentKind::Devin
+        // 与 thread_is_read_only 一致：只有 CodeBuddy 的进程不区分只读。
+        let read_only = self.kind != AgentKind::CodeBuddy
             && mode.as_deref().map(unify_mode_id).as_deref() == Some("plan");
         let entry = Arc::new(AcpPrewarm {
             cwd: cwd.clone(),
