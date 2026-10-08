@@ -285,7 +285,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                   </label>
                   <label class="backend-field">
                     <span class="field-label">API Key</span>
-                    <input class="field-input" type="password" autocomplete="off" placeholder="sk-… 或 {env:NAME}" value={p().apiKey} onInput={(e) => setP((x) => (x.apiKey = e.currentTarget.value))} />
+                    <input class="field-input" type="text" autocomplete="off" placeholder="sk-… 或 {env:NAME}" value={p().apiKey} onInput={(e) => setP((x) => (x.apiKey = e.currentTarget.value))} />
                   </label>
                   <label class="backend-field">
                     <span class="field-label">代理</span>
