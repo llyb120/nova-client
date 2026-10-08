@@ -10,9 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod local_provider;
 
 /// 导入为普通 provider，后续由现有设置编辑/保存；不把本机配置引用写入可共享配置。
-pub(crate) async fn import_local(http: &reqwest::Client, source: &str) -> Result<Value, String> {
-    let (provider, selected) = local_provider::load(source, &super::config::process_env())?;
-    let explicit = provider["models"].as_object().cloned().unwrap_or_default();
+async fn fetch_local_models(http: &reqwest::Client, provider: Value, catalog: &mut Option<Value>) -> Result<Map<String, Value>, String> {
     let base = provider["options"]["baseURL"].as_str().unwrap_or("").trim_end_matches('/');
     let url = reqwest::Url::parse(base).map_err(|_| "本地 API 的 Base URL 无效")?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -28,18 +26,37 @@ pub(crate) async fn import_local(http: &reqwest::Client, source: &str) -> Result
     if anthropic { request = request.header("anthropic-version", "2023-06-01"); }
     if let Some(headers) = provider["options"]["headers"].as_object() {
         for (name, value) in headers {
+            if value.is_null() { continue; }
             let value = value.as_str().ok_or("本地 API 请求头必须是字符串")?;
             let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| "本地 API 请求头名称无效")?;
             let value = reqwest::header::HeaderValue::from_str(value).map_err(|_| "本地 API 请求头值无效")?;
             request = request.header(name, value);
         }
     }
-    let (list, catalog) = tokio::join!(async {
-        // 优先导入用户已配置的模型；未指定时才查询端点，兼容不提供 /models 的网关。
-        if !explicit.is_empty() { return Some(json!({ "data": [] })); }
-        request.send().await.ok()?.error_for_status().ok()?.json::<Value>().await.ok()
-    }, get_json(http, "https://models.dev/api.json", ""));
-    convert_local(provider, &selected, &list.unwrap_or(Value::Null), catalog.as_ref().ok())
+    let list = async {
+        let mut entries = Vec::new();
+        let mut cursors = std::collections::HashSet::new();
+        let mut cursor = None;
+        loop {
+            let mut page = request.try_clone().ok_or("无法复制模型列表请求")?;
+            if let Some(cursor) = &cursor { page = page.query(&[("after_id", cursor)]); }
+            let page: Value = page.send().await.map_err(|_| "无法连接本地配置的模型 API")?
+                .error_for_status().map_err(|e| format!("模型 API 返回 {}", e.status().unwrap()))?
+                .json().await.map_err(|_| "模型 API 返回的 JSON 无效")?;
+            entries.extend(page["data"].as_array().ok_or("模型 API 缺少 data 列表")?.iter().cloned());
+            if page["has_more"] != true { break; }
+            let next = page["last_id"].as_str().filter(|id| !id.is_empty()).ok_or("模型列表分页缺少 last_id")?;
+            if !cursors.insert(next.to_string()) { return Err("模型列表分页游标重复".to_string()); }
+            cursor = Some(next.to_string());
+        }
+        Ok::<_, String>(json!({ "data": entries }))
+    };
+    let (list, meta) = tokio::join!(list, async {
+        if catalog.is_none() { get_json(http, "https://models.dev/api.json", "").await.ok() } else { None }
+    });
+    if let Some(meta) = meta { *catalog = Some(meta); }
+    // 失败交给统一刷新流程保留旧缓存，不能把完整列表缩回本地选中的一个模型。
+    Ok(convert_local(provider, "", &list?, catalog.as_ref())?["provider"]["models"].as_object().unwrap().clone())
 }
 
 fn convert_local(mut provider: Value, selected: &str, list: &Value, catalog: Option<&Value>) -> Result<Value, String> {
@@ -57,17 +74,7 @@ fn convert_local(mut provider: Value, selected: &str, list: &Value, catalog: Opt
                 catalog_model(catalog, id).and_then(|info| info["reasoning_options"].as_array()));
         }
     }
-    for (id, local) in explicit {
-        let model = models.entry(id).or_insert_with(|| json!({}));
-        for field in ["options", "variants"] {
-            if let Some(values) = local[field].as_object() {
-                let mut merged = model[field].as_object().cloned().unwrap_or_default();
-                merged.extend(values.clone());
-                model[field] = json!(merged);
-            }
-        }
-        if let Some(reasoning) = local.get("reasoning") { model["reasoning"] = reasoning.clone(); }
-    }
+    merge_local_models(&mut models, &explicit);
     if models.is_empty() {
         return Err("本地配置未指定模型，且 API 未返回可用模型；请在本地设置中指定完整模型 ID 后重试".into());
     }
@@ -77,6 +84,20 @@ fn convert_local(mut provider: Value, selected: &str, list: &Value, catalog: Opt
     let config = json!({ "model": format!("local/{selected}"), "provider": { "local": provider } });
     let model = super::config::default_model(&config)?;
     Ok(json!({ "provider": config["provider"]["local"], "model": model.strip_prefix("local/").unwrap() }))
+}
+
+fn merge_local_models(models: &mut Map<String, Value>, explicit: &Map<String, Value>) {
+    for (id, local) in explicit {
+        let model = models.entry(id.clone()).or_insert_with(|| json!({}));
+        for field in ["options", "variants"] {
+            if let Some(values) = local[field].as_object() {
+                let mut merged = model[field].as_object().cloned().unwrap_or_default();
+                merged.extend(values.clone());
+                model[field] = json!(merged);
+            }
+        }
+        if let Some(reasoning) = local.get("reasoning") { model["reasoning"] = reasoning.clone(); }
+    }
 }
 
 struct Preset {
@@ -93,6 +114,8 @@ const fn preset(id: &'static str, name: &'static str, base_url: &'static str, mo
 
 /// Base URL 取自 models.dev 各 provider 的 api 字段，离线时也能直接用。
 const PRESETS: &[Preset] = &[
+    preset("local-codex", "本地 Codex", "", false),
+    preset("local-claude-code", "本地 Claude Code", "", false),
     preset("commandcode", "Command Code", "https://api.commandcode.ai/provider/v1", false),
     preset("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1", true),
     preset("opencode-go", "OpenCode Go", "https://opencode.ai/zen/go/v1", true),
@@ -120,7 +143,32 @@ const PRESETS: &[Preset] = &[
 
 /// 设置页的预设下拉：[{ id, name, baseURL }]。
 pub(crate) fn list() -> Value {
-    PRESETS.iter().map(|p| json!({ "id": p.id, "name": p.name, "baseURL": p.base_url })).collect()
+    PRESETS.iter().map(|p| json!({ "id": p.id, "name": p.name, "baseURL": p.base_url, "local": local_source(p.id).is_some() })).collect()
+}
+
+fn local_source(preset: &str) -> Option<&str> {
+    match preset {
+        "local-codex" => Some("codex"),
+        "local-claude-code" => Some("claude-code"),
+        _ => None,
+    }
+}
+
+fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap<String, String>) -> Result<Value, String> {
+    let (mut local, _) = local_provider::load(source, env)?;
+    let mut options = local["options"].as_object().cloned().unwrap_or_default();
+    let mut headers = options["headers"].as_object().cloned().unwrap_or_default();
+    if let Some(explicit) = provider["options"].as_object() {
+        // Key 始终跟随 CLI；其余手写选项仍可覆盖默认值。
+        options.extend(explicit.iter().filter(|(key, _)| key.as_str() != "apiKey").map(|(k, v)| (k.clone(), v.clone())));
+        if let Some(explicit) = explicit.get("headers").and_then(Value::as_object) { headers.extend(explicit.clone()); }
+    }
+    options.insert("headers".into(), json!(headers));
+    let models = local["models"].clone();
+    if let Some(explicit) = provider.as_object() { local.as_object_mut().unwrap().extend(explicit.clone()); }
+    local["options"] = json!(options);
+    local["models"] = json!(models);
+    super::config::resolve_config_env(&local, env)
 }
 
 const CACHE_TTL_SECS: u64 = 6 * 3600;
@@ -149,8 +197,26 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
         return;
     };
     let cache = read_cache(nova_root);
+    let env = super::config::process_env();
     for (id, provider) in providers.iter_mut() {
         let Some(preset) = preset_of(provider) else { continue };
+        if let Some(source) = local_source(preset.id) {
+            let explicit = provider["models"].as_object().cloned().unwrap_or_default();
+            match resolve_local(provider, source, &env) {
+                Ok(mut local) => {
+                    let mut models = cache[id.as_str()]["models"].as_object().cloned().unwrap_or_default();
+                    merge_local_models(&mut models, local["models"].as_object().unwrap());
+                    models.extend(explicit);
+                    local["models"] = json!(models);
+                    *provider = local;
+                }
+                Err(error) => {
+                    eprintln!("[lyra] {id}：{error}");
+                    provider["models"] = json!({});
+                }
+            }
+            continue;
+        }
         let Some(object) = provider.as_object_mut() else { continue };
         object.entry("name").or_insert_with(|| json!(preset.name));
         object.entry("api").or_insert_with(|| json!(DEFAULT_API));
@@ -187,6 +253,18 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
     let mut errors = Vec::new();
     for (id, provider) in providers {
         let Some(preset) = preset_of(provider) else { continue };
+        let local;
+        let provider = if let Some(source) = local_source(preset.id) {
+            local = match resolve_local(provider, source, &env) {
+                Ok(local) => local,
+                Err(error) => {
+                    if force { errors.push(format!("{id}：{error}")); }
+                    else { eprintln!("[lyra] {id}：{error}"); }
+                    continue;
+                }
+            };
+            &local
+        } else { provider };
         let option = |key: &str| {
             provider.pointer(&format!("/options/{key}")).and_then(Value::as_str).unwrap_or("")
         };
@@ -198,7 +276,9 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         let base_url = if base_url.is_empty() { preset.base_url.to_string() } else { base_url };
         let api_key = crate::lyra_complete::resolve_env_string(option("apiKey"), &env).unwrap_or_default();
         // 转换规则升级：旧缓存缺少模型私有参数，不能继续沿用六小时。
-        let print = fingerprint(&["3", preset.id, &base_url, &api_key]);
+        let headers = provider["options"]["headers"].to_string();
+        let local_models = if local_source(preset.id).is_some() { provider["models"].to_string() } else { String::new() };
+        let print = fingerprint(&["4", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
         let entry = &cache[id.as_str()];
         if !force
             && entry["fingerprint"] == print.as_str()
@@ -214,7 +294,12 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
                 &proxied
             }
         };
-        match fetch_models(http, preset, &base_url, &api_key, &mut models_dev).await {
+        let result = if local_source(preset.id).is_some() {
+            fetch_local_models(http, provider.clone(), &mut models_dev).await
+        } else {
+            fetch_models(http, preset, &base_url, &api_key, &mut models_dev).await
+        };
+        match result {
             Ok(models) => {
                 cache[id.as_str()] = json!({ "fingerprint": print, "fetchedAt": now, "models": models });
                 changed = true;
@@ -527,6 +612,95 @@ pub(crate) fn cache_mtime(nova_root: &Path) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_presets_fetch_all_pages_despite_selected_model_and_keep_private_options() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for source in ["codex", "claude-code"] {
+            let dir = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let (variable, api) = if source == "codex" {
+                std::fs::write(dir.path().join("config.toml"), format!(r#"
+model = "selected"
+model_provider = "proxy"
+model_reasoning_effort = "high"
+[model_providers.proxy]
+base_url = "{base}/v1"
+env_key = "TEST_KEY"
+"#)).unwrap();
+                ("CODEX_HOME", "openai-responses")
+            } else {
+                std::fs::write(dir.path().join("settings.json"), json!({
+                    "model": "selected", "effortLevel": "high", "env": {
+                        "ANTHROPIC_BASE_URL": base, "ANTHROPIC_AUTH_TOKEN": "test-token"
+                    }
+                }).to_string()).unwrap();
+                ("CLAUDE_CONFIG_DIR", "anthropic-messages")
+            };
+            let env = std::collections::HashMap::from([
+                (variable.into(), dir.path().to_string_lossy().into_owned()),
+                ("TEST_KEY".into(), "test-token".into()),
+            ]);
+            let config = json!({ "preset": format!("local-{source}"), "options": {
+                "apiKey": "stale-key", "temperature": 0.5, "headers": {"X-Route": "test"}
+            }, "models": { "old-cache-only": {} } });
+            let provider = resolve_local(&config, source, &env).unwrap();
+            assert_eq!(provider["api"], api);
+            assert!(provider["models"].get("old-cache-only").is_none());
+            assert_eq!(provider["options"]["temperature"], 0.5);
+            assert_eq!(provider["name"], if source == "codex" { "本地 Codex" } else { "本地 Claude Code" });
+            let server = tokio::spawn(async move {
+                for page in 0..3 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut buf = [0; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert!(n > 0);
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                    assert!(request.starts_with(if page == 1 { "get /v1/models?after_id=selected " } else { "get /v1/models " }));
+                    assert!(request.contains("authorization: bearer test-token\r\n"));
+                    assert!(request.contains("x-route: test\r\n"));
+                    assert!(!request.contains("stale-key"));
+                    if source == "claude-code" { assert!(request.contains("anthropic-version: 2023-06-01\r\n")); }
+                    if page == 2 {
+                        socket.write_all(b"HTTP/1.1 503 Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+                        continue;
+                    }
+                    let body = if page == 0 {
+                        json!({"data":[{"id":"selected"}],"has_more":true,"last_id":"selected"})
+                    } else {
+                        json!({"data":[{"id":"another","name":"另一个模型"}],"has_more":false})
+                    }.to_string();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let mut catalog = Some(json!({ "test": { "models": { "selected": {
+                "reasoning": true, "limit": {"context": 100000},
+                "reasoning_options": [{"type":"effort","values":["low","high"]}]
+            } } } }));
+            let models = tokio::time::timeout(Duration::from_secs(5), fetch_local_models(
+                &reqwest::Client::builder().no_proxy().build().unwrap(), provider.clone(), &mut catalog
+            )).await.unwrap().unwrap();
+            assert_eq!(models.len(), 2);
+            assert_eq!(models["another"]["name"], "另一个模型");
+            assert_eq!(models["selected"]["limit"]["context"], 100000);
+            assert_eq!(models["selected"]["options"]["reasoningEffort"], "high");
+            assert_eq!(models["selected"]["variants"]["low"]["reasoningEffort"], "low");
+            assert!(models.values().all(|m| m.get("api").is_none()));
+            let mut expanded = models.clone();
+            merge_local_models(&mut expanded, provider["models"].as_object().unwrap());
+            assert_eq!(expanded, models, "展开本地选择不能丢掉缓存中的能力和档位");
+            let failed = tokio::time::timeout(Duration::from_secs(5), fetch_local_models(
+                &reqwest::Client::builder().no_proxy().build().unwrap(), provider, &mut catalog
+            )).await.unwrap();
+            assert!(failed.unwrap_err().contains("503"), "失败时不得返回单模型列表覆盖完整缓存");
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn local_import_keeps_configured_protocol_and_effort_with_or_without_catalog() {

@@ -31,7 +31,8 @@ export type ProviderDraft = {
 
 export const APIS = ["openai-completions", "openai-responses", "anthropic-messages"];
 /** 后端 lyra/presets.rs 的自适应预设：只填 Key 即自动拉取模型列表；baseURL 为空表示需自填。 */
-export type Preset = { id: string; name: string; baseURL: string };
+export type Preset = { id: string; name: string; baseURL: string; local?: boolean };
+export const isLocalPreset = (id: string) => id === "local-codex" || id === "local-claude-code";
 const OPTION_KEYS = ["baseURL", "baseUrl", "apiKey", "proxy", "headers"];
 
 export const isObject = (v: unknown): v is Record<string, any> =>
@@ -78,9 +79,13 @@ export function modelDraft(id: string, raw: Record<string, any>): ModelDraft {
 
 export function providerDraft(id: string, raw: Record<string, any>): ProviderDraft {
   const options = isObject(raw.options) ? raw.options : {};
+  // 旧导入项接入统一预设，保留 ID、已选模型和用户覆盖项。
+  const legacy = !raw.preset && ["local-codex", "local-claude-code"].find((prefix) =>
+    (id === prefix || new RegExp(`^${prefix}-[0-9]+$`).test(id)) &&
+    raw.name === (prefix === "local-codex" ? "本地 Codex" : "本地 Claude Code"));
   return {
     id,
-    preset: typeof raw.preset === "string" ? raw.preset : "",
+    preset: typeof raw.preset === "string" ? raw.preset : legacy || "",
     name: raw.name ?? "",
     api: raw.api ?? "",
     baseURL: options.baseURL ?? options.baseUrl ?? "",
@@ -133,7 +138,7 @@ export function serializeProvider(p: ProviderDraft) {
   const options: Record<string, any> = { ...fromKv(p.fields, false), baseURL: p.baseURL.trim() };
   // 预设的 Base URL 留空即用默认值，不写空串。
   if (p.preset) setOrDelete(options, "baseURL", options.baseURL);
-  setOrDelete(options, "apiKey", p.apiKey.trim());
+  setOrDelete(options, "apiKey", isLocalPreset(p.preset) ? "" : p.apiKey.trim());
   setOrDelete(options, "proxy", p.proxy.trim());
   out.options = { ...options, ...withHeaders(p.headers) };
   const models = Object.fromEntries(p.models.map((m) => [m.id.trim(), serializeModel(m)]));
@@ -151,7 +156,7 @@ export function validate(providers: ProviderDraft[], presets: Preset[]): string 
     if (ids.has(id)) return `Provider ID 重复：${id}`;
     ids.add(id);
     const preset = presets.find((x) => x.id === p.preset);
-    if (!p.baseURL.trim() && !preset?.baseURL) return `Provider ${id} 缺少 Base URL`;
+    if (!p.baseURL.trim() && !preset?.baseURL && !preset?.local) return `Provider ${id} 缺少 Base URL`;
     if (!p.api && !p.raw.npm && !preset) return `Provider ${id} 需要选择协议`;
     const models = new Set<string>();
     for (const m of p.models) {

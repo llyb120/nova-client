@@ -8,6 +8,7 @@ import {
   draftFromConfig,
   hasVariants,
   isObject,
+  isLocalPreset,
   modelDraft,
   providerDraft,
   serializeProvider,
@@ -88,9 +89,10 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
     setError("");
     try {
       raw = await api.getLyraConfig();
-      setDraft(draftFromConfig(raw));
+      const next = draftFromConfig(raw);
+      setDraft(next);
       setLoaded(true);
-      setDirty(false);
+      setDirty(next.providers.some((p) => p.preset !== (raw.provider?.[p.id]?.preset ?? "")));
     } catch (e) {
       // 解析失败时不允许保存，避免用空配置覆盖手写文件。
       setLoaded(false);
@@ -136,11 +138,13 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
   const fetchModels = async (p: ProviderDraft) => {
     const id = p.id.trim();
     if (!id) return setFetched("", { error: "请先填写 Provider ID" });
-    setFetched(id, { busy: true });
+    setFetched(id, { busy: true, error: undefined });
     try {
       setFetched(id, { models: await api.fetchLyraModels(id, serializeProvider(unwrap(p))) });
     } catch (e) {
       setFetched(id, { error: String(e) });
+    } finally {
+      setFetched(id, "busy", false);
     }
   };
 
@@ -161,26 +165,6 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
     let id = presetId === "openai-compatible" ? "" : presetId;
     for (let n = 2; id && draft.providers.some((p) => p.id === id); n++) id = `${presetId}-${n}`;
     edit((d) => void d.providers.push(presetId === "manual" ? providerDraft("", { api: APIS[0] }) : providerDraft(id, { preset: presetId })));
-  };
-
-  const [importing, setImporting] = createSignal(false);
-  const importLocal = async (source: "codex" | "claude-code") => {
-    setImporting(true);
-    setError("");
-    try {
-      const result = await api.importLocalLyraProvider(source);
-      const base = `local-${source}`;
-      let id = base;
-      for (let n = 2; draft.providers.some((p) => p.id === id); n++) id = `${base}-${n}`;
-      edit((d) => {
-        d.providers.push(providerDraft(id, result.provider));
-        if (!d.model) d.model = `${id}/${result.model}`;
-      });
-    } catch (e) {
-      setError(`导入失败：${String(e)}`);
-    } finally {
-      setImporting(false);
-    }
   };
 
   // 预设 provider 的模型自动拉取，界面里看不到，选中的默认模型不应标为不存在。
@@ -224,6 +208,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
           {(p, pi) => {
             const setP = (fn: (p: ProviderDraft) => void) => edit((d) => fn(d.providers[pi]));
             const preset = () => presets().find((x) => x.id === p().preset);
+            const local = () => isLocalPreset(p().preset);
             const setPreset = (id: string) =>
               setP((x) => {
                 x.preset = id;
@@ -235,14 +220,14 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
               <div class="backend-card">
                 <div class="backend-card-head">
                   <span class="agent-badge lyra">{p().name || p().id || "未命名 Provider"}</span>
-                  <span class="field-hint">{p().models.length} 个模型</span>
+                  <span class="field-hint">{new Set([...Object.keys(fetched[p().id.trim()]?.models ?? {}), ...p().models.map((m) => m.id)]).size} 个模型</span>
                   <button type="button" class="link-btn" style={{ "margin-left": "auto" }} onClick={() => void removeProvider(pi)}>
                     删除 Provider
                   </button>
                 </div>
                 <div class="backend-fields">
                   <label class="backend-field">
-                    <span class="field-label" title="选择厂商后只需填 API Key，Base URL 与模型列表自动获取">类型</span>
+                    <span class="field-label" title="选择 Provider 自动获取模型；本地 Codex / Claude Code 沿用本地认证，无需填写 Key">类型</span>
                     <select class="field-input" onChange={(e) => setPreset(e.currentTarget.value)}>
                       <option value="" selected={!p().preset}>手动配置</option>
                       <Show when={p().preset && presets().length && !preset()}>
@@ -266,7 +251,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                         <option value="" selected={!p().api}>按 npm 推导（{p().raw.npm}）</option>
                       </Show>
                       <Show when={!p().raw.npm && preset()}>
-                        <option value="" selected={!p().api}>按模型自动识别</option>
+                        <option value="" selected={!p().api}>{local() ? "跟随本地配置" : "按模型自动识别"}</option>
                       </Show>
                       <Show when={!p().raw.npm && !preset()}>
                         <option value="" disabled selected={!p().api}>请选择</option>
@@ -281,12 +266,14 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                 <div class="backend-fields">
                   <label class="backend-field backend-field-wide">
                     <span class="field-label">Base URL</span>
-                    <input class="field-input" type="url" placeholder={preset()?.baseURL ? `留空使用 ${preset()!.baseURL}` : "https://api.openai.com/v1"} value={p().baseURL} onInput={(e) => setP((x) => (x.baseURL = e.currentTarget.value))} />
+                    <input class="field-input" type="url" placeholder={local() ? "留空跟随本地配置" : preset()?.baseURL ? `留空使用 ${preset()!.baseURL}` : "https://api.openai.com/v1"} value={p().baseURL} onInput={(e) => setP((x) => (x.baseURL = e.currentTarget.value))} />
                   </label>
-                  <label class="backend-field">
-                    <span class="field-label">API Key</span>
-                    <input class="field-input" type="text" autocomplete="off" placeholder="sk-… 或 {env:NAME}" value={p().apiKey} onInput={(e) => setP((x) => (x.apiKey = e.currentTarget.value))} />
-                  </label>
+                  <Show when={!local()}>
+                    <label class="backend-field">
+                      <span class="field-label">API Key</span>
+                      <input class="field-input" type="text" autocomplete="off" placeholder="sk-… 或 {env:NAME}" value={p().apiKey} onInput={(e) => setP((x) => (x.apiKey = e.currentTarget.value))} />
+                    </label>
+                  </Show>
                   <label class="backend-field">
                     <span class="field-label">代理</span>
                     <input class="field-input" placeholder="留空跟随 Lyra 全局代理" value={p().proxy} onInput={(e) => setP((x) => (x.proxy = e.currentTarget.value))} />
@@ -310,7 +297,9 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                             ? `获取失败：${result()!.error}`
                             : result()?.models
                               ? `已获取 ${names().length} 个模型：${names().join("、")}`
-                              : "填好 API Key 后点击获取全部模型；之后每 6 小时自动更新。下方手写的同 ID 模型会覆盖获取结果。"}
+                              : local()
+                                ? "沿用本地 API 配置，无需填写 Key；点击获取全部模型，之后每 6 小时自动更新。下方同 ID 配置会覆盖获取结果。"
+                                : "填好 API Key 后点击获取全部模型；之后每 6 小时自动更新。下方手写的同 ID 模型会覆盖获取结果。"}
                         </span>
                       </div>
                     );
@@ -384,15 +373,9 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
           }}
         >
           <option value="" selected>添加 Provider…</option>
-          <For each={presets()}>{(x) => <option value={x.id}>{x.name}（填 Key 一键获取模型）</option>}</For>
+          <For each={presets()}>{(x) => <option value={x.id}>{x.name}（{x.local ? "无需填 Key" : "填 Key 一键获取模型"}）</option>}</For>
           <option value="manual">手动配置</option>
         </select>
-        <div class="backend-card-head">
-          <button type="button" class="btn secondary" disabled={importing()} onClick={() => void importLocal("codex")}>从本地 Codex 导入</button>
-          <button type="button" class="btn secondary" disabled={importing()} onClick={() => void importLocal("claude-code")}>从本地 Claude Code 导入</button>
-          <Show when={importing()}><span class="field-hint" role="status">正在读取 API 配置和模型…</span></Show>
-        </div>
-        <span class="field-hint">读取本地用户级 API 配置，导入后可编辑并保存；本地配置变更后需重新导入。</span>
       </Show>
     </section>
   );

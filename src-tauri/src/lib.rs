@@ -3689,13 +3689,6 @@ fn get_lyra_presets() -> Value {
     lyra::presets::list()
 }
 
-#[tauri::command]
-async fn import_local_lyra_provider(state: State<'_, AppState>, source: String) -> Result<Value, String> {
-    let proxy = state.settings.lock().unwrap().lyra_proxy.clone();
-    let http = lyra::provider::client_for_proxy(proxy.trim());
-    lyra::presets::import_local(&http, &source).await
-}
-
 /// 设置页「获取模型」：按编辑中的 provider（可未保存）立即拉取模型列表写入缓存并返回。
 #[tauri::command]
 async fn fetch_lyra_models(state: State<'_, AppState>, id: String, provider: Value) -> Result<Value, String> {
@@ -5871,7 +5864,6 @@ pub fn run() {
             refresh_lyra_config,
             get_lyra_config,
             get_lyra_presets,
-            import_local_lyra_provider,
             fetch_lyra_models,
             save_lyra_config,
             get_slash_commands,

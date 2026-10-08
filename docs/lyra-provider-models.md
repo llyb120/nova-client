@@ -22,6 +22,9 @@
 
 ## 能力与边界
 
+- 本地 Codex / Claude Code 与其它 provider 共用添加、获取模型和缓存流程，无需在 Lyra 中填写 Key。运行时读取 CLI 的用户级 API 配置，始终请求完整 `/models` 列表（支持 Anthropic 分页），再合并本地选择及其私有参数；列表不可用时保留本地已配置模型。仍需 CLI 已配置 API 认证，订阅登录暂不支持。
+- 旧导入项在设置页自动转为对应预设，保存后生效；保留原 ID、默认模型及手写覆盖。JSONC 去注释/尾逗号时保留原始 UTF-8 字节，中文名称、路径不再二次转码；Lyra 冷启动从当前配置重新生成模型名称，替换旧乱码缓存。
+
 - `options.supportsThinkingToggle: false`：强制思考模型，普通对话、标题、补全均不能自动发送 `disabled` / `none`。
 - `options.supportsReasoningEffort: false`：不自动发送模型不支持的 effort。
 - `thinkingFormat` 按接入端点生成；未知 OpenAI 兼容网关仅补能力，用户可显式配置其实际接受的参数。
