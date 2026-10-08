@@ -9,7 +9,7 @@ import {
 } from "../store";
 import type { AgentKind, ModelCost, ModelOptions } from "../types";
 import { agentLabel } from "../utils";
-import { foldEfforts as foldModelEfforts } from "../modelEfforts";
+import { foldEfforts as foldModelEfforts, splitEffort } from "../modelEfforts";
 import { SearchSelect, type SelectOption } from "./SearchSelect";
 
 /** 模型/模式选项来源：漫游时返回对端（host）的列表；返回 undefined 表示用本机全局列表。 */
@@ -144,7 +144,18 @@ export function modelOptionsOf(
 ): SelectOption[] {
   const costs = state.modelCosts;
   const encode = (value: string) => (merged ? encodeModelValue(agentKind, value) : value);
+  const config = (source !== undefined ? source : state.modelOptions[agentKind])?.configOptions;
+  const effortConfig = config?.find((o) => o.id === (agentKind === "kimi" ? "thinking" : "thought_level"));
+  // 与 ACP 展开模型档位时的默认解析一致；漫游/共享使用传入的配置。
+  const acpEffort = effortConfig
+    ? ["low", "high", "max"].includes(effortConfig.currentValue ?? "") ? effortConfig.currentValue : "high"
+    : undefined;
+  const defaultEfforts = new Map<string, string>();
   const flat = modelChoices(agentKind, source).map((m): SelectOption => {
+    const effort = m._meta?.["nova.ai/defaultReasoningEffort"] ?? acpEffort;
+    if (typeof effort === "string" && effort) {
+      defaultEfforts.set(splitEffort(m.value, agentKind === "lyra")?.[0] ?? m.value, effort);
+    }
     const cost = costs?.[m.value];
     const metaVision =
       m._meta?.["cognition.ai/supportsImages"] ?? m._meta?.["codex.ai/supportsImages"];
@@ -170,7 +181,7 @@ export function modelOptionsOf(
     };
   });
   if (!foldEfforts) return flat;
-  return foldModelEfforts(flat, agentKind === "lyra", encode, (v) => `${agentKind}:${encodeURIComponent(v)}`);
+  return foldModelEfforts(flat, agentKind === "lyra", encode, (v) => `${agentKind}:${encodeURIComponent(v)}`, defaultEfforts);
 }
 
 /** 把某后端的模型选项按厂商分组，供原生 <select><optgroup> 使用（弹窗里不被 overflow 裁剪） */

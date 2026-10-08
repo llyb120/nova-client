@@ -19,6 +19,8 @@ function readLastEfforts(): Record<string, string> {
 export interface SelectOption {
   value: string;
   label: string;
+  /** 触发器文案；模型列表保留短名，默认档位在这里显示实际强度。 */
+  selectedLabel?: string;
   title?: string;
   /** 分组名（厂商）；任一选项带分组时整个下拉切换为二级面板 */
   group?: string;
@@ -125,26 +127,18 @@ export function SearchSelect(props: {
   });
 
   const currentLabel = createMemo(() => {
-    // 命中当前值：直接用该项 label
-    const hit = currentOption();
+    const hit = currentOption() ?? (!props.value && !props.allowDefault ? firstSelectable() : undefined);
     if (hit) {
+      const label = hit.selectedLabel ?? hit.label;
       // 三级（合并后端）模式下，触发器带上后端名便于区分
       if (isThreeLevel() && hit.backendLabel) {
-        return hit.isDefault ? `${hit.backendLabel} 默认` : `${hit.backendLabel} · ${hit.label}`;
+        return hit.isDefault ? `${hit.backendLabel} 默认` : `${hit.backendLabel} · ${label}`;
       }
-      return hit.label;
+      return label;
     }
     // 值非空但未命中列表（如 codebuddy 云端清单未就绪时的中间态）：用友好名/原值显示，
     // 不回退到第一项，否则触发器会显示成别的模型（显示与实际选择不一致）。
     if (props.value) return props.fallbackLabel ?? props.value;
-    // 空值：不提供「默认」时回退到第一项，提供则用默认 label
-    const opt = props.allowDefault ? undefined : firstSelectable();
-    if (opt) {
-      if (isThreeLevel() && opt.backendLabel) {
-        return opt.isDefault ? `${opt.backendLabel} 默认` : `${opt.backendLabel} · ${opt.label}`;
-      }
-      return opt.label;
-    }
     return defaultLabel();
   });
 

@@ -1524,6 +1524,7 @@ impl CodexManager {
                     "_meta": {
                         "codex.ai/supportsImages": supports_images,
                         "codex.ai/default": is_default_model,
+                        "nova.ai/defaultReasoningEffort": default_effort,
                         "codex.ai/description": description,
                         "contextWindow": context_window
                     }
@@ -1542,6 +1543,7 @@ impl CodexManager {
                             "codex.ai/supportsImages": supports_images,
                             "codex.ai/default": is_default_model && effort == default_effort,
                             "codex.ai/effort": effort,
+                            "nova.ai/defaultReasoningEffort": default_effort,
                             "codex.ai/description": desc,
                             "contextWindow": context_window
                         }

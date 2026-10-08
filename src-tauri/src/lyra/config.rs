@@ -222,6 +222,9 @@ pub fn model_options(config: &Value) -> Vec<Value> {
             let meta = json!({
                 "codex.ai/supportsImages": supports_images,
                 "contextWindow": context_window,
+                "nova.ai/defaultReasoningEffort": model.pointer("/options/reasoningEffort")
+                    .or_else(|| provider.pointer("/options/reasoningEffort"))
+                    .and_then(Value::as_str).unwrap_or(""),
             });
             let variants: Vec<(&String, &Value)> = model
                 .get("variants")
@@ -757,7 +760,7 @@ mod tests {
                 "custom": {
                     "name": "Command Code GOAT",
                     "npm": "@ai-sdk/openai-compatible",
-                    "options": { "baseURL": "http://127.0.0.1:8317/v1", "apiKey": "key" },
+                    "options": { "baseURL": "http://127.0.0.1:8317/v1", "apiKey": "key", "reasoningEffort": "high" },
                     "models": {
                         "qwen": {
                             "qwen3.8-flash": {
@@ -787,6 +790,18 @@ mod tests {
         let resolved = resolve_model(&config, None, &HashMap::new()).unwrap();
         assert_eq!(resolved.model.id, "qwen/qwen3.8-flash");
         assert_eq!(resolved.thinking_level.as_deref(), Some("max"));
+        assert!(model_options(&config).iter().all(|option| {
+            option["_meta"]["nova.ai/defaultReasoningEffort"] == "max"
+        }));
+        let mut inherited = config.clone();
+        inherited["provider"]["custom"]["models"]["qwen"]["qwen3.8-flash"]["options"] = json!({});
+        assert!(model_options(&inherited).iter().all(|option| {
+            option["_meta"]["nova.ai/defaultReasoningEffort"] == "high"
+        }));
+        inherited["provider"]["custom"]["options"].as_object_mut().unwrap().remove("reasoningEffort");
+        assert!(model_options(&inherited).iter().all(|option| {
+            option["_meta"]["nova.ai/defaultReasoningEffort"] == ""
+        }));
     }
 
     #[test]

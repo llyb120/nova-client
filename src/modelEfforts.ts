@@ -17,6 +17,7 @@ export function foldEfforts(
   lyra: boolean,
   encode: (value: string) => string,
   favoriteId: (value: string) => string,
+  defaultEfforts: ReadonlyMap<string, string> = new Map(),
 ): SelectOption[] {
   const out: SelectOption[] = [];
   const parents = new Map<string, SelectOption>();
@@ -47,6 +48,11 @@ export function foldEfforts(
     }
     if (effort === "default") parent.value = option.value;
     parent.efforts!.push({ ...option, short: cut > 0 ? option.label.slice(cut + 3) : effort });
+  }
+  for (const [base, parent] of parents) {
+    const effort = defaultEfforts.get(base);
+    const selected = parent.efforts!.find((o) => splitEffort(o.title!, lyra)?.[1] === effort);
+    parent.selectedLabel = selected?.label ?? `${parent.label} · ${effort || "默认"}`;
   }
   return out;
 }
