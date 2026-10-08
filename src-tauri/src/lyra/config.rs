@@ -311,7 +311,11 @@ pub fn default_model(config: &Value) -> Result<String, String> {
             selection = effort
                 .map(|effort| format!("{current}/variant/{effort}"))
                 .filter(|candidate| has(candidate))
-                .or(None);
+                // 自动获取的模型新增档位后仍选同一模型，避免退回整个列表的第一个。
+                .or_else(|| options.iter()
+                    .filter_map(|option| option.get("value").and_then(Value::as_str))
+                    .find(|value| value.starts_with(&format!("{current}/variant/")))
+                    .map(str::to_string));
         }
     }
     let selection = selection

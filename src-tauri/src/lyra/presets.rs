@@ -124,7 +124,8 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         .unwrap_or_default();
         let base_url = if base_url.is_empty() { preset.base_url.to_string() } else { base_url };
         let api_key = crate::lyra_complete::resolve_env_string(option("apiKey"), &env).unwrap_or_default();
-        let print = fingerprint(&[preset.id, &base_url, &api_key]);
+        // 转换规则升级：旧缓存缺少思考能力，不能继续沿用六小时。
+        let print = fingerprint(&["2", preset.id, &base_url, &api_key]);
         let entry = &cache[id.as_str()];
         if !force
             && entry["fingerprint"] == print.as_str()
@@ -189,11 +190,16 @@ async fn fetch_models(
         return Err("缺少 Base URL".into());
     }
     let list = get_json(http, &format!("{}/models", base_url.trim_end_matches('/')), api_key).await;
-    if !preset.models_dev {
-        return Ok(convert(&list?, None));
-    }
     if models_dev.is_none() {
-        *models_dev = Some(get_json(http, "https://models.dev/api.json", "").await?);
+        match get_json(http, "https://models.dev/api.json", "").await {
+            Ok(meta) => *models_dev = Some(meta),
+            Err(error) if preset.models_dev => return Err(error),
+            // 兼容端点以自己的 /models 为准，补充能力信息失败不能使列表不可用。
+            Err(error) => eprintln!("[lyra] 模型能力信息暂不可用：{error}"),
+        }
+    }
+    if !preset.models_dev {
+        return Ok(convert(&list?, None, models_dev.as_ref()));
     }
     let meta = models_dev.as_ref().and_then(|all| all.get(preset.id)).cloned().unwrap_or_default();
     // Coding Plan、Anthropic 协议端点等常不提供 /models，此时整份用 models.dev 的列表。
@@ -201,7 +207,33 @@ async fn fetch_models(
         eprintln!("[lyra] {}：{error}，改用 models.dev 模型列表", preset.id);
         Value::Null
     });
-    Ok(convert(&list, Some(&meta)))
+    Ok(convert(&list, Some(&meta), models_dev.as_ref()))
+}
+
+/// 中转站模型名可能带厂商前缀；按完整 ID / canonical ID 匹配，优先原厂能力。
+fn catalog_model<'a>(catalog: Option<&'a Value>, id: &str) -> Option<&'a Value> {
+    // ponytail: 每次刷新按模型扫描目录；若目录规模使刷新变慢，再建立 ID 索引。
+    let catalog = catalog?.as_object()?;
+    catalog.iter()
+        .flat_map(|(provider, info)| info["models"].as_object().into_iter().flatten()
+            .map(move |(key, model)| (provider, key, model)))
+        .filter_map(|(provider, key, model)| {
+            let qualified = format!("{provider}/{key}");
+            let canonical = model["canonical_model_id"].as_str().unwrap_or("");
+            if id.eq_ignore_ascii_case(&qualified) {
+                Some((0, model))
+            } else if id.eq_ignore_ascii_case(key) || id.eq_ignore_ascii_case(canonical) {
+                let native = canonical.split_once('/').is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(provider));
+                // 旧的原厂条目可能没有 canonical 字段；中转条目的 canonical 仍可指回它。
+                let origin = canonical.split_once('/')
+                    .and_then(|(owner, key)| catalog.get(owner)?.get("models")?.get(key));
+                Some((if native || origin.is_some() { 1 } else { 2 }, origin.unwrap_or(model)))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, model)| model)
 }
 
 /// models.dev 的 npm 包名 → Lyra 协议；Google 原生协议不支持，返回 None。
@@ -216,7 +248,7 @@ fn npm_api(npm: &str) -> Option<&'static str> {
 
 /// /models 列表 + 可选 models.dev provider 条目 → Lyra models 配置。
 /// 有 models.dev 时只保留它认识的模型（滤掉嵌入、绘图等非对话模型），/models 不可用则整份采用。
-fn convert(list: &Value, meta: Option<&Value>) -> Map<String, Value> {
+fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>) -> Map<String, Value> {
     let known = meta.and_then(|m| m["models"].as_object());
     let provider_npm = meta.and_then(|m| m["npm"].as_str()).unwrap_or("");
     let null = Value::Null;
@@ -235,7 +267,8 @@ fn convert(list: &Value, meta: Option<&Value>) -> Map<String, Value> {
         if id.starts_with("jev-") {
             continue;
         }
-        let info = known.and_then(|m| m.get(id));
+        let provider_info = known.and_then(|m| m.get(id));
+        let info = provider_info.or_else(|| catalog_model(catalog, id));
         // Lyra 是 agent，不支持工具调用的模型（深度研究、数学等）选了也用不了。
         if info.is_some_and(|i| i["tool_call"] == false) {
             continue;
@@ -254,7 +287,8 @@ fn convert(list: &Value, meta: Option<&Value>) -> Map<String, Value> {
                     None
                 }
             }
-            None => npm_api(info.and_then(|i| i.pointer("/provider/npm")).and_then(Value::as_str).unwrap_or(provider_npm)),
+            // 跨 provider 只补能力，不继承原厂协议（如兼容端点上的 Claude / Gemini）。
+            None => npm_api(provider_info.and_then(|i| i.pointer("/provider/npm")).and_then(Value::as_str).unwrap_or(provider_npm)),
         };
         let Some(api) = api else { continue };
         let mut model = json!({});
@@ -286,19 +320,25 @@ fn convert(list: &Value, meta: Option<&Value>) -> Map<String, Value> {
             if info.pointer("/interleaved/field") == Some(&json!("reasoning_content")) {
                 model["options"] = json!({ "requiresReasoningContentOnAssistantMessages": true });
             }
-            if info["reasoning"].as_bool() == Some(true) {
-                model["reasoning"] = json!(true);
-                // 有显式强度档位的生成 variants，选择器里作为思考强度下一级。
-                let efforts = info["reasoning_options"].as_array().into_iter().flatten()
-                    .find(|o| o["type"] == "effort")
-                    .and_then(|o| o["values"].as_array());
-                let variants: Map<String, Value> = efforts.into_iter().flatten()
-                    .filter_map(Value::as_str)
-                    .map(|e| (e.to_string(), json!({ "reasoningEffort": e })))
-                    .collect();
-                if !variants.is_empty() {
-                    model["variants"] = Value::Object(variants);
-                }
+        }
+        // /models 显式声明优先，缺失时才补目录信息；兼容 provider 也走同一条路径。
+        let reasoning_options = entry["reasoning_options"].as_array()
+            .or_else(|| info.and_then(|i| i["reasoning_options"].as_array()));
+        let efforts = reasoning_options.into_iter().flatten()
+            .find(|o| o["type"] == "effort")
+            .and_then(|o| o["values"].as_array());
+        let variants: Map<String, Value> = efforts.into_iter().flatten()
+            .filter_map(Value::as_str).filter(|e| !e.trim().is_empty())
+            .map(|e| (e.to_string(), json!({ "reasoningEffort": e })))
+            .collect();
+        let reasoning = entry["reasoning"].as_bool()
+            .or((entry["reasoning_options"].is_array() && !variants.is_empty()).then_some(true))
+            .or_else(|| info.and_then(|i| i["reasoning"].as_bool()))
+            .unwrap_or(!variants.is_empty());
+        if reasoning {
+            model["reasoning"] = json!(true);
+            if !variants.is_empty() {
+                model["variants"] = Value::Object(variants);
             }
         }
         out.insert(id.to_string(), model);
@@ -323,7 +363,7 @@ mod tests {
             { "id": "jev-1", "supported_endpoints": ["/systemone"] },
             { "id": "odd", "supported_endpoints": ["/systemone"] },
         ]});
-        let models = convert(&cc, None);
+        let models = convert(&cc, None, None);
         assert_eq!(models["claude-opus-5-5"], json!({ "api": "anthropic-messages", "name": "Claude Opus 5.5", "limit": { "context": 1000000 } }));
         assert_eq!(models["deepseek/deepseek-v4-pro"], json!({ "limit": { "context": 1000000 } }));
         assert!(!models.contains_key("jev-1") && !models.contains_key("odd"));
@@ -336,7 +376,7 @@ mod tests {
             "glm-5.3": { "name": "GLM-5.3", "reasoning": true, "reasoning_options": [{ "type": "toggle" }] },
             "gemini-4": { "provider": { "npm": "@ai-sdk/google" } },
         }});
-        let models = convert(&zen, Some(&meta));
+        let models = convert(&zen, Some(&meta), None);
         assert_eq!(models["gpt-6"], json!({
             "api": "openai-responses", "name": "GPT-6", "limit": { "context": 400000, "output": 128000 },
             "modalities": { "input": ["text", "image"] }, "reasoning": true,
@@ -351,7 +391,7 @@ mod tests {
             "old": { "status": "deprecated" },
             "research": { "tool_call": false },
         }});
-        let models = convert(&Value::Null, Some(&minimax));
+        let models = convert(&Value::Null, Some(&minimax), None);
         assert_eq!(Value::Object(models), json!({ "m3": {
             "api": "anthropic-messages", "name": "M3",
             "options": { "requiresReasoningContentOnAssistantMessages": true },
@@ -374,5 +414,94 @@ mod tests {
         assert_eq!(cc["models"], json!({ "a": {}, "b": { "name": "mine" } }));
         assert_eq!(config["provider"]["plain"]["models"], json!({ "m": {} }));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn compatible_presets_fill_reasoning_without_changing_protocol() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let catalog = json!({
+            "aaa-relay": { "models": { "claude-opus-5-5": {
+                "canonical_model_id": "anthropic/claude-opus-5-5", "reasoning": false
+            } } },
+            "anthropic": { "npm": "@ai-sdk/anthropic", "models": {
+                "claude-opus-5-5": { "reasoning": true,
+                    "reasoning_options": [{ "type": "effort", "values": ["low", "high"] }] }
+            } },
+            "deepseek": { "models": {
+                "deepseek-flash": { "canonical_model_id": "deepseek/deepseek-v4.1-flash", "reasoning": true,
+                    "reasoning_options": [{ "type": "effort", "values": ["high", "max"] }] }
+            } },
+            "google": { "npm": "@ai-sdk/google", "models": {
+                "gemini-test": { "reasoning": true, "reasoning_options": [{ "type": "effort", "values": ["low", "high"] }] }
+            } },
+        });
+        let list = json!({ "data": [
+            { "id": "claude-opus-5-5", "supported_endpoints": ["/messages"] },
+            { "id": "deepseek/deepseek-v4.1-flash", "supported_endpoints": ["/chat/completions", "/responses"] },
+            { "id": "Google/Gemini-Test" },
+            { "id": "unknown" },
+        ] });
+        for preset_id in ["commandcode", "openai-compatible"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let body = list.to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
+                assert!(request.starts_with(b"GET /models "));
+                socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let preset = PRESETS.iter().find(|p| p.id == preset_id).unwrap();
+            let models = fetch_models(&reqwest::Client::builder().no_proxy().build().unwrap(), preset,
+                &url, "", &mut Some(catalog.clone())).await.unwrap();
+            server.await.unwrap();
+            assert_eq!(models["claude-opus-5-5"]["api"], "anthropic-messages");
+            assert_eq!(models["claude-opus-5-5"]["variants"]["high"]["reasoningEffort"], "high");
+            assert_eq!(models["deepseek/deepseek-v4.1-flash"]["variants"]["max"]["reasoningEffort"], "max");
+            assert!(models["Google/Gemini-Test"].get("api").is_none());
+            assert_eq!(models["Google/Gemini-Test"]["reasoning"], true);
+            assert_eq!(models["unknown"], json!({}));
+            let config = json!({ "model": "p/deepseek/deepseek-v4.1-flash",
+                "provider": { "p": { "api": DEFAULT_API, "options": { "baseURL": url }, "models": models } } });
+            assert!(super::super::config::default_model(&config).unwrap().starts_with("p/deepseek/deepseek-v4.1-flash/variant/"));
+            let selection = "p/deepseek/deepseek-v4.1-flash/variant/max";
+            assert!(super::super::config::model_options(&config).iter().any(|o| o["value"] == selection));
+            let resolved = super::super::config::resolve_model(&config, Some(selection), &Default::default()).unwrap();
+            assert_eq!(resolved.thinking_level.as_deref(), Some("max"));
+            assert!(resolved.model.reasoning);
+            assert_eq!(resolved.model.api, DEFAULT_API);
+        }
+    }
+
+    #[test]
+    fn explicit_reasoning_metadata_takes_precedence() {
+        let meta = json!({ "models": { "m": { "reasoning": true,
+            "reasoning_options": [{ "type": "effort", "values": ["low", "high"] }] } } });
+        for (fields, expected) in [
+            (json!({ "reasoning": false }), json!({})),
+            (json!({ "reasoning_options": [] }), json!({ "reasoning": true })),
+            (json!({ "reasoning_options": [{ "type": "effort", "values": ["max", "", null, 1] }] }),
+                json!({ "reasoning": true, "variants": { "max": { "reasoningEffort": "max" } } })),
+        ] {
+            let mut entry = fields;
+            entry["id"] = json!("m");
+            let models = convert(&json!({ "data": [entry] }), Some(&meta), None);
+            assert_eq!(models["m"], expected);
+        }
+        let models = convert(&json!({ "data": [{ "id": "custom", "reasoning_options": [
+            { "type": "effort", "values": ["medium"] }
+        ] }] }), None, None);
+        assert_eq!(models["custom"]["variants"]["medium"]["reasoningEffort"], "medium");
+        assert_eq!(models["custom"]["reasoning"], true);
+        let models = convert(&json!({ "data": [{ "id": "custom", "reasoning_options": [
+            { "type": "effort", "values": ["high"] }
+        ] }] }), Some(&json!({ "models": { "custom": { "reasoning": false } } })), None);
+        assert_eq!(models["custom"]["variants"]["high"]["reasoningEffort"], "high");
     }
 }
