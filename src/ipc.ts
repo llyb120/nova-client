@@ -248,6 +248,7 @@ export const api = {
     invoke<SlashCommand[]>("get_slash_commands", { agentKind }),
   renameThread: (threadId: string, title: string) =>
     invoke<void>("rename_thread", { threadId, title }),
+  clearThreadClue: (threadId: string) => invoke<void>("clear_thread_clue", { threadId }),
   /** 让模型按节点任务生成会话标题（仅用于工作流阶段会话，前缀由后端保留）。 */
   generateThreadTitle: (threadId: string, prompt: string) =>
     invoke<void>("generate_thread_title", { threadId, prompt }),

@@ -33,6 +33,7 @@ import {
   openClueCard,
   pickThreadModel,
   refreshSlashCommands,
+  refreshThreads,
   reasoningEffortChoices,
   setThreadReasoningEffort,
   sendPrompt,
@@ -50,7 +51,7 @@ import {
   workflowSuspendedNotice,
 } from "../workflow/runtime";
 import { ConfigSelects } from "./ConfigSelects";
-import { IconClue, IconFile, IconSend, IconStop, IconUndo } from "./icons";
+import { IconClue, IconFile, IconX, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
@@ -709,6 +710,17 @@ export function Composer() {
             <span class="clue-context-label">证据链</span>
             <span class="clue-context-separator" aria-hidden="true" />
             <span class="clue-context-title">{clue().title}</span>
+            <button
+              type="button"
+              aria-label="移除线索上下文"
+              title="移除线索上下文"
+              onClick={() => {
+                const id = state.currentId;
+                if (id) void api.clearThreadClue(id).then(refreshThreads);
+              }}
+            >
+              <IconX size={12} />
+            </button>
           </div>
         )}
       </Show>

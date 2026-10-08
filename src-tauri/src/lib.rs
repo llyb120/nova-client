@@ -3324,6 +3324,24 @@ fn rename_thread(
     Ok(())
 }
 
+/// 移除会话的证据链引用（位置与注入给 agent 的上下文快照一并清掉）。
+#[tauri::command]
+fn clear_thread_clue(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<(), String> {
+    {
+        let mut store = state.store.lock().unwrap();
+        let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
+        thread.active_clue_card_id = None;
+        thread.clue_context = None;
+        store.save();
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+    Ok(())
+}
+
 /// 工作流阶段会话：让模型按节点任务生成标题。会话先以「[WF] 节点名」兜底创建，
 /// 生成成功后替换（[WF] 前缀由后端统一保留）；生成失败则保持兜底标题。
 #[tauri::command]
@@ -5850,6 +5868,7 @@ pub fn run() {
             restore_time_machine_checkpoint,
             delete_time_machine_context,
             rename_thread,
+            clear_thread_clue,
             notify_fire_done,
             notify_workflow_done,
             push_system_item,
