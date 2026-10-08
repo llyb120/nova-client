@@ -122,6 +122,11 @@ async function execute(command) {
         }
         return {targetInfos:[...(frameTargets.get(tab.id)?.values() || [])].map(value=>value.targetInfo)};
       }
+      if(args.method==='Page.captureScreenshot') {
+        // A minimized window or background tab never paints: the capture would hang until timeout.
+        if((await chrome.windows.get(tab.windowId)).state==='minimized')await chrome.windows.update(tab.windowId,{state:'normal'});
+        if(!tab.active)await chrome.tabs.update(tab.id,{active:true});
+      }
       if(args.method==='Target.attachToTarget') {
         const child=frameTargets.get(tab.id)?.get(args.params?.targetId);
         if(!child)throw Error('子框架已变化，请重新观察');

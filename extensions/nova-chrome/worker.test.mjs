@@ -32,6 +32,24 @@ test('native downloads expose progress, interruption and completion without tab 
   }
 });
 
+test('screenshots reveal a minimized window or background tab instead of hanging',async()=>{
+  const event=()=>({addListener(){}});const calls=[];
+  let win={id:5,state:'minimized'};const tab={id:11,windowId:5,url:'https://example.com',active:false};
+  const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},
+    tabs:{query:async()=>[tab],get:async()=>({...tab}),update:async(id,props)=>{calls.push(['tab',id,props]);Object.assign(tab,props);},onRemoved:event(),onReplaced:event()},
+    windows:{get:async()=>({...win}),update:async(id,props)=>{calls.push(['window',id,props]);win={...win,...props};}},
+    debugger:{attach:async()=>{},sendCommand:async(_t,method)=>{calls.push(['cdp',method]);return {data:'png'};},onEvent:event(),onDetach:event()},
+    runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+
+    '\nglobalThis.run=async method=>execute({operation:"cdp",args:{tabTag:(await inventory())[0].tag,method},expiresAt:Date.now()+3000});',scope);
+  assert.equal((await scope.run('Page.captureScreenshot')).data,'png');
+  // JSON compare: objects created inside the vm context have a different prototype.
+  assert.equal(JSON.stringify(calls),JSON.stringify([['window',5,{state:'normal'}],['tab',11,{active:true}],['cdp','Page.captureScreenshot']]));
+  calls.length=0;await scope.run('Page.captureScreenshot');await scope.run('Runtime.evaluate');
+  assert.equal(JSON.stringify(calls),JSON.stringify([['cdp','Page.captureScreenshot'],['cdp','Runtime.evaluate']]),'visible tabs and other commands are left alone');
+});
+
 test('a stuck debugger command times out, polling resumes and late results are not replayed',async()=>{
   const event=()=>({addListener(){}});
   const replies=[]; let polls=0, calls=0, finishCommand;
