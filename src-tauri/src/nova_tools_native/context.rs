@@ -600,6 +600,19 @@ fn run_command_until_limited(
     deadline: Option<Instant>,
     max_output_bytes: usize,
 ) -> Option<Vec<u8>> {
+    run_command_partial(root, program, args, deadline, max_output_bytes)
+        .and_then(|(bytes, finished)| finished.then_some(bytes))
+}
+
+/// Like `run_command_until_limited`, but keeps whatever stdout arrived before a timeout or a
+/// failing exit (`finished == false`) so searches can degrade to partial hits instead of none.
+fn run_command_partial(
+    root: &Path,
+    program: &str,
+    args: &[String],
+    deadline: Option<Instant>,
+    max_output_bytes: usize,
+) -> Option<(Vec<u8>, bool)> {
     let remaining = deadline.and_then(|limit| limit.checked_duration_since(Instant::now()));
     if deadline.is_some() && remaining.is_none() {
         return None;
@@ -636,11 +649,11 @@ fn run_command_until_limited(
         let _ = child.wait();
     }
     let bytes = reader.join().ok().flatten()?;
-    let status = status?;
     // rg 的1是正常零命中；Git/其它程序失败不能被当作成功的空结果缓存。
-    // 达到输出上限时仍返回有界字节，由调用方区分截断（保留现有 cap 契约）。
-    (status.success() || (program == "rg" && status.code() == Some(1)) || bytes.len() >= max_output_bytes)
-        .then_some(bytes)
+    // 达到输出上限时仍视为完成并返回有界字节，由调用方区分截断（保留现有 cap 契约）。
+    let finished = status.is_some_and(|status| status.success() || (program == "rg" && status.code() == Some(1)))
+        || bytes.len() >= max_output_bytes;
+    Some((bytes, finished))
 }
 
 fn walk_code_files(root: &Path) -> Vec<String> {
@@ -1707,13 +1720,18 @@ fn rg_search(
     } else {
         args.extend(paths.iter().cloned());
     }
-    let stdout = run_command_until_limited(root, "rg", &args, deadline, MAX_SEARCH_OUTPUT_BYTES)?;
-    if stdout.len() >= MAX_SEARCH_OUTPUT_BYTES { return None; }
+    let (mut stdout, finished) = run_command_partial(root, "rg", &args, deadline, MAX_SEARCH_OUTPUT_BYTES)?;
+    // 超时/输出封顶/exit 2（部分文件不可读）时保留已到达的完整行，避免整批命中被丢弃。
+    let finished = finished && stdout.len() < MAX_SEARCH_OUTPUT_BYTES;
+    if !finished {
+        stdout.truncate(stdout.iter().rposition(|&b| b == b'\n').map_or(0, |end| end + 1));
+        if stdout.is_empty() { return None; }
+    }
     let valid_utf8 = std::str::from_utf8(&stdout).is_ok();
     let rows = parse_search_rows(stdout);
     let mut counts = HashMap::<&str, usize>::new();
-    // 保守完整性证明：任何文件达到行上限、长行省略、总行上限或非UTF8，都不能证明零命中。
-    let complete = valid_utf8 && rows.len() < MAX_HIT_LINES && rows.iter().all(|row| {
+    // 保守完整性证明：未跑完、任何文件达到行上限、长行省略、总行上限或非UTF8，都不能证明零命中。
+    let complete = finished && valid_utf8 && rows.len() < MAX_HIT_LINES && rows.iter().all(|row| {
         let count = counts.entry(&row.file).or_default();
         *count += 1;
         *count < MAX_HITS_PER_FILE && !row.text.contains("[Omitted long matching line]")
@@ -1771,7 +1789,9 @@ fn search_text_until(
     if rg_available(root) {
         // rg is the bounded primary path. A timeout/output-cap failure must not fall through to an
         // unbounded `git grep` over the same large repository.
-        return rg_search(root, &terms, ignore_case, word, files, false, deadline)
+        let rows = rg_search(root, &terms, ignore_case, word, files, false, deadline);
+        search.expired();
+        return rows
             .map(|(rows, _)| rows)
             .unwrap_or_else(|| { search.incomplete.store(true, Ordering::Relaxed); Vec::new() });
     }
@@ -3206,6 +3226,7 @@ fn search_scopes_result(
             }
             _ => rg_search(root, terms, ignore_case, word, &[], true, deadline),
         };
+        search.expired();
         // rg 失败不能再对同一范围重跑一遍；输出显式缺口而不是隐藏超时。
         return rows.unwrap_or_else(|| { search.incomplete.store(true, Ordering::Relaxed); (Vec::new(), false) });
     }
@@ -6499,6 +6520,9 @@ mod tests {
         fs::write(root.join("a.rs"), format!("{}alpha\n", "x".repeat(1200))).unwrap();
         assert!(!rg_search(root, &["alpha".into(), "absent".into()], true, false, &[], true, None).unwrap().1);
         assert!(rg_search(root, &["alpha".into()], true, false, &[], true, Some(Instant::now())).is_none());
+        // exit 2（部分路径不可读）保留已输出命中，但不能当作完整负证据。
+        let (rows, complete) = rg_search(root, &["alpha".into()], true, false, &["a.rs".into(), "missing.rs".into()], false, None).unwrap();
+        assert!(!rows.is_empty() && !complete);
     }
 
     #[test]
