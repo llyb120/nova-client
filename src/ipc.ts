@@ -241,6 +241,8 @@ export const api = {
   /** 设置页图形化编辑 Lyra config.jsonc；保存后后端立即重载。 */
   getLyraConfig: () => invoke<Record<string, any>>("get_lyra_config"),
   getLyraPresets: () => invoke<Preset[]>("get_lyra_presets"),
+  importLocalLyraProvider: (source: "codex" | "claude-code") =>
+    invoke<{ provider: Record<string, any>; model: string }>("import_local_lyra_provider", { source }),
   fetchLyraModels: (id: string, provider: Record<string, any>) =>
     invoke<Record<string, any>>("fetch_lyra_models", { id, provider }),
   saveLyraConfig: (config: Record<string, any>) => invoke<void>("save_lyra_config", { config }),

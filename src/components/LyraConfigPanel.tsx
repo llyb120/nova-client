@@ -163,6 +163,26 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
     edit((d) => void d.providers.push(presetId === "manual" ? providerDraft("", { api: APIS[0] }) : providerDraft(id, { preset: presetId })));
   };
 
+  const [importing, setImporting] = createSignal(false);
+  const importLocal = async (source: "codex" | "claude-code") => {
+    setImporting(true);
+    setError("");
+    try {
+      const result = await api.importLocalLyraProvider(source);
+      const base = `local-${source}`;
+      let id = base;
+      for (let n = 2; draft.providers.some((p) => p.id === id); n++) id = `${base}-${n}`;
+      edit((d) => {
+        d.providers.push(providerDraft(id, result.provider));
+        if (!d.model) d.model = `${id}/${result.model}`;
+      });
+    } catch (e) {
+      setError(`导入失败：${String(e)}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+
   // 预设 provider 的模型自动拉取，界面里看不到，选中的默认模型不应标为不存在。
   const fetchedModel = (value: string) => draft.providers.some((p) => p.preset && value.startsWith(`${p.id}/`));
 
@@ -367,6 +387,12 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
           <For each={presets()}>{(x) => <option value={x.id}>{x.name}（填 Key 一键获取模型）</option>}</For>
           <option value="manual">手动配置</option>
         </select>
+        <div class="backend-card-head">
+          <button type="button" class="btn secondary" disabled={importing()} onClick={() => void importLocal("codex")}>从本地 Codex 导入</button>
+          <button type="button" class="btn secondary" disabled={importing()} onClick={() => void importLocal("claude-code")}>从本地 Claude Code 导入</button>
+          <Show when={importing()}><span class="field-hint" role="status">正在读取 API 配置和模型…</span></Show>
+        </div>
+        <span class="field-hint">读取本地用户级 API 配置，导入后可编辑并保存；本地配置变更后需重新导入。</span>
       </Show>
     </section>
   );

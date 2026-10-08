@@ -6,6 +6,71 @@ use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "local_provider.rs"]
+mod local_provider;
+
+/// 导入为普通 provider，后续由现有设置编辑/保存；不把本机配置引用写入可共享配置。
+pub(crate) async fn import_local(http: &reqwest::Client, source: &str) -> Result<Value, String> {
+    let (provider, selected) = local_provider::load(source, &super::config::process_env())?;
+    let explicit = provider["models"].as_object().cloned().unwrap_or_default();
+    let base = provider["options"]["baseURL"].as_str().unwrap_or("").trim_end_matches('/');
+    let url = reqwest::Url::parse(base).map_err(|_| "本地 API 的 Base URL 无效")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("本地 API 的 Base URL 必须使用 HTTP 或 HTTPS".into());
+    }
+    let anthropic = provider["api"] == "anthropic-messages";
+    let models_url = if anthropic && !base.ends_with("/v1") { format!("{base}/v1/models") } else { format!("{base}/models") };
+    let mut request = http.get(models_url).timeout(Duration::from_secs(30));
+    let key = provider["options"]["apiKey"].as_str().unwrap_or("");
+    if !key.is_empty() {
+        request = if anthropic { request.header("x-api-key", key) } else { request.bearer_auth(key) };
+    }
+    if anthropic { request = request.header("anthropic-version", "2023-06-01"); }
+    if let Some(headers) = provider["options"]["headers"].as_object() {
+        for (name, value) in headers {
+            let value = value.as_str().ok_or("本地 API 请求头必须是字符串")?;
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| "本地 API 请求头名称无效")?;
+            let value = reqwest::header::HeaderValue::from_str(value).map_err(|_| "本地 API 请求头值无效")?;
+            request = request.header(name, value);
+        }
+    }
+    let (list, catalog) = tokio::join!(async {
+        // 优先导入用户已配置的模型；未指定时才查询端点，兼容不提供 /models 的网关。
+        if !explicit.is_empty() { return Some(json!({ "data": [] })); }
+        request.send().await.ok()?.error_for_status().ok()?.json::<Value>().await.ok()
+    }, get_json(http, "https://models.dev/api.json", ""));
+    convert_local(provider, &selected, &list.unwrap_or(Value::Null), catalog.as_ref().ok())
+}
+
+fn convert_local(mut provider: Value, selected: &str, list: &Value, catalog: Option<&Value>) -> Result<Value, String> {
+    let explicit = provider["models"].as_object().cloned().unwrap_or_default();
+    let mut entries = list["data"].as_array().cloned().unwrap_or_default();
+    for id in explicit.keys() {
+        if !entries.iter().any(|entry| entry["id"] == id.as_str()) { entries.push(json!({ "id": id })); }
+    }
+    let mut models = convert(&json!({ "data": entries }), None, catalog);
+    for (id, local) in explicit {
+        let model = models.entry(id).or_insert_with(|| json!({}));
+        for field in ["options", "variants"] {
+            if let Some(values) = local[field].as_object() {
+                let mut merged = model[field].as_object().cloned().unwrap_or_default();
+                merged.extend(values.clone());
+                model[field] = json!(merged);
+            }
+        }
+        if let Some(reasoning) = local.get("reasoning") { model["reasoning"] = reasoning.clone(); }
+    }
+    if models.is_empty() {
+        return Err("本地配置未指定模型，且 API 未返回可用模型；请在本地设置中指定完整模型 ID 后重试".into());
+    }
+    // 本地 CLI 明确选择了协议，所有导入模型沿用该协议。
+    for model in models.values_mut() { model.as_object_mut().unwrap().remove("api"); }
+    provider["models"] = json!(models);
+    let config = json!({ "model": format!("local/{selected}"), "provider": { "local": provider } });
+    let model = super::config::default_model(&config)?;
+    Ok(json!({ "provider": config["provider"]["local"], "model": model.strip_prefix("local/").unwrap() }))
+}
+
 struct Preset {
     id: &'static str,
     name: &'static str,
@@ -354,6 +419,31 @@ pub(crate) fn cache_mtime(nova_root: &Path) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_import_keeps_configured_protocol_and_effort_with_or_without_catalog() {
+        let provider = json!({ "api": "openai-responses", "options": {
+            "baseURL": "https://proxy.example/v1", "apiKey": "test-key"
+        }, "models": { "custom/model": {
+            "reasoning": true, "options": { "reasoningEffort": "high" },
+            "variants": { "high": { "reasoningEffort": "high" } }
+        } } });
+        let catalog = json!({ "upstream": { "models": { "custom/model": {
+            "reasoning": true, "reasoning_options": [{ "type": "effort", "values": ["low", "high"] }]
+        } } } });
+        for catalog in [None, Some(&catalog)] {
+            let imported = convert_local(provider.clone(), "custom/model", &Value::Null, catalog).unwrap();
+            assert_eq!(imported["model"], "custom/model/variant/high");
+            assert_eq!(imported["provider"]["api"], "openai-responses");
+            assert_eq!(imported["provider"]["options"]["apiKey"], "test-key");
+            assert_eq!(imported["provider"]["models"]["custom/model"]["variants"]["low"].is_object(), catalog.is_some());
+        }
+        let provider = json!({ "api": "anthropic-messages", "options": { "baseURL": "https://api.example" }, "models": {} });
+        assert!(convert_local(provider.clone(), "", &Value::Null, None).is_err());
+        let imported = convert_local(provider, "", &json!({ "data": [{ "id": "from-api", "supported_endpoints": ["/responses"] }] }), None).unwrap();
+        assert_eq!(imported["model"], "from-api");
+        assert!(imported["provider"]["models"]["from-api"].get("api").is_none());
+    }
 
     #[test]
     fn converts_commandcode_and_models_dev_lists() {

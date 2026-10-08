@@ -51,4 +51,18 @@ assert.equal(validate(presetDraft.providers, presets), null);
 assert.deepEqual(configFromDraft(presetRaw, presetDraft).provider.cc, presetRaw.provider.cc);
 presetDraft.providers[0].preset = "openai-compatible";
 assert.match(validate(presetDraft.providers, presets) ?? "", /Base URL/);
+
+// 本地 API 配置导入为普通 provider：保存时保留协议、认证头和思考档位。
+const imported = { model: "local-claude-code/custom/variant/high", provider: { "local-claude-code": {
+  name: "本地 Claude Code", api: "anthropic-messages",
+  options: { baseURL: "https://gateway.example", apiKey: "", headers: { Authorization: "Bearer test-token" } },
+  models: { custom: { reasoning: true, options: { reasoningEffort: "high" }, variants: { high: { reasoningEffort: "high" } } } },
+} } };
+const importedDraft = draftFromConfig(imported);
+assert.equal(validate(importedDraft.providers, presets), null);
+const savedImport = configFromDraft(imported, importedDraft);
+assert.equal(savedImport.provider["local-claude-code"].api, "anthropic-messages");
+assert.equal(savedImport.provider["local-claude-code"].options.headers.Authorization, "Bearer test-token");
+assert.equal(savedImport.model, imported.model);
+assert.deepEqual(savedImport.provider["local-claude-code"].models.custom.variants, imported.provider["local-claude-code"].models.custom.variants);
 console.log("ok");
