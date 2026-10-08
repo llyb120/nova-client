@@ -1663,11 +1663,13 @@ export function SettingsModal(props: { onClose: () => void }) {
           </Show>
 
           {/* ===== Lyra（常驻挂载，切换 tab 不丢草稿） ===== */}
-          <div class="settings-tab-pane" hidden={tab() !== "lyra"}>
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class={`agent-badge lyra`}>{agentLabel("lyra")}</span>
-                <span class="fixed-integration">Rust</span>
+          <div class="settings-tab-pane lyra-settings" hidden={tab() !== "lyra"}>
+            <div class="lyra-overview">
+              <div class="lyra-section-head">
+                <div class="lyra-heading">
+                  <h3>Lyra</h3>
+                  <p class="field-hint">连接模型服务，使用本机 Skills 开始工作。</p>
+                </div>
                 <label class="backend-switch">
                   <input
                     type="checkbox"
@@ -1675,11 +1677,16 @@ export function SettingsModal(props: { onClose: () => void }) {
                     disabled={lyraEnabled() && enabledCount() === 1}
                     onChange={(e) => setLyraEnabled(e.currentTarget.checked)}
                   />
-                  <span>启用</span>
+                  <span>启用 Lyra</span>
                 </label>
               </div>
-              <span class="field-hint">Rust 原生 agent，不经 Node bridge；复用本机模型 provider 配置与 Skills。</span>
-              <ProxyField value={lyraProxy()} onInput={setLyraProxy} />
+              <details class="lyra-advanced">
+                <summary>网络代理<span class="field-hint">{lyraProxy().trim() ? "已配置" : "默认直连"}</span></summary>
+                <div class="lyra-detail-body">
+                  <ProxyField value={lyraProxy()} onInput={setLyraProxy} />
+                  <span class="field-hint">作为所有 Lyra 服务商的默认代理，可在服务商设置中单独覆盖。</span>
+                </div>
+              </details>
             </div>
 
             <LyraConfigPanel onSaver={(fn) => (saveLyraConfig = fn)} />

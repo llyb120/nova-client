@@ -7275,6 +7275,162 @@ button:focus-visible {
   display: none;
 }
 
+/* Lyra：默认模型 → 服务商 → 模型与高级参数，逐层展开。 */
+.lyra-config,
+.lyra-overview,
+.lyra-provider-body,
+.lyra-detail-body,
+.lyra-models {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.lyra-section-head,
+.lyra-provider-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.lyra-heading h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+.lyra-overview .lyra-heading h3 { font-size: 22px; }
+.lyra-heading p { margin: 5px 0 0; }
+.lyra-default-model {
+  padding: 18px 20px;
+  background: var(--accent-dim);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  border-radius: var(--r-md);
+  margin-bottom: 8px;
+}
+.lyra-default-model .field-label { font-size: 14px; }
+.lyra-default-model select { margin-top: 5px; }
+.lyra-add-provider { width: 162px; max-width: 100%; }
+.lyra-provider {
+  min-width: 0;
+  border: 1px solid var(--card-border);
+  border-radius: var(--r-md);
+  background: var(--bg-panel);
+}
+.lyra-config summary,
+.lyra-overview summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.lyra-config summary::-webkit-details-marker,
+.lyra-overview summary::-webkit-details-marker { display: none; }
+.lyra-config summary::before,
+.lyra-overview summary::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  margin-right: 4px;
+}
+.lyra-config details[open] > summary::before,
+.lyra-overview details[open] > summary::before { transform: rotate(45deg); }
+.lyra-config summary:hover,
+.lyra-overview summary:hover { color: var(--text); }
+.lyra-config summary:focus-visible,
+.lyra-overview summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+.lyra-provider > summary { padding: 16px 18px; }
+.lyra-provider[open] > summary { border-bottom: 1px solid var(--border); }
+.lyra-provider-title {
+  min-width: 0;
+  flex: 1;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.lyra-provider-meta { color: var(--text-muted); font-size: 11.5px; }
+.lyra-count {
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+.lyra-provider-body { padding: 18px; }
+.lyra-config h4 { margin: 0; font-size: 12.5px; font-weight: 600; }
+.lyra-config .backend-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.lyra-config .field-input { min-width: 0; max-width: 100%; }
+.lyra-config .backend-card-head { flex-wrap: wrap; }
+.lyra-config .field-hint,
+.lyra-overview .field-hint { overflow-wrap: anywhere; }
+.lyra-models { padding-top: 16px; border-top: 1px solid var(--border); gap: 12px; }
+.lyra-models .btn { padding: 6px 10px; font-size: 12px; }
+.lyra-fetch {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 12px;
+  align-items: center;
+}
+.lyra-fetch > [role="status"],
+.lyra-model-catalog { grid-column: 1 / -1; }
+.lyra-fetch > [role="status"]:empty { display: none; }
+.lyra-model-names {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+  max-height: 180px;
+  overflow: auto;
+}
+.lyra-model-names span {
+  font-size: 11.5px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  overflow-wrap: anywhere;
+}
+.lyra-model { background: var(--bg-input); border-radius: var(--r-sm); }
+.lyra-model > summary { padding: 12px; }
+.lyra-model > .lyra-detail-body { padding: 0 12px 14px; }
+.lyra-advanced,
+.lyra-file-settings { border-top: 1px solid var(--border); padding-top: 12px; }
+.lyra-advanced > .lyra-detail-body,
+.lyra-file-settings > .lyra-detail-body { padding-top: 14px; }
+.lyra-file-settings .btn { align-self: flex-start; }
+.lyra-provider-footer { border-top: 1px solid var(--border); padding-top: 12px; }
+.lyra-provider-footer .link-btn { color: var(--text-muted); font-size: 11.5px; }
+.lyra-provider-footer .link-btn:hover { color: var(--red); }
+.lyra-empty { display: grid; gap: 8px; padding: 24px; border: 1px dashed var(--border-light); border-radius: var(--r-md); }
+.lyra-config .lyra-error { color: var(--red); }
+@media (max-width: 600px) {
+  .lyra-config .backend-fields,
+  .lyra-config .env-var-row { grid-template-columns: minmax(0, 1fr); }
+  .lyra-provider > summary { padding: 14px; }
+  .lyra-provider-body { padding: 14px; }
+  .lyra-provider-meta { display: none; }
+  .lyra-default-model { padding: 16px; }
+  .lyra-fetch { grid-template-columns: minmax(0, 1fr); }
+  .lyra-fetch > .btn { justify-self: start; }
+  .lyra-overview .backend-proxy-field { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* 模型右侧的思考强度列（第四级） */
 .sel-pop.grouped.efforts {
   width: 600px;
