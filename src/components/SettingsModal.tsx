@@ -434,6 +434,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     const kinds: AgentKind[] = [];
     if (lyraEnabled()) kinds.push("lyra");
     if (devinEnabled()) kinds.push("devin");
+    if (claudeEnabled()) kinds.push("claude");
     if (codexEnabled()) kinds.push("codex");
     if (codebuddyEnabled()) kinds.push("codebuddy");
     if (cursorEnabled()) kinds.push("cursor");
