@@ -7,7 +7,7 @@ import type { AgentKind } from "../types";
 import { ModelPicker } from "./ConfigSelects";
 import "./EmployeeView.css";
 
-type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; lastRunAt: number; lastResult: string };
+type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; nextCheckAt: number; lastRunAt: number; lastResult: string };
 type Todo = { id: string; text: string; confirm: boolean; createdAt: number; threadId?: string | null };
 type Run = { at: number; dutyId: string; result: string; threadId: string };
 type Snapshot = {
@@ -28,9 +28,10 @@ export default function EmployeeView() {
   // 不用 createResource：页面在 <Suspense> 里，轮询 refetch 会让整页切到 fallback 闪烁并丢失输入焦点；
   // reconcile 保持行对象稳定，列表不重建，展开的菜单也不会被关掉。
   const [store, setStore] = createStore<{ snap?: Snapshot }>({});
+  const [now, setNow] = createSignal(Date.now());
   const data = () => store.snap;
   const refetch = () => invoke<Snapshot>("employee_get").then(
-    (snap) => setStore("snap", reconcile(snap)),
+    (snap) => { setStore("snap", reconcile(snap)); setNow(Date.now()); },
     (error) => showToast(`读取员工数据失败：${String(error)}`),
   );
   void refetch();
@@ -116,6 +117,9 @@ export default function EmployeeView() {
                         if (note !== duty.note) await run("employee_do", { action: "duty_note", id: duty.id, text: note });
                         setNoteDraft(null);
                       };
+                      const nextCheckAt = () => duty.everyMinutes > 0
+                        ? (duty.lastRunAt ? duty.lastRunAt + duty.everyMinutes * 60_000 : 0)
+                        : duty.nextCheckAt;
                       return (
                       <li>
                         <input type="checkbox" checked={duty.enabled} aria-label={`启用职责：${duty.text}`}
@@ -134,11 +138,12 @@ export default function EmployeeView() {
                             </div>
                           </Show>
                           <small>
-                            <label title="留空：按职责描述里的时间要求判断">每 <input type="number" min="0" max="10080" placeholder="—"
+                            {duty.everyMinutes > 0 ? "固定间隔" : "动态调度"} · <label title="留空或 0：员工根据职责和执行结果安排下次检查；填入数字：每次结束后等待固定分钟数">每 <input type="number" min="0" max="10080" placeholder="—"
                               value={duty.everyMinutes || ""} aria-label="执行间隔（分钟）"
                               onChange={(ev) => void run("employee_do", { action: "duty_every", id: duty.id, text: ev.currentTarget.value })} /> 分钟 · </label>
                             上次 {time(duty.lastRunAt)}{duty.lastResult ? ` · ${duty.lastResult}` : ""}
                           </small>
+                          <small>下次检查 {duty.enabled ? (nextCheckAt() > now() ? time(nextCheckAt()) : "待检查") : "已停用"}</small>
                           <Show when={noteDraft() !== null} fallback={<Show when={duty.note}>
                             <small class="employee-note">备注：{duty.note}</small>
                           </Show>}>

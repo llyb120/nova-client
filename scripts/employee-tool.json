@@ -1,6 +1,6 @@
 {
   "name": "employee",
-  "description": "Nova 数字员工的职责与待办。用户在任何会话里说“交给员工：xxx”时，调用 add(kind=todo,text=xxx) 记下后告知用户已交给员工，不要自己去做。list 查看职责/待办/最近运行；add 新增职责(kind=duty)或待办(kind=todo)；“每隔 N 分钟/小时”这类不挑具体时刻的职责设 everyMinutes，到点即执行，员工可按实际情况自行调快调慢；update 修改职责 text/enabled/everyMinutes 或覆盖写 note（≤1KB，员工自己的备忘）；done 删除已处理的待办/待确认，或移除职责；ask 把没有明确授权的不可逆操作（支付、删除、对外发送、提交审批等）记为待确认并通知用户，然后停止该操作。只能通过本工具修改员工数据。",
+  "description": "Nova 数字员工的职责与待办。用户在任何会话里说“交给员工：xxx”时，调用 add(kind=todo,text=xxx) 记下后告知用户已交给员工，不要自己去做。list 查看职责/待办/最近运行，动态职责的 nextCheckAt 为下次检查的 UTC 毫秒时间戳；add 新增职责(kind=duty)或待办(kind=todo)；“隔一段时间”“每隔几分钟”等未指定数字的职责用动态调度（everyMinutes=0），每轮先判断执行条件，再用 nextCheckInMinutes 根据结果安排下次检查，可逐轮调快调慢；用户明确指定每隔 N 分钟/小时则用 everyMinutes 固定间隔，不得擅自调整；update 修改职责 text/enabled/everyMinutes/nextCheckInMinutes 或覆盖写 note（≤1KB，员工自己的备忘），修改 text 会清空旧备注、时间计划和固定间隔，需要保留或改设固定间隔时同次提供 everyMinutes；done 删除已处理的待办/待确认，或移除职责；ask 把没有明确授权的不可逆操作（支付、删除、对外发送、提交审批等）记为待确认并通知用户，然后停止该操作。只能通过本工具修改员工数据。",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -10,7 +10,8 @@
       "text": { "type": "string", "minLength": 1, "maxLength": 500, "description": "add/ask 必填；update 可选" },
       "note": { "type": "string", "maxLength": 1024, "description": "update 可选，覆盖写职责备注" },
       "enabled": { "type": "boolean", "description": "update 可选，启用/停用职责" },
-      "everyMinutes": { "type": "integer", "minimum": 0, "maximum": 10080, "description": "职责 add/update 可选：每隔多少分钟执行一次（距上次结束）；0 表示按职责原文的时间要求由心跳判断" }
+      "everyMinutes": { "type": "integer", "minimum": 0, "maximum": 10080, "description": "职责 add/update 可选：大于 0 为固定间隔（距上次结束的分钟数），仅用于用户明确指定的频率；0 为动态调度（默认），员工每轮安排下次检查" },
+      "nextCheckInMinutes": { "type": "integer", "minimum": 1, "maximum": 10080, "description": "动态职责 add/update 可选：从本次调用起多少分钟后再检查；每轮根据职责时间要求和执行结果安排，即使本轮条件不满足也要安排。仅适用于 everyMinutes=0，不能与固定间隔同时设置" }
     },
     "required": ["action"],
     "additionalProperties": false
