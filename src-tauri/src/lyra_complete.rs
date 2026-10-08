@@ -24,6 +24,7 @@ struct ResolvedCompletionTarget {
     thinking_format: Option<String>,
     max_tokens_field: &'static str,
     reasoning: bool,
+    supports_thinking_toggle: bool,
     service_tier: Option<String>,
     temperature: Option<f64>,
     top_p: Option<f64>,
@@ -122,7 +123,7 @@ async fn complete_openai_responses(
     if let Some(top_p) = target.top_p {
         body["top_p"] = json!(top_p);
     }
-    if target.reasoning {
+    if target.reasoning && target.supports_thinking_toggle {
         body["reasoning"] = json!({ "effort": "none" });
     }
     let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
@@ -130,16 +131,17 @@ async fn complete_openai_responses(
 }
 
 fn apply_thinking_disabled_completions(body: &mut Value, target: &ResolvedCompletionTarget) {
-    if !target.reasoning {
+    if !target.reasoning || !target.supports_thinking_toggle {
         return;
     }
     match target.thinking_format.as_deref() {
-        Some("deepseek") | Some("zai") => {
+        Some("deepseek" | "zai" | "moonshot" | "minimax" | "volcengine") => {
             body["thinking"] = json!({ "type": "disabled" });
         }
         Some("qwen") => {
             body["enable_thinking"] = json!(false);
         }
+        Some("openrouter") => { body["reasoning"] = json!({ "enabled": false }); }
         _ => {}
     }
 }
@@ -503,6 +505,8 @@ fn resolve_target(
         thinking_format,
         max_tokens_field,
         reasoning,
+        supports_thinking_toggle: model.pointer("/options/supportsThinkingToggle")
+            .or_else(|| provider.pointer("/options/supportsThinkingToggle")).and_then(Value::as_bool).unwrap_or(true),
         service_tier,
         temperature,
         top_p,
@@ -815,6 +819,23 @@ mod tests {
         let target = resolve_target(&explicit, "opencode/gpt", &HashMap::new()).unwrap();
         // 显式声明后 provider 侧自动附加 x-opencode-session 路由头。
         assert_eq!(target.thinking_format.as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn completion_does_not_disable_mandatory_thinking() {
+        for format in ["zai", "moonshot", "qwen", "minimax", "openrouter"] {
+            let mut config = json!({"provider":{"p":{"api":"openai-completions",
+                "options":{"baseURL":"https://example.test"},"models":{"m":{"reasoning":true,
+                    "options":{"thinkingFormat":format,"supportsThinkingToggle":false}}}}}});
+            let target = resolve_target(&config, "p/m", &HashMap::new()).unwrap();
+            let mut body = json!({});
+            apply_thinking_disabled_completions(&mut body, &target);
+            assert_eq!(body, json!({}), "{format}");
+            config["provider"]["p"]["models"]["m"]["options"]["supportsThinkingToggle"] = json!(true);
+            let target = resolve_target(&config, "p/m", &HashMap::new()).unwrap();
+            apply_thinking_disabled_completions(&mut body, &target);
+            assert_ne!(body, json!({}), "{format}");
+        }
     }
 
     #[test]

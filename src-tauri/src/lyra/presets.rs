@@ -48,7 +48,15 @@ fn convert_local(mut provider: Value, selected: &str, list: &Value, catalog: Opt
     for id in explicit.keys() {
         if !entries.iter().any(|entry| entry["id"] == id.as_str()) { entries.push(json!({ "id": id })); }
     }
-    let mut models = convert(&json!({ "data": entries }), None, catalog);
+    let preset_id = PRESETS.iter().find(|p| provider["options"]["baseURL"].as_str()
+        .is_some_and(|url| !p.base_url.is_empty() && url.trim_end_matches('/') == p.base_url)).map(|p| p.id).unwrap_or("");
+    let mut models = convert(&json!({ "data": entries }), None, catalog, preset_id);
+    for (id, model) in &mut models {
+        if model["reasoning"] == true {
+            configure_reasoning(model, id, provider["api"].as_str().unwrap_or(DEFAULT_API), preset_id,
+                catalog_model(catalog, id).and_then(|info| info["reasoning_options"].as_array()));
+        }
+    }
     for (id, local) in explicit {
         let model = models.entry(id).or_insert_with(|| json!({}));
         for field in ["options", "variants"] {
@@ -189,8 +197,8 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         .unwrap_or_default();
         let base_url = if base_url.is_empty() { preset.base_url.to_string() } else { base_url };
         let api_key = crate::lyra_complete::resolve_env_string(option("apiKey"), &env).unwrap_or_default();
-        // 转换规则升级：旧缓存缺少思考能力，不能继续沿用六小时。
-        let print = fingerprint(&["2", preset.id, &base_url, &api_key]);
+        // 转换规则升级：旧缓存缺少模型私有参数，不能继续沿用六小时。
+        let print = fingerprint(&["3", preset.id, &base_url, &api_key]);
         let entry = &cache[id.as_str()];
         if !force
             && entry["fingerprint"] == print.as_str()
@@ -258,13 +266,13 @@ async fn fetch_models(
     if models_dev.is_none() {
         match get_json(http, "https://models.dev/api.json", "").await {
             Ok(meta) => *models_dev = Some(meta),
-            Err(error) if preset.models_dev => return Err(error),
+            Err(error) if preset.models_dev && list.is_err() => return Err(error),
             // 兼容端点以自己的 /models 为准，补充能力信息失败不能使列表不可用。
             Err(error) => eprintln!("[lyra] 模型能力信息暂不可用：{error}"),
         }
     }
     if !preset.models_dev {
-        return Ok(convert(&list?, None, models_dev.as_ref()));
+        return Ok(convert(&list?, None, models_dev.as_ref(), preset.id));
     }
     let meta = models_dev.as_ref().and_then(|all| all.get(preset.id)).cloned().unwrap_or_default();
     // Coding Plan、Anthropic 协议端点等常不提供 /models，此时整份用 models.dev 的列表。
@@ -272,7 +280,7 @@ async fn fetch_models(
         eprintln!("[lyra] {}：{error}，改用 models.dev 模型列表", preset.id);
         Value::Null
     });
-    Ok(convert(&list, Some(&meta), models_dev.as_ref()))
+    Ok(convert(&list, Some(&meta), models_dev.as_ref(), preset.id))
 }
 
 /// 中转站模型名可能带厂商前缀；按完整 ID / canonical ID 匹配，优先原厂能力。
@@ -313,15 +321,15 @@ fn npm_api(npm: &str) -> Option<&'static str> {
 
 /// /models 列表 + 可选 models.dev provider 条目 → Lyra models 配置。
 /// 有 models.dev 时只保留它认识的模型（滤掉嵌入、绘图等非对话模型），/models 不可用则整份采用。
-fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>) -> Map<String, Value> {
+fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_id: &str) -> Map<String, Value> {
     let known = meta.and_then(|m| m["models"].as_object());
     let provider_npm = meta.and_then(|m| m["npm"].as_str()).unwrap_or("");
     let null = Value::Null;
     let mut entries: Vec<(&str, &Value)> = list["data"].as_array().into_iter().flatten()
         .filter_map(|entry| entry["id"].as_str().filter(|id| !id.is_empty()).map(|id| (id, entry)))
-        .filter(|(id, _)| known.is_none_or(|k| k.contains_key(*id)))
         .collect();
-    if entries.is_empty() {
+    // 成功返回的列表（包括空列表）是可用性依据；目录只能补能力，不能补回无权限模型。
+    if !list["data"].is_array() {
         if let Some(known) = known {
             entries = known.iter().filter(|(_, info)| info["status"] != "deprecated").map(|(id, _)| (id.as_str(), &null)).collect();
         }
@@ -335,14 +343,19 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>) -> Map<S
         let provider_info = known.and_then(|m| m.get(id));
         let info = provider_info.or_else(|| catalog_model(catalog, id));
         // Lyra 是 agent，不支持工具调用的模型（深度研究、数学等）选了也用不了。
-        if info.is_some_and(|i| i["tool_call"] == false) {
+        let tool_call = entry["supported_parameters"].as_array().map(|p| p.iter().any(|v| v == "tools"))
+            .or_else(|| info.and_then(|i| i["tool_call"].as_bool())).unwrap_or(true);
+        if !tool_call {
             continue;
         }
         // Command Code 在 supported_endpoints 声明协议，两者都支持时优先 chat/completions。
         let api = match entry["supported_endpoints"].as_array() {
             Some(endpoints) => {
                 let has = |path: &str| endpoints.iter().any(|e| e.as_str() == Some(path));
-                if has("/chat/completions") {
+                let responses_tools_only = matches!(id.rsplit('/').next(), Some("gpt-6-astra" | "gpt-6.1-sol"));
+                if has("/responses") && responses_tools_only {
+                    Some("openai-responses")
+                } else if has("/chat/completions") && !responses_tools_only {
                     Some(DEFAULT_API)
                 } else if has("/responses") {
                     Some("openai-responses")
@@ -364,7 +377,8 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>) -> Map<S
             model["name"] = json!(name);
         }
         let context = entry["context_length"].as_u64().or_else(|| info.and_then(|i| i.pointer("/limit/context")).and_then(Value::as_u64));
-        let output = info.and_then(|i| i.pointer("/limit/output")).and_then(Value::as_u64);
+        let output = entry.pointer("/top_provider/max_completion_tokens").and_then(Value::as_u64)
+            .or_else(|| info.and_then(|i| i.pointer("/limit/output")).and_then(Value::as_u64));
         let mut limit = json!({});
         if let Some(context) = context.filter(|n| *n > 0) {
             limit["context"] = json!(context);
@@ -375,12 +389,13 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>) -> Map<S
         if limit.as_object().is_some_and(|l| !l.is_empty()) {
             model["limit"] = limit;
         }
+        let image = entry.pointer("/architecture/input_modalities")
+            .or_else(|| info.and_then(|i| i.pointer("/modalities/input"))).and_then(Value::as_array)
+            .is_some_and(|input| input.iter().any(|v| v.as_str() == Some("image")));
+        if image {
+            model["modalities"] = json!({ "input": ["text", "image"] });
+        }
         if let Some(info) = info {
-            let image = info.pointer("/modalities/input").and_then(Value::as_array)
-                .is_some_and(|input| input.iter().any(|v| v.as_str() == Some("image")));
-            if image {
-                model["modalities"] = json!({ "input": ["text", "image"] });
-            }
             // DeepSeek、GLM、Kimi 等要求多轮里回传 reasoning_content，否则报错或丢思维链。
             if info.pointer("/interleaved/field") == Some(&json!("reasoning_content")) {
                 model["options"] = json!({ "requiresReasoningContentOnAssistantMessages": true });
@@ -392,16 +407,34 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>) -> Map<S
         let efforts = reasoning_options.into_iter().flatten()
             .find(|o| o["type"] == "effort")
             .and_then(|o| o["values"].as_array());
-        let variants: Map<String, Value> = efforts.into_iter().flatten()
+        // OpenRouter 的 /models 使用 reasoning 对象，而非 models.dev 的 reasoning_options。
+        let router_reasoning = entry["reasoning"].as_object().filter(|_| preset_id == "openrouter");
+        let router_efforts = json!(["max", "xhigh", "high", "medium", "low", "minimal", "none"]);
+        let efforts = if let Some(reasoning) = router_reasoning {
+            reasoning.get("supported_efforts").and_then(|v| if v.is_null() { router_efforts.as_array() } else { v.as_array() })
+        } else { efforts };
+        let mut variants: Map<String, Value> = efforts.into_iter().flatten()
             .filter_map(Value::as_str).filter(|e| !e.trim().is_empty())
+            .filter(|e| *e != "none" || router_reasoning.is_none_or(|r| r.get("mandatory") != Some(&json!(true))))
             .map(|e| (e.to_string(), json!({ "reasoningEffort": e })))
             .collect();
         let reasoning = entry["reasoning"].as_bool()
-            .or((entry["reasoning_options"].is_array() && !variants.is_empty()).then_some(true))
+            .or(router_reasoning.map(|_| true))
+            .or(entry["reasoning_options"].as_array().filter(|o| !o.is_empty()).map(|_| true))
             .or_else(|| info.and_then(|i| i["reasoning"].as_bool()))
             .unwrap_or(!variants.is_empty());
         if reasoning {
             model["reasoning"] = json!(true);
+            configure_reasoning(&mut model, id, api, preset_id, reasoning_options);
+            if let Some(reasoning) = router_reasoning {
+                model["options"]["supportsThinkingToggle"] = json!(reasoning.get("mandatory") != Some(&json!(true)));
+                model["options"]["supportsReasoningEffort"] = json!(efforts.is_some());
+                if let Some(default) = reasoning.get("default_effort").and_then(Value::as_str).filter(|e| variants.contains_key(*e)) {
+                    model["options"]["reasoningEffort"] = json!(default);
+                }
+            }
+            if model.pointer("/options/supportsThinkingToggle") == Some(&json!(false)) { variants.remove("none"); }
+            if model.pointer("/options/supportsReasoningEffort") == Some(&json!(false)) { variants.clear(); }
             if !variants.is_empty() {
                 model["variants"] = Value::Object(variants);
             }
@@ -409,6 +442,81 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>) -> Map<S
         out.insert(id.to_string(), model);
     }
     out
+}
+
+// 厂商参数取决于接入端点，不能把原厂私有字段复制到未知兼容网关。
+// 官方文档及未覆盖的端点见 docs/lyra-provider-models.md。
+fn configure_reasoning(model: &mut Value, id: &str, api: &str, preset_id: &str, capabilities: Option<&Vec<Value>>) {
+    let id = id.to_ascii_lowercase();
+    let format = if api == "anthropic-messages" && id.contains("claude")
+        && capabilities.is_some_and(|c| c.iter().any(|c| c["type"] == "effort")
+            && (!c.iter().any(|c| c["type"] == "budget_tokens")
+                || id.ends_with("opus-4-6") || id.ends_with("sonnet-4-6")
+                || id.ends_with("opus-4.6") || id.ends_with("sonnet-4.6"))) {
+        Some("anthropic")
+    } else { match preset_id {
+        "deepseek" => Some("deepseek"),
+        "zai" | "zai-coding-plan" | "zhipuai" | "zhipuai-coding-plan" => Some("zai"),
+        "moonshotai" | "moonshotai-cn" | "kimi-code-plan-cn" => Some(if id.starts_with("kimi-k2") { "moonshot" } else { "kimi" }),
+        "alibaba" | "alibaba-cn" | "alibaba-coding-plan-cn" if id.starts_with("qwen") || id.starts_with("qwq") => Some("qwen"),
+        "siliconflow-cn" if matches!(id.rsplit('/').next().unwrap_or(""),
+            "qwen3-8b" | "qwen3-14b" | "qwen3-32b" | "qwen3-30b-a3b" | "qwen3-235b-a22b"
+            | "hunyuan-a13b-instruct" | "glm-5v-turbo" | "glm-4.6v" | "glm-4.5v"
+            | "deepseek-v3.1" | "deepseek-v3.1-terminus" | "deepseek-v3.2-exp" | "deepseek-v3.2") => Some("qwen"),
+        "minimax-cn" => Some("minimax"),
+        "volcengine" | "volcengine-coding-plan" => Some("volcengine"),
+        "openrouter" => Some("openrouter"),
+        _ => None,
+    } };
+    let mut options = model["options"].as_object().cloned().unwrap_or_default();
+    if let Some(format) = format {
+        options.insert("thinkingFormat".into(), json!(format));
+        if !matches!(format, "openrouter" | "volcengine") { options.insert("maxTokensField".into(), json!("max_tokens")); }
+    }
+    if let Some(capabilities) = capabilities {
+        let effort = capabilities.iter().any(|c| c["type"] == "effort");
+        let toggle = capabilities.iter().any(|c| c["type"] == "toggle"
+            || (api == "anthropic-messages" && c["type"] == "budget_tokens")
+            || c["values"].as_array().is_some_and(|v| v.iter().any(|v| v == "none")));
+        options.insert("supportsReasoningEffort".into(), json!(effort));
+        options.insert("supportsThinkingToggle".into(), json!(toggle));
+        if format == Some("anthropic") {
+            let default = if id.ends_with("opus-5-5") || id.ends_with("opus-5.5")
+                || id.ends_with("haiku-5-5") || id.ends_with("haiku-5.5") { "medium" } else { "high" };
+            if capabilities.iter().any(|c| c["type"] == "effort" && c["values"].as_array().is_some_and(|v| v.iter().any(|v| v == default))) {
+                options.insert("reasoningEffort".into(), json!(default));
+            }
+        }
+    }
+    if matches!(format, Some("deepseek" | "zai" | "moonshot" | "kimi" | "volcengine")) {
+        options.insert("requiresReasoningContentOnAssistantMessages".into(), json!(true));
+    }
+    if format == Some("zai") && id.starts_with("glm-5.3") {
+        options.insert("supportsThinkingToggle".into(), json!(false));
+    }
+    if preset_id == "siliconflow-cn" && id.rsplit('/').next() == Some("deepseek-v3.1") {
+        // SiliconFlow 此版本的工具调用仅支持非思考模式。
+        options.insert("enable_thinking".into(), json!(false));
+        options.insert("supportsThinkingToggle".into(), json!(false));
+        options.insert("supportsReasoningEffort".into(), json!(false));
+    }
+    // K2.x 不接受 reasoning_effort；K3 不接受 K2.x 的 thinking 参数。
+    if matches!(format, Some("moonshot")) {
+        options.insert("supportsReasoningEffort".into(), json!(false));
+        options.insert("supportsThinkingToggle".into(), json!(matches!(id.as_str(), "kimi-k2.5" | "kimi-k2.6")));
+    }
+    if format == Some("kimi") { options.insert("supportsThinkingToggle".into(), json!(false)); }
+    if matches!(format, Some("moonshot" | "kimi")) {
+        // 固定采样值随思考模式变化，交给服务端默认；模型级 null 屏蔽 provider 的全局值。
+        options.insert("temperature".into(), Value::Null);
+        options.insert("top_p".into(), Value::Null);
+        options.insert("topP".into(), Value::Null);
+    }
+    if format == Some("minimax") {
+        options.insert("supportsThinkingToggle".into(), json!(id == "minimax-m3"));
+        options.insert("supportsReasoningEffort".into(), json!(id == "minimax-m3.1-flash-preview"));
+    }
+    if !options.is_empty() { model["options"] = json!(options); }
 }
 
 /// load_config 缓存键的一部分：config.jsonc 与模型缓存任一变化都要重新解析。
@@ -453,7 +561,7 @@ mod tests {
             { "id": "jev-1", "supported_endpoints": ["/systemone"] },
             { "id": "odd", "supported_endpoints": ["/systemone"] },
         ]});
-        let models = convert(&cc, None, None);
+        let models = convert(&cc, None, None, "");
         assert_eq!(models["claude-opus-5-5"], json!({ "api": "anthropic-messages", "name": "Claude Opus 5.5", "limit": { "context": 1000000 } }));
         assert_eq!(models["deepseek/deepseek-v4-pro"], json!({ "limit": { "context": 1000000 } }));
         assert!(!models.contains_key("jev-1") && !models.contains_key("odd"));
@@ -466,14 +574,16 @@ mod tests {
             "glm-5.3": { "name": "GLM-5.3", "reasoning": true, "reasoning_options": [{ "type": "toggle" }] },
             "gemini-4": { "provider": { "npm": "@ai-sdk/google" } },
         }});
-        let models = convert(&zen, Some(&meta), None);
+        let models = convert(&zen, Some(&meta), None, "");
         assert_eq!(models["gpt-6"], json!({
             "api": "openai-responses", "name": "GPT-6", "limit": { "context": 400000, "output": 128000 },
             "modalities": { "input": ["text", "image"] }, "reasoning": true,
+            "options": { "supportsReasoningEffort": true, "supportsThinkingToggle": false },
             "variants": { "low": { "reasoningEffort": "low" }, "high": { "reasoningEffort": "high" } },
         }));
-        assert_eq!(models["glm-5.3"], json!({ "name": "GLM-5.3", "reasoning": true }));
-        assert!(!models.contains_key("gemini-4") && !models.contains_key("new-model"));
+        assert_eq!(models["glm-5.3"], json!({ "name": "GLM-5.3", "reasoning": true,
+            "options": { "supportsReasoningEffort": false, "supportsThinkingToggle": true } }));
+        assert!(!models.contains_key("gemini-4") && models.contains_key("new-model"));
 
         // /models 不可用（如 MiniMax 的 Anthropic 端点）：整份采用 models.dev，跳过弃用与不支持工具的模型。
         let minimax = json!({ "npm": "@ai-sdk/anthropic", "models": {
@@ -481,7 +591,7 @@ mod tests {
             "old": { "status": "deprecated" },
             "research": { "tool_call": false },
         }});
-        let models = convert(&Value::Null, Some(&minimax), None);
+        let models = convert(&Value::Null, Some(&minimax), None, "");
         assert_eq!(Value::Object(models), json!({ "m3": {
             "api": "anthropic-messages", "name": "M3",
             "options": { "requiresReasoningContentOnAssistantMessages": true },
@@ -575,23 +685,105 @@ mod tests {
             "reasoning_options": [{ "type": "effort", "values": ["low", "high"] }] } } });
         for (fields, expected) in [
             (json!({ "reasoning": false }), json!({})),
-            (json!({ "reasoning_options": [] }), json!({ "reasoning": true })),
+            (json!({ "reasoning_options": [] }), json!({ "reasoning": true,
+                "options": { "supportsReasoningEffort": false, "supportsThinkingToggle": false } })),
             (json!({ "reasoning_options": [{ "type": "effort", "values": ["max", "", null, 1] }] }),
-                json!({ "reasoning": true, "variants": { "max": { "reasoningEffort": "max" } } })),
+                json!({ "reasoning": true, "options": { "supportsReasoningEffort": true, "supportsThinkingToggle": false },
+                    "variants": { "max": { "reasoningEffort": "max" } } })),
         ] {
             let mut entry = fields;
             entry["id"] = json!("m");
-            let models = convert(&json!({ "data": [entry] }), Some(&meta), None);
+            let models = convert(&json!({ "data": [entry] }), Some(&meta), None, "");
             assert_eq!(models["m"], expected);
         }
         let models = convert(&json!({ "data": [{ "id": "custom", "reasoning_options": [
             { "type": "effort", "values": ["medium"] }
-        ] }] }), None, None);
+        ] }] }), None, None, "");
         assert_eq!(models["custom"]["variants"]["medium"]["reasoningEffort"], "medium");
         assert_eq!(models["custom"]["reasoning"], true);
         let models = convert(&json!({ "data": [{ "id": "custom", "reasoning_options": [
             { "type": "effort", "values": ["high"] }
-        ] }] }), Some(&json!({ "models": { "custom": { "reasoning": false } } })), None);
+        ] }] }), Some(&json!({ "models": { "custom": { "reasoning": false } } })), None, "");
         assert_eq!(models["custom"]["variants"]["high"]["reasoningEffort"], "high");
+    }
+
+    #[test]
+    fn native_model_constraints_are_scoped_to_the_endpoint() {
+        let meta = json!({ "models": {
+            "kimi-k2.6": { "reasoning": true, "reasoning_options": [{ "type": "toggle" }] },
+            "kimi-k2.7-code": { "reasoning": true, "reasoning_options": [] },
+            "kimi-k3": { "reasoning": true, "reasoning_options": [{ "type": "effort", "values": ["low", "high", "max"] }] },
+            "glm-5.3": { "reasoning": true, "reasoning_options": [{ "type": "effort", "values": ["low", "high", "max"] }] },
+            "qwen3.5-plus": { "reasoning": true, "reasoning_options": [{ "type": "toggle" }] },
+            "MiniMax-M3": { "reasoning": true, "reasoning_options": [{ "type": "toggle" }] },
+            "MiniMax-M3.1-Flash-Preview": { "reasoning": true, "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] }] }
+        }});
+        for (preset, id, format, toggle, effort) in [
+            ("moonshotai", "kimi-k2.6", "moonshot", true, false),
+            ("moonshotai-cn", "kimi-k2.7-code", "moonshot", false, false),
+            ("moonshotai", "kimi-k3", "kimi", false, true),
+            ("zai-coding-plan", "glm-5.3", "zai", false, true),
+            ("alibaba-cn", "qwen3.5-plus", "qwen", true, false),
+            ("minimax-cn", "MiniMax-M3", "minimax", true, false),
+            ("minimax-cn", "MiniMax-M3.1-Flash-Preview", "minimax", false, true),
+        ] {
+            let list = json!({ "data": [{ "id": id }] });
+            let models = convert(&list, Some(&meta), None, preset);
+            let config = json!({ "provider": { "p": { "api": DEFAULT_API,
+                "options": { "baseURL": "https://example.test", "temperature": 0.7, "topP": 0.3 }, "models": models } } });
+            let resolved = super::super::config::resolve_model(&config, Some(&format!("p/{id}")), &Default::default()).unwrap();
+            assert_eq!(resolved.model.thinking_format.as_deref(), Some(format), "{id}");
+            assert_eq!(resolved.model.supports_thinking_toggle, toggle, "{id}");
+            assert_eq!(resolved.model.supports_reasoning_effort, effort, "{id}");
+            assert_eq!(resolved.model.max_tokens_field, "max_tokens");
+            assert!(!resolved.model.extra_options.contains_key("supportsThinkingToggle"));
+            if id.starts_with("kimi") { assert_eq!(resolved.model.temperature, None); assert_eq!(resolved.model.top_p, None); }
+            let gateway = convert(&list, Some(&meta), None, "openai-compatible");
+            assert!(gateway[id].pointer("/options/thinkingFormat").is_none());
+        }
+    }
+
+    #[test]
+    fn live_list_and_openrouter_capabilities_override_the_catalog() {
+        let meta = json!({ "models": { "old": { "reasoning": true }, "fresh": { "tool_call": false } } });
+        assert!(convert(&json!({"data":[]}), Some(&meta), None, "openrouter").is_empty());
+        let models = convert(&json!({ "data": [
+            { "id": "fresh", "supported_parameters": ["tools", "reasoning"], "context_length": 1000000,
+                "top_provider": { "max_completion_tokens": 64000 }, "architecture": { "input_modalities": ["text", "image"] },
+                "reasoning": { "mandatory": true, "supported_efforts": ["none", "low", "high"], "default_effort": "high" } },
+            { "id": "embedding", "supported_parameters": [] }
+        ] }), Some(&meta), None, "openrouter");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models["fresh"]["limit"]["output"], 64000);
+        assert_eq!(models["fresh"]["modalities"]["input"], json!(["text", "image"]));
+        assert_eq!(models["fresh"]["options"]["thinkingFormat"], "openrouter");
+        assert_eq!(models["fresh"]["options"]["supportsThinkingToggle"], false);
+        assert_eq!(models["fresh"]["options"]["reasoningEffort"], "high");
+        assert!(models["fresh"]["variants"].get("none").is_none());
+        assert!(models["fresh"]["variants"].get("high").is_some());
+    }
+
+    #[test]
+    fn protocols_and_claude_thinking_follow_model_capabilities() {
+        let catalog = json!({ "anthropic": { "models": {
+            "claude-opus-5-5": { "reasoning": true, "reasoning_options": [{"type":"effort","values":["low","medium","high","xhigh","max"]}] },
+            "claude-opus-4-5": { "reasoning": true, "reasoning_options": [{"type":"effort","values":["low","medium","high"]},{"type":"budget_tokens","min":1024}] }
+        } } });
+        let models = convert(&json!({"data":[
+            {"id":"gpt-6-astra","supported_endpoints":["/chat/completions","/responses"]},
+            {"id":"gpt-6.1-sol","supported_endpoints":["/chat/completions"]},
+            {"id":"claude-opus-5-5","supported_endpoints":["/messages"]},
+            {"id":"claude-opus-4-5","supported_endpoints":["/messages"]}
+        ]}), None, Some(&catalog), "commandcode");
+        assert_eq!(models["gpt-6-astra"]["api"], "openai-responses");
+        assert!(!models.contains_key("gpt-6.1-sol"));
+        assert_eq!(models["claude-opus-5-5"]["options"]["thinkingFormat"], "anthropic");
+        assert_eq!(models["claude-opus-5-5"]["options"]["reasoningEffort"], "medium");
+        assert_eq!(models["claude-opus-5-5"]["options"]["supportsThinkingToggle"], false);
+        assert!(models["claude-opus-4-5"].pointer("/options/thinkingFormat").is_none());
+        let imported = convert_local(json!({"api":"anthropic-messages","options":{"baseURL":"https://proxy.example"},
+            "models":{"claude-opus-5-5":{"options":{"thinkingFormat":"custom"}}}}), "claude-opus-5-5", &Value::Null, Some(&catalog)).unwrap();
+        assert_eq!(imported["provider"]["models"]["claude-opus-5-5"]["options"]["thinkingFormat"], "custom");
+        assert_eq!(imported["model"], "claude-opus-5-5/variant/medium");
     }
 }

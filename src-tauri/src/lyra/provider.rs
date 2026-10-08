@@ -196,12 +196,23 @@ fn completions_messages(
                         .filter(|part| part.get("type").and_then(Value::as_str) == Some("thinking"))
                         .filter_map(|part| part.get("thinking").and_then(Value::as_str))
                         .collect::<Vec<_>>()
-                        .join("\n");
+                        .concat();
                     // DeepSeek/Console Go 的 thinking 模式要求每条带 tool_calls 的 assistant
                     // 历史都显式回传 reasoning_content；运行时合成工具调用可能只有决策轨迹。
                     if !thinking.is_empty() || !tool_calls.is_empty() {
                         item.insert("reasoning_content".into(), json!(thinking));
                     }
+                }
+                if model.thinking_format.as_deref() == Some("openrouter")
+                    && message["api"] == model.api && message["provider"] == model.provider && message["model"] == model.id {
+                    let details: Vec<Value> = content.iter().filter_map(|b| b["reasoningDetails"].as_array())
+                        .flatten().cloned().collect();
+                    if !details.is_empty() { item.insert("reasoning_details".into(), json!(details)); }
+                }
+                if model.thinking_format.as_deref() == Some("volcengine")
+                    && message["api"] == model.api && message["provider"] == model.provider && message["model"] == model.id {
+                    let encrypted: String = content.iter().filter_map(|b| b["encryptedContent"].as_str()).collect();
+                    if !encrypted.is_empty() { item.insert("encrypted_content".into(), json!(encrypted)); }
                 }
                 if !tool_calls.is_empty() {
                     item.insert("tool_calls".into(), Value::Array(tool_calls));
@@ -237,14 +248,15 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
     if !model.reasoning {
         return;
     }
-    let enabled = !matches!(level, Some("off"));
+    let level = level.filter(|l| !matches!(*l, "off" | "none") || model.supports_thinking_toggle);
+    let enabled = !matches!(level, Some("off" | "none"));
     match model.thinking_format.as_deref() {
-        Some("deepseek") | Some("zai") => {
-            body["thinking"] = json!({ "type": if enabled { "enabled" } else { "disabled" } });
-            // deepseek 等在 thinking.enabled 之外同时发送 reasoning_effort（如 max）。
-            if enabled && model.supports_reasoning_effort {
-                if let Some(level) = level {
-                    body["reasoning_effort"] = json!(level);
+        Some("deepseek" | "zai" | "moonshot" | "minimax" | "volcengine") => {
+            if model.supports_thinking_toggle || model.thinking_format.as_deref() == Some("minimax") {
+                let kind = if !enabled { "disabled" } else if model.thinking_format.as_deref() == Some("minimax") { "adaptive" } else { "enabled" };
+                // 保留 thinking.keep / clear_thinking 等私有配置；显式档位才覆盖手写开关。
+                if level.is_some() || body.pointer("/thinking/type").is_none() {
+                    body["thinking"]["type"] = json!(kind);
                 }
             }
         }
@@ -252,19 +264,25 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
         // kimi → 只发 reasoning_effort；qwen → enable_thinking 且中转普遍同时收 effort，
         // 端点只认 thinking_budget 时配 supportsReasoningEffort: false 关掉。
         Some("qwen") => {
-            body["enable_thinking"] = json!(enabled);
-            if enabled && model.supports_reasoning_effort {
-                if let Some(level) = level {
-                    body["reasoning_effort"] = json!(level);
-                }
+            if model.supports_thinking_toggle && (level.is_some() || body.get("enable_thinking").is_none()) {
+                body["enable_thinking"] = json!(enabled);
             }
         }
-        _ => {
-            if enabled {
-                if let Some(level) = level {
-                    body["reasoning_effort"] = json!(level);
-                }
+        Some("openrouter") => {
+            if level.is_some() || body.get("reasoning").is_none() {
+                body["reasoning"]["enabled"] = json!(enabled);
             }
+            if enabled && model.supports_reasoning_effort && body.pointer("/reasoning/max_tokens").is_none() {
+                if let Some(level) = level { body["reasoning"]["effort"] = json!(level); }
+            } else if !enabled {
+                if let Some(reasoning) = body["reasoning"].as_object_mut() { reasoning.remove("effort"); reasoning.remove("max_tokens"); }
+            }
+        }
+        _ => {}
+    }
+    if model.thinking_format.as_deref() != Some("openrouter") && model.supports_reasoning_effort {
+        if let Some(level) = level.filter(|l| enabled || *l == "none") {
+            body["reasoning_effort"] = json!(level);
         }
     }
     // 与 thinking_format 无关：显式配置即下发 thinking.clear_thinking（Some(false) =
@@ -517,16 +535,19 @@ fn responses_body(
     if !tool_defs.is_empty() {
         body["tools"] = Value::Array(tool_defs);
     }
+    let level = level.filter(|l| !matches!(*l, "off" | "none") || model.supports_thinking_toggle);
     if model.reasoning && level != Some("off") {
         // OpenAI Responses 只有显式请求 summary 才会流式返回
         // response.reasoning_summary_text.delta；仅发送 effort 会有推理开销但前端无内容可展示。
-        let mut reasoning = Map::new();
-        reasoning.insert("summary".into(), json!("auto"));
+        let mut reasoning = body["reasoning"].as_object().cloned().unwrap_or_default();
+        reasoning.entry("summary").or_insert_with(|| json!("auto"));
         if let Some(level) = level {
             reasoning.insert("effort".into(), json!(level));
         }
         body["reasoning"] = Value::Object(reasoning);
-        body["include"] = json!(["reasoning.encrypted_content"]);
+        let mut include = body["include"].as_array().cloned().unwrap_or_default();
+        if !include.iter().any(|v| v == "reasoning.encrypted_content") { include.push(json!("reasoning.encrypted_content")); }
+        body["include"] = json!(include);
     }
     if let Some(key) = session_id.and_then(clamp_prompt_cache_key) {
         body["prompt_cache_key"] = json!(key);
@@ -854,6 +875,7 @@ async fn stream_completions(
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
     let mut finish_reason: Option<String> = None;
+    let mut reasoning_details = Vec::new();
     let cancelled = read_sse(&mut response, cancel, |data| {
         if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
@@ -865,6 +887,7 @@ async fn stream_completions(
             && value.pointer("/choices/0/message").is_some()
         {
             let message = &value["choices"][0]["message"];
+            completion_reasoning(message, &mut result, &mut reasoning_details, on_event);
             if let Some(text) = message.get("content").and_then(Value::as_str) {
                 push_delta(&mut result, "text", text, on_event);
             }
@@ -906,12 +929,7 @@ async fn stream_completions(
             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                 push_delta(&mut result, "text", text, on_event);
             }
-            for field in ["reasoning_content", "reasoning", "reasoning_text"] {
-                if let Some(thinking) = delta.get(field).and_then(Value::as_str) {
-                    push_delta(&mut result, "thinking", thinking, on_event);
-                    break;
-                }
-            }
+            completion_reasoning(delta, &mut result, &mut reasoning_details, on_event);
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
                     let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -963,6 +981,9 @@ async fn stream_completions(
         Ok(())
     })
     .await?;
+    if !reasoning_details.is_empty() {
+        result.content.push(json!({ "type": "thinking", "thinking": "", "reasoningDetails": reasoning_details }));
+    }
     if cancelled {
         result.stop_reason = "aborted".into();
         return Ok(result);
@@ -979,6 +1000,33 @@ async fn stream_completions(
     result.stop_reason = stop;
     result.error_message = error;
     Ok(result)
+}
+
+// 同时覆盖 SSE 与代理的整包 JSON 回退，避免后者丢失工具调用所需的思考内容。
+fn completion_reasoning(delta: &Value, result: &mut StreamResult, details: &mut Vec<Value>, on_event: &mut (dyn FnMut(StreamEvent) + Send)) {
+    let text = ["reasoning_content", "reasoning", "reasoning_text"].iter().find_map(|field| delta[*field].as_str());
+    if let Some(text) = text { push_delta(result, "thinking", text, on_event); }
+    if let Some(encrypted) = delta["encrypted_content"].as_str().filter(|s| !s.is_empty()) {
+        result.content.push(json!({ "type": "thinking", "thinking": "", "encryptedContent": encrypted }));
+    }
+    for part in delta["reasoning_details"].as_array().into_iter().flatten().filter(|p| p.is_object()) {
+        if text.is_none() {
+            if let Some(text) = part["text"].as_str().or_else(|| part["summary"].as_str()) {
+                push_delta(result, "thinking", text, on_event);
+            }
+        }
+        // ponytail: 思考块通常只有数个，线性合并；大量交错块时改成按 index/id 建索引。
+        let existing = details.iter_mut().find(|old| old["type"] == part["type"] && old["format"] == part["format"]
+            && ((part["index"].is_number() && old["index"] == part["index"])
+                || (part["id"].is_string() && old["id"] == part["id"])));
+        if let Some(old) = existing {
+            for (key, value) in part.as_object().unwrap() {
+                if matches!(key.as_str(), "text" | "summary" | "data" | "signature") && value.is_string() {
+                    old[key] = json!(format!("{}{}", old[key].as_str().unwrap_or(""), value.as_str().unwrap()));
+                } else if !value.is_null() { old[key] = value.clone(); }
+            }
+        } else { details.push(part.clone()); }
+    }
 }
 
 async fn stream_responses(
@@ -1468,6 +1516,8 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                                 } else {
                                     json!({ "type": "thinking", "thinking": text, "signature": signature })
                                 });
+                            } else if same_model && model.thinking_format.as_deref() == Some("minimax") && block["redacted"] != true {
+                                parts.push(json!({ "type": "thinking", "thinking": text }));
                             } else if block["redacted"] != true && !text.trim().is_empty() {
                                 parts.push(json!({ "type": "text", "text": text }));
                             }
@@ -1578,11 +1628,21 @@ fn anthropic_body(
         }
     }
     budget_output_tokens(&mut body, model, "max_tokens");
+    let thinking_level = thinking_level.filter(|l| !matches!(*l, "off" | "none") || model.supports_thinking_toggle);
+    let minimax = model.thinking_format.as_deref() == Some("minimax");
     if matches!(thinking_level, Some("off" | "none")) {
         body["thinking"] = json!({ "type": "disabled" });
+    } else if minimax && model.reasoning {
+            if thinking_level.is_some() || body.pointer("/thinking/type").is_none() {
+                body["thinking"]["type"] = json!("adaptive");
+            }
+        if model.supports_reasoning_effort {
+            if let Some(level) = thinking_level { body["output_config"]["effort"] = json!(level); }
+        }
     } else if model.reasoning && body.get("thinking").is_none() {
         // ponytail: 无模型能力目录时仅识别已知 4.6 系列；新模型可显式配置 thinking.type。
-        let adaptive = model.id.contains("opus-4-6") || model.id.contains("opus-4.6")
+        let adaptive = model.thinking_format.as_deref() == Some("anthropic")
+            || model.id.contains("opus-4-6") || model.id.contains("opus-4.6")
             || model.id.contains("sonnet-4-6") || model.id.contains("sonnet-4.6");
         if adaptive {
             body["thinking"] = json!({ "type": "adaptive" });
@@ -1590,13 +1650,15 @@ fn anthropic_body(
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
     }
-    if body["thinking"]["type"] == "adaptive" && body.pointer("/output_config/effort").is_none() {
-        let effort = match thinking_level.unwrap_or("high") {
+    if !minimax && body["thinking"]["type"] == "adaptive" && body.pointer("/output_config/effort").is_none() {
+        let effort = if model.thinking_format.as_deref() == Some("anthropic") {
+            thinking_level.unwrap_or("high")
+        } else { match thinking_level.unwrap_or("high") {
             "minimal" | "low" => "low",
             "medium" => "medium",
             "max" | "xhigh" if model.id.contains("opus") => "max",
             _ => "high",
-        };
+        } };
         body["output_config"]["effort"] = json!(effort);
     }
     if body["thinking"]["type"] == "enabled" {
@@ -1608,7 +1670,7 @@ fn anthropic_body(
         }
     }
     let thinking = matches!(body["thinking"]["type"].as_str(), Some("enabled" | "adaptive"));
-    if thinking {
+    if thinking && !minimax {
         // pi 默认请求可见摘要；保留用户显式的 omitted，不展示加密签名。
         if body["thinking"].get("display").is_none() {
             body["thinking"]["display"] = json!("summarized");
@@ -1987,7 +2049,7 @@ mod tests {
         let mut model = test_model("openai-completions");
         model.context_window = 1_048_576;
         model.max_output_tokens = 943_718;
-        let messages = vec![json!({"role":"user", "content":"x".repeat(120_000)})];
+        let messages = vec![json!({"role":"user", "content":"x".repeat(360_000)})];
         for (body, field) in [
             (completions_body(&model, "sys", &messages, &[], None, None), "max_completion_tokens"),
             (responses_body(&model, "sys", &messages, &[], None, None), "max_output_tokens"),
@@ -2034,6 +2096,7 @@ mod tests {
             session_affinity_format: "openai".into(),
             supports_long_cache_retention: true,
             supports_reasoning_effort: true,
+            supports_thinking_toggle: true,
             clear_thinking: None,
             extra_options: Map::new(),
             proxy: None,
@@ -2560,7 +2623,7 @@ mod tests {
     }
 
     #[test]
-    fn zai_thinking_sends_clear_thinking_and_suppresses_reasoning_content() {
+    fn zai_thinking_sends_clear_thinking() {
         let mut model = test_model("openai-completions");
         model.thinking_format = Some("zai".into());
         model.clear_thinking = Some(true);
@@ -2622,6 +2685,9 @@ mod tests {
         model.thinking_format = Some("kimi".into());
         let mut body = json!({});
         apply_reasoning_completions(&mut body, &model, Some("max"));
+        assert!(body.get("reasoning_effort").is_none());
+        model.supports_reasoning_effort = true;
+        apply_reasoning_completions(&mut body, &model, Some("max"));
         assert_eq!(body["reasoning_effort"], json!("max"));
         assert!(body.get("thinking").is_none());
         assert!(body.get("enable_thinking").is_none());
@@ -2636,6 +2702,110 @@ mod tests {
         );
         assert_eq!(anthropic_thinking_budget(Some("xhigh"), 8_000), Some(6_976));
         assert_eq!(anthropic_thinking_budget(None, 32_000), Some(16384));
+    }
+
+    #[test]
+    fn private_thinking_parameters_preserve_options_and_mandatory_reasoning() {
+        let mut model = test_model("openai-completions");
+        model.thinking_format = Some("moonshot".into());
+        model.supports_reasoning_effort = false;
+        let mut body = json!({ "thinking": { "type": "enabled", "keep": "all" } });
+        apply_reasoning_completions(&mut body, &model, Some("high"));
+        assert_eq!(body["thinking"]["keep"], "all");
+        assert!(body.get("reasoning_effort").is_none());
+        model.supports_thinking_toggle = false;
+        for format in ["moonshot", "kimi", "zai", "qwen", "openrouter", "minimax"] {
+            model.thinking_format = Some(format.into());
+            let mut body = json!({});
+            apply_reasoning_completions(&mut body, &model, Some("off"));
+            assert_ne!(body["thinking"]["type"], "disabled", "{format}");
+            assert_ne!(body["enable_thinking"], false, "{format}");
+            assert_ne!(body["reasoning"]["enabled"], false, "{format}");
+            assert!(body.get("reasoning_effort").is_none(), "{format}");
+        }
+        model.supports_thinking_toggle = true;
+        model.thinking_format = Some("qwen".into());
+        let mut body = json!({"enable_thinking":false,"thinking_budget":2048});
+        apply_reasoning_completions(&mut body, &model, None);
+        assert_eq!(body["enable_thinking"], false);
+        assert_eq!(body["thinking_budget"], 2048);
+        model.thinking_format = Some("openrouter".into());
+        model.supports_reasoning_effort = true;
+        let mut body = json!({"reasoning":{"exclude":false,"context":"all_turns"}});
+        apply_reasoning_completions(&mut body, &model, Some("high"));
+        assert_eq!(body["reasoning"], json!({"enabled":true,"effort":"high","exclude":false,"context":"all_turns"}));
+        assert!(body.get("reasoning_effort").is_none());
+        apply_reasoning_completions(&mut body, &model, Some("none"));
+        assert_eq!(body["reasoning"]["enabled"], false);
+        assert!(body["reasoning"].get("effort").is_none());
+    }
+
+    #[test]
+    fn minimax_anthropic_uses_adaptive_thinking_and_replays_unsigned_blocks() {
+        let mut model = test_model("anthropic-messages");
+        model.thinking_format = Some("minimax".into());
+        model.supports_reasoning_effort = false;
+        model.supports_thinking_toggle = false;
+        let body = anthropic_body(&model, "", &[], &[], Some("off"));
+        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+        assert!(body.get("output_config").is_none());
+        model.supports_reasoning_effort = true;
+        assert_eq!(anthropic_body(&model, "", &[], &[], Some("xhigh"))["output_config"]["effort"], "xhigh");
+        let message = json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,
+            "content":[{"type":"thinking","thinking":"original"}]});
+        assert_eq!(anthropic_messages(&[message], &model)[0]["content"][0], json!({"type":"thinking","thinking":"original"}));
+    }
+
+    #[test]
+    fn completion_reasoning_roundtrips_text_and_openrouter_details() {
+        let mut result = StreamResult::empty();
+        let mut details = Vec::new();
+        for delta in [
+            json!({"reasoning":"part 1","reasoning_details":[{"type":"reasoning.text","index":0,"text":"part 1","signature":null}]}),
+            json!({"reasoning":"part 2","reasoning_details":[{"type":"reasoning.text","index":0,"text":"part 2","signature":"sig"}]}),
+            json!({"reasoning_details":[{"type":"reasoning.encrypted","index":1,"data":"encrypted"}]})
+        ] { completion_reasoning(&delta, &mut result, &mut details, &mut |_| {}); }
+        assert_eq!(result.content[0]["thinking"], "part 1part 2");
+        assert_eq!(details, vec![json!({"type":"reasoning.text","index":0,"text":"part 1part 2","signature":"sig"}),
+            json!({"type":"reasoning.encrypted","index":1,"data":"encrypted"})]);
+        result.content.push(json!({"type":"thinking","thinking":"","reasoningDetails":details}));
+        let mut model = test_model("openai-completions");
+        model.thinking_format = Some("openrouter".into());
+        let message = json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,"content":result.content});
+        assert_eq!(completions_messages("", &[message.clone()], &model)[1]["reasoning_details"], json!(details));
+        model.id = "another-model".into();
+        assert!(completions_messages("", &[message], &model)[1].get("reasoning_details").is_none());
+        let mut result = StreamResult::empty();
+        completion_reasoning(&json!({"reasoning_content":"original\ntext"}), &mut result, &mut Vec::new(), &mut |_| {});
+        model.requires_reasoning_content = true;
+        result.content.push(json!({"type":"thinking","thinking":"tail"}));
+        assert_eq!(completions_messages("", &[json!({"role":"assistant","content":result.content})], &model)[1]["reasoning_content"], "original\ntexttail");
+    }
+
+    #[test]
+    fn responses_private_options_and_volcengine_encrypted_content_survive() {
+        let mut model = test_model("openai-responses");
+        model.extra_options.insert("reasoning".into(), json!({"mode":"pro","context":"all_turns","summary":"detailed"}));
+        model.extra_options.insert("include".into(), json!(["web_search_call.action.sources"]));
+        let body = responses_body(&model, "", &[], &[], Some("high"), None);
+        assert_eq!(body["reasoning"], json!({"mode":"pro","context":"all_turns","summary":"detailed","effort":"high"}));
+        assert_eq!(body["include"], json!(["web_search_call.action.sources","reasoning.encrypted_content"]));
+        model.api = "openai-completions".into();
+        model.thinking_format = Some("volcengine".into());
+        let mut result = StreamResult::empty();
+        for part in ["opaque", "-data"] {
+            completion_reasoning(&json!({"encrypted_content":part}), &mut result, &mut Vec::new(), &mut |_| {});
+        }
+        let message = json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,"content":result.content});
+        assert_eq!(completions_messages("", &[message.clone()], &model)[1]["encrypted_content"], "opaque-data");
+        model.id = "different".into();
+        assert!(completions_messages("", &[message], &model)[1].get("encrypted_content").is_none());
+        model.api = "anthropic-messages".into();
+        model.thinking_format = Some("anthropic".into());
+        let body = anthropic_body(&model, "", &[], &[], Some("xhigh"));
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert!(body["thinking"].get("budget_tokens").is_none());
     }
 
     #[test]

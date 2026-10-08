@@ -539,6 +539,7 @@ pub(crate) mod tests {
                 session_affinity_format: "openai".into(),
                 supports_long_cache_retention: false,
                 supports_reasoning_effort: false,
+                supports_thinking_toggle: true,
                 clear_thinking: None,
                 extra_options: serde_json::Map::new(),
                 proxy: None,

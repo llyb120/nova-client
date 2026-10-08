@@ -101,6 +101,8 @@ pub struct ResolvedModel {
     /// 控制思考强度的协议字段。deepseek/zai 发 thinking.type；GLM-5.2+ / deepseek 同时发
     /// reasoning_effort。端点不支持时可用 options.supportsReasoningEffort 关掉。
     pub supports_reasoning_effort: bool,
+    /// 强制思考模型不能发送 disabled / none（标题与补全请求也必须遵守）。
+    pub supports_thinking_toggle: bool,
     /// 是否下发 thinking.clear_thinking（控制服务端是否抹掉历史 reasoning_content）。
     /// None 表示不下发、由端点默认值决定（GLM 标准端点默认 true=清除）；
     /// Some(false) 开启 Preserved Thinking，需同时回传 reasoning_content。
@@ -349,6 +351,7 @@ const RESERVED_OPTION_KEYS: &[&str] = &[
     "requiresReasoningContentOnAssistantMessages",
     "supportsLongCacheRetention",
     "supportsReasoningEffort",
+    "supportsThinkingToggle",
     "clearThinking",
     "proxy",
 ];
@@ -545,7 +548,8 @@ pub fn resolve_model(
             .and_then(|variant| variant.get("reasoningEffort"))
             .and_then(Value::as_str)
             .map(str::to_string)
-    });
+    }).or_else(|| model.pointer("/options/reasoningEffort").or_else(|| provider.pointer("/options/reasoningEffort"))
+        .and_then(Value::as_str).map(str::to_string));
     let reasoning = model
         .get("reasoning")
         .and_then(Value::as_bool)
@@ -598,13 +602,8 @@ pub fn resolve_model(
             }
         }
     }
-    // 保留历史思维链必须同时回传 reasoning_content，否则服务端拼不回原序列；
-    // 反向若确定要清除，回传只是白烧 input token。
-    let requires_reasoning_content = match clear_thinking {
-        Some(true) => false,
-        Some(false) => true,
-        None => requires_reasoning_content,
-    };
+    // clear_thinking 清除先前轮次，不免除当前工具调用链的 reasoning_content 回传要求。
+    let requires_reasoning_content = requires_reasoning_content || clear_thinking == Some(false);
     Ok(Resolved {
         model: ResolvedModel {
             provider: provider_id.to_string(),
@@ -639,6 +638,7 @@ pub fn resolve_model(
             },
             supports_long_cache_retention,
             supports_reasoning_effort,
+            supports_thinking_toggle: compat_flag(model, provider, "supportsThinkingToggle").unwrap_or(true),
             clear_thinking,
             extra_options,
             proxy: resolve_proxy(model, provider, env)?,
