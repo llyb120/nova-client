@@ -2461,6 +2461,8 @@ fn effort_label(effort: &str) -> String {
         "medium" => "Medium",
         "high" => "High",
         "xhigh" => "XHigh",
+        "max" => "Max",
+        "ultra" => "Ultra",
         other => other,
     }
     .to_string()

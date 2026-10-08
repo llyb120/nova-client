@@ -6,7 +6,7 @@ import type { SelectOption } from "./components/SearchSelect";
 export function splitEffort(value: string, lyra: boolean): [string, string] | null {
   const m = lyra
     ? value.match(/^(.+)\/variant\/([^/]+)$/)
-    : value.match(/^(.+):(none|minimal|default|low|medium|high|xhigh|max)$/);
+    : value.match(/^(.+):(none|minimal|default|low|medium|high|xhigh|max|ultra)$/);
   return m ? [m[1], m[2]] : null;
 }
 
