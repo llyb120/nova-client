@@ -37,6 +37,7 @@ import {
   setThreadReasoningEffort,
   sendPrompt,
   setView,
+  STAGE_COMMAND_PATTERN,
   state,
 } from "../store";
 import type { AgentKind, PromptImage } from "../types";
@@ -397,7 +398,8 @@ export function Composer() {
     });
   };
 
-  // 运行中第一次回车只排队；队列可立即引导，或在当前任务结束后自动发送。
+  // Stage 独立启动，无需等待当前会话结束；普通提示词仍在运行中默认排队。
+  const shouldQueue = (value: string) => running() && !STAGE_COMMAND_PATTERN.test(value);
   const submit = () => {
     const value = text().trim();
     if (empty()) return;
@@ -406,7 +408,7 @@ export function Composer() {
     if (!currentId) return;
     rememberPromptHistory(value, images);
     clearInput();
-    if (running()) {
+    if (shouldQueue(value)) {
       enqueuePrompt(currentId, value, images);
       return;
     }
@@ -843,7 +845,7 @@ export function Composer() {
             class="composer-btn send"
             disabled={empty()}
             onClick={submit}
-            title={running() ? "加入提示词队列" : "发送"}
+            title={shouldQueue(text().trim()) ? "加入提示词队列" : "发送"}
           >
             <IconSend size={16} />
           </button>

@@ -2112,8 +2112,10 @@ export async function startWorkflowOnThread(
 
 type StageInput = { currentPrompt: string; stagePrompt: string; stageIndex: number };
 
+export const STAGE_COMMAND_PATTERN = /(^|\s)\/stage(\d*)(?:[ \t]+|(?=\r?\n)|$)/i;
+
 function parseStageInput(input: string): StageInput | null {
-  const match = /(^|\s)\/stage(\d*)(?:[ \t]+|(?=\r?\n)|$)/i.exec(input);
+  const match = STAGE_COMMAND_PATTERN.exec(input);
   if (!match) return null;
   const commandStart = match.index + match[1].length;
   const stageNumber = match[2] ? Number(match[2]) : 1;
