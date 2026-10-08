@@ -480,7 +480,13 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_i
         if image {
             model["modalities"] = json!({ "input": ["text", "image"] });
         }
-        if let Some(info) = info {
+        // `-fast` / `-paid` / `:free` 只是同一模型的计费/速度档，目录里没有独立条目时
+        // 借用基础模型的推理能力（不借上下文、模态，那些可能因档位而异）。
+        let reasoning_info = info.or_else(|| {
+            let base = ["-fast", "-paid", ":free"].iter().find_map(|s| id.strip_suffix(s))?;
+            catalog_model(catalog, base)
+        });
+        if let Some(info) = reasoning_info {
             // DeepSeek、GLM、Kimi 等要求多轮里回传 reasoning_content，否则报错或丢思维链。
             if info.pointer("/interleaved/field") == Some(&json!("reasoning_content")) {
                 model["options"] = json!({ "requiresReasoningContentOnAssistantMessages": true });
@@ -488,7 +494,7 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_i
         }
         // /models 显式声明优先，缺失时才补目录信息；兼容 provider 也走同一条路径。
         let reasoning_options = entry["reasoning_options"].as_array()
-            .or_else(|| info.and_then(|i| i["reasoning_options"].as_array()));
+            .or_else(|| reasoning_info.and_then(|i| i["reasoning_options"].as_array()));
         let efforts = reasoning_options.into_iter().flatten()
             .find(|o| o["type"] == "effort")
             .and_then(|o| o["values"].as_array());
@@ -506,7 +512,7 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_i
         let reasoning = entry["reasoning"].as_bool()
             .or(router_reasoning.map(|_| true))
             .or(entry["reasoning_options"].as_array().filter(|o| !o.is_empty()).map(|_| true))
-            .or_else(|| info.and_then(|i| i["reasoning"].as_bool()))
+            .or_else(|| reasoning_info.and_then(|i| i["reasoning"].as_bool()))
             .unwrap_or(!variants.is_empty());
         if reasoning {
             model["reasoning"] = json!(true);
@@ -949,6 +955,8 @@ env_key = "TEST_KEY"
             {"id":"claude-opus-5-5","supported_endpoints":["/messages"]},
             {"id":"claude-opus-4-5","supported_endpoints":["/messages"]}
         ]}), None, Some(&catalog), "commandcode");
+        let fast = convert(&json!({"data":[{"id":"claude-opus-5-5-fast","supported_endpoints":["/messages"]}]}), None, Some(&catalog), "commandcode");
+        assert_eq!(fast["claude-opus-5-5-fast"]["variants"]["high"]["reasoningEffort"], "high");
         assert_eq!(models["gpt-6-astra"]["api"], "openai-responses");
         assert!(!models.contains_key("gpt-6.1-sol"));
         assert_eq!(models["claude-opus-5-5"]["options"]["thinkingFormat"], "anthropic");
