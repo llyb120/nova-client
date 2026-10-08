@@ -2251,8 +2251,9 @@ impl CodexManager {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             match store.get(thread_id) {
-                Some(t) => t.title.clone(),
-                None => return,
+                // 员工会话结束不打扰，需要决策时由 employee ask 单独通知。
+                Some(t) if !t.employee_thread => t.title.clone(),
+                _ => return,
             }
         };
         let body = match stop_reason {
