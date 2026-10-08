@@ -369,7 +369,10 @@ pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
         let cache = config_cache().lock().unwrap();
         if let Some(cached) = cache.as_ref() {
             if cached.path == path && cached.mtime == mtime {
-                return Ok(cached.config.clone());
+                let mut config = cached.config.clone();
+                drop(cache);
+                crate::lyra::presets::expand(&mut config, data_dir);
+                return Ok(config);
             }
         }
     }
@@ -388,12 +391,13 @@ pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
     {
         return Err("Lyra 配置缺少 provider".into());
     }
-    crate::lyra::presets::expand(&mut config, data_dir);
     *config_cache().lock().unwrap() = Some(CachedConfig {
         path,
         mtime,
         config: config.clone(),
     });
+    // 缓存原始配置；本地 CLI 的地址、认证和模型选择每次使用时重新读取。
+    crate::lyra::presets::expand(&mut config, data_dir);
     Ok(config)
 }
 
@@ -642,41 +646,41 @@ pub(crate) fn parse_jsonc(text: &str) -> Result<Value, String> {
 
 fn strip_json_comments(text: &str) -> String {
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut out = Vec::with_capacity(text.len());
     let mut i = 0;
     let mut in_string = false;
     let mut escaped = false;
     while i < bytes.len() {
-        let c = bytes[i] as char;
+        let c = bytes[i];
         if in_string {
             out.push(c);
             if escaped {
                 escaped = false;
-            } else if c == '\\' {
+            } else if c == b'\\' {
                 escaped = true;
-            } else if c == '"' {
+            } else if c == b'"' {
                 in_string = false;
             }
             i += 1;
             continue;
         }
-        if c == '"' {
+        if c == b'"' {
             in_string = true;
             out.push(c);
             i += 1;
             continue;
         }
-        if c == '/' && bytes.get(i + 1) == Some(&b'/') {
+        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
             continue;
         }
-        if c == '/' && bytes.get(i + 1) == Some(&b'*') {
+        if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
             i += 2;
             while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 if bytes[i] == b'\n' {
-                    out.push('\n');
+                    out.push(b'\n');
                 }
                 i += 1;
             }
@@ -686,36 +690,36 @@ fn strip_json_comments(text: &str) -> String {
         out.push(c);
         i += 1;
     }
-    out
+    String::from_utf8(out).expect("删除完整注释不会破坏 UTF-8")
 }
 
 fn strip_trailing_commas(text: &str) -> String {
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut out = Vec::with_capacity(text.len());
     let mut i = 0;
     let mut in_string = false;
     let mut escaped = false;
     while i < bytes.len() {
-        let c = bytes[i] as char;
+        let c = bytes[i];
         if in_string {
             out.push(c);
             if escaped {
                 escaped = false;
-            } else if c == '\\' {
+            } else if c == b'\\' {
                 escaped = true;
-            } else if c == '"' {
+            } else if c == b'"' {
                 in_string = false;
             }
             i += 1;
             continue;
         }
-        if c == '"' {
+        if c == b'"' {
             in_string = true;
             out.push(c);
             i += 1;
             continue;
         }
-        if c == ',' {
+        if c == b',' {
             let mut next = i + 1;
             while next < bytes.len() && bytes[next].is_ascii_whitespace() {
                 next += 1;
@@ -728,7 +732,7 @@ fn strip_trailing_commas(text: &str) -> String {
         out.push(c);
         i += 1;
     }
-    out
+    String::from_utf8(out).expect("删除 ASCII 逗号不会破坏 UTF-8")
 }
 
 #[cfg(test)]
@@ -751,6 +755,16 @@ mod tests {
                 .and_then(Value::as_str),
             Some("@ai-sdk/openai-compatible")
         );
+        let unicode = parse_jsonc(r#"{
+            // 中文注释
+            "provider": { "本地": { "name": "本地 Codex 🧭", "path": "C:\\用户\\配置", }, },
+            /* 多行
+               注释 */
+            "模型": ["中文模型", "https://example.com/a//b/*c*/", "引号\"与逗号,}",],
+        }"#).unwrap();
+        assert_eq!(unicode["provider"]["本地"]["name"], "本地 Codex 🧭");
+        assert_eq!(unicode["provider"]["本地"]["path"], "C:\\用户\\配置");
+        assert_eq!(unicode["模型"], json!(["中文模型", "https://example.com/a//b/*c*/", "引号\"与逗号,}"]));
     }
 
     #[test]
