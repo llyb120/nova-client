@@ -1189,6 +1189,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // images cache
   const imgCache = new Map<string, HTMLImageElement>();
+  const IMAGE_CACHE_KEEP = 48;
+  let imageRebuildTimer: number | undefined;
   const paintedImageSources = new Set<string>();
   const imageSizes = new Map<string, Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">>();
   const toolTextLayouts = new LruMap<string, { lines: string[]; seps: string[] }>(32);
@@ -2197,7 +2199,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
 
     // 离开视口的原图释放解码内存；保留轻量尺寸，回来时不会重新变成占位布局。
+    // 超过上限才按 LRU 淘汰：略微滚出视口又滚回时不必重新解码（否则每次都会闪空白）。
     for (const [source, image] of imgCache) {
+      if (imgCache.size <= IMAGE_CACHE_KEEP) break;
       if (paintedImageSources.has(source)) continue;
       image.onload = null;
       image.src = "";
@@ -3560,15 +3564,28 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   function loadImageSource(src: string): HTMLImageElement | null {
     paintedImageSources.add(src);
     let el = imgCache.get(src);
-    if (el) return (el as unknown as { _loaded?: boolean })._loaded ? el : null;
+    if (el) {
+      // 刷新 LRU 顺序：Map 迭代按插入序，近期画过的图排在末尾。
+      imgCache.delete(src);
+      imgCache.set(src, el);
+      return (el as unknown as { _loaded?: boolean })._loaded ? el : null;
+    }
     el = new Image();
     (el as unknown as { _loaded?: boolean })._loaded = false;
-    el.onload = () => {
-      if (disposed || imgCache.get(src) !== el) return;
-      (el as unknown as { _loaded?: boolean })._loaded = true;
-      imageSizes.set(src, { naturalWidth: el.naturalWidth, naturalHeight: el.naturalHeight });
-      scheduleRebuild();
+    const image = el;
+    const ready = () => {
+      if (disposed || imgCache.get(src) !== image) return;
+      (image as unknown as { _loaded?: boolean })._loaded = true;
+      const prev = imageSizes.get(src);
+      imageSizes.set(src, { naturalWidth: image.naturalWidth, naturalHeight: image.naturalHeight });
+      // 回滚重新加载的图尺寸不变，只需重绘；首次加载按 60ms 合并成一次重排，避免多图逐张跳动。
+      if (prev?.naturalWidth === image.naturalWidth && prev.naturalHeight === image.naturalHeight) requestPaint();
+      else if (imageRebuildTimer === undefined) {
+        imageRebuildTimer = window.setTimeout(() => { imageRebuildTimer = undefined; if (!disposed) scheduleRebuild(); }, 60);
+      }
     };
+    // 先解码再入画：同步解码会在 drawImage 时卡住一帧。
+    image.onload = () => { image.decode().then(ready, ready); };
     el.src = src;
     imgCache.set(src, el);
     return null;
