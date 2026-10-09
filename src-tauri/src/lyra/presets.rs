@@ -71,7 +71,9 @@ fn convert_local(mut provider: Value, selected: &str, list: &Value, catalog: Opt
     for (id, model) in &mut models {
         if model["reasoning"] == true {
             configure_reasoning(model, id, provider["api"].as_str().unwrap_or(DEFAULT_API), preset_id,
-                catalog_model(catalog, id).and_then(|info| info["reasoning_options"].as_array()));
+                entries.iter().find(|entry| entry["id"] == id.as_str())
+                    .and_then(|entry| entry["reasoning_options"].as_array())
+                    .or_else(|| reasoning_catalog_model(catalog, id).and_then(|info| info["reasoning_options"].as_array())));
         }
     }
     merge_local_models(&mut models, &explicit);
@@ -278,7 +280,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         // 转换规则升级：旧缓存缺少模型私有参数，不能继续沿用六小时。
         let headers = provider["options"]["headers"].to_string();
         let local_models = if local_source(preset.id).is_some() { provider["models"].to_string() } else { String::new() };
-        let print = fingerprint(&["4", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
+        let print = fingerprint(&["5", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
         let entry = &cache[id.as_str()];
         if !force
             && entry["fingerprint"] == print.as_str()
@@ -394,6 +396,14 @@ fn catalog_model<'a>(catalog: Option<&'a Value>, id: &str) -> Option<&'a Value> 
         .map(|(_, model)| model)
 }
 
+// 只借用基础模型的推理能力，不借上下文、模态等可能因变体而异的元数据。
+fn reasoning_catalog_model<'a>(catalog: Option<&'a Value>, id: &str) -> Option<&'a Value> {
+    catalog_model(catalog, id).or_else(|| {
+        let base = ["[1m]", "-1m", "-fast", "-paid", ":free"].iter().find_map(|s| id.strip_suffix(s))?;
+        catalog_model(catalog, base)
+    })
+}
+
 /// models.dev 的 npm 包名 → Lyra 协议；Google 原生协议不支持，返回 None。
 fn npm_api(npm: &str) -> Option<&'static str> {
     match npm {
@@ -480,12 +490,7 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_i
         if image {
             model["modalities"] = json!({ "input": ["text", "image"] });
         }
-        // `-fast` / `-paid` / `:free` 只是同一模型的计费/速度档，目录里没有独立条目时
-        // 借用基础模型的推理能力（不借上下文、模态，那些可能因档位而异）。
-        let reasoning_info = info.or_else(|| {
-            let base = ["-fast", "-paid", ":free"].iter().find_map(|s| id.strip_suffix(s))?;
-            catalog_model(catalog, base)
-        });
+        let reasoning_info = info.or_else(|| reasoning_catalog_model(catalog, id));
         if let Some(info) = reasoning_info {
             // DeepSeek、GLM、Kimi 等要求多轮里回传 reasoning_content，否则报错或丢思维链。
             if info.pointer("/interleaved/field") == Some(&json!("reasoning_content")) {
@@ -539,6 +544,7 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_i
 // 官方文档及未覆盖的端点见 docs/lyra-provider-models.md。
 fn configure_reasoning(model: &mut Value, id: &str, api: &str, preset_id: &str, capabilities: Option<&Vec<Value>>) {
     let id = id.to_ascii_lowercase();
+    let id = id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m")).unwrap_or(&id);
     let format = if api == "anthropic-messages" && id.contains("claude")
         && capabilities.is_some_and(|c| c.iter().any(|c| c["type"] == "effort")
             && (!c.iter().any(|c| c["type"] == "budget_tokens")
@@ -594,7 +600,7 @@ fn configure_reasoning(model: &mut Value, id: &str, api: &str, preset_id: &str, 
     // K2.x 不接受 reasoning_effort；K3 不接受 K2.x 的 thinking 参数。
     if matches!(format, Some("moonshot")) {
         options.insert("supportsReasoningEffort".into(), json!(false));
-        options.insert("supportsThinkingToggle".into(), json!(matches!(id.as_str(), "kimi-k2.5" | "kimi-k2.6")));
+        options.insert("supportsThinkingToggle".into(), json!(matches!(id, "kimi-k2.5" | "kimi-k2.6")));
     }
     if format == Some("kimi") { options.insert("supportsThinkingToggle".into(), json!(false)); }
     if matches!(format, Some("moonshot" | "kimi")) {
@@ -941,6 +947,58 @@ env_key = "TEST_KEY"
         assert_eq!(models["fresh"]["options"]["reasoningEffort"], "high");
         assert!(models["fresh"]["variants"].get("none").is_none());
         assert!(models["fresh"]["variants"].get("high").is_some());
+    }
+
+    #[test]
+    fn local_claude_1m_models_inherit_reasoning_and_remain_selectable() {
+        let catalog = json!({"anthropic":{"models":{
+            "claude-haiku-5-5":{"reasoning":true,"reasoning_options":[
+                {"type":"effort","values":["low","medium","high","xhigh","max"]}
+            ]},
+            "claude-sonnet-4-6":{"reasoning":true,"reasoning_options":[
+                {"type":"effort","values":["low","medium","high","max"]},{"type":"budget_tokens","min":1024}
+            ]},
+            "claude-haiku-4-5":{"reasoning":true,"reasoning_options":[{"type":"budget_tokens","min":1024}]}
+        }}});
+        for base in ["claude-haiku-5-5", "claude-sonnet-4-6", "claude-haiku-4-5"] {
+            for suffix in ["[1m]", "-1m"] {
+                let id = format!("{base}{suffix}");
+                // 复现本地配置独有的 1M ID：/models 只返回原模型，变体由本地配置追加。
+                let provider = json!({"api":"anthropic-messages","options":{"baseURL":"https://proxy.example"},
+                    "models":{id.clone():{}}});
+                let imported = convert_local(provider.clone(), &id, &json!({"data":[{"id":base}]}), Some(&catalog)).unwrap();
+                let models = &imported["provider"]["models"];
+                for field in ["reasoning", "variants", "options"] {
+                    assert_eq!(models[&id][field], models[base][field], "{id}: {field}");
+                }
+                let config = json!({"provider":{"local":imported["provider"]}});
+                let choices = super::super::config::model_options(&config);
+                if base == "claude-haiku-4-5" {
+                    assert!(models[&id].get("variants").is_none(), "无档位的原模型不能凭空补档位");
+                    assert!(choices.iter().any(|o| o["value"] == format!("local/{id}")));
+                    continue;
+                }
+                assert!(choices.iter().any(|o| o["value"] == format!("local/{id}/variant/high")));
+                assert_eq!(models[&id]["options"]["thinkingFormat"], "anthropic");
+                let default = if base == "claude-haiku-5-5" { "medium" } else { "high" };
+                assert_eq!(imported["model"], format!("{id}/variant/{default}"));
+                // 普通 provider 走相同继承路径；显式 API 能力优先于原模型。
+                let mut entry = json!({"id":id,"supported_endpoints":["/messages"],"context_length":1_000_000});
+                let direct = convert(&json!({"data":[entry]}), None, Some(&catalog), "commandcode");
+                assert_eq!(direct[&id]["variants"], models[&id]["variants"]);
+                assert_eq!(direct[&id]["options"], models[&id]["options"]);
+                assert_eq!(direct[&id]["limit"]["context"], 1_000_000);
+                entry["reasoning_options"] = json!([{"type":"effort","values":["max"]}]);
+                let explicit = convert_local(provider, &id, &json!({"data":[entry]}), Some(&catalog)).unwrap();
+                let model = &explicit["provider"]["models"][&id];
+                assert_eq!(model["variants"], json!({"max":{"reasoningEffort":"max"}}));
+                assert!(model["options"].get("reasoningEffort").is_none(), "不能下发显式能力以外的默认档位");
+            }
+        }
+        let exact = json!({"anthropic":{"models":{
+            "claude-haiku-5-5":{"reasoning":true}, "claude-haiku-5-5[1m]":{"reasoning":false}
+        }}});
+        assert_eq!(reasoning_catalog_model(Some(&exact), "claude-haiku-5-5[1m]").unwrap()["reasoning"], false);
     }
 
     #[test]

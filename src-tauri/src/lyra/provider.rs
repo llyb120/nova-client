@@ -1568,7 +1568,8 @@ fn anthropic_body(
     thinking_level: Option<&str>,
 ) -> Value {
     let mut body = json!({
-        "model": model.id,
+        // `[1m]` 是 Claude Code 的本地写法：真实 ID 不带它，改用 context-1m beta 头开启。
+        "model": model.id.strip_suffix("[1m]").unwrap_or(&model.id),
         "max_tokens": model.max_output_tokens,
         "messages": anthropic_messages(messages, model),
         "stream": true,
@@ -1773,6 +1774,9 @@ async fn stream_anthropic(
     let mut betas: Vec<&str> = Vec::new();
     if thinking_enabled {
         betas.push("interleaved-thinking-2025-05-14");
+    }
+    if model.id.ends_with("[1m]") {
+        betas.push("context-1m-2025-08-07");
     }
     if oauth {
         betas.push("oauth-2025-04-20");
@@ -2617,6 +2621,8 @@ mod tests {
         assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
         let empty = anthropic_body(&model, "", &[], &[], None);
         assert_eq!(empty["messages"], json!([]));
+        model.id = "claude-haiku-5-5[1m]".into();
+        assert_eq!(anthropic_body(&model, "", &[], &[], None)["model"], "claude-haiku-5-5", "中转不认 [1m] 后缀");
         // provider 级配置在切换协议后也不能泄漏客户端字段。
         assert!(completions_body(&model, "", &[], &[], None, None).get("cacheRetention").is_none());
         assert!(responses_body(&model, "", &[], &[], None, None).get("cacheRetention").is_none());
