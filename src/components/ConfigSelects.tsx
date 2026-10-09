@@ -256,8 +256,23 @@ export function ModelPicker(props: {
   const merged = createMemo(
     () => (!sharedOnly() && props.agentKinds !== undefined) || sharedList().length > 0,
   );
+  // Lyra 的每个 provider 单独占一行（不再有「Lyra」一行），避免 provider 多时挤在二级里。
+  const lyraProviders = (o: SelectOption) => {
+    const id = (o.title ?? "").split("/")[0];
+    return { id: `lyra:${id}`, label: o.label.split(" / ")[0] || id };
+  };
   const backendOptions = createMemo(() =>
-    kinds().map((kind) => ({ id: kind, label: agentLabel(kind) })),
+    kinds().flatMap((kind) => {
+      if (kind !== "lyra") return [{ id: kind, label: agentLabel(kind) }];
+      const seen = new Map<string, string>();
+      for (const o of modelOptionsOf("lyra", true, props.modelSource?.("lyra"), true)) {
+        const p = lyraProviders(o);
+        if (!seen.has(p.id)) seen.set(p.id, p.label);
+      }
+      return seen.size
+        ? [...seen].map(([id, label]) => ({ id, label }))
+        : [{ id: kind, label: agentLabel(kind) }];
+    }),
   );
   const sourceOf = (k: AgentKind) => props.modelSource?.(k);
   const quotaPeerForToken = (token: string) =>
@@ -268,7 +283,11 @@ export function ModelPicker(props: {
     if (sharedOnly()) return [];
     if (!merged()) return modelOptionsOf(props.agentKind, false, sourceOf(props.agentKind), true);
     return [
-      ...kinds().flatMap((k) => modelOptionsOf(k, true, sourceOf(k), true)),
+      ...kinds().flatMap((k) =>
+        modelOptionsOf(k, true, sourceOf(k), true).map((o) =>
+          k === "lyra" ? { ...o, backend: lyraProviders(o).id } : o,
+        ),
+      ),
       ...sharedList(),
     ];
   });
