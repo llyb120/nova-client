@@ -33,24 +33,23 @@ const MAX_WALK_FILES: usize = 8_000;
 const MAX_HITS_PER_FILE: usize = 60;
 const MAX_HIT_LINES: usize = 6_000;
 const MAX_LINE_CHARS: usize = 240;
-const DEFAULT_HARD_BYTES: usize = 32 * 1024;
-const MIN_HARD_BYTES: usize = 8 * 1024;
+/// 只返回片段：默认 12KB（约 3k token），调用方可用 maxChars 放大。
+const DEFAULT_HARD_BYTES: usize = 12 * 1024;
+const MIN_HARD_BYTES: usize = 4 * 1024;
 const MAX_HARD_BYTES: usize = 64 * 1024;
 const DEFAULT_BUDGET: usize = 600;
 const MIN_BUDGET: usize = 100;
 const MAX_BUDGET: usize = 1200;
 const MAX_CANDIDATES: usize = 8;
 const MAX_UNITS_PER_FILE: usize = 6;
-/// 超过此行数的单元整体装不下：按命中开窗、定义只取头部，而不是整段丢进 SIG。
-const OVERSIZED_UNIT_LINES: usize = 160;
-/// 超长单元内命中窗口的上下文半径（行）。
-const HIT_WINDOW_LINES: usize = 12;
-/// 超长目标定义/依赖定义保留的头部行数（签名 + 参数解析/字段）。
-const OVERSIZED_HEAD_LINES: usize = 40;
-const FULL_FILE_MAX: usize = 100;
-const EXPLICIT_FULL_MAX: usize = 300;
-const SUBJECT_FULL_MAX: usize = 800;
-const MAX_SUBJECT_UNITS: usize = 30;
+/// 只返回片段：超过此行数的单元不整段输出，按命中开窗、定义只取头部。
+const OVERSIZED_UNIT_LINES: usize = 12;
+/// 命中窗口的上下文半径（行）。
+const HIT_WINDOW_LINES: usize = 5;
+/// 目标定义/依赖定义保留的头部行数（签名 + 开头几行）。
+const OVERSIZED_HEAD_LINES: usize = 8;
+const FULL_FILE_MAX: usize = 30;
+const EXPLICIT_FULL_MAX: usize = 60;
 const SUBJECT_BONUS: f64 = 600.0;
 /// 高频泛词（命中行数超过该值）不作为种子定义，避免同名函数把噪声反馈回排名。
 const SEED_FREQ_CAP: usize = 200;
@@ -60,7 +59,10 @@ const DID_YOU_MEAN_MIN_WORD: usize = 4;
 const MAX_FILES: usize = 6;
 const MAX_DEPS: usize = 12;
 const MAX_DEP_FILES: usize = 6;
-const MAX_IMPACT: usize = 20;
+const MAX_IMPACT: usize = 12;
+const MAX_SIGS: usize = 10;
+/// 反向 import 图逐目标补搜的总时间预算。
+const GRAPH_SEARCH_BUDGET: Duration = Duration::from_millis(600);
 const MAX_GRAPH_TERMS: usize = 12;
 /// 反向 import 图无论变更规模都做增量补丁：大仓库一次 rebase/批量改动不应触发
 /// O(全部 import × resolve_specifier) 的整图重建；补丁只动受影响边（先按 importer
@@ -4756,6 +4758,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     if !seeds.is_empty() {
         let all_paths = all.iter().cloned().collect::<HashSet<_>>();
         let mut searched_targets = HashSet::<String>::new();
+        let graph_start = Instant::now();
         // 发现 target 的引用方：反向图（增量缓存）+ 词根搜索兜底（冷启动时
         // 未扫描过的引用方不在缓存里，用文件名词根搜 import 行再精确解析）。
         let discover = |target: &str,
@@ -4771,7 +4774,12 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                 .to_string();
             if stem.len() >= 3 && searched.insert(target.to_string()) {
                 // 种子目标的词根行来自预取的批量检索；动态发现的中转目标才单独补搜。
+                // ponytail: 补搜是逐个全仓 rg，泛词种子多时串行可达数秒；前几个目标必搜，
+                // 之后超出预算只用反向图缓存 + 预取结果，调用方覆盖可能少几个。需要更全时改成批量补搜。
                 let rows = stem_rows.get(&stem).cloned().unwrap_or_else(|| {
+                    if searched.len() > 4 && graph_start.elapsed() >= GRAPH_SEARCH_BUDGET {
+                        return Vec::new();
+                    }
                     search_text_scopes_until(
                         root,
                         &[stem.clone()],
@@ -5137,24 +5145,18 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                     unit_label(&chain, symbol),
                     Some(symbol.clone()),
                 ),
-                // 超长单元整体永远装不下，原来整段转 deferred/SIG 后命中行就此丢失，
-                // 调用方只能补读。改为按命中开窗：窗口在下方按重叠合并，正文仍是连续行段。
+                // 只返回片段：按命中开窗，窗口在下方按重叠合并，正文仍是连续行段。
                 Some(symbol) => (
                     format!("{}-{}#w{}", symbol.ln, symbol.end, hit.ln / HIT_WINDOW_LINES),
                     hit.ln.saturating_sub(HIT_WINDOW_LINES).max(symbol.ln),
                     (hit.ln + HIT_WINDOW_LINES).min(symbol.end).min(source.lines.len()),
-                    format!(
-                        "{} (超长单元 {}-{}, 命中窗口)",
-                        unit_label(&chain, symbol),
-                        symbol.ln,
-                        symbol.end
-                    ),
+                    format!("{} (片段, 全{}-{})", unit_label(&chain, symbol), symbol.ln, symbol.end),
                     Some(symbol.clone()),
                 ),
                 None => {
-                    let start = hit.ln.saturating_sub(8).max(1);
-                    let end = (hit.ln + 8).min(source.lines.len());
-                    (format!("w{}", hit.ln / 20), start, end, String::new(), None)
+                    let start = hit.ln.saturating_sub(HIT_WINDOW_LINES).max(1);
+                    let end = (hit.ln + HIT_WINDOW_LINES).min(source.lines.len());
+                    (format!("w{}", hit.ln / HIT_WINDOW_LINES), start, end, String::new(), None)
                 }
             };
             let position = grouped.iter().position(|(existing, _)| existing == &key);
@@ -5193,15 +5195,12 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                 } else {
                     label
                 };
-                // 超长目标定义：先保住签名 + 头部（参数解析/字段），命中窗口由上面的 hit 单元补齐；
-                // 标签明示行段是头部，调用方按需只补读剩余段而不是整函数。
+                // 目标定义只保签名 + 头部，命中窗口由上面的 hit 单元补齐；
+                // 标签明示完整行段，调用方按需只补读剩余段而不是整函数。
                 let (end, label) = if definition.symbol.end - definition.symbol.ln + 1 > OVERSIZED_UNIT_LINES {
                     (
                         (definition.symbol.ln + OVERSIZED_HEAD_LINES - 1).min(definition.symbol.end),
-                        format!(
-                            "{label} (超长单元 {}-{}, 头部; 其余按命中窗口)",
-                            definition.symbol.ln, definition.symbol.end
-                        ),
+                        format!("{label} (头部, 全{}-{})", definition.symbol.ln, definition.symbol.end),
                     )
                 } else {
                     (definition.symbol.end, label)
@@ -5369,16 +5368,23 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         }
         features
     };
-    let mut remaining = units;
+    // 特征只算一次：片段化后单元数量多，O(n²) 选择循环里不能每轮重新分配特征字符串。
+    let mut remaining = units
+        .into_iter()
+        .map(|unit| {
+            let features = unit_features(&unit);
+            (unit, features)
+        })
+        .collect::<Vec<_>>();
     let mut units = Vec::<UnitCandidate>::new();
     let mut covered_features = HashSet::<String>::new();
     while !remaining.is_empty() {
         let mut best_index = 0usize;
         let mut best_value = f64::NEG_INFINITY;
-        for (index, unit) in remaining.iter().enumerate() {
+        for (index, (unit, features)) in remaining.iter().enumerate() {
             let mut gain = if unit.required { 1000.0 } else { 0.0 };
-            for (feature, weight) in unit_features(unit) {
-                if !covered_features.contains(&feature) {
+            for (feature, weight) in features {
+                if !covered_features.contains(feature) {
                     gain += weight;
                 }
             }
@@ -5392,11 +5398,11 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                 best_index = index;
             }
         }
-        let mut picked = remaining.remove(best_index);
+        let (mut picked, features) = remaining.remove(best_index);
         picked.obligation = if picked.role == "caller" {
-            unit_features(&picked)
-                .into_iter()
-                .find_map(|(feature, _)| feature.starts_with("caller:").then_some(feature))
+            features
+                .iter()
+                .find_map(|(feature, _)| feature.starts_with("caller:").then(|| feature.clone()))
         } else if picked.role == "test" {
             if companion_tests.contains(&picked.file) {
                 // 伴生测试按文件保底：每个伴生文件至少打包一个块，
@@ -5408,9 +5414,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         } else {
             None
         };
-        for (feature, _) in unit_features(&picked) {
-            covered_features.insert(feature);
-        }
+        covered_features.extend(features.into_iter().map(|(feature, _)| feature));
         units.push(picked);
     }
     // 显式文件是调用方给定的范围，不只是可被全仓泛词淹没的评分提示。
@@ -5480,139 +5484,6 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                 blocks: Vec::new(),
                 rank: *file_rank.get(file).unwrap_or(&99),
             });
-        }
-    }
-    // 已有明确 seed 时，先保证目标闭包；文件名主题扩展不能抢走目标、调用方和依赖预算。
-    // 仅文件名命中、没有可解析 seed 时，保留原来的主题文件通读行为。
-    let subject_list = final_candidates
-        .iter()
-        .map(|(file, _)| file)
-        .filter(|file| {
-            seeds.is_empty()
-                && subject_match(file, &subject_terms, &term_freq) >= 300.0
-                && !noise_path(file)
-                && sources.contains_key(*file)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for file in &subject_list {
-        let Some(source) = sources.get(file).cloned() else {
-            continue;
-        };
-        if source.lines.len() > SUBJECT_FULL_MAX
-            || plans.iter().any(|plan| plan.file == *file && plan.full)
-        {
-            continue;
-        }
-        let cost = range_cost(&source, 1, source.lines.len());
-        if used + source.lines.len() <= budget && used_bytes + cost <= soft_bytes {
-            used += source.lines.len();
-            used_bytes += cost;
-            plans.push(PlannedFile {
-                file: file.clone(),
-                source,
-                section: "edit",
-                full: true,
-                blocks: Vec::new(),
-                rank: *file_rank.get(file).unwrap_or(&99),
-            });
-        }
-    }
-    for file in &subject_list {
-        if plans.iter().any(|plan| plan.file == *file && plan.full) {
-            continue;
-        }
-        let Some(source) = sources.get(file).cloned() else {
-            continue;
-        };
-        if !plans.iter().any(|plan| plan.file == *file) {
-            plans.push(PlannedFile {
-                file: file.clone(),
-                source: source.clone(),
-                section: "edit",
-                full: false,
-                blocks: Vec::new(),
-                rank: *file_rank.get(file).unwrap_or(&99),
-            });
-        }
-        let plan_index = plans.iter().position(|plan| plan.file == *file).unwrap();
-        let hit_lines = hit_files
-            .get(file)
-            .map(|rows| rows.iter().map(|row| row.ln).collect::<Vec<_>>())
-            .unwrap_or_default();
-        let mut eligible = source
-            .syms
-            .iter()
-            .filter(|symbol| {
-                if symbol.depth > 1
-                    || (symbol.kind == "const" && symbol.end == symbol.ln)
-                    || matches!(
-                        symbol.name.to_ascii_lowercase().as_str(),
-                        "test" | "tests" | "spec"
-                    )
-                {
-                    return false;
-                }
-                !source.syms.iter().any(|parent| {
-                    parent.ln <= symbol.ln
-                        && parent.end >= symbol.end
-                        && parent.depth < symbol.depth
-                        && matches!(
-                            parent.name.to_ascii_lowercase().as_str(),
-                            "test" | "tests" | "spec"
-                        )
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        eligible.sort_by_key(|symbol| {
-            (
-                !hit_lines
-                    .iter()
-                    .any(|line| *line >= symbol.ln && *line <= symbol.end),
-                symbol.ln,
-            )
-        });
-        for symbol in eligible {
-            if plans[plan_index].blocks.len() >= MAX_SUBJECT_UNITS {
-                break;
-            }
-            if plans[plan_index]
-                .blocks
-                .iter()
-                .any(|block| symbol.ln >= block.start && symbol.end <= block.end)
-            {
-                continue;
-            }
-            let lines = symbol.end - symbol.ln + 1;
-            let cost = range_cost(&source, symbol.ln, symbol.end.min(source.lines.len()));
-            if used + lines > budget || used_bytes + cost > soft_bytes {
-                if symbol.depth == 0 {
-                    push_sig(&mut sigs, file, symbol.ln, &symbol.sig);
-                }
-                continue;
-            }
-            let mut chain = source
-                .syms
-                .iter()
-                .filter(|parent| {
-                    parent.ln <= symbol.ln
-                        && parent.end >= symbol.end
-                        && parent.depth < symbol.depth
-                })
-                .collect::<Vec<_>>();
-            chain.sort_by_key(|parent| (parent.depth, parent.ln));
-            chain.push(&symbol);
-            plans[plan_index].blocks.push(Block {
-                start: symbol.ln,
-                end: symbol.end.min(source.lines.len()),
-                label: unit_label(&chain, &symbol),
-                tag: "hit",
-                score: 0.0,
-                required: false,
-            });
-            used += lines;
-            used_bytes += cost;
         }
     }
     if std::env::var_os("NOVA_CTX_DEBUG").is_some() {
@@ -5860,8 +5731,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
             continue;
         };
         if def.symbol.ln == 0 || def.symbol.end > src.lines.len() { continue; }
-        // 超长依赖定义只取头部（签名 + 字段/参数解析）：整段既装不下也没必要，
-        // 头部足以确认类型形状与入口；标签明示为头部。
+        // 依赖定义只取头部（签名 + 字段/参数解析），头部足以确认类型形状与入口；标签明示完整行段。
         let oversized = def.symbol.end - def.symbol.ln + 1 > OVERSIZED_UNIT_LINES;
         let block = Block {
             start: def.symbol.ln,
@@ -5871,7 +5741,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                 def.symbol.end
             },
             label: if oversized {
-                format!("{} {} (超长 {}-{}, 仅头部)", def.symbol.kind, dep_name, def.symbol.ln, def.symbol.end)
+                format!("{} {} (头部, 全{}-{})", def.symbol.kind, dep_name, def.symbol.ln, def.symbol.end)
             } else {
                 format!("{} {}", def.symbol.kind, dep_name)
             },
@@ -5944,7 +5814,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
             body.push(if section == "edit" {
                 "## EDIT".into()
             } else {
-                "## DEPS (依赖定义, 完整单元)".into()
+                "## DEPS".into()
             });
             for plan in group {
                 // import 图精确调用方（别名/透传证据）在文件头打标，无论正文是否覆盖
@@ -6024,13 +5894,13 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                     // 显式 files 是调用方点名要看的文件：未展开的顶层符号清单要够长，
                     // 让调用方按行号直接精确补读，而不是再搜一次结构。
                     let cap = if files.contains(&plan.file) {
-                        48
-                    } else if subject_file {
                         24
-                    } else if plan.rank < 1 {
+                    } else if subject_file {
                         12
+                    } else if plan.rank < 1 {
+                        8
                     } else if plan.rank < 3 {
-                        6
+                        4
                     } else {
                         0
                     };
@@ -6085,7 +5955,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         impacts.sort();
         if !impacts.is_empty() {
             body.push(format!(
-                "## IMPACT (调用方/引用清单 {}/{}, 仅行; 确需函数体按 path:ln 补读)",
+                "## IMPACT (引用行 {}/{})",
                 impacts.len().min(impact_limit),
                 impacts.len()
             ));
@@ -6148,17 +6018,6 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                 "未发现".into()
             }
         ));
-        let partial_units = plans
-            .iter()
-            .filter(|plan| !plan.full)
-            .flat_map(|plan| plan.blocks.iter())
-            .filter(|block| block.label.contains("超长"))
-            .count();
-        if partial_units > 0 {
-            body.push(format!(
-                "超长单元: {partial_units} 块仅展示头部/命中窗口（标签标明原始行段；确需其余段时按行段精确 read，勿整函数重读）"
-            ));
-        }
         if plan_intent.errors {
             let count = role_count("handler");
             body.push(format!(
@@ -6194,8 +6053,8 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         }
         body.push(String::new());
         if !sigs.is_empty() {
-            body.push("## SIG (预算内放不下或最终回退的定义, 仅签名)".into());
-            for (file, line, sig) in sigs {
+            body.push(format!("## SIG (未展开的定义签名 {}/{})", sigs.len().min(MAX_SIGS), sigs.len()));
+            for (file, line, sig) in sigs.iter().take(MAX_SIGS) {
                 body.push(format!("{file}:{line} {sig}"));
             }
             body.push(String::new());
@@ -6252,7 +6111,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                     .sum::<usize>()
             })
             .sum::<usize>();
-        let mut head = format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# 契约: 已按修改计划构建符号关系、计算任务闭包并做缺口证明；正文均为完整单元/完整文件。已展示行段禁止重读。",
+        let mut head = format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# 正文为片段(定义头部/命中窗口, 括号内为完整行段)；需更多时按行段 read，已展示行段勿重读。",
             if keywords.is_empty() { String::new() } else { format!("q={}", keywords.join(",")) },
             if task.is_empty() { String::new() } else { format!(" task=\"{}\"", js_utf16_slice(&task, 80)) },
             if files.is_empty() { String::new() } else { format!(" files={}", files.join(",")) },
@@ -7251,8 +7110,8 @@ mod tests {
             serde_json::json!({"keywords":["requiredTarget"],"budget":100,"maxBytes":32768}),
         )
         .unwrap();
-        assert!(out.contains("@@ 1-143 fn requiredTarget [def]"), "{out}");
-        assert!(out.contains("return value_139;\n}"), "{out}");
+        assert!(out.contains(&format!("@@ 1-{OVERSIZED_HEAD_LINES} fn requiredTarget (头部, 全1-143) [def]")), "{out}");
+        assert!(!out.contains("return value_139;"), "{out}");
     }
 
     #[test]
@@ -7315,7 +7174,7 @@ mod tests {
     }
 
     #[test]
-    fn tight_budget_keeps_whole_units_and_indexes_remainder() {
+    fn tight_budget_returns_snippets() {
         let d = tempdir().unwrap();
         fs::create_dir(d.path().join("src")).unwrap();
         for i in 0..8 {
@@ -7335,13 +7194,17 @@ mod tests {
         )
         .unwrap();
         assert!(out.len() <= 8192, "{}", out.len());
-        assert!(
-            out.contains("## SIG") || out.contains("其它命中文件(未展开)"),
-            "{out}"
-        );
+        // 片段足够小，8 个 62 行函数都能装进 8KB。
+        for i in 0..8 {
+            assert!(out.contains(&format!("### src/f{i}.ts")), "{out}");
+        }
         assert!(!out.contains("partial"));
+        // 只返回片段：62 行的函数不整段输出，每块不超过单元上限。
         for block in out.split("@@ ").skip(1) {
-            assert!(block.contains("\n}"), "{block}");
+            let range = block.split_whitespace().next().unwrap();
+            let (start, end) = range.split_once('-').unwrap();
+            let span = end.parse::<usize>().unwrap() - start.parse::<usize>().unwrap() + 1;
+            assert!(span <= OVERSIZED_UNIT_LINES, "{block}");
         }
     }
 
@@ -7675,7 +7538,7 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("\n");
                 units.push(format!(
-                    "export function useTarget{m}_{n}() {{\n  // block-{m}-{n}-marker\n{pad}\n  return alphaTarget({n});\n}}\n"
+                    "export function useTarget{m}_{n}() {{\n{pad}\n  // block-{m}-{n}-marker\n  return alphaTarget({n});\n}}\n"
                 ));
             }
             fs::write(d.path().join(format!("src/mod{m}.ts")), units.join("\n")).unwrap();
