@@ -435,9 +435,11 @@ fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool,
     let picked = employee.pool.iter().find(|m| m.name == profile);
     let (kind_name, model) = picked.map_or((&employee.agent_kind, &employee.model), |m| (&m.agent_kind, &m.model));
     let kind = AgentKind::from_str(kind_name).unwrap_or(AgentKind::Lyra);
-    let pool_hint = if employee.pool.is_empty() { String::new() } else {
-        let list = employee.pool.iter().map(|m| format!("- {}：{}", m.name, m.when)).collect::<Vec<_>>().join("\n");
-        format!("你有一个模型池，当事项符合某个适用条件时，不要自己做，用 employee action=add kind=todo profile=<名字> text=<可独立执行的完整说明> 交给对应模型开新会话，然后结束本次任务：\n{list}\n\n")
+    // 与本会话同一模型的条目不列出：开新会话只是多一跳，直接在当前会话做。
+    let others = employee.pool.iter().filter(|m| (&m.agent_kind, &m.model) != (kind_name, model)).collect::<Vec<_>>();
+    let pool_hint = if others.is_empty() { String::new() } else {
+        let list = others.iter().map(|m| format!("- {}：{}", m.name, m.when)).collect::<Vec<_>>().join("\n");
+        format!("你有一个模型池，当事项符合某个适用条件时，不要自己做，也不要记待办，用 employee action=stage profile=<名字> text=<要它做什么> 直接开新会话交给对应模型（新会话能看到本会话上下文），然后结束本次任务：\n{list}\n\n")
     };
     let prompt = if picked.is_some() { prompt.to_string() } else { format!("{pool_hint}{prompt}") };
     if !state.agent_enabled(&kind) {
@@ -663,8 +665,56 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
             }
             Ok(json!({"ok": true, "id": id, "next": "已记为待确认并通知用户；不要执行该操作，结束本次任务。"}))
         }
-        _ => Err("action 应为 list/add/update/done/ask".into()),
+        "stage" => stage(args, text()?),
+        _ => Err("action 应为 list/add/update/done/ask/stage".into()),
     }
+}
+
+/// 在当前员工会话上开 Stage：新会话用模型池里的模型、引用本会话上下文，并接管本次运行的结束判定。
+fn stage(args: &Value, text: String) -> Result<Value, String> {
+    let app = APP.get().ok_or("员工未启动")?;
+    let state = app.state::<AppState>();
+    let employee = load()?;
+    let profile = check_profile(&employee, args)?;
+    let target = employee.pool.iter().find(|m| m.name == profile).ok_or("stage 需要 profile=模型池里的名字")?;
+    let kind = AgentKind::from_str(&target.agent_kind).unwrap_or(AgentKind::Lyra);
+    if !state.agent_enabled(&kind) {
+        return Err(format!("{} 后端已关闭", kind.label()));
+    }
+    let (parent_id, thread_id) = {
+        let mut guard = RUNTIME.lock().unwrap();
+        let current = guard.as_mut().and_then(|rt| rt.current.as_mut()).ok_or("只能在员工执行任务时使用 stage")?;
+        let mut store = state.store.lock().unwrap();
+        let source = store.get(&current.thread_id).ok_or("当前员工会话不存在")?;
+        if source.agent_kind == kind && source.model.as_deref().unwrap_or_default() == target.model {
+            return Ok(json!({"ok": false, "next": "该模型与当前会话相同，不要开新会话，直接在本会话完成。"}));
+        }
+        let mut thread = Thread::new(source.cwd.clone(), kind, Some(target.model.clone()).filter(|m| !m.is_empty()),
+            Some("build".into()), None, false);
+        thread.employee_thread = true;
+        thread.parent_thread_id = Some(source.id.clone());
+        thread.stage_source_thread_id = Some(source.id.clone());
+        thread.title = format!("{} · {}", source.title, target.name);
+        let ids = (source.id.clone(), thread.id.clone());
+        store.threads.push(thread);
+        store.save();
+        current.thread_id = ids.1.clone();
+        current.started = Instant::now();
+        current.seen_running = false;
+        ids
+    };
+    let _ = app.emit(crate::acp::EV_THREADS, json!({}));
+    let relink = |from: &str, to: &str| update(|e| {
+        if let Some(run) = e.runs.iter_mut().rev().find(|r| r.thread_id == from) { run.thread_id = to.into(); }
+        Ok(())
+    });
+    relink(&parent_id, &thread_id)?;
+    if let Err(error) = crate::dispatch_prompt(app, thread_id.clone(), format!("{RULES}{text}"), Vec::new()) {
+        runtime(|rt| if let Some(c) = rt.current.as_mut().filter(|c| c.thread_id == thread_id) { c.thread_id = parent_id.clone() });
+        let _ = relink(&thread_id, &parent_id);
+        return Err(error);
+    }
+    Ok(json!({"ok": true, "threadId": thread_id, "next": "已交给新会话执行；结束本次任务（动态职责仍需先安排下次检查）。"}))
 }
 
 // ---------- 前端命令 ----------
