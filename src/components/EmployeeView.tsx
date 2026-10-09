@@ -206,22 +206,30 @@ export default function EmployeeView() {
                 <h2 id="employee-inbox">待办 / 待确认</h2>
                 <Show when={e().inbox.length} fallback={<p class="employee-empty">没有待处理的事。任意会话里说“交给员工：xxx”即可派活。</p>}>
                   <ul class="employee-list">
-                    <For each={e().inbox}>{(item) => (
+                    <For each={e().inbox}>{(item) => {
+                      // 补充说明放本地信号，轮询 reconcile 不会冲掉正在输入的内容。
+                      const [extra, setExtra] = createSignal("");
+                      return (
                       <li>
                         <span class={`employee-tag ${item.confirm ? "confirm" : ""}`}>{item.confirm ? "待确认" : "待办"}</span>
                         <div class="employee-main">
                           <div>{item.text}</div>
                           <small>{time(item.createdAt)}{item.profile ? ` · 模型：${item.profile}` : ""}</small>
+                          <Show when={item.confirm}>
+                            <textarea rows={2} placeholder="补充说明（可选，批准时一并交给员工）" aria-label="批准时的补充说明"
+                              value={extra()} onInput={(ev) => setExtra(ev.currentTarget.value)} />
+                          </Show>
                         </div>
                         <Show when={item.confirm} fallback={<button type="button" onClick={() => void act("dismiss", item.id)}>撤回</button>}>
-                          <button type="button" onClick={() => void act("approve", item.id)}>批准</button>
+                          <button type="button" onClick={() => void run("employee_do", { action: "approve", id: item.id, text: extra() })}>批准</button>
                           <button type="button" onClick={() => void act("dismiss", item.id)}>驳回</button>
                         </Show>
                         <Show when={item.threadId}>
                           {(id) => <button type="button" onClick={() => void openThread(id())}>看会话</button>}
                         </Show>
                       </li>
-                    )}</For>
+                      );
+                    }}</For>
                   </ul>
                 </Show>
               </section>

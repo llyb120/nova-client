@@ -738,8 +738,12 @@ pub async fn employee_do(app: AppHandle, action: String, id: Option<String>, tex
         }
         "approve" => {
             let item = load()?.inbox.into_iter().find(|t| t.id == id).ok_or("这条已不存在")?;
+            let extra = text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+                .map(|t| format!("\n用户的补充说明（与上面冲突时以补充为准）：\n{t}")).unwrap_or_default();
+            // 已获批准的会话不得再 ask：否则信息不足时会反复生成待确认，形成批准 → 再确认的死循环。
             launch(&app, "approve", &format!("已批准：{}", clip(&item.text, 40)),
-                &format!("用户已批准执行以下事项，按其授权执行（仅限此事项）：\n{}", item.text), false, None, &item.profile)?;
+                &format!("用户已批准执行以下事项，按其授权执行（仅限此事项）：\n{}{extra}\n\
+                          此事项已获批准，不要再调用 employee action=ask 请求确认；若信息不足或无法完成，直接说明原因并结束。", item.text), false, None, &item.profile)?;
             execute_tool(&json!({"action": "done", "id": id})).map(|_| ())
         }
         _ => Err(format!("未知操作：{action}")),
