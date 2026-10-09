@@ -52,7 +52,7 @@ export function foldEfforts(
   for (const [base, parent] of parents) {
     const effort = defaultEfforts.get(base);
     const selected = parent.efforts!.find((o) => splitEffort(o.title!, lyra)?.[1] === effort);
-    parent.selectedLabel = selected?.label ?? `${parent.label} · ${effort || "默认"}`;
+    parent.selectedLabel = selected?.label ?? effort ? `${parent.label} · ${effort}` : parent.label;
   }
   return out;
 }
