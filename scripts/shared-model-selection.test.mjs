@@ -23,8 +23,12 @@ assert.equal(units.length, names.size);
 const code = ts.transpileModule(units.join("\n").replace(/export function/g, "function"), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
-const kinds = ["lyra", "devin", "codex", "codebuddy", "cursor"];
-const select = new Function("props", "sharedOnly", "ALL_AGENT_KINDS", `
+const kinds = ["lyra", "devin", "codex", "codebuddy", "cursor", "kimi", "claude"];
+const efforts = {};
+new Function("exports", ts.transpileModule(readFileSync(
+  new URL("../src/modelEfforts.ts", import.meta.url), "utf8",
+), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText)(efforts);
+const select = new Function("props", "sharedOnly", "ALL_AGENT_KINDS", "foldModelEfforts", "splitEffort", `
   const createMemo = f => f;
   const state = {};
   const agentLabel = k => k;
@@ -33,7 +37,8 @@ const select = new Function("props", "sharedOnly", "ALL_AGENT_KINDS", `
   const priceText = () => undefined;
   const multiplierText = priceText, creditsText = priceText, detailTitle = priceText;
   ${code}
-  return sharedList().map(option => ({ option, decoded: decodeModelValue(option.value) }));
+  return sharedList().flatMap(option => option.efforts ?? [option])
+    .map(option => ({ option, decoded: decodeModelValue(option.value) }));
 `);
 
 test("shared selection preserves the exact model ID for every backend", () => {
@@ -41,10 +46,10 @@ test("shared selection preserves the exact model ID for every backend", () => {
   for (const kind of kinds) {
     for (const model of ["provider/model", "provider/model:high", "模型 / 100%", "gpt-5.6"]) {
       const props = { agentKind: kind, sharedModels: [{ peer, options: { [kind]: [{ value: model, name: model }] } }] };
-      const [{ option, decoded }] = select(props, () => false, kinds);
+      const [{ option, decoded }] = select(props, () => false, kinds, efforts.foldEfforts, efforts.splitEffort);
       assert.deepEqual(decoded, { agentKind: kind, model, peerToken: peer.token });
       assert.equal(option.favoriteId, option.value);
-      assert.equal(select(props, () => true, kinds)[0].option.value, model);
+      assert.equal(select(props, () => true, kinds, efforts.foldEfforts, efforts.splitEffort)[0].option.value, model);
     }
   }
 });
