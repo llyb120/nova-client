@@ -239,7 +239,7 @@ fn claude(env: &HashMap<String, String>) -> Result<(Value, String), String> {
     };
     let mut provider = json!({ "name": "本地 Claude Code", "api": "anthropic-messages",
         "options": { "baseURL": get("ANTHROPIC_BASE_URL").unwrap_or("https://api.anthropic.com"),
-            "apiKey": key, "headers": headers }, "models": {} });
+            "apiKey": key, "headers": headers, "claudeCodeClient": true }, "models": {} });
     let selected = get("ANTHROPIC_MODEL").or_else(|| text(&settings["model"]))
         .or_else(|| get("ANTHROPIC_DEFAULT_MODEL")).unwrap_or("sonnet");
     let alias = match selected {
