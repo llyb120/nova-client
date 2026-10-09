@@ -8,12 +8,13 @@ import { ModelPicker } from "./ConfigSelects";
 import "./EmployeeView.css";
 
 type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; nextCheckAt: number; lastRunAt: number; lastResult: string };
-type Todo = { id: string; text: string; confirm: boolean; createdAt: number; threadId?: string | null };
+type Todo = { id: string; text: string; confirm: boolean; profile?: string; createdAt: number; threadId?: string | null };
+type PoolModel = { name: string; when: string; agentKind: string; model: string };
 type Run = { at: number; dutyId: string; result: string; threadId: string };
 type Snapshot = {
   employee: {
     enabled: boolean; workStart: string; workEnd: string; idleMinutes: number;
-    agentKind: string; model: string; duties: Duty[]; inbox: Todo[]; runs: Run[];
+    agentKind: string; model: string; pool: PoolModel[]; duties: Duty[]; inbox: Todo[]; runs: Run[];
   };
   status: "working" | "yielded" | "duty" | "rest";
   threadId: string | null;
@@ -88,7 +89,7 @@ export default function EmployeeView() {
                   onChange={(ev) => void set({ idleMinutes: Number(ev.currentTarget.value) || 10 })} /> 分钟后接管</label>
                 <ModelPicker agentKind={(e().agentKind || lastUsed.agentKind()) as AgentKind} agentKinds={enabledAgentKinds()}
                   model={e().model} onPickModel={(agentKind, model) => void set({ agentKind, model })}
-                  title="员工会话使用的模型" portal />
+                  title="默认模型：值班检查、职责执行，以及没有匹配模型池条件的事项" portal />
                 <Show when={snap().threadId}>
                   {(id) => <button type="button" onClick={() => void openThread(id())}>看当前会话</button>}
                 </Show>
@@ -96,6 +97,31 @@ export default function EmployeeView() {
                 <Show when={!snap().idleSupported}>
                   <span class="employee-hint">当前平台无法检测空闲，不会自动接管，只能手动触发。</span>
                 </Show>
+              </section>
+
+              <section aria-labelledby="employee-pool">
+                <h2 id="employee-pool">模型池</h2>
+                <p class="employee-hint">上方是默认模型。事项符合下面某条适用条件（如需要写代码）时，员工会交给对应模型开新会话。</p>
+                <ul class="employee-list">
+                  <For each={e().pool}>{(m, i) => {
+                    const edit = (patch: Partial<PoolModel>) => set({ pool: e().pool.map((p, j) => (j === i() ? { ...p, ...patch } : p)) });
+                    return (
+                      <li>
+                        <input type="text" maxLength={40} placeholder="名字，如 编码" aria-label="模型名字" value={m.name}
+                          onChange={(ev) => void edit({ name: ev.currentTarget.value })} />
+                        <input type="text" class="employee-main" maxLength={500} placeholder="适用条件，如 需要写代码、改仓库、调试时" aria-label="适用条件" value={m.when}
+                          onChange={(ev) => void edit({ when: ev.currentTarget.value })} />
+                        <ModelPicker agentKind={m.agentKind as AgentKind} agentKinds={enabledAgentKinds()} model={m.model}
+                          onPickModel={(agentKind, model) => void edit({ agentKind, model })} title="该条件下使用的模型" portal />
+                        <button type="button" onClick={() => void set({ pool: e().pool.filter((_, j) => j !== i()) })}>删除</button>
+                      </li>
+                    );
+                  }}</For>
+                </ul>
+                <button type="button" onClick={() => {
+                  const agentKind = lastUsed.agentKind();
+                  void set({ pool: [...e().pool, { name: `模型${e().pool.length + 1}`, when: "", agentKind, model: lastUsed.model(agentKind) }] });
+                }}>添加模型</button>
               </section>
 
               <section aria-labelledby="employee-duties">
@@ -185,7 +211,7 @@ export default function EmployeeView() {
                         <span class={`employee-tag ${item.confirm ? "confirm" : ""}`}>{item.confirm ? "待确认" : "待办"}</span>
                         <div class="employee-main">
                           <div>{item.text}</div>
-                          <small>{time(item.createdAt)}</small>
+                          <small>{time(item.createdAt)}{item.profile ? ` · 模型：${item.profile}` : ""}</small>
                         </div>
                         <Show when={item.confirm} fallback={<button type="button" onClick={() => void act("dismiss", item.id)}>撤回</button>}>
                           <button type="button" onClick={() => void act("approve", item.id)}>批准</button>

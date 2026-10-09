@@ -17,6 +17,7 @@ const MAX_DUTIES: usize = 50;
 const MAX_TEXT_CHARS: usize = 500;
 const MAX_NOTE_BYTES: usize = 1024;
 const MAX_INBOX: usize = 100;
+const MAX_POOL: usize = 10;
 const MAX_RUNS: usize = 200;
 const MAX_EVERY_MINUTES: u64 = 7 * 24 * 60;
 
@@ -29,6 +30,8 @@ pub struct Employee {
     pub idle_minutes: u32,
     pub agent_kind: String,
     pub model: String,
+    /// 模型池：上面的 agent_kind/model 是默认（心跳）模型，这里是按条件选用的其它模型。
+    pub pool: Vec<PoolModel>,
     pub duties: Vec<Duty>,
     /// 待办（confirm=false）与待确认（confirm=true），处理完即删。
     pub inbox: Vec<Todo>,
@@ -46,6 +49,7 @@ impl Default for Employee {
             idle_minutes: 10,
             agent_kind: String::new(),
             model: String::new(),
+            pool: Vec::new(),
             duties: Vec::new(),
             inbox: Vec::new(),
             runs: Vec::new(),
@@ -56,10 +60,23 @@ impl Default for Employee {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(rename_all = "camelCase", default)]
+pub struct PoolModel {
+    /// 唯一名字，待办/职责的 profile 引用它。
+    pub name: String,
+    /// 用户写的适用条件，原样给员工模型参考，例如“需要写代码、改仓库时”。
+    pub when: String,
+    pub agent_kind: String,
+    pub model: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct Duty {
     pub id: String,
     pub text: String,
     pub enabled: bool,
+    /// 模型池名字；空为默认模型。
+    pub profile: String,
     pub note: String,
     /// >0：用户指定的固定间隔（距上次结束）；0：员工逐次安排下次检查。
     pub every_minutes: u32,
@@ -74,6 +91,8 @@ pub struct Todo {
     pub id: String,
     pub text: String,
     pub confirm: bool,
+    /// 模型池名字；空为默认模型。
+    pub profile: String,
     pub created_at: i64,
     pub thread_id: Option<String>,
     pub next_check_at: i64,
@@ -127,6 +146,7 @@ impl Duty {
             self.set_text(text.into());
         }
         if let Some(note) = args["note"].as_str() { self.note = note.into(); }
+        if let Some(profile) = args["profile"].as_str() { self.profile = profile.trim().into(); }
         if let Some(enabled) = args["enabled"].as_bool() { self.enabled = enabled; }
         if let Some(value) = args.get("everyMinutes") {
             let minutes = value.as_u64().filter(|v| *v <= MAX_EVERY_MINUTES)
@@ -165,6 +185,21 @@ impl Employee {
         for text in self.duties.iter().map(|d| &d.text).chain(self.inbox.iter().map(|t| &t.text)) {
             if text.trim().is_empty() || text.chars().count() > MAX_TEXT_CHARS {
                 return Err(format!("内容不能为空且每条不超过 {MAX_TEXT_CHARS} 字"));
+            }
+        }
+        if self.pool.len() > MAX_POOL {
+            return Err(format!("模型池最多 {MAX_POOL} 个"));
+        }
+        self.pool.iter_mut().for_each(|m| m.name = m.name.trim().into());
+        for (i, m) in self.pool.iter().enumerate() {
+            if m.name.is_empty() || m.name.chars().count() > 40 || m.when.chars().count() > MAX_TEXT_CHARS {
+                return Err(format!("模型池名字不能为空，且不超过 40 字；适用条件不超过 {MAX_TEXT_CHARS} 字"));
+            }
+            if AgentKind::from_str(&m.agent_kind).is_none() {
+                return Err(format!("模型池「{}」还没有选择模型", m.name));
+            }
+            if self.pool[..i].iter().any(|p| p.name == m.name) {
+                return Err(format!("模型池名字重复：{}", m.name));
             }
         }
         if self.duties.iter().any(|d| d.note.len() > MAX_NOTE_BYTES) {
@@ -340,7 +375,7 @@ fn check_due(app: &AppHandle, manual: bool) -> Result<String, String> {
     // 待办优先，但单条失败/未完成的待办退避不阻挡其他到期任务。
     if let Some(todo) = todo_next(&employee).filter(|t| t.next_check_at <= now_ms()) {
         let started = launch(app, &todo.id, &format!("待办：{}", clip(&todo.text, 40)),
-            &format!("处理一条待办（id={}）：\n{}\n完成后调用 employee action=done id={} 删除它。", todo.id, todo.text, todo.id), !manual, None);
+            &format!("处理一条待办（id={}）：\n{}\n完成后调用 employee action=done id={} 删除它。", todo.id, todo.text, todo.id), !manual, None, &todo.profile);
         if started.is_err() && runtime(|rt| rt.current.is_none()) {
             update(|e| {
                 if let Some(t) = e.inbox.iter_mut().find(|t| t.id == todo.id) {
@@ -383,7 +418,7 @@ fn run_duty(app: &AppHandle, duty: &Duty, auto: bool) -> Result<(), String> {
     };
     launch(app, &duty.id, &format!("职责：{}", clip(&duty.text, 40)),
         &format!("检查并按条件执行职责（id={}）：\n{}\n当前时间：{}\n上次结束：{}；结果：{}{note}{schedule}\n需要留给下次的备忘可用 employee action=update id={} note=… 覆盖写。",
-            duty.id, duty.text, chrono::Local::now().to_rfc3339(), fmt_ms(duty.last_run_at), duty.last_result, duty.id), auto, Some(&duty))
+            duty.id, duty.text, chrono::Local::now().to_rfc3339(), fmt_ms(duty.last_run_at), duty.last_result, duty.id), auto, Some(&duty), &duty.profile)
 }
 
 const RULES: &str = "你是 Nova 数字员工，正在无人值守地执行一件事。规则：\n\
@@ -393,10 +428,18 @@ const RULES: &str = "你是 Nova 数字员工，正在无人值守地执行一�
 - 用户随时可能接管电脑；被停止后不要重试。\n\n";
 
 /// 新开一个员工专属会话（不进普通会话列表）并投递提示词。
-fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool, duty: Option<&Duty>) -> Result<(), String> {
+/// `profile` 为模型池名字；空或已被删除时回落到默认模型。
+fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool, duty: Option<&Duty>, profile: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
     let employee = load()?;
-    let kind = AgentKind::from_str(&employee.agent_kind).unwrap_or(AgentKind::Lyra);
+    let picked = employee.pool.iter().find(|m| m.name == profile);
+    let (kind_name, model) = picked.map_or((&employee.agent_kind, &employee.model), |m| (&m.agent_kind, &m.model));
+    let kind = AgentKind::from_str(kind_name).unwrap_or(AgentKind::Lyra);
+    let pool_hint = if employee.pool.is_empty() { String::new() } else {
+        let list = employee.pool.iter().map(|m| format!("- {}：{}", m.name, m.when)).collect::<Vec<_>>().join("\n");
+        format!("你有一个模型池，当事项符合某个适用条件时，不要自己做，用 employee action=add kind=todo profile=<名字> text=<可独立执行的完整说明> 交给对应模型开新会话，然后结束本次任务：\n{list}\n\n")
+    };
+    let prompt = if picked.is_some() { prompt.to_string() } else { format!("{pool_hint}{prompt}") };
     if !state.agent_enabled(&kind) {
         return Err(format!("{} 后端已关闭，请在员工页重新选择模型", kind.label()));
     }
@@ -412,7 +455,7 @@ fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool,
         let mut thread = Thread::new(
             cwd.to_string_lossy().to_string(),
             kind,
-            Some(employee.model.clone()).filter(|m| !m.is_empty()),
+            Some(model.clone()).filter(|m| !m.is_empty()),
             Some("build".into()),
             None,
             false,
@@ -547,6 +590,15 @@ pub(crate) fn tool_definition() -> Value {
     serde_json::from_str(include_str!("../../scripts/employee-tool.json")).unwrap()
 }
 
+/// 工具写入的 profile 必须是模型池里现有的名字（空串表示默认模型）。
+fn check_profile(e: &Employee, args: &Value) -> Result<String, String> {
+    let profile = args["profile"].as_str().map(str::trim).unwrap_or_default();
+    if profile.is_empty() || e.pool.iter().any(|m| m.name == profile) {
+        return Ok(profile.into());
+    }
+    Err(format!("模型池里没有「{profile}」，可用：{}", e.pool.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join("、")))
+}
+
 pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
     let s = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
     let id = || s("id").ok_or("缺少 id");
@@ -555,10 +607,11 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
         "list" => {
             let e = load()?;
             let recent = &e.runs[e.runs.len().saturating_sub(10)..];
-            Ok(json!({"duties": e.duties, "inbox": e.inbox, "recentRuns": recent}))
+            Ok(json!({"duties": e.duties, "inbox": e.inbox, "recentRuns": recent, "modelPool": e.pool}))
         }
         "add" => update(|e| {
             let text = text()?;
+            let profile = check_profile(e, args)?;
             match args["kind"].as_str() {
                 Some("duty") => {
                     let id = e.new_id("d");
@@ -569,7 +622,7 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
                 }
                 Some("todo") => {
                     let id = e.new_id("t");
-                    e.inbox.push(Todo { id: id.clone(), text, created_at: now_ms(), ..Default::default() });
+                    e.inbox.push(Todo { id: id.clone(), text, profile, created_at: now_ms(), ..Default::default() });
                     Ok(json!({"ok": true, "id": id}))
                 }
                 _ => Err("add 需要 kind=duty 或 kind=todo".into()),
@@ -577,6 +630,7 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
         }),
         "update" => update(|e| {
             let id = id()?;
+            check_profile(e, args)?;
             let duty = e.duties.iter_mut().find(|d| d.id == id).ok_or("没有这条职责")?;
             if args.get("nextCheckInMinutes").is_some() && runtime(|rt| rt.current.as_ref()
                 .and_then(|c| c.duty.as_ref()).is_some_and(|old|
@@ -649,6 +703,9 @@ pub fn employee_set(patch: Value) -> Result<(), String> {
         if let Some(v) = patch["idleMinutes"].as_u64() { e.idle_minutes = v.clamp(1, 24 * 60) as u32; }
         if let Some(v) = patch["agentKind"].as_str() { e.agent_kind = v.into(); }
         if let Some(v) = patch["model"].as_str() { e.model = v.into(); }
+        if !patch["pool"].is_null() {
+            e.pool = serde_json::from_value(patch["pool"].clone()).map_err(|e| format!("模型池格式错误：{e}"))?;
+        }
         Ok(())
     })?;
     runtime(|rt| rt.yielded = false);
@@ -682,7 +739,7 @@ pub async fn employee_do(app: AppHandle, action: String, id: Option<String>, tex
         "approve" => {
             let item = load()?.inbox.into_iter().find(|t| t.id == id).ok_or("这条已不存在")?;
             launch(&app, "approve", &format!("已批准：{}", clip(&item.text, 40)),
-                &format!("用户已批准执行以下事项，按其授权执行（仅限此事项）：\n{}", item.text), false, None)?;
+                &format!("用户已批准执行以下事项，按其授权执行（仅限此事项）：\n{}", item.text), false, None, &item.profile)?;
             execute_tool(&json!({"action": "done", "id": id})).map(|_| ())
         }
         _ => Err(format!("未知操作：{action}")),
@@ -702,7 +759,7 @@ pub fn employee_say(app: AppHandle, text: String) -> Result<(), String> {
          职责写成可独立执行的一句话，包含时间/频率要求与授权范围；用户明确“每隔 N 分钟/小时”才设固定 everyMinutes。\
          “每隔几分钟/隔一段时间”等模糊频率设 everyMinutes=0，由你选择初始 nextCheckInMinutes，员工以后每轮再按结果调整。\
          每天某时刻等要求也用动态调度，将 nextCheckInMinutes 安排到下次满足条件的时间；未安排的职责将在空闲时先检查条件。\
-         修改职责 text 会清除旧备注、固定间隔和下次计划，需要的参数应同次重新提供。除非用户要求立刻去做，否则只改配置不执行。"), false, None)
+         修改职责 text 会清除旧备注、固定间隔和下次计划，需要的参数应同次重新提供。除非用户要求立刻去做，否则只改配置不执行。"), false, None, "")
 }
 
 #[cfg(test)]
