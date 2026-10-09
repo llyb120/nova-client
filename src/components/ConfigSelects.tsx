@@ -168,7 +168,8 @@ export function modelOptionsOf(
       label: m.name,
       title: m.value,
       group: groupOf(m.value, m.name, cost),
-      backend: merged ? agentKind : undefined,
+      // 在折叠强度前展开 provider，确保父模型与各档位指向同一个一级分组。
+      backend: merged ? (agentKind === "lyra" ? `lyra:${m.value.split("/")[0]}` : agentKind) : undefined,
       backendLabel: merged ? agentLabel(agentKind) : undefined,
       // token 单价为主；没有单价的模型（促销/私有）退回显示倍率；CodeBuddy 退回积分倍率
       detail: price ?? mult ?? credits,
@@ -283,11 +284,7 @@ export function ModelPicker(props: {
     if (sharedOnly()) return [];
     if (!merged()) return modelOptionsOf(props.agentKind, false, sourceOf(props.agentKind), true);
     return [
-      ...kinds().flatMap((k) =>
-        modelOptionsOf(k, true, sourceOf(k), true).map((o) =>
-          k === "lyra" ? { ...o, backend: lyraProviders(o).id } : o,
-        ),
-      ),
+      ...kinds().flatMap((k) => modelOptionsOf(k, true, sourceOf(k), true)),
       ...sharedList(),
     ];
   });
