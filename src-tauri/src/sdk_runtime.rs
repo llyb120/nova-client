@@ -1046,7 +1046,7 @@ impl SdkManager {
     async fn run_prompt_inprocess(
         &self,
         thread_id: &str,
-        request: Value,
+        mut request: Value,
         user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
@@ -1055,6 +1055,8 @@ impl SdkManager {
             let enabled = state.settings.lock().unwrap().context_tools_enabled();
             enabled
         };
+        // Lyra 子 agent 的 Stage 只用于展示，不经主轮次的短生命周期事件通道。
+        request["novaThreadId"] = json!(thread_id);
         let session = if self.adapter.agent_kind() == AgentKind::Codex {
             let (command, options) =
                 self.codex_launch(request["cwd"].as_str().unwrap_or_default(), false)?;
@@ -1541,7 +1543,7 @@ impl SdkManager {
         store.save_thread(thread_id);
     }
 
-    fn apply_item(&self, thread_id: &str, value: &Value, ids: &mut HashMap<String, u64>) {
+    pub(crate) fn apply_item(&self, thread_id: &str, value: &Value, ids: &mut HashMap<String, u64>) {
         if self.adapter.uses_codex_model_routing() && is_codex_model_resume_warning(value) {
             return;
         }
@@ -1734,7 +1736,7 @@ impl SdkManager {
         Ok(())
     }
 
-    fn push_system(&self, thread_id: &str, text: String, level: &str) {
+    pub(crate) fn push_system(&self, thread_id: &str, text: String, level: &str) {
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
@@ -1744,7 +1746,7 @@ impl SdkManager {
         store.save_thread(thread_id);
     }
 
-    fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<&str>) {
+    pub(crate) fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<&str>) {
         self.app
             .state::<AppState>()
             .sleep_inhibitor
@@ -1766,7 +1768,7 @@ impl SdkManager {
         let _ = self.app.emit(EV_THREADS, json!({}));
     }
 
-    fn finish_turn(&self, thread_id: &str, stop_reason: &str, usage: Option<Value>) {
+    pub(crate) fn finish_turn(&self, thread_id: &str, stop_reason: &str, usage: Option<Value>) {
         if !self.is_running(thread_id) {
             return;
         }
@@ -1820,7 +1822,7 @@ impl SdkManager {
         }
     }
 
-    fn emit_update(&self, thread_id: &str, item: &Item) -> Result<(), tauri::Error> {
+    pub(crate) fn emit_update(&self, thread_id: &str, item: &Item) -> Result<(), tauri::Error> {
         self.emit_op(thread_id, json!({ "t": "upsert", "item": item }))
     }
 

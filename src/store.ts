@@ -1395,7 +1395,8 @@ export async function openThread(id: string) {
     await api.reportActivity(id);
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
-    if (cached && switching && !staleThreadSnapshots.has(id)) {
+    // 空闲子 Agent 仍可收到排队消息/关闭日志，不一定伴随新轮次使缓存失效。
+    if (cached && switching && !cached.subagent && !staleThreadSnapshots.has(id)) {
       const agentKind = cached.agentKind ?? "devin";
       const roamingPeer =
         cached.roamingRole === "guest" ? cached.roamingPeer ?? null : cached.quotaPeer ?? null;
@@ -1712,7 +1713,7 @@ export function liveWorkflowStage(rootId: string): string | undefined {
   workflowReviewRevision();
   const tip = workflowChainTip(rootId);
   if (!tip) return undefined;
-  return state.threads.some((thread) => thread.id === tip) ? tip : undefined;
+  return state.threads.some((thread) => thread.id === tip && !thread.subagent) ? tip : undefined;
 }
 
 /** 会话及其子孙（接力链）上的未读总数，与侧栏徽标口径一致。 */
@@ -1743,7 +1744,7 @@ export async function openNextUnreadThread(): Promise<void> {
   // 口径与侧栏普通模式列表一致：排除训练会话，以及室女座收起的会话。
   const hidden = virgoHiddenThreads();
   const visible = state.threads.filter(
-    (t) => !t.experienceThread && !t.employeeThread && !hidden.has(t.id),
+    (t) => !t.subagent && !t.experienceThread && !t.employeeThread && !hidden.has(t.id),
   );
   const visibleIds = new Set(visible.map((t) => t.id));
   const unreadRoots = visible.filter(
@@ -1968,9 +1969,13 @@ function syncLyraConfigDefaultModel(agentKind: AgentKind, options: ModelOptions 
   setLyraConfigDefaultModel(configured);
 }
 
+export function isSubagentThread(id: string | null = state.currentId): boolean {
+  return !!id && !!state.threads.find((thread) => thread.id === id)?.subagent;
+}
+
 export async function setThreadModel(model: string) {
   const id = state.currentId;
-  if (!id) return;
+  if (!id || isSubagentThread(id)) return;
   setState("model", model);
   try {
     await api.setThreadModel(id, model || null);
@@ -1985,7 +1990,7 @@ export async function setThreadModel(model: string) {
  *  旧 remote 会话作废、上下文不互通，由后端补一条系统提示。 */
 export async function pickThreadModel(agentKind: AgentKind, model: string) {
   const id = state.currentId;
-  if (!id) return;
+  if (!id || isSubagentThread(id)) return;
   if (agentKind === state.agentKind) {
     await setThreadModel(model);
     return;
@@ -2007,7 +2012,7 @@ export async function pickThreadModel(agentKind: AgentKind, model: string) {
 
 export async function setThreadMode(mode: string) {
   const id = state.currentId;
-  if (!id) return;
+  if (!id || isSubagentThread(id)) return;
   setState("mode", mode);
   lastUsed.setMode(state.agentKind, mode);
   await api.setThreadMode(id, mode || null);
@@ -2016,7 +2021,7 @@ export async function setThreadMode(mode: string) {
 /** Plan 模式收尾：切换到 Build 并提交实施指令 */
 export async function implementProposedPlan() {
   const plan = state.proposedPlan;
-  if (!plan || !state.currentId) return;
+  if (!plan || !state.currentId || isSubagentThread()) return;
   setState("proposedPlan", null);
   await setThreadMode("build");
   await sendPrompt(`请按以下计划开始实施：\n\n${plan}`);
@@ -2028,7 +2033,7 @@ export function dismissProposedPlan() {
 
 export async function setThreadReasoningEffort(reasoningEffort: string) {
   const id = state.currentId;
-  if (!id) return;
+  if (!id || isSubagentThread(id)) return;
   setState("reasoningEffort", reasoningEffort);
   lastUsed.setReasoningEffort(state.agentKind, reasoningEffort);
   await api.setThreadReasoningEffort(id, reasoningEffort || null);
@@ -2065,7 +2070,7 @@ export async function sendPrompt(
   images: PromptImage[] = [],
 ) {
   let id = state.currentId;
-  if (!id || (!text.trim() && images.length === 0)) return;
+  if (!id || isSubagentThread(id) || (!text.trim() && images.length === 0)) return;
   // 内置命令优先于工作流触发器，避免 /fire、/hard 等被当成普通内容。
   if (await tryBuiltinPrompt(id, text, images)) return;
   // 在历史分支预览中追加提示词时才发生时间跳跃：先恢复该分支，再把新提示词
@@ -2095,6 +2100,7 @@ export async function startWorkflowOnThread(
   workflowId: string,
   followFrom?: { agentKind: AgentKind; model: string | null },
 ): Promise<void> {
+  if (isSubagentThread(threadId)) return;
   try {
     await startWorkflow(workflowId, { goal: text.trim() }, threadId, images, followFrom);
   } catch (e) {
@@ -2404,6 +2410,7 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
 
 /** 向指定会话投递普通提示词（含 Fire 阶段续跑）。不处理内置命令。一律 Build。 */
 async function deliverPrompt(threadId: string, text: string, images: PromptImage[]) {
+  if (isSubagentThread(threadId)) return;
   // 后端 user 事件到达前先把用户刚发送的内容上屏，避免首轮仍显示“请在下方输入”。
   // applyUpsert 收到真实 user item 后会移除这个负 id 临时项。
   const optimisticId = state.currentId === threadId ? -Date.now() : null;
@@ -2747,6 +2754,7 @@ export async function startFireRelay(
   threadId?: string | null,
 ) {
   const rootId = threadId ?? state.currentId;
+  if (isSubagentThread(rootId)) return;
   const trimmed = goal.trim();
   if (!rootId || !trimmed) throw new Error("请在 /fire 后输入目标");
   // 首页刚创建会话后会立即发送首条提示，此时异步 refreshThreads 可能尚未完成；
@@ -2894,7 +2902,7 @@ export function stashWorktreePrompt(
  * （worktree 就绪补发、以及未来其它非 Composer 入口）。
  */
 export async function sendPromptTo(threadId: string, text: string, images: PromptImage[]) {
-  if (!text.trim() && images.length === 0) return;
+  if (isSubagentThread(threadId) || (!text.trim() && images.length === 0)) return;
   if (await tryBuiltinPrompt(threadId, text, images)) return;
   await deliverPrompt(threadId, text, images);
 }
@@ -2902,7 +2910,7 @@ export async function sendPromptTo(threadId: string, text: string, images: Promp
 /** 编辑历史用户消息并从该处重新开始：界面立即更新，SDK restore/fork 在后端排队完成后再发送。 */
 export async function editUserMessage(itemId: number, text: string, images: PromptImage[] = []) {
   let id = state.currentId;
-  if (!id || (!text.trim() && images.length === 0)) return;
+  if (!id || isSubagentThread(id) || (!text.trim() && images.length === 0)) return;
   assertBuiltinPrompt(text, images);
   // 历史分支预览中发生编辑时，先恢复对应快照；随后的 truncate_thread 会自动
   // 从被编辑提示词处截断并创建新分支，无需用户先手动执行时间跳跃。
@@ -2956,7 +2964,7 @@ export async function editUserMessage(itemId: number, text: string, images: Prom
 
 export async function cancelTurn(stopReason?: string, deleteWork = false) {
   const id = state.currentId;
-  if (!id) return;
+  if (!id || isSubagentThread(id)) return;
   optimisticRunningThreads.delete(id);
   await api.cancelTurn(id, stopReason, deleteWork);
   // 部分后端的取消调用会先返回，结束事件稍后才到；主动释放前端忙碌态，
@@ -2968,7 +2976,7 @@ export async function cancelTurn(stopReason?: string, deleteWork = false) {
  *  忙碌态由后端 acp:turn 事件驱动，这里乐观置位以即时反馈。 */
 export async function compactThread() {
   const id = state.currentId;
-  if (!id) return;
+  if (!id || isSubagentThread(id)) return;
   setState("running", id, true);
   try {
     await api.compactThread(id);

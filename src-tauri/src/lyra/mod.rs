@@ -22,6 +22,7 @@ pub(crate) mod provider;
 mod read;
 mod rollout;
 mod session;
+mod stage;
 mod tools;
 mod turn;
 

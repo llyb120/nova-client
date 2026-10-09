@@ -9,6 +9,7 @@ import {
   chatScrollToBottomSignal,
   createThread,
   deleteThread,
+  isSubagentThread,
   markThreadSwitchPointerDown,
   openThread,
   pickThreadModel,
@@ -37,11 +38,13 @@ import { fmtTokens, groupItems } from "./TurnGroup";
 const WorkspacePanel = lazy(() => import("./WorkspacePanel"));
 
 export function ChatView() {
+  const isSubagent = () => isSubagentThread();
   const workspaceOpen = () => workspaceLayout.open;
   const setWorkspaceOpen = (open: boolean) => setWorkspaceLayout({ open });
   const [workspaceRequest, setWorkspaceRequest] = createSignal<{ path: string; line?: number } | null>(null);
   createEffect(() => { state.currentId; setWorkspaceRequest(null); });
   const previewFile = (event: Event) => {
+    if (isSubagent()) return;
     const detail = (event as CustomEvent<string | { path: string; line?: number }>).detail;
     const target = typeof detail === 'string' ? { path: detail } : detail;
     if (!target || typeof target.path !== "string" || !state.currentId) return;
@@ -305,7 +308,7 @@ export function ChatView() {
     setPreviewItems(null);
     setPreviewCheckpointId(null);
     setTimeMachineEditTarget(null);
-    if (!threadId) return;
+    if (!threadId || isSubagent()) return;
     void api.getTimeMachineTimeline(threadId).then((value) => {
       if (state.currentId === threadId) setTimeline(value);
     }).catch(() => {});
@@ -315,7 +318,7 @@ export function ChatView() {
     state.threads.find((t) => t.id === state.currentId),
   );
   const isFireThread = () => /^\[Fire\]/.test(currentMeta()?.title ?? "");
-  const showTimeMachine = () => !isFireThread();
+  const showTimeMachine = () => !isSubagent() && !isFireThread();
   // 索引只依赖会话树；同链切换时根 id 不变，不重扫历史、不重建阶段列表。
   const stageIndex = createMemo(() => {
     const byId = new Map(state.threads.map((thread) => [thread.id, thread]));
@@ -365,9 +368,10 @@ export function ChatView() {
   const showStageRail = () => {
     const threads = stageThreads();
     // 链上有多个会话，或链本身就是工作流/Fire/员工事件链（从第一个节点起就显示）。
-    return threads.length > 1 || threads.some((thread) => isStageTitle(thread.title));
+    return threads.length > 1 || threads.some((thread) => thread.subagent || isStageTitle(thread.title));
   };
   const stageName = (thread: (typeof state.threads)[number]) => {
+    if (thread.subagent) return thread.title.replace(/^\[Agent\]\s*/, "").trim() || "子 Agent";
     // 工作流节点：[WF] 节点名 · 第N次（· 待补充等状态后缀），显示节点名。
     const hardStage = thread.title.match(/^\[Hard\]\s*(.+?)\s*$/);
     if (hardStage) return hardStage[1].trim() || "Hard";
@@ -402,6 +406,7 @@ export function ChatView() {
   } | null>(null);
   const deleteStageEvent = async (thread: ThreadMeta) => {
     setStageContextMenu(null);
+    if (thread.subagent) return;
     const descendants = new Set([thread.id]);
     let changed = true;
     while (changed) {
@@ -429,7 +434,7 @@ export function ChatView() {
   const roamingRole = () => currentMeta()?.roamingRole ?? null;
   const canStar = () => {
     const meta = currentMeta();
-    return !!meta && !meta.roamingRole;
+    return !!meta && !meta.subagent && !meta.roamingRole;
   };
   const toggleStar = async () => {
     const meta = currentMeta();
@@ -450,6 +455,7 @@ export function ChatView() {
   const cwdDisplay = () => currentMeta()?.worktree?.repo || state.cwd;
 
   const startRename = () => {
+    if (isSubagent()) return;
     setDraft(state.title);
     setEditing(true);
   };
@@ -781,7 +787,7 @@ export function ChatView() {
     setEditing(false);
     const id = state.currentId;
     const title = draft().trim();
-    if (!id || !title || title === state.title) return;
+    if (!id || isSubagent() || !title || title === state.title) return;
     await api.renameThread(id, title);
     setState("title", title);
   };
@@ -792,7 +798,7 @@ export function ChatView() {
         <Show
           when={editing()}
           fallback={
-            <div class="chat-title" onDblClick={startRename} title="双击重命名">
+            <div class="chat-title" onDblClick={startRename} title={isSubagent() ? "子 Agent 执行记录（只读）" : "双击重命名"}>
               <TypewriterText
                 text={state.title}
                 title={state.title}
@@ -881,6 +887,7 @@ export function ChatView() {
         </span>
         <Show
           when={
+            !isSubagent() &&
             state.agentKind === "codex" &&
             !!state.currentId &&
             state.items.length > 0 &&
@@ -900,6 +907,7 @@ export function ChatView() {
         <Show
           when={
             !!state.currentId &&
+            !isSubagent() &&
             roamingRole() !== "guest" &&
             (state.relay.connected ||
               state.items.some((item) => item.type === "assistant"))
@@ -943,7 +951,7 @@ export function ChatView() {
             </span>
           </button>
         </Show>
-        <Show when={!!state.currentId && roamingRole() !== "guest"}>
+        <Show when={!!state.currentId && !isSubagent() && roamingRole() !== "guest"}>
           <button
             type="button"
             class="chat-files-btn"
@@ -956,10 +964,10 @@ export function ChatView() {
           </button>
         </Show>
       </header>
-      <Show when={showShare() && state.currentId}>
+      <Show when={!isSubagent() && showShare() && state.currentId}>
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
       </Show>
-      <Show when={showTimeNotes() && state.currentId}>
+      <Show when={!isSubagent() && showTimeNotes() && state.currentId}>
         <TimeNotesModal
           defaultName={state.title.trim()}
           onConfirm={startTimeNotes}
@@ -977,6 +985,7 @@ export function ChatView() {
             loadItems={ensureHistoryItems}
             permissions={permissions()}
             running={isRunning() && !previewItems()}
+            readOnly={isSubagent()}
             loading={state.loadingThread}
             preview={!!previewCheckpointId()}
             onReturnToCurrent={returnToCurrentTimeline}
@@ -991,11 +1000,19 @@ export function ChatView() {
               syncTimeCursor();
             }}
             onBrowseDetail={cancelBottomFollow}
-            emptyHint={`在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
+            emptyHint={isSubagent() ? "子 Agent 执行记录 · 由主会话调度" : `在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
           />
       </div>
 
       <footer class="chat-foot">
+        <Show when={!isSubagent()} fallback={
+          <div class="checkpoint-preview-banner">
+            <span role="status">子 Agent 执行记录 · 由主会话调度{isRunning() ? " · 执行中" : ""}</span>
+            <Show when={currentMeta()?.parentThreadId}>
+              {parentId => <button type="button" class="btn secondary small" onClick={() => void openThread(parentId())}>回主会话</button>}
+            </Show>
+          </div>
+        }>
         <Show when={previewCheckpointId()}>
           <button class="checkpoint-preview-banner" onClick={returnToCurrentTimeline}>回到当前时间线</button>
         </Show>
@@ -1007,6 +1024,7 @@ export function ChatView() {
         {/* 暂时隐藏「计划」面板；内部 plan 状态与事件仍照常更新 */}
         <PlanActionCard />
         <Composer />
+        </Show>
       </footer>
         </div>
 
@@ -1112,7 +1130,7 @@ export function ChatView() {
         </aside>
       </Show>
       <Portal>
-        <Show when={contextMenu()} keyed>
+        <Show when={!isSubagent() && contextMenu()} keyed>
           {(menu) => (
             <div class="repo-time-context-backdrop" onMouseDown={() => setContextMenu(null)}>
               <div
@@ -1150,7 +1168,7 @@ export function ChatView() {
               <button
                 type="button"
                 class="stage-rail-item"
-                classList={{ active: thread.id === state.currentId, unread: stageUnread(thread) > 0 }}
+                classList={{ active: thread.id === state.currentId, unread: stageUnread(thread) > 0, subagent: thread.subagent }}
                 title={thread.title}
                 onPointerDown={() => markThreadSwitchPointerDown()}
                 onClick={() => {
@@ -1160,11 +1178,11 @@ export function ChatView() {
                 onContextMenu={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
-                  setStageContextMenu({ x: event.clientX, y: event.clientY, thread });
+                  if (!isSubagent() && !thread.subagent) setStageContextMenu({ x: event.clientX, y: event.clientY, thread });
                 }}
               >
                 <span>{stageName(thread)}</span>
-                <small>{index() + 1}</small>
+                <small>{thread.subagent ? `子 Agent · 并行${state.running[thread.id] ? " · 执行中" : ""}` : index() + 1}</small>
                 <Show when={stageUnread(thread) > 0}>
                   <span class="thread-unread-badge">{stageUnread(thread) > 9 ? "9+" : stageUnread(thread)}</span>
                 </Show>
@@ -1174,13 +1192,13 @@ export function ChatView() {
         </aside>
       </Show>
       {/* 文件/产物侧栏排在 Stage 导航右边：聊天 → 世界线 → Stage → 侧边栏。 */}
-      <Show when={workspaceOpen() && roamingRole() !== "guest"}>
+      <Show when={!isSubagent() && workspaceOpen() && roamingRole() !== "guest"}>
         <Show keyed when={state.currentId}>
           {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceLayout.mode === "terminal" ? null : workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
         </Show>
       </Show>
       <Portal>
-        <Show when={stageContextMenu()} keyed>
+        <Show when={!isSubagent() && stageContextMenu()} keyed>
           {(menu) => (
             <div class="repo-time-context-backdrop" onMouseDown={() => setStageContextMenu(null)}>
               <div

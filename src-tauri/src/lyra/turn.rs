@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 pub enum TurnEvent {
+    /// 补充输入实际从队列交付给本轮；仅供展示，不改变调度。
+    Steer(Value),
     MessageStart,
     TextDelta(String),
     ThinkingDelta(String),
@@ -153,6 +155,7 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
             }
             let steered: Vec<Value> = s.steer.lock().unwrap().drain(..).collect();
             for message in steered {
+                on_event(TurnEvent::Steer(message.clone()));
                 s.history.record(message);
             }
             if s.context.should_compact(s.history.items()) {

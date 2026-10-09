@@ -46,6 +46,14 @@ test("文件面板开关跨会话保持，重新挂载恢复全局偏好", () =>
   } finally { panel.dispose(); }
 });
 
+test("空闲子 Agent 重新打开时校准快照，显示后台追加的排队和关闭记录", () => {
+  const condition = store.match(/if \((cached && switching[^\n]+)\) \{/)[1];
+  const skipRefresh = new Function("cached", "switching", "staleThreadSnapshots", "id", `return ${condition};`);
+  assert.equal(skipRefresh({ subagent: true }, true, new Set(), "agent"), false);
+  assert.equal(skipRefresh({ subagent: false }, true, new Set(), "ordinary"), true);
+  assert.equal(skipRefresh({}, true, new Set(["ordinary"]), "ordinary"), false);
+});
+
 test("缓存切换跳过加载帧并取消流式节流，首次加载仍允许先绘制提示", () => {
   const canvas = readFileSync(new URL("../src/components/CanvasTranscript.tsx", import.meta.url), "utf8");
   const source = canvas.slice(canvas.indexOf("  const queueRebuildFrame ="), canvas.indexOf("  function resizeCanvas()"));

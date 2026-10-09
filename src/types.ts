@@ -135,6 +135,8 @@ export interface ThreadMeta {
   experienceThread?: boolean;
   /** 数字员工会话：不进普通列表，只在员工页「最近运行」里出现。 */
   employeeThread?: boolean;
+  /** 由主会话调度的子 Agent 执行记录，仅供查看。 */
+  subagent?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** 普通 /stage 引用的源会话；用于导航显示 Stage 自己的会话名。 */
@@ -293,6 +295,8 @@ export interface Thread {
   experienceThread?: boolean;
   /** 数字员工会话：不进普通列表，只在员工页「最近运行」里出现。 */
   employeeThread?: boolean;
+  /** 由主会话调度的子 Agent 执行记录，仅供查看。 */
+  subagent?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** Stage 会话动态引用的源会话。 */

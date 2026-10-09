@@ -51,6 +51,7 @@ export function latestFireStage(
   prefer: "running" | "unread" = "running",
   workflowStageId?: string,
 ): ThreadMeta | undefined {
+  if (root.subagent) return undefined;
   let latest = root;
   let running = isRunning?.(root.id) ? root : undefined;
   let unread: ThreadMeta | undefined;
@@ -60,7 +61,8 @@ export function latestFireStage(
   while (pending.length > 0) {
     const parentId = pending.shift()!;
     for (const thread of threads) {
-      if (thread.parentThreadId !== parentId || seen.has(thread.id)) continue;
+      // 并行子 Agent 仅供手动查看，不参与接力链自动选目标（含其子树）。
+      if (thread.subagent || thread.parentThreadId !== parentId || seen.has(thread.id)) continue;
       seen.add(thread.id);
       pending.push(thread.id);
       if (isRunning?.(thread.id) && (!running || thread.createdAt > running.createdAt)) {

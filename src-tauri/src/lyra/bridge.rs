@@ -33,7 +33,7 @@ fn send_error(error: impl Into<String>) {
 }
 
 /// 事件出口：stdio 子进程写 stdout，进程内运行写 mpsc 通道。
-type Emit = Arc<dyn Fn(&Value) + Send + Sync>;
+pub(super) type Emit = Arc<dyn Fn(&Value) + Send + Sync>;
 
 fn stdout_emit() -> Emit {
     Arc::new(|value: &Value| send(value))
@@ -167,6 +167,92 @@ fn completed_tool_item(started: &Value, outcome: &Value) -> Value {
     item
 }
 
+/// 主会话和只读子 Agent Stage 使用同一套事件映射，工具结果/流式文本不会分叉。
+pub(super) fn turn_event_sink<'a>(
+    emit: &'a Emit,
+    session_id: &'a str,
+    total_usage: &'a mut Value,
+) -> impl FnMut(TurnEvent) + Send + 'a {
+    let turn_started = Instant::now();
+    let mut agent_message_index = 0u64;
+    let mut current_text = String::new();
+    let mut current_thinking = String::new();
+    let mut started_tools = std::collections::HashMap::new();
+    move |event| match event {
+        TurnEvent::Steer(message) => emit(&json!({ "type": "steer", "message": message })),
+        TurnEvent::MessageStart => {
+            agent_message_index += 1;
+            emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
+            current_text.clear();
+            current_thinking.clear();
+            // 快照刷新可能清掉 liveUsage；只重发真实累计用量，不估算 token。
+            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
+                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+            }
+        }
+        TurnEvent::TextDelta(delta) => {
+            current_text.push_str(&delta);
+            emit(&json!({
+                "type": "item",
+                "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
+            }));
+        }
+        TurnEvent::ThinkingDelta(delta) => {
+            current_thinking.push_str(&delta);
+            emit(&json!({
+                "type": "item",
+                "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
+            }));
+        }
+        TurnEvent::ToolStart { id, name, args } => {
+            let item = started_tool_item(&id, &name, &args);
+            started_tools.insert(id, item.clone());
+            emit(&json!({ "type": "item", "item": item }));
+        }
+        TurnEvent::ToolEnd { id, outcome } => {
+            let started = started_tools
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| json!({ "id": id, "type": "mcp_tool_call", "server": "Lyra" }));
+            emit(&json!({ "type": "item", "item": completed_tool_item(&started, &outcome) }));
+            if let Some(cwd) = outcome.get("details").and_then(|d| d.get("workingDirectory")).and_then(Value::as_str) {
+                emit(&json!({ "type": "working_directory_changed", "cwd": cwd }));
+            }
+            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
+                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+            }
+        }
+        TurnEvent::MessageEnd { usage } => {
+            let context_tokens: u64 = ["input", "cacheRead", "cacheWrite"]
+                .iter()
+                .map(|key| usage.get(key).and_then(Value::as_u64).unwrap_or(0))
+                .sum();
+            merge_usage(total_usage, &usage);
+            total_usage["contextTokens"] = json!(context_tokens);
+            emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+        }
+        TurnEvent::Retry { attempt, error, context_recovery } => {
+            emit(&json!({
+                "type": "timing",
+                "phase": if context_recovery { "context_overflow_recovery" } else { "provider_retry" },
+                "elapsedMs": turn_started.elapsed().as_millis() as u64,
+                "error": error,
+            }));
+            let mut ready = json!({ "type": "ready", "sessionId": session_id, "retry": attempt });
+            if context_recovery {
+                ready["contextRecovery"] = json!(true);
+            }
+            emit(&ready);
+        }
+        TurnEvent::Compacted(receipt) => {
+            emit(&json!({
+                "type": "timing", "phase": "context_compaction",
+                "elapsedMs": turn_started.elapsed().as_millis() as u64, "receipt": receipt,
+            }));
+        }
+    }
+}
+
 struct PromptContext {
     session_id: String,
     cwd: String,
@@ -180,7 +266,7 @@ async fn handle_prompt(
     fast_context: bool,
     roots: &Roots,
     mut line_rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
-    _app: Option<tauri::AppHandle>,
+    app: Option<tauri::AppHandle>,
 ) -> Result<(), String> {
     let turn_started = Instant::now();
     let sessions_root = roots.sessions();
@@ -301,7 +387,9 @@ async fn handle_prompt(
         context,
         cancelled: cancelled.clone(),
         steer: steer.clone(),
-        agents: Some(session::root_handle(&ctx.session_id)),
+        agents: Some(session::root_handle(&ctx.session_id).with_stage(
+            app.zip(request.get("novaThreadId").and_then(Value::as_str).map(str::to_owned)),
+        )),
     };
 
     emit(&json!({ "type": "ready", "sessionId": ctx.session_id }));
@@ -340,96 +428,9 @@ async fn handle_prompt(
         })
     };
 
-    // ---- 事件 → 协议 items ----
+    // ---- 事件 → 协议 items（与子 Agent Stage 共用）----
     let mut total_usage = json!({});
-    let mut agent_message_index = 0u64;
-    let mut current_text = String::new();
-    let mut current_thinking = String::new();
-    let mut started_tools: std::collections::HashMap<String, Value> =
-        std::collections::HashMap::new();
-
-    let mut on_event = |event: TurnEvent| match event {
-        TurnEvent::MessageStart => {
-            agent_message_index += 1;
-            emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
-            current_text.clear();
-            current_thinking.clear();
-            // 快照刷新可能清掉前端的临时 liveUsage；下一次 request 开始时用此前
-            // request 已返回的真实累计 usage 重发一次，不做任何 token 估算。
-            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
-                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
-            }
-        }
-        TurnEvent::TextDelta(delta) => {
-            current_text.push_str(&delta);
-            emit(&json!({
-                "type": "item",
-                "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
-            }));
-        }
-        TurnEvent::ThinkingDelta(delta) => {
-            current_thinking.push_str(&delta);
-            emit(&json!({
-                "type": "item",
-                "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
-            }));
-        }
-        TurnEvent::ToolStart { id, name, args } => {
-            let item = started_tool_item(&id, &name, &args);
-            started_tools.insert(id, item.clone());
-            emit(&json!({ "type": "item", "item": item }));
-        }
-        TurnEvent::ToolEnd { id, outcome } => {
-            let started = started_tools
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| json!({ "id": id, "type": "mcp_tool_call", "server": "Lyra" }));
-            emit(&json!({ "type": "item", "item": completed_tool_item(&started, &outcome) }));
-            if let Some(cwd) = outcome
-                .get("details")
-                .and_then(|details| details.get("workingDirectory"))
-                .and_then(Value::as_str)
-            {
-                emit(&json!({ "type": "working_directory_changed", "cwd": cwd }));
-            }
-            // 工具执行期间前端可能因运行态快照刷新而清空 liveUsage。在工具结束、
-            // 下一次 provider request 之前重发上一 request 的真实累计值。
-            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
-                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
-            }
-        }
-        TurnEvent::MessageEnd { usage } => {
-            // 费用字段按整轮累计；contextTokens 始终表示最后一次真实 provider 请求的输入上下文。
-            let context_tokens: u64 = ["input", "cacheRead", "cacheWrite"]
-                .iter()
-                .map(|key| usage.get(key).and_then(Value::as_u64).unwrap_or(0))
-                .sum();
-            merge_usage(&mut total_usage, &usage);
-            total_usage["contextTokens"] = json!(context_tokens);
-            emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
-        }
-        TurnEvent::Retry { attempt, error, context_recovery } => {
-            emit(&json!({
-                "type": "timing",
-                "phase": if context_recovery { "context_overflow_recovery" } else { "provider_retry" },
-                "elapsedMs": turn_started.elapsed().as_millis() as u64,
-                "error": error,
-            }));
-            let mut ready = json!({ "type": "ready", "sessionId": ctx.session_id, "retry": attempt });
-            if context_recovery {
-                ready["contextRecovery"] = json!(true);
-            }
-            emit(&ready);
-        }
-        TurnEvent::Compacted(receipt) => {
-            emit(&json!({
-                "type": "timing",
-                "phase": "context_compaction",
-                "elapsedMs": turn_started.elapsed().as_millis() as u64,
-                "receipt": receipt,
-            }));
-        }
-    };
+    let mut on_event = turn_event_sink(emit, &ctx.session_id, &mut total_usage);
 
     let mut input = Some(user_message(&text, &images));
     let outcome = loop {
@@ -725,6 +726,40 @@ pub async fn run() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stage_and_main_share_streaming_tool_and_steer_projection() {
+        use super::*;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
+        let mut usage = json!({});
+        let mut sink = turn_event_sink(&emit, "session", &mut usage);
+        sink(TurnEvent::MessageStart);
+        sink(TurnEvent::TextDelta("hello".into()));
+        sink(TurnEvent::TextDelta(" world".into()));
+        sink(TurnEvent::ToolStart { id: "t1".into(), name: "read".into(), args: json!({"path":"missing"}) });
+        sink(TurnEvent::ToolEnd { id: "t1".into(), outcome: json!({"isError":true,"content":[{"type":"text","text":"not found"}]}) });
+        sink(TurnEvent::Steer(user_message("check again", &[])));
+        sink(TurnEvent::MessageEnd { usage: json!({"input":10,"output":2}) });
+        sink(TurnEvent::MessageStart);
+        sink(TurnEvent::TextDelta("next".into()));
+        sink(TurnEvent::MessageEnd { usage: json!({"input":20,"output":3}) });
+        drop(sink);
+        let events = events.lock().unwrap();
+        let items: Vec<_> = events.iter().filter(|e| e["type"] == "item").map(|e| &e["item"]).collect();
+        assert_eq!(items[0]["id"], items[1]["id"]);
+        assert_eq!(items[1]["text"], "hello world");
+        assert_eq!(items[2]["status"], "in_progress");
+        assert_eq!(items[2]["id"], items[3]["id"]);
+        assert_eq!(items[3]["isError"], true);
+        assert_eq!(items[3]["result"]["content"][0]["text"], "not found");
+        assert_ne!(items[1]["id"], items[4]["id"]);
+        assert_eq!(items[4]["text"], "next");
+        assert!(events.iter().any(|e| e["type"] == "steer" && e["message"]["content"][0]["text"] == "check again"));
+        assert_eq!(usage["input"], 30);
+        assert_eq!(usage["output"], 5);
+        assert_eq!(usage["contextTokens"], 20);
+    }
 
     /// 借用额度运行时：进程内按隔离数据根加载凭证配置（不起子进程、不读全局配置）。
     #[tokio::test]

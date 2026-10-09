@@ -886,6 +886,7 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
                 .or_else(|| wt_by_path.get(&t.cwd).cloned()),
             experience_thread: t.experience_thread,
             employee_thread: t.employee_thread,
+            subagent: t.subagent,
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             active_clue_card_id: t.active_clue_card_id.clone(),
@@ -3827,20 +3828,23 @@ pub(crate) fn dispatch_prompt(
     if text.is_empty() && images.is_empty() {
         return Err("内容不能为空".into());
     }
-    // 内置 /fire：任意入口（IPC、远程、后台重发、worktree 补发若未在前端拦截等）
-    // 都交前端编排，禁止把字面量丢给模型。
-    if remote::route_fire_command(app, &thread_id, &text, &images)? {
-        return Ok(());
-    }
     let (agent_kind, is_guest, is_quota) = {
         let store = state.store.lock().unwrap();
         let t = store.get(&thread_id).ok_or("线程不存在")?;
+        if t.subagent {
+            return Err("子 Agent 执行记录只读，请回主会话调度".into());
+        }
         (
             t.agent_kind.clone(),
             t.is_roaming_guest(),
             t.is_quota_borrowed(),
         )
     };
+    // 内置 /fire：任意入口（IPC、远程、后台重发、worktree 补发若未在前端拦截等）
+    // 都交前端编排，禁止把字面量丢给模型；子 Agent 必须在路由前拒绝。
+    if remote::route_fire_command(app, &thread_id, &text, &images)? {
+        return Ok(());
+    }
     // Stage 引用不是一次性快照：每次投递都从源会话最新 items 重建。
     {
         let mut store = state.store.lock().unwrap();
@@ -4220,6 +4224,10 @@ async fn cancel_turn(
     _stop_reason: Option<String>,
     _delete_work: Option<bool>,
 ) -> Result<(), String> {
+    // 子 Stage 只有观察用 running，没有可取消的主会话 bridge；不能伪造结束事件。
+    if state.store.lock().unwrap().get(&thread_id).is_some_and(|t| t.subagent) {
+        return Err("子 Agent 执行记录只读，请回主会话调度".into());
+    }
     if state
         .pending_prompt_restores
         .lock()

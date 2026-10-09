@@ -1,11 +1,14 @@
 //! 多 agent（Codex multi_agents_v2 的精简版）：主 agent 用 spawn_agent 派生进程内子 agent，
 //! 用 send_message / followup_task / wait_agent / list_agents / interrupt_agent / close_agent 协作。
-//! 子 agent 继承主 agent 的模型、工具与工作目录，历史只在内存里（不落盘），深度上限 1。
+//! 子 agent 继承主 agent 的模型、工具与工作目录，模型历史只在内存里，深度上限 1。
+//! Nova 中额外把任务和执行事件投影到只读 Stage，展示记录落盘，不参与调度。
 
 use crate::lyra::context::ContextWindow;
 use crate::lyra::history::{text_content, user_message, History};
 use crate::lyra::tools::{Tool, ToolOutcome};
-use crate::lyra::turn::{run_turn, text_outcome, BoxFuture, Session, TurnEvent};
+use crate::lyra::turn::{run_turn, text_outcome, BoxFuture, Session};
+use crate::lyra::bridge::{turn_event_sink, Emit};
+use crate::lyra::stage::Stage;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +24,7 @@ struct Child {
     tasks: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Value>>>,
     steer: Arc<Mutex<VecDeque<Value>>>,
     cancelled: Arc<AtomicBool>,
+    stage: Option<Stage>,
 }
 
 impl Child {
@@ -43,6 +47,7 @@ struct Registry {
 #[derive(Clone)]
 pub struct AgentHandle {
     registry: Arc<Registry>,
+    stage_parent: Option<(tauri::AppHandle, String)>,
 }
 
 // ponytail: 注册表按根会话常驻进程内存、不回收；子 agent 随 close_agent 或进程退出结束。
@@ -55,7 +60,7 @@ pub fn root_handle(session_id: &str) -> AgentHandle {
         .entry(session_id.to_string())
         .or_default()
         .clone();
-    AgentHandle { registry }
+    AgentHandle { registry, stage_parent: None }
 }
 
 const AGENT_TOOLS: [&str; 7] = [
@@ -134,6 +139,11 @@ pub fn agent_tools() -> Vec<Tool> {
 }
 
 impl AgentHandle {
+    pub(super) fn with_stage(mut self, parent: Option<(tauri::AppHandle, String)>) -> Self {
+        self.stage_parent = parent;
+        self
+    }
+
     fn resolve(&self, target: &str) -> Result<(String, Arc<Child>), String> {
         let agents = self.registry.agents.lock().unwrap();
         let path = if target.starts_with('/') { target.to_string() } else { format!("{ROOT}/{target}") };
@@ -168,15 +178,31 @@ pub async fn call(handle: &AgentHandle, parent: &Session, name: &str, args: &Val
             let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
             handle.resolve(target).and_then(|(path, child)| {
                 match name {
-                    "send_message" => child.steer.lock().unwrap().push_back(user_message(message, &[])),
+                    "send_message" => {
+                        if let Some(stage) = &child.stage {
+                            stage.note(format!("补充消息（已排队，下次模型请求前交付）：\n{message}"));
+                        }
+                        child.steer.lock().unwrap().push_back(user_message(message, &[]));
+                    }
                     "followup_task" => {
                         let sent = child.tasks.lock().unwrap().as_ref().map(|tx| tx.send(user_message(message, &[])));
                         if !matches!(sent, Some(Ok(()))) {
                             return Err(format!("{path} is shut down"));
                         }
+                        if let Some(stage) = &child.stage {
+                            stage.note(format!("主会话已提交后续任务：\n{message}"));
+                        }
                     }
-                    "interrupt_agent" => child.cancelled.store(true, Ordering::SeqCst),
+                    "interrupt_agent" => {
+                        child.cancelled.store(true, Ordering::SeqCst);
+                        if let Some(stage) = &child.stage {
+                            stage.note("主会话已请求中断。".into());
+                        }
+                    }
                     _ => {
+                        if let Some(stage) = &child.stage {
+                            stage.note("主会话已请求关闭。".into());
+                        }
                         child.cancelled.store(true, Ordering::SeqCst);
                         child.tasks.lock().unwrap().take();
                         handle.registry.agents.lock().unwrap().remove(&path);
@@ -236,6 +262,9 @@ fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, 
         tasks: Mutex::new(Some(tx)),
         steer: Arc::new(Mutex::new(VecDeque::new())),
         cancelled: Arc::new(AtomicBool::new(false)),
+        stage: handle.stage_parent.as_ref().and_then(|(app, parent_id)| {
+            Stage::new(app, parent_id, task_name, parent.cwd.to_string_lossy().into_owned(), parent.model.model.id.clone())
+        }),
     });
     let session = Session {
         http: parent.http.clone(),
@@ -275,7 +304,18 @@ fn child_loop(
         while let Some(task) = tasks.recv().await {
             session.cancelled.store(false, Ordering::SeqCst);
             *child.status.lock().unwrap() = ("running".into(), None);
-            let outcome = run_turn(&mut session, Some(task), &mut |_: TurnEvent| {}).await;
+            if let Some(stage) = &child.stage {
+                stage.begin(&task);
+            }
+            let emit: Emit = child.stage.as_ref().map(Stage::emitter).unwrap_or_else(|| Arc::new(|_| {}));
+            let mut usage = json!({});
+            let session_id = session.session_id.clone();
+            let mut on_event = turn_event_sink(&emit, &session_id, &mut usage);
+            let outcome = run_turn(&mut session, Some(task), &mut on_event).await;
+            drop(on_event);
+            if let Some(stage) = &child.stage {
+                stage.finish(&outcome, usage);
+            }
             let last = session
                 .history
                 .items()
@@ -292,6 +332,9 @@ fn child_loop(
             registry.changed.notify_waiters();
         }
         *child.status.lock().unwrap() = ("shutdown".into(), None);
+        if let Some(stage) = &child.stage {
+            stage.note("子 Agent 已关闭，执行记录保留供回看。".into());
+        }
         registry.changed.notify_waiters();
     })
 }
@@ -344,7 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawned_agent_completes_and_wait_reports_its_message() {
-        let url = scripted_server(vec![text_reply("child done")]).await;
+        let url = scripted_server(vec![text_reply("child done"), text_reply("followup done")]).await;
         let mut parent = test_session(url, std::env::temp_dir());
         let handle = root_handle("session-test-root");
         parent.agents = Some(handle.clone());
@@ -356,6 +399,22 @@ mod tests {
         let waited = call(&handle, &parent, "wait_agent", &json!({ "timeout_ms": 5000 })).await;
         let text = waited.content[0]["text"].as_str().unwrap();
         assert!(text.contains("\"completed\"") && text.contains("child done") && text.contains("/root/probe"), "{text}");
+        // 主会话下一轮仍能使用原来的子 Agent；只读展示不创建另一套执行会话。
+        let next_handle = root_handle("session-test-root");
+        let sent = call(&next_handle, &parent, "send_message", &json!({"target":"probe","message":"extra context"})).await;
+        assert!(!sent.is_error);
+        let followup = call(&next_handle, &parent, "followup_task", &json!({"target":"probe","message":"continue"})).await;
+        assert!(!followup.is_error);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, child) = next_handle.resolve("probe").unwrap();
+                if child.status().1.as_deref() == Some("followup done") {
+                    assert!(child.steer.lock().unwrap().is_empty());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("followup completes on the existing agent");
         let closed = call(&handle, &parent, "close_agent", &json!({ "target": "probe" })).await;
         assert!(!closed.is_error);
         let listed = call(&handle, &parent, "list_agents", &json!({})).await;

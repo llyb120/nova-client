@@ -42,6 +42,7 @@ interface CanvasTranscriptProps {
   groups: Group[];
   permissions: PermissionRequest[];
   running: boolean;
+  readOnly?: boolean;
   loading: boolean;
   emptyHint: string;
   preview: boolean;
@@ -1419,7 +1420,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           // .user-edit-btn: padding 5px, margin 0 2px 4px 0, align-self flex-end
           // 世界线预览是静态快照，即使当前主线仍在运行，也应允许从历史消息编辑并分叉。
           // 使用父组件传入的有效 running 状态，避免直接读取主线状态把预览中的编辑入口隐藏。
-          if (!props.running) {
+          if (!props.running && !props.readOnly) {
             result.push({ kind: "resend-btn", id: item.id, groupIdx: gi,
               x: bx - 52, y: y + bubbleH - 26 - 4, w: 24, h: 24,
               hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
@@ -3843,6 +3844,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
     void props.permissions;
     void props.running;
+    void props.readOnly;
     void props.loading;
     void props.preview;
     void props.emptyHint;
@@ -3912,7 +3914,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const item = editing();
     const text = draft().trim();
     const images = editAttachments.images();
-    if (!item || (!text && !images.length)) return;
+    if (props.readOnly || !item || (!text && !images.length)) return;
     clearEditing();
     void editUserMessage(item.id, text, images);
   };

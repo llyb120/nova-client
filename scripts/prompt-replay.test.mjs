@@ -14,12 +14,17 @@ assert.match(replay, /"restored": true/);
 const parsed = ts.createSourceFile('store.ts', source, ts.ScriptTarget.Latest, true);
 const units = [];
 function visit(node) {
-  if (ts.isFunctionDeclaration(node) && ['tryBuiltinPrompt', 'deliverPrompt', 'sendPromptTo'].includes(node.name?.text)) units.push(node.getText(parsed));
+  if (ts.isFunctionDeclaration(node) && [
+    'tryBuiltinPrompt', 'deliverPrompt', 'sendPromptTo', 'isSubagentThread', 'sendPrompt',
+    'setThreadModel', 'pickThreadModel', 'setThreadMode', 'setThreadReasoningEffort',
+    'implementProposedPlan', 'startWorkflowOnThread', 'startFireRelay', 'editUserMessage',
+    'cancelTurn', 'compactThread',
+  ].includes(node.name?.text)) units.push(node.getText(parsed));
   if (ts.isCallExpression(node) && node.expression.getText(parsed) === 'listen' && node.arguments[0]?.text === 'remote-prompt:dispatch') units.push(node.getText(parsed) + ';');
   ts.forEachChild(node, visit);
 }
 visit(parsed);
-assert.equal(units.length, 4);
+assert.equal(units.length, 16);
 const calls = [], toasts = [];
 const state = { currentId: 'thread', mode: 'plan', items: [], threads: [], running: {} };
 let handler;
@@ -71,4 +76,37 @@ handler({ payload: { threadId: 'thread', text: 'retry', restored: true } });
 await new Promise(resolve => setImmediate(resolve));
 assert.equal(state.running.thread, false);
 assert.match(toasts.at(-1), /编辑后重新发送失败/);
-console.log('Prompt replay preserves history and matches direct send processing; errors release running state.');
+// 子 Stage 的所有前端执行入口必须在任何状态/API 副作用前退出。
+state.currentId = 'agent';
+state.threads = [{ id: 'agent', subagent: true, parentThreadId: 'thread' }];
+state.proposedPlan = 'plan';
+state.running.agent = true;
+const before = structuredClone(state);
+const callsBefore = structuredClone(calls);
+const actions = {
+  sendPrompt: ['/fire 不应启动'], sendPromptTo: ['agent', '/stage 不应创建', []],
+  setThreadModel: ['other'], pickThreadModel: ['codex', 'other'], setThreadMode: ['build'],
+  setThreadReasoningEffort: ['high'], implementProposedPlan: [],
+  startWorkflowOnThread: ['agent', 'goal', [], 'workflow'], startFireRelay: ['goal', null, 'agent'],
+  editUserMessage: [1, '不应截断'], cancelTurn: [], compactThread: [],
+};
+for (const [name, args] of Object.entries(actions)) {
+  await module.exports[name](...args);
+  assert.deepEqual(state, before, `${name} must not mutate child Stage state`);
+  assert.deepEqual(calls, callsBefore, `${name} must not call the backend`);
+}
+const dispatch = lib.slice(lib.indexOf('pub(crate) fn dispatch_prompt('), lib.indexOf('\nfn truncate_thread('));
+assert.match(dispatch, /if t\.subagent\s*\{\s*return Err\(/);
+assert.ok(dispatch.indexOf('if t.subagent') < dispatch.indexOf('remote::route_fire_command('), 'reject before built-in routing');
+assert.ok(dispatch.indexOf('if t.subagent') < dispatch.indexOf('mgr.steer_prompt('), 'reject before steer');
+const cancel = lib.slice(lib.indexOf('async fn cancel_turn('), lib.indexOf('async fn compact_thread('));
+assert.match(cancel, /is_some_and\(\|t\| t\.subagent\)\s*\{\s*return Err\(/);
+assert.ok(cancel.indexOf('t.subagent') < cancel.indexOf('.pending_prompt_restores'), 'reject before clearing restores or emitting running=false');
+const chat = readFileSync(new URL('../src/components/ChatView.tsx', import.meta.url), 'utf8');
+const canvas = readFileSync(new URL('../src/components/CanvasTranscript.tsx', import.meta.url), 'utf8');
+assert.match(chat, /readOnly=\{isSubagent\(\)\}/);
+assert.match(chat, /when=\{!isSubagent\(\)\} fallback=\{/);
+assert.match(chat, /子 Agent 执行记录 · 由主会话调度/);
+assert.match(chat, /openThread\(parentId\(\)\)/);
+assert.match(canvas, /if \(!props\.running && !props\.readOnly\)/);
+console.log('Prompt replay and subagent read-only entry checks passed.');

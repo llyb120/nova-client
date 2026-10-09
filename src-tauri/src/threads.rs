@@ -654,6 +654,9 @@ pub struct Thread {
     /// 数字员工会话：不进普通会话列表，只在员工页「最近运行」里出现。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub employee_thread: bool,
+    /// 由主会话调度的子 Agent 执行记录；前端仅供查看。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagent: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -675,6 +678,22 @@ pub struct Thread {
     pub items: Vec<Item>,
     #[serde(default)]
     pub plan: Option<Value>,
+}
+
+#[test]
+fn subagent_metadata_defaults_and_roundtrips() {
+    let thread = Thread::new(".".into(), AgentKind::Lyra, None, None, None, false);
+    assert!(!thread.subagent);
+    let mut value = serde_json::to_value(&thread).unwrap();
+    assert!(value.get("subagent").is_none());
+    assert!(!serde_json::from_value::<Thread>(value.clone()).unwrap().subagent);
+    value["subagent"] = true.into();
+    value["parentThreadId"] = "main".into();
+    let child: Thread = serde_json::from_value(value).unwrap();
+    assert!(child.subagent);
+    assert_eq!(child.parent_thread_id.as_deref(), Some("main"));
+    assert!(child.stage_source_thread_id.is_none());
+    assert_eq!(serde_json::to_value(child).unwrap()["subagent"], true);
 }
 
 impl Thread {
@@ -727,6 +746,7 @@ impl Thread {
             worktree: None,
             experience_thread: false,
             employee_thread: false,
+            subagent: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
             pending_stage_context: None,
@@ -995,6 +1015,9 @@ pub struct ThreadMeta {
     /// 数字员工会话：不进普通会话列表，只在员工页「最近运行」里出现。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub employee_thread: bool,
+    /// 由主会话调度的子 Agent 执行记录；前端仅供查看。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagent: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
