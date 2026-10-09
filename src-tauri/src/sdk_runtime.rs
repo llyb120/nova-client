@@ -1297,6 +1297,15 @@ impl SdkManager {
                             self.adapter.label()
                         ),
                     );
+                    // provider 出错后 turn 会退避重试（每次可能等满 180s），只写日志时界面像卡死。
+                    if phase == "provider_retry" {
+                        let error = event.get("error").and_then(Value::as_str).unwrap_or("未知错误");
+                        self.push_system(
+                            thread_id,
+                            format!("{} 请求出错，正在自动重试：{error}", self.adapter.label()),
+                            "warn",
+                        );
+                    }
                 }
                 Some("item") => self.apply_item(thread_id, &event["item"], &mut item_ids),
                 Some("working_directory_changed") => {
