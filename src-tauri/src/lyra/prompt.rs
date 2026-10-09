@@ -166,6 +166,8 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "rate limit",
     "503",
     "service unavailable",
+    "no available accounts",
+    "please retry later",
     "timed out",
     "error sending request",
 ];
@@ -596,6 +598,9 @@ mod tests {
         assert!(is_retryable_provider_error("HTTP 429 too many requests"));
         assert!(is_retryable_provider_error(
             "Lyra provider 请求失败：HTTP 503 Service Unavailable"
+        ));
+        assert!(is_retryable_provider_error(
+            "Lyra provider 请求失败：Anthropic 流错误：No available accounts, please retry later"
         ));
         assert!(is_retryable_provider_error("connection error: ECONNRESET"));
         assert!(is_retryable_provider_error(
