@@ -1191,13 +1191,15 @@ pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Va
     }
     if args["operation"] == "advise" {
         let settings = crate::native_browser::jev_settings()?;
+        let mut image = None;
         if settings.jev_enabled {
             let state = DESKTOP.try_lock().map_err(|_| "剑来正在操作桌面")?;
-            state.as_ref().filter(|s| s.owner == owner && args["snapshotId"].as_str() == Some(&s.id)
+            let snap = state.as_ref().filter(|s| s.owner == owner && args["snapshotId"].as_str() == Some(&s.id)
                 && s.invalidated.is_none() && s.taken.elapsed() <= Duration::from_secs(180))
                 .ok_or("JEV 辅助判断需本会话最新有效截图（180秒内）")?;
+            image = snap.shots.first().and_then(|shot| crate::jev::image_part(&shot_folder(&owner).join(format!("{}-{}.png", snap.id, shot.image_id))));
         }
-        let mut result = crate::jev::advise(settings, args).await?;
+        let mut result = crate::jev::advise(settings, args, image).await?;
         result["basedOnSnapshotId"] = args["snapshotId"].clone();
         return Ok(result);
     }

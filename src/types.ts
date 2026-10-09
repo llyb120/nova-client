@@ -426,6 +426,9 @@ export interface Settings {
   jevEnabled: boolean;
   jevApiKey: string;
   jevApiUrl: string;
+  /** "lyra"：用 Lyra 模型（关闭思考、附截图）代替 TypeSafe JEV。 */
+  jevProvider: string;
+  jevLyraModel: string;
   claudePath: string;
   claudeProxy: string;
   claudeEnabled: boolean;
