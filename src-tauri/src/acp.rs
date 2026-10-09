@@ -374,13 +374,26 @@ fn expand_claude_model_options(config: &Value, known: Option<&Value>) -> Value {
         }));
         let name = option.pointer("/_meta/claude.ai~1baseName").and_then(Value::as_str)
             .or_else(|| option["name"].as_str()).unwrap_or(&base);
-        let levels = if current.as_deref() == Some(base.as_str()) {
+        let mut levels = if current.as_deref() == Some(base.as_str()) {
             effort.and_then(|o| o["options"].as_array()).cloned().unwrap_or_default()
         } else {
             option.pointer("/_meta/claude.ai~1effortOptions")
                 .or_else(|| cached.and_then(|m| m.pointer("/_meta/claude.ai~1effortOptions")))
                 .and_then(Value::as_array).cloned().unwrap_or_default()
         };
+        // 1M 只改变上下文；变体未上报档位时参考原模型，但保留下发的真实模型 ID。
+        if levels.is_empty() {
+            if let Some(original) = base.strip_suffix("[1m]").or_else(|| base.strip_suffix("-1m")) {
+                levels = if current.as_deref() == Some(original) {
+                    effort.and_then(|o| o["options"].as_array()).cloned().unwrap_or_default()
+                } else {
+                    models.iter().chain(known_models.into_iter().flatten())
+                        .filter(|m| split_model_effort(m["value"].as_str()).0.as_deref() == Some(original))
+                        .filter_map(|m| m.pointer("/_meta/claude.ai~1effortOptions").and_then(Value::as_array))
+                        .find(|levels| !levels.is_empty()).cloned().unwrap_or_default()
+                };
+            }
+        }
         let levels: Vec<Value> = levels.into_iter().filter(|e| {
             e["value"].as_str().is_some_and(|v| CLAUDE_EFFORT_LEVELS.contains(&v))
         }).collect();
@@ -4559,6 +4572,57 @@ mod codebuddy_acp_tests {
         super::apply_proxy_env(&mut cmd, "127.0.0.1:10808");
         assert!(cmd.as_std().get_envs().any(|(name, value)| name.to_string_lossy().eq_ignore_ascii_case("HTTPS_PROXY") && value == Some(std::ffi::OsStr::new("http://127.0.0.1:10808"))));
         assert!(cmd.as_std().get_envs().any(|(name, value)| name.to_string_lossy().eq_ignore_ascii_case("NO_PROXY") && value.is_none()));
+    }
+
+    #[test]
+    fn claude_1m_models_inherit_original_efforts() {
+        let config = json!([
+            {"id":"model","currentValue":"sonnet","options":[
+                {"value":"sonnet[1m]","name":"Sonnet","_meta":{"claude.ai/effortOptions":[]}},
+                {"value":"sonnet-1m","name":"Sonnet"},
+                {"value":"sonnet","name":"Sonnet"},
+                {"value":"haiku[1m]","name":"Haiku"},
+                {"value":"haiku","name":"Haiku"},
+                {"value":"sonnet-other[1m]","name":"Other Sonnet"}
+            ]},
+            {"id":"effort","currentValue":"high","options":[{"value":"default"},{"value":"high"}]}
+        ]);
+        let expanded = super::expand_claude_model_options(&config, None);
+        assert_eq!(expanded[0]["currentValue"], "sonnet:high");
+        let rows = expanded[0]["options"].as_array().unwrap();
+        for id in ["sonnet[1m]", "sonnet-1m"] {
+            let high = rows.iter().find(|o| o["value"] == format!("{id}:high")).unwrap();
+            assert_eq!(high["name"], "Sonnet · 1M · High");
+            assert_eq!(high["_meta"]["contextWindow"], 1_000_000);
+            assert_eq!(super::split_model_effort(high["value"].as_str()),
+                (Some(id.into()), Some("high".into())));
+        }
+        for id in ["haiku", "haiku[1m]", "sonnet-other[1m]"] {
+            assert!(rows.iter().any(|o| o["value"] == id));
+            assert!(!rows.iter().any(|o| o["value"].as_str().unwrap().starts_with(&format!("{id}:"))));
+        }
+        // 缓存只含原模型，确保不是从变体自身的旧档位恢复。
+        let original = rows.iter().find(|o| o["value"] == "sonnet:high").unwrap();
+        let known = json!([{"id":"model","currentValue":"haiku","options":[original]}]);
+        for id in ["sonnet[1m]", "sonnet-1m"] {
+            let mut current = json!([config[0].clone()]);
+            current[0]["currentValue"] = json!(id);
+            let inherited = super::expand_claude_model_options(&current, Some(&known));
+            assert_eq!(inherited[0]["currentValue"], format!("{id}:default"));
+            assert!(inherited[0]["options"].as_array().unwrap().iter()
+                .any(|o| o["value"] == format!("{id}:high")));
+            assert_eq!(super::expand_claude_model_options(&inherited, None), inherited);
+            // 原模型能力随当前列表返回时同样可用；变体自身的明确档位优先。
+            current[0]["options"][2] = original.clone();
+            assert_eq!(super::expand_claude_model_options(&current, None), inherited);
+            current.as_array_mut().unwrap().push(json!({
+                "id":"effort","currentValue":"low","options":[{"value":"low"}]
+            }));
+            let explicit = super::expand_claude_model_options(&current, Some(&known));
+            assert_eq!(explicit[0]["currentValue"], format!("{id}:low"));
+            assert!(!explicit[0]["options"].as_array().unwrap().iter()
+                .any(|o| o["value"] == format!("{id}:high")));
+        }
     }
 
     #[test]
