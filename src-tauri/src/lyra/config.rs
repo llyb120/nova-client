@@ -107,6 +107,8 @@ pub struct ResolvedModel {
     /// None 表示不下发、由端点默认值决定（GLM 标准端点默认 true=清除）；
     /// Some(false) 开启 Preserved Thinking，需同时回传 reasoning_content。
     pub clear_thinking: Option<bool>,
+    /// 以 Claude Code 客户端身份请求 Anthropic 协议（sub2api 等中转按此分配订阅账号）。
+    pub claude_code_client: bool,
     /// options 里非内置键原样透传进请求体顶层（model.options 覆盖 provider.options），
     /// 厂商特有字段（tool_stream、thinking_budget、preserve_thinking 等）无需逐个接线。
     pub extra_options: Map<String, Value>,
@@ -356,6 +358,7 @@ const RESERVED_OPTION_KEYS: &[&str] = &[
     "supportsReasoningEffort",
     "supportsThinkingToggle",
     "clearThinking",
+    "claudeCodeClient",
     "proxy",
 ];
 
@@ -643,6 +646,7 @@ pub fn resolve_model(
             supports_reasoning_effort,
             supports_thinking_toggle: compat_flag(model, provider, "supportsThinkingToggle").unwrap_or(true),
             clear_thinking,
+            claude_code_client: compat_flag(model, provider, "claudeCodeClient").unwrap_or(false),
             extra_options,
             proxy: resolve_proxy(model, provider, env)?,
         },

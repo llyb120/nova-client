@@ -1738,15 +1738,47 @@ fn map_anthropic_stop(
     }
 }
 
+// ponytail: 固定伪装版本；中转若启用最低版本闸门，需随 Claude Code 升级手动调高。
+const CLAUDE_CODE_VERSION: &str = "2.1.292";
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// sub2api / claude-relay-service 只把带 Claude Code 特征的请求调度到订阅账号，
+/// 缺 system 身份块或 metadata.user_id 时报 “No available accounts”。
+fn apply_claude_code_identity(body: &mut Value, model: &ResolvedModel, api_key: &str, session_id: Option<&str>) {
+    use sha2::{Digest, Sha256};
+    // 单独成块：中转按块与身份文案比相似度，拼进长提示词会被稀释。
+    let identity = json!({ "type": "text", "text": CLAUDE_CODE_IDENTITY });
+    if let Some(blocks) = body["system"].as_array_mut() {
+        blocks.insert(0, identity);
+    } else {
+        body["system"] = json!([identity]);
+    }
+    if body.pointer("/metadata/user_id").is_some() {
+        return;
+    }
+    let auth = model.headers.get("Authorization").and_then(Value::as_str).unwrap_or_default();
+    let device_id = format!("{:x}", Sha256::digest(format!("{api_key}\n{auth}")));
+    let session = match session_id {
+        Some(id) => uuid::Builder::from_random_bytes(Sha256::digest(id)[..16].try_into().unwrap()).into_uuid(),
+        None => uuid::Uuid::new_v4(),
+    };
+    // Claude Code ≥ 2.1.78 的 JSON 格式 user_id。
+    let user_id = json!({ "device_id": device_id, "account_uuid": "", "session_id": session.to_string() });
+    body["metadata"]["user_id"] = json!(user_id.to_string());
+}
+
 async fn stream_anthropic(
     http: &reqwest::Client,
     model: &ResolvedModel,
     api_key: &str,
-    body: Value,
+    mut body: Value,
     session_id: Option<&str>,
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
+    if model.claude_code_client {
+        apply_claude_code_identity(&mut body, model, api_key, session_id);
+    }
     // Anthropic 约定 baseURL 不含版本段时追加 /v1（与官方 SDK 一致）。
     let base = model.base_url.trim_end_matches('/');
     let url = if base.ends_with("/v1") {
@@ -1771,6 +1803,12 @@ async fn stream_anthropic(
     }
     // interleaved thinking / OAuth beta 头
     let mut betas: Vec<&str> = Vec::new();
+    if model.claude_code_client {
+        betas.push("claude-code-20250219");
+        request = request
+            .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"))
+            .header("x-app", "cli");
+    }
     if thinking_enabled {
         betas.push("interleaved-thinking-2025-05-14");
     }
@@ -2098,6 +2136,7 @@ mod tests {
             supports_reasoning_effort: true,
             supports_thinking_toggle: true,
             clear_thinking: None,
+            claude_code_client: false,
             extra_options: Map::new(),
             proxy: None,
         }
@@ -2620,6 +2659,23 @@ mod tests {
         // provider 级配置在切换协议后也不能泄漏客户端字段。
         assert!(completions_body(&model, "", &[], &[], None, None).get("cacheRetention").is_none());
         assert!(responses_body(&model, "", &[], &[], None, None).get("cacheRetention").is_none());
+    }
+
+    #[test]
+    fn claude_code_identity_passes_relay_client_check() {
+        let model = test_model("anthropic-messages");
+        let mut body = anthropic_body(&model, "Lyra system", &[], &[], None);
+        apply_claude_code_identity(&mut body, &model, "k", Some("session-1"));
+        assert_eq!(body["system"][0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(body["system"][1]["text"], "Lyra system");
+        assert!(body["system"][1].get("cache_control").is_some(), "缓存断点仍在末块");
+        let user_id: Value = serde_json::from_str(body["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(user_id["device_id"].as_str().unwrap().len(), 64);
+        assert_eq!(user_id["session_id"].as_str().unwrap().len(), 36);
+        let mut again = anthropic_body(&model, "", &[], &[], None);
+        apply_claude_code_identity(&mut again, &model, "k", Some("session-1"));
+        assert_eq!(again["system"][0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(again["metadata"], body["metadata"], "同会话 user_id 稳定");
     }
 
     #[test]

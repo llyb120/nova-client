@@ -544,6 +544,7 @@ pub(crate) mod tests {
                 supports_reasoning_effort: false,
                 supports_thinking_toggle: true,
                 clear_thinking: None,
+                claude_code_client: false,
                 extra_options: serde_json::Map::new(),
                 proxy: None,
             },
