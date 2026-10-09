@@ -31,6 +31,9 @@ const LOG_CAP: usize = 800;
 /// session/prompt 发出后允许「零通知」的最长静默；超过即判定连接假死（见 prompt_with_stall_guard）。
 const PROMPT_FIRST_RESPONSE_STALL: Duration = Duration::from_secs(90);
 
+/// Claude 无任何新输出多久后在会话里提示一次（见 await_with_silence_notice）。
+const CLAUDE_SILENCE_NOTICE: Duration = Duration::from_secs(60);
+
 /// 模型探测、命令探测和标题生成共用的辅助连接。
 const SHARED_KEY: &str = "__shared__";
 const CODEBUDDY_ACP_ARGS: [&str; 3] = ["--acp", "--acp-transport", "stdio"];
@@ -4146,9 +4149,52 @@ impl AcpManager {
                     self.kind.label(),
                 )));
             }
-            None => request.await,
+            None => self.await_with_silence_notice(session_id, request).await,
         };
         result.map_err(PromptFailure::Rpc)
+    }
+
+    /// Claude 遇到 503/限流时 CLI 会自行退避重试多次，但 claude-agent-acp 在客户端未声明
+    /// AIR sessionFailure 能力时不转发 `api_retry`，这期间 Nova 收不到任何通知，界面只剩
+    /// 「运行中」。静默超过 `CLAUDE_SILENCE_NOTICE` 就在会话里补一条提示（每段静默只提示一次）。
+    async fn await_with_silence_notice(
+        &self,
+        session_id: &str,
+        request: impl std::future::Future<Output = Result<Value, String>>,
+    ) -> Result<Value, String> {
+        if self.kind != AgentKind::Claude {
+            return request.await;
+        }
+        tokio::pin!(request);
+        let mut notified_for = 0;
+        loop {
+            tokio::select! {
+                result = &mut request => return result,
+                _ = sleep(Duration::from_secs(15)) => {}
+            }
+            let Some(thread_id) = self.routes.lock().unwrap().get(session_id).map(|r| r.thread_id.clone())
+            else { continue };
+            if self.pending_permissions.lock().unwrap().values().any(|p| p.session_id == session_id) {
+                continue;
+            }
+            let state = self.app.state::<AppState>();
+            let mut store = state.store.lock().unwrap();
+            let Some(thread) = store.get_mut(&thread_id) else { continue };
+            let silent_ms = now_ms() - thread.updated_at;
+            if thread.updated_at == notified_for || silent_ms < CLAUDE_SILENCE_NOTICE.as_millis() as i64 {
+                continue;
+            }
+            let item = thread.push_system(
+                format!(
+                    "Claude 已 {silent_ms_s} 秒没有新输出：可能在执行长耗时工具，或在自动重试连接（503/限流时 Claude Code 会退避重试多次，期间同样消耗额度）。可点击停止中断。",
+                    silent_ms_s = silent_ms / 1000
+                ),
+                "info",
+            );
+            notified_for = thread.updated_at;
+            self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
+            store.save_thread(&thread_id);
+        }
     }
 
     /// 只解除线程上 session 的进程内挂载（保留 thread.acp_session_id）：
