@@ -1178,13 +1178,13 @@ fn local_project_entries(state: &AppState) -> Vec<ProjectEntry> {
     {
         let projects = state.projects.lock().unwrap();
         for p in projects.projects.iter() {
-            if !guest_cwds.contains(p) && seen.insert(p.clone()) {
+            if !guest_cwds.contains(p) && seen.insert(project_path_key(p)) {
                 paths.push(p.clone());
             }
         }
     }
     for c in thread_cwds {
-        if seen.insert(c.clone()) {
+        if seen.insert(project_path_key(&c)) {
             paths.push(c);
         }
     }
@@ -1220,10 +1220,10 @@ fn list_projects(state: State<'_, AppState>) -> Vec<ProjectEntry> {
     local_project_entries(state.inner())
 }
 
-fn project_path_key(path: &str) -> String {
+pub(crate) fn project_path_key(path: &str) -> String {
     #[cfg(windows)]
     {
-        path.replace('/', "\\").to_lowercase()
+        path.trim().replace('/', "\\").trim_start_matches(r"\\?\").to_lowercase()
     }
     #[cfg(not(windows))]
     {

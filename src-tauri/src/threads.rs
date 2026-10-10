@@ -1064,14 +1064,16 @@ impl ProjectStore {
 
     /// 把项目移到最前（不存在则插入），保留最多 20 条
     pub fn touch(&mut self, cwd: &str) {
-        self.projects.retain(|p| p != cwd);
+        let key = crate::project_path_key(cwd);
+        self.projects.retain(|p| crate::project_path_key(p) != key);
         self.projects.insert(0, cwd.to_string());
         self.projects.truncate(20);
         self.save();
     }
 
     pub fn remove(&mut self, cwd: &str) {
-        self.projects.retain(|p| p != cwd);
+        let key = crate::project_path_key(cwd);
+        self.projects.retain(|p| crate::project_path_key(p) != key);
         self.save();
     }
 }
