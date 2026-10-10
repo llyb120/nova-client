@@ -374,24 +374,50 @@ pub(crate) async fn plan_path(settings: Settings, task: &str, state: &Value,
 pub(crate) async fn test_altair_connection(webview: tauri::Webview, altair_model: String) -> Result<Value, String> {
     use base64::Engine;
     if webview.label() != "main" { return Err("仅 Nova 主界面可以测试 Altair".into()); }
-    let settings = Settings { altair_enabled: true, altair_model,
-        ..Settings::load(&crate::lyra::config::nova_root()) };
+    connection_check(Settings { altair_enabled: true, altair_model,
+        ..Settings::load(&crate::lyra::config::nova_root()) }).await
+}
+
+async fn connection_check(settings: Settings) -> Result<Value, String> {
+    use base64::Engine;
     let icon = json!({"type":"image","mimeType":"image/png",
         "data":base64::engine::general_purpose::STANDARD.encode(include_bytes!("../icons/128x128.png"))});
     let result = advise(settings, &json!({"advice":{
-        "task":"选择与观察中的单词相同的候选", "state":"单词是 ready",
+        "task":"连通性测试：以文字观察为准选择与其中单词相同的候选；附图只是应用图标，与题目无关",
+        "state":"单词是 ready",
         "choices":{"ready":"单词是 ready", "other":"单词不是 ready"}
     }}), std::future::ready(Some(icon))).await?;
     if result["status"] != "advised" {
         return Err(result["error"].as_str().or(result["next"].as_str()).unwrap_or("测试未成功").into());
     }
-    if result["choice"] != "ready" { return Err("接口已响应，但测试判断未通过，请检查模型配置".into()); }
+    if result["choice"] != "ready" {
+        return Err(format!("接口已响应，但测试判断未通过（选择 {}，置信度 {}），请检查模型配置", result["choice"], result["confidence"]));
+    }
     Ok(json!({"model":result["model"], "elapsedMs":result["elapsedMs"]}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live: the settings-page check with the user's saved Altair model (one small request).
+    #[tokio::test]
+    #[ignore]
+    async fn probe_live_connection_check() {
+        let mut settings = Settings::load(&crate::lyra::config::nova_root());
+        settings.altair_enabled = true;
+        if let Ok(model) = std::env::var("NOVA_ALTAIR_PROBE_MODEL") { settings.altair_model = model; }
+        let mut attempted = false;
+        let body = advice_request(&json!({"advice":{"task":"连通性测试：以文字观察为准选择与其中单词相同的候选；附图只是应用图标，与题目无关",
+            "state":"单词是 ready","choices":{"ready":"单词是 ready","other":"单词不是 ready"}}})).unwrap();
+        use base64::Engine;
+        let icon = json!({"type":"image","mimeType":"image/png",
+            "data":base64::engine::general_purpose::STANDARD.encode(include_bytes!("../icons/128x128.png"))});
+        eprintln!("RAW {:?}", ask(&settings, &body, Some(icon), &mut attempted).await);
+        let result = connection_check(settings).await;
+        eprintln!("CHECK {result:?}");
+        result.unwrap();
+    }
 
     #[tokio::test]
     async fn disabled_unconfigured_and_low_confidence_never_act() {
