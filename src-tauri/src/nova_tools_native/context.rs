@@ -42,12 +42,23 @@ const MIN_BUDGET: usize = 100;
 const MAX_BUDGET: usize = 1200;
 const MAX_CANDIDATES: usize = 8;
 const MAX_UNITS_PER_FILE: usize = 6;
-/// 只返回片段：超过此行数的单元不整段输出，按命中开窗、定义只取头部。
-const OVERSIZED_UNIT_LINES: usize = 12;
+/// 只返回片段：超过此行数的单元不整段输出，按命中开窗、定义只取签名。
+const OVERSIZED_UNIT_LINES: usize = 5;
 /// 命中窗口的上下文半径（行）。
-const HIT_WINDOW_LINES: usize = 5;
-/// 目标定义/依赖定义保留的头部行数（签名 + 开头几行）。
+const HIT_WINDOW_LINES: usize = 2;
+/// 目标定义/依赖定义签名最多扫描的行数（多行签名）。
 const OVERSIZED_HEAD_LINES: usize = 8;
+
+/// 定义只保签名：从首行起找到第一个含 `{` 或以 `:` 结尾的行（多行签名），找不到只取首行。
+fn signature_end(lines: &[String], start: usize, end: usize) -> usize {
+    let cap = (start + OVERSIZED_HEAD_LINES - 1).min(end).min(lines.len());
+    (start..=cap)
+        .find(|&ln| {
+            let text = lines[ln - 1].trim_end();
+            text.contains('{') || text.ends_with(':')
+        })
+        .unwrap_or(start)
+}
 const FULL_FILE_MAX: usize = 30;
 const EXPLICIT_FULL_MAX: usize = 60;
 const SUBJECT_BONUS: f64 = 600.0;
@@ -5145,11 +5156,16 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                     unit_label(&chain, symbol),
                     Some(symbol.clone()),
                 ),
-                // 只返回片段：按命中开窗，窗口在下方按重叠合并，正文仍是连续行段。
+                // 只返回片段：按命中开窗，窗口在下方按重叠合并，正文仍是连续行段；
+                // 命中在定义首行时只给签名，不带函数体。
                 Some(symbol) => (
                     format!("{}-{}#w{}", symbol.ln, symbol.end, hit.ln / HIT_WINDOW_LINES),
                     hit.ln.saturating_sub(HIT_WINDOW_LINES).max(symbol.ln),
-                    (hit.ln + HIT_WINDOW_LINES).min(symbol.end).min(source.lines.len()),
+                    if hit.ln == symbol.ln {
+                        signature_end(&source.lines, symbol.ln, symbol.end)
+                    } else {
+                        (hit.ln + HIT_WINDOW_LINES).min(symbol.end).min(source.lines.len())
+                    },
                     format!("{} (片段, 全{}-{})", unit_label(&chain, symbol), symbol.ln, symbol.end),
                     Some(symbol.clone()),
                 ),
@@ -5195,12 +5211,12 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                 } else {
                     label
                 };
-                // 目标定义只保签名 + 头部，命中窗口由上面的 hit 单元补齐；
+                // 目标定义只保签名，命中窗口由上面的 hit 单元补齐；
                 // 标签明示完整行段，调用方按需只补读剩余段而不是整函数。
                 let (end, label) = if definition.symbol.end - definition.symbol.ln + 1 > OVERSIZED_UNIT_LINES {
                     (
-                        (definition.symbol.ln + OVERSIZED_HEAD_LINES - 1).min(definition.symbol.end),
-                        format!("{label} (头部, 全{}-{})", definition.symbol.ln, definition.symbol.end),
+                        signature_end(&source.lines, definition.symbol.ln, definition.symbol.end),
+                        format!("{label} (签名, 全{}-{})", definition.symbol.ln, definition.symbol.end),
                     )
                 } else {
                     (definition.symbol.end, label)
@@ -5731,17 +5747,17 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
             continue;
         };
         if def.symbol.ln == 0 || def.symbol.end > src.lines.len() { continue; }
-        // 依赖定义只取头部（签名 + 字段/参数解析），头部足以确认类型形状与入口；标签明示完整行段。
+        // 依赖定义只取签名，足以确认入口；标签明示完整行段。
         let oversized = def.symbol.end - def.symbol.ln + 1 > OVERSIZED_UNIT_LINES;
         let block = Block {
             start: def.symbol.ln,
             end: if oversized {
-                (def.symbol.ln + OVERSIZED_HEAD_LINES - 1).min(def.symbol.end)
+                signature_end(&src.lines, def.symbol.ln, def.symbol.end)
             } else {
                 def.symbol.end
             },
             label: if oversized {
-                format!("{} {} (头部, 全{}-{})", def.symbol.kind, dep_name, def.symbol.ln, def.symbol.end)
+                format!("{} {} (签名, 全{}-{})", def.symbol.kind, dep_name, def.symbol.ln, def.symbol.end)
             } else {
                 format!("{} {}", def.symbol.kind, dep_name)
             },
@@ -6111,7 +6127,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                     .sum::<usize>()
             })
             .sum::<usize>();
-        let mut head = format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# 正文为片段(定义头部/命中窗口, 括号内为完整行段)；需更多时按行段 read，已展示行段勿重读。",
+        let mut head = format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# 正文为片段(定义签名/命中窗口, 括号内为完整行段)；需更多时按行段 read，已展示行段勿重读。",
             if keywords.is_empty() { String::new() } else { format!("q={}", keywords.join(",")) },
             if task.is_empty() { String::new() } else { format!(" task=\"{}\"", js_utf16_slice(&task, 80)) },
             if files.is_empty() { String::new() } else { format!(" files={}", files.join(",")) },
@@ -7110,7 +7126,8 @@ mod tests {
             serde_json::json!({"keywords":["requiredTarget"],"budget":100,"maxBytes":32768}),
         )
         .unwrap();
-        assert!(out.contains(&format!("@@ 1-{OVERSIZED_HEAD_LINES} fn requiredTarget (头部, 全1-143) [def]")), "{out}");
+        assert!(out.contains("@@ 1-1 fn requiredTarget (签名, 全1-143) [def]"), "{out}");
+        assert!(!out.contains("const value_0 = 0;"), "{out}");
         assert!(!out.contains("return value_139;"), "{out}");
     }
 

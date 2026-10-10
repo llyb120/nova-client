@@ -475,7 +475,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             })
         },
         polaris.then_some(
-            "- polaris: 一次返回命中片段（定义头部 + 命中行窗口）+ 依赖头部 + IMPACT/SIG（内部批量 rg + 增量符号索引）",
+            "- polaris: 一次返回命中片段（定义签名 + 命中行窗口）+ 依赖签名 + IMPACT/SIG（内部批量 rg + 增量符号索引）",
         ),
         if read_only {
             None
