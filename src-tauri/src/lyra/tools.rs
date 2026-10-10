@@ -258,7 +258,7 @@ fn compact_browser_result(value: &Value, max_bytes: usize) -> String {
             let mut fallback = json!({"contextCompacted":true,"evidenceOmitted":true,
                 "nextRead":"Read archivedToolOutput/documentPath before judging task completion."});
             for key in ["status","snapshotId","basedOnSnapshotId","documentPath","archivedToolOutput",
-                "images","coordinateSpace","tabTag","browserId","completedActions","verification","altair","altairRun"] {
+                "images","coordinateSpace","tabTag","browserId","completedActions","verification","vision","steps","altairRun"] {
                 if let Some(value) = compact.get(key) { fallback[key] = value.clone(); }
             }
             return fallback.to_string();

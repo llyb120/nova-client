@@ -1,22 +1,23 @@
-# Altair DOM 决策
+# Altair 视觉代理
 
-## Altair 单一决策（2026-10-10，移除 JEV）
+## 分工（2026-10-10 重设计）
 
-JEV（TypeSafe SystemOne，文本无图）已移除：设置、HTTP 客户端、`jev.rs` 均删除，旧设置里的 `jevEnabled/jevApiKey/jevApiUrl` 读取时忽略。设置 → “Altair 辅助决策”只剩 **Altair**（Lyra 配置的识图模型，文本 + 截图，`src-tauri/src/altair.rs`）。`altair::decide` 是唯一入口（advise / choose / plan_path 共用），执行器为 `src-tauri/src/altair_run.rs`：
+Altair（设置里选的 Lyra 识图模型，`src-tauri/src/altair.rs`）只当主模型的眼睛，不做任何决策；判断全部由主模型完成。目的是让截图不进入主模型上下文。
 
-1. 每次决策附当前视口截图（单次无上下文请求、按协议请求关闭思考、20 秒超时）。辅助图片统一最长边 1024、JPEG 质量 70；未缩放且原 PNG 更小时保留 PNG，原工具截图不覆盖。截图惰性获取：观察已有截图就复用，否则 run 内部做一次 viewport screenshot，之后按候选 `key` 重新绑定新快照的 ref（`Run::rebind`）。
-2. `advised` 且目标/操作两层置信度均在 0.6–1 才执行；WAIT（observe）与 defer 不看置信度。缺失或非法置信度按 0 处理。不足 → `status=low_confidence`，run 交回主模型（reason 带置信度）。
-3. **连续操作**：目标模式请求带 `next_1..3` 同屏续步题。只保留合法、不重复且置信度 ≥0.6 的前缀，`replan` 截断。执行器只在下一步目标仍在新 DOM 中同节点同状态、URL 不变、没有新控件时继续，每步动作后先等页面稳定（连续两次观察一致，最多 1 秒）再执行下一步，因此一次请求可执行多步，省去中间往返。
+- **出口过滤**：剑来（`jianlai::execute`）、WebView（`native_browser::execute`）、Chrome（`native_browser::execute_chrome`，UI 调用除外）的返回在最后一步经过 `altair::filter`。Altair 开启且结果带截图时：
+  - 一次请求把截图（最多 4 张，含滚动中间帧）发给 Altair；
+  - 返回 `vision`：`summary`（画面概述）、`answer`（回答调用参数 `look`）、`targets`（最多 20 个可操作目标 `v1…`，坐标已换算回 imageId 像素）；
+  - 删除 `images[].path`、`path`、`imagePath`，三个转换器（MCP Node、Codex、Lyra）就不会附图。`imageId`、`snapshotId` 保留，坐标校验链路不变。
+  - 失败（未配置、超时、无效 JSON）时保留原图并写 `vision.error`，主模型不会看不到画面。`vision:"raw"` 主动要原图。
+- **target 定位**：坐标动作可以不写 x/y，改写 `target`：
+  - `vN`：从该 snapshotId 的 `vision.targets` 取坐标，不再请求模型（内存表保留最近 32 个快照）；
+  - 文字描述：`altair::ground` 在该快照截图上定位，置信度 < 0.6 不执行。
+- **连续操作（剑来）**：一次 act 里带 target 的多步由 `jianlai::vision_act` 逐步执行。每步定位后单独走原有 act 校验（快照/窗口/遮挡/像素守卫），反馈截图等界面稳定后作为下一步依据；`vN` 在画面变化后按其标签重新定位。任一步失败即停，返回 `steps`，不重放。最后一张图再经出口过滤变成文字。
+- **浏览器**：DOM 动作照旧用 frame/ref；`click_at/move/scroll_at/drag` 支持 target，按该 snapshotId 自己的截图定位（同一批共用一张图）。
+- **run**：只执行主模型给出的 `plan.steps`（必填，1–24 步），本地在最新 DOM 上绑定、步间等页面稳定；歧义或 expect 不成立时交回。`expectedText` 可选，给出时才做最终文字核验。不再有 Altair 自动驾驶、强制委托、advise。
 
-**所有后端一致**：拦截点在共享执行层 `native_browser::execute/execute_chrome` 的 act 入口（`altair_run::route_act`）。Altair 开启时，主模型未经 run 的 DOM click/fill/scroll 不执行，返回 `not_executed` + `runTemplate`；坐标/按键/等待、run 内部动作、UI 调用不受限。run 交回并取得有效快照后，该目标仅获得 **2 个 DOM 排障尝试**额度（批量按动作数计），下一次 run 清零。run 的 plan 只需 `task`，应一次交出完整目标。完成的 run 不返回 decisions/trace/decisionTree；`requestCount` 统计已发起的 Altair 调用。
-
-**剑来**：advise 走同一入口（附本会话最新截图）。`run` 传 `plan.task` 时由 Altair 看截图逐步操作（经原 act 校验；≤20 次决策/120 秒；输入文字只能取 `plan.inputs`；置信度 < 0.6、blocked、连续 3 次 wait、执行不明确即交回）。同屏可确定的后续 1–3 步（如点输入框→输入→回车）可放在 `then` 中，与首步合成一次 act，步间等待 400ms；只允许 click/double_click/press/type_input，无效项截断。传 `actions` 时仍与 act 等价。
-
-**容错**：动作缺 `frame` 默认 0，press/wait/type 上多余的 frame/ref 丢弃，`{"type":...}` 视作 action，action 为 JSON 字符串时直接解析；缺 `operation` 按字段推断（plan→run、action(s)→act、url→open/goto、仅目标→inspect、空→tabs），结果附 `operationInferred`。委托门槛和执行器共用动作解析器，解析失败不消耗额度。
-
-`run` 交接时刷新观察，`altairRun.fallback.allowed` 表示是否取得可接手的有效快照，不是额外操作授权。障碍未变化时不要重复 `run`；条件具备后只委托剩余目标，不重放已执行步骤。
-
-> 以下章节为 JEV 时期的设计与实测记录：决策树、候选、完成核验机制沿用，决策服务已换成 Altair；其中的实测数字只代表当时的 JEV/Altair 链路。
+实测（`commandcode/deepseek/deepseek-v4.1-flash-fast`，合成 2000×1200 图）：`see` 约 5.3 秒，两个色块描述正确、目标中心误差 < 15px；`ground` 约 3.4 秒，误差 < 10px。用例 `cargo test --lib probe_live_see_and_ground -- --ignored`（`NOVA_DATA_DIR`、`NOVA_ALTAIR_PROBE_MODEL` 指定配置）。
+> 以下为 JEV/Altair 决策时期的历史记录，相关代码已移除，仅供参考。
 ### 2026-10-10 性能验收边界
 
 真实榜单截图离线压缩：1600×719 PNG 307726 字节 → 1024×460 JPEG 45754 字节，准备约122ms；单次合成视觉定位（不执行输入）约4.17秒，坐标正确。真实 dev 回归曾出现网关返回思考耗尽 512 总 token，未达到一次委托完成；思考模型预算保留2048。后续有界原始 SSE 对照查实 CommandCode Chat Completions 的关闭参数必须为 `reasoning_effort:"off"`：只发 DeepSeek 原生 `thinking.type:"disabled"` 仍返回 reasoning_content；`reasoning_effort:"none"` 被400拒绝且报出枚举；改为 `off` 后同一图文请求无任何推理字段（约2.19秒）。共享 provider 按精确 host 适配此规则，不修改 DeepSeek 原生接口或用户选择的 high；不能把该单次对照当作整页连续驱动已验收。浏览器摘要同60元素预算、三张真实快照减小约27%，不包含图片/MCP外层封装。

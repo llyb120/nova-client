@@ -23,6 +23,12 @@ assert.deepEqual(processLiveLines([tool(1, "read"), thought(2, "abcd")], wrapThr
 assert.deepEqual(processLiveLines([tool(1, "read"), thought(2, "旧行\n最新第一行\n最新第二行\n")]), ["最新第一行", "最新第二行"]);
 assert.deepEqual(processLiveLines([thought(1, "abcdef")], text => text.match(/.{1,2}/gu)), ["cd", "ef"]);
 assert.deepEqual(processLiveLines([thought(1, "abcdefg")], text => text.match(/.{1,2}/gu)), ["ef", "g"]);
+// 思考分段或换行后的空白不能占用两行摘要，也不能挤掉上一条工具状态。
+assert.deepEqual(processLiveLines([thought(1, "\n\n**Refining capped selection**")]), ["**Refining capped selection**"]);
+assert.deepEqual(processLiveLines([tool(1, "read"), thought(2, "\n\n新段落")]), ["已完成 · read file.ts", "新段落"]);
+assert.deepEqual(processLiveLines([thought(1, "上一行\n \t\r\n最新一行\n")]), ["上一行", "最新一行"]);
+assert.deepEqual(processLiveLines([thought(1)], () => ["较早", "", "上一行", " \t", "最新一行", ""]), ["上一行", "最新一行"]);
+assert.deepEqual(processLiveLines([thought(1, " \n\t")]), ["思考中…"]);
 assert.deepEqual(processLiveLines([]), []);
 assert.deepEqual(processSegments([]), []);
 assert.deepEqual(processSegments([thought(1, ""), thought(2, " \n\t")]), []);

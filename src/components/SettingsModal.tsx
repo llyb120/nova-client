@@ -235,7 +235,7 @@ type SettingsTab =
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
   { id: "advanced", name: "高级" },
-  { id: "altair", name: "Altair 辅助决策" },
+  { id: "altair", name: "Altair 视觉代理" },
   { id: "lyra", name: "Lyra" },
   { id: "backends", name: "模型后端" },
   { id: "instructions", name: "Agent 配置" },
@@ -260,7 +260,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     setAltairTestResult("");
     try {
       const result = await invoke<{ elapsedMs: number }>("test_altair_connection", { altairModel: altairModel() });
-      setAltairTestResult(`接口测试通过，耗时 ${result.elapsedMs} ms（仅固定测试，不代表控制成功率）`);
+      setAltairTestResult(`接口测试通过，耗时 ${result.elapsedMs} ms（仅连通性测试，不代表识图准确率）`);
     } catch (error) { setAltairTestResult(String(error)); }
     finally { setAltairTesting(false); }
   };
@@ -1124,10 +1124,10 @@ export function SettingsModal(props: { onClose: () => void }) {
         <div class="modal-body">
           <Show when={tab() === "altair"}>
             <section class="settings-group">
-              <h3 class="settings-group-title">Altair（文本 + 截图）</h3>
+              <h3 class="settings-group-title">Altair 视觉代理</h3>
               <label class="field">
                 <span><input type="checkbox" checked={altairEnabled()} onChange={e => setAltairEnabled(e.currentTarget.checked)} /> 启用 Altair</span>
-                <span class="field-hint">开启后，主模型的网页 DOM 点击/填写/滚动先交给 run，由所选模型结合页面文字与当前截图逐步决策，同屏可确定的后续步骤连续执行（每步之间等待页面稳定）；剑来桌面 run（plan.task）也由 Altair 驱动。置信度不足、卡住或越权时交回主模型。每次只发一次独立请求（不带会话上下文），关闭思考，会上传截图。</span>
+                <span class="field-hint">开启后，剑来与浏览器的截图交给所选模型识别，主模型只收到文字摘要、问题回答和可点击目标（v1…），不再接收图片；主模型仍负责所有判断，坐标动作可写 target 由 Altair 定位，多步操作每步重新截图定位。识图失败时自动附原图，主模型也可用 vision:"raw" 要原图。每次识图是一次独立请求（不带会话上下文，关闭思考），会上传截图。</span>
               </label>
               <div class="field">
                 <span class="field-label">Altair 模型</span>

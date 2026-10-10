@@ -17,9 +17,9 @@
 
 标签 tag 在导航、切换激活页、后台重启时保持稳定，关闭标签或重启 Chrome 后失效。目标参数名是 `tabTag`，不是数字 `tabId`；从 `tabs[].tag` 或 `open` 返回值原样复制。目标操作应始终携带它；漏传时仅用本会话 180 秒内的 `snapshotId` 或唯一有效观察恢复，不选择 Chrome 当前激活页。多标签有歧义、观察过期或属于其它会话时要求明确指定目标。
 
-常用调用：`inspect(tabTag)`、`act(tabTag,snapshotId,action或actions)`、`run(tabTag,plan)`。`act` 缺少/失效的快照只返回新观察，不执行原动作；`run` 可在缺少/失效快照时先观察再决策。Altair 开启后，网页 DOM 点击/填写/滚动先委托 `run`（Altair 结合页面文字与截图决策，同屏续步连续执行），受阻后由主模型处理。
+常用调用：`inspect(tabTag)`、`act(tabTag,snapshotId,action或actions)`、`run(tabTag,plan)`。`act` 缺少/失效的快照只返回新观察，不执行原动作；`run` 可在缺少/失效快照时先观察再决策。Altair 开启后截图由 Altair 转成文字（`vision`），主模型不接收图片；坐标动作可写 `target` 由 Altair 定位。`run` 只按主模型给出的 steps 连续执行。
 
-支持整页 DOM、iframe、滚动区域、整页分片截图、点击、填写、键盘、滚动、拖动、等待、多标签和导航。act 返回最新观察供验证并继续。基础操作无需辅助模型，连续任务可选 Altair，不使用 Playwright。切换 Nova 会话保留 Chrome 页面。
+支持整页 DOM、iframe、滚动区域、整页分片截图、点击、填写、键盘、滚动、拖动、等待、多标签和导航。act 返回最新观察供验证并继续。基础操作无需辅助模型，截图可交给 Altair 识别，不使用 Playwright。切换 Nova 会话保留 Chrome 页面。
 
 需要停止操作时使用 chrome 的 stop 操作。断线、超时不自动重放操作，应先观察确认结果。
 

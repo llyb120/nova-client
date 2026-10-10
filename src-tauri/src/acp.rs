@@ -3432,8 +3432,7 @@ impl AcpManager {
             Err(e) => {
                 let state = self.app.state::<AppState>();
                 let mut store = state.store.lock().unwrap();
-                if let Some(thread) = store.get_mut(&thread_id) {
-                    let item = thread.push_system(e, "error");
+                if let Some(item) = store.get_mut(&thread_id).and_then(|thread| push_prompt_error(thread, e)) {
                     self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
                 }
                 ("error".to_string(), None)
@@ -3681,8 +3680,7 @@ impl AcpManager {
         let err = |msg: String| {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
-            if let Some(thread) = store.get_mut(&thread_id) {
-                let item = thread.push_system(msg, "error");
+            if let Some(item) = store.get_mut(&thread_id).and_then(|thread| push_prompt_error(thread, msg)) {
                 store.save_thread(&thread_id);
                 self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
             }
@@ -5137,6 +5135,58 @@ pub(crate) fn apply_proxy_env(cmd: &mut tokio::process::Command, proxy: &str) {
 /// 典型：`RetriableError: [unavailable] PING timed out`、`RetriableError: Connection stalled`、
 /// `RetriableError: [aborted] read ECONNRESET`、裸 `Internal error`。
 /// 重试通常能成功，不应清 session / 杀进程（进程已死的情况由调用方单独处理）。
+fn push_prompt_error(thread: &mut Thread, error: String) -> Option<Item> {
+    let message = error.trim();
+    // Claude may stream the failure as assistant text before rejecting session/prompt.
+    // Only deduplicate visible text in this turn; never hide a later turn's failure.
+    let shown = !message.is_empty() && thread.items.iter().rev()
+        .take_while(|item| !matches!(item, Item::User { .. } | Item::Turn { .. }))
+        .any(|item| match item {
+            Item::Assistant { text, .. } | Item::System { text, .. } => {
+                text.trim() == message || text.trim_end().strip_suffix(message)
+                    .is_some_and(|prefix| prefix.ends_with('\n'))
+            }
+            _ => false,
+        });
+    if shown { None } else { Some(thread.push_system(error, "error")) }
+}
+
+#[test]
+fn prompt_error_is_shown_once_per_turn() {
+    const ERROR: &str = "API Error: Repeated 529 Overloaded errors.";
+    for text in [ERROR.to_string(), format!("Earlier output\n\n{ERROR}\r\n")] {
+        let mut thread = Thread::new(String::new(), AgentKind::Claude, None, None, None, false);
+        thread.push_user("test".into(), vec![]);
+        thread.items.push(Item::Assistant { id: thread.next_item_id(), text, ts: now_ms() });
+        let before = thread.items.len();
+        assert!(push_prompt_error(&mut thread, format!(" {ERROR}\n")).is_none());
+        assert_eq!(thread.items.len(), before);
+        let turn = thread.push_turn(1, None, "error");
+        assert!(matches!(turn, Item::Turn { stop_reason, .. } if stop_reason == "error"));
+        // Identical failures in a subsequent turn must still be reported.
+        assert!(push_prompt_error(&mut thread, ERROR.into()).is_some());
+        thread.push_user("retry".into(), vec![]);
+        assert!(push_prompt_error(&mut thread, ERROR.into()).is_some());
+    }
+
+    let mut thread = Thread::new(String::new(), AgentKind::Claude, None, None, None, false);
+    thread.push_user(ERROR.into(), vec![]);
+    thread.items.push(Item::Thought { id: thread.next_item_id(), text: ERROR.into(), ts: now_ms() });
+    // User text and hidden reasoning are not an error notification.
+    assert!(push_prompt_error(&mut thread, ERROR.into()).is_some());
+    let before = thread.items.len();
+    assert!(push_prompt_error(&mut thread, ERROR.into()).is_none());
+    assert_eq!(thread.items.len(), before);
+    assert!(push_prompt_error(&mut thread, "API Error: Unauthorized".into()).is_some());
+
+    thread.push_user("retry".into(), vec![]);
+    thread.items.push(Item::Assistant {
+        id: thread.next_item_id(), text: format!("Not an {ERROR}"), ts: now_ms(),
+    });
+    // A substring in normal prose is not the same error.
+    assert!(push_prompt_error(&mut thread, ERROR.into()).is_some());
+}
+
 fn is_retriable_rpc_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("retriable")
