@@ -69,25 +69,115 @@ fn answer(body: &Value, response: &Value) -> Result<Value, String> {
 
 /// 在最新观察中公开实际启用状态，让主模型能选择已开启的委托入口。
 pub(crate) fn availability(settings: &Settings) -> Value {
-    json!({"enabled":settings.jev_enabled,"requestAttempted":false,"status":"not_delegated","next":if settings.jev_enabled {
-        "JEV 已启用，可按任务委托：明确单步或同屏合批直接 act；目标、授权、输入值和完成条件明确的连续 DOM 流程，在开始前一次 run。已知步骤用 plan.steps，本地先绑定并连续执行，JEV 仅辅助定位歧义与语义核验；未知路径可省略 steps。run 需目标标识（Chrome 的 tabTag / WebView 的 browserId）和 plan.task、authorization、expectedText；snapshotId 可省略，内部会先观察。视觉、授权不明或 handoff 由主模型处理；障碍未变化不要重复 run，解决后再委托剩余目标。act 始终使用最新 snapshotId 和原样复制的 frame/ref，保留节点、焦点与防重放校验。主模型核对最终结果。此字段仅表示可用，不代表已调用。"
-    } else { "JEV 已关闭，主模型继续处理。" }})
+    json!({"enabled":enabled(settings),"jev":settings.jev_enabled,"altair":settings.altair_enabled,
+        "requestAttempted":false,"status":"not_delegated","next":if enabled(settings) {
+        "决策链已启用（JEV 文本判断 → 置信度不足时 Altair 看截图 → 仍不足才交回主模型）。网页 DOM 点击/填写/滚动用 run 驱动，只需 plan.task（一句话目标），authorization/expectedText 可省略；未经 run 的 DOM act 会被退回。run 交回（handoff）后、Canvas/坐标目标才直接 act。主模型核对最终结果。此字段仅表示可用，不代表已调用。"
+    } else { "JEV/Altair 均未开启，主模型继续处理。" }})
 }
 
-pub(crate) async fn advise(settings: Settings, args: &Value) -> Result<Value, String> {
+/// JEV or Altair can drive DOM decisions.
+pub(crate) fn enabled(settings: &Settings) -> bool { settings.jev_enabled || settings.altair_enabled }
+
+// ponytail: one fixed threshold for JEV and Altair; tune from decidedBy/confidence logs or make it a setting.
+pub(crate) const MIN_CONFIDENCE: f64 = 0.6;
+
+/// A decision is acted on only with enough confidence; services that omit it are trusted.
+pub(crate) fn confident(decision: &Value) -> bool {
+    [&decision["confidence"], &decision["operationConfidence"]].into_iter()
+        .all(|v| v.is_null() || v.as_f64().is_some_and(|c| (MIN_CONFIDENCE..=1.0).contains(&c)))
+}
+
+/// WAIT needs no confidence; BLOCKED/defer and unsure answers escalate to the next tier.
+fn settled(decision: &Value) -> bool {
+    decision["status"] == "advised" && (decision["choice"] == "observe" || (decision["choice"] != "defer" && confident(decision)))
+}
+
+/// The decision chain: JEV (text, fast) → Altair (screenshot) → main model.
+/// `image` is awaited only when Altair is actually asked, so the screenshot costs nothing otherwise.
+/// Result `status`: advised (act on it, incl. defer) / low_confidence (hand off) / unavailable / disabled.
+async fn decide(settings: Settings, body: Result<Value, String>, image: impl std::future::Future<Output = Option<Value>>) -> Result<Value, String> {
+    if !enabled(&settings) {
+        let mut result = send(settings, body).await;
+        result["attempts"] = json!([]);
+        return Ok(result);
+    }
+    let started = std::time::Instant::now();
+    let mut jev = None;
+    if settings.jev_enabled {
+        let mut result = send(settings.clone(), body.clone()).await;
+        result["decidedBy"] = json!("jev");
+        if settled(&result) || !settings.altair_enabled { return Ok(unsure(result, None)); }
+        jev = Some(result);
+    }
+    let mut result = altair_send(&settings, body, image).await;
+    result["decidedBy"] = json!("altair");
+    if let Some(jev) = &jev {
+        result["jev"] = json!({"choice":jev["choice"],"confidence":jev["confidence"],"status":jev["status"],"error":jev["error"]});
+    }
+    let mut result = unsure(result, jev);
+    result["elapsedMs"] = json!(started.elapsed().as_millis() as u64);
+    Ok(result)
+}
+
+/// Picks the usable answer of the last tier (falling back to the earlier one when it failed) and
+/// marks an unsure action as low_confidence so callers hand off instead of executing it.
+fn unsure(primary: Value, fallback: Option<Value>) -> Value {
+    // One entry per tier, before choosing/normalising the final answer; not one per HTTP retry.
+    let attempts: Vec<Value> = fallback.iter().chain(std::iter::once(&primary)).map(|decision| {
+        json!({"by":decision["decidedBy"],"status":decision["status"],"choice":decision["choice"],
+            "confidence":decision["confidence"],"operationConfidence":decision["operationConfidence"],"requestAttempted":decision["requestAttempted"],
+            "elapsedMs":decision["elapsedMs"],"latency":decision["latency"],"error":decision["error"]})
+    }).collect();
+    let altair_error = if primary["decidedBy"] == "altair" { primary["error"].clone() } else { Value::Null };
+    let mut result = match fallback { Some(earlier) if primary["status"] != "advised" => earlier, _ => primary };
+    if !altair_error.is_null() { result["altairError"] = altair_error; }
+    result["attempts"] = json!(attempts);
+    if result["status"] == "advised" && result["choice"] != "defer" && !settled(&result) {
+        result["status"] = json!("low_confidence");
+        result["next"] = json!("JEV/Altair 置信度不足，交回主模型核对最新观察后决定");
+    }
+    result
+}
+
+async fn altair_send(settings: &Settings, body: Result<Value, String>, image: impl std::future::Future<Output = Option<Value>>) -> Value {
+    let started = std::time::Instant::now();
+    let mut attempted = false;
+    let result = async {
+        let mut body = body?;
+        // Fallback is one cautious step, not three duplicate full candidate lists for prediction.
+        if body["questions"]["operation"].is_object() {
+            body["questions"].as_object_mut().unwrap().retain(|name, _| !name.starts_with("next_"));
+        }
+        let image = image.await;
+        let response = crate::altair::ask(settings, &body, image, &mut attempted).await?;
+        let mut decision = if body["questions"].get("operation").is_some() { path_answer(&body, &response) } else { answer(&body, &response) }?;
+        decision["latency"] = response["latency"].clone();
+        Ok::<_, String>(decision)
+    }.await;
+    let mut result = result.unwrap_or_else(|error: String| {
+        let error = if error.starts_with("Altair") { error } else { format!("Altair {}", error.strip_prefix("JEV ").unwrap_or(&error)) };
+        json!({"status":"unavailable","advisoryOnly":true,
+            "error":error,"next":"交回主模型继续处理，不自动重试，不重放操作"})
+    });
+    result["elapsedMs"] = json!(started.elapsed().as_millis() as u64);
+    result["requestAttempted"] = json!(attempted);
+    result
+}
+
+pub(crate) async fn advise(settings: Settings, args: &Value, image: impl std::future::Future<Output = Option<Value>>) -> Result<Value, String> {
     let body = request(&settings, args);
-    send(settings, body).await
+    decide(settings, body, image).await
 }
 
 // Ultrafast-style dynamic action space (browser-use/jev-ultrafast): one operation head plus one
 // target head per operation kind, answered in the same request. Only the chosen operation's target
 // can execute; control choices no longer compete with ~90 element hints in one flat list.
 const OPERATION_RULES: &str = "从当前页面选择一种能推进整个目标的操作；具体目标由对应的 *_target 题选出，只有被选中操作的目标会执行。\
-DONE：最新观察已有满足全部完成条件的证据（数量、筛选、排序、日期都核对；选项出现不等于已选中或已应用）。已满足的步骤不要重做，避免反转已完成状态。\
+DONE：最新观察已有满足全部完成条件的证据（数量、筛选、排序、日期都核对；选项出现不等于已选中或已应用）。指定排序的 TopN 是该排序下的前 N 行，不能拿最高 N 项反转；空值如实报告，不擅自改口径。已满足的步骤不要重做，避免反转已完成状态。\
 WAIT：只在页面确有加载迹象或刚提交的结果尚未出现时；已打开的菜单不是加载，最近的等待不是加载证据；有能推进目标的控件时优先操作。\
 TYPE_TEXT：有已授权的 fill 候选且字段值还不对时先填写，再提交；输入搜索词后仍需选择匹配的建议项或提交。\
 PRESS：已填好的授权输入框需要回车提交或 Tab 确认。\
-CLICK：目标、入口、菜单项可见时直接点；面板里勾选或填写后要点确认/应用才生效；必填项已就绪且搜索/提交按钮可见时立即点。\
+CLICK：仅为尚未满足的条件点击目标、入口或菜单项；面板里勾选或填写后需要确认/应用才生效时点击它。目标已经满足时选DONE，不因搜索/提交按钮仍可见而再点一次。\
 SCROLL：目标在视口外。\
 BLOCKED：需要输入文字却没有对应 fill 候选（值未授权）、真实歧义、越权、需要视觉，或本批候选里没有目标（会换下一批）；不要反复点输入框、来回滚动或打开无关菜单拖延。\
 最近动作的 effect 是执行后的实际变化（url 跳转、newControls、newText、changed）；无变化或只多了释义/提示文字说明该动作没达到目的，不要重复。\
@@ -189,7 +279,8 @@ fn path_answer(body: &Value, response: &Value) -> Result<Value, String> {
 
 /// One narrow multiple-choice question (which control is this step's target / is this condition
 /// met). Small, precise questions are where JEV is fast and stable; planning stays with the main model.
-pub(crate) async fn choose(settings: Settings, task: &str, state: &str, choices: &BTreeMap<String, String>, instructions: &str) -> Result<Value, String> {
+pub(crate) async fn choose(settings: Settings, task: &str, state: &str, choices: &BTreeMap<String, String>, instructions: &str,
+    image: impl std::future::Future<Output = Option<Value>>) -> Result<Value, String> {
     let body = (|| {
         if task.trim().is_empty() || task.chars().count() > 8000 || state.chars().count() > 48000
             || choices.is_empty() || choices.len() > 96
@@ -201,19 +292,21 @@ pub(crate) async fn choose(settings: Settings, task: &str, state: &str, choices:
         Ok(json!({"model":"jev-latest","state":{"task":task,"observation":if state.trim().is_empty() { "无" } else { state }},
             "questions":{"next":{"type":"choice","criteria":criteria,"instructions":instructions}}}))
     })();
-    send(settings, body).await
+    decide(settings, body, image).await
 }
 
 /// One request plans the current step plus a short same-screen continuation; the runner
 /// re-binds and validates every continuation step against fresh DOM before executing it.
 pub(crate) async fn plan_path(settings: Settings, task: &str, state: &Value,
-    targets: &BTreeMap<String, BTreeMap<String, String>>, done: &str, followups: &BTreeMap<String, String>, depth: usize) -> Result<Value, String> {
-    send(settings, path_request(task, state, targets, done, followups, depth)).await
+    targets: &BTreeMap<String, BTreeMap<String, String>>, done: &str, followups: &BTreeMap<String, String>, depth: usize,
+    image: impl std::future::Future<Output = Option<Value>>) -> Result<Value, String> {
+    decide(settings, path_request(task, state, targets, done, followups, depth), image).await
 }
 
-async fn send(settings: Settings, body: Result<Value, String>) -> Result<Value, String> {
+// Transport/preflight errors are decision data: they must not bypass the Altair tier via `?`.
+async fn send(settings: Settings, body: Result<Value, String>) -> Value {
     if !settings.jev_enabled {
-        return Ok(json!({"status":"disabled","advisoryOnly":true,"requestAttempted":false,"elapsedMs":0,"next":"JEV 已关闭，主模型继续处理；可在设置中启用"}));
+        return json!({"status":"disabled","advisoryOnly":true,"requestAttempted":false,"elapsedMs":0,"next":"JEV 已关闭，主模型继续处理；可在设置中启用"});
     }
     let key = if settings.jev_api_key.trim().is_empty() {
         std::env::var("NOVA_JEV_API_KEY").unwrap_or_default()
@@ -239,12 +332,13 @@ async fn send(settings: Settings, body: Result<Value, String>) -> Result<Value, 
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(3)).timeout(Duration::from_secs(8))
             .build().map_err(|_| "无法创建 JEV HTTP 客户端".to_string())).as_ref().map_err(Clone::clone)?;
-        request_attempted = true;
         // Advice is read-only, so a transient overload is retried twice with backoff (as jev-ultrafast does).
         let mut attempt = 0;
         let mut response = loop {
-            let response = client.post(url.clone()).bearer_auth(key.trim()).json(&body).send().await
-                .map_err(|_| "JEV 请求失败或超时".to_string())?;
+            let request = client.post(url.clone()).bearer_auth(key.trim()).json(&body).build()
+                .map_err(|_| "JEV 请求构建失败，请检查 API Key 和请求配置".to_string())?;
+            request_attempted = true;
+            let response = client.execute(request).await.map_err(|_| "JEV 请求失败或超时".to_string())?;
             if !matches!(response.status().as_u16(), 429 | 503 | 529) || attempt >= 2 { break response; }
             tokio::time::sleep(Duration::from_millis(500 << attempt)).await;
             attempt += 1;
@@ -272,7 +366,7 @@ async fn send(settings: Settings, body: Result<Value, String>) -> Result<Value, 
         "error":error,"next":"交回主模型继续处理，不自动重试，不重放操作"}));
     result["elapsedMs"] = json!(started.elapsed().as_millis() as u64);
     result["requestAttempted"] = json!(request_attempted);
-    Ok(result)
+    result
 }
 
 /// Tests the draft configuration without persisting it or sending any user observations.
@@ -281,19 +375,28 @@ pub(crate) async fn test_jev_connection(
     webview: tauri::Webview,
     api_key: String,
     api_url: Option<String>,
+    altair_model: Option<String>,
 ) -> Result<Value, String> {
+    use base64::Engine;
     if webview.label() != "main" { return Err("仅 Nova 主界面可以测试 JEV".into()); }
+    // A non-empty altair_model tests only Altair (with the bundled app icon as the screenshot).
+    let altair_model = altair_model.unwrap_or_default();
+    let altair = !altair_model.trim().is_empty();
     let settings = Settings {
-        jev_enabled: true, jev_api_key: api_key,
+        jev_enabled: !altair, jev_api_key: api_key,
         jev_api_url: api_url.unwrap_or_default(),
+        altair_enabled: altair, altair_model,
+        lyra_proxy: crate::settings::Settings::load(&crate::lyra::config::nova_root()).lyra_proxy,
         ..Settings::default()
     };
+    let icon = json!({"type":"image","mimeType":"image/png",
+        "data":base64::engine::general_purpose::STANDARD.encode(include_bytes!("../icons/128x128.png"))});
     let result = advise(settings, &json!({"advice":{
         "task":"选择与观察中的单词相同的候选", "state":"单词是 ready",
         "choices":{"ready":"单词是 ready", "other":"单词不是 ready"}
-    }})).await?;
+    }}), std::future::ready(Some(icon))).await?;
     if result["status"] != "advised" {
-        return Err(result["error"].as_str().unwrap_or("JEV 测试未成功").into());
+        return Err(result["error"].as_str().or(result["next"].as_str()).unwrap_or("测试未成功").into());
     }
     if result["choice"] != "ready" { return Err("接口已响应，但测试判断未通过，请检查模型配置".into()); }
     Ok(json!({"model":result["model"], "elapsedMs":result["elapsedMs"]}))
@@ -340,15 +443,102 @@ mod tests {
             stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
         });
         let args = json!({"advice":{"task":"test", "state":"ready", "choices":{"ready":"ready"}}});
-        let result = advise(settings.clone(), &args).await.unwrap();
+        let result = advise(settings.clone(), &args, std::future::ready(None)).await.unwrap();
         assert_eq!(result["status"], "advised", "{result}");
         assert_eq!(result["requestAttempted"], true);
+        assert_eq!(result["attempts"].as_array().unwrap().len(), 1);
+        assert_eq!(result["attempts"][0]["by"], "jev");
         tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
         for address in ["invalid", "ftp://example.com/jev", "https://user:secret@example.com/jev", "https://example.com/jev#fragment"] {
-            let result = advise(Settings { jev_api_url: address.into(), ..settings.clone() }, &args).await.unwrap();
+            let result = advise(Settings { jev_api_url: address.into(), ..settings.clone() }, &args, std::future::ready(None)).await.unwrap();
             assert_eq!(result["status"], "unavailable");
             assert_eq!(result["requestAttempted"], false);
         }
+    }
+
+    #[test]
+    fn chain_escalates_unsure_and_blocked_answers() {
+        let ok = json!({"status":"advised","choice":"a01","confidence":0.9});
+        let low = json!({"status":"advised","choice":"a01","confidence":0.2});
+        assert!(settled(&ok) && settled(&json!({"status":"advised","choice":"a01"})));
+        assert!(settled(&json!({"status":"advised","choice":"observe","confidence":0.1})), "WAIT 不需要置信度");
+        assert!(!settled(&low) && !settled(&json!({"status":"advised","choice":"defer","confidence":0.99})));
+        assert_eq!(unsure(low.clone(), None)["status"], "low_confidence");
+        // Altair failed: fall back to JEV's (still unsure) answer and keep the error for diagnosis.
+        let failed = json!({"decidedBy":"altair","status":"unavailable","error":"Altair 响应超时"});
+        let merged = unsure(failed, Some(low));
+        assert_eq!((merged["status"].as_str(), merged["altairError"].as_str()), (Some("low_confidence"), Some("Altair 响应超时")));
+        let defer = json!({"status":"advised","choice":"defer","confidence":0.3});
+        assert_eq!(unsure(defer, None)["status"], "advised", "defer 保持原语义，由调用方换批或交回");
+        let mut unsure_operation = ok.clone();
+        unsure_operation["operationConfidence"] = json!(0.3);
+        assert!(!settled(&unsure_operation), "a confident target cannot override an unsure operation");
+        assert_eq!(unsure(unsure_operation, None)["status"], "low_confidence");
+        for invalid in [json!(-0.1), json!(1.1), json!("0.9")] {
+            let mut decision = ok.clone(); decision["confidence"] = invalid;
+            assert!(!confident(&decision));
+        }
+    }
+
+    #[test]
+    fn chain_attempts_keep_single_success_and_failed_fallback() {
+        let jev = json!({"decidedBy":"jev","status":"advised","choice":"a01","confidence":0.9,
+            "requestAttempted":true,"elapsedMs":12});
+        let single = unsure(jev.clone(), None);
+        assert_eq!(single["decidedBy"], "jev");
+        assert_eq!(single["attempts"], json!([{"by":"jev","status":"advised","choice":"a01","confidence":0.9,
+            "operationConfidence":null,"requestAttempted":true,"elapsedMs":12,"latency":null,"error":null}]));
+        let wait = unsure(json!({"decidedBy":"altair","status":"advised","choice":"observe","confidence":0.1}), Some(jev.clone()));
+        assert_eq!(wait["status"], "advised", "WAIT keeps the existing no-confidence-required policy");
+        assert_eq!(wait["decidedBy"], "altair");
+        assert_eq!(wait["attempts"].as_array().unwrap().len(), 2);
+        for choice in ["a01", "defer"] {
+            for attempted in [false, true] {
+                let mut earlier = jev.clone();
+                earlier["choice"] = json!(choice);
+                earlier["confidence"] = json!(0.2);
+                let error = if attempted { "Altair 响应超时" } else { "Altair 需要当前截图" };
+                let failed = json!({"decidedBy":"altair","status":"unavailable","requestAttempted":attempted,"elapsedMs":34,"error":error});
+                let merged = unsure(failed.clone(), Some(earlier));
+                assert_eq!(merged["decidedBy"], "jev");
+                assert_eq!(merged["choice"], choice);
+                assert_eq!(merged["status"], if choice == "defer" { "advised" } else { "low_confidence" });
+                assert_eq!(merged["altairError"], error);
+                assert_eq!(merged["attempts"], json!([
+                    {"by":"jev","status":"advised","choice":choice,"confidence":0.2,"operationConfidence":null,"requestAttempted":true,"elapsedMs":12,"latency":null,"error":null},
+                    {"by":"altair","status":"unavailable","choice":null,"confidence":null,"operationConfidence":null,"requestAttempted":attempted,"elapsedMs":34,"latency":null,"error":error}
+                ]));
+                assert_eq!(unsure(failed, None)["altairError"], error, "Altair-only failures retain the same error field");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn network_failure_escalates_and_preflight_does_not_claim_a_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let settings = Settings { jev_enabled: true, jev_api_key: "test-key".into(),
+            jev_api_url: format!("http://{}", listener.local_addr().unwrap()),
+            altair_enabled: true, altair_model: String::new(), ..Settings::default() };
+        let server = tokio::spawn(async move { drop(listener.accept().await.unwrap()); });
+        let args = json!({"advice":{"task":"test","state":"ready","choices":{"ready":"ready"}}});
+        let result = advise(settings, &args, std::future::ready(None)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+        assert_eq!(result["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(result["attempts"][0]["by"], "jev");
+        assert_eq!(result["attempts"][0]["requestAttempted"], true);
+        assert_eq!(result["attempts"][0]["error"], "JEV 请求失败或超时");
+        assert_eq!(result["attempts"][1]["by"], "altair");
+        assert_eq!(result["attempts"][1]["requestAttempted"], false);
+        assert!(result["altairError"].as_str().unwrap().contains("选择 Altair 模型"));
+        // Missing screenshot is rejected before config lookup, so no credentials or remote endpoint are used.
+        let settings = Settings { jev_enabled: false, altair_enabled: true, altair_model: "unused/model".into(), ..Settings::default() };
+        let missing = advise(settings, &args, std::future::ready(None)).await.unwrap();
+        assert_eq!(missing["attempts"].as_array().unwrap().len(), 1);
+        assert_eq!(missing["attempts"][0]["requestAttempted"], false);
+        assert_eq!(missing["altairError"], "Altair 需要当前截图");
+        let disabled = advise(Settings { jev_enabled: false, altair_enabled: false, ..Settings::default() },
+            &args, std::future::ready(None)).await.unwrap();
+        assert_eq!(disabled["attempts"], json!([]));
     }
 
     #[test]
@@ -415,9 +605,9 @@ mod tests {
         assert_eq!(availability(&settings)["status"], "not_delegated");
         assert_eq!(availability(&settings)["requestAttempted"], false);
         assert_eq!(availability(&Settings { jev_enabled: true, ..settings.clone() })["enabled"], true);
-        assert_eq!(advise(settings.clone(), &json!({})).await.unwrap()["status"], "disabled");
-        assert_eq!(advise(settings.clone(), &json!({})).await.unwrap()["requestAttempted"], false);
-        let invalid = advise(Settings { jev_enabled: true, jev_api_key: "unused".into(), ..settings.clone() }, &json!({})).await.unwrap();
+        assert_eq!(advise(settings.clone(), &json!({}), std::future::ready(None)).await.unwrap()["status"], "disabled");
+        assert_eq!(advise(settings.clone(), &json!({}), std::future::ready(None)).await.unwrap()["requestAttempted"], false);
+        let invalid = advise(Settings { jev_enabled: true, jev_api_key: "unused".into(), ..settings.clone() }, &json!({}), std::future::ready(None)).await.unwrap();
         assert_eq!(invalid["status"], "unavailable");
         assert_eq!(invalid["requestAttempted"], false);
         assert!(invalid["elapsedMs"].is_u64());

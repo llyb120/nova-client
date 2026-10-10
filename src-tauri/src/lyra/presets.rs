@@ -396,12 +396,14 @@ fn catalog_model<'a>(catalog: Option<&'a Value>, id: &str) -> Option<&'a Value> 
         .map(|(_, model)| model)
 }
 
-// 只借用基础模型的推理能力，不借上下文、模态等可能因变体而异的元数据。
+/// 计费/速度/上下文变体对应的原模型 ID。
+fn variant_base(id: &str) -> Option<&str> {
+    ["[1m]", "-1m", "-fast", "-paid", ":free"].iter().find_map(|s| id.strip_suffix(s))
+}
+
+// 目录里只借用基础模型的推理能力；同列表里的原模型由 convert 末尾整体补齐。
 fn reasoning_catalog_model<'a>(catalog: Option<&'a Value>, id: &str) -> Option<&'a Value> {
-    catalog_model(catalog, id).or_else(|| {
-        let base = ["[1m]", "-1m", "-fast", "-paid", ":free"].iter().find_map(|s| id.strip_suffix(s))?;
-        catalog_model(catalog, base)
-    })
+    catalog_model(catalog, id).or_else(|| catalog_model(catalog, variant_base(id)?))
 }
 
 /// models.dev 的 npm 包名 → Lyra 协议；Google 原生协议不支持，返回 None。
@@ -536,6 +538,26 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_i
             }
         }
         out.insert(id.to_string(), model);
+    }
+    // 变体（如 deepseek-v4-flash-fast）常缺模态、输出上限等元数据，缺什么沿用原模型；1M 变体不继承上下文。
+    let ids: Vec<String> = out.keys().cloned().collect();
+    for id in ids {
+        let Some(base) = variant_base(&id).and_then(|b| out.get(b)).cloned() else { continue };
+        let model = out.get_mut(&id).unwrap();
+        for field in ["modalities", "reasoning", "options", "variants"] {
+            if model.get(field).is_none() {
+                if let Some(value) = base.get(field) { model[field] = value.clone(); }
+            }
+        }
+        let long = id.ends_with("[1m]") || id.ends_with("-1m");
+        for key in ["context", "output"] {
+            if (key == "output" || !long) && model.pointer(&format!("/limit/{key}")).is_none() {
+                if let Some(value) = base.pointer(&format!("/limit/{key}")) {
+                    if !model["limit"].is_object() { model["limit"] = json!({}); }
+                    model["limit"][key] = value.clone();
+                }
+            }
+        }
     }
     out
 }
@@ -1015,6 +1037,12 @@ env_key = "TEST_KEY"
         ]}), None, Some(&catalog), "commandcode");
         let fast = convert(&json!({"data":[{"id":"claude-opus-5-5-fast","supported_endpoints":["/messages"]}]}), None, Some(&catalog), "commandcode");
         assert_eq!(fast["claude-opus-5-5-fast"]["variants"]["high"]["reasoningEffort"], "high");
+        let flash = convert(&json!({"data":[
+            {"id":"deepseek/deepseek-v4-flash","context_length":1_000_000,"architecture":{"input_modalities":["text","image"]},"top_provider":{"max_completion_tokens":393216}},
+            {"id":"deepseek/deepseek-v4-flash-fast","context_length":1_000_000}
+        ]}), None, None, "commandcode");
+        assert_eq!(flash["deepseek/deepseek-v4-flash-fast"]["modalities"], flash["deepseek/deepseek-v4-flash"]["modalities"]);
+        assert_eq!(flash["deepseek/deepseek-v4-flash-fast"]["limit"]["output"], 393216);
         assert_eq!(models["gpt-6-astra"]["api"], "openai-responses");
         assert!(!models.contains_key("gpt-6.1-sol"));
         assert_eq!(models["claude-opus-5-5"]["options"]["thinkingFormat"], "anthropic");

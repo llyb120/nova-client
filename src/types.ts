@@ -426,6 +426,9 @@ export interface Settings {
   jevEnabled: boolean;
   jevApiKey: string;
   jevApiUrl: string;
+  /** Altair：Lyra 识图模型，JEV 置信度不足或未开启时带截图判断。 */
+  altairEnabled: boolean;
+  altairModel: string;
   claudePath: string;
   claudeProxy: string;
   claudeEnabled: boolean;

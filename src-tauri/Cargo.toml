@@ -24,6 +24,8 @@ anyhow = "1"
 base64 = "0.22"
 enigo = "0.6.1"
 xcap = "0.9.8"
+# Enable JPEG on xcap's existing image crate for compact auxiliary-model screenshots.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 flate2 = "1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "native-tls", "blocking", "system-proxy", "socks", "stream", "multipart"] }

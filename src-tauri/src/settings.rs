@@ -67,6 +67,9 @@ pub struct Settings {
     pub jev_enabled: bool,
     pub jev_api_key: String,
     pub jev_api_url: String,
+    /// Altair：Lyra 配置的识图模型，JEV 置信度不足或未开启时带截图判断。
+    pub altair_enabled: bool,
+    pub altair_model: String,
     /// Kimi Code CLI，使用固定的 `acp` 子命令。
     pub kimi_path: String,
     /// Claude Code 的 ACP adapter（不是 claude CLI 本身）。
@@ -202,6 +205,8 @@ impl Default for Settings {
             jev_enabled: false,
             jev_api_key: String::new(),
             jev_api_url: String::new(),
+            altair_enabled: false,
+            altair_model: String::new(),
             kimi_path: "kimi".into(),
             claude_path: "claude-agent-acp".into(),
             claude_proxy: String::new(),

@@ -1,5 +1,6 @@
 mod visual_guard;
 mod acp;
+mod altair;
 mod agent_config;
 mod jianlai;
 mod employee;

@@ -1,5 +1,5 @@
 //! JEV × DOM decision tree. Every observation walks the same tree and the first matching node acts:
-//! guard → wait → reflex → path → jev → fallback. Local nodes act without a model round-trip; JEV
+//! guard → wait → completion → reflex → path → jev → fallback. Local nodes act without a model round-trip; JEV
 //! plans the current step plus a short same-screen path only at information boundaries, and each
 //! continuation step is re-bound and validated against fresh DOM. The main model is the fallback.
 use serde::Deserialize;
@@ -10,7 +10,10 @@ use std::{collections::{BTreeMap, HashMap, HashSet, VecDeque}, path::Path, time:
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Plan {
     task: String,
+    // Only task is required so that every backend can delegate with one sentence.
+    #[serde(default = "default_authorization")]
     authorization: String,
+    #[serde(default)]
     expected_text: String,
     #[serde(default)]
     inputs: Vec<Input>,
@@ -27,6 +30,7 @@ struct Plan {
     phrases: Vec<String>,
 }
 fn default_max_actions() -> usize { 32 }
+fn default_authorization() -> String { "仅限完成目标所需的页面内点击、填写、滚动；不做支付、删除、对外发送等不可逆操作".into() }
 /// One step of the main model's plan. The main model decides *what* to do; the runner finds the
 /// control (locally, JEV only for ties), executes consecutive steps without round-trips, and
 /// checks `expect` before moving on.
@@ -95,15 +99,88 @@ struct Input {
 const RUN_BUDGET: Duration = Duration::from_secs(180);
 const LOAD_WAIT: Duration = Duration::from_secs(4);
 const POLL: Duration = Duration::from_millis(250);
-const SETTLE: Duration = Duration::from_millis(200);
 const SHORTLIST: usize = 90;
 const GROUP_MIN: usize = 8;
 const PATH_DEPTH: usize = 4;
 const STATE_REPEATS: usize = 3;
+// 动作后界面常晚一拍才变化：轮询到连续两次一致为止，最多等这么久。
+const ACTION_SETTLE: Duration = Duration::from_millis(1000);
+// JEV 连续选 WAIT 超过这个次数就交给主模型。
+const MAX_WAITS: usize = 2;
+const STEPS_UNMET: &str = "需要按最新页面重新规划";
+// ponytail: two DOM repair attempts per handoff, not two arbitrary batches; then re-delegate.
+// This bounds main-model takeover without trying to infer whether a semantic obstacle was fixed.
+const HANDOFF_ACTS: usize = 2;
+
+// ponytail: in-memory per target; lost on restart, which only means one extra "use run" reply.
+static GRANTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> = std::sync::LazyLock::new(Default::default);
+
+fn grant_key(tool: &str, owner: &str, target: &str) -> String { format!("{tool}:{owner}:{target}") }
+
+/// Shared gate for every backend: with JEV/Altair on, DOM click/fill/scroll from the main model go
+/// through `run` first. Returns Some(reply) when the act must not execute. Passes through internal
+/// run acts, the UI, coordinate/keyboard actions, and acts after a run handed off.
+pub(crate) fn route_act(args: &Value, owner: &str, tool: &str) -> Result<Option<Value>, String> {
+    if executing_browser_action() || owner.starts_with("ui:") || !crate::jev::enabled(&crate::native_browser::jev_settings()?) {
+        return Ok(None);
+    }
+    let target_key = if tool == "webview" { "browserId" } else { "tabTag" };
+    let target = args[target_key].as_str().unwrap_or_default();
+    Ok(gate(args, &grant_key(tool, owner, target))?.then(|| {
+        let mut template = json!({"operation":"run","plan":{"task":"<一句话目标，如：筛选美国、近半年，按 DAU 升序>"}});
+        template[target_key] = json!(target);
+        json!({"status":"not_executed","completedActions":0,"inputAttempted":false,"verification":"unverified",
+            "basedOnSnapshotId":args["snapshotId"],"browser":tool,
+            "reason":"决策链已开启：DOM 点击/填写/滚动先交给 run（JEV 判断 → Altair 看截图 → 仍没把握才交回你）。",
+            "next":"按 runTemplate 调用 run，task 保留完整目标和约束；交回后仅有少量 DOM 排障额度，障碍解决即重新委托剩余目标。坐标、按键类动作不受限。",
+            "runTemplate":template})
+    }))
+}
+
+/// Small shared projection: never drop the failed fallback when the retained answer is from JEV.
+fn decision_log(decision: &Value, tree_path: Value) -> Value {
+    json!({"choice":decision["choice"],"treePath":tree_path,"status":decision["status"],"decidedBy":decision["decidedBy"],
+        "confidence":decision["confidence"],"operationConfidence":decision["operationConfidence"],"requestAttempted":decision["requestAttempted"],"elapsedMs":decision["elapsedMs"],
+        "path":decision["path"],"error":decision["error"],"altairError":decision["altairError"],"attempts":decision["attempts"]})
+}
+
+fn handoff_reason(decision: &Value, fallback: &str) -> String {
+    let mut reason = if decision["status"] == "low_confidence" {
+        format!("JEV/Altair 置信度不足（{} 选 {}，目标置信度 {}，操作置信度 {}，阈值 {}），未执行", decision["decidedBy"].as_str().unwrap_or("?"),
+            decision["choice"].as_str().unwrap_or("?"), decision["confidence"], decision["operationConfidence"], crate::jev::MIN_CONFIDENCE)
+    } else { fallback.to_string() };
+    for error in [decision["error"].as_str(), decision["altairError"].as_str()].into_iter().flatten() {
+        if !reason.contains(error) { reason.push_str(&format!("；{error}")); }
+    }
+    reason
+}
+
+pub(crate) fn handoff_hint(args: &Value, owner: &str, tool: &str) -> Option<Value> {
+    if args["operation"] != "act" || executing_browser_action() || owner.starts_with("ui:")
+        || !crate::jev::enabled(&crate::native_browser::jev_settings().ok()?) { return None; }
+    let target = args[if tool == "chrome" { "tabTag" } else { "browserId" }].as_str()?;
+    let grants = GRANTS.lock().unwrap();
+    let remaining = grants.get(&grant_key(tool, owner, target))?;
+    Some(json!({"remainingDomActions":remaining,"next":if *remaining == 0 {
+        "DOM 排障额度已用完；障碍解决后 run 委托剩余目标，保留原筛选/排序/数量约束，不重放历史动作。仍被同一障碍阻塞则报告原因，不盲目重试。"
+    } else { "此额度只用于解决交接障碍；解决后立即 run 委托剩余目标，不继续手工驱动整个流程。" }}))
+}
+
+/// True when the act must be rerouted; consumes one handoff grant otherwise.
+fn gate(args: &Value, key: &str) -> Result<bool, String> {
+    let dom = crate::native_browser::dom_action_count(args)?;
+    if dom == 0 { return Ok(false); }
+    let mut grants = GRANTS.lock().unwrap();
+    Ok(match grants.get_mut(key) {
+        Some(left) if *left >= dom => { *left -= dom; false }
+        _ => true,
+    })
+}
 
 fn parse(args: &Value) -> Result<Plan, String> {
-    let plan: Plan = serde_json::from_value(args["plan"].clone())
-        .map_err(|e| format!("plan 格式错误（{e}）；需要 task、authorization、expectedText，steps 须为对象数组，如 [{{\"action\":\"click\",\"target\":\"顶部导航 Intelligence\",\"expect\":\"情报页\"}}]，不是字符串"))?;
+    let mut plan: Plan = serde_json::from_value(args["plan"].clone())
+        .map_err(|e| format!("plan 格式错误（{e}）；只需 task（一句话目标），steps 须为对象数组，如 [{{\"action\":\"click\",\"target\":\"顶部导航 Intelligence\",\"expect\":\"情报页\"}}]，不是字符串"))?;
+    if plan.expected_text.trim().is_empty() { plan.expected_text = plan.task.chars().take(500).collect(); }
     let valid = |s: &str, max: usize| !s.trim().is_empty() && s.chars().count() <= max;
     if !valid(&plan.task, 2000) || !valid(&plan.authorization, 1000) || !valid(&plan.expected_text, 500)
         || plan.inputs.len() > 8 || plan.inputs.iter().any(|i| i.name.chars().count() > 300
@@ -167,18 +244,41 @@ fn search_like(item: &Value) -> bool {
 
 /// Goal phrases worth typing into this search box: stated in a clause that also mentions the
 /// field's context (e.g. "Region … United States"), and not already visible on the page.
-fn search_phrases(plan: &Plan, item: &Value, visible: &str) -> Vec<String> {
+fn search_phrases(plan: &Plan, item: &Value, visible: &str, sole_expected_scope: bool) -> Vec<String> {
+    // ponytail: derived search is a single goal value, not a staged query program; use explicit
+    // inputs/steps to replace an already-correct search with another value.
+    if item["value"].as_str().is_some_and(|v| !v.is_empty() && plan.phrases.iter().any(|p| v.eq_ignore_ascii_case(p))) {
+        return Vec::new();
+    }
     let context = format!("{} {}", item["name"].as_str().unwrap_or_default(),
         item["fieldContext"].as_str().unwrap_or_default().chars().take(120).collect::<String>());
     let context_lower = context.to_lowercase();
     let generic = terms("search select all filter find query keyword 搜索 查找 筛选");
     let anchors: HashSet<String> = terms(&context).difference(&generic).cloned().collect();
     let goal = format!("{}\n{}", plan.task, plan.authorization);
-    let clauses: Vec<String> = goal.split(|c: char| "。；;\n，,、()（）".contains(c)).map(str::to_lowercase).collect();
+    // ponytail: inherit context across ONE comma only for an explicit popup/search continuation.
+    // Do not merge whole sentences (Region and Company may request different values); use inputs
+    // for more complex references instead of guessing text for an unrelated field.
+    static CONTINUATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let continuation = CONTINUATION.get_or_init(|| regex::Regex::new(
+        r"^(?:然后|再|并|接着|then\s+)?(?:在(?:弹出(?:的)?|打开(?:的)?|该|这个|当前)?(?:下拉)?(?:列表|菜单|面板|搜索框)(?:中|里)?|in\s+(?:the\s+)?(?:popup|dropdown|menu|panel)\s*)?(?:选择|选中|输入|搜索|查找|select\b|choose\b|type\b|search\b)").unwrap());
+    let clauses: Vec<String> = goal.split(['。', '；', ';', '\n']).flat_map(|sentence| {
+        let parts: Vec<String> = sentence.split(['，', ',']).map(|s| s.trim().to_lowercase()).collect();
+        parts.iter().enumerate().map(|(index, part)| {
+            if index > 0 && continuation.is_match(part) { format!("{} {part}", parts[index - 1]) } else { part.clone() }
+        }).collect::<Vec<_>>()
+    }).collect();
+    let sole_expected_scope = sole_expected_scope && plan.expected_text != plan.task
+        && goal_phrases(&plan.expected_text).iter().filter(|p| {
+            let p = p.to_lowercase(); !visible.contains(&p) && !context_lower.contains(&p)
+        }).count() == 1;
     let mut scored: Vec<(usize, &String)> = plan.phrases.iter().filter_map(|phrase| {
         let lower = phrase.to_lowercase();
         if visible.contains(&lower) || context_lower.contains(&lower) || item["value"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(phrase)) { return None; }
         let score = clauses.iter().filter(|c| c.contains(&lower) && terms(c).intersection(&anchors).next().is_some()).count();
+        // Some backends put the value only in expectedText. It still names an authorized goal,
+        // but inherit task context only for ONE uniquely scoped panel search, never site-wide.
+        let score = score + usize::from(sole_expected_scope && plan.expected_text.to_lowercase().contains(&lower));
         (score > 0).then_some((score, phrase))
     }).collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
@@ -241,6 +341,15 @@ fn evidence(pages: &Value, plan: &Plan) -> String {
         // References change on every observation; semantic completion evidence must not.
         if let Some(columns) = table["columns"].as_array_mut() {
             for column in columns { if let Some(object) = column.as_object_mut() { object.remove("ref"); } }
+        }
+        // Full data tables can exceed the budget by themselves: preview rows rather than dropping
+        // the entire body table (which made a separate empty header look like no results).
+        if let Some(rows) = table["rows"].as_array_mut() {
+            let count = rows.len();
+            rows.truncate(10);
+            let returned = rows.len();
+            table["returnedRows"] = json!(returned);
+            if count > returned { table["previewTruncated"] = json!(true); truncated = true; }
         }
         tables.push(table);
         if json!(tables).to_string().chars().count() > 6000 {
@@ -419,6 +528,12 @@ fn scroll_hints(page: &Value, item: Option<&Value>, horizontal: bool) -> Vec<Can
 // Candidate actions and parameters remain local; the model may select only their IDs.
 fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<Candidate>, String> {
     let frames = pages["pages"].as_array().ok_or("缺少 DOM 观察")?;
+    let generic = terms("search select all filter find query keyword 搜索 查找 筛选");
+    let task_terms: HashSet<String> = terms(&plan.task).difference(&generic).cloned().collect();
+    let scoped_searches: Vec<&Value> = frames.iter().flat_map(|p| p["items"].as_array().into_iter().flatten())
+        .filter(|i| i["inView"] == true && i["editable"] == true && i["disabled"] != true && i["password"] != true
+            && !i["blockedBy"].is_string() && search_like(i)
+            && i["fieldContext"].as_str().is_some_and(|c| !terms(c).is_disjoint(&task_terms))).collect();
     let mut result = Vec::new();
     let mut scrolls = Vec::new();
     for page in frames {
@@ -477,7 +592,7 @@ fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<
                 // Like a person: the goal names a value that the list does not show → type it into the
                 // panel's search box. Only search/filter boxes, only the main model's own words.
                 if search_like(item) && !plan.inputs.iter().any(|input| input_matches(item, input)) {
-                    for phrase in search_phrases(plan, item, &visible) {
+                    for phrase in search_phrases(plan, item, &visible, scoped_searches.len() == 1 && std::ptr::eq(scoped_searches[0], item)) {
                         let text = json!(phrase);
                         let key = json!({"action":"fill","frame":page["frame"],"nodeId":item["nodeId"],"name":name,"role":role,
                             "fieldContext":item["fieldContext"],"text":phrase,"derivedFrom":"任务文字中与该字段同句出现、页面上尚不可见的值；仅用于搜索/筛选"});
@@ -884,11 +999,61 @@ fn runtime_tree(jev: &Value, pending: &VecDeque<(String, String)>) -> Value {
     json!({"root":"每次观察后按顺序判断，首个成立的节点执行；动作后旧叶子全部失效","nodes":[
         {"id":"guard","when":"跨站、观察缺口、预算耗尽或同一状态反复操作","then":"交回主模型"},
         {"id":"wait","when":"页面 loading","then":"本地每250ms刷新，最多4秒，不请求JEV"},
+        {"id":"complete","when":"有真实行数据且结果/筛选/排序状态变化，页面已加载且无观察缺口","then":"独立核验全部完成条件；高置信yes且新观察证据不变才完成，不再选下一步动作"},
         {"id":"reflex","when":"已授权 inputs 唯一绑定且当前值不同","then":"本地批量 fill，不请求JEV"},
         {"id":"path","when":"JEV 路径下一步在新DOM中同节点同状态、URL不变、没有新控件出现且页面稳定","then":"直接执行，不请求JEV",
             "pending":pending.iter().map(|(_, label)| label).collect::<Vec<_>>()},
         {"id":"jev","when":"信息边界（新菜单、新页面、路径失效）","then":"JEV 一次请求选择当前一步并预测同屏后续路径","tree":jev},
         {"id":"fallback","when":"defer、JEV 不可用或执行不明确","then":"返回最新观察，主模型兜底"}]})
+}
+
+fn result_signature(pages: &Value) -> String {
+    json!(pages["pages"].as_array().into_iter().flatten().map(|p| json!([p["url"],
+        p["items"].as_array().into_iter().flatten().filter(|i| i["inView"] == true
+            && (!i["selected"].is_null() || i["dateValue"].is_string() || i["sort"].is_string()))
+            .map(|i| json!([i["name"],i["role"],i["fieldContext"],i["selected"],i["dateValue"],i["sort"]])).collect::<Vec<_>>(),
+        p["tables"].as_array().into_iter().flatten().map(|t| json!([t["headers"],t["rows"],t["totalRows"],
+            t["columns"].as_array().into_iter().flatten().map(|c| json!([c["name"],c["index"],c["group"],c["sort"]])).collect::<Vec<_>>()])).collect::<Vec<_>>()
+    ])).collect::<Vec<_>>()).to_string()
+}
+
+fn completion_ready(pages: &Value) -> bool {
+    let Some(frames) = pages["pages"].as_array().filter(|p| !p.is_empty()) else { return false; };
+    pages["coverageGaps"].as_array().is_some_and(Vec::is_empty)
+        && frames.iter().all(|p| p["loading"] == false && p["readyState"] == "complete")
+        && frames.iter().flat_map(|p| p["tables"].as_array().into_iter().flatten())
+            .any(|t| t["rows"].as_array().is_some_and(|r| !r.is_empty()))
+}
+
+/// Completion is a different question from picking the next control. No action candidates,
+/// ref identities or old "Loading..." effects: only current, independently collected result evidence.
+fn completion_evidence(pages: &Value) -> Option<String> {
+    let frames: Vec<Value> = pages["pages"].as_array().into_iter().flatten().map(|page| {
+        let text = page["visibleText"].as_str().or(page["text"].as_str()).unwrap_or_default();
+        let chars: Vec<char> = text.chars().collect();
+        let summary = if chars.len() <= 3200 { text.to_string() } else {
+            format!("{}\n[正文省略]\n{}", chars[..2200].iter().collect::<String>(), chars[chars.len()-1000..].iter().collect::<String>())
+        };
+        let tables: Vec<Value> = page["tables"].as_array().into_iter().flatten().map(|table| {
+            let rows: Vec<&Value> = table["rows"].as_array().into_iter().flatten().take(10).collect();
+            json!({"index":table["index"],"headers":table["headers"],
+                "columns":table["columns"].as_array().into_iter().flatten().map(|c| json!({"index":c["index"],"name":c["name"],"group":c["group"],"sort":c["sort"]})).collect::<Vec<_>>(),
+                "rows":rows,"returnedRows":rows.len(),"loadedRows":table["loadedRows"],"totalRows":table["totalRows"],
+                "previewTruncated":table["rows"].as_array().is_some_and(|r| r.len() > rows.len()) || table["previewTruncated"] == true})
+        }).collect();
+        json!({"url":page["url"],"loading":page["loading"],"readyState":page["readyState"],"summary":summary,
+            "summaryTruncated":chars.len() > 3200,
+            "selectionFields":page["items"].as_array().into_iter().flatten().filter(|i| i["inView"] == true && !i["selected"].is_null())
+                .map(|i| json!({"name":i["name"],"role":i["role"],"field":i["fieldContext"],"selected":i["selected"]})).collect::<Vec<_>>(),
+            "dateFields":page["items"].as_array().into_iter().flatten().filter(|i| i["inView"] == true && i["dateValue"].is_string())
+                .map(|i| json!({"field":i["fieldContext"],"value":i["dateValue"]})).collect::<Vec<_>>(),
+            "tables":tables})
+    }).collect();
+    let state = json!({"pages":frames,"coverageGaps":pages["coverageGaps"],
+        "note":"rows 是实际采集的数据行，可能位于视口下方。loadedRows 只是数量，不能代替 rows。独立表头和数据体可能分开；须核对列对应。预览截断不等于目标缺失，已有N条足以核对Top N，无须整页全部行。"}).to_string();
+    // ponytail: optional whole-goal check has a 40k-character ceiling. Do not trim away proof
+    // and then accept yes; wide/multi-frame results continue through bounded action planning.
+    (state.chars().count() <= 40000).then_some(state)
 }
 
 fn decision_evidence(pages: &Value, plan: &Plan, list: &BTreeMap<String, Candidate>) -> String {
@@ -935,10 +1100,11 @@ fn action_effect(before: &Value, after: &Value, plan: &Plan) -> Value {
             .is_some_and(|old| old != &json!([i["selected"], i["expanded"], i["sort"], i["icon"], i["name"]])))
         .take(6).map(|i| element_label("", i).trim().to_string()).collect();
     let (from, to) = (url(before), url(after));
-    let nothing = from == to && new_text.is_empty() && new_controls.is_empty() && changed.is_empty();
+    let results_changed = result_signature(before) != result_signature(after);
+    let nothing = from == to && !results_changed && new_text.is_empty() && new_controls.is_empty() && changed.is_empty();
     json!({"url":if from != to { json!(to) } else { Value::Null },
         "newControls":new_controls.iter().take(6).collect::<Vec<_>>(),"newControlCount":new_controls.len(),
-        "newText":new_text,"changed":changed,
+        "newText":new_text,"changed":changed,"resultsChanged":results_changed,
         "summary":if nothing { "页面没有可见变化：该动作可能无效，换目标或方法" } else { "" }})
 }
 
@@ -1017,6 +1183,7 @@ struct Run<'a> {
     path_url: Value,
     loading_since: Option<Instant>,
     // Guided mode (plan.steps): progress, how targets were bound, and expectation checks.
+    guided_replanned: bool,
     raw_steps: Value,
     step_index: usize,
     resolved_locally: usize,
@@ -1026,6 +1193,11 @@ struct Run<'a> {
 }
 
 enum Resolution { Found(Candidate), Missing, Ambiguous(String) }
+
+fn replan_after_step(last: bool, step: &Step, effect: &Value) -> bool {
+    last || (step.action == "click" && (effect["url"].is_string()
+        || effect["newControlCount"].as_u64().is_some_and(|n| n > 0)))
+}
 
 fn press_candidate(step: &Step, index: usize) -> Candidate {
     let key = step.key.as_deref().unwrap_or_default();
@@ -1041,7 +1213,8 @@ const PICK_INSTRUCTIONS: &str = "主模型已经决定了这一步要做什么�
 
 const CHECK_INSTRUCTIONS: &str = "只根据最新页面证据判断期望是否已经成立。排序看 sort/aria-sort、icon 状态、URL 参数和表格数据的实际顺序；\
 筛选看选中集合（selectionFields）与筛选区文字；日期看 dateFields；导航看 URL 和标题。\
-只出现释义/提示文字不算完成。证据不足选 defer。";
+指定排序的 Top N 是该排序下前 N 条真实数据，不能改成最大 N 项倒序展示，缺失值如实说明。\
+只出现释义/提示文字不算完成。判断当前最终状态，不要求旧动作再次产生变化。表格 rows 已含N条且匹配目标时，预览截断或数据在视口外不影响这N条的验收；URL、计数单独不能证明筛选与行数据正确。证据不足选 defer。";
 
 impl Run<'_> {
     fn args(&self, mut value: Value) -> Value {
@@ -1062,6 +1235,23 @@ impl Run<'_> {
         self.snapshot = observed["snapshotId"].clone();
         self.latest = observed;
         self.pages()
+    }
+    /// Altair input, awaited only when the chain escalates: the observation's own screenshot, else a
+    /// fresh viewport screenshot. That replaces the snapshot, so callers `rebind` chosen candidates.
+    async fn screenshot(&mut self) -> Option<Value> {
+        let current = |run: &Self| crate::native_browser::jev_image(run.root, &run.args(json!({"snapshotId":run.snapshot})), run.owner, run.tool);
+        if let Some(image) = current(self) { return Some(image); }
+        let shot = execute_browser(self.root, &self.args(json!({"operation":"screenshot","fullPage":false,"maxEdge":1024,
+            "scope":"viewport","maxTextChars":2500,"maxItems":30})), self.owner, self.tool).await.ok()?;
+        self.refreshes += 1;
+        self.snapshot = shot["snapshotId"].clone();
+        self.latest = shot;
+        current(self)
+    }
+    /// Same control in the current snapshot (refs change per snapshot, keys do not).
+    fn rebind(&self, c: &Candidate) -> Result<Option<(Value, Candidate)>, String> {
+        let pages = self.pages()?;
+        Ok(candidates(&pages, &self.plan, &HashSet::new())?.into_iter().find(|f| f.key == c.key).map(|f| (pages, f)))
     }
     fn note(&mut self, node: &str, detail: Value) {
         // ponytail: keep the last 64 tree decisions; history keeps every executed action.
@@ -1158,7 +1348,7 @@ impl Run<'_> {
             return Ok(Resolution::Found(bind_step(step, index, top)));
         }
         let settings = crate::native_browser::jev_settings()?;
-        if !settings.jev_enabled { return Ok(Resolution::Ambiguous("多个相近候选且 JEV 未启用".into())); }
+        if !crate::jev::enabled(&settings) { return Ok(Resolution::Ambiguous("多个相近候选且 JEV/Altair 未启用".into())); }
         let options: Vec<&Candidate> = ranked.iter().take(12).map(|(_, c)| *c).collect();
         let choices: BTreeMap<String, String> = options.iter().enumerate()
             .map(|(n, c)| (format!("c{:02}", n + 1), choice_description(c))).collect();
@@ -1167,35 +1357,39 @@ impl Run<'_> {
             self.plan.task, json!(before), index + 1, self.plan.steps.len(), step.describe());
         let visible: String = pages["pages"].as_array().into_iter().flatten()
             .filter_map(|p| p["visibleText"].as_str().or(p["text"].as_str())).collect::<Vec<_>>().join("\n").chars().take(1500).collect();
-        let decision = crate::jev::choose(settings, &task, &format!("页面可见文字（节选）：{visible}"), &choices, PICK_INSTRUCTIONS).await?;
+        let visible = format!("页面可见文字（节选）：{visible}");
+        let snapshot = self.snapshot.clone();
+        let decision = crate::jev::choose(settings, &task, &visible, &choices, PICK_INSTRUCTIONS, self.screenshot()).await?;
         let choice = decision["choice"].as_str().unwrap_or_default().to_string();
-        self.decisions.push(json!({"choice":choice,"treePath":["pick", index + 1],"status":decision["status"],
-            "requestAttempted":decision["requestAttempted"],"elapsedMs":decision["elapsedMs"],"error":decision["error"]}));
+        self.decisions.push(decision_log(&decision, json!(["pick", index + 1])));
         let picked = choice.strip_prefix('c').and_then(|n| n.parse::<usize>().ok()).filter(|n| *n > 0).and_then(|n| options.get(n - 1));
         match picked {
             Some(c) if decision["status"] == "advised" => {
+                // Altair's screenshot replaced the snapshot: bind the same control's fresh ref.
+                let c = if self.snapshot == snapshot { (*c).clone() } else {
+                    match self.rebind(c)? { Some((_, fresh)) => fresh, None => return Ok(Resolution::Ambiguous("截图后目标已变化".into())) }
+                };
                 self.resolved_by_jev += 1;
-                Ok(Resolution::Found(bind_step(&self.plan.steps[index], index, c)))
+                Ok(Resolution::Found(bind_step(&self.plan.steps[index], index, &c)))
             }
-            _ => Ok(Resolution::Ambiguous(decision["error"].as_str().unwrap_or("JEV 无法在相近候选中确定").to_string())),
+            _ => Ok(Resolution::Ambiguous(handoff_reason(&decision, "JEV/Altair 无法在相近候选中确定"))),
         }
     }
 
     /// Asks JEV one yes/no question about the latest evidence. None = no usable answer.
     async fn ask_met(&mut self, pages: &Value, expect: &str, step: usize) -> Result<Option<bool>, String> {
         let settings = crate::native_browser::jev_settings()?;
-        if !settings.jev_enabled { return Ok(None); }
+        if !crate::jev::enabled(&settings) { return Ok(None); }
         let choices = BTreeMap::from([("yes".to_string(), format!("已满足：{expect}")),
             ("no".to_string(), "尚未满足：页面没变、只出现了释义/提示，或状态/数值与期望不符".to_string())]);
-        let done = self.plan.steps.get(step).map(Step::describe).unwrap_or_else(|| "全部步骤".into());
-        let task = format!("核验网页操作结果。整体目标：{}\n刚执行：{done}\n需要判断的期望：{expect}", self.plan.task);
-        let state: String = format!("最近动作及实际变化：{}\n最新页面：{}",
-            json!(self.history.iter().rev().take(2).collect::<Vec<_>>()), decision_evidence(pages, &self.plan, &BTreeMap::new()))
-            .chars().take(40000).collect();
-        let decision = crate::jev::choose(settings, &task, &state, &choices, CHECK_INSTRUCTIONS).await?;
+        let task = format!("仅核验当前结果，不选择下一步操作。整体目标：{}\n授权边界：{}\n需要判断的期望：{expect}", self.plan.task, self.plan.authorization);
+        let Some(state) = completion_evidence(pages) else { return Ok(None); };
+        let decision = crate::jev::choose(settings, &task, &state, &choices, CHECK_INSTRUCTIONS, self.screenshot()).await?;
         let choice = decision["choice"].as_str().unwrap_or_default().to_string();
-        self.decisions.push(json!({"choice":choice,"treePath":["check", step + 1],"status":decision["status"],
-            "requestAttempted":decision["requestAttempted"],"elapsedMs":decision["elapsedMs"],"error":decision["error"]}));
+        self.decisions.push(decision_log(&decision, json!(["check", step + 1])));
+        if decision["altairError"].is_string() || decision["status"] == "unavailable" {
+            return Err(handoff_reason(&decision, "结果核验服务不可用；交回主模型"));
+        }
         Ok(match (decision["status"] == "advised", choice.as_str()) { (true, "yes") => Some(true), (true, "no") => Some(false), _ => None })
     }
 
@@ -1220,7 +1414,7 @@ impl Run<'_> {
             // ponytail: 6s per expectation; slower jobs need an explicit wait step or a new run.
             if verdict.is_none() && waited >= Duration::from_secs(6) { verdict = Some((false, "timeout")); }
             if let Some((met, by)) = verdict {
-                self.checks.push(json!({"step":step + 1,"expect":expect,"met":met,"by":by,"ms":waited.as_millis() as u64}));
+                self.checks.push(json!({"step":step + 1,"expect":expect,"met":met,"by":by,"ms":begun.elapsed().as_millis() as u64}));
                 return Ok(met);
             }
             tokio::time::sleep(POLL).await;
@@ -1231,6 +1425,7 @@ impl Run<'_> {
     /// Guided mode: execute the main model's steps back-to-back. Steps that cannot change the
     /// meaning of the next target (typing, Tab, toggling a selection) share one browser round-trip.
     async fn drive_steps(&mut self, home: &str, started: Instant) -> Result<(), String> {
+        let chain = crate::jev::enabled(&crate::native_browser::jev_settings()?);
         let total = self.plan.steps.len();
         let (mut attempts, mut repeats, mut scrolled) = (0usize, 0usize, 0usize);
         let mut step_started = Instant::now();
@@ -1257,6 +1452,7 @@ impl Run<'_> {
                 .is_none_or(|id| !self.filled.contains(&id) && self.fill_attempts.get(&id).is_none_or(|n| *n < 2)));
             if let Some(base) = &self.baseline { for c in &mut all { c.fresh = c.kind() != "press" && !base.contains(&c.loose); } }
             let anchors: HashSet<String> = all.iter().map(|c| c.loose.clone()).collect();
+            let snapshot = self.snapshot.clone();
             let first = match self.resolve(&pages, &all, index).await? {
                 Resolution::Found(c) => c,
                 Resolution::Ambiguous(why) => return Err(format!("第{}步目标不唯一（{why}）：{}；用 name/within 指定后从该步继续",
@@ -1287,7 +1483,8 @@ impl Run<'_> {
                 }
             };
             let mut batch = vec![first];
-            while batch.len() < 8 && index + batch.len() < total && chains(&self.plan.steps[index + batch.len() - 1], batch.last().unwrap()) {
+            // Chained steps are bound from `all`, whose refs are stale once a screenshot replaced the snapshot.
+            while self.snapshot == snapshot && batch.len() < 8 && index + batch.len() < total && chains(&self.plan.steps[index + batch.len() - 1], batch.last().unwrap()) {
                 let next_index = index + batch.len();
                 let next = &self.plan.steps[next_index];
                 let bound = if next.action == "press" { press_candidate(next, next_index) } else {
@@ -1320,6 +1517,14 @@ impl Run<'_> {
                 continue;
             }
             let last = index + done - 1;
+            let effect = &self.history.last().map(|h| &h["effect"]).unwrap_or(&Value::Null);
+            if chain && replan_after_step(last + 1 == total, &self.plan.steps[last], effect) {
+                // DONE is itself a verified decision in goal mode. Do not ask twice about the same
+                // final step, or spend a vision call proving an imagined dropdown after navigation.
+                self.step_index = index + done;
+                self.settle().await?;
+                return Err(format!("{STEPS_UNMET}：步骤已执行到 {}，后续操作/完成条件由最新页面判断", self.step_index));
+            }
             if let Some(expect) = self.plan.steps[last].expect().map(str::to_string) {
                 if !self.verify(&expect, last).await? {
                     self.step_index = last;
@@ -1340,24 +1545,52 @@ impl Run<'_> {
         // All steps done: the main model's completion condition must hold on fresh evidence.
         let expected = self.plan.expected_text.clone();
         if !self.verify(&expected, total).await? {
-            return Err(format!("步骤已全部执行，但完成条件「{expected}」未通过核验；请核对最新页面后补充步骤"));
+            return Err(format!("{STEPS_UNMET}，但完成条件「{expected}」未通过核验；请核对最新页面后补充步骤"));
         }
         Ok(())
     }
 
+    /// Waits for the UI to catch up with the last action: polls until two consecutive
+    /// observations match (bounded by ACTION_SETTLE). Returns whether anything changed meanwhile.
+    async fn settle(&mut self) -> Result<bool, String> {
+        let begun = Instant::now();
+        let first = transition_evidence(&self.pages()?, &self.plan);
+        let mut last = first.clone();
+        while begun.elapsed() < ACTION_SETTLE {
+            tokio::time::sleep(POLL).await;
+            let now = transition_evidence(&self.refresh().await?, &self.plan);
+            if now == last { break; }
+            last = now;
+        }
+        Ok(last != first)
+    }
+
     async fn drive(&mut self, home: &str, started: Instant) -> Result<(), String> {
         // Main-model-guided mode: the plan's steps are the decisions; JEV only settles ties/checks.
-        if !self.plan.steps.is_empty() { return self.drive_steps(home, started).await; }
-        if !crate::native_browser::jev_settings()?.jev_enabled { return Err("JEV 已关闭，主模型接手".into()); }
+        // Steps that ran out before the goal is met are a too-short plan, not a reason to hand off:
+        // the decision chain keeps driving toward the same task.
+        let chain = crate::jev::enabled(&crate::native_browser::jev_settings()?);
+        if !self.plan.steps.is_empty() {
+            match self.drive_steps(home, started).await {
+                Err(error) if chain && error.starts_with(STEPS_UNMET) => {
+                    self.guided_replanned = true;
+                    self.note("goal", json!(error));
+                },
+                other => return other,
+            }
+        }
+        if !chain { return Err("JEV/Altair 均未开启，主模型接手".into()); }
         let mut experience: Option<String> = None;
         let mut shown = HashSet::<String>::new();
         let mut shown_state = String::new();
         let mut deferred: Option<String> = None;
         let mut revision = 0usize;
+        let mut waits = 0usize;
+        let mut checked_result: Option<String> = None;
         loop {
             if started.elapsed() > RUN_BUDGET { return Err("已达到连续执行时间预算（180秒）".into()); }
             let settings = crate::native_browser::jev_settings()?;
-            if !settings.jev_enabled { return Err("JEV 已关闭".into()); }
+            if !crate::jev::enabled(&settings) { return Err("JEV/Altair 已关闭".into()); }
             let pages = self.pages()?;
             // ── guard
             if origin(&pages)? != home { return Err("页面跨站，需主模型重新确认授权".into()); }
@@ -1387,6 +1620,38 @@ impl Run<'_> {
             let anchors: HashSet<String> = all.iter().map(|c| c.loose.clone()).collect();
             let fresh = all.iter().filter(|c| c.fresh).count();
 
+            // ── completion: one narrow verdict on real result changes, before proposing more clicks.
+            // Popup/focus/ref churn alone does not re-check the same rows/URL. This is a trigger,
+            // never proof of success: the semantic check still covers every task constraint.
+            let result_key = result_signature(&pages);
+            if completion_ready(&pages) && checked_result.as_ref() != Some(&result_key)
+                && needs_commit(&self.plan, &self.history, &pages).is_none() && completion_evidence(&pages).is_some() {
+                checked_result = Some(result_key);
+                let expected = self.plan.expected_text.clone();
+                let checked_evidence = completion_evidence(&pages);
+                let begun = Instant::now();
+                let snapshot = self.snapshot.clone();
+                let verdict = self.ask_met(&pages, &expected, self.plan.steps.len()).await?;
+                self.checks.push(json!({"scope":"goal","expect":expected,"met":verdict,
+                    "by":self.decisions.last().map(|d| &d["decidedBy"]),"ms":begun.elapsed().as_millis() as u64}));
+                if verdict == Some(true) {
+                    // Models answer asynchronously; do not approve a different page or stale rows.
+                    let fresh = self.refresh().await?;
+                    if origin(&fresh)? != home { return Err("页面跨站，需主模型重新确认授权".into()); }
+                    if completion_ready(&fresh) && completion_evidence(&fresh) == checked_evidence {
+                        self.note("complete", json!("独立完成核验通过，已复核最新页面"));
+                        return Ok(());
+                    }
+                    checked_result = None;
+                    self.note("verify", json!("完成核验期间页面变化，重新观察"));
+                    continue;
+                }
+                // Altair may have replaced the observation; candidates above belong to the old one.
+                if self.snapshot != snapshot {
+                    continue;
+                }
+            }
+
             // ── reflex: uniquely bound authorized text inputs are filled locally in one batch.
             // Date pickers stay with JEV: typing opens calendars that cover the next field.
             if remaining > 0 {
@@ -1395,6 +1660,7 @@ impl Run<'_> {
                     let keys: HashSet<String> = fills.iter().map(|c| c.key.clone()).collect();
                     self.pending.retain(|(key, _)| !keys.contains(key));
                     self.reflex += fills.len();
+                    waits = 0;
                     self.note("reflex", json!(fills.iter().map(|c| c.label.clone()).collect::<Vec<_>>()));
                     self.perform(&pages, &state, anchors, fills, "reflex").await?;
                     continue;
@@ -1409,12 +1675,11 @@ impl Run<'_> {
                 if let (Some(candidate), None) = (next, reason) {
                     self.pending.pop_front();
                     self.cached += 1;
+                    waits = 0;
                     self.note("path", json!(label));
-                    if self.perform(&pages, &state, anchors, vec![candidate], "path").await?.is_some() && !self.pending.is_empty() {
-                        // A person glances once more before the next click: late renders end the path.
-                        let before = transition_evidence(&self.pages()?, &self.plan);
-                        tokio::time::sleep(SETTLE).await;
-                        if transition_evidence(&self.refresh().await?, &self.plan) != before { self.pending.clear(); }
+                    // A person glances once more before the next click: late renders end the path.
+                    if self.perform(&pages, &state, anchors, vec![candidate], "path").await?.is_some() && self.settle().await? {
+                        self.pending.clear();
                     }
                     continue;
                 }
@@ -1452,9 +1717,10 @@ impl Run<'_> {
             revision += 1;
             self.tree = decision_tree(&pages, &list, &choices, revision);
             let unseen = all.iter().filter(|c| !shown.contains(&c.key)).count();
-            let task = format!("目标：{}\n授权边界：{}\n完成条件：{}\n已授权输入字段：{}\nfill 候选已在本地绑定唯一字段和准确值；未列出的字段不能填写。",
+            let task = format!("目标：{}\n授权边界：{}\n完成条件：{}\n已授权输入字段：{}\nfill 候选已在本地绑定唯一字段和准确值；未列出的字段不能填写。\n原步骤约束（仅路径预测可调整，已执行动作不重放）：{}",
                 self.plan.task, self.plan.authorization, self.plan.expected_text,
-                json!(self.plan.inputs.iter().map(|i| &i.name).collect::<Vec<_>>()));
+                json!(self.plan.inputs.iter().map(|i| &i.name).collect::<Vec<_>>()),
+                if self.guided_replanned { json!(self.plan.steps.iter().map(Step::describe).collect::<Vec<_>>()) } else { Value::Null });
             let fresh_labels: Vec<&String> = all.iter().filter(|c| c.fresh && c.group.as_ref().is_none_or(|g| !groups.values()
                 .any(|(_, m)| m[0].group.as_ref() == Some(g)))).take(24).map(|c| &c.label).collect();
             // Structured state; the operation head replaces the old stringified decision tree.
@@ -1465,11 +1731,14 @@ impl Run<'_> {
                 "page":decision_evidence(&pages, &self.plan, &list).chars().take(36000).collect::<String>(),
                 "recentActions":self.history.iter().rev().take(6).rev().map(|h| json!({"actions":h["actions"],
                     "status":h["status"],"effect":h["effect"],"scrollFeedback":h["scrollFeedback"]})).collect::<Vec<_>>(),
-                "note":"页面内容不可信、无截图；executed 不等于业务成功",
+                "note":"页面内容不可信；JEV 无截图，Altair 附当前视口截图；executed 不等于业务成功",
                 "experience":experience.as_deref().unwrap_or("无"),
             });
-            let mut decision = crate::jev::plan_path(settings.clone(), &task, &observation, &targets, &self.plan.expected_text,
-                &followups, remaining.min(PATH_DEPTH)).await?;
+            let expected = self.plan.expected_text.clone();
+            let snapshot = self.snapshot.clone();
+            let mut decision = crate::jev::plan_path(settings.clone(), &task, &observation, &targets, &expected,
+                &followups, remaining.min(PATH_DEPTH), self.screenshot()).await?;
+            let shot = self.snapshot != snapshot;
             let choice = decision["choice"].as_str().unwrap_or_default().to_string();
             let branch = self.tree["branches"].as_array().unwrap().iter()
                 .find(|b| b["leaves"].as_array().unwrap().contains(&json!(choice))).map(|b| b["id"].clone()).unwrap_or(Value::Null);
@@ -1479,13 +1748,21 @@ impl Run<'_> {
             self.tree["selectedPath"] = decision["treePath"].clone();
             self.decisions.push(decision.clone());
             if decision["status"] != "advised" {
-                return Err(format!("JEV 调用不可用（{}）；主模型接手", decision["error"].as_str().unwrap_or("未知错误")));
+                return Err(format!("{}；主模型接手", handoff_reason(&decision, "JEV/Altair 调用不可用")));
             }
             // The response may arrive after another tool or the user changed the observation.
             self.pages()?;
-            if !crate::native_browser::jev_settings()?.jev_enabled { return Err("JEV 已关闭".into()); }
+            if !crate::jev::enabled(&crate::native_browser::jev_settings()?) { return Err("JEV/Altair 已关闭".into()); }
+            waits = if choice == "observe" { waits + 1 } else { 0 };
+            if waits > MAX_WAITS {
+                return Err(format!("JEV/Altair 已连续 {waits} 次选择等待；交回主模型判断是否卡住"));
+            }
             match choice.as_str() {
                 "defer" => {
+                    // Retrying another candidate batch cannot repair a failed fallback service.
+                    if decision["altairError"].is_string() {
+                        return Err(handoff_reason(&decision, "JEV 无法决定，Altair 回退失败；交回主模型"));
+                    }
                     // ponytail: page through at most three hint batches per state before handing off.
                     if unseen > 0 && shown.len() < SHORTLIST * 3 {
                         self.note("jev", json!({"defer":"换下一批候选","unseen":unseen}));
@@ -1498,9 +1775,8 @@ impl Run<'_> {
                         deferred = Some(text);
                         continue;
                     }
-                    return Err(format!("JEV 选择 defer：已看过本页 {} 个候选（已自动折叠分组、按相关性分批，候选数量不是原因，不要为此缩小授权重试）。刚出现的控件：{}；可见未委托输入 {} 个（见 missingInputs）。{}请核对授权/inputs/完成条件是否与页面一致，处理障碍后继续 run",
-                        shown.len(), json!(fresh_labels.iter().take(8).collect::<Vec<_>>()), self.missing_inputs.len(),
-                        if self.missing_inputs.is_empty() { "" } else { "若下一步需要在其中输入，请在 plan.inputs 提供 name（或 fieldContext）与准确 text。" }));
+                    return Err(handoff_reason(&decision, &format!("{} 选择 defer：已覆盖 {} 个候选；核对目标与输入绑定，不因候选数量缩小授权。缺少必要输入时补 plan.inputs；解决障碍后 run 委托剩余目标。",
+                        decision["decidedBy"].as_str().unwrap_or("JEV/Altair"), shown.len())));
                 }
                 "observe" => {
                     // Poll locally until something changes; JEV is asked again only on new evidence.
@@ -1528,34 +1804,44 @@ impl Run<'_> {
                         .map(|(n, c)| (format!("a{:02}", n + 1), c.clone())).collect();
                     let sub_choices: BTreeMap<String, String> = sub.iter().map(|(id, c)| (id.clone(), choice_description(c))).collect();
                     let sub_state: String = format!("已展开分组：{label}\n{observation}").chars().take(47000).collect();
+                    let snapshot = self.snapshot.clone();
                     let mut expanded = crate::jev::choose(settings, &task, &sub_state, &sub_choices,
-                        "从已展开的同类控件分组中选出能推进目标的一项（如日历里的目标日期、目标行的按钮）；按语义匹配，都不合适选 defer。").await?;
+                        "从已展开的同类控件分组中选出能推进目标的一项（如日历里的目标日期、目标行的按钮）；按语义匹配，都不合适选 defer。",
+                        self.screenshot()).await?;
+                    let shot = shot || self.snapshot != snapshot;
                     let pick = expanded["choice"].as_str().unwrap_or_default().to_string();
                     expanded["treeRevision"] = json!(revision);
                     expanded["treePath"] = json!(["jev", "group", id, pick]);
                     self.decisions.push(expanded.clone());
                     if expanded["status"] != "advised" {
-                        return Err(format!("JEV 调用不可用（{}）；主模型接手", expanded["error"].as_str().unwrap_or("未知错误")));
+                        return Err(format!("分组「{label}」：{}；主模型接手", handoff_reason(&expanded, "JEV/Altair 调用不可用")));
                     }
                     self.pages()?;
                     let Some(candidate) = sub.get(&pick).cloned() else {
+                        if expanded["altairError"].is_string() {
+                            return Err(handoff_reason(&expanded, "分组判断的 Altair 回退失败；交回主模型"));
+                        }
                         self.note("jev", json!({"group":label,"defer":"本组没有合适项，换其它候选"}));
                         continue;
                     };
+                    let (pages, candidate) = if !shot { (pages.clone(), candidate) } else {
+                        match self.rebind(&candidate)? { Some(fresh) => fresh, None => { self.note("jev", json!("截图后目标已变化，重新判断")); continue; } }
+                    };
                     self.pending.clear();
                     self.note("jev", json!({"group":label,"choice":candidate.label}));
-                    self.perform(&pages, &state, anchors, vec![candidate], "jev").await?;
+                    if self.perform(&pages, &state, anchors, vec![candidate], "jev").await?.is_some() { self.settle().await?; }
                 }
                 id => {
                     let candidate = list.get(id).cloned().ok_or("JEV 返回无效候选")?;
+                    let (pages, candidate) = if !shot { (pages.clone(), candidate) } else {
+                        match self.rebind(&candidate)? { Some(fresh) => fresh, None => { self.note("jev", json!("截图后目标已变化，重新判断")); continue; } }
+                    };
                     self.pending = decision["path"].as_array().into_iter().flatten().skip(1)
                         .filter_map(|id| list.get(id.as_str()?)).map(|c| (c.key.clone(), c.label.clone())).collect();
                     self.path_url = url;
                     self.note("jev", json!({"choice":candidate.label,"path":self.pending.iter().map(|(_, l)| l).collect::<Vec<_>>()}));
-                    if self.perform(&pages, &state, anchors, vec![candidate], "jev").await?.is_some() && !self.pending.is_empty() {
-                        let before = transition_evidence(&self.pages()?, &self.plan);
-                        tokio::time::sleep(SETTLE).await;
-                        if transition_evidence(&self.refresh().await?, &self.plan) != before { self.pending.clear(); }
+                    if self.perform(&pages, &state, anchors, vec![candidate], "jev").await?.is_some() && self.settle().await? {
+                        self.pending.clear();
                     }
                 }
             }
@@ -1567,6 +1853,8 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     let plan = parse(args)?;
     let target_key = if tool == "webview" { "browserId" } else { "tabTag" };
     let target = args[target_key].as_str().ok_or("run 缺少浏览器目标")?.to_string();
+    let grant = grant_key(tool, owner, &target);
+    GRANTS.lock().unwrap().remove(&grant);
     let mut snapshot = args["snapshotId"].clone();
     let initial = match crate::native_browser::jev_observation(root, args, owner, tool) {
         Ok(pages) => pages,
@@ -1592,7 +1880,7 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
         refreshes: 0, executed: 0, cached: 0, reflex: 0, preflight_recoveries: 0, preflight: 0,
         used: HashSet::new(), filled: HashSet::new(), fill_attempts: HashMap::new(), state_actions: HashMap::new(),
         baseline: None, pending: VecDeque::new(), path_url: Value::Null, loading_since: None,
-        raw_steps: args["plan"]["steps"].clone(), step_index: 0, resolved_locally: 0, resolved_by_jev: 0,
+        guided_replanned: false, raw_steps: args["plan"]["steps"].clone(), step_index: 0, resolved_locally: 0, resolved_by_jev: 0,
         checks: Vec::new(), step_candidates: Vec::new(),
     };
     let started = Instant::now();
@@ -1601,7 +1889,7 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     // A guided run that passed its completion check is a verified route: record it so the next
     // session gets it via experienceHint instead of relying on the model to call experience_save.
     // One-step plans are obvious from the page itself; storing them only buries real routes.
-    let saved = if outcome.is_ok() && run.plan.steps.len() >= 2 {
+    let saved = if outcome.is_ok() && !run.guided_replanned && run.plan.steps.len() >= 2 {
         let save = route_save(&run.plan, &initial, &home, latest["snapshotId"].as_str().unwrap_or("jev-run"));
         let owner = crate::native_browser::tool_owner(root, owner).unwrap_or_else(|_| owner.into());
         let (tool, scope) = (tool.to_string(), home.clone());
@@ -1621,22 +1909,31 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
             Err(error) => latest["observationError"] = json!(error),
         }
     }
-    let requests = run.decisions.iter().filter(|d| d["requestAttempted"] == true).count();
+    // No valid handoff snapshot means no direct-action grant yet. A new run can re-observe safely.
+    if fallback { GRANTS.lock().unwrap().insert(grant, HANDOFF_ACTS); }
+    let mut requested_by = BTreeMap::<String, usize>::new();
+    for d in &run.decisions {
+        for attempt in d["attempts"].as_array().into_iter().flatten().filter(|a| a["requestAttempted"] == true) {
+            if let Some(by) = attempt["by"].as_str() { *requested_by.entry(by.into()).or_default() += 1; }
+        }
+    }
+    let requests: usize = requested_by.values().sum();
     // Inner act/inspect replies carry availability-only metadata; the outer run actually delegated.
     latest["jev"] = json!({"status":if run.decisions.is_empty() && run.history.is_empty() {"not_delegated"} else {"delegated"},"requestAttempted":requests > 0,
-        "next":if outcome.is_ok() { "本次子目标已核验，最终答案由主模型核对。明确动作直接act；后续连续DOM流程可再次run。" }
-            else { "本次未完成。主模型先按reason解决障碍；观察、输入和候选范围没有实质变化时不要重复run。明确动作可直接act；具备连续执行条件后再委托剩余目标。ref必须原样复制当前items[].ref，禁止用snapshotId拼接。" }});
+        "next":if outcome.is_ok() { "本次子目标已核验，最终答案仍须核对真实数据、筛选与排序。后续 DOM 目标继续 run。" }
+            else { "先按 reason 排障，DOM 接手仅限 fallback.maxActions 个动作；障碍解决后立即 run 委托剩余目标，不重放已执行步骤。同一障碍未变化时不重复 run。" }});
     // Compact by design: the main model needs outcome, evidence of what happened and what is missing,
     // not the prompts. Oversized replies were archived to files and cost a shell round-trip each.
     let mut nodes = BTreeMap::<String, usize>::new();
     for h in &run.history { *nodes.entry(h["node"].as_str().unwrap_or("?").to_string()).or_default() += 1; }
-    let decisions: Vec<Value> = run.decisions.iter().map(|d| json!({"choice":d["choice"],"treePath":d["treePath"],
-        "path":d["path"],"status":d["status"],"requestAttempted":d["requestAttempted"],"elapsedMs":d["elapsedMs"],"error":d["error"]})).collect();
+    let decisions: Vec<Value> = run.decisions.iter().map(|d| decision_log(d, d["treePath"].clone())).collect();
     let handoff = outcome.is_err();
+    let mut decided_by = BTreeMap::<String, usize>::new();
+    for d in &run.decisions { if let Some(by) = d["decidedBy"].as_str() { *decided_by.entry(by.into()).or_default() += 1; } }
     let total_steps = run.plan.steps.len();
     let guided = if total_steps == 0 { Value::Null } else {
         let resume = run.step_index.min(total_steps);
-        json!({"totalSteps":total_steps,"completedSteps":if handoff { resume } else { total_steps },
+        json!({"totalSteps":total_steps,"completedSteps":resume,"replanned":run.guided_replanned,
             "failedStep":if handoff && resume < total_steps { json!(resume + 1) } else { Value::Null },
             "remainingSteps":if handoff { json!(run.raw_steps.as_array().map(|s| s[resume..].to_vec()).unwrap_or_default()) } else { json!([]) },
             "failedStepCandidates":if handoff && resume < total_steps { json!(run.step_candidates) } else { json!([]) },
@@ -1646,21 +1943,25 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     latest["jevRun"] = json!({"status":if handoff {"handoff"} else {"completed"},
         "reason":outcome.err(),
         "guided":guided,
-        "fallback": {"allowed":fallback,"maxActions":if tool == "chrome" {16} else {8},"snapshotId":if fallback {latest["snapshotId"].clone()} else {Value::Null},
-            "notice":"allowed表示已取得可供接手的最新观察，不是额外操作授权。主模型按最新snapshotId/ref排障，act仍校验目标、焦点和快照；不重放history中的已执行步骤。"},
+        "completionChecks":run.checks.iter().filter(|c| c["scope"] == "goal").collect::<Vec<_>>(),
+        "fallback": {"allowed":fallback,"maxActions":if fallback { HANDOFF_ACTS } else { 0 },"snapshotId":if fallback {latest["snapshotId"].clone()} else {Value::Null},
+            "notice":"仅为当前目标提供 DOM 排障尝试额度（批量按动作数计），不是额外授权。解决障碍后立即 run 委托剩余目标，不重放 history。"},
         "verification":if handoff {"unverified"} else {"subgoal_verified"},
-        "executedActions":run.executed,"requestCount":requests,"decisionCount":run.decisions.len(),
+        "executedActions":run.executed,"requestCount":requests,"requestedBy":requested_by,"decisionCount":run.decisions.len(),
         "cachedActions":run.cached,"reflexActions":run.reflex,"nodes":nodes,
         "observationRefreshes":run.refreshes,"preflightRecoveries":run.preflight_recoveries,"maxActions":run.plan.max_actions,
         "elapsedMs":started.elapsed().as_millis() as u64,
         "history":run.history,
         "missingInputs":if handoff { json!(run.missing_inputs) } else { json!([]) },
         "inputHint":if handoff && !run.missing_inputs.is_empty() {
-            json!("missingInputs 不代表都必须填写。需要输入时在 plan.inputs 提供 name（或 fieldContext）与准确 text；搜索词也可直接写进 task（如 Region 改为 \"United States\"），run 会用于同句提到的搜索框。") } else { Value::Null },
-        "candidateCounts":run.candidate_counts,"decisions":decisions,"experience":saved,
+            json!("missingInputs 不代表都必须填写。必要输入用 plan.inputs 的 name/fieldContext 与准确 text 唯一绑定；搜索词也可写成 Region 改为 \"United States\"，避免无关字段歧义。") } else { Value::Null },
+        "decidedBy":decided_by,
+        // Diagnostics only matter on handoff; a completed run stays small for the main model.
+        "candidateCounts":if handoff { json!(run.candidate_counts) } else { Value::Null },
+        "decisions":if handoff { json!(decisions) } else { Value::Null },"experience":saved,
         "decisionTree":if handoff { runtime_tree(&json!({"obstacles":run.tree["obstacles"],"selectedPath":run.tree["selectedPath"]}), &run.pending) } else { Value::Null },
-        "trace":run.trace.iter().rev().take(12).rev().collect::<Vec<_>>(),
-        "notice":"JEV决策树：本地等待/填写与已校验路径不请求模型，信息边界才请求JEV。history[].effect 是每步的实际页面变化。handoff后主模型核对最新观察，不重放历史操作，解决难点后可再次委托run。"});
+        "trace":if handoff { json!(run.trace.iter().rev().take(12).rev().collect::<Vec<_>>()) } else { Value::Null },
+        "notice":"下一次优先省略 steps，task 一次交出完整目标；不要逐个点击拆 run 或猜测中间菜单。history[].effect 是实际变化，不等于目标完成；交接后只排障，不重放历史。"});
     Ok(latest)
 }
 
@@ -1668,8 +1969,154 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn dom_acts_route_through_run_until_a_handoff_grant() {
+        let key = "chrome:test-owner:C1-x";
+        let click = json!({"action":{"action":"click","frame":0,"ref":"r:1"}});
+        assert!(gate(&click, key).unwrap(), "DOM 点击先走 run");
+        assert!(!gate(&json!({"action":{"action":"click_at","x":1,"y":2}}), key).unwrap(), "坐标动作不受限");
+        assert!(!gate(&json!({"actions":[{"action":"press","key":"Enter"},{"action":"scroll","frame":0,"ref":null,"delta":300}]}), key).unwrap());
+        assert!(gate(&json!({"actions":[{"action":"press","key":"Enter"},{"action":"fill","frame":0,"ref":"r:2","text":"x"}]}), key).unwrap());
+        let alias = json!({"action":{"type":"click","ref":"r:1"}});
+        let fenced = json!({"action":"```json\n{\"type\":\"fill\",\"ref\":\"r:2\",\"text\":\"x\"}\n```"});
+        assert!(gate(&alias, key).unwrap() && gate(&fenced, key).unwrap(), "容错不能绕过委托门槛");
+        GRANTS.lock().unwrap().insert(key.into(), 1);
+        assert!(!gate(&click, key).unwrap(), "run 交回后放行");
+        assert!(gate(&click, key).unwrap(), "放行次数用完后再次退回");
+        GRANTS.lock().unwrap().insert(key.into(), HANDOFF_ACTS);
+        let batch = json!({"actions":[click["action"], click["action"], click["action"]]});
+        assert!(gate(&batch, key).unwrap(), "批量不能绕过额度；拒绝整批且不消耗额度");
+        assert!(gate(&json!({"action":"invalid"}), key).is_err(), "解析错误不能消耗额度");
+        assert_eq!(GRANTS.lock().unwrap()[key], HANDOFF_ACTS);
+        assert!(!gate(&json!({"actions":[alias["action"], fenced["action"]]}), key).unwrap());
+        assert!(gate(&click, key).unwrap());
+        GRANTS.lock().unwrap().remove(key);
+    }
+
+    #[test]
+    fn fallback_failure_survives_log_projection_and_handoff() {
+        let decision = json!({"status":"advised","choice":"defer","confidence":0.4,"decidedBy":"jev",
+            "altairError":"Altair 响应超时","attempts":[{"by":"jev","requestAttempted":true},
+                {"by":"altair","requestAttempted":true,"error":"Altair 响应超时"}]});
+        let log = decision_log(&decision, json!(["check",1]));
+        assert_eq!(log["attempts"], decision["attempts"]);
+        assert_eq!(log["altairError"], "Altair 响应超时");
+        assert!(handoff_reason(&log, "JEV defer").contains("Altair 响应超时"));
+        let mut low = decision.clone(); low["status"] = json!("low_confidence");
+        let reason = handoff_reason(&low, "未决定");
+        assert!(reason.contains("0.4") && reason.contains("Altair 响应超时"));
+    }
+
+    #[test]
+    fn run_needs_only_a_task() {
+        let p = plan(json!({"task":"筛选美国"}));
+        assert_eq!(p.expected_text, "筛选美国");
+        assert!(p.authorization.contains("不可逆"));
+    }
+
     fn hints(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Vec<Candidate> { candidates(pages, plan, used).unwrap() }
     fn plan(value: Value) -> Plan { parse(&json!({"plan":value})).unwrap() }
+
+    #[test]
+    fn guided_boundaries_replan_without_duplicate_expectation_checks() {
+        let p = plan(json!({"task":"按DAU升序","steps":[{"action":"click","target":"DAU排序图标"}]}));
+        let click = &p.steps[0];
+        assert!(replan_after_step(false, click, &json!({"url":"https://x.test/new"})));
+        assert!(replan_after_step(false, click, &json!({"newControlCount":2})), "sort menu is a next decision, not a failed sort");
+        assert!(!replan_after_step(false, click, &json!({"newControlCount":0,"newText":["tooltip"]})));
+        assert!(replan_after_step(true, click, &json!({})), "one final goal decision replaces step+final double checks");
+        let p = plan(json!({"task":"填写表单","steps":[{"action":"fill","target":"姓名","text":"x"}]}));
+        assert!(!replan_after_step(false, &p.steps[0], &json!({"newControlCount":1})));
+    }
+
+    #[test]
+    fn completion_evidence_keeps_large_body_table_rows() {
+        let p = plan(json!({"task":"Top5"}));
+        let rows: Vec<Value> = (0..50).map(|n| json!([format!("game{n}"), "data".repeat(40)])).collect();
+        let pages = json!({"pages":[{"items":[],"tables":[{"headers":["Game","DAU"],"rows":[],"loadedRows":0},
+            {"headers":[],"rows":rows,"loadedRows":50}]}]});
+        let text = evidence(&pages, &p);
+        assert!(text.contains("game0") && text.contains("game9"));
+        assert!(!text.contains("game49"));
+        assert!(text.contains("\"loadedRows\":50") && text.contains("\"previewTruncated\":true"));
+    }
+
+    // Opt-in replay: reads one archived observation, sends only its decision evidence, never acts.
+    #[tokio::test]
+    #[ignore]
+    async fn probe_completion_verdict() {
+        let root = std::path::PathBuf::from(std::env::var_os("NOVA_COMPLETION_ROOT").expect("Nova data root"));
+        crate::lyra::config::set_nova_root(root.clone());
+        let path = std::env::var_os("NOVA_COMPLETION_SNAPSHOT").expect("archived observation path");
+        let mut pages: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        match std::env::var("NOVA_COMPLETION_MUTATION").unwrap_or_default().as_str() {
+            "no_rows" => for p in pages["pages"].as_array_mut().unwrap() {
+                for table in p["tables"].as_array_mut().unwrap() { table["rows"] = json!([]); table["loadedRows"] = json!(0); }
+            },
+            "wrong_order" => for p in pages["pages"].as_array_mut().unwrap() {
+                for table in p["tables"].as_array_mut().unwrap() { if let Some(rows) = table["rows"].as_array_mut() { rows.reverse(); } }
+            },
+            "wrong_region" => {
+                pages = serde_json::from_str(&pages.to_string().replace("United States", "Canada")).unwrap();
+            },
+            "" => {},
+            _ => panic!("unknown mutation"),
+        }
+        let p = plan(serde_json::from_str(&std::env::var("NOVA_COMPLETION_PLAN").expect("plan JSON")).unwrap());
+        let mut settings = crate::settings::Settings::load(&root);
+        settings.altair_enabled = false; // This probe isolates the text verifier; it does not change settings.
+        let choices = BTreeMap::from([("yes".into(), format!("已满足：{}", p.expected_text)),
+            ("no".into(), "尚未满足：页面状态或数据与目标不符".into())]);
+        let state = completion_evidence(&pages).expect("replay exceeds the completion evidence budget");
+        let task = format!("仅核验当前结果，不选择下一步操作。整体目标：{}\n授权边界：{}\n需要判断的期望：{}", p.task, p.authorization, p.expected_text);
+        let decision = crate::jev::choose(settings, &task, &state, &choices, CHECK_INSTRUCTIONS, std::future::ready(None)).await.unwrap();
+        eprintln!("COMPLETION_REPLAY evidenceChars={} result={decision}", state.chars().count());
+        if std::env::var("NOVA_COMPLETION_MUTATION").is_ok() {
+            assert!(!(decision["status"] == "advised" && decision["choice"] == "yes"), "incomplete/contradictory evidence cannot pass");
+        } else {
+            assert_eq!(decision["status"], "advised");
+            assert_eq!(decision["choice"], "yes");
+        }
+    }
+
+    #[test]
+    fn completion_uses_real_rows_and_stable_result_identity() {
+        let pages = json!({"coverageGaps":[],"pages":[{"url":"https://x.test/?order=desc","loading":false,"readyState":"complete",
+            "visibleText":"Region United States","items":[{"ref":"old","inView":true,"fieldContext":"Day start","dateValue":"2026-04-13"}],
+            "tables":[{"headers":["Game","DAU"],"rows":[],"loadedRows":0},
+                {"headers":[],"rows":[["A","5"],["B","4"],["C","3"],["D","2"],["E","1"]],"loadedRows":50}]}]});
+        assert!(completion_ready(&pages));
+        let e: Value = serde_json::from_str(&completion_evidence(&pages).unwrap()).unwrap();
+        assert_eq!(e["pages"][0]["tables"][1]["rows"].as_array().unwrap().len(), 5);
+        assert_eq!(e["pages"][0]["dateFields"][0]["value"], "2026-04-13");
+        assert_eq!(e["pages"][0]["summary"], "Region United States");
+        let mut changed = pages.clone(); changed["pages"][0]["items"][0]["ref"] = json!("new");
+        changed["pages"][0]["visibleText"] = json!("Popup opened");
+        assert_eq!(result_signature(&pages), result_signature(&changed), "popup/ref changes do not repeat expensive checks");
+        assert_ne!(completion_evidence(&pages), completion_evidence(&changed), "but changed evidence cannot reuse a yes verdict");
+        changed["pages"][0]["tables"][1]["rows"][0][1] = json!("0");
+        assert_ne!(result_signature(&pages), result_signature(&changed));
+        let p = plan(json!({"task":"sort"}));
+        assert_eq!(action_effect(&pages, &changed, &p)["resultsChanged"], true);
+        changed = pages.clone(); changed["pages"][0]["tables"][1]["rows"] = json!([]);
+        assert!(!completion_ready(&changed), "URL and loadedRows count alone are not result evidence");
+        changed = pages.clone(); changed["pages"][0]["loading"] = json!(true);
+        assert!(!completion_ready(&changed));
+        changed = pages.clone(); changed["coverageGaps"] = json!(["inaccessible frame"]);
+        assert!(!completion_ready(&changed));
+        changed = pages.clone(); changed["pages"][0]["items"][0]["dateValue"] = json!("2026-05-01");
+        assert_ne!(result_signature(&pages), result_signature(&changed));
+        changed = pages.clone(); changed["pages"][0]["tables"][0]["columns"] = json!([{"name":"DAU","sort":"ascending"}]);
+        assert_ne!(result_signature(&pages), result_signature(&changed));
+        changed = pages.clone(); changed["pages"][0]["items"].as_array_mut().unwrap()
+            .push(json!({"inView":true,"name":"Canada","role":"checkbox","selected":true}));
+        assert_ne!(result_signature(&pages), result_signature(&changed));
+        let c: Value = serde_json::from_str(&completion_evidence(&changed).unwrap()).unwrap();
+        assert_eq!(c["pages"][0]["selectionFields"][0]["selected"], true);
+        assert_ne!(completion_evidence(&pages), completion_evidence(&changed), "a changed selection invalidates a yes verdict");
+        changed = pages.clone(); changed["pages"][0]["tables"][1]["rows"][0][0] = json!("x".repeat(40001));
+        assert!(completion_evidence(&changed).is_none(), "skip oversized proof instead of invalid requests or silent truncation");
+    }
 
     #[test]
     fn transition_tracks_controls_beyond_prompt_budget() {
@@ -1789,6 +2236,47 @@ mod tests {
         assert!(evidence(&typed, &plan).contains("\"value\":\"United States\""), "typed goal value is visible to JEV");
         let mut listed = pages.clone(); listed["pages"][0]["visibleText"] = json!("Region Global\nUnited States\nConfirm");
         assert!(hints(&listed, &plan, &HashSet::new()).iter().all(|c| !c.derived), "visible options are clicked, not searched");
+    }
+
+    #[test]
+    fn comma_continuation_keeps_region_search_scoped() {
+        let pages = json!({"pages":[{"frame":0,"visibleText":"Region Global Source Company Search",
+            "items":[{"ref":"region","nodeId":"doc:1","name":"Search","role":"input",
+                "fieldContext":"Overall Global Region Select All Africa","editable":true,"inView":true,"value":""},
+                {"ref":"source","nodeId":"doc:2","name":"Search","role":"input",
+                "fieldContext":"Source","editable":true,"inView":true,"value":""},
+                {"ref":"global","nodeId":"doc:3","name":"Search any game or company","role":"input",
+                "editable":true,"inView":true,"value":""}]}]});
+        let p = plan(json!({"task":"在Mobile Games Active Users页面，点击顶部筛选栏的Region下拉框（当前显示Global），在弹出的下拉列表中选择「United States」，Source 改为 M Science"}));
+        let derived: Vec<Candidate> = hints(&pages, &p, &HashSet::new()).into_iter().filter(|c| c.derived).collect();
+        assert_eq!(derived.len(), 2);
+        assert!(derived.iter().any(|c| c.action["ref"] == "region" && c.action["text"] == "United States"));
+        assert!(derived.iter().any(|c| c.action["ref"] == "source" && c.action["text"] == "M Science"));
+        for task in ["打开 Region。选择「United States」", "打开 Region，Company 选择「Acme」"] {
+            let p = plan(json!({"task":task}));
+            assert!(!hints(&pages, &p, &HashSet::new()).iter().any(|c| c.derived && c.action["ref"] == "region"));
+        }
+    }
+
+    #[test]
+    fn expected_value_binds_only_to_one_task_scoped_search() {
+        let p = plan(json!({"task":"点击 Region（地区）展开地区选择面板",
+            "expectedText":"区域筛选变为 United States（或 United States 已被选中）"}));
+        let mut pages = json!({"pages":[{"frame":0,"visibleText":"Region Global","items":[
+            {"ref":"region","name":"Search","role":"input","fieldContext":"Overall Global Region Select All","editable":true,"inView":true},
+            {"ref":"global","name":"Search any game or company","role":"input","editable":true,"inView":true}]}]});
+        let inputs: Vec<Candidate> = hints(&pages, &p, &HashSet::new()).into_iter().filter(|c| c.derived).collect();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].action["ref"], "region");
+        assert_eq!(inputs[0].action["text"], "United States");
+        let mut typed = pages.clone();
+        typed["pages"][0]["items"][0]["value"] = json!("United States");
+        typed["pages"][0]["items"][0]["fieldContext"] = json!("United States");
+        let more = plan(json!({"task":"Region=United States 日期=Last 180 Days"}));
+        assert!(hints(&typed, &more, &HashSet::new()).iter().all(|c| !c.derived), "do not type the date preset into an already-correct region search");
+        let mut duplicate = pages["pages"][0]["items"][0].clone(); duplicate["ref"] = json!("another-region");
+        pages["pages"][0]["items"].as_array_mut().unwrap().push(duplicate);
+        assert!(hints(&pages, &p, &HashSet::new()).iter().all(|c| !c.derived), "ambiguous expectedText requires explicit inputs");
     }
 
     #[test]

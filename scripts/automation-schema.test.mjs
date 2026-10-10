@@ -45,22 +45,28 @@ test('Chrome and WebView share image coordinates, fast scope and bounded batch s
     }
   }
 });
-test('JEV browser decisions share bounded plans; desktop remains advisory', async()=>{
+test('JEV/Altair browser decisions share bounded plans and repair grants', async()=>{
   const [chrome,webview,jianlai]=await Promise.all(['chrome','webview','jianlai'].map(tool));
   assert.deepEqual(webview.inputSchema.properties.plan,chrome.inputSchema.properties.plan);
   assert.deepEqual(webview.inputSchema.properties.experience,chrome.inputSchema.properties.experience);
   assert.deepEqual(webview.inputSchema.properties.advice,chrome.inputSchema.properties.advice);
   for (const browser of [chrome,webview]) {
-    assert.match(browser.description,/按情况选择/);
+    assert.match(browser.description,/网页DOM点击\/填写\/滚动用run驱动（plan只需task/);
+    assert.match(browser.description,/Altair看截图/);
     assert.match(browser.description,/知识图谱/);
-    assert.match(browser.description,/不强制拦截act/);
+    assert.match(browser.description,/最多2个DOM排障动作/);
+    assert.match(browser.description,/解决障碍即run委托剩余目标/);
+    assert.match(browser.description,/默认省略steps，一次委托完整目标/);
+    assert.match(browser.description,/升序前N不能替换为最高N项倒序展示/);
+    assert.match(browser.inputSchema.properties.plan.properties.task.description,/一次委托完整目标/);
     assert.doesNotMatch(browser.description,/jev_run_required/);
-    assert.match(browser.inputSchema.properties.plan.description,/可省略steps/);
+    assert.match(browser.inputSchema.properties.plan.description,/省略steps/);
     assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
   }
   assert.deepEqual(chrome.inputSchema.properties.advice,jianlai.inputSchema.properties.advice);
   assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,24);
-  assert.deepEqual(chrome.inputSchema.properties.plan.required,['task','authorization','expectedText']);
+  assert.deepEqual(chrome.inputSchema.properties.plan.required,['task']);
+  assert.deepEqual(jianlai.inputSchema.properties.plan.required,['task']);
   assert.match(chrome.inputSchema.properties.tabTag.description,/本会话snapshotId/);
   for (const key of ['anyOf','oneOf','allOf']) assert.equal(chrome.inputSchema[key],undefined,'Keep the tool compatible with Claude Code');
   assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.default,32);

@@ -235,7 +235,7 @@ type SettingsTab =
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
   { id: "advanced", name: "高级" },
-  { id: "jev", name: "JEV 辅助决策" },
+  { id: "jev", name: "Altair 辅助决策" },
   { id: "lyra", name: "Lyra" },
   { id: "backends", name: "模型后端" },
   { id: "instructions", name: "Agent 配置" },
@@ -253,13 +253,21 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [jevApiUrl, setJevApiUrl] = createSignal(s?.jevApiUrl ?? "");
   const [jevTesting, setJevTesting] = createSignal(false);
   const [jevTestResult, setJevTestResult] = createSignal("");
-  const testJev = async () => {
+  const [altairEnabled, setAltairEnabled] = createSignal(s?.altairEnabled ?? false);
+  const [altairModel, setAltairModel] = createSignal(s?.altairModel ?? "");
+  const [altairTestResult, setAltairTestResult] = createSignal("");
+  createEffect(() => { if (tab() === "jev") void ensureModelOptions("lyra"); });
+  // altairModel set → the backend tests only Altair (with the app icon as the screenshot).
+  const testDecision = async (altair: boolean) => {
+    const show = altair ? setAltairTestResult : setJevTestResult;
     setJevTesting(true);
-    setJevTestResult("");
+    show("");
     try {
-      const result = await invoke<{ elapsedMs: number }>("test_jev_connection", { apiKey: jevApiKey().trim(), apiUrl: jevApiUrl().trim() });
-      setJevTestResult(`接口测试通过，耗时 ${result.elapsedMs} ms（仅固定测试，不代表控制成功率）`);
-    } catch (error) { setJevTestResult(String(error)); }
+      const result = await invoke<{ elapsedMs: number }>("test_jev_connection", {
+        apiKey: jevApiKey().trim(), apiUrl: jevApiUrl().trim(), altairModel: altair ? altairModel() : null,
+      });
+      show(`接口测试通过，耗时 ${result.elapsedMs} ms（仅固定测试，不代表控制成功率）`);
+    } catch (error) { show(String(error)); }
     finally { setJevTesting(false); }
   };
   const [jevApiKey, setJevApiKey] = createSignal(s?.jevApiKey ?? "");
@@ -701,6 +709,8 @@ export function SettingsModal(props: { onClose: () => void }) {
     jevEnabled: jevEnabled(),
     jevApiKey: jevApiKey().trim(),
     jevApiUrl: jevApiUrl().trim(),
+    altairEnabled: altairEnabled(),
+    altairModel: altairModel(),
     claudePath: claudePath().trim() || "claude-agent-acp",
     claudeProxy: claudeProxy().trim(),
     claudeEnabled: claudeEnabled(),
@@ -1123,8 +1133,9 @@ export function SettingsModal(props: { onClose: () => void }) {
 
         <div class="modal-body">
           <Show when={tab() === "jev"}>
+            <p class="field-hint">网页与桌面操作的决策链：JEV 先按页面文字判断；置信度不足时 Altair 看截图判断；仍不足才交回主模型。开启任一项后，主模型的网页 DOM 点击/填写/滚动会先交给 run，所有后端一致。</p>
             <section class="settings-group">
-              <h3 class="settings-group-title">JEV DOM 决策</h3>
+              <h3 class="settings-group-title">JEV（文本，无图）</h3>
               <label class="field">
                 <span><input type="checkbox" checked={jevEnabled()} onChange={e => setJevEnabled(e.currentTarget.checked)} /> 启用 JEV</span>
                 <span class="field-hint">保存后生效。使用 jev-latest，默认使用系统代理。浏览器 DOM 操作默认委托 JEV，按元素编号规划并在每步后刷新 DOM；视觉操作由主模型负责，JEV 只辅助判断文字证据。仅实际调用 advise/run 时产生用量。不确定时交回主模型，关闭后不发起新请求。</span>
@@ -1139,9 +1150,24 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <input class="field-input" type="text" autocomplete="off" value={jevApiKey()} onInput={e => setJevApiKey(e.currentTarget.value)} />
                 <span class="field-hint">密钥保存在本机设置文件中（非加密）；也可留空使用 NOVA_JEV_API_KEY 环境变量。调用时会向所配置的服务发送任务、观察摘要和候选项；连续执行还会发送相关页面文本与目标信息，不上传截图；请勿提交密码、令牌等敏感信息。JEV 不负责视觉定位。</span>
               </label>
-              <button type="button" class="btn" disabled={jevTesting()} onClick={() => void testJev()}>{jevTesting() ? "测试中…" : "测试连接"}</button>
+              <button type="button" class="btn" disabled={jevTesting()} onClick={() => void testDecision(false)}>{jevTesting() ? "测试中…" : "测试连接"}</button>
               <p class="field-hint">使用当前填写的地址和密钥发送固定测试，可能产生少量费用；无需先保存或启用。</p>
               <p role="status" aria-live="polite">{jevTestResult()}</p>
+            </section>
+            <section class="settings-group">
+              <h3 class="settings-group-title">Altair（文本 + 截图）</h3>
+              <label class="field">
+                <span><input type="checkbox" checked={altairEnabled()} onChange={e => setAltairEnabled(e.currentTarget.checked)} /> 启用 Altair</span>
+                <span class="field-hint">JEV 置信度不足、选择 BLOCKED 或不可用时，用所选模型看当前截图再判断；JEV 未开启时由 Altair 直接代替。剑来桌面 run（plan.task）也由 Altair 驱动。每次只发一次独立请求（不带会话上下文），关闭思考，会上传截图。</span>
+              </label>
+              <div class="field">
+                <span class="field-label">Altair 模型</span>
+                <ModelPicker agentKind="lyra" model={altairModel()} onPickModel={(_, m) => setAltairModel(m)}
+                  prefix="Altair" title="Altair 模型" portal />
+                <span class="field-hint">需选择支持图片输入的 Lyra 模型；响应越快越好（建议 Flash/Haiku 级别）。</span>
+              </div>
+              <button type="button" class="btn" disabled={jevTesting() || !altairModel()} onClick={() => void testDecision(true)}>{jevTesting() ? "测试中…" : "测试 Altair"}</button>
+              <p role="status" aria-live="polite">{altairTestResult()}</p>
             </section>
           </Show>
           {/* ===== 通用 ===== */}
