@@ -280,7 +280,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         // 转换规则升级：旧缓存缺少模型私有参数，不能继续沿用六小时。
         let headers = provider["options"]["headers"].to_string();
         let local_models = if local_source(preset.id).is_some() { provider["models"].to_string() } else { String::new() };
-        let print = fingerprint(&["5", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
+        let print = fingerprint(&["6", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
         let entry = &cache[id.as_str()];
         if !force
             && entry["fingerprint"] == print.as_str()
