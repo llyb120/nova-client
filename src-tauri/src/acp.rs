@@ -3550,9 +3550,12 @@ impl AcpManager {
             return;
         }
         let rules = self.nova_rules(thread_id);
+        // 模型不得自行 EnterPlanMode；Plan 只能由用户在界面切换（走 session mode，不依赖该工具）。
+        let mut meta = json!({ "claudeCode": { "options": { "disallowedTools": ["EnterPlanMode"] } } });
         if !rules.is_empty() {
-            params["_meta"] = json!({ "systemPrompt": { "append": rules.join("\n\n") } });
+            meta["systemPrompt"] = json!({ "append": rules.join("\n\n") });
         }
+        params["_meta"] = meta;
     }
 
     fn build_user_prompt_blocks(
@@ -5046,7 +5049,8 @@ mod codebuddy_acp_tests {
         assert!(per_turn.contains("if self.kind == AgentKind::Claude {\n            Vec::new()"));
         let meta = source.split("fn add_session_meta(").nth(1).unwrap()
             .split("fn build_user_prompt_blocks(").next().unwrap();
-        assert!(meta.contains("\"systemPrompt\": { \"append\""));
+        assert!(meta.contains("\"systemPrompt\"] = json!({ \"append\""));
+        assert!(meta.contains("\"disallowedTools\": [\"EnterPlanMode\"]"));
         assert!(source.contains(".request(\"session/new\", params.clone()"));
         assert!(source.contains(".request(\"session/load\", params.clone()"));
         let rules = source.split("fn nova_rules(").nth(1).unwrap()
