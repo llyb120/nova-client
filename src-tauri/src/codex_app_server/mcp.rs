@@ -11,7 +11,7 @@ pub(super) struct Config {
 }
 
 fn tool() -> Value {
-    json!({"name":"polaris","description":"需要跨文件查找、分析修改位置或读取多个文件时先调用：按 keywords/task/files 打包完整代码单元、依赖和 IMPACT 调用方。已展示范围视为已读，只补 coverage gaps / next_reads，不重复搜索相同关键词。返回 CTX MISS 时按 next 提示修正符号或传 files 重试。",
+    json!({"name":"polaris","description":"需要跨文件查找、分析修改位置或读取多个文件时先调用：按 keywords/task/files 返回高相关命中行（每处1–2行）+必要签名/定位及 IMPACT 调用方；依赖默认仅签名/位置，按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。仅实际展示的行段视为已读，不重复搜索相同关键词。返回 CTX MISS 时按 next 提示修正符号或传 files 重试。",
         "inputSchema":{"type":"object","properties":{
             "keywords":{"anyOf":[{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},{"type":"string","minLength":1}],"description":"关键词或符号名，最多取前 5 项"},
             "query":{"type":"string","minLength":1,"description":"简短检索词"},

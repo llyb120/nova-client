@@ -30,8 +30,8 @@ export function createCursorFilesystemTools(cwd, options = {}) {
           },
           task: { type: "string", description: "一句话任务描述，用于补充检索词和排序" },
           files: { type: "array", maxItems: 6, items: { type: "string" }, description: "已知必看文件，可与 keywords/task 同用" },
-          budget: { type: "integer", minimum: 100, maximum: 1200, description: "完整代码单元行预算；默认随 maxBytes 推导（32KB≈1024 行），一般不必传" },
-          maxBytes: { type: "integer", minimum: 8192, maximum: 65536, description: "输出硬预算，默认 32768；仅按完整文件/单元边界收敛" },
+          budget: { type: "integer", minimum: 100, maximum: 1200, description: "输出行预算；通常无需设置，不用于凑满输出" },
+          maxBytes: { type: "integer", minimum: 4096, maximum: 65536, description: "输出字节硬上限，默认 12288（12KB）；只返回高相关命中行与必要签名/定位，不凑满" },
           coupling: { type: "boolean", description: "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" },
         },
         additionalProperties: false,
@@ -61,14 +61,14 @@ export function cursorBatchToolPolicy(options = {}) {
       + ". The following tool-selection rules are hard constraints.",
     "Prefer minimal reads: when line ranges are known, read only those segments; expand nearby context only as needed. "
       + (fastContext
-        ? "When edit distribution is unknown — or when you plan to modify two or more files not yet read this session — call polaris first; one call typically replaces 5–10 grep+read round-trips. Never re-read shown ranges; read SIG/IMPACT bodies by path:line only when truly needed. "
+        ? "When edit distribution is unknown — or when you plan to modify two or more files not yet read this session — call polaris first; one call typically replaces 5–10 grep+read round-trips. Only actual shown lines count as read; read dependency/SIG/IMPACT bodies by path:line only when truly needed. "
         : "When location is unknown, search first (see below), then read near hits. ")
       + "Do not dump large files blindly."
       + (readOnly
         ? ""
         : " For edits, use Cursor built-in Write/Edit/StrReplace."),
     (fastContext
-      ? "Search and traversal must be cost-bounded. If path and range are known, use Read directly. When edit distribution is unknown, or you plan to modify 2+ unread files, call polaris once — one call typically replaces 5–10 grep+read round-trips. It returns complete EDIT/DEPS units plus IMPACT/SIG indexes using batched rg and an incremental symbol index. Never re-read shown ranges. Read SIG/IMPACT bodies by exact path:line only when truly needed. Do not re-discover the same keywords with Shell rg/git grep or Cursor Grep, and do not re-call merely with a larger budget. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
+      ? "Search and traversal must be cost-bounded. If path and range are known, use Read directly. When edit distribution is unknown, or you plan to modify 2+ unread files, call polaris once — one call typically replaces 5–10 grep+read round-trips. It returns highly relevant core hit lines (1–2 lines per hit) plus necessary signatures/locations and IMPACT/SIG indexes using batched rg and an incremental symbol index. Dependencies default to signatures/locations only; use Read by exact path:line when needed. The default hard limit is 12KB, not a target to fill; whole functions are not automatically expanded. Only actual shown lines count as read; do not re-read them. Do not re-discover the same keywords with Shell rg/git grep or Cursor Grep, and do not re-call merely with a larger budget. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. "
       : "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. ")
       + "Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.",
   ];
