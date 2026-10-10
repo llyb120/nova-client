@@ -45,46 +45,35 @@ test('Chrome and WebView share image coordinates, fast scope and bounded batch s
     }
   }
 });
-test('Altair browser decisions share bounded plans and repair grants', async()=>{
+test('Altair is a vision proxy: the main model decides, run only executes its steps', async()=>{
   const [chrome,webview,jianlai]=await Promise.all(['chrome','webview','jianlai'].map(tool));
   assert.deepEqual(webview.inputSchema.properties.plan,chrome.inputSchema.properties.plan);
   assert.deepEqual(webview.inputSchema.properties.experience,chrome.inputSchema.properties.experience);
-  assert.deepEqual(webview.inputSchema.properties.advice,chrome.inputSchema.properties.advice);
   for (const browser of [chrome,webview]) {
-    assert.match(browser.description,/网页DOM点击\/填写\/滚动用run驱动（plan只需task/);
-    assert.match(browser.description,/Altair结合页面文字与截图/);
-    assert.match(browser.description,/同屏可确定的后续步骤连续执行/);
-    assert.match(browser.description,/知识图谱/);
-    assert.match(browser.description,/最多2个DOM排障动作/);
-    assert.match(browser.description,/解决障碍即run委托剩余目标/);
-    assert.match(browser.description,/默认省略steps，一次委托完整目标/);
+    assert.match(browser.description,/截图不再发给你/);
+    assert.match(browser.description,/所有判断由你决定，Altair只负责看/);
     assert.match(browser.description,/升序前N不能替换为最高N项倒序展示/);
-    assert.match(browser.inputSchema.properties.plan.properties.task.description,/一次委托完整目标/);
-    assert.doesNotMatch(browser.description,/JEV/);
-    assert.match(browser.inputSchema.properties.plan.description,/省略steps/);
+    assert.doesNotMatch(browser.description,/JEV|advise|runTemplate|DOM排障/);
+    assert.deepEqual(browser.inputSchema.properties.plan.required,['task','steps']);
+    assert.equal(browser.inputSchema.properties.action.properties.target.maxLength,300);
+    assert.equal(browser.inputSchema.properties.actions.items.properties.target.maxLength,300);
     assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
   }
-  assert.deepEqual(chrome.inputSchema.properties.advice,jianlai.inputSchema.properties.advice);
+  assert.match(jianlai.description,/一次act可下发多步/);
+  assert.equal(jianlai.inputSchema.properties.plan,undefined);
+  assert.deepEqual(jianlai.inputSchema.properties.actions.items.allOf[0].then,{anyOf:[{required:['x','y']},{required:['target']}]});
   assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,24);
-  assert.deepEqual(chrome.inputSchema.properties.plan.required,['task']);
-  assert.deepEqual(jianlai.inputSchema.properties.plan.required,['task']);
   assert.match(chrome.inputSchema.properties.tabTag.description,/本会话snapshotId/);
   for (const key of ['anyOf','oneOf','allOf']) assert.equal(chrome.inputSchema[key],undefined,'Keep the tool compatible with Claude Code');
   assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.default,32);
-  assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.maximum,64);
   assert.equal(chrome.inputSchema.properties.plan.properties.inputs.maxItems,8);
-  assert.deepEqual(chrome.inputSchema.properties.plan.properties.inputs.items.required,['name','text']);
-  assert.equal(chrome.inputSchema.properties.plan.properties.inputs.items.properties.name.minLength,0);
-  assert.equal(chrome.inputSchema.properties.plan.properties.controlNames.maxItems,16);
-  assert.equal(chrome.inputSchema.properties.plan.properties.useExperience.default,false);
   assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.required,['action']);
-  assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.properties.action.enum,['click','fill','press','scroll']);
   for(const tool of [chrome,webview,jianlai]) {
-    assert(tool.inputSchema.properties.operation.enum.includes('advise'));
+    assert(!tool.inputSchema.properties.operation.enum.includes('advise'));
+    assert.equal(tool.inputSchema.properties.advice,undefined);
     assert(tool.inputSchema.properties.operation.enum.includes('run'));
-    assert.deepEqual(tool.inputSchema.properties.advice.required,['task','state','choices']);
-    assert.equal(tool.inputSchema.properties.advice.properties.choices.maxProperties,32);
-    assert.match(tool.description,/不自动执行/);
+    assert.deepEqual(tool.inputSchema.properties.vision.enum,['auto','raw']);
+    assert.equal(tool.inputSchema.properties.look.maxLength,500);
   }
 });
 test('browser run transport outlives the decision budget without changing normal calls',async t=>{

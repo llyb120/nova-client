@@ -1099,11 +1099,6 @@ fn validate_action(action: &Action) -> Result<(), String> {
     if let Action::ScrollAt { delta_x:Some(x), .. } | Action::Scroll { delta_x:Some(x), .. } = action { if x.unsigned_abs()>1200 { return Err("delta_x 超过1200像素".into()); } }
     Ok(())
 }
-/// The delegation gate and executor must agree on aliases, string JSON and fenced JSON.
-pub(crate) fn dom_action_count(args: &Value) -> Result<usize, String> {
-    Ok(parse_actions(args, 16)?.iter().filter(|action| matches!(action,
-        Action::Click { .. } | Action::Fill { .. } | Action::Scroll { r#ref: Some(_), .. })).count())
-}
 
 fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String> {
     if !args["action"].is_null() && !args["actions"].is_null() { return Err("action 和 actions 不能同时提供：单步仅传 action，多步仅传 actions；删除另一个字段。本批次未执行。".into()); }
@@ -1925,9 +1920,6 @@ async fn control_session(
     }
     if let Ok(value) = &mut result {
         value["durationMs"] = json!(started.elapsed().as_millis());
-        if value["snapshotId"].is_string() {
-            value["altair"] = crate::altair::availability(&app.state::<AppState>().settings.lock().unwrap());
-        }
     }
     result
 }
@@ -1960,13 +1952,53 @@ pub(crate) fn current_context(root: &Path) -> Result<(&'static AppHandle, String
 
 pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> {
     let (args, inferred) = infer_operation(args, "browserId");
-    let mut result = execute_webview(root, &args).await?;
-    if let Some(op) = inferred { result["operationInferred"] = json!(op); }
     let owner = current_context(root)?.1;
-    if args["operation"] == "act" {
-        if let Some(hint) = crate::altair_run::handoff_hint(&args, &owner, "webview") { result["handoff"] = hint; }
+    let resolved = resolve_targets(root, &args, &owner, "webview").await?;
+    let mut result = execute_webview(root, &resolved).await?;
+    if let Some(op) = inferred { result["operationInferred"] = json!(op); }
+    Ok(crate::altair::filter(&args, with_experience_hint("webview", &owner, result)).await)
+}
+
+/// Coordinate actions may name a `target` (a `vN` from vision.targets or a description) instead of
+/// x/y: Altair locates it on this snapshot's own screenshot, then the normal imageId validation runs.
+async fn resolve_targets(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
+    let named = |a: &Value| a["target"].is_string();
+    if args["operation"] != "act" || !(named(&args["action"]) || args["actions"].as_array().is_some_and(|a| a.iter().any(named))) {
+        return Ok(args.clone());
     }
-    Ok(with_experience_hint("webview", &owner, result))
+    let settings = altair_settings()?;
+    if !settings.altair_enabled { return Err("target 需要在设置中开启 Altair；未开启时用 x/y 或 DOM ref".into()); }
+    let snapshot = args["snapshotId"].as_str().unwrap_or_default().to_string();
+    let mut args = args.clone();
+    let single = args["action"].is_object();
+    let mut actions = if single { vec![args["action"].take()] } else { args["actions"].as_array().cloned().unwrap_or_default() };
+    let mut image_id = args["imageId"].clone();
+    for action in &mut actions {
+        let Some(target) = action["target"].as_str().map(str::to_string) else { continue };
+        if action["action"] == "click" && action["ref"].is_null() { action["action"] = json!("click_at"); }
+        if !matches!(action["action"].as_str(), Some("click_at" | "move" | "scroll_at" | "drag")) {
+            return Err("target 只用于 click_at/move/scroll_at/drag；DOM 控件用 frame/ref".into());
+        }
+        let (id, x, y) = match crate::altair::recall(&snapshot, &target) {
+            Some((id, x, y, _)) => (json!(id), x, y),
+            None if target.strip_prefix('v').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) =>
+                return Err(format!("{target} 不在该 snapshotId 的 vision.targets 中；改用文字描述 target")),
+            None => {
+                let (id, path) = altair_shot(root, &args, owner, tool)
+                    .ok_or("该 snapshotId 没有本次截图；先 screenshot（或 act feedback=screenshot）再用 target")?;
+                let point = crate::altair::ground(&settings, &path, &target).await?;
+                (json!(id), point["x"].as_u64().unwrap_or_default() as u32, point["y"].as_u64().unwrap_or_default() as u32)
+            }
+        };
+        if !image_id.is_null() && image_id != id { return Err("同一批 target 必须来自同一张截图（imageId）".into()); }
+        image_id = id;
+        action["x"] = json!(x);
+        action["y"] = json!(y);
+        if let Some(map) = action.as_object_mut() { map.remove("target"); }
+    }
+    if single { args["action"] = actions.remove(0); } else { args["actions"] = json!(actions); }
+    args["imageId"] = image_id;
+    Ok(args)
 }
 
 /// A missing `operation` is inferred from the other fields instead of failing the call:
@@ -2025,7 +2057,7 @@ async fn execute_webview(root: &Path, args: &Value) -> Result<Value, String> {
             .navigate(url)
             .map_err(|e| e.to_string())?;
         return Ok(
-            json!({"browserId":value["browserId"],"status":"opening","altair":crate::altair::availability(&altair_settings()?),"next":"页面加载完成后 inspect；Altair 启用时优先 run 委托文本 DOM 子目标"}),
+            json!({"browserId":value["browserId"],"status":"opening","next":"页面加载完成后 inspect"}),
         );
     }
     let id = args["browserId"]
@@ -2037,17 +2069,6 @@ async fn execute_webview(root: &Path, args: &Value) -> Result<Value, String> {
     }
     if operation == "run" {
         return Box::pin(crate::altair_run::browser(root, args, &thread_id, "webview")).await;
-    }
-    if operation == "act" {
-        if let Some(rejected) = crate::altair_run::route_act(args, &thread_id, "webview")? { return Ok(rejected); }
-    }
-    if operation == "advise" {
-        let settings = altair_settings()?;
-        if crate::altair::enabled(&settings) { altair_observation(root, args, &thread_id, "webview")?; }
-        let image = altair_image(root, args, &thread_id, "webview");
-        let mut result = crate::altair::advise(settings, args, std::future::ready(image)).await?;
-        result["basedOnSnapshotId"] = args["snapshotId"].clone();
-        return Ok(result);
     }
     if crate::tool_experience::is_operation(args) {
         let observed = if operation == "experience_search" { None } else {
@@ -2126,23 +2147,21 @@ fn decision_image(observation: &Observation) -> Option<&ScreenshotImage> {
     observation.images.first().filter(|image| image.id.starts_with(&format!("{}-", observation.id)))
 }
 
-pub(crate) fn altair_image(root: &Path, args: &Value, owner: &str, tool: &str) -> Option<Value> {
+/// (imageId, file) of the snapshot's own fresh screenshot, for Altair grounding.
+fn altair_shot(root: &Path, args: &Value, owner: &str, tool: &str) -> Option<(String, std::path::PathBuf)> {
     let key = altair_observation_key(root, args, owner, tool).ok()?;
-    let path = {
-        let state = APP.get()?.state::<BrowserState>();
-        let observations = state.observations.lock().unwrap();
-        let observation = observations.get(&key)
-            .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))?;
-        decision_image(observation)?.path.clone()
-    };
-    crate::altair::image_part(&path)
+    let state = APP.get()?.state::<BrowserState>();
+    let observations = state.observations.lock().unwrap();
+    let observation = observations.get(&key)
+        .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))?;
+    decision_image(observation).map(|image| (image.id.clone(), image.path.clone()))
 }
 
 fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashMap<String, Observation>) -> Result<Value, String> {
     let mut args = args.as_object().cloned().ok_or("chrome 参数必须是对象")?;
     match args.get("operation").and_then(Value::as_str).unwrap_or_default() {
         "connect" | "status" | "tabs" | "open" | "new_tab" | "downloads" | "experience_search" => return Ok(Value::Object(args)),
-        "inspect" | "screenshot" | "act" | "run" | "advise" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
+        "inspect" | "screenshot" | "act" | "run" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
         _ => return Err("缺少或无效 operation；先用 {\"operation\":\"tabs\"} 获取标签".into()),
     }
     let valid_tag = |tag: &str| tag.len() <= 80 && tag.starts_with('C')
@@ -2178,16 +2197,16 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
     let (args, inferred) = infer_operation(args, "tabTag");
     let args = &args;
     let normalized = chrome_args(args, &thread_id, &app.state::<BrowserState>().observations.lock().unwrap())?;
+    let normalized = resolve_targets(root, &normalized, owner, "chrome").await?;
     let mut result = execute_chrome_inner(root, &normalized, owner).await?;
     if let Some(op) = inferred { result["operationInferred"] = json!(op); }
     if args.get("tabTag").is_none() && normalized["tabTag"].is_string() {
         result["tabTag"] = normalized["tabTag"].clone();
         result["targetResolvedFrom"] = json!(if args.get("snapshotId").is_some() { "snapshotId" } else { "sessionObservation" });
     }
-    if normalized["operation"] == "act" {
-        if let Some(hint) = crate::altair_run::handoff_hint(&normalized, owner, "chrome") { result["handoff"] = hint; }
-    }
-    Ok(with_experience_hint("chrome", &thread_id, result))
+    let result = with_experience_hint("chrome", &thread_id, result);
+    // The settings UI drives Chrome too; only agent replies go through the vision proxy.
+    Ok(if owner.starts_with("ui:") { result } else { crate::altair::filter(args, result).await })
 }
 
 async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
@@ -2196,24 +2215,6 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     let operation = args["operation"].as_str().unwrap_or_default();
     if operation == "run" {
         return Box::pin(crate::altair_run::browser(root, args, owner, "chrome")).await;
-    }
-    if operation == "act" {
-        if let Some(rejected) = crate::altair_run::route_act(args, owner, "chrome")? { return Ok(rejected); }
-    }
-    if operation == "advise" {
-        let settings = altair_settings()?;
-        if crate::altair::enabled(&settings) {
-            let tag = args["tabTag"].as_str().ok_or("Altair 辅助判断需 tabTag")?;
-            let state = app.state::<BrowserState>();
-            let observations = state.observations.lock().unwrap();
-            observations.get(&format!("chrome:{thread_id}:{tag}"))
-                .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
-                .ok_or("Altair 辅助判断需本会话该标签最新观察（180秒内）")?;
-        }
-        let image = altair_image(root, args, owner, "chrome");
-        let mut result = crate::altair::advise(settings, args, std::future::ready(image)).await?;
-        result["basedOnSnapshotId"] = args["snapshotId"].clone();
-        return Ok(result);
     }
     if crate::tool_experience::is_operation(args) {
         let observed = if operation == "experience_search" { None } else {
@@ -2238,7 +2239,6 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     }
     if matches!(operation, "connect" | "status") {
         let mut connection = connection;
-        connection["altair"] = crate::altair::availability(&altair_settings()?);
         if connection["connected"] == true {
             match crate::chrome_browser::request(app, "status", json!({})).await {
                 Ok(capabilities) => connection["incognitoAllowed"] = capabilities["incognitoAllowed"].clone(),
@@ -2659,7 +2659,7 @@ mod tests {
         observations.insert("chrome:owner:C2-test".into(), second);
         assert!(chrome_args(&inspect, "owner", &observations).is_err());
         assert_eq!(chrome_args(&act, "owner", &observations).unwrap()["tabTag"], "C1-test");
-        for operation in ["run", "advise", "experience_save", "experience_feedback", "goto", "close_tab"] {
+        for operation in ["run", "experience_save", "experience_feedback", "goto", "close_tab"] {
             let args = json!({"operation":operation,"snapshotId":"second"});
             assert_eq!(chrome_args(&args, "owner", &observations).unwrap()["tabTag"], "C2-test");
         }

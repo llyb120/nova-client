@@ -1,16 +1,19 @@
-//! Altair × DOM decision tree. Every observation walks the same tree and the first matching node acts:
-//! guard → wait → completion → reflex → path → altair → fallback. Local nodes act without a model round-trip; Altair
-//! plans the current step plus a short same-screen path only at information boundaries, and each
-//! continuation step is re-bound and validated against fresh DOM. The main model is the fallback.
+//! Guided browser runs: executes the main model's `plan.steps` back-to-back against fresh DOM.
+//! The main model makes every decision; this module makes none and sends no screenshots. Each step
+//! is bound locally to one control of the latest observation (name/role/container/description
+//! scoring), consecutive steps that cannot change what the next target means share one act, and
+//! `expect`/`expectedText` are checked literally (page text, URL, title). Anything uncertain —
+//! close or missing matches, unmet expectations, cross-site pages, exhausted budgets — hands back to
+//! the main model with the latest observation and the remaining steps.
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::{BTreeMap, HashMap, HashSet, VecDeque}, path::Path, time::{Duration, Instant}};
+use std::{collections::{BTreeMap, HashMap, HashSet}, path::Path, time::{Duration, Instant}};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Plan {
     task: String,
-    // Only task is required so that every backend can delegate with one sentence.
+    // task + steps are required; authorization and expectedText have safe defaults.
     #[serde(default = "default_authorization")]
     authorization: String,
     #[serde(default)]
@@ -19,21 +22,20 @@ struct Plan {
     inputs: Vec<Input>,
     #[serde(default)]
     steps: Vec<Step>,
-    #[serde(default)]
-    control_names: Vec<String>,
-    #[serde(default)]
-    use_experience: bool,
     #[serde(default = "default_max_actions")]
     max_actions: usize,
+    /// expectedText was given: only then is the final page-text check a completion gate.
+    #[serde(skip)]
+    check_goal: bool,
     /// Concrete values the main model wrote into the goal (e.g. "United States"); local only.
     #[serde(skip)]
     phrases: Vec<String>,
 }
 fn default_max_actions() -> usize { 32 }
 fn default_authorization() -> String { "仅限完成目标所需的页面内点击、填写、滚动；不做支付、删除、对外发送等不可逆操作".into() }
-/// One step of the main model's plan. The main model decides *what* to do; the runner finds the
-/// control (locally, Altair only for ties), executes consecutive steps without round-trips, and
-/// checks `expect` before moving on.
+/// One step of the main model's plan. The main model decides *what* to do; the runner binds the
+/// control locally on fresh DOM (close matches go back to the main model), executes consecutive
+/// steps without round-trips, and checks `expect` before moving on.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Step {
@@ -54,7 +56,8 @@ struct Step {
     key: Option<String>,
     #[serde(default)]
     direction: Option<String>,
-    /// Observable result that must hold before the next step (literal text first, then Altair yes/no).
+    /// Observable result that must hold before the next step: literal text/URL/title fragments,
+    /// alternatives separated by `|`.
     #[serde(default)]
     expect: Option<String>,
     #[serde(default)]
@@ -94,98 +97,28 @@ struct Input {
     text: String,
 }
 
-// ponytail: fixed budgets. 180s per run, 4s local load wait, 15s no-progress wait, 90 entries per Altair batch
-// (with groups collapsed most screens fit entirely; ranking only trims crowded pages).
+// ponytail: fixed budgets. 180s per run, 4s local load wait, 250ms polling.
 const RUN_BUDGET: Duration = Duration::from_secs(180);
 const LOAD_WAIT: Duration = Duration::from_secs(4);
 const POLL: Duration = Duration::from_millis(250);
-const SHORTLIST: usize = 90;
-const GROUP_MIN: usize = 8;
-const PATH_DEPTH: usize = 4;
 const STATE_REPEATS: usize = 3;
-// 动作后界面常晚一拍才变化：轮询到连续两次一致为止，最多等这么久。
-const ACTION_SETTLE: Duration = Duration::from_millis(1000);
-// Altair 连续选 WAIT 超过这个次数就交给主模型。
-const MAX_WAITS: usize = 2;
-const STEPS_UNMET: &str = "需要按最新页面重新规划";
-// ponytail: two DOM repair attempts per handoff, not two arbitrary batches; then re-delegate.
-// This bounds main-model takeover without trying to infer whether a semantic obstacle was fixed.
-const HANDOFF_ACTS: usize = 2;
-
-// ponytail: in-memory per target; lost on restart, which only means one extra "use run" reply.
-static GRANTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> = std::sync::LazyLock::new(Default::default);
-
-fn grant_key(tool: &str, owner: &str, target: &str) -> String { format!("{tool}:{owner}:{target}") }
-
-/// Shared gate for every backend: with Altair on, DOM click/fill/scroll from the main model go
-/// through `run` first. Returns Some(reply) when the act must not execute. Passes through internal
-/// run acts, the UI, coordinate/keyboard actions, and acts after a run handed off.
-pub(crate) fn route_act(args: &Value, owner: &str, tool: &str) -> Result<Option<Value>, String> {
-    if executing_browser_action() || owner.starts_with("ui:") || !crate::altair::enabled(&crate::native_browser::altair_settings()?) {
-        return Ok(None);
-    }
-    let target_key = if tool == "webview" { "browserId" } else { "tabTag" };
-    let target = args[target_key].as_str().unwrap_or_default();
-    Ok(gate(args, &grant_key(tool, owner, target))?.then(|| {
-        let mut template = json!({"operation":"run","plan":{"task":"<一句话目标，如：筛选美国、近半年，按 DAU 升序>"}});
-        template[target_key] = json!(target);
-        json!({"status":"not_executed","completedActions":0,"inputAttempted":false,"verification":"unverified",
-            "basedOnSnapshotId":args["snapshotId"],"browser":tool,
-            "reason":"决策链已开启：DOM 点击/填写/滚动先交给 run（Altair 结合页面文字与截图逐步决策，仍没把握才交回你）。",
-            "next":"按 runTemplate 调用 run，task 保留完整目标和约束；交回后仅有少量 DOM 排障额度，障碍解决即重新委托剩余目标。坐标、按键类动作不受限。",
-            "runTemplate":template})
-    }))
-}
-
-/// Small shared projection of one decision for handoff diagnostics.
-fn decision_log(decision: &Value, tree_path: Value) -> Value {
-    json!({"choice":decision["choice"],"treePath":tree_path,"status":decision["status"],"decidedBy":decision["decidedBy"],
-        "confidence":decision["confidence"],"operationConfidence":decision["operationConfidence"],"requestAttempted":decision["requestAttempted"],"elapsedMs":decision["elapsedMs"],
-        "path":decision["path"],"pathWarning":decision["pathWarning"],"error":decision["error"],"latency":decision["latency"]})
-}
-
-fn handoff_reason(decision: &Value, fallback: &str) -> String {
-    let mut reason = if decision["status"] == "low_confidence" {
-        format!("Altair 置信度不足（{} 选 {}，目标置信度 {}，操作置信度 {}，阈值 {}），未执行", decision["decidedBy"].as_str().unwrap_or("?"),
-            decision["choice"].as_str().unwrap_or("?"), decision["confidence"], decision["operationConfidence"], crate::altair::MIN_CONFIDENCE)
-    } else { fallback.to_string() };
-    if let Some(error) = decision["error"].as_str().filter(|e| !reason.contains(e)) { reason.push_str(&format!("；{error}")); }
-    reason
-}
-
-pub(crate) fn handoff_hint(args: &Value, owner: &str, tool: &str) -> Option<Value> {
-    if args["operation"] != "act" || executing_browser_action() || owner.starts_with("ui:")
-        || !crate::altair::enabled(&crate::native_browser::altair_settings().ok()?) { return None; }
-    let target = args[if tool == "chrome" { "tabTag" } else { "browserId" }].as_str()?;
-    let grants = GRANTS.lock().unwrap();
-    let remaining = grants.get(&grant_key(tool, owner, target))?;
-    Some(json!({"remainingDomActions":remaining,"next":if *remaining == 0 {
-        "DOM 排障额度已用完；障碍解决后 run 委托剩余目标，保留原筛选/排序/数量约束，不重放历史动作。仍被同一障碍阻塞则报告原因，不盲目重试。"
-    } else { "此额度只用于解决交接障碍；解决后立即 run 委托剩余目标，不继续手工驱动整个流程。" }}))
-}
-
-/// True when the act must be rerouted; consumes one handoff grant otherwise.
-fn gate(args: &Value, key: &str) -> Result<bool, String> {
-    let dom = crate::native_browser::dom_action_count(args)?;
-    if dom == 0 { return Ok(false); }
-    let mut grants = GRANTS.lock().unwrap();
-    Ok(match grants.get_mut(key) {
-        Some(left) if *left >= dom => { *left -= dom; false }
-        _ => true,
-    })
-}
 
 fn parse(args: &Value) -> Result<Plan, String> {
-    let mut plan: Plan = serde_json::from_value(args["plan"].clone())
-        .map_err(|e| format!("plan 格式错误（{e}）；只需 task（一句话目标），steps 须为对象数组，如 [{{\"action\":\"click\",\"target\":\"顶部导航 Intelligence\",\"expect\":\"情报页\"}}]，不是字符串"))?;
-    if plan.expected_text.trim().is_empty() { plan.expected_text = plan.task.chars().take(500).collect(); }
+    let mut raw = args["plan"].clone();
+    // Hints of the removed goal mode: still accepted so older prompts parse, but unused.
+    if let Some(object) = raw.as_object_mut() { object.remove("controlNames"); object.remove("useExperience"); }
+    let mut plan: Plan = serde_json::from_value(raw)
+        .map_err(|e| format!("plan 格式错误（{e}）；需要 task 与 steps，steps 须为对象数组，如 [{{\"action\":\"click\",\"target\":\"顶部导航 Intelligence\",\"expect\":\"情报页\"}}]，不是字符串"))?;
+    if plan.steps.is_empty() { return Err("run 需要 plan.steps（主模型给出的步骤）；单步或同屏合批直接用 act".into()); }
+    plan.check_goal = !plan.expected_text.trim().is_empty();
+    if !plan.check_goal { plan.expected_text = plan.task.chars().take(500).collect(); }
     let valid = |s: &str, max: usize| !s.trim().is_empty() && s.chars().count() <= max;
     if !valid(&plan.task, 2000) || !valid(&plan.authorization, 1000) || !valid(&plan.expected_text, 500)
         || plan.inputs.len() > 8 || plan.inputs.iter().any(|i| i.name.chars().count() > 300
             || (i.name.trim().is_empty() && i.role.is_none() && i.field_context.is_none())
             || i.field_context.as_ref().is_some_and(|f| !valid(f, 600))
             || i.role.as_ref().is_some_and(|r| !valid(r, 80)) || i.text.chars().count() > 4000) {
-        return Err("Altair 目标/授权/完成证据无效，inputs 最多8个非敏感字段".into());
+        return Err("run 目标/授权/完成证据无效，inputs 最多8个非敏感字段".into());
     }
     let optional = |v: &Option<String>, max: usize| v.as_ref().is_none_or(|s| valid(s, max));
     if let Some((index, _)) = plan.steps.iter().enumerate().find(|(_, s)|
@@ -201,19 +134,15 @@ fn parse(args: &Value) -> Result<Plan, String> {
         return Err(format!("steps[{index}] 无效：action 为 click/fill/press/scroll；click/fill 需 target（或 name）；fill 需 text；press 需 key（Enter/Tab/Escape/ArrowDown/ArrowUp/Space/Backspace）；scroll 可选 direction；repeat≤3"));
     }
     if plan.steps.len() > 24 { return Err("steps 最多24步；更长的流程分段 run".into()); }
-    if plan.control_names.len() > 16 || plan.control_names.iter().any(|n| !valid(n, 300)) {
-        return Err("controlNames 最多16个非空控件名称片段".into());
-    }
     if !(1..=64).contains(&plan.max_actions) { return Err("maxActions 必须为1–64".into()); }
     let mut fields = HashSet::new();
     if plan.inputs.iter().any(|i| !fields.insert((&i.name, &i.role, &i.field_context))) { return Err("inputs 字段重复".into()); }
-    let mut plan = plan;
     plan.phrases = goal_phrases(&format!("{}\n{}\n{}", plan.task, plan.authorization, plan.expected_text));
     Ok(plan)
 }
 
 /// Concrete values a person would type into a search box: quoted text and Title-Case Latin
-/// phrases ("United States", "M Science"). Only the main model's own words are ever typed.
+/// phrases ("United States", "M Science"). Used to recognise filter values typed by fill steps.
 fn goal_phrases(text: &str) -> Vec<String> {
     static QUOTED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static TITLED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -232,57 +161,6 @@ fn goal_phrases(text: &str) -> Vec<String> {
     out
 }
 
-fn search_like(item: &Value) -> bool {
-    matches!(item["role"].as_str(), Some("searchbox" | "combobox"))
-        || [&item["name"], &item["fieldContext"]].iter().any(|v| v.as_str().is_some_and(|s| {
-            let s = s.chars().take(80).collect::<String>().to_lowercase();
-            ["search", "filter", "find", "query", "keyword", "搜索", "查找", "筛选", "过滤", "检索"].iter().any(|k| s.contains(k))
-        }))
-}
-
-/// Goal phrases worth typing into this search box: stated in a clause that also mentions the
-/// field's context (e.g. "Region … United States"), and not already visible on the page.
-fn search_phrases(plan: &Plan, item: &Value, visible: &str, sole_expected_scope: bool) -> Vec<String> {
-    // ponytail: derived search is a single goal value, not a staged query program; use explicit
-    // inputs/steps to replace an already-correct search with another value.
-    if item["value"].as_str().is_some_and(|v| !v.is_empty() && plan.phrases.iter().any(|p| v.eq_ignore_ascii_case(p))) {
-        return Vec::new();
-    }
-    let context = format!("{} {}", item["name"].as_str().unwrap_or_default(),
-        item["fieldContext"].as_str().unwrap_or_default().chars().take(120).collect::<String>());
-    let context_lower = context.to_lowercase();
-    let generic = terms("search select all filter find query keyword 搜索 查找 筛选");
-    let anchors: HashSet<String> = terms(&context).difference(&generic).cloned().collect();
-    let goal = format!("{}\n{}", plan.task, plan.authorization);
-    // ponytail: inherit context across ONE comma only for an explicit popup/search continuation.
-    // Do not merge whole sentences (Region and Company may request different values); use inputs
-    // for more complex references instead of guessing text for an unrelated field.
-    static CONTINUATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let continuation = CONTINUATION.get_or_init(|| regex::Regex::new(
-        r"^(?:然后|再|并|接着|then\s+)?(?:在(?:弹出(?:的)?|打开(?:的)?|该|这个|当前)?(?:下拉)?(?:列表|菜单|面板|搜索框)(?:中|里)?|in\s+(?:the\s+)?(?:popup|dropdown|menu|panel)\s*)?(?:选择|选中|输入|搜索|查找|select\b|choose\b|type\b|search\b)").unwrap());
-    let clauses: Vec<String> = goal.split(['。', '；', ';', '\n']).flat_map(|sentence| {
-        let parts: Vec<String> = sentence.split(['，', ',']).map(|s| s.trim().to_lowercase()).collect();
-        parts.iter().enumerate().map(|(index, part)| {
-            if index > 0 && continuation.is_match(part) { format!("{} {part}", parts[index - 1]) } else { part.clone() }
-        }).collect::<Vec<_>>()
-    }).collect();
-    let sole_expected_scope = sole_expected_scope && plan.expected_text != plan.task
-        && goal_phrases(&plan.expected_text).iter().filter(|p| {
-            let p = p.to_lowercase(); !visible.contains(&p) && !context_lower.contains(&p)
-        }).count() == 1;
-    let mut scored: Vec<(usize, &String)> = plan.phrases.iter().filter_map(|phrase| {
-        let lower = phrase.to_lowercase();
-        if visible.contains(&lower) || context_lower.contains(&lower) || item["value"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(phrase)) { return None; }
-        let score = clauses.iter().filter(|c| c.contains(&lower) && terms(c).intersection(&anchors).next().is_some()).count();
-        // Some backends put the value only in expectedText. It still names an authorized goal,
-        // but inherit task context only for ONE uniquely scoped panel search, never site-wide.
-        let score = score + usize::from(sole_expected_scope && plan.expected_text.to_lowercase().contains(&lower));
-        (score > 0).then_some((score, phrase))
-    }).collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.into_iter().take(3).map(|(_, p)| p.clone()).collect()
-}
-
 fn input_matches(item: &Value, input: &Input) -> bool {
     let context = item["fieldContext"].as_str().unwrap_or_default();
     // ponytail: a copied fieldContext may be cut by the observation summary; ≥24 chars prefix still binds.
@@ -293,82 +171,12 @@ fn input_matches(item: &Value, input: &Input) -> bool {
             || (input.name.is_empty() && input.field_context.is_some()))
 }
 
-/// Date pickers normalise typed values and open calendars; Altair decides those (presets are often
-/// better). Plain text fields are filled locally.
-fn date_like(candidate: &Candidate) -> bool {
-    let key: Value = serde_json::from_str(&candidate.key).unwrap_or(Value::Null);
-    let text = candidate.action["text"].as_str().unwrap_or_default();
-    let name = key["name"].as_str().unwrap_or_default().to_lowercase();
-    key["fieldContext"].as_str().is_some_and(|f| f.ends_with("/2]")) || name.contains("date") || name.contains("日期")
-        || (text.len() >= 8 && text.chars().all(|c| c.is_ascii_digit() || "-/.: ".contains(c)))
-}
-
-fn delegated(item: &Value, plan: &Plan) -> bool {
-    plan.inputs.iter().any(|i| input_matches(item, i))
-        || plan.steps.iter().any(|s| s.action == "fill" && item["value"].as_str().is_some_and(|v| Some(v) == s.text.as_deref()))
-}
-
 fn short(text: &str, max: usize) -> String {
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if text.chars().count() <= max { text } else { format!("{}…", text.chars().take(max).collect::<String>()) }
 }
 
-fn evidence(pages: &Value, plan: &Plan) -> String {
-    // ponytail: bounded text/DOM state, no visual interpretation; larger tasks need a narrower subgoal.
-    let text = pages["pages"].as_array().into_iter().flatten()
-        .filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n");
-    let mut states = Vec::new();
-    let mut truncated = text.chars().count() > 12000;
-    for page in pages["pages"].as_array().into_iter().flatten() {
-        for item in page["items"].as_array().into_iter().flatten().filter(|i| i["inView"] == true) {
-            // Only disclose values of fields explicitly delegated by the main model, or values that
-            // are the main model's own goal wording (typed into a search box).
-            let disclosed = delegated(item, plan)
-                || item["value"].as_str().is_some_and(|v| plan.phrases.iter().any(|p| v.eq_ignore_ascii_case(p)));
-            states.push(json!({"frame":page["frame"],"name":item["name"],"role":item["role"],
-                "region":item["region"],"fieldContext":item["fieldContext"],"value":if disclosed { item["value"].clone() } else { Value::Null },"selected":item["selected"],
-                "expanded":item["expanded"],"sort":item["sort"],"columnKey":item["columnKey"],"disabled":item["disabled"],
-                "blockedBy":item["blockedBy"],"editable":item["editable"],"nodeId":item["nodeId"]}));
-            if json!(states).to_string().chars().count() > 6000 { states.pop(); truncated = true; break; }
-        }
-    }
-    let mut tables = Vec::new();
-    for table in pages["pages"].as_array().into_iter().flatten()
-        .flat_map(|p| p["tables"].as_array().into_iter().flatten()) {
-        let mut table = table.clone();
-        // References change on every observation; semantic completion evidence must not.
-        if let Some(columns) = table["columns"].as_array_mut() {
-            for column in columns { if let Some(object) = column.as_object_mut() { object.remove("ref"); } }
-        }
-        // Full data tables can exceed the budget by themselves: preview rows rather than dropping
-        // the entire body table (which made a separate empty header look like no results).
-        if let Some(rows) = table["rows"].as_array_mut() {
-            let count = rows.len();
-            rows.truncate(10);
-            let returned = rows.len();
-            table["returnedRows"] = json!(returned);
-            if count > returned { table["previewTruncated"] = json!(true); truncated = true; }
-        }
-        tables.push(table);
-        if json!(tables).to_string().chars().count() > 6000 {
-            tables.pop(); truncated = true; break;
-        }
-    }
-    let locations: Vec<_> = pages["pages"].as_array().into_iter().flatten()
-        .map(|p| json!({"url":p["url"],"readyState":p["readyState"],"loading":p["loading"],
-            // Selection is completion evidence even when its click was suppressed or DOM text was truncated.
-            // ponytail: 64 visible selection controls; larger lists explicitly report incomplete evidence.
-            "selectionFields":p["items"].as_array().into_iter().flatten().filter(|i|i["inView"]==true && !i["selected"].is_null())
-                .take(64).map(|i|json!({"name":i["name"],"role":i["role"],"region":i["region"].as_str().map(|s|s.chars().take(120).collect::<String>()),"selected":i["selected"]})).collect::<Vec<_>>(),
-            "selectionFieldsTruncated":p["items"].as_array().into_iter().flatten().filter(|i|i["inView"]==true && !i["selected"].is_null()).count()>64,
-            "dateFields":p["items"].as_array().into_iter().flatten().filter(|i|i["inView"]==true && i["dateValue"].is_string())
-                .map(|i|json!({"field":i["fieldContext"],"value":i["dateValue"]})).collect::<Vec<_>>(),
-            "tables":p["tables"].as_array().into_iter().flatten().map(|t|
-                json!({"index":t["index"],"headers":t["headers"],"loadedRows":t["loadedRows"],"totalRows":t["totalRows"]})).collect::<Vec<_>>()})).collect();
-    format!("当前页面及加载/结果状态：{}\n{}\nDOM 状态：{}\n表格预览（独立表头表的loadedRows=0不代表同页数据表为空；totalRows=null为未知；不足Top N必须补读）：{}\n观察摘要截断：{}", json!(locations), text.chars().take(12000).collect::<String>(), json!(states), json!(tables), truncated)
-}
-
-// Transition identity must cover all controls, including those beyond the prompt's text budget.
+// Transition identity must cover all controls, including those beyond the reply's text budget.
 // Tooltip/body copy and observation refs are not progress.
 fn replay_evidence(pages: &Value) -> String {
     let state: Vec<_> = pages["pages"].as_array().into_iter().flatten().map(|p| {
@@ -382,30 +190,13 @@ fn replay_evidence(pages: &Value) -> String {
     json!(state).to_string()
 }
 
-fn transition_evidence(pages: &Value, plan: &Plan) -> String {
-    let controls: Vec<_> = pages["pages"].as_array().into_iter().flatten().map(|p| {
-        let items: Vec<_> = p["items"].as_array().into_iter().flatten().map(|i|
-            json!([i["nodeId"],i["name"],i["inView"],i["actionable"],i["disabled"],i["blockedBy"],
-                i["editable"],i["haspopup"],i["selected"],i["expanded"],i["sort"],i["scroll"]])).collect();
-        json!([p["frame"],p["loading"],p["viewport"],items])
-    }).collect();
-    format!("{}\n{}", evidence(pages, plan), json!(controls))
-}
-
-fn undelegated_inputs(pages: &Value, plan: &Plan) -> Vec<Value> {
-    pages["pages"].as_array().into_iter().flatten()
-        .flat_map(|p| p["items"].as_array().into_iter().flatten())
-        .filter(|i| i["inView"] == true && i["editable"] == true && i["disabled"] != true && !delegated(i, plan))
-        .take(8).map(|i| json!({"name":i["name"],"role":i["role"],"fieldContext":i["fieldContext"]})).collect()
-}
-
 fn origin(pages: &Value) -> Result<String, String> {
     let url = reqwest::Url::parse(pages["pages"][0]["url"].as_str().ok_or("页面缺少 URL")?).map_err(|_| "页面 URL 无效")?;
     if !matches!(url.scheme(), "https" | "http") { return Err("只支持 HTTP(S) 页面".into()); }
     Ok(url.origin().ascii_serialization())
 }
 
-// Distinguish delegated actions from the main model's actions for experience recording.
+// Distinguish run-executed actions from the main model's own actions for experience recording.
 tokio::task_local! { static BROWSER_ACTION: bool; }
 
 pub(crate) fn executing_browser_action() -> bool {
@@ -416,7 +207,7 @@ async fn execute_browser(root: &Path, args: &Value, owner: &str, tool: &str) -> 
     BROWSER_ACTION.scope(args["operation"] == "act", async { match tool {
         "webview" => Box::pin(crate::native_browser::execute(root, args)).await,
         "chrome" => Box::pin(crate::native_browser::execute_chrome(root, args, owner)).await,
-        _ => Err("不支持的 Altair 浏览器".into()),
+        _ => Err("不支持的浏览器".into()),
     }}).await
 }
 
@@ -425,25 +216,12 @@ fn route_save(plan: &Plan, start: &Value, home: &str, snapshot: &str) -> Value {
     let steps = crate::tool_experience::fit_steps(&plan.steps.iter().map(|s| s.describe_with(false)).collect::<Vec<_>>());
     json!({"operation":"experience_save","snapshotId":snapshot,"experience":{"scope":home,"task":short(&plan.task, 290),
         "conditions":[format!("起始页面 {}", short(&path, 400))],"steps":steps,"checks":[short(&plan.expected_text, 480)],
-        "evidence":format!("Altair run 已核验完成条件：{}", short(&plan.expected_text, 400)),"outcome":"success","redacted":true}})
+        "evidence":format!("run 已核验完成条件：{}", short(&plan.expected_text, 400)),"outcome":"success","redacted":true}})
 }
 
-fn graph_context(search: &Value) -> Value {
-    // ponytail: at most three complete graph routes / 12k chars; larger graphs need a narrower subgoal.
-    // Never cut serialized JSON: that used to drop route checks or the graph altogether.
-    let mut routes = Vec::new();
-    for route in search["graph"]["routes"].as_array().into_iter().flatten().take(3) {
-        routes.push(route.clone());
-        if json!(routes).to_string().chars().count() > 12000 { routes.pop(); break; }
-    }
-    json!({"routes":routes,"truncated":search["graphTruncated"] == true
-        || search["graph"]["routes"].as_array().is_some_and(|all| all.len() > routes.len()),
-        "notice":"每条路径保留独立的条件、步骤及检查点；只在当前观察满足条件时参考，不拼接不同路径。"})
-}
-
-/// One executable DOM hint. `action` (with the live ref) never leaves this process; the model
-/// only sees an ID plus `key`/`label`. `key` is node + state identity (replay protection and
-/// path re-binding); `loose` is target identity without node/state (detects newly surfaced UI).
+/// One executable DOM hint. `action` (with the live ref) never leaves this process. `key` is
+/// node + state identity (replay protection); `loose` is target identity without node/state
+/// (detects newly surfaced UI).
 #[derive(Clone, Debug)]
 struct Candidate {
     action: Value,
@@ -451,19 +229,15 @@ struct Candidate {
     loose: String,
     label: String,
     name: String,
-    words: String,
     fresh: bool,
-    group: Option<String>,
-    /// Fill whose text comes from the goal wording rather than plan.inputs; never auto-filled.
-    derived: bool,
     /// Click hint on a non-password editable control (guided fill steps bind here).
     editable: bool,
 }
 
 impl Candidate {
-    fn new(action: Value, key: Value, loose: Value, label: String, name: &str, context: &str) -> Self {
+    fn new(action: Value, key: Value, loose: Value, label: String, name: &str) -> Self {
         Candidate { action, key: key.to_string(), loose: loose.to_string(), label,
-            name: name.trim().to_lowercase(), words: format!("{name} {context}"), fresh: false, group: None, derived: false, editable: false }
+            name: name.trim().to_lowercase(), fresh: false, editable: false }
     }
     fn kind(&self) -> &str { self.action["action"].as_str().unwrap_or_default() }
 }
@@ -518,20 +292,15 @@ fn scroll_hints(page: &Value, item: Option<&Value>, horizontal: bool) -> Vec<Can
             "position":top,"extent":height,"viewport":viewport,"axis":if horizontal {"horizontal"} else {"vertical"},"direction":direction,"delta":delta});
         let loose = json!(["scroll", page["frame"], name, item.map(|i| &i["role"]), direction]);
         let zh = match direction { "up" => "向上", "down" => "向下", "left" => "向左", _ => "向右" };
-        out.push(Candidate::new(action, key, loose, format!("滚动{zh} {area}"), &area, ""));
+        out.push(Candidate::new(action, key, loose, format!("滚动{zh} {area}"), &area));
     }
     out
 }
 
-// Candidate actions and parameters remain local; the model may select only their IDs.
-fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<Candidate>, String> {
+/// Every visible, enabled control a guided step could bind to: clicks (editable fields included,
+/// fill steps bind to them) and page/region scrolls. Passwords are never offered.
+fn candidates(pages: &Value, used: &HashSet<String>) -> Result<Vec<Candidate>, String> {
     let frames = pages["pages"].as_array().ok_or("缺少 DOM 观察")?;
-    let generic = terms("search select all filter find query keyword 搜索 查找 筛选");
-    let task_terms: HashSet<String> = terms(&plan.task).difference(&generic).cloned().collect();
-    let scoped_searches: Vec<&Value> = frames.iter().flat_map(|p| p["items"].as_array().into_iter().flatten())
-        .filter(|i| i["inView"] == true && i["editable"] == true && i["disabled"] != true && i["password"] != true
-            && !i["blockedBy"].is_string() && search_like(i)
-            && i["fieldContext"].as_str().is_some_and(|c| !terms(c).is_disjoint(&task_terms))).collect();
     let mut result = Vec::new();
     let mut scrolls = Vec::new();
     for page in frames {
@@ -539,8 +308,6 @@ fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<
             scrolls.extend(scroll_hints(page, None, false));
             scrolls.extend(scroll_hints(page, None, true));
         }
-        let focused = page["focus"]["identity"].as_u64().map(|id| format!(":{id}"));
-        let visible = page["visibleText"].as_str().or(page["text"].as_str()).unwrap_or_default().to_lowercase();
         for item in page["items"].as_array().ok_or("缺少 DOM 元素")? {
             let name = item["name"].as_str().unwrap_or_default();
             let role = item["role"].as_str().unwrap_or_default();
@@ -549,57 +316,17 @@ fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<
             scrolls.extend(scroll_hints(page, Some(item), false));
             scrolls.extend(scroll_hints(page, Some(item), true));
             if item["blockedBy"].is_string() { continue; }
-            let context = format!("{} {}", item["fieldContext"].as_str().unwrap_or_default(), item["column"]["name"].as_str().unwrap_or_default());
-            let loose = |kind: &str, text: &Value| json!([kind, page["frame"], name, role, item["region"].as_str().map(|r| short(r, 120)),
-                item["fieldContext"], item["column"]["name"], item["href"], text]);
+            let loose = json!(["click", page["frame"], name, role, item["region"].as_str().map(|r| short(r, 120)),
+                item["fieldContext"], item["column"]["name"], item["href"], Value::Null]);
+            let action = json!({"action":"click","frame":page["frame"],"ref":item["ref"]});
             if item["editable"] == true {
                 if item["password"] == true { continue; }
                 // Clicking an editable control can open a date picker or combobox without typing.
                 let key = json!({"action":"click","frame":page["frame"],"nodeId":item["nodeId"],
                     "name":name,"role":role,"region":item["region"],"fieldContext":item["fieldContext"],"expanded":item["expanded"]});
-                let mut click = Candidate::new(json!({"action":"click","frame":page["frame"],"ref":item["ref"]}), key,
-                    loose("click", &Value::Null), element_label("点击", item), name, &context);
+                let mut click = Candidate::new(action, key, loose, element_label("点击", item), name);
                 click.editable = true;
                 result.push(click);
-                for input in &plan.inputs {
-                    // Bind authorized text before presenting choices. A model must never
-                    // be offered that text for unrelated fields, even when they have labels.
-                    if !input_matches(item, input) || frames.iter().flat_map(|p| p["items"].as_array().into_iter().flatten())
-                        .filter(|i| input_matches(i, input) && i["editable"] == true && i["inView"] == true
-                            && i["disabled"] != true && i["password"] != true).count() != 1 { continue; }
-                    let text = json!(input.text);
-                    if item["value"] == text {
-                        // Human shortcut: a filled, focused authorized field can be submitted with Enter.
-                        if focused.as_ref().is_some_and(|f| item["nodeId"].as_str().is_some_and(|id| id.ends_with(f.as_str()))) {
-                            for (key_name, effect, verb) in [("Enter", "在已填好的授权输入框内按回车提交", "回车提交"),
-                                ("Tab", "确认当前输入并把焦点移到下一个字段（不提交），常用于日期区间的开始→结束", "Tab 确认并移到下一字段")] {
-                                let key = json!({"action":"press","key":key_name,"frame":page["frame"],"nodeId":item["nodeId"],
-                                    "name":name,"role":role,"fieldContext":item["fieldContext"],"value":text,"effect":effect});
-                                result.push(Candidate::new(json!({"action":"press","key":key_name}), key, loose(key_name, &text),
-                                    format!("{verb} {}", element_label("", item).trim()), name, &context));
-                            }
-                        }
-                        continue;
-                    }
-                    let key = json!({"action":"fill","frame":page["frame"],"nodeId":item["nodeId"],
-                        "name":name,"role":role,"region":item["region"],"fieldContext":item["fieldContext"],
-                        "authorizedField":input.field_context.as_ref().unwrap_or(&input.name),"binding":"only if field context uniquely matches authorizedField","text":input.text});
-                    result.push(Candidate::new(json!({"action":"fill","frame":page["frame"],"ref":item["ref"],"text":input.text}), key,
-                        loose("fill", &text), format!("{} = \"{}\"", element_label("填写", item), short(&input.text, 40)), name, &context));
-                }
-                // Like a person: the goal names a value that the list does not show → type it into the
-                // panel's search box. Only search/filter boxes, only the main model's own words.
-                if search_like(item) && !plan.inputs.iter().any(|input| input_matches(item, input)) {
-                    for phrase in search_phrases(plan, item, &visible, scoped_searches.len() == 1 && std::ptr::eq(scoped_searches[0], item)) {
-                        let text = json!(phrase);
-                        let key = json!({"action":"fill","frame":page["frame"],"nodeId":item["nodeId"],"name":name,"role":role,
-                            "fieldContext":item["fieldContext"],"text":phrase,"derivedFrom":"任务文字中与该字段同句出现、页面上尚不可见的值；仅用于搜索/筛选"});
-                        let mut candidate = Candidate::new(json!({"action":"fill","frame":page["frame"],"ref":item["ref"],"text":phrase}), key,
-                            loose("fill", &text), format!("{} = \"{}\"（来自任务文字）", element_label("搜索框输入", item), short(&phrase, 40)), name, &context);
-                        candidate.derived = true;
-                        result.push(candidate);
-                    }
-                }
                 continue;
             }
             if !(matches!(role, "button" | "a" | "link" | "tab" | "menuitem" | "menuitemcheckbox" | "menuitemradio" | "option" | "radio" | "checkbox" | "combobox" | "summary")
@@ -610,22 +337,11 @@ fn candidates(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Result<Vec<
             let key = json!({"action":"click","frame":page["frame"],"nodeId":item["nodeId"],
                 "name":name,"role":role,"region":item["region"],"fieldContext":item["fieldContext"],"href":item["href"],"text":Value::Null,
                 "column":item["column"],"sort":item["sort"],"icon":item["icon"],"selected":item["selected"],"expanded":item["expanded"]});
-            result.push(Candidate::new(json!({"action":"click","frame":page["frame"],"ref":item["ref"]}), key,
-                loose("click", &Value::Null), element_label("点击", item), name, &context));
+            result.push(Candidate::new(action, key, loose, element_label("点击", item), name));
         }
     }
     result.extend(scrolls);
     result.retain(|c| !used.contains(&c.key));
-    // Same role + same name shape (digits folded) = one visual collection: calendar day cells,
-    // per-row "Open" buttons, unnamed column icons. Large collections are offered as one group.
-    for c in result.iter_mut().filter(|c| c.kind() == "click") {
-        let key: Value = serde_json::from_str(&c.key).unwrap_or(Value::Null);
-        let mut shape = String::new();
-        for ch in c.name.chars() {
-            if ch.is_ascii_digit() { if !shape.ends_with('#') { shape.push('#'); } } else { shape.push(ch); }
-        }
-        c.group = Some(json!([key["frame"], key["role"], shape.split_whitespace().collect::<Vec<_>>().join(" ")]).to_string());
-    }
     Ok(result)
 }
 
@@ -649,93 +365,6 @@ fn terms(text: &str) -> HashSet<String> {
         } else { i += 1; }
     }
     out
-}
-
-/// One Altair batch: individual hints (`aNN`) plus collapsed collections (`gNN`) that expand into a
-/// second, member-only decision. `covered` lists every candidate key represented in the batch.
-struct Batch {
-    list: BTreeMap<String, Candidate>,
-    groups: BTreeMap<String, (String, Vec<Candidate>)>,
-    covered: Vec<String>,
-}
-
-/// Ranks hints like a person scanning a page: authorized fills, controls that just appeared
-/// (opened menus/dialogs) and controls named in the goal come first; big repetitive collections
-/// collapse into one entry so they cannot crowd out unique controls such as preset shortcuts.
-/// Returns the batch in DOM order with stable, sortable IDs; `skip` pages past declined hints.
-fn shortlist(all: &[Candidate], plan: &Plan, skip: &HashSet<String>) -> Batch {
-    let goal_text = format!("{}\n{}\n{}\n{}", plan.task, plan.expected_text,
-        plan.inputs.iter().map(|i| format!("{} {}", i.name, i.text)).collect::<Vec<_>>().join("\n"),
-        plan.control_names.join("\n")).to_lowercase();
-    let goal = terms(&goal_text);
-    let named = plan.control_names.iter().map(|n| n.trim().to_lowercase()).collect::<Vec<_>>();
-    let primary = terms("confirm apply search submit save ok done next 确定 确认 查询 搜索 应用 提交 保存 完成 下一步");
-    // A goal only "names" a control when the name stands alone. Occurrences inside a larger token
-    // don't count: the "19" and "03" of the authorized date 2026-03-19 are not the calendar's
-    // 19th and 3rd cells, and letting them score leaves stray cells outside their collapsed group.
-    let called_out = |name: &str| -> bool {
-        let name: Vec<char> = name.chars().collect();
-        if name.len() < 2 { return false; }
-        if !name.iter().all(char::is_ascii_digit) { return goal_text.contains(&name.iter().collect::<String>()); }
-        let text: Vec<char> = goal_text.chars().collect();
-        let boundary = |c: char| !c.is_ascii_alphanumeric() && !"-/.:".contains(c);
-        text.windows(name.len()).enumerate().any(|(i, window)| window == name.as_slice()
-            && i.checked_sub(1).is_none_or(|j| boundary(text[j]))
-            && text.get(i + name.len()).is_none_or(|c| boundary(*c)))
-    };
-    let relevance = |c: &Candidate| -> i64 {
-        let own = terms(&c.words);
-        let mut score = 12 * own.intersection(&goal).count().min(6) as i64;
-        if called_out(&c.name) { score += 25; }
-        if named.iter().any(|n| c.words.to_lowercase().contains(n.as_str())) { score += 60; }
-        score
-    };
-    let score = |c: &Candidate| -> i64 {
-        let mut score = relevance(c);
-        if terms(&c.words).intersection(&primary).next().is_some() { score += 10; }
-        if c.fresh { score += 150; }
-        score + match c.kind() { "fill" if c.derived => 300, "fill" => 1000, "press" => 400, "scroll" if c.action["ref"].is_null() => 40, "scroll" => 15, _ => 0 }
-    };
-    let open: Vec<usize> = (0..all.len()).filter(|&i| !skip.contains(&all[i].key) || all[i].kind() == "fill").collect();
-    let mut sizes = HashMap::<&str, usize>::new();
-    for &i in &open { if let Some(g) = &all[i].group { *sizes.entry(g).or_default() += 1; } }
-    // (order, score, members): one member = individual hint, several = collapsed group.
-    let mut entries: Vec<(usize, i64, Vec<usize>)> = Vec::new();
-    let mut grouped = BTreeMap::<usize, Vec<usize>>::new();
-    let mut group_slot = HashMap::<&str, usize>::new();
-    for &i in &open {
-        let c = &all[i];
-        match c.group.as_deref() {
-            // Members explicitly named by the goal stay individually selectable.
-            Some(g) if sizes[g] >= GROUP_MIN && relevance(c) < 25 => {
-                let first = *group_slot.entry(g).or_insert(i);
-                grouped.entry(first).or_default().push(i);
-            }
-            _ => entries.push((i, score(c), vec![i])),
-        }
-    }
-    for (first, members) in grouped {
-        let best = members.iter().map(|&i| score(&all[i])).max().unwrap_or(0);
-        entries.push((first, best, members));
-    }
-    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    entries.truncate(SHORTLIST);
-    entries.sort_by_key(|(order, _, _)| *order);
-    let mut batch = Batch { list: BTreeMap::new(), groups: BTreeMap::new(), covered: Vec::new() };
-    for (_, _, members) in entries {
-        batch.covered.extend(members.iter().map(|&i| all[i].key.clone()));
-        if members.len() == 1 {
-            batch.list.insert(format!("a{:02}", batch.list.len() + 1), all[members[0]].clone());
-            continue;
-        }
-        let items: Vec<Candidate> = members.iter().map(|&i| all[i].clone()).collect();
-        let sample = |c: &Candidate| short(&c.label, 60);
-        let label = format!("{}折叠分组：{} 个同类控件（{}、{} … {}）。选择后展开，再从中选一个",
-            if items.iter().any(|c| c.fresh) { "[新] " } else { "" }, items.len(),
-            sample(&items[0]), sample(&items[1]), sample(items.last().unwrap()));
-        batch.groups.insert(format!("g{:02}", batch.groups.len() + 1), (label, items));
-    }
-    batch
 }
 
 /// A control name mentioned only to be excluded ("…不是顶部的 Search…", "不要点…") must repel
@@ -836,7 +465,8 @@ fn step_score(step: &Step, c: &Candidate) -> i64 {
     score
 }
 
-/// Local certainty: a strong match clearly ahead of the runner-up. Anything closer goes to Altair.
+/// Local certainty: a strong match clearly ahead of the runner-up. Anything closer goes back to
+/// the main model.
 fn step_confident(best: i64, second: Option<i64>) -> bool {
     best >= 40 && second.is_none_or(|s| best - s >= 25)
 }
@@ -847,22 +477,17 @@ fn step_ranking<'a>(step: &Step, all: &'a [Candidate]) -> Vec<(i64, &'a Candidat
     ranked
 }
 
-/// A fill step carrying an input's exact text may only bind to that input's field (or a derived
-/// search candidate with the same text) — never to an unrelated box that happens to match the
-/// description. Steps with novel text keep legacy freedom.
+/// A fill step carrying an input's exact text may only bind to that input's field — never to an
+/// unrelated box that happens to match the description. Steps with novel text keep legacy freedom.
 fn rank_for_step<'a>(step: &Step, plan: &Plan, all: &'a [Candidate]) -> Vec<(i64, &'a Candidate)> {
     let mut ranked = step_ranking(step, all);
-    if step.action == "fill" {
-        if let Some(text) = step.text.as_deref() {
-            if plan.inputs.iter().any(|i| i.text == text) {
-                ranked.retain(|(_, c)| {
-                    let key: Value = serde_json::from_str(&c.key).unwrap_or(Value::Null);
-                    if key["text"].as_str() == Some(text) { return true; }
-                    // The clickable face of the authorized field (the fill action is built on bind).
-                    c.editable && plan.inputs.iter().any(|i| i.text == text && input_matches(
-                        &json!({"name":key["name"],"role":key["role"],"fieldContext":key["fieldContext"]}), &i))
-                });
-            }
+    if let Some(text) = step.text.as_deref().filter(|_| step.action == "fill") {
+        if plan.inputs.iter().any(|i| i.text == text) {
+            ranked.retain(|(_, c)| {
+                let key: Value = serde_json::from_str(&c.key).unwrap_or(Value::Null);
+                c.editable && plan.inputs.iter().any(|i| i.text == text && input_matches(
+                    &json!({"name":key["name"],"role":key["role"],"fieldContext":key["fieldContext"]}), i))
+            });
         }
     }
     ranked
@@ -884,7 +509,7 @@ fn bind_step(step: &Step, index: usize, c: &Candidate) -> Candidate {
 /// typing, Tab, and toggling a selection. Menus, links, submits and Enter end the batch.
 fn chains(step: &Step, bound: &Candidate) -> bool {
     if step.expect().is_some() || step.repeat > 0 { return false; }
-    let key: Value = serde_json::from_str(&bound.key.split("|fill|").next().unwrap_or_default()).unwrap_or(Value::Null);
+    let key: Value = serde_json::from_str(bound.key.split("|fill|").next().unwrap_or_default()).unwrap_or(Value::Null);
     match step.action.as_str() {
         "fill" => true,
         "press" => step.key.as_deref() == Some("Tab"),
@@ -960,51 +585,6 @@ fn needs_commit(plan: &Plan, history: &[Value], pages: &Value) -> Option<String>
     Some(format!("本轮已勾选/填写，但「{name}」仍可点击且本轮未点，筛选可能尚未生效；请新起一次 run，只提交一步点击「{name}」(target 写明所在面板/筛选区)，然后核验「{}", plan.expected_text))
 }
 
-// ponytail: allow up to 15s without progress; long-running jobs need a separate monitoring goal.
-fn observation_delay(elapsed: Duration) -> Result<Duration, String> {
-    Duration::from_secs(15).checked_sub(elapsed).filter(|left| !left.is_zero())
-        .map(|left| left.min(POLL))
-        .ok_or_else(|| "等待页面变化超过15秒，交回主模型；不重放已执行动作".into())
-}
-
-// The Altair branch of the tree only contains current DOM leaves; rebuilding after feedback
-// invalidates every previous reference.
-fn decision_tree(pages: &Value, list: &BTreeMap<String, Candidate>, choices: &BTreeMap<String, String>, revision: usize) -> Value {
-    let mut branches = json!([
-        {"id":"interact","when":"目标可见可操作，或是通往目标的入口/关闭遮挡的控件：点击、填写或回车。[新]出现的菜单选项优先于同名表头；表头文字可能只打开释义，排序入口可能是该列无名图标","leaves":[]},
-        {"id":"reveal","when":"目标在视口外：按目标所在区域和方向滚动；scrollFeedback.changed=false表示没动，换区域或方向","leaves":[]},
-        {"id":"wait","when":"确有加载或刚提交的结果尚未出现；已可操作的菜单不属于等待","leaves":[]},
-        {"id":"verify","when":"URL参数、选中集合selectionFields、日期dateFields、排序和表格结果已满足全部完成条件；选项出现不等于已选中","leaves":[]},
-        {"id":"blocked","when":"缺授权/输入、真实歧义或需要视觉","leaves":["defer"]}
-    ]);
-    for id in choices.keys() {
-        let branch = match id.as_str() {
-            "observe" => 2, "done" => 3,
-            _ if list.get(id).is_some_and(|c| c.kind() == "scroll") => 1,
-            _ => 0,
-        };
-        branches[branch]["leaves"].as_array_mut().unwrap().push(json!(id));
-    }
-    let obstacles: Vec<_> = pages["pages"].as_array().into_iter().flatten()
-        .flat_map(|p| p["items"].as_array().into_iter().flatten()
-            .filter(|i| i["inView"] == true && i["blockedBy"].is_string())
-            .map(|i| json!({"target":i["name"],"blockedBy":i["blockedBy"]})))
-        .take(16).collect();
-    json!({"revision":revision,"obstacles":obstacles,"branches":branches})
-}
-
-fn runtime_tree(altair: &Value, pending: &VecDeque<(String, String)>) -> Value {
-    json!({"root":"每次观察后按顺序判断，首个成立的节点执行；动作后旧叶子全部失效","nodes":[
-        {"id":"guard","when":"跨站、观察缺口、预算耗尽或同一状态反复操作","then":"交回主模型"},
-        {"id":"wait","when":"页面 loading","then":"本地每250ms刷新，最多4秒，不请求Altair"},
-        {"id":"complete","when":"有真实行数据且结果/筛选/排序状态变化，页面已加载且无观察缺口","then":"独立核验全部完成条件；高置信yes且新观察证据不变才完成，不再选下一步动作"},
-        {"id":"reflex","when":"已授权 inputs 唯一绑定且当前值不同","then":"本地批量 fill，不请求Altair"},
-        {"id":"path","when":"Altair 路径下一步在新DOM中同节点同状态、URL不变、没有新控件出现且页面稳定","then":"直接执行，不请求Altair",
-            "pending":pending.iter().map(|(_, label)| label).collect::<Vec<_>>()},
-        {"id":"altair","when":"信息边界（新菜单、新页面、路径失效）","then":"Altair 一次请求选择当前一步并预测同屏后续路径","tree":altair},
-        {"id":"fallback","when":"defer、Altair 不可用或执行不明确","then":"返回最新观察，主模型兜底"}]})
-}
-
 fn result_signature(pages: &Value) -> String {
     json!(pages["pages"].as_array().into_iter().flatten().map(|p| json!([p["url"],
         p["items"].as_array().into_iter().flatten().filter(|i| i["inView"] == true
@@ -1015,66 +595,9 @@ fn result_signature(pages: &Value) -> String {
     ])).collect::<Vec<_>>()).to_string()
 }
 
-fn completion_ready(pages: &Value) -> bool {
-    let Some(frames) = pages["pages"].as_array().filter(|p| !p.is_empty()) else { return false; };
-    pages["coverageGaps"].as_array().is_some_and(Vec::is_empty)
-        && frames.iter().all(|p| p["loading"] == false && p["readyState"] == "complete")
-        && frames.iter().flat_map(|p| p["tables"].as_array().into_iter().flatten())
-            .any(|t| t["rows"].as_array().is_some_and(|r| !r.is_empty()))
-}
-
-/// Completion is a different question from picking the next control. No action candidates,
-/// ref identities or old "Loading..." effects: only current, independently collected result evidence.
-fn completion_evidence(pages: &Value) -> Option<String> {
-    let frames: Vec<Value> = pages["pages"].as_array().into_iter().flatten().map(|page| {
-        let text = page["visibleText"].as_str().or(page["text"].as_str()).unwrap_or_default();
-        let chars: Vec<char> = text.chars().collect();
-        let summary = if chars.len() <= 3200 { text.to_string() } else {
-            format!("{}\n[正文省略]\n{}", chars[..2200].iter().collect::<String>(), chars[chars.len()-1000..].iter().collect::<String>())
-        };
-        let tables: Vec<Value> = page["tables"].as_array().into_iter().flatten().map(|table| {
-            let rows: Vec<&Value> = table["rows"].as_array().into_iter().flatten().take(10).collect();
-            json!({"index":table["index"],"headers":table["headers"],
-                "columns":table["columns"].as_array().into_iter().flatten().map(|c| json!({"index":c["index"],"name":c["name"],"group":c["group"],"sort":c["sort"]})).collect::<Vec<_>>(),
-                "rows":rows,"returnedRows":rows.len(),"loadedRows":table["loadedRows"],"totalRows":table["totalRows"],
-                "previewTruncated":table["rows"].as_array().is_some_and(|r| r.len() > rows.len()) || table["previewTruncated"] == true})
-        }).collect();
-        json!({"url":page["url"],"loading":page["loading"],"readyState":page["readyState"],"summary":summary,
-            "summaryTruncated":chars.len() > 3200,
-            "selectionFields":page["items"].as_array().into_iter().flatten().filter(|i| i["inView"] == true && !i["selected"].is_null())
-                .map(|i| json!({"name":i["name"],"role":i["role"],"field":i["fieldContext"],"selected":i["selected"]})).collect::<Vec<_>>(),
-            "dateFields":page["items"].as_array().into_iter().flatten().filter(|i| i["inView"] == true && i["dateValue"].is_string())
-                .map(|i| json!({"field":i["fieldContext"],"value":i["dateValue"]})).collect::<Vec<_>>(),
-            "tables":tables})
-    }).collect();
-    let state = json!({"pages":frames,"coverageGaps":pages["coverageGaps"],
-        "note":"rows 是实际采集的数据行，可能位于视口下方。loadedRows 只是数量，不能代替 rows。独立表头和数据体可能分开；须核对列对应。预览截断不等于目标缺失，已有N条足以核对Top N，无须整页全部行。"}).to_string();
-    // ponytail: optional whole-goal check has a 40k-character ceiling. Do not trim away proof
-    // and then accept yes; wide/multi-frame results continue through bounded action planning.
-    (state.chars().count() <= 40000).then_some(state)
-}
-
-fn decision_evidence(pages: &Value, plan: &Plan, list: &BTreeMap<String, Candidate>) -> String {
-    let mut view = pages.clone();
-    for page in view["pages"].as_array_mut().into_iter().flatten() {
-        let text = page["visibleText"].as_str().unwrap_or_else(|| page["text"].as_str().unwrap_or_default());
-        // ponytail: old captures lack visibleText; preserve both toolbar and appended popup, within 4k chars.
-        let chars: Vec<_> = text.chars().collect();
-        page["text"] = json!(if chars.len() <= 4000 { text.to_owned() } else {
-            format!("{}\n[正文省略]\n{}", chars[..2400].iter().collect::<String>(), chars[chars.len()-1600..].iter().collect::<String>())
-        });
-        if let Some(items) = page["items"].as_array_mut() {
-            items.retain(|i| list.values().any(|c| c.action["ref"].is_string() && c.action["ref"] == i["ref"])
-                || !i["selected"].is_null() || i["expanded"] == "true" || i["sort"].is_string() || i["dateValue"].is_string());
-            for item in items { if let Some(region) = item["region"].as_str() { item["region"] = json!(region.chars().take(120).collect::<String>()); } }
-        }
-    }
-    evidence(&view, plan)
-}
-
 /// Observable consequence of one action: navigation, newly surfaced controls, newly visible text
 /// (tooltips, validation, result counts) and changed control states. Empty = nothing happened.
-fn action_effect(before: &Value, after: &Value, plan: &Plan) -> Value {
+fn action_effect(before: &Value, after: &Value) -> Value {
     let url = |pages: &Value| pages["pages"][0]["url"].as_str().unwrap_or_default().to_string();
     let lines = |pages: &Value| -> Vec<String> {
         pages["pages"].as_array().into_iter().flatten()
@@ -1084,8 +607,8 @@ fn action_effect(before: &Value, after: &Value, plan: &Plan) -> Value {
     let old_lines: HashSet<String> = lines(before).into_iter().collect();
     let new_text: Vec<String> = lines(after).into_iter().filter(|l| !old_lines.contains(l)).take(4).map(|l| short(&l, 80)).collect();
     let none = HashSet::new();
-    let old_controls: HashSet<String> = candidates(before, plan, &none).unwrap_or_default().into_iter().map(|c| c.loose).collect();
-    let new_controls: Vec<String> = candidates(after, plan, &none).unwrap_or_default().into_iter()
+    let old_controls: HashSet<String> = candidates(before, &none).unwrap_or_default().into_iter().map(|c| c.loose).collect();
+    let new_controls: Vec<String> = candidates(after, &none).unwrap_or_default().into_iter()
         .filter(|c| c.kind() != "scroll" && !old_controls.contains(&c.loose)).map(|c| c.label).collect();
     let states = |pages: &Value| -> HashMap<String, Value> {
         pages["pages"].as_array().into_iter().flatten().flat_map(|p| p["items"].as_array().into_iter().flatten())
@@ -1106,51 +629,6 @@ fn action_effect(before: &Value, after: &Value, plan: &Plan) -> Value {
         "summary":if nothing { "页面没有可见变化：该动作可能无效，换目标或方法" } else { "" }})
 }
 
-fn fill_identity(pages: &Value, action: &Value) -> Option<String> {
-    if action["action"] != "fill" { return None; }
-    let page = pages["pages"].as_array()?.iter().find(|p| p["frame"] == action["frame"])?;
-    let item = page["items"].as_array()?.iter().find(|i| i["ref"] == action["ref"])?;
-    Some(json!([page["frame"], item["nodeId"].as_str()?, item["fieldContext"], action["text"]]).to_string())
-}
-
-fn choice_description(candidate: &Candidate) -> String {
-    let mut description: Value = serde_json::from_str(&candidate.key).unwrap_or(Value::Null);
-    let fresh = if candidate.fresh { "[新] " } else { "" };
-    if description["action"] == "click" && matches!(description["role"].as_str(), Some("checkbox" | "menuitemcheckbox")) {
-        description["effect"] = json!(match description["selected"].as_bool().or_else(|| description["selected"].as_str().and_then(|s| s.parse().ok())) {
-            Some(true) => "取消选中（不是展开）；若目标是保留选中，不要点击",
-            Some(false) => "选中（不是展开）；分组复选框可能同时选中全部子项",
-            None => "切换选择状态（不是展开）；当前选中状态不明确",
-        });
-    }
-    if description["action"] == "click" && ["confirm", "apply", "submit", "save", "确认", "确定", "应用", "提交", "保存"]
-        .iter().any(|n| description["name"].as_str().unwrap_or_default().trim().eq_ignore_ascii_case(n)) {
-        description["effect"] = json!("确认/应用按钮：面板内的勾选或填写通常要点它才真正生效；若本轮刚勾选/填写过，下一步通常是点它");
-    }
-    if description["action"] == "scroll" {
-        return format!("{fresh}{}；当前位置={}，内容长度={}，可见长度={}。用于寻找视口外的控件/表头，执行后检查实际位移。",
-            candidate.label, description["position"], description["extent"], description["viewport"]);
-    }
-    if description["action"] == "click" && description["column"].is_object() {
-        let icon = description["icon"].as_str().unwrap_or_default();
-        description["effect"] = json!(if description["name"].as_str().is_some_and(|n| !n.is_empty()) {
-            "表头文字：可能只弹出释义浮层而不排序；若上一步点它只出现释义文字，改点同列的无名排序图标"
-        } else if ["sort", "caret", "order", "asc", "desc"].iter().any(|k| icon.contains(k)) {
-            "表头排序图标：切换该列排序（常见顺序 无→升序→降序）；先核对列名/分组，同名列看分组与序号"
-        } else { "表头内无名图标：通常是排序或筛选入口，看 icon 提示" });
-    }
-    // The label already carries name/role/context/icon/href/state; only keep fields it lacks.
-    let mut extra = serde_json::Map::new();
-    for key in ["effect", "text", "authorizedField", "derivedFrom", "expanded", "haspopup"] {
-        if let Some(value) = description.get(key).filter(|v| !v.is_null()) { extra.insert(key.into(), value.clone()); }
-    }
-    if let Some(region) = description["region"].as_str().filter(|r| !r.is_empty() && !candidate.label.contains(&short(r, 50))) {
-        extra.insert("region".into(), json!(short(region, 100)));
-    }
-    let extra = if extra.is_empty() { String::new() } else { format!(" {}", Value::Object(extra)) };
-    format!("{fresh}{}{extra}", candidate.label).chars().take(700).collect()
-}
-
 struct Run<'a> {
     root: &'a Path,
     owner: &'a str,
@@ -1161,66 +639,38 @@ struct Run<'a> {
     snapshot: Value,
     latest: Value,
     history: Vec<Value>,
-    decisions: Vec<Value>,
     trace: Vec<Value>,
-    tree: Value,
-    missing_inputs: Vec<Value>,
-    candidate_counts: Vec<usize>,
     refreshes: usize,
     executed: usize,
-    cached: usize,
-    reflex: usize,
     preflight_recoveries: usize,
     preflight: usize,
     used: HashSet<(String, String)>,
-    filled: HashSet<String>,
-    fill_attempts: HashMap<String, usize>,
     state_actions: HashMap<String, usize>,
     baseline: Option<HashSet<String>>,
-    pending: VecDeque<(String, String)>,
-    path_url: Value,
     loading_since: Option<Instant>,
-    // Guided mode (plan.steps): progress, how targets were bound, and expectation checks.
-    guided_replanned: bool,
+    // Progress, how targets were bound, and expectation checks.
     raw_steps: Value,
     step_index: usize,
     resolved_locally: usize,
-    resolved_by_altair: usize,
     checks: Vec<Value>,
     step_candidates: Vec<String>,
 }
 
 enum Resolution { Found(Candidate), Missing, Ambiguous(String) }
 
-fn replan_after_step(last: bool, step: &Step, effect: &Value) -> bool {
-    last || (step.action == "click" && (effect["url"].is_string()
-        || effect["newControlCount"].as_u64().is_some_and(|n| n > 0)))
-}
-
 fn press_candidate(step: &Step, index: usize) -> Candidate {
     let key = step.key.as_deref().unwrap_or_default();
     Candidate::new(json!({"action":"press","key":key}), json!({"action":"press","key":key,"step":index}),
-        json!(["press", key, index]), format!("第{}步 按键 {key}", index + 1), "", "")
+        json!(["press", key, index]), format!("第{}步 按键 {key}", index + 1), "")
 }
-
-const PICK_INSTRUCTIONS: &str = "主模型已经决定了这一步要做什么，你只负责从候选中找出这一步所指的那个控件。\
-依次核对：名称或含义（界面可能是英文，按语义匹配）、所在区域/字段/列与分组、图标类型、链接路径；\
-[新] 表示上一步刚出现（例如刚展开的菜单或面板），通常就是这一步要找的。\
-上一步点击后页面没有变化的控件不要再选；刚展开的菜单或面板中新出现的选项优先于背景里的同名控件。\
-只选完全对应的一个；都不对，或有两个同样符合时选 defer。";
-
-const CHECK_INSTRUCTIONS: &str = "只根据最新页面证据判断期望是否已经成立。排序看 sort/aria-sort、icon 状态、URL 参数和表格数据的实际顺序；\
-筛选看选中集合（selectionFields）与筛选区文字；日期看 dateFields；导航看 URL 和标题。\
-指定排序的 Top N 是该排序下前 N 条真实数据，不能改成最大 N 项倒序展示，缺失值如实说明。\
-只出现释义/提示文字不算完成。判断当前最终状态，不要求旧动作再次产生变化。表格 rows 已含N条且匹配目标时，预览截断或数据在视口外不影响这N条的验收；URL、计数单独不能证明筛选与行数据正确。证据不足选 defer。";
 
 impl Run<'_> {
     fn args(&self, mut value: Value) -> Value {
         value[self.target_key] = json!(self.target);
         value
     }
-    // Altair reads the full stored observation; the inline summary only goes back to the main model,
-    // so keep it small enough to never be truncated into a file the model has to read with a shell.
+    // The run reads the full stored observation; the inline summary only goes back to the main
+    // model, so keep it small enough to never be truncated into a file it has to read with a shell.
     fn inspect_args(&self) -> Value {
         self.args(json!({"operation":"inspect","scope":"viewport","visual":"none","maxTextChars":2500,"maxItems":30}))
     }
@@ -1234,31 +684,14 @@ impl Run<'_> {
         self.latest = observed;
         self.pages()
     }
-    /// Altair input, awaited only when the chain escalates: the observation's own screenshot, else a
-    /// fresh viewport screenshot. That replaces the snapshot, so callers `rebind` chosen candidates.
-    async fn screenshot(&mut self) -> Option<Value> {
-        let current = |run: &Self| crate::native_browser::altair_image(run.root, &run.args(json!({"snapshotId":run.snapshot})), run.owner, run.tool);
-        if let Some(image) = current(self) { return Some(image); }
-        let shot = execute_browser(self.root, &self.args(json!({"operation":"screenshot","fullPage":false,"maxEdge":1024,
-            "scope":"viewport","maxTextChars":2500,"maxItems":30})), self.owner, self.tool).await.ok()?;
-        self.refreshes += 1;
-        self.snapshot = shot["snapshotId"].clone();
-        self.latest = shot;
-        current(self)
-    }
-    /// Same control in the current snapshot (refs change per snapshot, keys do not).
-    fn rebind(&self, c: &Candidate) -> Result<Option<(Value, Candidate)>, String> {
-        let pages = self.pages()?;
-        Ok(candidates(&pages, &self.plan, &HashSet::new())?.into_iter().find(|f| f.key == c.key).map(|f| (pages, f)))
-    }
     fn note(&mut self, node: &str, detail: Value) {
-        // ponytail: keep the last 64 tree decisions; history keeps every executed action.
+        // ponytail: keep the last 64 notes; history keeps every executed action.
         if self.trace.len() >= 64 { self.trace.remove(0); }
         self.trace.push(json!({"node":node,"detail":detail,"executed":self.executed}));
     }
 
-    /// Executes one batch (a single hint, or several reflex fills) from the observed state.
-    /// Ok(None): DOM preflight failed before any input — re-decide from fresh DOM.
+    /// Executes one batch (a single step, or several chained steps) from the observed state.
+    /// Ok(None): DOM preflight failed before any input — re-bind from fresh DOM.
     /// Ok(Some(n)): the first n actions of the batch completed (the rest sent no input).
     async fn perform(&mut self, pages: &Value, state: &str, anchors: HashSet<String>, batch: Vec<Candidate>, node: &str) -> Result<Option<usize>, String> {
         let repeats = self.state_actions.entry(state.to_string()).or_default();
@@ -1275,12 +708,6 @@ impl Run<'_> {
             Err(error) => json!({"status":"needs_review","error":error,"basedOnSnapshotId":self.snapshot,"verification":"unverified"}),
         };
         let completed = (result["completedActions"].as_u64().unwrap_or(0) as usize).min(batch.len());
-        for (index, c) in batch.iter().enumerate() {
-            if let Some(id) = fill_identity(pages, &c.action) {
-                // ponytail: one successful fill per node/context/value per run; do not fight a formatter.
-                if index < completed { self.filled.insert(id); } else { *self.fill_attempts.entry(id).or_default() += 1; }
-            }
-        }
         self.executed += completed;
         self.history.push(json!({"step":self.history.len()+1,"node":node,
             "actions":batch.iter().map(|c| c.label.clone()).collect::<Vec<_>>(),"status":result["status"],
@@ -1292,13 +719,12 @@ impl Run<'_> {
             self.preflight_recoveries += 1;
             *self.state_actions.entry(state.to_string()).or_default() -= 1;
             for c in &batch { self.used.remove(&(state.to_string(), c.key.clone())); }
-            self.pending.clear();
             if !result["snapshotId"].is_string() || result["observationError"].is_string() { self.refresh().await?; }
             else { self.snapshot = result["snapshotId"].clone(); }
             return Ok(None);
         }
         // A fill always selects all and replaces the value, and a batch action that failed at DOM
-        // preflight sent no input: both are re-decided on fresh DOM instead of handing off.
+        // preflight sent no input: both are re-bound on fresh DOM instead of handing off.
         let partial_fill = completed < batch.len() && (batch.iter().all(|c| c.kind() == "fill") || result["failedAtPreflight"] == true);
         if result["status"] != "executed" && !partial_fill {
             return Err(format!("执行不明确（{}）；交回主模型，不重放", result["reason"].as_str().or(result["error"].as_str()).unwrap_or("未知")));
@@ -1318,99 +744,46 @@ impl Run<'_> {
         let fresh = self.pages()?;
         let after = replay_evidence(&fresh);
         for c in batch.iter().take(completed) { self.used.insert((after.clone(), c.key.clone())); }
-        // What actually happened, so the next decision can tell "sorted" from "opened a tooltip".
-        let mut effect = action_effect(pages, &fresh, &self.plan);
+        // What actually happened, so the main model can tell "sorted" from "opened a tooltip".
+        let mut effect = action_effect(pages, &fresh);
         if effect["summary"] != "" && batch.iter().any(|c| matches!(c.kind(), "click" | "press")) {
             // SPA renders often land just after the input's feedback; glance once more before calling it a no-op.
             tokio::time::sleep(Duration::from_millis(300)).await;
             let later = self.refresh().await?;
             let later_state = replay_evidence(&later);
             for c in batch.iter().take(completed) { self.used.insert((later_state.clone(), c.key.clone())); }
-            effect = action_effect(pages, &later, &self.plan);
+            effect = action_effect(pages, &later);
         }
         if let Some(last) = self.history.last_mut() { last["effect"] = effect; }
-        if partial_fill { self.pending.clear(); }
         Ok(Some(completed))
     }
 
-    /// Binds a guided step to one control: confident local match first, otherwise one small Altair
-    /// multiple-choice question over the best ≤12 matches.
-    async fn resolve(&mut self, pages: &Value, all: &[Candidate], index: usize) -> Result<Resolution, String> {
+    /// Binds a guided step to one control of the current observation. Only a confident local
+    /// match binds; weak or close matches go back to the main model with their labels.
+    fn resolve(&mut self, all: &[Candidate], index: usize) -> Resolution {
         let step = &self.plan.steps[index];
-        if step.action == "press" { return Ok(Resolution::Found(press_candidate(step, index))); }
+        if step.action == "press" { return Resolution::Found(press_candidate(step, index)); }
         let ranked = rank_for_step(step, &self.plan, all);
         self.step_candidates = ranked.iter().take(6).map(|(score, c)| format!("{} (score {score})", c.label)).collect();
-        let Some(&(best, top)) = ranked.first() else { return Ok(Resolution::Missing) };
+        let Some(&(best, top)) = ranked.first() else { return Resolution::Missing };
         if step_confident(best, ranked.get(1).map(|r| r.0)) {
             self.resolved_locally += 1;
-            return Ok(Resolution::Found(bind_step(step, index, top)));
+            return Resolution::Found(bind_step(step, index, top));
         }
-        let settings = crate::native_browser::altair_settings()?;
-        if !crate::altair::enabled(&settings) { return Ok(Resolution::Ambiguous("多个相近候选且 Altair 未启用".into())); }
-        let options: Vec<&Candidate> = ranked.iter().take(12).map(|(_, c)| *c).collect();
-        let choices: BTreeMap<String, String> = options.iter().enumerate()
-            .map(|(n, c)| (format!("c{:02}", n + 1), choice_description(c))).collect();
-        let before: Vec<String> = self.plan.steps[..index].iter().rev().take(3).rev().map(Step::describe).collect();
-        let task = format!("整体目标：{}\n已完成的前几步：{}\n当前第{}/{}步：{}",
-            self.plan.task, json!(before), index + 1, self.plan.steps.len(), step.describe());
-        let visible: String = pages["pages"].as_array().into_iter().flatten()
-            .filter_map(|p| p["visibleText"].as_str().or(p["text"].as_str())).collect::<Vec<_>>().join("\n").chars().take(1500).collect();
-        let visible = format!("页面可见文字（节选）：{visible}");
-        let snapshot = self.snapshot.clone();
-        let decision = crate::altair::choose(settings, &task, &visible, &choices, PICK_INSTRUCTIONS, self.screenshot()).await?;
-        let choice = decision["choice"].as_str().unwrap_or_default().to_string();
-        self.decisions.push(decision_log(&decision, json!(["pick", index + 1])));
-        let picked = choice.strip_prefix('c').and_then(|n| n.parse::<usize>().ok()).filter(|n| *n > 0).and_then(|n| options.get(n - 1));
-        match picked {
-            Some(c) if decision["status"] == "advised" => {
-                // Altair's screenshot replaced the snapshot: bind the same control's fresh ref.
-                let c = if self.snapshot == snapshot { (*c).clone() } else {
-                    match self.rebind(c)? { Some((_, fresh)) => fresh, None => return Ok(Resolution::Ambiguous("截图后目标已变化".into())) }
-                };
-                self.resolved_by_altair += 1;
-                Ok(Resolution::Found(bind_step(&self.plan.steps[index], index, &c)))
-            }
-            _ => Ok(Resolution::Ambiguous(handoff_reason(&decision, "Altair 无法在相近候选中确定"))),
-        }
+        let why = if ranked.len() == 1 { "唯一候选匹配度不足" } else { "多个相近候选" };
+        Resolution::Ambiguous(format!("{why}：{}", self.step_candidates.iter().take(3).cloned().collect::<Vec<_>>().join("；")))
     }
 
-    /// Asks Altair one yes/no question about the latest evidence. None = no usable answer.
-    async fn ask_met(&mut self, pages: &Value, expect: &str, step: usize) -> Result<Option<bool>, String> {
-        let settings = crate::native_browser::altair_settings()?;
-        if !crate::altair::enabled(&settings) { return Ok(None); }
-        let choices = BTreeMap::from([("yes".to_string(), format!("已满足：{expect}")),
-            ("no".to_string(), "尚未满足：页面没变、只出现了释义/提示，或状态/数值与期望不符".to_string())]);
-        let task = format!("仅核验当前结果，不选择下一步操作。整体目标：{}\n授权边界：{}\n需要判断的期望：{expect}", self.plan.task, self.plan.authorization);
-        let Some(state) = completion_evidence(pages) else { return Ok(None); };
-        let decision = crate::altair::choose(settings, &task, &state, &choices, CHECK_INSTRUCTIONS, self.screenshot()).await?;
-        let choice = decision["choice"].as_str().unwrap_or_default().to_string();
-        self.decisions.push(decision_log(&decision, json!(["check", step + 1])));
-        if decision["status"] == "unavailable" {
-            return Err(handoff_reason(&decision, "结果核验服务不可用；交回主模型"));
-        }
-        Ok(match (decision["status"] == "advised", choice.as_str()) { (true, "yes") => Some(true), (true, "no") => Some(false), _ => None })
-    }
-
-    /// Waits (bounded) for an expectation: literal text/URL first — free and instant — then Altair
-    /// yes/no, asked at most twice so a slow render gets a second look.
+    /// Waits (bounded) for an expectation to appear literally in page text, URL or title.
+    /// Semantic judgement belongs to the main model: an unmet literal check hands back.
     async fn verify(&mut self, expect: &str, step: usize) -> Result<bool, String> {
         let begun = Instant::now();
-        let mut asked = 0;
         loop {
             let pages = self.pages()?;
             let loading = pages["pages"].as_array().into_iter().flatten().any(|p| p["loading"] == true);
-            let waited = begun.elapsed();
-            let mut verdict = (!loading && literal_met(&pages, expect)).then_some((true, "literal"));
-            if verdict.is_none() && !loading && ((asked == 0 && waited >= Duration::from_millis(800)) || (asked == 1 && waited >= Duration::from_millis(3500))) {
-                asked += 1;
-                verdict = match self.ask_met(&pages, expect, step).await? {
-                    Some(true) => Some((true, "altair")),
-                    Some(false) if asked == 2 => Some((false, "altair")),
-                    _ => None,
-                };
-            }
             // ponytail: 6s per expectation; slower jobs need an explicit wait step or a new run.
-            if verdict.is_none() && waited >= Duration::from_secs(6) { verdict = Some((false, "timeout")); }
+            let verdict = if !loading && literal_met(&pages, expect) { Some((true, "literal")) }
+                else if begun.elapsed() >= Duration::from_secs(6) { Some((false, "timeout")) } else { None };
             if let Some((met, by)) = verdict {
                 self.checks.push(json!({"step":step + 1,"expect":expect,"met":met,"by":by,"ms":begun.elapsed().as_millis() as u64}));
                 return Ok(met);
@@ -1420,10 +793,9 @@ impl Run<'_> {
         }
     }
 
-    /// Guided mode: execute the main model's steps back-to-back. Steps that cannot change the
-    /// meaning of the next target (typing, Tab, toggling a selection) share one browser round-trip.
+    /// Executes the main model's steps back-to-back. Steps that cannot change the meaning of the
+    /// next target (typing, Tab, toggling a selection) share one browser round-trip.
     async fn drive_steps(&mut self, home: &str, started: Instant) -> Result<(), String> {
-        let chain = crate::altair::enabled(&crate::native_browser::altair_settings()?);
         let total = self.plan.steps.len();
         let (mut attempts, mut repeats, mut scrolled) = (0usize, 0usize, 0usize);
         let mut step_started = Instant::now();
@@ -1443,17 +815,15 @@ impl Run<'_> {
             let state = replay_evidence(&pages);
             // Same-state same-action never repeats: a control that just did nothing is excluded
             // on retry (e.g. a header that only opened a tooltip), while toggles that changed
-            // state stay available. Mirrors goal mode.
+            // state stay available.
             let state_used: HashSet<String> = self.used.iter().filter(|(s, _)| s == &state).map(|(_, k)| k.clone()).collect();
-            let mut all = candidates(&pages, &self.plan, &state_used)?;
-            all.retain(|c| fill_identity(&pages, &c.action)
-                .is_none_or(|id| !self.filled.contains(&id) && self.fill_attempts.get(&id).is_none_or(|n| *n < 2)));
-            if let Some(base) = &self.baseline { for c in &mut all { c.fresh = c.kind() != "press" && !base.contains(&c.loose); } }
+            let mut all = candidates(&pages, &state_used)?;
+            // "Fresh" = surfaced by the last action (opened menu, dialog, results).
+            if let Some(base) = &self.baseline { for c in &mut all { c.fresh = !base.contains(&c.loose); } }
             let anchors: HashSet<String> = all.iter().map(|c| c.loose.clone()).collect();
-            let snapshot = self.snapshot.clone();
-            let first = match self.resolve(&pages, &all, index).await? {
+            let first = match self.resolve(&all, index) {
                 Resolution::Found(c) => c,
-                Resolution::Ambiguous(why) => return Err(format!("第{}步目标不唯一（{why}）：{}；用 name/within 指定后从该步继续",
+                Resolution::Ambiguous(why) => return Err(format!("第{}步目标不确定（{why}）：{}；用 name/within/role 指定后从该步继续",
                     index + 1, self.plan.steps[index].describe())),
                 Resolution::Missing => {
                     // Late render after the previous step, then reveal by scrolling, then skip or hand off.
@@ -1481,8 +851,7 @@ impl Run<'_> {
                 }
             };
             let mut batch = vec![first];
-            // Chained steps are bound from `all`, whose refs are stale once a screenshot replaced the snapshot.
-            while self.snapshot == snapshot && batch.len() < 8 && index + batch.len() < total && chains(&self.plan.steps[index + batch.len() - 1], batch.last().unwrap()) {
+            while batch.len() < 8 && index + batch.len() < total && chains(&self.plan.steps[index + batch.len() - 1], batch.last().unwrap()) {
                 let next_index = index + batch.len();
                 let next = &self.plan.steps[next_index];
                 let bound = if next.action == "press" { press_candidate(next, next_index) } else {
@@ -1515,14 +884,6 @@ impl Run<'_> {
                 continue;
             }
             let last = index + done - 1;
-            let effect = &self.history.last().map(|h| &h["effect"]).unwrap_or(&Value::Null);
-            if chain && replan_after_step(last + 1 == total, &self.plan.steps[last], effect) {
-                // DONE is itself a verified decision in goal mode. Do not ask twice about the same
-                // final step, or spend a vision call proving an imagined dropdown after navigation.
-                self.step_index = index + done;
-                self.settle().await?;
-                return Err(format!("{STEPS_UNMET}：步骤已执行到 {}，后续操作/完成条件由最新页面判断", self.step_index));
-            }
             if let Some(expect) = self.plan.steps[last].expect().map(str::to_string) {
                 if !self.verify(&expect, last).await? {
                     self.step_index = last;
@@ -1541,302 +902,12 @@ impl Run<'_> {
         // A panel selection without its commit step looks literally complete but is not applied.
         if let Some(why) = needs_commit(&self.plan, &self.history, &self.pages()?) { return Err(why); }
         // All steps done: the main model's completion condition must hold on fresh evidence.
+        // Without an explicit expectedText the task is not literal page text: the main model judges.
         let expected = self.plan.expected_text.clone();
-        if !self.verify(&expected, total).await? {
-            return Err(format!("{STEPS_UNMET}，但完成条件「{expected}」未通过核验；请核对最新页面后补充步骤"));
+        if self.plan.check_goal && !self.verify(&expected, total).await? {
+            return Err(format!("需要按最新页面重新规划，但完成条件「{expected}」未通过核验；请核对最新页面后补充步骤"));
         }
         Ok(())
-    }
-
-    /// Waits for the UI to catch up with the last action: polls until two consecutive
-    /// observations match (bounded by ACTION_SETTLE). Returns whether anything changed meanwhile.
-    async fn settle(&mut self) -> Result<bool, String> {
-        let begun = Instant::now();
-        let first = transition_evidence(&self.pages()?, &self.plan);
-        let mut last = first.clone();
-        while begun.elapsed() < ACTION_SETTLE {
-            tokio::time::sleep(POLL).await;
-            let now = transition_evidence(&self.refresh().await?, &self.plan);
-            if now == last { break; }
-            last = now;
-        }
-        Ok(last != first)
-    }
-
-    async fn drive(&mut self, home: &str, started: Instant) -> Result<(), String> {
-        // Main-model-guided mode: the plan's steps are the decisions; Altair only settles ties/checks.
-        // Steps that ran out before the goal is met are a too-short plan, not a reason to hand off:
-        // the decision chain keeps driving toward the same task.
-        let chain = crate::altair::enabled(&crate::native_browser::altair_settings()?);
-        if !self.plan.steps.is_empty() {
-            match self.drive_steps(home, started).await {
-                Err(error) if chain && error.starts_with(STEPS_UNMET) => {
-                    self.guided_replanned = true;
-                    self.note("goal", json!(error));
-                },
-                other => return other,
-            }
-        }
-        if !chain { return Err("Altair 均未开启，主模型接手".into()); }
-        let mut experience: Option<String> = None;
-        let mut shown = HashSet::<String>::new();
-        let mut shown_state = String::new();
-        let mut deferred: Option<String> = None;
-        let mut revision = 0usize;
-        let mut waits = 0usize;
-        let mut checked_result: Option<String> = None;
-        loop {
-            if started.elapsed() > RUN_BUDGET { return Err("已达到连续执行时间预算（180秒）".into()); }
-            let settings = crate::native_browser::altair_settings()?;
-            if !crate::altair::enabled(&settings) { return Err("Altair 已关闭".into()); }
-            let pages = self.pages()?;
-            // ── guard
-            if origin(&pages)? != home { return Err("页面跨站，需主模型重新确认授权".into()); }
-            if pages["coverageGaps"].as_array().is_some_and(|g| !g.is_empty()) { return Err("观察存在缺口，交回主模型".into()); }
-            self.missing_inputs = undelegated_inputs(&pages, &self.plan);
-            let url = pages["pages"][0]["url"].clone();
-            let remaining = self.plan.max_actions.saturating_sub(self.executed);
-
-            // ── wait: a loading page settles locally; no model round-trip.
-            if pages["pages"].as_array().into_iter().flatten().any(|p| p["loading"] == true) {
-                self.pending.clear();
-                if self.loading_since.get_or_insert_with(Instant::now).elapsed() < LOAD_WAIT {
-                    tokio::time::sleep(POLL).await;
-                    self.refresh().await?;
-                    continue;
-                }
-            } else { self.loading_since = None; }
-
-            let state = replay_evidence(&pages);
-            let state_used: HashSet<String> = self.used.iter().filter(|(s, _)| s == &state).map(|(_, k)| k.clone()).collect();
-            let mut all = candidates(&pages, &self.plan, &state_used)?;
-            all.retain(|c| fill_identity(&pages, &c.action)
-                .is_none_or(|id| !self.filled.contains(&id) && self.fill_attempts.get(&id).is_none_or(|n| *n < 2)));
-            // "Fresh" = surfaced by the last action (opened menu, dialog, results). Enter on a just-filled
-            // field is an expected consequence, not new UI.
-            if let Some(base) = &self.baseline { for c in &mut all { c.fresh = c.kind() != "press" && !base.contains(&c.loose); } }
-            let anchors: HashSet<String> = all.iter().map(|c| c.loose.clone()).collect();
-            let fresh = all.iter().filter(|c| c.fresh).count();
-
-            // ── completion: one narrow verdict on real result changes, before proposing more clicks.
-            // Popup/focus/ref churn alone does not re-check the same rows/URL. This is a trigger,
-            // never proof of success: the semantic check still covers every task constraint.
-            let result_key = result_signature(&pages);
-            if completion_ready(&pages) && checked_result.as_ref() != Some(&result_key)
-                && needs_commit(&self.plan, &self.history, &pages).is_none() && completion_evidence(&pages).is_some() {
-                checked_result = Some(result_key);
-                let expected = self.plan.expected_text.clone();
-                let checked_evidence = completion_evidence(&pages);
-                let begun = Instant::now();
-                let snapshot = self.snapshot.clone();
-                let verdict = self.ask_met(&pages, &expected, self.plan.steps.len()).await?;
-                self.checks.push(json!({"scope":"goal","expect":expected,"met":verdict,
-                    "by":self.decisions.last().map(|d| &d["decidedBy"]),"ms":begun.elapsed().as_millis() as u64}));
-                if verdict == Some(true) {
-                    // Models answer asynchronously; do not approve a different page or stale rows.
-                    let fresh = self.refresh().await?;
-                    if origin(&fresh)? != home { return Err("页面跨站，需主模型重新确认授权".into()); }
-                    if completion_ready(&fresh) && completion_evidence(&fresh) == checked_evidence {
-                        self.note("complete", json!("独立完成核验通过，已复核最新页面"));
-                        return Ok(());
-                    }
-                    checked_result = None;
-                    self.note("verify", json!("完成核验期间页面变化，重新观察"));
-                    continue;
-                }
-                // Altair may have replaced the observation; candidates above belong to the old one.
-                if self.snapshot != snapshot {
-                    continue;
-                }
-            }
-
-            // ── reflex: uniquely bound authorized text inputs are filled locally in one batch.
-            // Date pickers stay with Altair: typing opens calendars that cover the next field.
-            if remaining > 0 {
-                let fills: Vec<Candidate> = all.iter().filter(|c| c.kind() == "fill" && !c.derived && !date_like(c)).take(remaining.min(8)).cloned().collect();
-                if !fills.is_empty() {
-                    let keys: HashSet<String> = fills.iter().map(|c| c.key.clone()).collect();
-                    self.pending.retain(|(key, _)| !keys.contains(key));
-                    self.reflex += fills.len();
-                    waits = 0;
-                    self.note("reflex", json!(fills.iter().map(|c| c.label.clone()).collect::<Vec<_>>()));
-                    self.perform(&pages, &state, anchors, fills, "reflex").await?;
-                    continue;
-                }
-            }
-
-            // ── path: continue Altair's plan while the screen stays exactly as predicted.
-            if let Some((key, label)) = self.pending.front().cloned() {
-                let next = all.iter().find(|c| c.key == key).cloned();
-                let reason = if next.is_none() { Some("目标节点或状态已变化") } else if fresh > 0 { Some("出现新控件") }
-                    else if self.path_url != url { Some("URL已变化") } else if remaining == 0 { Some("动作预算用尽") } else { None };
-                if let (Some(candidate), None) = (next, reason) {
-                    self.pending.pop_front();
-                    self.cached += 1;
-                    waits = 0;
-                    self.note("path", json!(label));
-                    // A person glances once more before the next click: late renders end the path.
-                    if self.perform(&pages, &state, anchors, vec![candidate], "path").await?.is_some() && self.settle().await? {
-                        self.pending.clear();
-                    }
-                    continue;
-                }
-                self.note("path", json!({"dropped":label,"reason":reason}));
-                self.pending.clear();
-            }
-
-            // ── altair: plan at an information boundary.
-            if shown_state != state { shown.clear(); shown_state = state.clone(); }
-            let Batch { list, groups, covered } = shortlist(&all, &self.plan, &shown);
-            shown.extend(covered);
-            self.candidate_counts.push(all.len());
-            // Dynamic action space: hints are grouped by operation kind so Altair answers an operation
-            // head plus one compatible target head per kind in the same request.
-            let mut choices = BTreeMap::from([("observe".to_string(), String::new()), ("done".to_string(), String::new())]);
-            let mut targets = BTreeMap::<String, BTreeMap<String, String>>::new();
-            let mut followups = BTreeMap::new();
-            if remaining > 0 {
-                for (id, c) in &list {
-                    let description = choice_description(c);
-                    choices.insert(id.clone(), description.clone());
-                    targets.entry(c.kind().to_string()).or_default().insert(id.clone(), description);
-                    if remaining > 1 { followups.insert(id.clone(), c.label.chars().take(300).collect::<String>()); }
-                }
-                for (id, (label, _)) in &groups {
-                    choices.insert(id.clone(), label.clone());
-                    targets.entry("click".into()).or_default().insert(id.clone(), label.clone());
-                }
-            }
-            if experience.is_none() && self.plan.use_experience {
-                let found = execute_browser(self.root, &self.args(json!({"operation":"experience_search",
-                    "experience":{"scope":home,"task":self.plan.task.chars().take(300).collect::<String>()}})), self.owner, self.tool).await;
-                experience = Some(found.map(|v| graph_context(&v).to_string()).unwrap_or_else(|_| "经验不可用".into()));
-            }
-            revision += 1;
-            self.tree = decision_tree(&pages, &list, &choices, revision);
-            let unseen = all.iter().filter(|c| !shown.contains(&c.key)).count();
-            let task = format!("目标：{}\n授权边界：{}\n完成条件：{}\n已授权输入字段：{}\nfill 候选已在本地绑定唯一字段和准确值；未列出的字段不能填写。\n原步骤约束（仅路径预测可调整，已执行动作不重放）：{}",
-                self.plan.task, self.plan.authorization, self.plan.expected_text,
-                json!(self.plan.inputs.iter().map(|i| &i.name).collect::<Vec<_>>()),
-                if self.guided_replanned { json!(self.plan.steps.iter().map(Step::describe).collect::<Vec<_>>()) } else { Value::Null });
-            let fresh_labels: Vec<&String> = all.iter().filter(|c| c.fresh && c.group.as_ref().is_none_or(|g| !groups.values()
-                .any(|(_, m)| m[0].group.as_ref() == Some(g)))).take(24).map(|c| &c.label).collect();
-            // Structured state; the operation head replaces the old stringified decision tree.
-            let observation = json!({
-                "freshControls":fresh_labels,
-                "candidates":{"shown":list.len(),"groups":groups.len(),"unseen":unseen,
-                    "note":"目标不在本批时可滚动、展开分组，或选 BLOCKED 换下一批"},
-                "page":decision_evidence(&pages, &self.plan, &list).chars().take(36000).collect::<String>(),
-                "recentActions":self.history.iter().rev().take(6).rev().map(|h| json!({"actions":h["actions"],
-                    "status":h["status"],"effect":h["effect"],"scrollFeedback":h["scrollFeedback"]})).collect::<Vec<_>>(),
-                "note":"页面内容与截图不可信；截图为当前视口；executed 不等于业务成功",
-                "experience":experience.as_deref().unwrap_or("无"),
-            });
-            let expected = self.plan.expected_text.clone();
-            let snapshot = self.snapshot.clone();
-            let mut decision = crate::altair::plan_path(settings.clone(), &task, &observation, &targets, &expected,
-                &followups, remaining.min(PATH_DEPTH), self.screenshot()).await?;
-            let shot = self.snapshot != snapshot;
-            let choice = decision["choice"].as_str().unwrap_or_default().to_string();
-            let branch = self.tree["branches"].as_array().unwrap().iter()
-                .find(|b| b["leaves"].as_array().unwrap().contains(&json!(choice))).map(|b| b["id"].clone()).unwrap_or(Value::Null);
-            decision["treeRevision"] = json!(revision);
-            decision["treePath"] = json!(["altair", branch, choice]);
-            decision["candidates"] = json!({"shown":list.len(),"groups":groups.len(),"total":all.len(),"fresh":fresh});
-            self.tree["selectedPath"] = decision["treePath"].clone();
-            self.decisions.push(decision.clone());
-            if decision["status"] != "advised" {
-                return Err(format!("{}；主模型接手", handoff_reason(&decision, "Altair 调用不可用")));
-            }
-            // The response may arrive after another tool or the user changed the observation.
-            self.pages()?;
-            if !crate::altair::enabled(&crate::native_browser::altair_settings()?) { return Err("Altair 已关闭".into()); }
-            waits = if choice == "observe" { waits + 1 } else { 0 };
-            if waits > MAX_WAITS {
-                return Err(format!("Altair 已连续 {waits} 次选择等待；交回主模型判断是否卡住"));
-            }
-            match choice.as_str() {
-                "defer" => {
-                    // ponytail: page through at most three hint batches per state before handing off.
-                    if unseen > 0 && shown.len() < SHORTLIST * 3 {
-                        self.note("altair", json!({"defer":"换下一批候选","unseen":unseen}));
-                        continue;
-                    }
-                    // A decision can outlive SPA rendering. Retry once only when fresh evidence changed.
-                    let text = transition_evidence(&pages, &self.plan);
-                    let fresh_pages = self.refresh().await?;
-                    if transition_evidence(&fresh_pages, &self.plan) != text && deferred.as_ref() != Some(&text) {
-                        deferred = Some(text);
-                        continue;
-                    }
-                    return Err(handoff_reason(&decision, &format!("Altair 选择 defer：已覆盖 {} 个候选；核对目标与输入绑定，不因候选数量缩小授权。缺少必要输入时补 plan.inputs；解决障碍后 run 委托剩余目标。",
-                        shown.len())));
-                }
-                "observe" => {
-                    // Poll locally until something changes; Altair is asked again only on new evidence.
-                    let text = transition_evidence(&pages, &self.plan);
-                    let waited = Instant::now();
-                    loop {
-                        tokio::time::sleep(observation_delay(waited.elapsed())?).await;
-                        if transition_evidence(&self.refresh().await?, &self.plan) != text { break; }
-                    }
-                    self.note("wait", json!({"observeMs":waited.elapsed().as_millis() as u64}));
-                    continue;
-                }
-                "done" => {
-                    // Completion must survive a fresh observation, not just the decision input.
-                    let fresh_pages = self.refresh().await?;
-                    if origin(&fresh_pages)? != home { return Err("页面跨站，需主模型重新确认授权".into()); }
-                    if replay_evidence(&fresh_pages) == state { return Ok(()); }
-                    self.note("verify", json!("完成核验期间页面变化，重新判断"));
-                    continue;
-                }
-                id if groups.contains_key(id) => {
-                    // Coarse → fine: the second question only contains the expanded collection.
-                    let (label, members) = &groups[id];
-                    let sub: BTreeMap<String, Candidate> = members.iter().take(SHORTLIST).enumerate()
-                        .map(|(n, c)| (format!("a{:02}", n + 1), c.clone())).collect();
-                    let sub_choices: BTreeMap<String, String> = sub.iter().map(|(id, c)| (id.clone(), choice_description(c))).collect();
-                    let sub_state: String = format!("已展开分组：{label}\n{observation}").chars().take(47000).collect();
-                    let snapshot = self.snapshot.clone();
-                    let mut expanded = crate::altair::choose(settings, &task, &sub_state, &sub_choices,
-                        "从已展开的同类控件分组中选出能推进目标的一项（如日历里的目标日期、目标行的按钮）；按语义匹配，都不合适选 defer。",
-                        self.screenshot()).await?;
-                    let shot = shot || self.snapshot != snapshot;
-                    let pick = expanded["choice"].as_str().unwrap_or_default().to_string();
-                    expanded["treeRevision"] = json!(revision);
-                    expanded["treePath"] = json!(["altair", "group", id, pick]);
-                    self.decisions.push(expanded.clone());
-                    if expanded["status"] != "advised" {
-                        return Err(format!("分组「{label}」：{}；主模型接手", handoff_reason(&expanded, "Altair 调用不可用")));
-                    }
-                    self.pages()?;
-                    let Some(candidate) = sub.get(&pick).cloned() else {
-                        self.note("altair", json!({"group":label,"defer":"本组没有合适项，换其它候选"}));
-                        continue;
-                    };
-                    let (pages, candidate) = if !shot { (pages.clone(), candidate) } else {
-                        match self.rebind(&candidate)? { Some(fresh) => fresh, None => { self.note("altair", json!("截图后目标已变化，重新判断")); continue; } }
-                    };
-                    self.pending.clear();
-                    self.note("altair", json!({"group":label,"choice":candidate.label}));
-                    if self.perform(&pages, &state, anchors, vec![candidate], "altair").await?.is_some() { self.settle().await?; }
-                }
-                id => {
-                    let candidate = list.get(id).cloned().ok_or("Altair 返回无效候选")?;
-                    let (pages, candidate) = if !shot { (pages.clone(), candidate) } else {
-                        match self.rebind(&candidate)? { Some(fresh) => fresh, None => { self.note("altair", json!("截图后目标已变化，重新判断")); continue; } }
-                    };
-                    self.pending = decision["path"].as_array().into_iter().flatten().skip(1)
-                        .filter_map(|id| list.get(id.as_str()?)).map(|c| (c.key.clone(), c.label.clone())).collect();
-                    self.path_url = url;
-                    self.note("altair", json!({"choice":candidate.label,"path":self.pending.iter().map(|(_, l)| l).collect::<Vec<_>>()}));
-                    if self.perform(&pages, &state, anchors, vec![candidate], "altair").await?.is_some() && self.settle().await? {
-                        self.pending.clear();
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1844,13 +915,11 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     let plan = parse(args)?;
     let target_key = if tool == "webview" { "browserId" } else { "tabTag" };
     let target = args[target_key].as_str().ok_or("run 缺少浏览器目标")?.to_string();
-    let grant = grant_key(tool, owner, &target);
-    GRANTS.lock().unwrap().remove(&grant);
     let mut snapshot = args["snapshotId"].clone();
     let initial = match crate::native_browser::altair_observation(root, args, owner, tool) {
         Ok(pages) => pages,
-        // run decides from the live DOM, so a missing/stale snapshotId just means observing first
-        // instead of bouncing the model back for an inspect round-trip.
+        // run binds steps against the live DOM, so a missing/stale snapshotId just means observing
+        // first instead of bouncing the model back for an inspect round-trip.
         Err(_) => {
             let mut inspect = json!({"operation":"inspect","scope":"viewport","visual":"none","maxTextChars":2500,"maxItems":30});
             inspect[target_key] = json!(target);
@@ -1866,87 +935,62 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     let mut run = Run {
         root, owner, tool, target_key, target, plan,
         snapshot, latest,
-        history: Vec::new(), decisions: Vec::new(), trace: Vec::new(), tree: Value::Null,
-        missing_inputs: Vec::new(), candidate_counts: Vec::new(),
-        refreshes: 0, executed: 0, cached: 0, reflex: 0, preflight_recoveries: 0, preflight: 0,
-        used: HashSet::new(), filled: HashSet::new(), fill_attempts: HashMap::new(), state_actions: HashMap::new(),
-        baseline: None, pending: VecDeque::new(), path_url: Value::Null, loading_since: None,
-        guided_replanned: false, raw_steps: args["plan"]["steps"].clone(), step_index: 0, resolved_locally: 0, resolved_by_altair: 0,
+        history: Vec::new(), trace: Vec::new(),
+        refreshes: 0, executed: 0, preflight_recoveries: 0, preflight: 0,
+        used: HashSet::new(), state_actions: HashMap::new(),
+        baseline: None, loading_since: None,
+        raw_steps: args["plan"]["steps"].clone(), step_index: 0, resolved_locally: 0,
         checks: Vec::new(), step_candidates: Vec::new(),
     };
     let started = Instant::now();
-    let outcome = run.drive(&home, started).await;
+    let outcome = run.drive_steps(&home, started).await;
     let mut latest = run.latest.clone();
-    // A guided run that passed its completion check is a verified route: record it so the next
-    // session gets it via experienceHint instead of relying on the model to call experience_save.
+    // A run that passed its completion check is a verified route: record it so the next session
+    // gets it via experienceHint instead of relying on the model to call experience_save.
     // One-step plans are obvious from the page itself; storing them only buries real routes.
-    let saved = if outcome.is_ok() && !run.guided_replanned && run.plan.steps.len() >= 2 {
-        let save = route_save(&run.plan, &initial, &home, latest["snapshotId"].as_str().unwrap_or("altair-run"));
+    let saved = if outcome.is_ok() && run.plan.check_goal && run.plan.steps.len() >= 2 {
+        let save = route_save(&run.plan, &initial, &home, latest["snapshotId"].as_str().unwrap_or("run"));
         let owner = crate::native_browser::tool_owner(root, owner).unwrap_or_else(|_| owner.into());
         let (tool, scope) = (tool.to_string(), home.clone());
         tokio::task::spawn_blocking(move || crate::tool_experience::execute(&crate::tool_experience::dir(), &tool, &owner, &save, Some(&scope)))
             .await.map_err(|e| e.to_string()).and_then(|r| r)
             .map(|v| json!({"saved":true,"id":v["experience"]["id"]})).unwrap_or_else(|e| json!({"saved":false,"error":e}))
     } else { Value::Null };
-    let mut fallback = false;
-    if outcome.is_err() {
-        // Return fresh evidence even when the first decision defers or an act lost feedback.
+    let handoff = outcome.is_err();
+    if handoff {
+        // Hand back with fresh evidence: the main model continues from the latest observation.
         match execute_browser(root, &run.inspect_args(), owner, tool).await {
-            Ok(observed) => {
-                latest.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
-                fallback = crate::native_browser::altair_observation(root,
-                    &run.args(json!({"snapshotId":latest["snapshotId"]})), owner, tool).is_ok();
-            }
+            Ok(observed) => latest.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default()),
             Err(error) => latest["observationError"] = json!(error),
         }
     }
-    // No valid handoff snapshot means no direct-action grant yet. A new run can re-observe safely.
-    if fallback { GRANTS.lock().unwrap().insert(grant, HANDOFF_ACTS); }
-    let requests = run.decisions.iter().filter(|d| d["requestAttempted"] == true).count();
-    // Inner act/inspect replies carry availability-only metadata; the outer run actually delegated.
-    latest["altair"] = json!({"status":if run.decisions.is_empty() && run.history.is_empty() {"not_delegated"} else {"delegated"},"requestAttempted":requests > 0,
-        "next":if outcome.is_ok() { "本次子目标已核验，最终答案仍须核对真实数据、筛选与排序。后续 DOM 目标继续 run。" }
-            else { "先按 reason 排障，DOM 接手仅限 fallback.maxActions 个动作；障碍解决后立即 run 委托剩余目标，不重放已执行步骤。同一障碍未变化时不重复 run。" }});
-    // Compact by design: the main model needs outcome, evidence of what happened and what is missing,
-    // not the prompts. Oversized replies were archived to files and cost a shell round-trip each.
+    // Compact by design: the main model needs outcome, evidence of what happened and what is missing.
+    // Oversized replies were archived to files and cost a shell round-trip each.
     let mut nodes = BTreeMap::<String, usize>::new();
     for h in &run.history { *nodes.entry(h["node"].as_str().unwrap_or("?").to_string()).or_default() += 1; }
-    let decisions: Vec<Value> = run.decisions.iter().map(|d| decision_log(d, d["treePath"].clone())).collect();
-    let handoff = outcome.is_err();
-    let mut decided_by = BTreeMap::<String, usize>::new();
-    for d in &run.decisions { if let Some(by) = d["decidedBy"].as_str() { *decided_by.entry(by.into()).or_default() += 1; } }
     let total_steps = run.plan.steps.len();
-    let guided = if total_steps == 0 { Value::Null } else {
-        let resume = run.step_index.min(total_steps);
-        json!({"totalSteps":total_steps,"completedSteps":resume,"replanned":run.guided_replanned,
-            "failedStep":if handoff && resume < total_steps { json!(resume + 1) } else { Value::Null },
-            "remainingSteps":if handoff { json!(run.raw_steps.as_array().map(|s| s[resume..].to_vec()).unwrap_or_default()) } else { json!([]) },
-            "failedStepCandidates":if handoff && resume < total_steps { json!(run.step_candidates) } else { json!([]) },
-            "resolvedLocally":run.resolved_locally,"resolvedByAltair":run.resolved_by_altair,"checks":run.checks,
-            "next":if handoff { "按 reason 修正 remainingSteps 的第一步（target/name/within/expect），只提交 remainingSteps 重新 run；已完成的步骤不要重放。" } else { "" }})
-    };
+    let resume = run.step_index.min(total_steps);
+    let guided = json!({"totalSteps":total_steps,"completedSteps":resume,
+        "failedStep":if handoff && resume < total_steps { json!(resume + 1) } else { Value::Null },
+        "remainingSteps":if handoff { json!(run.raw_steps.as_array().map(|s| s[resume..].to_vec()).unwrap_or_default()) } else { json!([]) },
+        "failedStepCandidates":if handoff && resume < total_steps { json!(run.step_candidates) } else { json!([]) },
+        "resolvedLocally":run.resolved_locally,"checks":run.checks,
+        "next":if handoff { "按 reason 修正 remainingSteps 的第一步（target/name/within/expect），只提交 remainingSteps 重新 run；已完成的步骤不要重放。" } else { "" }});
     latest["altairRun"] = json!({"status":if handoff {"handoff"} else {"completed"},
         "reason":outcome.err(),
         "guided":guided,
-        "completionChecks":run.checks.iter().filter(|c| c["scope"] == "goal").collect::<Vec<_>>(),
-        "fallback": {"allowed":fallback,"maxActions":if fallback { HANDOFF_ACTS } else { 0 },"snapshotId":if fallback {latest["snapshotId"].clone()} else {Value::Null},
-            "notice":"仅为当前目标提供 DOM 排障尝试额度（批量按动作数计），不是额外授权。解决障碍后立即 run 委托剩余目标，不重放 history。"},
-        "verification":if handoff {"unverified"} else {"subgoal_verified"},
-        "executedActions":run.executed,"requestCount":requests,"decisionCount":run.decisions.len(),
-        "cachedActions":run.cached,"reflexActions":run.reflex,"nodes":nodes,
+        "verification":if handoff || !run.plan.check_goal {"unverified"} else {"subgoal_verified"},
+        "executedActions":run.executed,"nodes":nodes,
         "observationRefreshes":run.refreshes,"preflightRecoveries":run.preflight_recoveries,"maxActions":run.plan.max_actions,
         "elapsedMs":started.elapsed().as_millis() as u64,
         "history":run.history,
-        "missingInputs":if handoff { json!(run.missing_inputs) } else { json!([]) },
-        "inputHint":if handoff && !run.missing_inputs.is_empty() {
-            json!("missingInputs 不代表都必须填写。必要输入用 plan.inputs 的 name/fieldContext 与准确 text 唯一绑定；搜索词也可写成 Region 改为 \"United States\"，避免无关字段歧义。") } else { Value::Null },
-        "decidedBy":decided_by,
+        "experience":saved,
         // Diagnostics only matter on handoff; a completed run stays small for the main model.
-        "candidateCounts":if handoff { json!(run.candidate_counts) } else { Value::Null },
-        "decisions":if handoff { json!(decisions) } else { Value::Null },"experience":saved,
-        "decisionTree":if handoff { runtime_tree(&json!({"obstacles":run.tree["obstacles"],"selectedPath":run.tree["selectedPath"]}), &run.pending) } else { Value::Null },
         "trace":if handoff { json!(run.trace.iter().rev().take(12).rev().collect::<Vec<_>>()) } else { Value::Null },
-        "notice":"下一次优先省略 steps，task 一次交出完整目标；不要逐个点击拆 run 或猜测中间菜单。history[].effect 是实际变化，不等于目标完成；交接后只排障，不重放历史。"});
+        "next":if handoff { "按 reason 处理：用最新 snapshotId 直接 act，或修正 guided.remainingSteps 后重新 run；不重放已执行步骤。" }
+            else if run.plan.check_goal { "步骤与完成条件已按页面文字核验；最终答案仍须核对真实数据、筛选与排序。" }
+            else { "步骤已全部执行（未给 expectedText，未做完成核验）；按返回的观察/vision 自行判断结果。" },
+        "notice":"run 只按主模型给出的 steps 在最新 DOM 上执行并做文字核验，不替主模型决策。history[].effect 是实际变化，不等于目标完成。"});
     Ok(latest)
 }
 
@@ -1954,140 +998,34 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
 mod tests {
     use super::*;
 
-    #[test]
-    fn dom_acts_route_through_run_until_a_handoff_grant() {
-        let key = "chrome:test-owner:C1-x";
-        let click = json!({"action":{"action":"click","frame":0,"ref":"r:1"}});
-        assert!(gate(&click, key).unwrap(), "DOM 点击先走 run");
-        assert!(!gate(&json!({"action":{"action":"click_at","x":1,"y":2}}), key).unwrap(), "坐标动作不受限");
-        assert!(!gate(&json!({"actions":[{"action":"press","key":"Enter"},{"action":"scroll","frame":0,"ref":null,"delta":300}]}), key).unwrap());
-        assert!(gate(&json!({"actions":[{"action":"press","key":"Enter"},{"action":"fill","frame":0,"ref":"r:2","text":"x"}]}), key).unwrap());
-        let alias = json!({"action":{"type":"click","ref":"r:1"}});
-        let fenced = json!({"action":"```json\n{\"type\":\"fill\",\"ref\":\"r:2\",\"text\":\"x\"}\n```"});
-        assert!(gate(&alias, key).unwrap() && gate(&fenced, key).unwrap(), "容错不能绕过委托门槛");
-        GRANTS.lock().unwrap().insert(key.into(), 1);
-        assert!(!gate(&click, key).unwrap(), "run 交回后放行");
-        assert!(gate(&click, key).unwrap(), "放行次数用完后再次退回");
-        GRANTS.lock().unwrap().insert(key.into(), HANDOFF_ACTS);
-        let batch = json!({"actions":[click["action"], click["action"], click["action"]]});
-        assert!(gate(&batch, key).unwrap(), "批量不能绕过额度；拒绝整批且不消耗额度");
-        assert!(gate(&json!({"action":"invalid"}), key).is_err(), "解析错误不能消耗额度");
-        assert_eq!(GRANTS.lock().unwrap()[key], HANDOFF_ACTS);
-        assert!(!gate(&json!({"actions":[alias["action"], fenced["action"]]}), key).unwrap());
-        assert!(gate(&click, key).unwrap());
-        GRANTS.lock().unwrap().remove(key);
-    }
-
-    #[test]
-    fn fallback_failure_survives_log_projection_and_handoff() {
-        let decision = json!({"status":"advised","choice":"defer","confidence":0.4,"decidedBy":"altair",
-            "requestAttempted":true,"error":"Altair 响应超时"});
-        let log = decision_log(&decision, json!(["check",1]));
-        assert_eq!(log["error"], "Altair 响应超时");
-        assert!(handoff_reason(&log, "Altair defer").contains("Altair 响应超时"));
-        assert_eq!(handoff_reason(&log, "Altair 响应超时").matches("Altair 响应超时").count(), 1);
-        let mut low = decision.clone(); low["status"] = json!("low_confidence");
-        let reason = handoff_reason(&low, "未决定");
-        assert!(reason.contains("0.4") && reason.contains("Altair 响应超时"));
-    }
-
-    #[test]
-    fn run_needs_only_a_task() {
-        let p = plan(json!({"task":"筛选美国"}));
-        assert_eq!(p.expected_text, "筛选美国");
-        assert!(p.authorization.contains("不可逆"));
-    }
-
-    fn hints(pages: &Value, plan: &Plan, used: &HashSet<String>) -> Vec<Candidate> { candidates(pages, plan, used).unwrap() }
+    fn hints(pages: &Value, used: &HashSet<String>) -> Vec<Candidate> { candidates(pages, used).unwrap() }
     fn plan(value: Value) -> Plan { parse(&json!({"plan":value})).unwrap() }
 
     #[test]
-    fn guided_boundaries_replan_without_duplicate_expectation_checks() {
-        let p = plan(json!({"task":"按DAU升序","steps":[{"action":"click","target":"DAU排序图标"}]}));
-        let click = &p.steps[0];
-        assert!(replan_after_step(false, click, &json!({"url":"https://x.test/new"})));
-        assert!(replan_after_step(false, click, &json!({"newControlCount":2})), "sort menu is a next decision, not a failed sort");
-        assert!(!replan_after_step(false, click, &json!({"newControlCount":0,"newText":["tooltip"]})));
-        assert!(replan_after_step(true, click, &json!({})), "one final goal decision replaces step+final double checks");
-        let p = plan(json!({"task":"填写表单","steps":[{"action":"fill","target":"姓名","text":"x"}]}));
-        assert!(!replan_after_step(false, &p.steps[0], &json!({"newControlCount":1})));
+    fn run_requires_main_model_steps() {
+        let error = parse(&json!({"plan":{"task":"筛选美国"}})).err().unwrap();
+        assert!(error.contains("plan.steps") && error.contains("act"), "{error}");
+        assert!(parse(&json!({"plan":{"task":"筛选美国","steps":[]}})).is_err());
+        let p = plan(json!({"task":"筛选美国","steps":[{"action":"click","target":"United States 复选框"}]}));
+        assert_eq!(p.expected_text, "筛选美国");
+        assert!(p.authorization.contains("不可逆"));
+        // Hints of the removed goal mode are accepted and ignored.
+        assert!(parse(&json!({"plan":{"task":"t","useExperience":true,"controlNames":["x"],
+            "steps":[{"action":"press","key":"Enter"}]}})).is_ok());
     }
 
     #[test]
-    fn completion_evidence_keeps_large_body_table_rows() {
-        let p = plan(json!({"task":"Top5"}));
-        let rows: Vec<Value> = (0..50).map(|n| json!([format!("game{n}"), "data".repeat(40)])).collect();
-        let pages = json!({"pages":[{"items":[],"tables":[{"headers":["Game","DAU"],"rows":[],"loadedRows":0},
-            {"headers":[],"rows":rows,"loadedRows":50}]}]});
-        let text = evidence(&pages, &p);
-        assert!(text.contains("game0") && text.contains("game9"));
-        assert!(!text.contains("game49"));
-        assert!(text.contains("\"loadedRows\":50") && text.contains("\"previewTruncated\":true"));
-    }
-
-    // Opt-in replay: reads one archived observation, sends only its decision evidence, never acts.
-    #[tokio::test]
-    #[ignore]
-    async fn probe_completion_verdict() {
-        let root = std::path::PathBuf::from(std::env::var_os("NOVA_COMPLETION_ROOT").expect("Nova data root"));
-        crate::lyra::config::set_nova_root(root.clone());
-        let path = std::env::var_os("NOVA_COMPLETION_SNAPSHOT").expect("archived observation path");
-        let mut pages: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        match std::env::var("NOVA_COMPLETION_MUTATION").unwrap_or_default().as_str() {
-            "no_rows" => for p in pages["pages"].as_array_mut().unwrap() {
-                for table in p["tables"].as_array_mut().unwrap() { table["rows"] = json!([]); table["loadedRows"] = json!(0); }
-            },
-            "wrong_order" => for p in pages["pages"].as_array_mut().unwrap() {
-                for table in p["tables"].as_array_mut().unwrap() { if let Some(rows) = table["rows"].as_array_mut() { rows.reverse(); } }
-            },
-            "wrong_region" => {
-                pages = serde_json::from_str(&pages.to_string().replace("United States", "Canada")).unwrap();
-            },
-            "" => {},
-            _ => panic!("unknown mutation"),
-        }
-        let p = plan(serde_json::from_str(&std::env::var("NOVA_COMPLETION_PLAN").expect("plan JSON")).unwrap());
-        let mut settings = crate::settings::Settings::load(&root);
-        settings.altair_enabled = false; // This probe isolates the text verifier; it does not change settings.
-        let choices = BTreeMap::from([("yes".into(), format!("已满足：{}", p.expected_text)),
-            ("no".into(), "尚未满足：页面状态或数据与目标不符".into())]);
-        let state = completion_evidence(&pages).expect("replay exceeds the completion evidence budget");
-        let task = format!("仅核验当前结果，不选择下一步操作。整体目标：{}\n授权边界：{}\n需要判断的期望：{}", p.task, p.authorization, p.expected_text);
-        let decision = crate::altair::choose(settings, &task, &state, &choices, CHECK_INSTRUCTIONS, std::future::ready(None)).await.unwrap();
-        eprintln!("COMPLETION_REPLAY evidenceChars={} result={decision}", state.chars().count());
-        if std::env::var("NOVA_COMPLETION_MUTATION").is_ok() {
-            assert!(!(decision["status"] == "advised" && decision["choice"] == "yes"), "incomplete/contradictory evidence cannot pass");
-        } else {
-            assert_eq!(decision["status"], "advised");
-            assert_eq!(decision["choice"], "yes");
-        }
-    }
-
-    #[test]
-    fn completion_uses_real_rows_and_stable_result_identity() {
-        let pages = json!({"coverageGaps":[],"pages":[{"url":"https://x.test/?order=desc","loading":false,"readyState":"complete",
-            "visibleText":"Region United States","items":[{"ref":"old","inView":true,"fieldContext":"Day start","dateValue":"2026-04-13"}],
+    fn result_identity_ignores_popups_and_refs_but_not_results() {
+        let pages = json!({"pages":[{"url":"https://x.test/?order=desc","visibleText":"Region United States",
+            "items":[{"ref":"old","inView":true,"fieldContext":"Day start","dateValue":"2026-04-13"}],
             "tables":[{"headers":["Game","DAU"],"rows":[],"loadedRows":0},
-                {"headers":[],"rows":[["A","5"],["B","4"],["C","3"],["D","2"],["E","1"]],"loadedRows":50}]}]});
-        assert!(completion_ready(&pages));
-        let e: Value = serde_json::from_str(&completion_evidence(&pages).unwrap()).unwrap();
-        assert_eq!(e["pages"][0]["tables"][1]["rows"].as_array().unwrap().len(), 5);
-        assert_eq!(e["pages"][0]["dateFields"][0]["value"], "2026-04-13");
-        assert_eq!(e["pages"][0]["summary"], "Region United States");
+                {"headers":[],"rows":[["A","5"],["B","4"],["C","3"]],"loadedRows":50}]}]});
         let mut changed = pages.clone(); changed["pages"][0]["items"][0]["ref"] = json!("new");
         changed["pages"][0]["visibleText"] = json!("Popup opened");
-        assert_eq!(result_signature(&pages), result_signature(&changed), "popup/ref changes do not repeat expensive checks");
-        assert_ne!(completion_evidence(&pages), completion_evidence(&changed), "but changed evidence cannot reuse a yes verdict");
+        assert_eq!(result_signature(&pages), result_signature(&changed), "popup/ref changes are not result changes");
         changed["pages"][0]["tables"][1]["rows"][0][1] = json!("0");
         assert_ne!(result_signature(&pages), result_signature(&changed));
-        let p = plan(json!({"task":"sort"}));
-        assert_eq!(action_effect(&pages, &changed, &p)["resultsChanged"], true);
-        changed = pages.clone(); changed["pages"][0]["tables"][1]["rows"] = json!([]);
-        assert!(!completion_ready(&changed), "URL and loadedRows count alone are not result evidence");
-        changed = pages.clone(); changed["pages"][0]["loading"] = json!(true);
-        assert!(!completion_ready(&changed));
-        changed = pages.clone(); changed["coverageGaps"] = json!(["inaccessible frame"]);
-        assert!(!completion_ready(&changed));
+        assert_eq!(action_effect(&pages, &changed)["resultsChanged"], true);
         changed = pages.clone(); changed["pages"][0]["items"][0]["dateValue"] = json!("2026-05-01");
         assert_ne!(result_signature(&pages), result_signature(&changed));
         changed = pages.clone(); changed["pages"][0]["tables"][0]["columns"] = json!([{"name":"DAU","sort":"ascending"}]);
@@ -2095,34 +1033,15 @@ mod tests {
         changed = pages.clone(); changed["pages"][0]["items"].as_array_mut().unwrap()
             .push(json!({"inView":true,"name":"Canada","role":"checkbox","selected":true}));
         assert_ne!(result_signature(&pages), result_signature(&changed));
-        let c: Value = serde_json::from_str(&completion_evidence(&changed).unwrap()).unwrap();
-        assert_eq!(c["pages"][0]["selectionFields"][0]["selected"], true);
-        assert_ne!(completion_evidence(&pages), completion_evidence(&changed), "a changed selection invalidates a yes verdict");
-        changed = pages.clone(); changed["pages"][0]["tables"][1]["rows"][0][0] = json!("x".repeat(40001));
-        assert!(completion_evidence(&changed).is_none(), "skip oversized proof instead of invalid requests or silent truncation");
-    }
-
-    #[test]
-    fn transition_tracks_controls_beyond_prompt_budget() {
-        let plan = plan(json!({"task":"查询","authorization":"查询","expectedText":"结果"}));
-        let mut items = vec![json!({"inView":true,"name":"x".repeat(7000)})];
-        items.push(json!({"nodeId":"menu","inView":true,"name":"PC & Console","actionable":false}));
-        let mut pages = json!({"pages":[{"items":items}]});
-        let before = transition_evidence(&pages, &plan);
-        pages["pages"][0]["items"][1]["ref"] = json!("fresh");
-        assert_eq!(before, transition_evidence(&pages, &plan));
-        pages["pages"][0]["items"][1]["actionable"] = json!(true);
-        assert_ne!(before, transition_evidence(&pages, &plan));
     }
 
     #[test]
     fn focusable_sort_icon_and_replay_state_survive_tooltip_changes() {
-        let plan = plan(json!({"task":"按销量排序","authorization":"排序","expectedText":"降序"}));
         let mut pages = json!({"pages":[{"frame":0,"url":"https://example.test/table","text":"table",
             "items":[{"ref":"icon","nodeId":"icon","role":"div","name":"","tabIndex":0,"inView":true,
                 "column":{"index":3,"name":"Digital Units"}},
                 {"ref":"pane","nodeId":"pane","role":"div","name":"table","tabIndex":0,"inView":true,"scroll":{}}]}]});
-        let available = hints(&pages, &plan, &HashSet::new());
+        let available = hints(&pages, &HashSet::new());
         assert_eq!(available.len(), 1);
         assert_eq!(available[0].action["ref"], "icon");
         assert!(available[0].key.contains("Digital Units"));
@@ -2130,168 +1049,42 @@ mod tests {
         pages["pages"][0]["text"] = json!("table tooltip definition");
         pages["pages"][0]["items"][0]["ref"] = json!("fresh");
         assert_eq!(state, replay_evidence(&pages));
-        assert!(hints(&pages, &plan, &HashSet::from([available[0].key.clone()])).is_empty());
+        assert!(hints(&pages, &HashSet::from([available[0].key.clone()])).is_empty());
         pages["pages"][0]["url"] = json!("https://example.test/table?order=desc");
         assert_ne!(state, replay_evidence(&pages));
     }
 
     #[test]
-    fn shortlist_prioritises_fills_fresh_popups_and_goal_names_within_budget() {
-        let plan = plan(json!({"task":"Change Region Global to United States then Confirm","authorization":"filter only","expectedText":"United States",
-            "inputs":[{"name":"Region search","text":"United"}]}));
-        let word = |n: usize| format!("x{}{}", (b'a' + (n / 26) as u8) as char, (b'a' + (n % 26) as u8) as char);
-        let mut items: Vec<Value> = (0..120).map(|n| json!({"name":word(n),"role":"button","ref":format!("r{n}"),"nodeId":format!("d:{n}"),"inView":true})).collect();
-        items.extend([json!({"name":"Confirm","role":"button","ref":"confirm","nodeId":"d:c","inView":true}),
-            json!({"name":"United States","role":"option","ref":"us","nodeId":"d:us","inView":true}),
-            json!({"name":"Canada","role":"option","ref":"ca","nodeId":"d:ca","inView":true}),
-            json!({"name":"Region search","role":"input","editable":true,"ref":"search","nodeId":"d:s","inView":true})]);
-        let pages = json!({"pages":[{"frame":0,"items":items}]});
-        let mut all = hints(&pages, &plan, &HashSet::new());
-        let baseline: HashSet<String> = all.iter().filter(|c| c.action["ref"] != "ca").map(|c| c.loose.clone()).collect();
-        for c in &mut all { c.fresh = !baseline.contains(&c.loose); }
-        let batch = shortlist(&all, &plan, &HashSet::new());
-        let list = &batch.list;
-        assert!(batch.groups.is_empty());
-        assert_eq!(list.len(), SHORTLIST);
-        for target in ["confirm", "us", "ca", "search"] { assert!(list.values().any(|c| c.action["ref"] == target), "{target}"); }
-        assert!(list.values().any(|c| c.kind() == "fill" && c.action["text"] == "United"));
-        assert!(list.keys().zip(list.keys().skip(1)).all(|(a, b)| a < b));
-        let shown: HashSet<String> = batch.covered.into_iter().collect();
-        let next = shortlist(&all, &plan, &shown);
-        assert_eq!(next.list.len(), all.len() - SHORTLIST + 1, "unseen hints plus the always-available fill");
-        assert!(next.list.values().all(|c| !shown.contains(&c.key) || c.kind() == "fill"));
-    }
-
-    #[test]
-    fn calendar_cells_collapse_so_preset_shortcuts_stay_visible() {
-        let plan = plan(json!({"task":"筛选近半年","authorization":"筛选","expectedText":"近半年",
-            "inputs":[{"name":"Week ~ [field 1/2]","text":"2026-03-19"}]}));
-        let mut items: Vec<Value> = (1..=31).map(|d| json!({"name":d.to_string(),"role":"gridcell","actionable":true,
-            "ref":format!("d{d}"),"nodeId":format!("doc:{d}"),"inView":true})).collect();
-        items.push(json!({"name":"2026-03-19","role":"gridcell","actionable":true,"ref":"exact","nodeId":"doc:exact","inView":true}));
-        items.extend(["Last 7 Days","Last 4 Weeks","Last 26 Weeks","Last 52 Weeks"].iter().enumerate()
-            .map(|(n, name)| json!({"name":name,"role":"button","ref":format!("p{n}"),"nodeId":format!("doc:p{n}"),"inView":true})));
-        let mut all = hints(&json!({"pages":[{"frame":0,"items":items}]}), &plan, &HashSet::new());
-        for c in &mut all { c.fresh = true; }
-        let batch = shortlist(&all, &plan, &HashSet::new());
-        assert_eq!(batch.groups.len(), 1);
-        let (label, members) = &batch.groups["g01"];
-        assert_eq!(members.len(), 31);
-        assert!(label.contains("[新]") && label.contains("31"));
-        assert!(batch.list.values().any(|c| c.name == "last 26 weeks"));
-        assert!(batch.list.values().any(|c| c.action["ref"] == "exact"), "goal-named cells stay individually selectable");
-        assert_eq!(batch.covered.len(), all.len());
-    }
-
-    #[test]
-    fn copied_field_context_binds_and_dates_stay_with_altair() {
-        let context = "Overall Global Global except China mainland Region Select All Africa (52)";
-        let plan = plan(json!({"task":"美国近半年","authorization":"筛选","expectedText":"美国","inputs":[
-            {"name":"Search","role":"input","fieldContext":&context[..40],"text":"United States"},
-            {"name":"Select date","fieldContext":"Week ~ [field 1/2]","text":"2026-03-20"},
-            {"name":"Select date","fieldContext":"Day ~ [field 1/2]","text":"2026-03-20"}]}));
-        let pages = json!({"pages":[{"frame":0,"focus":{"identity":1},"items":[
-            {"ref":"region","nodeId":"doc:3","name":"Search","role":"input","fieldContext":context,"editable":true,"inView":true},
-            {"ref":"global","nodeId":"doc:4","name":"Search","role":"input","fieldContext":"Top bar","editable":true,"inView":true},
-            {"ref":"week","nodeId":"doc:1","name":"Select date","role":"input","fieldContext":"Week ~ [field 1/2]","editable":true,"inView":true,"value":""},
-            {"ref":"day","nodeId":"doc:2","name":"Select date","role":"input","fieldContext":"Day ~ [field 1/2]","editable":true,"inView":true,"value":""}]}]});
-        let fills: Vec<Candidate> = hints(&pages, &plan, &HashSet::new()).into_iter().filter(|c| c.kind() == "fill").collect();
-        assert_eq!(fills.iter().map(|c| c.action["ref"].as_str().unwrap()).collect::<Vec<_>>(), ["region", "week", "day"]);
-        assert_eq!(fills.iter().filter(|c| !date_like(c)).map(|c| c.action["ref"].as_str().unwrap()).collect::<Vec<_>>(), ["region"]);
-        assert!(parse(&json!({"plan":{"task":"t","authorization":"a","expectedText":"e","inputs":[{"fieldContext":"Week","text":"x"}]}})).is_ok());
-    }
-
-    #[test]
-    fn goal_values_become_search_input_only_for_the_panel_named_with_them() {
+    fn goal_phrases_pick_quoted_and_title_case_values() {
         let phrases = goal_phrases("Region 改为 \"United States\"，数据源 M Science，按Digital Units降序");
         for p in ["United States", "M Science", "Digital Units", "Region"] { assert!(phrases.iter().any(|x| x == p), "{p} in {phrases:?}"); }
-        let plan = plan(json!({"task":"2) Region 从当前 Global 改为 United States（美国）；3) 点 Confirm","authorization":"筛选","expectedText":"United States"}));
-        let pages = json!({"pages":[{"frame":0,"visibleText":"Region Global\nAfrica (52)\nNorth America (8)\nConfirm\nSearch any game or company","items":[
-            {"ref":"region","nodeId":"doc:1","name":"Search","role":"input","fieldContext":"Overall Global Region Select All Africa (52)","editable":true,"inView":true,"value":""},
-            {"ref":"global","nodeId":"doc:2","name":"Search any game or company","role":"input","editable":true,"inView":true,"value":""}]}]});
-        let all = hints(&pages, &plan, &HashSet::new());
-        let derived: Vec<&Candidate> = all.iter().filter(|c| c.derived).collect();
-        assert_eq!(derived.len(), 1, "only the Region panel box, never the site-wide search");
-        assert_eq!(derived[0].action["ref"], "region");
-        assert_eq!(derived[0].action["text"], "United States");
-        assert!(choice_description(derived[0]).contains("来自任务文字"));
-        let mut typed = pages.clone(); typed["pages"][0]["items"][0]["value"] = json!("United States");
-        assert!(hints(&typed, &plan, &HashSet::new()).iter().all(|c| !c.derived), "no re-typing once entered");
-        assert!(evidence(&typed, &plan).contains("\"value\":\"United States\""), "typed goal value is visible to Altair");
-        let mut listed = pages.clone(); listed["pages"][0]["visibleText"] = json!("Region Global\nUnited States\nConfirm");
-        assert!(hints(&listed, &plan, &HashSet::new()).iter().all(|c| !c.derived), "visible options are clicked, not searched");
     }
 
     #[test]
-    fn comma_continuation_keeps_region_search_scoped() {
-        let pages = json!({"pages":[{"frame":0,"visibleText":"Region Global Source Company Search",
-            "items":[{"ref":"region","nodeId":"doc:1","name":"Search","role":"input",
-                "fieldContext":"Overall Global Region Select All Africa","editable":true,"inView":true,"value":""},
-                {"ref":"source","nodeId":"doc:2","name":"Search","role":"input",
-                "fieldContext":"Source","editable":true,"inView":true,"value":""},
-                {"ref":"global","nodeId":"doc:3","name":"Search any game or company","role":"input",
-                "editable":true,"inView":true,"value":""}]}]});
-        let p = plan(json!({"task":"在Mobile Games Active Users页面，点击顶部筛选栏的Region下拉框（当前显示Global），在弹出的下拉列表中选择「United States」，Source 改为 M Science"}));
-        let derived: Vec<Candidate> = hints(&pages, &p, &HashSet::new()).into_iter().filter(|c| c.derived).collect();
-        assert_eq!(derived.len(), 2);
-        assert!(derived.iter().any(|c| c.action["ref"] == "region" && c.action["text"] == "United States"));
-        assert!(derived.iter().any(|c| c.action["ref"] == "source" && c.action["text"] == "M Science"));
-        for task in ["打开 Region。选择「United States」", "打开 Region，Company 选择「Acme」"] {
-            let p = plan(json!({"task":task}));
-            assert!(!hints(&pages, &p, &HashSet::new()).iter().any(|c| c.derived && c.action["ref"] == "region"));
-        }
-    }
-
-    #[test]
-    fn expected_value_binds_only_to_one_task_scoped_search() {
-        let p = plan(json!({"task":"点击 Region（地区）展开地区选择面板",
-            "expectedText":"区域筛选变为 United States（或 United States 已被选中）"}));
-        let mut pages = json!({"pages":[{"frame":0,"visibleText":"Region Global","items":[
-            {"ref":"region","name":"Search","role":"input","fieldContext":"Overall Global Region Select All","editable":true,"inView":true},
-            {"ref":"global","name":"Search any game or company","role":"input","editable":true,"inView":true}]}]});
-        let inputs: Vec<Candidate> = hints(&pages, &p, &HashSet::new()).into_iter().filter(|c| c.derived).collect();
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].action["ref"], "region");
-        assert_eq!(inputs[0].action["text"], "United States");
-        let mut typed = pages.clone();
-        typed["pages"][0]["items"][0]["value"] = json!("United States");
-        typed["pages"][0]["items"][0]["fieldContext"] = json!("United States");
-        let more = plan(json!({"task":"Region=United States 日期=Last 180 Days"}));
-        assert!(hints(&typed, &more, &HashSet::new()).iter().all(|c| !c.derived), "do not type the date preset into an already-correct region search");
-        let mut duplicate = pages["pages"][0]["items"][0].clone(); duplicate["ref"] = json!("another-region");
-        pages["pages"][0]["items"].as_array_mut().unwrap().push(duplicate);
-        assert!(hints(&pages, &p, &HashSet::new()).iter().all(|c| !c.derived), "ambiguous expectedText requires explicit inputs");
-    }
-
-    #[test]
-    fn header_icons_are_labelled_as_sort_entries_and_text_as_tooltip() {
-        let plan = plan(json!({"task":"按 Digital Units 降序","authorization":"排序","expectedText":"降序"}));
+    fn header_icons_are_labelled_with_column_and_group() {
         let pages = json!({"pages":[{"frame":0,"items":[
             {"ref":"text","nodeId":"doc:1","name":"Digital Units","role":"th","actionable":true,"inView":true,"column":{"name":"Digital Units","index":3,"group":"M Science"}},
             {"ref":"icon","nodeId":"doc:2","name":"","role":"span","actionable":true,"inView":true,"icon":"sort caret","column":{"name":"Digital Units","index":3,"group":"M Science"}}]}]});
-        let all = hints(&pages, &plan, &HashSet::new());
+        let all = hints(&pages, &HashSet::new());
         let icon = all.iter().find(|c| c.action["ref"] == "icon").unwrap();
         for part in ["无名表头图标", "icon=sort caret", "列=Digital Units#3", "分组=M Science"] { assert!(icon.label.contains(part), "{part}: {}", icon.label); }
-        assert!(choice_description(icon).contains("表头排序图标"));
-        assert!(choice_description(all.iter().find(|c| c.action["ref"] == "text").unwrap()).contains("释义"));
     }
 
     #[test]
     fn action_effect_separates_tooltips_state_changes_and_no_ops() {
-        let plan = plan(json!({"task":"排序","authorization":"排序","expectedText":"降序"}));
         let before = json!({"pages":[{"frame":0,"url":"https://x.test/a","visibleText":"Top Charts\nDigital Units","items":[
             {"ref":"h","nodeId":"doc:1","name":"Digital Units","role":"th","actionable":true,"inView":true,"sort":"none"}]}]});
-        assert!(action_effect(&before, &before, &plan)["summary"].as_str().unwrap().contains("没有可见变化"));
+        assert!(action_effect(&before, &before)["summary"].as_str().unwrap().contains("没有可见变化"));
         let mut tooltip = before.clone();
         tooltip["pages"][0]["visibleText"] = json!("Top Charts\nDigital Units\nDefinition: Game units made through online purchase");
-        let effect = action_effect(&before, &tooltip, &plan);
+        let effect = action_effect(&before, &tooltip);
         assert_eq!(effect["summary"], "");
         assert!(effect["newText"][0].as_str().unwrap().starts_with("Definition"));
         assert_eq!(effect["changed"], json!([]));
         let mut sorted = before.clone();
         sorted["pages"][0]["items"][0]["sort"] = json!("descending");
         sorted["pages"][0]["url"] = json!("https://x.test/a?order=desc");
-        let effect = action_effect(&before, &sorted, &plan);
+        let effect = action_effect(&before, &sorted);
         assert!(effect["changed"][0].as_str().unwrap().contains("sort=descending"));
         assert_eq!(effect["url"], "https://x.test/a?order=desc");
     }
@@ -2304,143 +1097,42 @@ mod tests {
     }
 
     #[test]
-    fn decision_tree_rebuilds_scroll_into_click_without_stale_leaves() {
-        let pages = json!({"pages":[{"items":[{"name":"Confirm","inView":true,"blockedBy":"Region"}]}]});
-        let scroll = Candidate::new(json!({"action":"scroll"}), json!("s"), json!("s"), String::new(), "", "");
-        let mut list = BTreeMap::from([("a01".to_string(), scroll)]);
-        let choices = BTreeMap::from([("a01".to_string(), String::new()), ("observe".into(), String::new()), ("done".into(), String::new())]);
-        let first = decision_tree(&pages, &list, &choices, 1);
-        assert_eq!(first["branches"][1]["leaves"], json!(["a01"]));
-        assert_eq!(first["obstacles"][0]["blockedBy"], "Region");
-        list.insert("a01".into(), Candidate::new(json!({"action":"click","ref":"fresh"}), json!("c"), json!("c"), String::new(), "", ""));
-        let next = decision_tree(&json!({"pages":[]}), &list, &choices, 2);
-        assert_eq!(next["revision"], 2);
-        assert_eq!(next["branches"][0]["leaves"], json!(["a01"]));
-        assert_eq!(next["branches"][1]["leaves"], json!([]));
-    }
-
-    #[test]
-    fn date_picker_and_descriptive_search_input_survive_compact_decisions() {
-        let plan = plan(json!({"task":"选择近半年美国数据","authorization":"筛选","expectedText":"United States",
-            "inputs":[{"name":"Overall Global Region","role":"input","text":"United States"}]}));
-        let pages = json!({"pages":[{"frame":0,"text":"noise".repeat(5000),"visibleText":"Region Global\nSearch\nGlobal\nAfrica\nConfirm",
-            "items":[{"name":"Select date","role":"input","editable":true,"ref":"date","inView":true},
-            {"name":"Search","role":"input","editable":true,"ref":"search","inView":true,"fieldContext":"Overall Global Region"},
-            {"name":"Select date","role":"input","editable":false,"tabIndex":0,"ref":"release","inView":true,"fieldContext":"Release Date ~ [field 1/2]"}]}]});
-        let all = hints(&pages, &plan, &HashSet::new());
-        assert!(all.iter().any(|c| c.kind() == "click" && c.action["ref"] == "date"));
-        assert!(all.iter().any(|c| c.kind() == "fill" && c.action["ref"] == "search" && c.action["text"] == "United States"));
-        assert!(all.iter().find(|c| c.action["ref"] == "release").unwrap().key.contains("Release Date ~ [field 1/2]"));
-        assert!(all.iter().all(|c| c.action["ref"] != "release" || c.kind() != "fill"));
-        let batch = shortlist(&all, &plan, &HashSet::new());
-        let compact = decision_evidence(&pages, &plan, &batch.list);
-        assert!(compact.contains("Region Global")); assert!(!compact.contains("noise")); assert!(compact.len() < 2500);
-    }
-
-    #[test]
-    fn filled_focused_field_offers_enter_instead_of_refill() {
-        let plan = plan(json!({"task":"搜索订单","authorization":"只读搜索","expectedText":"结果","inputs":[{"name":"关键词","text":"订单"}]}));
-        let mut pages = json!({"pages":[{"frame":0,"focus":{"identity":7},"items":[
-            {"ref":"q","nodeId":"doc:7","name":"关键词","role":"input","editable":true,"inView":true,"value":"订单"}]}]});
-        let all = hints(&pages, &plan, &HashSet::new());
-        assert!(all.iter().any(|c| c.kind() == "press" && c.action["key"] == "Enter"));
-        assert!(all.iter().all(|c| c.kind() != "fill"));
-        pages["pages"][0]["focus"]["identity"] = json!(8);
-        assert!(hints(&pages, &plan, &HashSet::new()).iter().all(|c| c.kind() != "press"));
-    }
-
-    #[test]
-    fn fill_identity_survives_normalization_popup_and_snapshot_changes() {
-        let mut pages = json!({"pages":[{"frame":0,"items":[{"ref":"old","nodeId":"doc:1","fieldContext":"Week start","value":"2026-03-23"}]}]});
-        let mut action = json!({"action":"fill","frame":0,"ref":"old","text":"2026-03-23"});
-        let id = fill_identity(&pages, &action).unwrap();
-        pages["pages"][0]["items"][0]["value"] = json!("2026-03-22");
-        pages["pages"][0]["items"][0]["ref"] = json!("fresh");
-        pages["pages"][0]["items"].as_array_mut().unwrap().push(json!({"name":"Search","nodeId":"new-popup"}));
-        action["ref"] = json!("fresh");
-        assert_eq!(fill_identity(&pages, &action).unwrap(), id);
-        action["text"] = json!("2026-03-15");
-        assert_ne!(fill_identity(&pages, &action).unwrap(), id);
-        let checkbox = |selected: bool| Candidate::new(json!({"action":"click"}), json!({"action":"click","role":"checkbox","selected":selected}), json!(0), String::new(), "", "");
-        assert!(choice_description(&checkbox(true)).contains("取消选中"));
-        assert!(choice_description(&checkbox(false)).contains("全部子项"));
-    }
-
-    #[test]
-    fn selection_and_date_evidence_survive_dom_budget() {
-        let plan = plan(json!({"task":"Only United States","authorization":"Change filters","expectedText":"United States only"}));
-        let mut items = vec![json!({"name":"noise","inView":true,"dateValue":""}); 100];
-        items.extend([
-            json!({"name":"Canada","role":"checkbox","inView":true,"selected":true}),
-            json!({"name":"United States","role":"checkbox","inView":true,"selected":false}),
-            json!({"name":"Select date","inView":true,"fieldContext":"Week ~ [field 2/2]","dateValue":"2026-09-19"}),
-        ]);
-        let state = decision_evidence(&json!({"pages":[{"items":items}]}), &plan, &BTreeMap::new());
-        let first_line = state.lines().next().unwrap();
-        let locations: Value = serde_json::from_str(first_line.strip_prefix("当前页面及加载/结果状态：").unwrap()).unwrap();
-        assert_eq!(locations[0]["selectionFields"][0]["selected"], true);
-        assert_eq!(locations[0]["selectionFields"][1]["name"], "United States");
-        assert!(state.contains("2026-09-19"));
-    }
-
-    #[test]
-    fn date_inputs_never_become_search_candidates() {
-        let mut args = json!({"plan":{"task":"半年美国","authorization":"筛选","expectedText":"美国",
-            "inputs":[{"name":"date range start (近半年开始，日期范围第一个输入框)","text":"2026-03-23"}]}});
-        let mut pages = json!({"pages":[{"frame":0,"items":[
-            {"ref":"date","name":"Select date","fieldContext":"Week ~ [field 1/2]","role":"input","editable":true,"inView":true},
-            {"ref":"region","name":"Search","fieldContext":"Overall Global Region","role":"input","editable":true,"inView":true},
-            {"ref":"global","name":"Search any game or company","role":"input","editable":true,"inView":true}]}]});
-        let fills = |pages: &Value, args: &Value| hints(pages, &parse(args).unwrap(), &HashSet::new())
-            .into_iter().filter(|c| c.kind() == "fill").map(|c| c.action["ref"].clone()).collect::<Vec<_>>();
-        assert!(fills(&pages, &args).is_empty(), "unbound descriptions must not authorize arbitrary fields");
-        args["plan"]["inputs"][0]["name"] = json!("Week ~ [field 1/2]");
-        assert_eq!(fills(&pages, &args), vec![json!("date")]);
-        let mut duplicate = pages["pages"][0]["items"][0].clone(); duplicate["ref"] = json!("duplicate");
-        pages["pages"][0]["items"].as_array_mut().unwrap().push(duplicate);
-        assert!(fills(&pages, &args).is_empty(), "duplicate contexts must not be guessed");
-    }
-
-    #[test]
-    fn semantic_inputs_keep_authorized_values_and_skip_passwords() {
-        let mut args = json!({"plan":{"task":"发布","authorization":"填写分支","expectedText":"成功",
-            "inputs":[{"name":"GIT_BRANCH","text":"version/260924/main"}]}});
+    fn authorized_text_binds_to_its_field_and_passwords_are_never_offered() {
         let pages = json!({"pages":[{"frame":1,"items":[
             {"ref":"branch","nodeId":"doc:1","name":"","role":"input","fieldContext":"GIT_BRANCH","editable":true,"inView":true},
-            {"ref":"unknown","name":"","role":"input","editable":true,"inView":true},
             {"ref":"secret","name":"GIT_BRANCH","role":"input","password":true,"editable":true,"inView":true}]}]});
-        let all = hints(&pages, &parse(&args).unwrap(), &HashSet::new());
-        let fills: Vec<_> = all.iter().filter(|c| c.kind() == "fill").collect();
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].action["ref"], "branch");
-        assert_eq!(fills[0].action["text"], "version/260924/main");
-        args["plan"]["inputs"][0]["role"] = json!("textarea");
-        assert!(hints(&pages, &parse(&args).unwrap(), &HashSet::new()).iter().all(|c| c.kind() != "fill"));
-        args["plan"]["inputs"][0]["name"] = json!("");
-        args["plan"]["inputs"][0].as_object_mut().unwrap().remove("role");
-        assert!(parse(&args).is_err());
+        let all = hints(&pages, &HashSet::new());
+        assert_eq!(all.len(), 1);
+        assert!(all[0].editable && all[0].kind() == "click" && all[0].action["ref"] == "branch");
+        let p = plan(json!({"task":"发布","inputs":[{"name":"GIT_BRANCH","text":"version/260924/main"}],
+            "steps":[{"action":"fill","target":"GIT_BRANCH 输入框","text":"version/260924/main"}]}));
+        assert_eq!(rank_for_step(&p.steps[0], &p, &all).len(), 1);
+        assert_eq!(bound(&p, 0, &pages).unwrap().action, json!({"action":"fill","frame":1,"ref":"branch","text":"version/260924/main"}));
+        let mut args = json!({"plan":{"task":"t","steps":[{"action":"press","key":"Enter"}],"inputs":[{"name":"","text":"x"}]}});
+        assert!(parse(&args).is_err(), "nameless inputs need a role or fieldContext");
+        args["plan"]["inputs"][0]["fieldContext"] = json!("Week ~ [field 1/2]");
+        assert!(parse(&args).is_ok());
     }
 
     #[test]
-    fn waits_are_bounded_and_used_actions_are_not_replayed() {
-        assert_eq!(observation_delay(Duration::ZERO).unwrap(), POLL);
-        assert_eq!(observation_delay(Duration::from_millis(14900)).unwrap(), Duration::from_millis(100));
-        assert!(observation_delay(Duration::from_secs(15)).is_err());
-        let plan = plan(json!({"task":"提交","authorization":"提交一次","expectedText":"新结果"}));
+    fn used_actions_are_not_replayed_and_plans_are_bounded() {
         let pages = json!({"pages":[{"frame":0,"url":"https://example.test/","items":[
             {"name":"提交","role":"button","ref":"r","nodeId":"doc:1","inView":true}]}]});
-        let used = hints(&pages, &plan, &HashSet::new()).into_iter().map(|c| c.key).collect();
+        let used = hints(&pages, &HashSet::new()).into_iter().map(|c| c.key).collect();
         let mut fresh = pages.clone(); fresh["pages"][0]["items"][0]["ref"] = json!("fresh");
-        assert!(hints(&fresh, &plan, &used).is_empty());
-        assert_eq!(evidence(&pages, &plan), evidence(&fresh, &plan));
-        let mut args = json!({"plan":{"task":"t","authorization":"a","expectedText":"e"}});
+        assert!(hints(&fresh, &used).is_empty());
+        let step = json!({"action":"press","key":"Enter"});
+        let mut args = json!({"plan":{"task":"t","authorization":"a","expectedText":"e","steps":[step]}});
         assert_eq!(parse(&args).unwrap().max_actions, 32);
         for invalid in [0, 65] { args["plan"]["maxActions"] = json!(invalid); assert!(parse(&args).is_err()); }
+        args["plan"]["maxActions"] = json!(8);
+        args["plan"]["steps"] = json!(vec![step; 25]);
+        assert!(parse(&args).is_err());
         assert!(origin(&json!({"pages":[{"url":"file:///tmp/x"}]})).is_err());
     }
 
     #[tokio::test]
-    async fn altair_trusted_action_scope_does_not_leak_to_other_tasks_or_after_return() {
+    async fn run_action_scope_does_not_leak_to_other_tasks_or_after_return() {
         assert!(!executing_browser_action());
         BROWSER_ACTION.scope(true, async {
             tokio::task::yield_now().await;
@@ -2452,24 +1144,23 @@ mod tests {
 
     #[test]
     fn dom_scroll_hints_follow_real_remaining_space_without_coordinates() {
-        let plan = plan(json!({"task":"find next record","authorization":"read","expectedText":"record"}));
         let pages = json!({"pages":[{"frame":0,"url":"https://example.test/","viewport":{"scrollY":0,"height":600},
             "documentSize":{"height":1800},"items":[{"ref":"list","nodeId":"d:1","name":"Results","role":"div",
                 "inView":true,"scroll":{"top":200,"height":1000,"viewportHeight":200}}]}]});
-        let all = hints(&pages, &plan, &HashSet::new());
+        let all = hints(&pages, &HashSet::new());
         assert_eq!(all.len(), 3);
         assert!(all.iter().all(|c| c.kind() == "scroll" && c.action["x"].is_null()));
         assert_eq!(all.iter().filter(|c| c.action["ref"].is_null() && c.action["delta"] == 480).count(), 1);
         let used = all.iter().map(|c| c.key.clone()).collect();
-        assert!(hints(&pages, &plan, &used).is_empty());
+        assert!(hints(&pages, &used).is_empty());
         let mut next = pages.clone(); next["pages"][0]["viewport"]["scrollY"] = json!(1200);
-        let remaining = hints(&next, &plan, &used);
+        let remaining = hints(&next, &used);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].action["delta"], -480);
     }
 
     fn bound(plan: &Plan, index: usize, pages: &Value) -> Option<Candidate> {
-        let all = hints(pages, plan, &HashSet::new());
+        let all = hints(pages, &HashSet::new());
         let ranked = step_ranking(&plan.steps[index], &all);
         let (best, top) = *ranked.first()?;
         step_confident(best, ranked.get(1).map(|r| r.0)).then(|| bind_step(&plan.steps[index], index, top))
@@ -2509,7 +1200,7 @@ mod tests {
             {"ref":"us","nodeId":"d:6","name":"United States","role":"checkbox","selected":false,"inView":true},
             {"ref":"ca","nodeId":"d:7","name":"Canada","role":"checkbox","selected":false,"inView":true}]}]});
         assert_eq!(bound(&goal, 2, &region).unwrap().action["ref"], "us");
-        // Ambiguity is never guessed locally: two equally named controls go to Altair / the main model.
+        // Ambiguity is never guessed locally: two equally named controls go back to the main model.
         let twins = json!({"pages":[{"frame":0,"items":[
             {"ref":"a","nodeId":"d:8","name":"United States","role":"checkbox","inView":true,"region":"Record A"},
             {"ref":"b","nodeId":"d:9","name":"United States","role":"checkbox","inView":true,"region":"Record B"}]}]});
@@ -2527,8 +1218,8 @@ mod tests {
             {"ref":"global","nodeId":"g:1","name":"Search any game or company","role":"input","editable":true,"inView":true},
             {"ref":"panel","nodeId":"p:1","name":"Search","role":"input","editable":true,"inView":true,
                 "fieldContext":"Overall Global Global except China mainland Region Select All Africa (52)"}]}]});
-        let all = hints(&pages, &plan, &HashSet::new());
-        // The authorized text exists only on its own field: the global box is not even offered.
+        let all = hints(&pages, &HashSet::new());
+        // The authorized text binds only to its own field: the global box is not even ranked.
         let ranked = rank_for_step(&plan.steps[0], &plan, &all);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].1.action["ref"], "panel");
@@ -2547,18 +1238,16 @@ mod tests {
         let pages = json!({"pages":[{"frame":0,"items":[
             {"ref":"c","nodeId":"c:1","name":"Confirm","role":"button","inView":true},
             {"ref":"g","nodeId":"g:1","name":"Germany","role":"checkbox","inView":true,"selected":true}]}]});
-        assert!(needs_commit(&plan(interagency), &history, &pages).is_some());
+        assert!(needs_commit(&plan(interagency.clone()), &history, &pages).is_some());
         // Summary pill shows the filter applied → quiet even with the box still ticked.
         let mut applied_pages = pages.clone();
         applied_pages["pages"][0]["items"].as_array_mut().unwrap().push(
             json!({"ref":"s","nodeId":"s:1","name":"Country/Market Germany","role":"div","inView":true}));
-        assert!(needs_commit(&plan(json!({"task":"选地区","authorization":"允许勾选 Germany；如有确认/Apply 按钮则点击它应用","expectedText":"Germany",
-            "steps":[{"action":"click","target":"Germany 选项"}]})), &history, &applied_pages).is_none());
+        assert!(needs_commit(&plan(interagency.clone()), &history, &applied_pages).is_none());
         // Clicked already → quiet.
         let mut done = history.clone();
         done.push(json!({"actions":["第2步 点击 \"Confirm\" [button]"],"status":"executed","completedActions":1,"effect":{}}));
-        assert!(needs_commit(&plan(json!({"task":"选地区","authorization":"允许勾选 Germany；如有确认/Apply 按钮则点击它应用","expectedText":"Germany",
-            "steps":[{"action":"click","target":"Germany 选项"}]})), &done, &pages).is_none());
+        assert!(needs_commit(&plan(interagency), &done, &pages).is_none());
         // A date-only run with Confirm merely somewhere on the page stays quiet.
         let date_run = json!({"task":"设时间","authorization":"允许填写日期；如有确认按钮则点它","expectedText":"2026-03-24",
             "steps":[{"action":"fill","target":"Week 起始日期框","text":"2026-03-24"}]});
@@ -2582,8 +1271,8 @@ mod tests {
             {"action":"click","target":"Confirm 按钮"},
             {"action":"press","key":"Enter"},
             {"action":"click","target":"排序图标","expect":"降序"}]}));
-        let checkbox = Candidate::new(json!({"action":"click"}), json!({"role":"checkbox"}), json!(0), String::new(), "", "");
-        let button = Candidate::new(json!({"action":"click"}), json!({"role":"button"}), json!(0), String::new(), "", "");
+        let checkbox = Candidate::new(json!({"action":"click"}), json!({"role":"checkbox"}), json!(0), String::new(), "");
+        let button = Candidate::new(json!({"action":"click"}), json!({"role":"button"}), json!(0), String::new(), "");
         assert!(chains(&plan.steps[0], &checkbox));
         assert!(chains(&plan.steps[1], &checkbox));
         assert!(!chains(&plan.steps[2], &button));
@@ -2599,7 +1288,6 @@ mod tests {
 
     #[test]
     fn semantic_controls_remain_available_beside_canvas() {
-        let plan = plan(json!({"task":"选择筛选","authorization":"允许筛选","expectedText":"结果"}));
         let pages = json!({"pages":[{"frame":0,"visualSuggested":true,"items":[
             {"ref":"r","name":"收入","role":"radio","inView":true},
             {"ref":"c","name":"仅已发布","role":"checkbox","inView":true},
@@ -2611,7 +1299,7 @@ mod tests {
             {"ref":"text","name":"普通文本","role":"div","inView":true},
             {"ref":"disabled","name":"不可用","role":"radio","disabled":true,"inView":true}
         ]}]});
-        let refs: HashSet<String> = hints(&pages, &plan, &HashSet::new()).iter().map(|c| c.action["ref"].as_str().unwrap().to_string()).collect();
+        let refs: HashSet<String> = hints(&pages, &HashSet::new()).iter().map(|c| c.action["ref"].as_str().unwrap().to_string()).collect();
         assert_eq!(refs, HashSet::from(["r", "c", "p", "s", "custom"].map(String::from)));
     }
 
@@ -2623,14 +1311,5 @@ mod tests {
         let e = &save["experience"];
         assert_eq!((e["steps"].as_array().unwrap().len(), e["conditions"][0].clone()), (7, json!("起始页面 /project/*/list")));
         assert!(!save.to_string().contains("secret-value"));
-    }
-    #[test]
-    fn graph_context_keeps_complete_routes_and_checks_within_budget() {
-        let route = json!({"id":"route-1","conditions":["已登录"],"steps":["查询订单"],"checks":["订单号匹配"]});
-        let result = graph_context(&json!({"graph":{"routes":[route.clone(),route.clone(),route.clone(),route.clone()]}}));
-        assert_eq!(result["routes"].as_array().unwrap().len(), 3);
-        assert_eq!(result["truncated"], true);
-        let oversized = graph_context(&json!({"graph":{"routes":[{"steps":["x".repeat(12001)]}]}}));
-        assert_eq!(oversized["routes"], json!([]));
     }
 }
