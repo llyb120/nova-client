@@ -15,7 +15,7 @@ mod bridge;
 pub(crate) mod config;
 mod context;
 mod edit;
-pub(crate) mod history;
+mod history;
 pub(crate) mod presets;
 mod prompt;
 pub(crate) mod provider;

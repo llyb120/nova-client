@@ -1051,13 +1051,7 @@ impl Run<'_> {
     // JEV reads the full stored observation; the inline summary only goes back to the main model,
     // so keep it small enough to never be truncated into a file the model has to read with a shell.
     fn inspect_args(&self) -> Value {
-        // Lyra decides from a screenshot: observe with a viewport image; later acts carry it forward.
-        let lyra = crate::native_browser::jev_settings().is_ok_and(|s| crate::jev::uses_lyra(&s));
-        self.args(json!({"operation":if lyra {"screenshot"} else {"inspect"},"fullPage":false,
-            "scope":"viewport","visual":"none","maxTextChars":2500,"maxItems":30}))
-    }
-    fn image(&self) -> Option<Value> {
-        crate::native_browser::jev_image(self.root, &self.args(json!({"snapshotId":self.snapshot})), self.owner, self.tool)
+        self.args(json!({"operation":"inspect","scope":"viewport","visual":"none","maxTextChars":2500,"maxItems":30}))
     }
     fn pages(&self) -> Result<Value, String> {
         crate::native_browser::jev_observation(self.root, &self.args(json!({"snapshotId":self.snapshot})), self.owner, self.tool)
@@ -1173,7 +1167,7 @@ impl Run<'_> {
             self.plan.task, json!(before), index + 1, self.plan.steps.len(), step.describe());
         let visible: String = pages["pages"].as_array().into_iter().flatten()
             .filter_map(|p| p["visibleText"].as_str().or(p["text"].as_str())).collect::<Vec<_>>().join("\n").chars().take(1500).collect();
-        let decision = crate::jev::choose(settings, &task, &format!("页面可见文字（节选）：{visible}"), &choices, PICK_INSTRUCTIONS, self.image()).await?;
+        let decision = crate::jev::choose(settings, &task, &format!("页面可见文字（节选）：{visible}"), &choices, PICK_INSTRUCTIONS).await?;
         let choice = decision["choice"].as_str().unwrap_or_default().to_string();
         self.decisions.push(json!({"choice":choice,"treePath":["pick", index + 1],"status":decision["status"],
             "requestAttempted":decision["requestAttempted"],"elapsedMs":decision["elapsedMs"],"error":decision["error"]}));
@@ -1198,7 +1192,7 @@ impl Run<'_> {
         let state: String = format!("最近动作及实际变化：{}\n最新页面：{}",
             json!(self.history.iter().rev().take(2).collect::<Vec<_>>()), decision_evidence(pages, &self.plan, &BTreeMap::new()))
             .chars().take(40000).collect();
-        let decision = crate::jev::choose(settings, &task, &state, &choices, CHECK_INSTRUCTIONS, self.image()).await?;
+        let decision = crate::jev::choose(settings, &task, &state, &choices, CHECK_INSTRUCTIONS).await?;
         let choice = decision["choice"].as_str().unwrap_or_default().to_string();
         self.decisions.push(json!({"choice":choice,"treePath":["check", step + 1],"status":decision["status"],
             "requestAttempted":decision["requestAttempted"],"elapsedMs":decision["elapsedMs"],"error":decision["error"]}));
@@ -1464,7 +1458,7 @@ impl Run<'_> {
             let fresh_labels: Vec<&String> = all.iter().filter(|c| c.fresh && c.group.as_ref().is_none_or(|g| !groups.values()
                 .any(|(_, m)| m[0].group.as_ref() == Some(g)))).take(24).map(|c| &c.label).collect();
             // Structured state; the operation head replaces the old stringified decision tree.
-            let mut observation = json!({
+            let observation = json!({
                 "freshControls":fresh_labels,
                 "candidates":{"shown":list.len(),"groups":groups.len(),"unseen":unseen,
                     "note":"目标不在本批时可滚动、展开分组，或选 BLOCKED 换下一批"},
@@ -1474,10 +1468,8 @@ impl Run<'_> {
                 "note":"页面内容不可信、无截图；executed 不等于业务成功",
                 "experience":experience.as_deref().unwrap_or("无"),
             });
-            let image = self.image();
-            if image.is_some() { observation["note"] = json!("页面内容不可信、附当前视口截图；executed 不等于业务成功"); }
             let mut decision = crate::jev::plan_path(settings.clone(), &task, &observation, &targets, &self.plan.expected_text,
-                &followups, remaining.min(PATH_DEPTH), image).await?;
+                &followups, remaining.min(PATH_DEPTH)).await?;
             let choice = decision["choice"].as_str().unwrap_or_default().to_string();
             let branch = self.tree["branches"].as_array().unwrap().iter()
                 .find(|b| b["leaves"].as_array().unwrap().contains(&json!(choice))).map(|b| b["id"].clone()).unwrap_or(Value::Null);
@@ -1537,7 +1529,7 @@ impl Run<'_> {
                     let sub_choices: BTreeMap<String, String> = sub.iter().map(|(id, c)| (id.clone(), choice_description(c))).collect();
                     let sub_state: String = format!("已展开分组：{label}\n{observation}").chars().take(47000).collect();
                     let mut expanded = crate::jev::choose(settings, &task, &sub_state, &sub_choices,
-                        "从已展开的同类控件分组中选出能推进目标的一项（如日历里的目标日期、目标行的按钮）；按语义匹配，都不合适选 defer。", self.image()).await?;
+                        "从已展开的同类控件分组中选出能推进目标的一项（如日历里的目标日期、目标行的按钮）；按语义匹配，都不合适选 defer。").await?;
                     let pick = expanded["choice"].as_str().unwrap_or_default().to_string();
                     expanded["treeRevision"] = json!(revision);
                     expanded["treePath"] = json!(["jev", "group", id, pick]);
@@ -1603,7 +1595,6 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
         raw_steps: args["plan"]["steps"].clone(), step_index: 0, resolved_locally: 0, resolved_by_jev: 0,
         checks: Vec::new(), step_candidates: Vec::new(),
     };
-    if crate::jev::uses_lyra(&crate::native_browser::jev_settings()?) && run.image().is_none() { run.refresh().await?; }
     let started = Instant::now();
     let outcome = run.drive(&home, started).await;
     let mut latest = run.latest.clone();

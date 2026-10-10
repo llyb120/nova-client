@@ -1960,8 +1960,7 @@ async fn execute_webview(root: &Path, args: &Value) -> Result<Value, String> {
     if operation == "advise" {
         let settings = jev_settings()?;
         if settings.jev_enabled { jev_observation(root, args, &thread_id, "webview")?; }
-        let image = jev_image(root, args, &thread_id, "webview");
-        let mut result = crate::jev::advise(settings, args, image).await?;
+        let mut result = crate::jev::advise(settings, args).await?;
         result["basedOnSnapshotId"] = args["snapshotId"].clone();
         return Ok(result);
     }
@@ -2035,15 +2034,6 @@ pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str, tool: &str
     Ok(observation.pages.clone())
 }
 
-/// 与 jev_observation 同一份有效观察的首张截图（Lyra 决策附图用）；无截图返回 None。
-pub(crate) fn jev_image(root: &Path, args: &Value, owner: &str, tool: &str) -> Option<Value> {
-    let key = jev_observation_key(root, args, owner, tool).ok()?;
-    let path = APP.get()?.state::<BrowserState>().observations.lock().unwrap().get(&key)
-        .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))?
-        .images.first()?.path.clone();
-    crate::jev::image_part(&path)
-}
-
 fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashMap<String, Observation>) -> Result<Value, String> {
     let mut args = args.as_object().cloned().ok_or("chrome 参数必须是对象")?;
     match args.get("operation").and_then(Value::as_str).unwrap_or_default() {
@@ -2107,8 +2097,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
                 .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
                 .ok_or("JEV 辅助判断需本会话该标签最新观察（180秒内）")?;
         }
-        let image = jev_image(root, args, owner, "chrome");
-        let mut result = crate::jev::advise(settings, args, image).await?;
+        let mut result = crate::jev::advise(settings, args).await?;
         result["basedOnSnapshotId"] = args["snapshotId"].clone();
         return Ok(result);
     }
