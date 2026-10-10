@@ -1262,6 +1262,7 @@ pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Va
 
 async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> {
     let owner = crate::native_browser::tool_owner(root, owner)?;
+    if args["operation"] == "advise" { return Ok(crate::altair::disabled_advice(args)); }
     if matches!(args["operation"].as_str(), Some("act" | "run")) && has_target(args) {
         return vision_act(owner, args).await;
     }
@@ -1270,7 +1271,12 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
         let actions = args["actions"].as_array().filter(|a| !a.is_empty() && a.len() <= 16).ok_or("run 需1–16个已确认动作")?;
         let act = json!({"operation":"act","snapshotId":args["snapshotId"],"imageId":args["imageId"],
             "actions":actions,"feedback":args.get("feedback").cloned().unwrap_or(json!("screenshot"))});
-        return tokio::task::spawn_blocking(move || run(owner, act)).await.map_err(err)?;
+        return tokio::task::spawn_blocking(move || {
+            let mut result = run(owner, act)?;
+            result["altairRun"] = json!({"status":"handoff","requestCount":0,"executedActions":result["completedActions"],
+                "verification":"unverified","reason":"桌面 run 与 act 等价，主模型核对新截图"});
+            Ok(result)
+        }).await.map_err(err)?;
     }
     let args = args.clone();
     tokio::task::spawn_blocking(move || {

@@ -53,8 +53,13 @@ test('Altair is a vision proxy: the main model decides, run only executes its st
     assert.match(browser.description,/截图不再发给你/);
     assert.match(browser.description,/所有判断由你决定，Altair只负责看/);
     assert.match(browser.description,/升序前N不能替换为最高N项倒序展示/);
-    assert.doesNotMatch(browser.description,/JEV|advise|runTemplate|DOM排障/);
-    assert.deepEqual(browser.inputSchema.properties.plan.required,['task','steps']);
+    assert.doesNotMatch(browser.description,/JEV|runTemplate|DOM排障/);
+    assert.deepEqual(browser.inputSchema.properties.plan.required,['task']);
+    assert.equal(browser.inputSchema.properties.plan.properties.steps.minItems,0,'legacy goal-only calls must reach the disabled handoff');
+    assert(browser.inputSchema.properties.plan.properties.controlNames);
+    assert(browser.inputSchema.properties.plan.properties.useExperience);
+    assert.match(browser.inputSchema.properties.plan.description,/缺省或空steps返回handoff/);
+    assert.match(browser.inputSchema.properties.plan.description,/开启时steps必填/);
     assert.equal(browser.inputSchema.properties.action.properties.target.maxLength,300);
     assert.equal(browser.inputSchema.properties.actions.items.properties.target.maxLength,300);
     assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
@@ -69,8 +74,9 @@ test('Altair is a vision proxy: the main model decides, run only executes its st
   assert.equal(chrome.inputSchema.properties.plan.properties.inputs.maxItems,8);
   assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.required,['action']);
   for(const tool of [chrome,webview,jianlai]) {
-    assert(!tool.inputSchema.properties.operation.enum.includes('advise'));
-    assert.equal(tool.inputSchema.properties.advice,undefined);
+    assert(tool.inputSchema.properties.operation.enum.includes('advise'));
+    assert.match(tool.inputSchema.properties.advice.description,/始终返回 disabled/);
+    assert.match(tool.description,/Altair关闭时：原图直接交给你看/);
     assert(tool.inputSchema.properties.operation.enum.includes('run'));
     assert.deepEqual(tool.inputSchema.properties.vision.enum,['auto','raw']);
     assert.equal(tool.inputSchema.properties.look.maxLength,500);

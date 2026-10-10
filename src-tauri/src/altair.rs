@@ -181,14 +181,21 @@ fn has_images(result: &Value) -> bool {
 pub(crate) async fn filter(args: &Value, mut result: Value) -> Value {
     if args["vision"] == "raw" || !has_images(&result) { return result; }
     let Ok(settings) = crate::native_browser::altair_settings() else { return result };
-    if !settings.altair_enabled { return result; }
     see(&settings, &mut result, args["look"].as_str().filter(|s| !s.trim().is_empty())).await;
     result
+}
+
+/// Compatibility for old tool calls. Decision delegation stays disabled; no model is contacted.
+pub(crate) fn disabled_advice(args: &Value) -> Value {
+    json!({"status":"disabled","advisoryOnly":true,"requestAttempted":false,"elapsedMs":0,
+        "basedOnSnapshotId":args["snapshotId"],
+        "next":"辅助决策已关闭，由主模型继续判断；操作用 act 或带 steps 的 run。"})
 }
 
 /// Replaces a tool result's screenshots with Altair's description, answer and target list.
 /// On any failure the images stay attached, so the main model is never left blind.
 pub(crate) async fn see(settings: &Settings, result: &mut Value, look: Option<&str>) {
+    if !settings.altair_enabled { return; }
     let started = std::time::Instant::now();
     let images: Vec<Value> = result["images"].as_array().into_iter().flatten()
         .filter(|i| i["path"].is_string()).take(4).cloned().collect();
@@ -283,6 +290,15 @@ mod tests {
         let path = dir.path().join("shot.png");
         xcap::image::RgbImage::new(64, 32).save(&path).unwrap();
         let original = json!({"snapshotId":"s1","path":path,"images":[{"imageId":"window-1","path":path}]});
+        // Explicitly disabled, even with a model selected: no request, no text replacement or error.
+        let mut disabled = original.clone();
+        see(&Settings { altair_enabled: false, altair_model: "must-not-be-called".into(), ..Settings::default() },
+            &mut disabled, Some("读标题")).await;
+        assert_eq!(disabled, original);
+        let advice = disabled_advice(&json!({"snapshotId":"s1"}));
+        assert_eq!(advice["status"], "disabled");
+        assert_eq!(advice["requestAttempted"], false);
+        assert_eq!(advice["basedOnSnapshotId"], "s1");
         // No model configured: the reply keeps its screenshot so the main model is never blind.
         let mut failed = original.clone();
         see(&Settings { altair_enabled: true, ..Settings::default() }, &mut failed, Some("读标题")).await;
