@@ -221,7 +221,7 @@ pub(crate) fn step_name(name: &str) -> String {
 }
 
 // Browser acts of the current turn, keyed by session owner + site. Saved only when the turn ends
-// normally, so reuse never depends on JEV or on the model remembering experience_save.
+// normally, so reuse never depends on Altair or on the model remembering experience_save.
 struct Trail { owner: String, tool: String, scope: String, start: String, url: String, title: String, steps: Vec<String>, at: std::time::Instant }
 static TRAILS: std::sync::LazyLock<std::sync::Mutex<Vec<Trail>>> = std::sync::LazyLock::new(Default::default);
 const TRAIL_STEPS: usize = 48;

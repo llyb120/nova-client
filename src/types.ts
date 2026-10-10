@@ -423,10 +423,7 @@ export interface PendingNewSessionSeed {
 }
 
 export interface Settings {
-  jevEnabled: boolean;
-  jevApiKey: string;
-  jevApiUrl: string;
-  /** Altair：Lyra 识图模型，JEV 置信度不足或未开启时带截图判断。 */
+  /** Altair：Lyra 识图模型，结合页面文字与截图驱动网页/桌面 run。 */
   altairEnabled: boolean;
   altairModel: string;
   claudePath: string;

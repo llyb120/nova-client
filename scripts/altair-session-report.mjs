@@ -70,7 +70,7 @@ function results(value,depth=0) {
   }
   if(Array.isArray(value)) return value.flatMap(v=>results(v,depth+1));
   if(typeof value!=='object' || value.type==='image') return [];
-  if(value.jevRun || value.jev || value.advisoryOnly || value.snapshotId || value.completedActions!==undefined) return [value];
+  if(value.altairRun || value.altair || value.advisoryOnly || value.snapshotId || value.completedActions!==undefined) return [value];
   const details=results(value.details,depth+1);
   return details.length?details:results(value.content??value.text,depth+1);
 }
@@ -78,8 +78,8 @@ function results(value,depth=0) {
 export function reportThread(thread) {
   const report={threadId:thread.id,title:thread.title,operations:{},toolCalls:0,
     enabledObservations:0,delegations:0,requestCount:0,unknownRequestOutcomes:0,
-    advised:0,deferred:0,unavailable:0,verifiedSubgoals:0,jevExecutedActions:0,cachedActions:0,
-    jevDecisionElapsedMs:0,delegationElapsedMs:0,zeroRequestHandoffs:0,candidateCounts:[],historyTruncated:0,recoveredArchives:0,archiveErrors:[],actionFailures:[],handoffs:[],
+    advised:0,deferred:0,unavailable:0,verifiedSubgoals:0,altairExecutedActions:0,cachedActions:0,
+    altairDecisionElapsedMs:0,delegationElapsedMs:0,zeroRequestHandoffs:0,candidateCounts:[],historyTruncated:0,recoveredArchives:0,archiveErrors:[],actionFailures:[],handoffs:[],
     taskVerification:'requires_review',durationMs:0};
   for(const item of thread.items) {
     if(item.type==='turn') report.durationMs+=item.durationMs||0;
@@ -99,18 +99,18 @@ export function reportThread(thread) {
     if(!outputs.length)outputs.push(...original.filter(v=>!v.historyTruncated));
     let decisions=[];
     for(const value of outputs) {
-      if(value.jev?.enabled) report.enabledObservations++;
+      if(value.altair?.enabled) report.enabledObservations++;
       if(value.status==='not_executed' || value.status==='needs_review')
         report.actionFailures.push({itemId:item.id,operation,status:value.status,reason:value.reason||value.error||null});
       if(operation==='advise' && value.advisoryOnly) decisions.push(value);
-      if(operation==='run' && value.jevRun) {
-        const run=value.jevRun;
+      if(operation==='run' && value.altairRun) {
+        const run=value.altairRun;
         report.delegationElapsedMs+=run.elapsedMs||0;
         report.cachedActions+=run.cachedActions||0;
         report.candidateCounts.push(...(run.candidateCounts||[]));
         if(run.status==='handoff' && run.requestCount===0)report.zeroRequestHandoffs++;
         decisions.push(...(run.decisions||(run.decision?[run.decision]:[])));
-        report.jevExecutedActions+=run.executedActions??(run.history||[]).reduce((n,h)=>n+(h.completedActions||0),0);
+        report.altairExecutedActions+=run.executedActions??(run.history||[]).reduce((n,h)=>n+(h.completedActions||0),0);
         if(run.verification==='subgoal_verified') report.verifiedSubgoals++;
         if(run.status==='handoff') report.handoffs.push({itemId:item.id,reason:run.reason||null});
       }
@@ -121,15 +121,15 @@ export function reportThread(thread) {
       if(decision.status==='advised') report.advised++;
       if(decision.choice==='defer') report.deferred++;
       if(decision.status==='unavailable') report.unavailable++;
-      report.jevDecisionElapsedMs+=decision.elapsedMs||0;
+      report.altairDecisionElapsedMs+=decision.elapsedMs||0;
     }
-    if(delegated && !decisions.length && !outputs.some(v=>v.jevRun?.requestCount===0)) report.unknownRequestOutcomes++;
+    if(delegated && !decisions.length && !outputs.some(v=>v.altairRun?.requestCount===0)) report.unknownRequestOutcomes++;
   }
   return report;
 }
 
 if(process.argv[1] && import.meta.url===pathToFileURL(resolve(process.argv[1])).href) {
-  if(!process.argv[2]) throw Error('Usage: node scripts/jev-session-report.mjs <thread.json> [archive-directory]');
+  if(!process.argv[2]) throw Error('Usage: node scripts/altair-session-report.mjs <thread.json> [archive-directory]');
   const thread=await readThread(resolve(process.argv[2]));
   if(process.argv[3])await recoverThreadArchives(thread,resolve(process.argv[3]));
   console.log(JSON.stringify(reportThread(thread),null,2));

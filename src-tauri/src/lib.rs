@@ -4,8 +4,7 @@ mod altair;
 mod agent_config;
 mod jianlai;
 mod employee;
-mod jev;
-mod jev_run;
+mod altair_run;
 mod tool_experience;
 mod cli_manager;
 mod clipboard;
@@ -5901,7 +5900,7 @@ pub fn run() {
             compact_thread,
             respond_permission,
             get_settings,
-            jev::test_jev_connection,
+            altair::test_altair_connection,
             set_settings,
             refresh_environment_variables,
             get_global_agent_instructions,

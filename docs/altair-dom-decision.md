@@ -1,25 +1,22 @@
-# JEV DOM 决策
+# Altair DOM 决策
 
-## Altair 决策链（2026-10-10）
+## Altair 单一决策（2026-10-10，移除 JEV）
 
-设置 → “Altair 辅助决策”下有两个子配置：**JEV**（TypeSafe，文本无图）与 **Altair**（Lyra 配置的识图模型，文本 + 截图；恢复自已回退的 a1c6314，`src-tauri/src/altair.rs`）。任一开启即启用决策链，`jev::decide` 是唯一入口（advise / choose / plan_path 共用）：
+JEV（TypeSafe SystemOne，文本无图）已移除：设置、HTTP 客户端、`jev.rs` 均删除，旧设置里的 `jevEnabled/jevApiKey/jevApiUrl` 读取时忽略。设置 → “Altair 辅助决策”只剩 **Altair**（Lyra 配置的识图模型，文本 + 截图，`src-tauri/src/altair.rs`）。`altair::decide` 是唯一入口（advise / choose / plan_path 共用），执行器为 `src-tauri/src/altair_run.rs`：
 
-1. JEV 先判断；`advised` 且目标/操作两层返回的置信度均在 0.6–1（WAIT 不看置信度）直接执行，`decidedBy=jev`。旧版 JEV 可省略置信度；Altair 缺失或非法置信度按 0 处理，不作为高置信答案执行。
-2. JEV 置信度不足、选 BLOCKED/defer、不可用或未开启 → Altair 带当前视口截图判断（单次无上下文请求、按协议请求关闭思考、20 秒超时）。辅助图片统一最长边 1024、JPEG 质量 70；未缩放且原 PNG 更小时保留 PNG，原工具截图不覆盖。桌面坐标先从发送图映射回 imageId 像素，再由原坐标校验处理裁剪/DPI。小字/小目标超出概览能力时需要局部高清截图，不自动降低置信度门槛。截图惰性获取：观察已有截图就复用，否则 run 内部做一次 viewport screenshot，之后按候选 `key` 重新绑定新快照的 ref（`Run::rebind`）。
-3. 仍不足 → `status=low_confidence`，run 交回主模型（reason 带置信度）。
+1. 每次决策附当前视口截图（单次无上下文请求、按协议请求关闭思考、20 秒超时）。辅助图片统一最长边 1024、JPEG 质量 70；未缩放且原 PNG 更小时保留 PNG，原工具截图不覆盖。截图惰性获取：观察已有截图就复用，否则 run 内部做一次 viewport screenshot，之后按候选 `key` 重新绑定新快照的 ref（`Run::rebind`）。
+2. `advised` 且目标/操作两层置信度均在 0.6–1 才执行；WAIT（observe）与 defer 不看置信度。缺失或非法置信度按 0 处理。不足 → `status=low_confidence`，run 交回主模型（reason 带置信度）。
+3. **连续操作**：目标模式请求带 `next_1..3` 同屏续步题。只保留合法、不重复且置信度 ≥0.6 的前缀，`replan` 截断。执行器只在下一步目标仍在新 DOM 中同节点同状态、URL 不变、没有新控件时继续，每步动作后先等页面稳定（连续两次观察一致，最多 1 秒）再执行下一步，因此一次请求可执行多步，省去中间往返。
 
-**所有后端一致**：拦截点在共享执行层 `native_browser::execute/execute_chrome` 的 act 入口（`jev_run::route_act`），不依赖工具描述。决策链开启时，主模型未经 run 的 DOM click/fill/scroll 不执行，返回约 300 字的 `not_executed` + `runTemplate`；坐标/按键/等待、run 内部动作、UI 调用不受限。run 交回并取得有效快照后，该目标仅获得 **2 个 DOM 排障尝试**额度（批量按动作数计，超额整批不执行），下一次 run 清零。act 返回 `handoff.remainingDomActions`，解决障碍后立即委托剩余目标；额度耗尽且障碍未变化时报告阻碍，不盲目重复 run。坐标/键盘与纯观察仍可用于视觉排障。run 的 plan 只需 `task`（authorization/expectedText 有缺省值），应一次交出完整目标，不拆成逐个点击。完成的 run 不返回 decisions/trace/decisionTree；交接诊断保留 `attempts` 与 `altairError`。`decidedBy` 表示最终保留的判断来源，`requestedBy`/`requestCount` 统计各层已发起的调用（不展开内部 HTTP 重试，不表示服务成功），不能据 `{jev:2}` 判断 Altair 未调用。
+**所有后端一致**：拦截点在共享执行层 `native_browser::execute/execute_chrome` 的 act 入口（`altair_run::route_act`）。Altair 开启时，主模型未经 run 的 DOM click/fill/scroll 不执行，返回 `not_executed` + `runTemplate`；坐标/按键/等待、run 内部动作、UI 调用不受限。run 交回并取得有效快照后，该目标仅获得 **2 个 DOM 排障尝试**额度（批量按动作数计），下一次 run 清零。run 的 plan 只需 `task`，应一次交出完整目标。完成的 run 不返回 decisions/trace/decisionTree；`requestCount` 统计已发起的 Altair 调用。
 
-**剑来**：advise 走同一决策链（Altair 附本会话最新截图）。`run` 传 `plan.task` 且开启 Altair 时由 Altair 看截图逐步操作（每步一个动作，经原 act 校验；≤20 步/120 秒；输入文字只能取 `plan.inputs`；置信度 < 0.6、blocked、连续 3 次 wait、执行不明确即交回）；传 `actions` 时仍与 act 等价。
+**剑来**：advise 走同一入口（附本会话最新截图）。`run` 传 `plan.task` 时由 Altair 看截图逐步操作（经原 act 校验；≤20 次决策/120 秒；输入文字只能取 `plan.inputs`；置信度 < 0.6、blocked、连续 3 次 wait、执行不明确即交回）。同屏可确定的后续 1–3 步（如点输入框→输入→回车）可放在 `then` 中，与首步合成一次 act，步间等待 400ms；只允许 click/double_click/press/type_input，无效项截断。传 `actions` 时仍与 act 等价。
 
-**容错**：动作缺 `frame` 默认 0，press/wait/type 上多余的 frame/ref 丢弃，`{"type":...}` 视作 action，action 为 JSON 字符串时直接解析；缺 `operation` 按字段推断（plan→run、action(s)→act、url→open/goto、仅目标→inspect、空→tabs），结果附 `operationInferred`。委托门槛和执行器共用动作解析器，`type` 别名、JSON 字符串或代码围栏不能绕过 DOM 门槛或额度，解析失败不消耗额度。
+**容错**：动作缺 `frame` 默认 0，press/wait/type 上多余的 frame/ref 丢弃，`{"type":...}` 视作 action，action 为 JSON 字符串时直接解析；缺 `operation` 按字段推断（plan→run、action(s)→act、url→open/goto、仅目标→inspect、空→tabs），结果附 `operationInferred`。委托门槛和执行器共用动作解析器，解析失败不消耗额度。
 
-JEV 启用时网页 DOM 操作优先委托 `run`（单步也一样；连续流程在开始前一次委托），JEV 按置信度直接执行，置信度不足、`defer` 或 handoff 时才交回主模型 `act`；Canvas/坐标等视觉目标和 JEV 关闭时直接 `act`。默认省略 `plan.steps`，一次委托完整目标；仅已观察确认的固定路径提供 steps，不猜菜单或排序的中间行为。guided 执行到新菜单/导航或最后一步后直接转目标决策，不先对同一步做两次 yes/no 核验再交接；步骤与整体目标不符时按最新页面继续，不重放已执行动作。重新规划后的路线不自动保存为原 guided 步骤经验。主模型处理视觉与异常，并核对最终结果。JEV 不接收截图、不推测坐标。
+`run` 交接时刷新观察，`altairRun.fallback.allowed` 表示是否取得可接手的有效快照，不是额外操作授权。障碍未变化时不要重复 `run`；条件具备后只委托剩余目标，不重放已执行步骤。
 
-Chrome/WebView 的共享入口执行上述 DOM 门槛与接手额度，Lyra、CodeBuddy、Codex 等后端使用同一策略。普通 `act` 和 `run` 内部动作都保留快照、节点身份、遮挡、焦点和输入结果校验。
-
-`run` 交接时刷新观察，`jevRun.fallback.allowed` 表示是否取得可接手的有效快照，不是额外操作授权。主模型按 reason 排障，仅在返回的额度内用最新快照 `act`，不能借一次交接手工驱动整个后续流程。障碍未变化时不要重复 `run`；条件具备后只委托剩余目标，不重放已执行步骤。`run` 缺少或持有过期 snapshotId 时先观察再决策；`act` 遇到无效快照只返回新观察，不执行原动作。
-
+> 以下章节为 JEV 时期的设计与实测记录：决策树、候选、完成核验机制沿用，决策服务已换成 Altair；其中的实测数字只代表当时的 JEV/Altair 链路。
 ### 2026-10-10 性能验收边界
 
 真实榜单截图离线压缩：1600×719 PNG 307726 字节 → 1024×460 JPEG 45754 字节，准备约122ms；单次合成视觉定位（不执行输入）约4.17秒，坐标正确。真实 dev 回归曾出现网关返回思考耗尽 512 总 token，未达到一次委托完成；思考模型预算保留2048。后续有界原始 SSE 对照查实 CommandCode Chat Completions 的关闭参数必须为 `reasoning_effort:"off"`：只发 DeepSeek 原生 `thinking.type:"disabled"` 仍返回 reasoning_content；`reasoning_effort:"none"` 被400拒绝且报出枚举；改为 `off` 后同一图文请求无任何推理字段（约2.19秒）。共享 provider 按精确 host 适配此规则，不修改 DeepSeek 原生接口或用户选择的 high；不能把该单次对照当作整页连续驱动已验收。浏览器摘要同60元素预算、三张真实快照减小约27%，不包含图片/MCP外层封装。
@@ -107,11 +104,9 @@ Altair 只判断当前一步：不发送重复的 `next_1..3` 候选列表，只
 
 ## 检查
 
-`cargo test --manifest-path src-tauri/Cargo.toml --lib jev` 检查候选、路径协议和状态校验；`node scripts/browser-precision.test.mjs` 在真实 Chromium 中检查节点身份与浏览器操作保护；工具描述变更后运行 `npm run build:nova-tools-mcp` 和 `node --test scripts/automation-schema.test.mjs`。
+`cargo test --manifest-path src-tauri/Cargo.toml --lib altair` 检查候选、路径协议和状态校验；`node scripts/browser-precision.test.mjs` 在真实 Chromium 中检查节点身份与浏览器操作保护；工具描述变更后运行 `npm run build:nova-tools-mcp` 和 `node --test scripts/automation-schema.test.mjs`。
 
-这些自动检查不调用线上 JEV。dev 真实页面验证见 [实测记录](jev-dom-live-test.md)，多题推演的命中率以实际 `cachedActions` 为准。
 
-编译 dev 二进制后，`node scripts/jev-delegation-live.mjs --run continuity --continuity-only` 使用真实 JEV 和本地模拟页，验证一次 `run` 连续完成延迟表单、无名字段填写、单次提交与结果等待，并验证同名歧义和持续加载会交接；不会操作业务流水线。
 
 2026-09-23 本地实测：JEV 1.13.0 一次 `run` 完成 3 次操作、4 次内部刷新和最终核验，耗时 3660ms，无主模型交接；同名字段歧义在 297ms 交回且零输入；持续加载在 5351ms 交回，期间仅请求 JEV 一次、零输入。结果保存在 `src-tauri/target/jev-delegation-continuity-report.json`。
 
@@ -131,7 +126,6 @@ Altair 只判断当前一步：不发送重复的 `next_1..3` 候选列表，只
 
 2026-09-23 Region 会话审计（913c790c）：第一次筛选 run 的32次动作循环于填写两端日期→打开 Region→点击 Search。日期被按周归一化；后续 run 点击 North America checkbox 选中整组，又点击 selected=true 的 United States 将其取消。源码原有的 fill_identity 防重填和 checkbox effect 提示编译于该会话之后，本次在此基础上补选择集合证据。现有17:30二进制的 region-baseline 实测通过搜索完成 Region United States 和半年日期，未通过完整排序检查；它不包含本次 selectionFields 改动，不能作为本次修改的验证。
 
-`node scripts/jev-databrain-ab.mjs --run <label> <exe> on --require-jev --dom-probe --region-regression` 专门复现只授权两个日期输入、不提供地区搜索文本的路径，检查周归一化、仅美国、Confirm 和恰好两次填写。本次3项抽取生产函数的轻量 Rust 检查通过；完整 Rust 测试/构建遇到虚拟内存不足及资源文件占用，当前不能声称新二进制已生成或实机回归已通过。
 
 2026-09-23 `field-date-evidence` 真实榜单直接 JEV 回归：8 次操作完成导航、美国、Week=2026-03-22~2026-09-19，Release Date=None；只选择一次 Last 26 Weeks。仅修字段上下文的前一轮为 12 次操作，重复打开两个日期端点并再次选预设。补齐日期值后未再重复，但后续排序仍 defer，完整任务未通过。报告位于 `src-tauri/target/jev-ab/field-date-evidence/report.json`。Chromium 34 项通过；Rust JEV 22 项通过、1 项忽略；使用命令级低调试信息配置完成最终测试与 Dev 编译。
 

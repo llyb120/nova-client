@@ -1613,7 +1613,7 @@ async fn snapshot(
     Ok((observation, result))
 }
 
-// Only the tool reply is compacted: stored observations (JEV, preflight, coordinates) and
+// Only the tool reply is compacted: stored observations (Altair, preflight, coordinates) and
 // documentPath keep the full DOM. Do not use Lyra's output fallback here: it also cuts names/rows.
 fn inline_summary(pages: &Value, args: &Value, document_path: &Path) -> Value {
     let mut result = pages.clone();
@@ -1838,8 +1838,8 @@ async fn control_session(
         }
         // Read after feedback so pages that write the clipboard asynchronously have finished.
         if let Some(copied)=crate::clipboard::copied_since(clipboard) {result["clipboard"]=copied;}
-        // JEV runs save their own verified route; everything else feeds the turn's auto trail.
-        if !crate::jev_run::executing_browser_action() {
+        // Altair runs save their own verified route; everything else feeds the turn's auto trail.
+        if !crate::altair_run::executing_browser_action() {
             let before = &observation.pages["pages"][0];
             let after = if result["pages"][0]["url"].is_string() { &result["pages"][0] } else { before };
             crate::tool_experience::record(if chrome {"chrome"} else {"webview"}, &s.thread_id,
@@ -1926,7 +1926,7 @@ async fn control_session(
     if let Ok(value) = &mut result {
         value["durationMs"] = json!(started.elapsed().as_millis());
         if value["snapshotId"].is_string() {
-            value["jev"] = crate::jev::availability(&app.state::<AppState>().settings.lock().unwrap());
+            value["altair"] = crate::altair::availability(&app.state::<AppState>().settings.lock().unwrap());
         }
     }
     result
@@ -1964,7 +1964,7 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> 
     if let Some(op) = inferred { result["operationInferred"] = json!(op); }
     let owner = current_context(root)?.1;
     if args["operation"] == "act" {
-        if let Some(hint) = crate::jev_run::handoff_hint(&args, &owner, "webview") { result["handoff"] = hint; }
+        if let Some(hint) = crate::altair_run::handoff_hint(&args, &owner, "webview") { result["handoff"] = hint; }
     }
     Ok(with_experience_hint("webview", &owner, result))
 }
@@ -2025,7 +2025,7 @@ async fn execute_webview(root: &Path, args: &Value) -> Result<Value, String> {
             .navigate(url)
             .map_err(|e| e.to_string())?;
         return Ok(
-            json!({"browserId":value["browserId"],"status":"opening","jev":crate::jev::availability(&jev_settings()?),"next":"页面加载完成后 inspect；JEV 启用时优先 run 委托文本 DOM 子目标"}),
+            json!({"browserId":value["browserId"],"status":"opening","altair":crate::altair::availability(&altair_settings()?),"next":"页面加载完成后 inspect；Altair 启用时优先 run 委托文本 DOM 子目标"}),
         );
     }
     let id = args["browserId"]
@@ -2036,22 +2036,22 @@ async fn execute_webview(root: &Path, args: &Value) -> Result<Value, String> {
         return Err("浏览器属于其它会话".into());
     }
     if operation == "run" {
-        return Box::pin(crate::jev_run::browser(root, args, &thread_id, "webview")).await;
+        return Box::pin(crate::altair_run::browser(root, args, &thread_id, "webview")).await;
     }
     if operation == "act" {
-        if let Some(rejected) = crate::jev_run::route_act(args, &thread_id, "webview")? { return Ok(rejected); }
+        if let Some(rejected) = crate::altair_run::route_act(args, &thread_id, "webview")? { return Ok(rejected); }
     }
     if operation == "advise" {
-        let settings = jev_settings()?;
-        if crate::jev::enabled(&settings) { jev_observation(root, args, &thread_id, "webview")?; }
-        let image = jev_image(root, args, &thread_id, "webview");
-        let mut result = crate::jev::advise(settings, args, std::future::ready(image)).await?;
+        let settings = altair_settings()?;
+        if crate::altair::enabled(&settings) { altair_observation(root, args, &thread_id, "webview")?; }
+        let image = altair_image(root, args, &thread_id, "webview");
+        let mut result = crate::altair::advise(settings, args, std::future::ready(image)).await?;
         result["basedOnSnapshotId"] = args["snapshotId"].clone();
         return Ok(result);
     }
     if crate::tool_experience::is_operation(args) {
         let observed = if operation == "experience_search" { None } else {
-            let pages = jev_observation(root, args, &thread_id, "webview")?;
+            let pages = altair_observation(root, args, &thread_id, "webview")?;
             let url = tauri::Url::parse(pages["pages"][0]["url"].as_str().ok_or("观察缺少网站 URL")?).map_err(|e| e.to_string())?;
             Some(url.origin().ascii_serialization())
         };
@@ -2087,16 +2087,16 @@ pub(crate) fn tool_owner(root: &Path, owner: &str) -> Result<String, String> {
     Ok(format!("{owner}:{}", root.display()))
 }
 
-pub(crate) fn jev_settings() -> Result<crate::settings::Settings, String> {
-    let app = APP.get().ok_or("JEV 仅在 Nova 桌面应用内可用")?;
+pub(crate) fn altair_settings() -> Result<crate::settings::Settings, String> {
+    let app = APP.get().ok_or("Altair 仅在 Nova 桌面应用内可用")?;
     Ok(app.state::<AppState>().settings.lock().unwrap().clone())
 }
 
-fn jev_observation_key(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<String, String> {
+fn altair_observation_key(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<String, String> {
     let app = APP.get().ok_or("仅 Nova 内可用")?;
     let key = if tool == "webview" {
         let (_, thread_id) = current_context(root)?;
-        if thread_id != owner { return Err("会话已切换，停止 JEV 连续决策".into()); }
+        if thread_id != owner { return Err("会话已切换，停止 Altair 连续决策".into()); }
         let s = session(app, args["browserId"].as_str().ok_or("缺少 browserId")?)?;
         check(app, &s)?;
         s.active_tab
@@ -2108,9 +2108,9 @@ fn jev_observation_key(root: &Path, args: &Value, owner: &str, tool: &str) -> Re
     Ok(key)
 }
 
-pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
+pub(crate) fn altair_observation(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
     let app = APP.get().ok_or("仅 Nova 内可用")?;
-    let key = jev_observation_key(root, args, owner, tool)?;
+    let key = altair_observation_key(root, args, owner, tool)?;
     let state = app.state::<BrowserState>();
     let observations = state.observations.lock().unwrap();
     let observation = observations.get(&key)
@@ -2119,15 +2119,15 @@ pub(crate) fn jev_observation(root: &Path, args: &Value, owner: &str, tool: &str
     Ok(observation.pages.clone())
 }
 
-/// First screenshot of the same valid observation as `jev_observation` (Altair input); None without one.
+/// First screenshot of the same valid observation as `altair_observation` (Altair input); None without one.
 fn decision_image(observation: &Observation) -> Option<&ScreenshotImage> {
     // Coordinate reuse has a live pixel guard; model perception does not. A carried screenshot
     // can show yesterday's popup/loading state even when URL/viewport did not change.
     observation.images.first().filter(|image| image.id.starts_with(&format!("{}-", observation.id)))
 }
 
-pub(crate) fn jev_image(root: &Path, args: &Value, owner: &str, tool: &str) -> Option<Value> {
-    let key = jev_observation_key(root, args, owner, tool).ok()?;
+pub(crate) fn altair_image(root: &Path, args: &Value, owner: &str, tool: &str) -> Option<Value> {
+    let key = altair_observation_key(root, args, owner, tool).ok()?;
     let path = {
         let state = APP.get()?.state::<BrowserState>();
         let observations = state.observations.lock().unwrap();
@@ -2185,7 +2185,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
         result["targetResolvedFrom"] = json!(if args.get("snapshotId").is_some() { "snapshotId" } else { "sessionObservation" });
     }
     if normalized["operation"] == "act" {
-        if let Some(hint) = crate::jev_run::handoff_hint(&normalized, owner, "chrome") { result["handoff"] = hint; }
+        if let Some(hint) = crate::altair_run::handoff_hint(&normalized, owner, "chrome") { result["handoff"] = hint; }
     }
     Ok(with_experience_hint("chrome", &thread_id, result))
 }
@@ -2195,23 +2195,23 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     let thread_id = tool_owner(root, owner)?;
     let operation = args["operation"].as_str().unwrap_or_default();
     if operation == "run" {
-        return Box::pin(crate::jev_run::browser(root, args, owner, "chrome")).await;
+        return Box::pin(crate::altair_run::browser(root, args, owner, "chrome")).await;
     }
     if operation == "act" {
-        if let Some(rejected) = crate::jev_run::route_act(args, owner, "chrome")? { return Ok(rejected); }
+        if let Some(rejected) = crate::altair_run::route_act(args, owner, "chrome")? { return Ok(rejected); }
     }
     if operation == "advise" {
-        let settings = jev_settings()?;
-        if crate::jev::enabled(&settings) {
-            let tag = args["tabTag"].as_str().ok_or("JEV 辅助判断需 tabTag")?;
+        let settings = altair_settings()?;
+        if crate::altair::enabled(&settings) {
+            let tag = args["tabTag"].as_str().ok_or("Altair 辅助判断需 tabTag")?;
             let state = app.state::<BrowserState>();
             let observations = state.observations.lock().unwrap();
             observations.get(&format!("chrome:{thread_id}:{tag}"))
                 .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
-                .ok_or("JEV 辅助判断需本会话该标签最新观察（180秒内）")?;
+                .ok_or("Altair 辅助判断需本会话该标签最新观察（180秒内）")?;
         }
-        let image = jev_image(root, args, owner, "chrome");
-        let mut result = crate::jev::advise(settings, args, std::future::ready(image)).await?;
+        let image = altair_image(root, args, owner, "chrome");
+        let mut result = crate::altair::advise(settings, args, std::future::ready(image)).await?;
         result["basedOnSnapshotId"] = args["snapshotId"].clone();
         return Ok(result);
     }
@@ -2238,7 +2238,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     }
     if matches!(operation, "connect" | "status") {
         let mut connection = connection;
-        connection["jev"] = crate::jev::availability(&jev_settings()?);
+        connection["altair"] = crate::altair::availability(&altair_settings()?);
         if connection["connected"] == true {
             match crate::chrome_browser::request(app, "status", json!({})).await {
                 Ok(capabilities) => connection["incognitoAllowed"] = capabilities["incognitoAllowed"].clone(),
@@ -2477,7 +2477,7 @@ mod tests {
         let args = json!({"maxItems":61,"maxTextChars":2500});
         let summary = inline_summary(&full, &args, Path::new("full-document.json"));
         assert!(summary.to_string().len() < original.len() * 3 / 4, "redundant summary must shrink substantially");
-        assert_eq!(full.to_string(), original, "JEV and documentPath must retain the full observation");
+        assert_eq!(full.to_string(), original, "Altair and documentPath must retain the full observation");
         let page = &summary["pages"][0];
         let mut expected = full["pages"][0]["items"][0].clone();
         expected.as_object_mut().unwrap().remove("nodeId");

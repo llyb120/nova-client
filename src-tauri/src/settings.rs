@@ -64,10 +64,7 @@ fn default_powershell_utf8() -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    pub jev_enabled: bool,
-    pub jev_api_key: String,
-    pub jev_api_url: String,
-    /// Altair：Lyra 配置的识图模型，JEV 置信度不足或未开启时带截图判断。
+    /// Altair：Lyra 配置的识图模型，结合页面文字与截图驱动网页/桌面 run。
     pub altair_enabled: bool,
     pub altair_model: String,
     /// Kimi Code CLI，使用固定的 `acp` 子命令。
@@ -202,9 +199,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            jev_enabled: false,
-            jev_api_key: String::new(),
-            jev_api_url: String::new(),
             altair_enabled: false,
             altair_model: String::new(),
             kimi_path: "kimi".into(),

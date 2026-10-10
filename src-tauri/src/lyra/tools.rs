@@ -258,7 +258,7 @@ fn compact_browser_result(value: &Value, max_bytes: usize) -> String {
             let mut fallback = json!({"contextCompacted":true,"evidenceOmitted":true,
                 "nextRead":"Read archivedToolOutput/documentPath before judging task completion."});
             for key in ["status","snapshotId","basedOnSnapshotId","documentPath","archivedToolOutput",
-                "images","coordinateSpace","tabTag","browserId","completedActions","verification","jev","jevRun"] {
+                "images","coordinateSpace","tabTag","browserId","completedActions","verification","altair","altairRun"] {
                 if let Some(value) = compact.get(key) { fallback[key] = value.clone(); }
             }
             return fallback.to_string();
@@ -1100,18 +1100,18 @@ mod browser_governance_tests {
             let text=compact_browser_result(&value,TOOL_OUTPUT_CONTEXT_MAX_BYTES);
             assert!(text.len()<=TOOL_OUTPUT_CONTEXT_MAX_BYTES,"{}: {} bytes",path.display(),text.len());
             let summary:Value=serde_json::from_str(&text).unwrap();
-            for key in ["snapshotId","status","images","jevRun"] {
+            for key in ["snapshotId","status","images","altairRun"] {
                 assert_eq!(summary[key],value[key],"{}: {key}",path.display());
             }
             count+=1;
         }
         assert!(count>0);
-        println!("Replayed {count} browser archives: valid bounded JSON and preserved status, images, JEV decisions.");
+        println!("Replayed {count} browser archives: valid bounded JSON and preserved status, images, Altair decisions.");
     }
     #[test]
     fn browser_governance_preserves_json_decisions_and_table_counts() {
         let value = json!({"snapshotId":"s", "status":"executed", "images":[{"imageId":"s-0","pixelWidth":1600,"pixelHeight":719}],
-            "jevRun":{"requestCount":2,"executedActions":1,"decisions":[{"choice":"defer","requestAttempted":true}]},
+            "altairRun":{"requestCount":2,"executedActions":1,"decisions":[{"choice":"defer","requestAttempted":true}]},
             "pages":[{"text":"美国 Units".repeat(10000),"items":(0..200).map(|n|json!({"ref":n,"name":"目标".repeat(200)})).collect::<Vec<_>>(),
                 "tables":[{"headers":["Units"],"returnedRows":10,"totalRows":100,"rows":vec![vec!["100";16];10]}]}]});
         let dir=std::env::temp_dir().join(format!("nova-govern-{}",uuid::Uuid::new_v4()));
@@ -1119,7 +1119,7 @@ mod browser_governance_tests {
         let text=result.content[0]["text"].as_str().unwrap();
         assert!(text.len()<=TOOL_OUTPUT_CONTEXT_MAX_BYTES);
         let summary:Value=serde_json::from_str(text).unwrap();
-        assert_eq!(summary["jevRun"],value["jevRun"]);
+        assert_eq!(summary["altairRun"],value["altairRun"]);
         assert_eq!(summary["images"],value["images"]);
         assert_eq!(summary["pages"][0]["tables"][0]["totalRows"],100);
         let table=&summary["pages"][0]["tables"][0];

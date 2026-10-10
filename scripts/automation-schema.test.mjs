@@ -45,21 +45,22 @@ test('Chrome and WebView share image coordinates, fast scope and bounded batch s
     }
   }
 });
-test('JEV/Altair browser decisions share bounded plans and repair grants', async()=>{
+test('Altair browser decisions share bounded plans and repair grants', async()=>{
   const [chrome,webview,jianlai]=await Promise.all(['chrome','webview','jianlai'].map(tool));
   assert.deepEqual(webview.inputSchema.properties.plan,chrome.inputSchema.properties.plan);
   assert.deepEqual(webview.inputSchema.properties.experience,chrome.inputSchema.properties.experience);
   assert.deepEqual(webview.inputSchema.properties.advice,chrome.inputSchema.properties.advice);
   for (const browser of [chrome,webview]) {
     assert.match(browser.description,/网页DOM点击\/填写\/滚动用run驱动（plan只需task/);
-    assert.match(browser.description,/Altair看截图/);
+    assert.match(browser.description,/Altair结合页面文字与截图/);
+    assert.match(browser.description,/同屏可确定的后续步骤连续执行/);
     assert.match(browser.description,/知识图谱/);
     assert.match(browser.description,/最多2个DOM排障动作/);
     assert.match(browser.description,/解决障碍即run委托剩余目标/);
     assert.match(browser.description,/默认省略steps，一次委托完整目标/);
     assert.match(browser.description,/升序前N不能替换为最高N项倒序展示/);
     assert.match(browser.inputSchema.properties.plan.properties.task.description,/一次委托完整目标/);
-    assert.doesNotMatch(browser.description,/jev_run_required/);
+    assert.doesNotMatch(browser.description,/JEV/);
     assert.match(browser.inputSchema.properties.plan.description,/省略steps/);
     assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
   }
@@ -89,7 +90,7 @@ test('JEV/Altair browser decisions share bounded plans and repair grants', async
 test('browser run transport outlives the decision budget without changing normal calls',async t=>{
   const {createServer}=await import('node:net');
   const {randomUUID}=await import('node:crypto');
-  const endpoint=process.platform==='win32' ? `\\\\.\\pipe\\nova-jev-${randomUUID()}` : join(tmpdir(),`nova-jev-${randomUUID()}.sock`);
+  const endpoint=process.platform==='win32' ? `\\\\.\\pipe\\nova-altair-${randomUUID()}` : join(tmpdir(),`nova-altair-${randomUUID()}.sock`);
   const server=createServer(socket=>socket.once('data',()=>socket.end(JSON.stringify({ok:true,result:{status:'handoff'}}))));
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(endpoint,resolve);});
   const saved=[process.env.NOVA_CONTEXT_SERVICE_ENDPOINT,process.env.NOVA_CONTEXT_SERVICE_TOKEN];
