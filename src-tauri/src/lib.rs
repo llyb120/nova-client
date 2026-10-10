@@ -354,11 +354,10 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
             .map(|thread| thread.id.clone())
             .collect(),
     );
-    for thread in permanently_removed {
-        if thread.cwd.contains(SCRATCH_MARK) {
-            let _ = std::fs::remove_dir_all(thread.cwd);
-        }
-    }
+    state.store.lock().unwrap().cleanup_unused_scratch_dirs(
+        &permanently_removed,
+        &state.thread_trash.lock().unwrap(),
+    );
     let thread_ids = {
         let store = state.store.lock().unwrap();
         store
@@ -2508,11 +2507,10 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
         .map(|thread| thread.id.clone())
         .collect();
     time_machine::remove_threads_data(&state.config_dir, &permanent_ids);
-    for thread in &removed {
-        if permanent_ids.contains(&thread.id) && thread.cwd.contains(SCRATCH_MARK) {
-            let _ = std::fs::remove_dir_all(&thread.cwd);
-        }
-    }
+    state.store.lock().unwrap().cleanup_unused_scratch_dirs(
+        &removed,
+        &state.thread_trash.lock().unwrap(),
+    );
     let _ = app.emit(acp::EV_THREADS, json!({}));
     removed
 }
@@ -3302,6 +3300,18 @@ fn delete_time_machine_context(
         thread_id,
         timeline,
     })
+}
+
+#[tauri::command]
+fn fork_thread(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    title: String,
+) -> Result<Thread, String> {
+    let thread = state.store.lock().unwrap().fork_thread(&thread_id, &title)?;
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+    Ok(thread)
 }
 
 #[tauri::command]
@@ -5875,6 +5885,7 @@ pub fn run() {
             get_time_machine_checkpoint_preview,
             restore_time_machine_checkpoint,
             delete_time_machine_context,
+            fork_thread,
             rename_thread,
             clear_thread_clue,
             notify_fire_done,
@@ -5987,11 +5998,10 @@ pub fn run() {
                     store.save_now();
                     removed
                 };
-                for t in &removed {
-                    if t.cwd.contains(SCRATCH_MARK) {
-                        let _ = std::fs::remove_dir_all(&t.cwd);
-                    }
-                }
+                state.store.lock().unwrap().cleanup_unused_scratch_dirs(
+                    &removed,
+                    &state.thread_trash.lock().unwrap(),
+                );
                 // 退出时杀掉全部后端进程（连同其子进程树）。
                 tauri::async_runtime::block_on(shutdown_agent_processes(&state));
             }

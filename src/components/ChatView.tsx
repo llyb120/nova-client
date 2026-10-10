@@ -20,14 +20,14 @@ import {
   state,
   timeMachineChangedSignal,
 } from "../store";
-import { mountSessionShortcuts } from "../sessionShortcuts";
+import { mountSessionShortcuts, setShortcutCaptureActive } from "../sessionShortcuts";
 import { ensureHistoryItems } from "../store";
 import { resolveUserScrollStick } from "../scrollStick";
 import type { AgentKind, Item, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
-import { IconBroadcast, IconCompress, IconDownload, IconFile, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
+import { IconBroadcast, IconCompress, IconCopy, IconDownload, IconFile, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { ShareModal } from "./ShareModal";
@@ -451,6 +451,55 @@ export function ChatView() {
       setStarUpdating(false);
     }
   };
+  const [forkSourceId, setForkSourceId] = createSignal<string | null>(null);
+  const [forkTitle, setForkTitle] = createSignal("");
+  const [forkBusy, setForkBusy] = createSignal(false);
+  const [forkError, setForkError] = createSignal("");
+  const [forkedId, setForkedId] = createSignal<string | null>(null);
+  const forkUnavailable = () => !!(currentMeta()?.roamingRole || currentMeta()?.quotaPeer);
+  const startFork = () => {
+    const meta = currentMeta();
+    if (!meta || forkUnavailable() || forkSourceId()) return;
+    const root = stageIndex().byId.get(stageRootId() ?? "");
+    setForkTitle(`${root?.title ?? meta.title} (fork)`);
+    setForkError("");
+    setForkedId(null);
+    // 固定打开弹窗时的源节点；切换 Stage 或收到列表更新不能改变 fork 目标。
+    setForkSourceId(meta.id);
+  };
+  const closeFork = () => {
+    if (!forkBusy()) setForkSourceId(null);
+  };
+  createEffect(() => {
+    if (!forkSourceId()) return;
+    // Esc 只关闭弹窗，不能落入 Composer 的全局停止执行快捷键。
+    setShortcutCaptureActive(true);
+    onCleanup(() => setShortcutCaptureActive(false));
+  });
+  const submitFork = async () => {
+    const sourceId = forkSourceId();
+    const title = forkTitle().trim();
+    if (!sourceId || !title || forkBusy()) return;
+    setForkBusy(true);
+    setForkError("");
+    try {
+      // 创建已成功时，刷新失败后的重试只打开同一副本，不重复 fork。
+      let id = forkedId();
+      if (!id) {
+        const thread = await api.forkThread(sourceId, title);
+        id = thread.id;
+        setForkedId(id);
+      }
+      await refreshThreads();
+      await openThread(id);
+      setForkSourceId(null);
+    } catch (error) {
+      setForkError(`${forkedId() ? "副本已创建，刷新或打开失败：" : "Fork 失败："}${String(error)}`);
+    } finally {
+      setForkBusy(false);
+    }
+  };
+
   // worktree 会话的 cwd 是 uuid 工作目录，展示时用源仓库路径更直观
   const cwdDisplay = () => currentMeta()?.worktree?.repo || state.cwd;
 
@@ -922,6 +971,20 @@ export function ChatView() {
             Flow
           </button>
         </Show>
+        <Show when={currentMeta()}>
+          <button
+            type="button"
+            class="chat-share-btn"
+            title={forkUnavailable() ? "漫游或额度会话不支持 Fork" : "Fork：复制整条会话及全部 Stage，不影响原会话；使用同一工作目录，不复制文件"}
+            aria-label={forkUnavailable() ? "Fork（漫游或额度会话不可用）" : "Fork 整条会话"}
+            aria-haspopup="dialog"
+            disabled={forkUnavailable()}
+            onClick={startFork}
+          >
+            <IconCopy size={14} />
+            Fork
+          </button>
+        </Show>
         <Show when={state.relay.connected && state.currentId && roamingRole() === "guest"}>
           <button
             class="chat-share-btn"
@@ -964,6 +1027,64 @@ export function ChatView() {
           </button>
         </Show>
       </header>
+      <Show when={forkSourceId()}>
+        <Portal>
+          <dialog
+            class="modal-backdrop"
+            aria-labelledby="fork-dialog-title"
+            aria-describedby="fork-dialog-description"
+            aria-modal="true"
+            style={{ width: "100%", height: "100%", "max-width": "none", "max-height": "none", margin: "0", padding: "0", border: "0", color: "var(--text)" }}
+            ref={(dialog) => {
+              queueMicrotask(() => {
+                if (!dialog.isConnected) return;
+                // 原生模态框负责 Tab 焦点约束及关闭后的焦点归还。
+                dialog.showModal();
+                dialog.querySelector("input")?.select();
+              });
+              onCleanup(() => dialog.close());
+            }}
+            onCancel={(event) => { event.preventDefault(); closeFork(); }}
+            onMouseDown={(event) => { if (event.target === event.currentTarget) closeFork(); }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && event.isComposing) event.preventDefault();
+            }}
+          >
+            <form
+              class="modal"
+              style={{ width: "460px", "max-width": "calc(100vw - 32px)" }}
+              aria-busy={forkBusy()}
+              onSubmit={(event) => { event.preventDefault(); void submitFork(); }}
+            >
+              <div class="modal-head"><span id="fork-dialog-title">Fork 会话 · 命名副本</span></div>
+              <div class="modal-body">
+                <p id="fork-dialog-description" class="field-hint">
+                  复制整条会话及全部 Stage，新名称用于副本根会话；原会话和正在运行的任务不受影响。
+                  副本沿用同一工作目录，不复制文件，也不会自动启动任务。
+                </p>
+                <label class="field">
+                  <span class="field-label">副本根会话名称</span>
+                  <input
+                    class="field-input"
+                    autofocus
+                    required
+                    value={forkTitle()}
+                    readOnly={forkBusy() || !!forkedId()}
+                    onInput={(event) => setForkTitle(event.currentTarget.value)}
+                  />
+                </label>
+                <Show when={forkError()}><p role="alert" class="field-hint" style={{ color: "var(--red)" }}>{forkError()}</p></Show>
+              </div>
+              <div class="modal-foot">
+                <button type="button" class="btn" disabled={forkBusy()} onClick={closeFork}>取消</button>
+                <button type="submit" class="btn primary" disabled={forkBusy() || !forkTitle().trim()}>
+                  {forkBusy() ? "处理中…" : forkedId() ? "重试打开副本" : "创建副本"}
+                </button>
+              </div>
+            </form>
+          </dialog>
+        </Portal>
+      </Show>
       <Show when={!isSubagent() && showShare() && state.currentId}>
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
       </Show>
