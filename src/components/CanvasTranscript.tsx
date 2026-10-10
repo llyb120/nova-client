@@ -1193,6 +1193,10 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let imageRebuildTimer: number | undefined;
   const paintedImageSources = new Set<string>();
   const imageSizes = new Map<string, Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">>();
+  // 发送后图片 src 会由 data URL 换成文件 URI；新图加载完成前沿用同一张图的旧元素/尺寸，避免闪烁和跳动。
+  type ImgSize = Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">;
+  const shownImages = new Map<string, { el?: HTMLImageElement; size?: ImgSize }>();
+  const imageKey = (img: PromptImage) => `${img.name}|${img.mimeType}|${img.size ?? ""}`;
   const toolTextLayouts = new LruMap<string, { lines: string[]; seps: string[] }>(32);
 
   // ─── Layout ────────────────────────────────────────────────────────────────
@@ -1358,7 +1362,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             : sourceText;
           // DOM .bubble-images: flex-wrap, img max 240×180, gap 6, margin-bottom 6
           const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH, imgMaxW } =
-            layoutBubbleImages(item.images, maxBubble - 32, img => imageSizes.get(promptImageSrc(img)) ?? null);
+            layoutBubbleImages(item.images, maxBubble - 32, img => {
+              const size = imageSizes.get(promptImageSrc(img));
+              const key = imageKey(img);
+              if (size) shownImages.set(key, { ...shownImages.get(key), size });
+              return size ?? shownImages.get(key)?.size ?? null;
+            });
           // Size to content like DOM (no artificial min-width that leaves empty bubble space).
           const lh = 14 * 1.6;
           let textLayout = userTextLayouts.get(item);
@@ -3558,7 +3567,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   // ─── Image loading ─────────────────────────────────────────────────────────
 
   function loadImage(img: PromptImage): HTMLImageElement | null {
-    return loadImageSource(promptImageSrc(img));
+    const el = loadImageSource(promptImageSrc(img));
+    const key = imageKey(img);
+    const shown = shownImages.get(key);
+    if (el) { if (shown?.el !== el) shownImages.set(key, { ...shown, el }); return el; }
+    return shown?.el ?? null;
   }
 
   function loadImageSource(src: string): HTMLImageElement | null {
@@ -3889,6 +3902,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       groupYs = [];
       imgCache.clear();
       imageSizes.clear();
+      shownImages.clear();
       laidOutStart = laidOutEnd = 0;
       jumpGroup = null;
       keepBottom = true;
