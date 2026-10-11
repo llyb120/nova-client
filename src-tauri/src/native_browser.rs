@@ -445,6 +445,10 @@ fn check(app: &AppHandle, current: &Session) -> Result<(), String> {
     if current.cancel.load(Ordering::SeqCst) {
         return Err("已停止浏览器控制".into());
     }
+    check_visible(app, current)
+}
+
+fn check_visible(app: &AppHandle, current: &Session) -> Result<(), String> {
     // Chrome targets an explicitly authorized tab, independently of Nova's visible thread.
     if current.browser_id == "chrome" {
         return Ok(());
@@ -2070,6 +2074,7 @@ async fn execute_webview(root: &Path, args: &Value) -> Result<Value, String> {
     if operation == "run" {
         return Box::pin(crate::altair_run::browser(root, args, &thread_id, "webview")).await;
     }
+    if operation == "advise" { return Ok(crate::altair::disabled_advice(args)); }
     if crate::tool_experience::is_operation(args) {
         let observed = if operation == "experience_search" { None } else {
             let pages = altair_observation(root, args, &thread_id, "webview")?;
@@ -2119,7 +2124,9 @@ fn altair_observation_key(root: &Path, args: &Value, owner: &str, tool: &str) ->
         let (_, thread_id) = current_context(root)?;
         if thread_id != owner { return Err("会话已切换，停止 Altair 连续决策".into()); }
         let s = session(app, args["browserId"].as_str().ok_or("缺少 browserId")?)?;
-        check(app, &s)?;
+        // control_session retires its input token even on success. Reading its snapshot must
+        // still work; explicit stop removes observations, and hide/switch is checked here.
+        check_visible(app, &s)?;
         s.active_tab
     } else {
         let owner = tool_owner(root, owner)?;
@@ -2161,7 +2168,7 @@ fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashM
     let mut args = args.as_object().cloned().ok_or("chrome 参数必须是对象")?;
     match args.get("operation").and_then(Value::as_str).unwrap_or_default() {
         "connect" | "status" | "tabs" | "open" | "new_tab" | "downloads" | "experience_search" => return Ok(Value::Object(args)),
-        "inspect" | "screenshot" | "act" | "run" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
+        "inspect" | "screenshot" | "act" | "run" | "advise" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
         _ => return Err("缺少或无效 operation；先用 {\"operation\":\"tabs\"} 获取标签".into()),
     }
     let valid_tag = |tag: &str| tag.len() <= 80 && tag.starts_with('C')
@@ -2216,6 +2223,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     if operation == "run" {
         return Box::pin(crate::altair_run::browser(root, args, owner, "chrome")).await;
     }
+    if operation == "advise" { return Ok(crate::altair::disabled_advice(args)); }
     if crate::tool_experience::is_operation(args) {
         let observed = if operation == "experience_search" { None } else {
             let tag = args["tabTag"].as_str().ok_or("经验保存/反馈需tabTag")?;
@@ -2659,7 +2667,7 @@ mod tests {
         observations.insert("chrome:owner:C2-test".into(), second);
         assert!(chrome_args(&inspect, "owner", &observations).is_err());
         assert_eq!(chrome_args(&act, "owner", &observations).unwrap()["tabTag"], "C1-test");
-        for operation in ["run", "experience_save", "experience_feedback", "goto", "close_tab"] {
+        for operation in ["run", "advise", "experience_save", "experience_feedback", "goto", "close_tab"] {
             let args = json!({"operation":operation,"snapshotId":"second"});
             assert_eq!(chrome_args(&args, "owner", &observations).unwrap()["tabTag"], "C2-test");
         }

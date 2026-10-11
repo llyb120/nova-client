@@ -13,7 +13,7 @@ use std::{collections::{BTreeMap, HashMap, HashSet}, path::Path, time::{Duration
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Plan {
     task: String,
-    // task + steps are required; authorization and expectedText have safe defaults.
+    // The vision proxy has safe defaults; with Altair off, preserve the old run contract.
     #[serde(default = "default_authorization")]
     authorization: String,
     #[serde(default)]
@@ -22,6 +22,10 @@ struct Plan {
     inputs: Vec<Input>,
     #[serde(default)]
     steps: Vec<Step>,
+    #[serde(default)]
+    control_names: Vec<String>,
+    #[serde(default, rename = "useExperience")]
+    _use_experience: bool,
     #[serde(default = "default_max_actions")]
     max_actions: usize,
     /// expectedText was given: only then is the final page-text check a completion gate.
@@ -103,14 +107,14 @@ const LOAD_WAIT: Duration = Duration::from_secs(4);
 const POLL: Duration = Duration::from_millis(250);
 const STATE_REPEATS: usize = 3;
 
-fn parse(args: &Value) -> Result<Plan, String> {
-    let mut raw = args["plan"].clone();
-    // Hints of the removed goal mode: still accepted so older prompts parse, but unused.
-    if let Some(object) = raw.as_object_mut() { object.remove("controlNames"); object.remove("useExperience"); }
-    let mut plan: Plan = serde_json::from_value(raw)
+fn parse(args: &Value, altair_enabled: bool) -> Result<Plan, String> {
+    if !altair_enabled && ["authorization", "expectedText"].iter().any(|key| !args["plan"][key].is_string()) {
+        return Err("Altair 关闭时 run 需要 plan.task、authorization、expectedText；直接操作用 act".into());
+    }
+    let mut plan: Plan = serde_json::from_value(args["plan"].clone())
         .map_err(|e| format!("plan 格式错误（{e}）；需要 task 与 steps，steps 须为对象数组，如 [{{\"action\":\"click\",\"target\":\"顶部导航 Intelligence\",\"expect\":\"情报页\"}}]，不是字符串"))?;
-    if plan.steps.is_empty() { return Err("run 需要 plan.steps（主模型给出的步骤）；单步或同屏合批直接用 act".into()); }
-    plan.check_goal = !plan.expected_text.trim().is_empty();
+    if altair_enabled && plan.steps.is_empty() { return Err("run 需要 plan.steps（主模型给出的步骤）；单步或同屏合批直接用 act".into()); }
+    plan.check_goal = !altair_enabled || !plan.expected_text.trim().is_empty();
     if !plan.check_goal { plan.expected_text = plan.task.chars().take(500).collect(); }
     let valid = |s: &str, max: usize| !s.trim().is_empty() && s.chars().count() <= max;
     if !valid(&plan.task, 2000) || !valid(&plan.authorization, 1000) || !valid(&plan.expected_text, 500)
@@ -134,6 +138,9 @@ fn parse(args: &Value) -> Result<Plan, String> {
         return Err(format!("steps[{index}] 无效：action 为 click/fill/press/scroll；click/fill 需 target（或 name）；fill 需 text；press 需 key（Enter/Tab/Escape/ArrowDown/ArrowUp/Space/Backspace）；scroll 可选 direction；repeat≤3"));
     }
     if plan.steps.len() > 24 { return Err("steps 最多24步；更长的流程分段 run".into()); }
+    if plan.control_names.len() > 16 || plan.control_names.iter().any(|n| !valid(n, 300)) {
+        return Err("controlNames 最多16个非空控件名称片段".into());
+    }
     if !(1..=64).contains(&plan.max_actions) { return Err("maxActions 必须为1–64".into()); }
     let mut fields = HashSet::new();
     if plan.inputs.iter().any(|i| !fields.insert((&i.name, &i.role, &i.field_context))) { return Err("inputs 字段重复".into()); }
@@ -797,6 +804,8 @@ impl Run<'_> {
     /// next target (typing, Tab, toggling a selection) share one browser round-trip.
     async fn drive_steps(&mut self, home: &str, started: Instant) -> Result<(), String> {
         let total = self.plan.steps.len();
+        // A legacy goal-only run must hand back without sending input, even if its goal is visible.
+        if total == 0 { return Err("Altair 已关闭，主模型接手；请直接 act 或提供 plan.steps".into()); }
         let (mut attempts, mut repeats, mut scrolled) = (0usize, 0usize, 0usize);
         let mut step_started = Instant::now();
         while self.step_index < total {
@@ -912,12 +921,14 @@ impl Run<'_> {
 }
 
 pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
-    let plan = parse(args)?;
+    let altair_enabled = crate::native_browser::altair_settings()?.altair_enabled;
+    let plan = parse(args, altair_enabled)?;
     let target_key = if tool == "webview" { "browserId" } else { "tabTag" };
     let target = args[target_key].as_str().ok_or("run 缺少浏览器目标")?.to_string();
     let mut snapshot = args["snapshotId"].clone();
     let initial = match crate::native_browser::altair_observation(root, args, owner, tool) {
         Ok(pages) => pages,
+        Err(error) if !altair_enabled => return Err(error),
         // run binds steps against the live DOM, so a missing/stale snapshotId just means observing
         // first instead of bouncing the model back for an inspect round-trip.
         Err(_) => {
@@ -970,17 +981,18 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     for h in &run.history { *nodes.entry(h["node"].as_str().unwrap_or("?").to_string()).or_default() += 1; }
     let total_steps = run.plan.steps.len();
     let resume = run.step_index.min(total_steps);
-    let guided = json!({"totalSteps":total_steps,"completedSteps":resume,
+    let guided = if total_steps == 0 { Value::Null } else { json!({"totalSteps":total_steps,"completedSteps":resume,
         "failedStep":if handoff && resume < total_steps { json!(resume + 1) } else { Value::Null },
         "remainingSteps":if handoff { json!(run.raw_steps.as_array().map(|s| s[resume..].to_vec()).unwrap_or_default()) } else { json!([]) },
         "failedStepCandidates":if handoff && resume < total_steps { json!(run.step_candidates) } else { json!([]) },
         "resolvedLocally":run.resolved_locally,"checks":run.checks,
-        "next":if handoff { "按 reason 修正 remainingSteps 的第一步（target/name/within/expect），只提交 remainingSteps 重新 run；已完成的步骤不要重放。" } else { "" }});
+        "next":if handoff { "按 reason 修正 remainingSteps 的第一步（target/name/within/expect），只提交 remainingSteps 重新 run；已完成的步骤不要重放。" } else { "" }}) };
     latest["altairRun"] = json!({"status":if handoff {"handoff"} else {"completed"},
         "reason":outcome.err(),
         "guided":guided,
         "verification":if handoff || !run.plan.check_goal {"unverified"} else {"subgoal_verified"},
         "executedActions":run.executed,"nodes":nodes,
+        "requestCount":0,
         "observationRefreshes":run.refreshes,"preflightRecoveries":run.preflight_recoveries,"maxActions":run.plan.max_actions,
         "elapsedMs":started.elapsed().as_millis() as u64,
         "history":run.history,
@@ -999,19 +1011,51 @@ mod tests {
     use super::*;
 
     fn hints(pages: &Value, used: &HashSet<String>) -> Vec<Candidate> { candidates(pages, used).unwrap() }
-    fn plan(value: Value) -> Plan { parse(&json!({"plan":value})).unwrap() }
+    fn plan(value: Value) -> Plan { parse(&json!({"plan":value}), true).unwrap() }
 
     #[test]
     fn run_requires_main_model_steps() {
-        let error = parse(&json!({"plan":{"task":"筛选美国"}})).err().unwrap();
+        let error = parse(&json!({"plan":{"task":"筛选美国"}}), true).err().unwrap();
         assert!(error.contains("plan.steps") && error.contains("act"), "{error}");
-        assert!(parse(&json!({"plan":{"task":"筛选美国","steps":[]}})).is_err());
+        assert!(parse(&json!({"plan":{"task":"筛选美国","steps":[]}}), true).is_err());
         let p = plan(json!({"task":"筛选美国","steps":[{"action":"click","target":"United States 复选框"}]}));
         assert_eq!(p.expected_text, "筛选美国");
         assert!(p.authorization.contains("不可逆"));
         // Hints of the removed goal mode are accepted and ignored.
         assert!(parse(&json!({"plan":{"task":"t","useExperience":true,"controlNames":["x"],
-            "steps":[{"action":"press","key":"Enter"}]}})).is_ok());
+            "steps":[{"action":"press","key":"Enter"}]}}), true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn disabled_run_preserves_legacy_plan_and_hands_back_without_input() {
+        let args = json!({"plan":{"task":"筛选美国","authorization":"只读筛选","expectedText":"United States",
+            "controlNames":["Region"],"useExperience":true}});
+        let p = parse(&args, false).unwrap();
+        assert!(p.steps.is_empty() && p.check_goal);
+        assert!(parse(&args, true).is_err(), "enabled mode still requires explicit steps");
+        for key in ["authorization", "expectedText"] {
+            let mut invalid = args.clone();
+            invalid["plan"].as_object_mut().unwrap().remove(key);
+            assert!(parse(&invalid, false).is_err());
+            invalid["plan"][key] = json!(" ");
+            assert!(parse(&invalid, false).is_err());
+        }
+        let mut guided = args.clone();
+        guided["plan"]["steps"] = json!([{"action":"click","target":"United States 复选框"}]);
+        assert!(parse(&guided, false).unwrap().check_goal);
+        guided["plan"]["controlNames"] = json!([""]);
+        assert!(parse(&guided, false).is_err());
+        let mut run = Run {
+            root: Path::new("."), owner: "test", tool: "webview", target_key: "browserId", target: "test".into(), plan: p,
+            snapshot: Value::Null, latest: Value::Null, history: vec![], trace: vec![], refreshes: 0, executed: 0,
+            preflight_recoveries: 0, preflight: 0, used: HashSet::new(), state_actions: HashMap::new(),
+            baseline: None, loading_since: None, raw_steps: Value::Null, step_index: 0, resolved_locally: 0,
+            checks: vec![], step_candidates: vec![],
+        };
+        let error = run.drive_steps("https://example.test", Instant::now()).await.unwrap_err();
+        assert!(error.contains("已关闭"), "{error}");
+        assert_eq!(run.executed, 0);
+        assert!(run.history.is_empty());
     }
 
     #[test]
@@ -1109,9 +1153,9 @@ mod tests {
         assert_eq!(rank_for_step(&p.steps[0], &p, &all).len(), 1);
         assert_eq!(bound(&p, 0, &pages).unwrap().action, json!({"action":"fill","frame":1,"ref":"branch","text":"version/260924/main"}));
         let mut args = json!({"plan":{"task":"t","steps":[{"action":"press","key":"Enter"}],"inputs":[{"name":"","text":"x"}]}});
-        assert!(parse(&args).is_err(), "nameless inputs need a role or fieldContext");
+        assert!(parse(&args, true).is_err(), "nameless inputs need a role or fieldContext");
         args["plan"]["inputs"][0]["fieldContext"] = json!("Week ~ [field 1/2]");
-        assert!(parse(&args).is_ok());
+        assert!(parse(&args, true).is_ok());
     }
 
     #[test]
@@ -1123,11 +1167,11 @@ mod tests {
         assert!(hints(&fresh, &used).is_empty());
         let step = json!({"action":"press","key":"Enter"});
         let mut args = json!({"plan":{"task":"t","authorization":"a","expectedText":"e","steps":[step]}});
-        assert_eq!(parse(&args).unwrap().max_actions, 32);
-        for invalid in [0, 65] { args["plan"]["maxActions"] = json!(invalid); assert!(parse(&args).is_err()); }
+        assert_eq!(parse(&args, true).unwrap().max_actions, 32);
+        for invalid in [0, 65] { args["plan"]["maxActions"] = json!(invalid); assert!(parse(&args, true).is_err()); }
         args["plan"]["maxActions"] = json!(8);
         args["plan"]["steps"] = json!(vec![step; 25]);
-        assert!(parse(&args).is_err());
+        assert!(parse(&args, true).is_err());
         assert!(origin(&json!({"pages":[{"url":"file:///tmp/x"}]})).is_err());
     }
 
@@ -1280,7 +1324,7 @@ mod tests {
         assert!(!chains(&plan.steps[4], &checkbox), "a step with an expectation is always checked before continuing");
         for invalid in [json!({"action":"press"}), json!({"action":"fill","target":"x"}), json!({"action":"hover","target":"x"}),
             json!({"action":"click"}), json!({"action":"click","target":"x","repeat":4}), json!({"action":"press","key":"F5"})] {
-            assert!(parse(&json!({"plan":{"task":"t","authorization":"a","expectedText":"e","steps":[invalid]}})).is_err());
+            assert!(parse(&json!({"plan":{"task":"t","authorization":"a","expectedText":"e","steps":[invalid]}}), true).is_err());
         }
         let pages = json!({"pages":[{"url":"https://x.test/?order=desc","visibleText":"Region United States","title":"Top"}]});
         assert!(literal_met(&pages, "美国|United States") && literal_met(&pages, "order=desc") && !literal_met(&pages, "Canada"));

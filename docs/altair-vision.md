@@ -14,7 +14,10 @@ Altair（设置里选的 Lyra 识图模型，`src-tauri/src/altair.rs`）只当�
   - 文字描述：`altair::ground` 在该快照截图上定位，置信度 < 0.6 不执行。
 - **连续操作（剑来）**：一次 act 里带 target 的多步由 `jianlai::vision_act` 逐步执行。每步定位后单独走原有 act 校验（快照/窗口/遮挡/像素守卫），反馈截图等界面稳定后作为下一步依据；`vN` 在画面变化后按其标签重新定位。任一步失败即停，返回 `steps`，不重放。最后一张图再经出口过滤变成文字。
 - **浏览器**：DOM 动作照旧用 frame/ref；`click_at/move/scroll_at/drag` 支持 target，按该 snapshotId 自己的截图定位（同一批共用一张图）。
-- **run**：只执行主模型给出的 `plan.steps`（必填，1–24 步），本地在最新 DOM 上绑定、步间等页面稳定；歧义或 expect 不成立时交回。`expectedText` 可选，给出时才做最终文字核验。不再有 Altair 自动驾驶、强制委托、advise。
+- **run（Altair 开启）**：只执行主模型给出的 `plan.steps`（必填，1–24 步），本地在最新 DOM 上绑定、步间等页面稳定；歧义或 expect 不成立时交回。`expectedText` 可选，给出时才做最终文字核验。不再有 Altair 自动驾驶或强制委托。
+- **关闭兼容**：按 `e661418` 的关闭路径处理。原图直接返回，不调用 Altair；浏览器 run 需要有效 `snapshotId` 和 `plan.task/authorization/expectedText`，缺省或空 steps 只返回 handoff、不执行动作，有 steps 时执行后必须核验完成条件。保留 `controlNames/useExperience` 旧参数的格式校验，但不恢复自动决策。桌面 run 仍等价于 act，并提示主模型核对新截图。旧 `advise` 调用在三个工具中均返回 disabled、不请求模型。运行报告统一使用 `altairRun`；不恢复 JEV 服务或配置。浏览器摘要、快捷键等独立修复保留。
+
+关闭状态 dev 回归：`node scripts/altair-vision-live.mjs --run --altair-off`。检查原图交给主模型、Canvas 识读和坐标点击，以及 advise 关闭返回、无 steps 的 handoff、有 steps 的执行核验、stop 后旧快照被拒绝。去掉 `--altair-off` 检查视觉代理模式。快照读取不使用上一条已结束操作的取消令牌；执行中的取消保护、会话可见性和 stop 作废快照仍保留。
 
 实测（`commandcode/deepseek/deepseek-v4.1-flash-fast`，合成 2000×1200 图）：`see` 约 5.3 秒，两个色块描述正确、目标中心误差 < 15px；`ground` 约 3.4 秒，误差 < 10px。用例 `cargo test --lib probe_live_see_and_ground -- --ignored`（`NOVA_DATA_DIR`、`NOVA_ALTAIR_PROBE_MODEL` 指定配置）。
 > 以下为 JEV/Altair 决策时期的历史记录，相关代码已移除，仅供参考。
