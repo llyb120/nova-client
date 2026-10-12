@@ -283,7 +283,7 @@ unsafe fn collect(walker: &IUIAutomationTreeWalker, node: &IUIAutomationElement,
 unsafe fn message_loop() {
     if SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_null() { return; }
     let instance = GetModuleHandleW(null());
-    let class = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: instance, lpszClassName: CLASS, style: CS_DBLCLKS, hCursor: LoadCursorW(null_mut(), IDC_HAND), ..Default::default() };
+    let class = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: instance, lpszClassName: CLASS, style: CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW, hCursor: LoadCursorW(null_mut(), IDC_HAND), ..Default::default() };
     if RegisterClassW(&class) == 0 { return; }
     let controls = INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_WIN95_CLASSES };
     InitCommonControlsEx(&controls);
