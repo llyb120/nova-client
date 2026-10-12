@@ -22,7 +22,7 @@ use windows_sys::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED}, Gdi::*},
-        System::LibraryLoader::GetModuleHandleW,
+        System::{LibraryLoader::GetModuleHandleW, SystemInformation::{GetVersionExW, OSVERSIONINFOW}},
         UI::{
             Controls::{
                 InitCommonControlsEx, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR, NMTTDISPINFOW,
@@ -340,7 +340,19 @@ unsafe fn refresh(shown: &mut Option<Status>) {
         // that can reset process DPI awareness. Restore physical coordinates after.
         let previous = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(parent));
         if previous.is_null() { return; }
-        hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, CLASS, w!("Nova taskbar status"), WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 0, 0, parent, null_mut(), GetModuleHandleW(null()), null());
+        // Windows 11's XAML taskbar is composed without a redirection surface, so a plain GDI
+        // child never reaches the screen. A layered child (Windows 8+, declared in the app
+        // manifest) gets its own surface; fall back to a plain child if the host refuses it.
+        // Windows 10's GDI taskbar never shows a layered child: keep it on the plain child.
+        let create = |ex| CreateWindowExW(ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, CLASS, w!("Nova taskbar status"), WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 0, 0, parent, null_mut(), GetModuleHandleW(null()), null());
+        let mut os = OSVERSIONINFOW { dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32, ..Default::default() };
+        // The manifest's Windows 10 declaration makes this report the real build (11 = 22000+).
+        if GetVersionExW(&mut os) != 0 && os.dwBuildNumber >= 22000 { hwnd = create(WS_EX_LAYERED); }
+        if !hwnd.is_null() && SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA) == 0 {
+            DestroyWindow(hwnd);
+            hwnd = null_mut();
+        }
+        if hwnd.is_null() { hwnd = create(0); }
         SetThreadDpiAwarenessContext(previous);
         if hwnd.is_null() { return; }
         WINDOW.store(hwnd as usize, Ordering::Release);
