@@ -18,7 +18,7 @@ test('embedded CodeBuddy MCP advertises the current browser schemas and instruct
   try {
     await client.connect(transport);
     const listed=(await client.listTools()).tools;
-    for(const name of ['chrome','webview']) {
+    for(const name of ['chrome','webview','jianlai']) {
       const actual=listed.find(t=>t.name===name),expected=await tool(name);
       assert(actual,`missing bundled ${name}`);
       assert.deepEqual(actual.inputSchema,expected.inputSchema,'Run npm run build:nova-tools-mcp before compiling Nova');
@@ -57,6 +57,9 @@ test('Chrome, WebView and Jianlai run only executes pre-confirmed steps', async(
     assert.equal(browser.inputSchema.properties.actions.items.properties.target,undefined);
     assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
   }
+  assert.match(jianlai.description,/Windows的type用整段剪贴板粘贴/);
+  assert.match(jianlai.description,/clipboard\.text.*相等就不重输/);
+  assert.match(jianlai.description,/未核验前不发送/);
   assert.equal(jianlai.inputSchema.properties.plan,undefined);
   assert.deepEqual(jianlai.inputSchema.properties.actions.items.allOf[0].then,{required:['x','y']});
   assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,24);

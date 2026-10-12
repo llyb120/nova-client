@@ -10,6 +10,8 @@ use std::{
 use xcap::{Monitor, Window};
 
 mod background;
+#[cfg(windows)]
+mod text_input;
 
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
@@ -625,7 +627,7 @@ fn keys(raw: &str) -> Result<Vec<Key>> {
             "f11" => Ok(Key::F11),
             "f12" => Ok(Key::F12),
             // Enigo 0.6 passes VkKeyScanExW's shift-state high byte through as VK.
-            // Shortcuts use physical letter/digit VKs; text still uses enigo.text.
+            // Shortcuts use physical letter/digit VKs; Windows text is pasted as one payload.
             #[cfg(windows)]
             _ if s.len() == 1 && s.as_bytes()[0].is_ascii_alphanumeric() =>
                 Ok(Key::Other(s.as_bytes()[0].to_ascii_uppercase() as u32)),
@@ -936,7 +938,12 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
             moved?;
             released?;
         }
-        "type" => enigo.text(a.text.as_deref().unwrap()).map_err(err)?,
+        "type" => {
+            #[cfg(windows)]
+            text_input::paste(enigo, a.text.as_deref().unwrap(), expected_foreground)?;
+            #[cfg(not(windows))]
+            enigo.text(a.text.as_deref().unwrap()).map_err(err)?;
+        }
         "press" => {
             let keys = keys(a.key.as_deref().unwrap())?;
             let pressed = keys
@@ -1234,7 +1241,8 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let mut completed = 0;
             let mut failure = None;
             let mut attempted = false;
-            let clipboard = crate::clipboard::sequence();
+            let mut clipboard = crate::clipboard::sequence();
+            let mut copied_before_paste = None;
             let mut failed_point = None;
             let mut frames = Vec::new();
             for (index, a) in actions.iter().enumerate() {
@@ -1247,11 +1255,17 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                         break;
                     }
                 }
+                let clipboard_paste = cfg!(windows) && a.action == "type" && a.text.as_deref().is_some_and(|text| !text.is_empty());
+                if clipboard_paste {
+                    if let Some(copied) = crate::clipboard::copied_since(clipboard) { copied_before_paste = Some(copied); }
+                }
                 attempted = true;
                 let sent = match enigo.as_mut() {
                     Some(enigo) => input(enigo, &shot, a, snap.foreground),
                     None => post_background(&shot, a),
                 };
+                // Our temporary paste/restore is not a copy made by the target application.
+                if clipboard_paste { clipboard = crate::clipboard::sequence(); }
                 if let Err(e) = sent {
                     failed_point = point(&shot, a.x, a.y).ok();
                     failure = Some(e);
@@ -1299,7 +1313,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 }
             }
             // Read after feedback settling so apps that write the clipboard asynchronously have finished.
-            if let Some(copied) = crate::clipboard::copied_since(clipboard) { result["clipboard"] = copied; }
+            if let Some(copied) = crate::clipboard::copied_since(clipboard).or(copied_before_paste) { result["clipboard"] = copied; }
             if let (Some(p), Some(current)) = (failed_point, state.as_mut().filter(|s| s.foreground == snap.foreground)) {
                 if let Err(error) = failure_detail(current, &shot.surface, p, &mut result) {
                     result["detailError"] = json!(error);
