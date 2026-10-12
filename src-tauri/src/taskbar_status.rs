@@ -2,7 +2,44 @@
 //! Jianlai only exempts text repaint inside an unchanged, verified child rectangle.
 
 #[cfg(windows)]
+mod bubble;
+#[cfg(windows)]
 mod windows;
+
+/// Bubble data: status, full latest reply and pending confirmations (null when the island is off).
+#[tauri::command]
+pub(crate) fn taskbar_bubble(app: tauri::AppHandle) -> serde_json::Value {
+    #[cfg(windows)]
+    return bubble::payload(&app);
+    #[cfg(not(windows))]
+    { let _ = app; serde_json::Value::Null }
+}
+
+/// The bubble page reports its rendered CSS height; the first call after a click also shows it.
+/// Returns whether the bubble is meant to be visible.
+#[tauri::command]
+pub(crate) fn taskbar_bubble_place(app: tauri::AppHandle, height: f64) -> bool {
+    #[cfg(windows)]
+    return bubble::place(&app, height);
+    #[cfg(not(windows))]
+    { let _ = (app, height); false }
+}
+
+#[tauri::command]
+pub(crate) fn taskbar_bubble_hide(app: tauri::AppHandle) {
+    #[cfg(windows)]
+    bubble::hide(&app);
+    #[cfg(not(windows))]
+    let _ = app;
+}
+
+#[tauri::command]
+pub(crate) fn taskbar_bubble_open(app: tauri::AppHandle, thread_id: Option<String>) {
+    #[cfg(windows)]
+    bubble::open_thread(&app, thread_id);
+    #[cfg(not(windows))]
+    let _ = (app, thread_id);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Rect {
@@ -208,7 +245,7 @@ fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
         .map(|v| v["threadId"].as_str().map(str::to_string)).collect();
     if desktop.is_none() && !waiting.is_empty() {
         let text = format!("{} 项待你确认", waiting.len());
-        return Some(Status::new(Kind::Waiting, text, String::new(), &["有操作等待你确认", "点击前往处理"], waiting.into_iter().flatten().next()));
+        return Some(Status::new(Kind::Waiting, text, String::new(), &["有操作等待你确认", "单击在气泡中处理 · 双击打开 Nova"], waiting.into_iter().flatten().next()));
     }
     // ponytail: scan thread headers once per refresh, not transcripts; if histories grow large,
     // replace this with a running-id index maintained by the shared runtime.
@@ -230,7 +267,7 @@ fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
         let started = thread.items.iter().rev().find_map(|item| match item { Item::User { ts, .. } => Some(*ts), _ => None });
         let text = if running.len() > 1 { format!("{} 项 · {activity}", running.len()) } else { activity.clone() };
         let trailing = started.map(|t| elapsed(now - t)).unwrap_or_default();
-        return Some(Status::new(Kind::Running, text, trailing, &[&thread.title, &activity, "点击查看进度"], Some(thread.id.clone())));
+        return Some(Status::new(Kind::Running, text, trailing, &[&thread.title, &activity, "单击查看进度 · 双击打开 Nova"], Some(thread.id.clone())));
     }
     if let Some(activity) = desktop {
         return Some(Status::new(Kind::Running, format!("剑来 · {activity}"), String::new(), &["Nova 正在操作桌面"], None));
@@ -241,7 +278,7 @@ fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
         (t.id.as_str(), t.updated_at, t.unread_turns)
     }).collect();
     let Some(thread) = pick(&candidates, &seen).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
-        return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Nova", "点击打开"], None));
+        return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Nova", "双击打开"], None));
     };
     // The last turn's final reply (or error) is the conclusion.
     let (kind, body) = thread.items.iter().rev()
@@ -252,7 +289,7 @@ fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
             _ => None,
         }).unwrap_or((Kind::Done, ""));
     let text = conclusion(body).unwrap_or_else(|| if kind == Kind::Error { "任务出错" } else { "已完成" }.into());
-    Some(Status::new(kind, text, ago(now - thread.updated_at), &[&thread.title, &excerpt(body, 240), "点击打开会话"], Some(thread.id.clone())))
+    Some(Status::new(kind, text, ago(now - thread.updated_at), &[&thread.title, &excerpt(body, 240), "单击查看完整结论 · 双击打开会话"], Some(thread.id.clone())))
 }
 
 /// Non-empty lines with common markdown decoration removed.

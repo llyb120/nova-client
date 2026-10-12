@@ -1699,7 +1699,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>Windows 任务栏灵动岛（实验）</span>
                 </label>
                 <span class="field-hint">
-                  开启后常驻 Windows 任务栏空闲区域：运行中显示当前动作与耗时，待确认时提醒，结束后显示结论；悬停看详情，点击打开对应会话。默认关闭；保存后即时生效。
+                  开启后常驻 Windows 任务栏空闲区域：运行中显示当前动作与耗时，待确认时提醒，结束后显示结论；单击弹出详情气泡（待确认事项可直接在气泡中选择），双击打开 Nova 对应会话。默认关闭；保存后即时生效。
                 </span>
               </div>
               <div class="field">

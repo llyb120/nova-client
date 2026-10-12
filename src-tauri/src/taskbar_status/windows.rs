@@ -29,7 +29,7 @@ use windows_sys::{
                 TOOLTIPS_CLASSW, TTDT_AUTOPOP, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETDELAYTIME,
                 TTM_SETMAXTIPWIDTH, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
             },
-            HiDpi::*, Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE}, WindowsAndMessaging::*,
+            HiDpi::*, Input::KeyboardAndMouse::{GetDoubleClickTime, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE}, WindowsAndMessaging::*,
         },
     },
 };
@@ -43,6 +43,8 @@ const REFRESH: u32 = WM_APP + 1;
 const WM_MOUSELEAVE: u32 = 0x02A3; // Win32 Controls message paired with TME_LEAVE.
 static LAYOUT: Mutex<Option<Arc<Layout>>> = Mutex::new(None);
 const ANIMATION: usize = 1;
+/// Single click waits out the double-click time before opening the bubble.
+const CLICK: usize = 2;
 
 // Everything below is touched only by the status message thread (refresh + window_proc).
 thread_local! {
@@ -50,6 +52,35 @@ thread_local! {
     static TIP: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
     static TOOLTIP: Cell<usize> = const { Cell::new(0) };
     static EPOCH: Instant = Instant::now();
+    /// This press found the bubble open, so its click only closes it.
+    static CLOSING: Cell<bool> = const { Cell::new(false) };
+    /// The button-up that ends a double click must not start a bubble.
+    static DOUBLE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Tauri window calls round-trip through the main thread; never block Explorer's child on them.
+fn on_app(work: impl FnOnce(&tauri::AppHandle) + Send + 'static) {
+    if let Some(app) = APP.get() { thread::spawn(move || work(app)); }
+}
+
+fn idle() -> bool {
+    CURRENT.with(|c| c.borrow().as_ref().is_none_or(|s| s.kind == Kind::Idle))
+}
+
+/// Chip rectangle and its monitor's work area, in physical pixels.
+unsafe fn anchor(hwnd: HWND) -> Option<super::bubble::Anchor> {
+    let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if previous.is_null() { return None; }
+    let result = (|| {
+        let chip = window_rect(hwnd)?;
+        let mut monitor = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut monitor) == 0 { return None; }
+        let w = monitor.rcWork;
+        let scale = GetDpiForWindow(hwnd).max(96) as f64 / 96.0;
+        Some(super::bubble::Anchor { chip, work: Rect { left: w.left, top: w.top, right: w.right, bottom: w.bottom }, scale })
+    })();
+    SetThreadDpiAwarenessContext(previous);
+    result
 }
 
 struct Layout {
@@ -252,7 +283,7 @@ unsafe fn collect(walker: &IUIAutomationTreeWalker, node: &IUIAutomationElement,
 unsafe fn message_loop() {
     if SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_null() { return; }
     let instance = GetModuleHandleW(null());
-    let class = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: instance, lpszClassName: CLASS, hCursor: LoadCursorW(null_mut(), IDC_HAND), ..Default::default() };
+    let class = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: instance, lpszClassName: CLASS, style: CS_DBLCLKS, hCursor: LoadCursorW(null_mut(), IDC_HAND), ..Default::default() };
     if RegisterClassW(&class) == 0 { return; }
     let controls = INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_WIN95_CLASSES };
     InitCommonControlsEx(&controls);
@@ -520,17 +551,34 @@ unsafe fn attach_tooltip(hwnd: HWND) {
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_LBUTTONDOWN => {
+            let closing = super::bubble::is_open();
+            CLOSING.set(closing);
+            if !closing && !idle() { on_app(|app| { super::bubble::window(app); }); }
+            0
+        }
         WM_LBUTTONUP => {
-            // Like a notification click: bring Nova forward on the thread the island is about.
-            if let Some(app) = APP.get() {
-                crate::sys_notify::focus_main_window(app);
-                if let Some(thread) = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone())) {
-                    super::mark_seen(app, &thread);
-                    wake();
-                    use tauri::Emitter;
-                    let _ = app.emit(crate::acp::EV_NOTIFY_OPEN, serde_json::json!({ "threadId": thread }));
-                }
+            if DOUBLE.replace(false) { return 0; }
+            if CLOSING.get() {
+                on_app(super::bubble::hide);
+            } else {
+                SetTimer(hwnd, CLICK, GetDoubleClickTime(), None);
             }
+            0
+        }
+        WM_LBUTTONDBLCLK => {
+            // Double click: the full Nova window, on the thread the island is about.
+            KillTimer(hwnd, CLICK);
+            DOUBLE.set(true);
+            let thread = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone()));
+            on_app(move |app| super::bubble::open_thread(app, thread));
+            0
+        }
+        WM_TIMER if wparam == CLICK => {
+            KillTimer(hwnd, CLICK);
+            // Idle has nothing to show; a double click still opens Nova.
+            if idle() { return 0; }
+            if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open(app, anchor)); }
             0
         }
         WM_TIMER if wparam == ANIMATION => {
