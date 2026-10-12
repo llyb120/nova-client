@@ -627,7 +627,7 @@ fn keys(raw: &str) -> Result<Vec<Key>> {
             "f11" => Ok(Key::F11),
             "f12" => Ok(Key::F12),
             // Enigo 0.6 passes VkKeyScanExW's shift-state high byte through as VK.
-            // Shortcuts use physical letter/digit VKs; Windows text is pasted as one payload.
+            // Shortcuts use physical letter/digit VKs; Windows text prefers paste with a clipboard-free fallback.
             #[cfg(windows)]
             _ if s.len() == 1 && s.as_bytes()[0].is_ascii_alphanumeric() =>
                 Ok(Key::Other(s.as_bytes()[0].to_ascii_uppercase() as u32)),
@@ -940,7 +940,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
         }
         "type" => {
             #[cfg(windows)]
-            text_input::paste(enigo, a.text.as_deref().unwrap(), expected_foreground)?;
+            text_input::type_text(enigo, a.text.as_deref().unwrap(), expected_foreground)?;
             #[cfg(not(windows))]
             enigo.text(a.text.as_deref().unwrap()).map_err(err)?;
         }
@@ -989,7 +989,12 @@ fn post_background(shot: &Shot, a: &Action) -> Result<()> {
     background::post(pid, shot.surface.id, at, to, a)
 }
 
-fn run(owner: String, args: Value) -> Result<Value> {
+fn run(owner: String, mut args: Value) -> Result<Value> {
+    // Some clients omit the operation while supplying a complete action batch. Normalize the
+    // unambiguous shape only; an explicitly supplied operation is never overridden.
+    if args.get("operation").is_none() && args["actions"].is_array() {
+        args["operation"] = json!("act");
+    }
     let is_act = args["operation"] == "act";
     let operation = args["operation"].clone();
     let based_on = args["snapshotId"].clone();
@@ -1179,6 +1184,25 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 return Err(
                     "剑来 Linux 输入当前仅支持 X11；Wayland 不会静默使用 XWayland 操作".into(),
                 );
+            }
+            if request.snapshot_id.as_deref().is_none_or(|id| id.trim().is_empty()) {
+                // Missing is not stale. Do not capture again and invalidate the very ID the model
+                // needs to supply. Never expose another client's or an invalidated snapshot.
+                let mut result = json!({"status":"not_executed","completedActions":0,
+                    "errorCode":"missing_snapshot_id","required":["snapshotId"],
+                    "error":"act 缺少 snapshotId（不是快照过期）；未执行、未重新截图。请原样填写上次观察返回的 snapshotId 后提交动作。"});
+                if let Some(snap) = state.as_ref().filter(|snap| snap.owner == owner && snap.background == bg
+                    && snap.invalidated.is_none() && snap.taken.elapsed() <= Duration::from_secs(180)) {
+                    result["snapshotId"] = json!(snap.id);
+                    result["snapshotPreserved"] = json!(true);
+                    result["imageIds"] = json!(snap.shots.iter().map(|shot| &shot.image_id).collect::<Vec<_>>());
+                    result["nextArguments"] = json!({"operation":"act","snapshotId":snap.id});
+                    if snap.shots.len() == 1 { result["nextArguments"]["imageId"] = json!(snap.shots[0].image_id); }
+                    result["next"] = json!("使用已有对应图片和 nextArguments 补齐参数，再附上确认过的 actions；没有输入过的动作可以提交，无需再截图。");
+                } else {
+                    result["next"] = json!("当前没有本会话未失效的同模式快照；先 windows(observe:true) 或 screenshot 获取 snapshotId，不要继续省略它。");
+                }
+                return Ok(result);
             }
             if state.is_none() {
                 let mut result = json!({"status":"not_executed","completedActions":0,"error":"没有可用快照，附当前观察；基于新图重新决策"});
@@ -1721,8 +1745,47 @@ mod tests {
         assert_eq!(foreign["completedActions"], 0);
         assert!(foreign.get("images").is_none());
         assert_eq!(DESKTOP.lock().unwrap().as_ref().unwrap().id, "validation");
-        let result = run("validation".into(), json!({"operation":"act","snapshotId":"validation",
+        let original_taken = DESKTOP.lock().unwrap().as_ref().unwrap().taken;
+        for request in [
+            json!({"operation":"act","imageId":"monitor-1","actions":[{"action":"click","x":1,"y":1}]}),
+            json!({"operation":"act","snapshotId":"","actions":[{"action":"click","x":1,"y":1}]}),
+            json!({"actions":[{"action":"click","x":1,"y":1}]}),
+        ] {
+            let result = run("validation".into(), request).unwrap();
+            assert_eq!(result["errorCode"], "missing_snapshot_id");
+            assert_eq!(result["status"], "not_executed");
+            assert_eq!(result["completedActions"], 0);
+            assert_eq!(result["snapshotId"], "validation");
+            assert_eq!(result["nextArguments"], json!({"operation":"act","snapshotId":"validation","imageId":"monitor-1"}));
+            assert!(result.get("images").is_none(), "missing parameters must not generate a new screenshot");
+            let state = DESKTOP.lock().unwrap();
+            assert_eq!(state.as_ref().unwrap().id, "validation");
+            assert_eq!(state.as_ref().unwrap().taken, original_taken);
+        }
+        for (owner, invalidated, expired, background) in [("other-owner", false, false, false),
+            ("validation", true, false, false), ("validation", false, true, false), ("validation", false, false, true)] {
+            {
+                let mut state = DESKTOP.lock().unwrap();
+                let snap = state.as_mut().unwrap();
+                snap.invalidated = invalidated.then(|| "changed by browser".into());
+                snap.taken = if expired { original_taken - Duration::from_secs(181) } else { original_taken };
+                snap.background = background;
+            }
+            let result = run(owner.into(), json!({"operation":"act","actions":[{"action":"click","x":1,"y":1}]})).unwrap();
+            assert_eq!(result["completedActions"], 0);
+            assert!(result.get("snapshotId").is_none());
+            assert!(result.get("nextArguments").is_none());
+        }
+        {
+            let mut state = DESKTOP.lock().unwrap();
+            let snap = state.as_mut().unwrap();
+            snap.invalidated = None; snap.taken = original_taken; snap.background = false;
+        }
+        // Reproduce the user's FIRST call: correct snapshotId but omitted operation. An invalid
+        // wait prevents real input while proving it reaches the shared act validation path.
+        let result = run("validation".into(), json!({"snapshotId":"validation",
             "imageId":"monitor-1","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":8000}]})).unwrap();
+        assert_eq!(result["operation"], "act");
         assert_eq!(result["status"], "not_executed");
         assert_eq!(result["completedActions"], 0);
         assert!(result["error"].as_str().unwrap().contains("actions[1].ms=8000"));

@@ -57,9 +57,12 @@ test('Chrome, WebView and Jianlai run only executes pre-confirmed steps', async(
     assert.equal(browser.inputSchema.properties.actions.items.properties.target,undefined);
     assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
   }
-  assert.match(jianlai.description,/Windows的type用整段剪贴板粘贴/);
+  assert.match(jianlai.description,/Windows的type整段粘贴，目标读取后自动恢复原剪贴板，从不逐字模拟按键/);
+  assert.doesNotMatch(jianlai.description,/Unicode/);
   assert.match(jianlai.description,/clipboard\.text.*相等就不重输/);
   assert.match(jianlai.description,/未核验前不发送/);
+  assert.match(jianlai.inputSchema.properties.snapshotId.description,/act\/run必填/);
+  assert.match(jianlai.description,/漏snapshotId只返回补参提示/);
   assert.equal(jianlai.inputSchema.properties.plan,undefined);
   assert.deepEqual(jianlai.inputSchema.properties.actions.items.allOf[0].then,{required:['x','y']});
   assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,24);
