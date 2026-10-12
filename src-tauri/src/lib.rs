@@ -21,6 +21,7 @@ mod chrome_browser;
 mod lyra;
 mod lyra_complete;
 mod model_cache;
+mod meteor;
 mod nova_tools_native;
 mod path_env;
 mod quota;
@@ -4380,6 +4381,7 @@ async fn apply_runtime_settings(
     persist: bool,
     restart_all_agents: bool,
 ) -> Result<(), String> {
+    meteor::validate(&settings)?;
     let state = app.state::<AppState>();
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
@@ -4514,6 +4516,7 @@ async fn apply_runtime_settings(
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     sync_global_session_shortcuts(app);
+    meteor::sync(app);
     spawn_session_auto_cleanup(app.clone());
     Ok(())
 }
@@ -5550,6 +5553,7 @@ pub fn run() {
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
             });
             native_browser::init(app.handle());
+            meteor::start(app.handle());
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             sync_global_session_shortcuts(app.handle());
@@ -5787,6 +5791,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            meteor::meteor_open,
+            meteor::meteor_context,
+            meteor::meteor_submit,
+            meteor::meteor_cancel,
+            meteor::meteor_set_shortcut_recording,
             employee::employee_get,
             employee::employee_set,
             employee::employee_do,

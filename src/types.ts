@@ -495,6 +495,13 @@ export interface Settings {
   modelFavorites: string[];
   /** 会话快捷键：按键一键切换项目或模型 */
   sessionShortcuts: SessionShortcut[];
+  /** Meteor 屏幕标注入口；dev 实例运行时非 dev 实例自动停用 */
+  meteorEnabled: boolean;
+  /** Alt+Alt 表示连按两次 Alt，其余为全局组合键 */
+  meteorShortcut: string;
+  meteorAgentKind: AgentKind;
+  /** 空值使用所选后端的默认模型 */
+  meteorModel: string;
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
   lyraEnabled: boolean;

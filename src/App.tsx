@@ -16,7 +16,7 @@ import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
 import { selectedChatText } from "./chatSelection";
 import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
-import { mountSessionShortcuts } from "./sessionShortcuts";
+import { mountSessionShortcuts, setShortcutRecordingActive } from "./sessionShortcuts";
 import { createHomeTerminalState, setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
 const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
 const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"));
@@ -177,6 +177,7 @@ export default function App() {
   });
 
   onMount(() => {
+    setShortcutRecordingActive(false);
     void initStore();
 
     // Native global shortcut events also arrive while the WebView is unfocused/minimized.

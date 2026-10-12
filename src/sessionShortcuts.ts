@@ -1,14 +1,25 @@
 import { onCleanup, onMount } from "solid-js";
+import { api } from "./ipc";
 import { ALL_AGENT_KINDS, state } from "./store";
 import type { AgentKind, SessionShortcut, SessionShortcutAction } from "./types";
 
 const MODIFIER_KEYS = new Set(["Control", "Shift", "Alt", "Meta", "OS"]);
 
-/** Settings 正在录制快捷键时置位，避免运行时监听抢先处理。 */
+/** 仅暂停页面内快捷键；普通弹窗不能禁用前台 Meteor。 */
 let shortcutCaptureActive = false;
+let shortcutRecordingActive = false;
 
 export function setShortcutCaptureActive(active: boolean) {
   shortcutCaptureActive = active;
+}
+
+/** 只有真正录制组合键时才暂停原生 Meteor；false 也用于页面重载后清除残留状态。 */
+export function setShortcutRecordingActive(active: boolean) {
+  if (active && shortcutRecordingActive) return;
+  shortcutRecordingActive = active;
+  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+    void api.setMeteorShortcutRecording(active).catch((error) => console.error("Meteor shortcut capture", error));
+  }
 }
 
 export function newSessionShortcutId(): string {
@@ -186,7 +197,7 @@ export function mountSessionShortcuts(options: {
 }): void {
   const allowed = new Set(options.allowedActions);
   const onKeyDown = (event: KeyboardEvent) => {
-    if (shortcutCaptureActive || event.defaultPrevented || event.isComposing || event.repeat) {
+    if (shortcutCaptureActive || shortcutRecordingActive || event.defaultPrevented || event.isComposing || event.repeat) {
       return;
     }
     const shortcuts = withDefaultSessionShortcuts(state.settings?.sessionShortcuts ?? []);

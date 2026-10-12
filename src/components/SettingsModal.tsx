@@ -34,7 +34,8 @@ import {
   newSessionShortcutId,
   parseModelTarget,
   parseRoamTarget,
-  setShortcutCaptureActive,
+  setShortcutRecordingActive,
+  withDefaultSessionShortcuts,
 } from "../sessionShortcuts";
 import type {
   AgentInstructionTarget,
@@ -113,17 +114,17 @@ function ShortcutKeyCapture(props: {
   let listener: ((event: KeyboardEvent) => void) | null = null;
 
   const stopRecording = () => {
-    if (listener) {
-      window.removeEventListener("keydown", listener, true);
-      listener = null;
-    }
-    setShortcutCaptureActive(false);
+    if (!listener) return;
+    window.removeEventListener("keydown", listener, true);
+    window.removeEventListener("blur", stopRecording);
+    listener = null;
+    setShortcutRecordingActive(false);
     setRecording(false);
   };
 
   const startRecording = () => {
     stopRecording();
-    setShortcutCaptureActive(true);
+    setShortcutRecordingActive(true);
     setRecording(true);
     listener = (event: KeyboardEvent) => {
       event.preventDefault();
@@ -138,6 +139,7 @@ function ShortcutKeyCapture(props: {
       stopRecording();
     };
     window.addEventListener("keydown", listener, true);
+    window.addEventListener("blur", stopRecording);
   };
 
   onCleanup(() => stopRecording());
@@ -153,6 +155,7 @@ function ShortcutKeyCapture(props: {
         if (recording()) stopRecording();
         else startRecording();
       }}
+      onBlur={stopRecording}
       aria-label="录制快捷键"
       title={recording() ? "按下组合键，Esc 取消" : "点击后按下组合键"}
     >
@@ -220,6 +223,7 @@ function CliManager(props: {
 
 type SettingsTab =
   | "general"
+  | "meteor"
   | "advanced"
   | "lyra"
   | "backends"
@@ -233,6 +237,7 @@ type SettingsTab =
 
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
+  { id: "meteor", name: "Meteor" },
   { id: "advanced", name: "高级" },
   { id: "lyra", name: "Lyra" },
   { id: "backends", name: "模型后端" },
@@ -297,6 +302,13 @@ export function SettingsModal(props: { onClose: () => void }) {
       .filter((item) => item.action !== "stopSession")
       .map((item) => ({ ...item })),
   );
+  const [meteorEnabled, setMeteorEnabled] = createSignal(s?.meteorEnabled ?? true);
+  const [meteorShortcut, setMeteorShortcut] = createSignal(s?.meteorShortcut ?? "Alt+Alt");
+  const [meteorAgentKind, setMeteorAgentKind] = createSignal<AgentKind>(
+    s?.meteorAgentKind && ALL_AGENT_KINDS.includes(s.meteorAgentKind) ? s.meteorAgentKind : "lyra",
+  );
+  const [meteorModel, setMeteorModel] = createSignal(s?.meteorModel ?? "");
+  const [tryingMeteor, setTryingMeteor] = createSignal(false);
   const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
     s?.cursorContextMode === "super" ? "super" : "default",
   );
@@ -430,6 +442,10 @@ export function SettingsModal(props: { onClose: () => void }) {
   const titleAgentKinds = createMemo(() =>
     enabledAgentKinds().filter((kind) => kind === "devin" || kind === "codex"),
   );
+  const meteorAgentKinds = createMemo(() => ALL_AGENT_KINDS.filter((kind) => ({
+    lyra: lyraEnabled(), devin: devinEnabled(), claude: claudeEnabled(), kimi: kimiEnabled(),
+    codex: codexEnabled(), codebuddy: codebuddyEnabled(), cursor: cursorEnabled(),
+  })[kind]));
 
   const quotaShareKey = (kind: AgentKind, model: string) => `${kind}:${model}`;
   const addQuotaSharedModel = (kind: AgentKind, model: string) => {
@@ -733,6 +749,10 @@ export function SettingsModal(props: { onClose: () => void }) {
     quotaSharedModels: quotaSharedModels(),
     modelFavorites: state.settings?.modelFavorites ?? [],
     sessionShortcuts: draftSessionShortcuts(),
+    meteorEnabled: meteorEnabled(),
+    meteorShortcut: meteorShortcut().trim(),
+    meteorAgentKind: meteorAgentKind(),
+    meteorModel: meteorModel().trim(),
     devinEnabled: devinEnabled(),
     lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
@@ -1004,6 +1024,19 @@ export function SettingsModal(props: { onClose: () => void }) {
   let saveLyraConfig: (() => Promise<void>) | undefined;
   const save = async () => {
     const draftedShortcuts = draftSessionShortcuts();
+    if (meteorEnabled()) {
+      const keys = meteorShortcut().trim().toLowerCase();
+      const error = !keys ? "请为 Meteor 录制快捷键，或恢复连按两次 Alt。"
+        : withDefaultSessionShortcuts(draftedShortcuts).some((item) => item.keys.trim().toLowerCase() === keys)
+          ? "Meteor 快捷键与会话快捷键冲突，请修改后再保存。"
+          : !meteorAgentKinds().includes(meteorAgentKind())
+            ? "Meteor 所选模型后端已关闭，请重新选择或关闭 Meteor。" : "";
+      if (error) {
+        setTab("meteor");
+        await message(error, { title: "保存设置失败", kind: "error" });
+        return;
+      }
+    }
     const keyCounts = new Map<string, number>();
     for (const item of draftedShortcuts) {
       const key = item.keys.toLowerCase();
@@ -1107,6 +1140,54 @@ export function SettingsModal(props: { onClose: () => void }) {
         </div>
 
         <div class="modal-body">
+          <Show when={tab() === "meteor"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">Meteor · 屏幕上的操作助手</h3>
+              <p class="settings-group-desc">
+                触发后立即显示实时透明标注层，可跨屏添加多个点或框选区域，并分别填写操作要求；输入后直接点击另一处即可自动新增标注。一次提交后 Nova 会在后台新建临时目录会话，桌面应用使用剑来，Chrome 网页使用 chrome，Nova 原生浏览器使用 webview；不切换当前会话。
+              </p>
+              <div class="field">
+                <span class="field-label">启用 Meteor</span>
+                <label class="backend-switch">
+                  <input type="checkbox" checked={meteorEnabled()} onChange={(e) => setMeteorEnabled(e.currentTarget.checked)} />
+                  <span>启用全局触发</span>
+                </label>
+                <span class="field-hint">同一台电脑运行 dev 实例时，非 dev 实例的 Meteor 自动停用，避免争抢快捷键；dev 退出后恢复。</span>
+              </div>
+              <div class="field">
+                <span class="field-label">全局快捷键</span>
+                <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
+                  <ShortcutKeyCapture value={meteorShortcut() === "Alt+Alt" ? "连按两次 Alt" : meteorShortcut()} onChange={setMeteorShortcut} />
+                  <button type="button" class="btn secondary" onClick={() => setMeteorShortcut("Alt+Alt")}>恢复双 Alt</button>
+                </div>
+                <span class="field-hint">目前支持 Windows。默认快速按下并松开两次 Alt；点击上方按钮可录制其他组合键，Esc 取消录制。请避免与系统或其他应用的快捷键冲突。</span>
+              </div>
+              <div class="field">
+                <span class="field-label">执行后端 / 模型</span>
+                <ModelPicker
+                  agentKind={meteorAgentKind()}
+                  agentKinds={meteorAgentKinds()}
+                  model={meteorModel()}
+                  allowDefault
+                  defaultLabel={`${agentLabel(meteorAgentKind())} 默认模型`}
+                  onPickModel={(kind, model) => { setMeteorAgentKind(kind); setMeteorModel(model); }}
+                  title="Meteor 执行模型"
+                  portal
+                />
+                <span class="field-hint">空值使用所选后端的默认模型；仅可选择已启用的本机后端。</span>
+              </div>
+              <p class="settings-group-desc">
+                提交时截取所有屏幕并提供完整截图，标注仅提示大致位置，不会裁掉周边或未标注屏幕；剪贴板文字、图片或文件引用同时作为参考，不会持续记录历史。目标明确时直接执行，不因未指定逐字措辞或操作步骤而重复询问；只要求草稿时不会发送。请避免在敏感内容可见或位于剪贴板时使用。
+              </p>
+              <button type="button" class="btn secondary" disabled={tryingMeteor()} onClick={async () => {
+                setTryingMeteor(true);
+                try { await api.openMeteor(); }
+                catch (error) { await message(String(error), { title: "Meteor", kind: "error" }); }
+                finally { setTryingMeteor(false); }
+              }}>{tryingMeteor() ? "正在打开标注层…" : "试用已保存配置"}</button>
+              <span class="field-hint">更改快捷键或模型后，请先保存设置再试用。</span>
+            </section>
+          </Show>
           {/* ===== 通用 ===== */}
           <Show when={tab() === "general"}>
             <section class="settings-group">

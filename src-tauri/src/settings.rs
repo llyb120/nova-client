@@ -156,6 +156,13 @@ pub struct Settings {
     pub model_favorites: Vec<String>,
     /// 会话快捷键：按键一键切换项目或模型。
     pub session_shortcuts: Vec<SessionShortcut>,
+    /// Meteor 屏幕标注入口；开发实例运行时正式版自动让出触发权。
+    pub meteor_enabled: bool,
+    /// Alt+Alt 表示连续两次纯 Alt；其它值为全局组合键。
+    pub meteor_shortcut: String,
+    pub meteor_agent_kind: String,
+    /// 空值使用所选后端的默认模型。
+    pub meteor_model: String,
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
@@ -243,6 +250,10 @@ impl Default for Settings {
             quota_shared_models: Vec::new(),
             model_favorites: Vec::new(),
             session_shortcuts: Vec::new(),
+            meteor_enabled: true,
+            meteor_shortcut: "Alt+Alt".into(),
+            meteor_agent_kind: "lyra".into(),
+            meteor_model: String::new(),
             devin_enabled: false,
             vega_enabled: false,
             lyra_enabled: true,
@@ -409,6 +420,24 @@ mod tests {
         assert_eq!(settings.cursor_model_contexts.len(), 1);
         assert_eq!(settings.cursor_model_contexts[0].prefix, "claude-4");
         assert_eq!(settings.cursor_model_contexts[0].context_window, 200_000);
+    }
+
+    #[test]
+    fn meteor_defaults_and_configuration_round_trip() {
+        for settings in [Settings::default(), serde_json::from_str::<Settings>(r#"{}"#).unwrap()] {
+            assert!(settings.meteor_enabled);
+            assert_eq!(settings.meteor_shortcut, "Alt+Alt");
+            assert_eq!(settings.meteor_agent_kind, "lyra");
+            assert!(settings.meteor_model.is_empty());
+        }
+        let settings: Settings = serde_json::from_str(
+            r#"{"meteorEnabled":false,"meteorShortcut":"Ctrl+Alt+M","meteorAgentKind":"codex","meteorModel":"gpt-5.6"}"#,
+        ).unwrap();
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["meteorEnabled"], false);
+        assert_eq!(saved["meteorShortcut"], "Ctrl+Alt+M");
+        assert_eq!(saved["meteorAgentKind"], "codex");
+        assert_eq!(saved["meteorModel"], "gpt-5.6");
     }
 
     #[test]

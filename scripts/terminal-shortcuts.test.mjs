@@ -43,7 +43,8 @@ assert.deepEqual(await navigate({threads:chain,currentId:'root',running:{other:t
 let handler,stops=0,toggles=0;
 class Element { constructor(terminal=false) { this.terminal=terminal; this.tagName='TEXTAREA'; } closest() { return this.terminal?this:null; } }
 const state={settings:{sessionShortcuts:[]}};
-const shortcuts=load('../src/sessionShortcuts.ts',{'solid-js':{onMount:cb=>cb(),onCleanup:()=>{}},'./store':{ALL_AGENT_KINDS:[],state}},{HTMLElement:Element,window:{addEventListener:(_event,cb)=>handler=cb,removeEventListener:()=>{}}});
+const meteorRecording=[];
+const shortcuts=load('../src/sessionShortcuts.ts',{'solid-js':{onMount:cb=>cb(),onCleanup:()=>{}},'./store':{ALL_AGENT_KINDS:[],state},'./ipc':{api:{setMeteorShortcutRecording:async active=>meteorRecording.push(active)}}},{HTMLElement:Element,window:{__TAURI_INTERNALS__:{},addEventListener:(_event,cb)=>handler=cb,removeEventListener:()=>{}}});
 const event=(key,patch={})=>({key,code:'',ctrlKey:false,altKey:false,shiftKey:false,metaKey:false,target:new Element(),preventDefault(){this.defaultPrevented=true;},stopPropagation(){},...patch});
 const defaults=shortcuts.withDefaultSessionShortcuts([]);
 assert.equal(shortcuts.findSessionShortcut(event('`',{ctrlKey:true,code:'Backquote'}),defaults).action,'toggleTerminal');
@@ -56,4 +57,17 @@ handler(event('Escape',{target:new Element(true)}));assert.equal(stops,0);
 handler(event('Escape'));assert.equal(stops,1);
 handler(event('~',{ctrlKey:true,shiftKey:true,code:'Backquote',target:new Element(true)}));assert.equal(toggles,1);
 shortcuts.setShortcutCaptureActive(true);handler(event('`',{ctrlKey:true}));assert.equal(toggles,1);
-console.log('Terminal and unread/running shortcut regression checks passed');
+shortcuts.setShortcutCaptureActive(false);
+assert.deepEqual(meteorRecording,[], 'ordinary modal capture must never suspend foreground Meteor');
+shortcuts.setShortcutRecordingActive(false);
+assert.deepEqual(meteorRecording,[false], 'a reloaded page clears stale native recording state');
+meteorRecording.length=0;
+shortcuts.setShortcutRecordingActive(true);
+shortcuts.setShortcutRecordingActive(true);
+handler(event('`',{ctrlKey:true}));assert.equal(toggles,1);
+shortcuts.setShortcutCaptureActive(false);
+handler(event('`',{ctrlKey:true}));assert.equal(toggles,1, 'closing a modal must not end a real recording');
+shortcuts.setShortcutRecordingActive(false);
+handler(event('`',{ctrlKey:true}));assert.equal(toggles,2);
+assert.deepEqual(meteorRecording,[true,false], 'only an actual recording pauses and resumes the Meteor hook');
+console.log('Terminal, unread/running shortcuts and Meteor recording suspension passed');

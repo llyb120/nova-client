@@ -46,6 +46,7 @@ function mount(t, { fork = async () => ({ id: "copy-stage" }), refresh = async (
   const shortcuts = load("../src/sessionShortcuts.ts", {
     "solid-js": { onMount: (fn) => fn(), onCleanup: () => {} },
     "./store": { state, ALL_AGENT_KINDS: [] },
+    "./ipc": { api },
   }, { HTMLElement: class {}, window: { addEventListener: (_, fn) => { keydown = fn; } } });
   shortcuts.mountSessionShortcuts({ allowedActions: ["stopSession"], onStopSession: () => { stops++; return true; } });
   const ui = createRoot((dispose) => {
