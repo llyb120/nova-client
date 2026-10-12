@@ -27,7 +27,7 @@ test("侧栏将 Windows 长路径前缀与普通源仓库路径归为同组", ()
 
 // 回归：三级工作流链（root → stage2 → stage3），stage2/stage3 的 cwd 被 agent
 // 中途切到别的目录（change_working_directory）。分组锚点必须一路取到链根，
-// 否则 stage3 与父级分进不同分组、组内找不到父节点，侧栏（含室女座）裂成两条会话。
+// 否则 stage3 与父级分进不同分组、组内找不到父节点，侧栏裂成两条会话。
 const threads = [
   { id: "root", cwd: "D:/code/repo" },
   { id: "stage2", parentThreadId: "root", cwd: "D:/code/repo-worktree" },

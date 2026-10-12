@@ -14,11 +14,10 @@ import {
   markThreadSwitchPointerDown,
   openNewSession,
   openThread,
+  runningTaskChains,
   setUnreadTurns,
   setView,
   state,
-  virgoHiddenThreads,
-  zenRunningChains,
 } from "../store";
 import { sidebarLayout, setSidebarLayout } from "../sidebarLayout";
 import { agentLabel, agentShort, isScratch, scratchParent } from "../utils";
@@ -118,40 +117,23 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "virgo" | "knowledge" | "employee") => {
+  const switchView = (view: "home" | "clues" | "workflows" | "knowledge" | "employee") => {
     setView(view);
     closeThread();
   };
   const openHome = () => openNewSession();
   const openClues = () => switchView("clues");
   const openWorkflows = () => switchView("workflows");
-  const openVirgo = () => switchView("virgo");
-
-  // 减少焦虑（高级设置开启）：运行中的任务链移入室女座，普通模式不再显示，结束后自动移回。
-  // 未开启时室女座仍是手动收纳位：快捷键收起的会话放在这里，tab 随收纳内容出现/隐藏。
-  const zenMode = () => !!state.settings?.zenModeEnabled;
-  const virgoHidden = createMemo(() => virgoHiddenThreads());
-  const virgoVisible = () => zenMode() || virgoHidden().size > 0;
-  const isVirgoView = () => virgoVisible() && state.view === "virgo";
 
   // 运行中任务链（含父子接力整条链）：整链的忙碌态与「正在运行的任务数」徽标沿用这套口径。
-  const chainInfo = createMemo(() => zenRunningChains());
+  const chainInfo = createMemo(() => runningTaskChains());
   const completedUnreadCount = createMemo(() => {
-    const { hidden } = chainInfo();
+    const { active } = chainInfo();
     return state.threads.reduce((sum, thread) =>
-      sum + (!thread.experienceThread && !thread.employeeThread && !hidden.has(thread.id) && thread.id !== state.currentId
+      sum + (!thread.experienceThread && !thread.employeeThread && !active.has(thread.id) && thread.id !== state.currentId
         ? (state.unreadTurns[thread.id] ?? 0) : 0), 0);
   });
   const railCount = () => chainInfo().rootCount + completedUnreadCount();
-  const inRunningChain = (t: ThreadMeta) => virgoHidden().has(t.id);
-  // 室女座里的任务数：减少焦虑下按运行中任务链计，手动收纳下按收纳的会话链计。
-  const virgoChainCount = createMemo(() => {
-    const ids = virgoHidden();
-    if (zenMode()) return chainInfo().rootCount;
-    return state.threads.filter(
-      (t) => ids.has(t.id) && (!t.parentThreadId || !ids.has(t.parentThreadId)),
-    ).length;
-  });
 
   // 只在会话树变化时重建索引，切换选中项不再让每行扫描全部历史。
   const childrenById = createMemo(() => {
@@ -166,8 +148,7 @@ export function Sidebar(props: {
   });
   const threadOf = (id: string) => state.threads.find((item) => item.id === id);
   const openHistoryThread = async (id: string) => {
-    const thread = state.threads.find((item) => item.id === id);
-    setView(thread && zenMode() && inRunningChain(thread) ? "virgo" : "home");
+    setView("home");
     // 打开时若链上仍有其它阶段未读，仅消费一条未读（聚合徽标 -1）；本 stage 自身清零。
     if (state.unreadTurns[id] && chainUnreadTurns(threadOf(id)) > 1) {
       setUnreadTurns(id, Math.max((state.unreadTurns[id] ?? 1) - 1, 0));
@@ -200,10 +181,7 @@ export function Sidebar(props: {
   };
 
   const currentGroups = createMemo(() => {
-    const threads = isVirgoView()
-        ? state.threads.filter((t) => !t.experienceThread && !t.employeeThread && inRunningChain(t))
-        : state.threads.filter((t) => !t.experienceThread && !t.employeeThread && !inRunningChain(t));
-    return groupByCwd(threads);
+    return groupByCwd(state.threads.filter((t) => !t.experienceThread && !t.employeeThread));
   });
 
   type ThreadTreeRow = {
@@ -425,7 +403,7 @@ export function Sidebar(props: {
       return chain;
     });
     // 整条链的忙碌态：工作流阶段接力空档里没有任何会话 running，
-    // 只看 state.running 会让侧栏转圈在刷新/回合结束时闪断，这里并入室女座运行链口径。
+    // 只看 state.running 会让侧栏转圈在刷新/回合结束时闪断，这里并入任务链运行口径。
     const running = () => {
       const { busy } = chainInfo();
       return chainThreads().some((thread) => !!state.running[thread.id] || busy.has(thread.id));
@@ -619,12 +597,6 @@ export function Sidebar(props: {
             <IconClue size={18} />
             <Show when={state.unreadClueMentions.length > 0}><span class="sidebar-rail-dot" /></Show>
           </button>
-          <Show when={virgoVisible()}>
-            <button title="室女座" aria-label="室女座" classList={{ active: state.view === "virgo" }} onClick={openVirgo}>
-              <IconLogo size={18} />
-              <Show when={virgoChainCount() > 0}><span class="sidebar-rail-dot" /></Show>
-            </button>
-          </Show>
           <div class="sidebar-rail-spacer" />
           <Show when={state.inbox.length > 0}>
             <button title="收件箱" aria-label="收件箱" onClick={props.onOpenInbox}>
@@ -786,29 +758,6 @@ export function Sidebar(props: {
             </button>
           </div>
           <div class="mode-seg secondary">
-            <Show when={virgoVisible()}>
-              <button
-                id="virgo-tab"
-                class="mode-seg-btn"
-                classList={{ active: state.view === "virgo" }}
-                onClick={openVirgo}
-                title={
-                  zenMode()
-                    ? "室女座（减少焦虑）：运行中的会话暂时移到这里，结束后自动回到普通模式"
-                    : "室女座：快捷键收起的会话放在这里，打开即回到普通会话"
-                }
-              >
-                室女座
-                <Show when={virgoChainCount() > 0}>
-                  <span
-                    class="mode-seg-badge"
-                    title={zenMode() ? "正在运行的任务数" : "已收起的会话数"}
-                  >
-                    {virgoChainCount()}
-                  </span>
-                </Show>
-              </button>
-            </Show>
             <Show when={state.settings?.knowledgeGraphEnabled}>
               <button class="mode-seg-btn" classList={{ active: state.view === "knowledge" }}
                 onClick={() => switchView("knowledge")} title="查看操作路径与下一步分支">
@@ -828,11 +777,7 @@ export function Sidebar(props: {
         <Show
           when={currentGroups().length > 0}
           fallback={
-            <div class="thread-empty">
-              {isVirgoView()
-                  ? "没有正在运行的会话。运行中的会话会暂时移到这里，结束后自动回到普通模式。"
-                  : "还没有会话。在右侧输入任务开始。"}
-            </div>
+            <div class="thread-empty">还没有会话。在右侧输入任务开始。</div>
           }
         >
           <Show when={showHistoryByTime()}>

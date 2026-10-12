@@ -393,9 +393,7 @@ export type SessionShortcutAction =
   | "toggleTerminal"
   | "insertText"
   /** 选中新会话页要运行的工作流；target 为工作流 id。仅新会话页生效。 */
-  | "selectWorkflow"
-  /** 把当前会话移入室女座；无 target。仅在未开启减少焦虑（室女座）时生效。 */
-  | "hideToVirgo";
+  | "selectWorkflow";
 
 /** 会话快捷键：一键切到指定项目或模型、快速新会话、插入文本、选择工作流。 */
 export interface SessionShortcut {
@@ -403,7 +401,7 @@ export interface SessionShortcut {
   /** 规范化按键，如 Ctrl+1 / Alt+P。 */
   keys: string;
   action: SessionShortcutAction;
-  /** 本地项目路径、roam/quota 编码、agentKind:model、工作流 id，或 insertText 的插入内容；newSession / openUnread / hideToVirgo 可为空。 */
+  /** 本地项目路径、roam/quota 编码、agentKind:model、工作流 id，或 insertText 的插入内容；newSession / openUnread 可为空。 */
   target: string;
 }
 
@@ -519,8 +517,6 @@ export interface Settings {
   sessionAutoCleanupEnabled: boolean;
   /** 自动清理会话的保留时长（小时） */
   sessionAutoCleanupHours: number;
-  /** 减少焦虑（室女座）：运行中的会话只在室女座显示，结束后自动回到普通模式 */
-  zenModeEnabled: boolean;
   knowledgeGraphEnabled: boolean;
   /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程并供工作流 {{xx}} 替换。 */
   customEnvVars: Record<string, string>;

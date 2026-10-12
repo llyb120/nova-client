@@ -181,8 +181,6 @@ export function mountSessionShortcuts(options: {
    * false 表示仅在输入框已聚焦时处理（避免抢走其它可编辑区的无修饰键输入）。
    */
   onInsertText?: (text: string, mayFocus: boolean) => boolean;
-  /** 返回 true 表示已收起运行中的会话：当前优先，否则取首个尚未隐藏的会话。 */
-  onHideToVirgo?: () => boolean;
 }): void {
   const allowed = new Set(options.allowedActions);
   const onKeyDown = (event: KeyboardEvent) => {
@@ -200,7 +198,6 @@ export function mountSessionShortcuts(options: {
       hit.action !== "newSession" &&
       hit.action !== "openUnread" &&
       hit.action !== "toggleTerminal" &&
-      hit.action !== "hideToVirgo" &&
       !hit.target
     ) {
       return;
@@ -243,13 +240,6 @@ export function mountSessionShortcuts(options: {
       event.preventDefault();
       event.stopPropagation();
       options.onOpenUnread?.();
-      return;
-    }
-    if (hit.action === "hideToVirgo") {
-      const handled = options.onHideToVirgo?.() ?? false;
-      if (!handled) return;
-      event.preventDefault();
-      event.stopPropagation();
       return;
     }
     if (hit.action === "selectProject") {

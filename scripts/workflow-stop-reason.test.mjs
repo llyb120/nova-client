@@ -15,7 +15,7 @@ test("内部 snake_case 原样保留，归一化是幂等的", () => {
 
 // 回归：ACP 是 camelCase 协议（响应字段即 stopReason），部分实现把枚举名
 // END_TURN / MAX_TURN_REQUESTS 原样透传。此前按全等比较会让一次正常收尾
-// 被判成异常，走 suspendWorkflow 挂起，整条链永久留在室女座且无任何界面提示。
+// 被判成异常，走 suspendWorkflow 挂起，整条链永久停住且无任何界面提示。
 test("camelCase 枚举名归一化到内部口径", () => {
   assert.equal(canonicalStopReason("endTurn"), "end_turn");
   assert.equal(canonicalStopReason("maxTurnRequests"), "max_turn_requests");

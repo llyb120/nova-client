@@ -46,7 +46,7 @@ import type {
   UpdateProgress,
 } from "./types";
 import { isScratch, scratchParent } from "./utils";
-import { virgoChains } from "./virgoChains";
+import { taskChains } from "./taskChains";
 import {
   busyWorkflowRoots,
   handleTurnEnd as handleWorkflowTurnEnd,
@@ -158,7 +158,7 @@ interface AppStore {
   /** 各会话未读新轮次结论数：每次轮次正常结束且该会话非当前打开则 +1，stage 链各自累计 */
   unreadTurns: Record<string, number>;
   running: Record<string, boolean>;
-  /** 提示词队列仍有待发条目（未挂起）的会话；接力空档保持室女座归属，由 promptQueue 镜像。 */
+  /** 提示词队列仍有待发条目（未挂起）的会话；接力空档仍算任务链未结束，由 promptQueue 镜像。 */
   promptQueued: Record<string, boolean>;
   permissions: PermissionRequest[];
   connected: boolean;
@@ -191,8 +191,8 @@ interface AppStore {
   roamingFolders: string[];
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
-  /** 主区域视图（currentId 非空时优先显示会话，与本字段无关）；virgo = 室女座（减少焦虑） */
-  view: "home" | "clues" | "workflows" | "virgo" | "knowledge" | "employee";
+  /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
+  view: "home" | "clues" | "workflows" | "knowledge" | "employee";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -535,8 +535,6 @@ const runningEventVersions = new Map<string, number>();
 // send_prompt 先乐观置忙，后端随后才会登记 manager.running；在这段窗口内刷新
 // list_threads 只能看到 false，额度租借创建线程时尤其容易撞上这个竞态。
 const optimisticRunningThreads = new Set<string>();
-/** 不需要接入室女座口径时的空集（避免每份刷新新建 Set）。 */
-const EMPTY_IDS: Set<string> = new Set();
 
 export async function refreshThreads() {
   const request = ++refreshThreadsRequest;
@@ -558,24 +556,20 @@ export async function refreshThreads() {
     }
   }
   const running: Record<string, boolean> = {};
-  // 室女座里仍在推进（含阶段接力空档）的任务链：后端 running 在这段空档就是 false，
-  // 快照不能把链上已有的忙碌态冲掉，否则侧栏转圈和徽标会闪断（以事件/乐观态为准）。
-  const zenBusyChains = zenModeOn() ? zenRunningChains().busy : EMPTY_IDS;
   for (const t of threads) {
     // 运行事件在本次请求期间到达时，以事件为准；否则使用后端快照。
     // 这样不会因额度租借的「创建线程刷新」竞态把实际运行态冲回 false。
     const before = runningVersionsBeforeRequest.get(t.id) ?? 0;
     const current = runningEventVersions.get(t.id) ?? 0;
     const optimistic = optimisticRunningThreads.has(t.id);
-    // 乐观位卡死的自愈：后端快照明确未运行、本次请求间无新运行事件、且非工作流
-    // 接力空档时，收回这个滞留的乐观位——否则手动中止后若 agent 未回 acp:turn(false)，
-    // 568 行的硬优先会让普通会话永久扣在室女座，重启才消失。
-    if (optimistic && !t.running && current === before && !zenBusyChains.has(t.id)) {
+    // 乐观位卡死的自愈：后端快照明确未运行、本次请求间无新运行事件时，收回这个滞留的
+    // 乐观位——否则手动中止后若 agent 未回 acp:turn(false)，下方的硬优先会让会话永久转圈。
+    if (optimistic && !t.running && current === before) {
       optimisticRunningThreads.delete(t.id);
     }
     running[t.id] = optimisticRunningThreads.has(t.id)
       ? true
-      : current !== before || zenBusyChains.has(t.id)
+      : current !== before
         ? !!state.running[t.id]
         : t.running;
   }
@@ -762,7 +756,7 @@ export async function refreshRoamingFolders() {
   }
 }
 
-export function setView(view: "home" | "clues" | "workflows" | "virgo" | "knowledge" | "employee") {
+export function setView(view: "home" | "clues" | "workflows" | "knowledge" | "employee") {
   setState("view", view);
 }
 
@@ -1274,7 +1268,7 @@ export function setUnreadTurns(id: string, count: number) {
   });
 }
 
-/** promptQueue 镜像过来的队列占位；内容不变时不写，避免室女座归属 memo 空转。 */
+/** promptQueue 镜像过来的队列占位；内容不变时不写，避免任务链 memo 空转。 */
 export function setPromptQueuedThreads(ids: ReadonlySet<string>) {
   const cur = state.promptQueued;
   if (Object.keys(cur).length === ids.size && [...ids].every((id) => cur[id])) return;
@@ -1333,8 +1327,6 @@ export async function ensureHistoryItems(ids?: number[]) {
 }
 
 export async function openThread(id: string) {
-  // 手动收进室女座的会话一旦打开就回到普通列表，避免用户盯着一个看不见归属的会话。
-  unhideVirgoThread(id);
   if (state.unreadTurns[id]) setUnreadTurns(id, 0);
   const switching = state.currentId !== id;
   const request = ++openThreadRequest;
@@ -1503,14 +1495,6 @@ export async function createThread(
   if (EFFORT_AGENT_KINDS.includes(storedAgentKind)) {
     lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
   }
-  // 减少焦虑：首页发起的会话不该先进会话页再被收起（新会话会闪一下才进室女座），
-  // 直接留在首页，由后续发送链路把运行态归到室女座。
-  if (zenModeOn() && !state.currentId) {
-    zenHold(t.id);
-    void refreshThreads();
-    void refreshProjects();
-    return t.id;
-  }
   setState("expanded", reconcile({}));
   setState({
     currentId: t.id,
@@ -1540,163 +1524,19 @@ export function isPendingThreadId(id: string | null | undefined): boolean {
   return !!id && id.startsWith(PENDING_THREAD_PREFIX);
 }
 
-/** 减少焦虑模式（室女座）：会话发出后转入后台运行，详情需到室女座手动查看。 */
-const ZEN_TOAST = "会话已在后台运行，去喝杯咖啡吧~";
-
 /**
- * 首页发起、提示词还没真正跑起来的会话占位：计入运行态（立即归入室女座，
- * 不会先在普通列表闪现），但不算「正在忙」，以免挡住紧随其后的工作流启动。
- */
-const zenHoldThreads = new Set<string>();
-function zenHold(threadId: string) {
-  zenHoldThreads.add(threadId);
-  optimisticRunningThreads.add(threadId);
-  setState("running", threadId, true);
-}
-function zenUnhold(threadId: string) {
-  // 只处理首页发起时的占位；没占位过（非减少焦虑、/run 等其它入口）时不能碰真实运行态。
-  if (!zenHoldThreads.delete(threadId)) return;
-  optimisticRunningThreads.delete(threadId);
-  setState("running", threadId, false);
-}
-
-function zenModeOn() {
-  return !!state.settings?.zenModeEnabled;
-}
-
-const VIRGO_MANUAL_KEY = "fd:virgoManualHidden:v1";
-
-/**
- * 快捷键手动收进室女座的会话链根 id：整条父子接力链一起收纳，重启后仍保留，
- * 整条任务链结束或再次打开链上任一会话时自动解纳回到普通列表。
- */
-const virgoManualRoots = new Set<string>(readVirgoManualRoots());
-const [virgoManualVersion, setVirgoManualVersion] = createSignal(0);
-
-function readVirgoManualRoots(): string[] {
-  try {
-    const value = JSON.parse(localStorage.getItem(VIRGO_MANUAL_KEY) ?? "[]");
-    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
-function persistVirgoManualRoots() {
-  try {
-    localStorage.setItem(VIRGO_MANUAL_KEY, JSON.stringify([...virgoManualRoots]));
-  } catch {
-    // 落盘失败只丢跨重启持久化，本次窗口内仍按内存状态收纳会话。
-  }
-}
-
-/** 读取前先订阅版本：收纳/解纳只改 Set，侧栏与首页的 memo 才会跟着重算。 */
-function virgoManualRootsSnapshot(): string[] {
-  virgoManualVersion();
-  return [...virgoManualRoots];
-}
-
-/** 会话所在任务链的根 id（父级不在列表或成环时以自身为根）。 */
-function virgoChainRoot(threadId: string): string {
-  const seen = new Set<string>([threadId]);
-  let cur = state.threads.find((thread) => thread.id === threadId);
-  while (cur?.parentThreadId && !seen.has(cur.parentThreadId)) {
-    const parent = state.threads.find((thread) => thread.id === cur!.parentThreadId);
-    if (!parent) break;
-    seen.add(parent.id);
-    cur = parent;
-  }
-  return cur?.id ?? threadId;
-}
-
-/** 给定链根所在整条父子链的全部会话 id。 */
-function virgoChainIds(roots: string[]): Set<string> {
-  if (roots.length === 0) return EMPTY_IDS;
-  const ids = new Set<string>();
-  for (const thread of state.threads) if (roots.includes(thread.id)) ids.add(thread.id);
-  // 逐级向下传递，覆盖多级 stage 接力链。
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const thread of state.threads) {
-      if (thread.parentThreadId && ids.has(thread.parentThreadId) && !ids.has(thread.id)) {
-        ids.add(thread.id);
-        changed = true;
-      }
-    }
-  }
-  return ids;
-}
-
-/** 手动收进室女座的会话 id（未开启减少焦虑时的收纳口径）。 */
-function virgoManualHidden(): Set<string> {
-  const roots = virgoManualRootsSnapshot();
-  const active = zenRunningChains().hidden;
-  const knownIds = new Set(state.threads.map((thread) => thread.id));
-  const finished = roots.filter((root) => knownIds.has(root) && !active.has(root));
-  if (finished.length > 0) {
-    for (const root of finished) virgoManualRoots.delete(root);
-    setVirgoManualVersion((version) => version + 1);
-    persistVirgoManualRoots();
-  }
-  return virgoChainIds(roots.filter((root) => active.has(root)));
-}
-
-/**
- * 室女座收纳口径（侧栏列表、首页最近会话、未读跳转共用）：
- * 开启减少焦虑时按运行链自动收纳；关闭时只认快捷键手动收起的会话。
- */
-export function virgoHiddenThreads(): Set<string> {
-  return zenModeOn() ? zenRunningChains().hidden : virgoManualHidden();
-}
-
-/**
- * 快捷键「把会话隐藏入室女座」：减少焦虑已开启时不生效（那时运行链自动归位），
- * 也不收起还没落库的乐观占位会话。返回是否已收纳。
- */
-export function hideCurrentThreadToVirgo(): boolean {
-  if (zenModeOn()) return false;
-  const canHide = (id: string) =>
-    !!state.running[id] && !isPendingThreadId(id) && !virgoManualRoots.has(virgoChainRoot(id));
-  const id = state.currentId && canHide(state.currentId)
-    ? state.currentId
-    : state.threads.find((thread) => canHide(thread.id))?.id;
-  if (!id) return false;
-  const root = virgoChainRoot(id);
-  if (virgoManualRoots.has(root)) return false;
-  virgoManualRoots.add(root);
-  setVirgoManualVersion((version) => version + 1);
-  persistVirgoManualRoots();
-  if (state.currentId && virgoChainRoot(state.currentId) === root) {
-    closeThread();
-    // 当前页面属于被收起的会话链时回到首页。
-    setView("home");
-  }
-  showToast("会话已移入室女座，结束后自动移回，也可手动打开");
-  return true;
-}
-
-/** 打开会话同时解手动收纳：会话回到普通列表，室女座 tab 随之腾空。 */
-function unhideVirgoThread(threadId: string): void {
-  if (zenModeOn() || virgoManualRoots.size === 0) return;
-  if (!virgoManualRoots.delete(virgoChainRoot(threadId))) return;
-  setVirgoManualVersion((version) => version + 1);
-  persistVirgoManualRoots();
-}
-/**
- * 减少焦虑模式的运行态口径（侧栏、首页最近会话、refreshThreads 共用）：
- * hidden = 归室女座的任务链（含父子接力整条链）的全部会话 id；
- * busy = 工作流仍在推进（活动阶段或阶段接力空档）的链上的会话 id，
- *        refreshThreads 合并后端快照时据此保留运行态；
- * rootCount = 运行中任务数（室女座徽标，不把「暂停等人」的任务计入）。
- * 集合计算在 virgoChains（纯函数，单测见 scripts/virgo-chains.test.mjs），
+ * 任务链运行态口径（侧栏转圈、运行中/已完成未读计数共用）：
+ * active = 未结束任务链（含父子接力整条链）的全部会话 id；
+ * busy = 工作流仍在推进（活动阶段或阶段接力空档）的链上的会话 id；
+ * rootCount = 运行中任务数（不把「暂停等人」的任务计入）。
+ * 集合计算在 taskChains（纯函数，单测见 scripts/task-chains.test.mjs），
  * 这里只接入信号与工作流运行时。
  */
-export function zenRunningChains(): { hidden: Set<string>; busy: Set<string>; rootCount: number } {
+export function runningTaskChains(): { active: Set<string>; busy: Set<string>; rootCount: number } {
   // 工作流运行态（activeRuns/suspendedRuns/advancingRoots）是普通内存集合，不是响应式信号；
-  // 读一下 revision，侧栏/首页才不会等到下一次 refreshThreads 才反映室女座归属。
+  // 读一下 revision，侧栏才不会等到下一次 refreshThreads 才反映任务链状态。
   workflowReviewRevision();
-  return virgoChains({
+  return taskChains({
     threads: state.threads,
     isRunning: (id) => !!state.running[id],
     advancingRoots: busyWorkflowRoots(),
@@ -1739,13 +1579,12 @@ export function chainUnreadTurns(thread: ThreadMeta | undefined): number {
 
 /**
  * 「打开未读消息」快捷键（含全局触发）：循环打开普通模式下有未读轮次的会话链。
- * 未读沿用侧栏普通列表口径；无未读时循环进行中的普通会话（含室女座）。
+ * 未读沿用侧栏列表口径；无未读时循环进行中的普通会话。
  */
 export async function openNextUnreadThread(): Promise<void> {
-  // 口径与侧栏普通模式列表一致：排除训练会话，以及室女座收起的会话。
-  const hidden = virgoHiddenThreads();
+  // 口径与侧栏列表一致：排除训练会话。
   const visible = state.threads.filter(
-    (t) => !t.subagent && !t.experienceThread && !t.employeeThread && !hidden.has(t.id),
+    (t) => !t.subagent && !t.experienceThread && !t.employeeThread,
   );
   const visibleIds = new Set(visible.map((t) => t.id));
   const unreadRoots = visible.filter(
@@ -1779,12 +1618,6 @@ export async function openNextUnreadThread(): Promise<void> {
   setView("home");
   await openThread(target.id);
 }
-/** 发送成功后离开会话详情并播放「提示词飞入室女座」动画；/fire 等内置命令的编排流程不在此列（/stage 在 startStageThread 内自行处理）。 */
-function zenHideAfterSend(text: string) {
-  if (!zenModeOn() || !state.currentId) return;
-  closeThread();
-  zenDropPrompt(text);
-}
 
 /**
  * 乐观创建本地会话：先切进聊天页并上屏用户消息，后台 create_thread 完成后
@@ -1803,34 +1636,29 @@ export function createThreadOptimistic(
   clueCardId: string,
 ): void {
   const pendingId = PENDING_THREAD_PREFIX + crypto.randomUUID();
-  // 减少焦虑：不进入会话页，留在首页并播放飞入室女座动画；下方后台分支完成创建与发送。
-  if (zenModeOn()) {
-    zenDropPrompt(text);
-  } else {
-    setState("expanded", reconcile({}));
-    setState({
-      currentId: pendingId,
-      items: [],
-      plan: null,
-      proposedPlan: null,
-      cwd,
-      title: "",
-      agentKind,
-      model,
-      mode,
-      reasoningEffort,
-      loadingThread: false,
-    });
-    // 用户消息立即上屏，与 deliverPrompt 的乐观项同一约定（负 id 临时项）。
-    setState("items", 0, {
-      type: "user",
-      id: -Date.now(),
-      text,
-      images,
-      ts: Date.now(),
-    } as Item);
-    bumpChatScrollToBottom();
-  }
+  setState("expanded", reconcile({}));
+  setState({
+    currentId: pendingId,
+    items: [],
+    plan: null,
+    proposedPlan: null,
+    cwd,
+    title: "",
+    agentKind,
+    model,
+    mode,
+    reasoningEffort,
+    loadingThread: false,
+  });
+  // 用户消息立即上屏，与 deliverPrompt 的乐观项同一约定（负 id 临时项）。
+  setState("items", 0, {
+    type: "user",
+    id: -Date.now(),
+    text,
+    images,
+    ts: Date.now(),
+  } as Item);
+  bumpChatScrollToBottom();
   void (async () => {
     let createdId: string | null = null;
     try {
@@ -1873,7 +1701,7 @@ export function createThreadOptimistic(
         reportActivity(true);
         await sendPromptTo(t.id, text, images);
       } else {
-        // 已切走或减少焦虑：后台建好后直接发；走 sendPromptTo 统一拦截 /fire 等
+        // 已切走：后台建好后直接发；走 sendPromptTo 统一拦截 /fire 等
         // 内置命令，running 状态由 deliverPrompt 维护。
         await sendPromptTo(t.id, text, images);
       }
@@ -2085,15 +1913,9 @@ export async function sendPrompt(
     id = restored.threadId;
   }
   await deliverPrompt(id, text, images);
-  zenHideAfterSend(text);
 }
 
-/**
- * 在指定会话上启动工作流（不依赖 currentId）：首页在减少焦虑模式下建完会话并不进
- * 会话页（避免新会话闪一下才进室女座），所以只能按 threadId 直接投递。
- * 启动失败（工作流停用/校验不过/首节点发送失败）时收回首页发起时的占位忙碌态，
- * 会话回到普通列表等用户处理，不会卡在室女座空转。
- */
+/** 在指定会话上启动工作流（不依赖 currentId，按 threadId 直接投递）。 */
 export async function startWorkflowOnThread(
   threadId: string,
   text: string,
@@ -2102,19 +1924,7 @@ export async function startWorkflowOnThread(
   followFrom?: { agentKind: AgentKind; model: string | null },
 ): Promise<void> {
   if (isSubagentThread(threadId)) return;
-  try {
-    await startWorkflow(workflowId, { goal: text.trim() }, threadId, images, followFrom);
-  } catch (e) {
-    // 启动失败（工作流停用/校验不过/首节点发送失败）：收回首页发起时的占位忙碌态，
-    // 会话回到普通列表等用户处理，不会卡在室女座空转。
-    zenUnhold(threadId);
-    throw e;
-  }
-  // 工作流已自己接管运行态（host.setRunning 会同时记乐观忙碌），首页占位可以收掉；
-  // 这里不能走 zenUnhold，它会把刚置上的 running 冲回 false。
-  zenHoldThreads.delete(threadId);
-  if (state.currentId === threadId) zenHideAfterSend(text);
-  else if (zenModeOn()) zenDropPrompt(text);
+  await startWorkflow(workflowId, { goal: text.trim() }, threadId, images, followFrom);
 }
 
 type StageInput = { currentPrompt: string; stagePrompt: string; stageIndex: number };
@@ -2145,13 +1955,7 @@ async function startStageThread(
   thread.title = ownTitle;
   rememberThreadSnapshot(thread);
   await refreshThreads();
-  if (zenModeOn()) {
-    // 室女座：不进入 Stage 会话页，回到首页并播放飞入动画；Stage 链在后台推进。
-    closeThread();
-    zenDropPrompt(prompt);
-  } else {
-    await openThread(thread.id);
-  }
+  await openThread(thread.id);
   setState("running", thread.id, true);
   // Stage 使用自己的任务生成标题，不沿用来源会话名；失败时保留上面的提示词兜底标题。
   void api.generateThreadTitle(thread.id, prompt.slice(0, 1200)).catch(() => {});
@@ -2469,7 +2273,6 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
       suspendWorkflowActive(threadId);
     }
     setState("running", threadId, false);
-    zenHoldThreads.delete(threadId);
     throw e;
   }
 }
@@ -2553,7 +2356,7 @@ restoreFireRelayState();
 // 通用工作流运行时（/run）：复用会话接力模式，与 /fire 专用路径并存。
 initWorkflowRuntime({
   currentId: () => state.currentId,
-  isRunning: (id) => !!state.running[id] && !zenHoldThreads.has(id),
+  isRunning: (id) => !!state.running[id],
   // 工作流节点在「已置忙 → sendPrompt 真正起来」的间隙里同样需要乐观运行态，
   // 否则阶段接力期间 refreshThreads 的后端 false 快照会把会话冲回普通列表。
   setRunning: (id, v) => {
@@ -2828,23 +2631,6 @@ export function showToast(text: string, ms = 3600) {
   toastTimer = setTimeout(() => setToastMessage(null), ms);
 }
 
-/** 减少焦虑：提示词飞入室女座的动画信号，由 App 的 ZenDropOverlay 消费。 */
-export type ZenDrop = { text: string; tick: number };
-const [zenDrop, setZenDrop] = createSignal<ZenDrop | null>(null);
-let zenDropTick = 0;
-export function zenDropSignal() {
-  return zenDrop();
-}
-function zenDropPrompt(text: string) {
-  const snippet = text.trim().split(/\r?\n/, 1)[0].slice(0, 24);
-  setZenDrop({ text: snippet || "消息已发送", tick: ++zenDropTick });
-  // 不等飞行动画落地，发出即弹轻提示，让用户立刻知道会话已转入后台。
-  showToast(ZEN_TOAST);
-}
-/** 飞入动画落地：收起气泡。 */
-export function zenDropLanded() {
-  setZenDrop(null);
-}
 const [timeMachineChangedTick, setTimeMachineChangedTick] = createSignal(0);
 let timeMachineEditTarget: { threadId: string; checkpointId: string } | null = null;
 export function setTimeMachineEditTarget(
@@ -3414,7 +3200,6 @@ export async function initStore() {
       const wasRunning = !!state.running[threadId];
       runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
       optimisticRunningThreads.delete(threadId);
-      zenHoldThreads.delete(threadId);
       setState("running", threadId, e.payload.running);
       if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
         staleThreadSnapshots.add(threadId);
@@ -3685,8 +3470,6 @@ export async function initStore() {
     // 本地 worktree 后台创建失败：丢弃暂存提示词（会话里已有错误系统消息）
     listen<{ threadId: string; error?: string }>("acp:worktree-failed", (e) => {
       pendingWorktreePrompts.delete(e.payload.threadId);
-      // 首页发起时占位到室女座的会话，worktree 没建起来就没后续轮次事件了，在这里收回。
-      zenUnhold(e.payload.threadId);
       void refreshThreads();
     }),
     // host 侧：收到漫游请求，入队等本机用户在弹框里确认

@@ -689,7 +689,7 @@ export function Composer() {
             </div>
             <div class="workflow-manual-review-actions">
               <button type="button" class="btn secondary small" onClick={abandonWorkflowChain}>
-                结束流程并移出室女座
+                结束流程
               </button>
             </div>
           </div>

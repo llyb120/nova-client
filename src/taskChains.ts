@@ -1,14 +1,11 @@
 /**
- * 室女座（减少焦虑）任务链归属计算：纯函数，便于脱离 Solid/Tauri 单测。
+ * 任务链（父子接力整条链）运行态计算：纯函数，便于脱离 Solid/Tauri 单测。
  * 这里判定的两套口径必须分开：
- * - hidden：整条链是否留在室女座（工作流没走到终点、或提示词队列还有待发条目就一直在，
+ * - active：整条链是否仍未结束（工作流没走到终点、或提示词队列还有待发条目就一直算，
  *   哪怕这一瞬没人 running）。
- * - busy：链上是否有推进中的阶段（回合在跑或阶段接力空档），refreshThreads 据此
- *   决定「后端快照 running=false」能不能冲掉前端已有的忙碌态。
- * 只按 running 判定会让未完成的工作流在室女座与普通列表之间来回闪；
- * 回合结束到队列自动投递下一条之间的空档同理。
+ * - busy：链上是否有推进中的阶段（回合在跑或阶段接力空档），侧栏据此保持转圈不闪断。
  */
-export type VirgoChainInput = {
+export type TaskChainInput = {
   threads: { id: string; parentThreadId?: string | null }[];
   /** 单会话忙碌态（acp:turn 事件、乐观置位的结果）。 */
   isRunning: (threadId: string) => boolean;
@@ -16,12 +13,12 @@ export type VirgoChainInput = {
   advancingRoots: Iterable<string>;
   /** 尚未走到终点的工作流 root（含暂停待补充、等待人工审核）。 */
   unfinishedRoots: Iterable<string>;
-  /** 提示词队列仍有待发条目（未挂起）的会话：接力空档保持归属，但不算在跑、不锁忙碌态。 */
+  /** 提示词队列仍有待发条目（未挂起）的会话：接力空档仍算未结束，但不算在跑、不锁忙碌态。 */
   queuedThreads: Iterable<string>;
 };
 
-export function virgoChains(input: VirgoChainInput): {
-  hidden: Set<string>;
+export function taskChains(input: TaskChainInput): {
+  active: Set<string>;
   busy: Set<string>;
   rootCount: number;
 } {
@@ -46,7 +43,7 @@ export function virgoChains(input: VirgoChainInput): {
   for (const root of input.advancingRoots) advancing.add(resolve(root));
   const unfinished = new Set<string>(advancing);
   for (const root of input.unfinishedRoots) unfinished.add(resolve(root));
-  // 队列待发条目只保归属：计为未完成，但不计入运行中任务数、不撑忙碌态。
+  // 队列待发条目只保未结束：计为未完成，但不计入运行中任务数、不撑忙碌态。
   for (const id of input.queuedThreads) unfinished.add(resolve(id));
 
   // 运行中任务数：本回合在跑的链 + 工作流推进中的链（阶段接力空档也算在跑）。
@@ -54,14 +51,14 @@ export function virgoChains(input: VirgoChainInput): {
   for (const t of input.threads) {
     if (input.isRunning(t.id)) runningRoots.add(resolve(t.id));
   }
-  const hidden = new Set<string>();
+  const active = new Set<string>();
   const busy = new Set<string>();
   for (const t of input.threads) {
     const root = resolve(t.id);
-    if (unfinished.has(root) || runningRoots.has(root)) hidden.add(t.id);
+    if (unfinished.has(root) || runningRoots.has(root)) active.add(t.id);
     // busy 只认工作流自己的推进态：普通会话漏收一个 acp:turn(false) 时，
     // 后端快照仍有机会把它自愈回 idle，不能被前端假忙碌态永久锁住。
     if (advancing.has(root)) busy.add(t.id);
   }
-  return { hidden, busy, rootCount: runningRoots.size };
+  return { active, busy, rootCount: runningRoots.size };
 }

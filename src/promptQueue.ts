@@ -165,12 +165,12 @@ export async function dispatchQueuedPrompt(item: QueuedPrompt, steerNow = false)
 /** 任意会话回合结束后按 FIFO 自动投递；不依赖 Composer 是否挂载或是否为前台会话。 */
 function startPromptQueueDispatcher() {
   createRoot(() => {
-    // 队列占位镜像进 store：回合结束到下一条自动投递之间的空档，会话保持室女座归属，
-    // 不会在普通列表闪一下再回来。挂起的队列不占位（用户已主动停下，会话回到普通列表）。
+    // 队列占位镜像进 store：回合结束到下一条自动投递之间的空档，任务链仍算未结束。
+    // 挂起的队列不占位（用户已主动停下）。
     createEffect(() => {
       const held = queueHeldThreadIds();
       // 发送失败的条目不会再自动投递，不能继续占着「有待发条目」的位：否则它所在的
-      // 任务链会被永久留在室女座（unfinished 只认队列里有待发条目的会话）。
+      // 任务链会被永久当作未结束（unfinished 只认队列里有待发条目的会话）。
       const failed = failedQueueIds();
       const ids = new Set<string>();
       for (const item of queuedPrompts()) {

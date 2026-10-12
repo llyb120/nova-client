@@ -112,7 +112,7 @@ test("new-thread send failures restore the draft, stop running and show the actu
     const done = new Promise((resolve) => { finished = resolve; });
     const noop = () => {};
     const deps = {
-      state, PENDING_THREAD_PREFIX: "pending-", zenModeOn: () => false, zenDropPrompt: noop,
+      state, PENDING_THREAD_PREFIX: "pending-",
       reconcile: (v) => v, bumpChatScrollToBottom: noop,
       setState: (...args) => {
         if (typeof args[0] === "object") Object.assign(state, args[0]);

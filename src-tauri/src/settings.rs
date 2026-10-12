@@ -22,7 +22,7 @@ pub struct SessionShortcut {
     pub id: String,
     /// 规范化按键，如 Ctrl+1 / Alt+P。
     pub keys: String,
-    /// selectProject | selectModel | newSession | openUnread | insertText | selectWorkflow | hideToVirgo
+    /// selectProject | selectModel | newSession | openUnread | insertText | selectWorkflow
     pub action: String,
     /// 项目绝对路径、`<agentKind>:<modelId>` / roam/quota 编码，或 insertText 文本；newSession 可为空。
     pub target: String,
@@ -191,9 +191,7 @@ pub struct Settings {
     pub session_auto_cleanup_enabled: bool,
     /// 自动清理会话的保留时长（小时）。
     pub session_auto_cleanup_hours: u32,
-    /// 禅意模式（室女座）：运行中的会话只在侧栏「室女座」中显示，结束后自动回到普通模式。
-    pub zen_mode_enabled: bool,
-    /// 在室女座旁显示操作知识图谱，默认关闭。
+    /// 在侧栏显示操作知识图谱入口，默认关闭。
     pub knowledge_graph_enabled: bool,
     /// 上下文检索：none / fast。旧配置中的 super 会在加载时迁移为 fast。
     pub context_retrieval_mode: ContextRetrievalMode,
@@ -272,7 +270,6 @@ impl Default for Settings {
             update_channel: "release".into(),
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,
-            zen_mode_enabled: false,
             knowledge_graph_enabled: false,
             context_retrieval_mode: ContextRetrievalMode::Fast,
             custom_env_vars: std::collections::HashMap::new(),

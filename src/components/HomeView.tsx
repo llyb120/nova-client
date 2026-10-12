@@ -38,8 +38,6 @@ import {
   startWorkflowOnThread,
   takePendingNewSessionSeed,
   assertBuiltinPrompt,
-  virgoHiddenThreads,
-  zenRunningChains,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import { setHomeTerminalCwd } from "../workspaceLayout";
@@ -723,7 +721,6 @@ export function HomeView() {
           if (!ephemeral) lastUsed.setModel(entryAgentKind, entryModel);
           if (clue) clearPendingClueCard();
           // 「跟随会话」节点跟随用户在新会话页选择的后端/模型，而非被首节点覆盖后的值。
-          // 减少焦虑模式下 createThread 不会进入会话页（currentId 仍为空），所以按会话 id 直接启动。
           await startWorkflowOnThread(threadId, prompt, images, workflowId, {
             agentKind: agentKind(),
             model: model() || null,
@@ -1005,14 +1002,10 @@ export function HomeView() {
     }
   };
 
-  // 旧版本训练记录继续隔离，不进入首页最近会话；
-  // 减少焦虑模式下运行中的任务链、以及快捷键手动收进室女座的会话都不再出现在最近会话。
-  const recent = createMemo(() => {
-    const hidden = virgoHiddenThreads();
-    return state.threads
-      .filter((t) => !t.experienceThread && !t.employeeThread && !hidden.has(t.id))
-      .slice(0, 6);
-  });
+  // 旧版本训练记录继续隔离，不进入首页最近会话。
+  const recent = createMemo(() =>
+    state.threads.filter((t) => !t.experienceThread && !t.employeeThread).slice(0, 6),
+  );
 
   return (
     <main class="home">

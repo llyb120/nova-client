@@ -336,7 +336,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [sessionAutoCleanupHours, setSessionAutoCleanupHours] = createSignal(
     s?.sessionAutoCleanupHours ?? 24 * 30,
   );
-  const [zenModeEnabled, setZenModeEnabled] = createSignal(s?.zenModeEnabled ?? false);
   const [knowledgeGraphEnabled, setKnowledgeGraphEnabled] = createSignal(s?.knowledgeGraphEnabled ?? false);
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
@@ -539,14 +538,12 @@ export function SettingsModal(props: { onClose: () => void }) {
                 ? "insertText"
                 : item.action === "selectWorkflow"
                   ? "selectWorkflow"
-                  : item.action === "hideToVirgo"
-                    ? "hideToVirgo"
-                    : "selectModel",
+                  : "selectModel",
         target: item.target.trim(),
       }))
       .filter((item) => {
         if (!item.keys) return false;
-        if (item.action === "newSession" || item.action === "openUnread" || item.action === "toggleTerminal" || item.action === "hideToVirgo") return true;
+        if (item.action === "newSession" || item.action === "openUnread" || item.action === "toggleTerminal") return true;
         return item.target.length > 0;
       });
 
@@ -764,7 +761,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     updateChannel: updateChannel(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
-    zenModeEnabled: zenModeEnabled(),
     knowledgeGraphEnabled: knowledgeGraphEnabled(),
     historyDisplayMode: historyDisplayMode(),
     customEnvVars: Object.fromEntries(
@@ -1275,7 +1271,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型/工作流、快速新会话，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换与隐藏到室女座有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发；「隐藏会话到室女座」仅在未开启减少焦虑（室女座）时可用，会话被收起期间侧栏会出现「室女座」tab，重新打开即回到普通会话。默认 Ctrl+`（~ 键）打开或收起终端，可添加「打开 / 收起终端」动作修改按键。
+                      一键切换项目/模型/工作流、快速新会话，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发。默认 Ctrl+`（~ 键）打开或收起终端，可添加「打开 / 收起终端」动作修改按键。
                     </div>
                   </div>
                   <button
@@ -1326,9 +1322,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                                         ? "insertText"
                                   : action === "selectWorkflow"
                                     ? "selectWorkflow"
-                                    : action === "hideToVirgo"
-                                      ? "hideToVirgo"
-                                      : "selectModel";
+                                    : "selectModel";
                                 updateSessionShortcut(index, {
                                   action: nextAction,
                                   target: "",
@@ -1343,15 +1337,13 @@ export function SettingsModal(props: { onClose: () => void }) {
                               <option value="toggleTerminal">打开 / 收起终端</option>
                               <option value="selectWorkflow">选择工作流</option>
                               <option value="insertText">快捷输入</option>
-                              <option value="hideToVirgo">隐藏会话到室女座</option>
                             </select>
                             <div class="session-shortcut-target">
                               <Show
                                 when={
                                   item().action === "newSession" ||
                                   item().action === "openUnread" ||
-                                  item().action === "toggleTerminal" ||
-                                  item().action === "hideToVirgo"
+                                  item().action === "toggleTerminal"
                                 }
                                 fallback={
                                   <Show
@@ -1423,9 +1415,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                                   {item().action === "openUnread"
                                     ? "优先未读；无未读时循环切换进行中的会话"
                                     : item().action === "toggleTerminal" ? "任意本地页 · 打开 / 收起右侧终端"
-                                    : item().action === "hideToVirgo"
-                                      ? "会话页生效 · 仅在未开启减少焦虑时可用"
-                                      : "任意页 · 继承当前目录与模型"}
+                                    : "任意页 · 继承当前目录与模型"}
                                 </div>
                               </Show>
                             </div>
@@ -1572,7 +1562,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <input type="checkbox" checked={knowledgeGraphEnabled()} onChange={(e) => setKnowledgeGraphEnabled(e.currentTarget.checked)} />
                 <span>显示知识图谱</span>
               </label>
-              <p class="field-hint">默认关闭。开启后在室女座旁显示入口，以向四周展开的操作树查看已记录的路径、下一步分支和可完成的目标。</p>
+              <p class="field-hint">默认关闭。开启后在侧栏显示入口，以向四周展开的操作树查看已记录的路径、下一步分支和可完成的目标。</p>
             </section>
             <section class="settings-group">
               <h3 class="settings-group-title">上下文机制</h3>
@@ -1653,25 +1643,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </label>
                 <span class="field-hint">
                   默认开启。Windows 下 Lyra 的 bash 工具按 UTF-8 捕获 PowerShell 输出，修复中文等字符出现「?」或乱码的问题。保存后对新会话生效。
-                </span>
-              </div>
-            </section>
-
-
-            <section class="settings-group">
-              <h3 class="settings-group-title">减少焦虑</h3>
-              <div class="field">
-                <span class="field-label">室女座</span>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={zenModeEnabled()}
-                    onChange={(e) => setZenModeEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-                <span class="field-hint">
-                  启用后侧栏多出「室女座」：会话发出后即转入后台运行并移入室女座（有轻提示，想看进度可手动点开），普通模式不再显示，会话结束后自动移回。不必一直盯着运行中的会话，专心做自己的事。
                 </span>
               </div>
             </section>

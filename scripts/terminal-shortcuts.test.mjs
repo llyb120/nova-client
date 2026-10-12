@@ -29,14 +29,14 @@ const ast = ts.createSourceFile('store.ts',readFileSync(new URL('../src/store.ts
 const selected = ast.statements.filter(node => ts.isFunctionDeclaration(node) && ['openNextUnreadThread','chainUnreadTurns'].includes(node.name?.text));
 assert.equal(selected.length,2);
 const code = ts.transpile(selected.map(node => node.getText(ast).replace(/^export /,'')).join('\n'));
-async function navigate(state,hidden=[]) {
+async function navigate(state) {
   const opened=[];
-  await vm.runInNewContext(`${code}\nopenNextUnreadThread()`,{state:{threads,currentId:null,running:{},unreadTurns:{},...state},virgoHiddenThreads:()=>new Set(hidden),nextRunningThread,isPendingThreadId:id=>id.startsWith('pending:'),latestFireStage:display.latestFireStage,setView:()=>{},openThread:async id=>opened.push(id)});
+  await vm.runInNewContext(`${code}\nopenNextUnreadThread()`,{state:{threads,currentId:null,running:{},unreadTurns:{},...state},nextRunningThread,isPendingThreadId:id=>id.startsWith('pending:'),latestFireStage:display.latestFireStage,setView:()=>{},openThread:async id=>opened.push(id)});
   return opened;
 }
 assert.deepEqual(await navigate({running:{a:true},unreadTurns:{b:1}}),['b']);
 assert.deepEqual(await navigate({running:{a:true,c:true},currentId:'a'}),['c']);
-assert.deepEqual(await navigate({running:{a:true}},['a']),['a']);
+assert.deepEqual(await navigate({running:{a:true}}),['a']);
 assert.deepEqual(await navigate({}),[]);
 assert.deepEqual(await navigate({threads:[thread('pending:new')],running:{'pending:new':true}}),[]);
 assert.deepEqual(await navigate({threads:chain,currentId:'root',running:{other:true,stage2:true},unreadTurns:{stage1:2}}),['stage1']);
