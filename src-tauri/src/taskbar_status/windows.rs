@@ -22,7 +22,7 @@ use windows_sys::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED}, Gdi::*},
         System::LibraryLoader::GetModuleHandleW,
-        UI::{HiDpi::*, WindowsAndMessaging::*},
+        UI::{HiDpi::*, Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE}, WindowsAndMessaging::*},
     },
 };
 
@@ -32,6 +32,7 @@ static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
 static WINDOW: AtomicUsize = AtomicUsize::new(0);
 static THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const REFRESH: u32 = WM_APP + 1;
+const WM_MOUSELEAVE: u32 = 0x02A3; // Win32 Controls message paired with TME_LEAVE.
 static LAYOUT: Mutex<Option<Arc<Layout>>> = Mutex::new(None);
 
 struct Layout {
@@ -178,7 +179,7 @@ unsafe fn query_layout() -> Option<Layout> {
         return None;
     }
     let dpi = GetDpiForWindow(parent) as i32;
-    let slot = free_slot(Rect { left: taskbar.left, top: taskbar.top, right: taskbar.right, bottom: taskbar.bottom }, &occupied, 240 * dpi / 96, 160 * dpi / 96, 8 * dpi / 96)?;
+    let slot = pill_slot(free_slot(taskbar, &occupied, 240 * dpi / 96, 160 * dpi / 96, 6 * dpi / 96)?, dpi);
     if !same_rect(&taskbar, &taskbar_rect(parent)?) || FindWindowW(w!("Shell_TrayWnd"), null()) != parent {
         return None;
     }
@@ -318,12 +319,149 @@ unsafe fn refresh(text: &mut String) {
     }
 }
 
+/// Keep the chip centered and compact even on a tall taskbar; never enlarge the verified gap.
+fn pill_slot(mut slot: Rect, dpi: i32) -> Rect {
+    let height = (28 * dpi / 96).min(slot.bottom - slot.top);
+    slot.top += (slot.bottom - slot.top - height) / 2;
+    slot.bottom = slot.top + height;
+    slot
+}
+
+#[derive(Clone, Copy)]
+struct Palette {
+    background: u32,
+    border: u32,
+    text: u32,
+    muted: u32,
+    accent: u32,
+}
+
+const fn rgb(r: u32, g: u32, b: u32) -> u32 { r | (g << 8) | (b << 16) }
+
+fn palette(light: bool, hover: bool) -> Palette {
+    if light {
+        Palette {
+            background: if hover { rgb(225, 235, 249) } else { rgb(241, 245, 251) },
+            border: rgb(198, 211, 229), text: rgb(28, 40, 58),
+            muted: rgb(79, 99, 124), accent: rgb(35, 108, 214),
+        }
+    } else {
+        Palette {
+            background: if hover { rgb(51, 59, 71) } else { rgb(38, 43, 51) },
+            border: rgb(65, 75, 89), text: rgb(237, 242, 250),
+            muted: rgb(168, 184, 205), accent: rgb(112, 178, 255),
+        }
+    }
+}
+
+unsafe fn paint_chip(hwnd: HWND, dc: HDC, mut rect: RECT) {
+    let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+    let px = |n| n * dpi / 96;
+    let mut cursor = POINT::default();
+    let hover = GetCursorPos(&mut cursor) != 0 && WindowFromPoint(cursor) == hwnd;
+    // Taskbar follows the Windows (not app) theme. Fall back to the usual dark shell.
+    let light = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+        .and_then(|key| key.get_value::<u32, _>("SystemUsesLightTheme"))
+        .unwrap_or(0) != 0;
+    let mut colors = palette(light, hover);
+    let mut contrast = HIGHCONTRASTW { cbSize: size_of::<HIGHCONTRASTW>() as u32, ..Default::default() };
+    if SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.cbSize, &mut contrast as *mut _ as _, 0) != 0
+        && contrast.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0
+    {
+        colors = Palette {
+            background: GetSysColor(if hover { COLOR_HIGHLIGHT } else { COLOR_BTNFACE }),
+            border: GetSysColor(COLOR_BTNTEXT),
+            text: GetSysColor(if hover { COLOR_HIGHLIGHTTEXT } else { COLOR_BTNTEXT }),
+            muted: GetSysColor(if hover { COLOR_HIGHLIGHTTEXT } else { COLOR_BTNTEXT }),
+            accent: GetSysColor(if hover { COLOR_HIGHLIGHTTEXT } else { COLOR_BTNTEXT }),
+        };
+    }
+    // Buffer the small native child so status changes/hover never flash a grey rectangle.
+    let buffer = CreateCompatibleDC(dc);
+    let bitmap = CreateCompatibleBitmap(dc, rect.right, rect.bottom);
+    let buffered = !buffer.is_null() && !bitmap.is_null();
+    let target = if buffered { buffer } else { dc };
+    let old_bitmap = if buffered { SelectObject(buffer, bitmap) } else { null_mut() };
+    let brush = CreateSolidBrush(colors.background);
+    let pen = CreatePen(PS_SOLID, px(1).max(1), colors.border);
+    FillRect(target, &rect, brush);
+    let old_brush = SelectObject(target, brush);
+    let old_pen = SelectObject(target, pen);
+    RoundRect(target, 0, 0, rect.right, rect.bottom, rect.bottom, rect.bottom);
+    SelectObject(target, old_pen);
+    SelectObject(target, old_brush);
+    DeleteObject(pen);
+    DeleteObject(brush);
+
+    SetBkMode(target, TRANSPARENT as i32);
+    let accent = CreateSolidBrush(colors.accent);
+    let old_brush = SelectObject(target, accent);
+    let old_pen = SelectObject(target, GetStockObject(NULL_PEN));
+    let middle = rect.bottom / 2;
+    Ellipse(target, px(12), middle - px(3), px(18), middle + px(3));
+    SelectObject(target, old_pen);
+    SelectObject(target, old_brush);
+    DeleteObject(accent);
+
+    let font = CreateFontW(-px(12), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, w!("Segoe UI"));
+    let brand_font = CreateFontW(-px(12), 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, w!("Segoe UI"));
+    let old_font = SelectObject(target, GetStockObject(DEFAULT_GUI_FONT));
+    if !brand_font.is_null() { SelectObject(target, brand_font); }
+    SetTextColor(target, colors.muted);
+    let mut brand = RECT { left: px(26), right: px(62), ..rect };
+    DrawTextW(target, w!("Nova"), 4, &mut brand, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    let separator = CreateSolidBrush(colors.border);
+    FillRect(target, &RECT { left: px(66), right: px(67), top: middle - px(5), bottom: middle + px(5) }, separator);
+    DeleteObject(separator);
+
+    SelectObject(target, if font.is_null() { GetStockObject(DEFAULT_GUI_FONT) } else { font });
+    SetTextColor(target, colors.text);
+    let mut title = [0u16; 1024];
+    let length = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32).max(0) as usize;
+    let title = String::from_utf16_lossy(&title[..length]);
+    // Keep the full window title for accessibility; the brand is already drawn separately.
+    let status: Vec<u16> = title.strip_prefix("Nova · ").unwrap_or(&title).encode_utf16().collect();
+    rect.left = px(77);
+    rect.right -= px(12);
+    DrawTextW(target, status.as_ptr(), status.len() as i32, &mut rect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(target, old_font);
+    if !font.is_null() { DeleteObject(font); }
+    if !brand_font.is_null() { DeleteObject(brand_font); }
+    if buffered {
+        let mut client = RECT::default();
+        GetClientRect(hwnd, &mut client);
+        BitBlt(dc, 0, 0, client.right, client.bottom, buffer, 0, 0, SRCCOPY);
+        SelectObject(buffer, old_bitmap);
+    }
+    if !bitmap.is_null() { DeleteObject(bitmap); }
+    if !buffer.is_null() { DeleteDC(buffer); }
+}
+
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONUP => {
             ShowWindow(hwnd, SW_HIDE);
             if let Some(app) = APP.get() { crate::sys_notify::focus_main_window(app); }
+            0
+        }
+        WM_SIZE => {
+            let mut rect = RECT::default();
+            GetClientRect(hwnd, &mut rect);
+            let region = CreateRoundRectRgn(0, 0, rect.right + 1, rect.bottom + 1, rect.bottom, rect.bottom);
+            // Windows owns the region only after a successful SetWindowRgn.
+            if !region.is_null() && SetWindowRgn(hwnd, region, 1) == 0 { DeleteObject(region); }
+            0
+        }
+        WM_MOUSEMOVE => {
+            let mut tracking = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+            TrackMouseEvent(&mut tracking);
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_MOUSELEAVE | WM_THEMECHANGED | WM_SYSCOLORCHANGE | WM_SETTINGCHANGE => {
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_ERASEBKGND => 1,
@@ -333,18 +471,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !dc.is_null() {
                 let mut rect = RECT::default();
                 GetClientRect(hwnd, &mut rect);
-                FillRect(dc, &rect, GetSysColorBrush(COLOR_BTNFACE));
-                SetBkMode(dc, TRANSPARENT as i32);
-                SetTextColor(dc, GetSysColor(COLOR_BTNTEXT));
-                let dpi = GetDpiForWindow(hwnd).max(96) as i32;
-                let font = CreateFontW(-12 * dpi / 96, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, w!("Segoe UI"));
-                let old = if font.is_null() { null_mut() } else { SelectObject(dc, font) };
-                rect.left += 8 * dpi / 96;
-                rect.right -= 8 * dpi / 96;
-                let mut text = [0u16; 1024];
-                let length = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
-                DrawTextW(dc, text.as_ptr(), length, &mut rect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-                if !font.is_null() { SelectObject(dc, old); DeleteObject(font); }
+                paint_chip(hwnd, dc, rect);
             }
             EndPaint(hwnd, &paint);
             0
@@ -360,6 +487,41 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chip_stays_inside_the_verified_gap_at_every_scale() {
+        for dpi in [96, 120, 144, 192] {
+            for height in [20, 40, 80] {
+                let slot = Rect { left: -1200, top: -100, right: -800, bottom: -100 + height * dpi / 96 };
+                let chip = pill_slot(slot, dpi);
+                assert_eq!((chip.left, chip.right), (slot.left, slot.right));
+                assert!(chip.top >= slot.top && chip.bottom <= slot.bottom);
+                assert!(chip.bottom > chip.top && chip.bottom - chip.top <= 28 * dpi / 96);
+                assert!(((chip.top - slot.top) - (slot.bottom - chip.bottom)).abs() <= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn chip_text_meets_normal_text_contrast_in_both_themes_and_hover() {
+        fn luminance(color: u32) -> f64 {
+            let channel = |shift| {
+                let value = ((color >> shift) & 255u32) as f64 / 255.0;
+                if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * channel(0) + 0.7152 * channel(8) + 0.0722 * channel(16)
+        }
+        for light in [false, true] {
+            for hover in [false, true] {
+                let colors = palette(light, hover);
+                for text in [colors.text, colors.muted] {
+                    let a = luminance(text);
+                    let b = luminance(colors.background);
+                    assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5);
+                }
+            }
+        }
+    }
 
     #[test]
     fn containers_are_not_blank_space_or_giant_controls() {
