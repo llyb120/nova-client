@@ -357,6 +357,9 @@ const RESERVED_OPTION_KEYS: &[&str] = &[
     "supportsThinkingToggle",
     "clearThinking",
     "proxy",
+    // 请求体的 tools 字段由实际启用的工具列表计算得出；放行会在无工具请求（如 Altair）时
+    // 把 body["tools"] 覆盖成非数组值，被网关拒绝（"tools must be an array"）。
+    "tools",
 ];
 
 /// 解析细粒度代理：model.options.proxy 覆盖 provider.options.proxy。
@@ -918,7 +921,8 @@ mod tests {
                         "baseURL": "https://api.z.ai/api/paas/v4",
                         "apiKey": "key",
                         "tool_stream": true,
-                        "thinking_format": "deepseek"
+                        "thinking_format": "deepseek",
+                        "tools": "auto"
                     },
                     "models": {
                         "glm": {
@@ -935,6 +939,8 @@ mod tests {
         // 内置键被消费，不会重复下发；snake 风格的 thinking_format 同样生效。
         assert!(!resolved.model.extra_options.contains_key("clearThinking"));
         assert!(!resolved.model.extra_options.contains_key("thinking_format"));
+        // tools 由实际工具列表计算,不允许 options 透传覆盖请求体顶层的 tools 字段。
+        assert!(!resolved.model.extra_options.contains_key("tools"));
         assert_eq!(resolved.model.thinking_format.as_deref(), Some("deepseek"));
         assert_eq!(resolved.model.clear_thinking, Some(false));
     }
