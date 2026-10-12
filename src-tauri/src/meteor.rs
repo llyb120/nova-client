@@ -184,6 +184,10 @@ fn validate_annotations(annotations: &[Annotation], context: &Context) -> Result
     Ok(())
 }
 
+/// A running dev build takes over per-user desktop surfaces (Meteor, taskbar island) from release.
+#[cfg(windows)]
+pub(crate) fn release_yields_to_dev() -> bool { !cfg!(debug_assertions) && platform::dev_present() }
+
 fn allowed(dev: bool, dev_present: bool, enabled: bool) -> bool {
     enabled && (dev || !dev_present)
 }

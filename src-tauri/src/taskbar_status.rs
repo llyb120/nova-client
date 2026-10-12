@@ -198,7 +198,8 @@ fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
     use tauri::Manager;
     let state = app.state::<crate::AppState>();
     // Enabled = always visible, foreground or not.
-    if !state.settings.lock().ok()?.taskbar_status_enabled {
+    // Hidden while a dev instance runs; it reappears when dev exits (refresh polls every 250ms).
+    if !state.settings.lock().ok()?.taskbar_status_enabled || crate::meteor::release_yields_to_dev() {
         return None;
     }
     let now = crate::threads::now_ms();
