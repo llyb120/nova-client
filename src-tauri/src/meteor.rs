@@ -196,7 +196,6 @@ fn ensure_allowed() -> Result<(), String> {
     return Err("Meteor 屏幕快捷入口目前仅支持 Windows".into());
     #[cfg(windows)]
     {
-        if !platform::ready() { return Err("Meteor 键盘监听尚未就绪".into()); }
         if !allowed(cfg!(debug_assertions), platform::dev_present(), ENABLED.load(Ordering::Acquire)) {
             return Err(if !cfg!(debug_assertions) && platform::dev_present() {
                 "开发版正在运行，正式版 Meteor 已暂停".into()
@@ -235,18 +234,14 @@ pub(crate) fn sync(app: &AppHandle) {
     let settings = state.settings.lock().unwrap();
     let enabled = settings.meteor_enabled;
     #[cfg(windows)]
-    let (enabled, binding_changed) = match platform::configure(&settings.meteor_shortcut) {
-        Ok(changed) => (enabled, changed),
-        Err(error) => { report(app, error); (false, false) }
+    let enabled = match platform::configure(&settings.meteor_shortcut) {
+        Ok(()) => enabled,
+        Err(error) => { report(app, error); false }
     };
-    #[cfg(not(windows))]
-    let binding_changed = false;
-    let was_enabled = ENABLED.swap(enabled, Ordering::AcqRel);
+    ENABLED.store(enabled, Ordering::Release);
     drop(settings);
-    if enabled && (!was_enabled || binding_changed) {
-        #[cfg(windows)]
-        platform::request_reinstall();
-    }
+    #[cfg(windows)]
+    platform::wake();
     if !enabled { dismiss(app); }
 }
 
@@ -288,9 +283,10 @@ fn dismiss(app: &AppHandle) {
 #[tauri::command]
 pub(crate) fn meteor_set_shortcut_recording(window: WebviewWindow, active: bool) -> Result<(), String> {
     if window.label() != "main" { return Err("仅 Nova 主窗口可以录制快捷键".into()); }
+    // While recording, release the hotkey so pressing the current combination can be recorded.
     RECORDING.store(active, Ordering::Release);
     #[cfg(windows)]
-    platform::reset_taps();
+    platform::wake();
     Ok(())
 }
 
@@ -660,90 +656,77 @@ fn prepare(app: &AppHandle, window: &WebviewWindow, capture: &Capture, annotatio
     Ok((thread_id, prompt, images, directory))
 }
 
+/// Two short, pure taps of the same Alt key (0xA4 left / 0xA5 right), times in milliseconds.
 #[cfg(any(windows, test))]
 #[derive(Default)]
 struct DoubleAlt {
+    held: [bool; 2],
     pressed: Option<(u32, u64)>,
     previous_up: Option<(u32, u64)>,
 }
 #[cfg(any(windows, test))]
 impl DoubleAlt {
-    fn key(&mut self, vk: u32, down: bool, repeat: bool, injected: bool, other_modifiers: bool, now: u64) -> bool {
-        if injected || other_modifiers || !matches!(vk, 0x12 | 0xA4 | 0xA5) {
-            *self = Self::default();
-            return false;
-        }
+    fn key(&mut self, vk: u32, down: bool, injected: bool, other_modifiers: bool, now: u64) -> bool {
+        let side = match vk {
+            0xA4 => 0,
+            0xA5 => 1,
+            _ => {
+                // Launchers/AutoHotkey inject a mask key around a lone Alt release; only physical keys break a tap.
+                if !injected { self.reset(); }
+                return false;
+            }
+        };
+        if injected { self.reset(); return false; }
+        let repeat = down && self.held[side];
+        self.held[side] = down;
+        if other_modifiers { self.reset(); return false; }
         if down {
             if !repeat {
-                if self.pressed.is_some() { *self = Self::default(); }
-                else { self.pressed = Some((vk, now)); }
+                if self.pressed.is_some() { self.reset(); } else { self.pressed = Some((vk, now)); }
             }
             return false;
         }
         let Some((pressed, started)) = self.pressed.take() else { return false; };
-        if pressed != vk || now.checked_sub(started).is_none_or(|elapsed| elapsed > 350) { *self = Self::default(); return false; }
+        if pressed != vk || now.checked_sub(started).is_none_or(|elapsed| elapsed > 350) { self.reset(); return false; }
         if self.previous_up.take().is_some_and(|(key, previous)| key == vk && now.checked_sub(previous).is_some_and(|elapsed| elapsed <= 500)) { return true; }
         self.previous_up = Some((vk, now));
         false
+    }
+    fn reset(&mut self) {
+        self.pressed = None;
+        self.previous_up = None;
     }
 }
 
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use std::sync::{atomic::{AtomicIsize, AtomicU32}, OnceLock};
-    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+    use std::mem::size_of;
+    use std::sync::{atomic::AtomicUsize, OnceLock};
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, LPARAM, LRESULT, POINT, WPARAM},
-        System::Threading::{CreateMutexW, GetCurrentThreadId, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE},
-        UI::{Input::KeyboardAndMouse::{GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD,
-            KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_EXTENDEDKEY}, WindowsAndMessaging::*},
+        Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, HWND, LPARAM, POINT},
+        System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE},
+        UI::{
+            Input::{GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+                RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD},
+            Input::KeyboardAndMouse::{GetAsyncKeyState, SendInput, INPUT, INPUT_MOUSE},
+            WindowsAndMessaging::*,
+        },
     };
 
     const PRESENCE: &str = "Local\\Nova.Meteor.DevPresence";
-    static APP: OnceLock<AppHandle> = OnceLock::new();
-    static HOOK: Mutex<Option<Keys>> = Mutex::new(None);
+    const WAKE: u32 = WM_APP + 0x4D;
     static DEV_HANDLE: OnceLock<usize> = OnceLock::new();
-    static READY: AtomicBool = AtomicBool::new(false);
-    static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
-    static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
-    static REINSTALL_REQUESTED: AtomicBool = AtomicBool::new(false);
-    const REINSTALL_HOOK: u32 = WM_APP + 0x4D;
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    pub(super) enum Binding { DoubleAlt, Chord { key: u32, modifiers: u8 } }
-    struct Keys { binding: Binding, down: [bool; 256], tap: DoubleAlt, swallowed: Option<u32> }
-    impl Keys {
-        fn event(&mut self, key: u32, down: bool, injected: bool, modifiers: u8, now: u64, active: bool) -> (bool, bool) {
-            if key as usize >= self.down.len() { return (false, false); }
-            let repeat = down && self.down[key as usize];
-            self.down[key as usize] = down;
-            let mut swallow = self.swallowed == Some(key);
-            if swallow && !down { self.swallowed = None; }
-            if !active {
-                self.tap = DoubleAlt::default();
-                return (false, swallow);
-            }
-            let fire = match self.binding {
-                Binding::DoubleAlt => self.tap.key(key, down, repeat, injected, modifiers & !2 != 0, now),
-                Binding::Chord { key: trigger, modifiers: required } => {
-                    let hit = down && !repeat && !injected && key == trigger && modifiers == required;
-                    if hit { self.swallowed = Some(key); }
-                    hit
-                }
-            };
-            // A double Alt is confirmed only on the second release. All earlier Alt events pass through.
-            swallow |= fire;
-            (fire, swallow)
-        }
-    }
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    /// The worker's message-only window, 0 until it exists.
+    static WORKER: AtomicUsize = AtomicUsize::new(0);
+    #[derive(Clone, Copy, PartialEq)]
+    pub(super) enum Binding { DoubleAlt, Hotkey(Shortcut) }
+    /// The configured binding. The worker keeps the system registration in line with it,
+    /// the enable switch, dev priority and settings recording.
+    static WANTED: Mutex<Option<Binding>> = Mutex::new(None);
 
-    pub(super) fn ready() -> bool { READY.load(Ordering::Acquire) }
-    fn recording() -> bool {
-        RECORDING.load(Ordering::Acquire) && foreground() == MAIN_HWND.load(Ordering::Acquire)
-    }
-    pub(super) fn reset_taps() {
-        if let Some(keys) = HOOK.lock().unwrap().as_mut() { keys.tap = DoubleAlt::default(); }
-    }
     pub(super) fn dev_present() -> bool {
         cfg!(debug_assertions) || presence_exists(PRESENCE)
     }
@@ -810,83 +793,116 @@ mod platform {
         if unsafe { GetCursorPos(&mut point) } == 0 { return Err("无法获取鼠标位置".into()); }
         Ok((point.x, point.y))
     }
+    /// Chords are system hotkeys (RegisterHotKey). Double Alt, which no hotkey can express, is read
+    /// from passive raw input. Neither is a keyboard hook that Windows can time out and remove.
     pub(super) fn parse_shortcut(keys: &str) -> Result<Binding, String> {
         if keys.trim().eq_ignore_ascii_case("Alt+Alt") { return Ok(Binding::DoubleAlt); }
-        let normalized = crate::normalize_global_shortcut(keys);
-        let shortcut = normalized.parse::<Shortcut>().map_err(|e| format!("Meteor 快捷键无效：{e}"))?;
-        let key = virtual_key(shortcut.key).ok_or("Meteor 不支持此快捷键，请使用字母、数字、功能键或常见导航键")?;
-        let m = shortcut.mods;
-        let modifiers = u8::from(m.contains(Modifiers::CONTROL)) | (u8::from(m.contains(Modifiers::ALT)) << 1)
-            | (u8::from(m.contains(Modifiers::SHIFT)) << 2) | (u8::from(m.contains(Modifiers::SUPER)) << 3);
-        if modifiers == 0 { return Err("Meteor 全局快捷键至少需要 Ctrl、Alt、Shift 或 Win 修饰键".into()); }
-        Ok(Binding::Chord { key, modifiers })
+        let shortcut = crate::normalize_global_shortcut(keys).parse::<Shortcut>().map_err(|e| format!("Meteor 快捷键无效：{e}"))?;
+        if shortcut.mods.is_empty() { return Err("Meteor 全局快捷键至少需要 Ctrl、Alt、Shift 或 Win 修饰键".into()); }
+        Ok(Binding::Hotkey(shortcut))
     }
-    fn virtual_key(code: Code) -> Option<u32> {
-        let name = code.to_string();
-        if let Some(key) = name.strip_prefix("Key").filter(|s| s.len() == 1) { return Some(u32::from(key.as_bytes()[0])); }
-        if let Some(key) = name.strip_prefix("Digit").filter(|s| s.len() == 1) { return Some(u32::from(key.as_bytes()[0])); }
-        if let Some(n) = name.strip_prefix('F').and_then(|s| s.parse::<u32>().ok()).filter(|n| (1..=24).contains(n)) { return Some(0x6F + n); }
-        Some(match code {
-            Code::Backspace => 0x08, Code::Tab => 0x09, Code::Enter => 0x0D, Code::Escape => 0x1B,
-            Code::Space => 0x20, Code::PageUp => 0x21, Code::PageDown => 0x22, Code::End => 0x23, Code::Home => 0x24,
-            Code::ArrowLeft => 0x25, Code::ArrowUp => 0x26, Code::ArrowRight => 0x27, Code::ArrowDown => 0x28,
-            Code::PrintScreen => 0x2C, Code::Insert => 0x2D, Code::Delete => 0x2E,
-            Code::Semicolon => 0xBA, Code::Equal => 0xBB, Code::Comma => 0xBC, Code::Minus => 0xBD,
-            Code::Period => 0xBE, Code::Slash => 0xBF, Code::Backquote => 0xC0, Code::BracketLeft => 0xDB,
-            Code::Backslash => 0xDC, Code::BracketRight => 0xDD, Code::Quote => 0xDE,
-            _ => return None,
-        })
+    pub(super) fn configure(keys: &str) -> Result<(), String> {
+        let binding = parse_shortcut(keys);
+        *WANTED.lock().unwrap() = binding.as_ref().ok().copied();
+        binding.map(|_| ())
     }
-    pub(super) fn configure(keys: &str) -> Result<bool, String> {
-        let binding = parse_shortcut(keys)?;
-        let mut guard = HOOK.lock().unwrap();
-        if let Some(keys) = guard.as_mut() {
-            if keys.binding == binding { return Ok(false); }
-            keys.binding = binding;
-            keys.tap = DoubleAlt::default();
-        } else {
-            *guard = Some(Keys { binding, down: [false; 256], tap: DoubleAlt::default(), swallowed: None });
+    pub(super) fn wake() {
+        let worker = WORKER.load(Ordering::Acquire);
+        if worker != 0 { unsafe { PostMessageW(worker as HWND, WAKE, 0, 0); } }
+    }
+    /// A hotkey grants the foreground right; raw input does not, and Windows 11 then leaves the
+    /// overlay without keyboard focus (Esc dead). A no-op mouse input makes Nova the last input
+    /// source, which SetForegroundWindow accepts.
+    fn grant_foreground() {
+        let input = INPUT { r#type: INPUT_MOUSE, ..Default::default() };
+        unsafe { SendInput(1, &input, size_of::<INPUT>() as i32); }
+    }
+    /// (virtual key with Alt split into 0xA4/0xA5, key down, injected)
+    fn read_key(input: LPARAM) -> Option<(u32, bool, bool)> {
+        let mut data = RAWINPUT::default();
+        let mut size = size_of::<RAWINPUT>() as u32;
+        let read = unsafe {
+            GetRawInputData(input as HRAWINPUT, RID_INPUT, &mut data as *mut RAWINPUT as *mut _, &mut size, size_of::<RAWINPUTHEADER>() as u32)
+        };
+        if read == u32::MAX || data.header.dwType != RIM_TYPEKEYBOARD { return None; }
+        let key = unsafe { data.data.keyboard };
+        let flags = u32::from(key.Flags);
+        let vk = match key.VKey {
+            0xFF => return None, // no virtual key: fake/overrun scancode
+            0x12 if flags & RI_KEY_E0 != 0 => 0xA5,
+            0x12 => 0xA4,
+            vk => u32::from(vk),
+        };
+        // SendInput has no source device.
+        Some((vk, flags & RI_KEY_BREAK == 0, data.header.hDevice.is_null()))
+    }
+    struct Listener { window: HWND, registered: Option<Shortcut>, listening: bool, failures: u32, taps: DoubleAlt }
+    impl Listener {
+        fn sync(&mut self, app: &AppHandle) {
+            let allowed = ensure_allowed().is_ok();
+            let want = WANTED.lock().unwrap().filter(|_| allowed && !RECORDING.load(Ordering::Acquire));
+            let hotkey = match want { Some(Binding::Hotkey(shortcut)) => Some(shortcut), _ => None };
+            match self.listen(want == Some(Binding::DoubleAlt)).and_then(|()| self.register(app, hotkey)) {
+                Ok(()) => self.failures = 0,
+                // A dev/release hand-over frees the key within a tick or two; report only a lasting
+                // failure, and only once.
+                Err(error) => {
+                    self.failures += 1;
+                    if self.failures == 4 { report(app, error); }
+                }
+            }
+            // Dev took over or Meteor was disabled while the overlay was open.
+            if !allowed && CAPTURE.lock().unwrap().is_some() { dismiss(app); }
         }
-        Ok(true)
-    }
-    pub(super) fn request_reinstall() {
-        REINSTALL_REQUESTED.store(true, Ordering::Release);
-        let thread = HOOK_THREAD.load(Ordering::Acquire);
-        if thread != 0 {
-            // The flag survives a startup/message-post race; the existing timer can pick it up once.
-            unsafe { PostThreadMessageW(thread, REINSTALL_HOOK, 0, 0); }
+        fn listen(&mut self, on: bool) -> Result<(), String> {
+            if on == self.listening { return Ok(()); }
+            // One keyboard raw-input target per process. tao's default filter only wants focused
+            // device events and Nova never changes it, so nothing claims the registration back.
+            let device = RAWINPUTDEVICE {
+                usUsagePage: 0x01, usUsage: 0x06,
+                dwFlags: if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE },
+                hwndTarget: if on { self.window } else { std::ptr::null_mut() },
+            };
+            if unsafe { RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) } == 0 {
+                return Err(format!("Meteor 无法监听连按两次 Alt（Windows {}），可在设置中改用组合键", unsafe { GetLastError() }));
+            }
+            self.listening = on;
+            self.taps = DoubleAlt::default();
+            Ok(())
+        }
+        fn register(&mut self, app: &AppHandle, want: Option<Shortcut>) -> Result<(), String> {
+            let shortcuts = app.global_shortcut();
+            // Session-shortcut sync unregisters everything; re-register whatever went missing.
+            if self.registered == want && want.is_none_or(|shortcut| shortcuts.is_registered(shortcut)) { return Ok(()); }
+            if let Some(old) = self.registered.take() {
+                if shortcuts.is_registered(old) { let _ = shortcuts.unregister(old); }
+            }
+            let Some(shortcut) = want else { return Ok(()); };
+            shortcuts.on_shortcut(shortcut, |app, _, event| {
+                if event.state == ShortcutState::Pressed { trigger(app); }
+            }).map_err(|error| format!("Meteor 快捷键 {shortcut} 注册失败，可能已被其他程序占用，请在设置中更换：{error}"))?;
+            self.registered = Some(shortcut);
+            Ok(())
+        }
+        fn key(&mut self, app: &AppHandle, input: LPARAM, time: u32) {
+            if !self.listening { return; }
+            let Some((vk, down, injected)) = read_key(input) else { return; };
+            let held = |vk| unsafe { GetAsyncKeyState(vk) } < 0;
+            let modifiers = held(0x10) || held(0x11) || held(0x5B) || held(0x5C);
+            if self.taps.key(vk, down, injected, modifiers, u64::from(time)) && ensure_allowed().is_ok() {
+                grant_foreground();
+                trigger(app);
+            }
         }
     }
-    unsafe fn reinstall_hook(app: &AppHandle, hook: &mut HHOOK) {
-        // New hooks run first. Install the replacement before removing the old hook so failure
-        // does not destroy a working listener. This is enable/config driven, never a priority loop.
-        let replacement = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_hook), std::ptr::null_mut(), 0);
-        if replacement.is_null() { report(app, format!("Meteor 重装键盘监听失败：{}", GetLastError())); return; }
-        if !hook.is_null() && UnhookWindowsHookEx(*hook) == 0 {
-            let error = GetLastError();
-            UnhookWindowsHookEx(replacement);
-            report(app, format!("Meteor 旧监听未能卸载，已保留原监听：{error}"));
-            return;
-        }
-        *hook = replacement;
-        if let Some(keys) = HOOK.lock().unwrap().as_mut() {
-            keys.tap = DoubleAlt::default();
-            for (key, down) in keys.down.iter_mut().enumerate() { *down = GetAsyncKeyState(key as i32) < 0; }
-        }
-        READY.store(true, Ordering::Release);
-    }
-    fn alt_release(event: &KBDLLHOOKSTRUCT) -> INPUT {
-        INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT {
-            wVk: event.vkCode as u16, wScan: event.scanCode as u16,
-            dwFlags: KEYEVENTF_KEYUP | if event.flags & LLKHF_EXTENDED != 0 { KEYEVENTF_EXTENDEDKEY } else { 0 },
-            time: 0, dwExtraInfo: 0x4E4D4554,
-        } } }
+    fn trigger(app: &AppHandle) {
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(error) = open(&app) { if ensure_allowed().is_ok() { report(&app, error); } }
+        });
     }
     pub(super) fn start(app: &AppHandle) {
-        if APP.set(app.clone()).is_err() { return; }
-        if let Some(hwnd) = app.get_webview_window("main").and_then(|window| window.hwnd().ok()) {
-            MAIN_HWND.store(hwnd.0 as isize, Ordering::Release);
-        }
+        if STARTED.swap(true, Ordering::AcqRel) { return; }
         if cfg!(debug_assertions) {
             let name = PRESENCE.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
             let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
@@ -896,127 +912,26 @@ mod platform {
         }
         let app = app.clone();
         std::thread::spawn(move || unsafe {
-            let mut message: MSG = std::mem::zeroed();
-            PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
-            HOOK_THREAD.store(GetCurrentThreadId(), Ordering::Release);
-            let mut hook = std::ptr::null_mut();
-            REINSTALL_REQUESTED.store(false, Ordering::Release);
-            reinstall_hook(&app, &mut hook);
-            let timer = SetTimer(std::ptr::null_mut(), 0, 250, None);
+            let class = "STATIC".encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            // Message-only: never shown or activated; it only receives raw input, timers and wakes.
+            let window = CreateWindowExW(0, class.as_ptr(), std::ptr::null(), 0, 0, 0, 0, 0, HWND_MESSAGE,
+                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+            if window.is_null() { report(&app, format!("Meteor 快捷键服务启动失败（Windows {}）", GetLastError())); return; }
+            WORKER.store(window as usize, Ordering::Release);
+            SetTimer(window, 1, 500, None);
+            let mut listener = Listener { window, registered: None, listening: false, failures: 0, taps: DoubleAlt::default() };
+            listener.sync(&app);
+            let mut message = MSG::default();
             while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
-                if matches!(message.message, REINSTALL_HOOK | WM_TIMER) {
-                    if allowed(cfg!(debug_assertions), dev_present(), ENABLED.load(Ordering::Acquire))
-                        && REINSTALL_REQUESTED.swap(false, Ordering::AcqRel) {
-                        reinstall_hook(&app, &mut hook);
-                    }
-                    if ensure_allowed().is_err() { dismiss(&app); }
+                match message.message {
+                    WM_INPUT => listener.key(&app, message.lParam, message.time),
+                    WM_TIMER | WAKE => listener.sync(&app),
+                    _ => {}
                 }
-                TranslateMessage(&message);
+                // WM_INPUT still needs DefWindowProc cleanup, which the STATIC procedure falls back to.
                 DispatchMessageW(&message);
             }
-            HOOK_THREAD.store(0, Ordering::Release);
-            if timer != 0 { KillTimer(std::ptr::null_mut(), timer); }
-            READY.store(false, Ordering::Release);
-            if !hook.is_null() { UnhookWindowsHookEx(hook); }
         });
-    }
-    unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        if code < 0 { return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam); }
-        let event = &*(lparam as *const KBDLLHOOKSTRUCT);
-        let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-        let up = matches!(wparam as u32, WM_KEYUP | WM_SYSKEYUP);
-        let injected = event.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) != 0;
-        let mut fire = false;
-        let mut swallow = false;
-        if down || up {
-            if let Ok(mut guard) = HOOK.try_lock() {
-                if let Some(keys) = guard.as_mut() {
-                    let ctrl = GetAsyncKeyState(0x11) < 0;
-                    let alt = GetAsyncKeyState(0x12) < 0;
-                    let shift = GetAsyncKeyState(0x10) < 0;
-                    let win = GetAsyncKeyState(0x5B) < 0 || GetAsyncKeyState(0x5C) < 0;
-                    let modifiers = u8::from(ctrl) | (u8::from(alt) << 1) | (u8::from(shift) << 2) | (u8::from(win) << 3);
-                    let active = !recording() && allowed(cfg!(debug_assertions), dev_present(), ENABLED.load(Ordering::Acquire));
-                    (fire, swallow) = keys.event(event.vkCode, down, injected, modifiers, u64::from(event.time), active);
-                }
-            }
-        }
-        if fire && up {
-            // Earlier physical Alt-downs were deliberately passed through. Swallow the triggering
-            // physical up, but balance keyboard state with an injected release (never another press).
-            // Injection-aware hotkeys ignore it; if insertion fails, let the physical release through.
-            let release = alt_release(event);
-            swallow = SendInput(1, &release, std::mem::size_of::<INPUT>() as i32) == 1;
-        }
-        if fire {
-            if let Some(app) = APP.get() {
-                let app = app.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    if let Err(error) = open(&app) { if ensure_allowed().is_ok() { report(&app, error); } }
-                });
-            }
-        }
-        if swallow { 1 } else { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
-    }
-
-    #[cfg(test)]
-    mod hook_tests {
-        use super::*;
-        fn keys() -> Keys { Keys { binding: Binding::DoubleAlt, down: [false; 256], tap: DoubleAlt::default(), swallowed: None } }
-
-        #[test]
-        fn only_second_pure_alt_release_is_consumed_and_cleanup_does_not_retrigger() {
-            for vk in [0xA4, 0xA5] {
-                let mut keys = keys();
-                assert_eq!(keys.event(vk, true, false, 0, 0, true), (false, false));
-                assert_eq!(keys.event(vk, false, false, 2, 60, true), (false, false));
-                assert_eq!(keys.event(vk, true, false, 0, 100, true), (false, false));
-                assert_eq!(keys.event(vk, false, false, 2, 150, true), (true, true));
-                let original = KBDLLHOOKSTRUCT { vkCode: vk, scanCode: 0x38,
-                    flags: LLKHF_UP | if vk == 0xA5 { LLKHF_EXTENDED } else { 0 }, time: 150, dwExtraInfo: 0 };
-                let release = unsafe { alt_release(&original).Anonymous.ki };
-                assert_eq!(release.wVk, vk as u16);
-                assert_eq!(release.dwFlags, KEYEVENTF_KEYUP | if vk == 0xA5 { KEYEVENTF_EXTENDEDKEY } else { 0 });
-                assert_eq!(keys.event(vk, false, true, 2, 151, true), (false, false));
-            }
-        }
-
-        #[test]
-        fn alt_tab_other_combinations_holds_and_disabled_capture_pass_through() {
-            for other in [0x09, 0x73, 0x41] { // Alt+Tab / Alt+F4 / Alt+A, even after a first tap.
-                let mut keys = keys();
-                for (vk, down, modifiers, time) in [(0xA4, true, 0, 0), (0xA4, false, 2, 60),
-                    (0xA4, true, 0, 100), (other, true, 2, 110), (other, false, 2, 120), (0xA4, false, 2, 150)] {
-                    assert_eq!(keys.event(vk, down, false, modifiers, time, true), (false, false));
-                }
-            }
-            let mut keys = keys();
-            for (down, time) in [(true, 0), (true, 100), (true, 200), (false, 400)] {
-                assert_eq!(keys.event(0xA4, down, false, 2, time, true), (false, false));
-            }
-            for (down, time) in [(true, 500), (false, 550), (true, 600), (false, 650)] {
-                assert_eq!(keys.event(0xA4, down, false, 2, time, false), (false, false));
-            }
-            assert_eq!(keys.event(0xA4, true, false, 0, 700, true), (false, false));
-            assert_eq!(keys.event(0xA4, false, false, 2, 750, true), (false, false));
-        }
-
-        #[test]
-        fn unchanged_binding_does_not_reset_a_gesture_or_request_priority_again() {
-            *HOOK.lock().unwrap() = None;
-            REINSTALL_REQUESTED.store(false, Ordering::Release);
-            assert!(configure("Alt+Alt").unwrap());
-            HOOK.lock().unwrap().as_mut().unwrap().tap.previous_up = Some((0xA4, 42));
-            assert!(!configure("alt+alt").unwrap());
-            assert_eq!(HOOK.lock().unwrap().as_ref().unwrap().tap.previous_up, Some((0xA4, 42)));
-            assert!(!REINSTALL_REQUESTED.load(Ordering::Acquire));
-            request_reinstall();
-            assert!(REINSTALL_REQUESTED.swap(false, Ordering::AcqRel));
-            assert!(!REINSTALL_REQUESTED.load(Ordering::Acquire), "priority refresh is a one-shot, not a timer loop");
-            assert!(configure("Ctrl+Shift+M").unwrap());
-            assert_eq!(HOOK.lock().unwrap().as_ref().unwrap().tap.previous_up, None);
-            assert!(!configure("Shift+Control+KeyM").unwrap());
-        }
     }
 }
 
@@ -1278,32 +1193,42 @@ mod tests {
     #[test]
     fn double_alt_requires_two_short_pure_presses() {
         let mut tap = DoubleAlt::default();
-        assert!(!tap.key(0xA4, true, false, false, false, 0));
-        assert!(!tap.key(0xA4, true, true, false, false, 10));
-        assert!(!tap.key(0xA4, false, false, false, false, 60));
-        assert!(!tap.key(0xA4, true, false, false, false, 100));
-        assert!(tap.key(0xA4, false, false, false, false, 150));
-        assert!(!tap.key(0xA4, false, false, false, false, 160));
+        assert!(!tap.key(0xA4, true, false, false, 0));
+        assert!(!tap.key(0xA4, false, false, false, 60));
+        // An AutoHotkey-style injected mask key does not break the physical sequence.
+        assert!(!tap.key(0xE8, true, true, false, 61));
+        assert!(!tap.key(0xE8, false, true, false, 62));
+        assert!(!tap.key(0xA4, true, false, false, 100));
+        assert!(tap.key(0xA4, false, false, false, 150));
+        assert!(!tap.key(0xA4, false, false, false, 160));
     }
     #[test]
-    fn alt_tab_altgr_injection_and_long_presses_do_not_trigger() {
+    fn alt_tab_altgr_injected_alt_and_held_alt_do_not_trigger() {
         for (other, injected, modifier, release) in [(0x09, false, false, 60), (0xA5, false, true, 60), (0xA4, true, false, 60), (0xA4, false, false, 400)] {
             let mut tap = DoubleAlt::default();
-            tap.key(0xA4, true, false, false, false, 0);
-            tap.key(other, true, false, injected, modifier, 10);
-            assert!(!tap.key(0xA4, false, false, false, false, release));
-            tap.key(0xA4, true, false, false, false, release + 50);
-            assert!(!tap.key(0xA4, false, false, false, false, release + 100));
+            tap.key(0xA4, true, false, false, 0);
+            tap.key(0xA4, false, false, false, 1);
+            tap.key(0xA4, true, false, false, 2);
+            tap.key(other, true, injected, modifier, 10);
+            assert!(!tap.key(0xA4, false, false, false, release));
+            tap.key(0xA4, true, false, false, release + 50);
+            assert!(!tap.key(0xA4, false, false, false, release + 100));
         }
+        // Auto-repeat while Alt is held keeps arriving; the hold is still not a tap.
+        let mut tap = DoubleAlt::default();
+        tap.key(0xA4, true, false, false, 0);
+        tap.key(0xA4, false, false, false, 60);
+        for time in (100..1000).step_by(33) { tap.key(0xA4, true, false, false, time); }
+        assert!(!tap.key(0xA4, false, false, false, 1000));
     }
     #[test]
     fn alternating_alt_sides_and_expired_sequences_do_not_trigger() {
         for (second_key, second_time) in [(0xA5, 100), (0xA4, 600)] {
             let mut tap = DoubleAlt::default();
-            tap.key(0xA4, true, false, false, false, 0);
-            tap.key(0xA4, false, false, false, false, 60);
-            tap.key(second_key, true, false, false, false, second_time);
-            assert!(!tap.key(second_key, false, false, false, false, second_time + 60));
+            tap.key(0xA4, true, false, false, 0);
+            tap.key(0xA4, false, false, false, 60);
+            tap.key(second_key, true, false, false, second_time);
+            assert!(!tap.key(second_key, false, false, false, second_time + 60));
         }
     }
     #[test]

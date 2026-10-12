@@ -1157,7 +1157,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <ShortcutKeyCapture value={meteorShortcut() === "Alt+Alt" ? "连按两次 Alt" : meteorShortcut()} onChange={setMeteorShortcut} />
                   <button type="button" class="btn secondary" onClick={() => setMeteorShortcut("Alt+Alt")}>恢复双 Alt</button>
                 </div>
-                <span class="field-hint">目前支持 Windows。默认快速按下并松开两次 Alt；点击上方按钮可录制其他组合键，Esc 取消录制。请避免与系统或其他应用的快捷键冲突。</span>
+                <span class="field-hint">目前支持 Windows。默认快速按下并松开两次 Alt；点击上方按钮可录制其他组合键（需包含 Ctrl、Alt、Shift 或 Win，以系统全局快捷键注册），Esc 取消录制。若组合键已被其他程序占用会提示注册失败，请换一个。</span>
               </div>
               <div class="field">
                 <span class="field-label">执行后端 / 模型</span>

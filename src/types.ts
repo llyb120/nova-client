@@ -495,7 +495,7 @@ export interface Settings {
   sessionShortcuts: SessionShortcut[];
   /** Meteor 屏幕标注入口；dev 实例运行时非 dev 实例自动停用 */
   meteorEnabled: boolean;
-  /** Alt+Alt 表示连按两次 Alt，其余为全局组合键 */
+  /** Alt+Alt 表示连按两次 Alt，其余为系统全局组合键（必须带修饰键） */
   meteorShortcut: string;
   meteorAgentKind: AgentKind;
   /** 空值使用所选后端的默认模型 */

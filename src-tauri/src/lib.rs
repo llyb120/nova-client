@@ -5967,7 +5967,12 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } = &event {
-                if label == "main" { app.state::<workspace_terminal::TerminalManager>().close_all(); }
+                if label == "main" {
+                    app.state::<workspace_terminal::TerminalManager>().close_all();
+                    // Hidden Meteor/bubble windows would otherwise keep a closed instance alive,
+                    // still owning the taskbar island, Meteor shortcut and dev-priority marker.
+                    app.exit(0);
+                }
             }
             if let tauri::RunEvent::Exit = event {
                 app.state::<workspace_terminal::TerminalManager>().close_all();
