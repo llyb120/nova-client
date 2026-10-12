@@ -28,27 +28,18 @@ export function newSessionShortcutId(): string {
     : `sc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-/** 内置：Esc 终止当前回合（非设置项，用户配置一律忽略）。 */
-export const BUILTIN_STOP_SESSION_SHORTCUT: SessionShortcut = {
-  id: "default-stop-session",
-  keys: "Escape",
-  action: "stopSession",
-  target: "",
-};
-
 export const DEFAULT_TERMINAL_SHORTCUT: SessionShortcut = {
   id: "default-toggle-terminal", keys: "Ctrl+`", action: "toggleTerminal", target: "",
 };
-/** 默认终端按键和 Esc；已配置同动作或占用同按键时尊重用户设置。 */
+/** 默认终端按键；已配置同动作或占用同按键时尊重用户设置。 */
 export function withDefaultSessionShortcuts(
   shortcuts: SessionShortcut[],
 ): SessionShortcut[] {
   return [
-    ...shortcuts.filter((item) => item.action !== "stopSession"),
+    ...shortcuts,
     ...(!shortcuts.some(item => item.action === "toggleTerminal" ||
       ["ctrl+`", "ctrl+~", "ctrl+shift+~", "ctrl+shift+`"].includes(item.keys.trim().toLowerCase()))
       ? [{ ...DEFAULT_TERMINAL_SHORTCUT }] : []),
-    { ...BUILTIN_STOP_SESSION_SHORTCUT },
   ];
 }
 
@@ -190,8 +181,6 @@ export function mountSessionShortcuts(options: {
    * false 表示仅在输入框已聚焦时处理（避免抢走其它可编辑区的无修饰键输入）。
    */
   onInsertText?: (text: string, mayFocus: boolean) => boolean;
-  /** 返回 true 表示已终止当前回合（例如正在运行且未被其它 Esc 用途占用）。 */
-  onStopSession?: () => boolean;
   /** 返回 true 表示已收起运行中的会话：当前优先，否则取首个尚未隐藏的会话。 */
   onHideToVirgo?: () => boolean;
 }): void {
@@ -212,15 +201,13 @@ export function mountSessionShortcuts(options: {
       hit.action !== "openUnread" &&
       hit.action !== "toggleTerminal" &&
       hit.action !== "hideToVirgo" &&
-      hit.action !== "stopSession" &&
       !hit.target
     ) {
       return;
     }
-    // insertText / stopSession 允许无修饰键；其它动作在可编辑区需 Ctrl/Alt/Meta。
+    // insertText 允许无修饰键；其它动作在可编辑区需 Ctrl/Alt/Meta。
     if (
       hit.action !== "insertText" &&
-      hit.action !== "stopSession" &&
       isEditableTarget(event.target) &&
       !shortcutHasModifier(hit.keys)
     ) {
@@ -232,13 +219,6 @@ export function mountSessionShortcuts(options: {
       // 无修饰键的快捷键只作用于已聚焦的输入框，避免抢走其它可编辑区的正常输入。
       const mayFocus = !(isEditableTarget(event.target) && !shortcutHasModifier(hit.keys));
       const handled = options.onInsertText?.(hit.target, mayFocus) ?? false;
-      if (!handled) return;
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-    if (hit.action === "stopSession") {
-      const handled = options.onStopSession?.() ?? false;
       if (!handled) return;
       event.preventDefault();
       event.stopPropagation();

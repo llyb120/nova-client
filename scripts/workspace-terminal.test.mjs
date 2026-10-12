@@ -66,7 +66,7 @@ let callback=0;
 window.__TAURI_INTERNALS__={transformCallback:()=>++callback};
 const created=[],closed=[],writes=[],resized=[],acknowledged=[];
 const channels=new Map(),pending=new Map();
-let deferred=false,fail=false,stops=0,gatedResize=false;
+let deferred=false,fail=false,gatedResize=false;
 const resizeGates=new Map();
 terminalApi.create=async (id,threadId,cwd,cols,rows,channel)=>{
   created.push({id,threadId,cwd,cols,rows});channels.set(id,channel);
@@ -93,13 +93,13 @@ window.termTest={created,closed,writes,resized,acknowledged,
  send:(id,event)=>channels.get(id).onmessage(event),
  switch:id=>{setState({currentId:id,cwd:'/project/'+id});setThread(id);},
  defer:()=>{deferred=true;},fail:()=>{fail=true;},resolve:id=>{pending.get(id)();pending.delete(id);},
- paste:text=>active().terminal.paste(text),stopCount:()=>stops,
+ paste:text=>active().terminal.paste(text),
  gateResize:()=>{gatedResize=true;},hasResizeGate:id=>resizeGates.has(id),
  releaseResize:id=>{resizeGates.get(id)?.();resizeGates.delete(id);},
  closeAll:async()=>{for(const id of ['a','b']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
 };
 function Fixture(){
- mountSessionShortcuts({allowedActions:['toggleTerminal','stopSession'],onToggleTerminal:()=>setWorkspaceLayout({open:!workspaceLayout.open,mode:'terminal'}),onStopSession:()=>{stops++;return true;}});
+ mountSessionShortcuts({allowedActions:['toggleTerminal'],onToggleTerminal:()=>setWorkspaceLayout({open:!workspaceLayout.open,mode:'terminal'})});
  return <div style="display:flex;height:100vh;width:100vw"><main style="flex:1;min-width:0">Terminal lifecycle test</main><Show when={workspaceLayout.open}><Show when={thread()} keyed>{id=><WorkspacePanel threadId={id} request={null} onClose={()=>setWorkspaceLayout({open:false})}/>}</Show></Show></div>;
 }
 render(()=><Fixture/>,document.getElementById('root')!);
@@ -140,7 +140,6 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.locator('.xterm-helper-textarea').focus();
   await page.keyboard.press('Escape');await page.keyboard.press('Control+c');await page.keyboard.press('Control+s');
   await page.waitForFunction(()=>[3,19,27].every(byte=>window.termTest.writes.some(write=>write.data.includes(byte))));
-  assert.equal(await page.evaluate(()=>window.termTest.stopCount()),0);
   await page.keyboard.press('Control+Backquote');
   await page.waitForFunction(()=>!document.querySelector('.workspace-terminal'));
   assert.deepEqual(await page.evaluate(()=>window.termTest.closed),[]);

@@ -52,9 +52,8 @@ assert.equal(shortcuts.findSessionShortcut(event('~',{ctrlKey:true,shiftKey:true
 assert.equal(shortcuts.findSessionShortcut(event('`'),defaults),null);
 assert.equal(shortcuts.findSessionShortcut(event('`',{ctrlKey:true}),shortcuts.withDefaultSessionShortcuts([{id:'custom',keys:'Alt+T',action:'toggleTerminal',target:''}])),null);
 assert.equal(shortcuts.findSessionShortcut(event('`',{ctrlKey:true}),shortcuts.withDefaultSessionShortcuts([{id:'custom',keys:'Ctrl+`',action:'newSession',target:''}])).action,'newSession');
-shortcuts.mountSessionShortcuts({allowedActions:['stopSession','toggleTerminal'],onStopSession:()=>{stops++;return true;},onToggleTerminal:()=>toggles++});
-handler(event('Escape',{target:new Element(true)}));assert.equal(stops,0);
-handler(event('Escape'));assert.equal(stops,1);
+assert.equal(shortcuts.findSessionShortcut(event('Escape'),defaults),null,'Esc no longer stops the running turn');
+shortcuts.mountSessionShortcuts({allowedActions:['toggleTerminal'],onToggleTerminal:()=>toggles++});
 handler(event('~',{ctrlKey:true,shiftKey:true,code:'Backquote',target:new Element(true)}));assert.equal(toggles,1);
 shortcuts.setShortcutCaptureActive(true);handler(event('`',{ctrlKey:true}));assert.equal(toggles,1);
 shortcuts.setShortcutCaptureActive(false);

@@ -298,9 +298,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     (s?.cursorModelContexts ?? []).map((rule) => ({ ...rule })),
   );
   const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(
-    (s?.sessionShortcuts ?? [])
-      .filter((item) => item.action !== "stopSession")
-      .map((item) => ({ ...item })),
+    (s?.sessionShortcuts ?? []).map((item) => ({ ...item })),
   );
   const [meteorEnabled, setMeteorEnabled] = createSignal(s?.meteorEnabled ?? true);
   const [meteorShortcut, setMeteorShortcut] = createSignal(s?.meteorShortcut ?? "Alt+Alt");
@@ -547,7 +545,6 @@ export function SettingsModal(props: { onClose: () => void }) {
       }))
       .filter((item) => {
         if (!item.keys) return false;
-        if (item.action === "stopSession") return false;
         if (item.action === "newSession" || item.action === "openUnread" || item.action === "toggleTerminal" || item.action === "hideToVirgo") return true;
         return item.target.length > 0;
       });
@@ -1268,7 +1265,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型/工作流、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换、终止回合与隐藏到室女座有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发；「隐藏会话到室女座」仅在未开启减少焦虑（室女座）时可用，会话被收起期间侧栏会出现「室女座」tab，重新打开即回到普通会话。默认 Esc 终止当前回合（终端获得焦点时交给终端）；默认 Ctrl+`（~ 键）打开或收起终端，可添加「打开 / 收起终端」动作修改按键。
+                      一键切换项目/模型/工作流、快速新会话，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换与隐藏到室女座有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发；「隐藏会话到室女座」仅在未开启减少焦虑（室女座）时可用，会话被收起期间侧栏会出现「室女座」tab，重新打开即回到普通会话。默认 Ctrl+`（~ 键）打开或收起终端，可添加「打开 / 收起终端」动作修改按键。
                     </div>
                   </div>
                   <button

@@ -395,9 +395,7 @@ export type SessionShortcutAction =
   /** 选中新会话页要运行的工作流；target 为工作流 id。仅新会话页生效。 */
   | "selectWorkflow"
   /** 把当前会话移入室女座；无 target。仅在未开启减少焦虑（室女座）时生效。 */
-  | "hideToVirgo"
-  /** 内置 Esc 终止，仅运行时使用，不可在设置中配置。 */
-  | "stopSession";
+  | "hideToVirgo";
 
 /** 会话快捷键：一键切到指定项目或模型、快速新会话、插入文本、选择工作流。 */
 export interface SessionShortcut {

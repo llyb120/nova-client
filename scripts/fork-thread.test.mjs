@@ -42,13 +42,13 @@ function mount(t, { fork = async () => ({ id: "copy-stage" }), refresh = async (
     assert.equal(command, "fork_thread", "fork must not rename, stop, or send a prompt");
     return fork(args);
   } } });
-  let keydown, stops = 0;
+  let keydown, toggles = 0;
   const shortcuts = load("../src/sessionShortcuts.ts", {
     "solid-js": { onMount: (fn) => fn(), onCleanup: () => {} },
     "./store": { state, ALL_AGENT_KINDS: [] },
     "./ipc": { api },
   }, { HTMLElement: class {}, window: { addEventListener: (_, fn) => { keydown = fn; } } });
-  shortcuts.mountSessionShortcuts({ allowedActions: ["stopSession"], onStopSession: () => { stops++; return true; } });
+  shortcuts.mountSessionShortcuts({ allowedActions: ["toggleTerminal"], onToggleTerminal: () => { toggles++; } });
   const ui = createRoot((dispose) => {
     t.after(dispose);
     return new Function("createSignal", "createMemo", "createEffect", "onCleanup", "state", "currentMeta", "api", "refreshThreads", "openThread", "setShortcutCaptureActive", `${logic}
@@ -57,8 +57,8 @@ function mount(t, { fork = async () => ({ id: "copy-stage" }), refresh = async (
       async () => { calls.push(["refresh"]); await refresh(); },
       async (id) => { calls.push(["open", id]); }, shortcuts.setShortcutCaptureActive);
   });
-  return { ...ui, state, setState, calls, stops: () => stops,
-    escape: () => keydown({ key: "Escape", target: null, preventDefault() {}, stopPropagation() {} }),
+  return { ...ui, state, setState, calls, toggles: () => toggles,
+    shortcut: () => keydown({ key: "`", code: "Backquote", ctrlKey: true, altKey: false, shiftKey: false, metaKey: false, target: null, preventDefault() {}, stopPropagation() {} }),
   };
 }
 
@@ -114,7 +114,7 @@ test("blank names do not submit; rejection keeps dialog/input; refresh retry doe
   assert.equal(ui.forkSourceId(), null);
 });
 
-test("roaming/quota nodes are blocked; modal Escape cannot stop the running original", (t) => {
+test("roaming/quota nodes are blocked; the open fork modal pauses session shortcuts", (t) => {
   const ui = mount(t);
   for (const patch of [{ roamingRole: "guest" }, { roamingRole: "host" }, { roamingRole: null, quotaPeer: "peer" }]) {
     ui.setState("threads", 1, patch);
@@ -124,12 +124,12 @@ test("roaming/quota nodes are blocked; modal Escape cannot stop the running orig
   }
   ui.setState("threads", 1, { roamingRole: null, quotaPeer: null });
   ui.startFork();
-  ui.escape();
-  assert.equal(ui.stops(), 0);
+  ui.shortcut();
+  assert.equal(ui.toggles(), 0);
   ui.closeFork();
   assert.equal(ui.forkSourceId(), null);
-  ui.escape();
-  assert.equal(ui.stops(), 1, "normal session shortcuts are restored after closing");
+  ui.shortcut();
+  assert.equal(ui.toggles(), 1, "normal session shortcuts are restored after closing");
 });
 
 test("dialog contracts: native modal focus, name input, Enter/IME, Escape/cancel, scope disclosure", () => {
