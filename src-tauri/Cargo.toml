@@ -65,12 +65,16 @@ tauri-plugin-global-shortcut = "2.3.2"
 [target.'cfg(windows)'.dependencies]
 # Keep COM types aligned with Tauri 2.12 / Wry 0.57.
 webview2-com = "0.39"
-windows = "0.62"
+windows = { version = "0.62", features = ["Win32_UI_Accessibility", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
 tauri-winrt-notification = "0.7"
 winreg = "0.55"
 windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader",
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",

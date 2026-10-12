@@ -86,6 +86,9 @@ struct Shot {
     source_pixels: (u32, u32),
     region: Option<Region>,
     guard: Option<crate::visual_guard::VisualGuard>,
+    overlay: Option<crate::taskbar_status::Rect>,
+    /// Only visible desktop pixels contain the taskbar; PrintWindow/private seats do not.
+    desktop_capture: bool,
 }
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -265,35 +268,78 @@ fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u
     Some((x as u32, y as u32))
 }
 
-fn visually_similar(a: &xcap::image::RgbaImage, b: &xcap::image::RgbaImage) -> bool {
+fn overlay_bounds(desktop_capture: bool) -> Option<crate::taskbar_status::Rect> {
+    desktop_capture.then(crate::taskbar_status::bounds).flatten()
+}
+
+fn overlay_on_surface(surface: &Surface, bounds: Option<crate::taskbar_status::Rect>) -> Option<crate::taskbar_status::Rect> {
+    bounds.filter(|r| (r.left as i64) < surface.x as i64 + surface.width as i64 && r.right as i64 > surface.x as i64
+        && (r.top as i64) < surface.y as i64 + surface.height as i64 && r.bottom as i64 > surface.y as i64)
+}
+
+fn overlay_region(surface: &Surface, pixels: (u32, u32), bounds: Option<crate::taskbar_status::Rect>) -> Option<crate::visual_guard::PixelRect> {
+    let r = bounds?;
+    if surface.width == 0 || surface.height == 0 || pixels.0 == 0 || pixels.1 == 0
+        || r.left >= r.right || r.top >= r.bottom { return None; }
+    let axis = |start: i32, end: i32, origin: i32, size: u32, pixels: u32| {
+        let start = (start as i64 - origin as i64).clamp(0, size as i64) as u64 * pixels as u64;
+        let end = (end as i64 - origin as i64).clamp(0, size as i64) as u64 * pixels as u64;
+        // Round inward: never exempt pixels partly outside the overlay at fractional scales.
+        (start.div_ceil(size as u64) as u32, (end / size as u64) as u32)
+    };
+    let (left, right) = axis(r.left, r.right, surface.x, surface.width, pixels.0);
+    let (top, bottom) = axis(r.top, r.bottom, surface.y, surface.height, pixels.1);
+    (left < right && top < bottom).then_some(crate::visual_guard::PixelRect { left, top, right, bottom })
+}
+
+fn visually_similar(a: &xcap::image::RgbaImage, b: &xcap::image::RgbaImage, exclude: Option<crate::visual_guard::PixelRect>) -> bool {
     if a.dimensions() != b.dimensions() || a.is_empty() { return false; }
+    let excluded = exclude.map_or(0, |r| {
+        r.right.min(a.width()).saturating_sub(r.left) as usize
+            * r.bottom.min(a.height()).saturating_sub(r.top) as usize
+    });
+    let compared = a.as_raw().len() / 4 - excluded;
+    if compared == 0 { return false; }
     // memcmp fast path for truly static frames; the per-pixel scan is slow in unoptimized NovaDev builds.
     if a.as_raw() == b.as_raw() { return true; }
     // ponytail: tolerate 0.05% changed pixels for caret/noise; this can miss tiny updates.
     // Visual quiet is not application readiness; use semantic result checks, not a looser threshold.
-    let allowance = a.as_raw().len() / 4 / 2000;
-    a.pixels().zip(b.pixels()).filter(|(x, y)| {
+    let allowance = compared / 2000;
+    a.pixels().zip(b.pixels()).enumerate().filter(|(i, (x, y))| {
         (0..3).any(|c| x[c].abs_diff(y[c]) > 16)
+            && !exclude.is_some_and(|r| r.contains((*i % a.width() as usize) as f64, (*i / a.width() as usize) as f64))
     }).take(allowance + 1).count() <= allowance
 }
 
-fn settled_image(mut grab: impl FnMut() -> Result<xcap::image::RgbaImage>, settle: bool)
-    -> Result<(xcap::image::RgbaImage, Value)> {
+fn settled_image(mut grab: impl FnMut() -> Result<xcap::image::RgbaImage>, settle: bool, desktop_surface: Option<&Surface>)
+    -> Result<(xcap::image::RgbaImage, Value, Option<crate::taskbar_status::Rect>)> {
     let started = Instant::now();
-    let mut image = grab()?;
+    let mut sample = || -> Result<_> {
+        let relevant_overlay = || desktop_surface.and_then(|s| overlay_on_surface(s, overlay_bounds(true)));
+        let overlay = relevant_overlay();
+        let image = grab()?;
+        if overlay != relevant_overlay() {
+            return Err("取样期间任务栏状态条范围改变，请重新截图".into());
+        }
+        Ok((image, overlay))
+    };
+    let (mut image, mut overlay) = sample()?;
     let mut samples = 1;
     let mut status = "not_checked";
     if settle {
         let mut anchor = image.clone();
+        let mut anchor_overlay = overlay;
         let mut quiet_since = Instant::now();
         loop {
             let elapsed = started.elapsed();
             if elapsed >= Duration::from_millis(2000) { status = "timeout"; break; }
             std::thread::sleep(Duration::from_millis(150).min(Duration::from_millis(2000) - elapsed));
-            image = grab()?;
+            (image, overlay) = sample()?;
             samples += 1;
-            if !visually_similar(&anchor, &image) {
+            let exclude = desktop_surface.and_then(|s| overlay_region(s, image.dimensions(), overlay));
+            if overlay != anchor_overlay || !visually_similar(&anchor, &image, exclude) {
                 anchor = image.clone();
+                anchor_overlay = overlay;
                 quiet_since = Instant::now();
             }
             // Compare against the quiet-period anchor so gradual changes cannot accumulate unnoticed.
@@ -305,10 +351,11 @@ fn settled_image(mut grab: impl FnMut() -> Result<xcap::image::RgbaImage>, settl
             }
         }
     }
-    Ok((image, json!({"status":status,"samples":samples,"elapsedMs":started.elapsed().as_millis()})))
+    Ok((image, json!({"status":status,"samples":samples,"elapsedMs":started.elapsed().as_millis()}), overlay))
 }
 
 fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, settle: bool, state: &mut Option<Snapshot>) -> Result<Value> {
+    let _activity = crate::taskbar_status::activity("截取画面");
     let started = Instant::now();
     let mut capture_ms = 0;
     let mut resize_ms = 0;
@@ -324,7 +371,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let cursor_before = cursor_position();
     let mut shots = Vec::new();
     let mut images = Vec::new();
-    let mut save = |surface: Surface, image: xcap::image::RgbaImage, stability: Value| -> Result<()> {
+    let mut save = |surface: Surface, image: xcap::image::RgbaImage, stability: Value, overlay, desktop_capture| -> Result<()> {
         let captured_at = chrono::Utc::now().to_rfc3339();
         if surface.width == 0 || surface.height == 0 || image.width() == 0 || image.height() == 0 {
             return Err("截图范围为空".into());
@@ -378,6 +425,8 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             source_pixels: original_pixels,
             region,
             guard,
+            overlay,
+            desktop_capture,
         });
         Ok(())
     };
@@ -390,7 +439,8 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         let capture_started = Instant::now();
         // PrintWindow omits separate popup windows (e.g. recipient suggestions).
         // Foreground input must observe the pixels that will actually receive it.
-        let (image, stability) = settled_image(|| {
+        let desktop_capture = !bg && before == Some((surface.id, surface.pid.unwrap()));
+        let (image, stability, overlay) = settled_image(|| {
             if foreground()? != before || window_surface(&w)? != surface {
                 return Err("取样期间窗口或焦点改变，请重新截图".into());
             }
@@ -404,19 +454,19 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             #[cfg(not(windows))]
             let image = w.capture_image().map_err(err)?;
             Ok(image)
-        }, settle)?;
+        }, settle, desktop_capture.then_some(&surface))?;
         capture_ms += capture_started.elapsed().as_millis();
         if window_surface(&w)? != surface {
             return Err("截图期间窗口移动，请重新截图".into());
         }
-        save(surface, image, stability)?;
+        save(surface, image, stability, overlay, desktop_capture)?;
     } else if bg {
         // Linux 座席：像素来自私有 X 服务器；xcap 只读进程的 DISPLAY，不能用于它。
         let surface = background::seat_surface()?;
         let capture_started = Instant::now();
-        let (image, stability) = settled_image(background::seat_grab, settle)?;
+        let (image, stability, overlay) = settled_image(background::seat_grab, settle, None)?;
         capture_ms += capture_started.elapsed().as_millis();
-        save(surface, image, stability)?;
+        save(surface, image, stability, overlay, false)?;
     } else {
         let monitors = Monitor::all().map_err(err)?;
         if monitors.is_empty() || monitors.len() > 16 {
@@ -426,14 +476,14 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             let surface = monitor_surface(&m)?;
             if monitor_id.is_some_and(|id| id != surface.id) { continue; }
             let capture_started = Instant::now();
-            let (image, stability) = settled_image(|| {
+            let (image, stability, overlay) = settled_image(|| {
                 if foreground()? != before || monitor_surface(&m)? != surface {
                     return Err("取样期间屏幕或焦点改变，请重新截图".into());
                 }
                 m.capture_image().map_err(err)
-            }, settle)?;
+            }, settle, Some(&surface))?;
             capture_ms += capture_started.elapsed().as_millis();
-            save(surface, image, stability)?;
+            save(surface, image, stability, overlay, true)?;
         }
         if shots.is_empty() { return Err("显示器不存在，请重新截图".into()); }
     }
@@ -646,12 +696,28 @@ fn image_region(shot: &Shot, region: Region) -> Result<Region> {
     crop.validate(shot.source_pixels)?;
     Ok(crop)
 }
+fn check_overlay(shot: &Shot, action: &Action, current: Option<crate::taskbar_status::Rect>) -> Result<Option<crate::visual_guard::PixelRect>> {
+    let current = overlay_on_surface(&shot.surface, current);
+    if guarded_pointer(action) {
+        let start = point(shot, action.x, action.y)?;
+        let end = if action.action == "drag" { point(shot, action.to_x, action.to_y)? } else { start };
+        if [shot.overlay, current].into_iter().flatten().any(|r|
+            [start, end].iter().any(|&(x,y)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)) {
+            return Err("工具不能点击或拖动任务栏状态提示，请选择提示区域之外的目标".into());
+        }
+    }
+    // A moved/hidden/new strip gets no exemption, but must not invalidate an unrelated
+    // app or monitor. Normal target-pixel checks still detect any change near the input.
+    Ok((shot.overlay == current).then(|| overlay_region(&shot.surface, shot.source_pixels, current)).flatten())
+}
+
 // after_input: earlier actions of this batch already changed the screen, so only the target's core is compared.
-fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, after_input:bool) -> Result<()> {
+fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, after_input:bool, overlay:Option<crate::taskbar_status::Rect>) -> Result<()> {
+    let exclude = check_overlay(shot, action, overlay)?;
     let Some(guard)=&shot.guard else {return Ok(());};
     let mut points=vec![source_point(shot,action.x.unwrap(),action.y.unwrap())];
     if action.action=="drag" {points.push(source_point(shot,action.to_x.unwrap(),action.to_y.unwrap()));}
-    if points.iter().any(|&(x,y)|guard.changed_near(image,x,y,after_input)) {
+    if points.iter().any(|&(x,y)|guard.changed_near_excluding(image,x,y,after_input,exclude)) {
         return Err("落点附近画面已变化，停止旧坐标输入；请用返回的新图重新定位，细小目标使用 regionSpace=image 局部截图".into());
     }
     Ok(())
@@ -672,6 +738,8 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
         });
     }
     let bg = background::active();
+    let overlay = overlay_on_surface(&shot.surface, overlay_bounds(shot.desktop_capture));
+    check_overlay(shot, a, overlay)?;
     if let Some(id) = snap.window {
         // Reuse one Z-order enumeration for geometry and occlusion checks.
         let windows = Window::all().map_err(err)?;
@@ -722,7 +790,7 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
             };
             #[cfg(not(windows))]
             let image=w.capture_image().map_err(err)?;
-            guard_target(shot,a,&image,after_input)?;
+            guard_target(shot,a,&image,after_input,overlay)?;
             if foreground()?!=snap.foreground || window_surface(w)?!=shot.surface {return Err("落点校验期间窗口或焦点改变，请重新观察".into());}
         }
     } else if bg {
@@ -731,7 +799,7 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
             return Err("座席已重启或尺寸改变，请重新截图".into());
         }
         if guarded_pointer(a) && shot.guard.is_some() {
-            guard_target(shot, a, &background::seat_grab()?, after_input)?;
+            guard_target(shot, a, &background::seat_grab()?, after_input, overlay)?;
         }
     } else {
         let monitors = Monitor::all().map_err(err)?;
@@ -745,10 +813,11 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
         }
         if guarded_pointer(a) && shot.guard.is_some() {
             let monitor=monitors.iter().find(|m|m.id().ok()==Some(shot.surface.id)).ok_or("显示器已改变")?;
-            guard_target(shot,a,&monitor.capture_image().map_err(err)?,after_input)?;
+            guard_target(shot,a,&monitor.capture_image().map_err(err)?,after_input,overlay)?;
             if foreground()?!=snap.foreground || monitor_surface(monitor)?!=shot.surface {return Err("落点校验期间屏幕或焦点改变，请重新观察".into());}
         }
     }
+    if overlay != overlay_on_surface(&shot.surface, overlay_bounds(shot.desktop_capture)) { return Err("落点校验期间任务栏状态条范围改变，请重新截图".into()); }
     Ok(())
 }
 
@@ -803,6 +872,16 @@ fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32), expected_foregroun
     }
 }
 fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option<(u32,u32)>) -> Result<()> {
+    let _activity = crate::taskbar_status::activity(match a.action.as_str() {
+        "click" | "double_click" => "点击控件",
+        "type" => "输入内容",
+        "press" => "发送按键",
+        "scroll" => "滚动页面",
+        "drag" => "拖动控件",
+        "wait" => "等待界面",
+        "move" => "移动指针",
+        _ => "操作桌面",
+    });
     let button = match a.button.as_deref() {
         Some("right") => Button::Right,
         Some("middle") => Button::Middle,
@@ -824,6 +903,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
         if !pointer_matches((x,y),actual) {return Err(format!("系统鼠标落点与请求不符（请求{x},{y}，实际{},{}），未按下按钮；请根据新图继续",actual.0,actual.1));}
     }
     if a.action!="wait" && foreground()?!=expected_foreground {return Err("鼠标移动后前台改变，停止后续输入".into());}
+    if a.action != "wait" { check_overlay(shot, a, overlay_bounds(shot.desktop_capture))?; }
     match a.action.as_str() {
         "click" => click_button(enigo,button)?,
         "double_click" => {
@@ -971,6 +1051,13 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
     let mut state = DESKTOP
         .try_lock()
         .map_err(|_| "剑来正在操作桌面，请勿并行调用")?;
+    let _activity = crate::taskbar_status::activity(match request.operation.as_str() {
+        "windows" => "观察窗口",
+        "screenshot" => "截取画面",
+        "act" => "操作桌面",
+        "activate" => "切换窗口",
+        _ => "查看桌面记录",
+    });
     match request.operation.as_str() {
         "windows" => {
             // One round-trip start: list windows and, on request, observe the bound target immediately.
@@ -1397,13 +1484,13 @@ mod tests {
         assert!(!has_target(&json!({"actions":[{"action":"click","x":1,"y":2}]})));
         // Altair's preview point → imageId pixels → the same region/DPI/desktop mapping as x/y input.
         let shot = Shot { image_id:"crop".into(), surface:Surface{id:1,pid:None,x:-1920,y:-100,width:1920,height:1080},
-            pixels:(1600,800),source_pixels:(3840,2160),region:Some(Region{x:200,y:100,width:800,height:400}),guard:None };
+            pixels:(1600,800),source_pixels:(3840,2160),region:Some(Region{x:200,y:100,width:800,height:400}),guard:None,overlay:None,desktop_capture:false };
         let (x, y) = crate::altair::scale_point(Some(512), Some(256), &json!({"imagePixels":[1024,512],"sourcePixels":[1600,800]})).unwrap();
         assert_eq!(point(&shot, Some(x as i32), Some(y as i32)).unwrap(), (-1620,50));
     }    #[test]
     fn local_image_regions_and_actual_pointer_validation() {
         let shot=Shot {image_id:"crop".into(),surface:Surface{id:1,pid:None,x:-1920,y:-100,width:1920,height:1080},
-            pixels:(400,200),source_pixels:(3840,2160),region:Some(Region{x:200,y:100,width:800,height:400}),guard:None};
+            pixels:(400,200),source_pixels:(3840,2160),region:Some(Region{x:200,y:100,width:800,height:400}),guard:None,overlay:None,desktop_capture:false};
         let region=image_region(&shot,Region{x:50,y:25,width:100,height:50}).unwrap();
         assert_eq!((region.x,region.y,region.width,region.height),(300,150,200,100));
         assert!(image_region(&shot,Region{x:399,y:0,width:2,height:1}).is_err());
@@ -1413,10 +1500,10 @@ mod tests {
         let original=xcap::image::RgbaImage::from_pixel(200,100,xcap::image::Rgba([20,20,20,255]));
         let guarded=Shot{pixels:(200,100),source_pixels:(200,100),region:None,guard:Some(crate::visual_guard::VisualGuard::new(&original)),..shot};
         let action:Action=serde_json::from_value(json!({"action":"click","x":80,"y":60})).unwrap();
-        assert!(guard_target(&guarded,&action,&original,false).is_ok());
+        assert!(guard_target(&guarded,&action,&original,false,None).is_ok());
         let changed=xcap::image::RgbaImage::from_pixel(200,100,xcap::image::Rgba([200,200,200,255]));
-        assert!(guard_target(&guarded,&action,&changed,false).is_err());
-        assert!(guard_target(&guarded,&action,&changed,true).is_err());
+        assert!(guard_target(&guarded,&action,&changed,false,None).is_err());
+        assert!(guard_target(&guarded,&action,&changed,true,None).is_err());
         let bad=run("test".into(),json!({"operation":"act","regionSpace":"unknown"})).unwrap();
         assert_eq!(bad["status"],"not_executed");
     }
@@ -1426,38 +1513,87 @@ mod tests {
         let old = RgbaImage::from_pixel(100, 100, Rgba([255, 255, 255, 255]));
         let mut caret = old.clone();
         for y in 0..5 { caret.put_pixel(0, y, Rgba([0, 0, 0, 255])); }
-        assert!(visually_similar(&old, &caret));
+        assert!(visually_similar(&old, &caret, None));
         caret.put_pixel(0, 5, Rgba([0, 0, 0, 255]));
-        assert!(!visually_similar(&old, &caret));
-        assert!(!visually_similar(&old, &RgbaImage::new(101, 100)));
+        assert!(!visually_similar(&old, &caret, None));
+        assert!(!visually_similar(&old, &RgbaImage::new(101, 100), None));
 
         // Header changes immediately; list remains old for the first two samples.
         let new = RgbaImage::from_pixel(100, 100, Rgba([0, 0, 0, 255]));
         let mut calls = 0;
-        let (frame, report) = settled_image(|| {
+        let (frame, report, _) = settled_image(|| {
             calls += 1;
             Ok(if calls < 3 { old.clone() } else { new.clone() })
-        }, true).unwrap();
+        }, true, None).unwrap();
         assert_eq!(frame, new);
         assert_eq!(report["status"], "stable");
         assert!(calls >= 6);
 
         let mut last = old.clone();
-        let (_, report) = settled_image(|| {
+        let (_, report, _) = settled_image(|| {
             last = if last == old { new.clone() } else { old.clone() };
             Ok(last.clone())
-        }, true).unwrap();
+        }, true, None).unwrap();
         assert_eq!(report["status"], "timeout");
         assert!(report["elapsedMs"].as_u64().unwrap() >= 2000);
-        let (frame, report) = settled_image(|| Ok(old.clone()), false).unwrap();
+        let (frame, report, _) = settled_image(|| Ok(old.clone()), false, None).unwrap();
         assert_eq!(frame, old);
         assert_eq!(report["samples"], 1);
         assert_eq!(report["status"], "not_checked");
-        assert!(settled_image(|| Err("capture failed".into()), true).is_err());
+        assert!(settled_image(|| Err("capture failed".into()), true, None).is_err());
         let result = run("validation".into(), json!({"operation":"act", "snapshotId":"old", "unexpected":true})).unwrap();
         assert_eq!(result["operation"], "act");
         assert_eq!(result["basedOnSnapshotId"], "old");
         assert_eq!(result["verification"], "unverified");
+    }
+    #[test]
+    fn taskbar_overlay_updates_only_exempt_unchanged_geometry() {
+        use xcap::image::{Rgba, RgbaImage};
+        use crate::taskbar_status::Rect;
+        let original = RgbaImage::from_pixel(200, 200, Rgba([20,20,20,255]));
+        let bounds = Rect { left:-50, top:-30, right:-20, bottom:30 };
+        let shot = Shot { image_id:"crop".into(), surface:Surface{id:1,pid:None,x:-100,y:-50,width:100,height:100},
+            pixels:(100,100), source_pixels:(200,200), region:Some(Region{x:40,y:40,width:100,height:100}),
+            guard:Some(crate::visual_guard::VisualGuard::new(&original)), overlay:Some(bounds), desktop_capture:true };
+        let exclude = overlay_region(&shot.surface, shot.source_pixels, shot.overlay).unwrap();
+        assert_eq!(exclude, crate::visual_guard::PixelRect { left:100, top:40, right:160, bottom:160 });
+        let mut updated = original.clone();
+        for y in exclude.top..exclude.bottom { for x in exclude.left..exclude.right {
+            updated.put_pixel(x,y,Rgba([220,220,220,255]));
+        } }
+        let action:Action = serde_json::from_value(json!({"action":"click","x":56,"y":60})).unwrap();
+        assert_eq!(point(&shot,action.x,action.y).unwrap(),(-52,0));
+        assert!(shot.guard.as_ref().unwrap().changed_near(&updated,96.,100.,false));
+        assert!(guard_target(&shot,&action,&updated,false,Some(bounds)).is_ok());
+        assert!(guard_target(&shot,&action,&updated,true,Some(bounds)).is_ok());
+        assert!(visually_similar(&original,&updated,Some(exclude)));
+        assert!(!visually_similar(&original,&updated,None));
+        // Comparisons never mask or alter the pixels returned to the model.
+        assert_eq!(updated.get_pixel(100,100).0,[220,220,220,255]);
+        for current in [None, Some(Rect{left:-49,..bounds}), Some(Rect{right:-19,..bounds}),
+            Some(Rect{top:-29,..bounds}), Some(Rect{bottom:31,..bounds})] {
+            assert!(check_overlay(&shot,&action,current).unwrap().is_none());
+            assert!(guard_target(&shot,&action,&updated,false,current).is_err());
+        }
+        let absent = Shot { overlay:None, ..shot.clone() };
+        assert!(check_overlay(&absent,&action,Some(bounds)).unwrap().is_none());
+        assert!(guard_target(&absent,&action,&updated,false,Some(bounds)).is_err());
+        for value in [json!({"action":"click","x":60,"y":60}),
+            json!({"action":"drag","x":56,"y":60,"toX":60,"toY":60})] {
+            let inside:Action = serde_json::from_value(value).unwrap();
+            assert!(guard_target(&shot,&inside,&original,false,Some(bounds)).is_err());
+        }
+        for y in 96..105 { for x in 92..100 { updated.put_pixel(x,y,Rgba([200,0,0,255])); } }
+        assert!(guard_target(&shot,&action,&updated,false,Some(bounds)).is_err());
+        assert!(guard_target(&shot,&action,&updated,true,Some(bounds)).is_err());
+        assert!(!visually_similar(&original,&updated,Some(exclude)));
+        let other_monitor = Surface { x:0,y:0,..shot.surface.clone() };
+        assert!(overlay_region(&other_monitor,shot.source_pixels,Some(bounds)).is_none());
+        let other_shot = Shot { surface:other_monitor, overlay:None, ..shot.clone() };
+        assert!(check_overlay(&other_shot,&action,Some(bounds)).is_ok());
+        let fractional = Surface { x:0,y:0,width:3,height:3,..shot.surface.clone() };
+        assert!(overlay_region(&fractional,(2,2),Some(Rect{left:1,top:1,right:2,bottom:2})).is_none());
+        assert!(overlay_region(&shot.surface,shot.source_pixels,None).is_none());
     }
     #[test]
     fn cursor_marker_tracks_actual_position_in_scaled_regions() {
@@ -1566,7 +1702,7 @@ mod tests {
         let path = folder.join("full.png");
         xcap::image::RgbaImage::from_pixel(400,300,xcap::image::Rgba([40,50,60,255])).save(&path).unwrap();
         let surface = Surface { id:1, pid:None, x:-800, y:0, width:800, height:600 };
-        let full = Shot { image_id:"full".into(), surface:surface.clone(), pixels:(400,300), source_pixels:(800,600), region:None, guard:None };
+        let full = Shot { image_id:"full".into(), surface:surface.clone(), pixels:(400,300), source_pixels:(800,600), region:None, guard:None, overlay:None, desktop_capture:false };
         let mut snap = Snapshot { id:"new".into(), owner, taken:Instant::now(), window:None, max_edge:1600, foreground:None, shots:vec![full], invalidated:None, background:false };
         let mut result = json!({"snapshotId":"new","images":[{"imageId":"full","path":path,"snapshotId":"new","cursor":{"x":390,"y":290}}]});
         failure_detail(&mut snap, &surface, (-20,580), &mut result).unwrap();
@@ -1583,7 +1719,7 @@ mod tests {
 
     #[test]
     fn coordinates_keys_and_validation() {
-        let shot = Shot { guard: None,
+        let shot = Shot { guard: None, overlay:None, desktop_capture:false,
             image_id: "test".into(),
             surface: Surface {
                 id: 1,
@@ -1639,7 +1775,7 @@ mod tests {
     }
     #[test]
     fn invalid_wait_rejects_whole_batch_before_input() {
-        let shot = Shot { guard: None, image_id:"monitor-1".into(),
+        let shot = Shot { guard: None, overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
             taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false});

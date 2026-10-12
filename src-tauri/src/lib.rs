@@ -35,6 +35,7 @@ mod signature;
 mod skills;
 mod sleep_inhibitor;
 mod sys_notify;
+mod taskbar_status;
 mod threads;
 mod thread_storage;
 mod time_machine;
@@ -5735,6 +5736,7 @@ pub fn run() {
             register_experience_trails(app.handle());
             register_roaming_forwarders(app.handle(), relay.clone());
             register_remote_permission_capture(app.handle());
+            taskbar_status::start(app.handle());
             // 连接中转站（未配置 token 时内部直接返回）
             relay.restart();
             // server 侧远程会话：空闲只做命令长轮询；运行中按全量 + 增量同步。

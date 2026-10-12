@@ -282,6 +282,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
   );
+  const [taskbarStatusEnabled, setTaskbarStatusEnabled] = createSignal(
+    s?.taskbarStatusEnabled ?? false,
+  );
   const [powershellUtf8Enabled, setPowershellUtf8Enabled] = createSignal(
     s?.powershellUtf8Enabled ?? true,
   );
@@ -716,6 +719,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     codexProxy: codexProxy().trim(),
     lyraProxy: lyraProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
+    taskbarStatusEnabled: taskbarStatusEnabled(),
     powershellUtf8Enabled: powershellUtf8Enabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
     ponytailEnabled: ponytailEnabled(),
@@ -1640,6 +1644,19 @@ export function SettingsModal(props: { onClose: () => void }) {
 
             <section class="settings-group">
               <h3 class="settings-group-title">Windows 启动</h3>
+              <div class="field">
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={taskbarStatusEnabled()}
+                    onChange={(e) => setTaskbarStatusEnabled(e.currentTarget.checked)}
+                  />
+                  <span>Windows 后台任务栏提示（实验）</span>
+                </label>
+                <span class="field-hint">
+                  主窗口在后台时，在 Windows 任务栏可识别的空闲区域显示任务状态；不创建桌面悬浮窗。默认关闭；保存后即时生效。
+                </span>
+              </div>
               <div class="field">
                 <span class="field-label">Windows shell 启动 shim</span>
                 <label class="backend-switch">

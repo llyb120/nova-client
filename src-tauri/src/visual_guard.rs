@@ -1,6 +1,21 @@
 //! Bounded pixel-only stale-target checks. This is not OCR or object recognition.
 use xcap::image::RgbaImage;
 
+/// Half-open rectangle in original image pixels, never display/cropped-image coordinates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PixelRect {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+impl PixelRect {
+    pub(crate) fn contains(self, x: f64, y: f64) -> bool {
+        x >= self.left as f64 && x < self.right as f64
+            && y >= self.top as f64 && y < self.bottom as f64
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct VisualGuard {
     width: u32,
@@ -25,8 +40,14 @@ impl VisualGuard {
     /// `core_only`: the batch's own earlier input legitimately changed the neighbourhood
     /// (typed text, ticked checkbox); only an overlay or shift right under the target counts.
     pub(crate) fn changed_near(&self, current: &RgbaImage, x: f64, y: f64, core_only: bool) -> bool {
+        self.changed_near_excluding(current, x, y, core_only, None)
+    }
+
+    /// The caller must verify that the excluded overlay's geometry has not changed.
+    pub(crate) fn changed_near_excluding(&self, current: &RgbaImage, x: f64, y: f64, core_only: bool, exclude: Option<PixelRect>) -> bool {
         if current.dimensions() != self.source || !x.is_finite() || !y.is_finite()
-            || x < 0. || y < 0. || x >= self.source.0 as f64 || y >= self.source.1 as f64 {
+            || x < 0. || y < 0. || x >= self.source.0 as f64 || y >= self.source.1 as f64
+            || exclude.is_some_and(|r| r.contains(x, y)) {
             return true;
         }
         let cx = (x / self.step as f64) as i64;
@@ -36,8 +57,10 @@ impl VisualGuard {
             for dx in -24i64..=24 {
                 let (px, py) = (cx + dx, cy + dy);
                 if px < 0 || py < 0 || px >= self.width as i64 || py >= self.height as i64 { continue; }
+                let (sx, sy) = (px as u32 * self.step, py as u32 * self.step);
+                if exclude.is_some_and(|r| r.contains(sx as f64, sy as f64)) { continue; }
                 let old = self.pixels[(py * self.width as i64 + px) as usize];
-                let new = current.get_pixel(px as u32 * self.step, py as u32 * self.step);
+                let new = current.get_pixel(sx, sy);
                 let different = (0..3).any(|c| old[c].abs_diff(new[c]) > 24);
                 total += 1;
                 changed += u32::from(different);
@@ -46,7 +69,7 @@ impl VisualGuard {
         }
         // Ignore small anti-aliasing/caret noise and unrelated animation elsewhere.
         // A changed centre or substantially changed neighbourhood requires a new observation.
-        total == 0 || (!core_only && changed * 100 > total * 12) || core_changed * 100 > core * 35
+        total == 0 || core == 0 || (!core_only && changed * 100 > total * 12) || core_changed * 100 > core * 35
     }
 }
 
@@ -81,6 +104,27 @@ mod tests {
         assert!(guard.changed_near(&current, 30., 60., true));
         assert!(guard.changed_near(&current, f64::NAN, 60., false));
         assert!(guard.changed_near(&RgbaImage::new(240,141),30.,60.,false));
+    }
+    #[test]
+    fn explicit_exclusion_keeps_nearby_targets_guarded() {
+        let original = RgbaImage::from_pixel(100, 100, Rgba([20,20,20,255]));
+        let guard = VisualGuard::new(&original);
+        let rect = PixelRect { left:50, top:20, right:80, bottom:80 };
+        let mut current = original.clone();
+        for y in rect.top..rect.bottom { for x in rect.left..rect.right {
+            current.put_pixel(x, y, Rgba([220,220,220,255]));
+        } }
+        assert!(guard.changed_near(&current, 48., 50., false));
+        for core_only in [false, true] {
+            assert!(!guard.changed_near_excluding(&current, 48., 50., core_only, Some(rect)));
+            assert!(guard.changed_near_excluding(&current, 50., 50., core_only, Some(rect)));
+        }
+        for y in 46..55 { for x in 44..50 { current.put_pixel(x, y, Rgba([200,0,0,255])); } }
+        assert!(guard.changed_near_excluding(&current, 48., 50., false, Some(rect)));
+        assert!(guard.changed_near_excluding(&current, 48., 50., true, Some(rect)));
+        // No exemptions for the browser caller or an image whose dimensions changed.
+        assert!(patch_changed(&original, &current));
+        assert!(guard.changed_near_excluding(&RgbaImage::new(101,100), 48., 50., false, Some(rect)));
     }
     #[test]
     fn high_dpi_and_image_boundaries_are_bounded() {
