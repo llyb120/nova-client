@@ -306,6 +306,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     s?.meteorAgentKind && ALL_AGENT_KINDS.includes(s.meteorAgentKind) ? s.meteorAgentKind : "lyra",
   );
   const [meteorModel, setMeteorModel] = createSignal(s?.meteorModel ?? "");
+  const [meteorClipboard, setMeteorClipboard] = createSignal(s?.meteorClipboard ?? false);
   const [tryingMeteor, setTryingMeteor] = createSignal(false);
   const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
     s?.cursorContextMode === "super" ? "super" : "default",
@@ -750,6 +751,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     meteorShortcut: meteorShortcut().trim(),
     meteorAgentKind: meteorAgentKind(),
     meteorModel: meteorModel().trim(),
+    meteorClipboard: meteorClipboard(),
     devinEnabled: devinEnabled(),
     lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
@@ -1173,8 +1175,16 @@ export function SettingsModal(props: { onClose: () => void }) {
                 />
                 <span class="field-hint">空值使用所选后端的默认模型；仅可选择已启用的本机后端。</span>
               </div>
+              <div class="field">
+                <span class="field-label">最近剪贴板</span>
+                <label class="backend-switch">
+                  <input type="checkbox" checked={meteorClipboard()} onChange={(e) => setMeteorClipboard(e.currentTarget.checked)} />
+                  <span>提交时附加最近的剪贴板</span>
+                </label>
+                <span class="field-hint">默认关闭。开启后把触发时剪贴板里的文字、图片或文件路径作为参考一并提交，仅取当前一条，不记录历史；关闭时不读取剪贴板。</span>
+              </div>
               <p class="settings-group-desc">
-                提交时截取所有屏幕并提供完整截图，标注仅提示大致位置，不会裁掉周边或未标注屏幕；剪贴板文字、图片或文件引用同时作为参考，不会持续记录历史。目标明确时直接执行，不因未指定逐字措辞或操作步骤而重复询问；只要求草稿时不会发送。请避免在敏感内容可见或位于剪贴板时使用。
+                提交时截取所有屏幕并提供完整截图，标注仅提示大致位置，不会裁掉周边或未标注屏幕。目标明确时直接执行，不因未指定逐字措辞或操作步骤而重复询问；只要求草稿时不会发送。请避免在敏感内容可见（或开启剪贴板附加且敏感内容位于剪贴板）时使用。
               </p>
               <button type="button" class="btn secondary" disabled={tryingMeteor()} onClick={async () => {
                 setTryingMeteor(true);

@@ -10,6 +10,7 @@ interface MeteorContext {
   height: number;
   monitors?: MeteorRegion[];
   pointer?: MeteorPoint;
+  clipboard?: boolean;
 }
 
 export default function MeteorOverlay() {
@@ -340,7 +341,7 @@ export default function MeteorOverlay() {
             disabled={locked()}
             aria-describedby="meteor-reference"
           />
-          <p id="meteor-reference">实时标注仅指示大致范围；提交时截取并保留所有屏幕的完整截图，连同全部标注与最近剪贴板一次提交。未填说明的标注仅作参考。</p>
+          <p id="meteor-reference">实时标注仅指示大致范围；提交时截取并保留所有屏幕的完整截图，连同全部标注{context()?.clipboard ? "与最近剪贴板" : ""}一次提交。未填说明的标注仅作参考。</p>
           <p classList={{ "meteor-error": textLength() > METEOR_MAX_TEXT }}>{textLength()} / 16000 字 · 最多 20 条标注</p>
           <Show when={error()}><p class="meteor-error" role="alert">{error()}</p></Show>
           <div class="meteor-note-actions">
