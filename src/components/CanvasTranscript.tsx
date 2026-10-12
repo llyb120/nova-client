@@ -1197,6 +1197,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   type ImgSize = Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">;
   const shownImages = new Map<string, { el?: HTMLImageElement; size?: ImgSize }>();
   const imageKey = (img: PromptImage) => `${img.name}|${img.mimeType}|${img.size ?? ""}`;
+  // 布局级双缓冲：新布局含尺寸未知的图片时不提交，旧帧留屏，解码完再整帧切换。
+  // 加载失败不会回调 ready，所以最多等 IMAGE_DEFER_MS 后按占位尺寸提交。
+  const IMAGE_DEFER_MS = 300;
+  let imageDeferSince = 0;
+  let imageDeferTimer: number | undefined;
   const toolTextLayouts = new LruMap<string, { lines: string[]; seps: string[] }>(32);
 
   // ─── Layout ────────────────────────────────────────────────────────────────
@@ -1279,6 +1284,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const result: Block[] = [];
     const nextGroupYs: number[] = [];
     let y = 24;
+    let pendingImages = false;
     let chunkStartedAt = performance.now();
     // DOM adjacent vertical margins collapse; canvas must emulate or user bubbles
     // stack 20+16 gaps and look full of blank space between short prompts.
@@ -1363,10 +1369,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           // DOM .bubble-images: flex-wrap, img max 240×180, gap 6, margin-bottom 6
           const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH, imgMaxW } =
             layoutBubbleImages(item.images, maxBubble - 32, img => {
-              const size = imageSizes.get(promptImageSrc(img));
+              const src = promptImageSrc(img);
+              const size = imageSizes.get(src);
               const key = imageKey(img);
               if (size) shownImages.set(key, { ...shownImages.get(key), size });
-              return size ?? shownImages.get(key)?.size ?? null;
+              const known = size ?? shownImages.get(key)?.size;
+              if (!known) { pendingImages = true; loadImageSource(src); }
+              return known ?? null;
             });
           // Size to content like DOM (no artificial min-width that leaves empty bubble space).
           const lh = 14 * 1.6;
@@ -1574,6 +1583,19 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     flushBottom();
     if (disposed || generation !== layoutGeneration || props.threadId !== threadId) return false;
+    // 只有已有真实内容的前台帧才值得保留；切会话的加载提示直接替换。
+    if (pendingImages && blocks.some(b => b.kind !== "hint")) {
+      const now = performance.now();
+      imageDeferSince ||= now;
+      const wait = IMAGE_DEFER_MS - (now - imageDeferSince);
+      if (wait > 0) {
+        if (imageDeferTimer === undefined) {
+          imageDeferTimer = window.setTimeout(() => { imageDeferTimer = undefined; if (!disposed) scheduleRebuild(); }, wait);
+        }
+        return false;
+      }
+    }
+    imageDeferSince = 0;
     groupYs = nextGroupYs;
     // 虚拟窗口前移后 block 下标变化，选区按组内位置迁移，不能误复制另一轮的文字。
     const remapBlock = (index: number) => {
