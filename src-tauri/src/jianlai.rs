@@ -1174,96 +1174,21 @@ fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, d
     }
 }
 
-/// The owner's current valid snapshot: (imageId, screenshot file) of its first shot.
-fn current_shot(owner: &str, snapshot: &str) -> Option<(String, std::path::PathBuf)> {
-    let state = DESKTOP.try_lock().ok()?;
-    let snap = state.as_ref().filter(|s| s.owner == owner && s.id == snapshot
-        && s.invalidated.is_none() && s.taken.elapsed() <= Duration::from_secs(180))?;
-    let shot = snap.shots.first()?;
-    Some((shot.image_id.clone(), shot_folder(owner).join(format!("{}-{}.png", snap.id, shot.image_id))))
-}
-
 fn has_target(args: &Value) -> bool {
     args["actions"].as_array().into_iter().flatten().chain(std::iter::once(&args["action"])).any(|a| a["target"].is_string())
 }
 
-/// act/run whose coordinate actions name a `target` (a `vN` from vision.targets or a description)
-/// instead of x/y. The main model decides the steps; Altair only locates them. Each step is located
-/// on the latest screenshot, executed alone through the guarded act path, and its settled feedback
-/// screenshot is the next step's basis. Stops at the first failure and never replays.
-async fn vision_act(owner: String, args: &Value) -> Result<Value> {
-    let settings = crate::native_browser::altair_settings()?;
-    if !settings.altair_enabled { return Err("target 需要在设置中开启 Altair；未开启时用 x/y".into()); }
-    let actions = args["actions"].as_array().cloned()
-        .or_else(|| args["action"].is_object().then(|| vec![args["action"].clone()]))
-        .filter(|a| !a.is_empty() && a.len() <= 16).ok_or("每次需要1至16个动作")?;
-    let first = args["snapshotId"].as_str().ok_or("target 动作需要最新截图的 snapshotId")?.to_string();
-    let mut snapshot = first.clone();
-    let (mut steps, mut latest, mut failure) = (Vec::<Value>::new(), Value::Null, None::<String>);
-    for (index, action) in actions.iter().enumerate() {
-        let mut action = action.clone();
-        let mut image_id = if index == 0 { args["imageId"].clone() } else { Value::Null };
-        let mut step = json!({"index":index,"action":action["action"],"target":action["target"]});
-        if let Some(target) = action["target"].as_str().map(str::to_string) {
-            let located = match current_shot(&owner, &snapshot) {
-                None => Err("截图已失效或属于其它会话，请重新截图".to_string()),
-                // vN is a shortcut into the screenshot it was listed for; after the screen changed,
-                // its label is located again on the fresh pixels instead of reusing stale coordinates.
-                Some((shot_id, path)) => match crate::altair::recall(&first, &target) {
-                    Some((id, x, y, label)) if snapshot == first => Ok(json!({"x":x,"y":y,"imageId":id,"label":label,"by":"targets"})),
-                    Some((_, _, _, label)) => crate::altair::ground(&settings, &path, &label).await.map(|mut p| { p["imageId"] = json!(shot_id); p }),
-                    None if target.strip_prefix('v').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) =>
-                        Err(format!("{target} 不在该截图的 vision.targets 中；改用文字描述 target")),
-                    None => crate::altair::ground(&settings, &path, &target).await.map(|mut p| { p["imageId"] = json!(shot_id); p }),
-                },
-            };
-            match located {
-                Ok(point) => {
-                    action["x"] = point["x"].clone();
-                    action["y"] = point["y"].clone();
-                    image_id = point["imageId"].clone();
-                    step["located"] = point;
-                    if let Some(a) = action.as_object_mut() { a.remove("target"); }
-                }
-                Err(error) => { step["status"] = json!("not_executed"); failure = Some(error); steps.push(step); break; }
-            }
-        }
-        let last = index + 1 == actions.len();
-        let feedback = if last { args.get("feedback").cloned().unwrap_or(json!("screenshot")) } else { json!("screenshot") };
-        let act = json!({"operation":"act","snapshotId":snapshot,"imageId":image_id,"actions":[action],"feedback":feedback});
-        let owner_for_act = owner.clone();
-        // Do not timeout/detach native input: cancellation cannot stop a spawn_blocking action.
-        let result = tokio::task::spawn_blocking(move || run(owner_for_act, act)).await.map_err(err)??;
-        step["status"] = result["status"].clone();
-        steps.push(step);
-        let executed = result["status"] == "executed";
-        if !executed { failure = result["error"].as_str().map(str::to_string).or(Some("执行未完成".into())); }
-        latest = result;
-        if !executed { break; }
-        snapshot = latest["snapshotId"].as_str().unwrap_or_default().to_string();
-    }
-    let done = steps.iter().filter(|s| s["status"] == "executed").count();
-    if latest.is_null() { latest = json!({"snapshotId":snapshot}); }
-    latest["status"] = json!(if done == actions.len() { "executed" } else if done > 0 || latest["status"] == "needs_review" { "needs_review" } else { "not_executed" });
-    latest["completedActions"] = json!(done);
-    latest["error"] = json!(failure);
-    latest["steps"] = json!(steps);
-    Ok(latest)
-}
-
-/// With Altair on, screenshots in the reply are replaced by `vision` text (see `altair::filter`).
 pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
-    // look/vision only steer the reply filter; the desktop request schema stays strict.
+    // look/vision are unused but still tolerated; the desktop request schema stays strict.
     let mut inner = args.clone();
     if let Some(map) = inner.as_object_mut() { map.remove("look"); map.remove("vision"); }
-    let result = execute_inner(root, &inner, owner).await?;
-    Ok(crate::altair::filter(args, result).await)
+    execute_inner(root, &inner, owner).await
 }
 
 async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> {
     let owner = crate::native_browser::tool_owner(root, owner)?;
     if matches!(args["operation"].as_str(), Some("act" | "run")) && has_target(args) {
-        return vision_act(owner, args).await;
+        return Err("target 定位暂不支持，请使用 x/y".into());
     }
     if args["operation"] == "run" {
         // run with actions is act; decisions stay with the main model.
@@ -1303,15 +1228,14 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
 mod tests {
     use super::*;
     #[test]
-    fn target_actions_route_to_vision_and_map_through_the_guarded_point() {
+    fn target_actions_map_through_the_guarded_point() {
         assert!(has_target(&json!({"actions":[{"action":"press","key":"Enter"},{"action":"click","target":"v2"}]})));
         assert!(has_target(&json!({"action":{"action":"click","target":"搜索框"}})));
         assert!(!has_target(&json!({"actions":[{"action":"click","x":1,"y":2}]})));
-        // Altair's preview point → imageId pixels → the same region/DPI/desktop mapping as x/y input.
+        // Image pixel (800,400) → desktop surface, through the same region/DPI mapping as x/y input.
         let shot = Shot { image_id:"crop".into(), surface:Surface{id:1,pid:None,x:-1920,y:-100,width:1920,height:1080},
             pixels:(1600,800),source_pixels:(3840,2160),region:Some(Region{x:200,y:100,width:800,height:400}),guard:None };
-        let (x, y) = crate::altair::scale_point(Some(512), Some(256), &json!({"imagePixels":[1024,512],"sourcePixels":[1600,800]})).unwrap();
-        assert_eq!(point(&shot, Some(x as i32), Some(y as i32)).unwrap(), (-1620,50));
+        assert_eq!(point(&shot, Some(800), Some(400)).unwrap(), (-1620,50));
     }    #[test]
     fn local_image_regions_and_actual_pointer_validation() {
         let shot=Shot {image_id:"crop".into(),surface:Surface{id:1,pid:None,x:-1920,y:-100,width:1920,height:1080},

@@ -221,7 +221,6 @@ function CliManager(props: {
 type SettingsTab =
   | "general"
   | "advanced"
-  | "altair"
   | "lyra"
   | "backends"
   | "instructions"
@@ -235,7 +234,6 @@ type SettingsTab =
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
   { id: "advanced", name: "高级" },
-  { id: "altair", name: "Altair 视觉代理" },
   { id: "lyra", name: "Lyra" },
   { id: "backends", name: "模型后端" },
   { id: "instructions", name: "Agent 配置" },
@@ -249,21 +247,6 @@ const TABS: { id: SettingsTab; name: string }[] = [
 
 export function SettingsModal(props: { onClose: () => void }) {
   const s = state.settings;
-  const [altairEnabled, setAltairEnabled] = createSignal(s?.altairEnabled ?? false);
-  const [altairModel, setAltairModel] = createSignal(s?.altairModel ?? "");
-  const [altairTesting, setAltairTesting] = createSignal(false);
-  const [altairTestResult, setAltairTestResult] = createSignal("");
-  createEffect(() => { if (tab() === "altair") void ensureModelOptions("lyra"); });
-  // Sends one fixed question with the app icon as the screenshot.
-  const testAltair = async () => {
-    setAltairTesting(true);
-    setAltairTestResult("");
-    try {
-      const result = await invoke<{ elapsedMs: number }>("test_altair_connection", { altairModel: altairModel() });
-      setAltairTestResult(`接口测试通过，耗时 ${result.elapsedMs} ms（仅连通性测试，不代表识图准确率）`);
-    } catch (error) { setAltairTestResult(String(error)); }
-    finally { setAltairTesting(false); }
-  };
   const [tab, setTab] = createSignal<SettingsTab>("general");
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
@@ -699,8 +682,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   };
 
   const draftSettings = (): Settings => ({
-    altairEnabled: altairEnabled(),
-    altairModel: altairModel(),
     claudePath: claudePath().trim() || "claude-agent-acp",
     claudeProxy: claudeProxy().trim(),
     claudeEnabled: claudeEnabled(),
@@ -1122,23 +1103,6 @@ export function SettingsModal(props: { onClose: () => void }) {
         </div>
 
         <div class="modal-body">
-          <Show when={tab() === "altair"}>
-            <section class="settings-group">
-              <h3 class="settings-group-title">Altair 视觉代理</h3>
-              <label class="field">
-                <span><input type="checkbox" checked={altairEnabled()} onChange={e => setAltairEnabled(e.currentTarget.checked)} /> 启用 Altair</span>
-                <span class="field-hint">开启后，剑来与浏览器的截图交给所选模型识别，主模型只收到文字摘要、问题回答和可点击目标（v1…），不再接收图片；主模型仍负责所有判断，坐标动作可写 target 由 Altair 定位，多步操作每步重新截图定位。识图失败时自动附原图，主模型也可用 vision:"raw" 要原图。每次识图是一次独立请求（不带会话上下文，关闭思考），会上传截图。</span>
-              </label>
-              <div class="field">
-                <span class="field-label">Altair 模型</span>
-                <ModelPicker agentKind="lyra" model={altairModel()} onPickModel={(_, m) => setAltairModel(m)}
-                  prefix="Altair" title="Altair 模型" portal />
-                <span class="field-hint">需选择支持图片输入的 Lyra 模型；响应越快越好（建议 Flash/Haiku 级别）。</span>
-              </div>
-              <button type="button" class="btn" disabled={altairTesting() || !altairModel()} onClick={() => void testAltair()}>{altairTesting() ? "测试中…" : "测试 Altair"}</button>
-              <p role="status" aria-live="polite">{altairTestResult()}</p>
-            </section>
-          </Show>
           {/* ===== 通用 ===== */}
           <Show when={tab() === "general"}>
             <section class="settings-group">

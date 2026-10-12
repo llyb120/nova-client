@@ -423,9 +423,6 @@ export interface PendingNewSessionSeed {
 }
 
 export interface Settings {
-  /** Altair：Lyra 识图模型，结合页面文字与截图驱动网页/桌面 run。 */
-  altairEnabled: boolean;
-  altairModel: string;
   claudePath: string;
   claudeProxy: string;
   claudeEnabled: boolean;
