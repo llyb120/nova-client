@@ -26,6 +26,22 @@
 
 `executed` 表示输入已发送，不表示应用任务成功；`needs_review` 表示可能部分执行，检查completedActions/error和随附新图，禁止重放整个批次。观察失败会单独返回observationError，不掩盖执行状态。
 
+## 后台操作（macOS / Linux）
+
+`windows`、`screenshot`、`act` 带 `background: true` 时，不动用户的真实光标、键盘焦点和前台窗口，用户可以同时使用电脑。后台不占输入闸门（不挡 Chrome 工具），也不计入「刚注入过输入」，因此不会掩盖用户自己的操作。
+
+| 平台 | 机制 | 范围 |
+|---|---|---|
+| macOS | 事件用 `CGEventPostToPid` 直接投递给窗口所属进程，截图取窗口自身像素（被遮挡也行） | 必须传 `windowId` |
+| Linux | 在 Nova 私有的 Xvfb「座席」里操作（首次后台调用时自动拉起，Nova 退出即被带走），用户的 X 会话完全不受影响 | 只有桌面视图，不传 `windowId`/`monitorId` |
+| Windows | 只有一个输入队列，不支持 | 返回错误，不会改用真实输入 |
+
+- **模式一致**：后台快照只能用 `background: true` 的 `act`，前台快照反之；不一致直接 `not_executed`。后台请求绝不回退到真实输入。
+- **Linux 座席**：`windows(background:true)` 返回 `background.display`（如 `:200`）。先在 shell 里用 `DISPLAY=:200 firefox &` 启动要操作的应用，再截图和 `act`。座席没有窗口管理器，所以没有窗口列表；整个进程共用一个座席（`ponytail`：按会话隔离时改为 owner → 座席的表）。座席重启后旧快照因屏幕标识变化而失效。
+- **macOS 前提**：授予 Nova「辅助功能」（缺失时系统会静默丢弃事件，工具会提前报错）和「屏幕录制」。键盘最稳；点击、滚动个别应用可能不响应。点击若让应用自行把窗口提到前台，结果带 `foregroundChanged`，此时停止并改用键盘。
+- **macOS 键位**：组合键按 ANSI/US 物理键位解析，非 US 布局下 `Cmd+字母` 可能对应到别的字符。
+- 后台下 `activate` 不可用；`glide` 在 macOS 后台被忽略（没有可见光标）。
+
 ## 观察与结果验证
 
 纯 move 定位反馈直接返回单帧（not_checked），不增加稳定等待；需等待悬停菜单/提示时使用 move + wait。包含其他动作或执行状态为 needs_review 的反馈仍做稳定取样。稳定取样在编码前每隔约150ms取样，至少观察600ms，并要求连续450ms画面近似稳定；2秒取样预算耗尽返回最后一帧及 images[].stability.status=timeout。单次系统抓屏耗时无法中断，失败后的桌面回退另有一次预算。中间帧不落盘、不发送；主动 screenshot 和未执行输入的恢复截图保持单帧，标记 not_checked。feedback=none 仍不取图。

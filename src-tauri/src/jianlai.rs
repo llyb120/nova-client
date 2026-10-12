@@ -9,6 +9,8 @@ use std::{
 };
 use xcap::{Monitor, Window};
 
+mod background;
+
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -107,6 +109,8 @@ struct Snapshot {
     foreground: Option<(u32, u32)>,
     shots: Vec<Shot>,
     invalidated: Option<String>,
+    /// 后台截图：act 必须同样带 background，两种模式的快照互不通用。
+    background: bool,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -125,6 +129,7 @@ struct Request {
     notes: Option<String>,
     query: Option<String>,
     observe: Option<bool>,
+    background: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -179,8 +184,13 @@ fn window(id: u32) -> Result<Window> {
         .find(|w| w.id().ok() == Some(id))
         .ok_or_else(|| "程序窗口已关闭，请重新 windows".into())
 }
-#[cfg(windows)]
+/// 后台模式没有「前台」可比较：恒为 None，使所有前台一致性校验自然成立。
 fn foreground() -> Result<Option<(u32, u32)>> {
+    if background::active() { return Ok(None); }
+    real_foreground()
+}
+#[cfg(windows)]
+fn real_foreground() -> Result<Option<(u32, u32)>> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
     // Read only: switching windows remains a mouse/keyboard operation.
     let hwnd = unsafe { GetForegroundWindow() };
@@ -192,7 +202,7 @@ fn foreground() -> Result<Option<(u32, u32)>> {
     Ok(Some((hwnd as usize as u32, pid)))
 }
 #[cfg(not(windows))]
-fn foreground() -> Result<Option<(u32, u32)>> {
+fn real_foreground() -> Result<Option<(u32, u32)>> {
     for w in Window::all().map_err(err)? {
         if w.is_focused().map_err(err)? {
             return Ok(Some((w.id().map_err(err)?, w.pid().map_err(err)?)));
@@ -304,6 +314,8 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let mut resize_ms = 0;
     let mut encode_ms = 0;
     *state = None;
+    let bg = background::active();
+    if bg { background::check_scope(window_id.is_some())?; }
     let id = uuid::Uuid::new_v4().to_string();
     let sequence = OBSERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let folder = shot_folder(owner);
@@ -398,6 +410,13 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             return Err("截图期间窗口移动，请重新截图".into());
         }
         save(surface, image, stability)?;
+    } else if bg {
+        // Linux 座席：像素来自私有 X 服务器；xcap 只读进程的 DISPLAY，不能用于它。
+        let surface = background::seat_surface()?;
+        let capture_started = Instant::now();
+        let (image, stability) = settled_image(background::seat_grab, settle)?;
+        capture_ms += capture_started.elapsed().as_millis();
+        save(surface, image, stability)?;
     } else {
         let monitors = Monitor::all().map_err(err)?;
         if monitors.is_empty() || monitors.len() > 16 {
@@ -430,9 +449,10 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         foreground: before,
         shots,
         invalidated: None,
+        background: bg,
     });
     Ok(
-        json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,
+        json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
             "foreground":before,"maxEdge":max_edge,
             "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
                 "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
@@ -651,19 +671,25 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
             None => "前台程序已改变，请重新截图".into(),
         });
     }
+    let bg = background::active();
     if let Some(id) = snap.window {
         // Reuse one Z-order enumeration for geometry and occlusion checks.
         let windows = Window::all().map_err(err)?;
         let w = windows.iter().find(|w| w.id().ok() == Some(id))
             .ok_or("程序窗口已关闭，请重新 windows")?;
-        if !w.is_focused().map_err(err)?
+        // 后台输入投递给进程，不依赖焦点，也不受遮挡影响；只要求窗口还在原处。
+        if bg {
+            if w.is_minimized().map_err(err)? || window_surface(w)? != shot.surface {
+                return Err("后台窗口已最小化、移动或尺寸改变，请重新截图".into());
+            }
+        } else if !w.is_focused().map_err(err)?
             || w.is_minimized().map_err(err)?
             || window_surface(w)? != shot.surface
         {
             return Err(format!("目标窗口失焦、移动或尺寸改变；失焦时直接 activate(windowId={id}) 切到前台并返回新图，移动或尺寸改变时重新截图"));
         }
         // Reject an overlapping higher window before coordinate input; window screenshots may include occluded content.
-        if a.x.is_some() {
+        if !bg && a.x.is_some() {
             let p = point(shot, a.x, a.y)?;
             let end = if a.action == "drag" {
                 point(shot, a.to_x, a.to_y)?
@@ -698,6 +724,14 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
             let image=w.capture_image().map_err(err)?;
             guard_target(shot,a,&image,after_input)?;
             if foreground()?!=snap.foreground || window_surface(w)?!=shot.surface {return Err("落点校验期间窗口或焦点改变，请重新观察".into());}
+        }
+    } else if bg {
+        let seat = background::seat_surface()?;
+        if snap.shots.iter().any(|s| s.surface != seat) {
+            return Err("座席已重启或尺寸改变，请重新截图".into());
+        }
+        if guarded_pointer(a) && shot.guard.is_some() {
+            guard_target(shot, a, &background::seat_grab()?, after_input)?;
         }
     } else {
         let monitors = Monitor::all().map_err(err)?;
@@ -859,6 +893,15 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
     Ok(())
 }
 
+/// macOS 后台：把动作按进程投递给窗口所属应用；坐标是屏幕全局点，不移动真实光标。
+fn post_background(shot: &Shot, a: &Action) -> Result<()> {
+    let pid = shot.surface.pid.ok_or("后台窗口缺少pid")? as i32;
+    let pointer = matches!(a.action.as_str(), "click" | "double_click" | "move" | "drag" | "scroll");
+    let at = if pointer { point(shot, a.x, a.y)? } else { (0, 0) };
+    let to = if a.action == "drag" { point(shot, a.to_x, a.to_y)? } else { at };
+    background::post(pid, shot.surface.id, at, to, a)
+}
+
 fn run(owner: String, args: Value) -> Result<Value> {
     let is_act = args["operation"] == "act";
     let operation = args["operation"].clone();
@@ -916,13 +959,24 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
     if (request.query.is_some() || request.observe.is_some()) && request.operation != "windows" {
         return Err("query/observe仅用于windows".into());
     }
+    if request.background.is_some() && !matches!(request.operation.as_str(), "windows" | "screenshot" | "act") {
+        return Err("background仅用于windows/screenshot/act".into());
+    }
+    if request.background == Some(true) && request.monitor_id.is_some() {
+        return Err("后台模式不使用monitorId：macOS用windowId，Linux座席只有一个桌面".into());
+    }
+    // 先于桌面锁进入：Linux 首次会拉起座席（最多 2 秒），不应占着锁。
+    let bg = request.background == Some(true);
+    let _background = background::enter(bg)?;
     let mut state = DESKTOP
         .try_lock()
         .map_err(|_| "剑来正在操作桌面，请勿并行调用")?;
     match request.operation.as_str() {
         "windows" => {
             // One round-trip start: list windows and, on request, observe the bound target immediately.
-            let mut result = windows()?;
+            // 座席没有窗口管理器；xcap 的窗口枚举读的是用户自己的显示，后台下不能碰。
+            let mut result = if bg && cfg!(target_os = "linux") { json!({"windows":[]}) } else { windows()? };
+            if bg { result["background"] = background::info()?; }
             let all = result["windows"].as_array().cloned().unwrap_or_default();
             let mut target = request.window_id;
             if let Some(q) = request.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
@@ -945,12 +999,13 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 // Background windows capture via PrintWindow; the fallback is the focused window, then the desktop.
                 let focused = all.iter().find(|w| w["focused"] == true && w["minimized"] != true)
                     .and_then(|w| w["windowId"].as_u64()).map(|id| id as u32);
-                let window_id = target.or(focused);
+                // 后台没有「前台窗口」可回退：只观察指定目标（Linux 座席为桌面）。
+                let window_id = if bg { target } else { target.or(focused) };
                 match capture(&owner, window_id, None, None, max_edge, false, &mut state) {
                     Ok(observed) => {
                         result.as_object_mut().unwrap().extend(observed.as_object().unwrap().clone());
                         result["observedWindowId"] = json!(window_id);
-                        result["observedBy"] = json!(if target.is_some() {"query/windowId"} else if focused.is_some() {"foreground"} else {"desktop"});
+                        result["observedBy"] = json!(if target.is_some() {"query/windowId"} else if bg {"background"} else if focused.is_some() {"foreground"} else {"desktop"});
                     }
                     Err(e) => result["observationError"] = json!(e),
                 }
@@ -998,6 +1053,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             }
             let (wid,mid,region)=if request.region_space.as_deref()==Some("image") {
                 let snap=state.as_ref().filter(|s|s.owner==owner && Some(&s.id)==request.snapshot_id.as_ref() && s.taken.elapsed()<=Duration::from_secs(180)).ok_or("局部截图依据已失效，请先重新截图")?;
+                if snap.background != bg {return Err("局部截图依据的快照与本次background模式不一致，请重新截图".into());}
                 let shot=snap.shots.iter().find(|s|Some(&s.image_id)==request.image_id.as_ref()).ok_or("imageId不属于最新截图")?;
                 let action:Action=serde_json::from_value(json!({"action":"move","x":0,"y":0})).map_err(err)?;
                 check_target(snap,shot,&action,false)?;
@@ -1024,7 +1080,8 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 "notice":"历史截图仅供阅读，不产生可操作快照；操作前请使用当前截图"}))
         }
         "act" => {
-            if cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            // 座席是 Xvfb（X11），与用户会话是否 Wayland 无关。
+            if !bg && cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some() {
                 return Err(
                     "剑来 Linux 输入当前仅支持 X11；Wayland 不会静默使用 XWayland 操作".into(),
                 );
@@ -1054,7 +1111,13 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, false, &mut state, &mut result);
                 return Ok(result);
             }
-            let _lease = lease_input("jianlai")?;
+            if snap.background != bg {
+                // 绝不让「想后台」的请求落到真实输入上，反过来也一样。
+                return Err(if bg { "当前快照是前台截图；后台 act 需要先用 background:true 截图，本次不会改用真实输入" }
+                    else { "当前快照是后台截图；act 也必须带 background:true，本次不会改用真实输入" }.into());
+            }
+            // 后台不注入真实输入：不占输入闸门（不挡用户的 Chrome），也不能记为「刚注入」掩盖用户的真实操作。
+            let _lease = if bg { None } else { Some(lease_input("jianlai")?) };
             if snap.window.is_some() && request.window_id.is_some() && request.window_id != snap.window {
                 return Err("windowId与截图不符".into());
             }
@@ -1064,15 +1127,21 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 return Err("每次需要1至16个动作".into());
             }
             for (index, a) in actions.iter().enumerate() {
-                if let Err(e) = validate(a, &shot) {
+                if let Err(e) = validate(a, &shot).and_then(|_| if bg { background::validate(a) } else { Ok(()) }) {
                     return Ok(json!({"status":"not_executed","completedActions":0,
                         "error":format!("actions[{index}].{e}；本批次尚未执行")}));
                 }
             }
             let max_edge = request.max_edge.unwrap_or(snap.max_edge);
-            let feedback_window = request.window_id.or(snap.window);
+            // 后台的观察范围由快照决定（Linux 座席是桌面），不听请求里多余的 windowId。
+            let feedback_window = if bg { snap.window } else { request.window_id.or(snap.window) };
             let monitor_id = snap.window.is_none().then_some(shot.surface.id);
-            let mut enigo = Enigo::new(&Settings::default()).map_err(err)?;
+            // macOS 后台按进程投递事件：不创建 Enigo（它只发给 HID 层，还会弹权限提示）。
+            let direct = bg && cfg!(target_os = "macos");
+            let mut enigo = if direct { None } else {
+                Some(Enigo::new(&if bg { background::seat_settings()? } else { Settings::default() }).map_err(err)?)
+            };
+            let foreground_before = if direct { real_foreground().ok().flatten() } else { None };
             // Consume before the first OS event; all later failures are explicitly non-retryable.
             let mut snap = state.take().unwrap();
             let mut completed = 0;
@@ -1092,7 +1161,11 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                     }
                 }
                 attempted = true;
-                if let Err(e) = input(&mut enigo, &shot, a, snap.foreground) {
+                let sent = match enigo.as_mut() {
+                    Some(enigo) => input(enigo, &shot, a, snap.foreground),
+                    None => post_background(&shot, a),
+                };
+                if let Err(e) = sent {
                     failed_point = point(&shot, a.x, a.y).ok();
                     failure = Some(e);
                     break;
@@ -1132,6 +1205,12 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 let settle = attempted && needs_stable_feedback(&actions[..completed], result["status"] == "needs_review");
                 observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, settle, &mut state, &mut result);
             }
+            if direct {
+                // 反馈取样已等过界面稳定；此时再读真实前台，才能发现应用收到点击后自行激活。
+                if let Some(changed) = background::foreground_notice(foreground_before, real_foreground().ok().flatten()) {
+                    result["foregroundChanged"] = changed;
+                }
+            }
             // Read after feedback settling so apps that write the clipboard asynchronously have finished.
             if let Some(copied) = crate::clipboard::copied_since(clipboard) { result["clipboard"] = copied; }
             if let (Some(p), Some(current)) = (failed_point, state.as_mut().filter(|s| s.foreground == snap.foreground)) {
@@ -1152,6 +1231,14 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
 }
 // Observation never retries input; follow the foreground and fall back to desktop if needed.
 fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, desktop: bool, max_edge: u32, settle: bool, state: &mut Option<Snapshot>, result: &mut Value) {
+    if background::active() {
+        // 后台没有「前台」可跟随：始终重拍同一目标（macOS 的同一窗口 / Linux 座席桌面），不回退到用户的桌面。
+        match capture(owner, previous_window, None, None, max_edge, settle, state) {
+            Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
+            Err(e) => result["observationError"] = json!(e),
+        }
+        return;
+    }
     // Follow the actual foreground after opening a compose window/dialog, never activate it.
     // Shell task view and hidden helper windows must stay in desktop scope.
     let focused = foreground().ok().flatten().and_then(|(id, _)| window(id).ok())
@@ -1230,7 +1317,7 @@ async fn vision_act(owner: String, args: &Value) -> Result<Value> {
         }
         let last = index + 1 == actions.len();
         let feedback = if last { args.get("feedback").cloned().unwrap_or(json!("screenshot")) } else { json!("screenshot") };
-        let act = json!({"operation":"act","snapshotId":snapshot,"imageId":image_id,"actions":[action],"feedback":feedback});
+        let act = json!({"operation":"act","snapshotId":snapshot,"imageId":image_id,"actions":[action],"feedback":feedback,"background":args["background"]});
         let owner_for_act = owner.clone();
         // Do not timeout/detach native input: cancellation cannot stop a spawn_blocking action.
         let result = tokio::task::spawn_blocking(move || run(owner_for_act, act)).await.map_err(err)??;
@@ -1269,7 +1356,8 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
         // run with actions is act; decisions stay with the main model.
         let actions = args["actions"].as_array().filter(|a| !a.is_empty() && a.len() <= 16).ok_or("run 需1–16个已确认动作")?;
         let act = json!({"operation":"act","snapshotId":args["snapshotId"],"imageId":args["imageId"],
-            "actions":actions,"feedback":args.get("feedback").cloned().unwrap_or(json!("screenshot"))});
+            "actions":actions,"feedback":args.get("feedback").cloned().unwrap_or(json!("screenshot")),
+            "background":args["background"]});
         return tokio::task::spawn_blocking(move || run(owner, act)).await.map_err(err)?;
     }
     let args = args.clone();
@@ -1479,7 +1567,7 @@ mod tests {
         xcap::image::RgbaImage::from_pixel(400,300,xcap::image::Rgba([40,50,60,255])).save(&path).unwrap();
         let surface = Surface { id:1, pid:None, x:-800, y:0, width:800, height:600 };
         let full = Shot { image_id:"full".into(), surface:surface.clone(), pixels:(400,300), source_pixels:(800,600), region:None, guard:None };
-        let mut snap = Snapshot { id:"new".into(), owner, taken:Instant::now(), window:None, max_edge:1600, foreground:None, shots:vec![full], invalidated:None };
+        let mut snap = Snapshot { id:"new".into(), owner, taken:Instant::now(), window:None, max_edge:1600, foreground:None, shots:vec![full], invalidated:None, background:false };
         let mut result = json!({"snapshotId":"new","images":[{"imageId":"full","path":path,"snapshotId":"new","cursor":{"x":390,"y":290}}]});
         failure_detail(&mut snap, &surface, (-20,580), &mut result).unwrap();
         assert_eq!(result["images"].as_array().unwrap().len(),2);
@@ -1554,7 +1642,7 @@ mod tests {
         let shot = Shot { guard: None, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
-            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None});
+            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false});
         let foreign = run("other-owner".into(), json!({"operation":"act","snapshotId":"old"})).unwrap();
         assert_eq!(foreign["completedActions"], 0);
         assert!(foreign.get("images").is_none());
