@@ -2972,20 +2972,6 @@ export async function cancelTurn(stopReason?: string, deleteWork = false) {
   setState("running", id, false);
 }
 
-/** 手动压缩当前会话上下文（仅 Codex）：把长历史浓缩为摘要，加快后续响应。
- *  忙碌态由后端 acp:turn 事件驱动，这里乐观置位以即时反馈。 */
-export async function compactThread() {
-  const id = state.currentId;
-  if (!id || isSubagentThread(id)) return;
-  setState("running", id, true);
-  try {
-    await api.compactThread(id);
-  } catch (e) {
-    setState("running", id, false);
-    throw e;
-  }
-}
-
 export async function respondPermission(requestKey: string, optionId: string) {
   try {
     await api.respondPermission(requestKey, optionId);

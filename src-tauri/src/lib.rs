@@ -4284,35 +4284,6 @@ async fn cancel_turn(
     Ok(())
 }
 
-/// 手动压缩上下文：把当前会话历史浓缩为摘要，后续轮次仅基于摘要继续，加快长上下文响应。
-/// Codex 走原生 thread/compact/start；Devin（ACP）暂无标准压缩接口，暂不支持。
-#[tauri::command]
-async fn compact_thread(state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
-    let (is_guest, is_quota) = {
-        let store = state.store.lock().unwrap();
-        store
-            .get(&thread_id)
-            .map(|t| (t.is_roaming_guest(), t.is_quota_borrowed()))
-            .unwrap_or((false, false))
-    };
-    if is_guest {
-        return Err("漫游会话暂不支持手动压缩上下文".into());
-    }
-    if is_quota {
-        return Err("额度租借会话暂不支持手动压缩上下文".into());
-    }
-    match agent_kind_for_thread(&state, &thread_id)? {
-        AgentKind::Codex => {
-            let mgr = state.codex.clone();
-            tauri::async_runtime::spawn(async move {
-                mgr.compact(thread_id).await;
-            });
-            Ok(())
-        }
-        kind => Err(format!("{} 暂不支持手动压缩上下文", kind.label())),
-    }
-}
-
 #[tauri::command]
 async fn respond_permission(
     state: State<'_, AppState>,
@@ -5909,7 +5880,6 @@ pub fn run() {
             send_prompt,
             truncate_thread,
             cancel_turn,
-            compact_thread,
             respond_permission,
             get_settings,
             set_settings,

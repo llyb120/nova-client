@@ -5,7 +5,6 @@ import { api } from "../ipc";
 import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
 import { buildTimeNotesPrompt } from "../builtinPrompts";
 import {
-  compactThread,
   chatScrollToBottomSignal,
   createThread,
   deleteThread,
@@ -27,7 +26,7 @@ import type { AgentKind, Item, ThreadMeta, TimeMachineCheckpoint, TimeMachinePro
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
-import { IconBroadcast, IconCompress, IconCopy, IconDownload, IconFile, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
+import { IconBroadcast,IconCopy, IconDownload, IconFile, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { ShareModal } from "./ShareModal";
@@ -934,25 +933,6 @@ export function ChatView() {
         >
           {fmtTokens(shownTokens())} tokens
         </span>
-        <Show
-          when={
-            !isSubagent() &&
-            state.agentKind === "codex" &&
-            !!state.currentId &&
-            state.items.length > 0 &&
-            roamingRole() !== "guest"
-          }
-        >
-          <button
-            class="chat-compact-btn"
-            title="压缩上下文：把当前长历史浓缩为摘要，后续仅基于摘要继续，加快响应"
-            disabled={isRunning()}
-            onClick={() => void compactThread()}
-          >
-            <IconCompress size={14} />
-            压缩
-          </button>
-        </Show>
         <Show
           when={
             !!state.currentId &&

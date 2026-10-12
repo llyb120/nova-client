@@ -5125,29 +5125,6 @@ button.head-badge:hover {
   background: var(--bg-hover);
   color: var(--text);
 }
-.chat-compact-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  margin-left: 8px;
-  padding: 3px 9px;
-  border-radius: 7px;
-  font-size: 12px;
-  cursor: pointer;
-  background: transparent;
-  color: var(--text-dim);
-  border: 1px solid var(--border-light);
-  flex-shrink: 0;
-}
-.chat-compact-btn:hover:not(:disabled) {
-  background: var(--bg-hover);
-  color: var(--text);
-}
-.chat-compact-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 /* 上下文压缩分隔条（自动/手动压缩进度） */
 .compaction-divider {
   display: flex;
