@@ -40,7 +40,8 @@ test("长提示词流式重排复用换行，绘制数量仅随视口高度增�
   `)(measure);
   const wrapUserText = (...args) => { wraps++; return wrap(...args); };
   const copied = [];
-  const layout = new Function("wrapUserText", "measure", "layoutBubbleImages", "navigator", `
+  const displays = new Map();
+  const layout = new Function("wrapUserText", "measure", "layoutBubbleImages", "navigator", "promptDisplayOf", `
     const userTextLayouts = new WeakMap();
     const copiedCodeUntil = new Map(), requestPaint = () => {};
     return async (item, contentW = 800, font = 'sans', open = true) => {
@@ -57,7 +58,7 @@ test("长提示词流式重排复用换行，绘制数量仅随视口高度增�
       return block;
     };
   `)(wrapUserText, measure, () => ({ layouts: [], usedW: 0, stackH: 0, imgMaxW: 240 }),
-    { clipboard: { writeText: async text => { copied.push(text); } } });
+    { clipboard: { writeText: async text => { copied.push(text); } } }, text => displays.get(text));
   const item = { id: 1, text: "启动提示词 😀 keep all text\n".repeat(20000) };
   let block = await layout(item);
   assert.equal(wraps, 1);
@@ -92,6 +93,14 @@ test("长提示词流式重排复用换行，绘制数量仅随视口高度增�
   preview.copyFullText();
   assert.deepEqual(copied, [item.text], '折叠状态仍能复制完整原文');
   assert.equal(preview.data.editItem, item, '编辑/重发保留原始消息');
+
+  const easy = { id: 2, text: "请以快速小改动方式完成…\n\n任务：\n修复类型错误" };
+  displays.set(easy.text, "/easy 修复类型错误");
+  const folded = await layout(easy);
+  assert.equal(folded.text, "/easy 修复类型错误", "系统改写的提示词默认只显示用户输入");
+  assert.equal(folded.actions.length, 1);
+  assert.ok(folded.actions[0].text.includes("系统修改"));
+  assert.equal(folded.data.editItem, easy, "编辑/重发仍使用实际发送内容");
 });
 
 test("冷加载图片重排后使用真实尺寸且不超出气泡", () => {

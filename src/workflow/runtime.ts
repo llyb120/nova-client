@@ -7,6 +7,7 @@
  */
 import { createSignal } from "solid-js";
 import { api } from "../ipc";
+import { rememberPromptDisplay } from "../promptDisplay";
 import type { AgentKind, PromptImage, Thread, Item } from "../types";
 import { getWorkflow, isWorkflowEnabled, unregisterTransientWorkflow } from "./storage";
 import {
@@ -530,7 +531,10 @@ export function startWorkflow(
     if (h.currentId() === rootId) h.bumpScrollToBottom();
     h.clearProposedPlan();
     try {
-      await api.sendPrompt(rootId, resolvePrompt(def, entry, ctx), images);
+      const prompt = resolvePrompt(def, entry, ctx);
+      // 首节点由用户输入的目标套模板生成：会话中默认只显示该目标（仅影响显示）。
+      rememberPromptDisplay(prompt, vars.goal ?? "");
+      await api.sendPrompt(rootId, prompt, images);
     } catch (e) {
       if (activeRuns.get(rootId) === run) {
         activeRuns.delete(rootId);

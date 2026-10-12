@@ -69,6 +69,7 @@ import { latestFireStage } from "./threadDisplay";
 import { normalizeGeneratedWorkflow } from "./workflow/types";
 import { initRoamingWorkflows, setPeerWorkflows } from "./workflow/roaming";
 import { buildEasyPrompt, buildHardDesignPrompt, buildIntegrateModelPrompt, buildPlanPrompt, buildSetupImagePrompt, buildGenerateImagePrompt } from "./builtinPrompts";
+import { rememberPromptDisplay } from "./promptDisplay";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
 export type ThemePref = "ink-dark" | "ink-light";
@@ -2187,14 +2188,14 @@ function lastAssistantText(thread: Thread): string {
 }
 
 /** 第一个阶段：当前会话本身立即成为工作流设计 Stage，不再派生一个空父/设计会话。 */
-async function startHardWorkflow(threadId: string, goal: string): Promise<void> {
+async function startHardWorkflow(threadId: string, goal: string, typed: string): Promise<void> {
   const designTitle = "[Hard] 工作流设计";
   await api.renameThread(threadId, designTitle);
   setState("title", designTitle);
   setState("threads", (thread) => thread.id === threadId, "title", designTitle);
   pendingHardDesign.set(threadId, { goal });
   try {
-    await deliverPrompt(threadId, buildHardDesignPrompt(goal), []);
+    await deliverPrompt(threadId, buildHardDesignPrompt(goal), [], typed);
   } catch (error) {
     pendingHardDesign.delete(threadId);
     throw error;
@@ -2259,7 +2260,7 @@ async function tryBuiltinPrompt(
     const edit = /^\/edit-image(?:\s|$)/i.test(builtInInput);
     const goal = builtInInput.replace(/^\/(?:setup-image|generate-image|edit-image)\s*/i, "").trim();
     const context = await api.imageCommandContext(!setup, images);
-    await deliverPrompt(threadId, setup ? buildSetupImagePrompt(goal, context.configPath) : buildGenerateImagePrompt(goal, context, edit ? "edit" : "generate"), images);
+    await deliverPrompt(threadId, setup ? buildSetupImagePrompt(goal, context.configPath) : buildGenerateImagePrompt(goal, context, edit ? "edit" : "generate"), images, builtInInput);
     return true;
   }
   const stage = parseStageInput(builtInInput);
@@ -2274,26 +2275,26 @@ async function tryBuiltinPrompt(
     const goal = builtInInput.replace(/^\/plan(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /plan 后输入规划目标，例如 /plan 设计登录流程");
     // 不切入 Plan 模式：仅静默展开为「先规划、少追问」提示词，仍走 Build。
-    await deliverPrompt(threadId, buildPlanPrompt(goal), images);
+    await deliverPrompt(threadId, buildPlanPrompt(goal), images, builtInInput);
     return true;
   }
   if (/^\/easy(?:\s|$)/i.test(builtInInput)) {
     const goal = builtInInput.replace(/^\/easy(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /easy 后输入明确的小修改目标，例如 /easy 修复这个类型错误");
-    await deliverPrompt(threadId, buildEasyPrompt(goal), images);
+    await deliverPrompt(threadId, buildEasyPrompt(goal), images, builtInInput);
     return true;
   }
   if (/^\/hard(?:\s|$)/i.test(builtInInput)) {
     if (images.length > 0) throw new Error("/hard 暂不支持附件");
     const goal = builtInInput.replace(/^\/hard(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /hard 后输入目标，例如 /hard 修复登录问题并完成测试");
-    await startHardWorkflow(threadId, goal);
+    await startHardWorkflow(threadId, goal, builtInInput);
     return true;
   }
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
     if (images.length > 0) throw new Error("/fire 暂不支持附件");
     const parsed = parseFireInput(builtInInput);
-    await startFireRelay(parsed.goal, parsed.acceptanceCriteria, threadId);
+    await startFireRelay(parsed.goal, parsed.acceptanceCriteria, threadId, builtInInput);
     return true;
   }
   if (/^\/run(?:\s|$)/i.test(builtInInput)) {
@@ -2308,7 +2309,7 @@ async function tryBuiltinPrompt(
     // 让 Lyra 立刻重读配置并刷新模型列表，而不要求用户手动点「刷新配置」。
     pendingSetupConfigRefresh.add(threadId);
     try {
-      await deliverPrompt(threadId, buildIntegrateModelPrompt(goal), images);
+      await deliverPrompt(threadId, buildIntegrateModelPrompt(goal), images, builtInInput);
     } catch (error) {
       pendingSetupConfigRefresh.delete(threadId);
       throw error;
@@ -2408,9 +2409,13 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   }
 }
 
-/** 向指定会话投递普通提示词（含 Fire 阶段续跑）。不处理内置命令。一律 Build。 */
-async function deliverPrompt(threadId: string, text: string, images: PromptImage[]) {
+/**
+ * 向指定会话投递普通提示词（含 Fire 阶段续跑）。不处理内置命令。一律 Build。
+ * typed 为用户原始输入：发送内容被系统改写时，会话中默认只显示它（仅影响显示）。
+ */
+async function deliverPrompt(threadId: string, text: string, images: PromptImage[], typed = text) {
   if (isSubagentThread(threadId)) return;
+  rememberPromptDisplay(text, typed);
   // 后端 user 事件到达前先把用户刚发送的内容上屏，避免首轮仍显示“请在下方输入”。
   // applyUpsert 收到真实 user item 后会移除这个负 id 临时项。
   const optimisticId = state.currentId === threadId ? -Date.now() : null;
@@ -2449,6 +2454,7 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
     const outbound = resumedFireStep?.role === "judge"
       ? fireJudgeResumePrompt(text)
       : workflowOutbound ?? text;
+    rememberPromptDisplay(outbound, typed);
     await api.sendPrompt(threadId, outbound, images);
   } catch (e) {
     optimisticRunningThreads.delete(threadId);
@@ -2752,6 +2758,7 @@ export async function startFireRelay(
   goal: string,
   acceptanceCriteria: string | null = null,
   threadId?: string | null,
+  typed = goal,
 ) {
   const rootId = threadId ?? state.currentId;
   if (isSubagentThread(rootId)) return;
@@ -2787,7 +2794,9 @@ export async function startFireRelay(
   setState("proposedPlan", null);
   setState("running", rootId, true);
   try {
-    await api.sendPrompt(rootId, fireWorkPrompt(trimmed), []);
+    const prompt = fireWorkPrompt(trimmed);
+    rememberPromptDisplay(prompt, typed);
+    await api.sendPrompt(rootId, prompt, []);
   } catch (e) {
     if (fireRelaySteps.get(rootId) === rootStep) {
       fireRelaySteps.delete(rootId);
@@ -2801,7 +2810,7 @@ export async function startFireRelay(
 
 async function handleFireStart(threadId: string, text: string) {
   const parsed = parseFireInput(text.trim());
-  await startFireRelay(parsed.goal, parsed.acceptanceCriteria, threadId);
+  await startFireRelay(parsed.goal, parsed.acceptanceCriteria, threadId, text);
 }
 
 /** ChatView 订阅：发送新提示词时强制滚到底 */

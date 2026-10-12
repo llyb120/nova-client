@@ -15,6 +15,7 @@ import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { visibleGroupRange, groupAtY } from "../transcriptViewport";
 import { LruMap } from "../lruMap";
+import { promptDisplayOf } from "../promptDisplay";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import { resolveExpandScroll, resolveScrollAfterLayout, resolveUserScrollStick } from "../scrollStick";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
@@ -1361,9 +1362,14 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         if (item.id !== editing()?.id) {
           const maxBubble = contentW * 0.85;
           const foldKey = `user-text-${item.id}`;
-          const longText = item.text.length > 4000;
+          // 系统改写过的提示词默认只显示用户原始输入，展开后显示实际发送的完整内容。
+          const itemText = item.text;
+          const typedText = promptDisplayOf(itemText);
+          const sysKey = `user-sys-${item.id}`;
+          const sysOpen = !!state.expanded[sysKey];
+          const sourceText = typedText !== undefined && !sysOpen ? typedText : itemText;
+          const longText = sourceText.length > 4000;
           const open = !!state.expanded[foldKey];
-          const sourceText = item.text;
           // 先显示有界预览；不能为了首屏等待数十万字的隐藏内容排版。
           const text = longText && !open
             ? sourceText.slice(0, 1000).replace(/[\uD800-\uDBFF]$/, "") + "…"
@@ -1386,7 +1392,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             textLayout = { text, width: maxBubble, viewWidth: W, font: p.sans, threadId,
               // 流式重排共享进行中的排版，不能每个 delta 都取消重来。
               layout: wrapUserText(text, maxBubble - 34, p.sans,
-                () => disposed || props.threadId !== threadId || viewW !== W || item.text !== sourceText || pal.sans !== p.sans || !!state.expanded[foldKey] !== open) };
+                () => disposed || props.threadId !== threadId || viewW !== W || item.text !== itemText || pal.sans !== p.sans || !!state.expanded[foldKey] !== open || !!state.expanded[sysKey] !== sysOpen) };
             userTextLayouts.set(item, textLayout);
           }
           const full = await textLayout.layout;
@@ -1414,9 +1420,21 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             _lineWidths: full.widths,
             data: { images: item.images, editItem: item, imageLayouts, imgMaxW } });
 
+          let belowH = 0;
+          if (typedText !== undefined) {
+            const sysLabel = sysOpen ? "收起系统修改内容" : "该提示词经过系统修改，展开查看完整内容";
+            // 文字 + chevron + 左右内边距；短气泡时右对齐，避免提示超出内容区右缘。
+            const sysW = measure(sysLabel, 13, p.sans) + 34;
+            result.push({ kind: "fold", id: item.id, groupIdx: gi,
+              x: Math.max(side, Math.min(bx, side + contentW - sysW)), y: y + bubbleH + 4, w: sysW, h: 28,
+              text: sysLabel, color: p.dim, fontSize: 13, font: p.sans, cursor: "pointer",
+              hoverBg: p.hover, borderRadius: 6, data: { open: sysOpen, foldKey: sysKey, userText: true },
+              clickAction: () => toggleExpanded(sysKey, !sysOpen) });
+            belowH += 32;
+          }
           if (longText) {
             const toggle: Block = { kind: "fold", id: item.id, groupIdx: gi,
-              x: bx, y: y + bubbleH + 4, w: Math.max(1, bubbleW - 32), h: 28,
+              x: bx, y: y + bubbleH + 4 + belowH, w: Math.max(1, bubbleW - 32), h: 28,
               text: open ? "收起长提示词" : `展开完整提示词（${fmtTokens(sourceText.length)} 字符）`,
               color: p.dim, fontSize: 13, font: p.sans, cursor: "pointer",
               hoverBg: p.hover, borderRadius: 6, data: { open, foldKey, userText: true },
@@ -1428,7 +1446,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               } };
             result.push(toggle);
             result.push({ kind: "code-copy-btn", id: item.id, groupIdx: gi,
-              x: bx + bubbleW - 24, y: y + bubbleH + 6, w: 24, h: 24, hoverKey: `user-${item.id}`,
+              x: bx + bubbleW - 24, y: y + bubbleH + 6 + belowH, w: 24, h: 24, hoverKey: `user-${item.id}`,
               data: { alwaysVisible: true },
               cursor: "pointer", title: "复制完整提示词", hoverBg: p.hover, borderRadius: 6,
               clickAction: () => {
@@ -1459,7 +1477,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
                 setEditing(item);
               } });
           }
-          y += bubbleH + (longText ? 36 : 0);
+          if (longText) belowH += 32;
+          y += bubbleH + (belowH ? belowH + 4 : 0);
           setBottom(16); // bottom margin
         } else {
           editLayoutY = y;
