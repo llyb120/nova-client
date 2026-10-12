@@ -1696,10 +1696,10 @@ export function SettingsModal(props: { onClose: () => void }) {
                     checked={taskbarStatusEnabled()}
                     onChange={(e) => setTaskbarStatusEnabled(e.currentTarget.checked)}
                   />
-                  <span>Windows 后台任务栏提示（实验）</span>
+                  <span>Windows 任务栏灵动岛（实验）</span>
                 </label>
                 <span class="field-hint">
-                  主窗口在后台时，在 Windows 任务栏可识别的空闲区域显示任务状态；不创建桌面悬浮窗。默认关闭；保存后即时生效。
+                  开启后常驻 Windows 任务栏空闲区域：运行中显示当前动作与耗时，待确认时提醒，结束后显示结论；悬停看详情，点击打开对应会话。默认关闭；保存后即时生效。
                 </span>
               </div>
               <div class="field">

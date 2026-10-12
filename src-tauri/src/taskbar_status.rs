@@ -126,46 +126,148 @@ fn tool_label(call: &crate::threads::ToolCall) -> String {
     }.to_string()
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind { Idle, Running, Waiting, Done, Error }
+
+/// One frame of the island: a glanceable line, hover detail and the thread a click opens.
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Status {
+    pub kind: Kind,
+    pub text: String,
+    pub trailing: String,
+    pub detail: String,
+    pub thread: Option<String>,
+}
+
+#[cfg(any(windows, test))]
+impl Status {
+    fn new(kind: Kind, text: String, trailing: String, detail: &[&str], thread: Option<String>) -> Self {
+        let detail = detail.iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join("\n");
+        Self { kind, text, trailing, detail, thread }
+    }
+
+    /// Accessible name / window text.
+    pub fn title(&self) -> String {
+        if self.trailing.is_empty() { format!("Nova · {}", self.text) } else { format!("Nova · {} · {}", self.text, self.trailing) }
+    }
+}
+
 #[cfg(windows)]
-fn snapshot(app: &tauri::AppHandle) -> Option<String> {
+fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
     use crate::threads::Item;
     use tauri::Manager;
     let state = app.state::<crate::AppState>();
+    // Enabled = always visible, foreground or not.
     if !state.settings.lock().ok()?.taskbar_status_enabled {
         return None;
     }
-    if app.get_window("main").is_some_and(|w| w.is_focused().unwrap_or(false)) {
-        return None;
-    }
-    if let Some(activity) = *ACTIVITY.lock().ok()? {
-        return Some(format!("Nova · 剑来 · {activity}"));
-    }
-    let permissions = state.remote_permissions.lock().ok()?.len();
-    if permissions > 0 {
-        return Some(format!("Nova · {permissions} 项待确认"));
+    let now = crate::threads::now_ms();
+    let desktop = *ACTIVITY.lock().ok()?;
+    let waiting: Vec<Option<String>> = state.remote_permissions.lock().ok()?.values()
+        .map(|v| v["threadId"].as_str().map(str::to_string)).collect();
+    if desktop.is_none() && !waiting.is_empty() {
+        let text = format!("{} 项待你确认", waiting.len());
+        return Some(Status::new(Kind::Waiting, text, String::new(), &["有操作等待你确认", "点击前往处理"], waiting.into_iter().flatten().next()));
     }
     // ponytail: scan thread headers once per refresh, not transcripts; if histories grow large,
     // replace this with a running-id index maintained by the shared runtime.
     let store = state.store.lock().ok()?;
-    let mut running = store.threads.iter().filter(|t| crate::is_running(&state, t));
-    let mut newest = running.next()?;
-    let mut count = 1;
-    for thread in running {
-        count += 1;
-        if thread.updated_at > newest.updated_at { newest = thread; }
+    let running: Vec<_> = store.threads.iter().filter(|t| crate::is_running(&state, t)).collect();
+    if let Some(thread) = running.iter().max_by_key(|t| t.updated_at) {
+        let turn = || thread.items.iter().rev().take_while(|item| !matches!(item, Item::User { .. } | Item::Turn { .. }));
+        let activity = match desktop {
+            Some(activity) => format!("剑来 · {activity}"),
+            None => turn().find_map(|item| match item {
+                Item::Tool { call, .. } if matches!(call.status.as_str(), "pending" | "in_progress") => Some(tool_label(call)),
+                _ => None,
+            }).unwrap_or_else(|| match turn().next() {
+                Some(Item::Thought { .. }) => "正在思考",
+                Some(Item::Assistant { .. }) => "正在回复",
+                _ => "正在处理",
+            }.into()),
+        };
+        let started = thread.items.iter().rev().find_map(|item| match item { Item::User { ts, .. } => Some(*ts), _ => None });
+        let text = if running.len() > 1 { format!("{} 项 · {activity}", running.len()) } else { activity.clone() };
+        let trailing = started.map(|t| elapsed(now - t)).unwrap_or_default();
+        return Some(Status::new(Kind::Running, text, trailing, &[&thread.title, &activity, "点击查看进度"], Some(thread.id.clone())));
     }
-    let activity = newest.items.iter().rev()
-        .take_while(|item| !matches!(item, Item::User { .. } | Item::Turn { .. }))
+    if let Some(activity) = desktop {
+        return Some(Status::new(Kind::Running, format!("剑来 · {activity}"), String::new(), &["Nova 正在操作桌面"], None));
+    }
+    let Some(thread) = store.threads.iter().filter(|t| !t.items.is_empty()).max_by_key(|t| t.updated_at) else {
+        return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Nova", "点击打开"], None));
+    };
+    // The last turn's final reply (or error) is the conclusion.
+    let (kind, body) = thread.items.iter().rev()
+        .take_while(|item| !matches!(item, Item::User { .. }))
         .find_map(|item| match item {
-            Item::Tool { call, .. } if matches!(call.status.as_str(), "pending" | "in_progress") => Some(tool_label(call)),
+            Item::Assistant { text, .. } if conclusion(text).is_some() => Some((Kind::Done, text.as_str())),
+            Item::System { text, level, .. } if level == "error" => Some((Kind::Error, text.as_str())),
             _ => None,
-        }).unwrap_or_else(|| "正在处理".into());
-    Some(if count > 1 { format!("Nova · {count} 项 · {activity}") } else { format!("Nova · {activity}") })
+        }).unwrap_or((Kind::Done, ""));
+    let text = conclusion(body).unwrap_or_else(|| if kind == Kind::Error { "任务出错" } else { "已完成" }.into());
+    Some(Status::new(kind, text, ago(now - thread.updated_at), &[&thread.title, &excerpt(body, 240), "点击打开会话"], Some(thread.id.clone())))
+}
+
+/// Non-empty lines with common markdown decoration removed.
+#[cfg(any(windows, test))]
+fn plain_lines(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.lines()
+        .map(|l| l.trim().trim_start_matches(['#', '>', '-', '*', '|', ' ']).replace("**", "").replace('`', "").trim().to_string())
+        .filter(|l| !l.is_empty())
+}
+
+#[cfg(any(windows, test))]
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() > max { text.chars().take(max).chain(Some('…')).collect() } else { text.to_string() }
+}
+
+/// First meaningful line of the final reply, capped for the small chip.
+#[cfg(any(windows, test))]
+fn conclusion(text: &str) -> Option<String> {
+    plain_lines(text).next().map(|line| clip(&line, 60))
+}
+
+/// A few leading lines for the hover tooltip.
+#[cfg(any(windows, test))]
+fn excerpt(text: &str, max: usize) -> String {
+    clip(&plain_lines(text).take(6).collect::<Vec<_>>().join("\n"), max)
+}
+
+#[cfg(any(windows, test))]
+fn elapsed(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
+}
+
+#[cfg(any(windows, test))]
+fn ago(ms: i64) -> String {
+    match ms.max(0) / 1000 {
+        s if s < 60 => "刚刚".into(),
+        s if s < 3600 => format!("{} 分钟前", s / 60),
+        s if s < 86400 => format!("{} 小时前", s / 3600),
+        s => format!("{} 天前", s / 86400),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conclusion_takes_first_plain_line_and_truncates() {
+        assert_eq!(conclusion("\n## **完成** 修复了 `foo`\n细节").as_deref(), Some("完成 修复了 foo"));
+        assert_eq!(conclusion("  \n```\n"), None);
+        assert_eq!(conclusion(&"字".repeat(80)).unwrap().chars().count(), 61);
+        assert_eq!(excerpt("# 结论\n\n- 一\n- 二", 240), "结论\n一\n二");
+        assert_eq!(elapsed(83_000), "1:23");
+        assert_eq!(elapsed(3_723_000), "1:02:03");
+        assert_eq!((ago(5_000), ago(180_000), ago(7_200_000)), ("刚刚".into(), "3 分钟前".into(), "2 小时前".into()));
+        let status = Status::new(Kind::Done, "好".into(), "刚刚".into(), &["标题", "", "点击"], None);
+        assert_eq!((status.title().as_str(), status.detail.as_str()), ("Nova · 好 · 刚刚", "标题\n点击"));
+    }
 
     #[test]
     fn taskbar_slot_preserves_controls_and_handles_negative_monitor_coordinates() {

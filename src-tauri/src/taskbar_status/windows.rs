@@ -1,8 +1,9 @@
 //! A real Explorer child, never a floating window or a taskbar layout modification.
 //! UIA lives on a separate MTA: querying our own HWND on the message thread deadlocks.
 
-use super::{free_slot, snapshot, Rect};
+use super::{free_slot, snapshot, Kind, Rect, Status};
 use std::{
+    cell::{Cell, RefCell},
     ptr::{null, null_mut},
     sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex, OnceLock},
     thread,
@@ -19,10 +20,17 @@ use windows::{
 use windows_sys::{
     core::w,
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED}, Gdi::*},
         System::LibraryLoader::GetModuleHandleW,
-        UI::{HiDpi::*, Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE}, WindowsAndMessaging::*},
+        UI::{
+            Controls::{
+                InitCommonControlsEx, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR, NMTTDISPINFOW,
+                TOOLTIPS_CLASSW, TTDT_AUTOPOP, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETDELAYTIME,
+                TTM_SETMAXTIPWIDTH, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+            },
+            HiDpi::*, Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE}, WindowsAndMessaging::*,
+        },
     },
 };
 
@@ -34,6 +42,15 @@ static THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
 const REFRESH: u32 = WM_APP + 1;
 const WM_MOUSELEAVE: u32 = 0x02A3; // Win32 Controls message paired with TME_LEAVE.
 static LAYOUT: Mutex<Option<Arc<Layout>>> = Mutex::new(None);
+const ANIMATION: usize = 1;
+
+// Everything below is touched only by the status message thread (refresh + window_proc).
+thread_local! {
+    static CURRENT: RefCell<Option<Status>> = const { RefCell::new(None) };
+    static TIP: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
+    static TOOLTIP: Cell<usize> = const { Cell::new(0) };
+    static EPOCH: Instant = Instant::now();
+}
 
 struct Layout {
     parent: usize,
@@ -179,7 +196,7 @@ unsafe fn query_layout() -> Option<Layout> {
         return None;
     }
     let dpi = GetDpiForWindow(parent) as i32;
-    let slot = pill_slot(free_slot(taskbar, &occupied, 240 * dpi / 96, 160 * dpi / 96, 6 * dpi / 96)?, dpi);
+    let slot = pill_slot(free_slot(taskbar, &occupied, 300 * dpi / 96, 160 * dpi / 96, 6 * dpi / 96)?, dpi);
     if !same_rect(&taskbar, &taskbar_rect(parent)?) || FindWindowW(w!("Shell_TrayWnd"), null()) != parent {
         return None;
     }
@@ -237,6 +254,8 @@ unsafe fn message_loop() {
     let instance = GetModuleHandleW(null());
     let class = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: instance, lpszClassName: CLASS, hCursor: LoadCursorW(null_mut(), IDC_HAND), ..Default::default() };
     if RegisterClassW(&class) == 0 { return; }
+    let controls = INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_WIN95_CLASSES };
+    InitCommonControlsEx(&controls);
     let timer = SetTimer(null_mut(), 0, 250, None);
     if timer == 0 { UnregisterClassW(CLASS, instance); return; }
     if let Err(error) = thread::Builder::new().name("nova-taskbar-layout".into()).spawn(|| unsafe { layout_worker() }) {
@@ -246,11 +265,11 @@ unsafe fn message_loop() {
         return;
     }
     THREAD.store(windows_sys::Win32::System::Threading::GetCurrentThreadId(), Ordering::Release);
-    let mut text = String::new();
+    let mut shown = None;
     let mut message = MSG::default();
     while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
         if message.hwnd.is_null() && (message.message == REFRESH || (message.message == WM_TIMER && message.wParam == timer)) {
-            refresh(&mut text);
+            refresh(&mut shown);
         } else {
             TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -263,7 +282,7 @@ unsafe fn message_loop() {
     UnregisterClassW(CLASS, instance);
 }
 
-unsafe fn refresh(text: &mut String) {
+unsafe fn refresh(shown: &mut Option<Status>) {
     let mut hwnd = WINDOW.load(Ordering::Acquire) as HWND;
     let summary = APP.get().and_then(snapshot);
     let layout = LAYOUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -294,13 +313,16 @@ unsafe fn refresh(text: &mut String) {
         SetThreadDpiAwarenessContext(previous);
         if hwnd.is_null() { return; }
         WINDOW.store(hwnd as usize, Ordering::Release);
-        text.clear();
+        *shown = None;
+        attach_tooltip(hwnd);
     }
-    let title = summary;
-    if *text != title {
-        let wide: Vec<u16> = title.chars().take(500).collect::<String>().encode_utf16().chain(Some(0)).collect();
+    if shown.as_ref() != Some(&summary) {
+        let wide: Vec<u16> = summary.title().chars().take(500).collect::<String>().encode_utf16().chain(Some(0)).collect();
         if SetWindowTextW(hwnd, wide.as_ptr()) == 0 { ShowWindow(hwnd, SW_HIDE); return; }
-        *text = title;
+        // Only live states breathe; settled states cost no repaints.
+        if matches!(summary.kind, Kind::Running | Kind::Waiting) { SetTimer(hwnd, ANIMATION, 40, None); } else { KillTimer(hwnd, ANIMATION); }
+        CURRENT.with(|current| *current.borrow_mut() = Some(summary.clone()));
+        *shown = Some(summary);
         InvalidateRect(hwnd, null(), 0);
     }
     let current = window_rect(hwnd);
@@ -333,38 +355,65 @@ struct Palette {
     border: u32,
     text: u32,
     muted: u32,
-    accent: u32,
 }
 
 const fn rgb(r: u32, g: u32, b: u32) -> u32 { r | (g << 8) | (b << 16) }
 
-fn palette(light: bool, hover: bool) -> Palette {
-    if light {
-        Palette {
-            background: if hover { rgb(225, 235, 249) } else { rgb(241, 245, 251) },
-            border: rgb(198, 211, 229), text: rgb(28, 40, 58),
-            muted: rgb(79, 99, 124), accent: rgb(35, 108, 214),
-        }
-    } else {
-        Palette {
-            background: if hover { rgb(51, 59, 71) } else { rgb(38, 43, 51) },
-            border: rgb(65, 75, 89), text: rgb(237, 242, 250),
-            muted: rgb(168, 184, 205), accent: rgb(112, 178, 255),
-        }
+/// Dynamic-Island look: the same near-black pill on light and dark taskbars.
+fn palette(hover: bool) -> Palette {
+    Palette {
+        background: if hover { rgb(40, 40, 44) } else { rgb(16, 16, 18) },
+        border: rgb(58, 58, 64), text: rgb(245, 245, 247), muted: rgb(152, 152, 160),
     }
 }
 
-unsafe fn paint_chip(hwnd: HWND, dc: HDC, mut rect: RECT) {
+/// State colour of the leading indicator (Apple system palette).
+fn signal(kind: Kind) -> u32 {
+    match kind {
+        Kind::Running => rgb(10, 132, 255),
+        Kind::Waiting => rgb(255, 159, 10),
+        Kind::Done => rgb(48, 209, 88),
+        Kind::Error => rgb(255, 69, 58),
+        Kind::Idle => rgb(142, 142, 147),
+    }
+}
+
+/// GDI has no alpha: blend by hand.
+fn mix(a: u32, b: u32, t: f64) -> u32 {
+    let channel = |shift: u32| {
+        let (x, y) = (((a >> shift) & 255) as f64, ((b >> shift) & 255) as f64);
+        ((x + (y - x) * t).round().clamp(0.0, 255.0) as u32) << shift
+    };
+    channel(0) | channel(8) | channel(16)
+}
+
+unsafe fn dot(dc: HDC, x: i32, y: i32, r: i32, color: u32) {
+    let brush = CreateSolidBrush(color);
+    let old_brush = SelectObject(dc, brush);
+    let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+    Ellipse(dc, x - r, y - r, x + r + 1, y + r + 1);
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+    DeleteObject(brush);
+}
+
+unsafe fn stroke(dc: HDC, points: &[POINT], width: i32, color: u32) {
+    let pen = CreatePen(PS_SOLID, width, color);
+    let old_pen = SelectObject(dc, pen);
+    Polyline(dc, points.as_ptr(), points.len() as i32);
+    SelectObject(dc, old_pen);
+    DeleteObject(pen);
+}
+
+unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     let dpi = GetDpiForWindow(hwnd).max(96) as i32;
-    let px = |n| n * dpi / 96;
+    let px = |n: i32| n * dpi / 96;
     let mut cursor = POINT::default();
     let hover = GetCursorPos(&mut cursor) != 0 && WindowFromPoint(cursor) == hwnd;
-    // Taskbar follows the Windows (not app) theme. Fall back to the usual dark shell.
-    let light = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
-        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
-        .and_then(|key| key.get_value::<u32, _>("SystemUsesLightTheme"))
-        .unwrap_or(0) != 0;
-    let mut colors = palette(light, hover);
+    let status = CURRENT.with(|current| current.borrow().clone());
+    let kind = status.as_ref().map_or(Kind::Idle, |s| s.kind);
+    let mut colors = palette(hover);
+    let mut accent = signal(kind);
     let mut contrast = HIGHCONTRASTW { cbSize: size_of::<HIGHCONTRASTW>() as u32, ..Default::default() };
     if SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.cbSize, &mut contrast as *mut _ as _, 0) != 0
         && contrast.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0
@@ -374,10 +423,10 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, mut rect: RECT) {
             border: GetSysColor(COLOR_BTNTEXT),
             text: GetSysColor(if hover { COLOR_HIGHLIGHTTEXT } else { COLOR_BTNTEXT }),
             muted: GetSysColor(if hover { COLOR_HIGHLIGHTTEXT } else { COLOR_BTNTEXT }),
-            accent: GetSysColor(if hover { COLOR_HIGHLIGHTTEXT } else { COLOR_BTNTEXT }),
         };
+        accent = colors.text;
     }
-    // Buffer the small native child so status changes/hover never flash a grey rectangle.
+    // Buffer the small native child so status changes/animation never flash a grey rectangle.
     let buffer = CreateCompatibleDC(dc);
     let bitmap = CreateCompatibleBitmap(dc, rect.right, rect.bottom);
     let buffered = !buffer.is_null() && !bitmap.is_null();
@@ -394,40 +443,54 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, mut rect: RECT) {
     DeleteObject(pen);
     DeleteObject(brush);
 
+    // Leading indicator: breathing while live, a glyph once settled.
+    let (cx, cy) = (px(17), rect.bottom / 2);
+    match kind {
+        Kind::Running | Kind::Waiting => {
+            let phase = (EPOCH.with(|e| e.elapsed().as_secs_f64()) * std::f64::consts::TAU / 1.4).sin() * 0.5 + 0.5;
+            dot(target, cx, cy, px(4) + (phase * px(3) as f64) as i32, mix(colors.background, accent, 0.5 - 0.35 * phase));
+            dot(target, cx, cy, px(3), accent);
+        }
+        Kind::Done | Kind::Error => {
+            dot(target, cx, cy, px(7), accent);
+            let width = px(2).max(1);
+            if kind == Kind::Done {
+                let check = [POINT { x: cx - px(3), y: cy }, POINT { x: cx - px(1), y: cy + px(2) }, POINT { x: cx + px(3), y: cy - px(2) }];
+                stroke(target, &check, width, colors.background);
+            } else {
+                stroke(target, &[POINT { x: cx, y: cy - px(4) }, POINT { x: cx, y: cy + px(1) }], width, colors.background);
+                dot(target, cx, cy + px(3), px(1), colors.background);
+            }
+        }
+        Kind::Idle => dot(target, cx, cy, px(3), accent),
+    }
+
     SetBkMode(target, TRANSPARENT as i32);
-    let accent = CreateSolidBrush(colors.accent);
-    let old_brush = SelectObject(target, accent);
-    let old_pen = SelectObject(target, GetStockObject(NULL_PEN));
-    let middle = rect.bottom / 2;
-    Ellipse(target, px(12), middle - px(3), px(18), middle + px(3));
-    SelectObject(target, old_pen);
-    SelectObject(target, old_brush);
-    DeleteObject(accent);
-
     let font = CreateFontW(-px(12), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, w!("Segoe UI"));
-    let brand_font = CreateFontW(-px(12), 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, w!("Segoe UI"));
+    let small = CreateFontW(-px(11), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, w!("Segoe UI"));
     let old_font = SelectObject(target, GetStockObject(DEFAULT_GUI_FONT));
-    if !brand_font.is_null() { SelectObject(target, brand_font); }
-    SetTextColor(target, colors.muted);
-    let mut brand = RECT { left: px(26), right: px(62), ..rect };
-    DrawTextW(target, w!("Nova"), 4, &mut brand, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-    let separator = CreateSolidBrush(colors.border);
-    FillRect(target, &RECT { left: px(66), right: px(67), top: middle - px(5), bottom: middle + px(5) }, separator);
-    DeleteObject(separator);
-
+    let (text, trailing) = status.map_or_else(Default::default, |s| (s.text, s.trailing));
+    let left = px(32);
+    let mut right = rect.right - px(12);
+    if !trailing.is_empty() {
+        // Trailing info (elapsed / finished-ago) is right-aligned and never truncated.
+        if !small.is_null() { SelectObject(target, small); }
+        SetTextColor(target, colors.muted);
+        let wide: Vec<u16> = trailing.encode_utf16().collect();
+        let mut size = SIZE::default();
+        GetTextExtentPoint32W(target, wide.as_ptr(), wide.len() as i32, &mut size);
+        let mut area = RECT { left, right, ..rect };
+        DrawTextW(target, wide.as_ptr(), wide.len() as i32, &mut area, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+        right -= size.cx + px(8);
+    }
     SelectObject(target, if font.is_null() { GetStockObject(DEFAULT_GUI_FONT) } else { font });
     SetTextColor(target, colors.text);
-    let mut title = [0u16; 1024];
-    let length = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32).max(0) as usize;
-    let title = String::from_utf16_lossy(&title[..length]);
-    // Keep the full window title for accessibility; the brand is already drawn separately.
-    let status: Vec<u16> = title.strip_prefix("Nova · ").unwrap_or(&title).encode_utf16().collect();
-    rect.left = px(77);
-    rect.right -= px(12);
-    DrawTextW(target, status.as_ptr(), status.len() as i32, &mut rect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut area = RECT { left, right: right.max(left), ..rect };
+    DrawTextW(target, wide.as_ptr(), wide.len() as i32, &mut area, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     SelectObject(target, old_font);
     if !font.is_null() { DeleteObject(font); }
-    if !brand_font.is_null() { DeleteObject(brand_font); }
+    if !small.is_null() { DeleteObject(small); }
     if buffered {
         let mut client = RECT::default();
         GetClientRect(hwnd, &mut client);
@@ -438,12 +501,48 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, mut rect: RECT) {
     if !buffer.is_null() { DeleteDC(buffer); }
 }
 
+/// Hover detail (thread title + conclusion excerpt), filled lazily from CURRENT.
+unsafe fn attach_tooltip(hwnd: HWND) {
+    let tip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, TOOLTIPS_CLASSW, null(), WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, null_mut(), null_mut(), GetModuleHandleW(null()), null());
+    if tip.is_null() { return; }
+    let info = TTTOOLINFOW {
+        cbSize: size_of::<TTTOOLINFOW>() as u32, uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+        hwnd, uId: hwnd as usize, lpszText: usize::MAX as *mut u16, // LPSTR_TEXTCALLBACKW
+        ..Default::default()
+    };
+    SendMessageW(tip, TTM_ADDTOOLW, 0, &info as *const _ as LPARAM);
+    SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, (360 * GetDpiForWindow(hwnd).max(96) / 96) as LPARAM);
+    SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP as WPARAM, 30_000);
+    TOOLTIP.with(|t| t.set(tip as usize));
+}
+
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONUP => {
-            ShowWindow(hwnd, SW_HIDE);
-            if let Some(app) = APP.get() { crate::sys_notify::focus_main_window(app); }
+            // Like a notification click: bring Nova forward on the thread the island is about.
+            if let Some(app) = APP.get() {
+                crate::sys_notify::focus_main_window(app);
+                if let Some(thread) = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone())) {
+                    use tauri::Emitter;
+                    let _ = app.emit(crate::acp::EV_NOTIFY_OPEN, serde_json::json!({ "threadId": thread }));
+                }
+            }
+            0
+        }
+        WM_TIMER if wparam == ANIMATION => {
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_NOTIFY if (*(lparam as *const NMHDR)).code == TTN_GETDISPINFOW => {
+            let info = &mut *(lparam as *mut NMTTDISPINFOW);
+            let detail = CURRENT.with(|c| c.borrow().as_ref().map(|s| s.detail.clone()).unwrap_or_default());
+            TIP.with(|tip| {
+                let mut tip = tip.borrow_mut();
+                *tip = detail.encode_utf16().chain(Some(0)).collect();
+                info.lpszText = tip.as_mut_ptr();
+            });
             0
         }
         WM_SIZE => {
@@ -476,6 +575,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             EndPaint(hwnd, &paint);
             0
         }
+        WM_DESTROY => {
+            // The tooltip is an unowned popup; it does not die with us.
+            let tip = TOOLTIP.with(|t| t.replace(0)) as HWND;
+            if !tip.is_null() { DestroyWindow(tip); }
+            0
+        }
         WM_NCDESTROY => {
             let _ = WINDOW.compare_exchange(hwnd as usize, 0, Ordering::AcqRel, Ordering::Acquire);
             DefWindowProcW(hwnd, message, wparam, lparam)
@@ -503,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn chip_text_meets_normal_text_contrast_in_both_themes_and_hover() {
+    fn chip_text_meets_normal_text_contrast_with_and_without_hover() {
         fn luminance(color: u32) -> f64 {
             let channel = |shift| {
                 let value = ((color >> shift) & 255u32) as f64 / 255.0;
@@ -511,16 +616,15 @@ mod tests {
             };
             0.2126 * channel(0) + 0.7152 * channel(8) + 0.0722 * channel(16)
         }
-        for light in [false, true] {
-            for hover in [false, true] {
-                let colors = palette(light, hover);
-                for text in [colors.text, colors.muted] {
-                    let a = luminance(text);
-                    let b = luminance(colors.background);
-                    assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5);
-                }
+        for hover in [false, true] {
+            let colors = palette(hover);
+            for text in [colors.text, colors.muted] {
+                let a = luminance(text);
+                let b = luminance(colors.background);
+                assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5);
             }
         }
+        assert_eq!(mix(rgb(0, 0, 0), rgb(200, 100, 50), 0.5), rgb(100, 50, 25));
     }
 
     #[test]
