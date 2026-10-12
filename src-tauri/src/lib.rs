@@ -5800,6 +5800,8 @@ pub fn run() {
             taskbar_status::taskbar_bubble_place,
             taskbar_status::taskbar_bubble_hide,
             taskbar_status::taskbar_bubble_open,
+            taskbar_status::taskbar_bubble_dismiss,
+            taskbar_status::taskbar_bubble_reply,
             employee::employee_get,
             employee::employee_set,
             employee::employee_do,

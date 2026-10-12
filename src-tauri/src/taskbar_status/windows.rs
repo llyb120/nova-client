@@ -29,7 +29,7 @@ use windows_sys::{
                 TOOLTIPS_CLASSW, TTDT_AUTOPOP, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETDELAYTIME,
                 TTM_SETMAXTIPWIDTH, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
             },
-            HiDpi::*, Input::KeyboardAndMouse::{GetDoubleClickTime, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE}, WindowsAndMessaging::*,
+            HiDpi::*, Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE}, WindowsAndMessaging::*,
         },
     },
 };
@@ -43,8 +43,6 @@ const REFRESH: u32 = WM_APP + 1;
 const WM_MOUSELEAVE: u32 = 0x02A3; // Win32 Controls message paired with TME_LEAVE.
 static LAYOUT: Mutex<Option<Arc<Layout>>> = Mutex::new(None);
 const ANIMATION: usize = 1;
-/// Single click waits out the double-click time before opening the bubble.
-const CLICK: usize = 2;
 
 // Everything below is touched only by the status message thread (refresh + window_proc).
 thread_local! {
@@ -56,6 +54,16 @@ thread_local! {
     static CLOSING: Cell<bool> = const { Cell::new(false) };
     /// The button-up that ends a double click must not start a bubble.
     static DOUBLE: Cell<bool> = const { Cell::new(false) };
+    /// Taskbar theme the chip was last painted for.
+    static LIGHT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Windows' own taskbar/Start theme (not the app theme). Missing on old Windows 10: dark.
+pub(super) fn light_theme() -> bool {
+    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|key| key.get_value::<u32, _>("SystemUsesLightTheme"))
+        .is_ok_and(|light| light != 0)
 }
 
 /// Tauri window calls round-trip through the main thread; never block Explorer's child on them.
@@ -81,6 +89,12 @@ unsafe fn anchor(hwnd: HWND) -> Option<super::bubble::Anchor> {
     })();
     SetThreadDpiAwarenessContext(previous);
     result
+}
+
+/// The visible chip's anchor, for a bubble no click asked for.
+pub(super) fn chip_anchor() -> Option<super::bubble::Anchor> {
+    let hwnd = WINDOW.load(Ordering::Acquire) as HWND;
+    unsafe { if hwnd.is_null() || IsWindowVisible(hwnd) == 0 { None } else { anchor(hwnd) } }
 }
 
 struct Layout {
@@ -344,7 +358,7 @@ unsafe fn refresh(shown: &mut Option<Status>) {
         // child never reaches the screen. A layered child (Windows 8+, declared in the app
         // manifest) gets its own surface; fall back to a plain child if the host refuses it.
         // Windows 10's GDI taskbar never shows a layered child: keep it on the plain child.
-        let create = |ex| CreateWindowExW(ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, CLASS, w!("Nova taskbar status"), WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 0, 0, parent, null_mut(), GetModuleHandleW(null()), null());
+        let create = |ex| CreateWindowExW(ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, CLASS, w!("Nova Butterfly"), WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 0, 0, parent, null_mut(), GetModuleHandleW(null()), null());
         let mut os = OSVERSIONINFOW { dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32, ..Default::default() };
         // The manifest's Windows 10 declaration makes this report the real build (11 = 22000+).
         if GetVersionExW(&mut os) != 0 && os.dwBuildNumber >= 22000 { hwnd = create(WS_EX_LAYERED); }
@@ -358,6 +372,8 @@ unsafe fn refresh(shown: &mut Option<Status>) {
         WINDOW.store(hwnd as usize, Ordering::Release);
         *shown = None;
         attach_tooltip(hwnd);
+        // Warm the bubble webview now: clicks open at once and pops can't wait for a cold build.
+        on_app(|app| { super::bubble::window(app); });
     }
     if shown.as_ref() != Some(&summary) {
         let wide: Vec<u16> = summary.title().chars().take(500).collect::<String>().encode_utf16().chain(Some(0)).collect();
@@ -368,6 +384,10 @@ unsafe fn refresh(shown: &mut Option<Status>) {
         *shown = Some(summary);
         InvalidateRect(hwnd, null(), 0);
     }
+    // A child of the taskbar never sees the top-level WM_SETTINGCHANGE broadcast, so follow a
+    // light/dark switch on the refresh tick (one small registry read).
+    let light = light_theme();
+    if LIGHT.with(|l| l.replace(light)) != light { InvalidateRect(hwnd, null(), 0); }
     let current = window_rect(hwnd);
     if IsWindowVisible(hwnd) == 0 || !current.as_ref().is_some_and(|r| same_rect(r, &layout.slot)) {
         // UIA rectangles are physical; child placement is in its parent's client units.
@@ -402,22 +422,34 @@ struct Palette {
 
 const fn rgb(r: u32, g: u32, b: u32) -> u32 { r | (g << 8) | (b << 16) }
 
-/// Dynamic-Island look: the same near-black pill on light and dark taskbars.
-fn palette(hover: bool) -> Palette {
-    Palette {
-        background: if hover { rgb(40, 40, 44) } else { rgb(16, 16, 18) },
-        border: rgb(58, 58, 64), text: rgb(245, 245, 247), muted: rgb(152, 152, 160),
+/// Butterfly pill matching the taskbar theme: a near-black chip on dark, a white card on light.
+fn palette(light: bool, hover: bool) -> Palette {
+    if light {
+        Palette {
+            background: if hover { rgb(240, 240, 242) } else { rgb(252, 252, 252) },
+            border: rgb(222, 222, 226), text: rgb(26, 26, 26), muted: rgb(96, 96, 96),
+        }
+    } else {
+        Palette {
+            background: if hover { rgb(40, 40, 44) } else { rgb(16, 16, 18) },
+            border: rgb(58, 58, 64), text: rgb(245, 245, 247), muted: rgb(152, 152, 160),
+        }
     }
 }
 
-/// State colour of the leading indicator (Apple system palette).
-fn signal(kind: Kind) -> u32 {
-    match kind {
-        Kind::Running => rgb(10, 132, 255),
-        Kind::Waiting => rgb(255, 159, 10),
-        Kind::Done => rgb(48, 209, 88),
-        Kind::Error => rgb(255, 69, 58),
-        Kind::Idle => rgb(142, 142, 147),
+/// State colour of the leading indicator: Apple's dark palette, Windows 11's light semantic colours.
+fn signal(light: bool, kind: Kind) -> u32 {
+    match (kind, light) {
+        (Kind::Running, false) => rgb(10, 132, 255),
+        (Kind::Waiting, false) => rgb(255, 159, 10),
+        (Kind::Done, false) => rgb(48, 209, 88),
+        (Kind::Error, false) => rgb(255, 69, 58),
+        (Kind::Idle, false) => rgb(142, 142, 147),
+        (Kind::Running, true) => rgb(0, 95, 184),
+        (Kind::Waiting, true) => rgb(157, 93, 0),
+        (Kind::Done, true) => rgb(15, 123, 15),
+        (Kind::Error, true) => rgb(196, 43, 28),
+        (Kind::Idle, true) => rgb(112, 112, 112),
     }
 }
 
@@ -431,13 +463,41 @@ fn mix(a: u32, b: u32, t: f64) -> u32 {
 }
 
 unsafe fn dot(dc: HDC, x: i32, y: i32, r: i32, color: u32) {
+    ellipse(dc, x - r, y - r, x + r, y + r, color);
+}
+
+unsafe fn ellipse(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
     let brush = CreateSolidBrush(color);
     let old_brush = SelectObject(dc, brush);
     let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-    Ellipse(dc, x - r, y - r, x + r + 1, y + r + 1);
+    Ellipse(dc, left, top, right + 1, bottom + 1);
     SelectObject(dc, old_pen);
     SelectObject(dc, old_brush);
     DeleteObject(brush);
+}
+
+/// Butterfly mark: wings mirrored around a slim body. `open` below 1 folds them toward the body
+/// (seen head-on), which reads as a wing beat when animated. Colours: upper wings, lower wings, body.
+unsafe fn butterfly(dc: HDC, cx: i32, cy: i32, unit: f64, open: f64, colors: [u32; 3]) {
+    // Right-hand wings in 1/96-inch units (x outward, y down); the left side mirrors them.
+    const UPPER: [(f64, f64); 6] = [(0.5, -0.5), (1.8, -4.4), (4.4, -6.0), (7.0, -5.2), (7.0, -2.6), (0.5, 0.6)];
+    const LOWER: [(f64, f64); 5] = [(0.5, 0.6), (4.6, 1.0), (5.0, 3.4), (2.8, 5.2), (0.5, 2.8)];
+    let lift = (1.0 - open) * unit; // the body rises a touch on the downstroke
+    let at = |x: f64, y: f64| POINT { x: cx + (x * unit).round() as i32, y: cy + (y * unit - lift).round() as i32 };
+    let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+    for (shape, color) in [(&UPPER[..], colors[0]), (&LOWER[..], colors[1])] {
+        let brush = CreateSolidBrush(color);
+        let old_brush = SelectObject(dc, brush);
+        for side in [-1.0, 1.0] {
+            let points: Vec<POINT> = shape.iter().map(|&(x, y)| at(side * x * open, y)).collect();
+            Polygon(dc, points.as_ptr(), points.len() as i32);
+        }
+        SelectObject(dc, old_brush);
+        DeleteObject(brush);
+    }
+    SelectObject(dc, old_pen);
+    let (top, bottom) = (at(-0.9, -4.6), at(0.9, 4.6));
+    ellipse(dc, top.x, top.y, bottom.x.max(top.x + 2), bottom.y, colors[2]);
 }
 
 unsafe fn stroke(dc: HDC, points: &[POINT], width: i32, color: u32) {
@@ -455,8 +515,9 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     let hover = GetCursorPos(&mut cursor) != 0 && WindowFromPoint(cursor) == hwnd;
     let status = CURRENT.with(|current| current.borrow().clone());
     let kind = status.as_ref().map_or(Kind::Idle, |s| s.kind);
-    let mut colors = palette(hover);
-    let mut accent = signal(kind);
+    let light = LIGHT.with(Cell::get);
+    let mut colors = palette(light, hover);
+    let mut accent = signal(light, kind);
     let mut contrast = HIGHCONTRASTW { cbSize: size_of::<HIGHCONTRASTW>() as u32, ..Default::default() };
     if SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.cbSize, &mut contrast as *mut _ as _, 0) != 0
         && contrast.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0
@@ -486,13 +547,15 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     DeleteObject(pen);
     DeleteObject(brush);
 
-    // Leading indicator: breathing while live, a glyph once settled.
+    // Leading mark: the butterfly beats its wings while live and rests open when idle; a glyph once settled.
     let (cx, cy) = (px(17), rect.bottom / 2);
     match kind {
-        Kind::Running | Kind::Waiting => {
-            let phase = (EPOCH.with(|e| e.elapsed().as_secs_f64()) * std::f64::consts::TAU / 1.4).sin() * 0.5 + 0.5;
-            dot(target, cx, cy, px(4) + (phase * px(3) as f64) as i32, mix(colors.background, accent, 0.5 - 0.35 * phase));
-            dot(target, cx, cy, px(3), accent);
+        Kind::Running | Kind::Waiting | Kind::Idle => {
+            // Brisk beats while working, slow ones while it waits on you.
+            let period = if kind == Kind::Running { 0.6 } else { 1.4 };
+            let beat = (EPOCH.with(|e| e.elapsed().as_secs_f64()) * std::f64::consts::TAU / period).cos() * 0.5 + 0.5;
+            let open = if kind == Kind::Idle { 1.0 } else { 0.2 + 0.8 * beat };
+            butterfly(target, cx, cy, dpi as f64 / 96.0, open, [accent, mix(accent, colors.background, 0.3), colors.text]);
         }
         Kind::Done | Kind::Error => {
             dot(target, cx, cy, px(7), accent);
@@ -505,7 +568,6 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
                 dot(target, cx, cy + px(3), px(1), colors.background);
             }
         }
-        Kind::Idle => dot(target, cx, cy, px(3), accent),
     }
 
     SetBkMode(target, TRANSPARENT as i32);
@@ -573,24 +635,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if DOUBLE.replace(false) { return 0; }
             if CLOSING.get() {
                 on_app(super::bubble::hide);
-            } else {
-                SetTimer(hwnd, CLICK, GetDoubleClickTime(), None);
+            } else if !idle() {
+                // Open at once: waiting out the double-click time made every bubble a beat late.
+                // A double click then hands over to Nova and closes the bubble it just opened.
+                if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open(app, anchor)); }
             }
             0
         }
         WM_LBUTTONDBLCLK => {
-            // Double click: the full Nova window, on the thread the island is about.
-            KillTimer(hwnd, CLICK);
+            // Double click: the full Nova window, on the thread the Butterfly is about.
             DOUBLE.set(true);
             let thread = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone()));
             on_app(move |app| super::bubble::open_thread(app, thread));
-            0
-        }
-        WM_TIMER if wparam == CLICK => {
-            KillTimer(hwnd, CLICK);
-            // Idle has nothing to show; a double click still opens Nova.
-            if idle() { return 0; }
-            if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open(app, anchor)); }
             0
         }
         WM_TIMER if wparam == ANIMATION => {
@@ -678,12 +734,20 @@ mod tests {
             };
             0.2126 * channel(0) + 0.7152 * channel(8) + 0.0722 * channel(16)
         }
-        for hover in [false, true] {
-            let colors = palette(hover);
-            for text in [colors.text, colors.muted] {
-                let a = luminance(text);
-                let b = luminance(colors.background);
-                assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5);
+        let contrast = |a: u32, b: u32| {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        for light in [false, true] {
+            for hover in [false, true] {
+                let colors = palette(light, hover);
+                for text in [colors.text, colors.muted] {
+                    assert!(contrast(text, colors.background) >= 4.5, "text, light={light} hover={hover}");
+                }
+                // The butterfly / state glyph is a graphic: 3:1 against its own theme's chip.
+                for kind in [Kind::Idle, Kind::Running, Kind::Waiting, Kind::Done, Kind::Error] {
+                    assert!(contrast(signal(light, kind), colors.background) >= 3.0, "{kind:?}, light={light} hover={hover}");
+                }
             }
         }
         assert_eq!(mix(rgb(0, 0, 0), rgb(200, 100, 50), 0.5), rgb(100, 50, 25));

@@ -32,7 +32,7 @@ pub fn focus_main_window(app: &AppHandle) {
     }
 }
 
-fn main_window_focused(app: &AppHandle) -> bool {
+pub(crate) fn main_window_focused(app: &AppHandle) -> bool {
     app.get_window("main")
         .and_then(|w| w.is_focused().ok())
         .unwrap_or(false)
@@ -92,10 +92,14 @@ pub fn show(
 }
 
 /// 任务结束通知：点击（Windows）跳转到会话。
+/// Fire 的执行与判断阶段会连续结束；中间阶段不逐个打扰，最终结果由
+/// `notify_fire_done` 显式发送一次。提示词队列同理，只通知最后一轮。系统通知与 Butterfly 气泡共用。
+pub fn intermediate_turn(thread_id: &str, title: &str) -> bool {
+    title.starts_with("[Fire]") || prompt_queued_threads().lock().unwrap().contains(thread_id)
+}
+
 pub fn notify_thread_done(app: &AppHandle, thread_id: &str, title: &str, body: &str, event: &str) {
-    // Fire 的执行与判断阶段会连续结束；中间阶段不逐个打扰，最终结果由
-    // `notify_fire_done` 显式发送一次。提示词队列同理，只通知最后一轮。
-    if title.starts_with("[Fire]") || prompt_queued_threads().lock().unwrap().contains(thread_id) {
+    if intermediate_turn(thread_id, title) {
         return;
     }
     notify_thread_done_unfiltered(app, thread_id, title, body, event);

@@ -1,48 +1,104 @@
 html.bubble-mode, html.bubble-mode body { margin: 0; background: transparent; overflow: hidden; }
 html.bubble-mode, html.bubble-mode * { box-sizing: border-box; }
+/* Pinned to the taskbar side: if the stack outgrows the screen, the oldest card is what gets cut. */
+html.bubble-mode body { display: flex; flex-direction: column; justify-content: flex-end; height: 100vh; }
+
+/* Follows the Windows taskbar theme (dark by default, `.light` from the payload).
+   --ink is the overlay colour: every translucent fill/border is rgb(var(--ink) / alpha). */
+html.bubble-mode {
+  color-scheme: dark;
+  --ink: 255 255 255;
+  --fg: #f5f5f7;
+  --fg-strong: #fff;
+  --fg-body: #e5e5ea;
+  --fg-2: #c7c7cc;
+  --fg-3: #98989f;
+  --fg-4: #6e6e73;
+  --bg-top: #232327;
+  --bg-bottom: #161618;
+  --shadow: 0 10px 28px rgba(0, 0, 0, 0.38), 0 2px 6px rgba(0, 0, 0, 0.28);
+  --code-bg: rgba(0, 0, 0, 0.35);
+  --field-bg: rgba(0, 0, 0, 0.3);
+  --blue: #0a84ff;
+  --link: #64d2ff;
+  --orange: #ff9f0a;
+  --on-orange: #1c1c1e;
+  --green: #30d158;
+  --red: #ff453a;
+  --red-text: #ff6961;
+  --gray: #8e8e93;
+}
+/* Windows 11 light semantic colours, matching the light taskbar chip. */
+html.bubble-mode.light {
+  color-scheme: light;
+  --ink: 0 0 0;
+  --fg: #1a1a1a;
+  --fg-strong: #000;
+  --fg-body: #2b2b2b;
+  --fg-2: #424242;
+  --fg-3: #616161;
+  --fg-4: #8a8a8a;
+  --bg-top: #ffffff;
+  --bg-bottom: #f6f6f7;
+  --shadow: 0 10px 28px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.08);
+  --code-bg: rgba(0, 0, 0, 0.04);
+  --field-bg: #fff;
+  --blue: #005fb8;
+  --link: #005fb8;
+  --orange: #9d5d00;
+  --on-orange: #fff;
+  --green: #0f7b0f;
+  --red: #c42b1c;
+  --red-text: #c42b1c;
+  --gray: #707070;
+}
 
 /* The transparent margin holds the card's shadow and is the gap to the taskbar. */
-.tb-shell { padding: 16px; }
+.tb-shell { display: flex; flex-direction: column; gap: 10px; padding: 16px; }
+.tb-shell.stack .tb-body { max-height: 160px; }
 
 .tb-card {
-  --accent: #8e8e93;
+  --accent: var(--gray);
   position: relative;
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding: 14px 16px 12px;
   border-radius: 18px;
-  color: #f5f5f7;
+  color: var(--fg);
   font: 13px/1.55 "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
   background:
     radial-gradient(120% 60% at 0% 0%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 60%),
-    linear-gradient(180deg, #232327 0%, #161618 100%);
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.38), 0 2px 6px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+  border: 1px solid rgb(var(--ink) / 0.09);
+  box-shadow: var(--shadow), inset 0 1px 0 rgba(255, 255, 255, 0.06);
   user-select: none;
   cursor: default;
+  transform-origin: 50% 100%;
+  animation: tb-in 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
-.tb-card.running { --accent: #0a84ff; }
-.tb-card.waiting { --accent: #ff9f0a; }
-.tb-card.done { --accent: #30d158; }
-.tb-card.error { --accent: #ff453a; }
-.tb-card.enter { animation: tb-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1); }
-@keyframes tb-in { from { opacity: 0; transform: translateY(6px) scale(0.98); } }
+.tb-card.running { --accent: var(--blue); }
+.tb-card.waiting { --accent: var(--orange); }
+.tb-card.done { --accent: var(--green); }
+.tb-card.error { --accent: var(--red); }
+/* Butterfly entrance: the card unfolds from the taskbar like opening wings, then flutters to rest. */
+@keyframes tb-in {
+  0% { opacity: 0; transform: translateY(8px) scale(0.2, 0.7); }
+  30% { opacity: 1; transform: translateY(0) scale(1.04, 1); }
+  52% { transform: scale(0.96, 1); }
+  74% { transform: scale(1.015, 1); }
+  100% { transform: none; }
+}
 
 .tb-head { display: flex; align-items: center; gap: 8px; }
-.tb-dot { position: relative; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
-.running .tb-dot::after, .waiting .tb-dot::after {
-  content: "";
-  position: absolute;
-  inset: -4px;
-  border-radius: 50%;
-  background: var(--accent);
-  opacity: 0.35;
-  animation: tb-pulse 1.4s ease-in-out infinite;
-}
-@keyframes tb-pulse { 50% { transform: scale(0.5); opacity: 0.05; } }
+.tb-fly { flex: none; overflow: visible; fill: var(--accent); }
+.tb-fly-body { fill: var(--fg); }
+.tb-wings { transform-box: fill-box; transform-origin: center; }
+.running .tb-wings { animation: tb-flap 0.6s ease-in-out infinite; }
+.waiting .tb-wings { animation: tb-flap 1.4s ease-in-out infinite; }
+@keyframes tb-flap { 50% { transform: scaleX(0.2); } }
 .tb-state { font-size: 12px; font-weight: 600; color: var(--accent); letter-spacing: 0.02em; }
-.tb-time { font-size: 12px; color: #98989f; font-variant-numeric: tabular-nums; }
+.tb-time { font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
 .tb-close {
   margin-left: auto;
   display: grid;
@@ -52,22 +108,22 @@ html.bubble-mode, html.bubble-mode * { box-sizing: border-box; }
   padding: 0;
   border: 0;
   border-radius: 50%;
-  color: #98989f;
-  background: rgba(255, 255, 255, 0.06);
+  color: var(--fg-3);
+  background: rgb(var(--ink) / 0.06);
   cursor: pointer;
   transition: background 120ms, color 120ms;
 }
-.tb-close:hover { background: rgba(255, 255, 255, 0.14); color: #f5f5f7; }
+.tb-close:hover { background: rgb(var(--ink) / 0.14); color: var(--fg); }
 
 .tb-title { font-size: 14px; font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; }
-.tb-activity { color: #c7c7cc; overflow-wrap: anywhere; }
+.tb-activity { color: var(--fg-2); overflow-wrap: anywhere; }
 
 .tb-body {
   max-height: 340px;
   overflow: auto;
   margin: 0 -6px;
   padding: 0 6px;
-  color: #e5e5ea;
+  color: var(--fg-body);
   overflow-wrap: anywhere;
   user-select: text;
   cursor: auto;
@@ -75,28 +131,28 @@ html.bubble-mode, html.bubble-mode * { box-sizing: border-box; }
 .tb-body > :first-child { margin-top: 0; }
 .tb-body > :last-child { margin-bottom: 0; }
 .tb-body p, .tb-body ul, .tb-body ol, .tb-body pre, .tb-body table, .tb-body blockquote { margin: 0 0 8px; }
-.tb-body h1, .tb-body h2, .tb-body h3, .tb-body h4 { margin: 10px 0 6px; font-size: 13.5px; font-weight: 600; color: #fff; }
+.tb-body h1, .tb-body h2, .tb-body h3, .tb-body h4 { margin: 10px 0 6px; font-size: 13.5px; font-weight: 600; color: var(--fg-strong); }
 .tb-body ul, .tb-body ol { padding-left: 20px; }
 .tb-body li + li { margin-top: 2px; }
-.tb-body a { color: #64d2ff; text-decoration: none; }
-.tb-body blockquote { padding-left: 10px; border-left: 2px solid rgba(255, 255, 255, 0.18); color: #aeaeb2; }
+.tb-body a { color: var(--link); text-decoration: none; }
+.tb-body blockquote { padding-left: 10px; border-left: 2px solid rgb(var(--ink) / 0.18); color: var(--fg-3); }
 .tb-body code, .tb-code {
   font-family: "Cascadia Code", Consolas, "JetBrains Mono", monospace;
   font-size: 12px;
 }
-.tb-body :not(pre) > code { padding: 1px 5px; border-radius: 5px; background: rgba(255, 255, 255, 0.09); }
+.tb-body :not(pre) > code { padding: 1px 5px; border-radius: 5px; background: rgb(var(--ink) / 0.09); }
 .tb-body pre, .tb-code {
   padding: 8px 10px;
   border-radius: 10px;
-  background: rgba(0, 0, 0, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--code-bg);
+  border: 1px solid rgb(var(--ink) / 0.06);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 .tb-body table { border-collapse: collapse; font-size: 12px; }
-.tb-body th, .tb-body td { padding: 3px 8px; border: 1px solid rgba(255, 255, 255, 0.12); }
+.tb-body th, .tb-body td { padding: 3px 8px; border: 1px solid rgb(var(--ink) / 0.12); }
 .tb-body img { max-width: 100%; border-radius: 8px; }
-.tb-body hr { border: 0; border-top: 1px solid rgba(255, 255, 255, 0.1); }
+.tb-body hr { border: 0; border-top: 1px solid rgb(var(--ink) / 0.1); }
 
 .tb-ask {
   display: flex;
@@ -104,8 +160,8 @@ html.bubble-mode, html.bubble-mode * { box-sizing: border-box; }
   gap: 8px;
   padding: 10px 12px 12px;
   border-radius: 14px;
-  background: rgba(255, 159, 10, 0.08);
-  border: 1px solid rgba(255, 159, 10, 0.28);
+  background: color-mix(in srgb, var(--orange) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--orange) 28%, transparent);
 }
 .tb-ask-head { display: flex; align-items: center; gap: 8px; }
 .tb-ask-badge {
@@ -113,15 +169,15 @@ html.bubble-mode, html.bubble-mode * { box-sizing: border-box; }
   border-radius: 999px;
   font-size: 11px;
   font-weight: 600;
-  color: #1c1c1e;
-  background: #ff9f0a;
+  color: var(--on-orange);
+  background: var(--orange);
 }
-.tb-ask-agent, .tb-ask-thread { font-size: 12px; color: #98989f; overflow-wrap: anywhere; }
+.tb-ask-agent, .tb-ask-thread { font-size: 12px; color: var(--fg-3); overflow-wrap: anywhere; }
 .tb-ask-title { font-weight: 600; overflow-wrap: anywhere; }
-.tb-code { margin: 0; max-height: 120px; overflow: auto; color: #e5e5ea; user-select: text; }
+.tb-code { margin: 0; max-height: 120px; overflow: auto; color: var(--fg-body); user-select: text; }
 
 .tb-question { display: flex; flex-direction: column; gap: 6px; }
-.tb-question-head { font-size: 11px; font-weight: 600; color: #ff9f0a; text-transform: uppercase; letter-spacing: 0.04em; }
+.tb-question-head { font-size: 11px; font-weight: 600; color: var(--orange); text-transform: uppercase; letter-spacing: 0.04em; }
 .tb-choices { display: flex; flex-direction: column; gap: 6px; }
 .tb-choice {
   display: flex;
@@ -130,27 +186,56 @@ html.bubble-mode, html.bubble-mode * { box-sizing: border-box; }
   gap: 1px;
   padding: 7px 10px;
   border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.05);
-  color: #f5f5f7;
+  border: 1px solid rgb(var(--ink) / 0.1);
+  background: rgb(var(--ink) / 0.05);
+  color: var(--fg);
   font: inherit;
   text-align: left;
   cursor: pointer;
   transition: background 120ms, border-color 120ms;
 }
-.tb-choice small { color: #98989f; font-size: 11.5px; }
-.tb-choice:hover { background: rgba(255, 255, 255, 0.1); }
-.tb-choice.selected { border-color: #0a84ff; background: rgba(10, 132, 255, 0.18); }
+.tb-choice small { color: var(--fg-3); font-size: 11.5px; }
+.tb-choice:hover { background: rgb(var(--ink) / 0.1); }
+.tb-choice.selected { border-color: var(--blue); background: color-mix(in srgb, var(--blue) 18%, transparent); }
 .tb-input {
   padding: 7px 10px;
   border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(0, 0, 0, 0.3);
-  color: #f5f5f7;
+  border: 1px solid rgb(var(--ink) / 0.12);
+  background: var(--field-bg);
+  color: var(--fg);
   font: inherit;
   outline: none;
 }
-.tb-input:focus { border-color: #0a84ff; }
+.tb-input:focus { border-color: var(--blue); }
+
+.tb-reply { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+.tb-reply-input {
+  flex: 1;
+  min-width: 0;
+  max-height: 110px;
+  field-sizing: content; /* grows with the text up to max-height, then scrolls */
+  resize: none;
+  line-height: 1.45;
+  user-select: text;
+}
+.tb-reply-input::placeholder { color: var(--fg-4); }
+.tb-send {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--blue);
+  cursor: pointer;
+  transition: filter 120ms, opacity 120ms;
+}
+.tb-send:hover { filter: brightness(1.12); }
+.tb-send:disabled { opacity: 0.35; cursor: default; filter: none; }
+.tb-reply-error { flex-basis: 100%; font-size: 12px; color: var(--red-text); overflow-wrap: anywhere; }
 
 .tb-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .tb-btn {
@@ -159,17 +244,17 @@ html.bubble-mode, html.bubble-mode * { box-sizing: border-box; }
   border-radius: 9px;
   font: inherit;
   font-weight: 600;
-  color: #f5f5f7;
-  background: rgba(255, 255, 255, 0.1);
+  color: var(--fg);
+  background: rgb(var(--ink) / 0.1);
   cursor: pointer;
   transition: filter 120ms, background 120ms, transform 80ms;
 }
-.tb-btn:hover { background: rgba(255, 255, 255, 0.16); }
+.tb-btn:hover { background: rgb(var(--ink) / 0.16); }
 .tb-btn:active { transform: scale(0.97); }
-.tb-btn.allow { background: #0a84ff; color: #fff; }
+.tb-btn.allow { background: var(--blue); color: #fff; }
 .tb-btn.allow:hover { filter: brightness(1.12); }
-.tb-btn.reject { background: rgba(255, 69, 58, 0.14); color: #ff6961; }
-.tb-btn.reject:hover { background: rgba(255, 69, 58, 0.22); }
+.tb-btn.reject { background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red-text); }
+.tb-btn.reject:hover { background: color-mix(in srgb, var(--red) 22%, transparent); }
 .tb-btn:disabled { opacity: 0.45; cursor: default; transform: none; }
 
 .tb-foot {
@@ -177,9 +262,9 @@ html.bubble-mode, html.bubble-mode * { box-sizing: border-box; }
   align-items: center;
   gap: 8px;
   padding-top: 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  border-top: 1px solid rgb(var(--ink) / 0.07);
 }
-.tb-hint { font-size: 11.5px; color: #6e6e73; }
+.tb-hint { font-size: 11.5px; color: var(--fg-4); }
 .tb-open {
   margin-left: auto;
   display: inline-flex;
@@ -191,19 +276,19 @@ html.bubble-mode, html.bubble-mode * { box-sizing: border-box; }
   font: inherit;
   font-size: 12px;
   font-weight: 600;
-  color: #f5f5f7;
-  background: rgba(255, 255, 255, 0.08);
+  color: var(--fg);
+  background: rgb(var(--ink) / 0.08);
   cursor: pointer;
   transition: background 120ms;
 }
-.tb-open:hover { background: rgba(255, 255, 255, 0.16); }
+.tb-open:hover { background: rgb(var(--ink) / 0.16); }
 
-.tb-card button:focus-visible, .tb-card input:focus-visible { outline: 2px solid #0a84ff; outline-offset: 2px; }
+.tb-card button:focus-visible, .tb-card input:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 
 .tb-card ::-webkit-scrollbar { width: 6px; height: 6px; }
-.tb-card ::-webkit-scrollbar-thumb { border-radius: 3px; background: rgba(255, 255, 255, 0.16); }
+.tb-card ::-webkit-scrollbar-thumb { border-radius: 3px; background: rgb(var(--ink) / 0.16); }
 .tb-card ::-webkit-scrollbar-track { background: transparent; }
 
 @media (prefers-reduced-motion: reduce) {
-  .tb-card.enter, .running .tb-dot::after, .waiting .tb-dot::after { animation: none; }
+  .tb-card, .tb-wings { animation: none !important; }
 }

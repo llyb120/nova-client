@@ -6,7 +6,7 @@ mod bubble;
 #[cfg(windows)]
 mod windows;
 
-/// Bubble data: status, full latest reply and pending confirmations (null when the island is off).
+/// Bubble data: popped results, the live card and pending confirmations (null when the Butterfly is off).
 #[tauri::command]
 pub(crate) fn taskbar_bubble(app: tauri::AppHandle) -> serde_json::Value {
     #[cfg(windows)]
@@ -33,6 +33,24 @@ pub(crate) fn taskbar_bubble_hide(app: tauri::AppHandle) {
     let _ = app;
 }
 
+/// Close one bubble card: a popped result by thread id, or the live card when `None`.
+#[tauri::command]
+pub(crate) fn taskbar_bubble_dismiss(app: tauri::AppHandle, thread_id: Option<String>) {
+    #[cfg(windows)]
+    bubble::dismiss(&app, thread_id);
+    #[cfg(not(windows))]
+    let _ = (app, thread_id);
+}
+
+/// Quick reply from a bubble card to its thread.
+#[tauri::command]
+pub(crate) fn taskbar_bubble_reply(app: tauri::AppHandle, thread_id: String, text: String) -> Result<(), String> {
+    #[cfg(windows)]
+    return bubble::reply(&app, &thread_id, &text);
+    #[cfg(not(windows))]
+    { let _ = (app, thread_id, text); Err("仅支持 Windows".into()) }
+}
+
 #[tauri::command]
 pub(crate) fn taskbar_bubble_open(app: tauri::AppHandle, thread_id: Option<String>) {
     #[cfg(windows)]
@@ -52,6 +70,7 @@ pub(crate) struct Rect {
 pub(crate) fn start(app: &tauri::AppHandle) {
     #[cfg(windows)]
     if !crate::server::is_headless() {
+        bubble::watch(app);
         windows::start(app.clone());
     }
     #[cfg(not(windows))]
@@ -225,7 +244,7 @@ impl Status {
 
     /// Accessible name / window text.
     pub fn title(&self) -> String {
-        if self.trailing.is_empty() { format!("Nova · {}", self.text) } else { format!("Nova · {} · {}", self.text, self.trailing) }
+        if self.trailing.is_empty() { format!("Butterfly · {}", self.text) } else { format!("Butterfly · {} · {}", self.text, self.trailing) }
     }
 }
 
@@ -278,7 +297,7 @@ fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
         (t.id.as_str(), t.updated_at, t.unread_turns)
     }).collect();
     let Some(thread) = pick(&candidates, &seen).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
-        return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Nova", "双击打开"], None));
+        return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "双击打开 Nova"], None));
     };
     // The last turn's final reply (or error) is the conclusion.
     let (kind, body) = thread.items.iter().rev()
@@ -347,7 +366,7 @@ mod tests {
         assert_eq!(elapsed(3_723_000), "1:02:03");
         assert_eq!((ago(5_000), ago(180_000), ago(7_200_000)), ("刚刚".into(), "3 分钟前".into(), "2 小时前".into()));
         let status = Status::new(Kind::Done, "好".into(), "刚刚".into(), &["标题", "", "点击"], None);
-        assert_eq!((status.title().as_str(), status.detail.as_str()), ("Nova · 好 · 刚刚", "标题\n点击"));
+        assert_eq!((status.title().as_str(), status.detail.as_str()), ("Butterfly · 好 · 刚刚", "标题\n点击"));
     }
 
     #[test]

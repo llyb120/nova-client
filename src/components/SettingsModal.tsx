@@ -1703,10 +1703,10 @@ export function SettingsModal(props: { onClose: () => void }) {
                     checked={taskbarStatusEnabled()}
                     onChange={(e) => setTaskbarStatusEnabled(e.currentTarget.checked)}
                   />
-                  <span>Windows 任务栏灵动岛（实验）</span>
+                  <span>Windows 任务栏 Butterfly（实验）</span>
                 </label>
                 <span class="field-hint">
-                  开启后常驻 Windows 任务栏空闲区域：运行中显示当前动作与耗时，待确认时提醒，结束后显示结论；单击弹出详情气泡（待确认事项可直接在气泡中选择），双击打开 Nova 对应会话。默认关闭；保存后即时生效。
+                  开启后常驻 Windows 任务栏空闲区域：运行中蝴蝶振翅并显示当前动作与耗时，待确认时提醒；任务结束后自动弹出结果气泡（多个任务各弹一个，不抢键盘焦点；Nova 窗口在前台时不弹）。单击 Butterfly 弹出/收起详情气泡（待确认事项可直接在气泡中选择，也可在气泡里直接输入快速回复），双击打开 Nova 对应会话。默认关闭；保存后即时生效。
                 </span>
               </div>
               <div class="field">

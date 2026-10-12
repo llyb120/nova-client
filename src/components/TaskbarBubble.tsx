@@ -3,24 +3,42 @@ import { Marked } from "marked";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createStore, reconcile } from "solid-js/store";
 import type { PermissionRequest } from "../types";
 import { agentLabel, stripAnsi } from "../utils";
 import "./TaskbarBubble.css";
 
 type Kind = "idle" | "running" | "waiting" | "done" | "error";
 type Permission = PermissionRequest & { threadTitle?: string | null };
-type Payload = {
+/** One bubble: a result popped when its turn finished, or the live card a click opened. */
+type Card = {
+  key: string;
+  live: boolean;
   kind: Kind;
   text: string;
   trailing: string;
   threadId: string | null;
   title: string;
   body: string;
-  permissions: Permission[];
 };
+/** `light`: the Windows taskbar theme, so cards match the Butterfly they pop out of. */
+type Payload = { cards: Card[]; permissions: Permission[]; light: boolean };
 
 const LABEL: Record<Kind, string> = { idle: "空闲", running: "进行中", waiting: "待确认", done: "已完成", error: "出错了" };
 const marked = new Marked({ gfm: true, breaks: true });
+const markdown = (body: string) => (body ? DOMPurify.sanitize(marked.parse(body, { async: false }) as string) : "");
+
+/** Same mark as the taskbar chip; the wings beat while the card is live. */
+const WING = "M0.5-0.5L1.8-4.4L4.4-6L7-5.2L7-2.6L0.5 0.6ZM0.5 0.6L4.6 1L5 3.4L2.8 5.2L0.5 2.8Z";
+const Butterfly = () => (
+  <svg class="tb-fly" viewBox="-8 -7 16 13" width="16" height="13" aria-hidden="true">
+    <g class="tb-wings">
+      <path d={WING} />
+      <path d={WING} transform="scale(-1 1)" />
+    </g>
+    <rect class="tb-fly-body" x="-0.9" y="-4.6" width="1.8" height="9.2" rx="0.9" />
+  </svg>
+);
 
 function preview(raw: unknown): string {
   if (raw == null) return "";
@@ -141,25 +159,72 @@ function Ask(props: { req: Permission; onDone: () => void }) {
   );
 }
 
+/** Quick reply to the card's thread; Enter sends, Shift+Enter breaks the line. */
+function Reply(props: { card: Card; onSent: () => void }) {
+  const [text, setText] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal("");
+  const send = async () => {
+    const value = text().trim();
+    if (!value || busy() || !props.card.threadId) return;
+    setBusy(true);
+    setError("");
+    try {
+      await invoke("taskbar_bubble_reply", { threadId: props.card.threadId, text: value });
+      setText("");
+      props.onSent();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <form class="tb-reply" onSubmit={(e) => { e.preventDefault(); void send(); }}>
+      <textarea
+        class="tb-input tb-reply-input"
+        rows={1}
+        value={text()}
+        disabled={busy()}
+        aria-label="快速回复"
+        placeholder={props.card.kind === "running" ? "追加消息，本轮结束后发送" : "快速回复，Enter 发送，Shift+Enter 换行"}
+        onInput={(e) => setText(e.currentTarget.value)}
+        onKeyDown={(e) => {
+          // isComposing: Enter that confirms an IME candidate is not a send.
+          if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+            e.preventDefault();
+            void send();
+          }
+        }}
+      />
+      <button class="tb-send" type="submit" title="发送" aria-label="发送" disabled={busy() || !text().trim()}>
+        <svg viewBox="0 0 12 12" width="12" height="12"><path d="M6 10V2.5M2.5 6L6 2.5 9.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </button>
+      <Show when={error()}>
+        <div class="tb-reply-error" role="alert">{error()}</div>
+      </Show>
+    </form>
+  );
+}
+
 export default function TaskbarBubble() {
-  const [data, setData] = createSignal<Payload | null>(null);
+  const [cards, setCards] = createStore<Card[]>([]);
   const [permissions, setPermissions] = createSignal<Permission[]>([]);
   let shell!: HTMLDivElement;
-  let card: HTMLDivElement | undefined;
   let timer: number | undefined;
 
-  const html = createMemo(() => {
-    const body = data()?.body ?? "";
-    return body ? DOMPurify.sanitize(marked.parse(body, { async: false }) as string) : "";
-  });
   const place = () => invoke<boolean>("taskbar_bubble_place", { height: shell.offsetHeight }).catch(() => false);
   const hide = () => void invoke("taskbar_bubble_hide").catch(() => {});
+  // Popped results go by thread id; the live card by null.
+  const dismiss = (card: Card) => void invoke("taskbar_bubble_dismiss", { threadId: card.live ? null : card.threadId }).catch(() => {});
 
   const load = async () => {
     const next = await invoke<Payload | null>("taskbar_bubble").catch(() => null);
-    // Nothing left to show (e.g. the result was viewed elsewhere): close instead of an empty card.
-    if (!next || (next.kind === "idle" && !next.permissions.length)) return hide();
-    setData(next);
+    // Nothing left to show (e.g. the result was viewed elsewhere): close instead of an empty bubble.
+    if (!next?.cards.length) return hide();
+    document.documentElement.classList.toggle("light", next.light);
+    // Keyed: a refresh updates cards in place, so only a newly popped one plays its entrance.
+    setCards(reconcile(next.cards, { key: "key" }));
     // Keep in-progress answers: only rebuild cards when the set of requests changes.
     const keys = (list: Permission[]) => list.map((p) => p.requestKey).join("\n");
     if (keys(next.permissions) !== keys(permissions())) setPermissions(next.permissions);
@@ -167,16 +232,15 @@ export default function TaskbarBubble() {
   const open = async () => {
     clearInterval(timer);
     await load();
-    card?.classList.remove("enter");
-    void card?.offsetWidth; // restart the entrance animation
-    card?.classList.add("enter");
     await new Promise(requestAnimationFrame);
     // Live refresh only while shown (a prewarmed page is not).
     if (await place()) timer = window.setInterval(() => void load(), 1000);
   };
   const answered = async () => {
     await load();
-    if (!permissions().length) hide();
+    // Last confirmation answered: close the live card, popped results stay.
+    const live = cards.find((c) => c.live);
+    if (!permissions().length && live) dismiss(live);
   };
 
   onMount(() => {
@@ -184,7 +248,14 @@ export default function TaskbarBubble() {
     observer.observe(shell);
     const keys = (e: KeyboardEvent) => e.key === "Escape" && hide();
     window.addEventListener("keydown", keys);
-    const offs = [listen("taskbar-bubble:open", () => void open()), listen("taskbar-bubble:hidden", () => clearInterval(timer))];
+    const offs = [
+      listen("taskbar-bubble:open", () => void open()),
+      // Drop the cards so the next bubble mounts fresh and plays its entrance again.
+      listen("taskbar-bubble:hidden", () => {
+        clearInterval(timer);
+        setCards([]);
+      }),
+    ];
     // Listen before the first place(): a click landing in between is then either seen by
     // place() or delivered as an open event, never lost.
     void Promise.all(offs).then(() => open());
@@ -197,44 +268,54 @@ export default function TaskbarBubble() {
   });
 
   return (
-    <div class="tb-shell" ref={shell}>
-      <Show when={data()}>
-        {(d) => (
-          <div class={`tb-card enter ${d().kind}`} ref={card}>
-            <header class="tb-head">
-              <span class="tb-dot" />
-              <span class="tb-state">{LABEL[d().kind]}</span>
-              <Show when={d().trailing}>
-                <span class="tb-time">{d().trailing}</span>
+    <div class="tb-shell" classList={{ stack: cards.length > 1 }} ref={shell}>
+      <For each={cards}>
+        {(card) => {
+          const html = createMemo(() => markdown(card.body));
+          return (
+            <div class={`tb-card ${card.kind}`}>
+              <header class="tb-head">
+                <Butterfly />
+                <span class="tb-state">{LABEL[card.kind]}</span>
+                <Show when={card.trailing}>
+                  <span class="tb-time">{card.trailing}</span>
+                </Show>
+                <button class="tb-close" title="关闭" aria-label="关闭" onClick={() => dismiss(card)}>
+                  <svg viewBox="0 0 12 12" width="10" height="10"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
+                </button>
+              </header>
+              <Show when={card.title}>
+                <div class="tb-title">{card.title}</div>
               </Show>
-              <button class="tb-close" title="关闭 (Esc)" aria-label="关闭" onClick={hide}>
-                <svg viewBox="0 0 12 12" width="10" height="10"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
-              </button>
-            </header>
-            <Show when={d().title}>
-              <div class="tb-title">{d().title}</div>
-            </Show>
-            <Show when={d().kind === "running" || !d().body}>
-              <div class="tb-activity">{d().text}</div>
-            </Show>
-            <For each={permissions()}>{(req) => <Ask req={req} onDone={() => void answered()} />}</For>
-            <Show when={html()}>
-              <div
-                class="tb-body"
-                innerHTML={html()}
-                onClick={(e) => (e.target as HTMLElement).closest("a") && e.preventDefault()}
-              />
-            </Show>
-            <footer class="tb-foot">
-              <span class="tb-hint">双击灵动岛直接打开</span>
-              <button class="tb-open" onClick={() => void invoke("taskbar_bubble_open", { threadId: d().threadId })}>
-                {d().threadId ? "打开会话" : "打开 Nova"}
-                <svg viewBox="0 0 12 12" width="10" height="10"><path d="M4.5 2.5L8 6l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
-              </button>
-            </footer>
-          </div>
-        )}
-      </Show>
+              <Show when={card.kind === "running" || !card.body}>
+                <div class="tb-activity">{card.text}</div>
+              </Show>
+              <Show when={card.live}>
+                <For each={permissions()}>{(req) => <Ask req={req} onDone={() => void answered()} />}</For>
+              </Show>
+              <Show when={html()}>
+                <div
+                  class="tb-body"
+                  innerHTML={html()}
+                  onClick={(e) => (e.target as HTMLElement).closest("a") && e.preventDefault()}
+                />
+              </Show>
+              {/* Waiting cards answer through the confirmation above, not a new prompt. */}
+              <Show when={card.threadId && card.kind !== "waiting"}>
+                {/* A popped result has been answered: it leaves; the live card stays to show progress. */}
+                <Reply card={card} onSent={() => !card.live && dismiss(card)} />
+              </Show>
+              <footer class="tb-foot">
+                <span class="tb-hint">双击 Butterfly 直接打开</span>
+                <button class="tb-open" onClick={() => void invoke("taskbar_bubble_open", { threadId: card.threadId })}>
+                  {card.threadId ? "打开会话" : "打开 Nova"}
+                  <svg viewBox="0 0 12 12" width="10" height="10"><path d="M4.5 2.5L8 6l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
+                </button>
+              </footer>
+            </div>
+          );
+        }}
+      </For>
     </div>
   );
 }
