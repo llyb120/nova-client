@@ -1193,6 +1193,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let imageRebuildTimer: number | undefined;
   const paintedImageSources = new Set<string>();
   const imageSizes = new Map<string, Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">>();
+  // 加载失败的图不再参与布局延迟，否则之后每次重排都要白等 IMAGE_DEFER_MS。
+  const brokenImages = new Set<string>();
   // 发送后图片 src 会由 data URL 换成文件 URI；新图加载完成前沿用同一张图的旧元素/尺寸，避免闪烁和跳动。
   type ImgSize = Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">;
   const shownImages = new Map<string, { el?: HTMLImageElement; size?: ImgSize }>();
@@ -1374,7 +1376,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               const key = imageKey(img);
               if (size) shownImages.set(key, { ...shownImages.get(key), size });
               const known = size ?? shownImages.get(key)?.size;
-              if (!known) { pendingImages = true; loadImageSource(src); }
+              if (!known) { loadImageSource(src); pendingImages ||= !brokenImages.has(src); }
               return known ?? null;
             });
           // Size to content like DOM (no artificial min-width that leaves empty bubble space).
@@ -1583,8 +1585,16 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     flushBottom();
     if (disposed || generation !== layoutGeneration || props.threadId !== threadId) return false;
-    // 只有已有真实内容的前台帧才值得保留；切会话的加载提示直接替换。
-    if (pendingImages && blocks.some(b => b.kind !== "hint")) {
+    // 切会话时前台是加载提示（暖切换则是旧会话像素），同样要等图片解码完再整帧提交，
+    // 否则先落占位再弹出图片，表现为进入会话闪一下。生成图尺寸固定，但未解码时会先画“加载中”文字。
+    for (const b of result) {
+      if (b.kind !== "generated-image") continue;
+      const src = String(b.data?.src ?? "");
+      if (imageSizes.has(src)) continue;
+      loadImageSource(src);
+      pendingImages ||= !brokenImages.has(src);
+    }
+    if (pendingImages) {
       const now = performance.now();
       imageDeferSince ||= now;
       const wait = IMAGE_DEFER_MS - (now - imageDeferSince);
@@ -3621,6 +3631,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     };
     // 先解码再入画：同步解码会在 drawImage 时卡住一帧。
     image.onload = () => { image.decode().then(ready, ready); };
+    image.onerror = () => { if (imgCache.get(src) === image) brokenImages.add(src); };
     el.src = src;
     imgCache.set(src, el);
     return null;
@@ -3925,6 +3936,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       imgCache.clear();
       imageSizes.clear();
       shownImages.clear();
+      brokenImages.clear();
+      imageDeferSince = 0;
       laidOutStart = laidOutEnd = 0;
       jumpGroup = null;
       keepBottom = true;
