@@ -1514,6 +1514,15 @@ impl AcpManager {
             });
         }
 
+        let mut client_capabilities = json!({
+            "fs": { "readTextFile": false, "writeTextFile": false }
+        });
+        // claude-agent-acp 的原生子代理扩展：声明后 Task/Agent 调用会以
+        // subagent_spawned/subagent_state_update announce 成独立 sessionId，
+        // 而不是混在主会话里的一条 tool_call；仅 Claude 认得这个扩展。
+        if self.kind == AgentKind::Claude {
+            client_capabilities["subagents"] = json!({});
+        }
         let init = conn
             .request(
                 "initialize",
@@ -1524,9 +1533,7 @@ impl AcpManager {
                         "title": "Nova",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "clientCapabilities": {
-                        "fs": { "readTextFile": false, "writeTextFile": false }
-                    }
+                    "clientCapabilities": client_capabilities
                 }),
                 Some(Duration::from_secs(60)),
             )
@@ -1998,6 +2005,25 @@ impl AcpManager {
         if self.capture_title_update(session_id, update) {
             return;
         }
+        // claude-agent-acp 原生子代理扩展：把 Task/Agent 调用投影成独立的只读子
+        // 线程，复用 Lyra Stage 的展示思路（仅展示，不支持回复/取消）。session_id
+        // 此时仍是父会话——子代理自己的 sessionId 要等 spawn_subagent_stage 里
+        // 注册路由后，才会出现在后续的分发里。
+        if kind == "subagent_spawned" || kind == "subagent_state_update" {
+            let parent_thread_id = {
+                let routes = self.routes.lock().unwrap();
+                let Some(r) = routes.get(session_id) else {
+                    return;
+                };
+                r.thread_id.clone()
+            };
+            if kind == "subagent_spawned" {
+                self.spawn_subagent_stage(&parent_thread_id, update);
+            } else {
+                self.finish_subagent_stage(update);
+            }
+            return;
+        }
         let thread_id = {
             let routes = self.routes.lock().unwrap();
             let Some(r) = routes.get(session_id) else {
@@ -2167,6 +2193,79 @@ impl AcpManager {
                 }
             }
         }
+    }
+
+    /// `subagent_spawned`：claude-agent-acp 宣告一个 Task/Agent 子代理开始执行。
+    /// 新建一个只读子线程挂到父线程下，并把子代理自己的 sessionId 注册到路由表——
+    /// 之后 bridge 重标给这个 sessionId 的所有更新都会落到子线程，走的是
+    /// on_session_update 后面那套通用分发，不需要再改别处。
+    fn spawn_subagent_stage(self: &Arc<Self>, parent_thread_id: &str, update: &Value) {
+        let Some(child_session_id) = update["subagentSessionId"].as_str() else {
+            return;
+        };
+        if self.routes.lock().unwrap().contains_key(child_session_id) {
+            return; // 重复 announce
+        }
+        let name = update["name"].as_str().unwrap_or("子 Agent");
+        let task = update["task"].as_str().unwrap_or_default();
+        let state = self.app.state::<AppState>();
+        let child_id = {
+            let mut store = state.store.lock().unwrap();
+            let Some(parent) = store.get(parent_thread_id) else {
+                return;
+            };
+            let child = subagent_child_thread(parent, name, task);
+            let id = child.id.clone();
+            store.threads.push(child);
+            store.save();
+            id
+        };
+        self.routes.lock().unwrap().insert(
+            child_session_id.to_string(),
+            Route {
+                thread_id: child_id.clone(),
+                text_items: HashMap::new(),
+                applied_model: None,
+                applied_mode: None,
+                applied_effort: None,
+            },
+        );
+        self.set_running(&child_id, true, None);
+        let _ = self.app.emit(EV_THREADS, json!({}));
+    }
+
+    /// `subagent_state_update`：子代理到达终态（completed/failed/cancelled/
+    /// disconnected）。补一条收尾 note，收起运行状态，并清掉路由——子代理的
+    /// sessionId 不会再有后续更新。
+    fn finish_subagent_stage(self: &Arc<Self>, update: &Value) {
+        let Some(child_session_id) = update["subagentSessionId"].as_str() else {
+            return;
+        };
+        let Some(child_id) = self
+            .routes
+            .lock()
+            .unwrap()
+            .remove(child_session_id)
+            .map(|r| r.thread_id)
+        else {
+            return;
+        };
+        let state_str = update["state"].as_str().unwrap_or("completed");
+        let level = if matches!(state_str, "failed" | "disconnected") {
+            "error"
+        } else {
+            "info"
+        };
+        {
+            let app_state = self.app.state::<AppState>();
+            let mut store = app_state.store.lock().unwrap();
+            if let Some(thread) = store.get_mut(&child_id) {
+                thread.push_system(format!("子 Agent 已结束（{state_str}）。"), level);
+                store.save_thread(&child_id);
+            }
+        }
+        self.set_running(&child_id, false, Some(state_str.to_string()));
+        let _ = self.app.emit(EV_THREADS, json!({}));
     }
 
     fn mark_plan_interrupted(&self, thread_id: &str, status: &str, include_pending: bool) {
@@ -4419,6 +4518,52 @@ impl AcpManager {
             }
             mgr.slots.lock().unwrap().remove(&key);
         });
+    }
+}
+
+/// claude-agent-acp 原生子代理的只读投影子线程，结构对齐 lyra::stage::stage_thread：
+/// 挂到父线程下、继承父线程的目录/模型/只读属性，不引入新的动态上下文。
+fn subagent_child_thread(parent: &Thread, name: &str, task: &str) -> Thread {
+    let mut thread = Thread::new(
+        parent.cwd.clone(),
+        AgentKind::Claude,
+        parent.model.clone(),
+        parent.mode.clone(),
+        None,
+        parent.ephemeral,
+    );
+    thread.title = format!("[Agent] {name}");
+    thread.subagent = true;
+    thread.parent_thread_id = Some(parent.id.clone());
+    thread.worktree = parent.worktree.clone();
+    thread.employee_thread = parent.employee_thread;
+    thread.experience_thread = parent.experience_thread;
+    if !task.is_empty() {
+        thread.push_system(format!("子 Agent 任务：{task}"), "info");
+    }
+    thread
+}
+
+#[cfg(test)]
+mod subagent_stage_tests {
+    use super::*;
+
+    #[test]
+    fn subagent_child_thread_is_readonly_sibling_with_task_note() {
+        let mut root = Thread::new("root-dir".into(), AgentKind::Claude, Some("claude-model".into()), Some("build".into()), None, true);
+        root.employee_thread = true;
+        root.acp_session_id = Some("parent-session".into());
+        let first = subagent_child_thread(&root, "探索", "找出登录逻辑");
+        let second = subagent_child_thread(&root, "探索", "找出登录逻辑");
+        assert!(first.subagent && first.ephemeral && first.employee_thread);
+        assert_eq!(first.parent_thread_id.as_deref(), Some(root.id.as_str()));
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.cwd, "root-dir");
+        assert_eq!(first.model.as_deref(), Some("claude-model"));
+        assert_eq!(first.agent_kind, AgentKind::Claude);
+        assert!(first.acp_session_id.is_none());
+        assert_eq!(first.items.len(), 1);
+        assert!(matches!(&first.items[0], Item::System { text, .. } if text.contains("找出登录逻辑")));
     }
 }
 

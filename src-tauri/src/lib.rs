@@ -1,6 +1,5 @@
 mod visual_guard;
 mod acp;
-mod altair;
 mod agent_config;
 mod jianlai;
 mod employee;
@@ -5913,7 +5912,6 @@ pub fn run() {
             compact_thread,
             respond_permission,
             get_settings,
-            altair::test_altair_connection,
             set_settings,
             refresh_environment_variables,
             get_global_agent_instructions,

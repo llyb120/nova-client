@@ -1988,69 +1988,6 @@ mod tests {
     use crate::lyra::config::ResolvedModel;
     use serde_json::Map;
 
-    /// Explicit opt-in diagnostic: two bounded requests, no business data or reasoning text logged.
-    #[tokio::test]
-    #[ignore]
-    async fn probe_commandcode_thinking_controls() {
-        let root = std::env::var_os("NOVA_ALTAIR_PROBE_ROOT").expect("set the opted-in Nova data directory");
-        crate::lyra::config::set_nova_root(std::path::PathBuf::from(root));
-        let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
-        let mut resolved = crate::lyra::config::resolve_model(&crate::lyra::config::Roots::global().load_config(None).unwrap(),
-            Some(&settings.altair_model), &crate::lyra::config::process_env()).unwrap();
-        assert_eq!(reqwest::Url::parse(&resolved.model.base_url).unwrap().host_str(), Some("api.commandcode.ai"));
-        resolved.model.max_output_tokens = 1024;
-        resolved.model.extra_options.remove("reasoning_effort");
-        let image = crate::altair::image_part(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/128x128.png")).unwrap();
-        let messages = [crate::lyra::history::user_message("以文字任务为准，图标与题目无关。计算17乘19，只返回JSON对象 {\"answer\":整数}，不要解释。", &[image])];
-        let body = completions_body(&resolved.model, "只回答结果。", &messages, &[], Some("off"), None);
-        assert_eq!(body["thinking"]["type"], "disabled");
-        let http = client_for_proxy(resolved.model.proxy.as_deref().unwrap_or(settings.lyra_proxy.trim()));
-        for (label, control) in [("native_thinking_off", None), ("gateway_effort_off", Some("off"))] {
-            if std::env::var("NOVA_ALTAIR_PROBE_CONTROL").ok().is_some_and(|name| name != label) { continue; }
-            let mut body = body.clone();
-            body.as_object_mut().unwrap().remove("reasoning_effort");
-            if let Some(effort) = control { body["reasoning_effort"] = json!(effort); }
-            eprintln!("CONTROL_REQUEST {label} {}", json!({"model":body["model"],"thinking":body["thinking"],
-                "reasoning_effort":body["reasoning_effort"],"reasoning":body["reasoning"],"enable_thinking":body["enable_thinking"],
-                "max_tokens":body["max_tokens"],"max_completion_tokens":body["max_completion_tokens"]}));
-            let cancel = Arc::new(AtomicBool::new(false));
-            let started = std::time::Instant::now();
-            let (mut bytes, mut events, mut text_chars, mut first_text_ms) = (0usize, 0usize, 0usize, None);
-            let mut thinking = std::collections::BTreeMap::<String, usize>::new();
-            let mut finish = Value::Null;
-            let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                let mut response = post_stream(&http, &format!("{}/chat/completions", resolved.model.base_url.trim_end_matches('/')),
-                    &resolved.model, &resolved.api_key, None, body, &cancel).await?;
-                read_sse(&mut response, &cancel, |data| {
-                    if data.is_empty() { return Ok(()); }
-                    bytes += data.len();
-                    if bytes > 65536 { return Err("diagnostic response exceeds 64KiB".into()); }
-                    let value: Value = serde_json::from_str(data).map_err(|_| "diagnostic invalid SSE JSON")?;
-                    events += 1;
-                    for choice in value["choices"].as_array().into_iter().flatten() {
-                        if !choice["finish_reason"].is_null() { finish = choice["finish_reason"].clone(); }
-                        let delta = &choice["delta"];
-                        let count = delta["content"].as_str().map_or(0, |s| s.chars().count());
-                        if count > 0 { first_text_ms.get_or_insert(started.elapsed().as_millis() as u64); text_chars += count; }
-                        for key in ["reasoning_content", "reasoning", "reasoning_text", "reasoning_details"] {
-                            if let Some(value) = delta.get(key).filter(|v| !v.is_null()) {
-                                let count = value.as_str().map_or_else(|| value.to_string().len(), |s| s.chars().count());
-                                if count > 0 { *thinking.entry(key.into()).or_default() += count; }
-                            }
-                        }
-                    }
-                    Ok(())
-                }).await.map(|_| ())
-            }).await;
-            eprintln!("CONTROL_RESULT {label} {}", json!({"elapsedMs":started.elapsed().as_millis() as u64,
-                "firstTextMs":first_text_ms,"events":events,"textChars":text_chars,"thinkingFields":thinking,
-                "finish":finish,"result":format!("{result:?}")}));
-            assert!(result.is_ok_and(|r| r.is_ok()), "request failed; do not auto-retry");
-            assert!(events > 0 && text_chars > 0, "diagnostic received no answer");
-            if control == Some("off") { assert!(thinking.is_empty(), "gateway off still returned reasoning"); }
-        }
-    }
-
     #[test]
     fn commandcode_off_uses_gateway_enum_without_changing_native_thinking() {
         let mut model = test_model("openai-completions");

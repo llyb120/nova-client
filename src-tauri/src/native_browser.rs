@@ -1956,49 +1956,16 @@ pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> 
     let resolved = resolve_targets(root, &args, &owner, "webview").await?;
     let mut result = execute_webview(root, &resolved).await?;
     if let Some(op) = inferred { result["operationInferred"] = json!(op); }
-    Ok(crate::altair::filter(&args, with_experience_hint("webview", &owner, result)).await)
+    Ok(with_experience_hint("webview", &owner, result))
 }
 
-/// Coordinate actions may name a `target` (a `vN` from vision.targets or a description) instead of
-/// x/y: Altair locates it on this snapshot's own screenshot, then the normal imageId validation runs.
-async fn resolve_targets(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
+/// Coordinate actions carrying a `target` instead of x/y are rejected up front (no target locating).
+async fn resolve_targets(_root: &Path, args: &Value, _owner: &str, _tool: &str) -> Result<Value, String> {
     let named = |a: &Value| a["target"].is_string();
     if args["operation"] != "act" || !(named(&args["action"]) || args["actions"].as_array().is_some_and(|a| a.iter().any(named))) {
         return Ok(args.clone());
     }
-    let settings = altair_settings()?;
-    if !settings.altair_enabled { return Err("target 需要在设置中开启 Altair；未开启时用 x/y 或 DOM ref".into()); }
-    let snapshot = args["snapshotId"].as_str().unwrap_or_default().to_string();
-    let mut args = args.clone();
-    let single = args["action"].is_object();
-    let mut actions = if single { vec![args["action"].take()] } else { args["actions"].as_array().cloned().unwrap_or_default() };
-    let mut image_id = args["imageId"].clone();
-    for action in &mut actions {
-        let Some(target) = action["target"].as_str().map(str::to_string) else { continue };
-        if action["action"] == "click" && action["ref"].is_null() { action["action"] = json!("click_at"); }
-        if !matches!(action["action"].as_str(), Some("click_at" | "move" | "scroll_at" | "drag")) {
-            return Err("target 只用于 click_at/move/scroll_at/drag；DOM 控件用 frame/ref".into());
-        }
-        let (id, x, y) = match crate::altair::recall(&snapshot, &target) {
-            Some((id, x, y, _)) => (json!(id), x, y),
-            None if target.strip_prefix('v').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) =>
-                return Err(format!("{target} 不在该 snapshotId 的 vision.targets 中；改用文字描述 target")),
-            None => {
-                let (id, path) = altair_shot(root, &args, owner, tool)
-                    .ok_or("该 snapshotId 没有本次截图；先 screenshot（或 act feedback=screenshot）再用 target")?;
-                let point = crate::altair::ground(&settings, &path, &target).await?;
-                (json!(id), point["x"].as_u64().unwrap_or_default() as u32, point["y"].as_u64().unwrap_or_default() as u32)
-            }
-        };
-        if !image_id.is_null() && image_id != id { return Err("同一批 target 必须来自同一张截图（imageId）".into()); }
-        image_id = id;
-        action["x"] = json!(x);
-        action["y"] = json!(y);
-        if let Some(map) = action.as_object_mut() { map.remove("target"); }
-    }
-    if single { args["action"] = actions.remove(0); } else { args["actions"] = json!(actions); }
-    args["imageId"] = image_id;
-    Ok(args)
+    Err("target 定位暂不支持，请使用 x/y 或 DOM ref".into())
 }
 
 /// A missing `operation` is inferred from the other fields instead of failing the call:
@@ -2108,16 +2075,11 @@ pub(crate) fn tool_owner(root: &Path, owner: &str) -> Result<String, String> {
     Ok(format!("{owner}:{}", root.display()))
 }
 
-pub(crate) fn altair_settings() -> Result<crate::settings::Settings, String> {
-    let app = APP.get().ok_or("Altair 仅在 Nova 桌面应用内可用")?;
-    Ok(app.state::<AppState>().settings.lock().unwrap().clone())
-}
-
 fn altair_observation_key(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<String, String> {
     let app = APP.get().ok_or("仅 Nova 内可用")?;
     let key = if tool == "webview" {
         let (_, thread_id) = current_context(root)?;
-        if thread_id != owner { return Err("会话已切换，停止 Altair 连续决策".into()); }
+        if thread_id != owner { return Err("会话已切换，停止连续决策".into()); }
         let s = session(app, args["browserId"].as_str().ok_or("缺少 browserId")?)?;
         check(app, &s)?;
         s.active_tab
@@ -2138,23 +2100,6 @@ pub(crate) fn altair_observation(root: &Path, args: &Value, owner: &str, tool: &
         .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
         .ok_or("观察已失效，交回主模型重新观察")?;
     Ok(observation.pages.clone())
-}
-
-/// First screenshot of the same valid observation as `altair_observation` (Altair input); None without one.
-fn decision_image(observation: &Observation) -> Option<&ScreenshotImage> {
-    // Coordinate reuse has a live pixel guard; model perception does not. A carried screenshot
-    // can show yesterday's popup/loading state even when URL/viewport did not change.
-    observation.images.first().filter(|image| image.id.starts_with(&format!("{}-", observation.id)))
-}
-
-/// (imageId, file) of the snapshot's own fresh screenshot, for Altair grounding.
-fn altair_shot(root: &Path, args: &Value, owner: &str, tool: &str) -> Option<(String, std::path::PathBuf)> {
-    let key = altair_observation_key(root, args, owner, tool).ok()?;
-    let state = APP.get()?.state::<BrowserState>();
-    let observations = state.observations.lock().unwrap();
-    let observation = observations.get(&key)
-        .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))?;
-    decision_image(observation).map(|image| (image.id.clone(), image.path.clone()))
 }
 
 fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashMap<String, Observation>) -> Result<Value, String> {
@@ -2204,9 +2149,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
         result["tabTag"] = normalized["tabTag"].clone();
         result["targetResolvedFrom"] = json!(if args.get("snapshotId").is_some() { "snapshotId" } else { "sessionObservation" });
     }
-    let result = with_experience_hint("chrome", &thread_id, result);
-    // The settings UI drives Chrome too; only agent replies go through the vision proxy.
-    Ok(if owner.starts_with("ui:") { result } else { crate::altair::filter(args, result).await })
+    Ok(with_experience_hint("chrome", &thread_id, result))
 }
 
 async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
@@ -2615,20 +2558,6 @@ mod tests {
             assert_eq!(carry_screenshot(&mut next, previous), None);
             assert_eq!(next.screenshot, had);
         }
-    }
-
-    #[test]
-    fn carried_coordinates_are_not_a_fresh_altair_image() {
-        let previous = Observation { frames: Vec::new(), pages: json!({"pages":[{"stamp":"same viewport","visibleText":"Loading"}]}),
-            id:"old".into(), captured:std::time::Instant::now(), screenshot:true, full_page:false,
-            images:vec![ScreenshotImage{id:"old-0".into(),path:"old.png".into(),x:0.,y:0.,width:100.,height:100.,pixels:(100,100)}] };
-        assert!(decision_image(&previous).is_some());
-        let mut fresh = previous.clone(); fresh.id = "new".into(); fresh.screenshot = false; fresh.images.clear();
-        fresh.pages["pages"][0]["visibleText"] = json!("Results ready; popup closed");
-        assert!(carry_screenshot(&mut fresh, Some(&previous)).is_some(), "coordinate compatibility is unchanged");
-        assert!(decision_image(&fresh).is_none(), "Altair must recapture even though viewport is identical");
-        fresh.images[0].id = "new-0".into();
-        assert!(decision_image(&fresh).is_some());
     }
 
     #[test]

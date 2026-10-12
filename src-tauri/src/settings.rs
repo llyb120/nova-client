@@ -64,9 +64,6 @@ fn default_powershell_utf8() -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// Altair：Lyra 配置的识图模型，结合页面文字与截图驱动网页/桌面 run。
-    pub altair_enabled: bool,
-    pub altair_model: String,
     /// Kimi Code CLI，使用固定的 `acp` 子命令。
     pub kimi_path: String,
     /// Claude Code 的 ACP adapter（不是 claude CLI 本身）。
@@ -201,8 +198,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            altair_enabled: false,
-            altair_model: String::new(),
             kimi_path: "kimi".into(),
             claude_path: "claude-agent-acp".into(),
             claude_proxy: String::new(),

@@ -45,23 +45,20 @@ test('Chrome and WebView share image coordinates, fast scope and bounded batch s
     }
   }
 });
-test('Altair is a vision proxy: the main model decides, run only executes its steps', async()=>{
+test('Chrome, WebView and Jianlai run only executes pre-confirmed steps', async()=>{
   const [chrome,webview,jianlai]=await Promise.all(['chrome','webview','jianlai'].map(tool));
   assert.deepEqual(webview.inputSchema.properties.plan,chrome.inputSchema.properties.plan);
   assert.deepEqual(webview.inputSchema.properties.experience,chrome.inputSchema.properties.experience);
   for (const browser of [chrome,webview]) {
-    assert.match(browser.description,/截图不再发给你/);
-    assert.match(browser.description,/所有判断由你决定，Altair只负责看/);
     assert.match(browser.description,/升序前N不能替换为最高N项倒序展示/);
-    assert.doesNotMatch(browser.description,/JEV|advise|runTemplate|DOM排障/);
+    assert.doesNotMatch(browser.description,/JEV|advise|runTemplate|DOM排障|Altair|vision/);
     assert.deepEqual(browser.inputSchema.properties.plan.required,['task','steps']);
-    assert.equal(browser.inputSchema.properties.action.properties.target.maxLength,300);
-    assert.equal(browser.inputSchema.properties.actions.items.properties.target.maxLength,300);
+    assert.equal(browser.inputSchema.properties.action.properties.target,undefined);
+    assert.equal(browser.inputSchema.properties.actions.items.properties.target,undefined);
     assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
   }
-  assert.match(jianlai.description,/一次act可下发多步/);
   assert.equal(jianlai.inputSchema.properties.plan,undefined);
-  assert.deepEqual(jianlai.inputSchema.properties.actions.items.allOf[0].then,{anyOf:[{required:['x','y']},{required:['target']}]});
+  assert.deepEqual(jianlai.inputSchema.properties.actions.items.allOf[0].then,{required:['x','y']});
   assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,24);
   assert.match(chrome.inputSchema.properties.tabTag.description,/本会话snapshotId/);
   for (const key of ['anyOf','oneOf','allOf']) assert.equal(chrome.inputSchema[key],undefined,'Keep the tool compatible with Claude Code');
@@ -72,8 +69,8 @@ test('Altair is a vision proxy: the main model decides, run only executes its st
     assert(!tool.inputSchema.properties.operation.enum.includes('advise'));
     assert.equal(tool.inputSchema.properties.advice,undefined);
     assert(tool.inputSchema.properties.operation.enum.includes('run'));
-    assert.deepEqual(tool.inputSchema.properties.vision.enum,['auto','raw']);
-    assert.equal(tool.inputSchema.properties.look.maxLength,500);
+    assert.equal(tool.inputSchema.properties.vision,undefined);
+    assert.equal(tool.inputSchema.properties.look,undefined);
   }
 });
 test('browser run transport outlives the decision budget without changing normal calls',async t=>{

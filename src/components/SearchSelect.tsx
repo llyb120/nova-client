@@ -267,6 +267,29 @@ export function SearchSelect(props: {
     return m?.efforts?.length ? m : undefined;
   });
 
+  // 思考强度列已展开时，划过中间的其它模型行容易在抵达强度列前把它顶掉（经典悬停子菜单问题）。
+  // 用短延迟 + 可取消替代立即切换：划过是连续 mouseenter 互相取消上一行的定时器，
+  // 真正停留或已进入强度列才提交切换；还没展开任何强度列时第一次悬停仍即时生效。
+  const HOVER_INTENT_MS = 120;
+  let intentTimer: ReturnType<typeof setTimeout> | undefined;
+  const cancelIntent = () => {
+    if (intentTimer === undefined) return;
+    clearTimeout(intentTimer);
+    intentTimer = undefined;
+  };
+  const scheduleActiveModel = (value: string) => {
+    cancelIntent();
+    if (!effortModel()) {
+      setActiveModel(value);
+      return;
+    }
+    intentTimer = setTimeout(() => {
+      intentTimer = undefined;
+      setActiveModel(value);
+    }, HOVER_INTENT_MS);
+  };
+  onCleanup(cancelIntent);
+
   /** 直接选模型时沿用该模型上次选的强度（仍在档位里才用），没有记录才用默认 */
   const pickModel = (o: SelectOption) => {
     const last = o.efforts?.length ? readLastEfforts()[o.value] : undefined;
@@ -349,6 +372,7 @@ export function SearchSelect(props: {
       setQuery("");
       setActiveGroup(null);
       setActiveBackend(null);
+      cancelIntent();
       setActiveModel(null);
       if (props.searchable) queueMicrotask(() => searchRef?.focus());
     }
@@ -388,7 +412,7 @@ export function SearchSelect(props: {
         o.efforts?.length && effortModel() === o ? "open" : ""
       }`}
       onClick={() => pickModel(o)}
-      onMouseEnter={() => setActiveModel(o.value)}
+      onMouseEnter={() => scheduleActiveModel(o.value)}
       title={o.title ?? o.value}
     >
       <span class="sel-model-copy">
@@ -445,7 +469,7 @@ export function SearchSelect(props: {
   );
   const effortPane = () => (
     <Show when={hasEfforts()}>
-      <div class="sel-list sel-efforts">
+      <div class="sel-list sel-efforts" onMouseEnter={cancelIntent}>
         <Show when={effortModel()} fallback={<div class="sel-empty">思考强度</div>}>
           {(m) => (
             <>
