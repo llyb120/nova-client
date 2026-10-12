@@ -84,6 +84,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
   const [dirty, setDirty] = createSignal(false);
   const [presets, setPresets] = createSignal<Preset[]>([]);
   let raw: Record<string, any> = {};
+  let root: HTMLElement | undefined;
 
   const load = async () => {
     setError("");
@@ -165,6 +166,12 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
     let id = presetId === "openai-compatible" ? "" : presetId;
     for (let n = 2; id && draft.providers.some((p) => p.id === id); n++) id = `${presetId}-${n}`;
     edit((d) => void d.providers.push(presetId === "manual" ? providerDraft("", { api: APIS[0] }) : providerDraft(id, { preset: presetId })));
+    // 新项在列表末尾，自动滚动到并聚焦，省去手动翻页。
+    requestAnimationFrame(() => {
+      const el = root?.querySelector<HTMLElement>(".lyra-provider:last-of-type");
+      el?.scrollIntoView({ block: "center", behavior: "smooth" });
+      el?.querySelector<HTMLElement>("input:not([type=checkbox])")?.focus({ preventScroll: true });
+    });
   };
 
   // 预设 provider 的模型自动拉取，界面里看不到，选中的默认模型不应标为不存在。
@@ -178,7 +185,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
   };
 
   return (
-    <section class="lyra-config">
+    <section class="lyra-config" ref={root}>
       <Show when={error()}>
         <span class="field-hint lyra-error" role="alert">{error()}</span>
       </Show>
@@ -195,7 +202,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
           </select>
         </label>
 
-        <div class="lyra-section-head">
+        <div class="lyra-section-head lyra-providers-head">
           <div class="lyra-heading">
             <h3>模型服务商 <span class="lyra-count">{draft.providers.length}</span></h3>
             <p class="field-hint">添加服务商、获取模型，再选择默认模型。</p>
@@ -241,6 +248,16 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                   <span class="lyra-count">{fetched[p().id.trim()]?.models || p().models.length
                     ? `${new Set([...Object.keys(fetched[p().id.trim()]?.models ?? {}), ...p().models.map((m) => m.id)]).size} 个模型`
                     : p().preset ? "自动获取模型" : "待添加模型"}</span>
+                  <button
+                    type="button"
+                    class="link-btn lyra-del"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      void removeProvider(pi);
+                    }}
+                  >
+                    删除
+                  </button>
                 </summary>
                 <div class="lyra-provider-body">
                   <h4>连接配置</h4>
@@ -316,13 +333,18 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                             <summary>
                               <span class="lyra-provider-title">{m().name || m().id || "未命名模型"}</span>
                               <span class="field-hint">手动配置</span>
+                              <button
+                                type="button"
+                                class="link-btn lyra-del"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  setP((x) => void x.models.splice(mi, 1));
+                                }}
+                              >
+                                删除
+                              </button>
                             </summary>
                             <div class="lyra-detail-body">
-                              <div class="backend-card-head">
-                                <button type="button" class="link-btn" style={{ "margin-left": "auto" }} onClick={() => setP((x) => void x.models.splice(mi, 1))}>
-                                  删除模型
-                                </button>
-                              </div>
                               <div class="backend-fields">
                                 <label class="backend-field">
                                   <span class="field-label">模型 ID</span>
@@ -402,7 +424,6 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                   </details>
                   <div class="lyra-provider-footer">
                     <span class="field-hint">修改后点击底部「保存」生效</span>
-                    <button type="button" class="link-btn" onClick={() => void removeProvider(pi)}>删除 Provider</button>
                   </div>
                 </div>
               </details>
