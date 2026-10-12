@@ -30,6 +30,44 @@ pub(crate) fn bounds() -> Option<Rect> {
 
 #[cfg(windows)]
 static ACTIVITY: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+#[cfg(windows)]
+static SEEN: std::sync::Mutex<Seen> = std::sync::Mutex::new(Seen { at: std::collections::BTreeMap::new(), unread: std::collections::BTreeSet::new() });
+
+/// A thread is viewed once clicked on the island, or opened in Nova after finishing unread,
+/// at or after its last update. In memory only: after a restart the latest result shows once more.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct Seen { at: std::collections::BTreeMap<String, i64>, unread: std::collections::BTreeSet<String> }
+
+#[cfg(any(windows, test))]
+impl Seen {
+    fn observe(&mut self, id: &str, unread: u32, updated_at: i64) {
+        if unread > 0 {
+            if !self.unread.contains(id) { self.unread.insert(id.into()); }
+        } else if self.unread.remove(id) {
+            self.at.insert(id.into(), updated_at);
+        }
+    }
+    fn viewed(&self, id: &str, updated_at: i64) -> bool { self.at.get(id).is_some_and(|&at| at >= updated_at) }
+}
+
+/// Newest unread result first, else the newest thread; anything viewed since its last update is skipped.
+#[cfg(any(windows, test))]
+fn pick<'a>(threads: &[(&'a str, i64, u32)], seen: &Seen) -> Option<&'a str> {
+    let fresh = |t: &&(&str, i64, u32)| !seen.viewed(t.0, t.1);
+    threads.iter().filter(|t| t.2 > 0).filter(fresh).max_by_key(|t| t.1)
+        .or_else(|| threads.iter().max_by_key(|t| t.1).filter(fresh))
+        .map(|t| t.0)
+}
+
+/// Island click: the result it showed is now viewed.
+#[cfg(windows)]
+fn mark_seen(app: &tauri::AppHandle, thread: &str) {
+    use tauri::Manager;
+    let state = app.state::<crate::AppState>();
+    let stamp = state.store.lock().ok().and_then(|store| store.threads.iter().find(|t| t.id == thread).map(|t| t.updated_at));
+    if let (Some(stamp), Ok(mut seen)) = (stamp, SEEN.lock()) { seen.at.insert(thread.into(), stamp); }
+}
 
 pub(crate) struct Activity {
     #[cfg(windows)]
@@ -196,7 +234,12 @@ fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
     if let Some(activity) = desktop {
         return Some(Status::new(Kind::Running, format!("剑来 · {activity}"), String::new(), &["Nova 正在操作桌面"], None));
     }
-    let Some(thread) = store.threads.iter().filter(|t| !t.items.is_empty()).max_by_key(|t| t.updated_at) else {
+    let mut seen = SEEN.lock().ok()?;
+    let candidates: Vec<_> = store.threads.iter().filter(|t| !t.items.is_empty()).map(|t| {
+        seen.observe(&t.id, t.unread_turns, t.updated_at);
+        (t.id.as_str(), t.updated_at, t.unread_turns)
+    }).collect();
+    let Some(thread) = pick(&candidates, &seen).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
         return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Nova", "点击打开"], None));
     };
     // The last turn's final reply (or error) is the conclusion.
@@ -267,6 +310,23 @@ mod tests {
         assert_eq!((ago(5_000), ago(180_000), ago(7_200_000)), ("刚刚".into(), "3 分钟前".into(), "2 小时前".into()));
         let status = Status::new(Kind::Done, "好".into(), "刚刚".into(), &["标题", "", "点击"], None);
         assert_eq!((status.title().as_str(), status.detail.as_str()), ("Nova · 好 · 刚刚", "标题\n点击"));
+    }
+
+    #[test]
+    fn viewed_results_give_way_to_other_unread_results() {
+        let mut seen = Seen::default();
+        let threads = [("old", 10, 0), ("a", 30, 1), ("b", 20, 2), ("latest", 40, 0)];
+        assert_eq!(pick(&threads, &seen), Some("a"), "unread beats a newer already-read thread");
+        seen.at.insert("a".into(), 30); // Clicked on the island.
+        assert_eq!(pick(&threads, &seen), Some("b"));
+        seen.observe("b", 2, 20);
+        seen.observe("b", 0, 20); // Opened in Nova: unread cleared.
+        let threads = [("old", 10, 0), ("a", 30, 0), ("b", 20, 0), ("latest", 40, 0)];
+        assert_eq!(pick(&threads, &seen), Some("latest"), "no unread left: the newest result if not viewed");
+        seen.at.insert("latest".into(), 40);
+        assert_eq!(pick(&threads, &seen), None, "never falls back to old history");
+        let threads = [("latest", 41, 0)];
+        assert_eq!(pick(&threads, &seen), Some("latest"), "a newer update is unviewed again");
     }
 
     #[test]

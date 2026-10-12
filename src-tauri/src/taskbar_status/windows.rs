@@ -525,6 +525,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if let Some(app) = APP.get() {
                 crate::sys_notify::focus_main_window(app);
                 if let Some(thread) = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone())) {
+                    super::mark_seen(app, &thread);
+                    wake();
                     use tauri::Emitter;
                     let _ = app.emit(crate::acp::EV_NOTIFY_OPEN, serde_json::json!({ "threadId": thread }));
                 }
