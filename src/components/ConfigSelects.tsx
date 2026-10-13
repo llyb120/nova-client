@@ -107,12 +107,12 @@ function priceText(cost?: ModelCost): string | undefined {
   return `$${fmt(p.input ?? 0)}/$${fmt(p.output ?? 0)}`;
 }
 
-/** CodeBuddy 的费用（积分倍率）随模型 description 下发，形如 "x0.79 credits"。
- *  解析成与 Devin 积分倍率一致的紧凑样式 "0.79×"，解析失败时回退去掉前缀的原文。 */
+/** CodeBuddy / WorkBuddy 的积分倍率随 description 下发："x0.79 credits" 或 "x0.79"。 */
 function creditsText(description?: string): string | undefined {
-  if (!description || !/credits/i.test(description)) return undefined;
-  const m = description.match(/x?\s*([\d.]+)\s*credits/i);
-  if (!m) return description.trim();
+  if (!description) return undefined;
+  const m = description.match(/^\s*[x×]\s*(\d+(?:\.\d+)?)\s*$/i)
+    ?? description.match(/x?\s*([\d.]+)\s*credits/i);
+  if (!m) return /credits/i.test(description) ? description.trim() : undefined;
   const n = Number(m[1]);
   return Number.isFinite(n) ? `${fmt(n)}×` : `${m[1]}×`;
 }
@@ -156,12 +156,15 @@ export function modelOptionsOf(
     if (typeof effort === "string" && effort) {
       defaultEfforts.set(splitEffort(m.value, agentKind === "lyra")?.[0] ?? m.value, effort);
     }
-    const cost = costs?.[m.value];
+    // Devin 的 ACP 思考档位是合成后缀，费用表仍按基础 modelUid 索引。
+    const cost = costs?.[m.value] ?? (agentKind === "devin"
+      ? costs?.[splitEffort(m.value, false)?.[0] ?? m.value]
+      : undefined);
     const metaVision =
       m._meta?.["cognition.ai/supportsImages"] ?? m._meta?.["codex.ai/supportsImages"];
     const price = priceText(cost);
     const mult = multiplierText(agentKind, cost);
-    // CodeBuddy 无 windsurf 费用数据，改用模型 description 里的积分倍率
+    // CodeBuddy / WorkBuddy 使用模型 description 里的积分倍率
     const credits = creditsText(m.description);
     return {
       value: encode(m.value),

@@ -10,6 +10,7 @@ const source = ts.createSourceFile("ConfigSelects.tsx", readFileSync(
 const names = new Set([
   "encodeModelValue", "encodeQuotaModelValue", "decodeModelValue", "modelOptionsOf", "sharedList",
   "kinds", "sharedReady", "merged", "lyraProviders", "backendOptions", "sourceOf", "modelOptions",
+  "fmt", "creditsText", "priceText", "multiplierText", "detailTitle",
 ]);
 const units = [];
 function visit(node) {
@@ -24,19 +25,17 @@ assert.equal(units.length, names.size);
 const code = ts.transpileModule(units.join("\n").replace(/export function/g, "function"), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
-const kinds = ["lyra", "devin", "codex", "codebuddy", "cursor", "kimi", "claude"];
+const kinds = ["lyra", "devin", "codex", "codebuddy", "workbuddy", "cursor", "kimi", "claude"];
 const efforts = {};
 new Function("exports", ts.transpileModule(readFileSync(
   new URL("../src/modelEfforts.ts", import.meta.url), "utf8",
 ), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText)(efforts);
 const select = new Function("props", "sharedOnly", "ALL_AGENT_KINDS", "foldModelEfforts", "splitEffort", `
   const createMemo = f => f;
-  const state = {};
+  const state = { modelCosts: props.modelCosts };
   const agentLabel = k => k;
   const modelChoices = (kind, source) => source ?? [];
   const groupOf = () => "models";
-  const priceText = () => undefined;
-  const multiplierText = priceText, creditsText = priceText, detailTitle = priceText;
   ${code}
   return {
     shared: () => sharedList().flatMap(option => option.efforts ?? [option])
@@ -44,6 +43,8 @@ const select = new Function("props", "sharedOnly", "ALL_AGENT_KINDS", "foldModel
     options: modelOptions,
     backends: backendOptions,
     decode: decodeModelValue,
+    credits: creditsText,
+    models: modelOptionsOf,
   };
 `);
 
@@ -58,6 +59,53 @@ test("shared selection preserves the exact model ID for every backend", () => {
       assert.equal(select(props, () => true, kinds, efforts.foldEfforts, efforts.splitEffort).shared()[0].option.value, model);
     }
   }
+});
+
+test("WorkBuddy multipliers appear on models and folded reasoning levels, including free models", () => {
+  const picker = select({}, () => false, kinds, efforts.foldEfforts, efforts.splitEffort);
+  for (const [description, expected] of [
+    ["x0.29", "0.29×"], ["x1.20", "1.2×"], ["x0.00", "0×"],
+    ["  X0.65  ", "0.65×"], ["×0.21", "0.21×"],
+    ["x0.79 credits", "0.79×"], ["0 credits", "0×"],
+    [undefined, undefined], ["", undefined], ["128k context", undefined],
+    ["context x2", undefined], ["x0.2.3", undefined], ["x-1", undefined],
+  ]) assert.equal(picker.credits(description), expected, String(description));
+  for (const [base, description, detail] of [["hy4-preview", "x0.29", "0.29×"], ["hy3", "x0.00", "0×"]]) {
+    const [model] = picker.models("workbuddy", false,
+      ["low", "high"].map(effort => ({ value: `${base}:${effort}`, name: `${base} · ${effort}`, description })), true);
+    assert.equal(model.detail, detail);
+    assert.match(model.detailTitle, /积分倍率/);
+    assert.equal(model.efforts.length, 2);
+    for (const effort of model.efforts) assert.equal(effort.detail, detail);
+  }
+});
+
+test("Devin reasoning levels inherit base prices without overriding exact model prices", () => {
+  const picker = select({ modelCosts: {
+    "devin-model": { prices: { input: 5, cached: 0.5, output: 25 } },
+    "devin-model:max": { prices: { input: 6, cached: 0.6, output: 30 } },
+    free: { prices: { input: 0, cached: 0, output: 0 } },
+  } }, () => false, kinds, efforts.foldEfforts, efforts.splitEffort);
+  const choices = ["low", "high", "max"].map(effort => ({
+    value: `devin-model:${effort}`, name: `Model · ${effort}`,
+  }));
+  for (const merged of [false, true]) {
+    const flat = picker.models("devin", merged, choices);
+    assert.deepEqual(flat.map(o => o.detail), ["$5/$25", "$5/$25", "$6/$30"]);
+    assert.match(flat[0].detailTitle, /缓存命中 \$0\.5/);
+    const [parent] = picker.models("devin", merged, choices, true);
+    assert.equal(parent.detail, "$5/$25");
+    assert.deepEqual(parent.efforts.map(o => o.detail), flat.map(o => o.detail));
+  }
+  const [free, unknown, invalidSuffix] = picker.models("devin", false, [
+    { value: "free:high", name: "Free" },
+    { value: "missing:high", name: "Unknown" },
+    { value: "devin-model:not-an-effort", name: "Other" },
+  ]);
+  assert.equal(free.detail, "$0/$0");
+  assert.equal(unknown.detail, undefined);
+  assert.equal(invalidSuffix.detail, undefined);
+  assert.equal(picker.models("workbuddy", false, [choices[0]])[0].detail, undefined);
 });
 
 test("expanded Lyra providers keep the selected effort in its model's backend", () => {
