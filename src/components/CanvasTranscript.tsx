@@ -1154,6 +1154,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let layoutGeneration = 0;
   let renderedThreadId = props.threadId;
   let waitingForInitialSnapshot = props.loading && props.groups.length === 0;
+  // 暖切换等待布局（含图片解码）时，所有重绘入口都保留旧帧，不仅是切换 effect。
+  let holdingFrame = false;
 
   // selection state
   let selection: Selection | null = null;
@@ -1194,16 +1196,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let imageRebuildTimer: number | undefined;
   const paintedImageSources = new Set<string>();
   const imageSizes = new Map<string, Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">>();
-  // 加载失败的图不再参与布局延迟，否则之后每次重排都要白等 IMAGE_DEFER_MS。
+  // 失败/超时是本次会话展示的终态，不再等待或让迟到的解码结果顶掉占位布局。
   const brokenImages = new Set<string>();
   // 发送后图片 src 会由 data URL 换成文件 URI；新图加载完成前沿用同一张图的旧元素/尺寸，避免闪烁和跳动。
   type ImgSize = Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">;
   const shownImages = new Map<string, { el?: HTMLImageElement; size?: ImgSize }>();
   const imageKey = (img: PromptImage) => `${img.name}|${img.mimeType}|${img.size ?? ""}`;
-  // 布局级双缓冲：新布局含尺寸未知的图片时不提交，旧帧留屏，解码完再整帧切换。
-  // 加载失败不会回调 ready，所以最多等 IMAGE_DEFER_MS 后按占位尺寸提交。
-  const IMAGE_DEFER_MS = 300;
-  let imageDeferSince = 0;
+  // 布局级双缓冲：图片全部解码或失败后才提交，不能按短延时强行落占位再补图。
+  // ponytail: 最多等待 10s，超时图片本次按失败处理；需支持更慢的远程图时可加显式重试。
+  const IMAGE_LOAD_TIMEOUT_MS = 10_000;
   let imageDeferTimer: number | undefined;
   const toolTextLayouts = new LruMap<string, { lines: string[]; seps: string[] }>(32);
 
@@ -1305,6 +1306,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         color: p.faint, fontSize: 13, font: p.sans, selectable: !props.loading });
       y += 60;
       if (generation !== layoutGeneration) return false;
+      if (imageDeferTimer !== undefined) window.clearTimeout(imageDeferTimer);
+      imageDeferTimer = undefined;
       groupYs = nextGroupYs;
       blocks = result;
       totalHeight = y + 16;
@@ -1609,22 +1612,27 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     for (const b of result) {
       if (b.kind !== "generated-image") continue;
       const src = String(b.data?.src ?? "");
-      if (imageSizes.has(src)) continue;
-      loadImageSource(src);
+      if (loadImageSource(src)) continue;
       pendingImages ||= !brokenImages.has(src);
     }
     if (pendingImages) {
-      const now = performance.now();
-      imageDeferSince ||= now;
-      const wait = IMAGE_DEFER_MS - (now - imageDeferSince);
-      if (wait > 0) {
-        if (imageDeferTimer === undefined) {
-          imageDeferTimer = window.setTimeout(() => { imageDeferTimer = undefined; if (!disposed) scheduleRebuild(); }, wait);
-        }
-        return false;
+      if (imageDeferTimer === undefined) {
+        imageDeferTimer = window.setTimeout(() => {
+          imageDeferTimer = undefined;
+          if (disposed) return;
+          for (const [src, image] of imgCache) {
+            if ((image as unknown as { _loaded?: boolean })._loaded) continue;
+            brokenImages.add(src);
+            image.onload = image.onerror = null;
+            image.src = "";
+          }
+          scheduleRebuild(false, true);
+        }, IMAGE_LOAD_TIMEOUT_MS);
       }
+      return false;
     }
-    imageDeferSince = 0;
+    if (imageDeferTimer !== undefined) window.clearTimeout(imageDeferTimer);
+    imageDeferTimer = undefined;
     groupYs = nextGroupYs;
     // 虚拟窗口前移后 block 下标变化，选区按组内位置迁移，不能误复制另一轮的文字。
     const remapBlock = (index: number) => {
@@ -2096,7 +2104,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function paintAll() {
     const canvas = canvasEl;
-    if (!canvas || disposed) return;
+    if (!canvas || disposed || holdingFrame) return;
+    // 修改位图尺寸会立即清屏，必须与可提交布局的绘制放在同一帧。
+    const pixelW = Math.max(1, Math.round(viewW * dpr));
+    const pixelH = Math.max(1, Math.round(viewH * dpr));
+    if (canvas.width !== pixelW) canvas.width = pixelW;
+    if (canvas.height !== pixelH) canvas.height = pixelH;
     // 所有滚动入口（滚轮、滚动条、时间线、钉底）都经过这里；按需唤醒屏外组。
     if (groupYs.length) {
       const first = groupAtY(groupYs, scrollY);
@@ -2286,7 +2299,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   function paintBusyIndicators() {
     busyTimer = undefined;
     const canvas = canvasEl;
-    if (!canvas || busyBlockIndices.length === 0) return;
+    if (!canvas || disposed || holdingFrame || busyBlockIndices.length === 0) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -3627,6 +3640,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   function loadImageSource(src: string): HTMLImageElement | null {
     paintedImageSources.add(src);
+    if (brokenImages.has(src)) return null;
     let el = imgCache.get(src);
     if (el) {
       // 刷新 LRU 顺序：Map 迭代按插入序，近期画过的图排在末尾。
@@ -3637,20 +3651,24 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     el = new Image();
     (el as unknown as { _loaded?: boolean })._loaded = false;
     const image = el;
-    const ready = () => {
-      if (disposed || imgCache.get(src) !== image) return;
-      (image as unknown as { _loaded?: boolean })._loaded = true;
+    const ready = (loaded: boolean) => {
+      if (disposed || imgCache.get(src) !== image || brokenImages.has(src)) return;
       const prev = imageSizes.get(src);
-      imageSizes.set(src, { naturalWidth: image.naturalWidth, naturalHeight: image.naturalHeight });
-      // 回滚重新加载的图尺寸不变，只需重绘；首次加载按 60ms 合并成一次重排，避免多图逐张跳动。
-      if (prev?.naturalWidth === image.naturalWidth && prev.naturalHeight === image.naturalHeight) requestPaint();
+      if (loaded) {
+        (image as unknown as { _loaded?: boolean })._loaded = true;
+        imageSizes.set(src, { naturalWidth: image.naturalWidth, naturalHeight: image.naturalHeight });
+      } else {
+        brokenImages.add(src);
+      }
+      // 尺寸不变也可能有布局正在等解码；成功和失败都要唤醒它，而不是只重绘旧帧。
+      if (loaded && imageDeferTimer === undefined && prev?.naturalWidth === image.naturalWidth && prev.naturalHeight === image.naturalHeight) requestPaint();
       else if (imageRebuildTimer === undefined) {
         imageRebuildTimer = window.setTimeout(() => { imageRebuildTimer = undefined; if (!disposed) scheduleRebuild(); }, 60);
       }
     };
-    // 先解码再入画：同步解码会在 drawImage 时卡住一帧。
-    image.onload = () => { image.decode().then(ready, ready); };
-    image.onerror = () => { if (imgCache.get(src) === image) brokenImages.add(src); };
+    // 先解码再入画：解码拒绝与加载失败同样处理，不能把损坏图片交给 drawImage。
+    image.onload = () => { image.decode().then(() => ready(true), () => ready(false)); };
+    image.onerror = () => ready(false);
     el.src = src;
     imgCache.set(src, el);
     return null;
@@ -3674,8 +3692,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     layoutPending = false;
     try {
       const oldScroll = scrollY;
-      if (!await computeLayout(generation)) return;
-      // 被后续重排取代的异步任务不能消费点击锚点；只由真正提交的布局使用。
+      if (!await computeLayout(generation) || disposed || generation !== layoutGeneration) return;
+      // 被后续重排取代的异步任务不能消费点击锚点或释放旧帧；只由真正提交的布局使用。
       const lock = scrollLock;
       scrollLock = null;
       // blocks are replaced during layout; an index from the previous block array may now
@@ -3711,6 +3729,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
       applyEditStyle();
       props.onScroll?.(scrollY, maxScroll, false);
+      holdingFrame = false;
       paintAll();
       // 仅在切换后有实际内容时收尾；缓存未命中会先空布局一帧，不能误清零起点。
       if (props.groups.length > 0) traceThreadSwitchLayoutDone(props.threadId, props.groups.length);
@@ -3783,10 +3802,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (w === viewW && h === viewH && dpr === devicePixelRatio) return;
     dpr = devicePixelRatio || 1;
     viewW = w; viewH = h;
-    const pixelW = Math.max(1, Math.round(w * dpr));
-    const pixelH = Math.max(1, Math.round(h * dpr));
-    canvasEl.width = pixelW;
-    canvasEl.height = pixelH;
     maxScroll = Math.max(0, totalHeight - viewH);
     if (keepBottom) scrollY = maxScroll;
     paintAll();
@@ -3888,6 +3903,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (wheelRaf) { cancelAnimationFrame(wheelRaf); wheelRaf = 0; wheelDelta = 0; }
       if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
       if (rebuildTimer !== undefined) window.clearTimeout(rebuildTimer);
+      if (imageRebuildTimer !== undefined) window.clearTimeout(imageRebuildTimer);
+      if (imageDeferTimer !== undefined) window.clearTimeout(imageDeferTimer);
       if (busyTimer !== undefined) window.clearTimeout(busyTimer);
       canvasEl.removeEventListener("mousemove", onMouseMove);
       canvasEl.removeEventListener("mouseleave", onMouseLeave);
@@ -3939,6 +3956,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const loadedInitialSnapshot = waitingForInitialSnapshot && groups.length > 0;
     if (loadedInitialSnapshot) waitingForInitialSnapshot = false;
     if (switchedThread) {
+      holdingFrame = warmSwitch;
       renderedThreadId = threadId;
       layoutGeneration++;
       scrollLock = null;
@@ -3956,7 +3974,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       imageSizes.clear();
       shownImages.clear();
       brokenImages.clear();
-      imageDeferSince = 0;
+      if (imageRebuildTimer !== undefined) window.clearTimeout(imageRebuildTimer);
+      if (imageDeferTimer !== undefined) window.clearTimeout(imageDeferTimer);
+      imageRebuildTimer = imageDeferTimer = undefined;
       laidOutStart = laidOutEnd = 0;
       jumpGroup = null;
       keepBottom = true;
