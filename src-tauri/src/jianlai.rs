@@ -1494,10 +1494,21 @@ fn has_target(args: &Value) -> bool {
 }
 
 pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
-    // look/vision are unused but still tolerated; the desktop request schema stays strict.
+    execute_inner(root, &tolerate_slips(args), owner).await
+}
+
+/// look/vision are unused but still tolerated, and a lone `action` (chrome's shape, often reused by
+/// weaker models such as DeepSeek) becomes a one-item batch; the desktop request schema stays strict.
+fn tolerate_slips(args: &Value) -> Value {
     let mut inner = args.clone();
-    if let Some(map) = inner.as_object_mut() { map.remove("look"); map.remove("vision"); }
-    execute_inner(root, &inner, owner).await
+    if let Some(map) = inner.as_object_mut() {
+        map.remove("look"); map.remove("vision");
+        if !map.contains_key("actions") && map.get("action").is_some_and(Value::is_object) {
+            let action = map.remove("action").unwrap();
+            map.insert("actions".into(), json!([action]));
+        }
+    }
+    inner
 }
 
 async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> {
@@ -1549,6 +1560,16 @@ mod tests {
         assert_eq!(unchanged_from(&seen, "window-1", 7), Some(&std::path::PathBuf::from("a.jpg")));
         assert_eq!(unchanged_from(&seen, "window-1", 8), None, "changed pixels are always resent");
         assert_eq!(unchanged_from(&seen, "window-1-region-0-0-10-10", 7), None, "a crop is a different image");
+    }
+    #[test]
+    fn lone_action_becomes_a_one_item_batch() {
+        let click = json!({"action":"click","x":1,"y":2});
+        let args = tolerate_slips(&json!({"operation":"act","snapshotId":"s","action":click,"look":true}));
+        assert_eq!(args, json!({"operation":"act","snapshotId":"s","actions":[click]}));
+        assert!(serde_json::from_value::<Request>(args).is_ok());
+        // Ambiguous shapes stay untouched so the strict schema still reports them.
+        let both = json!({"operation":"act","action":click,"actions":[]});
+        assert_eq!(tolerate_slips(&both), both);
     }
     #[test]
     fn target_actions_map_through_the_guarded_point() {
