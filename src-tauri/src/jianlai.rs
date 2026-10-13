@@ -948,7 +948,7 @@ fn click_button(enigo: &mut Enigo, button: Button) -> Result<()> {
     }
     Ok(())
 }
-/// Default human-like pointer motion: duration grows with distance (Fitts), minimum-jerk easing, slight arc.
+/// Opt-in human-like pointer motion: duration grows with distance (Fitts), minimum-jerk easing, slight arc.
 fn glide_ms(from: (i32, i32), to: (i32, i32)) -> f64 {
     let d = ((to.0 - from.0) as f64).hypot((to.1 - from.1) as f64);
     (80.0 + 60.0 * (1.0 + d / 24.0).log2()).min(400.0)
@@ -999,8 +999,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
         "click" | "double_click" | "move" | "drag" | "scroll"
     ) {
         let (x, y) = point(shot, a.x, a.y)?;
-        // 指针默认沿轨迹可见地移过去（用户能看清剑来在做什么）；glide:false 才瞬移。滚动始终瞬移定位。
-        if a.glide.unwrap_or(a.action != "scroll") {
+        if a.glide == Some(true) {
             glide(enigo, enigo.location().map_err(err)?, (x, y), expected_foreground)?;
         } else {
             move_pointer(enigo, x, y, false)?;
