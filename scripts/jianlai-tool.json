@@ -250,7 +250,7 @@
             },
             "glide": {
               "type": "boolean",
-              "description": "仅click/double_click/move/drag：true时按拟人连续轨迹移动（约80–400ms，带弧度与先快后慢），默认瞬移。只在需要时开启：悬停才展开的菜单、需拖动阈值/中间移动事件的拖拽或Canvas绘制、应用对瞬移无反应、用户要求可见轨迹"
+              "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
             }
           },
           "allOf": [
