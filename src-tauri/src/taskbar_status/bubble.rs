@@ -31,8 +31,8 @@ static ANCHOR: Mutex<Option<Anchor>> = Mutex::new(None);
 static WANTED: AtomicBool = AtomicBool::new(false);
 static HIDDEN_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static BUILD: Mutex<()> = Mutex::new(());
-/// Finished result on the live card; it counts as viewed once that card closes.
-static SHOWN: Mutex<Option<String>> = Mutex::new(None);
+/// Finished result and its rendered revision, kept on the live card even after it is read.
+static SHOWN: Mutex<Option<(String, i64)>> = Mutex::new(None);
 
 /// Open, or the live card was closed by this very click (blur fires on mouse-down, before the chip sees it).
 pub(super) fn is_open() -> bool {
@@ -79,12 +79,10 @@ pub(super) fn open(app: &AppHandle, anchor: Anchor) {
     if window(app).is_some() { let _ = app.emit_to(LABEL, "taskbar-bubble:open", ()); }
 }
 
-/// Close the card; whatever was on screen counts as viewed.
+/// Close the card without acknowledging updates it has not rendered yet.
 pub(super) fn hide(app: &AppHandle) {
     if WANTED.swap(false, Ordering::AcqRel) { *HIDDEN_AT.lock().unwrap() = Some(Instant::now()); }
-    // Release SHOWN before mark_seen takes the store: payload() locks them the other way round.
-    let shown = SHOWN.lock().unwrap().take();
-    if let Some(thread) = shown { super::mark_seen(app, &thread); }
+    SHOWN.lock().unwrap().take();
     if let Some(window) = app.get_webview_window(LABEL) {
         if window.is_visible().unwrap_or(false) { let _ = window.hide(); }
     }
@@ -127,6 +125,14 @@ pub(super) fn place(app: &AppHandle, css_height: f64) -> bool {
     if wanted && !window.is_visible().unwrap_or(true) {
         let _ = window.show();
         let _ = window.set_focus();
+    }
+    if WANTED.load(Ordering::Acquire) && window.is_visible().unwrap_or(false) {
+        // Acknowledge only the revision rendered by the page, not a newer store update.
+        let shown = SHOWN.lock().unwrap().clone();
+        if let (Some((thread, stamp)), Ok(mut seen)) = (shown, super::SEEN.lock()) {
+            seen.at.entry(thread).and_modify(|at| *at = (*at).max(stamp)).or_insert(stamp);
+        }
+        super::windows::wake();
     }
     wanted
 }
@@ -184,7 +190,8 @@ fn name(kind: Kind) -> &'static str {
 
 /// The live card is available only after a click on the Butterfly.
 pub(super) fn payload(app: &AppHandle) -> Value {
-    let Some(status) = super::snapshot(app) else { return Value::Null };
+    let shown = SHOWN.lock().unwrap().clone();
+    let Some(status) = super::snapshot(app, shown.as_ref().map(|(thread, _)| thread.as_str())) else { return Value::Null };
     let state = app.state::<crate::AppState>();
     let mut permissions: Vec<Value> = state.remote_permissions.lock().map(|p| p.values().cloned().collect()).unwrap_or_default();
     let cards = {
@@ -196,9 +203,9 @@ pub(super) fn payload(app: &AppHandle) -> Value {
         let mut cards = Vec::new();
         let settled = matches!(status.kind, Kind::Done | Kind::Error);
         if WANTED.load(Ordering::Acquire) {
-            let (title, body) = status.thread.as_deref().and_then(|id| store.get(id))
-                .map(|t| (t.title.clone(), latest_reply(&t.items).1)).unwrap_or_default();
-            if settled { *SHOWN.lock().unwrap() = status.thread.clone(); }
+            let thread = status.thread.as_deref().and_then(|id| store.get(id));
+            let (title, body) = thread.map(|t| (t.title.clone(), latest_reply(&t.items).1)).unwrap_or_default();
+            *SHOWN.lock().unwrap() = thread.filter(|_| settled).map(|t| (t.id.clone(), t.updated_at));
             // Keyed by thread: a half-typed reply never carries over to another thread's card.
             let key = format!("live:{}", status.thread.as_deref().unwrap_or(""));
             cards.push(json!({ "key": key, "live": true, "kind": name(status.kind), "text": if status.kind == Kind::Idle { "新会话 · 临时目录" } else { &status.text }, "trailing": status.trailing,

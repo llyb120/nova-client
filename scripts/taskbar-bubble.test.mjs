@@ -81,6 +81,29 @@ async function replyCheck(threadId, fail) {
 await replyCheck(null, false);
 await replyCheck('existing', false);
 await replyCheck(null, true);
+// A completed reply may have exactly the same height as its streaming preview.
+// Every successful refresh must acknowledge the rendered card, not only a resize or close.
+const load = find('src/components/TaskbarBubble.tsx', n => ts.isVariableDeclaration(n) && n.name.getText() === 'load');
+const loadExpression = load.slice(load.indexOf('=') + 1);
+const rendered = [];
+let hasCard = true;
+const reloadCard = evaluate(loadExpression, {
+  invoke: async () => ({ cards: hasCard ? [{ key: 'live:thread' }] : [], permissions: [], light: false }),
+  document: { documentElement: { classList: { toggle() {} } } },
+  setCards: () => rendered.push('cards'), reconcile: x => x,
+  permissions: () => [], setPermissions() {},
+  requestAnimationFrame: callback => { rendered.push('render'); callback(); },
+  place: async () => { rendered.push('acknowledge'); return true; },
+  hide: () => { rendered.push('hide'); },
+});
+assert.equal(await reloadCard(), true);
+assert.equal(await reloadCard(), true);
+assert.deepEqual(rendered, ['cards', 'render', 'acknowledge', 'cards', 'render', 'acknowledge']);
+rendered.length = 0;
+hasCard = false;
+await reloadCard();
+assert.deepEqual(rendered, ['hide'], 'a hidden/prewarmed bubble must not acknowledge a result');
+
 // Native placement must reject post-hide ResizeObserver notifications before touching HWND
 // geometry. No AppHandle/HWND is available in this headless check, so pin the guard's ordering.
 const native = readFileSync(new URL('../src-tauri/src/taskbar_status/bubble.rs', import.meta.url), 'utf8');
@@ -91,4 +114,10 @@ assert.ok(hiddenGuard >= 0 && hiddenGuard < placement.indexOf('let Some(anchor)'
 const construction = native.slice(native.indexOf('pub(super) fn window('), native.indexOf('pub(super) fn open('));
 assert.match(construction, /let disabled = 1i32;[\s\S]*DwmSetWindowAttribute\(hwnd\.0 as _, DWMWA_TRANSITIONS_FORCEDISABLED/,
   'the transparent flyout must not retain a native hide-animation surface');
-console.log('Butterfly dispatch, reply collapse and hidden-window placement checks passed.');
+assert.match(placement, /WANTED\.load\(Ordering::Acquire\) && window\.is_visible\(\)\.unwrap_or\(false\)/,
+  'only a genuinely visible bubble can mark its rendered revision seen');
+assert.match(placement, /Some\(\(thread, stamp\)\)[\s\S]*seen\.at\.entry\(thread\)[\s\S]*max\(stamp\)/,
+  'acknowledgement must use the rendered timestamp, without rolling back newer acknowledgements');
+const closing = native.slice(native.indexOf('pub(super) fn hide('), native.indexOf('/// Close the card, optionally'));
+assert.doesNotMatch(closing, /mark_seen/, 'closing must not mark a newer, unrendered result read');
+console.log('Butterfly dispatch, reply collapse, visible-result acknowledgement and placement checks passed.');

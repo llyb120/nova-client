@@ -106,9 +106,10 @@ impl Seen {
     fn viewed(&self, id: &str, updated_at: i64) -> bool { self.at.get(id).is_some_and(|&at| at >= updated_at) }
 }
 
-/// Newest unread result first, else the newest thread; anything viewed since its last update is skipped.
+/// Keep an open card readable after marking it seen; the chip still skips viewed results.
 #[cfg(any(windows, test))]
-fn pick<'a>(threads: &[(&'a str, i64, u32)], seen: &Seen) -> Option<&'a str> {
+fn pick<'a>(threads: &[(&'a str, i64, u32)], seen: &Seen, shown: Option<&str>) -> Option<&'a str> {
+    if let Some(thread) = threads.iter().find(|t| Some(t.0) == shown) { return Some(thread.0); }
     let fresh = |t: &&(&str, i64, u32)| !seen.viewed(t.0, t.1);
     threads.iter().filter(|t| t.2 > 0).filter(fresh).max_by_key(|t| t.1)
         .or_else(|| threads.iter().max_by_key(|t| t.1).filter(fresh))
@@ -248,7 +249,7 @@ impl Status {
 }
 
 #[cfg(windows)]
-fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
+fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
     use crate::threads::Item;
     use tauri::Manager;
     let state = app.state::<crate::AppState>();
@@ -295,7 +296,7 @@ fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
         seen.observe(&t.id, t.unread_turns, t.updated_at);
         (t.id.as_str(), t.updated_at, t.unread_turns)
     }).collect();
-    let Some(thread) = pick(&candidates, &seen).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
+    let Some(thread) = pick(&candidates, &seen, shown).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
         return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "单击发起新会话 · 双击打开 Nova"], None));
     };
     // The last turn's final reply (or error) is the conclusion.
@@ -372,17 +373,20 @@ mod tests {
     fn viewed_results_give_way_to_other_unread_results() {
         let mut seen = Seen::default();
         let threads = [("old", 10, 0), ("a", 30, 1), ("b", 20, 2), ("latest", 40, 0)];
-        assert_eq!(pick(&threads, &seen), Some("a"), "unread beats a newer already-read thread");
-        seen.at.insert("a".into(), 30); // Clicked on the island.
-        assert_eq!(pick(&threads, &seen), Some("b"));
+        assert_eq!(pick(&threads, &seen, None), Some("a"), "unread beats a newer already-read thread");
+        seen.at.insert("a".into(), 30); // Result rendered in the open bubble.
+        assert_eq!(pick(&threads, &seen, None), Some("b"), "the chip advances immediately, without closing the bubble");
+        assert_eq!(pick(&threads, &seen, Some("a")), Some("a"), "reading or replying must not switch cards after marking seen");
+        assert_eq!(pick(&threads, &seen, Some("deleted")), Some("b"));
         seen.observe("b", 2, 20);
         seen.observe("b", 0, 20); // Opened in Nova: unread cleared.
         let threads = [("old", 10, 0), ("a", 30, 0), ("b", 20, 0), ("latest", 40, 0)];
-        assert_eq!(pick(&threads, &seen), Some("latest"), "no unread left: the newest result if not viewed");
+        assert_eq!(pick(&threads, &seen, None), Some("latest"), "no unread left: the newest result if not viewed");
         seen.at.insert("latest".into(), 40);
-        assert_eq!(pick(&threads, &seen), None, "never falls back to old history");
+        assert_eq!(pick(&threads, &seen, None), None, "never falls back to old history");
+        assert_eq!(pick(&threads, &seen, Some("latest")), Some("latest"), "last result stays readable while the chip is idle");
         let threads = [("latest", 41, 0)];
-        assert_eq!(pick(&threads, &seen), Some("latest"), "a newer update is unviewed again");
+        assert_eq!(pick(&threads, &seen, None), Some("latest"), "a newer update is unviewed again");
     }
 
     #[test]

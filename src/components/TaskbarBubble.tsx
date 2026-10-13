@@ -227,13 +227,14 @@ export default function TaskbarBubble() {
     // Keep in-progress answers: only rebuild cards when the set of requests changes.
     const keys = (list: Permission[]) => list.map((p) => p.requestKey).join("\n");
     if (keys(next.permissions) !== keys(permissions())) setPermissions(next.permissions);
+    // A same-size update does not fire ResizeObserver; acknowledge it after rendering too.
+    await new Promise(requestAnimationFrame);
+    return place();
   };
   const open = async () => {
     clearInterval(timer);
-    await load();
-    await new Promise(requestAnimationFrame);
     // Live refresh only while shown (a prewarmed page is not).
-    if (await place()) timer = window.setInterval(() => void load(), 1000);
+    if (await load()) timer = window.setInterval(() => void load(), 1000);
   };
   const answered = async () => {
     await load();

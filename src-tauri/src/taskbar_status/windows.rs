@@ -55,6 +55,8 @@ thread_local! {
     static CLOSING: Cell<bool> = const { Cell::new(false) };
     /// The button-up that ends a double click must not start a bubble.
     static DOUBLE: Cell<bool> = const { Cell::new(false) };
+    /// The first click can mark its result read and advance CURRENT before the double click.
+    static CLICKED: RefCell<Option<String>> = const { RefCell::new(None) };
     /// Taskbar theme the chip was last painted for.
     static LIGHT: Cell<bool> = const { Cell::new(false) };
 }
@@ -198,7 +200,7 @@ unsafe fn layout_worker() {
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     // No COM objects, UIA calls or foreign-window messages while holding LAYOUT.
     loop {
-        let layout = APP.get().and_then(snapshot).and_then(|_| query_layout()).map(Arc::new);
+        let layout = APP.get().and_then(|app| snapshot(app, None)).and_then(|_| query_layout()).map(Arc::new);
         *LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = layout;
         thread::sleep(Duration::from_millis(500));
         if APP.get().is_none() {
@@ -320,7 +322,7 @@ unsafe fn message_loop() {
 
 unsafe fn refresh(shown: &mut Option<Status>) {
     let mut hwnd = WINDOW.load(Ordering::Acquire) as HWND;
-    let summary = APP.get().and_then(snapshot);
+    let summary = APP.get().and_then(|app| snapshot(app, None));
     let layout = LAYOUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let ready = layout.as_ref().filter(|layout| {
         let parent = layout.parent as HWND;
@@ -747,7 +749,10 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     SetTextColor(target, colors.text);
     let wide: Vec<u16> = text.encode_utf16().collect();
     let mut area = RECT { left, right: right.max(left), ..rect };
-    DrawTextW(target, wide.as_ptr(), wide.len() as i32, &mut area, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    // DrawTextW still dereferences its string for count=0; an empty Vec has no valid buffer.
+    if !wide.is_empty() {
+        DrawTextW(target, wide.as_ptr(), wide.len() as i32, &mut area, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
     SelectObject(target, old_font);
     if !font.is_null() { DeleteObject(font); }
     if !small.is_null() { DeleteObject(small); }
@@ -781,6 +786,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
     match message {
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONDOWN => {
+            CLICKED.with(|clicked| *clicked.borrow_mut() = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone())));
             let closing = super::bubble::is_open();
             CLOSING.set(closing);
             if !closing { on_app(|app| { super::bubble::window(app); }); }
@@ -800,7 +806,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_LBUTTONDBLCLK => {
             // Double click: the full Nova window, on the thread the Butterfly is about.
             DOUBLE.set(true);
-            let thread = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone()));
+            let thread = CLICKED.with(|clicked| clicked.borrow_mut().take());
             on_app(move |app| super::bubble::open_thread(app, thread));
             0
         }
@@ -809,7 +815,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 let mut lens = RECT::default();
                 GetClientRect(hwnd, &mut lens);
                 lens.right = (31 * GetDpiForWindow(hwnd).max(96) as i32 / 96).min(lens.right);
-                InvalidateRect(hwnd, &lens, 0);
+                // Commit each frame now; Win11's layered child gets a whole-surface repaint.
+                // Plain Win10 children keep the small icon-only update region.
+                let layered = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED as isize != 0;
+                RedrawWindow(hwnd, if layered { null() } else { &lens }, null_mut(), RDW_INVALIDATE | RDW_UPDATENOW);
             }
             0
         }
@@ -901,6 +910,58 @@ mod tests {
             }
             DeleteObject(region);
             DestroyWindow(hwnd);
+            UnregisterClassW(class, instance);
+        }
+    }
+
+    #[test]
+    fn double_click_keeps_the_result_target_after_the_first_click_marks_it_read() {
+        CURRENT.with(|c| *c.borrow_mut() = Some(Status::new(Kind::Done, "Done".into(), String::new(), &[], Some("first".into()))));
+        unsafe { window_proc(null_mut(), WM_LBUTTONDOWN, 0, 0); }
+        CURRENT.with(|c| *c.borrow_mut() = None); // The chip has advanced after acknowledging the open card.
+        assert_eq!(CLICKED.with(|clicked| clicked.borrow().clone()).as_deref(), Some("first"));
+        unsafe { window_proc(null_mut(), WM_LBUTTONDBLCLK, 0, 0); }
+        assert!(CLICKED.with(|clicked| clicked.borrow().is_none()));
+        DOUBLE.set(false);
+    }
+
+    #[test]
+    fn animation_tick_paints_immediately_and_refreshes_the_whole_layered_surface() {
+        thread_local! { static PAINTS: RefCell<Vec<Rect>> = const { RefCell::new(Vec::new()) }; }
+        unsafe extern "system" fn observe(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            if message == WM_PAINT {
+                let mut dirty = RECT::default();
+                GetUpdateRect(hwnd, &mut dirty, 0);
+                PAINTS.with(|paints| paints.borrow_mut().push(Rect {
+                    left: dirty.left, top: dirty.top, right: dirty.right, bottom: dirty.bottom,
+                }));
+            }
+            window_proc(hwnd, message, wparam, lparam)
+        }
+        unsafe {
+            let instance = GetModuleHandleW(null());
+            let class = w!("Nova.TaskbarStatus.AnimationTest");
+            let definition = WNDCLASSW { lpfnWndProc: Some(observe), hInstance: instance,
+                lpszClassName: class, ..Default::default() };
+            assert_ne!(RegisterClassW(&definition), 0);
+            for layered in [false, true] {
+                // Exercise both paint paths off-screen, without Explorer or input/focus changes.
+                let ex = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | if layered { WS_EX_LAYERED } else { 0 };
+                let hwnd = CreateWindowExW(ex, class, w!(""), WS_POPUP | WS_VISIBLE,
+                    -32000, -32000, 300, 28, null_mut(), null_mut(), instance, null());
+                assert!(!hwnd.is_null());
+                if layered { assert_ne!(SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA), 0); }
+                UpdateWindow(hwnd);
+                PAINTS.with(|paints| paints.borrow_mut().clear());
+                SendMessageW(hwnd, WM_TIMER, ANIMATION, 0);
+                let mut client = RECT::default();
+                GetClientRect(hwnd, &mut client);
+                let right = if layered { client.right } else { (31 * GetDpiForWindow(hwnd).max(96) as i32 / 96).min(client.right) };
+                PAINTS.with(|paints| assert_eq!(paints.borrow().as_slice(), &[Rect {
+                    left: 0, top: 0, right, bottom: client.bottom,
+                }], "timer must paint before returning (layered={layered})"));
+                DestroyWindow(hwnd);
+            }
             UnregisterClassW(class, instance);
         }
     }
