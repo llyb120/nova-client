@@ -1432,7 +1432,7 @@ async fn guard_coordinate(app:&AppHandle, observation:&Observation, point:&Value
     let expected=xcap::image::imageops::crop_imm(&expected,left,top,width,height).to_image();
     let actual=capture_viewport(app,&observation.pages["pages"][0]["viewport"],
         vx+(left as f64-px)*sx,vy+(top as f64-py)*sy,width as f64*sx,height as f64*sy).await?.to_rgba8();
-    if crate::visual_guard::patch_changed(&expected,&actual) { return Err("落点附近画面已变化，未点击；请根据新截图重新定位".into()); }
+    if crate::visual_guard::patch_changed(&expected,&actual) { return Err("落点附近画面已变化，未点击；请根据新截图重新定位，不要原样重试同一坐标，细小目标先用 screenshot(region) 局部放大".into()); }
     if evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?!=point["stamp"] {return Err("落点校验期间视口已变化，停止点击".into());}
     Ok(())
 }

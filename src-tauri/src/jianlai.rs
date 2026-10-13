@@ -787,7 +787,7 @@ fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, after
     let mut points=vec![source_point(shot,action.x.unwrap(),action.y.unwrap())];
     if action.action=="drag" {points.push(source_point(shot,action.to_x.unwrap(),action.to_y.unwrap()));}
     if points.iter().any(|&(x,y)|guard.changed_near_excluding(image,x,y,after_input,exclude)) {
-        return Err("落点附近画面已变化，停止旧坐标输入；请用返回的新图重新定位，细小目标使用 regionSpace=image 局部截图".into());
+        return Err("落点附近画面已变化，停止旧坐标输入；请用返回的新图重新定位，不要原样重试同一坐标，细小目标使用 regionSpace=image 局部截图".into());
     }
     Ok(())
 }
