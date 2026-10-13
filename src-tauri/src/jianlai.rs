@@ -688,7 +688,7 @@ fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, after
 // Scroll is excluded: a batch's earlier scroll always changes pixels under the same point, and scrolling is reversible.
 fn guarded_pointer(action:&Action) -> bool {matches!(action.action.as_str(),"click"|"double_click"|"drag")}
 fn pointer_matches(expected:(i32,i32),actual:(i32,i32)) -> bool {
-    // Allow native pixel rounding/jitter, not a wrong monitor or DPI mapping.
+    // Allow native rounding (e.g. a late SendInput normalization), not a wrong monitor or DPI mapping.
     (expected.0 as i64-actual.0 as i64).abs()<=2 && (expected.1 as i64-actual.1 as i64).abs()<=2
 }
 fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> Result<()> {
@@ -800,12 +800,32 @@ fn needs_scroll_frame(actions: &[Action], index: usize, feedback: Option<&str>) 
     feedback != Some("none") && actions[index].action == "scroll"
         && actions[index + 1..].iter().any(|a| a.action != "wait")
 }
-fn move_pointer(_enigo: &mut Enigo, x: i32, y: i32) -> Result<()> {
+/// Desktop pixel -> SendInput VIRTUALDESK normalized value; ceil so floor(n*size/65536) lands on the pixel.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn virtual_desk_coordinate(p: i32, origin: i32, size: i32) -> i32 {
+    if size <= 0 { return 0; }
+    ((p as i64 - origin as i64) * 65536 + size as i64 - 1).div_euclid(size as i64).clamp(0, 65535) as i32
+}
+/// `input_event`: glide/drag path points must be real input (hover, drag thresholds, hooks, raw input).
+fn move_pointer(_enigo: &mut Enigo, x: i32, y: i32, input_event: bool) -> Result<()> {
     #[cfg(windows)]
-    {
-        // Enigo 0.6 normalizes to the primary display without VIRTUALDESK.
-        // SetCursorPos accepts desktop coordinates (including negative monitors) synchronously.
-        if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) } == 0 {
+    unsafe {
+        use windows_sys::Win32::UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
+        if input_event {
+            // Enigo 0.6 normalizes to the primary display only (no VIRTUALDESK), which misses other monitors.
+            let mut input = INPUT { r#type: INPUT_MOUSE, ..Default::default() };
+            input.Anonymous.mi = MOUSEINPUT {
+                dx: virtual_desk_coordinate(x, GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN)),
+                dy: virtual_desk_coordinate(y, GetSystemMetrics(SM_YVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)),
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                ..Default::default()
+            };
+            if SendInput(1, &input, size_of::<INPUT>() as i32) != 1 {
+                return Err(err(std::io::Error::last_os_error()));
+            }
+        }
+        // Exact landing in desktop coordinates (incl. negative monitors), immune to normalization rounding.
+        if SetCursorPos(x, y) == 0 {
             return Err(err(std::io::Error::last_os_error()));
         }
         Ok(())
@@ -847,7 +867,7 @@ fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32), expected_foregroun
         let t = (started.elapsed().as_secs_f64() * 1000.0 / ms).min(1.0);
         if foreground()? != expected_foreground { return Err("轨迹移动期间前台改变，停止输入".into()); }
         let (x, y) = glide_at(from, to, bend, t);
-        move_pointer(enigo, x, y)?;
+        move_pointer(enigo, x, y, true)?;
         if t >= 1.0 { return Ok(()); }
         std::thread::sleep(Duration::from_millis(8));
     }
@@ -876,7 +896,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
         if a.glide == Some(true) {
             glide(enigo, enigo.location().map_err(err)?, (x, y), expected_foreground)?;
         } else {
-            move_pointer(enigo, x, y)?;
+            move_pointer(enigo, x, y, false)?;
         }
         // Read back the actual native pointer. A wrong-DPI/clamped/injected location
         // must not be followed by a button press. No speculative correction/replay.
@@ -906,6 +926,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
                 move_pointer(enigo,
                     (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
                     (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
+                    true,
                 )?;
                 std::thread::sleep(Duration::from_millis(16));
                 Ok::<_, String>(())
@@ -1181,7 +1202,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                     result["imageIds"] = json!(snap.shots.iter().map(|shot| &shot.image_id).collect::<Vec<_>>());
                     result["nextArguments"] = json!({"operation":"act","snapshotId":snap.id});
                     if snap.shots.len() == 1 { result["nextArguments"]["imageId"] = json!(snap.shots[0].image_id); }
-                    result["next"] = json!("使用已有最新图片和 nextArguments 修正参数，重新决策剩余 actions；不要重放已执行动作，无需再截图。");
+                    result["next"] = json!("使用已有最新图片和 nextArguments 修正参数，重新决策剩余 actions；不要重放已执行动作。若上下文中已看不到该图，先用 recall 回看或重新 screenshot，不要凭记忆操作。");
                 } else {
                     result["next"] = json!("当前没有本会话未失效的同模式快照；先 windows(observe:true) 或 screenshot 获取 snapshotId，不要继续省略它。");
                 }
@@ -1433,9 +1454,16 @@ mod tests {
         assert!(image_region(&shot,Region{x:399,y:0,width:2,height:1}).is_err());
         assert!(pointer_matches((-1920,-100),(-1919,-99)));
         assert!(pointer_matches((-1920,-100),(-1918,-98)));
-        assert!(pointer_matches((2250,55),(2248,53)));
         assert!(!pointer_matches((-1920,-100),(-1917,-100)));
         assert!(!pointer_matches((2250,55),(2250,58)));
+        // VIRTUALDESK mapping: Windows floors n*size/65536; edges and negative origins must land exactly.
+        for (origin, size) in [(-1920, 4480), (0, 1920), (-3840, 11520)] {
+            for p in [origin, origin + 1, origin + size / 2, origin + size - 1] {
+                let n = virtual_desk_coordinate(p, origin, size) as i64;
+                assert_eq!(origin as i64 + n * size as i64 / 65536, p as i64);
+            }
+        }
+        assert_eq!(virtual_desk_coordinate(-5000, -1920, 4480), 0);
         assert!(!pointer_matches((2250,55),(2054,188))); // Reported multi-monitor miss is not rounding.
         assert!(!pointer_matches((i32::MIN,0),(i32::MAX,0)));
         let original=xcap::image::RgbaImage::from_pixel(200,100,xcap::image::Rgba([20,20,20,255]));
@@ -1793,23 +1821,29 @@ mod tests {
     #[test]
     #[ignore = "Moves the pointer across all monitors; use an idle test desktop"]
     fn pointer_reaches_each_monitor() {
+        use windows_sys::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+        // The app runs Per-Monitor V2 (tao); a bare test process would see virtualized coordinates instead.
+        assert!(!unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }.is_null());
         let mut enigo = Enigo::new(&Settings::default()).unwrap();
         let before = enigo.location().unwrap();
         let checked = (|| -> Result<()> {
             for monitor in Monitor::all().map_err(err)? {
                 let s = monitor_surface(&monitor)?;
                 for (dx, dy) in [(0, 0), (s.width / 2, s.height / 2), (s.width - 1, s.height - 1)] {
-                    let expected = (s.x + dx as i32, s.y + dy as i32);
-                    move_pointer(&mut enigo, expected.0, expected.1)?;
-                    let actual = enigo.location().map_err(err)?;
-                    if !pointer_matches(expected, actual) {
-                        return Err(format!("monitor {}: expected {expected:?}, actual {actual:?}", s.id));
+                    for input_event in [false, true] {
+                        let expected = (s.x + dx as i32, s.y + dy as i32);
+                        move_pointer(&mut enigo, expected.0, expected.1, input_event)?;
+                        std::thread::sleep(Duration::from_millis(20)); // let a queued SendInput land first
+                        let actual = enigo.location().map_err(err)?;
+                        if !pointer_matches(expected, actual) {
+                            return Err(format!("monitor {} input_event={input_event}: expected {expected:?}, actual {actual:?}", s.id));
+                        }
                     }
                 }
             }
             Ok(())
         })();
-        let restored = move_pointer(&mut enigo, before.0, before.1);
+        let restored = move_pointer(&mut enigo, before.0, before.1, false);
         checked.unwrap();
         restored.unwrap();
     }

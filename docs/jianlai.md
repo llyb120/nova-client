@@ -80,7 +80,7 @@ NovaDev对xcap、image、png及压缩依赖启用优化编译；稳定取样先�
 
 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai` 验证坐标、按键与参数边界。
 
-`cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::desktop_smoke -- --ignored` 在真实桌面验证截图→鼠标移动→截图及拒绝重放（只移动指针，不点击或输入）。将测试名换成 `jianlai::tests::pointer_reaches_each_monitor` 可在Windows验证所有显示器的边缘、中心及负坐标落点，结束时恢复指针，不产生截图。两项都只在空闲的测试桌面手动执行。
+`cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::desktop_smoke -- --ignored` 在真实桌面验证截图→鼠标移动→截图及拒绝重放（只移动指针，不点击或输入）。将测试名换成 `jianlai::tests::pointer_reaches_each_monitor` 可在Windows以Per-Monitor V2 DPI感知验证所有显示器的边缘、中心及负坐标落点（瞬移与真实输入路径点两种方式），结束时恢复指针，不产生截图。两项都只在空闲的测试桌面手动执行。
 
 ## 操作调度与定位
 
@@ -104,7 +104,7 @@ Windows的press字母/数字按虚拟键发送，Ctrl+A与Ctrl+a等价；大小�
 
 `regionSpace=image` 可按最新返回图片的像素给出局部裁剪区域，必须同时提供该图的 `snapshotId/imageId`；工具反算裁剪和缩放，重新采集细节图。默认 `regionSpace=source` 兼容原始图片坐标，需要 `windowId` 或 `monitorId`。局部图生成后旧快照失效。
 
-点击/双击/拖动前检查未绘制鼠标标记的原始落点邻域（滚动不检查：同一点连续滚动必然改变画面，且滚动可逆）。Windows瞬移、拟人轨迹及拖动统一使用SetCursorPos，直接接受桌面坐标，避免Enigo按主屏归一化造成多屏偏移；移动后读取系统实际位置，各轴允许最多2个原生像素的舍入/抖动误差，超过仍停止按钮输入，不做猜测补偿。前台改变时停止后续输入，窗口快照的报错直接提示 activate(windowId)，无需先重新截图；第一次点击后前台变化也不继续双击第二次。保留原有反馈稳定检查。像素守卫是启发式，不是控件识别，不承诺捕获所有视觉变化或竞态。
+点击/双击/拖动前检查未绘制鼠标标记的原始落点邻域（滚动不检查：同一点连续滚动必然改变画面，且滚动可逆）。Windows瞬移用SetCursorPos直接接受桌面坐标；拟人轨迹及拖动的路径点先发送按虚拟桌面归一化的SendInput真实输入，再用SetCursorPos校正，避免Enigo按主屏归一化造成多屏偏移；移动后读取系统实际位置，各轴允许最多2个原生像素的舍入误差，超过仍停止按钮输入，不做猜测补偿。前台改变时停止后续输入，窗口快照的报错直接提示 activate(windowId)，无需先重新截图；第一次点击后前台变化也不继续双击第二次。保留原有反馈稳定检查。像素守卫是启发式，不是控件识别，不承诺捕获所有视觉变化或竞态。
 
 本轮未在 Windows 编译和执行原生输入链；新原生单元测试和验收入口见 [精准交互说明](automation-precision.md)。
 
