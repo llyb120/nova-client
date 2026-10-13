@@ -1,5 +1,5 @@
 //! 剑来: native desktop input and screenshot observations. No browser automation.
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -525,45 +525,6 @@ fn visible_window_crop(window: &Surface, monitor: &Surface, image: &xcap::image:
     Ok(xcap::image::imageops::crop_imm(image, x as u32, y as u32, window.width, window.height).to_image())
 }
 
-// ponytail: magnify the current feedback PNG (bounded by maxEdge); use a fresh native crop if more detail is needed.
-fn failure_detail(snap: &mut Snapshot, surface: &Surface, p: (i32, i32), result: &mut Value) -> Result<()> {
-    let Some(full) = snap.shots.iter().find(|s| &s.surface == surface && s.region.is_none()).cloned() else { return Ok(()); };
-    let Some(meta) = result["images"].as_array().and_then(|images| images.iter().find(|v| v["imageId"] == full.image_id)).cloned() else { return Ok(()); };
-    let x = (p.0 as i64 - surface.x as i64) * full.pixels.0 as i64 / surface.width as i64;
-    let y = (p.1 as i64 - surface.y as i64) * full.pixels.1 as i64 / surface.height as i64;
-    if x < 0 || y < 0 || x >= full.pixels.0 as i64 || y >= full.pixels.1 as i64 { return Ok(()); }
-    let region = detail_region(full.pixels, (x as u32, y as u32));
-    let source_region = image_region(&full, region)?;
-    let image = xcap::image::open(meta["path"].as_str().ok_or("反馈图片缺少path")?).map_err(err)?.into_rgba8();
-    let crop = xcap::image::imageops::crop_imm(&image, region.x, region.y, region.width, region.height).to_image();
-    let enlarged = xcap::image::imageops::resize(&crop, region.width * 3, region.height * 3, xcap::image::imageops::FilterType::Triangle);
-    let id = format!("{}-detail", full.image_id);
-    let path = shot_folder(&snap.owner).join(format!("{}-{id}.png", snap.id));
-    enlarged.save(&path).map_err(err)?;
-    let mut detail = meta;
-    detail["imageId"] = json!(id);
-    detail["path"] = json!(path);
-    detail["width"] = json!(enlarged.width());
-    detail["height"] = json!(enlarged.height());
-    detail["region"] = json!({"x":source_region.x,"y":source_region.y,"width":source_region.width,"height":source_region.height});
-    detail["attemptedPoint"] = json!({"x":(x as u32-region.x)*3,"y":(y as u32-region.y)*3});
-    detail["cursor"] = match (detail["cursor"]["x"].as_u64(), detail["cursor"]["y"].as_u64()) {
-        (Some(cx),Some(cy)) if cx >= region.x as u64 && cy >= region.y as u64 && cx < (region.x+region.width) as u64 && cy < (region.y+region.height) as u64 =>
-            json!({"x":(cx-region.x as u64)*3,"y":(cy-region.y as u64)*3,"marker":"magenta-ring","source":"system-pointer"}),
-        _ => Value::Null,
-    };
-    detail["purpose"] = json!("失败落点附近3倍放大图；attemptedPoint是请求落点，cursor是实际鼠标位置，均不是识别出的目标。按此图像素重新定位，不重放旧动作。");
-    snap.shots.push(Shot { image_id:id, pixels:enlarged.dimensions(), region:Some(source_region), ..full });
-    result["images"].as_array_mut().unwrap().push(detail);
-    Ok(())
-}
-
-fn detail_region(pixels: (u32,u32), p: (u32,u32)) -> Region {
-    let width = pixels.0.min(200);
-    let height = pixels.1.min(160);
-    Region { x:p.0.saturating_sub(width/2).min(pixels.0-width), y:p.1.saturating_sub(height/2).min(pixels.1-height), width, height }
-}
-
 fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>) -> Result<&'a Shot> {
     if let Some(id) = image_id {
         if let Some(shot) = shots.iter().find(|s| s.image_id == id) { return Ok(shot); }
@@ -727,7 +688,8 @@ fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, after
 // Scroll is excluded: a batch's earlier scroll always changes pixels under the same point, and scrolling is reversible.
 fn guarded_pointer(action:&Action) -> bool {matches!(action.action.as_str(),"click"|"double_click"|"drag")}
 fn pointer_matches(expected:(i32,i32),actual:(i32,i32)) -> bool {
-    (expected.0 as i64-actual.0 as i64).abs()<=1 && (expected.1 as i64-actual.1 as i64).abs()<=1
+    // Allow native pixel rounding/jitter, not a wrong monitor or DPI mapping.
+    (expected.0 as i64-actual.0 as i64).abs()<=2 && (expected.1 as i64-actual.1 as i64).abs()<=2
 }
 fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> Result<()> {
     if snap.taken.elapsed() > Duration::from_secs(180) {
@@ -834,6 +796,23 @@ fn needs_stable_feedback(actions: &[Action], needs_review: bool) -> bool {
     // Pure positioning gets an immediate frame; hover-dependent UI must use move + wait.
     needs_review || actions.iter().any(|a| a.action != "move")
 }
+fn needs_scroll_frame(actions: &[Action], index: usize, feedback: Option<&str>) -> bool {
+    feedback != Some("none") && actions[index].action == "scroll"
+        && actions[index + 1..].iter().any(|a| a.action != "wait")
+}
+fn move_pointer(_enigo: &mut Enigo, x: i32, y: i32) -> Result<()> {
+    #[cfg(windows)]
+    {
+        // Enigo 0.6 normalizes to the primary display without VIRTUALDESK.
+        // SetCursorPos accepts desktop coordinates (including negative monitors) synchronously.
+        if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) } == 0 {
+            return Err(err(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    _enigo.move_mouse(x, y, enigo::Coordinate::Abs).map_err(err)
+}
 fn click_button(enigo: &mut Enigo, button: Button) -> Result<()> {
     // Keep the native down/up pair together on the successful fast path.
     // A failed reply can still mean partial input: release, but never replay.
@@ -868,7 +847,7 @@ fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32), expected_foregroun
         let t = (started.elapsed().as_secs_f64() * 1000.0 / ms).min(1.0);
         if foreground()? != expected_foreground { return Err("轨迹移动期间前台改变，停止输入".into()); }
         let (x, y) = glide_at(from, to, bend, t);
-        enigo.move_mouse(x, y, Coordinate::Abs).map_err(err)?;
+        move_pointer(enigo, x, y)?;
         if t >= 1.0 { return Ok(()); }
         std::thread::sleep(Duration::from_millis(8));
     }
@@ -897,7 +876,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
         if a.glide == Some(true) {
             glide(enigo, enigo.location().map_err(err)?, (x, y), expected_foreground)?;
         } else {
-            enigo.move_mouse(x, y, Coordinate::Abs).map_err(err)?;
+            move_pointer(enigo, x, y)?;
         }
         // Read back the actual native pointer. A wrong-DPI/clamped/injected location
         // must not be followed by a button press. No speculative correction/replay.
@@ -924,13 +903,10 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
             }
             let moved = if a.glide == Some(true) { glide(enigo, (x, y), (tx, ty), expected_foreground) } else { (1..=12).try_for_each(|i| {
                 if foreground()?!=expected_foreground {return Err("拖动期间前台改变，释放按钮并停止".into());}
-                enigo
-                    .move_mouse(
-                        (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
-                        (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
-                        Coordinate::Abs,
-                    )
-                    .map_err(err)?;
+                move_pointer(enigo,
+                    (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
+                    (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
+                )?;
                 std::thread::sleep(Duration::from_millis(16));
                 Ok::<_, String>(())
             }) };
@@ -1185,20 +1161,27 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                     "剑来 Linux 输入当前仅支持 X11；Wayland 不会静默使用 XWayland 操作".into(),
                 );
             }
-            if request.snapshot_id.as_deref().is_none_or(|id| id.trim().is_empty()) {
-                // Missing is not stale. Do not capture again and invalidate the very ID the model
-                // needs to supply. Never expose another client's or an invalidated snapshot.
-                let mut result = json!({"status":"not_executed","completedActions":0,
-                    "errorCode":"missing_snapshot_id","required":["snapshotId"],
-                    "error":"act 缺少 snapshotId（不是快照过期）；未执行、未重新截图。请原样填写上次观察返回的 snapshotId 后提交动作。"});
-                if let Some(snap) = state.as_ref().filter(|snap| snap.owner == owner && snap.background == bg
-                    && snap.invalidated.is_none() && snap.taken.elapsed() <= Duration::from_secs(180)) {
+            let missing_snapshot = request.snapshot_id.as_deref().is_none_or(|id| id.trim().is_empty());
+            let current = state.as_ref().filter(|snap| snap.owner == owner && snap.background == bg
+                && snap.invalidated.is_none() && snap.taken.elapsed() <= Duration::from_secs(180));
+            if missing_snapshot || current.is_some_and(|snap| Some(&snap.id) != request.snapshot_id.as_ref()) {
+                // Reject, never replay. Keep the latest usable observation instead of rotating IDs/images
+                // on every parameter error; check_target still validates it before any subsequent input.
+                let mut result = json!({"status":"not_executed","completedActions":0,"required":["snapshotId"]});
+                if missing_snapshot {
+                    result["errorCode"] = json!("missing_snapshot_id");
+                    result["error"] = json!("act 缺少 snapshotId（不是快照过期）；未执行、未重新截图。请原样填写上次观察返回的 snapshotId 后提交动作。");
+                } else {
+                    result["errorCode"] = json!("stale_snapshot_id");
+                    result["error"] = json!("旧snapshotId不可用于输入；最新快照仍可用，未执行、未重新截图。请核对最新图及completedActions，不要重放已执行动作。");
+                }
+                if let Some(snap) = current {
                     result["snapshotId"] = json!(snap.id);
                     result["snapshotPreserved"] = json!(true);
                     result["imageIds"] = json!(snap.shots.iter().map(|shot| &shot.image_id).collect::<Vec<_>>());
                     result["nextArguments"] = json!({"operation":"act","snapshotId":snap.id});
                     if snap.shots.len() == 1 { result["nextArguments"]["imageId"] = json!(snap.shots[0].image_id); }
-                    result["next"] = json!("使用已有对应图片和 nextArguments 补齐参数，再附上确认过的 actions；没有输入过的动作可以提交，无需再截图。");
+                    result["next"] = json!("使用已有最新图片和 nextArguments 修正参数，重新决策剩余 actions；不要重放已执行动作，无需再截图。");
                 } else {
                     result["next"] = json!("当前没有本会话未失效的同模式快照；先 windows(observe:true) 或 screenshot 获取 snapshotId，不要继续省略它。");
                 }
@@ -1267,14 +1250,12 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let mut attempted = false;
             let mut clipboard = crate::clipboard::sequence();
             let mut copied_before_paste = None;
-            let mut failed_point = None;
             let mut frames = Vec::new();
             for (index, a) in actions.iter().enumerate() {
                 if a.action != "wait" {
                     // Earlier input (incl. hover from move) changes nearby pixels by design; relax to the target core.
                     let after_input = actions[..index].iter().any(|p| p.action != "wait");
                     if let Err(e) = check_target(&snap, &shot, a, after_input) {
-                        failed_point = point(&shot, a.x, a.y).ok();
                         failure = Some(e);
                         break;
                     }
@@ -1291,14 +1272,13 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 // Our temporary paste/restore is not a copy made by the target application.
                 if clipboard_paste { clipboard = crate::clipboard::sequence(); }
                 if let Err(e) = sent {
-                    failed_point = point(&shot, a.x, a.y).ok();
                     failure = Some(e);
                     break;
                 }
                 completed += 1;
                 std::thread::sleep(action_delay(&actions, index));
-                // 一批多个 scroll 时逐屏附只读中间帧，模型一次调用读完整个列表，不必每滚一次往返一轮。
-                if a.action == "scroll" && index + 1 < actions.len() {
+                // Keep reading frames between inputs, but never duplicate the final scroll + wait feedback.
+                if needs_scroll_frame(&actions, index, request.feedback.as_deref()) {
                     let (mut frame, mut scratch) = (json!({}), None);
                     observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, true, &mut scratch, &mut frame);
                     for mut image in frame["images"].as_array().cloned().unwrap_or_default() {
@@ -1338,13 +1318,8 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             }
             // Read after feedback settling so apps that write the clipboard asynchronously have finished.
             if let Some(copied) = crate::clipboard::copied_since(clipboard).or(copied_before_paste) { result["clipboard"] = copied; }
-            if let (Some(p), Some(current)) = (failed_point, state.as_mut().filter(|s| s.foreground == snap.foreground)) {
-                if let Err(error) = failure_detail(current, &shot.surface, p, &mut result) {
-                    result["detailError"] = json!(error);
-                }
-            }
+            // One fresh feedback is enough on failure; request a native crop only if more detail is needed.
             if !frames.is_empty() {
-                // 放在 failure_detail 之后：它按 imageId 找首张图，中间帧与最终帧 imageId 相同。
                 frames.extend(result["images"].as_array().cloned().unwrap_or_default());
                 result["images"] = json!(frames);
                 result["framesNotice"] = json!("images中带frame的是第frame个scroll后的只读中间帧，仅供阅读；act只用顶层snapshotId及最后一张图的坐标");
@@ -1457,7 +1432,11 @@ mod tests {
         assert_eq!((region.x,region.y,region.width,region.height),(300,150,200,100));
         assert!(image_region(&shot,Region{x:399,y:0,width:2,height:1}).is_err());
         assert!(pointer_matches((-1920,-100),(-1919,-99)));
-        assert!(!pointer_matches((-1920,-100),(-1918,-100)));
+        assert!(pointer_matches((-1920,-100),(-1918,-98)));
+        assert!(pointer_matches((2250,55),(2248,53)));
+        assert!(!pointer_matches((-1920,-100),(-1917,-100)));
+        assert!(!pointer_matches((2250,55),(2250,58)));
+        assert!(!pointer_matches((2250,55),(2054,188))); // Reported multi-monitor miss is not rounding.
         assert!(!pointer_matches((i32::MIN,0),(i32::MAX,0)));
         let original=xcap::image::RgbaImage::from_pixel(200,100,xcap::image::Rgba([20,20,20,255]));
         let guarded=Shot{pixels:(200,100),source_pixels:(200,100),region:None,guard:Some(crate::visual_guard::VisualGuard::new(&original)),..shot};
@@ -1657,26 +1636,17 @@ mod tests {
         assert!(!guarded_pointer(&scroll) && guarded_pointer(&actions[0]));
     }
     #[test]
-    fn failure_detail_keeps_snapshot_and_maps_enlarged_coordinates() {
-        let owner = format!("detail-test-{}", uuid::Uuid::new_v4());
-        let folder = shot_folder(&owner);
-        std::fs::create_dir_all(&folder).unwrap();
-        let path = folder.join("full.png");
-        xcap::image::RgbaImage::from_pixel(400,300,xcap::image::Rgba([40,50,60,255])).save(&path).unwrap();
-        let surface = Surface { id:1, pid:None, x:-800, y:0, width:800, height:600 };
-        let full = Shot { image_id:"full".into(), surface:surface.clone(), pixels:(400,300), source_pixels:(800,600), region:None, guard:None, overlay:None, desktop_capture:false };
-        let mut snap = Snapshot { id:"new".into(), owner, taken:Instant::now(), window:None, max_edge:1600, foreground:None, shots:vec![full], invalidated:None, background:false };
-        let mut result = json!({"snapshotId":"new","images":[{"imageId":"full","path":path,"snapshotId":"new","cursor":{"x":390,"y":290}}]});
-        failure_detail(&mut snap, &surface, (-20,580), &mut result).unwrap();
-        assert_eq!(result["images"].as_array().unwrap().len(),2);
-        assert_eq!(result["images"][1]["width"],600);
-        assert_eq!(result["images"][1]["height"],480);
-        assert_eq!(result["images"][1]["cursor"]["x"],570);
-        assert_eq!(point(&snap.shots[1],Some(570),Some(450)).unwrap(),(-20,580));
-        assert_eq!(snap.id,"new");
-        let r = detail_region((70,90),(0,0));
-        assert_eq!((r.x,r.y,r.width,r.height),(0,0,70,90));
-        std::fs::remove_dir_all(folder).unwrap();
+    fn scroll_frames_respect_feedback_and_skip_trailing_waits() {
+        let actions: Vec<Action> = serde_json::from_value(json!([
+            {"action":"scroll","x":1,"y":1,"delta":3}, {"action":"wait","ms":400},
+            {"action":"scroll","x":1,"y":1,"delta":3}, {"action":"wait","ms":400}
+        ])).unwrap();
+        for feedback in [None, Some("screenshot"), Some("desktop")] {
+            let frames: Vec<_> = (0..actions.len()).filter(|&i| needs_scroll_frame(&actions, i, feedback)).collect();
+            assert_eq!(frames, [0]); // Last scroll is already covered by the final feedback.
+        }
+        assert!((0..actions.len()).all(|i| !needs_scroll_frame(&actions, i, Some("none"))));
+        assert!(!needs_scroll_frame(&actions[..1], 0, None));
     }
 
     #[test]
@@ -1762,6 +1732,19 @@ mod tests {
             assert_eq!(state.as_ref().unwrap().id, "validation");
             assert_eq!(state.as_ref().unwrap().taken, original_taken);
         }
+        for _ in 0..3 {
+            let result = run("validation".into(), json!({"operation":"act","snapshotId":"old",
+                "actions":[{"action":"click","x":1,"y":1}]})).unwrap();
+            assert_eq!(result["errorCode"], "stale_snapshot_id");
+            assert_eq!(result["status"], "not_executed");
+            assert_eq!(result["completedActions"], 0);
+            assert_eq!(result["snapshotPreserved"], true);
+            assert_eq!(result["nextArguments"], json!({"operation":"act","snapshotId":"validation","imageId":"monitor-1"}));
+            assert!(result.get("images").is_none(), "stale IDs must not churn screenshots");
+            let state = DESKTOP.lock().unwrap();
+            assert_eq!(state.as_ref().unwrap().id, "validation");
+            assert_eq!(state.as_ref().unwrap().taken, original_taken);
+        }
         for (owner, invalidated, expired, background) in [("other-owner", false, false, false),
             ("validation", true, false, false), ("validation", false, true, false), ("validation", false, false, true)] {
             {
@@ -1804,6 +1787,31 @@ mod tests {
         assert!(DESKTOP.lock().unwrap().take().is_some());
         let invalid = run("validation".into(), json!({"operation":"act","actions":[{"action":"wait","ms":-1}]})).unwrap();
         assert_eq!(invalid["status"], "not_executed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Moves the pointer across all monitors; use an idle test desktop"]
+    fn pointer_reaches_each_monitor() {
+        let mut enigo = Enigo::new(&Settings::default()).unwrap();
+        let before = enigo.location().unwrap();
+        let checked = (|| -> Result<()> {
+            for monitor in Monitor::all().map_err(err)? {
+                let s = monitor_surface(&monitor)?;
+                for (dx, dy) in [(0, 0), (s.width / 2, s.height / 2), (s.width - 1, s.height - 1)] {
+                    let expected = (s.x + dx as i32, s.y + dy as i32);
+                    move_pointer(&mut enigo, expected.0, expected.1)?;
+                    let actual = enigo.location().map_err(err)?;
+                    if !pointer_matches(expected, actual) {
+                        return Err(format!("monitor {}: expected {expected:?}, actual {actual:?}", s.id));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        let restored = move_pointer(&mut enigo, before.0, before.1);
+        checked.unwrap();
+        restored.unwrap();
     }
 
     // Opt-in real desktop smoke test: captures and moves only the pointer; never clicks/types into user applications.
@@ -1856,8 +1864,9 @@ mod tests {
         let stale = run("test".into(), args).unwrap();
         assert_eq!(stale["status"], "not_executed");
         assert_eq!(stale["completedActions"], 0);
-        assert!(stale["images"].as_array().is_some());
-        assert_ne!(stale["snapshotId"], result["snapshotId"]);
+        assert!(stale.get("images").is_none());
+        assert_eq!(stale["snapshotId"], result["snapshotId"]);
+        assert_eq!(stale["snapshotPreserved"], true);
         // Simulate a stale foreground identity without actually changing the user's focus.
         DESKTOP.lock().unwrap().as_mut().unwrap().foreground = Some((u32::MAX, u32::MAX));
         let recovered = run("test".into(), json!({"operation":"act","snapshotId":result["snapshotId"],
@@ -1892,7 +1901,7 @@ mod tests {
             }
         }
         for result in [observation, focused_result, shot, result, stale, recovered] {
-            for img in result["images"].as_array().unwrap() {
+            for img in result["images"].as_array().into_iter().flatten() {
                 let _ = std::fs::remove_file(img["path"].as_str().unwrap());
             }
         }
