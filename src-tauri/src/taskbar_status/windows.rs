@@ -50,6 +50,7 @@ thread_local! {
     static TIP: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
     static TOOLTIP: Cell<usize> = const { Cell::new(0) };
     static EPOCH: Instant = Instant::now();
+    static ANIMATING: Cell<bool> = const { Cell::new(false) };
     /// This press found the bubble open, so its click only closes it.
     static CLOSING: Cell<bool> = const { Cell::new(false) };
     /// The button-up that ends a double click must not start a bubble.
@@ -71,10 +72,6 @@ fn on_app(work: impl FnOnce(&tauri::AppHandle) + Send + 'static) {
     if let Some(app) = APP.get() { thread::spawn(move || work(app)); }
 }
 
-fn idle() -> bool {
-    CURRENT.with(|c| c.borrow().as_ref().is_none_or(|s| s.kind == Kind::Idle))
-}
-
 /// Chip rectangle and its monitor's work area, in physical pixels.
 unsafe fn anchor(hwnd: HWND) -> Option<super::bubble::Anchor> {
     let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -89,12 +86,6 @@ unsafe fn anchor(hwnd: HWND) -> Option<super::bubble::Anchor> {
     })();
     SetThreadDpiAwarenessContext(previous);
     result
-}
-
-/// The visible chip's anchor, for a bubble no click asked for.
-pub(super) fn chip_anchor() -> Option<super::bubble::Anchor> {
-    let hwnd = WINDOW.load(Ordering::Acquire) as HWND;
-    unsafe { if hwnd.is_null() || IsWindowVisible(hwnd) == 0 { None } else { anchor(hwnd) } }
 }
 
 struct Layout {
@@ -340,7 +331,8 @@ unsafe fn refresh(shown: &mut Option<Status>) {
             && taskbar_rect(parent).is_some_and(|r| same_rect(&r, &layout.taskbar))
     });
     let (Some(summary), Some(layout)) = (summary, ready) else {
-        if !hwnd.is_null() { ShowWindow(hwnd, SW_HIDE); }
+        if !hwnd.is_null() { KillTimer(hwnd, ANIMATION); ShowWindow(hwnd, SW_HIDE); }
+        ANIMATING.set(false);
         return;
     };
     let parent = layout.parent as HWND;
@@ -370,16 +362,23 @@ unsafe fn refresh(shown: &mut Option<Status>) {
         SetThreadDpiAwarenessContext(previous);
         if hwnd.is_null() { return; }
         WINDOW.store(hwnd as usize, Ordering::Release);
+        ANIMATING.set(false);
         *shown = None;
         attach_tooltip(hwnd);
-        // Warm the bubble webview now: clicks open at once and pops can't wait for a cold build.
+        // Warm the bubble webview now so clicks open at once.
         on_app(|app| { super::bubble::window(app); });
+    }
+    // Honour Windows' animation preference, including changes while a task is running.
+    let mut motion = 1i32;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &mut motion as *mut _ as _, 0);
+    let animate = motion != 0 && matches!(summary.kind, Kind::Running | Kind::Waiting);
+    if ANIMATING.replace(animate) != animate {
+        if animate { SetTimer(hwnd, ANIMATION, 16, None); } else { KillTimer(hwnd, ANIMATION); }
+        InvalidateRect(hwnd, null(), 0);
     }
     if shown.as_ref() != Some(&summary) {
         let wide: Vec<u16> = summary.title().chars().take(500).collect::<String>().encode_utf16().chain(Some(0)).collect();
         if SetWindowTextW(hwnd, wide.as_ptr()) == 0 { ShowWindow(hwnd, SW_HIDE); return; }
-        // Only live states breathe; settled states cost no repaints.
-        if matches!(summary.kind, Kind::Running | Kind::Waiting) { SetTimer(hwnd, ANIMATION, 40, None); } else { KillTimer(hwnd, ANIMATION); }
         CURRENT.with(|current| *current.borrow_mut() = Some(summary.clone()));
         *shown = Some(summary);
         InvalidateRect(hwnd, null(), 0);
@@ -398,7 +397,7 @@ unsafe fn refresh(shown: &mut Option<Status>) {
         let mapped = PhysicalToLogicalPointForPerMonitorDPI(parent, &mut a) != 0
             && PhysicalToLogicalPointForPerMonitorDPI(parent, &mut b) != 0
             && ScreenToClient(parent, &mut a) != 0 && ScreenToClient(parent, &mut b) != 0;
-        let placed = mapped && SetWindowPos(hwnd, HWND_TOP, a.x, a.y, b.x - a.x, b.y - a.y, SWP_NOACTIVATE | SWP_SHOWWINDOW) != 0;
+        let placed = mapped && SetWindowPos(hwnd, HWND_TOP, a.x, a.y, b.x - a.x, b.y - a.y, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS) != 0;
         SetThreadDpiAwarenessContext(previous);
         if !placed { ShowWindow(hwnd, SW_HIDE); }
     }
@@ -476,28 +475,186 @@ unsafe fn ellipse(dc: HDC, left: i32, top: i32, right: i32, bottom: i32, color: 
     DeleteObject(brush);
 }
 
-/// Butterfly mark: wings mirrored around a slim body. `open` below 1 folds them toward the body
-/// (seen head-on), which reads as a wing beat when animated. Colours: upper wings, lower wings, body.
-unsafe fn butterfly(dc: HDC, cx: i32, cy: i32, unit: f64, open: f64, colors: [u32; 3]) {
-    // Right-hand wings in 1/96-inch units (x outward, y down); the left side mirrors them.
-    const UPPER: [(f64, f64); 6] = [(0.5, -0.5), (1.8, -4.4), (4.4, -6.0), (7.0, -5.2), (7.0, -2.6), (0.5, 0.6)];
-    const LOWER: [(f64, f64); 5] = [(0.5, 0.6), (4.6, 1.0), (5.0, 3.4), (2.8, 5.2), (0.5, 2.8)];
-    let lift = (1.0 - open) * unit; // the body rises a touch on the downstroke
-    let at = |x: f64, y: f64| POINT { x: cx + (x * unit).round() as i32, y: cy + (y * unit - lift).round() as i32 };
-    let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-    for (shape, color) in [(&UPPER[..], colors[0]), (&LOWER[..], colors[1])] {
-        let brush = CreateSolidBrush(color);
-        let old_brush = SelectObject(dc, brush);
-        for side in [-1.0, 1.0] {
-            let points: Vec<POINT> = shape.iter().map(|&(x, y)| at(side * x * open, y)).collect();
-            Polygon(dc, points.as_ptr(), points.len() as i32);
+// Cubic outlines: a swept forewing and a smaller, scalloped hindwing, not mirrored icon lobes.
+const FOREWING: [(f64, f64); 13] = [
+    (0.3, 1.0), (1.1, 3.2), (4.7, 6.4), (6.9, 5.8),
+    (8.0, 5.5), (6.7, 2.2), (6.2, 0.9),
+    (5.0, -0.4), (2.1, -0.5), (0.35, 0.1),
+    (0.15, 0.35), (0.15, 0.75), (0.3, 1.0),
+];
+const HINDWING: [(f64, f64); 16] = [
+    (0.25, 0.65), (2.7, 1.1), (5.8, 1.0), (5.7, -1.6),
+    (5.6, -2.1), (5.2, -2.5), (4.9, -2.5),
+    (4.8, -3.1), (4.3, -3.6), (3.8, -3.5),
+    (3.3, -4.4), (2.2, -4.4), (1.7, -3.7),
+    (0.9, -2.9), (0.35, -1.0), (0.25, 0.65),
+];
+
+#[derive(Clone, Copy)]
+struct ButterflyPose {
+    phase: f64,
+    effort: f64,
+    yaw: f64,
+    bank: f64,
+    drift: f64,
+    lift: f64,
+    scale: f64,
+    flying: bool,
+}
+
+impl ButterflyPose {
+    fn at(t: f64, flying: bool, waiting: bool) -> Self {
+        use std::f64::consts::{FRAC_PI_4, TAU};
+        if !flying {
+            return Self { phase: 0.8, effort: 0.65, yaw: FRAC_PI_4, bank: -0.22, drift: 0.0, lift: 0.0, scale: 1.15, flying: false };
         }
-        SelectObject(dc, old_brush);
-        DeleteObject(brush);
+        // A brief glide between bouts; continuous phase modulation avoids a mechanical loop.
+        let glide = (((t * 1.43).sin() - 0.72) / 0.28).clamp(0.0, 1.0);
+        let effort = 1.0 - 0.9 * glide * glide * (3.0 - 2.0 * glide);
+        // Keep one continuous beat clock across Running/Waiting; waiting only tightens the flight path.
+        // Readable, slow-motion wing strokes in a 28-DIP viewport, rather than an insect-like buzz.
+        let phase = t * TAU * 1.65 + 0.22 * (t * 1.7).sin();
+        let wander = if waiting { 0.9 } else { 1.0 };
+        let turn = t * 1.45;
+        Self {
+            phase, effort, flying: true,
+            yaw: FRAC_PI_4 + 0.13 * turn.sin(),
+            bank: -0.22 + 0.16 * turn.cos() + 0.055 * effort * (phase - 0.8).sin(),
+            drift: wander * (1.8 * turn.sin() + 0.30 * (t * 0.62).sin()),
+            // Let the subject travel several pixels before the camera catches up; bank into turns.
+            lift: wander * 1.2 * (t * 2.1).sin() + 0.42 * effort * (phase - 1.1).sin(),
+            scale: 1.10 + 0.045 * (t * 0.83).sin(),
+        }
     }
-    SelectObject(dc, old_pen);
-    let (top, bottom) = (at(-0.9, -4.6), at(0.9, 4.6));
-    ellipse(dc, top.x, top.y, bottom.x.max(top.x + 2), bottom.y, colors[2]);
+
+    fn project(self, x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+        let (sy, cy) = self.yaw.sin_cos();
+        // A higher three-quarter camera reveals both wing surfaces instead of an edge-on sliver.
+        let (se, ce) = 0.82f64.sin_cos();
+        let depth = (x * sy - y * cy) * ce + z * se;
+        let perspective = self.scale * 42.0 / (42.0 - depth);
+        let (u, v) = (x * cy + y * sy, (x * sy - y * cy) * se - z * ce);
+        let (sb, cb) = self.bank.sin_cos();
+        ((u * cb - v * sb) * perspective + self.drift,
+         (u * sb + v * cb) * perspective + self.lift, depth)
+    }
+
+    fn wing(self, span: f64, y: f64, side: f64) -> (f64, f64, f64) {
+        // The tip/trailing edge lag the root; near and far wings are not perfectly synchronous.
+        let phase = self.phase - span * 0.028 - side * 0.055;
+        let angle = 0.18 + self.effort * (0.94 * phase.sin() + 0.16 * (2.0 * phase).sin()
+            + (1.5 - y).max(0.0) * 0.022 * phase.cos());
+        self.project(side * span * angle.cos(), y, span * angle.sin())
+    }
+}
+
+unsafe fn butterfly_path(dc: HDC, points: &[POINT], color: u32) {
+    let brush = CreateSolidBrush(color);
+    let old = SelectObject(dc, brush);
+    BeginPath(dc);
+    MoveToEx(dc, points[0].x, points[0].y, null_mut());
+    PolyBezierTo(dc, points[1..].as_ptr(), (points.len() - 1) as u32);
+    CloseFigure(dc);
+    EndPath(dc);
+    FillPath(dc);
+    SelectObject(dc, old);
+    DeleteObject(brush);
+}
+
+unsafe fn butterfly_frame(dc: HDC, cx: i32, cy: i32, unit: f64, pose: ButterflyPose, colors: [u32; 3], high_contrast: bool) {
+    let [accent, background, ink] = colors;
+    let at = |p: (f64, f64, f64)| POINT {
+        x: cx + (p.0 * unit).round() as i32, y: cy + (p.1 * unit).round() as i32,
+    };
+    let rim = if high_contrast { accent } else { mix(accent, rgb(6, 15, 26), 0.78) };
+    if pose.flying && !high_contrast {
+        // A faint, short shutter smear on moving wings; keep the body and counters tack-sharp.
+        let shutter = ButterflyPose { phase: pose.phase - 0.28, ..pose };
+        let fade = 1.0 - 0.13 * pose.effort * pose.phase.cos().abs();
+        for side in [-1.0, 1.0] {
+            for shape in [&HINDWING[..], &FOREWING[..]] {
+                let points: Vec<_> = shape.iter().map(|&(x, y)| at(shutter.wing(x, y, side))).collect();
+                butterfly_path(dc, &points, mix(accent, background, fade));
+            }
+        }
+    }
+    // ponytail: whole-wing depth ordering is enough at this fixed 45° view; an orbiting camera needs a depth-tested mesh.
+    let mut sides = [-1.0, 1.0];
+    sides.sort_by(|a, b| pose.wing(4.0, 0.5, *a).2.total_cmp(&pose.wing(4.0, 0.5, *b).2));
+    let draw_body = || {
+        // Tapered abdomen, thorax, head and two fine clubbed antennae, aligned with the flight axis.
+        let body = if high_contrast { background } else { rim };
+        let line = |points: &[(f64, f64, f64)], width: f64, color| {
+            let points: Vec<POINT> = points.iter().map(|&(x, y, z)| at(pose.project(x, y, z))).collect();
+            stroke(dc, &points, (unit * width).round().max(1.0) as i32, color);
+        };
+        line(&[(0.0, -4.1, 0.2), (0.0, -2.3, 0.35), (0.0, 1.8, 0.35)], 0.8, body);
+        for (y, radius) in [(1.4, 0.63), (2.6, 0.48)] {
+            let p = at(pose.project(0.0, y, 0.4));
+            dot(dc, p.x, p.y, (unit * radius).round().max(1.0) as i32, body);
+        }
+        line(&[(-0.15, -2.8, 0.65), (-0.15, 0.3, 0.7), (-0.15, 1.8, 0.8)], 0.22, mix(accent, ink, 0.48));
+        for side in [-1.0, 1.0] {
+            line(&[(side * 0.15, 2.9, 0.4), (side * 0.50, 3.8, 0.65), (side * 0.85, 4.25, 0.6)], 0.18, if high_contrast { accent } else { mix(accent, ink, 0.32) });
+            let tip = at(pose.project(side * 0.85, 4.25, 0.6));
+            dot(dc, tip.x, tip.y, (unit * 0.14).round().max(1.0) as i32, accent);
+        }
+    };
+    for (layer, side) in sides.into_iter().enumerate() {
+        if layer == 1 { draw_body(); } // The near wing occludes the thorax, not the other way around.
+        for (shape, veins) in [
+            (&HINDWING[..], [(5.2, -1.6), (4.4, -2.6), (2.8, -3.8)]),
+            (&FOREWING[..], [(6.8, 5.45), (6.6, 4.0), (6.0, 2.1)]),
+        ] {
+            let light = 0.22 + 0.22 * (pose.phase - 0.4).cos().abs() * pose.effort;
+            for (inset, shine) in [(1.0, -1.0), (0.90, 0.0), (0.76, light * 0.65), (0.56, light)] {
+                let color = if high_contrast { accent } else if shine < 0.0 { rim } else {
+                    let blue = mix(accent, rgb(208, 242, 250), shine);
+                    mix(blue, rim, if layer == 0 { 0.28 } else { 0.0 })
+                };
+                let points: Vec<POINT> = shape.iter().map(|&(x, y)|
+                    at(pose.wing(x * inset, 0.7 + (y - 0.7) * (0.5 + inset * 0.5), side))).collect();
+                butterfly_path(dc, &points, color);
+                if high_contrast { break; }
+            }
+            if !high_contrast {
+                for (x, y) in veins {
+                    let vein = [(0.4, 0.7), (x * 0.52, y * 0.48 + 0.36), (x * 0.94, y * 0.94)];
+                    let points = vein.map(|(x, y)| at(pose.wing(x, y, side)));
+                    stroke(dc, &points, (unit * 0.16).round().max(1.0) as i32, mix(accent, rim, 0.58));
+                    let spot = at(pose.wing(x * 0.99, y, side));
+                    dot(dc, spot.x, spot.y, (unit * 0.16).round().max(1.0) as i32, mix(accent, ink, 0.55));
+                }
+            }
+        }
+    }
+}
+
+/// A tiny tracked-camera viewport. Supersample only the butterfly, never the ClearType text.
+unsafe fn butterfly(dc: HDC, cx: i32, cy: i32, unit: f64, pose: ButterflyPose, colors: [u32; 3], high_contrast: bool) {
+    let width = (28.0 * unit).round().max(1.0) as i32;
+    let height = (26.0 * unit).round().max(1.0) as i32;
+    let buffer = CreateCompatibleDC(dc);
+    let bitmap = CreateCompatibleBitmap(dc, width * 4, height * 4);
+    if buffer.is_null() || bitmap.is_null() {
+        if !bitmap.is_null() { DeleteObject(bitmap); }
+        if !buffer.is_null() { DeleteDC(buffer); }
+        butterfly_frame(dc, cx, cy, unit, pose, colors, high_contrast);
+        return;
+    }
+    let old_bitmap = SelectObject(buffer, bitmap);
+    // The lens overlaps the rounded corner slightly: retain the chip border underneath it.
+    StretchBlt(buffer, 0, 0, width * 4, height * 4, dc, cx - width / 2, cy - height / 2, width, height, SRCCOPY);
+    butterfly_frame(buffer, width * 2, height * 2, unit * 4.0, pose, colors, high_contrast);
+    let old_mode = SetStretchBltMode(dc, HALFTONE);
+    let mut origin = POINT::default();
+    SetBrushOrgEx(dc, 0, 0, &mut origin);
+    StretchBlt(dc, cx - width / 2, cy - height / 2, width, height, buffer, 0, 0, width * 4, height * 4, SRCCOPY);
+    SetBrushOrgEx(dc, origin.x, origin.y, null_mut());
+    SetStretchBltMode(dc, old_mode);
+    SelectObject(buffer, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(buffer);
 }
 
 unsafe fn stroke(dc: HDC, points: &[POINT], width: i32, color: u32) {
@@ -519,9 +676,9 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     let mut colors = palette(light, hover);
     let mut accent = signal(light, kind);
     let mut contrast = HIGHCONTRASTW { cbSize: size_of::<HIGHCONTRASTW>() as u32, ..Default::default() };
-    if SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.cbSize, &mut contrast as *mut _ as _, 0) != 0
-        && contrast.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0
-    {
+    let high_contrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.cbSize, &mut contrast as *mut _ as _, 0) != 0
+        && contrast.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0;
+    if high_contrast {
         colors = Palette {
             background: GetSysColor(if hover { COLOR_HIGHLIGHT } else { COLOR_BTNFACE }),
             border: GetSysColor(COLOR_BTNTEXT),
@@ -547,15 +704,13 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     DeleteObject(pen);
     DeleteObject(brush);
 
-    // Leading mark: the butterfly beats its wings while live and rests open when idle; a glyph once settled.
+    // Keep the camera inside the existing leading slot; counters and hit targets do not move.
     let (cx, cy) = (px(17), rect.bottom / 2);
     match kind {
         Kind::Running | Kind::Waiting | Kind::Idle => {
-            // Brisk beats while working, slow ones while it waits on you.
-            let period = if kind == Kind::Running { 0.6 } else { 1.4 };
-            let beat = (EPOCH.with(|e| e.elapsed().as_secs_f64()) * std::f64::consts::TAU / period).cos() * 0.5 + 0.5;
-            let open = if kind == Kind::Idle { 1.0 } else { 0.2 + 0.8 * beat };
-            butterfly(target, cx, cy, dpi as f64 / 96.0, open, [accent, mix(accent, colors.background, 0.3), colors.text]);
+            let pose = ButterflyPose::at(EPOCH.with(|e| e.elapsed().as_secs_f64()), ANIMATING.get(), kind == Kind::Waiting);
+            let unit = (dpi as f64 / 96.0).min((rect.bottom - px(2)).max(1) as f64 / 26.0);
+            butterfly(target, cx, cy, unit, pose, [accent, colors.background, colors.text], high_contrast);
         }
         Kind::Done | Kind::Error => {
             dot(target, cx, cy, px(7), accent);
@@ -628,14 +783,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_LBUTTONDOWN => {
             let closing = super::bubble::is_open();
             CLOSING.set(closing);
-            if !closing && !idle() { on_app(|app| { super::bubble::window(app); }); }
+            if !closing { on_app(|app| { super::bubble::window(app); }); }
             0
         }
         WM_LBUTTONUP => {
             if DOUBLE.replace(false) { return 0; }
             if CLOSING.get() {
                 on_app(super::bubble::hide);
-            } else if !idle() {
+            } else {
                 // Open at once: waiting out the double-click time made every bubble a beat late.
                 // A double click then hands over to Nova and closes the bubble it just opened.
                 if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open(app, anchor)); }
@@ -650,7 +805,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             0
         }
         WM_TIMER if wparam == ANIMATION => {
-            InvalidateRect(hwnd, null(), 0);
+            if IsWindowVisible(hwnd) != 0 {
+                let mut lens = RECT::default();
+                GetClientRect(hwnd, &mut lens);
+                lens.right = (31 * GetDpiForWindow(hwnd).max(96) as i32 / 96).min(lens.right);
+                InvalidateRect(hwnd, &lens, 0);
+            }
             0
         }
         WM_NOTIFY if (*(lparam as *const NMHDR)).code == TTN_GETDISPINFOW => {
@@ -669,6 +829,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let region = CreateRoundRectRgn(0, 0, rect.right + 1, rect.bottom + 1, rect.bottom, rect.bottom);
             // Windows owns the region only after a successful SetWindowRgn.
             if !region.is_null() && SetWindowRgn(hwnd, region, 1) == 0 { DeleteObject(region); }
+            // SetWindowRgn can finish its redraw inside this resize. Leave the whole new border
+            // dirty so an idle chip cannot retain pixels clipped from the previous width.
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_MOUSEMOVE => {
@@ -712,6 +875,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resizing_chip_repaints_the_entire_rounded_border() {
+        unsafe {
+            let instance = GetModuleHandleW(null());
+            let class = w!("Nova.TaskbarStatus.ResizeTest");
+            let definition = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: instance,
+                lpszClassName: class, style: CS_HREDRAW | CS_VREDRAW, ..Default::default() };
+            assert_ne!(RegisterClassW(&definition), 0);
+            // Keep the native paint path active, off-screen and without taking focus or a taskbar slot.
+            let hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, class, w!(""), WS_POPUP | WS_VISIBLE, -32000, -32000, 300, 28,
+                null_mut(), null_mut(), instance, null());
+            assert!(!hwnd.is_null());
+            let region = CreateRectRgn(0, 0, 0, 0);
+            assert!(!region.is_null());
+            for (width, height) in [(250, 28), (300, 28), (200, 35), (450, 42), (160, 28)] {
+                ValidateRect(hwnd, null());
+                assert_ne!(SetWindowPos(hwnd, null_mut(), 0, 0, width, height, SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER), 0);
+                assert_ne!(GetWindowRgn(hwnd, region), 0);
+                assert_eq!(PtInRegion(region, width - 2, 1), 0, "right corner must follow the new width");
+                assert_ne!(PtInRegion(region, width - 2, height / 2), 0, "right cap must remain visible");
+                let mut dirty = RECT::default();
+                assert_ne!(GetUpdateRect(hwnd, &mut dirty, 0), 0, "resize must repaint even when idle");
+                assert_eq!((dirty.left, dirty.top, dirty.right, dirty.bottom), (0, 0, width, height),
+                    "resize must repaint both ends, not just exposed pixels or the animated icon");
+            }
+            DeleteObject(region);
+            DestroyWindow(hwnd);
+            UnregisterClassW(class, instance);
+        }
+    }
+
+    #[test]
     fn chip_stays_inside_the_verified_gap_at_every_scale() {
         for dpi in [96, 120, 144, 192] {
             for height in [20, 40, 80] {
@@ -751,6 +945,62 @@ mod tests {
             }
         }
         assert_eq!(mix(rgb(0, 0, 0), rgb(200, 100, 50), 0.5), rgb(100, 50, 25));
+    }
+
+    #[test]
+    fn butterfly_flight_is_continuous_and_stays_inside_the_lens() {
+        let mut effort_range = (1.0f64, 0.0f64);
+        let mut extent = (0.0f64, 0.0f64);
+        let mut drift_range = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut lift_range = (f64::INFINITY, f64::NEG_INFINITY);
+        for waiting in [false, true] {
+            for frame in 0..7200 {
+                let t = frame as f64 / 120.0;
+                let pose = ButterflyPose::at(t, true, waiting);
+                let next = ButterflyPose::at(t + 1.0 / 240.0, true, waiting);
+                let switched = ButterflyPose::at(t, true, !waiting);
+                assert_eq!(pose.phase, switched.phase, "status switch restarted the beat clock");
+                assert!((pose.drift - switched.drift).hypot(pose.lift - switched.lift) < 0.5);
+                effort_range = (effort_range.0.min(pose.effort), effort_range.1.max(pose.effort));
+                drift_range = (drift_range.0.min(pose.drift), drift_range.1.max(pose.drift));
+                lift_range = (lift_range.0.min(pose.lift), lift_range.1.max(pose.lift));
+                let beats_per_second = (next.phase - pose.phase) * 240.0 / std::f64::consts::TAU;
+                assert!((1.5..1.8).contains(&beats_per_second), "wing strokes became too fast");
+                assert!((pose.yaw.to_degrees() - 45.0).abs() < 8.0);
+                assert!(pose.wing(4.0, 0.5, 1.0).2 > pose.wing(4.0, 0.5, -1.0).2);
+                for side in [-1.0, 1.0] {
+                    for shape in [&FOREWING[..], &HINDWING[..]] {
+                        for segment in shape.windows(4).step_by(3) {
+                            // GDI draws the projected cubic, not its off-curve control points.
+                            let points: Vec<_> = segment.iter().map(|&(x, y)| pose.wing(x, y, side)).collect();
+                            let after: Vec<_> = segment.iter().map(|&(x, y)| next.wing(x, y, side)).collect();
+                            for sample in 0..=24 {
+                                let u = sample as f64 / 24.0;
+                                let v = 1.0 - u;
+                                let weights = [v * v * v, 3.0 * v * v * u, 3.0 * v * u * u, u * u * u];
+                                let curve = |points: &[(f64, f64, f64)]| weights.iter().zip(points)
+                                    .fold((0.0, 0.0), |(x, y), (w, p)| (x + w * p.0, y + w * p.1));
+                                let (x, y) = curve(&points);
+                                let (nx, ny) = curve(&after);
+                                assert!(x.is_finite() && y.is_finite(), "non-finite wing at {t}");
+                                extent = (extent.0.max(x.abs()), extent.1.max(y.abs()));
+                                assert!((nx - x).hypot(ny - y) < 1.6, "discontinuous wing at {t}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(extent.0 < 13.5 && extent.1 < 12.5, "wing left the 28×26-DIP lens: maximum extent {extent:?}");
+        assert!(drift_range.1 - drift_range.0 > 3.8 && lift_range.1 - lift_range.0 > 2.8, "flight became imperceptible");
+        // Even in a glide, show substantial wing area rather than a thin side-on line.
+        let spread = ButterflyPose { phase: 0.0, effort: 0.0, ..ButterflyPose::at(0.0, false, false) };
+        let top = spread.wing(6.9, 5.8, -1.0).1;
+        let bottom = spread.wing(3.8, -3.5, 1.0).1;
+        assert!((bottom - top).abs() > 8.0, "camera flattened the wings");
+        assert!(effort_range.0 < 0.15 && effort_range.1 > 0.95, "missing glide or power stroke");
+        let rest = ButterflyPose::at(0.0, false, false).wing(6.0, 3.0, 1.0);
+        assert_eq!(rest, ButterflyPose::at(100.0, false, true).wing(6.0, 3.0, 1.0));
     }
 
     #[test]

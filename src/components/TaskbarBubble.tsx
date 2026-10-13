@@ -166,7 +166,7 @@ function Reply(props: { card: Card; onSent: () => void }) {
   const [error, setError] = createSignal("");
   const send = async () => {
     const value = text().trim();
-    if (!value || busy() || !props.card.threadId) return;
+    if (!value || busy()) return;
     setBusy(true);
     setError("");
     try {
@@ -186,8 +186,8 @@ function Reply(props: { card: Card; onSent: () => void }) {
         rows={1}
         value={text()}
         disabled={busy()}
-        aria-label="快速回复"
-        placeholder={props.card.kind === "running" ? "追加消息，本轮结束后发送" : "快速回复，Enter 发送，Shift+Enter 换行"}
+        aria-label={props.card.kind === "idle" ? "发起新会话" : "快速回复"}
+        placeholder={props.card.kind === "idle" ? "输入消息，在临时目录发起新会话" : props.card.kind === "running" ? "追加消息，本轮结束后发送" : "快速回复，Enter 发送，Shift+Enter 换行"}
         onInput={(e) => setText(e.currentTarget.value)}
         onKeyDown={(e) => {
           // isComposing: Enter that confirms an IME candidate is not a send.
@@ -215,7 +215,6 @@ export default function TaskbarBubble() {
 
   const place = () => invoke<boolean>("taskbar_bubble_place", { height: shell.offsetHeight }).catch(() => false);
   const hide = () => void invoke("taskbar_bubble_hide").catch(() => {});
-  // Popped results go by thread id; the live card by null.
   const dismiss = (card: Card) => void invoke("taskbar_bubble_dismiss", { threadId: card.live ? null : card.threadId }).catch(() => {});
 
   const load = async () => {
@@ -223,7 +222,7 @@ export default function TaskbarBubble() {
     // Nothing left to show (e.g. the result was viewed elsewhere): close instead of an empty bubble.
     if (!next?.cards.length) return hide();
     document.documentElement.classList.toggle("light", next.light);
-    // Keyed: a refresh updates cards in place, so only a newly popped one plays its entrance.
+    // Keyed: a refresh updates the current card in place.
     setCards(reconcile(next.cards, { key: "key" }));
     // Keep in-progress answers: only rebuild cards when the set of requests changes.
     const keys = (list: Permission[]) => list.map((p) => p.requestKey).join("\n");
@@ -238,7 +237,7 @@ export default function TaskbarBubble() {
   };
   const answered = async () => {
     await load();
-    // Last confirmation answered: close the live card, popped results stay.
+    // Last confirmation answered: close the live card.
     const live = cards.find((c) => c.live);
     if (!permissions().length && live) dismiss(live);
   };
@@ -301,9 +300,8 @@ export default function TaskbarBubble() {
                 />
               </Show>
               {/* Waiting cards answer through the confirmation above, not a new prompt. */}
-              <Show when={card.threadId && card.kind !== "waiting"}>
-                {/* A popped result has been answered: it leaves; the live card stays to show progress. */}
-                <Reply card={card} onSent={() => !card.live && dismiss(card)} />
+              <Show when={(card.threadId || card.kind === "idle") && card.kind !== "waiting"}>
+                <Reply card={card} onSent={hide} />
               </Show>
               <footer class="tb-foot">
                 <span class="tb-hint">双击 Butterfly 直接打开</span>

@@ -6,7 +6,7 @@ mod bubble;
 #[cfg(windows)]
 mod windows;
 
-/// Bubble data: popped results, the live card and pending confirmations (null when the Butterfly is off).
+/// Bubble data: the live card and pending confirmations (null when the Butterfly is off).
 #[tauri::command]
 pub(crate) fn taskbar_bubble(app: tauri::AppHandle) -> serde_json::Value {
     #[cfg(windows)]
@@ -33,7 +33,7 @@ pub(crate) fn taskbar_bubble_hide(app: tauri::AppHandle) {
     let _ = app;
 }
 
-/// Close one bubble card: a popped result by thread id, or the live card when `None`.
+/// Close the bubble, marking its result as viewed.
 #[tauri::command]
 pub(crate) fn taskbar_bubble_dismiss(app: tauri::AppHandle, thread_id: Option<String>) {
     #[cfg(windows)]
@@ -42,11 +42,11 @@ pub(crate) fn taskbar_bubble_dismiss(app: tauri::AppHandle, thread_id: Option<St
     let _ = (app, thread_id);
 }
 
-/// Quick reply from a bubble card to its thread.
+/// Quick reply, or a new scratch session when the idle card has no thread.
 #[tauri::command]
-pub(crate) fn taskbar_bubble_reply(app: tauri::AppHandle, thread_id: String, text: String) -> Result<(), String> {
+pub(crate) fn taskbar_bubble_reply(app: tauri::AppHandle, thread_id: Option<String>, text: String) -> Result<(), String> {
     #[cfg(windows)]
-    return bubble::reply(&app, &thread_id, &text);
+    return bubble::reply(&app, thread_id.as_deref(), &text);
     #[cfg(not(windows))]
     { let _ = (app, thread_id, text); Err("仅支持 Windows".into()) }
 }
@@ -70,7 +70,6 @@ pub(crate) struct Rect {
 pub(crate) fn start(app: &tauri::AppHandle) {
     #[cfg(windows)]
     if !crate::server::is_headless() {
-        bubble::watch(app);
         windows::start(app.clone());
     }
     #[cfg(not(windows))]
@@ -152,7 +151,7 @@ impl Drop for Activity {
     }
 }
 
-/// Never move or resize Explorer controls. Use only a gap in the observed layout.
+/// Right-align in the rightmost verified gap. Never move or resize Explorer controls.
 #[cfg(any(windows, test))]
 fn free_slot(taskbar: Rect, occupied: &[Rect], desired_width: i32, min_width: i32, gap: i32) -> Option<Rect> {
     if gap < 0 || min_width <= 0 || desired_width < min_width || taskbar.bottom <= taskbar.top {
@@ -174,8 +173,8 @@ fn free_slot(taskbar: Rect, occupied: &[Rect], desired_width: i32, min_width: i3
     let mut best = None;
     for (left, right) in spans {
         let width = left.saturating_sub(cursor).min(desired_width);
-        if width >= min_width && best.is_none_or(|r: Rect| width > r.right - r.left) {
-            best = Some(Rect { left: cursor, right: cursor + width, top, bottom });
+        if width >= min_width {
+            best = Some(Rect { left: left - width, right: left, top, bottom });
         }
         cursor = cursor.max(right);
     }
@@ -297,7 +296,7 @@ fn snapshot(app: &tauri::AppHandle) -> Option<Status> {
         (t.id.as_str(), t.updated_at, t.unread_turns)
     }).collect();
     let Some(thread) = pick(&candidates, &seen).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
-        return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "双击打开 Nova"], None));
+        return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "单击发起新会话 · 双击打开 Nova"], None));
     };
     // The last turn's final reply (or error) is the conclusion.
     let (kind, body) = thread.items.iter().rev()
@@ -392,7 +391,13 @@ mod tests {
         let icons = Rect { left: -1200, top: 1040, right: -500, bottom: 1080 };
         let tray = Rect { left: -300, top: 1040, right: 0, bottom: 1080 };
         let slot = free_slot(bar, &[icons, tray], 240, 160, 4).unwrap();
-        assert_eq!(slot, Rect { left: -1916, top: 1044, right: -1676, bottom: 1076 });
+        // Prefer the narrower right-hand gap over the larger one on the left.
+        assert_eq!(slot, Rect { left: -496, top: 1044, right: -304, bottom: 1076 });
+        assert_eq!(free_slot(bar, &[tray, icons, icons], 240, 160, 4), Some(slot));
+        assert_eq!(free_slot(bar, &[], 240, 160, 4), Some(Rect { left: -244, right: -4, ..slot }));
+        // If the right gap is too narrow, right-align inside the preceding safe gap.
+        let wider_icons = Rect { right: -450, ..icons };
+        assert_eq!(free_slot(bar, &[wider_icons, tray], 240, 160, 4), Some(Rect { left: -1444, right: -1204, ..slot }));
         assert!(free_slot(bar, &[bar], 240, 160, 4).is_none());
         assert!(free_slot(bar, &[], 100, 160, 4).is_none());
         // Two individually valid but overlapping occupied spans are a single obstruction.
