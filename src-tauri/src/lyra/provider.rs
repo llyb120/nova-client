@@ -84,6 +84,40 @@ fn screenshot_caption(message: &Value) -> String {
         message["toolCallId"], details["snapshotId"], json!(images), details["coordinateSpace"].as_str().unwrap_or_default())
 }
 
+/// 每次请求都会把历史截图从磁盘重读成 base64；只内嵌最近几次带图的工具结果，避免请求体 413。
+const RECENT_TOOL_IMAGES: usize = 3;
+
+fn has_tool_images(message: &Value) -> bool {
+    message["role"] == "toolResult"
+        && (message["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"] == "image"))
+            || message.pointer("/details/images").and_then(Value::as_array).is_some_and(|a| !a.is_empty())
+            || message.pointer("/details/imagePath").and_then(Value::as_str).is_some())
+}
+
+/// 下标不小于返回值的工具结果才内嵌图片。
+fn tool_images_from(messages: &[Value]) -> usize {
+    messages.iter().enumerate().rev().filter(|(_, m)| has_tool_images(m))
+        .nth(RECENT_TOOL_IMAGES - 1).map_or(0, |(i, _)| i)
+}
+
+/// 工具结果文本与要内嵌的图片；较早的图片换成路径/imageId 说明，需要时由模型再读。
+fn tool_result_parts(message: &Value, model: &ResolvedModel, embed: bool) -> (String, Vec<Value>) {
+    let text = tool_result_text(message);
+    if embed || !model.supports_images || !has_tool_images(message) {
+        return (text, tool_result_images(message, model));
+    }
+    let paths: Vec<String> = message.pointer("/details/images").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|image| image["path"].as_str().map(|path| format!("imageId={} path={path}", image["imageId"])))
+        .chain(message.pointer("/details/imagePath").and_then(Value::as_str).map(|path| format!("path={path}")))
+        .collect();
+    let note = if paths.is_empty() {
+        "[Earlier image omitted from context to save space; rerun the tool if you need to see it again.]".to_string()
+    } else {
+        format!("[Earlier screenshot omitted from context to save space: {}. Use read on the path if you need to look again; its imageId is stale, take a fresh screenshot before acting on coordinates.]", paths.join("; "))
+    };
+    (format!("{text}\n\n{note}"), Vec::new())
+}
+
 fn tool_result_images(message: &Value, model: &ResolvedModel) -> Vec<Value> {
     if !model.supports_images {
         return Vec::new();
@@ -122,7 +156,8 @@ fn completions_messages(
 ) -> Vec<Value> {
     let mut out = vec![json!({ "role": "system", "content": system_prompt })];
     let mut screenshots = Vec::new();
-    for message in messages {
+    let images_from = tool_images_from(messages);
+    for (index, message) in messages.iter().enumerate() {
         // 截图是额外的 user 消息，不能打断同一轮连续的 tool 回复。
         if message.get("role").and_then(Value::as_str) != Some("toolResult") {
             out.append(&mut screenshots);
@@ -220,12 +255,12 @@ fn completions_messages(
                 out.push(Value::Object(item));
             }
             Some("toolResult") => {
+                let (text, images) = tool_result_parts(message, model, index >= images_from);
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": replay_tool_id(message.get("toolCallId").and_then(Value::as_str).unwrap_or_default()),
-                    "content": tool_result_text(message),
+                    "content": text,
                 }));
-                let images = tool_result_images(message, model);
                 if !images.is_empty() {
                     let mut parts = Vec::new();
                     parts.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
@@ -395,7 +430,8 @@ fn completions_body(
 
 fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
     let mut out = Vec::new();
-    for message in messages {
+    let images_from = tool_images_from(messages);
+    for (index, message) in messages.iter().enumerate() {
         match message.get("role").and_then(Value::as_str) {
             Some("user") => {
                 let mut parts = Vec::new();
@@ -482,12 +518,12 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                 }
             }
             Some("toolResult") => {
+                let (text, images) = tool_result_parts(message, model, index >= images_from);
                 out.push(json!({
                     "type": "function_call_output",
                     "call_id": message.get("toolCallId").and_then(Value::as_str).unwrap_or_default().split('|').next().unwrap_or_default(),
-                    "output": tool_result_text(message),
+                    "output": text,
                 }));
-                let images = tool_result_images(message, model);
                 if !images.is_empty() {
                     let mut content = Vec::new();
                     content.extend(images.into_iter().flat_map(|image| [json!({"type":"input_text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
@@ -1454,7 +1490,8 @@ fn anthropic_thinking_budget(level: Option<&str>, max_output_tokens: u64) -> Opt
 
 fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
-    for message in messages {
+    let images_from = tool_images_from(messages);
+    for (index, message) in messages.iter().enumerate() {
         match message.get("role").and_then(Value::as_str) {
             Some("user") => {
                 let mut parts = Vec::new();
@@ -1537,16 +1574,16 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
             }
             Some("toolResult") => {
                 let is_error = message.get("isError").and_then(Value::as_bool) == Some(true);
+                let (text, images) = tool_result_parts(message, model, index >= images_from);
                 out.push(json!({
                     "role": "user",
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": replay_tool_id(message.get("toolCallId").and_then(Value::as_str).unwrap_or_default()),
-                        "content": [{ "type": "text", "text": tool_result_text(message) }],
+                        "content": [{ "type": "text", "text": text }],
                         "is_error": is_error,
                     }],
                 }));
-                let images = tool_result_images(message, model);
                 if !images.is_empty() {
                     let mut content = Vec::new();
                     content.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
@@ -2078,6 +2115,18 @@ mod tests {
             let text=output.to_string();
             for expected in ["snap-0","1600","719","NEVER rescale","call-shot"] { assert!(text.contains(expected),"{expected}: {text}"); }
         }
+    }
+
+    #[test]
+    fn only_recent_tool_images_are_embedded() {
+        let shot = |i: usize| json!({"role":"toolResult","toolCallId":format!("call-{i}"),"content":[{"type":"text","text":"ok"}],
+            "details":{"snapshotId":format!("snap{i}"),"images":[{"imageId":format!("snap{i}-0"),"path":format!("C:/shots/{i}.png")}]}});
+        let messages: Vec<Value> = (0..5).map(shot).collect();
+        assert_eq!(tool_images_from(&messages), 2);
+        let model = test_model("openai-completions");
+        let (text, images) = tool_result_parts(&messages[0], &model, false);
+        assert!(images.is_empty() && text.contains("C:/shots/0.png") && text.contains("snap0-0"), "{text}");
+        assert_eq!(tool_result_parts(&messages[4], &model, true).0, "ok");
     }
 
     #[test]

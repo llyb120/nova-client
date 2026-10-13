@@ -192,6 +192,8 @@ pub fn is_context_window_error(error: &str) -> bool {
         "input is too long",
         "too many tokens",
         "request too large for model",
+        "request_too_large",
+        "payload too large",
     ]
     .iter()
     .any(|fragment| message.contains(fragment))
@@ -649,6 +651,9 @@ mod context_error_tests {
             "invalid_request_error: context_length_exceeded"
         ));
         assert!(is_context_window_error("Prompt is too long"));
+        assert!(is_context_window_error(
+            "HTTP 413 Payload Too Large：{\"error\":{\"code\":\"request_too_large\",\"message\":\"请求体过大\"}}"
+        ));
         assert!(is_context_window_error(
             "HTTP 401 Unauthorized: {\"error\":{\"message\":\"k3-256k supports only 256K context.\",\"type\":\"invalid_authentication_error\"}}"
         ));
