@@ -20,10 +20,10 @@ pub fn image_media_type(path: &str) -> Option<&'static str> {
         .unwrap_or_default()
         .to_lowercase();
     match ext.as_str() {
-        ".gif" => Some("image/gif"),
-        ".jpeg" | ".jpg" => Some("image/jpeg"),
-        ".png" => Some("image/png"),
-        ".webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "jpeg" | "jpg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
         _ => None,
     }
 }

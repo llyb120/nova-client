@@ -174,7 +174,7 @@ async fn tool_result(name: &str, result: Result<Value, String>) -> Value {
             for image in images.iter().take(if name == "jianlai" { 16 } else { 4 }) {
                 if let Some(path) = image["path"].as_str() {
                     match tokio::fs::read(path).await {
-                        Ok(data) => content.push(json!({"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(data)})),
+                        Ok(data) => content.push(json!({"type":"image","mimeType":crate::lyra::prompt::image_media_type(path).unwrap_or("image/png"),"data":base64::engine::general_purpose::STANDARD.encode(data)})),
                         Err(_) => content.push(json!({"type":"text","text":format!("图片加载失败，可读取截图文件：{path}")})),
                     }
                 }

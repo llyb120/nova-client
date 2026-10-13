@@ -17,7 +17,7 @@ mod context;
 mod edit;
 pub(crate) mod history;
 pub(crate) mod presets;
-mod prompt;
+pub(crate) mod prompt;
 pub(crate) mod provider;
 mod read;
 mod rollout;

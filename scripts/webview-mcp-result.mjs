@@ -16,7 +16,8 @@ export async function webviewMcpResult(text) {
       readMs += performance.now() - readStarted;
       imageBytes += data.length;
       const encodeStarted = performance.now();
-      content.push({ type: 'image', mimeType: 'image/png', data: data.toString('base64') });
+      const mimeType = /\.jpe?g$/i.test(image.path) ? 'image/jpeg' : 'image/png';
+      content.push({ type: 'image', mimeType, data: data.toString('base64') });
       base64Ms += performance.now() - encodeStarted;
     } catch {
       content.push({ type: 'text', text: `图片加载失败，可读取截图文件：${image.path}` });

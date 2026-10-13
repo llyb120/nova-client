@@ -103,7 +103,7 @@ fn tool_result_images(message: &Value, model: &ResolvedModel) -> Vec<Value> {
         if let Ok(data) = std::fs::read(path) {
             images.push(json!({
                 "type": "image",
-                "mimeType": "image/png",
+                "mimeType": crate::lyra::prompt::image_media_type(path).unwrap_or("image/png"),
                 "data": base64::engine::general_purpose::STANDARD.encode(data),
                 "caption":format!("This image: imageId={}, {}×{} image pixels; snapshotId={}. Use these image pixels directly with imageId, without CSS/DPI conversion.",
                     metadata["imageId"],metadata["pixelWidth"],metadata["pixelHeight"],message["details"]["snapshotId"]),

@@ -410,9 +410,9 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
-        let path = folder.join(format!("{id}-{image_id}.png"));
+        let path = folder.join(format!("{id}-{image_id}.jpg"));
         let encode_started = Instant::now();
-        image.save(&path).map_err(err)?;
+        std::fs::write(&path, crate::visual_guard::encode_jpeg(&image)?).map_err(err)?;
         encode_ms += encode_started.elapsed().as_millis();
         images.push(json!({"imageId":image_id,"path":path,"width":image.width(),"height":image.height(),
             "snapshotId":id,"capturedAt":captured_at,"stability":stability,
@@ -1169,7 +1169,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
         "recall" => {
             let path = std::fs::canonicalize(request.image_path.ok_or("recall缺少imagePath")?).map_err(err)?;
             let folder = std::fs::canonicalize(shot_folder(&owner)).map_err(err)?;
-            if !path.starts_with(folder) || path.extension().and_then(|s| s.to_str()) != Some("png") {
+            if !path.starts_with(folder) || !matches!(path.extension().and_then(|s| s.to_str()), Some("jpg" | "png")) {
                 return Err("只能回看本会话的桌面截图".into());
             }
             Ok(json!({"images":[{"path":path}],"historical":true,
@@ -1594,12 +1594,11 @@ mod tests {
                 .resize_exact(1600, 900, xcap::image::imageops::FilterType::Triangle).into_rgba8();
             let resize_ms = started.elapsed().as_millis();
             assert_eq!(resized, expected);
-            let mut encoded = std::io::Cursor::new(Vec::new());
             let started = Instant::now();
-            resized.write_to(&mut encoded, xcap::image::ImageFormat::Png).unwrap();
+            let encoded = crate::visual_guard::encode_jpeg(&resized).unwrap();
             let encode_ms = started.elapsed().as_millis();
-            assert_eq!(xcap::image::load_from_memory(encoded.get_ref()).unwrap().to_rgba8(), resized);
-            eprintln!("screenshot pipeline: resize={resize_ms}ms encode={encode_ms}ms bytes={}", encoded.get_ref().len());
+            assert_eq!(xcap::image::load_from_memory(&encoded).unwrap().to_rgba8().dimensions(), resized.dimensions());
+            eprintln!("screenshot pipeline: resize={resize_ms}ms encode={encode_ms}ms bytes={}", encoded.len());
         }
     }
     #[cfg(windows)]

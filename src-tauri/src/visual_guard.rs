@@ -73,6 +73,18 @@ impl VisualGuard {
     }
 }
 
+/// 截图统一存 JPEG：模型历史里每张图都会被重发，PNG 体积大数倍。落点校验会拿这份文件对比新画面，
+/// 质量须保证压缩噪声不触发 `patch_changed`。
+pub(crate) fn encode_jpeg(image: &RgbaImage) -> Result<Vec<u8>, String> {
+    use xcap::image::buffer::ConvertBuffer;
+    let rgb: xcap::image::RgbImage = image.convert();
+    let mut bytes = Vec::new();
+    xcap::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 85)
+        .encode(rgb.as_raw(), rgb.width(), rgb.height(), xcap::image::ExtendedColorType::Rgb8)
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
 pub(crate) fn patch_changed(before: &RgbaImage, after: &RgbaImage) -> bool {
     if before.width() == 0 || before.height() == 0 || after.width() == 0 || after.height() == 0 { return true; }
     let after = if before.dimensions() == after.dimensions() { after.clone() } else {
@@ -85,6 +97,22 @@ pub(crate) fn patch_changed(before: &RgbaImage, after: &RgbaImage) -> bool {
 mod tests {
     use super::*;
     use xcap::image::Rgba;
+    #[test]
+    fn jpeg_screenshot_noise_is_not_a_visual_change() {
+        // 密集细字 + 彩色控件：JPEG 最容易产生振铃的画面。
+        let source = RgbaImage::from_fn(240, 140, |x, y| {
+            if (y / 12) % 2 == 0 && (x % 5 == 0 || (x + y) % 7 == 0) { Rgba([20, 20, 20, 255]) }
+            else if (100..180).contains(&x) && (90..120).contains(&y) { Rgba([30, 110, 230, 255]) }
+            else { Rgba([250, 250, 250, 255]) }
+        });
+        let decoded = xcap::image::load_from_memory(&encode_jpeg(&source).unwrap()).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), source.dimensions());
+        assert!(!patch_changed(&decoded, &source));
+        let mut moved = source.clone();
+        for y in 0..140 { for x in 0..240 { moved.put_pixel(x, y, *source.get_pixel((x + 3) % 240, y)); } }
+        assert!(patch_changed(&decoded, &moved), "real content shifts must still be detected");
+    }
+
     #[test]
     fn stale_targets_not_background_animation_or_caret_noise() {
         let original = RgbaImage::from_pixel(240, 140, Rgba([80, 80, 80, 255]));

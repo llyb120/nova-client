@@ -820,8 +820,7 @@ fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
 fn screenshot_bytes(data:&str, edge:u32) -> Result<(Vec<u8>,(u32,u32)),String> {
     use base64::Engine;
     let bytes=base64::engine::general_purpose::STANDARD.decode(data).map_err(|e|e.to_string())?;
-    let pixels=png_dimensions(&bytes)?;
-    if edge==0 || pixels.0.max(pixels.1)<=edge {return Ok((bytes,pixels));}
+    png_dimensions(&bytes)?;
     // CDP implementations do not all produce the same pixel dimensions for
     // clip.scale=1. Enforce the budget against the actual PNG, not guessed DPR.
     encode_screenshot(xcap::image::load_from_memory(&bytes).map_err(|e|e.to_string())?,edge)
@@ -832,9 +831,7 @@ fn encode_screenshot(image:xcap::image::DynamicImage, edge:u32) -> Result<(Vec<u
         image.resize(edge,edge,xcap::image::imageops::FilterType::Triangle)
     } else {image};
     let pixels=(image.width(),image.height());
-    let mut output=std::io::Cursor::new(Vec::new());
-    image.write_to(&mut output,xcap::image::ImageFormat::Png).map_err(|e|e.to_string())?;
-    Ok((output.into_inner(),pixels))
+    Ok((crate::visual_guard::encode_jpeg(&image.into_rgba8())?,pixels))
 }
 
 async fn capture_viewport(app:&AppHandle, viewport:&Value, x:f64, y:f64, w:f64, h:f64) -> Result<xcap::image::DynamicImage,String> {
@@ -1554,7 +1551,7 @@ async fn snapshot(
                 let h = (height - y).min(4096.);
                 let scale=if edge==0 {1.} else {(edge as f64/w.max(h)).min(1.)};
                 let shot=cdp(app,"Page.captureScreenshot",json!({"format":"png","fromSurface":true,"captureBeyondViewport":true,"clip":{"x":x,"y":y,"width":w,"height":h,"scale":scale}}),None,None).await?;
-                let path = dir.join(format!("{}-{tile}.png", observation.id));
+                let path = dir.join(format!("{}-{tile}.jpg", observation.id));
                 let (bytes,pixels)=screenshot_bytes(shot["data"].as_str().ok_or("截图为空")?,edge as u32)?;
                 std::fs::write(&path,bytes).map_err(|e|e.to_string())?;
                 let image_id=format!("{}-{tile}",observation.id);
@@ -1570,7 +1567,7 @@ async fn snapshot(
             } else {
                 Value::Null
             };
-            result["coordinateSpace"]=json!("Prefer act(imageId) with image-pixel x/y: tile offsets and PNG dimensions are mapped automatically. Without imageId use legacy CSS document pixels. click_at/move/scroll_at can auto-scroll; prefer DOM ref offscreen and viewport screenshots for Canvas; drag requires fullPage=false.");
+            result["coordinateSpace"]=json!("Prefer act(imageId) with image-pixel x/y: tile offsets and image dimensions are mapped automatically. Without imageId use legacy CSS document pixels. click_at/move/scroll_at can auto-scroll; prefer DOM ref offscreen and viewport screenshots for Canvas; drag requires fullPage=false.");
             result["screenshotScope"]=json!("主文档整页；内部滚动区域/iframe的屏幕外内容用整页DOM读取。未加载图片或虚拟数据可能仍需定向滚动。");
         } else {
             let viewport=&observation.pages["pages"][0]["viewport"];
@@ -1581,7 +1578,7 @@ async fn snapshot(
                 if w<=0. || h<=0. || x>=vw || y>=vh || x+w<=0. || y+h<=0. {return Err("region 不在当前视口中".into());}
                 (x.max(0.),y.max(0.),(x+w).min(vw)-x.max(0.),(y+h).min(vh)-y.max(0.))
             } else {(0.,0.,vw,vh)};
-            let path=dir.join(format!("{}.png",observation.id));
+            let path=dir.join(format!("{}.jpg",observation.id));
             let (bytes,pixels)=encode_screenshot(capture_viewport(app,viewport,x,y,w,h).await?,edge as u32)?;
             std::fs::write(&path,bytes).map_err(|e|e.to_string())?;
             let image_id=format!("{}-0",observation.id);
@@ -2643,7 +2640,7 @@ mod tests {
         png[16..20].copy_from_slice(&u32::MAX.to_be_bytes());assert!(png_dimensions(&png).is_err());
     }
     #[test]
-    fn screenshot_budget_uses_actual_png_dimensions() {
+    fn screenshot_budget_uses_actual_image_dimensions() {
         use base64::Engine;
         let image = xcap::image::RgbaImage::from_pixel(2400, 1200, xcap::image::Rgba([30, 90, 150, 255]));
         let mut png = std::io::Cursor::new(Vec::new());
@@ -2652,10 +2649,10 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(png.get_ref());
         let (resized, pixels) = screenshot_bytes(&encoded, 1600).unwrap();
         assert_eq!(pixels, (1600, 800));
-        assert_eq!(png_dimensions(&resized).unwrap(), pixels);
+        assert_eq!(xcap::image::load_from_memory(&resized).unwrap().to_rgba8().dimensions(), pixels);
         let (unchanged, pixels) = screenshot_bytes(&encoded, 0).unwrap();
         assert_eq!(pixels, (2400, 1200));
-        assert_eq!(unchanged, png.into_inner());
+        assert!(unchanged.starts_with(b"\xff\xd8\xff"), "screenshots are stored as JPEG");
         assert!(screenshot_bytes("not-base64", 1600).is_err());
     }
     #[test]
