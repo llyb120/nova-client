@@ -1491,8 +1491,18 @@ fn anthropic_thinking_budget(level: Option<&str>, max_output_tokens: u64) -> Opt
 
 fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
+    let mut screenshots: Vec<Value> = Vec::new();
     let images_from = tool_images_from(messages);
+    // 并行工具的 tool_result 必须连续排在同一条 user 消息开头，截图只能跟在全部结果之后。
+    let flush = |out: &mut Vec<Value>, screenshots: &mut Vec<Value>| {
+        if let Some(content) = out.last_mut().and_then(|m| m["content"].as_array_mut()) {
+            content.append(screenshots);
+        }
+    };
     for (index, message) in messages.iter().enumerate() {
+        if message.get("role").and_then(Value::as_str) != Some("toolResult") {
+            flush(&mut out, &mut screenshots);
+        }
         match message.get("role").and_then(Value::as_str) {
             Some("user") => {
                 let mut parts = Vec::new();
@@ -1576,18 +1586,18 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
             Some("toolResult") => {
                 let is_error = message.get("isError").and_then(Value::as_bool) == Some(true);
                 let (text, images) = tool_result_parts(message, model, index >= images_from);
-                out.push(json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": replay_tool_id(message.get("toolCallId").and_then(Value::as_str).unwrap_or_default()),
-                        "content": [{ "type": "text", "text": text }],
-                        "is_error": is_error,
-                    }],
-                }));
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": replay_tool_id(message.get("toolCallId").and_then(Value::as_str).unwrap_or_default()),
+                    "content": [{ "type": "text", "text": text }],
+                    "is_error": is_error,
+                });
+                match out.last_mut().and_then(|m| m["content"].as_array_mut()) {
+                    Some(content) if index > 0 && messages[index - 1]["role"] == "toolResult" => content.push(block),
+                    _ => out.push(json!({ "role": "user", "content": [block] })),
+                }
                 if !images.is_empty() {
-                    let mut content = Vec::new();
-                    content.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
+                    screenshots.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
                         "type": "image",
                         "source": {
                             "type": "base64",
@@ -1595,12 +1605,12 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                             "data": image.get("data").and_then(Value::as_str).unwrap_or_default(),
                         }
                     })]));
-                    out.push(json!({ "role": "user", "content": content }));
                 }
             }
             _ => {}
         }
     }
+    flush(&mut out, &mut screenshots);
     out
 }
 
@@ -2394,6 +2404,27 @@ mod tests {
         );
         assert_eq!(out[3]["role"], "tool");
         assert_eq!(out[3]["content"], "文件内容");
+    }
+
+    #[test]
+    fn anthropic_screenshots_follow_all_parallel_tool_results() {
+        let model = test_model("anthropic-messages");
+        let mut messages = vec![json!({ "role": "assistant", "content": [
+            { "type": "toolCall", "id": "a", "name": "browser", "arguments": {} },
+            { "type": "toolCall", "id": "b", "name": "read", "arguments": {} }
+        ]})];
+        messages.push(json!({ "role": "toolResult", "toolCallId": "a", "content": [
+            { "type": "text", "text": "shot" }, { "type": "image", "mimeType": "image/png", "data": "QUJD" }
+        ]}));
+        messages.push(json!({ "role": "toolResult", "toolCallId": "b", "content": [{ "type": "text", "text": "ok" }] }));
+        messages.push(json!({ "role": "user", "content": "继续" }));
+        let out = anthropic_messages(&messages, &model);
+        assert_eq!(out.len(), 3);
+        let content = out[1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["tool_use_id"], "a");
+        assert_eq!(content[1]["tool_use_id"], "b");
+        assert_eq!(content.last().unwrap()["type"], "image");
+        assert_eq!(out[2]["content"][0]["text"], "继续");
     }
 
     #[test]
