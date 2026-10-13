@@ -283,29 +283,7 @@ pub async fn knowledge_graph(webview: tauri::Webview) -> Result<Value> {
         .await.map_err(err)?
 }
 
-/// Tool entry: search answers inline; save/feedback are validated now and written in the background,
-/// so the calling model can end its turn without waiting for the store.
-pub(crate) fn submit(dir: &Path, tool: &str, owner: &str, args: &Value, observed_scope: Option<&str>) -> Result<Value> {
-    if args["operation"] == "experience_search" { return execute(dir, tool, owner, args, observed_scope); }
-    let (_, scope) = validate(tool, args, observed_scope)?;
-    // The model recorded this flow itself; drop the auto trail now, before the turn-end save can race it.
-    forget(tool, owner, &scope);
-    let (dir, tool, owner, args, observed) = (dir.to_path_buf(), tool.to_string(), owner.to_string(), args.clone(), observed_scope.map(str::to_owned));
-    std::thread::spawn(move || {
-        // ponytail: ~3s of retries while another writer/instance holds the store lock; later failures are only logged.
-        for attempt in 0..30 {
-            match execute(&dir, &tool, &owner, &args, observed.as_deref()) {
-                Err(e) if e.starts_with("经验库忙") && attempt < 29 => std::thread::sleep(std::time::Duration::from_millis(100)),
-                Err(e) => return eprintln!("[experience] 后台记录失败：{e}"),
-                Ok(_) => return,
-            }
-        }
-    });
-    Ok(json!({"accepted":true,"notice":"已校验并转后台写入，无需等待或确认；本轮任务已可结束，不要再追加回复或调用。"}))
-}
-
-/// Parameter, scope and observation checks shared by the inline and background paths.
-fn validate(tool: &str, args: &Value, observed_scope: Option<&str>) -> Result<(Request, String)> {
+pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observed_scope: Option<&str>) -> Result<Value> {
     let operation = args["operation"].as_str().unwrap_or_default();
     if !matches!(operation, "experience_search" | "experience_save" | "experience_feedback") {
         return Err("未知经验操作".into());
@@ -328,13 +306,6 @@ fn validate(tool: &str, args: &Value, observed_scope: Option<&str>) -> Result<(R
             return Err("反馈需reason及outcome=success/transient/precondition/invalid；超时用transient，确认路径失效才用invalid".into());
         }
     }
-    Ok((request, scope))
-}
-
-pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observed_scope: Option<&str>) -> Result<Value> {
-    let (request, scope) = validate(tool, args, observed_scope)?;
-    let operation = args["operation"].as_str().unwrap_or_default();
-    let writing = operation != "experience_search";
     let (_lock, mut entries) = read_entries(dir)?;
     if !writing {
         let query = terms(&request.task);
@@ -470,21 +441,6 @@ mod tests {
         let (_l, entries) = read_entries(dir.path()).unwrap();
         assert_eq!(entries.len(), 300);
         assert!(entries.iter().any(|e| e.successes.len() == 2), "proven route kept");
-    }
-    #[test]
-    fn tool_writes_validate_inline_and_land_in_the_background() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut args = json!({"operation":"experience_save","snapshotId":"s","experience":{"scope":"Navicat","task":"刷新表",
-            "conditions":["已打开表"],"steps":["按F5"],"checks":["数据更新"],"outcome":"success","evidence":"可见新数据","redacted":true}});
-        assert!(submit(dir.path(), "jianlai", "o", &args, Some("other")).is_err(), "scope mismatch is reported to the model at once");
-        assert_eq!(submit(dir.path(), "jianlai", "o", &args, Some("navicat")).unwrap()["accepted"], true);
-        let landed = (0..100).any(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            read_entries(dir.path()).is_ok_and(|(_l, entries)| entries.len() == 1)
-        });
-        assert!(landed, "background write reaches the store");
-        args["operation"] = json!("experience_search");
-        assert_eq!(submit(dir.path(), "jianlai", "o", &args, None).unwrap()["totalRoutes"], 1, "search stays inline");
     }
     #[test]
     fn turn_trails_save_only_on_normal_end_and_yield_to_model_saves() {

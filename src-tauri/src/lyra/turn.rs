@@ -260,7 +260,6 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
                     part.get("arguments").cloned().unwrap_or_else(|| json!({})),
                 ));
             }
-            let closing = closes_turn(&content, &calls);
             let aborted = result.stop_reason == "aborted";
             if !(aborted && content.is_empty()) {
                 s.history.record(json!({
@@ -293,24 +292,11 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
                     parts.push(json!({ "type": "text", "text": notice }));
                 }
             }
-            let accepted = results.iter().all(|r| r["isError"] != true);
             for message in results {
                 s.history.record(message);
             }
-            // The final reply already went out beside a background experience write; another request would only restate it.
-            if closing && accepted && s.steer.lock().unwrap().is_empty() {
-                return TurnOutcome::default();
-            }
         }
     })
-}
-
-/// A message that answers the user and only records experience (written in the background) ends the turn.
-fn closes_turn(content: &[Value], calls: &[(String, String, Value)]) -> bool {
-    !calls.is_empty()
-        && content.iter().any(|p| p["type"] == "text" && p["text"].as_str().is_some_and(|t| !t.trim().is_empty()))
-        && calls.iter().all(|(_, name, args)| matches!(name.as_str(), "jianlai" | "chrome" | "webview")
-            && matches!(args["operation"].as_str(), Some("experience_save" | "experience_feedback")))
 }
 
 /// 按顺序执行：相邻的可并发调用一起跑（提前派发的直接取结果），其余逐个串行。
@@ -477,17 +463,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::lyra::config::ResolvedModel;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[test]
-    fn final_reply_with_only_experience_writes_ends_the_turn() {
-        let reply = [json!({"type":"text","text":"已完成"})];
-        let save = |tool: &str, op: &str| ("1".to_string(), tool.to_string(), json!({"operation":op}));
-        assert!(closes_turn(&reply, &[save("jianlai", "experience_save"), save("chrome", "experience_feedback")]));
-        assert!(!closes_turn(&[], &[save("jianlai", "experience_save")]), "no answer yet: the model still has to reply");
-        assert!(!closes_turn(&reply, &[save("jianlai", "experience_search")]), "search results must be read");
-        assert!(!closes_turn(&reply, &[save("jianlai", "experience_save"), save("jianlai", "act")]));
-        assert!(!closes_turn(&reply, &[]));
-    }
 
     /// 依次回放脚本化响应的本地 HTTP 服务；`None` 表示 HTTP 503。
     pub(crate) async fn scripted_server(responses: Vec<Option<Vec<Value>>>) -> String {

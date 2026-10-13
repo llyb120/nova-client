@@ -1534,7 +1534,7 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
                 let id = snap.window.or(snap.foreground.map(|(id, _)| id)).ok_or("请截目标应用窗口后记录经验")?;
                 Some(crate::tool_experience::scope("jianlai", &window(id)?.app_name().map_err(err)?)?)
             };
-            return crate::tool_experience::submit(&crate::tool_experience::dir(), "jianlai", &owner, &args, observed.as_deref());
+            return crate::tool_experience::execute(&crate::tool_experience::dir(), "jianlai", &owner, &args, observed.as_deref());
         }
         let entering = matches!(args["operation"].as_str(), Some("windows" | "screenshot" | "activate"));
         let mut result = run(owner.clone(), args)?;

@@ -116,9 +116,6 @@ test("desktop optimizations are shared by custom tools and MCP, not Lyra-only", 
     assert.deepEqual(tool.inputSchema.properties.experience.required, ["scope", "task"]);
     assert.equal(tool.inputSchema.properties.actions.maxItems, 16);
     assert.match(tool.description, /操作经验按需使用/);
-    // Save/feedback are written in the background, so they ride along with the final reply.
-    assert.match(tool.description, /最终回复与.*同一条消息/);
-    assert.match(tool.description, /转后台写入并立即返回/);
     // Browser acts are auto-recorded; desktop acts are not, so jianlai must save explicitly.
     if (name === "chrome") {
       assert.match(tool.description, /仅当发现有复用价值的新路径或修正了旧经验/);

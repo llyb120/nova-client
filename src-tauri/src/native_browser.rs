@@ -2041,7 +2041,7 @@ async fn execute_webview(root: &Path, args: &Value) -> Result<Value, String> {
             Some(url.origin().ascii_serialization())
         };
         let args = args.clone();
-        return tokio::task::spawn_blocking(move || crate::tool_experience::submit(
+        return tokio::task::spawn_blocking(move || crate::tool_experience::execute(
             &crate::tool_experience::dir(), "webview", &thread_id, &args, observed.as_deref()))
             .await.map_err(|e| e.to_string())?;
     }
@@ -2168,7 +2168,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
             Some(url.origin().ascii_serialization())
         };
         let args = args.clone();
-        return tokio::task::spawn_blocking(move || crate::tool_experience::submit(
+        return tokio::task::spawn_blocking(move || crate::tool_experience::execute(
             &crate::tool_experience::dir(), "chrome", &thread_id, &args, observed.as_deref()))
             .await.map_err(|e| e.to_string())?;
     }
