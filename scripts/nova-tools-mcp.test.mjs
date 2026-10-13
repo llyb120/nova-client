@@ -72,8 +72,10 @@ test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
   }
 });
 
-test("context argument aliases normalize", () => {
+test("context argument aliases normalize and preserve explicit deep mode", () => {
   assert.deepEqual(normalizePolarisArgs({ query: "Widget" }).keywords, ["Widget"]);
+  assert.equal(normalizePolarisArgs({ query: "Widget", deep: true }).deep, true);
+  assert.equal(normalizePolarisArgs({ query: "Widget" }).deep, undefined);
 });
 
 test("polaris keywords normalize to top five", () => {
@@ -84,6 +86,7 @@ test("polaris keywords normalize to top five", () => {
   );
   const inputSchema = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true })).polaris.inputSchema;
   for (const key of ["anyOf", "oneOf", "allOf"]) assert.equal(inputSchema[key], undefined, `top-level ${key} makes Claude Code drop polaris`);
+  assert.equal(inputSchema.properties.deep.type, "boolean");
   const schema = inputSchema.properties.keywords;
   assert.equal(schema.maxItems, undefined);
   assert(schema.anyOf.some((option) => option.type === "string"));

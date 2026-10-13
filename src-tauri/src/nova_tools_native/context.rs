@@ -1163,7 +1163,18 @@ fn spawn_search_index_build(root: &Path, key: String) {
                 .get_or_init(|| Mutex::new(()))
                 .lock()
                 .unwrap();
-            if let Some(snapshot) = build_search_snapshot(&root) {
+            // 冷启动的整仓快照反序列化也留在后台，不能先花数秒加载、再让首个查询走 rg。
+            if let Some(mut index) = load_search_snapshot(&root) {
+                index.checked_at = Instant::now() - Duration::from_secs(60);
+                SEARCH_INDEXES.get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock().unwrap().insert(key.clone(), index);
+                SEARCH_INDEX_COMPACTED.get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock().unwrap().insert(key.clone(), Instant::now());
+                SEARCH_INDEX_BUILDING.get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock().unwrap().remove(&key);
+                // 磁盘快照复核 HEAD/脏文件前只用实时 rg，不把旧正文当作当前代码。
+                ensure_search_updater(&root, &key);
+            } else if let Some(snapshot) = build_search_snapshot(&root) {
                 publish_search_snapshot(&root, snapshot);
                 ensure_search_updater(&root, &key);
             } else {
@@ -1190,18 +1201,6 @@ fn search_index_now(root: &Path) -> Option<SearchIndex> {
         return (index.checked_at.elapsed() < Duration::from_millis(SEARCH_GIT_POLL_MS * 3)).then_some(index);
     }
     if cfg!(test) {
-        return None;
-    }
-    if let Some(mut index) = load_search_snapshot(root) {
-        index.checked_at = Instant::now() - Duration::from_secs(60);
-        indexes.lock().unwrap().insert(key.clone(), index.clone());
-        SEARCH_INDEX_COMPACTED
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap()
-            .insert(key.clone(), Instant::now());
-        ensure_search_updater(root, &key);
-        // 磁盘快照尚未复核当前 HEAD/脏文件，首次查询走实时 rg，后台校验后再使用。
         return None;
     }
     spawn_search_index_build(root, key);
@@ -4174,6 +4173,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     } else {
         &anchor_terms
     };
+    let deep = params.get("deep").and_then(Value::as_bool).unwrap_or(false);
     let plan_intent = retrieval_plan(&task);
     let mut file_seen = HashSet::new();
     let files: Vec<String> = params
@@ -4436,7 +4436,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         candidates = preliminary.iter().take(3).cloned().collect();
     }
     let mut wanted: HashSet<_> = candidates.iter().map(|value| value.0.clone()).collect();
-    if !subject_terms.is_empty() {
+    if deep && !subject_terms.is_empty() {
         for file in &all {
             if is_subject_file(file, &subject_terms) {
                 wanted.insert(file.clone());
@@ -4463,7 +4463,8 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         );
     }
     let stage = Instant::now();
-    let (index, _, snapshot) = build_index(root, Some(&wanted), 3, Some(all.as_slice()));
+    // ponytail: 概览仅索引命中候选，不递归 import；完整依赖/别名调用需显式 deep=true。
+    let (index, _, snapshot) = build_index(root, Some(&wanted), if deep { 3 } else { 0 }, Some(all.as_slice()));
     trace("fast_context.index", stage);
     let stage = Instant::now();
     // 请求内共享正文；下一次调用重新读取，避免编辑后的内容被跨请求缓存遮蔽。
@@ -4547,7 +4548,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         .into_iter().collect::<Vec<_>>();
     ordered_strong_seed_files.sort();
     // 仍等待并使用完整历史结果，不降低测试召回；将 750ms 上限的 Git 等待与闭包计算重叠。
-    let history_job = if ordered_strong_seed_files.is_empty() { None } else {
+    let history_job = if !deep || ordered_strong_seed_files.is_empty() { None } else {
         let history_root = root.to_path_buf();
         let history_seeds = ordered_strong_seed_files.iter().take(3).cloned().collect::<Vec<_>>();
         let revision = revision.clone();
@@ -4555,6 +4556,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     };
     let seed_bodies = seeds
         .iter()
+        .filter(|_| deep)
         .filter_map(|(definition, _, _)| {
             source(root, &definition.file, index.files.get(&definition.file), &mut sources).and_then(|src| {
                 Some((definition.file.clone(), src.lines.get(definition.symbol.ln.checked_sub(1)?..definition.symbol.end)?.join("\n")))
@@ -4565,7 +4567,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     // 反向图 discover 兜底的词根预取：把所有种子目标的文件名词根合并成一次批量
     // 检索（原先每个种子目标单独全仓搜一次，串行）。
     let mut discover_stems = Vec::<String>::new();
-    {
+    if deep {
         let mut seen_targets = HashSet::<String>::new();
         for (definition, _, _) in &seeds {
             if !seen_targets.insert(definition.file.clone()) {
@@ -4687,7 +4689,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     let mut invisible_callers = HashSet::<String>::new();
     const MAX_GRAPH_IMPORTERS: usize = 12;
     const MAX_GRAPH_ROWS_PER_FILE: usize = 6;
-    if !seeds.is_empty() {
+    if deep && !seeds.is_empty() {
         let all_paths = all.iter().cloned().collect::<HashSet<_>>();
         let mut searched_targets = HashSet::<String>::new();
         let graph_start = Instant::now();
@@ -4967,7 +4969,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     let mut history_incomplete = history.is_none();
     let history = history.unwrap_or_default();
     trace("fast_context.history_wait", history_wait);
-    let companion_tests = if ordered_strong_seed_files.is_empty() {
+    let companion_tests = if !deep || ordered_strong_seed_files.is_empty() {
         Vec::new()
     } else {
         // 只排除非测试文件：已进 ranked 的测试文件仍会被 noise 过滤丢弃，
@@ -5806,7 +5808,9 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         }
         body.push(format!(
             "符号关系: {}",
-            if planned_terms.is_empty() {
+            if !deep {
+                "未扩展（快速概览）".into()
+            } else if planned_terms.is_empty() {
                 "无可解析扩展边".into()
             } else {
                 format!("已解析 {}", planned_terms.len())
@@ -5920,6 +5924,9 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
             if task.is_empty() { String::new() } else { format!(" task=\"{}\"", js_utf16_slice(&task, 80)) },
             if files.is_empty() { String::new() } else { format!(" files={}", files.join(",")) },
             revision, order.len(), block_count, shown_lines, content.len() as f64 / 1024.0);
+        if !deep {
+            head.push_str("\n# 快速概览：未追踪依赖图、别名调用或函数体扩展词；需要深度检索时传 deep=true。");
+        }
         if search.incomplete.load(Ordering::Relaxed) {
             head.push_str(&format!("\n# {PARTIAL_SEARCH_NOTE}"));
         }
@@ -6051,6 +6058,27 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn overview_skips_dependency_expansion_and_deep_is_opt_in() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/entry.ts"), "import { deepHelper } from './helper';\nexport function overviewTarget(value: number) {\n  return deepHelper(value);\n}\n").unwrap();
+        fs::write(root.join("src/helper.ts"), "export function deepHelper(value: number) { return value + 1; }\n").unwrap();
+        fs::write(root.join("src/caller.ts"), "import { overviewTarget as alias } from './entry';\nexport function caller(value: number) {\n  return alias(value);\n}\n").unwrap();
+        let mut params = serde_json::json!({"keywords":["overviewTarget"], "task":"说明 overviewTarget 的调用方和返回", "maxBytes":4096});
+        let overview = polaris(root, params.clone()).unwrap();
+        assert!(overview.contains("src/entry.ts") && overview.contains("[def]"), "{overview}");
+        assert!(overview.contains("快速概览") && overview.len() <= 4096, "{overview}");
+        assert!(!overview.contains("[import图]") && !overview.contains("Git 共改检索未完成"), "{overview}");
+        assert!(!load_cache(root).files.contains_key("src/helper.ts"));
+        params["deep"] = Value::Bool(true);
+        let deep = polaris(root, params).unwrap();
+        assert!(load_cache(root).files.contains_key("src/helper.ts"));
+        assert!(deep.contains("[import图]") && deep.contains("符号关系: 已解析"), "{deep}");
+        assert!(!deep.contains("快速概览") && deep.len() <= 4096, "{deep}");
+    }
 
     #[test]
     fn parallel_cold_scans_keep_all_disjoint_updates() {
@@ -6680,7 +6708,7 @@ mod tests {
             "export function helperFn(value) {\n  return `${value}!`;\n}\n",
         )
         .unwrap();
-        let out = fast_context(d.path(), serde_json::json!({"keywords":["targetFn"]})).unwrap();
+        let out = fast_context(d.path(), serde_json::json!({"keywords":["targetFn"],"deep":true})).unwrap();
         assert!(out.contains("@@ 3-4 fn targetFn (头部, 全3-5) [def]"), "{out}");
         assert!(out.contains("src/helper.ts:1 export function helperFn"), "{out}");
         assert!(out.contains("(全1-3)"), "{out}");
@@ -6720,6 +6748,7 @@ mod tests {
             d.path(),
             serde_json::json!({
                 "keywords":["refreshSession"],
+                "deep":true,
                 "task":"修改 refreshSession 的失败和错误处理，保持会话过期行为"
             }),
         )
@@ -6757,7 +6786,7 @@ mod tests {
         ).unwrap();
         let out = fast_context(
             d.path(),
-            serde_json::json!({"keywords":["authorize"],"task":"修改 authorize 的失败处理"}),
+            serde_json::json!({"keywords":["authorize"],"task":"修改 authorize 的失败处理","deep":true}),
         )
         .unwrap();
         assert!(out.contains("if (reason instanceof AuthFault) return 'login'"), "{out}");
@@ -6786,7 +6815,7 @@ mod tests {
             "export class ResultEnvelope {\n  constructor(value) { this.value = value; }\n}\n",
         )
         .unwrap();
-        let out = fast_context(d.path(), serde_json::json!({"keywords":["targetFlow"]})).unwrap();
+        let out = fast_context(d.path(), serde_json::json!({"keywords":["targetFlow"],"deep":true})).unwrap();
         assert!(out.contains("buildEnvelope"), "{out}");
         assert!(out.contains("src/helper.ts:2"), "{out}");
         assert!(!out.contains("constructor(value)"), "{out}");
@@ -7160,7 +7189,7 @@ mod tests {
         .unwrap();
         let out = fast_context(
             d.path(),
-            serde_json::json!({"keywords":["renderWidget"],"task":"找出所有调用方 caller 兼容"}),
+            serde_json::json!({"keywords":["renderWidget"],"task":"找出所有调用方 caller 兼容","deep":true}),
         )
         .unwrap();
         assert!(out.contains("renderWidget"), "{out}");
@@ -7241,7 +7270,7 @@ mod tests {
         .unwrap();
         let out = fast_context(
             d.path(),
-            serde_json::json!({"keywords":["mountWidget"],"task":"修改挂载入口签名"}),
+            serde_json::json!({"keywords":["mountWidget"],"task":"修改挂载入口签名","deep":true}),
         )
         .unwrap();
         assert!(out.contains("## DEPS"), "{out}");
@@ -7340,7 +7369,7 @@ mod tests {
                 format!("import {{ sharedHelper }} from './helper';\nexport function noise{i}() {{\n  return sharedHelper('unrelated');\n}}\n")).unwrap();
         }
         let out = fast_context(d.path(), serde_json::json!({
-            "keywords":["focusedTarget"], "task":"inspect focusedTarget", "maxBytes":65536
+            "keywords":["focusedTarget"], "task":"inspect focusedTarget", "maxBytes":65536, "deep":true
         })).unwrap();
         assert!(out.contains("return sharedHelper(input);"), "{out}");
         assert!(out.contains("src/helper.ts:1 export function sharedHelper"), "{out}");
@@ -7387,8 +7416,8 @@ mod tests {
     }
 
     #[test]
-    fn companion_test_files_are_packed_by_default() {
-        // 伴生测试：改实现默认带上共改的测试文件，即使任务文本未提测试、
+    fn companion_test_files_are_packed_only_in_deep_mode() {
+        // 深度检索带上共改的测试文件，即使任务文本未提测试、
         // 测试文件与关键词零重叠（noise_path 不再拦截伴生测试）。
         let d = tempdir().unwrap();
         git(d.path(), &["init", "-q"]);
@@ -7413,9 +7442,11 @@ mod tests {
             git(d.path(), &["add", "-A"]);
             git(d.path(), &["commit", "-qm", "change"]);
         }
+        let overview = fast_context(d.path(), serde_json::json!({"keywords":["companionTarget"]})).unwrap();
+        assert!(!overview.contains("### src/core.test.ts"), "{overview}");
         let out = fast_context(
             d.path(),
-            serde_json::json!({"keywords":["companionTarget"],"task":"修改实现逻辑"}),
+            serde_json::json!({"keywords":["companionTarget"],"task":"修改实现逻辑","deep":true}),
         )
         .unwrap();
         assert!(out.contains("### src/core.test.ts"), "{out}");
@@ -7434,7 +7465,7 @@ mod tests {
         .unwrap();
         let out2 = fast_context(
             d2.path(),
-            serde_json::json!({"keywords":["widgetTarget"],"task":"修改实现逻辑"}),
+            serde_json::json!({"keywords":["widgetTarget"],"task":"修改实现逻辑","deep":true}),
         )
         .unwrap();
         assert!(out2.contains("### lib/widget.test.ts"), "{out2}");
@@ -7473,7 +7504,7 @@ mod tests {
             git(d.path(), &["add", "-A"]);
             git(d.path(), &["commit", "-qm", "change"]);
         }
-        let out = fast_context(d.path(), serde_json::json!({"keywords":["BetaView"]})).unwrap();
+        let out = fast_context(d.path(), serde_json::json!({"keywords":["BetaView"],"deep":true})).unwrap();
         assert!(!out.contains("# CTX MISS"), "{out}");
         assert!(!out.contains("### src/settings.test.ts"), "{out}");
     }

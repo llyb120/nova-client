@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 返回高相关命中行（每处1–2行）+必要签名/定位及 IMPACT；依赖默认仅签名/位置，按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。目标行段已明确时直接按行段 read。";
+const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析。仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。目标行段已明确时直接按行段 read。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。禁止无排除的递归搜索（grep -r 等）。";
@@ -67,6 +67,7 @@ pub fn tool_set(
                     "files": { "type": "array", "items": { "type": "string" }, "maxItems": 6, "description": "已知必看文件，可与 keywords/task 同用" },
                     "budget": { "type": "integer", "minimum": 100, "maximum": 1200, "description": "输出行预算；通常无需设置，不用于凑满输出" },
                     "maxBytes": { "type": "integer", "minimum": 4096, "maximum": 65536, "description": "输出字节硬上限，默认 12288（12KB）；只返回高相关命中行与必要签名/定位，不凑满" },
+                    "deep": { "type": "boolean", "description": "默认 false，仅返回快速概览；确需递归依赖、别名调用及伴生测试时才开启（较慢）" },
                     "coupling": { "type": "boolean", "description": "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" }
                 }
             })),

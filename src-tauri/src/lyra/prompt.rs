@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 /// Reasonix 风格的单工具上下文预算；超限文本先归档再截断。
 pub const TOOL_OUTPUT_CONTEXT_MAX_BYTES: usize = 32 * 1024;
-/// polaris 有自己的完整单元预算（默认 32KB，显式上限 64KB）。
+/// polaris 默认快速概览有自己的输出预算（默认 12KB，显式上限 64KB）。
 pub const POLARIS_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// OpenAI Responses function_call_output.output 硬限制，预留截断提示空间。
 pub const OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS: usize = 10_485_760 - 512;
@@ -475,7 +475,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             })
         },
         polaris.then_some(
-            "- polaris: 高相关命中行（每处1–2行）+必要签名/定位及 IMPACT/SIG；依赖默认仅签名/位置，按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数（内部批量 rg + 增量符号索引）",
+            "- polaris: 默认快速概览，每处1–2行命中+必要签名/定位及 IMPACT/SIG；不递归依赖、不追踪别名调用或 Git 历史，正文按需 read 补读；仅确需深度关系时传 deep=true（较慢）；默认12KB硬上限、不凑满，不自动展开完整函数",
         ),
         if read_only {
             None

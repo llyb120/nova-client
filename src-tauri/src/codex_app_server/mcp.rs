@@ -11,7 +11,7 @@ pub(super) struct Config {
 }
 
 fn tool() -> Value {
-    json!({"name":"polaris","description":"需要跨文件查找、分析修改位置或读取多个文件时先调用：按 keywords/task/files 返回高相关命中行（每处1–2行）+必要签名/定位及 IMPACT 调用方；依赖默认仅签名/位置，按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。仅实际展示的行段视为已读，不重复搜索相同关键词。返回 CTX MISS 时按 next 提示修正符号或传 files 重试。",
+    json!({"name":"polaris","description":"需要跨文件查找、分析修改位置或读取多个文件时先调用：按 keywords/task/files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析；仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。仅实际展示的行段视为已读，不重复搜索相同关键词。返回 CTX MISS 时按 next 提示修正符号或传 files 重试。",
         "inputSchema":{"type":"object","properties":{
             "keywords":{"anyOf":[{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},{"type":"string","minLength":1}],"description":"关键词或符号名，最多取前 5 项"},
             "query":{"type":"string","minLength":1,"description":"简短检索词"},
@@ -19,6 +19,7 @@ fn tool() -> Value {
             "files":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},
             "maxChars":{"type":"integer","minimum":4000,"maximum":80000},
             "budget":{"type":"integer","minimum":100,"maximum":4000},
+            "deep":{"type":"boolean","description":"默认 false，仅返回快速概览；确需递归依赖、别名调用及伴生测试时才开启（较慢）"},
             "coupling":{"type":"boolean"}
         },"anyOf":[{"required":["keywords"]},{"required":["query"]},{"required":["task"]},{"required":["files"]}],"additionalProperties":false}})
 }
