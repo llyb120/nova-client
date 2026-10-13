@@ -9,7 +9,8 @@ export async function webviewMcpResult(text) {
   let readMs = 0;
   let base64Ms = 0;
   let imageBytes = 0;
-  for (const image of (result.images ?? []).slice(0, 16)) {
+  // jianlai omits path for pixel-identical repeats: nothing to attach, the model already has that image.
+  for (const image of (result.images ?? []).filter((image) => image.path).slice(0, 16)) {
     try {
       const readStarted = performance.now();
       const data = await readFile(image.path);

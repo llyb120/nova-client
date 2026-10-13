@@ -90,7 +90,8 @@ const RECENT_TOOL_IMAGES: usize = 3;
 fn has_tool_images(message: &Value) -> bool {
     message["role"] == "toolResult"
         && (message["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"] == "image"))
-            || message.pointer("/details/images").and_then(Value::as_array).is_some_and(|a| !a.is_empty())
+            // jianlai omits path for pixel-identical repeats; they carry no image and must not evict real ones.
+            || message.pointer("/details/images").and_then(Value::as_array).is_some_and(|a| a.iter().any(|i| i["path"].is_string()))
             || message.pointer("/details/imagePath").and_then(Value::as_str).is_some())
 }
 

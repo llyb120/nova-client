@@ -125,6 +125,13 @@ struct Snapshot {
     invalidated: Option<String>,
     /// 后台截图：act 必须同样带 background，两种模式的快照互不通用。
     background: bool,
+    /// (imageId, JPEG digest, path the model actually received) per image, so identical repeats are not resent.
+    delivered: Vec<(String, u64, std::path::PathBuf)>,
+}
+
+/// The previously delivered image this one repeats pixel for pixel (same imageId and encoded bytes).
+fn unchanged_from<'a>(previous: &'a [(String, u64, std::path::PathBuf)], image_id: &str, digest: u64) -> Option<&'a std::path::PathBuf> {
+    previous.iter().find(|(id, d, _)| id == image_id && *d == digest).map(|(_, _, path)| path)
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -443,8 +450,11 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let mut capture_ms = 0;
     let mut resize_ms = 0;
     let mut encode_ms = 0;
-    *state = None;
     let bg = background::active();
+    // Only this session's recent, same-mode observation counts as something the model has already seen.
+    let previous = state.take().filter(|s| s.owner == owner && s.background == bg && s.taken.elapsed() <= Duration::from_secs(180))
+        .map(|s| s.delivered).unwrap_or_default();
+    let mut delivered = Vec::new();
     if bg { background::check_scope(window_id.is_some())?; }
     let id = uuid::Uuid::new_v4().to_string();
     let sequence = OBSERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -493,14 +503,25 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
         let path = folder.join(format!("{id}-{image_id}.jpg"));
         let encode_started = Instant::now();
-        std::fs::write(&path, crate::visual_guard::encode_jpeg(&image)?).map_err(err)?;
+        let bytes = crate::visual_guard::encode_jpeg(&image)?;
+        let digest = { use std::hash::{Hash, Hasher}; let mut h = std::hash::DefaultHasher::new(); bytes.hash(&mut h); h.finish() };
+        let same = unchanged_from(&previous, &image_id, digest).cloned();
+        if same.is_none() { std::fs::write(&path, &bytes).map_err(err)?; }
         encode_ms += encode_started.elapsed().as_millis();
-        images.push(json!({"imageId":image_id,"path":path,"width":image.width(),"height":image.height(),
+        let mut entry = json!({"imageId":image_id,"path":path,"width":image.width(),"height":image.height(),
             "snapshotId":id,"capturedAt":captured_at,"stability":stability,
             "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
             "cursor":cursor.map(|(x,y)| json!({"x":x,"y":y,"marker":"sword-tip","source":"system-pointer"})),
             "region":region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height})),
-            "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}}));
+            "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}});
+        // No path means hosts attach no image; samePixelsAs stays readable through recall.
+        if let Some(same) = &same {
+            entry.as_object_mut().unwrap().remove("path");
+            entry["unchanged"] = json!(true);
+            entry["samePixelsAs"] = json!(same);
+        }
+        images.push(entry);
+        delivered.push((image_id.clone(), digest, same.unwrap_or(path)));
         shots.push(Shot {
             image_id,
             surface,
@@ -583,14 +604,18 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         shots,
         invalidated: None,
         background: bg,
+        delivered,
     });
-    Ok(
-        json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
+    let unchanged: Vec<&str> = images.iter().filter(|i| i["unchanged"] == true).filter_map(|i| i["imageId"].as_str()).collect();
+    let mut result = json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
             "foreground":before,"maxEdge":max_edge,
             "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
                 "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
-                "total":started.elapsed().as_millis()}}),
-    )
+                "total":started.elapsed().as_millis()}});
+    if !unchanged.is_empty() {
+        result["unchangedNotice"] = json!(format!("{} 与上一张逐像素相同，未重复发送图片：直接沿用上一张图判断，坐标对本次snapshotId/imageId同样有效。动作后出现此提示说明该动作没有产生可见变化，换方法而不是重复同一输入或反复截图；上一张已不在上下文时用recall(imagePath=samePixelsAs)回看。", unchanged.join("、")));
+    }
+    Ok(result)
 }
 
 #[cfg(windows)]
@@ -1519,6 +1544,13 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
 mod tests {
     use super::*;
     #[test]
+    fn only_identical_bytes_of_the_same_image_count_as_unchanged() {
+        let seen = vec![("window-1".to_string(), 7, std::path::PathBuf::from("a.jpg"))];
+        assert_eq!(unchanged_from(&seen, "window-1", 7), Some(&std::path::PathBuf::from("a.jpg")));
+        assert_eq!(unchanged_from(&seen, "window-1", 8), None, "changed pixels are always resent");
+        assert_eq!(unchanged_from(&seen, "window-1-region-0-0-10-10", 7), None, "a crop is a different image");
+    }
+    #[test]
     fn target_actions_map_through_the_guarded_point() {
         assert!(has_target(&json!({"actions":[{"action":"press","key":"Enter"},{"action":"click","target":"v2"}]})));
         assert!(has_target(&json!({"action":{"action":"click","target":"搜索框"}})));
@@ -1822,7 +1854,7 @@ mod tests {
         let shot = Shot { guard: None, overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
-            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false});
+            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false,delivered:vec![]});
         let foreign = run("other-owner".into(), json!({"operation":"act","snapshotId":"old"})).unwrap();
         assert_eq!(foreign["completedActions"], 0);
         assert!(foreign.get("images").is_none());
