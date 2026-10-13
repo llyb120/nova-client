@@ -3269,7 +3269,7 @@ export async function initStore() {
       );
     }),
 
-    listen<{ threadId: string; text: string; images?: PromptImage[]; restored?: boolean }>(
+    listen<{ threadId: string | null; text: string; images?: PromptImage[]; restored?: boolean }>(
       "remote-prompt:dispatch",
       (e) => {
         const { threadId, text, images = [], restored } = e.payload;
@@ -3277,11 +3277,19 @@ export async function initStore() {
         if (restored && state.currentId === threadId) {
           setState("items", items => items.filter(item => item.id >= 0));
         }
-        void sendPromptTo(threadId, text, images).catch((error) => {
-          if (restored) {
-            setState("running", threadId, false);
-            showToast(`编辑后重新发送失败：${String(error)}`);
+        void (async () => {
+          let target = threadId;
+          if (target === null) {
+            // Butterfly has independent defaults; never substitute the last-used model/backend.
+            const kind = state.settings?.butterflyAgentKind ?? "lyra";
+            if (!enabledAgentKinds().includes(kind)) throw new Error("请先启用 Butterfly 配置的模型后端");
+            target = await createThread(await api.scratchDir(), kind,
+              state.settings?.butterflyModel?.trim() ?? "", "build", "");
           }
+          await sendPromptTo(target, text, images);
+        })().catch((error) => {
+          if (restored && threadId) setState("running", threadId, false);
+          showToast(`${restored ? "编辑后重新发送" : "消息发送"}失败：${String(error)}`);
           console.error("Prompt dispatch failed", error);
         });
       },

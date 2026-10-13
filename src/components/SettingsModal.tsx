@@ -273,6 +273,8 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [taskbarStatusEnabled, setTaskbarStatusEnabled] = createSignal(
     s?.taskbarStatusEnabled ?? false,
   );
+  const [butterflyAgentKind, setButterflyAgentKind] = createSignal<AgentKind>(s?.butterflyAgentKind ?? "lyra");
+  const [butterflyModel, setButterflyModel] = createSignal(s?.butterflyModel ?? "");
   const [powershellUtf8Enabled, setPowershellUtf8Enabled] = createSignal(
     s?.powershellUtf8Enabled ?? true,
   );
@@ -712,6 +714,8 @@ export function SettingsModal(props: { onClose: () => void }) {
     lyraProxy: lyraProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
     taskbarStatusEnabled: taskbarStatusEnabled(),
+    butterflyAgentKind: butterflyAgentKind(),
+    butterflyModel: butterflyModel().trim(),
     powershellUtf8Enabled: powershellUtf8Enabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
     ponytailEnabled: ponytailEnabled(),
@@ -1677,8 +1681,22 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <span>Windows 任务栏 Butterfly（实验）</span>
                 </label>
                 <span class="field-hint">
-                  开启后常驻 Windows 任务栏空闲区域：运行中蝴蝶振翅并显示当前动作与耗时，待确认时提醒；任务结束后自动弹出结果气泡（多个任务各弹一个，不抢键盘焦点；Nova 窗口在前台时不弹）。单击 Butterfly 弹出/收起详情气泡（待确认事项可直接在气泡中选择，也可在气泡里直接输入快速回复），双击打开 Nova 对应会话。默认关闭；保存后即时生效。
+                  开启后常驻 Windows 任务栏空闲区域：运行中蝴蝶振翅并显示当前动作与耗时，待确认时提醒，任务结束后显示结果摘要。单击 Butterfly 弹出/收起气泡（空闲时可在临时目录发起新会话，待确认事项可直接选择，也可快速回复；发送后自动收起），双击打开 Nova 对应会话。默认关闭；保存后即时生效。
                 </span>
+              </div>
+              <div class="field">
+                <span class="field-label">Butterfly 新会话模型</span>
+                <ModelPicker
+                  agentKind={butterflyAgentKind()}
+                  agentKinds={meteorAgentKinds()}
+                  model={butterflyModel()}
+                  allowDefault
+                  defaultLabel={`${agentLabel(butterflyAgentKind())} 默认模型`}
+                  onPickModel={(kind, model) => { setButterflyAgentKind(kind); setButterflyModel(model); }}
+                  title="Butterfly 新会话模型"
+                  portal
+                />
+                <span class="field-hint">空闲气泡发起的新会话使用此模型；空值使用所选后端默认模型，不跟随最近使用的模型。回复已有会话时沿用该会话模型。</span>
               </div>
               <div class="field">
                 <span class="field-label">Windows shell 启动 shim</span>

@@ -112,6 +112,9 @@ pub struct Settings {
     pub windows_shell_shim_enabled: bool,
     /// Windows 后台任务栏提示（实验）；默认关闭，保存后即时生效。
     pub taskbar_status_enabled: bool,
+    /// Butterfly 空闲气泡新会话使用的后端及模型；空模型使用后端默认值。
+    pub butterfly_agent_kind: String,
+    pub butterfly_model: String,
     /// PowerShell 输出按 UTF-8 捕获（Lyra 的 bash 工具注入一次性前缀，把控制台
     /// 输出切到 UTF-8），避免 GBK(cp936) 与 UTF-8 解码错配产生乱码。默认开启。
     #[serde(default = "default_powershell_utf8")]
@@ -230,6 +233,8 @@ impl Default for Settings {
             lyra_proxy: String::new(),
             windows_shell_shim_enabled: false,
             taskbar_status_enabled: false,
+            butterfly_agent_kind: "lyra".into(),
+            butterfly_model: String::new(),
             powershell_utf8_enabled: true,
             auto_change_project_enabled: true,
             ponytail_enabled: true,

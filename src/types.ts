@@ -450,6 +450,8 @@ export interface Settings {
   windowsShellShimEnabled: boolean;
   /** Windows 后台任务栏提示（实验）；默认关闭，保存后即时生效。 */
   taskbarStatusEnabled?: boolean;
+  butterflyAgentKind?: AgentKind;
+  butterflyModel?: string;
   /** PowerShell 输出按 UTF-8 捕获，避免 GBK 与 UTF-8 解码错配乱码；默认开启。 */
   powershellUtf8Enabled: boolean;
   /** 是否允许 Lyra 自动切换当前项目和工具工作目录；默认开启。 */
