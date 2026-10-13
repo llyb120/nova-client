@@ -378,7 +378,7 @@ fn expand_acp_effort_options(config_options: &Value, effort_config_id: &str) -> 
 /// 探测到的权威清单，否则 hy4-preview / glm-5.3-flash 等云端动态模型会时有时无。
 // Claude / Devin 只上报当前模型的档位（Claude `effort`、Devin `thought_level`）；随模型缓存，
 // 不能用当前模型的档位展开整张表（例如 Haiku 不支持 effort）。上下文变体只使用 ACP 的真实模型 ID。
-// Devin 不逐个探测：没选过的模型先不展开档位，选中后由 set_config_option 的返回补上。
+// Devin 的 fusion-* 组合模型不对用户开放，直接剔除。
 fn expand_claude_model_options(config: &Value, known: Option<&Value>, effort_id: &str) -> Value {
     let claude = effort_id == "effort";
     let Some(model) = model_config_option(config) else { return config.clone() };
@@ -392,7 +392,7 @@ fn expand_claude_model_options(config: &Value, known: Option<&Value>, effort_id:
     let mut selected = model["currentValue"].clone();
     for option in models {
         let (Some(base), _) = split_model_effort(option["value"].as_str()) else { continue };
-        if !seen.insert(base.clone()) { continue; }
+        if !seen.insert(base.clone()) || (!claude && base.starts_with("fusion-")) { continue; }
         let cached = known_models.and_then(|models| models.iter().find(|m| {
             split_model_effort(m["value"].as_str()).0.as_deref() == Some(base.as_str())
         }));
@@ -1247,11 +1247,12 @@ impl AcpManager {
             .await
             .map_err(|e| format!("拉取 {} 模型列表失败：{e}", self.kind.label()))?;
         self.capture_options(&resp, !conn.from_prewarm);
-        if self.kind == AgentKind::Claude {
+        if self.per_model_efforts() {
             if let (Some(sid), Some(model)) = (resp["sessionId"].as_str(), model_config_option(&resp["configOptions"])) {
                 let current = model["currentValue"].as_str().unwrap_or_default();
                 let mut ids: Vec<&str> = model["options"].as_array().into_iter().flatten()
-                    .filter_map(|o| o["value"].as_str()).filter(|id| *id != current).collect();
+                    .filter_map(|o| o["value"].as_str())
+                    .filter(|id| *id != current && !id.starts_with("fusion-")).collect();
                 // 在独立探测会话里切换模型读取各自档位，最后恢复默认模型；不发送 prompt。
                 if !current.is_empty() { ids.push(current); }
                 for id in ids {
@@ -1259,7 +1260,7 @@ impl AcpManager {
                         json!({"sessionId": sid, "configId": "model", "value": id}),
                         Some(Duration::from_secs(30))).await {
                         Ok(result) => self.capture_options(&result, true),
-                        Err(error) => self.push_log(format!("[nova] 探测 Claude 模型 {id} 的思考档位失败：{error}")),
+                        Err(error) => self.push_log(format!("[nova] 探测 {} 模型 {id} 的思考档位失败：{error}", self.kind.label())),
                     }
                 }
             }
@@ -4973,7 +4974,8 @@ mod codebuddy_acp_tests {
         let models = json!([
             {"value":"swe-1-7-medium","name":"SWE-1.7"},
             {"value":"gpt-5-4-none","name":"GPT-5.4"},
-            {"value":"glm-5-2-1m","name":"GLM-5.2 1M"}
+            {"value":"glm-5-2-1m","name":"GLM-5.2 1M"},
+            {"value":"fusion-gpt-6-sol-high-sidekick-swe-2-medium","name":"Fusion"}
         ]);
         let config = json!([
             {"id":"model","currentValue":"swe-1-7-medium","options":models},
@@ -4982,7 +4984,7 @@ mod codebuddy_acp_tests {
         let first = super::expand_claude_model_options(&config, None, "thought_level");
         let values = |v: &serde_json::Value| v[0]["options"].as_array().unwrap().iter()
             .map(|o| o["value"].as_str().unwrap().to_string()).collect::<Vec<_>>();
-        // 没选过的模型不猜档位；1M 模型不重复加后缀。
+        // 未探测的模型不猜档位；1M 模型不重复加后缀；fusion 剔除。
         assert_eq!(values(&first), ["swe-1-7-medium:medium", "swe-1-7-medium:max", "gpt-5-4-none", "glm-5-2-1m"]);
         assert_eq!(first[0]["currentValue"], "swe-1-7-medium:medium");
         assert_eq!(first[0]["options"][3]["name"], "GLM-5.2 1M");
