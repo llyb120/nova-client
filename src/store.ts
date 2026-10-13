@@ -233,6 +233,7 @@ export const [state, setState] = createStore<AppStore>({
     claude: null,
     codex: null,
     codebuddy: null,
+    workbuddy: null,
     cursor: null,
   },
   logs: [],
@@ -250,6 +251,7 @@ export const [state, setState] = createStore<AppStore>({
     claude: [],
     codex: [],
     codebuddy: [],
+    workbuddy: [],
     cursor: [],
   },
   updateProgress: null,
@@ -490,10 +492,11 @@ export const ALL_AGENT_KINDS: AgentKind[] = [
   "claude",
   "codex",
   "codebuddy",
+  "workbuddy",
   "cursor",
 ];
 
-/** 某后端在设置里是否启用。缺字段（老版本 settings）按启用处理（!== false）。 */
+/** 某后端在设置里是否启用。Claude / Kimi / WorkBuddy 默认关闭，其余缺字段按启用处理。 */
 function agentEnabled(s: Settings, k: AgentKind): boolean {
   switch (k) {
     case "lyra":
@@ -508,6 +511,8 @@ function agentEnabled(s: Settings, k: AgentKind): boolean {
       return s.codexEnabled !== false;
     case "codebuddy":
       return s.codebuddyEnabled !== false;
+    case "workbuddy":
+      return s.workbuddyEnabled === true;
     case "cursor":
       return s.cursorEnabled !== false;
   }
@@ -3123,11 +3128,13 @@ export async function initStore() {
       setTheme(resolvedSettings.theme);
     }
     setState({ settings: resolvedSettings, agentKind: initialAgent });
-    // 后端先返回上次缓存，并在进程内只后台重验一次；CodeBuddy 即使不是当前后端也要
+    // 后端先返回上次缓存，并在进程内只后台重验一次；CodeBuddy / WorkBuddy 即使不是当前后端也要
     // 静默同步云端动态模型，选择器打开时继续展示旧列表，不清空、不阻塞。
     void ensureModelOptions(initialAgent);
-    if (initialAgent !== "codebuddy" && agentEnabled(resolvedSettings, "codebuddy")) {
-      void ensureModelOptions("codebuddy");
+    for (const kind of ["codebuddy", "workbuddy"] as const) {
+      if (initialAgent !== kind && agentEnabled(resolvedSettings, kind)) {
+        void ensureModelOptions(kind);
+      }
     }
     return { settings: resolvedSettings, initialAgent };
   }).catch((error: unknown) => {

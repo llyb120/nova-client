@@ -104,6 +104,14 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
             install_command: "npm install -g @tencent-ai/codebuddy-code@latest".into(),
             proxy: settings.codebuddy_proxy.clone(),
         },
+        AgentKind::WorkBuddy => CliSpec {
+            kind: kind.clone(),
+            cli_name: "workbuddy-codebuddy",
+            program: crate::workbuddy::program(&settings.workbuddy_path),
+            version_args: vec!["--version".into()],
+            install_command: String::new(),
+            proxy: settings.workbuddy_proxy.clone(),
+        },
         AgentKind::Cursor => CliSpec {
             kind: kind.clone(),
             cli_name: "cursor-sdk",
@@ -122,6 +130,7 @@ fn all_specs(settings: &Settings) -> Vec<CliSpec> {
         AgentKind::Devin,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
+        AgentKind::WorkBuddy,
     ]
     .iter()
     .map(|kind| spec_for(kind, settings))
@@ -157,18 +166,17 @@ fn build_command(program: &str, args: &[String]) -> tokio::process::Command {
     cmd
 }
 
-async fn run_command(
+async fn command_output_with_timeout(
+    cmd: &mut tokio::process::Command,
     program: &str,
-    args: &[String],
     proxy: &str,
     timeout_duration: Duration,
 ) -> Result<String, String> {
-    let mut cmd = build_command(program, args);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    apply_proxy_env(&mut cmd, proxy);
+    apply_proxy_env(cmd, proxy);
     let output = tokio::time::timeout(timeout_duration, cmd.output())
         .await
         .map_err(|_| format!("{program} 执行超时"))?
@@ -222,17 +230,30 @@ async fn status_for(spec: CliSpec) -> CliStatus {
             installed: false,
             version: "未安装".into(),
             install_command: spec.install_command,
-            detail: format!("未找到 {}", spec.program),
+            detail: if spec.kind == AgentKind::WorkBuddy {
+                "未找到 WorkBuddy 内置 CLI；请安装 WorkBuddy，自定义安装位置可在设置中指定".into()
+            } else {
+                format!("未找到 {}", spec.program)
+            },
         };
     }
-    match run_command(
-        &spec.program,
-        &spec.version_args,
-        &spec.proxy,
-        Duration::from_secs(30),
-    )
-    .await
-    {
+    let result = if spec.kind == AgentKind::WorkBuddy {
+        match crate::workbuddy::command(&spec.program) {
+            Ok(mut cmd) => {
+                cmd.args(&spec.version_args).env("DISABLE_AUTOUPDATER", "1");
+                #[cfg(windows)]
+                cmd.creation_flags(0x0800_0000);
+                command_output_with_timeout(&mut cmd, &spec.program, &spec.proxy, Duration::from_secs(30)).await
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        command_output_with_timeout(
+            &mut build_command(&spec.program, &spec.version_args),
+            &spec.program, &spec.proxy, Duration::from_secs(30),
+        ).await
+    };
+    match result {
         Ok(version) => CliStatus {
             agent_kind: spec.kind.as_str().into(),
             cli_name: spec.cli_name.into(),
@@ -273,6 +294,9 @@ pub fn install_command(kind: &AgentKind, settings: &Settings) -> String {
 pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
     if matches!(kind, AgentKind::Cursor | AgentKind::Lyra) {
         return true;
+    }
+    if *kind == AgentKind::WorkBuddy {
+        return crate::workbuddy::command(&settings.workbuddy_path).is_ok();
     }
     resolve_program_on_path(&spec_for(kind, settings).program).is_some()
 }

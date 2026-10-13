@@ -1,6 +1,6 @@
 import type { WorkflowDef } from "./workflow/types";
 
-export type AgentKind = "claude" | "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "cursor";
+export type AgentKind = "claude" | "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "workbuddy" | "cursor";
 
 export interface SlashCommand {
   name: string;
@@ -432,6 +432,9 @@ export interface Settings {
   /** CodeBuddy CLI 可执行文件 */
   codebuddyPath: string;
   codebuddyProxy: string;
+  /** 空 = 自动查找 Windows 默认安装目录；支持安装目录、WorkBuddy.exe（仅定位内置 CLI）或内置 CodeBuddy CLI 路径。 */
+  workbuddyPath: string;
+  workbuddyProxy: string;
   cursorProxy: string;
   /** 兼容旧配置；Cursor 后端仅使用官方 SDK，不再依赖本机 CLI */
   cursorPath: string;
@@ -507,6 +510,8 @@ export interface Settings {
   lyraEnabled: boolean;
   codexEnabled: boolean;
   codebuddyEnabled: boolean;
+  /** WorkBuddy 本机后端，默认关闭。 */
+  workbuddyEnabled: boolean;
   cursorEnabled: boolean;
   codexIntegration: "app-server";
   codebuddyIntegration: "sdk" | "acp";

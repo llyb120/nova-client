@@ -183,6 +183,7 @@ fn quota_model_key(kind: &AgentKind, model: &str) -> String {
 fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
     match kind {
         AgentKind::Kimi => Err("Kimi Code 暂不支持额度租借".into()),
+        AgentKind::WorkBuddy => Err("WorkBuddy 暂不支持额度租借".into()),
         AgentKind::Lyra
         | AgentKind::Devin
         | AgentKind::Claude
@@ -255,7 +256,7 @@ fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> 
     let enabled = match kind {
         AgentKind::Lyra => settings.lyra_enabled,
         AgentKind::Devin => settings.devin_enabled,
-        AgentKind::Kimi => false,
+        AgentKind::Kimi | AgentKind::WorkBuddy => false,
         AgentKind::Claude => settings.claude_enabled,
         AgentKind::Codex => settings.codex_enabled,
         AgentKind::CodexPlus => settings.codex_enabled,
@@ -1775,7 +1776,7 @@ impl RelayManager {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
             }
-            AgentKind::Kimi | AgentKind::Claude => {
+            AgentKind::Kimi | AgentKind::Claude | AgentKind::WorkBuddy => {
                 let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move {
                     mgr.run_prompt(run_id, seed, vec![]).await;
@@ -2814,6 +2815,7 @@ impl RelayManager {
                     (AgentKind::Claude, s.claude_enabled),
                     (AgentKind::Codex, s.codex_enabled),
                     (AgentKind::CodeBuddy, s.codebuddy_enabled),
+                    (AgentKind::WorkBuddy, s.workbuddy_enabled),
                     (AgentKind::Cursor, s.cursor_enabled),
                 ]
                 .into_iter()
@@ -2848,6 +2850,7 @@ impl RelayManager {
                             .ensure_model_options()
                             .await
                     }
+                    AgentKind::WorkBuddy => app.state::<AppState>().workbuddy.ensure_model_options().await,
                     AgentKind::Devin => app.state::<AppState>().acp.fetch_model_options().await,
                     AgentKind::Kimi => app.state::<AppState>().kimi.fetch_model_options().await,
                     AgentKind::Claude => app.state::<AppState>().claude.fetch_model_options().await,
@@ -3515,10 +3518,15 @@ impl RelayManager {
                     });
                 }
             }
-            AgentKind::Kimi | AgentKind::Claude => {
+            AgentKind::Kimi | AgentKind::Claude | AgentKind::WorkBuddy => {
                 let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move {
-                    if host_prompt_is_current(&prompt_epoch) {
+                    if !host_prompt_is_current(&prompt_epoch) {
+                        return;
+                    }
+                    if agent_kind == AgentKind::WorkBuddy && mgr.is_running(&host_thread_id) {
+                        mgr.steer_prompt(host_thread_id, text, images).await;
+                    } else {
                         mgr.run_prompt(host_thread_id, text, images).await;
                     }
                 });
@@ -3585,7 +3593,7 @@ impl RelayManager {
                 let mgr = state.acp.clone();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
-            AgentKind::Kimi | AgentKind::Claude => {
+            AgentKind::Kimi | AgentKind::Claude | AgentKind::WorkBuddy => {
                 let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }

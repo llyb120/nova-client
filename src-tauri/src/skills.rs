@@ -113,6 +113,9 @@ pub fn backend_skill_roots() -> Vec<PathBuf> {
     {
         roots.push(root.join("skills"));
     }
+    if let Some(root) = crate::workbuddy::config_dir() {
+        roots.push(root.join("skills"));
+    }
     if let Some(home) = user_home_dir() {
         roots.push(home.join(".nova").join("alkaid").join("skills"));
         roots.push(home.join(".codex").join("skills"));

@@ -796,7 +796,9 @@ button {
 }
 
 .thread-agent.codebuddy,
-.agent-badge.codebuddy {
+.agent-badge.codebuddy,
+.thread-agent.workbuddy,
+.agent-badge.workbuddy {
   color: var(--yellow);
   border-color: color-mix(in srgb, var(--yellow) 36%, transparent);
   background: color-mix(in srgb, var(--yellow) 13%, transparent);

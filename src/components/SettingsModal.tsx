@@ -264,6 +264,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
   const [acpArgs, setAcpArgs] = createSignal(s?.acpArgs ?? "acp");
   const [codebuddyPath, setCodebuddyPath] = createSignal(s?.codebuddyPath ?? "codebuddy");
+  const [workbuddyPath, setWorkbuddyPath] = createSignal(s?.workbuddyPath ?? "");
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
   const [lyraProxy, setLyraProxy] = createSignal(s?.lyraProxy ?? "");
@@ -291,6 +292,7 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
+  const [workbuddyProxy, setWorkbuddyProxy] = createSignal(s?.workbuddyProxy ?? "");
   const [cursorProxy, setCursorProxy] = createSignal(s?.cursorProxy ?? "");
   const [cursorSdkApiKey, setCursorSdkApiKey] = createSignal(s?.cursorSdkApiKey ?? "");
   const [cursorDisableSubagents, setCursorDisableSubagents] = createSignal(
@@ -320,6 +322,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
   const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
+  const [workbuddyEnabled, setWorkbuddyEnabled] = createSignal(s?.workbuddyEnabled === true);
   const [cursorEnabled, setCursorEnabled] = createSignal(s?.cursorEnabled !== false);
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
   const [lightweightAgent, setLightweightAgent] = createSignal<AgentKind>(
@@ -426,10 +429,12 @@ export function SettingsModal(props: { onClose: () => void }) {
       lyraEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
+      workbuddyEnabled(),
       cursorEnabled(),
     ].filter(Boolean).length;
 
   const quotaShareKinds = createMemo<AgentKind[]>(() => {
+    // Kimi / WorkBuddy 暂不支持额度租借，不复用其他后端的凭据。
     const kinds: AgentKind[] = [];
     if (lyraEnabled()) kinds.push("lyra");
     if (devinEnabled()) kinds.push("devin");
@@ -444,7 +449,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   );
   const meteorAgentKinds = createMemo(() => ALL_AGENT_KINDS.filter((kind) => ({
     lyra: lyraEnabled(), devin: devinEnabled(), claude: claudeEnabled(), kimi: kimiEnabled(),
-    codex: codexEnabled(), codebuddy: codebuddyEnabled(), cursor: cursorEnabled(),
+    codex: codexEnabled(), codebuddy: codebuddyEnabled(), workbuddy: workbuddyEnabled(), cursor: cursorEnabled(),
   })[kind]));
 
   const quotaShareKey = (kind: AgentKind, model: string) => `${kind}:${model}`;
@@ -707,6 +712,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     devinPath: devinPath().trim() || "devin",
     acpArgs: acpArgs().trim() || "acp",
     codebuddyPath: codebuddyPath().trim() || "codebuddy",
+    workbuddyPath: workbuddyPath().trim(),
     // Cursor 仅走官方 SDK，不再依赖本机 cursor-agent；保留字段兼容旧配置。
     cursorPath: s?.cursorPath?.trim() || "cursor-agent",
     codexPath: codexPath().trim() || "codex",
@@ -724,6 +730,7 @@ export function SettingsModal(props: { onClose: () => void }) {
 
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
+    workbuddyProxy: workbuddyProxy().trim(),
     cursorProxy: cursorProxy().trim(),
     cursorSdkApiKey: cursorSdkApiKey().trim(),
     cursorDisableSubagents: cursorDisableSubagents(),
@@ -757,6 +764,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),
+    workbuddyEnabled: workbuddyEnabled(),
     cursorEnabled: cursorEnabled(),
     codexIntegration: "app-server",
     codebuddyIntegration: "acp",
@@ -1874,6 +1882,34 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </label>
               </div>
               <ProxyField value={codebuddyProxy()} onInput={setCodebuddyProxy} />
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class="agent-badge workbuddy">{agentLabel("workbuddy")}</span>
+                <span class="fixed-integration">ACP</span>
+                <Show when={backendMissing("workbuddy")}>
+                  <span class="backend-missing">未检测到 CLI</span>
+                </Show>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={workbuddyEnabled()}
+                    disabled={workbuddyEnabled() && enabledCount() === 1}
+                    onChange={(e) => setWorkbuddyEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager status={cliStatuses().workbuddy} loading={cliLoading()} />
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">WorkBuddy 路径</span>
+                  <input class="field-input" value={workbuddyPath()} onInput={(e) => setWorkbuddyPath(e.currentTarget.value)} placeholder="留空自动查找 WorkBuddy" />
+                </label>
+              </div>
+              <ProxyField value={workbuddyProxy()} onInput={setWorkbuddyProxy} />
+              <p class="field-hint">直接启动 WorkBuddy 内置的 CodeBuddy ACP，复用其登录态，无需 WorkBuddy 保持运行；需先在 WorkBuddy 中登录过一次。留空自动查找 Windows 默认安装目录，也可填写安装目录、WorkBuddy.exe 或内置 CLI 路径；不会自动启动桌面程序。当前支持 Windows，暂不支持额度租借。</p>
             </div>
 
             <div class="backend-card">

@@ -85,6 +85,9 @@ pub struct Settings {
     pub codebuddy_args: String,
     /// CodeBuddy 代理地址
     pub codebuddy_proxy: String,
+    /// WorkBuddy 安装目录或内置 CodeBuddy CLI；空 = 自动发现，不回退到普通 CodeBuddy。
+    pub workbuddy_path: String,
+    pub workbuddy_proxy: String,
     /// 兼容旧配置；Cursor 后端已改为仅使用官方 SDK，不再依赖本机 CLI
     pub cursor_path: String,
     /// 旧版 Cursor ACP 启动参数，仅用于兼容已有设置。
@@ -180,6 +183,7 @@ pub struct Settings {
     pub codexplus_enabled: bool,
     pub codebuddy_enabled: bool,
     pub codebuddyplus_enabled: bool,
+    pub workbuddy_enabled: bool,
     pub cursor_enabled: bool,
     /// 各后端接入方式：app-server / sdk / acp。Codex 固定使用 app-server。
     pub codex_integration: String,
@@ -220,6 +224,8 @@ impl Default for Settings {
             codebuddy_path: "codebuddy".into(),
             codebuddy_args: "--acp".into(),
             codebuddy_proxy: String::new(),
+            workbuddy_path: String::new(),
+            workbuddy_proxy: String::new(),
             cursor_path: "cursor-agent".into(),
             cursor_args: "acp".into(),
             cursor_proxy: String::new(),
@@ -267,6 +273,7 @@ impl Default for Settings {
             codexplus_enabled: false,
             codebuddy_enabled: false,
             codebuddyplus_enabled: false,
+            workbuddy_enabled: false,
             cursor_enabled: false,
             codex_integration: "app-server".into(),
             codebuddy_integration: "acp".into(),

@@ -191,6 +191,7 @@ fn normal_targets(config_dir: &Path) -> Result<Vec<Target>, String> {
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
+        AgentKind::WorkBuddy,
         AgentKind::Cursor,
     ]
     .iter()
@@ -246,6 +247,14 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
                 configured_dir(overrides, "CODEX_HOME").unwrap_or_else(|| home.join(".codex"));
             (kind.label(), root.join("AGENTS.md"), TargetFormat::Markdown)
         }
+        AgentKind::WorkBuddy => (
+            kind.label(),
+            configured_dir(overrides, "WORKBUDDY_CONFIG_DIR")
+                .or_else(crate::workbuddy::config_dir)
+                .unwrap_or_else(|| home.join(".workbuddy"))
+                .join("CODEBUDDY.md"),
+            TargetFormat::Markdown,
+        ),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
             let root = configured_dir(overrides, "CODEBUDDY_CONFIG_DIR")
                 .unwrap_or_else(|| home.join(".codebuddy"));

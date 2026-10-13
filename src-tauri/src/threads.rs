@@ -57,6 +57,7 @@ pub enum AgentKind {
     CodexPlus,
     CodeBuddy,
     CodeBuddyPlus,
+    WorkBuddy,
     Cursor,
     Lyra,
 }
@@ -77,6 +78,11 @@ impl<'de> Deserialize<'de> for AgentKind {
 }
 
 impl AgentKind {
+    /// 同一 CodeBuddy ACP 协议，不代表共用进程或登录凭据。
+    pub fn is_codebuddy(&self) -> bool {
+        matches!(self, Self::CodeBuddy | Self::CodeBuddyPlus | Self::WorkBuddy)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
@@ -86,6 +92,7 @@ impl AgentKind {
             AgentKind::CodexPlus => "codexplus",
             AgentKind::CodeBuddy => "codebuddy",
             AgentKind::CodeBuddyPlus => "codebuddyplus",
+            AgentKind::WorkBuddy => "workbuddy",
             AgentKind::Cursor => "cursor",
             AgentKind::Lyra => "lyra",
         }
@@ -103,6 +110,7 @@ impl AgentKind {
             "codexplus" => Some(AgentKind::CodexPlus),
             "codebuddy" => Some(AgentKind::CodeBuddy),
             "codebuddyplus" => Some(AgentKind::CodeBuddyPlus),
+            "workbuddy" => Some(AgentKind::WorkBuddy),
             "cursor" => Some(AgentKind::Cursor),
             "lyra" => Some(AgentKind::Lyra),
             _ => None,
@@ -119,6 +127,7 @@ impl AgentKind {
             AgentKind::CodexPlus => "Codex",
             AgentKind::CodeBuddy => "CodeBuddy",
             AgentKind::CodeBuddyPlus => "CodeBuddy",
+            AgentKind::WorkBuddy => "WorkBuddy",
             AgentKind::Cursor => "Cursor",
             AgentKind::Lyra => "Lyra",
         }
