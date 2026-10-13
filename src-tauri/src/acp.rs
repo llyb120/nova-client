@@ -41,7 +41,8 @@ const CODEBUDDY_ACP_ARGS: [&str; 3] = ["--acp", "--acp-transport", "stdio"];
 /// CodeBuddy ACP `thought_level`（会话级）实际开放的档位。官方 CLI 还支持
 /// `minimal` / `medium` / `xhigh`，这里按 nova 的取舍只暴露三档。
 const CODEBUDDY_EFFORT_LEVELS: [&str; 3] = ["low", "high", "max"];
-const CLAUDE_EFFORT_LEVELS: [&str; 6] = ["default", "low", "medium", "high", "xhigh", "max"];
+/// Claude / Devin 按模型上报档位（Devin 有 none / minimal），拆模型 value 时也认这些后缀。
+const EFFORT_LEVELS: [&str; 8] = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 pub struct PendingPermission {
     pub rpc_id: Value,
@@ -233,7 +234,7 @@ fn split_model_effort(model: Option<&str>) -> (Option<String>, Option<String>) {
     };
     match m.rsplit_once(':') {
         Some((id, effort))
-            if !id.is_empty() && CLAUDE_EFFORT_LEVELS.contains(&effort) =>
+            if !id.is_empty() && EFFORT_LEVELS.contains(&effort) =>
         {
             (Some(id.to_string()), Some(effort.to_string()))
         }
@@ -259,7 +260,7 @@ fn effort_display_name(effort: &str) -> String {
 /// 拆成 model + 对应的思考配置分别下发。
 fn expand_acp_effort_options(config_options: &Value, effort_config_id: &str) -> Value {
     if effort_config_id == "effort" {
-        return expand_claude_model_options(config_options, None);
+        return expand_claude_model_options(config_options, None, "effort");
     }
     let Some(options) = config_options.as_array() else {
         return config_options.clone();
@@ -276,7 +277,7 @@ fn expand_acp_effort_options(config_options: &Value, effort_config_id: &str) -> 
     let Some(models) = model_opt.get("options").and_then(Value::as_array) else {
         return config_options.clone();
     };
-    // Devin / CodeBuddy 用 thought_level，Kimi 用 thinking。
+    // CodeBuddy 用 thought_level，Kimi 用 thinking。
     let current_effort = options
         .iter()
         .find(|o| o.get("id").and_then(Value::as_str) == Some(effort_config_id))
@@ -375,13 +376,15 @@ fn expand_acp_effort_options(config_options: &Value, effort_config_id: &str) -> 
 /// 推迟产品配置初始化（日志 `prewarm standby: defer init until activate`），激活后补拉到
 /// 的云端清单不会回填这份快照。所以这类连接只有「当前模型」可信，可选清单必须沿用冷启动
 /// 探测到的权威清单，否则 hy4-preview / glm-5.3-flash 等云端动态模型会时有时无。
-// Claude 只上报当前模型的 effort；逐模型探测后把能力随模型缓存，不能用当前模型的
-// 档位展开整张表（例如 Haiku 不支持 effort）。上下文变体只使用 ACP 的真实模型 ID。
-fn expand_claude_model_options(config: &Value, known: Option<&Value>) -> Value {
+// Claude / Devin 只上报当前模型的档位（Claude `effort`、Devin `thought_level`）；随模型缓存，
+// 不能用当前模型的档位展开整张表（例如 Haiku 不支持 effort）。上下文变体只使用 ACP 的真实模型 ID。
+// Devin 不逐个探测：没选过的模型先不展开档位，选中后由 set_config_option 的返回补上。
+fn expand_claude_model_options(config: &Value, known: Option<&Value>, effort_id: &str) -> Value {
+    let claude = effort_id == "effort";
     let Some(model) = model_config_option(config) else { return config.clone() };
     let Some(models) = model["options"].as_array() else { return config.clone() };
     let (current, _) = split_model_effort(model["currentValue"].as_str());
-    let effort = config.as_array().and_then(|options| options.iter().find(|o| o["id"] == "effort"));
+    let effort = config.as_array().and_then(|options| options.iter().find(|o| o["id"] == effort_id));
     let current_effort = effort.and_then(|o| o["currentValue"].as_str()).unwrap_or("default");
     let known_models = known.and_then(model_config_option).and_then(|o| o["options"].as_array());
     let mut seen = HashSet::new();
@@ -403,7 +406,8 @@ fn expand_claude_model_options(config: &Value, known: Option<&Value>) -> Value {
                 .and_then(Value::as_array).cloned().unwrap_or_default()
         };
         // 1M 只改变上下文；变体未上报档位时参考原模型，但保留下发的真实模型 ID。
-        if levels.is_empty() {
+        // Devin 的 1M 模型名自带「1M」且会自己上报档位，不走这套。
+        if claude && levels.is_empty() {
             if let Some(original) = base.strip_suffix("[1m]").or_else(|| base.strip_suffix("-1m")) {
                 levels = if current.as_deref() == Some(original) {
                     effort.and_then(|o| o["options"].as_array()).cloned().unwrap_or_default()
@@ -416,14 +420,14 @@ fn expand_claude_model_options(config: &Value, known: Option<&Value>) -> Value {
             }
         }
         let levels: Vec<Value> = levels.into_iter().filter(|e| {
-            e["value"].as_str().is_some_and(|v| CLAUDE_EFFORT_LEVELS.contains(&v))
+            e["value"].as_str().is_some_and(|v| EFFORT_LEVELS.contains(&v))
         }).collect();
         let mut meta = option.get("_meta").and_then(Value::as_object).cloned().unwrap_or_default();
         meta.insert("claude.ai/baseName".into(), json!(name));
         meta.insert("claude.ai/effortOptions".into(), json!(levels));
         meta.remove("codebuddy.ai/default");
-        let is_1m = base.ends_with("[1m]") || base.ends_with("-1m")
-            || (base == "default" && option["description"].as_str().is_some_and(|d| d.contains("[1m]")));
+        let is_1m = claude && (base.ends_with("[1m]") || base.ends_with("-1m")
+            || base == "default" && option["description"].as_str().is_some_and(|d| d.contains("[1m]")));
         let display = if is_1m { format!("{name} · 1M") } else { name.to_string() };
         if is_1m { meta.insert("contextWindow".into(), json!(1_000_000)); }
         let variants: Vec<Option<&str>> = if levels.is_empty() { vec![None] } else {
@@ -1074,8 +1078,8 @@ impl AcpManager {
 
     /// 启动时从磁盘缓存灌入内存（不广播；前端经 get_model_options 立刻拿到）。
     pub fn seed_model_options(&self, mut v: Value) {
-        if let (Some(id), Some(options)) = (self.effort_config_id(), v.get_mut("configOptions")) {
-            *options = expand_acp_effort_options(options, id);
+        if let Some(options) = v.get_mut("configOptions") {
+            *options = self.expand_effort_options(options, None);
         }
         *self.model_options.lock().unwrap() = Some(v);
     }
@@ -2697,14 +2701,9 @@ impl AcpManager {
         };
         // ACP 的思考强度不单列下拉，按 codex 的惯例折进模型选项
         // （`hy4-preview:high`），下发时再拆成 model + thought_level。
-        let config_options = if self.kind == AgentKind::Claude {
-            let known = self.get_model_options();
-            expand_claude_model_options(&config_options, known.as_ref().and_then(|v| v.get("configOptions")))
-        } else if let Some(id) = self.effort_config_id() {
-            expand_acp_effort_options(&config_options, id)
-        } else {
-            config_options
-        };
+        let known = self.get_model_options();
+        let config_options =
+            self.expand_effort_options(&config_options, known.as_ref().and_then(|v| v.get("configOptions")));
         let modes = match result.get("modes") {
             Some(m) if !m.is_null() => m.clone(),
             _ => modes_from_config_options(&config_options),
@@ -3029,6 +3028,8 @@ impl AcpManager {
             None => (model.clone(), None),
         };
         let effort_to_apply = self.effort_to_apply(effort_from_model.or(effort));
+        // 切换模型会把档位重置成新模型的默认值：模型先落地，再下发强度。
+        let resets = self.per_model_efforts();
         let (need_model, need_mode, need_effort) = {
             let routes = self.routes.lock().unwrap();
             let Some(r) = routes.get(sid) else { return };
@@ -3036,7 +3037,7 @@ impl AcpManager {
                 model_to_send.clone().filter(|m| r.applied_model.as_ref() != Some(m)),
                 mode.filter(|m| r.applied_mode.as_ref() != Some(m)),
                 effort_to_apply.filter(|e| r.applied_effort.as_ref() != Some(e)
-                    || (self.kind == AgentKind::Claude && r.applied_model != model_to_send)),
+                    || (resets && r.applied_model != model_to_send)),
             )
         };
         // 统一模式翻译：界面只暴露 build / plan 两种，这里翻成各后端的真实模式 id。
@@ -3080,18 +3081,18 @@ impl AcpManager {
                     .await;
                 match r {
                     Ok(result) => {
-                        if self.kind == AgentKind::Claude {
+                        if resets {
                             self.capture_options(&result, true);
                             let actual = model_config_option(&result["configOptions"])
                                 .and_then(|o| o["currentValue"].as_str());
                             if actual != Some(model.as_str()) {
-                                self.push_log(format!("[nova] Claude 未应用模型 {model}，实际返回 {actual:?}"));
+                                self.push_log(format!("[nova] {} 未应用模型 {model}，实际返回 {actual:?}", self.kind.label()));
                                 return;
                             }
                         }
                         if let Some(route) = self.routes.lock().unwrap().get_mut(sid) {
                             route.applied_model = Some(model);
-                            if self.kind == AgentKind::Claude {
+                            if resets {
                                 // 模型切换会重置档位；强度请求失败时必须允许下轮重试。
                                 route.applied_effort = None;
                             }
@@ -3123,7 +3124,7 @@ impl AcpManager {
             }
         };
         let effort_fut = async {
-            if self.kind == AgentKind::Claude && model_to_send.is_some()
+            if resets && model_to_send.is_some()
                 && !self.routes.lock().unwrap().get(sid).is_some_and(|r| r.applied_model == model_to_send)
             {
                 return;
@@ -3146,7 +3147,7 @@ impl AcpManager {
                 }
             }
         };
-        if self.kind == AgentKind::Claude {
+        if resets {
             // 切换模型会重建 effort 配置，必须先完成模型变更再设置强度。
             tokio::join!(model_fut, mode_fut);
             effort_fut.await;
@@ -3311,14 +3312,28 @@ impl AcpManager {
         }
     }
 
+    /// 档位按模型上报（只认当前模型的选项），而非整个后端一套固定档位。
+    fn per_model_efforts(&self) -> bool {
+        matches!(self.kind, AgentKind::Claude | AgentKind::Devin)
+    }
+
+    /// 把模型选项按思考强度展开成 `<model>:<effort>`。
+    fn expand_effort_options(&self, config: &Value, known: Option<&Value>) -> Value {
+        match self.effort_config_id() {
+            Some(id) if self.per_model_efforts() => expand_claude_model_options(config, known, id),
+            Some(id) => expand_acp_effort_options(config, id),
+            None => config.clone(),
+        }
+    }
+
     /// 把线程上的思考强度翻成可下发的档位；后端不支持或档位非法时返回 None。
     fn effort_to_apply(&self, effort: Option<String>) -> Option<String> {
         let effort = effort?;
         if self.effort_config_id().is_none() {
             return None;
         }
-        if self.kind == AgentKind::Claude {
-            return CLAUDE_EFFORT_LEVELS.contains(&effort.as_str()).then_some(effort);
+        if self.per_model_efforts() {
+            return EFFORT_LEVELS.contains(&effort.as_str()).then_some(effort);
         }
         if CODEBUDDY_EFFORT_LEVELS.contains(&effort.as_str()) {
             Some(effort)
@@ -4877,7 +4892,7 @@ mod codebuddy_acp_tests {
             ]},
             {"id":"effort","currentValue":"high","options":[{"value":"default"},{"value":"high"}]}
         ]);
-        let expanded = super::expand_claude_model_options(&config, None);
+        let expanded = super::expand_claude_model_options(&config, None, "effort");
         assert_eq!(expanded[0]["currentValue"], "sonnet:high");
         let rows = expanded[0]["options"].as_array().unwrap();
         for id in ["sonnet[1m]", "sonnet-1m"] {
@@ -4897,18 +4912,18 @@ mod codebuddy_acp_tests {
         for id in ["sonnet[1m]", "sonnet-1m"] {
             let mut current = json!([config[0].clone()]);
             current[0]["currentValue"] = json!(id);
-            let inherited = super::expand_claude_model_options(&current, Some(&known));
+            let inherited = super::expand_claude_model_options(&current, Some(&known), "effort");
             assert_eq!(inherited[0]["currentValue"], format!("{id}:default"));
             assert!(inherited[0]["options"].as_array().unwrap().iter()
                 .any(|o| o["value"] == format!("{id}:high")));
-            assert_eq!(super::expand_claude_model_options(&inherited, None), inherited);
+            assert_eq!(super::expand_claude_model_options(&inherited, None, "effort"), inherited);
             // 原模型能力随当前列表返回时同样可用；变体自身的明确档位优先。
             current[0]["options"][2] = original.clone();
-            assert_eq!(super::expand_claude_model_options(&current, None), inherited);
+            assert_eq!(super::expand_claude_model_options(&current, None, "effort"), inherited);
             current.as_array_mut().unwrap().push(json!({
                 "id":"effort","currentValue":"low","options":[{"value":"low"}]
             }));
-            let explicit = super::expand_claude_model_options(&current, Some(&known));
+            let explicit = super::expand_claude_model_options(&current, Some(&known), "effort");
             assert_eq!(explicit[0]["currentValue"], format!("{id}:low"));
             assert!(!explicit[0]["options"].as_array().unwrap().iter()
                 .any(|o| o["value"] == format!("{id}:high")));
@@ -4927,11 +4942,11 @@ mod codebuddy_acp_tests {
                 {"value":"default"},{"value":"medium"},{"value":"xhigh"}
             ]}
         ]);
-        let expanded = super::expand_claude_model_options(&config, None);
+        let expanded = super::expand_claude_model_options(&config, None, "effort");
         assert_eq!(expanded[0]["currentValue"], "sonnet[1m]:medium");
         assert_eq!(expanded[0]["options"][1]["name"], "Sonnet · 1M · Medium");
         assert_eq!(expanded[0]["options"][1]["_meta"]["contextWindow"], 1_000_000);
-        assert_eq!(super::expand_claude_model_options(&expanded, None), expanded);
+        assert_eq!(super::expand_claude_model_options(&expanded, None, "effort"), expanded);
         assert_eq!(super::split_model_effort(Some("sonnet[1m]:xhigh")),
             (Some("sonnet[1m]".into()), Some("xhigh".into())));
         assert_eq!(super::split_model_effort(Some("custom:unknown")),
@@ -4940,17 +4955,46 @@ mod codebuddy_acp_tests {
         next[0]["currentValue"] = json!("opus");
         next[1]["currentValue"] = json!("max");
         next[1]["options"] = json!([{"value":"high"},{"value":"max"}]);
-        let next = super::expand_claude_model_options(&next, Some(&expanded));
+        let next = super::expand_claude_model_options(&next, Some(&expanded), "effort");
         let rows = next[0]["options"].as_array().unwrap();
         assert!(rows.iter().any(|o| o["value"] == "sonnet[1m]:medium"));
         assert!(rows.iter().any(|o| o["value"] == "opus:max"));
         assert!(!rows.iter().any(|o| o["value"] == "opus:medium"));
         assert_eq!(rows.iter().filter(|o| o["_meta"]["codebuddy.ai/default"] == true).count(), 1);
         let haiku = json!([{"id":"model","currentValue":"haiku","options":config[0]["options"]}]);
-        let haiku = super::expand_claude_model_options(&haiku, Some(&next));
+        let haiku = super::expand_claude_model_options(&haiku, Some(&next), "effort");
         assert_eq!(haiku[0]["currentValue"], "haiku");
         assert!(haiku[0]["options"].as_array().unwrap().iter().any(|o| o["value"] == "opus:max"));
         assert!(!haiku[0]["options"].as_array().unwrap().iter().any(|o| o["value"].as_str().unwrap().starts_with("haiku:")));
+    }
+
+    #[test]
+    fn devin_efforts_follow_reported_levels_per_model() {
+        let models = json!([
+            {"value":"swe-1-7-medium","name":"SWE-1.7"},
+            {"value":"gpt-5-4-none","name":"GPT-5.4"},
+            {"value":"glm-5-2-1m","name":"GLM-5.2 1M"}
+        ]);
+        let config = json!([
+            {"id":"model","currentValue":"swe-1-7-medium","options":models},
+            {"id":"thought_level","currentValue":"medium","options":[{"value":"medium"},{"value":"max"}]}
+        ]);
+        let first = super::expand_claude_model_options(&config, None, "thought_level");
+        let values = |v: &serde_json::Value| v[0]["options"].as_array().unwrap().iter()
+            .map(|o| o["value"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        // 没选过的模型不猜档位；1M 模型不重复加后缀。
+        assert_eq!(values(&first), ["swe-1-7-medium:medium", "swe-1-7-medium:max", "gpt-5-4-none", "glm-5-2-1m"]);
+        assert_eq!(first[0]["currentValue"], "swe-1-7-medium:medium");
+        assert_eq!(first[0]["options"][3]["name"], "GLM-5.2 1M");
+        // 选中另一个模型后按它上报的档位展开，先前学到的保留。
+        let next = json!([
+            {"id":"model","currentValue":"gpt-5-4-none","options":models},
+            {"id":"thought_level","currentValue":"none","options":[{"value":"none"},{"value":"xhigh"}]}
+        ]);
+        let next = super::expand_claude_model_options(&next, Some(&first), "thought_level");
+        assert_eq!(values(&next), ["swe-1-7-medium:medium", "swe-1-7-medium:max", "gpt-5-4-none:none", "gpt-5-4-none:xhigh", "glm-5-2-1m"]);
+        assert_eq!(next[0]["currentValue"], "gpt-5-4-none:none");
+        assert_eq!(super::split_model_effort(Some("gpt-5-4-none:none")), (Some("gpt-5-4-none".into()), Some("none".into())));
     }
 
     #[test]
