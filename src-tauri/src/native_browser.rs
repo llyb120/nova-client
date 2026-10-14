@@ -2114,6 +2114,15 @@ fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashM
         }
         return Ok(Value::Object(args));
     }
+    // 弱模型经常把正确的 tabTag 填进 tabId/browserId；值本身就是合法 tag 时直接用，不打回去重试。
+    let adopted = ["tabId", "browserId"].iter()
+        .find_map(|key| args.get(*key)?.as_str().filter(|tag| valid_tag(tag)).map(str::to_string));
+    if let Some(tag) = adopted {
+        args.remove("tabId");
+        args.remove("browserId");
+        args.insert("tabTag".into(), json!(tag));
+        return Ok(Value::Object(args));
+    }
     if args.contains_key("tabId") || args.contains_key("browserId") {
         return Err("Chrome 目标参数名是 tabTag；请复制 tabs[].tag 或 open 返回的 tabTag，不能使用 tabId/browserId".into());
     }
@@ -2579,6 +2588,11 @@ mod tests {
             let mut wrong_target = act.clone();
             wrong_target[key] = json!("another-target");
             assert!(chrome_args(&wrong_target, "owner", &observations).is_err());
+            // 弱模型把合法 tag 填进了错字段：直接当 tabTag 用，不打回去重试。
+            wrong_target[key] = json!("C1-test");
+            let adopted = chrome_args(&wrong_target, "owner", &observations).unwrap();
+            assert_eq!(adopted["tabTag"], "C1-test");
+            assert!(adopted.get(key).is_none(), "{key} 不进入归一后的参数");
         }
         let mut second = observation.clone();
         second.id = "second".into();
