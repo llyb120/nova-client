@@ -1136,7 +1136,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
     let request: Request = match serde_json::from_value(args) {
         Ok(request) => request,
         Err(e) if is_act => return Ok(json!({"status":"not_executed","completedActions":0,
-            "error":format!("参数无效：{e}；本批次尚未执行")})),
+            "error":format!("参数无效：{e}；本批次尚未执行。动作项只接受 action/x/y/toX/toY/button/text/key/delta/axis/ms/glide，action 取 click/double_click/move/drag/scroll/type/press/wait")})),
         Err(e) => return Err(err(e)),
     };
     let max_edge = request.max_edge.unwrap_or(1600);
@@ -1521,8 +1521,50 @@ fn tolerate_slips(args: &Value) -> Value {
             let action = map.remove("action").unwrap();
             map.insert("actions".into(), json!([action]));
         }
+        if let Some(actions) = map.get_mut("actions").and_then(Value::as_array_mut) {
+            for action in actions { normalize_action(action); }
+        }
     }
     inner
+}
+
+/// 弱模型（Devin 等）反复搞错的动作形状：动作名写在 `type` 上、拿 text/key 当动作名、
+/// 坐标写成字符串或小数。这些写法没有歧义，归一后直接执行比退回让模型重试更快也更稳；
+/// 其余字段仍走严格 schema，真正说不清的形状照旧报错。
+fn normalize_action(action: &mut Value) {
+    let Some(map) = action.as_object_mut() else { return };
+    if !map.contains_key("action") {
+        if let Some(kind) = map.remove("type").filter(Value::is_string) { map.insert("action".into(), kind); }
+    }
+    for (from, to) in [("keys", "key"), ("value", "text"), ("content", "text"), ("to_x", "toX"), ("to_y", "toY"),
+        ("duration", "ms"), ("durationMs", "ms"), ("duration_ms", "ms")] {
+        if !map.contains_key(to) { if let Some(v) = map.remove(from) { map.insert(to.into(), v); } }
+    }
+    for key in ["x", "y", "toX", "toY", "delta", "ms"] {
+        let fixed = match map.get(key) {
+            Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
+            Some(v) => v.as_f64().filter(|f| f.fract() != 0.0),
+            None => None,
+        };
+        if let Some(v) = fixed { map.insert(key.into(), json!(v.round() as i64)); }
+    }
+    let canonical = match map.get("action").and_then(Value::as_str).unwrap_or_default() {
+        "left_click" | "leftclick" | "mouse_click" | "single_click" | "tap" => "click",
+        "doubleclick" | "dblclick" => "double_click",
+        "mouse_move" | "mousemove" | "hover" | "moveto" => "move",
+        "input" | "write" | "text" | "type_text" | "settext" | "send_text" => "type",
+        "key" | "keys" | "keypress" | "key_press" | "hotkey" | "shortcut" | "press_key" | "sendkeys" => "press",
+        "wheel" | "mouse_wheel" | "scroll_at" | "scrollat" => "scroll",
+        "sleep" | "delay" => "wait",
+        "mouse_drag" | "drag_and_drop" | "dragto" => "drag",
+        _ => "",
+    };
+    if !canonical.is_empty() { map.insert("action".into(), json!(canonical)); }
+    match map.get("action").and_then(Value::as_str).unwrap_or_default() {
+        "press" if !map.contains_key("key") => { if let Some(text) = map.remove("text") { map.insert("key".into(), text); } }
+        "type" if !map.contains_key("text") && map.contains_key("key") => { map.insert("action".into(), json!("press")); }
+        _ => {}
+    }
 }
 
 async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> {
@@ -1586,6 +1628,19 @@ mod tests {
         assert_eq!(tolerate_slips(&both), both);
     }
     #[test]
+    fn weak_model_action_shapes_are_normalized_instead_of_bounced() {
+        let args = tolerate_slips(&json!({"operation":"act","snapshotId":"s","actions":[
+            {"type":"left_click","x":"12","y":34.6},
+            {"action":"text","value":"hi"},
+            {"action":"key","text":"Enter"},
+            {"action":"sleep","duration":200}]}));
+        assert_eq!(args["actions"], json!([
+            {"action":"click","x":12,"y":35},
+            {"action":"type","text":"hi"},
+            {"action":"press","key":"Enter"},
+            {"action":"wait","ms":200}]));
+        assert!(serde_json::from_value::<Request>(args).is_ok());
+    }
     fn target_actions_map_through_the_guarded_point() {
         assert!(has_target(&json!({"actions":[{"action":"press","key":"Enter"},{"action":"click","target":"v2"}]})));
         assert!(has_target(&json!({"action":{"action":"click","target":"搜索框"}})));
