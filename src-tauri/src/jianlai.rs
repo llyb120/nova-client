@@ -1006,7 +1006,8 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
         "click" | "double_click" | "move" | "drag" | "scroll"
     ) {
         let (x, y) = point(shot, a.x, a.y)?;
-        if a.glide == Some(true) {
+        // 指针默认沿轨迹可见地移过去（用户能看清剑来在做什么）；glide:false 才瞬移。滚动始终瞬移定位。
+        if a.glide.unwrap_or(a.action != "scroll") {
             glide(enigo, enigo.location().map_err(err)?, (x, y), expected_foreground)?;
         } else {
             move_pointer(enigo, x, y, false)?;
