@@ -105,7 +105,7 @@ fn build_command(configured: &str, managed: bool) -> Result<tokio::process::Comm
         if managed {
             // ponytail: embedded bridge stays below Windows' 32K command-line ceiling;
             // materialize it as a resource if it outgrows the bound checked below.
-            command.args(["--input-type=module", "-e", include_str!("../resources/workbuddy-acp.mjs"), "--"]);
+            command.args(["--input-type=module", "-e", include_str!("../../scripts/workbuddy-acp.mjs"), "--"]);
         }
         command.arg(&path);
         if managed && !script { command.arg("--native"); }
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn workbuddy_acp_uses_managed_bridge_without_exporting_desktop_credentials() {
-        let bridge = include_str!("../resources/workbuddy-acp.mjs");
+        let bridge = include_str!("../../scripts/workbuddy-acp.mjs");
         assert!(bridge.encode_utf16().count() < 16000, "materialize an oversized bridge instead of passing it on the Windows command line");
         let dir = tempfile::tempdir().unwrap();
         let cli = bundled_cli(dir.path());

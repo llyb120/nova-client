@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const source = await readFile(new URL('../src-tauri/resources/workbuddy-acp.mjs', import.meta.url), 'utf8');
+const source = await readFile(new URL('./workbuddy-acp.mjs', import.meta.url), 'utf8');
 const rpc = (id, method, params = {}) => ({ jsonrpc: '2.0', id, method, params });
 const event = message => `data: ${JSON.stringify(message)}\r\n\r\n`;
 const wait = async predicate => {
