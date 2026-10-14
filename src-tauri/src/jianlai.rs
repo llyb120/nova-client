@@ -35,7 +35,14 @@ pub(crate) struct InputLease(u64);
 impl Drop for InputLease {
     fn drop(&mut self) {
         if let Ok(mut lease) = INPUT_LEASE.lock() {
-            if lease.is_some_and(|(_, _, id)| id == self.0) { *lease = None; *LAST_INJECTED.lock().unwrap() = Some(Instant::now()); }
+            if let Some((tool, _, id)) = *lease {
+                if id != self.0 { return; }
+                *lease = None;
+                *LAST_INJECTED.lock().unwrap() = Some(Instant::now());
+                #[cfg(windows)]
+                if tool == "jianlai" { crate::agent_glow::release(); }
+                let _ = tool;
+            }
         }
     }
 }
@@ -52,6 +59,9 @@ pub(crate) fn lease_input(tool: &'static str) -> Result<InputLease> {
     }
     let id = INPUT_LEASE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     *lease = Some((tool, Instant::now(), id));
+    // 整批输入期间保持桌面光效，即使调用方不是 Nova 会话（看不到回合状态）。
+    #[cfg(windows)]
+    if tool == "jianlai" { crate::agent_glow::hold(); }
     Ok(InputLease(id))
 }
 /// Called by chrome after it changed what is on screen (tab switch, navigation, input). The stale
@@ -263,18 +273,96 @@ fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u
     let height = r.height as i128 * surface.height as i128;
     if x < 0 || y < 0 || x >= width || y >= height { return None; }
     let (x, y) = ((x * image.width() as i128 / width) as i32, (y * image.height() as i128 / height) as i32);
-    // Hollow high-contrast ring: preserve the target pixels at the hotspot.
-    for dy in -12i32..=12 {
-        for dx in -12i32..=12 {
-            let d = dx * dx + dy * dy;
-            if !(64..=144).contains(&d) { continue; }
-            let (px, py) = (x + dx, y + dy);
-            if px >= 0 && py >= 0 && px < image.width() as i32 && py < image.height() as i32 {
-                image.put_pixel(px as u32, py as u32, xcap::image::Rgba(if (81..=121).contains(&d) { [255,0,180,255] } else { [0,0,0,255] }));
-            }
+    // 与系统指针同款的剑（系统截图本就不含真实指针），剑尖即热点；光晕在反馈图里刻意很淡，
+    // 压住的内容仍然可读，不干扰模型对目标的判断。
+    let hot = POINTER_TIP as i32;
+    for (i, c) in pointer_pixels(32, MARKER_GLOW).into_iter().enumerate() {
+        let a = (c >> 24) as f32 / 255.0;
+        let (px, py) = (x + i as i32 % 32 - hot, y + i as i32 / 32 - hot);
+        if a == 0.0 || px < 0 || py < 0 || px >= image.width() as i32 || py >= image.height() as i32 { continue; }
+        let dst = image.get_pixel_mut(px as u32, py as u32);
+        for (k, shift) in [16, 8, 0].into_iter().enumerate() {
+            dst.0[k] = (((c >> shift) & 255) as f32 * a + dst.0[k] as f32 * (1.0 - a)).round() as u8;
         }
     }
     Some((x as u32, y as u32))
+}
+
+/// 剑尖（即热点）在 32 单位指针坐标中的位置，向内缩一点让圆形光晕完整落在图内。
+pub(crate) const POINTER_TIP: f32 = 10.0;
+/// 以剑尖为圆心的墨点式光晕半径：一个大而明确的落点参照。
+const TIP_GLOW: f32 = 9.5;
+/// 剑按这个比例绘制，才能与剑尖光晕并存。
+const SWORD_SCALE: f32 = 0.82;
+/// 真实系统指针上的光晕浓度：一滴天蓝墨点，用户平时就能找到指针（指针从不进入截图）。
+pub(crate) const CURSOR_GLOW: f32 = 0.72;
+/// 反馈截图里的光晕浓度：只做淡提示，不遮挡模型要读的内容。
+pub(crate) const MARKER_GLOW: f32 = 0.2;
+
+/// Signed distance to a polygon (negative inside).
+fn polygon_sd(poly: &[(f32, f32)], x: f32, y: f32) -> f32 {
+    let (mut inside, mut d) = (false, f32::MAX);
+    for i in 0..poly.len() {
+        let ((ax, ay), (bx, by)) = (poly[i], poly[(i + 1) % poly.len()]);
+        if (ay > y) != (by > y) && x < (bx - ax) * (y - ay) / (by - ay) + ax { inside = !inside; }
+        let (ex, ey) = (bx - ax, by - ay);
+        let t = (((x - ax) * ex + (y - ay) * ey) / (ex * ex + ey * ey)).clamp(0.0, 1.0);
+        d = d.min((x - ax - t * ex).hypot(y - ay - t * ey));
+    }
+    if inside { -d } else { d }
+}
+
+/// 剑来的剑：剑尖朝左上（热点），沿对角线依次是剑身、护手、剑柄、剑首。
+/// 坐标 (s, w)：s 从剑尖沿剑身、w 垂直剑身。返回 (有符号距离, 部位颜色)。
+fn sword(x: f32, y: f32) -> (f32, (f32, f32, f32)) {
+    let (dx, dy) = (x - POINTER_TIP, y - POINTER_TIP);
+    let k = std::f32::consts::FRAC_1_SQRT_2 / SWORD_SCALE;
+    let (s, w) = ((dx + dy) * k, (dx - dy) * k);
+    // 细长的双刃剑身：剑脊一线高光，两侧一亮一暗。
+    let blade = if w.abs() < 0.3 { (255.0, 255.0, 255.0) } else if w < 0.0 { (224.0, 242.0, 254.0) } else { (147.0, 197.0, 253.0) };
+    // 剑柄缠绳。
+    let grip = if (s * 1.6).fract() < 0.5 { (30.0, 64.0, 175.0) } else { (23.0, 37.0, 84.0) };
+    [
+        (polygon_sd(&[(0.0, 0.0), (5.5, -1.5), (17.0, -1.85), (17.0, 1.85), (5.5, 1.5)], s, w), blade),
+        (polygon_sd(&[(16.8, -3.9), (17.8, -4.9), (18.9, -3.9), (18.9, 3.9), (17.8, 4.9), (16.8, 3.9)], s, w), (2.0, 132.0, 199.0)),
+        (polygon_sd(&[(18.9, -1.15), (24.0, -1.15), (24.0, 1.15), (18.9, 1.15)], s, w), grip),
+        (polygon_sd(&[(23.8, 0.0), (25.2, -1.6), (26.6, 0.0), (25.2, 1.6)], s, w), (14.0, 165.0, 233.0)),
+    ].into_iter().min_by(|a, b| a.0.total_cmp(&b.0)).map(|(d, c)| (d * SWORD_SCALE, c)).unwrap()
+}
+
+/// Anti-aliased sword pointer: navy outline over a round sky-blue ink dot at the tip.
+/// `glow` is the dot's peak alpha. Straight-alpha 0xAARRGGBB.
+pub(crate) fn pointer_pixels(size: i32, glow: f32) -> Vec<u32> {
+    const SS: i32 = 4;
+    let unit = 32.0 / size as f32;
+    let mut pixels = vec![0u32; (size * size) as usize];
+    for py in 0..size {
+        for px in 0..size {
+            let mut acc = [0f32; 4]; // premultiplied r,g,b,a
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let x = (px as f32 + (sx as f32 + 0.5) / SS as f32) * unit;
+                    let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) * unit;
+                    let (d, (r, g, b)) = sword(x, y);
+                    let (r, g, b, a) = if d <= 0.0 {
+                        (r, g, b, 1.0)
+                    } else if d < 0.6 {
+                        (12.0, 30.0, 64.0, 1.0)
+                    } else {
+                        // 以剑尖为圆心的天蓝墨点，中心浓、向外平滑淡出。
+                        let r2 = ((x - POINTER_TIP).powi(2) + (y - POINTER_TIP).powi(2)) / (TIP_GLOW * TIP_GLOW);
+                        (56.0, 189.0, 248.0, glow * (1.0 - r2).max(0.0).powf(1.5))
+                    };
+                    acc[0] += r * a; acc[1] += g * a; acc[2] += b * a; acc[3] += a;
+                }
+            }
+            let a = acc[3] / (SS * SS) as f32;
+            if a <= 0.0 { continue; }
+            let c = |v: f32| (v / acc[3]).round().clamp(0.0, 255.0) as u32;
+            pixels[(py * size + px) as usize] = ((a * 255.0).round() as u32) << 24 | c(acc[0]) << 16 | c(acc[1]) << 8 | c(acc[2]);
+        }
+    }
+    pixels
 }
 
 fn overlay_bounds(desktop_capture: bool) -> Option<crate::taskbar_status::Rect> {
@@ -430,7 +518,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         let mut entry = json!({"imageId":image_id,"path":path,"width":image.width(),"height":image.height(),
             "snapshotId":id,"capturedAt":captured_at,"stability":stability,
             "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
-            "cursor":cursor.map(|(x,y)| json!({"x":x,"y":y,"marker":"magenta-ring","source":"system-pointer"})),
+            "cursor":cursor.map(|(x,y)| json!({"x":x,"y":y,"marker":"sword-tip","source":"system-pointer"})),
             "region":region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height})),
             "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}});
         // No path means hosts attach no image; samePixelsAs stays readable through recall.
@@ -1412,7 +1500,14 @@ fn has_target(args: &Value) -> bool {
 }
 
 pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
-    execute_inner(root, &tolerate_slips(args), owner).await
+    let args = tolerate_slips(args);
+    // 第一次调用（通常是 windows 观察）就点亮边缘呼吸光效与剑形指针：模型还在看图时，
+    // 用户已经知道剑来接手了。后台模式不碰用户的指针与前台，经验读写不操作桌面，都不点亮。
+    #[cfg(windows)]
+    if args["background"] != json!(true) && !crate::tool_experience::is_operation(&args) {
+        crate::agent_glow::touch();
+    }
+    execute_inner(root, &args, owner).await
 }
 
 /// look/vision are unused but still tolerated, and a lone `action` (chrome's shape, often reused by
@@ -1624,8 +1719,11 @@ mod tests {
         let original = xcap::image::RgbaImage::from_pixel(400, 200, xcap::image::Rgba([255,255,255,255]));
         let mut image = original.clone();
         assert_eq!(mark_cursor(&mut image, &surface, (3840,2160), Some(region), (-1620,50)), Some((200,100)));
-        assert_eq!(image.get_pixel(200,100), original.get_pixel(200,100));
-        assert_eq!(image.get_pixel(210,100).0, [255,0,180,255]);
+        let tip = image.get_pixel(200,100).0;
+        assert!(tip[0] < 250 && tip != [255,255,255,255], "剑尖落在热点上: {tip:?}");
+        let blade = image.get_pixel(208,107).0;
+        assert!(blade[2] > 200 && blade[0] < 200, "剑身自剑尖向右下延伸: {blade:?}");
+        assert_eq!(image.get_pixel(190,90), original.get_pixel(190,90), "光晕之外不改动原图");
         assert_eq!(mark_cursor(&mut image, &surface, (3840,2160), Some(region), (-1820,-50)), Some((0,0)));
         let unchanged = image.clone();
         assert_eq!(mark_cursor(&mut image, &surface, (3840,2160), Some(region), (-1821,-50)), None);

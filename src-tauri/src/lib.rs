@@ -1,4 +1,6 @@
 mod visual_guard;
+#[cfg(windows)]
+mod agent_glow;
 mod acp;
 mod agent_config;
 mod jianlai;
@@ -5603,6 +5605,9 @@ pub fn run() {
             native_browser::init(app.handle());
             meteor::start(app.handle());
 
+            #[cfg(windows)]
+            agent_glow::init(app.handle());
+
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             sync_global_session_shortcuts(app.handle());
             spawn_session_auto_cleanup(app.handle().clone());
@@ -6033,6 +6038,8 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::Exit = event {
+                #[cfg(windows)]
+                agent_glow::exit();
                 app.state::<workspace_terminal::TerminalManager>().close_all();
                 let state = app.state::<AppState>();
                 // 临时会话随程序关闭一并删除，并清理其临时工作目录。
