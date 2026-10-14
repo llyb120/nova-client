@@ -852,7 +852,9 @@ fn get_backend_availability(state: State<'_, AppState>) -> HashMap<String, bool>
 }
 
 #[tauri::command]
-async fn get_cli_statuses(settings: Settings) -> Vec<cli_manager::CliStatus> {
+async fn get_cli_statuses(app: tauri::AppHandle, settings: Settings) -> Vec<cli_manager::CliStatus> {
+    // 可用性只在启动/改路径时检测过；用户在终端里装好 CLI 后打开设置页要能看到新结果
+    spawn_backend_availability_check(app);
     cli_manager::statuses(&settings).await
 }
 
@@ -4370,8 +4372,11 @@ fn get_settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
-fn refresh_environment_variables() -> Result<usize, String> {
-    path_env::refresh_process_environment()
+fn refresh_environment_variables(app: tauri::AppHandle) -> Result<usize, String> {
+    let count = path_env::refresh_process_environment()?;
+    // 新 PATH 可能让之前没找到的 CLI 变得可解析，顺带重新检测后端可用性
+    spawn_backend_availability_check(app);
+    Ok(count)
 }
 
 #[tauri::command]

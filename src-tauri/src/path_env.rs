@@ -10,16 +10,16 @@ const PATH_MARKER_BEGIN: &[u8] = b"__NOVA_PATH_BEGIN__";
 #[cfg(any(target_os = "macos", test))]
 const PATH_MARKER_END: &[u8] = b"__NOVA_PATH_END__";
 
-/// macOS 从 Finder / Dock 启动 .app 时不会加载用户的 shell 配置，进程 PATH 通常只有
-/// /usr/bin:/bin:/usr/sbin:/sbin。后端 CLI 大多由 Homebrew 或 Node 版本管理器安装，
-/// 因此必须在任何后端检测、CLI 子命令或 Tauri 线程启动前恢复终端使用的 PATH。
+/// 桌面启动不会加载终端的 shell 配置，Windows 注册表也不包含 fnm 动态注入的 PATH。
+/// 必须在任何后端检测、CLI 子命令或 Tauri 线程启动前恢复 Node 和全局 CLI 的搜索路径。
 pub fn init_process_path() {
     #[cfg(windows)]
     {
         // Tauri GUI may inherit Explorer's stale environment block. Refresh synchronously before
         // any CodeBuddy prewarm/model probe can spawn and snapshot missing CODEBUDDY_* values.
-        let _ = refresh_windows_process_environment();
-        init_windows_process_path();
+        if refresh_windows_process_environment().is_err() {
+            init_windows_process_path();
+        }
     }
     #[cfg(target_os = "macos")]
     init_macos_process_path();
@@ -59,24 +59,62 @@ fn merge_paths<'a>(groups: impl IntoIterator<Item = &'a OsStr>) -> Option<OsStri
 
 #[cfg(windows)]
 fn init_windows_process_path() {
-    let current = std::env::var_os("PATH");
-    let fallback = fallback_windows_path(std::env::var_os("USERPROFILE").map(PathBuf::from));
-    let mut groups = Vec::<&OsStr>::new();
-    if let Some(path) = current.as_deref() {
-        groups.push(path);
-    }
-    if let Some(path) = fallback.as_deref() {
-        groups.push(path);
-    }
-    if let Some(path) = merge_paths(groups) {
+    if let Some(path) = windows_process_path(
+        std::env::var_os("PATH"),
+        std::env::var_os("USERPROFILE").map(PathBuf::from),
+        std::env::var_os("APPDATA").map(PathBuf::from),
+        std::env::var_os("FNM_DIR").map(PathBuf::from),
+        std::env::var_os("FNM_MULTISHELL_PATH").map(PathBuf::from),
+    ) {
         std::env::set_var("PATH", path);
     }
 }
 
 #[cfg(any(windows, test))]
-fn fallback_windows_path(home: Option<PathBuf>) -> Option<OsString> {
-    let home = home?;
-    std::env::join_paths([home.join(".local/bin")]).ok()
+fn windows_process_path(
+    current: Option<OsString>,
+    home: Option<PathBuf>,
+    appdata: Option<PathBuf>,
+    fnm_dir: Option<PathBuf>,
+    multishell: Option<PathBuf>,
+) -> Option<OsString> {
+    let home = home.filter(|path| path.is_absolute());
+    let appdata = appdata.filter(|path| path.is_absolute());
+    // Follow fnm's root selection: explicit FNM_DIR, existing modern root, then legacy ~/.fnm.
+    let default = fnm_dir
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            appdata
+                .as_ref()
+                .map(|path| path.join("fnm"))
+                .filter(|path| path.exists())
+        })
+        .or_else(|| home.as_ref().map(|path| path.join(".fnm")))
+        .map(|path| path.join("aliases/default"));
+    let active = multishell.filter(|path| {
+        path.is_absolute() && (path.join("node.exe").is_file() || std::fs::read_link(path).is_ok())
+    });
+    // `fnm use system` deliberately leaves a dangling session link. Honor any existing link,
+    // even without Node, instead of silently switching the user's selected version to default.
+    // Windows aliases/sessions point directly to installation (no bin suffix). Use one version
+    // only, so a missing CLI is not borrowed from a different version's global installation.
+    let mut paths: Vec<PathBuf> = active
+        .or(default)
+        .filter(|path| path.join("node.exe").is_file())
+        .into_iter()
+        .collect();
+    // 与 fnm env 一样让所选版本优先于系统 Node；子进程也会继承同一份 PATH。
+    if let Some(current) = current {
+        paths.extend(std::env::split_paths(&current));
+    }
+    if let Some(home) = home {
+        paths.push(home.join(".local/bin"));
+    }
+    if let Some(appdata) = appdata {
+        paths.push(appdata.join("npm"));
+    }
+    let path = std::env::join_paths(paths).ok()?;
+    merge_paths([path.as_os_str()])
 }
 
 #[cfg(windows)]
@@ -149,15 +187,8 @@ fn refresh_windows_process_environment() -> Result<usize, String> {
         std::env::set_var(name, value);
     }
 
-    // Preserve Nova's native CLI fallback directories when replacing the inherited Path.
-    if let (Some(registry_path), Some(fallback)) = (
-        std::env::var_os("PATH"),
-        fallback_windows_path(std::env::var_os("USERPROFILE").map(PathBuf::from)),
-    ) {
-        if let Some(path) = merge_paths([registry_path.as_os_str(), fallback.as_os_str()]) {
-            std::env::set_var("PATH", path);
-        }
-    }
+    // Registry Path omits fnm's shell-only Node path. Restore it on refresh as well as startup.
+    init_windows_process_path();
 
     Ok(expanded_values.len())
 }
@@ -391,7 +422,7 @@ fn append_matching_dirs(paths: &mut Vec<PathBuf>, root: PathBuf, suffix: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_marked_path, fallback_windows_path, merge_paths};
+    use super::{extract_marked_path, merge_paths, windows_process_path};
     use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
@@ -424,11 +455,168 @@ mod tests {
     }
 
     #[test]
-    fn windows_fallback_includes_local_bin() {
-        let home = PathBuf::from("C:/Users/professor");
-        let fallback = fallback_windows_path(Some(home.clone())).unwrap();
-        let paths: Vec<PathBuf> = std::env::split_paths(&fallback).collect();
+    fn windows_path_preserves_existing_entries_and_adds_cli_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("用户 home");
+        let appdata = home.join("AppData/Roaming");
+        let system = temp.path().join("system");
+        let current = std::env::join_paths([&system, &home.join(".local/bin")]).unwrap();
+        let path = windows_process_path(
+            Some(current),
+            Some(home.clone()),
+            Some(appdata.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            vec![system, home.join(".local/bin"), appdata.join("npm")],
+        );
+    }
 
-        assert_eq!(paths, vec![home.join(".local/bin")]);
+    #[test]
+    fn windows_path_recovers_fnm_default_node_and_global_clis() {
+        let temp = tempfile::tempdir().unwrap();
+        let appdata = temp.path().join("用户 data; with spaces");
+        let default = appdata.join("fnm/aliases/default");
+        let npm = appdata.join("npm");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::create_dir_all(&npm).unwrap();
+        for name in ["node.exe", "npm.cmd", "npx.cmd", "codebuddy.cmd"] {
+            std::fs::write(default.join(name), "").unwrap();
+        }
+        std::fs::write(npm.join("claude.cmd"), "").unwrap();
+        let system = temp.path().join("system-node");
+        let path = windows_process_path(
+            Some(std::env::join_paths([&system]).unwrap()),
+            None,
+            Some(appdata),
+            None,
+            None,
+        )
+        .unwrap();
+        let paths = std::env::split_paths(&path).collect::<Vec<_>>();
+        assert_eq!(paths, vec![default.clone(), system, npm.clone()]);
+        for name in [
+            "node.exe",
+            "npm.cmd",
+            "npx.cmd",
+            "codebuddy.cmd",
+            "claude.cmd",
+        ] {
+            assert_eq!(
+                paths
+                    .iter()
+                    .map(|dir| dir.join(name))
+                    .find(|file| file.is_file()),
+                Some(if name == "claude.cmd" {
+                    npm.join(name)
+                } else {
+                    default.join(name)
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn windows_path_uses_active_fnm_session_then_custom_default_not_other_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let appdata = temp.path().join("roaming");
+        let custom = temp.path().join("custom fnm");
+        let default = custom.join("aliases/default");
+        let active = temp.path().join("fnm_multishells/session");
+        let other = custom.join("node-versions/v99.0.0/installation");
+        for dir in [
+            &active,
+            &default,
+            &other,
+            &appdata.join("fnm/aliases/default"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("node.exe"), "").unwrap();
+        }
+        let missing = temp.path().join("stale-session");
+        for (session, expected) in [
+            (Some(active.clone()), active),
+            (Some(missing), default.clone()),
+            (None, default.clone()),
+        ] {
+            let path = windows_process_path(
+                None,
+                None,
+                Some(appdata.clone()),
+                Some(custom.clone()),
+                session,
+            )
+            .unwrap();
+            assert_eq!(
+                std::env::split_paths(&path).collect::<Vec<_>>(),
+                vec![expected, appdata.join("npm")],
+            );
+        }
+        // A broken custom default must not silently switch to a different fnm installation/version.
+        std::fs::remove_file(default.join("node.exe")).unwrap();
+        let path =
+            windows_process_path(None, None, Some(appdata.clone()), Some(custom), None).unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            vec![appdata.join("npm")]
+        );
+    }
+
+    #[test]
+    fn windows_path_uses_legacy_fnm_root_only_without_modern_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let appdata = home.join("roaming");
+        let legacy = home.join(".fnm/aliases/default");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("node.exe"), "").unwrap();
+        let path =
+            windows_process_path(None, Some(home.clone()), Some(appdata.clone()), None, None)
+                .unwrap();
+        assert_eq!(std::env::split_paths(&path).next(), Some(legacy));
+        std::fs::create_dir_all(appdata.join("fnm")).unwrap();
+        let path =
+            windows_process_path(None, Some(home.clone()), Some(appdata.clone()), None, None)
+                .unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            vec![home.join(".local/bin"), appdata.join("npm")],
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_honors_dangling_fnm_session_link_for_system_node() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let default = root.join("aliases/default");
+        let target = root.join("system-placeholder");
+        let session = root.join("session");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(default.join("node.exe"), "").unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&session)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        std::fs::remove_dir(&target).unwrap();
+        assert!(std::fs::read_link(&session).is_ok());
+        let current = std::env::join_paths([root.join("system-node")]).unwrap();
+        assert_eq!(
+            windows_process_path(
+                Some(current.clone()),
+                None,
+                None,
+                Some(root.to_path_buf()),
+                Some(session),
+            ),
+            Some(current),
+        );
     }
 }
