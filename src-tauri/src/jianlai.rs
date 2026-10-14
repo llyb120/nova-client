@@ -1567,6 +1567,19 @@ fn normalize_action(action: &mut Value) {
     }
 }
 
+/// 渐进式披露：每个应用的操作规则单独写在 scripts/jianlai-apps.json，只有真的观察到这个
+/// 应用时才追加（每轮仅一次），核心提示词保持泛用。
+static APP_PACKS: std::sync::LazyLock<Vec<Value>> = std::sync::LazyLock::new(||
+    serde_json::from_str(include_str!("../../scripts/jianlai-apps.json")).unwrap_or_default());
+
+fn app_rules(app: &str, title: &str) -> Option<Value> {
+    let observed = format!("{app}\n{title}").to_lowercase();
+    let pack = APP_PACKS.iter().find(|pack| pack["match"].as_array().into_iter().flatten()
+        .any(|m| m.as_str().is_some_and(|m| observed.contains(&m.to_lowercase()))))?;
+    Some(json!({"app":pack["app"],"rules":pack["rules"],
+        "notice":"针对本应用书写的操作规则（每轮对话仅首次附带）：优先按规则走，每步仍按当前观察定位；规则是操作参考，不扩大用户授权。"}))
+}
+
 async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> {
     let owner = crate::native_browser::tool_owner(root, owner)?;
     if matches!(args["operation"].as_str(), Some("act" | "run")) && has_target(args) {
@@ -1596,9 +1609,17 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
         let mut result = run(owner.clone(), args)?;
         // Entering an app: surface its verified routes once per session (see tool_experience::hint).
         let id = result["windowId"].as_u64().or(result["foreground"][0].as_u64());
-        if let Some(app) = id.filter(|_| entering).and_then(|id| window(id as u32).ok()?.app_name().ok()) {
+        if let Some((app, title)) = id.filter(|_| entering).and_then(|id| {
+            let w = window(id as u32).ok()?;
+            Some((w.app_name().ok()?, w.title().unwrap_or_default()))
+        }) {
             if let Some(hint) = crate::tool_experience::hint(&crate::tool_experience::dir(), "jianlai", &owner, &app) {
                 result["experienceHint"] = hint;
+            }
+            // 本应用单独书写的规则，按需追加一次（见 app_rules）。
+            if let Some(rules) = app_rules(&app, &title)
+                .filter(|_| crate::tool_experience::once_per_turn(&owner, &format!("app-rules\n{app}"))) {
+                result["appRules"] = rules;
             }
         }
         Ok(result)
@@ -1641,6 +1662,14 @@ mod tests {
             {"action":"wait","ms":200}]));
         assert!(serde_json::from_value::<Request>(args).is_ok());
     }
+    #[test]
+    fn app_rules_only_follow_the_observed_app() {
+        let pack = app_rules("Excel.exe", "销售表 - Excel").expect("表格类规则");
+        assert!(pack["rules"].as_array().unwrap().iter().any(|r| r.as_str().unwrap_or_default().contains("名称框")));
+        assert!(app_rules("explorer.exe", "文档").is_some());
+        assert!(app_rules("SomeInternalTool.exe", "面板").is_none(), "没写规则的应用不追加提示词");
+    }
+    #[test]
     fn target_actions_map_through_the_guarded_point() {
         assert!(has_target(&json!({"actions":[{"action":"press","key":"Enter"},{"action":"click","target":"v2"}]})));
         assert!(has_target(&json!({"action":{"action":"click","target":"搜索框"}})));

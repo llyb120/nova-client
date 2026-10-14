@@ -185,6 +185,12 @@ pub(crate) fn hint(dir: &Path, tool: &str, owner: &str, raw_scope: &str) -> Opti
         "notice":"本应用/网站的已记录路径（每轮对话仅首次附带）。目标相关且conditions符合就按steps走，每步仍按当前观察定位；source=auto为自动记录的操作轨迹，可能含绕路，已有验证路径时不列出（计入totalRoutes）；…表示截断，用experience_search(task)取完整路径。"}))
 }
 
+/// 跟 hint 共用这一轮的去重集（finish_turn 重置）：同一 owner 下的同一 key 每轮只放一次，
+/// 用于按需追加的提示词（如剑来的应用规则）。
+pub(crate) fn once_per_turn(owner: &str, key: &str) -> bool {
+    HINTED.lock().unwrap().insert(format!("{owner}\n{key}"))
+}
+
 const AUTO: &str = "auto-trail";
 fn source(e: &Entry) -> &'static str { if e.snapshot_id == AUTO { "auto" } else { "model" } }
 
