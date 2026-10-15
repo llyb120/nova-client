@@ -5225,6 +5225,8 @@ fn respond_roam_request(
 #[tauri::command]
 async fn restart_devin(state: State<'_, AppState>) -> Result<(), String> {
     state.acp.restart().await;
+    state.kimi.restart().await;
+    state.claude.restart().await;
     state.workbuddy.restart().await;
     state.codex.restart().await;
     state.codexplus.shutdown();
