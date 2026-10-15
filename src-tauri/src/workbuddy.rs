@@ -94,6 +94,9 @@ fn build_command(configured: &str, managed: bool) -> Result<tokio::process::Comm
         return Err("请选择 WorkBuddy 内置的 CodeBuddy CLI，而不是 WorkBuddy 桌面程序".into());
     }
     let root = config_dir().ok_or("无法确定 WorkBuddy 用户配置目录")?;
+    if managed {
+        seed_cloud_product_config(&root);
+    }
     let script = node_script(&path);
     let mut command = if script || managed {
         let node = path.parent().map(|dir| dir.join(if cfg!(windows) { "node.exe" } else { "node" }))
@@ -126,6 +129,26 @@ fn build_command(configured: &str, managed: bool) -> Result<tokio::process::Comm
     };
     apply_runtime_env(&mut command, &root);
     Ok(command)
+}
+
+/// The CLI keeps the user's last-good cloud product config (the real model catalog) in
+/// `local_storage/entry_<md5(key)>.info`; the desktop keeps the same entry with a `wb_` prefix.
+/// After a fresh install the CLI copy is missing, its first cloud fetch fails into a cooldown and
+/// nothing retries, so the worker serves bundled stale models. Seed it from the newer desktop copy.
+fn seed_cloud_product_config(root: &Path) {
+    const ENTRY: &str = "entry_d43e96994f944cfb77961c2ea7d04605.info"; // md5("cloud_product_config_cache")
+    let dir = root.join("local_storage");
+    let (from, to) = (dir.join(format!("wb_{ENTRY}")), dir.join(ENTRY));
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok();
+    let Some(source) = modified(&from) else { return };
+    if modified(&to).is_some_and(|target| target >= source) {
+        return;
+    }
+    // Replace atomically: running workers may read the entry concurrently.
+    let tmp = dir.join(format!("{ENTRY}.nova-{}.tmp", std::process::id()));
+    if std::fs::copy(&from, &tmp).is_err() || std::fs::rename(&tmp, &to).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn apply_runtime_env(command: &mut tokio::process::Command, root: &Path) {
@@ -199,6 +222,23 @@ mod tests {
         assert!(!command.as_std().get_envs().any(|(key, _)| key == "ACC_PRODUCT_CONFIG_PATH"));
         assert_eq!(ACP_CLIENT_NAME, "codebuddy-web-ui");
         assert!(include_str!("acp.rs").contains("crate::workbuddy::ACP_CLIENT_NAME"));
+    }
+
+    #[test]
+    fn workbuddy_seeds_missing_cli_cloud_config_from_desktop_without_clobbering_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("local_storage");
+        let cli = storage.join("entry_d43e96994f944cfb77961c2ea7d04605.info");
+        seed_cloud_product_config(dir.path());
+        assert!(!cli.exists());
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(storage.join("wb_entry_d43e96994f944cfb77961c2ea7d04605.info"), "desktop").unwrap();
+        seed_cloud_product_config(dir.path());
+        assert_eq!(std::fs::read_to_string(&cli).unwrap(), "desktop");
+        std::fs::write(&cli, "cli").unwrap();
+        seed_cloud_product_config(dir.path());
+        assert_eq!(std::fs::read_to_string(&cli).unwrap(), "cli");
+        assert_eq!(std::fs::read_dir(&storage).unwrap().count(), 2, "no temp files left behind");
     }
 
     #[test]
