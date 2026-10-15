@@ -21,7 +21,7 @@ import { resolveExpandScroll, resolveScrollAfterLayout, resolveUserScrollStick }
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail, toolDisplayText } from "../utils";
 import { createFileContextMenu } from "./FileContextMenu";
-import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
+import { createImageAttachments, ImageAttachmentStrip, takeWarmImage } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
 import { fmtDuration, fmtTokens, turnAvgTokensPerSec, turnTokenTitle } from "./TurnGroup";
 
@@ -1381,12 +1381,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH, imgMaxW } =
             layoutBubbleImages(item.images, maxBubble - 32, img => {
               const src = promptImageSrc(img);
-              const size = imageSizes.get(src);
               const key = imageKey(img);
+              // 输入框已预解码的附件同步命中，刚发送的消息无需等待即可提交。
+              if (!imageSizes.has(src) && !shownImages.get(key)?.size && !loadImageSource(src)) pendingImages ||= !brokenImages.has(src);
+              const size = imageSizes.get(src);
               if (size) shownImages.set(key, { ...shownImages.get(key), size });
-              const known = size ?? shownImages.get(key)?.size;
-              if (!known) { loadImageSource(src); pendingImages ||= !brokenImages.has(src); }
-              return known ?? null;
+              return size ?? shownImages.get(key)?.size ?? null;
             });
           // Size to content like DOM (no artificial min-width that leaves empty bubble space).
           const lh = 14 * 1.6;
@@ -3647,6 +3647,13 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       imgCache.delete(src);
       imgCache.set(src, el);
       return (el as unknown as { _loaded?: boolean })._loaded ? el : null;
+    }
+    el = takeWarmImage(src);
+    if (el) {
+      (el as unknown as { _loaded?: boolean })._loaded = true;
+      imageSizes.set(src, { naturalWidth: el.naturalWidth, naturalHeight: el.naturalHeight });
+      imgCache.set(src, el);
+      return el;
     }
     el = new Image();
     (el as unknown as { _loaded?: boolean })._loaded = false;

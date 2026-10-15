@@ -82,6 +82,33 @@ export function attachmentPreviewSrc(image: PromptImage) {
     : convertFileSrc(fileUriPath(image.uri ?? ""));
 }
 
+// 附件进输入框时就预解码：发送后 Canvas 首帧即拿到尺寸和位图，不必先等解码再整帧提交
+// （等待期间输入框收起、旧画面下移，消息随后才出现，表现为发送后画面闪一下）。
+// ponytail: 只留最近 8 张；更大批量的附件回退到 Canvas 自己解码。
+const warmImages = new Map<string, HTMLImageElement>();
+const decodedImages = new WeakSet<HTMLImageElement>();
+
+export function prewarmAttachmentImages(images: PromptImage[]) {
+  for (const image of images) {
+    if (!image.mimeType.startsWith("image/")) continue;
+    const src = attachmentPreviewSrc(image);
+    if (warmImages.has(src)) continue;
+    const el = new Image();
+    el.src = src;
+    el.decode().then(() => decodedImages.add(el), () => { if (warmImages.get(src) === el) warmImages.delete(src); });
+    warmImages.set(src, el);
+    if (warmImages.size > 8) warmImages.delete(warmImages.keys().next().value!);
+  }
+}
+
+/** 取走已解码完成的预热图片，所有权交给调用方。 */
+export function takeWarmImage(src: string): HTMLImageElement | undefined {
+  const el = warmImages.get(src);
+  if (!el || !decodedImages.has(el)) return undefined;
+  warmImages.delete(src);
+  return el;
+}
+
 /** 附件状态：粘贴图片走 base64，拖入文件走 Tauri file path。 */
 export function createImageAttachments(
   options: {
@@ -92,6 +119,10 @@ export function createImageAttachments(
   } = {},
 ) {
   const [images, setImages] = createSignal<PromptImage[]>([]);
+  const add = (next: PromptImage[]) => {
+    prewarmAttachmentImages(next);
+    setImages((prev) => [...prev, ...next]);
+  };
   const [dragging, setDragging] = createSignal(false);
 
   const onPaste = (e: ClipboardEvent) => {
@@ -105,9 +136,7 @@ export function createImageAttachments(
       .filter((f): f is File => f != null);
     if (files.length === 0) return;
     e.preventDefault();
-    void Promise.all(files.map(fileToAttachment)).then((imgs) =>
-      setImages((prev) => [...prev, ...imgs]),
-    );
+    void Promise.all(files.map(fileToAttachment)).then(add);
   };
 
   const addPaths = (paths: string[]) => {
@@ -119,7 +148,7 @@ export function createImageAttachments(
         uri: pathToFileUri(path),
       };
     });
-    if (next.length > 0) setImages((prev) => [...prev, ...next]);
+    if (next.length > 0) add(next);
   };
 
   onMount(() => {
@@ -166,7 +195,10 @@ export function createImageAttachments(
     setImages((prev) => prev.filter((_, i) => i !== index));
   const clear = () => setImages([]);
   /** 用已有附件初始化（编辑历史消息时复制一份，避免引用 store 节点） */
-  const set = (imgs: PromptImage[]) => setImages(imgs.map((img) => ({ ...img })));
+  const set = (imgs: PromptImage[]) => {
+    prewarmAttachmentImages(imgs);
+    setImages(imgs.map((img) => ({ ...img })));
+  };
 
   /** 通过系统文件对话框选择本地文件，读取为内嵌附件（不限图片类型）。 */
   const pickFiles = async () => {
@@ -179,7 +211,7 @@ export function createImageAttachments(
     for (const path of paths) {
       added.push(await api.readLocalAttachment(path));
     }
-    if (added.length > 0) setImages((prev) => [...prev, ...added]);
+    if (added.length > 0) add(added);
   };
 
   return { images, dragging, onPaste, remove, clear, set, pickFiles };
