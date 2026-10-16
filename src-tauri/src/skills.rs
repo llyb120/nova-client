@@ -398,7 +398,7 @@ pub fn install_skill_zip(config_dir: &Path, zip_path: &Path) -> Result<SkillInfo
                 .map_err(|e| format!("读取 zip 条目失败：{e}"))?;
             let name = entry
                 .enclosed_name()
-                .ok_or_else(|| format!("zip 含非法路径：{}", entry.name()))?
+                .ok_or_else(|| format!("zip 含非法路径：{:?}", entry.name()))?
                 .to_path_buf();
             let out = tmp.join(&name);
             if entry.is_dir() {
