@@ -86,23 +86,16 @@ pub(crate) fn bounds() -> Option<Rect> {
 #[cfg(windows)]
 static ACTIVITY: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
 #[cfg(windows)]
-static SEEN: std::sync::Mutex<Seen> = std::sync::Mutex::new(Seen { at: std::collections::BTreeMap::new(), unread: std::collections::BTreeSet::new() });
+static SEEN: std::sync::Mutex<Seen> = std::sync::Mutex::new(Seen { at: std::collections::BTreeMap::new() });
 
-/// A thread is viewed once clicked on the island, or opened in Nova after finishing unread,
-/// at or after its last update. In memory only: after a restart the latest result shows once more.
+/// Only unread results reach the chip (reading in Nova clears unread); this tracks results
+/// already viewed on the island, at or after their last update. In memory only.
 #[cfg(any(windows, test))]
 #[derive(Default)]
-struct Seen { at: std::collections::BTreeMap<String, i64>, unread: std::collections::BTreeSet<String> }
+struct Seen { at: std::collections::BTreeMap<String, i64> }
 
 #[cfg(any(windows, test))]
 impl Seen {
-    fn observe(&mut self, id: &str, unread: u32, updated_at: i64) {
-        if unread > 0 {
-            if !self.unread.contains(id) { self.unread.insert(id.into()); }
-        } else if self.unread.remove(id) {
-            self.at.insert(id.into(), updated_at);
-        }
-    }
     fn viewed(&self, id: &str, updated_at: i64) -> bool { self.at.get(id).is_some_and(|&at| at >= updated_at) }
 }
 
@@ -110,10 +103,7 @@ impl Seen {
 #[cfg(any(windows, test))]
 fn pick<'a>(threads: &[(&'a str, i64, u32)], seen: &Seen, shown: Option<&str>) -> Option<&'a str> {
     if let Some(thread) = threads.iter().find(|t| Some(t.0) == shown) { return Some(thread.0); }
-    let fresh = |t: &&(&str, i64, u32)| !seen.viewed(t.0, t.1);
-    threads.iter().filter(|t| t.2 > 0).filter(fresh).max_by_key(|t| t.1)
-        .or_else(|| threads.iter().max_by_key(|t| t.1).filter(fresh))
-        .map(|t| t.0)
+    threads.iter().filter(|t| t.2 > 0 && !seen.viewed(t.0, t.1)).max_by_key(|t| t.1).map(|t| t.0)
 }
 
 /// Island click: the result it showed is now viewed.
@@ -291,11 +281,9 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
     if let Some(activity) = desktop {
         return Some(Status::new(Kind::Running, format!("剑来 · {activity}"), String::new(), &["Nova 正在操作桌面"], None));
     }
-    let mut seen = SEEN.lock().ok()?;
-    let candidates: Vec<_> = store.threads.iter().filter(|t| !t.items.is_empty()).map(|t| {
-        seen.observe(&t.id, t.unread_turns, t.updated_at);
-        (t.id.as_str(), t.updated_at, t.unread_turns)
-    }).collect();
+    let seen = SEEN.lock().ok()?;
+    let candidates: Vec<_> = store.threads.iter().filter(|t| !t.items.is_empty())
+        .map(|t| (t.id.as_str(), t.updated_at, t.unread_turns)).collect();
     let Some(thread) = pick(&candidates, &seen, shown).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
         return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "单击发起新会话 · 双击打开 Nova"], None));
     };
@@ -378,15 +366,11 @@ mod tests {
         assert_eq!(pick(&threads, &seen, None), Some("b"), "the chip advances immediately, without closing the bubble");
         assert_eq!(pick(&threads, &seen, Some("a")), Some("a"), "reading or replying must not switch cards after marking seen");
         assert_eq!(pick(&threads, &seen, Some("deleted")), Some("b"));
-        seen.observe("b", 2, 20);
-        seen.observe("b", 0, 20); // Opened in Nova: unread cleared.
         let threads = [("old", 10, 0), ("a", 30, 0), ("b", 20, 0), ("latest", 40, 0)];
-        assert_eq!(pick(&threads, &seen, None), Some("latest"), "no unread left: the newest result if not viewed");
-        seen.at.insert("latest".into(), 40);
-        assert_eq!(pick(&threads, &seen, None), None, "never falls back to old history");
-        assert_eq!(pick(&threads, &seen, Some("latest")), Some("latest"), "last result stays readable while the chip is idle");
-        let threads = [("latest", 41, 0)];
-        assert_eq!(pick(&threads, &seen, None), Some("latest"), "a newer update is unviewed again");
+        assert_eq!(pick(&threads, &seen, None), None, "read in Nova (or never unread): the chip goes idle");
+        assert_eq!(pick(&threads, &seen, Some("latest")), Some("latest"), "an open card stays readable while the chip is idle");
+        let threads = [("a", 31, 1)];
+        assert_eq!(pick(&threads, &seen, None), Some("a"), "a newer unread update is shown again");
     }
 
     #[test]
