@@ -5862,6 +5862,7 @@ pub fn run() {
             meteor::meteor_open,
             meteor::meteor_context,
             meteor::meteor_submit,
+            meteor::meteor_paste,
             meteor::meteor_cancel,
             meteor::meteor_set_shortcut_recording,
             taskbar_status::taskbar_bubble,

@@ -171,6 +171,8 @@ pub struct Settings {
     pub meteor_model: String,
     /// Meteor 提交时附加触发时的最近剪贴板（文字/图片/文件路径）；默认关闭。
     pub meteor_clipboard: bool,
+    /// Meteor 星移（StartShift）的全局组合键；空值关闭。
+    pub meteor_paste_shortcut: String,
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
@@ -266,6 +268,7 @@ impl Default for Settings {
             meteor_agent_kind: "lyra".into(),
             meteor_model: String::new(),
             meteor_clipboard: false,
+            meteor_paste_shortcut: "Alt+V".into(),
             devin_enabled: false,
             vega_enabled: false,
             lyra_enabled: true,
@@ -442,6 +445,7 @@ mod tests {
             assert_eq!(settings.meteor_agent_kind, "lyra");
             assert!(settings.meteor_model.is_empty());
             assert!(!settings.meteor_clipboard);
+            assert_eq!(settings.meteor_paste_shortcut, "Alt+V");
         }
         let settings: Settings = serde_json::from_str(
             r#"{"meteorEnabled":false,"meteorShortcut":"Ctrl+Alt+M","meteorAgentKind":"codex","meteorModel":"gpt-5.6","meteorClipboard":true}"#,

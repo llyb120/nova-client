@@ -11,6 +11,8 @@ interface MeteorContext {
   monitors?: MeteorRegion[];
   pointer?: MeteorPoint;
   clipboard?: boolean;
+  /** Alt+V smart paste: one request box, no annotations. */
+  paste?: boolean;
 }
 
 export default function MeteorOverlay() {
@@ -26,8 +28,10 @@ export default function MeteorOverlay() {
   const [submitted, setSubmitted] = createSignal(false);
   const [viewport, setViewport] = createSignal({ width: window.innerWidth, height: window.innerHeight });
   const [panelSize, setPanelSize] = createSignal({ width: 420, height: 280 });
+  const [pasteText, setPasteText] = createSignal("");
   let surface!: HTMLDivElement;
   let input: HTMLTextAreaElement | undefined;
+  let pasteInput: HTMLTextAreaElement | undefined;
   let dragStart: MeteorPoint | null = null;
   let pointerId: number | null = null;
   let previousActiveIndex: number | null = null;
@@ -36,7 +40,8 @@ export default function MeteorOverlay() {
   let disposed = false;
   const locked = () => busy() || cancelling() || submitted();
   const active = () => annotations()[activeIndex() ?? -1];
-  const canAdd = () => ready() && !locked() && annotations().length < METEOR_MAX_ANNOTATIONS;
+  const paste = () => !!context()?.paste;
+  const canAdd = () => ready() && !locked() && !paste() && annotations().length < METEOR_MAX_ANNOTATIONS;
   const request = createMemo(() => meteorRequest(context()?.captureId ?? "", annotations()));
   const textLength = () => annotations().reduce((sum, item) => sum + [...item.text.trim()].length, 0);
   const focusInput = () => queueMicrotask(() => input?.focus({ preventScroll: true }));
@@ -75,6 +80,24 @@ export default function MeteorOverlay() {
       }
     } finally {
       if (context()?.captureId === payload.captureId) setBusy(false);
+    }
+  };
+
+  const submitPaste = async () => {
+    const captureId = context()?.captureId;
+    if (!captureId || locked() || !ready()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await invoke<string>("meteor_paste", { captureId, text: pasteText() });
+      if (context()?.captureId === captureId) setSubmitted(true);
+    } catch (cause) {
+      if (context()?.captureId === captureId) {
+        setError(`未能启动星移：${String(cause)}`);
+        queueMicrotask(() => pasteInput?.focus({ preventScroll: true }));
+      }
+    } finally {
+      if (context()?.captureId === captureId) setBusy(false);
     }
   };
 
@@ -120,6 +143,7 @@ export default function MeteorOverlay() {
   };
 
   const pointerDown = (event: PointerEvent) => {
+    if (paste()) { event.preventDefault(); void cancel(); return; } // Clicking outside the paste box dismisses it.
     if (event.button !== 0 || !event.isPrimary || !canAdd() || dragging()) return;
     event.preventDefault();
     previousActiveIndex = activeIndex();
@@ -179,10 +203,12 @@ export default function MeteorOverlay() {
       setBusy(false);
       setCancelling(false);
       setSubmitted(false);
+      setPasteText("");
       setViewport({ width: window.innerWidth, height: window.innerHeight });
       setReady(true);
     });
-    surface.focus({ preventScroll: true });
+    if (value.paste) queueMicrotask(() => pasteInput?.focus({ preventScroll: true }));
+    else surface.focus({ preventScroll: true });
   };
 
   const regionStyle = (selected: MeteorRegion) => {
@@ -230,6 +256,21 @@ export default function MeteorOverlay() {
     };
   });
 
+  const pasteStyle = createMemo(() => {
+    const image = context();
+    const screen = screenRect();
+    const view = viewport();
+    const width = Math.min(420, screen.width - 24);
+    const x = image?.pointer ? image.pointer.x / image.width * view.width : screen.x + (screen.width - width) / 2;
+    const y = image?.pointer ? image.pointer.y / image.height * view.height : screen.y + screen.height / 3;
+    const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(value, max));
+    return {
+      width: `${width}px`,
+      left: `${clamp(x + 12, screen.x + 12, screen.x + screen.width - width - 12)}px`,
+      top: `${clamp(y + 16, screen.y + 12, screen.y + screen.height - panelSize().height - 12)}px`,
+    };
+  });
+
   const attachPanel = (element: HTMLElement) => {
     panelObserver?.disconnect();
     panelObserver = new ResizeObserver(() => setPanelSize({ width: element.offsetWidth, height: element.offsetHeight }));
@@ -246,7 +287,7 @@ export default function MeteorOverlay() {
         void cancel();
       } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
         event.preventDefault();
-        void submit();
+        void (paste() ? submitPaste() : submit());
       } else if ((event.key === "Enter" || event.key === " ") && event.target === surface && activeIndex() === null) {
         event.preventDefault();
         selectCenter();
@@ -308,6 +349,34 @@ export default function MeteorOverlay() {
           aria-label={`选择屏幕标注 ${index + 1}`} disabled={locked() || dragging()} onClick={() => selectAnnotation(index)}>{index + 1}</button>
       )}</Index>
 
+      <Show when={paste() && ready()}>
+        <form class="meteor-note" ref={attachPanel} style={pasteStyle()} onSubmit={(event) => { event.preventDefault(); void submitPaste(); }}>
+          <label for="meteor-paste">星移 · 怎么处理剪贴板内容？</label>
+          <textarea
+            ref={pasteInput}
+            id="meteor-paste"
+            value={pasteText()}
+            onInput={(event) => setPasteText(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.isComposing) {
+                event.preventDefault();
+                void submitPaste();
+              }
+            }}
+            placeholder="留空则根据剪贴板和当前输入框自动推断。例如：翻译成英文 / 只粘贴手机号 / 在浏览器里搜索它"
+            rows={3}
+            maxLength={METEOR_MAX_TEXT}
+            disabled={locked()}
+          />
+          <Show when={error()}><p class="meteor-error" role="alert">{error()}</p></Show>
+          <div class="meteor-note-actions">
+            <span>Enter 执行 · Shift+Enter 换行 · Esc 取消</span>
+            <button type="submit" class="meteor-submit" disabled={locked()}>{busy() ? "启动中…" : submitted() ? "已启动" : "执行"}</button>
+          </div>
+        </form>
+      </Show>
+
+      <Show when={!paste()}>
       <header class="meteor-toolbar" style={toolbarStyle()}>
         <strong>Meteor</strong>
         <span class="meteor-status" role="status">{submitted() ? "任务已在后台启动" : busy() ? "正在启动桌面 / 浏览器操作…" : ready() ? `${annotations().length} / 20 条标注` : error() ? "屏幕布局不可用" : "等待屏幕标注…"}</span>
@@ -350,11 +419,14 @@ export default function MeteorOverlay() {
           </div>
         </form>
       </Show>
+      </Show>
 
-      <Show when={error() && (!active() || !ready())}>
+      <Show when={error() && (paste() ? !ready() : !active() || !ready())}>
         <div class="meteor-load-error" style={{ ...toolbarStyle(), top: `${screenRect().y + screenRect().height / 2}px` }} role="alert">{error()}<button type="button" onClick={() => void cancel()} disabled={cancelling()}>关闭</button></div>
       </Show>
-      <footer class="meteor-help" style={helpStyle()}>直接单击 / 拖动空白处继续标注 · Esc 取消 · Ctrl+Enter 执行全部<span>实时标注 · 提交时保留所有屏幕截图 · 位置仅指示大致范围</span></footer>
+      <Show when={!paste()}>
+        <footer class="meteor-help" style={helpStyle()}>直接单击 / 拖动空白处继续标注 · Esc 取消 · Ctrl+Enter 执行全部<span>实时标注 · 提交时保留所有屏幕截图 · 位置仅指示大致范围</span></footer>
+      </Show>
     </main>
   );
 }

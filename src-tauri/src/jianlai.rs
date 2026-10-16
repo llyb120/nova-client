@@ -206,6 +206,11 @@ fn window(id: u32) -> Result<Window> {
         .find(|w| w.id().ok() == Some(id))
         .ok_or_else(|| "程序窗口已关闭，请重新 windows".into())
 }
+/// 窗口的应用名与标题（Windows 上 id 即 HWND）。
+pub(crate) fn window_label(id: u32) -> Option<(String, String)> {
+    let w = window(id).ok()?;
+    Some((w.app_name().ok()?, w.title().unwrap_or_default()))
+}
 /// 后台模式没有「前台」可比较：恒为 None，使所有前台一致性校验自然成立。
 fn foreground() -> Result<Option<(u32, u32)>> {
     if background::active() { return Ok(None); }
@@ -1609,10 +1614,7 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
         let mut result = run(owner.clone(), args)?;
         // Entering an app: surface its verified routes once per session (see tool_experience::hint).
         let id = result["windowId"].as_u64().or(result["foreground"][0].as_u64());
-        if let Some((app, title)) = id.filter(|_| entering).and_then(|id| {
-            let w = window(id as u32).ok()?;
-            Some((w.app_name().ok()?, w.title().unwrap_or_default()))
-        }) {
+        if let Some((app, title)) = id.filter(|_| entering).and_then(|id| window_label(id as u32)) {
             if let Some(hint) = crate::tool_experience::hint(&crate::tool_experience::dir(), "jianlai", &owner, &app) {
                 result["experienceHint"] = hint;
             }

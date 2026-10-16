@@ -311,6 +311,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   );
   const [meteorModel, setMeteorModel] = createSignal(s?.meteorModel ?? "");
   const [meteorClipboard, setMeteorClipboard] = createSignal(s?.meteorClipboard ?? false);
+  const [meteorPasteShortcut, setMeteorPasteShortcut] = createSignal(s?.meteorPasteShortcut ?? "Alt+V");
   const [tryingMeteor, setTryingMeteor] = createSignal(false);
   const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
     s?.cursorContextMode === "super" ? "super" : "default",
@@ -760,6 +761,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     meteorAgentKind: meteorAgentKind(),
     meteorModel: meteorModel().trim(),
     meteorClipboard: meteorClipboard(),
+    meteorPasteShortcut: meteorPasteShortcut().trim(),
     devinEnabled: devinEnabled(),
     lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
@@ -1033,9 +1035,13 @@ export function SettingsModal(props: { onClose: () => void }) {
     const draftedShortcuts = draftSessionShortcuts();
     if (meteorEnabled()) {
       const keys = meteorShortcut().trim().toLowerCase();
+      const pasteKeys = meteorPasteShortcut().trim().toLowerCase();
+      const sessionKeys = withDefaultSessionShortcuts(draftedShortcuts).map((item) => item.keys.trim().toLowerCase());
       const error = !keys ? "请为 Meteor 录制快捷键，或恢复连按两次 Alt。"
-        : withDefaultSessionShortcuts(draftedShortcuts).some((item) => item.keys.trim().toLowerCase() === keys)
+        : sessionKeys.includes(keys)
           ? "Meteor 快捷键与会话快捷键冲突，请修改后再保存。"
+          : pasteKeys && (pasteKeys === keys || sessionKeys.includes(pasteKeys))
+            ? "星移快捷键与 Meteor 或会话快捷键冲突，请修改后再保存。"
           : !meteorAgentKinds().includes(meteorAgentKind())
             ? "Meteor 所选模型后端已关闭，请重新选择或关闭 Meteor。" : "";
       if (error) {
@@ -1168,6 +1174,15 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <button type="button" class="btn secondary" onClick={() => setMeteorShortcut("Alt+Alt")}>恢复双 Alt</button>
                 </div>
                 <span class="field-hint">目前支持 Windows。默认快速按下并松开两次 Alt；点击上方按钮可录制其他组合键（需包含 Ctrl、Alt、Shift 或 Win，以系统全局快捷键注册），Esc 取消录制。若组合键已被其他程序占用会提示注册失败，请换一个。</span>
+              </div>
+              <div class="field">
+                <span class="field-label">星移（StartShift）快捷键</span>
+                <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
+                  <ShortcutKeyCapture value={meteorPasteShortcut() || "已关闭"} onChange={setMeteorPasteShortcut} />
+                  <button type="button" class="btn secondary" onClick={() => setMeteorPasteShortcut("Alt+V")}>恢复 Alt+V</button>
+                  <button type="button" class="btn secondary" onClick={() => setMeteorPasteShortcut("")}>关闭</button>
+                </div>
+                <span class="field-hint">按下后弹出要求输入框，由剑来把剪贴板内容按要求粘贴到当前焦点处；不填要求则自动推断。需为带修饰键的组合键，且不能与 Meteor 或会话快捷键相同。</span>
               </div>
               <div class="field">
                 <span class="field-label">执行后端 / 模型</span>

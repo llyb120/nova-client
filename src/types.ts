@@ -505,6 +505,8 @@ export interface Settings {
   meteorModel: string;
   /** Meteor 提交时附加最近剪贴板；默认关闭 */
   meteorClipboard?: boolean;
+  /** Meteor 星移（StartShift）全局组合键，默认 Alt+V；空值关闭 */
+  meteorPasteShortcut?: string;
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
   lyraEnabled: boolean;
