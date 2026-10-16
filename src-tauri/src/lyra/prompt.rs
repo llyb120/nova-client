@@ -174,7 +174,7 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
 
 pub fn is_retryable_provider_error(error: &str) -> bool {
     let message = error.to_lowercase();
-    RETRYABLE_FRAGMENTS
+    !is_context_window_error(error) && RETRYABLE_FRAGMENTS
         .iter()
         .any(|fragment| message.contains(fragment))
 }
@@ -199,6 +199,8 @@ pub fn is_context_window_error(error: &str) -> bool {
     .any(|fragment| message.contains(fragment))
         // k3 等 provider 的超限文案形如 “k3-256k supports only 256K context.”。
         || (message.contains("supports only") && message.contains("context"))
+        // 输出预算被上下文挤占：只产出思考就擞上限，原样重试必然同样失败，应先收缩上下文。
+        || (message.contains("no actionable output") && message.contains("stop_reason=length"))
 }
 
 pub const PROVIDER_RETRY_DELAYS_MS: &[u64] = &[1_000, 3_000];
@@ -640,7 +642,7 @@ mod tests {
 
 #[cfg(test)]
 mod context_error_tests {
-    use super::is_context_window_error;
+    use super::{is_context_window_error, is_retryable_provider_error};
 
     #[test]
     fn recognizes_provider_context_limit_errors() {
@@ -658,6 +660,9 @@ mod context_error_tests {
             "HTTP 401 Unauthorized: {\"error\":{\"message\":\"k3-256k supports only 256K context.\",\"type\":\"invalid_authentication_error\"}}"
         ));
         assert!(!is_context_window_error("connection reset by peer"));
+        let squeezed = "provider returned no actionable output: 模型未返回正文或工具调用（可能仅有思考内容，stop_reason=length）";
+        assert!(is_context_window_error(squeezed) && !is_retryable_provider_error(squeezed));
+        assert!(is_retryable_provider_error(&squeezed.replace("length", "stop")));
         assert!(!is_context_window_error("this model supports only text input"));
     }
 }

@@ -2110,7 +2110,10 @@ mod tests {
             assert_eq!(result.usage["output"], 5);
             if expected == "error" {
                 let error = result.error_message.unwrap();
-                assert!(crate::lyra::prompt::is_retryable_provider_error(&error));
+                // length 时输出预算被挤占，走上下文收缩而非原样重试。
+                let squeezed = finish == "length";
+                assert_eq!(crate::lyra::prompt::is_retryable_provider_error(&error), !squeezed, "{error}");
+                assert_eq!(crate::lyra::prompt::is_context_window_error(&error), squeezed, "{error}");
                 assert!(!is_retryable_stream_error(&error), "retry only at turn level");
             } else {
                 assert!(result.error_message.is_none());
