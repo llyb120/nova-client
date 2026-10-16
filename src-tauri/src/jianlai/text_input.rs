@@ -16,6 +16,10 @@ const MAX_BYTES: usize = 256 * 1024 * 1024;
 const CF_UNICODETEXT: u32 = 13;
 const CF_ENHMETAFILE: u32 = 14;
 const PASTE_ACK: Duration = Duration::from_millis(3000);
+// Some targets (企业微信) ack with one read but insert from a later async read; restoring right after
+// the first read left their input empty. The rendered text stays on the clipboard for that read.
+// ponytail: fixed grace; a target reading again even later still gets the restored clipboard.
+const PASTE_GRACE: Duration = Duration::from_millis(400);
 
 thread_local! {
     // Text handed out on WM_RENDERFORMAT, and whether something has read it.
@@ -281,6 +285,8 @@ pub(super) fn type_text(enigo: &mut Enigo, text: &str, expected_foreground: Opti
             unread = true;
             return Err("目标应用3秒内没有读取粘贴内容，焦点可能不在可粘贴的输入框".into());
         }
+        let grace = Instant::now() + PASTE_GRACE;
+        while Instant::now() < grace { pump(); sleep(Duration::from_millis(5)); }
         if focus(expected_foreground)? != target { return Err("粘贴期间输入焦点改变".into()); }
         if !swap.owned() { return Err("粘贴期间剪贴板被其他程序改写，已保留新的剪贴板".into()); }
         Ok(())
