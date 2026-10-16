@@ -1105,12 +1105,13 @@ fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String
     values.into_iter().map(|value| { let action=parse_action(&value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()))?; validate_action(&action)?; Ok(action) }).collect()
 }
 
-fn preflight(observation:&Observation, action:&Action, image_id:Option<&str>) -> Result<(),String> {
+fn preflight(observation:&Observation, action:&mut Action, image_id:Option<&str>) -> Result<(),String> {
     match action {
         Action::Click{frame,r#ref,..}|Action::Fill{frame,r#ref,..}|Action::Scroll{frame,r#ref:Some(r#ref),..}=>{
-            if *frame>=observation.frames.len() {return Err("frame 不属于当前快照".into());}
-            if !observation.pages["pages"][*frame]["items"].as_array().is_some_and(|items|items.iter().any(|item|item["ref"].as_str()==Some(r#ref.as_str()))) {
-                return Err("ref 不属于当前快照的指定 frame；ref 必须原样复制该 frame 的 items[].ref，不能用 snapshotId 加序号拼造。这不等于快照过期；先核对已有观察中的真实 ref，不要直接重试或无故重新截图".into());
+            let has=|f:usize| observation.pages["pages"][f]["items"].as_array().is_some_and(|items|items.iter().any(|item|item["ref"].as_str()==Some(r#ref.as_str())));
+            if !has(*frame) {
+                // ref 带文档前缀、跨 frame 唯一：模型常照示例填 frame 0，按 ref 实际所在 frame 纠正。
+                *frame=(0..observation.frames.len()).find(|f|has(*f)).ok_or("ref 不在当前快照的任何 frame 中；ref 必须原样复制 items[].ref，不能拼造。这不等于快照过期；先核对已有观察中的真实 ref，不要直接重试或无故重新截图")?;
             }
         }
         Action::Scroll{frame,..} if *frame!=0=>return Err("子框架滚动需要明确 ref".into()),
@@ -1761,7 +1762,7 @@ async fn control_session(
     let task=CONTROL_TAB.scope(s.active_tab.clone(),async {
         let current=state.observations.lock().unwrap().get(&s.active_tab).cloned();
         if operation!="act" {return Ok(snapshot(app,operation=="screenshot",args,current.as_ref()).await?.1);}
-        let actions=parse_actions(args, if chrome { 16 } else { 8 })?;
+        let mut actions=parse_actions(args, if chrome { 16 } else { 8 })?;
         let all_dom=actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
         let with_image=current.as_ref().is_some_and(|o|o.screenshot) || actions.iter().any(|a|matches!(a,Action::ClickAt{..}|Action::Move{..}|Action::Drag{..}|Action::ScrollAt{..}));
         let Some(observation)=current.clone().filter(|o|args["snapshotId"].as_str()==Some(&o.id) && (all_dom || o.captured.elapsed()<=Duration::from_secs(180))) else {
@@ -1777,7 +1778,7 @@ async fn control_session(
         };
         // Static validation for the WHOLE batch; revalidate the live node/focus
         // before every individual input. Never retarget by matching its label.
-        for action in &actions {
+        for action in &mut actions {
             preflight(&observation,action,args["imageId"].as_str())?;
         }
         if chrome {
@@ -2564,6 +2565,19 @@ mod tests {
             assert_eq!(carry_screenshot(&mut next, previous), None);
             assert_eq!(next.screenshot, had);
         }
+    }
+
+    #[test]
+    fn preflight_corrects_frame_from_unique_ref() {
+        let frame = |id: &str| Frame { id: id.into(), parent: None, session: None, context: 0 };
+        let observation = Observation { frames: vec![frame("top"), frame("child")], id: "s".into(),
+            pages: json!({"pages":[{"items":[{"ref":"a:1"}]},{"items":[{"ref":"b:51"}]}]}),
+            captured: std::time::Instant::now(), screenshot: false, full_page: false, images: Vec::new() };
+        let mut click = parse_action(r#"{"action":"click","frame":0,"ref":"b:51"}"#).unwrap();
+        preflight(&observation, &mut click, None).unwrap();
+        assert!(matches!(click, Action::Click { frame: 1, .. }));
+        let mut fake = parse_action(r#"{"action":"click","frame":0,"ref":"c:1"}"#).unwrap();
+        assert!(preflight(&observation, &mut fake, None).is_err());
     }
 
     #[test]
