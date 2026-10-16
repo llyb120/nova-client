@@ -1619,24 +1619,29 @@ fn inline_summary(pages: &Value, args: &Value, document_path: &Path) -> Value {
     let mut remaining_visible = remaining_text;
     let mut remaining_headings = 20;
     let query = args["query"].as_str().unwrap_or("").trim().to_lowercase();
+    // 有 query 时正文只从命中前 120 字开始，未命中则为空。
+    let around_query = |original: &str| -> String {
+        if query.is_empty() { return original.to_string(); }
+        let lower = original.to_lowercase();
+        lower.find(&query).map(|at| {
+            let start = lower[..at].char_indices().rev().nth(120).map_or(0, |(index, _)| index);
+            lower[start..].to_string()
+        }).unwrap_or_default()
+    };
     if let Some(pages) = result["pages"].as_array_mut() {
         for page in pages {
             let original_text = page["text"].as_str().unwrap_or_default();
-            let matching_text = if query.is_empty() {
-                original_text.to_string()
-            } else {
-                let lower = original_text.to_lowercase();
-                lower.find(&query).map(|at| {
-                    let start = lower[..at].char_indices().rev().nth(120).map_or(0, |(index, _)| index);
-                    lower[start..].to_string()
-                }).unwrap_or_default()
-            };
-            let text: String = matching_text.chars().take(remaining_text).collect();
+            let text: String = around_query(original_text).chars().take(remaining_text).collect();
             let returned_text = text.chars().count();
             remaining_text -= returned_text;
             let mut trimmed = text.len() < original_text.len();
             page["text"] = json!(text);
             if let Some(visible) = page.get_mut("visibleText") {
+                if let Some(original) = visible.as_str().filter(|_| !query.is_empty()) {
+                    let matched = around_query(original);
+                    trimmed |= matched.len() < original.len();
+                    *visible = json!(matched);
+                }
                 trimmed |= truncate_inline_text(visible, remaining_visible);
                 let returned = visible.as_str().unwrap_or_default().chars().count();
                 remaining_visible -= returned;
@@ -1674,6 +1679,20 @@ fn inline_summary(pages: &Value, args: &Value, document_path: &Path) -> Value {
                     // Names, exact fieldContext, states, table columns and all points stay intact.
                     if let Some(region) = object.get_mut("region") { trimmed |= truncate_inline_text(region, 120); }
                 }
+            }
+            // 有 query 时表格只留命中行；表头与行都未命中的表整张省略（documentPath 仍是全量）。
+            if let Some(tables) = page.get_mut("tables").and_then(Value::as_array_mut).filter(|_| !query.is_empty()) {
+                let before = tables.to_vec();
+                tables.retain_mut(|table| {
+                    let header_hit = table["headers"].to_string().to_lowercase().contains(&query);
+                    let rows = table.get_mut("rows").and_then(Value::as_array_mut).map_or(0, |rows| {
+                        rows.retain(|row| row.to_string().to_lowercase().contains(&query));
+                        rows.len()
+                    });
+                    if table.get("returnedRows").is_some() { table["returnedRows"] = json!(rows); }
+                    header_hit || rows > 0
+                });
+                trimmed |= *tables != before;
             }
             if let Some(headings) = page["headings"].as_array_mut() {
                 trimmed |= headings.len() > remaining_headings;
@@ -2462,6 +2481,13 @@ mod tests {
         }
         let searched = inline_summary(&full, &json!({"query":"needle","maxItems":1}), Path::new("full-document.json"));
         assert_eq!(searched["pages"][0]["matchingItems"], 60, "query must see uncut region suffixes");
+        let mut tabled = full.clone();
+        tabled["pages"][0]["tables"] = json!([{"headers":["Name"],"rows":[["a needle"],["other"]],"returnedRows":2},{"headers":["X"],"rows":[["y"]]}]);
+        tabled["pages"][0]["visibleText"] = json!(format!("{} needle tail", "x".repeat(500)));
+        let narrowed = inline_summary(&tabled, &json!({"query":"needle"}), Path::new("full-document.json"));
+        assert_eq!(narrowed["pages"][0]["tables"], json!([{"headers":["Name"],"rows":[["a needle"]],"returnedRows":1}]));
+        let visible = narrowed["pages"][0]["visibleText"].as_str().unwrap();
+        assert!(visible.ends_with("needle tail") && visible.len() < 200);
         assert_eq!(searched["pages"][0]["items"].as_array().unwrap().len(), 1);
         let canvas = inline_summary(&full, &json!({"query":"Canvas","maxItems":1}), Path::new("full-document.json"));
         assert_eq!(canvas["pages"][1]["items"], full["pages"][1]["items"]);
