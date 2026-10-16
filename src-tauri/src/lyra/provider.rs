@@ -1662,10 +1662,11 @@ fn anthropic_body(
         if retention == "long" && (official || model.supports_long_cache_retention) {
             cache["ttl"] = json!("1h");
         }
-        if let Some(last) = body["system"].as_array_mut().and_then(|blocks| blocks.last_mut()) {
+        // 用 get_mut：`body["tools"]` 的 IndexMut 会插入 null，无工具请求（如摘要）就被拒为 tools must be an array。
+        if let Some(last) = body.get_mut("system").and_then(Value::as_array_mut).and_then(|blocks| blocks.last_mut()) {
             last["cache_control"] = cache.clone();
         }
-        if let Some(last) = body["tools"].as_array_mut().and_then(|tools| tools.last_mut()) {
+        if let Some(last) = body.get_mut("tools").and_then(Value::as_array_mut).and_then(|tools| tools.last_mut()) {
             last["cache_control"] = cache.clone();
         }
         // 与 pi 一致：只在末条 user/system 的末块落断点，不改写 assistant 思考签名。
@@ -2734,6 +2735,7 @@ mod tests {
         assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
         let empty = anthropic_body(&model, "", &[], &[], None);
         assert_eq!(empty["messages"], json!([]));
+        assert!(empty.get("tools").is_none() && empty.get("system").is_none(), "无工具时不能发 tools: null");
         model.id = "claude-haiku-5-5[1m]".into();
         assert_eq!(anthropic_body(&model, "", &[], &[], None)["model"], "claude-haiku-5-5", "中转不认 [1m] 后缀");
         // provider 级配置在切换协议后也不能泄漏客户端字段。
