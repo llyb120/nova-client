@@ -15,8 +15,8 @@ use windows_sys::Win32::{
 };
 
 /// 会话回合仍在运行时保持（模型看图思考、两次剑来调用之间不断开）；回合结束即收起。
-/// 回合还在跑但这么久没再碰桌面，说明已转去做别的事，也收起。
-const IDLE_CAP: Duration = Duration::from_secs(180);
+/// 回合还在跑但这么久没再碰桌面，说明已转去做别的事（或卡住），也收起。
+const IDLE_CAP: Duration = Duration::from_secs(60);
 /// 外部 MCP 调用方不是 Nova 会话，看不到回合状态，只能按时间保持。
 const EXTERNAL_LINGER: Duration = Duration::from_secs(20);
 const TICK: Duration = Duration::from_millis(500);
@@ -36,19 +36,20 @@ pub(crate) fn init(app: &AppHandle) {
     restore_cursor();
 }
 
-fn wake(hold: bool) {
+/// 只看窗口列表/截图不算接手：只给已点亮的光效续期，从不点亮。
+pub(crate) fn touch() {
     let mut s = STATE.lock().unwrap();
-    if hold { s.holds += 1; } else { s.last = Some(Instant::now()); }
+    if s.watching { s.last = Some(Instant::now()); }
+}
+
+/// 剑来拿到输入闸门（真正要动鼠标键盘/切窗）时才点亮；整批输入期间都保持，外部调用方也不会中途熄灭。
+/// 显示在后台线程完成，从不阻塞工具。
+pub(crate) fn hold() {
+    let mut s = STATE.lock().unwrap();
+    s.holds += 1;
     s.generation += 1;
     if !s.watching { s.watching = true; std::thread::spawn(watch); }
 }
-
-/// 剑来的任意一次调用（第一次观察就算）都点亮：模型还在看图时用户已经知道剑来接手了。
-/// 后台模式不碰用户的指针与前台，也不点亮。显示在后台线程完成，从不阻塞工具。
-pub(crate) fn touch() { wake(false); }
-
-/// 剑来拿到输入闸门时调用；整批输入期间都保持，外部调用方也不会中途熄灭。
-pub(crate) fn hold() { wake(true); }
 
 pub(crate) fn release() {
     let mut s = STATE.lock().unwrap();
@@ -245,8 +246,10 @@ mod tests {
     fn glow_follows_the_turn_not_each_call() {
         let s = Duration::from_secs;
         assert!(wanted(1, s(999), false, true), "正在输入");
-        assert!(wanted(0, s(60), true, true), "回合仍在跑：调用之间不断开");
-        assert!(!wanted(0, s(200), true, true), "回合在跑但久未操作桌面");
+        assert!(wanted(0, s(30), true, true), "回合仍在跑：调用之间不断开");
+        assert!(!wanted(0, s(90), true, true), "回合在跑但久未操作桌面");
+        touch();
+        assert!(!STATE.lock().unwrap().watching, "只观察不点亮");
         assert!(!wanted(0, s(0), false, true), "回合结束立即收起");
         assert!(wanted(0, s(10), false, false) && !wanted(0, s(30), false, false), "外部调用方按时间");
     }

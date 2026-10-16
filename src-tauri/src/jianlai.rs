@@ -1507,8 +1507,8 @@ fn has_target(args: &Value) -> bool {
 
 pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
     let args = tolerate_slips(args);
-    // 第一次调用（通常是 windows 观察）就点亮边缘呼吸光效与剑形指针：模型还在看图时，
-    // 用户已经知道剑来接手了。后台模式不碰用户的指针与前台，经验读写不操作桌面，都不点亮。
+    // 观察只给已点亮的光效续期；真正点亮在拿到输入闸门时（act/activate）。
+    // 后台模式不碰用户的指针与前台，经验读写不操作桌面，都不续期。
     #[cfg(windows)]
     if args["background"] != json!(true) && !crate::tool_experience::is_operation(&args) {
         crate::agent_glow::touch();
