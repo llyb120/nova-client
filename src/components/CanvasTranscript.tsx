@@ -2102,20 +2102,25 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.fillText(text, snap(x), snap(y));
   }
 
-  function paintAll() {
+  function paintAll(committed = false) {
     const canvas = canvasEl;
     if (!canvas || disposed || holdingFrame) return;
+    // 所有滚动入口（滚轮、滚动条、时间线、钉底）都经过这里；按需唤醒屏外组。
+    if (groupYs.length) {
+      const first = groupAtY(groupYs, scrollY);
+      const last = groupAtY(groupYs, scrollY + viewH);
+      if (first < laidOutStart || last >= laidOutEnd) {
+        scheduleRebuild(false, true);
+        // 目标视口还没排版（如上翻浏览时发送、钉底跳到末尾）：保留旧像素等新布局提交，
+        // 否则先画一帧空白再重新渲染。布局提交时的绘制不受此限，避免互等。
+        if (!committed) return;
+      }
+    }
     // 修改位图尺寸会立即清屏，必须与可提交布局的绘制放在同一帧。
     const pixelW = Math.max(1, Math.round(viewW * dpr));
     const pixelH = Math.max(1, Math.round(viewH * dpr));
     if (canvas.width !== pixelW) canvas.width = pixelW;
     if (canvas.height !== pixelH) canvas.height = pixelH;
-    // 所有滚动入口（滚轮、滚动条、时间线、钉底）都经过这里；按需唤醒屏外组。
-    if (groupYs.length) {
-      const first = groupAtY(groupYs, scrollY);
-      const last = groupAtY(groupYs, scrollY + viewH);
-      if (first < laidOutStart || last >= laidOutEnd) scheduleRebuild(false, true);
-    }
     // 前景保持透明，只清空并重绘正文；星图背景由下层 canvas 保留，不再随滚动反复拷贝。
     const ctx = canvas.getContext("2d")!;
     const p = pal;
@@ -3737,7 +3742,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       applyEditStyle();
       props.onScroll?.(scrollY, maxScroll, false);
       holdingFrame = false;
-      paintAll();
+      paintAll(true);
       // 仅在切换后有实际内容时收尾；缓存未命中会先空布局一帧，不能误清零起点。
       if (props.groups.length > 0) traceThreadSwitchLayoutDone(props.threadId, props.groups.length);
     } finally {

@@ -16,7 +16,7 @@ import { prewarmAttachmentImages } from './src/components/ImageAttachmentStrip';
 import './src/app.css';
 const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400"><rect width="800" height="400" fill="blue"/></svg>';
 const image = {name:'pic',mimeType:'image/svg+xml',data:btoa(svg),size:svg.length};
-const hist = Array.from({length:8},(_,i)=>({user:{type:'user',id:i*3+1,text:'q'+i,images:[],ts:0},
+const hist = Array.from({length:40},(_,i)=>({user:{type:'user',id:i*3+1,text:'q'+i,images:[],ts:0},
   body:[{type:'assistant',id:i*3+2,text:'answer '.repeat(80),ts:0}],turn:{type:'turn',id:i*3+3,ts:0,stopReason:'end'}}));
 const [groups, setGroups] = createSignal(hist);
 let handle; window.frames = [];
@@ -25,9 +25,9 @@ const mine = c => c.canvas.classList.contains('transcript-canvas-only');
 CanvasRenderingContext2D.prototype.clearRect = function(...a) { if (mine(this)) window.frames.push({h:this.canvas.height,texts:[]}); return clear.apply(this,a); };
 CanvasRenderingContext2D.prototype.fillText = function(...a) { if (mine(this)) window.frames.at(-1)?.texts.push(a[0]); return fill.apply(this,a); };
 window.attach = () => prewarmAttachmentImages([image]);
-window.send = () => {
+window.send = (text = 'new message') => {
   window.frames = [];
-  setGroups([...hist, {user:{type:'user',id:-1,text:'new message',images:[{...image}],ts:1},body:[]}]);
+  setGroups([...groups(), {user:{type:'user',id:-groups().length,text,images:[{...image}],ts:1},body:[],turn:{type:'turn',id:-1000-groups().length,ts:0,stopReason:'end'}}]);
   document.getElementById('fx').style.height = '680px';
 };
 render(() => {
@@ -56,7 +56,7 @@ render(() => {
   const errors = [];
   page.on("pageerror", error => errors.push(error.message));
   await page.goto(`http://127.0.0.1:${port}/${name}.html`, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForFunction(() => window.frames.at(-1)?.texts.includes("q7"), null, { timeout: 60000 });
+  await page.waitForFunction(() => window.frames.at(-1)?.texts.includes("q39"), null, { timeout: 60000 });
   await page.evaluate(() => window.attach());
   await page.waitForTimeout(200);
   await page.evaluate(() => window.send());
@@ -65,6 +65,15 @@ render(() => {
   const tall = frames.filter(frame => frame.h === 680);
   assert.ok(tall.length && tall.every(frame => frame.texts.includes("new message")),
     "After the composer collapses, no frame may show the shifted old transcript without the sent message");
+
+  // 上翻浏览时发送会钉底跳到未排版的末尾，只能保留旧像素等新布局，不能先画一帧空白。
+  await page.mouse.move(500, 300);
+  for (let i = 0; i < 15; i++) { await page.mouse.wheel(0, -600); await page.waitForTimeout(50); }
+  await page.waitForTimeout(300);
+  await page.evaluate(() => window.send("second message"));
+  await page.waitForFunction(() => window.frames.at(-1)?.texts.includes("second message"), null, { timeout: 2000 });
+  assert.ok((await page.evaluate(() => window.frames)).every(frame => frame.texts.length > 0),
+    "Jumping to an unlaid-out bottom must keep the old pixels instead of painting a blank frame");
   assert.deepEqual(errors, []);
   console.log("Canvas send image regression passed");
 } finally {
