@@ -280,7 +280,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         // 转换规则升级：旧缓存缺少模型私有参数，不能继续沿用六小时。
         let headers = provider["options"]["headers"].to_string();
         let local_models = if local_source(preset.id).is_some() { provider["models"].to_string() } else { String::new() };
-        let print = fingerprint(&["6", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
+        let print = fingerprint(&["7", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
         let entry = &cache[id.as_str()];
         if !force
             && entry["fingerprint"] == print.as_str()
@@ -539,9 +539,14 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_i
         }
         out.insert(id.to_string(), model);
     }
-    // 变体（如 deepseek-v4-flash-fast）常缺模态、输出上限等元数据，缺什么沿用原模型；1M 变体不继承上下文。
+    // 变体（如 deepseek-v4-flash-fast）常缺模态、输出上限等元数据，缺什么沿用原模型；1M 变体的上下文按变体本身（缺省 1M）。
     let ids: Vec<String> = out.keys().cloned().collect();
     for id in ids {
+        let model = out.get_mut(&id).unwrap();
+        if (id.ends_with("[1m]") || id.ends_with("-1m")) && model.pointer("/limit/context").is_none() {
+            if !model["limit"].is_object() { model["limit"] = json!({}); }
+            model["limit"]["context"] = json!(1_000_000);
+        }
         let Some(base) = variant_base(&id).and_then(|b| out.get(b)).cloned() else { continue };
         let model = out.get_mut(&id).unwrap();
         for field in ["modalities", "reasoning", "options", "variants"] {
@@ -549,9 +554,8 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_i
                 if let Some(value) = base.get(field) { model[field] = value.clone(); }
             }
         }
-        let long = id.ends_with("[1m]") || id.ends_with("-1m");
         for key in ["context", "output"] {
-            if (key == "output" || !long) && model.pointer(&format!("/limit/{key}")).is_none() {
+            if model.pointer(&format!("/limit/{key}")).is_none() {
                 if let Some(value) = base.pointer(&format!("/limit/{key}")) {
                     if !model["limit"].is_object() { model["limit"] = json!({}); }
                     model["limit"][key] = value.clone();
@@ -993,6 +997,7 @@ env_key = "TEST_KEY"
                 for field in ["reasoning", "variants", "options"] {
                     assert_eq!(models[&id][field], models[base][field], "{id}: {field}");
                 }
+                assert_eq!(models[&id]["limit"]["context"], 1_000_000, "{id}: 1M 变体上下文按变体");
                 let config = json!({"provider":{"local":imported["provider"]}});
                 let choices = super::super::config::model_options(&config);
                 if base == "claude-haiku-4-5" {
