@@ -333,7 +333,7 @@ fn open_inner(app: &AppHandle) -> Result<(), String> {
         if current_capture(&capture.context.capture_id) {
             app.emit_to(WINDOW, "meteor:open", &capture.context).map_err(|e| e.to_string())?;
             window.show().map_err(|e| e.to_string())?;
-            window.set_focus().map_err(|e| e.to_string())?;
+            focus(&window)?;
         }
         return Ok(());
     }
@@ -362,7 +362,7 @@ fn open_inner(app: &AppHandle) -> Result<(), String> {
         ensure_allowed()?;
         if !current_capture(&capture.context.capture_id) { return Ok(()); }
         window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())?;
+        focus(&window)?;
         if capture.context.clipboard {
             let reference = capture.clone();
             tauri::async_runtime::spawn_blocking(move || {
@@ -373,6 +373,15 @@ fn open_inner(app: &AppHandle) -> Result<(), String> {
     })();
     if result.is_err() { dismiss(app); }
     result
+}
+
+/// tao's set_focus falls back to tapping a lone Alt to steal the foreground. That tap lands in the
+/// overlay and opens its (invisible) system menu, so the first Esc only closes that menu.
+fn focus(window: &WebviewWindow) -> Result<(), String> {
+    #[cfg(windows)]
+    return platform::activate(window);
+    #[cfg(not(windows))]
+    window.set_focus().map_err(|e| e.to_string())
 }
 
 fn stabilize_overlay(window: &WebviewWindow, origin: (i32, i32), width: u32, height: u32, capture_id: &str) -> Result<(), String> {
@@ -469,7 +478,7 @@ pub(crate) async fn meteor_submit(app: AppHandle, window: WebviewWindow, capture
     if result.is_err() && ensure_allowed().is_ok() && current_capture(&capture_id) {
         // Preserve the request on recoverable failures. No event/reset is sent for the same captureId.
         let _ = window.show();
-        let _ = window.set_focus();
+        let _ = focus(&window);
     }
     SUBMITTING.store(false, Ordering::Release);
     if ensure_allowed().is_err() { dismiss(&app); }
@@ -723,7 +732,8 @@ mod platform {
         UI::{
             Input::{GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
                 RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD},
-            Input::KeyboardAndMouse::{GetAsyncKeyState, SendInput, INPUT, INPUT_MOUSE},
+            Input::KeyboardAndMouse::{GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+                KEYBDINPUT, KEYEVENTF_KEYUP, VK_LMENU},
             WindowsAndMessaging::*,
         },
     };
@@ -801,6 +811,21 @@ mod platform {
         Ok(())
     }
 
+    pub(super) fn activate(window: &WebviewWindow) -> Result<(), String> {
+        let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as usize;
+        // Queued on the UI thread after show(), like allow_capture.
+        window.run_on_main_thread(move || unsafe {
+            let hwnd = hwnd as HWND;
+            if SetForegroundWindow(hwnd) != 0 { return; }
+            // tao's foreground-lock bypass, but vkE8 (unassigned; AutoHotkey's menu mask key) turns the
+            // Alt tap into a chord, so no window enters menu mode.
+            let key = |vk: u16, up: bool| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT {
+                wVk: vk, wScan: 0, dwFlags: if up { KEYEVENTF_KEYUP } else { 0 }, time: 0, dwExtraInfo: 0 } } };
+            let inputs = [key(VK_LMENU, false), key(0xE8, false), key(0xE8, true), key(VK_LMENU, true)];
+            SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32);
+            SetForegroundWindow(hwnd);
+        }).map_err(|e| e.to_string())
+    }
     pub(super) fn foreground() -> isize { unsafe { GetForegroundWindow() as isize } }
     pub(super) fn restore_foreground(window: isize) {
         unsafe {
