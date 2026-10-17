@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
-// Only hydrate paths returned by Nova's authenticated webview service, never tool arguments/page text.
-export async function webviewMcpResult(text) {
+// Only hydrate paths returned by Nova's authenticated automation service, never tool arguments/page text.
+export async function automationMcpResult(text) {
   const content = [{ type: 'text', text }];
   let result;
   try { result = JSON.parse(text); } catch { return { content }; }

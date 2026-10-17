@@ -121,9 +121,6 @@ export default function App() {
     // Butterfly 面板「知识图谱」：切到图谱页。
     void listen<{ view: "knowledge" }>("nova:open-view", event => { closeThread(); setView(event.payload.view); })
       .then(remove => { if (disposed) remove(); else unlistens.push(remove); });
-    void listen<{ threadId: string }>("native-browser:open", event => {
-      if (event.payload.threadId === state.currentId) setWorkspaceLayout({ open: true, mode: "browser" });
-    }).then(remove => { if (disposed) remove(); else unlistens.push(remove); });
     onCleanup(() => {
       disposed = true;
       for (const unlisten of unlistens) unlisten();

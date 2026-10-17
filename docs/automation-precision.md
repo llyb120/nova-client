@@ -1,6 +1,6 @@
 # 剑来 / Chrome 精准交互与 Canvas 观察
 
-本补丁的基线是 `pre-release` 提交 `9798b86d66b8b7b8822c3d26a92cf838d6efb03d`。Chrome 与内置 WebView 共用 `native_browser` 引擎；剑来仍是纯系统输入和截图工具。没有引入生产环境 Playwright、OCR、辅助模型、任意页面脚本执行接口，也没有调整扩展权限或删除会话历史。
+本补丁的基线是 `pre-release` 提交 `9798b86d66b8b7b8822c3d26a92cf838d6efb03d`。Chrome 使用 `native_browser` 引擎；剑来仍是纯系统输入和截图工具。没有引入生产环境 Playwright、OCR、辅助模型、任意页面脚本执行接口，也没有调整扩展权限或删除会话历史。
 
 ## 定位与输入的执行条件
 
@@ -94,7 +94,7 @@ WebGL 页面可以沿同样的截图/坐标路径处理，但本次执行环境�
 - 写入：`type` 后 `Enter`/`Tab` 提交；`F2` 编辑已有值。
 - 读取：选中区域后 `press Ctrl+C`。批次内系统剪贴板序号变化时，act 结果附 `clipboard:{text,truncated,rows}`（TSV，最多10万字符），只回传本批复制产生的内容，不读用户原有剪贴板。
 
-chrome/webview 的 `press` 支持 Ctrl/Shift/Alt/Meta 与字母、数字、F1–F12、命名键的组合；Ctrl+C/X/V 附带 CDP 编辑命令，否则合成按键不会触发浏览器复制粘贴。剑来按键同时接受 `ArrowDown` 与 `down`。剪贴板回传目前仅 Windows。
+chrome 的 `press` 支持 Ctrl/Shift/Alt/Meta 与字母、数字、F1–F12、命名键的组合；Ctrl+C/X/V 附带 CDP 编辑命令，否则合成按键不会触发浏览器复制粘贴。剑来按键同时接受 `ArrowDown` 与 `down`。剪贴板回传目前仅 Windows。
 
 ## 剑来：局部细看与实际落点校验
 

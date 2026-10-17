@@ -4,7 +4,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
-import { webviewMcpResult } from './webview-mcp-result.mjs';
+import { automationMcpResult } from './automation-mcp-result.mjs';
 import {
   createNovaBatchTools,
   normalizePolarisArgs,
@@ -25,21 +25,21 @@ function withContextService(run) {
   }
 }
 
-test('webview sends native MCP images without putting base64 in text; failures preserve action status', async () => {
+test('automation sends native MCP images without putting base64 in text; failures preserve action status', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'nova-mcp-image-'));
   try {
     const path = join(dir, 'shot.png');
     const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZioAAAAASUVORK5CYII=', 'base64');
     await writeFile(path, bytes);
     const text = JSON.stringify({status:'executed',snapshotId:'fresh',images:[{path},{path:join(dir,'missing.png')}]});
-    const result = await webviewMcpResult(text);
+    const result = await automationMcpResult(text);
     assert.equal(result.content[0].text,text);
     assert.equal(result.content[1].type,'image');
     assert.deepEqual(Buffer.from(result.content[1].data,'base64'),bytes);
     assert.match(result.content[2].text,/图片加载失败/);
     assert.equal(JSON.parse(result.content[0].text).status,'executed');
-    assert.deepEqual(await webviewMcpResult('not ready'),{content:[{type:'text',text:'not ready'}]});
-    const desktop = await webviewMcpResult(JSON.stringify({images:Array.from({length:16},(_,i)=>({path,imageId:`monitor-${i}`}))}));
+    assert.deepEqual(await automationMcpResult('not ready'),{content:[{type:'text',text:'not ready'}]});
+    const desktop = await automationMcpResult(JSON.stringify({images:Array.from({length:16},(_,i)=>({path,imageId:`monitor-${i}`}))}));
     assert.equal(desktop.content.filter(part=>part.type==='image').length,16);
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
@@ -55,7 +55,7 @@ test("createNovaBatchTools exposes context tools only with the native service", 
     if (previousToken !== undefined) process.env.NOVA_CONTEXT_SERVICE_TOKEN = previousToken;
   }
   const tools = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }));
-  assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "employee", "generate_image", "jianlai", "polaris", "webview"]);
+  assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "employee", "generate_image", "jianlai", "polaris"]);
 });
 
 test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
@@ -63,13 +63,32 @@ test("NOVA_FAST_CONTEXT=0 omits context tools", () => {
   process.env.NOVA_FAST_CONTEXT = "0";
   try {
     const tools = withContextService(() => createNovaBatchTools(process.cwd()));
-    assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "employee", "generate_image", "jianlai", "webview"]);
+    assert.deepEqual(Object.keys(tools).sort(), ["chrome", "edit_image", "employee", "generate_image", "jianlai"]);
     assert.deepEqual(withContextService(() => createNovaBatchTools(process.cwd(), { readOnly: true })), {});
   }
   finally {
     if (previous === undefined) delete process.env.NOVA_FAST_CONTEXT;
     else process.env.NOVA_FAST_CONTEXT = previous;
   }
+});
+
+test("auto scene toolEnv exposes handoff without desktop tools; ordinary and read-only modes do not", () => {
+  withContextService(() => {
+    const toolEnv = { NOVA_THREAD_ID: "scene-thread", NOVA_SCENE_HANDOFF: "1", NOVA_DESKTOP: "0" };
+    const auto = createNovaBatchTools(process.cwd(), { toolEnv, readOnly: false });
+    for (const name of ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "close_agent"]) assert(auto[name], name);
+    for (const name of ["chrome", "jianlai", "webview"]) assert.equal(auto[name], undefined, name);
+    const ordinary = createNovaBatchTools(process.cwd(), {
+      toolEnv: { NOVA_THREAD_ID: "", NOVA_SCENE_HANDOFF: "0", NOVA_DESKTOP: "1" }, readOnly: false,
+    });
+    assert(ordinary.chrome && ordinary.jianlai);
+    assert.equal(ordinary.webview, undefined);
+    const readOnly = createNovaBatchTools(process.cwd(), { toolEnv, readOnly: true });
+    const noThread = createNovaBatchTools(process.cwd(), { toolEnv: { ...toolEnv, NOVA_THREAD_ID: "" } });
+    for (const tools of [ordinary, readOnly, noThread]) {
+      for (const name of ["spawn_agent", "list_agents", "wait_agent", "followup_task", "interrupt_agent", "close_agent"]) assert.equal(tools[name], undefined, name);
+    }
+  });
 });
 
 test("context argument aliases normalize and preserve explicit deep mode", () => {
@@ -140,7 +159,7 @@ test("desktop optimizations are shared by custom tools and MCP, not Lyra-only", 
   try {
     const path = join(dir, 'shot.png');
     await writeFile(path, Buffer.from('PNG'));
-    const result = await webviewMcpResult(JSON.stringify({ source: 'jianlai', status: 'not_executed',
+    const result = await automationMcpResult(JSON.stringify({ source: 'jianlai', status: 'not_executed',
       error: '前台程序已改变', snapshotId: 'new', notes: '已读第1页，测速未确认',
       operation: 'act', basedOnSnapshotId: 'old', observationSequence: 2, historical: false,
       verification: 'unverified',
@@ -172,6 +191,7 @@ test("devin policy routes context through MCP when the native service exists", (
   assert.match(policy, /mcp_call_tool/);
   assert.match(policy, /polaris/);
   assert.match(policy, /Devin native edit tools/);
+  assert.doesNotMatch(policy, /webview/i);
 });
 
 test("directory switching is session scoped, works without polaris, and updates its root only on success", async () => {
@@ -188,7 +208,7 @@ test("directory switching is session scoped, works without polaris, and updates 
       if (!line.includes("\n")) return;
       const request = JSON.parse(line.trim());
       calls.push(request);
-      if (request.params.prompt === "lost response" || ["webview", "chrome", "jianlai"].includes(request.method)) { socket.destroy(); return; }
+      if (request.params.prompt === "lost response" || ["chrome", "jianlai"].includes(request.method)) { socket.destroy(); return; }
       const rejected = request.params.path === "missing";
       socket.end(JSON.stringify(rejected
         ? { ok: false, error: "directory missing" }
@@ -221,19 +241,15 @@ test("directory switching is session scoped, works without polaris, and updates 
     const before = calls.length;
     await assert.rejects(tools.generate_image.execute({ prompt: "lost response" }));
     assert.equal(calls.length, before + 1);
-    const webviewArgs = { operation: "act", browserId: "test-browser", snapshotId: "test-snapshot", action: { action: "press", key: "Enter" } };
-    await assert.rejects(tools.webview.execute(webviewArgs));
-    assert.equal(calls.length, before + 2, "browser mutations must not retry a lost response");
-    assert.equal(calls.at(-1).method, "webview");
-    assert.deepEqual(calls.at(-1).params, webviewArgs);
+    assert.equal(tools.webview, undefined);
     const chromeArgs = { operation: "act", tabTag: "C1-test", snapshotId: "test-snapshot", action: { action: "press", key: "Enter" } };
     await assert.rejects(tools.chrome.execute(chromeArgs));
-    assert.equal(calls.length, before + 3, "Chrome mutations must not retry a lost response");
+    assert.equal(calls.length, before + 2, "Chrome mutations must not retry a lost response");
     assert.equal(calls.at(-1).method, "chrome");
     assert.deepEqual(calls.at(-1).params, chromeArgs);
     const desktopArgs = {operation:'act',snapshotId:'test-snapshot',imageId:'monitor-1',actions:[{action:'press',key:'Enter'}]};
     await assert.rejects(tools.jianlai.execute(desktopArgs));
-    assert.equal(calls.length,before+4,'desktop input must never retry a lost response');
+    assert.equal(calls.length,before+3,'desktop input must never retry a lost response');
     assert.equal(calls.at(-1).method,'jianlai');
     assert.deepEqual(calls.at(-1).params,desktopArgs);
   } finally {

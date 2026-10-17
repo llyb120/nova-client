@@ -2,7 +2,7 @@
 
 支持按任务检索、成功后提炼和复用反馈的本机[操作经验](tool-experiences.md)：`experience_search` / `experience_save` / `experience_feedback`。
 
-扩展独立安装和发布，右侧浏览器始终是 WebView。Agent 使用 webview 操作内置页面，使用 chrome 操作 Chrome，两者可同时使用。
+扩展独立安装和发布。Agent 的浏览器网页操作统一使用 chrome，复用用户 Chrome 的登录态与标签页。
 
 ## 安装
 
@@ -27,7 +27,7 @@
 
 Nova 启动时依次尝试 127.0.0.1:47653–47662，跳过已占用端口。扩展自动发现并连接该范围内的所有 Nova 实例，接收端验证固定扩展 Origin，再使用各实例独立的本机令牌传输命令。断线或新启动实例每 30 秒尝试连接，打开扩展弹窗也会触发发现。
 
-支持同时运行开发版、正式版等多个 Nova，扩展弹窗显示连接数量。命令结果回传给发起它的实例，单条浏览器命令串行执行；多个任务操作同一标签页仍会共享页面状态，建议使用不同标签页。WebView 不依赖这些端口。显式设置 NOVA_CHROME_PORT 时只监听指定端口（0 表示系统分配，供测试使用），扩展仅自动发现上述默认范围。
+支持同时运行开发版、正式版等多个 Nova，扩展弹窗显示连接数量。命令结果回传给发起它的实例，单条浏览器命令串行执行；多个任务操作同一标签页仍会共享页面状态，建议使用不同标签页。显式设置 NOVA_CHROME_PORT 时只监听指定端口（0 表示系统分配，供测试使用），扩展仅自动发现上述默认范围。
 
 多实例连接需要 Nova 和 Chrome 扩展同步更新，已安装的扩展请更新至 0.1.4，并在 chrome://extensions 重新加载。
 
@@ -47,7 +47,7 @@ Chrome API 不提供可靠的来源标签 ID，所以结果标记 `scope:browser
 
 运行 node --test extensions/nova-chrome/worker.test.mjs scripts/nova-tools-mcp.test.mjs。
 Rust 检查使用 cargo test 的 chrome_browser::tests。
-集成脚本 node scripts/native-browser-smoke.mjs 使用独立 Nova/WebView2 与模拟扩展，验证握手和共享操作引擎。真实 Chrome 端到端验证需加载扩展后进行。
+Windows 集成脚本 `node scripts/native-browser-smoke.mjs src-tauri/target/debug/nova.exe` 使用隔离 Nova 配置、独立无头 Chromium fixture 与模拟扩展，验证握手、DOM 输入、图片回传、缩放/裁剪坐标和陈旧画面拒绝；不依赖已移除的内置浏览器。`TEST_BROWSER` 可指定 Chromium/Chrome/Edge 可执行文件，Playwright 仅作测试驱动。真实 Chrome 扩展端到端验证需另行加载扩展。
 
 0.1.2 修复 Chrome 扩展 auto-attach-only 模式下直接发现/附加 Target 返回 Not allowed 的问题，改用 Target.setAutoAttach 和子会话事件，支持嵌套 iframe。Chrome 自身限制的内部页面仍受浏览器限制。
 

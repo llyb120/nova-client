@@ -2,7 +2,7 @@
 
 支持按任务检索、成功后提炼和复用反馈的本机[操作经验](tool-experiences.md)：`experience_search` / `experience_save` / `experience_feedback`。
 
-系统级桌面工具，和 `chrome` / `webview` 并存。通过 Enigo 注入原生鼠标键盘事件，通过 XCap 获取程序窗口和显示器截图；不使用 Playwright、DOM 或辅助模型。
+系统级桌面工具，和 `chrome` 并存；浏览器网页操作仅用 `chrome`。通过 Enigo 注入原生鼠标键盘事件，通过 XCap 获取程序窗口和显示器截图；不使用 Playwright、DOM 或辅助模型。
 
 - `windows`：列出程序名称、窗口标题、PID、windowId、尺寸及monitorId；1x1等辅助窗口不适合交互。
 - `screenshot`：优先传 windowId 截目标窗口；省略则返回全部显示器独立图片（最多16屏）；已知monitorId时可只截一屏，不能同时传windowId。默认长边最多1600像素；`maxEdge: 0` 使用原分辨率，否则允许640–3840。

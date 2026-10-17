@@ -29,7 +29,6 @@ fn available_tools() -> Vec<Value> {
     if std::env::var("NOVA_FAST_CONTEXT").as_deref() != Ok("0") { tools.push(tool()); }
     if std::env::var("NOVA_TOOLS_READ_ONLY").as_deref() != Ok("1") {
         tools.extend(crate::image_generation::tool_definitions());
-        tools.push(crate::native_browser::tool_definition());
         tools.push(crate::chrome_browser::tool_definition());
         tools.push(crate::jianlai::tool_definition());
         tools.push(crate::employee::tool_definition());
@@ -146,8 +145,10 @@ mod desktop_tests {
         assert_eq!(result["content"].as_array().unwrap().len(), 17);
         assert!(result["content"][0]["text"].as_str().unwrap().contains("not_executed"));
         assert_eq!(result["content"][1]["type"], "image");
+        let tools = super::available_tools();
+        assert!(!tools.iter().any(|t| t["name"] == "webview"));
         if std::env::var("NOVA_TOOLS_READ_ONLY").as_deref() != Ok("1") {
-            assert!(super::available_tools().iter().any(|t| t["name"] == "jianlai"));
+            for name in ["jianlai", "chrome"] { assert!(tools.iter().any(|t| t["name"] == name)); }
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -167,7 +168,7 @@ async fn tool_result(name: &str, result: Result<Value, String>) -> Value {
     };
     let text = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
     let mut content = vec![json!({"type":"text","text":text})];
-    if matches!(name, "webview" | "chrome" | "jianlai") {
+    if matches!(name, "chrome" | "jianlai") {
         use base64::Engine;
         if let Some(images) = value["images"].as_array() {
             // Paths originate from the authenticated native service, not the caller or page text.
@@ -269,15 +270,15 @@ pub(crate) fn maybe_run() -> bool {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn webview_screenshot_is_an_image_block_and_keeps_action_status() {
+    async fn chrome_screenshot_is_an_image_block_and_keeps_action_status() {
         let path = std::env::temp_dir().join(format!("nova-mcp-{}.png", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"image-bytes").unwrap();
-        let result = tool_result("webview", Ok(json!({"status":"executed","images":[{"path":path}]}))).await;
+        let result = tool_result("chrome", Ok(json!({"status":"executed","images":[{"path":path}]}))).await;
         std::fs::remove_file(&path).unwrap();
         assert_eq!(result["content"][1]["type"], "image");
         assert_eq!(result["content"][1]["data"], "aW1hZ2UtYnl0ZXM=");
         assert_eq!(serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap()["status"], "executed");
-        assert_eq!(tool_result("webview", Err("stopped".into())).await["isError"], true);
+        assert_eq!(tool_result("chrome", Err("stopped".into())).await["isError"], true);
     }
     #[tokio::test]
     async fn native_mcp_forwards_image_arguments_and_result() {

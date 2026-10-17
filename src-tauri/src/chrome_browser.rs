@@ -160,7 +160,7 @@ pub(crate) async fn connect(app: &AppHandle) -> Result<Value, String> {
     let config = state.config.lock().unwrap();
     let (port, _, _) = config.as_ref().unwrap();
     Ok(
-        json!({"connected":state.connected(),"origin":format!("http://127.0.0.1:{port}"),"extensionId":EXTENSION_ID,"next":"独立 Nova Chrome 扩展会自动连接本机 Nova，在扩展中勾选允许控制的标签。chrome 和右侧 webview 可同时使用。"}),
+        json!({"connected":state.connected(),"origin":format!("http://127.0.0.1:{port}"),"extensionId":EXTENSION_ID,"next":"独立 Nova Chrome 扩展会自动连接本机 Nova，在扩展中勾选允许控制的标签；浏览器网页操作使用 chrome。"}),
     )
 }
 pub(crate) async fn request(

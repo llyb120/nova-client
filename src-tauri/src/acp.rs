@@ -3804,7 +3804,7 @@ impl AcpManager {
                     guidance.push("Nova auto mode: nova-tools also exposes spawn_agent, wait_agent, list_agents, followup_task, interrupt_agent and close_agent (call them through mcp_call_tool with server_name \"nova-tools\" like the other Nova tools).".into());
                 }
                 if auto_env.iter().any(|(name, value)| *name == "NOVA_DESKTOP" && value == "0") {
-                    guidance.push("In this session jianlai, chrome and webview are not available; hand desktop or browser work off with spawn_agent(scene=\"computer\").".into());
+                    guidance.push("In this session jianlai and chrome are not available; hand desktop or browser work off with spawn_agent(scene=\"computer\").".into());
                 }
             }
         }
@@ -5031,9 +5031,10 @@ mod codebuddy_acp_tests {
         assert_eq!(expanded[0]["options"][0]["value"], "sonnet:medium");
         assert_eq!(super::expand_acp_effort_options(&expanded, "effort"), expanded);
         let server = codebuddy_nova_tools_mcp_server_value("node", "nova-tools.mjs", "/repo", "fast", false, "endpoint", "token");
-        for tool in ["polaris", "webview", "chrome", "jianlai", "generate_image", "edit_image"] {
+        for tool in ["polaris", "chrome", "jianlai", "generate_image", "edit_image"] {
             assert_eq!(server["_meta"]["tools"][tool]["defer_loading"], false);
         }
+        assert!(server["_meta"]["tools"].get("webview").is_none());
     }
 
     #[test]
@@ -5765,7 +5766,6 @@ fn codebuddy_nova_tools_mcp_server_value(
     if !read_only {
         meta["tools"]["generate_image"] = json!({ "defer_loading": false });
         meta["tools"]["edit_image"] = json!({ "defer_loading": false });
-        meta["tools"]["webview"] = json!({ "defer_loading": false });
         meta["tools"]["chrome"] = json!({ "defer_loading": false });
         meta["tools"]["jianlai"] = json!({ "defer_loading": false });
     }
@@ -6012,6 +6012,7 @@ mod nova_tools_config_tests {
         assert!(guidance.contains("do not call mcp_list_tools merely to discover them"));
         assert!(guidance.contains("Never repeat a malformed call unchanged"));
         assert!(guidance.contains("Prefer minimal reads via Devin native read"));
+        assert!(!guidance.contains("webview"));
         assert!(!guidance.contains("never invent arbitrary 100/200-line pages"));
         assert!(!guidance.contains("merge them into one read_files"));
     }
@@ -6050,7 +6051,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
     if polaris {
         tool_names.extend(["polaris"]);
     }
-    if !read_only { tool_names.extend(["generate_image", "edit_image", "webview", "chrome", "jianlai", "employee"]); }
+    if !read_only { tool_names.extend(["generate_image", "edit_image", "chrome", "jianlai", "employee"]); }
     if tool_names.is_empty() {
         let mut lines = vec![
             "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."
@@ -6095,7 +6096,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
     if !read_only {
         lines.push(r#"jianlai act arguments={"operation":"act","snapshotId":"<latest returned snapshotId>","actions":[{"action":"type","text":"<text>"},{"action":"press","key":"Enter"}]}. Each item uses the key action (not type). Actions: click/double_click/move(x,y), drag(x,y,toX,toY), scroll(x,y,delta), type(text), press(key), wait(ms:0–2000); text/key are not action names. If focused:false, call activate(windowId) and use its fresh snapshotId before constructing a long input batch. Consult the selected tool schema when unsure rather than probe with invalid calls or regenerate the full payload."#.into());
         lines.push(r#"chrome arguments={"operation":"act","tabTag":"<tabs[].tag or the tabTag returned by open>","snapshotId":"<latest returned snapshotId>","actions":[{"action":"click","frame":0,"ref":"<items[].ref copied verbatim>"}]}. The target field is tabTag, never tabId/browserId; one tabs call with query binds it and returns the inspect. DOM actions need frame plus a ref copied verbatim from the latest inspect; coordinate actions are click_at/move/drag/scroll_at with x/y plus the top-level imageId. Never mix chrome shapes into jianlai (no frame/ref/tabTag there) or jianlai shapes into chrome (no toX/toY/press-with-text there)."#.into());
-        lines.push("Desktop routing: 剑来 means the jianlai desktop mouse/keyboard/screenshot tool, not a shell command. When the user requests 剑来/jianlai, start with ONE call mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"jianlai\",\"arguments\":{\"operation\":\"windows\",\"observe\":true}} (add \"query\":\"<app or title>\" or \"windowId\" to bind the target) — it returns the window list AND the target screenshot, verify the observed target is in the foreground before act; a background target must first be switched with {\"operation\":\"activate\",\"windowId\":<id>} (returns a fresh screenshot). Execute the longest sequence determined by the current observation in one act (up to 16), ending at the first information boundary. Put navigation, dropdown opening or a focus/layout transition last when the next action depends on its result. Use returned feedback directly: if it matches expectations, continue with its fresh snapshotId without redundant inspect/screenshot or replanning. On partial failure, check completedActions and the fresh observation; never replay completed actions. Chrome forms use consecutive fill actions in one batch; jianlai can batch a confirmed field click, select-all and whole-text input. An information boundary means the next step lacks necessary evidence, not every click. Do not pad batches or use waits to guess unseen content. Experience search/save/feedback are optional: use them only for unfamiliar paths, blockers or reusable new knowledge, never as mandatory per-task round trips. Verify the visible outcome when the task finishes. Use jianlai only for what truly needs the GUI: view local images/files with the file read tool, get processes, files, system info or anything a command returns with shell, and Chrome page content with chrome. While operating a GUI, never use shell, COM, PowerShell, P/Invoke, UIAutomation or scripts to activate/control apps. Switch background windows with jianlai activate(windowId); only if activate is refused, inspect the desktop and click a visible taskbar icon or use Win+Tab; do not blindly cycle windows. If the endpoint is missing, report the MCP error rather than silently switching methods. webview controls Nova's sidebar browser; chrome controls the user's Chrome. Division of labor: web page content inside a Chrome tab → chrome (DOM refs; tabs with query binds a tabTag and returns the inspect in one call; open/goto/select_tab wait for load and return the inspect; act waits for navigation before feeding back). Other apps and Chrome's native dialogs (file picker, print, system prompts) → jianlai. They share one physical screen: NEVER call chrome and jianlai in parallel; after switching tools, re-observe before acting (chrome navigation/act retires the jianlai snapshot; a jianlai act that touched Chrome requires a fresh chrome inspect).".into());
+        lines.push("Desktop routing: 剑来 means the jianlai desktop mouse/keyboard/screenshot tool, not a shell command. When the user requests 剑来/jianlai, start with ONE call mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"jianlai\",\"arguments\":{\"operation\":\"windows\",\"observe\":true}} (add \"query\":\"<app or title>\" or \"windowId\" to bind the target) — it returns the window list AND the target screenshot, verify the observed target is in the foreground before act; a background target must first be switched with {\"operation\":\"activate\",\"windowId\":<id>} (returns a fresh screenshot). Execute the longest sequence determined by the current observation in one act (up to 16), ending at the first information boundary. Put navigation, dropdown opening or a focus/layout transition last when the next action depends on its result. Use returned feedback directly: if it matches expectations, continue with its fresh snapshotId without redundant inspect/screenshot or replanning. On partial failure, check completedActions and the fresh observation; never replay completed actions. Chrome forms use consecutive fill actions in one batch; jianlai can batch a confirmed field click, select-all and whole-text input. An information boundary means the next step lacks necessary evidence, not every click. Do not pad batches or use waits to guess unseen content. Experience search/save/feedback are optional: use them only for unfamiliar paths, blockers or reusable new knowledge, never as mandatory per-task round trips. Verify the visible outcome when the task finishes. Use jianlai only for what truly needs the GUI: view local images/files with the file read tool, get processes, files, system info or anything a command returns with shell, and Chrome page content with chrome. While operating a GUI, never use shell, COM, PowerShell, P/Invoke, UIAutomation or scripts to activate/control apps. Switch background windows with jianlai activate(windowId); only if activate is refused, inspect the desktop and click a visible taskbar icon or use Win+Tab; do not blindly cycle windows. If the endpoint is missing, report the MCP error rather than silently switching methods. Use chrome for browser operations in the user's Chrome. Division of labor: web page content inside a Chrome tab → chrome (DOM refs; tabs with query binds a tabTag and returns the inspect in one call; open/goto/select_tab wait for load and return the inspect; act waits for navigation before feeding back). Other apps and Chrome's native dialogs (file picker, print, system prompts) → jianlai. They share one physical screen: NEVER call chrome and jianlai in parallel; after switching tools, re-observe before acting (chrome navigation/act retires the jianlai snapshot; a jianlai act that touched Chrome requires a fresh chrome inspect).".into());
     }
     if read_only {
         lines.push("Current mode is plan/read-only: analyze only; do not modify files.".into());
@@ -6104,7 +6105,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
 }
 
 fn direct_desktop_guidance() -> &'static str {
-    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、webview（侧栏浏览器）、chrome（用户Chrome）。用户指定剑来时，直接调用工具列表中来自 nova-tools 的 jianlai，第一步用 operation=windows 加 observe=true（可带 query/windowId 绑定目标）一次拿到窗口列表和目标截图，核对目标处于前台后 act；后台窗口先用 operation=activate 加 windowId 切到前台（直接返回新图）。连续执行原则：用当前观察确定最长连续动作段，合批执行到第一个需要新信息的节点（每批最多16个）。下一步的目标、输入或分支依赖新页面、下拉候选、弹窗、焦点或布局变化时，把触发变化的动作放在批末，看返回的观察再决策。反馈符合预期就用新的snapshotId继续，不额外inspect/screenshot或重述计划；达到16个动作上限也按此方式继续。校验失败或needs_review时先核对completedActions和新观察，不重放已执行步骤。信息屏障指下一步缺少必要信息，不是每次点击都停；不凑满批次，不用wait代替观察新内容。经验检索/保存/反馈按需使用，仅用于陌生路径、受阻或新增可复用经验，不作为每个任务的必经往返。任务结束用可见结果验证。Chrome 表单用多个 fill 合批；剑来可合批已确认输入框的点击、全选和整段输入。剑来只用于必须操作图形界面的部分：本地图片/文件直接读文件，进程、文件、系统信息等命令能拿到的用shell，Chrome网页内容用chrome；操作界面时禁止用shell、COM、PowerShell、P/Invoke、UIAutomation或脚本激活/控制窗口。activate 被系统拒绝时才截桌面点可见任务栏图标或Win+Tab，不要盲目循环切换。分工：Chrome 标签页内的网页内容用 chrome（tabs 带 query 可一次绑定并返回 inspect；open/goto/select_tab 会等待加载并直接返回 inspect），其它应用和 Chrome 原生对话框用 jianlai；两者共用一块屏幕，绝不并行调用，换工具后先重新观察。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
+    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、chrome（用户Chrome）。用户指定剑来时，直接调用工具列表中来自 nova-tools 的 jianlai，第一步用 operation=windows 加 observe=true（可带 query/windowId 绑定目标）一次拿到窗口列表和目标截图，核对目标处于前台后 act；后台窗口先用 operation=activate 加 windowId 切到前台（直接返回新图）。连续执行原则：用当前观察确定最长连续动作段，合批执行到第一个需要新信息的节点（每批最多16个）。下一步的目标、输入或分支依赖新页面、下拉候选、弹窗、焦点或布局变化时，把触发变化的动作放在批末，看返回的观察再决策。反馈符合预期就用新的snapshotId继续，不额外inspect/screenshot或重述计划；达到16个动作上限也按此方式继续。校验失败或needs_review时先核对completedActions和新观察，不重放已执行步骤。信息屏障指下一步缺少必要信息，不是每次点击都停；不凑满批次，不用wait代替观察新内容。经验检索/保存/反馈按需使用，仅用于陌生路径、受阻或新增可复用经验，不作为每个任务的必经往返。任务结束用可见结果验证。Chrome 表单用多个 fill 合批；剑来可合批已确认输入框的点击、全选和整段输入。剑来只用于必须操作图形界面的部分：本地图片/文件直接读文件，进程、文件、系统信息等命令能拿到的用shell，Chrome网页内容用chrome；操作界面时禁止用shell、COM、PowerShell、P/Invoke、UIAutomation或脚本激活/控制窗口。activate 被系统拒绝时才截桌面点可见任务栏图标或Win+Tab，不要盲目循环切换。分工：Chrome 标签页内的网页内容用 chrome（tabs 带 query 可一次绑定并返回 inspect；open/goto/select_tab 会等待加载并直接返回 inspect），其它应用和 Chrome 原生对话框用 jianlai；两者共用一块屏幕，绝不并行调用，换工具后先重新观察。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
 }
 
 #[cfg(test)]
@@ -6113,11 +6114,13 @@ mod desktop_prompt_tests {
     fn devin_discovers_desktop_tools_without_polaris() {
         assert!(super::direct_desktop_guidance().contains("直接调用"));
         assert!(super::direct_desktop_guidance().contains("jianlai"));
+        assert!(!super::direct_desktop_guidance().contains("webview"));
         let source = include_str!("acp.rs").replace("\r\n", "\n");
         assert!(source.contains("if self.kind == AgentKind::Devin {\n                guidance.push(nova_tools_prompt_guidance"));
         for polaris in [true, false] {
             let prompt = super::nova_tools_prompt_guidance(polaris, false);
-            for tool in ["jianlai", "chrome", "webview"] {
+            assert!(!prompt.contains("webview"));
+            for tool in ["jianlai", "chrome"] {
                 assert!(prompt.contains(tool));
                 assert!(!super::nova_tools_prompt_guidance(polaris, true).contains(tool));
             }

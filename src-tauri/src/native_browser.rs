@@ -1,6 +1,6 @@
-//! Right sidebar browser. Native WebView2 COM/CDP only; no Playwright or debug port.
+//! Chrome automation engine, using the authenticated extension transport.
 use crate::AppState;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     path::Path,
@@ -10,498 +10,30 @@ use std::{
     },
     time::Duration,
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
-#[cfg(windows)]
-struct Download {
-    thread: String,
-    tab: String,
-    id: String,
-    started: i64,
-    operation: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2DownloadOperation,
-}
-// COM download objects stay on the UI apartment; queries marshal only JSON back.
-#[cfg(windows)]
-thread_local! { static DOWNLOADS: std::cell::RefCell<Vec<Download>> = const { std::cell::RefCell::new(Vec::new()) }; }
-
-async fn downloads(app: &AppHandle, thread: &str, args: &Value) -> Result<Value, String> {
-    let id = match args.get("downloadId") {
-        Some(value) => Some(value.as_str().filter(|v| !v.is_empty() && v.len() <= 80).ok_or("无效 downloadId")?.to_owned()),
-        None => None,
-    };
-    let since = match args.get("since").filter(|_| id.is_none()) {
-        Some(value) => value.as_i64().filter(|v| (0..=8_640_000_000_000_000).contains(v)).ok_or("since 必须为有效的 Unix 毫秒时间戳")?,
-        None => chrono::Utc::now().timestamp_millis() - 600_000,
-    };
-    #[cfg(not(windows))]
-    { let _ = (app, thread, since, id); Err("需要 Windows WebView2".into()) }
-    #[cfg(windows)]
-    {
-        use webview2_com::Microsoft::Web::WebView2::Win32::*;
-        let thread = thread.to_owned();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        app.run_on_main_thread(move || {
-            let result = DOWNLOADS.with(|records| -> Result<Value, String> {
-                let records = records.borrow();
-                let mut items = Vec::new();
-                for record in records.iter().rev().filter(|d| d.thread == thread && id.as_ref().map_or(d.started >= since, |id| d.id == *id)).take(100) {
-                    let read = || -> windows::core::Result<Value> { unsafe {
-                        let op = &record.operation;
-                        let mut state = COREWEBVIEW2_DOWNLOAD_STATE::default();
-                        let mut reason = COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON::default();
-                        let (mut received, mut total) = (0, 0);
-                        op.State(&mut state)?;
-                        op.InterruptReason(&mut reason)?;
-                        op.BytesReceived(&mut received)?;
-                        op.TotalBytesToReceive(&mut total)?;
-                        let mut raw = windows::core::PWSTR::null();
-                        op.ResultFilePath(&mut raw)?;
-                        let path = webview2_com::take_pwstr(raw);
-                        op.Uri(&mut raw)?;
-                        let full_url = webview2_com::take_pwstr(raw);
-                        let url: String = full_url.chars().take(4096).collect();
-                        let state = if state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED { "complete" }
-                            else if state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED { "interrupted" } else { "in_progress" };
-                        Ok(json!({"id":record.id,"tabId":record.tab,"startTime":record.started,
-                            "url":url,"urlTruncated":url.len()!=full_url.len(),"path":path,"state":state,"bytesReceived":received,"totalBytes":total,
-                            "exists":Path::new(&path).is_file(),
-                            "error":if state == "interrupted" {
-                                let reasons = ["NONE", "FILE_FAILED", "FILE_ACCESS_DENIED", "FILE_NO_SPACE", "FILE_NAME_TOO_LONG", "FILE_TOO_LARGE", "FILE_MALICIOUS", "FILE_TRANSIENT_ERROR", "FILE_BLOCKED_BY_POLICY", "FILE_SECURITY_CHECK_FAILED", "FILE_TOO_SHORT", "FILE_HASH_MISMATCH", "NETWORK_FAILED", "NETWORK_TIMEOUT", "NETWORK_DISCONNECTED", "NETWORK_SERVER_DOWN", "NETWORK_INVALID_REQUEST", "SERVER_FAILED", "SERVER_NO_RANGE", "SERVER_BAD_CONTENT", "SERVER_UNAUTHORIZED", "SERVER_CERTIFICATE_PROBLEM", "SERVER_FORBIDDEN", "SERVER_UNEXPECTED_RESPONSE", "SERVER_CONTENT_LENGTH_MISMATCH", "SERVER_CROSS_ORIGIN_REDIRECT", "USER_CANCELED", "USER_SHUTDOWN", "USER_PAUSED", "DOWNLOAD_PROCESS_CRASHED"];
-                                Some(format!("{} ({})", reasons.get(reason.0 as usize).unwrap_or(&"UNKNOWN"), reason.0))
-                            } else { None }}))
-                    }};
-                    // Closing a tab may invalidate its COM object. Never report that as completion.
-                    items.push(read().unwrap_or_else(|e| json!({"id":record.id,"tabId":record.tab,"state":"unknown","error":e.to_string()})));
-                }
-                Ok(json!({"scope":"session","queriedAt":chrono::Utc::now().timestamp_millis(),"limit":100,"downloads":items,
-                    "notice":"仅保留本次应用运行最近 200 条下载。空列表不代表导出失败；页面稳定不代表下载完成。只有 state=complete 才表示完成，原生保存/安全提示仍需处理。"}))
-            });
-            let _ = tx.send(result);
-        }).map_err(|e| e.to_string())?;
-        tokio::time::timeout(Duration::from_secs(5), rx).await
-            .map_err(|_| "下载查询超时，请处理原生对话框后重新查询")?.map_err(|e| e.to_string())?
-    }
-}
 tokio::task_local! { static CONTROL_TAB: String; }
-#[cfg(windows)]
-struct Popup {
-    args: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2NewWindowRequestedEventArgs,
-    deferral: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Deferral,
-    environment: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
-}
-#[cfg(windows)]
-impl Drop for Popup {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.deferral.Complete();
-        }
-    }
-}
-#[cfg(windows)]
-thread_local! { static POPUPS: std::cell::RefCell<std::collections::HashMap<String,Popup>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
 const PAGE_SCRIPT: &str = include_str!("native_browser_page.js");
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct Session {
-    browser_id: String,
     thread_id: String,
-    url: String,
-    visible: bool,
-    busy: bool,
-    status: String,
     active_tab: String,
-    tabs: Vec<Tab>,
-    #[serde(skip)]
-    bounds: Option<[f64; 4]>,
-    #[serde(skip)]
     cancel: Arc<AtomicBool>,
-}
-
-#[derive(Clone, Serialize)]
-struct Tab {
-    id: String,
-    url: String,
-    title: String,
 }
 
 #[derive(Default)]
 struct BrowserState {
-    session: Mutex<Option<Session>>,
-    // Oldest first. Each parked tab keeps a live WebView2 renderer, so only MAX_PARKED survive;
-    // evicted/deleted threads lose page JS/form state but cookies stay in the shared profile.
-    parked: Mutex<Vec<Session>>,
-    // Tabs whose renderer/browser process failed (tab id -> reason); cleared by the next navigation.
-    crashed: Mutex<std::collections::HashMap<String, String>>,
     gate: tokio::sync::Mutex<()>,
     frame_sessions: Mutex<std::collections::HashMap<String, String>>,
     observations: Mutex<std::collections::HashMap<String, Observation>>,
 }
 
-fn active_label(app: &AppHandle) -> Result<String, String> {
-    if let Ok(label) = CONTROL_TAB.try_with(Clone::clone) {
-        return Ok(label);
-    }
-    app.state::<BrowserState>()
-        .session
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.active_tab.clone())
-        .ok_or("浏览器未创建".into())
+fn active_label(_app: &AppHandle) -> Result<String, String> {
+    CONTROL_TAB.try_with(Clone::clone).map_err(|_| "缺少 Chrome tabTag".into())
 }
 
-fn update_session(app: &AppHandle, thread: &str, f: impl FnOnce(&mut Session)) {
-    let state = app.state::<BrowserState>();
-    let mut current = state.session.lock().unwrap();
-    if let Some(s) = current.as_mut().filter(|s| s.thread_id == thread) {
-        f(s);
-    } else if let Some(s) = state.parked.lock().unwrap().iter_mut().find(|s| s.thread_id == thread) {
-        f(s);
-    }
-}
-
-#[cfg(windows)]
-const MAX_PARKED: usize = 4;
-#[cfg(windows)]
-const MAX_TABS: usize = 8;
 const MAX_FULL_PAGE_DEVICE_PX: f64 = 16384.;
-
-/// Main thread only: destroy a session's WebViews so their WebView2 processes exit.
-fn close_session(app: &AppHandle, s: Session) {
-    s.cancel.store(true, Ordering::SeqCst);
-    for tab in &s.tabs {
-        close_tab_view(app, &tab.id);
-    }
-}
-
-fn close_tab_view(app: &AppHandle, id: &str) {
-    if let Some(view) = app.get_webview(id) {
-        let _ = view.close();
-    }
-    let state = app.state::<BrowserState>();
-    state.observations.lock().unwrap().remove(id);
-    state.crashed.lock().unwrap().remove(id);
-}
-
-/// Called when a thread is deleted: its browser (visible or parked) must not outlive it.
-pub(crate) fn release_thread(app: &AppHandle, thread: &str) {
-    let handle = app.clone();
-    let thread = thread.to_owned();
-    let _ = app.run_on_main_thread(move || {
-        let state = handle.state::<BrowserState>();
-        let current = {
-            let mut current = state.session.lock().unwrap();
-            if current.as_ref().is_some_and(|s| s.thread_id == thread) { current.take() } else { None }
-        };
-        let was_current = current.is_some();
-        let parked = {
-            let mut parked = state.parked.lock().unwrap();
-            parked.iter().position(|s| s.thread_id == thread).map(|i| parked.remove(i))
-        };
-        for s in current.into_iter().chain(parked) {
-            close_session(&handle, s);
-        }
-        if was_current {
-            emit(&handle);
-        }
-    });
-}
-
-#[cfg(windows)]
-fn mark_crashed(app: &AppHandle, thread: &str, tab: &str, message: &str) {
-    let state = app.state::<BrowserState>();
-    state.crashed.lock().unwrap().insert(tab.to_owned(), message.to_owned());
-    state.observations.lock().unwrap().remove(tab);
-    update_session(app, thread, |s| {
-        if s.active_tab == tab {
-            s.cancel.store(true, Ordering::SeqCst);
-            s.busy = false;
-            s.status = message.to_owned();
-        }
-    });
-    emit(app);
-}
-
-fn show_tab(app: &AppHandle, s: &Session) -> Result<(), String> {
-    let view = app.get_webview(&s.active_tab).ok_or("标签页不存在")?;
-    if let Some([x, y, w, h]) = s.bounds {
-        view.set_position(tauri::LogicalPosition::new(x, y))
-            .map_err(|e| e.to_string())?;
-        view.set_size(tauri::LogicalSize::new(w, h))
-            .map_err(|e| e.to_string())?;
-        if s.visible {
-            view.show().map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn create_tab(
-    app: &AppHandle,
-    thread: &str,
-    url: tauri::Url,
-    popup_id: Option<String>,
-) -> Result<Tab, String> {
-    let id = format!("nova-browser-{}", uuid::Uuid::new_v4().simple());
-    let tab = Tab {
-        id: id.clone(),
-        url: url.to_string(),
-        title: String::new(),
-    };
-    let nav_app = app.clone();
-    let nav_thread = thread.to_owned();
-    let nav_id = id.clone();
-    let title_app = app.clone();
-    let title_thread = thread.to_owned();
-    let title_id = id.clone();
-    let mut builder = tauri::WebviewBuilder::new(&id, tauri::WebviewUrl::External(url))
-        .data_directory(state_dir(app).join("native-browser-profile"))
-        .on_navigation(move |url| {
-            if !matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data") {
-                return false;
-            }
-            let state = nav_app.state::<BrowserState>();
-            state.observations.lock().unwrap().remove(&nav_id);
-            state.crashed.lock().unwrap().remove(&nav_id);
-            update_session(&nav_app, &nav_thread, |s| {
-                if let Some(t) = s.tabs.iter_mut().find(|t| t.id == nav_id) {
-                    t.url = url.to_string();
-                }
-                if s.active_tab == nav_id {
-                    s.url = url.to_string();
-                }
-            });
-            emit(&nav_app);
-            true
-        })
-        .on_document_title_changed(move |_, title| {
-            update_session(&title_app, &title_thread, |s| {
-                if let Some(t) = s.tabs.iter_mut().find(|t| t.id == title_id) {
-                    t.title = title.clone();
-                }
-            });
-            emit(&title_app);
-        });
-    if let Some(key) = popup_id.as_ref() {
-        if let Some(environment) =
-            POPUPS.with(|p| p.borrow().get(key).map(|p| p.environment.clone()))
-        {
-            builder = builder.with_environment(environment);
-        }
-    }
-    let view = app
-        .get_window("main")
-        .ok_or("主窗口不存在")?
-        .add_child(
-            builder,
-            tauri::LogicalPosition::new(0., 0.),
-            tauri::LogicalSize::new(1., 1.),
-        )
-        .map_err(|e| e.to_string())?;
-    view.hide().map_err(|e| e.to_string())?;
-    let popup_app = app.clone();
-    let popup_thread = thread.to_owned();
-    let download_thread = thread.to_owned();
-    let download_tab = id.clone();
-    let crash_app = app.clone();
-    let crash_thread = thread.to_owned();
-    let crash_tab = id.clone();
-    view.with_webview(move |native| unsafe {
-        let Ok(core) = native.controller().CoreWebView2() else {
-            return;
-        };
-        use windows::core::Interface;
-        use webview2_com::Microsoft::Web::WebView2::Win32::*;
-        // Without this a crashed/hung page stays a dead child window and every CDP call just times out.
-        let registration = core.add_ProcessFailed(
-            &webview2_com::ProcessFailedEventHandler::create(Box::new(move |_, args| {
-                let Some(args) = args else { return Ok(()) };
-                let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
-                args.ProcessFailedKind(&mut kind)?;
-                let message = match kind {
-                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED => "网页渲染进程已崩溃，请 reload 重新加载",
-                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE => "网页长时间无响应，请 reload 重新加载",
-                    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED => "浏览器进程已退出，请关闭此标签页后新建",
-                    _ => return Ok(()),
-                };
-                eprintln!("browser process failed ({}): {message}", kind.0);
-                mark_crashed(&crash_app, &crash_thread, &crash_tab, message);
-                Ok(())
-            })),
-            &mut 0,
-        );
-        if let Err(error) = registration { eprintln!("browser crash handler: {error}"); }
-        let registration = core.cast::<ICoreWebView2_4>().and_then(|core| core.add_DownloadStarting(
-            &webview2_com::DownloadStartingEventHandler::create(Box::new(move |_, args| {
-                if let Some(args) = args {
-                    let operation = args.DownloadOperation()?;
-                    DOWNLOADS.with(|records| {
-                        let mut records = records.borrow_mut();
-                        // ponytail: retain the latest 200 operations; use a persistent history if needed.
-                        if records.len() >= 200 { records.remove(0); }
-                        records.push(Download { thread: download_thread.clone(), tab: download_tab.clone(),
-                            id: uuid::Uuid::new_v4().to_string(), started: chrono::Utc::now().timestamp_millis(), operation });
-                    });
-                }
-                Ok(())
-            })), &mut 0));
-        if let Err(error) = registration { eprintln!("browser download handler: {error}"); }
-        if let Some(key) = popup_id {
-            if let Some(popup) = POPUPS.with(|p| p.borrow_mut().remove(&key)) {
-                if let Err(e) = popup.args.SetNewWindow(&core) {
-                    update_session(&popup_app, &popup_thread, |s| {
-                        s.status = format!("新窗口接管失败：{e}")
-                    });
-                }
-                // Drop completes the deferral on this same UI apartment.
-            }
-        }
-        let environment = native.environment();
-        let mut token = 0;
-        let registration = core.add_NewWindowRequested(
-            &webview2_com::NewWindowRequestedEventHandler::create(Box::new(move |_, args| {
-                let Some(args) = args else {
-                    return Ok(());
-                };
-                args.SetHandled(true)?;
-                let mut raw = windows::core::PWSTR::null();
-                args.Uri(&mut raw)?;
-                let url = webview2_com::take_pwstr(raw);
-                if !tauri::Url::parse(&url).is_ok_and(|u| {
-                    matches!(u.scheme(), "http" | "https" | "blob" | "data") || u.as_str() == "about:blank"
-                }) {
-                    return Ok(());
-                }
-                let key = uuid::Uuid::new_v4().to_string();
-                let deferral = args.GetDeferral()?;
-                POPUPS.with(|p| {
-                    p.borrow_mut().insert(
-                        key.clone(),
-                        Popup {
-                            args: args.clone(),
-                            deferral,
-                            environment: environment.clone(),
-                        },
-                    )
-                });
-                let app = popup_app.clone();
-                let thread = popup_thread.clone();
-                // Leave the COM event before constructing a child WebView (WebView2 disallows reentrancy).
-                tauri::async_runtime::spawn(async move {
-                    if let Err(error) =
-                        change_tab(&app, &thread, "new_tab", json!({"popupId":key})).await
-                    {
-                        update_session(&app, &thread, |s| s.status = error);
-                        emit(&app);
-                        let _ = app.run_on_main_thread(move || {
-                            POPUPS.with(|p| p.borrow_mut().remove(&key));
-                        });
-                    }
-                });
-                Ok(())
-            })),
-            &mut token,
-        );
-        if let Err(e) = registration {
-            eprintln!("browser popup handler: {e}");
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    Ok(tab)
-}
-
-async fn change_tab(
-    app: &AppHandle,
-    thread: &str,
-    operation: &str,
-    args: Value,
-) -> Result<Value, String> {
-    #[cfg(not(windows))]
-    {
-        let _ = (app, thread, operation, args);
-        return Err("需要 Windows WebView2".into());
-    }
-    #[cfg(windows)]
-    {
-        let app2 = app.clone();
-        let thread = thread.to_string();
-        let op = operation.to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        app.run_on_main_thread(move || {
-            let result = (|| {
-                let state = app2.state::<BrowserState>();
-                let mut s = state
-                    .session
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .filter(|s| s.thread_id == thread)
-                    .cloned()
-                    .or_else(|| state.parked.lock().unwrap().iter().find(|s| s.thread_id == thread).cloned())
-                    .ok_or("会话浏览器不存在")?;
-                let target = args["tabId"].as_str().unwrap_or(&s.active_tab).to_owned();
-                if op != "new_tab" && !s.tabs.iter().any(|t| t.id == target) {
-                    return Err("标签页不存在".to_string());
-                }
-                s.cancel.store(true, Ordering::SeqCst);
-                s.busy = false;
-                if let Some(v) = app2.get_webview(&s.active_tab) {
-                    v.hide().map_err(|e| e.to_string())?;
-                }
-                if op == "new_tab" || (op == "close_tab" && s.tabs.len() == 1) {
-                    let url = if let Some(url) = args["url"].as_str() {
-                        normalized_url(url)?
-                    } else {
-                        "about:blank".parse().unwrap()
-                    };
-                    let tab = create_tab(
-                        &app2,
-                        &thread,
-                        url,
-                        args["popupId"].as_str().map(str::to_owned),
-                    )?;
-                    s.active_tab = tab.id.clone();
-                    s.tabs.push(tab);
-                    // Popups can open tabs without bound; each is a live renderer process.
-                    if s.tabs.len() > MAX_TABS {
-                        close_tab_view(&app2, &s.tabs.remove(0).id);
-                    }
-                } else if op == "select_tab" {
-                    s.active_tab = target.clone();
-                }
-                if op == "close_tab" {
-                    if let Some(v) = app2.get_webview(&target) {
-                        v.close().map_err(|e| e.to_string())?;
-                    }
-                    s.tabs.retain(|t| t.id != target);
-                    state.observations.lock().unwrap().remove(&target);
-                    state.crashed.lock().unwrap().remove(&target);
-                    if s.active_tab == target {
-                        s.active_tab = s.tabs.last().unwrap().id.clone();
-                    }
-                }
-                s.url = s
-                    .tabs
-                    .iter()
-                    .find(|t| t.id == s.active_tab)
-                    .unwrap()
-                    .url
-                    .clone();
-                s.status = "就绪".into();
-                show_tab(&app2, &s)?;
-                update_session(&app2, &thread, |current| *current = s.clone());
-                emit(&app2);
-                Ok(json!(s))
-            })();
-            let _ = tx.send(result);
-        })
-        .map_err(|e| e.to_string())?;
-        rx.await.map_err(|e| e.to_string())?
-    }
-}
 
 pub(crate) fn init(app: &AppHandle) {
     app.manage(BrowserState::default());
@@ -509,44 +41,9 @@ pub(crate) fn init(app: &AppHandle) {
     let _ = APP.set(app.clone());
 }
 
-pub(crate) fn tool_definition() -> Value {
-    serde_json::from_str(include_str!("../../scripts/webview-tool.json"))
-        .expect("webview tool schema")
-}
-
-fn emit(app: &AppHandle) {
-    let session = app.state::<BrowserState>().session.lock().unwrap().clone();
-    let _ = app.emit_to("main", "native-browser:state", session);
-}
-
-fn session(app: &AppHandle, id: &str) -> Result<Session, String> {
-    app.state::<BrowserState>()
-        .session
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|s| s.browser_id == id)
-        .cloned()
-        .ok_or("浏览器已关闭或属于其它会话，请重新打开".into())
-}
-
-fn check(app: &AppHandle, current: &Session) -> Result<(), String> {
+fn check(_app: &AppHandle, current: &Session) -> Result<(), String> {
     if current.cancel.load(Ordering::SeqCst) {
         return Err("已停止浏览器控制".into());
-    }
-    // Chrome targets an explicitly authorized tab, independently of Nova's visible thread.
-    if current.browser_id == "chrome" {
-        return Ok(());
-    }
-    let active = app
-        .state::<AppState>()
-        .active_thread
-        .lock()
-        .unwrap()
-        .clone();
-    let latest = session(app, &current.browser_id)?;
-    if !latest.visible || active.as_deref() != Some(&current.thread_id) {
-        return Err("浏览器不在当前可见会话中，已停止操作".into());
     }
     Ok(())
 }
@@ -577,171 +74,6 @@ fn normalized_url(raw: &str) -> Result<tauri::Url, String> {
     Ok(url)
 }
 
-async fn mount(app: &AppHandle, thread_id: String) -> Result<Value, String> {
-    #[cfg(not(windows))]
-    return Err("原生浏览器控制当前支持 Windows WebView2".into());
-    #[cfg(windows)]
-    {
-        if app
-            .state::<AppState>()
-            .store
-            .lock()
-            .unwrap()
-            .get(&thread_id)
-            .is_none()
-        {
-            return Err("会话不存在".into());
-        }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let handle = app.clone();
-        app.run_on_main_thread(move || {
-            let result = (|| -> Result<Value, String> {
-                let state = handle.state::<BrowserState>();
-                if let Some(s) = state
-                    .session
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .filter(|s| s.thread_id == thread_id)
-                {
-                    return Ok(json!(s));
-                }
-                if let Some(mut old) = state.session.lock().unwrap().take() {
-                    old.cancel.store(true, Ordering::SeqCst);
-                    old.busy = false;
-                    old.visible = false;
-                    if let Some(view) = handle.get_webview(&old.active_tab) {
-                        view.hide().map_err(|e| e.to_string())?;
-                    }
-                    state.parked.lock().unwrap().push(old);
-                }
-                let (restored, evicted) = {
-                    let mut parked = state.parked.lock().unwrap();
-                    let restored = parked.iter().position(|s| s.thread_id == thread_id).map(|i| parked.remove(i));
-                    let excess = parked.len().saturating_sub(MAX_PARKED);
-                    (restored, parked.drain(..excess).collect::<Vec<_>>())
-                };
-                for s in evicted {
-                    close_session(&handle, s);
-                }
-                let s = if let Some(mut s) = restored {
-                    s.visible = false;
-                    s
-                } else {
-                    let tab =
-                        create_tab(&handle, &thread_id, "about:blank".parse().unwrap(), None)?;
-                    Session {
-                        browser_id: uuid::Uuid::new_v4().to_string(),
-                        thread_id,
-                        url: tab.url.clone(),
-                        active_tab: tab.id.clone(),
-                        tabs: vec![tab],
-                        bounds: None,
-                        visible: false,
-                        busy: false,
-                        status: "就绪".into(),
-                        cancel: Arc::new(AtomicBool::new(false)),
-                    }
-                };
-                *state.session.lock().unwrap() = Some(s.clone());
-                Ok(json!(s))
-            })();
-            let _ = tx.send(result);
-        })
-        .map_err(|e| e.to_string())?;
-        rx.await.map_err(|e| e.to_string())?
-    }
-}
-
-#[tauri::command]
-pub async fn native_browser_ui(
-    app: AppHandle,
-    webview: tauri::Webview,
-    thread_id: String,
-    operation: String,
-    args: Value,
-) -> Result<Value, String> {
-    if webview.label() != "main" {
-        return Err("仅 Nova 主界面可以控制浏览器".into());
-    }
-    if operation == "mount" {
-        return mount(&app, thread_id).await;
-    }
-    if matches!(operation.as_str(), "new_tab" | "select_tab" | "close_tab") {
-        return change_tab(&app, &thread_id, &operation, args).await;
-    }
-    let state = app.state::<BrowserState>();
-    let s = state
-        .session
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|s| s.thread_id == thread_id)
-        .cloned()
-        .ok_or("请先打开浏览器标签页")?;
-    match operation.as_str() {
-        "layout" => {
-            if args["tabId"].as_str().is_some_and(|id| id != s.active_tab) {
-                return Ok(Value::Null);
-            }
-            let visible = args["visible"] == true;
-            let view = app.get_webview(&s.active_tab).ok_or("浏览器未创建")?;
-            if visible {
-                let n = |key: &str| {
-                    args[key]
-                        .as_f64()
-                        .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 32768.0)
-                        .ok_or("无效浏览器布局")
-                };
-                let (x, y, width, height) = (n("x")?, n("y")?, n("width")?, n("height")?);
-                if width < 1.0 || height < 1.0 {
-                    return Err("浏览器区域过小".into());
-                }
-                view.set_position(tauri::LogicalPosition::new(x, y))
-                    .map_err(|e| e.to_string())?;
-                view.set_size(tauri::LogicalSize::new(width, height))
-                    .map_err(|e| e.to_string())?;
-                view.show().map_err(|e| e.to_string())?;
-                update_session(&app, &thread_id, |s| s.bounds = Some([x, y, width, height]));
-            } else {
-                s.cancel.store(true, Ordering::SeqCst);
-                view.hide().map_err(|e| e.to_string())?;
-            }
-            if let Some(current) = state.session.lock().unwrap().as_mut() {
-                current.visible = visible;
-            }
-            Ok(Value::Null)
-        }
-        "stop" => {
-            s.cancel.store(true, Ordering::SeqCst);
-            state.observations.lock().unwrap().remove(&s.active_tab);
-            Ok(json!({"stopped":true}))
-        }
-        "status" => Ok(json!(s)),
-        "downloads" => downloads(&app, &thread_id, &args).await,
-        "goto" | "back" | "forward" | "reload" => {
-            let _guard = state
-                .gate
-                .try_lock()
-                .map_err(|_| "浏览器正在执行动作，请先停止")?;
-            let view = app.get_webview(&s.active_tab).ok_or("浏览器未创建")?;
-            if operation == "goto" {
-                view.navigate(normalized_url(args["url"].as_str().unwrap_or_default())?)
-                    .map_err(|e| e.to_string())?;
-            } else if operation == "reload" {
-                // Native reload also recovers a crashed renderer, unlike page script.
-                view.reload().map_err(|e| e.to_string())?;
-            } else {
-                view.eval(if operation == "back" { "history.back()" } else { "history.forward()" })
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(Value::Null)
-        }
-        "inspect" | "screenshot" | "act" => control(&app, &s.browser_id, &operation, &args).await,
-        _ => Err("未知浏览器操作".into()),
-    }
-}
-
 async fn cdp(
     app: &AppHandle,
     method: &str,
@@ -756,101 +88,12 @@ async fn cdp(
         return Err("已停止".into());
     }
     let label = active_label(app)?;
-    if label.starts_with("chrome:") {
-        let tag = label.rsplit(':').next().ok_or("缺少 Chrome tabTag")?;
-        return crate::chrome_browser::request(
-            app,
-            "cdp",
-            json!({"tabTag":tag,"method":method,"params":params,"sessionId":session_id}),
-        )
-        .await;
-    }
-    native_cdp(app, method, params, session_id, cancel).await
-}
-
-#[cfg(windows)]
-async fn native_cdp(
-    app: &AppHandle,
-    method: &str,
-    params: Value,
-    session_id: Option<&str>,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<Value, String> {
-    use webview2_com::{
-        CallDevToolsProtocolMethodCompletedHandler,
-        Microsoft::Web::WebView2::Win32::ICoreWebView2_11,
-    };
-    use windows::core::{Interface, HSTRING};
-    let label = active_label(app)?;
-    if let Some(message) = app.state::<BrowserState>().crashed.lock().unwrap().get(&label).cloned() {
-        return Err(message);
-    }
-    let view = app.get_webview(&label).ok_or("浏览器未创建")?;
-    let method = method.to_string();
-    let params = params.to_string();
-    let session_id = session_id.map(str::to_owned);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    view.with_webview(move |native| unsafe {
-        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
-            let _ = tx.send(Err("已停止".into()));
-            return;
-        }
-        let sender = Arc::new(Mutex::new(Some(tx)));
-        let callback_sender = sender.clone();
-        let callback =
-            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |status, body| {
-                if let Some(tx) = callback_sender.lock().unwrap().take() {
-                    let _ = tx.send(
-                        status
-                            .map_err(|e| e.to_string())
-                            .and_then(|_| serde_json::from_str(&body).map_err(|e| e.to_string())),
-                    );
-                }
-                Ok(())
-            }));
-        let result = native.controller().CoreWebView2().and_then(|core| {
-            if let Some(session_id) = session_id {
-                core.cast::<ICoreWebView2_11>()?
-                    .CallDevToolsProtocolMethodForSession(
-                        &HSTRING::from(session_id),
-                        &HSTRING::from(method),
-                        &HSTRING::from(params),
-                        &callback,
-                    )
-            } else {
-                core.CallDevToolsProtocolMethod(
-                    &HSTRING::from(method),
-                    &HSTRING::from(params),
-                    &callback,
-                )
-            }
-        });
-        if let Err(error) = result {
-            if let Some(tx) = sender.lock().unwrap().take() {
-                let _ = tx.send(Err(error.to_string()));
-            }
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    let value: Value = tokio::time::timeout(Duration::from_secs(3), rx)
-        .await
-        .map_err(|_| "网页响应超时")?
-        .map_err(|e| e.to_string())??;
-    if value.get("error").is_some() {
-        return Err(value["error"].to_string());
-    }
-    Ok(value)
-}
-
-#[cfg(not(windows))]
-async fn native_cdp(
-    _: &AppHandle,
-    _: &str,
-    _: Value,
-    _: Option<&str>,
-    _: Option<Arc<AtomicBool>>,
-) -> Result<Value, String> {
-    Err("需要 Windows WebView2".into())
+    let tag = label.rsplit(':').next().ok_or("缺少 Chrome tabTag")?;
+    crate::chrome_browser::request(
+        app,
+        "cdp",
+        json!({"tabTag":tag,"method":method,"params":params,"sessionId":session_id}),
+    ).await
 }
 
 #[derive(Clone)]
@@ -1847,15 +1090,6 @@ fn carry_screenshot(observation: &mut Observation, previous: Option<&Observation
     Some(observation.images.iter().map(|i| i.id.clone()).collect())
 }
 
-async fn control(
-    app: &AppHandle,
-    id: &str,
-    operation: &str,
-    args: &Value,
-) -> Result<Value, String> {
-    control_session(app, session(app, id)?, operation, args).await
-}
-
 async fn control_session(
     app: &AppHandle,
     mut s: Session,
@@ -1871,27 +1105,14 @@ async fn control_session(
         None => 1500,
         Some(v) => v.as_u64().filter(|ms| *ms <= 4000).ok_or("settleMs 必须为 0–4000")?,
     };
-    let chrome = s.browser_id == "chrome";
-    s.cancel = if chrome {
-        crate::chrome_browser::begin(app, s.active_tab.rsplit(':').next().unwrap())
-    } else {
-        Arc::new(AtomicBool::new(false))
-    };
+    s.cancel = crate::chrome_browser::begin(app, s.active_tab.rsplit(':').next().unwrap());
     check(app, &s)?;
-    if !chrome {
-        update_session(app, &s.thread_id, |current| {
-            current.cancel = s.cancel.clone();
-            current.busy = true;
-            current.status = "正在操作网页".into();
-        });
-        emit(app);
-    }
     let mut completed_action = None;
     let mut progress=InputProgress::default();
     let task=CONTROL_TAB.scope(s.active_tab.clone(),async {
         let current=state.observations.lock().unwrap().get(&s.active_tab).cloned();
         if operation!="act" {return Ok(snapshot(app,operation=="screenshot",args,current.as_ref()).await?.1);}
-        let mut actions=parse_actions(args, if chrome { 16 } else { 8 })?;
+        let mut actions=parse_actions(args, 16)?;
         let all_dom=actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
         let with_image=current.as_ref().is_some_and(|o|o.screenshot) || actions.iter().any(|a|matches!(a,Action::ClickAt{..}|Action::Move{..}|Action::Drag{..}|Action::ScrollAt{..}));
         let Some(observation)=current.clone().filter(|o|args["snapshotId"].as_str()==Some(&o.id) && (all_dom || o.captured.elapsed()<=Duration::from_secs(180))) else {
@@ -1910,11 +1131,9 @@ async fn control_session(
         for action in &mut actions {
             preflight(&observation,action,args["imageId"].as_str())?;
         }
-        if chrome {
-            // Background tabs throttle animation/timer sampling, making stable DOM targets time out as "moving".
-            // Activate the explicitly bound tab before live checks; stale geometry/identity is still checked by apply.
-            crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
-        }
+        // Background tabs throttle animation/timer sampling, making stable DOM targets time out as "moving".
+        // Activate the explicitly bound tab before live checks; stale geometry/identity is still checked by apply.
+        crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
         state.observations.lock().unwrap().remove(&s.active_tab);
         let mut failure=None;
         let mut action_timings=Vec::new();
@@ -1939,7 +1158,7 @@ async fn control_session(
         completed_action = Some(result.clone());
         // A click/Enter often starts a navigation; feeding back the old DOM costs the model another
         // inspect round-trip. Wait (bounded) for the tab to finish loading before observing.
-        if chrome && failure.is_none() && settle_ms > 0 && args["feedback"] != "none" && !s.cancel.load(Ordering::SeqCst)
+        if failure.is_none() && settle_ms > 0 && args["feedback"] != "none" && !s.cancel.load(Ordering::SeqCst)
             && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::ClickAt{..} | Action::Press{..})) {
             let tag = s.active_tab.rsplit(':').next().unwrap_or_default();
             result["settle"] = wait_for_tab_load(app, tag, Duration::from_millis(settle_ms)).await;
@@ -1964,7 +1183,7 @@ async fn control_session(
         if !crate::altair_run::executing_browser_action() {
             let before = &observation.pages["pages"][0];
             let after = if result["pages"][0]["url"].is_string() { &result["pages"][0] } else { before };
-            crate::tool_experience::record(if chrome {"chrome"} else {"webview"}, &s.thread_id,
+            crate::tool_experience::record("chrome", &s.thread_id,
                 before["url"].as_str().unwrap_or_default(), after["url"].as_str().unwrap_or_default(),
                 after["title"].as_str().unwrap_or_default(),
                 actions[..progress.completed].iter().filter_map(|a| trail_step(&observation.pages, a)).collect());
@@ -2009,7 +1228,7 @@ async fn control_session(
         if let Some(captured) = captured.filter(|o| o.full_page) {
             let restored = CONTROL_TAB
                 .scope(s.active_tab.clone(), async {
-                    // A viewport capture resets WebView2's full-page scrollbar/layout override.
+                    // A viewport capture resets the full-page scrollbar/layout override.
                     let reset = cdp(
                         app,
                         "Page.captureScreenshot",
@@ -2036,54 +1255,10 @@ async fn control_session(
             }
         }
     }
-    if !chrome {
-        update_session(app, &s.thread_id, |current| {
-            if Arc::ptr_eq(&current.cancel, &s.cancel) {
-                current.busy = false;
-                current.status = "就绪".into();
-            }
-        });
-        emit(app);
-    }
     if let Ok(value) = &mut result {
         value["durationMs"] = json!(started.elapsed().as_millis());
     }
     result
-}
-
-pub(crate) fn current_context(root: &Path) -> Result<(&'static AppHandle, String), String> {
-    let app = APP.get().ok_or("电脑/网页工具仅在 Nova 桌面应用内可用")?;
-    let state = app.state::<AppState>();
-    let thread_id = state
-        .active_thread
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or("请打开一个会话")?;
-    let cwd = state
-        .store
-        .lock()
-        .unwrap()
-        .get(&thread_id)
-        .map(|t| t.cwd.clone())
-        .ok_or("会话不存在")?;
-    if std::fs::canonicalize(root)
-        .ok()
-        .zip(std::fs::canonicalize(&cwd).ok())
-        .is_none_or(|(a, b)| a != b)
-    {
-        return Err("工具工作目录与前台会话不同，请切到对应会话后使用电脑/网页工具".into());
-    }
-    Ok((app, thread_id))
-}
-
-pub(crate) async fn execute(root: &Path, args: &Value) -> Result<Value, String> {
-    let (args, inferred) = infer_operation(args, "browserId");
-    let owner = current_context(root)?.1;
-    let resolved = resolve_targets(root, &args, &owner, "webview").await?;
-    let mut result = execute_webview(root, &resolved).await?;
-    if let Some(op) = inferred { result["operationInferred"] = json!(op); }
-    Ok(with_experience_hint("webview", &owner, result))
 }
 
 /// Coordinate actions carrying a `target` instead of x/y are rejected up front (no target locating).
@@ -2134,63 +1309,6 @@ fn with_experience_hint(tool: &str, owner: &str, mut result: Value) -> Value {
     result
 }
 
-async fn execute_webview(root: &Path, args: &Value) -> Result<Value, String> {
-    let (app, thread_id) = current_context(root)?;
-    let operation = args["operation"].as_str().unwrap_or_default();
-    if operation == "open" {
-        let url = normalized_url(args["url"].as_str().unwrap_or_default())?;
-        let _ = app.emit_to("main", "native-browser:open", json!({"threadId":thread_id}));
-        let value = mount(app, thread_id).await?;
-        let gate = app.state::<BrowserState>();
-        let _guard = gate
-            .gate
-            .try_lock()
-            .map_err(|_| "浏览器正在执行任务，请先停止")?;
-        app.get_webview(&active_label(app)?)
-            .ok_or("浏览器未创建")?
-            .navigate(url)
-            .map_err(|e| e.to_string())?;
-        return Ok(
-            json!({"browserId":value["browserId"],"status":"opening","next":"页面加载完成后 inspect"}),
-        );
-    }
-    let id = args["browserId"]
-        .as_str()
-        .ok_or("缺少 open 返回的 browserId")?;
-    let s = session(app, id)?;
-    if s.thread_id != thread_id {
-        return Err("浏览器属于其它会话".into());
-    }
-    if operation == "run" {
-        return Box::pin(crate::altair_run::browser(root, args, &thread_id, "webview")).await;
-    }
-    if crate::tool_experience::is_operation(args) {
-        let observed = if operation == "experience_search" { None } else {
-            let pages = altair_observation(root, args, &thread_id, "webview")?;
-            let url = tauri::Url::parse(pages["pages"][0]["url"].as_str().ok_or("观察缺少网站 URL")?).map_err(|e| e.to_string())?;
-            Some(url.origin().ascii_serialization())
-        };
-        let args = args.clone();
-        return tokio::task::spawn_blocking(move || crate::tool_experience::execute(
-            &crate::tool_experience::dir(), "webview", &thread_id, &args, observed.as_deref()))
-            .await.map_err(|e| e.to_string())?;
-    }
-    match operation {
-        "stop" => {
-            s.cancel.store(true, Ordering::SeqCst);
-            app.state::<BrowserState>().observations.lock().unwrap().remove(&s.active_tab);
-            Ok(json!({"stopped":true}))
-        }
-        "tabs" => Ok(json!(s)),
-        "downloads" => downloads(app, &thread_id, args).await,
-        "new_tab" | "select_tab" | "close_tab" => {
-            change_tab(app, &thread_id, operation, args.clone()).await
-        }
-        "inspect" | "screenshot" | "act" => control(app, id, operation, args).await,
-        _ => Err("未知 webview 操作".into()),
-    }
-}
-
 pub(crate) fn tool_owner(root: &Path, owner: &str) -> Result<String, String> {
     if owner.trim().is_empty() || owner.len() > 4096 {
         return Err("缺少有效工具客户端标识，请重启工具客户端".into());
@@ -2203,19 +1321,10 @@ pub(crate) fn tool_owner(root: &Path, owner: &str) -> Result<String, String> {
 }
 
 fn altair_observation_key(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<String, String> {
-    let app = APP.get().ok_or("仅 Nova 内可用")?;
-    let key = if tool == "webview" {
-        let (_, thread_id) = current_context(root)?;
-        if thread_id != owner { return Err("会话已切换，停止连续决策".into()); }
-        let s = session(app, args["browserId"].as_str().ok_or("缺少 browserId")?)?;
-        check(app, &s)?;
-        s.active_tab
-    } else {
-        let owner = tool_owner(root, owner)?;
-        let tag = args["tabTag"].as_str().ok_or("缺少 tabTag")?;
-        format!("chrome:{owner}:{tag}")
-    };
-    Ok(key)
+    if tool != "chrome" { return Err("不支持的浏览器".into()); }
+    let owner = tool_owner(root, owner)?;
+    let tag = args["tabTag"].as_str().ok_or("缺少 tabTag")?;
+    Ok(format!("chrome:{owner}:{tag}"))
 }
 
 pub(crate) fn altair_observation(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
@@ -2456,15 +1565,8 @@ fn strip_observe_keys(params: &mut Value) {
 
 fn chrome_session(thread_id: &str, tag: &str) -> Session {
     Session {
-        browser_id: "chrome".into(),
         thread_id: thread_id.into(),
-        url: String::new(),
-        visible: true,
-        busy: false,
-        status: String::new(),
         active_tab: format!("chrome:{thread_id}:{tag}"),
-        tabs: Vec::new(),
-        bounds: None,
         cancel: Arc::new(AtomicBool::new(false)),
     }
 }

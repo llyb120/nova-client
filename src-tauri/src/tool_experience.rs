@@ -54,6 +54,7 @@ pub(crate) fn is_operation(args: &Value) -> bool {
 pub(crate) fn scope(tool: &str, raw: &str) -> Result<String> {
     let raw = raw.trim();
     if raw.is_empty() || raw.chars().count() > 200 { return Err("scope需为1–200字符的应用名或网站origin".into()); }
+    // Retain URL normalization for historical routes from the removed browser tool.
     if matches!(tool, "chrome" | "webview") {
         let url = tauri::Url::parse(raw).map_err(err)?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
@@ -461,12 +462,12 @@ mod tests {
         record("chrome", "mcp:D:\\w", list, list, "列表", vec!["点击 button「查询」".into()]);
         let order = format!("点击 link「{}」", step_name("订单 20260930123"));
         record("chrome", "mcp:D:\\w", "https://t.com/p/12/detail?x=1", "https://t.com/p/12/detail", "详情", vec![order.clone(), order]);
-        record("webview", "cancelled", list, list, "列表", vec!["按 Enter".into(), "按 Tab".into()]);
-        record("webview", "model", list, list, "列表", vec!["按 Enter".into(), "按 Tab".into()]);
+        record("chrome", "cancelled", list, list, "列表", vec!["按 Enter".into(), "按 Tab".into()]);
+        record("chrome", "model", list, list, "列表", vec!["按 Enter".into(), "按 Tab".into()]);
         finish_turn(dir.path(), |o| o == "cancelled", false);
         let save = json!({"operation":"experience_save","snapshotId":"s","experience":{"scope":"https://t.com","task":"手写",
             "conditions":["c"],"steps":["s"],"checks":["k"],"evidence":"e","outcome":"success","redacted":true}});
-        execute(dir.path(), "webview", "model", &save, Some("https://t.com")).unwrap();
+        execute(dir.path(), "chrome", "model", &save, Some("https://t.com")).unwrap();
         finish_turn(dir.path(), |o| o.ends_with(":D:\\w") || o == "model" || o == "cancelled", true);
         let (_l, entries) = read_entries(dir.path()).unwrap();
         assert_eq!(entries.len(), 2, "cancelled turn and model-saved flow add no auto route");
@@ -494,6 +495,7 @@ mod tests {
     fn library_keeps_all_routes_isolated_and_preserves_bad_files() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(library_graph(dir.path()).unwrap(), json!([]));
+        // Historical browser routes remain readable alongside current tools.
         for tool in ["jianlai", "chrome", "webview"] {
             for i in 0..14 {
                 let args = json!({"operation":"experience_save","snapshotId":"fresh","experience":{

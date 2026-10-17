@@ -353,7 +353,7 @@ async fn handle_prompt(
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
     if !desktop {
-        tools.retain(|tool| !matches!(tool.name, "jianlai" | "chrome" | "webview"));
+        tools.retain(|tool| !matches!(tool.name, "jianlai" | "chrome"));
     }
     tools.extend(session::agent_tools(auto.map(|scope| scope.handoff).filter(|handoff| !handoff.is_empty())));
     let tool_shape = serde_json::to_string(

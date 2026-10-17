@@ -87,8 +87,6 @@ pub fn tool_set(
         })),
     });
     if !read_only {
-        let webview = crate::native_browser::tool_definition();
-        tools.push(Tool { name: "webview", description: webview["description"].as_str().unwrap().into(), parameters: schema(webview["inputSchema"].clone()) });
         let desktop = crate::jianlai::tool_definition();
         tools.push(Tool { name: "jianlai", description: desktop["description"].as_str().unwrap().into(), parameters: schema(desktop["inputSchema"].clone()) });
         let employee = crate::employee::tool_definition();
@@ -285,7 +283,7 @@ fn govern(
     }
     let (mut governed, archive_path, original_bytes) =
         govern_tool_text(&text, max_bytes, archive_dir, call_id, name);
-    if matches!(name, "chrome" | "webview" | "jianlai") {
+    if matches!(name, "chrome" | "jianlai") {
         if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
             if value.is_object() {
                 value["archivedToolOutput"] = json!(archive_path);
@@ -601,13 +599,6 @@ async fn execute_inner(
     owner: &str,
 ) -> ToolOutcome {
     match name {
-        "webview" => {
-            if shell.is_none() { return ToolOutcome::error("当前为只读模式，网页控制不可用"); }
-            match crate::native_browser::execute(root, args).await {
-                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
-                Err(error) => ToolOutcome::error(error),
-            }
-        }
         "chrome" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，Chrome 控制不可用"); }
             match crate::native_browser::execute_chrome(root, args, owner).await {
@@ -803,14 +794,18 @@ mod embedded_rtk_tests {
     async fn image_tools_work_without_polaris_and_are_blocked_in_read_only_mode() {
         for read_only in [false, true] {
             let tools = tool_set(read_only, false, false);
-            for name in ["generate_image", "edit_image", "jianlai"] {
+            for name in ["generate_image", "edit_image", "jianlai", "chrome"] {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
+            assert!(tools.iter().all(|tool| tool.name != "webview"));
         }
         let root = tempfile::tempdir().unwrap();
         let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, "test").await;
         assert!(result.is_error);
         assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
+        let removed = super::execute_inner(root.path(), "webview", &json!({}), Some(&crate::lyra::prompt::detect_shell()), None, "test").await;
+        assert!(removed.is_error);
+        assert_eq!(removed.content[0]["text"], "未知工具：webview");
     }
 
     #[test]

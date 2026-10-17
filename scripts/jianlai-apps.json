@@ -44,7 +44,7 @@
     "app": "浏览器窗口（Chrome/Edge/Firefox）",
     "match": ["chrome", "msedge", "firefox", "brave", "浏览器"],
     "rules": [
-      "页面内容、标签页与表单用 chrome 或 webview 工具按 DOM 定位；剑来只处理原生对话框（文件选择、打印、权限、下载确认）和浏览器窗口本身。",
+      "页面内容、标签页与表单仅用 chrome 工具按 DOM 定位；剑来只处理原生对话框（文件选择、打印、权限、下载确认）和浏览器窗口本身。",
       "两个工具共用一块屏幕：剑来动过浏览器后，chrome 侧必须重新 inspect 再操作。"
     ]
   }

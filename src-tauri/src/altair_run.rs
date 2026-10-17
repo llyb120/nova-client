@@ -205,7 +205,6 @@ pub(crate) fn executing_browser_action() -> bool {
 
 async fn execute_browser(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
     BROWSER_ACTION.scope(args["operation"] == "act", async { match tool {
-        "webview" => Box::pin(crate::native_browser::execute(root, args)).await,
         "chrome" => Box::pin(crate::native_browser::execute_chrome(root, args, owner)).await,
         _ => Err("不支持的浏览器".into()),
     }}).await
@@ -913,7 +912,7 @@ impl Run<'_> {
 
 pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
     let plan = parse(args)?;
-    let target_key = if tool == "webview" { "browserId" } else { "tabTag" };
+    let target_key = "tabTag";
     let target = args[target_key].as_str().ok_or("run 缺少浏览器目标")?.to_string();
     let mut snapshot = args["snapshotId"].clone();
     let initial = match crate::native_browser::altair_observation(root, args, owner, tool) {

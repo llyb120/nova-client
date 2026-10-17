@@ -140,9 +140,6 @@ fn dispatch(
         ));
     }
     let mut params = request.params;
-    if request.method == "webview" {
-        return tauri::async_runtime::block_on(crate::native_browser::execute(root, &params));
-    }
     if request.method == "jianlai" {
         return tauri::async_runtime::block_on(crate::jianlai::execute(root, &params, &request.owner));
     }
@@ -436,6 +433,18 @@ mod tests {
         );
         assert!(response.ok);
         assert_eq!(response.result.unwrap()["runtime"], "rust");
+    }
+
+    #[test]
+    fn rejects_removed_browser_tool() {
+        let root = tempfile::tempdir().unwrap();
+        let request = ContextRequest {
+            token: "secret".into(), method: "webview".into(),
+            root: root.path().to_string_lossy().into_owned(), owner: "test".into(),
+            params: serde_json::json!({"operation":"open","url":"https://example.com"}),
+        };
+        assert_eq!(dispatch(request, "secret", &CwdChanges::default()).unwrap_err(),
+            "unknown context service method: webview");
     }
 
     #[test]

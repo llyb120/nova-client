@@ -2659,7 +2659,6 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
         state.codebuddy.forget_session_of_thread(id);
         state.workbuddy.forget_session_of_thread(id);
         state.cursorplus.forget_session_of_thread(id);
-        native_browser::release_thread(app, id);
     }
     // 自动清理的普通会话仍保留在回收站一个周期，session 要等彻底过期再删；
     // 手动删除、worktree 删除及训练会话清理则没有回收站，立即清理。
@@ -5851,7 +5850,6 @@ pub fn run() {
             workspace_terminal::terminal_resize,
             workspace_terminal::terminal_ack,
             workspace_terminal::terminal_close,
-            native_browser::native_browser_ui,
             chrome_browser::chrome_browser_ui,
             tool_experience::knowledge_graph,
             jianpu::jianpu_toggle,

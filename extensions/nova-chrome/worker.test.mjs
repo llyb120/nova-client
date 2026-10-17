@@ -24,12 +24,10 @@ test('native downloads expose progress, interruption and completion without tab 
   for(const args of [{since:-1},{since:'1'},{since:8640000000000001},{downloadId:'oops'},{downloadId:'9007199254740992'},{incognito:'true'}])await assert.rejects(scope.run(args));
   assert.equal(calls,4,'invalid inputs must not query or trigger downloads');
   delete chrome.downloads;await assert.rejects(scope.run({}),/0\.1\.6/);
-  for(const name of ['chrome','webview']) {
-    const schema=JSON.parse(await readFile(new URL(`../../scripts/${name}-tool.json`,import.meta.url),'utf8'));
-    assert.ok(schema.inputSchema.properties.operation.enum.includes('downloads'));
-    assert.equal(schema.inputSchema.properties.downloadId.type,'string');
-    assert.match(schema.description,/只有state=complete才算完成/);
-  }
+  const schema=JSON.parse(await readFile(new URL('../../scripts/chrome-tool.json',import.meta.url),'utf8'));
+  assert.ok(schema.inputSchema.properties.operation.enum.includes('downloads'));
+  assert.equal(schema.inputSchema.properties.downloadId.type,'string');
+  assert.match(schema.description,/只有state=complete才算完成/);
 });
 
 test('screenshots reveal a minimized window or background tab instead of hanging',async()=>{

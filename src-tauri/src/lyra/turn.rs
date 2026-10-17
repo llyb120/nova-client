@@ -77,7 +77,7 @@ fn parallel_safe(name: &str) -> bool {
 
 /// 操作同一块屏幕的工具跨 agent 互斥。
 fn screen_tool(name: &str) -> bool {
-    matches!(name, "jianlai" | "chrome" | "webview")
+    matches!(name, "jianlai" | "chrome")
 }
 
 fn screen_lock() -> &'static tokio::sync::Mutex<()> {
