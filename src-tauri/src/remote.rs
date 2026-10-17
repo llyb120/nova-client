@@ -1929,9 +1929,6 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
-        if thread.is_quota_borrowed() && !cmd.agent_kind.trim().is_empty() {
-            return Err("额度租借会话的后端已绑定；请重新发起租借以切换后端".into());
-        }
         if is_running(&state, thread) {
             return Err("请先停止当前轮次再切换模型或模式".into());
         }
@@ -2040,16 +2037,6 @@ async fn respond_remote_permission(
         return Err("缺少权限请求标识".into());
     }
     let state = app.state::<AppState>();
-    let borrowed = state
-        .borrowed_runtimes
-        .lock()
-        .unwrap()
-        .values()
-        .find(|runtime| runtime.has_pending_permission(request_key))
-        .cloned();
-    if let Some(runtime) = borrowed {
-        return runtime.respond_permission(request_key, option_id).await;
-    }
     if state.workbuddy.has_pending_permission(request_key) {
         state.workbuddy.respond_permission(request_key, option_id).await
     } else if request_key.starts_with("claude-") {
@@ -2527,7 +2514,7 @@ pub(crate) fn route_fire_command(
         let state = app.state::<AppState>();
         let store = state.store.lock().unwrap();
         let thread = store.get(thread_id).ok_or("会话不存在")?;
-        if thread.roaming_role.is_some() || thread.quota_peer_name.is_some() {
+        if thread.roaming_role.is_some() {
             return Err("/fire 仅支持本地普通会话".into());
         }
         if is_running(&state, thread) {

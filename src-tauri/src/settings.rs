@@ -24,7 +24,7 @@ pub struct SessionShortcut {
     pub keys: String,
     /// selectProject | selectModel | newSession | openUnread | insertText | selectWorkflow
     pub action: String,
-    /// 项目绝对路径、`<agentKind>:<modelId>` / roam/quota 编码，或 insertText 文本；newSession 可为空。
+    /// 项目绝对路径、`<agentKind>:<modelId>` / roam 编码，或 insertText 文本；newSession 可为空。
     pub target: String,
 }
 
@@ -156,8 +156,6 @@ pub struct Settings {
     pub relay_groups: String,
     /// 是否允许 server 端远程查看和控制本机会话；默认关闭。
     pub remote_control_enabled: bool,
-    /// 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>`；空 = 不共享额度。
-    pub quota_shared_models: Vec<String>,
     /// 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>`。
     pub model_favorites: Vec<String>,
     /// 会话快捷键：按键一键切换项目或模型。
@@ -262,7 +260,6 @@ impl Default for Settings {
             relay_token: String::new(),
             relay_groups: String::new(),
             remote_control_enabled: false,
-            quota_shared_models: Vec::new(),
             model_favorites: Vec::new(),
             session_shortcuts: Vec::new(),
             meteor_enabled: true,
@@ -512,7 +509,6 @@ mod tests {
             agent_kind: "alkaid".into(),
             model: "p/m".into(),
         });
-        settings.quota_shared_models = vec!["alkaid:p/m".into()];
         settings.model_favorites = vec!["alkaid:p/m".into()];
         settings.session_shortcuts.push(SessionShortcut {
             id: "1".into(),
@@ -525,7 +521,6 @@ mod tests {
         assert!(!settings.vega_enabled);
         assert_eq!(settings.lightweight_model_agent, "lyra");
         assert_eq!(settings.stage_models[0].agent_kind, "lyra");
-        assert_eq!(settings.quota_shared_models[0], "lyra:p/m");
         assert_eq!(settings.model_favorites[0], "lyra:p/m");
         assert_eq!(settings.session_shortcuts[0].target, "lyra:p/m");
     }
@@ -553,26 +548,6 @@ mod tests {
         assert_eq!(
             Settings::load(&dir).model_favorites,
             settings.model_favorites
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn quota_shared_models_survive_reload_for_all_backends() {
-        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
-        let mut settings = Settings::default();
-        settings.quota_shared_models = vec![
-            "lyra:provider/model".into(),
-            "devin:swe-1.6".into(),
-            "codex:gpt-5.6".into(),
-            "codebuddy:claude-sonnet".into(),
-            "cursor:cursor-small".into(),
-        ];
-        settings.save(&dir);
-
-        assert_eq!(
-            Settings::load(&dir).quota_shared_models,
-            settings.quota_shared_models
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -632,7 +607,7 @@ mod tests {
     }
 }
 
-/// `<agentKind>:<modelId>` / roam/quota 编码键中，值为 alkaid 的段改写为 lyra；其余不变。
+/// `<agentKind>:<modelId>` / roam 编码键中，值为 alkaid 的段改写为 lyra；其余不变。
 fn migrate_alkaid_key(key: &mut String) {
     if key.split(':').any(|seg| seg == "alkaid") {
         *key = key
@@ -668,7 +643,6 @@ impl Settings {
                 target.agent_kind = "lyra".into();
             }
         }
-        migrate_alkaid_keys(&mut self.quota_shared_models);
         migrate_alkaid_keys(&mut self.model_favorites);
         for shortcut in &mut self.session_shortcuts {
             migrate_alkaid_target(&mut shortcut.target);

@@ -23,7 +23,7 @@ assert.match(relay, /self\.publish_roaming_stage\(&child\)/);
 assert.match(relay, /self\.send_snapshot\(&child\.id, &child_guest\)/);
 assert.equal((lib.match(/inherit_roaming_stage\(&mut thread\)/g) ?? []).length, 2);
 assert.equal((lib.match(/publish_roaming_stage\(&thread\)/g) ?? []).length, 2);
-assert.match(runtime, /root\.roamingRole === "guest" \|\| root\.quotaPeerName/);
+assert.match(runtime, /root\.roamingRole === "guest"\)/);
 assert.match(runtime, /api\.checkRoamingWorkflow\(originThreadId \?\? root\.id\)/);
 // 使用真实运行时、内存 IPC 检查两阶段接力；不需要启动 Tauri 或实际模型。
 const { build } = await import("esbuild");

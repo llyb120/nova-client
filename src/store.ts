@@ -32,7 +32,6 @@ import type {
   ProjectEntry,
   PromptImage,
   Quota,
-  QuotaRoamingProgress,
   RelayStatus,
   Settings,
   SlashCommand,
@@ -187,7 +186,6 @@ interface AppStore {
   unseenAchievementIds: string[];
   inboxPromptAt: number;
   incomingRoams: IncomingRoamRequest[];
-  quotaRoamingProgress: QuotaRoamingProgress | null;
   roamingFolders: string[];
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
@@ -267,7 +265,6 @@ export const [state, setState] = createStore<AppStore>({
   unseenAchievementIds: [],
   inboxPromptAt: 0,
   incomingRoams: [],
-  quotaRoamingProgress: null,
   roamingFolders: [],
   expanded: {},
   titleTyping: {},
@@ -538,12 +535,12 @@ let refreshThreadsRequest = 0;
 // 事件版本比单纯比较 running 值可靠：同一状态的重复事件也不能被旧快照覆盖。
 const runningEventVersions = new Map<string, number>();
 // send_prompt 先乐观置忙，后端随后才会登记 manager.running；在这段窗口内刷新
-// list_threads 只能看到 false，额度租借创建线程时尤其容易撞上这个竞态。
+// list_threads 只能看到 false，创建线程后立即刷新时容易撞上这个竞态。
 const optimisticRunningThreads = new Set<string>();
 
 export async function refreshThreads() {
   const request = ++refreshThreadsRequest;
-  // list_threads 可能与 send_prompt 并发：额度会话创建后会立即触发一次刷新，
+  // list_threads 可能与 send_prompt 并发：会话创建后会立即触发一次刷新，
   // 但后端此时还没来得及把异步 agent 任务登记为 running。记录请求开始时的
   // 事件版本，若期间已经收到 acp:turn，就不能再用这份旧快照覆盖事件结果。
   const runningVersionsBeforeRequest = new Map(runningEventVersions);
@@ -563,7 +560,7 @@ export async function refreshThreads() {
   const running: Record<string, boolean> = {};
   for (const t of threads) {
     // 运行事件在本次请求期间到达时，以事件为准；否则使用后端快照。
-    // 这样不会因额度租借的「创建线程刷新」竞态把实际运行态冲回 false。
+    // 这样不会因「创建线程刷新」竞态把实际运行态冲回 false。
     const before = runningVersionsBeforeRequest.get(t.id) ?? 0;
     const current = runningEventVersions.get(t.id) ?? 0;
     const optimistic = optimisticRunningThreads.has(t.id);
@@ -883,14 +880,11 @@ export function openNewSession(quote = "") {
       mode: state.mode,
       reasoningEffort: state.reasoningEffort,
       roam: null,
-      quotaPeerToken: null,
       quote: quote.trim(),
     };
     if (meta?.roamingRole === "guest" && state.roamingPeer) {
       seed.roam = { peerToken: state.roamingPeer, folder: state.cwd };
       seed.cwd = state.cwd;
-    } else if (meta?.quotaPeerName && state.roamingPeer) {
-      seed.quotaPeerToken = state.roamingPeer;
     }
     setState("pendingNewSessionSeed", seed);
   } else {
@@ -930,13 +924,6 @@ export function markClueMentionRead(cardId: string) {
 export function roamingPeers(): Peer[] {
   const me = state.settings?.relayToken ?? "";
   return state.peers.filter((p) => p.online && p.token !== me);
-}
-
-/** 额度共享可选的队友（排除自己，离线也保留）：只要对方未撤销共享，
- *  借用方应可持续使用已获取的凭证/模型列表，不应因对方关机/离线而消失。 */
-export function quotaPeers(): Peer[] {
-  const me = state.settings?.relayToken ?? "";
-  return state.peers.filter((p) => p.token !== me && !!p.token);
 }
 
 /** 漫游：确保已拉取某对端（host）的模型/模式列表。已缓存则跳过，force 时强制刷新。
@@ -1100,55 +1087,6 @@ export async function respondRoamRequest(
   }
 }
 
-/** 本机目录执行，使用已同步的队友共享后端额度。 */
-export async function createQuotaThread(
-  peer: Peer,
-  cwd: string,
-  agentKind: AgentKind,
-  model: string,
-  mode: string,
-  clueCardId = "",
-): Promise<string> {
-  const operationId = crypto.randomUUID();
-  const t = await api.createQuotaThread(
-    peer.token,
-    peer.name,
-    cwd,
-    agentKind,
-    model || null,
-    mode || null,
-    clueCardId || null,
-    operationId,
-  );
-  rememberThreadSnapshot(t);
-  setState("expanded", reconcile({}));
-  setState({
-    currentId: t.id,
-    items: t.items,
-    plan: (t.plan as PlanEntry[] | null) ?? null,
-    proposedPlan: null,
-    cwd: t.cwd,
-    title: t.title,
-    agentKind: t.agentKind ?? agentKind,
-    model: t.model ?? "",
-    mode: t.mode ?? "",
-    reasoningEffort: "",
-    roamingPeer: peer.token,
-    loadingThread: false,
-  });
-  // 新线程通常紧接着就会由首页 sendPrompt 投递；不要在这里把后端尚未登记
-  // running 的瞬间覆盖掉事件/发送方的乐观忙碌态。
-  if (!optimisticRunningThreads.has(t.id)) setState("running", t.id, false);
-  reportActivity(true);
-  void refreshThreads();
-  ensurePeerModels(peer.token);
-  return t.id;
-}
-
-export function clearQuotaRoamingProgress() {
-  setState("quotaRoamingProgress", null);
-}
-
 // 覆盖典型 /stage 链（源会话 + 多个 stage 节点）来回切换，避免快照互相挤出后
 // 每次切换都退化成 getThread 全量拉取整条 transcript。items 是 unwrap 浅引用，
 // 单条快照内存开销可控，上限取 8 而非无上限。
@@ -1204,10 +1142,7 @@ function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileIte
       model: thread.model ?? "",
       mode: thread.mode ?? "",
       reasoningEffort: thread.reasoningEffort ?? "",
-      roamingPeer:
-        thread.roamingRole === "guest"
-          ? thread.roamingPeer ?? null
-          : thread.quotaPeer ?? null,
+      roamingPeer: thread.roamingRole === "guest" ? thread.roamingPeer ?? null : null,
       loadingThread,
       // 运行中切回会话时恢复此前收到的 usage；结束会话仍以 Turn 项的最终值为准。
       liveUsage: state.running[thread.id] ? (liveUsageByThread.get(thread.id) ?? null) : null,
@@ -1396,8 +1331,7 @@ export async function openThread(id: string) {
     // 空闲子 Agent 仍可收到排队消息/关闭日志，不一定伴随新轮次使缓存失效。
     if (cached && switching && !cached.subagent && !staleThreadSnapshots.has(id)) {
       const agentKind = cached.agentKind ?? "devin";
-      const roamingPeer =
-        cached.roamingRole === "guest" ? cached.roamingPeer ?? null : cached.quotaPeer ?? null;
+      const roamingPeer = cached.roamingRole === "guest" ? cached.roamingPeer ?? null : null;
       if (roamingPeer) ensurePeerModels(roamingPeer);
       else void ensureModelOptions(agentKind);
       return;
@@ -1436,8 +1370,7 @@ export async function openThread(id: string) {
         }
       });
     }
-    const roamingPeer =
-      t.roamingRole === "guest" ? t.roamingPeer ?? null : t.quotaPeer ?? null;
+    const roamingPeer = t.roamingRole === "guest" ? t.roamingPeer ?? null : null;
     if (roamingPeer) ensurePeerModels(roamingPeer);
     else void ensureModelOptions(agentKind);
   } catch {
@@ -1814,7 +1747,7 @@ export async function setThreadModel(model: string) {
   try {
     await api.setThreadModel(id, model || null);
   } catch (error) {
-    // 额度会话只能切到出借方已共享且本机已持有租约的模型：被拒时以后端为准回滚选择
+    // 被拒时以后端为准回滚选择
     await openThread(id).catch(() => {});
     void message(String(error), { kind: "error" });
   }
@@ -2575,7 +2508,7 @@ export async function startFireRelay(
   // 首页刚创建会话后会立即发送首条提示，此时异步 refreshThreads 可能尚未完成；
   // 直接读取后端快照，不能依赖列表中已经出现该会话。
   const root = await api.getThread(rootId);
-  if (root.roamingRole || root.quotaPeerName) {
+  if (root.roamingRole) {
     throw new Error("/fire 仅支持本地普通会话");
   }
   if (state.running[rootId]) throw new Error("请等待当前会话结束后再启动 /fire");
@@ -3435,16 +3368,14 @@ export async function initStore() {
       peer: string;
       backends: AgentKind[];
       options: PeerModels["options"];
-      sharedOptions: PeerModels["sharedOptions"];
     }>(
       "relay:peer-models",
       (e) => {
-        const { peer, backends, options, sharedOptions } = e.payload;
+        const { peer, backends, options } = e.payload;
         if (!peer) return;
         setState("peerModels", peer, {
           backends: Array.isArray(backends) ? backends : [],
           options: options ?? {},
-          sharedOptions: sharedOptions ?? {},
         });
       },
     ),
@@ -3493,9 +3424,6 @@ export async function initStore() {
         ...prev.filter((r) => r.reqId !== e.payload.reqId),
         e.payload,
       ]);
-    }),
-    listen<QuotaRoamingProgress>("relay:quota-progress", (e) => {
-      setState("quotaRoamingProgress", e.payload);
     }),
   ]);
   // 启动即反映「已暂存好」的更新，让角标立刻出现（新版本的下载交给后端静默处理）

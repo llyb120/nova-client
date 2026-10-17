@@ -648,12 +648,6 @@ pub struct Thread {
     /// 漫游对端的线程 id（guest 记录 host 侧线程 id，用于发送/取消路由）
     #[serde(default)]
     pub roaming_remote_id: Option<String>,
-    /// 额度租借提供方 token。非空时本机执行，但必须走独立租借进程，禁止回退到本机凭证。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota_peer: Option<String>,
-    /// 额度租借提供方展示名。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota_peer_name: Option<String>,
     /// 非 None：本会话在独立 git worktree 中执行（cwd 已指向该 worktree 工作目录）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
@@ -750,8 +744,6 @@ impl Thread {
             roaming_peer: None,
             roaming_peer_name: None,
             roaming_remote_id: None,
-            quota_peer: None,
-            quota_peer_name: None,
             worktree: None,
             experience_thread: false,
             employee_thread: false,
@@ -771,10 +763,6 @@ impl Thread {
     /// 是否为漫游 guest 会话（本机只接收展示，真正执行在对端）
     pub fn is_roaming_guest(&self) -> bool {
         self.roaming_role.as_deref() == Some("guest")
-    }
-
-    pub fn is_quota_borrowed(&self) -> bool {
-        self.quota_peer.is_some()
     }
 
     pub fn next_item_id(&self) -> u64 {
@@ -1013,8 +1001,6 @@ pub struct ThreadMeta {
     pub roaming_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roaming_peer_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota_peer_name: Option<String>,
     /// 非 None：该会话在独立 git worktree 中执行（前端据此显示分支标记）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
@@ -1649,9 +1635,9 @@ impl ThreadStore {
             }
             index += 1;
         }
-        // 远端路由/租约绑定旧 thread id，不能让副本借用原会话的执行通道。
-        if sources.iter().any(|t| t.roaming_role.is_some() || t.quota_peer.is_some()) {
-            return Err("包含漫游或额度租借的会话暂不支持 fork，请先召回为本地会话".into());
+        // 远端路由绑定旧 thread id，不能让副本借用原会话的执行通道。
+        if sources.iter().any(|t| t.roaming_role.is_some()) {
+            return Err("包含漫游的会话暂不支持 fork，请先召回为本地会话".into());
         }
         let ids: HashMap<&str, String> = sources.iter()
             .map(|t| (t.id.as_str(), uuid::Uuid::new_v4().to_string())).collect();
@@ -2027,12 +2013,11 @@ mod tests {
         store.threads.push(source.clone());
         assert!(store.fork_thread(&id, "  ").is_err());
         assert!(store.fork_thread("missing", "fork").is_err());
-        for case in 0..4 {
+        for case in 0..3 {
             let mut invalid = source.clone();
             match case {
                 0 => invalid.roaming_role = Some("guest".into()),
-                1 => invalid.quota_peer = Some("peer".into()),
-                2 => invalid.parent_thread_id = Some(id.clone()),
+                1 => invalid.parent_thread_id = Some(id.clone()),
                 _ => invalid.stage_source_thread_id = Some("outside-tree".into()),
             }
             store.threads = vec![invalid];

@@ -487,7 +487,7 @@ export function startWorkflow(
   return (async () => {
     const root = await api.getThread(rootId);
     // guest 只展示；工作流由持有定义和实际工作目录的 host 驱动。
-    if (root.roamingRole === "guest" || root.quotaPeerName) {
+    if (root.roamingRole === "guest") {
       throw new Error("请在执行端启动工作流");
     }
     if (root.roamingRole === "host") await api.checkRoamingWorkflow(rootId);

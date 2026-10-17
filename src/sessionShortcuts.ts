@@ -47,15 +47,6 @@ export function encodeModelTarget(agentKind: AgentKind, model: string): string {
   return `${agentKind}:${encodeURIComponent(model)}`;
 }
 
-/** 额度租借模型：与 ModelPicker 的 quota: 编码一致。 */
-export function encodeQuotaModelTarget(
-  peerToken: string,
-  agentKind: AgentKind,
-  model: string,
-): string {
-  return `quota:${encodeURIComponent(peerToken)}:${agentKind}:${encodeURIComponent(model)}`;
-}
-
 /** 漫游目录：`roam:<token>:<folder>`，folder 经 encodeURIComponent。 */
 export function encodeRoamTarget(peerToken: string, folder: string): string {
   return `roam:${encodeURIComponent(peerToken)}:${encodeURIComponent(folder)}`;
@@ -80,21 +71,7 @@ export function parseRoamTarget(
 
 export function parseModelTarget(
   target: string,
-): { agentKind: AgentKind; model: string; peerToken?: string } | null {
-  if (target.startsWith("quota:")) {
-    const parts = target.split(":");
-    if (parts.length !== 4) return null;
-    const agentKind = parts[2] as AgentKind;
-    if (!ALL_AGENT_KINDS.includes(agentKind)) return null;
-    try {
-      const peerToken = decodeURIComponent(parts[1]);
-      const model = decodeURIComponent(parts[3]);
-      if (!peerToken || !model) return null;
-      return { peerToken, agentKind, model };
-    } catch {
-      return null;
-    }
-  }
+): { agentKind: AgentKind; model: string } | null {
   const i = target.indexOf(":");
   if (i <= 0) return null;
   const agentKind = target.slice(0, i) as AgentKind;
@@ -164,11 +141,7 @@ export function mountSessionShortcuts(options: {
     path: string,
     roam?: { peerToken: string; folder: string } | null,
   ) => void;
-  onSelectModel?: (
-    agentKind: AgentKind,
-    model: string,
-    quotaPeer?: { token: string; name: string } | null,
-  ) => void;
+  onSelectModel?: (agentKind: AgentKind, model: string) => void;
   onNewSession?: () => void;
   /** 循环打开普通模式下有未读轮次的会话。 */
   onOpenUnread?: () => void;
@@ -258,13 +231,7 @@ export function mountSessionShortcuts(options: {
       if (!parsed) return;
       event.preventDefault();
       event.stopPropagation();
-      const quotaPeer = parsed.peerToken
-        ? {
-            token: parsed.peerToken,
-            name: state.peers.find((peer) => peer.token === parsed.peerToken)?.name ?? "队友",
-          }
-        : null;
-      options.onSelectModel?.(parsed.agentKind, parsed.model, quotaPeer);
+      options.onSelectModel?.(parsed.agentKind, parsed.model);
     }
   };
 

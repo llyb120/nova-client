@@ -4492,7 +4492,7 @@ button {
   font-size: 12px;
 }
 
-/* ===== 团队共享：逐行添加列表（漫游项目 / 共享模型额度） ===== */
+/* ===== 团队共享：逐行添加列表（漫游项目） ===== */
 .share-list {
   display: flex;
   flex-direction: column;

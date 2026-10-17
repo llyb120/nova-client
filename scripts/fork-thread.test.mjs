@@ -114,15 +114,15 @@ test("blank names do not submit; rejection keeps dialog/input; refresh retry doe
   assert.equal(ui.forkSourceId(), null);
 });
 
-test("roaming/quota nodes are blocked; the open fork modal pauses session shortcuts", (t) => {
+test("roaming nodes are blocked; the open fork modal pauses session shortcuts", (t) => {
   const ui = mount(t);
-  for (const patch of [{ roamingRole: "guest" }, { roamingRole: "host" }, { roamingRole: null, quotaPeer: "peer" }]) {
+  for (const patch of [{ roamingRole: "guest" }, { roamingRole: "host" }]) {
     ui.setState("threads", 1, patch);
     assert.equal(ui.forkUnavailable(), true);
     ui.startFork();
     assert.equal(ui.forkSourceId(), null);
   }
-  ui.setState("threads", 1, { roamingRole: null, quotaPeer: null });
+  ui.setState("threads", 1, { roamingRole: null });
   ui.startFork();
   ui.shortcut();
   assert.equal(ui.toggles(), 0);

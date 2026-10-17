@@ -672,41 +672,6 @@ impl SdkManager {
         self.refresh_model_options_soon();
     }
 
-    /// 出借 Lyra 额度：进程内导出本地 config.jsonc 的生效配置，
-    /// 并把 {env:NAME} 密钥占位符解析成字面量，
-    /// 借用方无需出借方的环境变量即可直接使用该配置。
-    pub async fn export_quota_credentials(&self, model: &str) -> Result<String, String> {
-        if self.adapter.agent_kind() != AgentKind::Lyra {
-            return Err("仅 Lyra 支持导出共享凭证".into());
-        }
-        let cwd = std::env::current_dir()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let shared_models: Vec<String> = self
-            .app
-            .state::<AppState>()
-            .settings
-            .lock()
-            .unwrap()
-            .quota_shared_models
-            .iter()
-            .filter_map(|key| key.strip_prefix("lyra:").map(str::to_string))
-            .collect();
-        let value = self
-            .run_bridge(
-                &cwd,
-                json!({
-                    "action": "export", "model": model, "sharedModels": shared_models
-                }),
-            )
-            .await?;
-        value
-            .as_str()
-            .filter(|config| !config.trim().is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| "Lyra 凭证导出结果无效".into())
-    }
-
     /// 返回当前缓存的模型列表，供同步的远程快照构建逻辑使用。
     pub fn get_model_options(&self) -> Option<Value> {
         self.model_options.lock().unwrap().clone()
@@ -1395,10 +1360,7 @@ impl SdkManager {
                     settings.context_retrieval_mode.as_str(),
                 );
         }
-        if !self.launch_env.is_empty() {
-            crate::credential_roaming::isolate_borrowed_command(&mut command);
-            command.envs(&self.launch_env);
-        }
+        command.envs(&self.launch_env);
         command.envs(launch.extra_env);
         apply_proxy_env(&mut command, &launch.proxy);
         if self.launch_env.is_empty() {
@@ -1439,10 +1401,7 @@ impl SdkManager {
             .arg("app-server")
             .current_dir(cwd)
             .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
-        if !self.launch_env.is_empty() {
-            crate::credential_roaming::isolate_borrowed_command(&mut command);
-            command.envs(&self.launch_env);
-        }
+        command.envs(&self.launch_env);
         apply_proxy_env(&mut command, &settings.codex_proxy);
         #[cfg(windows)]
         if state.windows_shell_shim_enabled {

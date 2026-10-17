@@ -8,8 +8,8 @@ const source = ts.createSourceFile("ConfigSelects.tsx", readFileSync(
   new URL("../src/components/ConfigSelects.tsx", import.meta.url), "utf8",
 ), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const names = new Set([
-  "encodeModelValue", "encodeQuotaModelValue", "decodeModelValue", "modelOptionsOf", "sharedList",
-  "kinds", "sharedReady", "merged", "lyraProviders", "backendOptions", "sourceOf", "modelOptions",
+  "encodeModelValue", "decodeModelValue", "modelOptionsOf",
+  "kinds", "merged", "lyraProviders", "backendOptions", "sourceOf", "modelOptions",
   "fmt", "creditsText", "priceText", "multiplierText", "detailTitle",
 ]);
 const units = [];
@@ -30,7 +30,7 @@ const efforts = {};
 new Function("exports", ts.transpileModule(readFileSync(
   new URL("../src/modelEfforts.ts", import.meta.url), "utf8",
 ), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText)(efforts);
-const select = new Function("props", "sharedOnly", "ALL_AGENT_KINDS", "foldModelEfforts", "splitEffort", `
+const select = new Function("props", "ALL_AGENT_KINDS", "foldModelEfforts", "splitEffort", `
   const createMemo = f => f;
   const state = { modelCosts: props.modelCosts };
   const agentLabel = k => k;
@@ -38,8 +38,6 @@ const select = new Function("props", "sharedOnly", "ALL_AGENT_KINDS", "foldModel
   const groupOf = () => "models";
   ${code}
   return {
-    shared: () => sharedList().flatMap(option => option.efforts ?? [option])
-      .map(option => ({ option, decoded: decodeModelValue(option.value) })),
     options: modelOptions,
     backends: backendOptions,
     decode: decodeModelValue,
@@ -48,21 +46,8 @@ const select = new Function("props", "sharedOnly", "ALL_AGENT_KINDS", "foldModel
   };
 `);
 
-test("shared selection preserves the exact model ID for every backend", () => {
-  const peer = { token: "team:user/%", name: "队友" };
-  for (const kind of kinds) {
-    for (const model of ["provider/model", "provider/model:high", "模型 / 100%", "gpt-5.6"]) {
-      const props = { agentKind: kind, sharedModels: [{ peer, options: { [kind]: [{ value: model, name: model }] } }] };
-      const [{ option, decoded }] = select(props, () => false, kinds, efforts.foldEfforts, efforts.splitEffort).shared();
-      assert.deepEqual(decoded, { agentKind: kind, model, peerToken: peer.token });
-      assert.equal(option.favoriteId, option.value);
-      assert.equal(select(props, () => true, kinds, efforts.foldEfforts, efforts.splitEffort).shared()[0].option.value, model);
-    }
-  }
-});
-
 test("WorkBuddy multipliers appear on models and folded reasoning levels, including free models", () => {
-  const picker = select({}, () => false, kinds, efforts.foldEfforts, efforts.splitEffort);
+  const picker = select({}, kinds, efforts.foldEfforts, efforts.splitEffort);
   for (const [description, expected] of [
     ["x0.29", "0.29×"], ["x1.20", "1.2×"], ["x0.00", "0×"],
     ["  X0.65  ", "0.65×"], ["×0.21", "0.21×"],
@@ -85,7 +70,7 @@ test("Devin reasoning levels inherit base prices without overriding exact model 
     "devin-model": { prices: { input: 5, cached: 0.5, output: 25 } },
     "devin-model:max": { prices: { input: 6, cached: 0.6, output: 30 } },
     free: { prices: { input: 0, cached: 0, output: 0 } },
-  } }, () => false, kinds, efforts.foldEfforts, efforts.splitEffort);
+  } }, kinds, efforts.foldEfforts, efforts.splitEffort);
   const choices = ["low", "high", "max"].map(effort => ({
     value: `devin-model:${effort}`, name: `Model · ${effort}`,
   }));
@@ -121,7 +106,7 @@ test("expanded Lyra providers keep the selected effort in its model's backend", 
       agentKind: "lyra",
       ...(merged ? { agentKinds: ["lyra", "codex"] } : {}),
       modelSource: kind => choices[kind],
-    }, () => false, kinds, efforts.foldEfforts, efforts.splitEffort);
+    }, kinds, efforts.foldEfforts, efforts.splitEffort);
     const options = picker.options();
     assert.equal(options.length, merged ? 3 : 2);
     for (const model of options) {

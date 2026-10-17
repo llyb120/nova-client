@@ -200,10 +200,6 @@ fn replace_model_state(result: &mut Value, update: &Value) -> bool {
     true
 }
 
-fn publishes_model_options(launch_env: &HashMap<String, String>) -> bool {
-    !launch_env.contains_key("NOVA_QUOTA_BORROWED")
-}
-
 /// 把 codebuddy 上报的当前模型并入可选列表（置顶，若原本不在列表里）。
 /// 应对云端清单异步就绪导致的「当前模型不在可选清单」残缺快照。
 fn merge_current_model_option(options: Vec<Value>, current: &str) -> Vec<Value> {
@@ -1486,12 +1482,6 @@ impl AcpManager {
         // 每个后端可单独配置代理：注入 HTTP(S)_PROXY 等环境变量到该子进程（空 = 直连）
         if self.kind == AgentKind::Claude {
             cmd.env_remove("CLAUDECODE");
-            if !self.launch_env.is_empty() {
-                crate::credential_roaming::isolate_borrowed_command(&mut cmd);
-                for name in ["ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"] {
-                    cmd.env_remove(name);
-                }
-            }
         }
         cmd.envs(&self.launch_env);
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
@@ -2714,14 +2704,11 @@ impl AcpManager {
             "modes": modes,
         });
         *self.model_options.lock().unwrap() = Some(v.clone());
-        // 额度借用实例属于另一个账号；只保留自己的进程内列表，不能覆盖主账号缓存/UI。
-        if publishes_model_options(&self.launch_env) {
-            self.persist_model_options(&v);
-            let _ = self.app.emit(
-                EV_OPTIONS,
-                json!({ "agentKind": self.kind.as_str(), "options": v }),
-            );
-        }
+        self.persist_model_options(&v);
+        let _ = self.app.emit(
+            EV_OPTIONS,
+            json!({ "agentKind": self.kind.as_str(), "options": v }),
+        );
     }
 
     fn capture_commands(&self, update: &Value) {
@@ -4810,20 +4797,16 @@ fn resolve_sibling_program(configured_program: &str, sibling: &str) -> String {
 
 /// `cbc-prewarm activate` 通过 `--env` 显式构造最终服务环境；普通本机会话必须把
 /// 当前进程继承的 CodeBuddy 配置一并传入，否则预热路径会表现为启动后环境变量消失。
-/// 额度借用保持隔离，只使用租约提供的 launch_env，禁止继承本机 CodeBuddy 凭据。
 fn merge_codebuddy_activation_env(
     launch_env: &HashMap<String, String>,
     inherited: impl IntoIterator<Item = (String, String)>,
 ) -> std::collections::BTreeMap<String, String> {
-    let borrowed = launch_env.contains_key("NOVA_QUOTA_BORROWED");
     let mut env = std::collections::BTreeMap::new();
-    if !borrowed {
-        env.extend(
-            inherited
-                .into_iter()
-                .filter(|(key, _)| key.to_ascii_uppercase().starts_with("CODEBUDDY_")),
-        );
-    }
+    env.extend(
+        inherited
+            .into_iter()
+            .filter(|(key, _)| key.to_ascii_uppercase().starts_with("CODEBUDDY_")),
+    );
     env.extend(launch_env.clone());
     // Nova kills managed process trees on eviction/exit. An interrupted npm self-update can
     // leave global CLI shims renamed to temporary backups; keep updates outside this lifecycle.
@@ -5041,7 +5024,7 @@ mod codebuddy_acp_tests {
         codebuddy_command, codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
         is_process_exit_error, is_retriable_rpc_error, keep_known_model_options, lru_evict_keys,
         merge_codebuddy_activation_env, merge_current_model_option, merge_model_config_option,
-        prompt_conn_needs_rebuild, publishes_model_options, stalled_prompt_error,
+        prompt_conn_needs_rebuild, stalled_prompt_error,
         thread_connection_key, AcpManager, PromptFailure, CODEBUDDY_ACP_ARGS,
     };
     use serde_json::json;
@@ -5201,7 +5184,7 @@ mod codebuddy_acp_tests {
     }
 
     #[test]
-    fn codebuddy_merges_standard_and_extension_models_and_borrowed_instances_do_not_publish_them() {
+    fn codebuddy_merges_standard_and_extension_models() {
         let merged = merge_model_config_option(
             json!([
                 { "id": "mode", "options": [{ "value": "plan", "name": "Plan" }] },
@@ -5222,11 +5205,6 @@ mod codebuddy_acp_tests {
                 { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
             ])
         );
-        assert!(publishes_model_options(&HashMap::new()));
-        assert!(!publishes_model_options(&HashMap::from([(
-            "NOVA_QUOTA_BORROWED".into(),
-            "1".into(),
-        )])));
     }
 
     #[test]
@@ -5300,7 +5278,7 @@ mod codebuddy_acp_tests {
     }
 
     #[test]
-    fn prewarm_activation_preserves_local_codebuddy_environment_but_isolates_borrowed_sessions() {
+    fn prewarm_activation_preserves_local_codebuddy_environment() {
         let inherited = [
             ("CODEBUDDY_API_KEY".into(), "local-secret".into()),
             ("OTHER_KEY".into(), "ignored".into()),
@@ -5312,19 +5290,6 @@ mod codebuddy_acp_tests {
         );
         assert!(!local.contains_key("OTHER_KEY"));
         assert_eq!(local["DISABLE_AUTOUPDATER"], "1");
-
-        let borrowed = HashMap::from([
-            ("NOVA_QUOTA_BORROWED".into(), "1".into()),
-            ("CODEBUDDY_CONFIG_DIR".into(), "isolated".into()),
-            ("DISABLE_AUTOUPDATER".into(), "0".into()),
-        ]);
-        let isolated = merge_codebuddy_activation_env(&borrowed, inherited);
-        assert!(!isolated.contains_key("CODEBUDDY_API_KEY"));
-        assert_eq!(isolated["DISABLE_AUTOUPDATER"], "1");
-        assert_eq!(
-            isolated.get("CODEBUDDY_CONFIG_DIR").map(String::as_str),
-            Some("isolated")
-        );
     }
 
     #[test]

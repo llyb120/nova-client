@@ -571,19 +571,7 @@ async fn complete_data(
     Ok(Value::String(data))
 }
 
-fn export_data(request: &Value, roots: &Roots) -> Result<Value, String> {
-    let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
-    let selected = request["model"].as_str().ok_or("共享导出缺少模型")?;
-    let selections: Vec<String> = serde_json::from_value(request["sharedModels"].clone())
-        .map_err(|_| "共享导出缺少模型白名单")?;
-    let config_value = config::shared_config(&config_value, &selections, selected)?;
-    let resolved = config::resolve_config_env(&config_value, &config::process_env())?;
-    Ok(Value::String(
-        serde_json::to_string_pretty(&resolved).map_err(|e| e.to_string())?,
-    ))
-}
-
-/// 一次性请求（models/title/complete/export）：进程内直接调用，返回 data 载荷。
+/// 一次性请求（models/title/complete）：进程内直接调用，返回 data 载荷。
 /// borrowed_root：借用额度运行时的隔离数据根（凭证即其中的 alkaid/config.jsonc）；
 /// None 表示主运行时，使用全局数据根。
 pub async fn run_oneshot(
@@ -598,7 +586,6 @@ pub async fn run_oneshot(
         Some("models") => models_data(http, request, &roots).await,
         Some("title") => title_data(http, request, &roots).await,
         Some("complete") => complete_data(http, request, &roots).await,
-        Some("export") => export_data(request, &roots),
         Some(other) => Err(format!("Lyra 不支持的 action：{other}")),
         None => Err("Lyra 请求缺少 action".into()),
     }
@@ -685,11 +672,6 @@ async fn dispatch(http: &reqwest::Client, request: &Value) -> Result<(), String>
         }
         Some("complete") => {
             let data = complete_data(http, request, &roots).await?;
-            send(&json!({ "ok": true, "data": data }));
-            Ok(())
-        }
-        Some("export") => {
-            let data = export_data(request, &roots)?;
             send(&json!({ "ok": true, "data": data }));
             Ok(())
         }

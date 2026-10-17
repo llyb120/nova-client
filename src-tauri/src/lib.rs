@@ -15,7 +15,6 @@ mod codex;
 mod codex_radar;
 mod codex_app_server;
 mod context_service;
-mod credential_roaming;
 mod gitwt;
 mod http_stream;
 pub mod image_generation;
@@ -61,7 +60,6 @@ pub use server::maybe_run_management_command as maybe_run_server_command;
 
 use acp::AcpManager;
 use codex::CodexManager;
-use credential_roaming::{BorrowedManager, BorrowedRuntime};
 use relay::{RelayManager, Share, WorkflowShare};
 use sdk_adapters::{CodexAdapter, CursorAdapter, LyraAdapter};
 use sdk_runtime::SdkManager;
@@ -107,10 +105,6 @@ pub struct AppState {
     /// Codex app-server 对话后端，复用公共桥接运行时；不依赖 Codex SDK。
     pub codexplus: Arc<SdkManager>,
     pub cursorplus: Arc<SdkManager>,
-    /// 额度租借会话的独立后端进程与临时凭证目录（只在本次运行内存在）。
-    pub borrowed_runtimes: Mutex<HashMap<String, BorrowedRuntime>>,
-    /// 重启后按需重新申请额度凭证时的线程级互斥，避免连续发送重复创建隔离运行时。
-    pub restoring_borrowed_runtimes: Mutex<HashSet<String>>,
     pub relay: Arc<RelayManager>,
     pub config_dir: PathBuf,
     /// 用户最近一次操作的时间戳（ms）。前端把鼠标/键盘等交互节流上报到这里，
@@ -140,14 +134,6 @@ impl AppState {
             AgentKind::WorkBuddy => Some(self.workbuddy.clone()),
             _ => None,
         }
-    }
-
-    pub fn borrowed_runtime(&self, thread_id: &str) -> Option<BorrowedRuntime> {
-        self.borrowed_runtimes
-            .lock()
-            .unwrap()
-            .get(thread_id)
-            .cloned()
     }
 
     /// 某后端在设置里是否启用（关闭的后端不参与标题/分享等自动路由）。
@@ -290,12 +276,6 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
     if thread.is_roaming_guest() {
         return state.relay.is_guest_running(&thread.id);
     }
-    if thread.is_quota_borrowed() {
-        return state
-            .borrowed_runtime(&thread.id)
-            .map(|runtime| runtime.is_running(&thread.id))
-            .unwrap_or(false);
-    }
     match thread.agent_kind {
         AgentKind::Lyra => state.lyra.is_running(&thread.id),
         AgentKind::Devin => state.acp.is_running(&thread.id),
@@ -321,8 +301,7 @@ fn is_starrable_thread(thread: &Thread) -> bool {
 }
 
 fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
-    // 漫游会话（host 替别人执行 / guest 收看别人执行）、额度租借会话与普通会话一样参与自动
-    // 清理：后者的运行时与隔离凭证只存活于单次运行，重启后只剩再也跑不动的僵尸记录。
+    // 漫游会话（host 替别人执行 / guest 收看别人执行）与普通会话一样参与自动清理。
     // 仍豁免：经验训练会话和星标会话。运行中的会话由调用方另行排除。
     !thread.experience_thread && !thread.starred
 }
@@ -441,16 +420,6 @@ pub(crate) async fn shutdown_agent_processes(state: &AppState) {
     state.codexplus.shutdown();
     state.codebuddy.shutdown();
     state.cursorplus.shutdown();
-    let borrowed: Vec<BorrowedRuntime> = state
-        .borrowed_runtimes
-        .lock()
-        .unwrap()
-        .drain()
-        .map(|(_, runtime)| runtime)
-        .collect();
-    for runtime in borrowed {
-        runtime.shutdown().await;
-    }
 }
 
 fn agent_kind_for_thread(state: &AppState, thread_id: &str) -> Result<AgentKind, String> {
@@ -459,15 +428,6 @@ fn agent_kind_for_thread(state: &AppState, thread_id: &str) -> Result<AgentKind,
         .get(thread_id)
         .map(|t| t.agent_kind.clone())
         .ok_or_else(|| "线程不存在".into())
-}
-
-fn cleanup_borrowed_runtime(state: &AppState, thread_id: &str) {
-    let runtime = state.borrowed_runtimes.lock().unwrap().remove(thread_id);
-    if let Some(runtime) = runtime {
-        tauri::async_runtime::spawn(async move {
-            runtime.shutdown().await;
-        });
-    }
 }
 
 #[cfg(test)]
@@ -534,16 +494,11 @@ mod session_auto_cleanup_tests {
         assert!(is_normal_thread_for_auto_cleanup(&thread));
         thread.roaming_role = Some("guest".into());
         assert!(is_normal_thread_for_auto_cleanup(&thread));
-        thread.roaming_role = None;
-        // 额度租借会话不再豁免
-        thread.quota_peer = Some("peer-token".into());
-        assert!(is_normal_thread_for_auto_cleanup(&thread));
     }
 
     #[test]
-    fn quota_threads_support_starring() {
+    fn roaming_guest_threads_cannot_be_starred() {
         let mut thread = Thread::new(String::new(), AgentKind::Devin, None, None, None, false);
-        thread.quota_peer = Some("peer".into());
         assert!(is_starrable_thread(&thread));
 
         thread.roaming_role = Some("guest".into());
@@ -915,7 +870,6 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
             unread_turns: t.unread_turns,
             roaming_role: t.roaming_role.clone(),
             roaming_peer_name: t.roaming_peer_name.clone(),
-            quota_peer_name: t.quota_peer_name.clone(),
             worktree: t
                 .worktree
                 .clone()
@@ -2521,7 +2475,6 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
         state.codebuddy.forget_session_of_thread(id);
         state.workbuddy.forget_session_of_thread(id);
         state.cursorplus.forget_session_of_thread(id);
-        cleanup_borrowed_runtime(state, id);
         native_browser::release_thread(app, id);
     }
     // 自动清理的普通会话仍保留在回收站一个周期，session 要等彻底过期再删；
@@ -3329,12 +3282,6 @@ fn delete_time_machine_context(
         AgentKind::WorkBuddy => state.workbuddy.forget_session_of_thread(&thread_id),
         AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&thread_id),
     }
-    if let Some(runtime) = state.borrowed_runtime(&thread_id) {
-        match runtime.manager {
-            BorrowedManager::Acp(manager) => manager.forget_session_of_thread(&thread_id),
-            BorrowedManager::Sdk(manager) => manager.forget_session_of_thread(&thread_id),
-        }
-    }
     let _ = app.emit(acp::EV_THREADS, json!({}));
     Ok(time_machine::RestoreResult {
         thread_id,
@@ -3416,29 +3363,6 @@ fn set_thread_model(
     thread_id: String,
     model: Option<String>,
 ) -> Result<(), String> {
-    // 额度租借会话可以换模型，但只能换到本会话出借方明确共享、且凭证已就绪的模型。
-    // 同时向多人租借时，挑到别人的模型会串凭证；校验放在写库前，被拒时不留半套状态。
-    let is_quota = {
-        let store = state.store.lock().unwrap();
-        let thread = store.get(&thread_id).ok_or("线程不存在")?;
-        if !thread.is_quota_borrowed() {
-            false
-        } else {
-            let value = model.as_deref().unwrap_or("").trim();
-            let peer = thread.quota_peer.clone().unwrap_or_default();
-            if value.is_empty()
-                || !state
-                    .relay
-                    .can_switch_quota_model(&peer, &thread.agent_kind, value)
-            {
-                return Err(format!(
-                    "额度会话只能切换到{}已共享且凭证已就绪的模型",
-                    thread.quota_peer_name.as_deref().unwrap_or("该队友")
-                ));
-            }
-            true
-        }
-    };
     let agent_kind;
     let is_guest;
     let was_running;
@@ -3459,22 +3383,6 @@ fn set_thread_model(
     }
     if is_guest {
         state.relay.guest_sync_config(&thread_id);
-    } else if let Some(runtime) = state.borrowed_runtime(&thread_id) {
-        match runtime.manager {
-            BorrowedManager::Acp(manager) => {
-                tauri::async_runtime::spawn(async move {
-                    manager.sync_thread_config(&thread_id).await;
-                });
-            }
-            BorrowedManager::Sdk(manager) => {
-                if !was_running {
-                    manager.forget_session_of_thread(&thread_id);
-                }
-            }
-        }
-    } else if is_quota {
-        // 重启后隔离运行时已丢、但本次已持有目标模型租约：新模型已落库，
-        // 下一轮发送会走 restore_quota_runtime 重建，不能去动本机全局 manager。
     } else if matches!(agent_kind, AgentKind::Devin | AgentKind::Kimi | AgentKind::Claude
         | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::WorkBuddy)
     {
@@ -3503,29 +3411,16 @@ fn set_thread_mode(
 ) -> Result<(), String> {
     let agent_kind;
     let is_guest;
-    let is_quota;
     {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
         thread.mode = mode.filter(|s| !s.is_empty());
         agent_kind = thread.agent_kind.clone();
         is_guest = thread.is_roaming_guest();
-        is_quota = thread.is_quota_borrowed();
         store.save();
     }
     if is_guest {
         state.relay.guest_sync_config(&thread_id);
-    } else if let Some(runtime) = state.borrowed_runtime(&thread_id) {
-        match runtime.manager {
-            BorrowedManager::Acp(manager) => {
-                tauri::async_runtime::spawn(async move {
-                    manager.sync_thread_config(&thread_id).await;
-                });
-            }
-            BorrowedManager::Sdk(manager) => manager.forget_session_of_thread(&thread_id),
-        }
-    } else if is_quota {
-        return Err("额度凭证已过期，请重新发起租借".into());
     } else if let Some(mgr) = state.acp_for(&agent_kind) {
         tauri::async_runtime::spawn(async move {
             mgr.sync_thread_config(&thread_id).await;
@@ -3592,7 +3487,7 @@ fn set_thread_starred(
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
         if !is_starrable_thread(thread) {
-            return Err("仅普通会话和额度租借会话支持星标".into());
+            return Err("仅普通会话支持星标".into());
         }
         thread.starred = starred;
         store.save();
@@ -3638,9 +3533,6 @@ fn set_thread_agent(
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
         if thread.is_roaming_guest() {
             return Err("漫游会话暂不支持切换 agent".into());
-        }
-        if thread.is_quota_borrowed() {
-            return Err("额度租借会话的后端已绑定；请重新发起租借以切换后端".into());
         }
         old_kind = thread.agent_kind.clone();
         changed = old_kind != agent_kind;
@@ -3880,17 +3772,13 @@ pub(crate) fn dispatch_prompt(
     if text.is_empty() && images.is_empty() {
         return Err("内容不能为空".into());
     }
-    let (agent_kind, is_guest, is_quota) = {
+    let (agent_kind, is_guest) = {
         let store = state.store.lock().unwrap();
         let t = store.get(&thread_id).ok_or("线程不存在")?;
         if t.subagent {
             return Err("子 Agent 执行记录只读，请回主会话调度".into());
         }
-        (
-            t.agent_kind.clone(),
-            t.is_roaming_guest(),
-            t.is_quota_borrowed(),
-        )
+        (t.agent_kind.clone(), t.is_roaming_guest())
     };
     // 内置 /fire：任意入口（IPC、远程、后台重发、worktree 补发若未在前端拦截等）
     // 都交前端编排，禁止把字面量丢给模型；子 Agent 必须在路由前拒绝。
@@ -3920,72 +3808,6 @@ pub(crate) fn dispatch_prompt(
     // 漫游 guest：本机不执行，转发到对端 host
     if is_guest {
         return state.relay.guest_send_prompt(&thread_id, text, images);
-    }
-    if is_quota {
-        let Some(runtime) = state.borrowed_runtime(&thread_id) else {
-            let started = state
-                .restoring_borrowed_runtimes
-                .lock()
-                .unwrap()
-                .insert(thread_id.clone());
-            if !started {
-                return Err("额度会话正在恢复，请稍候再发送".into());
-            }
-            let restore_app = app.clone();
-            let restore_thread_id = thread_id.clone();
-            tauri::async_runtime::spawn(async move {
-                let state = restore_app.state::<AppState>();
-                let result = state.relay.restore_quota_runtime(&restore_thread_id).await;
-                state
-                    .restoring_borrowed_runtimes
-                    .lock()
-                    .unwrap()
-                    .remove(&restore_thread_id);
-                match result {
-                    Ok(()) => {
-                        if let Err(error) =
-                            dispatch_prompt(&restore_app, restore_thread_id.clone(), text, images)
-                        {
-                            append_thread_error(&restore_app, &restore_thread_id, error);
-                        }
-                    }
-                    Err(error) => append_thread_error(
-                        &restore_app,
-                        &restore_thread_id,
-                        format!("额度会话恢复失败：{error}"),
-                    ),
-                }
-            });
-            return Ok(());
-        };
-        match runtime.manager {
-            BorrowedManager::Acp(manager) => {
-                if matches!(agent_kind, AgentKind::CodeBuddy | AgentKind::WorkBuddy | AgentKind::Cursor)
-                    || !manager.is_running(&thread_id)
-                {
-                    tauri::async_runtime::spawn(async move {
-                        manager.run_prompt(thread_id, text, images).await;
-                    });
-                } else {
-                    tauri::async_runtime::spawn(async move {
-                        manager.steer_prompt(thread_id, text, images).await;
-                    });
-                }
-            }
-            BorrowedManager::Sdk(manager) => {
-                // Lyra：原生 steer；Cursor 等：打断当前轮后以新 turn / slim memory 继续。
-                if manager.is_running(&thread_id) {
-                    tauri::async_runtime::spawn(async move {
-                        manager.steer_prompt(thread_id, text, images).await;
-                    });
-                } else {
-                    tauri::async_runtime::spawn(async move {
-                        manager.run_prompt(thread_id, text, images).await;
-                    });
-                }
-            }
-        }
-        return Ok(());
     }
     match agent_kind {
         AgentKind::Lyra => {
@@ -4081,7 +3903,7 @@ fn truncate_thread(
     // 与手动恢复保持相同的锁顺序，保证编辑分叉和恢复不会交叉写时间线或项目文件。
     let _time_machine_guard = state.time_machine_lock.lock().unwrap();
     let capture_workspace = state.settings.lock().unwrap().checkpoint_enabled;
-    let (agent_kind, cwd, old_session_id, retained_turns, is_quota, is_guest) = {
+    let (agent_kind, cwd, old_session_id, retained_turns, is_guest) = {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
         let idx = thread
@@ -4116,17 +3938,7 @@ fn truncate_thread(
         }
         // 截断到开头时重置标题，让编辑后的首条消息重新生成标题
         if idx == 0 {
-            thread.title = thread
-                .quota_peer_name
-                .as_ref()
-                .map(|peer| {
-                    let name = Path::new(&thread.cwd)
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or(&thread.cwd);
-                    format!("额度@{peer} · {name}")
-                })
-                .unwrap_or_else(|| "新会话".into());
+            thread.title = "新会话".into();
         }
         thread.updated_at = now_ms();
         let retained_turns = thread
@@ -4139,7 +3951,6 @@ fn truncate_thread(
             thread.cwd.clone(),
             old_session_id,
             retained_turns,
-            thread.is_quota_borrowed(),
             is_guest,
         );
         store.save();
@@ -4158,12 +3969,6 @@ fn truncate_thread(
     state.codebuddy.forget_session_of_thread(&thread_id);
     state.workbuddy.forget_session_of_thread(&thread_id);
     state.cursorplus.forget_session_of_thread(&thread_id);
-    if let Some(runtime) = state.borrowed_runtime(&thread_id) {
-        match runtime.manager {
-            BorrowedManager::Acp(manager) => manager.forget_session_of_thread(&thread_id),
-            BorrowedManager::Sdk(manager) => manager.forget_session_of_thread(&thread_id),
-        }
-    }
 
     let _ = app.emit(acp::EV_THREADS, json!({}));
     let images = images.unwrap_or_default();
@@ -4188,22 +3993,11 @@ fn truncate_thread(
             match agent_kind {
                 AgentKind::Codex | AgentKind::CodexPlus if retained_turns > 0 => {
                     if let Some(session_id) = old_session_id.as_deref() {
-                        let manager = match state.borrowed_runtime(&thread_id) {
-                            Some(runtime) => match runtime.manager {
-                                BorrowedManager::Sdk(manager) => Some(manager),
-                                _ => None,
-                            },
-                            None if !is_quota => Some(state.codexplus.clone()),
-                            None => None,
-                        };
-                        if let Some(manager) = manager {
-                            manager
-                                .fork_session(&cwd, session_id, retained_turns)
-                                .await
-                                .ok()
-                        } else {
-                            None
-                        }
+                        state
+                            .codexplus
+                            .fork_session(&cwd, session_id, retained_turns)
+                            .await
+                            .ok()
                     } else {
                         None
                     }
@@ -4291,25 +4085,14 @@ async fn cancel_turn(
         );
         return Ok(());
     }
-    let (is_guest, is_quota) = {
+    let is_guest = {
         let store = state.store.lock().unwrap();
         store
             .get(&thread_id)
-            .map(|t| (t.is_roaming_guest(), t.is_quota_borrowed()))
-            .unwrap_or((false, false))
+            .is_some_and(|t| t.is_roaming_guest())
     };
     if is_guest {
         return state.relay.guest_cancel(&thread_id);
-    }
-    if let Some(runtime) = state.borrowed_runtime(&thread_id) {
-        match runtime.manager {
-            BorrowedManager::Acp(manager) => manager.cancel(&thread_id).await,
-            BorrowedManager::Sdk(manager) => manager.cancel(&thread_id).await,
-        }
-        return Ok(());
-    }
-    if is_quota {
-        return Err("额度凭证已过期，请重新发起租借".into());
     }
     let kind = agent_kind_for_thread(&state, &thread_id)?;
     match kind {
@@ -4337,16 +4120,6 @@ async fn respond_permission(
         .guest_respond_permission(&request_key, &option_id)
     {
         return Ok(());
-    }
-    let borrowed = state
-        .borrowed_runtimes
-        .lock()
-        .unwrap()
-        .values()
-        .find(|runtime| runtime.has_pending_permission(&request_key))
-        .cloned();
-    if let Some(runtime) = borrowed {
-        return runtime.respond_permission(&request_key, &option_id).await;
     }
     if state.workbuddy.has_pending_permission(&request_key) {
         state.workbuddy.respond_permission(&request_key, &option_id).await
@@ -4451,7 +4224,6 @@ async fn apply_runtime_settings(
         restart_cursor,
         restart_codex,
         restart_relay,
-        notify_peer_models,
         recheck_availability,
     ) = {
         let mut s = state.settings.lock().unwrap();
@@ -4519,7 +4291,6 @@ async fn apply_runtime_settings(
             || s.codex_args != settings.codex_args
             || s.codex_proxy != settings.codex_proxy
             || s.codex_enabled != settings.codex_enabled;
-        let notify_peer_models = s.quota_shared_models != settings.quota_shared_models;
         let restart_relay = s.relay_server != settings.relay_server
             || s.relay_token != settings.relay_token
             || s.relay_groups != settings.relay_groups;
@@ -4543,7 +4314,6 @@ async fn apply_runtime_settings(
             restart_cursor,
             restart_codex,
             restart_relay,
-            notify_peer_models,
             recheck_availability,
         )
     };
@@ -4577,8 +4347,6 @@ async fn apply_runtime_settings(
     }
     if restart_relay {
         state.relay.restart();
-    } else if notify_peer_models {
-        state.relay.notify_peer_models_changed();
     }
     if recheck_availability {
         spawn_backend_availability_check(app.clone());
@@ -5137,57 +4905,6 @@ async fn create_roaming_thread(
         .await
 }
 
-/// 借用方：本机目录执行，但临时使用在线队友加密授权的后端额度。
-#[tauri::command]
-async fn create_quota_thread(
-    state: State<'_, AppState>,
-    peer_token: String,
-    peer_name: String,
-    cwd: String,
-    agent_kind: Option<AgentKind>,
-    model: Option<String>,
-    mode: Option<String>,
-    clue_card_id: Option<String>,
-    operation_id: String,
-) -> Result<Thread, String> {
-    let clue_context = match clue_card_id.filter(|value| !value.trim().is_empty()) {
-        Some(card_id) => Some(state.relay.clue_context(&card_id).await?),
-        None => None,
-    };
-    state
-        .relay
-        .create_quota_thread(
-            peer_token,
-            peer_name,
-            cwd,
-            agent_kind.unwrap_or(AgentKind::Devin),
-            model,
-            mode,
-            clue_context,
-            operation_id,
-        )
-        .await
-}
-
-/// 选择共享模型时后台预热应用级额度租约，正式创建会话时直接复用。
-#[tauri::command]
-async fn prepare_quota_lease(
-    state: State<'_, AppState>,
-    peer_token: String,
-    agent_kind: AgentKind,
-    model: String,
-) -> Result<(), String> {
-    state
-        .relay
-        .prepare_quota_lease(peer_token, agent_kind, model)
-        .await
-}
-
-#[tauri::command]
-fn cancel_quota_roaming(state: State<'_, AppState>, operation_id: String) -> bool {
-    state.relay.cancel_quota_roaming(&operation_id)
-}
-
 /// guest：召回漫游会话——请求 host 把完整会话快照 Flow 回来，
 /// 收到后在收件箱选择本地项目接收成本地会话
 #[tauri::command]
@@ -5521,7 +5238,7 @@ pub fn run() {
             if let Err(error) = agent_config::sync_global_instructions(&dir) {
                 eprintln!("[agent-config] 启动同步失败：{error}");
             }
-            // 上次若异常退出，租借凭证明文目录可能没走正常清理；启动第一时间删除。
+            // 旧版额度租借若异常退出可能残留明文凭证目录，启动时顺手删除。
             let _ = std::fs::remove_dir_all(std::env::temp_dir().join("Nova-borrowed-credentials"));
 
             // 清理上次自更新留下的旧 exe
@@ -5621,8 +5338,6 @@ pub fn run() {
                 lyra,
                 codexplus,
                 cursorplus,
-                borrowed_runtimes: Mutex::new(HashMap::new()),
-                restoring_borrowed_runtimes: Mutex::new(HashSet::new()),
                 relay: relay.clone(),
                 config_dir: dir.clone(),
                 // 启动即视为一次活动，避免刚开机就触发静默升级
@@ -6031,9 +5746,6 @@ pub fn run() {
             set_folder_roaming,
             set_roaming_folders,
             create_roaming_thread,
-            create_quota_thread,
-            prepare_quota_lease,
-            cancel_quota_roaming,
             recall_roaming_thread,
             request_peer_models,
             reply_roaming_workflows,

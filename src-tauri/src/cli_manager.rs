@@ -287,10 +287,6 @@ pub async fn statuses(settings: &Settings) -> Vec<CliStatus> {
     result
 }
 
-pub fn install_command(kind: &AgentKind, settings: &Settings) -> String {
-    spec_for(kind, settings).install_command
-}
-
 pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
     if matches!(kind, AgentKind::Cursor | AgentKind::Lyra) {
         return true;
@@ -313,9 +309,9 @@ mod tests {
             AgentKind::Codex,
             AgentKind::CodeBuddy,
         ] {
-            assert!(!install_command(&kind, &settings).is_empty());
+            assert!(!spec_for(&kind, &settings).install_command.is_empty());
         }
-        assert!(install_command(&AgentKind::CodeBuddy, &settings)
+        assert!(spec_for(&AgentKind::CodeBuddy, &settings).install_command
             .contains("@tencent-ai/codebuddy-code@latest"));
     }
 

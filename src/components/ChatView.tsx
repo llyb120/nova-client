@@ -58,12 +58,7 @@ export function ChatView() {
   mountSessionShortcuts({
     allowedActions: ["selectModel"],
     onSelectProject: () => {},
-    onSelectModel: (agentKind, model, quotaPeer) => {
-      // 额度会话的共享模型条目（快捷键 target 带队友）不能拿来换后端；只当前后端
-      // 的模型走 set_thread_model，由后端按已持有的额度租约把关。
-      if (quotaPeer) return;
-      void pickThreadModel(agentKind, model);
-    },
+    onSelectModel: (agentKind, model) => void pickThreadModel(agentKind, model),
   });
   let scrollQueued = false;
   let lastScrollTop = 0;
@@ -455,7 +450,7 @@ export function ChatView() {
   const [forkBusy, setForkBusy] = createSignal(false);
   const [forkError, setForkError] = createSignal("");
   const [forkedId, setForkedId] = createSignal<string | null>(null);
-  const forkUnavailable = () => !!(currentMeta()?.roamingRole || currentMeta()?.quotaPeer);
+  const forkUnavailable = () => !!(currentMeta()?.roamingRole);
   const startFork = () => {
     const meta = currentMeta();
     if (!meta || forkUnavailable() || forkSourceId()) return;
@@ -897,15 +892,6 @@ export function ChatView() {
               : `代执行 · ${currentMeta()?.roamingPeerName ?? "队友"}`}
           </span>
         </Show>
-        <Show when={currentMeta()?.quotaPeerName}>
-          <span
-            class="roaming-badge quota"
-            title={`本机目录执行，临时使用 ${currentMeta()?.quotaPeerName} 的加密授权额度`}
-          >
-            <IconBroadcast size={11} />
-            额度 · {currentMeta()?.quotaPeerName}
-          </span>
-        </Show>
         <div
           class="chat-cwd"
           title={
@@ -955,8 +941,8 @@ export function ChatView() {
           <button
             type="button"
             class="chat-share-btn"
-            title={forkUnavailable() ? "漫游或额度会话不支持 Fork" : "Fork：复制整条会话及全部 Stage，不影响原会话；使用同一工作目录，不复制文件"}
-            aria-label={forkUnavailable() ? "Fork（漫游或额度会话不可用）" : "Fork 整条会话"}
+            title={forkUnavailable() ? "漫游会话不支持 Fork" : "Fork：复制整条会话及全部 Stage，不影响原会话；使用同一工作目录，不复制文件"}
+            aria-label={forkUnavailable() ? "Fork（漫游会话不可用）" : "Fork 整条会话"}
             aria-haspopup="dialog"
             disabled={forkUnavailable()}
             onClick={startFork}

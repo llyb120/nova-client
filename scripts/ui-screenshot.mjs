@@ -57,7 +57,7 @@ const mockSettings = {
   defaultMode: "build", lightweightModelAgent: "lyra", lightweightModel: "",
   editor: "cursor", theme: "", historyDisplayMode: "project",
   relayServer: "", relayToken: "", relayGroups: "", remoteControlEnabled: false,
-  quotaSharedModels: [], devinEnabled: true, codexEnabled: true,
+  devinEnabled: true, codexEnabled: true,
   codebuddyEnabled: false, cursorEnabled: false,
   codexIntegration: "app-server", codebuddyIntegration: "sdk",
   cursorIntegration: "sdk",

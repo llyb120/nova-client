@@ -125,10 +125,6 @@ export interface ThreadMeta {
   roamingRole?: string | null;
   /** 漫游对端展示名 */
   roamingPeerName?: string | null;
-  /** 非空：本机会话使用该在线队友临时授权的额度（提供方 token） */
-  quotaPeer?: string | null;
-  /** 额度租借提供方展示名 */
-  quotaPeerName?: string | null;
   /** 非空：该会话在独立 git worktree 中执行 */
   worktree?: Worktree | null;
   /** 兼容旧版本训练记录，仅用于保持历史隔离。 */
@@ -286,9 +282,6 @@ export interface Thread {
   roamingPeer?: string | null;
   roamingPeerName?: string | null;
   roamingRemoteId?: string | null;
-  /** 非空：本机会话使用该在线队友临时授权的额度 */
-  quotaPeer?: string | null;
-  quotaPeerName?: string | null;
   /** 非空：该会话在独立 git worktree 中执行（cwd 已指向该 worktree 工作目录） */
   worktree?: Worktree | null;
   /** 兼容旧版本训练记录，仅用于保持历史隔离。 */
@@ -401,7 +394,7 @@ export interface SessionShortcut {
   /** 规范化按键，如 Ctrl+1 / Alt+P。 */
   keys: string;
   action: SessionShortcutAction;
-  /** 本地项目路径、roam/quota 编码、agentKind:model、工作流 id，或 insertText 的插入内容；newSession / openUnread 可为空。 */
+  /** 本地项目路径、roam 编码、agentKind:model、工作流 id，或 insertText 的插入内容；newSession / openUnread 可为空。 */
   target: string;
 }
 
@@ -413,7 +406,6 @@ export interface PendingNewSessionSeed {
   mode: string;
   reasoningEffort: string;
   roam: { peerToken: string; folder: string } | null;
-  quotaPeerToken: string | null;
   /** 快捷键触发时，聊天记录中选中的引用文本。 */
   quote: string;
 }
@@ -490,8 +482,6 @@ export interface Settings {
   relayGroups: string;
   /** 是否允许 server 端远程查看和控制本机会话（默认关闭） */
   remoteControlEnabled: boolean;
-  /** 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>` */
-  quotaSharedModels: string[];
   /** 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>` */
   modelFavorites: string[];
   /** 会话快捷键：按键一键切换项目或模型 */
@@ -603,8 +593,6 @@ export interface PeerModels {
   backends: AgentKind[];
   /** 各后端的模型/模式选项（缺失的后端为 undefined） */
   options: Partial<Record<AgentKind, ModelOptions | null>>;
-  /** 对端明确开放额度租借的模型；仅注入新会话模型选择器。 */
-  sharedOptions: Partial<Record<AgentKind, ModelOptions | null>>;
 }
 
 /** 团队/漫游：在线名单里的一个人 */
@@ -657,12 +645,6 @@ export interface IncomingRoamRequest {
   mode?: string | null;
   /** 已有会话授权过期后的单轮续期审批。 */
   continuation?: boolean;
-}
-
-export interface QuotaRoamingProgress {
-  operationId: string;
-  stage: "requesting" | "preparing" | "ready";
-  message: string;
 }
 
 /** 收到的一条分享 */

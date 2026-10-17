@@ -377,30 +377,6 @@ export const api = {
       durationMinutes: number;
     },
   ) => invoke<void>("respond_roam_request", { reqId, accept, ...changes }),
-  createQuotaThread: (
-    peerToken: string,
-    peerName: string,
-    cwd: string,
-    agentKind: AgentKind,
-    model: string | null,
-    mode: string | null,
-    clueCardId: string | null,
-    operationId: string,
-  ) =>
-    invoke<Thread>("create_quota_thread", {
-      peerToken,
-      peerName,
-      cwd,
-      agentKind,
-      model,
-      mode,
-      clueCardId,
-      operationId,
-    }),
-  cancelQuotaRoaming: (operationId: string) =>
-    invoke<boolean>("cancel_quota_roaming", { operationId }),
-  prepareQuotaLease: (peerToken: string, agentKind: AgentKind, model: string) =>
-    invoke<void>("prepare_quota_lease", { peerToken, agentKind, model }),
   /** guest：召回漫游会话（host 自动把完整快照 Flow 回来，去收件箱选项目接收） */
   recallRoamingThread: (threadId: string) =>
     invoke<void>("recall_roaming_thread", { threadId }),

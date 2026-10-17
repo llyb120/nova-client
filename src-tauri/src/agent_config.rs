@@ -234,24 +234,6 @@ pub fn sync_global_instructions(config_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 额度漫游会为每个后端准备隔离 HOME/config；把本机全局指令同步进该真实运行环境。
-pub fn sync_backend_with_env(
-    config_dir: &Path,
-    kind: &AgentKind,
-    env: &HashMap<String, String>,
-) -> Result<(), String> {
-    if cfg!(debug_assertions) {
-        return Ok(());
-    }
-    let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
-    let enabled = !read_adapter_preferences(config_dir)
-        .disabled_agent_kinds
-        .contains(kind.as_str());
-    let target = target_for(kind, env)?;
-    let _ = sync_target(&target, if enabled { &content } else { "" }, enabled);
-    Ok(())
-}
-
 fn central_path(config_dir: &Path) -> PathBuf {
     config_dir.join(CENTRAL_FILE)
 }
