@@ -92,7 +92,12 @@ impl AcpPrewarm {
         slot: &StdMutex<Option<Arc<Self>>>,
         cwd: &str,
         read_only: bool,
+        requires_thread_env: bool,
     ) -> Option<Arc<AcpConn>> {
+        // ponytail: Devin 的线程级 MCP 环境需冷启动绑定；支持会话级重绑后才能复用通用预热进程。
+        if requires_thread_env {
+            return None;
+        }
         let entry = {
             let slot = slot.lock().unwrap();
             slot.as_ref()
@@ -1383,8 +1388,10 @@ impl AcpManager {
             s
         };
         let read_only = self.thread_is_read_only(conn_key);
-        let warmed = if conn_key.starts_with("thread:") {
-            AcpPrewarm::take(&self.prewarmed, want_cwd.unwrap_or_default(), read_only).await
+        let warmed = if let Some(thread_id) = conn_key.strip_prefix("thread:") {
+            let requires_thread_env = self.kind == AgentKind::Devin
+                && !crate::auto_tool_env(&self.app.state::<AppState>(), thread_id).is_empty();
+            AcpPrewarm::take(&self.prewarmed, want_cwd.unwrap_or_default(), read_only, requires_thread_env).await
         } else {
             None
         };
@@ -6462,14 +6469,17 @@ mod acp_prewarm_tests {
         }
         let first = entry("A", true, true);
         let slot = StdMutex::new(Some(first.clone()));
-        assert!(AcpPrewarm::take(&slot, "B", true).await.is_none());
-        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+        // 自动模式 Devin 必须冷启动以注册场景工具；不能消耗普通会话的预热连接。
+        assert!(AcpPrewarm::take(&slot, "A", true, true).await.is_none());
+        assert!(Arc::ptr_eq(slot.lock().unwrap().as_ref().unwrap(), &first));
+        assert!(AcpPrewarm::take(&slot, "B", true, false).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false, false).await.is_none());
         assert!(slot.lock().unwrap().is_some());
-        assert!(AcpPrewarm::take(&slot, "A", true).await.is_some());
-        assert!(AcpPrewarm::take(&slot, "A", true).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", true, false).await.is_some());
+        assert!(AcpPrewarm::take(&slot, "A", true, false).await.is_none());
 
         *slot.lock().unwrap() = Some(entry("A", false, false));
-        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false, false).await.is_none());
         assert!(slot.lock().unwrap().is_none());
 
         // 在飞预热晚于旧的 250ms 阈值才就绪，仍要等待并认领原连接，不能丢弃后冷启动。
@@ -6478,7 +6488,7 @@ mod acp_prewarm_tests {
         let expected = held.as_ref().unwrap().clone();
         *slot.lock().unwrap() = Some(pending.clone());
         let (claimed, ()) = tokio::join!(
-            AcpPrewarm::take(&slot, "A", false),
+            AcpPrewarm::take(&slot, "A", false, false),
             async {
                 sleep(Duration::from_millis(350)).await;
                 drop(held);
@@ -6493,7 +6503,7 @@ mod acp_prewarm_tests {
         *slot.lock().unwrap() = Some(pending.clone());
         let next = entry("B", false, true);
         let (claimed, ()) = tokio::join!(
-            AcpPrewarm::take(&slot, "A", false),
+            AcpPrewarm::take(&slot, "A", false, false),
             async {
                 sleep(Duration::from_millis(10)).await;
                 *slot.lock().unwrap() = Some(next.clone());
@@ -6502,13 +6512,13 @@ mod acp_prewarm_tests {
         );
         assert!(claimed.is_none());
         assert!(Arc::ptr_eq(slot.lock().unwrap().as_ref().unwrap(), &next));
-        assert!(AcpPrewarm::take(&slot, "B", false).await.is_some());
+        assert!(AcpPrewarm::take(&slot, "B", false, false).await.is_some());
 
         // 预热失败时释放等待并允许调用方回退，不返回空槽或死亡连接。
         let failed = entry("A", false, true);
         failed.conn.lock().await.take();
         *slot.lock().unwrap() = Some(failed);
-        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false, false).await.is_none());
 
         // 槽替换/关闭即便撞上预热完成，最后一个条目引用释放时仍要杀掉未认领连接。
         let unused = entry("C", false, true);
@@ -6518,8 +6528,8 @@ mod acp_prewarm_tests {
 
         *slot.lock().unwrap() = Some(entry("D", false, true));
         let (a, b) = tokio::join!(
-            AcpPrewarm::take(&slot, "D", false),
-            AcpPrewarm::take(&slot, "D", false)
+            AcpPrewarm::take(&slot, "D", false, false),
+            AcpPrewarm::take(&slot, "D", false, false)
         );
         assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
     }
