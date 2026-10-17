@@ -2522,6 +2522,7 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
         state.workbuddy.forget_session_of_thread(id);
         state.cursorplus.forget_session_of_thread(id);
         cleanup_borrowed_runtime(state, id);
+        native_browser::release_thread(app, id);
     }
     // 自动清理的普通会话仍保留在回收站一个周期，session 要等彻底过期再删；
     // 手动删除、worktree 删除及训练会话清理则没有回收站，立即清理。

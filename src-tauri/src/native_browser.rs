@@ -128,9 +128,12 @@ struct Tab {
 
 #[derive(Default)]
 struct BrowserState {
-    // ponytail: keep live pages until explicit close/app exit; eviction would lose form/JS state.
     session: Mutex<Option<Session>>,
-    parked: Mutex<std::collections::HashMap<String, Session>>,
+    // Oldest first. Each parked tab keeps a live WebView2 renderer, so only MAX_PARKED survive;
+    // evicted/deleted threads lose page JS/form state but cookies stay in the shared profile.
+    parked: Mutex<Vec<Session>>,
+    // Tabs whose renderer/browser process failed (tab id -> reason); cleared by the next navigation.
+    crashed: Mutex<std::collections::HashMap<String, String>>,
     gate: tokio::sync::Mutex<()>,
     frame_sessions: Mutex<std::collections::HashMap<String, String>>,
     observations: Mutex<std::collections::HashMap<String, Observation>>,
@@ -154,9 +157,71 @@ fn update_session(app: &AppHandle, thread: &str, f: impl FnOnce(&mut Session)) {
     let mut current = state.session.lock().unwrap();
     if let Some(s) = current.as_mut().filter(|s| s.thread_id == thread) {
         f(s);
-    } else if let Some(s) = state.parked.lock().unwrap().get_mut(thread) {
+    } else if let Some(s) = state.parked.lock().unwrap().iter_mut().find(|s| s.thread_id == thread) {
         f(s);
     }
+}
+
+#[cfg(windows)]
+const MAX_PARKED: usize = 4;
+#[cfg(windows)]
+const MAX_TABS: usize = 8;
+const MAX_FULL_PAGE_DEVICE_PX: f64 = 16384.;
+
+/// Main thread only: destroy a session's WebViews so their WebView2 processes exit.
+fn close_session(app: &AppHandle, s: Session) {
+    s.cancel.store(true, Ordering::SeqCst);
+    for tab in &s.tabs {
+        close_tab_view(app, &tab.id);
+    }
+}
+
+fn close_tab_view(app: &AppHandle, id: &str) {
+    if let Some(view) = app.get_webview(id) {
+        let _ = view.close();
+    }
+    let state = app.state::<BrowserState>();
+    state.observations.lock().unwrap().remove(id);
+    state.crashed.lock().unwrap().remove(id);
+}
+
+/// Called when a thread is deleted: its browser (visible or parked) must not outlive it.
+pub(crate) fn release_thread(app: &AppHandle, thread: &str) {
+    let handle = app.clone();
+    let thread = thread.to_owned();
+    let _ = app.run_on_main_thread(move || {
+        let state = handle.state::<BrowserState>();
+        let current = {
+            let mut current = state.session.lock().unwrap();
+            if current.as_ref().is_some_and(|s| s.thread_id == thread) { current.take() } else { None }
+        };
+        let was_current = current.is_some();
+        let parked = {
+            let mut parked = state.parked.lock().unwrap();
+            parked.iter().position(|s| s.thread_id == thread).map(|i| parked.remove(i))
+        };
+        for s in current.into_iter().chain(parked) {
+            close_session(&handle, s);
+        }
+        if was_current {
+            emit(&handle);
+        }
+    });
+}
+
+#[cfg(windows)]
+fn mark_crashed(app: &AppHandle, thread: &str, tab: &str, message: &str) {
+    let state = app.state::<BrowserState>();
+    state.crashed.lock().unwrap().insert(tab.to_owned(), message.to_owned());
+    state.observations.lock().unwrap().remove(tab);
+    update_session(app, thread, |s| {
+        if s.active_tab == tab {
+            s.cancel.store(true, Ordering::SeqCst);
+            s.busy = false;
+            s.status = message.to_owned();
+        }
+    });
+    emit(app);
 }
 
 fn show_tab(app: &AppHandle, s: &Session) -> Result<(), String> {
@@ -198,12 +263,9 @@ fn create_tab(
             if !matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data") {
                 return false;
             }
-            nav_app
-                .state::<BrowserState>()
-                .observations
-                .lock()
-                .unwrap()
-                .remove(&nav_id);
+            let state = nav_app.state::<BrowserState>();
+            state.observations.lock().unwrap().remove(&nav_id);
+            state.crashed.lock().unwrap().remove(&nav_id);
             update_session(&nav_app, &nav_thread, |s| {
                 if let Some(t) = s.tabs.iter_mut().find(|t| t.id == nav_id) {
                     t.url = url.to_string();
@@ -244,12 +306,34 @@ fn create_tab(
     let popup_thread = thread.to_owned();
     let download_thread = thread.to_owned();
     let download_tab = id.clone();
+    let crash_app = app.clone();
+    let crash_thread = thread.to_owned();
+    let crash_tab = id.clone();
     view.with_webview(move |native| unsafe {
         let Ok(core) = native.controller().CoreWebView2() else {
             return;
         };
         use windows::core::Interface;
-        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_4;
+        use webview2_com::Microsoft::Web::WebView2::Win32::*;
+        // Without this a crashed/hung page stays a dead child window and every CDP call just times out.
+        let registration = core.add_ProcessFailed(
+            &webview2_com::ProcessFailedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                args.ProcessFailedKind(&mut kind)?;
+                let message = match kind {
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED => "网页渲染进程已崩溃，请 reload 重新加载",
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE => "网页长时间无响应，请 reload 重新加载",
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED => "浏览器进程已退出，请关闭此标签页后新建",
+                    _ => return Ok(()),
+                };
+                eprintln!("browser process failed ({}): {message}", kind.0);
+                mark_crashed(&crash_app, &crash_thread, &crash_tab, message);
+                Ok(())
+            })),
+            &mut 0,
+        );
+        if let Err(error) = registration { eprintln!("browser crash handler: {error}"); }
         let registration = core.cast::<ICoreWebView2_4>().and_then(|core| core.add_DownloadStarting(
             &webview2_com::DownloadStartingEventHandler::create(Box::new(move |_, args| {
                 if let Some(args) = args {
@@ -356,7 +440,7 @@ async fn change_tab(
                     .as_ref()
                     .filter(|s| s.thread_id == thread)
                     .cloned()
-                    .or_else(|| state.parked.lock().unwrap().get(&thread).cloned())
+                    .or_else(|| state.parked.lock().unwrap().iter().find(|s| s.thread_id == thread).cloned())
                     .ok_or("会话浏览器不存在")?;
                 let target = args["tabId"].as_str().unwrap_or(&s.active_tab).to_owned();
                 if op != "new_tab" && !s.tabs.iter().any(|t| t.id == target) {
@@ -381,6 +465,10 @@ async fn change_tab(
                     )?;
                     s.active_tab = tab.id.clone();
                     s.tabs.push(tab);
+                    // Popups can open tabs without bound; each is a live renderer process.
+                    if s.tabs.len() > MAX_TABS {
+                        close_tab_view(&app2, &s.tabs.remove(0).id);
+                    }
                 } else if op == "select_tab" {
                     s.active_tab = target.clone();
                 }
@@ -390,6 +478,7 @@ async fn change_tab(
                     }
                     s.tabs.retain(|t| t.id != target);
                     state.observations.lock().unwrap().remove(&target);
+                    state.crashed.lock().unwrap().remove(&target);
                     if s.active_tab == target {
                         s.active_tab = s.tabs.last().unwrap().id.clone();
                     }
@@ -524,13 +613,17 @@ async fn mount(app: &AppHandle, thread_id: String) -> Result<Value, String> {
                     if let Some(view) = handle.get_webview(&old.active_tab) {
                         view.hide().map_err(|e| e.to_string())?;
                     }
-                    state
-                        .parked
-                        .lock()
-                        .unwrap()
-                        .insert(old.thread_id.clone(), old);
+                    state.parked.lock().unwrap().push(old);
                 }
-                let restored = state.parked.lock().unwrap().remove(&thread_id);
+                let (restored, evicted) = {
+                    let mut parked = state.parked.lock().unwrap();
+                    let restored = parked.iter().position(|s| s.thread_id == thread_id).map(|i| parked.remove(i));
+                    let excess = parked.len().saturating_sub(MAX_PARKED);
+                    (restored, parked.drain(..excess).collect::<Vec<_>>())
+                };
+                for s in evicted {
+                    close_session(&handle, s);
+                }
                 let s = if let Some(mut s) = restored {
                     s.visible = false;
                     s
@@ -635,13 +728,12 @@ pub async fn native_browser_ui(
             if operation == "goto" {
                 view.navigate(normalized_url(args["url"].as_str().unwrap_or_default())?)
                     .map_err(|e| e.to_string())?;
+            } else if operation == "reload" {
+                // Native reload also recovers a crashed renderer, unlike page script.
+                view.reload().map_err(|e| e.to_string())?;
             } else {
-                view.eval(match operation.as_str() {
-                    "back" => "history.back()",
-                    "forward" => "history.forward()",
-                    _ => "location.reload()",
-                })
-                .map_err(|e| e.to_string())?;
+                view.eval(if operation == "back" { "history.back()" } else { "history.forward()" })
+                    .map_err(|e| e.to_string())?;
             }
             Ok(Value::Null)
         }
@@ -689,7 +781,11 @@ async fn native_cdp(
         Microsoft::Web::WebView2::Win32::ICoreWebView2_11,
     };
     use windows::core::{Interface, HSTRING};
-    let view = app.get_webview(&active_label(app)?).ok_or("浏览器未创建")?;
+    let label = active_label(app)?;
+    if let Some(message) = app.state::<BrowserState>().crashed.lock().unwrap().get(&label).cloned() {
+        return Err(message);
+    }
+    let view = app.get_webview(&label).ok_or("浏览器未创建")?;
     let method = method.to_string();
     let params = params.to_string();
     let session_id = session_id.map(str::to_owned);
@@ -1510,6 +1606,7 @@ async fn snapshot(
         if edge!=0 && !(320..=3840).contains(&edge) {return Err("maxEdge 必须为0或320–3840".into());}
         observation.full_page = !auto_visual && region.is_none() && args["fullPage"] != false;
         let mut images = Vec::new();
+        let mut document = None;
         if observation.full_page {
             // Retain the root world for cleanup even if capture is cancelled or times out.
             app.state::<BrowserState>()
@@ -1537,6 +1634,19 @@ async fn snapshot(
                 .filter(|v| v.is_finite() && *v > 0.)
                 .ok_or("无效文档高度")?
                 .ceil();
+            // captureBeyondViewport resizes the renderer to the document; past the GPU texture limit
+            // (16384 device px) Chromium crashes the page/GPU process and weak GPUs can hang the system.
+            let dpr = evaluate(app, &observation.frames[0], "devicePixelRatio".into()).await?
+                .as_f64().filter(|v| v.is_finite() && *v > 0.).unwrap_or(1.);
+            if width.max(height) * dpr > MAX_FULL_PAGE_DEVICE_PX {
+                evaluate(app, &observation.frames[0], "__novaWebview.captureLayout(false)".into()).await?;
+                observation.full_page = false;
+                result["fullPageFallback"] = json!(format!("文档 {width}x{height} CSS像素超出整页截图安全上限，已改为视口截图；屏外内容请滚动后再截或读 DOM"));
+            } else {
+                document = Some((width, height));
+            }
+        }
+        if let Some((width, height)) = document {
             let columns = (width / 2048.).ceil() as u64;
             let rows = (height / 4096.).ceil() as u64;
             let total = columns.checked_mul(rows).ok_or("文档尺寸过大")?;
