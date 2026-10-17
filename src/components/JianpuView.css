@@ -2,8 +2,8 @@
 .jianpu-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 24px 28px 16px; }
 .jianpu-header h1 { margin: 0; font-size: 22px; }
 .jianpu-header p { margin: 6px 0 0; color: var(--text-muted); font-size: 13px; }
-/* Recording uses the vermilion of the 剑谱 edge glow, distinct from jianlai's sky blue. */
-.jianpu-rec { color: #fff; background: #dc2626; border-color: #dc2626; }
+/* Recording uses the warm amber of the 剑谱 edge glow, distinct from jianlai's sky blue. */
+.jianpu-rec { color: #451a03; background: #fbbf24; border-color: #f59e0b; }
 .jianpu-error { margin: 0 28px 12px; color: var(--red, #e5484d); font-size: 13px; }
 .jianpu-body { flex: 1; min-height: 0; display: flex; gap: 16px; padding: 0 28px 24px; }
 .jianpu-list { width: 280px; flex: none; overflow: auto; display: flex; flex-direction: column; gap: 6px; }

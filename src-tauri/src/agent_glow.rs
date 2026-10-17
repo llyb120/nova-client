@@ -25,7 +25,7 @@ static APP: OnceLock<AppHandle> = OnceLock::new();
 struct State { holds: u32, generation: u64, last: Option<Instant>, watching: bool }
 static STATE: Mutex<State> = Mutex::new(State { holds: 0, generation: 0, last: None, watching: false });
 static CURSOR: AtomicBool = AtomicBool::new(false);
-/// 剑谱录制中：朱红慢呼吸 +「剑谱录制中」标签 + 毛笔指针，与剑来的天蓝 + 剑互斥（录制中剑来不接手桌面）。
+/// 剑谱录制中：暖金慢呼吸 +「剑谱录制中」标签 + 带录制圆点的箭头指针，与剑来的天蓝 + 剑互斥（录制中剑来不接手桌面）。
 static RECORDING: AtomicBool = AtomicBool::new(false);
 /// 开始录制时的指针位置（屏幕物理像素）：按钮/快捷键触发处，涟漪从这里铺满屏幕。
 static ORIGIN: Mutex<Option<(i32, i32)>> = Mutex::new(None);
@@ -74,8 +74,10 @@ pub(crate) fn recording(on: bool) {
     let Some(app) = APP.get() else { return };
     let app = app.clone();
     std::thread::spawn(move || {
-        // 持 STATE 锁：剑来 watch 的「收起」要么排在前面，要么看到录制后退出，不会把刚亮起的朱红光效收掉。
+        // 持 STATE 锁：剑来 watch 的「收起」要么排在前面，要么看到录制后退出，不会把刚亮起的暖金光效收掉。
         let _state = STATE.lock().unwrap();
+        // 停止后马上又开始时，两个线程的先后不定：只执行与当前状态一致的那个，迟到的「收起」不会熄掉新录制。
+        if RECORDING.load(Ordering::Acquire) != on { return; }
         if !on { hide(&app); }
         else {
             brand_cursor(true);
@@ -152,7 +154,7 @@ fn show(app: &AppHandle) -> Result<(), String> {
     let mut loaded = LOADED.lock().unwrap();
     let fresh = app.get_webview_window(LABEL).is_none();
     let window = window(app, &query)?;
-    // 新建的窗口已带着 query 加载；已有窗口在天蓝 ↔ 朱红、布局变化或新起点时重新加载。
+    // 新建的窗口已带着 query 加载；已有窗口在天蓝 ↔ 暖金、布局变化或新起点时重新加载。
     if fresh { *loaded = query; } else if *loaded != query {
         let mut url = window.url().map_err(|e| e.to_string())?;
         url.set_query(Some(&query));
@@ -205,6 +207,8 @@ fn window(app: &AppHandle, query: &str) -> Result<WebviewWindow, String> {
 
 fn hide(app: &AppHandle) {
     restore_cursor();
+    // 下次显示一定重新加载页面：同一按钮位置再次开始录制时 query 相同，不重载就不会再播涟漪。
+    LOADED.lock().unwrap().clear();
     let Some(window) = app.get_webview_window(LABEL) else { return };
     let Ok(hwnd) = window.hwnd() else { return };
     let hwnd = hwnd.0 as usize;
@@ -213,27 +217,19 @@ fn hide(app: &AppHandle) {
     let _ = window.run_on_main_thread(move || { let _ = hidden.hide(); unsafe { ShowWindow(hwnd as HWND, SW_HIDE); } });
 }
 
-/// 剑谱的毛笔：笔尖朝左上（热点），沿对角线依次是墨色笔头、金色笔箍、竹色笔杆、朱红笔尾。
-fn brush(x: f32, y: f32) -> (f32, (f32, f32, f32)) {
-    use crate::jianlai::{polygon_sd, POINTER_TIP};
-    const SCALE: f32 = 0.82;
-    let (dx, dy) = (x - POINTER_TIP, y - POINTER_TIP);
-    let k = std::f32::consts::FRAC_1_SQRT_2 / SCALE;
-    let (s, w) = ((dx + dy) * k, (dx - dy) * k);
-    // 竹节：笔杆上每隔一段一道深色。
-    let bamboo = if (s - 10.0).rem_euclid(5.0) < 0.6 { (120.0, 72.0, 24.0) } else { (217.0, 160.0, 82.0) };
-    [
-        (polygon_sd(&[(0.0, 0.0), (2.5, -1.3), (6.0, -2.1), (8.2, -2.1), (8.2, 2.1), (6.0, 2.1), (2.5, 1.3)], s, w), (28.0, 25.0, 23.0)),
-        (polygon_sd(&[(8.0, -2.3), (10.2, -2.3), (10.2, 2.3), (8.0, 2.3)], s, w), (234.0, 179.0, 8.0)),
-        (polygon_sd(&[(10.0, -1.5), (24.0, -1.5), (24.0, 1.5), (10.0, 1.5)], s, w), bamboo),
-        (polygon_sd(&[(23.8, -1.7), (26.2, -1.7), (26.2, 1.7), (23.8, 1.7)], s, w), (220.0, 38.0, 38.0)),
-    ].into_iter().min_by(|a, b| a.0.total_cmp(&b.0)).map(|(d, c)| (d * SCALE, c)).unwrap()
+/// 剑谱的指针：常见的箭头形状，奶油色填充、琥珀描边，右下一颗琥珀圆点表示「录制中」；温和、一眼可认，
+/// 又与剑来的剑形区分。坐标是 32 单位指针空间，箭头尖即热点。
+fn rec_arrow(x: f32, y: f32) -> (f32, (f32, f32, f32)) {
+    use crate::jianlai::{polygon_sd, POINTER_TIP as T};
+    let arrow = polygon_sd(&[(T, T), (T, T + 17.0), (T + 4.0, T + 13.2), (T + 7.0, T + 19.5), (T + 9.6, T + 18.4), (T + 6.8, T + 12.2), (T + 12.2, T + 12.2)], x, y);
+    let dot = ((x - 25.5).powi(2) + (y - 26.0).powi(2)).sqrt() - 3.6;
+    if dot < arrow { (dot, (245.0, 158.0, 11.0)) } else { (arrow, (255.0, 251.0, 235.0)) }
 }
 
-/// 剑来：与截图里的落点标记同款的剑，只是光晕更浓；剑谱：笔尖带朱红墨点的毛笔。
+/// 剑来：与截图里的落点标记同款的剑，只是光晕更浓；剑谱：琥珀描边的箭头 + 录制圆点，尖端一圈暖金光晕。
 /// 真实指针不会进入任何截图，浓光晕只帮用户找指针。
-fn brush_pixels(size: i32) -> Vec<u32> {
-    crate::jianlai::paint_pointer(size, brush, (40.0, 20.0, 12.0), (239.0, 68.0, 68.0, crate::jianlai::CURSOR_GLOW))
+fn rec_pixels(size: i32) -> Vec<u32> {
+    crate::jianlai::paint_pointer(size, rec_arrow, (146.0, 64.0, 14.0), (245.0, 158.0, 11.0, crate::jianlai::CURSOR_GLOW * 0.7))
 }
 
 fn brand_cursor(recording: bool) {
@@ -246,7 +242,7 @@ fn brand_cursor(recording: bool) {
         let mut bits = null_mut();
         let color = CreateDIBSection(null_mut(), &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
         if color.is_null() || bits.is_null() { return; }
-        let pixels = if recording { brush_pixels(size) } else { pointer_pixels(size, CURSOR_GLOW) };
+        let pixels = if recording { rec_pixels(size) } else { pointer_pixels(size, CURSOR_GLOW) };
         std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
         // 全 0 的 AND 掩码：像素完全由带 alpha 的彩色位图决定。
         let mask_bits = vec![0u8; (((size + 15) / 16) * 2 * size) as usize];
@@ -295,13 +291,15 @@ mod tests {
     }
 
     #[test]
-    fn brush_is_ink_tipped_with_a_red_glow_and_unlike_the_sword() {
-        let (p, sword) = (brush_pixels(32), crate::jianlai::pointer_pixels(32, crate::jianlai::CURSOR_GLOW));
+    fn recording_pointer_is_a_cream_arrow_with_a_warm_glow_unlike_the_sword() {
+        let (p, sword) = (rec_pixels(32), crate::jianlai::pointer_pixels(32, crate::jianlai::CURSOR_GLOW));
         let at = |p: &Vec<u32>, x: usize, y: usize| p[y * 32 + x];
-        assert_eq!(at(&p, 13, 13) >> 24, 255, "笔头实心");
-        assert!(at(&p, 13, 13) & 0xff < 60, "笔头是墨色: {:08x}", at(&p, 13, 13));
+        let fill = at(&p, 12, 16);
+        assert!(fill >> 24 == 255 && fill & 0xff > 200, "箭头是奶油色实心: {fill:08x}");
+        let dot = at(&p, 25, 26);
+        assert!(dot >> 24 == 255 && (dot >> 16) & 0xff > 200 && dot & 0xff < 60, "右下是琥珀录制点: {dot:08x}");
         let glow = at(&p, 6, 10);
-        assert!(glow >> 24 > 0 && (glow >> 16) & 0xff > 200 && glow & 0xff < 120, "笔尖是朱红墨点: {glow:08x}");
+        assert!(glow >> 24 > 0 && (glow >> 16) & 0xff > 200 && glow & 0xff < 60, "尖端是暖金光晕: {glow:08x}");
         assert!(at(&sword, 6, 10) & 0xff > 200, "剑是天蓝，两者一眼可分");
     }
 

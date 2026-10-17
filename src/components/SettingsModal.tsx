@@ -1200,7 +1200,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <button type="button" class="btn secondary" onClick={() => setJianpuShortcut("Alt+R")}>恢复 Alt+R</button>
                   <button type="button" class="btn secondary" onClick={() => setJianpuShortcut("")}>关闭</button>
                 </div>
-                <span class="field-hint">目前支持 Windows。按一次开始录制你的桌面操作（朱红边框 + 毛笔指针），再按一次停止；也可在 Butterfly 悬停面板里开始/停止。注册为全局快捷键后，其他程序自己的同名快捷键（如 Word 的 Alt+R）会被占用。录制的打字内容按原文保存在本机。</span>
+                <span class="field-hint">目前支持 Windows。按一次开始录制你的桌面操作（暖金边框 + 带录制圆点的箭头指针），再按一次停止；也可在 Butterfly 悬停面板里开始/停止。注册为全局快捷键后，其他程序自己的同名快捷键（如 Word 的 Alt+R）会被占用。录制的打字内容按原文保存在本机。</span>
               </div>
               <div class="field">
                 <span class="field-label">执行后端 / 模型</span>
