@@ -1,7 +1,7 @@
 html.bubble-mode, html.bubble-mode body { margin: 0; background: transparent; overflow: hidden; }
 html.bubble-mode, html.bubble-mode * { box-sizing: border-box; }
-/* Pinned to the taskbar side: if the stack outgrows the screen, the oldest card is what gets cut. */
-html.bubble-mode body { display: flex; flex-direction: column; justify-content: flex-end; height: 100vh; }
+/* The native window is clamped to its monitor; content scrolls inside the panel. */
+html.bubble-mode body { display: flex; flex-direction: column; justify-content: flex-start; height: 100vh; }
 
 /* Follows the Windows taskbar theme (dark by default, `.light` from the payload).
    --ink is the overlay colour: every translucent fill/border is rgb(var(--ink) / alpha). */
@@ -54,8 +54,8 @@ html.bubble-mode.light {
 }
 
 /* The transparent margin holds the card's shadow and is the gap to the taskbar. */
-.tb-shell { display: flex; flex-direction: column; gap: 10px; padding: 16px; }
-.tb-shell.stack .tb-body { max-height: 160px; }
+.tb-shell { display: flex; flex-direction: column; flex: none; box-sizing: border-box; width: min(560px, 100vw); height: 640px; padding: 8px; }
+.tb-shell [hidden] { display: none !important; }
 
 .tb-card {
   --accent: var(--gray);
@@ -74,23 +74,13 @@ html.bubble-mode.light {
   box-shadow: var(--shadow), inset 0 1px 0 rgba(255, 255, 255, 0.06);
   user-select: none;
   cursor: default;
-  transform-origin: 50% 100%;
-  animation: tb-in 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 .tb-card.running { --accent: var(--blue); }
 .tb-card.waiting { --accent: var(--orange); }
 .tb-card.done { --accent: var(--green); }
 .tb-card.error { --accent: var(--red); }
-/* Butterfly entrance: the card unfolds from the taskbar like opening wings, then flutters to rest. */
-@keyframes tb-in {
-  0% { opacity: 0; transform: translateY(8px) scale(0.2, 0.7); }
-  30% { opacity: 1; transform: translateY(0) scale(1.04, 1); }
-  52% { transform: scale(0.96, 1); }
-  74% { transform: scale(1.015, 1); }
-  100% { transform: none; }
-}
 
-.tb-head { display: flex; align-items: center; gap: 8px; }
+.tb-head { display: flex; flex: none; align-items: center; gap: 8px; }
 .tb-fly { flex: none; overflow: visible; fill: var(--accent); }
 .tb-fly-body { fill: var(--fg); }
 .tb-wings { transform-box: fill-box; transform-origin: center; }
@@ -283,7 +273,7 @@ html.bubble-mode.light {
 }
 .tb-open:hover { background: rgb(var(--ink) / 0.16); }
 
-.tb-card button:focus-visible, .tb-card input:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.tb-card button:focus-visible, .tb-card input:focus-visible, .tb-card textarea:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 
 .tb-card ::-webkit-scrollbar { width: 6px; height: 6px; }
 .tb-card ::-webkit-scrollbar-thumb { border-radius: 3px; background: rgb(var(--ink) / 0.16); }
@@ -293,16 +283,29 @@ html.bubble-mode.light {
   .tb-card, .tb-wings { animation: none !important; }
 }
 
-/* Butterfly panel: compact, vertical tabs on the left (会话 / 快捷). */
-.tb-panel { flex-direction: row; gap: 10px; padding: 10px 12px 10px 8px; height: 300px; }
+/* Shared panel; changing tabs or live cards never changes its size or assistant identity. */
+.tb-panel { flex-direction: row; gap: 10px; padding: 12px 12px 12px 8px; height: min(624px, calc(100vh - 16px)); flex: none; min-height: 0; overflow: hidden; }
 .tb-tabs { flex: none; display: flex; flex-direction: column; gap: 2px; padding-right: 8px; border-right: 1px solid rgb(var(--ink) / 0.08); }
 .tb-tabs button { padding: 5px 8px; border: 0; border-radius: 7px; font: inherit; font-size: 12px; color: var(--fg-3); background: transparent; cursor: pointer; white-space: nowrap; }
 .tb-tabs button:hover { background: rgb(var(--ink) / 0.07); }
 .tb-tabs button.active { color: var(--fg-strong); background: rgb(var(--ink) / 0.11); font-weight: 600; }
 .tb-tabs button.rec::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 4px; border-radius: 50%; background: #f59e0b; vertical-align: middle; }
 .tb-panel-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
-/* Fixed panel size: the summary scrolls inside it, so switching tabs never resizes or moves the window. */
-.tb-session { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.tb-capsules-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.tb-capsules-pane[hidden] { display: none; }
+.tb-shell { position: relative; }
+.tb-capsule-drop { position: absolute; z-index: 20; inset: 8px; border: 2px dashed var(--link); border-radius: 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--fg); background: color-mix(in srgb, var(--bg-top) 96%, transparent); pointer-events: none; box-shadow: inset 0 0 80px color-mix(in srgb, var(--link) 10%, transparent); font: 14px/1.5 "Segoe UI", system-ui, sans-serif; }
+.tb-capsule-drop > span { color: var(--link); font-size: 44px; }
+.tb-capsule-drop strong { font-size: 20px; letter-spacing: .04em; }
+.tb-capsule-drop small { color: var(--fg-2); }
+.tb-capture-error { position: absolute; z-index: 21; inset: auto 26px 22px; padding: 12px 32px 12px 14px; border: 1px solid color-mix(in srgb, var(--red) 35%, transparent); border-radius: 12px; background: var(--bg-top); color: var(--red-text); font: 12px/1.5 system-ui, sans-serif; box-shadow: var(--shadow); overflow-wrap: anywhere; }
+.tb-capture-error button { position: absolute; right: 8px; top: 8px; border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 18px; }
+.tb-capture-progress { position: absolute; z-index: 21; top: 18px; left: 50%; transform: translateX(-50%); padding: 7px 14px; border: 1px solid color-mix(in srgb, var(--link) 30%, transparent); border-radius: 999px; background: var(--bg-top); color: var(--link); font: 12px/1.5 system-ui, sans-serif; pointer-events: none; box-shadow: var(--shadow); }
+.tb-tab-count { display: inline-block; margin-left: 3px; padding: 0 4px; border-radius: 5px; color: var(--on-orange); background: var(--orange); font-size: 10px; }
+.tb-session-list { flex: 1; min-height: 0; overflow-y: auto; }
+.tb-session { display: flex; flex-direction: column; gap: 8px; }
+.tb-session + .tb-session { margin-top: 16px; padding-top: 12px; border-top: 1px solid rgb(var(--ink) / 0.1); }
+#tb-pane-quick { overflow-y: auto; min-height: 0; }
 .tb-panel .tb-body { flex: 1 0 auto; max-height: none; overflow: visible; }
 .tb-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; }
 .tb-tile { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px 2px; border: 0; border-radius: 10px; font: inherit; font-size: 11.5px; color: var(--fg-2); background: transparent; cursor: pointer; white-space: nowrap; }

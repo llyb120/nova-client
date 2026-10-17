@@ -80,23 +80,64 @@ await replyCheck(null, true);
 const load = find('src/components/TaskbarBubble.tsx', n => ts.isVariableDeclaration(n) && n.name.getText() === 'load');
 const loadExpression = load.slice(load.indexOf('=') + 1);
 const rendered = [];
-let hasCard = true;
-const reloadCard = evaluate(loadExpression, {
-  invoke: async () => ({ cards: hasCard ? [{ key: 'live:thread' }] : [], permissions: [], light: false }),
+let hasCard = true, panel = true, tab, active, focusRequest = 0;
+const loadContext = {
+  revision: 0, fresh: true, focusPending: false,
+  setPanel() {}, setTab: value => { tab = value; },
+  setActive: value => { active = value; },
+  setFocusRequest: update => { focusRequest = update(focusRequest); rendered.push('focus'); },
+  invoke: async () => ({ cards: hasCard ? [{ key: 'live:thread' }] : [], permissions: [], light: false, panel }),
   document: { documentElement: { classList: { toggle() {} } } },
   setCards: () => rendered.push('cards'), reconcile: x => x,
   permissions: () => [], setPermissions() {},
   requestAnimationFrame: callback => { rendered.push('render'); callback(); },
   place: async () => { rendered.push('acknowledge'); return true; },
   hide: () => { rendered.push('hide'); },
-});
+};
+const reloadCard = evaluate(loadExpression, loadContext);
 assert.equal(await reloadCard(), true);
 assert.equal(await reloadCard(), true);
 assert.deepEqual(rendered, ['cards', 'render', 'acknowledge', 'cards', 'render', 'acknowledge']);
+assert.equal(tab, 'assistant');
+assert.equal(focusRequest, 0, 'hover never requests focus');
+assert.equal(active, true);
+rendered.length = 0;
+panel = false;
+loadContext.fresh = true;
+await reloadCard();
+assert.deepEqual(rendered, ['cards', 'render', 'acknowledge', 'focus'], 'click focuses only after placement');
+await reloadCard();
+assert.equal(focusRequest, 1, 'polls never steal focus');
+loadContext.fresh = true;
+loadContext.place = async () => false;
+await reloadCard();
+assert.equal(focusRequest, 1, 'failed placement cannot focus');
+loadContext.place = async () => true;
+const frames = [];
+loadContext.requestAnimationFrame = callback => frames.push(callback);
+loadContext.fresh = true;
+const firstOpen = reloadCard();
+await new Promise(setImmediate);
+const overlappingPoll = reloadCard();
+await new Promise(setImmediate);
+frames.forEach(callback => callback());
+assert.deepEqual(await Promise.all([firstOpen, overlappingPoll]), [false, true]);
+assert.equal(focusRequest, 2, 'a newer poll cannot swallow a pending click focus');
+loadContext.requestAnimationFrame = callback => callback();
 rendered.length = 0;
 hasCard = false;
 await reloadCard();
 assert.deepEqual(rendered, ['hide'], 'a hidden/prewarmed bubble must not acknowledge a result');
+assert.equal(active, false);
+// A late IPC result after hiding must not revive/focus the assistant.
+let resolvePayload;
+loadContext.invoke = () => new Promise(resolve => { resolvePayload = resolve; });
+const stale = reloadCard();
+++loadContext.revision;
+resolvePayload({ cards: [{ key: 'late' }], permissions: [], light: false, panel: false });
+rendered.length = 0;
+assert.equal(await stale, false);
+assert.deepEqual(rendered, []);
 
 // Native placement must reject post-hide ResizeObserver notifications before touching HWND
 // geometry. No AppHandle/HWND is available in this headless check, so pin the guard's ordering.

@@ -5,7 +5,7 @@ import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { LruMap } from "./lruMap";
 import { api } from "./ipc";
-import { rememberPromptDraft } from "./promptDraft";
+import { rememberPromptDraft, saveSessionDraft } from "./promptDraft";
 import type {
   Achievement,
   AgentKind,
@@ -3222,6 +3222,21 @@ export async function initStore() {
       void handleFireStart(e.payload.threadId, e.payload.text).catch((error) =>
         console.error("Fire start failed", error),
       );
+    }),
+
+    listen<{ text: string; images: PromptImage[] }>("capsules:compose", (e) => {
+      const { text, images } = e.payload;
+      void (async () => {
+        const { agentKind, model } = sceneModel("lightweight");
+        const thread = await api.createThread(await api.scratchDir(), agentKind, model || null, "build", null);
+        // Seed before switching: both a mounted Composer and a fresh one consume it exactly once.
+        saveSessionDraft(thread.id, text, images);
+        rememberThreadSnapshot(thread);
+        setView("home");
+        await openThread(thread.id);
+        void refreshThreads();
+        void refreshProjects();
+      })().catch((error) => showToast(`星屑会话创建失败，原内容仍保留在星屑中：${String(error)}`));
     }),
 
     listen<{ threadId: string | null; text: string; images?: PromptImage[]; restored?: boolean }>(

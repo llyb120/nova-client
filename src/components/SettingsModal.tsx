@@ -1614,7 +1614,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <span>Windows 任务栏 Butterfly（实验）</span>
                 </label>
                 <span class="field-hint">
-                  开启后常驻 Windows 任务栏空闲区域：运行中蝴蝶振翅并显示当前动作与耗时，待确认时提醒，任务结束后显示结果摘要。单击 Butterfly 弹出/收起气泡（空闲时可在临时目录发起新会话，待确认事项可直接选择，也可快速回复；发送后自动收起），双击打开 Nova 对应会话。默认关闭；保存后即时生效。
+                  开启后常驻 Windows 任务栏空闲区域：运行中蝴蝶振翅并显示当前动作与耗时，待确认时提醒，任务结束后显示结果摘要。悬停打开助理面板，单击后可直接输入，回车发送给助理；助理使用轻量模型回复、搜索历史并调度会话，新会话默认自动模式（助理当前要求轻量化场景首选为 Lyra，以禁用执行工具）。面板中可查看最新会话进展、处理确认或使用快捷操作，点击会话卡片或双击 Butterfly 打开 Nova 对应会话。默认关闭；保存后即时生效。
                 </span>
               </div>
               <div class="field">

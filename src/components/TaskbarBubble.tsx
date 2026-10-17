@@ -6,6 +6,9 @@ import { createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } fro
 import { createStore, reconcile } from "solid-js/store";
 import type { PermissionRequest } from "../types";
 import { agentLabel, stripAnsi } from "../utils";
+import TaskbarAssistant from "./TaskbarAssistant";
+import ThoughtCapsules, { captureCapsule } from "./ThoughtCapsules";
+import { fileToAttachment } from "./ImageAttachmentStrip";
 import "./TaskbarBubble.css";
 
 type Kind = "idle" | "running" | "waiting" | "done" | "error";
@@ -22,12 +25,12 @@ type Card = {
   body: string;
 };
 /** `light`: the Windows taskbar theme, so cards match the Butterfly they pop out of.
- *  `panel`: opened by hovering (default tab 快捷操作) rather than a click (default tab 会话). */
-type Payload = { cards: Card[]; permissions: Permission[]; light: boolean; panel?: boolean } & Partial<PanelData>;
+ *  `panel`: hover must not focus; a click focuses the assistant after placement. */
+type Payload = { cards: Card[]; permissions: Permission[]; light: boolean; panel?: boolean; capsules?: boolean; captureError?: string | null } & Partial<PanelData>;
 
 type PanelData = { jianpu: { recording: boolean; id?: string; elapsedMs?: number } };
-type Tab = "session" | "quick";
-const TABS: [Tab, string][] = [["session", "会话"], ["quick", "快捷"]];
+type Tab = "assistant" | "session" | "capsules" | "quick";
+const TABS: [Tab, string][] = [["assistant", "助理"], ["session", "会话"], ["capsules", "星屑"], ["quick", "快捷"]];
 const clock = (ms = 0) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
 const icon = (d: string) => (
   <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d={d} fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -38,9 +41,8 @@ const ICONS = {
   graph: "M6 7a2 2 0 100-.01M18 6a2 2 0 100-.01M12 18a2 2 0 100-.01M7.6 8.2l3.2 7.8M16.4 7.2l-3.2 8.8M8 6.6h8",
 };
 
-/** Butterfly panel: compact, left tabs switch features. 会话 is the live summary card, 快捷 an
- *  app-desktop style icon grid. */
-function Panel(props: { card: Card; data: PanelData; tab: Tab; setTab: (tab: Tab) => void; session: JSX.Element; onClose: () => void; reload: () => void }) {
+/** One persistent panel, independent of session keys and native show/hide cycles. */
+function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Tab) => void; session: JSX.Element; active: boolean; focusRequest: number; permissionCount: number; onClose: () => void; reload: () => void }) {
   const [error, setError] = createSignal("");
   const run = async (action: string) => {
     setError("");
@@ -59,27 +61,40 @@ function Panel(props: { card: Card; data: PanelData; tab: Tab; setTab: (tab: Tab
     { action: "knowledge", label: () => "知识图谱", icon: () => ICONS.graph, hot: () => false },
   ];
   return (
-    <div class={`tb-card tb-panel ${props.card.kind}`}>
-      <nav class="tb-tabs" role="tablist" aria-orientation="vertical">
+    <div class={`tb-card tb-panel ${props.card?.kind ?? "idle"}`}>
+      <nav class="tb-tabs" role="tablist" aria-label="蝴蝶面板" aria-orientation="vertical">
         <For each={TABS}>
           {([id, label]) => (
-            <button role="tab" aria-selected={props.tab === id} classList={{ active: props.tab === id, rec: id === "quick" && rec() }} onPointerDown={() => props.setTab(id)}>{label}</button>
+            <button id={`tb-tab-${id}`} role="tab" aria-controls={`tb-pane-${id}`} aria-selected={props.tab === id} tabIndex={props.tab === id ? 0 : -1} classList={{ active: props.tab === id, rec: id === "quick" && rec() }} onClick={() => props.setTab(id)} onKeyDown={(event) => {
+              if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+              event.preventDefault();
+              const index = TABS.findIndex(([tab]) => tab === id);
+              const next = event.key === "Home" ? 0 : event.key === "End" ? TABS.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + TABS.length) % TABS.length;
+              props.setTab(TABS[next][0]);
+              document.getElementById(`tb-tab-${TABS[next][0]}`)?.focus();
+            }}>
+              {label}<Show when={id === "session" && props.permissionCount}><span class="tb-tab-count">{props.permissionCount}</span></Show>
+            </button>
           )}
         </For>
       </nav>
       <div class="tb-panel-main">
         <header class="tb-head">
           <Butterfly />
-          <span class="tb-state">{LABEL[props.card.kind]}</span>
-          <Show when={props.card.trailing}>
-            <span class="tb-time">{props.card.trailing}</span>
+          <span class="tb-state">{props.tab === "assistant" ? "Nova 助理" : props.tab === "capsules" ? "星屑" : LABEL[props.card?.kind ?? "idle"]}</span>
+          <Show when={props.tab === "session" && props.card?.trailing}>
+            <span class="tb-time">{props.card?.trailing}</span>
           </Show>
           <button class="tb-close" title="关闭" aria-label="关闭" onClick={props.onClose}>
             <svg viewBox="0 0 12 12" width="10" height="10"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
           </button>
         </header>
-        <Show when={props.tab === "session"}>{props.session}</Show>
-        <Show when={props.tab === "quick"}>
+        <TaskbarAssistant active={props.active && props.tab === "assistant"} focusRequest={props.focusRequest} />
+        <div id="tb-pane-capsules" role="tabpanel" aria-labelledby="tb-tab-capsules" class="tb-capsules-pane" hidden={props.tab !== "capsules"}>
+          <ThoughtCapsules active={props.active && props.tab === "capsules"} onCaptured={() => props.setTab("capsules")} />
+        </div>
+        <div id="tb-pane-session" role="tabpanel" aria-labelledby="tb-tab-session" class="tb-session-list" hidden={props.tab !== "session"}>{props.session}</div>
+        <div id="tb-pane-quick" role="tabpanel" aria-labelledby="tb-tab-quick" hidden={props.tab !== "quick"}>
           <div class="tb-grid">
             <For each={tiles}>
               {(t) => (
@@ -90,7 +105,7 @@ function Panel(props: { card: Card; data: PanelData; tab: Tab; setTab: (tab: Tab
               )}
             </For>
           </div>
-        </Show>
+        </div>
         <Show when={error()}>
           <div class="tb-reply-error" role="alert">{error()}</div>
         </Show>
@@ -266,7 +281,7 @@ function Reply(props: { card: Card; onSent: () => void }) {
         onInput={(e) => setText(e.currentTarget.value)}
         onKeyDown={(e) => {
           // isComposing: Enter that confirms an IME candidate is not a send.
-          if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+          if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
             e.preventDefault();
             void send();
           }
@@ -286,23 +301,69 @@ export default function TaskbarBubble() {
   const [cards, setCards] = createStore<Card[]>([]);
   const [permissions, setPermissions] = createSignal<Permission[]>([]);
   const [panel, setPanel] = createSignal<PanelData>({ jianpu: { recording: false } });
-  const [tab, setTab] = createSignal<Tab>("session");
-  /** The next load comes from an open event: pick the tab for how it was opened. */
+  const [tab, setTab] = createSignal<Tab>("assistant");
+  const [active, setActive] = createSignal(false);
+  const [focusRequest, setFocusRequest] = createSignal(0);
+  const [dragging, setDragging] = createSignal(false);
+  const [captureError, setCaptureError] = createSignal("");
+  const [capturing, setCapturing] = createSignal(false);
+  const capture = async (event: DragEvent) => {
+    event.preventDefault();
+    setDragging(false);
+    const data = event.dataTransfer;
+    if (!data) return;
+    if (capturing()) { setCaptureError("上一份星屑仍在保存，请完成后重新拖入。"); return; }
+    // Snapshot while the drag data is readable. Wry's native handler is disabled on this
+    // WebView so text, links and files all arrive here once; the chip still uses native OLE.
+    const files = Array.from(data.files);
+    const directory = Array.from(data.items).some(item => item.webkitGetAsEntry?.()?.isDirectory);
+    const text = files.length ? "" : data.getData("text/plain") || data.getData("text/uri-list").split(/\r?\n/).filter(line => line && !line.startsWith("#")).join("\n")
+      || new DOMParser().parseFromString(data.getData("text/html"), "text/html").body.textContent || "";
+    setCaptureError("");
+    setTab("capsules");
+    setCapturing(true);
+    try {
+      await invoke("taskbar_bubble_activate");
+      if (directory) throw new Error("请拖入文件，不支持文件夹；不会递归读取。");
+      if (files.length > 16 || files.some(file => file.size > 20 * 1024 * 1024) || files.reduce((total, file) => total + file.size, 0) > 80 * 1024 * 1024) {
+        throw new Error("一次最多收取 16 个文件，单文件 20 MiB，合计 80 MiB；本次未保存。");
+      }
+      if (files.length) {
+        const uploads = [];
+        for (const file of files) { const attachment = await fileToAttachment(file); uploads.push({ name: attachment.name, data: attachment.data }); }
+        await invoke("capsule_capture", { text: "", paths: [], uploads });
+      } else {
+        if (!text.trim()) throw new Error("这份拖入内容没有可保存的文字，请拖入文件、链接或选中的文本。");
+        await captureCapsule(text);
+      }
+    } catch (error) { setCaptureError(String(error)); }
+    finally { setCapturing(false); }
+  };
   let fresh = true;
+  let focusPending = false;
+  let revision = 0;
   let shell!: HTMLDivElement;
   let timer: number | undefined;
 
-  const place = () => invoke<boolean>("taskbar_bubble_place", { height: shell.offsetHeight }).catch(() => false);
+  // Ask for the desired height, not the viewport-clamped DOM height: otherwise each native
+  // resize would subtract the transparent padding again. Native clamps this to the work area.
+  const place = () => invoke<boolean>("taskbar_bubble_place", { height: 640 }).catch(() => false);
   const hide = () => void invoke("taskbar_bubble_hide").catch(() => {});
   const dismiss = (card: Card) => void invoke("taskbar_bubble_dismiss", { threadId: card.live ? null : card.threadId }).catch(() => {});
 
   const load = async () => {
+    const request = ++revision;
     const next = await invoke<Payload | null>("taskbar_bubble").catch(() => null);
-    // Nothing left to show (e.g. the result was viewed elsewhere): close instead of an empty bubble.
-    if (!next?.cards.length) return hide();
+    if (request !== revision) return false;
+    // Empty payload means hidden/prewarmed; it must not acknowledge a result or take focus.
+    if (!next?.cards.length) { setActive(false); return hide(); }
     document.documentElement.classList.toggle("light", next.light);
     setPanel({ jianpu: next.jianpu ?? { recording: false } });
-    if (fresh) setTab(next.panel ? "quick" : "session");
+    if (fresh) {
+      focusPending = next.panel === false && !next.capsules;
+      setTab(next.capsules ? "capsules" : "assistant");
+    }
+    if (next.captureError) { setCaptureError(next.captureError); setTab("capsules"); }
     fresh = false;
     // Keyed: a refresh updates the current card in place.
     setCards(reconcile(next.cards, { key: "key" }));
@@ -310,8 +371,16 @@ export default function TaskbarBubble() {
     const keys = (list: Permission[]) => list.map((p) => p.requestKey).join("\n");
     if (keys(next.permissions) !== keys(permissions())) setPermissions(next.permissions);
     // A same-size update does not fire ResizeObserver; acknowledge it after rendering too.
+    setActive(true);
     await new Promise(requestAnimationFrame);
-    return place();
+    if (request !== revision) return false;
+    const placed = await place();
+    if (request !== revision) return false;
+    if (placed && focusPending) {
+      focusPending = false;
+      setFocusRequest((value) => value + 1);
+    }
+    return placed;
   };
   const open = async () => {
     clearInterval(timer);
@@ -331,13 +400,21 @@ export default function TaskbarBubble() {
     const keys = (e: KeyboardEvent) => e.key === "Escape" && hide();
     window.addEventListener("keydown", keys);
     const offs = [
+      listen<boolean>("capsules:dragging", (event) => setDragging(event.payload)),
+      listen("capsules:captured", () => { fresh = false; setDragging(false); setCaptureError(""); setTab("capsules"); }),
+      listen<{ error: string }>("capsules:error", (event) => { setDragging(false); setTab("capsules"); setCaptureError(event.payload.error); }),
       listen("taskbar-bubble:open", () => {
         fresh = true;
         void open();
       }),
-      // Drop the cards so the next bubble mounts fresh and plays its entrance again.
       listen("taskbar-bubble:hidden", () => {
+        ++revision;
+        fresh = true;
+        focusPending = false;
         clearInterval(timer);
+        setActive(false);
+        setDragging(false);
+        setCaptureError("");
         setCards([]);
       }),
     ];
@@ -345,6 +422,7 @@ export default function TaskbarBubble() {
     // place() or delivered as an open event, never lost.
     void Promise.all(offs).then(() => open());
     onCleanup(() => {
+      ++revision;
       observer.disconnect();
       window.removeEventListener("keydown", keys);
       clearInterval(timer);
@@ -353,11 +431,19 @@ export default function TaskbarBubble() {
   });
 
   return (
-    <div class="tb-shell" ref={shell}>
-      <For each={cards}>
+    <div class="tb-shell" ref={shell}
+      onPointerDown={() => void invoke("taskbar_bubble_activate").catch(() => {})}
+      onDragOver={(event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = "copy"; setDragging(true); }}
+      onDragLeave={(event) => { if (!shell.contains(event.relatedTarget as Node | null)) setDragging(false); }}
+      onDrop={(event) => void capture(event)}>
+      <Show when={dragging()}><div class="tb-capsule-drop" role="status"><span>✦</span><strong>松手，收好这一刻</strong><small>文字、链接、文件 · 收集成星屑</small></div></Show>
+      <Show when={capturing()}><div class="tb-capture-progress" role="status">正在收好星屑…</div></Show>
+      <Show when={captureError()}><div class="tb-capture-error" role="alert">{captureError()}<button aria-label="关闭错误提示" onClick={() => setCaptureError("")}>×</button></div></Show>
+      <Panel card={cards[0]} data={panel()} tab={tab()} setTab={setTab} active={active()} focusRequest={focusRequest()} permissionCount={permissions().length} onClose={() => cards[0] ? dismiss(cards[0]) : hide()} reload={() => void load()} session={
+      <For each={cards} fallback={<div class="tb-activity">暂无会话</div>}>
         {(card) => {
           const html = createMemo(() => markdown(card.body));
-          const session = (
+          return (
             <div class="tb-session">
               <Show when={card.title}>
                 <div class="tb-title">{card.title}</div>
@@ -388,9 +474,9 @@ export default function TaskbarBubble() {
               </footer>
             </div>
           );
-          return <Panel card={card} data={panel()} tab={tab()} setTab={setTab} session={session} onClose={() => dismiss(card)} reload={() => void load()} />;
         }}
       </For>
+      } />
     </div>
   );
 }

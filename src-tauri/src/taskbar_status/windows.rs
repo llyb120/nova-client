@@ -1,7 +1,7 @@
 //! A real Explorer child, never a floating window or a taskbar layout modification.
 //! UIA lives on a separate MTA: querying our own HWND on the message thread deadlocks.
 
-use super::{free_slot, snapshot, Kind, Rect, Status};
+use super::{drop_target, free_slot, snapshot, Kind, Rect, Status};
 use std::{
     cell::{Cell, RefCell},
     ptr::{null, null_mut},
@@ -50,7 +50,6 @@ thread_local! {
     static EPOCH: Instant = Instant::now();
     static ANIMATING: Cell<bool> = const { Cell::new(false) };
     /// This press found the bubble open, so its click only closes it.
-    static CLOSING: Cell<bool> = const { Cell::new(false) };
     /// The button-up that ends a double click must not start a bubble.
     static DOUBLE: Cell<bool> = const { Cell::new(false) };
     /// The first click can mark its result read and advance CURRENT before the double click.
@@ -68,12 +67,15 @@ pub(super) fn light_theme() -> bool {
 }
 
 /// Tauri window calls round-trip through the main thread; never block Explorer's child on them.
-fn on_app(work: impl FnOnce(&tauri::AppHandle) + Send + 'static) {
-    if let Some(app) = APP.get() { thread::spawn(move || work(app)); }
+pub(super) fn on_app(work: impl FnOnce(&tauri::AppHandle) + Send + 'static) -> bool {
+    let Some(app) = APP.get() else { return false; };
+    thread::Builder::new().name("nova-taskbar-app".into()).spawn(move || work(app))
+        .map_err(|error| eprintln!("[taskbar-status] cannot dispatch app work: {error}"))
+        .is_ok()
 }
 
 /// Chip rectangle and its monitor's work area, in physical pixels.
-unsafe fn anchor(hwnd: HWND) -> Option<super::bubble::Anchor> {
+pub(super) unsafe fn anchor(hwnd: HWND) -> Option<super::bubble::Anchor> {
     let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if previous.is_null() { return None; }
     let result = (|| {
@@ -286,6 +288,12 @@ unsafe fn collect(walker: &IUIAutomationTreeWalker, node: &IUIAutomationElement,
 }
 
 unsafe fn message_loop() {
+    // OLE needs an STA with a pumping message loop, not the layout worker's MTA.
+    // The guard revokes any remaining target before balancing OleInitialize on this thread.
+    let _ole = match drop_target::Ole::initialize() {
+        Ok(ole) => ole,
+        Err(error) => { eprintln!("[taskbar-status] cannot initialize OLE: {error}"); return; }
+    };
     if SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_null() { return; }
     let instance = GetModuleHandleW(null());
     let class = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: instance, lpszClassName: CLASS, style: CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW, hCursor: LoadCursorW(null_mut(), IDC_HAND), ..Default::default() };
@@ -337,6 +345,7 @@ unsafe fn refresh(shown: &mut Option<Status>) {
     };
     let parent = layout.parent as HWND;
     if !hwnd.is_null() && (IsWindow(hwnd) == 0 || GetParent(hwnd) != parent) {
+        drop_target::revoke();
         WINDOW.store(0, Ordering::Release);
         if IsWindow(hwnd) != 0 { DestroyWindow(hwnd); }
         hwnd = null_mut();
@@ -362,6 +371,9 @@ unsafe fn refresh(shown: &mut Option<Status>) {
         SetThreadDpiAwarenessContext(previous);
         if hwnd.is_null() { return; }
         WINDOW.store(hwnd as usize, Ordering::Release);
+        if let Err(error) = drop_target::register(UiaHwnd(hwnd)) {
+            eprintln!("[taskbar-status] cannot register drop target: {error}");
+        }
         ANIMATING.set(false);
         *shown = None;
         // Warm the bubble webview now so clicks open at once.
@@ -769,20 +781,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_LBUTTONDOWN => {
             KillTimer(hwnd, HOVER);
             CLICKED.with(|clicked| *clicked.borrow_mut() = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone())));
-            let closing = super::bubble::is_open();
-            CLOSING.set(closing);
-            if !closing { on_app(|app| { super::bubble::window(app); }); }
+            on_app(|app| { super::bubble::window(app); });
             0
         }
         WM_LBUTTONUP => {
             if DOUBLE.replace(false) { return 0; }
-            if CLOSING.get() {
-                on_app(super::bubble::hide);
-            } else {
-                // Open at once: waiting out the double-click time made every bubble a beat late.
-                // A double click then hands over to Nova and closes the bubble it just opened.
-                if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open(app, anchor)); }
-            }
+            // Every click is a quick-entry gesture, even when hover already opened the panel.
+            // A double click still hands over to Nova and closes the panel it just opened.
+            if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open(app, anchor)); }
             0
         }
         WM_LBUTTONDBLCLK => {
@@ -850,6 +856,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 paint_chip(hwnd, dc, rect);
             }
             EndPaint(hwnd, &paint);
+            0
+        }
+        WM_DESTROY => {
+            // Also runs when Explorer destroys its child, before the HWND becomes invalid.
+            drop_target::revoke();
             0
         }
         WM_NCDESTROY => {

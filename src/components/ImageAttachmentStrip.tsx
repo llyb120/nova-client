@@ -7,7 +7,7 @@ import type { PromptImage } from "../types";
 import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
 import { IconFile, IconX } from "./icons";
 
-function fileToAttachment(f: File): Promise<PromptImage> {
+export function fileToAttachment(f: File): Promise<PromptImage> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {

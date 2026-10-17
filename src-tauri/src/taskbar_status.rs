@@ -1,6 +1,10 @@
 //! Opt-in Windows taskbar child, not a desktop overlay. Its pixels remain in screenshots;
 //! Jianlai only exempts text repaint inside an unchanged, verified child rectangle.
 
+pub(crate) mod assistant;
+pub(crate) mod capsules;
+#[cfg(windows)]
+mod drop_target;
 #[cfg(windows)]
 mod bubble;
 #[cfg(windows)]
@@ -23,6 +27,14 @@ pub(crate) fn taskbar_bubble_place(app: tauri::AppHandle, height: f64) -> bool {
     return bubble::place(&app, height);
     #[cfg(not(windows))]
     { let _ = (app, height); false }
+}
+
+#[tauri::command]
+pub(crate) fn taskbar_bubble_activate(app: tauri::AppHandle) {
+    #[cfg(windows)]
+    bubble::activate(&app);
+    #[cfg(not(windows))]
+    let _ = app;
 }
 
 #[tauri::command]
@@ -77,6 +89,8 @@ pub(crate) struct Rect {
 }
 
 pub(crate) fn start(app: &tauri::AppHandle) {
+    // Resume accepted assistant tasks even before the next panel is opened.
+    if let Err(error) = assistant::start(app) { eprintln!("[taskbar-assistant] {error}"); }
     #[cfg(windows)]
     if !crate::server::is_headless() {
         windows::start(app.clone());
@@ -285,7 +299,7 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
         let started = thread.items.iter().rev().find_map(|item| match item { Item::User { ts, .. } => Some(*ts), _ => None });
         let text = if running.len() > 1 { format!("{} 项 · {activity}", running.len()) } else { activity.clone() };
         let trailing = started.map(|t| elapsed(now - t)).unwrap_or_default();
-        return Some(Status::new(Kind::Running, text, trailing, &[&thread.title, &activity, "单击查看进度 · 双击打开 Nova"], Some(thread.id.clone())));
+        return Some(Status::new(Kind::Running, text, trailing, &[&thread.title, &activity, "单击打开助理 · 双击打开 Nova"], Some(thread.id.clone())));
     }
     if let Some(activity) = desktop {
         return Some(Status::new(Kind::Running, format!("剑来 · {activity}"), String::new(), &["Nova 正在操作桌面"], None));
@@ -294,7 +308,7 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
     let candidates: Vec<_> = store.threads.iter().filter(|t| !t.items.is_empty())
         .map(|t| (t.id.as_str(), t.updated_at, t.unread_turns)).collect();
     let Some(thread) = pick(&candidates, &seen, shown).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
-        return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "单击发起新会话 · 双击打开 Nova"], None));
+        return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "单击向助理发消息 · 双击打开 Nova"], None));
     };
     // The last turn's final reply (or error) is the conclusion.
     let (kind, body) = thread.items.iter().rev()
@@ -305,7 +319,7 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
             _ => None,
         }).unwrap_or((Kind::Done, ""));
     let text = conclusion(body).unwrap_or_else(|| if kind == Kind::Error { "任务出错" } else { "已完成" }.into());
-    Some(Status::new(kind, text, ago(now - thread.updated_at), &[&thread.title, &excerpt(body, 240), "单击查看完整结论 · 双击打开会话"], Some(thread.id.clone())))
+    Some(Status::new(kind, text, ago(now - thread.updated_at), &[&thread.title, &excerpt(body, 240), "单击打开助理 · 双击打开会话"], Some(thread.id.clone())))
 }
 
 /// Non-empty lines with common markdown decoration removed.

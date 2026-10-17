@@ -1,5 +1,5 @@
-//! A click on the taskbar Butterfly opens the live card (full result, progress and pending
-//! confirmations) in a reused transparent webview. Finishing a turn does not open it.
+//! A click on the taskbar Butterfly focuses the assistant in a reused transparent webview.
+//! Hover previews the same panel without taking focus. Finishing a turn does not open it.
 
 use super::{Kind, Rect};
 use serde_json::{json, Value};
@@ -16,7 +16,7 @@ use windows_sys::Win32::{
 
 const LABEL: &str = "taskbar-bubble";
 /// CSS width including the transparent margin that holds the card's shadow.
-const WIDTH: f64 = 380.0;
+const WIDTH: f64 = 560.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Anchor {
@@ -30,21 +30,16 @@ pub(super) struct Anchor {
 static ANCHOR: Mutex<Option<Anchor>> = Mutex::new(None);
 /// The live card, asked for by a click on the Butterfly.
 static WANTED: AtomicBool = AtomicBool::new(false);
-/// The same window shows the hover quick panel; it never takes focus and closes once the pointer
-/// has left both the Butterfly and the panel.
+/// Persist the requested tab until the page has loaded, including a cold WebView.
+static CAPSULES: AtomicBool = AtomicBool::new(false);
+static CAPTURE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+/// Hover never takes focus and closes once the pointer leaves both the Butterfly and the panel.
+/// Clicking inside pins the panel for keyboard input until blur or explicit dismissal.
 static PANEL: AtomicBool = AtomicBool::new(false);
 static PANEL_WATCH: AtomicBool = AtomicBool::new(false);
-static HIDDEN_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static BUILD: Mutex<()> = Mutex::new(());
 /// Finished result and its rendered revision, kept on the live card even after it is read.
 static SHOWN: Mutex<Option<(String, i64)>> = Mutex::new(None);
-
-/// Open, or the live card was closed by this very click (blur fires on mouse-down, before the chip sees it).
-pub(super) fn is_open() -> bool {
-    // A click on the Butterfly while the hover panel shows opens the live card instead of closing.
-    (WANTED.load(Ordering::Acquire) && !PANEL.load(Ordering::Acquire))
-        || HIDDEN_AT.lock().unwrap().is_some_and(|at| at.elapsed() < Duration::from_millis(400))
-}
 
 /// Built once the Butterfly shows, so a click does not wait for a cold webview.
 pub(super) fn window(app: &AppHandle) -> Option<WebviewWindow> {
@@ -54,12 +49,15 @@ pub(super) fn window(app: &AppHandle) -> Option<WebviewWindow> {
         .title("Nova").decorations(false).resizable(false).shadow(false)
         .transparent(true).background_color(tauri::window::Color(0, 0, 0, 0))
         .always_on_top(true).skip_taskbar(true).visible(false).focused(false)
-        .inner_size(WIDTH, 200.0)
+        // Wry's Windows native handler consumes text/URL drops without forwarding them.
+        // This panel handles DOM files + text; the taskbar chip keeps its native OLE target.
+        .disable_drag_drop_handler()
+        .inner_size(WIDTH, 640.0)
         .build()
         .map_err(|error| eprintln!("[taskbar-status] cannot create bubble: {error}"))
         .ok()?;
-    // The card already animates in CSS. A native hide transition can retain its old WebView
-    // surface after blur/DOM cleanup and briefly flash that surface at the taskbar edge.
+    // Neither native nor CSS entrance transitions: show the assistant immediately. A native hide
+    // transition can retain the old WebView surface and flash it at the taskbar edge.
     if let Ok(hwnd) = window.hwnd() {
         let disabled = 1i32;
         let result = unsafe { DwmSetWindowAttribute(hwnd.0 as _, DWMWA_TRANSITIONS_FORCEDISABLED as u32,
@@ -68,6 +66,7 @@ pub(super) fn window(app: &AppHandle) -> Option<WebviewWindow> {
     }
     let handle = app.clone();
     window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Focused(true) => { PANEL.store(false, Ordering::Release); }
         tauri::WindowEvent::Focused(false) => hide(&handle),
         tauri::WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
@@ -79,6 +78,21 @@ pub(super) fn window(app: &AppHandle) -> Option<WebviewWindow> {
 }
 
 pub(super) fn open(app: &AppHandle, anchor: Anchor) {
+    open_tab(app, anchor, false);
+}
+
+pub(super) fn open_capsules(app: &AppHandle, anchor: Anchor) {
+    open_tab(app, anchor, true);
+}
+
+/// The first native drop may finish before the WebView's event listeners exist.
+pub(super) fn capture_error(app: &AppHandle, error: &str) {
+    *CAPTURE_ERROR.lock().unwrap() = Some(error.to_owned());
+    let _ = app.emit_to(LABEL, "capsules:error", json!({ "error": error }));
+}
+
+fn open_tab(app: &AppHandle, anchor: Anchor, capsules: bool) {
+    CAPSULES.store(capsules, Ordering::Release);
     PANEL.store(false, Ordering::Release);
     *ANCHOR.lock().unwrap() = Some(anchor);
     WANTED.store(true, Ordering::Release);
@@ -86,9 +100,10 @@ pub(super) fn open(app: &AppHandle, anchor: Anchor) {
     if window(app).is_some() { let _ = app.emit_to(LABEL, "taskbar-bubble:open", ()); }
 }
 
-/// Hover: the quick panel, unless the live card is already open.
+/// Hover: preview the assistant unless the panel is already open.
 pub(super) fn open_panel(app: &AppHandle, anchor: Anchor) {
     if WANTED.load(Ordering::Acquire) { return; }
+    CAPSULES.store(false, Ordering::Release);
     PANEL.store(true, Ordering::Release);
     *ANCHOR.lock().unwrap() = Some(anchor);
     WANTED.store(true, Ordering::Release);
@@ -96,6 +111,16 @@ pub(super) fn open_panel(app: &AppHandle, anchor: Anchor) {
     if !PANEL_WATCH.swap(true, Ordering::AcqRel) {
         let app = app.clone();
         std::thread::spawn(move || { watch_panel(&app); PANEL_WATCH.store(false, Ordering::Release); });
+    }
+}
+
+/// Input in a hover preview becomes an ordinary focused panel, no longer pointer-dismissed.
+pub(super) fn activate(app: &AppHandle) {
+    if !WANTED.load(Ordering::Acquire) { return; }
+    PANEL.store(false, Ordering::Release);
+    if let Some(window) = app.get_webview_window(LABEL) {
+        let _ = window.show();
+        let _ = window.set_focus();
     }
 }
 
@@ -124,9 +149,8 @@ fn watch_panel(app: &AppHandle) {
 
 /// Close the card without acknowledging updates it has not rendered yet.
 pub(super) fn hide(app: &AppHandle) {
-    // Only the live card arms the click grace period; a panel closing under the pointer must not eat the next click.
-    let panel = PANEL.swap(false, Ordering::AcqRel);
-    if WANTED.swap(false, Ordering::AcqRel) && !panel { *HIDDEN_AT.lock().unwrap() = Some(Instant::now()); }
+    PANEL.store(false, Ordering::Release);
+    WANTED.store(false, Ordering::Release);
     SHOWN.lock().unwrap().take();
     // The hover panel is shown with ShowWindow (no activation), which tao's visibility flag never saw:
     // window.hide() alone is then a no-op and leaves a transparent, click-eating window. Do both — tao's
@@ -149,7 +173,7 @@ pub(super) fn dismiss(app: &AppHandle, thread: Option<String>) {
 fn frame(anchor: Anchor, css_height: f64) -> (i32, i32, i32, i32) {
     let a = anchor;
     let margin = (8.0 * a.scale).round() as i32;
-    let width = (WIDTH * a.scale).round() as i32;
+    let width = ((WIDTH * a.scale).round() as i32).min((a.work.right - a.work.left - 2 * margin).max(1));
     let height = ((css_height.max(1.0) * a.scale).round() as i32).min((a.work.bottom - a.work.top - margin).max(1));
     let center = (a.chip.left + a.chip.right) / 2;
     let x = (center - width / 2).min(a.work.right - margin - width).max(a.work.left + margin);
@@ -160,8 +184,7 @@ fn frame(anchor: Anchor, css_height: f64) -> (i32, i32, i32, i32) {
 }
 
 pub(super) fn place(app: &AppHandle, css_height: f64) -> bool {
-    // Clearing cards on hide fires ResizeObserver again. Do not move/resize the hidden
-    // surface; is_open() is deliberately unsuitable here because it includes a click grace period.
+    // Clearing cards on hide fires ResizeObserver again. Do not move/resize the hidden surface.
     if !WANTED.load(Ordering::Acquire) { return false; }
     let Some(anchor) = *ANCHOR.lock().unwrap() else { return false };
     let Some(window) = app.get_webview_window(LABEL) else { return false };
@@ -182,7 +205,9 @@ pub(super) fn place(app: &AppHandle, css_height: f64) -> bool {
         let _ = window.show();
         let _ = window.set_focus();
     } else if wanted && !window.is_focused().unwrap_or(true) {
-        // A click turned the hover panel into the live card: take focus for the reply box and blur-to-close.
+        // Hover used native ShowWindow, so Tao's visible flag can still be false; synchronize
+        // it before set_focus(), which otherwise silently skips an allegedly hidden window.
+        let _ = window.show();
         let _ = window.set_focus();
     }
     if WANTED.load(Ordering::Acquire) && window.is_visible().unwrap_or(false) {
@@ -261,7 +286,7 @@ pub(super) fn quick(app: &AppHandle, action: &str) -> Result<Value, String> {
     Ok(Value::Null)
 }
 
-/// The live card: the 会话 tab, opened by a click on the Butterfly (a hover opens 快捷).
+/// The session tab remains available alongside the default assistant and quick actions.
 pub(super) fn payload(app: &AppHandle) -> Value {
     let shown = SHOWN.lock().unwrap().clone();
     let Some(status) = super::snapshot(app, shown.as_ref().map(|(thread, _)| thread.as_str())) else { return Value::Null };
@@ -288,8 +313,9 @@ pub(super) fn payload(app: &AppHandle) -> Value {
     };
     permissions.sort_by(|a, b| a["requestKey"].as_str().cmp(&b["requestKey"].as_str()));
     // Cards follow the taskbar they pop out of, like Windows' own taskbar flyouts.
-    // One window, tabbed: 会话 (this live card, the default after a click) and 快捷 (default on hover).
-    json!({ "cards": cards, "permissions": permissions, "light": super::windows::light_theme(), "panel": PANEL.load(Ordering::Acquire),
+    // Both hover and click default to the assistant; `panel` only controls focus behavior.
+    let capture_error = if cards.is_empty() { None } else { CAPTURE_ERROR.lock().unwrap().take() };
+    json!({ "cards": cards, "permissions": permissions, "light": super::windows::light_theme(), "panel": PANEL.load(Ordering::Acquire), "capsules": CAPSULES.load(Ordering::Acquire), "captureError": capture_error,
         "jianpu": crate::jianpu::status() })
 }
 
@@ -302,12 +328,16 @@ mod tests {
         let work = Rect { left: -1920, top: 0, right: 0, bottom: 1032 };
         let chip = Rect { left: -60, top: 1040, right: -10, bottom: 1068 };
         let (x, y, w, h) = frame(Anchor { chip, work, scale: 1.0 }, 300.0);
-        assert_eq!((w, h, y + h), (380, 300, 1032), "bottom taskbar: above the work area edge");
+        assert_eq!((w, h, y + h), (560, 300, 1032), "bottom taskbar: above the work area edge");
         assert_eq!(x + w, -8, "clamped inside the right edge");
         let top = Anchor { chip: Rect { left: -1000, top: 6, right: -800, bottom: 34 }, work: Rect { top: 40, ..work }, scale: 1.5 };
         let (x, y, w, h) = frame(top, 5000.0);
-        assert_eq!((y, w), (40, 570), "top taskbar: below it, scaled");
+        assert_eq!((y, w), (40, 840), "top taskbar: below it, scaled");
         assert!(h <= 1032 - 40 && x == -900 - w / 2);
+        let narrow = Anchor { work: Rect { left: 0, top: 0, right: 480, bottom: 400 }, chip: Rect { left: 420, top: 400, right: 470, bottom: 430 }, scale: 1.0 };
+        let (x, y, w, h) = frame(narrow, 640.0);
+        assert_eq!((x, w, h), (8, 464, 392));
+        assert!(y >= narrow.work.top && y + h <= narrow.work.bottom);
     }
 
 }
