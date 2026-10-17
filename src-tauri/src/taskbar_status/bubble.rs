@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use windows_sys::Win32::{
     Foundation::{POINT, RECT},
     Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED},
-    UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE},
+    UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE},
 };
 
 const LABEL: &str = "taskbar-bubble";
@@ -128,8 +128,12 @@ pub(super) fn hide(app: &AppHandle) {
     let panel = PANEL.swap(false, Ordering::AcqRel);
     if WANTED.swap(false, Ordering::AcqRel) && !panel { *HIDDEN_AT.lock().unwrap() = Some(Instant::now()); }
     SHOWN.lock().unwrap().take();
+    // The hover panel is shown with ShowWindow (no activation), which tao's visibility flag never saw:
+    // window.hide() alone is then a no-op and leaves a transparent, click-eating window. Do both — tao's
+    // call keeps its flag in sync so the next window.show() is not skipped, Win32 hides for real.
     if let Some(window) = app.get_webview_window(LABEL) {
-        if window.is_visible().unwrap_or(false) { let _ = window.hide(); }
+        let _ = window.hide();
+        if let Ok(hwnd) = window.hwnd() { unsafe { ShowWindow(hwnd.0 as _, SW_HIDE); } }
     }
     let _ = app.emit_to(LABEL, "taskbar-bubble:hidden", ());
     super::windows::wake();
@@ -170,6 +174,8 @@ pub(super) fn place(app: &AppHandle, css_height: f64) -> bool {
     if wanted && PANEL.load(Ordering::Acquire) {
         // Hover must not steal focus from the app the user is working in.
         if !window.is_visible().unwrap_or(true) { unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE); } }
+        // The pointer may have left (watch_panel hid it) between the check above and the show.
+        if !WANTED.load(Ordering::Acquire) { unsafe { ShowWindow(hwnd, SW_HIDE); } return false; }
         return true;
     }
     if wanted && !window.is_visible().unwrap_or(true) {
@@ -249,10 +255,6 @@ pub(super) fn quick(app: &AppHandle, action: &str) -> Result<Value, String> {
     }
     hide(app);
     match action {
-        "newSession" | "openUnread" => {
-            crate::sys_notify::focus_main_window(app);
-            let _ = app.emit(if action == "newSession" { crate::EV_NEW_SESSION_SHORTCUT } else { crate::EV_OPEN_UNREAD_SHORTCUT }, ());
-        }
         "knowledge" => { crate::sys_notify::focus_main_window(app); let _ = app.emit("nova:open-view", json!({ "view": "knowledge" })); }
         _ => return Err(format!("未知快捷操作：{action}")),
     }

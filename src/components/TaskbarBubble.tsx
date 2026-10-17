@@ -35,8 +35,6 @@ const icon = (d: string) => (
 const ICONS = {
   brush: "M4 20l4.5-1.2L19 8.3a2.1 2.1 0 00-3-3L5.5 15.8 4 20zM14.5 6.8l3 3",
   stop: "M7 7h10v10H7z",
-  chat: "M5 5h14v10H9l-4 4V5zM12 8v4M10 10h4",
-  bell: "M6 16V11a6 6 0 0112 0v5l1.5 2h-15L6 16zM10 20a2 2 0 004 0",
   graph: "M6 7a2 2 0 100-.01M18 6a2 2 0 100-.01M12 18a2 2 0 100-.01M7.6 8.2l3.2 7.8M16.4 7.2l-3.2 8.8M8 6.6h8",
 };
 
@@ -56,8 +54,6 @@ function Panel(props: { card: Card; data: PanelData; tab: Tab; setTab: (tab: Tab
   const rec = () => props.data.jianpu.recording;
   const tiles = () => [
     { action: "jianpu", label: rec() ? `停止 ${clock(props.data.jianpu.elapsedMs)}` : "剑谱录制", icon: rec() ? ICONS.stop : ICONS.brush, hot: rec() },
-    { action: "newSession", label: "新会话", icon: ICONS.chat },
-    { action: "openUnread", label: "打开未读", icon: ICONS.bell },
     { action: "knowledge", label: "知识图谱", icon: ICONS.graph },
   ];
   return (

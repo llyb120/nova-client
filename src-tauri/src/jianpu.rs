@@ -17,8 +17,6 @@ type Result<T> = std::result::Result<T, String>;
 
 const MAX_STEPS: usize = 200;
 const MAX_TIME: Duration = Duration::from_secs(600);
-/// 关键帧附图上限：其余截图仍在目录里，模型可按文件名 read。
-const MAX_IMAGES: usize = 16;
 pub(crate) const EV_CHANGED: &str = "jianpu:changed";
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
@@ -209,11 +207,17 @@ pub(crate) fn list() -> Vec<Value> {
     all.iter().map(summary).collect()
 }
 
-/// experience_save 带 recordingId 时代替「180 秒内的截图」做来源校验：scope 必须是演示里出现过的应用。
-pub(crate) fn scope_of(id: &str, raw_scope: &str) -> Result<String> {
+/// experience_save 带 recordingId 时代替「180 秒内的观察」做来源校验：剑来的 scope 必须是演示里出现过的应用，
+/// chrome 的 scope 必须是演示里 Chrome 地址栏出现过的网站 origin。
+pub(crate) fn scope_of(id: &str, tool: &str, raw_scope: &str) -> Result<String> {
     let rec = load(id)?;
-    let want = raw_scope.trim().to_lowercase();
-    rec.steps.iter().find(|s| s.app.to_lowercase() == want).map(|_| want).ok_or_else(|| "scope 不是这段剑谱里出现过的应用名".into())
+    let want = crate::tool_experience::scope(tool, raw_scope)?;
+    let seen = |s: &Step| if tool == "chrome" {
+        s.url.as_deref().and_then(|u| crate::tool_experience::scope("chrome", u).ok()).as_deref() == Some(want.as_str())
+    } else { s.app.to_lowercase() == want };
+    if rec.steps.iter().any(seen) { Ok(want) } else if tool == "chrome" {
+        Err("scope 不是这段剑谱里 Chrome 打开过的网站 origin".into())
+    } else { Err("scope 不是这段剑谱里出现过的应用名".into()) }
 }
 
 pub(crate) fn link_route(id: &str, route: &str) {
@@ -223,29 +227,24 @@ pub(crate) fn link_route(id: &str, route: &str) {
 }
 
 const LEARN_RULES: &str = "你在整理一段用户亲手演示的桌面操作（剑谱），目标是把它存进剑来知识图谱，供以后复用。只整理，不要操作桌面，也不要重放。\n\
-下方 JSON 是按时间排列的步骤：click/double_click/right_click/drag 的 x/y 是对应截图（image 字段，文件在下方截图目录里）里的像素，红圈标出了点击位置；scroll 的 key 是方向、amount 是格数；key 是组合键；type 的 text 是按键得到的文字，value 是这段输入结束时读到的输入框内容（更可信；输入法输入只有 value）。附图是部分点击截图，其余可用 read 读取截图目录下的文件。\n\
-1. 按 app 拆开（图谱按应用隔离，不能跨应用拼接）；每个应用按目标切成一条或多条路径，task 写成通用目标，如“给联系人发送文件”。\n\
+下方 JSON 是按时间排列的步骤：click/double_click/right_click/drag 的 x/y 是对应截图（image 字段，文件在下方截图目录里）里的像素，红圈标出了点击位置；scroll 的 key 是方向、amount 是格数；key 是组合键；type 的 text 是按键得到的文字，value 是这段输入结束时读到的输入框内容（更可信；输入法输入只有 value）。截图不随提示词附上：需要确认点的是什么时，用 read 按 image 文件名读取截图目录下的图片，只读需要的几张。\n\
+1. 按 app 拆开（图谱按应用/网站隔离，不能跨应用拼接）；带 url 的步骤是在 Chrome 网页里的操作，按网站 origin 拆开，归为 chrome 经验；每个应用/网站按目标切成一条或多条路径，task 写成通用目标，如“给联系人发送文件”。\n\
 2. 对照截图把坐标写成语义步骤（如 点击「发送」按钮），去掉试错、绕路和撤销的操作；超过 12 步时合并相邻步骤。\n\
 3. 输入内容：必须输入指定内容的（命令、网址、路径、配置值、固定选项文字）在步骤里原样写出，如 输入「git status」并回车；每次会变的（搜索词、人名、日期、正文）只写方法，如 在搜索框输入要找的联系人名称。拿不准按会变处理。\n\
-4. 每条路径调用 jianlai operation=experience_save，experience 带 recordingId、scope（该应用 app 原值）、task、conditions（入口条件）、steps、checks（演示最后可见的结果）、pitfalls（演示中暴露的坑，可空）、evidence（简述演示终态）、outcome=success、redacted=true；不需要 snapshotId。\n\
+4. 桌面应用的路径调用 jianlai operation=experience_save，scope 填该应用 app 原值；Chrome 网页里的路径调用 chrome operation=experience_save，scope 填网站 origin（如 https://github.com，取自 url），conditions 写起始页面路径，步骤按网页控件写（如 点击 button「提交」），不写坐标。experience 都带 recordingId、task、conditions（入口条件）、steps、checks（演示最后可见的结果）、pitfalls（演示中暴露的坑，可空）、evidence（简述演示终态）、outcome=success、redacted=true；不需要 snapshotId/tabTag。\n\
 5. 保存完用一两句话汇报存了哪几条路径。演示提炼不出可复用路径时直接说明原因，不保存。";
 
 pub(crate) fn learn(app: &AppHandle, id: &str) -> Result<String> {
-    use base64::Engine;
     let mut rec = load(id)?;
     if rec.steps.is_empty() { return Err("这段剑谱没有录到操作".into()); }
     let dir = dir_of(id)?;
     let state = app.state::<crate::AppState>();
     let (kind, model) = {
         let s = state.settings.lock().unwrap();
-        (crate::threads::AgentKind::from_str(&s.butterfly_agent_kind).unwrap_or(crate::threads::AgentKind::Lyra), s.butterfly_model.clone())
+        // 暂时沿用 Meteor（流星）的执行后端与模型。
+        (crate::threads::AgentKind::from_str(&s.meteor_agent_kind).unwrap_or(crate::threads::AgentKind::Lyra), s.meteor_model.clone())
     };
-    if !state.agent_enabled(&kind) { return Err(format!("{} 后端已关闭，请在设置里更换 Butterfly 模型", kind.label())); }
-    let images: Vec<_> = rec.steps.iter().filter_map(|s| s.image.as_deref()).take(MAX_IMAGES).filter_map(|name| {
-        let bytes = std::fs::read(dir.join(name)).ok()?;
-        Some(crate::threads::PromptImage { name: name.into(), mime_type: "image/jpeg".into(), size: Some(bytes.len() as u64),
-            data: Some(base64::engine::general_purpose::STANDARD.encode(bytes)), uri: None })
-    }).collect();
+    if !state.agent_enabled(&kind) { return Err(format!("{} 后端已关闭，请在设置 → Meteor 里更换执行模型", kind.label())); }
     // 与 Meteor 一样在临时目录开会话：不给每段剑谱各建一个项目；截图按绝对路径读取。
     let scratch = std::env::temp_dir().join(crate::SCRATCH_MARK).join(format!("jianpu-{id}"));
     std::fs::create_dir_all(&scratch).map_err(|e| format!("创建临时目录失败：{e}"))?;
@@ -259,7 +258,7 @@ pub(crate) fn learn(app: &AppHandle, id: &str) -> Result<String> {
         store.save();
     }
     let prompt = format!("{LEARN_RULES}\n\nrecordingId: {id}\n截图目录：{}\n```json\n{}\n```", dir.display(), serde_json::to_string(&rec.steps).unwrap_or_default());
-    if let Err(e) = crate::dispatch_prompt(app, thread_id.clone(), prompt, images) {
+    if let Err(e) = crate::dispatch_prompt(app, thread_id.clone(), prompt, Vec::new()) {
         let mut store = state.store.lock().unwrap();
         store.threads.retain(|t| t.id != thread_id);
         store.save();
@@ -444,7 +443,7 @@ mod platform {
 
         fn ctx(&mut self, hwnd: HWND) -> (Ctx, Option<xcap::Window>) {
             let window = xcap::Window::all().ok().and_then(|all| all.into_iter().find(|w| w.id().ok() == Some(hwnd as usize as u32)));
-            let ctx = window.as_ref().map(|w| Ctx { app: w.app_name().unwrap_or_default(), title: w.title().unwrap_or_default() }).unwrap_or_default();
+            let ctx = window.as_ref().map(|w| Ctx { app: w.app_name().unwrap_or_default(), title: w.title().unwrap_or_default(), url: String::new() }).unwrap_or_default();
             self.cache = Some((hwnd as usize, ctx.clone()));
             (ctx, window)
         }
@@ -456,7 +455,9 @@ mod platform {
 
         pub(super) fn shot(&mut self, pt: (i32, i32), dir: &Path, n: usize) -> (Ctx, Option<Frame>) {
             let hwnd = unsafe { GetAncestor(WindowFromPoint(POINT { x: pt.0, y: pt.1 }), GA_ROOT) };
-            let (ctx, window) = self.ctx(hwnd);
+            let (mut ctx, window) = self.ctx(hwnd);
+            // 按下时地址栏还是这次点击所在的页面。
+            if ctx.app.to_lowercase().contains("chrome") { ctx.url = self.chrome_url(hwnd).unwrap_or_default(); }
             let file = format!("{n:03}.jpg");
             // 任务栏、桌面等不在窗口列表里的位置截所在显示器。
             let captured = window.and_then(|w| Some((w.capture_image().ok()?, (w.x().ok()?, w.y().ok()?), w.width().ok()?)))
@@ -466,6 +467,24 @@ mod platform {
                 Some(Frame { file, origin, scale })
             });
             (if ctx.app.is_empty() { Ctx { app: "桌面".into(), ..ctx } } else { ctx }, frame)
+        }
+
+        /// Chrome 地址栏内容（UIA 里窗口内第一个 Edit 控件）。显示时省掉的 https:// 补回来。
+        /// ponytail: 依赖 Chrome 把地址栏放在第一个 Edit；界面改版时读不到就留空，该步按桌面应用整理。
+        fn chrome_url(&self, hwnd: HWND) -> Option<String> {
+            use windows::Win32::{Foundation::HWND as UiaHwnd, System::Variant::VARIANT, UI::Accessibility::*};
+            let automation = self.automation.as_ref()?;
+            let text = unsafe {
+                let root = automation.ElementFromHandle(UiaHwnd(hwnd as _)).ok()?;
+                let edit = automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_EditControlTypeId.0)).ok()?;
+                let bar = root.FindFirst(TreeScope_Descendants, &edit).ok()?;
+                let pattern: IUIAutomationValuePattern = bar.GetCurrentPatternAs(UIA_ValuePatternId).ok()?;
+                pattern.CurrentValue().ok()?.to_string()
+            };
+            let text = text.trim();
+            if text.is_empty() || text.contains(' ') { return None; }
+            let url = if text.contains("://") { text.to_string() } else { format!("https://{text}") };
+            tauri::Url::parse(&url).ok().filter(|u| matches!(u.scheme(), "http" | "https")).map(|u| u.to_string())
         }
 
         /// 焦点输入框的当前内容；密码框等读不到时返回 None。

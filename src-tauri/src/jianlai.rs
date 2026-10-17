@@ -1614,7 +1614,7 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
             // 剑谱整理：用户演示录制代替「本会话180秒内截图」做来源校验。
             if let Some(id) = args["experience"]["recordingId"].as_str().filter(|s| !s.is_empty()) {
                 if args["operation"] != "experience_save" { return Err("recordingId仅用于experience_save".into()); }
-                let observed = crate::jianpu::scope_of(id, args["experience"]["scope"].as_str().unwrap_or_default())?;
+                let observed = crate::jianpu::scope_of(id, "jianlai", args["experience"]["scope"].as_str().unwrap_or_default())?;
                 let mut args = args.clone();
                 args["snapshotId"] = json!(format!("{}{id}", crate::tool_experience::DEMO));
                 let result = crate::tool_experience::execute(&crate::tool_experience::dir(), "jianlai", &owner, &args, Some(&observed))?;

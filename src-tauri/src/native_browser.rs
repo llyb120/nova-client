@@ -2186,6 +2186,18 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
         return Box::pin(crate::altair_run::browser(root, args, owner, "chrome")).await;
     }
     if crate::tool_experience::is_operation(args) {
+        // 剑谱整理：用户在 Chrome 里的演示录制代替本会话标签观察做来源校验。
+        if let Some(id) = args["experience"]["recordingId"].as_str().filter(|s| !s.is_empty()).map(str::to_string) {
+            if operation != "experience_save" { return Err("recordingId仅用于experience_save".into()); }
+            let mut args = args.clone();
+            return tokio::task::spawn_blocking(move || {
+                let observed = crate::jianpu::scope_of(&id, "chrome", args["experience"]["scope"].as_str().unwrap_or_default())?;
+                args["snapshotId"] = json!(format!("{}{id}", crate::tool_experience::DEMO));
+                let result = crate::tool_experience::execute(&crate::tool_experience::dir(), "chrome", &thread_id, &args, Some(&observed))?;
+                if let Some(route) = result["experience"]["id"].as_str() { crate::jianpu::link_route(&id, route); }
+                Ok(result)
+            }).await.map_err(|e| e.to_string())?;
+        }
         let observed = if operation == "experience_search" { None } else {
             let tag = args["tabTag"].as_str().ok_or("经验保存/反馈需tabTag")?;
             let state = app.state::<BrowserState>();

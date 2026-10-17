@@ -22,8 +22,8 @@ const EXTERNAL_LINGER: Duration = Duration::from_secs(20);
 const TICK: Duration = Duration::from_millis(500);
 const LABEL: &str = "agent-glow";
 static APP: OnceLock<AppHandle> = OnceLock::new();
-struct State { holds: u32, generation: u64, last: Option<Instant>, watching: bool, layout: String }
-static STATE: Mutex<State> = Mutex::new(State { holds: 0, generation: 0, last: None, watching: false, layout: String::new() });
+struct State { holds: u32, generation: u64, last: Option<Instant>, watching: bool }
+static STATE: Mutex<State> = Mutex::new(State { holds: 0, generation: 0, last: None, watching: false });
 static CURSOR: AtomicBool = AtomicBool::new(false);
 /// 剑谱录制中：朱红慢呼吸 +「剑谱录制中」标签 + 毛笔指针，与剑来的天蓝 + 剑互斥（录制中剑来不接手桌面）。
 static RECORDING: AtomicBool = AtomicBool::new(false);
@@ -72,15 +72,15 @@ pub(crate) fn recording(on: bool) {
     let Some(app) = APP.get() else { return };
     let app = app.clone();
     std::thread::spawn(move || {
-        let mut layout = std::mem::take(&mut STATE.lock().unwrap().layout);
+        // 持 STATE 锁：剑来 watch 的「收起」要么排在前面，要么看到录制后退出，不会把刚亮起的朱红光效收掉。
+        let _state = STATE.lock().unwrap();
         if !on { hide(&app); }
         else {
             brand_cursor(true);
             if !OVERLAY_OFF.load(Ordering::Relaxed) {
-                if let Err(e) = show(&app, &mut layout) { eprintln!("[agent-glow] {e}"); }
+                if let Err(e) = show(&app) { eprintln!("[agent-glow] {e}"); }
             }
         }
-        STATE.lock().unwrap().layout = layout;
     });
 }
 
@@ -105,7 +105,7 @@ fn watch() {
     loop {
         let running = any_running(app);
         saw_running |= running;
-        let (generation, mut layout) = {
+        let generation = {
             let mut s = STATE.lock().unwrap();
             if RECORDING.load(Ordering::Acquire) { s.watching = false; return; }
             if !wanted(s.holds, s.last.map_or(Duration::ZERO, |t| t.elapsed()), running, saw_running) {
@@ -114,25 +114,24 @@ fn watch() {
                 hide(app);
                 return;
             }
-            (s.generation, std::mem::take(&mut s.layout))
+            s.generation
         };
         // 每次新的剑来调用都换好指针、重新置顶并按当前显示器布局铺满。
         if generation != shown {
             shown = generation;
             if !CURSOR.load(Ordering::Acquire) { brand_cursor(false); }
             if !OVERLAY_OFF.load(Ordering::Relaxed) {
-                if let Err(e) = show(app, &mut layout) {
+                if let Err(e) = show(app) {
                     eprintln!("[agent-glow] {e}");
                     if e.starts_with(FATAL) { OVERLAY_OFF.store(true, Ordering::Relaxed); }
                 }
             }
         }
-        STATE.lock().unwrap().layout = layout;
         std::thread::sleep(TICK);
     }
 }
 
-fn show(app: &AppHandle, loaded: &mut String) -> Result<(), String> {
+fn show(app: &AppHandle) -> Result<(), String> {
     let mut rects = Vec::new();
     for m in xcap::Monitor::all().map_err(|e| e.to_string())? {
         rects.push((m.x().map_err(|e| e.to_string())?, m.y().map_err(|e| e.to_string())?,
@@ -149,13 +148,11 @@ fn show(app: &AppHandle, loaded: &mut String) -> Result<(), String> {
         query += &format!("&o={},{}", x - left, y - top);
     }
     let window = window(app, &query)?;
-    if *loaded != query {
-        if !loaded.is_empty() {
-            let mut url = window.url().map_err(|e| e.to_string())?;
-            url.set_query(Some(&query));
-            window.navigate(url).map_err(|e| e.to_string())?;
-        }
-        *loaded = query;
+    // 以窗口实际加载的地址为准（不另记状态）：剑来天蓝 ↔ 剑谱朱红切换、显示器布局变化都会重新加载。
+    let mut url = window.url().map_err(|e| e.to_string())?;
+    if url.query() != Some(query.as_str()) {
+        url.set_query(Some(&query));
+        window.navigate(url).map_err(|e| e.to_string())?;
     }
     let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as usize;
     let (tx, rx) = mpsc::channel();

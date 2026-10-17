@@ -14,7 +14,7 @@
 
 剑来、Chrome、WebView 均接入经验保存，按工具分组展示；没有记录时显示空状态。
 
-剑来路径还可来自[剑谱](jianlai.md#剑谱用户演示录制windows)：用户演示录制后由模型整理保存，`experience_save` 带 `recordingId` 代替最新截图校验，路径标为 `source=demo`、`verification=user_demonstrated`，与模型验证路径同等参与 `experienceHint` 排序；详情里「查看剑谱」打开原始录制。
+剑来与 Chrome 路径还可来自[剑谱](jianlai.md#剑谱用户演示录制windows)（演示中 Chrome 网页的操作按网站 origin 存为 chrome 经验）：用户演示录制后由模型整理保存，`experience_save` 带 `recordingId` 代替最新截图校验，路径标为 `source=demo`、`verification=user_demonstrated`，与模型验证路径同等参与 `experienceHint` 排序；详情里「查看剑谱」打开原始录制。
 
 页面验证：`node scripts/knowledge-graph.test.mjs`（需本机 Edge，或用 `TEST_BROWSER` 指定 Chromium 路径）。
 

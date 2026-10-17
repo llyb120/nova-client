@@ -314,6 +314,11 @@
           "redacted": {
             "type": "boolean",
             "description": "必须true，确认已脱敏"
+          },
+          "recordingId": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "仅整理剑谱时：save带剑谱id代替tabTag/snapshotId，scope须是剑谱里出现过的网站origin"
           }
         },
         "required": [

@@ -8,7 +8,7 @@ const IMAGE_EDGE: u32 = 1280;
 pub(super) struct Frame { pub file: String, pub origin: (i32, i32), pub scale: f32 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(super) struct Ctx { pub app: String, pub title: String }
+pub(super) struct Ctx { pub app: String, pub title: String, /** Chrome 页面地址（地址栏读到的），其它应用为空。 */ pub url: String }
 
 /// worker 补上上下文与截图后的事件，`fold` 的输入（纯数据，便于测试）。
 #[derive(Clone, Debug)]
@@ -43,6 +43,8 @@ pub(crate) struct Step {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub key: Option<String>,
     /// scroll：滚轮格数。
     #[serde(default, skip_serializing_if = "Option::is_none")] pub amount: Option<i32>,
+    /// 点击时 Chrome 地址栏的页面地址：这一步属于 chrome 工具的网站经验。
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub url: Option<String>,
 }
 
 
@@ -75,7 +77,8 @@ pub(super) fn fold(events: &[Ev]) -> Vec<Step> {
                 let Some((start, b, from, ctx, frame)) = down.take().filter(|d| d.1 == *button) else { continue };
                 let far = (pt.0 - from.0).abs().max((pt.1 - from.1).abs());
                 let (x, y) = image_point(&frame, from);
-                let mut step = Step { at: start, app: ctx.app, title: ctx.title, x, y, image: frame.as_ref().map(|f| f.file.clone()), ..Step::default() };
+                let url = Some(ctx.url).filter(|u| !u.is_empty());
+                let mut step = Step { at: start, app: ctx.app, title: ctx.title, url, x, y, image: frame.as_ref().map(|f| f.file.clone()), ..Step::default() };
                 if far > 8 {
                     let (to_x, to_y) = image_point(&frame, *pt);
                     step = Step { kind: "drag".into(), to_x, to_y, ..step };
@@ -167,7 +170,7 @@ pub(super) fn save_frame(mut image: image::RgbaImage, origin: (i32, i32), source
 mod tests {
     use super::*;
 
-    fn ctx(app: &str) -> Ctx { Ctx { app: app.into(), title: "t".into() } }
+    fn ctx(app: &str) -> Ctx { Ctx { app: app.into(), title: "t".into(), url: if app == "Chrome" { "https://a.com/x".into() } else { String::new() } } }
     fn key(at: i64, name: &str, text: Option<&str>, mods: [bool; 4], app: &str) -> Ev {
         Ev::Key { at, name: name.into(), text: text.map(Into::into), mods, ctx: ctx(app) }
     }
@@ -214,6 +217,9 @@ mod tests {
         // 别的应用里的打字不并入上一段。
         let split = fold(&[key(0, "A", Some("a"), NONE, "A"), key(1, "B", Some("b"), NONE, "B")]);
         assert_eq!(split.len(), 2);
+        // Chrome 里的点击带上页面地址，供整理成 chrome 网站经验。
+        let web = fold(&[Ev::Down { at: 0, button: 0, pt: (1, 1), ctx: ctx("Chrome"), frame: None }, Ev::Up { button: 0, pt: (1, 1) }]);
+        assert_eq!((web[0].url.as_deref(), steps[0].url.as_deref()), (Some("https://a.com/x"), None));
     }
 
     #[test]
