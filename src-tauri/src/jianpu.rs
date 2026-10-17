@@ -126,25 +126,11 @@ pub(crate) fn stop() -> Result<Recording> {
     saved.map(|_| rec)
 }
 
-/// 快捷键/自动停止入口：Nova 窗口通常不在前台，结果用系统通知告知，点通知打开剑谱查看页。
+/// 快捷键/自动停止入口：停止时只收起光效、静默保存（不打开剑谱页）；只有失败才用系统通知告知，
+/// 因为此时 Nova 窗口通常不在前台。
 pub(crate) fn toggle_notify() {
     let Some(app) = APP.get() else { return };
-    match toggle() {
-        Ok(v) if v["recording"] == false => {
-            let (id, n) = (v["id"].as_str().unwrap_or_default().to_string(), v["steps"].as_u64().unwrap_or(0));
-            let handle = app.clone();
-            crate::sys_notify::show(app, "剑谱已保存", &format!("录到 {n} 步，点击查看并交给 AI 学习"), false,
-                Some(Box::new(move || open_viewer(&handle, &id))));
-        }
-        Ok(_) => {}
-        Err(e) => crate::sys_notify::show(app, "剑谱", &e, false, None),
-    }
-}
-
-/// 在主窗口打开剑谱查看页（id 为空时打开列表）。
-pub(crate) fn open_viewer(app: &AppHandle, id: &str) {
-    crate::sys_notify::focus_main_window(app);
-    let _ = app.emit("jianpu:open", json!({"id": id}));
+    if let Err(e) = toggle() { crate::sys_notify::show(app, "剑谱", &e, false, None); }
 }
 
 /// 退出 Nova 时保存正在进行的录制，并卸载钩子、恢复指针。

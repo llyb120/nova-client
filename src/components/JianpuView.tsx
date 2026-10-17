@@ -1,4 +1,4 @@
-import { createEffect, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { jianpuFocus, setFocusRouteId, setJianpuFocus } from "../knowledgeGraph";
@@ -22,16 +22,29 @@ function describe(step: Step) {
   return step.x == null ? "" : `(${step.x}, ${step.y})`;
 }
 
-/** Click screenshot loaded on demand; images stay in the recording folder, not in the bundle. */
+/** Click screenshot loaded on demand; images stay in the recording folder, not in the bundle.
+ *  Plain signals, not createResource: a resource read here suspends the App-level <Suspense> and blanks the whole page. */
 function Shot(props: { id: string; name: string }) {
-  const [src] = createResource(() => [props.id, props.name] as const, ([id, name]) => invoke<string>("jianpu_image", { id, name }).catch(() => ""));
+  const [src, setSrc] = createSignal("");
+  createEffect(on(() => [props.id, props.name] as const, ([id, name]) => {
+    void invoke<string>("jianpu_image", { id, name }).then(setSrc, () => setSrc(""));
+  }));
   return <Show when={src()}><img class="jianpu-shot" src={src()} alt={`点击截图 ${props.name}`} loading="lazy" /></Show>;
 }
 
 export default function JianpuView() {
-  const [list, { refetch }] = createResource(() => invoke<Summary[]>("jianpu_list").catch(() => []));
+  // Signals keep the previous recording on screen until the next one has loaded (no Suspense flash).
+  const [list, setList] = createSignal<Summary[]>([]);
   const [selected, setSelected] = createSignal("");
-  const [detail, { refetch: reloadDetail }] = createResource(selected, id => invoke<Detail>("jianpu_get", { id }).catch(() => null));
+  const [detail, setDetail] = createSignal<Detail | null>(null);
+  const refetch = () => invoke<Summary[]>("jianpu_list").then(setList, () => {});
+  const reloadDetail = () => {
+    const id = selected();
+    if (!id) return setDetail(null);
+    void invoke<Detail>("jianpu_get", { id }).then(d => { if (selected() === id) setDetail(d); }, () => setDetail(null));
+  };
+  void refetch();
+  createEffect(on(selected, reloadDetail));
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
   const [recording, setRecording] = createSignal(false);
@@ -39,14 +52,14 @@ export default function JianpuView() {
   createEffect(() => {
     const focus = jianpuFocus();
     if (focus) { setSelected(focus); setJianpuFocus(""); }
-    else if (!selected() && list()?.length) setSelected(list()![0].id);
+    else if (!selected() && list().length) setSelected(list()[0].id);
   });
   onMount(() => {
     void invoke<{ recording: boolean }>("jianpu_status").then(s => setRecording(s.recording)).catch(() => {});
     const off = listen<{ recording: boolean }>("jianpu:changed", event => {
       setRecording(event.payload.recording);
       void refetch();
-      if (selected()) void reloadDetail();
+      reloadDetail();
     });
     onCleanup(() => void off.then(fn => fn()));
   });
@@ -55,7 +68,7 @@ export default function JianpuView() {
     setBusy(true); setError("");
     try { await work(); } catch (e) { setError(String(e)); }
     setBusy(false);
-    void refetch(); void reloadDetail();
+    void refetch(); reloadDetail();
   };
   const learn = (id: string) => act(async () => { await openThread(await invoke<string>("jianpu_learn", { id })); });
   const remove = (id: string) => {

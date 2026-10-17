@@ -52,16 +52,18 @@ function Panel(props: { card: Card; data: PanelData; tab: Tab; setTab: (tab: Tab
     props.reload();
   };
   const rec = () => props.data.jianpu.recording;
-  const tiles = () => [
-    { action: "jianpu", label: rec() ? `停止 ${clock(props.data.jianpu.elapsedMs)}` : "剑谱录制", icon: rec() ? ICONS.stop : ICONS.brush, hot: rec() },
-    { action: "knowledge", label: "知识图谱", icon: ICONS.graph },
+  // Fixed button nodes with reactive labels: the 1s refresh (recording clock) must not rebuild the DOM
+  // under the pointer, or a click spanning the refresh is lost.
+  const tiles = [
+    { action: "jianpu", label: () => (rec() ? `停止 ${clock(props.data.jianpu.elapsedMs)}` : "剑谱录制"), icon: () => (rec() ? ICONS.stop : ICONS.brush), hot: rec },
+    { action: "knowledge", label: () => "知识图谱", icon: () => ICONS.graph, hot: () => false },
   ];
   return (
     <div class={`tb-card tb-panel ${props.card.kind}`}>
       <nav class="tb-tabs" role="tablist" aria-orientation="vertical">
         <For each={TABS}>
           {([id, label]) => (
-            <button role="tab" aria-selected={props.tab === id} classList={{ active: props.tab === id, rec: id === "quick" && rec() }} onClick={() => props.setTab(id)}>{label}</button>
+            <button role="tab" aria-selected={props.tab === id} classList={{ active: props.tab === id, rec: id === "quick" && rec() }} onPointerDown={() => props.setTab(id)}>{label}</button>
           )}
         </For>
       </nav>
@@ -79,11 +81,11 @@ function Panel(props: { card: Card; data: PanelData; tab: Tab; setTab: (tab: Tab
         <Show when={props.tab === "session"}>{props.session}</Show>
         <Show when={props.tab === "quick"}>
           <div class="tb-grid">
-            <For each={tiles()}>
+            <For each={tiles}>
               {(t) => (
-                <button class="tb-tile" classList={{ hot: !!t.hot }} onClick={() => void run(t.action)}>
-                  {icon(t.icon)}
-                  <span>{t.label}</span>
+                <button class="tb-tile" classList={{ hot: t.hot() }} onClick={() => void run(t.action)}>
+                  {icon(t.icon())}
+                  <span>{t.label()}</span>
                 </button>
               )}
             </For>

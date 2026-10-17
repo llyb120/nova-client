@@ -25,15 +25,13 @@
   .burst .ring:nth-child(4) { animation-delay: .32s; border-width: 3px; }
   @keyframes core { 0% { opacity: 1; transform: translate(-50%, -50%) scale(.1) } 35% { opacity: 1; transform: translate(-50%, -50%) scale(1) } 100% { opacity: 0; transform: translate(-50%, -50%) scale(1.25) } }
   @keyframes ring { 0% { opacity: 1; transform: translate(-50%, -50%) scale(.04) } 60% { opacity: .95 } 100% { opacity: 0; transform: translate(-50%, -50%) scale(1) } }
-  .entering .screen { animation: arrive .5s ease-out .45s both; }
-  @keyframes arrive { from { opacity: 0 } to { opacity: 1 } }
   .tag { position: absolute; left: 14px; top: 12px; padding: 3px 10px; border-radius: 999px; font: 600 12px/18px system-ui, sans-serif;
     color: #fff; background: rgba(185, 28, 28, .82); letter-spacing: .5px; }
   .tag::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: #fecaca; animation: blink 1.2s steps(2) infinite; }
   @keyframes blink { 50% { opacity: .2 } }
   @keyframes edge { from { opacity: 1 } to { opacity: .55 } }
   @keyframes halo { from { opacity: .15 } to { opacity: 1 } }
-  @media (prefers-reduced-motion: reduce) { .screen i { animation: none; opacity: .8 } .burst { display: none } .entering .screen { animation: none } }
+  @media (prefers-reduced-motion: reduce) { .screen i { animation: none; opacity: .8 } .burst .ring { display: none } }
 </style>
 <script>
   // s=x,y,w,h,...：每块屏相对本窗口左上角的物理像素
@@ -62,7 +60,6 @@
       burst.innerHTML = '<i class="core"></i><i class="ring"></i><i class="ring"></i><i class="ring"></i>';
       setTimeout(() => burst.remove(), 1600);
       nodes.push(burst);
-      document.body.classList.add("entering");
     }
     document.body.replaceChildren(...nodes);
   }

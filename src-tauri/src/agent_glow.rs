@@ -29,6 +29,8 @@ static CURSOR: AtomicBool = AtomicBool::new(false);
 static RECORDING: AtomicBool = AtomicBool::new(false);
 /// 开始录制时的指针位置（屏幕物理像素）：按钮/快捷键触发处，涟漪从这里铺满屏幕。
 static ORIGIN: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// 光效页当前加载的查询串；锁住整个 show，剑来与剑谱的显示互斥，不会各自以为页面已是自己的颜色。
+static LOADED: Mutex<String> = Mutex::new(String::new());
 /// 系统不支持把光效排除出截图时只报一次，之后不再建窗口；剑形指针不受影响（指针从不进截图）。
 static OVERLAY_OFF: AtomicBool = AtomicBool::new(false);
 /// 永久关闭的原因前缀（结构性问题）；其余失败当做一次性的，下次调用再试。
@@ -147,15 +149,19 @@ fn show(app: &AppHandle) -> Result<(), String> {
     if let Some((x, y)) = ORIGIN.lock().unwrap().take().filter(|_| RECORDING.load(Ordering::Acquire)) {
         query += &format!("&o={},{}", x - left, y - top);
     }
+    let mut loaded = LOADED.lock().unwrap();
+    let fresh = app.get_webview_window(LABEL).is_none();
     let window = window(app, &query)?;
-    // 以窗口实际加载的地址为准（不另记状态）：剑来天蓝 ↔ 剑谱朱红切换、显示器布局变化都会重新加载。
-    let mut url = window.url().map_err(|e| e.to_string())?;
-    if url.query() != Some(query.as_str()) {
+    // 新建的窗口已带着 query 加载；已有窗口在天蓝 ↔ 朱红、布局变化或新起点时重新加载。
+    if fresh { *loaded = query; } else if *loaded != query {
+        let mut url = window.url().map_err(|e| e.to_string())?;
         url.set_query(Some(&query));
         window.navigate(url).map_err(|e| e.to_string())?;
+        *loaded = query;
     }
     let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as usize;
     let (tx, rx) = mpsc::channel();
+    let shown = window.clone();
     window.run_on_main_thread(move || {
         let result = unsafe {
             let hwnd = hwnd as HWND;
@@ -172,6 +178,9 @@ fn show(app: &AppHandle) -> Result<(), String> {
                 for _ in 0..2 {
                     SetWindowPos(hwnd, HWND_TOPMOST, left, top, right - left, bottom - top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
                 }
+                // 再经 tao 显示一次：只用 Win32 显示时 WebView2 仍当自己不可见，动画停在首帧（涟漪不播、呼吸不动）。
+                // 窗口不可聚焦（NOACTIVATE），不会抢前台。
+                let _ = shown.show();
                 Ok(())
             }
         };
@@ -199,7 +208,9 @@ fn hide(app: &AppHandle) {
     let Some(window) = app.get_webview_window(LABEL) else { return };
     let Ok(hwnd) = window.hwnd() else { return };
     let hwnd = hwnd.0 as usize;
-    let _ = window.run_on_main_thread(move || unsafe { ShowWindow(hwnd as HWND, SW_HIDE); });
+    let hidden = window.clone();
+    // tao 与 Win32 都收起：tao 记得自己「已显示」，下一次 show() 才不会被它当成无事可做。
+    let _ = window.run_on_main_thread(move || { let _ = hidden.hide(); unsafe { ShowWindow(hwnd as HWND, SW_HIDE); } });
 }
 
 /// 剑谱的毛笔：笔尖朝左上（热点），沿对角线依次是墨色笔头、金色笔箍、竹色笔杆、朱红笔尾。

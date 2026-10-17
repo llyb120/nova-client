@@ -16,7 +16,6 @@ import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
 import { selectedChatText } from "./chatSelection";
 import { closeThread, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal } from "./store";
-import { setJianpuFocus } from "./knowledgeGraph";
 import { mountSessionShortcuts, setShortcutRecordingActive } from "./sessionShortcuts";
 import { createHomeTerminalState, setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
 const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
@@ -116,12 +115,7 @@ export default function App() {
       });
     onGlobalShortcut("session-shortcut:new-session", () => openNewSession(selectedChatText()));
     onGlobalShortcut("session-shortcut:open-unread", () => void openNextUnreadThread());
-    // Butterfly 面板 / 剑谱通知：切到对应页面（剑谱带 id 时定位到那一段）。
-    void listen<{ id: string }>("jianpu:open", event => {
-      setJianpuFocus(event.payload.id);
-      closeThread();
-      setView("jianpu");
-    }).then(remove => { if (disposed) remove(); else unlistens.push(remove); });
+    // Butterfly 面板「知识图谱」：切到图谱页。
     void listen<{ view: "knowledge" }>("nova:open-view", event => { closeThread(); setView(event.payload.view); })
       .then(remove => { if (disposed) remove(); else unlistens.push(remove); });
     void listen<{ threadId: string }>("native-browser:open", event => {
