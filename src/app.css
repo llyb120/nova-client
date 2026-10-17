@@ -4514,7 +4514,10 @@ button {
   gap: 6px;
 }
 .stage-model-row {
-  grid-template-columns: 64px minmax(0, 1fr) 28px;
+  grid-template-columns: 28px minmax(0, 1fr) 28px 28px;
+}
+.stage-model-row.share-row-add {
+  grid-template-columns: 28px minmax(0, 1fr) 28px;
 }
 .share-row .proj-picker,
 .share-row .search-select,
