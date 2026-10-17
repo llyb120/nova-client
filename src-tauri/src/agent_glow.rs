@@ -25,6 +25,10 @@ static APP: OnceLock<AppHandle> = OnceLock::new();
 struct State { holds: u32, generation: u64, last: Option<Instant>, watching: bool, layout: String }
 static STATE: Mutex<State> = Mutex::new(State { holds: 0, generation: 0, last: None, watching: false, layout: String::new() });
 static CURSOR: AtomicBool = AtomicBool::new(false);
+/// 剑谱录制中：朱红慢呼吸 +「剑谱录制中」标签 + 毛笔指针，与剑来的天蓝 + 剑互斥（录制中剑来不接手桌面）。
+static RECORDING: AtomicBool = AtomicBool::new(false);
+/// 开始录制时的指针位置（屏幕物理像素）：按钮/快捷键触发处，涟漪从这里铺满屏幕。
+static ORIGIN: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 /// 系统不支持把光效排除出截图时只报一次，之后不再建窗口；剑形指针不受影响（指针从不进截图）。
 static OVERLAY_OFF: AtomicBool = AtomicBool::new(false);
 /// 永久关闭的原因前缀（结构性问题）；其余失败当做一次性的，下次调用再试。
@@ -57,6 +61,29 @@ pub(crate) fn release() {
     s.last = Some(Instant::now());
 }
 
+/// 剑谱开始/停止录制。剑来的光效若还在延时保持，watch 看到录制后自行退出、不再收起。
+pub(crate) fn recording(on: bool) {
+    RECORDING.store(on, Ordering::Release);
+    if on {
+        // 点按钮开始时指针就停在按钮上；快捷键开始则从指针所在处起涟漪。
+        let mut p = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        *ORIGIN.lock().unwrap() = (unsafe { GetCursorPos(&mut p) } != 0).then_some((p.x, p.y));
+    }
+    let Some(app) = APP.get() else { return };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let mut layout = std::mem::take(&mut STATE.lock().unwrap().layout);
+        if !on { hide(&app); }
+        else {
+            brand_cursor(true);
+            if !OVERLAY_OFF.load(Ordering::Relaxed) {
+                if let Err(e) = show(&app, &mut layout) { eprintln!("[agent-glow] {e}"); }
+            }
+        }
+        STATE.lock().unwrap().layout = layout;
+    });
+}
+
 /// 退出时只恢复指针：不等待 UI 线程，窗口随进程销毁。
 pub(crate) fn exit() {
     if CURSOR.load(Ordering::Acquire) { restore_cursor(); }
@@ -80,6 +107,7 @@ fn watch() {
         saw_running |= running;
         let (generation, mut layout) = {
             let mut s = STATE.lock().unwrap();
+            if RECORDING.load(Ordering::Acquire) { s.watching = false; return; }
             if !wanted(s.holds, s.last.map_or(Duration::ZERO, |t| t.elapsed()), running, saw_running) {
                 // 持锁收起：新的 hold 只能排在这次隐藏之后再显示。
                 s.watching = false;
@@ -91,7 +119,7 @@ fn watch() {
         // 每次新的剑来调用都换好指针、重新置顶并按当前显示器布局铺满。
         if generation != shown {
             shown = generation;
-            if !CURSOR.load(Ordering::Acquire) { brand_cursor(); }
+            if !CURSOR.load(Ordering::Acquire) { brand_cursor(false); }
             if !OVERLAY_OFF.load(Ordering::Relaxed) {
                 if let Err(e) = show(app, &mut layout) {
                     eprintln!("[agent-glow] {e}");
@@ -115,14 +143,19 @@ fn show(app: &AppHandle, loaded: &mut String) -> Result<(), String> {
     let bottom = rects.iter().map(|r| r.1 + r.3).max().unwrap();
     // 各屏相对窗口左上角的物理像素，页面按 devicePixelRatio 换算。
     let layout = rects.iter().map(|r| format!("{},{},{},{}", r.0 - left, r.1 - top, r.2, r.3)).collect::<Vec<_>>().join(",");
-    let window = window(app, &layout)?;
-    if *loaded != layout {
+    let mut query = format!("s={layout}{}", if RECORDING.load(Ordering::Acquire) { "&m=rec" } else { "" });
+    // 起点每次不同，带上它会让页面重新加载，涟漪也就每次开始录制都播一遍。
+    if let Some((x, y)) = ORIGIN.lock().unwrap().take().filter(|_| RECORDING.load(Ordering::Acquire)) {
+        query += &format!("&o={},{}", x - left, y - top);
+    }
+    let window = window(app, &query)?;
+    if *loaded != query {
         if !loaded.is_empty() {
             let mut url = window.url().map_err(|e| e.to_string())?;
-            url.set_query(Some(&format!("s={layout}")));
+            url.set_query(Some(&query));
             window.navigate(url).map_err(|e| e.to_string())?;
         }
-        *loaded = layout;
+        *loaded = query;
     }
     let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as usize;
     let (tx, rx) = mpsc::channel();
@@ -150,9 +183,9 @@ fn show(app: &AppHandle, loaded: &mut String) -> Result<(), String> {
     rx.recv_timeout(Duration::from_secs(2)).map_err(|_| "光效层显示超时".to_string())?
 }
 
-fn window(app: &AppHandle, layout: &str) -> Result<WebviewWindow, String> {
+fn window(app: &AppHandle, query: &str) -> Result<WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(LABEL) { return Ok(window); }
-    let url = tauri::WebviewUrl::App(format!("agent-glow.html?s={layout}").into());
+    let url = tauri::WebviewUrl::App(format!("agent-glow.html?{query}").into());
     // 空标题：xcap 只跳过无标题的 TOOLWINDOW。
     let window = tauri::WebviewWindowBuilder::new(app, LABEL, url)
         .title("").decorations(false).resizable(false).shadow(false)
@@ -172,8 +205,30 @@ fn hide(app: &AppHandle) {
     let _ = window.run_on_main_thread(move || unsafe { ShowWindow(hwnd as HWND, SW_HIDE); });
 }
 
-/// 与剑来截图里的落点标记同款的剑，只是光晕更浓：真实指针不会进入任何截图，浓光晕只帮用户找指针。
-fn brand_cursor() {
+/// 剑谱的毛笔：笔尖朝左上（热点），沿对角线依次是墨色笔头、金色笔箍、竹色笔杆、朱红笔尾。
+fn brush(x: f32, y: f32) -> (f32, (f32, f32, f32)) {
+    use crate::jianlai::{polygon_sd, POINTER_TIP};
+    const SCALE: f32 = 0.82;
+    let (dx, dy) = (x - POINTER_TIP, y - POINTER_TIP);
+    let k = std::f32::consts::FRAC_1_SQRT_2 / SCALE;
+    let (s, w) = ((dx + dy) * k, (dx - dy) * k);
+    // 竹节：笔杆上每隔一段一道深色。
+    let bamboo = if (s - 10.0).rem_euclid(5.0) < 0.6 { (120.0, 72.0, 24.0) } else { (217.0, 160.0, 82.0) };
+    [
+        (polygon_sd(&[(0.0, 0.0), (2.5, -1.3), (6.0, -2.1), (8.2, -2.1), (8.2, 2.1), (6.0, 2.1), (2.5, 1.3)], s, w), (28.0, 25.0, 23.0)),
+        (polygon_sd(&[(8.0, -2.3), (10.2, -2.3), (10.2, 2.3), (8.0, 2.3)], s, w), (234.0, 179.0, 8.0)),
+        (polygon_sd(&[(10.0, -1.5), (24.0, -1.5), (24.0, 1.5), (10.0, 1.5)], s, w), bamboo),
+        (polygon_sd(&[(23.8, -1.7), (26.2, -1.7), (26.2, 1.7), (23.8, 1.7)], s, w), (220.0, 38.0, 38.0)),
+    ].into_iter().min_by(|a, b| a.0.total_cmp(&b.0)).map(|(d, c)| (d * SCALE, c)).unwrap()
+}
+
+/// 剑来：与截图里的落点标记同款的剑，只是光晕更浓；剑谱：笔尖带朱红墨点的毛笔。
+/// 真实指针不会进入任何截图，浓光晕只帮用户找指针。
+fn brush_pixels(size: i32) -> Vec<u32> {
+    crate::jianlai::paint_pointer(size, brush, (40.0, 20.0, 12.0), (239.0, 68.0, 68.0, crate::jianlai::CURSOR_GLOW))
+}
+
+fn brand_cursor(recording: bool) {
     use crate::jianlai::{pointer_pixels, CURSOR_GLOW, POINTER_TIP};
     unsafe {
         let size = GetSystemMetrics(SM_CXCURSOR).clamp(32, 256);
@@ -183,7 +238,7 @@ fn brand_cursor() {
         let mut bits = null_mut();
         let color = CreateDIBSection(null_mut(), &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
         if color.is_null() || bits.is_null() { return; }
-        let pixels = pointer_pixels(size, CURSOR_GLOW);
+        let pixels = if recording { brush_pixels(size) } else { pointer_pixels(size, CURSOR_GLOW) };
         std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
         // 全 0 的 AND 掩码：像素完全由带 alpha 的彩色位图决定。
         let mask_bits = vec![0u8; (((size + 15) / 16) * 2 * size) as usize];
@@ -229,6 +284,17 @@ mod tests {
             assert!(near > far && far > 0 && near < 255, "{size}px 光晕由浓到淡: {near} -> {far}");
             assert!((at(4.0, 10.0) & 255) > 200, "{size}px 光晕是天蓝色");
         }
+    }
+
+    #[test]
+    fn brush_is_ink_tipped_with_a_red_glow_and_unlike_the_sword() {
+        let (p, sword) = (brush_pixels(32), crate::jianlai::pointer_pixels(32, crate::jianlai::CURSOR_GLOW));
+        let at = |p: &Vec<u32>, x: usize, y: usize| p[y * 32 + x];
+        assert_eq!(at(&p, 13, 13) >> 24, 255, "笔头实心");
+        assert!(at(&p, 13, 13) & 0xff < 60, "笔头是墨色: {:08x}", at(&p, 13, 13));
+        let glow = at(&p, 6, 10);
+        assert!(glow >> 24 > 0 && (glow >> 16) & 0xff > 200 && glow & 0xff < 120, "笔尖是朱红墨点: {glow:08x}");
+        assert!(at(&sword, 6, 10) & 0xff > 200, "剑是天蓝，两者一眼可分");
     }
 
     #[test]

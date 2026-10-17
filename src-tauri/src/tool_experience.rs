@@ -22,6 +22,9 @@ struct Request {
     #[serde(default)] outcome: String,
     #[serde(default)] reason: String,
     #[serde(default)] redacted: bool,
+    /// 剑谱整理：由 jianlai 适配层校验后改写为 snapshotId=demo:<id>，这里只需接受字段。
+    #[allow(dead_code)]
+    #[serde(default)] recording_id: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,7 +92,8 @@ fn summary(entry: &Entry) -> Value {
         "confidence":if entry.successes.len() > 1 {"reused"} else {"initial"},
         "successes":entry.successes.len(),"failures":entry.failures.len(),"disabled":entry.disabled,
         "lastReason":entry.last_reason,"updatedAt":entry.updated_at,
-        "verification":if source(entry) == "auto" {"auto_recorded"} else {"model_verified"}})
+        "verification":match source(entry) { "auto" => "auto_recorded", "demo" => "user_demonstrated", _ => "model_verified" },
+        "source":source(entry),"recordingId":entry.snapshot_id.strip_prefix(DEMO)})
 }
 
 // A trie shares only identical prefixes under identical preconditions. Never join
@@ -176,7 +180,7 @@ pub(crate) fn hint(dir: &Path, tool: &str, owner: &str, raw_scope: &str) -> Opti
     routes.sort_by_key(|e| (source(e) == "auto", std::cmp::Reverse(e.successes.len()), std::cmp::Reverse(e.updated_at)));
     let total = routes.len();
     // Sent every turn: once a verified route exists, auto trails are token cost without guidance.
-    if source(routes[0]) == "model" { routes.retain(|e| source(e) == "model"); }
+    if source(routes[0]) != "auto" { routes.retain(|e| source(e) != "auto"); }
     let cut = |s: String, n: usize| if s.chars().count() > n { s.chars().take(n).collect::<String>() + "…" } else { s };
     Some(json!({"scope":scope,"totalRoutes":total,
         "routes":routes.iter().take(8).map(|e| json!({"id":e.id,"task":e.task,"conditions":cut(e.conditions.join("；"), 200),
@@ -192,7 +196,9 @@ pub(crate) fn once_per_turn(owner: &str, key: &str) -> bool {
 }
 
 const AUTO: &str = "auto-trail";
-fn source(e: &Entry) -> &'static str { if e.snapshot_id == AUTO { "auto" } else { "model" } }
+/// 剑谱整理保存的路径：snapshotId 记为 demo:<剑谱 id>。
+pub(crate) const DEMO: &str = "demo:";
+fn source(e: &Entry) -> &'static str { if e.snapshot_id == AUTO { "auto" } else if e.snapshot_id.starts_with(DEMO) { "demo" } else { "model" } }
 
 fn clip(text: &str, max: usize) -> String {
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");

@@ -4,6 +4,7 @@ mod agent_glow;
 mod acp;
 mod agent_config;
 mod jianlai;
+mod jianpu;
 mod employee;
 mod altair_run;
 mod tool_experience;
@@ -692,6 +693,18 @@ fn sync_global_session_shortcuts(app: &tauri::AppHandle) {
 
     let mut seen = HashSet::new();
     let state = app.state::<AppState>();
+    // 剑谱：按一次开始录制、再按一次停止；不拉起 Nova 窗口，免得挡住要演示的应用。
+    let jianpu = normalize_global_shortcut(&state.settings.lock().unwrap().jianpu_shortcut);
+    if !jianpu.is_empty() && seen.insert(jianpu.to_ascii_lowercase()) {
+        match jianpu.parse::<tauri_plugin_global_shortcut::Shortcut>() {
+            Ok(shortcut) => if let Err(error) = app.global_shortcut().on_shortcut(shortcut, |_, _, event| {
+                if event.state == ShortcutState::Pressed && !meteor::shortcut_recording() {
+                    std::thread::spawn(jianpu::toggle_notify);
+                }
+            }) { eprintln!("[shortcut] 注册剑谱快捷键失败（{jianpu}）：{error}"); },
+            Err(_) => eprintln!("[shortcut] 忽略无法注册的剑谱快捷键：{jianpu}"),
+        }
+    }
     let shortcuts = {
         let settings = state.settings.lock().unwrap();
         settings
@@ -4413,6 +4426,11 @@ async fn apply_runtime_settings(
     restart_all_agents: bool,
 ) -> Result<(), String> {
     meteor::validate(&settings)?;
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if !settings.jianpu_shortcut.trim().is_empty() {
+        normalize_global_shortcut(&settings.jianpu_shortcut).parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .map_err(|e| format!("剑谱快捷键无效：{e}"))?;
+    }
     let state = app.state::<AppState>();
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
@@ -5614,6 +5632,7 @@ pub fn run() {
 
             #[cfg(windows)]
             agent_glow::init(app.handle());
+            jianpu::init(app.handle());
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             sync_global_session_shortcuts(app.handle());
@@ -5871,6 +5890,7 @@ pub fn run() {
             taskbar_status::taskbar_bubble_open,
             taskbar_status::taskbar_bubble_dismiss,
             taskbar_status::taskbar_bubble_reply,
+            taskbar_status::taskbar_quick,
             employee::employee_get,
             employee::employee_set,
             employee::employee_do,
@@ -5883,6 +5903,13 @@ pub fn run() {
             native_browser::native_browser_ui,
             chrome_browser::chrome_browser_ui,
             tool_experience::knowledge_graph,
+            jianpu::jianpu_toggle,
+            jianpu::jianpu_status,
+            jianpu::jianpu_list,
+            jianpu::jianpu_get,
+            jianpu::jianpu_image,
+            jianpu::jianpu_delete,
+            jianpu::jianpu_learn,
             image_generation::image_command_context,
             list_threads,
             load_threads,
@@ -6046,6 +6073,8 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::Exit = event {
+                // 先保存录制并卸载钩子，再恢复指针。
+                jianpu::exit();
                 #[cfg(windows)]
                 agent_glow::exit();
                 app.state::<workspace_terminal::TerminalManager>().close_all();

@@ -312,6 +312,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [meteorModel, setMeteorModel] = createSignal(s?.meteorModel ?? "");
   const [meteorClipboard, setMeteorClipboard] = createSignal(s?.meteorClipboard ?? false);
   const [meteorPasteShortcut, setMeteorPasteShortcut] = createSignal(s?.meteorPasteShortcut ?? "Alt+V");
+  const [jianpuShortcut, setJianpuShortcut] = createSignal(s?.jianpuShortcut ?? "Alt+R");
   const [tryingMeteor, setTryingMeteor] = createSignal(false);
   const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
     s?.cursorContextMode === "super" ? "super" : "default",
@@ -762,6 +763,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     meteorModel: meteorModel().trim(),
     meteorClipboard: meteorClipboard(),
     meteorPasteShortcut: meteorPasteShortcut().trim(),
+    jianpuShortcut: jianpuShortcut().trim(),
     devinEnabled: devinEnabled(),
     lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
@@ -1033,6 +1035,13 @@ export function SettingsModal(props: { onClose: () => void }) {
   let saveLyraConfig: (() => Promise<void>) | undefined;
   const save = async () => {
     const draftedShortcuts = draftSessionShortcuts();
+    const jianpuKeys = jianpuShortcut().trim().toLowerCase();
+    if (jianpuKeys && [meteorEnabled() ? meteorShortcut() : "", meteorEnabled() ? meteorPasteShortcut() : "", ...withDefaultSessionShortcuts(draftedShortcuts).map((item) => item.keys)]
+      .some((keys) => keys.trim().toLowerCase() === jianpuKeys)) {
+      setTab("meteor");
+      await message("剑谱快捷键与 Meteor、星移或会话快捷键冲突，请修改后再保存。", { title: "保存设置失败", kind: "error" });
+      return;
+    }
     if (meteorEnabled()) {
       const keys = meteorShortcut().trim().toLowerCase();
       const pasteKeys = meteorPasteShortcut().trim().toLowerCase();
@@ -1183,6 +1192,15 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <button type="button" class="btn secondary" onClick={() => setMeteorPasteShortcut("")}>关闭</button>
                 </div>
                 <span class="field-hint">按下后弹出要求输入框，由剑来把剪贴板内容按要求粘贴到当前焦点处；不填要求则自动推断。需为带修饰键的组合键，且不能与 Meteor 或会话快捷键相同。</span>
+              </div>
+              <div class="field">
+                <span class="field-label">剑谱录制快捷键</span>
+                <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
+                  <ShortcutKeyCapture value={jianpuShortcut() || "已关闭"} onChange={setJianpuShortcut} />
+                  <button type="button" class="btn secondary" onClick={() => setJianpuShortcut("Alt+R")}>恢复 Alt+R</button>
+                  <button type="button" class="btn secondary" onClick={() => setJianpuShortcut("")}>关闭</button>
+                </div>
+                <span class="field-hint">目前支持 Windows。按一次开始录制你的桌面操作（朱红边框 + 毛笔指针），再按一次停止；也可在 Butterfly 悬停面板里开始/停止。注册为全局快捷键后，其他程序自己的同名快捷键（如 Word 的 Alt+R）会被占用。录制的打字内容按原文保存在本机。</span>
               </div>
               <div class="field">
                 <span class="field-label">执行后端 / 模型</span>

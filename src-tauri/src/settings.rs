@@ -173,6 +173,8 @@ pub struct Settings {
     pub meteor_clipboard: bool,
     /// Meteor 星移（StartShift）的全局组合键；空值关闭。
     pub meteor_paste_shortcut: String,
+    /// 剑谱录制开关的全局组合键；空值关闭。
+    pub jianpu_shortcut: String,
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
@@ -269,6 +271,7 @@ impl Default for Settings {
             meteor_model: String::new(),
             meteor_clipboard: false,
             meteor_paste_shortcut: "Alt+V".into(),
+            jianpu_shortcut: "Alt+R".into(),
             devin_enabled: false,
             vega_enabled: false,
             lyra_enabled: true,

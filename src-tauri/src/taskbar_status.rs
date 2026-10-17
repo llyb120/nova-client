@@ -59,6 +59,15 @@ pub(crate) fn taskbar_bubble_open(app: tauri::AppHandle, thread_id: Option<Strin
     let _ = (app, thread_id);
 }
 
+/// Butterfly 面板「快捷」标签的操作（剑谱录制、新会话、未读、知识图谱）。
+#[tauri::command]
+pub(crate) async fn taskbar_quick(app: tauri::AppHandle, action: String) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    return tokio::task::spawn_blocking(move || bubble::quick(&app, &action)).await.map_err(|e| e.to_string())?;
+    #[cfg(not(windows))]
+    { let _ = (app, action); Err("仅支持 Windows".into()) }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Rect {
     pub left: i32,

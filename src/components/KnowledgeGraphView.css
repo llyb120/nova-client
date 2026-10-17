@@ -76,3 +76,4 @@
 .knowledge-step-link { border: 0; background: none; color: var(--accent); text-align: left; padding: 2px 0; }
 .knowledge-edge-detail { border-bottom: 1px solid var(--border-light); padding-bottom: 16px; margin-bottom: 16px; }
 .knowledge-toolbar .knowledge-count { white-space: normal; font-size: 12px; }
+.knowledge-header-actions { display: flex; gap: 8px; }

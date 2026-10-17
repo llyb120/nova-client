@@ -17,6 +17,8 @@ const REFERENCE_MAX_EDGE: u32 = 1920;
 const REFERENCE_JPEG_QUALITY: u8 = 75;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static RECORDING: AtomicBool = AtomicBool::new(false);
+/// 设置页正在录制快捷键：其它全局快捷键（如剑谱）此时也不应触发。
+pub(crate) fn shortcut_recording() -> bool { RECORDING.load(Ordering::Acquire) }
 static OPENING: AtomicBool = AtomicBool::new(false);
 static SUBMITTING: AtomicBool = AtomicBool::new(false);
 static CAPTURE: Mutex<Option<Arc<Capture>>> = Mutex::new(None);

@@ -2,7 +2,7 @@ import DOMPurify from "dompurify";
 import { Marked } from "marked";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import type { PermissionRequest } from "../types";
 import { agentLabel, stripAnsi } from "../utils";
@@ -21,8 +21,85 @@ type Card = {
   title: string;
   body: string;
 };
-/** `light`: the Windows taskbar theme, so cards match the Butterfly they pop out of. */
-type Payload = { cards: Card[]; permissions: Permission[]; light: boolean };
+/** `light`: the Windows taskbar theme, so cards match the Butterfly they pop out of.
+ *  `panel`: opened by hovering (default tab 快捷操作) rather than a click (default tab 会话). */
+type Payload = { cards: Card[]; permissions: Permission[]; light: boolean; panel?: boolean } & Partial<PanelData>;
+
+type PanelData = { jianpu: { recording: boolean; id?: string; elapsedMs?: number } };
+type Tab = "session" | "quick";
+const TABS: [Tab, string][] = [["session", "会话"], ["quick", "快捷"]];
+const clock = (ms = 0) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
+const icon = (d: string) => (
+  <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d={d} fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" /></svg>
+);
+const ICONS = {
+  brush: "M4 20l4.5-1.2L19 8.3a2.1 2.1 0 00-3-3L5.5 15.8 4 20zM14.5 6.8l3 3",
+  stop: "M7 7h10v10H7z",
+  chat: "M5 5h14v10H9l-4 4V5zM12 8v4M10 10h4",
+  bell: "M6 16V11a6 6 0 0112 0v5l1.5 2h-15L6 16zM10 20a2 2 0 004 0",
+  graph: "M6 7a2 2 0 100-.01M18 6a2 2 0 100-.01M12 18a2 2 0 100-.01M7.6 8.2l3.2 7.8M16.4 7.2l-3.2 8.8M8 6.6h8",
+};
+
+/** Butterfly panel: compact, left tabs switch features. 会话 is the live summary card, 快捷 an
+ *  app-desktop style icon grid. */
+function Panel(props: { card: Card; data: PanelData; tab: Tab; setTab: (tab: Tab) => void; session: JSX.Element; onClose: () => void; reload: () => void }) {
+  const [error, setError] = createSignal("");
+  const run = async (action: string) => {
+    setError("");
+    try {
+      await invoke("taskbar_quick", { action });
+    } catch (e) {
+      setError(String(e));
+    }
+    props.reload();
+  };
+  const rec = () => props.data.jianpu.recording;
+  const tiles = () => [
+    { action: "jianpu", label: rec() ? `停止 ${clock(props.data.jianpu.elapsedMs)}` : "剑谱录制", icon: rec() ? ICONS.stop : ICONS.brush, hot: rec() },
+    { action: "newSession", label: "新会话", icon: ICONS.chat },
+    { action: "openUnread", label: "打开未读", icon: ICONS.bell },
+    { action: "knowledge", label: "知识图谱", icon: ICONS.graph },
+  ];
+  return (
+    <div class={`tb-card tb-panel ${props.card.kind}`}>
+      <nav class="tb-tabs" role="tablist" aria-orientation="vertical">
+        <For each={TABS}>
+          {([id, label]) => (
+            <button role="tab" aria-selected={props.tab === id} classList={{ active: props.tab === id, rec: id === "quick" && rec() }} onClick={() => props.setTab(id)}>{label}</button>
+          )}
+        </For>
+      </nav>
+      <div class="tb-panel-main">
+        <header class="tb-head">
+          <Butterfly />
+          <span class="tb-state">{LABEL[props.card.kind]}</span>
+          <Show when={props.card.trailing}>
+            <span class="tb-time">{props.card.trailing}</span>
+          </Show>
+          <button class="tb-close" title="关闭" aria-label="关闭" onClick={props.onClose}>
+            <svg viewBox="0 0 12 12" width="10" height="10"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
+          </button>
+        </header>
+        <Show when={props.tab === "session"}>{props.session}</Show>
+        <Show when={props.tab === "quick"}>
+          <div class="tb-grid">
+            <For each={tiles()}>
+              {(t) => (
+                <button class="tb-tile" classList={{ hot: !!t.hot }} onClick={() => void run(t.action)}>
+                  {icon(t.icon)}
+                  <span>{t.label}</span>
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
+        <Show when={error()}>
+          <div class="tb-reply-error" role="alert">{error()}</div>
+        </Show>
+      </div>
+    </div>
+  );
+}
 
 const LABEL: Record<Kind, string> = { idle: "空闲", running: "进行中", waiting: "待确认", done: "已完成", error: "出错了" };
 const marked = new Marked({ gfm: true, breaks: true });
@@ -210,6 +287,10 @@ function Reply(props: { card: Card; onSent: () => void }) {
 export default function TaskbarBubble() {
   const [cards, setCards] = createStore<Card[]>([]);
   const [permissions, setPermissions] = createSignal<Permission[]>([]);
+  const [panel, setPanel] = createSignal<PanelData>({ jianpu: { recording: false } });
+  const [tab, setTab] = createSignal<Tab>("session");
+  /** The next load comes from an open event: pick the tab for how it was opened. */
+  let fresh = true;
   let shell!: HTMLDivElement;
   let timer: number | undefined;
 
@@ -222,6 +303,9 @@ export default function TaskbarBubble() {
     // Nothing left to show (e.g. the result was viewed elsewhere): close instead of an empty bubble.
     if (!next?.cards.length) return hide();
     document.documentElement.classList.toggle("light", next.light);
+    setPanel({ jianpu: next.jianpu ?? { recording: false } });
+    if (fresh) setTab(next.panel ? "quick" : "session");
+    fresh = false;
     // Keyed: a refresh updates the current card in place.
     setCards(reconcile(next.cards, { key: "key" }));
     // Keep in-progress answers: only rebuild cards when the set of requests changes.
@@ -249,7 +333,10 @@ export default function TaskbarBubble() {
     const keys = (e: KeyboardEvent) => e.key === "Escape" && hide();
     window.addEventListener("keydown", keys);
     const offs = [
-      listen("taskbar-bubble:open", () => void open()),
+      listen("taskbar-bubble:open", () => {
+        fresh = true;
+        void open();
+      }),
       // Drop the cards so the next bubble mounts fresh and plays its entrance again.
       listen("taskbar-bubble:hidden", () => {
         clearInterval(timer);
@@ -268,22 +355,12 @@ export default function TaskbarBubble() {
   });
 
   return (
-    <div class="tb-shell" classList={{ stack: cards.length > 1 }} ref={shell}>
+    <div class="tb-shell" ref={shell}>
       <For each={cards}>
         {(card) => {
           const html = createMemo(() => markdown(card.body));
-          return (
-            <div class={`tb-card ${card.kind}`}>
-              <header class="tb-head">
-                <Butterfly />
-                <span class="tb-state">{LABEL[card.kind]}</span>
-                <Show when={card.trailing}>
-                  <span class="tb-time">{card.trailing}</span>
-                </Show>
-                <button class="tb-close" title="关闭" aria-label="关闭" onClick={() => dismiss(card)}>
-                  <svg viewBox="0 0 12 12" width="10" height="10"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
-                </button>
-              </header>
+          const session = (
+            <div class="tb-session">
               <Show when={card.title}>
                 <div class="tb-title">{card.title}</div>
               </Show>
@@ -313,6 +390,7 @@ export default function TaskbarBubble() {
               </footer>
             </div>
           );
+          return <Panel card={card} data={panel()} tab={tab()} setTab={setTab} session={session} onClose={() => dismiss(card)} reload={() => void load()} />;
         }}
       </For>
     </div>

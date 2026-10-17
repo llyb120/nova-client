@@ -9,13 +9,14 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use windows_sys::Win32::{
+    Foundation::{POINT, RECT},
     Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED},
-    UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER},
+    UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE},
 };
 
 const LABEL: &str = "taskbar-bubble";
 /// CSS width including the transparent margin that holds the card's shadow.
-const WIDTH: f64 = 412.0;
+const WIDTH: f64 = 380.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Anchor {
@@ -29,6 +30,10 @@ pub(super) struct Anchor {
 static ANCHOR: Mutex<Option<Anchor>> = Mutex::new(None);
 /// The live card, asked for by a click on the Butterfly.
 static WANTED: AtomicBool = AtomicBool::new(false);
+/// The same window shows the hover quick panel; it never takes focus and closes once the pointer
+/// has left both the Butterfly and the panel.
+static PANEL: AtomicBool = AtomicBool::new(false);
+static PANEL_WATCH: AtomicBool = AtomicBool::new(false);
 static HIDDEN_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static BUILD: Mutex<()> = Mutex::new(());
 /// Finished result and its rendered revision, kept on the live card even after it is read.
@@ -36,7 +41,8 @@ static SHOWN: Mutex<Option<(String, i64)>> = Mutex::new(None);
 
 /// Open, or the live card was closed by this very click (blur fires on mouse-down, before the chip sees it).
 pub(super) fn is_open() -> bool {
-    WANTED.load(Ordering::Acquire)
+    // A click on the Butterfly while the hover panel shows opens the live card instead of closing.
+    (WANTED.load(Ordering::Acquire) && !PANEL.load(Ordering::Acquire))
         || HIDDEN_AT.lock().unwrap().is_some_and(|at| at.elapsed() < Duration::from_millis(400))
 }
 
@@ -73,15 +79,54 @@ pub(super) fn window(app: &AppHandle) -> Option<WebviewWindow> {
 }
 
 pub(super) fn open(app: &AppHandle, anchor: Anchor) {
+    PANEL.store(false, Ordering::Release);
     *ANCHOR.lock().unwrap() = Some(anchor);
     WANTED.store(true, Ordering::Release);
     // A freshly built page places itself on mount; a warm one reloads on this event.
     if window(app).is_some() { let _ = app.emit_to(LABEL, "taskbar-bubble:open", ()); }
 }
 
+/// Hover: the quick panel, unless the live card is already open.
+pub(super) fn open_panel(app: &AppHandle, anchor: Anchor) {
+    if WANTED.load(Ordering::Acquire) { return; }
+    PANEL.store(true, Ordering::Release);
+    *ANCHOR.lock().unwrap() = Some(anchor);
+    WANTED.store(true, Ordering::Release);
+    if window(app).is_some() { let _ = app.emit_to(LABEL, "taskbar-bubble:open", ()); }
+    if !PANEL_WATCH.swap(true, Ordering::AcqRel) {
+        let app = app.clone();
+        std::thread::spawn(move || { watch_panel(&app); PANEL_WATCH.store(false, Ordering::Release); });
+    }
+}
+
+fn inside(r: (i32, i32, i32, i32), p: POINT) -> bool { p.x >= r.0 && p.x < r.2 && p.y >= r.1 && p.y < r.3 }
+
+/// Close the panel 300ms after the pointer left both the Butterfly and the panel.
+fn watch_panel(app: &AppHandle) {
+    let mut away: Option<Instant> = None;
+    while PANEL.load(Ordering::Acquire) && WANTED.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(100));
+        let Some(anchor) = *ANCHOR.lock().unwrap() else { break };
+        let mut p = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut p) } == 0 { continue; }
+        let c = anchor.chip;
+        let over_panel = app.get_webview_window(LABEL).filter(|w| w.is_visible().unwrap_or(false)).and_then(|w| w.hwnd().ok()).is_some_and(|h| {
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            (unsafe { GetWindowRect(h.0 as _, &mut r) }) != 0 && inside((r.left, r.top, r.right, r.bottom), p)
+        });
+        if inside((c.left, c.top, c.right, c.bottom), p) || over_panel { away = None; continue; }
+        if away.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(300) {
+            if PANEL.load(Ordering::Acquire) { hide(app); }
+            break;
+        }
+    }
+}
+
 /// Close the card without acknowledging updates it has not rendered yet.
 pub(super) fn hide(app: &AppHandle) {
-    if WANTED.swap(false, Ordering::AcqRel) { *HIDDEN_AT.lock().unwrap() = Some(Instant::now()); }
+    // Only the live card arms the click grace period; a panel closing under the pointer must not eat the next click.
+    let panel = PANEL.swap(false, Ordering::AcqRel);
+    if WANTED.swap(false, Ordering::AcqRel) && !panel { *HIDDEN_AT.lock().unwrap() = Some(Instant::now()); }
     SHOWN.lock().unwrap().take();
     if let Some(window) = app.get_webview_window(LABEL) {
         if window.is_visible().unwrap_or(false) { let _ = window.hide(); }
@@ -122,8 +167,16 @@ pub(super) fn place(app: &AppHandle, css_height: f64) -> bool {
     // Not tauri's set_size/set_position: tao re-shows with activation on each resize.
     unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE); }
     let wanted = WANTED.load(Ordering::Acquire);
+    if wanted && PANEL.load(Ordering::Acquire) {
+        // Hover must not steal focus from the app the user is working in.
+        if !window.is_visible().unwrap_or(true) { unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE); } }
+        return true;
+    }
     if wanted && !window.is_visible().unwrap_or(true) {
         let _ = window.show();
+        let _ = window.set_focus();
+    } else if wanted && !window.is_focused().unwrap_or(true) {
+        // A click turned the hover panel into the live card: take focus for the reply box and blur-to-close.
         let _ = window.set_focus();
     }
     if WANTED.load(Ordering::Acquire) && window.is_visible().unwrap_or(false) {
@@ -188,7 +241,25 @@ fn name(kind: Kind) -> &'static str {
     }
 }
 
-/// The live card is available only after a click on the Butterfly.
+/// Panel quick actions. Anything that needs the full window hands over to it and closes the panel.
+pub(super) fn quick(app: &AppHandle, action: &str) -> Result<Value, String> {
+    match action {
+        "jianpu" => return crate::jianpu::toggle(),
+        _ => {}
+    }
+    hide(app);
+    match action {
+        "newSession" | "openUnread" => {
+            crate::sys_notify::focus_main_window(app);
+            let _ = app.emit(if action == "newSession" { crate::EV_NEW_SESSION_SHORTCUT } else { crate::EV_OPEN_UNREAD_SHORTCUT }, ());
+        }
+        "knowledge" => { crate::sys_notify::focus_main_window(app); let _ = app.emit("nova:open-view", json!({ "view": "knowledge" })); }
+        _ => return Err(format!("未知快捷操作：{action}")),
+    }
+    Ok(Value::Null)
+}
+
+/// The live card: the 会话 tab, opened by a click on the Butterfly (a hover opens 快捷).
 pub(super) fn payload(app: &AppHandle) -> Value {
     let shown = SHOWN.lock().unwrap().clone();
     let Some(status) = super::snapshot(app, shown.as_ref().map(|(thread, _)| thread.as_str())) else { return Value::Null };
@@ -215,7 +286,9 @@ pub(super) fn payload(app: &AppHandle) -> Value {
     };
     permissions.sort_by(|a, b| a["requestKey"].as_str().cmp(&b["requestKey"].as_str()));
     // Cards follow the taskbar they pop out of, like Windows' own taskbar flyouts.
-    json!({ "cards": cards, "permissions": permissions, "light": super::windows::light_theme() })
+    // One window, tabbed: 会话 (this live card, the default after a click) and 快捷 (default on hover).
+    json!({ "cards": cards, "permissions": permissions, "light": super::windows::light_theme(), "panel": PANEL.load(Ordering::Acquire),
+        "jianpu": crate::jianpu::status() })
 }
 
 #[cfg(test)]
@@ -227,11 +300,11 @@ mod tests {
         let work = Rect { left: -1920, top: 0, right: 0, bottom: 1032 };
         let chip = Rect { left: -60, top: 1040, right: -10, bottom: 1068 };
         let (x, y, w, h) = frame(Anchor { chip, work, scale: 1.0 }, 300.0);
-        assert_eq!((w, h, y + h), (412, 300, 1032), "bottom taskbar: above the work area edge");
+        assert_eq!((w, h, y + h), (380, 300, 1032), "bottom taskbar: above the work area edge");
         assert_eq!(x + w, -8, "clamped inside the right edge");
         let top = Anchor { chip: Rect { left: -1000, top: 6, right: -800, bottom: 34 }, work: Rect { top: 40, ..work }, scale: 1.5 };
         let (x, y, w, h) = frame(top, 5000.0);
-        assert_eq!((y, w), (40, 618), "top taskbar: below it, scaled");
+        assert_eq!((y, w), (40, 570), "top taskbar: below it, scaled");
         assert!(h <= 1032 - 40 && x == -900 - w / 2);
     }
 

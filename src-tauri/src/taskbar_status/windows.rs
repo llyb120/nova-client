@@ -24,11 +24,7 @@ use windows_sys::{
         Graphics::{Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED}, Gdi::*},
         System::{LibraryLoader::GetModuleHandleW, SystemInformation::{GetVersionExW, OSVERSIONINFOW}},
         UI::{
-            Controls::{
-                InitCommonControlsEx, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR, NMTTDISPINFOW,
-                TOOLTIPS_CLASSW, TTDT_AUTOPOP, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETDELAYTIME,
-                TTM_SETMAXTIPWIDTH, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
-            },
+            Controls::{InitCommonControlsEx, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX},
             HiDpi::*, Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE}, WindowsAndMessaging::*,
         },
     },
@@ -43,12 +39,14 @@ const REFRESH: u32 = WM_APP + 1;
 const WM_MOUSELEAVE: u32 = 0x02A3; // Win32 Controls message paired with TME_LEAVE.
 static LAYOUT: Mutex<Option<Arc<Layout>>> = Mutex::new(None);
 const ANIMATION: usize = 1;
+/// Resting on the Butterfly this long opens the quick panel (the panel replaced the hover tooltip).
+const HOVER: usize = 2;
+const HOVER_MS: u32 = 350;
 
 // Everything below is touched only by the status message thread (refresh + window_proc).
 thread_local! {
     static CURRENT: RefCell<Option<Status>> = const { RefCell::new(None) };
-    static TIP: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
-    static TOOLTIP: Cell<usize> = const { Cell::new(0) };
+    static HOVERING: Cell<bool> = const { Cell::new(false) };
     static EPOCH: Instant = Instant::now();
     static ANIMATING: Cell<bool> = const { Cell::new(false) };
     /// This press found the bubble open, so its click only closes it.
@@ -366,7 +364,6 @@ unsafe fn refresh(shown: &mut Option<Status>) {
         WINDOW.store(hwnd as usize, Ordering::Release);
         ANIMATING.set(false);
         *shown = None;
-        attach_tooltip(hwnd);
         // Warm the bubble webview now so clicks open at once.
         on_app(|app| { super::bubble::window(app); });
     }
@@ -766,26 +763,11 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     if !buffer.is_null() { DeleteDC(buffer); }
 }
 
-/// Hover detail (thread title + conclusion excerpt), filled lazily from CURRENT.
-unsafe fn attach_tooltip(hwnd: HWND) {
-    let tip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, TOOLTIPS_CLASSW, null(), WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
-        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, null_mut(), null_mut(), GetModuleHandleW(null()), null());
-    if tip.is_null() { return; }
-    let info = TTTOOLINFOW {
-        cbSize: size_of::<TTTOOLINFOW>() as u32, uFlags: TTF_IDISHWND | TTF_SUBCLASS,
-        hwnd, uId: hwnd as usize, lpszText: usize::MAX as *mut u16, // LPSTR_TEXTCALLBACKW
-        ..Default::default()
-    };
-    SendMessageW(tip, TTM_ADDTOOLW, 0, &info as *const _ as LPARAM);
-    SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, (360 * GetDpiForWindow(hwnd).max(96) / 96) as LPARAM);
-    SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP as WPARAM, 30_000);
-    TOOLTIP.with(|t| t.set(tip as usize));
-}
-
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONDOWN => {
+            KillTimer(hwnd, HOVER);
             CLICKED.with(|clicked| *clicked.borrow_mut() = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone())));
             let closing = super::bubble::is_open();
             CLOSING.set(closing);
@@ -822,14 +804,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             0
         }
-        WM_NOTIFY if (*(lparam as *const NMHDR)).code == TTN_GETDISPINFOW => {
-            let info = &mut *(lparam as *mut NMTTDISPINFOW);
-            let detail = CURRENT.with(|c| c.borrow().as_ref().map(|s| s.detail.clone()).unwrap_or_default());
-            TIP.with(|tip| {
-                let mut tip = tip.borrow_mut();
-                *tip = detail.encode_utf16().chain(Some(0)).collect();
-                info.lpszText = tip.as_mut_ptr();
-            });
+        WM_TIMER if wparam == HOVER => {
+            KillTimer(hwnd, HOVER);
+            let mut cursor = POINT::default();
+            if HOVERING.get() && GetCursorPos(&mut cursor) != 0 && WindowFromPoint(cursor) == hwnd {
+                if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open_panel(app, anchor)); }
+            }
             0
         }
         WM_SIZE => {
@@ -846,10 +826,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_MOUSEMOVE => {
             let mut tracking = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
             TrackMouseEvent(&mut tracking);
+            if !HOVERING.replace(true) { SetTimer(hwnd, HOVER, HOVER_MS, None); }
             InvalidateRect(hwnd, null(), 0);
             0
         }
-        WM_MOUSELEAVE | WM_THEMECHANGED | WM_SYSCOLORCHANGE | WM_SETTINGCHANGE => {
+        WM_MOUSELEAVE => {
+            HOVERING.set(false);
+            KillTimer(hwnd, HOVER);
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_THEMECHANGED | WM_SYSCOLORCHANGE | WM_SETTINGCHANGE => {
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -863,12 +850,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 paint_chip(hwnd, dc, rect);
             }
             EndPaint(hwnd, &paint);
-            0
-        }
-        WM_DESTROY => {
-            // The tooltip is an unowned popup; it does not die with us.
-            let tip = TOOLTIP.with(|t| t.replace(0)) as HWND;
-            if !tip.is_null() { DestroyWindow(tip); }
             0
         }
         WM_NCDESTROY => {

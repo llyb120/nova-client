@@ -507,6 +507,8 @@ export interface Settings {
   meteorClipboard?: boolean;
   /** Meteor 星移（StartShift）全局组合键，默认 Alt+V；空值关闭 */
   meteorPasteShortcut?: string;
+  /** 剑谱录制开关的全局组合键，默认 Alt+R；空值关闭 */
+  jianpuShortcut?: string;
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
   lyraEnabled: boolean;

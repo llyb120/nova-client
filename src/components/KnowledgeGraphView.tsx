@@ -1,6 +1,7 @@
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { buildKnowledgeGraph, graphEdgePath, type GraphNode, type KnowledgeGroup, type GraphEdge } from "../knowledgeGraph";
+import { buildKnowledgeGraph, focusRouteId, graphEdgePath, setFocusRouteId, setJianpuFocus, type GraphNode, type KnowledgeGroup, type GraphEdge } from "../knowledgeGraph";
+import { setView } from "../store";
 import "./KnowledgeGraphView.css";
 
 const toolName = (tool: string) => ({ jianlai: "剑来", chrome: "Chrome", webview: "WebView" })[tool] ?? tool;
@@ -62,6 +63,15 @@ export default function KnowledgeGraphView() {
     const scale = Math.max(.005, Math.min(2, value.scale * factor));
     return { x: value.x * scale / value.scale, y: value.y * scale / value.scale, scale };
   });
+  // Arriving from the 剑谱 viewer: highlight that route and show its first step.
+  createEffect(() => {
+    const route = focusRouteId() && graph().routes.find(item => item.id === focusRouteId());
+    if (!route) return;
+    setFocusRouteId("");
+    const first = byId().get(route.nodeIds[1] ?? route.nodeIds[0]);
+    if (first) locate(first);
+    setRouteKey(route.key);
+  });
   createEffect(() => {
     graph(); size();
     const node = selected();
@@ -72,7 +82,7 @@ export default function KnowledgeGraphView() {
     observer.observe(canvas); onCleanup(() => observer.disconnect());
   });
   return <main class="knowledge-page">
-    <header class="knowledge-header"><div><h1>知识图谱</h1><p>所有起点、操作与目标，在一张图里连接</p></div><button class="btn" disabled={groups.loading} onClick={() => void refetch()}>刷新记录</button></header>
+    <header class="knowledge-header"><div><h1>知识图谱</h1><p>所有起点、操作与目标，在一张图里连接</p></div><div class="knowledge-header-actions"><button class="btn" onClick={() => setView("jianpu")} title="录下你的桌面操作，交给 AI 学成图谱路径">剑谱</button><button class="btn" disabled={groups.loading} onClick={() => void refetch()}>刷新记录</button></div></header>
     <div class="knowledge-toolbar"><button class="btn" onClick={overview}>全图总览</button>
       <input type="search" aria-label="搜索全部图谱" placeholder="搜索步骤、目标、应用或网站…" value={query()} onInput={event => setQuery(event.currentTarget.value)} />
       <span class="knowledge-count">全部来源 · {graph().starts.length} 个起点 · {graph().nodes.length} 个节点 · {graph().edges.length} 条连接 · {graph().routes.length} 条路径</span>
@@ -118,8 +128,9 @@ export default function KnowledgeGraphView() {
             <h3>从哪里来 · {incoming().length}</h3><For each={incoming()}>{edge => <button class="knowledge-next" onClick={() => locate(byId().get(edge.source)!)}>{byId().get(edge.source)!.title}<span>定位</span></button>}</For>
             <h3>接下来 · {outgoing().length}</h3><For each={outgoing()} fallback={<p>已到记录终点，请核对下方成功检查点。</p>}>{edge => <button class="knowledge-next" onClick={() => locate(byId().get(edge.target)!)}>{byId().get(edge.target)!.title}<span>{edge.kind === "goal" ? "查看目标" : "定位下一步"}</span></button>}</For>
             <h3>来源路径与检查点</h3><p>同名操作表示共同概念。选择一条来源路径，核对入口条件与完整顺序。</p>
-            <For each={selectedRoutes()}>{route => <details class="knowledge-route"><summary>{route.task}<small>{toolName(route.tool)} · {route.scope} · {route.confidence === "reused" ? "多会话复用" : "首次验证"}</small></summary>
-              <button class="btn" onClick={() => setRouteKey(route.key)}>高亮这条路径</button><p>入口：{route.conditions.join("；")}</p>
+            <For each={selectedRoutes()}>{route => <details class="knowledge-route"><summary>{route.task}<small>{toolName(route.tool)} · {route.scope} · {route.source === "demo" ? "用户演示 · " : ""}{route.confidence === "reused" ? "多会话复用" : "首次验证"}</small></summary>
+              <button class="btn" onClick={() => setRouteKey(route.key)}>高亮这条路径</button>
+              <Show when={route.recordingId}>{id => <button class="btn" onClick={() => { setJianpuFocus(id()); setView("jianpu"); }}>查看剑谱</button>}</Show><p>入口：{route.conditions.join("；")}</p>
               <ol><For each={route.steps}>{(step, i) => <li><button class="knowledge-step-link" onClick={() => locate(byId().get(route.nodeIds[i() + 1])!)}>{step}</button></li>}</For></ol>
               <strong>成功检查点</strong><ul><For each={route.checks}>{check => <li>{check}</li>}</For></ul>
               <Show when={route.pitfalls.length}><strong>已知注意事项</strong><ul><For each={route.pitfalls}>{pitfall => <li>{pitfall}</li>}</For></ul></Show>

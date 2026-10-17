@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<!-- 剑来操作桌面时的边缘呼吸光效。窗口排除在截图外且鼠标穿透，见 src-tauri/src/agent_glow.rs -->
+<!-- 剑来操作桌面（天蓝）/ 剑谱录制（m=rec，朱红）时的边缘呼吸光效。窗口排除在截图外且鼠标穿透，见 src-tauri/src/agent_glow.rs -->
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
   .screen { position: fixed; overflow: hidden; pointer-events: none; }
@@ -9,24 +9,61 @@
   .edge { box-shadow: inset 0 0 0 1.5px rgba(125, 211, 252, .9), inset 0 0 14px 2px rgba(56, 189, 248, .7); animation-name: edge; }
   /* 向内弥散的柔光：吸气时铺开，留足中间区域不挡用户看内容 */
   .halo { box-shadow: inset 0 0 48px 10px rgba(56, 189, 248, .42), inset 0 0 120px 28px rgba(14, 165, 233, .18); animation-name: halo; }
+  /* 剑谱录制：朱红、更慢的呼吸，左上角标签；和剑来的天蓝一眼可分 */
+  .rec .screen i { animation-duration: 4.8s; }
+  .rec .edge { box-shadow: inset 0 0 0 1.5px rgba(252, 165, 165, .95), inset 0 0 14px 2px rgba(239, 68, 68, .7); }
+  .rec .halo { box-shadow: inset 0 0 48px 10px rgba(234, 88, 12, .4), inset 0 0 120px 28px rgba(220, 38, 38, .16); }
+  /* 开始录制：从按下的按钮（指针处）荡开两道朱红涟漪，扫到屏幕边缘时边框光效才亮起 */
+  .ripple { position: fixed; border-radius: 50%; pointer-events: none; transform: translate(-50%, -50%) scale(0); opacity: 0;
+    border: 3px solid rgba(248, 113, 113, .95); box-shadow: 0 0 24px 6px rgba(239, 68, 68, .45), inset 0 0 40px 8px rgba(239, 68, 68, .25);
+    animation: ripple .9s cubic-bezier(.2, .7, .3, 1) forwards; }
+  .ripple.second { animation-delay: .14s; border-width: 2px; }
+  @keyframes ripple { 0% { opacity: 1; transform: translate(-50%, -50%) scale(0) } 75% { opacity: .9 } 100% { opacity: 0; transform: translate(-50%, -50%) scale(1) } }
+  .entering .screen { animation: arrive .5s ease-out .55s both; }
+  @keyframes arrive { from { opacity: 0 } to { opacity: 1 } }
+  .tag { position: absolute; left: 14px; top: 12px; padding: 3px 10px; border-radius: 999px; font: 600 12px/18px system-ui, sans-serif;
+    color: #fff; background: rgba(185, 28, 28, .82); letter-spacing: .5px; }
+  .tag::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: #fecaca; animation: blink 1.2s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: .2 } }
   @keyframes edge { from { opacity: 1 } to { opacity: .55 } }
   @keyframes halo { from { opacity: .15 } to { opacity: 1 } }
-  @media (prefers-reduced-motion: reduce) { .screen i { animation: none; opacity: .8 } }
+  @media (prefers-reduced-motion: reduce) { .screen i { animation: none; opacity: .8 } .ripple { display: none } .entering .screen { animation: none } }
 </style>
 <script>
   // s=x,y,w,h,...：每块屏相对本窗口左上角的物理像素
   function draw() {
-    const n = (new URLSearchParams(location.search).get("s") || "").split(",").map(Number);
+    const q = new URLSearchParams(location.search);
+    const n = (q.get("s") || "").split(",").map(Number);
+    const rec = q.get("m") === "rec";
+    document.body.classList.toggle("rec", rec);
     const r = devicePixelRatio || 1;
-    document.body.replaceChildren(...Array.from({ length: n.length / 4 | 0 }, (_, i) => {
+    const nodes = Array.from({ length: n.length / 4 | 0 }, (_, i) => {
       const [x, y, w, h] = n.slice(i * 4, i * 4 + 4).map(v => v / r);
       const screen = document.createElement("div");
       screen.className = "screen";
       Object.assign(screen.style, { left: x + "px", top: y + "px", width: w + "px", height: h + "px" });
-      screen.innerHTML = '<i class="halo"></i><i class="edge"></i>';
+      screen.innerHTML = '<i class="halo"></i><i class="edge"></i>' + (rec && i === 0 ? '<span class="tag">剑谱录制中</span>' : '');
       return screen;
-    }));
+    });
+    // o=x,y：开始录制的起点（相对本窗口左上角的物理像素），只在首次绘制时播放涟漪。
+    const o = (q.get("o") || "").split(",").map(Number);
+    if (rec && o.length === 2 && o.every(Number.isFinite) && !played) {
+      played = true;
+      const [x, y] = o.map(v => v / r);
+      // 半径取到最远窗口角，保证涟漪扫过所有屏幕。
+      const radius = Math.max(...[[0, 0], [innerWidth, 0], [0, innerHeight], [innerWidth, innerHeight]].map(([cx, cy]) => Math.hypot(cx - x, cy - y)));
+      for (const cls of ["ripple", "ripple second"]) {
+        const ring = document.createElement("div");
+        ring.className = cls;
+        Object.assign(ring.style, { left: x + "px", top: y + "px", width: radius * 2 + "px", height: radius * 2 + "px" });
+        ring.addEventListener("animationend", () => ring.remove());
+        nodes.push(ring);
+      }
+      document.body.classList.add("entering");
+    }
+    document.body.replaceChildren(...nodes);
   }
+  let played = false;
   addEventListener("DOMContentLoaded", draw);
   addEventListener("resize", draw);
 </script>

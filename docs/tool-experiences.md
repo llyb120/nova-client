@@ -14,6 +14,8 @@
 
 剑来、Chrome、WebView 均接入经验保存，按工具分组展示；没有记录时显示空状态。
 
+剑来路径还可来自[剑谱](jianlai.md#剑谱用户演示录制windows)：用户演示录制后由模型整理保存，`experience_save` 带 `recordingId` 代替最新截图校验，路径标为 `source=demo`、`verification=user_demonstrated`，与模型验证路径同等参与 `experienceHint` 排序；详情里「查看剑谱」打开原始录制。
+
 页面验证：`node scripts/knowledge-graph.test.mjs`（需本机 Edge，或用 `TEST_BROWSER` 指定 Chromium 路径）。
 
 经验调用按需触发，不是任务开始/结束的必经流程；已知路径直接操作，不因新任务或切换应用/网站/子任务机械检索，浏览器普通成功无需保存（回合正常结束时自动记录轨迹），不为记录经验打断连续步骤。剑来没有自动记录，未照已有路径、经2步以上操作并以截图确认成功时，结束前 experience_save 一次。图谱增强检索结果和规划能力，不改变这一触发原则。

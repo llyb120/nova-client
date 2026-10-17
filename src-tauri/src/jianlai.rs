@@ -49,6 +49,10 @@ impl Drop for InputLease {
 /// Claim the desktop for one tool call. A concurrent claim by the other tool fails fast with a
 /// clear reason instead of racing keystrokes against a tab switch; cancellation/unwinding releases the lease through Drop.
 pub(crate) fn lease_input(tool: &'static str) -> Result<InputLease> {
+    // 用户正在演示剑谱：剑来的输入会混进录制，也会和用户抢鼠标。
+    if tool == "jianlai" && crate::jianpu::recording() {
+        return Err("剑谱录制中，桌面正由用户演示，本次未执行；等用户停止录制（Alt+R 或 Butterfly 面板）后再调用".into());
+    }
     let mut lease = INPUT_LEASE.lock().map_err(|_| "输入闸门不可用")?;
     if let Some((holder, since, _)) = *lease {
         // A live call may exceed 30s (16 waits alone can take 32s); only Drop releases it.
@@ -305,7 +309,7 @@ pub(crate) const CURSOR_GLOW: f32 = 0.72;
 pub(crate) const MARKER_GLOW: f32 = 0.2;
 
 /// Signed distance to a polygon (negative inside).
-fn polygon_sd(poly: &[(f32, f32)], x: f32, y: f32) -> f32 {
+pub(crate) fn polygon_sd(poly: &[(f32, f32)], x: f32, y: f32) -> f32 {
     let (mut inside, mut d) = (false, f32::MAX);
     for i in 0..poly.len() {
         let ((ax, ay), (bx, by)) = (poly[i], poly[(i + 1) % poly.len()]);
@@ -338,6 +342,12 @@ fn sword(x: f32, y: f32) -> (f32, (f32, f32, f32)) {
 /// Anti-aliased sword pointer: navy outline over a round sky-blue ink dot at the tip.
 /// `glow` is the dot's peak alpha. Straight-alpha 0xAARRGGBB.
 pub(crate) fn pointer_pixels(size: i32, glow: f32) -> Vec<u32> {
+    paint_pointer(size, sword, (12.0, 30.0, 64.0), (56.0, 189.0, 248.0, glow))
+}
+
+/// Anti-aliased pointer from a signed-distance `shape` with an outline and a round ink-dot glow
+/// (r, g, b, peak alpha) centred on the hotspot. Shared by the sword and the 剑谱 brush.
+pub(crate) fn paint_pointer(size: i32, shape: fn(f32, f32) -> (f32, (f32, f32, f32)), outline: (f32, f32, f32), glow: (f32, f32, f32, f32)) -> Vec<u32> {
     const SS: i32 = 4;
     let unit = 32.0 / size as f32;
     let mut pixels = vec![0u32; (size * size) as usize];
@@ -348,15 +358,15 @@ pub(crate) fn pointer_pixels(size: i32, glow: f32) -> Vec<u32> {
                 for sx in 0..SS {
                     let x = (px as f32 + (sx as f32 + 0.5) / SS as f32) * unit;
                     let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) * unit;
-                    let (d, (r, g, b)) = sword(x, y);
+                    let (d, (r, g, b)) = shape(x, y);
                     let (r, g, b, a) = if d <= 0.0 {
                         (r, g, b, 1.0)
                     } else if d < 0.6 {
-                        (12.0, 30.0, 64.0, 1.0)
+                        (outline.0, outline.1, outline.2, 1.0)
                     } else {
-                        // 以剑尖为圆心的天蓝墨点，中心浓、向外平滑淡出。
+                        // 以尖端为圆心的墨点，中心浓、向外平滑淡出。
                         let r2 = ((x - POINTER_TIP).powi(2) + (y - POINTER_TIP).powi(2)) / (TIP_GLOW * TIP_GLOW);
-                        (56.0, 189.0, 248.0, glow * (1.0 - r2).max(0.0).powf(1.5))
+                        (glow.0, glow.1, glow.2, glow.3 * (1.0 - r2).max(0.0).powf(1.5))
                     };
                     acc[0] += r * a; acc[1] += g * a; acc[2] += b * a; acc[3] += a;
                 }
@@ -1601,6 +1611,16 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
     let args = args.clone();
     tokio::task::spawn_blocking(move || {
         if crate::tool_experience::is_operation(&args) {
+            // 剑谱整理：用户演示录制代替「本会话180秒内截图」做来源校验。
+            if let Some(id) = args["experience"]["recordingId"].as_str().filter(|s| !s.is_empty()) {
+                if args["operation"] != "experience_save" { return Err("recordingId仅用于experience_save".into()); }
+                let observed = crate::jianpu::scope_of(id, args["experience"]["scope"].as_str().unwrap_or_default())?;
+                let mut args = args.clone();
+                args["snapshotId"] = json!(format!("{}{id}", crate::tool_experience::DEMO));
+                let result = crate::tool_experience::execute(&crate::tool_experience::dir(), "jianlai", &owner, &args, Some(&observed))?;
+                if let Some(route) = result["experience"]["id"].as_str() { crate::jianpu::link_route(id, route); }
+                return Ok(result);
+            }
             let observed = if args["operation"] == "experience_search" { None } else {
                 let state = DESKTOP.try_lock().map_err(|_| "剑来正在操作桌面")?;
                 let snap = state.as_ref().filter(|s| s.owner == owner && args["snapshotId"].as_str() == Some(&s.id)

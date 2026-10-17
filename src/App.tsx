@@ -15,11 +15,13 @@ import { UpdateModal } from "./components/UpdateModal";
 import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
 import { selectedChatText } from "./chatSelection";
-import { initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal } from "./store";
+import { closeThread, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal } from "./store";
+import { setJianpuFocus } from "./knowledgeGraph";
 import { mountSessionShortcuts, setShortcutRecordingActive } from "./sessionShortcuts";
 import { createHomeTerminalState, setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
 const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
 const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"));
+const JianpuView = lazy(() => import("./components/JianpuView"));
 const EmployeeView = lazy(() => import("./components/EmployeeView"));
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
@@ -114,6 +116,14 @@ export default function App() {
       });
     onGlobalShortcut("session-shortcut:new-session", () => openNewSession(selectedChatText()));
     onGlobalShortcut("session-shortcut:open-unread", () => void openNextUnreadThread());
+    // Butterfly 面板 / 剑谱通知：切到对应页面（剑谱带 id 时定位到那一段）。
+    void listen<{ id: string }>("jianpu:open", event => {
+      setJianpuFocus(event.payload.id);
+      closeThread();
+      setView("jianpu");
+    }).then(remove => { if (disposed) remove(); else unlistens.push(remove); });
+    void listen<{ view: "knowledge" }>("nova:open-view", event => { closeThread(); setView(event.payload.view); })
+      .then(remove => { if (disposed) remove(); else unlistens.push(remove); });
     void listen<{ threadId: string }>("native-browser:open", event => {
       if (event.payload.threadId === state.currentId) setWorkspaceLayout({ open: true, mode: "browser" });
     }).then(remove => { if (disposed) remove(); else unlistens.push(remove); });
@@ -161,7 +171,11 @@ export default function App() {
           <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
             <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={
-              <Show when={state.view === "employee"} fallback={<HomeView />}>
+              <Show when={state.view === "employee"} fallback={
+                <Show when={state.view === "jianpu"} fallback={<HomeView />}>
+                  <Suspense><JianpuView /></Suspense>
+                </Show>
+              }>
                 <Suspense><EmployeeView /></Suspense>
               </Show>
             }>
