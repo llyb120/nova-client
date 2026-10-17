@@ -39,6 +39,7 @@ import {
 } from "../sessionShortcuts";
 import type {
   AgentInstructionTarget,
+  PromptTrigger,
   AgentKind,
   CliStatus,
   Peer,
@@ -370,6 +371,14 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [globalInstructionsBusy, setGlobalInstructionsBusy] = createSignal(false);
   const [globalInstructionsDirty, setGlobalInstructionsDirty] = createSignal(false);
   const [globalInstructionsMsg, setGlobalInstructionsMsg] = createSignal("");
+  const [promptTriggers, setPromptTriggers] = createSignal<PromptTrigger[]>([]);
+  const editPromptTrigger = (index: number, patch: Partial<PromptTrigger> | null) => {
+    setPromptTriggers((list) =>
+      patch ? list.map((item, i) => (i === index ? { ...item, ...patch } : item)) : list.filter((_, i) => i !== index),
+    );
+    setGlobalInstructionsDirty(true);
+    setGlobalInstructionsMsg("");
+  };
   const [verifying, setVerifying] = createSignal(false);
   const [verifyMsg, setVerifyMsg] = createSignal("");
   const [showLogs, setShowLogs] = createSignal(false);
@@ -624,6 +633,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       setGlobalInstructions(config.content);
       setGlobalInstructionsPath(config.path);
       setGlobalInstructionTargets(config.targets);
+      setPromptTriggers(config.triggers);
       setGlobalInstructionsDirty(false);
       globalInstructionsLoaded = true;
     } catch (error) {
@@ -639,10 +649,15 @@ export function SettingsModal(props: { onClose: () => void }) {
       const enabledAgentKinds = globalInstructionTargets()
         .filter((target) => target.enabled)
         .map((target) => target.agentKind);
-      const config = await api.setGlobalAgentInstructions(globalInstructions(), enabledAgentKinds);
+      const config = await api.setGlobalAgentInstructions(
+        globalInstructions(),
+        enabledAgentKinds,
+        promptTriggers(),
+      );
       setGlobalInstructions(config.content);
       setGlobalInstructionsPath(config.path);
       setGlobalInstructionTargets(config.targets);
+      setPromptTriggers(config.triggers);
       setGlobalInstructionsDirty(false);
       const conflicts = config.targets.filter(
         (target) => target.status === "conflict" || target.status === "error",
@@ -2114,7 +2129,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   type="button"
                   class="btn secondary"
                   disabled={globalInstructionsLoading() || globalInstructionsBusy()}
-                  onClick={() => void syncGlobalInstructions()}
+                  onClick={() => void syncGlobalInstructions().catch((error) => setGlobalInstructionsMsg(`同步失败：${String(error)}`))}
                 >
                   {globalInstructionsBusy() ? "同步中…" : "保存并同步"}
                 </button>
@@ -2130,6 +2145,67 @@ export function SettingsModal(props: { onClose: () => void }) {
                 清空后同步会移除 Nova 创建的托管文件/区块，不会删除各后端原有的其它配置。正在运行的 Agent 需重启后读取新内容。
               </span>
             </label>
+
+            <div class="field">
+              <span class="field-label">提示词触发器</span>
+              <span class="field-hint">
+                类似 skill 的渐进披露：各后端只预载「触发条件」和正文文件路径，条件命中时 Agent 再读取并遵循对应提示词。随「保存并同步」一起写入。
+              </span>
+              <Index each={promptTriggers()}>
+                {(trigger, index) => (
+                  <div class="wt-row">
+                    <div class="wt-row-main">
+                      <input
+                        class="field-input"
+                        value={trigger().when}
+                        aria-label={`触发器 ${index + 1} 的触发条件`}
+                        placeholder="触发条件，例如：用户要求写周报或总结本周工作时"
+                        disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                        onInput={(event) => editPromptTrigger(index, { when: event.currentTarget.value })}
+                      />
+                      <button
+                        type="button"
+                        class="btn secondary"
+                        disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                        onClick={() => editPromptTrigger(index, null)}
+                      >
+                        删除
+                      </button>
+                    </div>
+                    <textarea
+                      class="field-input"
+                      rows={4}
+                      value={trigger().prompt}
+                      aria-label={`触发器 ${index + 1} 的提示词`}
+                      placeholder="命中后加载的提示词……"
+                      disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                      onInput={(event) => editPromptTrigger(index, { prompt: event.currentTarget.value })}
+                    />
+                  </div>
+                )}
+              </Index>
+              <div class="global-agent-actions">
+                <button
+                  type="button"
+                  class="btn secondary"
+                  disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                  onClick={() => {
+                    setPromptTriggers((list) => [...list, { when: "", prompt: "" }]);
+                    setGlobalInstructionsDirty(true);
+                  }}
+                >
+                  添加触发器
+                </button>
+                <button
+                  type="button"
+                  class="btn secondary"
+                  disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                  onClick={() => void syncGlobalInstructions().catch((error) => setGlobalInstructionsMsg(`同步失败：${String(error)}`))}
+                >
+                  {globalInstructionsBusy() ? "同步中…" : "保存并同步"}
+                </button>
+              </div>
+            </div>
 
             <div class="field">
               <span class="field-label">后端适配状态</span>

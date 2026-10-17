@@ -546,6 +546,13 @@ export interface GlobalAgentInstructions {
   content: string;
   path: string;
   targets: AgentInstructionTarget[];
+  triggers: PromptTrigger[];
+}
+
+/** 提示词触发器：满足 when 时由 Agent 读取 prompt 正文（渐进披露） */
+export interface PromptTrigger {
+  when: string;
+  prompt: string;
 }
 
 /** 集中管理的 skill（~/.nova/skills） */

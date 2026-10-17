@@ -11,6 +11,7 @@ import type {
   ClueContextSnapshot,
   ClueNodeGroup,
   GlobalAgentInstructions,
+  PromptTrigger,
   IncomingShare,
   IncomingWorkflowShare,
   ModelCost,
@@ -284,8 +285,12 @@ export const api = {
   refreshEnvironmentVariables: () => invoke<number>("refresh_environment_variables"),
   getGlobalAgentInstructions: () =>
     invoke<GlobalAgentInstructions>("get_global_agent_instructions"),
-  setGlobalAgentInstructions: (content: string, enabledAgentKinds: AgentKind[]) =>
-    invoke<GlobalAgentInstructions>("set_global_agent_instructions", { content, enabledAgentKinds }),
+  setGlobalAgentInstructions: (
+    content: string,
+    enabledAgentKinds: AgentKind[],
+    triggers: PromptTrigger[],
+  ) =>
+    invoke<GlobalAgentInstructions>("set_global_agent_instructions", { content, enabledAgentKinds, triggers }),
   /** 后端可用性检测结果（agentKind → 是否可用）；空 map = 尚未检测完成 */
   getBackendAvailability: () =>
     invoke<Record<string, boolean>>("get_backend_availability"),

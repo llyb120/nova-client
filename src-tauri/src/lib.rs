@@ -4404,8 +4404,14 @@ fn set_global_agent_instructions(
     state: State<'_, AppState>,
     content: String,
     enabled_agent_kinds: Vec<String>,
+    triggers: Option<Vec<agent_config::PromptTrigger>>,
 ) -> Result<agent_config::GlobalAgentInstructions, String> {
-    agent_config::set_global_instructions(&state.config_dir, &content, &enabled_agent_kinds)
+    agent_config::set_global_instructions(
+        &state.config_dir,
+        &content,
+        &enabled_agent_kinds,
+        &triggers.unwrap_or_default(),
+    )
 }
 
 #[tauri::command]
