@@ -9,8 +9,10 @@ import { ponytailPrompt } from "./ponytail-prompt.mjs";
  * Exposes polaris; filesystem operations use Cursor built-ins.
  */
 export function createCursorFilesystemTools(cwd, options = {}) {
-  const { generate_image, edit_image } = createNovaBatchTools(cwd, { ...options, fastContext: false });
-  const images = generate_image ? { generate_image, edit_image } : {};
+  const batch = createNovaBatchTools(cwd, { ...options, fastContext: false });
+  // 图片工具 + 自动模式的场景转交工具（仅 Nova 注入 toolEnv 时存在）。
+  const images = Object.fromEntries(Object.entries(batch).filter(([name]) =>
+    ["generate_image", "edit_image", "spawn_agent", "wait_agent", "list_agents", "followup_task", "interrupt_agent", "close_agent"].includes(name)));
   const fastContext = process.env.NOVA_FAST_CONTEXT !== "0" && globalContextServiceConfigured();
   const root = resolve(cwd);
   if (!fastContext) return images;

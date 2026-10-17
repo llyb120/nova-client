@@ -2881,6 +2881,14 @@ button {
   background: var(--bg-hover);
   border-color: var(--border);
 }
+.composer-bar .composer-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  cursor: pointer;
+  white-space: nowrap;
+}
 .composer-run-stats {
   display: inline-flex;
   align-items: center;

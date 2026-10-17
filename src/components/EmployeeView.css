@@ -107,16 +107,6 @@
 .employee-time-range input { flex: 1; width: 0; padding: 7px; font-size: 12px; }
 .employee-idle-input input { width: 76px; }
 .employee-settings > .employee-hint { margin-top: 12px; font-size: 11px; }
-.employee-default-model { padding-top: 18px; border-top: 1px solid var(--border); }
-.employee-default-model > :last-child, .employee-pool-actions > :first-child { min-width: 0; max-width: 100%; }
-.employee-default-model button, .employee-pool-actions button { max-width: 100%; }
-.employee-pool .employee-list { margin-top: 16px; }
-.employee-pool .employee-list > li { flex-direction: column; gap: 8px; }
-.employee-pool input { width: 100%; font-size: 12px; }
-.employee-pool-actions { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
-.employee-pool-actions > :first-child { flex: 1; }
-.employee-pool-actions > button { flex-shrink: 0; }
-.employee-page .employee-add-model { width: 100%; margin-top: 14px; border-style: dashed; background: transparent; }
 .employee-card > summary { cursor: pointer; list-style: none; }
 .employee-card > summary::-webkit-details-marker, .employee-more > summary::-webkit-details-marker { display: none; }
 .employee-card:not([open]) > summary { margin-bottom: 0; }

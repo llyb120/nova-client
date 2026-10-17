@@ -30,9 +30,77 @@ pub struct SessionShortcut {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct StageModelTarget {
+pub struct ModelTarget {
     pub agent_kind: String,
+    /// 空 = 该后端默认模型。
     pub model: String,
+}
+
+/// 预设场景：自动模式、Stage、Butterfly/Meteor/员工等入口按场景取模型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scene {
+    Lightweight,
+    Coding,
+    Computer,
+}
+
+impl Scene {
+    pub const ALL: [Scene; 3] = [Scene::Lightweight, Scene::Coding, Scene::Computer];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Scene::Lightweight => "lightweight",
+            Scene::Coding => "coding",
+            Scene::Computer => "computer",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Scene::Lightweight => "轻量化",
+            Scene::Coding => "编码",
+            Scene::Computer => "电脑操控",
+        }
+    }
+
+    /// 适用条件，给模型判断是否转交。
+    pub fn when(self) -> &'static str {
+        match self {
+            Scene::Lightweight => "简单问答、整理总结、标题摘要等轻量事务",
+            Scene::Coding => "需要写代码、改仓库、调试或运行构建测试",
+            Scene::Computer => "需要操作桌面应用或浏览器（截图、点击、输入）",
+        }
+    }
+
+    /// 接受 key 或中文名。
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        Self::ALL.into_iter().find(|s| s.key().eq_ignore_ascii_case(value) || s.label() == value)
+    }
+}
+
+/// 每个场景一个有序模型列表：按顺序取第一个可用的，失效时切换下一个。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SceneModels {
+    pub lightweight: Vec<ModelTarget>,
+    pub coding: Vec<ModelTarget>,
+    pub computer: Vec<ModelTarget>,
+}
+
+impl SceneModels {
+    pub fn get(&self, scene: Scene) -> &[ModelTarget] {
+        match scene {
+            Scene::Lightweight => &self.lightweight,
+            Scene::Coding => &self.coding,
+            Scene::Computer => &self.computer,
+        }
+    }
+
+    /// 先决条件：三个场景都至少配置一个模型。
+    pub fn ready(&self) -> bool {
+        Scene::ALL.into_iter().all(|scene| !self.get(scene).is_empty())
+    }
 }
 
 /// 上下文检索模式：none = 不注入工具，fast = 旧 FastContext，super = 无索引单遍 SuperContext。
@@ -115,9 +183,6 @@ pub struct Settings {
     pub windows_shell_shim_enabled: bool,
     /// Windows 后台任务栏提示（实验）；默认关闭，保存后即时生效。
     pub taskbar_status_enabled: bool,
-    /// Butterfly 空闲气泡新会话使用的后端及模型；空模型使用后端默认值。
-    pub butterfly_agent_kind: String,
-    pub butterfly_model: String,
     /// PowerShell 输出按 UTF-8 捕获（Lyra 的 bash 工具注入一次性前缀，把控制台
     /// 输出切到 UTF-8），避免 GBK(cp936) 与 UTF-8 解码错配产生乱码。默认开启。
     #[serde(default = "default_powershell_utf8")]
@@ -131,14 +196,8 @@ pub struct Settings {
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
     pub default_mode: String,
-    /// 标题、快速总结、摘要和上下文压缩等辅助任务使用的轻量级模型后端。
-    #[serde(alias = "titleModelAgent")]
-    pub lightweight_model_agent: String,
-    /// 轻量级模型 id；失败时辅助任务回退到发起任务的原模型。
-    #[serde(alias = "titleModel")]
-    pub lightweight_model: String,
-    /// /stage、/stage2 等命令依次使用的模型；/stage 默认取第一项。
-    pub stage_models: Vec<StageModelTarget>,
+    /// 场景模型：轻量化（标题/摘要/Stage/Butterfly/Meteor/员工）、编码、电脑操控。
+    pub scene_models: SceneModels,
     /// 打开文件用的编辑器命令（cursor / code / zed / windsurf 等，依赖 PATH）
     pub editor: String,
     pub terminal_shell: String,
@@ -164,9 +223,6 @@ pub struct Settings {
     pub meteor_enabled: bool,
     /// Alt+Alt 表示连续两次纯 Alt；其它值为全局组合键。
     pub meteor_shortcut: String,
-    pub meteor_agent_kind: String,
-    /// 空值使用所选后端的默认模型。
-    pub meteor_model: String,
     /// Meteor 提交时附加触发时的最近剪贴板（文字/图片/文件路径）；默认关闭。
     pub meteor_clipboard: bool,
     /// Meteor 星移（StartShift）的全局组合键；空值关闭。
@@ -241,16 +297,12 @@ impl Default for Settings {
             lyra_proxy: String::new(),
             windows_shell_shim_enabled: false,
             taskbar_status_enabled: false,
-            butterfly_agent_kind: "lyra".into(),
-            butterfly_model: String::new(),
             powershell_utf8_enabled: true,
             auto_change_project_enabled: true,
             ponytail_enabled: true,
             checkpoint_enabled: false,
             default_mode: String::new(),
-            lightweight_model_agent: "lyra".into(),
-            lightweight_model: String::new(),
-            stage_models: Vec::new(),
+            scene_models: SceneModels::default(),
             editor: "code".into(),
             terminal_shell: String::new(),
             terminal_args: Vec::new(),
@@ -264,8 +316,6 @@ impl Default for Settings {
             session_shortcuts: Vec::new(),
             meteor_enabled: true,
             meteor_shortcut: "Alt+Alt".into(),
-            meteor_agent_kind: "lyra".into(),
-            meteor_model: String::new(),
             meteor_clipboard: false,
             meteor_paste_shortcut: "Alt+V".into(),
             jianpu_shortcut: "Alt+R".into(),
@@ -294,7 +344,7 @@ impl Default for Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionShortcut, Settings, StageModelTarget};
+    use super::{ModelTarget, Scene, SessionShortcut, Settings};
     use std::fs;
 
     #[test]
@@ -360,12 +410,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_title_model_migrates_to_lightweight_model() {
-        let settings: Settings =
-            serde_json::from_str(r#"{"titleModelAgent":"codex","titleModel":"gpt-5-mini"}"#)
-                .unwrap();
-        assert_eq!(settings.lightweight_model_agent, "codex");
-        assert_eq!(settings.lightweight_model, "gpt-5-mini");
+    fn legacy_lightweight_model_migrates_to_scene() {
+        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.json"), r#"{"titleModelAgent":"alkaid","titleModel":"p/m","stageModels":[{"agentKind":"codex","model":"x"}]}"#).unwrap();
+        let settings = Settings::load(&dir);
+        assert_eq!(settings.scene_models.lightweight, vec![ModelTarget { agent_kind: "lyra".into(), model: "p/m".into() }]);
+        assert!(settings.scene_models.coding.is_empty() && !settings.scene_models.ready());
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert!(saved.get("stageModels").is_none() && saved.get("lightweightModel").is_none());
+        // 已有场景配置时不再被旧字段覆盖。
+        fs::write(dir.join("settings.json"), r#"{"lightweightModelAgent":"codex","sceneModels":{"lightweight":[{"agentKind":"lyra","model":""}]}}"#).unwrap();
+        assert_eq!(Settings::load(&dir).scene_models.lightweight[0].agent_kind, "lyra");
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(Scene::parse("电脑操控"), Some(Scene::Computer));
+        assert_eq!(Scene::parse("coding"), Some(Scene::Coding));
     }
 
     #[test]
@@ -442,8 +501,6 @@ mod tests {
         for settings in [Settings::default(), serde_json::from_str::<Settings>(r#"{}"#).unwrap()] {
             assert!(settings.meteor_enabled);
             assert_eq!(settings.meteor_shortcut, "Alt+Alt");
-            assert_eq!(settings.meteor_agent_kind, "lyra");
-            assert!(settings.meteor_model.is_empty());
             assert!(!settings.meteor_clipboard);
             assert_eq!(settings.meteor_paste_shortcut, "Alt+V");
         }
@@ -454,8 +511,6 @@ mod tests {
         let saved = serde_json::to_value(&settings).unwrap();
         assert_eq!(saved["meteorEnabled"], false);
         assert_eq!(saved["meteorShortcut"], "Ctrl+Alt+M");
-        assert_eq!(saved["meteorAgentKind"], "codex");
-        assert_eq!(saved["meteorModel"], "gpt-5.6");
     }
 
     #[test]
@@ -504,8 +559,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.vega_enabled = true;
         settings.lyra_enabled = false;
-        settings.lightweight_model_agent = "alkaid".into();
-        settings.stage_models.push(StageModelTarget {
+        settings.scene_models.coding.push(ModelTarget {
             agent_kind: "alkaid".into(),
             model: "p/m".into(),
         });
@@ -519,8 +573,7 @@ mod tests {
         settings.migrate_legacy_vega();
         assert!(settings.lyra_enabled);
         assert!(!settings.vega_enabled);
-        assert_eq!(settings.lightweight_model_agent, "lyra");
-        assert_eq!(settings.stage_models[0].agent_kind, "lyra");
+        assert_eq!(settings.scene_models.coding[0].agent_kind, "lyra");
         assert_eq!(settings.model_favorites[0], "lyra:p/m");
         assert_eq!(settings.session_shortcuts[0].target, "lyra:p/m");
     }
@@ -635,10 +688,8 @@ impl Settings {
             self.lyra_enabled = true;
             self.vega_enabled = false;
         }
-        if self.lightweight_model_agent.trim() == "alkaid" {
-            self.lightweight_model_agent = "lyra".into();
-        }
-        for target in &mut self.stage_models {
+        let scenes = &mut self.scene_models;
+        for target in scenes.lightweight.iter_mut().chain(&mut scenes.coding).chain(&mut scenes.computer) {
             if target.agent_kind.trim() == "alkaid" {
                 target.agent_kind = "lyra".into();
             }
@@ -674,6 +725,16 @@ impl Settings {
                 == Some(false)
         {
             settings.context_retrieval_mode = ContextRetrievalMode::None;
+        }
+        // 旧版单独的轻量级模型迁移为轻量化场景的第一项；Stage/Butterfly/Meteor 模型配置已移除。
+        if settings.scene_models.lightweight.is_empty() {
+            let legacy = |keys: [&str; 2]| raw_value.as_ref().and_then(|value| {
+                keys.iter().find_map(|key| value.get(*key).and_then(serde_json::Value::as_str)).map(str::to_string)
+            });
+            if let Some(agent_kind) = legacy(["lightweightModelAgent", "titleModelAgent"]).filter(|kind| !kind.trim().is_empty()) {
+                let model = legacy(["lightweightModel", "titleModel"]).unwrap_or_default();
+                settings.scene_models.lightweight.push(ModelTarget { agent_kind, model });
+            }
         }
         if settings.update_channel != "pre-release" {
             settings.update_channel = "release".into();

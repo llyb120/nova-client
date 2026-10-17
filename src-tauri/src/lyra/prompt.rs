@@ -467,7 +467,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目",
         ),
         Some("- read: 读取单个文件（图片直接返回图像）"),
-        (!read_only).then_some("- jianlai（剑来）: 仅在必须操作图形界面时用真实鼠标键盘与截图操作电脑；本地文件/图片用 read，命令能拿到的用 bash，Chrome 网页用 chrome"),
+        (!read_only && options.desktop).then_some("- jianlai（剑来）: 仅在必须操作图形界面时用真实鼠标键盘与截图操作电脑；本地文件/图片用 read，命令能拿到的用 bash，Chrome 网页用 chrome"),
         if read_only {
             None
         } else {
@@ -552,6 +552,8 @@ pub struct SystemPromptOptions {
     pub skills_text: String,
     pub custom_instructions: String,
     pub ponytail: bool,
+    /// 自动模式非电脑操控场景不提供桌面工具。
+    pub desktop: bool,
 }
 
 #[cfg(test)]
@@ -569,9 +571,11 @@ mod tests {
             skills_text: String::new(),
             custom_instructions: String::new(),
             ponytail: false,
+            desktop: false,
         };
         let prompt = build_system_prompt(&options);
         assert!(!prompt.contains("change_working_directory"));
+        assert!(!prompt.contains("jianlai"));
     }
 
     #[test]

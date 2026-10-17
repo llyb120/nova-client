@@ -710,7 +710,7 @@ async function recoverTimedOutAgent(
     model: modelSelection(request.model),
     local: {
       cwd: request.cwd,
-      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan", toolEnv: request.novaToolEnv }),
     },
   };
   return {
@@ -792,7 +792,7 @@ function canReuseAgentSession(agent, session, request, sessionKey) {
 }
 
 function cursorToolShape(request) {
-  const tools = createCursorFilesystemTools(request?.cwd, { readOnly: request?.mode === "plan" });
+  const tools = createCursorFilesystemTools(request?.cwd, { readOnly: request?.mode === "plan", toolEnv: request?.novaToolEnv });
   return Object.entries(tools).map(([name, tool]) => ({
     name,
     description: tool.description ?? "",
@@ -808,7 +808,7 @@ function agentCreateOptions(request) {
     local: {
       cwd: request?.cwd,
       // Vega-style batch FS tools; inlined via SDK (unlike hooks, which are file-only).
-      customTools: createCursorFilesystemTools(request?.cwd, { readOnly }),
+      customTools: createCursorFilesystemTools(request?.cwd, { readOnly, toolEnv: request?.novaToolEnv }),
     },
   };
 }

@@ -225,12 +225,8 @@ pub(crate) fn learn(app: &AppHandle, id: &str) -> Result<String> {
     if rec.steps.is_empty() { return Err("这段剑谱没有录到操作".into()); }
     let dir = dir_of(id)?;
     let state = app.state::<crate::AppState>();
-    let (kind, model) = {
-        let s = state.settings.lock().unwrap();
-        // 暂时沿用 Meteor（流星）的执行后端与模型。
-        (crate::threads::AgentKind::from_str(&s.meteor_agent_kind).unwrap_or(crate::threads::AgentKind::Lyra), s.meteor_model.clone())
-    };
-    if !state.agent_enabled(&kind) { return Err(format!("{} 后端已关闭，请在设置 → Meteor 里更换执行模型", kind.label())); }
+    // 与 Meteor 一样使用轻量化场景模型。
+    let (kind, model) = state.scene_model(crate::settings::Scene::Lightweight)?;
     // 与 Meteor 一样在临时目录开会话：不给每段剑谱各建一个项目；截图按绝对路径读取。
     let scratch = std::env::temp_dir().join(crate::SCRATCH_MARK).join(format!("jianpu-{id}"));
     std::fs::create_dir_all(&scratch).map_err(|e| format!("创建临时目录失败：{e}"))?;

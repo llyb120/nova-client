@@ -255,7 +255,6 @@ pub(crate) fn validate(settings: &crate::settings::Settings) -> Result<(), Strin
     // Unsupported platforms must still be able to save their other settings.
     if !cfg!(windows) || !settings.meteor_enabled { return Ok(()); }
     validate_shortcut(&settings.meteor_shortcut)?;
-    AgentKind::from_str(&settings.meteor_agent_kind).ok_or("Meteor 模型后端无效")?;
     #[cfg(windows)]
     {
         let binding = platform::parse_shortcut(&settings.meteor_shortcut)?;
@@ -655,13 +654,8 @@ fn build_prompt(capture: &Capture, annotations: &[Annotation], manifest: &[serde
 }
 
 fn meteor_agent(app: &AppHandle) -> Result<(AgentKind, String), String> {
-    let state = app.state::<AppState>();
-    let (kind, model) = {
-        let settings = state.settings.lock().unwrap();
-        (AgentKind::from_str(&settings.meteor_agent_kind).ok_or("Meteor 模型后端无效")?, settings.meteor_model.trim().to_string())
-    };
-    if !state.agent_enabled(&kind) { return Err(format!("{} 后端已关闭，请更换 Meteor 模型", kind.label())); }
-    Ok((kind, model))
+    // Meteor 使用轻量化场景模型。
+    app.state::<AppState>().scene_model(crate::settings::Scene::Lightweight)
 }
 
 fn new_thread(app: &AppHandle, (kind, model): (AgentKind, String), title: &str) -> Result<(String, std::path::PathBuf), String> {
@@ -1352,7 +1346,6 @@ mod tests {
         let mut settings = crate::settings::Settings::default();
         settings.meteor_enabled = true;
         settings.meteor_shortcut.clear();
-        settings.meteor_agent_kind = "unknown".into();
         assert!(validate(&settings).is_ok());
     }
     #[test]
@@ -1416,8 +1409,6 @@ mod tests {
         assert!(validate(&settings).is_err());
         settings.session_shortcuts.clear();
         assert!(validate(&settings).is_ok());
-        settings.meteor_agent_kind = "unknown".into();
-        assert!(validate(&settings).is_err());
     }
     #[cfg(windows)]
     #[test]

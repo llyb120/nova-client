@@ -44,6 +44,7 @@ import type {
   UpdateOp,
   UpdateProgress,
 } from "./types";
+import { SCENES, type ModelTarget, type SceneKey } from "./types";
 import { isScratch, scratchParent } from "./utils";
 import { taskChains } from "./taskChains";
 import {
@@ -523,6 +524,15 @@ export function enabledAgentKinds(): AgentKind[] {
   const s = state.settings;
   if (!s) return [];
   return ALL_AGENT_KINDS.filter((k) => agentEnabled(s, k));
+}
+
+/** 场景里按顺序第一个已启用后端的模型；没有则报错提示去配置。 */
+export function sceneModel(scene: SceneKey): ModelTarget {
+  const enabled = enabledAgentKinds();
+  const target = state.settings?.sceneModels?.[scene]?.find((t) => enabled.includes(t.agentKind));
+  if (target) return target;
+  const label = SCENES.find((item) => item.key === scene)?.label ?? scene;
+  throw new Error(`「${label}」场景没有可用模型，请在设置 → 场景模型中配置`);
 }
 
 /** 把 agentKind 收敛到「已启用」集合：已启用则原样返回，否则回退到第一个启用项 */
@@ -1572,6 +1582,7 @@ export function createThreadOptimistic(
   images: PromptImage[],
   ephemeral: boolean,
   clueCardId: string,
+  autoScene = "",
 ): void {
   const pendingId = PENDING_THREAD_PREFIX + crypto.randomUUID();
   setState("expanded", reconcile({}));
@@ -1612,6 +1623,7 @@ export function createThreadOptimistic(
         null,
         clueCardId || null,
         null,
+        autoScene || null,
       );
       createdId = t.id;
       rememberThreadSnapshot(t);
@@ -1885,9 +1897,8 @@ function parseStageInput(input: string): StageInput | null {
 async function startStageThread(
   sourceThreadId: string,
   prompt: string,
-  stageIndex: number,
 ): Promise<void> {
-  const thread = await api.createStageThread(sourceThreadId, stageIndex);
+  const thread = await api.createStageThread(sourceThreadId);
   const ownTitle = prompt.split(/\r?\n/, 1)[0].trim().slice(0, 40) || "Stage";
   await api.renameThread(thread.id, ownTitle);
   thread.title = ownTitle;
@@ -1962,7 +1973,7 @@ async function finalizeHardDesign(threadId: string): Promise<void> {
     // 单独插入一个只读流程图 Stage：设计会话保留设计原文，下一 Stage 复用
     // 工作流配置画布展示结构，再由后续 Stage 开始执行入口节点。
     const workflowJson = JSON.stringify(workflow);
-    const previewThread = await api.createStageThread(threadId, 1, true);
+    const previewThread = await api.createStageThread(threadId, true);
     const previewTitle = "[Hard] 工作流图";
     await api.renameThread(previewThread.id, previewTitle);
     previewThread.title = previewTitle;
@@ -1972,7 +1983,7 @@ async function finalizeHardDesign(threadId: string): Promise<void> {
     await openThread(previewThread.id);
 
     const entry = workflow.stages.find((stage) => stage.id === workflow.entry)!;
-    const execThread = await api.createStageThread(previewThread.id, 2, true);
+    const execThread = await api.createStageThread(previewThread.id, true);
     const execTitle = `[WF] ${entry.name}`;
     await api.renameThread(execThread.id, execTitle);
     execThread.title = execTitle;
@@ -2010,7 +2021,7 @@ async function tryBuiltinPrompt(
     if (images.length > 0) throw new Error("/stage 暂不支持附件");
     // 命令前有实质内容时，先作为普通提示追加到当前会话；Stage 随后独立启动。
     if (stage.currentPrompt) await deliverPrompt(threadId, stage.currentPrompt, []);
-    await startStageThread(threadId, stage.stagePrompt, stage.stageIndex);
+    await startStageThread(threadId, stage.stagePrompt);
     return true;
   }
   if (/^\/plan(?:\s|$)/i.test(builtInInput)) {
@@ -3182,6 +3193,10 @@ export async function initStore() {
             : suspendFireRelay(e.payload.threadId, manuallyInterrupted);
           void action.catch((error) => console.error("Fire relay failed", error));
         }
+        // 自动模式：本轮出错且无回复时，后端按场景列表切到下一个模型重发（非自动会话直接返回 false）。
+        if (e.payload.stopReason === "error") {
+          void api.autoFailover(threadId).catch((error) => console.error("Auto failover failed", error));
+        }
         // 通用工作流（/run）与 Fire 互斥：非 Fire 会话才会被其接管。
         handleWorkflowTurnEnd(e.payload.threadId, e.payload.stopReason);
         if (pendingHardDesign.has(threadId)) {
@@ -3220,11 +3235,9 @@ export async function initStore() {
         void (async () => {
           let target = threadId;
           if (target === null) {
-            // Butterfly has independent defaults; never substitute the last-used model/backend.
-            const kind = state.settings?.butterflyAgentKind ?? "lyra";
-            if (!enabledAgentKinds().includes(kind)) throw new Error("请先启用 Butterfly 配置的模型后端");
-            target = await createThread(await api.scratchDir(), kind,
-              state.settings?.butterflyModel?.trim() ?? "", "build", "");
+            // Butterfly 使用轻量化场景模型，不跟随最近使用的模型/后端。
+            const { agentKind, model } = sceneModel("lightweight");
+            target = await createThread(await api.scratchDir(), agentKind, model, "build", "");
           }
           await sendPromptTo(target, text, images);
         })().catch((error) => {

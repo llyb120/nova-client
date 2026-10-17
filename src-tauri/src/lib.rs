@@ -32,7 +32,7 @@ mod remote;
 mod sdk_adapters;
 mod sdk_runtime;
 mod server;
-mod settings;
+pub(crate) mod settings;
 mod signature;
 mod skills;
 mod sleep_inhibitor;
@@ -153,6 +153,30 @@ impl AppState {
         }
     }
 
+    /// 场景里按顺序可用的模型（跳过无效或已关闭的后端）；模型空串 = 后端默认模型。
+    pub fn scene_models(&self, scene: settings::Scene) -> Vec<(AgentKind, String)> {
+        let targets = self.settings.lock().unwrap().scene_models.get(scene).to_vec();
+        targets
+            .into_iter()
+            .filter_map(|t| AgentKind::from_str(t.agent_kind.trim()).map(|kind| (kind, t.model.trim().to_string())))
+            .filter(|(kind, _)| self.agent_enabled(kind))
+            .collect()
+    }
+
+    pub fn scene_model(&self, scene: settings::Scene) -> Result<(AgentKind, String), String> {
+        self.scene_models(scene).into_iter().next().ok_or_else(|| {
+            format!("「{}」场景没有可用模型，请在设置 → 场景模型中配置", scene.label())
+        })
+    }
+
+    /// 轻量化场景里第一个指定了模型的 Lyra 项（Lyra 进程内辅助调用只认 Lyra 模型）。
+    pub fn lyra_lightweight_model(&self) -> Option<String> {
+        self.scene_models(settings::Scene::Lightweight)
+            .into_iter()
+            .find(|(kind, model)| *kind == AgentKind::Lyra && !model.is_empty())
+            .map(|(_, model)| model)
+    }
+
     /// ACP 后端优先使用自身凭证生成标题。
     fn title_fallback_mgr(&self, origin: &AgentKind) -> Arc<AcpManager> {
         self.acp_for(origin).unwrap_or_else(|| self.acp.clone())
@@ -182,13 +206,10 @@ impl AppState {
         } else {
             fallback
         };
-        let (agent_raw, model) = {
-            let s = self.settings.lock().unwrap();
-            (
-                s.lightweight_model_agent.trim().to_string(),
-                s.lightweight_model.trim().to_string(),
-            )
-        };
+        let (agent_raw, model) = self
+            .scene_model(settings::Scene::Lightweight)
+            .map(|(kind, model)| (kind.as_str().to_string(), model))
+            .unwrap_or_default();
         if AgentKind::from_str(&agent_raw) == Some(AgentKind::Cursor)
             && self.agent_enabled(&AgentKind::Cursor)
         {
@@ -288,7 +309,182 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
     }
 }
 
-fn running_by_id(state: &AppState, thread_id: &str) -> bool {
+/// 供无 AppHandle 上下文的后台入口（如 nova-tools MCP 的场景转交）使用。
+pub(crate) static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// 自动模式会话的场景范围。
+#[derive(Debug, PartialEq)]
+pub(crate) struct AutoScope {
+    pub scene: settings::Scene,
+    /// 首选模型就是当前模型的场景（含本会话场景）：自己做，不切 Stage，相应工具也直接给。
+    pub covered: Vec<settings::Scene>,
+    /// 可转交的场景：首选模型与当前不同，且不在上游转交链上（防止来回推）。
+    pub handoff: Vec<settings::Scene>,
+    /// 是否为场景子会话（结论交回上游）。
+    pub child: bool,
+}
+
+impl AutoScope {
+    pub fn desktop(&self) -> bool {
+        self.covered.contains(&settings::Scene::Computer)
+    }
+}
+
+fn scope_of(
+    scene: settings::Scene,
+    current: &(AgentKind, String),
+    upstream: &[settings::Scene],
+    first: impl Fn(settings::Scene) -> Option<(AgentKind, String)>,
+) -> AutoScope {
+    let mut covered = vec![scene];
+    let mut handoff = Vec::new();
+    for other in settings::Scene::ALL.into_iter().filter(|s| *s != scene) {
+        match first(other) {
+            Some(target) if target == *current => covered.push(other),
+            Some(_) if !upstream.contains(&other) => handoff.push(other),
+            _ => {}
+        }
+    }
+    AutoScope { scene, covered, handoff, child: !upstream.is_empty() }
+}
+
+pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope> {
+    let (scene, current, upstream) = {
+        let store = state.store.lock().unwrap();
+        let thread = store.get(thread_id)?;
+        let scene = thread.auto_scene.as_deref().and_then(settings::Scene::parse)?;
+        let mut upstream = Vec::new();
+        let mut source = thread.stage_source_thread_id.clone();
+        while let Some(parent) = source.and_then(|id| store.get(&id)).filter(|_| upstream.len() < 8) {
+            let Some(parent_scene) = parent.auto_scene.as_deref().and_then(settings::Scene::parse) else { break };
+            upstream.push(parent_scene);
+            source = parent.stage_source_thread_id.clone();
+        }
+        (scene, (thread.agent_kind.clone(), thread.model.clone().unwrap_or_default()), upstream)
+    };
+    Some(scope_of(scene, &current, &upstream, |s| state.scene_model(s).ok()))
+}
+
+/// 自动模式会话首条消息的隐式说明：哪些场景可转交、主会话还附项目目录清单。无可转交场景时为 None。
+fn auto_mode_context(scope: &AutoScope, projects: &[String]) -> Option<String> {
+    if scope.handoff.is_empty() {
+        return None;
+    }
+    let scenes = scope
+        .handoff
+        .iter()
+        .map(|s| format!("{}（{}）", s.key(), s.when()))
+        .collect::<Vec<_>>()
+        .join("、");
+    let keys = scope.handoff.iter().map(|s| s.key()).collect::<Vec<_>>().join("|");
+    if scope.child {
+        return Some(format!(
+            "[Nova 自动模式] 你是「{}」场景会话，负责把交给你的整块工作做完并给出结论（结论会交回上游会话）。\
+             过程中遇到 {scenes} 的整块工作，用 spawn_agent(scene={keys}, task_name, message) 转交给该场景的模型独立完成，\
+             再用 wait_agent 取结果后继续；不要中途逐步指挥。",
+            scope.scene.label()
+        ));
+    }
+    let list = projects
+        .iter()
+        .filter(|p| Path::new(p).is_dir())
+        .map(|p| format!("- {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "[Nova 自动模式] 你是本会话的主 Agent，直接面向用户。能用自己工具完成的事直接做；\
+         {scenes} 的整块工作，用 spawn_agent(scene={keys}, cwd=<项目目录>, task_name, message) 交给对应场景的模型独立完成，\
+         再用 wait_agent 取结果，以你自己的口吻向用户汇报；不要中途逐步指挥，也不要向用户提及转交细节。\
+         message 要写清目标、约束和完成标准。任务涉及的项目从下列目录中选择作为 cwd（都不相符就省略 cwd）：\n{}",
+        if list.is_empty() { "（暂无项目）".into() } else { list }
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn auto_scope_skips_same_model_and_upstream_scenes() {
+    use settings::Scene::*;
+    let light = (AgentKind::Lyra, "light".to_string());
+    let code = (AgentKind::Codex, "code".to_string());
+    // 电脑操控与轻量化同模型：轻量主会话自己操作电脑，只转交编码。
+    let first = |s: settings::Scene| Some(if s == Coding { code.clone() } else { light.clone() });
+    let main = scope_of(Lightweight, &light, &[], first);
+    assert_eq!((main.covered.clone(), main.handoff.clone(), main.desktop()), (vec![Lightweight, Computer], vec![Coding], true));
+    // 编码子会话需要操作电脑：电脑操控模型不同且不在上游链上，可以转交；不能推回上游的轻量化。
+    let first = |s: settings::Scene| Some(match s { Coding => code.clone(), Computer => (AgentKind::Claude, "cu".into()), Lightweight => light.clone() });
+    let child = scope_of(Coding, &code, &[Lightweight], first);
+    assert_eq!((child.handoff.clone(), child.desktop(), child.child), (vec![Computer], false, true));
+    // 三个场景同模型：什么都不转交。
+    assert!(scope_of(Lightweight, &light, &[], |_| Some(light.clone())).handoff.is_empty());
+}
+
+/// 场景转交：在场景模型（可跨后端）上开一个引用父会话上下文的 Stage 会话。
+/// 目标场景的模型与父会话相同时返回 None，由父会话自己做；不能转交回上游链上的场景。
+pub(crate) fn create_scene_stage(
+    app: &tauri::AppHandle,
+    parent_id: &str,
+    scene: settings::Scene,
+    name: &str,
+    cwd_override: Option<&str>,
+    attempt: usize,
+) -> Result<Option<String>, String> {
+    if let Some(dir) = cwd_override.filter(|dir| !Path::new(dir).is_dir()) {
+        return Err(format!("目录不存在：{dir}"));
+    }
+    let state = app.state::<AppState>();
+    // attempt > 0 是失效切换，转交本身已校验过。
+    if attempt == 0 {
+        let scope = auto_scope(&state, parent_id).ok_or("只有自动模式会话可以按场景转交")?;
+        if scope.covered.contains(&scene) {
+            return Ok(None);
+        }
+        if !scope.handoff.contains(&scene) {
+            return Err(format!("「{}」是上游会话的场景，不能转回；请在本会话完成后把结论交回", scene.label()));
+        }
+    }
+    let (cwd, worktree) = {
+        let store = state.store.lock().unwrap();
+        let parent = store.get(parent_id).ok_or("父会话不存在")?;
+        // 指定项目目录时不沿用父会话的 worktree。
+        let worktree = if cwd_override.is_some() { None } else { parent.worktree.clone() };
+        (cwd_override.map_or_else(|| parent.cwd.clone(), str::to_string), worktree)
+    };
+    // attempt 为失效切换序号：按场景列表顺序取下一个可用模型。
+    let (scene_kind, scene_model) = match state.scene_models(scene).into_iter().nth(attempt) {
+        Some(target) => target,
+        None if attempt == 0 => state.scene_model(scene)?,
+        None => return Err(format!("「{}」场景的模型都已失效", scene.label())),
+    };
+    let mut thread = Thread::new(cwd, scene_kind, Some(scene_model).filter(|m| !m.is_empty()), Some("build".into()), None, false);
+    thread.worktree = worktree;
+    thread.parent_thread_id = Some(parent_id.into());
+    thread.stage_source_thread_id = Some(parent_id.into());
+    thread.auto_scene = Some(scene.key().into());
+    thread.title = format!("[{}] {name}", scene.label());
+    let id = thread.id.clone();
+    {
+        let mut store = state.store.lock().unwrap();
+        store.threads.push(thread);
+        store.save();
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+    Ok(Some(id))
+}
+
+/// 自动模式会话注入 nova-tools 的环境：线程 id、是否提供桌面/浏览器工具、是否可按场景转交。普通会话为空。
+pub(crate) fn auto_tool_env(state: &AppState, thread_id: &str) -> Vec<(&'static str, String)> {
+    let Some(scope) = auto_scope(state, thread_id) else { return Vec::new() };
+    let mut env = vec![
+        ("NOVA_THREAD_ID", thread_id.to_string()),
+        ("NOVA_DESKTOP", if scope.desktop() { "1" } else { "0" }.into()),
+    ];
+    if !scope.handoff.is_empty() {
+        env.push(("NOVA_SCENE_HANDOFF", "1".into()));
+    }
+    env
+}
+
+pub(crate) fn running_by_id(state: &AppState, thread_id: &str) -> bool {
     let store = state.store.lock().unwrap();
     let Some(thread) = store.get(thread_id) else {
         return false;
@@ -1657,6 +1853,7 @@ async fn create_thread(
     worktree_base: Option<String>,
     clue_card_id: Option<String>,
     parent_thread_id: Option<String>,
+    auto_scene: Option<String>,
 ) -> Result<Thread, String> {
     let dir = std::path::Path::new(&cwd);
     if !dir.is_dir() {
@@ -1678,6 +1875,7 @@ async fn create_thread(
         ephemeral.unwrap_or(false),
     );
     thread.parent_thread_id = parent_thread_id.filter(|id| !id.trim().is_empty());
+    thread.auto_scene = auto_scene.as_deref().and_then(settings::Scene::parse).map(|s| s.key().into());
     if let Some(card_id) = clue_card_id.filter(|value| !value.trim().is_empty()) {
         let snapshot = if state.relay.is_configured() {
             state.relay.clue_context(&card_id).await?
@@ -1860,7 +2058,6 @@ fn create_stage_thread(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     source_thread_id: String,
-    stage_index: usize,
     inherit_source_model: bool,
 ) -> Result<Thread, String> {
     let (cwd, source_id, source_agent_kind, source_model, source_worktree) = {
@@ -1877,22 +2074,9 @@ fn create_stage_thread(
     let (agent_kind, model) = if inherit_source_model {
         (source_agent_kind, source_model)
     } else {
-        let settings = state.settings.lock().unwrap();
-        let target = settings.stage_models.get(stage_index).ok_or_else(|| {
-            if settings.stage_models.is_empty() {
-                "尚未配置 Stage 模型，请先在设置中添加".to_string()
-            } else {
-                format!(
-                    "未配置 /stage{} 对应的模型，当前共有 {} 个 Stage 模型",
-                    stage_index + 1,
-                    settings.stage_models.len()
-                )
-            }
-        })?;
-        let kind = AgentKind::from_str(target.agent_kind.trim())
-            .ok_or_else(|| format!("Stage 模型后端无效：{}", target.agent_kind))?;
-        let model = (!target.model.trim().is_empty()).then(|| target.model.trim().to_string());
-        (kind, model)
+        // Stage 只用轻量化场景的模型。
+        let (kind, model) = state.scene_model(settings::Scene::Lightweight)?;
+        (kind, Some(model).filter(|m| !m.is_empty()))
     };
     if !state.agent_enabled(&agent_kind) {
         return Err(format!("Stage 模型后端 {} 已关闭", agent_kind.label()));
@@ -3786,6 +3970,9 @@ pub(crate) fn dispatch_prompt(
         return Ok(());
     }
     // Stage 引用不是一次性快照：每次投递都从源会话最新 items 重建。
+    // 自动模式会话的首条消息另注入场景转交说明（主会话附可选项目目录）。
+    let projects: Vec<String> = state.projects.lock().unwrap().projects.iter().take(50).cloned().collect();
+    let auto = auto_scope(&state, &thread_id);
     {
         let mut store = state.store.lock().unwrap();
         let source_id = store
@@ -3801,8 +3988,13 @@ pub(crate) fn dispatch_prompt(
         } else {
             None
         };
+        let first_message = store
+            .get(&thread_id)
+            .is_some_and(|t| !t.items.iter().any(|item| matches!(item, Item::User { .. })));
+        let auto_context = auto.as_ref().filter(|_| first_message).and_then(|scope| auto_mode_context(scope, &projects));
+        let context = [stage_context, auto_context].into_iter().flatten().reduce(|a, b| format!("{a}\n\n{b}"));
         if let Some(thread) = store.get_mut(&thread_id) {
-            thread.pending_stage_context = stage_context;
+            thread.pending_stage_context = context;
         }
     }
     // 漫游 guest：本机不执行，转发到对端 host
@@ -4538,6 +4730,90 @@ fn last_assistant_text(app: &tauri::AppHandle, thread_id: &str) -> Option<String
         })
 }
 
+/// 按顺序用临时辅助会话跑一次提示词，返回第一个非空回复；每次尝试后清理辅助会话。
+async fn auxiliary_complete(
+    app: &tauri::AppHandle,
+    cwd: &str,
+    title: &str,
+    attempts: Vec<(AgentKind, Option<String>)>,
+    seed: &str,
+) -> Option<String> {
+    let state = app.state::<AppState>();
+    for (agent_kind, model_opt) in attempts {
+        let mut thread = Thread::new(cwd.to_string(), agent_kind.clone(), model_opt, None, None, true);
+        thread.title = title.into();
+        let run_id = thread.id.clone();
+        {
+            let mut store = state.store.lock().unwrap();
+            store.threads.push(thread);
+            store.save();
+        }
+        let _ = app.emit(acp::EV_THREADS, json!({}));
+        run_auxiliary_prompt(&agent_kind, app, run_id.clone(), seed.to_string()).await;
+        let output = last_assistant_text(app, &run_id).filter(|text| !text.trim().is_empty());
+        {
+            let mut store = state.store.lock().unwrap();
+            store.threads.retain(|t| t.id != run_id);
+            store.save();
+        }
+        state.acp.forget_session_of_thread(&run_id);
+        state.kimi.forget_session_of_thread(&run_id);
+        state.codex.forget_session_of_thread(&run_id);
+        state.lyra.forget_session_of_thread(&run_id);
+        state.codexplus.forget_session_of_thread(&run_id);
+        state.codebuddy.forget_session_of_thread(&run_id);
+        state.workbuddy.forget_session_of_thread(&run_id);
+        state.cursorplus.forget_session_of_thread(&run_id);
+        let _ = app.emit(acp::EV_THREADS, json!({}));
+        if output.is_some() {
+            return output;
+        }
+    }
+    None
+}
+
+/// 自动模式主会话的失效切换：本轮出错且没有任何回复时，按场景列表切到下一个模型并重发该提示词。
+/// 返回是否已切换。场景子会话的失效切换在 lyra::session::scene_loop 里处理。
+#[tauri::command]
+fn auto_failover(app: tauri::AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<bool, String> {
+    if running_by_id(&state, &thread_id) {
+        return Ok(false);
+    }
+    let (scene, current, mode, effort, text, images) = {
+        let store = state.store.lock().unwrap();
+        let thread = store.get(&thread_id).ok_or("线程不存在")?;
+        let Some(scene) = thread.auto_scene.as_deref().and_then(settings::Scene::parse) else { return Ok(false) };
+        if thread.stage_source_thread_id.is_some() {
+            return Ok(false);
+        }
+        let Some(last_user) = thread.items.iter().rposition(|item| matches!(item, Item::User { .. })) else { return Ok(false) };
+        if thread.items[last_user..].iter().any(|item| matches!(item, Item::Assistant { text, .. } if !text.trim().is_empty())) {
+            return Ok(false);
+        }
+        let Item::User { text, images, .. } = &thread.items[last_user] else { return Ok(false) };
+        let current = (thread.agent_kind.clone(), thread.model.clone().unwrap_or_default());
+        (scene, current, thread.mode.clone(), thread.reasoning_effort.clone(), text.clone(), images.clone())
+    };
+    let targets = state.scene_models(scene);
+    let next = match targets.iter().position(|target| *target == current) {
+        Some(index) => targets.get(index + 1),
+        None => targets.first(),
+    };
+    let Some((kind, model)) = next.cloned() else { return Ok(false) };
+    set_thread_agent(app.clone(), app.state(), thread_id.clone(), kind.clone(), Some(model.clone()), mode, effort)?;
+    {
+        let mut store = state.store.lock().unwrap();
+        if let Some(thread) = store.get_mut(&thread_id) {
+            let label = if model.is_empty() { format!("{} 默认模型", kind.label()) } else { format!("{} · {model}", kind.label()) };
+            thread.push_system(format!("「{}」场景模型失效，已切换到 {label} 重试。", scene.label()), "info");
+            store.save_thread(&thread_id);
+        }
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+    dispatch_prompt(&app, thread_id, text, images)?;
+    Ok(true)
+}
+
 /// 优先用轻量级模型总结会话核心内容，失败时回退到原会话模型。
 #[tauri::command]
 async fn summarize_clue(
@@ -4560,16 +4836,13 @@ async fn summarize_clue(
         return Err("会话还没有内容可总结".into());
     }
 
-    let (lightweight_agent, lightweight_model) = {
-        let s = state.settings.lock().unwrap();
-        (
-            AgentKind::from_str(&s.lightweight_model_agent).unwrap_or(AgentKind::Lyra),
-            (!s.lightweight_model.trim().is_empty())
-                .then(|| s.lightweight_model.trim().to_string()),
-        )
-    };
-    let mut attempts = vec![(lightweight_agent, lightweight_model)];
-    if attempts[0].0 != origin_agent || attempts[0].1 != origin_model {
+    // 轻量化场景按顺序尝试，最后回退到原会话模型。
+    let mut attempts: Vec<(AgentKind, Option<String>)> = state
+        .scene_models(settings::Scene::Lightweight)
+        .into_iter()
+        .map(|(kind, model)| (kind, Some(model).filter(|m| !m.is_empty())))
+        .collect();
+    if !attempts.contains(&(origin_agent.clone(), origin_model.clone())) {
         attempts.push((origin_agent, origin_model));
     }
 
@@ -4590,41 +4863,7 @@ async fn summarize_clue(
          ----\n会话记录：\n\n{transcript}"
     );
 
-    let mut raw = None;
-    for (agent_kind, model_opt) in attempts {
-        let mut thread = Thread::new(cwd.clone(), agent_kind.clone(), model_opt, None, None, true);
-        thread.title = "线索 AI 总结".into();
-        let run_id = thread.id.clone();
-        {
-            let mut store = state.store.lock().unwrap();
-            store.threads.push(thread);
-            store.save();
-        }
-        let _ = app.emit(acp::EV_THREADS, json!({}));
-        run_auxiliary_prompt(&agent_kind, &app, run_id.clone(), seed.clone()).await;
-        let output = last_assistant_text(&app, &run_id).filter(|text| !text.trim().is_empty());
-
-        // 每次尝试后都清理辅助会话；轻量模型失败时再用原会话模型重试。
-        {
-            let mut store = state.store.lock().unwrap();
-            store.threads.retain(|t| t.id != run_id);
-            store.save();
-        }
-        state.acp.forget_session_of_thread(&run_id);
-        state.kimi.forget_session_of_thread(&run_id);
-        state.codex.forget_session_of_thread(&run_id);
-        state.lyra.forget_session_of_thread(&run_id);
-        state.codexplus.forget_session_of_thread(&run_id);
-        state.codebuddy.forget_session_of_thread(&run_id);
-        state.workbuddy.forget_session_of_thread(&run_id);
-        state.cursorplus.forget_session_of_thread(&run_id);
-        let _ = app.emit(acp::EV_THREADS, json!({}));
-        if output.is_some() {
-            raw = output;
-            break;
-        }
-    }
-
+    let raw = auxiliary_complete(&app, &cwd, "线索 AI 总结", attempts, &seed).await;
     let raw = raw.ok_or_else(|| "总结失败：轻量模型和原模型均没有返回内容".to_string())?;
     Ok(parse_clue_ai_summary(&raw, &fallback_title))
 }
@@ -4705,20 +4944,9 @@ async fn judge_workflow_route(
     if options.is_empty() {
         return Ok(String::new());
     }
-    let model = {
-        let s = state.settings.lock().unwrap();
-        let lightweight = s.lightweight_model.trim().to_string();
-        let lightweight_agent = s.lightweight_model_agent.trim();
-        if (lightweight_agent.is_empty() || lightweight_agent == "lyra") && !lightweight.is_empty()
-        {
-            lightweight
-        } else {
-            String::new()
-        }
+    let Some(model) = state.lyra_lightweight_model() else {
+        return Err("轻量化场景未配置 Lyra 模型，无法使用提示词判断连线".into());
     };
-    if model.is_empty() {
-        return Err("未配置轻量级模型，无法使用提示词判断连线".into());
-    }
     let list = options
         .iter()
         .enumerate()
@@ -5525,6 +5753,7 @@ pub fn run() {
             // server 侧远程会话：空闲只做命令长轮询；运行中按全量 + 增量同步。
             remote::start(app.handle().clone());
             employee::start(app.handle().clone());
+            let _ = APP_HANDLE.set(app.handle().clone());
             // `Nova server config/project ...` 由独立管理进程写盘；运行实例监听提交标记，
             // 无需重启即可同步设置、环境变量与项目白名单。
             start_headless_config_watcher(app.handle().clone());
@@ -5732,6 +5961,7 @@ pub fn run() {
             share_thread,
             advanced_share,
             summarize_clue,
+            auto_failover,
             generate_thread_title,
             judge_workflow_route,
             accept_share,

@@ -1,7 +1,8 @@
 //! 数字员工：`~/.nova/employee.json` 保存各职责的下次检查时间，按需调度 +
 //! 每次新开隐藏会话 + 检测到用户操作即让出。员工数据只经 `employee` 工具或本模块命令修改。
 
-use crate::threads::{now_ms, AgentKind, Item, Thread};
+use crate::settings::Scene;
+use crate::threads::{now_ms, Item, Thread};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -17,7 +18,6 @@ const MAX_DUTIES: usize = 50;
 const MAX_TEXT_CHARS: usize = 500;
 const MAX_NOTE_BYTES: usize = 1024;
 const MAX_INBOX: usize = 100;
-const MAX_POOL: usize = 10;
 const MAX_RUNS: usize = 200;
 const MAX_EVERY_MINUTES: u64 = 7 * 24 * 60;
 
@@ -28,10 +28,6 @@ pub struct Employee {
     pub work_start: String,
     pub work_end: String,
     pub idle_minutes: u32,
-    pub agent_kind: String,
-    pub model: String,
-    /// 模型池：上面的 agent_kind/model 是默认（心跳）模型，这里是按条件选用的其它模型。
-    pub pool: Vec<PoolModel>,
     pub duties: Vec<Duty>,
     /// 待办（confirm=false）与待确认（confirm=true），处理完即删。
     pub inbox: Vec<Todo>,
@@ -47,26 +43,12 @@ impl Default for Employee {
             work_start: "09:00".into(),
             work_end: "18:00".into(),
             idle_minutes: 10,
-            agent_kind: String::new(),
-            model: String::new(),
-            pool: Vec::new(),
             duties: Vec::new(),
             inbox: Vec::new(),
             runs: Vec::new(),
             next_id: 1,
         }
     }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct PoolModel {
-    /// 唯一名字，待办/职责的 profile 引用它。
-    pub name: String,
-    /// 用户写的适用条件，原样给员工模型参考，例如“需要写代码、改仓库时”。
-    pub when: String,
-    pub agent_kind: String,
-    pub model: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -185,21 +167,6 @@ impl Employee {
         for text in self.duties.iter().map(|d| &d.text).chain(self.inbox.iter().map(|t| &t.text)) {
             if text.trim().is_empty() || text.chars().count() > MAX_TEXT_CHARS {
                 return Err(format!("内容不能为空且每条不超过 {MAX_TEXT_CHARS} 字"));
-            }
-        }
-        if self.pool.len() > MAX_POOL {
-            return Err(format!("模型池最多 {MAX_POOL} 个"));
-        }
-        self.pool.iter_mut().for_each(|m| m.name = m.name.trim().into());
-        for (i, m) in self.pool.iter().enumerate() {
-            if m.name.is_empty() || m.name.chars().count() > 40 || m.when.chars().count() > MAX_TEXT_CHARS {
-                return Err(format!("模型池名字不能为空，且不超过 40 字；适用条件不超过 {MAX_TEXT_CHARS} 字"));
-            }
-            if AgentKind::from_str(&m.agent_kind).is_none() {
-                return Err(format!("模型池「{}」还没有选择模型", m.name));
-            }
-            if self.pool[..i].iter().any(|p| p.name == m.name) {
-                return Err(format!("模型池名字重复：{}", m.name));
             }
         }
         if self.duties.iter().any(|d| d.note.len() > MAX_NOTE_BYTES) {
@@ -428,23 +395,19 @@ const RULES: &str = "你是 Nova 数字员工，正在无人值守地执行一�
 - 用户随时可能接管电脑；被停止后不要重试。\n\n";
 
 /// 新开一个员工专属会话（不进普通会话列表）并投递提示词。
-/// `profile` 为模型池名字；空或已被删除时回落到默认模型。
+/// `profile` 为场景名；空或无效时用轻量化场景。
 fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool, duty: Option<&Duty>, profile: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let employee = load()?;
-    let picked = employee.pool.iter().find(|m| m.name == profile);
-    let (kind_name, model) = picked.map_or((&employee.agent_kind, &employee.model), |m| (&m.agent_kind, &m.model));
-    let kind = AgentKind::from_str(kind_name).unwrap_or(AgentKind::Lyra);
-    // 与本会话同一模型的条目不列出：开新会话只是多一跳，直接在当前会话做。
-    let others = employee.pool.iter().filter(|m| (&m.agent_kind, &m.model) != (kind_name, model)).collect::<Vec<_>>();
-    let pool_hint = if others.is_empty() { String::new() } else {
-        let list = others.iter().map(|m| format!("- {}：{}", m.name, m.when)).collect::<Vec<_>>().join("\n");
-        format!("你有一个模型池，当事项符合某个适用条件时，不要自己做，也不要记待办，用 employee action=stage profile=<名字> text=<要它做什么> 直接开新会话交给对应模型（新会话能看到本会话上下文），然后结束本次任务：\n{list}\n\n")
+    let picked = Scene::parse(profile);
+    let (kind, model) = state.scene_model(picked.unwrap_or(Scene::Lightweight))?;
+    // 与本会话同一模型的场景不列出：开新会话只是多一跳，直接在当前会话做。
+    let others = Scene::ALL.into_iter()
+        .filter(|scene| state.scene_model(*scene).is_ok_and(|target| target != (kind.clone(), model.clone())))
+        .map(|scene| format!("- {}：{}", scene.label(), scene.when()))
+        .collect::<Vec<_>>();
+    let prompt = if picked.is_some() || others.is_empty() { prompt.to_string() } else {
+        format!("当事项符合下面某个场景时，不要自己做，也不要记待办，用 employee action=stage profile=<场景名> text=<要它做什么> 直接开新会话交给该场景的模型（新会话能看到本会话上下文），然后结束本次任务：\n{}\n\n{prompt}", others.join("\n"))
     };
-    let prompt = if picked.is_some() { prompt.to_string() } else { format!("{pool_hint}{prompt}") };
-    if !state.agent_enabled(&kind) {
-        return Err(format!("{} 后端已关闭，请在员工页重新选择模型", kind.label()));
-    }
     let cwd = crate::lyra::config::nova_root().join("employee");
     std::fs::create_dir_all(&cwd).map_err(|e| format!("创建员工工作目录失败：{e}"))?;
     let thread_id = {
@@ -479,7 +442,7 @@ fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool,
     };
     let _ = app.emit(crate::acp::EV_THREADS, json!({}));
     let dispatched = update(|e| {
-        let run_id = if employee.inbox.iter().any(|t| t.id == duty_id) { "inbox" } else { duty_id };
+        let run_id = if e.inbox.iter().any(|t| t.id == duty_id) { "inbox" } else { duty_id };
         e.runs.push(Run { at: now_ms(), duty_id: run_id.into(), result: "运行中".into(), thread_id: thread_id.clone() });
         let over = e.runs.len().saturating_sub(MAX_RUNS);
         Ok(e.runs.drain(..over).map(|r| r.thread_id).collect::<Vec<_>>())
@@ -592,13 +555,13 @@ pub(crate) fn tool_definition() -> Value {
     serde_json::from_str(include_str!("../../scripts/employee-tool.json")).unwrap()
 }
 
-/// 工具写入的 profile 必须是模型池里现有的名字（空串表示默认模型）。
-fn check_profile(e: &Employee, args: &Value) -> Result<String, String> {
+/// 工具写入的 profile 必须是场景名（空串表示轻量化场景）。
+fn check_profile(args: &Value) -> Result<String, String> {
     let profile = args["profile"].as_str().map(str::trim).unwrap_or_default();
-    if profile.is_empty() || e.pool.iter().any(|m| m.name == profile) {
-        return Ok(profile.into());
-    }
-    Err(format!("模型池里没有「{profile}」，可用：{}", e.pool.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join("、")))
+    if profile.is_empty() { return Ok(String::new()); }
+    Scene::parse(profile).map(|scene| scene.label().into()).ok_or_else(|| {
+        format!("没有「{profile}」场景，可用：{}", Scene::ALL.map(Scene::label).join("、"))
+    })
 }
 
 pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
@@ -609,11 +572,11 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
         "list" => {
             let e = load()?;
             let recent = &e.runs[e.runs.len().saturating_sub(10)..];
-            Ok(json!({"duties": e.duties, "inbox": e.inbox, "recentRuns": recent, "modelPool": e.pool}))
+            Ok(json!({"duties": e.duties, "inbox": e.inbox, "recentRuns": recent, "scenes": Scene::ALL.map(|s| json!({"name": s.label(), "when": s.when()}))}))
         }
         "add" => update(|e| {
             let text = text()?;
-            let profile = check_profile(e, args)?;
+            let profile = check_profile(args)?;
             match args["kind"].as_str() {
                 Some("duty") => {
                     let id = e.new_id("d");
@@ -632,7 +595,7 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
         }),
         "update" => update(|e| {
             let id = id()?;
-            check_profile(e, args)?;
+            check_profile(args)?;
             let duty = e.duties.iter_mut().find(|d| d.id == id).ok_or("没有这条职责")?;
             if args.get("nextCheckInMinutes").is_some() && runtime(|rt| rt.current.as_ref()
                 .and_then(|c| c.duty.as_ref()).is_some_and(|old|
@@ -674,27 +637,22 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
 fn stage(args: &Value, text: String) -> Result<Value, String> {
     let app = APP.get().ok_or("员工未启动")?;
     let state = app.state::<AppState>();
-    let employee = load()?;
-    let profile = check_profile(&employee, args)?;
-    let target = employee.pool.iter().find(|m| m.name == profile).ok_or("stage 需要 profile=模型池里的名字")?;
-    let kind = AgentKind::from_str(&target.agent_kind).unwrap_or(AgentKind::Lyra);
-    if !state.agent_enabled(&kind) {
-        return Err(format!("{} 后端已关闭", kind.label()));
-    }
+    let scene = Scene::parse(&check_profile(args)?).ok_or("stage 需要 profile=场景名")?;
+    let (kind, model) = state.scene_model(scene)?;
     let (parent_id, thread_id) = {
         let mut guard = RUNTIME.lock().unwrap();
         let current = guard.as_mut().and_then(|rt| rt.current.as_mut()).ok_or("只能在员工执行任务时使用 stage")?;
         let mut store = state.store.lock().unwrap();
         let source = store.get(&current.thread_id).ok_or("当前员工会话不存在")?;
-        if source.agent_kind == kind && source.model.as_deref().unwrap_or_default() == target.model {
+        if source.agent_kind == kind && source.model.as_deref().unwrap_or_default() == model {
             return Ok(json!({"ok": false, "next": "该模型与当前会话相同，不要开新会话，直接在本会话完成。"}));
         }
-        let mut thread = Thread::new(source.cwd.clone(), kind, Some(target.model.clone()).filter(|m| !m.is_empty()),
+        let mut thread = Thread::new(source.cwd.clone(), kind, Some(model.clone()).filter(|m| !m.is_empty()),
             Some("build".into()), None, false);
         thread.employee_thread = true;
         thread.parent_thread_id = Some(source.id.clone());
         thread.stage_source_thread_id = Some(source.id.clone());
-        thread.title = format!("{} · {}", source.title, target.name);
+        thread.title = format!("{} · {}", source.title, scene.label());
         let ids = (source.id.clone(), thread.id.clone());
         store.threads.push(thread);
         store.save();
@@ -751,11 +709,6 @@ pub fn employee_set(patch: Value) -> Result<(), String> {
         if let Some(v) = patch["workStart"].as_str() { e.work_start = v.trim().into(); }
         if let Some(v) = patch["workEnd"].as_str() { e.work_end = v.trim().into(); }
         if let Some(v) = patch["idleMinutes"].as_u64() { e.idle_minutes = v.clamp(1, 24 * 60) as u32; }
-        if let Some(v) = patch["agentKind"].as_str() { e.agent_kind = v.into(); }
-        if let Some(v) = patch["model"].as_str() { e.model = v.into(); }
-        if !patch["pool"].is_null() {
-            e.pool = serde_json::from_value(patch["pool"].clone()).map_err(|e| format!("模型池格式错误：{e}"))?;
-        }
         Ok(())
     })?;
     runtime(|rt| rt.yielded = false);

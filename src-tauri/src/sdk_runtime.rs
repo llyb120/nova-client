@@ -351,11 +351,7 @@ impl SdkManager {
         }
         parts.extend(prompt_parts(self.adapter.as_ref(), &text, &images));
         let lightweight_model = if self.adapter.agent_kind() == AgentKind::Lyra {
-            let app_state = self.app.state::<AppState>();
-            let settings = app_state.settings.lock().unwrap();
-            (AgentKind::from_str(&settings.lightweight_model_agent) == Some(AgentKind::Lyra))
-                .then(|| settings.lightweight_model.trim().to_string())
-                .filter(|model| !model.is_empty())
+            self.app.state::<AppState>().lyra_lightweight_model()
         } else {
             None
         };
@@ -369,6 +365,10 @@ impl SdkManager {
             "mode": mode,
             "reasoningEffort": reasoning_effort,
             "lightweightModel": lightweight_model,
+            "novaToolEnv": crate::auto_tool_env(&self.app.state::<AppState>(), &thread_id)
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), Value::String(value)))
+                .collect::<serde_json::Map<_, _>>(),
             "parts": parts
         });
         let mut outcome = self

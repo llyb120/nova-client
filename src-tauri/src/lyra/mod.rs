@@ -21,7 +21,7 @@ pub(crate) mod prompt;
 pub(crate) mod provider;
 mod read;
 mod rollout;
-mod session;
+pub(crate) mod session;
 mod stage;
 mod tools;
 mod turn;

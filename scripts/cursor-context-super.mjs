@@ -662,7 +662,7 @@ async function recoverTimedOutAgent(
     model: modelSelection(request.model),
     local: {
       cwd: request.cwd,
-      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan", toolEnv: request.novaToolEnv }),
     },
   };
   // Slim-memory mode prefers a fresh agent so poisoned checkpoints are never resumed.
@@ -740,7 +740,7 @@ async function sendPromptWithRecovery(
     model: modelSelection(request.model),
     local: {
       cwd: request.cwd,
-      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan" }),
+      customTools: createCursorFilesystemTools(request.cwd, { readOnly: request.mode === "plan", toolEnv: request.novaToolEnv }),
     },
   });
   emitTiming("agent_resume", resumeStartedAt);
@@ -765,7 +765,7 @@ function agentCreateOptions(request) {
     local: {
       cwd: request?.cwd,
       // Vega-style batch FS tools; inlined via SDK (unlike hooks, which are file-only).
-      customTools: createCursorFilesystemTools(request?.cwd, { readOnly }),
+      customTools: createCursorFilesystemTools(request?.cwd, { readOnly, toolEnv: request?.novaToolEnv }),
     },
   };
 }

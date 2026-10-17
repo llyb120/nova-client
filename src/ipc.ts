@@ -124,6 +124,7 @@ export const api = {
     worktreeBase: string | null = null,
     clueCardId: string | null = null,
     parentThreadId: string | null = null,
+    autoScene: string | null = null,
   ) =>
     invoke<Thread>("create_thread", {
       cwd,
@@ -137,9 +138,11 @@ export const api = {
       worktreeBase,
       clueCardId,
       parentThreadId,
+      autoScene,
     }),
-  createStageThread: (sourceThreadId: string, stageIndex = 0, inheritSourceModel = false) =>
-    invoke<Thread>("create_stage_thread", { sourceThreadId, stageIndex, inheritSourceModel }),
+  autoFailover: (threadId: string) => invoke<boolean>("auto_failover", { threadId }),
+  createStageThread: (sourceThreadId: string, inheritSourceModel = false) =>
+    invoke<Thread>("create_stage_thread", { sourceThreadId, inheritSourceModel }),
   listClueGroups: (space: "personal" | "team" = "personal") =>
     invoke<ClueNodeGroup[]>("list_clue_groups", { space }),
   getClueContext: (cardId: string) =>

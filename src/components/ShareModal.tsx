@@ -1,7 +1,7 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { api } from "../ipc";
-import { enabledAgentKinds, openThread, refreshThreads, state } from "../store";
+import { enabledAgentKinds, openThread, refreshThreads, sceneModel, state } from "../store";
 import type { AgentKind, Peer } from "../types";
 import { ClueCaptureModal } from "./ClueCaptureModal";
 import { ModelPicker } from "./ConfigSelects";
@@ -19,11 +19,10 @@ export function ShareModal(props: {
   const [mode, setMode] = createSignal<Mode>(props.initialMode ?? "clue");
   const [target, setTarget] = createSignal<string>("");
   const [prompt, setPrompt] = createSignal("总结这段会话的要点");
-  // 高级分享仍可临时选择处理模型，默认使用统一的轻量级模型。
-  const [agent, setAgent] = createSignal<AgentKind>(
-    (state.settings?.lightweightModelAgent as AgentKind) || "lyra",
-  );
-  const [model, setModel] = createSignal(state.settings?.lightweightModel || "");
+  // 高级分享仍可临时选择处理模型，默认使用轻量化场景的第一个可用模型。
+  const lightweight = (() => { try { return sceneModel("lightweight"); } catch { return null; } })();
+  const [agent, setAgent] = createSignal<AgentKind>(lightweight?.agentKind ?? "lyra");
+  const [model, setModel] = createSignal(lightweight?.model ?? "");
   const [busy, setBusy] = createSignal(false);
   const [done, setDone] = createSignal<string | null>(null);
 

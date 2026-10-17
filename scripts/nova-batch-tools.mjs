@@ -3,6 +3,7 @@ import webviewTool from "./webview-tool.json" with { type: "json" };
 import chromeTool from "./chrome-tool.json" with { type: "json" };
 import jianlaiTool from "./jianlai-tool.json" with { type: "json" };
 import employeeTool from "./employee-tool.json" with { type: "json" };
+import agentTools from "./agent-tools.json" with { type: "json" };
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { POLARIS_DESCRIPTION } from "./ctx-core.mjs";
@@ -43,28 +44,42 @@ export function normalizePolarisArgs(params = {}) {
 /**
  * Shared Nova context tools for Cursor customTools and Devin ACP MCP.
  * @param {string} cwd
- * @param {{ readOnly?: boolean, fastContext?: boolean }} [options]
+ * @param {{ readOnly?: boolean, fastContext?: boolean, toolEnv?: Record<string, string> }} [options]
  */
 export function createNovaBatchTools(cwd, options = {}) {
   const owner = randomUUID();
   const fastContext = fastContextEnabled(options);
   const readOnly = readOnlyEnabled(options);
   let root = resolve(cwd);
+  // 自动模式（Nova 按会话注入）：当前模型不是电脑操控场景的模型时不暴露桌面/浏览器工具；
+  // 存在模型不同的场景时可按场景转交。
+  const env = (name) => String(options.toolEnv?.[name] ?? process.env[name] ?? "");
+  const threadId = env("NOVA_THREAD_ID");
+  const desktop = env("NOVA_DESKTOP") !== "0";
 
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
   const tools = {};
   if (!readOnly && globalContextServiceConfigured()) {
-    tools.webview = { ...webviewTool,
-      execute: async params => JSON.stringify(await callGlobalContextTool("webview", root, params)),
-    };
-    tools.jianlai = { ...jianlaiTool,
-      execute: async params => JSON.stringify(await callGlobalContextTool("jianlai", root, params, owner)),
-    };
+    if (desktop) {
+      tools.webview = { ...webviewTool,
+        execute: async params => JSON.stringify(await callGlobalContextTool("webview", root, params)),
+      };
+      tools.jianlai = { ...jianlaiTool,
+        execute: async params => JSON.stringify(await callGlobalContextTool("jianlai", root, params, owner)),
+      };
+      tools.chrome = { ...chromeTool,
+        execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params, owner)),
+      };
+    }
+    if (threadId && env("NOVA_SCENE_HANDOFF") === "1") {
+      for (const { name, description, inputSchema } of agentTools) {
+        tools[name] = { description, inputSchema,
+          execute: async args => JSON.stringify(await callGlobalContextTool("agent", root, { threadId, name, args })),
+        };
+      }
+    }
     tools.employee = { ...employeeTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("employee", root, params)),
-    };
-    tools.chrome = { ...chromeTool,
-      execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params, owner)),
     };
     for (const definition of imageTools) {
       tools[definition.name] = { ...definition,

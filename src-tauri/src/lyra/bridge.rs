@@ -331,6 +331,12 @@ async fn handle_prompt(
     let agent_instructions = load_agent_instructions(roots);
     let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
     let auto_change_project = settings.auto_change_project_enabled;
+    // 自动模式：当前模型不是电脑操控场景的模型时不给桌面/浏览器工具，转交给电脑操控场景闭环。
+    let auto = app.as_ref().zip(request.get("novaThreadId").and_then(Value::as_str)).and_then(|(app, id)| {
+        use tauri::Manager;
+        crate::auto_scope(&app.state::<crate::AppState>(), id)
+    });
+    let desktop = auto.as_ref().is_none_or(crate::AutoScope::desktop);
     let shell = (!read_only).then(prompt::detect_shell);
     let prompt_options = SystemPromptOptions {
         cwd: cwd_path.display().to_string(),
@@ -341,11 +347,15 @@ async fn handle_prompt(
         skills_text: format_skills_prompt(&skills),
         custom_instructions: agent_instructions,
         ponytail: settings.ponytail_enabled,
+        desktop,
     };
     let system_prompt = build_system_prompt(&prompt_options);
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
-    tools.extend(session::agent_tools());
+    if !desktop {
+        tools.retain(|tool| !matches!(tool.name, "jianlai" | "chrome" | "webview"));
+    }
+    tools.extend(session::agent_tools(auto.map(|scope| scope.handoff).filter(|handoff| !handoff.is_empty())));
     let tool_shape = serde_json::to_string(
         &tools
             .iter()

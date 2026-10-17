@@ -146,6 +146,12 @@ fn dispatch(
     if request.method == "jianlai" {
         return tauri::async_runtime::block_on(crate::jianlai::execute(root, &params, &request.owner));
     }
+    if request.method == "agent" {
+        let app = crate::APP_HANDLE.get().ok_or("Nova 尚未就绪")?;
+        let thread_id = params["threadId"].as_str().filter(|id| !id.is_empty()).ok_or("缺少 threadId")?;
+        let name = params["name"].as_str().unwrap_or_default();
+        return tauri::async_runtime::block_on(crate::lyra::session::call_for_thread(app, thread_id, name, &params["args"]));
+    }
     if request.method == "employee" {
         return crate::employee::execute_tool(&params);
     }

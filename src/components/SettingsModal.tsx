@@ -45,6 +45,7 @@ import type {
   SkillInfo,
   WorktreeRecord,
 } from "../types";
+import { SCENES, scenesReady, type SceneKey, type SceneModels } from "../types";
 
 function threadGroupName(cwd: string): string {
   if (isScratch(cwd)) return "临时会话";
@@ -209,8 +210,9 @@ function CliManager(props: {
   );
 }
 
-type SettingsTab =
+export type SettingsTab =
   | "general"
+  | "scenes"
   | "meteor"
   | "advanced"
   | "lyra"
@@ -225,6 +227,7 @@ type SettingsTab =
 
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
+  { id: "scenes", name: "场景模型" },
   { id: "meteor", name: "Meteor" },
   { id: "advanced", name: "高级" },
   { id: "lyra", name: "Lyra" },
@@ -238,9 +241,9 @@ const TABS: { id: SettingsTab; name: string }[] = [
   { id: "about", name: "关于" },
 ];
 
-export function SettingsModal(props: { onClose: () => void }) {
+export function SettingsModal(props: { onClose: () => void; initialTab?: SettingsTab; required?: boolean }) {
   const s = state.settings;
-  const [tab, setTab] = createSignal<SettingsTab>("general");
+  const [tab, setTab] = createSignal<SettingsTab>(props.initialTab ?? "general");
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
   const [claudePath, setClaudePath] = createSignal(s?.claudePath ?? "claude-agent-acp");
@@ -262,8 +265,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [taskbarStatusEnabled, setTaskbarStatusEnabled] = createSignal(
     s?.taskbarStatusEnabled ?? false,
   );
-  const [butterflyAgentKind, setButterflyAgentKind] = createSignal<AgentKind>(s?.butterflyAgentKind ?? "lyra");
-  const [butterflyModel, setButterflyModel] = createSignal(s?.butterflyModel ?? "");
   const [powershellUtf8Enabled, setPowershellUtf8Enabled] = createSignal(
     s?.powershellUtf8Enabled ?? true,
   );
@@ -294,10 +295,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   );
   const [meteorEnabled, setMeteorEnabled] = createSignal(s?.meteorEnabled ?? true);
   const [meteorShortcut, setMeteorShortcut] = createSignal(s?.meteorShortcut ?? "Alt+Alt");
-  const [meteorAgentKind, setMeteorAgentKind] = createSignal<AgentKind>(
-    s?.meteorAgentKind && ALL_AGENT_KINDS.includes(s.meteorAgentKind) ? s.meteorAgentKind : "lyra",
-  );
-  const [meteorModel, setMeteorModel] = createSignal(s?.meteorModel ?? "");
   const [meteorClipboard, setMeteorClipboard] = createSignal(s?.meteorClipboard ?? false);
   const [meteorPasteShortcut, setMeteorPasteShortcut] = createSignal(s?.meteorPasteShortcut ?? "Alt+V");
   const [jianpuShortcut, setJianpuShortcut] = createSignal(s?.jianpuShortcut ?? "Alt+R");
@@ -315,15 +312,9 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [workbuddyEnabled, setWorkbuddyEnabled] = createSignal(s?.workbuddyEnabled === true);
   const [cursorEnabled, setCursorEnabled] = createSignal(s?.cursorEnabled !== false);
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
-  const [lightweightAgent, setLightweightAgent] = createSignal<AgentKind>(
-    (s?.lightweightModelAgent as AgentKind) || "lyra",
+  const [sceneModels, setSceneModels] = createSignal<SceneModels>(
+    Object.fromEntries(SCENES.map(({ key }) => [key, (s?.sceneModels?.[key] ?? []).map((t) => ({ ...t }))])) as SceneModels,
   );
-  const [lightweightModel, setLightweightModel] = createSignal(s?.lightweightModel ?? "");
-  const [stageModels, setStageModels] = createSignal<Settings["stageModels"]>(
-    (s?.stageModels ?? []).map((target) => ({ ...target })),
-  );
-  const [draftStageKind, setDraftStageKind] = createSignal<AgentKind | null>(null);
-  const [draftStageModel, setDraftStageModel] = createSignal("");
   const [editor, setEditor] = createSignal(s?.editor ?? "code");
   const [sessionAutoCleanupEnabled, setSessionAutoCleanupEnabled] = createSignal(
     s?.sessionAutoCleanupEnabled ?? false,
@@ -428,34 +419,23 @@ export function SettingsModal(props: { onClose: () => void }) {
       cursorEnabled(),
     ].filter(Boolean).length;
 
-  const titleAgentKinds = createMemo(() =>
-    enabledAgentKinds().filter((kind) => kind === "devin" || kind === "codex"),
-  );
-  const meteorAgentKinds = createMemo(() => ALL_AGENT_KINDS.filter((kind) => ({
+  const sceneAgentKinds = createMemo(() => ALL_AGENT_KINDS.filter((kind) => ({
     lyra: lyraEnabled(), devin: devinEnabled(), claude: claudeEnabled(), kimi: kimiEnabled(),
     codex: codexEnabled(), codebuddy: codebuddyEnabled(), workbuddy: workbuddyEnabled(), cursor: cursorEnabled(),
   })[kind]));
 
-  const stageRowKinds = (kind: AgentKind): AgentKind[] => {
-    const enabled = enabledAgentKinds();
-    return enabled.includes(kind) ? enabled : [...enabled, kind];
-  };
-  const addStageModel = (agentKind: AgentKind, model: string) => {
-    if (!model) return;
-    setStageModels((current) => [...current, { agentKind, model }]);
-    setDraftStageKind(agentKind);
-    setDraftStageModel("");
-  };
-  const replaceStageModel = (index: number, agentKind: AgentKind, model: string) => {
-    setStageModels((current) =>
-      current.map((target, targetIndex) =>
-        targetIndex === index ? { agentKind, model } : target,
-      ),
-    );
-  };
-  const removeStageModelAt = (index: number) => {
-    setStageModels((current) => current.filter((_, targetIndex) => targetIndex !== index));
-  };
+  const sceneRowKinds = (kind: AgentKind): AgentKind[] =>
+    sceneAgentKinds().includes(kind) ? sceneAgentKinds() : [...sceneAgentKinds(), kind];
+  const editScene = (key: SceneKey, edit: (list: SceneModels[SceneKey]) => SceneModels[SceneKey]) =>
+    setSceneModels((current) => ({ ...current, [key]: edit(current[key]) }));
+  const moveSceneModel = (key: SceneKey, index: number, delta: number) =>
+    editScene(key, (list) => {
+      const next = [...list];
+      const target = index + delta;
+      if (target < 0 || target >= next.length) return list;
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
   const updateCursorModelContext = (index: number, patch: { prefix?: string; contextWindow?: number }) => {
     setCursorModelContexts((current) => current.map((rule, ruleIndex) =>
       ruleIndex === index ? { ...rule, ...patch } : rule));
@@ -672,8 +652,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     lyraProxy: lyraProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
     taskbarStatusEnabled: taskbarStatusEnabled(),
-    butterflyAgentKind: butterflyAgentKind(),
-    butterflyModel: butterflyModel().trim(),
     powershellUtf8Enabled: powershellUtf8Enabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
     ponytailEnabled: ponytailEnabled(),
@@ -691,11 +669,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       .filter((rule) => rule.prefix.length > 0),
     cursorContextMode: cursorContextMode(),
     defaultMode: "build",
-    lightweightModelAgent: lightweightAgent(),
-    lightweightModel: lightweightModel().trim(),
-    stageModels: stageModels()
-      .map((target) => ({ agentKind: target.agentKind, model: target.model.trim() }))
-      .filter((target) => target.model.length > 0),
+    sceneModels: sceneModels(),
     editor: editor().trim() || "code",
     terminalShell: terminalShell().trim(),
     terminalArgs: terminalArgs().split(/\r?\n/).filter(arg => arg.length > 0),
@@ -708,8 +682,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     sessionShortcuts: draftSessionShortcuts(),
     meteorEnabled: meteorEnabled(),
     meteorShortcut: meteorShortcut().trim(),
-    meteorAgentKind: meteorAgentKind(),
-    meteorModel: meteorModel().trim(),
     meteorClipboard: meteorClipboard(),
     meteorPasteShortcut: meteorPasteShortcut().trim(),
     jianpuShortcut: jianpuShortcut().trim(),
@@ -982,6 +954,11 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   let saveLyraConfig: (() => Promise<void>) | undefined;
   const save = async () => {
+    if (!scenesReady(sceneModels())) {
+      setTab("scenes");
+      await message("请为每个场景至少配置一个模型后再保存。", { title: "场景模型未配置", kind: "error" });
+      return;
+    }
     const draftedShortcuts = draftSessionShortcuts();
     const jianpuKeys = jianpuShortcut().trim().toLowerCase();
     if (jianpuKeys && [meteorEnabled() ? meteorShortcut() : "", meteorEnabled() ? meteorPasteShortcut() : "", ...withDefaultSessionShortcuts(draftedShortcuts).map((item) => item.keys)]
@@ -998,9 +975,7 @@ export function SettingsModal(props: { onClose: () => void }) {
         : sessionKeys.includes(keys)
           ? "Meteor 快捷键与会话快捷键冲突，请修改后再保存。"
           : pasteKeys && (pasteKeys === keys || sessionKeys.includes(pasteKeys))
-            ? "星移快捷键与 Meteor 或会话快捷键冲突，请修改后再保存。"
-          : !meteorAgentKinds().includes(meteorAgentKind())
-            ? "Meteor 所选模型后端已关闭，请重新选择或关闭 Meteor。" : "";
+            ? "星移快捷键与 Meteor 或会话快捷键冲突，请修改后再保存。" : "";
       if (error) {
         setTab("meteor");
         await message(error, { title: "保存设置失败", kind: "error" });
@@ -1089,10 +1064,12 @@ export function SettingsModal(props: { onClose: () => void }) {
     <div class="modal-backdrop">
       <div class="modal settings-modal">
         <div class="modal-head">
-          <span>设置</span>
-          <button class="icon-btn" onClick={props.onClose}>
-            <IconX size={16} />
-          </button>
+          <span>{props.required ? "请先配置场景模型" : "设置"}</span>
+          <Show when={!props.required}>
+            <button class="icon-btn" onClick={props.onClose}>
+              <IconX size={16} />
+            </button>
+          </Show>
         </div>
 
         <div class="settings-tabs">
@@ -1151,20 +1128,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <span class="field-hint">目前支持 Windows。按一次开始录制你的桌面操作（暖金边框 + 带录制圆点的箭头指针），再按一次停止；也可在 Butterfly 悬停面板里开始/停止。注册为全局快捷键后，其他程序自己的同名快捷键（如 Word 的 Alt+R）会被占用。录制的打字内容按原文保存在本机。</span>
               </div>
               <div class="field">
-                <span class="field-label">执行后端 / 模型</span>
-                <ModelPicker
-                  agentKind={meteorAgentKind()}
-                  agentKinds={meteorAgentKinds()}
-                  model={meteorModel()}
-                  allowDefault
-                  defaultLabel={`${agentLabel(meteorAgentKind())} 默认模型`}
-                  onPickModel={(kind, model) => { setMeteorAgentKind(kind); setMeteorModel(model); }}
-                  title="Meteor 执行模型"
-                  portal
-                />
-                <span class="field-hint">空值使用所选后端的默认模型；仅可选择已启用的本机后端。</span>
-              </div>
-              <div class="field">
                 <span class="field-label">最近剪贴板</span>
                 <label class="backend-switch">
                   <input type="checkbox" checked={meteorClipboard()} onChange={(e) => setMeteorClipboard(e.currentTarget.checked)} />
@@ -1181,7 +1144,73 @@ export function SettingsModal(props: { onClose: () => void }) {
                 catch (error) { await message(String(error), { title: "Meteor", kind: "error" }); }
                 finally { setTryingMeteor(false); }
               }}>{tryingMeteor() ? "正在打开标注层…" : "试用已保存配置"}</button>
-              <span class="field-hint">更改快捷键或模型后，请先保存设置再试用。</span>
+              <span class="field-hint">更改快捷键后，请先保存设置再试用；执行模型使用「场景模型 → 轻量化」。</span>
+            </section>
+          </Show>
+          <Show when={tab() === "scenes"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">场景模型</h3>
+              <p class="settings-group-desc">
+                每个场景按顺序使用第一个可用的模型，失效时自动切换到下一个。自动模式会话以轻量化模型开局，由它把整块编码或电脑操控工作转交给对应场景；轻量化场景还用于标题、摘要、上下文压缩、/stage、Butterfly、Meteor 和数字员工。每个场景至少配置一个模型。
+              </p>
+              <For each={SCENES}>
+                {(scene) => (
+                  <div class="field">
+                    <span class="field-label">{scene.label}</span>
+                    <span class="field-hint">{scene.hint}</span>
+                    <div class="share-list">
+                      <Index each={sceneModels()[scene.key]}>
+                        {(target, index) => (
+                          <div class="share-row stage-model-row">
+                            <span style={{ width: "28px", "flex-shrink": 0 }}>{index + 1}</span>
+                            <ModelPicker
+                              agentKind={target().agentKind}
+                              agentKinds={sceneRowKinds(target().agentKind)}
+                              model={target().model}
+                              allowDefault
+                              defaultLabel={`${agentLabel(target().agentKind)} 默认模型`}
+                              onPickModel={(agentKind, model) =>
+                                editScene(scene.key, (list) => list.map((t, i) => (i === index ? { agentKind, model } : t)))
+                              }
+                              title={`${scene.label}模型 ${index + 1}`}
+                              portal
+                            />
+                            <button type="button" class="icon-btn" title="上移" aria-label="上移" disabled={index === 0}
+                              onClick={() => moveSceneModel(scene.key, index, -1)}>↑</button>
+                            <button type="button" class="icon-btn share-row-remove" title="移除该模型" aria-label="移除该模型"
+                              onClick={() => editScene(scene.key, (list) => list.filter((_, i) => i !== index))}>
+                              <IconX size={14} />
+                            </button>
+                          </div>
+                        )}
+                      </Index>
+                      <Show when={sceneModels()[scene.key].length === 0}>
+                        <div class="share-empty">尚未配置，至少需要一个模型。</div>
+                      </Show>
+                      <Show when={sceneAgentKinds().length > 0}>
+                        <div class="share-row share-row-add stage-model-row">
+                          <span style={{ width: "28px", "flex-shrink": 0 }}>{sceneModels()[scene.key].length + 1}</span>
+                          <ModelPicker
+                            agentKind={sceneAgentKinds()[0]}
+                            agentKinds={sceneAgentKinds()}
+                            model=""
+                            allowDefault
+                            defaultLabel="选择并添加模型"
+                            onPickModel={(agentKind, model) => {
+                              if (model) editScene(scene.key, (list) => [...list, { agentKind, model }]);
+                            }}
+                            title={`添加${scene.label}模型`}
+                            portal
+                          />
+                          <span class="share-row-plus" title="选择模型后自动加入列表">
+                            <IconPlus size={13} />
+                          </span>
+                        </div>
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </For>
             </section>
           </Show>
           {/* ===== 通用 ===== */}
@@ -1427,87 +1456,6 @@ export function SettingsModal(props: { onClose: () => void }) {
             </section>
 
             <section class="settings-group">
-              <h3 class="settings-group-title">轻量级模型</h3>
-              <p class="settings-group-desc">
-                用于标题生成、快速总结、摘要和上下文压缩等辅助任务；调用失败时自动回退到任务原模型。
-              </p>
-              <div class="field">
-                <span class="field-label">Stage 模型</span>
-                <span class="field-hint">
-                  按顺序配置 /stage、/stage2、/stage3… 使用的模型；/stage 等同于 /stage1。命令会引用当前会话并直接开启对应模型的新会话。
-                </span>
-                <div class="share-list">
-                  <Index each={stageModels()}>
-                    {(target, index) => (
-                      <div class="share-row stage-model-row" title={`/stage${index + 1}`}>
-                        <span style={{ width: "64px", "flex-shrink": 0 }}>
-                          {index === 0 ? "/stage" : `/stage${index + 1}`}
-                        </span>
-                        <ModelPicker
-                          agentKind={target().agentKind}
-                          agentKinds={stageRowKinds(target().agentKind)}
-                          model={target().model}
-                          onPickModel={(agentKind, model) =>
-                            replaceStageModel(index, agentKind, model)
-                          }
-                          title={`Stage ${index + 1} 模型`}
-                          portal
-                        />
-                        <button
-                          type="button"
-                          class="icon-btn share-row-remove"
-                          title="移除该模型"
-                          aria-label="移除该 Stage 模型"
-                          onClick={() => removeStageModelAt(index)}
-                        >
-                          <IconX size={14} />
-                        </button>
-                      </div>
-                    )}
-                  </Index>
-                  <Show when={stageModels().length === 0}>
-                    <div class="share-empty">尚未配置 Stage 模型，/stage 将提示先完成配置。</div>
-                  </Show>
-                  <Show when={enabledAgentKinds().length > 0}>
-                    <div class="share-row share-row-add stage-model-row">
-                      <span style={{ width: "64px", "flex-shrink": 0 }}>
-                        /stage{stageModels().length + 1}
-                      </span>
-                      <ModelPicker
-                        agentKind={draftStageKind() ?? (enabledAgentKinds()[0] ?? "lyra")}
-                        agentKinds={enabledAgentKinds()}
-                        model={draftStageModel()}
-                        allowDefault
-                        defaultLabel="选择并添加模型"
-                        onPickModel={(agentKind, model) => addStageModel(agentKind, model)}
-                        title="添加 Stage 模型"
-                        portal
-                      />
-                      <span class="share-row-plus" title="选择模型后自动加入列表">
-                        <IconPlus size={13} />
-                      </span>
-                    </div>
-                  </Show>
-                </div>
-              </div>
-              <div class="field">
-                <span class="field-label">轻量级模型</span>
-                <ModelPicker
-                  agentKind={lightweightAgent()}
-                  agentKinds={titleAgentKinds()}
-                  model={lightweightModel()}
-                  onPickModel={(a, m) => {
-                    setLightweightAgent(a);
-                    setLightweightModel(m);
-                  }}
-                  prefix="轻量模型"
-                  title="轻量级模型"
-                  portal
-                />
-              </div>
-            </section>
-
-            <section class="settings-group">
               <h3 class="settings-group-title">环境变量</h3>
               <div class="field">
                 <span class="field-label">刷新 Windows 环境变量</span>
@@ -1668,20 +1616,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <span class="field-hint">
                   开启后常驻 Windows 任务栏空闲区域：运行中蝴蝶振翅并显示当前动作与耗时，待确认时提醒，任务结束后显示结果摘要。单击 Butterfly 弹出/收起气泡（空闲时可在临时目录发起新会话，待确认事项可直接选择，也可快速回复；发送后自动收起），双击打开 Nova 对应会话。默认关闭；保存后即时生效。
                 </span>
-              </div>
-              <div class="field">
-                <span class="field-label">Butterfly 新会话模型</span>
-                <ModelPicker
-                  agentKind={butterflyAgentKind()}
-                  agentKinds={meteorAgentKinds()}
-                  model={butterflyModel()}
-                  allowDefault
-                  defaultLabel={`${agentLabel(butterflyAgentKind())} 默认模型`}
-                  onPickModel={(kind, model) => { setButterflyAgentKind(kind); setButterflyModel(model); }}
-                  title="Butterfly 新会话模型"
-                  portal
-                />
-                <span class="field-hint">空闲气泡发起的新会话使用此模型；空值使用所选后端默认模型，不跟随最近使用的模型。回复已有会话时沿用该会话模型。</span>
               </div>
               <div class="field">
                 <span class="field-label">Windows shell 启动 shim</span>

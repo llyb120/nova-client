@@ -9,6 +9,7 @@ use crate::lyra::tools::{Tool, ToolOutcome};
 use crate::lyra::turn::{run_turn, text_outcome, BoxFuture, Session};
 use crate::lyra::bridge::{turn_event_sink, Emit};
 use crate::lyra::stage::Stage;
+use crate::settings::Scene;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +26,8 @@ struct Child {
     steer: Arc<Mutex<VecDeque<Value>>>,
     cancelled: Arc<AtomicBool>,
     stage: Option<Stage>,
+    /// 场景转交子任务所在的 Nova 会话（失效切换后会换成新会话）；进程内子 agent 为 None。
+    scene_thread: Mutex<Option<String>>,
 }
 
 impl Child {
@@ -34,6 +37,15 @@ impl Child {
 
     fn active(&self) -> bool {
         matches!(self.status().0.as_str(), "pending_init" | "running")
+    }
+
+    fn row(&self, path: &str) -> Value {
+        let (status, message) = self.status();
+        let mut row = json!({ "path": path, "status": status, "message": message });
+        if let Some(thread) = self.scene_thread.lock().unwrap().clone() {
+            row["threadId"] = thread.into();
+        }
+        row
     }
 }
 
@@ -77,7 +89,20 @@ pub fn is_agent_tool(name: &str) -> bool {
     AGENT_TOOLS.contains(&name)
 }
 
-pub fn agent_tools() -> Vec<Tool> {
+/// 自动模式会话可按场景转交：spawn_agent 增加 scene 参数，只列出模型不同且不在上游链上的场景。
+fn scene_param(handoff: &[Scene]) -> (String, Value) {
+    let scenes = handoff.iter().map(|s| format!("{}={}（{}）", s.key(), s.label(), s.when())).collect::<Vec<_>>().join("；");
+    (
+        " Auto mode: when a whole chunk of work fits one of the scene options, pass scene to hand it off to that scene's model in its own Stage session (it sees this conversation and closes the loop itself); then wait_agent for the final result instead of directing it step by step.".into(),
+        json!({ "type": "string", "enum": handoff.iter().map(|s| s.key()).collect::<Vec<_>>(), "description": format!("optional handoff scene: {scenes}. Omit for an in-process helper on this model.") }),
+    )
+}
+
+fn cwd_param() -> Value {
+    json!({ "type": "string", "description": "with scene: absolute project directory for the handoff session; default is this session's directory" })
+}
+
+pub fn agent_tools(handoff: Option<Vec<Scene>>) -> Vec<Tool> {
     let target = json!({ "type": "string", "description": "agent path from spawn_agent/list_agents, or its task_name" });
     let target_and_message = json!({
         "type": "object",
@@ -85,20 +110,27 @@ pub fn agent_tools() -> Vec<Tool> {
         "required": ["target", "message"]
     });
     let target_only = json!({ "type": "object", "properties": { "target": target }, "required": ["target"] });
+    let mut spawn = Tool {
+        name: "spawn_agent",
+        description: format!("Start a sub-agent on a self-contained task; it runs in the background with your tools and working directory. Use for independent work that can proceed in parallel, then wait_agent for results. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task_name": { "type": "string", "pattern": "^[a-z0-9_]+$", "description": "short unique name, lowercase letters, digits, underscores" },
+                "message": { "type": "string", "description": "the full task; the agent sees only this plus any forked history" },
+                "fork_turns": { "type": "string", "description": "history to give the agent: \"none\" (default), \"all\", or a number of recent user turns" }
+            },
+            "required": ["task_name", "message"]
+        }),
+    };
+    if let Some(handoff) = handoff {
+        let (hint, param) = scene_param(&handoff);
+        spawn.description.push_str(&hint);
+        spawn.parameters["properties"]["scene"] = param;
+        spawn.parameters["properties"]["cwd"] = cwd_param();
+    }
     vec![
-        Tool {
-            name: "spawn_agent",
-            description: format!("Start a sub-agent on a self-contained task; it runs in the background with your tools and working directory. Use for independent work that can proceed in parallel, then wait_agent for results. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "task_name": { "type": "string", "pattern": "^[a-z0-9_]+$", "description": "short unique name, lowercase letters, digits, underscores" },
-                    "message": { "type": "string", "description": "the full task; the agent sees only this plus any forked history" },
-                    "fork_turns": { "type": "string", "description": "history to give the agent: \"none\" (default), \"all\", or a number of recent user turns" }
-                },
-                "required": ["task_name", "message"]
-            }),
-        },
+        spawn,
         Tool {
             name: "send_message",
             description: "Queue a message for an agent without starting a new task; a running agent sees it before its next model request.".into(),
@@ -158,10 +190,7 @@ impl AgentHandle {
         let mut rows: Vec<Value> = agents
             .iter()
             .filter(|(path, _)| prefix.is_none_or(|p| path.starts_with(p)))
-            .map(|(path, child)| {
-                let (status, message) = child.status();
-                json!({ "path": path, "status": status, "message": message })
-            })
+            .map(|(path, child)| child.row(path))
             .collect();
         rows.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
         Value::Array(rows)
@@ -170,47 +199,16 @@ impl AgentHandle {
 
 pub async fn call(handle: &AgentHandle, parent: &Session, name: &str, args: &Value) -> ToolOutcome {
     let result = match name {
+        "spawn_agent" if args.get("scene").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) => {
+            match &handle.stage_parent {
+                Some((app, parent_id)) => scene_spawn(handle, app, parent_id, args),
+                None => Err("scene handoff requires a Nova session".into()),
+            }
+        }
         "spawn_agent" => spawn(handle, parent, args),
         "list_agents" => Ok(handle.report(args.get("path_prefix").and_then(Value::as_str))),
-        "wait_agent" => wait(handle, parent, args).await,
-        _ => {
-            let target = args.get("target").and_then(Value::as_str).unwrap_or_default();
-            let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
-            handle.resolve(target).and_then(|(path, child)| {
-                match name {
-                    "send_message" => {
-                        if let Some(stage) = &child.stage {
-                            stage.note(format!("补充消息（已排队，下次模型请求前交付）：\n{message}"));
-                        }
-                        child.steer.lock().unwrap().push_back(user_message(message, &[]));
-                    }
-                    "followup_task" => {
-                        let sent = child.tasks.lock().unwrap().as_ref().map(|tx| tx.send(user_message(message, &[])));
-                        if !matches!(sent, Some(Ok(()))) {
-                            return Err(format!("{path} is shut down"));
-                        }
-                        if let Some(stage) = &child.stage {
-                            stage.note(format!("主会话已提交后续任务：\n{message}"));
-                        }
-                    }
-                    "interrupt_agent" => {
-                        child.cancelled.store(true, Ordering::SeqCst);
-                        if let Some(stage) = &child.stage {
-                            stage.note("主会话已请求中断。".into());
-                        }
-                    }
-                    _ => {
-                        if let Some(stage) = &child.stage {
-                            stage.note("主会话已请求关闭。".into());
-                        }
-                        child.cancelled.store(true, Ordering::SeqCst);
-                        child.tasks.lock().unwrap().take();
-                        handle.registry.agents.lock().unwrap().remove(&path);
-                    }
-                }
-                Ok(json!({ "path": path, "status": child.status().0 }))
-            })
-        }
+        "wait_agent" => wait(handle, Some(&parent.cancelled), args, 600_000).await,
+        _ => control(handle, name, args),
     };
     match result {
         Ok(value) => text_outcome(value.to_string(), false),
@@ -218,20 +216,195 @@ pub async fn call(handle: &AgentHandle, parent: &Session, name: &str, args: &Val
     }
 }
 
-fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, String> {
+/// nova-tools MCP 入口：非 Lyra 后端的自动模式会话只能按场景转交（子任务在场景模型的 Stage 会话里闭环）。
+pub async fn call_for_thread(app: &tauri::AppHandle, thread_id: &str, name: &str, args: &Value) -> Result<Value, String> {
+    let handle = root_handle(&format!("thread:{thread_id}"));
+    match name {
+        "spawn_agent" => scene_spawn(&handle, app, thread_id, args),
+        "list_agents" => Ok(handle.report(args.get("path_prefix").and_then(Value::as_str))),
+        // MCP 客户端单次调用约 120s 超时，等待上限留足余量。
+        "wait_agent" => wait(&handle, None, args, 90_000).await,
+        _ if is_agent_tool(name) => control(&handle, name, args),
+        _ => Err(format!("unknown agent tool: {name}")),
+    }
+}
+
+fn control(handle: &AgentHandle, name: &str, args: &Value) -> Result<Value, String> {
+    let target = args.get("target").and_then(Value::as_str).unwrap_or_default();
+    let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
+    handle.resolve(target).and_then(|(path, child)| {
+        match name {
+            "send_message" if child.scene_thread.lock().unwrap().is_some() => {
+                return Err("场景子任务独立闭环，不接收中途插话；需要追加工作请用 followup_task".into());
+            }
+            "send_message" => {
+                if let Some(stage) = &child.stage {
+                    stage.note(format!("补充消息（已排队，下次模型请求前交付）：\n{message}"));
+                }
+                child.steer.lock().unwrap().push_back(user_message(message, &[]));
+            }
+            "followup_task" => {
+                let sent = child.tasks.lock().unwrap().as_ref().map(|tx| tx.send(user_message(message, &[])));
+                if !matches!(sent, Some(Ok(()))) {
+                    return Err(format!("{path} is shut down"));
+                }
+                if let Some(stage) = &child.stage {
+                    stage.note(format!("主会话已提交后续任务：\n{message}"));
+                }
+            }
+            "interrupt_agent" => {
+                child.cancelled.store(true, Ordering::SeqCst);
+                if let Some(stage) = &child.stage {
+                    stage.note("主会话已请求中断。".into());
+                }
+            }
+            _ => {
+                if let Some(stage) = &child.stage {
+                    stage.note("主会话已请求关闭。".into());
+                }
+                child.cancelled.store(true, Ordering::SeqCst);
+                child.tasks.lock().unwrap().take();
+                handle.registry.agents.lock().unwrap().remove(&path);
+            }
+        }
+        Ok(json!({ "path": path, "status": child.status().0 }))
+    })
+}
+
+type Agents<'a> = std::sync::MutexGuard<'a, HashMap<String, Arc<Child>>>;
+
+/// 校验 task_name 并占住注册表槽位：返回 (task_name, message, path, 已加锁的注册表)。
+fn reserve<'a>(handle: &'a AgentHandle, args: &'a Value) -> Result<(&'a str, &'a str, String, Agents<'a>), String> {
     let task_name = args.get("task_name").and_then(Value::as_str).unwrap_or_default();
     if task_name.is_empty() || !task_name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
         return Err("task_name must be lowercase letters, digits and underscores".into());
     }
     let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
     let path = format!("{ROOT}/{task_name}");
-    let mut agents = handle.registry.agents.lock().unwrap();
+    let agents = handle.registry.agents.lock().unwrap();
     if agents.get(&path).is_some_and(|c| c.status().0 != "shutdown") {
         return Err(format!("{path} already exists; use followup_task or pick another task_name"));
     }
     if agents.values().filter(|c| c.active()).count() >= MAX_ACTIVE {
         return Err(format!("{MAX_ACTIVE} agents are already running; wait_agent or close_agent first"));
     }
+    Ok((task_name, message, path, agents))
+}
+
+fn new_child(message: &str, stage: Option<Stage>, scene_thread: Option<String>) -> Result<(Arc<Child>, tokio::sync::mpsc::UnboundedReceiver<Value>), String> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tx.send(user_message(message, &[])).map_err(|e| e.to_string())?;
+    let child = Arc::new(Child {
+        status: Mutex::new(("pending_init".into(), None)),
+        tasks: Mutex::new(Some(tx)),
+        steer: Arc::new(Mutex::new(VecDeque::new())),
+        cancelled: Arc::new(AtomicBool::new(false)),
+        stage,
+        scene_thread: Mutex::new(scene_thread),
+    });
+    Ok((child, rx))
+}
+
+/// 场景转交：子任务在场景模型（可跨后端）的 Stage 会话里独立闭环，主 agent 只等最终结果。
+fn scene_spawn(handle: &AgentHandle, app: &tauri::AppHandle, parent_id: &str, args: &Value) -> Result<Value, String> {
+    let scene = args
+        .get("scene")
+        .and_then(Value::as_str)
+        .and_then(Scene::parse)
+        .ok_or("scene must be lightweight, coding or computer")?;
+    let cwd = args.get("cwd").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
+    let (task_name, message, path, mut agents) = reserve(handle, args)?;
+    let Some(thread_id) = crate::create_scene_stage(app, parent_id, scene, task_name, cwd.as_deref(), 0)? else {
+        return Ok(json!({ "ok": false, "next": "该场景的模型与当前会话相同，不要转交，直接在本会话完成。" }));
+    };
+    let (child, rx) = new_child(message, None, Some(thread_id.clone()))?;
+    agents.insert(path.clone(), child.clone());
+    drop(agents);
+    tauri::async_runtime::spawn(scene_loop(
+        child,
+        app.clone(),
+        parent_id.to_string(),
+        scene,
+        task_name.to_string(),
+        cwd,
+        rx,
+        handle.registry.clone(),
+    ));
+    Ok(json!({ "path": path, "status": "pending_init", "threadId": thread_id }))
+}
+
+async fn scene_loop(
+    child: Arc<Child>,
+    app: tauri::AppHandle,
+    parent_id: String,
+    scene: Scene,
+    name: String,
+    cwd: Option<String>,
+    mut tasks: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    registry: Arc<Registry>,
+) {
+    while let Some(task) = tasks.recv().await {
+        child.cancelled.store(false, Ordering::SeqCst);
+        *child.status.lock().unwrap() = ("running".into(), None);
+        let text = text_content(&task["content"]);
+        let mut attempt = 0;
+        let status = loop {
+            let thread_id = child.scene_thread.lock().unwrap().clone().unwrap_or_default();
+            let result = run_scene_turn(&app, &thread_id, &text, &child.cancelled).await;
+            if child.cancelled.load(Ordering::SeqCst) {
+                break ("interrupted", result.ok().flatten());
+            }
+            let error = match result {
+                Ok(Some(reply)) => break ("completed", Some(reply)),
+                Ok(None) => "场景模型没有返回内容".to_string(),
+                Err(error) => error,
+            };
+            // 没有任何输出：视为该模型失效，按场景列表顺序换下一个模型在新 Stage 会话重做。
+            attempt += 1;
+            match crate::create_scene_stage(&app, &parent_id, scene, &name, cwd.as_deref(), attempt) {
+                Ok(Some(next)) => *child.scene_thread.lock().unwrap() = Some(next),
+                _ => break ("errored", Some(error)),
+            }
+        };
+        *child.status.lock().unwrap() = (status.0.into(), status.1);
+        registry.changed.notify_waiters();
+    }
+    *child.status.lock().unwrap() = ("shutdown".into(), None);
+    registry.changed.notify_waiters();
+}
+
+/// 投递到场景会话并等它跑完，返回本轮新增的最后一条助手回复。
+async fn run_scene_turn(app: &tauri::AppHandle, thread_id: &str, text: &str, cancelled: &AtomicBool) -> Result<Option<String>, String> {
+    use tauri::Manager;
+    let state = app.state::<crate::AppState>();
+    let before = state.store.lock().unwrap().get(thread_id).map_or(0, |t| t.items.len());
+    crate::dispatch_prompt(app, thread_id.to_string(), text.to_string(), Vec::new())?;
+    let started = Instant::now();
+    let mut seen_running = false;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if cancelled.load(Ordering::SeqCst) {
+            let _ = crate::cancel_turn(app.clone(), app.state(), thread_id.to_string(), None, None).await;
+            break;
+        }
+        let running = crate::running_by_id(&state, thread_id);
+        seen_running |= running;
+        // dispatch 异步起跑：给 30s 宽限再判定“没跑起来”。
+        if !running && (seen_running || started.elapsed() > Duration::from_secs(30)) {
+            break;
+        }
+    }
+    let store = state.store.lock().unwrap();
+    Ok(store.get(thread_id).and_then(|thread| {
+        thread.items.iter().skip(before).rev().find_map(|item| match item {
+            crate::threads::Item::Assistant { text, .. } if !text.trim().is_empty() => Some(text.trim().to_string()),
+            _ => None,
+        })
+    }))
+}
+
+fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, String> {
+    let (task_name, message, path, mut agents) = reserve(handle, args)?;
 
     // 从主 agent 的模型可见视图分叉（已折叠的部分以摘要形式带入）。
     let view = parent.context.view(parent.history.items());
@@ -255,17 +428,10 @@ fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, 
     let mut history = History::new(forked, None);
     history.close_pending_calls("（已分叉给子 agent，结果交由主 agent）");
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tx.send(user_message(message, &[])).map_err(|e| e.to_string())?;
-    let child = Arc::new(Child {
-        status: Mutex::new(("pending_init".into(), None)),
-        tasks: Mutex::new(Some(tx)),
-        steer: Arc::new(Mutex::new(VecDeque::new())),
-        cancelled: Arc::new(AtomicBool::new(false)),
-        stage: handle.stage_parent.as_ref().and_then(|(app, parent_id)| {
-            Stage::new(app, parent_id, task_name, parent.cwd.to_string_lossy().into_owned(), parent.model.model.id.clone())
-        }),
+    let stage = handle.stage_parent.as_ref().and_then(|(app, parent_id)| {
+        Stage::new(app, parent_id, task_name, parent.cwd.to_string_lossy().into_owned(), parent.model.model.id.clone())
     });
+    let (child, rx) = new_child(message, stage, None)?;
     let session = Session {
         http: parent.http.clone(),
         model: parent.model.clone(),
@@ -339,7 +505,7 @@ fn child_loop(
     })
 }
 
-async fn wait(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, String> {
+async fn wait(handle: &AgentHandle, cancelled: Option<&AtomicBool>, args: &Value, max_ms: u64) -> Result<Value, String> {
     let targets: Vec<(String, Arc<Child>)> = match args.get("targets").and_then(Value::as_array) {
         Some(list) if !list.is_empty() => list
             .iter()
@@ -357,25 +523,19 @@ async fn wait(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Va
     if targets.is_empty() {
         return Err("no agents to wait for".into());
     }
-    let timeout = Duration::from_millis(args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(30_000).clamp(1_000, 600_000));
+    let timeout = Duration::from_millis(args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(30_000).clamp(1_000, max_ms));
     let deadline = Instant::now() + timeout;
     // 通知可能在检查与等待之间错过，因此同时按 250ms 轮询（也用于响应主 agent 的取消）。
     while targets.iter().all(|(_, child)| child.active())
         && Instant::now() < deadline
-        && !parent.cancelled.load(Ordering::SeqCst)
+        && !cancelled.is_some_and(|c| c.load(Ordering::SeqCst))
     {
         tokio::select! {
             _ = handle.registry.changed.notified() => {}
             _ = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
     }
-    let rows: Vec<Value> = targets
-        .iter()
-        .map(|(path, child)| {
-            let (status, message) = child.status();
-            json!({ "path": path, "status": status, "message": message })
-        })
-        .collect();
+    let rows: Vec<Value> = targets.iter().map(|(path, child)| child.row(path)).collect();
     let timed_out = targets.iter().all(|(_, child)| child.active());
     Ok(json!({ "agents": rows, "timedOut": timed_out }))
 }

@@ -2,19 +2,16 @@ import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { enabledAgentKinds, lastUsed, openThread, showToast } from "../store";
-import type { AgentKind } from "../types";
-import { ModelPicker } from "./ConfigSelects";
+import { openThread, showToast } from "../store";
 import "./EmployeeView.css";
 
 type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; nextCheckAt: number; lastRunAt: number; lastResult: string };
 type Todo = { id: string; text: string; confirm: boolean; profile?: string; createdAt: number; threadId?: string | null };
-type PoolModel = { name: string; when: string; agentKind: string; model: string };
 type Run = { at: number; dutyId: string; result: string; threadId: string };
 type Snapshot = {
   employee: {
     enabled: boolean; workStart: string; workEnd: string; idleMinutes: number;
-    agentKind: string; model: string; pool: PoolModel[]; duties: Duty[]; inbox: Todo[]; runs: Run[];
+    duties: Duty[]; inbox: Todo[]; runs: Run[];
   };
   status: "working" | "yielded" | "duty" | "rest";
   threadId: string | null;
@@ -55,15 +52,10 @@ export default function EmployeeView() {
   };
   const act = (action: string, id?: string) => run("employee_do", { action, id: id ?? null });
   const set = (patch: Record<string, unknown>) => run("employee_set", { patch });
-  const useCurrentModel = () => {
-    const agentKind = lastUsed.agentKind();
-    return set({ agentKind, model: lastUsed.model(agentKind) });
-  };
   const send = async () => {
     const text = say().trim();
     if (!text || busy()) return;
     setBusy(true);
-    if (!data()?.employee.agentKind) await useCurrentModel();
     try { await invoke("employee_say", { text }); setSay(""); } catch (error) { showToast(String(error)); }
     setBusy(false);
     void refetch();
@@ -83,10 +75,7 @@ export default function EmployeeView() {
                 </div>
                 <div class="employee-header-actions">
                   <label class="employee-toggle"><input type="checkbox" role="switch" checked={e().enabled}
-                    onChange={(ev) => void (async () => {
-                      if (ev.currentTarget.checked && !e().agentKind) await useCurrentModel();
-                      await set({ enabled: ev.currentTarget.checked });
-                    })()} /> 自动值班</label>
+                    onChange={(ev) => void set({ enabled: ev.currentTarget.checked })} /> 自动值班</label>
                   <button type="button" onClick={() => void act("check")}>立即检查</button>
                 </div>
               </header>
@@ -265,40 +254,9 @@ export default function EmployeeView() {
                         onChange={(ev) => void set({ idleMinutes: Number(ev.currentTarget.value) || 10 })} /> 分钟</span>
                     </label>
                     <p class="employee-hint">在工作时段内，电脑空闲后自动开始工作；你回来时，员工会让出。</p>
-                    <div class="employee-field employee-default-model">
-                      <span>默认模型</span>
-                      <ModelPicker agentKind={(e().agentKind || lastUsed.agentKind()) as AgentKind} agentKinds={enabledAgentKinds()}
-                        model={e().model} onPickModel={(agentKind, model) => void set({ agentKind, model })}
-                        title="默认模型：值班检查、职责执行，以及没有匹配模型池条件的事项" portal />
-                    </div>
+                    <p class="employee-hint">员工使用「设置 → 场景模型 → 轻量化」，符合编码或电脑操控场景的事项会转交对应场景的模型。</p>
                   </section>
 
-                  <details class="employee-card employee-pool">
-                    <summary class="employee-section-heading"><h2>模型池 <span class="employee-count">{e().pool.length}</span></h2><span class="employee-disclosure" aria-hidden="true">⌄</span></summary>
-                    <p class="employee-hint">按任务匹配专用模型，其余使用默认模型。</p>
-                    <ul class="employee-list">
-                      <For each={e().pool}>{(m, i) => {
-                        const edit = (patch: Partial<PoolModel>) => set({ pool: e().pool.map((p, j) => (j === i() ? { ...p, ...patch } : p)) });
-                        return (
-                          <li>
-                            <input type="text" maxLength={40} placeholder="名字，如 编码" aria-label="模型名字" value={m.name}
-                              onChange={(ev) => void edit({ name: ev.currentTarget.value })} />
-                            <input type="text" maxLength={500} placeholder="适用条件，如 需要写代码时" aria-label="适用条件" value={m.when}
-                              onChange={(ev) => void edit({ when: ev.currentTarget.value })} />
-                            <div class="employee-pool-actions">
-                              <ModelPicker agentKind={m.agentKind as AgentKind} agentKinds={enabledAgentKinds()} model={m.model}
-                                onPickModel={(agentKind, model) => void edit({ agentKind, model })} title="该条件下使用的模型" portal />
-                              <button type="button" onClick={() => void set({ pool: e().pool.filter((_, j) => j !== i()) })}>删除</button>
-                            </div>
-                          </li>
-                        );
-                      }}</For>
-                    </ul>
-                    <button type="button" class="employee-add-model" onClick={() => {
-                      const agentKind = lastUsed.agentKind();
-                      void set({ pool: [...e().pool, { name: `模型${e().pool.length + 1}`, when: "", agentKind, model: lastUsed.model(agentKind) }] });
-                    }}>＋ 添加模型</button>
-                  </details>
                 </aside>
               </div>
             </div>

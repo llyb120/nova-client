@@ -9,10 +9,22 @@ export interface SlashCommand {
   input?: string;
 }
 
-export interface StageModelTarget {
+export interface ModelTarget {
   agentKind: AgentKind;
+  /** 空 = 该后端默认模型 */
   model: string;
 }
+
+/** 预设场景：每个场景一个有序模型列表，按顺序取第一个可用的，失效时切换下一个。 */
+export type SceneKey = "lightweight" | "coding" | "computer";
+export type SceneModels = Record<SceneKey, ModelTarget[]>;
+export const SCENES: { key: SceneKey; label: string; hint: string }[] = [
+  { key: "lightweight", label: "轻量化", hint: "自动模式会话的起手模型；标题、摘要、上下文压缩、/stage、Butterfly、Meteor、数字员工" },
+  { key: "coding", label: "编码", hint: "写代码、改仓库、调试和构建测试" },
+  { key: "computer", label: "电脑操控", hint: "操作桌面应用与浏览器" },
+];
+export const scenesReady = (scenes?: Partial<SceneModels>) =>
+  SCENES.every(({ key }) => (scenes?.[key]?.length ?? 0) > 0);
 
 /** worktree 执行信息：会话在为某 git 仓库创建的独立 worktree（分支 + 工作目录）中运行 */
 export interface Worktree {
@@ -136,6 +148,8 @@ export interface ThreadMeta {
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** 普通 /stage 引用的源会话；用于导航显示 Stage 自己的会话名。 */
+  /** 自动模式会话的场景 key；普通会话为空 */
+  autoScene?: string | null;
   stageSourceThreadId?: string | null;
   /** 当前会话在证据链中的线索位置 */
   activeClueCardId?: string | null;
@@ -445,8 +459,6 @@ export interface Settings {
   windowsShellShimEnabled: boolean;
   /** Windows 后台任务栏提示（实验）；默认关闭，保存后即时生效。 */
   taskbarStatusEnabled?: boolean;
-  butterflyAgentKind?: AgentKind;
-  butterflyModel?: string;
   /** PowerShell 输出按 UTF-8 捕获，避免 GBK 与 UTF-8 解码错配乱码；默认开启。 */
   powershellUtf8Enabled: boolean;
   /** 是否允许 Lyra 自动切换当前项目和工具工作目录；默认开启。 */
@@ -458,12 +470,8 @@ export interface Settings {
   /** 代码上下文检索模式：无 / FastContext。 */
   contextRetrievalMode: "none" | "fast";
   defaultMode: string;
-  /** 标题、快速总结、摘要和压缩等辅助任务所用后端 */
-  lightweightModelAgent: string;
-  /** 辅助任务所用轻量级模型；失败时回退到任务原模型 */
-  lightweightModel: string;
-  /** /stage、/stage2 等命令依次使用的模型；/stage 默认取第一项 */
-  stageModels: StageModelTarget[];
+  /** 场景模型：轻量化 / 编码 / 电脑操控 */
+  sceneModels: SceneModels;
   /** 打开文件用的编辑器命令（cursor / code / zed 等） */
   editor: string;
   /** 内嵌终端程序，空为系统默认 shell。 */
@@ -490,9 +498,6 @@ export interface Settings {
   meteorEnabled: boolean;
   /** Alt+Alt 表示连按两次 Alt，其余为系统全局组合键（必须带修饰键） */
   meteorShortcut: string;
-  meteorAgentKind: AgentKind;
-  /** 空值使用所选后端的默认模型 */
-  meteorModel: string;
   /** Meteor 提交时附加最近剪贴板；默认关闭 */
   meteorClipboard?: boolean;
   /** Meteor 星移（StartShift）全局组合键，默认 Alt+V；空值关闭 */

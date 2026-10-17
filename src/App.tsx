@@ -14,6 +14,7 @@ import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
 import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
+import { scenesReady } from "./types";
 import { selectedChatText } from "./chatSelection";
 import { closeThread, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal } from "./store";
 import { mountSessionShortcuts, setShortcutRecordingActive } from "./sessionShortcuts";
@@ -94,6 +95,8 @@ export default function App() {
     homeComposerFocusAt: state.homeComposerFocusAt,
   }));
   const [showSettings, setShowSettings] = createSignal(false);
+  // 先决条件：三个场景都至少配置一个模型，否则启动即弹出且不可关闭的场景配置。
+  const scenesMissing = () => !!state.settings && !scenesReady(state.settings.sceneModels);
   const [showAchievements, setShowAchievements] = createSignal(false);
   const [showUpdate, setShowUpdate] = createSignal(false);
   const [showInbox, setShowInbox] = createSignal(false);
@@ -188,12 +191,14 @@ export default function App() {
       <Show when={homeTerminal.open()}>
         <Suspense><HomeTerminalPanel onClose={homeTerminal.close} /></Suspense>
       </Show>
-      <Show when={showSettings()}>
+      <Show when={showSettings() || scenesMissing()}>
         <Show
           when={state.settings}
           fallback={<SettingsLoadingModal onClose={() => setShowSettings(false)} />}
         >
-          <SettingsModal onClose={() => setShowSettings(false)} />
+          <Show when={scenesMissing()} fallback={<SettingsModal onClose={() => setShowSettings(false)} />}>
+            <SettingsModal initialTab="scenes" required onClose={() => setShowSettings(false)} />
+          </Show>
         </Show>
       </Show>
       <Show when={showAchievements()}>

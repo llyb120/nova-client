@@ -19,17 +19,15 @@ function evaluate(expression, context) {
   return runInNewContext(ts.transpile(`(${expression})`, { target: ts.ScriptTarget.ES2022 }), context);
 }
 const listener = find('src/store.ts', n => ts.isCallExpression(n) && n.expression.getText() === 'listen' && n.arguments[0]?.text === 'remote-prompt:dispatch');
-async function dispatch(threadId, enabled = true, fail = false, settings = { butterflyAgentKind: 'codex', butterflyModel: 'butterfly-model' }) {
+async function dispatch(threadId, scene = { agentKind: 'codex', model: 'light-model' }, fail = false) {
   const calls = [], errors = [];
   let handler;
   evaluate(listener, {
     listen: (_, fn) => { handler = fn; },
-    state: { settings },
+    state: { settings: {} },
     lastUsed: { agentKind: () => 'lyra', model: () => 'last-model', reasoningEffort: () => 'high' },
-    resolveEnabledAgentKind: k => k,
-    enabledAgentKinds: () => enabled ? ['lyra', 'codex'] : ['lyra'],
-    ensureModelOptions: async () => {},
-    resolveAvailableModel: (_, model) => model,
+    // Butterfly 使用轻量化场景模型；没有可用模型时 sceneModel 抛错。
+    sceneModel: key => { assert.equal(key, 'lightweight'); if (!scene) throw Error('「轻量化」场景没有可用模型'); return scene; },
     api: { scratchDir: async () => 'temp/Nova-scratch/new' },
     createThread: async (...args) => { calls.push(['create', ...args]); return 'new-thread'; },
     sendPromptTo: async (...args) => { if (fail) throw Error('offline'); calls.push(['send', ...args]); },
@@ -41,18 +39,14 @@ async function dispatch(threadId, enabled = true, fail = false, settings = { but
   return { calls: JSON.parse(JSON.stringify(calls)), errors };
 }
 assert.deepEqual((await dispatch(null)).calls, [
-  ['create', 'temp/Nova-scratch/new', 'codex', 'butterfly-model', 'build', ''],
+  ['create', 'temp/Nova-scratch/new', 'codex', 'light-model', 'build', ''],
   ['send', 'new-thread', 'hello', []],
 ]);
 assert.deepEqual((await dispatch('existing')).calls, [['send', 'existing', 'hello', []]]);
-const disabled = await dispatch(null, false);
-assert.equal(disabled.calls.length, 0);
-assert.match(disabled.errors[0], /启用 Butterfly 配置的模型后端/);
-assert.deepEqual((await dispatch(null, true, false, {})).calls[0],
-  ['create', 'temp/Nova-scratch/new', 'lyra', '', 'build', '']);
-assert.deepEqual((await dispatch(null, true, false, { butterflyAgentKind: 'codex', butterflyModel: '' })).calls[0],
-  ['create', 'temp/Nova-scratch/new', 'codex', '', 'build', '']);
-assert.match((await dispatch('existing', true, true)).errors[0], /offline/);
+const missing = await dispatch(null, null);
+assert.equal(missing.calls.length, 0);
+assert.match(missing.errors[0], /场景没有可用模型/);
+assert.match((await dispatch('existing', undefined, true)).errors[0], /offline/);
 
 const reply = find('src/components/TaskbarBubble.tsx', n => ts.isFunctionDeclaration(n) && n.name?.text === 'Reply');
 const replySource = ts.createSourceFile('reply.tsx', reply, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);

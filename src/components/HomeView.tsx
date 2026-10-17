@@ -13,6 +13,7 @@ import {
   createRoamingThread,
   createThread,
   createThreadOptimistic,
+  sceneModel,
   clearPendingClueCard,
   enabledAgentKinds,
   ensureModelOptions,
@@ -55,6 +56,7 @@ import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 import { TypewriterText } from "./TypewriterText";
 
 const LAST_NEW_THREAD_PROJECT_KEY = "fd:lastNewThreadProject";
+const AUTO_MODE_KEY = "fd:newThreadAutoMode";
 
 /** codex 风格草稿首页：输入任务 + 选择项目/模型/模式，回车即开干 */
 export function HomeView() {
@@ -79,6 +81,12 @@ export function HomeView() {
   const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(agentKind()));
   const [mode, setMode] = createSignal("build");
   const [busy, setBusy] = createSignal(false);
+  // 自动模式：按提示词自动选择项目目录与场景模型；场景模型配置只在此模式下用于新会话。
+  const [auto, setAuto] = createSignal(localStorage.getItem(AUTO_MODE_KEY) === "1");
+  const toggleAuto = (on: boolean) => {
+    setAuto(on);
+    localStorage.setItem(AUTO_MODE_KEY, on ? "1" : "0");
+  };
   const [roam, setRoam] = createSignal<{ peer: Peer; folder: string } | null>(null);
   // 漫游选择对端工作流，只发送标识和目标，由对端读取定义并执行。
   const [workflowMenuOpen, setWorkflowMenuOpen] = createSignal(false);
@@ -563,6 +571,7 @@ export function HomeView() {
   };
 
   const composerPlaceholder = () => {
+    if (auto()) return "描述任务，自动选择项目与模型（Enter 发送 · Ctrl+Enter 临时会话）";
     const wt = worktreeAvailable() ? " · Alt+Enter 在 worktree 执行" : "";
     const target = roam();
     if (target) return `描述任务，将在 ${target.peer.name} 的机器上执行（Enter 发送${wt}）`;
@@ -577,17 +586,18 @@ export function HomeView() {
     const quoted = quote().trim();
     const prompt = quoted ? `<nova_quote>\n${quoted}\n</nova_quote>\n\n${t}` : t;
     const images = attach.images();
-    const target = roam();
-    const workflow = !target ? selectedWorkflow() : null;
+    const autoMode = auto();
+    const target = autoMode ? null : roam();
+    const workflow = !target && !autoMode ? selectedWorkflow() : null;
     const clue = state.pendingClueCard;
     if (
       (!t && images.length === 0) ||
       busy() ||
-      (!cwd() && !target) ||
+      (!cwd() && !target && !autoMode) ||
       !peerReady() ||
       (usesPeerModels() && configAgentKinds().length === 0)
     ) return;
-    const wtOn = opts.worktree === true && worktreeAvailable();
+    const wtOn = !autoMode && opts.worktree === true && worktreeAvailable();
     const branch = opts.branch?.trim() ?? "";
     const base = wtOn ? opts.base?.trim() ?? "" : "";
     if (wtOn && !branch && !base) return; // 新分支名与基于分支至少填一个（留空分支名 = 直接用所选分支）
@@ -595,7 +605,14 @@ export function HomeView() {
     rememberPromptHistory(t, images);
     setBusy(true);
     try {
-      if (target) {
+      if (autoMode) {
+        // 直接以轻量化场景模型开局：由它判断是否把整块工作按场景转交，并选择项目目录。
+        const { agentKind: autoKind, model: autoModel } = sceneModel("lightweight");
+        const clueId = clue?.id ?? "";
+        if (clue) clearPendingClueCard();
+        createThreadOptimistic(await api.scratchDir(), autoKind, autoModel, mode(), "", prompt, images,
+          opts.ephemeral ?? false, clueId, "lightweight");
+      } else if (target) {
         const remoteWorkflow = selectedPeerWorkflow();
         if (selectedWorkflowId() && !remoteWorkflow) throw new Error("对方工作流列表已失效，请重新选择");
         const outbound = remoteWorkflow ? roamingWorkflowPrompt(remoteWorkflow, prompt) : prompt;
@@ -1063,6 +1080,11 @@ export function HomeView() {
             />
           </div>
           <div class="composer-bar">
+            <label class="pill composer-auto" title="以轻量化模型开局，按需把编码或电脑操控工作交给对应场景模型（设置 → 场景模型）">
+              <input type="checkbox" checked={auto()} onChange={(e) => toggleAuto(e.currentTarget.checked)} />
+              自动模式
+            </label>
+            <Show when={!auto()}>
             <ProjectPicker
               value={cwd()}
               onChange={selectProject}
@@ -1087,8 +1109,9 @@ export function HomeView() {
                 favorites
               />
             </Show>
+            </Show>
             <div class="composer-actions">
-              <Show when={true}>
+              <Show when={!auto()}>
                 <div ref={workflowPickerRef} class="composer-workflow-picker">
                   <Show when={workflowMenuOpen()}>
                     <div class="composer-workflow-menu">
@@ -1162,7 +1185,7 @@ export function HomeView() {
                 disabled={
                   (!text().trim() && attach.images().length === 0) ||
                   (!!selectedWorkflow() && !text().trim() && attach.images().length === 0) ||
-                  (!cwd() && !roam()) ||
+                  (!cwd() && !roam() && !auto()) ||
                   busy() ||
                   !peerReady() ||
                   (usesPeerModels() && configAgentKinds().length === 0)

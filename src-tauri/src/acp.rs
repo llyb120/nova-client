@@ -1453,13 +1453,21 @@ impl AcpManager {
         }
         if self.kind == AgentKind::Devin {
             if let Some(cwd) = want_cwd {
+                // Devin 每个线程一条连接：自动模式的线程/场景环境既写进该连接的启动目录配置，
+                // 也设在 Devin 进程上，供 3000.3.x 共享的会话目录配置经环境继承拿到。
+                let auto_env = conn_key
+                    .strip_prefix("thread:")
+                    .map(|id| crate::auto_tool_env(&self.app.state::<AppState>(), id))
+                    .unwrap_or_default();
                 let launch_dir = prepare_devin_nova_tools_config(
                     &self.app,
                     conn_key,
                     cwd,
                     settings.context_retrieval_mode.as_str(),
                     read_only,
+                    &auto_env,
                 )?;
+                cmd.envs(auto_env.iter().map(|(name, value)| (*name, value.as_str())));
                 cmd.current_dir(&launch_dir);
                 self.push_log(format!(
                     "[nova] Devin 使用本地 nova-tools MCP 配置：{}",
@@ -3784,6 +3792,13 @@ impl AcpManager {
             };
             if self.kind == AgentKind::Devin {
                 guidance.push(nova_tools_prompt_guidance(context_tools, read_only));
+                let auto_env = crate::auto_tool_env(&self.app.state::<AppState>(), thread_id);
+                if auto_env.iter().any(|(name, _)| *name == "NOVA_SCENE_HANDOFF") && !read_only {
+                    guidance.push("Nova auto mode: nova-tools also exposes spawn_agent, wait_agent, list_agents, followup_task, interrupt_agent and close_agent (call them through mcp_call_tool with server_name \"nova-tools\" like the other Nova tools).".into());
+                }
+                if auto_env.iter().any(|(name, value)| *name == "NOVA_DESKTOP" && value == "0") {
+                    guidance.push("In this session jianlai, chrome and webview are not available; hand desktop or browser work off with spawn_agent(scene=\"computer\").".into());
+                }
             }
         }
         // CodeBuddy 的工作目录契约逐轮附在用户文本末尾。其 CLI 会把同一条 ACP
@@ -4595,6 +4610,14 @@ impl AcpManager {
             }));
             server["_meta"]["tools"]["change_working_directory"] =
                 json!({ "defer_loading": false });
+        }
+        for (name, value) in crate::auto_tool_env(&state, thread_id) {
+            server["env"].as_array_mut().unwrap().push(json!({ "name": name, "value": value }));
+            if name == "NOVA_SCENE_HANDOFF" {
+                for tool in ["spawn_agent", "wait_agent", "list_agents", "followup_task", "interrupt_agent", "close_agent"] {
+                    server["_meta"]["tools"][tool] = json!({ "defer_loading": false });
+                }
+            }
         }
         self.push_log(format!(
             "[nova] {} 已为 {cwd} 注入 nova-tools",
@@ -5811,6 +5834,7 @@ fn prepare_devin_nova_tools_config(
     cwd: &str,
     context_mode: &str,
     read_only: bool,
+    auto_env: &[(&'static str, String)],
 ) -> Result<PathBuf, String> {
     let script = materialize_nova_tools_mcp(app)?;
     let node = resolve_program_on_path("node")
@@ -5842,7 +5866,12 @@ fn prepare_devin_nova_tools_config(
         state.context_service.endpoint(),
         state.context_service.token(),
     );
-    let bytes = serde_json::to_vec_pretty(&config)
+    // 会话目录的配置可能被同目录的其它线程共用，只在本连接的启动目录配置里写线程级环境。
+    let mut launch_config = config.clone();
+    for (name, value) in auto_env {
+        launch_config["mcpServers"]["nova-tools"]["env"][*name] = Value::String(value.clone());
+    }
+    let bytes = serde_json::to_vec_pretty(&launch_config)
         .map_err(|e| format!("序列化 Devin MCP 配置失败：{e}"))?;
     let path = config_dir.join("config.local.json");
     if std::fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
