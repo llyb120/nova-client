@@ -66,6 +66,36 @@ async fn settle_pending_input(command_busy: &AtomicBool, command_revision: &Atom
     }
 }
 
+/// 模型侧视觉上限：Claude 会把长边 >1568 或总像素超约 115 万的图先缩小再看，
+/// 本地按同一上限预缩，模型所见不变，请求体却小得多（大图原样上传会拖到网关超时）。
+const IMAGE_MAX_EDGE: f64 = 1568.0;
+const IMAGE_MAX_PIXELS: f64 = 1_150_000.0;
+
+/// 超出上限时等比缩小并重新编码（PNG 保持无损，JPEG 用 q90）；未超限或无法解码返回 None，调用方沿用原图。
+pub(crate) fn fit_image(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
+    let format = image::guess_format(bytes).ok()?;
+    let img = image::load_from_memory_with_format(bytes, format).ok()?;
+    let (w, h) = (img.width() as f64, img.height() as f64);
+    let scale = (IMAGE_MAX_EDGE / w.max(h)).min((IMAGE_MAX_PIXELS / (w * h)).sqrt());
+    if scale >= 1.0 {
+        return None;
+    }
+    let resized = img.resize_exact(
+        ((w * scale).round() as u32).max(1),
+        ((h * scale).round() as u32).max(1),
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut out = Vec::new();
+    if format == image::ImageFormat::Jpeg {
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
+        resized.to_rgb8().write_with_encoder(encoder).ok()?;
+        Some((out, "image/jpeg"))
+    } else {
+        resized.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
+        Some((out, "image/png"))
+    }
+}
+
 /// 把协议 parts 转为 (文本, 图片)（local_image 读文件转 base64）。
 fn prompt_input(parts: &[Value]) -> (String, Vec<Value>) {
     let mut texts = Vec::new();
@@ -78,17 +108,22 @@ fn prompt_input(parts: &[Value]) -> (String, Vec<Value>) {
                 }
             }
             Some("image_data") => {
-                images.push(json!({
-                    "type": "image",
-                    "data": part.get("data").and_then(Value::as_str).unwrap_or_default(),
-                    "mimeType": part.get("mime").and_then(Value::as_str).unwrap_or("image/png"),
-                }));
+                use base64::Engine;
+                let data = part.get("data").and_then(Value::as_str).unwrap_or_default();
+                let mime = part.get("mime").and_then(Value::as_str).unwrap_or("image/png");
+                let engine = base64::engine::general_purpose::STANDARD;
+                let fitted = engine.decode(data).ok().and_then(|bytes| fit_image(&bytes));
+                images.push(match fitted {
+                    Some((bytes, mime)) => json!({ "type": "image", "data": engine.encode(bytes), "mimeType": mime }),
+                    None => json!({ "type": "image", "data": data, "mimeType": mime }),
+                });
             }
             Some("local_image") => {
                 let path = part.get("path").and_then(Value::as_str).unwrap_or_default();
                 if let Some(mime) = image_media_type(path) {
                     if let Ok(data) = std::fs::read(path) {
                         use base64::Engine;
+                        let (data, mime) = fit_image(&data).unwrap_or((data, mime));
                         images.push(json!({
                             "type": "image",
                             "data": base64::engine::general_purpose::STANDARD.encode(data),
@@ -718,6 +753,23 @@ pub async fn run() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fit_image_downscales_only_oversized_images() {
+        let png = |w, h| {
+            let mut out = Vec::new();
+            image::DynamicImage::new_rgb8(w, h)
+                .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                .unwrap();
+            out
+        };
+        assert!(super::fit_image(&png(1000, 800)).is_none());
+        let (bytes, mime) = super::fit_image(&png(2564, 1700)).unwrap();
+        assert_eq!(mime, "image/png");
+        let fitted = image::load_from_memory(&bytes).unwrap();
+        assert!(fitted.width() <= 1568 && (fitted.width() * fitted.height()) as f64 <= 1_150_000.0 * 1.01);
+        assert!(fitted.width() > 1200, "不应过度缩小：{}", fitted.width());
+    }
+
     #[test]
     fn stage_and_main_share_streaming_tool_and_steer_projection() {
         use super::*;

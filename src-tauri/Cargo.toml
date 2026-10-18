@@ -25,7 +25,7 @@ base64 = "0.22"
 enigo = "0.6.1"
 xcap = "0.9.8"
 # Reuse xcap's image crate for compact screenshots and Windows clipboard DIB decoding.
-image = { version = "0.25", default-features = false, features = ["jpeg", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "bmp", "png"] }
 flate2 = "1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "native-tls", "blocking", "system-proxy", "socks", "stream", "multipart"] }
