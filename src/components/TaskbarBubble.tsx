@@ -359,9 +359,11 @@ export default function TaskbarBubble() {
     const request = ++revision;
     const next = await invoke<Payload | null>("taskbar_bubble").catch(() => null);
     if (request !== revision) return false;
+    // Theme the prewarmed page too: switching dark→light on the first open runs the 120ms
+    // background/color transitions while the window is being shown, a visible flash.
+    if (next) document.documentElement.classList.toggle("light", next.light);
     // Empty payload means hidden/prewarmed; it must not acknowledge a result or take focus.
     if (!next?.cards.length) { setActive(false); return hide(); }
-    document.documentElement.classList.toggle("light", next.light);
     setPanel({ jianpu: next.jianpu ?? { recording: false } });
     if (fresh) {
       focusPending = next.panel === false;
