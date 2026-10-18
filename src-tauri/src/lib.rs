@@ -5848,6 +5848,7 @@ pub fn run() {
             meteor::meteor_cancel,
             meteor::meteor_set_shortcut_recording,
             taskbar_status::capsules::capsule_list,
+            taskbar_status::capsules::capsule_preview,
             taskbar_status::capsules::capsule_capture,
             taskbar_status::capsules::capsule_remove,
             taskbar_status::capsules::capsule_open,

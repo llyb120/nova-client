@@ -49,15 +49,31 @@ const excerpt = (text: string, length = 220) => text.length > length ? `${text.s
 export const titleOf = (capsule: Capsule) => capsule.title.trim() || excerpt(capsule.text.trim().split("\n", 1)[0], 50) || capsule.files[0]?.name || "未命名星屑";
 const hasSummary = (capsule: Capsule) => capsule.status === "ready" && !!capsule.summary.trim() && capsule.summary.trim() !== capsule.text.trim();
 const matches = (capsule: Capsule, query: string) => [capsule.title, capsule.text, capsule.summary, ...capsule.files.map((f) => `${f.name}\n${f.path}`)].some((value) => value.toLocaleLowerCase().includes(query));
-const select = (previous: Set<string>, id: string, additive: boolean) => {
-  // A plain click on the only selected card deselects it; otherwise it becomes the sole selection.
-  if (!additive) return previous.size === 1 && previous.has(id) ? new Set<string>() : new Set([id]);
+const select = (previous: Set<string>, id: string) => {
+  // Every click toggles: selecting several capsules needs no modifier key.
   const next = new Set(previous);
   if (next.has(id)) next.delete(id); else next.add(id);
   return next;
 };
 const fileSize = (size: number) => size < 1024 ? `${size} B` : size < 1024 ** 2 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1024 ** 2).toFixed(1)} MB`;
 const dateLabel = (time: number) => new Date(time).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const isImage = (capsule: Capsule) => !!capsule.files[0]?.mimeType.startsWith("image/");
+// Stored copies have no extension (the asset protocol cannot serve them): fetch inline, keep a few.
+const thumbs = new Map<string, Promise<string | null>>();
+const thumbnail = (id: string) => {
+  let hit = thumbs.get(id);
+  if (!hit) {
+    hit = invoke<string | null>("capsule_preview", { id }).catch(() => null);
+    thumbs.set(id, hit);
+    if (thumbs.size > 24) thumbs.delete(thumbs.keys().next().value!);
+  }
+  return hit;
+};
+function Thumb(props: { id: string; large?: boolean }) {
+  const [src, setSrc] = createSignal<string | null>(null);
+  createEffect(() => { const id = props.id; setSrc(null); void thumbnail(id).then((url) => { if (id === props.id) setSrc(url); }); });
+  return <Show when={src()}><img class="tc-thumb" classList={{ "tc-thumb-large": props.large }} src={src()!} alt="" draggable={false} /></Show>;
+}
 type View = { kind: "detail"; id: string } | { kind: "remove"; ids: string[]; hidden: number };
 
 /** Keep mounted across tab changes: active controls visibility, not lifetime.
@@ -184,8 +200,8 @@ export default function ThoughtCapsules(props: ThoughtCapsulesProps) {
     }
   };
 
-  const choose = (id: string, additive: boolean) => {
-    if (!busy() && props.active) { setSelected((previous) => select(previous, id, additive)); setNotice(""); }
+  const choose = (id: string) => {
+    if (!busy() && props.active) { setSelected((previous) => select(previous, id)); setNotice(""); }
   };
   const panelKeys = (event: KeyboardEvent) => {
     if (!view() || !props.active) return;
@@ -265,12 +281,13 @@ export default function ThoughtCapsules(props: ThoughtCapsulesProps) {
             <ul class="tc-list" aria-label="星屑列表">
               <For each={filtered()}>{(capsule) => (
                 <li class="tc-card" classList={{ "tc-selected": selected().has(capsule.id) }}>
-                  <label class="tc-check"><input type="checkbox" class="tc-checkbox" aria-label={`多选：${titleOf(capsule)}`} checked={selected().has(capsule.id)} disabled={!!busy()} onChange={() => choose(capsule.id, true)} /></label>
-                  <button type="button" class="tc-card-select" aria-pressed={selected().has(capsule.id)} aria-label={`选择星屑：${titleOf(capsule)}`} title="点击单选 · Ctrl / ⌘ + 点击多选" disabled={!!busy()}
-                    onClick={(event) => choose(capsule.id, event.ctrlKey || event.metaKey)}
-                    onKeyDown={(event) => { if (event.key === " " || event.key === "Enter") { event.preventDefault(); event.stopPropagation(); if (!event.repeat) choose(capsule.id, event.ctrlKey || event.metaKey); } }}>
+                  <label class="tc-check"><input type="checkbox" class="tc-checkbox" aria-label={`多选：${titleOf(capsule)}`} checked={selected().has(capsule.id)} disabled={!!busy()} onChange={() => choose(capsule.id)} /></label>
+                  <button type="button" class="tc-card-select" aria-pressed={selected().has(capsule.id)} aria-label={`选择星屑：${titleOf(capsule)}`} title="点击选择 / 取消，可多选" disabled={!!busy()}
+                    onClick={() => choose(capsule.id)}
+                    onKeyDown={(event) => { if (event.key === " " || event.key === "Enter") { event.preventDefault(); event.stopPropagation(); if (!event.repeat) choose(capsule.id); } }}>
                     <span class="tc-card-title">{titleOf(capsule)}</span>
                     <span class="tc-preview"><span class="tc-preview-label">{hasSummary(capsule) ? "摘要" : capsule.files.length ? "文件预览" : "原文"}</span>{excerpt(hasSummary(capsule) ? capsule.summary : capsule.text) || "这条星屑里装着文件，原件副本已收好。"}</span>
+                    <Show when={isImage(capsule)}><Thumb id={capsule.id} /></Show>
                     <span class="tc-card-meta"><time title={new Date(capsule.createdAt).toLocaleString()}>{dateLabel(capsule.createdAt)}</time><Show when={capsule.files.length}><span class="tc-attachment">{icon("file")}{capsule.files.length} 个文件</span></Show><span class={`tc-state tc-state-${capsule.status}`} title={capsule.summaryError}>{capsule.status === "pending" ? "摘要中" : capsule.status === "unavailable" ? "原文已保存" : "已收好"}</span></span>
                   </button>
                   <button type="button" class="tc-icon-button tc-detail-button" aria-label={`查看${capsule.files.length ? "文件内容预览" : "完整原文"}：${titleOf(capsule)}`} title={capsule.files.length ? "查看文件内容预览与附件" : "查看完整原文"} disabled={!!busy()} onClick={() => showView({ kind: "detail", id: capsule.id })}>{icon("expand")}</button>
@@ -281,7 +298,7 @@ export default function ThoughtCapsules(props: ThoughtCapsulesProps) {
         </div>
 
         <footer class="tc-footer">
-          <div class="tc-selection"><span aria-live="polite">已选 <strong>{selected().size}</strong> 条<Show when={hiddenCount()}><span class="tc-hidden-count">含 {hiddenCount()} 条搜索隐藏项</span></Show></span><span class="tc-multiselect-hint">Ctrl / ⌘ 点击多选</span><button type="button" class="tc-text-button" disabled={!selected().size || !!busy()} onClick={() => { setSelected(new Set<string>()); setNotice(""); }}>清空选择</button></div>
+          <div class="tc-selection"><span aria-live="polite">已选 <strong>{selected().size}</strong> 条<Show when={hiddenCount()}><span class="tc-hidden-count">含 {hiddenCount()} 条搜索隐藏项</span></Show></span><span class="tc-multiselect-hint">点击可多选</span><button type="button" class="tc-text-button" disabled={!selected().size || !!busy()} onClick={() => { setSelected(new Set<string>()); setNotice(""); }}>清空选择</button></div>
           <div class="tc-actions"><button type="button" class="tc-delete" disabled={!selected().size || !!busy()} aria-label={`删除选中的 ${selected().size} 条星屑`} title="删除所选（需确认）" onClick={() => showView({ kind: "remove", ids: selectedIds(), hidden: hiddenCount() })}>{icon("trash")}</button><button type="button" class="tc-open" disabled={!selected().size || !!busy()} onKeyDown={(event) => { if (event.repeat && (event.key === "Enter" || event.key === " ")) event.preventDefault(); }} onClick={(event) => { if (event.detail < 2) void openSelected(); }}><span>{busy() === "open" ? "正在准备草稿…" : "带入新会话"}</span><small>仅草稿 · 不发送</small>{icon("arrow")}</button></div>
           <p class="tc-privacy" title="自动摘要交给轻量场景模型（任意后端），附带源文件由 agent 自行读取，请留意敏感信息。单文件最多 20 MiB，每次最多 16 个、合计 80 MiB；原文和文件副本独立保留。">{icon("shield")}自动摘要使用轻量场景模型 · 原文保留</p>
         </footer>
@@ -293,6 +310,7 @@ export default function ThoughtCapsules(props: ThoughtCapsulesProps) {
           <Show when={shownError()}><div class="tc-message tc-error" role="alert">{shownError()}</div></Show>
           <Show when={detail()}>{(capsule) => <div class="tc-detail-content" tabIndex={0} aria-label="完整星屑内容">
             <div class="tc-detail-heading"><h4>{titleOf(capsule())}</h4><time>{new Date(capsule().createdAt).toLocaleString()}</time></div>
+            <Show when={isImage(capsule())}><Thumb id={capsule().id} large /></Show>
             <h5>{capsule().files.length ? "文件内容预览" : "完整原文"} <span>{capsule().files.length ? "完整内容保存在附件中" : "始终保留"}</span></h5><div class="tc-original">{capsule().text || (capsule().files.length ? "暂无文件内容预览，完整内容保存在附件中。" : "此星屑没有文字。")}</div>
             <Show when={capsule().files.length}><h5>文件副本 <span>{capsule().files.length} 个</span></h5><ul class="tc-files"><For each={capsule().files}>{(file) => <li>{icon("file")}<div><strong>{file.name}</strong><small>{fileSize(file.size)} · {file.mimeType || "文件"}</small><code>{file.path}</code></div></li>}</For></ul><p class="tc-detail-note">实际副本由后端保存；这里展示记录中的文件路径。</p></Show>
             <h5>自动摘要 <span>{capsule().status === "pending" ? "生成中" : capsule().status === "unavailable" ? "暂不可用" : "仅供预览"}</span></h5><div class="tc-summary">{capsule().summary || (capsule().status === "pending" ? "正在整理这段灵感，原文已安全收好。" : "暂无摘要，不影响查看原文或带入草稿。")}</div><Show when={capsule().summaryError}><p class="tc-detail-note">摘要提示：{capsule().summaryError}</p></Show>

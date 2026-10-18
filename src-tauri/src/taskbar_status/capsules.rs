@@ -546,6 +546,28 @@ pub(crate) async fn capsule_list(app: AppHandle) -> Result<Vec<Capsule>, String>
     tokio::task::spawn_blocking(move || list(&root)).await.map_err(|e| e.to_string())?
 }
 
+const MAX_PREVIEW: u64 = 8 * 1024 * 1024;
+
+/// Inline preview of a capsule's image copy. The stored copy has no extension, so the asset
+/// protocol (extension-scoped) cannot serve it; None when it is not an image or too large.
+fn preview(root: &Path, id: &str) -> Result<Option<String>, String> {
+    validate_ids(&[id.to_owned()])?;
+    let _lock = STORE.lock().map_err(|_| "星屑存储锁不可用")?;
+    let root = prepare(root)?;
+    let items = load(&root)?;
+    let file = items.iter().find(|c| c.id == id).and_then(|c| c.files.first()).ok_or("星屑不存在")?;
+    if !file.mime_type.starts_with("image/") || file.size > MAX_PREVIEW { return Ok(None); }
+    check_copy(Path::new(&file.path), file.size)?;
+    let bytes = read_bounded(Path::new(&file.path), MAX_PREVIEW)?;
+    Ok(Some(format!("data:{};base64,{}", file.mime_type, base64::engine::general_purpose::STANDARD.encode(bytes))))
+}
+
+#[tauri::command]
+pub(crate) async fn capsule_preview(app: AppHandle, id: String) -> Result<Option<String>, String> {
+    let root = storage_dir(&app);
+    tokio::task::spawn_blocking(move || preview(&root, &id)).await.map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub(crate) async fn capsule_capture(app: AppHandle, text: String, paths: Vec<String>, uploads: Option<Vec<CapsuleUpload>>) -> Result<Vec<Capsule>, String> {
     // Any enabled lightweight-scene backend, tried in the configured order.
