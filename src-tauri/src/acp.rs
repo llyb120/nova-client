@@ -1462,10 +1462,13 @@ impl AcpManager {
             if let Some(cwd) = want_cwd {
                 // Devin 每个线程一条连接：自动模式的线程/场景环境既写进该连接的启动目录配置，
                 // 也设在 Devin 进程上，供 3000.3.x 共享的会话目录配置经环境继承拿到。
-                let auto_env = conn_key
-                    .strip_prefix("thread:")
+                let thread_id = conn_key.strip_prefix("thread:");
+                let mut auto_env = thread_id
                     .map(|id| crate::auto_tool_env(&self.app.state::<AppState>(), id))
                     .unwrap_or_default();
+                if let Some(id) = thread_id.filter(|id| self.cwd_change_enabled(id)) {
+                    auto_env.push(("NOVA_CWD_CHANGE_SCOPE", self.cwd_change_scope(id)));
+                }
                 let launch_dir = prepare_devin_nova_tools_config(
                     &self.app,
                     conn_key,
@@ -3737,16 +3740,7 @@ impl AcpManager {
                 guidance.push(crate::lyra::PONYTAIL_RULES.to_string());
             }
         }
-        if (self.kind.is_codebuddy() || self.kind == AgentKind::Claude)
-            && self
-                .app
-                .state::<AppState>()
-                .settings
-                .lock()
-                .unwrap()
-                .auto_change_project_enabled
-            && !self.app.state::<AppState>().context_service.endpoint().is_empty()
-        {
+        if self.kind != AgentKind::Devin && self.cwd_change_enabled(thread_id) {
             guidance.push("需要更换工作目录/项目时，单独调用 nova-tools 的 change_working_directory(path)，不要与其它工具并行。Nova 会在新目录恢复本会话并自动继续；普通 cd 不能更改 Nova 会话目录。".into());
         }
         guidance
@@ -3803,6 +3797,9 @@ impl AcpManager {
                 // 否则模型调用失败后会退回 shell 自己“操作网页”，而不是转交。
                 let desktop = !auto_env.iter().any(|(name, value)| *name == "NOVA_DESKTOP" && value == "0");
                 guidance.push(nova_tools_prompt_guidance(context_tools, read_only, desktop));
+                if self.cwd_change_enabled(thread_id) {
+                    guidance.push("To change the working directory/project, call nova-tools change_working_directory alone via mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"change_working_directory\",\"arguments\":{\"path\":\"<dir>\"}}, never in parallel with other tools. Nova then restores this session in the new directory and continues automatically; a plain cd cannot change Nova's session directory.".into());
+                }
                 if auto_env.iter().any(|(name, _)| *name == "NOVA_SCENE_HANDOFF") && !read_only {
                     guidance.push("Nova auto mode: nova-tools also exposes spawn_agent, wait_agent, list_agents, followup_task, interrupt_agent and close_agent (call them through mcp_call_tool with server_name \"nova-tools\" like the other Nova tools).".into());
                     if !desktop {
@@ -4201,6 +4198,22 @@ impl AcpManager {
         Err(last_err)
     }
 
+    /// 本会话是否开放 nova-tools 的 change_working_directory。
+    /// ponytail: Devin 的 MCP 环境在进程启动时定型，线程级 scope 只能冷启动绑定，故仅对
+    /// 本就跳过预热的自动模式线程开放；普通 Devin 线程要支持，需先让预热进程可重绑线程环境。
+    fn cwd_change_enabled(&self, thread_id: &str) -> bool {
+        let state = self.app.state::<AppState>();
+        if !state.settings.lock().unwrap().auto_change_project_enabled
+            || state.context_service.endpoint().is_empty()
+        {
+            return false;
+        }
+        self.kind.is_codebuddy()
+            || self.kind == AgentKind::Claude
+            || (self.kind == AgentKind::Devin
+                && !crate::auto_tool_env(&state, thread_id).is_empty())
+    }
+
     fn cwd_change_scope(&self, thread_id: &str) -> String {
         format!(
             "{}:{}:{thread_id}",
@@ -4228,8 +4241,7 @@ impl AcpManager {
             };
             let target = (|| {
                 let state = self.app.state::<AppState>();
-                if !(self.kind.is_codebuddy() || self.kind == AgentKind::Claude)
-                    || !state.settings.lock().unwrap().auto_change_project_enabled
+                if !self.cwd_change_enabled(thread_id)
                     || !self.is_running(thread_id)
                     || !changes.is_current()
                 {
@@ -4599,9 +4611,7 @@ impl AcpManager {
             let settings = state.settings.lock().unwrap();
             settings.context_retrieval_mode.as_str().to_string()
         };
-        let auto_change_project = (self.kind.is_codebuddy() || self.kind == AgentKind::Claude)
-            && state.settings.lock().unwrap().auto_change_project_enabled
-            && !state.context_service.endpoint().is_empty();
+        let auto_change_project = self.cwd_change_enabled(thread_id);
         if !auto_change_project && state.context_service.endpoint().is_empty()
         {
             return Ok(json!([]));
@@ -5428,6 +5438,14 @@ mod codebuddy_acp_tests {
         assert!(rules.contains("crate::codex_app_server::rtk_guidance()"));
         assert!(rules.contains("ponytail_enabled"));
         assert!(rules.contains("crate::lyra::PONYTAIL_RULES"));
+        // Devin 自动模式线程：MCP 环境带 cwd scope，提示词宣传工具，切换请求不被拒。
+        let spawn = source.split("async fn spawn_conn(").nth(1).unwrap()
+            .split("cmd.stdin(").next().unwrap();
+        assert!(spawn.contains("auto_env.push((\"NOVA_CWD_CHANGE_SCOPE\""));
+        let enabled = source.split("fn cwd_change_enabled(").nth(1).unwrap()
+            .split("fn cwd_change_scope(").next().unwrap();
+        assert!(enabled.contains("self.kind == AgentKind::Devin"));
+        assert!(source.contains("if !self.cwd_change_enabled(thread_id)\n"));
         let steer = source.split("pub async fn steer_prompt(").nth(1).unwrap()
             .split("async fn drive_prompt(").next().unwrap();
         assert!(steer.contains("self.build_user_prompt_blocks(&thread_id, &text, &images, false)"));
