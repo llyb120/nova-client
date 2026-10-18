@@ -1371,7 +1371,16 @@ async fn stream_chat_once(
         }
         "anthropic-messages" => {
             let body = anthropic_body(model, system_prompt, messages, tools, thinking_level);
-            stream_anthropic(http, model, api_key, body, session_id, cancel, on_event).await
+            match stream_anthropic(http, model, api_key, body, session_id, cancel, on_event).await {
+                // 签名绑定原会话前缀：工具列表/系统提示变化或子 agent fork 后会被 400 拒绝。
+                // 400 发生在流开始前，去掉签名（思考降级为文本）重发一次即可。
+                // ponytail: 历史里的旧签名不改写，受影响会话每次请求多一次快速 400；需要时可按工具指纹预先剔除。
+                Err(error) if error.contains("Invalid `signature`") => {
+                    let body = anthropic_body(model, system_prompt, &unsigned_thinking(messages), tools, thinking_level);
+                    stream_anthropic(http, model, api_key, body, session_id, cancel, on_event).await
+                }
+                outcome => outcome,
+            }
         }
         other => Err(format!("Lyra 暂不支持协议 {other}")),
     }
@@ -1487,6 +1496,22 @@ fn anthropic_thinking_budget(level: Option<&str>, max_output_tokens: u64) -> Opt
     // Anthropic 要求 max_tokens > budget_tokens。
     let cap = max_output_tokens.saturating_sub(1024).max(1024).min(max_output_tokens - 1);
     Some(budget.min(cap))
+}
+
+/// 去掉 assistant 思考块的签名，让 anthropic_messages 按无签名路径降级回放。
+fn unsigned_thinking(messages: &[Value]) -> Vec<Value> {
+    let mut messages = messages.to_vec();
+    for message in &mut messages {
+        if message["role"] != "assistant" {
+            continue;
+        }
+        for block in message.get_mut("content").and_then(Value::as_array_mut).into_iter().flatten() {
+            if let Some(block) = block.as_object_mut().filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking")) {
+                block.remove("thinkingSignature");
+            }
+        }
+    }
+    messages
 }
 
 fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
@@ -2862,6 +2887,18 @@ mod tests {
         apply_reasoning_completions(&mut body, &model, Some("none"));
         assert_eq!(body["reasoning"]["enabled"], false);
         assert!(body["reasoning"].get("effort").is_none());
+    }
+
+    #[test]
+    fn unsigned_thinking_downgrades_signed_blocks_to_text() {
+        let model = test_model("anthropic-messages");
+        let messages = vec![json!({"role":"assistant","api":"anthropic-messages","provider":"p","model":"m","content":[
+            {"type":"thinking","thinking":"想","thinkingSignature":"sig"},
+            {"type":"thinking","thinking":"","thinkingSignature":"x","redacted":true},
+            {"type":"text","text":"答"}]})];
+        assert_eq!(anthropic_messages(&messages, &model)[0]["content"][0]["signature"], "sig");
+        let replay = anthropic_messages(&unsigned_thinking(&messages), &model);
+        assert_eq!(replay[0]["content"], json!([{"type":"text","text":"想"},{"type":"text","text":"答"}]));
     }
 
     #[test]
