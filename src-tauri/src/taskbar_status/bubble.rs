@@ -1,5 +1,6 @@
 //! A click on the taskbar Butterfly focuses the assistant in a reused transparent webview.
-//! Hover previews the same panel without taking focus. Finishing a turn does not open it.
+//! Hovering or dragging over the chip never opens it; only a failed drop surfaces it unfocused.
+//! Finishing a turn does not open it.
 
 use super::{Kind, Rect};
 use serde_json::{json, Value};
@@ -11,7 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT},
     Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED},
-    UI::WindowsAndMessaging::{GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowRect, GA_ROOTOWNER, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE},
+    UI::WindowsAndMessaging::{GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowRect, GA_ROOTOWNER, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE},
 };
 
 const LABEL: &str = "taskbar-bubble";
@@ -63,11 +64,20 @@ pub(super) fn window(app: &AppHandle) -> Option<WebviewWindow> {
         let result = unsafe { DwmSetWindowAttribute(hwnd.0 as _, DWMWA_TRANSITIONS_FORCEDISABLED as u32,
             &disabled as *const _ as _, size_of::<i32>() as u32) };
         if result < 0 { eprintln!("[taskbar-status] cannot disable bubble transitions: {result:#x}"); }
+        // tao keeps WS_CAPTION on undecorated windows and strips it in WM_NCCALCSIZE, but the
+        // frame computed during creation still has the caption; only tao's show() refreshed it.
+        // We show natively (see focus()), so refresh the frame once here while still hidden.
+        unsafe { SetWindowPos(hwnd.0 as _, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED); }
     }
     let handle = app.clone();
+    let panel = window.hwnd().map_or(0, |hwnd| hwnd.0 as isize);
     window.on_window_event(move |event| match event {
         tauri::WindowEvent::Focused(true) => { PANEL.store(false, Ordering::Release); }
-        tauri::WindowEvent::Focused(false) => hide(&handle),
+        // A file picker opened from the panel is owned by it: not a blur.
+        tauri::WindowEvent::Focused(false) => {
+            let fg = unsafe { GetForegroundWindow() };
+            if fg.is_null() || unsafe { GetAncestor(fg, GA_ROOTOWNER) } as isize != panel { hide(&handle); }
+        }
         tauri::WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             hide(&handle);
@@ -93,7 +103,7 @@ pub(super) fn open(app: &AppHandle, anchor: Anchor) {
     watch(app);
 }
 
-/// Hover: preview the assistant unless the panel is already open.
+/// Unfocused preview after a failed drop: show the assistant unless the panel is already open.
 pub(super) fn open_panel(app: &AppHandle, anchor: Anchor) {
     if WANTED.load(Ordering::Acquire) { return; }
     PANEL.store(true, Ordering::Release);
@@ -130,9 +140,15 @@ fn focus(window: &WebviewWindow) {
     let Ok(hwnd) = window.hwnd() else { return };
     let hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
     unsafe {
+        // Already active: do nothing. Re-moving focus into the WebView blurs/refocuses the
+        // textarea, whose focus handler calls activate() again, an endless focus loop.
+        if IsWindowVisible(hwnd) != 0 && GetForegroundWindow() == hwnd { return; }
         if IsWindowVisible(hwnd) == 0 { ShowWindow(hwnd, SW_SHOW); }
         SetForegroundWindow(hwnd);
     }
+    // A foreground HWND does not hand keyboard focus to WebView2 on its first activation
+    // (keys then reach the bare host window: no caret, IME at 0,0). Move it in explicitly.
+    let _ = AsRef::<tauri::Webview>::as_ref(window).set_focus();
 }
 
 fn inside(r: (i32, i32, i32, i32), p: POINT) -> bool { p.x >= r.0 && p.x < r.2 && p.y >= r.1 && p.y < r.3 }

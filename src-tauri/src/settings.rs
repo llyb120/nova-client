@@ -181,8 +181,6 @@ pub struct Settings {
     pub lyra_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
     pub windows_shell_shim_enabled: bool,
-    /// Windows 后台任务栏提示（实验）；默认关闭，保存后即时生效。
-    pub taskbar_status_enabled: bool,
     /// PowerShell 输出按 UTF-8 捕获（Lyra 的 bash 工具注入一次性前缀，把控制台
     /// 输出切到 UTF-8），避免 GBK(cp936) 与 UTF-8 解码错配产生乱码。默认开启。
     #[serde(default = "default_powershell_utf8")]
@@ -296,7 +294,6 @@ impl Default for Settings {
             codex_proxy: String::new(),
             lyra_proxy: String::new(),
             windows_shell_shim_enabled: false,
-            taskbar_status_enabled: false,
             powershell_utf8_enabled: true,
             auto_change_project_enabled: true,
             ponytail_enabled: true,
@@ -363,20 +360,9 @@ mod tests {
     }
 
     #[test]
-    fn taskbar_status_is_disabled_by_default_and_round_trips() {
-        assert!(!Settings::default().taskbar_status_enabled);
-        let legacy: Settings = serde_json::from_str(r#"{}"#).unwrap();
-        assert!(!legacy.taskbar_status_enabled);
-        for enabled in [false, true] {
-            let settings = Settings {
-                taskbar_status_enabled: enabled,
-                ..Settings::default()
-            };
-            let json = serde_json::to_value(&settings).unwrap();
-            assert_eq!(json["taskbarStatusEnabled"], enabled);
-            let restored: Settings = serde_json::from_value(json).unwrap();
-            assert_eq!(restored.taskbar_status_enabled, enabled);
-        }
+    fn removed_taskbar_status_toggle_still_loads() {
+        // Butterfly is always on; old configs carrying the toggle must still parse.
+        assert!(serde_json::from_str::<Settings>(r#"{"taskbarStatusEnabled":false}"#).is_ok());
     }
 
     #[test]

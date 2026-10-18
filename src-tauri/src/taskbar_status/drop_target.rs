@@ -91,19 +91,16 @@ pub(super) fn register(hwnd: HWND) -> Result<()> {
 pub(super) fn revoke() {
     // Drop outside the RefCell borrow: COM teardown can reenter the window procedure.
     let registration = REGISTERED.with(|slot| slot.borrow_mut().take());
-    if registration.is_some() { hover(None, false); }
+    if registration.is_some() { hover(false); }
     drop(registration);
 }
 
 /// Enter/Leave only, never DragOver. Drop cancels stale hover jobs and shares their UI lock.
-fn hover(anchor: Option<super::bubble::Anchor>, dragging: bool) {
+/// A drag never opens the panel; the chip's border lights up instead (see windows::glow).
+fn hover(dragging: bool) {
     let revision = HOVER_REVISION.fetch_add(1, Ordering::AcqRel) + 1;
     super::windows::on_app(move |app| {
         let _ui = UI_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        if HOVER_REVISION.load(Ordering::Acquire) != revision { return; }
-        if dragging {
-            if let Some(anchor) = anchor { super::bubble::open_panel(app, anchor); }
-        }
         if HOVER_REVISION.load(Ordering::Acquire) == revision {
             let _ = app.emit_to("taskbar-bubble", "capsules:dragging", dragging);
         }
@@ -126,7 +123,8 @@ impl IDropTarget_Impl for Target_Impl {
                 .any(|format| format != 0 && unsafe { data.QueryGetData(&format_etc(format)).is_ok() })
         }));
         *effect = copy_effect(*effect, self.supported.get());
-        hover(unsafe { super::windows::anchor(self.hwnd.0) }, *effect == DROPEFFECT_COPY);
+        unsafe { super::windows::glow(self.hwnd.0, *effect == DROPEFFECT_COPY); }
+        hover(*effect == DROPEFFECT_COPY);
         Ok(())
     }
 
@@ -138,12 +136,14 @@ impl IDropTarget_Impl for Target_Impl {
 
     fn DragLeave(&self) -> Result<()> {
         self.supported.set(false);
-        hover(None, false);
+        unsafe { super::windows::glow(self.hwnd.0, false); }
+        hover(false);
         Ok(())
     }
 
     fn Drop(&self, data: Ref<IDataObject>, _: MODIFIERKEYS_FLAGS, _: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
         self.supported.set(false);
+        unsafe { super::windows::glow(self.hwnd.0, false); }
         HOVER_REVISION.fetch_add(1, Ordering::AcqRel);
         let effect = unsafe { effect.as_mut() }.ok_or_else(|| windows::core::Error::from(E_POINTER))?;
         let allowed = copy_effect(*effect, true);

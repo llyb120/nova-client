@@ -39,14 +39,11 @@ const REFRESH: u32 = WM_APP + 1;
 const WM_MOUSELEAVE: u32 = 0x02A3; // Win32 Controls message paired with TME_LEAVE.
 static LAYOUT: Mutex<Option<Arc<Layout>>> = Mutex::new(None);
 const ANIMATION: usize = 1;
-/// Resting on the Butterfly this long opens the quick panel (the panel replaced the hover tooltip).
-const HOVER: usize = 2;
-const HOVER_MS: u32 = 120;
+const GLOW: usize = 2;
 
 // Everything below is touched only by the status message thread (refresh + window_proc).
 thread_local! {
     static CURRENT: RefCell<Option<Status>> = const { RefCell::new(None) };
-    static HOVERING: Cell<bool> = const { Cell::new(false) };
     static EPOCH: Instant = Instant::now();
     static ANIMATING: Cell<bool> = const { Cell::new(false) };
     /// This press found the bubble open, so its click only closes it.
@@ -56,6 +53,65 @@ thread_local! {
     static CLICKED: RefCell<Option<String>> = const { RefCell::new(None) };
     /// Taskbar theme the chip was last painted for.
     static LIGHT: Cell<bool> = const { Cell::new(false) };
+    /// A droppable drag is over the chip: paint the flowing rainbow border.
+    static GLOWING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Drop-target Enter/Leave/Drop run on this same STA thread (OLE was initialized here).
+pub(super) unsafe fn glow(hwnd: HWND, on: bool) {
+    GLOWING.set(on);
+    let mut motion = 1i32;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &mut motion as *mut _ as _, 0);
+    // Reduced motion keeps a still rainbow border.
+    if on && motion != 0 { SetTimer(hwnd, GLOW, 16, None); } else { KillTimer(hwnd, GLOW); }
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// Saturated-but-soft HSV hue (s=0.8, v=1), `h` in turns.
+fn rainbow(h: f64) -> u32 {
+    let channel = |n: f64| {
+        let k = (n + h.rem_euclid(1.0) * 6.0) % 6.0;
+        ((1.0 - 0.8 * k.min(4.0 - k).clamp(0.0, 1.0)) * 255.0).round() as u32
+    };
+    rgb(channel(5.0), channel(3.0), channel(1.0))
+}
+
+/// Point at `s` (0..1) along a stadium's centerline inset by `inset`, clockwise from the top-left.
+fn stadium_point(width: i32, height: i32, inset: f64, s: f64) -> POINT {
+    use std::f64::consts::PI;
+    let r = height as f64 / 2.0;
+    let radius = (r - inset).max(0.0);
+    let straight = (width as f64 - 2.0 * r).max(0.0);
+    let arc = PI * radius;
+    let d = s.rem_euclid(1.0) * (2.0 * straight + 2.0 * arc);
+    let angle = |d: f64, start: f64| start + d / radius.max(1e-6);
+    let (x, y) = if d < straight {
+        (r + d, inset)
+    } else if d < straight + arc {
+        let a = angle(d - straight, -PI / 2.0);
+        (r + straight + radius * a.cos(), r + radius * a.sin())
+    } else if d < 2.0 * straight + arc {
+        (r + straight - (d - straight - arc), height as f64 - inset)
+    } else {
+        let a = angle(d - 2.0 * straight - arc, PI / 2.0);
+        (r + radius * a.cos(), r + radius * a.sin())
+    };
+    POINT { x: x.round() as i32, y: y.round() as i32 }
+}
+
+/// Flowing rainbow border: hues travel clockwise around the pill, with a soft inner halo.
+unsafe fn glow_border(dc: HDC, rect: RECT, px: impl Fn(i32) -> i32, background: u32, high_contrast: bool) {
+    const SEGMENTS: usize = 120;
+    let t = EPOCH.with(|e| e.elapsed().as_secs_f64()) * 0.6;
+    for (width, halo) in [(px(5).max(3), 0.6), (px(2).max(2), 0.0)] {
+        let inset = width as f64 / 2.0;
+        for i in 0..SEGMENTS {
+            let s = i as f64 / SEGMENTS as f64;
+            let color = if high_contrast { GetSysColor(COLOR_HIGHLIGHT) } else { mix(rainbow(s - t), background, halo) };
+            let ends = [s, s + 1.0 / SEGMENTS as f64].map(|s| stadium_point(rect.right, rect.bottom, inset, s));
+            stroke(dc, &ends, width, color);
+        }
+    }
 }
 
 /// Windows' own taskbar/Start theme (not the app theme). Missing on old Windows 10: dark.
@@ -375,6 +431,7 @@ unsafe fn refresh(shown: &mut Option<Status>) {
             eprintln!("[taskbar-status] cannot register drop target: {error}");
         }
         ANIMATING.set(false);
+        GLOWING.set(false);
         *shown = None;
         // Warm the bubble webview now so clicks open at once.
         on_app(|app| { super::bubble::window(app); });
@@ -765,6 +822,7 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     SelectObject(target, old_font);
     if !font.is_null() { DeleteObject(font); }
     if !small.is_null() { DeleteObject(small); }
+    if GLOWING.get() { glow_border(target, rect, px, colors.background, high_contrast); }
     if buffered {
         let mut client = RECT::default();
         GetClientRect(hwnd, &mut client);
@@ -779,15 +837,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
     match message {
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONDOWN => {
-            KillTimer(hwnd, HOVER);
             CLICKED.with(|clicked| *clicked.borrow_mut() = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone())));
             on_app(|app| { super::bubble::window(app); });
             0
         }
         WM_LBUTTONUP => {
             if DOUBLE.replace(false) { return 0; }
-            // Every click is a quick-entry gesture, even when hover already opened the panel.
-            // A double click still hands over to Nova and closes the panel it just opened.
+            // Only a click opens the panel (no hover preview). A double click still hands over to Nova and closes the panel it just opened.
             if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open(app, anchor)); }
             0
         }
@@ -810,12 +866,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             0
         }
-        WM_TIMER if wparam == HOVER => {
-            KillTimer(hwnd, HOVER);
-            let mut cursor = POINT::default();
-            if HOVERING.get() && GetCursorPos(&mut cursor) != 0 && WindowFromPoint(cursor) == hwnd {
-                if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open_panel(app, anchor)); }
-            }
+        WM_TIMER if wparam == GLOW => {
+            RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_UPDATENOW);
             0
         }
         WM_SIZE => {
@@ -832,13 +884,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_MOUSEMOVE => {
             let mut tracking = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
             TrackMouseEvent(&mut tracking);
-            if !HOVERING.replace(true) { SetTimer(hwnd, HOVER, HOVER_MS, None); }
             InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_MOUSELEAVE => {
-            HOVERING.set(false);
-            KillTimer(hwnd, HOVER);
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -970,6 +1019,21 @@ mod tests {
                 assert!(((chip.top - slot.top) - (slot.bottom - chip.bottom)).abs() <= 1);
             }
         }
+    }
+
+    #[test]
+    fn glow_border_is_a_closed_stadium_inside_the_chip_with_rainbow_hues() {
+        let (w, h, inset) = (160, 28, 1.0);
+        let points: Vec<POINT> = (0..=480).map(|i| stadium_point(w, h, inset, i as f64 / 480.0)).collect();
+        assert_eq!((points[0].x, points[0].y), (14, 1));
+        assert_eq!((points[480].x, points[480].y), (points[0].x, points[0].y));
+        for pair in points.windows(2) {
+            assert!((pair[0].x - pair[1].x).abs() <= 2 && (pair[0].y - pair[1].y).abs() <= 2, "gap at {:?}", (pair[0].x, pair[0].y));
+        }
+        assert!(points.iter().all(|p| (0..=w).contains(&p.x) && (0..=h).contains(&p.y)));
+        assert_eq!(rainbow(0.0), rgb(255, 51, 51));
+        assert_eq!(rainbow(1.0 / 3.0), rgb(51, 255, 51));
+        assert_eq!(rainbow(-1.0 / 3.0), rgb(51, 51, 255));
     }
 
     #[test]

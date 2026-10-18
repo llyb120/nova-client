@@ -262,9 +262,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
   );
-  const [taskbarStatusEnabled, setTaskbarStatusEnabled] = createSignal(
-    s?.taskbarStatusEnabled ?? false,
-  );
   const [powershellUtf8Enabled, setPowershellUtf8Enabled] = createSignal(
     s?.powershellUtf8Enabled ?? true,
   );
@@ -651,7 +648,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     codexProxy: codexProxy().trim(),
     lyraProxy: lyraProxy().trim(),
     windowsShellShimEnabled: windowsShellShimEnabled(),
-    taskbarStatusEnabled: taskbarStatusEnabled(),
     powershellUtf8Enabled: powershellUtf8Enabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
     ponytailEnabled: ponytailEnabled(),
@@ -1604,19 +1600,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
 
             <section class="settings-group">
               <h3 class="settings-group-title">Windows 启动</h3>
-              <div class="field">
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={taskbarStatusEnabled()}
-                    onChange={(e) => setTaskbarStatusEnabled(e.currentTarget.checked)}
-                  />
-                  <span>Windows 任务栏 Butterfly（实验）</span>
-                </label>
-                <span class="field-hint">
-                  开启后常驻 Windows 任务栏空闲区域：运行中蝴蝶振翅并显示当前动作与耗时，待确认时提醒，任务结束后显示结果摘要。悬停打开助理面板，单击后可直接输入，回车发送给助理；助理使用轻量模型回复、搜索历史并调度会话，新会话默认自动模式（助理当前要求轻量化场景首选为 Lyra，以禁用执行工具）。面板中可查看最新会话进展、处理确认或使用快捷操作，点击会话卡片或双击 Butterfly 打开 Nova 对应会话。默认关闭；保存后即时生效。
-                </span>
-              </div>
               <div class="field">
                 <span class="field-label">Windows shell 启动 shim</span>
                 <label class="backend-switch">
