@@ -298,11 +298,6 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                         添加模型
                       </button>
                     </div>
-                    <label class="backend-field">
-                      <span class="field-label">关键词过滤</span>
-                      <span class="field-hint">仅在模型选择器中保留 ID 或名称包含这些关键词的模型；多个用逗号分隔，不分大小写，留空则不过滤。</span>
-                      <input class="field-input" placeholder="如 claude, gpt-5" value={p().modelFilter} onInput={(e) => setP((x) => (x.modelFilter = e.currentTarget.value))} />
-                    </label>
                     <Show when={preset()}>
                       {(() => {
                         const result = () => fetched[p().id.trim()];
@@ -422,6 +417,10 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                         <label class="backend-field">
                           <span class="field-label">代理</span>
                           <input class="field-input" placeholder="留空跟随 Lyra 全局代理" value={p().proxy} onInput={(e) => setP((x) => (x.proxy = e.currentTarget.value))} />
+                        </label>
+                        <label class="backend-field">
+                          <span class="field-label" title="仅在模型选择器中保留 ID 或名称包含这些关键词的模型；多个用逗号分隔，不分大小写">模型关键词过滤</span>
+                          <input class="field-input" placeholder="如 claude, gpt-5；留空不过滤" value={p().modelFilter} onInput={(e) => setP((x) => (x.modelFilter = e.currentTarget.value))} />
                         </label>
                       </div>
                       <KvEditor title="自定义请求头" hint={HEADER_HINT} rows={p().headers} keyPlaceholder="Header 名，如 X-Api-Version" valuePlaceholder="值" onChange={(fn) => setP((x) => fn(x.headers))} />
