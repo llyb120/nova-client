@@ -14,9 +14,12 @@ html.bubble-mode {
   --fg-2: #c7c7cc;
   --fg-3: #98989f;
   --fg-4: #6e6e73;
-  --bg-top: #232327;
-  --bg-bottom: #161618;
-  --shadow: 0 10px 28px rgba(0, 0, 0, 0.38), 0 2px 6px rgba(0, 0, 0, 0.28);
+  --bg-top: #202128;
+  --bg-bottom: #16171b;
+  --surface: rgb(255 255 255 / 0.06);
+  --brand: #91adff;
+  --brand-fill: linear-gradient(135deg, #7c95ff 0%, #4f6fd8 100%);
+  --shadow: 0 16px 40px rgba(0, 0, 0, 0.42), 0 2px 8px rgba(0, 0, 0, 0.28);
   --code-bg: rgba(0, 0, 0, 0.35);
   --field-bg: rgba(0, 0, 0, 0.3);
   --blue: #0a84ff;
@@ -38,9 +41,12 @@ html.bubble-mode.light {
   --fg-2: #424242;
   --fg-3: #616161;
   --fg-4: #8a8a8a;
-  --bg-top: #ffffff;
-  --bg-bottom: #f6f6f7;
-  --shadow: 0 10px 28px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.08);
+  --bg-top: #f8f9fc;
+  --bg-bottom: #f1f3f8;
+  --surface: #fff;
+  --brand: #4363c7;
+  --brand-fill: linear-gradient(135deg, #6584f0 0%, #4363c7 100%);
+  --shadow: 0 16px 40px rgba(30, 40, 80, 0.16), 0 2px 8px rgba(30, 40, 80, 0.08);
   --code-bg: rgba(0, 0, 0, 0.04);
   --field-bg: #fff;
   --blue: #005fb8;
@@ -64,11 +70,11 @@ html.bubble-mode.light {
   flex-direction: column;
   gap: 10px;
   padding: 14px 16px 12px;
-  border-radius: 18px;
+  border-radius: 16px;
   color: var(--fg);
   font: 13px/1.55 "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
   background:
-    radial-gradient(120% 60% at 0% 0%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 60%),
+    radial-gradient(90% 40% at 100% 0%, color-mix(in srgb, var(--brand) 10%, transparent), transparent 70%),
     linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
   border: 1px solid rgb(var(--ink) / 0.09);
   box-shadow: var(--shadow), inset 0 1px 0 rgba(255, 255, 255, 0.06);
@@ -87,7 +93,7 @@ html.bubble-mode.light {
 .running .tb-wings { animation: tb-flap 0.6s ease-in-out infinite; }
 .waiting .tb-wings { animation: tb-flap 1.4s ease-in-out infinite; }
 @keyframes tb-flap { 50% { transform: scaleX(0.2); } }
-.tb-state { font-size: 12px; font-weight: 600; color: var(--accent); letter-spacing: 0.02em; }
+.tb-state { font-size: 13.5px; font-weight: 600; color: var(--fg-strong); letter-spacing: 0.01em; }
 .tb-time { font-size: 12px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
 .tb-close {
   margin-left: auto;
@@ -279,12 +285,12 @@ html.bubble-mode.light {
 }
 
 /* Shared panel; changing tabs or live cards never changes its size or assistant identity. */
-.tb-panel { flex-direction: row; gap: 10px; padding: 12px 12px 12px 8px; height: min(624px, calc(100vh - 16px)); flex: none; min-height: 0; overflow: hidden; }
-.tb-tabs { flex: none; display: flex; flex-direction: column; gap: 4px; padding-right: 8px; border-right: 1px solid rgb(var(--ink) / 0.08); }
-.tb-tabs button { min-width: 56px; min-height: 40px; padding: 9px 12px; border: 0; border-radius: 8px; font: inherit; font-size: 14px; color: var(--fg-3); background: transparent; cursor: pointer; white-space: nowrap; }
-.tb-tabs button:hover { background: rgb(var(--ink) / 0.07); }
-.tb-tabs button.active { color: var(--fg-strong); background: rgb(var(--ink) / 0.11); font-weight: 600; }
-.tb-tabs button.rec::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 4px; border-radius: 50%; background: #f59e0b; vertical-align: middle; }
+.tb-panel { flex-direction: row; gap: 12px; padding: 12px 12px 12px 8px; height: min(624px, calc(100vh - 16px)); flex: none; min-height: 0; overflow: hidden; }
+.tb-tabs { flex: none; display: flex; flex-direction: column; gap: 4px; padding-right: 8px; border-right: 1px solid rgb(var(--ink) / 0.07); }
+.tb-tabs button { position: relative; display: flex; flex-direction: column; align-items: center; gap: 3px; width: 54px; padding: 9px 4px 7px; border: 0; border-radius: 11px; font: inherit; font-size: 11.5px; line-height: 1.2; color: var(--fg-3); background: transparent; cursor: pointer; white-space: nowrap; transition: background 120ms, color 120ms; }
+.tb-tabs button:hover { color: var(--fg); background: rgb(var(--ink) / 0.05); }
+.tb-tabs button.active { color: var(--brand); background: color-mix(in srgb, var(--brand) 13%, transparent); font-weight: 600; }
+.tb-tabs button.rec::after { content: ""; position: absolute; top: 7px; right: 11px; width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; box-shadow: 0 0 0 2px var(--bg-top); }
 .tb-panel-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
 .tb-capsules-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .tb-capsules-pane[hidden] { display: none; }
@@ -296,16 +302,16 @@ html.bubble-mode.light {
 .tb-capture-error { position: absolute; z-index: 21; inset: auto 26px 22px; padding: 12px 32px 12px 14px; border: 1px solid color-mix(in srgb, var(--red) 35%, transparent); border-radius: 12px; background: var(--bg-top); color: var(--red-text); font: 12px/1.5 system-ui, sans-serif; box-shadow: var(--shadow); overflow-wrap: anywhere; }
 .tb-capture-error button { position: absolute; right: 8px; top: 8px; border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 18px; }
 .tb-capture-progress { position: absolute; z-index: 21; top: 18px; left: 50%; transform: translateX(-50%); padding: 7px 14px; border: 1px solid color-mix(in srgb, var(--link) 30%, transparent); border-radius: 999px; background: var(--bg-top); color: var(--link); font: 12px/1.5 system-ui, sans-serif; pointer-events: none; box-shadow: var(--shadow); }
-.tb-tab-count { display: inline-block; margin-left: 3px; padding: 0 4px; border-radius: 5px; color: var(--on-orange); background: var(--orange); font-size: 10px; }
+.tb-tab-count { position: absolute; top: 4px; right: 7px; min-width: 15px; padding: 0 4px; border-radius: 999px; color: var(--on-orange); background: var(--orange); font-size: 10px; font-weight: 600; line-height: 15px; text-align: center; }
 .tb-session-list { flex: 1; min-height: 0; overflow-y: auto; }
 .tb-session { display: flex; flex-direction: column; gap: 8px; }
 .tb-session + .tb-session { margin-top: 16px; padding-top: 12px; border-top: 1px solid rgb(var(--ink) / 0.1); }
 #tb-pane-quick { flex: 1; overflow-y: auto; min-height: 0; }
 .tb-panel .tb-body { flex: 1 0 auto; max-height: none; overflow: visible; }
-.tb-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; }
-.tb-tile { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px 2px; border: 0; border-radius: 10px; font: inherit; font-size: 11.5px; color: var(--fg-2); background: transparent; cursor: pointer; white-space: nowrap; }
-.tb-tile svg { padding: 7px; width: 36px; height: 36px; border-radius: 10px; color: var(--fg); background: rgb(var(--ink) / 0.08); }
-.tb-tile:hover { background: rgb(var(--ink) / 0.06); }
+.tb-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding-top: 2px; }
+.tb-tile { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 14px 6px 12px; border: 1px solid rgb(var(--ink) / 0.06); border-radius: 12px; font: inherit; font-size: 12px; color: var(--fg-2); background: var(--surface); cursor: pointer; white-space: nowrap; transition: border-color 120ms, transform 120ms, box-shadow 120ms; }
+.tb-tile svg { padding: 8px; width: 38px; height: 38px; border-radius: 11px; color: var(--brand); background: color-mix(in srgb, var(--brand) 12%, transparent); }
+.tb-tile:hover { border-color: color-mix(in srgb, var(--brand) 35%, transparent); box-shadow: 0 4px 14px rgb(0 0 0 / 0.06); transform: translateY(-1px); }
 .tb-tile:active { transform: scale(0.96); }
 /* Recording: the same warm amber as the edge glow, never the jianlai sky blue. */
 .tb-tile.hot { color: #d97706; }

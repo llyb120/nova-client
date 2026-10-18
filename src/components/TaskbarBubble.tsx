@@ -30,10 +30,15 @@ type Payload = { cards: Card[]; permissions: Permission[]; light: boolean; panel
 
 type PanelData = { jianpu: { recording: boolean; id?: string; elapsedMs?: number } };
 type Tab = "assistant" | "session" | "capsules" | "quick";
-const TABS: [Tab, string][] = [["assistant", "助理"], ["session", "会话"], ["capsules", "星屑"], ["quick", "快捷"]];
+const TABS: [Tab, string, string][] = [
+  ["assistant", "助理", "M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1L5 10.5l5.1-1.9zM18.5 15.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"],
+  ["session", "会话", "M5.5 5h13A1.5 1.5 0 0120 6.5v8a1.5 1.5 0 01-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 014 14.5v-8A1.5 1.5 0 015.5 5zM8.5 10.5h7"],
+  ["capsules", "星屑", "M12 3.8l2.5 5.1 5.6.8-4 4 .9 5.6-5-2.6-5 2.6.9-5.6-4-4 5.6-.8z"],
+  ["quick", "快捷", "M5 4.5h4.5A.5.5 0 0110 5v4.5a.5.5 0 01-.5.5H5a.5.5 0 01-.5-.5V5a.5.5 0 01.5-.5zM14.5 4.5H19a.5.5 0 01.5.5v4.5a.5.5 0 01-.5.5h-4.5a.5.5 0 01-.5-.5V5a.5.5 0 01.5-.5zM5 14h4.5a.5.5 0 01.5.5V19a.5.5 0 01-.5.5H5a.5.5 0 01-.5-.5v-4.5A.5.5 0 015 14zM14.5 14H19a.5.5 0 01.5.5V19a.5.5 0 01-.5.5h-4.5a.5.5 0 01-.5-.5v-4.5a.5.5 0 01.5-.5z"],
+];
 const clock = (ms = 0) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
-const icon = (d: string) => (
-  <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d={d} fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" /></svg>
+const icon = (d: string, size = 22) => (
+  <svg viewBox="0 0 24 24" width={size} height={size} aria-hidden="true"><path d={d} fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" /></svg>
 );
 const ICONS = {
   brush: "M4 20l4.5-1.2L19 8.3a2.1 2.1 0 00-3-3L5.5 15.8 4 20zM14.5 6.8l3 3",
@@ -64,7 +69,7 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
     <div class={`tb-card tb-panel ${props.card?.kind ?? "idle"}`}>
       <nav class="tb-tabs" role="tablist" aria-label="蝴蝶面板" aria-orientation="vertical">
         <For each={TABS}>
-          {([id, label]) => (
+          {([id, label, d]) => (
             <button id={`tb-tab-${id}`} role="tab" aria-controls={`tb-pane-${id}`} aria-selected={props.tab === id} tabIndex={props.tab === id ? 0 : -1} classList={{ active: props.tab === id, rec: id === "quick" && rec() }} onClick={() => props.setTab(id)} onKeyDown={(event) => {
               if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
               event.preventDefault();
@@ -73,7 +78,7 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
               props.setTab(TABS[next][0]);
               document.getElementById(`tb-tab-${TABS[next][0]}`)?.focus();
             }}>
-              {label}<Show when={id === "session" && props.permissionCount}><span class="tb-tab-count">{props.permissionCount}</span></Show>
+              {icon(d, 19)}<span>{label}</span><Show when={id === "session" && props.permissionCount}><span class="tb-tab-count">{props.permissionCount}</span></Show>
             </button>
           )}
         </For>
