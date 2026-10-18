@@ -1,4 +1,4 @@
-//! Opt-in Windows taskbar child, not a desktop overlay. Its pixels remain in screenshots;
+//! Always-on Windows taskbar child, not a desktop overlay. Its pixels remain in screenshots;
 //! Jianlai only exempts text repaint inside an unchanged, verified child rectangle.
 
 pub(crate) mod assistant;
@@ -414,6 +414,10 @@ mod tests {
         // Two individually valid but overlapping occupied spans are a single obstruction.
         let almost_full = Rect { right: -100, ..bar };
         assert!(free_slot(bar, &[almost_full, tray], 240, 160, 4).is_none());
+        // The icon-only fallback still fits the 92px gap that the full chip rejected.
+        let crowded = Rect { right: -400, ..bar };
+        assert!(free_slot(bar, &[crowded, tray], 240, 160, 4).is_none());
+        assert_eq!(free_slot(bar, &[crowded, tray], 240, 34, 4), Some(Rect { left: -396, right: -304, ..slot }));
     }
 
     #[test]

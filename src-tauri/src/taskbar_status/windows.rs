@@ -32,6 +32,8 @@ use windows_sys::{
 
 const CLASS: *const u16 = w!("Nova.TaskbarStatus");
 const MAX_AGE: Duration = Duration::from_millis(1500);
+/// Logical width of the icon-only chip: the leading butterfly slot plus a symmetric cap.
+const ICON_ONLY: i32 = 34;
 static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
 static WINDOW: AtomicUsize = AtomicUsize::new(0);
 static THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -290,7 +292,11 @@ unsafe fn query_layout() -> Option<Layout> {
         return None;
     }
     let dpi = GetDpiForWindow(parent) as i32;
-    let slot = pill_slot(free_slot(taskbar, &occupied, 300 * dpi / 96, 160 * dpi / 96, 6 * dpi / 96)?, dpi);
+    let (desired, gap) = (300 * dpi / 96, 6 * dpi / 96);
+    // Centered taskbars shrink the gaps as apps open; degrade to a shorter label, then the
+    // icon-only chip (butterfly + padding), instead of hiding Butterfly.
+    let slot = [160, 96, ICON_ONLY].into_iter().find_map(|min| free_slot(taskbar, &occupied, desired, min * dpi / 96, gap));
+    let slot = pill_slot(slot?, dpi);
     if !same_rect(&taskbar, &taskbar_rect(parent)?) || FindWindowW(w!("Shell_TrayWnd"), null()) != parent {
         return None;
     }
@@ -797,7 +803,8 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     let font = CreateFontW(-px(12), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, w!("Segoe UI"));
     let small = CreateFontW(-px(11), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, CLEARTYPE_QUALITY as u32, 0, w!("Segoe UI"));
     let old_font = SelectObject(target, GetStockObject(DEFAULT_GUI_FONT));
-    let (text, trailing) = status.map_or_else(Default::default, |s| (s.text, s.trailing));
+    // Icon-only chip: no room for a readable label, so skip text instead of drawing a lone ellipsis.
+    let (text, trailing) = status.filter(|_| rect.right >= px(ICON_ONLY + 30)).map_or_else(Default::default, |s| (s.text, s.trailing));
     let left = px(32);
     let mut right = rect.right - px(12);
     if !trailing.is_empty() {
