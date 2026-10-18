@@ -30,7 +30,8 @@
 .ta-message.user .ta-bubble { border-radius: 10px 3px 10px 10px; color: #14391b; background: #95ec69; }
 .ta-thread { margin-top: 4px; font-size: 11px; }
 .ta-latest { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); padding: 4px 12px; border: 1px solid rgb(var(--ink) / 0.12); border-radius: 12px; color: var(--link); background: var(--bg-top); box-shadow: 0 2px 8px #0002; font: inherit; font-size: 11px; cursor: pointer; }
-.ta-compose { flex: none; display: flex; flex-direction: column; gap: 7px; }
+/* Shared by every tab: sits below whichever pane is visible. */
+.ta-compose { flex: none; order: 1; display: flex; flex-direction: column; gap: 7px; }
 .ta-input { width: 100%; min-height: 52px; max-height: 84px; resize: none; field-sizing: content; line-height: 1.5; user-select: text; }
 .ta-input::placeholder { color: var(--fg-3); }
 .ta-compose-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

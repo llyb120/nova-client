@@ -57,6 +57,18 @@ pub async fn complete_direct(
     model_selection: &str,
     prompt: &str,
 ) -> Result<String, String> {
+    complete_direct_image(http, data_dir, env, model_selection, prompt, None).await
+}
+
+/// 同 complete_direct，可附一张图片（data URL）；模型不支持视觉时由 provider 报错。
+pub async fn complete_direct_image(
+    http: &reqwest::Client,
+    data_dir: &Path,
+    env: &HashMap<String, String>,
+    model_selection: &str,
+    prompt: &str,
+    image: Option<&str>,
+) -> Result<String, String> {
     let config = load_config(data_dir)?;
     let target = resolve_target(&config, model_selection, env)?;
     // 模型在 config.jsonc 声明了 options.proxy 时改用按代理地址缓存的客户端。
@@ -69,8 +81,8 @@ pub async fn complete_direct(
         None => http,
     };
     match target.api.as_str() {
-        "openai-completions" => complete_openai_completions(http, &target, prompt).await,
-        "openai-responses" => complete_openai_responses(http, &target, prompt).await,
+        "openai-completions" => complete_openai_completions(http, &target, prompt, image).await,
+        "openai-responses" => complete_openai_responses(http, &target, prompt, image).await,
         other => Err(format!("补全暂不支持直连协议：{other}")),
     }
 }
@@ -79,11 +91,16 @@ async fn complete_openai_completions(
     http: &reqwest::Client,
     target: &ResolvedCompletionTarget,
     prompt: &str,
+    image: Option<&str>,
 ) -> Result<String, String> {
     let url = join_url(&target.base_url, "chat/completions");
+    let content = match image {
+        Some(url) => json!([{ "type": "text", "text": prompt }, { "type": "image_url", "image_url": { "url": url } }]),
+        None => json!(prompt),
+    };
     let mut body = json!({
         "model": target.model_id,
-        "messages": [{ "role": "user", "content": prompt }],
+        "messages": [{ "role": "user", "content": content }],
         "stream": true,
     });
     body[target.max_tokens_field] = json!(COMPLETION_MAX_TOKENS);
@@ -105,11 +122,16 @@ async fn complete_openai_responses(
     http: &reqwest::Client,
     target: &ResolvedCompletionTarget,
     prompt: &str,
+    image: Option<&str>,
 ) -> Result<String, String> {
     let url = join_url(&target.base_url, "responses");
+    let content = match image {
+        Some(url) => json!([{ "type": "input_text", "text": prompt }, { "type": "input_image", "image_url": url }]),
+        None => json!(prompt),
+    };
     let mut body = json!({
         "model": target.model_id,
-        "input": [{ "role": "user", "content": prompt }],
+        "input": [{ "role": "user", "content": content }],
         "stream": true,
         "store": false,
         "max_output_tokens": COMPLETION_MAX_TOKENS.max(16),

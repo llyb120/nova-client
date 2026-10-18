@@ -11,9 +11,47 @@ type View = { id?: string; offset: number; top: number; bottom: boolean };
 const LABEL = { running: "进行中", waiting: "待确认", done: "已完成", error: "出错了" };
 const PAGE_SIZE = 30;
 
-export default function TaskbarAssistant(props: { active: boolean; focusRequest: number }) {
-  const [messages, setMessages] = createStore<Message[]>([]);
+/** `active`: assistant tab visible; `shown`: panel visible. The compose box serves every tab. */
+/** 会话动态 for the 会话 tab: the user's own running / recently finished sessions. */
+export function TaskbarSessions(props: { active: boolean }) {
   const [sessions, setSessions] = createStore<Session[]>([]);
+  const [error, setError] = createSignal("");
+  const refresh = async () => {
+    if (!props.active) return;
+    try {
+      const current = await invoke<Session[]>("taskbar_assistant_sessions");
+      const rank = (session: Session) => session.kind === "running" || session.kind === "waiting" ? 0 : 1;
+      setSessions(reconcile([...current].sort((a, b) => rank(a) - rank(b) || b.updatedAt - a.updatedAt), { key: "threadId" }));
+      setError("");
+    } catch (e) { setError(String(e)); }
+  };
+  createEffect(() => {
+    if (!props.active) return;
+    untrack(() => void refresh());
+    const timer = window.setInterval(() => void refresh(), 3000);
+    onCleanup(() => clearInterval(timer));
+  });
+  const open = (threadId: string) => void invoke("taskbar_bubble_open", { threadId }).catch((e) => setError(String(e)));
+  return (
+    <section class="ta-sessions" aria-label="运行中和最近完成的会话">
+      <div class="ta-section-title">会话动态 <span>最新步骤 / 结论</span></div>
+      <div class="ta-session-list">
+        <For each={sessions} fallback={<div class="ta-empty">暂无运行中或最近完成的会话</div>}>
+          {(session) => (
+            <button class="ta-session" onClick={() => open(session.threadId)}>
+              <span class="ta-session-heading"><strong>{session.title || "未命名会话"}</strong><span class={`ta-status ${session.kind}`}>{LABEL[session.kind]}</span></span>
+              <span class="ta-session-text">{session.text || "暂无更新"}</span>
+            </button>
+          )}
+        </For>
+      </div>
+      <Show when={error()}><div class="ta-error" role="alert">{error()}</div></Show>
+    </section>
+  );
+}
+
+export default function TaskbarAssistant(props: { active: boolean; shown: boolean; focusRequest: number }) {
+  const [messages, setMessages] = createStore<Message[]>([]);
   const [text, setText] = createSignal("");
   const [sending, setSending] = createSignal(false);
   const [backendBusy, setBackendBusy] = createSignal(false);
@@ -75,10 +113,7 @@ export default function TaskbarAssistant(props: { active: boolean; focusRequest:
     refreshing = true;
     refreshAgain = false;
     const revision = messageRevision;
-    const [recent, current] = await Promise.allSettled([
-      invoke<History>("taskbar_assistant_history", { limit: PAGE_SIZE }),
-      invoke<Session[]>("taskbar_assistant_sessions"),
-    ]);
+    const [recent] = await Promise.allSettled([invoke<History>("taskbar_assistant_history", { limit: PAGE_SIZE })]);
     if (disposed) return;
     const errors: string[] = [];
     if (revision !== messageRevision) refreshAgain = true;
@@ -107,10 +142,6 @@ export default function TaskbarAssistant(props: { active: boolean; focusRequest:
         }
       } catch (error) { errors.push(`聊天记录：${String(error)}`); }
     } else errors.push(`聊天记录：${String(recent.reason)}`);
-    if (current.status === "fulfilled") {
-      const rank = (session: Session) => session.kind === "running" || session.kind === "waiting" ? 0 : 1;
-      setSessions(reconcile([...current.value].sort((a, b) => rank(a) - rank(b) || b.updatedAt - a.updatedAt), { key: "threadId" }));
-    } else errors.push(`会话动态：${String(current.reason)}`);
     setLoadError(errors.join("；"));
     setLoading(false);
     refreshing = false;
@@ -140,13 +171,17 @@ export default function TaskbarAssistant(props: { active: boolean; focusRequest:
     if (!value || busy() || composing) return;
     setSending(true);
     setSendError("");
+    setText(""); // Clear now: dispatch waits for the model, which can take seconds.
     try {
       // The assistant only dispatches. Never send this text via taskbar_bubble_reply.
       const message = await invoke<Message>("taskbar_assistant_send", { text: value });
       if (disposed) return;
       merge([message]);
-      if (text() === draft) setText(""); // Preserve anything typed while dispatch was in flight.
-    } catch (error) { if (!disposed) setSendError(String(error)); }
+    } catch (error) {
+      if (disposed) return;
+      setSendError(String(error));
+      if (!text()) setText(draft); // Restore the draft unless something new was typed meanwhile.
+    }
     finally {
       setSending(false);
       if (!disposed) void refresh();
@@ -165,7 +200,7 @@ export default function TaskbarAssistant(props: { active: boolean; focusRequest:
   });
   createEffect(() => {
     const request = props.focusRequest;
-    if (!props.active || !request || request === focusedRequest) return;
+    if (!props.shown || !request || request === focusedRequest) return;
     focusedRequest = request;
     // Parent increments only after successful native placement of a click-opened panel.
     input.focus({ preventScroll: true });
@@ -175,28 +210,24 @@ export default function TaskbarAssistant(props: { active: boolean; focusRequest:
     const resize = new ResizeObserver(restoreView);
     resize.observe(history);
     void off.then(() => { if (props.active) void refresh(); }).catch((error) => setLoadError(String(error)));
+    // Typing anywhere in the panel that is not already a field goes to the assistant, on any tab.
+    const redirect = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!props.shown || event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || event.key.length !== 1 || event.key === " ") return;
+      if (target?.closest?.("input, textarea, select, [contenteditable], [role=dialog], [aria-modal]")) return;
+      input.focus({ preventScroll: true }); // The keystroke then lands in the focused textarea.
+    };
+    window.addEventListener("keydown", redirect);
     onCleanup(() => {
       disposed = true;
+      window.removeEventListener("keydown", redirect);
       resize.disconnect();
       void off.then((unlisten) => unlisten()).catch(() => {});
     });
   });
 
-  return (
+  return (<>
     <section id="tb-pane-assistant" role="tabpanel" aria-labelledby="tb-tab-assistant" class="ta" hidden={!props.active}>
-      <section class="ta-sessions" aria-label="运行中和最近完成的会话">
-        <div class="ta-section-title">会话动态 <span>最新步骤 / 结论</span></div>
-        <div class="ta-session-list">
-          <For each={sessions} fallback={<div class="ta-empty">暂无运行中或最近完成的会话</div>}>
-            {(session) => (
-              <button class="ta-session" onClick={() => openThread(session.threadId)}>
-                <span class="ta-session-heading"><strong>{session.title || "未命名会话"}</strong><span class={`ta-status ${session.kind}`}>{LABEL[session.kind]}</span></span>
-                <span class="ta-session-text">{session.text || "暂无更新"}</span>
-              </button>
-            )}
-          </For>
-        </div>
-      </section>
       <div class="ta-chat">
         <div class="ta-history" ref={history} role="log" aria-label="助理聊天记录" aria-live="polite" tabIndex={0} onScroll={() => {
           if (!history.clientHeight) return;
@@ -227,7 +258,8 @@ export default function TaskbarAssistant(props: { active: boolean; focusRequest:
         <Show when={away()}><button class="ta-latest" onClick={() => { view = { offset: 0, top: 0, bottom: true }; restoreView(); }}>回到最新 ↓</button></Show>
       </div>
       <Show when={loadError()}><div class="ta-error" role="alert">{loadError()} <button onClick={() => void refresh()}>刷新</button></div></Show>
-      <form class="ta-compose" onSubmit={(event) => { event.preventDefault(); void send(); }}>
+    </section>
+    <form class="ta-compose" onSubmit={(event) => { event.preventDefault(); void send(); }}>
         <textarea ref={input} class="tb-input ta-input" rows={2} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" value={text()}
           onInput={(event) => setText(event.currentTarget.value)}
           onFocus={() => void invoke("taskbar_bubble_activate").catch((error) => setSendError(String(error)))}
@@ -242,6 +274,5 @@ export default function TaskbarAssistant(props: { active: boolean; focusRequest:
         <div class="ta-compose-foot"><span role="status">{busy() ? "助理正在调度…" : "Enter 发送 · Shift+Enter 换行"}</span><button class="ta-submit" type="submit" disabled={busy() || !text().trim()}>发送</button></div>
         <Show when={sendError()}><div class="ta-error" role="alert">{sendError()}</div></Show>
       </form>
-    </section>
-  );
+  </>);
 }

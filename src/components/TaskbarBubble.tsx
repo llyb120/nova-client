@@ -6,7 +6,7 @@ import { createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } fro
 import { createStore, reconcile } from "solid-js/store";
 import type { PermissionRequest } from "../types";
 import { agentLabel, stripAnsi } from "../utils";
-import TaskbarAssistant from "./TaskbarAssistant";
+import TaskbarAssistant, { TaskbarSessions } from "./TaskbarAssistant";
 import ThoughtCapsules, { captureCapsule } from "./ThoughtCapsules";
 import { fileToAttachment } from "./ImageAttachmentStrip";
 import "./TaskbarBubble.css";
@@ -26,7 +26,7 @@ type Card = {
 };
 /** `light`: the Windows taskbar theme, so cards match the Butterfly they pop out of.
  *  `panel`: hover must not focus; a click focuses the assistant after placement. */
-type Payload = { cards: Card[]; permissions: Permission[]; light: boolean; panel?: boolean; capsules?: boolean; captureError?: string | null } & Partial<PanelData>;
+type Payload = { cards: Card[]; permissions: Permission[]; light: boolean; panel?: boolean; captureError?: string | null } & Partial<PanelData>;
 
 type PanelData = { jianpu: { recording: boolean; id?: string; elapsedMs?: number } };
 type Tab = "assistant" | "session" | "capsules" | "quick";
@@ -89,11 +89,11 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
             <svg viewBox="0 0 12 12" width="10" height="10"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
           </button>
         </header>
-        <TaskbarAssistant active={props.active && props.tab === "assistant"} focusRequest={props.focusRequest} />
+        <TaskbarAssistant active={props.active && props.tab === "assistant"} shown={props.active} focusRequest={props.focusRequest} />
         <div id="tb-pane-capsules" role="tabpanel" aria-labelledby="tb-tab-capsules" class="tb-capsules-pane" hidden={props.tab !== "capsules"}>
           <ThoughtCapsules active={props.active && props.tab === "capsules"} onCaptured={() => props.setTab("capsules")} />
         </div>
-        <div id="tb-pane-session" role="tabpanel" aria-labelledby="tb-tab-session" class="tb-session-list" hidden={props.tab !== "session"}>{props.session}</div>
+        <div id="tb-pane-session" role="tabpanel" aria-labelledby="tb-tab-session" class="tb-session-list" hidden={props.tab !== "session"}>{props.session}<TaskbarSessions active={props.active && props.tab === "session"} /></div>
         <div id="tb-pane-quick" role="tabpanel" aria-labelledby="tb-tab-quick" hidden={props.tab !== "quick"}>
           <div class="tb-grid">
             <For each={tiles}>
@@ -320,7 +320,6 @@ export default function TaskbarBubble() {
     const text = files.length ? "" : data.getData("text/plain") || data.getData("text/uri-list").split(/\r?\n/).filter(line => line && !line.startsWith("#")).join("\n")
       || new DOMParser().parseFromString(data.getData("text/html"), "text/html").body.textContent || "";
     setCaptureError("");
-    setTab("capsules");
     setCapturing(true);
     try {
       await invoke("taskbar_bubble_activate");
@@ -360,10 +359,10 @@ export default function TaskbarBubble() {
     document.documentElement.classList.toggle("light", next.light);
     setPanel({ jianpu: next.jianpu ?? { recording: false } });
     if (fresh) {
-      focusPending = next.panel === false && !next.capsules;
-      setTab(next.capsules ? "capsules" : "assistant");
+      focusPending = next.panel === false;
+      setTab("assistant");
     }
-    if (next.captureError) { setCaptureError(next.captureError); setTab("capsules"); }
+    if (next.captureError) setCaptureError(next.captureError);
     fresh = false;
     // Keyed: a refresh updates the current card in place.
     setCards(reconcile(next.cards, { key: "key" }));
@@ -401,8 +400,9 @@ export default function TaskbarBubble() {
     window.addEventListener("keydown", keys);
     const offs = [
       listen<boolean>("capsules:dragging", (event) => setDragging(event.payload)),
-      listen("capsules:captured", () => { fresh = false; setDragging(false); setCaptureError(""); setTab("capsules"); }),
-      listen<{ error: string }>("capsules:error", (event) => { setDragging(false); setTab("capsules"); setCaptureError(event.payload.error); }),
+      // Drops are captured in place: never switch the user to the capsules tab.
+      listen("capsules:captured", () => { setDragging(false); setCaptureError(""); }),
+      listen<{ error: string }>("capsules:error", (event) => { setDragging(false); setCaptureError(event.payload.error); }),
       listen("taskbar-bubble:open", () => {
         fresh = true;
         void open();

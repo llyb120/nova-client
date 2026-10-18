@@ -30,8 +30,6 @@ pub(super) struct Anchor {
 static ANCHOR: Mutex<Option<Anchor>> = Mutex::new(None);
 /// The live card, asked for by a click on the Butterfly.
 static WANTED: AtomicBool = AtomicBool::new(false);
-/// Persist the requested tab until the page has loaded, including a cold WebView.
-static CAPSULES: AtomicBool = AtomicBool::new(false);
 static CAPTURE_ERROR: Mutex<Option<String>> = Mutex::new(None);
 /// Hover never takes focus and closes once the pointer leaves both the Butterfly and the panel.
 /// Clicking inside pins the panel for keyboard input until blur or explicit dismissal.
@@ -77,13 +75,6 @@ pub(super) fn window(app: &AppHandle) -> Option<WebviewWindow> {
     Some(window)
 }
 
-pub(super) fn open(app: &AppHandle, anchor: Anchor) {
-    open_tab(app, anchor, false);
-}
-
-pub(super) fn open_capsules(app: &AppHandle, anchor: Anchor) {
-    open_tab(app, anchor, true);
-}
 
 /// The first native drop may finish before the WebView's event listeners exist.
 pub(super) fn capture_error(app: &AppHandle, error: &str) {
@@ -91,8 +82,7 @@ pub(super) fn capture_error(app: &AppHandle, error: &str) {
     let _ = app.emit_to(LABEL, "capsules:error", json!({ "error": error }));
 }
 
-fn open_tab(app: &AppHandle, anchor: Anchor, capsules: bool) {
-    CAPSULES.store(capsules, Ordering::Release);
+pub(super) fn open(app: &AppHandle, anchor: Anchor) {
     PANEL.store(false, Ordering::Release);
     *ANCHOR.lock().unwrap() = Some(anchor);
     WANTED.store(true, Ordering::Release);
@@ -103,7 +93,6 @@ fn open_tab(app: &AppHandle, anchor: Anchor, capsules: bool) {
 /// Hover: preview the assistant unless the panel is already open.
 pub(super) fn open_panel(app: &AppHandle, anchor: Anchor) {
     if WANTED.load(Ordering::Acquire) { return; }
-    CAPSULES.store(false, Ordering::Release);
     PANEL.store(true, Ordering::Release);
     *ANCHOR.lock().unwrap() = Some(anchor);
     WANTED.store(true, Ordering::Release);
@@ -315,7 +304,7 @@ pub(super) fn payload(app: &AppHandle) -> Value {
     // Cards follow the taskbar they pop out of, like Windows' own taskbar flyouts.
     // Both hover and click default to the assistant; `panel` only controls focus behavior.
     let capture_error = if cards.is_empty() { None } else { CAPTURE_ERROR.lock().unwrap().take() };
-    json!({ "cards": cards, "permissions": permissions, "light": super::windows::light_theme(), "panel": PANEL.load(Ordering::Acquire), "capsules": CAPSULES.load(Ordering::Acquire), "captureError": capture_error,
+    json!({ "cards": cards, "permissions": permissions, "light": super::windows::light_theme(), "panel": PANEL.load(Ordering::Acquire), "captureError": capture_error,
         "jianpu": crate::jianpu::status() })
 }
 

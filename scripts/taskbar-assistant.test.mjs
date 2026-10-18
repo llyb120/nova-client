@@ -52,7 +52,7 @@ try {
         if (id === '/__taskbar_check.tsx') return id;
       },
       load(id) {
-        if (id === '\0check-core') return 'export const invoke = (...args) => window.ipc(...args);';
+        if (id === '\0check-core') return 'export const invoke = (...args) => window.ipc(...args); export const convertFileSrc = path => path;';
         if (id === '\0check-capsules') return 'export const captureCapsule = async () => {}; export default function ThoughtCapsules() { return null; }';
         if (id === '\0check-event') return 'export const listen = async (name, fn) => { (window.events[name] ||= []).push(fn); return () => window.events[name].splice(window.events[name].indexOf(fn),1); };';
         if (id === '/__taskbar_check.tsx') return entry;
@@ -86,7 +86,7 @@ try {
   assert.equal(await input.evaluate(el => el === document.activeElement), false, 'hover cannot focus');
   assert.equal(await page.getByRole('tab', { name: '助理', exact: true }).getAttribute('aria-selected'), 'true');
   assert.equal(await page.locator('.ta-message').count(), 30, 'initially only newest page');
-  assert.equal(await page.locator('.ta-session').first().textContent(), '运行任务进行中最新一步');
+  assert.equal(await page.locator('.ta-session').count(), 0, 'session activity lives in the 会话 tab');
   assert.equal(await page.locator('.tb-card').evaluate(el => getComputedStyle(el).animationName), 'none');
   await page.waitForFunction(() => { const el = document.querySelector('.ta-history'); return el.scrollHeight - el.clientHeight - el.scrollTop < 2; });
   const node = await input.elementHandle();
@@ -137,6 +137,7 @@ try {
   await page.evaluate(() => { window.delaySend = true; });
   await input.press('Enter');
   await page.waitForFunction(() => typeof window.resolveSend === 'function');
+  assert.equal(await input.inputValue(), '', 'sent text clears immediately, not after dispatch');
   await input.fill('下一条草稿');
   await input.press('Enter');
   assert.equal(await page.evaluate(() => window.calls.filter(([cmd]) => cmd === 'taskbar_assistant_send').length), 1, 'busy dispatch cannot duplicate');
@@ -159,7 +160,15 @@ try {
   assert.equal(await page.locator('[data-message-id^="gap"]').count(), 65);
   assert.equal(await page.evaluate(() => { const ids = [...document.querySelectorAll('.ta-message')].map(el => el.dataset.messageId); return ids.length === new Set(ids).size; }), true);
   assert.equal(await input.inputValue(), '下一条草稿');
+  // Any tab: the compose box stays visible and stray typing lands in it.
+  await page.getByRole('tab', { name: '快捷', exact: true }).click();
+  assert.equal(await input.isVisible(), true, 'assistant input is available on every tab');
+  await page.keyboard.type('x');
+  assert.equal(await input.inputValue(), '下一条草稿x', 'typing outside a field goes to the assistant');
+  await page.getByRole('tab', { name: '会话', exact: true }).click();
+  assert.equal(await page.locator('.ta-session').first().textContent(), '运行任务进行中最新一步');
   await page.locator('.ta-session').first().click();
+  await page.getByRole('tab', { name: '助理', exact: true }).click();
   assert.equal(await page.evaluate(() => window.calls.some(([cmd, args]) => cmd === 'taskbar_bubble_open' && args.threadId === 'running')), true);
 
   for (const [width, height] of [[400, 340], [560, 200], [560, 640]]) {

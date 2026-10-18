@@ -159,11 +159,14 @@ impl IDropTarget_Impl for Target_Impl {
         if super::windows::on_app(move |app| {
             let _ui = UI_WORK.lock().unwrap_or_else(|e| e.into_inner());
             let _ = app.emit_to("taskbar-bubble", "capsules:dragging", false);
-            // Persisted intent/error also works for a cold page. No success event before save.
-            if let Some(anchor) = anchor { super::bubble::open_capsules(app, anchor); }
+            // Capture silently in the background; only a failure surfaces the panel (on its
+            // current tab). The persisted error also works for a cold page.
             match copied {
                 Ok((text, paths)) => super::capsules::capture_drop(app.clone(), text, paths),
-                Err(error) => super::bubble::capture_error(app, error),
+                Err(error) => {
+                    super::bubble::capture_error(app, error);
+                    if let Some(anchor) = anchor { super::bubble::open_panel(app, anchor); }
+                }
             }
         }) && accepted {
             // COPY means accepted for background capture, not persisted. capture_drop reports
