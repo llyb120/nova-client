@@ -299,7 +299,19 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         };
         match result {
             Ok(models) => {
-                cache[id.as_str()] = json!({ "fingerprint": print, "fetchedAt": now, "models": models, "noCatalog": models_dev.is_none() });
+                let no_catalog = models_dev.is_none();
+                let mut models = models;
+                // 目录没拉到时，降级结果不能抹掉之前缓存里的能力（思考强度等）；按同名模型沿用，短 TTL 后重试。
+                if no_catalog && cache[id.as_str()]["noCatalog"] != true {
+                    for (name, model) in models.iter_mut() {
+                        if let Some(old) = cache[id.as_str()]["models"].get(name) {
+                            for field in ["reasoning", "options", "variants"] {
+                                if model.get(field).is_none() && old.get(field).is_some() { model[field] = old[field].clone(); }
+                            }
+                        }
+                    }
+                }
+                cache[id.as_str()] = json!({ "fingerprint": print, "fetchedAt": now, "models": models, "noCatalog": no_catalog });
                 changed = true;
             }
             Err(error) if force => errors.push(format!("{id}：{error}")),
