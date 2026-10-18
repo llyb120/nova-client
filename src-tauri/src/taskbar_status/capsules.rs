@@ -654,35 +654,71 @@ fn compose(root: &Path, ids: &[String]) -> Result<Compose, String> {
         }
     }
     if !files.is_empty() {
-        // Drafts outlive the inbox: removal NEVER visits this tree. No event is emitted until
-        // all copies succeed. ponytail: detached draft copies are retained (80 MiB per open);
-        // integrate reference-counted attachment GC before reclaiming abandoned drafts.
-        let attachments = root.parent().ok_or("星屑目录缺少父目录")?.join("capsule-attachments");
-        directory(&attachments)?;
-        let draft = attachments.join(uuid::Uuid::new_v4().to_string());
-        fs::create_dir(&draft).map_err(|e| e.to_string())?;
-        let mut staged = Vec::new();
-        let result = (|| {
-            for (index, file) in files.into_iter().enumerate() {
-                let bytes = read_bounded(Path::new(&file.path), MAX_FILE)?;
-                if bytes.len() as u64 != file.size { return Err("星屑副本在转移时发生变化".into()); }
-                let path = draft.join(draft_file_name(index, &file.name));
-                staged.push(path.clone());
-                crate::thread_storage::atomic_write(&path, &bytes)?;
-                let uri = reqwest::Url::from_file_path(&path).map_err(|_| "无法生成附件 file URI")?;
-                payload.images.push(PromptImage { name: file.name.clone(), mime_type: file.mime_type.clone(),
-                    size: Some(file.size), uri: Some(uri.into()), data: None });
-            }
-            Ok::<(), String>(())
-        })();
-        if let Err(error) = result {
-            // These copies were never handed off. Only remove exact newly created paths.
-            for path in staged { let _ = fs::remove_file(path); }
-            let _ = fs::remove_dir(draft);
-            return Err(error);
-        }
+        payload.images = draft(&root, files.into_iter().map(|file| {
+            let bytes = read_bounded(Path::new(&file.path), MAX_FILE)?;
+            if bytes.len() as u64 != file.size { return Err("星屑副本在转移时发生变化".into()); }
+            Ok((file.name.clone(), bytes))
+        }))?;
     }
     Ok(payload)
+}
+
+/// Copies handed to a prompt as file URIs; one decoded/read file is held at a time.
+/// Drafts outlive the inbox: removal NEVER visits this tree. ponytail: detached draft copies
+/// are retained (80 MiB per open/send); integrate reference-counted attachment GC before
+/// reclaiming abandoned drafts.
+fn draft(root: &Path, files: impl Iterator<Item = Result<(String, Vec<u8>), String>>) -> Result<Vec<PromptImage>, String> {
+    let attachments = root.parent().ok_or("星屑目录缺少父目录")?.join("capsule-attachments");
+    directory(&attachments)?;
+    let draft = attachments.join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir(&draft).map_err(|e| e.to_string())?;
+    let mut staged = Vec::new();
+    let mut images = Vec::new();
+    let result = (|| {
+        for (index, file) in files.enumerate() {
+            let (name, bytes) = file?;
+            let path = draft.join(draft_file_name(index, &name));
+            staged.push(path.clone());
+            crate::thread_storage::atomic_write(&path, &bytes)?;
+            let uri = reqwest::Url::from_file_path(&path).map_err(|_| "无法生成附件 file URI")?;
+            images.push(PromptImage { mime_type: crate::guess_attachment_mime_type(&name), name,
+                size: Some(bytes.len() as u64), uri: Some(uri.into()), data: None });
+        }
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = result {
+        // These copies were never handed off. Only remove exact newly created paths.
+        for path in staged { let _ = fs::remove_file(path); }
+        let _ = fs::remove_dir(draft);
+        return Err(error);
+    }
+    Ok(images)
+}
+
+/// Butterfly assistant attachments: selected capsules' original text and file copies, plus
+/// pasted/picked uploads, staged as draft copies. Blocking I/O; call off the async runtime.
+pub(crate) fn assistant_attachments(app: &AppHandle, ids: &[String], uploads: Vec<CapsuleUpload>) -> Result<(String, Vec<PromptImage>), String> {
+    if uploads.len() > MAX_FILES { return Err("一次最多附带 16 个文件，单文件 20 MiB，合计 80 MiB".into()); }
+    for upload in &uploads {
+        if upload.name.is_empty() || upload.name.len() > 1024 || upload.name.contains('\0') {
+            return Err("附件文件名不能为空、含 NUL 或超过 1024 字节".into());
+        }
+        if upload.data.len() > MAX_ENCODED_FILE { return Err("单个附件上限为 20 MiB".into()); }
+    }
+    let root = storage_dir(app);
+    let mut payload = if ids.is_empty() { Compose { text: String::new(), images: Vec::new() } } else { compose(&root, ids)? };
+    if !uploads.is_empty() {
+        let mut batch = 0;
+        let uploaded = draft(&prepare(&root)?, uploads.into_iter().map(|upload| {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(&upload.data)
+                .map_err(|e| format!("附件 base64 无效：{e}"))?;
+            batch += bytes.len() as u64;
+            if bytes.len() as u64 > MAX_FILE || batch > MAX_BATCH_BYTES { return Err("单个附件上限 20 MiB，一次合计 80 MiB".into()); }
+            Ok((upload.name, bytes))
+        }))?;
+        payload.images.extend(uploaded);
+    }
+    Ok((payload.text, payload.images))
 }
 
 #[tauri::command]
@@ -821,7 +857,7 @@ mod tests {
         let item = capture(dir.path(), text.clone(), vec![], vec![], false).unwrap().remove(0);
         assert_eq!(item.text, text);
         assert_eq!(item.status, CapsuleStatus::Unavailable);
-        assert!(item.summary_error.unwrap().contains("纯文本摘要配置"));
+        assert!(item.summary_error.unwrap().contains(NO_MODEL));
         assert!(capture(dir.path(), "a".repeat(MAX_TEXT + 1), vec![], vec![], false).is_err());
         assert!(capture(dir.path(), String::new(), vec!["missing".into(); MAX_FILES + 1], vec![], false).is_err());
         let bytes = "中".repeat(MAX_SAMPLE).into_bytes();

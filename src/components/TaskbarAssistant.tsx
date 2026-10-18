@@ -1,17 +1,48 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import DOMPurify from "dompurify";
+import { marked } from "marked";
 import { createEffect, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
+import { fileToAttachment } from "./ImageAttachmentStrip";
+import { captureCapsule, titleOf, type Capsule } from "./ThoughtCapsules";
 import "./TaskbarAssistant.css";
 
 type Kind = "running" | "waiting" | "done" | "error";
-/** `status`: live state of the dispatched session task; the backend rewrites this message in place. */
-type Message = { id: string; role: "user" | "assistant"; text: string; createdAt: number; threadId?: string; status?: Kind };
+/** `status`: live state of the dispatched session task; the backend rewrites this message in place.
+ * `thinking` (assistant) / `running` with empty text (session) render as a typing indicator. */
+type Message = { id: string; role: "user" | "assistant"; text: string; createdAt: number; threadId?: string; status?: Kind | "thinking" };
 type History = { messages: Message[]; hasMore: boolean; busy?: boolean };
 type Session = { threadId: string; title: string; kind: Kind; text: string; updatedAt: number };
 type View = { id?: string; offset: number; top: number; bottom: boolean };
 const LABEL = { running: "进行中", waiting: "待确认", done: "已完成", error: "出错了" };
 const PAGE_SIZE = 30;
+const MAX_FILE = 20 * 1024 * 1024;
+type Upload = { name: string; data: string; mimeType: string };
+/** Not the shared Markdown component: it pulls in main-window store/IPC this light page avoids. */
+const markdown = (text: string) => DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: true, async: false }));
+/** Links open in the browser; never navigate the panel's own page. */
+const openLink = (event: MouseEvent) => {
+  const href = (event.target as HTMLElement).closest("a")?.getAttribute("href");
+  if (!href) return;
+  event.preventDefault();
+  if (/^https?:\/\//i.test(href)) void invoke("open_url", { url: href }).catch(() => {});
+};
+
+/** The unsent draft outlives the panel and Nova restarts. IndexedDB, not localStorage:
+ * pasted attachments can reach 80 MiB. Keys: "text", "uploads", "picked". */
+const draftStore = <T,>(run: (store: IDBObjectStore) => IDBRequest<T>, mode: IDBTransactionMode = "readonly") =>
+  new Promise<T>((resolve, reject) => {
+    const open = indexedDB.open("taskbar-assistant-draft", 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("draft");
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const request = run(db.transaction("draft", mode).objectStore("draft"));
+      request.onsuccess = () => { resolve(request.result); db.close(); };
+      request.onerror = () => { reject(request.error); db.close(); };
+    };
+  });
 
 /** `active`: assistant tab visible; `shown`: panel visible. The compose box serves every tab. */
 /** 会话动态 for the 会话 tab: the user's own running / recently finished sessions. */
@@ -63,6 +94,13 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
   const [loadError, setLoadError] = createSignal("");
   const [sendError, setSendError] = createSignal("");
   const [away, setAway] = createSignal(false);
+  const [uploads, setUploads] = createSignal<Upload[]>([]);
+  const [picked, setPicked] = createSignal<Capsule[]>([]);
+  const [menu, setMenu] = createSignal<"" | "menu" | "capsules">("");
+  const [capsules, setCapsules] = createSignal<Capsule[]>([]);
+  let imagePicker!: HTMLInputElement;
+  let filePicker!: HTMLInputElement;
+  let compose!: HTMLFormElement;
   let history!: HTMLDivElement;
   let messageList!: HTMLDivElement;
   let input!: HTMLTextAreaElement;
@@ -76,6 +114,50 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
   let messageRevision = 0;
   let latestHistoryId: string | undefined;
   const busy = () => sending() || backendBusy();
+  const hasDraft = () => !!text().trim() || uploads().length > 0 || picked().length > 0;
+  const addFiles = async (files: File[]) => {
+    if (!files.length) return;
+    setSendError("");
+    try {
+      // Checked before reading: a huge file must not be base64-encoded in the webview.
+      if (files.some((file) => file.size > MAX_FILE)) throw new Error("单个附件上限 20 MiB");
+      const read = await Promise.all(files.map(fileToAttachment));
+      setUploads((all) => [...all, ...read.map(({ name, data, mimeType }) => ({ name, data: data ?? "", mimeType }))]);
+    } catch (error) { setSendError(String(error)); }
+  };
+  const openCapsules = async () => {
+    setMenu("capsules");
+    try { setCapsules(await invoke<Capsule[]>("capsule_list")); }
+    catch (error) { setSendError(String(error)); setMenu(""); }
+  };
+  const toggleCapsule = (capsule: Capsule) =>
+    setPicked((all) => all.some((c) => c.id === capsule.id) ? all.filter((c) => c.id !== capsule.id) : [...all, capsule]);
+  let restored = false;
+  const persist = (key: string, value: unknown) => {
+    if (restored) draftStore((s) => s.put(value, key), "readwrite").catch((error) => setSendError(`草稿未能保存到本机：${String(error)}`));
+  };
+  createEffect(() => persist("text", text()));
+  createEffect(() => persist("uploads", uploads()));
+  createEffect(() => persist("picked", picked()));
+  /** On close, a draft of only text or only files becomes a capsule; anything else stays as the draft. */
+  const stash = async () => {
+    const value = text();
+    const files = uploads();
+    if (sending() || picked().length || !value.trim() === !files.length) return;
+    try {
+      if (files.length) await invoke("capsule_capture", { text: "", paths: [], uploads: files.map(({ name, data }) => ({ name, data })) });
+      else await captureCapsule(value);
+      // Clear only what was captured; anything added meanwhile stays in the draft.
+      if (text() === value) setText("");
+      if (uploads() === files) setUploads([]);
+    } catch (error) { setSendError(`未能存为星屑，已保留草稿：${String(error)}`); }
+  };
+  let wasShown = false;
+  createEffect(() => {
+    const shown = props.shown;
+    if (wasShown && !shown) void stash();
+    wasShown = shown;
+  });
 
   const readView = (): View => {
     if (!history.clientHeight) return view;
@@ -110,7 +192,8 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
   };
 
   const refresh = async () => {
-    if (disposed || !props.active) return;
+    // The first page also loads while hidden, so the first click opens on ready history.
+    if (disposed || (!props.active && initialized)) return;
     if (refreshing || paging()) { refreshAgain = true; return; }
     refreshing = true;
     refreshAgain = false;
@@ -170,19 +253,30 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
   const send = async () => {
     const draft = text();
     const value = draft.trim();
-    if (!value || busy() || composing) return;
+    const files = uploads();
+    const chosen = picked();
+    if (!hasDraft() || busy() || composing) return;
     setSending(true);
     setSendError("");
-    setText(""); // Clear now: dispatch waits for the model, which can take seconds.
+    setMenu("");
+    // Clear now: dispatch waits for the model, which can take seconds.
+    setText("");
+    setUploads([]);
+    setPicked([]);
     try {
       // The assistant only dispatches. Never send this text via taskbar_bubble_reply.
-      const message = await invoke<Message>("taskbar_assistant_send", { text: value });
+      const message = await invoke<Message>("taskbar_assistant_send", {
+        text: value, capsules: chosen.map((c) => c.id), uploads: files.map(({ name, data }) => ({ name, data })),
+      });
       if (disposed) return;
       merge([message]);
     } catch (error) {
       if (disposed) return;
       setSendError(String(error));
-      if (!text()) setText(draft); // Restore the draft unless something new was typed meanwhile.
+      // Restore the draft unless something new was added meanwhile.
+      if (!text()) setText(draft);
+      if (!uploads().length) setUploads(files);
+      if (!picked().length) setPicked(chosen);
     }
     finally {
       setSending(false);
@@ -205,13 +299,28 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
     if (!props.shown || !request || request === focusedRequest) return;
     focusedRequest = request;
     // Parent increments only after successful native placement of a click-opened panel.
-    input.focus({ preventScroll: true });
+    const focus = () => input.focus({ preventScroll: true });
+    focus();
+    // The first native activation can reach the WebView after this; focus again once it does.
+    if (!document.hasFocus()) window.addEventListener("focus", focus, { once: true });
   });
   onMount(() => {
+    void Promise.all(["text", "uploads", "picked"].map((key) => draftStore((s) => s.get(key))))
+      .then(([savedText, savedUploads, savedPicked]) => {
+        if (disposed) return;
+        // Typing that raced the restore wins; it is persisted once `restored` is set.
+        if (typeof savedText === "string" && !text()) setText(savedText);
+        if (Array.isArray(savedUploads) && !uploads().length) setUploads(savedUploads as Upload[]);
+        if (Array.isArray(savedPicked) && !picked().length) setPicked(savedPicked as Capsule[]);
+        // Only after a successful read: never overwrite a saved draft we could not load.
+        restored = true;
+        persist("text", text()); persist("uploads", uploads()); persist("picked", picked());
+      })
+      .catch((error) => setSendError(`未能读取上次的草稿：${String(error)}`));
     const off = listen("taskbar-assistant:changed", () => void refresh());
     const resize = new ResizeObserver(restoreView);
     resize.observe(history);
-    void off.then(() => { if (props.active) void refresh(); }).catch((error) => setLoadError(String(error)));
+    void off.then(() => void refresh()).catch((error) => setLoadError(String(error)));
     // Typing anywhere in the panel that is not already a field goes to the assistant, on any tab.
     const redirect = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -220,9 +329,12 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
       input.focus({ preventScroll: true }); // The keystroke then lands in the focused textarea.
     };
     window.addEventListener("keydown", redirect);
+    const dismiss = (event: PointerEvent) => { if (menu() && !compose.contains(event.target as Node)) setMenu(""); };
+    window.addEventListener("pointerdown", dismiss);
     onCleanup(() => {
       disposed = true;
       window.removeEventListener("keydown", redirect);
+      window.removeEventListener("pointerdown", dismiss);
       resize.disconnect();
       void off.then((unlisten) => unlisten()).catch(() => {});
     });
@@ -249,10 +361,14 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
                 <article class={`ta-message ${message.role}`} data-message-id={message.id} aria-label={message.role === "user" ? "你" : "Nova 助理"}>
                   <span class="ta-avatar" aria-hidden="true">{message.role === "user" ? "我" : "N"}</span>
                   <div class="ta-message-content">
-                    <div class="ta-bubble">{message.text}</div>
-                    <Show when={message.threadId || message.status}>
+                    <div class="ta-bubble" classList={{ typing: !message.text, md: message.role === "assistant" && !!message.text }}>
+                      <Show when={message.text} keyed fallback={<>{message.status === "thinking" ? "正在思考中" : "会话正在输入中"}<span class="ta-dots" aria-hidden="true"><i /><i /><i /></span></>}>
+                        {(text) => message.role === "assistant" ? <div class="ta-md" innerHTML={markdown(text)} onClick={openLink} /> : text}
+                      </Show>
+                    </div>
+                    <Show when={message.threadId || (message.status && message.text)}>
                       <div class="ta-message-meta">
-                        <Show when={message.status}><span class={`ta-status ${message.status}`} title="会话状态">会话{LABEL[message.status!]}</span></Show>
+                        <Show when={message.text && message.status && message.status !== "thinking"}><span class={`ta-status ${message.status}`} title="会话状态">会话{LABEL[message.status as Kind]}</span></Show>
                         <Show when={message.threadId}><button class="ta-thread" onClick={() => openThread(message.threadId!)}>打开会话 ↗</button></Show>
                       </div>
                     </Show>
@@ -266,9 +382,61 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
       </div>
       <Show when={loadError()}><div class="ta-error" role="alert">{loadError()} <button onClick={() => void refresh()}>刷新</button></div></Show>
     </section>
-    <form class="ta-compose" onSubmit={(event) => { event.preventDefault(); void send(); }}>
-        <textarea ref={input} class="tb-input ta-input" rows={1} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" title="Enter 发送 · Shift+Enter 换行" value={text()}
+    <form class="ta-compose" ref={compose} onSubmit={(event) => { event.preventDefault(); void send(); }}>
+        <Show when={uploads().length || picked().length}>
+          <div class="ta-attachments">
+            <For each={picked()}>
+              {(capsule) => (
+                <span class="ta-chip capsule" title={titleOf(capsule)}>
+                  <span class="ta-chip-icon" aria-hidden="true">✦</span><span class="ta-chip-name">{titleOf(capsule)}</span>
+                  <button type="button" aria-label={`移除星屑 ${titleOf(capsule)}`} onClick={() => toggleCapsule(capsule)}>×</button>
+                </span>
+              )}
+            </For>
+            <For each={uploads()}>
+              {(file, index) => (
+                <span class="ta-chip" title={file.name}>
+                  <Show when={file.mimeType.startsWith("image/")} fallback={<svg class="ta-chip-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-5zm0 0v5h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" /></svg>}>
+                    <img src={`data:${file.mimeType};base64,${file.data}`} alt="" />
+                  </Show>
+                  <span class="ta-chip-name">{file.name}</span>
+                  <button type="button" aria-label={`移除 ${file.name}`} onClick={() => setUploads((all) => all.filter((_, i) => i !== index()))}>×</button>
+                </span>
+              )}
+            </For>
+          </div>
+        </Show>
+        <button type="button" class="ta-plus" classList={{ open: !!menu() }} title="添加图片、文件或星屑" aria-label="添加附件" aria-expanded={!!menu()} onClick={() => setMenu(menu() ? "" : "menu")}>
+          <svg viewBox="0 0 12 12" width="13" height="13" aria-hidden="true"><path d="M6 2v8M2 6h8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
+        </button>
+        <Show when={menu() === "menu"}>
+          <div class="ta-menu" role="menu">
+            <button type="button" role="menuitem" onClick={() => { setMenu(""); imagePicker.click(); }}>图片</button>
+            <button type="button" role="menuitem" onClick={() => { setMenu(""); filePicker.click(); }}>文件</button>
+            <button type="button" role="menuitem" onClick={() => void openCapsules()}>星屑</button>
+          </div>
+        </Show>
+        <Show when={menu() === "capsules"}>
+          <div class="ta-menu ta-capsule-menu" role="listbox" aria-multiselectable="true" aria-label="选择星屑">
+            <For each={capsules()} fallback={<div class="ta-empty">还没有星屑，可以拖入文字或文件收集</div>}>
+              {(capsule) => (
+                <button type="button" role="option" aria-selected={picked().some((c) => c.id === capsule.id)} onClick={() => toggleCapsule(capsule)}>
+                  <span class="ta-check" aria-hidden="true" />{titleOf(capsule)}
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
+        <input ref={imagePicker} type="file" accept="image/*" multiple hidden onChange={(event) => { void addFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ""; }} />
+        <input ref={filePicker} type="file" multiple hidden onChange={(event) => { void addFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ""; }} />
+        <textarea ref={input} class="tb-input ta-input" rows={1} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" title="Enter 发送 · Shift+Enter 换行 · 可粘贴图片和文件" value={text()}
           onInput={(event) => setText(event.currentTarget.value)}
+          onPaste={(event) => {
+            const files = Array.from(event.clipboardData?.files ?? []);
+            if (!files.length) return;
+            event.preventDefault();
+            void addFiles(files);
+          }}
           onFocus={() => void invoke("taskbar_bubble_activate").catch((error) => setSendError(String(error)))}
           onCompositionStart={() => { composing = true; }} onCompositionEnd={() => { composing = false; }}
           onKeyDown={(event) => {
@@ -278,10 +446,9 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
             }
           }}
         />
-        <button class="ta-submit" type="submit" title="发送" aria-label="发送" disabled={busy() || !text().trim()}>
+        <button class="ta-submit" type="submit" title="发送" aria-label="发送" disabled={busy() || !hasDraft()}>
           <svg viewBox="0 0 12 12" width="13" height="13" aria-hidden="true"><path d="M6 10V2.5M2.5 6L6 2.5 9.5 6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" /></svg>
         </button>
-        <Show when={busy()}><span class="ta-busy" role="status">助理正在调度…</span></Show>
         <Show when={sendError()}><div class="ta-error" role="alert">{sendError()}</div></Show>
       </form>
   </>);

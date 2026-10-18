@@ -46,7 +46,7 @@ const paths = {
 };
 const icon = (name: keyof typeof paths) => <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={paths[name]} /></svg>;
 const excerpt = (text: string, length = 220) => text.length > length ? `${text.slice(0, length).replace(/[\uD800-\uDBFF]$/, "")}…` : text;
-const titleOf = (capsule: Capsule) => capsule.title.trim() || excerpt(capsule.text.trim().split("\n", 1)[0], 50) || capsule.files[0]?.name || "未命名星屑";
+export const titleOf = (capsule: Capsule) => capsule.title.trim() || excerpt(capsule.text.trim().split("\n", 1)[0], 50) || capsule.files[0]?.name || "未命名星屑";
 const hasSummary = (capsule: Capsule) => capsule.status === "ready" && !!capsule.summary.trim() && capsule.summary.trim() !== capsule.text.trim();
 const matches = (capsule: Capsule, query: string) => [capsule.title, capsule.text, capsule.summary, ...capsule.files.map((f) => `${f.name}\n${f.path}`)].some((value) => value.toLocaleLowerCase().includes(query));
 const select = (previous: Set<string>, id: string, additive: boolean) => {
