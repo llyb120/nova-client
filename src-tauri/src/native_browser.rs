@@ -444,6 +444,16 @@ fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String
     values.into_iter().map(|value| { let action=parse_action(&value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()))?; validate_action(&action)?; Ok(action) }).collect()
 }
 
+/// ref 前缀每次观察重新生成，全部 ref 都在当前观察里即证明决策基于最新观察，snapshotId 可不精确。
+fn refs_in(observation:&Observation, actions:&[Action]) -> bool {
+    !actions.is_empty() && actions.iter().all(|action| match action {
+        Action::Click{r#ref,..}|Action::Fill{r#ref,..}|Action::Scroll{r#ref:Some(r#ref),..} =>
+            observation.pages["pages"].as_array().is_some_and(|pages| pages.iter().any(|page|
+                page["items"].as_array().is_some_and(|items| items.iter().any(|item| item["ref"].as_str()==Some(r#ref.as_str()))))),
+        _ => false,
+    })
+}
+
 fn preflight(observation:&Observation, action:&mut Action, image_id:Option<&str>) -> Result<(),String> {
     match action {
         Action::Click{frame,r#ref,..}|Action::Fill{frame,r#ref,..}|Action::Scroll{frame,r#ref:Some(r#ref),..}=>{
@@ -1115,7 +1125,7 @@ async fn control_session(
         let mut actions=parse_actions(args, 16)?;
         let all_dom=actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
         let with_image=current.as_ref().is_some_and(|o|o.screenshot) || actions.iter().any(|a|matches!(a,Action::ClickAt{..}|Action::Move{..}|Action::Drag{..}|Action::ScrollAt{..}));
-        let Some(observation)=current.clone().filter(|o|args["snapshotId"].as_str()==Some(&o.id) && (all_dom || o.captured.elapsed()<=Duration::from_secs(180))) else {
+        let Some(observation)=current.clone().filter(|o|(args["snapshotId"].as_str()==Some(&o.id) || (all_dom && refs_in(o,&actions))) && (all_dom || o.captured.elapsed()<=Duration::from_secs(180))) else {
             // Nothing was sent; attach a fresh observation so the model re-decides in this round-trip.
             let mut observe_args=args.clone();
             if let Some(a)=observe_args.as_object_mut() {for key in ["ref","frame","region"] {a.remove(key);}}
@@ -1154,6 +1164,9 @@ async fn control_session(
             "failedAtPreflight":failure.is_some() && progress.dom_preflight,
             "reason":failure,"inputAttempted":progress.attempted,"completedActions":progress.completed,"actionTimingsMs":action_timings,"basedOnSnapshotId":observation.id,"verification":"unverified"});
         result["actionMs"] = json!(started.elapsed().as_millis());
+        if args["snapshotId"].as_str()!=Some(&observation.id) {
+            result["snapshotIdNote"]=json!(format!("传入的 snapshotId 不是最新观察（最新为 {}）；本批 ref 均属最新观察，已按 ref 执行。snapshotId 取工具返回的顶层 snapshotId，不是 ref 冒号前的部分", observation.id));
+        }
         result["next"] = json!("根据返回的最新状态验证并继续；fill 一次完成聚焦和填写。executed/needs_review 不要直接重放。坐标操作需截图，DOM 操作使用最新 frame/ref。");
         completed_action = Some(result.clone());
         // A click/Enter often starts a navigation; feeding back the old DOM costs the model another
@@ -1551,7 +1564,19 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     if operation == "act" && value["status"] != "not_executed" { retire_desktop(&mut value); }
     value["tabTag"] = json!(tag);
     value["browser"] = json!("chrome");
+    if operation == "act" && value["status"] != "executed" { value = errors_first(value); }
     Ok(value)
+}
+
+/// 仅调整键顺序：失败时把状态、原因和重发所需 ID 放在长观察之前，输出被截断也不丢。
+fn errors_first(value: Value) -> Value {
+    let Value::Object(mut rest) = value else { return value };
+    let mut out = serde_json::Map::new();
+    for key in ["status", "reason", "completedActions", "inputAttempted", "snapshotId", "tabTag", "observationError", "next"] {
+        if let Some(v) = rest.remove(key) { out.insert(key.into(), v); }
+    }
+    out.extend(rest);
+    Value::Object(out)
 }
 
 // Observation-only parameters ride along with navigation calls; the extension must not see them.
@@ -1828,6 +1853,20 @@ mod tests {
         assert!(matches!(click, Action::Click { frame: 1, .. }));
         let mut fake = parse_action(r#"{"action":"click","frame":0,"ref":"c:1"}"#).unwrap();
         assert!(preflight(&observation, &mut fake, None).is_err());
+        // 纯 DOM 动作的 ref 均属当前观察即可执行；旧 ref、坐标/按键仍需精确 snapshotId。
+        let act = |json: &str| vec![parse_action(json).unwrap()];
+        assert!(refs_in(&observation, &act(r#"{"action":"click","frame":0,"ref":"b:51"}"#)));
+        assert!(!refs_in(&observation, &act(r#"{"action":"click","frame":0,"ref":"c:1"}"#)));
+        assert!(!refs_in(&observation, &act(r#"{"action":"press","key":"Enter"}"#)));
+        assert!(!refs_in(&observation, &[]));
+    }
+
+    #[test]
+    fn errors_first_only_reorders() {
+        let value = json!({"pages":[1],"snapshotId":"s","status":"not_executed","reason":"r","x":1});
+        let ordered = errors_first(value.clone());
+        assert_eq!(ordered, value);
+        assert_eq!(ordered.as_object().unwrap().keys().take(3).collect::<Vec<_>>(), ["status", "reason", "snapshotId"]);
     }
 
     #[test]
