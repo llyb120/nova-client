@@ -63,9 +63,6 @@ export function createNovaBatchTools(cwd, options = {}) {
       tools.jianlai = { ...jianlaiTool,
         execute: async params => JSON.stringify(await callGlobalContextTool("jianlai", root, params, owner)),
       };
-      tools.chrome = { ...chromeTool,
-        execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params, owner)),
-      };
     }
     if (threadId && env("NOVA_SCENE_HANDOFF") === "1") {
       for (const { name, description, inputSchema } of agentTools) {
@@ -77,6 +74,12 @@ export function createNovaBatchTools(cwd, options = {}) {
     tools.employee = { ...employeeTool,
       execute: async params => JSON.stringify(await callGlobalContextTool("employee", root, params)),
     };
+    // 非自动模式保持原工具顺序（jianlai、employee、chrome）。
+    if (desktop) {
+      tools.chrome = { ...chromeTool,
+        execute: async params => JSON.stringify(await callGlobalContextTool("chrome", root, params, owner)),
+      };
+    }
     for (const definition of imageTools) {
       tools[definition.name] = { ...definition,
         execute: async (params) => JSON.stringify(await callGlobalContextTool(definition.name, root, params)),

@@ -3798,13 +3798,16 @@ impl AcpManager {
                 (context_tools, read_only)
             };
             if self.kind == AgentKind::Devin {
-                guidance.push(nova_tools_prompt_guidance(context_tools, read_only));
                 let auto_env = crate::auto_tool_env(&self.app.state::<AppState>(), thread_id);
+                // 自动模式下电脑操控场景是别的模型时，nova-tools 不暴露 jianlai/chrome：提示词也不能再宣传它们，
+                // 否则模型调用失败后会退回 shell 自己“操作网页”，而不是转交。
+                let desktop = !auto_env.iter().any(|(name, value)| *name == "NOVA_DESKTOP" && value == "0");
+                guidance.push(nova_tools_prompt_guidance(context_tools, read_only, desktop));
                 if auto_env.iter().any(|(name, _)| *name == "NOVA_SCENE_HANDOFF") && !read_only {
                     guidance.push("Nova auto mode: nova-tools also exposes spawn_agent, wait_agent, list_agents, followup_task, interrupt_agent and close_agent (call them through mcp_call_tool with server_name \"nova-tools\" like the other Nova tools).".into());
-                }
-                if auto_env.iter().any(|(name, value)| *name == "NOVA_DESKTOP" && value == "0") {
-                    guidance.push("In this session jianlai and chrome are not available; hand desktop or browser work off with spawn_agent(scene=\"computer\").".into());
+                    if !desktop {
+                        guidance.push("Hard rule: this session has NO desktop or browser tools (no jianlai, no chrome). Any request to operate, open, click, fill or read a web page, browser or desktop app is computer-scene work: hand the whole task off at once via mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"spawn_agent\",\"arguments\":{\"scene\":\"computer\",\"task_name\":\"<name>\",\"message\":\"<goal, constraints, done criteria>\"}}, then wait_agent for the result. Never substitute shell commands, scripts, curl/wget, headless browsers (Playwright/Puppeteer/Selenium), xdg-open/start or similar for that work.".into());
+                    }
                 }
             }
         }
@@ -5996,7 +5999,7 @@ mod nova_tools_config_tests {
 
     #[test]
     fn devin_nova_tools_guidance_requires_wrapper_server_name() {
-        let guidance = super::nova_tools_prompt_guidance(true, false);
+        let guidance = super::nova_tools_prompt_guidance(true, false, true);
         assert!(guidance.contains("ROUTING RULE — before choosing any tool"));
         assert!(guidance.contains("must NEVER be selected as direct tool calls"));
         assert!(guidance.contains("polaris"));
@@ -6019,7 +6022,7 @@ mod nova_tools_config_tests {
 
     #[test]
     fn disabled_polaris_is_absent_from_devin_guidance() {
-        let guidance = super::nova_tools_prompt_guidance(false, false);
+        let guidance = super::nova_tools_prompt_guidance(false, false, true);
         assert!(!guidance.contains("polaris"));
         assert!(!guidance.contains("find_symbols"));
         assert!(!guidance.contains("read_files"));
@@ -6046,12 +6049,15 @@ mod nova_tools_config_tests {
 /// Aligned with scripts/nova-batch-tools.mjs `novaDevinBatchToolPolicy`:
 /// read_files / edit_files are intentionally omitted (edit_files 全链路默认禁用，
 /// NOVA_EDIT_FILES=1 才在 MCP 工具层恢复，此处提示词同步恢复前仍按原生 edit 引导)。
-fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
+fn nova_tools_prompt_guidance(polaris: bool, read_only: bool, desktop: bool) -> String {
+    let desktop = desktop && !read_only;
     let mut tool_names: Vec<&str> = Vec::new();
     if polaris {
         tool_names.extend(["polaris"]);
     }
-    if !read_only { tool_names.extend(["generate_image", "edit_image", "chrome", "jianlai", "employee"]); }
+    if !read_only { tool_names.extend(["generate_image", "edit_image"]); }
+    if desktop { tool_names.extend(["chrome", "jianlai"]); }
+    if !read_only { tool_names.push("employee"); }
     if tool_names.is_empty() {
         let mut lines = vec![
             "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."
@@ -6093,7 +6099,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
             "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.".into()
         },
     ];
-    if !read_only {
+    if desktop {
         lines.push(r#"jianlai act arguments={"operation":"act","snapshotId":"<latest returned snapshotId>","actions":[{"action":"type","text":"<text>"},{"action":"press","key":"Enter"}]}. Each item uses the key action (not type). Actions: click/double_click/move(x,y), drag(x,y,toX,toY), scroll(x,y,delta), type(text), press(key), wait(ms:0–2000); text/key are not action names. If focused:false, call activate(windowId) and use its fresh snapshotId before constructing a long input batch. Consult the selected tool schema when unsure rather than probe with invalid calls or regenerate the full payload."#.into());
         lines.push(r#"chrome arguments={"operation":"act","tabTag":"<tabs[].tag or the tabTag returned by open>","snapshotId":"<latest returned snapshotId>","actions":[{"action":"click","frame":0,"ref":"<items[].ref copied verbatim>"}]}. The target field is tabTag, never tabId/browserId; one tabs call with query binds it and returns the inspect. DOM actions need frame plus a ref copied verbatim from the latest inspect; coordinate actions are click_at/move/drag/scroll_at with x/y plus the top-level imageId. Never mix chrome shapes into jianlai (no frame/ref/tabTag there) or jianlai shapes into chrome (no toX/toY/press-with-text there)."#.into());
         lines.push("Desktop routing: 剑来 means the jianlai desktop mouse/keyboard/screenshot tool, not a shell command. When the user requests 剑来/jianlai, start with ONE call mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"jianlai\",\"arguments\":{\"operation\":\"windows\",\"observe\":true}} (add \"query\":\"<app or title>\" or \"windowId\" to bind the target) — it returns the window list AND the target screenshot, verify the observed target is in the foreground before act; a background target must first be switched with {\"operation\":\"activate\",\"windowId\":<id>} (returns a fresh screenshot). Execute the longest sequence determined by the current observation in one act (up to 16), ending at the first information boundary. Put navigation, dropdown opening or a focus/layout transition last when the next action depends on its result. Use returned feedback directly: if it matches expectations, continue with its fresh snapshotId without redundant inspect/screenshot or replanning. On partial failure, check completedActions and the fresh observation; never replay completed actions. Chrome forms use consecutive fill actions in one batch; jianlai can batch a confirmed field click, select-all and whole-text input. An information boundary means the next step lacks necessary evidence, not every click. Do not pad batches or use waits to guess unseen content. Experience search/save/feedback are optional: use them only for unfamiliar paths, blockers or reusable new knowledge, never as mandatory per-task round trips. Verify the visible outcome when the task finishes. Use jianlai only for what truly needs the GUI: view local images/files with the file read tool, get processes, files, system info or anything a command returns with shell, and Chrome page content with chrome. While operating a GUI, never use shell, COM, PowerShell, P/Invoke, UIAutomation or scripts to activate/control apps. Switch background windows with jianlai activate(windowId); only if activate is refused, inspect the desktop and click a visible taskbar icon or use Win+Tab; do not blindly cycle windows. If the endpoint is missing, report the MCP error rather than silently switching methods. Use chrome for browser operations in the user's Chrome. Division of labor: web page content inside a Chrome tab → chrome (DOM refs; tabs with query binds a tabTag and returns the inspect in one call; open/goto/select_tab wait for load and return the inspect; act waits for navigation before feeding back). Other apps and Chrome's native dialogs (file picker, print, system prompts) → jianlai. They share one physical screen: NEVER call chrome and jianlai in parallel; after switching tools, re-observe before acting (chrome navigation/act retires the jianlai snapshot; a jianlai act that touched Chrome requires a fresh chrome inspect).".into());
@@ -6116,13 +6122,15 @@ mod desktop_prompt_tests {
         assert!(super::direct_desktop_guidance().contains("jianlai"));
         assert!(!super::direct_desktop_guidance().contains("webview"));
         let source = include_str!("acp.rs").replace("\r\n", "\n");
-        assert!(source.contains("if self.kind == AgentKind::Devin {\n                guidance.push(nova_tools_prompt_guidance"));
+        assert!(source.contains("guidance.push(nova_tools_prompt_guidance(context_tools, read_only, desktop));"));
         for polaris in [true, false] {
-            let prompt = super::nova_tools_prompt_guidance(polaris, false);
+            let prompt = super::nova_tools_prompt_guidance(polaris, false, true);
             assert!(!prompt.contains("webview"));
             for tool in ["jianlai", "chrome"] {
                 assert!(prompt.contains(tool));
-                assert!(!super::nova_tools_prompt_guidance(polaris, true).contains(tool));
+                assert!(!super::nova_tools_prompt_guidance(polaris, true, true).contains(tool));
+                // 自动模式未暴露桌面工具时，提示词不得再宣传它们（否则模型会退回 shell 而不转交）。
+                assert!(!super::nova_tools_prompt_guidance(polaris, false, false).contains(tool));
             }
             assert!(prompt.contains("剑来"));
             assert!(prompt.contains(r#""tool_name":"jianlai""#));
