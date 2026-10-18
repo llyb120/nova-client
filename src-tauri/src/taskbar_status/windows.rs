@@ -41,7 +41,7 @@ static LAYOUT: Mutex<Option<Arc<Layout>>> = Mutex::new(None);
 const ANIMATION: usize = 1;
 /// Resting on the Butterfly this long opens the quick panel (the panel replaced the hover tooltip).
 const HOVER: usize = 2;
-const HOVER_MS: u32 = 350;
+const HOVER_MS: u32 = 120;
 
 // Everything below is touched only by the status message thread (refresh + window_proc).
 thread_local! {

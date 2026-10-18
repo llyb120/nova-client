@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use windows_sys::Win32::{
     Foundation::{POINT, RECT},
     Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED},
-    UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE},
+    UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE},
 };
 
 const LABEL: &str = "taskbar-bubble";
@@ -107,9 +107,20 @@ pub(super) fn open_panel(app: &AppHandle, anchor: Anchor) {
 pub(super) fn activate(app: &AppHandle) {
     if !WANTED.load(Ordering::Acquire) { return; }
     PANEL.store(false, Ordering::Release);
-    if let Some(window) = app.get_webview_window(LABEL) {
-        let _ = window.show();
-        let _ = window.set_focus();
+    if let Some(window) = app.get_webview_window(LABEL) { focus(&window); }
+}
+
+/// Show and focus natively. Hover shows with ShowWindow, so tao's VISIBLE flag lags; tao's
+/// show() would then flip it and re-apply the window style with SWP_FRAMECHANGED, which
+/// flashes the transparent WebView on every click into the panel. hide() already hides
+/// natively too, so tao's flag is never needed. Our process owns the click, so
+/// SetForegroundWindow is permitted.
+fn focus(window: &WebviewWindow) {
+    let Ok(hwnd) = window.hwnd() else { return };
+    let hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        if IsWindowVisible(hwnd) == 0 { ShowWindow(hwnd, SW_SHOW); }
+        SetForegroundWindow(hwnd);
     }
 }
 
@@ -124,9 +135,9 @@ fn watch_panel(app: &AppHandle) {
         let mut p = POINT { x: 0, y: 0 };
         if unsafe { GetCursorPos(&mut p) } == 0 { continue; }
         let c = anchor.chip;
-        let over_panel = app.get_webview_window(LABEL).filter(|w| w.is_visible().unwrap_or(false)).and_then(|w| w.hwnd().ok()).is_some_and(|h| {
+        let over_panel = app.get_webview_window(LABEL).and_then(|w| w.hwnd().ok()).is_some_and(|h| {
             let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-            (unsafe { GetWindowRect(h.0 as _, &mut r) }) != 0 && inside((r.left, r.top, r.right, r.bottom), p)
+            (unsafe { IsWindowVisible(h.0 as _) }) != 0 && (unsafe { GetWindowRect(h.0 as _, &mut r) }) != 0 && inside((r.left, r.top, r.right, r.bottom), p)
         });
         if inside((c.left, c.top, c.right, c.bottom), p) || over_panel { away = None; continue; }
         if away.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(300) {
@@ -141,12 +152,9 @@ pub(super) fn hide(app: &AppHandle) {
     PANEL.store(false, Ordering::Release);
     WANTED.store(false, Ordering::Release);
     SHOWN.lock().unwrap().take();
-    // The hover panel is shown with ShowWindow (no activation), which tao's visibility flag never saw:
-    // window.hide() alone is then a no-op and leaves a transparent, click-eating window. Do both — tao's
-    // call keeps its flag in sync so the next window.show() is not skipped, Win32 hides for real.
-    if let Some(window) = app.get_webview_window(LABEL) {
-        let _ = window.hide();
-        if let Ok(hwnd) = window.hwnd() { unsafe { ShowWindow(hwnd.0 as _, SW_HIDE); } }
+    // Shown natively (see focus()), so hide natively; tao's VISIBLE flag is never relied on.
+    if let Some(Ok(hwnd)) = app.get_webview_window(LABEL).map(|window| window.hwnd()) {
+        unsafe { ShowWindow(hwnd.0 as _, SW_HIDE); }
     }
     let _ = app.emit_to(LABEL, "taskbar-bubble:hidden", ());
     super::windows::wake();
@@ -185,21 +193,13 @@ pub(super) fn place(app: &AppHandle, css_height: f64) -> bool {
     let wanted = WANTED.load(Ordering::Acquire);
     if wanted && PANEL.load(Ordering::Acquire) {
         // Hover must not steal focus from the app the user is working in.
-        if !window.is_visible().unwrap_or(true) { unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE); } }
+        if unsafe { IsWindowVisible(hwnd) } == 0 { unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE); } }
         // The pointer may have left (watch_panel hid it) between the check above and the show.
         if !WANTED.load(Ordering::Acquire) { unsafe { ShowWindow(hwnd, SW_HIDE); } return false; }
         return true;
     }
-    if wanted && !window.is_visible().unwrap_or(true) {
-        let _ = window.show();
-        let _ = window.set_focus();
-    } else if wanted && !window.is_focused().unwrap_or(true) {
-        // Hover used native ShowWindow, so Tao's visible flag can still be false; synchronize
-        // it before set_focus(), which otherwise silently skips an allegedly hidden window.
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-    if WANTED.load(Ordering::Acquire) && window.is_visible().unwrap_or(false) {
+    if wanted && (unsafe { IsWindowVisible(hwnd) } == 0 || !window.is_focused().unwrap_or(true)) { focus(&window); }
+    if WANTED.load(Ordering::Acquire) && unsafe { IsWindowVisible(hwnd) } != 0 {
         // Acknowledge only the revision rendered by the page, not a newer store update.
         let shown = SHOWN.lock().unwrap().clone();
         if let (Some((thread, stamp)), Ok(mut seen)) = (shown, super::SEEN.lock()) {

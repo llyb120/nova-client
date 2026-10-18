@@ -149,7 +149,7 @@ assert.ok(hiddenGuard >= 0 && hiddenGuard < placement.indexOf('let Some(anchor)'
 const construction = native.slice(native.indexOf('pub(super) fn window('), native.indexOf('pub(super) fn open('));
 assert.match(construction, /let disabled = 1i32;[\s\S]*DwmSetWindowAttribute\(hwnd\.0 as _, DWMWA_TRANSITIONS_FORCEDISABLED/,
   'the transparent flyout must not retain a native hide-animation surface');
-assert.match(placement, /WANTED\.load\(Ordering::Acquire\) && window\.is_visible\(\)\.unwrap_or\(false\)/,
+assert.match(placement, /WANTED\.load\(Ordering::Acquire\) && unsafe \{ IsWindowVisible\(hwnd\) \} != 0/,
   'only a genuinely visible bubble can mark its rendered revision seen');
 assert.match(placement, /Some\(\(thread, stamp\)\)[\s\S]*seen\.at\.entry\(thread\)[\s\S]*max\(stamp\)/,
   'acknowledgement must use the rendered timestamp, without rolling back newer acknowledgements');
