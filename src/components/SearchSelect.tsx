@@ -267,19 +267,33 @@ export function SearchSelect(props: {
     return m?.efforts?.length ? m : undefined;
   });
 
-  // 思考强度列已展开时，划过中间的其它模型行容易在抵达强度列前把它顶掉（经典悬停子菜单问题）。
-  // 用短延迟 + 可取消替代立即切换：划过是连续 mouseenter 互相取消上一行的定时器，
-  // 真正停留或已进入强度列才提交切换；还没展开任何强度列时第一次悬停仍即时生效。
-  const HOVER_INTENT_MS = 120;
+  // 思考强度列已展开时，从低处的模型斜向划向强度列（它从顶部起排），会先经过中间的其它模型行。
+  // 参考 Amazon 菜单的「安全三角」：以上一个鼠标位置为顶点、强度列左侧上下角为底边；
+  // 当前位置落在三角内说明正朝强度列移动，此时延迟切换（进入强度列即取消）；
+  // 否则是在模型列内正常浏览，立即切换。还没展开强度列时第一次悬停同样即时生效。
+  const HOVER_INTENT_MS = 300;
   let intentTimer: ReturnType<typeof setTimeout> | undefined;
+  let effortRef: HTMLDivElement | undefined;
+  let lastPt: { x: number; y: number } | undefined;
   const cancelIntent = () => {
     if (intentTimer === undefined) return;
     clearTimeout(intentTimer);
     intentTimer = undefined;
   };
-  const scheduleActiveModel = (value: string) => {
+  const headingToEfforts = (e: MouseEvent) => {
+    const r = effortRef?.getBoundingClientRect();
+    if (!r || !r.width || !lastPt) return false;
+    const side = (ax: number, ay: number, bx: number, by: number) =>
+      (e.clientX - bx) * (ay - by) - (ax - bx) * (e.clientY - by);
+    const d1 = side(lastPt.x, lastPt.y, r.left, r.top);
+    const d2 = side(r.left, r.top, r.left, r.bottom);
+    const d3 = side(r.left, r.bottom, lastPt.x, lastPt.y);
+    return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
+  };
+  const scheduleActiveModel = (value: string, e: MouseEvent) => {
     cancelIntent();
-    if (!effortModel()) {
+    if (value === activeModel()) return;
+    if (!effortModel() || !headingToEfforts(e)) {
       setActiveModel(value);
       return;
     }
@@ -412,7 +426,8 @@ export function SearchSelect(props: {
         o.efforts?.length && effortModel() === o ? "open" : ""
       }`}
       onClick={() => pickModel(o)}
-      onMouseEnter={() => scheduleActiveModel(o.value)}
+      onMouseEnter={(e) => scheduleActiveModel(o.value, e)}
+      onMouseMove={(e) => scheduleActiveModel(o.value, e)}
       title={o.title ?? o.value}
     >
       <span class="sel-model-copy">
@@ -469,7 +484,7 @@ export function SearchSelect(props: {
   );
   const effortPane = () => (
     <Show when={hasEfforts()}>
-      <div class="sel-list sel-efforts" onMouseEnter={cancelIntent}>
+      <div ref={effortRef} class="sel-list sel-efforts" onMouseEnter={cancelIntent}>
         <Show when={effortModel()} fallback={<div class="sel-empty">思考强度</div>}>
           {(m) => (
             <>
@@ -487,6 +502,7 @@ export function SearchSelect(props: {
   const renderPop = () => (
     <div
       ref={popRef}
+      onMouseMove={(e) => (lastPt = { x: e.clientX, y: e.clientY })}
       class={`sel-pop ${isThreeLevel() ? "three" : ""} ${hasEfforts() ? "efforts" : ""} ${
         isGrouped() || isThreeLevel() ? "grouped" : ""
       } ${!usePortal() && place().down ? "down" : ""} ${
