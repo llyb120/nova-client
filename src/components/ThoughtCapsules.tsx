@@ -18,7 +18,7 @@ export type Capsule = {
 export type ThoughtCapsulesProps = { active: boolean; onCaptured?: () => void; captureError?: string };
 
 /** Shared with the shell's DOM/native drop handlers. Pass real native paths, not File.name.
- * Privacy: automatic summaries use the configured lightweight Lyra model; captured text
+ * Privacy: automatic summaries run the lightweight-scene model (any backend) with the source file attached; captured text
  * is never replaced by a summary. Capsule.text may only sample a file; the full file
  * copy is saved by the backend, not the webview.
  * This only captures: the caller owns tab switching; nothing is sent to a conversation.
@@ -282,7 +282,7 @@ export default function ThoughtCapsules(props: ThoughtCapsulesProps) {
         <footer class="tc-footer">
           <div class="tc-selection"><span aria-live="polite">已选 <strong>{selected().size}</strong> 条<Show when={hiddenCount()}><span class="tc-hidden-count">含 {hiddenCount()} 条搜索隐藏项</span></Show></span><span class="tc-multiselect-hint">Ctrl / ⌘ 点击多选</span><button type="button" class="tc-text-button" disabled={!selected().size || !!busy()} onClick={() => { setSelected(new Set<string>()); setNotice(""); }}>清空选择</button></div>
           <div class="tc-actions"><button type="button" class="tc-delete" disabled={!selected().size || !!busy()} aria-label={`删除选中的 ${selected().size} 条星屑`} title="删除所选（需确认）" onClick={() => showView({ kind: "remove", ids: selectedIds(), hidden: hiddenCount() })}>{icon("trash")}</button><button type="button" class="tc-open" disabled={!selected().size || !!busy()} onKeyDown={(event) => { if (event.repeat && (event.key === "Enter" || event.key === " ")) event.preventDefault(); }} onClick={(event) => { if (event.detail < 2) void openSelected(); }}><span>{busy() === "open" ? "正在准备草稿…" : "带入新会话"}</span><small>仅草稿 · 不发送</small>{icon("arrow")}</button></div>
-          <p class="tc-privacy" title="文本摘要使用已配置的轻量 Lyra 模型，请留意敏感信息。单文件最多 20 MiB，每次最多 16 个、合计 80 MiB；原文和文件副本独立保留。">{icon("shield")}自动摘要使用轻量 Lyra 模型 · 原文保留</p>
+          <p class="tc-privacy" title="自动摘要交给轻量场景模型（任意后端），附带源文件由 agent 自行读取，请留意敏感信息。单文件最多 20 MiB，每次最多 16 个、合计 80 MiB；原文和文件副本独立保留。">{icon("shield")}自动摘要使用轻量场景模型 · 原文保留</p>
         </footer>
       </div>
 

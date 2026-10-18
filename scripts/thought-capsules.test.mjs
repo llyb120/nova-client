@@ -172,7 +172,7 @@ const dragAttributes = [];
 assert.deepEqual(dragAttributes, [], 'all DOM/native drops must reach the root shell');
 assert.match(source.text, /完整内容保存在附件中/);
 assert.match(source.text, /Ctrl \/ ⌘ 点击多选/);
-assert.match(source.text, /轻量 Lyra 模型/);
+assert.match(source.text, /轻量场景模型/);
 assert.match(source.text, /<h2>星屑 /, 'the panel uses the new display name');
 assert.match(source.text, /aria-label="星屑"/);
 assert.doesNotMatch(source.text, /\u80f6\u56ca/, 'no old display name remains in labels, messages or fallbacks');

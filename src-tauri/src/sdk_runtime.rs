@@ -801,12 +801,6 @@ impl SdkManager {
 
     /// 一次性行内补全：Rust 直连 provider HTTP（不冷启 Node）。
     /// 仅 openai-completions / openai-responses；其它协议再回退 bridge。
-    /// 带一张图片（data URL）的直连补全；仅 openai completions/responses，无 bridge 回退。
-    pub async fn complete_once_image(&self, model: &str, prompt: &str, image: &str) -> Result<String, String> {
-        let data_dir = self.borrowed_root().unwrap_or_else(|| nova_data_dir(&self.app));
-        crate::lyra_complete::complete_direct_image(&self.native_http(), &data_dir, &self.launch_env, model, prompt, Some(image)).await
-    }
-
     pub async fn complete_once(
         &self,
         cwd: &str,
