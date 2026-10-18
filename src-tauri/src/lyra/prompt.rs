@@ -552,7 +552,7 @@ pub struct SystemPromptOptions {
     pub skills_text: String,
     pub custom_instructions: String,
     pub ponytail: bool,
-    /// 自动模式非电脑操控场景不提供桌面工具。
+    /// 自动模式非剑来场景不提供桌面工具。
     pub desktop: bool,
 }
 

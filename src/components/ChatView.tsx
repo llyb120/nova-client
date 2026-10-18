@@ -389,9 +389,18 @@ export function ChatView() {
   // 链上其它 stage 的未读轮次数：当前打开的 stage 在 openThread 时已清零，不会再显示角标。
   const stageUnread = (thread: (typeof state.threads)[number]) =>
     thread.id === state.currentId ? 0 : (state.unreadTurns[thread.id] ?? 0);
+  // 点击即高亮：先让导航栏绘制一帧，再做耗时的会话切换，避免点击后“没反应”的卡顿观感。
+  const [pendingStageId, setPendingStageId] = createSignal<string | null>(null);
   const jumpToStage = async (threadId: string) => {
     // 每个 stage 都是独立会话；切换 stage 只切换会话，不再拼接 transcript。
-    await openThread(threadId);
+    if (threadId === state.currentId) return;
+    setPendingStageId(threadId);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+    try {
+      await openThread(threadId);
+    } finally {
+      setPendingStageId(null);
+    }
   };
   const [stageContextMenu, setStageContextMenu] = createSignal<{
     x: number;
@@ -1255,7 +1264,7 @@ export function ChatView() {
               <button
                 type="button"
                 class="stage-rail-item"
-                classList={{ active: thread.id === state.currentId, unread: stageUnread(thread) > 0, subagent: thread.subagent }}
+                classList={{ active: thread.id === (pendingStageId() ?? state.currentId), unread: stageUnread(thread) > 0, subagent: thread.subagent }}
                 title={thread.title}
                 onPointerDown={() => markThreadSwitchPointerDown()}
                 onClick={() => {

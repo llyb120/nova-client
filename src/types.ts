@@ -21,7 +21,7 @@ export type SceneModels = Record<SceneKey, ModelTarget[]>;
 export const SCENES: { key: SceneKey; label: string; hint: string }[] = [
   { key: "lightweight", label: "轻量化", hint: "自动模式会话的起手模型；标题、摘要、上下文压缩、/stage、Butterfly、Meteor、数字员工" },
   { key: "coding", label: "编码", hint: "写代码、改仓库、调试和构建测试" },
-  { key: "computer", label: "电脑操控", hint: "操作桌面应用与浏览器" },
+  { key: "computer", label: "剑来", hint: "操作桌面应用与浏览器" },
 ];
 export const scenesReady = (scenes?: Partial<SceneModels>) =>
   SCENES.every(({ key }) => (scenes?.[key]?.length ?? 0) > 0);
@@ -470,7 +470,7 @@ export interface Settings {
   /** 代码上下文检索模式：无 / FastContext。 */
   contextRetrievalMode: "none" | "fast";
   defaultMode: string;
-  /** 场景模型：轻量化 / 编码 / 电脑操控 */
+  /** 场景模型：轻量化 / 编码 / 剑来 */
   sceneModels: SceneModels;
   /** 打开文件用的编辑器命令（cursor / code / zed 等） */
   editor: string;

@@ -1336,6 +1336,7 @@ export async function openThread(id: string) {
     // 先接通前台推流再取快照，避免工具在快照之后、active_thread 切换之前完成而漏报。
     // 缓存仍在 await 前显示；只让后台校准等待这次交接。
     await api.reportActivity(id);
+    traceThreadSwitch(id, "reportActivity 返回");
     lastActivityReport = Date.now();
     if (request !== openThreadRequest) return;
     // 空闲子 Agent 仍可收到排队消息/关闭日志，不一定伴随新轮次使缓存失效。

@@ -1151,7 +1151,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
             <section class="settings-group">
               <h3 class="settings-group-title">场景模型</h3>
               <p class="settings-group-desc">
-                每个场景按顺序使用第一个可用的模型，失效时自动切换到下一个。自动模式会话以轻量化模型开局，由它把整块编码或电脑操控工作转交给对应场景；轻量化场景还用于标题、摘要、上下文压缩、/stage、Butterfly、Meteor 和数字员工。每个场景至少配置一个模型。
+                每个场景按顺序使用第一个可用的模型，失效时自动切换到下一个。自动模式会话以轻量化模型开局，由它把整块编码或剑来工作转交给对应场景；轻量化场景还用于标题、摘要、上下文压缩、/stage、Butterfly、Meteor 和数字员工。每个场景至少配置一个模型。
               </p>
               <For each={SCENES}>
                 {(scene) => (

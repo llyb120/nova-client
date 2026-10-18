@@ -367,8 +367,15 @@ pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope>
 
 /// 自动模式会话首条消息的隐式说明：哪些场景可转交、主会话还附项目目录清单。无可转交场景时为 None。
 fn auto_mode_context(scope: &AutoScope, projects: &[String]) -> Option<String> {
+    // 电脑操控子会话的交回规则不依赖是否可转交。
+    let verify = if scope.child && scope.scene == settings::Scene::Computer {
+        "交回前必须用最新截图确认结果确已达成；看到“可能还没刷新/还没加载完”等疑点时，自己等待、刷新并重新截图复查，确认后再交回，不要把未核实的状态或“建议再检查”推给上游。"
+    } else {
+        ""
+    };
     if scope.handoff.is_empty() {
-        return None;
+        return (!verify.is_empty())
+            .then(|| format!("[Nova 自动模式] 你是「{}」场景会话，负责把交给你的整块工作做完并给出结论（结论会交回上游会话）。{verify}", scope.scene.label()));
     }
     let scenes = scope
         .handoff
@@ -381,7 +388,7 @@ fn auto_mode_context(scope: &AutoScope, projects: &[String]) -> Option<String> {
         return Some(format!(
             "[Nova 自动模式] 你是「{}」场景会话，负责把交给你的整块工作做完并给出结论（结论会交回上游会话）。\
              过程中遇到 {scenes} 的整块工作，用 spawn_agent(scene={keys}, task_name, message) 转交给该场景的模型独立完成，\
-             再用 wait_agent 取结果后继续；不要中途逐步指挥。",
+             再用 wait_agent 取结果后继续；不要中途逐步指挥。{verify}",
             scope.scene.label()
         ));
     }
@@ -395,6 +402,7 @@ fn auto_mode_context(scope: &AutoScope, projects: &[String]) -> Option<String> {
         "[Nova 自动模式] 你是本会话的主 Agent，直接面向用户。能用自己工具完成的事直接做；\
          {scenes} 的整块工作，用 spawn_agent(scene={keys}, cwd=<项目目录>, task_name, message) 交给对应场景的模型独立完成，\
          再用 wait_agent 取结果，以你自己的口吻向用户汇报；不要中途逐步指挥，也不要向用户提及转交细节。\
+         结果不满意或同一件事需要继续（包括之前几轮派出的 agent），优先对原 agent 用 followup_task(target=原 task_name) 继续，不要再 spawn_agent 新开。\
          message 要写清目标、约束和完成标准。任务涉及的项目从下列目录中选择作为 cwd（都不相符就省略 cwd）：\n{}",
         if list.is_empty() { "（暂无项目）".into() } else { list }
     ))
@@ -406,16 +414,20 @@ fn auto_scope_skips_same_model_and_upstream_scenes() {
     use settings::Scene::*;
     let light = (AgentKind::Lyra, "light".to_string());
     let code = (AgentKind::Codex, "code".to_string());
-    // 电脑操控与轻量化同模型：轻量主会话自己操作电脑，只转交编码。
+    // 剑来与轻量化同模型：轻量主会话自己操作电脑，只转交编码。
     let first = |s: settings::Scene| Some(if s == Coding { code.clone() } else { light.clone() });
     let main = scope_of(Lightweight, &light, &[], first);
     assert_eq!((main.covered.clone(), main.handoff.clone(), main.desktop()), (vec![Lightweight, Computer], vec![Coding], true));
-    // 编码子会话需要操作电脑：电脑操控模型不同且不在上游链上，可以转交；不能推回上游的轻量化。
+    // 编码子会话需要操作电脑：剑来模型不同且不在上游链上，可以转交；不能推回上游的轻量化。
     let first = |s: settings::Scene| Some(match s { Coding => code.clone(), Computer => (AgentKind::Claude, "cu".into()), Lightweight => light.clone() });
     let child = scope_of(Coding, &code, &[Lightweight], first);
     assert_eq!((child.handoff.clone(), child.desktop(), child.child), (vec![Computer], false, true));
     // 三个场景同模型：什么都不转交。
     assert!(scope_of(Lightweight, &light, &[], |_| Some(light.clone())).handoff.is_empty());
+    // 电脑操控子会话无可转交场景时仍带交回前复查规则；主会话提示复用原 agent。
+    let cu = scope_of(Computer, &light, &[Lightweight], |_| Some(light.clone()));
+    assert!(auto_mode_context(&cu, &[]).is_some_and(|c| c.contains("最新截图")));
+    assert!(auto_mode_context(&main, &[]).is_some_and(|c| c.contains("followup_task")));
 }
 
 /// 场景转交：在场景模型（可跨后端）上开一个引用父会话上下文的 Stage 会话。

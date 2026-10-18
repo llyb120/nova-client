@@ -50,7 +50,7 @@ export function createNovaBatchTools(cwd, options = {}) {
   const fastContext = fastContextEnabled(options);
   const readOnly = readOnlyEnabled(options);
   let root = resolve(cwd);
-  // 自动模式（Nova 按会话注入）：当前模型不是电脑操控场景的模型时不暴露桌面/浏览器工具；
+  // 自动模式（Nova 按会话注入）：当前模型不是剑来场景的模型时不暴露桌面/浏览器工具；
   // 存在模型不同的场景时可按场景转交。
   const env = (name) => String(options.toolEnv?.[name] ?? process.env[name] ?? "");
   const threadId = env("NOVA_THREAD_ID");

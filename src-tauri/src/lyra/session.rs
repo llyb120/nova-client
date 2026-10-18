@@ -2,6 +2,7 @@
 //! 用 send_message / followup_task / wait_agent / list_agents / interrupt_agent / close_agent 协作。
 //! 子 agent 继承主 agent 的模型、工具与工作目录，模型历史只在内存里，深度上限 1。
 //! Nova 中额外把任务和执行事件投影到只读 Stage，展示记录落盘，不参与调度。
+//! 场景转交子任务的 Stage 会话本身落盘：注册表里找不到时（如 Nova 重启后）按 task_name 从会话存储找回继续用。
 
 use crate::lyra::context::ContextWindow;
 use crate::lyra::history::{text_content, user_message, History};
@@ -62,7 +63,7 @@ pub struct AgentHandle {
     stage_parent: Option<(tauri::AppHandle, String)>,
 }
 
-// ponytail: 注册表按根会话常驻进程内存、不回收；子 agent 随 close_agent 或进程退出结束。
+// ponytail: 注册表按根会话常驻进程内存、不回收；进程内子 agent 随 close_agent 或进程退出结束，场景子任务可从落盘的 Stage 会话找回。
 pub fn root_handle(session_id: &str) -> AgentHandle {
     static REGISTRIES: OnceLock<Mutex<HashMap<String, Arc<Registry>>>> = OnceLock::new();
     let registry = REGISTRIES
@@ -93,7 +94,7 @@ pub fn is_agent_tool(name: &str) -> bool {
 fn scene_param(handoff: &[Scene]) -> (String, Value) {
     let scenes = handoff.iter().map(|s| format!("{}={}（{}）", s.key(), s.label(), s.when())).collect::<Vec<_>>().join("；");
     (
-        " Auto mode: when a whole chunk of work fits one of the scene options, pass scene to hand it off to that scene's model in its own Stage session (it sees this conversation and closes the loop itself); then wait_agent for the final result instead of directing it step by step.".into(),
+        " Auto mode: when a whole chunk of work fits one of the scene options, pass scene to hand it off to that scene's model in its own Stage session (it sees this conversation and closes the loop itself); then wait_agent for the final result instead of directing it step by step. To continue or correct an existing scene agent (even from an earlier turn), use followup_task on its task_name instead of spawning another.".into(),
         json!({ "type": "string", "enum": handoff.iter().map(|s| s.key()).collect::<Vec<_>>(), "description": format!("optional handoff scene: {scenes}. Omit for an in-process helper on this model.") }),
     )
 }
@@ -177,12 +178,51 @@ impl AgentHandle {
     }
 
     fn resolve(&self, target: &str) -> Result<(String, Arc<Child>), String> {
-        let agents = self.registry.agents.lock().unwrap();
         let path = if target.starts_with('/') { target.to_string() } else { format!("{ROOT}/{target}") };
-        agents
-            .get(&path)
-            .map(|child| (path, child.clone()))
+        let mut agents = self.registry.agents.lock().unwrap();
+        self.lookup(&mut agents, &path)
+            .map(|child| (path, child))
             .ok_or_else(|| format!("not_found: no agent {target}"))
+    }
+
+    /// 注册表优先；没有时从会话存储找回同名场景子任务并登记。
+    fn lookup(&self, agents: &mut HashMap<String, Arc<Child>>, path: &str) -> Option<Arc<Child>> {
+        if let Some(child) = agents.get(path) {
+            return Some(child.clone());
+        }
+        let child = self.revive(path)?;
+        agents.insert(path.to_string(), child.clone());
+        Some(child)
+    }
+
+    /// 找回父会话下最近一个同名场景 Stage 会话（失效切换会新建同名会话，取最新），接回 scene_loop。
+    fn revive(&self, path: &str) -> Option<Arc<Child>> {
+        use tauri::Manager;
+        let (app, parent_id) = self.stage_parent.as_ref()?;
+        let name = path.strip_prefix(ROOT)?.strip_prefix('/')?;
+        let state = app.state::<crate::AppState>();
+        let (thread_id, scene, cwd, reply) = {
+            let store = state.store.lock().unwrap();
+            let parent_cwd = store.get(parent_id)?.cwd.clone();
+            let (thread, scene) = store
+                .threads
+                .iter()
+                .filter(|t| t.stage_source_thread_id.as_deref() == Some(parent_id.as_str()))
+                .filter_map(|t| t.auto_scene.as_deref().and_then(Scene::parse).map(|s| (t, s)))
+                .filter(|(t, s)| t.title == format!("[{}] {name}", s.label()))
+                .max_by_key(|(t, _)| t.created_at)?;
+            let reply = thread.items.iter().rev().find_map(|item| match item {
+                crate::threads::Item::Assistant { text, .. } if !text.trim().is_empty() => Some(text.trim().to_string()),
+                _ => None,
+            });
+            // 与父会话同目录说明当初没指定 cwd：失效切换时继续沿用父会话（含 worktree）。
+            let cwd = (thread.cwd != parent_cwd).then(|| thread.cwd.clone());
+            (thread.id.clone(), scene, cwd, reply)
+        };
+        let (child, rx) = new_child(None, None, Some(thread_id)).ok()?;
+        *child.status.lock().unwrap() = ("completed".into(), reply);
+        tauri::async_runtime::spawn(scene_loop(child.clone(), app.clone(), parent_id.clone(), scene, name.into(), cwd, rx, self.registry.clone()));
+        Some(child)
     }
 
     fn report(&self, prefix: Option<&str>) -> Value {
@@ -218,7 +258,7 @@ pub async fn call(handle: &AgentHandle, parent: &Session, name: &str, args: &Val
 
 /// nova-tools MCP 入口：非 Lyra 后端的自动模式会话只能按场景转交（子任务在场景模型的 Stage 会话里闭环）。
 pub async fn call_for_thread(app: &tauri::AppHandle, thread_id: &str, name: &str, args: &Value) -> Result<Value, String> {
-    let handle = root_handle(&format!("thread:{thread_id}"));
+    let handle = root_handle(&format!("thread:{thread_id}")).with_stage(Some((app.clone(), thread_id.to_string())));
     match name {
         "spawn_agent" => scene_spawn(&handle, app, thread_id, args),
         "list_agents" => Ok(handle.report(args.get("path_prefix").and_then(Value::as_str))),
@@ -281,8 +321,8 @@ fn reserve<'a>(handle: &'a AgentHandle, args: &'a Value) -> Result<(&'a str, &'a
     }
     let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
     let path = format!("{ROOT}/{task_name}");
-    let agents = handle.registry.agents.lock().unwrap();
-    if agents.get(&path).is_some_and(|c| c.status().0 != "shutdown") {
+    let mut agents = handle.registry.agents.lock().unwrap();
+    if handle.lookup(&mut agents, &path).is_some_and(|c| c.status().0 != "shutdown") {
         return Err(format!("{path} already exists; use followup_task or pick another task_name"));
     }
     if agents.values().filter(|c| c.active()).count() >= MAX_ACTIVE {
@@ -291,9 +331,11 @@ fn reserve<'a>(handle: &'a AgentHandle, args: &'a Value) -> Result<(&'a str, &'a
     Ok((task_name, message, path, agents))
 }
 
-fn new_child(message: &str, stage: Option<Stage>, scene_thread: Option<String>) -> Result<(Arc<Child>, tokio::sync::mpsc::UnboundedReceiver<Value>), String> {
+fn new_child(message: Option<&str>, stage: Option<Stage>, scene_thread: Option<String>) -> Result<(Arc<Child>, tokio::sync::mpsc::UnboundedReceiver<Value>), String> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tx.send(user_message(message, &[])).map_err(|e| e.to_string())?;
+    if let Some(message) = message {
+        tx.send(user_message(message, &[])).map_err(|e| e.to_string())?;
+    }
     let child = Arc::new(Child {
         status: Mutex::new(("pending_init".into(), None)),
         tasks: Mutex::new(Some(tx)),
@@ -317,7 +359,7 @@ fn scene_spawn(handle: &AgentHandle, app: &tauri::AppHandle, parent_id: &str, ar
     let Some(thread_id) = crate::create_scene_stage(app, parent_id, scene, task_name, cwd.as_deref(), 0)? else {
         return Ok(json!({ "ok": false, "next": "该场景的模型与当前会话相同，不要转交，直接在本会话完成。" }));
     };
-    let (child, rx) = new_child(message, None, Some(thread_id.clone()))?;
+    let (child, rx) = new_child(Some(message), None, Some(thread_id.clone()))?;
     agents.insert(path.clone(), child.clone());
     drop(agents);
     tauri::async_runtime::spawn(scene_loop(
@@ -431,7 +473,7 @@ fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, 
     let stage = handle.stage_parent.as_ref().and_then(|(app, parent_id)| {
         Stage::new(app, parent_id, task_name, parent.cwd.to_string_lossy().into_owned(), parent.model.model.id.clone())
     });
-    let (child, rx) = new_child(message, stage, None)?;
+    let (child, rx) = new_child(Some(message), stage, None)?;
     let session = Session {
         http: parent.http.clone(),
         model: parent.model.clone(),

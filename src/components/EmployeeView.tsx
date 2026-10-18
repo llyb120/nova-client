@@ -254,7 +254,7 @@ export default function EmployeeView() {
                         onChange={(ev) => void set({ idleMinutes: Number(ev.currentTarget.value) || 10 })} /> 分钟</span>
                     </label>
                     <p class="employee-hint">在工作时段内，电脑空闲后自动开始工作；你回来时，员工会让出。</p>
-                    <p class="employee-hint">员工使用「设置 → 场景模型 → 轻量化」，符合编码或电脑操控场景的事项会转交对应场景的模型。</p>
+                    <p class="employee-hint">员工使用「设置 → 场景模型 → 轻量化」，符合编码或剑来场景的事项会转交对应场景的模型。</p>
                   </section>
 
                 </aside>

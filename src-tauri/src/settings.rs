@@ -59,7 +59,7 @@ impl Scene {
         match self {
             Scene::Lightweight => "轻量化",
             Scene::Coding => "编码",
-            Scene::Computer => "电脑操控",
+            Scene::Computer => "剑来",
         }
     }
 
@@ -75,7 +75,7 @@ impl Scene {
     /// 接受 key 或中文名。
     pub fn parse(value: &str) -> Option<Self> {
         let value = value.trim();
-        Self::ALL.into_iter().find(|s| s.key().eq_ignore_ascii_case(value) || s.label() == value)
+        Self::ALL.into_iter().find(|s| s.key().eq_ignore_ascii_case(value) || s.label() == value || (s == &Scene::Computer && value == "电脑操控"))
     }
 }
 
@@ -196,7 +196,7 @@ pub struct Settings {
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
     pub default_mode: String,
-    /// 场景模型：轻量化（标题/摘要/Stage/Butterfly/Meteor/员工）、编码、电脑操控。
+    /// 场景模型：轻量化（标题/摘要/Stage/Butterfly/Meteor/员工）、编码、剑来。
     pub scene_models: SceneModels,
     /// 打开文件用的编辑器命令（cursor / code / zed / windsurf 等，依赖 PATH）
     pub editor: String,
@@ -423,6 +423,7 @@ mod tests {
         fs::write(dir.join("settings.json"), r#"{"lightweightModelAgent":"codex","sceneModels":{"lightweight":[{"agentKind":"lyra","model":""}]}}"#).unwrap();
         assert_eq!(Settings::load(&dir).scene_models.lightweight[0].agent_kind, "lyra");
         fs::remove_dir_all(dir).unwrap();
+        assert_eq!(Scene::parse("剑来"), Some(Scene::Computer));
         assert_eq!(Scene::parse("电脑操控"), Some(Scene::Computer));
         assert_eq!(Scene::parse("coding"), Some(Scene::Coding));
     }

@@ -331,7 +331,7 @@ async fn handle_prompt(
     let agent_instructions = load_agent_instructions(roots);
     let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
     let auto_change_project = settings.auto_change_project_enabled;
-    // 自动模式：当前模型不是电脑操控场景的模型时不给桌面/浏览器工具，转交给电脑操控场景闭环。
+    // 自动模式：当前模型不是剑来场景的模型时不给桌面/浏览器工具，转交给剑来场景闭环。
     let auto = app.as_ref().zip(request.get("novaThreadId").and_then(Value::as_str)).and_then(|(app, id)| {
         use tauri::Manager;
         crate::auto_scope(&app.state::<crate::AppState>(), id)

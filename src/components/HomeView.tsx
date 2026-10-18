@@ -1,4 +1,4 @@
-﻿import { message } from "@tauri-apps/plugin-dialog";
+import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 
 import { api } from "../ipc";
@@ -1080,7 +1080,7 @@ export function HomeView() {
             />
           </div>
           <div class="composer-bar">
-            <label class="pill composer-auto" title="以轻量化模型开局，按需把编码或电脑操控工作交给对应场景模型（设置 → 场景模型）">
+            <label class="pill composer-auto" title="以轻量化模型开局，按需把编码或剑来工作交给对应场景模型（设置 → 场景模型）">
               <input type="checkbox" checked={auto()} onChange={(e) => toggleAuto(e.currentTarget.checked)} />
               自动模式
             </label>
