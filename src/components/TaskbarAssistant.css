@@ -28,7 +28,8 @@
 .ta-message-content { min-width: 0; max-width: calc(100% - 50px); }
 .ta-bubble { position: relative; padding: 8px 11px; border-radius: 3px 10px 10px 10px; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; color: var(--fg-body); background: rgb(var(--ink) / 0.08); }
 .ta-message.user .ta-bubble { border-radius: 10px 3px 10px 10px; color: #14391b; background: #95ec69; }
-.ta-thread { margin-top: 4px; font-size: 11px; }
+.ta-message-meta { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+.ta-thread { font-size: 11px; }
 .ta-latest { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); padding: 4px 12px; border: 1px solid rgb(var(--ink) / 0.12); border-radius: 12px; color: var(--link); background: var(--bg-top); box-shadow: 0 2px 8px #0002; font: inherit; font-size: 11px; cursor: pointer; }
 /* Shared by every tab: one compact row below whichever pane is visible. */
 .ta-compose { flex: none; order: 1; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 4px 6px; }

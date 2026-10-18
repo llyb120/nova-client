@@ -4,9 +4,11 @@ import { createEffect, createSignal, For, onCleanup, onMount, Show, untrack } fr
 import { createStore, reconcile } from "solid-js/store";
 import "./TaskbarAssistant.css";
 
-type Message = { id: string; role: "user" | "assistant"; text: string; createdAt: number; threadId?: string };
+type Kind = "running" | "waiting" | "done" | "error";
+/** `status`: live state of the dispatched session task; the backend rewrites this message in place. */
+type Message = { id: string; role: "user" | "assistant"; text: string; createdAt: number; threadId?: string; status?: Kind };
 type History = { messages: Message[]; hasMore: boolean; busy?: boolean };
-type Session = { threadId: string; title: string; kind: "running" | "waiting" | "done" | "error"; text: string; updatedAt: number };
+type Session = { threadId: string; title: string; kind: Kind; text: string; updatedAt: number };
 type View = { id?: string; offset: number; top: number; bottom: boolean };
 const LABEL = { running: "进行中", waiting: "待确认", done: "已完成", error: "出错了" };
 const PAGE_SIZE = 30;
@@ -248,7 +250,12 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
                   <span class="ta-avatar" aria-hidden="true">{message.role === "user" ? "我" : "N"}</span>
                   <div class="ta-message-content">
                     <div class="ta-bubble">{message.text}</div>
-                    <Show when={message.threadId}><button class="ta-thread" onClick={() => openThread(message.threadId!)}>打开会话 ↗</button></Show>
+                    <Show when={message.threadId || message.status}>
+                      <div class="ta-message-meta">
+                        <Show when={message.status}><span class={`ta-status ${message.status}`} title="会话状态">会话{LABEL[message.status!]}</span></Show>
+                        <Show when={message.threadId}><button class="ta-thread" onClick={() => openThread(message.threadId!)}>打开会话 ↗</button></Show>
+                      </div>
+                    </Show>
                   </div>
                 </article>
               )}

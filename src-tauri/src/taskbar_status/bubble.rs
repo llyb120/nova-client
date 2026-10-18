@@ -4,14 +4,14 @@
 use super::{Kind, Rect};
 use serde_json::{json, Value};
 use std::{
-    sync::{atomic::{AtomicBool, Ordering}, Mutex},
+    sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Mutex},
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use windows_sys::Win32::{
-    Foundation::{POINT, RECT},
+    Foundation::{HWND, POINT, RECT},
     Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED},
-    UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE},
+    UI::WindowsAndMessaging::{GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowRect, GA_ROOTOWNER, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE},
 };
 
 const LABEL: &str = "taskbar-bubble";
@@ -35,6 +35,8 @@ static CAPTURE_ERROR: Mutex<Option<String>> = Mutex::new(None);
 /// Clicking inside pins the panel for keyboard input until blur or explicit dismissal.
 static PANEL: AtomicBool = AtomicBool::new(false);
 static PANEL_WATCH: AtomicBool = AtomicBool::new(false);
+/// Bumped by hide(): a watcher outliving a quick hide/reopen restarts its bookkeeping.
+static OPENED: AtomicUsize = AtomicUsize::new(0);
 static BUILD: Mutex<()> = Mutex::new(());
 /// Finished result and its rendered revision, kept on the live card even after it is read.
 static SHOWN: Mutex<Option<(String, i64)>> = Mutex::new(None);
@@ -88,6 +90,7 @@ pub(super) fn open(app: &AppHandle, anchor: Anchor) {
     WANTED.store(true, Ordering::Release);
     // A freshly built page places itself on mount; a warm one reloads on this event.
     if window(app).is_some() { let _ = app.emit_to(LABEL, "taskbar-bubble:open", ()); }
+    watch(app);
 }
 
 /// Hover: preview the assistant unless the panel is already open.
@@ -97,10 +100,18 @@ pub(super) fn open_panel(app: &AppHandle, anchor: Anchor) {
     *ANCHOR.lock().unwrap() = Some(anchor);
     WANTED.store(true, Ordering::Release);
     if window(app).is_some() { let _ = app.emit_to(LABEL, "taskbar-bubble:open", ()); }
-    if !PANEL_WATCH.swap(true, Ordering::AcqRel) {
-        let app = app.clone();
-        std::thread::spawn(move || { watch_panel(&app); PANEL_WATCH.store(false, Ordering::Release); });
-    }
+    watch(app);
+}
+
+fn watch(app: &AppHandle) {
+    if PANEL_WATCH.swap(true, Ordering::AcqRel) { return; }
+    let app = app.clone();
+    std::thread::spawn(move || loop {
+        watch_panel(&app);
+        PANEL_WATCH.store(false, Ordering::Release);
+        // An open racing this exit saw a live watcher and did not start its own.
+        if !WANTED.load(Ordering::Acquire) || PANEL_WATCH.swap(true, Ordering::AcqRel) { break; }
+    });
 }
 
 /// Input in a hover preview becomes an ordinary focused panel, no longer pointer-dismissed.
@@ -126,19 +137,45 @@ fn focus(window: &WebviewWindow) {
 
 fn inside(r: (i32, i32, i32, i32), p: POINT) -> bool { p.x >= r.0 && p.x < r.2 && p.y >= r.1 && p.y < r.3 }
 
-/// Close the panel 300ms after the pointer left both the Butterfly and the panel.
+/// Hover preview: close 300ms after the pointer left both the Butterfly and the panel.
+/// Clicked (pinned) panel: close once another window takes the foreground. tao only reports
+/// Focused(false) after it saw Focused(true), which the first native activation of this
+/// WebView can miss, so blur is also checked against the real foreground window.
 fn watch_panel(app: &AppHandle) {
     let mut away: Option<Instant> = None;
-    while PANEL.load(Ordering::Acquire) && WANTED.load(Ordering::Acquire) {
+    // (open generation, foreground when pinning was first seen, panel has been foreground since)
+    let mut pinned: Option<(usize, HWND, bool)> = None;
+    while WANTED.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(100));
+        let Some(panel) = app.get_webview_window(LABEL).and_then(|w| w.hwnd().ok()).map(|h| h.0 as HWND) else { break };
+        if !PANEL.load(Ordering::Acquire) {
+            away = None;
+            let generation = OPENED.load(Ordering::Acquire);
+            let fg = unsafe { GetForegroundWindow() };
+            if fg.is_null() { continue; }
+            // Owned dialogs (e.g. a file picker) still count as the panel.
+            let ours = fg == panel || unsafe { GetAncestor(fg, GA_ROOTOWNER) } == panel;
+            match &mut pinned {
+                Some((g, first, seen)) if *g == generation => {
+                    if ours { *seen = true; continue; }
+                    // Never activated (foreground denied): only a change of foreground is a blur.
+                    if !*seen && fg == *first { continue; }
+                    if OPENED.load(Ordering::Acquire) == generation && !PANEL.load(Ordering::Acquire) { hide(app); }
+                    break;
+                }
+                _ => pinned = Some((generation, fg, ours)),
+            }
+            continue;
+        }
+        pinned = None;
         let Some(anchor) = *ANCHOR.lock().unwrap() else { break };
         let mut p = POINT { x: 0, y: 0 };
         if unsafe { GetCursorPos(&mut p) } == 0 { continue; }
         let c = anchor.chip;
-        let over_panel = app.get_webview_window(LABEL).and_then(|w| w.hwnd().ok()).is_some_and(|h| {
+        let over_panel = {
             let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-            (unsafe { IsWindowVisible(h.0 as _) }) != 0 && (unsafe { GetWindowRect(h.0 as _, &mut r) }) != 0 && inside((r.left, r.top, r.right, r.bottom), p)
-        });
+            (unsafe { IsWindowVisible(panel) }) != 0 && (unsafe { GetWindowRect(panel, &mut r) }) != 0 && inside((r.left, r.top, r.right, r.bottom), p)
+        };
         if inside((c.left, c.top, c.right, c.bottom), p) || over_panel { away = None; continue; }
         if away.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(300) {
             if PANEL.load(Ordering::Acquire) { hide(app); }
@@ -151,6 +188,7 @@ fn watch_panel(app: &AppHandle) {
 pub(super) fn hide(app: &AppHandle) {
     PANEL.store(false, Ordering::Release);
     WANTED.store(false, Ordering::Release);
+    OPENED.fetch_add(1, Ordering::AcqRel);
     SHOWN.lock().unwrap().take();
     // Shown natively (see focus()), so hide natively; tao's VISIBLE flag is never relied on.
     if let Some(Ok(hwnd)) = app.get_webview_window(LABEL).map(|window| window.hwnd()) {
