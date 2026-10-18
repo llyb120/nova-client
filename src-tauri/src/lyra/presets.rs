@@ -280,12 +280,8 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         // 转换规则升级：旧缓存缺少模型私有参数，不能继续沿用六小时。
         let headers = provider["options"]["headers"].to_string();
         let local_models = if local_source(preset.id).is_some() { provider["models"].to_string() } else { String::new() };
-        let print = fingerprint(&["7", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
-        let entry = &cache[id.as_str()];
-        if !force
-            && entry["fingerprint"] == print.as_str()
-            && now.saturating_sub(entry["fetchedAt"].as_u64().unwrap_or(0)) < CACHE_TTL_SECS
-        {
+        let print = fingerprint(&["8", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
+        if !force && cache_fresh(&cache[id.as_str()], &print, now) {
             continue;
         }
         let proxied;
@@ -303,7 +299,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         };
         match result {
             Ok(models) => {
-                cache[id.as_str()] = json!({ "fingerprint": print, "fetchedAt": now, "models": models });
+                cache[id.as_str()] = json!({ "fingerprint": print, "fetchedAt": now, "models": models, "noCatalog": models_dev.is_none() });
                 changed = true;
             }
             Err(error) if force => errors.push(format!("{id}：{error}")),
@@ -319,6 +315,13 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         written.map_err(|error| format!("写入模型缓存失败：{error}"))?;
     }
     if errors.is_empty() { Ok(changed) } else { Err(errors.join("；")) }
+}
+
+const NO_CATALOG_CACHE_TTL_SECS: u64 = 5 * 60;
+
+fn cache_fresh(entry: &Value, print: &str, now: u64) -> bool {
+    let ttl = if entry["noCatalog"] == true { NO_CATALOG_CACHE_TTL_SECS } else { CACHE_TTL_SECS };
+    entry["fingerprint"] == print && now.saturating_sub(entry["fetchedAt"].as_u64().unwrap_or(0)) < ttl
 }
 
 /// 缓存中某 provider 的模型（设置页「获取模型」后展示）。
@@ -763,6 +766,17 @@ env_key = "TEST_KEY"
         let imported = convert_local(provider, "", &json!({ "data": [{ "id": "from-api", "supported_endpoints": ["/responses"] }] }), None).unwrap();
         assert_eq!(imported["model"], "from-api");
         assert!(imported["provider"]["models"]["from-api"].get("api").is_none());
+    }
+
+    #[test]
+    fn degraded_cache_without_model_catalog_expires_quickly() {
+        let fresh = json!({ "fingerprint": "p", "fetchedAt": 1000, "models": {} });
+        assert!(cache_fresh(&fresh, "p", 1000 + CACHE_TTL_SECS - 1));
+        assert!(!cache_fresh(&fresh, "p", 1000 + CACHE_TTL_SECS));
+        assert!(!cache_fresh(&fresh, "q", 1000));
+        let degraded = json!({ "fingerprint": "p", "fetchedAt": 1000, "noCatalog": true, "models": {} });
+        assert!(cache_fresh(&degraded, "p", 1000 + NO_CATALOG_CACHE_TTL_SECS - 1));
+        assert!(!cache_fresh(&degraded, "p", 1000 + NO_CATALOG_CACHE_TTL_SECS));
     }
 
     #[test]
