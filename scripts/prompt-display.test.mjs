@@ -31,3 +31,10 @@ test("超过上限时淘汰最早的记录", () => {
   assert.equal(m.promptDisplayOf("expanded 0"), undefined);
   assert.equal(m.promptDisplayOf("expanded 300"), "typed 300");
 });
+
+test("蝴蝶助理投递按结构折叠为用户原文", () => {
+  const m = loadModule();
+  const sent = "[蝴蝶助理投递 1f2e]\n用户原文：\n继续搜索你坏\n\n补充上下文（不得扩大用户授权）：\n沿用百度搜索会话";
+  assert.equal(m.promptDisplayOf(sent), "继续搜索你坏");
+  assert.equal(m.promptDisplayOf("用户原文：\n继续"), undefined);
+});

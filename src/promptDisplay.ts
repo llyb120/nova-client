@@ -46,8 +46,13 @@ export function rememberPromptDisplay(sent: string, typed: string): void {
   }
 }
 
+/** 蝴蝶助理在后端拼装的投递（taskbar_status/assistant.rs scheduled），不经前端发送，按结构识别。 */
+const ASSISTANT_JOB = /^\[蝴蝶助理投递 [^\]\n]+\]\n用户原文：\n([\s\S]*?)\n\n补充上下文（不得扩大用户授权）：\n/;
+
 /** 实际发送内容经过系统改写时，返回用户原始输入；否则 undefined。 */
 export function promptDisplayOf(sent: string): string | undefined {
+  const job = ASSISTANT_JOB.exec(sent.trimStart())?.[1]?.trim();
+  if (job) return job;
   const map = load();
   return map.size ? map.get(keyOf(sent)) : undefined;
 }
