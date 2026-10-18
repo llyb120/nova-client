@@ -247,15 +247,10 @@ html.bubble-mode.light {
 .tb-btn.reject:hover { background: color-mix(in srgb, var(--red) 22%, transparent); }
 .tb-btn:disabled { opacity: 0.45; cursor: default; transform: none; }
 
-.tb-foot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding-top: 10px;
-  border-top: 1px solid rgb(var(--ink) / 0.07);
-}
-.tb-hint { font-size: 11.5px; color: var(--fg-4); }
+.tb-session-head { display: flex; align-items: flex-start; gap: 8px; }
+.tb-session-head .tb-title { flex: 1; min-width: 0; }
 .tb-open {
+  flex: none;
   margin-left: auto;
   display: inline-flex;
   align-items: center;
@@ -316,4 +311,8 @@ html.bubble-mode.light {
 .tb-tile.hot { color: #d97706; }
 .tb-tile.hot svg { color: #451a03; background: #fbbf24; animation: tb-rec 2.4s ease-in-out infinite; }
 @keyframes tb-rec { 50% { box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.3); } }
-.tb-session-list .ta-sessions { max-height: none; margin-top: 10px; }
+/* Inside the scrolling session pane the activity list must not be its own (contained) scroller,
+   or the wheel over it neither scrolls it nor chains to the pane. */
+.tb-session-list .ta-sessions { max-height: none; margin-top: 12px; padding-top: 10px; border-top: 1px solid rgb(var(--ink) / 0.08); }
+.tb-session-list .ta-session-list { overflow: visible; overscroll-behavior: auto; }
+.tb-session-list { overscroll-behavior: contain; }

@@ -445,9 +445,13 @@ export default function TaskbarBubble() {
           const html = createMemo(() => markdown(card.body));
           return (
             <div class="tb-session">
-              <Show when={card.title}>
-                <div class="tb-title">{card.title}</div>
-              </Show>
+              <div class="tb-session-head">
+                <div class="tb-title">{card.title || (card.threadId ? "未命名会话" : "新会话")}</div>
+                <button class="tb-open" title="双击 Butterfly 也可直接打开" onClick={() => void invoke("taskbar_bubble_open", { threadId: card.threadId })}>
+                  {card.threadId ? "打开会话" : "打开 Nova"}
+                  <svg viewBox="0 0 12 12" width="10" height="10"><path d="M4.5 2.5L8 6l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
+                </button>
+              </div>
               <Show when={card.kind === "running" || !card.body}>
                 <div class="tb-activity">{card.text}</div>
               </Show>
@@ -465,13 +469,6 @@ export default function TaskbarBubble() {
               <Show when={(card.threadId || card.kind === "idle") && card.kind !== "waiting"}>
                 <Reply card={card} onSent={hide} />
               </Show>
-              <footer class="tb-foot">
-                <span class="tb-hint">双击 Butterfly 直接打开</span>
-                <button class="tb-open" onClick={() => void invoke("taskbar_bubble_open", { threadId: card.threadId })}>
-                  {card.threadId ? "打开会话" : "打开 Nova"}
-                  <svg viewBox="0 0 12 12" width="10" height="10"><path d="M4.5 2.5L8 6l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
-                </button>
-              </footer>
             </div>
           );
         }}

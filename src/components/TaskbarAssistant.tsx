@@ -260,7 +260,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
       <Show when={loadError()}><div class="ta-error" role="alert">{loadError()} <button onClick={() => void refresh()}>刷新</button></div></Show>
     </section>
     <form class="ta-compose" onSubmit={(event) => { event.preventDefault(); void send(); }}>
-        <textarea ref={input} class="tb-input ta-input" rows={2} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" value={text()}
+        <textarea ref={input} class="tb-input ta-input" rows={1} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" title="Enter 发送 · Shift+Enter 换行" value={text()}
           onInput={(event) => setText(event.currentTarget.value)}
           onFocus={() => void invoke("taskbar_bubble_activate").catch((error) => setSendError(String(error)))}
           onCompositionStart={() => { composing = true; }} onCompositionEnd={() => { composing = false; }}
@@ -271,7 +271,10 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
             }
           }}
         />
-        <div class="ta-compose-foot"><span role="status">{busy() ? "助理正在调度…" : "Enter 发送 · Shift+Enter 换行"}</span><button class="ta-submit" type="submit" disabled={busy() || !text().trim()}>发送</button></div>
+        <button class="ta-submit" type="submit" title="发送" aria-label="发送" disabled={busy() || !text().trim()}>
+          <svg viewBox="0 0 12 12" width="13" height="13" aria-hidden="true"><path d="M6 10V2.5M2.5 6L6 2.5 9.5 6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        </button>
+        <Show when={busy()}><span class="ta-busy" role="status">助理正在调度…</span></Show>
         <Show when={sendError()}><div class="ta-error" role="alert">{sendError()}</div></Show>
       </form>
   </>);

@@ -50,7 +50,8 @@ const titleOf = (capsule: Capsule) => capsule.title.trim() || excerpt(capsule.te
 const hasSummary = (capsule: Capsule) => capsule.status === "ready" && !!capsule.summary.trim() && capsule.summary.trim() !== capsule.text.trim();
 const matches = (capsule: Capsule, query: string) => [capsule.title, capsule.text, capsule.summary, ...capsule.files.map((f) => `${f.name}\n${f.path}`)].some((value) => value.toLocaleLowerCase().includes(query));
 const select = (previous: Set<string>, id: string, additive: boolean) => {
-  if (!additive) return new Set([id]);
+  // A plain click on the only selected card deselects it; otherwise it becomes the sole selection.
+  if (!additive) return previous.size === 1 && previous.has(id) ? new Set<string>() : new Set([id]);
   const next = new Set(previous);
   if (next.has(id)) next.delete(id); else next.add(id);
   return next;

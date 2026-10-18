@@ -38,6 +38,8 @@ const select = bind('select');
 let selection = new Set(['a', 'b']);
 assert.deepEqual([...select(selection, 'c', false)], ['c'], 'ordinary click replaces selection');
 assert.deepEqual([...select(selection, 'c', true)], ['a', 'b', 'c'], 'Ctrl/Meta/checkbox adds independently');
+assert.deepEqual([...select(new Set(['c']), 'c', false)], [], 'clicking the selected card again deselects it');
+assert.deepEqual([...select(selection, 'a', false)], ['a'], 'plain click on one of several keeps only it');
 assert.deepEqual([...select(selection, 'a', true)], ['b'], 'additive selection toggles');
 assert.deepEqual([...selection], ['a', 'b'], 'the old selection is never mutated');
 const hasSummary = bind('hasSummary');
