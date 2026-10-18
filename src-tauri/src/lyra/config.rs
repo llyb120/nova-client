@@ -190,6 +190,12 @@ fn model_by_id<'a>(provider: &'a Value, model_id: &str) -> Option<&'a Value> {
     is_model_config(model).then_some(model)
 }
 
+/// provider.modelFilter：关键词（不分大小写、子串匹配、任一命中即保留）；仅影响选择器展示，已选模型照常可用。
+fn model_filter(provider: &Value) -> Vec<String> {
+    provider.get("modelFilter").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(Value::as_str).map(|k| k.trim().to_lowercase()).filter(|k| !k.is_empty()).collect()
+}
+
 /// 模型选择器枚举，与 alkaidModelOptions 输出保持一致。
 pub fn model_options(config: &Value) -> Vec<Value> {
     let mut out = Vec::new();
@@ -197,7 +203,11 @@ pub fn model_options(config: &Value) -> Vec<Value> {
         return out;
     };
     for (provider_id, provider) in providers {
+        let filter = model_filter(provider);
         for (model_id, model) in model_entries(provider) {
+            if !filter.is_empty() && !filter.iter().any(|k| model_id.to_lowercase().contains(k) || model.get("name").and_then(Value::as_str).is_some_and(|n| n.to_lowercase().contains(k))) {
+                continue;
+            }
             let value = format!("{provider_id}/{model_id}");
             let name = format!(
                 "{} / {}",
@@ -743,6 +753,22 @@ mod tests {
         assert!(model_options(&inherited).iter().all(|option| {
             option["_meta"]["nova.ai/defaultReasoningEffort"] == ""
         }));
+    }
+
+    #[test]
+    fn model_filter_keeps_matching_models_case_insensitively() {
+        let mut config = json!({ "provider": { "p": {
+            "options": { "baseURL": "http://x" },
+            "models": { "GPT-5": {}, "claude-opus": { "name": "Opus" }, "gemini": {} }
+        } } });
+        let values = |c: &Value| model_options(c).iter().map(|o| o["value"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(values(&config).len(), 3);
+        config["provider"]["p"]["modelFilter"] = json!(["gpt", " OPUS ", ""]);
+        let mut kept = values(&config);
+        kept.sort();
+        assert_eq!(kept, ["p/GPT-5", "p/claude-opus"]);
+        config["provider"]["p"]["modelFilter"] = json!([]);
+        assert_eq!(values(&config).len(), 3);
     }
 
     #[test]

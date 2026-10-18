@@ -7,6 +7,7 @@ import {
   configFromDraft,
   draftFromConfig,
   hasVariants,
+  passesFilter,
   isObject,
   isLocalPreset,
   modelDraft,
@@ -155,7 +156,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
         ...Object.entries(fetched[p.id]?.models ?? {}).filter(([mid]) => !p.models.some((m) => m.id === mid)),
         ...p.models.map((m) => [m.id, m.raw] as const),
       ];
-      return models.flatMap(([mid, raw]) => {
+      return models.filter(([mid, raw]) => passesFilter(p, mid, raw?.name)).flatMap(([mid, raw]) => {
         const base = `${p.id}/${mid}`;
         const variants = isObject(raw?.variants) ? Object.keys(raw.variants) : [];
         return [base, ...variants.map((v) => `${base}/variant/${v}`)];
@@ -297,6 +298,11 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                         添加模型
                       </button>
                     </div>
+                    <label class="backend-field">
+                      <span class="field-label">关键词过滤</span>
+                      <span class="field-hint">仅在模型选择器中保留 ID 或名称包含这些关键词的模型；多个用逗号分隔，不分大小写，留空则不过滤。</span>
+                      <input class="field-input" placeholder="如 claude, gpt-5" value={p().modelFilter} onInput={(e) => setP((x) => (x.modelFilter = e.currentTarget.value))} />
+                    </label>
                     <Show when={preset()}>
                       {(() => {
                         const result = () => fetched[p().id.trim()];

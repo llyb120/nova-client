@@ -23,6 +23,8 @@ export type ProviderDraft = {
   baseURL: string;
   apiKey: string;
   proxy: string;
+  /** 模型关键词过滤（逗号分隔），空表示不过滤。 */
+  modelFilter: string;
   headers: Kv[];
   fields: Kv[];
   models: ModelDraft[];
@@ -59,6 +61,12 @@ const fromKv = (rows: Kv[], header: boolean) => {
   }
   return out;
 };
+/** 关键词以逗号/分号/换行分隔，不分大小写，任一命中即保留。 */
+export const splitFilter = (text: string) => text.split(/[,，;；\n]/).map((s) => s.trim()).filter(Boolean);
+export const passesFilter = (p: { modelFilter: string }, id: string, name?: string) => {
+  const words = splitFilter(p.modelFilter).map((w) => w.toLowerCase());
+  return !words.length || words.some((w) => id.toLowerCase().includes(w) || (name ?? "").toLowerCase().includes(w));
+};
 export const hasVariants = (raw: Record<string, any>) =>
   isObject(raw.variants) && Object.keys(raw.variants).length > 0;
 
@@ -91,6 +99,7 @@ export function providerDraft(id: string, raw: Record<string, any>): ProviderDra
     baseURL: options.baseURL ?? options.baseUrl ?? "",
     apiKey: options.apiKey ?? "",
     proxy: options.proxy ?? "",
+    modelFilter: Array.isArray(raw.modelFilter) ? raw.modelFilter.join(", ") : "",
     headers: toKv(options.headers),
     fields: fieldsOf(options, OPTION_KEYS),
     models: Object.entries(isObject(raw.models) ? raw.models : {}).map(([mid, m]) =>
@@ -135,6 +144,7 @@ export function serializeProvider(p: ProviderDraft) {
   setOrDelete(out, "preset", p.preset);
   setOrDelete(out, "name", p.name.trim());
   setOrDelete(out, "api", p.api);
+  setOrDelete(out, "modelFilter", splitFilter(p.modelFilter).length ? splitFilter(p.modelFilter) : "");
   const options: Record<string, any> = { ...fromKv(p.fields, false), baseURL: p.baseURL.trim() };
   // 预设的 Base URL 留空即用默认值，不写空串。
   if (p.preset) setOrDelete(options, "baseURL", options.baseURL);
