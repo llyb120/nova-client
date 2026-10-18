@@ -105,7 +105,7 @@ fn stadium_point(width: i32, height: i32, inset: f64, s: f64) -> POINT {
 unsafe fn glow_border(dc: HDC, rect: RECT, px: impl Fn(i32) -> i32, background: u32, high_contrast: bool) {
     const SEGMENTS: usize = 120;
     let t = EPOCH.with(|e| e.elapsed().as_secs_f64()) * 0.6;
-    for (width, halo) in [(px(5).max(3), 0.6), (px(2).max(2), 0.0)] {
+    for (width, halo) in [(px(3).max(2), 0.6), (px(1).max(1), 0.0)] {
         let inset = width as f64 / 2.0;
         for i in 0..SEGMENTS {
             let s = i as f64 / SEGMENTS as f64;
