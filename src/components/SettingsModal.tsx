@@ -241,9 +241,18 @@ const TABS: { id: SettingsTab; name: string }[] = [
   { id: "about", name: "关于" },
 ];
 
-export function SettingsModal(props: { onClose: () => void; initialTab?: SettingsTab; required?: boolean }) {
+// 首次运行引导：第 1 步配置后端（含 Lyra），第 2 步配置场景模型。
+const ONBOARDING_STEPS: { title: string; tabs: SettingsTab[] }[] = [
+  { title: "配置模型后端", tabs: ["lyra", "backends"] },
+  { title: "配置场景模型", tabs: ["scenes"] },
+];
+
+export function SettingsModal(props: { onClose: () => void; initialTab?: SettingsTab; onboarding?: boolean }) {
   const s = state.settings;
-  const [tab, setTab] = createSignal<SettingsTab>(props.initialTab ?? "general");
+  const [step, setStep] = createSignal(0);
+  const visibleTabs = () =>
+    props.onboarding ? TABS.filter((t) => ONBOARDING_STEPS[step()].tabs.includes(t.id)) : TABS;
+  const [tab, setTab] = createSignal<SettingsTab>(props.onboarding ? "lyra" : props.initialTab ?? "general");
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
   const [claudePath, setClaudePath] = createSignal(s?.claudePath ?? "claude-agent-acp");
@@ -949,8 +958,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   });
 
   let saveLyraConfig: (() => Promise<void>) | undefined;
-  const save = async () => {
-    if (!scenesReady(sceneModels())) {
+  // afterSave 仅供引导第 1 步使用：先落盘后端与 Lyra 配置（此时场景尚未配置），让模型列表加载出来。
+  const save = async (afterSave?: () => void) => {
+    if (!afterSave && !scenesReady(sceneModels())) {
       setTab("scenes");
       await message("请为每个场景至少配置一个模型后再保存。", { title: "场景模型未配置", kind: "error" });
       return;
@@ -1024,7 +1034,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           kind: "info",
         });
       }
-      props.onClose();
+      (afterSave ?? props.onClose)();
     } catch (error) {
       await message(String(error), { title: "保存设置失败", kind: "error" });
     } finally {
@@ -1060,8 +1070,12 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     <div class="modal-backdrop">
       <div class="modal settings-modal">
         <div class="modal-head">
-          <span>{props.required ? "请先配置场景模型" : "设置"}</span>
-          <Show when={!props.required}>
+          <span>
+            {props.onboarding
+              ? `欢迎使用 Nova · 第 ${step() + 1}/${ONBOARDING_STEPS.length} 步：${ONBOARDING_STEPS[step()].title}`
+              : "设置"}
+          </span>
+          <Show when={!props.onboarding}>
             <button class="icon-btn" onClick={props.onClose}>
               <IconX size={16} />
             </button>
@@ -1069,7 +1083,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
         </div>
 
         <div class="settings-tabs">
-          <For each={TABS}>
+          <For each={visibleTabs()}>
             {(t) => (
               <button
                 type="button"
@@ -1083,6 +1097,13 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
         </div>
 
         <div class="modal-body">
+          <Show when={props.onboarding}>
+            <p class="settings-group-desc">
+              {step() === 0
+                ? "先启用并配置至少一个能提供模型的后端：在 Lyra 中添加模型服务商，或在「模型后端」中启用已安装并登录的 Claude Code、Codex 等。点「下一步」会保存并启动这些后端。"
+                : "为每个场景选择至少一个模型。后端刚启动时模型列表可能需要稍等；仍没有可选模型时请返回上一步检查后端配置。以后可在「设置」中修改。"}
+            </p>
+          </Show>
           <Show when={tab() === "meteor"}>
             <section class="settings-group">
               <h3 class="settings-group-title">Meteor · 屏幕上的操作助手</h3>
@@ -2679,12 +2700,35 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
         </div>
 
         <div class="modal-foot">
-          <button class="btn secondary" onClick={props.onClose}>
-            取消
-          </button>
-          <button class="btn primary" disabled={saving()} onClick={() => void save()}>
-            {saving() ? "保存中…" : "保存"}
-          </button>
+          <Show
+            when={props.onboarding}
+            fallback={
+              <>
+                <button class="btn secondary" onClick={props.onClose}>
+                  取消
+                </button>
+                <button class="btn primary" disabled={saving()} onClick={() => void save()}>
+                  {saving() ? "保存中…" : "保存"}
+                </button>
+              </>
+            }
+          >
+            <Show
+              when={step() > 0}
+              fallback={
+                <button class="btn primary" disabled={saving()} onClick={() => void save(() => { setStep(1); setTab("scenes"); })}>
+                  {saving() ? "保存中…" : "下一步"}
+                </button>
+              }
+            >
+              <button class="btn secondary" disabled={saving()} onClick={() => { setStep(0); setTab("lyra"); }}>
+                上一步
+              </button>
+              <button class="btn primary" disabled={saving()} onClick={() => void save()}>
+                {saving() ? "保存中…" : "完成"}
+              </button>
+            </Show>
+          </Show>
         </div>
       </div>
 

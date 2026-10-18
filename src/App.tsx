@@ -95,7 +95,7 @@ export default function App() {
     homeComposerFocusAt: state.homeComposerFocusAt,
   }));
   const [showSettings, setShowSettings] = createSignal(false);
-  // 先决条件：三个场景都至少配置一个模型，否则启动即弹出且不可关闭的场景配置。
+  // 先决条件：三个场景都至少配置一个模型，否则启动即弹出不可关闭的首次引导（后端 → 场景模型）。
   const scenesMissing = () => !!state.settings && !scenesReady(state.settings.sceneModels);
   const [showAchievements, setShowAchievements] = createSignal(false);
   const [showUpdate, setShowUpdate] = createSignal(false);
@@ -194,7 +194,7 @@ export default function App() {
           fallback={<SettingsLoadingModal onClose={() => setShowSettings(false)} />}
         >
           <Show when={scenesMissing()} fallback={<SettingsModal onClose={() => setShowSettings(false)} />}>
-            <SettingsModal initialTab="scenes" required onClose={() => setShowSettings(false)} />
+            <SettingsModal onboarding onClose={() => setShowSettings(false)} />
           </Show>
         </Show>
       </Show>
