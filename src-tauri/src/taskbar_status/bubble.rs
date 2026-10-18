@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT},
     Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED},
+    UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
     UI::WindowsAndMessaging::{GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowRect, GA_ROOTOWNER, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE},
 };
 
@@ -76,7 +77,7 @@ pub(super) fn window(app: &AppHandle) -> Option<WebviewWindow> {
         // A file picker opened from the panel is owned by it: not a blur.
         tauri::WindowEvent::Focused(false) => {
             let fg = unsafe { GetForegroundWindow() };
-            if fg.is_null() || unsafe { GetAncestor(fg, GA_ROOTOWNER) } as isize != panel { hide(&handle); }
+            if fg.is_null() || unsafe { GetAncestor(fg, GA_ROOTOWNER) } as isize != panel { blur(&handle); }
         }
         tauri::WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
@@ -176,7 +177,7 @@ fn watch_panel(app: &AppHandle) {
                     if ours { *seen = true; continue; }
                     // Never activated (foreground denied): only a change of foreground is a blur.
                     if !*seen && fg == *first { continue; }
-                    if OPENED.load(Ordering::Acquire) == generation && !PANEL.load(Ordering::Acquire) { hide(app); }
+                    if OPENED.load(Ordering::Acquire) == generation && !PANEL.load(Ordering::Acquire) { blur(app); }
                     break;
                 }
                 _ => pinned = Some((generation, fg, ours)),
@@ -198,6 +199,28 @@ fn watch_panel(app: &AppHandle) {
             break;
         }
     }
+}
+
+/// Another window took the foreground. With the left button still down that is probably the
+/// source of a drag headed for this panel: keep it until release, then close unless the drop
+/// (which re-activates the panel) landed on it.
+fn blur(app: &AppHandle) {
+    let down = || unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000 != 0;
+    if !down() { return hide(app); }
+    let (app, generation) = (app.clone(), OPENED.load(Ordering::Acquire));
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        while down() && start.elapsed() < Duration::from_secs(60) { std::thread::sleep(Duration::from_millis(30)); }
+        let panel = app.get_webview_window(LABEL).and_then(|w| w.hwnd().ok()).map(|h| h.0 as HWND);
+        let over = panel.is_some_and(|panel| {
+            let (mut r, mut p) = (RECT { left: 0, top: 0, right: 0, bottom: 0 }, POINT { x: 0, y: 0 });
+            (unsafe { GetWindowRect(panel, &mut r) != 0 && GetCursorPos(&mut p) != 0 }) && inside((r.left, r.top, r.right, r.bottom), p)
+        });
+        if over { std::thread::sleep(Duration::from_millis(500)); }
+        let fg = unsafe { GetForegroundWindow() };
+        let ours = panel.is_some_and(|panel| fg == panel || unsafe { GetAncestor(fg, GA_ROOTOWNER) } == panel);
+        if OPENED.load(Ordering::Acquire) == generation && !PANEL.load(Ordering::Acquire) && !ours { hide(&app); }
+    });
 }
 
 /// Close the card without acknowledging updates it has not rendered yet.
