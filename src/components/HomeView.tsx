@@ -1,5 +1,5 @@
 import { message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
 
 import { api } from "../ipc";
 import { latestFireStage } from "../threadDisplay";
@@ -549,6 +549,14 @@ export function HomeView() {
   // 快捷键/侧栏「新会话」后聚焦首页输入框（含已在首页、组件未重挂载的情况）。
   createEffect(() => {
     if (state.homeComposerFocusAt <= 0) return;
+    // 星屑「带入新会话」落在已挂载的首页时，把草稿并入当前输入。
+    const draft = takeSessionDraft(null);
+    if (draft) untrack(() => {
+      const merged = [text(), draft.text].filter(Boolean).join("\n\n");
+      setText(merged);
+      setCursor(merged.length);
+      attach.set([...attach.images(), ...draft.images]);
+    });
     queueMicrotask(() => textareaRef?.focus());
   });
   onCleanup(() => {

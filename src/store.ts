@@ -5,7 +5,7 @@ import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { LruMap } from "./lruMap";
 import { api } from "./ipc";
-import { rememberPromptDraft, saveSessionDraft } from "./promptDraft";
+import { rememberPromptDraft, saveSessionDraft, takeSessionDraft } from "./promptDraft";
 import type {
   Achievement,
   AgentKind,
@@ -3260,17 +3260,10 @@ export async function initStore() {
 
     listen<{ text: string; images: PromptImage[] }>("capsules:compose", (e) => {
       const { text, images } = e.payload;
-      void (async () => {
-        const { agentKind, model } = sceneModel("lightweight");
-        const thread = await api.createThread(await api.scratchDir(), agentKind, model || null, "build", null);
-        // Seed before switching: both a mounted Composer and a fresh one consume it exactly once.
-        saveSessionDraft(thread.id, text, images);
-        rememberThreadSnapshot(thread);
-        setView("home");
-        await openThread(thread.id);
-        void refreshThreads();
-        void refreshProjects();
-      })().catch((error) => showToast(`星屑会话创建失败，原内容仍保留在星屑中：${String(error)}`));
+      // 直接进入新会话页（草稿首页）并带入内容，不预先创建会话；HomeView 挂载时或已挂载时各取走一次。
+      const prev = takeSessionDraft(null);
+      saveSessionDraft(null, [prev?.text, text].filter(Boolean).join("\n\n"), [...(prev?.images ?? []), ...images]);
+      openNewSession();
     }),
 
     listen<{ threadId: string | null; text: string; images?: PromptImage[]; restored?: boolean }>(
