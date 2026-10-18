@@ -1790,6 +1790,19 @@ export async function pickThreadModel(agentKind: AgentKind, model: string) {
   }
 }
 
+/** 后端主导的后端/模型变更（场景模型失效自动切换、自动模式转交）不经过 pickThreadModel，
+ *  按列表 meta 同步当前会话，否则输入栏仍停留在切换前的后端与模型。 */
+function syncThreadAgentFromMeta(meta: ThreadMeta) {
+  const agentKind = meta.agentKind ?? state.agentKind;
+  if (agentKind === state.agentKind && (meta.model ?? "") === state.model) return;
+  const switched = agentKind !== state.agentKind;
+  setState({ agentKind, model: meta.model ?? "" });
+  if (switched) {
+    void ensureModelOptions(agentKind);
+    void refreshSlashCommands(agentKind);
+  }
+}
+
 export async function setThreadMode(mode: string) {
   const id = state.currentId;
   if (!id || isSubagentThread(id)) return;
@@ -3331,7 +3344,9 @@ export async function initStore() {
         const id = state.currentId;
         if (!id) return;
         const meta = state.threads.find((t) => t.id === id);
-        if (meta && meta.title !== state.title) setState("title", meta.title);
+        if (!meta) return;
+        if (meta.title !== state.title) setState("title", meta.title);
+        syncThreadAgentFromMeta(meta);
       });
       // 项目列表由后端合并会话目录生成，会话增删后同步刷新
       void refreshProjects();

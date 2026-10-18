@@ -3999,9 +3999,10 @@ pub(crate) fn dispatch_prompt(
         } else {
             None
         };
+        // 跨 Agent 接力（含场景模型失效切换）时新 Agent 没见过首条消息的转交说明，需重新注入，否则它会自己干完整块编码。
         let first_message = store
             .get(&thread_id)
-            .is_some_and(|t| !t.items.iter().any(|item| matches!(item, Item::User { .. })));
+            .is_some_and(|t| t.handoff_from.is_some() || !t.items.iter().any(|item| matches!(item, Item::User { .. })));
         let auto_context = auto.as_ref().filter(|_| first_message).and_then(|scope| auto_mode_context(scope, &projects));
         let context = [stage_context, auto_context].into_iter().flatten().reduce(|a, b| format!("{a}\n\n{b}"));
         if let Some(thread) = store.get_mut(&thread_id) {
