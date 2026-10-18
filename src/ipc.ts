@@ -99,6 +99,16 @@ export const api = {
   judgeWorkflowRoute: (conclusion: string, options: { id: string; label: string }[]) =>
     invoke<string>("judge_workflow_route", { conclusion, options }),
   scratchDir: () => invoke<string>("scratch_dir"),
+  chromeDependencyStatus: () =>
+    invoke<{
+      chromePath: string | null;
+      connected: boolean;
+      incognitoAllowed: boolean | null;
+      extensionDir: string;
+      extensionId: string;
+    }>(
+      "chrome_dependency_status",
+    ),
   directoryExists: (path: string) => invoke<boolean>("directory_exists", { path }),
   clipboardFilePaths: () => invoke<string[]>("clipboard_file_paths"),
   getQuota: () => invoke<Quota>("get_quota"),

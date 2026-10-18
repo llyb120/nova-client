@@ -5873,6 +5873,7 @@ pub fn run() {
             workspace_terminal::terminal_ack,
             workspace_terminal::terminal_close,
             chrome_browser::chrome_browser_ui,
+            chrome_browser::chrome_dependency_status,
             tool_experience::knowledge_graph,
             jianpu::jianpu_toggle,
             jianpu::jianpu_status,

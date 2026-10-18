@@ -11,6 +11,7 @@ import {
   checkAndStageUpdate,
   deleteThreads,
   enabledAgentKinds,
+  installChromeExtensionWithJianlai,
   refreshQuota,
   refreshRelayStatus,
   setState,
@@ -214,6 +215,7 @@ export type SettingsTab =
   | "general"
   | "scenes"
   | "meteor"
+  | "jianlai"
   | "advanced"
   | "lyra"
   | "backends"
@@ -229,6 +231,7 @@ const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
   { id: "scenes", name: "场景模型" },
   { id: "meteor", name: "Meteor" },
+  { id: "jianlai", name: "剑来" },
   { id: "advanced", name: "高级" },
   { id: "lyra", name: "Lyra" },
   { id: "backends", name: "模型后端" },
@@ -250,6 +253,29 @@ const ONBOARDING_STEPS: { title: string; tabs: SettingsTab[] }[] = [
 export function SettingsModal(props: { onClose: () => void; initialTab?: SettingsTab; onboarding?: boolean }) {
   const s = state.settings;
   const [step, setStep] = createSignal(0);
+  const [chromeDep, setChromeDep] = createSignal<Awaited<ReturnType<typeof api.chromeDependencyStatus>> | null>(null);
+  const [chromeDepBusy, setChromeDepBusy] = createSignal(false);
+  const checkChromeDep = async () => {
+    setChromeDepBusy(true);
+    try {
+      setChromeDep(await api.chromeDependencyStatus());
+    } catch (error) {
+      void message(`检测失败：${String(error)}`, { kind: "error" });
+    } finally {
+      setChromeDepBusy(false);
+    }
+  };
+  const installChromeDep = async () => {
+    setChromeDepBusy(true);
+    try {
+      await installChromeExtensionWithJianlai(chromeDep() ?? (await api.chromeDependencyStatus()));
+      props.onClose();
+    } catch (error) {
+      void message(`启动安装会话失败：${String(error)}`, { kind: "error" });
+    } finally {
+      setChromeDepBusy(false);
+    }
+  };
   const visibleTabs = () =>
     props.onboarding ? TABS.filter((t) => ONBOARDING_STEPS[step()].tabs.includes(t.id)) : TABS;
   const [tab, setTab] = createSignal<SettingsTab>(props.onboarding ? "lyra" : props.initialTab ?? "general");
@@ -1103,6 +1129,32 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 ? "先启用并配置至少一个能提供模型的后端：在 Lyra 中添加模型服务商，或在「模型后端」中启用已安装并登录的 Claude Code、Codex 等。点「下一步」会保存并启动这些后端。"
                 : "为每个场景选择至少一个模型。后端刚启动时模型列表可能需要稍等；仍没有可选模型时请返回上一步检查后端配置。以后可在「设置」中修改。"}
             </p>
+          </Show>
+          <Show when={tab() === "jianlai"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">剑来 · Chrome 依赖</h3>
+              <p class="settings-group-desc">
+                chrome 工具需要本机安装 Google Chrome 并加载 Nova 自带的 Chrome 扩展。自动安装会用上一次会话的模型在临时目录开启新会话，由剑来操作 Chrome 完成安装并开启无痕模式。
+              </p>
+              <div class="field">
+                <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
+                  <button type="button" class="btn secondary" disabled={chromeDepBusy()} onClick={() => void checkChromeDep()}>检测 Chrome 依赖</button>
+                  <button type="button" class="btn primary" disabled={chromeDepBusy() || chromeDep()?.chromePath === null} onClick={() => void installChromeDep()}>用剑来自动安装</button>
+                </div>
+                <Show when={chromeDep()}>
+                  {(dep) => (
+                    <span class="field-hint">
+                      Chrome：{dep().chromePath ?? "未找到，请先安装 Google Chrome"}
+                      <br />
+                      Nova Chrome 扩展：{dep().connected ? "已连接" : "未连接"}
+                      {dep().connected ? `（${dep().incognitoAllowed ? "已允许无痕" : "未允许无痕"}）` : ""}
+                      <br />
+                      扩展目录：{dep().extensionDir}
+                    </span>
+                  )}
+                </Show>
+              </div>
+            </section>
           </Show>
           <Show when={tab() === "meteor"}>
             <section class="settings-group">

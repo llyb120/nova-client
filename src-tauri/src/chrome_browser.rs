@@ -372,6 +372,59 @@ pub async fn chrome_browser_ui(
     crate::native_browser::execute_chrome(&root, &args, &format!("ui:{id}")).await
 }
 
+const EXTENSION_FILES: [(&str, &str); 4] = [
+    ("manifest.json", include_str!("../../extensions/nova-chrome/manifest.json")),
+    ("worker.js", include_str!("../../extensions/nova-chrome/worker.js")),
+    ("popup.html", include_str!("../../extensions/nova-chrome/popup.html")),
+    ("popup.js", include_str!("../../extensions/nova-chrome/popup.js")),
+];
+
+fn find_chrome() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let candidates: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+        .iter()
+        .filter_map(|key| std::env::var_os(key))
+        .map(|base| PathBuf::from(base).join(r"Google\Chrome\Application\chrome.exe"))
+        .collect();
+    #[cfg(target_os = "macos")]
+    let candidates = vec![PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|dir| ["google-chrome", "google-chrome-stable"].map(|name| dir.join(name)))
+        .collect();
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// 检测 Chrome 依赖：Chrome 是否安装、扩展是否已连接及是否允许无痕；同时释放自带扩展到固定目录供「加载已解压的扩展程序」使用。
+#[tauri::command]
+pub async fn chrome_dependency_status(app: AppHandle) -> Result<Value, String> {
+    let directory = app
+        .state::<crate::AppState>()
+        .config_dir
+        .join("chrome-extension")
+        .join("nova-chrome");
+    std::fs::create_dir_all(&directory).map_err(|e| format!("释放 Chrome 扩展失败：{e}"))?;
+    for (name, content) in EXTENSION_FILES {
+        std::fs::write(directory.join(name), content).map_err(|e| format!("释放 Chrome 扩展失败：{e}"))?;
+    }
+    let connected = connect(&app).await.map(|v| v["connected"] == true).unwrap_or(false);
+    let incognito_allowed = if connected {
+        request(&app, "status", json!({})).await.ok().map(|v| v["incognitoAllowed"] == true)
+    } else {
+        None
+    };
+    Ok(json!({
+        "chromePath": find_chrome().map(|p| p.to_string_lossy().to_string()),
+        "connected": connected,
+        "incognitoAllowed": incognito_allowed,
+        "extensionDir": directory.to_string_lossy(),
+        "extensionId": EXTENSION_ID,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

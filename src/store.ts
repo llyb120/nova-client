@@ -2665,6 +2665,26 @@ export async function sendPromptTo(threadId: string, text: string, images: Promp
   await deliverPrompt(threadId, text, images);
 }
 
+/** 用上一次会话的模型在临时目录开新会话，由剑来把自带的 Nova Chrome 扩展装进 Chrome 并允许无痕。 */
+export async function installChromeExtensionWithJianlai(status: { chromePath: string | null; extensionDir: string; extensionId: string }) {
+  const agentKind = lastUsed.agentKind();
+  const id = await createThread(
+    await api.scratchDir(),
+    agentKind,
+    lastUsed.model(agentKind),
+    "build",
+    lastUsed.reasoningEffort(agentKind),
+  );
+  await sendPromptTo(id, [
+    "请用剑来（jianlai）操作桌面，为 Google Chrome 安装 Nova 自带的 Chrome 扩展：",
+    `1. 打开 Chrome${status.chromePath ? `（路径：${status.chromePath}）` : ""}，在地址栏输入 chrome://extensions 并回车。chrome:// 页面无法用 chrome 工具操作，全程用剑来。`,
+    "2. 若右上角「开发者模式」未开启，先开启。",
+    `3. 若列表中已有 Nova Chrome（ID ${status.extensionId}），点它的重新加载按钮即可；否则点击「加载已解压的扩展程序」，在文件夹选择对话框中选择目录：${status.extensionDir}`,
+    "4. 打开 Nova Chrome 的「详细信息」，开启「在无痕模式下启用」。",
+    "5. 确认 Nova Chrome 已启用，再用 chrome 工具的 status 确认已连接 Nova 且 incognitoAllowed 为 true。",
+  ].join("\n"), []);
+}
+
 /** 编辑历史用户消息并从该处重新开始：界面立即更新，SDK restore/fork 在后端排队完成后再发送。 */
 export async function editUserMessage(itemId: number, text: string, images: PromptImage[] = []) {
   let id = state.currentId;
