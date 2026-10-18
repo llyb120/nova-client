@@ -120,13 +120,24 @@ try {
     const first=await fixture('<button>Open</button><button>Open</button><input aria-label="Name">');
     const second=await call('observe',randomUUID());
     assert.deepEqual(first.items.map(i=>i.nodeId),second.items.map(i=>i.nodeId));
-    assert.notEqual(first.items[0].ref,second.items[0].ref);
+    assert.deepEqual(first.items.map(i=>i.ref),second.items.map(i=>i.ref),'refs stay stable so act feedback can be a delta');
     const twins=second.items.filter(i=>i.name==='Open');assert.equal(twins.length,2);
     assert.notEqual(twins[0].nodeId,twins[1].nodeId);
     await page.evaluate(()=>{const old=document.querySelector('button');old.replaceWith(old.cloneNode(true));});
     const replaced=await call('observe',randomUUID());
     assert.notEqual(replaced.items[0].nodeId,first.items[0].nodeId);
     assert.equal(replaced.items[1].nodeId,first.items[1].nodeId);
+    assert.notEqual(replaced.items[0].ref,first.items[0].ref);
+  });
+  await run('settle waits until SPA-style mutations go quiet, bounded',async()=>{
+    await fixture('<div id="x">0</div>');
+    await page.evaluate(()=>{let n=0;const t=setInterval(()=>{document.getElementById('x').textContent=++n;if(n>=5)clearInterval(t);},60);});
+    const quiet=await call('settle',250,2000);
+    assert.equal(quiet.quiet,true);assert.ok(quiet.waitedMs>=500,`waited ${quiet.waitedMs}`);
+    assert.equal(await page.evaluate(()=>document.getElementById('x').textContent),'5');
+    await page.evaluate(()=>setInterval(()=>{document.getElementById('x').textContent=Math.random();},40));
+    const busy=await call('settle',250,600);
+    assert.equal(busy.quiet,false);assert.ok(busy.waitedMs<900);
   });
   await run('hidden and offscreen bulk DOM cannot exhaust visible custom menu hints',async()=>{
     const bulk='<span>Cell</span>'.repeat(4100);
@@ -184,7 +195,7 @@ try {
     assert.equal((await fixture('<table aria-rowcount="0" style="width:100px;height:10px"></table>')).tables[0].totalRows,0);
     await evaluate('Object.defineProperty(globalThis,"__novaWebview",{value:{apiVersion:7},configurable:true}); true');
     await evaluate(engine);
-    assert.equal(await evaluate('__novaWebview.apiVersion'),20,'Existing Chrome worlds must upgrade to current DOM hints');
+    assert.equal(await evaluate('__novaWebview.apiVersion'),21,'Existing Chrome worlds must upgrade to current DOM hints');
     assert.equal((await call('observe',randomUUID())).tables[0].totalRows,0);
   });
   await run('native and ARIA checkboxes expose role and current selection',async()=>{
@@ -308,6 +319,9 @@ try {
     const obs=await fixture('<button>隔离目标</button>');
     await page.evaluate(()=>window.__novaWebview={prepare:()=>({x:1,y:1})});
     await evaluate(engine);await call('prepare',target(obs,'隔离目标').ref);
+    // Refs are stable per document (the snapshotId check lives in Rust); a replaced node is never retargeted.
+    await call('observe',randomUUID());await call('prepare',target(obs,'隔离目标').ref);
+    await page.evaluate(()=>{const old=document.querySelector('button');old.replaceWith(old.cloneNode(true));});
     await call('observe',randomUUID());await assert.rejects(call('prepare',target(obs,'隔离目标').ref),/失效/);
   });
   await run('readonly inheritance and exact post-fill value verification',async()=>{

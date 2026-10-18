@@ -1,6 +1,6 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 20) return;
+  if (globalThis.__novaWebview?.apiVersion === 21) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   // Icon-only controls (sort carets, filter funnels, close ×) carry their meaning in class names.
   const iconHint = e => {
@@ -152,8 +152,19 @@
     return entry;
   };
   const api = {
-    apiVersion: 20,
+    apiVersion: 21,
     stamp,
+    // After an input: wait until the observed roots stop mutating (SPA renders after XHR), bounded.
+    async settle(quietMs=250, budgetMs=1000) {
+      const started=performance.now();let last=revision,since=started;
+      while(performance.now()-started<budgetMs) {
+        await new Promise(resolve=>setTimeout(resolve,50));
+        for(const observer of rootObservers.values()) if(observer.takeRecords().length) revision++;
+        if(revision!==last) {last=revision;since=performance.now();}
+        else if(performance.now()-since>=quietMs) return {quiet:true,waitedMs:Math.round(performance.now()-started)};
+      }
+      return {quiet:false,waitedMs:Math.round(performance.now()-started)};
+    },
     inputState(ref) {
       const e = active();
       return {identity:identity(e),editable:!!e && editable(e),password:e?.type==='password',matches:ref ? e === entryFor(ref).e : undefined};
@@ -244,7 +255,9 @@
         const visibility=getComputedStyle(e).visibility;
         if (visibility==='hidden' || visibility==='collapse') continue;
         total++;if (items.length >= limit) continue;
-        const ref=`${nonce}:${items.length}`, isDisabled=disabled(e);
+        // Stable per document: unchanged elements keep their ref across observations, so replies can be deltas.
+        // entryFor() still re-checks the live fingerprint before every input.
+        const ref=`${documentId.slice(0,6)}.${identity(e)}`, isDisabled=disabled(e);
         // Cache semantics only, never geometry, hit tests, focus, values or
         // enabled state. prepare()/verifyPoint() always fingerprint live nodes.
         let cached=semanticCache.get(e);
@@ -343,12 +356,11 @@
           loadedRows:dataRows.length,returnedRows:preview.length,rows:preview,
           previewTruncated:preview.length<dataRows.length||cellsTruncated,
           countMismatch:totalRows!==null&&totalRows<dataRows.length,
-          moreRows:totalRows===null||totalRows<dataRows.length?null:totalRows>dataRows.length,
-          next:'日期、区域和表格排序字段/方向必须分别验证；图表 Metrics 不代表表格排序，同名列需核对列索引/分组。Top N 必须读取足够的数据行并核对筛选及排序；不足时读取 documentPath、inspect(query) 或翻页/滚动后观察。Metrics 等标签数字不是总条数。'};
+          moreRows:totalRows===null||totalRows<dataRows.length?null:totalRows>dataRows.length};
       });
       const loading=document.readyState!=='complete'||visibleLines.some(text=>/^(?:loading|加载中)(?:\.{3}|…)?$/i.test(text))
         ||allRoots.some(root=>Array.from(root.querySelectorAll('[aria-busy=true],[role=progressbar]')).some(visible));
-      return {url:location.href,title:document.title,readyState:document.readyState,loading,version,stamp:stamp(),text:fullText.slice(0,1000000),visibleText:visibleLines.join('\n'),textLength:fullText.length,
+      return {url:location.href,title:document.title,document:documentId,readyState:document.readyState,loading,version,stamp:stamp(),text:fullText.slice(0,1000000),visibleText:visibleLines.join('\n'),textLength:fullText.length,
         tables,tableCount:tableNodes.length,tablesTruncated:tableNodes.length>tables.length,paginationTotals,
         items,totalItems:total,customTargetsTruncated,headings:headings.slice(0,1000),canvases:canvases.slice(0,100),visualSuggested:visualArea>=innerWidth*innerHeight*.15,focus:api.inputState(),
         truncated:customTargetsTruncated||total>items.length||fullText.length>1000000||headings.length>1000||canvases.length>100,

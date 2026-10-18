@@ -3,6 +3,7 @@ use crate::AppState;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -444,7 +445,7 @@ fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String
     values.into_iter().map(|value| { let action=parse_action(&value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()))?; validate_action(&action)?; Ok(action) }).collect()
 }
 
-/// ref 前缀每次观察重新生成，全部 ref 都在当前观察里即证明决策基于最新观察，snapshotId 可不精确。
+/// ref 同文档内稳定、执行前校验节点指纹：全部 ref 都在当前观察里即可执行，snapshotId 可不精确。
 fn refs_in(observation:&Observation, actions:&[Action]) -> bool {
     !actions.is_empty() && actions.iter().all(|action| match action {
         Action::Click{r#ref,..}|Action::Fill{r#ref,..}|Action::Scroll{r#ref:Some(r#ref),..} =>
@@ -460,7 +461,7 @@ fn preflight(observation:&Observation, action:&mut Action, image_id:Option<&str>
             let has=|f:usize| observation.pages["pages"][f]["items"].as_array().is_some_and(|items|items.iter().any(|item|item["ref"].as_str()==Some(r#ref.as_str())));
             if !has(*frame) {
                 // ref 带文档前缀、跨 frame 唯一：模型常照示例填 frame 0，按 ref 实际所在 frame 纠正。
-                *frame=(0..observation.frames.len()).find(|f|has(*f)).ok_or("ref 不在当前快照的任何 frame 中；ref 必须原样复制 items[].ref，不能拼造。这不等于快照过期；先核对已有观察中的真实 ref，不要直接重试或无故重新截图")?;
+                *frame=(0..observation.frames.len()).find(|f|has(*f)).ok_or("ref 不在当前快照的任何 frame 中；ref 必须原样复制 elements 行首的 ref，不能拼造。这不等于快照过期；先核对已有观察中的真实 ref，不要直接重试或无故重新截图")?;
             }
         }
         Action::Scroll{frame,..} if *frame!=0=>return Err("子框架滚动需要明确 ref".into()),
@@ -849,11 +850,12 @@ async fn snapshot(
         serde_json::to_vec(&observation.pages).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let mut result = inline_summary(&observation.pages, args, &document_path);
+    // The private __delta flag is set only by act feedback: diff against the pre-action observation.
+    let base = previous.filter(|_| args["__delta"] == true).map(|p| &p.pages);
+    let mut result = inline_summary(&observation.pages, args, base);
     result["snapshotId"] = json!(observation.id);
     result["visualReason"] = if auto_visual {json!("页面有大面积 Canvas，自动附可操作视口截图；图内控件不可由 DOM 枚举")} else {Value::Null};
     result["documentPath"] = json!(document_path);
-    result["scope"]=json!(if scope=="viewport" {"当前各框架视口内的 DOM 目标；文本仍含已加载文档。屏外/虚拟化内容需 scope=all 或滚动后观察。"} else {"整页已加载DOM，包含屏幕外和内部滚动区域；documentPath保留完整文本、元素和引用。inlineTruncated仅代表工具回复摘要被截短；truncated/coverageGaps表示采集本身不完整。"});
     if with_image {
         let edge=args["maxEdge"].as_u64().unwrap_or(1600);
         if edge!=0 && !(320..=3840).contains(&edge) {return Err("maxEdge 必须为0或320–3840".into());}
@@ -931,8 +933,6 @@ async fn snapshot(
             } else {
                 Value::Null
             };
-            result["coordinateSpace"]=json!("Prefer act(imageId) with image-pixel x/y: tile offsets and image dimensions are mapped automatically. Without imageId use legacy CSS document pixels. click_at/move/scroll_at can auto-scroll; prefer DOM ref offscreen and viewport screenshots for Canvas; drag requires fullPage=false.");
-            result["screenshotScope"]=json!("主文档整页；内部滚动区域/iframe的屏幕外内容用整页DOM读取。未加载图片或虚拟数据可能仍需定向滚动。");
         } else {
             let viewport=&observation.pages["pages"][0]["viewport"];
             let vw=viewport["width"].as_f64().ok_or("无效视口")?;let vh=viewport["height"].as_f64().ok_or("无效视口")?;
@@ -948,7 +948,6 @@ async fn snapshot(
             let image_id=format!("{}-0",observation.id);
             observation.images.push(ScreenshotImage{id:image_id.clone(),path:path.clone(),x,y,width:w,height:h,pixels});
             images.push(json!({"imageId":image_id,"path":path,"x":x,"y":y,"width":w,"height":h,"pixelWidth":pixels.0,"pixelHeight":pixels.1}));
-            result["coordinateSpace"]=json!("Provide imageId with act and use image-pixel x/y/to_x/to_y; crop offsets and DPI are mapped automatically. Without imageId, legacy CSS viewport coordinates apply.");
             let after=evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?;
             if after!=observation.pages["pages"][0]["stamp"] {return Err("截图期间视口变化，请重新截图".into());}
         }
@@ -971,11 +970,11 @@ async fn snapshot(
 
 // Only the tool reply is compacted: stored observations (Altair, preflight, coordinates) and
 // documentPath keep the full DOM. Do not use Lyra's output fallback here: it also cuts names/rows.
-fn inline_summary(pages: &Value, args: &Value, document_path: &Path) -> Value {
+// `base` (act feedback only) is the pre-action observation: pages of the same document then reply
+// with what changed only (+new/~changed/-gone elements, new text lines); refs are stable per document.
+fn inline_summary(pages: &Value, args: &Value, base: Option<&Value>) -> Value {
     let mut result = pages.clone();
-    // Reply-only defaults; keep state evidence (selected/expanded/value/dateValue) explicit.
-    let item_defaults = json!({"disabled":false,"editable":false,"password":false,"actionable":false});
-    result["itemDefaults"] = item_defaults.clone();
+    if let Some(object) = result.as_object_mut() { object.remove("domCoordinates"); }
     let mut remaining_items = args["maxItems"].as_u64().unwrap_or(60).clamp(1, 2000) as usize;
     let mut remaining_text = args["maxTextChars"].as_u64().unwrap_or(3000).clamp(100, 100000) as usize;
     // Separate, global budgets: viewport evidence must not disappear behind a long document prefix.
@@ -991,14 +990,55 @@ fn inline_summary(pages: &Value, args: &Value, document_path: &Path) -> Value {
             lower[start..].to_string()
         }).unwrap_or_default()
     };
+    let lines = |text: &Value| -> HashSet<String> { text.as_str().unwrap_or_default().lines().map(str::to_owned).collect() };
     if let Some(pages) = result["pages"].as_array_mut() {
         for page in pages {
-            let original_text = page["text"].as_str().unwrap_or_default();
-            let text: String = around_query(original_text).chars().take(remaining_text).collect();
-            let returned_text = text.chars().count();
-            remaining_text -= returned_text;
-            let mut trimmed = text.len() < original_text.len();
-            page["text"] = json!(text);
+            let before = base.and_then(|b| b["pages"].as_array()?.iter()
+                .find(|p| p["document"].is_string() && p["document"] == page["document"]));
+            if let Some(object) = page.as_object_mut() {
+                for key in ["document", "version", "stamp", "timingsMs", "scannedRoots"] { object.remove(key); }
+            }
+            if let Some(coverage) = page["coverage"].as_object_mut() { coverage.remove("note"); coverage.remove("scope"); }
+            let mut trimmed = false;
+            let items = page["items"].as_array().cloned().unwrap_or_default();
+            let mut gone = Vec::new();
+            // (mark, item): "" full listing, "+" new, "~" changed since `before`.
+            let mut listed: Vec<(&str, Value)> = match before {
+                None => items.into_iter().map(|item| ("", item)).collect(),
+                Some(before) => {
+                    let old: HashMap<&str, &Value> = before["items"].as_array().into_iter().flatten()
+                        .filter_map(|i| Some((i["ref"].as_str()?, i))).collect();
+                    let current: HashSet<String> = items.iter().filter_map(|i| i["ref"].as_str().map(str::to_owned)).collect();
+                    gone = old.iter().filter(|(r, _)| !current.contains(**r)).map(|(_, i)| (*i).clone()).collect();
+                    let unchanged = items.len();
+                    let changed: Vec<(&str, Value)> = items.into_iter().filter_map(|item| match item["ref"].as_str().and_then(|r| old.get(r)) {
+                        None => Some(("+", item)),
+                        Some(o) if item_state(o) != item_state(&item) || (item["inView"] == true && o["inView"] != true) => Some(("~", item)),
+                        Some(_) => None,
+                    }).collect();
+                    page["delta"] = json!(true);
+                    page["unchangedItems"] = json!(unchanged - changed.len());
+                    let old_text = lines(&before["text"]);
+                    let fresh: String = page["text"].as_str().unwrap_or_default().lines()
+                        .filter(|l| !l.trim().is_empty() && !old_text.contains(*l)).collect::<Vec<_>>().join("\n");
+                    page["text"] = json!(fresh);
+                    if let Some(object) = page.as_object_mut() { object.remove("visibleText"); }
+                    if let Some(tables) = page["tables"].as_array_mut() {
+                        let old = before["tables"].as_array().cloned().unwrap_or_default();
+                        tables.retain(|t| !old.contains(t));
+                    }
+                    if let Some(headings) = page["headings"].as_array_mut() {
+                        let old = before["headings"].as_array().cloned().unwrap_or_default();
+                        headings.retain(|h| !old.contains(h));
+                    }
+                    if page["canvases"] == before["canvases"] { if let Some(o) = page.as_object_mut() { o.remove("canvases"); } }
+                    changed
+                }
+            };
+            let original_text = page["text"].as_str().unwrap_or_default().to_string();
+            let mut text: String = around_query(&original_text).chars().take(remaining_text).collect();
+            remaining_text -= text.chars().count();
+            trimmed |= text.len() < original_text.len();
             if let Some(visible) = page.get_mut("visibleText") {
                 if let Some(original) = visible.as_str().filter(|_| !query.is_empty()) {
                     let matched = around_query(original);
@@ -1006,43 +1046,32 @@ fn inline_summary(pages: &Value, args: &Value, document_path: &Path) -> Value {
                     *visible = json!(matched);
                 }
                 trimmed |= truncate_inline_text(visible, remaining_visible);
-                let returned = visible.as_str().unwrap_or_default().chars().count();
-                remaining_visible -= returned;
-                page["returnedVisibleTextChars"] = json!(returned);
+                remaining_visible -= visible.as_str().unwrap_or_default().chars().count();
+                // Short pages: the document text adds nothing the visible text does not already show.
+                let shown = lines(visible);
+                if text.lines().all(|l| l.trim().is_empty() || shown.contains(l)) { text.clear(); }
             }
-            let items = page["items"].as_array().cloned().unwrap_or_default();
-            let mut matches: Vec<Value> = items.into_iter().filter(|item| {
-                query.is_empty() || format!("{} {} {}", item["name"], item["region"], item["href"])
-                    .to_lowercase().contains(&query)
-            }).collect();
+            page["text"] = json!(text);
+            listed.retain(|(_, item)| query.is_empty() || format!("{} {} {}", item["name"], item["region"], item["href"])
+                .to_lowercase().contains(&query));
             // Filter before shortening context; keep actionable visible controls first, as before.
-            matches.sort_by_key(|item| (item["inView"] != true, item["blockedBy"].is_string()));
-            let total = matches.len();
-            let mut kept: Vec<Value> = matches.into_iter().take(remaining_items).collect();
-            remaining_items -= kept.len();
-            trimmed |= total > kept.len();
-            for item in &mut kept {
-                if let Some(object) = item.as_object_mut() {
-                    object.remove("nodeId"); // Internal identity; actions bind the unchanged frame/ref.
-                    if object.get("tag") == object.get("role") { object.remove("tag"); }
-                    object.retain(|key, value| !value.is_null() && item_defaults.get(key) != Some(value));
-                    // Keep hit-tested points, not two rectangles per ordinary control. Canvas/scroll
-                    // bounds and targets without a point still need viewport geometry in the reply.
-                    if object.get("viewportRect").is_some_and(Value::is_object)
-                        && object.get("documentRect") == object.get("viewportRect") {
-                        object.remove("documentRect");
-                    }
-                    if object.get("point").is_some_and(Value::is_object)
-                        && !object.get("canvas").is_some_and(Value::is_object)
-                        && !object.get("scroll").is_some_and(Value::is_object) {
-                        trimmed |= object.remove("viewportRect").is_some();
-                        trimmed |= object.remove("documentRect").is_some();
-                    }
-                    // ponytail: region previews are 120 chars, headings 20 total; query/documentPath recover the rest.
-                    // Names, exact fieldContext, states, table columns and all points stay intact.
-                    if let Some(region) = object.get_mut("region") { trimmed |= truncate_inline_text(region, 120); }
-                }
+            listed.sort_by_key(|(_, item)| (item["inView"] != true, item["blockedBy"].is_string()));
+            let total = listed.len();
+            listed.truncate(remaining_items);
+            remaining_items -= listed.len();
+            trimmed |= total > listed.len();
+            let mut out = Vec::new();
+            let mut last_region = String::new();
+            for (mark, item) in &listed {
+                // ponytail: region previews are 120 chars, printed once per run of same-region elements; query/documentPath recover the rest.
+                let mut region = item["region"].clone();
+                trimmed |= truncate_inline_text(&mut region, 120);
+                let region = region.as_str().unwrap_or_default().to_string();
+                if region != last_region { out.push(format!("@ {}", if region.is_empty() { "-" } else { &region })); last_region = region; }
+                out.push(item_line(item, mark));
             }
+            for item in gone.iter().take(10) { out.push(format!("- {} {} {}", str_of(&item["ref"]), str_of(&item["role"]), json!(str_of(&item["name"])))); }
+            if gone.len() > 10 { out.push(format!("- …另有{}个元素消失", gone.len() - 10)); }
             // 有 query 时表格只留命中行；表头与行都未命中的表整张省略（documentPath 仍是全量）。
             if let Some(tables) = page.get_mut("tables").and_then(Value::as_array_mut).filter(|_| !query.is_empty()) {
                 let before = tables.to_vec();
@@ -1062,17 +1091,56 @@ fn inline_summary(pages: &Value, args: &Value, document_path: &Path) -> Value {
                 headings.truncate(remaining_headings);
                 remaining_headings -= headings.len();
             }
+            if let Some(object) = page.as_object_mut() { object.remove("items"); }
             page["inlineTruncated"] = json!(trimmed);
-            page["returnedTextChars"] = json!(returned_text);
-            page["nextRead"] = if trimmed {
-                json!({"documentPath":document_path,"operation":"inspect","scope":"all",
-                    "notice":"摘要有裁剪（文本/visibleText/元素/region/标题/矩形）；itemDefaults为省略字段的默认值，point和fieldContext保持原值。完整数据在 documentPath；按 tables.rows 核对 Top N，不足时读全文或 inspect(query)，不能据摘要断言全部/不存在。"})
-            } else { Value::Null };
             page["matchingItems"] = json!(total);
-            page["items"] = json!(kept);
+            page["elements"] = json!(out.join("\n"));
         }
     }
     result
+}
+
+fn str_of(value: &Value) -> &str { value.as_str().unwrap_or_default() }
+
+/// What an element looks like to the model, without geometry: equal states mean "unchanged".
+fn item_state(item: &Value) -> Value {
+    let mut state = item.clone();
+    if let Some(object) = state.as_object_mut() {
+        for key in ["ref", "nodeId", "point", "viewportRect", "documentRect", "inView", "tabIndex"] { object.remove(key); }
+    }
+    state
+}
+
+/// One element per line: `[mark]ref role "name" key=value… flags`. Geometry is kept only where
+/// coordinates are the interface (Canvas, scroll containers); DOM actions bind by frame/ref.
+fn item_line(item: &Value, mark: &str) -> String {
+    let token = |value: &Value| match value.as_str() {
+        Some(s) if !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '=' | '\\')) => s.to_string(),
+        Some(s) => json!(s).to_string(),
+        None => value.to_string(),
+    };
+    let rect = |r: &Value| format!("{},{},{},{}", r["x"].as_f64().unwrap_or(0.).round(), r["y"].as_f64().unwrap_or(0.).round(),
+        r["width"].as_f64().unwrap_or(0.).round(), r["height"].as_f64().unwrap_or(0.).round());
+    let mut line = format!("{mark}{} {} {}", str_of(&item["ref"]), str_of(&item["role"]), json!(str_of(&item["name"])));
+    for (key, label) in [("value", "value"), ("dateValue", "date"), ("selected", "selected"), ("expanded", "expanded"), ("haspopup", "popup"),
+        ("sort", "sort"), ("href", "href"), ("icon", "icon"), ("columnKey", "key"), ("fieldContext", "field"), ("blockedBy", "blockedBy")] {
+        let value = &item[key];
+        if !value.is_null() && value != "" { line += &format!(" {label}={}", token(value)); }
+    }
+    let column = &item["column"];
+    if column.is_object() {
+        line += &format!(" col={}.{}:{}", column["table"], column["index"], json!(str_of(&column["name"])));
+        if !str_of(&column["group"]).is_empty() { line += &format!("/{}", json!(str_of(&column["group"]))); }
+    }
+    for flag in ["disabled", "editable", "password", "actionable"] { if item[flag] == true { line += &format!(" {flag}"); } }
+    if item["inView"] != true { line += " offscreen"; }
+    if item["canvas"].is_object() { line += &format!(" canvas={}x{}", item["canvas"]["width"], item["canvas"]["height"]); }
+    if let Some(scroll) = item["scroll"].as_object() {
+        let scroll: serde_json::Map<String, Value> = scroll.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), v.clone())).collect();
+        line += &format!(" scroll={}", Value::Object(scroll));
+    }
+    if (item["canvas"].is_object() || item["scroll"].is_object()) && item["viewportRect"].is_object() { line += &format!(" rect={}", rect(&item["viewportRect"])); }
+    line
 }
 
 fn truncate_inline_text(value: &mut Value, max_chars: usize) -> bool {
@@ -1165,9 +1233,9 @@ async fn control_session(
             "reason":failure,"inputAttempted":progress.attempted,"completedActions":progress.completed,"actionTimingsMs":action_timings,"basedOnSnapshotId":observation.id,"verification":"unverified"});
         result["actionMs"] = json!(started.elapsed().as_millis());
         if args["snapshotId"].as_str()!=Some(&observation.id) {
-            result["snapshotIdNote"]=json!(format!("传入的 snapshotId 不是最新观察（最新为 {}）；本批 ref 均属最新观察，已按 ref 执行。snapshotId 取工具返回的顶层 snapshotId，不是 ref 冒号前的部分", observation.id));
+            result["snapshotIdNote"]=json!(format!("传入的 snapshotId 不是最新观察（最新为 {}）；本批 ref 均属最新观察，已按 ref 执行。snapshotId 取工具返回的顶层 snapshotId，不是 ref", observation.id));
         }
-        result["next"] = json!("根据返回的最新状态验证并继续；fill 一次完成聚焦和填写。executed/needs_review 不要直接重放。坐标操作需截图，DOM 操作使用最新 frame/ref。");
+        result.as_object_mut().unwrap().retain(|_, v| !v.is_null());
         completed_action = Some(result.clone());
         // A click/Enter often starts a navigation; feeding back the old DOM costs the model another
         // inspect round-trip. Wait (bounded) for the tab to finish loading before observing.
@@ -1175,11 +1243,19 @@ async fn control_session(
             && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::ClickAt{..} | Action::Press{..})) {
             let tag = s.active_tab.rsplit(':').next().unwrap_or_default();
             result["settle"] = wait_for_tab_load(app, tag, Duration::from_millis(settle_ms)).await;
+            // Loaded is not rendered: SPAs patch the DOM after their XHR. Wait for the DOM to go quiet
+            // so the feedback shows the result instead of costing the model another observe round-trip.
+            let budget = settle_ms.saturating_sub(result["settle"]["waitedMs"].as_u64().unwrap_or(0)).min(1000);
+            if result["settle"]["status"] == "complete" && budget >= 100 {
+                // A navigation replaced the document (and our world): nothing to wait for there.
+                if let Ok(quiet) = evaluate(app, &observation.frames[0], format!("__novaWebview.settle(250,{budget})")).await { result["settle"]["dom"] = quiet; }
+            }
             completed_action = Some(result.clone());
         }
         if (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
             let mut feedback_args = args.clone();
             feedback_args["fullPage"] = json!(false);
+            feedback_args["__delta"] = json!(true);
             if let Some(args)=feedback_args.as_object_mut() {for key in ["ref","frame","region"] {args.remove(key);} }
             if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
             let visual=args["feedback"]=="screenshot" || (args["feedback"].is_null() && observation.screenshot);
@@ -1665,123 +1741,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inline_summary_preserves_actions_tables_and_full_observation() {
-        let items: Vec<Value> = (0..60).map(|n| json!({
-            "ref":format!("snapshot:{n}"),"nodeId":format!("internal-document:{n}"),"role":"input","tag":"input",
-            "name":format!("Search {n}"),"fieldContext":format!("{} [field 2/2]", "精确日期字段上下文 ".repeat(25)),
-            "region":format!("{} needle", "redundant panel region ".repeat(14)),
-            "inView":true,"editable":true,"disabled":false,"selected":false,"expanded":"false",
-            "sort":"descending","column":{"table":0,"index":2,"name":"Units","group":"M Science"},
-            "value":"2026-09-23","dateValue":"2026-09-23","href":"https://example.test/?sort=units&order=desc",
-            "point":{"x":42.5,"y":36.25},"viewportRect":{"x":40,"y":30,"width":100,"height":20},
-            "documentRect":{"x":40,"y":1030,"width":100,"height":20},
-            "scroll":{"top":1000,"height":3000,"viewportHeight":400,"pointY":{"x":44,"y":50}}
-        })).collect();
-        let table = json!({"headers":["Name","Units"],"columns":[{"index":1,"name":"Units","sort":"descending","ref":"snapshot:0"}],
-            "rows":(0..10).map(|n|json!([format!("Game {n}"),100-n])).collect::<Vec<_>>(),
-            "returnedRows":10,"loadedRows":20,"totalRows":100,"totalRowsSource":"pagination",
-            "previewTruncated":true,"moreRows":true,"countMismatch":false});
-        let full = json!({"coverageGaps":["unread iframe"],"domCoordinates":"frame-local viewport",
-            "pages":[{"frame":0,"text":"Document evidence ".repeat(150),"visibleText":"Visible evidence ".repeat(750),
-                "items":items,"totalItems":60,"headings":vec![json!({"level":"H2","text":"Heading ".repeat(35)});60],
-                "tables":[table],"tableCount":1,"tablesTruncated":false,"paginationTotals":[{"totalRows":100}],
-                "truncated":true,"coverage":{"scope":"viewport","textScanTruncated":true},
-                "viewport":{"width":1200,"height":800,"scrollY":1000}},
-                {"frame":1,"text":"Iframe","visibleText":"Iframe visible","items":[{"ref":"iframe:0","name":"Canvas","role":"canvas",
-                    "point":{"x":25,"y":35},"viewportRect":{"x":0,"y":0,"width":500,"height":400},
-                    "canvas":{"width":1000,"height":800}}],"totalItems":1,
-                    "canvases":[{"ref":"iframe:0","backingWidth":1000,"backingHeight":800}],"visualSuggested":true}]});
+    fn inline_summary_lists_compact_elements_and_act_deltas() {
+        let item = |n: usize, name: &str| json!({"ref":format!("d.{n}"),"nodeId":format!("doc:{n}"),"role":"input","tag":"input",
+            "name":name,"fieldContext":"日期 [field 2/2]","region":"Filters panel","inView":n < 50,"editable":true,"disabled":false,
+            "selected":false,"sort":"descending","column":{"table":0,"index":2,"name":"Units","group":"M Science"},
+            "value":"2026-09-23","dateValue":"2026-09-23","point":{"x":42.5,"y":36.25},
+            "viewportRect":{"x":40,"y":30,"width":100,"height":20},"documentRect":{"x":40,"y":1030,"width":100,"height":20},"tabIndex":0});
+        let table = json!({"headers":["Name","Units"],"rows":[["Game","100"],["needle row","9"]],"returnedRows":2});
+        let page = |items: Vec<Value>, text: &str| json!({"frame":0,"document":"doc","url":"https://a.test/","stamp":"[]","version":"v",
+            "text":text,"visibleText":"Visible line","items":items,"tables":[table.clone()],"headings":[{"level":"H2","text":"Results"}],
+            "coverage":{"scope":"all","note":"boilerplate","lazyImages":0}});
+        let full = json!({"coverageGaps":[],"domCoordinates":"boilerplate","pages":[page((0..60).map(|n| item(n, &format!("Search {n}"))).collect(), "Visible line")]});
         let original = full.to_string();
-        let args = json!({"maxItems":61,"maxTextChars":2500});
-        let summary = inline_summary(&full, &args, Path::new("full-document.json"));
-        assert!(summary.to_string().len() < original.len() * 3 / 4, "redundant summary must shrink substantially");
+        let summary = inline_summary(&full, &json!({"maxItems":61}), None);
         assert_eq!(full.to_string(), original, "Altair and documentPath must retain the full observation");
-        let page = &summary["pages"][0];
-        let mut expected = full["pages"][0]["items"][0].clone();
-        expected.as_object_mut().unwrap().remove("nodeId");
-        expected.as_object_mut().unwrap().remove("tag");
-        expected.as_object_mut().unwrap().remove("disabled");
-        truncate_inline_text(&mut expected["region"], 120);
-        assert_eq!(summary["itemDefaults"]["disabled"], false);
-        assert_eq!(page["items"][0], expected, "binding, state and scroll geometry cannot be clipped");
-        let mut ordinary = full.clone();
-        ordinary["pages"][0]["items"][0].as_object_mut().unwrap().remove("scroll");
-        let compact = inline_summary(&ordinary, &args, Path::new("full-document.json"));
-        assert!(compact["pages"][0]["items"][0].get("viewportRect").is_none());
-        assert!(compact["pages"][0]["items"][0].get("documentRect").is_none());
-        for key in ["ref","point","fieldContext","value","dateValue","selected","expanded","sort","column"] {
-            assert_eq!(compact["pages"][0]["items"][0][key], full["pages"][0]["items"][0][key], "{key}");
-        }
-        for key in ["tables","coverage","truncated","totalItems","paginationTotals","viewport","tableCount","tablesTruncated"] {
-            assert_eq!(page[key], full["pages"][0][key], "{key}");
-        }
-        assert_eq!(summary["coverageGaps"], full["coverageGaps"]);
-        assert_eq!(summary["domCoordinates"], full["domCoordinates"]);
-        for key in ["frame","items","canvases","visualSuggested"] {
-            assert_eq!(summary["pages"][1][key], full["pages"][1][key], "iframe {key}");
-        }
-        assert_eq!(page["inlineTruncated"], true);
-        assert_eq!(page["nextRead"]["documentPath"], "full-document.json");
-        assert_eq!(page["headings"].as_array().unwrap().len(), 20);
-        assert_eq!(summary["pages"][1]["visibleText"], "");
-        for (text, count) in [("text", "returnedTextChars"), ("visibleText", "returnedVisibleTextChars")] {
-            assert!(summary["pages"].as_array().unwrap().iter().map(|p|p[text].as_str().unwrap().chars().count()).sum::<usize>() <= 2500);
-            assert_eq!(page[count].as_u64().unwrap() as usize, page[text].as_str().unwrap().chars().count());
-        }
-        let searched = inline_summary(&full, &json!({"query":"needle","maxItems":1}), Path::new("full-document.json"));
-        assert_eq!(searched["pages"][0]["matchingItems"], 60, "query must see uncut region suffixes");
-        let mut tabled = full.clone();
-        tabled["pages"][0]["tables"] = json!([{"headers":["Name"],"rows":[["a needle"],["other"]],"returnedRows":2},{"headers":["X"],"rows":[["y"]]}]);
-        tabled["pages"][0]["visibleText"] = json!(format!("{} needle tail", "x".repeat(500)));
-        let narrowed = inline_summary(&tabled, &json!({"query":"needle"}), Path::new("full-document.json"));
-        assert_eq!(narrowed["pages"][0]["tables"], json!([{"headers":["Name"],"rows":[["a needle"]],"returnedRows":1}]));
-        let visible = narrowed["pages"][0]["visibleText"].as_str().unwrap();
-        assert!(visible.ends_with("needle tail") && visible.len() < 200);
-        assert_eq!(searched["pages"][0]["items"].as_array().unwrap().len(), 1);
-        let canvas = inline_summary(&full, &json!({"query":"Canvas","maxItems":1}), Path::new("full-document.json"));
-        assert_eq!(canvas["pages"][1]["items"], full["pages"][1]["items"]);
+        let p = &summary["pages"][0];
+        let elements = p["elements"].as_str().unwrap();
+        assert_eq!(elements.lines().next(), Some("@ Filters panel"), "region printed once per run");
+        assert_eq!(elements.lines().filter(|l| l.starts_with('@')).count(), 1);
+        assert_eq!(elements.lines().nth(1), Some(r#"d.0 input "Search 0" value=2026-09-23 date=2026-09-23 selected=false sort=descending field="日期 [field 2/2]" col=0.2:"Units"/"M Science" editable"#));
+        assert!(elements.lines().last().unwrap().ends_with(" offscreen"));
+        for key in ["items", "stamp", "version", "document", "domCoordinates"] { assert!(p.get(key).is_none() && summary.get(key).is_none(), "{key}"); }
+        assert!(p["coverage"].get("note").is_none() && p["coverage"]["lazyImages"] == 0);
+        assert_eq!(p["text"], "", "document text already shown as visible text");
+        assert_eq!(p["tables"], json!([table]));
+        assert!(summary.to_string().len() < original.len() / 2, "compact lines must shrink the reply: {} vs {}", summary.to_string().len(), original.len());
+
+        let searched = inline_summary(&full, &json!({"query":"needle","maxItems":1}), None);
+        assert_eq!(searched["pages"][0]["matchingItems"], 0);
+        assert_eq!(searched["pages"][0]["tables"][0]["rows"], json!([["needle row","9"]]));
+        let limited = inline_summary(&full, &json!({"maxItems":5}), None);
+        assert_eq!(limited["pages"][0]["inlineTruncated"], true);
+        assert_eq!(limited["pages"][0]["matchingItems"], 60);
+
+        // After an act: same document → only changed elements, new text and changed tables.
+        let mut after_items: Vec<Value> = (1..60).map(|n| item(n, &format!("Search {n}"))).collect();
+        after_items[0]["value"] = json!("2027-01-01");
+        after_items[1]["point"] = json!({"x":1,"y":1}); // geometry only: unchanged
+        after_items[55]["inView"] = json!(true); // scrolled into view
+        after_items.push(item(99, "Apply"));
+        let after = json!({"pages":[page(after_items, "Visible line\nSaved 3 rows")]});
+        let delta = inline_summary(&after, &json!({}), Some(&full));
+        let p = &delta["pages"][0];
+        let lines: Vec<&str> = p["elements"].as_str().unwrap().lines().filter(|l| !l.starts_with('@')).collect();
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with("~d.1 ") && lines[0].contains("value=2027-01-01"));
+        assert!(lines.iter().any(|l| l.starts_with("~d.56 ")) && lines.iter().any(|l| l.starts_with("+d.99 input \"Apply\"")));
+        assert_eq!(lines[3], r#"- d.0 input "Search 0""#);
+        assert_eq!(p["delta"], true);
+        assert_eq!(p["unchangedItems"], 57);
+        assert_eq!(p["text"], "Saved 3 rows");
+        assert!(p.get("visibleText").is_none());
+        assert_eq!(p["tables"], json!([]));
+        assert_eq!(p["headings"], json!([]));
+        // Another document (navigation) is never diffed.
+        let mut navigated = after.clone();
+        navigated["pages"][0]["document"] = json!("other");
+        assert!(inline_summary(&navigated, &json!({}), Some(&full))["pages"][0].get("delta").is_none());
     }
 
-    // Offline replay: NOVA_BROWSER_SHOTS points to the real browser-shots archive. No live page needed.
     #[test]
-    #[ignore = "requires the three archived snapshots and NOVA_BROWSER_SHOTS"]
-    fn inline_summary_archived_snapshots_stay_compact() {
-        let dir = std::path::PathBuf::from(std::env::var_os("NOVA_BROWSER_SHOTS").expect("set NOVA_BROWSER_SHOTS"));
-        for id in ["2efcac37-47b3-48c2-bc42-18739b695f04", "94d6bc52-115a-46b9-869a-e32f7113e610", "9b1a7a6f-ea61-4e55-bbbe-e7051e01890e"] {
-            let path = dir.join(format!("{id}.json"));
-            let full: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            let original = full.to_string();
-            for budget in [30, 60] {
-                let summary = inline_summary(&full, &json!({"maxItems":budget}), &path);
-                let bytes = serde_json::to_vec(&summary).unwrap().len();
-                println!("{id} maxItems={budget}: {bytes} bytes");
-                assert!(bytes < 30000, "{id}: redundant metadata/geometry grew back ({bytes} bytes)");
-                assert_eq!(full.to_string(), original, "full observation must stay intact");
-                assert_eq!(summary["coverageGaps"], full["coverageGaps"]);
-                assert_eq!(summary["domCoordinates"], full["domCoordinates"]);
-                if budget == 60 { assert_eq!(summary, inline_summary(&full, &json!({}), &path)); }
-                for (page, source) in summary["pages"].as_array().unwrap().iter().zip(full["pages"].as_array().unwrap()) {
-                    for key in ["frame","tables","paginationTotals","coverage","truncated","viewport","canvases"] {
-                        assert_eq!(page[key], source[key], "{id}: {key}");
-                    }
-                    for item in page["items"].as_array().unwrap() {
-                        let original = source["items"].as_array().unwrap().iter().find(|i| i["ref"] == item["ref"]).unwrap();
-                        for key in ["name","role","fieldContext","href","value","dateValue","selected","expanded",
-                            "sort","icon","column","point","scroll","inView","blockedBy"] {
-                            assert_eq!(item[key], original[key], "{id}: {key}");
-                        }
-                        for key in ["disabled","editable","password","actionable"] {
-                            if let Some(value) = original.get(key).filter(|v| !v.is_null()) {
-                                assert_eq!(item.get(key).unwrap_or(&summary["itemDefaults"][key]), value, "{id}: {key}");
-                            }
-                        }
-                        if original["point"].is_null() || original["canvas"].is_object() || original["scroll"].is_object() {
-                            assert_eq!(item["viewportRect"], original["viewportRect"]);
-                        }
-                    }
-                }
-            }
-        }
+    fn item_line_keeps_coordinate_geometry_for_canvas_and_scroll_only() {
+        let canvas = json!({"ref":"f.1","role":"canvas","name":"","inView":true,"canvas":{"width":1000,"height":800},
+            "point":{"x":5,"y":5},"viewportRect":{"x":0.4,"y":10,"width":500,"height":400}});
+        assert_eq!(item_line(&canvas, ""), r#"f.1 canvas "" canvas=1000x800 rect=0,10,500,400"#);
+        let pane = json!({"ref":"f.2","role":"div","name":"list","inView":true,"scroll":{"top":10,"height":900,"pointX":null},
+            "viewportRect":{"x":0,"y":0,"width":200,"height":300},"blockedBy":"Cookie banner"});
+        assert_eq!(item_line(&pane, "~"), r#"~f.2 div "list" blockedBy="Cookie banner" scroll={"top":10,"height":900} rect=0,0,200,300"#);
     }
 
     #[test]
@@ -1793,7 +1819,7 @@ mod tests {
         assert!(truncate_inline_text(&mut text, 0));
         assert_eq!(text, "");
         let small = json!({"pages":[{"text":"ok","visibleText":"ok","items":[],"headings":[],"truncated":false}]});
-        let summarize = |v: &Value| inline_summary(v, &json!({}), Path::new("full.json"));
+        let summarize = |v: &Value| inline_summary(v, &json!({}), None);
         assert_eq!(summarize(&small)["pages"][0]["inlineTruncated"], false);
         for (key, value) in [("visibleText", json!("界".repeat(3001))),
             ("headings", json!(vec![json!({"text":"heading"});21])),
@@ -1803,7 +1829,6 @@ mod tests {
             let summary = summarize(&full);
             assert_eq!(summary["pages"][0]["inlineTruncated"], true, "{key}");
             assert_eq!(summary["pages"][0]["truncated"], false, "preview cuts are not collection gaps");
-            assert_eq!(summary["pages"][0]["nextRead"]["documentPath"], "full.json");
         }
     }
 
