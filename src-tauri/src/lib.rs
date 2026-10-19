@@ -22,6 +22,10 @@ mod native_browser;
 mod chrome_browser;
 mod lyra;
 mod lyra_complete;
+mod text_generation;
+mod miniapp_commands;
+mod miniapp_design;
+mod miniapp_window;
 mod model_cache;
 mod meteor;
 mod nova_tools_native;
@@ -1846,13 +1850,13 @@ async fn create_thread(
         s.default_mode.clone()
     };
     let agent_kind = agent_kind.unwrap_or(AgentKind::Devin);
+    if agent_kind == AgentKind::Unsupported {
+        return Err("该后端已移除，请选择其他后端".into());
+    }
     let mut thread = Thread::new(
         cwd.clone(),
         agent_kind,
         model.filter(|s| !s.is_empty()),
-    if agent_kind == AgentKind::Unsupported {
-        return Err("该后端已移除，请选择其他后端".into());
-    }
         mode.filter(|s| !s.is_empty())
             .or(Some(default_mode).filter(|s| !s.is_empty())),
         reasoning_effort.filter(|s| !s.is_empty()),
@@ -3671,13 +3675,13 @@ fn set_thread_agent(
     mode: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<(), String> {
+    if agent_kind == AgentKind::Unsupported {
+        return Err("该后端已移除，请选择其他后端".into());
+    }
     // 同后端切模型允许在运行中进行：set_thread_model 会保留当前运行，
     // 新模型从下一轮生效。跨后端切换涉及运行路由迁移，仍需等待当前轮结束。
     if running_by_id(&state, &thread_id) {
         let current_kind = {
-    if agent_kind == AgentKind::Unsupported {
-        return Err("该后端已移除，请选择其他后端".into());
-    }
             let store = state.store.lock().unwrap();
             store
                 .get(&thread_id)
@@ -3942,13 +3946,13 @@ pub(crate) fn dispatch_prompt(
         if t.subagent {
             return Err("子 Agent 执行记录只读，请回主会话调度".into());
         }
+        if t.agent_kind == AgentKind::Unsupported {
+            return Err("此会话的后端已移除，请先切换到其他后端".into());
+        }
         (t.agent_kind.clone(), t.is_roaming_guest())
     };
     // 内置 /fire：任意入口（IPC、远程、后台重发、worktree 补发若未在前端拦截等）
     // 都交前端编排，禁止把字面量丢给模型；子 Agent 必须在路由前拒绝。
-        if t.agent_kind == AgentKind::Unsupported {
-            return Err("此会话的后端已移除，请先切换到其他后端".into());
-        }
     if remote::route_fire_command(app, &thread_id, &text, &images)? {
         return Ok(());
     }
@@ -4863,6 +4867,41 @@ fn take_last_chars(text: &str, max: usize) -> String {
     out
 }
 
+fn miniapp_validate_text(text: &str, max_bytes: usize) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("文本不能为空".into());
+    }
+    if text.len() > max_bytes {
+        return Err(format!("文本不能超过 {max_bytes} UTF-8 字节"));
+    }
+    Ok(())
+}
+
+/// 每个轻应用独立、持久的无工具设计会话，仅允许主窗口调用。
+#[tauri::command]
+async fn miniapp_generate(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    app_id: String,
+    prompt: String,
+) -> Result<String, String> {
+    miniapp_design::generate(window, state, app_id, prompt).await
+}
+
+#[cfg(test)]
+#[test]
+fn miniapp_text_limits_are_utf8_bytes() {
+    for limit in [160_000, 180 * 1024] {
+        assert!(miniapp_validate_text("", limit).is_err());
+        assert!(miniapp_validate_text(" \r\n\t\u{3000}", limit).is_err());
+        let mut text = "中".repeat(limit / 3) + &"a".repeat(limit % 3);
+        assert_eq!(text.len(), limit);
+        assert!(miniapp_validate_text(&text, limit).is_ok());
+        text.push('a');
+        assert!(miniapp_validate_text(&text, limit).is_err());
+    }
+}
+
 /* ===== 工作流连线判断（轻量模型） ===== */
 
 /// 提示词模式连线的候选分支。
@@ -5753,7 +5792,19 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(|invoke| {
+            if !miniapp_window::allows_command(invoke.message.webview().label(), invoke.message.command()) {
+                invoke.resolver.reject("观星台运行窗口不允许此命令");
+                return true;
+            }
+            let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+            miniapp_commands::miniapp_command_start,
+            miniapp_commands::miniapp_command_status,
+            miniapp_commands::miniapp_command_cancel,
+            miniapp_window::miniapp_open,
+            miniapp_window::miniapp_scene_model,
+            miniapp_window::miniapp_show_thread,
+            miniapp_window::miniapp_pending_permissions,
             meteor::meteor_open,
             meteor::meteor_context,
             meteor::meteor_submit,
@@ -5898,6 +5949,7 @@ pub fn run() {
             summarize_clue,
             auto_failover,
             generate_thread_title,
+            miniapp_generate,
             judge_workflow_route,
             accept_share,
             decline_share,
@@ -5930,7 +5982,9 @@ pub fn run() {
             install_skill,
             remove_skill,
             sync_skills
-        ])
+            ];
+            handler(invoke)
+        })
         .build(context)
         .expect("Nova 启动失败")
         .run(|app, event| {

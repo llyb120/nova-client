@@ -23,6 +23,7 @@ const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
 const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"));
 const JianpuView = lazy(() => import("./components/JianpuView"));
 const EmployeeView = lazy(() => import("./components/EmployeeView"));
+const MiniAppsView = lazy(() => import("./components/MiniAppsView"));
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
   return (
@@ -118,8 +119,15 @@ export default function App() {
       });
     onGlobalShortcut("session-shortcut:new-session", () => openNewSession(selectedChatText()));
     onGlobalShortcut("session-shortcut:open-unread", () => void openNextUnreadThread());
-    // Butterfly 面板「知识图谱」：切到图谱页。
-    void listen<{ view: "knowledge" }>("nova:open-view", event => { closeThread(); setView(event.payload.view); })
+    // Butterfly 快捷入口：关闭当前会话并切换主区域。
+    void listen<{ view: "knowledge" | "miniapps"; appId?: string; run?: boolean; create?: boolean }>("nova:open-view", event => {
+      const view = event.payload?.view;
+      if (view !== "knowledge" && view !== "miniapps") return;
+      if (view === "miniapps") sessionStorage.setItem("nova:miniapps:open", JSON.stringify(event.payload));
+      closeThread();
+      setView(view);
+      if (view === "miniapps") window.dispatchEvent(new Event("nova:miniapps-open"));
+    })
       .then(remove => { if (disposed) remove(); else unlistens.push(remove); });
     onCleanup(() => {
       disposed = true;
@@ -166,7 +174,11 @@ export default function App() {
           <Show when={state.view === "clues"} fallback={
             <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={
               <Show when={state.view === "employee"} fallback={
-                <Show when={state.view === "jianpu"} fallback={<HomeView />}>
+                <Show when={state.view === "jianpu"} fallback={
+                  <Show when={state.view === "miniapps"} fallback={<HomeView />}>
+                    <Suspense><MiniAppsView /></Suspense>
+                  </Show>
+                }>
                   <Suspense><JianpuView /></Suspense>
                 </Show>
               }>

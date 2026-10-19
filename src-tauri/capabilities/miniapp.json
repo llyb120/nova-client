@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "miniapp",
+  "description": "Independent miniapp runtimes listen for backend events without plugin execution permissions",
+  "webviews": ["miniapp-*"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-set-title"
+  ]
+}

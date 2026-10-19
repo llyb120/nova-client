@@ -10,6 +10,15 @@ if (new URLSearchParams(window.location.search).get("meteor") === "1") {
   document.documentElement.classList.add("bubble-mode");
   const { default: TaskbarBubble } = await import("./components/TaskbarBubble");
   render(() => <TaskbarBubble />, document.getElementById("root")!);
+} else if (new URLSearchParams(window.location.search).has("miniapp")) {
+  // A runtime renders only its app; never mount Nova's shell or prompt queues twice.
+  const appId = new URLSearchParams(window.location.search).get("miniapp") || "invalid";
+  const [{ default: MiniAppsView }, { initTheme }] = await Promise.all([
+    import("./components/MiniAppsView"), import("./store"), import("./app.css"),
+    import("@fontsource-variable/inter"), import("@fontsource-variable/noto-sans-sc"), import("@fontsource-variable/jetbrains-mono"),
+  ]);
+  initTheme();
+  render(() => <MiniAppsView runtimeAppId={appId} />, document.getElementById("root")!);
 } else {
   const [{ default: App }, { initTheme }] = await Promise.all([
     import("./App"), import("./store"), import("./app.css"),

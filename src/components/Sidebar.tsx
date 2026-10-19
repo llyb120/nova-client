@@ -117,7 +117,7 @@ export function Sidebar(props: {
   });
   const onlineCount = createMemo(() => onlinePeers().length);
   // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
-  const switchView = (view: "home" | "clues" | "workflows" | "knowledge" | "employee" | "jianpu") => {
+  const switchView = (view: typeof state.view) => {
     setView(view);
     closeThread();
   };
@@ -597,6 +597,13 @@ export function Sidebar(props: {
             <IconClue size={18} />
             <Show when={state.unreadClueMentions.length > 0}><span class="sidebar-rail-dot" /></Show>
           </button>
+          <button type="button" title="观星台" aria-label="观星台"
+            classList={{ active: state.view === "miniapps" }} aria-current={state.view === "miniapps" ? "page" : undefined}
+            onClick={() => switchView("miniapps")}>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z" />
+            </svg>
+          </button>
           <div class="sidebar-rail-spacer" />
           <Show when={state.inbox.length > 0}>
             <button title="收件箱" aria-label="收件箱" onClick={props.onOpenInbox}>
@@ -767,6 +774,11 @@ export function Sidebar(props: {
             <button class="mode-seg-btn" classList={{ active: state.view === "employee" }}
               onClick={() => switchView("employee")} title="数字员工：空闲时按职责自动干活">
               数字员工
+            </button>
+            <button type="button" class="mode-seg-btn" classList={{ active: state.view === "miniapps" }}
+              aria-current={state.view === "miniapps" ? "page" : undefined}
+              onClick={() => switchView("miniapps")} title="观星台：创建和打开应用">
+              观星台
             </button>
           </div>
 
