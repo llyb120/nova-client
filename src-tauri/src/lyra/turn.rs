@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 pub enum TurnEvent {
+    /// 补充输入实际从队列交付给本轮；仅供展示，不改变调度。
+    Steer(Value),
     MessageStart,
     TextDelta(String),
     ThinkingDelta(String),
@@ -75,7 +77,7 @@ fn parallel_safe(name: &str) -> bool {
 
 /// 操作同一块屏幕的工具跨 agent 互斥。
 fn screen_tool(name: &str) -> bool {
-    matches!(name, "jianlai" | "chrome" | "webview")
+    matches!(name, "jianlai" | "chrome")
 }
 
 fn screen_lock() -> &'static tokio::sync::Mutex<()> {
@@ -153,6 +155,7 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
             }
             let steered: Vec<Value> = s.steer.lock().unwrap().drain(..).collect();
             for message in steered {
+                on_event(TurnEvent::Steer(message.clone()));
                 s.history.record(message);
             }
             if s.context.should_compact(s.history.items()) {
@@ -539,6 +542,7 @@ pub(crate) mod tests {
                 session_affinity_format: "openai".into(),
                 supports_long_cache_retention: false,
                 supports_reasoning_effort: false,
+                supports_thinking_toggle: true,
                 clear_thinking: None,
                 extra_options: serde_json::Map::new(),
                 proxy: None,

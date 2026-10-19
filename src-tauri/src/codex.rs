@@ -1524,6 +1524,7 @@ impl CodexManager {
                     "_meta": {
                         "codex.ai/supportsImages": supports_images,
                         "codex.ai/default": is_default_model,
+                        "nova.ai/defaultReasoningEffort": default_effort,
                         "codex.ai/description": description,
                         "contextWindow": context_window
                     }
@@ -1542,6 +1543,7 @@ impl CodexManager {
                             "codex.ai/supportsImages": supports_images,
                             "codex.ai/default": is_default_model && effort == default_effort,
                             "codex.ai/effort": effort,
+                            "nova.ai/defaultReasoningEffort": default_effort,
                             "codex.ai/description": desc,
                             "contextWindow": context_window
                         }
@@ -2251,8 +2253,9 @@ impl CodexManager {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             match store.get(thread_id) {
-                Some(t) => t.title.clone(),
-                None => return,
+                // 员工会话结束不打扰，需要决策时由 employee ask 单独通知。
+                Some(t) if !t.employee_thread => t.title.clone(),
+                _ => return,
             }
         };
         let body = match stop_reason {
@@ -2261,56 +2264,6 @@ impl CodexManager {
             _ => "Codex 任务已结束（出错）",
         };
         crate::sys_notify::notify_thread_done(&self.app, thread_id, &title, body, EV_NOTIFY_OPEN);
-    }
-
-    /// 触发手动上下文压缩：调用 codex 原生 thread/compact/start。
-    /// 压缩在 codex 内部完成（把历史浓缩为摘要，后续轮次仅基于摘要继续），
-    /// 进度通过 contextCompaction item 通知，完成/超时后解除忙碌态。
-    pub async fn compact(self: &Arc<Self>, thread_id: String) {
-        if self.is_running(&thread_id) {
-            return;
-        }
-        self.manual_compacting
-            .lock()
-            .unwrap()
-            .insert(thread_id.clone());
-        self.set_running(&thread_id, true, None);
-        let result = async {
-            let remote_thread_id = self.ensure_thread(&thread_id).await?;
-            let conn = self.current_conn().await.ok_or("codex 未连接")?;
-            conn.request(
-                "thread/compact/start",
-                json!({ "threadId": remote_thread_id }),
-                Some(Duration::from_secs(60)),
-            )
-            .await
-        }
-        .await;
-        match result {
-            Ok(_) => {
-                // 兜底：极端情况下长时间收不到压缩完成通知时自行解除忙碌态，避免卡住
-                let mgr = self.clone();
-                let tid = thread_id.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(180)).await;
-                    mgr.finish_manual_compaction(&tid);
-                });
-            }
-            Err(e) => {
-                self.manual_compacting.lock().unwrap().remove(&thread_id);
-                {
-                    let state = self.app.state::<AppState>();
-                    let mut store = state.store.lock().unwrap();
-                    if let Some(thread) = store.get_mut(&thread_id) {
-                        let item = thread.push_system(format!("压缩上下文失败：{e}"), "error");
-                        self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
-                        store.save();
-                    }
-                }
-                self.set_running(&thread_id, false, Some("error".into()));
-                let _ = self.app.emit(EV_THREADS, json!({}));
-            }
-        }
     }
 
     /// 手动压缩收尾：解除忙碌态（幂等；压缩完成通知与伪轮次结束通知谁先到都安全）

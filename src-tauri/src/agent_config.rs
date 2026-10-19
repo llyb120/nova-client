@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 
 const CENTRAL_FILE: &str = "global-agent-instructions.md";
 const ADAPTERS_FILE: &str = "global-agent-adapters.json";
+/// 提示词触发器：条件索引进各后端全局指令，正文落盘成独立文件，命中时由 Agent 自行读取（同 skill 渐进披露）。
+const TRIGGERS_FILE: &str = "prompt-triggers.json";
+const TRIGGERS_DIR: &str = "prompt-triggers";
 const BLOCK_START: &str = "<!-- NOVA_GLOBAL_INSTRUCTIONS_START -->";
 const BLOCK_END: &str = "<!-- NOVA_GLOBAL_INSTRUCTIONS_END -->";
 const CURSOR_MARKER: &str = "<!-- NOVA_GLOBAL_INSTRUCTIONS_CURSOR -->";
@@ -30,6 +33,16 @@ pub struct GlobalAgentInstructions {
     pub content: String,
     pub path: String,
     pub targets: Vec<AgentInstructionTarget>,
+    pub triggers: Vec<PromptTrigger>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptTrigger {
+    /// 自然语言触发条件，由模型判断是否命中。
+    pub when: String,
+    /// 命中后加载的提示词正文。
+    pub prompt: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -54,7 +67,8 @@ struct Target {
 pub fn get_global_instructions(config_dir: &Path) -> GlobalAgentInstructions {
     let central = central_path(config_dir);
     let content = fs::read_to_string(&central).unwrap_or_default();
-    let active = !content.trim().is_empty();
+    let triggers = read_triggers(config_dir);
+    let active = !content.trim().is_empty() || !triggers.is_empty();
     let disabled = read_adapter_preferences(config_dir).disabled_agent_kinds;
     let targets = normal_targets(config_dir)
         .unwrap_or_default()
@@ -65,6 +79,7 @@ pub fn get_global_instructions(config_dir: &Path) -> GlobalAgentInstructions {
         content,
         path: central.to_string_lossy().to_string(),
         targets,
+        triggers,
     }
 }
 
@@ -72,16 +87,36 @@ pub fn set_global_instructions(
     config_dir: &Path,
     content: &str,
     enabled_agent_kinds: &[String],
+    triggers: &[PromptTrigger],
 ) -> Result<GlobalAgentInstructions, String> {
-    if content.contains(BLOCK_START)
-        || content.contains(BLOCK_END)
-        || content.contains(CURSOR_MARKER)
+    let has_marker = |text: &str| {
+        text.contains(BLOCK_START) || text.contains(BLOCK_END) || text.contains(CURSOR_MARKER)
+    };
+    if has_marker(content)
+        || triggers
+            .iter()
+            .any(|trigger| has_marker(&trigger.when) || has_marker(&trigger.prompt))
     {
         return Err("全局指令不能包含 Nova 内部托管标记".into());
     }
+    let mut cleaned = Vec::new();
+    for trigger in triggers {
+        let when = trigger.when.split_whitespace().collect::<Vec<_>>().join(" ");
+        let prompt = trigger.prompt.trim();
+        match (when.is_empty(), prompt.is_empty()) {
+            (true, true) => continue,
+            (false, false) => cleaned.push(PromptTrigger {
+                when,
+                prompt: prompt.to_string(),
+            }),
+            _ => return Err("触发器的触发条件和提示词都不能为空".into()),
+        }
+    }
     fs::create_dir_all(config_dir).map_err(|e| format!("创建 Nova 配置目录失败：{e}"))?;
+    write_triggers(config_dir, &cleaned)?;
     let central = central_path(config_dir);
-    let active = !content.trim().is_empty();
+    let managed = managed_content(content, config_dir, &cleaned);
+    let active = !managed.trim().is_empty();
     let enabled: HashSet<&str> = enabled_agent_kinds.iter().map(String::as_str).collect();
     let all_targets = normal_targets(config_dir)?;
     let disabled_agent_kinds = all_targets
@@ -95,9 +130,6 @@ pub fn set_global_instructions(
             disabled_agent_kinds,
         },
     )?;
-    if active {
-        fs::write(&central, content).map_err(|e| format!("保存全局指令失败：{e}"))?;
-    }
     let targets = all_targets
         .iter()
         .map(|target| {
@@ -105,24 +137,87 @@ pub fn set_global_instructions(
             if cfg!(debug_assertions) {
                 inspect_target(target, active, target_enabled)
             } else if target_enabled {
-                sync_target(target, if active { content } else { "" }, true)
+                sync_target(target, &managed, true)
             } else {
                 sync_target(target, "", false)
             }
         })
         .collect();
-    if !active {
+    let has_content = !content.trim().is_empty();
+    if has_content {
+        fs::write(&central, content).map_err(|e| format!("保存全局指令失败：{e}"))?;
+    } else {
         let _ = fs::remove_file(&central);
     }
     Ok(GlobalAgentInstructions {
-        content: if active {
+        content: if has_content {
             content.to_string()
         } else {
             String::new()
         },
         path: central.to_string_lossy().to_string(),
         targets,
+        triggers: cleaned,
     })
+}
+
+fn read_triggers(config_dir: &Path) -> Vec<PromptTrigger> {
+    fs::read_to_string(config_dir.join(TRIGGERS_FILE))
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn trigger_path(config_dir: &Path, index: usize) -> PathBuf {
+    config_dir.join(TRIGGERS_DIR).join(format!("{:02}.md", index + 1))
+}
+
+/// 触发器配置写 JSON 供界面编辑；正文另写成独立 md 供 Agent 按需读取，旧文件整体替换。
+fn write_triggers(config_dir: &Path, triggers: &[PromptTrigger]) -> Result<(), String> {
+    let dir = config_dir.join(TRIGGERS_DIR);
+    let _ = fs::remove_dir_all(&dir);
+    let json = config_dir.join(TRIGGERS_FILE);
+    if triggers.is_empty() {
+        let _ = fs::remove_file(json);
+        return Ok(());
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("创建触发器目录失败：{e}"))?;
+    for (index, trigger) in triggers.iter().enumerate() {
+        let body = format!("<!-- 触发条件：{} -->\n\n{}\n", trigger.when, trigger.prompt);
+        fs::write(trigger_path(config_dir, index), body)
+            .map_err(|e| format!("保存触发器失败：{e}"))?;
+    }
+    let content = serde_json::to_string_pretty(triggers)
+        .map_err(|e| format!("序列化触发器失败：{e}"))?;
+    fs::write(json, content).map_err(|e| format!("保存触发器失败：{e}"))
+}
+
+/// 各后端托管区块 = 全局指令 + 触发器索引（只含条件与文件路径，正文不预加载）。
+fn managed_content(content: &str, config_dir: &Path, triggers: &[PromptTrigger]) -> String {
+    if triggers.is_empty() {
+        return content.to_string();
+    }
+    let mut out = String::new();
+    if !content.trim().is_empty() {
+        out.push_str(content.trim_end());
+        out.push_str("\n\n");
+    }
+    out.push_str(
+        "## Nova 提示词触发器\n以下指令按条件触发，正文未预加载。当用户请求或当前任务满足某条「触发条件」时，先用读取文件工具读取对应文件全文并严格遵循，再继续工作；不满足则忽略。同一会话已读过且未变化的无需重复读取。\n",
+    );
+    for (index, trigger) in triggers.iter().enumerate() {
+        out.push_str(&format!(
+            "- 触发条件：{}\n  文件：{}\n",
+            trigger.when,
+            trigger_path(config_dir, index).to_string_lossy()
+        ));
+    }
+    out
+}
+
+fn stored_managed_content(config_dir: &Path) -> String {
+    let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
+    managed_content(&content, config_dir, &read_triggers(config_dir))
 }
 
 /// 启动时重新同步一次，修复用户移动/删除了后端配置入口的情况。
@@ -130,30 +225,12 @@ pub fn sync_global_instructions(config_dir: &Path) -> Result<(), String> {
     if cfg!(debug_assertions) {
         return Ok(());
     }
-    let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
+    let content = stored_managed_content(config_dir);
     let disabled = read_adapter_preferences(config_dir).disabled_agent_kinds;
     for target in normal_targets(config_dir)? {
         let enabled = !disabled.contains(target.kind.as_str());
         let _ = sync_target(&target, if enabled { &content } else { "" }, enabled);
     }
-    Ok(())
-}
-
-/// 额度漫游会为每个后端准备隔离 HOME/config；把本机全局指令同步进该真实运行环境。
-pub fn sync_backend_with_env(
-    config_dir: &Path,
-    kind: &AgentKind,
-    env: &HashMap<String, String>,
-) -> Result<(), String> {
-    if cfg!(debug_assertions) {
-        return Ok(());
-    }
-    let content = fs::read_to_string(central_path(config_dir)).unwrap_or_default();
-    let enabled = !read_adapter_preferences(config_dir)
-        .disabled_agent_kinds
-        .contains(kind.as_str());
-    let target = target_for(kind, env)?;
-    let _ = sync_target(&target, if enabled { &content } else { "" }, enabled);
     Ok(())
 }
 
@@ -191,6 +268,7 @@ fn normal_targets(config_dir: &Path) -> Result<Vec<Target>, String> {
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
+        AgentKind::WorkBuddy,
         AgentKind::Cursor,
     ]
     .iter()
@@ -246,6 +324,14 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
                 configured_dir(overrides, "CODEX_HOME").unwrap_or_else(|| home.join(".codex"));
             (kind.label(), root.join("AGENTS.md"), TargetFormat::Markdown)
         }
+        AgentKind::WorkBuddy => (
+            kind.label(),
+            configured_dir(overrides, "WORKBUDDY_CONFIG_DIR")
+                .or_else(crate::workbuddy::config_dir)
+                .unwrap_or_else(|| home.join(".workbuddy"))
+                .join("CODEBUDDY.md"),
+            TargetFormat::Markdown,
+        ),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
             let root = configured_dir(overrides, "CODEBUDDY_CONFIG_DIR")
                 .unwrap_or_else(|| home.join(".codebuddy"));
@@ -494,6 +580,26 @@ mod tests {
         let (cleaned, removed) = remove_managed_block(&merged);
         assert!(removed);
         assert_eq!(cleaned, "# Existing\n");
+    }
+
+    #[test]
+    fn triggers_index_lists_condition_and_file_but_not_body() {
+        let dir = std::env::temp_dir().join(format!("nova-triggers-{}", uuid::Uuid::new_v4()));
+        let triggers = [PromptTrigger {
+            when: "用户要求  写\n周报".into(),
+            prompt: "SECRET_BODY".into(),
+        }];
+        let saved = set_global_instructions(&dir, "", &[], &triggers).unwrap();
+        assert_eq!(saved.triggers[0].when, "用户要求 写 周报");
+        let index = stored_managed_content(&dir);
+        assert!(index.contains("触发条件：用户要求 写 周报"));
+        assert!(index.contains(&trigger_path(&dir, 0).to_string_lossy().to_string()));
+        assert!(!index.contains("SECRET_BODY"));
+        assert!(fs::read_to_string(trigger_path(&dir, 0)).unwrap().contains("SECRET_BODY"));
+        assert!(set_global_instructions(&dir, "", &[], &[PromptTrigger { when: "x".into(), prompt: " ".into() }]).is_err());
+        set_global_instructions(&dir, "", &[], &[]).unwrap();
+        assert!(!dir.join(TRIGGERS_DIR).exists() && stored_managed_content(&dir).is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

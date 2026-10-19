@@ -24,6 +24,7 @@ struct ResolvedCompletionTarget {
     thinking_format: Option<String>,
     max_tokens_field: &'static str,
     reasoning: bool,
+    supports_thinking_toggle: bool,
     service_tier: Option<String>,
     temperature: Option<f64>,
     top_p: Option<f64>,
@@ -122,7 +123,7 @@ async fn complete_openai_responses(
     if let Some(top_p) = target.top_p {
         body["top_p"] = json!(top_p);
     }
-    if target.reasoning {
+    if target.reasoning && target.supports_thinking_toggle {
         body["reasoning"] = json!({ "effort": "none" });
     }
     let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
@@ -130,16 +131,17 @@ async fn complete_openai_responses(
 }
 
 fn apply_thinking_disabled_completions(body: &mut Value, target: &ResolvedCompletionTarget) {
-    if !target.reasoning {
+    if !target.reasoning || !target.supports_thinking_toggle {
         return;
     }
     match target.thinking_format.as_deref() {
-        Some("deepseek") | Some("zai") => {
+        Some("deepseek" | "zai" | "moonshot" | "minimax" | "volcengine") => {
             body["thinking"] = json!({ "type": "disabled" });
         }
         Some("qwen") => {
             body["enable_thinking"] = json!(false);
         }
+        Some("openrouter") => { body["reasoning"] = json!({ "enabled": false }); }
         _ => {}
     }
 }
@@ -367,7 +369,10 @@ pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
         let cache = config_cache().lock().unwrap();
         if let Some(cached) = cache.as_ref() {
             if cached.path == path && cached.mtime == mtime {
-                return Ok(cached.config.clone());
+                let mut config = cached.config.clone();
+                drop(cache);
+                crate::lyra::presets::expand(&mut config, data_dir);
+                return Ok(config);
             }
         }
     }
@@ -386,12 +391,13 @@ pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
     {
         return Err("Lyra 配置缺少 provider".into());
     }
-    crate::lyra::presets::expand(&mut config, data_dir);
     *config_cache().lock().unwrap() = Some(CachedConfig {
         path,
         mtime,
         config: config.clone(),
     });
+    // 缓存原始配置；本地 CLI 的地址、认证和模型选择每次使用时重新读取。
+    crate::lyra::presets::expand(&mut config, data_dir);
     Ok(config)
 }
 
@@ -503,6 +509,8 @@ fn resolve_target(
         thinking_format,
         max_tokens_field,
         reasoning,
+        supports_thinking_toggle: model.pointer("/options/supportsThinkingToggle")
+            .or_else(|| provider.pointer("/options/supportsThinkingToggle")).and_then(Value::as_bool).unwrap_or(true),
         service_tier,
         temperature,
         top_p,
@@ -638,41 +646,41 @@ pub(crate) fn parse_jsonc(text: &str) -> Result<Value, String> {
 
 fn strip_json_comments(text: &str) -> String {
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut out = Vec::with_capacity(text.len());
     let mut i = 0;
     let mut in_string = false;
     let mut escaped = false;
     while i < bytes.len() {
-        let c = bytes[i] as char;
+        let c = bytes[i];
         if in_string {
             out.push(c);
             if escaped {
                 escaped = false;
-            } else if c == '\\' {
+            } else if c == b'\\' {
                 escaped = true;
-            } else if c == '"' {
+            } else if c == b'"' {
                 in_string = false;
             }
             i += 1;
             continue;
         }
-        if c == '"' {
+        if c == b'"' {
             in_string = true;
             out.push(c);
             i += 1;
             continue;
         }
-        if c == '/' && bytes.get(i + 1) == Some(&b'/') {
+        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
             continue;
         }
-        if c == '/' && bytes.get(i + 1) == Some(&b'*') {
+        if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
             i += 2;
             while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 if bytes[i] == b'\n' {
-                    out.push('\n');
+                    out.push(b'\n');
                 }
                 i += 1;
             }
@@ -682,36 +690,36 @@ fn strip_json_comments(text: &str) -> String {
         out.push(c);
         i += 1;
     }
-    out
+    String::from_utf8(out).expect("删除完整注释不会破坏 UTF-8")
 }
 
 fn strip_trailing_commas(text: &str) -> String {
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut out = Vec::with_capacity(text.len());
     let mut i = 0;
     let mut in_string = false;
     let mut escaped = false;
     while i < bytes.len() {
-        let c = bytes[i] as char;
+        let c = bytes[i];
         if in_string {
             out.push(c);
             if escaped {
                 escaped = false;
-            } else if c == '\\' {
+            } else if c == b'\\' {
                 escaped = true;
-            } else if c == '"' {
+            } else if c == b'"' {
                 in_string = false;
             }
             i += 1;
             continue;
         }
-        if c == '"' {
+        if c == b'"' {
             in_string = true;
             out.push(c);
             i += 1;
             continue;
         }
-        if c == ',' {
+        if c == b',' {
             let mut next = i + 1;
             while next < bytes.len() && bytes[next].is_ascii_whitespace() {
                 next += 1;
@@ -724,7 +732,7 @@ fn strip_trailing_commas(text: &str) -> String {
         out.push(c);
         i += 1;
     }
-    out
+    String::from_utf8(out).expect("删除 ASCII 逗号不会破坏 UTF-8")
 }
 
 #[cfg(test)]
@@ -747,6 +755,16 @@ mod tests {
                 .and_then(Value::as_str),
             Some("@ai-sdk/openai-compatible")
         );
+        let unicode = parse_jsonc(r#"{
+            // 中文注释
+            "provider": { "本地": { "name": "本地 Codex 🧭", "path": "C:\\用户\\配置", }, },
+            /* 多行
+               注释 */
+            "模型": ["中文模型", "https://example.com/a//b/*c*/", "引号\"与逗号,}",],
+        }"#).unwrap();
+        assert_eq!(unicode["provider"]["本地"]["name"], "本地 Codex 🧭");
+        assert_eq!(unicode["provider"]["本地"]["path"], "C:\\用户\\配置");
+        assert_eq!(unicode["模型"], json!(["中文模型", "https://example.com/a//b/*c*/", "引号\"与逗号,}"]));
     }
 
     #[test]
@@ -815,6 +833,23 @@ mod tests {
         let target = resolve_target(&explicit, "opencode/gpt", &HashMap::new()).unwrap();
         // 显式声明后 provider 侧自动附加 x-opencode-session 路由头。
         assert_eq!(target.thinking_format.as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn completion_does_not_disable_mandatory_thinking() {
+        for format in ["zai", "moonshot", "qwen", "minimax", "openrouter"] {
+            let mut config = json!({"provider":{"p":{"api":"openai-completions",
+                "options":{"baseURL":"https://example.test"},"models":{"m":{"reasoning":true,
+                    "options":{"thinkingFormat":format,"supportsThinkingToggle":false}}}}}});
+            let target = resolve_target(&config, "p/m", &HashMap::new()).unwrap();
+            let mut body = json!({});
+            apply_thinking_disabled_completions(&mut body, &target);
+            assert_eq!(body, json!({}), "{format}");
+            config["provider"]["p"]["models"]["m"]["options"]["supportsThinkingToggle"] = json!(true);
+            let target = resolve_target(&config, "p/m", &HashMap::new()).unwrap();
+            apply_thinking_disabled_completions(&mut body, &target);
+            assert_ne!(body, json!({}), "{format}");
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { configFromDraft, draftFromConfig, validate } from "../src/lyraConfig.ts";
+import { configFromDraft, draftFromConfig, providerDraft, validate } from "../src/lyraConfig.ts";
 
 const raw = {
   $schema: "x",
@@ -59,10 +59,22 @@ const imported = { model: "local-claude-code/custom/variant/high", provider: { "
   models: { custom: { reasoning: true, options: { reasoningEffort: "high" }, variants: { high: { reasoningEffort: "high" } } } },
 } } };
 const importedDraft = draftFromConfig(imported);
+presets.push({ id: "local-claude-code", name: "本地 Claude Code", baseURL: "" });
+assert.equal(importedDraft.providers[0].preset, "local-claude-code");
 assert.equal(validate(importedDraft.providers, presets), null);
 const savedImport = configFromDraft(imported, importedDraft);
 assert.equal(savedImport.provider["local-claude-code"].api, "anthropic-messages");
 assert.equal(savedImport.provider["local-claude-code"].options.headers.Authorization, "Bearer test-token");
 assert.equal(savedImport.model, imported.model);
 assert.deepEqual(savedImport.provider["local-claude-code"].models.custom.variants, imported.provider["local-claude-code"].models.custom.variants);
+
+// 本地 provider 无需手填地址/协议/Key；凭证跟随 CLI，不能把旧导入的 Key 固化回去。
+for (const id of ["local-codex", "local-claude-code"]) {
+  const provider = providerDraft(id, { preset: id, options: { apiKey: "old-key" } });
+  assert.equal(validate([provider], [{ id, name: id, baseURL: "", local: true }]), null);
+  const config = configFromDraft({}, { model: "", providers: [provider] });
+  assert.deepEqual(config.provider[id], { preset: id, options: {} });
+}
+assert.equal(providerDraft("local-codex-2", { name: "本地 Codex" }).preset, "local-codex");
+assert.equal(providerDraft("local-codex", { name: "我自己的网关" }).preset, "");
 console.log("ok");

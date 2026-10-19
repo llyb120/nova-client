@@ -90,7 +90,7 @@ export function processLiveLines(items: ProcessItem[], wrap = (text: string) => 
       : "";
     const text = item.type === "thought" ? item.text.trimEnd() || "思考中…"
       : `${status} · ${(item.title || item.kind).replace(/\s+/g, " ").trim()}`;
-    lines = [...wrap(text).slice(-(2 - lines.length)), ...lines];
+    lines = [...wrap(text).filter(line => line.trim()).slice(-(2 - lines.length)), ...lines];
   }
   return lines;
 }

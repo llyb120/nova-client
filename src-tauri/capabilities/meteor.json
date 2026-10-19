@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "meteor",
+  "description": "Meteor overlay listens for new capture contexts while its webview is reused",
+  "webviews": ["meteor"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

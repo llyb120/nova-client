@@ -796,7 +796,9 @@ button {
 }
 
 .thread-agent.codebuddy,
-.agent-badge.codebuddy {
+.agent-badge.codebuddy,
+.thread-agent.workbuddy,
+.agent-badge.workbuddy {
   color: var(--yellow);
   border-color: color-mix(in srgb, var(--yellow) 36%, transparent);
   background: color-mix(in srgb, var(--yellow) 13%, transparent);
@@ -1664,50 +1666,96 @@ button {
 }
 
 .stage-rail {
-  flex: 0 0 var(--stage-width, 92px);
-  width: var(--stage-width, 92px);
+  flex: 0 0 var(--stage-width, 128px);
+  width: var(--stage-width, 128px);
   min-height: 0;
   overflow-y: auto;
-  padding: 18px 10px 18px 0;
+  padding: 16px 8px 16px 12px;
   border-left: 1px solid var(--border-light);
   background: var(--sidebar-veil);
 }
 .stage-rail-count {
-  padding: 0 7px 8px;
+  padding: 0 0 10px 2px;
   color: var(--text-faint);
   font-size: 10px;
   white-space: nowrap;
 }
+/* 时间线：圆点 + 向下连线表示事件先后顺序；不使用 transition/多行截断，切换时只重绘 class */
 .stage-rail-item {
+  position: relative;
   width: 100%;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 4px;
-  padding: 6px 7px;
+  gap: 6px;
+  min-height: 30px;
+  padding: 5px 6px 5px 20px;
   border-radius: var(--r-sm);
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 12px;
+  text-align: left;
 }
-.stage-rail-item:hover,
+.stage-rail-item::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin-top: -3.5px;
+  border-radius: 50%;
+  background: var(--bg-sidebar);
+  border: 1.5px solid var(--border-strong);
+  box-sizing: border-box;
+}
+.stage-rail-item:not(:last-of-type)::after {
+  content: "";
+  position: absolute;
+  left: 9px;
+  top: calc(50% + 4px);
+  bottom: -11px;
+  width: 1px;
+  background: var(--border-light);
+}
+.stage-rail-item:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
 .stage-rail-item.active {
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
-.stage-rail-item small {
-  color: var(--text-faint);
-  font-family: var(--mono);
-  font-size: 9px;
+.stage-rail-item.active::before {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
 }
-/* stage 导航条上的未读角标：复用侧栏未读徽标样式，仅调整定位 */
-.stage-rail-item.unread {
-  position: relative;
+.stage-rail-item > span:first-child {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 序号被时间线圆点取代；子 Agent 仅保留状态小字 */
+.stage-rail-item small {
+  display: none;
+}
+.stage-rail-item.subagent {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+.stage-rail-item.subagent small {
+  display: block;
+  order: 3;
+  flex-basis: 100%;
+  color: var(--text-faint);
+  font-size: 10px;
 }
 .stage-rail-item .thread-unread-badge {
-  top: 1px;
-  right: 2px;
-}
-@media (max-width: 820px) {
+  position: static;
+  flex: none;
+  border-color: transparent;
+}@media (max-width: 820px) {
   .chat {
     --stage-width: 72px;
   }
@@ -2872,6 +2920,14 @@ button {
 .composer-bar .pill[aria-expanded="true"] {
   background: var(--bg-hover);
   border-color: var(--border);
+}
+.composer-bar .composer-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  cursor: pointer;
+  white-space: nowrap;
 }
 .composer-run-stats {
   display: inline-flex;
@@ -4484,7 +4540,7 @@ button {
   font-size: 12px;
 }
 
-/* ===== 团队共享：逐行添加列表（漫游项目 / 共享模型额度） ===== */
+/* ===== 团队共享：逐行添加列表（漫游项目） ===== */
 .share-list {
   display: flex;
   flex-direction: column;
@@ -4498,7 +4554,10 @@ button {
   gap: 6px;
 }
 .stage-model-row {
-  grid-template-columns: 64px minmax(0, 1fr) 28px;
+  grid-template-columns: 28px minmax(0, 1fr) 28px 28px;
+}
+.stage-model-row.share-row-add {
+  grid-template-columns: 28px minmax(0, 1fr) 28px;
 }
 .share-row .proj-picker,
 .share-row .search-select,
@@ -5119,29 +5178,6 @@ button.head-badge:hover {
   background: var(--bg-hover);
   color: var(--text);
 }
-.chat-compact-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  margin-left: 8px;
-  padding: 3px 9px;
-  border-radius: 7px;
-  font-size: 12px;
-  cursor: pointer;
-  background: transparent;
-  color: var(--text-dim);
-  border: 1px solid var(--border-light);
-  flex-shrink: 0;
-}
-.chat-compact-btn:hover:not(:disabled) {
-  background: var(--bg-hover);
-  color: var(--text);
-}
-.chat-compact-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 /* 上下文压缩分隔条（自动/手动压缩进度） */
 .compaction-divider {
   display: flex;
@@ -6839,7 +6875,7 @@ button.clue-bar-item:hover,
 .wf-toast.error { border-color: color-mix(in srgb, var(--red) 55%, var(--border)); color: var(--red); }
 @keyframes wfDrop2 { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
-/* 全局轻提示（减少焦虑模式等）：底部居中，自动消失，不拦截点击 */
+/* 全局轻提示：底部居中，自动消失，不拦截点击 */
 .app-toast {
   position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); z-index: 100;
   padding: 9px 16px; border-radius: 999px; font-size: 12.5px; color: var(--text); white-space: nowrap;
@@ -6865,30 +6901,6 @@ button.clue-bar-item:hover,
   border-top: 1px solid var(--border);
   border-bottom-right-radius: 0;
   border-top-left-radius: 2px;
-}
-
-/* 减少焦虑：提示词化作星尘沿弧线飞入室女座（位置由 ZenDropChip 的 rAF 驱动） */
-.zen-drop {
-  position: fixed; left: 0; top: 0; z-index: 100; width: 0; height: 0;
-  pointer-events: none; will-change: transform;
-}
-.zen-drop-dot {
-  position: absolute; left: -6px; top: -6px; width: 12px; height: 12px; border-radius: 50%;
-  background: radial-gradient(circle, #fff 0%, color-mix(in srgb, var(--accent) 75%, #fff) 38%, color-mix(in srgb, var(--accent) 50%, transparent) 62%, transparent 74%);
-  box-shadow: 0 0 10px 2px color-mix(in srgb, var(--accent) 65%, transparent),
-              0 0 26px 8px color-mix(in srgb, var(--accent) 26%, transparent);
-}
-.zen-drop-label {
-  position: absolute; left: 0; top: 14px; transform: translateX(-50%);
-  padding: 4px 11px; border-radius: 999px; font-size: 11.5px; color: var(--text-dim); white-space: nowrap;
-  background: color-mix(in srgb, var(--bg-float) 82%, transparent);
-  border: 1px solid var(--border); backdrop-filter: blur(6px);
-}
-.mode-seg-btn.virgo-landed { animation: virgoLand .85s cubic-bezier(.2, .8, .3, 1); }
-@keyframes virgoLand {
-  0% { transform: scale(1); box-shadow: 0 0 0 0 transparent, 0 0 14px 3px transparent; }
-  30% { transform: scale(1.09); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent), 0 0 14px 3px color-mix(in srgb, var(--accent) 38%, transparent); }
-  100% { transform: scale(1); box-shadow: 0 0 0 12px transparent, 0 0 14px 3px transparent; }
 }
 
 /* 空状态 */
@@ -7273,6 +7285,169 @@ button:focus-visible {
 
 .settings-tab-pane[hidden] {
   display: none;
+}
+
+/* Lyra：默认模型 → 服务商 → 模型与高级参数，逐层展开。 */
+.lyra-config,
+.lyra-overview,
+.lyra-provider-body,
+.lyra-detail-body,
+.lyra-models {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.lyra-section-head,
+.lyra-provider-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.lyra-heading h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+.lyra-overview .lyra-heading h3 { font-size: 22px; }
+.lyra-heading p { margin: 5px 0 0; }
+.lyra-default-model {
+  padding: 18px 20px;
+  background: var(--accent-dim);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  border-radius: var(--r-md);
+  margin-bottom: 8px;
+}
+.lyra-default-model .field-label { font-size: 14px; }
+.lyra-default-model select { margin-top: 5px; }
+.lyra-add-provider { width: 162px; max-width: 100%; }
+.lyra-provider {
+  min-width: 0;
+  border: 1px solid var(--card-border);
+  border-radius: var(--r-md);
+  background: var(--bg-panel);
+}
+.lyra-config summary,
+.lyra-overview summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.lyra-config summary::-webkit-details-marker,
+.lyra-overview summary::-webkit-details-marker { display: none; }
+.lyra-config summary::before,
+.lyra-overview summary::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  margin-right: 4px;
+}
+.lyra-config details[open] > summary::before,
+.lyra-overview details[open] > summary::before { transform: rotate(45deg); }
+.lyra-config summary:hover,
+.lyra-overview summary:hover { color: var(--text); }
+.lyra-config summary:focus-visible,
+.lyra-overview summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+.lyra-provider > summary { padding: 16px 18px; }
+.lyra-provider[open] > summary { border-bottom: 1px solid var(--border); }
+.lyra-provider-title {
+  min-width: 0;
+  flex: 1;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.lyra-provider-meta { color: var(--text-muted); font-size: 11.5px; }
+.lyra-count {
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+.lyra-provider-body { padding: 18px; }
+.lyra-config h4 { margin: 0; font-size: 12.5px; font-weight: 600; }
+.lyra-config .backend-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.lyra-config .field-input { min-width: 0; max-width: 100%; }
+.lyra-config .backend-card-head { flex-wrap: wrap; }
+.lyra-config .field-hint,
+.lyra-overview .field-hint { overflow-wrap: anywhere; }
+.lyra-models { padding-top: 16px; border-top: 1px solid var(--border); gap: 12px; }
+.lyra-models .btn { padding: 6px 10px; font-size: 12px; }
+.lyra-fetch {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 12px;
+  align-items: center;
+}
+.lyra-fetch > [role="status"],
+.lyra-model-catalog { grid-column: 1 / -1; }
+.lyra-fetch > [role="status"]:empty { display: none; }
+.lyra-model-names {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+  max-height: 180px;
+  overflow: auto;
+}
+.lyra-model-names span {
+  font-size: 11.5px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  overflow-wrap: anywhere;
+}
+.lyra-model { background: var(--bg-input); border-radius: var(--r-sm); }
+.lyra-model > summary { padding: 12px; }
+.lyra-model > .lyra-detail-body { padding: 0 12px 14px; }
+.lyra-advanced,
+.lyra-file-settings { border-top: 1px solid var(--border); padding-top: 12px; }
+.lyra-advanced > .lyra-detail-body,
+.lyra-file-settings > .lyra-detail-body { padding-top: 14px; }
+.lyra-file-settings .btn { align-self: flex-start; }
+.lyra-provider-footer { border-top: 1px solid var(--border); padding-top: 12px; }
+.lyra-del { margin-left: auto; color: var(--text-muted); font-size: 11.5px; }
+.lyra-del:hover { color: var(--red); }
+.lyra-providers-head {
+  position: sticky;
+  top: -24px;
+  z-index: 2;
+  padding: 24px 0 8px;
+  background: var(--bg);
+}
+.lyra-empty { display: grid; gap: 8px; padding: 24px; border: 1px dashed var(--border-light); border-radius: var(--r-md); }
+.lyra-config .lyra-error { color: var(--red); }
+@media (max-width: 600px) {
+  .lyra-config .backend-fields,
+  .lyra-config .env-var-row { grid-template-columns: minmax(0, 1fr); }
+  .lyra-provider > summary { padding: 14px; }
+  .lyra-provider-body { padding: 14px; }
+  .lyra-provider-meta { display: none; }
+  .lyra-default-model { padding: 16px; }
+  .lyra-fetch { grid-template-columns: minmax(0, 1fr); }
+  .lyra-fetch > .btn { justify-self: start; }
+  .lyra-overview .backend-proxy-field { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* 模型右侧的思考强度列（第四级） */

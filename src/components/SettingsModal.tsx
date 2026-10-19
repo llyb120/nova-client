@@ -11,33 +11,32 @@ import {
   checkAndStageUpdate,
   deleteThreads,
   enabledAgentKinds,
-  ensureModelOptions,
-  preloadPeerModels,
+  installChromeExtensionWithJianlai,
   refreshQuota,
   refreshRelayStatus,
-  quotaPeers,
   setState,
   setTheme,
   state,
 } from "../store";
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
-import { ModelPicker, type SharedModelSource } from "./ConfigSelects";
+import { ModelPicker } from "./ConfigSelects";
 import { IconPlus, IconX } from "./icons";
 import { LyraConfigPanel } from "./LyraConfigPanel";
 import { ProjectPicker } from "./ProjectPicker";
 import { WorkflowPicker } from "./WorkflowPicker";
 import {
   encodeModelTarget,
-  encodeQuotaModelTarget,
   encodeRoamTarget,
   formatShortcutKeys,
   newSessionShortcutId,
   parseModelTarget,
   parseRoamTarget,
-  setShortcutCaptureActive,
+  setShortcutRecordingActive,
+  withDefaultSessionShortcuts,
 } from "../sessionShortcuts";
 import type {
   AgentInstructionTarget,
+  PromptTrigger,
   AgentKind,
   CliStatus,
   Peer,
@@ -47,6 +46,7 @@ import type {
   SkillInfo,
   WorktreeRecord,
 } from "../types";
+import { SCENES, scenesReady, type SceneKey, type SceneModels } from "../types";
 
 function threadGroupName(cwd: string): string {
   if (isScratch(cwd)) return "临时会话";
@@ -55,15 +55,6 @@ function threadGroupName(cwd: string): string {
 
 function projectPathKey(path: string): string {
   return path.replace(/\\/g, "/").toLowerCase();
-}
-
-/** 解析共享模型额度的键 `<agentKind>:<modelId>`；非法键返回 null。 */
-function parseQuotaShareKey(key: string): { kind: AgentKind; model: string } | null {
-  const i = key.indexOf(":");
-  if (i <= 0) return null;
-  const kind = key.slice(0, i) as AgentKind;
-  if (!ALL_AGENT_KINDS.includes(kind)) return null;
-  return { kind, model: key.slice(i + 1) };
 }
 
 function resolveShortcutRoam(target: string): { peer: Peer; folder: string } | null {
@@ -113,17 +104,17 @@ function ShortcutKeyCapture(props: {
   let listener: ((event: KeyboardEvent) => void) | null = null;
 
   const stopRecording = () => {
-    if (listener) {
-      window.removeEventListener("keydown", listener, true);
-      listener = null;
-    }
-    setShortcutCaptureActive(false);
+    if (!listener) return;
+    window.removeEventListener("keydown", listener, true);
+    window.removeEventListener("blur", stopRecording);
+    listener = null;
+    setShortcutRecordingActive(false);
     setRecording(false);
   };
 
   const startRecording = () => {
     stopRecording();
-    setShortcutCaptureActive(true);
+    setShortcutRecordingActive(true);
     setRecording(true);
     listener = (event: KeyboardEvent) => {
       event.preventDefault();
@@ -138,6 +129,7 @@ function ShortcutKeyCapture(props: {
       stopRecording();
     };
     window.addEventListener("keydown", listener, true);
+    window.addEventListener("blur", stopRecording);
   };
 
   onCleanup(() => stopRecording());
@@ -153,6 +145,7 @@ function ShortcutKeyCapture(props: {
         if (recording()) stopRecording();
         else startRecording();
       }}
+      onBlur={stopRecording}
       aria-label="录制快捷键"
       title={recording() ? "按下组合键，Esc 取消" : "点击后按下组合键"}
     >
@@ -218,10 +211,12 @@ function CliManager(props: {
   );
 }
 
-type SettingsTab =
+export type SettingsTab =
   | "general"
+  | "scenes"
+  | "meteor"
+  | "jianlai"
   | "advanced"
-  | "jev"
   | "lyra"
   | "backends"
   | "instructions"
@@ -234,8 +229,10 @@ type SettingsTab =
 
 const TABS: { id: SettingsTab; name: string }[] = [
   { id: "general", name: "通用" },
+  { id: "scenes", name: "场景模型" },
+  { id: "meteor", name: "Meteor" },
+  { id: "jianlai", name: "剑来" },
   { id: "advanced", name: "高级" },
-  { id: "jev", name: "JEV 辅助决策" },
   { id: "lyra", name: "Lyra" },
   { id: "backends", name: "模型后端" },
   { id: "instructions", name: "Agent 配置" },
@@ -247,23 +244,41 @@ const TABS: { id: SettingsTab; name: string }[] = [
   { id: "about", name: "关于" },
 ];
 
-export function SettingsModal(props: { onClose: () => void }) {
+// 首次运行引导：第 1 步配置后端（含 Lyra），第 2 步配置场景模型。
+const ONBOARDING_STEPS: { title: string; tabs: SettingsTab[] }[] = [
+  { title: "配置模型后端", tabs: ["lyra", "backends"] },
+  { title: "配置场景模型", tabs: ["scenes"] },
+];
+
+export function SettingsModal(props: { onClose: () => void; initialTab?: SettingsTab; onboarding?: boolean }) {
   const s = state.settings;
-  const [jevEnabled, setJevEnabled] = createSignal(s?.jevEnabled ?? false);
-  const [jevApiUrl, setJevApiUrl] = createSignal(s?.jevApiUrl ?? "");
-  const [jevTesting, setJevTesting] = createSignal(false);
-  const [jevTestResult, setJevTestResult] = createSignal("");
-  const testJev = async () => {
-    setJevTesting(true);
-    setJevTestResult("");
+  const [step, setStep] = createSignal(0);
+  const [chromeDep, setChromeDep] = createSignal<Awaited<ReturnType<typeof api.chromeDependencyStatus>> | null>(null);
+  const [chromeDepBusy, setChromeDepBusy] = createSignal(false);
+  const checkChromeDep = async () => {
+    setChromeDepBusy(true);
     try {
-      const result = await invoke<{ elapsedMs: number }>("test_jev_connection", { apiKey: jevApiKey().trim(), apiUrl: jevApiUrl().trim() });
-      setJevTestResult(`接口测试通过，耗时 ${result.elapsedMs} ms（仅固定测试，不代表控制成功率）`);
-    } catch (error) { setJevTestResult(String(error)); }
-    finally { setJevTesting(false); }
+      setChromeDep(await api.chromeDependencyStatus());
+    } catch (error) {
+      void message(`检测失败：${String(error)}`, { kind: "error" });
+    } finally {
+      setChromeDepBusy(false);
+    }
   };
-  const [jevApiKey, setJevApiKey] = createSignal(s?.jevApiKey ?? "");
-  const [tab, setTab] = createSignal<SettingsTab>("general");
+  const installChromeDep = async () => {
+    setChromeDepBusy(true);
+    try {
+      await installChromeExtensionWithJianlai(chromeDep() ?? (await api.chromeDependencyStatus()));
+      props.onClose();
+    } catch (error) {
+      void message(`启动安装会话失败：${String(error)}`, { kind: "error" });
+    } finally {
+      setChromeDepBusy(false);
+    }
+  };
+  const visibleTabs = () =>
+    props.onboarding ? TABS.filter((t) => ONBOARDING_STEPS[step()].tabs.includes(t.id)) : TABS;
+  const [tab, setTab] = createSignal<SettingsTab>(props.onboarding ? "lyra" : props.initialTab ?? "general");
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
   const [claudePath, setClaudePath] = createSignal(s?.claudePath ?? "claude-agent-acp");
@@ -275,6 +290,7 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
   const [acpArgs, setAcpArgs] = createSignal(s?.acpArgs ?? "acp");
   const [codebuddyPath, setCodebuddyPath] = createSignal(s?.codebuddyPath ?? "codebuddy");
+  const [workbuddyPath, setWorkbuddyPath] = createSignal(s?.workbuddyPath ?? "");
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
   const [lyraProxy, setLyraProxy] = createSignal(s?.lyraProxy ?? "");
@@ -297,6 +313,7 @@ export function SettingsModal(props: { onClose: () => void }) {
 
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
+  const [workbuddyProxy, setWorkbuddyProxy] = createSignal(s?.workbuddyProxy ?? "");
   const [cursorProxy, setCursorProxy] = createSignal(s?.cursorProxy ?? "");
   const [cursorSdkApiKey, setCursorSdkApiKey] = createSignal(s?.cursorSdkApiKey ?? "");
   const [cursorDisableSubagents, setCursorDisableSubagents] = createSignal(
@@ -306,10 +323,14 @@ export function SettingsModal(props: { onClose: () => void }) {
     (s?.cursorModelContexts ?? []).map((rule) => ({ ...rule })),
   );
   const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(
-    (s?.sessionShortcuts ?? [])
-      .filter((item) => item.action !== "stopSession")
-      .map((item) => ({ ...item })),
+    (s?.sessionShortcuts ?? []).map((item) => ({ ...item })),
   );
+  const [meteorEnabled, setMeteorEnabled] = createSignal(s?.meteorEnabled ?? true);
+  const [meteorShortcut, setMeteorShortcut] = createSignal(s?.meteorShortcut ?? "Alt+Alt");
+  const [meteorClipboard, setMeteorClipboard] = createSignal(s?.meteorClipboard ?? false);
+  const [meteorPasteShortcut, setMeteorPasteShortcut] = createSignal(s?.meteorPasteShortcut ?? "Alt+V");
+  const [jianpuShortcut, setJianpuShortcut] = createSignal(s?.jianpuShortcut ?? "Alt+R");
+  const [tryingMeteor, setTryingMeteor] = createSignal(false);
   const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
     s?.cursorContextMode === "super" ? "super" : "default",
   );
@@ -320,17 +341,12 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
   const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
+  const [workbuddyEnabled, setWorkbuddyEnabled] = createSignal(s?.workbuddyEnabled === true);
   const [cursorEnabled, setCursorEnabled] = createSignal(s?.cursorEnabled !== false);
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
-  const [lightweightAgent, setLightweightAgent] = createSignal<AgentKind>(
-    (s?.lightweightModelAgent as AgentKind) || "lyra",
+  const [sceneModels, setSceneModels] = createSignal<SceneModels>(
+    Object.fromEntries(SCENES.map(({ key }) => [key, (s?.sceneModels?.[key] ?? []).map((t) => ({ ...t }))])) as SceneModels,
   );
-  const [lightweightModel, setLightweightModel] = createSignal(s?.lightweightModel ?? "");
-  const [stageModels, setStageModels] = createSignal<Settings["stageModels"]>(
-    (s?.stageModels ?? []).map((target) => ({ ...target })),
-  );
-  const [draftStageKind, setDraftStageKind] = createSignal<AgentKind | null>(null);
-  const [draftStageModel, setDraftStageModel] = createSignal("");
   const [editor, setEditor] = createSignal(s?.editor ?? "code");
   const [sessionAutoCleanupEnabled, setSessionAutoCleanupEnabled] = createSignal(
     s?.sessionAutoCleanupEnabled ?? false,
@@ -338,7 +354,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [sessionAutoCleanupHours, setSessionAutoCleanupHours] = createSignal(
     s?.sessionAutoCleanupHours ?? 24 * 30,
   );
-  const [zenModeEnabled, setZenModeEnabled] = createSignal(s?.zenModeEnabled ?? false);
   const [knowledgeGraphEnabled, setKnowledgeGraphEnabled] = createSignal(s?.knowledgeGraphEnabled ?? false);
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
@@ -351,12 +366,9 @@ export function SettingsModal(props: { onClose: () => void }) {
     s?.remoteControlEnabled ?? false,
   );
   const [remoteQr, setRemoteQr] = createSignal<{ url: string; dataUrl: string } | null>(null);
-  const [quotaSharedModels, setQuotaSharedModels] = createSignal<string[]>(s?.quotaSharedModels ?? []);
   const [roamingFolders, setRoamingFolders] = createSignal<string[]>(state.roamingFolders);
   const [roamingFoldersLoading, setRoamingFoldersLoading] = createSignal(false);
   // 「添加一行」式共享模型选择器的草稿状态：选完即加入列表并复位为空。
-  const [draftShareKind, setDraftShareKind] = createSignal<AgentKind | null>(null);
-  const [draftShareModel, setDraftShareModel] = createSignal("");
   const [globalInstructions, setGlobalInstructions] = createSignal("");
   const [globalInstructionsPath, setGlobalInstructionsPath] = createSignal("");
   const [globalInstructionTargets, setGlobalInstructionTargets] = createSignal<
@@ -366,6 +378,14 @@ export function SettingsModal(props: { onClose: () => void }) {
   const [globalInstructionsBusy, setGlobalInstructionsBusy] = createSignal(false);
   const [globalInstructionsDirty, setGlobalInstructionsDirty] = createSignal(false);
   const [globalInstructionsMsg, setGlobalInstructionsMsg] = createSignal("");
+  const [promptTriggers, setPromptTriggers] = createSignal<PromptTrigger[]>([]);
+  const editPromptTrigger = (index: number, patch: Partial<PromptTrigger> | null) => {
+    setPromptTriggers((list) =>
+      patch ? list.map((item, i) => (i === index ? { ...item, ...patch } : item)) : list.filter((_, i) => i !== index),
+    );
+    setGlobalInstructionsDirty(true);
+    setGlobalInstructionsMsg("");
+  };
   const [verifying, setVerifying] = createSignal(false);
   const [verifyMsg, setVerifyMsg] = createSignal("");
   const [showLogs, setShowLogs] = createSignal(false);
@@ -427,66 +447,27 @@ export function SettingsModal(props: { onClose: () => void }) {
       lyraEnabled(),
       codexEnabled(),
       codebuddyEnabled(),
+      workbuddyEnabled(),
       cursorEnabled(),
     ].filter(Boolean).length;
 
-  const quotaShareKinds = createMemo<AgentKind[]>(() => {
-    const kinds: AgentKind[] = [];
-    if (lyraEnabled()) kinds.push("lyra");
-    if (devinEnabled()) kinds.push("devin");
-    if (codexEnabled()) kinds.push("codex");
-    if (codebuddyEnabled()) kinds.push("codebuddy");
-    if (cursorEnabled()) kinds.push("cursor");
-    return kinds;
-  });
-  const titleAgentKinds = createMemo(() =>
-    enabledAgentKinds().filter((kind) => kind === "devin" || kind === "codex"),
-  );
+  const sceneAgentKinds = createMemo(() => ALL_AGENT_KINDS.filter((kind) => ({
+    lyra: lyraEnabled(), devin: devinEnabled(), claude: claudeEnabled(), kimi: kimiEnabled(),
+    codex: codexEnabled(), codebuddy: codebuddyEnabled(), workbuddy: workbuddyEnabled(), cursor: cursorEnabled(),
+  })[kind]));
 
-  const quotaShareKey = (kind: AgentKind, model: string) => `${kind}:${model}`;
-  const addQuotaSharedModel = (kind: AgentKind, model: string) => {
-    if (!model) return;
-    const key = quotaShareKey(kind, model);
-    setQuotaSharedModels((current) => (current.includes(key) ? current : [...current, key]));
-    // 记住上次选择的后端，连续添加时不用每次重新选后端
-    setDraftShareKind(kind);
-    setDraftShareModel("");
-  };
-  const replaceQuotaSharedModel = (oldKey: string, kind: AgentKind, model: string) => {
-    const key = quotaShareKey(kind, model);
-    if (key === oldKey) return;
-    setQuotaSharedModels((current) => {
-      // 目标已在列表中：移除旧行避免重复
-      if (current.includes(key)) return current.filter((item) => item !== oldKey);
-      return current.map((item) => (item === oldKey ? key : item));
+  const sceneRowKinds = (kind: AgentKind): AgentKind[] =>
+    sceneAgentKinds().includes(kind) ? sceneAgentKinds() : [...sceneAgentKinds(), kind];
+  const editScene = (key: SceneKey, edit: (list: SceneModels[SceneKey]) => SceneModels[SceneKey]) =>
+    setSceneModels((current) => ({ ...current, [key]: edit(current[key]) }));
+  const moveSceneModel = (key: SceneKey, index: number, delta: number) =>
+    editScene(key, (list) => {
+      const next = [...list];
+      const target = index + delta;
+      if (target < 0 || target >= next.length) return list;
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
     });
-  };
-  const removeQuotaSharedModelAt = (index: number) => {
-    setQuotaSharedModels((current) => current.filter((_, i) => i !== index));
-  };
-  /** 行选择器的后端列表：已启用后端 + 该行自身的后端（后端被停用后旧行仍可展示/移除） */
-  const quotaRowKinds = (kind: AgentKind): AgentKind[] =>
-    quotaShareKinds().includes(kind) ? quotaShareKinds() : [...quotaShareKinds(), kind];
-  const stageRowKinds = (kind: AgentKind): AgentKind[] => {
-    const enabled = enabledAgentKinds();
-    return enabled.includes(kind) ? enabled : [...enabled, kind];
-  };
-  const addStageModel = (agentKind: AgentKind, model: string) => {
-    if (!model) return;
-    setStageModels((current) => [...current, { agentKind, model }]);
-    setDraftStageKind(agentKind);
-    setDraftStageModel("");
-  };
-  const replaceStageModel = (index: number, agentKind: AgentKind, model: string) => {
-    setStageModels((current) =>
-      current.map((target, targetIndex) =>
-        targetIndex === index ? { agentKind, model } : target,
-      ),
-    );
-  };
-  const removeStageModelAt = (index: number) => {
-    setStageModels((current) => current.filter((_, targetIndex) => targetIndex !== index));
-  };
   const updateCursorModelContext = (index: number, patch: { prefix?: string; contextWindow?: number }) => {
     setCursorModelContexts((current) => current.map((rule, ruleIndex) =>
       ruleIndex === index ? { ...rule, ...patch } : rule));
@@ -536,31 +517,14 @@ export function SettingsModal(props: { onClose: () => void }) {
                 ? "insertText"
                 : item.action === "selectWorkflow"
                   ? "selectWorkflow"
-                  : item.action === "hideToVirgo"
-                    ? "hideToVirgo"
-                    : "selectModel",
+                  : "selectModel",
         target: item.target.trim(),
       }))
       .filter((item) => {
         if (!item.keys) return false;
-        if (item.action === "stopSession") return false;
-        if (item.action === "newSession" || item.action === "openUnread" || item.action === "toggleTerminal" || item.action === "hideToVirgo") return true;
+        if (item.action === "newSession" || item.action === "openUnread" || item.action === "toggleTerminal") return true;
         return item.target.length > 0;
       });
-
-  const shortcutSharedModels = createMemo<SharedModelSource[]>(() =>
-    quotaPeers()
-      .map((peer) => ({
-        peer: { token: peer.token, name: peer.name },
-        options: state.peerModels[peer.token]?.sharedOptions ?? {},
-      }))
-      .filter((source) => Object.keys(source.options).length > 0),
-  );
-
-  createEffect(() => {
-    if (sessionShortcuts().length === 0) return;
-    preloadPeerModels();
-  });
 
   let roamingFoldersLoaded = false;
   const loadRoamingFolders = async () => {
@@ -616,6 +580,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       setGlobalInstructions(config.content);
       setGlobalInstructionsPath(config.path);
       setGlobalInstructionTargets(config.targets);
+      setPromptTriggers(config.triggers);
       setGlobalInstructionsDirty(false);
       globalInstructionsLoaded = true;
     } catch (error) {
@@ -631,10 +596,15 @@ export function SettingsModal(props: { onClose: () => void }) {
       const enabledAgentKinds = globalInstructionTargets()
         .filter((target) => target.enabled)
         .map((target) => target.agentKind);
-      const config = await api.setGlobalAgentInstructions(globalInstructions(), enabledAgentKinds);
+      const config = await api.setGlobalAgentInstructions(
+        globalInstructions(),
+        enabledAgentKinds,
+        promptTriggers(),
+      );
       setGlobalInstructions(config.content);
       setGlobalInstructionsPath(config.path);
       setGlobalInstructionTargets(config.targets);
+      setPromptTriggers(config.triggers);
       setGlobalInstructionsDirty(false);
       const conflicts = config.targets.filter(
         (target) => target.status === "conflict" || target.status === "error",
@@ -697,9 +667,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   };
 
   const draftSettings = (): Settings => ({
-    jevEnabled: jevEnabled(),
-    jevApiKey: jevApiKey().trim(),
-    jevApiUrl: jevApiUrl().trim(),
     claudePath: claudePath().trim() || "claude-agent-acp",
     claudeProxy: claudeProxy().trim(),
     claudeEnabled: claudeEnabled(),
@@ -709,6 +676,7 @@ export function SettingsModal(props: { onClose: () => void }) {
     devinPath: devinPath().trim() || "devin",
     acpArgs: acpArgs().trim() || "acp",
     codebuddyPath: codebuddyPath().trim() || "codebuddy",
+    workbuddyPath: workbuddyPath().trim(),
     // Cursor 仅走官方 SDK，不再依赖本机 cursor-agent；保留字段兼容旧配置。
     cursorPath: s?.cursorPath?.trim() || "cursor-agent",
     codexPath: codexPath().trim() || "codex",
@@ -723,6 +691,7 @@ export function SettingsModal(props: { onClose: () => void }) {
 
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
+    workbuddyProxy: workbuddyProxy().trim(),
     cursorProxy: cursorProxy().trim(),
     cursorSdkApiKey: cursorSdkApiKey().trim(),
     cursorDisableSubagents: cursorDisableSubagents(),
@@ -731,11 +700,7 @@ export function SettingsModal(props: { onClose: () => void }) {
       .filter((rule) => rule.prefix.length > 0),
     cursorContextMode: cursorContextMode(),
     defaultMode: "build",
-    lightweightModelAgent: lightweightAgent(),
-    lightweightModel: lightweightModel().trim(),
-    stageModels: stageModels()
-      .map((target) => ({ agentKind: target.agentKind, model: target.model.trim() }))
-      .filter((target) => target.model.length > 0),
+    sceneModels: sceneModels(),
     editor: editor().trim() || "code",
     terminalShell: terminalShell().trim(),
     terminalArgs: terminalArgs().split(/\r?\n/).filter(arg => arg.length > 0),
@@ -744,13 +709,18 @@ export function SettingsModal(props: { onClose: () => void }) {
     relayToken: relayToken().trim(),
     relayGroups: relayGroups().trim(),
     remoteControlEnabled: remoteControlEnabled(),
-    quotaSharedModels: quotaSharedModels(),
     modelFavorites: state.settings?.modelFavorites ?? [],
     sessionShortcuts: draftSessionShortcuts(),
+    meteorEnabled: meteorEnabled(),
+    meteorShortcut: meteorShortcut().trim(),
+    meteorClipboard: meteorClipboard(),
+    meteorPasteShortcut: meteorPasteShortcut().trim(),
+    jianpuShortcut: jianpuShortcut().trim(),
     devinEnabled: devinEnabled(),
     lyraEnabled: lyraEnabled(),
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),
+    workbuddyEnabled: workbuddyEnabled(),
     cursorEnabled: cursorEnabled(),
     codexIntegration: "app-server",
     codebuddyIntegration: "acp",
@@ -759,7 +729,6 @@ export function SettingsModal(props: { onClose: () => void }) {
     updateChannel: updateChannel(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
-    zenModeEnabled: zenModeEnabled(),
     knowledgeGraphEnabled: knowledgeGraphEnabled(),
     historyDisplayMode: historyDisplayMode(),
     customEnvVars: Object.fromEntries(
@@ -792,7 +761,6 @@ export function SettingsModal(props: { onClose: () => void }) {
   createEffect(() => {
     if (tab() !== "team") return;
     void loadRoamingFolders();
-    for (const kind of quotaShareKinds()) void ensureModelOptions(kind);
   });
 
   createEffect(() => {
@@ -1016,8 +984,36 @@ export function SettingsModal(props: { onClose: () => void }) {
   });
 
   let saveLyraConfig: (() => Promise<void>) | undefined;
-  const save = async () => {
+  // afterSave 仅供引导第 1 步使用：先落盘后端与 Lyra 配置（此时场景尚未配置），让模型列表加载出来。
+  const save = async (afterSave?: () => void) => {
+    if (!afterSave && !scenesReady(sceneModels())) {
+      setTab("scenes");
+      await message("请为每个场景至少配置一个模型后再保存。", { title: "场景模型未配置", kind: "error" });
+      return;
+    }
     const draftedShortcuts = draftSessionShortcuts();
+    const jianpuKeys = jianpuShortcut().trim().toLowerCase();
+    if (jianpuKeys && [meteorEnabled() ? meteorShortcut() : "", meteorEnabled() ? meteorPasteShortcut() : "", ...withDefaultSessionShortcuts(draftedShortcuts).map((item) => item.keys)]
+      .some((keys) => keys.trim().toLowerCase() === jianpuKeys)) {
+      setTab("meteor");
+      await message("剑谱快捷键与 Meteor、星移或会话快捷键冲突，请修改后再保存。", { title: "保存设置失败", kind: "error" });
+      return;
+    }
+    if (meteorEnabled()) {
+      const keys = meteorShortcut().trim().toLowerCase();
+      const pasteKeys = meteorPasteShortcut().trim().toLowerCase();
+      const sessionKeys = withDefaultSessionShortcuts(draftedShortcuts).map((item) => item.keys.trim().toLowerCase());
+      const error = !keys ? "请为 Meteor 录制快捷键，或恢复连按两次 Alt。"
+        : sessionKeys.includes(keys)
+          ? "Meteor 快捷键与会话快捷键冲突，请修改后再保存。"
+          : pasteKeys && (pasteKeys === keys || sessionKeys.includes(pasteKeys))
+            ? "星移快捷键与 Meteor 或会话快捷键冲突，请修改后再保存。" : "";
+      if (error) {
+        setTab("meteor");
+        await message(error, { title: "保存设置失败", kind: "error" });
+        return;
+      }
+    }
     const keyCounts = new Map<string, number>();
     for (const item of draftedShortcuts) {
       const key = item.keys.toLowerCase();
@@ -1064,7 +1060,7 @@ export function SettingsModal(props: { onClose: () => void }) {
           kind: "info",
         });
       }
-      props.onClose();
+      (afterSave ?? props.onClose)();
     } catch (error) {
       await message(String(error), { title: "保存设置失败", kind: "error" });
     } finally {
@@ -1100,14 +1096,20 @@ export function SettingsModal(props: { onClose: () => void }) {
     <div class="modal-backdrop">
       <div class="modal settings-modal">
         <div class="modal-head">
-          <span>设置</span>
-          <button class="icon-btn" onClick={props.onClose}>
-            <IconX size={16} />
-          </button>
+          <span>
+            {props.onboarding
+              ? `欢迎使用 Nova · 第 ${step() + 1}/${ONBOARDING_STEPS.length} 步：${ONBOARDING_STEPS[step()].title}`
+              : "设置"}
+          </span>
+          <Show when={!props.onboarding}>
+            <button class="icon-btn" onClick={props.onClose}>
+              <IconX size={16} />
+            </button>
+          </Show>
         </div>
 
         <div class="settings-tabs">
-          <For each={TABS}>
+          <For each={visibleTabs()}>
             {(t) => (
               <button
                 type="button"
@@ -1121,26 +1123,163 @@ export function SettingsModal(props: { onClose: () => void }) {
         </div>
 
         <div class="modal-body">
-          <Show when={tab() === "jev"}>
+          <Show when={props.onboarding}>
+            <p class="settings-group-desc">
+              {step() === 0
+                ? "先启用并配置至少一个能提供模型的后端：在 Lyra 中添加模型服务商，或在「模型后端」中启用已安装并登录的 Claude Code、Codex 等。点「下一步」会保存并启动这些后端。"
+                : "为每个场景选择至少一个模型。后端刚启动时模型列表可能需要稍等；仍没有可选模型时请返回上一步检查后端配置。以后可在「设置」中修改。"}
+            </p>
+          </Show>
+          <Show when={tab() === "jianlai"}>
             <section class="settings-group">
-              <h3 class="settings-group-title">JEV DOM 决策</h3>
-              <label class="field">
-                <span><input type="checkbox" checked={jevEnabled()} onChange={e => setJevEnabled(e.currentTarget.checked)} /> 启用 JEV</span>
-                <span class="field-hint">保存后生效。使用 jev-latest，默认使用系统代理。浏览器 DOM 操作默认委托 JEV，按元素编号规划并在每步后刷新 DOM；视觉操作由主模型负责，JEV 只辅助判断文字证据。仅实际调用 advise/run 时产生用量。不确定时交回主模型，关闭后不发起新请求。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">API 地址</span>
-                <input class="field-input" type="url" placeholder="https://api.typesafe.ai/v1/systemone" value={jevApiUrl()} onInput={e => setJevApiUrl(e.currentTarget.value)} />
-                <span class="field-hint">留空使用 TypeSafe 官方接口；第三方服务请填写兼容 SystemOne 协议的完整接口地址（含路径），并使用该服务的 API Key。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">API Key</span>
-                <input class="field-input" type="text" autocomplete="off" value={jevApiKey()} onInput={e => setJevApiKey(e.currentTarget.value)} />
-                <span class="field-hint">密钥保存在本机设置文件中（非加密）；也可留空使用 NOVA_JEV_API_KEY 环境变量。调用时会向所配置的服务发送任务、观察摘要和候选项；连续执行还会发送相关页面文本与目标信息，不上传截图；请勿提交密码、令牌等敏感信息。JEV 不负责视觉定位。</span>
-              </label>
-              <button type="button" class="btn" disabled={jevTesting()} onClick={() => void testJev()}>{jevTesting() ? "测试中…" : "测试连接"}</button>
-              <p class="field-hint">使用当前填写的地址和密钥发送固定测试，可能产生少量费用；无需先保存或启用。</p>
-              <p role="status" aria-live="polite">{jevTestResult()}</p>
+              <h3 class="settings-group-title">剑来 · Chrome 依赖</h3>
+              <p class="settings-group-desc">
+                chrome 工具需要本机安装 Google Chrome 并加载 Nova 自带的 Chrome 扩展。自动安装会用上一次会话的模型在临时目录开启新会话，由剑来操作 Chrome 完成安装并开启无痕模式。
+              </p>
+              <div class="field">
+                <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
+                  <button type="button" class="btn secondary" disabled={chromeDepBusy()} onClick={() => void checkChromeDep()}>检测 Chrome 依赖</button>
+                  <button type="button" class="btn primary" disabled={chromeDepBusy() || chromeDep()?.chromePath === null} onClick={() => void installChromeDep()}>用剑来自动安装</button>
+                </div>
+                <Show when={chromeDep()}>
+                  {(dep) => (
+                    <span class="field-hint">
+                      Chrome：{dep().chromePath ?? "未找到，请先安装 Google Chrome"}
+                      <br />
+                      Nova Chrome 扩展：{dep().connected ? "已连接" : "未连接"}
+                      {dep().connected ? `（${dep().incognitoAllowed ? "已允许无痕" : "未允许无痕"}）` : ""}
+                      <br />
+                      扩展目录：{dep().extensionDir}
+                    </span>
+                  )}
+                </Show>
+              </div>
+            </section>
+          </Show>
+          <Show when={tab() === "meteor"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">Meteor · 屏幕上的操作助手</h3>
+              <p class="settings-group-desc">
+                触发后立即显示实时透明标注层，可跨屏添加多个点或框选区域，并分别填写操作要求；输入后直接点击另一处即可自动新增标注。一次提交后 Nova 会在后台新建临时目录会话，桌面应用使用剑来，Chrome 网页使用 chrome，Nova 原生浏览器使用 webview；不切换当前会话。
+              </p>
+              <div class="field">
+                <span class="field-label">启用 Meteor</span>
+                <label class="backend-switch">
+                  <input type="checkbox" checked={meteorEnabled()} onChange={(e) => setMeteorEnabled(e.currentTarget.checked)} />
+                  <span>启用全局触发</span>
+                </label>
+                <span class="field-hint">同一台电脑运行 dev 实例时，非 dev 实例的 Meteor 自动停用，避免争抢快捷键；dev 退出后恢复。</span>
+              </div>
+              <div class="field">
+                <span class="field-label">全局快捷键</span>
+                <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
+                  <ShortcutKeyCapture value={meteorShortcut() === "Alt+Alt" ? "连按两次 Alt" : meteorShortcut()} onChange={setMeteorShortcut} />
+                  <button type="button" class="btn secondary" onClick={() => setMeteorShortcut("Alt+Alt")}>恢复双 Alt</button>
+                </div>
+                <span class="field-hint">目前支持 Windows。默认快速按下并松开两次 Alt；点击上方按钮可录制其他组合键（需包含 Ctrl、Alt、Shift 或 Win，以系统全局快捷键注册），Esc 取消录制。若组合键已被其他程序占用会提示注册失败，请换一个。</span>
+              </div>
+              <div class="field">
+                <span class="field-label">星移（StartShift）快捷键</span>
+                <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
+                  <ShortcutKeyCapture value={meteorPasteShortcut() || "已关闭"} onChange={setMeteorPasteShortcut} />
+                  <button type="button" class="btn secondary" onClick={() => setMeteorPasteShortcut("Alt+V")}>恢复 Alt+V</button>
+                  <button type="button" class="btn secondary" onClick={() => setMeteorPasteShortcut("")}>关闭</button>
+                </div>
+                <span class="field-hint">按下后弹出要求输入框，由剑来把剪贴板内容按要求粘贴到当前焦点处；不填要求则自动推断。需为带修饰键的组合键，且不能与 Meteor 或会话快捷键相同。</span>
+              </div>
+              <div class="field">
+                <span class="field-label">剑谱录制快捷键</span>
+                <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
+                  <ShortcutKeyCapture value={jianpuShortcut() || "已关闭"} onChange={setJianpuShortcut} />
+                  <button type="button" class="btn secondary" onClick={() => setJianpuShortcut("Alt+R")}>恢复 Alt+R</button>
+                  <button type="button" class="btn secondary" onClick={() => setJianpuShortcut("")}>关闭</button>
+                </div>
+                <span class="field-hint">目前支持 Windows。按一次开始录制你的桌面操作（暖金边框 + 带录制圆点的箭头指针），再按一次停止；也可在 Butterfly 悬停面板里开始/停止。注册为全局快捷键后，其他程序自己的同名快捷键（如 Word 的 Alt+R）会被占用。录制的打字内容按原文保存在本机。</span>
+              </div>
+              <div class="field">
+                <span class="field-label">最近剪贴板</span>
+                <label class="backend-switch">
+                  <input type="checkbox" checked={meteorClipboard()} onChange={(e) => setMeteorClipboard(e.currentTarget.checked)} />
+                  <span>提交时附加最近的剪贴板</span>
+                </label>
+                <span class="field-hint">默认关闭。开启后把触发时剪贴板里的文字、图片或文件路径作为参考一并提交，仅取当前一条，不记录历史；关闭时不读取剪贴板。</span>
+              </div>
+              <p class="settings-group-desc">
+                提交时截取所有屏幕并提供完整截图，标注仅提示大致位置，不会裁掉周边或未标注屏幕。目标明确时直接执行，不因未指定逐字措辞或操作步骤而重复询问；只要求草稿时不会发送。请避免在敏感内容可见（或开启剪贴板附加且敏感内容位于剪贴板）时使用。
+              </p>
+              <button type="button" class="btn secondary" disabled={tryingMeteor()} onClick={async () => {
+                setTryingMeteor(true);
+                try { await api.openMeteor(); }
+                catch (error) { await message(String(error), { title: "Meteor", kind: "error" }); }
+                finally { setTryingMeteor(false); }
+              }}>{tryingMeteor() ? "正在打开标注层…" : "试用已保存配置"}</button>
+              <span class="field-hint">更改快捷键后，请先保存设置再试用；执行模型使用「场景模型 → 轻量化」。</span>
+            </section>
+          </Show>
+          <Show when={tab() === "scenes"}>
+            <section class="settings-group">
+              <h3 class="settings-group-title">场景模型</h3>
+              <p class="settings-group-desc">
+                每个场景按顺序使用第一个可用的模型，失效时自动切换到下一个。自动模式会话以轻量化模型开局，由它把整块编码或剑来工作转交给对应场景；轻量化场景还用于标题、摘要、上下文压缩、/stage、Butterfly、Meteor 和数字员工。每个场景至少配置一个模型。
+              </p>
+              <For each={SCENES}>
+                {(scene) => (
+                  <div class="field">
+                    <span class="field-label">{scene.label}</span>
+                    <span class="field-hint">{scene.hint}</span>
+                    <div class="share-list">
+                      <Index each={sceneModels()[scene.key]}>
+                        {(target, index) => (
+                          <div class="share-row stage-model-row">
+                            <span style={{ width: "28px", "flex-shrink": 0 }}>{index + 1}</span>
+                            <ModelPicker
+                              agentKind={target().agentKind}
+                              agentKinds={sceneRowKinds(target().agentKind)}
+                              model={target().model}
+                              allowDefault
+                              defaultLabel={`${agentLabel(target().agentKind)} 默认模型`}
+                              onPickModel={(agentKind, model) =>
+                                editScene(scene.key, (list) => list.map((t, i) => (i === index ? { agentKind, model } : t)))
+                              }
+                              title={`${scene.label}模型 ${index + 1}`}
+                              portal
+                            />
+                            <button type="button" class="icon-btn" title="上移" aria-label="上移" disabled={index === 0}
+                              onClick={() => moveSceneModel(scene.key, index, -1)}>↑</button>
+                            <button type="button" class="icon-btn share-row-remove" title="移除该模型" aria-label="移除该模型"
+                              onClick={() => editScene(scene.key, (list) => list.filter((_, i) => i !== index))}>
+                              <IconX size={14} />
+                            </button>
+                          </div>
+                        )}
+                      </Index>
+                      <Show when={sceneModels()[scene.key].length === 0}>
+                        <div class="share-empty">尚未配置，至少需要一个模型。</div>
+                      </Show>
+                      <Show when={sceneAgentKinds().length > 0}>
+                        <div class="share-row share-row-add stage-model-row">
+                          <span style={{ width: "28px", "flex-shrink": 0 }}>{sceneModels()[scene.key].length + 1}</span>
+                          <ModelPicker
+                            agentKind={sceneAgentKinds()[0]}
+                            agentKinds={sceneAgentKinds()}
+                            model=""
+                            allowDefault
+                            defaultLabel="选择并添加模型"
+                            onPickModel={(agentKind, model) => {
+                              if (model) editScene(scene.key, (list) => [...list, { agentKind, model }]);
+                            }}
+                            title={`添加${scene.label}模型`}
+                            portal
+                          />
+                          <span class="share-row-plus" title="选择模型后自动加入列表">
+                            <IconPlus size={13} />
+                          </span>
+                        </div>
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </For>
             </section>
           </Show>
           {/* ===== 通用 ===== */}
@@ -1223,7 +1362,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型/工作流、快速新会话、终止当前回合，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换、终止回合与隐藏到室女座有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发；「隐藏会话到室女座」仅在未开启减少焦虑（室女座）时可用，会话被收起期间侧栏会出现「室女座」tab，重新打开即回到普通会话。默认 Esc 终止当前回合（终端获得焦点时交给终端）；默认 Ctrl+`（~ 键）打开或收起终端，可添加「打开 / 收起终端」动作修改按键。
+                      一键切换项目/模型/工作流、快速新会话，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发。默认 Ctrl+`（~ 键）打开或收起终端，可添加「打开 / 收起终端」动作修改按键。
                     </div>
                   </div>
                   <button
@@ -1274,9 +1413,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                                         ? "insertText"
                                   : action === "selectWorkflow"
                                     ? "selectWorkflow"
-                                    : action === "hideToVirgo"
-                                      ? "hideToVirgo"
-                                      : "selectModel";
+                                    : "selectModel";
                                 updateSessionShortcut(index, {
                                   action: nextAction,
                                   target: "",
@@ -1291,15 +1428,13 @@ export function SettingsModal(props: { onClose: () => void }) {
                               <option value="toggleTerminal">打开 / 收起终端</option>
                               <option value="selectWorkflow">选择工作流</option>
                               <option value="insertText">快捷输入</option>
-                              <option value="hideToVirgo">隐藏会话到室女座</option>
                             </select>
                             <div class="session-shortcut-target">
                               <Show
                                 when={
                                   item().action === "newSession" ||
                                   item().action === "openUnread" ||
-                                  item().action === "toggleTerminal" ||
-                                  item().action === "hideToVirgo"
+                                  item().action === "toggleTerminal"
                                 }
                                 fallback={
                                   <Show
@@ -1315,13 +1450,9 @@ export function SettingsModal(props: { onClose: () => void }) {
                                                 agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "lyra")}
                                                 agentKinds={enabledAgentKinds()}
                                                 model={modelTarget()?.model ?? ""}
-                                                sharedModels={shortcutSharedModels()}
-                                                quotaPeerToken={modelTarget()?.peerToken}
-                                                onPickModel={(agentKind, model, quotaPeer) =>
+                                                onPickModel={(agentKind, model) =>
                                                   updateSessionShortcut(index, {
-                                                    target: quotaPeer
-                                                      ? encodeQuotaModelTarget(quotaPeer.token, agentKind, model)
-                                                      : encodeModelTarget(agentKind, model),
+                                                    target: encodeModelTarget(agentKind, model),
                                                   })
                                                 }
                                                 title="快捷键目标模型"
@@ -1371,9 +1502,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                                   {item().action === "openUnread"
                                     ? "优先未读；无未读时循环切换进行中的会话"
                                     : item().action === "toggleTerminal" ? "任意本地页 · 打开 / 收起右侧终端"
-                                    : item().action === "hideToVirgo"
-                                      ? "会话页生效 · 仅在未开启减少焦虑时可用"
-                                      : "任意页 · 继承当前目录与模型"}
+                                    : "任意页 · 继承当前目录与模型"}
                                 </div>
                               </Show>
                             </div>
@@ -1392,87 +1521,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                     </Index>
                   </div>
                 </Show>
-              </div>
-            </section>
-
-            <section class="settings-group">
-              <h3 class="settings-group-title">轻量级模型</h3>
-              <p class="settings-group-desc">
-                用于标题生成、快速总结、摘要和上下文压缩等辅助任务；调用失败时自动回退到任务原模型。
-              </p>
-              <div class="field">
-                <span class="field-label">Stage 模型</span>
-                <span class="field-hint">
-                  按顺序配置 /stage、/stage2、/stage3… 使用的模型；/stage 等同于 /stage1。命令会引用当前会话并直接开启对应模型的新会话。
-                </span>
-                <div class="share-list">
-                  <Index each={stageModels()}>
-                    {(target, index) => (
-                      <div class="share-row stage-model-row" title={`/stage${index + 1}`}>
-                        <span style={{ width: "64px", "flex-shrink": 0 }}>
-                          {index === 0 ? "/stage" : `/stage${index + 1}`}
-                        </span>
-                        <ModelPicker
-                          agentKind={target().agentKind}
-                          agentKinds={stageRowKinds(target().agentKind)}
-                          model={target().model}
-                          onPickModel={(agentKind, model) =>
-                            replaceStageModel(index, agentKind, model)
-                          }
-                          title={`Stage ${index + 1} 模型`}
-                          portal
-                        />
-                        <button
-                          type="button"
-                          class="icon-btn share-row-remove"
-                          title="移除该模型"
-                          aria-label="移除该 Stage 模型"
-                          onClick={() => removeStageModelAt(index)}
-                        >
-                          <IconX size={14} />
-                        </button>
-                      </div>
-                    )}
-                  </Index>
-                  <Show when={stageModels().length === 0}>
-                    <div class="share-empty">尚未配置 Stage 模型，/stage 将提示先完成配置。</div>
-                  </Show>
-                  <Show when={enabledAgentKinds().length > 0}>
-                    <div class="share-row share-row-add stage-model-row">
-                      <span style={{ width: "64px", "flex-shrink": 0 }}>
-                        /stage{stageModels().length + 1}
-                      </span>
-                      <ModelPicker
-                        agentKind={draftStageKind() ?? (enabledAgentKinds()[0] ?? "lyra")}
-                        agentKinds={enabledAgentKinds()}
-                        model={draftStageModel()}
-                        allowDefault
-                        defaultLabel="选择并添加模型"
-                        onPickModel={(agentKind, model) => addStageModel(agentKind, model)}
-                        title="添加 Stage 模型"
-                        portal
-                      />
-                      <span class="share-row-plus" title="选择模型后自动加入列表">
-                        <IconPlus size={13} />
-                      </span>
-                    </div>
-                  </Show>
-                </div>
-              </div>
-              <div class="field">
-                <span class="field-label">轻量级模型</span>
-                <ModelPicker
-                  agentKind={lightweightAgent()}
-                  agentKinds={titleAgentKinds()}
-                  model={lightweightModel()}
-                  onPickModel={(a, m) => {
-                    setLightweightAgent(a);
-                    setLightweightModel(m);
-                  }}
-                  prefix="轻量模型"
-                  title="轻量级模型"
-                  portal
-                />
               </div>
             </section>
 
@@ -1520,7 +1568,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                 <input type="checkbox" checked={knowledgeGraphEnabled()} onChange={(e) => setKnowledgeGraphEnabled(e.currentTarget.checked)} />
                 <span>显示知识图谱</span>
               </label>
-              <p class="field-hint">默认关闭。开启后在室女座旁显示入口，以向四周展开的操作树查看已记录的路径、下一步分支和可完成的目标。</p>
+              <p class="field-hint">默认关闭。开启后在侧栏显示入口，以向四周展开的操作树查看已记录的路径、下一步分支和可完成的目标。</p>
             </section>
             <section class="settings-group">
               <h3 class="settings-group-title">上下文机制</h3>
@@ -1605,25 +1653,6 @@ export function SettingsModal(props: { onClose: () => void }) {
               </div>
             </section>
 
-
-            <section class="settings-group">
-              <h3 class="settings-group-title">减少焦虑</h3>
-              <div class="field">
-                <span class="field-label">室女座</span>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={zenModeEnabled()}
-                    onChange={(e) => setZenModeEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-                <span class="field-hint">
-                  启用后侧栏多出「室女座」：会话发出后即转入后台运行并移入室女座（有轻提示，想看进度可手动点开），普通模式不再显示，会话结束后自动移回。不必一直盯着运行中的会话，专心做自己的事。
-                </span>
-              </div>
-            </section>
-
             <section class="settings-group">
               <h3 class="settings-group-title">世界线</h3>
               <div class="field">
@@ -1662,11 +1691,13 @@ export function SettingsModal(props: { onClose: () => void }) {
           </Show>
 
           {/* ===== Lyra（常驻挂载，切换 tab 不丢草稿） ===== */}
-          <div class="settings-tab-pane" hidden={tab() !== "lyra"}>
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class={`agent-badge lyra`}>{agentLabel("lyra")}</span>
-                <span class="fixed-integration">Rust</span>
+          <div class="settings-tab-pane lyra-settings" hidden={tab() !== "lyra"}>
+            <div class="lyra-overview">
+              <div class="lyra-section-head">
+                <div class="lyra-heading">
+                  <h3>Lyra</h3>
+                  <p class="field-hint">连接模型服务，使用本机 Skills 开始工作。</p>
+                </div>
                 <label class="backend-switch">
                   <input
                     type="checkbox"
@@ -1674,11 +1705,16 @@ export function SettingsModal(props: { onClose: () => void }) {
                     disabled={lyraEnabled() && enabledCount() === 1}
                     onChange={(e) => setLyraEnabled(e.currentTarget.checked)}
                   />
-                  <span>启用</span>
+                  <span>启用 Lyra</span>
                 </label>
               </div>
-              <span class="field-hint">Rust 原生 agent，不经 Node bridge；复用本机模型 provider 配置与 Skills。</span>
-              <ProxyField value={lyraProxy()} onInput={setLyraProxy} />
+              <details class="lyra-advanced">
+                <summary>网络代理<span class="field-hint">{lyraProxy().trim() ? "已配置" : "默认直连"}</span></summary>
+                <div class="lyra-detail-body">
+                  <ProxyField value={lyraProxy()} onInput={setLyraProxy} />
+                  <span class="field-hint">作为所有 Lyra 服务商的默认代理，可在服务商设置中单独覆盖。</span>
+                </div>
+              </details>
             </div>
 
             <LyraConfigPanel onSaver={(fn) => (saveLyraConfig = fn)} />
@@ -1813,6 +1849,34 @@ export function SettingsModal(props: { onClose: () => void }) {
                 </label>
               </div>
               <ProxyField value={codebuddyProxy()} onInput={setCodebuddyProxy} />
+            </div>
+
+            <div class="backend-card">
+              <div class="backend-card-head">
+                <span class="agent-badge workbuddy">{agentLabel("workbuddy")}</span>
+                <span class="fixed-integration">ACP</span>
+                <Show when={backendMissing("workbuddy")}>
+                  <span class="backend-missing">未检测到 CLI</span>
+                </Show>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={workbuddyEnabled()}
+                    disabled={workbuddyEnabled() && enabledCount() === 1}
+                    onChange={(e) => setWorkbuddyEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+              </div>
+              <CliManager status={cliStatuses().workbuddy} loading={cliLoading()} />
+              <div class="backend-fields">
+                <label class="backend-field">
+                  <span class="field-label">WorkBuddy 路径</span>
+                  <input class="field-input" value={workbuddyPath()} onInput={(e) => setWorkbuddyPath(e.currentTarget.value)} placeholder="留空自动查找 WorkBuddy" />
+                </label>
+              </div>
+              <ProxyField value={workbuddyProxy()} onInput={setWorkbuddyProxy} />
+              <p class="field-hint">直接启动 WorkBuddy 内置的 CodeBuddy ACP，复用其登录态，无需 WorkBuddy 保持运行；需先在 WorkBuddy 中登录过一次。留空自动查找 Windows 默认安装目录，也可填写安装目录、WorkBuddy.exe 或内置 CLI 路径；不会自动启动桌面程序。当前支持 Windows。</p>
             </div>
 
             <div class="backend-card">
@@ -1984,7 +2048,7 @@ export function SettingsModal(props: { onClose: () => void }) {
                   type="button"
                   class="btn secondary"
                   disabled={globalInstructionsLoading() || globalInstructionsBusy()}
-                  onClick={() => void syncGlobalInstructions()}
+                  onClick={() => void syncGlobalInstructions().catch((error) => setGlobalInstructionsMsg(`同步失败：${String(error)}`))}
                 >
                   {globalInstructionsBusy() ? "同步中…" : "保存并同步"}
                 </button>
@@ -2000,6 +2064,67 @@ export function SettingsModal(props: { onClose: () => void }) {
                 清空后同步会移除 Nova 创建的托管文件/区块，不会删除各后端原有的其它配置。正在运行的 Agent 需重启后读取新内容。
               </span>
             </label>
+
+            <div class="field">
+              <span class="field-label">提示词触发器</span>
+              <span class="field-hint">
+                类似 skill 的渐进披露：各后端只预载「触发条件」和正文文件路径，条件命中时 Agent 再读取并遵循对应提示词。随「保存并同步」一起写入。
+              </span>
+              <Index each={promptTriggers()}>
+                {(trigger, index) => (
+                  <div class="wt-row">
+                    <div class="wt-row-main">
+                      <input
+                        class="field-input"
+                        value={trigger().when}
+                        aria-label={`触发器 ${index + 1} 的触发条件`}
+                        placeholder="触发条件，例如：用户要求写周报或总结本周工作时"
+                        disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                        onInput={(event) => editPromptTrigger(index, { when: event.currentTarget.value })}
+                      />
+                      <button
+                        type="button"
+                        class="btn secondary"
+                        disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                        onClick={() => editPromptTrigger(index, null)}
+                      >
+                        删除
+                      </button>
+                    </div>
+                    <textarea
+                      class="field-input"
+                      rows={4}
+                      value={trigger().prompt}
+                      aria-label={`触发器 ${index + 1} 的提示词`}
+                      placeholder="命中后加载的提示词……"
+                      disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                      onInput={(event) => editPromptTrigger(index, { prompt: event.currentTarget.value })}
+                    />
+                  </div>
+                )}
+              </Index>
+              <div class="global-agent-actions">
+                <button
+                  type="button"
+                  class="btn secondary"
+                  disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                  onClick={() => {
+                    setPromptTriggers((list) => [...list, { when: "", prompt: "" }]);
+                    setGlobalInstructionsDirty(true);
+                  }}
+                >
+                  添加触发器
+                </button>
+                <button
+                  type="button"
+                  class="btn secondary"
+                  disabled={globalInstructionsLoading() || globalInstructionsBusy()}
+                  onClick={() => void syncGlobalInstructions().catch((error) => setGlobalInstructionsMsg(`同步失败：${String(error)}`))}
+                >
+                  {globalInstructionsBusy() ? "同步中…" : "保存并同步"}
+                </button>
+              </div>
+            </div>
 
             <div class="field">
               <span class="field-label">后端适配状态</span>
@@ -2215,70 +2340,6 @@ export function SettingsModal(props: { onClose: () => void }) {
                     </Show>
                   </div>
                 </Show>
-              </Show>
-            </div>
-
-            <div class="field">
-              <span class="field-label">共享模型额度</span>
-              <span class="field-hint">
-                每次添加一行；共享的模型会以“我的 Cursor”这类一级分类出现在队友的新会话模型选择器中。首次添加会安全同步并预热额度租约；移除后，旧缓存中的入口也无法再使用。
-              </span>
-              <Show
-                when={quotaShareKinds().length > 0}
-                fallback={<div class="sel-empty">暂无可共享的后端，请先在「后端」页启用。</div>}
-              >
-                <div class="share-list">
-                  <Index each={quotaSharedModels()}>
-                    {(key, index) => {
-                      const parsed = () => parseQuotaShareKey(key());
-                      return (
-                        <Show when={parsed()}>
-                          {(entry) => (
-                            <div class="share-row" title={key()}>
-                              <ModelPicker
-                                agentKind={entry().kind}
-                                agentKinds={quotaRowKinds(entry().kind)}
-                                model={entry().model}
-                                onPickModel={(kind, model) =>
-                                  replaceQuotaSharedModel(key(), kind, model)
-                                }
-                                title="共享模型"
-                                portal
-                              />
-                              <button
-                                type="button"
-                                class="icon-btn share-row-remove"
-                                title="移除该模型"
-                                aria-label="移除该模型"
-                                onClick={() => removeQuotaSharedModelAt(index)}
-                              >
-                                <IconX size={14} />
-                              </button>
-                            </div>
-                          )}
-                        </Show>
-                      );
-                    }}
-                  </Index>
-                  <Show when={quotaSharedModels().length === 0}>
-                    <div class="share-empty">尚未共享任何模型，用下方选择器添加一行。</div>
-                  </Show>
-                  <div class="share-row share-row-add">
-                    <ModelPicker
-                      agentKind={draftShareKind() ?? (quotaShareKinds()[0] ?? "cursor")}
-                      agentKinds={quotaShareKinds()}
-                      model={draftShareModel()}
-                      allowDefault
-                      defaultLabel="选择要共享的模型"
-                      onPickModel={(kind, model) => addQuotaSharedModel(kind, model)}
-                      title="添加共享模型"
-                      portal
-                    />
-                    <span class="share-row-plus" title="选择模型后自动加入列表">
-                      <IconPlus size={13} />
-                    </span>
-                  </div>
-                </div>
               </Show>
             </div>
           </Show>
@@ -2691,12 +2752,35 @@ export function SettingsModal(props: { onClose: () => void }) {
         </div>
 
         <div class="modal-foot">
-          <button class="btn secondary" onClick={props.onClose}>
-            取消
-          </button>
-          <button class="btn primary" disabled={saving()} onClick={() => void save()}>
-            {saving() ? "保存中…" : "保存"}
-          </button>
+          <Show
+            when={props.onboarding}
+            fallback={
+              <>
+                <button class="btn secondary" onClick={props.onClose}>
+                  取消
+                </button>
+                <button class="btn primary" disabled={saving()} onClick={() => void save()}>
+                  {saving() ? "保存中…" : "保存"}
+                </button>
+              </>
+            }
+          >
+            <Show
+              when={step() > 0}
+              fallback={
+                <button class="btn primary" disabled={saving()} onClick={() => void save(() => { setStep(1); setTab("scenes"); })}>
+                  {saving() ? "保存中…" : "下一步"}
+                </button>
+              }
+            >
+              <button class="btn secondary" disabled={saving()} onClick={() => { setStep(0); setTab("lyra"); }}>
+                上一步
+              </button>
+              <button class="btn primary" disabled={saving()} onClick={() => void save()}>
+                {saving() ? "保存中…" : "完成"}
+              </button>
+            </Show>
+          </Show>
         </div>
       </div>
 

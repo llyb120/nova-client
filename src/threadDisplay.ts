@@ -13,7 +13,7 @@ function isStageThread(thread: ThreadMeta): boolean {
 /**
  * 任务链分组锚点：多级 stage 链里各环节的 cwd 可能已被 agent 中途切换
  *（change_working_directory），侧栏分组若只向上一级找父会话，会把孙子会话
- * 分进另一组，组内找不到父节点而被当作链根，普通列表与室女座都裂成两条会话。
+ * 分进另一组，组内找不到父节点而被当作链根，侧栏列表裂成两条会话。
  * 返回该会话在 threads 内可见的最高祖先（父级不在列表或成环时停在当前会话）。
  */
 export function chainGroupAnchor(
@@ -51,6 +51,7 @@ export function latestFireStage(
   prefer: "running" | "unread" = "running",
   workflowStageId?: string,
 ): ThreadMeta | undefined {
+  if (root.subagent) return undefined;
   let latest = root;
   let running = isRunning?.(root.id) ? root : undefined;
   let unread: ThreadMeta | undefined;
@@ -60,7 +61,8 @@ export function latestFireStage(
   while (pending.length > 0) {
     const parentId = pending.shift()!;
     for (const thread of threads) {
-      if (thread.parentThreadId !== parentId || seen.has(thread.id)) continue;
+      // 并行子 Agent 仅供手动查看，不参与接力链自动选目标（含其子树）。
+      if (thread.subagent || thread.parentThreadId !== parentId || seen.has(thread.id)) continue;
       seen.add(thread.id);
       pending.push(thread.id);
       if (isRunning?.(thread.id) && (!running || thread.createdAt > running.createdAt)) {

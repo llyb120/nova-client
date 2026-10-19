@@ -12,9 +12,9 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 打包完整编辑单元、依赖和 IMPACT，一并返回。目标行段已明确时直接 read。";
+const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析。仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。目标行段已明确时直接按行段 read。";
 
-const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。";
+const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。禁止无排除的递归搜索（grep -r 等）。";
 const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 const WRITE_DESCRIPTION: &str =
@@ -65,8 +65,9 @@ pub fn tool_set(
                     },
                     "task": { "type": "string", "description": "一句话任务描述，用于补充检索词和排序" },
                     "files": { "type": "array", "items": { "type": "string" }, "maxItems": 6, "description": "已知必看文件，可与 keywords/task 同用" },
-                    "budget": { "type": "integer", "minimum": 100, "maximum": 1200, "description": "完整代码单元行预算；默认随 maxBytes 推导（32KB≈1024 行），一般不必传" },
-                    "maxBytes": { "type": "integer", "minimum": 8192, "maximum": 65536, "description": "输出硬预算，默认 32768；仅按完整文件/单元边界收敛" },
+                    "budget": { "type": "integer", "minimum": 100, "maximum": 1200, "description": "输出行预算；通常无需设置，不用于凑满输出" },
+                    "maxBytes": { "type": "integer", "minimum": 4096, "maximum": 65536, "description": "输出字节硬上限，默认 12288（12KB）；只返回高相关命中行与必要签名/定位，不凑满" },
+                    "deep": { "type": "boolean", "description": "默认 false，仅返回快速概览；确需递归依赖、别名调用及伴生测试时才开启（较慢）" },
                     "coupling": { "type": "boolean", "description": "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" }
                 }
             })),
@@ -86,8 +87,6 @@ pub fn tool_set(
         })),
     });
     if !read_only {
-        let webview = crate::native_browser::tool_definition();
-        tools.push(Tool { name: "webview", description: webview["description"].as_str().unwrap().into(), parameters: schema(webview["inputSchema"].clone()) });
         let desktop = crate::jianlai::tool_definition();
         tools.push(Tool { name: "jianlai", description: desktop["description"].as_str().unwrap().into(), parameters: schema(desktop["inputSchema"].clone()) });
         let employee = crate::employee::tool_definition();
@@ -258,7 +257,7 @@ fn compact_browser_result(value: &Value, max_bytes: usize) -> String {
             let mut fallback = json!({"contextCompacted":true,"evidenceOmitted":true,
                 "nextRead":"Read archivedToolOutput/documentPath before judging task completion."});
             for key in ["status","snapshotId","basedOnSnapshotId","documentPath","archivedToolOutput",
-                "images","coordinateSpace","tabTag","browserId","completedActions","verification","jev","jevRun"] {
+                "images","coordinateSpace","tabTag","browserId","completedActions","verification","vision","steps","altairRun"] {
                 if let Some(value) = compact.get(key) { fallback[key] = value.clone(); }
             }
             return fallback.to_string();
@@ -284,7 +283,7 @@ fn govern(
     }
     let (mut governed, archive_path, original_bytes) =
         govern_tool_text(&text, max_bytes, archive_dir, call_id, name);
-    if matches!(name, "chrome" | "webview" | "jianlai") {
+    if matches!(name, "chrome" | "jianlai") {
         if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
             if value.is_object() {
                 value["archivedToolOutput"] = json!(archive_path);
@@ -600,13 +599,6 @@ async fn execute_inner(
     owner: &str,
 ) -> ToolOutcome {
     match name {
-        "webview" => {
-            if shell.is_none() { return ToolOutcome::error("当前为只读模式，网页控制不可用"); }
-            match crate::native_browser::execute(root, args).await {
-                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
-                Err(error) => ToolOutcome::error(error),
-            }
-        }
         "chrome" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，Chrome 控制不可用"); }
             match crate::native_browser::execute_chrome(root, args, owner).await {
@@ -802,14 +794,18 @@ mod embedded_rtk_tests {
     async fn image_tools_work_without_polaris_and_are_blocked_in_read_only_mode() {
         for read_only in [false, true] {
             let tools = tool_set(read_only, false, false);
-            for name in ["generate_image", "edit_image", "jianlai"] {
+            for name in ["generate_image", "edit_image", "jianlai", "chrome"] {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
+            assert!(tools.iter().all(|tool| tool.name != "webview"));
         }
         let root = tempfile::tempdir().unwrap();
         let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, "test").await;
         assert!(result.is_error);
         assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
+        let removed = super::execute_inner(root.path(), "webview", &json!({}), Some(&crate::lyra::prompt::detect_shell()), None, "test").await;
+        assert!(removed.is_error);
+        assert_eq!(removed.content[0]["text"], "未知工具：webview");
     }
 
     #[test]
@@ -1100,18 +1096,18 @@ mod browser_governance_tests {
             let text=compact_browser_result(&value,TOOL_OUTPUT_CONTEXT_MAX_BYTES);
             assert!(text.len()<=TOOL_OUTPUT_CONTEXT_MAX_BYTES,"{}: {} bytes",path.display(),text.len());
             let summary:Value=serde_json::from_str(&text).unwrap();
-            for key in ["snapshotId","status","images","jevRun"] {
+            for key in ["snapshotId","status","images","altairRun"] {
                 assert_eq!(summary[key],value[key],"{}: {key}",path.display());
             }
             count+=1;
         }
         assert!(count>0);
-        println!("Replayed {count} browser archives: valid bounded JSON and preserved status, images, JEV decisions.");
+        println!("Replayed {count} browser archives: valid bounded JSON and preserved status, images, Altair decisions.");
     }
     #[test]
     fn browser_governance_preserves_json_decisions_and_table_counts() {
         let value = json!({"snapshotId":"s", "status":"executed", "images":[{"imageId":"s-0","pixelWidth":1600,"pixelHeight":719}],
-            "jevRun":{"requestCount":2,"executedActions":1,"decisions":[{"choice":"defer","requestAttempted":true}]},
+            "altairRun":{"requestCount":2,"executedActions":1,"decisions":[{"choice":"defer","requestAttempted":true}]},
             "pages":[{"text":"美国 Units".repeat(10000),"items":(0..200).map(|n|json!({"ref":n,"name":"目标".repeat(200)})).collect::<Vec<_>>(),
                 "tables":[{"headers":["Units"],"returnedRows":10,"totalRows":100,"rows":vec![vec!["100";16];10]}]}]});
         let dir=std::env::temp_dir().join(format!("nova-govern-{}",uuid::Uuid::new_v4()));
@@ -1119,7 +1115,7 @@ mod browser_governance_tests {
         let text=result.content[0]["text"].as_str().unwrap();
         assert!(text.len()<=TOOL_OUTPUT_CONTEXT_MAX_BYTES);
         let summary:Value=serde_json::from_str(text).unwrap();
-        assert_eq!(summary["jevRun"],value["jevRun"]);
+        assert_eq!(summary["altairRun"],value["altairRun"]);
         assert_eq!(summary["images"],value["images"]);
         assert_eq!(summary["pages"][0]["tables"][0]["totalRows"],100);
         let table=&summary["pages"][0]["tables"][0];

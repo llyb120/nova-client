@@ -101,6 +101,8 @@ pub struct ResolvedModel {
     /// 控制思考强度的协议字段。deepseek/zai 发 thinking.type；GLM-5.2+ / deepseek 同时发
     /// reasoning_effort。端点不支持时可用 options.supportsReasoningEffort 关掉。
     pub supports_reasoning_effort: bool,
+    /// 强制思考模型不能发送 disabled / none（标题与补全请求也必须遵守）。
+    pub supports_thinking_toggle: bool,
     /// 是否下发 thinking.clear_thinking（控制服务端是否抹掉历史 reasoning_content）。
     /// None 表示不下发、由端点默认值决定（GLM 标准端点默认 true=清除）；
     /// Some(false) 开启 Preserved Thinking，需同时回传 reasoning_content。
@@ -188,6 +190,12 @@ fn model_by_id<'a>(provider: &'a Value, model_id: &str) -> Option<&'a Value> {
     is_model_config(model).then_some(model)
 }
 
+/// provider.modelFilter：关键词（不分大小写、子串匹配、任一命中即保留）；仅影响选择器展示，已选模型照常可用。
+fn model_filter(provider: &Value) -> Vec<String> {
+    provider.get("modelFilter").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(Value::as_str).map(|k| k.trim().to_lowercase()).filter(|k| !k.is_empty()).collect()
+}
+
 /// 模型选择器枚举，与 alkaidModelOptions 输出保持一致。
 pub fn model_options(config: &Value) -> Vec<Value> {
     let mut out = Vec::new();
@@ -195,7 +203,11 @@ pub fn model_options(config: &Value) -> Vec<Value> {
         return out;
     };
     for (provider_id, provider) in providers {
+        let filter = model_filter(provider);
         for (model_id, model) in model_entries(provider) {
+            if !filter.is_empty() && !filter.iter().any(|k| model_id.to_lowercase().contains(k) || model.get("name").and_then(Value::as_str).is_some_and(|n| n.to_lowercase().contains(k))) {
+                continue;
+            }
             let value = format!("{provider_id}/{model_id}");
             let name = format!(
                 "{} / {}",
@@ -220,6 +232,9 @@ pub fn model_options(config: &Value) -> Vec<Value> {
             let meta = json!({
                 "codex.ai/supportsImages": supports_images,
                 "contextWindow": context_window,
+                "nova.ai/defaultReasoningEffort": model.pointer("/options/reasoningEffort")
+                    .or_else(|| provider.pointer("/options/reasoningEffort"))
+                    .and_then(Value::as_str).unwrap_or(""),
             });
             let variants: Vec<(&String, &Value)> = model
                 .get("variants")
@@ -245,46 +260,6 @@ pub fn model_options(config: &Value) -> Vec<Value> {
         }
     }
     out
-}
-
-/// 仅导出明确共享的模型；不携带其它 provider、模型或顶层私有配置。
-pub fn shared_config(config: &Value, selections: &[String], selected: &str) -> Result<Value, String> {
-    if !selections.iter().any(|value| value == selected) {
-        return Err("Lyra 模型已取消共享".into());
-    }
-    let available = model_options(config);
-    let mut providers = Map::new();
-    for selection in selections {
-        if !available.iter().any(|option| option["value"].as_str() == Some(selection)) {
-            if selection == selected {
-                return Err(format!("共享的 Lyra 模型不存在：{selected}"));
-            }
-            continue;
-        }
-        let (base, variant) = selection.rsplit_once("/variant/")
-            .map(|(base, variant)| (base, Some(variant))).unwrap_or((selection, None));
-        let (provider_id, model_id) = base.split_once('/').ok_or("Lyra 模型格式无效")?;
-        let source = &config["provider"][provider_id];
-        let mut model = model_by_id(source, model_id).ok_or("Lyra 模型不存在")?.clone();
-        let variant_config = variant.map(|name| model["variants"][name].clone());
-        model.as_object_mut().ok_or("Lyra 模型配置无效")?.remove("variants");
-        let provider = providers.entry(provider_id.to_string()).or_insert_with(|| {
-            let mut provider = source.clone();
-            provider["models"] = json!({});
-            // 借用方只用共享的模型，不再按预设自动拉取全部模型
-            if let Some(object) = provider.as_object_mut() {
-                object.remove("preset");
-            }
-            provider
-        });
-        let models = provider["models"].as_object_mut().ok_or("Lyra models 配置无效")?;
-        let entry = models.entry(model_id.to_string()).or_insert(model);
-        if let Some(name) = variant {
-            if entry.get("variants").is_none() { entry["variants"] = json!({}); }
-            entry["variants"][name] = variant_config.unwrap();
-        }
-    }
-    Ok(json!({ "model": selected, "provider": providers }))
 }
 
 pub fn default_model(config: &Value) -> Result<String, String> {
@@ -349,8 +324,12 @@ const RESERVED_OPTION_KEYS: &[&str] = &[
     "requiresReasoningContentOnAssistantMessages",
     "supportsLongCacheRetention",
     "supportsReasoningEffort",
+    "supportsThinkingToggle",
     "clearThinking",
     "proxy",
+    // 请求体的 tools 字段由实际启用的工具列表计算得出；放行会在无工具请求（如 Altair）时
+    // 把 body["tools"] 覆盖成非数组值，被网关拒绝（"tools must be an array"）。
+    "tools",
 ];
 
 /// 解析细粒度代理：model.options.proxy 覆盖 provider.options.proxy。
@@ -545,7 +524,8 @@ pub fn resolve_model(
             .and_then(|variant| variant.get("reasoningEffort"))
             .and_then(Value::as_str)
             .map(str::to_string)
-    });
+    }).or_else(|| model.pointer("/options/reasoningEffort").or_else(|| provider.pointer("/options/reasoningEffort"))
+        .and_then(Value::as_str).map(str::to_string));
     let reasoning = model
         .get("reasoning")
         .and_then(Value::as_bool)
@@ -598,13 +578,8 @@ pub fn resolve_model(
             }
         }
     }
-    // 保留历史思维链必须同时回传 reasoning_content，否则服务端拼不回原序列；
-    // 反向若确定要清除，回传只是白烧 input token。
-    let requires_reasoning_content = match clear_thinking {
-        Some(true) => false,
-        Some(false) => true,
-        None => requires_reasoning_content,
-    };
+    // clear_thinking 清除先前轮次，不免除当前工具调用链的 reasoning_content 回传要求。
+    let requires_reasoning_content = requires_reasoning_content || clear_thinking == Some(false);
     Ok(Resolved {
         model: ResolvedModel {
             provider: provider_id.to_string(),
@@ -639,6 +614,7 @@ pub fn resolve_model(
             },
             supports_long_cache_retention,
             supports_reasoning_effort,
+            supports_thinking_toggle: compat_flag(model, provider, "supportsThinkingToggle").unwrap_or(true),
             clear_thinking,
             extra_options,
             proxy: resolve_proxy(model, provider, env)?,
@@ -648,7 +624,7 @@ pub fn resolve_model(
     })
 }
 
-/// 额度共享导出：把配置中的 {env:NAME} 占位符解析为字面量。
+/// 把配置中的 {env:NAME} 占位符解析为字面量。
 pub fn resolve_config_env(value: &Value, env: &HashMap<String, String>) -> Result<Value, String> {
     match value {
         Value::String(text) => Ok(json!(resolve_env_string(text, env)?)),
@@ -672,28 +648,6 @@ pub fn resolve_config_env(value: &Value, env: &HashMap<String, String>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shared_config_limits_models_and_rejects_invalid_selection() {
-        let config = json!({"model":"p/other", "private":"secret", "provider": {
-            "p":{"api":"openai-completions", "options":{"baseURL":"http://localhost/v1", "apiKey":"key", "model":"wrong"},
-                "models":{"gemini/model":{"variants":{"low":{}, "high":{}}}, "other":{}}},
-            "private":{"options":{"apiKey":"private-key"}, "models":{"hidden":{}}}
-        }});
-        let selected = "p/gemini/model/variant/high";
-        let shared = shared_config(&config, &[selected.into()], selected).unwrap();
-        assert_eq!(model_options(&shared).len(), 1);
-        assert_eq!(default_model(&shared).unwrap(), selected);
-        assert!(shared.get("private").is_none());
-        assert!(shared["provider"].get("private").is_none());
-        assert!(shared["provider"]["p"]["models"].get("other").is_none());
-        let resolved = resolve_model(&shared, Some(selected), &HashMap::new()).unwrap();
-        assert_eq!(resolved.model.id, "gemini/model");
-        assert!(!resolved.model.extra_options.contains_key("model"));
-        assert!(resolve_model(&shared, Some("gpt"), &HashMap::new()).is_err());
-        assert!(resolve_model(&shared, Some("p/other"), &HashMap::new()).is_err());
-        assert!(shared_config(&config, &[selected.into()], "p/other").is_err());
-    }
 
     #[test]
     fn unknown_openai_proxy_defaults_match_legacy_pi() {
@@ -757,7 +711,7 @@ mod tests {
                 "custom": {
                     "name": "Command Code GOAT",
                     "npm": "@ai-sdk/openai-compatible",
-                    "options": { "baseURL": "http://127.0.0.1:8317/v1", "apiKey": "key" },
+                    "options": { "baseURL": "http://127.0.0.1:8317/v1", "apiKey": "key", "reasoningEffort": "high" },
                     "models": {
                         "qwen": {
                             "qwen3.8-flash": {
@@ -787,6 +741,34 @@ mod tests {
         let resolved = resolve_model(&config, None, &HashMap::new()).unwrap();
         assert_eq!(resolved.model.id, "qwen/qwen3.8-flash");
         assert_eq!(resolved.thinking_level.as_deref(), Some("max"));
+        assert!(model_options(&config).iter().all(|option| {
+            option["_meta"]["nova.ai/defaultReasoningEffort"] == "max"
+        }));
+        let mut inherited = config.clone();
+        inherited["provider"]["custom"]["models"]["qwen"]["qwen3.8-flash"]["options"] = json!({});
+        assert!(model_options(&inherited).iter().all(|option| {
+            option["_meta"]["nova.ai/defaultReasoningEffort"] == "high"
+        }));
+        inherited["provider"]["custom"]["options"].as_object_mut().unwrap().remove("reasoningEffort");
+        assert!(model_options(&inherited).iter().all(|option| {
+            option["_meta"]["nova.ai/defaultReasoningEffort"] == ""
+        }));
+    }
+
+    #[test]
+    fn model_filter_keeps_matching_models_case_insensitively() {
+        let mut config = json!({ "provider": { "p": {
+            "options": { "baseURL": "http://x" },
+            "models": { "GPT-5": {}, "claude-opus": { "name": "Opus" }, "gemini": {} }
+        } } });
+        let values = |c: &Value| model_options(c).iter().map(|o| o["value"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(values(&config).len(), 3);
+        config["provider"]["p"]["modelFilter"] = json!(["gpt", " OPUS ", ""]);
+        let mut kept = values(&config);
+        kept.sort();
+        assert_eq!(kept, ["p/GPT-5", "p/claude-opus"]);
+        config["provider"]["p"]["modelFilter"] = json!([]);
+        assert_eq!(values(&config).len(), 3);
     }
 
     #[test]
@@ -903,7 +885,8 @@ mod tests {
                         "baseURL": "https://api.z.ai/api/paas/v4",
                         "apiKey": "key",
                         "tool_stream": true,
-                        "thinking_format": "deepseek"
+                        "thinking_format": "deepseek",
+                        "tools": "auto"
                     },
                     "models": {
                         "glm": {
@@ -920,6 +903,8 @@ mod tests {
         // 内置键被消费，不会重复下发；snake 风格的 thinking_format 同样生效。
         assert!(!resolved.model.extra_options.contains_key("clearThinking"));
         assert!(!resolved.model.extra_options.contains_key("thinking_format"));
+        // tools 由实际工具列表计算,不允许 options 透传覆盖请求体顶层的 tools 字段。
+        assert!(!resolved.model.extra_options.contains_key("tools"));
         assert_eq!(resolved.model.thinking_format.as_deref(), Some("deepseek"));
         assert_eq!(resolved.model.clear_thinking, Some(false));
     }

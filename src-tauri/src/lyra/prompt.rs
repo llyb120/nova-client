@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 /// Reasonix 风格的单工具上下文预算；超限文本先归档再截断。
 pub const TOOL_OUTPUT_CONTEXT_MAX_BYTES: usize = 32 * 1024;
-/// polaris 有自己的完整单元预算（默认 32KB，显式上限 64KB）。
+/// polaris 默认快速概览有自己的输出预算（默认 12KB，显式上限 64KB）。
 pub const POLARIS_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// OpenAI Responses function_call_output.output 硬限制，预留截断提示空间。
 pub const OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS: usize = 10_485_760 - 512;
@@ -20,10 +20,10 @@ pub fn image_media_type(path: &str) -> Option<&'static str> {
         .unwrap_or_default()
         .to_lowercase();
     match ext.as_str() {
-        ".gif" => Some("image/gif"),
-        ".jpeg" | ".jpg" => Some("image/jpeg"),
-        ".png" => Some("image/png"),
-        ".webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "jpeg" | "jpg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
         _ => None,
     }
 }
@@ -166,13 +166,15 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "rate limit",
     "503",
     "service unavailable",
+    "no available accounts",
+    "please retry later",
     "timed out",
     "error sending request",
 ];
 
 pub fn is_retryable_provider_error(error: &str) -> bool {
     let message = error.to_lowercase();
-    RETRYABLE_FRAGMENTS
+    !is_context_window_error(error) && RETRYABLE_FRAGMENTS
         .iter()
         .any(|fragment| message.contains(fragment))
 }
@@ -190,11 +192,15 @@ pub fn is_context_window_error(error: &str) -> bool {
         "input is too long",
         "too many tokens",
         "request too large for model",
+        "request_too_large",
+        "payload too large",
     ]
     .iter()
     .any(|fragment| message.contains(fragment))
         // k3 等 provider 的超限文案形如 “k3-256k supports only 256K context.”。
         || (message.contains("supports only") && message.contains("context"))
+        // 输出预算被上下文挤占：只产出思考就擞上限，原样重试必然同样失败，应先收缩上下文。
+        || (message.contains("no actionable output") && message.contains("stop_reason=length"))
 }
 
 pub const PROVIDER_RETRY_DELAYS_MS: &[u64] = &[1_000, 3_000];
@@ -460,8 +466,8 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         options.auto_change_project.then_some(
             "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目",
         ),
-        Some("- read: 读取单个文件"),
-        (!read_only).then_some("- jianlai（剑来）: 通过真实鼠标键盘操作电脑，支持程序窗口或整个桌面截图"),
+        Some("- read: 读取单个文件（图片直接返回图像）"),
+        (!read_only && options.desktop).then_some("- jianlai（剑来）: 仅在必须操作图形界面时用真实鼠标键盘与截图操作电脑；本地文件/图片用 read，命令能拿到的用 bash，Chrome 网页用 chrome"),
         if read_only {
             None
         } else {
@@ -473,7 +479,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             })
         },
         polaris.then_some(
-            "- polaris: 一次打包完整编辑单元 + 依赖定义 + IMPACT/SIG（内部批量 rg + 增量符号索引）",
+            "- polaris: 默认快速概览，每处1–2行命中+必要签名/定位及 IMPACT/SIG；不递归依赖、不追踪别名调用或 Git 历史，正文按需 read 补读；仅确需深度关系时传 deep=true（较慢）；默认12KB硬上限、不凑满，不自动展开完整函数",
         ),
         if read_only {
             None
@@ -489,13 +495,13 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         format!("Available tools:\n{}", tool_lines.join("\n")),
 
         if polaris {
-            "你拥有 Lyra 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 polaris。任务涉及跨文件查找或修改（含分析要改哪里）且现有上下文不足时，先调用一次 polaris；已展示且未失效的上下文足够时直接回答或修改，不重复检索；一次调用通常替代 5–10 轮 rg+read 往返。拿不准修改位置且现有上下文不足时先调用 polaris；优先传用户明确提到的模块名、符号和文件路径，不堆叠猜测的泛词。定位后仍需阅读两个及以上文件正文时，把文件清单传给 polaris 的 files 一次打包，不要逐个 read。已展示范围视为已读，SIG/IMPACT 仅在确需函数体时按 path:line 精确补读；大文件禁止无目的全量读取。修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。编辑已有文件时，只要 oldText 能引用 polaris 已展示内容、上次 edit 返回的 diff 或用户消息原文，就跳过 read 直接 edit：edit 是原子操作，失败报错会给出最接近匹配的真实内容与行号，据此修正一次即可。edit 结果已含 diff 与变更后内容，禁止为确认改动重复 read 同一文件。无相互依赖的 bash 步骤（多个探测、git add/commit/push 串联等）合并为一条命令一次发起，不要拆成多轮串行调用。"
+            "你拥有 Lyra 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 polaris。任务涉及跨文件查找或修改（含分析要改哪里）且现有上下文不足时，先调用一次 polaris；已展示且未失效的上下文足够时直接回答或修改，不重复检索；一次调用通常替代 5–10 轮 rg+read 往返。拿不准修改位置且现有上下文不足时先调用 polaris；优先传用户明确提到的模块名、符号和文件路径，不堆叠猜测的泛词。定位后仍需阅读两个及以上文件正文时，把文件清单传给 polaris 的 files 一次打包，不要逐个 read。仅实际展示的行段视为已读，依赖/SIG/IMPACT 仅在确需正文时按 path:line 精确补读；大文件禁止无目的全量读取。修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。编辑已有文件时，只要 oldText 能引用 polaris 已展示内容、上次 edit 返回的 diff 或用户消息原文，就跳过 read 直接 edit：edit 是原子操作，失败报错会给出最接近匹配的真实内容与行号，据此修正一次即可。edit 结果已含 diff 与变更后内容，禁止为确认改动重复 read 同一文件。无相互依赖的 bash 步骤（多个探测、git add/commit/push 串联等）合并为一条命令一次发起，不要拆成多轮串行调用。"
         } else {
             "你拥有 Lyra 的原生 read、bash、edit、write 工具。未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；大文件禁止无目的全量读取。修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再发起。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。编辑已有文件时，只要 oldText 能引用对话中已有内容（搜索结果、上次 edit 返回的 diff、用户消息原文），就跳过 read 直接 edit：edit 是原子操作，失败报错会给出最接近匹配的真实内容与行号，据此修正一次即可。edit 结果已含 diff 与变更后内容，禁止为确认改动重复 read 同一文件。无相互依赖的 bash 步骤（多个探测、git add/commit/push 串联等）合并为一条命令一次发起，不要拆成多轮串行调用。"
         }
         .into(),
         if polaris {
-            "搜索与遍历必须成本有界。路径和行段已明确且只需少量行段时直接 read；任务涉及跨文件查找或修改（含分析要改哪里）且现有上下文不足时，先调用一次 polaris（完整 EDIT/DEPS 单元 + IMPACT/SIG；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返）。polaris 已展示范围视为已读；SIG/IMPACT 仅在确需函数体时精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调；返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要退回 rg/grep 逐个搜索。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。"
+            "搜索与遍历必须成本有界。路径和行段已明确且只需少量行段时直接 read；任务涉及跨文件查找或修改（含分析要改哪里）且现有上下文不足时，先调用一次 polaris（高相关命中行（每处1–2行）+必要签名/定位及 IMPACT/SIG；依赖默认仅签名/位置，按需 read 补读；默认12KB硬上限、不凑满；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返）。polaris 仅实际展示的行段视为已读；依赖/SIG/IMPACT 仅在确需正文时按 path:line 精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调；返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要退回 rg/grep 逐个搜索。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。"
         } else {
             "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。"
         }
@@ -546,6 +552,8 @@ pub struct SystemPromptOptions {
     pub skills_text: String,
     pub custom_instructions: String,
     pub ponytail: bool,
+    /// 自动模式非剑来场景不提供桌面工具。
+    pub desktop: bool,
 }
 
 #[cfg(test)]
@@ -563,9 +571,11 @@ mod tests {
             skills_text: String::new(),
             custom_instructions: String::new(),
             ponytail: false,
+            desktop: false,
         };
         let prompt = build_system_prompt(&options);
         assert!(!prompt.contains("change_working_directory"));
+        assert!(!prompt.contains("jianlai"));
     }
 
     #[test]
@@ -596,6 +606,9 @@ mod tests {
         assert!(is_retryable_provider_error("HTTP 429 too many requests"));
         assert!(is_retryable_provider_error(
             "Lyra provider 请求失败：HTTP 503 Service Unavailable"
+        ));
+        assert!(is_retryable_provider_error(
+            "Lyra provider 请求失败：Anthropic 流错误：No available accounts, please retry later"
         ));
         assert!(is_retryable_provider_error("connection error: ECONNRESET"));
         assert!(is_retryable_provider_error(
@@ -633,7 +646,7 @@ mod tests {
 
 #[cfg(test)]
 mod context_error_tests {
-    use super::is_context_window_error;
+    use super::{is_context_window_error, is_retryable_provider_error};
 
     #[test]
     fn recognizes_provider_context_limit_errors() {
@@ -645,9 +658,15 @@ mod context_error_tests {
         ));
         assert!(is_context_window_error("Prompt is too long"));
         assert!(is_context_window_error(
+            "HTTP 413 Payload Too Large：{\"error\":{\"code\":\"request_too_large\",\"message\":\"请求体过大\"}}"
+        ));
+        assert!(is_context_window_error(
             "HTTP 401 Unauthorized: {\"error\":{\"message\":\"k3-256k supports only 256K context.\",\"type\":\"invalid_authentication_error\"}}"
         ));
         assert!(!is_context_window_error("connection reset by peer"));
+        let squeezed = "provider returned no actionable output: 模型未返回正文或工具调用（可能仅有思考内容，stop_reason=length）";
+        assert!(is_context_window_error(squeezed) && !is_retryable_provider_error(squeezed));
+        assert!(is_retryable_provider_error(&squeezed.replace("length", "stop")));
         assert!(!is_context_window_error("this model supports only text input"));
     }
 }

@@ -907,6 +907,7 @@ fn config(app: &AppHandle) -> Option<RemoteConfig> {
             &s.codex_proxy,
             &s.codebuddy_proxy,
             &s.cursor_proxy,
+            &s.workbuddy_proxy,
         ]
         .into_iter()
         .map(|p| p.trim())
@@ -1007,6 +1008,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         AgentKind::Codex,
         AgentKind::CodeBuddy,
         AgentKind::Cursor,
+        AgentKind::WorkBuddy,
     ] {
         if !state.agent_enabled(&kind) {
             continue;
@@ -1028,6 +1030,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
             AgentKind::Claude => state.claude.get_model_options(),
             AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.get_model_options(),
+            AgentKind::WorkBuddy => state.workbuddy.get_model_options(),
             AgentKind::Cursor => state.cursorplus.get_model_options(),
         }
         .unwrap_or_else(|| json!({ "configOptions": [], "modes": null }));
@@ -1926,9 +1929,6 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
-        if thread.is_quota_borrowed() && !cmd.agent_kind.trim().is_empty() {
-            return Err("额度租借会话的后端已绑定；请重新发起租借以切换后端".into());
-        }
         if is_running(&state, thread) {
             return Err("请先停止当前轮次再切换模型或模式".into());
         }
@@ -1996,6 +1996,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
                 state.codebuddy.forget_session_of_thread(&cmd.thread_id)
             }
+            AgentKind::WorkBuddy => state.workbuddy.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
         }
@@ -2020,6 +2021,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
                 state.codebuddy.forget_session_of_thread(&cmd.thread_id)
             }
+            AgentKind::WorkBuddy => state.workbuddy.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
         }
     }
@@ -2035,17 +2037,9 @@ async fn respond_remote_permission(
         return Err("缺少权限请求标识".into());
     }
     let state = app.state::<AppState>();
-    let borrowed = state
-        .borrowed_runtimes
-        .lock()
-        .unwrap()
-        .values()
-        .find(|runtime| runtime.has_pending_permission(request_key))
-        .cloned();
-    if let Some(runtime) = borrowed {
-        return runtime.respond_permission(request_key, option_id).await;
-    }
-    if request_key.starts_with("claude-") {
+    if state.workbuddy.has_pending_permission(request_key) {
+        state.workbuddy.respond_permission(request_key, option_id).await
+    } else if request_key.starts_with("claude-") {
         state.claude.respond_permission(request_key, option_id).await
     } else if request_key.starts_with("kimi-") {
         state.kimi.respond_permission(request_key, option_id).await
@@ -2520,7 +2514,7 @@ pub(crate) fn route_fire_command(
         let state = app.state::<AppState>();
         let store = state.store.lock().unwrap();
         let thread = store.get(thread_id).ok_or("会话不存在")?;
-        if thread.roaming_role.is_some() || thread.quota_peer_name.is_some() {
+        if thread.roaming_role.is_some() {
             return Err("/fire 仅支持本地普通会话".into());
         }
         if is_running(&state, thread) {
@@ -2623,6 +2617,7 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         AgentKind::Claude => state.claude.cancel(thread_id).await,
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.cancel(thread_id).await,
+        AgentKind::WorkBuddy => state.workbuddy.cancel(thread_id).await,
         AgentKind::Cursor => state.cursorplus.cancel(thread_id).await,
     };
     Ok(())

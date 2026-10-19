@@ -1,14 +1,25 @@
 import { onCleanup, onMount } from "solid-js";
+import { api } from "./ipc";
 import { ALL_AGENT_KINDS, state } from "./store";
 import type { AgentKind, SessionShortcut, SessionShortcutAction } from "./types";
 
 const MODIFIER_KEYS = new Set(["Control", "Shift", "Alt", "Meta", "OS"]);
 
-/** Settings 正在录制快捷键时置位，避免运行时监听抢先处理。 */
+/** 仅暂停页面内快捷键；普通弹窗不能禁用前台 Meteor。 */
 let shortcutCaptureActive = false;
+let shortcutRecordingActive = false;
 
 export function setShortcutCaptureActive(active: boolean) {
   shortcutCaptureActive = active;
+}
+
+/** 只有真正录制组合键时才暂停原生 Meteor；false 也用于页面重载后清除残留状态。 */
+export function setShortcutRecordingActive(active: boolean) {
+  if (active && shortcutRecordingActive) return;
+  shortcutRecordingActive = active;
+  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+    void api.setMeteorShortcutRecording(active).catch((error) => console.error("Meteor shortcut capture", error));
+  }
 }
 
 export function newSessionShortcutId(): string {
@@ -17,41 +28,23 @@ export function newSessionShortcutId(): string {
     : `sc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-/** 内置：Esc 终止当前回合（非设置项，用户配置一律忽略）。 */
-export const BUILTIN_STOP_SESSION_SHORTCUT: SessionShortcut = {
-  id: "default-stop-session",
-  keys: "Escape",
-  action: "stopSession",
-  target: "",
-};
-
 export const DEFAULT_TERMINAL_SHORTCUT: SessionShortcut = {
   id: "default-toggle-terminal", keys: "Ctrl+`", action: "toggleTerminal", target: "",
 };
-/** 默认终端按键和 Esc；已配置同动作或占用同按键时尊重用户设置。 */
+/** 默认终端按键；已配置同动作或占用同按键时尊重用户设置。 */
 export function withDefaultSessionShortcuts(
   shortcuts: SessionShortcut[],
 ): SessionShortcut[] {
   return [
-    ...shortcuts.filter((item) => item.action !== "stopSession"),
+    ...shortcuts,
     ...(!shortcuts.some(item => item.action === "toggleTerminal" ||
       ["ctrl+`", "ctrl+~", "ctrl+shift+~", "ctrl+shift+`"].includes(item.keys.trim().toLowerCase()))
       ? [{ ...DEFAULT_TERMINAL_SHORTCUT }] : []),
-    { ...BUILTIN_STOP_SESSION_SHORTCUT },
   ];
 }
 
 export function encodeModelTarget(agentKind: AgentKind, model: string): string {
   return `${agentKind}:${encodeURIComponent(model)}`;
-}
-
-/** 额度租借模型：与 ModelPicker 的 quota: 编码一致。 */
-export function encodeQuotaModelTarget(
-  peerToken: string,
-  agentKind: AgentKind,
-  model: string,
-): string {
-  return `quota:${encodeURIComponent(peerToken)}:${agentKind}:${encodeURIComponent(model)}`;
 }
 
 /** 漫游目录：`roam:<token>:<folder>`，folder 经 encodeURIComponent。 */
@@ -78,21 +71,7 @@ export function parseRoamTarget(
 
 export function parseModelTarget(
   target: string,
-): { agentKind: AgentKind; model: string; peerToken?: string } | null {
-  if (target.startsWith("quota:")) {
-    const parts = target.split(":");
-    if (parts.length !== 4) return null;
-    const agentKind = parts[2] as AgentKind;
-    if (!ALL_AGENT_KINDS.includes(agentKind)) return null;
-    try {
-      const peerToken = decodeURIComponent(parts[1]);
-      const model = decodeURIComponent(parts[3]);
-      if (!peerToken || !model) return null;
-      return { peerToken, agentKind, model };
-    } catch {
-      return null;
-    }
-  }
+): { agentKind: AgentKind; model: string } | null {
   const i = target.indexOf(":");
   if (i <= 0) return null;
   const agentKind = target.slice(0, i) as AgentKind;
@@ -162,11 +141,7 @@ export function mountSessionShortcuts(options: {
     path: string,
     roam?: { peerToken: string; folder: string } | null,
   ) => void;
-  onSelectModel?: (
-    agentKind: AgentKind,
-    model: string,
-    quotaPeer?: { token: string; name: string } | null,
-  ) => void;
+  onSelectModel?: (agentKind: AgentKind, model: string) => void;
   onNewSession?: () => void;
   /** 循环打开普通模式下有未读轮次的会话。 */
   onOpenUnread?: () => void;
@@ -179,14 +154,10 @@ export function mountSessionShortcuts(options: {
    * false 表示仅在输入框已聚焦时处理（避免抢走其它可编辑区的无修饰键输入）。
    */
   onInsertText?: (text: string, mayFocus: boolean) => boolean;
-  /** 返回 true 表示已终止当前回合（例如正在运行且未被其它 Esc 用途占用）。 */
-  onStopSession?: () => boolean;
-  /** 返回 true 表示已收起运行中的会话：当前优先，否则取首个尚未隐藏的会话。 */
-  onHideToVirgo?: () => boolean;
 }): void {
   const allowed = new Set(options.allowedActions);
   const onKeyDown = (event: KeyboardEvent) => {
-    if (shortcutCaptureActive || event.defaultPrevented || event.isComposing || event.repeat) {
+    if (shortcutCaptureActive || shortcutRecordingActive || event.defaultPrevented || event.isComposing || event.repeat) {
       return;
     }
     const shortcuts = withDefaultSessionShortcuts(state.settings?.sessionShortcuts ?? []);
@@ -200,16 +171,13 @@ export function mountSessionShortcuts(options: {
       hit.action !== "newSession" &&
       hit.action !== "openUnread" &&
       hit.action !== "toggleTerminal" &&
-      hit.action !== "hideToVirgo" &&
-      hit.action !== "stopSession" &&
       !hit.target
     ) {
       return;
     }
-    // insertText / stopSession 允许无修饰键；其它动作在可编辑区需 Ctrl/Alt/Meta。
+    // insertText 允许无修饰键；其它动作在可编辑区需 Ctrl/Alt/Meta。
     if (
       hit.action !== "insertText" &&
-      hit.action !== "stopSession" &&
       isEditableTarget(event.target) &&
       !shortcutHasModifier(hit.keys)
     ) {
@@ -221,13 +189,6 @@ export function mountSessionShortcuts(options: {
       // 无修饰键的快捷键只作用于已聚焦的输入框，避免抢走其它可编辑区的正常输入。
       const mayFocus = !(isEditableTarget(event.target) && !shortcutHasModifier(hit.keys));
       const handled = options.onInsertText?.(hit.target, mayFocus) ?? false;
-      if (!handled) return;
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-    if (hit.action === "stopSession") {
-      const handled = options.onStopSession?.() ?? false;
       if (!handled) return;
       event.preventDefault();
       event.stopPropagation();
@@ -254,13 +215,6 @@ export function mountSessionShortcuts(options: {
       options.onOpenUnread?.();
       return;
     }
-    if (hit.action === "hideToVirgo") {
-      const handled = options.onHideToVirgo?.() ?? false;
-      if (!handled) return;
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
     if (hit.action === "selectProject") {
       event.preventDefault();
       event.stopPropagation();
@@ -277,13 +231,7 @@ export function mountSessionShortcuts(options: {
       if (!parsed) return;
       event.preventDefault();
       event.stopPropagation();
-      const quotaPeer = parsed.peerToken
-        ? {
-            token: parsed.peerToken,
-            name: state.peers.find((peer) => peer.token === parsed.peerToken)?.name ?? "队友",
-          }
-        : null;
-      options.onSelectModel?.(parsed.agentKind, parsed.model, quotaPeer);
+      options.onSelectModel?.(parsed.agentKind, parsed.model);
     }
   };
 

@@ -24,12 +24,28 @@ test('native downloads expose progress, interruption and completion without tab 
   for(const args of [{since:-1},{since:'1'},{since:8640000000000001},{downloadId:'oops'},{downloadId:'9007199254740992'},{incognito:'true'}])await assert.rejects(scope.run(args));
   assert.equal(calls,4,'invalid inputs must not query or trigger downloads');
   delete chrome.downloads;await assert.rejects(scope.run({}),/0\.1\.6/);
-  for(const name of ['chrome','webview']) {
-    const schema=JSON.parse(await readFile(new URL(`../../scripts/${name}-tool.json`,import.meta.url),'utf8'));
-    assert.ok(schema.inputSchema.properties.operation.enum.includes('downloads'));
-    assert.equal(schema.inputSchema.properties.downloadId.type,'string');
-    assert.match(schema.description,/只有state=complete才算完成/);
-  }
+  const schema=JSON.parse(await readFile(new URL('../../scripts/chrome-tool.json',import.meta.url),'utf8'));
+  assert.ok(schema.inputSchema.properties.operation.enum.includes('downloads'));
+  assert.equal(schema.inputSchema.properties.downloadId.type,'string');
+  assert.match(schema.description,/只有state=complete才算完成/);
+});
+
+test('screenshots reveal a minimized window or background tab instead of hanging',async()=>{
+  const event=()=>({addListener(){}});const calls=[];
+  let win={id:5,state:'minimized'};const tab={id:11,windowId:5,url:'https://example.com',active:false};
+  const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},
+    tabs:{query:async()=>[tab],get:async()=>({...tab}),update:async(id,props)=>{calls.push(['tab',id,props]);Object.assign(tab,props);},onRemoved:event(),onReplaced:event()},
+    windows:{get:async()=>({...win}),update:async(id,props)=>{calls.push(['window',id,props]);win={...win,...props};}},
+    debugger:{attach:async()=>{},sendCommand:async(_t,method)=>{calls.push(['cdp',method]);return {data:'png'};},onEvent:event(),onDetach:event()},
+    runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+
+    '\nglobalThis.run=async method=>execute({operation:"cdp",args:{tabTag:(await inventory())[0].tag,method},expiresAt:Date.now()+3000});',scope);
+  assert.equal((await scope.run('Page.captureScreenshot')).data,'png');
+  // JSON compare: objects created inside the vm context have a different prototype.
+  assert.equal(JSON.stringify(calls),JSON.stringify([['window',5,{state:'normal'}],['tab',11,{active:true}],['cdp','Page.captureScreenshot']]));
+  calls.length=0;await scope.run('Page.captureScreenshot');await scope.run('Runtime.evaluate');
+  assert.equal(JSON.stringify(calls),JSON.stringify([['cdp','Page.captureScreenshot'],['cdp','Runtime.evaluate']]),'visible tabs and other commands are left alone');
 });
 
 test('a stuck debugger command times out, polling resumes and late results are not replayed',async()=>{

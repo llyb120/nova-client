@@ -1,5 +1,5 @@
-﻿import { message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { message } from "@tauri-apps/plugin-dialog";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
 
 import { api } from "../ipc";
 import { latestFireStage } from "../threadDisplay";
@@ -11,11 +11,10 @@ import {
 } from "../promptHistory";
 import {
   createRoamingThread,
-  createQuotaThread,
   createThread,
   createThreadOptimistic,
+  sceneModel,
   clearPendingClueCard,
-  clearQuotaRoamingProgress,
   enabledAgentKinds,
   ensureModelOptions,
   ensurePeerBranches,
@@ -25,11 +24,9 @@ import {
   peerBranchKey,
   modelChoices,
   openThread,
-  preloadPeerModels,
   refreshSlashCommands,
   resolveAvailableModel,
   resolveEnabledAgentKind,
-  quotaPeers,
   roamingPeers,
   sendPrompt,
   setView,
@@ -38,8 +35,6 @@ import {
   startWorkflowOnThread,
   takePendingNewSessionSeed,
   assertBuiltinPrompt,
-  virgoHiddenThreads,
-  zenRunningChains,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import { setHomeTerminalCwd } from "../workspaceLayout";
@@ -50,7 +45,7 @@ import { enabledWorkflows } from "../workflow/storage";
 import { peerWorkflows } from "../workflow/roaming";
 import { roamingWorkflowPrompt } from "../workflow/roamingProtocol";
 import type { WorkflowDef } from "../workflow/types";
-import { ConfigSelects, type QuotaModelPeer, type SharedModelSource } from "./ConfigSelects";
+import { ConfigSelects } from "./ConfigSelects";
 import { IconClue, IconFile, IconFolder, IconLogo, IconMerge, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { HaibaraBubble } from "./HaibaraBubble";
@@ -61,6 +56,7 @@ import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 import { TypewriterText } from "./TypewriterText";
 
 const LAST_NEW_THREAD_PROJECT_KEY = "fd:lastNewThreadProject";
+const AUTO_MODE_KEY = "fd:newThreadAutoMode";
 
 /** codex 风格草稿首页：输入任务 + 选择项目/模型/模式，回车即开干 */
 export function HomeView() {
@@ -85,8 +81,13 @@ export function HomeView() {
   const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(agentKind()));
   const [mode, setMode] = createSignal("build");
   const [busy, setBusy] = createSignal(false);
+  // 自动模式：按提示词自动选择项目目录与场景模型；场景模型配置只在此模式下用于新会话。
+  const [auto, setAuto] = createSignal(localStorage.getItem(AUTO_MODE_KEY) === "1");
+  const toggleAuto = (on: boolean) => {
+    setAuto(on);
+    localStorage.setItem(AUTO_MODE_KEY, on ? "1" : "0");
+  };
   const [roam, setRoam] = createSignal<{ peer: Peer; folder: string } | null>(null);
-  const [quotaPeer, setQuotaPeer] = createSignal<Peer | null>(null);
   // 漫游选择对端工作流，只发送标识和目标，由对端读取定义并执行。
   const [workflowMenuOpen, setWorkflowMenuOpen] = createSignal(false);
   const [selectedWorkflowId, setSelectedWorkflowId] = createSignal<string | null>(null);
@@ -109,7 +110,6 @@ export function HomeView() {
     ? peerWorkflows()[roam()!.peer.token]?.find((workflow) => workflow.id === selectedWorkflowId())
     : undefined;
   const selectedWorkflowName = () => selectedPeerWorkflow()?.name ?? selectedWorkflow()?.name;
-  const [quotaCancelling, setQuotaCancelling] = createSignal(false);
   // worktree：在独立 git worktree（分支 + 工作目录）中执行，不干扰主工作区正在进行的任务。
   // 通过 Alt+Enter 或工具条按钮弹窗填分支名后创建（不占用输入行空间）。
   const [cwdIsRepo, setCwdIsRepo] = createSignal(false);
@@ -155,7 +155,6 @@ export function HomeView() {
 
   createEffect(() => {
     roam()?.peer.token;
-    quotaPeer();
     setWorkflowMenuOpen(false);
     setSelectedWorkflowId(null);
   });
@@ -265,7 +264,7 @@ export function HomeView() {
   });
 
   const prewarmCurrent = (target: PrewarmTarget = {}) => {
-    if (!state.settings || roam() || quotaPeer()) return;
+    if (!state.settings || roam()) return;
     const p = target.cwd ?? cwd();
     if (!p) return;
     const nextAgentKind = target.agentKind ?? agentKind();
@@ -292,7 +291,7 @@ export function HomeView() {
 
   // 恢复项目/草稿和切换模式也要预热，把用户阅读、输入的时间用于启动 ACP。
   createEffect(() => {
-    if (!state.settings || roam() || quotaPeer()) return;
+    if (!state.settings || roam()) return;
     const target = { cwd: cwd(), agentKind: agentKind(), model: model(), mode: mode() };
     if (!target.cwd) return;
     const timer = setTimeout(() => prewarmCurrent(target), 150);
@@ -315,21 +314,7 @@ export function HomeView() {
     }
   };
   // 三级菜单一次性提交「后端 + 模型」：跨后端时切后端，同后端时仅换模型
-  const pickModelCombined = (next: AgentKind, m: string, borrowed?: QuotaModelPeer | null) => {
-    if (borrowed) {
-      const peer = quotaPeers().find((item) => item.token === borrowed.token);
-      if (!peer) return;
-      setRoam(null);
-      setQuotaPeer(peer);
-      setAgentKind(next);
-      setModel(m);
-      setMode("build");
-      void api
-        .prepareQuotaLease(peer.token, next, m)
-        .catch((error) => console.warn("额度租约预热失败", error));
-      return;
-    }
-    setQuotaPeer(null);
+  const pickModelCombined = (next: AgentKind, m: string) => {
     if (next === agentKind()) {
       pickModel(m);
       return;
@@ -345,7 +330,6 @@ export function HomeView() {
 
   // ===== 漫游：用对端（host）的模型列表，而不是本机的（本机模型对方可能没有）=====
   const roaming = () => !!roam();
-  const quotaBorrowing = () => !!quotaPeer();
   const usesPeerModels = () => roaming();
   const roamPeerToken = () => roam()?.peer.token ?? null;
   const peerModels = () => {
@@ -359,17 +343,9 @@ export function HomeView() {
     usesPeerModels() ? peerModels()?.backends ?? [] : enabledAgentKinds();
   // 模型选项来源：漫游取对端列表（缺失返回 null → 空列表），否则用本机全局
   const peerModelSource = (k: AgentKind) => peerModels()?.options[k] ?? null;
-  const quotaSharedModelSources = createMemo<SharedModelSource[]>(() =>
-    quotaPeers()
-      .map((peer) => ({
-        peer: { token: peer.token, name: peer.name },
-        options: state.peerModels[peer.token]?.sharedOptions ?? {},
-      }))
-      .filter((source) => Object.keys(source.options).length > 0),
-  );
   // 空值才落到可用项；已有选择即使暂不在列表也保留（Cursor 目录未就绪等中间态不应重置成 Auto）。
   createEffect(() => {
-    if (usesPeerModels() || quotaBorrowing()) return;
+    if (usesPeerModels()) return;
     const choices = modelChoices(agentKind());
     if (choices.length === 0) return;
     const current = model();
@@ -419,24 +395,24 @@ export function HomeView() {
 
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => {
-    if (!usesPeerModels() && !quotaBorrowing()) void ensureModelOptions(agentKind());
+    if (!usesPeerModels()) void ensureModelOptions(agentKind());
   });
 
   // 当前选中的后端若被设置里关闭，回退到第一个启用的后端（漫游时后端由对端决定，跳过）
   createEffect(() => {
-    if (usesPeerModels() || quotaBorrowing()) return;
+    if (usesPeerModels()) return;
     const next = resolveEnabledAgentKind(agentKind());
     if (next !== agentKind()) pickModelAgent(next);
   });
 
   // worktree 是否可用：漫游（对方仓库交给 host 校验）或本地当前目录是 git 仓库
-  const worktreeAvailable = () => roaming() || (!quotaBorrowing() && cwdIsRepo());
+  const worktreeAvailable = () => roaming() || cwdIsRepo();
 
   // 本地会话：判断当前目录是否 git 仓库（决定 worktree 开关可用性）。
   // 漫游目录在对方机器上，无法本地判断，统一按可用处理、交由 host 校验。
   createEffect(() => {
     const dir = cwd();
-    if (usesPeerModels() || quotaBorrowing() || !dir) {
+    if (usesPeerModels() || !dir) {
       setCwdIsRepo(false);
       return;
     }
@@ -487,8 +463,8 @@ export function HomeView() {
         void message("该工作流已删除或已停用，请在设置里重新选择。", { kind: "error" });
         return;
       }
-      if (roam() || quotaPeer()) {
-        void message("漫游与额度会话不支持工作流，请先取消漫游/额度。", { kind: "error" });
+      if (roam()) {
+        void message("漫游会话不支持工作流，请先取消漫游。", { kind: "error" });
         return;
       }
       setSelectedWorkflowId(workflowId);
@@ -504,7 +480,6 @@ export function HomeView() {
           void message(`对方未共享该目录：${roam.folder}`, { kind: "error" });
           return;
         }
-        setQuotaPeer(null);
         setRoam({ peer, folder: roam.folder });
         ensurePeerModels(peer.token, true);
         return;
@@ -521,13 +496,7 @@ export function HomeView() {
         selectProject(path);
       })();
     },
-    onSelectModel: (next, modelId, quotaPeer) => {
-      if (quotaPeer && !quotaPeers().some((peer) => peer.token === quotaPeer.token)) {
-        void message(`队友不在线，无法使用共享模型：${quotaPeer.name}`, { kind: "error" });
-        return;
-      }
-      pickModelCombined(next, modelId, quotaPeer);
-    },
+    onSelectModel: pickModelCombined,
   });
 
   const ensureScratchProject = () => {
@@ -567,7 +536,6 @@ export function HomeView() {
         peer?.online &&
         peer.folders.some((folder) => folder.path === sessionSeed.roam!.folder)
       ) {
-        setQuotaPeer(null);
         setRoam({ peer, folder: sessionSeed.roam.folder });
         ensurePeerModels(peer.token, true);
         return;
@@ -577,21 +545,18 @@ export function HomeView() {
     }
     if (sessionSeed.cwd) selectProject(sessionSeed.cwd);
     else void restoreLastProject();
-    if (sessionSeed.quotaPeerToken) {
-      const peer = quotaPeers().find((item) => item.token === sessionSeed.quotaPeerToken);
-      if (peer) {
-        pickModelCombined(sessionSeed.agentKind, sessionSeed.model, {
-          token: peer.token,
-          name: peer.name,
-        });
-      }
-    }
   });
-  // 每次进入新会话页都强制校准在线队友的共享模型，避免沿用旧 peerModels 缓存。
-  onMount(() => preloadPeerModels(true));
   // 快捷键/侧栏「新会话」后聚焦首页输入框（含已在首页、组件未重挂载的情况）。
   createEffect(() => {
     if (state.homeComposerFocusAt <= 0) return;
+    // 星屑「带入新会话」落在已挂载的首页时，把草稿并入当前输入。
+    const draft = takeSessionDraft(null);
+    if (draft) untrack(() => {
+      const merged = [text(), draft.text].filter(Boolean).join("\n\n");
+      setText(merged);
+      setCursor(merged.length);
+      attach.set([...attach.images(), ...draft.images]);
+    });
     queueMicrotask(() => textareaRef?.focus());
   });
   onCleanup(() => {
@@ -614,11 +579,10 @@ export function HomeView() {
   };
 
   const composerPlaceholder = () => {
+    if (auto()) return "描述任务，自动选择项目与模型（Enter 发送 · Ctrl+Enter 临时会话）";
     const wt = worktreeAvailable() ? " · Alt+Enter 在 worktree 执行" : "";
     const target = roam();
     if (target) return `描述任务，将在 ${target.peer.name} 的机器上执行（Enter 发送${wt}）`;
-    const quota = quotaPeer();
-    if (quota) return `描述任务，将在本机执行并使用 ${quota.name} 的额度（Enter 发送）`;
     if (cwd()) return `描述任务，Enter 发送 · Ctrl+Enter 临时会话${wt}`;
     return "先选择一个项目目录…";
   };
@@ -630,27 +594,33 @@ export function HomeView() {
     const quoted = quote().trim();
     const prompt = quoted ? `<nova_quote>\n${quoted}\n</nova_quote>\n\n${t}` : t;
     const images = attach.images();
-    const target = roam();
-    const quota = quotaPeer();
-    const workflow = !target && !quota ? selectedWorkflow() : null;
+    const autoMode = auto();
+    const target = autoMode ? null : roam();
+    const workflow = !target && !autoMode ? selectedWorkflow() : null;
     const clue = state.pendingClueCard;
     if (
       (!t && images.length === 0) ||
       busy() ||
-      (!cwd() && !target) ||
+      (!cwd() && !target && !autoMode) ||
       !peerReady() ||
       (usesPeerModels() && configAgentKinds().length === 0)
     ) return;
-    const wtOn = opts.worktree === true && worktreeAvailable();
+    const wtOn = !autoMode && opts.worktree === true && worktreeAvailable();
     const branch = opts.branch?.trim() ?? "";
     const base = wtOn ? opts.base?.trim() ?? "" : "";
     if (wtOn && !branch && !base) return; // 新分支名与基于分支至少填一个（留空分支名 = 直接用所选分支）
     submittingPrompt = true;
     rememberPromptHistory(t, images);
-    setQuotaCancelling(false);
     setBusy(true);
     try {
-      if (target) {
+      if (autoMode) {
+        // 直接以轻量化场景模型开局：由它判断是否把整块工作按场景转交，并选择项目目录。
+        const { agentKind: autoKind, model: autoModel } = sceneModel("lightweight");
+        const clueId = clue?.id ?? "";
+        if (clue) clearPendingClueCard();
+        createThreadOptimistic(await api.scratchDir(), autoKind, autoModel, mode(), "", prompt, images,
+          opts.ephemeral ?? false, clueId, "lightweight");
+      } else if (target) {
         const remoteWorkflow = selectedPeerWorkflow();
         if (selectedWorkflowId() && !remoteWorkflow) throw new Error("对方工作流列表已失效，请重新选择");
         const outbound = remoteWorkflow ? roamingWorkflowPrompt(remoteWorkflow, prompt) : prompt;
@@ -670,10 +640,6 @@ export function HomeView() {
         if (clue) clearPendingClueCard();
         if (remoteWorkflow) await api.sendPrompt(threadId, outbound, images);
         else await sendPrompt(prompt, images);
-      } else if (quota) {
-        await createQuotaThread(quota, cwd(), agentKind(), model(), mode(), clue?.id ?? "");
-        if (clue) clearPendingClueCard();
-        await sendPrompt(prompt, images);
       } else if (wtOn) {
         // 本地 worktree：后台创建、界面立即进入会话，就绪后再自动补发首条提示词。
         // 先校验 /fire，避免建完 worktree 才因语法错误失败。
@@ -723,7 +689,6 @@ export function HomeView() {
           if (!ephemeral) lastUsed.setModel(entryAgentKind, entryModel);
           if (clue) clearPendingClueCard();
           // 「跟随会话」节点跟随用户在新会话页选择的后端/模型，而非被首节点覆盖后的值。
-          // 减少焦虑模式下 createThread 不会进入会话页（currentId 仍为空），所以按会话 id 直接启动。
           await startWorkflowOnThread(threadId, prompt, images, workflowId, {
             agentKind: agentKind(),
             model: model() || null,
@@ -750,7 +715,6 @@ export function HomeView() {
       setQuote("");
       setSlashStart(null);
       setRoam(null);
-      setQuotaPeer(null);
       setSelectedWorkflowId(null);
       attach.clear();
       clearPendingClueCard();
@@ -758,26 +722,9 @@ export function HomeView() {
       submittingPrompt = false;
     } catch (error) {
       submittingPrompt = false;
-      const text = String(error);
-      if (!text.includes("额度漫游已取消")) {
-        await message(text, { kind: "error" });
-      }
-    } finally {
-      clearQuotaRoamingProgress();
-      setQuotaCancelling(false);
-      setBusy(false);
-    }
-  };
-
-  const cancelQuotaPreparation = async () => {
-    const operationId = state.quotaRoamingProgress?.operationId;
-    if (!operationId || quotaCancelling()) return;
-    setQuotaCancelling(true);
-    try {
-      await api.cancelQuotaRoaming(operationId);
-    } catch (error) {
-      setQuotaCancelling(false);
       await message(String(error), { kind: "error" });
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -1005,14 +952,10 @@ export function HomeView() {
     }
   };
 
-  // 旧版本训练记录继续隔离，不进入首页最近会话；
-  // 减少焦虑模式下运行中的任务链、以及快捷键手动收进室女座的会话都不再出现在最近会话。
-  const recent = createMemo(() => {
-    const hidden = virgoHiddenThreads();
-    return state.threads
-      .filter((t) => !t.experienceThread && !t.employeeThread && !hidden.has(t.id))
-      .slice(0, 6);
-  });
+  // 旧版本训练记录继续隔离，不进入首页最近会话。
+  const recent = createMemo(() =>
+    state.threads.filter((t) => !t.experienceThread && !t.employeeThread).slice(0, 6),
+  );
 
   return (
     <main class="home">
@@ -1145,12 +1088,16 @@ export function HomeView() {
             />
           </div>
           <div class="composer-bar">
+            <label class="pill composer-auto" title="以轻量化模型开局，按需把编码或剑来工作交给对应场景模型（设置 → 场景模型）">
+              <input type="checkbox" checked={auto()} onChange={(e) => toggleAuto(e.currentTarget.checked)} />
+              自动模式
+            </label>
+            <Show when={!auto()}>
             <ProjectPicker
               value={cwd()}
               onChange={selectProject}
               roam={roam()}
               onPickRoaming={(peer, folder) => {
-                setQuotaPeer(null);
                 setRoam({ peer, folder });
                 // 用户明确选择队友时强制刷新，不能继续依赖可能已过期的预加载缓存。
                 ensurePeerModels(peer.token, true);
@@ -1165,15 +1112,14 @@ export function HomeView() {
                 agentKinds={configAgentKinds()}
                 model={model()}
                 modelSource={usesPeerModels() ? peerModelSource : undefined}
-                sharedModels={usesPeerModels() ? undefined : quotaSharedModelSources()}
-                quotaPeerToken={quotaPeer()?.token}
                 onPickModel={pickModelCombined}
                 anchorTo=".home-composer"
                 favorites
               />
             </Show>
+            </Show>
             <div class="composer-actions">
-              <Show when={!quotaPeer()}>
+              <Show when={!auto()}>
                 <div ref={workflowPickerRef} class="composer-workflow-picker">
                   <Show when={workflowMenuOpen()}>
                     <div class="composer-workflow-menu">
@@ -1247,7 +1193,7 @@ export function HomeView() {
                 disabled={
                   (!text().trim() && attach.images().length === 0) ||
                   (!!selectedWorkflow() && !text().trim() && attach.images().length === 0) ||
-                  (!cwd() && !roam()) ||
+                  (!cwd() && !roam() && !auto()) ||
                   busy() ||
                   !peerReady() ||
                   (usesPeerModels() && configAgentKinds().length === 0)
@@ -1398,32 +1344,6 @@ export function HomeView() {
                 {wtBranchDraft().trim() ? "创建并执行" : "在所选分支执行"}
               </button>
             </div>
-          </div>
-        </div>
-      </Show>
-      <Show
-        when={
-          state.quotaRoamingProgress
-        }
-      >
-        <div class="modal-backdrop quota-loading-backdrop">
-          <div class="modal quota-loading-modal">
-            <div class="quota-loading-spinner" />
-            <div class="quota-loading-title">正在准备额度会话</div>
-            <div class="field-hint">
-              {quotaCancelling()
-                ? "正在取消本次额度漫游…"
-                : state.quotaRoamingProgress?.message}
-            </div>
-            <Show when={state.quotaRoamingProgress?.stage !== "ready"}>
-              <button
-                class="btn secondary quota-loading-cancel"
-                disabled={quotaCancelling()}
-                onClick={() => void cancelQuotaPreparation()}
-              >
-                {quotaCancelling() ? "正在取消…" : "取消本次漫游"}
-              </button>
-            </Show>
           </div>
         </div>
       </Show>

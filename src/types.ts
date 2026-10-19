@@ -1,6 +1,6 @@
 import type { WorkflowDef } from "./workflow/types";
 
-export type AgentKind = "claude" | "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "cursor";
+export type AgentKind = "claude" | "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "workbuddy" | "cursor";
 
 export interface SlashCommand {
   name: string;
@@ -9,10 +9,22 @@ export interface SlashCommand {
   input?: string;
 }
 
-export interface StageModelTarget {
+export interface ModelTarget {
   agentKind: AgentKind;
+  /** 空 = 该后端默认模型 */
   model: string;
 }
+
+/** 预设场景：每个场景一个有序模型列表，按顺序取第一个可用的，失效时切换下一个。 */
+export type SceneKey = "lightweight" | "coding" | "computer";
+export type SceneModels = Record<SceneKey, ModelTarget[]>;
+export const SCENES: { key: SceneKey; label: string; hint: string }[] = [
+  { key: "lightweight", label: "轻量化", hint: "自动模式会话的起手模型；标题、摘要、上下文压缩、/stage、Butterfly、Meteor、数字员工" },
+  { key: "coding", label: "编码", hint: "写代码、改仓库、调试和构建测试" },
+  { key: "computer", label: "剑来", hint: "操作桌面应用与浏览器" },
+];
+export const scenesReady = (scenes?: Partial<SceneModels>) =>
+  SCENES.every(({ key }) => (scenes?.[key]?.length ?? 0) > 0);
 
 /** worktree 执行信息：会话在为某 git 仓库创建的独立 worktree（分支 + 工作目录）中运行 */
 export interface Worktree {
@@ -125,19 +137,19 @@ export interface ThreadMeta {
   roamingRole?: string | null;
   /** 漫游对端展示名 */
   roamingPeerName?: string | null;
-  /** 非空：本机会话使用该在线队友临时授权的额度（提供方 token） */
-  quotaPeer?: string | null;
-  /** 额度租借提供方展示名 */
-  quotaPeerName?: string | null;
   /** 非空：该会话在独立 git worktree 中执行 */
   worktree?: Worktree | null;
   /** 兼容旧版本训练记录，仅用于保持历史隔离。 */
   experienceThread?: boolean;
   /** 数字员工会话：不进普通列表，只在员工页「最近运行」里出现。 */
   employeeThread?: boolean;
+  /** 由主会话调度的子 Agent 执行记录，仅供查看。 */
+  subagent?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** 普通 /stage 引用的源会话；用于导航显示 Stage 自己的会话名。 */
+  /** 自动模式会话的场景 key；普通会话为空 */
+  autoScene?: string | null;
   stageSourceThreadId?: string | null;
   /** 当前会话在证据链中的线索位置 */
   activeClueCardId?: string | null;
@@ -284,15 +296,14 @@ export interface Thread {
   roamingPeer?: string | null;
   roamingPeerName?: string | null;
   roamingRemoteId?: string | null;
-  /** 非空：本机会话使用该在线队友临时授权的额度 */
-  quotaPeer?: string | null;
-  quotaPeerName?: string | null;
   /** 非空：该会话在独立 git worktree 中执行（cwd 已指向该 worktree 工作目录） */
   worktree?: Worktree | null;
   /** 兼容旧版本训练记录，仅用于保持历史隔离。 */
   experienceThread?: boolean;
   /** 数字员工会话：不进普通列表，只在员工页「最近运行」里出现。 */
   employeeThread?: boolean;
+  /** 由主会话调度的子 Agent 执行记录，仅供查看。 */
+  subagent?: boolean;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** Stage 会话动态引用的源会话。 */
@@ -389,11 +400,7 @@ export type SessionShortcutAction =
   | "toggleTerminal"
   | "insertText"
   /** 选中新会话页要运行的工作流；target 为工作流 id。仅新会话页生效。 */
-  | "selectWorkflow"
-  /** 把当前会话移入室女座；无 target。仅在未开启减少焦虑（室女座）时生效。 */
-  | "hideToVirgo"
-  /** 内置 Esc 终止，仅运行时使用，不可在设置中配置。 */
-  | "stopSession";
+  | "selectWorkflow";
 
 /** 会话快捷键：一键切到指定项目或模型、快速新会话、插入文本、选择工作流。 */
 export interface SessionShortcut {
@@ -401,7 +408,7 @@ export interface SessionShortcut {
   /** 规范化按键，如 Ctrl+1 / Alt+P。 */
   keys: string;
   action: SessionShortcutAction;
-  /** 本地项目路径、roam/quota 编码、agentKind:model、工作流 id，或 insertText 的插入内容；newSession / openUnread / hideToVirgo 可为空。 */
+  /** 本地项目路径、roam 编码、agentKind:model、工作流 id，或 insertText 的插入内容；newSession / openUnread 可为空。 */
   target: string;
 }
 
@@ -413,15 +420,11 @@ export interface PendingNewSessionSeed {
   mode: string;
   reasoningEffort: string;
   roam: { peerToken: string; folder: string } | null;
-  quotaPeerToken: string | null;
   /** 快捷键触发时，聊天记录中选中的引用文本。 */
   quote: string;
 }
 
 export interface Settings {
-  jevEnabled: boolean;
-  jevApiKey: string;
-  jevApiUrl: string;
   claudePath: string;
   claudeProxy: string;
   claudeEnabled: boolean;
@@ -435,6 +438,9 @@ export interface Settings {
   /** CodeBuddy CLI 可执行文件 */
   codebuddyPath: string;
   codebuddyProxy: string;
+  /** 空 = 自动查找 Windows 默认安装目录；支持安装目录、WorkBuddy.exe（仅定位内置 CLI）或内置 CodeBuddy CLI 路径。 */
+  workbuddyPath: string;
+  workbuddyProxy: string;
   cursorProxy: string;
   /** 兼容旧配置；Cursor 后端仅使用官方 SDK，不再依赖本机 CLI */
   cursorPath: string;
@@ -462,12 +468,8 @@ export interface Settings {
   /** 代码上下文检索模式：无 / FastContext。 */
   contextRetrievalMode: "none" | "fast";
   defaultMode: string;
-  /** 标题、快速总结、摘要和压缩等辅助任务所用后端 */
-  lightweightModelAgent: string;
-  /** 辅助任务所用轻量级模型；失败时回退到任务原模型 */
-  lightweightModel: string;
-  /** /stage、/stage2 等命令依次使用的模型；/stage 默认取第一项 */
-  stageModels: StageModelTarget[];
+  /** 场景模型：轻量化 / 编码 / 剑来 */
+  sceneModels: SceneModels;
   /** 打开文件用的编辑器命令（cursor / code / zed 等） */
   editor: string;
   /** 内嵌终端程序，空为系统默认 shell。 */
@@ -486,17 +488,27 @@ export interface Settings {
   relayGroups: string;
   /** 是否允许 server 端远程查看和控制本机会话（默认关闭） */
   remoteControlEnabled: boolean;
-  /** 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>` */
-  quotaSharedModels: string[];
   /** 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>` */
   modelFavorites: string[];
   /** 会话快捷键：按键一键切换项目或模型 */
   sessionShortcuts: SessionShortcut[];
+  /** Meteor 屏幕标注入口；dev 实例运行时非 dev 实例自动停用 */
+  meteorEnabled: boolean;
+  /** Alt+Alt 表示连按两次 Alt，其余为系统全局组合键（必须带修饰键） */
+  meteorShortcut: string;
+  /** Meteor 提交时附加最近剪贴板；默认关闭 */
+  meteorClipboard?: boolean;
+  /** Meteor 星移（StartShift）全局组合键，默认 Alt+V；空值关闭 */
+  meteorPasteShortcut?: string;
+  /** 剑谱录制开关的全局组合键，默认 Alt+R；空值关闭 */
+  jianpuShortcut?: string;
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   devinEnabled: boolean;
   lyraEnabled: boolean;
   codexEnabled: boolean;
   codebuddyEnabled: boolean;
+  /** WorkBuddy 本机后端，默认关闭。 */
+  workbuddyEnabled: boolean;
   cursorEnabled: boolean;
   codexIntegration: "app-server";
   codebuddyIntegration: "sdk" | "acp";
@@ -509,8 +521,6 @@ export interface Settings {
   sessionAutoCleanupEnabled: boolean;
   /** 自动清理会话的保留时长（小时） */
   sessionAutoCleanupHours: number;
-  /** 减少焦虑（室女座）：运行中的会话只在室女座显示，结束后自动回到普通模式 */
-  zenModeEnabled: boolean;
   knowledgeGraphEnabled: boolean;
   /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程并供工作流 {{xx}} 替换。 */
   customEnvVars: Record<string, string>;
@@ -529,6 +539,13 @@ export interface GlobalAgentInstructions {
   content: string;
   path: string;
   targets: AgentInstructionTarget[];
+  triggers: PromptTrigger[];
+}
+
+/** 提示词触发器：满足 when 时由 Agent 读取 prompt 正文（渐进披露） */
+export interface PromptTrigger {
+  when: string;
+  prompt: string;
 }
 
 /** 集中管理的 skill（~/.nova/skills） */
@@ -579,8 +596,6 @@ export interface PeerModels {
   backends: AgentKind[];
   /** 各后端的模型/模式选项（缺失的后端为 undefined） */
   options: Partial<Record<AgentKind, ModelOptions | null>>;
-  /** 对端明确开放额度租借的模型；仅注入新会话模型选择器。 */
-  sharedOptions: Partial<Record<AgentKind, ModelOptions | null>>;
 }
 
 /** 团队/漫游：在线名单里的一个人 */
@@ -633,12 +648,6 @@ export interface IncomingRoamRequest {
   mode?: string | null;
   /** 已有会话授权过期后的单轮续期审批。 */
   continuation?: boolean;
-}
-
-export interface QuotaRoamingProgress {
-  operationId: string;
-  stage: "requesting" | "preparing" | "ready";
-  message: string;
 }
 
 /** 收到的一条分享 */

@@ -14,7 +14,6 @@
 //! since=<最后 seq> 补发漏掉的消息，保证不丢、不影响使用。HTTP 上行使用 messageId 幂等重试。
 
 use crate::clues::{CaptureClueResult, ClueContextSnapshot, ClueNodeGroup, EV_CLUES};
-use crate::credential_roaming::CredentialBundle;
 use crate::http_stream::{decode_sse_json, SseDecoder, SSE_IDLE_TIMEOUT_SECS};
 use crate::settings::Settings;
 use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, Worktree};
@@ -29,13 +28,12 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, Notify};
 use tokio::time::{sleep, timeout, Duration, Instant};
-use x25519_dalek::StaticSecret;
 
 use crate::acp::{EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS, EV_TURN, EV_UPDATE};
 
@@ -50,16 +48,8 @@ pub const EV_RELAY_PEER_MODELS: &str = "relay:peer-models";
 pub const EV_RELAY_PEER_BRANCHES: &str = "relay:peer-branches";
 /// host 侧：收到漫游请求，前端弹确认框
 pub const EV_RELAY_ROAM_REQUEST: &str = "relay:roam-request";
-/// 额度借用方：请求、安装 CLI、准备隔离凭证的进度。
-pub const EV_RELAY_QUOTA_PROGRESS: &str = "relay:quota-progress";
 /// 整段刷新某线程（漫游快照重同步后用），前端据此重新拉取 transcript
 pub const EV_RELAY_RELOAD: &str = "acp:reload";
-
-const QUOTA_CANCELLED_ERROR: &str = "额度漫游已取消";
-const QUOTA_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const QUOTA_OPERATION_ACTIVE: u8 = 0;
-const QUOTA_OPERATION_CANCELLED: u8 = 1;
-const QUOTA_OPERATION_COMMITTED: u8 = 2;
 
 /// host 侧：本机某线程正被哪个 guest 漫游驱动
 #[derive(Clone)]
@@ -91,218 +81,6 @@ struct PendingRoam {
     /// 续期审批时已有的 host 会话；首次创建时为空。
     host_thread_id: Option<String>,
     images: Vec<PromptImage>,
-}
-
-struct PendingQuotaClient {
-    peer: String,
-    agent_kind: AgentKind,
-    secret: StaticSecret,
-    reply: oneshot::Sender<Result<CredentialBundle, String>>,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct QuotaLeaseKey {
-    peer: String,
-    agent_kind: AgentKind,
-}
-
-impl QuotaLeaseKey {
-    fn new(peer: String, agent_kind: AgentKind) -> Result<Self, String> {
-        let peer = peer.trim().to_string();
-        if peer.is_empty() {
-            return Err("额度租约必须指定队友".into());
-        }
-        Ok(Self { peer, agent_kind })
-    }
-}
-
-type QuotaLeaseResult = Result<CredentialBundle, String>;
-type QuotaLeaseWaiter = oneshot::Sender<QuotaLeaseResult>;
-
-struct QuotaOperation {
-    state: AtomicU8,
-    notify: Notify,
-}
-
-impl QuotaOperation {
-    fn new() -> Self {
-        Self {
-            state: AtomicU8::new(QUOTA_OPERATION_ACTIVE),
-            notify: Notify::new(),
-        }
-    }
-
-    fn cancel(&self) -> bool {
-        if self
-            .state
-            .compare_exchange(
-                QUOTA_OPERATION_ACTIVE,
-                QUOTA_OPERATION_CANCELLED,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_err()
-        {
-            return false;
-        }
-        self.notify.notify_one();
-        true
-    }
-
-    fn commit(&self) -> bool {
-        self.state
-            .compare_exchange(
-                QUOTA_OPERATION_ACTIVE,
-                QUOTA_OPERATION_COMMITTED,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
-    }
-
-    fn ensure_active(&self) -> Result<(), String> {
-        if self.state.load(Ordering::SeqCst) == QUOTA_OPERATION_ACTIVE {
-            Ok(())
-        } else {
-            Err(QUOTA_CANCELLED_ERROR.into())
-        }
-    }
-
-    async fn cancelled(&self) {
-        if self.state.load(Ordering::SeqCst) != QUOTA_OPERATION_ACTIVE {
-            return;
-        }
-        self.notify.notified().await;
-    }
-}
-
-fn quota_model_key(kind: &AgentKind, model: &str) -> String {
-    format!("{}:{model}", kind.as_str())
-}
-
-fn ensure_quota_backend_supported(kind: &AgentKind) -> Result<(), String> {
-    match kind {
-        AgentKind::Kimi => Err("Kimi Code 暂不支持额度租借".into()),
-        AgentKind::Lyra
-        | AgentKind::Devin
-        | AgentKind::Claude
-        | AgentKind::Codex
-        | AgentKind::CodexPlus
-        | AgentKind::CodeBuddy
-        | AgentKind::CodeBuddyPlus
-        | AgentKind::Cursor => Ok(()),
-    }
-}
-
-fn shared_quota_leases(peer: &str, shared_options: &Value) -> HashMap<QuotaLeaseKey, String> {
-    let mut leases = HashMap::new();
-    let Some(backends) = shared_options.as_object() else {
-        return leases;
-    };
-    for (kind, options) in backends {
-        let Some(kind) = AgentKind::from_str(kind) else {
-            continue;
-        };
-        let model_options = options["configOptions"]
-            .as_array()
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|item| item["id"].as_str() == Some("model"))
-            })
-            .and_then(|item| item["options"].as_array());
-        let Some(model_options) = model_options else {
-            continue;
-        };
-        for model in model_options {
-            let Some(value) = model["value"].as_str().filter(|value| !value.is_empty()) else {
-                continue;
-            };
-            if let Ok(key) = QuotaLeaseKey::new(peer.to_string(), kind.clone()) {
-                leases.entry(key).or_insert_with(|| value.to_string());
-            }
-        }
-    }
-    leases
-}
-
-/// 对端公布的全部共享模型键（`<agentKind>:<modelId>`）：租约按账号/Provider 复用去重后
-/// 会丢失同租约键下的其余模型，需要从原始 shared_options 独立提取完整名单。
-fn shared_model_keys(shared_options: &Value) -> HashSet<String> {
-    let mut keys = HashSet::new();
-    for (kind, options) in shared_options.as_object().into_iter().flatten() {
-        let Some(kind) = AgentKind::from_str(kind) else {
-            continue;
-        };
-        let model_options = options["configOptions"]
-            .as_array()
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|item| item["id"].as_str() == Some("model"))
-            })
-            .and_then(|item| item["options"].as_array());
-        for model in model_options.into_iter().flatten() {
-            if let Some(value) = model["value"].as_str().filter(|value| !value.is_empty()) {
-                keys.insert(quota_model_key(&kind, value));
-            }
-        }
-    }
-    keys
-}
-
-fn quota_model_is_shared(settings: &Settings, kind: &AgentKind, model: &str) -> bool {
-    let enabled = match kind {
-        AgentKind::Lyra => settings.lyra_enabled,
-        AgentKind::Devin => settings.devin_enabled,
-        AgentKind::Kimi => false,
-        AgentKind::Claude => settings.claude_enabled,
-        AgentKind::Codex => settings.codex_enabled,
-        AgentKind::CodexPlus => settings.codex_enabled,
-        AgentKind::CodeBuddy => settings.codebuddy_enabled,
-        AgentKind::CodeBuddyPlus => settings.codebuddy_enabled,
-        AgentKind::Cursor => settings.cursor_enabled,
-    };
-    enabled
-        && !model.is_empty()
-        && settings
-            .quota_shared_models
-            .contains(&quota_model_key(kind, model))
-}
-
-fn shared_model_options(
-    kind: &AgentKind,
-    value: &Value,
-    shared: &HashSet<String>,
-) -> Option<Value> {
-    let mut filtered = value.clone();
-    let config_options = filtered.get_mut("configOptions")?.as_array_mut()?;
-    let model_option = config_options
-        .iter_mut()
-        .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))?;
-    let current = model_option
-        .get("currentValue")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let options = model_option.get_mut("options")?.as_array_mut()?;
-    options.retain(|option| {
-        option
-            .get("value")
-            .and_then(Value::as_str)
-            .is_some_and(|model| shared.contains(&quota_model_key(kind, model)))
-    });
-    let first = options
-        .first()
-        .and_then(|option| option.get("value"))
-        .and_then(Value::as_str)
-        .map(str::to_string)?;
-    if !current
-        .as_deref()
-        .is_some_and(|model| shared.contains(&quota_model_key(kind, model)))
-    {
-        model_option["currentValue"] = json!(first);
-    }
-    Some(filtered)
 }
 
 fn is_publishable_roaming_path(path: &str) -> bool {
@@ -436,17 +214,6 @@ pub struct RelayManager {
     pending_prompts: StdMutex<HashMap<String, Vec<(String, Vec<PromptImage>)>>>,
     /// host 侧：reqId -> 待本机用户确认的漫游请求
     incoming_roams: StdMutex<HashMap<String, PendingRoam>>,
-    /// 借用方：reqId -> 一次性私钥与等待中的 Tauri 调用。
-    pending_quota: StdMutex<HashMap<String, PendingQuotaClient>>,
-    /// 借用方：一次额度漫游从安装、请求凭证到落库的取消状态。
-    quota_operations: StdMutex<HashMap<String, Arc<QuotaOperation>>>,
-    /// 借用方：共享模型的应用级内存租约；每个会话仍各自创建隔离运行目录。
-    quota_leases: StdMutex<HashMap<QuotaLeaseKey, CredentialBundle>>,
-    /// 借用方最近一次收到的每位队友共享模型全集（`<agentKind>:<modelId>`）。
-    /// 租约可能按账号/provider 复用，换模型时仍需用这份精确名单校验具体模型。
-    quota_shared_models: StdMutex<HashMap<String, HashSet<String>>>,
-    /// 同一租约同时预热/创建时只向对端请求一次，其余调用等待同一结果。
-    quota_lease_flights: StdMutex<HashMap<QuotaLeaseKey, Vec<QuotaLeaseWaiter>>>,
     /// 高级分享：本机处理线程 id -> 处理完成后要分享给谁
     advanced: StdMutex<HashMap<String, String>>,
     /// guest 侧落盘节流：流式期间不要每条增量都写整个 store（会拖慢 SSE 消费）
@@ -500,11 +267,6 @@ impl RelayManager {
             pending_creates: StdMutex::new(HashMap::new()),
             pending_prompts: StdMutex::new(HashMap::new()),
             incoming_roams: StdMutex::new(HashMap::new()),
-            pending_quota: StdMutex::new(HashMap::new()),
-            quota_operations: StdMutex::new(HashMap::new()),
-            quota_leases: StdMutex::new(HashMap::new()),
-            quota_shared_models: StdMutex::new(HashMap::new()),
-            quota_lease_flights: StdMutex::new(HashMap::new()),
             advanced: StdMutex::new(HashMap::new()),
             last_store_save: StdMutex::new(Instant::now()),
             guest_activity: StdMutex::new(HashMap::new()),
@@ -632,24 +394,8 @@ impl RelayManager {
         let _ = self.app.emit(EV_RELAY_STATUS, self.status());
     }
 
-    fn retain_online_quota_leases(&self, _peers: &Value) {
-        // 额度共享租约不应因提供方离线而失效：只要对方未撤销共享（sharedOptions 仍包含该模型），
-        // 借用方应可持续使用已获取的凭证，直到收到明确的撤销通知（retain_shared_quota_leases）。
-        // 此前按 online 过滤会在对方关机后立即清除租约，导致新会话创建失败。
-    }
-
-    fn retain_shared_quota_leases(&self, peer: &str, shared_options: &Value) {
-        let shared = shared_quota_leases(peer, shared_options);
-        self.quota_leases
-            .lock()
-            .unwrap()
-            .retain(|key, _| key.peer != peer || shared.contains_key(key));
-    }
-
     fn set_connected(&self, on: bool) {
         let prev = self.connected.swap(on, Ordering::SeqCst);
-        // 断线不应清空已获取的额度租约；租约仅在对方撤销共享时由 retain_shared_quota_leases 清理。
-        // 此前 clear_quota_leases 会导致重连后所有已预热租约丢失，对方若已关机则无法重新获取。
         if prev != on {
             self.emit_status();
         }
@@ -832,7 +578,6 @@ impl RelayManager {
                 // 漫游/分享侧各自会用自己的 token 排除自己，不受此影响。
                 let peers =
                     relay_display_peers(env.data.get("peers").cloned().unwrap_or(json!([])));
-                self.retain_online_quota_leases(&peers);
                 *self.peers.lock().unwrap() = peers.clone();
                 let _ = self.app.emit(EV_RELAY_PEERS, peers);
             }
@@ -853,13 +598,11 @@ impl RelayManager {
             "roaming.config" => self.on_roaming_config(&env),
             "roaming.resync" => self.on_roaming_resync(&env),
             "roaming.recall" => self.on_roaming_recall(&env),
-            "roaming.models_changed" => self.on_roaming_models_changed(&env),
             "roaming.models_request" => self.on_roaming_models_request(&env),
             "roaming.workflows" => {
                 let _ = self.app.emit("relay:peer-workflows", json!({ "peer": env.from, "workflows": env.data }));
             }
             "roaming.branches_request" => self.on_roaming_branches_request(&env),
-            "quota.request" => self.on_quota_request(&env),
             // host -> guest
             "roaming.created" => self.on_roaming_created(&env),
             "roaming.stage" => self.on_roaming_stage(&env),
@@ -872,8 +615,6 @@ impl RelayManager {
             "roaming.snapshot" => self.on_roaming_snapshot(&env),
             "roaming.title" => self.on_roaming_title(&env),
             "roaming.error" => self.on_roaming_error(&env),
-            "quota.granted" => self.on_quota_granted(&env),
-            "quota.rejected" => self.on_quota_rejected(&env),
             _ => {}
         }
     }
@@ -1720,25 +1461,22 @@ impl RelayManager {
             make_scratch_dir()?
         };
         // 后端优先用调用方临时选择；为空回退统一轻量级模型，再兜底 Lyra。
-        let agent_kind = {
-            let raw = if agent.trim().is_empty() {
-                let state = self.app.state::<AppState>();
-                let s = state.settings.lock().unwrap();
-                s.lightweight_model_agent.trim().to_string()
-            } else {
-                agent.trim().to_string()
-            };
-            AgentKind::from_str(&raw).unwrap_or(AgentKind::Lyra)
+        let lightweight = self
+            .app
+            .state::<AppState>()
+            .scene_model(crate::settings::Scene::Lightweight)
+            .ok();
+        let agent_kind = if agent.trim().is_empty() {
+            lightweight.as_ref().map(|(kind, _)| kind.clone()).unwrap_or(AgentKind::Lyra)
+        } else {
+            AgentKind::from_str(agent.trim()).unwrap_or(AgentKind::Lyra)
         };
-        // 模型优先用调用方临时选择；为空回退统一轻量级模型。
+        // 模型优先用调用方临时选择；为空且后端一致时回退轻量化场景模型。
         let model = if model.trim().is_empty() {
-            let state = self.app.state::<AppState>();
-            let settings = state.settings.lock().unwrap();
-            if AgentKind::from_str(&settings.lightweight_model_agent) == Some(agent_kind.clone()) {
-                settings.lightweight_model.trim().to_string()
-            } else {
-                String::new()
-            }
+            lightweight
+                .filter(|(kind, _)| *kind == agent_kind)
+                .map(|(_, model)| model)
+                .unwrap_or_default()
         } else {
             model.trim().to_string()
         };
@@ -1775,7 +1513,7 @@ impl RelayManager {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
             }
-            AgentKind::Kimi | AgentKind::Claude => {
+            AgentKind::Kimi | AgentKind::Claude | AgentKind::WorkBuddy => {
                 let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move {
                     mgr.run_prompt(run_id, seed, vec![]).await;
@@ -1817,549 +1555,6 @@ impl RelayManager {
 
     pub fn is_advanced(&self, thread_id: &str) -> bool {
         self.advanced.lock().unwrap().contains_key(thread_id)
-    }
-
-    // ===== 额度租借：A 本机执行，临时使用 B 的加密凭证 =====
-
-    fn emit_quota_progress(&self, operation_id: &str, stage: &str, message: impl Into<String>) {
-        let _ = self.app.emit(
-            EV_RELAY_QUOTA_PROGRESS,
-            json!({
-                "operationId": operation_id,
-                "stage": stage,
-                "message": message.into(),
-            }),
-        );
-    }
-
-    /// 程序重启会销毁内存中的隔离运行时和明文凭证。再次发送时向原提供方
-    /// 重新申请同一模型的额度租约，并用持久化的 provider session 恢复上下文。
-    pub async fn restore_quota_runtime(self: &Arc<Self>, thread_id: &str) -> Result<(), String> {
-        if self.cfg().is_none() {
-            return Err("未配置中转站 token".into());
-        }
-        if self
-            .app
-            .state::<AppState>()
-            .borrowed_runtime(thread_id)
-            .is_some()
-        {
-            return Ok(());
-        }
-        let (peer, agent_kind, model) = {
-            let state = self.app.state::<AppState>();
-            let store = state.store.lock().unwrap();
-            let thread = store.get(thread_id).ok_or("线程不存在")?;
-            let peer = thread.quota_peer.clone().ok_or("该会话不是额度租借会话")?;
-            let model = thread
-                .model
-                .clone()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or("额度会话缺少共享模型")?;
-            (peer, thread.agent_kind.clone(), model)
-        };
-        ensure_quota_backend_supported(&agent_kind)?;
-        let key = QuotaLeaseKey::new(peer, agent_kind.clone())?;
-        let bundle = self.acquire_quota_lease(key, model, None).await?;
-        let runtime = crate::credential_roaming::materialize_runtime(
-            self.app.clone(),
-            thread_id,
-            &agent_kind,
-            bundle,
-        )?;
-        let state = self.app.state::<AppState>();
-        let still_valid = {
-            let store = state.store.lock().unwrap();
-            store
-                .get(thread_id)
-                .is_some_and(|thread| thread.is_quota_borrowed() && thread.agent_kind == agent_kind)
-        };
-        if !still_valid {
-            runtime.shutdown().await;
-            return Err("额度会话已不存在或后端已变化".into());
-        }
-        state
-            .borrowed_runtimes
-            .lock()
-            .unwrap()
-            .insert(thread_id.to_string(), runtime);
-        Ok(())
-    }
-
-    pub async fn prepare_quota_lease(
-        self: &Arc<Self>,
-        peer_token: String,
-        agent_kind: AgentKind,
-        model: String,
-    ) -> Result<(), String> {
-        ensure_quota_backend_supported(&agent_kind)?;
-        if self.cfg().is_none() {
-            return Err("未配置中转站 token".into());
-        }
-        let model = model.trim().to_string();
-        if model.is_empty() {
-            return Err("额度租约必须指定共享模型".into());
-        }
-        let key = QuotaLeaseKey::new(peer_token, agent_kind)?;
-        self.acquire_quota_lease(key, model, None).await?;
-        Ok(())
-    }
-
-    fn quota_lease_ready(&self, key: &QuotaLeaseKey) -> bool {
-        self.quota_leases.lock().unwrap().contains_key(key)
-    }
-
-    /// 本机是否已持有该队友/后端所需凭证，且该具体模型仍在队友最近公布的共享名单中。
-    /// 租约按账号复用，不能只看租约键，否则同后端任意未共享模型也会误通过。
-    pub fn can_switch_quota_model(
-        &self,
-        peer: &str,
-        agent_kind: &AgentKind,
-        model: &str,
-    ) -> bool {
-        let model_key = quota_model_key(agent_kind, model);
-        self.quota_shared_models
-            .lock()
-            .unwrap()
-            .get(peer)
-            .is_some_and(|models| models.contains(&model_key))
-            && QuotaLeaseKey::new(peer.to_string(), agent_kind.clone())
-                .is_ok_and(|key| self.quota_lease_ready(&key))
-    }
-
-    async fn wait_quota_lease_flight(
-        wait: oneshot::Receiver<QuotaLeaseResult>,
-        operation: Option<&QuotaOperation>,
-    ) -> QuotaLeaseResult {
-        let result = if let Some(operation) = operation {
-            tokio::select! {
-                _ = operation.cancelled() => return Err(QUOTA_CANCELLED_ERROR.into()),
-                result = wait => result,
-            }
-        } else {
-            wait.await
-        };
-        result.map_err(|_| "额度租约准备通道已关闭".to_string())?
-    }
-
-    async fn acquire_quota_lease(
-        self: &Arc<Self>,
-        key: QuotaLeaseKey,
-        model: String,
-        operation: Option<&QuotaOperation>,
-    ) -> QuotaLeaseResult {
-        // Lyra 租约是配置快照；每次新建/恢复都重新授权，避免沿用已变更的模型和凭证。
-        if key.agent_kind == AgentKind::Lyra {
-            let bundle = self.request_quota_bundle(&key, &model, operation).await?;
-            self.quota_leases.lock().unwrap().insert(key, bundle.clone());
-            return Ok(bundle);
-        }
-        if let Some(bundle) = self.quota_leases.lock().unwrap().get(&key).cloned() {
-            return Ok(bundle);
-        }
-
-        let wait = {
-            let mut flights = self.quota_lease_flights.lock().unwrap();
-            if let Some(waiters) = flights.get_mut(&key) {
-                let (reply, wait) = oneshot::channel();
-                waiters.push(reply);
-                Some(wait)
-            } else {
-                flights.insert(key.clone(), Vec::new());
-                None
-            }
-        };
-        if let Some(wait) = wait {
-            return Self::wait_quota_lease_flight(wait, operation).await;
-        }
-
-        let result = self.request_quota_bundle(&key, &model, operation).await;
-        if let Ok(bundle) = &result {
-            self.quota_leases
-                .lock()
-                .unwrap()
-                .insert(key.clone(), bundle.clone());
-        }
-        let waiters = self
-            .quota_lease_flights
-            .lock()
-            .unwrap()
-            .remove(&key)
-            .unwrap_or_default();
-        for waiter in waiters {
-            let _ = waiter.send(result.clone());
-        }
-        result
-    }
-
-    async fn request_quota_bundle(
-        self: &Arc<Self>,
-        key: &QuotaLeaseKey,
-        model: &str,
-        operation: Option<&QuotaOperation>,
-    ) -> QuotaLeaseResult {
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let (secret, public_key) = crate::credential_roaming::new_request_key();
-        let (reply, wait) = oneshot::channel();
-        self.pending_quota.lock().unwrap().insert(
-            request_id.clone(),
-            PendingQuotaClient {
-                peer: key.peer.clone(),
-                agent_kind: key.agent_kind.clone(),
-                secret,
-                reply,
-            },
-        );
-        let request = self.send(
-            &key.peer,
-            "quota.request",
-            json!({
-                "reqId": request_id,
-                "agentKind": key.agent_kind,
-                "model": model,
-                "publicKey": public_key,
-            }),
-        );
-        let send_result = if let Some(operation) = operation {
-            tokio::select! {
-                _ = operation.cancelled() => {
-                    self.pending_quota.lock().unwrap().remove(&request_id);
-                    return Err(QUOTA_CANCELLED_ERROR.into());
-                }
-                result = request => result,
-            }
-        } else {
-            request.await
-        };
-        if let Err(error) = send_result {
-            self.pending_quota.lock().unwrap().remove(&request_id);
-            return Err(format!("发送额度请求失败：{error}"));
-        }
-
-        let response = if let Some(operation) = operation {
-            tokio::select! {
-                _ = operation.cancelled() => {
-                    self.pending_quota.lock().unwrap().remove(&request_id);
-                    return Err(QUOTA_CANCELLED_ERROR.into());
-                }
-                result = timeout(QUOTA_REQUEST_TIMEOUT, wait) => result,
-            }
-        } else {
-            timeout(QUOTA_REQUEST_TIMEOUT, wait).await
-        };
-        match response {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("额度授权通道已关闭".into()),
-            Err(_) => {
-                self.pending_quota.lock().unwrap().remove(&request_id);
-                Err("等待对方授权超时".into())
-            }
-        }
-    }
-
-    pub async fn create_quota_thread(
-        self: &Arc<Self>,
-        peer_token: String,
-        peer_name: String,
-        cwd: String,
-        agent_kind: AgentKind,
-        model: Option<String>,
-        mode: Option<String>,
-        clue_context: Option<ClueContextSnapshot>,
-        operation_id: String,
-    ) -> Result<Thread, String> {
-        if self.cfg().is_none() {
-            return Err("未配置中转站 token".into());
-        }
-        if !std::path::Path::new(&cwd).is_dir() {
-            return Err(format!("本地目录不存在：{cwd}"));
-        }
-        let operation_id = operation_id.trim().to_string();
-        if operation_id.is_empty() {
-            return Err("额度漫游操作编号不能为空".into());
-        }
-        let operation = Arc::new(QuotaOperation::new());
-        {
-            let mut operations = self.quota_operations.lock().unwrap();
-            if operations.contains_key(&operation_id) {
-                return Err("额度漫游操作已存在".into());
-            }
-            operations.insert(operation_id.clone(), operation.clone());
-        }
-        let result = self
-            .create_quota_thread_inner(
-                peer_token,
-                peer_name,
-                cwd,
-                agent_kind,
-                model,
-                mode,
-                clue_context,
-                &operation_id,
-                operation,
-            )
-            .await;
-        self.quota_operations.lock().unwrap().remove(&operation_id);
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn create_quota_thread_inner(
-        self: &Arc<Self>,
-        peer_token: String,
-        peer_name: String,
-        cwd: String,
-        agent_kind: AgentKind,
-        model: Option<String>,
-        mode: Option<String>,
-        clue_context: Option<ClueContextSnapshot>,
-        operation_id: &str,
-        operation: Arc<QuotaOperation>,
-    ) -> Result<Thread, String> {
-        ensure_quota_backend_supported(&agent_kind)?;
-        let settings = {
-            let state = self.app.state::<AppState>();
-            let settings = state.settings.lock().unwrap().clone();
-            settings
-        };
-        operation.ensure_active()?;
-        if !crate::cli_manager::is_installed(&agent_kind, &settings) {
-            let command = crate::cli_manager::install_command(&agent_kind, &settings);
-            return Err(format!(
-                "本机缺少 {} CLI，请先在终端执行：{command}",
-                agent_kind.label()
-            ));
-        }
-
-        let model = model
-            .filter(|value| !value.trim().is_empty())
-            .ok_or("额度漫游必须选择对方明确共享的模型")?;
-        let lease_key = QuotaLeaseKey::new(peer_token.clone(), agent_kind.clone())?;
-        let lease_ready = self.quota_lease_ready(&lease_key);
-        if lease_ready {
-            self.emit_quota_progress(operation_id, "preparing", "正在复用已预热的额度租约…");
-        } else {
-            self.emit_quota_progress(
-                operation_id,
-                "requesting",
-                format!("正在向 {peer_name} 同步额度租约…"),
-            );
-        }
-        let bundle = self
-            .acquire_quota_lease(lease_key, model.clone(), Some(operation.as_ref()))
-            .await?;
-
-        operation.ensure_active()?;
-        if !lease_ready {
-            self.emit_quota_progress(
-                operation_id,
-                "preparing",
-                "额度租约已就绪，正在创建隔离会话…",
-            );
-        }
-        let default_mode = {
-            let state = self.app.state::<AppState>();
-            let default_mode = state.settings.lock().unwrap().default_mode.clone();
-            default_mode
-        };
-        let mut thread = Thread::new(
-            cwd.clone(),
-            agent_kind.clone(),
-            Some(model),
-            mode.filter(|value| !value.is_empty())
-                .or(Some(default_mode).filter(|value| !value.is_empty())),
-            None,
-            false,
-        );
-        thread.quota_peer = Some(peer_token);
-        thread.quota_peer_name = Some(peer_name.clone());
-        if let Some(context) = clue_context {
-            thread.active_clue_card_id = Some(context.root_card_id.clone());
-            thread.clue_context = Some(context);
-        }
-        thread.title = format!("额度@{peer_name} · {}", basename(&cwd));
-        thread.push_system_local(
-            format!(
-                "🔐 本会话在你的本地目录执行，临时使用 {peer_name} 的 {} 额度；凭证已隔离，不会覆盖本机登录。",
-                agent_kind.label()
-            ),
-            "info",
-        );
-        let thread_id = thread.id.clone();
-        let runtime = crate::credential_roaming::materialize_runtime(
-            self.app.clone(),
-            &thread_id,
-            &agent_kind,
-            bundle,
-        )?;
-        if !operation.commit() {
-            runtime.shutdown().await;
-            return Err(QUOTA_CANCELLED_ERROR.into());
-        }
-        {
-            let state = self.app.state::<AppState>();
-            state
-                .borrowed_runtimes
-                .lock()
-                .unwrap()
-                .insert(thread_id.clone(), runtime);
-            let mut store = state.store.lock().unwrap();
-            store.threads.push(thread.clone());
-            store.save();
-            if !cwd.contains(crate::SCRATCH_MARK) {
-                state.projects.lock().unwrap().touch(&cwd);
-            }
-        }
-        self.publish_folders();
-        let _ = self.app.emit(EV_THREADS, json!({}));
-        self.emit_quota_progress(operation_id, "ready", "额度凭证已就绪，开始本地会话");
-        Ok(thread)
-    }
-
-    pub fn cancel_quota_roaming(&self, operation_id: &str) -> bool {
-        let Some(operation) = self
-            .quota_operations
-            .lock()
-            .unwrap()
-            .get(operation_id)
-            .cloned()
-        else {
-            return false;
-        };
-        operation.cancel()
-    }
-
-    fn spawn_quota_send(&self, to: String, kind: &str, data: Value) {
-        let relay = self.app.state::<AppState>().relay.clone();
-        let kind = kind.to_string();
-        tauri::async_runtime::spawn(async move {
-            relay.send_with_retry(&to, &kind, data).await;
-        });
-    }
-
-    fn on_quota_request(&self, env: &InEnvelope) {
-        let req_id = env.data["reqId"].as_str().unwrap_or_default().to_string();
-        let public_key = env.data["publicKey"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let agent_kind: AgentKind =
-            serde_json::from_value(env.data["agentKind"].clone()).unwrap_or(AgentKind::Devin);
-        let model = env.data["model"].as_str().unwrap_or_default().to_string();
-        if req_id.is_empty() || public_key.is_empty() {
-            return;
-        }
-        let allowed = {
-            let state = self.app.state::<AppState>();
-            let settings = state.settings.lock().unwrap();
-            quota_model_is_shared(&settings, &agent_kind, &model)
-        };
-        if !allowed {
-            self.spawn_quota_send(
-                env.from.clone(),
-                "quota.rejected",
-                json!({
-                    "reqId": req_id,
-                    "error": format!(
-                        "对方已取消共享 {} 模型 {model}，当前无法使用",
-                        agent_kind.label()
-                    ),
-                }),
-            );
-            return;
-        }
-
-        let app = self.app.clone();
-        let to = env.from.clone();
-        tauri::async_runtime::spawn(async move {
-            // Lyra 没有独立登录凭证文件：先在出借方把
-            // 生效配置（含密钥解析）导出，再走统一的凭证打包加密链路
-            let lyra_config = if matches!(agent_kind, AgentKind::Lyra) {
-                match app
-                    .state::<AppState>()
-                    .lyra
-                    .export_quota_credentials(&model)
-                    .await
-                {
-                    Ok(config) => Some(config),
-                    Err(error) => {
-                        let relay = app.state::<AppState>().relay.clone();
-                        relay.spawn_quota_send(
-                            to,
-                            "quota.rejected",
-                            json!({
-                                "reqId": req_id,
-                                "error": format!("{} 额度共享失败：{error}", agent_kind.label()),
-                            }),
-                        );
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-            std::thread::spawn(move || {
-                let result = crate::credential_roaming::collect_credentials(
-                    &app,
-                    agent_kind,
-                    lyra_config.as_deref(),
-                )
-                .and_then(|bundle| {
-                    crate::credential_roaming::encrypt_bundle(&public_key, &req_id, &bundle)
-                });
-                let relay = app.state::<AppState>().relay.clone();
-                match result {
-                    Ok(grant) => relay.spawn_quota_send(
-                        to,
-                        "quota.granted",
-                        json!({ "reqId": req_id, "grant": grant }),
-                    ),
-                    Err(error) => relay.spawn_quota_send(
-                        to,
-                        "quota.rejected",
-                        json!({ "reqId": req_id, "error": error }),
-                    ),
-                }
-            });
-        });
-    }
-
-    fn on_quota_granted(&self, env: &InEnvelope) {
-        let req_id = env.data["reqId"].as_str().unwrap_or_default().to_string();
-        let Some(pending) = self.pending_quota.lock().unwrap().remove(&req_id) else {
-            return;
-        };
-        let result = if env.from != pending.peer {
-            Err("额度凭证来源与请求目标不一致".into())
-        } else {
-            serde_json::from_value::<crate::credential_roaming::EncryptedGrant>(
-                env.data["grant"].clone(),
-            )
-            .map_err(|_| "加密凭证载荷无效".to_string())
-            .and_then(|grant| {
-                crate::credential_roaming::decrypt_bundle(pending.secret, &req_id, &grant)
-            })
-            .and_then(|bundle| {
-                if bundle.agent_kind == pending.agent_kind {
-                    Ok(bundle)
-                } else {
-                    Err("额度凭证后端与请求不一致".into())
-                }
-            })
-        };
-        let _ = pending.reply.send(result);
-    }
-
-    fn on_quota_rejected(&self, env: &InEnvelope) {
-        let req_id = env.data["reqId"].as_str().unwrap_or_default().to_string();
-        let Some(pending) = self.pending_quota.lock().unwrap().remove(&req_id) else {
-            return;
-        };
-        let error = env.data["error"]
-            .as_str()
-            .unwrap_or("对方拒绝了额度租借请求")
-            .to_string();
-        let _ = pending.reply.send(Err(error));
     }
 
     // ===== 漫游：guest 侧 =====
@@ -2653,36 +1848,6 @@ impl RelayManager {
         self.spawn_send(peer_token, "roaming.models_request", json!({}));
     }
 
-    /// 本机共享模型配置变化后，通知在线队友立即回拉，避免等待定时刷新或重启。
-    pub fn notify_peer_models_changed(self: &Arc<Self>) {
-        let Some((_, me, _)) = self.cfg() else {
-            return;
-        };
-        let peers = self.peers();
-        let Some(peers) = peers.as_array() else {
-            return;
-        };
-        for peer in peers {
-            let token = peer["token"].as_str().unwrap_or_default();
-            if token.is_empty()
-                || token == me.as_str()
-                || !peer["online"].as_bool().unwrap_or(false)
-            {
-                continue;
-            }
-            self.spawn_send(token.to_string(), "roaming.models_changed", json!({}));
-        }
-    }
-
-    /// 队友提示其共享模型已变化：立即向该队友回拉最新列表。
-    fn on_roaming_models_changed(&self, env: &InEnvelope) {
-        if env.from.is_empty() {
-            return;
-        }
-        // 等完整列表返回后再按凭证作用域清理；刷新失败不能误删仍有效的离线租约。
-        self.spawn_send_now(env.from.clone(), "roaming.models_request", json!({}));
-    }
-
     /// host：收到模型请求，收集本机「已启用且检测可用」后端的模型/模式列表回给对端。
     /// 顺序与前端 ALL_AGENT_KINDS 保持一致（lyra → devin → codex → codebuddy → cursor）。
     /// 所有 host 子会话共用父会话的授权，但各自拥有独立的 guest 镜像和事件路由。
@@ -2803,29 +1968,28 @@ impl RelayManager {
         let to = env.from.clone();
         let app = self.app.clone();
         tauri::async_runtime::spawn(async move {
-            let (kinds, shared): (Vec<AgentKind>, HashSet<String>) = {
+            let kinds: Vec<AgentKind> = {
                 let state = app.state::<AppState>();
                 let s = state.settings.lock().unwrap();
                 let avail = state.backend_availability.lock().unwrap();
-                let kinds = [
+                [
                     (AgentKind::Lyra, s.lyra_enabled),
                     (AgentKind::Devin, s.devin_enabled),
                     (AgentKind::Kimi, s.kimi_enabled),
                     (AgentKind::Claude, s.claude_enabled),
                     (AgentKind::Codex, s.codex_enabled),
                     (AgentKind::CodeBuddy, s.codebuddy_enabled),
+                    (AgentKind::WorkBuddy, s.workbuddy_enabled),
                     (AgentKind::Cursor, s.cursor_enabled),
                 ]
                 .into_iter()
                 // 可用性未检测完（map 为空/无该键）时按可用处理，避免误伤
                 .filter(|(k, en)| *en && avail.get(k.as_str()).copied().unwrap_or(true))
                 .map(|(k, _)| k)
-                .collect();
-                (kinds, s.quota_shared_models.iter().cloned().collect())
+                .collect()
             };
             let mut backends: Vec<&str> = Vec::new();
             let mut options = serde_json::Map::new();
-            let mut shared_options = serde_json::Map::new();
             for kind in kinds {
                 backends.push(kind.as_str());
                 let fetched = match kind {
@@ -2848,14 +2012,12 @@ impl RelayManager {
                             .ensure_model_options()
                             .await
                     }
+                    AgentKind::WorkBuddy => app.state::<AppState>().workbuddy.ensure_model_options().await,
                     AgentKind::Devin => app.state::<AppState>().acp.fetch_model_options().await,
                     AgentKind::Kimi => app.state::<AppState>().kimi.fetch_model_options().await,
                     AgentKind::Claude => app.state::<AppState>().claude.fetch_model_options().await,
                 };
                 if let Ok(v) = fetched {
-                    if let Some(filtered) = shared_model_options(&kind, &v, &shared) {
-                        shared_options.insert(kind.as_str().into(), filtered);
-                    }
                     options.insert(kind.as_str().into(), v);
                 }
             }
@@ -2866,40 +2028,19 @@ impl RelayManager {
                 json!({
                     "backends": backends,
                     "options": Value::Object(options),
-                    "sharedOptions": Value::Object(shared_options),
                 }),
             );
         });
     }
 
-    /// guest：收到 host 回传的模型列表，转发给前端按对端 token 缓存，
-    /// 并趁 host 在线预取共享凭证，使用户稍后选择模型时不依赖 host 仍在线。
+    /// guest：收到 host 回传的模型列表，转发给前端按对端 token 缓存。
     fn on_roaming_models(&self, env: &InEnvelope) {
-        let shared_options = &env.data["sharedOptions"];
-        let leases = shared_quota_leases(&env.from, shared_options);
-        self.quota_shared_models
-            .lock()
-            .unwrap()
-            .insert(env.from.clone(), shared_model_keys(shared_options));
-        self.retain_shared_quota_leases(&env.from, shared_options);
-        for (key, model) in leases {
-            if self.quota_lease_ready(&key) {
-                continue;
-            }
-            let relay = self.app.state::<AppState>().relay.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) = relay.acquire_quota_lease(key, model, None).await {
-                    relay.log(format!("[relay] 共享模型凭证预取失败：{error}"));
-                }
-            });
-        }
         let _ = self.app.emit(
             EV_RELAY_PEER_MODELS,
             json!({
                 "peer": env.from,
                 "backends": env.data["backends"].clone(),
                 "options": env.data["options"].clone(),
-                "sharedOptions": shared_options.clone(),
             }),
         );
     }
@@ -3515,10 +2656,15 @@ impl RelayManager {
                     });
                 }
             }
-            AgentKind::Kimi | AgentKind::Claude => {
+            AgentKind::Kimi | AgentKind::Claude | AgentKind::WorkBuddy => {
                 let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move {
-                    if host_prompt_is_current(&prompt_epoch) {
+                    if !host_prompt_is_current(&prompt_epoch) {
+                        return;
+                    }
+                    if agent_kind == AgentKind::WorkBuddy && mgr.is_running(&host_thread_id) {
+                        mgr.steer_prompt(host_thread_id, text, images).await;
+                    } else {
                         mgr.run_prompt(host_thread_id, text, images).await;
                     }
                 });
@@ -3585,7 +2731,7 @@ impl RelayManager {
                 let mgr = state.acp.clone();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
-            AgentKind::Kimi | AgentKind::Claude => {
+            AgentKind::Kimi | AgentKind::Claude | AgentKind::WorkBuddy => {
                 let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
             }
@@ -4901,165 +4047,6 @@ mod tests {
         assert_eq!(accepted_share_mode(true, "build").as_deref(), Some("build"));
         assert_eq!(accepted_share_mode(true, ""), None);
         assert_eq!(accepted_share_mode(false, "build"), None);
-    }
-
-    #[test]
-    fn filters_peer_models_to_explicit_quota_shares() {
-        let source = json!({
-            "configOptions": [{
-                "id": "model",
-                "currentValue": "cursor-large",
-                "options": [
-                    { "value": "cursor-small", "name": "Small" },
-                    { "value": "cursor-large", "name": "Large" }
-                ]
-            }],
-            "modes": null
-        });
-        let shared = HashSet::from(["cursor:cursor-small".to_string()]);
-
-        let filtered = shared_model_options(&AgentKind::Cursor, &source, &shared).unwrap();
-        let model = &filtered["configOptions"][0];
-        assert_eq!(model["currentValue"], "cursor-small");
-        assert_eq!(model["options"].as_array().unwrap().len(), 1);
-        assert_eq!(model["options"][0]["value"], "cursor-small");
-    }
-
-    #[test]
-    fn quota_request_requires_current_exact_model_share() {
-        let mut settings = Settings::default();
-        settings.cursor_enabled = true;
-        settings.quota_shared_models = vec!["cursor:cursor-small".into()];
-
-        assert!(quota_model_is_shared(
-            &settings,
-            &AgentKind::Cursor,
-            "cursor-small"
-        ));
-        assert!(!quota_model_is_shared(
-            &settings,
-            &AgentKind::Cursor,
-            "cursor-large"
-        ));
-        assert!(!quota_model_is_shared(
-            &settings,
-            &AgentKind::Codex,
-            "cursor-small"
-        ));
-
-        let mut lyra_settings = Settings::default();
-        lyra_settings.lyra_enabled = true;
-        lyra_settings.quota_shared_models = vec!["lyra:provider/model".into()];
-        assert!(quota_model_is_shared(
-            &lyra_settings,
-            &AgentKind::Lyra,
-            "provider/model"
-        ));
-        lyra_settings.lyra_enabled = false;
-        assert!(!quota_model_is_shared(
-            &lyra_settings,
-            &AgentKind::Lyra,
-            "provider/model"
-        ));
-    }
-
-    #[test]
-    fn quota_lease_key_is_per_peer_and_backend() {
-        let cursor = QuotaLeaseKey::new("peer-a".into(), AgentKind::Cursor).unwrap();
-        let codex = QuotaLeaseKey::new("peer-a".into(), AgentKind::Codex).unwrap();
-
-        assert_ne!(cursor, codex);
-        assert!(QuotaLeaseKey::new("".into(), AgentKind::Cursor).is_err());
-    }
-
-    #[test]
-    fn quota_runtime_supports_every_frontend_backend() {
-        for kind in [
-            AgentKind::Lyra,
-            AgentKind::Devin,
-            AgentKind::Codex,
-            AgentKind::CodeBuddy,
-            AgentKind::Cursor,
-        ] {
-            assert!(ensure_quota_backend_supported(&kind).is_ok());
-        }
-    }
-
-    #[test]
-    fn shared_quota_leases_follow_peer_payload_and_auth_scope() {
-        let shared = shared_quota_leases(
-            "peer-a",
-            &json!({
-                "cursor": {
-                    "configOptions": [{
-                        "id": "model",
-                        "options": [
-                            { "value": "cursor-small" },
-                            { "value": "cursor-large" }
-                        ]
-                    }]
-                },
-                "codex": {
-                    "configOptions": [{
-                        "id": "model",
-                        "options": [
-                            { "value": "gpt-5" }
-                        ]
-                    }]
-                }
-            }),
-        );
-
-        assert_eq!(shared.len(), 2);
-        assert!(shared.contains_key(
-            &QuotaLeaseKey::new("peer-a".into(), AgentKind::Cursor).unwrap()
-        ));
-        assert!(shared.contains_key(
-            &QuotaLeaseKey::new("peer-a".into(), AgentKind::Codex).unwrap()
-        ));
-        assert!(!shared.contains_key(
-            &QuotaLeaseKey::new("peer-b".into(), AgentKind::Cursor).unwrap()
-        ));
-
-        // Cursor 等后端的凭证按账号复用，两个模型映射到同一租约；具体模型是否共享
-        // 必须另存完整模型键（shared_model_keys 从原始 shared_options 提取），不能仅凭租约键判断。
-        let cursor_models = shared_model_keys(
-            &json!({
-                "cursor": {
-                    "configOptions": [{
-                        "id": "model",
-                        "options": [
-                            { "value": "cursor-small" },
-                            { "value": "cursor-large" }
-                        ]
-                    }]
-                }
-            }),
-        );
-        assert_eq!(cursor_models.len(), 2);
-        assert!(cursor_models.contains("cursor:cursor-small"));
-        assert!(cursor_models.contains("cursor:cursor-large"));
-    }
-
-    #[tokio::test]
-    async fn quota_operation_cancel_wakes_waiter_and_blocks_commit() {
-        let operation = Arc::new(QuotaOperation::new());
-        let waiter = operation.clone();
-        let task = tokio::spawn(async move { waiter.cancelled().await });
-
-        assert!(operation.cancel());
-        timeout(Duration::from_millis(100), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!operation.commit());
-    }
-
-    #[test]
-    fn committed_quota_operation_rejects_late_cancel() {
-        let operation = QuotaOperation::new();
-        assert!(operation.commit());
-        assert!(!operation.cancel());
     }
 
     #[test]

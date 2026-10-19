@@ -33,10 +33,12 @@ import {
   openClueCard,
   pickThreadModel,
   refreshSlashCommands,
+  refreshThreads,
   reasoningEffortChoices,
   setThreadReasoningEffort,
   sendPrompt,
   setView,
+  STAGE_COMMAND_PATTERN,
   state,
 } from "../store";
 import type { AgentKind, PromptImage } from "../types";
@@ -49,7 +51,7 @@ import {
   workflowSuspendedNotice,
 } from "../workflow/runtime";
 import { ConfigSelects } from "./ConfigSelects";
-import { IconClue, IconFile, IconSend, IconStop, IconUndo } from "./icons";
+import { IconClue, IconFile, IconX, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
@@ -161,11 +163,12 @@ export function Composer() {
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
-  // 原生注入当前轮：Lyra / Codex / Devin / CodeBuddy / Claude。
+  // 原生注入当前轮：Lyra / Codex / Devin / CodeBuddy / WorkBuddy / Claude。
   const supportsLiveSteer = () =>
     state.agentKind === "lyra" ||
     state.agentKind === "codex" ||
     state.agentKind === "codebuddy" ||
+    state.agentKind === "workbuddy" ||
     state.agentKind === "claude" ||
     state.agentKind === "devin";
   // 打断当前轮后以新 turn 继续：Cursor（Agent.create + slim memory）。
@@ -195,39 +198,16 @@ export function Composer() {
   };
 
   mountSessionShortcuts({
-    allowedActions: ["insertText", "stopSession"],
+    allowedActions: ["insertText"],
     onInsertText: insertShortcutText,
-    onStopSession: () => {
-      if (historyOpen() || slashQuery() !== null || stopDialogOpen()) return false;
-      if (!running()) return false;
-      requestStop();
-      return true;
-    },
   });
-
-  const stopShortcutLabel = () => "停止 (Esc)";
 
   // 进行中 / 漫游会话不开放跨后端切换，退回当前后端单选；否则可在已启用后端间切换
   const isGuest = () =>
     (state.threads.find((t) => t.id === state.currentId)?.roamingRole ?? null) === "guest";
-  const quotaThread = () => state.threads.find((t) => t.id === state.currentId);
-  const isQuotaBorrowed = () => !!quotaThread()?.quotaPeerName;
   const usesPeerModels = () => isGuest();
   const agentKinds = (): AgentKind[] =>
-    !running() && !usesPeerModels() && !isQuotaBorrowed() ? enabledAgentKinds() : [state.agentKind];
-  // 额度会话：模型列表用出借方共享的那一份（本机同后端列表可能包含没凭证的模型）。
-  // ThreadMeta 只带展示名，出借方 token 在打开会话时回填到 state.roamingPeer。
-  const quotaPeerToken = () => (isQuotaBorrowed() ? state.roamingPeer : null);
-  const quotaSharedModels = () => {
-    const token = quotaPeerToken();
-    if (!token) return undefined;
-    return [
-      {
-        peer: { token, name: quotaThread()?.quotaPeerName ?? "队友" },
-        options: state.peerModels[token]?.sharedOptions ?? {},
-      },
-    ];
-  };
+    !running() && !usesPeerModels() ? enabledAgentKinds() : [state.agentKind];
   // 漫游 guest：模型选择用对端（host）的列表（本机模型对方可能没有）
   const guestModels = () => {
     const t = state.roamingPeer;
@@ -237,11 +217,6 @@ export function Composer() {
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => {
     if (!usesPeerModels()) void ensureModelOptions(state.agentKind);
-  });
-  // 额度会话：已拉取共享列表后只展示共享模型（后端固定，只能换模型）
-  createEffect(() => {
-    const t = quotaPeerToken();
-    if (t) ensurePeerModels(t);
   });
   // 漫游 guest：确保已拉取对端模型列表
   createEffect(() => {
@@ -397,7 +372,8 @@ export function Composer() {
     });
   };
 
-  // 运行中第一次回车只排队；队列可立即引导，或在当前任务结束后自动发送。
+  // Stage 独立启动，无需等待当前会话结束；普通提示词仍在运行中默认排队。
+  const shouldQueue = (value: string) => running() && !STAGE_COMMAND_PATTERN.test(value);
   const submit = () => {
     const value = text().trim();
     if (empty()) return;
@@ -406,7 +382,7 @@ export function Composer() {
     if (!currentId) return;
     rememberPromptHistory(value, images);
     clearInput();
-    if (running()) {
+    if (shouldQueue(value)) {
       enqueuePrompt(currentId, value, images);
       return;
     }
@@ -694,7 +670,7 @@ export function Composer() {
             </div>
             <div class="workflow-manual-review-actions">
               <button type="button" class="btn secondary small" onClick={abandonWorkflowChain}>
-                结束流程并移出室女座
+                结束流程
               </button>
             </div>
           </div>
@@ -707,6 +683,17 @@ export function Composer() {
             <span class="clue-context-label">证据链</span>
             <span class="clue-context-separator" aria-hidden="true" />
             <span class="clue-context-title">{clue().title}</span>
+            <button
+              type="button"
+              aria-label="移除线索上下文"
+              title="移除线索上下文"
+              onClick={() => {
+                const id = state.currentId;
+                if (id) void api.clearThreadClue(id).then(refreshThreads);
+              }}
+            >
+              <IconX size={12} />
+            </button>
           </div>
         )}
       </Show>
@@ -791,9 +778,6 @@ export function Composer() {
           agentKinds={agentKinds()}
           model={state.model}
           modelSource={usesPeerModels() ? guestModelSource : undefined}
-          sharedModels={quotaSharedModels()}
-          sharedModelsOnly={isQuotaBorrowed()}
-          quotaPeerToken={quotaPeerToken()}
           onPickModel={(k, m) => void pickThreadModel(k, m)}
           anchorTo=".composer"
           favorites
@@ -833,7 +817,7 @@ export function Composer() {
             <button
               class="composer-btn stop"
               onClick={requestStop}
-              title={running() ? stopShortcutLabel() : "停止"}
+              title="停止"
               disabled={!running()}
             >
               <IconStop size={16} />
@@ -843,7 +827,7 @@ export function Composer() {
             class="composer-btn send"
             disabled={empty()}
             onClick={submit}
-            title={running() ? "加入提示词队列" : "发送"}
+            title={shouldQueue(text().trim()) ? "加入提示词队列" : "发送"}
           >
             <IconSend size={16} />
           </button>

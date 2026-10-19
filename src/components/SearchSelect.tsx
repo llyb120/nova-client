@@ -19,6 +19,8 @@ function readLastEfforts(): Record<string, string> {
 export interface SelectOption {
   value: string;
   label: string;
+  /** 触发器文案；模型列表保留短名，默认档位在这里显示实际强度。 */
+  selectedLabel?: string;
   title?: string;
   /** 分组名（厂商）；任一选项带分组时整个下拉切换为二级面板 */
   group?: string;
@@ -125,26 +127,18 @@ export function SearchSelect(props: {
   });
 
   const currentLabel = createMemo(() => {
-    // 命中当前值：直接用该项 label
-    const hit = currentOption();
+    const hit = currentOption() ?? (!props.value && !props.allowDefault ? firstSelectable() : undefined);
     if (hit) {
+      const label = hit.selectedLabel ?? hit.label;
       // 三级（合并后端）模式下，触发器带上后端名便于区分
       if (isThreeLevel() && hit.backendLabel) {
-        return hit.isDefault ? `${hit.backendLabel} 默认` : `${hit.backendLabel} · ${hit.label}`;
+        return hit.isDefault ? `${hit.backendLabel} 默认` : `${hit.backendLabel} · ${label}`;
       }
-      return hit.label;
+      return label;
     }
     // 值非空但未命中列表（如 codebuddy 云端清单未就绪时的中间态）：用友好名/原值显示，
     // 不回退到第一项，否则触发器会显示成别的模型（显示与实际选择不一致）。
     if (props.value) return props.fallbackLabel ?? props.value;
-    // 空值：不提供「默认」时回退到第一项，提供则用默认 label
-    const opt = props.allowDefault ? undefined : firstSelectable();
-    if (opt) {
-      if (isThreeLevel() && opt.backendLabel) {
-        return opt.isDefault ? `${opt.backendLabel} 默认` : `${opt.backendLabel} · ${opt.label}`;
-      }
-      return opt.label;
-    }
     return defaultLabel();
   });
 
@@ -273,6 +267,43 @@ export function SearchSelect(props: {
     return m?.efforts?.length ? m : undefined;
   });
 
+  // 思考强度列已展开时，从低处的模型斜向划向强度列（它从顶部起排），会先经过中间的其它模型行。
+  // 参考 Amazon 菜单的「安全三角」：以上一个鼠标位置为顶点、强度列左侧上下角为底边；
+  // 当前位置落在三角内说明正朝强度列移动，此时延迟切换（进入强度列即取消）；
+  // 否则是在模型列内正常浏览，立即切换。还没展开强度列时第一次悬停同样即时生效。
+  const HOVER_INTENT_MS = 300;
+  let intentTimer: ReturnType<typeof setTimeout> | undefined;
+  let effortRef: HTMLDivElement | undefined;
+  let lastPt: { x: number; y: number } | undefined;
+  const cancelIntent = () => {
+    if (intentTimer === undefined) return;
+    clearTimeout(intentTimer);
+    intentTimer = undefined;
+  };
+  const headingToEfforts = (e: MouseEvent) => {
+    const r = effortRef?.getBoundingClientRect();
+    if (!r || !r.width || !lastPt) return false;
+    const side = (ax: number, ay: number, bx: number, by: number) =>
+      (e.clientX - bx) * (ay - by) - (ax - bx) * (e.clientY - by);
+    const d1 = side(lastPt.x, lastPt.y, r.left, r.top);
+    const d2 = side(r.left, r.top, r.left, r.bottom);
+    const d3 = side(r.left, r.bottom, lastPt.x, lastPt.y);
+    return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
+  };
+  const scheduleActiveModel = (value: string, e: MouseEvent) => {
+    cancelIntent();
+    if (value === activeModel()) return;
+    if (!effortModel() || !headingToEfforts(e)) {
+      setActiveModel(value);
+      return;
+    }
+    intentTimer = setTimeout(() => {
+      intentTimer = undefined;
+      setActiveModel(value);
+    }, HOVER_INTENT_MS);
+  };
+  onCleanup(cancelIntent);
+
   /** 直接选模型时沿用该模型上次选的强度（仍在档位里才用），没有记录才用默认 */
   const pickModel = (o: SelectOption) => {
     const last = o.efforts?.length ? readLastEfforts()[o.value] : undefined;
@@ -355,6 +386,7 @@ export function SearchSelect(props: {
       setQuery("");
       setActiveGroup(null);
       setActiveBackend(null);
+      cancelIntent();
       setActiveModel(null);
       if (props.searchable) queueMicrotask(() => searchRef?.focus());
     }
@@ -394,7 +426,8 @@ export function SearchSelect(props: {
         o.efforts?.length && effortModel() === o ? "open" : ""
       }`}
       onClick={() => pickModel(o)}
-      onMouseEnter={() => setActiveModel(o.value)}
+      onMouseEnter={(e) => scheduleActiveModel(o.value, e)}
+      onMouseMove={(e) => scheduleActiveModel(o.value, e)}
       title={o.title ?? o.value}
     >
       <span class="sel-model-copy">
@@ -451,7 +484,7 @@ export function SearchSelect(props: {
   );
   const effortPane = () => (
     <Show when={hasEfforts()}>
-      <div class="sel-list sel-efforts">
+      <div ref={effortRef} class="sel-list sel-efforts" onMouseEnter={cancelIntent}>
         <Show when={effortModel()} fallback={<div class="sel-empty">思考强度</div>}>
           {(m) => (
             <>
@@ -469,6 +502,7 @@ export function SearchSelect(props: {
   const renderPop = () => (
     <div
       ref={popRef}
+      onMouseMove={(e) => (lastPt = { x: e.clientX, y: e.clientY })}
       class={`sel-pop ${isThreeLevel() ? "three" : ""} ${hasEfforts() ? "efforts" : ""} ${
         isGrouped() || isThreeLevel() ? "grouped" : ""
       } ${!usePortal() && place().down ? "down" : ""} ${

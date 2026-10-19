@@ -24,14 +24,15 @@ anyhow = "1"
 base64 = "0.22"
 enigo = "0.6.1"
 xcap = "0.9.8"
+# Reuse xcap's image crate for compact screenshots and Windows clipboard DIB decoding.
+image = { version = "0.25", default-features = false, features = ["jpeg", "bmp", "png"] }
 flate2 = "1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "native-tls", "blocking", "system-proxy", "socks", "stream", "multipart"] }
 hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# 星屑 PDF 文本提取（纯 Rust）。
+pdf-extract = "0.12"
 sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 keepawake = "0.6"
@@ -49,19 +50,30 @@ rtk = { path = "../vendor/rtk" }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# 剑来后台操作：Linux 私有 Xvfb 座席截图；macOS 按进程投递输入事件（enigo 只能发给 HID 层）。
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
+
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 
 tauri-plugin-global-shortcut = "2.3.2"
 
 [target.'cfg(windows)'.dependencies]
-# Keep COM types aligned with Tauri 2.12 / Wry 0.57.
-webview2-com = "0.39"
-windows = "0.62"
+windows = { version = "0.62", features = ["Win32_UI_Accessibility", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_Com_StructuredStorage", "Win32_System_SystemServices", "Win32_Graphics_Gdi", "Win32_System_Memory", "Win32_System_DataExchange", "Win32_Globalization"] }
+# windows::core::implement emits absolute ::windows_core paths.
+windows-core = "0.62"
 tauri-winrt-notification = "0.7"
 winreg = "0.55"
 windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader",
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
@@ -72,7 +84,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
+    "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Controls",
 ] }
 
 [dev-dependencies]
@@ -81,6 +95,22 @@ tempfile = "3"
 [profile.release]
 strip = true
 lto = true
+
+# 会话读写（JSON 序列化、SHA-256、压缩、base64）每次切会话/落盘都在热路径上；dev 下未优化会慢一个数量级。
+[profile.dev.package.serde_json]
+opt-level = 3
+
+[profile.dev.package.serde]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.base64]
+opt-level = 3
 
 # Keep screenshot resize/PNG processing fast in NovaDev without optimizing app code.
 [profile.dev.package.image]

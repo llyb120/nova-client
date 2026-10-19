@@ -5,10 +5,10 @@ import { api } from "../ipc";
 import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
 import { buildTimeNotesPrompt } from "../builtinPrompts";
 import {
-  compactThread,
   chatScrollToBottomSignal,
   createThread,
   deleteThread,
+  isSubagentThread,
   markThreadSwitchPointerDown,
   openThread,
   pickThreadModel,
@@ -19,14 +19,14 @@ import {
   state,
   timeMachineChangedSignal,
 } from "../store";
-import { mountSessionShortcuts } from "../sessionShortcuts";
+import { mountSessionShortcuts, setShortcutCaptureActive } from "../sessionShortcuts";
 import { ensureHistoryItems } from "../store";
 import { resolveUserScrollStick } from "../scrollStick";
 import type { AgentKind, Item, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
 import { Composer } from "./Composer";
-import { IconBroadcast, IconCompress, IconDownload, IconFile, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
+import { IconBroadcast,IconCopy, IconDownload, IconFile, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { PlanActionCard } from "./PlanActionCard";
 import { ShareModal } from "./ShareModal";
@@ -37,11 +37,13 @@ import { fmtTokens, groupItems } from "./TurnGroup";
 const WorkspacePanel = lazy(() => import("./WorkspacePanel"));
 
 export function ChatView() {
+  const isSubagent = () => isSubagentThread();
   const workspaceOpen = () => workspaceLayout.open;
   const setWorkspaceOpen = (open: boolean) => setWorkspaceLayout({ open });
   const [workspaceRequest, setWorkspaceRequest] = createSignal<{ path: string; line?: number } | null>(null);
   createEffect(() => { state.currentId; setWorkspaceRequest(null); });
   const previewFile = (event: Event) => {
+    if (isSubagent()) return;
     const detail = (event as CustomEvent<string | { path: string; line?: number }>).detail;
     const target = typeof detail === 'string' ? { path: detail } : detail;
     if (!target || typeof target.path !== "string" || !state.currentId) return;
@@ -56,12 +58,7 @@ export function ChatView() {
   mountSessionShortcuts({
     allowedActions: ["selectModel"],
     onSelectProject: () => {},
-    onSelectModel: (agentKind, model, quotaPeer) => {
-      // 额度会话的共享模型条目（快捷键 target 带队友）不能拿来换后端；只当前后端
-      // 的模型走 set_thread_model，由后端按已持有的额度租约把关。
-      if (quotaPeer) return;
-      void pickThreadModel(agentKind, model);
-    },
+    onSelectModel: (agentKind, model) => void pickThreadModel(agentKind, model),
   });
   let scrollQueued = false;
   let lastScrollTop = 0;
@@ -305,7 +302,7 @@ export function ChatView() {
     setPreviewItems(null);
     setPreviewCheckpointId(null);
     setTimeMachineEditTarget(null);
-    if (!threadId) return;
+    if (!threadId || isSubagent()) return;
     void api.getTimeMachineTimeline(threadId).then((value) => {
       if (state.currentId === threadId) setTimeline(value);
     }).catch(() => {});
@@ -315,7 +312,7 @@ export function ChatView() {
     state.threads.find((t) => t.id === state.currentId),
   );
   const isFireThread = () => /^\[Fire\]/.test(currentMeta()?.title ?? "");
-  const showTimeMachine = () => !isFireThread();
+  const showTimeMachine = () => !isSubagent() && !isFireThread();
   // 索引只依赖会话树；同链切换时根 id 不变，不重扫历史、不重建阶段列表。
   const stageIndex = createMemo(() => {
     const byId = new Map(state.threads.map((thread) => [thread.id, thread]));
@@ -365,9 +362,10 @@ export function ChatView() {
   const showStageRail = () => {
     const threads = stageThreads();
     // 链上有多个会话，或链本身就是工作流/Fire/员工事件链（从第一个节点起就显示）。
-    return threads.length > 1 || threads.some((thread) => isStageTitle(thread.title));
+    return threads.length > 1 || threads.some((thread) => thread.subagent || isStageTitle(thread.title));
   };
   const stageName = (thread: (typeof state.threads)[number]) => {
+    if (thread.subagent) return thread.title.replace(/^\[Agent\]\s*/, "").trim() || "子 Agent";
     // 工作流节点：[WF] 节点名 · 第N次（· 待补充等状态后缀），显示节点名。
     const hardStage = thread.title.match(/^\[Hard\]\s*(.+?)\s*$/);
     if (hardStage) return hardStage[1].trim() || "Hard";
@@ -391,9 +389,18 @@ export function ChatView() {
   // 链上其它 stage 的未读轮次数：当前打开的 stage 在 openThread 时已清零，不会再显示角标。
   const stageUnread = (thread: (typeof state.threads)[number]) =>
     thread.id === state.currentId ? 0 : (state.unreadTurns[thread.id] ?? 0);
+  // 点击即高亮：先让导航栏绘制一帧，再做耗时的会话切换，避免点击后“没反应”的卡顿观感。
+  const [pendingStageId, setPendingStageId] = createSignal<string | null>(null);
   const jumpToStage = async (threadId: string) => {
     // 每个 stage 都是独立会话；切换 stage 只切换会话，不再拼接 transcript。
-    await openThread(threadId);
+    if (threadId === state.currentId) return;
+    setPendingStageId(threadId);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+    try {
+      await openThread(threadId);
+    } finally {
+      setPendingStageId(null);
+    }
   };
   const [stageContextMenu, setStageContextMenu] = createSignal<{
     x: number;
@@ -402,6 +409,7 @@ export function ChatView() {
   } | null>(null);
   const deleteStageEvent = async (thread: ThreadMeta) => {
     setStageContextMenu(null);
+    if (thread.subagent) return;
     const descendants = new Set([thread.id]);
     let changed = true;
     while (changed) {
@@ -429,7 +437,7 @@ export function ChatView() {
   const roamingRole = () => currentMeta()?.roamingRole ?? null;
   const canStar = () => {
     const meta = currentMeta();
-    return !!meta && !meta.roamingRole;
+    return !!meta && !meta.subagent && !meta.roamingRole;
   };
   const toggleStar = async () => {
     const meta = currentMeta();
@@ -446,10 +454,60 @@ export function ChatView() {
       setStarUpdating(false);
     }
   };
+  const [forkSourceId, setForkSourceId] = createSignal<string | null>(null);
+  const [forkTitle, setForkTitle] = createSignal("");
+  const [forkBusy, setForkBusy] = createSignal(false);
+  const [forkError, setForkError] = createSignal("");
+  const [forkedId, setForkedId] = createSignal<string | null>(null);
+  const forkUnavailable = () => !!(currentMeta()?.roamingRole);
+  const startFork = () => {
+    const meta = currentMeta();
+    if (!meta || forkUnavailable() || forkSourceId()) return;
+    const root = stageIndex().byId.get(stageRootId() ?? "");
+    setForkTitle(`${root?.title ?? meta.title} (fork)`);
+    setForkError("");
+    setForkedId(null);
+    // 固定打开弹窗时的源节点；切换 Stage 或收到列表更新不能改变 fork 目标。
+    setForkSourceId(meta.id);
+  };
+  const closeFork = () => {
+    if (!forkBusy()) setForkSourceId(null);
+  };
+  createEffect(() => {
+    if (!forkSourceId()) return;
+    // Esc 只关闭弹窗，不能落入 Composer 的全局停止执行快捷键。
+    setShortcutCaptureActive(true);
+    onCleanup(() => setShortcutCaptureActive(false));
+  });
+  const submitFork = async () => {
+    const sourceId = forkSourceId();
+    const title = forkTitle().trim();
+    if (!sourceId || !title || forkBusy()) return;
+    setForkBusy(true);
+    setForkError("");
+    try {
+      // 创建已成功时，刷新失败后的重试只打开同一副本，不重复 fork。
+      let id = forkedId();
+      if (!id) {
+        const thread = await api.forkThread(sourceId, title);
+        id = thread.id;
+        setForkedId(id);
+      }
+      await refreshThreads();
+      await openThread(id);
+      setForkSourceId(null);
+    } catch (error) {
+      setForkError(`${forkedId() ? "副本已创建，刷新或打开失败：" : "Fork 失败："}${String(error)}`);
+    } finally {
+      setForkBusy(false);
+    }
+  };
+
   // worktree 会话的 cwd 是 uuid 工作目录，展示时用源仓库路径更直观
   const cwdDisplay = () => currentMeta()?.worktree?.repo || state.cwd;
 
   const startRename = () => {
+    if (isSubagent()) return;
     setDraft(state.title);
     setEditing(true);
   };
@@ -781,7 +839,7 @@ export function ChatView() {
     setEditing(false);
     const id = state.currentId;
     const title = draft().trim();
-    if (!id || !title || title === state.title) return;
+    if (!id || isSubagent() || !title || title === state.title) return;
     await api.renameThread(id, title);
     setState("title", title);
   };
@@ -792,7 +850,7 @@ export function ChatView() {
         <Show
           when={editing()}
           fallback={
-            <div class="chat-title" onDblClick={startRename} title="双击重命名">
+            <div class="chat-title" onDblClick={startRename} title={isSubagent() ? "子 Agent 执行记录（只读）" : "双击重命名"}>
               <TypewriterText
                 text={state.title}
                 title={state.title}
@@ -843,15 +901,6 @@ export function ChatView() {
               : `代执行 · ${currentMeta()?.roamingPeerName ?? "队友"}`}
           </span>
         </Show>
-        <Show when={currentMeta()?.quotaPeerName}>
-          <span
-            class="roaming-badge quota"
-            title={`本机目录执行，临时使用 ${currentMeta()?.quotaPeerName} 的加密授权额度`}
-          >
-            <IconBroadcast size={11} />
-            额度 · {currentMeta()?.quotaPeerName}
-          </span>
-        </Show>
         <div
           class="chat-cwd"
           title={
@@ -881,25 +930,8 @@ export function ChatView() {
         </span>
         <Show
           when={
-            state.agentKind === "codex" &&
             !!state.currentId &&
-            state.items.length > 0 &&
-            roamingRole() !== "guest"
-          }
-        >
-          <button
-            class="chat-compact-btn"
-            title="压缩上下文：把当前长历史浓缩为摘要，后续仅基于摘要继续，加快响应"
-            disabled={isRunning()}
-            onClick={() => void compactThread()}
-          >
-            <IconCompress size={14} />
-            压缩
-          </button>
-        </Show>
-        <Show
-          when={
-            !!state.currentId &&
+            !isSubagent() &&
             roamingRole() !== "guest" &&
             (state.relay.connected ||
               state.items.some((item) => item.type === "assistant"))
@@ -912,6 +944,20 @@ export function ChatView() {
           >
             <IconShare size={14} />
             Flow
+          </button>
+        </Show>
+        <Show when={currentMeta()}>
+          <button
+            type="button"
+            class="chat-share-btn"
+            title={forkUnavailable() ? "漫游会话不支持 Fork" : "Fork：复制整条会话及全部 Stage，不影响原会话；使用同一工作目录，不复制文件"}
+            aria-label={forkUnavailable() ? "Fork（漫游会话不可用）" : "Fork 整条会话"}
+            aria-haspopup="dialog"
+            disabled={forkUnavailable()}
+            onClick={startFork}
+          >
+            <IconCopy size={14} />
+            Fork
           </button>
         </Show>
         <Show when={state.relay.connected && state.currentId && roamingRole() === "guest"}>
@@ -943,7 +989,7 @@ export function ChatView() {
             </span>
           </button>
         </Show>
-        <Show when={!!state.currentId && roamingRole() !== "guest"}>
+        <Show when={!!state.currentId && !isSubagent() && roamingRole() !== "guest"}>
           <button
             type="button"
             class="chat-files-btn"
@@ -956,10 +1002,68 @@ export function ChatView() {
           </button>
         </Show>
       </header>
-      <Show when={showShare() && state.currentId}>
+      <Show when={forkSourceId()}>
+        <Portal>
+          <dialog
+            class="modal-backdrop"
+            aria-labelledby="fork-dialog-title"
+            aria-describedby="fork-dialog-description"
+            aria-modal="true"
+            style={{ width: "100%", height: "100%", "max-width": "none", "max-height": "none", margin: "0", padding: "0", border: "0", color: "var(--text)" }}
+            ref={(dialog) => {
+              queueMicrotask(() => {
+                if (!dialog.isConnected) return;
+                // 原生模态框负责 Tab 焦点约束及关闭后的焦点归还。
+                dialog.showModal();
+                dialog.querySelector("input")?.select();
+              });
+              onCleanup(() => dialog.close());
+            }}
+            onCancel={(event) => { event.preventDefault(); closeFork(); }}
+            onMouseDown={(event) => { if (event.target === event.currentTarget) closeFork(); }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && event.isComposing) event.preventDefault();
+            }}
+          >
+            <form
+              class="modal"
+              style={{ width: "460px", "max-width": "calc(100vw - 32px)" }}
+              aria-busy={forkBusy()}
+              onSubmit={(event) => { event.preventDefault(); void submitFork(); }}
+            >
+              <div class="modal-head"><span id="fork-dialog-title">Fork 会话 · 命名副本</span></div>
+              <div class="modal-body">
+                <p id="fork-dialog-description" class="field-hint">
+                  复制整条会话及全部 Stage，新名称用于副本根会话；原会话和正在运行的任务不受影响。
+                  副本沿用同一工作目录，不复制文件，也不会自动启动任务。
+                </p>
+                <label class="field">
+                  <span class="field-label">副本根会话名称</span>
+                  <input
+                    class="field-input"
+                    autofocus
+                    required
+                    value={forkTitle()}
+                    readOnly={forkBusy() || !!forkedId()}
+                    onInput={(event) => setForkTitle(event.currentTarget.value)}
+                  />
+                </label>
+                <Show when={forkError()}><p role="alert" class="field-hint" style={{ color: "var(--red)" }}>{forkError()}</p></Show>
+              </div>
+              <div class="modal-foot">
+                <button type="button" class="btn" disabled={forkBusy()} onClick={closeFork}>取消</button>
+                <button type="submit" class="btn primary" disabled={forkBusy() || !forkTitle().trim()}>
+                  {forkBusy() ? "处理中…" : forkedId() ? "重试打开副本" : "创建副本"}
+                </button>
+              </div>
+            </form>
+          </dialog>
+        </Portal>
+      </Show>
+      <Show when={!isSubagent() && showShare() && state.currentId}>
         <ShareModal threadId={state.currentId!} onClose={() => setShowShare(false)} />
       </Show>
-      <Show when={showTimeNotes() && state.currentId}>
+      <Show when={!isSubagent() && showTimeNotes() && state.currentId}>
         <TimeNotesModal
           defaultName={state.title.trim()}
           onConfirm={startTimeNotes}
@@ -977,6 +1081,7 @@ export function ChatView() {
             loadItems={ensureHistoryItems}
             permissions={permissions()}
             running={isRunning() && !previewItems()}
+            readOnly={isSubagent()}
             loading={state.loadingThread}
             preview={!!previewCheckpointId()}
             onReturnToCurrent={returnToCurrentTimeline}
@@ -991,11 +1096,19 @@ export function ChatView() {
               syncTimeCursor();
             }}
             onBrowseDetail={cancelBottomFollow}
-            emptyHint={`在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
+            emptyHint={isSubagent() ? "子 Agent 执行记录 · 由主会话调度" : `在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
           />
       </div>
 
       <footer class="chat-foot">
+        <Show when={!isSubagent()} fallback={
+          <div class="checkpoint-preview-banner">
+            <span role="status">子 Agent 执行记录 · 由主会话调度{isRunning() ? " · 执行中" : ""}</span>
+            <Show when={currentMeta()?.parentThreadId}>
+              {parentId => <button type="button" class="btn secondary small" onClick={() => void openThread(parentId())}>回主会话</button>}
+            </Show>
+          </div>
+        }>
         <Show when={previewCheckpointId()}>
           <button class="checkpoint-preview-banner" onClick={returnToCurrentTimeline}>回到当前时间线</button>
         </Show>
@@ -1007,6 +1120,7 @@ export function ChatView() {
         {/* 暂时隐藏「计划」面板；内部 plan 状态与事件仍照常更新 */}
         <PlanActionCard />
         <Composer />
+        </Show>
       </footer>
         </div>
 
@@ -1112,7 +1226,7 @@ export function ChatView() {
         </aside>
       </Show>
       <Portal>
-        <Show when={contextMenu()} keyed>
+        <Show when={!isSubagent() && contextMenu()} keyed>
           {(menu) => (
             <div class="repo-time-context-backdrop" onMouseDown={() => setContextMenu(null)}>
               <div
@@ -1150,7 +1264,7 @@ export function ChatView() {
               <button
                 type="button"
                 class="stage-rail-item"
-                classList={{ active: thread.id === state.currentId, unread: stageUnread(thread) > 0 }}
+                classList={{ active: thread.id === (pendingStageId() ?? state.currentId), unread: stageUnread(thread) > 0, subagent: thread.subagent }}
                 title={thread.title}
                 onPointerDown={() => markThreadSwitchPointerDown()}
                 onClick={() => {
@@ -1160,11 +1274,11 @@ export function ChatView() {
                 onContextMenu={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
-                  setStageContextMenu({ x: event.clientX, y: event.clientY, thread });
+                  if (!isSubagent() && !thread.subagent) setStageContextMenu({ x: event.clientX, y: event.clientY, thread });
                 }}
               >
                 <span>{stageName(thread)}</span>
-                <small>{index() + 1}</small>
+                <small>{thread.subagent ? `子 Agent · 并行${state.running[thread.id] ? " · 执行中" : ""}` : index() + 1}</small>
                 <Show when={stageUnread(thread) > 0}>
                   <span class="thread-unread-badge">{stageUnread(thread) > 9 ? "9+" : stageUnread(thread)}</span>
                 </Show>
@@ -1174,13 +1288,13 @@ export function ChatView() {
         </aside>
       </Show>
       {/* 文件/产物侧栏排在 Stage 导航右边：聊天 → 世界线 → Stage → 侧边栏。 */}
-      <Show when={workspaceOpen() && roamingRole() !== "guest"}>
+      <Show when={!isSubagent() && workspaceOpen() && roamingRole() !== "guest"}>
         <Show keyed when={state.currentId}>
           {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceLayout.mode === "terminal" ? null : workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
         </Show>
       </Show>
       <Portal>
-        <Show when={stageContextMenu()} keyed>
+        <Show when={!isSubagent() && stageContextMenu()} keyed>
           {(menu) => (
             <div class="repo-time-context-backdrop" onMouseDown={() => setStageContextMenu(null)}>
               <div

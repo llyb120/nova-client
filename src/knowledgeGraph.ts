@@ -1,3 +1,5 @@
+import { createSignal } from "solid-js";
+
 export interface KnowledgeRoute {
   id: string;
   task: string;
@@ -7,6 +9,9 @@ export interface KnowledgeRoute {
   pitfalls: string[];
   confidence: string;
   successes: number;
+  /** demo = 整理自用户演示的剑谱。 */
+  source?: string;
+  recordingId?: string | null;
 }
 export interface KnowledgeGroup {
   tool: string;
@@ -160,3 +165,7 @@ export function graphEdgePath(edge: GraphEdge, nodes: Map<string, GraphNode>, re
   return 'M ' + (a.x + (cx - a.x) * (a.radius + 3) / fromLength) + ' ' + (a.y + (cy - a.y) * (a.radius + 3) / fromLength)
     + ' Q ' + cx + ' ' + cy + ', ' + (b.x + (cx - b.x) * (b.radius + 6) / toLength) + ' ' + (b.y + (cy - b.y) * (b.radius + 6) / toLength);
 }
+
+/** Cross-page hand-off between the 剑谱 viewer and the knowledge graph (route id / recording id). */
+export const [focusRouteId, setFocusRouteId] = createSignal("");
+export const [jianpuFocus, setJianpuFocus] = createSignal("");

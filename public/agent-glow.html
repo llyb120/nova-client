@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- 剑来操作桌面（天蓝）/ 剑谱录制（m=rec，暖金）时的边缘呼吸光效。窗口排除在截图外且鼠标穿透，见 src-tauri/src/agent_glow.rs -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
+  .screen { position: fixed; overflow: hidden; pointer-events: none; }
+  .screen i { position: absolute; inset: 0; will-change: opacity; animation: 3.2s ease-in-out infinite alternate; }
+  /* 贴边的细光线：始终在，呼气时略暗 */
+  .edge { box-shadow: inset 0 0 0 1.5px rgba(125, 211, 252, .9), inset 0 0 14px 2px rgba(56, 189, 248, .7); animation-name: edge; }
+  /* 向内弥散的柔光：吸气时铺开，留足中间区域不挡用户看内容 */
+  .halo { box-shadow: inset 0 0 48px 10px rgba(56, 189, 248, .42), inset 0 0 120px 28px rgba(14, 165, 233, .18); animation-name: halo; }
+  /* 剑谱录制：暖金色、更慢的呼吸，左上角标签；和剑来的天蓝一眼可分，又不像告警红那样刺眼 */
+  .rec .screen i { animation-duration: 4.8s; }
+  .rec .edge { box-shadow: inset 0 0 0 1.5px rgba(253, 230, 138, .95), inset 0 0 14px 2px rgba(245, 158, 11, .6); }
+  .rec .halo { box-shadow: inset 0 0 48px 10px rgba(251, 191, 36, .32), inset 0 0 120px 28px rgba(217, 119, 6, .14); }
+  /* 开始录制：从按下处荡开一圈水波——亮的前沿、暗的后沿，先快后慢地减速扩散并淡出 */
+  .ripple { position: fixed; width: 420px; height: 420px; border-radius: 50%; pointer-events: none; opacity: 0;
+    transform: translate(-50%, -50%) scale(.04);
+    /* 深琥珀外缘 + 亮金前沿 + 内侧淡尾，深浅背景上都看得清；外圈一点阴影模拟水面折光 */
+    background: radial-gradient(circle closest-side, transparent 62%, rgba(217, 119, 6, .18) 74%, rgba(245, 158, 11, .7) 85%,
+      rgba(255, 236, 170, 1) 90%, rgba(217, 119, 6, .95) 95%, rgba(146, 64, 14, .5) 98%, transparent 100%);
+    box-shadow: 0 0 18px 2px rgba(180, 83, 9, .25);
+    animation: ripple 1.25s cubic-bezier(.08, .62, .25, 1) forwards; }
+  .touch { position: fixed; width: 34px; height: 34px; border-radius: 50%; pointer-events: none; transform: translate(-50%, -50%);
+    background: radial-gradient(circle, rgba(255, 251, 235, .95), rgba(245, 158, 11, .6) 50%, rgba(180, 83, 9, .25) 65%, transparent 74%); animation: touch .45s ease-out forwards; }
+  @keyframes ripple { 0% { opacity: 1; transform: translate(-50%, -50%) scale(.04) } 55% { opacity: .9 } 100% { opacity: 0; transform: translate(-50%, -50%) scale(1) } }
+  @keyframes touch { from { opacity: 1; transform: translate(-50%, -50%) scale(.6) } to { opacity: 0; transform: translate(-50%, -50%) scale(1.4) } }
+  .tag { position: absolute; left: 14px; top: 12px; padding: 3px 10px; border-radius: 999px; font: 600 12px/18px system-ui, sans-serif;
+    color: #451a03; background: rgba(253, 230, 138, .92); letter-spacing: .5px; }
+  .tag::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: #d97706; animation: blink 1.6s ease-in-out infinite; }
+  @keyframes blink { 50% { opacity: .25 } }
+  @keyframes edge { from { opacity: 1 } to { opacity: .55 } }
+  @keyframes halo { from { opacity: .15 } to { opacity: 1 } }
+  @media (prefers-reduced-motion: reduce) { .screen i { animation: none; opacity: .8 } .ripple { display: none } }
+</style>
+<div id="screens"></div>
+<script>
+  // s=x,y,w,h,...：每块屏相对本窗口左上角的物理像素
+  function draw() {
+    const q = new URLSearchParams(location.search);
+    const n = (q.get("s") || "").split(",").map(Number);
+    const rec = q.get("m") === "rec";
+    document.body.classList.toggle("rec", rec);
+    const r = devicePixelRatio || 1;
+    const nodes = Array.from({ length: n.length / 4 | 0 }, (_, i) => {
+      const [x, y, w, h] = n.slice(i * 4, i * 4 + 4).map(v => v / r);
+      const screen = document.createElement("div");
+      screen.className = "screen";
+      Object.assign(screen.style, { left: x + "px", top: y + "px", width: w + "px", height: h + "px" });
+      screen.innerHTML = '<i class="halo"></i><i class="edge"></i>' + (rec && i === 0 ? '<span class="tag">剑谱录制中</span>' : '');
+      return screen;
+    });
+    document.getElementById("screens").replaceChildren(...nodes);
+    // o=x,y：开始录制的起点（相对本窗口左上角的物理像素）。涟漪放在 screens 之外：窗口显示时会被
+    // 拉伸到全屏触发 resize 重绘，不能把正在播的涟漪一起替换掉（首次录制看不到涟漪的原因）。
+    const o = (q.get("o") || "").split(",").map(Number);
+    if (rec && o.length === 2 && o.every(Number.isFinite) && !played) {
+      played = true;
+      const [x, y] = o.map(v => v / r);
+      // 等页面真正可见再播：窗口刚建好时 WebView 还当自己隐藏，动画会在看不见时播完。
+      const play = () => requestAnimationFrame(() => {
+        for (const cls of ["touch", "ripple"]) {
+          const el = document.createElement("div");
+          el.className = cls;
+          Object.assign(el.style, { left: x + "px", top: y + "px" });
+          el.addEventListener("animationend", () => el.remove());
+          document.body.append(el);
+        }
+      });
+      if (document.visibilityState === "visible") play();
+      else document.addEventListener("visibilitychange", function once() {
+        if (document.visibilityState !== "visible") return;
+        document.removeEventListener("visibilitychange", once);
+        play();
+      });
+    }
+  }
+  let played = false;
+  addEventListener("DOMContentLoaded", draw);
+  addEventListener("resize", draw);
+</script>

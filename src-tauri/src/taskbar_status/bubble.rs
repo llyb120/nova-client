@@ -1,0 +1,409 @@
+//! A click on the taskbar Butterfly focuses the assistant in a reused transparent webview.
+//! Hovering or dragging over the chip never opens it; only a failed drop surfaces it unfocused.
+//! Finishing a turn does not open it.
+
+use super::{Kind, Rect};
+use serde_json::{json, Value};
+use std::{
+    sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Mutex},
+    time::{Duration, Instant},
+};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use windows_sys::Win32::{
+    Foundation::{HWND, POINT, RECT},
+    Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED},
+    UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
+    UI::WindowsAndMessaging::{GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowRect, GA_ROOTOWNER, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE},
+};
+
+const LABEL: &str = "taskbar-bubble";
+/// CSS width including the transparent margin that holds the card's shadow.
+const WIDTH: f64 = 560.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Anchor {
+    /// Butterfly chip, physical pixels.
+    pub chip: Rect,
+    /// Work area of the chip's monitor, physical pixels.
+    pub work: Rect,
+    pub scale: f64,
+}
+
+static ANCHOR: Mutex<Option<Anchor>> = Mutex::new(None);
+/// The live card, asked for by a click on the Butterfly.
+static WANTED: AtomicBool = AtomicBool::new(false);
+static CAPTURE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+/// Hover never takes focus and closes once the pointer leaves both the Butterfly and the panel.
+/// Clicking inside pins the panel for keyboard input until blur or explicit dismissal.
+static PANEL: AtomicBool = AtomicBool::new(false);
+static PANEL_WATCH: AtomicBool = AtomicBool::new(false);
+/// Bumped by hide(): a watcher outliving a quick hide/reopen restarts its bookkeeping.
+static OPENED: AtomicUsize = AtomicUsize::new(0);
+static BUILD: Mutex<()> = Mutex::new(());
+/// Finished result and its rendered revision, kept on the live card even after it is read.
+static SHOWN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+/// Built once the Butterfly shows, so a click does not wait for a cold webview.
+pub(super) fn window(app: &AppHandle) -> Option<WebviewWindow> {
+    let _building = BUILD.lock().unwrap();
+    if let Some(window) = app.get_webview_window(LABEL) { return Some(window); }
+    let window = tauri::WebviewWindowBuilder::new(app, LABEL, tauri::WebviewUrl::App("index.html?bubble=1".into()))
+        .title("Nova").decorations(false).resizable(false).shadow(false)
+        .transparent(true).background_color(tauri::window::Color(0, 0, 0, 0))
+        .always_on_top(true).skip_taskbar(true).visible(false).focused(false)
+        // Wry's Windows native handler consumes text/URL drops without forwarding them.
+        // This panel handles DOM files + text; the taskbar chip keeps its native OLE target.
+        .disable_drag_drop_handler()
+        .inner_size(WIDTH, 640.0)
+        .build()
+        .map_err(|error| eprintln!("[taskbar-status] cannot create bubble: {error}"))
+        .ok()?;
+    // Neither native nor CSS entrance transitions: show the assistant immediately. A native hide
+    // transition can retain the old WebView surface and flash it at the taskbar edge.
+    if let Ok(hwnd) = window.hwnd() {
+        let disabled = 1i32;
+        let result = unsafe { DwmSetWindowAttribute(hwnd.0 as _, DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+            &disabled as *const _ as _, size_of::<i32>() as u32) };
+        if result < 0 { eprintln!("[taskbar-status] cannot disable bubble transitions: {result:#x}"); }
+        // tao keeps WS_CAPTION on undecorated windows and strips it in WM_NCCALCSIZE, but the
+        // frame computed during creation still has the caption; only tao's show() refreshed it.
+        // We show natively (see focus()), so refresh the frame once here while still hidden.
+        unsafe { SetWindowPos(hwnd.0 as _, std::ptr::null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED); }
+    }
+    let handle = app.clone();
+    let panel = window.hwnd().map_or(0, |hwnd| hwnd.0 as isize);
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Focused(true) => { PANEL.store(false, Ordering::Release); }
+        // A file picker opened from the panel is owned by it: not a blur.
+        tauri::WindowEvent::Focused(false) => {
+            let fg = unsafe { GetForegroundWindow() };
+            if fg.is_null() || unsafe { GetAncestor(fg, GA_ROOTOWNER) } as isize != panel { blur(&handle); }
+        }
+        tauri::WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            hide(&handle);
+        }
+        _ => {}
+    });
+    Some(window)
+}
+
+
+/// The first native drop may finish before the WebView's event listeners exist.
+pub(super) fn capture_error(app: &AppHandle, error: &str) {
+    *CAPTURE_ERROR.lock().unwrap() = Some(error.to_owned());
+    let _ = app.emit_to(LABEL, "capsules:error", json!({ "error": error }));
+}
+
+pub(super) fn open(app: &AppHandle, anchor: Anchor) {
+    PANEL.store(false, Ordering::Release);
+    *ANCHOR.lock().unwrap() = Some(anchor);
+    WANTED.store(true, Ordering::Release);
+    // A freshly built page places itself on mount; a warm one reloads on this event.
+    if window(app).is_some() { let _ = app.emit_to(LABEL, "taskbar-bubble:open", ()); }
+    watch(app);
+}
+
+/// Unfocused preview after a failed drop: show the assistant unless the panel is already open.
+pub(super) fn open_panel(app: &AppHandle, anchor: Anchor) {
+    if WANTED.load(Ordering::Acquire) { return; }
+    PANEL.store(true, Ordering::Release);
+    *ANCHOR.lock().unwrap() = Some(anchor);
+    WANTED.store(true, Ordering::Release);
+    if window(app).is_some() { let _ = app.emit_to(LABEL, "taskbar-bubble:open", ()); }
+    watch(app);
+}
+
+fn watch(app: &AppHandle) {
+    if PANEL_WATCH.swap(true, Ordering::AcqRel) { return; }
+    let app = app.clone();
+    std::thread::spawn(move || loop {
+        watch_panel(&app);
+        PANEL_WATCH.store(false, Ordering::Release);
+        // An open racing this exit saw a live watcher and did not start its own.
+        if !WANTED.load(Ordering::Acquire) || PANEL_WATCH.swap(true, Ordering::AcqRel) { break; }
+    });
+}
+
+/// Input in a hover preview becomes an ordinary focused panel, no longer pointer-dismissed.
+pub(super) fn activate(app: &AppHandle) {
+    if !WANTED.load(Ordering::Acquire) { return; }
+    PANEL.store(false, Ordering::Release);
+    if let Some(window) = app.get_webview_window(LABEL) { focus(&window); }
+}
+
+/// Show and focus natively. Hover shows with ShowWindow, so tao's VISIBLE flag lags; tao's
+/// show() would then flip it and re-apply the window style with SWP_FRAMECHANGED, which
+/// flashes the transparent WebView on every click into the panel. hide() already hides
+/// natively too, so tao's flag is never needed. Our process owns the click, so
+/// SetForegroundWindow is permitted.
+fn focus(window: &WebviewWindow) {
+    let Ok(hwnd) = window.hwnd() else { return };
+    let hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        // Already active: do nothing. Re-moving focus into the WebView blurs/refocuses the
+        // textarea, whose focus handler calls activate() again, an endless focus loop.
+        if IsWindowVisible(hwnd) != 0 && GetForegroundWindow() == hwnd { return; }
+        if IsWindowVisible(hwnd) == 0 { ShowWindow(hwnd, SW_SHOW); }
+        SetForegroundWindow(hwnd);
+    }
+    // A foreground HWND does not hand keyboard focus to WebView2 on its first activation
+    // (keys then reach the bare host window: no caret, IME at 0,0). Move it in explicitly.
+    let _ = AsRef::<tauri::Webview>::as_ref(window).set_focus();
+}
+
+fn inside(r: (i32, i32, i32, i32), p: POINT) -> bool { p.x >= r.0 && p.x < r.2 && p.y >= r.1 && p.y < r.3 }
+
+/// Hover preview: close 300ms after the pointer left both the Butterfly and the panel.
+/// Clicked (pinned) panel: close once another window takes the foreground. tao only reports
+/// Focused(false) after it saw Focused(true), which the first native activation of this
+/// WebView can miss, so blur is also checked against the real foreground window.
+fn watch_panel(app: &AppHandle) {
+    let mut away: Option<Instant> = None;
+    // (open generation, foreground when pinning was first seen, panel has been foreground since)
+    let mut pinned: Option<(usize, HWND, bool)> = None;
+    while WANTED.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(100));
+        let Some(panel) = app.get_webview_window(LABEL).and_then(|w| w.hwnd().ok()).map(|h| h.0 as HWND) else { break };
+        if !PANEL.load(Ordering::Acquire) {
+            away = None;
+            let generation = OPENED.load(Ordering::Acquire);
+            let fg = unsafe { GetForegroundWindow() };
+            if fg.is_null() { continue; }
+            // Owned dialogs (e.g. a file picker) still count as the panel.
+            let ours = fg == panel || unsafe { GetAncestor(fg, GA_ROOTOWNER) } == panel;
+            match &mut pinned {
+                Some((g, first, seen)) if *g == generation => {
+                    if ours { *seen = true; continue; }
+                    // Never activated (foreground denied): only a change of foreground is a blur.
+                    if !*seen && fg == *first { continue; }
+                    if OPENED.load(Ordering::Acquire) == generation && !PANEL.load(Ordering::Acquire) { blur(app); }
+                    break;
+                }
+                _ => pinned = Some((generation, fg, ours)),
+            }
+            continue;
+        }
+        pinned = None;
+        let Some(anchor) = *ANCHOR.lock().unwrap() else { break };
+        let mut p = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut p) } == 0 { continue; }
+        let c = anchor.chip;
+        let over_panel = {
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            (unsafe { IsWindowVisible(panel) }) != 0 && (unsafe { GetWindowRect(panel, &mut r) }) != 0 && inside((r.left, r.top, r.right, r.bottom), p)
+        };
+        if inside((c.left, c.top, c.right, c.bottom), p) || over_panel { away = None; continue; }
+        if away.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(300) {
+            if PANEL.load(Ordering::Acquire) { hide(app); }
+            break;
+        }
+    }
+}
+
+/// Another window took the foreground. With the left button still down that is probably the
+/// source of a drag headed for this panel: keep it until release, then close unless the drop
+/// (which re-activates the panel) landed on it.
+fn blur(app: &AppHandle) {
+    let down = || unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000 != 0;
+    if !down() { return hide(app); }
+    let (app, generation) = (app.clone(), OPENED.load(Ordering::Acquire));
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        while down() && start.elapsed() < Duration::from_secs(60) { std::thread::sleep(Duration::from_millis(30)); }
+        let panel = app.get_webview_window(LABEL).and_then(|w| w.hwnd().ok()).map(|h| h.0 as HWND);
+        let over = panel.is_some_and(|panel| {
+            let (mut r, mut p) = (RECT { left: 0, top: 0, right: 0, bottom: 0 }, POINT { x: 0, y: 0 });
+            (unsafe { GetWindowRect(panel, &mut r) != 0 && GetCursorPos(&mut p) != 0 }) && inside((r.left, r.top, r.right, r.bottom), p)
+        });
+        if over { std::thread::sleep(Duration::from_millis(500)); }
+        let fg = unsafe { GetForegroundWindow() };
+        let ours = panel.is_some_and(|panel| fg == panel || unsafe { GetAncestor(fg, GA_ROOTOWNER) } == panel);
+        if OPENED.load(Ordering::Acquire) == generation && !PANEL.load(Ordering::Acquire) && !ours { hide(&app); }
+    });
+}
+
+/// Close the card without acknowledging updates it has not rendered yet.
+pub(super) fn hide(app: &AppHandle) {
+    PANEL.store(false, Ordering::Release);
+    WANTED.store(false, Ordering::Release);
+    OPENED.fetch_add(1, Ordering::AcqRel);
+    SHOWN.lock().unwrap().take();
+    // Shown natively (see focus()), so hide natively; tao's VISIBLE flag is never relied on.
+    if let Some(Ok(hwnd)) = app.get_webview_window(LABEL).map(|window| window.hwnd()) {
+        unsafe { ShowWindow(hwnd.0 as _, SW_HIDE); }
+    }
+    let _ = app.emit_to(LABEL, "taskbar-bubble:hidden", ());
+    super::windows::wake();
+}
+
+/// Close the card, optionally marking the supplied thread as viewed.
+pub(super) fn dismiss(app: &AppHandle, thread: Option<String>) {
+    if let Some(thread) = thread { super::mark_seen(app, &thread); }
+    hide(app);
+}
+
+/// Size to the rendered cards and sit just above (or below) the taskbar, centred on the chip.
+fn frame(anchor: Anchor, css_height: f64) -> (i32, i32, i32, i32) {
+    let a = anchor;
+    let margin = (8.0 * a.scale).round() as i32;
+    let width = ((WIDTH * a.scale).round() as i32).min((a.work.right - a.work.left - 2 * margin).max(1));
+    let height = ((css_height.max(1.0) * a.scale).round() as i32).min((a.work.bottom - a.work.top - margin).max(1));
+    let center = (a.chip.left + a.chip.right) / 2;
+    let x = (center - width / 2).min(a.work.right - margin - width).max(a.work.left + margin);
+    // The window's own transparent margin is the visual gap to the taskbar edge.
+    let below = a.chip.top + a.chip.bottom < a.work.top + a.work.bottom;
+    let y = if below { a.work.top } else { a.work.bottom - height };
+    (x, y, width, height)
+}
+
+pub(super) fn place(app: &AppHandle, css_height: f64) -> bool {
+    // Clearing cards on hide fires ResizeObserver again. Do not move/resize the hidden surface.
+    if !WANTED.load(Ordering::Acquire) { return false; }
+    let Some(anchor) = *ANCHOR.lock().unwrap() else { return false };
+    let Some(window) = app.get_webview_window(LABEL) else { return false };
+    let Ok(hwnd) = window.hwnd() else { return false };
+    let hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
+    let (x, y, width, height) = frame(anchor, css_height);
+    // Not tauri's set_size/set_position: tao re-shows with activation on each resize.
+    unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE); }
+    let wanted = WANTED.load(Ordering::Acquire);
+    if wanted && PANEL.load(Ordering::Acquire) {
+        // Hover must not steal focus from the app the user is working in.
+        if unsafe { IsWindowVisible(hwnd) } == 0 { unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE); } }
+        // The pointer may have left (watch_panel hid it) between the check above and the show.
+        if !WANTED.load(Ordering::Acquire) { unsafe { ShowWindow(hwnd, SW_HIDE); } return false; }
+        return true;
+    }
+    if wanted && (unsafe { IsWindowVisible(hwnd) } == 0 || !window.is_focused().unwrap_or(true)) { focus(&window); }
+    if WANTED.load(Ordering::Acquire) && unsafe { IsWindowVisible(hwnd) } != 0 {
+        // Acknowledge only the revision rendered by the page, not a newer store update.
+        let shown = SHOWN.lock().unwrap().clone();
+        if let (Some((thread, stamp)), Ok(mut seen)) = (shown, super::SEEN.lock()) {
+            seen.at.entry(thread).and_modify(|at| *at = (*at).max(stamp)).or_insert(stamp);
+        }
+        super::windows::wake();
+    }
+    wanted
+}
+
+/// Bubble "open session" / Butterfly double-click: hand over to the full Nova window.
+pub(super) fn open_thread(app: &AppHandle, thread: Option<String>) {
+    hide(app);
+    crate::sys_notify::focus_main_window(app);
+    if let Some(thread) = thread {
+        super::mark_seen(app, &thread);
+        super::windows::wake();
+        let _ = app.emit(crate::acp::EV_NOTIFY_OPEN, json!({ "threadId": thread }));
+    }
+}
+
+/// Quick reply typed on a card. Goes through the same main-window entry as remote control, so
+/// slash commands and workflows expand like Composer input; a busy thread queues it behind its turn.
+pub(super) fn reply(app: &AppHandle, thread: Option<&str>, text: &str) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() { return Err("回复内容不能为空".into()); }
+    let state = app.state::<crate::AppState>();
+    let busy = if let Some(thread) = thread {
+        let store = state.store.lock().map_err(|_| "会话存储不可用")?;
+        let t = store.get(thread).ok_or("会话不存在")?;
+        if t.subagent { return Err("子 Agent 会话不能直接回复".into()); }
+        crate::is_running(&state, t)
+    } else { false };
+    let event = if busy { crate::remote::EV_PROMPT_QUEUE_ENQUEUE } else { crate::remote::EV_REMOTE_PROMPT_DISPATCH };
+    app.emit(event, json!({ "threadId": thread, "text": text, "images": [] }))
+        .map_err(|error| format!("发送回复失败：{error}"))
+}
+
+/// The current turn's latest reply, or its error, in full.
+fn latest_reply(items: &[crate::threads::Item]) -> (Kind, String) {
+    use crate::threads::Item;
+    items.iter().rev()
+        .take_while(|item| !matches!(item, Item::User { .. }))
+        .find_map(|item| match item {
+            Item::Assistant { text, .. } if !text.trim().is_empty() => Some((Kind::Done, text.clone())),
+            Item::System { text, level, .. } if level == "error" => Some((Kind::Error, text.clone())),
+            _ => None,
+        })
+        .unwrap_or((Kind::Done, String::new()))
+}
+
+fn name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Idle => "idle",
+        Kind::Running => "running",
+        Kind::Waiting => "waiting",
+        Kind::Done => "done",
+        Kind::Error => "error",
+    }
+}
+
+/// Panel quick actions. Anything that needs the full window hands over to it and closes the panel.
+pub(super) fn quick(app: &AppHandle, action: &str) -> Result<Value, String> {
+    match action {
+        "jianpu" => return crate::jianpu::toggle(),
+        _ => {}
+    }
+    hide(app);
+    match action {
+        "knowledge" => { crate::sys_notify::focus_main_window(app); let _ = app.emit("nova:open-view", json!({ "view": "knowledge" })); }
+        _ => return Err(format!("未知快捷操作：{action}")),
+    }
+    Ok(Value::Null)
+}
+
+/// The session tab remains available alongside the default assistant and quick actions.
+pub(super) fn payload(app: &AppHandle) -> Value {
+    let shown = SHOWN.lock().unwrap().clone();
+    let Some(status) = super::snapshot(app, shown.as_ref().map(|(thread, _)| thread.as_str())) else { return Value::Null };
+    let state = app.state::<crate::AppState>();
+    let mut permissions: Vec<Value> = state.remote_permissions.lock().map(|p| p.values().cloned().collect()).unwrap_or_default();
+    let cards = {
+        let Ok(store) = state.store.lock() else { return Value::Null };
+        for permission in &mut permissions {
+            let title = permission["threadId"].as_str().and_then(|id| store.get(id)).map(|t| t.title.clone());
+            permission["threadTitle"] = json!(title);
+        }
+        let mut cards = Vec::new();
+        let settled = matches!(status.kind, Kind::Done | Kind::Error);
+        if WANTED.load(Ordering::Acquire) {
+            let thread = status.thread.as_deref().and_then(|id| store.get(id));
+            let (title, body) = thread.map(|t| (t.title.clone(), latest_reply(&t.items).1)).unwrap_or_default();
+            *SHOWN.lock().unwrap() = thread.filter(|_| settled).map(|t| (t.id.clone(), t.updated_at));
+            // Keyed by thread: a half-typed reply never carries over to another thread's card.
+            let key = format!("live:{}", status.thread.as_deref().unwrap_or(""));
+            cards.push(json!({ "key": key, "live": true, "kind": name(status.kind), "text": if status.kind == Kind::Idle { "新会话 · 临时目录" } else { &status.text }, "trailing": status.trailing,
+                "threadId": status.thread, "title": title, "body": body }));
+        }
+        cards
+    };
+    permissions.sort_by(|a, b| a["requestKey"].as_str().cmp(&b["requestKey"].as_str()));
+    // Cards follow the taskbar they pop out of, like Windows' own taskbar flyouts.
+    // Both hover and click default to the assistant; `panel` only controls focus behavior.
+    let capture_error = if cards.is_empty() { None } else { CAPTURE_ERROR.lock().unwrap().take() };
+    json!({ "cards": cards, "permissions": permissions, "light": super::windows::light_theme(), "panel": PANEL.load(Ordering::Acquire), "captureError": capture_error,
+        "jianpu": crate::jianpu::status() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bubble_hugs_the_taskbar_edge_and_stays_on_the_chip_monitor() {
+        let work = Rect { left: -1920, top: 0, right: 0, bottom: 1032 };
+        let chip = Rect { left: -60, top: 1040, right: -10, bottom: 1068 };
+        let (x, y, w, h) = frame(Anchor { chip, work, scale: 1.0 }, 300.0);
+        assert_eq!((w, h, y + h), (560, 300, 1032), "bottom taskbar: above the work area edge");
+        assert_eq!(x + w, -8, "clamped inside the right edge");
+        let top = Anchor { chip: Rect { left: -1000, top: 6, right: -800, bottom: 34 }, work: Rect { top: 40, ..work }, scale: 1.5 };
+        let (x, y, w, h) = frame(top, 5000.0);
+        assert_eq!((y, w), (40, 840), "top taskbar: below it, scaled");
+        assert!(h <= 1032 - 40 && x == -900 - w / 2);
+        let narrow = Anchor { work: Rect { left: 0, top: 0, right: 480, bottom: 400 }, chip: Rect { left: 420, top: 400, right: 470, bottom: 430 }, scale: 1.0 };
+        let (x, y, w, h) = frame(narrow, 640.0);
+        assert_eq!((x, w, h), (8, 464, 392));
+        assert!(y >= narrow.work.top && y + h <= narrow.work.bottom);
+    }
+
+}

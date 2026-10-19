@@ -19,7 +19,7 @@ export function nextRunningThread(
   };
   const targets = new Map<string, ThreadMeta>();
   for (const thread of ordinary) {
-    if (!running[thread.id]) continue;
+    if (thread.subagent || !running[thread.id]) continue;
     const root = rootOf(thread), previous = targets.get(root);
     if (!previous || thread.createdAt > previous.createdAt) targets.set(root, thread);
   }

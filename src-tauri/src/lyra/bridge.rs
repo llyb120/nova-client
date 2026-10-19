@@ -33,7 +33,7 @@ fn send_error(error: impl Into<String>) {
 }
 
 /// 事件出口：stdio 子进程写 stdout，进程内运行写 mpsc 通道。
-type Emit = Arc<dyn Fn(&Value) + Send + Sync>;
+pub(super) type Emit = Arc<dyn Fn(&Value) + Send + Sync>;
 
 fn stdout_emit() -> Emit {
     Arc::new(|value: &Value| send(value))
@@ -66,6 +66,36 @@ async fn settle_pending_input(command_busy: &AtomicBool, command_revision: &Atom
     }
 }
 
+/// 模型侧视觉上限：Claude 会把长边 >1568 或总像素超约 115 万的图先缩小再看，
+/// 本地按同一上限预缩，模型所见不变，请求体却小得多（大图原样上传会拖到网关超时）。
+const IMAGE_MAX_EDGE: f64 = 1568.0;
+const IMAGE_MAX_PIXELS: f64 = 1_150_000.0;
+
+/// 超出上限时等比缩小并重新编码（PNG 保持无损，JPEG 用 q90）；未超限或无法解码返回 None，调用方沿用原图。
+pub(crate) fn fit_image(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
+    let format = image::guess_format(bytes).ok()?;
+    let img = image::load_from_memory_with_format(bytes, format).ok()?;
+    let (w, h) = (img.width() as f64, img.height() as f64);
+    let scale = (IMAGE_MAX_EDGE / w.max(h)).min((IMAGE_MAX_PIXELS / (w * h)).sqrt());
+    if scale >= 1.0 {
+        return None;
+    }
+    let resized = img.resize_exact(
+        ((w * scale).round() as u32).max(1),
+        ((h * scale).round() as u32).max(1),
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut out = Vec::new();
+    if format == image::ImageFormat::Jpeg {
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
+        resized.to_rgb8().write_with_encoder(encoder).ok()?;
+        Some((out, "image/jpeg"))
+    } else {
+        resized.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
+        Some((out, "image/png"))
+    }
+}
+
 /// 把协议 parts 转为 (文本, 图片)（local_image 读文件转 base64）。
 fn prompt_input(parts: &[Value]) -> (String, Vec<Value>) {
     let mut texts = Vec::new();
@@ -78,17 +108,22 @@ fn prompt_input(parts: &[Value]) -> (String, Vec<Value>) {
                 }
             }
             Some("image_data") => {
-                images.push(json!({
-                    "type": "image",
-                    "data": part.get("data").and_then(Value::as_str).unwrap_or_default(),
-                    "mimeType": part.get("mime").and_then(Value::as_str).unwrap_or("image/png"),
-                }));
+                use base64::Engine;
+                let data = part.get("data").and_then(Value::as_str).unwrap_or_default();
+                let mime = part.get("mime").and_then(Value::as_str).unwrap_or("image/png");
+                let engine = base64::engine::general_purpose::STANDARD;
+                let fitted = engine.decode(data).ok().and_then(|bytes| fit_image(&bytes));
+                images.push(match fitted {
+                    Some((bytes, mime)) => json!({ "type": "image", "data": engine.encode(bytes), "mimeType": mime }),
+                    None => json!({ "type": "image", "data": data, "mimeType": mime }),
+                });
             }
             Some("local_image") => {
                 let path = part.get("path").and_then(Value::as_str).unwrap_or_default();
                 if let Some(mime) = image_media_type(path) {
                     if let Ok(data) = std::fs::read(path) {
                         use base64::Engine;
+                        let (data, mime) = fit_image(&data).unwrap_or((data, mime));
                         images.push(json!({
                             "type": "image",
                             "data": base64::engine::general_purpose::STANDARD.encode(data),
@@ -167,6 +202,92 @@ fn completed_tool_item(started: &Value, outcome: &Value) -> Value {
     item
 }
 
+/// 主会话和只读子 Agent Stage 使用同一套事件映射，工具结果/流式文本不会分叉。
+pub(super) fn turn_event_sink<'a>(
+    emit: &'a Emit,
+    session_id: &'a str,
+    total_usage: &'a mut Value,
+) -> impl FnMut(TurnEvent) + Send + 'a {
+    let turn_started = Instant::now();
+    let mut agent_message_index = 0u64;
+    let mut current_text = String::new();
+    let mut current_thinking = String::new();
+    let mut started_tools = std::collections::HashMap::new();
+    move |event| match event {
+        TurnEvent::Steer(message) => emit(&json!({ "type": "steer", "message": message })),
+        TurnEvent::MessageStart => {
+            agent_message_index += 1;
+            emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
+            current_text.clear();
+            current_thinking.clear();
+            // 快照刷新可能清掉 liveUsage；只重发真实累计用量，不估算 token。
+            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
+                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+            }
+        }
+        TurnEvent::TextDelta(delta) => {
+            current_text.push_str(&delta);
+            emit(&json!({
+                "type": "item",
+                "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
+            }));
+        }
+        TurnEvent::ThinkingDelta(delta) => {
+            current_thinking.push_str(&delta);
+            emit(&json!({
+                "type": "item",
+                "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
+            }));
+        }
+        TurnEvent::ToolStart { id, name, args } => {
+            let item = started_tool_item(&id, &name, &args);
+            started_tools.insert(id, item.clone());
+            emit(&json!({ "type": "item", "item": item }));
+        }
+        TurnEvent::ToolEnd { id, outcome } => {
+            let started = started_tools
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| json!({ "id": id, "type": "mcp_tool_call", "server": "Lyra" }));
+            emit(&json!({ "type": "item", "item": completed_tool_item(&started, &outcome) }));
+            if let Some(cwd) = outcome.get("details").and_then(|d| d.get("workingDirectory")).and_then(Value::as_str) {
+                emit(&json!({ "type": "working_directory_changed", "cwd": cwd }));
+            }
+            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
+                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+            }
+        }
+        TurnEvent::MessageEnd { usage } => {
+            let context_tokens: u64 = ["input", "cacheRead", "cacheWrite"]
+                .iter()
+                .map(|key| usage.get(key).and_then(Value::as_u64).unwrap_or(0))
+                .sum();
+            merge_usage(total_usage, &usage);
+            total_usage["contextTokens"] = json!(context_tokens);
+            emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+        }
+        TurnEvent::Retry { attempt, error, context_recovery } => {
+            emit(&json!({
+                "type": "timing",
+                "phase": if context_recovery { "context_overflow_recovery" } else { "provider_retry" },
+                "elapsedMs": turn_started.elapsed().as_millis() as u64,
+                "error": error,
+            }));
+            let mut ready = json!({ "type": "ready", "sessionId": session_id, "retry": attempt });
+            if context_recovery {
+                ready["contextRecovery"] = json!(true);
+            }
+            emit(&ready);
+        }
+        TurnEvent::Compacted(receipt) => {
+            emit(&json!({
+                "type": "timing", "phase": "context_compaction",
+                "elapsedMs": turn_started.elapsed().as_millis() as u64, "receipt": receipt,
+            }));
+        }
+    }
+}
+
 struct PromptContext {
     session_id: String,
     cwd: String,
@@ -180,7 +301,7 @@ async fn handle_prompt(
     fast_context: bool,
     roots: &Roots,
     mut line_rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
-    _app: Option<tauri::AppHandle>,
+    app: Option<tauri::AppHandle>,
 ) -> Result<(), String> {
     let turn_started = Instant::now();
     let sessions_root = roots.sessions();
@@ -245,6 +366,12 @@ async fn handle_prompt(
     let agent_instructions = load_agent_instructions(roots);
     let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
     let auto_change_project = settings.auto_change_project_enabled;
+    // 自动模式：当前模型不是剑来场景的模型时不给桌面/浏览器工具，转交给剑来场景闭环。
+    let auto = app.as_ref().zip(request.get("novaThreadId").and_then(Value::as_str)).and_then(|(app, id)| {
+        use tauri::Manager;
+        crate::auto_scope(&app.state::<crate::AppState>(), id)
+    });
+    let desktop = auto.as_ref().is_none_or(crate::AutoScope::desktop);
     let shell = (!read_only).then(prompt::detect_shell);
     let prompt_options = SystemPromptOptions {
         cwd: cwd_path.display().to_string(),
@@ -255,11 +382,15 @@ async fn handle_prompt(
         skills_text: format_skills_prompt(&skills),
         custom_instructions: agent_instructions,
         ponytail: settings.ponytail_enabled,
+        desktop,
     };
     let system_prompt = build_system_prompt(&prompt_options);
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
-    tools.extend(session::agent_tools());
+    if !desktop {
+        tools.retain(|tool| !matches!(tool.name, "jianlai" | "chrome"));
+    }
+    tools.extend(session::agent_tools(auto.map(|scope| scope.handoff).filter(|handoff| !handoff.is_empty())));
     let tool_shape = serde_json::to_string(
         &tools
             .iter()
@@ -301,7 +432,9 @@ async fn handle_prompt(
         context,
         cancelled: cancelled.clone(),
         steer: steer.clone(),
-        agents: Some(session::root_handle(&ctx.session_id)),
+        agents: Some(session::root_handle(&ctx.session_id).with_stage(
+            app.zip(request.get("novaThreadId").and_then(Value::as_str).map(str::to_owned)),
+        )),
     };
 
     emit(&json!({ "type": "ready", "sessionId": ctx.session_id }));
@@ -340,96 +473,9 @@ async fn handle_prompt(
         })
     };
 
-    // ---- 事件 → 协议 items ----
+    // ---- 事件 → 协议 items（与子 Agent Stage 共用）----
     let mut total_usage = json!({});
-    let mut agent_message_index = 0u64;
-    let mut current_text = String::new();
-    let mut current_thinking = String::new();
-    let mut started_tools: std::collections::HashMap<String, Value> =
-        std::collections::HashMap::new();
-
-    let mut on_event = |event: TurnEvent| match event {
-        TurnEvent::MessageStart => {
-            agent_message_index += 1;
-            emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
-            current_text.clear();
-            current_thinking.clear();
-            // 快照刷新可能清掉前端的临时 liveUsage；下一次 request 开始时用此前
-            // request 已返回的真实累计 usage 重发一次，不做任何 token 估算。
-            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
-                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
-            }
-        }
-        TurnEvent::TextDelta(delta) => {
-            current_text.push_str(&delta);
-            emit(&json!({
-                "type": "item",
-                "item": { "id": format!("agent_message-{agent_message_index}"), "type": "agent_message", "text": current_text.as_str() },
-            }));
-        }
-        TurnEvent::ThinkingDelta(delta) => {
-            current_thinking.push_str(&delta);
-            emit(&json!({
-                "type": "item",
-                "item": { "id": format!("reasoning-{agent_message_index}"), "type": "reasoning", "text": current_thinking.as_str() },
-            }));
-        }
-        TurnEvent::ToolStart { id, name, args } => {
-            let item = started_tool_item(&id, &name, &args);
-            started_tools.insert(id, item.clone());
-            emit(&json!({ "type": "item", "item": item }));
-        }
-        TurnEvent::ToolEnd { id, outcome } => {
-            let started = started_tools
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| json!({ "id": id, "type": "mcp_tool_call", "server": "Lyra" }));
-            emit(&json!({ "type": "item", "item": completed_tool_item(&started, &outcome) }));
-            if let Some(cwd) = outcome
-                .get("details")
-                .and_then(|details| details.get("workingDirectory"))
-                .and_then(Value::as_str)
-            {
-                emit(&json!({ "type": "working_directory_changed", "cwd": cwd }));
-            }
-            // 工具执行期间前端可能因运行态快照刷新而清空 liveUsage。在工具结束、
-            // 下一次 provider request 之前重发上一 request 的真实累计值。
-            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
-                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
-            }
-        }
-        TurnEvent::MessageEnd { usage } => {
-            // 费用字段按整轮累计；contextTokens 始终表示最后一次真实 provider 请求的输入上下文。
-            let context_tokens: u64 = ["input", "cacheRead", "cacheWrite"]
-                .iter()
-                .map(|key| usage.get(key).and_then(Value::as_u64).unwrap_or(0))
-                .sum();
-            merge_usage(&mut total_usage, &usage);
-            total_usage["contextTokens"] = json!(context_tokens);
-            emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
-        }
-        TurnEvent::Retry { attempt, error, context_recovery } => {
-            emit(&json!({
-                "type": "timing",
-                "phase": if context_recovery { "context_overflow_recovery" } else { "provider_retry" },
-                "elapsedMs": turn_started.elapsed().as_millis() as u64,
-                "error": error,
-            }));
-            let mut ready = json!({ "type": "ready", "sessionId": ctx.session_id, "retry": attempt });
-            if context_recovery {
-                ready["contextRecovery"] = json!(true);
-            }
-            emit(&ready);
-        }
-        TurnEvent::Compacted(receipt) => {
-            emit(&json!({
-                "type": "timing",
-                "phase": "context_compaction",
-                "elapsedMs": turn_started.elapsed().as_millis() as u64,
-                "receipt": receipt,
-            }));
-        }
-    };
+    let mut on_event = turn_event_sink(emit, &ctx.session_id, &mut total_usage);
 
     let mut input = Some(user_message(&text, &images));
     let outcome = loop {
@@ -570,19 +616,7 @@ async fn complete_data(
     Ok(Value::String(data))
 }
 
-fn export_data(request: &Value, roots: &Roots) -> Result<Value, String> {
-    let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
-    let selected = request["model"].as_str().ok_or("共享导出缺少模型")?;
-    let selections: Vec<String> = serde_json::from_value(request["sharedModels"].clone())
-        .map_err(|_| "共享导出缺少模型白名单")?;
-    let config_value = config::shared_config(&config_value, &selections, selected)?;
-    let resolved = config::resolve_config_env(&config_value, &config::process_env())?;
-    Ok(Value::String(
-        serde_json::to_string_pretty(&resolved).map_err(|e| e.to_string())?,
-    ))
-}
-
-/// 一次性请求（models/title/complete/export）：进程内直接调用，返回 data 载荷。
+/// 一次性请求（models/title/complete）：进程内直接调用，返回 data 载荷。
 /// borrowed_root：借用额度运行时的隔离数据根（凭证即其中的 alkaid/config.jsonc）；
 /// None 表示主运行时，使用全局数据根。
 pub async fn run_oneshot(
@@ -597,7 +631,6 @@ pub async fn run_oneshot(
         Some("models") => models_data(http, request, &roots).await,
         Some("title") => title_data(http, request, &roots).await,
         Some("complete") => complete_data(http, request, &roots).await,
-        Some("export") => export_data(request, &roots),
         Some(other) => Err(format!("Lyra 不支持的 action：{other}")),
         None => Err("Lyra 请求缺少 action".into()),
     }
@@ -687,11 +720,6 @@ async fn dispatch(http: &reqwest::Client, request: &Value) -> Result<(), String>
             send(&json!({ "ok": true, "data": data }));
             Ok(())
         }
-        Some("export") => {
-            let data = export_data(request, &roots)?;
-            send(&json!({ "ok": true, "data": data }));
-            Ok(())
-        }
         Some(other) => Err(format!("Lyra 不支持的 action：{other}")),
         None => Err("Lyra 请求缺少 action".into()),
     }
@@ -725,6 +753,57 @@ pub async fn run() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fit_image_downscales_only_oversized_images() {
+        let png = |w, h| {
+            let mut out = Vec::new();
+            image::DynamicImage::new_rgb8(w, h)
+                .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                .unwrap();
+            out
+        };
+        assert!(super::fit_image(&png(1000, 800)).is_none());
+        let (bytes, mime) = super::fit_image(&png(2564, 1700)).unwrap();
+        assert_eq!(mime, "image/png");
+        let fitted = image::load_from_memory(&bytes).unwrap();
+        assert!(fitted.width() <= 1568 && (fitted.width() * fitted.height()) as f64 <= 1_150_000.0 * 1.01);
+        assert!(fitted.width() > 1200, "不应过度缩小：{}", fitted.width());
+    }
+
+    #[test]
+    fn stage_and_main_share_streaming_tool_and_steer_projection() {
+        use super::*;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
+        let mut usage = json!({});
+        let mut sink = turn_event_sink(&emit, "session", &mut usage);
+        sink(TurnEvent::MessageStart);
+        sink(TurnEvent::TextDelta("hello".into()));
+        sink(TurnEvent::TextDelta(" world".into()));
+        sink(TurnEvent::ToolStart { id: "t1".into(), name: "read".into(), args: json!({"path":"missing"}) });
+        sink(TurnEvent::ToolEnd { id: "t1".into(), outcome: json!({"isError":true,"content":[{"type":"text","text":"not found"}]}) });
+        sink(TurnEvent::Steer(user_message("check again", &[])));
+        sink(TurnEvent::MessageEnd { usage: json!({"input":10,"output":2}) });
+        sink(TurnEvent::MessageStart);
+        sink(TurnEvent::TextDelta("next".into()));
+        sink(TurnEvent::MessageEnd { usage: json!({"input":20,"output":3}) });
+        drop(sink);
+        let events = events.lock().unwrap();
+        let items: Vec<_> = events.iter().filter(|e| e["type"] == "item").map(|e| &e["item"]).collect();
+        assert_eq!(items[0]["id"], items[1]["id"]);
+        assert_eq!(items[1]["text"], "hello world");
+        assert_eq!(items[2]["status"], "in_progress");
+        assert_eq!(items[2]["id"], items[3]["id"]);
+        assert_eq!(items[3]["isError"], true);
+        assert_eq!(items[3]["result"]["content"][0]["text"], "not found");
+        assert_ne!(items[1]["id"], items[4]["id"]);
+        assert_eq!(items[4]["text"], "next");
+        assert!(events.iter().any(|e| e["type"] == "steer" && e["message"]["content"][0]["text"] == "check again"));
+        assert_eq!(usage["input"], 30);
+        assert_eq!(usage["output"], 5);
+        assert_eq!(usage["contextTokens"], 20);
+    }
 
     /// 借用额度运行时：进程内按隔离数据根加载凭证配置（不起子进程、不读全局配置）。
     #[tokio::test]

@@ -11,6 +11,8 @@ export function agentLabel(kind: AgentKind): string {
       return "Codex";
     case "codebuddy":
       return "CodeBuddy";
+    case "workbuddy":
+      return "WorkBuddy";
     case "cursor":
       return "Cursor";
     default:
@@ -19,7 +21,7 @@ export function agentLabel(kind: AgentKind): string {
 }
 
 /** agent 单字徽标（侧边栏紧凑展示）：Lyra=L / Devin=D / Codex=C / CodeBuddy=B /
- *  Cursor=CS */
+ *  WorkBuddy=W / Cursor=CS */
 export function agentShort(kind: AgentKind): string {
   if (kind === "claude") return "CC";
   if (kind === "kimi") return "K";
@@ -30,6 +32,8 @@ export function agentShort(kind: AgentKind): string {
       return "C";
     case "codebuddy":
       return "B";
+    case "workbuddy":
+      return "W";
     case "cursor":
       return "CS";
     default:

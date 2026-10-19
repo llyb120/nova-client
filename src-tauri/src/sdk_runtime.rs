@@ -351,11 +351,7 @@ impl SdkManager {
         }
         parts.extend(prompt_parts(self.adapter.as_ref(), &text, &images));
         let lightweight_model = if self.adapter.agent_kind() == AgentKind::Lyra {
-            let app_state = self.app.state::<AppState>();
-            let settings = app_state.settings.lock().unwrap();
-            (AgentKind::from_str(&settings.lightweight_model_agent) == Some(AgentKind::Lyra))
-                .then(|| settings.lightweight_model.trim().to_string())
-                .filter(|model| !model.is_empty())
+            self.app.state::<AppState>().lyra_lightweight_model()
         } else {
             None
         };
@@ -369,6 +365,10 @@ impl SdkManager {
             "mode": mode,
             "reasoningEffort": reasoning_effort,
             "lightweightModel": lightweight_model,
+            "novaToolEnv": crate::auto_tool_env(&self.app.state::<AppState>(), &thread_id)
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), Value::String(value)))
+                .collect::<serde_json::Map<_, _>>(),
             "parts": parts
         });
         let mut outcome = self
@@ -670,41 +670,6 @@ impl SdkManager {
             kill_child(&mut bridge.child);
         }
         self.refresh_model_options_soon();
-    }
-
-    /// 出借 Lyra 额度：进程内导出本地 config.jsonc 的生效配置，
-    /// 并把 {env:NAME} 密钥占位符解析成字面量，
-    /// 借用方无需出借方的环境变量即可直接使用该配置。
-    pub async fn export_quota_credentials(&self, model: &str) -> Result<String, String> {
-        if self.adapter.agent_kind() != AgentKind::Lyra {
-            return Err("仅 Lyra 支持导出共享凭证".into());
-        }
-        let cwd = std::env::current_dir()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let shared_models: Vec<String> = self
-            .app
-            .state::<AppState>()
-            .settings
-            .lock()
-            .unwrap()
-            .quota_shared_models
-            .iter()
-            .filter_map(|key| key.strip_prefix("lyra:").map(str::to_string))
-            .collect();
-        let value = self
-            .run_bridge(
-                &cwd,
-                json!({
-                    "action": "export", "model": model, "sharedModels": shared_models
-                }),
-            )
-            .await?;
-        value
-            .as_str()
-            .filter(|config| !config.trim().is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| "Lyra 凭证导出结果无效".into())
     }
 
     /// 返回当前缓存的模型列表，供同步的远程快照构建逻辑使用。
@@ -1046,7 +1011,7 @@ impl SdkManager {
     async fn run_prompt_inprocess(
         &self,
         thread_id: &str,
-        request: Value,
+        mut request: Value,
         user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
@@ -1055,6 +1020,8 @@ impl SdkManager {
             let enabled = state.settings.lock().unwrap().context_tools_enabled();
             enabled
         };
+        // Lyra 子 agent 的 Stage 只用于展示，不经主轮次的短生命周期事件通道。
+        request["novaThreadId"] = json!(thread_id);
         let session = if self.adapter.agent_kind() == AgentKind::Codex {
             let (command, options) =
                 self.codex_launch(request["cwd"].as_str().unwrap_or_default(), false)?;
@@ -1295,6 +1262,15 @@ impl SdkManager {
                             self.adapter.label()
                         ),
                     );
+                    // provider 出错后 turn 会退避重试（每次可能等满 180s），只写日志时界面像卡死。
+                    if phase == "provider_retry" {
+                        let error = event.get("error").and_then(Value::as_str).unwrap_or("未知错误");
+                        self.push_system(
+                            thread_id,
+                            format!("{} 请求出错，正在自动重试：{error}", self.adapter.label()),
+                            "warn",
+                        );
+                    }
                 }
                 Some("item") => self.apply_item(thread_id, &event["item"], &mut item_ids),
                 Some("working_directory_changed") => {
@@ -1384,10 +1360,7 @@ impl SdkManager {
                     settings.context_retrieval_mode.as_str(),
                 );
         }
-        if !self.launch_env.is_empty() {
-            crate::credential_roaming::isolate_borrowed_command(&mut command);
-            command.envs(&self.launch_env);
-        }
+        command.envs(&self.launch_env);
         command.envs(launch.extra_env);
         apply_proxy_env(&mut command, &launch.proxy);
         if self.launch_env.is_empty() {
@@ -1428,10 +1401,7 @@ impl SdkManager {
             .arg("app-server")
             .current_dir(cwd)
             .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
-        if !self.launch_env.is_empty() {
-            crate::credential_roaming::isolate_borrowed_command(&mut command);
-            command.envs(&self.launch_env);
-        }
+        command.envs(&self.launch_env);
         apply_proxy_env(&mut command, &settings.codex_proxy);
         #[cfg(windows)]
         if state.windows_shell_shim_enabled {
@@ -1541,7 +1511,7 @@ impl SdkManager {
         store.save_thread(thread_id);
     }
 
-    fn apply_item(&self, thread_id: &str, value: &Value, ids: &mut HashMap<String, u64>) {
+    pub(crate) fn apply_item(&self, thread_id: &str, value: &Value, ids: &mut HashMap<String, u64>) {
         if self.adapter.uses_codex_model_routing() && is_codex_model_resume_warning(value) {
             return;
         }
@@ -1734,7 +1704,7 @@ impl SdkManager {
         Ok(())
     }
 
-    fn push_system(&self, thread_id: &str, text: String, level: &str) {
+    pub(crate) fn push_system(&self, thread_id: &str, text: String, level: &str) {
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
@@ -1744,7 +1714,7 @@ impl SdkManager {
         store.save_thread(thread_id);
     }
 
-    fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<&str>) {
+    pub(crate) fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<&str>) {
         self.app
             .state::<AppState>()
             .sleep_inhibitor
@@ -1766,7 +1736,7 @@ impl SdkManager {
         let _ = self.app.emit(EV_THREADS, json!({}));
     }
 
-    fn finish_turn(&self, thread_id: &str, stop_reason: &str, usage: Option<Value>) {
+    pub(crate) fn finish_turn(&self, thread_id: &str, stop_reason: &str, usage: Option<Value>) {
         if !self.is_running(thread_id) {
             return;
         }
@@ -1820,7 +1790,7 @@ impl SdkManager {
         }
     }
 
-    fn emit_update(&self, thread_id: &str, item: &Item) -> Result<(), tauri::Error> {
+    pub(crate) fn emit_update(&self, thread_id: &str, item: &Item) -> Result<(), tauri::Error> {
         self.emit_op(thread_id, json!({ "t": "upsert", "item": item }))
     }
 

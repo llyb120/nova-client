@@ -1,0 +1,24 @@
+.jianpu-page { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); color: var(--text); overflow: hidden; }
+.jianpu-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 24px 28px 16px; }
+.jianpu-header h1 { margin: 0; font-size: 22px; }
+.jianpu-header p { margin: 6px 0 0; color: var(--text-muted); font-size: 13px; }
+/* Recording uses the warm amber of the 剑谱 edge glow, distinct from jianlai's sky blue. */
+.jianpu-rec { color: #451a03; background: #fbbf24; border-color: #f59e0b; }
+.jianpu-error { margin: 0 28px 12px; color: var(--red, #e5484d); font-size: 13px; }
+.jianpu-body { flex: 1; min-height: 0; display: flex; gap: 16px; padding: 0 28px 24px; }
+.jianpu-list { width: 280px; flex: none; overflow: auto; display: flex; flex-direction: column; gap: 6px; }
+.jianpu-item { display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; border: 1px solid var(--border-light); border-radius: 10px; background: var(--bg-panel); color: var(--text); text-align: left; font: inherit; cursor: pointer; }
+.jianpu-item.active { border-color: var(--accent); }
+.jianpu-item strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.jianpu-item small { color: var(--text-muted); font-size: 12px; }
+.jianpu-state.learned { color: var(--green, #30a46c); }
+.jianpu-state.learning { color: var(--accent); }
+.jianpu-detail { flex: 1; min-width: 0; overflow: auto; }
+.jianpu-empty { color: var(--text-muted); font-size: 13px; }
+.jianpu-actions, .jianpu-routes { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; }
+.jianpu-steps { margin: 0; padding-left: 26px; display: flex; flex-direction: column; gap: 14px; }
+.jianpu-step-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 13px; word-break: break-all; }
+.jianpu-step-head small { color: var(--text-muted); font-size: 12px; }
+.jianpu-kind { padding: 1px 8px; border-radius: 999px; background: var(--accent-dim); color: var(--accent); font-size: 12px; white-space: nowrap; }
+.jianpu-shot { display: block; margin-top: 6px; max-width: min(100%, 720px); border: 1px solid var(--border-light); border-radius: 8px; }
+.jianpu-header-actions { display: flex; gap: 8px; }

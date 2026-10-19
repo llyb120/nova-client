@@ -6,7 +6,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createNovaBatchTools} from './nova-batch-tools.mjs';
-import {webviewMcpResult} from './webview-mcp-result.mjs';
+import {automationMcpResult} from './automation-mcp-result.mjs';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
 const tool = async name=>JSON.parse(await readFile(new URL(`./${name}-tool.json`,import.meta.url),'utf8'));
@@ -18,7 +18,11 @@ test('embedded CodeBuddy MCP advertises the current browser schemas and instruct
   try {
     await client.connect(transport);
     const listed=(await client.listTools()).tools;
-    for(const name of ['chrome','webview']) {
+    assert(!listed.some(t=>t.name==='webview'));
+    const removed=await client.callTool({name:'webview',arguments:{operation:'open',url:'https://example.com'}});
+    assert.equal(removed.isError,true);
+    assert.match(removed.content[0].text,/Unknown tool: webview/);
+    for(const name of ['chrome','jianlai']) {
       const actual=listed.find(t=>t.name===name),expected=await tool(name);
       assert(actual,`missing bundled ${name}`);
       assert.deepEqual(actual.inputSchema,expected.inputSchema,'Run npm run build:nova-tools-mcp before compiling Nova');
@@ -26,10 +30,11 @@ test('embedded CodeBuddy MCP advertises the current browser schemas and instruct
     }
   } finally {await client.close();}
 });
-test('Chrome and WebView share image coordinates, fast scope and bounded batch schemas',async()=>{
-  const [chrome,webview]=await Promise.all(['chrome','webview'].map(tool));
-  for(const name of ['action','imageId','scope','region','visual','maxEdge']) assert.deepEqual(chrome.inputSchema.properties[name],webview.inputSchema.properties[name]);
-  assert.deepEqual(chrome.inputSchema.properties.actions.items,webview.inputSchema.properties.actions.items);
+test('Chrome retains image coordinates, fast scope and bounded batch schemas',async()=>{
+  const chrome=await tool('chrome');
+  for(const name of ['action','imageId','scope','region','visual','maxEdge']) assert(chrome.inputSchema.properties[name]);
+  const withoutDescriptions=value=>JSON.parse(JSON.stringify(value,(key,value)=>key==='description'?undefined:value));
+  assert.deepEqual(withoutDescriptions(chrome.inputSchema.properties.actions.items),withoutDescriptions(chrome.inputSchema.properties.action));
   assert.equal(chrome.inputSchema.properties.actions.maxItems,16);
   assert.equal(chrome.inputSchema.properties.incognito.type,"boolean");
   assert.equal(chrome.inputSchema.properties.actions.items.properties.duration_ms.maximum,1500);
@@ -45,45 +50,42 @@ test('Chrome and WebView share image coordinates, fast scope and bounded batch s
     }
   }
 });
-test('JEV browser decisions share bounded plans; desktop remains advisory', async()=>{
-  const [chrome,webview,jianlai]=await Promise.all(['chrome','webview','jianlai'].map(tool));
-  assert.deepEqual(webview.inputSchema.properties.plan,chrome.inputSchema.properties.plan);
-  assert.deepEqual(webview.inputSchema.properties.experience,chrome.inputSchema.properties.experience);
-  assert.deepEqual(webview.inputSchema.properties.advice,chrome.inputSchema.properties.advice);
-  for (const browser of [chrome,webview]) {
-    assert.match(browser.description,/按情况选择/);
-    assert.match(browser.description,/知识图谱/);
-    assert.match(browser.description,/不强制拦截act/);
-    assert.doesNotMatch(browser.description,/jev_run_required/);
-    assert.match(browser.inputSchema.properties.plan.description,/可省略steps/);
+test('Chrome and Jianlai run only executes pre-confirmed steps', async()=>{
+  const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));
+  for (const browser of [chrome]) {
+    assert.match(browser.description,/升序前N不能替换为最高N项倒序展示/);
+    assert.doesNotMatch(browser.description,/JEV|advise|runTemplate|DOM排障|Altair|vision/);
+    assert.deepEqual(browser.inputSchema.properties.plan.required,['task','steps']);
+    assert.equal(browser.inputSchema.properties.action.properties.target,undefined);
+    assert.equal(browser.inputSchema.properties.actions.items.properties.target,undefined);
     assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
   }
-  assert.deepEqual(chrome.inputSchema.properties.advice,jianlai.inputSchema.properties.advice);
+  assert.match(jianlai.description,/Windows的type整段粘贴，目标读取后自动恢复原剪贴板，从不逐字模拟按键/);
+  assert.doesNotMatch(jianlai.description,/Unicode/);
+  assert.match(jianlai.description,/clipboard\.text.*相等就不重输/);
+  assert.match(jianlai.description,/未核验前不发送/);
+  assert.match(jianlai.inputSchema.properties.snapshotId.description,/act\/run必填/);
+  assert.match(jianlai.description,/漏snapshotId只返回补参提示/);
+  assert.equal(jianlai.inputSchema.properties.plan,undefined);
+  assert.deepEqual(jianlai.inputSchema.properties.actions.items.allOf[0].then,{required:['x','y']});
   assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,24);
-  assert.deepEqual(chrome.inputSchema.properties.plan.required,['task','authorization','expectedText']);
   assert.match(chrome.inputSchema.properties.tabTag.description,/本会话snapshotId/);
   for (const key of ['anyOf','oneOf','allOf']) assert.equal(chrome.inputSchema[key],undefined,'Keep the tool compatible with Claude Code');
   assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.default,32);
-  assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.maximum,64);
   assert.equal(chrome.inputSchema.properties.plan.properties.inputs.maxItems,8);
-  assert.deepEqual(chrome.inputSchema.properties.plan.properties.inputs.items.required,['name','text']);
-  assert.equal(chrome.inputSchema.properties.plan.properties.inputs.items.properties.name.minLength,0);
-  assert.equal(chrome.inputSchema.properties.plan.properties.controlNames.maxItems,16);
-  assert.equal(chrome.inputSchema.properties.plan.properties.useExperience.default,false);
   assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.required,['action']);
-  assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.properties.action.enum,['click','fill','press','scroll']);
-  for(const tool of [chrome,webview,jianlai]) {
-    assert(tool.inputSchema.properties.operation.enum.includes('advise'));
+  for(const tool of [chrome,jianlai]) {
+    assert(!tool.inputSchema.properties.operation.enum.includes('advise'));
+    assert.equal(tool.inputSchema.properties.advice,undefined);
     assert(tool.inputSchema.properties.operation.enum.includes('run'));
-    assert.deepEqual(tool.inputSchema.properties.advice.required,['task','state','choices']);
-    assert.equal(tool.inputSchema.properties.advice.properties.choices.maxProperties,32);
-    assert.match(tool.description,/不自动执行/);
+    assert.equal(tool.inputSchema.properties.vision,undefined);
+    assert.equal(tool.inputSchema.properties.look,undefined);
   }
 });
 test('browser run transport outlives the decision budget without changing normal calls',async t=>{
   const {createServer}=await import('node:net');
   const {randomUUID}=await import('node:crypto');
-  const endpoint=process.platform==='win32' ? `\\\\.\\pipe\\nova-jev-${randomUUID()}` : join(tmpdir(),`nova-jev-${randomUUID()}.sock`);
+  const endpoint=process.platform==='win32' ? `\\\\.\\pipe\\nova-altair-${randomUUID()}` : join(tmpdir(),`nova-altair-${randomUUID()}.sock`);
   const server=createServer(socket=>socket.once('data',()=>socket.end(JSON.stringify({ok:true,result:{status:'handoff'}}))));
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(endpoint,resolve);});
   const saved=[process.env.NOVA_CONTEXT_SERVICE_ENDPOINT,process.env.NOVA_CONTEXT_SERVICE_TOKEN];
@@ -92,11 +94,9 @@ test('browser run transport outlives the decision budget without changing normal
   t.mock.method(globalThis,'setTimeout',(fn,ms,...args)=>{durations.push(ms);return original(fn,ms,...args);});
   try {
     const tools=createNovaBatchTools(process.cwd());
-    for(const name of ['chrome','webview']) {
-      await tools[name].execute({operation:'run'});
-      await tools[name].execute({operation:'inspect'});
-    }
-    assert.deepEqual(durations,[210000,45000,210000,45000]);
+    await tools.chrome.execute({operation:'run'});
+    await tools.chrome.execute({operation:'inspect'});
+    assert.deepEqual(durations,[210000,45000]);
   } finally {
     t.mock.restoreAll();
     for(const [i,key] of ['NOVA_CONTEXT_SERVICE_ENDPOINT','NOVA_CONTEXT_SERVICE_TOKEN'].entries()) {
@@ -110,7 +110,7 @@ test('inspect automatic Canvas images are delivered without losing imageId or pa
   try {
     const path=join(dir,'canvas.png');
     await writeFile(path,Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZioAAAAASUVORK5CYII=','base64'));
-    const result=await webviewMcpResult(JSON.stringify({status:'needs_review',completedActions:1,verification:'unverified',visualReason:'canvas',snapshotId:'new',images:[{imageId:'new-0',path,x:100,y:200,width:300,height:200,pixelWidth:600,pixelHeight:400}]}));
+    const result=await automationMcpResult(JSON.stringify({status:'needs_review',completedActions:1,verification:'unverified',visualReason:'canvas',snapshotId:'new',images:[{imageId:'new-0',path,x:100,y:200,width:300,height:200,pixelWidth:600,pixelHeight:400}]}));
     assert.equal(result.content.filter(c=>c.type==='image').length,1);
     const text=JSON.parse(result.content[0].text);assert.equal(text.status,'needs_review');assert.equal(text.images[0].imageId,'new-0');assert.equal(text.images[0].pixelWidth,600);
   } finally {await rm(dir,{recursive:true,force:true});}

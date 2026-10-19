@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,6 +57,7 @@ pub enum AgentKind {
     CodexPlus,
     CodeBuddy,
     CodeBuddyPlus,
+    WorkBuddy,
     Cursor,
     Lyra,
 }
@@ -77,6 +78,11 @@ impl<'de> Deserialize<'de> for AgentKind {
 }
 
 impl AgentKind {
+    /// 同一 CodeBuddy ACP 协议，不代表共用进程或登录凭据。
+    pub fn is_codebuddy(&self) -> bool {
+        matches!(self, Self::CodeBuddy | Self::CodeBuddyPlus | Self::WorkBuddy)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
@@ -86,6 +92,7 @@ impl AgentKind {
             AgentKind::CodexPlus => "codexplus",
             AgentKind::CodeBuddy => "codebuddy",
             AgentKind::CodeBuddyPlus => "codebuddyplus",
+            AgentKind::WorkBuddy => "workbuddy",
             AgentKind::Cursor => "cursor",
             AgentKind::Lyra => "lyra",
         }
@@ -103,6 +110,7 @@ impl AgentKind {
             "codexplus" => Some(AgentKind::CodexPlus),
             "codebuddy" => Some(AgentKind::CodeBuddy),
             "codebuddyplus" => Some(AgentKind::CodeBuddyPlus),
+            "workbuddy" => Some(AgentKind::WorkBuddy),
             "cursor" => Some(AgentKind::Cursor),
             "lyra" => Some(AgentKind::Lyra),
             _ => None,
@@ -119,6 +127,7 @@ impl AgentKind {
             AgentKind::CodexPlus => "Codex",
             AgentKind::CodeBuddy => "CodeBuddy",
             AgentKind::CodeBuddyPlus => "CodeBuddy",
+            AgentKind::WorkBuddy => "WorkBuddy",
             AgentKind::Cursor => "Cursor",
             AgentKind::Lyra => "Lyra",
         }
@@ -639,12 +648,6 @@ pub struct Thread {
     /// 漫游对端的线程 id（guest 记录 host 侧线程 id，用于发送/取消路由）
     #[serde(default)]
     pub roaming_remote_id: Option<String>,
-    /// 额度租借提供方 token。非空时本机执行，但必须走独立租借进程，禁止回退到本机凭证。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota_peer: Option<String>,
-    /// 额度租借提供方展示名。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota_peer_name: Option<String>,
     /// 非 None：本会话在独立 git worktree 中执行（cwd 已指向该 worktree 工作目录）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
@@ -654,12 +657,18 @@ pub struct Thread {
     /// 数字员工会话：不进普通会话列表，只在员工页「最近运行」里出现。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub employee_thread: bool,
+    /// 由主会话调度的子 Agent 执行记录；前端仅供查看。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagent: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
     /// Stage 会话引用的源会话。每次发送前都会从源会话最新时间线重建上下文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_source_thread_id: Option<String>,
+    /// 自动模式会话的场景 key；None = 普通会话，场景转交与失效切换不生效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_scene: Option<String>,
     /// 仅供下一次 prompt 隐式注入，不持久化到会话文件或前端快照。
     #[serde(skip)]
     pub pending_stage_context: Option<String>,
@@ -675,6 +684,22 @@ pub struct Thread {
     pub items: Vec<Item>,
     #[serde(default)]
     pub plan: Option<Value>,
+}
+
+#[test]
+fn subagent_metadata_defaults_and_roundtrips() {
+    let thread = Thread::new(".".into(), AgentKind::Lyra, None, None, None, false);
+    assert!(!thread.subagent);
+    let mut value = serde_json::to_value(&thread).unwrap();
+    assert!(value.get("subagent").is_none());
+    assert!(!serde_json::from_value::<Thread>(value.clone()).unwrap().subagent);
+    value["subagent"] = true.into();
+    value["parentThreadId"] = "main".into();
+    let child: Thread = serde_json::from_value(value).unwrap();
+    assert!(child.subagent);
+    assert_eq!(child.parent_thread_id.as_deref(), Some("main"));
+    assert!(child.stage_source_thread_id.is_none());
+    assert_eq!(serde_json::to_value(child).unwrap()["subagent"], true);
 }
 
 impl Thread {
@@ -722,13 +747,13 @@ impl Thread {
             roaming_peer: None,
             roaming_peer_name: None,
             roaming_remote_id: None,
-            quota_peer: None,
-            quota_peer_name: None,
             worktree: None,
             experience_thread: false,
             employee_thread: false,
+            subagent: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
+            auto_scene: None,
             pending_stage_context: None,
             active_clue_card_id: None,
             clue_context: None,
@@ -742,10 +767,6 @@ impl Thread {
     /// 是否为漫游 guest 会话（本机只接收展示，真正执行在对端）
     pub fn is_roaming_guest(&self) -> bool {
         self.roaming_role.as_deref() == Some("guest")
-    }
-
-    pub fn is_quota_borrowed(&self) -> bool {
-        self.quota_peer.is_some()
     }
 
     pub fn next_item_id(&self) -> u64 {
@@ -984,8 +1005,6 @@ pub struct ThreadMeta {
     pub roaming_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roaming_peer_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota_peer_name: Option<String>,
     /// 非 None：该会话在独立 git worktree 中执行（前端据此显示分支标记）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
@@ -995,6 +1014,9 @@ pub struct ThreadMeta {
     /// 数字员工会话：不进普通会话列表，只在员工页「最近运行」里出现。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub employee_thread: bool,
+    /// 由主会话调度的子 Agent 执行记录；前端仅供查看。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagent: bool,
     /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -1041,14 +1063,16 @@ impl ProjectStore {
 
     /// 把项目移到最前（不存在则插入），保留最多 20 条
     pub fn touch(&mut self, cwd: &str) {
-        self.projects.retain(|p| p != cwd);
+        let key = crate::project_path_key(cwd);
+        self.projects.retain(|p| crate::project_path_key(p) != key);
         self.projects.insert(0, cwd.to_string());
         self.projects.truncate(20);
         self.save();
     }
 
     pub fn remove(&mut self, cwd: &str) {
-        self.projects.retain(|p| p != cwd);
+        let key = crate::project_path_key(cwd);
+        self.projects.retain(|p| crate::project_path_key(p) != key);
         self.save();
     }
 }
@@ -1583,6 +1607,96 @@ impl ThreadStore {
         self.threads.iter_mut().find(|t| t.id == id)
     }
 
+    /// 复制当前节点所在的整条 Stage 树；只登记副本，不触碰源会话及其运行时。
+    pub fn fork_thread(&mut self, thread_id: &str, title: &str) -> Result<Thread, String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("标题不能为空".into());
+        }
+        let by_id: HashMap<&str, &Thread> = self.threads.iter().map(|t| (t.id.as_str(), t)).collect();
+        let mut root = *by_id.get(thread_id).ok_or("会话不存在")?;
+        let mut ancestors = HashSet::from([root.id.as_str()]);
+        while let Some(parent) = root.parent_thread_id.as_deref().and_then(|id| by_id.get(id)) {
+            if !ancestors.insert(parent.id.as_str()) {
+                return Err("会话 Stage 关系存在循环，无法 fork".into());
+            }
+            root = parent;
+        }
+        let mut children: HashMap<&str, Vec<&Thread>> = HashMap::new();
+        for thread in &self.threads {
+            if let Some(parent) = thread.parent_thread_id.as_deref() {
+                children.entry(parent).or_default().push(thread);
+            }
+        }
+        let mut sources = vec![root];
+        let mut seen = HashSet::from([root.id.as_str()]);
+        let mut index = 0;
+        while index < sources.len() {
+            for child in children.get(sources[index].id.as_str()).into_iter().flatten() {
+                if seen.insert(child.id.as_str()) {
+                    sources.push(child);
+                }
+            }
+            index += 1;
+        }
+        // 远端路由绑定旧 thread id，不能让副本借用原会话的执行通道。
+        if sources.iter().any(|t| t.roaming_role.is_some()) {
+            return Err("包含漫游的会话暂不支持 fork，请先召回为本地会话".into());
+        }
+        let ids: HashMap<&str, String> = sources.iter()
+            .map(|t| (t.id.as_str(), uuid::Uuid::new_v4().to_string())).collect();
+        if sources.iter().any(|t| t.stage_source_thread_id.as_deref().is_some_and(|id| !ids.contains_key(id))) {
+            return Err("Stage 引用了会话树外的源会话，无法安全 fork".into());
+        }
+        sources.sort_by_key(|t| t.created_at);
+        let now = now_ms();
+        let copies: Vec<Thread> = sources.iter().enumerate().map(|(index, source)| {
+            let mut copy = (*source).clone();
+            copy.id = ids[source.id.as_str()].clone();
+            copy.parent_thread_id = source.parent_thread_id.as_deref().and_then(|id| ids.get(id)).cloned();
+            copy.stage_source_thread_id = source.stage_source_thread_id.as_deref().and_then(|id| ids.get(id)).cloned();
+            if source.id == root.id {
+                copy.title = title.to_string();
+            }
+            // 不复用 provider session/checkpoint：下一次发送走现有历史接力，不能写入源 session。
+            copy.acp_session_id = None;
+            copy.provider_checkpoints.clear();
+            copy.pending_native_restore = None;
+            copy.codex_usage_snapshot = None;
+            copy.pending_stage_context = None;
+            copy.handoff_from = (!copy.items.is_empty()).then(|| copy.agent_kind.clone());
+            copy.unread_turns = 0;
+            copy.ephemeral = false;
+            copy.employee_thread = false;
+            copy.experience_thread = false;
+            copy.created_at = now + index as i64;
+            copy.updated_at = copy.created_at;
+            copy
+        }).collect();
+        let selected = copies.iter().find(|t| t.id == ids[thread_id]).unwrap().clone();
+        for copy in copies {
+            self.save_thread(&copy.id);
+            self.threads.push(copy);
+        }
+        Ok(selected)
+    }
+
+    /// 持有 store/trash 锁时清理，避免 fork 或 Stage 仍引用的共享 scratch 目录被删除。
+    pub fn cleanup_unused_scratch_dirs(&self, removed: &[Thread], trash: &ThreadTrashStore) {
+        for thread in removed {
+            let path = PathBuf::from(crate::project_path_key(&thread.cwd));
+            if thread.cwd.contains(crate::SCRATCH_MARK)
+                && !self.threads.iter().chain(trash.entries.iter().map(|entry| &entry.thread))
+                    .any(|retained| {
+                        let retained = PathBuf::from(crate::project_path_key(&retained.cwd));
+                        retained.starts_with(&path) || path.starts_with(retained)
+                    })
+            {
+                let _ = fs::remove_dir_all(&thread.cwd);
+            }
+        }
+    }
+
     pub fn clear_active_clue_card(&mut self, card_id: &str) -> bool {
         let mut changed = false;
         for thread in &mut self.threads {
@@ -1813,6 +1927,144 @@ mod tests {
             std::env::temp_dir().join(format!("nova-thread-store-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn fork_thread_copies_entire_stage_tree_without_changing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ThreadStore::load(dir.path().to_path_buf());
+        let mut root = Thread::new("project".into(), AgentKind::Lyra, Some("model".into()), Some("plan".into()), None, true);
+        root.title = "original".into();
+        root.acp_session_id = Some("original-provider".into());
+        root.record_provider_checkpoint(0, "original-provider".into(), "position".into());
+        root.pending_native_restore = Some(PendingNativeRestore { session_id: "original-provider".into(), position: "position".into() });
+        root.codex_usage_snapshot = Some(CodexUsageSnapshot::default());
+        root.pending_stage_context = Some("stale context".into());
+        root.unread_turns = 3;
+        root.plan = Some(serde_json::json!([{ "step": "test", "status": "pending" }]));
+        for i in 0..140 {
+            root.push_user(format!("history {i}"), vec![PromptImage {
+                name: "attachment".into(), mime_type: "image/png".into(), data: Some("YWJj".into()), uri: None, size: Some(3),
+            }]);
+        }
+        let mut stage = root.clone();
+        stage.id = "stage".into();
+        stage.title = "stage title".into();
+        stage.parent_thread_id = Some(root.id.clone());
+        stage.stage_source_thread_id = Some(root.id.clone());
+        let mut sibling = stage.clone();
+        sibling.id = "sibling".into();
+        let mut child = stage.clone();
+        child.id = "child".into();
+        child.parent_thread_id = Some(stage.id.clone());
+        child.stage_source_thread_id = Some(stage.id.clone());
+        child.subagent = true;
+        let unrelated = Thread::new("other".into(), AgentKind::Codex, None, None, None, false);
+        store.threads = vec![root, stage, sibling, child, unrelated];
+        store.save_now();
+        let originals = serde_json::to_value(&store.threads).unwrap();
+        let original_paths: Vec<_> = store.threads.iter().map(|t| dir.path().join("threads").join(ThreadStore::thread_file_name(&t.id))).collect();
+        let original_bytes: Vec<_> = original_paths.iter().map(|path| fs::read(path).unwrap()).collect();
+
+        let selected = store.fork_thread("stage", "  independent fork  ").unwrap();
+        assert_eq!(store.threads.len(), 9);
+        assert_eq!(serde_json::to_value(&store.threads[..5]).unwrap(), originals);
+        let copies = &store.threads[5..];
+        let root_copy = copies.iter().find(|t| t.parent_thread_id.is_none()).unwrap();
+        assert_eq!(root_copy.title, "independent fork");
+        assert_eq!(selected.title, "stage title");
+        assert_eq!(selected.parent_thread_id.as_deref(), Some(root_copy.id.as_str()));
+        assert_eq!(selected.stage_source_thread_id, selected.parent_thread_id);
+        let child_copy = copies.iter().find(|t| t.subagent).unwrap();
+        assert_eq!(child_copy.parent_thread_id.as_deref(), Some(selected.id.as_str()));
+        assert_eq!(child_copy.stage_source_thread_id, child_copy.parent_thread_id);
+        for copy in copies {
+            assert!(!store.threads[..5].iter().any(|t| t.id == copy.id));
+            assert!(copy.acp_session_id.is_none() && copy.pending_native_restore.is_none());
+            assert!(copy.provider_checkpoints.is_empty() && copy.codex_usage_snapshot.is_none());
+            assert!(copy.pending_stage_context.is_none() && copy.handoff_from == Some(AgentKind::Lyra));
+            assert!(!copy.ephemeral && copy.unread_turns == 0);
+            assert_eq!(copy.cwd, "project");
+            assert_eq!(copy.model.as_deref(), Some("model"));
+            assert_eq!(copy.mode.as_deref(), Some("plan"));
+            assert_eq!(copy.plan, store.threads[0].plan);
+            assert_eq!(serde_json::to_value(&copy.items).unwrap(), originals[0]["items"]);
+        }
+        let mut snapshot = store.take_persist_snapshot().unwrap();
+        assert!(!snapshot.full);
+        assert_eq!(snapshot.threads.len(), 4);
+        ThreadStore::write_persist_snapshot(&mut snapshot).unwrap();
+        for (path, bytes) in original_paths.iter().zip(original_bytes) {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        let reloaded = ThreadStore::load(dir.path().to_path_buf());
+        assert_eq!(reloaded.get(&selected.id).unwrap().items.len(), 140);
+        let fork = store.get_mut(&selected.id).unwrap();
+        assert!(fork.take_prompt_context("Lyra").unwrap().contains("history 139"));
+        fork.title = "renamed fork".into();
+        fork.items.clear();
+        store.threads.truncate(5);
+        assert_eq!(serde_json::to_value(&store.threads).unwrap(), originals);
+        assert_eq!(store.get("stage").unwrap().pending_stage_context.as_deref(), Some("stale context"));
+    }
+
+    #[test]
+    fn fork_thread_rejects_invalid_or_shared_remote_routes_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ThreadStore::load(dir.path().to_path_buf());
+        let source = Thread::new("project".into(), AgentKind::Lyra, None, None, None, false);
+        let id = source.id.clone();
+        store.threads.push(source.clone());
+        assert!(store.fork_thread(&id, "  ").is_err());
+        assert!(store.fork_thread("missing", "fork").is_err());
+        for case in 0..3 {
+            let mut invalid = source.clone();
+            match case {
+                0 => invalid.roaming_role = Some("guest".into()),
+                1 => invalid.parent_thread_id = Some(id.clone()),
+                _ => invalid.stage_source_thread_id = Some("outside-tree".into()),
+            }
+            store.threads = vec![invalid];
+            let before = serde_json::to_value(&store.threads).unwrap();
+            assert!(store.fork_thread(&id, "fork").is_err());
+            assert_eq!(serde_json::to_value(&store.threads).unwrap(), before);
+            assert!(store.take_persist_snapshot().is_none());
+        }
+    }
+
+    #[test]
+    fn fork_thread_scratch_cleanup_keeps_live_and_trashed_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join(crate::SCRATCH_MARK).join("shared");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("keep.txt"), "keep").unwrap();
+        let mut store = ThreadStore::load(dir.path().to_path_buf());
+        let mut trash = ThreadTrashStore::load(&dir.path().to_path_buf());
+        let source = Thread::new(scratch.to_string_lossy().into_owned(), AgentKind::Lyra, None, None, None, true);
+        store.threads.push(source.clone());
+        let fork = store.fork_thread(&source.id, "fork").unwrap();
+        // 退出时删临时源会话，不能连带清掉持久副本的工作目录。
+        let removed = store.purge_ephemeral();
+        store.cleanup_unused_scratch_dirs(&removed, &trash);
+        assert!(scratch.join("keep.txt").exists());
+        // 副本切到原工作区子目录后删除，父目录中的源会话也必须受到保护。
+        let nested = scratch.join("sub");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("keep.txt"), "keep").unwrap();
+        let mut nested_fork = fork.clone();
+        nested_fork.cwd = nested.to_string_lossy().into_owned();
+        store.threads = vec![source.clone()];
+        store.cleanup_unused_scratch_dirs(&[nested_fork], &trash);
+        assert!(nested.join("keep.txt").exists());
+        store.cleanup_unused_scratch_dirs(&[fork.clone()], &trash);
+        assert!(scratch.join("keep.txt").exists());
+        trash.move_to_trash(vec![source], now_ms()).unwrap();
+        store.threads.clear();
+        store.cleanup_unused_scratch_dirs(&[fork.clone()], &trash);
+        assert!(scratch.join("keep.txt").exists());
+        trash.entries.clear();
+        store.cleanup_unused_scratch_dirs(&[fork], &trash);
+        assert!(!scratch.exists());
     }
 
     #[test]

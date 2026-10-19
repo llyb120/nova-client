@@ -11,6 +11,7 @@ import type {
   ClueContextSnapshot,
   ClueNodeGroup,
   GlobalAgentInstructions,
+  PromptTrigger,
   IncomingShare,
   IncomingWorkflowShare,
   ModelCost,
@@ -98,6 +99,16 @@ export const api = {
   judgeWorkflowRoute: (conclusion: string, options: { id: string; label: string }[]) =>
     invoke<string>("judge_workflow_route", { conclusion, options }),
   scratchDir: () => invoke<string>("scratch_dir"),
+  chromeDependencyStatus: () =>
+    invoke<{
+      chromePath: string | null;
+      connected: boolean;
+      incognitoAllowed: boolean | null;
+      extensionDir: string;
+      extensionId: string;
+    }>(
+      "chrome_dependency_status",
+    ),
   directoryExists: (path: string) => invoke<boolean>("directory_exists", { path }),
   clipboardFilePaths: () => invoke<string[]>("clipboard_file_paths"),
   getQuota: () => invoke<Quota>("get_quota"),
@@ -123,6 +134,7 @@ export const api = {
     worktreeBase: string | null = null,
     clueCardId: string | null = null,
     parentThreadId: string | null = null,
+    autoScene: string | null = null,
   ) =>
     invoke<Thread>("create_thread", {
       cwd,
@@ -136,9 +148,11 @@ export const api = {
       worktreeBase,
       clueCardId,
       parentThreadId,
+      autoScene,
     }),
-  createStageThread: (sourceThreadId: string, stageIndex = 0, inheritSourceModel = false) =>
-    invoke<Thread>("create_stage_thread", { sourceThreadId, stageIndex, inheritSourceModel }),
+  autoFailover: (threadId: string) => invoke<boolean>("auto_failover", { threadId }),
+  createStageThread: (sourceThreadId: string, inheritSourceModel = false) =>
+    invoke<Thread>("create_stage_thread", { sourceThreadId, inheritSourceModel }),
   listClueGroups: (space: "personal" | "team" = "personal") =>
     invoke<ClueNodeGroup[]>("list_clue_groups", { space }),
   getClueContext: (cardId: string) =>
@@ -241,8 +255,6 @@ export const api = {
   /** 设置页图形化编辑 Lyra config.jsonc；保存后后端立即重载。 */
   getLyraConfig: () => invoke<Record<string, any>>("get_lyra_config"),
   getLyraPresets: () => invoke<Preset[]>("get_lyra_presets"),
-  importLocalLyraProvider: (source: "codex" | "claude-code") =>
-    invoke<{ provider: Record<string, any>; model: string }>("import_local_lyra_provider", { source }),
   fetchLyraModels: (id: string, provider: Record<string, any>) =>
     invoke<Record<string, any>>("fetch_lyra_models", { id, provider }),
   saveLyraConfig: (config: Record<string, any>) => invoke<void>("save_lyra_config", { config }),
@@ -250,6 +262,9 @@ export const api = {
     invoke<SlashCommand[]>("get_slash_commands", { agentKind }),
   renameThread: (threadId: string, title: string) =>
     invoke<void>("rename_thread", { threadId, title }),
+  forkThread: (threadId: string, title: string) =>
+    invoke<Thread>("fork_thread", { threadId, title }),
+  clearThreadClue: (threadId: string) => invoke<void>("clear_thread_clue", { threadId }),
   /** 让模型按节点任务生成会话标题（仅用于工作流阶段会话，前缀由后端保留）。 */
   generateThreadTitle: (threadId: string, prompt: string) =>
     invoke<void>("generate_thread_title", { threadId, prompt }),
@@ -272,18 +287,23 @@ export const api = {
   ) => invoke<void>("truncate_thread", { threadId, itemId, text, images }),
   cancelTurn: (threadId: string, stopReason?: string | null, deleteWork = false) =>
     invoke<void>("cancel_turn", { threadId, stopReason: stopReason ?? null, deleteWork }),
-  compactThread: (threadId: string) => invoke<void>("compact_thread", { threadId }),
   respondPermission: (requestKey: string, optionId: string) =>
     invoke<void>("respond_permission", { requestKey, optionId }),
   getSettings: () => invoke<Settings>("get_settings"),
+  openMeteor: () => invoke<void>("meteor_open"),
+  setMeteorShortcutRecording: (active: boolean) => invoke<void>("meteor_set_shortcut_recording", { active }),
   getWindowLayout: () => invoke<{width: number; height: number; maximized: boolean; remember: boolean}>("get_window_layout"),
   setWindowLayout: (layout: {width?: number; height?: number; maximized?: boolean; remember?: boolean; reset?: boolean}) => invoke<void>("set_window_layout", layout),
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
   refreshEnvironmentVariables: () => invoke<number>("refresh_environment_variables"),
   getGlobalAgentInstructions: () =>
     invoke<GlobalAgentInstructions>("get_global_agent_instructions"),
-  setGlobalAgentInstructions: (content: string, enabledAgentKinds: AgentKind[]) =>
-    invoke<GlobalAgentInstructions>("set_global_agent_instructions", { content, enabledAgentKinds }),
+  setGlobalAgentInstructions: (
+    content: string,
+    enabledAgentKinds: AgentKind[],
+    triggers: PromptTrigger[],
+  ) =>
+    invoke<GlobalAgentInstructions>("set_global_agent_instructions", { content, enabledAgentKinds, triggers }),
   /** 后端可用性检测结果（agentKind → 是否可用）；空 map = 尚未检测完成 */
   getBackendAvailability: () =>
     invoke<Record<string, boolean>>("get_backend_availability"),
@@ -370,30 +390,6 @@ export const api = {
       durationMinutes: number;
     },
   ) => invoke<void>("respond_roam_request", { reqId, accept, ...changes }),
-  createQuotaThread: (
-    peerToken: string,
-    peerName: string,
-    cwd: string,
-    agentKind: AgentKind,
-    model: string | null,
-    mode: string | null,
-    clueCardId: string | null,
-    operationId: string,
-  ) =>
-    invoke<Thread>("create_quota_thread", {
-      peerToken,
-      peerName,
-      cwd,
-      agentKind,
-      model,
-      mode,
-      clueCardId,
-      operationId,
-    }),
-  cancelQuotaRoaming: (operationId: string) =>
-    invoke<boolean>("cancel_quota_roaming", { operationId }),
-  prepareQuotaLease: (peerToken: string, agentKind: AgentKind, model: string) =>
-    invoke<void>("prepare_quota_lease", { peerToken, agentKind, model }),
   /** guest：召回漫游会话（host 自动把完整快照 Flow 回来，去收件箱选项目接收） */
   recallRoamingThread: (threadId: string) =>
     invoke<void>("recall_roaming_thread", { threadId }),

@@ -2,7 +2,7 @@
 
 支持按任务检索、成功后提炼和复用反馈的本机[操作经验](tool-experiences.md)：`experience_search` / `experience_save` / `experience_feedback`。
 
-扩展独立安装和发布，右侧浏览器始终是 WebView。Agent 使用 webview 操作内置页面，使用 chrome 操作 Chrome，两者可同时使用。
+扩展独立安装和发布。Agent 的浏览器网页操作统一使用 chrome，复用用户 Chrome 的登录态与标签页。
 
 ## 安装
 
@@ -17,9 +17,9 @@
 
 标签 tag 在导航、切换激活页、后台重启时保持稳定，关闭标签或重启 Chrome 后失效。目标参数名是 `tabTag`，不是数字 `tabId`；从 `tabs[].tag` 或 `open` 返回值原样复制。目标操作应始终携带它；漏传时仅用本会话 180 秒内的 `snapshotId` 或唯一有效观察恢复，不选择 Chrome 当前激活页。多标签有歧义、观察过期或属于其它会话时要求明确指定目标。
 
-常用调用：`inspect(tabTag)`、`act(tabTag,snapshotId,action或actions)`、`run(tabTag,plan)`。`act` 缺少/失效的快照只返回新观察，不执行原动作；`run` 可在缺少/失效快照时先观察再决策。JEV 开启后，明确单步或同屏合批仍可直接 `act`；目标、授权和完成条件清楚的连续 DOM 流程，在开始前委托 `run`，受阻后由主模型处理。
+常用调用：`inspect(tabTag)`、`act(tabTag,snapshotId,action或actions)`、`run(tabTag,plan)`。`act` 缺少/失效的快照只返回新观察，不执行原动作；`run` 可在缺少/失效快照时先观察再决策。`run` 只按主模型给出的 steps 连续执行。
 
-支持整页 DOM、iframe、滚动区域、整页分片截图、点击、填写、键盘、滚动、拖动、等待、多标签和导航。act 返回最新观察供验证并继续。基础操作无需辅助模型，连续任务可选 JEV，不使用 Playwright。切换 Nova 会话保留 Chrome 页面。
+支持整页 DOM、iframe、滚动区域、整页分片截图、点击、填写、键盘、滚动、拖动、等待、多标签和导航。act 返回最新观察供验证并继续。基础操作无需辅助模型，不使用 Playwright。切换 Nova 会话保留 Chrome 页面。
 
 需要停止操作时使用 chrome 的 stop 操作。断线、超时不自动重放操作，应先观察确认结果。
 
@@ -27,13 +27,13 @@
 
 Nova 启动时依次尝试 127.0.0.1:47653–47662，跳过已占用端口。扩展自动发现并连接该范围内的所有 Nova 实例，接收端验证固定扩展 Origin，再使用各实例独立的本机令牌传输命令。断线或新启动实例每 30 秒尝试连接，打开扩展弹窗也会触发发现。
 
-支持同时运行开发版、正式版等多个 Nova，扩展弹窗显示连接数量。命令结果回传给发起它的实例，单条浏览器命令串行执行；多个任务操作同一标签页仍会共享页面状态，建议使用不同标签页。WebView 不依赖这些端口。显式设置 NOVA_CHROME_PORT 时只监听指定端口（0 表示系统分配，供测试使用），扩展仅自动发现上述默认范围。
+支持同时运行开发版、正式版等多个 Nova，扩展弹窗显示连接数量。命令结果回传给发起它的实例，单条浏览器命令串行执行；多个任务操作同一标签页仍会共享页面状态，建议使用不同标签页。显式设置 NOVA_CHROME_PORT 时只监听指定端口（0 表示系统分配，供测试使用），扩展仅自动发现上述默认范围。
 
 多实例连接需要 Nova 和 Chrome 扩展同步更新，已安装的扩展请更新至 0.1.4，并在 chrome://extensions 重新加载。
 
 0.1.4 为调试调用增加命令截止时间，避免页面调试命令不返回时阻塞轮询，导致扩展显示已连接但 Nova 判定断线。超时后恢复接收命令，不重放可能已经执行的动作；应先重新观察页面。
 
-JEV 连续执行的 CDP 截止时间现为 10 秒，Nova 与扩展端需同步更新并重新加载扩展；正常响应立即继续，不固定等待。动作反馈读取也允许最多 10 秒。已确认动作成功但读取失败时，run 只补读观察；定位/悬停阶段确认未按下鼠标的失败，才允许基于新 DOM 有界重新决策。
+连续执行的 CDP 截止时间现为 10 秒，Nova 与扩展端需同步更新并重新加载扩展；正常响应立即继续，不固定等待。动作反馈读取也允许最多 10 秒。已确认动作成功但读取失败时，run 只补读观察；定位/悬停阶段确认未按下鼠标的失败，才允许基于新 DOM 有界重新决策。
 
 ## 下载（扩展 0.1.6）
 
@@ -47,7 +47,7 @@ Chrome API 不提供可靠的来源标签 ID，所以结果标记 `scope:browser
 
 运行 node --test extensions/nova-chrome/worker.test.mjs scripts/nova-tools-mcp.test.mjs。
 Rust 检查使用 cargo test 的 chrome_browser::tests。
-集成脚本 node scripts/native-browser-smoke.mjs 使用独立 Nova/WebView2 与模拟扩展，验证握手和共享操作引擎。真实 Chrome 端到端验证需加载扩展后进行。
+Windows 集成脚本 `node scripts/native-browser-smoke.mjs src-tauri/target/debug/nova.exe` 使用隔离 Nova 配置、独立无头 Chromium fixture 与模拟扩展，验证握手、DOM 输入、图片回传、缩放/裁剪坐标和陈旧画面拒绝；不依赖已移除的内置浏览器。`TEST_BROWSER` 可指定 Chromium/Chrome/Edge 可执行文件，Playwright 仅作测试驱动。真实 Chrome 扩展端到端验证需另行加载扩展。
 
 0.1.2 修复 Chrome 扩展 auto-attach-only 模式下直接发现/附加 Target 返回 Not allowed 的问题，改用 Target.setAutoAttach 和子会话事件，支持嵌套 iframe。Chrome 自身限制的内部页面仍受浏览器限制。
 

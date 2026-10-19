@@ -1,0 +1,129 @@
+[
+  {
+    "name": "spawn_agent",
+    "description": "自动模式场景转交：当一整块工作符合另一个场景时，用 scene 把它交给该场景的模型，在独立的 Stage 会话里执行（能看到本会话上下文，由它自己闭环完成），然后用 wait_agent 取最终结果；不要中途逐步指挥。场景：lightweight=轻量化（简单问答、整理总结等轻量事务）；coding=编码（写代码、改仓库、调试或运行构建测试）；computer=剑来（操作桌面应用或浏览器）。返回 ok=false 表示该场景模型与当前会话相同，直接自己完成。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scene": {
+          "type": "string",
+          "enum": [
+            "lightweight",
+            "coding",
+            "computer"
+          ],
+          "description": "转交到的场景"
+        },
+        "cwd": {
+          "type": "string",
+          "description": "转交会话的项目目录（绝对路径）；默认沿用当前会话目录"
+        },
+        "task_name": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+$",
+          "description": "简短唯一名，小写字母、数字、下划线"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "description": "完整任务描述：目标、约束、完成标准"
+        }
+      },
+      "required": [
+        "scene",
+        "task_name",
+        "message"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wait_agent",
+    "description": "等待转交的场景子任务结束（任一目标结束或超时即返回），返回各目标的状态、最终回复与会话 threadId；timedOut=true 时可再次调用继续等。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "spawn_agent 返回的 path 或 task_name；默认全部"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 90000,
+          "description": "默认 30000，最大 90000"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "list_agents",
+    "description": "列出转交的场景子任务及其状态和最终回复。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path_prefix": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "followup_task",
+    "description": "子任务结束后，在同一个场景会话里追加下一项工作（不是中途插话）。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "target",
+        "message"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "interrupt_agent",
+    "description": "中断正在执行的场景子任务，之后仍可 followup_task。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "close_agent",
+    "description": "中断并关闭场景子任务；其 Stage 会话保留供查看。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

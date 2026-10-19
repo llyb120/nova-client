@@ -1,25 +1,25 @@
-//! 数字员工（极简版）：`~/.nova/employee.json` 一个文件 + 15 分钟心跳 + JEV 分诊 +
+//! 数字员工：`~/.nova/employee.json` 保存各职责的下次检查时间，按需调度 +
 //! 每次新开隐藏会话 + 检测到用户操作即让出。员工数据只经 `employee` 工具或本模块命令修改。
 
-use crate::threads::{now_ms, AgentKind, Item, Thread};
+use crate::settings::Scene;
+use crate::threads::{now_ms, Item, Thread};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const EV_EMPLOYEE: &str = "employee:changed";
-/// 检查点对齐到整点后每 15 分钟（:00/:15/:30/:45）。
-const HEARTBEAT_MIN: u32 = 15;
+/// 模型没有安排下次检查或启动失败时的重试间隔，不是统一心跳。
+const RETRY_MINUTES: i64 = 5;
 const MAX_DUTIES: usize = 50;
 const MAX_TEXT_CHARS: usize = 500;
 const MAX_NOTE_BYTES: usize = 1024;
 const MAX_INBOX: usize = 100;
 const MAX_RUNS: usize = 200;
-const MIN_CONFIDENCE: f64 = 0.6;
+const MAX_EVERY_MINUTES: u64 = 7 * 24 * 60;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
@@ -28,8 +28,6 @@ pub struct Employee {
     pub work_start: String,
     pub work_end: String,
     pub idle_minutes: u32,
-    pub agent_kind: String,
-    pub model: String,
     pub duties: Vec<Duty>,
     /// 待办（confirm=false）与待确认（confirm=true），处理完即删。
     pub inbox: Vec<Todo>,
@@ -45,8 +43,6 @@ impl Default for Employee {
             work_start: "09:00".into(),
             work_end: "18:00".into(),
             idle_minutes: 10,
-            agent_kind: String::new(),
-            model: String::new(),
             duties: Vec::new(),
             inbox: Vec::new(),
             runs: Vec::new(),
@@ -61,7 +57,12 @@ pub struct Duty {
     pub id: String,
     pub text: String,
     pub enabled: bool,
+    /// 模型池名字；空为默认模型。
+    pub profile: String,
     pub note: String,
+    /// >0：用户指定的固定间隔（距上次结束）；0：员工逐次安排下次检查。
+    pub every_minutes: u32,
+    pub next_check_at: i64,
     pub last_run_at: i64,
     pub last_result: String,
 }
@@ -72,8 +73,11 @@ pub struct Todo {
     pub id: String,
     pub text: String,
     pub confirm: bool,
+    /// 模型池名字；空为默认模型。
+    pub profile: String,
     pub created_at: i64,
     pub thread_id: Option<String>,
+    pub next_check_at: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -84,6 +88,66 @@ pub struct Run {
     pub duty_id: String,
     pub result: String,
     pub thread_id: String,
+}
+
+impl Duty {
+    /// 备注是针对旧职责写的，留着会让员工继续按旧要求办事，改了文本就清空。
+    fn set_text(&mut self, text: String) {
+        if text != self.text {
+            self.text = text;
+            self.note.clear();
+            self.every_minutes = 0;
+            self.next_check_at = 0;
+        }
+    }
+
+    fn due_at(&self) -> i64 {
+        if self.every_minutes == 0 {
+            self.next_check_at
+        } else if self.last_run_at == 0 {
+            0
+        } else {
+            self.last_run_at.saturating_add(self.every_minutes as i64 * 60_000)
+        }
+    }
+
+    fn finish(&mut self, original: &Duty, at: i64, result: &str) {
+        // 旧会话不能把修改后的职责重新排回旧时间。
+        if self.text != original.text || self.every_minutes != original.every_minutes || !self.enabled {
+            return;
+        }
+        self.last_run_at = at;
+        self.last_result = result.into();
+        if self.every_minutes == 0 && self.next_check_at <= at {
+            self.next_check_at = at + RETRY_MINUTES * 60_000;
+        }
+    }
+
+    fn apply_update(&mut self, args: &Value, now: i64) -> Result<(), String> {
+        if let Some(text) = args["text"].as_str().map(str::trim).filter(|v| !v.is_empty()) {
+            self.set_text(text.into());
+        }
+        if let Some(note) = args["note"].as_str() { self.note = note.into(); }
+        if let Some(profile) = args["profile"].as_str() { self.profile = profile.trim().into(); }
+        if let Some(enabled) = args["enabled"].as_bool() { self.enabled = enabled; }
+        if let Some(value) = args.get("everyMinutes") {
+            let minutes = value.as_u64().filter(|v| *v <= MAX_EVERY_MINUTES)
+                .ok_or("everyMinutes 应为 0–10080 的整数")?;
+            if self.every_minutes != minutes as u32 {
+                self.every_minutes = minutes as u32;
+                self.next_check_at = 0;
+            }
+        }
+        if let Some(value) = args.get("nextCheckInMinutes") {
+            let minutes = value.as_u64().filter(|v| (1..=MAX_EVERY_MINUTES).contains(v))
+                .ok_or("nextCheckInMinutes 应为 1–10080 的整数")?;
+            if self.every_minutes > 0 {
+                return Err("固定间隔职责使用 everyMinutes；动态职责才使用 nextCheckInMinutes".into());
+            }
+            self.next_check_at = now + minutes as i64 * 60_000;
+        }
+        Ok(())
+    }
 }
 
 impl Employee {
@@ -155,9 +219,9 @@ fn update<T>(f: impl FnOnce(&mut Employee) -> Result<T, String>) -> Result<T, St
 struct Current {
     thread_id: String,
     duty_id: String,
-    label: String,
+    duty: Option<Duty>,
     started: Instant,
-    /// 心跳自动发起的才需要让出；用户手动触发时人就在电脑前。
+    /// 自动发起的才需要让出；用户手动触发时人就在电脑前。
     auto: bool,
     seen_running: bool,
 }
@@ -166,9 +230,6 @@ struct Current {
 struct Runtime {
     current: Option<Current>,
     yielded: bool,
-    /// 最近一个待满足的检查点；过了点但用户在用或员工在忙时保持挂起，
-    /// 满足后才排下一个，错过的多个点合并为一次。手动检查不推迟它。
-    next_check_at: i64,
 }
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
@@ -220,137 +281,111 @@ fn user_took_over(system_idle_ms: u64, since_start_ms: u64, since_injected_ms: O
     !injecting && system_idle_ms + 1500 < baseline
 }
 
-/// 严格晚于 now 的下一个整 15 分钟；落在工作时段外则顺延到下一次上班时间。
-fn next_slot(now: chrono::NaiveDateTime, start: &str, end: &str) -> chrono::NaiveDateTime {
+/// 到期时间落在工作时段外时，顺延到下次上班，不再对齐固定检查周期。
+fn work_slot(now: chrono::NaiveDateTime, start: &str, end: &str) -> chrono::NaiveDateTime {
     use chrono::Timelike;
-    let step = HEARTBEAT_MIN as i64;
-    let minute = (now.hour() * 60 + now.minute()) as i64;
-    let add = step - minute % step;
-    let slot = now.with_second(0).and_then(|t| t.with_nanosecond(0)).unwrap() + chrono::TimeDelta::minutes(add);
-    let slot_minute = (minute + add) % 1440;
-    if in_work_hours(start, end, slot_minute as u32) {
-        return slot;
+    let minute = now.hour() * 60 + now.minute();
+    if in_work_hours(start, end, minute) {
+        return now;
     }
-    let to_start = parse_hm(start).map_or(0, |s| (s as i64 - slot_minute).rem_euclid(1440));
-    slot + chrono::TimeDelta::minutes(to_start)
+    let to_start = parse_hm(start).map_or(0, |s| (s as i64 - minute as i64).rem_euclid(1440));
+    now.with_second(0).and_then(|t| t.with_nanosecond(0)).unwrap() + chrono::TimeDelta::minutes(to_start)
 }
 
-fn reschedule(employee: &Employee) {
-    use chrono::TimeZone;
-    let slot = next_slot(chrono::Local::now().naive_local(), &employee.work_start, &employee.work_end);
-    let at = chrono::Local
-        .from_local_datetime(&slot)
-        .earliest()
-        .map_or(now_ms() + HEARTBEAT_MIN as i64 * 60_000, |t| t.timestamp_millis());
-    runtime(|rt| rt.next_check_at = at);
+fn duty_next(employee: &Employee) -> Option<&Duty> {
+    employee.duties.iter().filter(|d| d.enabled).min_by_key(|d| d.due_at())
 }
 
-// ---------- 心跳 ----------
+fn todo_next(employee: &Employee) -> Option<&Todo> {
+    employee.inbox.iter().filter(|t| !t.confirm).min_by_key(|t| t.next_check_at)
+}
+
+fn next_check_at(employee: &Employee) -> Option<i64> {
+    duty_next(employee).map(Duty::due_at).into_iter()
+        .chain(todo_next(employee).map(|t| t.next_check_at)).min()
+}
 
 pub fn start(app: AppHandle) {
     let _ = APP.set(app.clone());
-    if let Ok(employee) = load() {
-        reschedule(&employee);
-    }
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             watch(&app).await;
-            if now_ms() < runtime(|rt| rt.next_check_at) {
+            // ponytail: 每秒监督接管并读一次 employee.json（几 KB）；职责量扩大后改为缓存到期时间和变更通知。
+            let Ok(employee) = load() else { continue };
+            if !next_check_at(&employee).is_some_and(|at| at <= now_ms()) {
                 continue;
             }
-            let Ok(employee) = load() else { continue };
             let now = chrono::Local::now();
             use chrono::Timelike;
             if !employee.enabled || !in_work_hours(&employee.work_start, &employee.work_end, now.hour() * 60 + now.minute()) {
-                // 未值班或已下班：这个点作废，排到下一个有效点。
-                reschedule(&employee);
                 continue;
             }
             let idle = system_idle_ms().is_some_and(|ms| ms >= employee.idle_minutes as u64 * 60_000);
             if !idle || runtime(|rt| rt.current.is_some()) {
-                continue; // 挂起：等用户离开 / 当前会话结束再补上这一次
+                continue; // 到期任务挂起，等用户离开 / 当前会话结束，只补一次。
             }
-            reschedule(&employee);
-            if let Err(error) = heartbeat(&app, false).await {
-                eprintln!("[employee] heartbeat failed: {error}");
+            if let Err(error) = check_due(&app, false) {
+                eprintln!("[employee] schedule failed: {error}");
             }
         }
     });
 }
 
-enum Job {
-    Duty(Duty),
-    Inbox(Todo),
-}
-
 /// 返回结果说明，供手动检查提示。
-async fn heartbeat(app: &AppHandle, manual: bool) -> Result<String, String> {
+fn check_due(app: &AppHandle, manual: bool) -> Result<String, String> {
     if runtime(|rt| rt.current.is_some()) {
         return Err("员工正在工作，请稍后".into());
     }
     runtime(|rt| rt.yielded = false);
     let employee = load()?;
-    let duties: Vec<&Duty> = employee.duties.iter().filter(|d| d.enabled).collect();
-    let todo = employee.inbox.iter().find(|t| !t.confirm).cloned();
-    if duties.is_empty() && todo.is_none() {
-        return Ok("没有启用的职责或待办".into());
+    // 待办优先，但单条失败/未完成的待办退避不阻挡其他到期任务。
+    if let Some(todo) = todo_next(&employee).filter(|t| t.next_check_at <= now_ms()) {
+        let started = launch(app, &todo.id, &format!("待办：{}", clip(&todo.text, 40)),
+            &format!("处理一条待办（id={}）：\n{}\n完成后调用 employee action=done id={} 删除它。", todo.id, todo.text, todo.id), !manual, None, &todo.profile);
+        if started.is_err() && runtime(|rt| rt.current.is_none()) {
+            update(|e| {
+                if let Some(t) = e.inbox.iter_mut().find(|t| t.id == todo.id) {
+                    t.next_check_at = now_ms() + RETRY_MINUTES * 60_000;
+                }
+                Ok(())
+            })?;
+        }
+        return started.map(|_| format!("已开始处理待办：{}", clip(&todo.text, 40)));
     }
-    let mut choices = BTreeMap::new();
-    let mut state = format!("当前时间：{}\n职责：\n", chrono::Local::now().format("%Y-%m-%d %H:%M %A"));
-    for duty in &duties {
-        choices.insert(format!("duty_{}", duty.id), clip(&duty.text, 300));
-        let last = if duty.last_run_at > 0 {
-            format!("上次 {}：{}", fmt_ms(duty.last_run_at), duty.last_result)
-        } else {
-            "从未执行".into()
-        };
-        state.push_str(&format!("- duty_{}：{}（{last}）\n", duty.id, duty.text));
+    if let Some(duty) = duty_next(&employee).filter(|d| d.due_at() <= now_ms()) {
+        let started = run_duty(app, duty, !manual);
+        if let Err(error) = &started {
+            if runtime(|rt| rt.current.is_some()) { return Err(error.clone()); }
+            // 记下这次失败，否则同一条职责会每秒重试。
+            update(|e| {
+                if let Some(d) = e.duties.iter_mut().find(|d| d.id == duty.id) {
+                    d.finish(duty, now_ms(), &clip(&format!("启动失败：{error}"), 120));
+                }
+                Ok(())
+            })?;
+        }
+        return started.map(|_| format!("已开始：{}", clip(&duty.text, 40)));
     }
-    if let Some(todo) = &todo {
-        choices.insert("inbox".into(), format!("处理新待办：{}", clip(&todo.text, 300)));
-        state.push_str(&format!("新待办：{}\n", todo.text));
-    }
-    choices.insert("idle".into(), "现在没有需要做的事（职责未到时候、刚做过或条件不满足）".into());
-    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
-    let decision = crate::jev::choose(settings, "数字员工心跳：判断此刻最该做哪一件事，没有就选 idle", &state, &choices,
-        "按职责原文里的时间/频率要求与上次执行时间判断是否该执行；有新待办优先处理；拿不准选 idle。").await;
-    let inbox = || todo.as_ref().map(|_| "inbox".to_string());
-    // 没选中任何事时的原因，避免 JEV 不可用时也笼统报“没事可做”。
-    let (picked, why) = match decision {
-        Ok(v) if v["status"] == "advised" => match v["confidence"].as_f64() {
-            Some(c) if c >= MIN_CONFIDENCE => (Some(v["choice"].as_str().unwrap_or("idle").to_string()),
-                "JEV 判断此刻没有到时候的职责".to_string()),
-            Some(c) => (None, format!("JEV 拿不准（置信度 {c:.2}），本次不执行")),
-            None => (inbox(), "JEV 未给出置信度，本次只处理待办".to_string()),
-        },
-        // JEV 不可用：保守规则，只有新待办才唤醒主模型。
-        Ok(v) if v["status"] == "disabled" => (inbox(),
-            "JEV 未启用，心跳无法判断职责是否到点，只会处理待办；请在设置中启用 JEV，或在职责菜单里点“立即执行”".to_string()),
-        Ok(v) => (inbox(), format!("JEV 不可用（{}），心跳只会处理待办", v["error"].as_str().unwrap_or("未知错误"))),
-        Err(e) => (inbox(), format!("JEV 不可用（{e}），心跳只会处理待办")),
-    };
-    let job = match picked.as_deref() {
-        Some("inbox") => todo.map(Job::Inbox),
-        Some(choice) => choice
-            .strip_prefix("duty_")
-            .and_then(|id| duties.iter().find(|d| d.id == id))
-            .map(|d| Job::Duty((*d).clone())),
-        None => None,
-    };
-    match job {
-        Some(Job::Duty(duty)) => run_duty(app, &duty, !manual).map(|_| format!("已开始：{}", clip(&duty.text, 40))),
-        Some(Job::Inbox(todo)) => launch(app, "inbox", &format!("待办：{}", clip(&todo.text, 40)),
-            &format!("处理一条待办（id={}）：\n{}\n完成后调用 employee action=done id={} 删除它。", todo.id, todo.text, todo.id), !manual)
-            .map(|_| format!("已开始处理待办：{}", clip(&todo.text, 40))),
-        None => Ok(format!("检查完毕：{why}")),
-    }
+    Ok("检查完毕：没有到期的职责或待办".into())
 }
 
 fn run_duty(app: &AppHandle, duty: &Duty, auto: bool) -> Result<(), String> {
-    let note = if duty.note.is_empty() { String::new() } else { format!("\n你上次留下的备注：\n{}", duty.note) };
+    let duty = load()?.duties.into_iter().find(|d| d.id == duty.id && (!auto || d.enabled)).ok_or("职责已删除或停用")?;
+    let note = if duty.note.is_empty() { String::new() } else {
+        format!("\n你上次留下的备注（仅供参考；与上面的职责原文冲突时一律以职责原文为准，并改写备注）：\n{}", duty.note)
+    };
+    let schedule = if duty.every_minutes == 0 {
+        format!("\n本职责采用动态调度，没有统一心跳。先判断原文的时间与条件是否满足；未到时间（例如每天9点）时不得提前执行，只安排下次检查。\
+                 本轮结束前必须调用 employee action=update id={} nextCheckInMinutes=N 安排从调用时起 N 分钟后再检查（整数1–10080）。\
+                 用户只说‘每隔几分钟/隔一段时间’时，你根据紧迫程度、变化速度和本轮结果选 N；连续无变化可延长，有新变化可缩短；\
+                 不要把自选间隔写成固定 everyMinutes，不要在会话内等待或循环。遵守原文明确的时间和频率约束。", duty.id)
+    } else {
+        format!("\n本职责由用户指定每 {} 分钟执行一次（距上次结束），系统会安排下一次；不要自行修改固定频率或设置 nextCheckInMinutes。", duty.every_minutes)
+    };
     launch(app, &duty.id, &format!("职责：{}", clip(&duty.text, 40)),
-        &format!("执行职责（id={}）：\n{}{note}\n需要留给下次的备忘可用 employee action=update id={} note=… 覆盖写。", duty.id, duty.text, duty.id), auto)
+        &format!("检查并按条件执行职责（id={}）：\n{}\n当前时间：{}\n上次结束：{}；结果：{}{note}{schedule}\n需要留给下次的备忘可用 employee action=update id={} note=… 覆盖写。",
+            duty.id, duty.text, chrono::Local::now().to_rfc3339(), fmt_ms(duty.last_run_at), duty.last_result, duty.id), auto, Some(&duty), &duty.profile)
 }
 
 const RULES: &str = "你是 Nova 数字员工，正在无人值守地执行一件事。规则：\n\
@@ -360,17 +395,23 @@ const RULES: &str = "你是 Nova 数字员工，正在无人值守地执行一�
 - 用户随时可能接管电脑；被停止后不要重试。\n\n";
 
 /// 新开一个员工专属会话（不进普通会话列表）并投递提示词。
-fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool) -> Result<(), String> {
+/// `profile` 为场景名；空或无效时用轻量化场景。
+fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool, duty: Option<&Duty>, profile: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let employee = load()?;
-    let kind = AgentKind::from_str(&employee.agent_kind).unwrap_or(AgentKind::Lyra);
-    if !state.agent_enabled(&kind) {
-        return Err(format!("{} 后端已关闭，请在员工页重新选择模型", kind.label()));
-    }
+    let picked = Scene::parse(profile);
+    let (kind, model) = state.scene_model(picked.unwrap_or(Scene::Lightweight))?;
+    // 与本会话同一模型的场景不列出：开新会话只是多一跳，直接在当前会话做。
+    let others = Scene::ALL.into_iter()
+        .filter(|scene| state.scene_model(*scene).is_ok_and(|target| target != (kind.clone(), model.clone())))
+        .map(|scene| format!("- {}：{}", scene.label(), scene.when()))
+        .collect::<Vec<_>>();
+    let prompt = if picked.is_some() || others.is_empty() { prompt.to_string() } else {
+        format!("当事项符合下面某个场景时，不要自己做，也不要记待办，用 employee action=stage profile=<场景名> text=<要它做什么> 直接开新会话交给该场景的模型（新会话能看到本会话上下文），然后结束本次任务：\n{}\n\n{prompt}", others.join("\n"))
+    };
     let cwd = crate::lyra::config::nova_root().join("employee");
     std::fs::create_dir_all(&cwd).map_err(|e| format!("创建员工工作目录失败：{e}"))?;
     let thread_id = {
-        // 先占位，防止心跳与手动触发并发各开一个会话。
+        // 先占位，防止自动调度与手动触发并发各开一个会话。
         let mut guard = RUNTIME.lock().unwrap();
         let rt = guard.get_or_insert_with(Runtime::default);
         if rt.current.is_some() {
@@ -379,7 +420,7 @@ fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool)
         let mut thread = Thread::new(
             cwd.to_string_lossy().to_string(),
             kind,
-            Some(employee.model.clone()).filter(|m| !m.is_empty()),
+            Some(model.clone()).filter(|m| !m.is_empty()),
             Some("build".into()),
             None,
             false,
@@ -389,7 +430,7 @@ fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool)
         rt.current = Some(Current {
             thread_id: thread.id.clone(),
             duty_id: duty_id.into(),
-            label: label.into(),
+            duty: duty.cloned(),
             started: Instant::now(),
             auto,
             seen_running: false,
@@ -401,7 +442,8 @@ fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool)
     };
     let _ = app.emit(crate::acp::EV_THREADS, json!({}));
     let dispatched = update(|e| {
-        e.runs.push(Run { at: now_ms(), duty_id: duty_id.into(), result: "运行中".into(), thread_id: thread_id.clone() });
+        let run_id = if e.inbox.iter().any(|t| t.id == duty_id) { "inbox" } else { duty_id };
+        e.runs.push(Run { at: now_ms(), duty_id: run_id.into(), result: "运行中".into(), thread_id: thread_id.clone() });
         let over = e.runs.len().saturating_sub(MAX_RUNS);
         Ok(e.runs.drain(..over).map(|r| r.thread_id).collect::<Vec<_>>())
     })
@@ -426,6 +468,15 @@ fn launch(app: &AppHandle, duty_id: &str, label: &str, prompt: &str, auto: bool)
 async fn watch(app: &AppHandle) {
     let Some(mut current) = runtime(|rt| rt.current.clone()) else { return };
     let running = crate::running_by_id(&app.state::<AppState>(), &current.thread_id);
+    if let Some(original) = &current.duty {
+        let changed = load().is_ok_and(|e| !e.duties.iter().any(|d|
+            d.id == original.id && d.text == original.text && d.every_minutes == original.every_minutes && (!current.auto || d.enabled)));
+        if changed {
+            let _ = crate::cancel_turn(app.clone(), app.state::<AppState>(), current.thread_id.clone(), None, None).await;
+            finish(app, &current, Some("已停止：职责已修改、删除或停用".into()));
+            return;
+        }
+    }
     if running && !current.seen_running {
         current.seen_running = true;
         runtime(|rt| if let Some(c) = rt.current.as_mut() { c.seen_running = true });
@@ -447,12 +498,10 @@ async fn watch(app: &AppHandle) {
         let _ = crate::cancel_turn(app.clone(), app.state::<AppState>(), current.thread_id.clone(), None, None).await;
         runtime(|rt| rt.yielded = true);
         finish(app, &current, Some("已让出：检测到用户操作".into()));
-        crate::sys_notify::show(app, "数字员工已让出", &format!("检测到你在操作电脑，已停下：{}", current.label), false, None);
     }
 }
 
 fn finish(app: &AppHandle, current: &Current, result: Option<String>) {
-    runtime(|rt| rt.current = None);
     let result = result.unwrap_or_else(|| {
         let state = app.state::<AppState>();
         let store = state.store.lock().unwrap();
@@ -465,16 +514,25 @@ fn finish(app: &AppHandle, current: &Current, result: Option<String>) {
             .unwrap_or_else(|| "已结束（无回复）".into())
     });
     let result = clip(result.trim(), 120);
-    let _ = update(|e| {
+    if let Err(error) = update(|e| {
         if let Some(run) = e.runs.iter_mut().rev().find(|r| r.thread_id == current.thread_id) {
             run.result = result.clone();
         }
-        if let Some(duty) = e.duties.iter_mut().find(|d| d.id == current.duty_id) {
-            duty.last_run_at = now_ms();
-            duty.last_result = result.clone();
+        if let Some(original) = &current.duty {
+            if let Some(duty) = e.duties.iter_mut().find(|d| d.id == original.id) {
+                duty.finish(original, now_ms(), &result);
+            }
+        }
+        if let Some(todo) = e.inbox.iter_mut().find(|t| t.id == current.duty_id) {
+            todo.next_check_at = now_ms() + RETRY_MINUTES * 60_000;
         }
         Ok(())
-    });
+    }) {
+        eprintln!("[employee] save completion failed: {error}");
+        return; // 保留当前会话，下一轮重试保存，避免丢失结果后重复执行任务。
+    }
+    runtime(|rt| rt.current = None);
+    let _ = app.emit(EV_EMPLOYEE, json!({}));
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -485,6 +543,7 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 fn fmt_ms(ms: i64) -> String {
+    if ms == 0 { return "从未执行".into(); }
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
         .unwrap_or_default()
@@ -496,6 +555,15 @@ pub(crate) fn tool_definition() -> Value {
     serde_json::from_str(include_str!("../../scripts/employee-tool.json")).unwrap()
 }
 
+/// 工具写入的 profile 必须是场景名（空串表示轻量化场景）。
+fn check_profile(args: &Value) -> Result<String, String> {
+    let profile = args["profile"].as_str().map(str::trim).unwrap_or_default();
+    if profile.is_empty() { return Ok(String::new()); }
+    Scene::parse(profile).map(|scene| scene.label().into()).ok_or_else(|| {
+        format!("没有「{profile}」场景，可用：{}", Scene::ALL.map(Scene::label).join("、"))
+    })
+}
+
 pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
     let s = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
     let id = || s("id").ok_or("缺少 id");
@@ -504,19 +572,22 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
         "list" => {
             let e = load()?;
             let recent = &e.runs[e.runs.len().saturating_sub(10)..];
-            Ok(json!({"duties": e.duties, "inbox": e.inbox, "recentRuns": recent}))
+            Ok(json!({"duties": e.duties, "inbox": e.inbox, "recentRuns": recent, "scenes": Scene::ALL.map(|s| json!({"name": s.label(), "when": s.when()}))}))
         }
         "add" => update(|e| {
             let text = text()?;
+            let profile = check_profile(args)?;
             match args["kind"].as_str() {
                 Some("duty") => {
                     let id = e.new_id("d");
-                    e.duties.push(Duty { id: id.clone(), text, enabled: true, ..Default::default() });
+                    let mut duty = Duty { id: id.clone(), text, enabled: true, ..Default::default() };
+                    duty.apply_update(args, now_ms())?;
+                    e.duties.push(duty);
                     Ok(json!({"ok": true, "id": id}))
                 }
                 Some("todo") => {
                     let id = e.new_id("t");
-                    e.inbox.push(Todo { id: id.clone(), text, created_at: now_ms(), ..Default::default() });
+                    e.inbox.push(Todo { id: id.clone(), text, profile, created_at: now_ms(), ..Default::default() });
                     Ok(json!({"ok": true, "id": id}))
                 }
                 _ => Err("add 需要 kind=duty 或 kind=todo".into()),
@@ -524,10 +595,14 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
         }),
         "update" => update(|e| {
             let id = id()?;
+            check_profile(args)?;
             let duty = e.duties.iter_mut().find(|d| d.id == id).ok_or("没有这条职责")?;
-            if let Some(text) = s("text") { duty.text = text; }
-            if let Some(note) = args["note"].as_str() { duty.note = note.to_string(); }
-            if let Some(enabled) = args["enabled"].as_bool() { duty.enabled = enabled; }
+            if args.get("nextCheckInMinutes").is_some() && runtime(|rt| rt.current.as_ref()
+                .and_then(|c| c.duty.as_ref()).is_some_and(|old|
+                    old.id == duty.id && (old.text != duty.text || old.every_minutes != duty.every_minutes))) {
+                return Err("职责已修改，旧会话不能再安排下次检查".into());
+            }
+            duty.apply_update(args, now_ms())?;
             Ok(json!({"ok": true}))
         }),
         "done" => update(|e| {
@@ -545,7 +620,7 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
             let thread_id = runtime(|rt| rt.current.as_ref().map(|c| c.thread_id.clone()));
             let id = update(|e| {
                 let id = e.new_id("c");
-                e.inbox.push(Todo { id: id.clone(), text: text.clone(), confirm: true, created_at: now_ms(), thread_id });
+                e.inbox.push(Todo { id: id.clone(), text: text.clone(), confirm: true, created_at: now_ms(), thread_id, ..Default::default() });
                 Ok(id)
             })?;
             if let Some(app) = APP.get() {
@@ -553,8 +628,51 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
             }
             Ok(json!({"ok": true, "id": id, "next": "已记为待确认并通知用户；不要执行该操作，结束本次任务。"}))
         }
-        _ => Err("action 应为 list/add/update/done/ask".into()),
+        "stage" => stage(args, text()?),
+        _ => Err("action 应为 list/add/update/done/ask/stage".into()),
     }
+}
+
+/// 在当前员工会话上开 Stage：新会话用模型池里的模型、引用本会话上下文，并接管本次运行的结束判定。
+fn stage(args: &Value, text: String) -> Result<Value, String> {
+    let app = APP.get().ok_or("员工未启动")?;
+    let state = app.state::<AppState>();
+    let scene = Scene::parse(&check_profile(args)?).ok_or("stage 需要 profile=场景名")?;
+    let (kind, model) = state.scene_model(scene)?;
+    let (parent_id, thread_id) = {
+        let mut guard = RUNTIME.lock().unwrap();
+        let current = guard.as_mut().and_then(|rt| rt.current.as_mut()).ok_or("只能在员工执行任务时使用 stage")?;
+        let mut store = state.store.lock().unwrap();
+        let source = store.get(&current.thread_id).ok_or("当前员工会话不存在")?;
+        if source.agent_kind == kind && source.model.as_deref().unwrap_or_default() == model {
+            return Ok(json!({"ok": false, "next": "该模型与当前会话相同，不要开新会话，直接在本会话完成。"}));
+        }
+        let mut thread = Thread::new(source.cwd.clone(), kind, Some(model.clone()).filter(|m| !m.is_empty()),
+            Some("build".into()), None, false);
+        thread.employee_thread = true;
+        thread.parent_thread_id = Some(source.id.clone());
+        thread.stage_source_thread_id = Some(source.id.clone());
+        thread.title = format!("{} · {}", source.title, scene.label());
+        let ids = (source.id.clone(), thread.id.clone());
+        store.threads.push(thread);
+        store.save();
+        current.thread_id = ids.1.clone();
+        current.started = Instant::now();
+        current.seen_running = false;
+        ids
+    };
+    let _ = app.emit(crate::acp::EV_THREADS, json!({}));
+    let relink = |from: &str, to: &str| update(|e| {
+        if let Some(run) = e.runs.iter_mut().rev().find(|r| r.thread_id == from) { run.thread_id = to.into(); }
+        Ok(())
+    });
+    relink(&parent_id, &thread_id)?;
+    if let Err(error) = crate::dispatch_prompt(app, thread_id.clone(), format!("{RULES}{text}"), Vec::new()) {
+        runtime(|rt| if let Some(c) = rt.current.as_mut().filter(|c| c.thread_id == thread_id) { c.thread_id = parent_id.clone() });
+        let _ = relink(&thread_id, &parent_id);
+        return Err(error);
+    }
+    Ok(json!({"ok": true, "threadId": thread_id, "next": "已交给新会话执行；结束本次任务（动态职责仍需先安排下次检查）。"}))
 }
 
 // ---------- 前端命令 ----------
@@ -562,7 +680,7 @@ pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
 #[tauri::command]
 pub fn employee_get() -> Result<Value, String> {
     let employee = load()?;
-    let (status, thread_id, next_check_at) = runtime(|rt| {
+    let (status, thread_id) = runtime(|rt| {
         let status = if rt.current.is_some() {
             "working"
         } else if rt.yielded {
@@ -572,8 +690,14 @@ pub fn employee_get() -> Result<Value, String> {
         } else {
             "rest"
         };
-        (status, rt.current.as_ref().map(|c| c.thread_id.clone()), rt.next_check_at)
+        (status, rt.current.as_ref().map(|c| c.thread_id.clone()))
     });
+    let next_check_at = next_check_at(&employee).filter(|_| employee.enabled).and_then(|at| {
+        use chrono::TimeZone;
+        let due = chrono::DateTime::from_timestamp_millis(at.max(now_ms()))?.with_timezone(&chrono::Local);
+        let slot = work_slot(due.naive_local(), &employee.work_start, &employee.work_end);
+        Some(chrono::Local.from_local_datetime(&slot).earliest().map_or(due.timestamp_millis(), |t| t.timestamp_millis()))
+    }).unwrap_or(0);
     Ok(json!({"employee": employee, "status": status, "threadId": thread_id, "nextCheckAt": next_check_at,
         "idleSupported": cfg!(windows)}))
 }
@@ -585,16 +709,9 @@ pub fn employee_set(patch: Value) -> Result<(), String> {
         if let Some(v) = patch["workStart"].as_str() { e.work_start = v.trim().into(); }
         if let Some(v) = patch["workEnd"].as_str() { e.work_end = v.trim().into(); }
         if let Some(v) = patch["idleMinutes"].as_u64() { e.idle_minutes = v.clamp(1, 24 * 60) as u32; }
-        if let Some(v) = patch["agentKind"].as_str() { e.agent_kind = v.into(); }
-        if let Some(v) = patch["model"].as_str() { e.model = v.into(); }
         Ok(())
     })?;
     runtime(|rt| rt.yielded = false);
-    // 改了时段等配置要重算检查点；已过点仍挂起的那一次保留，由心跳循环判定是否作废。
-    let employee = load()?;
-    if runtime(|rt| rt.next_check_at > now_ms()) {
-        reschedule(&employee);
-    }
     Ok(())
 }
 
@@ -602,12 +719,7 @@ pub fn employee_set(patch: Value) -> Result<(), String> {
 #[tauri::command]
 pub async fn employee_do(app: AppHandle, action: String, id: Option<String>, text: Option<String>) -> Result<String, String> {
     if action == "check" {
-        let out = heartbeat(&app, true).await?;
-        // 顺带满足已过点的挂起检查点，但不推迟未来的检查点。
-        if runtime(|rt| rt.next_check_at <= now_ms()) {
-            reschedule(&load()?);
-        }
-        return Ok(out);
+        return check_due(&app, true);
     }
     let id = id.unwrap_or_default();
     match action.as_str() {
@@ -617,6 +729,11 @@ pub async fn employee_do(app: AppHandle, action: String, id: Option<String>, tex
             Ok(())
         }),
         "duty_edit" => execute_tool(&json!({"action": "update", "id": id, "text": text.ok_or("缺少 text")?})).map(|_| ()),
+        "duty_note" => execute_tool(&json!({"action": "update", "id": id, "note": text.unwrap_or_default()})).map(|_| ()),
+        "duty_every" => {
+            let minutes: u64 = text.as_deref().map(str::trim).filter(|t| !t.is_empty()).unwrap_or("0").parse().map_err(|_| "间隔应为整数分钟")?;
+            execute_tool(&json!({"action": "update", "id": id, "everyMinutes": minutes})).map(|_| ())
+        }
         "duty_delete" | "dismiss" => execute_tool(&json!({"action": "done", "id": id})).map(|_| ()),
         "duty_run" => {
             let duty = load()?.duties.into_iter().find(|d| d.id == id).ok_or("没有这条职责")?;
@@ -624,8 +741,12 @@ pub async fn employee_do(app: AppHandle, action: String, id: Option<String>, tex
         }
         "approve" => {
             let item = load()?.inbox.into_iter().find(|t| t.id == id).ok_or("这条已不存在")?;
+            let extra = text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+                .map(|t| format!("\n用户的补充说明（与上面冲突时以补充为准）：\n{t}")).unwrap_or_default();
+            // 已获批准的会话不得再 ask：否则信息不足时会反复生成待确认，形成批准 → 再确认的死循环。
             launch(&app, "approve", &format!("已批准：{}", clip(&item.text, 40)),
-                &format!("用户已批准执行以下事项，按其授权执行（仅限此事项）：\n{}", item.text), false)?;
+                &format!("用户已批准执行以下事项，按其授权执行（仅限此事项）：\n{}{extra}\n\
+                          此事项已获批准，不要再调用 employee action=ask 请求确认；若信息不足或无法完成，直接说明原因并结束。", item.text), false, None, &item.profile)?;
             execute_tool(&json!({"action": "done", "id": id})).map(|_| ())
         }
         _ => Err(format!("未知操作：{action}")),
@@ -642,7 +763,10 @@ pub fn employee_say(app: AppHandle, text: String) -> Result<(), String> {
     }
     launch(&app, "say", &format!("对员工说：{}", clip(text, 30)), &format!(
         "用户在数字员工页面对你说：\n{text}\n\n先用 employee action=list 看现状，再用 employee 工具增改职责、派发待办或回答问题。\
-         职责写成可独立执行的一句话，包含时间/频率要求与授权范围。除非用户要求立刻去做，否则只改配置不执行。"), false)
+         职责写成可独立执行的一句话，包含时间/频率要求与授权范围；用户明确“每隔 N 分钟/小时”才设固定 everyMinutes。\
+         “每隔几分钟/隔一段时间”等模糊频率设 everyMinutes=0，由你选择初始 nextCheckInMinutes，员工以后每轮再按结果调整。\
+         每天某时刻等要求也用动态调度，将 nextCheckInMinutes 安排到下次满足条件的时间；未安排的职责将在空闲时先检查条件。\
+         修改职责 text 会清除旧备注、固定间隔和下次计划，需要的参数应同次重新提供。除非用户要求立刻去做，否则只改配置不执行。"), false, None, "")
 }
 
 #[cfg(test)]
@@ -661,16 +785,85 @@ mod tests {
     }
 
     #[test]
-    fn next_slot_aligns_to_quarter_and_skips_off_hours() {
+    fn work_slot_preserves_due_time_and_skips_off_hours() {
         let at = |mo: u32, d: u32, h: u32, m: u32, s: u32| {
             chrono::NaiveDate::from_ymd_opt(2026, mo, d).unwrap().and_hms_opt(h, m, s).unwrap()
         };
-        assert_eq!(next_slot(at(9, 30, 10, 7, 30), "09:00", "18:00"), at(9, 30, 10, 15, 0));
-        assert_eq!(next_slot(at(9, 30, 10, 15, 0), "09:00", "18:00"), at(9, 30, 10, 30, 0));
-        assert_eq!(next_slot(at(9, 30, 17, 50, 0), "09:00", "18:00"), at(10, 1, 9, 0, 0));
-        assert_eq!(next_slot(at(9, 30, 8, 50, 0), "09:10", "18:00"), at(9, 30, 9, 10, 0));
-        assert_eq!(next_slot(at(9, 30, 23, 50, 0), "22:00", "06:00"), at(10, 1, 0, 0, 0));
-        assert_eq!(next_slot(at(9, 30, 12, 0, 0), "22:00", "06:00"), at(9, 30, 22, 0, 0));
+        assert_eq!(work_slot(at(9, 30, 10, 7, 30), "09:00", "18:00"), at(9, 30, 10, 7, 30));
+        assert_eq!(work_slot(at(9, 30, 18, 0, 0), "09:00", "18:00"), at(10, 1, 9, 0, 0));
+        assert_eq!(work_slot(at(9, 30, 8, 50, 0), "09:10", "18:00"), at(9, 30, 9, 10, 0));
+        assert_eq!(work_slot(at(9, 30, 23, 50, 0), "22:00", "06:00"), at(9, 30, 23, 50, 0));
+        assert_eq!(work_slot(at(9, 30, 6, 0, 0), "22:00", "06:00"), at(9, 30, 22, 0, 0));
+    }
+
+    #[test]
+    fn schedules_are_independent_and_survive_reload() {
+        let duty = |id: &str, every, last, enabled| Duty { id: id.into(), text: "x".into(), enabled, every_minutes: every, last_run_at: last, ..Default::default() };
+        let mut e = Employee::default();
+        e.duties = vec![duty("a", 0, 0, true), duty("b", 5, 600_000, true), duty("c", 1, 0, false)];
+        assert_eq!(duty_next(&e).map(|d| d.id.as_str()), Some("a")); // 未安排：先检查
+        e.duties[0].apply_update(&json!({"nextCheckInMinutes": 20}), 0).unwrap();
+        assert_eq!(duty_next(&e).map(|d| (d.due_at(), d.id.as_str())), Some((900_000, "b")));
+        e.duties[0].apply_update(&json!({"nextCheckInMinutes": 2}), 0).unwrap();
+        let restored: Employee = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(next_check_at(&restored), Some(120_000));
+        assert_eq!(restored.duties[1].due_at(), 900_000);
+        e.duties.clear();
+        e.inbox = vec![Todo { id: "t1".into(), next_check_at: 300_000, ..Default::default() },
+            Todo { id: "c1".into(), confirm: true, ..Default::default() },
+            Todo { id: "t2".into(), ..Default::default() }];
+        assert_eq!(todo_next(&e).map(|t| t.id.as_str()), Some("t2")); // 失败退避不挡住新待办
+        e.inbox.pop();
+        e.duties.push(Duty { next_check_at: 120_000, ..duty("a", 0, 0, true) });
+        assert_eq!(next_check_at(&e), Some(120_000)); // 也不挡住职责
+    }
+
+    #[test]
+    fn dynamic_completion_keeps_plan_and_recovers_missing_plan() {
+        let original = Duty { text: "隔一段时间检查".into(), enabled: true, ..Default::default() };
+        let mut d = original.clone();
+        d.apply_update(&json!({"nextCheckInMinutes": 2}), 10_000).unwrap();
+        d.finish(&original, 20_000, "有新内容");
+        assert_eq!(d.due_at(), 130_000); // 保留本轮安排
+        d.finish(&original, 140_000, "未安排或计划已过期");
+        assert_eq!(d.due_at(), 440_000); // 从结束时兜底，不会每秒重跑
+        d.apply_update(&json!({"text": "新的职责", "nextCheckInMinutes": 30}), 150_000).unwrap();
+        let edited = d.clone();
+        d.finish(&original, 160_000, "旧职责的结果");
+        assert_eq!(d, edited);
+        let old: Duty = serde_json::from_value(json!({"id":"d1", "text":"旧职责", "enabled":true})).unwrap();
+        assert_eq!(old.due_at(), 0); // 旧文件无需迁移
+    }
+
+    #[test]
+    fn schedule_updates_validate_input_and_keep_fixed_frequency() {
+        let mut d = Duty { text: "每5分钟".into(), enabled: true, every_minutes: 5, last_run_at: 60_000, ..Default::default() };
+        assert!(d.apply_update(&json!({"nextCheckInMinutes": 2}), 0).is_err());
+        let original = d.clone();
+        d.finish(&original, 120_000, "已完成");
+        assert_eq!(d.due_at(), 420_000);
+        for value in [json!(-1), json!(1.5), json!(10081), json!("5"), Value::Null] {
+            assert!(d.apply_update(&json!({"everyMinutes": value}), 0).is_err());
+        }
+        d.apply_update(&json!({"everyMinutes": 0}), 0).unwrap();
+        assert_eq!(d.due_at(), 0);
+        for value in [json!(0), json!(-1), json!(1.5), json!(10081), json!("5"), Value::Null] {
+            assert!(d.apply_update(&json!({"nextCheckInMinutes": value}), 0).is_err());
+        }
+        d.apply_update(&json!({"text": "每1分钟", "everyMinutes": 1, "note": "新备注"}), 0).unwrap();
+        assert_eq!(d.every_minutes, 1);
+        assert_eq!(d.note, "新备注");
+    }
+
+    #[test]
+    fn editing_duty_text_drops_stale_note() {
+        let mut d = Duty { id: "d1".into(), text: "每10分钟".into(), note: "旧备注".into(), every_minutes: 10, next_check_at: 600_000, ..Default::default() };
+        d.set_text("每10分钟".into());
+        assert_eq!(d.note, "旧备注");
+        d.set_text("每1分钟".into());
+        assert!(d.note.is_empty());
+        assert_eq!(d.every_minutes, 0);
+        assert_eq!(d.next_check_at, 0);
     }
 
     #[test]

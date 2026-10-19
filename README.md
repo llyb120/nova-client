@@ -63,7 +63,7 @@ Claude Code 有独立后端，不需要占用 Devin 配置。需要 Node.js 22+�
 2. 运行 `claude-agent-acp --cli` 完成 Claude Code 登录，或在 Nova 环境变量中配置 `ANTHROPIC_API_KEY`。
 3. 设置 → 后端 → Claude Code，启用并保存。默认可执行文件是 `claude-agent-acp`（不是 `claude`），支持自定义路径与独立代理。
 
-复用 ACP 的流式消息、工具展示、图片、权限审批、Build/Plan、模型与思考强度、恢复、取消、预热、标题、接力、漫游和历史编辑。Nova 的 Polaris、剑来、Chrome、WebView、图片生成/编辑及工作目录切换通过会话 MCP 自动挂载；Plan 模式不开放写入类 Nova 工具。全局指令同步到 `CLAUDE.md`，skills 同步到 Claude 配置目录。
+复用 ACP 的流式消息、工具展示、图片、权限审批、Build/Plan、模型与思考强度、恢复、取消、预热、标题、接力、漫游和历史编辑。Nova 的 Polaris、剑来、Chrome、图片生成/编辑及工作目录切换通过会话 MCP 自动挂载；Plan 模式不开放写入类 Nova 工具。全局指令同步到 `CLAUDE.md`，skills 同步到 Claude 配置目录。
 
 额度租借仅支持显式 API Key / Token，不自动导出系统钥匙串中的登录凭证。ACP 不提供通用运行中引导接口，Claude 忙碌时使用消息队列。
 

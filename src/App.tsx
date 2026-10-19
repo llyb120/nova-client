@@ -14,12 +14,14 @@ import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
 import { WorkflowsView } from "./components/WorkflowsView";
 import "./promptQueue";
+import { scenesReady } from "./types";
 import { selectedChatText } from "./chatSelection";
-import { hideCurrentThreadToVirgo, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal, zenDropLanded, zenDropSignal } from "./store";
-import { mountSessionShortcuts } from "./sessionShortcuts";
+import { closeThread, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal } from "./store";
+import { mountSessionShortcuts, setShortcutRecordingActive } from "./sessionShortcuts";
 import { createHomeTerminalState, setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
 const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
 const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"));
+const JianpuView = lazy(() => import("./components/JianpuView"));
 const EmployeeView = lazy(() => import("./components/EmployeeView"));
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
@@ -40,83 +42,7 @@ function SettingsLoadingModal(props: { onClose: () => void }) {
   );
 }
 
-/** 减少焦虑：提示词化作星尘沿弧线飞进侧栏「室女座」tab，落地后轻脉冲并弹轻提示。 */
-function ZenDropOverlay() {
-  return (
-    <Show when={zenDropSignal()} keyed>
-      {(drop) => <ZenDropChip text={drop.text} />}
-    </Show>
-  );
-}
-
-function ZenDropChip(props: { text: string }) {
-  let el: HTMLDivElement | undefined;
-  let raf = 0;
-  onMount(() => {
-    if (!el) return;
-    const tab = document.getElementById("virgo-tab");
-    const rect = tab?.getBoundingClientRect();
-    // 起点取提示词输入框中心（发送后视图已回到首页），找不到时退回屏幕下方。
-    const inputRect = document.querySelector(".composer-input")?.getBoundingClientRect();
-    const start = inputRect
-      ? { x: inputRect.left + inputRect.width / 2, y: inputRect.top + inputRect.height / 2 }
-      : { x: window.innerWidth / 2, y: window.innerHeight - 150 };
-    const end = rect
-      ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
-      : { x: 130, y: 180 };
-    const dist = Math.hypot(end.x - start.x, end.y - start.y);
-    const duration = Math.min(1050, Math.max(720, 620 + dist * 0.3));
-    // 二次贝塞尔：中点上抬控制点，走出柔和弧线。
-    const ctrl = {
-      x: (start.x + end.x) / 2,
-      y: Math.min(start.y, end.y) - Math.min(200, dist * 0.22),
-    };
-    const dot = el.querySelector(".zen-drop-dot") as HTMLElement | null;
-    const label = el.querySelector(".zen-drop-label") as HTMLElement | null;
-    const easeInOut = (t: number) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
-    const t0 = performance.now();
-    const step = (now: number) => {
-      const t = Math.min(1, (now - t0) / duration);
-      const e = easeInOut(t);
-      const u = 1 - e;
-      const x = u * u * start.x + 2 * u * e * ctrl.x + e * e * end.x;
-      const y = u * u * start.y + 2 * u * e * ctrl.y + e * e * end.y;
-      // 起步轻弹放大，中段巡航，末段缩小「被吸进去」；标签在途中逐渐消散。
-      const scale =
-        t < 0.14
-          ? 0.4 + 0.6 * (t / 0.14)
-          : 1 - 0.65 * Math.pow(Math.max(0, (t - 0.55) / 0.45), 1.6);
-      const fadeIn = Math.min(1, t / 0.1);
-      el!.style.transform = `translate(${x}px, ${y}px)`;
-      if (dot) {
-        dot.style.transform = `scale(${scale})`;
-        dot.style.opacity = String(fadeIn * (t > 0.9 ? (1 - t) / 0.1 : 1));
-      }
-      if (label) {
-        label.style.opacity = String(Math.max(0, fadeIn * (1 - Math.max(0, (t - 0.32) / 0.33))));
-      }
-      if (t < 1) {
-        raf = requestAnimationFrame(step);
-      } else {
-        if (tab) {
-          tab.classList.add("virgo-landed");
-          setTimeout(() => tab.classList.remove("virgo-landed"), 900);
-        }
-        zenDropLanded();
-      }
-    };
-    raf = requestAnimationFrame(step);
-  });
-  onCleanup(() => cancelAnimationFrame(raf));
-  return (
-    <div ref={el} class="zen-drop">
-      <div class="zen-drop-dot" />
-      <div class="zen-drop-label">{props.text}</div>
-    </div>
-  );
-}
-
-/** 全局轻提示：优先贴着提示词输入框显示（减少焦虑发送后用户视线停留在输入框处），找不到输入框退回底部居中。 */
+/** 全局轻提示：优先贴着提示词输入框显示（发送后用户视线停留在输入框处），找不到输入框退回底部居中。 */
 function AppToast() {
   return (
     <Show when={toastMessageSignal()} keyed>
@@ -169,6 +95,8 @@ export default function App() {
     homeComposerFocusAt: state.homeComposerFocusAt,
   }));
   const [showSettings, setShowSettings] = createSignal(false);
+  // 先决条件：三个场景都至少配置一个模型，否则启动即弹出不可关闭的首次引导（后端 → 场景模型）。
+  const scenesMissing = () => !!state.settings && !scenesReady(state.settings.sceneModels);
   const [showAchievements, setShowAchievements] = createSignal(false);
   const [showUpdate, setShowUpdate] = createSignal(false);
   const [showInbox, setShowInbox] = createSignal(false);
@@ -177,6 +105,7 @@ export default function App() {
   });
 
   onMount(() => {
+    setShortcutRecordingActive(false);
     void initStore();
 
     // Native global shortcut events also arrive while the WebView is unfocused/minimized.
@@ -189,9 +118,9 @@ export default function App() {
       });
     onGlobalShortcut("session-shortcut:new-session", () => openNewSession(selectedChatText()));
     onGlobalShortcut("session-shortcut:open-unread", () => void openNextUnreadThread());
-    void listen<{ threadId: string }>("native-browser:open", event => {
-      if (event.payload.threadId === state.currentId) setWorkspaceLayout({ open: true, mode: "browser" });
-    }).then(remove => { if (disposed) remove(); else unlistens.push(remove); });
+    // Butterfly 面板「知识图谱」：切到图谱页。
+    void listen<{ view: "knowledge" }>("nova:open-view", event => { closeThread(); setView(event.payload.view); })
+      .then(remove => { if (disposed) remove(); else unlistens.push(remove); });
     onCleanup(() => {
       disposed = true;
       for (const unlisten of unlistens) unlisten();
@@ -200,9 +129,8 @@ export default function App() {
 
   // 「打开未读消息」在应用聚焦时的按键处理；全局注册（Rust 侧）覆盖最小化/失焦场景。
   mountSessionShortcuts({
-    allowedActions: ["openUnread", "hideToVirgo", "toggleTerminal"],
+    allowedActions: ["openUnread", "toggleTerminal"],
     onOpenUnread: () => void openNextUnreadThread(),
-    onHideToVirgo: hideCurrentThreadToVirgo,
     onToggleTerminal: () => {
       if (!state.currentId) { homeTerminal.toggle(); return; }
       if (state.threads.find(thread => thread.id === state.currentId)?.roamingRole === "guest") return;
@@ -237,7 +165,11 @@ export default function App() {
           <Show when={state.view === "workflows"} fallback={
           <Show when={state.view === "clues"} fallback={
             <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={
-              <Show when={state.view === "employee"} fallback={<HomeView />}>
+              <Show when={state.view === "employee"} fallback={
+                <Show when={state.view === "jianpu"} fallback={<HomeView />}>
+                  <Suspense><JianpuView /></Suspense>
+                </Show>
+              }>
                 <Suspense><EmployeeView /></Suspense>
               </Show>
             }>
@@ -256,12 +188,14 @@ export default function App() {
       <Show when={homeTerminal.open()}>
         <Suspense><HomeTerminalPanel onClose={homeTerminal.close} /></Suspense>
       </Show>
-      <Show when={showSettings()}>
+      <Show when={showSettings() || scenesMissing()}>
         <Show
           when={state.settings}
           fallback={<SettingsLoadingModal onClose={() => setShowSettings(false)} />}
         >
-          <SettingsModal onClose={() => setShowSettings(false)} />
+          <Show when={scenesMissing()} fallback={<SettingsModal onClose={() => setShowSettings(false)} />}>
+            <SettingsModal onboarding onClose={() => setShowSettings(false)} />
+          </Show>
         </Show>
       </Show>
       <Show when={showAchievements()}>
@@ -273,7 +207,6 @@ export default function App() {
       <RoamRequestModal />
       <UpdateModal show={showUpdate()} onClose={() => setShowUpdate(false)} />
       <SignatureSplash />
-      <ZenDropOverlay />
       <AppToast />
     </div>
   );

@@ -7,7 +7,9 @@ import {
   configFromDraft,
   draftFromConfig,
   hasVariants,
+  passesFilter,
   isObject,
+  isLocalPreset,
   modelDraft,
   providerDraft,
   serializeProvider,
@@ -83,14 +85,16 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
   const [dirty, setDirty] = createSignal(false);
   const [presets, setPresets] = createSignal<Preset[]>([]);
   let raw: Record<string, any> = {};
+  let root: HTMLElement | undefined;
 
   const load = async () => {
     setError("");
     try {
       raw = await api.getLyraConfig();
-      setDraft(draftFromConfig(raw));
+      const next = draftFromConfig(raw);
+      setDraft(next);
       setLoaded(true);
-      setDirty(false);
+      setDirty(next.providers.some((p) => p.preset !== (raw.provider?.[p.id]?.preset ?? "")));
     } catch (e) {
       // 解析失败时不允许保存，避免用空配置覆盖手写文件。
       setLoaded(false);
@@ -136,11 +140,13 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
   const fetchModels = async (p: ProviderDraft) => {
     const id = p.id.trim();
     if (!id) return setFetched("", { error: "请先填写 Provider ID" });
-    setFetched(id, { busy: true });
+    setFetched(id, { busy: true, error: undefined });
     try {
       setFetched(id, { models: await api.fetchLyraModels(id, serializeProvider(unwrap(p))) });
     } catch (e) {
       setFetched(id, { error: String(e) });
+    } finally {
+      setFetched(id, "busy", false);
     }
   };
 
@@ -150,7 +156,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
         ...Object.entries(fetched[p.id]?.models ?? {}).filter(([mid]) => !p.models.some((m) => m.id === mid)),
         ...p.models.map((m) => [m.id, m.raw] as const),
       ];
-      return models.flatMap(([mid, raw]) => {
+      return models.filter(([mid, raw]) => passesFilter(p, mid, raw?.name)).flatMap(([mid, raw]) => {
         const base = `${p.id}/${mid}`;
         const variants = isObject(raw?.variants) ? Object.keys(raw.variants) : [];
         return [base, ...variants.map((v) => `${base}/variant/${v}`)];
@@ -161,26 +167,12 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
     let id = presetId === "openai-compatible" ? "" : presetId;
     for (let n = 2; id && draft.providers.some((p) => p.id === id); n++) id = `${presetId}-${n}`;
     edit((d) => void d.providers.push(presetId === "manual" ? providerDraft("", { api: APIS[0] }) : providerDraft(id, { preset: presetId })));
-  };
-
-  const [importing, setImporting] = createSignal(false);
-  const importLocal = async (source: "codex" | "claude-code") => {
-    setImporting(true);
-    setError("");
-    try {
-      const result = await api.importLocalLyraProvider(source);
-      const base = `local-${source}`;
-      let id = base;
-      for (let n = 2; draft.providers.some((p) => p.id === id); n++) id = `${base}-${n}`;
-      edit((d) => {
-        d.providers.push(providerDraft(id, result.provider));
-        if (!d.model) d.model = `${id}/${result.model}`;
-      });
-    } catch (e) {
-      setError(`导入失败：${String(e)}`);
-    } finally {
-      setImporting(false);
-    }
+    // 新项在列表末尾，自动滚动到并聚焦，省去手动翻页。
+    requestAnimationFrame(() => {
+      const el = root?.querySelector<HTMLElement>(".lyra-provider:last-of-type");
+      el?.scrollIntoView({ block: "center", behavior: "smooth" });
+      el?.querySelector<HTMLElement>("input:not([type=checkbox])")?.focus({ preventScroll: true });
+    });
   };
 
   // 预设 provider 的模型自动拉取，界面里看不到，选中的默认模型不应标为不存在。
@@ -194,23 +186,14 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
   };
 
   return (
-    <section class="settings-group">
-      <h3 class="settings-group-title">模型配置</h3>
-      <span class="field-hint">
-        对应 ~/.nova/alkaid/config.jsonc，点击底部「保存」写回并立即重载。图形保存会改写为标准 JSON，手写注释会丢失，首次覆盖前备份为 config.jsonc.bak。
-      </span>
-      <div class="backend-card-head">
-        <Show when={error()}>
-          <span class="field-hint" role="alert">{error()}</span>
-        </Show>
-        <span class="field-hint" role="status" aria-live="polite">{reloadMsg()}</span>
-        <button type="button" class="btn secondary" style={{ "margin-left": "auto" }} onClick={() => void reload()}>
-          从文件重新加载
-        </button>
-      </div>
+    <section class="lyra-config" ref={root}>
+      <Show when={error()}>
+        <span class="field-hint lyra-error" role="alert">{error()}</span>
+      </Show>
       <Show when={loaded()}>
-        <label class="field">
+        <label class="field lyra-default-model">
           <span class="field-label">默认模型</span>
+          <span class="field-hint">新会话默认使用此模型，也可以在会话中切换。</span>
           <select class="field-input" onChange={(e) => edit((d) => void (d.model = e.currentTarget.value))}>
             <option value="" selected={!draft.model}>未设置（使用第一个模型）</option>
             <Show when={draft.model && !modelChoices().includes(draft.model)}>
@@ -220,10 +203,37 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
           </select>
         </label>
 
+        <div class="lyra-section-head lyra-providers-head">
+          <div class="lyra-heading">
+            <h3>模型服务商 <span class="lyra-count">{draft.providers.length}</span></h3>
+            <p class="field-hint">添加服务商、获取模型，再选择默认模型。</p>
+          </div>
+          <select
+            class="field-input lyra-add-provider"
+            aria-label="添加 Provider"
+            onChange={(e) => {
+              addProvider(e.currentTarget.value);
+              e.currentTarget.value = "";
+            }}
+          >
+            <option value="" selected>＋ 添加服务商</option>
+            <For each={presets()}>{(x) => <option value={x.id}>{x.name}（{x.local ? "无需填 Key" : "填 Key 一键获取模型"}）</option>}</For>
+            <option value="manual">手动配置</option>
+          </select>
+        </div>
+        <Show when={!draft.providers.length}>
+          <div class="lyra-empty">
+            <span class="field-label">添加第一个模型服务商</span>
+            <span class="field-hint">选择预设后填写 API Key；本地 Codex / Claude Code 可直接沿用本机认证。</span>
+          </div>
+        </Show>
         <Index each={draft.providers}>
           {(p, pi) => {
             const setP = (fn: (p: ProviderDraft) => void) => edit((d) => fn(d.providers[pi]));
             const preset = () => presets().find((x) => x.id === p().preset);
+            const local = () => isLocalPreset(p().preset);
+            const advancedInitiallyOpen = !p().id;
+            const initiallyOpen = pi === 0 || !Object.hasOwn(raw.provider ?? {}, p().id);
             const setPreset = (id: string) =>
               setP((x) => {
                 x.preset = id;
@@ -232,168 +242,208 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                 if (id && !x.id.trim() && id !== "openai-compatible") x.id = id;
               });
             return (
-              <div class="backend-card">
-                <div class="backend-card-head">
-                  <span class="agent-badge lyra">{p().name || p().id || "未命名 Provider"}</span>
-                  <span class="field-hint">{p().models.length} 个模型</span>
-                  <button type="button" class="link-btn" style={{ "margin-left": "auto" }} onClick={() => void removeProvider(pi)}>
-                    删除 Provider
+              <details class="lyra-provider" open={initiallyOpen}>
+                <summary>
+                  <span class="lyra-provider-title">{p().name || p().id || preset()?.name || "未命名服务商"}</span>
+                  <span class="lyra-provider-meta">{preset()?.name || "手动配置"}</span>
+                  <span class="lyra-count">{fetched[p().id.trim()]?.models || p().models.length
+                    ? `${new Set([...Object.keys(fetched[p().id.trim()]?.models ?? {}), ...p().models.map((m) => m.id)]).size} 个模型`
+                    : p().preset ? "自动获取模型" : "待添加模型"}</span>
+                  <button
+                    type="button"
+                    class="link-btn lyra-del"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      void removeProvider(pi);
+                    }}
+                  >
+                    删除
                   </button>
-                </div>
-                <div class="backend-fields">
-                  <label class="backend-field">
-                    <span class="field-label" title="选择厂商后只需填 API Key，Base URL 与模型列表自动获取">类型</span>
-                    <select class="field-input" onChange={(e) => setPreset(e.currentTarget.value)}>
-                      <option value="" selected={!p().preset}>手动配置</option>
-                      <Show when={p().preset && presets().length && !preset()}>
-                        <option value={p().preset} selected>{p().preset}（不支持）</option>
-                      </Show>
-                      <For each={presets()}>{(x) => <option value={x.id} selected={x.id === p().preset}>{x.name}</option>}</For>
-                    </select>
-                  </label>
-                  <label class="backend-field">
-                    <span class="field-label">ID</span>
-                    <input class="field-input" placeholder="如 openai" value={p().id} onInput={(e) => setP((x) => (x.id = e.currentTarget.value))} />
-                  </label>
-                  <label class="backend-field">
-                    <span class="field-label">显示名称</span>
-                    <input class="field-input" placeholder={preset()?.name} value={p().name} onInput={(e) => setP((x) => (x.name = e.currentTarget.value))} />
-                  </label>
-                  <label class="backend-field">
-                    <span class="field-label">协议</span>
-                    <select class="field-input" onChange={(e) => setP((x) => (x.api = e.currentTarget.value))}>
-                      <Show when={p().raw.npm}>
-                        <option value="" selected={!p().api}>按 npm 推导（{p().raw.npm}）</option>
-                      </Show>
-                      <Show when={!p().raw.npm && preset()}>
-                        <option value="" selected={!p().api}>按模型自动识别</option>
-                      </Show>
-                      <Show when={!p().raw.npm && !preset()}>
-                        <option value="" disabled selected={!p().api}>请选择</option>
-                      </Show>
-                      <Show when={p().api && !APIS.includes(p().api)}>
-                        <option value={p().api} selected>{p().api}（不支持）</option>
-                      </Show>
-                      <For each={APIS}>{(a) => <option value={a} selected={a === p().api}>{a}</option>}</For>
-                    </select>
-                  </label>
-                </div>
-                <div class="backend-fields">
-                  <label class="backend-field backend-field-wide">
-                    <span class="field-label">Base URL</span>
-                    <input class="field-input" type="url" placeholder={preset()?.baseURL ? `留空使用 ${preset()!.baseURL}` : "https://api.openai.com/v1"} value={p().baseURL} onInput={(e) => setP((x) => (x.baseURL = e.currentTarget.value))} />
-                  </label>
-                  <label class="backend-field">
-                    <span class="field-label">API Key</span>
-                    <input class="field-input" type="password" autocomplete="off" placeholder="sk-… 或 {env:NAME}" value={p().apiKey} onInput={(e) => setP((x) => (x.apiKey = e.currentTarget.value))} />
-                  </label>
-                  <label class="backend-field">
-                    <span class="field-label">代理</span>
-                    <input class="field-input" placeholder="留空跟随 Lyra 全局代理" value={p().proxy} onInput={(e) => setP((x) => (x.proxy = e.currentTarget.value))} />
-                  </label>
-                </div>
-                <KvEditor title="自定义请求头" hint={HEADER_HINT} rows={p().headers} keyPlaceholder="Header 名，如 X-Api-Version" valuePlaceholder="值" onChange={(fn) => setP((x) => fn(x.headers))} />
-                <KvEditor title="自定义字段" hint={FIELD_HINT} rows={p().fields} keyPlaceholder="字段名，如 temperature" valuePlaceholder="值，如 0.7" onChange={(fn) => setP((x) => fn(x.fields))} />
+                </summary>
+                <div class="lyra-provider-body">
+                  <h4>连接配置</h4>
+                  <div class="backend-fields">
+                    <label class="backend-field">
+                      <span class="field-label" title="选择 Provider 自动获取模型；本地 Codex / Claude Code 沿用本地认证，无需填写 Key">类型</span>
+                      <select class="field-input" onChange={(e) => setPreset(e.currentTarget.value)}>
+                        <option value="" selected={!p().preset}>手动配置</option>
+                        <Show when={p().preset && presets().length && !preset()}>
+                          <option value={p().preset} selected>{p().preset}（不支持）</option>
+                        </Show>
+                        <For each={presets()}>{(x) => <option value={x.id} selected={x.id === p().preset}>{x.name}</option>}</For>
+                      </select>
+                    </label>
+                    <label class="backend-field">
+                      <span class="field-label">显示名称</span>
+                      <input class="field-input" placeholder={preset()?.name} value={p().name} onInput={(e) => setP((x) => (x.name = e.currentTarget.value))} />
+                    </label>
+                  </div>
+                  <div class="backend-fields">
+                    <label class="backend-field">
+                      <span class="field-label">Base URL</span>
+                      <input class="field-input" type="url" placeholder={local() ? "留空跟随本地配置" : preset()?.baseURL ? `留空使用 ${preset()!.baseURL}` : "https://api.openai.com/v1"} value={p().baseURL} onInput={(e) => setP((x) => (x.baseURL = e.currentTarget.value))} />
+                    </label>
+                    <Show when={!local()}>
+                      <label class="backend-field">
+                        <span class="field-label">API Key</span>
+                        <input class="field-input" type="text" autocomplete="off" placeholder="sk-… 或 {env:NAME}" value={p().apiKey} onInput={(e) => setP((x) => (x.apiKey = e.currentTarget.value))} />
+                      </label>
+                    </Show>
+                  </div>
 
-                <span class="field-label">模型</span>
-                <Show when={preset()}>
-                  {(() => {
-                    const result = () => fetched[p().id.trim()];
-                    const names = () => Object.entries(result()?.models ?? {}).map(([mid, m]) => m?.name || mid);
-                    return (
-                      <div class="backend-card-head">
-                        <button type="button" class="btn secondary" disabled={result()?.busy} onClick={() => void fetchModels(p())}>
-                          {result()?.busy ? "获取中…" : "获取模型"}
-                        </button>
-                        <span class="field-hint" role="status" aria-live="polite">
-                          {result()?.error
-                            ? `获取失败：${result()!.error}`
-                            : result()?.models
-                              ? `已获取 ${names().length} 个模型：${names().join("、")}`
-                              : "填好 API Key 后点击获取全部模型；之后每 6 小时自动更新。下方手写的同 ID 模型会覆盖获取结果。"}
-                        </span>
+                  <section class="lyra-models">
+                    <div class="lyra-section-head">
+                      <h4>模型</h4>
+                      <button type="button" class="btn secondary" onClick={() => setP((x) => void x.models.push(modelDraft("", {})))}>
+                        添加模型
+                      </button>
+                    </div>
+                    <Show when={preset()}>
+                      {(() => {
+                        const result = () => fetched[p().id.trim()];
+                        const names = () => Object.entries(result()?.models ?? {}).map(([mid, m]) => m?.name || mid);
+                        return (
+                          <div class="lyra-fetch">
+                            <span class="field-hint">{local() ? "沿用本机认证，无需填写 Key。" : "填写 API Key 后获取可用模型。"}模型每 6 小时自动更新，同 ID 的手动配置优先。</span>
+                            <button type="button" class="btn secondary" disabled={result()?.busy} onClick={() => void fetchModels(p())}>
+                              {result()?.busy ? "获取中…" : "获取模型"}
+                            </button>
+                            <span class="field-hint" role="status" aria-live="polite">
+                              {result()?.error
+                                ? `获取失败：${result()!.error}`
+                                : result()?.models
+                                  ? `已获取 ${names().length} 个模型`
+                                  : ""}
+                            </span>
+                            <Show when={names().length}>
+                              <details class="lyra-model-catalog">
+                                <summary>查看模型列表</summary>
+                                <div class="lyra-model-names"><For each={names()}>{(name) => <span>{name}</span>}</For></div>
+                              </details>
+                            </Show>
+                          </div>
+                        );
+                      })()}
+                    </Show>
+                    <Index each={p().models}>
+                      {(m, mi) => {
+                        const setM = (fn: (m: ModelDraft) => void) => setP((x) => fn(x.models[mi]));
+                        const initiallyOpen = !m().id;
+                        return (
+                          <details class="lyra-model" open={initiallyOpen}>
+                            <summary>
+                              <span class="lyra-provider-title">{m().name || m().id || "未命名模型"}</span>
+                              <span class="field-hint">手动配置</span>
+                              <button
+                                type="button"
+                                class="link-btn lyra-del"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  setP((x) => void x.models.splice(mi, 1));
+                                }}
+                              >
+                                删除
+                              </button>
+                            </summary>
+                            <div class="lyra-detail-body">
+                              <div class="backend-fields">
+                                <label class="backend-field">
+                                  <span class="field-label">模型 ID</span>
+                                  <input class="field-input" placeholder="如 gpt-5" value={m().id} onInput={(e) => setM((x) => (x.id = e.currentTarget.value))} />
+                                </label>
+                                <label class="backend-field">
+                                  <span class="field-label">显示名称</span>
+                                  <input class="field-input" value={m().name} onInput={(e) => setM((x) => (x.name = e.currentTarget.value))} />
+                                </label>
+                                <label class="backend-field">
+                                  <span class="field-label">上下文窗口</span>
+                                  <input class="field-input" inputmode="numeric" placeholder="128000" value={m().context} onInput={(e) => setM((x) => (x.context = e.currentTarget.value))} />
+                                </label>
+                                <label class="backend-field">
+                                  <span class="field-label">最大输出</span>
+                                  <input class="field-input" inputmode="numeric" placeholder="32000" value={m().output} onInput={(e) => setM((x) => (x.output = e.currentTarget.value))} />
+                                </label>
+                              </div>
+                              <div class="backend-card-head">
+                                <label>
+                                  <input type="checkbox" checked={m().reasoning} onChange={(e) => setM((x) => (x.reasoning = e.currentTarget.checked))} /> 支持思考
+                                </label>
+                                <label>
+                                  <input type="checkbox" checked={m().image} onChange={(e) => setM((x) => (x.image = e.currentTarget.checked))} /> 支持图片输入
+                                </label>
+                                <Show when={hasVariants(m().raw)}>
+                                  <span class="field-hint">思考强度：{Object.keys(m().raw.variants).join(" / ")}</span>
+                                </Show>
+                              </div>
+                              <details class="lyra-advanced">
+                                <summary>高级参数<span class="field-hint">{m().headers.length + m().fields.length} 项自定义配置</span></summary>
+                                <div class="lyra-detail-body">
+                                  <KvEditor title="自定义请求头" hint="覆盖 Provider 级同名头。" rows={m().headers} keyPlaceholder="Header 名" valuePlaceholder="值" onChange={(fn) => setM((x) => fn(x.headers))} />
+                                  <KvEditor title="自定义字段" hint="覆盖 Provider 级同名字段。" rows={m().fields} keyPlaceholder="字段名" valuePlaceholder="值" onChange={(fn) => setM((x) => fn(x.fields))} />
+                                </div>
+                              </details>
+                            </div>
+                          </details>
+                        );
+                      }}
+                    </Index>
+                  </section>
+                  <details class="lyra-advanced" open={advancedInitiallyOpen || !p().preset}>
+                    <summary>高级设置<span class="field-hint">ID、协议、代理 · {p().headers.length + p().fields.length} 项自定义配置</span></summary>
+                    <div class="lyra-detail-body">
+                      <div class="backend-fields">
+                        <label class="backend-field">
+                          <span class="field-label">ID</span>
+                          <input class="field-input" placeholder="如 openai" value={p().id} onInput={(e) => setP((x) => (x.id = e.currentTarget.value))} />
+                        </label>
+                        <label class="backend-field">
+                          <span class="field-label">协议</span>
+                          <select class="field-input" onChange={(e) => setP((x) => (x.api = e.currentTarget.value))}>
+                            <Show when={p().raw.npm}>
+                              <option value="" selected={!p().api}>按 npm 推导（{p().raw.npm}）</option>
+                            </Show>
+                            <Show when={!p().raw.npm && preset()}>
+                              <option value="" selected={!p().api}>{local() ? "跟随本地配置" : "按模型自动识别"}</option>
+                            </Show>
+                            <Show when={!p().raw.npm && !preset()}>
+                              <option value="" disabled selected={!p().api}>请选择</option>
+                            </Show>
+                            <Show when={p().api && !APIS.includes(p().api)}>
+                              <option value={p().api} selected>{p().api}（不支持）</option>
+                            </Show>
+                            <For each={APIS}>{(a) => <option value={a} selected={a === p().api}>{a}</option>}</For>
+                          </select>
+                        </label>
+                        <label class="backend-field">
+                          <span class="field-label">代理</span>
+                          <input class="field-input" placeholder="留空跟随 Lyra 全局代理" value={p().proxy} onInput={(e) => setP((x) => (x.proxy = e.currentTarget.value))} />
+                        </label>
+                        <label class="backend-field">
+                          <span class="field-label" title="仅在模型选择器中保留 ID 或名称包含这些关键词的模型；多个用逗号分隔，不分大小写">模型关键词过滤</span>
+                          <input class="field-input" placeholder="如 claude, gpt-5；留空不过滤" value={p().modelFilter} onInput={(e) => setP((x) => (x.modelFilter = e.currentTarget.value))} />
+                        </label>
                       </div>
-                    );
-                  })()}
-                </Show>
-                <Index each={p().models}>
-                  {(m, mi) => {
-                    const setM = (fn: (m: ModelDraft) => void) => setP((x) => fn(x.models[mi]));
-                    return (
-                      <div class="backend-card">
-                        <div class="backend-card-head">
-                          <span class="field-label">{m().name || m().id || "未命名模型"}</span>
-                          <button type="button" class="link-btn" style={{ "margin-left": "auto" }} onClick={() => setP((x) => void x.models.splice(mi, 1))}>
-                            删除模型
-                          </button>
-                        </div>
-                        <div class="backend-fields">
-                          <label class="backend-field">
-                            <span class="field-label">模型 ID</span>
-                            <input class="field-input" placeholder="如 gpt-5" value={m().id} onInput={(e) => setM((x) => (x.id = e.currentTarget.value))} />
-                          </label>
-                          <label class="backend-field">
-                            <span class="field-label">显示名称</span>
-                            <input class="field-input" value={m().name} onInput={(e) => setM((x) => (x.name = e.currentTarget.value))} />
-                          </label>
-                          <label class="backend-field">
-                            <span class="field-label">上下文窗口</span>
-                            <input class="field-input" inputmode="numeric" placeholder="128000" value={m().context} onInput={(e) => setM((x) => (x.context = e.currentTarget.value))} />
-                          </label>
-                          <label class="backend-field">
-                            <span class="field-label">最大输出</span>
-                            <input class="field-input" inputmode="numeric" placeholder="32000" value={m().output} onInput={(e) => setM((x) => (x.output = e.currentTarget.value))} />
-                          </label>
-                        </div>
-                        <div class="backend-card-head">
-                          <label>
-                            <input type="checkbox" checked={m().reasoning} onChange={(e) => setM((x) => (x.reasoning = e.currentTarget.checked))} /> 支持思考
-                          </label>
-                          <label>
-                            <input type="checkbox" checked={m().image} onChange={(e) => setM((x) => (x.image = e.currentTarget.checked))} /> 支持图片输入
-                          </label>
-                          <Show when={hasVariants(m().raw)}>
-                            <span class="field-hint">思考强度：{Object.keys(m().raw.variants).join(" / ")}</span>
-                          </Show>
-                        </div>
-                        <KvEditor title="自定义请求头" hint="覆盖 Provider 级同名头。" rows={m().headers} keyPlaceholder="Header 名" valuePlaceholder="值" onChange={(fn) => setM((x) => fn(x.headers))} />
-                        <KvEditor title="自定义字段" hint="覆盖 Provider 级同名字段。" rows={m().fields} keyPlaceholder="字段名" valuePlaceholder="值" onChange={(fn) => setM((x) => fn(x.fields))} />
-                      </div>
-                    );
-                  }}
-                </Index>
-                <button
-                  type="button"
-                  class="btn secondary"
-                  style={{ "align-self": "flex-start" }}
-                  onClick={() => setP((x) => void x.models.push(modelDraft("", {})))}
-                >
-                  添加模型
-                </button>
-              </div>
+                      <KvEditor title="自定义请求头" hint={HEADER_HINT} rows={p().headers} keyPlaceholder="Header 名，如 X-Api-Version" valuePlaceholder="值" onChange={(fn) => setP((x) => fn(x.headers))} />
+                      <KvEditor title="自定义字段" hint={FIELD_HINT} rows={p().fields} keyPlaceholder="字段名，如 temperature" valuePlaceholder="值，如 0.7" onChange={(fn) => setP((x) => fn(x.fields))} />
+                    </div>
+                  </details>
+                  <div class="lyra-provider-footer">
+                    <span class="field-hint">修改后点击底部「保存」生效</span>
+                  </div>
+                </div>
+              </details>
             );
           }}
         </Index>
-        <select
-          class="field-input"
-          style={{ "align-self": "flex-start", width: "auto" }}
-          aria-label="添加 Provider"
-          onChange={(e) => {
-            addProvider(e.currentTarget.value);
-            e.currentTarget.value = "";
-          }}
-        >
-          <option value="" selected>添加 Provider…</option>
-          <For each={presets()}>{(x) => <option value={x.id}>{x.name}（填 Key 一键获取模型）</option>}</For>
-          <option value="manual">手动配置</option>
-        </select>
-        <div class="backend-card-head">
-          <button type="button" class="btn secondary" disabled={importing()} onClick={() => void importLocal("codex")}>从本地 Codex 导入</button>
-          <button type="button" class="btn secondary" disabled={importing()} onClick={() => void importLocal("claude-code")}>从本地 Claude Code 导入</button>
-          <Show when={importing()}><span class="field-hint" role="status">正在读取 API 配置和模型…</span></Show>
-        </div>
-        <span class="field-hint">读取本地用户级 API 配置，导入后可编辑并保存；本地配置变更后需重新导入。</span>
       </Show>
+      <details class="lyra-file-settings" open={!loaded()}>
+        <summary>配置文件与重新加载</summary>
+        <div class="lyra-detail-body">
+          <span class="field-hint">配置文件：~/.nova/alkaid/config.jsonc。保存后立即重载；文件会转为标准 JSON，手写注释会丢失，首次覆盖前备份为 config.jsonc.bak。</span>
+          <button type="button" class="btn secondary" onClick={() => void reload()}>从文件重新加载</button>
+          <span class="field-hint" role="status" aria-live="polite">{reloadMsg()}</span>
+        </div>
+      </details>
     </section>
   );
 }

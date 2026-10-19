@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import { transformSync } from "esbuild";
 import { chainGroupAnchor, latestFireStage } from "../src/threadDisplay.ts";
+import { nextRunningThread } from "../src/nextRunningThread.ts";
 import { isScratch, scratchParent } from "../src/utils.ts";
 
 test("侧栏将 Windows 长路径前缀与普通源仓库路径归为同组", () => {
@@ -26,7 +27,7 @@ test("侧栏将 Windows 长路径前缀与普通源仓库路径归为同组", ()
 
 // 回归：三级工作流链（root → stage2 → stage3），stage2/stage3 的 cwd 被 agent
 // 中途切到别的目录（change_working_directory）。分组锚点必须一路取到链根，
-// 否则 stage3 与父级分进不同分组、组内找不到父节点，侧栏（含室女座）裂成两条会话。
+// 否则 stage3 与父级分进不同分组、组内找不到父节点，侧栏裂成两条会话。
 const threads = [
   { id: "root", cwd: "D:/code/repo" },
   { id: "stage2", parentThreadId: "root", cwd: "D:/code/repo-worktree" },
@@ -102,4 +103,22 @@ test("接力空档：链 busy 时运行口径优先于旧 stage 的未读", () =
 test("链上没有 stage 节点时保持原行为：打开被点击的会话本身", () => {
   const plain = [{ id: "a", title: "普通会话", createdAt: 1, cwd: "x" }];
   assert.equal(latestFireStage(plain, plain[0], isRunning, unreadOf), undefined);
+});
+
+test("并行子 Agent 保留父链分组，但运行、未读和链尖都不抢自动导航", () => {
+  const root = runningChain[0];
+  const child = { id: "agent", parentThreadId: root.id, subagent: true, title: "[Agent] 检查接口", createdAt: 9, cwd: "other" };
+  const threads = [root, child];
+  assert.equal(chainGroupAnchor(threads, child), root);
+  for (const prefer of ["running", "unread"]) {
+    assert.equal(latestFireStage(threads, root, id => id === child.id, () => 3, prefer, child.id), undefined);
+    assert.equal(latestFireStage(threads, child, () => true, () => 3, prefer, child.id), undefined);
+  }
+  assert.equal(nextRunningThread(threads, root.id, { agent: true }), undefined);
+  assert.equal(nextRunningThread(threads, child.id, { root: true, agent: true }), root);
+  // 即使旧数据误带 stage 标记，子 Agent 也不能成为接力目标。
+  const mixed = [...runningChain, { ...child, stageSourceThreadId: root.id }];
+  assert.equal(latestFireStage(mixed, root, id => id === child.id)?.id, "s2");
+  assert.equal(latestFireStage(mixed, root, () => false, () => 0, "running", child.id)?.id, "s2");
+  assert.equal(nextRunningThread(mixed, root.id, { s1: true, agent: true })?.id, "s1");
 });

@@ -1,0 +1,96 @@
+.ta { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.ta-sessions { flex: 0 1 auto; min-height: 0; max-height: 30%; display: flex; flex-direction: column; }
+.ta-section-title { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 8px; padding: 0 2px 6px; font-size: 12px; font-weight: 600; }
+.ta-section-title > span { font-size: 10px; font-weight: 400; color: var(--fg-3); }
+.ta-session-list { min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 5px; }
+.ta-session { flex: none; display: flex; flex-direction: column; gap: 2px; width: 100%; padding: 7px 10px; border: 1px solid rgb(var(--ink) / 0.06); border-radius: 10px; color: var(--fg); background: var(--surface); font: inherit; text-align: left; cursor: pointer; transition: border-color 120ms; }
+.ta-session:hover { border-color: color-mix(in srgb, var(--brand) 35%, transparent); }
+.ta-session-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ta-session-heading strong { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 600; }
+.ta-status { flex: none; color: var(--fg-3); font-size: 10px; }
+.ta-status.running { color: var(--blue); }
+.ta-status.waiting { color: var(--orange); }
+.ta-status.done { color: var(--green); }
+.ta-status.error { color: var(--red-text); }
+.ta-session-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fg-2); font-size: 11px; line-height: 1.5; }
+.ta-empty { padding: 6px 2px; color: var(--fg-3); font-size: 11px; }
+.ta-chat { position: relative; display: flex; flex: 1 1 120px; min-height: 0; overflow: hidden; }
+.ta-history { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; overflow-anchor: none; overscroll-behavior: contain; padding: 4px 6px 4px 2px; outline-offset: -2px; }
+.ta-history-head { height: 26px; display: flex; align-items: flex-start; justify-content: center; color: var(--fg-3); font-size: 10px; }
+.ta-history-head button, .ta-thread, .ta-error button { border: 0; padding: 0; background: transparent; color: var(--link); font: inherit; cursor: pointer; }
+.ta-history-head button:disabled { color: var(--fg-3); cursor: default; }
+.ta-welcome { padding: 56px 12px; text-align: center; font-size: 15px; font-weight: 600; color: var(--fg); }
+.ta-welcome small { display: block; margin-top: 8px; font-size: 12px; font-weight: 400; color: var(--fg-3); }
+.ta-message { display: flex; align-items: flex-start; gap: 10px; margin: 0 0 14px; }
+.ta-message.user { flex-direction: row-reverse; }
+.ta-avatar { flex: none; display: grid; place-items: center; width: 28px; height: 28px; border-radius: 9px; color: #fff; background: var(--brand-fill); box-shadow: 0 2px 6px color-mix(in srgb, var(--brand) 30%, transparent); font-weight: 700; font-size: 12px; }
+.ta-message.user .ta-avatar { display: none; }
+.ta-message-content { min-width: 0; max-width: calc(100% - 44px); }
+.ta-message.user .ta-message-content { max-width: 82%; }
+.ta-bubble { position: relative; padding: 9px 13px; border: 1px solid rgb(var(--ink) / 0.06); border-radius: 4px 14px 14px 14px; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; line-height: 1.6; color: var(--fg-body); background: var(--surface); box-shadow: 0 1px 2px rgb(0 0 0 / 0.04); }
+.ta-message.user .ta-bubble { border: 0; border-radius: 14px 4px 14px 14px; color: #fff; background: var(--brand-fill); box-shadow: 0 3px 10px color-mix(in srgb, var(--brand) 28%, transparent); }
+.ta-message-meta { display: flex; align-items: center; gap: 10px; margin: 5px 0 0 2px; }
+.ta-message.user .ta-message-meta { justify-content: flex-end; }
+.ta-thread { font-size: 11px; color: var(--brand) !important; opacity: 0.85; }
+.ta-thread:hover { opacity: 1; text-decoration: underline; }
+.ta-latest { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); padding: 4px 12px; border: 1px solid rgb(var(--ink) / 0.1); border-radius: 999px; color: var(--brand); background: var(--surface); box-shadow: 0 4px 12px rgb(0 0 0 / 0.12); font: inherit; font-size: 11px; cursor: pointer; }
+/* Shared by every tab: one compact row below whichever pane is visible. */
+.ta-compose { position: relative; flex: none; order: 1; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: end; gap: 2px 6px; padding: 5px; border: 1px solid rgb(var(--ink) / 0.1); border-radius: 14px; background: var(--surface); box-shadow: 0 2px 8px rgb(0 0 0 / 0.05); }
+.ta-compose .ta-input { box-sizing: border-box; width: 100%; min-height: 34px; max-height: 96px; padding: 6px 8px; border: 0; background: transparent; resize: none; field-sizing: content; line-height: 1.5; user-select: text; }
+.tb-card .ta-input:focus-visible { outline: none; }
+.ta-input::placeholder { color: var(--fg-4); }
+.ta-bubble.typing { color: var(--fg-3); }
+.ta-bubble.md { white-space: normal; }
+.ta-md > :first-child { margin-top: 0; }
+.ta-md > :last-child { margin-bottom: 0; }
+.ta-md :is(p, ul, ol, pre, blockquote, table) { margin: 0 0 8px; }
+.ta-md :is(ul, ol) { padding-left: 20px; }
+.ta-md li { margin: 2px 0; }
+.ta-md :is(h1, h2, h3, h4) { margin: 10px 0 6px; font-size: 1em; font-weight: 650; }
+.ta-md code { padding: 1px 4px; border-radius: 4px; font-size: 0.92em; background: rgb(var(--ink) / 0.06); }
+.ta-md pre { padding: 8px 10px; overflow-x: auto; border-radius: 8px; background: rgb(var(--ink) / 0.05); }
+.ta-md pre code { padding: 0; background: none; }
+.ta-md a { color: var(--brand); text-decoration: none; }
+.ta-md a:hover { text-decoration: underline; }
+.ta-md blockquote { padding-left: 10px; border-left: 3px solid rgb(var(--ink) / 0.12); color: var(--fg-3); }
+.ta-md table { border-collapse: collapse; font-size: 0.92em; }
+.ta-md :is(th, td) { padding: 4px 8px; border: 1px solid rgb(var(--ink) / 0.1); }
+.ta-md img { max-width: 100%; }
+.ta-dots { display: inline-flex; gap: 3px; margin-left: 6px; vertical-align: middle; }
+.ta-dots i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; animation: ta-dot 1.2s infinite ease-in-out; }
+.ta-dots i:nth-child(2) { animation-delay: 0.15s; }
+.ta-dots i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes ta-dot { 0%, 60%, 100% { opacity: 0.25; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
+@media (prefers-reduced-motion: reduce) { .ta-dots i { animation: none; opacity: 0.6; } }
+.ta-compose .ta-error { grid-column: 1 / -1; padding: 0 8px 2px; color: var(--fg-3); font-size: 10.5px; }
+.ta-compose .ta-error { color: var(--red-text); }
+.ta-submit { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 10px; background: var(--brand-fill); color: #fff; font: inherit; cursor: pointer; transition: filter 120ms, opacity 120ms, transform 80ms; }
+.ta-submit:hover { filter: brightness(1.08); }
+.ta-submit:active { transform: scale(0.95); }
+.ta-submit:disabled { opacity: 0.35; cursor: default; filter: none; transform: none; }
+.ta-plus { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 10px; color: var(--fg-3); background: transparent; cursor: pointer; transition: background 120ms, color 120ms; }
+.ta-plus svg { transition: transform 150ms; }
+.ta-plus:hover, .ta-plus.open { color: var(--brand); background: color-mix(in srgb, var(--brand) 10%, transparent); }
+.ta-plus.open svg { transform: rotate(45deg); }
+.ta-menu { position: absolute; z-index: 5; left: 0; bottom: calc(100% + 6px); display: flex; flex-direction: column; min-width: 120px; padding: 4px; border: 1px solid rgb(var(--ink) / 0.1); border-radius: 12px; background: var(--bg-top); box-shadow: var(--shadow); }
+.ta-menu > button { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border: 0; border-radius: 8px; color: var(--fg); background: transparent; font: inherit; text-align: left; cursor: pointer; white-space: nowrap; }
+.ta-menu > button:hover { background: color-mix(in srgb, var(--brand) 10%, transparent); }
+.ta-capsule-menu { right: 0; max-height: 260px; overflow-y: auto; overscroll-behavior: contain; }
+.ta-capsule-menu > button { overflow: hidden; text-overflow: ellipsis; }
+.ta-check { flex: none; width: 14px; height: 14px; border: 1.5px solid rgb(var(--ink) / 0.3); border-radius: 4px; }
+.ta-capsule-menu > button[aria-selected="true"] .ta-check { border-color: var(--brand); background: var(--brand) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.2l2.3 2.3 4.7-5' fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 12px no-repeat; }
+.ta-attachments { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 2px 4px; max-height: 76px; overflow-y: auto; }
+.ta-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 200px; height: 30px; padding: 0 4px 0 4px; border: 1px solid rgb(var(--ink) / 0.08); border-radius: 8px; background: rgb(var(--ink) / 0.04); font-size: 12px; color: var(--fg-2); }
+.ta-chip img { width: 22px; height: 22px; border-radius: 5px; object-fit: cover; }
+.ta-chip-icon { flex: none; display: grid; place-items: center; width: 22px; height: 22px; color: var(--fg-3); }
+.ta-chip.capsule .ta-chip-icon { color: var(--brand); }
+svg.ta-chip-icon { padding: 4px; }
+.ta-chip-name { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.ta-chip button { flex: none; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 6px; color: var(--fg-3); background: transparent; font-size: 14px; line-height: 1; cursor: pointer; }
+.ta-chip button:hover { color: var(--fg); background: rgb(var(--ink) / 0.08); }
+.ta-error { flex: none; max-height: 52px; overflow: auto; font-size: 11px; color: var(--red-text); overflow-wrap: anywhere; user-select: text; }
+@media (max-height: 400px) {
+  .ta { gap: 6px; }
+  .ta-sessions { max-height: 22%; }
+  .ta-compose .ta-input { min-height: 30px; max-height: 52px; }
+}

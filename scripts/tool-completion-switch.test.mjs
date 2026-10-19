@@ -48,7 +48,7 @@ for (const cached of [false, true]) {
       setState: (value) => Object.assign(state, value),
       batch: (fn) => fn(),
       threadSnapshots: new Map(), staleThreadSnapshots: new Set(["target"]), liveUsageByThread: new Map(),
-      unhideVirgoThread() {}, setUnreadTurns() {}, markThreadSwitchStart() {},
+      setUnreadTurns() {}, markThreadSwitchStart() {},
       flushPendingStreamUpdates() {}, rememberCurrentThreadSnapshot() {},
       discardPendingStreamUpdates() {}, resetExpanded() {}, traceThreadSwitch() {},
       rememberThreadSnapshot() {}, ensurePeerModels() {}, ensureModelOptions() {},

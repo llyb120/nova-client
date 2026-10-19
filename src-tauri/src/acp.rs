@@ -31,6 +31,9 @@ const LOG_CAP: usize = 800;
 /// session/prompt 发出后允许「零通知」的最长静默；超过即判定连接假死（见 prompt_with_stall_guard）。
 const PROMPT_FIRST_RESPONSE_STALL: Duration = Duration::from_secs(90);
 
+/// Claude 无任何新输出多久后在会话里提示一次（见 await_with_silence_notice）。
+const CLAUDE_SILENCE_NOTICE: Duration = Duration::from_secs(60);
+
 /// 模型探测、命令探测和标题生成共用的辅助连接。
 const SHARED_KEY: &str = "__shared__";
 const CODEBUDDY_ACP_ARGS: [&str; 3] = ["--acp", "--acp-transport", "stdio"];
@@ -38,7 +41,8 @@ const CODEBUDDY_ACP_ARGS: [&str; 3] = ["--acp", "--acp-transport", "stdio"];
 /// CodeBuddy ACP `thought_level`（会话级）实际开放的档位。官方 CLI 还支持
 /// `minimal` / `medium` / `xhigh`，这里按 nova 的取舍只暴露三档。
 const CODEBUDDY_EFFORT_LEVELS: [&str; 3] = ["low", "high", "max"];
-const CLAUDE_EFFORT_LEVELS: [&str; 6] = ["default", "low", "medium", "high", "xhigh", "max"];
+/// Claude / Devin 按模型上报档位（Devin 有 none / minimal），拆模型 value 时也认这些后缀。
+const EFFORT_LEVELS: [&str; 8] = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 pub struct PendingPermission {
     pub rpc_id: Value,
@@ -88,7 +92,12 @@ impl AcpPrewarm {
         slot: &StdMutex<Option<Arc<Self>>>,
         cwd: &str,
         read_only: bool,
+        requires_thread_env: bool,
     ) -> Option<Arc<AcpConn>> {
+        // ponytail: Devin 的线程级 MCP 环境需冷启动绑定；支持会话级重绑后才能复用通用预热进程。
+        if requires_thread_env {
+            return None;
+        }
         let entry = {
             let slot = slot.lock().unwrap();
             slot.as_ref()
@@ -178,8 +187,22 @@ fn merge_model_config_option(config_options: Value, model_config_options: Value)
     Value::Array(options)
 }
 
-fn publishes_model_options(launch_env: &HashMap<String, String>) -> bool {
-    !launch_env.contains_key("NOVA_QUOTA_BORROWED")
+/// WorkBuddy's refresh and CodeBuddy's model_update carry an authoritative catalog.
+/// Keep session/known non-model state, but do not merge stale extension models back in.
+fn replace_model_state(result: &mut Value, update: &Value) -> bool {
+    let Some(available) = update.get("availableModels").and_then(Value::as_array)
+        .filter(|models| !models.is_empty()) else {
+        return false; // An empty/partial catalog must not erase usable session/cache options.
+    };
+    let Some(result) = result.as_object_mut() else { return false };
+    result.insert("models".into(), json!({
+        "availableModels": available,
+        "currentModelId": update["currentModelId"],
+    }));
+    if let Some(options) = result.get_mut("configOptions").and_then(Value::as_array_mut) {
+        options.retain(|option| option.get("id").and_then(Value::as_str) != Some("model"));
+    }
+    true
 }
 
 /// 把 codebuddy 上报的当前模型并入可选列表（置顶，若原本不在列表里）。
@@ -212,7 +235,7 @@ fn split_model_effort(model: Option<&str>) -> (Option<String>, Option<String>) {
     };
     match m.rsplit_once(':') {
         Some((id, effort))
-            if !id.is_empty() && CLAUDE_EFFORT_LEVELS.contains(&effort) =>
+            if !id.is_empty() && EFFORT_LEVELS.contains(&effort) =>
         {
             (Some(id.to_string()), Some(effort.to_string()))
         }
@@ -238,7 +261,7 @@ fn effort_display_name(effort: &str) -> String {
 /// 拆成 model + 对应的思考配置分别下发。
 fn expand_acp_effort_options(config_options: &Value, effort_config_id: &str) -> Value {
     if effort_config_id == "effort" {
-        return expand_claude_model_options(config_options, None);
+        return expand_claude_model_options(config_options, None, "effort");
     }
     let Some(options) = config_options.as_array() else {
         return config_options.clone();
@@ -255,7 +278,7 @@ fn expand_acp_effort_options(config_options: &Value, effort_config_id: &str) -> 
     let Some(models) = model_opt.get("options").and_then(Value::as_array) else {
         return config_options.clone();
     };
-    // Devin / CodeBuddy 用 thought_level，Kimi 用 thinking。
+    // CodeBuddy 用 thought_level，Kimi 用 thinking。
     let current_effort = options
         .iter()
         .find(|o| o.get("id").and_then(Value::as_str) == Some(effort_config_id))
@@ -354,13 +377,15 @@ fn expand_acp_effort_options(config_options: &Value, effort_config_id: &str) -> 
 /// 推迟产品配置初始化（日志 `prewarm standby: defer init until activate`），激活后补拉到
 /// 的云端清单不会回填这份快照。所以这类连接只有「当前模型」可信，可选清单必须沿用冷启动
 /// 探测到的权威清单，否则 hy4-preview / glm-5.3-flash 等云端动态模型会时有时无。
-// Claude 只上报当前模型的 effort；逐模型探测后把能力随模型缓存，不能用当前模型的
-// 档位展开整张表（例如 Haiku 不支持 effort）。上下文变体只使用 ACP 的真实模型 ID。
-fn expand_claude_model_options(config: &Value, known: Option<&Value>) -> Value {
+// Claude / Devin 只上报当前模型的档位（Claude `effort`、Devin `thought_level`）；随模型缓存，
+// 不能用当前模型的档位展开整张表（例如 Haiku 不支持 effort）。上下文变体只使用 ACP 的真实模型 ID。
+// Devin 的 fusion-* 组合模型不对用户开放，直接剔除。
+fn expand_claude_model_options(config: &Value, known: Option<&Value>, effort_id: &str) -> Value {
+    let claude = effort_id == "effort";
     let Some(model) = model_config_option(config) else { return config.clone() };
     let Some(models) = model["options"].as_array() else { return config.clone() };
     let (current, _) = split_model_effort(model["currentValue"].as_str());
-    let effort = config.as_array().and_then(|options| options.iter().find(|o| o["id"] == "effort"));
+    let effort = config.as_array().and_then(|options| options.iter().find(|o| o["id"] == effort_id));
     let current_effort = effort.and_then(|o| o["currentValue"].as_str()).unwrap_or("default");
     let known_models = known.and_then(model_config_option).and_then(|o| o["options"].as_array());
     let mut seen = HashSet::new();
@@ -368,28 +393,42 @@ fn expand_claude_model_options(config: &Value, known: Option<&Value>) -> Value {
     let mut selected = model["currentValue"].clone();
     for option in models {
         let (Some(base), _) = split_model_effort(option["value"].as_str()) else { continue };
-        if !seen.insert(base.clone()) { continue; }
+        if !seen.insert(base.clone()) || (!claude && base.starts_with("fusion-")) { continue; }
         let cached = known_models.and_then(|models| models.iter().find(|m| {
             split_model_effort(m["value"].as_str()).0.as_deref() == Some(base.as_str())
         }));
         let name = option.pointer("/_meta/claude.ai~1baseName").and_then(Value::as_str)
             .or_else(|| option["name"].as_str()).unwrap_or(&base);
-        let levels = if current.as_deref() == Some(base.as_str()) {
+        let mut levels = if current.as_deref() == Some(base.as_str()) {
             effort.and_then(|o| o["options"].as_array()).cloned().unwrap_or_default()
         } else {
             option.pointer("/_meta/claude.ai~1effortOptions")
                 .or_else(|| cached.and_then(|m| m.pointer("/_meta/claude.ai~1effortOptions")))
                 .and_then(Value::as_array).cloned().unwrap_or_default()
         };
+        // 1M 只改变上下文；变体未上报档位时参考原模型，但保留下发的真实模型 ID。
+        // Devin 的 1M 模型名自带「1M」且会自己上报档位，不走这套。
+        if claude && levels.is_empty() {
+            if let Some(original) = base.strip_suffix("[1m]").or_else(|| base.strip_suffix("-1m")) {
+                levels = if current.as_deref() == Some(original) {
+                    effort.and_then(|o| o["options"].as_array()).cloned().unwrap_or_default()
+                } else {
+                    models.iter().chain(known_models.into_iter().flatten())
+                        .filter(|m| split_model_effort(m["value"].as_str()).0.as_deref() == Some(original))
+                        .filter_map(|m| m.pointer("/_meta/claude.ai~1effortOptions").and_then(Value::as_array))
+                        .find(|levels| !levels.is_empty()).cloned().unwrap_or_default()
+                };
+            }
+        }
         let levels: Vec<Value> = levels.into_iter().filter(|e| {
-            e["value"].as_str().is_some_and(|v| CLAUDE_EFFORT_LEVELS.contains(&v))
+            e["value"].as_str().is_some_and(|v| EFFORT_LEVELS.contains(&v))
         }).collect();
         let mut meta = option.get("_meta").and_then(Value::as_object).cloned().unwrap_or_default();
         meta.insert("claude.ai/baseName".into(), json!(name));
         meta.insert("claude.ai/effortOptions".into(), json!(levels));
         meta.remove("codebuddy.ai/default");
-        let is_1m = base.ends_with("[1m]") || base.ends_with("-1m")
-            || (base == "default" && option["description"].as_str().is_some_and(|d| d.contains("[1m]")));
+        let is_1m = claude && (base.ends_with("[1m]") || base.ends_with("-1m")
+            || base == "default" && option["description"].as_str().is_some_and(|d| d.contains("[1m]")));
         let display = if is_1m { format!("{name} · 1M") } else { name.to_string() };
         if is_1m { meta.insert("contextWindow".into(), json!(1_000_000)); }
         let variants: Vec<Option<&str>> = if levels.is_empty() { vec![None] } else {
@@ -461,6 +500,33 @@ pub struct AcpConn {
     from_prewarm: bool,
 }
 
+// CodeBuddy can return a successful JSON-RPC envelope with a failed model
+// request inside _meta; propagate that error to every caller, including titles.
+fn acp_result(result: Value) -> Result<Value, String> {
+    let Some(raw) = result.pointer("/_meta/codebuddy.ai~1errorMessage")
+        .and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+    else { return Ok(result) };
+    let error = serde_json::from_str::<Value>(raw).ok();
+    let message = error.as_ref().and_then(|error| {
+        error.pointer("/data/details").and_then(Value::as_str)
+            .or_else(|| error.get("message").and_then(Value::as_str))
+    }).unwrap_or(raw);
+    Err(message.to_string())
+}
+
+#[test]
+fn codebuddy_embedded_prompt_error_is_not_a_model_refusal() {
+    let error = json!({ "code": -32000, "message": "Authentication required",
+        "data": { "details": "Authentication required. Please use /login", "category": "auth" } });
+    let result = json!({ "stopReason": "refusal", "_meta": { "codebuddy.ai/errorMessage": error.to_string() } });
+    assert_eq!(acp_result(result).unwrap_err(), "Authentication required. Please use /login");
+    assert_eq!(acp_result(json!({ "_meta": { "codebuddy.ai/errorMessage": "Model unavailable" } })).unwrap_err(), "Model unavailable");
+    for result in [json!({"stopReason":"end_turn"}), json!({"stopReason":"refusal"}),
+        json!({"_meta":{"codebuddy.ai/errorMessage":"  "}})] {
+        assert_eq!(acp_result(result.clone()).unwrap(), result);
+    }
+}
+
 impl AcpConn {
     fn send_raw(&self, msg: Value) -> Result<(), String> {
         match &self.transport {
@@ -492,13 +558,35 @@ impl AcpConn {
             rx.await
                 .map_err(|_| format!("{} 连接已断开", self.label))
                 .and_then(|r| r)
+                .and_then(acp_result)
         };
-        match wait {
+        let mut result = match wait {
             Some(d) => timeout(d, recv)
                 .await
-                .map_err(|_| format!("{method} 等待超时"))?,
+                .map_err(|_| {
+                    self.pending.lock().unwrap().remove(&id);
+                    format!("{method} 等待超时")
+                })?,
             None => recv.await,
+        }?;
+        // Every session/new caller must see the live catalog before capturing/using it.
+        // This extension is optional; older/unsupported WorkBuddy CLIs still open sessions.
+        if self.label == AgentKind::WorkBuddy.label() && method == "session/new" {
+            if let Some(session_id) = result.get("sessionId").and_then(Value::as_str) {
+                match Box::pin(self.request(
+                    "_codebuddy.ai/models/refresh",
+                    json!({ "sessionId": session_id }),
+                    Some(Duration::from_secs(15)),
+                )).await {
+                    Ok(refresh) if refresh["ok"].as_bool() == Some(true) => {
+                        replace_model_state(&mut result, &refresh);
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("[nova] {} 模型刷新失败，保留 session/new 选项：{error}", self.label),
+                }
+            }
         }
+        Ok(result)
     }
 
     pub fn notify(&self, method: &str, params: Value) {
@@ -524,6 +612,17 @@ impl AcpConn {
     pub fn kill(&self) {
         self.alive.store(false, Ordering::SeqCst);
         if let Some(mut child) = self.child.lock().unwrap().take() {
+            if self.label == AgentKind::WorkBuddy.label() {
+                // Give the bridge time to DELETE its ACP connection before it kills its worker.
+                self.notify("nova/workbuddy/shutdown", json!({}));
+                tauri::async_runtime::spawn(async move {
+                    if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+                        if let Some(pid) = child.id() { kill_process_tree(pid); }
+                        let _ = child.start_kill();
+                    }
+                });
+                return;
+            }
             // 先杀整棵进程树：ACP agent 常经 cmd 垫片启动（cmd→node），且 agent 执行工具调用时
             // 会 spawn shell（powershell/bash）。仅 start_kill 只终止直接子进程，node 与其拉起的
             // shell 会变孤儿堆积，塞满 shell 通道。
@@ -858,8 +957,8 @@ impl AcpManager {
     }
 
     fn thread_is_read_only(&self, conn_key: &str) -> bool {
-        // CodeBuddy 共享连接且 MCP 按会话注入，只读与否不影响进程。
-        if self.kind == AgentKind::CodeBuddy {
+        // CodeBuddy 协议的 MCP 按会话注入，只读与否不影响进程。
+        if self.kind.is_codebuddy() {
             return false;
         }
         let Some(thread_id) = conn_key.strip_prefix("thread:") else {
@@ -903,7 +1002,7 @@ impl AcpManager {
     /// 共享槽（探测/标题等辅助任务）不参与回收。
     fn hot_thread_conn_cap(&self) -> usize {
         match self.kind {
-            AgentKind::CodeBuddy => 1,
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::WorkBuddy => 1,
             _ => 3,
         }
     }
@@ -980,8 +1079,8 @@ impl AcpManager {
 
     /// 启动时从磁盘缓存灌入内存（不广播；前端经 get_model_options 立刻拿到）。
     pub fn seed_model_options(&self, mut v: Value) {
-        if let (Some(id), Some(options)) = (self.effort_config_id(), v.get_mut("configOptions")) {
-            *options = expand_acp_effort_options(options, id);
+        if let Some(options) = v.get_mut("configOptions") {
+            *options = self.expand_effort_options(options, None);
         }
         *self.model_options.lock().unwrap() = Some(v);
     }
@@ -1065,7 +1164,8 @@ impl AcpManager {
         match self.kind {
             AgentKind::Claude => &settings.claude_proxy,
             AgentKind::Kimi => &settings.kimi_proxy,
-            AgentKind::CodeBuddy => &settings.codebuddy_proxy,
+            AgentKind::WorkBuddy => &settings.workbuddy_proxy,
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => &settings.codebuddy_proxy,
             _ => &settings.devin_proxy,
         }
     }
@@ -1148,11 +1248,12 @@ impl AcpManager {
             .await
             .map_err(|e| format!("拉取 {} 模型列表失败：{e}", self.kind.label()))?;
         self.capture_options(&resp, !conn.from_prewarm);
-        if self.kind == AgentKind::Claude {
+        if self.per_model_efforts() {
             if let (Some(sid), Some(model)) = (resp["sessionId"].as_str(), model_config_option(&resp["configOptions"])) {
                 let current = model["currentValue"].as_str().unwrap_or_default();
                 let mut ids: Vec<&str> = model["options"].as_array().into_iter().flatten()
-                    .filter_map(|o| o["value"].as_str()).filter(|id| *id != current).collect();
+                    .filter_map(|o| o["value"].as_str())
+                    .filter(|id| *id != current && !id.starts_with("fusion-")).collect();
                 // 在独立探测会话里切换模型读取各自档位，最后恢复默认模型；不发送 prompt。
                 if !current.is_empty() { ids.push(current); }
                 for id in ids {
@@ -1160,7 +1261,7 @@ impl AcpManager {
                         json!({"sessionId": sid, "configId": "model", "value": id}),
                         Some(Duration::from_secs(30))).await {
                         Ok(result) => self.capture_options(&result, true),
-                        Err(error) => self.push_log(format!("[nova] 探测 Claude 模型 {id} 的思考档位失败：{error}")),
+                        Err(error) => self.push_log(format!("[nova] 探测 {} 模型 {id} 的思考档位失败：{error}", self.kind.label())),
                     }
                 }
             }
@@ -1287,8 +1388,10 @@ impl AcpManager {
             s
         };
         let read_only = self.thread_is_read_only(conn_key);
-        let warmed = if conn_key.starts_with("thread:") {
-            AcpPrewarm::take(&self.prewarmed, want_cwd.unwrap_or_default(), read_only).await
+        let warmed = if let Some(thread_id) = conn_key.strip_prefix("thread:") {
+            let requires_thread_env = self.kind == AgentKind::Devin
+                && !crate::auto_tool_env(&self.app.state::<AppState>(), thread_id).is_empty();
+            AcpPrewarm::take(&self.prewarmed, want_cwd.unwrap_or_default(), read_only, requires_thread_env).await
         } else {
             None
         };
@@ -1325,10 +1428,10 @@ impl AcpManager {
         want_cwd: Option<&str>,
         read_only: bool,
     ) -> Result<Arc<AcpConn>, String> {
-        // 未命中预热时，CodeBuddy 走官方 ACP stdio 冷启动。
-        if self.kind == AgentKind::CodeBuddy {
+        // CodeBuddy 协议后端共用 ACP stdio 冷启动，不落入 Devin 的启动配置。
+        if self.kind.is_codebuddy() {
             self.push_log(format!(
-                "[nova] CodeBuddy 正在启动 ACP stdio（key={conn_key}）"
+                "[nova] {} 正在启动 ACP stdio（key={conn_key}）", self.kind.label()
             ));
             return self
                 .spawn_codebuddy_stdio_conn(settings, conn_key, want_cwd)
@@ -1357,13 +1460,24 @@ impl AcpManager {
         }
         if self.kind == AgentKind::Devin {
             if let Some(cwd) = want_cwd {
+                // Devin 每个线程一条连接：自动模式的线程/场景环境既写进该连接的启动目录配置，
+                // 也设在 Devin 进程上，供 3000.3.x 共享的会话目录配置经环境继承拿到。
+                let thread_id = conn_key.strip_prefix("thread:");
+                let mut auto_env = thread_id
+                    .map(|id| crate::auto_tool_env(&self.app.state::<AppState>(), id))
+                    .unwrap_or_default();
+                if let Some(id) = thread_id.filter(|id| self.cwd_change_enabled(id)) {
+                    auto_env.push(("NOVA_CWD_CHANGE_SCOPE", self.cwd_change_scope(id)));
+                }
                 let launch_dir = prepare_devin_nova_tools_config(
                     &self.app,
                     conn_key,
                     cwd,
                     settings.context_retrieval_mode.as_str(),
                     read_only,
+                    &auto_env,
                 )?;
+                cmd.envs(auto_env.iter().map(|(name, value)| (*name, value.as_str())));
                 cmd.current_dir(&launch_dir);
                 self.push_log(format!(
                     "[nova] Devin 使用本地 nova-tools MCP 配置：{}",
@@ -1386,21 +1500,9 @@ impl AcpManager {
         // 每个后端可单独配置代理：注入 HTTP(S)_PROXY 等环境变量到该子进程（空 = 直连）
         if self.kind == AgentKind::Claude {
             cmd.env_remove("CLAUDECODE");
-            if !self.launch_env.is_empty() {
-                crate::credential_roaming::isolate_borrowed_command(&mut cmd);
-                for name in ["ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"] {
-                    cmd.env_remove(name);
-                }
-            }
         }
         cmd.envs(&self.launch_env);
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
-        #[cfg(windows)]
-        if self.kind == AgentKind::CodeBuddy {
-            // Windows 上 CodeBuddy 的 Bash 工具默认走 Git Bash；显式指定 PowerShell，
-            // 避免依赖 Git Bash 安装，同时与 Nova 自身的 PowerShell 工具约定一致。
-            cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
-        }
         {
             let state = self.app.state::<AppState>();
             cmd.env(
@@ -1498,19 +1600,26 @@ impl AcpManager {
             });
         }
 
+        let mut client_capabilities = json!({
+            "fs": { "readTextFile": false, "writeTextFile": false }
+        });
+        // claude-agent-acp 的原生子代理扩展：声明后 Task/Agent 调用会以
+        // subagent_spawned/subagent_state_update announce 成独立 sessionId，
+        // 而不是混在主会话里的一条 tool_call；仅 Claude 认得这个扩展。
+        if self.kind == AgentKind::Claude {
+            client_capabilities["subagents"] = json!({});
+        }
         let init = conn
             .request(
                 "initialize",
                 json!({
                     "protocolVersion": 1,
                     "clientInfo": {
-                        "name": "nova",
+                        "name": if self.kind == AgentKind::WorkBuddy { crate::workbuddy::ACP_CLIENT_NAME } else { "nova" },
                         "title": "Nova",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "clientCapabilities": {
-                        "fs": { "readTextFile": false, "writeTextFile": false }
-                    }
+                    "clientCapabilities": client_capabilities
                 }),
                 Some(Duration::from_secs(60)),
             )
@@ -1541,7 +1650,15 @@ impl AcpManager {
     ) -> Result<Arc<AcpConn>, String> {
         crate::skills::sync_skills_from_home();
 
-        let (program, mut cmd) = codebuddy_command(&settings.codebuddy_path, &CODEBUDDY_ACP_ARGS);
+        let (program, mut cmd) = if self.kind == AgentKind::WorkBuddy {
+            let program = crate::workbuddy::program(&settings.workbuddy_path);
+            let mut cmd = crate::workbuddy::acp_command(&program)?;
+            cmd.env("CODEBUDDY_DEFER_TOOL_LOADING", "0")
+                .env("DISABLE_AUTOUPDATER", "1");
+            (program, cmd)
+        } else {
+            codebuddy_command(&settings.codebuddy_path, &CODEBUDDY_ACP_ARGS)
+        };
         if let Some(cwd) = want_cwd {
             cmd.current_dir(cwd);
         }
@@ -1553,7 +1670,12 @@ impl AcpManager {
         cmd.creation_flags(0x0800_0000);
         #[cfg(unix)]
         cmd.process_group(0);
-        cmd.envs(codebuddy_activation_env(&self.launch_env));
+        if self.kind == AgentKind::WorkBuddy {
+            // command() 已设置 WorkBuddy 配置目录，不能再用继承的 CODEBUDDY_CONFIG_DIR 覆盖。
+            cmd.envs(&self.launch_env);
+        } else {
+            cmd.envs(codebuddy_activation_env(&self.launch_env));
+        }
         apply_proxy_env(&mut cmd, self.proxy_of(settings));
         #[cfg(windows)]
         cmd.env("CODEBUDDY_CODE_SHELL", "powershell");
@@ -1580,7 +1702,7 @@ impl AcpManager {
 
         let child = cmd
             .spawn()
-            .map_err(|error| format!("无法启动 CodeBuddy ACP（{program}）：{error}"))?;
+            .map_err(|error| format!("无法启动 {} ACP（{program}）：{error}", self.kind.label()))?;
         assign_to_agent_job(&child);
         self.finish_stdio_conn(conn_key, child, false, false).await
     }
@@ -1962,8 +2084,16 @@ impl AcpManager {
             self.capture_commands(update);
             return;
         }
-        if kind == "config_option_update" && matches!(self.kind, AgentKind::Kimi | AgentKind::Claude) {
+        if kind == "config_option_update" && (self.kind.is_codebuddy() || matches!(self.kind, AgentKind::Kimi | AgentKind::Claude)) {
             self.capture_options(update, true);
+            return;
+        }
+        if kind == "model_update" && self.kind.is_codebuddy() {
+            // Model-only pushes also arrive for probes/titles without a thread route.
+            let mut result = self.get_model_options().unwrap_or_else(|| json!({}));
+            if replace_model_state(&mut result, update) {
+                self.capture_options(&result, true);
+            }
             return;
         }
 
@@ -1982,6 +2112,25 @@ impl AcpManager {
         if self.capture_title_update(session_id, update) {
             return;
         }
+        // claude-agent-acp 原生子代理扩展：把 Task/Agent 调用投影成独立的只读子
+        // 线程，复用 Lyra Stage 的展示思路（仅展示，不支持回复/取消）。session_id
+        // 此时仍是父会话——子代理自己的 sessionId 要等 spawn_subagent_stage 里
+        // 注册路由后，才会出现在后续的分发里。
+        if kind == "subagent_spawned" || kind == "subagent_state_update" {
+            let parent_thread_id = {
+                let routes = self.routes.lock().unwrap();
+                let Some(r) = routes.get(session_id) else {
+                    return;
+                };
+                r.thread_id.clone()
+            };
+            if kind == "subagent_spawned" {
+                self.spawn_subagent_stage(&parent_thread_id, update);
+            } else {
+                self.finish_subagent_stage(update);
+            }
+            return;
+        }
         let thread_id = {
             let routes = self.routes.lock().unwrap();
             let Some(r) = routes.get(session_id) else {
@@ -1997,7 +2146,7 @@ impl AcpManager {
             };
 
             match kind {
-                "usage_update" if self.kind == AgentKind::CodeBuddy => {
+                "usage_update" if self.kind.is_codebuddy() => {
                     if let Some(usage) = self.codebuddy_turn_usage.lock().unwrap().get_mut(&thread_id) {
                         usage.update(update);
                     }
@@ -2011,7 +2160,7 @@ impl AcpManager {
                         return;
                     }
                     let is_thought = kind == "agent_thought_chunk";
-                    let target = if self.kind == AgentKind::CodeBuddy {
+                    let target = if self.kind.is_codebuddy() {
                         let mut routes = self.routes.lock().unwrap();
                         let Some(route) = routes.get_mut(session_id) else { return };
                         acp_text_target(&thread.items, update, &mut route.text_items)
@@ -2153,6 +2302,79 @@ impl AcpManager {
         }
     }
 
+    /// `subagent_spawned`：claude-agent-acp 宣告一个 Task/Agent 子代理开始执行。
+    /// 新建一个只读子线程挂到父线程下，并把子代理自己的 sessionId 注册到路由表——
+    /// 之后 bridge 重标给这个 sessionId 的所有更新都会落到子线程，走的是
+    /// on_session_update 后面那套通用分发，不需要再改别处。
+    fn spawn_subagent_stage(self: &Arc<Self>, parent_thread_id: &str, update: &Value) {
+        let Some(child_session_id) = update["subagentSessionId"].as_str() else {
+            return;
+        };
+        if self.routes.lock().unwrap().contains_key(child_session_id) {
+            return; // 重复 announce
+        }
+        let name = update["name"].as_str().unwrap_or("子 Agent");
+        let task = update["task"].as_str().unwrap_or_default();
+        let state = self.app.state::<AppState>();
+        let child_id = {
+            let mut store = state.store.lock().unwrap();
+            let Some(parent) = store.get(parent_thread_id) else {
+                return;
+            };
+            let child = subagent_child_thread(parent, name, task);
+            let id = child.id.clone();
+            store.threads.push(child);
+            store.save();
+            id
+        };
+        self.routes.lock().unwrap().insert(
+            child_session_id.to_string(),
+            Route {
+                thread_id: child_id.clone(),
+                text_items: HashMap::new(),
+                applied_model: None,
+                applied_mode: None,
+                applied_effort: None,
+            },
+        );
+        self.set_running(&child_id, true, None);
+        let _ = self.app.emit(EV_THREADS, json!({}));
+    }
+
+    /// `subagent_state_update`：子代理到达终态（completed/failed/cancelled/
+    /// disconnected）。补一条收尾 note，收起运行状态，并清掉路由——子代理的
+    /// sessionId 不会再有后续更新。
+    fn finish_subagent_stage(self: &Arc<Self>, update: &Value) {
+        let Some(child_session_id) = update["subagentSessionId"].as_str() else {
+            return;
+        };
+        let Some(child_id) = self
+            .routes
+            .lock()
+            .unwrap()
+            .remove(child_session_id)
+            .map(|r| r.thread_id)
+        else {
+            return;
+        };
+        let state_str = update["state"].as_str().unwrap_or("completed");
+        let level = if matches!(state_str, "failed" | "disconnected") {
+            "error"
+        } else {
+            "info"
+        };
+        {
+            let app_state = self.app.state::<AppState>();
+            let mut store = app_state.store.lock().unwrap();
+            if let Some(thread) = store.get_mut(&child_id) {
+                thread.push_system(format!("子 Agent 已结束（{state_str}）。"), level);
+                store.save_thread(&child_id);
+            }
+        }
+        self.set_running(&child_id, false, Some(state_str.to_string()));
+        let _ = self.app.emit(EV_THREADS, json!({}));
+    }
+
     fn mark_plan_interrupted(&self, thread_id: &str, status: &str, include_pending: bool) {
         let plan = {
             let state = self.app.state::<AppState>();
@@ -2217,7 +2439,7 @@ impl AcpManager {
     }
 
     fn set_running(&self, thread_id: &str, running: bool, stop_reason: Option<String>) {
-        if self.kind == AgentKind::CodeBuddy {
+        if self.kind.is_codebuddy() {
             let mut usage = self.codebuddy_turn_usage.lock().unwrap();
             if running {
                 usage.insert(thread_id.to_string(), CodeBuddyTurnUsage::default());
@@ -2366,8 +2588,9 @@ impl AcpManager {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             match store.get(thread_id) {
-                Some(t) => t.title.clone(),
-                None => return,
+                // 员工会话结束不打扰，需要决策时由 employee ask 单独通知。
+                Some(t) if !t.employee_thread => t.title.clone(),
+                _ => return,
             }
         };
         let body = match stop_reason {
@@ -2467,7 +2690,7 @@ impl AcpManager {
         let extension_config_options = result.get("configOptions").cloned().unwrap_or(Value::Null);
         let standard_config_options = models_to_config_options(result.get("models"));
         let config_options =
-            if self.kind == AgentKind::CodeBuddy && !standard_config_options.is_null() {
+            if self.kind.is_codebuddy() && !standard_config_options.is_null() {
                 merge_model_config_option(extension_config_options, standard_config_options)
             } else if has_config {
                 extension_config_options
@@ -2487,14 +2710,9 @@ impl AcpManager {
         };
         // ACP 的思考强度不单列下拉，按 codex 的惯例折进模型选项
         // （`hy4-preview:high`），下发时再拆成 model + thought_level。
-        let config_options = if self.kind == AgentKind::Claude {
-            let known = self.get_model_options();
-            expand_claude_model_options(&config_options, known.as_ref().and_then(|v| v.get("configOptions")))
-        } else if let Some(id) = self.effort_config_id() {
-            expand_acp_effort_options(&config_options, id)
-        } else {
-            config_options
-        };
+        let known = self.get_model_options();
+        let config_options =
+            self.expand_effort_options(&config_options, known.as_ref().and_then(|v| v.get("configOptions")));
         let modes = match result.get("modes") {
             Some(m) if !m.is_null() => m.clone(),
             _ => modes_from_config_options(&config_options),
@@ -2504,14 +2722,11 @@ impl AcpManager {
             "modes": modes,
         });
         *self.model_options.lock().unwrap() = Some(v.clone());
-        // 额度借用实例属于另一个账号；只保留自己的进程内列表，不能覆盖主账号缓存/UI。
-        if publishes_model_options(&self.launch_env) {
-            self.persist_model_options(&v);
-            let _ = self.app.emit(
-                EV_OPTIONS,
-                json!({ "agentKind": self.kind.as_str(), "options": v }),
-            );
-        }
+        self.persist_model_options(&v);
+        let _ = self.app.emit(
+            EV_OPTIONS,
+            json!({ "agentKind": self.kind.as_str(), "options": v }),
+        );
     }
 
     fn capture_commands(&self, update: &Value) {
@@ -2530,10 +2745,11 @@ impl AcpManager {
     /// 草稿页提前启动并完成 ACP initialize；CodeBuddy 的官方 activate 也在后台完成。
     /// 不创建 session，发送时仍按真实线程注入 MCP 并设置模型/模式。
     pub async fn prewarm(self: &Arc<Self>, cwd: String, mode: Option<String>) {
-        if !matches!(self.kind, AgentKind::Devin | AgentKind::CodeBuddy) {
+        if !matches!(self.kind, AgentKind::Devin | AgentKind::CodeBuddy | AgentKind::WorkBuddy | AgentKind::Claude) {
             return;
         }
-        let read_only = self.kind == AgentKind::Devin
+        // 与 thread_is_read_only 一致：CodeBuddy 协议的进程不区分只读。
+        let read_only = !self.kind.is_codebuddy()
             && mode.as_deref().map(unify_mode_id).as_deref() == Some("plan");
         let entry = Arc::new(AcpPrewarm {
             cwd: cwd.clone(),
@@ -2570,6 +2786,7 @@ impl AcpManager {
         crate::skills::sync_skills_from_home();
         let started = std::time::Instant::now();
         let key = format!("prewarm-{}", uuid::Uuid::new_v4().simple());
+        // WorkBuddy 仅做普通 ACP stdio 预热，不能借用全局 cbc-prewarm 的路径/凭据。
         let result = if self.kind == AgentKind::CodeBuddy {
             match self.spawn_codebuddy_prewarm(&settings, cwd.clone()).await {
                 Ok(process) => {
@@ -2721,21 +2938,15 @@ impl AcpManager {
                 );
                 let load_attempts: u32 = 2;
                 let mut loaded: Result<Value, String> = Err("session/load 未执行".into());
+                let mut params = json!({ "sessionId": sid, "cwd": cwd, "mcpServers": mcp_servers });
+                self.add_session_meta(&mut params, thread_id);
                 for attempt in 1..=load_attempts {
                     if !conn.alive.load(Ordering::SeqCst) {
                         loaded = Err(format!("{} 进程已退出", self.kind.label()));
                         break;
                     }
                     loaded = conn
-                        .request(
-                            "session/load",
-                            json!({
-                                "sessionId": sid,
-                                "cwd": cwd,
-                                "mcpServers": mcp_servers.clone()
-                            }),
-                            Some(Duration::from_secs(300)),
-                        )
+                        .request("session/load", params.clone(), Some(Duration::from_secs(300)))
                         .await;
                     match &loaded {
                         Ok(_) => break,
@@ -2823,6 +3034,8 @@ impl AcpManager {
             None => (model.clone(), None),
         };
         let effort_to_apply = self.effort_to_apply(effort_from_model.or(effort));
+        // 切换模型会把档位重置成新模型的默认值：模型先落地，再下发强度。
+        let resets = self.per_model_efforts();
         let (need_model, need_mode, need_effort) = {
             let routes = self.routes.lock().unwrap();
             let Some(r) = routes.get(sid) else { return };
@@ -2830,7 +3043,7 @@ impl AcpManager {
                 model_to_send.clone().filter(|m| r.applied_model.as_ref() != Some(m)),
                 mode.filter(|m| r.applied_mode.as_ref() != Some(m)),
                 effort_to_apply.filter(|e| r.applied_effort.as_ref() != Some(e)
-                    || (self.kind == AgentKind::Claude && r.applied_model != model_to_send)),
+                    || (resets && r.applied_model != model_to_send)),
             )
         };
         // 统一模式翻译：界面只暴露 build / plan 两种，这里翻成各后端的真实模式 id。
@@ -2874,18 +3087,18 @@ impl AcpManager {
                     .await;
                 match r {
                     Ok(result) => {
-                        if self.kind == AgentKind::Claude {
+                        if resets {
                             self.capture_options(&result, true);
                             let actual = model_config_option(&result["configOptions"])
                                 .and_then(|o| o["currentValue"].as_str());
                             if actual != Some(model.as_str()) {
-                                self.push_log(format!("[nova] Claude 未应用模型 {model}，实际返回 {actual:?}"));
+                                self.push_log(format!("[nova] {} 未应用模型 {model}，实际返回 {actual:?}", self.kind.label()));
                                 return;
                             }
                         }
                         if let Some(route) = self.routes.lock().unwrap().get_mut(sid) {
                             route.applied_model = Some(model);
-                            if self.kind == AgentKind::Claude {
+                            if resets {
                                 // 模型切换会重置档位；强度请求失败时必须允许下轮重试。
                                 route.applied_effort = None;
                             }
@@ -2917,7 +3130,7 @@ impl AcpManager {
             }
         };
         let effort_fut = async {
-            if self.kind == AgentKind::Claude && model_to_send.is_some()
+            if resets && model_to_send.is_some()
                 && !self.routes.lock().unwrap().get(sid).is_some_and(|r| r.applied_model == model_to_send)
             {
                 return;
@@ -2940,7 +3153,7 @@ impl AcpManager {
                 }
             }
         };
-        if self.kind == AgentKind::Claude {
+        if resets {
             // 切换模型会重建 effort 配置，必须先完成模型变更再设置强度。
             tokio::join!(model_fut, mode_fut);
             effort_fut.await;
@@ -3098,10 +3311,24 @@ impl AcpManager {
     /// 会话级推理强度在各后端 ACP 的 configId。
     fn effort_config_id(&self) -> Option<&'static str> {
         match self.kind {
-            AgentKind::Devin | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => Some("thought_level"),
+            AgentKind::Devin | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::WorkBuddy => Some("thought_level"),
             AgentKind::Kimi => Some("thinking"),
             AgentKind::Claude => Some("effort"),
             _ => None,
+        }
+    }
+
+    /// 档位按模型上报（只认当前模型的选项），而非整个后端一套固定档位。
+    fn per_model_efforts(&self) -> bool {
+        matches!(self.kind, AgentKind::Claude | AgentKind::Devin)
+    }
+
+    /// 把模型选项按思考强度展开成 `<model>:<effort>`。
+    fn expand_effort_options(&self, config: &Value, known: Option<&Value>) -> Value {
+        match self.effort_config_id() {
+            Some(id) if self.per_model_efforts() => expand_claude_model_options(config, known, id),
+            Some(id) => expand_acp_effort_options(config, id),
+            None => config.clone(),
         }
     }
 
@@ -3111,8 +3338,8 @@ impl AcpManager {
         if self.effort_config_id().is_none() {
             return None;
         }
-        if self.kind == AgentKind::Claude {
-            return CLAUDE_EFFORT_LEVELS.contains(&effort.as_str()).then_some(effort);
+        if self.per_model_efforts() {
+            return EFFORT_LEVELS.contains(&effort.as_str()).then_some(effort);
         }
         if CODEBUDDY_EFFORT_LEVELS.contains(&effort.as_str()) {
             Some(effort)
@@ -3128,7 +3355,7 @@ impl AcpManager {
 /// Devin 的模式读写权限绑定进程级 MCP 配置，变化时要重启连接刷新；
     /// CodeBuddy 无此耦合，模式变化经 session/set_mode 即时生效。
     fn restart_conn_on_mode_change(&self) -> bool {
-        self.kind != AgentKind::CodeBuddy
+        !self.kind.is_codebuddy()
     }
 
     /// 线程的模型/模式/思考强度被修改后，若 session 已挂载则立即同步
@@ -3190,6 +3417,8 @@ impl AcpManager {
         let mut last_err = String::new();
         let mut resp = None;
         let mut conn = conn.clone();
+        let mut params = json!({ "cwd": cwd, "mcpServers": mcp_servers });
+        self.add_session_meta(&mut params, thread_id);
         for attempt in 1..=max_attempts {
             if !conn.alive.load(Ordering::SeqCst) {
                 self.push_log(format!(
@@ -3210,14 +3439,7 @@ impl AcpManager {
                 }
             }
             match conn
-                .request(
-                    "session/new",
-                    json!({
-                        "cwd": cwd,
-                        "mcpServers": mcp_servers
-                    }),
-                    Some(Duration::from_secs(180)),
-                )
+                .request("session/new", params.clone(), Some(Duration::from_secs(180)))
                 .await
             {
                 Ok(r) => {
@@ -3277,7 +3499,7 @@ impl AcpManager {
             return;
         }
         // 漫游和额度入口也会直接调用 run_prompt；追加消息统一走 CodeBuddy / Claude 原生引导。
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Claude) && self.is_running(&thread_id) {
+        if (self.kind.is_codebuddy() || self.kind == AgentKind::Claude) && self.is_running(&thread_id) {
             Box::pin(self.steer_prompt(thread_id, text, images)).await;
             return;
         }
@@ -3361,7 +3583,9 @@ impl AcpManager {
             resumed_after_cwd_change = true;
             // CodeBuddy may not persist the interrupted turn, even when session/load
             // succeeds. Reuse Nova's bounded handoff transcript to retain the task.
-            let handoff = {
+            // Other agents restore native history via session/load (require_restore), so
+            // re-sending the transcript would duplicate the whole conversation.
+            let handoff = if !self.kind.is_codebuddy() { None } else {
                 let state = self.app.state::<AppState>();
                 let store = state.store.lock().unwrap();
                 store.get(&thread_id).and_then(|thread| {
@@ -3423,8 +3647,7 @@ impl AcpManager {
             Err(e) => {
                 let state = self.app.state::<AppState>();
                 let mut store = state.store.lock().unwrap();
-                if let Some(thread) = store.get_mut(&thread_id) {
-                    let item = thread.push_system(e, "error");
+                if let Some(item) = store.get_mut(&thread_id).and_then(|thread| push_prompt_error(thread, e)) {
                     self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
                 }
                 ("error".to_string(), None)
@@ -3498,18 +3721,11 @@ impl AcpManager {
         prompt
     }
 
-    fn build_user_prompt_blocks(
-        &self,
-        thread_id: &str,
-        text: &str,
-        images: &[PromptImage],
-        include_runtime_guidance: bool,
-    ) -> Vec<Value> {
-        let mut prompt = Self::build_prompt_blocks(text, images);
+    /// Nova 的工具/工作流规则。Claude 经 session 级 system prompt 下发（见 add_session_meta），
+    /// CodeBuddy/Kimi 没有 system-prompt 入口，只能逐轮附在用户消息里。
+    fn nova_rules(&self, thread_id: &str) -> Vec<String> {
         let mut guidance = Vec::new();
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi | AgentKind::Claude) {
-            // ponytail: ACP has no system-prompt setter; repeat rules per turn so resumed
-            // sessions and setting changes work. Use session-level instructions if ACP adds them.
+        if self.kind.is_codebuddy() || matches!(self.kind, AgentKind::Kimi | AgentKind::Claude) {
             guidance.push(crate::codex_app_server::rtk_guidance());
             let state = self.app.state::<AppState>();
             let read_only = state.store.lock().unwrap().get(thread_id)
@@ -3524,6 +3740,42 @@ impl AcpManager {
                 guidance.push(crate::lyra::PONYTAIL_RULES.to_string());
             }
         }
+        if self.kind != AgentKind::Devin && self.cwd_change_enabled(thread_id) {
+            guidance.push("需要更换工作目录/项目时，单独调用 nova-tools 的 change_working_directory(path)，不要与其它工具并行。Nova 会在新目录恢复本会话并自动继续；普通 cd 不能更改 Nova 会话目录。".into());
+        }
+        guidance
+    }
+
+    /// claude-agent-acp 的 session/new 与 session/load 共用 createSession，都读取
+    /// `_meta.systemPrompt.append`；规则进 system prompt，不再逐轮混进用户消息、撑大历史。
+    /// ponytail: 规则在建会话/load 时定型，会话中途改设置（ponytail、plan 模式）要到下次
+    /// session/load（重启或回收连接后）才生效；需要即时生效再改为设置变更时重建会话。
+    fn add_session_meta(&self, params: &mut Value, thread_id: &str) {
+        if self.kind != AgentKind::Claude {
+            return;
+        }
+        let rules = self.nova_rules(thread_id);
+        // 模型不得自行 EnterPlanMode；Plan 只能由用户在界面切换（走 session mode，不依赖该工具）。
+        let mut meta = json!({ "claudeCode": { "options": { "disallowedTools": ["EnterPlanMode"] } } });
+        if !rules.is_empty() {
+            meta["systemPrompt"] = json!({ "append": rules.join("\n\n") });
+        }
+        params["_meta"] = meta;
+    }
+
+    fn build_user_prompt_blocks(
+        &self,
+        thread_id: &str,
+        text: &str,
+        images: &[PromptImage],
+        include_runtime_guidance: bool,
+    ) -> Vec<Value> {
+        let mut prompt = Self::build_prompt_blocks(text, images);
+        let mut guidance = if self.kind == AgentKind::Claude {
+            Vec::new()
+        } else {
+            self.nova_rules(thread_id)
+        };
         if include_runtime_guidance {
             let (context_tools, read_only) = {
                 let state = self.app.state::<AppState>();
@@ -3540,14 +3792,27 @@ impl AcpManager {
                 (context_tools, read_only)
             };
             if self.kind == AgentKind::Devin {
-                guidance.push(nova_tools_prompt_guidance(context_tools, read_only));
+                let auto_env = crate::auto_tool_env(&self.app.state::<AppState>(), thread_id);
+                // 自动模式下电脑操控场景是别的模型时，nova-tools 不暴露 jianlai/chrome：提示词也不能再宣传它们，
+                // 否则模型调用失败后会退回 shell 自己“操作网页”，而不是转交。
+                let desktop = !auto_env.iter().any(|(name, value)| *name == "NOVA_DESKTOP" && value == "0");
+                guidance.push(nova_tools_prompt_guidance(context_tools, read_only, desktop));
+                if self.cwd_change_enabled(thread_id) {
+                    guidance.push("To change the working directory/project, call nova-tools change_working_directory alone via mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"change_working_directory\",\"arguments\":{\"path\":\"<dir>\"}}, never in parallel with other tools. Nova then restores this session in the new directory and continues automatically; a plain cd cannot change Nova's session directory.".into());
+                }
+                if auto_env.iter().any(|(name, _)| *name == "NOVA_SCENE_HANDOFF") && !read_only {
+                    guidance.push("Nova auto mode: nova-tools also exposes spawn_agent, wait_agent, list_agents, followup_task, interrupt_agent and close_agent (call them through mcp_call_tool with server_name \"nova-tools\" like the other Nova tools).".into());
+                    if !desktop {
+                        guidance.push("Hard rule: this session has NO desktop or browser tools (no jianlai, no chrome). Any request to operate, open, click, fill or read a web page, browser or desktop app is computer-scene work: hand the whole task off at once via mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"spawn_agent\",\"arguments\":{\"scene\":\"computer\",\"task_name\":\"<name>\",\"message\":\"<goal, constraints, done criteria>\"}}, then wait_agent for the result. Never substitute shell commands, scripts, curl/wget, headless browsers (Playwright/Puppeteer/Selenium), xdg-open/start or similar for that work.".into());
+                    }
+                }
             }
         }
         // CodeBuddy 的工作目录契约逐轮附在用户文本末尾。其 CLI 会把同一条 ACP
         // prompt 中最后一个 text block 当成最新指令；若 guidance 放在最前面，模型可能
         // 把它当成当前消息而忽略随后真正的用户请求。
         let runtime_guidance = match self.kind {
-            AgentKind::CodeBuddy => {
+            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::WorkBuddy => {
                 let cwd = {
                     let state = self.app.state::<AppState>();
                     let store = state.store.lock().unwrap();
@@ -3573,21 +3838,9 @@ impl AcpManager {
         if let Some(runtime) = runtime_guidance {
             guidance.push(runtime);
         }
-        if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Claude)
-            && self
-                .app
-                .state::<AppState>()
-                .settings
-                .lock()
-                .unwrap()
-                .auto_change_project_enabled
-            && !self.app.state::<AppState>().context_service.endpoint().is_empty()
-        {
-            guidance.push("需要更换工作目录/项目时，单独调用 nova-tools 的 change_working_directory(path)，不要与其它工具并行。Nova 会在新目录恢复本会话并自动继续；普通 cd 不能更改 Nova 会话目录。".into());
-        }
         if !guidance.is_empty() {
             let guidance = guidance.join("\n\n");
-            if self.kind == AgentKind::CodeBuddy {
+            if self.kind.is_codebuddy() {
                 if let Some(block) = prompt
                     .iter_mut()
                     .find(|block| block.get("type").and_then(Value::as_str) == Some("text"))
@@ -3646,8 +3899,7 @@ impl AcpManager {
         let err = |msg: String| {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
-            if let Some(thread) = store.get_mut(&thread_id) {
-                let item = thread.push_system(msg, "error");
+            if let Some(item) = store.get_mut(&thread_id).and_then(|thread| push_prompt_error(thread, msg)) {
                 store.save_thread(&thread_id);
                 self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
             }
@@ -3681,13 +3933,14 @@ impl AcpManager {
         let _ = self.app.emit(EV_THREADS, json!({}));
         let prompt = self.build_user_prompt_blocks(&thread_id, &text, &images, false);
         let kind = self.kind.clone();
-        let native = matches!(kind, AgentKind::CodeBuddy | AgentKind::Claude);
+        let native = kind.is_codebuddy() || kind == AgentKind::Claude;
         let mgr = self.clone();
         let tid = thread_id.clone();
         // Devin 随主 prompt 返回；CodeBuddy / Claude 立即确认注入，当前轮仍由主 drive 收尾。
         tauri::async_runtime::spawn(async move {
             let (method, params) = match kind {
-                AgentKind::CodeBuddy => ("session/steer", json!({ "sessionId": session_id, "contentBlocks": prompt })),
+                AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::WorkBuddy =>
+                    ("session/steer", json!({ "sessionId": session_id, "contentBlocks": prompt })),
                 // promptRequired：轮次已结束时不让 agent 偷偷另起一轮（那轮输出 Nova 收不了尾）。
                 AgentKind::Claude => ("_session/steering", json!({ "sessionId": session_id, "prompt": prompt,
                     "_meta": { "steering": { "idleBehavior": "promptRequired" } } })),
@@ -3698,7 +3951,8 @@ impl AcpManager {
                 .await
                 .and_then(|result| {
                     let accepted = match kind {
-                        AgentKind::CodeBuddy => result.get("steered").and_then(Value::as_bool) == Some(true),
+                        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::WorkBuddy =>
+                            result.get("steered").and_then(Value::as_bool) == Some(true),
                         AgentKind::Claude => result.get("outcome").and_then(Value::as_str) == Some("injected"),
                         _ => true,
                     };
@@ -3767,7 +4021,7 @@ impl AcpManager {
         // CodeBuddy treats the final text block as the current message; keep the
         // handoff and continuation together so interrupted user messages survive.
         let codebuddy_text = handoff
-            .filter(|_| self.kind == AgentKind::CodeBuddy)
+            .filter(|_| self.kind.is_codebuddy())
             .map(|context| format!("{context}\n\n{text}"));
         let mut prompt = self.build_user_prompt_blocks(
             thread_id,
@@ -3775,7 +4029,9 @@ impl AcpManager {
             images,
             include_runtime_guidance,
         );
-        if let Some(ctx) = handoff.filter(|_| self.kind != AgentKind::CodeBuddy) {
+        if let Some(ctx) = handoff.filter(|_| !self.kind.is_codebuddy()) {
+            // 包上标签，免得模型把接力记录/线索当成用户本轮新说的话。
+            let ctx = format!("<nova-context>\n以下是 Nova 提供的背景上下文（此前的会话记录、线索等），不是用户本轮的新请求。\n\n{ctx}\n</nova-context>");
             prompt.insert(0, json!({ "type": "text", "text": ctx }));
         }
         let items_at_prompt = {
@@ -3942,6 +4198,22 @@ impl AcpManager {
         Err(last_err)
     }
 
+    /// 本会话是否开放 nova-tools 的 change_working_directory。
+    /// ponytail: Devin 的 MCP 环境在进程启动时定型，线程级 scope 只能冷启动绑定，故仅对
+    /// 本就跳过预热的自动模式线程开放；普通 Devin 线程要支持，需先让预热进程可重绑线程环境。
+    fn cwd_change_enabled(&self, thread_id: &str) -> bool {
+        let state = self.app.state::<AppState>();
+        if !state.settings.lock().unwrap().auto_change_project_enabled
+            || state.context_service.endpoint().is_empty()
+        {
+            return false;
+        }
+        self.kind.is_codebuddy()
+            || self.kind == AgentKind::Claude
+            || (self.kind == AgentKind::Devin
+                && !crate::auto_tool_env(&state, thread_id).is_empty())
+    }
+
     fn cwd_change_scope(&self, thread_id: &str) -> String {
         format!(
             "{}:{}:{thread_id}",
@@ -3969,8 +4241,7 @@ impl AcpManager {
             };
             let target = (|| {
                 let state = self.app.state::<AppState>();
-                if !matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Claude)
-                    || !state.settings.lock().unwrap().auto_change_project_enabled
+                if !self.cwd_change_enabled(thread_id)
                     || !self.is_running(thread_id)
                     || !changes.is_current()
                 {
@@ -4115,9 +4386,52 @@ impl AcpManager {
                     self.kind.label(),
                 )));
             }
-            None => request.await,
+            None => self.await_with_silence_notice(session_id, request).await,
         };
         result.map_err(PromptFailure::Rpc)
+    }
+
+    /// Claude 遇到 503/限流时 CLI 会自行退避重试多次，但 claude-agent-acp 在客户端未声明
+    /// AIR sessionFailure 能力时不转发 `api_retry`，这期间 Nova 收不到任何通知，界面只剩
+    /// 「运行中」。静默超过 `CLAUDE_SILENCE_NOTICE` 就在会话里补一条提示（每段静默只提示一次）。
+    async fn await_with_silence_notice(
+        &self,
+        session_id: &str,
+        request: impl std::future::Future<Output = Result<Value, String>>,
+    ) -> Result<Value, String> {
+        if self.kind != AgentKind::Claude {
+            return request.await;
+        }
+        tokio::pin!(request);
+        let mut notified_for = 0;
+        loop {
+            tokio::select! {
+                result = &mut request => return result,
+                _ = sleep(Duration::from_secs(15)) => {}
+            }
+            let Some(thread_id) = self.routes.lock().unwrap().get(session_id).map(|r| r.thread_id.clone())
+            else { continue };
+            if self.pending_permissions.lock().unwrap().values().any(|p| p.session_id == session_id) {
+                continue;
+            }
+            let state = self.app.state::<AppState>();
+            let mut store = state.store.lock().unwrap();
+            let Some(thread) = store.get_mut(&thread_id) else { continue };
+            let silent_ms = now_ms() - thread.updated_at;
+            if thread.updated_at == notified_for || silent_ms < CLAUDE_SILENCE_NOTICE.as_millis() as i64 {
+                continue;
+            }
+            let item = thread.push_system(
+                format!(
+                    "Claude 已 {silent_ms_s} 秒没有新输出：可能在执行长耗时工具，或在自动重试连接（503/限流时 Claude Code 会退避重试多次，期间同样消耗额度）。可点击停止中断。",
+                    silent_ms_s = silent_ms / 1000
+                ),
+                "info",
+            );
+            notified_for = thread.updated_at;
+            self.emit_update(&thread_id, json!({ "t": "upsert", "item": item }));
+            store.save_thread(&thread_id);
+        }
     }
 
     /// 只解除线程上 session 的进程内挂载（保留 thread.acp_session_id）：
@@ -4239,14 +4553,15 @@ impl AcpManager {
         Ok(())
     }
 
-    /// 该连接需要自动代答的权限请求作用域：Devin 与 CodeBuddy 的递增 RPC id
-    /// 都在同一前端路由表里，CodeBuddy 加 cbp- 前缀避免键碰撞。
+    /// 各后端的递增 RPC id 共用前端路由表；独立 manager 必须使用独立前缀。
     fn permission_scope_prefix(&self) -> String {
         if self.permission_scope.is_empty() && self.kind == AgentKind::Claude {
             "claude-".to_string()
         } else if self.permission_scope.is_empty() && self.kind == AgentKind::Kimi {
             "kimi-".to_string()
-        } else if self.permission_scope.is_empty() && self.kind == AgentKind::CodeBuddy {
+        } else if self.permission_scope.is_empty() && self.kind == AgentKind::WorkBuddy {
+            "workbuddy-".to_string()
+        } else if self.permission_scope.is_empty() && self.kind.is_codebuddy() {
             "cbp-".to_string()
         } else {
             self.permission_scope.clone()
@@ -4256,7 +4571,7 @@ impl AcpManager {
     /// Devin 保持无前缀的 perm- key；CodeBuddy 每线程一条连接、RPC id 各自递增，
     /// 必须把连接键纳入作用域，避免两个并发会话的权限请求互相覆盖。
     fn permission_key(&self, conn: &AcpConn, id: &Value) -> String {
-        let scope = if matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi | AgentKind::Claude) {
+        let scope = if self.kind.is_codebuddy() || matches!(self.kind, AgentKind::Kimi | AgentKind::Claude) {
             format!("{}{}-", self.permission_scope_prefix(), conn.key.lock().unwrap())
         } else {
             self.permission_scope_prefix()
@@ -4288,7 +4603,7 @@ impl AcpManager {
         read_only: bool,
         thread_id: &str,
     ) -> Result<Value, String> {
-        if !matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Kimi | AgentKind::Claude) {
+        if !(self.kind.is_codebuddy() || matches!(self.kind, AgentKind::Kimi | AgentKind::Claude)) {
             return Ok(json!([]));
         }
         let state = self.app.state::<AppState>();
@@ -4296,9 +4611,7 @@ impl AcpManager {
             let settings = state.settings.lock().unwrap();
             settings.context_retrieval_mode.as_str().to_string()
         };
-        let auto_change_project = matches!(self.kind, AgentKind::CodeBuddy | AgentKind::Claude)
-            && state.settings.lock().unwrap().auto_change_project_enabled
-            && !state.context_service.endpoint().is_empty();
+        let auto_change_project = self.cwd_change_enabled(thread_id);
         if !auto_change_project && state.context_service.endpoint().is_empty()
         {
             return Ok(json!([]));
@@ -4317,6 +4630,14 @@ impl AcpManager {
             }));
             server["_meta"]["tools"]["change_working_directory"] =
                 json!({ "defer_loading": false });
+        }
+        for (name, value) in crate::auto_tool_env(&state, thread_id) {
+            server["env"].as_array_mut().unwrap().push(json!({ "name": name, "value": value }));
+            if name == "NOVA_SCENE_HANDOFF" {
+                for tool in ["spawn_agent", "wait_agent", "list_agents", "followup_task", "interrupt_agent", "close_agent"] {
+                    server["_meta"]["tools"][tool] = json!({ "defer_loading": false });
+                }
+            }
         }
         self.push_log(format!(
             "[nova] {} 已为 {cwd} 注入 nova-tools",
@@ -4341,6 +4662,52 @@ impl AcpManager {
             }
             mgr.slots.lock().unwrap().remove(&key);
         });
+    }
+}
+
+/// claude-agent-acp 原生子代理的只读投影子线程，结构对齐 lyra::stage::stage_thread：
+/// 挂到父线程下、继承父线程的目录/模型/只读属性，不引入新的动态上下文。
+fn subagent_child_thread(parent: &Thread, name: &str, task: &str) -> Thread {
+    let mut thread = Thread::new(
+        parent.cwd.clone(),
+        AgentKind::Claude,
+        parent.model.clone(),
+        parent.mode.clone(),
+        None,
+        parent.ephemeral,
+    );
+    thread.title = format!("[Agent] {name}");
+    thread.subagent = true;
+    thread.parent_thread_id = Some(parent.id.clone());
+    thread.worktree = parent.worktree.clone();
+    thread.employee_thread = parent.employee_thread;
+    thread.experience_thread = parent.experience_thread;
+    if !task.is_empty() {
+        thread.push_system(format!("子 Agent 任务：{task}"), "info");
+    }
+    thread
+}
+
+#[cfg(test)]
+mod subagent_stage_tests {
+    use super::*;
+
+    #[test]
+    fn subagent_child_thread_is_readonly_sibling_with_task_note() {
+        let mut root = Thread::new("root-dir".into(), AgentKind::Claude, Some("claude-model".into()), Some("build".into()), None, true);
+        root.employee_thread = true;
+        root.acp_session_id = Some("parent-session".into());
+        let first = subagent_child_thread(&root, "探索", "找出登录逻辑");
+        let second = subagent_child_thread(&root, "探索", "找出登录逻辑");
+        assert!(first.subagent && first.ephemeral && first.employee_thread);
+        assert_eq!(first.parent_thread_id.as_deref(), Some(root.id.as_str()));
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.cwd, "root-dir");
+        assert_eq!(first.model.as_deref(), Some("claude-model"));
+        assert_eq!(first.agent_kind, AgentKind::Claude);
+        assert!(first.acp_session_id.is_none());
+        assert_eq!(first.items.len(), 1);
+        assert!(matches!(&first.items[0], Item::System { text, .. } if text.contains("找出登录逻辑")));
     }
 }
 
@@ -4473,20 +4840,16 @@ fn resolve_sibling_program(configured_program: &str, sibling: &str) -> String {
 
 /// `cbc-prewarm activate` 通过 `--env` 显式构造最终服务环境；普通本机会话必须把
 /// 当前进程继承的 CodeBuddy 配置一并传入，否则预热路径会表现为启动后环境变量消失。
-/// 额度借用保持隔离，只使用租约提供的 launch_env，禁止继承本机 CodeBuddy 凭据。
 fn merge_codebuddy_activation_env(
     launch_env: &HashMap<String, String>,
     inherited: impl IntoIterator<Item = (String, String)>,
 ) -> std::collections::BTreeMap<String, String> {
-    let borrowed = launch_env.contains_key("NOVA_QUOTA_BORROWED");
     let mut env = std::collections::BTreeMap::new();
-    if !borrowed {
-        env.extend(
-            inherited
-                .into_iter()
-                .filter(|(key, _)| key.to_ascii_uppercase().starts_with("CODEBUDDY_")),
-        );
-    }
+    env.extend(
+        inherited
+            .into_iter()
+            .filter(|(key, _)| key.to_ascii_uppercase().starts_with("CODEBUDDY_")),
+    );
     env.extend(launch_env.clone());
     // Nova kills managed process trees on eviction/exit. An interrupted npm self-update can
     // leave global CLI shims renamed to temporary backups; keep updates outside this lifecycle.
@@ -4544,6 +4907,57 @@ mod codebuddy_acp_tests {
     }
 
     #[test]
+    fn claude_1m_models_inherit_original_efforts() {
+        let config = json!([
+            {"id":"model","currentValue":"sonnet","options":[
+                {"value":"sonnet[1m]","name":"Sonnet","_meta":{"claude.ai/effortOptions":[]}},
+                {"value":"sonnet-1m","name":"Sonnet"},
+                {"value":"sonnet","name":"Sonnet"},
+                {"value":"haiku[1m]","name":"Haiku"},
+                {"value":"haiku","name":"Haiku"},
+                {"value":"sonnet-other[1m]","name":"Other Sonnet"}
+            ]},
+            {"id":"effort","currentValue":"high","options":[{"value":"default"},{"value":"high"}]}
+        ]);
+        let expanded = super::expand_claude_model_options(&config, None, "effort");
+        assert_eq!(expanded[0]["currentValue"], "sonnet:high");
+        let rows = expanded[0]["options"].as_array().unwrap();
+        for id in ["sonnet[1m]", "sonnet-1m"] {
+            let high = rows.iter().find(|o| o["value"] == format!("{id}:high")).unwrap();
+            assert_eq!(high["name"], "Sonnet · 1M · High");
+            assert_eq!(high["_meta"]["contextWindow"], 1_000_000);
+            assert_eq!(super::split_model_effort(high["value"].as_str()),
+                (Some(id.into()), Some("high".into())));
+        }
+        for id in ["haiku", "haiku[1m]", "sonnet-other[1m]"] {
+            assert!(rows.iter().any(|o| o["value"] == id));
+            assert!(!rows.iter().any(|o| o["value"].as_str().unwrap().starts_with(&format!("{id}:"))));
+        }
+        // 缓存只含原模型，确保不是从变体自身的旧档位恢复。
+        let original = rows.iter().find(|o| o["value"] == "sonnet:high").unwrap();
+        let known = json!([{"id":"model","currentValue":"haiku","options":[original]}]);
+        for id in ["sonnet[1m]", "sonnet-1m"] {
+            let mut current = json!([config[0].clone()]);
+            current[0]["currentValue"] = json!(id);
+            let inherited = super::expand_claude_model_options(&current, Some(&known), "effort");
+            assert_eq!(inherited[0]["currentValue"], format!("{id}:default"));
+            assert!(inherited[0]["options"].as_array().unwrap().iter()
+                .any(|o| o["value"] == format!("{id}:high")));
+            assert_eq!(super::expand_claude_model_options(&inherited, None, "effort"), inherited);
+            // 原模型能力随当前列表返回时同样可用；变体自身的明确档位优先。
+            current[0]["options"][2] = original.clone();
+            assert_eq!(super::expand_claude_model_options(&current, None, "effort"), inherited);
+            current.as_array_mut().unwrap().push(json!({
+                "id":"effort","currentValue":"low","options":[{"value":"low"}]
+            }));
+            let explicit = super::expand_claude_model_options(&current, Some(&known), "effort");
+            assert_eq!(explicit[0]["currentValue"], format!("{id}:low"));
+            assert!(!explicit[0]["options"].as_array().unwrap().iter()
+                .any(|o| o["value"] == format!("{id}:high")));
+        }
+    }
+
+    #[test]
     fn claude_flattened_models_preserve_capabilities_and_context() {
         let config = json!([
             {"id":"model","currentValue":"sonnet[1m]","options":[
@@ -4555,11 +4969,11 @@ mod codebuddy_acp_tests {
                 {"value":"default"},{"value":"medium"},{"value":"xhigh"}
             ]}
         ]);
-        let expanded = super::expand_claude_model_options(&config, None);
+        let expanded = super::expand_claude_model_options(&config, None, "effort");
         assert_eq!(expanded[0]["currentValue"], "sonnet[1m]:medium");
         assert_eq!(expanded[0]["options"][1]["name"], "Sonnet · 1M · Medium");
         assert_eq!(expanded[0]["options"][1]["_meta"]["contextWindow"], 1_000_000);
-        assert_eq!(super::expand_claude_model_options(&expanded, None), expanded);
+        assert_eq!(super::expand_claude_model_options(&expanded, None, "effort"), expanded);
         assert_eq!(super::split_model_effort(Some("sonnet[1m]:xhigh")),
             (Some("sonnet[1m]".into()), Some("xhigh".into())));
         assert_eq!(super::split_model_effort(Some("custom:unknown")),
@@ -4568,17 +4982,47 @@ mod codebuddy_acp_tests {
         next[0]["currentValue"] = json!("opus");
         next[1]["currentValue"] = json!("max");
         next[1]["options"] = json!([{"value":"high"},{"value":"max"}]);
-        let next = super::expand_claude_model_options(&next, Some(&expanded));
+        let next = super::expand_claude_model_options(&next, Some(&expanded), "effort");
         let rows = next[0]["options"].as_array().unwrap();
         assert!(rows.iter().any(|o| o["value"] == "sonnet[1m]:medium"));
         assert!(rows.iter().any(|o| o["value"] == "opus:max"));
         assert!(!rows.iter().any(|o| o["value"] == "opus:medium"));
         assert_eq!(rows.iter().filter(|o| o["_meta"]["codebuddy.ai/default"] == true).count(), 1);
         let haiku = json!([{"id":"model","currentValue":"haiku","options":config[0]["options"]}]);
-        let haiku = super::expand_claude_model_options(&haiku, Some(&next));
+        let haiku = super::expand_claude_model_options(&haiku, Some(&next), "effort");
         assert_eq!(haiku[0]["currentValue"], "haiku");
         assert!(haiku[0]["options"].as_array().unwrap().iter().any(|o| o["value"] == "opus:max"));
         assert!(!haiku[0]["options"].as_array().unwrap().iter().any(|o| o["value"].as_str().unwrap().starts_with("haiku:")));
+    }
+
+    #[test]
+    fn devin_efforts_follow_reported_levels_per_model() {
+        let models = json!([
+            {"value":"swe-1-7-medium","name":"SWE-1.7"},
+            {"value":"gpt-5-4-none","name":"GPT-5.4"},
+            {"value":"glm-5-2-1m","name":"GLM-5.2 1M"},
+            {"value":"fusion-gpt-6-sol-high-sidekick-swe-2-medium","name":"Fusion"}
+        ]);
+        let config = json!([
+            {"id":"model","currentValue":"swe-1-7-medium","options":models},
+            {"id":"thought_level","currentValue":"medium","options":[{"value":"medium"},{"value":"max"}]}
+        ]);
+        let first = super::expand_claude_model_options(&config, None, "thought_level");
+        let values = |v: &serde_json::Value| v[0]["options"].as_array().unwrap().iter()
+            .map(|o| o["value"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        // 未探测的模型不猜档位；1M 模型不重复加后缀；fusion 剔除。
+        assert_eq!(values(&first), ["swe-1-7-medium:medium", "swe-1-7-medium:max", "gpt-5-4-none", "glm-5-2-1m"]);
+        assert_eq!(first[0]["currentValue"], "swe-1-7-medium:medium");
+        assert_eq!(first[0]["options"][3]["name"], "GLM-5.2 1M");
+        // 选中另一个模型后按它上报的档位展开，先前学到的保留。
+        let next = json!([
+            {"id":"model","currentValue":"gpt-5-4-none","options":models},
+            {"id":"thought_level","currentValue":"none","options":[{"value":"none"},{"value":"xhigh"}]}
+        ]);
+        let next = super::expand_claude_model_options(&next, Some(&first), "thought_level");
+        assert_eq!(values(&next), ["swe-1-7-medium:medium", "swe-1-7-medium:max", "gpt-5-4-none:none", "gpt-5-4-none:xhigh", "glm-5-2-1m"]);
+        assert_eq!(next[0]["currentValue"], "gpt-5-4-none:none");
+        assert_eq!(super::split_model_effort(Some("gpt-5-4-none:none")), (Some("gpt-5-4-none".into()), Some("none".into())));
     }
 
     #[test]
@@ -4600,9 +5044,10 @@ mod codebuddy_acp_tests {
         assert_eq!(expanded[0]["options"][0]["value"], "sonnet:medium");
         assert_eq!(super::expand_acp_effort_options(&expanded, "effort"), expanded);
         let server = codebuddy_nova_tools_mcp_server_value("node", "nova-tools.mjs", "/repo", "fast", false, "endpoint", "token");
-        for tool in ["polaris", "webview", "chrome", "jianlai", "generate_image", "edit_image"] {
+        for tool in ["polaris", "chrome", "jianlai", "generate_image", "edit_image"] {
             assert_eq!(server["_meta"]["tools"][tool]["defer_loading"], false);
         }
+        assert!(server["_meta"]["tools"].get("webview").is_none());
     }
 
     #[test]
@@ -4623,7 +5068,7 @@ mod codebuddy_acp_tests {
         codebuddy_command, codebuddy_nova_tools_mcp_server_value, codebuddy_runtime_guidance,
         is_process_exit_error, is_retriable_rpc_error, keep_known_model_options, lru_evict_keys,
         merge_codebuddy_activation_env, merge_current_model_option, merge_model_config_option,
-        prompt_conn_needs_rebuild, publishes_model_options, stalled_prompt_error,
+        prompt_conn_needs_rebuild, stalled_prompt_error,
         thread_connection_key, AcpManager, PromptFailure, CODEBUDDY_ACP_ARGS,
     };
     use serde_json::json;
@@ -4632,6 +5077,89 @@ mod codebuddy_acp_tests {
     #[test]
     fn codebuddy_uses_official_stdio_acp_contract() {
         assert_eq!(CODEBUDDY_ACP_ARGS, ["--acp", "--acp-transport", "stdio"]);
+    }
+
+    #[test]
+    fn authoritative_model_updates_replace_stale_models_and_keep_other_state() {
+        let modes = json!({"currentModeId":"plan","availableModes":[{"id":"plan","name":"Plan"}]});
+        let config = json!([
+            {"id":"model","currentValue":"stale:high","options":[{"value":"stale:high"}]},
+            {"id":"thought_level","currentValue":"high","options":[{"value":"high"}]},
+            {"id":"mode","currentValue":"plan","options":[{"value":"plan"}]},
+            {"id":"model","options":[{"value":"stale-duplicate"}]}
+        ]);
+        let models = json!({"availableModels":[{"modelId":"live","name":"Live"}],"currentModelId":"live"});
+        // Both session/new and a model-only push over an already-expanded cache use this path.
+        for mut result in [
+            json!({"sessionId":"session","models":{"availableModels":[{"modelId":"stale"}],
+                "currentModelId":"stale"},"configOptions":config,"modes":modes}),
+            json!({"configOptions":config,"modes":modes}),
+        ] {
+            let session_id = result.get("sessionId").cloned();
+            assert!(super::replace_model_state(&mut result, &models));
+            assert_eq!(result["models"], models);
+            assert_eq!(result["configOptions"], json!([config[1], config[2]]));
+            assert_eq!(result["modes"], modes);
+            assert_eq!(result.get("sessionId").cloned(), session_id);
+            let once = result.clone();
+            assert!(super::replace_model_state(&mut result, &models));
+            assert_eq!(result, once);
+        }
+        let mut uncached = json!({});
+        assert!(super::replace_model_state(&mut uncached, &models));
+        assert_eq!(uncached, json!({"models":models}));
+    }
+
+    #[test]
+    fn empty_or_incomplete_model_updates_do_not_discard_known_options() {
+        let known = json!({
+            "models":{"availableModels":[{"modelId":"known"}],"currentModelId":"known"},
+            "configOptions":[{"id":"model","options":[{"value":"known"}]},
+                {"id":"thought_level","currentValue":"high"}],
+            "modes":{"currentModeId":"plan"}
+        });
+        for update in [json!({}), json!({"currentModelId":"live"}),
+            json!({"availableModels":null}), json!({"availableModels":{}}),
+            json!({"ok":true,"availableModels":[],"currentModelId":"live"})] {
+            let mut result = known.clone();
+            assert!(!super::replace_model_state(&mut result, &update));
+            assert_eq!(result, known);
+        }
+    }
+
+    #[test]
+    fn workbuddy_reuses_codebuddy_protocol_but_not_global_prewarm() {
+        use super::*;
+        assert!(AgentKind::WorkBuddy.is_codebuddy());
+        assert!(!AgentKind::Devin.is_codebuddy());
+        for mode in ["build", "bypass", "plan", "default"] {
+            assert_eq!(AcpManager::backend_mode_id(&AgentKind::WorkBuddy, mode),
+                AcpManager::backend_mode_id(&AgentKind::CodeBuddy, mode));
+        }
+        let mut thread = Thread::new(String::new(), AgentKind::WorkBuddy, None, None, None, false);
+        thread.items.push(Item::Tool { id: 1, ts: now_ms(),
+            call: tool_call_from_update("tool", &json!({"status": "in_progress"})) });
+        assert!(complete_pending_tools_on_update(&mut thread, None).is_empty());
+        assert_eq!(complete_pending_tools(&mut thread, None).len(), 1);
+
+        // 不构造 GUI AppHandle：检查启动/预热分流，防止 helper 扩大后误用全局凭据。
+        let source = include_str!("acp.rs");
+        let startup = source.split("async fn spawn_codebuddy_stdio_conn(").nth(1).unwrap()
+            .split("async fn activate_codebuddy_prewarm(").next().unwrap();
+        assert!(startup.contains("crate::workbuddy::program(&settings.workbuddy_path)"));
+        assert!(startup.contains("crate::workbuddy::acp_command(&program)?"));
+        assert!(startup.contains("cmd.env(\"CODEBUDDY_DEFER_TOOL_LOADING\", \"0\")"));
+        assert!(startup.contains(".env(\"DISABLE_AUTOUPDATER\", \"1\")"));
+        assert!(startup.contains("codebuddy_command(&settings.codebuddy_path, &CODEBUDDY_ACP_ARGS)"));
+        let prewarm = source.split("pub async fn prewarm(").nth(1).unwrap()
+            .split("async fn spawn_codebuddy_prewarm(").next().unwrap();
+        assert!(prewarm.contains("AgentKind::WorkBuddy"));
+        assert!(prewarm.contains("let result = if self.kind == AgentKind::CodeBuddy {"));
+        assert!(prewarm.contains("self.spawn_conn(&settings, &key, Some(&cwd), read_only)"));
+        let permissions = source.split("fn permission_scope_prefix(").nth(1).unwrap()
+            .split("fn permission_key(").next().unwrap();
+        assert!(permissions.contains("self.kind == AgentKind::WorkBuddy"));
+        assert!(permissions.contains("\"workbuddy-\".to_string()"));
     }
 
     #[test]
@@ -4700,7 +5228,7 @@ mod codebuddy_acp_tests {
     }
 
     #[test]
-    fn codebuddy_merges_standard_and_extension_models_and_borrowed_instances_do_not_publish_them() {
+    fn codebuddy_merges_standard_and_extension_models() {
         let merged = merge_model_config_option(
             json!([
                 { "id": "mode", "options": [{ "value": "plan", "name": "Plan" }] },
@@ -4721,11 +5249,6 @@ mod codebuddy_acp_tests {
                 { "value": "glm-5.3-flash", "name": "GLM-5.3-Flash" }
             ])
         );
-        assert!(publishes_model_options(&HashMap::new()));
-        assert!(!publishes_model_options(&HashMap::from([(
-            "NOVA_QUOTA_BORROWED".into(),
-            "1".into(),
-        )])));
     }
 
     #[test]
@@ -4799,7 +5322,7 @@ mod codebuddy_acp_tests {
     }
 
     #[test]
-    fn prewarm_activation_preserves_local_codebuddy_environment_but_isolates_borrowed_sessions() {
+    fn prewarm_activation_preserves_local_codebuddy_environment() {
         let inherited = [
             ("CODEBUDDY_API_KEY".into(), "local-secret".into()),
             ("OTHER_KEY".into(), "ignored".into()),
@@ -4811,19 +5334,6 @@ mod codebuddy_acp_tests {
         );
         assert!(!local.contains_key("OTHER_KEY"));
         assert_eq!(local["DISABLE_AUTOUPDATER"], "1");
-
-        let borrowed = HashMap::from([
-            ("NOVA_QUOTA_BORROWED".into(), "1".into()),
-            ("CODEBUDDY_CONFIG_DIR".into(), "isolated".into()),
-            ("DISABLE_AUTOUPDATER".into(), "0".into()),
-        ]);
-        let isolated = merge_codebuddy_activation_env(&borrowed, inherited);
-        assert!(!isolated.contains_key("CODEBUDDY_API_KEY"));
-        assert_eq!(isolated["DISABLE_AUTOUPDATER"], "1");
-        assert_eq!(
-            isolated.get("CODEBUDDY_CONFIG_DIR").map(String::as_str),
-            Some("isolated")
-        );
     }
 
     #[test]
@@ -4901,7 +5411,7 @@ mod codebuddy_acp_tests {
     #[test]
     fn codebuddy_guidance_keeps_the_latest_user_request_in_the_same_text_block() {
         let manager = AcpManager::new_with_env;
-        let source = include_str!("acp.rs");
+        let source = include_str!("acp.rs").replace("\r\n", "\n");
         let body = source
             .split("fn build_user_prompt_blocks(")
             .nth(1)
@@ -4913,11 +5423,29 @@ mod codebuddy_acp_tests {
         assert!(body.contains("<system-reminder>"));
         assert!(body.contains("block[\"text\"]"));
         assert!(!body.contains("AgentKind::CodeBuddy => prompt.insert(0"));
-        let rules = body.split("if include_runtime_guidance {").next().unwrap();
-        assert!(rules.contains("AgentKind::CodeBuddy | AgentKind::Kimi"));
+        // Claude 的规则走 session 级 system prompt，不再逐轮前插进用户消息。
+        let per_turn = body.split("if include_runtime_guidance {").next().unwrap();
+        assert!(per_turn.contains("if self.kind == AgentKind::Claude {\n            Vec::new()"));
+        let meta = source.split("fn add_session_meta(").nth(1).unwrap()
+            .split("fn build_user_prompt_blocks(").next().unwrap();
+        assert!(meta.contains("\"systemPrompt\"] = json!({ \"append\""));
+        assert!(meta.contains("\"disallowedTools\": [\"EnterPlanMode\"]"));
+        assert!(source.contains(".request(\"session/new\", params.clone()"));
+        assert!(source.contains(".request(\"session/load\", params.clone()"));
+        let rules = source.split("fn nova_rules(").nth(1).unwrap()
+            .split("fn add_session_meta(").next().unwrap();
+        assert!(rules.contains("self.kind.is_codebuddy() || matches!(self.kind, AgentKind::Kimi | AgentKind::Claude)"));
         assert!(rules.contains("crate::codex_app_server::rtk_guidance()"));
         assert!(rules.contains("ponytail_enabled"));
         assert!(rules.contains("crate::lyra::PONYTAIL_RULES"));
+        // Devin 自动模式线程：MCP 环境带 cwd scope，提示词宣传工具，切换请求不被拒。
+        let spawn = source.split("async fn spawn_conn(").nth(1).unwrap()
+            .split("cmd.stdin(").next().unwrap();
+        assert!(spawn.contains("auto_env.push((\"NOVA_CWD_CHANGE_SCOPE\""));
+        let enabled = source.split("fn cwd_change_enabled(").nth(1).unwrap()
+            .split("fn cwd_change_scope(").next().unwrap();
+        assert!(enabled.contains("self.kind == AgentKind::Devin"));
+        assert!(source.contains("if !self.cwd_change_enabled(thread_id)\n"));
         let steer = source.split("pub async fn steer_prompt(").nth(1).unwrap()
             .split("async fn drive_prompt(").next().unwrap();
         assert!(steer.contains("self.build_user_prompt_blocks(&thread_id, &text, &images, false)"));
@@ -4996,6 +5524,58 @@ pub(crate) fn apply_proxy_env(cmd: &mut tokio::process::Command, proxy: &str) {
 /// 典型：`RetriableError: [unavailable] PING timed out`、`RetriableError: Connection stalled`、
 /// `RetriableError: [aborted] read ECONNRESET`、裸 `Internal error`。
 /// 重试通常能成功，不应清 session / 杀进程（进程已死的情况由调用方单独处理）。
+fn push_prompt_error(thread: &mut Thread, error: String) -> Option<Item> {
+    let message = error.trim();
+    // Claude may stream the failure as assistant text before rejecting session/prompt.
+    // Only deduplicate visible text in this turn; never hide a later turn's failure.
+    let shown = !message.is_empty() && thread.items.iter().rev()
+        .take_while(|item| !matches!(item, Item::User { .. } | Item::Turn { .. }))
+        .any(|item| match item {
+            Item::Assistant { text, .. } | Item::System { text, .. } => {
+                text.trim() == message || text.trim_end().strip_suffix(message)
+                    .is_some_and(|prefix| prefix.ends_with('\n'))
+            }
+            _ => false,
+        });
+    if shown { None } else { Some(thread.push_system(error, "error")) }
+}
+
+#[test]
+fn prompt_error_is_shown_once_per_turn() {
+    const ERROR: &str = "API Error: Repeated 529 Overloaded errors.";
+    for text in [ERROR.to_string(), format!("Earlier output\n\n{ERROR}\r\n")] {
+        let mut thread = Thread::new(String::new(), AgentKind::Claude, None, None, None, false);
+        thread.push_user("test".into(), vec![]);
+        thread.items.push(Item::Assistant { id: thread.next_item_id(), text, ts: now_ms() });
+        let before = thread.items.len();
+        assert!(push_prompt_error(&mut thread, format!(" {ERROR}\n")).is_none());
+        assert_eq!(thread.items.len(), before);
+        let turn = thread.push_turn(1, None, "error");
+        assert!(matches!(turn, Item::Turn { stop_reason, .. } if stop_reason == "error"));
+        // Identical failures in a subsequent turn must still be reported.
+        assert!(push_prompt_error(&mut thread, ERROR.into()).is_some());
+        thread.push_user("retry".into(), vec![]);
+        assert!(push_prompt_error(&mut thread, ERROR.into()).is_some());
+    }
+
+    let mut thread = Thread::new(String::new(), AgentKind::Claude, None, None, None, false);
+    thread.push_user(ERROR.into(), vec![]);
+    thread.items.push(Item::Thought { id: thread.next_item_id(), text: ERROR.into(), ts: now_ms() });
+    // User text and hidden reasoning are not an error notification.
+    assert!(push_prompt_error(&mut thread, ERROR.into()).is_some());
+    let before = thread.items.len();
+    assert!(push_prompt_error(&mut thread, ERROR.into()).is_none());
+    assert_eq!(thread.items.len(), before);
+    assert!(push_prompt_error(&mut thread, "API Error: Unauthorized".into()).is_some());
+
+    thread.push_user("retry".into(), vec![]);
+    thread.items.push(Item::Assistant {
+        id: thread.next_item_id(), text: format!("Not an {ERROR}"), ts: now_ms(),
+    });
+    // A substring in normal prose is not the same error.
+    assert!(push_prompt_error(&mut thread, ERROR.into()).is_some());
+}
+
 fn is_retriable_rpc_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("retriable")
@@ -5207,7 +5787,6 @@ fn codebuddy_nova_tools_mcp_server_value(
     if !read_only {
         meta["tools"]["generate_image"] = json!({ "defer_loading": false });
         meta["tools"]["edit_image"] = json!({ "defer_loading": false });
-        meta["tools"]["webview"] = json!({ "defer_loading": false });
         meta["tools"]["chrome"] = json!({ "defer_loading": false });
         meta["tools"]["jianlai"] = json!({ "defer_loading": false });
     }
@@ -5283,6 +5862,7 @@ fn prepare_devin_nova_tools_config(
     cwd: &str,
     context_mode: &str,
     read_only: bool,
+    auto_env: &[(&'static str, String)],
 ) -> Result<PathBuf, String> {
     let script = materialize_nova_tools_mcp(app)?;
     let node = resolve_program_on_path("node")
@@ -5314,7 +5894,12 @@ fn prepare_devin_nova_tools_config(
         state.context_service.endpoint(),
         state.context_service.token(),
     );
-    let bytes = serde_json::to_vec_pretty(&config)
+    // 会话目录的配置可能被同目录的其它线程共用，只在本连接的启动目录配置里写线程级环境。
+    let mut launch_config = config.clone();
+    for (name, value) in auto_env {
+        launch_config["mcpServers"]["nova-tools"]["env"][*name] = Value::String(value.clone());
+    }
+    let bytes = serde_json::to_vec_pretty(&launch_config)
         .map_err(|e| format!("序列化 Devin MCP 配置失败：{e}"))?;
     let path = config_dir.join("config.local.json");
     if std::fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
@@ -5432,7 +6017,7 @@ mod nova_tools_config_tests {
 
     #[test]
     fn devin_nova_tools_guidance_requires_wrapper_server_name() {
-        let guidance = super::nova_tools_prompt_guidance(true, false);
+        let guidance = super::nova_tools_prompt_guidance(true, false, true);
         assert!(guidance.contains("ROUTING RULE — before choosing any tool"));
         assert!(guidance.contains("must NEVER be selected as direct tool calls"));
         assert!(guidance.contains("polaris"));
@@ -5448,13 +6033,14 @@ mod nova_tools_config_tests {
         assert!(guidance.contains("do not call mcp_list_tools merely to discover them"));
         assert!(guidance.contains("Never repeat a malformed call unchanged"));
         assert!(guidance.contains("Prefer minimal reads via Devin native read"));
+        assert!(!guidance.contains("webview"));
         assert!(!guidance.contains("never invent arbitrary 100/200-line pages"));
         assert!(!guidance.contains("merge them into one read_files"));
     }
 
     #[test]
     fn disabled_polaris_is_absent_from_devin_guidance() {
-        let guidance = super::nova_tools_prompt_guidance(false, false);
+        let guidance = super::nova_tools_prompt_guidance(false, false, true);
         assert!(!guidance.contains("polaris"));
         assert!(!guidance.contains("find_symbols"));
         assert!(!guidance.contains("read_files"));
@@ -5481,12 +6067,15 @@ mod nova_tools_config_tests {
 /// Aligned with scripts/nova-batch-tools.mjs `novaDevinBatchToolPolicy`:
 /// read_files / edit_files are intentionally omitted (edit_files 全链路默认禁用，
 /// NOVA_EDIT_FILES=1 才在 MCP 工具层恢复，此处提示词同步恢复前仍按原生 edit 引导)。
-fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
+fn nova_tools_prompt_guidance(polaris: bool, read_only: bool, desktop: bool) -> String {
+    let desktop = desktop && !read_only;
     let mut tool_names: Vec<&str> = Vec::new();
     if polaris {
         tool_names.extend(["polaris"]);
     }
-    if !read_only { tool_names.extend(["generate_image", "edit_image", "webview", "chrome", "jianlai", "employee"]); }
+    if !read_only { tool_names.extend(["generate_image", "edit_image"]); }
+    if desktop { tool_names.extend(["chrome", "jianlai"]); }
+    if !read_only { tool_names.push("employee"); }
     if tool_names.is_empty() {
         let mut lines = vec![
             "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools."
@@ -5512,7 +6101,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
         format!(
             "Prefer minimal reads via Devin native read: when line ranges are known, read only those segments; expand nearby context only as needed. {}Do not dump large files blindly.{}",
             if polaris {
-                "When location is unknown — or when you plan to modify two or more files not yet read in this session — you must call polaris first; one call typically replaces 5–10 grep+read round-trips. Then read only coverage gaps / next_reads with native read. "
+                "When location is unknown — or when you plan to modify two or more files not yet read in this session — you must call polaris first; one call typically replaces 5–10 grep+read round-trips. Then use native read by path:line only when the shown hit lines or dependency signatures/locations are insufficient. "
             } else {
                 "When location is unknown, search first (see below), then read near hits. "
             },
@@ -5523,13 +6112,15 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
             }
         ),
         if polaris {
-            "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only polaris (packs definition bodies + 1-hop neighbors + coverage; internal rg, honors `.gitignore`). Do not re-read FULL/BODY.covered ranges; fill gaps via next_reads with Devin native read. After polaris, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep—rg is already inside polaris. External rg/grep/git grep are allowed only when: (1) next_reads/gaps are still insufficient, or (2) the task explicitly needs a scoped literal search that polaris did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.".into()
+            "Search and traversal must be cost-bounded. When symbol/keyword distribution or surrounding code is unknown, you MUST call only polaris (highly relevant core hit lines, 1–2 lines per hit, plus necessary signatures/locations; internal rg, honors `.gitignore`). Dependencies default to signatures/locations only; use Devin native read by path:line when needed. The default hard limit is 12KB, not a target to fill; whole functions are not automatically expanded. Only actual shown lines count as read; do not re-read them. After polaris, do not re-discover the same keywords with shell `rg`/`git grep` or Devin grep—rg is already inside polaris. External rg/grep/git grep are allowed only when: (1) shown hit lines and targeted read follow-ups are still insufficient, or (2) the task explicitly needs a scoped literal search that polaris did not cover. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Fallback searches must honor `.gitignore` by default. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.".into()
         } else {
             "Search and traversal must be cost-bounded. Do not use `grep -r` or `grep -R` for unscoped recursive searches of a repo/source root. Prefer `rg` (honors `.gitignore`); use `git grep` only as a fallback for tracked-only searches. Unless the task requires it, do not scan build artifacts, dependencies, caches, generated files, or large binary asset dirs. `| head` / `| tail` and output truncation only limit display, not work; recursive commands must narrow via path/glob/type/excludes and use a short timeout. After a recursive timeout, do not retry the same command unchanged—narrow scope or switch tools.".into()
         },
     ];
-    if !read_only {
-        lines.push("Desktop routing: 剑来 means the jianlai desktop mouse/keyboard/screenshot tool, not a shell command. When the user requests 剑来/jianlai, start with ONE call mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"jianlai\",\"arguments\":{\"operation\":\"windows\",\"observe\":true}} (add \"query\":\"<app or title>\" or \"windowId\" to bind the target) — it returns the window list AND the target screenshot, verify the observed target is in the foreground before act; a background target must first be switched with {\"operation\":\"activate\",\"windowId\":<id>} (returns a fresh screenshot). Execute the longest sequence determined by the current observation in one act (up to 16), ending at the first information boundary. Put navigation, dropdown opening or a focus/layout transition last when the next action depends on its result. Use returned feedback directly: if it matches expectations, continue with its fresh snapshotId without redundant inspect/screenshot or replanning. On partial failure, check completedActions and the fresh observation; never replay completed actions. Chrome forms use consecutive fill actions in one batch; jianlai can batch a confirmed field click, select-all and whole-text input. An information boundary means the next step lacks necessary evidence, not every click. Do not pad batches or use waits to guess unseen content. Experience search/save/feedback are optional: use them only for unfamiliar paths, blockers or reusable new knowledge, never as mandatory per-task round trips. Verify the visible outcome when the task finishes. Use only jianlai mouse/keyboard/screenshot throughout the desktop task; never use shell, COM, PowerShell, P/Invoke, UIAutomation or scripts to activate/control apps. Switch background windows with jianlai activate(windowId); only if activate is refused, inspect the desktop and click a visible taskbar icon or use Win+Tab; do not blindly cycle windows. If the endpoint is missing, report the MCP error rather than silently switching methods. webview controls Nova's sidebar browser; chrome controls the user's Chrome. Division of labor: web page content inside a Chrome tab → chrome (DOM refs; tabs with query binds a tabTag and returns the inspect in one call; open/goto/select_tab wait for load and return the inspect; act waits for navigation before feeding back). Other apps and Chrome's native dialogs (file picker, print, system prompts) → jianlai. They share one physical screen: NEVER call chrome and jianlai in parallel; after switching tools, re-observe before acting (chrome navigation/act retires the jianlai snapshot; a jianlai act that touched Chrome requires a fresh chrome inspect).".into());
+    if desktop {
+        lines.push(r#"jianlai act arguments={"operation":"act","snapshotId":"<latest returned snapshotId>","actions":[{"action":"type","text":"<text>"},{"action":"press","key":"Enter"}]}. Each item uses the key action (not type). Actions: click/double_click/move(x,y), drag(x,y,toX,toY), scroll(x,y,delta), type(text), press(key), wait(ms:0–2000); text/key are not action names. If focused:false, call activate(windowId) and use its fresh snapshotId before constructing a long input batch. Consult the selected tool schema when unsure rather than probe with invalid calls or regenerate the full payload."#.into());
+        lines.push(r#"chrome arguments={"operation":"act","tabTag":"<tabs[].tag or the tabTag returned by open>","snapshotId":"<latest returned snapshotId>","actions":[{"action":"click","frame":0,"ref":"<ref at the start of an elements line, copied verbatim>"}]}. The target field is tabTag, never tabId/browserId; one tabs call with query binds it and returns the inspect. DOM actions need frame plus a ref copied verbatim from the latest inspect; coordinate actions are click_at/move/drag/scroll_at with x/y plus the top-level imageId. Never mix chrome shapes into jianlai (no frame/ref/tabTag there) or jianlai shapes into chrome (no toX/toY/press-with-text there)."#.into());
+        lines.push("Desktop routing: 剑来 means the jianlai desktop mouse/keyboard/screenshot tool, not a shell command. When the user requests 剑来/jianlai, start with ONE call mcp_call_tool {\"server_name\":\"nova-tools\",\"tool_name\":\"jianlai\",\"arguments\":{\"operation\":\"windows\",\"observe\":true}} (add \"query\":\"<app or title>\" or \"windowId\" to bind the target) — it returns the window list AND the target screenshot, verify the observed target is in the foreground before act; a background target must first be switched with {\"operation\":\"activate\",\"windowId\":<id>} (returns a fresh screenshot). Execute the longest sequence determined by the current observation in one act (up to 16), ending at the first information boundary. Put navigation, dropdown opening or a focus/layout transition last when the next action depends on its result. Use returned feedback directly: if it matches expectations, continue with its fresh snapshotId without redundant inspect/screenshot or replanning. On partial failure, check completedActions and the fresh observation; never replay completed actions. Chrome forms use consecutive fill actions in one batch; jianlai can batch a confirmed field click, select-all and whole-text input. An information boundary means the next step lacks necessary evidence, not every click. Do not pad batches or use waits to guess unseen content. Experience search/save/feedback are optional: use them only for unfamiliar paths, blockers or reusable new knowledge, never as mandatory per-task round trips. Verify the visible outcome when the task finishes. Use jianlai only for what truly needs the GUI: view local images/files with the file read tool, get processes, files, system info or anything a command returns with shell, and Chrome page content with chrome. While operating a GUI, never use shell, COM, PowerShell, P/Invoke, UIAutomation or scripts to activate/control apps. Switch background windows with jianlai activate(windowId); only if activate is refused, inspect the desktop and click a visible taskbar icon or use Win+Tab; do not blindly cycle windows. If the endpoint is missing, report the MCP error rather than silently switching methods. Use chrome for browser operations in the user's Chrome. Division of labor: web page content inside a Chrome tab → chrome (DOM refs; tabs with query binds a tabTag and returns the inspect in one call; open/goto/select_tab wait for load and return the inspect; act waits for navigation before feeding back). Other apps and Chrome's native dialogs (file picker, print, system prompts) → jianlai. They share one physical screen: NEVER call chrome and jianlai in parallel; after switching tools, re-observe before acting (chrome navigation/act retires the jianlai snapshot; a jianlai act that touched Chrome requires a fresh chrome inspect).".into());
     }
     if read_only {
         lines.push("Current mode is plan/read-only: analyze only; do not modify files.".into());
@@ -5538,7 +6129,7 @@ fn nova_tools_prompt_guidance(polaris: bool, read_only: bool) -> String {
 }
 
 fn direct_desktop_guidance() -> &'static str {
-    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、webview（侧栏浏览器）、chrome（用户Chrome）。用户指定剑来时，直接调用工具列表中来自 nova-tools 的 jianlai，第一步用 operation=windows 加 observe=true（可带 query/windowId 绑定目标）一次拿到窗口列表和目标截图，核对目标处于前台后 act；后台窗口先用 operation=activate 加 windowId 切到前台（直接返回新图）。连续执行原则：用当前观察确定最长连续动作段，合批执行到第一个需要新信息的节点（每批最多16个）。下一步的目标、输入或分支依赖新页面、下拉候选、弹窗、焦点或布局变化时，把触发变化的动作放在批末，看返回的观察再决策。反馈符合预期就用新的snapshotId继续，不额外inspect/screenshot或重述计划；达到16个动作上限也按此方式继续。校验失败或needs_review时先核对completedActions和新观察，不重放已执行步骤。信息屏障指下一步缺少必要信息，不是每次点击都停；不凑满批次，不用wait代替观察新内容。经验检索/保存/反馈按需使用，仅用于陌生路径、受阻或新增可复用经验，不作为每个任务的必经往返。任务结束用可见结果验证。Chrome 表单用多个 fill 合批；剑来可合批已确认输入框的点击、全选和整段输入。整个桌面任务仅用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation或脚本激活窗口。activate 被系统拒绝时才截桌面点可见任务栏图标或Win+Tab，不要盲目循环切换。分工：Chrome 标签页内的网页内容用 chrome（tabs 带 query 可一次绑定并返回 inspect；open/goto/select_tab 会等待加载并直接返回 inspect），其它应用和 Chrome 原生对话框用 jianlai；两者共用一块屏幕，绝不并行调用，换工具后先重新观察。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
+    "Nova MCP 提供 jianlai（剑来：桌面鼠标、键盘、截图）、chrome（用户Chrome）。用户指定剑来时，直接调用工具列表中来自 nova-tools 的 jianlai，第一步用 operation=windows 加 observe=true（可带 query/windowId 绑定目标）一次拿到窗口列表和目标截图，核对目标处于前台后 act；后台窗口先用 operation=activate 加 windowId 切到前台（直接返回新图）。连续执行原则：用当前观察确定最长连续动作段，合批执行到第一个需要新信息的节点（每批最多16个）。下一步的目标、输入或分支依赖新页面、下拉候选、弹窗、焦点或布局变化时，把触发变化的动作放在批末，看返回的观察再决策。反馈符合预期就用新的snapshotId继续，不额外inspect/screenshot或重述计划；达到16个动作上限也按此方式继续。校验失败或needs_review时先核对completedActions和新观察，不重放已执行步骤。信息屏障指下一步缺少必要信息，不是每次点击都停；不凑满批次，不用wait代替观察新内容。经验检索/保存/反馈按需使用，仅用于陌生路径、受阻或新增可复用经验，不作为每个任务的必经往返。任务结束用可见结果验证。Chrome 表单用多个 fill 合批；剑来可合批已确认输入框的点击、全选和整段输入。剑来只用于必须操作图形界面的部分：本地图片/文件直接读文件，进程、文件、系统信息等命令能拿到的用shell，Chrome网页内容用chrome；操作界面时禁止用shell、COM、PowerShell、P/Invoke、UIAutomation或脚本激活/控制窗口。activate 被系统拒绝时才截桌面点可见任务栏图标或Win+Tab，不要盲目循环切换。分工：Chrome 标签页内的网页内容用 chrome（tabs 带 query 可一次绑定并返回 inspect；open/goto/select_tab 会等待加载并直接返回 inspect），其它应用和 Chrome 原生对话框用 jianlai；两者共用一块屏幕，绝不并行调用，换工具后先重新观察。以实际工具名及schema为准，不套用 Devin 的 mcp_call_tool 包装；工具不可用时明确报告。"
 }
 
 #[cfg(test)]
@@ -5547,17 +6138,25 @@ mod desktop_prompt_tests {
     fn devin_discovers_desktop_tools_without_polaris() {
         assert!(super::direct_desktop_guidance().contains("直接调用"));
         assert!(super::direct_desktop_guidance().contains("jianlai"));
+        assert!(!super::direct_desktop_guidance().contains("webview"));
         let source = include_str!("acp.rs").replace("\r\n", "\n");
-        assert!(source.contains("if self.kind == AgentKind::Devin {\n                guidance.push(nova_tools_prompt_guidance"));
+        assert!(source.contains("guidance.push(nova_tools_prompt_guidance(context_tools, read_only, desktop));"));
         for polaris in [true, false] {
-            let prompt = super::nova_tools_prompt_guidance(polaris, false);
-            for tool in ["jianlai", "chrome", "webview"] {
+            let prompt = super::nova_tools_prompt_guidance(polaris, false, true);
+            assert!(!prompt.contains("webview"));
+            for tool in ["jianlai", "chrome"] {
                 assert!(prompt.contains(tool));
-                assert!(!super::nova_tools_prompt_guidance(polaris, true).contains(tool));
+                assert!(!super::nova_tools_prompt_guidance(polaris, true, true).contains(tool));
+                // 自动模式未暴露桌面工具时，提示词不得再宣传它们（否则模型会退回 shell 而不转交）。
+                assert!(!super::nova_tools_prompt_guidance(polaris, false, false).contains(tool));
             }
             assert!(prompt.contains("剑来"));
             assert!(prompt.contains(r#""tool_name":"jianlai""#));
             assert!(prompt.contains(r#""operation":"windows""#));
+            for contract in [r#""action":"type""#, r#""action":"press""#, "key action (not type)", "text/key are not action names", "If focused:false, call activate(windowId)", "fresh snapshotId before constructing a long input batch",
+                "The target field is tabTag, never tabId/browserId", r#""ref":"<ref at the start of an elements line, copied verbatim>""#, "Never mix chrome shapes into jianlai"] {
+                assert!(prompt.contains(contract), "missing Devin action contract: {contract}");
+            }
         }
     }
 }
@@ -5786,7 +6385,7 @@ fn set_tool_duration(call: &mut ToolCall, duration_ms: u64) {
 
 fn complete_pending_tools_on_update(thread: &mut Thread, except_tool_call_id: Option<&str>) -> Vec<Item> {
     // 并行消息/工具开始不代表其它工具已结束；CodeBuddy 会上报终态。
-    if matches!(thread.agent_kind, AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus) {
+    if thread.agent_kind.is_codebuddy() {
         return Vec::new();
     }
     complete_pending_tools(thread, except_tool_call_id)
@@ -5899,14 +6498,17 @@ mod acp_prewarm_tests {
         }
         let first = entry("A", true, true);
         let slot = StdMutex::new(Some(first.clone()));
-        assert!(AcpPrewarm::take(&slot, "B", true).await.is_none());
-        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+        // 自动模式 Devin 必须冷启动以注册场景工具；不能消耗普通会话的预热连接。
+        assert!(AcpPrewarm::take(&slot, "A", true, true).await.is_none());
+        assert!(Arc::ptr_eq(slot.lock().unwrap().as_ref().unwrap(), &first));
+        assert!(AcpPrewarm::take(&slot, "B", true, false).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false, false).await.is_none());
         assert!(slot.lock().unwrap().is_some());
-        assert!(AcpPrewarm::take(&slot, "A", true).await.is_some());
-        assert!(AcpPrewarm::take(&slot, "A", true).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", true, false).await.is_some());
+        assert!(AcpPrewarm::take(&slot, "A", true, false).await.is_none());
 
         *slot.lock().unwrap() = Some(entry("A", false, false));
-        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false, false).await.is_none());
         assert!(slot.lock().unwrap().is_none());
 
         // 在飞预热晚于旧的 250ms 阈值才就绪，仍要等待并认领原连接，不能丢弃后冷启动。
@@ -5915,7 +6517,7 @@ mod acp_prewarm_tests {
         let expected = held.as_ref().unwrap().clone();
         *slot.lock().unwrap() = Some(pending.clone());
         let (claimed, ()) = tokio::join!(
-            AcpPrewarm::take(&slot, "A", false),
+            AcpPrewarm::take(&slot, "A", false, false),
             async {
                 sleep(Duration::from_millis(350)).await;
                 drop(held);
@@ -5930,7 +6532,7 @@ mod acp_prewarm_tests {
         *slot.lock().unwrap() = Some(pending.clone());
         let next = entry("B", false, true);
         let (claimed, ()) = tokio::join!(
-            AcpPrewarm::take(&slot, "A", false),
+            AcpPrewarm::take(&slot, "A", false, false),
             async {
                 sleep(Duration::from_millis(10)).await;
                 *slot.lock().unwrap() = Some(next.clone());
@@ -5939,13 +6541,13 @@ mod acp_prewarm_tests {
         );
         assert!(claimed.is_none());
         assert!(Arc::ptr_eq(slot.lock().unwrap().as_ref().unwrap(), &next));
-        assert!(AcpPrewarm::take(&slot, "B", false).await.is_some());
+        assert!(AcpPrewarm::take(&slot, "B", false, false).await.is_some());
 
         // 预热失败时释放等待并允许调用方回退，不返回空槽或死亡连接。
         let failed = entry("A", false, true);
         failed.conn.lock().await.take();
         *slot.lock().unwrap() = Some(failed);
-        assert!(AcpPrewarm::take(&slot, "A", false).await.is_none());
+        assert!(AcpPrewarm::take(&slot, "A", false, false).await.is_none());
 
         // 槽替换/关闭即便撞上预热完成，最后一个条目引用释放时仍要杀掉未认领连接。
         let unused = entry("C", false, true);
@@ -5955,8 +6557,8 @@ mod acp_prewarm_tests {
 
         *slot.lock().unwrap() = Some(entry("D", false, true));
         let (a, b) = tokio::join!(
-            AcpPrewarm::take(&slot, "D", false),
-            AcpPrewarm::take(&slot, "D", false)
+            AcpPrewarm::take(&slot, "D", false, false),
+            AcpPrewarm::take(&slot, "D", false, false)
         );
         assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
     }

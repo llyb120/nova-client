@@ -22,17 +22,85 @@ pub struct SessionShortcut {
     pub id: String,
     /// 规范化按键，如 Ctrl+1 / Alt+P。
     pub keys: String,
-    /// selectProject | selectModel | newSession | openUnread | insertText | selectWorkflow | hideToVirgo
+    /// selectProject | selectModel | newSession | openUnread | insertText | selectWorkflow
     pub action: String,
-    /// 项目绝对路径、`<agentKind>:<modelId>` / roam/quota 编码，或 insertText 文本；newSession 可为空。
+    /// 项目绝对路径、`<agentKind>:<modelId>` / roam 编码，或 insertText 文本；newSession 可为空。
     pub target: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct StageModelTarget {
+pub struct ModelTarget {
     pub agent_kind: String,
+    /// 空 = 该后端默认模型。
     pub model: String,
+}
+
+/// 预设场景：自动模式、Stage、Butterfly/Meteor/员工等入口按场景取模型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scene {
+    Lightweight,
+    Coding,
+    Computer,
+}
+
+impl Scene {
+    pub const ALL: [Scene; 3] = [Scene::Lightweight, Scene::Coding, Scene::Computer];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Scene::Lightweight => "lightweight",
+            Scene::Coding => "coding",
+            Scene::Computer => "computer",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Scene::Lightweight => "轻量化",
+            Scene::Coding => "编码",
+            Scene::Computer => "剑来",
+        }
+    }
+
+    /// 适用条件，给模型判断是否转交。
+    pub fn when(self) -> &'static str {
+        match self {
+            Scene::Lightweight => "简单问答、整理总结、标题摘要等轻量事务",
+            Scene::Coding => "需要写代码、改仓库、调试或运行构建测试",
+            Scene::Computer => "需要操作桌面应用或浏览器（截图、点击、输入）",
+        }
+    }
+
+    /// 接受 key 或中文名。
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        Self::ALL.into_iter().find(|s| s.key().eq_ignore_ascii_case(value) || s.label() == value || (s == &Scene::Computer && value == "电脑操控"))
+    }
+}
+
+/// 每个场景一个有序模型列表：按顺序取第一个可用的，失效时切换下一个。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SceneModels {
+    pub lightweight: Vec<ModelTarget>,
+    pub coding: Vec<ModelTarget>,
+    pub computer: Vec<ModelTarget>,
+}
+
+impl SceneModels {
+    pub fn get(&self, scene: Scene) -> &[ModelTarget] {
+        match scene {
+            Scene::Lightweight => &self.lightweight,
+            Scene::Coding => &self.coding,
+            Scene::Computer => &self.computer,
+        }
+    }
+
+    /// 先决条件：三个场景都至少配置一个模型。
+    pub fn ready(&self) -> bool {
+        Scene::ALL.into_iter().all(|scene| !self.get(scene).is_empty())
+    }
 }
 
 /// 上下文检索模式：none = 不注入工具，fast = 旧 FastContext，super = 无索引单遍 SuperContext。
@@ -64,9 +132,6 @@ fn default_powershell_utf8() -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    pub jev_enabled: bool,
-    pub jev_api_key: String,
-    pub jev_api_url: String,
     /// Kimi Code CLI，使用固定的 `acp` 子命令。
     pub kimi_path: String,
     /// Claude Code 的 ACP adapter（不是 claude CLI 本身）。
@@ -88,6 +153,9 @@ pub struct Settings {
     pub codebuddy_args: String,
     /// CodeBuddy 代理地址
     pub codebuddy_proxy: String,
+    /// WorkBuddy 安装目录或内置 CodeBuddy CLI；空 = 自动发现，不回退到普通 CodeBuddy。
+    pub workbuddy_path: String,
+    pub workbuddy_proxy: String,
     /// 兼容旧配置；Cursor 后端已改为仅使用官方 SDK，不再依赖本机 CLI
     pub cursor_path: String,
     /// 旧版 Cursor ACP 启动参数，仅用于兼容已有设置。
@@ -126,14 +194,8 @@ pub struct Settings {
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
     pub default_mode: String,
-    /// 标题、快速总结、摘要和上下文压缩等辅助任务使用的轻量级模型后端。
-    #[serde(alias = "titleModelAgent")]
-    pub lightweight_model_agent: String,
-    /// 轻量级模型 id；失败时辅助任务回退到发起任务的原模型。
-    #[serde(alias = "titleModel")]
-    pub lightweight_model: String,
-    /// /stage、/stage2 等命令依次使用的模型；/stage 默认取第一项。
-    pub stage_models: Vec<StageModelTarget>,
+    /// 场景模型：轻量化（标题/摘要/Stage/Butterfly/Meteor/员工）、编码、剑来。
+    pub scene_models: SceneModels,
     /// 打开文件用的编辑器命令（cursor / code / zed / windsurf 等，依赖 PATH）
     pub editor: String,
     pub terminal_shell: String,
@@ -151,12 +213,20 @@ pub struct Settings {
     pub relay_groups: String,
     /// 是否允许 server 端远程查看和控制本机会话；默认关闭。
     pub remote_control_enabled: bool,
-    /// 允许同团队成员借用的模型，键格式为 `<agentKind>:<modelId>`；空 = 不共享额度。
-    pub quota_shared_models: Vec<String>,
     /// 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>`。
     pub model_favorites: Vec<String>,
     /// 会话快捷键：按键一键切换项目或模型。
     pub session_shortcuts: Vec<SessionShortcut>,
+    /// Meteor 屏幕标注入口；开发实例运行时正式版自动让出触发权。
+    pub meteor_enabled: bool,
+    /// Alt+Alt 表示连续两次纯 Alt；其它值为全局组合键。
+    pub meteor_shortcut: String,
+    /// Meteor 提交时附加触发时的最近剪贴板（文字/图片/文件路径）；默认关闭。
+    pub meteor_clipboard: bool,
+    /// Meteor 星移（StartShift）的全局组合键；空值关闭。
+    pub meteor_paste_shortcut: String,
+    /// 剑谱录制开关的全局组合键；空值关闭。
+    pub jianpu_shortcut: String,
     /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
     /// 已存在的该后端历史会话仍可打开查看）
     pub devin_enabled: bool,
@@ -169,6 +239,7 @@ pub struct Settings {
     pub codexplus_enabled: bool,
     pub codebuddy_enabled: bool,
     pub codebuddyplus_enabled: bool,
+    pub workbuddy_enabled: bool,
     pub cursor_enabled: bool,
     /// 各后端接入方式：app-server / sdk / acp。Codex 固定使用 app-server。
     pub codex_integration: String,
@@ -183,9 +254,7 @@ pub struct Settings {
     pub session_auto_cleanup_enabled: bool,
     /// 自动清理会话的保留时长（小时）。
     pub session_auto_cleanup_hours: u32,
-    /// 禅意模式（室女座）：运行中的会话只在侧栏「室女座」中显示，结束后自动回到普通模式。
-    pub zen_mode_enabled: bool,
-    /// 在室女座旁显示操作知识图谱，默认关闭。
+    /// 在侧栏显示操作知识图谱入口，默认关闭。
     pub knowledge_graph_enabled: bool,
     /// 上下文检索：none / fast。旧配置中的 super 会在加载时迁移为 fast。
     pub context_retrieval_mode: ContextRetrievalMode,
@@ -199,9 +268,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            jev_enabled: false,
-            jev_api_key: String::new(),
-            jev_api_url: String::new(),
             kimi_path: "kimi".into(),
             claude_path: "claude-agent-acp".into(),
             claude_proxy: String::new(),
@@ -214,6 +280,8 @@ impl Default for Settings {
             codebuddy_path: "codebuddy".into(),
             codebuddy_args: "--acp".into(),
             codebuddy_proxy: String::new(),
+            workbuddy_path: String::new(),
+            workbuddy_proxy: String::new(),
             cursor_path: "cursor-agent".into(),
             cursor_args: "acp".into(),
             cursor_proxy: String::new(),
@@ -231,9 +299,7 @@ impl Default for Settings {
             ponytail_enabled: true,
             checkpoint_enabled: false,
             default_mode: String::new(),
-            lightweight_model_agent: "lyra".into(),
-            lightweight_model: String::new(),
-            stage_models: Vec::new(),
+            scene_models: SceneModels::default(),
             editor: "code".into(),
             terminal_shell: String::new(),
             terminal_args: Vec::new(),
@@ -243,9 +309,13 @@ impl Default for Settings {
             relay_token: String::new(),
             relay_groups: String::new(),
             remote_control_enabled: false,
-            quota_shared_models: Vec::new(),
             model_favorites: Vec::new(),
             session_shortcuts: Vec::new(),
+            meteor_enabled: true,
+            meteor_shortcut: "Alt+Alt".into(),
+            meteor_clipboard: false,
+            meteor_paste_shortcut: "Alt+V".into(),
+            jianpu_shortcut: "Alt+R".into(),
             devin_enabled: false,
             vega_enabled: false,
             lyra_enabled: true,
@@ -253,6 +323,7 @@ impl Default for Settings {
             codexplus_enabled: false,
             codebuddy_enabled: false,
             codebuddyplus_enabled: false,
+            workbuddy_enabled: false,
             cursor_enabled: false,
             codex_integration: "app-server".into(),
             codebuddy_integration: "acp".into(),
@@ -261,7 +332,6 @@ impl Default for Settings {
             update_channel: "release".into(),
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,
-            zen_mode_enabled: false,
             knowledge_graph_enabled: false,
             context_retrieval_mode: ContextRetrievalMode::Fast,
             custom_env_vars: std::collections::HashMap::new(),
@@ -271,7 +341,7 @@ impl Default for Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionShortcut, Settings, StageModelTarget};
+    use super::{ModelTarget, Scene, SessionShortcut, Settings};
     use std::fs;
 
     #[test]
@@ -287,6 +357,12 @@ mod tests {
     #[test]
     fn windows_shell_shim_is_disabled_by_default() {
         assert!(!Settings::default().windows_shell_shim_enabled);
+    }
+
+    #[test]
+    fn removed_taskbar_status_toggle_still_loads() {
+        // Butterfly is always on; old configs carrying the toggle must still parse.
+        assert!(serde_json::from_str::<Settings>(r#"{"taskbarStatusEnabled":false}"#).is_ok());
     }
 
     #[test]
@@ -320,12 +396,22 @@ mod tests {
     }
 
     #[test]
-    fn legacy_title_model_migrates_to_lightweight_model() {
-        let settings: Settings =
-            serde_json::from_str(r#"{"titleModelAgent":"codex","titleModel":"gpt-5-mini"}"#)
-                .unwrap();
-        assert_eq!(settings.lightweight_model_agent, "codex");
-        assert_eq!(settings.lightweight_model, "gpt-5-mini");
+    fn legacy_lightweight_model_migrates_to_scene() {
+        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.json"), r#"{"titleModelAgent":"alkaid","titleModel":"p/m","stageModels":[{"agentKind":"codex","model":"x"}]}"#).unwrap();
+        let settings = Settings::load(&dir);
+        assert_eq!(settings.scene_models.lightweight, vec![ModelTarget { agent_kind: "lyra".into(), model: "p/m".into() }]);
+        assert!(settings.scene_models.coding.is_empty() && !settings.scene_models.ready());
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert!(saved.get("stageModels").is_none() && saved.get("lightweightModel").is_none());
+        // 已有场景配置时不再被旧字段覆盖。
+        fs::write(dir.join("settings.json"), r#"{"lightweightModelAgent":"codex","sceneModels":{"lightweight":[{"agentKind":"lyra","model":""}]}}"#).unwrap();
+        assert_eq!(Settings::load(&dir).scene_models.lightweight[0].agent_kind, "lyra");
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(Scene::parse("剑来"), Some(Scene::Computer));
+        assert_eq!(Scene::parse("电脑操控"), Some(Scene::Computer));
+        assert_eq!(Scene::parse("coding"), Some(Scene::Coding));
     }
 
     #[test]
@@ -398,6 +484,23 @@ mod tests {
     }
 
     #[test]
+    fn meteor_defaults_and_configuration_round_trip() {
+        for settings in [Settings::default(), serde_json::from_str::<Settings>(r#"{}"#).unwrap()] {
+            assert!(settings.meteor_enabled);
+            assert_eq!(settings.meteor_shortcut, "Alt+Alt");
+            assert!(!settings.meteor_clipboard);
+            assert_eq!(settings.meteor_paste_shortcut, "Alt+V");
+        }
+        let settings: Settings = serde_json::from_str(
+            r#"{"meteorEnabled":false,"meteorShortcut":"Ctrl+Alt+M","meteorAgentKind":"codex","meteorModel":"gpt-5.6","meteorClipboard":true}"#,
+        ).unwrap();
+        assert!(settings.meteor_clipboard);
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["meteorEnabled"], false);
+        assert_eq!(saved["meteorShortcut"], "Ctrl+Alt+M");
+    }
+
+    #[test]
     fn session_shortcuts_round_trip() {
         let settings: Settings = serde_json::from_str(
             r#"{"sessionShortcuts":[{"id":"a","keys":"Ctrl+1","action":"selectModel","target":"codex:gpt-5.6"}]}"#,
@@ -443,12 +546,10 @@ mod tests {
         let mut settings = Settings::default();
         settings.vega_enabled = true;
         settings.lyra_enabled = false;
-        settings.lightweight_model_agent = "alkaid".into();
-        settings.stage_models.push(StageModelTarget {
+        settings.scene_models.coding.push(ModelTarget {
             agent_kind: "alkaid".into(),
             model: "p/m".into(),
         });
-        settings.quota_shared_models = vec!["alkaid:p/m".into()];
         settings.model_favorites = vec!["alkaid:p/m".into()];
         settings.session_shortcuts.push(SessionShortcut {
             id: "1".into(),
@@ -459,9 +560,7 @@ mod tests {
         settings.migrate_legacy_vega();
         assert!(settings.lyra_enabled);
         assert!(!settings.vega_enabled);
-        assert_eq!(settings.lightweight_model_agent, "lyra");
-        assert_eq!(settings.stage_models[0].agent_kind, "lyra");
-        assert_eq!(settings.quota_shared_models[0], "lyra:p/m");
+        assert_eq!(settings.scene_models.coding[0].agent_kind, "lyra");
         assert_eq!(settings.model_favorites[0], "lyra:p/m");
         assert_eq!(settings.session_shortcuts[0].target, "lyra:p/m");
     }
@@ -489,26 +588,6 @@ mod tests {
         assert_eq!(
             Settings::load(&dir).model_favorites,
             settings.model_favorites
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn quota_shared_models_survive_reload_for_all_backends() {
-        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
-        let mut settings = Settings::default();
-        settings.quota_shared_models = vec![
-            "lyra:provider/model".into(),
-            "devin:swe-1.6".into(),
-            "codex:gpt-5.6".into(),
-            "codebuddy:claude-sonnet".into(),
-            "cursor:cursor-small".into(),
-        ];
-        settings.save(&dir);
-
-        assert_eq!(
-            Settings::load(&dir).quota_shared_models,
-            settings.quota_shared_models
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -568,7 +647,7 @@ mod tests {
     }
 }
 
-/// `<agentKind>:<modelId>` / roam/quota 编码键中，值为 alkaid 的段改写为 lyra；其余不变。
+/// `<agentKind>:<modelId>` / roam 编码键中，值为 alkaid 的段改写为 lyra；其余不变。
 fn migrate_alkaid_key(key: &mut String) {
     if key.split(':').any(|seg| seg == "alkaid") {
         *key = key
@@ -596,15 +675,12 @@ impl Settings {
             self.lyra_enabled = true;
             self.vega_enabled = false;
         }
-        if self.lightweight_model_agent.trim() == "alkaid" {
-            self.lightweight_model_agent = "lyra".into();
-        }
-        for target in &mut self.stage_models {
+        let scenes = &mut self.scene_models;
+        for target in scenes.lightweight.iter_mut().chain(&mut scenes.coding).chain(&mut scenes.computer) {
             if target.agent_kind.trim() == "alkaid" {
                 target.agent_kind = "lyra".into();
             }
         }
-        migrate_alkaid_keys(&mut self.quota_shared_models);
         migrate_alkaid_keys(&mut self.model_favorites);
         for shortcut in &mut self.session_shortcuts {
             migrate_alkaid_target(&mut shortcut.target);
@@ -636,6 +712,16 @@ impl Settings {
                 == Some(false)
         {
             settings.context_retrieval_mode = ContextRetrievalMode::None;
+        }
+        // 旧版单独的轻量级模型迁移为轻量化场景的第一项；Stage/Butterfly/Meteor 模型配置已移除。
+        if settings.scene_models.lightweight.is_empty() {
+            let legacy = |keys: [&str; 2]| raw_value.as_ref().and_then(|value| {
+                keys.iter().find_map(|key| value.get(*key).and_then(serde_json::Value::as_str)).map(str::to_string)
+            });
+            if let Some(agent_kind) = legacy(["lightweightModelAgent", "titleModelAgent"]).filter(|kind| !kind.trim().is_empty()) {
+                let model = legacy(["lightweightModel", "titleModel"]).unwrap_or_default();
+                settings.scene_models.lightweight.push(ModelTarget { agent_kind, model });
+            }
         }
         if settings.update_channel != "pre-release" {
             settings.update_channel = "release".into();

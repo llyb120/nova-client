@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { transformSync } from "esbuild";
 import { createEffect, createMemo, createRoot, createSignal } from "solid-js/dist/solid.js";
 import { createStore, reconcile } from "solid-js/store/dist/store.js";
-import { virgoChains } from "../src/virgoChains.ts";
+import { taskChains } from "../src/taskChains.ts";
 
 const store = readFileSync(new URL("../src/store.ts", import.meta.url), "utf8");
 const sidebar = readFileSync(new URL("../src/components/Sidebar.tsx", import.meta.url), "utf8");
@@ -44,6 +44,14 @@ test("文件面板开关跨会话保持，重新挂载恢复全局偏好", () =>
     assert.equal(loadLayout().workspaceLayout.widthRatio, null);
     assert.equal(loadLayout().workspaceLayout.minimap, true);
   } finally { panel.dispose(); }
+});
+
+test("空闲子 Agent 重新打开时校准快照，显示后台追加的排队和关闭记录", () => {
+  const condition = store.match(/if \((cached && switching[^\n]+)\) \{/)[1];
+  const skipRefresh = new Function("cached", "switching", "staleThreadSnapshots", "id", `return ${condition};`);
+  assert.equal(skipRefresh({ subagent: true }, true, new Set(), "agent"), false);
+  assert.equal(skipRefresh({ subagent: false }, true, new Set(), "ordinary"), true);
+  assert.equal(skipRefresh({}, true, new Set(["ordinary"]), "ordinary"), false);
 });
 
 test("缓存切换跳过加载帧并取消流式节流，首次加载仍允许先绘制提示", () => {
@@ -124,21 +132,21 @@ test("多 stage 同链反复切换复用导航列表，新增阶段后更新，�
   });
 });
 
-test("队列镜像移除旧 key，清空或挂起后整条链退出室女座", () => {
+test("队列镜像移除旧 key，清空或挂起后整条链结束", () => {
   const [state, setState] = createStore({ promptQueued: {} });
   const source = store.slice(store.indexOf("export function setPromptQueuedThreads("), store.indexOf("const historyLoads ="));
   const update = new Function("state", "setState", "reconcile", `${js(source.replace("export ", ""))}; return setPromptQueuedThreads;`)(state, setState, reconcile);
   update(new Set(["child"]));
-  const hidden = () => virgoChains({
+  const active = () => taskChains({
     threads: [{ id: "root" }, { id: "child", parentThreadId: "root" }],
     isRunning: () => false, advancingRoots: [], unfinishedRoots: [],
     queuedThreads: Object.keys(state.promptQueued),
-  }).hidden;
-  assert.equal(hidden().size, 2);
+  }).active;
+  assert.equal(active().size, 2);
   update(new Set(["other"]));
   assert.deepEqual(Object.keys(state.promptQueued), ["other"]);
   update(new Set());
-  assert.equal(hidden().size, 0);
+  assert.equal(active().size, 0);
   assert.deepEqual(Object.keys(state.promptQueued), []);
 });
 

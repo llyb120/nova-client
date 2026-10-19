@@ -11,7 +11,7 @@ pub(super) struct Config {
 }
 
 fn tool() -> Value {
-    json!({"name":"polaris","description":"需要跨文件查找、分析修改位置或读取多个文件时先调用：按 keywords/task/files 打包完整代码单元、依赖和 IMPACT 调用方。已展示范围视为已读，只补 coverage gaps / next_reads，不重复搜索相同关键词。返回 CTX MISS 时按 next 提示修正符号或传 files 重试。",
+    json!({"name":"polaris","description":"需要跨文件查找、分析修改位置或读取多个文件时先调用：按 keywords/task/files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析；仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。仅实际展示的行段视为已读，不重复搜索相同关键词。返回 CTX MISS 时按 next 提示修正符号或传 files 重试。",
         "inputSchema":{"type":"object","properties":{
             "keywords":{"anyOf":[{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},{"type":"string","minLength":1}],"description":"关键词或符号名，最多取前 5 项"},
             "query":{"type":"string","minLength":1,"description":"简短检索词"},
@@ -19,6 +19,7 @@ fn tool() -> Value {
             "files":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},
             "maxChars":{"type":"integer","minimum":4000,"maximum":80000},
             "budget":{"type":"integer","minimum":100,"maximum":4000},
+            "deep":{"type":"boolean","description":"默认 false，仅返回快速概览；确需递归依赖、别名调用及伴生测试时才开启（较慢）"},
             "coupling":{"type":"boolean"}
         },"anyOf":[{"required":["keywords"]},{"required":["query"]},{"required":["task"]},{"required":["files"]}],"additionalProperties":false}})
 }
@@ -28,7 +29,6 @@ fn available_tools() -> Vec<Value> {
     if std::env::var("NOVA_FAST_CONTEXT").as_deref() != Ok("0") { tools.push(tool()); }
     if std::env::var("NOVA_TOOLS_READ_ONLY").as_deref() != Ok("1") {
         tools.extend(crate::image_generation::tool_definitions());
-        tools.push(crate::native_browser::tool_definition());
         tools.push(crate::chrome_browser::tool_definition());
         tools.push(crate::jianlai::tool_definition());
         tools.push(crate::employee::tool_definition());
@@ -145,8 +145,10 @@ mod desktop_tests {
         assert_eq!(result["content"].as_array().unwrap().len(), 17);
         assert!(result["content"][0]["text"].as_str().unwrap().contains("not_executed"));
         assert_eq!(result["content"][1]["type"], "image");
+        let tools = super::available_tools();
+        assert!(!tools.iter().any(|t| t["name"] == "webview"));
         if std::env::var("NOVA_TOOLS_READ_ONLY").as_deref() != Ok("1") {
-            assert!(super::available_tools().iter().any(|t| t["name"] == "jianlai"));
+            for name in ["jianlai", "chrome"] { assert!(tools.iter().any(|t| t["name"] == name)); }
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -166,14 +168,14 @@ async fn tool_result(name: &str, result: Result<Value, String>) -> Value {
     };
     let text = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
     let mut content = vec![json!({"type":"text","text":text})];
-    if matches!(name, "webview" | "chrome" | "jianlai") {
+    if matches!(name, "chrome" | "jianlai") {
         use base64::Engine;
         if let Some(images) = value["images"].as_array() {
             // Paths originate from the authenticated native service, not the caller or page text.
             for image in images.iter().take(if name == "jianlai" { 16 } else { 4 }) {
                 if let Some(path) = image["path"].as_str() {
                     match tokio::fs::read(path).await {
-                        Ok(data) => content.push(json!({"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(data)})),
+                        Ok(data) => content.push(json!({"type":"image","mimeType":crate::lyra::prompt::image_media_type(path).unwrap_or("image/png"),"data":base64::engine::general_purpose::STANDARD.encode(data)})),
                         Err(_) => content.push(json!({"type":"text","text":format!("图片加载失败，可读取截图文件：{path}")})),
                     }
                 }
@@ -268,15 +270,15 @@ pub(crate) fn maybe_run() -> bool {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn webview_screenshot_is_an_image_block_and_keeps_action_status() {
+    async fn chrome_screenshot_is_an_image_block_and_keeps_action_status() {
         let path = std::env::temp_dir().join(format!("nova-mcp-{}.png", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"image-bytes").unwrap();
-        let result = tool_result("webview", Ok(json!({"status":"executed","images":[{"path":path}]}))).await;
+        let result = tool_result("chrome", Ok(json!({"status":"executed","images":[{"path":path}]}))).await;
         std::fs::remove_file(&path).unwrap();
         assert_eq!(result["content"][1]["type"], "image");
         assert_eq!(result["content"][1]["data"], "aW1hZ2UtYnl0ZXM=");
         assert_eq!(serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap()["status"], "executed");
-        assert_eq!(tool_result("webview", Err("stopped".into())).await["isError"], true);
+        assert_eq!(tool_result("chrome", Err("stopped".into())).await["isError"], true);
     }
     #[tokio::test]
     async fn native_mcp_forwards_image_arguments_and_result() {

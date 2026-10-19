@@ -32,7 +32,7 @@ test("setup-image requires models and discovers compatible image models before r
 test("image commands are available to every backend and keep credentials out of generation instructions", () => {
   const prompts = exportsOf(read("../src/builtinPrompts.ts"));
   const suggestions = exportsOf(read("../src/components/slashSuggestions.ts"), { "../utils": { agentLabel: (id) => id } });
-  for (const backend of ["lyra", "codex", "devin", "codebuddy", "cursor", "kimi"]) {
+  for (const backend of ["lyra", "codex", "devin", "codebuddy", "cursor", "kimi", "claude"]) {
     const commands = suggestions.getSlashSuggestions(backend, [], "image").map((v) => v.title);
     assert.ok(commands.includes("/setup-image"));
     assert.ok(commands.includes("/generate-image"));
@@ -112,7 +112,7 @@ test("new-thread send failures restore the draft, stop running and show the actu
     const done = new Promise((resolve) => { finished = resolve; });
     const noop = () => {};
     const deps = {
-      state, PENDING_THREAD_PREFIX: "pending-", zenModeOn: () => false, zenDropPrompt: noop,
+      state, PENDING_THREAD_PREFIX: "pending-",
       reconcile: (v) => v, bumpChatScrollToBottom: noop,
       setState: (...args) => {
         if (typeof args[0] === "object") Object.assign(state, args[0]);

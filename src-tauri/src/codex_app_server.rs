@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(120);
-const POLARIS_GUIDANCE: &str = "Nova provides the polaris tool through MCP server nova-tools. Call its exposed MCP tool directly, using the name in the tool schema; do not use Devin's mcp_call_tool wrapper. When edit locations are unknown or you need to read two or more unread files, call polaris first with the user's symbols, keywords or file paths. It returns complete code units, dependencies and coverage gaps. Do not re-read covered ranges or rediscover the same keywords with shell searches; read only gaps / next_reads by exact path and line. Keep searches bounded and honor .gitignore. Use Codex's built-in file and shell tools for edits and verification.";
+const POLARIS_GUIDANCE: &str = "Nova provides the polaris tool through MCP server nova-tools. Call its exposed MCP tool directly, using the name in the tool schema; do not use Devin's mcp_call_tool wrapper. When edit locations are unknown or you need to read two or more unread files, call polaris first with the user's symbols, keywords or file paths. It defaults to a fast overview: 1–2 core hit lines plus necessary signatures/locations, without recursive dependency indexing, alias-call tracing, body-driven follow-up searches or Git history analysis. Set deep=true only when those deeper relationships are needed (slower). Only actual shown lines count as read; use exact path and line for necessary body reads, without rediscovering the same keywords with shell searches. Keep searches bounded and honor .gitignore. Use Codex's built-in file and shell tools for edits and verification.";
 
 pub struct Options {
     pub ponytail: bool,
@@ -58,6 +58,10 @@ fn thread_options(request: &Value, options: &Options) -> Value {
     if let Some(mcp) = mcp.as_mut() {
         mcp["env"]["NOVA_TOOLS_CWD"] = request["cwd"].clone();
         mcp["env"]["NOVA_TOOLS_READ_ONLY"] = json!(if read_only { "1" } else { "0" });
+        // 自动模式：线程 id / 场景 / 是否可按场景转交，供 nova-tools 暴露场景转交工具。
+        if let Some(env) = request["novaToolEnv"].as_object() {
+            for (name, value) in env { mcp["env"][name] = value.clone(); }
+        }
         if mcp["env"]["NOVA_FAST_CONTEXT"] != "0" { guidance.push(POLARIS_GUIDANCE); }
     }
     if !title {

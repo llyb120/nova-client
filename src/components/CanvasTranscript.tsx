@@ -15,12 +15,13 @@ import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { visibleGroupRange, groupAtY } from "../transcriptViewport";
 import { LruMap } from "../lruMap";
+import { promptDisplayOf } from "../promptDisplay";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import { resolveExpandScroll, resolveScrollAfterLayout, resolveUserScrollStick } from "../scrollStick";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
 import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail, toolDisplayText } from "../utils";
 import { createFileContextMenu } from "./FileContextMenu";
-import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
+import { createImageAttachments, ImageAttachmentStrip, takeWarmImage } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
 import { fmtDuration, fmtTokens, turnAvgTokensPerSec, turnTokenTitle } from "./TurnGroup";
 
@@ -42,6 +43,7 @@ interface CanvasTranscriptProps {
   groups: Group[];
   permissions: PermissionRequest[];
   running: boolean;
+  readOnly?: boolean;
   loading: boolean;
   emptyHint: string;
   preview: boolean;
@@ -1152,6 +1154,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let layoutGeneration = 0;
   let renderedThreadId = props.threadId;
   let waitingForInitialSnapshot = props.loading && props.groups.length === 0;
+  // 暖切换等待布局（含图片解码）时，所有重绘入口都保留旧帧，不仅是切换 effect。
+  let holdingFrame = false;
 
   // selection state
   let selection: Selection | null = null;
@@ -1188,8 +1192,20 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
   // images cache
   const imgCache = new Map<string, HTMLImageElement>();
+  const IMAGE_CACHE_KEEP = 48;
+  let imageRebuildTimer: number | undefined;
   const paintedImageSources = new Set<string>();
   const imageSizes = new Map<string, Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">>();
+  // 失败/超时是本次会话展示的终态，不再等待或让迟到的解码结果顶掉占位布局。
+  const brokenImages = new Set<string>();
+  // 发送后图片 src 会由 data URL 换成文件 URI；新图加载完成前沿用同一张图的旧元素/尺寸，避免闪烁和跳动。
+  type ImgSize = Pick<HTMLImageElement, "naturalWidth" | "naturalHeight">;
+  const shownImages = new Map<string, { el?: HTMLImageElement; size?: ImgSize }>();
+  const imageKey = (img: PromptImage) => `${img.name}|${img.mimeType}|${img.size ?? ""}`;
+  // 布局级双缓冲：图片全部解码或失败后才提交，不能按短延时强行落占位再补图。
+  // ponytail: 最多等待 10s，超时图片本次按失败处理；需支持更慢的远程图时可加显式重试。
+  const IMAGE_LOAD_TIMEOUT_MS = 10_000;
+  let imageDeferTimer: number | undefined;
   const toolTextLayouts = new LruMap<string, { lines: string[]; seps: string[] }>(32);
 
   // ─── Layout ────────────────────────────────────────────────────────────────
@@ -1272,6 +1288,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const result: Block[] = [];
     const nextGroupYs: number[] = [];
     let y = 24;
+    let pendingImages = false;
     let chunkStartedAt = performance.now();
     // DOM adjacent vertical margins collapse; canvas must emulate or user bubbles
     // stack 20+16 gaps and look full of blank space between short prompts.
@@ -1289,6 +1306,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         color: p.faint, fontSize: 13, font: p.sans, selectable: !props.loading });
       y += 60;
       if (generation !== layoutGeneration) return false;
+      if (imageDeferTimer !== undefined) window.clearTimeout(imageDeferTimer);
+      imageDeferTimer = undefined;
       groupYs = nextGroupYs;
       blocks = result;
       totalHeight = y + 16;
@@ -1346,16 +1365,29 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
         if (item.id !== editing()?.id) {
           const maxBubble = contentW * 0.85;
           const foldKey = `user-text-${item.id}`;
-          const longText = item.text.length > 4000;
+          // 系统改写过的提示词默认只显示用户原始输入，展开后显示实际发送的完整内容。
+          const itemText = item.text;
+          const typedText = promptDisplayOf(itemText);
+          const sysKey = `user-sys-${item.id}`;
+          const sysOpen = !!state.expanded[sysKey];
+          const sourceText = typedText !== undefined && !sysOpen ? typedText : itemText;
+          const longText = sourceText.length > 4000;
           const open = !!state.expanded[foldKey];
-          const sourceText = item.text;
           // 先显示有界预览；不能为了首屏等待数十万字的隐藏内容排版。
           const text = longText && !open
             ? sourceText.slice(0, 1000).replace(/[\uD800-\uDBFF]$/, "") + "…"
             : sourceText;
           // DOM .bubble-images: flex-wrap, img max 240×180, gap 6, margin-bottom 6
           const { layouts: imageLayouts, usedW: imgUsedW, stackH: imgH, imgMaxW } =
-            layoutBubbleImages(item.images, maxBubble - 32, img => imageSizes.get(promptImageSrc(img)) ?? null);
+            layoutBubbleImages(item.images, maxBubble - 32, img => {
+              const src = promptImageSrc(img);
+              const key = imageKey(img);
+              // 输入框已预解码的附件同步命中，刚发送的消息无需等待即可提交。
+              if (!imageSizes.has(src) && !shownImages.get(key)?.size && !loadImageSource(src)) pendingImages ||= !brokenImages.has(src);
+              const size = imageSizes.get(src);
+              if (size) shownImages.set(key, { ...shownImages.get(key), size });
+              return size ?? shownImages.get(key)?.size ?? null;
+            });
           // Size to content like DOM (no artificial min-width that leaves empty bubble space).
           const lh = 14 * 1.6;
           let textLayout = userTextLayouts.get(item);
@@ -1363,7 +1395,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             textLayout = { text, width: maxBubble, viewWidth: W, font: p.sans, threadId,
               // 流式重排共享进行中的排版，不能每个 delta 都取消重来。
               layout: wrapUserText(text, maxBubble - 34, p.sans,
-                () => disposed || props.threadId !== threadId || viewW !== W || item.text !== sourceText || pal.sans !== p.sans || !!state.expanded[foldKey] !== open) };
+                () => disposed || props.threadId !== threadId || viewW !== W || item.text !== itemText || pal.sans !== p.sans || !!state.expanded[foldKey] !== open || !!state.expanded[sysKey] !== sysOpen) };
             userTextLayouts.set(item, textLayout);
           }
           const full = await textLayout.layout;
@@ -1391,9 +1423,21 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
             _lineWidths: full.widths,
             data: { images: item.images, editItem: item, imageLayouts, imgMaxW } });
 
+          let belowH = 0;
+          if (typedText !== undefined) {
+            const sysLabel = sysOpen ? "收起系统修改内容" : "该提示词经过系统修改，展开查看完整内容";
+            // 文字 + chevron + 左右内边距；短气泡时右对齐，避免提示超出内容区右缘。
+            const sysW = measure(sysLabel, 13, p.sans) + 34;
+            result.push({ kind: "fold", id: item.id, groupIdx: gi,
+              x: Math.max(side, Math.min(bx, side + contentW - sysW)), y: y + bubbleH + 4, w: sysW, h: 28,
+              text: sysLabel, color: p.dim, fontSize: 13, font: p.sans, cursor: "pointer",
+              hoverBg: p.hover, borderRadius: 6, data: { open: sysOpen, foldKey: sysKey, userText: true },
+              clickAction: () => toggleExpanded(sysKey, !sysOpen) });
+            belowH += 32;
+          }
           if (longText) {
             const toggle: Block = { kind: "fold", id: item.id, groupIdx: gi,
-              x: bx, y: y + bubbleH + 4, w: Math.max(1, bubbleW - 32), h: 28,
+              x: bx, y: y + bubbleH + 4 + belowH, w: Math.max(1, bubbleW - 32), h: 28,
               text: open ? "收起长提示词" : `展开完整提示词（${fmtTokens(sourceText.length)} 字符）`,
               color: p.dim, fontSize: 13, font: p.sans, cursor: "pointer",
               hoverBg: p.hover, borderRadius: 6, data: { open, foldKey, userText: true },
@@ -1405,7 +1449,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
               } };
             result.push(toggle);
             result.push({ kind: "code-copy-btn", id: item.id, groupIdx: gi,
-              x: bx + bubbleW - 24, y: y + bubbleH + 6, w: 24, h: 24, hoverKey: `user-${item.id}`,
+              x: bx + bubbleW - 24, y: y + bubbleH + 6 + belowH, w: 24, h: 24, hoverKey: `user-${item.id}`,
               data: { alwaysVisible: true },
               cursor: "pointer", title: "复制完整提示词", hoverBg: p.hover, borderRadius: 6,
               clickAction: () => {
@@ -1419,7 +1463,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
           // .user-edit-btn: padding 5px, margin 0 2px 4px 0, align-self flex-end
           // 世界线预览是静态快照，即使当前主线仍在运行，也应允许从历史消息编辑并分叉。
           // 使用父组件传入的有效 running 状态，避免直接读取主线状态把预览中的编辑入口隐藏。
-          if (!props.running) {
+          if (!props.running && !props.readOnly) {
             result.push({ kind: "resend-btn", id: item.id, groupIdx: gi,
               x: bx - 52, y: y + bubbleH - 26 - 4, w: 24, h: 24,
               hoverBg: p.hover, borderRadius: 6, cursor: "pointer",
@@ -1436,7 +1480,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
                 setEditing(item);
               } });
           }
-          y += bubbleH + (longText ? 36 : 0);
+          if (longText) belowH += 32;
+          y += bubbleH + (belowH ? belowH + 4 : 0);
           setBottom(16); // bottom margin
         } else {
           editLayoutY = y;
@@ -1562,6 +1607,32 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
 
     flushBottom();
     if (disposed || generation !== layoutGeneration || props.threadId !== threadId) return false;
+    // 切会话时前台是加载提示（暖切换则是旧会话像素），同样要等图片解码完再整帧提交，
+    // 否则先落占位再弹出图片，表现为进入会话闪一下。生成图尺寸固定，但未解码时会先画“加载中”文字。
+    for (const b of result) {
+      if (b.kind !== "generated-image") continue;
+      const src = String(b.data?.src ?? "");
+      if (loadImageSource(src)) continue;
+      pendingImages ||= !brokenImages.has(src);
+    }
+    if (pendingImages) {
+      if (imageDeferTimer === undefined) {
+        imageDeferTimer = window.setTimeout(() => {
+          imageDeferTimer = undefined;
+          if (disposed) return;
+          for (const [src, image] of imgCache) {
+            if ((image as unknown as { _loaded?: boolean })._loaded) continue;
+            brokenImages.add(src);
+            image.onload = image.onerror = null;
+            image.src = "";
+          }
+          scheduleRebuild(false, true);
+        }, IMAGE_LOAD_TIMEOUT_MS);
+      }
+      return false;
+    }
+    if (imageDeferTimer !== undefined) window.clearTimeout(imageDeferTimer);
+    imageDeferTimer = undefined;
     groupYs = nextGroupYs;
     // 虚拟窗口前移后 block 下标变化，选区按组内位置迁移，不能误复制另一轮的文字。
     const remapBlock = (index: number) => {
@@ -2031,15 +2102,25 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.fillText(text, snap(x), snap(y));
   }
 
-  function paintAll() {
+  function paintAll(committed = false) {
     const canvas = canvasEl;
-    if (!canvas || disposed) return;
+    if (!canvas || disposed || holdingFrame) return;
     // 所有滚动入口（滚轮、滚动条、时间线、钉底）都经过这里；按需唤醒屏外组。
     if (groupYs.length) {
       const first = groupAtY(groupYs, scrollY);
       const last = groupAtY(groupYs, scrollY + viewH);
-      if (first < laidOutStart || last >= laidOutEnd) scheduleRebuild(false, true);
+      if (first < laidOutStart || last >= laidOutEnd) {
+        scheduleRebuild(false, true);
+        // 目标视口还没排版（如上翻浏览时发送、钉底跳到末尾）：保留旧像素等新布局提交，
+        // 否则先画一帧空白再重新渲染。布局提交时的绘制不受此限，避免互等。
+        if (!committed) return;
+      }
     }
+    // 修改位图尺寸会立即清屏，必须与可提交布局的绘制放在同一帧。
+    const pixelW = Math.max(1, Math.round(viewW * dpr));
+    const pixelH = Math.max(1, Math.round(viewH * dpr));
+    if (canvas.width !== pixelW) canvas.width = pixelW;
+    if (canvas.height !== pixelH) canvas.height = pixelH;
     // 前景保持透明，只清空并重绘正文；星图背景由下层 canvas 保留，不再随滚动反复拷贝。
     const ctx = canvas.getContext("2d")!;
     const p = pal;
@@ -2196,7 +2277,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
 
     // 离开视口的原图释放解码内存；保留轻量尺寸，回来时不会重新变成占位布局。
+    // 超过上限才按 LRU 淘汰：略微滚出视口又滚回时不必重新解码（否则每次都会闪空白）。
     for (const [source, image] of imgCache) {
+      if (imgCache.size <= IMAGE_CACHE_KEEP) break;
       if (paintedImageSources.has(source)) continue;
       image.onload = null;
       image.src = "";
@@ -2221,7 +2304,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   function paintBusyIndicators() {
     busyTimer = undefined;
     const canvas = canvasEl;
-    if (!canvas || busyBlockIndices.length === 0) return;
+    if (!canvas || disposed || holdingFrame || busyBlockIndices.length === 0) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -3553,21 +3636,51 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   // ─── Image loading ─────────────────────────────────────────────────────────
 
   function loadImage(img: PromptImage): HTMLImageElement | null {
-    return loadImageSource(promptImageSrc(img));
+    const el = loadImageSource(promptImageSrc(img));
+    const key = imageKey(img);
+    const shown = shownImages.get(key);
+    if (el) { if (shown?.el !== el) shownImages.set(key, { ...shown, el }); return el; }
+    return shown?.el ?? null;
   }
 
   function loadImageSource(src: string): HTMLImageElement | null {
     paintedImageSources.add(src);
+    if (brokenImages.has(src)) return null;
     let el = imgCache.get(src);
-    if (el) return (el as unknown as { _loaded?: boolean })._loaded ? el : null;
-    el = new Image();
-    (el as unknown as { _loaded?: boolean })._loaded = false;
-    el.onload = () => {
-      if (disposed || imgCache.get(src) !== el) return;
+    if (el) {
+      // 刷新 LRU 顺序：Map 迭代按插入序，近期画过的图排在末尾。
+      imgCache.delete(src);
+      imgCache.set(src, el);
+      return (el as unknown as { _loaded?: boolean })._loaded ? el : null;
+    }
+    el = takeWarmImage(src);
+    if (el) {
       (el as unknown as { _loaded?: boolean })._loaded = true;
       imageSizes.set(src, { naturalWidth: el.naturalWidth, naturalHeight: el.naturalHeight });
-      scheduleRebuild();
+      imgCache.set(src, el);
+      return el;
+    }
+    el = new Image();
+    (el as unknown as { _loaded?: boolean })._loaded = false;
+    const image = el;
+    const ready = (loaded: boolean) => {
+      if (disposed || imgCache.get(src) !== image || brokenImages.has(src)) return;
+      const prev = imageSizes.get(src);
+      if (loaded) {
+        (image as unknown as { _loaded?: boolean })._loaded = true;
+        imageSizes.set(src, { naturalWidth: image.naturalWidth, naturalHeight: image.naturalHeight });
+      } else {
+        brokenImages.add(src);
+      }
+      // 尺寸不变也可能有布局正在等解码；成功和失败都要唤醒它，而不是只重绘旧帧。
+      if (loaded && imageDeferTimer === undefined && prev?.naturalWidth === image.naturalWidth && prev.naturalHeight === image.naturalHeight) requestPaint();
+      else if (imageRebuildTimer === undefined) {
+        imageRebuildTimer = window.setTimeout(() => { imageRebuildTimer = undefined; if (!disposed) scheduleRebuild(); }, 60);
+      }
     };
+    // 先解码再入画：解码拒绝与加载失败同样处理，不能把损坏图片交给 drawImage。
+    image.onload = () => { image.decode().then(() => ready(true), () => ready(false)); };
+    image.onerror = () => ready(false);
     el.src = src;
     imgCache.set(src, el);
     return null;
@@ -3591,8 +3704,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     layoutPending = false;
     try {
       const oldScroll = scrollY;
-      if (!await computeLayout(generation)) return;
-      // 被后续重排取代的异步任务不能消费点击锚点；只由真正提交的布局使用。
+      if (!await computeLayout(generation) || disposed || generation !== layoutGeneration) return;
+      // 被后续重排取代的异步任务不能消费点击锚点或释放旧帧；只由真正提交的布局使用。
       const lock = scrollLock;
       scrollLock = null;
       // blocks are replaced during layout; an index from the previous block array may now
@@ -3628,7 +3741,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       }
       applyEditStyle();
       props.onScroll?.(scrollY, maxScroll, false);
-      paintAll();
+      holdingFrame = false;
+      paintAll(true);
       // 仅在切换后有实际内容时收尾；缓存未命中会先空布局一帧，不能误清零起点。
       if (props.groups.length > 0) traceThreadSwitchLayoutDone(props.threadId, props.groups.length);
     } finally {
@@ -3700,10 +3814,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     if (w === viewW && h === viewH && dpr === devicePixelRatio) return;
     dpr = devicePixelRatio || 1;
     viewW = w; viewH = h;
-    const pixelW = Math.max(1, Math.round(w * dpr));
-    const pixelH = Math.max(1, Math.round(h * dpr));
-    canvasEl.width = pixelW;
-    canvasEl.height = pixelH;
     maxScroll = Math.max(0, totalHeight - viewH);
     if (keepBottom) scrollY = maxScroll;
     paintAll();
@@ -3805,6 +3915,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       if (wheelRaf) { cancelAnimationFrame(wheelRaf); wheelRaf = 0; wheelDelta = 0; }
       if (rebuildRaf) cancelAnimationFrame(rebuildRaf);
       if (rebuildTimer !== undefined) window.clearTimeout(rebuildTimer);
+      if (imageRebuildTimer !== undefined) window.clearTimeout(imageRebuildTimer);
+      if (imageDeferTimer !== undefined) window.clearTimeout(imageDeferTimer);
       if (busyTimer !== undefined) window.clearTimeout(busyTimer);
       canvasEl.removeEventListener("mousemove", onMouseMove);
       canvasEl.removeEventListener("mouseleave", onMouseLeave);
@@ -3843,6 +3955,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
     void props.permissions;
     void props.running;
+    void props.readOnly;
     void props.loading;
     void props.preview;
     void props.emptyHint;
@@ -3855,6 +3968,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const loadedInitialSnapshot = waitingForInitialSnapshot && groups.length > 0;
     if (loadedInitialSnapshot) waitingForInitialSnapshot = false;
     if (switchedThread) {
+      holdingFrame = warmSwitch;
       renderedThreadId = threadId;
       layoutGeneration++;
       scrollLock = null;
@@ -3870,6 +3984,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       groupYs = [];
       imgCache.clear();
       imageSizes.clear();
+      shownImages.clear();
+      brokenImages.clear();
+      if (imageRebuildTimer !== undefined) window.clearTimeout(imageRebuildTimer);
+      if (imageDeferTimer !== undefined) window.clearTimeout(imageDeferTimer);
+      imageRebuildTimer = imageDeferTimer = undefined;
       laidOutStart = laidOutEnd = 0;
       jumpGroup = null;
       keepBottom = true;
@@ -3912,7 +4031,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const item = editing();
     const text = draft().trim();
     const images = editAttachments.images();
-    if (!item || (!text && !images.length)) return;
+    if (props.readOnly || !item || (!text && !images.length)) return;
     clearEditing();
     void editUserMessage(item.id, text, images);
   };

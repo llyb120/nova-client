@@ -140,11 +140,14 @@ fn dispatch(
         ));
     }
     let mut params = request.params;
-    if request.method == "webview" {
-        return tauri::async_runtime::block_on(crate::native_browser::execute(root, &params));
-    }
     if request.method == "jianlai" {
         return tauri::async_runtime::block_on(crate::jianlai::execute(root, &params, &request.owner));
+    }
+    if request.method == "agent" {
+        let app = crate::APP_HANDLE.get().ok_or("Nova 尚未就绪")?;
+        let thread_id = params["threadId"].as_str().filter(|id| !id.is_empty()).ok_or("缺少 threadId")?;
+        let name = params["name"].as_str().unwrap_or_default();
+        return tauri::async_runtime::block_on(crate::lyra::session::call_for_thread(app, thread_id, name, &params["args"]));
     }
     if request.method == "employee" {
         return crate::employee::execute_tool(&params);
@@ -430,6 +433,18 @@ mod tests {
         );
         assert!(response.ok);
         assert_eq!(response.result.unwrap()["runtime"], "rust");
+    }
+
+    #[test]
+    fn rejects_removed_browser_tool() {
+        let root = tempfile::tempdir().unwrap();
+        let request = ContextRequest {
+            token: "secret".into(), method: "webview".into(),
+            root: root.path().to_string_lossy().into_owned(), owner: "test".into(),
+            params: serde_json::json!({"operation":"open","url":"https://example.com"}),
+        };
+        assert_eq!(dispatch(request, "secret", &CwdChanges::default()).unwrap_err(),
+            "unknown context service method: webview");
     }
 
     #[test]
