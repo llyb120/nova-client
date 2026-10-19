@@ -1,5 +1,4 @@
-// Standalone Node >=18: node --input-type=module -e <source> -- <CLI> [--native]
-// Runs WorkBuddy's bundled CLI as our own child; the WorkBuddy desktop app need not be running.
+// Node >=18 wrapper args: <CLI> [--native] [--print <restricted args>]
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -9,8 +8,10 @@ import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 
 const LIMIT = 4 * 1024 * 1024, INPUT_LIMIT = 32 * 1024 * 1024;
-// ponytail: WorkBuddy 5.7.x builds pin at-rest policy "fields"; follow the desktop if it changes.
+// ponytail: WorkBuddy 5.7.x pins "fields"; track desktop policy changes.
 const POLICY = 'fields';
+const native = process.argv[2] === '--native', cliArgs = process.argv.slice(native ? 3 : 2);
+const print = cliArgs[0] === '--print';
 const owner = `nova-${randomUUID()}`, password = randomBytes(32).toString('hex');
 const controllers = new Set(), pending = new Set();
 let endpoint, headers, worker, readyServer, starting, stopping = false, cleanup;
@@ -92,8 +93,7 @@ async function jsonBody(body) {
   return size ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : undefined;
 }
 
-// Rebuild the credential bootstrap the desktop hands its workers: WorkBuddy.exe run as plain
-// Node (no window, no login state) exposes the build key; the user key is unwrapped from keyblob.
+// Plain-Node WorkBuddy.exe exposes the build key; unwrap the user key from keyblob.
 function credentials(cli, root) {
   const exe = process.env.WORKBUDDY_EXE || join(dirname(cli), '../../../../WorkBuddy.exe');
   const payload = JSON.parse(execFileSync(exe, ['-e',
@@ -140,7 +140,7 @@ async function sendCredentials(path, message) {
       try {
         await once(socket, 'connect');
       } catch {
-        await new Promise(resolve => setTimeout(resolve, 50)); // The worker has not listened yet.
+        await new Promise(resolve => setTimeout(resolve, 50));
         continue;
       }
       socket.write(JSON.stringify(message) + '\n');
@@ -189,7 +189,7 @@ async function http(method, body, suffix = '', timeout) {
     }
     if (sse) {
       if (suffix || method === 'DELETE') throw Error('Unexpected event stream');
-      if (streaming) clearTimeout(timer); // No fixed deadline once a prompt is streaming.
+      if (streaming) clearTimeout(timer); // No deadline while streaming.
       await relay(response.body);
     } else {
       const message = await jsonBody(response.body);
@@ -203,8 +203,10 @@ async function http(method, body, suffix = '', timeout) {
 
 async function start() {
   startupDeadline = Date.now() + 45000;
-  const cli = process.argv[1], native = process.argv[2] === '--native';
-  if (!cli || (process.argv[2] && !native)) throw Error('Invalid CLI arguments');
+  const cli = process.argv[1];
+  if (!cli || (cliArgs.length && !print)) throw Error('Invalid CLI arguments');
+  // Strip Nova capabilities before credential bootstrap.
+  if (print) for (const key of Object.keys(process.env)) if (/^NOVA_/i.test(key)) delete process.env[key];
   const root = process.env.WORKBUDDY_CONFIG_DIR || join(homedir(), '.workbuddy');
   const bootstrap = credentials(cli, root);
   const token = randomBytes(32).toString('hex'), pipe = name => `\\\\.\\pipe\\nova-workbuddy-${name}-${randomUUID()}`;
@@ -212,7 +214,7 @@ async function start() {
   let reportReady, failReady;
   const port = new Promise((resolve, reject) => { reportReady = resolve; failReady = reject; });
   port.catch(() => {});
-  readyServer = createServer(socket => {
+  if (!print) readyServer = createServer(socket => {
     socket.on('error', () => {});
     void (async () => {
       for await (const line of lines(socket, 65536)) {
@@ -226,7 +228,7 @@ async function start() {
       socket.destroy();
     })().catch(() => socket.destroy());
   });
-  await new Promise((resolve, reject) => readyServer.once('error', reject).listen(readyPipe, resolve));
+  if (!print) await new Promise((resolve, reject) => readyServer.once('error', reject).listen(readyPipe, resolve));
   if (stopping) throw Error('Closing');
   const env = {
     ...process.env,
@@ -239,21 +241,22 @@ async function start() {
     CODEBUDDY_SIDECAR_READY_SOCKET: readyPipe, CODEBUDDY_SIDECAR_READY_TOKEN: token,
     CODEBUDDY_SIDECAR_READY_SESSION_ID: owner, CODEBUDDY_SIDECAR_CREDENTIAL_BOOTSTRAP_SOCKET: credentialPipe,
   };
-  // Desktop spill/inline config can be a bootstrap-only snapshot. It overrides
-  // cloud agents/models even after sync, so let this authenticated worker fetch its own policy.
+  // Discard stale desktop snapshots in favor of authenticated cloud policy.
   for (const key of Object.keys(env)) {
     if (/FORCE_LITE_WB/i.test(key) || /^ACC_PRODUCT_CONFIG(?:_PATH|_V[23])?$/i.test(key)) delete env[key];
   }
-  const args = ['--serve', '--port', '0', '--host', '127.0.0.1'];
-  // The CLI puts its own descendants in a kill-on-close job, so killing it cleans the tree.
+  if (print) delete env.CODEBUDDY_SIDECAR_READY_SOCKET;
+  const args = print ? cliArgs : ['--serve', '--port', '0', '--host', '127.0.0.1'];
+  // CLI's kill-on-close job cleans descendants.
   worker = spawn(native ? cli : process.execPath, native ? args : [cli, ...args],
-    { cwd: process.cwd(), env, stdio: 'ignore', windowsHide: true });
+    { cwd: process.cwd(), env, stdio: print ? 'inherit' : 'ignore', windowsHide: true });
   const lost = error => {
     failReady(error);
     if (!stopping) void shutdown('WorkBuddy worker exited', 1);
   };
-  worker.once('error', lost).once('exit', () => lost(Error('Worker exited')));
+  worker.once('error', lost).once('exit', code => print ? void shutdown(undefined, code ?? 1) : lost(Error('Worker exited')));
   await sendCredentials(credentialPipe, { version: 1, sessionId: owner, token, pid: worker.pid, bootstrap });
+  if (print) return; // Input EOF is completion, not cancellation.
   let timer;
   const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Ready timeout')), remaining()); });
   endpoint = `http://127.0.0.1:${await Promise.race([port, deadline]).finally(() => clearTimeout(timer))}/api/v1/acp`;
@@ -288,7 +291,7 @@ async function shutdown(reason, exitCode = 0) {
       worker.kill();
       await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 2000).unref())]);
     }
-    // Exiting while a pipe server is still closing can abort Node on Windows.
+    // Drain pipe close before exit (Windows).
     await new Promise(resolve => readyServer ? readyServer.close(() => resolve()) : resolve());
   })();
   return cleanup;
@@ -320,6 +323,10 @@ process.stdout.on('error', () => { void shutdown('stdout failed', 1); });
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => { void shutdown(); });
 if (process.platform !== 'win32') {
   void shutdown('only Windows is supported', 1);
+} else if (print) {
+  void start().catch(() => {
+    if (!stopping) void shutdown('print 启动失败，请检查 WorkBuddy 登录', 1);
+  });
 } else {
   void (async () => {
     try {
@@ -333,7 +340,7 @@ if (process.platform !== 'win32') {
           await shutdown();
           process.exit(process.exitCode || 0);
         }
-        void handle(message); // Permission responses must not wait behind an active prompt POST.
+        void handle(message); // Do not block permission replies.
       }
       await shutdown();
     } catch {

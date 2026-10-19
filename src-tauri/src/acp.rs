@@ -1,3 +1,6 @@
+mod assistant;
+mod claude_text;
+
 use crate::threads::{compact_tool_value, compact_tool_values};
 use crate::model_cache;
 use crate::nova_data_dir;
@@ -10,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 use tokio::time::{sleep, timeout, Duration};
@@ -3166,6 +3169,87 @@ impl AcpManager {
         ));
     }
 
+    /// Use native print where supported; otherwise create a private ACP session.
+    /// Never reuse a user's conversation or a title-generation connection.
+    pub(crate) async fn generate_text(&self, model: &str, prompt: String, images: &[Value], deadline: Duration) -> Result<String, String> {
+        let label = self.kind.label();
+        let cwd = std::env::temp_dir().join(format!("nova-assistant-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&cwd).map_err(|e| format!("创建无工具生成目录失败：{e}"))?;
+        let mut process = CodeBuddyPrintProcess { cwd, child: None, pid: None };
+        if matches!(self.kind, AgentKind::Kimi | AgentKind::Devin) {
+            let (program, proxy) = {
+                let state = self.app.state::<AppState>();
+                let settings = state.settings.lock().map_err(|e| e.to_string())?;
+                (if self.kind == AgentKind::Kimi { settings.kimi_path.clone() } else { settings.devin_path.clone() },
+                    self.proxy_of(&settings).to_owned())
+            };
+            return assistant::complete(&self.kind, &program, model, prompt, images, &process.cwd, &self.launch_env, &proxy, deadline).await;
+        }
+        let input = codebuddy_print_input(prompt, images).map_err(|e| e.replace("CodeBuddy", label))?;
+        // Files avoid cmd.exe corrupting JSON quotes. No user settings/credentials are read here.
+        std::fs::write(process.cwd.join("settings.json"), CODEBUDDY_PRINT_SETTINGS)
+            .and_then(|_| std::fs::write(process.cwd.join("mcp.json"), r#"{"mcpServers":{}}"#))
+            .map_err(|e| format!("写入无工具生成配置失败：{e}"))?;
+        let (mut command, proxy) = {
+            let state = self.app.state::<AppState>();
+            let settings = state.settings.lock().map_err(|e| e.to_string())?;
+            let args = codebuddy_print_args(model);
+            let command = match self.kind {
+                AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus =>
+                    codebuddy_command(&settings.codebuddy_path, &args.iter().map(String::as_str).collect::<Vec<_>>()).1,
+                AgentKind::WorkBuddy => crate::workbuddy::print_command(&settings.workbuddy_path, &args)?,
+                AgentKind::Claude => claude_text::command(&settings.claude_path, model, &process.cwd)?,
+                _ => return Err(format!("{label} 未提供 print 入口")),
+            };
+            (command, self.proxy_of(&settings).to_owned())
+        };
+        command.current_dir(&process.cwd).envs(&self.launch_env);
+        if self.kind == AgentKind::Claude { command.env_remove("CLAUDECODE"); }
+        // Do not hand a restricted child Nova's privileged local-service credentials/capabilities.
+        for key in std::env::vars_os().map(|(key, _)| key)
+            .chain(self.launch_env.keys().map(std::ffi::OsString::from))
+        {
+            if key.to_string_lossy().to_ascii_uppercase().starts_with("NOVA_") {
+                command.env_remove(key);
+            }
+        }
+        command.env("DISABLE_AUTOUPDATER", "1").env("CODEBUDDY_DEFER_TOOL_LOADING", "0");
+        apply_proxy_env(&mut command, &proxy);
+        command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000);
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn().map_err(|e| format!("无法启动 {label} 无工具生成：{e}"))?;
+        assign_to_agent_job(&child);
+        process.pid = child.id();
+        process.child = Some(child);
+        let child = process.child.as_mut().unwrap();
+        let mut stdin = child.stdin.take().ok_or("助理生成 stdin 不可用")?;
+        let stdout = child.stdout.take().ok_or("助理生成 stdout 不可用")?;
+        let stderr = child.stderr.take().ok_or("助理生成 stderr 不可用")?;
+        let result = timeout(deadline, async {
+            tokio::try_join!(
+                async move {
+                    stdin.write_all(input.as_bytes()).await.map_err(|e| e.to_string())?;
+                    stdin.shutdown().await.map_err(|e| e.to_string())
+                },
+                codebuddy_print_read(stdout, 1024 * 1024),
+                codebuddy_print_read(stderr, 64 * 1024),
+                async { child.wait().await.map_err(|e| e.to_string()) },
+            )
+        }).await.map_err(|_| format!("{label} 无工具生成超时，已终止进程树，未重试"))?
+            .map_err(|e| e.replace("CodeBuddy", label))?;
+        // All pipes have closed and the process was reaped; never kill a potentially reused PID.
+        process.pid = None;
+        if !result.3.success() {
+            // stderr may contain credentials from a third-party CLI; never log/return it.
+            return Err(format!("{label} 无工具生成退出失败（{}）；请检查登录、模型及受限 CLI 参数支持", result.3));
+        }
+        codebuddy_print_result(&result.1).map_err(|e| e.replace("CodeBuddy", label))
+    }
+
     /// 在 Devin 实例上异步生成标题。model 非空时下发为标题会话模型，
     /// "" 表示使用会话默认模型。
     pub fn generate_title_async(
@@ -4781,6 +4865,104 @@ pub(crate) fn resolve_program_on_path(name: &str) -> Option<std::path::PathBuf> 
     })
 }
 
+// 2.164 accepts but ignores disableAllHooks. Isolation is --setting-sources none plus
+// these exclusively controlled CLI settings, NOT that unsupported switch.
+const CODEBUDDY_PRINT_SETTINGS: &str = r#"{"hooks":{},"enabledPlugins":{}}"#;
+
+fn codebuddy_print_args(model: &str) -> Vec<String> {
+    // `none`, not an empty setting-sources value: an empty value restores default scopes.
+    // --tools is the actual built-in-tool boundary; permission mode is only defense in depth.
+    let mut args: Vec<String> = [
+        "--print", "--verbose", "--tools", "", "--strict-mcp-config", "--mcp-config", "mcp.json",
+        "--setting-sources", "none", "--settings", "settings.json", "--permission-mode", "dontAsk",
+        "--no-session-persistence", "--max-turns", "1",
+        "--input-format", "stream-json", "--output-format", "stream-json",
+    ].into_iter().map(str::to_owned).collect();
+    if let (Some(model), _) = split_model_effort(Some(model.trim()).filter(|s| !s.is_empty())) {
+        args.extend(["--model".into(), model]);
+    }
+    args
+}
+
+fn codebuddy_print_input(prompt: String, images: &[Value]) -> Result<String, String> {
+    use base64::Engine;
+    const LIMIT: usize = 32 * 1024 * 1024;
+    let size = images.iter().try_fold(prompt.len(), |size, image| {
+        size.checked_add(image["data"].as_str().map_or(0, str::len))
+    }).ok_or("CodeBuddy 输入过大")?;
+    if size > LIMIT { return Err("CodeBuddy 输入超过 32 MiB".into()); }
+    let mut content = vec![json!({"type":"text", "text":prompt})];
+    for image in images {
+        let mime = image["mimeType"].as_str().unwrap_or_default();
+        let data = image["data"].as_str().filter(|s| !s.is_empty()).ok_or("图片缺少 base64 数据")?;
+        if image["type"] != "image" || !matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp") {
+            return Err("CodeBuddy 无工具生成仅接受内联 PNG/JPEG/GIF/WebP 图片".into());
+        }
+        base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| "图片 base64 数据无效")?;
+        content.push(json!({"type":"image", "source":{"type":"base64", "media_type":mime, "data":data}}));
+    }
+    let input = format!("{}\n", json!({"type":"user", "message":{"role":"user", "content":content}}));
+    if input.len() > LIMIT { return Err("CodeBuddy 编码后输入超过 32 MiB".into()); }
+    Ok(input)
+}
+
+async fn codebuddy_print_read(reader: impl tokio::io::AsyncRead + Unpin, limit: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes).await.map_err(|e| e.to_string())?;
+    if bytes.len() > limit { return Err("CodeBuddy 无工具生成输出超过上限，已终止进程树".into()); }
+    Ok(bytes)
+}
+
+fn codebuddy_print_result(bytes: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "CodeBuddy 返回了非 UTF-8 输出")?;
+    let mut output = None;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let event: Value = serde_json::from_str(line).map_err(|_| "CodeBuddy 返回了无效的 stream-json")?;
+        // CodeBuddy 2.164 init.tools lists the agent registry BEFORE session --tools filtering;
+        // it is not the effective tool set. Reject actual calls, not that informational catalog.
+        let content = event["message"]["content"].as_array();
+        let tool = |part: &Value| matches!(part["type"].as_str(), Some("tool_use" | "tool_call" | "tool_result"));
+        if matches!(event["type"].as_str(), Some("tool_call" | "tool_use" | "control_request"))
+            || content.is_some_and(|parts| parts.iter().any(tool))
+            || tool(&event["event"]["content_block"])
+            || matches!(event["message"]["stop_reason"].as_str(), Some("tool_use" | "max_tokens"))
+            || event["mcp_servers"].as_array().is_some_and(|servers| !servers.is_empty())
+        {
+            return Err("CodeBuddy 无工具生成出现未授权工具或不完整输出，已拒绝".into());
+        }
+        if event["type"] == "error" || event["is_error"] == true
+            || event.get("error").is_some_and(|error| !error.is_null())
+        {
+            return Err("CodeBuddy 无工具生成返回错误，未采用部分回复".into());
+        }
+        if event["type"] == "result" {
+            if event["subtype"] != "success" || output.is_some() {
+                return Err("CodeBuddy 无工具生成未正常完成".into());
+            }
+            output = event["result"].as_str().map(str::to_owned);
+            if output.as_ref().is_none_or(|s| s.trim().is_empty()) {
+                return Err("CodeBuddy 无工具生成返回空结果".into());
+            }
+        }
+    }
+    output.ok_or_else(|| "CodeBuddy 无工具生成缺少成功回执，未采用部分回复".into())
+}
+
+struct CodeBuddyPrintProcess {
+    cwd: PathBuf,
+    child: Option<Child>,
+    pid: Option<u32>,
+}
+
+impl Drop for CodeBuddyPrintProcess {
+    fn drop(&mut self) {
+        // Also runs when the caller cancels/drops the future, not just on timeout.
+        if let Some(pid) = self.pid.take() { kill_process_tree(pid); }
+        if let Some(child) = self.child.as_mut() { let _ = child.start_kill(); }
+        let _ = std::fs::remove_dir_all(&self.cwd);
+    }
+}
+
 /// Windows：构造 CodeBuddy 启动命令；参数逐项传递，避免 prewarm 的 cwd/env 含空格时
 /// 被通用 ACP 参数字符串的 split_whitespace 拆坏。
 #[cfg(windows)]
@@ -5183,6 +5365,54 @@ mod codebuddy_acp_tests {
             .split("fn permission_key(").next().unwrap();
         assert!(permissions.contains("self.kind == AgentKind::WorkBuddy"));
         assert!(permissions.contains("\"workbuddy-\".to_string()"));
+    }
+
+    #[test]
+    fn codebuddy_print_is_tool_free_and_preserves_model_images_and_errors() {
+        let args = super::codebuddy_print_args("vision-model:high");
+        for pair in [
+            ["--tools", ""], ["--mcp-config", "mcp.json"], ["--setting-sources", "none"],
+            ["--settings", "settings.json"], ["--permission-mode", "dontAsk"],
+            ["--input-format", "stream-json"], ["--output-format", "stream-json"],
+            ["--model", "vision-model"], ["--max-turns", "1"],
+        ] {
+            assert!(args.windows(2).any(|window| window == pair), "missing {pair:?}");
+        }
+        for flag in ["--print", "--verbose", "--strict-mcp-config", "--no-session-persistence"] {
+            assert!(args.iter().any(|arg| arg == flag));
+        }
+        assert!(!super::codebuddy_print_args("").iter().any(|arg| arg == "--model"));
+        let settings: serde_json::Value = serde_json::from_str(super::CODEBUDDY_PRINT_SETTINGS).unwrap();
+        assert!(settings.get("disableAllHooks").is_none());
+        assert_eq!(settings["hooks"], json!({}));
+        assert_eq!(settings["enabledPlugins"], json!({}));
+        let images = [json!({"type":"image", "mimeType":"image/png", "data":"aW1hZ2U="})];
+        let input = super::codebuddy_print_input("用户提示\n第二行".into(), &images).unwrap();
+        assert_eq!(input.lines().count(), 1);
+        let input: serde_json::Value = serde_json::from_str(&input).unwrap();
+        assert_eq!(input["type"], "user");
+        assert_eq!(input["message"]["role"], "user");
+        assert_eq!(input["message"]["content"][0]["text"], "用户提示\n第二行");
+        assert_eq!(input["message"]["content"][1], json!({"type":"image", "source":{
+            "type":"base64", "media_type":"image/png", "data":"aW1hZ2U="
+        }}));
+        assert!(super::codebuddy_print_input("x".into(), &[json!({"type":"image","mimeType":"image/png","data":"!"})]).is_err());
+        let success = json!({"type":"result", "subtype":"success", "is_error":false, "result":"完整回复"});
+        assert_eq!(super::codebuddy_print_result(success.to_string().as_bytes()).unwrap(), "完整回复");
+        let init = json!({"type":"system", "subtype":"init", "tools":["Read"], "mcp_servers":[]});
+        assert_eq!(super::codebuddy_print_result(format!("{init}\n{success}\n").as_bytes()).unwrap(), "完整回复");
+        for event in [
+            json!({"type":"result", "subtype":"success", "is_error":true, "result":"partial"}),
+            json!({"type":"result", "subtype":"error_max_turns", "result":"partial"}),
+            json!({"type":"assistant", "message":{"content":[{"type":"text","text":"partial"}]}}),
+            json!({"type":"error", "error":"failed"}),
+        ] { assert!(super::codebuddy_print_result(event.to_string().as_bytes()).is_err()); }
+        for event in [
+            json!({"type":"assistant", "message":{"content":[{"type":"tool_use","name":"Read"}]}}),
+            json!({"type":"system", "subtype":"init", "mcp_servers":[{"name":"external"}]}),
+        ] {
+            assert!(super::codebuddy_print_result(format!("{event}\n{success}\n").as_bytes()).is_err());
+        }
     }
 
     #[test]

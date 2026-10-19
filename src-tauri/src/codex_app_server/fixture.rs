@@ -42,6 +42,14 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(30));
             }
             "{}"
+        } else if line.contains("\"hooks/list\"") {
+            if scenario == "no-hook" {
+                r#"{"data":[{"errors":[],"hooks":[]}]}"#
+            } else {
+                r#"{"data":[{"errors":[],"hooks":[{"eventName":"preToolUse","handlerType":"command","enabled":true,"source":"sessionFlags","key":"guard","currentHash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","trustStatus":"untrusted","command":"echo Nova complete_text forbids all tools >&2; exit 2"}]}]}"#
+            }
+        } else if line.contains("\"config/read\"") {
+            r#"{"config":{"mcp_servers":{"user-tools":{"command":"test"}}}}"#
         } else if line.contains("\"thread/start\"") || line.contains("\"thread/resume\"") {
             r#"{"thread":{"id":"thread-1"}}"#
         } else if line.contains("\"thread/read\"") {
@@ -87,6 +95,8 @@ fn main() {
                     r#"{{"id":3,"method":"item/commandExecution/requestApproval","params":{{"reason":"test approval"}}}}"#
                 ),
                 "failed" => complete("failed"),
+                "interrupted" => complete("interrupted"),
+                "stall" => (),
                 _ => complete("completed"), // deliberately precedes turn/start response
             }
             r#"{"turn":{"id":"turn-1"}}"#

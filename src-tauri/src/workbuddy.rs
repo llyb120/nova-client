@@ -83,6 +83,17 @@ pub(crate) fn acp_command(configured: &str) -> Result<tokio::process::Command, S
     build_command(configured, true)
 }
 
+/// Use the caller's restricted CodeBuddy print args and controlled cwd/settings/MCP files.
+/// The caller also owns the output limits, request timeout and process-tree cleanup.
+pub(crate) fn print_command(configured: &str, args: &[String]) -> Result<tokio::process::Command, String> {
+    if args.first().is_none_or(|arg| arg != "--print") {
+        return Err("WorkBuddy 无工具生成必须显式传入 --print".into());
+    }
+    let mut command = build_command(configured, true)?;
+    command.args(args);
+    Ok(command)
+}
+
 fn build_command(configured: &str, managed: bool) -> Result<tokio::process::Command, String> {
     let configured = program(configured);
     if configured.is_empty() {
@@ -207,6 +218,37 @@ mod tests {
         let args: Vec<_> = command.as_std().get_args().collect();
         assert_eq!(args, vec![std::ffi::OsStr::new("--input-type=module"), std::ffi::OsStr::new("-e"),
             std::ffi::OsStr::new(bridge), std::ffi::OsStr::new("--"), cli.as_os_str()]);
+    }
+
+    #[test]
+    fn workbuddy_print_reuses_the_bridge_and_preserves_restricted_args() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(if cfg!(windows) { "node.exe" } else { "node" }), []).unwrap();
+        let args: Vec<String> = ["--print", "--tools", "", "--strict-mcp-config", "--mcp-config", "mcp.json",
+            "--setting-sources", "none", "--settings", "settings.json", "--no-session-persistence",
+            "--model", "model with spaces"].into_iter().map(str::to_owned).collect();
+        for name in ["cli.mjs", "cli.exe"] {
+            let cli = dir.path().join(name);
+            std::fs::write(&cli, []).unwrap();
+            let configured = cli.to_str().unwrap();
+            let command = print_command(configured, &args).unwrap();
+            let actual: Vec<_> = command.as_std().get_args().collect();
+            assert_eq!(actual[2], std::ffi::OsStr::new(include_str!("../../scripts/workbuddy-acp.mjs")));
+            assert_eq!(actual[4], cli.as_os_str());
+            let offset = if name == "cli.exe" {
+                assert_eq!(actual[5], "--native");
+                6
+            } else { 5 };
+            assert_eq!(&actual[offset..], args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>());
+            let env: std::collections::HashMap<_, _> = command.as_std().get_envs().collect();
+            let root = config_dir().unwrap();
+            for key in ["CODEBUDDY_CONFIG_DIR", "WORKBUDDY_CONFIG_DIR"] {
+                assert_eq!(env.get(std::ffi::OsStr::new(key)), Some(&Some(root.as_os_str())));
+            }
+            assert!(print_command(configured, &[]).is_err());
+            assert!(print_command(configured, &["--model".into(), "--print".into()]).is_err());
+        }
+        assert!(print_command(dir.path().join("missing-cli").to_str().unwrap(), &args).is_err());
     }
 
     #[test]

@@ -49,8 +49,68 @@ pub(super) fn rtk_guidance() -> String {
     )
 }
 
+// Defense in depth after removing native executors. Codex hooks fail open on
+// execution errors; the completion notification guard also aborts on such errors.
+const DENY_TOOLS: &str = "echo Nova complete_text forbids all tools >&2; exit 2";
+// Fixed UTF-16LE script emits native permissionDecision=deny JSON with exit 0.
+// An outer pwsh -Command translates an external exit 2 into 1 (fail-open), so
+// Windows must use structured denial instead. No caller/model text is interpolated.
+const DENY_TOOLS_WINDOWS: &str = "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand WwBDAG8AbgBzAG8AbABlAF0AOgA6AE8AdQB0AC4AVwByAGkAdABlACgAJwB7ACIAaABvAG8AawBTAHAAZQBjAGkAZgBpAGMATwB1AHQAcAB1AHQAIgA6AHsAIgBoAG8AbwBrAEUAdgBlAG4AdABOAGEAbQBlACIAOgAiAFAAcgBlAFQAbwBvAGwAVQBzAGUAIgAsACIAcABlAHIAbQBpAHMAcwBpAG8AbgBEAGUAYwBpAHMAaQBvAG4AIgA6ACIAZABlAG4AeQAiACwAIgBwAGUAcgBtAGkAcwBzAGkAbwBuAEQAZQBjAGkAcwBpAG8AbgBSAGUAYQBzAG8AbgAiADoAIgBOAG8AdgBhACAAYwBvAG0AcABsAGUAdABlAF8AdABlAHgAdAAgAGYAbwByAGIAaQBkAHMAIABhAGwAbAAgAHQAbwBvAGwAcwAiAH0AfQAnACkA";
+
+fn restrict_completion(command: &mut Command) {
+    let hooks = format!(
+        "hooks.PreToolUse=[{{hooks=[{{type=\"command\",command={},commandWindows={},timeout=5}}]}}]",
+        json!(DENY_TOOLS), json!(DENY_TOOLS_WINDOWS)
+    );
+    command.args(["--strict-config", "-c", &hooks, "-c", "features.hooks=true",
+        "-c", "web_search=\"disabled\"", "-c", "notify=[]",
+        "-c", "tools.experimental_request_user_input.enabled=false", "-c", "tools.update_plan.enabled=false"]);
+    // Remove native executors, not merely their approval paths. These feature
+    // names are declared by Codex 0.161.0; strict-config fails on incompatible CLIs.
+    for feature in ["shell_tool", "unified_exec", "multi_agent", "code_mode", "code_mode_host",
+        "view_image", "browser_use", "computer_use", "apps", "plugins", "image_generation", "goals",
+        "js_repl", "memory_tool", "multi_agent_v2", "browser_use_external", "imagegenext",
+        "request_permissions", "sleep_tool", "tool_search", "skill_search"] {
+        command.args(["-c", &format!("features.{feature}=false")]);
+    }
+    // Do not run inherited lifecycle hooks. hooks/list below also rejects hooks
+    // loaded from hooks.json/plugins/managed configuration that survived overrides.
+    for event in ["PermissionRequest", "PostToolUse", "PreCompact", "PostCompact",
+        "SessionStart", "SessionEnd", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop", "Interrupt"] {
+        command.args(["-c", &format!("hooks.{event}=[]")]);
+    }
+}
+
+fn check_completion_hooks(response: &Value) -> Result<Value, String> {
+    let entries = response["data"].as_array().ok_or("Codex 未提供 hooks/list 能力")?;
+    let mut state = serde_json::Map::new();
+    for entry in entries {
+        if !entry["errors"].as_array().is_some_and(Vec::is_empty) {
+            return Err("Codex 一次性生成的工具拦截 hook 加载失败".into());
+        }
+        for hook in entry["hooks"].as_array().ok_or("Codex 未返回 hook 列表")? {
+            if hook["enabled"] == false { continue; }
+            if hook["eventName"] != "preToolUse" || hook["handlerType"] != "command"
+                || hook["source"] != "sessionFlags"
+                || hook["async"] == true || !hook["matcher"].is_null()
+                || ![DENY_TOOLS, DENY_TOOLS_WINDOWS].iter().any(|command| hook["command"] == *command) {
+                return Err("Codex 一次性生成拒绝未受控或未信任的 hook".into());
+            }
+            let key = hook["key"].as_str().ok_or("Codex hook 缺少 key")?;
+            let hash = hook["currentHash"].as_str().filter(|hash| hash.starts_with("sha256:") && hash.len() == 71)
+                .ok_or("Codex hook 缺少有效 currentHash")?;
+            // Only trust our exact command from our CLI layer. Never persist trust
+            // or approve any inherited hook. Codex initially lists CLI hooks as untrusted.
+            state.insert(key.into(), json!({"enabled":true,"trusted_hash":hash}));
+        }
+    }
+    if state.is_empty() { return Err("Codex 一次性生成需要启用原生 PreToolUse 拦截 hook（Codex 0.161.0+）".into()); }
+    Ok(json!({"PreToolUse":[{"hooks":[{"type":"command","command":DENY_TOOLS,
+        "commandWindows":DENY_TOOLS_WINDOWS,"timeout":5}]}],"state":state}))
+}
+
 fn thread_options(request: &Value, options: &Options) -> Value {
-    let title = request["action"] == "title";
+    let title = matches!(request["action"].as_str(), Some("title" | "complete_text"));
     let read_only = title || request["mode"] == "plan";
     let mut guidance = Vec::new();
     let rtk = rtk_guidance();
@@ -167,7 +227,12 @@ impl Images {
                         .extension()
                         .and_then(|v| v.to_str())
                         .filter(|v| v.len() <= 10 && v.bytes().all(|c| c.is_ascii_alphanumeric()))
-                        .unwrap_or("png");
+                        .unwrap_or_else(|| match part["mime"].as_str() {
+                            Some("image/jpeg") => "jpg",
+                            Some("image/webp") => "webp",
+                            Some("image/gif") => "gif",
+                            _ => "png",
+                        });
                     let path = dir.join(format!("image.{ext}"));
                     std::fs::write(&path, data).map_err(|e| e.to_string())?;
                     parts.push(json!({"type":"localImage", "path":path}));
@@ -414,8 +479,8 @@ impl Turn {
                 .into());
         }
         if title {
-            if turn["status"] == "interrupted" {
-                return Err("Codex title generation interrupted".into());
+            if turn["status"] != "completed" {
+                return Err("Codex text generation did not complete".into());
             }
             let messages: Vec<_> = self
                 .order
@@ -462,6 +527,10 @@ async fn control(
     Ok(())
 }
 
+/// `complete_text`: fresh ephemeral, tool-denied text/image-input completion.
+/// Request: {action, cwd, model?, reasoningEffort?, parts:[text|image_data|local_image]}.
+/// Returns a JSON string (not a title-normalized value); never resumes a session.
+/// The caller should use codex_launch(cwd, true) and an isolated temporary cwd.
 pub async fn run(
     mut command: Command,
     request: Value,
@@ -469,10 +538,25 @@ pub async fn run(
     mut controls: mpsc::UnboundedReceiver<String>,
     emit: impl Fn(Value),
 ) -> Result<Value, String> {
-    let title = request["action"] == "title";
+    let complete = request["action"] == "complete_text";
+    let title = request["action"] == "title" || complete;
     let fork = request["action"] == "fork";
     if !title && !fork && request["action"] != "prompt" {
         return Err("Unknown Codex action".into());
+    }
+    if complete {
+        if optional_text(&request["sessionId"]).is_some() {
+            return Err("Codex complete_text cannot resume a session".into());
+        }
+        if !request["parts"].as_array().is_some_and(|parts| !parts.is_empty() && parts.iter().all(|part| match part["type"].as_str() {
+            Some("text") => part["text"].is_string(),
+            Some("image_data") => part["data"].is_string(),
+            Some("local_image") => part["path"].is_string(),
+            _ => false,
+        })) {
+            return Err("Codex complete_text requires valid text/image input parts".into());
+        }
+        restrict_completion(&mut command);
     }
     if fork && request["retainedTurns"].as_u64().unwrap_or(0) == 0 {
         return Err("retainedTurns must be a positive integer".into());
@@ -506,14 +590,23 @@ pub async fn run(
     let mut controls_open = true;
     let mut stderr_open = true;
     let mut errors = VecDeque::new();
+    let mut completion_config = json!({});
+    let completion_deadline = Instant::now() + Duration::from_millis(request["timeoutMs"].as_u64().unwrap_or(60_000));
     let result = async {
         client.rpc("initialize", json!({"clientInfo":{"name":"nova_app_server","title":"Nova","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
         loop {
-            if turn.completed.is_some() { return turn.result(title); }
+            if turn.completed.is_some() {
+                let result = turn.result(title)?;
+                if complete && result.as_str().is_none_or(|text| text.trim().is_empty()) {
+                    return Err("Codex complete_text returned empty text".into());
+                }
+                return Ok(result);
+            }
             if turn.id.is_some() {
                 while let Some(value) = queued.pop_front() { control(&mut client, &mut turn, &mut images, value).await?; }
             }
-            let deadline = client.pending.values().map(|p| p.deadline).min().unwrap_or_else(|| Instant::now() + RPC_TIMEOUT);
+            let mut deadline = client.pending.values().map(|p| p.deadline).min().unwrap_or_else(|| Instant::now() + RPC_TIMEOUT);
+            if complete { deadline = deadline.min(completion_deadline); }
             tokio::select! {
                 line = lines.next_line() => {
                     let line = line.map_err(|e| e.to_string())?.ok_or("Codex app-server 在请求完成前退出")?;
@@ -530,7 +623,15 @@ pub async fn run(
                                     emit(json!({"type":"permission","permission":{"id":key,"permission":message["params"]["reason"].as_str().unwrap_or(method),"metadata":message["params"]}}));
                                 }
                             } else { write(&mut client.stdin, json!({"id":id,"error":{"code":-32601,"message":format!("Nova does not support {method}")}})).await?; }
-                        } else { turn.notification(method, &message["params"], title, &emit)?; }
+                        } else {
+                            // ponytail: upstream hook errors fail open. This notification abort
+                            // is best-effort, not an atomic barrier; strict fault-safe no-tools
+                            // requires Codex to expose a fail-closed hook/tool policy.
+                            if complete && method == "hook/completed" && message["params"]["run"]["status"] != "blocked" {
+                                return Err("Codex 工具拦截 hook 未成功拒绝，终止生成".into());
+                            }
+                            turn.notification(method, &message["params"], title, &emit)?;
+                        }
                         continue;
                     }
                     let Some(pending) = message["id"].as_u64().and_then(|id| client.pending.remove(&id)) else { continue; };
@@ -546,7 +647,8 @@ pub async fn run(
                     match pending.method {
                         "initialize" => {
                             write(&mut client.stdin, json!({"method":"initialized","params":{}})).await?;
-                            if fork { client.rpc("thread/read", json!({"threadId":request["sessionId"],"includeTurns":true})).await?; }
+                            if complete { client.rpc("hooks/list", json!({"cwds":[request["cwd"]]})).await?; }
+                            else if fork { client.rpc("thread/read", json!({"threadId":request["sessionId"],"includeTurns":true})).await?; }
                             else {
                                 let mut params = thread_options(&request, &options);
                                 let resume = request["sessionId"].as_str().is_some_and(|s| !s.is_empty());
@@ -554,10 +656,27 @@ pub async fn run(
                                 client.rpc(if resume { "thread/resume" } else { "thread/start" }, params).await?;
                             }
                         }
+                        "hooks/list" => {
+                            completion_config["hooks"] = check_completion_hooks(response)?;
+                            client.rpc("config/read", json!({"cwd":request["cwd"],"includeLayers":false})).await?;
+                        }
+                        "config/read" => {
+                            // Disable every configured MCP server, not just Nova's; avoid
+                            // starting user MCP subprocesses before a tool call is attempted.
+                            if let Some(servers) = response["config"]["mcp_servers"].as_object() {
+                                // Overlay only enabled: config/read includes null optionals
+                                // which cannot round-trip through Codex's TOML overrides.
+                                completion_config["mcp_servers"] = json!(servers.keys().map(|name|
+                                    (name.clone(), json!({"enabled":false}))).collect::<serde_json::Map<_, _>>());
+                            }
+                            let mut params = thread_options(&request, &options);
+                            params["config"].as_object_mut().unwrap().extend(completion_config.as_object().unwrap().clone());
+                            client.rpc("thread/start", params).await?;
+                        }
                         "thread/start" | "thread/resume" => {
                             turn.thread = Some(response["thread"]["id"].as_str().ok_or("Codex 未返回 thread id")?.to_string());
                             if !title { emit(json!({"type":"ready","sessionId":turn.thread})); }
-                            let input = if title { json!([{"type":"text","text":request["prompt"]}]) } else { images.input(&request)? };
+                            let input = if request["action"] == "title" { json!([{"type":"text","text":request["prompt"]}]) } else { images.input(&request)? };
                             client.rpc("turn/start", json!({"threadId":turn.thread,"input":input,"cwd":request["cwd"],"model":optional_text(&request["model"]),"effort":optional_text(&request["reasoningEffort"]),"approvalPolicy":"never","sandboxPolicy":{"type":if title || request["mode"] == "plan" { "readOnly" } else { "dangerFullAccess" }}})).await?;
                         }
                         "turn/start" => turn.id = Some(response["turn"]["id"].as_str().ok_or("Codex 未返回 turn id")?.to_string()),
@@ -573,7 +692,7 @@ pub async fn run(
                         _ => {}
                     }
                 }
-                value = controls.recv(), if controls_open => {
+                value = controls.recv(), if controls_open && !complete => {
                     if let Some(line) = value {
                         let value: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
                         if value["action"] == "permission" || turn.id.is_some() { control(&mut client, &mut turn, &mut images, value).await?; }
@@ -587,6 +706,7 @@ pub async fn run(
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
+                    if complete && Instant::now() >= completion_deadline { return Err("Codex complete_text timed out after 60s".into()); }
                     if let Some(p) = client.pending.values().find(|p| p.deadline <= Instant::now()) { return Err(format!("Codex app-server request timed out: {}",p.method)); }
                 }
             }

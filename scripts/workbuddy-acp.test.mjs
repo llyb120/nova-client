@@ -12,6 +12,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 const source = await readFile(new URL('./workbuddy-acp.mjs', import.meta.url), 'utf8');
 const rpc = (id, method, params = {}) => ({ jsonrpc: '2.0', id, method, params });
 const event = message => `data: ${JSON.stringify(message)}\r\n\r\n`;
+// Same restricted arguments owned by acp.rs; the bridge must preserve even the empty value.
+const printArgs = ['--print', '--verbose', '--tools', '', '--strict-mcp-config', '--mcp-config', 'mcp.json',
+  '--setting-sources', 'none', '--settings', 'settings.json', '--permission-mode', 'dontAsk',
+  '--no-session-persistence', '--max-turns', '1', '--input-format', 'stream-json', '--output-format', 'stream-json',
+  '--model', 'model with spaces'];
+const printStderr = Buffer.from('worker stderr\r\n分块🐰\0');
 const wait = async predicate => {
   const deadline = Date.now() + 5000;
   while (!predicate()) {
@@ -48,18 +54,33 @@ test('SSE split UTF-8, CRLF, multiline data, multiple events and buffer limits',
 // Real local pipes/HTTP and a fake worker; never start WorkBuddy or make any upstream/model request.
 const fakeWorker = `
 import { createServer, createConnection } from 'node:net';
-import { writeFileSync } from 'node:fs';
-const env = process.env;
+import { readFileSync, writeFileSync } from 'node:fs';
+const env = process.env, argv = process.argv.slice(2), print = argv[0] === '--print';
 if (env.FAKE_EXIT) process.exit(2);
+const keepAlive = setInterval(() => {}, 1000);
 const server = createServer(socket => {
   let body = '';
   socket.on('data', chunk => {
     body += chunk;
     if (!body.includes('\\n')) return;
     const message = JSON.parse(body);
-    writeFileSync(env.FAKE_REPORT, JSON.stringify({ argv: process.argv.slice(2), env, message, pid: process.pid }));
+    writeFileSync(env.FAKE_REPORT, JSON.stringify({ argv, env, message, pid: process.pid, cwd: process.cwd(),
+      ...(print ? { settings: JSON.parse(readFileSync('settings.json', 'utf8')), mcp: JSON.parse(readFileSync('mcp.json', 'utf8')) } : {}) }));
+    if (env.FAKE_HANG_CREDENTIALS) return;
     socket.end(JSON.stringify({ ok: true, policy: message.bootstrap.policy }) + '\\n');
     server.close();
+    if (print) {
+      clearInterval(keepAlive);
+      void (async () => {
+        const chunks = [];
+        for await (const chunk of process.stdin) chunks.push(chunk);
+        await new Promise(resolve => setTimeout(resolve, 50)); // Input EOF must not kill the worker.
+        process.stdout.write(Buffer.concat(chunks));
+        process.stderr.write(Buffer.from(${JSON.stringify(printStderr.toString('base64'))}, 'base64'));
+        process.exitCode = Number(env.FAKE_PRINT_EXIT || 0);
+      })();
+      return;
+    }
     const ready = createConnection(env.CODEBUDDY_SIDECAR_READY_SOCKET, () => ready.write(JSON.stringify({ jsonrpc: '2.0', id: 'ready',
       method: 'session.ready', params: { protocolVersion: 1, sessionId: env.CODEBUDDY_SIDECAR_READY_SESSION_ID,
         token: env.CODEBUDDY_SIDECAR_READY_TOKEN, pid: process.pid, port: Number(env.FAKE_PORT) } }) + '\\n'));
@@ -67,7 +88,6 @@ const server = createServer(socket => {
   });
 });
 server.listen(env.CODEBUDDY_SIDECAR_CREDENTIAL_BOOTSTRAP_SOCKET);
-setInterval(() => {}, 1000);
 `;
 const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const sha = data => createHash('sha256').update(data).digest();
@@ -88,7 +108,8 @@ function keyblob(secret, user) {
 
 async function fixture(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'nova-wb-test-'));
-  const f = { posts: [], requests: [], messages: [], lifecycle: [], sockets: new Set(), stderr: '', stdout: '' };
+  const print = options.args?.[0] === '--print';
+  const f = { root, posts: [], requests: [], messages: [], lifecycle: [], sockets: new Set(), stderr: '', stdout: '', stdoutBytes: [], stderrBytes: [] };
   f.secret = randomBytes(32).toString('base64');
   f.user = randomBytes(32);
   f.developerPublicKey = { alg: 'RSA-OAEP-256', id: 'ab'.repeat(32), key: 'AAAA' };
@@ -137,15 +158,21 @@ async function fixture(t, options = {}) {
   await writeFile(preload, `process._linkedBinding = name => name === 'electron_browser_workbuddy_storage' ? { loggerGet: () => ${JSON.stringify(payload)} } : undefined;`);
   await writeFile(cli, fakeWorker);
   await writeFile(join(root, 'keyblob'), keyblob(f.secret, f.user));
+  if (print) {
+    await writeFile(join(root, 'settings.json'), '{"hooks":{},"enabledPlugins":{}}');
+    await writeFile(join(root, 'mcp.json'), '{"mcpServers":{}}');
+  }
   http.listen(0, '127.0.0.1');
   await once(http, 'listening');
   // Only non-Windows tests lift the platform gate; production intentionally rejects Unix.
-  const childSource = process.platform === 'win32' ? source : source.replace("process.platform !== 'win32'", 'false');
-  f.child = spawn(process.execPath, ['--input-type=module', '-e', childSource, '--', cli], {
+  let childSource = process.platform === 'win32' ? source : source.replace("process.platform !== 'win32'", 'false');
+  if (options.hangCredentials) childSource = childSource.replace('startupDeadline = Date.now() + 45000;', 'startupDeadline = Date.now() + 1500;');
+  f.child = spawn(process.execPath, ['--input-type=module', '-e', childSource, '--', cli, ...(options.args || [])], {
     cwd: root, stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, WORKBUDDY_CONFIG_DIR: root, NOVA_CONTEXT_TEST: 'forward-context',
       WORKBUDDY_EXE: options.exe ?? process.execPath, NODE_OPTIONS: `--require ${JSON.stringify(preload)}`,
       FAKE_PORT: String(http.address().port), FAKE_REPORT: report, ...(options.workerExit ? { FAKE_EXIT: '1' } : {}),
+      FAKE_PRINT_EXIT: String(options.printExit || 0), ...(options.hangCredentials ? { FAKE_HANG_CREDENTIALS: '1' } : {}),
       HTTPS_PROXY: 'http://127.0.0.1:9', CODEBUDDY_CODE_SHELL: 'custom-shell',
       CODEBUDDY_GATEWAY_PASSWORD: 'OLD_PASSWORD', CODEBUDDY_FORCE_LITE_WB_BUNDLE: '1',
       ACC_PRODUCT_CONFIG_PATH: join(root, 'stale-desktop-policy.json'),
@@ -153,20 +180,27 @@ async function fixture(t, options = {}) {
       ACC_PRODUCT_CONFIG_V2: '{}', ACC_PRODUCT_CONFIG: '{}' },
   });
   f.exit = once(f.child, 'exit');
+  f.close = once(f.child, 'close');
   f.send = message => f.child.stdin.write(JSON.stringify(message) + '\n');
   f.loadReport = async () => (f.report ??= JSON.parse(await readFile(report, 'utf8')));
-  f.child.stderr.setEncoding('utf8').on('data', text => { f.stderr += text; });
-  let tail = '';
-  f.child.stdout.setEncoding('utf8').on('data', text => {
-    f.stdout += text;
-    const split = (tail + text).split('\n');
-    tail = split.pop();
-    for (const line of split) if (line) f.messages.push(JSON.parse(line));
-  });
+  if (print) {
+    f.child.stdout.on('data', chunk => { f.stdoutBytes.push(chunk); f.stdout += chunk.toString('utf8'); });
+    f.child.stderr.on('data', chunk => { f.stderrBytes.push(chunk); f.stderr += chunk.toString('utf8'); });
+  } else {
+    f.child.stderr.setEncoding('utf8').on('data', text => { f.stderr += text; });
+    let tail = '';
+    f.child.stdout.setEncoding('utf8').on('data', text => {
+      f.stdout += text;
+      const split = (tail + text).split('\n');
+      tail = split.pop();
+      for (const line of split) if (line) f.messages.push(JSON.parse(line));
+    });
+  }
   f.checkSecrets = () => {
     const output = f.stdout + f.stderr;
     const password = f.report?.env.CODEBUDDY_GATEWAY_PASSWORD;
-    for (const secret of [f.secret, f.user.toString('base64'), 'HTTP_SESSION_SECRET', 'OLD_PASSWORD', password].filter(Boolean)) {
+    for (const secret of [f.secret, sha(f.secret).toString('base64'), f.user.toString('base64'),
+      'HTTP_SESSION_SECRET', 'OLD_PASSWORD', password, f.report?.message.token].filter(Boolean)) {
       assert.equal(output.includes(secret), false, 'Secret leaked to stdio');
     }
   };
@@ -249,6 +283,81 @@ test('self-hosted worker: credential bootstrap, env, GET and POST forwarding, co
   }
   assert.equal(f.requests.filter(r => r.method === 'GET').length, 1);
   assert.equal(f.requests.filter(r => r.url.endsWith('/connect')).length, 1);
+  f.checkSecrets();
+});
+
+test('print reuses credentials and identity, preserves restricted args/cwd and raw stdio, and never opens ACP', { timeout: 10000 }, async t => {
+  const f = await fixture(t, { args: printArgs });
+  const input = Buffer.concat([Buffer.from('not RPC\r\n分块🐰\0'), Buffer.from([0xff, 0xfe]), Buffer.alloc(128 * 1024, 'x')]);
+  f.child.stdin.end(input);
+  assert.equal((await f.close)[0], 0);
+  assert.deepEqual(Buffer.concat(f.stdoutBytes), input);
+  assert.deepEqual(Buffer.concat(f.stderrBytes), printStderr);
+  const { argv, env, message, cwd, settings, mcp, pid } = await f.loadReport();
+  assert.deepEqual(argv, printArgs);
+  assert.equal(cwd, f.root);
+  assert.deepEqual(settings, { hooks: {}, enabledPlugins: {} });
+  assert.deepEqual(mcp, { mcpServers: {} });
+  assert.equal(env.WORKBUDDY_CONFIG_DIR, f.root);
+  assert.equal(env.CODEBUDDY_CONFIG_DIR, f.root);
+  assert.equal(env.CODEBUDDY_HOST, 'workbuddy-desktop');
+  assert.equal(env.CODEBUDDY_FORCE_HEADLESS_BUNDLE, '1');
+  assert.equal(env.DISABLE_AUTOUPDATER, '1');
+  assert.equal(env.CODEBUDDY_DEFER_TOOL_LOADING, '0');
+  assert.equal(env.WORKBUDDY_AT_REST_ENCRYPTION, 'fields');
+  assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:9');
+  assert.equal(env.CODEBUDDY_SIDECAR_READY_SOCKET, undefined);
+  assert.ok(!Object.keys(env).some(key => /^(NOVA_|ACC_PRODUCT_CONFIG)|FORCE_LITE_WB/i.test(key)));
+  assert.equal(message.sessionId, env.CODEBUDDY_SIDECAR_READY_SESSION_ID);
+  assert.equal(message.token, env.CODEBUDDY_SIDECAR_READY_TOKEN);
+  assert.equal(message.pid, pid);
+  assert.equal(message.bootstrap.symmetricKey.keyBase64, sha(f.secret).toString('base64'));
+  assert.equal(message.bootstrap.userKey.keyBase64, f.user.toString('base64'));
+  for (const value of Object.values(env)) {
+    assert.ok(!value.includes(f.secret) && !value.includes(f.user.toString('base64')) && !value.includes(sha(f.secret).toString('base64')));
+  }
+  assert.equal(f.requests.length, 0);
+  assert.deepEqual(f.lifecycle, []);
+  assert.equal(alive(pid), false);
+  f.checkSecrets();
+});
+
+test('print preserves a nonzero worker exit without replacing its output with JSON-RPC', { timeout: 10000 }, async t => {
+  const f = await fixture(t, { args: printArgs, printExit: 7 });
+  f.child.stdin.end('partial output');
+  assert.equal((await f.close)[0], 7);
+  assert.equal(f.stdout, 'partial output');
+  assert.deepEqual(Buffer.concat(f.stderrBytes), printStderr);
+  await f.loadReport();
+  assert.equal(f.requests.length, 0);
+  f.checkSecrets();
+});
+
+for (const failure of ['build key', 'early worker exit', 'credential timeout']) {
+  test(`print fails closed on ${failure} and cleans up without leaking credentials`, { timeout: 10000 }, async t => {
+    const f = await fixture(t, { args: printArgs,
+      ...(failure === 'build key' ? { exe: join(tmpdir(), 'missing-workbuddy.exe') } : {}),
+      workerExit: failure === 'early worker exit', hangCredentials: failure === 'credential timeout' });
+    f.child.stdin.end();
+    assert.notEqual((await f.close)[0], 0);
+    assert.equal(f.stdout, '');
+    assert.equal(f.requests.length, 0);
+    if (failure === 'credential timeout') {
+      const { pid } = await f.loadReport();
+      assert.equal(alive(pid), false);
+    } else await assert.rejects(f.loadReport());
+    f.checkSecrets();
+  });
+}
+
+test('a print token outside the explicit mode position cannot enable stdio forwarding', { timeout: 10000 }, async t => {
+  const f = await fixture(t, { args: ['--model', '--print'] });
+  f.send(rpc('invalid-args', 'initialize'));
+  assert.equal((await f.close)[0], 1);
+  assert.equal(f.messages[0].id, 'invalid-args');
+  assert.equal(f.messages[0].error.code, -32000);
+  await assert.rejects(f.loadReport());
+  assert.equal(f.requests.length, 0);
   f.checkSecrets();
 });
 

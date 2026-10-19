@@ -192,6 +192,73 @@ fn options_preserve_polaris_ponytail_and_plan_mode() {
     assert_eq!(value["config"]["mcp_servers.nova-tools"]["enabled"], false);
 }
 
+#[tokio::test]
+async fn complete_text_is_guarded_ephemeral_and_preserves_images_and_full_text() {
+    let mut req = request();
+    req["action"] = json!("complete_text");
+    req["parts"] = json!([{"type":"text","text":"describe"}, {"type":"image_data","data":"aGVsbG8=","name":"test.png"}]);
+    let (result, events, calls) = exercise("stream", req, Some(json!({"action":"steer","parts":[]}))).await;
+    assert_eq!(result.unwrap(), "hello world");
+    assert!(events.is_empty());
+    assert_eq!(calls[2]["method"], "hooks/list");
+    assert_eq!(calls[3]["method"], "config/read");
+    let start = calls.iter().find(|c| c["method"] == "thread/start").unwrap();
+    assert_eq!(start["params"]["ephemeral"], true);
+    assert_eq!(start["params"]["config"]["mcp_servers"]["user-tools"]["enabled"], false);
+    assert!(start["params"]["config"]["hooks"]["state"]["guard"]["trusted_hash"].as_str().unwrap().starts_with("sha256:"));
+    let turn = calls.iter().find(|c| c["method"] == "turn/start").unwrap();
+    assert_eq!(turn["params"]["input"][0]["text"], "describe");
+    assert_eq!(turn["params"]["input"][1]["type"], "localImage");
+    let path = Path::new(turn["params"]["input"][1]["path"].as_str().unwrap());
+    assert!(!path.exists() && !path.parent().unwrap().exists());
+    assert!(!calls.iter().any(|c| c["method"] == "turn/steer"));
+}
+
+#[tokio::test]
+async fn complete_text_fails_closed_before_generation_without_hook() {
+    let mut req = request();
+    req["action"] = json!("complete_text");
+    let (result, _, calls) = exercise("no-hook", req.clone(), None).await;
+    assert!(result.unwrap_err().contains("PreToolUse"));
+    assert!(!calls.iter().any(|c| c["method"] == "thread/start" || c["method"] == "turn/start"));
+    for scenario in ["interrupted", "failed", "exit", "malformed"] {
+        assert!(exercise(scenario, req.clone(), None).await.0.is_err(), "{scenario}");
+    }
+}
+
+#[test]
+fn completion_disables_native_executors_and_pins_hook_interpreter() {
+    let mut command = Command::new("codex");
+    restrict_completion(&mut command);
+    let args: Vec<_> = command.as_std().get_args().map(|arg| arg.to_str().unwrap()).collect();
+    for feature in ["shell_tool", "unified_exec", "multi_agent", "code_mode", "code_mode_host",
+        "view_image", "browser_use", "computer_use", "apps", "plugins", "image_generation", "goals",
+        "js_repl", "memory_tool", "multi_agent_v2", "browser_use_external", "imagegenext",
+        "request_permissions", "sleep_tool", "tool_search", "skill_search"] {
+        assert!(args.contains(&format!("features.{feature}=false").as_str()), "{feature}");
+    }
+    assert!(args.contains(&"web_search=\"disabled\""));
+    assert!(args.contains(&"tools.experimental_request_user_input.enabled=false"));
+    assert!(args.contains(&"tools.update_plan.enabled=false"));
+    let encoded = DENY_TOOLS_WINDOWS.strip_prefix("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ").unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+    let script = String::from_utf16(&bytes.chunks_exact(2).map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])).collect::<Vec<_>>()).unwrap();
+    assert_eq!(script, r#"[Console]::Out.Write('{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Nova complete_text forbids all tools"}}')"#);
+}
+
+#[test]
+fn completion_trusts_only_its_own_synchronous_session_hook() {
+    let hook = json!({"eventName":"preToolUse","handlerType":"command","enabled":true,"trustStatus":"untrusted","source":"sessionFlags","key":"guard","currentHash":format!("sha256:{}", "0".repeat(64)),"command":DENY_TOOLS});
+    let response = |hook| json!({"data":[{"errors":[],"hooks":[hook]}]});
+    assert!(check_completion_hooks(&response(hook.clone())).is_ok());
+    for (key, value) in [("source", json!("user")), ("currentHash", json!("")), ("async", json!(true)),
+        ("enabled", json!(false)), ("matcher", json!("shell")), ("eventName", json!("sessionStart")), ("command", json!("echo ok"))] {
+        let mut invalid = hook.clone();
+        invalid[key] = value;
+        assert!(check_completion_hooks(&response(invalid)).is_err(), "{key}");
+    }
+}
+
 #[test]
 fn tool_normalization_preserves_output_diff_and_errors() {
     let item = normalize_item(&json!({"id":"c","type":"commandExecution","status":"inProgress","aggregatedOutput":"out","exitCode":1})).unwrap();
@@ -233,7 +300,7 @@ async fn live_turn_resume_title_and_fork() {
     let addr = listener.local_addr().unwrap();
     let provider = tokio::spawn(async move {
         let mut requests = Vec::new();
-        while requests.len() < 3 {
+        while requests.len() < 5 {
             let (stream, _) = listener.accept().await.unwrap();
             let mut stream = BufReader::new(stream);
             let mut length = 0;
@@ -262,16 +329,22 @@ async fn live_turn_resume_title_and_fork() {
                 continue;
             }
             requests.push(String::from_utf8(body).unwrap());
-            let item = json!({"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"stub response","annotations":[]}]});
+            let injected_call = requests.len() == 4;
+            let item = if injected_call {
+                json!({"id":"fc_guard","type":"function_call","call_id":"call_guard","name":"exec_command","arguments":"{\"cmd\":\"echo forbidden > guarded.txt\"}"})
+            } else {
+                json!({"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"stub response","annotations":[]}]})
+            };
             let events = [
                 json!({"type":"response.created","response":{"id":"resp_test","status":"in_progress","output":[]}}),
-                json!({"type":"response.output_item.added","output_index":0,"item":{"id":"msg_test","type":"message","role":"assistant","status":"in_progress","content":[]}}),
+                json!({"type":"response.output_item.added","output_index":0,"item":if injected_call { item.clone() } else { json!({"id":"msg_test","type":"message","role":"assistant","status":"in_progress","content":[]}) }}),
                 json!({"type":"response.output_text.delta","item_id":"msg_test","output_index":0,"content_index":0,"delta":"stub response"}),
                 json!({"type":"response.output_item.done","output_index":0,"item":item}),
                 json!({"type":"response.completed","response":{"id":"resp_test","status":"completed","output":[item],"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15,"input_tokens_details":{"cached_tokens":0}}}}),
             ];
             let body = events
                 .iter()
+                .filter(|event| !injected_call || event["type"] != "response.output_text.delta")
                 .map(|event| {
                     format!(
                         "event: {}\ndata: {event}\n\n",
@@ -360,10 +433,29 @@ requires_openai_auth = false
     req["action"] = json!("title");
     req["sessionId"] = Value::Null;
     req["prompt"] = json!("Make a title");
-    let (title, events) = invoke(req).await;
+    let (title, events) = invoke(req.clone()).await;
     assert_eq!(title, "stub response");
     assert!(events.is_empty());
+    // An inherited required MCP server must be disabled before thread/start.
+    // Inherited lifecycle hooks are rejected by check_completion_hooks instead:
+    // Codex merges hook declarations across layers, including empty CLI arrays.
+    use std::io::Write as _;
+    writeln!(std::fs::OpenOptions::new().append(true).open(home.path().join("config.toml")).unwrap(), r#"
+[mcp_servers.inherited]
+command = "missing-inherited-mcp-must-not-start"
+required = true
+"#).unwrap();
+    req["action"] = json!("complete_text");
+    req["parts"] = json!([{"type":"text","text":"describe the image"}, {"type":"image_data","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII="}]);
+    let (text, events) = invoke(req).await;
+    assert_eq!(text, "stub response");
+    assert!(events.is_empty());
+    assert!(!home.path().join("guarded.txt").exists());
     let requests = provider.await.unwrap();
+    assert!(requests[3].contains("input_image"));
+    let completion: Value = serde_json::from_str(&requests[3]).unwrap();
+    assert!(completion["tools"].as_array().is_some_and(Vec::is_empty), "unexpected tools: {}", completion["tools"]);
+    assert!(requests[4].contains("unsupported call: exec_command"));
     assert!(requests[0].contains("ponytail:"));
     assert!(requests[0].contains("__rtk"));
     assert!(requests[1].contains("__rtk"));
