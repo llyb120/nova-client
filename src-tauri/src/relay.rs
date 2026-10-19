@@ -40,8 +40,6 @@ use crate::acp::{EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS, EV_TURN, EV_
 pub const EV_RELAY_STATUS: &str = "relay:status";
 pub const EV_RELAY_PEERS: &str = "relay:peers";
 pub const EV_RELAY_INBOX: &str = "relay:inbox";
-/// 工作流分享收件箱变化
-pub const EV_RELAY_WORKFLOW_INBOX: &str = "relay:workflow-inbox";
 /// guest 侧：收到对端（host）回传的可选模型/模式列表，前端据此缓存并在漫游时选用对方的模型
 pub const EV_RELAY_PEER_MODELS: &str = "relay:peer-models";
 /// guest 侧：收到对端某目录的本地分支列表，worktree「基于分支」下拉据此填充
@@ -137,18 +135,6 @@ pub struct Share {
     pub ts: i64,
 }
 
-/// 一条待接收的工作流分享（队友通过中转站定向发来）
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkflowShare {
-    pub id: String,
-    pub from: String,
-    pub from_name: String,
-    /// 完整的工作流定义（前端 WorkflowDef 的 JSON）
-    pub def: Value,
-    pub ts: i64,
-}
-
 fn accepted_share_mode(recall: bool, default_mode: &str) -> Option<String> {
     recall
         .then(|| default_mode.to_string())
@@ -202,8 +188,6 @@ pub struct RelayManager {
     last_persist: StdMutex<Instant>,
     peers: StdMutex<Value>,
     inbox: StdMutex<Vec<Share>>,
-    /// 工作流分享收件箱：待本机用户接收进本地工作流库
-    workflow_inbox: StdMutex<Vec<WorkflowShare>>,
     /// host 侧：hostThreadId -> guest
     hosted: StdMutex<HashMap<String, RoamGuest>>,
     /// host 侧漫游提示词的取消代次。收到 cancel 时递增；尚未真正进入 manager 的旧任务
@@ -241,7 +225,6 @@ impl RelayManager {
     pub fn new(app: AppHandle, config_dir: PathBuf) -> Arc<Self> {
         let (last_seq, server_epoch) = read_relay_state(&config_dir);
         let inbox = read_inbox(&config_dir);
-        let workflow_inbox = read_workflow_inbox(&config_dir);
         let device_id = read_or_create_device_id(&config_dir);
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
@@ -264,7 +247,6 @@ impl RelayManager {
             last_persist: StdMutex::new(Instant::now()),
             peers: StdMutex::new(json!([])),
             inbox: StdMutex::new(inbox),
-            workflow_inbox: StdMutex::new(workflow_inbox),
             hosted: StdMutex::new(HashMap::new()),
             host_prompt_epochs: StdMutex::new(HashMap::new()),
             guest_perms: StdMutex::new(HashMap::new()),
@@ -592,8 +574,6 @@ impl RelayManager {
             "clue.mentioned" => self.on_clue_mentioned(&env),
             "remote.device" => crate::remote::publish_main_sse(env.data),
             "share" => self.on_share(&env),
-            "workflow" => self.on_workflow(&env),
-            "workflow.revoke" => self.on_workflow_revoke(&env),
             // guest -> host
             "roaming.create" => self.on_roaming_create(&env),
             "roaming.prompt" => self.on_roaming_prompt(&env),
@@ -604,9 +584,6 @@ impl RelayManager {
             "roaming.resync" => self.on_roaming_resync(&env),
             "roaming.recall" => self.on_roaming_recall(&env),
             "roaming.models_request" => self.on_roaming_models_request(&env),
-            "roaming.workflows" => {
-                let _ = self.app.emit("relay:peer-workflows", json!({ "peer": env.from, "workflows": env.data }));
-            }
             "roaming.branches_request" => self.on_roaming_branches_request(&env),
             // host -> guest
             "roaming.created" => self.on_roaming_created(&env),
@@ -1287,152 +1264,6 @@ impl RelayManager {
         self.emit_inbox();
     }
 
-    // ===== 工作流分享：把工作流定义定向发给队友，对方接收后进入其工作流库 =====
-
-    /// 把工作流定义分享给指定队友。def 为前端完整的 WorkflowDef JSON。
-    pub fn share_workflow(&self, def: &Value, to: &str) -> Result<usize, String> {
-        let (_, own_token, _) = self.cfg().ok_or_else(|| "未配置团队中转站".to_string())?;
-        let name = def
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .unwrap_or_default();
-        if name.is_empty() {
-            return Err("工作流名称为空，无法分享".into());
-        }
-        let stage_count = def
-            .get("stages")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        if stage_count == 0 {
-            return Err("工作流没有阶段，无法分享".into());
-        }
-        // to 为空 = 共享给全组在线队友（排除自己；各自收件箱出现，按需导入；
-        // 同一发送方再次共享同一工作流 = 更新原来的收件箱条目）。presence 名单包含自己，
-        // 不能直接把所有 token 当作目标，否则“共享”可能只发回自己，且离线成员也会被计数。
-        let targets: Vec<String> = if to.trim().is_empty() {
-            self.peers
-                .lock()
-                .unwrap()
-                .as_array()
-                .map(|list| {
-                    list.iter()
-                        .filter(|peer| peer["online"].as_bool().unwrap_or(false))
-                        .filter_map(|peer| peer["token"].as_str())
-                        .filter(|token| !token.is_empty() && *token != own_token)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            vec![to.to_string()]
-        };
-        if targets.is_empty() {
-            return Err("当前没有在线队友，对方上线后请重新共享".into());
-        }
-        let count = targets.len();
-        for target in targets {
-            self.enqueue(target, "workflow", def.clone());
-        }
-        Ok(count)
-    }
-
-    pub async fn revoke_workflow(&self, workflow_id: &str) -> Result<usize, String> {
-        let response = self
-            .clue_request(reqwest::Method::POST, "/v2/workflows/revoke")?
-            .json(&json!({ "workflowId": workflow_id }))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let value: Value = decode_relay_json(response).await?;
-        Ok(value.get("count").and_then(Value::as_u64).unwrap_or(0) as usize)
-    }
-
-    fn on_workflow(&self, env: &InEnvelope) {
-        let stages = env.data.get("stages").and_then(|v| v.as_array());
-        if stages.map(|a| a.is_empty()).unwrap_or(true) {
-            return;
-        }
-        let share = WorkflowShare {
-            id: uuid::Uuid::new_v4().to_string(),
-            from: env.from.clone(),
-            from_name: env.from_name.clone(),
-            def: env.data.clone(),
-            ts: now_ms(),
-        };
-        {
-            let mut inbox = self.workflow_inbox.lock().unwrap();
-            let workflow_id = share
-                .def
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string);
-            let existing = workflow_id.as_deref().and_then(|id| {
-                inbox.iter().position(|item| {
-                    item.from == share.from
-                        && item.def.get("id").and_then(Value::as_str) == Some(id)
-                })
-            });
-            if let Some(index) = existing {
-                inbox[index] = share;
-            } else {
-                inbox.push(share);
-            }
-            persist_workflow_inbox(&self.config_dir, &inbox);
-        }
-        self.emit_workflow_inbox();
-    }
-
-    fn on_workflow_revoke(&self, env: &InEnvelope) {
-        let Some(workflow_id) = env.data.get("workflowId").and_then(Value::as_str) else {
-            return;
-        };
-        {
-            let mut inbox = self.workflow_inbox.lock().unwrap();
-            inbox.retain(|item| {
-                !(item.from == env.from
-                    && item.def.get("id").and_then(Value::as_str) == Some(workflow_id))
-            });
-            persist_workflow_inbox(&self.config_dir, &inbox);
-        }
-        self.emit_workflow_inbox();
-    }
-
-    pub fn workflow_inbox_list(&self) -> Vec<WorkflowShare> {
-        self.workflow_inbox.lock().unwrap().clone()
-    }
-
-    fn emit_workflow_inbox(&self) {
-        let _ = self
-            .app
-            .emit(EV_RELAY_WORKFLOW_INBOX, self.workflow_inbox_list());
-    }
-
-    /// 接收一条工作流分享：从收件箱移除并返回定义，由前端写入本地工作流库。
-    pub fn accept_workflow_share(&self, id: &str) -> Result<Value, String> {
-        let mut inbox = self.workflow_inbox.lock().unwrap();
-        let idx = inbox
-            .iter()
-            .position(|s| s.id == id)
-            .ok_or("该工作流分享已失效")?;
-        let share = inbox.remove(idx);
-        persist_workflow_inbox(&self.config_dir, &inbox);
-        drop(inbox);
-        self.emit_workflow_inbox();
-        Ok(share.def)
-    }
-
-    pub fn decline_workflow_share(&self, id: &str) {
-        {
-            let mut inbox = self.workflow_inbox.lock().unwrap();
-            inbox.retain(|s| s.id != id);
-            persist_workflow_inbox(&self.config_dir, &inbox);
-        }
-        self.emit_workflow_inbox();
-    }
-
     /// 高级分享：用指定模型（默认 swe-1.6）对会话执行一段提示词，
     /// 在本机起一个会话跑出结果，跑完后自动把结果分享给目标。返回处理线程供前端打开观看。
     pub fn advanced_share(
@@ -1945,22 +1776,7 @@ impl RelayManager {
         let _ = self.app.emit(EV_THREADS, json!({}));
     }
 
-    pub fn reply_roaming_workflows(&self, peer: String, workflows: Value) {
-        self.spawn_send_now(peer, "roaming.workflows", workflows);
-    }
-
-    pub fn check_roaming_workflow(&self, thread_id: &str) -> Result<(), String> {
-        if !self.ensure_hosted(thread_id) {
-            return Err("漫游会话已失效".into());
-        }
-        let hosted = self.hosted.lock().unwrap();
-        if !hosted.get(thread_id).is_some_and(|guest| guest.approved_until > Instant::now()) {
-            return Err("漫游授权已到期，请重新授权后继续工作流".into());
-        }
-        Ok(())
-    }
-
-    pub fn fail_roaming_workflow(&self, thread_id: &str, error: &str) {
+    fn send_roaming_error(&self, thread_id: &str, error: &str) {
         let guest = self.hosted.lock().unwrap().get(thread_id).cloned();
         if let Some(guest) = guest {
             self.spawn_send_now(guest.token, "roaming.error", json!({
@@ -1970,7 +1786,6 @@ impl RelayManager {
     }
 
     fn on_roaming_models_request(&self, env: &InEnvelope) {
-        let _ = self.app.emit("relay:workflows-request", json!({ "peer": env.from }));
         let to = env.from.clone();
         let app = self.app.clone();
         tauri::async_runtime::spawn(async move {
@@ -2612,12 +2427,6 @@ impl RelayManager {
                 None => return,
             }
         };
-        if agent_kind != AgentKind::Unsupported && text.starts_with("/nova-workflow ") {
-            let _ = self.app.emit("relay:workflow-start", json!({
-                "threadId": host_thread_id, "text": text, "images": images,
-            }));
-            return;
-        }
         let state = self.app.state::<AppState>();
         let prompt_epoch = {
             let mut epochs = self.host_prompt_epochs.lock().unwrap();
@@ -2691,7 +2500,7 @@ impl RelayManager {
                     }
                 });
             }
-            AgentKind::Unsupported => self.fail_roaming_workflow(&host_thread_id, "该后端不可用"),
+            AgentKind::Unsupported => self.send_roaming_error(&host_thread_id, "该后端不可用"),
         }
     }
 
@@ -2725,7 +2534,7 @@ impl RelayManager {
             self.forward_local_turn(&host_thread_id, false, &json!("force_cancelled"));
         }
         if agent_kind == AgentKind::Unsupported {
-            self.fail_roaming_workflow(&host_thread_id, "该后端不可用");
+            self.send_roaming_error(&host_thread_id, "该后端不可用");
             return;
         }
         let app = self.app.clone();
@@ -3467,17 +3276,6 @@ impl RelayManager {
                     Vec::with_capacity(snap_items.len() + local_users.len());
                 for it in snap_items {
                     if let Some(snap_text) = item_user_text(&it) {
-                        // 工作流启动指令由 host 展开为首节点提示词，消费原指令并保留附件，
-                        // 否则它会被当作尚未执行的本地消息追加到回复末尾。
-                        if li == 0 && local_users.first().and_then(item_user_text)
-                            .is_some_and(|text| text.starts_with("/nova-workflow "))
-                        {
-                            let mut local = local_users[li].clone();
-                            if let Item::User { text, .. } = &mut local { *text = snap_text.to_string(); }
-                            merged.push(local);
-                            li += 1;
-                            continue;
-                        }
                         // 文本与下一条待匹配的本地用户消息一致 → 用本地版本（恢复附件、稳定 id）
                         if li < local_users.len()
                             && item_user_text(&local_users[li]) == Some(snap_text)
@@ -3960,20 +3758,6 @@ fn persist_inbox(dir: &PathBuf, inbox: &[Share]) {
     let _ = std::fs::create_dir_all(dir);
     if let Ok(json) = serde_json::to_string_pretty(inbox) {
         let _ = std::fs::write(dir.join("relay-inbox.json"), json);
-    }
-}
-
-fn read_workflow_inbox(dir: &PathBuf) -> Vec<WorkflowShare> {
-    std::fs::read_to_string(dir.join("relay-workflow-inbox.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Vec<WorkflowShare>>(&s).ok())
-        .unwrap_or_default()
-}
-
-fn persist_workflow_inbox(dir: &PathBuf, inbox: &[WorkflowShare]) {
-    let _ = std::fs::create_dir_all(dir);
-    if let Ok(json) = serde_json::to_string_pretty(inbox) {
-        let _ = std::fs::write(dir.join("relay-workflow-inbox.json"), json);
     }
 }
 

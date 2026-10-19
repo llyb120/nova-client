@@ -23,7 +23,6 @@ import { ModelPicker } from "./ConfigSelects";
 import { IconPlus, IconX } from "./icons";
 import { LyraConfigPanel } from "./LyraConfigPanel";
 import { ProjectPicker } from "./ProjectPicker";
-import { WorkflowPicker } from "./WorkflowPicker";
 import {
   encodeModelTarget,
   encodeRoamTarget,
@@ -479,9 +478,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 : item.action === "toggleTerminal" ? "toggleTerminal"
                 : item.action === "insertText"
                 ? "insertText"
-                : item.action === "selectWorkflow"
-                  ? "selectWorkflow"
-                  : "selectModel",
+                : "selectModel",
         target: item.target.trim(),
       }))
       .filter((item) => {
@@ -1315,7 +1312,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型/工作流、快速新会话，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效；选择工作流仅新会话页可用，选中后本次任务按该工作流运行。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发。默认 Ctrl+`（~ 键）打开或收起终端，可添加「打开 / 收起终端」动作修改按键。
+                      一键切换项目/模型、快速新会话，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发。默认 Ctrl+`（~ 键）打开或收起终端，可添加「打开 / 收起终端」动作修改按键。
                     </div>
                   </div>
                   <button
@@ -1364,9 +1361,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                         : action === "toggleTerminal" ? "toggleTerminal"
                                         : action === "insertText"
                                         ? "insertText"
-                                  : action === "selectWorkflow"
-                                    ? "selectWorkflow"
-                                    : "selectModel";
+                                        : "selectModel";
                                 updateSessionShortcut(index, {
                                   action: nextAction,
                                   target: "",
@@ -1379,7 +1374,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                               <option value="newSession">快速新会话</option>
                               <option value="openUnread">未读 / 进行中会话</option>
                               <option value="toggleTerminal">打开 / 收起终端</option>
-                              <option value="selectWorkflow">选择工作流</option>
                               <option value="insertText">快捷输入</option>
                             </select>
                             <div class="session-shortcut-target">
@@ -1396,32 +1390,18 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                       <Show
                                         when={item().action === "selectProject"}
                                         fallback={
-                                          <Show
-                                            when={item().action === "selectWorkflow"}
-                                            fallback={
-                                              <ModelPicker
-                                                agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "lyra")}
-                                                agentKinds={enabledAgentKinds()}
-                                                model={modelTarget()?.model ?? ""}
-                                                onPickModel={(agentKind, model) =>
-                                                  updateSessionShortcut(index, {
-                                                    target: encodeModelTarget(agentKind, model),
-                                                  })
-                                                }
-                                                title="快捷键目标模型"
-                                                portal
-                                              />
+                                          <ModelPicker
+                                            agentKind={modelTarget()?.agentKind ?? (enabledAgentKinds()[0] ?? "lyra")}
+                                            agentKinds={enabledAgentKinds()}
+                                            model={modelTarget()?.model ?? ""}
+                                            onPickModel={(agentKind, model) =>
+                                              updateSessionShortcut(index, {
+                                                target: encodeModelTarget(agentKind, model),
+                                              })
                                             }
-                                          >
-                                            <WorkflowPicker
-                                              workflowId={item().target}
-                                              onChange={(workflowId) =>
-                                                updateSessionShortcut(index, { target: workflowId })
-                                              }
-                                              title="快捷键目标工作流"
-                                              portal
-                                            />
-                                          </Show>
+                                            title="快捷键目标模型"
+                                            portal
+                                          />
                                         }
                                       >
                                         <ProjectPicker
@@ -2390,7 +2370,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               <h3 class="settings-group-title">自定义环境变量</h3>
               <div class="field">
                 <span class="field-hint">
-                  追加到所有 agent 子进程的环境变量，同名时覆盖用户环境变量。工作流提示词模板中的 {"{{xx}}"} 占位符也会用这里的值替换。
+                  追加到所有 agent 子进程的环境变量，同名时覆盖用户环境变量。
                 </span>
                 <div class="session-shortcut-list">
                   {/* Index 按索引追踪：输入时仅更新对应值，不重建行 DOM，避免输入框失焦。 */}

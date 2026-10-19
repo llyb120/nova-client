@@ -16,7 +16,6 @@ const settings = { modelFavorites: [], theme: "ink-dark" };
 const noop = () => {};
 const context = vm.createContext({
   initialized: false,
-  initRoamingWorkflows: async () => {},
   setInterval: noop,
   RATE_WINDOW_MS: 1000,
   listen: (event) => {

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { transformSync } from 'esbuild';
 import ts from 'typescript';
+import { isSupportedAgentKind } from '../src/types.ts';
 
 const source = readFileSync(new URL('../src/store.ts', import.meta.url), 'utf8');
 const lib = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8');
@@ -17,16 +18,16 @@ function visit(node) {
   if (ts.isFunctionDeclaration(node) && [
     'tryBuiltinPrompt', 'deliverPrompt', 'sendPromptTo', 'isSubagentThread', 'sendPrompt',
     'setThreadModel', 'pickThreadModel', 'setThreadMode', 'setThreadReasoningEffort',
-    'implementProposedPlan', 'startWorkflowOnThread', 'startFireRelay', 'editUserMessage',
-    'cancelTurn', 'compactThread',
+    'implementProposedPlan', 'startFireRelay', 'editUserMessage',
+    'cancelTurn',
   ].includes(node.name?.text)) units.push(node.getText(parsed));
   if (ts.isCallExpression(node) && node.expression.getText(parsed) === 'listen' && node.arguments[0]?.text === 'remote-prompt:dispatch') units.push(node.getText(parsed) + ';');
   ts.forEachChild(node, visit);
 }
 visit(parsed);
-assert.equal(units.length, 16);
+assert.equal(units.length, 14);
 const calls = [], toasts = [];
-const state = { currentId: 'thread', mode: 'plan', items: [], threads: [], running: {} };
+const state = { currentId: 'thread', agentKind: 'lyra', mode: 'plan', items: [], threads: [{ id: 'thread', agentKind: 'lyra' }], running: {} };
 let handler;
 const deps = {
   console: { error() {} },
@@ -41,9 +42,10 @@ const deps = {
     } else if (key === 'running') state.running[args[0]] = args[1];
     else state[key] = args[0];
   },
-  parseStageInput: () => null, findTriggeredWorkflow: () => null, getThreadSnapshot: () => null,
+  isSupportedAgentKind, rememberPromptDisplay() {},
+  parseStageInput: () => null,
   buildPlanPrompt: goal => `expanded plan: ${goal}`,
-  resumeFireRelay: () => null, prepareWorkflowPrompt: () => null,
+  resumeFireRelay: () => null,
   bumpChatScrollToBottom() {}, lastUsed: { setMode() {} },
   optimisticRunningThreads: new Set(), zenHoldThreads: new Set(),
   showToast: text => toasts.push(text),
@@ -87,8 +89,8 @@ const actions = {
   sendPrompt: ['/fire 不应启动'], sendPromptTo: ['agent', '/stage 不应创建', []],
   setThreadModel: ['other'], pickThreadModel: ['codex', 'other'], setThreadMode: ['build'],
   setThreadReasoningEffort: ['high'], implementProposedPlan: [],
-  startWorkflowOnThread: ['agent', 'goal', [], 'workflow'], startFireRelay: ['goal', null, 'agent'],
-  editUserMessage: [1, '不应截断'], cancelTurn: [], compactThread: [],
+  startFireRelay: ['goal', null, 'agent'],
+  editUserMessage: [1, '不应截断'], cancelTurn: [],
 };
 for (const [name, args] of Object.entries(actions)) {
   await module.exports[name](...args);
@@ -99,7 +101,8 @@ const dispatch = lib.slice(lib.indexOf('pub(crate) fn dispatch_prompt('), lib.in
 assert.match(dispatch, /if t\.subagent\s*\{\s*return Err\(/);
 assert.ok(dispatch.indexOf('if t.subagent') < dispatch.indexOf('remote::route_fire_command('), 'reject before built-in routing');
 assert.ok(dispatch.indexOf('if t.subagent') < dispatch.indexOf('mgr.steer_prompt('), 'reject before steer');
-const cancel = lib.slice(lib.indexOf('async fn cancel_turn('), lib.indexOf('async fn compact_thread('));
+const cancelStart = lib.indexOf('async fn cancel_turn(');
+const cancel = lib.slice(cancelStart, lib.indexOf('\n#[tauri::command]', cancelStart));
 assert.match(cancel, /is_some_and\(\|t\| t\.subagent\)\s*\{\s*return Err\(/);
 assert.ok(cancel.indexOf('t.subagent') < cancel.indexOf('.pending_prompt_restores'), 'reject before clearing restores or emitting running=false');
 const chat = readFileSync(new URL('../src/components/ChatView.tsx', import.meta.url), 'utf8');

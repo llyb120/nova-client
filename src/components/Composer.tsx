@@ -43,13 +43,6 @@ import {
 } from "../store";
 import { isSupportedAgentKind, type AgentKind, type PromptImage } from "../types";
 import { agentLabel } from "../utils";
-import {
-  abandonWorkflow,
-  chooseManualWorkflowTransition,
-  manualWorkflowReview,
-  workflowReviewRevision,
-  workflowSuspendedNotice,
-} from "../workflow/runtime";
 import { ConfigSelects } from "./ConfigSelects";
 import { IconClue, IconFile, IconX, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
@@ -66,7 +59,6 @@ export function Composer() {
   const [activeSlashIndex, setActiveSlashIndex] = createSignal(0);
   const [historyOpen, setHistoryOpen] = createSignal(false);
   const [activeHistoryIndex, setActiveHistoryIndex] = createSignal(0);
-  const [choosingWorkflowRoute, setChoosingWorkflowRoute] = createSignal(false);
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
@@ -530,34 +522,6 @@ export function Composer() {
     }
   };
 
-  const manualReview = createMemo(() => {
-    workflowReviewRevision();
-    return state.currentId ? manualWorkflowReview(state.currentId) : null;
-  });
-
-  const suspendedNotice = createMemo(() => {
-    workflowReviewRevision();
-    return state.currentId ? workflowSuspendedNotice(state.currentId) : null;
-  });
-
-  const abandonWorkflowChain = () => {
-    const threadId = state.currentId;
-    if (threadId) abandonWorkflow(threadId);
-  };
-
-  const chooseWorkflowRoute = async (transitionId: string) => {
-    const threadId = state.currentId;
-    if (!threadId || choosingWorkflowRoute()) return;
-    setChoosingWorkflowRoute(true);
-    try {
-      await chooseManualWorkflowTransition(threadId, transitionId);
-    } catch (error) {
-      console.error("Workflow manual transition failed", error);
-    } finally {
-      setChoosingWorkflowRoute(false);
-    }
-  };
-
   const onPaste = (e: ClipboardEvent) => {
     const asPaths = pasteAsPaths;
     pasteAsPaths = false;
@@ -635,45 +599,6 @@ export function Composer() {
     >
       <noteFlow.Notes />
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
-      <Show when={manualReview()}>
-        {(review) => (
-          <div class="workflow-manual-review">
-            <div class="workflow-manual-review-head">
-              <strong>等待人工审核</strong>
-              <span>选择下一步</span>
-            </div>
-            <div class="workflow-manual-review-actions">
-              <For each={review().transitions}>
-                {(transition) => (
-                  <button
-                    type="button"
-                    class="btn secondary small"
-                    disabled={choosingWorkflowRoute()}
-                    onClick={() => void chooseWorkflowRoute(transition.id)}
-                  >
-                    {transition.label}
-                  </button>
-                )}
-              </For>
-            </div>
-          </div>
-        )}
-      </Show>
-      <Show when={suspendedNotice()}>
-        {(notice) => (
-          <div class="workflow-manual-review">
-            <div class="workflow-manual-review-head">
-              <strong>工作流已暂停</strong>
-              <span>「{notice().stageName}」没判定出下一步，直接发消息可继续</span>
-            </div>
-            <div class="workflow-manual-review-actions">
-              <button type="button" class="btn secondary small" onClick={abandonWorkflowChain}>
-                结束流程
-              </button>
-            </div>
-          </div>
-        )}
-      </Show>
       <Show when={activeClue()}>
         {(clue) => (
           <div class="clue-context-chip" title={`本会话引用线索：${clue().title}`}>

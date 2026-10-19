@@ -13,10 +13,20 @@ pub struct SessionShortcut {
     pub id: String,
     /// 规范化按键，如 Ctrl+1 / Alt+P。
     pub keys: String,
-    /// selectProject | selectModel | newSession | openUnread | insertText | selectWorkflow
+    /// selectProject | selectModel | newSession | openUnread | insertText | toggleTerminal
     pub action: String,
     /// 项目绝对路径、`<agentKind>:<modelId>` / roam 编码，或 insertText 文本；newSession 可为空。
     pub target: String,
+}
+
+fn deserialize_session_shortcuts<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<SessionShortcut>, D::Error> {
+    let mut shortcuts = Vec::<SessionShortcut>::deserialize(deserializer)?;
+    shortcuts.retain(|shortcut| matches!(shortcut.action.as_str(),
+        "selectProject" | "selectModel" | "newSession" | "openUnread" | "insertText" | "toggleTerminal"
+    ));
+    Ok(shortcuts)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -193,6 +203,7 @@ pub struct Settings {
     /// 新建会话模型选择器中收藏的模型，键格式为 `<agentKind>:<modelId>`。
     pub model_favorites: Vec<String>,
     /// 会话快捷键：按键一键切换项目或模型。
+    #[serde(deserialize_with = "deserialize_session_shortcuts")]
     pub session_shortcuts: Vec<SessionShortcut>,
     /// Meteor 屏幕标注入口；开发实例运行时正式版自动让出触发权。
     pub meteor_enabled: bool,
@@ -235,7 +246,7 @@ pub struct Settings {
     pub context_retrieval_mode: ContextRetrievalMode,
 
     /// 用户自定义追加的环境变量（覆盖同名用户/系统变量），
-    /// 注入所有 agent 子进程，并作为工作流模板 {{xx}} 的替换来源。
+    /// 注入所有 agent 子进程。
     #[serde(default)]
     pub custom_env_vars: std::collections::HashMap<String, String>,
 }
@@ -486,6 +497,21 @@ mod tests {
         assert_eq!(settings.session_shortcuts[0].keys, "Ctrl+1");
         assert_eq!(settings.session_shortcuts[0].action, "selectModel");
         assert_eq!(settings.session_shortcuts[0].target, "codex:gpt-5.6");
+    }
+
+    #[test]
+    fn session_shortcuts_discard_removed_actions_without_reassigning_them() {
+        let actions = ["selectProject", "selectModel", "newSession", "openUnread", "insertText", "toggleTerminal"];
+        let shortcuts: Vec<_> = actions.iter().copied().chain(["selectWorkflow", "unknown"])
+            .map(|action| serde_json::json!({
+                "id": action, "keys": "Ctrl+1", "action": action, "target": "original-target"
+            }))
+            .collect();
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "sessionShortcuts": shortcuts
+        })).unwrap();
+        assert_eq!(settings.session_shortcuts.iter().map(|s| s.action.as_str()).collect::<Vec<_>>(), actions);
+        assert!(settings.session_shortcuts.iter().all(|s| s.id == s.action && s.target == "original-target"));
     }
 
     #[test]

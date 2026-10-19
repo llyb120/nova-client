@@ -13,7 +13,6 @@ import type {
   GlobalAgentInstructions,
   PromptTrigger,
   IncomingShare,
-  IncomingWorkflowShare,
   ModelCost,
   ModelOptions,
   Peer,
@@ -36,7 +35,6 @@ import type {
   UpdateInfo,
   WorktreeRecord,
 } from "./types";
-import type { WorkflowDef } from "./workflow/types";
 import type { Preset } from "./lyraConfig";
 
 export function fileUriPath(uri: string) {
@@ -95,9 +93,6 @@ export const api = {
   removeProject: (cwd: string) => invoke<void>("remove_project", { cwd }),
   prewarm: (cwd: string, agentKind: AgentKind, mode?: string | null) =>
     invoke<void>("prewarm", { cwd, agentKind, mode }),
-  /** 工作流提示词模式连线判断（轻量模型）；返回选中的连线 id，无法判断返回空串 */
-  judgeWorkflowRoute: (conclusion: string, options: { id: string; label: string }[]) =>
-    invoke<string>("judge_workflow_route", { conclusion, options }),
   scratchDir: () => invoke<string>("scratch_dir"),
   chromeDependencyStatus: () =>
     invoke<{
@@ -265,16 +260,11 @@ export const api = {
   forkThread: (threadId: string, title: string) =>
     invoke<Thread>("fork_thread", { threadId, title }),
   clearThreadClue: (threadId: string) => invoke<void>("clear_thread_clue", { threadId }),
-  /** 让模型按节点任务生成会话标题（仅用于工作流阶段会话，前缀由后端保留）。 */
+  /** 为阶段会话按任务生成标题。 */
   generateThreadTitle: (threadId: string, prompt: string) =>
     invoke<void>("generate_thread_title", { threadId, prompt }),
   notifyFireDone: (threadId: string, success: boolean) =>
     invoke<void>("notify_fire_done", { threadId, success }),
-  notifyWorkflowDone: (threadId: string, success: boolean) =>
-    invoke<void>("notify_workflow_done", { threadId, success }),
-  /** 向后端追加一条系统提示（工作流预览等由前端渲染的结构化内容）。 */
-  pushSystemItem: (threadId: string, text: string, level = "info") =>
-    invoke<void>("push_system_item", { threadId, text, level }),
   setPromptQueuePending: (threadId: string, pending: boolean) =>
     invoke<void>("set_prompt_queue_pending", { threadId, pending }),
   sendPrompt: (threadId: string, text: string, images: PromptImage[] = []) =>
@@ -333,17 +323,6 @@ export const api = {
   acceptShare: (id: string, cwd: string, ephemeral = false) =>
     invoke<string>("accept_share", { id, cwd, ephemeral }),
   declineShare: (id: string) => invoke<void>("decline_share", { id }),
-  // 工作流分享：把工作流定义定向发给队友 / 接收队友分享的工作流
-  /** 共享/分享工作流：to 为空串 = 共享给全组在线队友；返回送达的队友数。 */
-  shareWorkflow: (workflow: WorkflowDef, to: string) =>
-    invoke<number>("share_workflow", { workflow, to }),
-  revokeWorkflow: (workflowId: string) =>
-    invoke<number>("revoke_workflow", { workflowId }),
-  getRelayWorkflowInbox: () => invoke<IncomingWorkflowShare[]>("get_relay_workflow_inbox"),
-  acceptRelayWorkflowShare: (id: string) =>
-    invoke<WorkflowDef>("accept_relay_workflow_share", { id }),
-  declineRelayWorkflowShare: (id: string) =>
-    invoke<void>("decline_relay_workflow_share", { id }),
   listRoamingFolders: () => invoke<string[]>("list_roaming_folders"),
   isFolderRoaming: (cwd: string) => invoke<boolean>("is_folder_roaming", { cwd }),
   setFolderRoaming: (cwd: string, allowed: boolean) =>
@@ -395,12 +374,6 @@ export const api = {
     invoke<void>("recall_roaming_thread", { threadId }),
   requestPeerModels: (peerToken: string) =>
     invoke<void>("request_peer_models", { peerToken }),
-  replyRoamingWorkflows: (peer: string, workflows: { id: string; name: string; stageCount: number }[]) =>
-    invoke<void>("reply_roaming_workflows", { peer, workflows }),
-  checkRoamingWorkflow: (threadId: string) =>
-    invoke<void>("check_roaming_workflow", { threadId }),
-  failRoamingWorkflow: (threadId: string, error: string) =>
-    invoke<void>("fail_roaming_workflow", { threadId, error }),
 
   // worktree（独立工作目录执行）
   isGitRepo: (path: string) => invoke<boolean>("is_git_repo", { path }),

@@ -255,7 +255,7 @@ pub(crate) fn taskbar_assistant_sessions(app: tauri::AppHandle) -> Result<Vec<Se
     } else { HashSet::new() };
     let store = state.store.lock().map_err(|e| e.to_string())?;
     // Only the user's own top-level sessions: no employee runs, and no internally spawned
-    // children (Stage/scene handoff/workflow carry a parent_thread_id).
+    // children (Stage/scene handoff carry a parent_thread_id).
     let mut threads: Vec<_> = store.threads.iter().filter(|t| eligible(t) && t.parent_thread_id.is_none())
         .filter_map(|t| {
             let running = crate::is_running(&state, t);

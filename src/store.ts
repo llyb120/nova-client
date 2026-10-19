@@ -17,7 +17,6 @@ import type {
   EffortChoice,
   IncomingRoamRequest,
   IncomingShare,
-  IncomingWorkflowShare,
   Item,
   LiveUsage,
   ModelChoice,
@@ -48,28 +47,8 @@ import { ALL_AGENT_KINDS, isSupportedAgentKind, SCENES, type ModelTarget, type S
 export { ALL_AGENT_KINDS } from "./types";
 import { isScratch, scratchParent } from "./utils";
 import { taskChains } from "./taskChains";
-import {
-  busyWorkflowRoots,
-  handleTurnEnd as handleWorkflowTurnEnd,
-  handleTurnStart as handleWorkflowTurnStart,
-  initWorkflowRuntime,
-  preparePrompt as prepareWorkflowPrompt,
-  startWorkflow,
-  suspendActive as suspendWorkflowActive,
-  unfinishedWorkflowRoots,
-  workflowChainTip,
-  workflowReviewRevision,
-} from "./workflow/runtime";
-import {
-  findTriggeredWorkflow,
-  findWorkflowByName,
-  registerTransientWorkflow,
-  unregisterTransientWorkflow,
-} from "./workflow/storage";
 import { latestFireStage } from "./threadDisplay";
-import { normalizeGeneratedWorkflow } from "./workflow/types";
-import { initRoamingWorkflows, setPeerWorkflows } from "./workflow/roaming";
-import { buildEasyPrompt, buildHardDesignPrompt, buildIntegrateModelPrompt, buildPlanPrompt, buildSetupImagePrompt, buildGenerateImagePrompt } from "./builtinPrompts";
+import { buildEasyPrompt, buildIntegrateModelPrompt, buildPlanPrompt, buildSetupImagePrompt, buildGenerateImagePrompt } from "./builtinPrompts";
 import { rememberPromptDisplay } from "./promptDisplay";
 
 /** 界面皮肤：深色（默认）/ 浅色 */
@@ -181,7 +160,6 @@ interface AppStore {
   peerModels: Record<string, PeerModels>;
   peerBranches: Record<string, BranchList>;
   inbox: IncomingShare[];
-  workflowInbox: IncomingWorkflowShare[];
   achievements: Achievement[];
   achievementsLoaded: boolean;
   achievementsError: string;
@@ -192,7 +170,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
-  view: "home" | "clues" | "workflows" | "knowledge" | "employee" | "jianpu" | "miniapps";
+  view: "home" | "clues" | "knowledge" | "employee" | "jianpu" | "miniapps";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -260,7 +238,6 @@ export const [state, setState] = createStore<AppStore>({
   peerModels: {},
   peerBranches: {},
   inbox: [],
-  workflowInbox: [],
   achievements: [],
   achievementsLoaded: false,
   achievementsError: "",
@@ -644,14 +621,6 @@ export async function refreshInbox() {
   }
 }
 
-export async function refreshWorkflowInbox() {
-  try {
-    setState("workflowInbox", await api.getRelayWorkflowInbox());
-  } catch {
-    // 忽略
-  }
-}
-
 // ===== 成就 =====
 
 const ACHIEVEMENT_IMAGE_CACHE_KEY = "nova.achievementImageRefresh";
@@ -926,11 +895,6 @@ export function roamingPeers(): Peer[] {
 export function ensurePeerModels(token: string, force = false) {
   if (!token) return;
   if (!force && state.peerModels[token]) return;
-  if (force) setPeerWorkflows((previous) => {
-    const next = { ...previous };
-    delete next[token];
-    return next;
-  });
   void api.requestPeerModels(token).catch(() => {
     // 对端离线/未连接时静默失败，选择器回退为空，用户可稍后重试
   });
@@ -1459,36 +1423,15 @@ export function isPendingThreadId(id: string | null | undefined): boolean {
 }
 
 /**
- * 任务链运行态口径（侧栏转圈、运行中/已完成未读计数共用）：
- * active = 未结束任务链（含父子接力整条链）的全部会话 id；
- * busy = 工作流仍在推进（活动阶段或阶段接力空档）的链上的会话 id；
- * rootCount = 运行中任务数（不把「暂停等人」的任务计入）。
- * 集合计算在 taskChains（纯函数，单测见 scripts/task-chains.test.mjs），
- * 这里只接入信号与工作流运行时。
+ * 任务链运行态：active 包含运行中或有待发提示词的整条父子链；
+ * rootCount 只统计运行中的任务链，不把队列等待计入。
  */
-export function runningTaskChains(): { active: Set<string>; busy: Set<string>; rootCount: number } {
-  // 工作流运行态（activeRuns/suspendedRuns/advancingRoots）是普通内存集合，不是响应式信号；
-  // 读一下 revision，侧栏才不会等到下一次 refreshThreads 才反映任务链状态。
-  workflowReviewRevision();
+export function runningTaskChains(): { active: Set<string>; rootCount: number } {
   return taskChains({
     threads: state.threads,
     isRunning: (id) => !!state.running[id],
-    advancingRoots: busyWorkflowRoots(),
-    unfinishedRoots: unfinishedWorkflowRoots(),
     queuedThreads: Object.keys(state.promptQueued),
   });
-}
-
-/**
- * 未完成的工作流链当前进行到的阶段会话（链尖），不存在时返回 undefined。
- * 点击任务链时优先用它：latestFireStage 只能按「谁在 running / 谁有未读」猜，
- * 阶段接力空档和等待补充/审核时会落到已结束的旧阶段。
- */
-export function liveWorkflowStage(rootId: string): string | undefined {
-  workflowReviewRevision();
-  const tip = workflowChainTip(rootId);
-  if (!tip) return undefined;
-  return state.threads.some((thread) => thread.id === tip && !thread.subagent) ? tip : undefined;
 }
 
 /** 会话及其子孙（接力链）上的未读总数，与侧栏徽标口径一致。 */
@@ -1850,7 +1793,6 @@ export async function sendPrompt(
 ) {
   let id = state.currentId;
   if (!id || isSubagentThread(id) || (!text.trim() && images.length === 0)) return;
-  // 内置命令优先于工作流触发器，避免 /fire、/hard 等被当成普通内容。
   if (await tryBuiltinPrompt(id, text, images)) return;
   // 在历史分支预览中追加提示词时才发生时间跳跃：先恢复该分支，再把新提示词
   // 发送到恢复出的会话。仅浏览或点击当前时间线不会恢复会话。
@@ -1863,18 +1805,6 @@ export async function sendPrompt(
     id = restored.threadId;
   }
   await deliverPrompt(id, text, images);
-}
-
-/** 在指定会话上启动工作流（不依赖 currentId，按 threadId 直接投递）。 */
-export async function startWorkflowOnThread(
-  threadId: string,
-  text: string,
-  images: PromptImage[],
-  workflowId: string,
-  followFrom?: { agentKind: AgentKind; model: string | null },
-): Promise<void> {
-  if (isSubagentThread(threadId)) return;
-  await startWorkflow(workflowId, { goal: text.trim() }, threadId, images, followFrom);
 }
 
 type StageInput = { currentPrompt: string; stagePrompt: string; stageIndex: number };
@@ -1912,90 +1842,6 @@ async function startStageThread(
     await api.sendPrompt(thread.id, prompt);
   } catch (error) {
     setState("running", thread.id, false);
-    throw error;
-  }
-}
-
-// ---- /hard：从第一个 Stage 设计并展示工作流，再直接执行工作流入口 ----
-
-interface PendingHardDesign {
-  goal: string;
-}
-
-/** 设计轮次 id → 待执行信息。设计正常结束后由 turn 事件驱动解析并启动工作流。 */
-const pendingHardDesign = new Map<string, PendingHardDesign>();
-
-function extractWorkflowJson(raw: string): string {
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start < 0 || end < start) throw new Error("Agent 未返回 JSON 工作流");
-  return raw.slice(start, end + 1);
-}
-
-function lastAssistantText(thread: Thread): string {
-  for (let i = thread.items.length - 1; i >= 0; i--) {
-    const item = thread.items[i];
-    if (item.type === "assistant" && item.text.trim()) return item.text.trim();
-  }
-  return "";
-}
-
-/** 第一个阶段：当前会话本身立即成为工作流设计 Stage，不再派生一个空父/设计会话。 */
-async function startHardWorkflow(threadId: string, goal: string, typed: string): Promise<void> {
-  const designTitle = "[Hard] 工作流设计";
-  await api.renameThread(threadId, designTitle);
-  setState("title", designTitle);
-  setState("threads", (thread) => thread.id === threadId, "title", designTitle);
-  pendingHardDesign.set(threadId, { goal });
-  try {
-    await deliverPrompt(threadId, buildHardDesignPrompt(goal), [], typed);
-  } catch (error) {
-    pendingHardDesign.delete(threadId);
-    throw error;
-  }
-}
-
-/** 设计 Stage 正常结束后：在结尾展示工作流图；入口节点从下一个 Stage 会话开始执行。 */
-async function finalizeHardDesign(threadId: string): Promise<void> {
-  const pending = pendingHardDesign.get(threadId);
-  if (!pending) return;
-  pendingHardDesign.delete(threadId);
-  let transientWorkflowId: string | null = null;
-
-  try {
-    const thread = await api.getThread(threadId);
-    const raw = lastAssistantText(thread);
-    if (!raw) throw new Error("Agent 没有返回工作流设计");
-    const workflow = normalizeGeneratedWorkflow(JSON.parse(extractWorkflowJson(raw)));
-    registerTransientWorkflow(workflow);
-    transientWorkflowId = workflow.id;
-
-    // 单独插入一个只读流程图 Stage：设计会话保留设计原文，下一 Stage 复用
-    // 工作流配置画布展示结构，再由后续 Stage 开始执行入口节点。
-    const workflowJson = JSON.stringify(workflow);
-    const previewThread = await api.createStageThread(threadId, true);
-    const previewTitle = "[Hard] 工作流图";
-    await api.renameThread(previewThread.id, previewTitle);
-    previewThread.title = previewTitle;
-    rememberThreadSnapshot(previewThread);
-    await api.pushSystemItem(previewThread.id, workflowJson, "workflow");
-    await refreshThreads();
-    await openThread(previewThread.id);
-
-    const entry = workflow.stages.find((stage) => stage.id === workflow.entry)!;
-    const execThread = await api.createStageThread(previewThread.id, true);
-    const execTitle = `[WF] ${entry.name}`;
-    await api.renameThread(execThread.id, execTitle);
-    execThread.title = execTitle;
-    rememberThreadSnapshot(execThread);
-    await refreshThreads();
-    // 执行节点在后台立即开始；界面停留在流程图 Stage，用户可先查看完整画布，
-    // 再从 Stage 导航进入已经启动的入口节点。
-    await startWorkflow(workflow.id, { goal: pending.goal }, execThread.id, []);
-  } catch (error) {
-    if (transientWorkflowId) unregisterTransientWorkflow(transientWorkflowId);
-    const message = error instanceof Error ? error.message : String(error);
-    await api.pushSystemItem(threadId, `Hard 工作流设计失败：${message}`, "error");
     throw error;
   }
 }
@@ -2043,22 +1889,10 @@ async function tryBuiltinPrompt(
     await deliverPrompt(threadId, buildEasyPrompt(goal), images, builtInInput);
     return true;
   }
-  if (/^\/hard(?:\s|$)/i.test(builtInInput)) {
-    if (images.length > 0) throw new Error("/hard 暂不支持附件");
-    const goal = builtInInput.replace(/^\/hard(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
-    if (!goal) throw new Error("请在 /hard 后输入目标，例如 /hard 修复登录问题并完成测试");
-    await startHardWorkflow(threadId, goal, builtInInput);
-    return true;
-  }
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
     if (images.length > 0) throw new Error("/fire 暂不支持附件");
     const parsed = parseFireInput(builtInInput);
     await startFireRelay(parsed.goal, parsed.acceptanceCriteria, threadId, builtInInput);
-    return true;
-  }
-  if (/^\/run(?:\s|$)/i.test(builtInInput)) {
-    const parsed = parseRunInput(builtInInput);
-    await startWorkflow(parsed.workflowId, parsed.vars, threadId, images);
     return true;
   }
   if (/^\/setup(?:\s|$)/i.test(builtInInput)) {
@@ -2075,51 +1909,10 @@ async function tryBuiltinPrompt(
     }
     return true;
   }
-  // 触发条件：提示词命中某工作流的 slash/contains/regex 触发器时自动启动。
-  // 漫游会话的普通补充消息不能被本机工作流触发器抢走。
-  const roamingRole = state.threads.find((thread) => thread.id === threadId)?.roamingRole
-    ?? getThreadSnapshot(threadId)?.roamingRole;
-  const triggered = roamingRole === "guest" ? null : findTriggeredWorkflow(builtInInput);
-  if (triggered) {
-    await startWorkflow(triggered.id, { goal: triggered.goal }, threadId, images);
-    return true;
-  }
   if (/^\/target(?:\s|$)/i.test(builtInInput)) {
     throw new Error("/target 只能与 /fire 一起发送");
   }
   return false;
-}
-
-/**
- * 解析 /run <工作流名> <目标> [-- key=value ...]。
- * 工作流名取第一个空白分隔的词；「--」之前（工作流名之后）为目标 goal；
- * 「--」之后为 key=value 形式的流程变量（值可含空格，最后一个 key 吞掉剩余文本），
- * 可在节点提示词模板里用 {{key}} 引用，例如 -- criteria=不能有类型错误。
- */
-function parseRunInput(input: string): { workflowId: string; vars: Record<string, string> } {
-  const body = input.replace(/^\/run(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
-  if (!body) throw new Error("请在 /run 后输入工作流名称和目标");
-  const [nameToken, ...restTokens] = body.split(/\s+/);
-  const workflow = findWorkflowByName(nameToken);
-  if (!workflow) throw new Error(`找不到名为「${nameToken}」的工作流，可在设置·工作流中查看`);
-  const rest = restTokens.join(" ");
-  const sepMatch = /(?:^|\s)--(?:\s|$)/.exec(rest);
-  const goal = (sepMatch ? rest.slice(0, sepMatch.index) : rest).trim();
-  if (!goal) throw new Error("请在 /run <工作流名> 后输入目标");
-  const vars: Record<string, string> = { goal };
-  const varsText = sepMatch ? rest.slice(sepMatch.index + sepMatch[0].length).trim() : "";
-  if (varsText) {
-    // 按「空白后跟 key=」切分，允许值里包含空格。
-    const parts = varsText.split(/\s+(?=[\w一-龥-]+=)/);
-    for (const part of parts) {
-      const eq = part.indexOf("=");
-      if (eq <= 0) continue;
-      const key = part.slice(0, eq).trim();
-      const value = part.slice(eq + 1).trim();
-      if (key && value) vars[key] = value;
-    }
-  }
-  return { workflowId: workflow.id, vars };
 }
 
 /** 创建会话 / 暂存前提前校验内置命令，避免 worktree 建完才发现 /fire 非法。 */
@@ -2145,12 +1938,6 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
   if (/^\/easy(?:\s|$)/i.test(builtInInput)) {
     const goal = builtInInput.replace(/^\/easy(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
     if (!goal) throw new Error("请在 /easy 后输入明确的小修改目标，例如 /easy 修复这个类型错误");
-    return;
-  }
-  if (/^\/hard(?:\s|$)/i.test(builtInInput)) {
-    if (images.length > 0) throw new Error("/hard 暂不支持附件");
-    const goal = builtInInput.replace(/^\/hard(?:[ \t]+|(?=\r?\n)|$)/i, "").trim();
-    if (!goal) throw new Error("请在 /hard 后输入目标，例如 /hard 修复登录问题并完成测试");
     return;
   }
   if (/^\/fire(?:\s|$)/i.test(builtInInput)) {
@@ -2192,8 +1979,6 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
   // Fire 阶段在暂停后，或已经产出过判断后，仍允许用户从该会话补充提示继续流程。
   // 本轮正常结束时会重新进入自动验收，而不是退化成不受跟踪的普通会话。
   const resumedFireStep = resumeFireRelay(threadId);
-  // 非 Fire 会话再尝试挂回通用工作流；只读阶段会改写为续跑提示。
-  const workflowOutbound = resumedFireStep ? null : prepareWorkflowPrompt(threadId, text);
   const currentMode = state.currentId === threadId ? state.mode : "";
   setState("proposedPlan", null);
   optimisticRunningThreads.add(threadId);
@@ -2212,7 +1997,7 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
     // 下一个执行阶段，否则判断会话会自己动手改项目。
     const outbound = resumedFireStep?.role === "judge"
       ? fireJudgeResumePrompt(text)
-      : workflowOutbound ?? text;
+      : text;
     rememberPromptDisplay(outbound, typed);
     await api.sendPrompt(threadId, outbound, images);
   } catch (e) {
@@ -2224,8 +2009,6 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
       fireRelaySteps.delete(threadId);
       suspendedFireRelaySteps.set(threadId, resumedFireStep);
       persistFireRelayState();
-    } else if (workflowOutbound !== null) {
-      suspendWorkflowActive(threadId);
     }
     setState("running", threadId, false);
     throw e;
@@ -2307,23 +2090,6 @@ function restoreFireRelayState() {
 }
 
 restoreFireRelayState();
-
-// 通用工作流运行时（/run）：复用会话接力模式，与 /fire 专用路径并存。
-initWorkflowRuntime({
-  currentId: () => state.currentId,
-  isRunning: (id) => !!state.running[id],
-  // 工作流节点在「已置忙 → sendPrompt 真正起来」的间隙里同样需要乐观运行态，
-  // 否则阶段接力期间 refreshThreads 的后端 false 快照会把会话冲回普通列表。
-  setRunning: (id, v) => {
-    if (v) optimisticRunningThreads.add(id);
-    else optimisticRunningThreads.delete(id);
-    setState("running", id, v);
-  },
-  refreshThreads: () => refreshThreads(),
-  openThread: (id) => openThread(id),
-  bumpScrollToBottom: () => bumpChatScrollToBottom(),
-  clearProposedPlan: () => setState("proposedPlan", null),
-});
 
 type ParsedFireInput = {
   goal: string;
@@ -2609,8 +2375,6 @@ const pendingWorktreePrompts = new Map<
   {
     text: string;
     images: PromptImage[];
-    workflowId?: string | null;
-    followFrom?: { agentKind: AgentKind; model: string | null };
   }
 >();
 
@@ -2618,11 +2382,7 @@ function flushWorktreePrompt(threadId: string) {
   const prompt = pendingWorktreePrompts.get(threadId);
   if (!prompt) return;
   pendingWorktreePrompts.delete(threadId);
-  // 新会话页选了工作流：就绪后直接启动工作流（goal 为暂存提示词），否则按普通提示词发送。
-  const action = prompt.workflowId
-    ? startWorkflowOnThread(threadId, prompt.text, prompt.images, prompt.workflowId, prompt.followFrom)
-    : sendPromptTo(threadId, prompt.text, prompt.images);
-  void action.catch((error) => {
+  void sendPromptTo(threadId, prompt.text, prompt.images).catch((error) => {
     console.error("worktree prompt flush failed", error);
   });
 }
@@ -2631,11 +2391,9 @@ export function stashWorktreePrompt(
   threadId: string,
   text: string,
   images: PromptImage[],
-  workflowId?: string | null,
-  followFrom?: { agentKind: AgentKind; model: string | null },
 ) {
   if (!text.trim() && images.length === 0) return;
-  pendingWorktreePrompts.set(threadId, { text, images, workflowId: workflowId ?? null, followFrom });
+  pendingWorktreePrompts.set(threadId, { text, images });
   // create_thread 可能直接复用已就绪的 worktree，或后台 ready 事件可能先于 invoke 返回。
   // 主动核对持久化状态，避免首条提示词永远留在暂存 Map。
   void api
@@ -3055,7 +2813,6 @@ export const [restoreSettled, setRestoreSettled] = createSignal(false);
 export async function initStore() {
   if (initialized) return;
   initialized = true;
-  await initRoamingWorkflows();
   // 无新消息也结算采样窗口：首块及时显示，工具执行/等待期间归零。
   setInterval(() => {
     for (const threadId of rateWindows.keys()) {
@@ -3191,7 +2948,6 @@ export async function initStore() {
         }
         // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
         resumeFireRelay(e.payload.threadId);
-        handleWorkflowTurnStart(e.payload.threadId);
       } else {
         // 轮次收尾（正常或出错）且该会话未打开 → 标记未读，提醒回看结论或错误；
         // 与后端 notify_done 的分类一致，只有用户主动取消不算未读。
@@ -3226,17 +2982,6 @@ export async function initStore() {
           : state.threads.find((thread) => thread.id === threadId)?.agentKind;
         if (e.payload.stopReason === "error" && isSupportedAgentKind(failedAgent)) {
           void api.autoFailover(threadId).catch((error) => console.error("Auto failover failed", error));
-        }
-        // 通用工作流（/run）与 Fire 互斥：非 Fire 会话才会被其接管。
-        handleWorkflowTurnEnd(e.payload.threadId, e.payload.stopReason);
-        if (pendingHardDesign.has(threadId)) {
-          const reason = e.payload.stopReason;
-          const completedNormally = reason === "end_turn" || reason === "max_turn_requests";
-          if (completedNormally) {
-            void finalizeHardDesign(threadId).catch((error) =>
-              console.error("Hard workflow design failed", error),
-            );
-          }
         }
         if (
           e.payload.threadId === state.currentId &&
@@ -3406,7 +3151,6 @@ export async function initStore() {
       setState("relay", e.payload);
       if (e.payload.connected) {
         void refreshInbox();
-        void refreshWorkflowInbox();
         // 重连后强制校准：离线期间对端可能已调整共享模型，旧 peerModels 不能继续复用。
         preloadPeerModels(true);
       }
@@ -3450,10 +3194,6 @@ export async function initStore() {
       const hasNewRecall = e.payload.some((s) => s.recall && !known.has(s.id));
       setState("inbox", e.payload);
       if (hasNewRecall) setState("inboxPromptAt", Date.now());
-    }),
-    // 队友分享的工作流到达：进入工作流收件箱，在「工作流」页接收
-    listen<IncomingWorkflowShare[]>("relay:workflow-inbox", (e) => {
-      setState("workflowInbox", e.payload);
     }),
     // 本地 worktree 后台创建就绪：切到 worktree 的 cwd 已由后端回写，这里补发暂存的首条提示词
     listen<{ threadId: string }>("acp:worktree-ready", (e) => {
@@ -3523,7 +3263,6 @@ export async function initStore() {
     })
     .catch(() => {});
   void refreshInbox();
-  void refreshWorkflowInbox();
   // 成就后台预拉：有新成就时侧栏入口直接亮角标，不必等用户打开成就页
   void refreshAchievements();
   void refreshRoamingFolders();

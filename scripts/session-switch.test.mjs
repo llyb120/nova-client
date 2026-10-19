@@ -103,7 +103,7 @@ test("缓存切换跳过加载帧并取消流式节流，首次加载仍允许�
 
 test("多 stage 同链反复切换复用导航列表，新增阶段后更新，断链和成环不挂起", () => {
   const chat = readFileSync(new URL("../src/components/ChatView.tsx", import.meta.url), "utf8");
-  const source = chat.slice(chat.indexOf("  const stageIndex ="), chat.indexOf("  /** 是否工作流/Fire/员工事件链"));
+  const source = chat.slice(chat.indexOf("  const stageIndex ="), chat.indexOf("  const isStageTitle ="));
   createRoot((dispose) => {
     try {
       const initial = Array.from({ length: 200 }, (_, i) => ({ id: `s${i}`, parentThreadId: i ? `s${i - 1}` : null, createdAt: i }));
@@ -139,7 +139,7 @@ test("队列镜像移除旧 key，清空或挂起后整条链结束", () => {
   update(new Set(["child"]));
   const active = () => taskChains({
     threads: [{ id: "root" }, { id: "child", parentThreadId: "root" }],
-    isRunning: () => false, advancingRoots: [], unfinishedRoots: [],
+    isRunning: () => false,
     queuedThreads: Object.keys(state.promptQueued),
   }).active;
   assert.equal(active().size, 2);
@@ -155,7 +155,8 @@ test("侧栏链索引只构建一次，重复查询不扫描历史，成环也�
   const threads = [{ id: "root", parentThreadId: "child" }, { id: "child", parentThreadId: "root" }, ...Array.from({ length: 10000 }, (_, i) => ({ id: `plain-${i}` }))];
   const state = { get threads() { scans++; return threads; } };
   const indexSource = sidebar.slice(sidebar.indexOf("  const childrenById ="), sidebar.indexOf("  const threadOf ="));
-  const chainSource = sidebar.slice(sidebar.indexOf("    const chainThreads ="), sidebar.indexOf("    // 整条链的忙碌态"));
+  const chainStart = sidebar.indexOf("    const chainThreads =");
+  const chainSource = sidebar.slice(chainStart, sidebar.indexOf("    const running =", chainStart));
   createRoot((dispose) => {
     try {
       const chain = new Function("state", "createMemo", "t", `${js(indexSource + chainSource)}; return chainThreads;`)(state, createMemo, threads[0]);

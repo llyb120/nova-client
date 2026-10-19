@@ -49,12 +49,6 @@ export function getSlashSuggestions(
       input: "/stage ",
     },
     {
-      name: "hard",
-      description: "让当前 Agent 设计简洁工作流并立即执行",
-      kind: "Nova",
-      input: "/hard ",
-    },
-    {
       name: "fire",
       description: "分阶段执行，并用独立会话反复验收直到目标达成",
       kind: "Nova",
@@ -65,12 +59,6 @@ export function getSlashSuggestions(
       description: "为 /fire 明确指定验收规则（需与 /fire 一起发送）",
       kind: "Nova",
       input: "/target ",
-    },
-    {
-      name: "run",
-      description: "运行一个已配置的工作流：/run 工作流名 目标",
-      kind: "Nova",
-      input: "/run ",
     },
     {
       name: "setup",

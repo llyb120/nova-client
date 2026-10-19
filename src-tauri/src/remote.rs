@@ -2477,7 +2477,7 @@ fn send_prompt(
         }
     }
     // 有界面时先交给前端统一输入入口，让远程文本与桌面 Composer 一样处理
-    // `/easy`、`/plan`、工作流触发器等客户端指令；前端展开后再经 IPC 投递。
+    // `/easy`、`/plan` 等客户端指令；前端展开后再经 IPC 投递。
     // headless 没有前端事件消费者，继续直接发送普通提示词。
     if !crate::server::is_headless() {
         app.emit(

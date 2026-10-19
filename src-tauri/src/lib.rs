@@ -64,7 +64,7 @@ pub use server::maybe_run_management_command as maybe_run_server_command;
 
 use acp::AcpManager;
 use codex::CodexManager;
-use relay::{RelayManager, Share, WorkflowShare};
+use relay::{RelayManager, Share};
 use sdk_adapters::{CodexAdapter, LyraAdapter};
 use sdk_runtime::SdkManager;
 use serde_json::{json, Value};
@@ -196,19 +196,6 @@ impl AppState {
         prompt: String,
         fallback: String,
     ) {
-        // 工作流会话保留 [WF] 前缀（阶段导航依赖它识别链）；超长的阶段名兜底标题截短。
-        let fallback = if fallback.starts_with("[WF]") {
-            if fallback.chars().count() > 28 {
-                format!(
-                    "[WF] {}",
-                    fallback[4..].chars().take(24).collect::<String>()
-                )
-            } else {
-                fallback
-            }
-        } else {
-            fallback
-        };
         let (agent_raw, model) = self
             .scene_model(settings::Scene::Lightweight)
             .map(|(kind, model)| (kind.as_str().to_string(), model))
@@ -3238,53 +3225,6 @@ fn notify_fire_done(
 }
 
 #[tauri::command]
-fn notify_workflow_done(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    thread_id: String,
-    success: bool,
-) -> Result<(), String> {
-    let title = {
-        let store = state.store.lock().unwrap();
-        let thread = store.get(&thread_id).ok_or("线程不存在")?;
-        if !(thread.title.starts_with("[Fire]") || thread.title.starts_with("[WF]")) {
-            return Err("不是工作流会话".into());
-        }
-        thread.title.clone()
-    };
-    let body = if success {
-        "工作流已完成，点击查看结果"
-    } else {
-        "工作流已结束，但未通过最终阶段"
-    };
-    sys_notify::notify_thread_done_unfiltered(&app, &thread_id, &title, body, acp::EV_NOTIFY_OPEN);
-    Ok(())
-}
-
-/// 向会话追加一条系统提示（工作流预览、错误提示等由前端渲染的结构化内容）。
-#[tauri::command]
-fn push_system_item(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    thread_id: String,
-    text: String,
-    level: String,
-) -> Result<(), String> {
-    let item = {
-        let mut store = state.store.lock().unwrap();
-        let thread = store.get_mut(&thread_id).ok_or("会话不存在")?;
-        let item = thread.push_system(text, &level);
-        store.save();
-        item
-    };
-    let _ = app.emit(
-        acp::EV_UPDATE,
-        json!({ "threadId": thread_id, "op": { "t": "upsert", "item": item } }),
-    );
-    Ok(())
-}
-
-#[tauri::command]
 fn create_time_machine_checkpoint(
     state: State<'_, AppState>,
     thread_id: String,
@@ -3507,8 +3447,7 @@ fn clear_thread_clue(
     Ok(())
 }
 
-/// 工作流阶段会话：让模型按节点任务生成标题。会话先以「[WF] 节点名」兜底创建，
-/// 生成成功后替换（[WF] 前缀由后端统一保留）；生成失败则保持兜底标题。
+/// 为阶段会话按任务生成标题；生成失败时保留现有标题。
 #[tauri::command]
 fn generate_thread_title(state: State<'_, AppState>, thread_id: String, prompt: String) {
     let (agent_kind, fallback) = {
@@ -4207,7 +4146,7 @@ fn truncate_thread(
         }
         if should_send {
             let prompt = prompt.unwrap_or_default();
-            // 恢复完成后与 Composer 共用前端命令展开、模式设置及工作流续跑入口。
+            // 恢复完成后与 Composer 共用前端命令展开及模式设置入口。
             let result = if server::is_headless() {
                 dispatch_prompt(&background_app, thread_id.clone(), prompt, images)
             } else {
@@ -4971,16 +4910,6 @@ fn parse_clue_ai_summary(raw: &str, fallback_title: &str) -> ClueAiSummary {
     ClueAiSummary { title, content }
 }
 
-fn take_last_chars(text: &str, max: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max {
-        return text.to_string();
-    }
-    let mut out = String::from("…");
-    out.extend(&chars[chars.len() - max..]);
-    out
-}
-
 fn miniapp_validate_text(text: &str, max_bytes: usize) -> Result<(), String> {
     if text.trim().is_empty() {
         return Err("文本不能为空".into());
@@ -5016,77 +4945,6 @@ fn miniapp_text_limits_are_utf8_bytes() {
     }
 }
 
-/* ===== 工作流连线判断（轻量模型） ===== */
-
-/// 提示词模式连线的候选分支。
-#[derive(serde::Deserialize)]
-struct RouteJudgeOption {
-    id: String,
-    label: String,
-}
-
-/// 传给判断模型的节点结论字数上限（结论通常在后面，取末尾）。
-const ROUTE_JUDGE_CONCLUSION_MAX: usize = 2000;
-
-/// 提示词模式连线判断：用配置的轻量级模型根据节点结论选择下一条连线。
-/// 返回选中的连线 id；无法判断返回空串，由前端按「待补充」暂停处理。
-#[tauri::command]
-async fn judge_workflow_route(
-    state: State<'_, AppState>,
-    conclusion: String,
-    options: Vec<RouteJudgeOption>,
-) -> Result<String, String> {
-    if options.is_empty() {
-        return Ok(String::new());
-    }
-    let Some(model) = state.lyra_lightweight_model() else {
-        return Err("轻量化场景未配置 Lyra 模型，无法使用提示词判断连线".into());
-    };
-    let list = options
-        .iter()
-        .enumerate()
-        .map(|(i, o)| format!("{}. {}", i + 1, o.label.trim()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let seed = format!(
-        "你是工作流路由器：根据「节点结论」判断流程接下来应该走哪一条分支。\n\
-         规则：只输出所选分支的编号（一个数字），不要输出任何其它内容；没有明显合适的分支时输出 0。\n\n\
-         分支：\n{list}\n\n节点结论：\n{}\n\n编号：",
-        take_last_chars(conclusion.trim(), ROUTE_JUDGE_CONCLUSION_MAX)
-    );
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let fut = state.lyra.complete_once(&cwd, &model, seed);
-    let raw = tokio::time::timeout(std::time::Duration::from_secs(20), fut)
-        .await
-        .map_err(|_| "连线判断超时".to_string())??;
-    let text = raw.trim();
-    // 1) 编号解析：只看输出中的第一个数字。
-    for token in text.split(|c: char| !c.is_ascii_digit()) {
-        if token.is_empty() {
-            continue;
-        }
-        if let Ok(n) = token.parse::<usize>() {
-            if n >= 1 && n <= options.len() {
-                return Ok(options[n - 1].id.clone());
-            }
-            if n == 0 {
-                return Ok(String::new());
-            }
-        }
-        break;
-    }
-    // 2) 名称兜底：输出里直接包含某分支名。
-    for opt in &options {
-        let label = opt.label.trim();
-        if !label.is_empty() && text.contains(label) {
-            return Ok(opt.id.clone());
-        }
-    }
-    Ok(String::new())
-}
-
 /// 接收一条分享，在指定目录新建本地会话，返回新会话 id
 #[tauri::command]
 fn accept_share(
@@ -5103,37 +4961,6 @@ fn accept_share(
 #[tauri::command]
 fn decline_share(state: State<'_, AppState>, id: String) {
     state.relay.decline_share(&id);
-}
-
-/// 把工作流定义分享给指定队友（对方接收后进入其工作流库）
-#[tauri::command]
-fn share_workflow(
-    state: State<'_, AppState>,
-    workflow: Value,
-    to: String,
-) -> Result<usize, String> {
-    state.relay.share_workflow(&workflow, &to)
-}
-
-#[tauri::command]
-async fn revoke_workflow(state: State<'_, AppState>, workflow_id: String) -> Result<usize, String> {
-    state.relay.revoke_workflow(&workflow_id).await
-}
-
-#[tauri::command]
-fn get_relay_workflow_inbox(state: State<'_, AppState>) -> Vec<WorkflowShare> {
-    state.relay.workflow_inbox_list()
-}
-
-/// 接收队友分享的工作流：返回定义 JSON，由前端写入本地工作流库
-#[tauri::command]
-fn accept_relay_workflow_share(state: State<'_, AppState>, id: String) -> Result<Value, String> {
-    state.relay.accept_workflow_share(&id)
-}
-
-#[tauri::command]
-fn decline_relay_workflow_share(state: State<'_, AppState>, id: String) {
-    state.relay.decline_workflow_share(&id);
 }
 
 #[tauri::command]
@@ -5240,21 +5067,6 @@ fn recall_roaming_thread(state: State<'_, AppState>, thread_id: String) -> Resul
 #[tauri::command]
 fn request_peer_models(state: State<'_, AppState>, peer_token: String) {
     state.relay.request_peer_models(peer_token);
-}
-
-#[tauri::command]
-fn reply_roaming_workflows(state: State<'_, AppState>, peer: String, workflows: serde_json::Value) {
-    state.relay.reply_roaming_workflows(peer, workflows);
-}
-
-#[tauri::command]
-fn check_roaming_workflow(state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
-    state.relay.check_roaming_workflow(&thread_id)
-}
-
-#[tauri::command]
-fn fail_roaming_workflow(state: State<'_, AppState>, thread_id: String, error: String) {
-    state.relay.fail_roaming_workflow(&thread_id, &error);
 }
 
 /// host：对收到的漫游请求作出应答（接受/拒绝）
@@ -6023,8 +5835,6 @@ pub fn run() {
             rename_thread,
             clear_thread_clue,
             notify_fire_done,
-            notify_workflow_done,
-            push_system_item,
             set_prompt_queue_pending,
             set_thread_model,
             set_thread_mode,
@@ -6064,14 +5874,8 @@ pub fn run() {
             auto_failover,
             generate_thread_title,
             miniapp_generate,
-            judge_workflow_route,
             accept_share,
             decline_share,
-            share_workflow,
-            revoke_workflow,
-            get_relay_workflow_inbox,
-            accept_relay_workflow_share,
-            decline_relay_workflow_share,
             list_roaming_folders,
             is_folder_roaming,
             set_folder_roaming,
@@ -6079,9 +5883,6 @@ pub fn run() {
             create_roaming_thread,
             recall_roaming_thread,
             request_peer_models,
-            reply_roaming_workflows,
-            check_roaming_workflow,
-            fail_roaming_workflow,
             respond_roam_request,
             directory_exists,
             clipboard_file_paths,

@@ -1,4 +1,3 @@
-import type { WorkflowDef } from "./workflow/types";
 
 /** unsupported 仅用于读取历史记录，不可选择或执行。 */
 export type AgentKind = "claude" | "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "workbuddy" | "unsupported";
@@ -397,17 +396,15 @@ export type SessionShortcutAction =
   | "openUnread"
   /** 打开 / 收起右侧终端，仅应用内生效。 */
   | "toggleTerminal"
-  | "insertText"
-  /** 选中新会话页要运行的工作流；target 为工作流 id。仅新会话页生效。 */
-  | "selectWorkflow";
+  | "insertText";
 
-/** 会话快捷键：一键切到指定项目或模型、快速新会话、插入文本、选择工作流。 */
+/** 会话快捷键：一键切到指定项目或模型、快速新会话、插入文本。 */
 export interface SessionShortcut {
   id: string;
   /** 规范化按键，如 Ctrl+1 / Alt+P。 */
   keys: string;
   action: SessionShortcutAction;
-  /** 本地项目路径、roam 编码、agentKind:model、工作流 id，或 insertText 的插入内容；newSession / openUnread 可为空。 */
+  /** 本地项目路径、roam 编码、agentKind:model，或 insertText 的插入内容；newSession / openUnread 可为空。 */
   target: string;
 }
 
@@ -509,7 +506,7 @@ export interface Settings {
   /** 自动清理会话的保留时长（小时） */
   sessionAutoCleanupHours: number;
   knowledgeGraphEnabled: boolean;
-  /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程并供工作流 {{xx}} 替换。 */
+  /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程。 */
   customEnvVars: Record<string, string>;
 }
 
@@ -649,15 +646,6 @@ export interface IncomingShare {
   activeClueCardId?: string | null;
   /** 漫游召回自动回传的快照（收件箱标注「召回」并自动弹出） */
   recall?: boolean;
-  ts: number;
-}
-
-/** 团队分享：队友分享过来的工作流，待接收进本地工作流库 */
-export interface IncomingWorkflowShare {
-  id: string;
-  from: string;
-  fromName: string;
-  def: WorkflowDef;
   ts: number;
 }
 

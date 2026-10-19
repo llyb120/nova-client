@@ -1,7 +1,7 @@
 import type { ThreadMeta } from "./types";
 
 function isFireThread(thread: ThreadMeta): boolean {
-  // 同时覆盖内置 Fire 与通用工作流（/run）产生的接力链。
+  // 旧版阶段标题仍参与历史消息导航，不恢复自动执行。
   return /^\[(?:Fire|WF)\]/.test(thread.title);
 }
 
@@ -36,8 +36,8 @@ export function chainGroupAnchor(
  * Fire 任务链与 /stage 链在侧栏只显示根会话，但用户真正关心的是当前进行到的阶段：
  * 点击时优先直达链上正在运行的阶段会话（多个取最新创建的）——链运行中时旧阶段
  * 的未读不应把点击劫持到已完成的环节；运行判断覆盖导航栏里的所有父子节点。
- * 没有运行中的阶段时优先工作流记录的链尖（接力空档/等待审核），再优先有未读的
- * （多个取最早创建的），都没有时回退到最新创建的阶段会话，
+ * 没有运行中的阶段时优先有未读的（多个取最早创建的），
+ * 都没有时回退到最新创建的阶段会话，
  * 而不是回到最初的目标会话。
  * 「打开未读消息」快捷键（openNextUnreadThread）语义相反：prefer 传 "unread"
  * 保持未读优先，否则链运行中时快捷键会反复落在运行中的 stage，永远消费不掉
@@ -49,7 +49,6 @@ export function latestFireStage(
   isRunning?: (id: string) => boolean,
   unreadOf?: (id: string) => number,
   prefer: "running" | "unread" = "running",
-  workflowStageId?: string,
 ): ThreadMeta | undefined {
   if (root.subagent) return undefined;
   let latest = root;
@@ -76,10 +75,8 @@ export function latestFireStage(
       }
     }
   }
-  // 没有运行节点、工作流链尖和 stage 标记时，保留调用方原来的打开目标。
-  const workflowStage = threads.find((thread) => thread.id === workflowStageId && seen.has(thread.id));
-  if (!isFireThread(root) && !hasStage && !running && !workflowStage) return undefined;
-  const target =
-    prefer === "unread" ? unread ?? running ?? workflowStage ?? latest : running ?? workflowStage ?? unread ?? latest;
+  // 没有运行节点和 stage 标记时，保留调用方原来的打开目标。
+  if (!isFireThread(root) && !hasStage && !running) return undefined;
+  const target = prefer === "unread" ? unread ?? running ?? latest : running ?? unread ?? latest;
   return target === root && !running ? undefined : target;
 }

@@ -659,7 +659,7 @@ pub struct Thread {
     /// 由主会话调度的子 Agent 执行记录；前端仅供查看。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subagent: bool,
-    /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
+    /// 会话树父节点：用于关联 Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
     /// Stage 会话引用的源会话。每次发送前都会从源会话最新时间线重建上下文。
@@ -1016,10 +1016,10 @@ pub struct ThreadMeta {
     /// 由主会话调度的子 Agent 执行记录；前端仅供查看。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subagent: bool,
-    /// 会话树父节点：用于关联工作流、Fire 和 Stage 会话。
+    /// 会话树父节点：用于关联 Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
-    /// 普通 /stage 引用的源会话；前端据此区别工作流事件链。
+    /// /stage 引用的源会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_source_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

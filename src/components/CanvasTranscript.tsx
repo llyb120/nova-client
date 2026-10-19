@@ -4,12 +4,9 @@ import { message } from "@tauri-apps/plugin-dialog";
 import {
   readBackdropTheme,
 } from "../canvasTranscript/base";
-import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelection";
 import { api, fileUriPath } from "../ipc";
-import { Portal } from "solid-js/web";
-import { WorkflowPreview } from "./WorkflowPreview";
-import type { WorkflowDef } from "../workflow/types";
 import { linkedFile, openWorkspaceFile as openInEditor } from "../workspaceLinks";
 import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
@@ -1026,7 +1023,6 @@ function relPath(p: string): string {
 }
 
 export function CanvasTranscript(props: CanvasTranscriptProps) {
-  const [workflowPreview, setWorkflowPreview] = createSignal<WorkflowDef | null>(null);
   let canvasEl!: HTMLCanvasElement;
   let hostEl!: HTMLDivElement;
 
@@ -1900,21 +1896,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
 
     if (item.type === "system") {
-      if (item.level === "workflow") {
-        let workflow: WorkflowDef | undefined;
-        try {
-          const value = JSON.parse(item.text);
-          if (typeof value?.name === "string" && Array.isArray(value.stages)) workflow = value;
-        } catch { /* 损坏的预览保留错误提示，不能中止整条会话布局。 */ }
-        const definition = workflow;
-        result.push({ kind: "fold", id: item.id, groupIdx: gi,
-          x, y: y + 10, w: proseW, h: 32,
-          text: definition ? `工作流 · ${definition.name}（${definition.stages.length} 阶段） · 点击查看` : "工作流数据无法解析",
-          color: p.dim, fontSize: 13, font: p.sans, hoverBg: p.hover, borderRadius: 6,
-          cursor: definition ? "pointer" : undefined,
-          clickAction: definition ? () => setWorkflowPreview(definition) : undefined });
-        return y + 52;
-      }
       const important = item.level === "error" || item.level === "warn" || item.level === "info";
       const color = item.level === "error" ? p.red : item.level === "warn" ? p.yellow
         : item.level === "info" ? `color-mix(in srgb, ${p.accent} 80%, ${p.text})` : p.faint;
@@ -3977,7 +3958,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       revealReadyAt.clear();
       revealRemainders.clear();
       clearEditing();
-      setWorkflowPreview(null);
       selection = null;
       selecting = false;
       selStart = null;
@@ -4039,14 +4019,6 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   return (
     <div class="canvas-transcript-host" ref={hostEl}>
       <fileMenu.Menu />
-      <Show when={workflowPreview()}>{workflow => <Portal>
-        <div class="modal-backdrop" onClick={() => setWorkflowPreview(null)}>
-          <div class="modal" style={{ width: "90vw", "max-width": "1200px" }} onClick={e => e.stopPropagation()}>
-            <button class="btn secondary small" onClick={() => setWorkflowPreview(null)}>关闭工作流预览</button>
-            <WorkflowPreview workflow={workflow()} />
-          </div>
-        </div>
-      </Portal>}</Show>
       <canvas ref={canvasEl} class="transcript-canvas-only" tabindex="0" aria-label="会话记录" />
       {editing() && (
         <div class="canvas-prompt-editor" style={editStyle()} ref={bindEditHost}>

@@ -20,7 +20,6 @@ import {
   ensurePeerBranches,
   ensurePeerModels,
   lastUsed,
-  liveWorkflowStage,
   peerBranchKey,
   modelChoices,
   openThread,
@@ -32,7 +31,6 @@ import {
   setView,
   state,
   stashWorktreePrompt,
-  startWorkflowOnThread,
   takePendingNewSessionSeed,
   assertBuiltinPrompt,
 } from "../store";
@@ -41,12 +39,8 @@ import { setHomeTerminalCwd } from "../workspaceLayout";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import { isSupportedAgentKind, type AgentKind, type Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
-import { enabledWorkflows } from "../workflow/storage";
-import { peerWorkflows } from "../workflow/roaming";
-import { roamingWorkflowPrompt } from "../workflow/roamingProtocol";
-import type { WorkflowDef } from "../workflow/types";
 import { ConfigSelects } from "./ConfigSelects";
-import { IconClue, IconFile, IconFolder, IconLogo, IconMerge, IconSend, IconX } from "./icons";
+import { IconClue, IconFile, IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { HaibaraBubble } from "./HaibaraBubble";
 import { createNoteFlow } from "./NoteFlow";
@@ -88,28 +82,6 @@ export function HomeView() {
     localStorage.setItem(AUTO_MODE_KEY, on ? "1" : "0");
   };
   const [roam, setRoam] = createSignal<{ peer: Peer; folder: string } | null>(null);
-  // 漫游选择对端工作流，只发送标识和目标，由对端读取定义并执行。
-  const [workflowMenuOpen, setWorkflowMenuOpen] = createSignal(false);
-  const [selectedWorkflowId, setSelectedWorkflowId] = createSignal<string | null>(null);
-  const selectedWorkflow = createMemo<WorkflowDef | null>(() => {
-    const id = selectedWorkflowId();
-    if (!id || roam()) return null;
-    // 已停用的工作流不展示也不可选：一旦在别处被停用，这里的选中自动失效。
-    return enabledWorkflows().find((workflow) => workflow.id === id) ?? null;
-  });
-  // 每次打开菜单都重新读取 localStorage，保证工作流编辑器改动后列表最新；只列启用的。
-  const workflowChoices = createMemo(() => {
-    workflowMenuOpen();
-    const target = roam();
-    if (target) return (peerWorkflows()[target.peer.token] ?? []).map((workflow) => ({
-      ...workflow, sharedBy: target.peer.name, builtin: false,
-    }));
-    return enabledWorkflows().map((workflow) => ({ ...workflow, stageCount: workflow.stages.length }));
-  });
-  const selectedPeerWorkflow = () => roam()
-    ? peerWorkflows()[roam()!.peer.token]?.find((workflow) => workflow.id === selectedWorkflowId())
-    : undefined;
-  const selectedWorkflowName = () => selectedPeerWorkflow()?.name ?? selectedWorkflow()?.name;
   // worktree：在独立 git worktree（分支 + 工作目录）中执行，不干扰主工作区正在进行的任务。
   // 通过 Alt+Enter 或工具条按钮弹窗填分支名后创建（不占用输入行空间）。
   const [cwdIsRepo, setCwdIsRepo] = createSignal(false);
@@ -134,7 +106,6 @@ export function HomeView() {
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
-  let workflowPickerRef: HTMLDivElement | undefined;
   type PrewarmTarget = {
     cwd?: string;
     agentKind?: AgentKind;
@@ -146,28 +117,6 @@ export function HomeView() {
     textareaRef.style.height = "auto";
     textareaRef.style.height = Math.min(textareaRef.scrollHeight, 220) + "px";
   };
-
-  const pickWorkflow = (workflowId: string | null) => {
-    setSelectedWorkflowId(workflowId);
-    setWorkflowMenuOpen(false);
-  };
-
-  createEffect(() => {
-    roam()?.peer.token;
-    setWorkflowMenuOpen(false);
-    setSelectedWorkflowId(null);
-  });
-
-  onMount(() => {
-    const closeWorkflowMenu = (event: PointerEvent) => {
-      if (!workflowMenuOpen() || workflowPickerRef?.contains(event.target as Node)) return;
-      setWorkflowMenuOpen(false);
-    };
-    document.addEventListener("pointerdown", closeWorkflowMenu);
-    onCleanup(() => {
-      document.removeEventListener("pointerdown", closeWorkflowMenu);
-    });
-  });
 
   createEffect(() => {
     text();
@@ -454,21 +403,8 @@ export function HomeView() {
   };
 
   mountSessionShortcuts({
-    allowedActions: ["selectProject", "selectModel", "selectWorkflow", "insertText"],
+    allowedActions: ["selectProject", "selectModel", "insertText"],
     onInsertText: insertShortcutText,
-    onSelectWorkflow: (workflowId) => {
-      // 已停用/已删除的工作流不可选：提示后保持当前选择，避免静默失效。
-      const workflow = enabledWorkflows().find((item) => item.id === workflowId);
-      if (!workflow) {
-        void message("该工作流已删除或已停用，请在设置里重新选择。", { kind: "error" });
-        return;
-      }
-      if (roam()) {
-        void message("漫游会话不支持工作流，请先取消漫游。", { kind: "error" });
-        return;
-      }
-      setSelectedWorkflowId(workflowId);
-    },
     onSelectProject: (path, roam) => {
       if (roam) {
         const peer = state.peers.find((item) => item.token === roam.peerToken);
@@ -596,7 +532,6 @@ export function HomeView() {
     const images = attach.images();
     const autoMode = auto();
     const target = autoMode ? null : roam();
-    const workflow = !target && !autoMode ? selectedWorkflow() : null;
     const clue = state.pendingClueCard;
     if (
       (!t && images.length === 0) ||
@@ -624,35 +559,29 @@ export function HomeView() {
         createThreadOptimistic(await api.scratchDir(), autoKind, autoModel, mode(), "", prompt, images,
           opts.ephemeral ?? false, clueId, "lightweight");
       } else if (target) {
-        const remoteWorkflow = selectedPeerWorkflow();
-        if (selectedWorkflowId() && !remoteWorkflow) throw new Error("对方工作流列表已失效，请重新选择");
-        const outbound = remoteWorkflow ? roamingWorkflowPrompt(remoteWorkflow, prompt) : prompt;
-        // 选定远端工作流时直接走 IPC，不能让本机的同名工作流或触发器抢先执行。
-        const threadId = await createRoamingThread(
+        await createRoamingThread(
           target.peer,
           target.folder,
           agentKind(),
           model(),
           mode(),
-          outbound,
+          prompt,
           clue?.id ?? "",
           wtOn,
           branch,
           base,
         );
         if (clue) clearPendingClueCard();
-        if (remoteWorkflow) await api.sendPrompt(threadId, outbound, images);
-        else await sendPrompt(prompt, images);
+        await sendPrompt(prompt, images);
       } else if (wtOn) {
         // 本地 worktree：后台创建、界面立即进入会话，就绪后再自动补发首条提示词。
         // 先校验 /fire，避免建完 worktree 才因语法错误失败。
         assertBuiltinPrompt(t, images);
-        const entry = workflow?.stages.find((stage) => stage.id === workflow.entry);
         const id = await createThread(
           cwd(),
-          entry?.agentKind ?? agentKind(),
-          entry?.agentKind ? (entry.model?.trim() || "") : (entry?.model?.trim() || model()),
-          entry?.mode ?? mode(),
+          agentKind(),
+          model(),
+          mode(),
           "",
           opts.ephemeral ?? false,
           true,
@@ -661,63 +590,29 @@ export function HomeView() {
           clue?.id ?? "",
         );
         if (clue) clearPendingClueCard();
-        stashWorktreePrompt(id, prompt, images, workflow?.id ?? null, {
-          agentKind: agentKind(),
-          model: model() || null,
-        });
+        stashWorktreePrompt(id, prompt, images);
       } else {
         const ephemeral = opts.ephemeral ?? false;
-        const workflowId = workflow?.id ?? null;
-        if (workflowId) {
-          // 工作流：会话需先建好再启动工作流，沿用同步创建，不乐观跳转。
-          // 首节点配置了后端/模型时直接以其创建会话；后续跟随节点仍使用用户的选择。
-          const entry = workflow?.stages.find((stage) => stage.id === workflow.entry);
-          const entryAgentKind = entry?.agentKind ?? agentKind();
-          const entryModel = entry?.agentKind
-            ? (entry.model?.trim() || "")
-            : (entry?.model?.trim() || model());
-          const threadId = await createThread(
-            cwd(),
-            entryAgentKind,
-            entryModel,
-            entry?.mode ?? mode(),
-            "",
-            ephemeral,
-            false,
-            "",
-            "",
-            clue?.id ?? "",
-          );
-          if (!ephemeral) lastUsed.setModel(entryAgentKind, entryModel);
-          if (clue) clearPendingClueCard();
-          // 「跟随会话」节点跟随用户在新会话页选择的后端/模型，而非被首节点覆盖后的值。
-          await startWorkflowOnThread(threadId, prompt, images, workflowId, {
-            agentKind: agentKind(),
-            model: model() || null,
-          });
-        } else {
-          // 乐观进入聊天页：消息立即上屏，后台建会话并补发，失败回退。
-          if (!ephemeral) lastUsed.setModel(agentKind(), model());
-          const clueId = clue?.id ?? "";
-          if (clue) clearPendingClueCard();
-          createThreadOptimistic(
-            cwd(),
-            agentKind(),
-            model(),
-            mode(),
-            "",
-            prompt,
-            images,
-            ephemeral,
-            clueId,
-          );
-        }
+        // 乐观进入聊天页：消息立即上屏，后台建会话并补发，失败回退。
+        if (!ephemeral) lastUsed.setModel(agentKind(), model());
+        const clueId = clue?.id ?? "";
+        if (clue) clearPendingClueCard();
+        createThreadOptimistic(
+          cwd(),
+          agentKind(),
+          model(),
+          mode(),
+          "",
+          prompt,
+          images,
+          ephemeral,
+          clueId,
+        );
       }
       setText("");
       setQuote("");
       setSlashStart(null);
       setRoam(null);
-      setSelectedWorkflowId(null);
       attach.clear();
       clearPendingClueCard();
       if (textareaRef) textareaRef.style.height = "auto";
@@ -1121,67 +1016,6 @@ export function HomeView() {
             </Show>
             </Show>
             <div class="composer-actions">
-              <Show when={!auto()}>
-                <div ref={workflowPickerRef} class="composer-workflow-picker">
-                  <Show when={workflowMenuOpen()}>
-                    <div class="composer-workflow-menu">
-                      <div class="composer-workflow-head">{roam() ? `${roam()!.peer.name} 的工作流` : "本次会话运行的工作流"}</div>
-                      <Show when={roam() && !workflowChoices().length}>
-                        <div class="composer-workflow-head">{peerWorkflows()[roam()!.peer.token] ? "对方暂无已启用的工作流" : "等待对方工作流列表（需双方升级）"}</div>
-                      </Show>
-                      <button
-                        type="button"
-                        classList={{
-                          "composer-workflow-item": true,
-                          active: !selectedWorkflowId(),
-                        }}
-                        onClick={() => pickWorkflow(null)}
-                      >
-                        <span>普通会话</span>
-                        <small>不运行工作流，直接执行任务</small>
-                      </button>
-                      <For each={workflowChoices()}>
-                        {(wf) => (
-                          <button
-                            type="button"
-                            classList={{
-                              "composer-workflow-item": true,
-                              active: selectedWorkflowId() === wf.id,
-                            }}
-                            onClick={() => pickWorkflow(wf.id)}
-                            title={wf.sharedBy ? `来自 ${wf.sharedBy} 的团队分享` : undefined}
-                          >
-                            <span>{wf.name}</span>
-                            <small>
-                              {wf.sharedBy
-                                ? `团队 · ${wf.sharedBy}`
-                                : wf.builtin
-                                  ? "内置"
-                                  : "自定义"} · {wf.stageCount} 个节点
-                            </small>
-                          </button>
-                        )}
-                      </For>
-                    </div>
-                  </Show>
-                  <button
-                    type="button"
-                    class="composer-btn workflow"
-                    classList={{ active: !!selectedWorkflowName() }}
-                    onClick={() => {
-                      if (!workflowMenuOpen() && roam()) ensurePeerModels(roam()!.peer.token, true);
-                      setWorkflowMenuOpen((open) => !open);
-                    }}
-                    title={
-                      selectedWorkflowName()
-                        ? `工作流：${selectedWorkflowName()}`
-                        : "选择用哪个工作流运行本次任务"
-                    }
-                  >
-                    <IconMerge size={16} />
-                  </button>
-                </div>
-              </Show>
               <button
                 type="button"
                 class="composer-btn clue"
@@ -1194,7 +1028,6 @@ export function HomeView() {
                 class="composer-btn send"
                 disabled={
                   (!text().trim() && attach.images().length === 0) ||
-                  (!!selectedWorkflow() && !text().trim() && attach.images().length === 0) ||
                   (!cwd() && !roam() && !auto()) ||
                   busy() ||
                   !peerReady() ||
@@ -1225,7 +1058,6 @@ export function HomeView() {
                         (id) => !!state.running[id],
                         (id) => state.unreadTurns[id] ?? 0,
                         "running",
-                        liveWorkflowStage(t.id),
                       )?.id ?? t.id,
                     )
                   }

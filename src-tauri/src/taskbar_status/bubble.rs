@@ -309,7 +309,7 @@ pub(super) fn open_thread(app: &AppHandle, thread: Option<String>) {
 }
 
 /// Quick reply typed on a card. Goes through the same main-window entry as remote control, so
-/// slash commands and workflows expand like Composer input; a busy thread queues it behind its turn.
+/// Slash commands expand like Composer input; a busy thread queues it behind its turn.
 pub(super) fn reply(app: &AppHandle, thread: Option<&str>, text: &str) -> Result<(), String> {
     let text = text.trim();
     if text.is_empty() { return Err("回复内容不能为空".into()); }

@@ -15,7 +15,7 @@ const { STAGE_COMMAND_PATTERN, parseStageInput } = module.exports;
 const composer = read("../src/components/Composer.tsx");
 const submitSource = composer.slice(composer.indexOf("  const shouldQueue"), composer.indexOf("  const insertSlashSuggestion"));
 const createSubmit = new Function("deps", transformSync(`
-  const { running, STAGE_COMMAND_PATTERN, text, empty, attach, state,
+  const { running, backendAvailable, STAGE_COMMAND_PATTERN, text, empty, attach, state,
     rememberPromptHistory, clearInput, enqueuePrompt, dropQueuedPromptsMatching,
     sendPrompt, releasePromptQueue } = deps;
   ${submitSource}
@@ -37,7 +37,7 @@ for (const busy of [true, false]) {
     const calls = [];
     const noop = () => {};
     createSubmit({
-      running: () => busy, STAGE_COMMAND_PATTERN,
+      running: () => busy, backendAvailable: () => true, STAGE_COMMAND_PATTERN,
       text: () => value, empty: () => !value.trim(), attach: { images: () => [] },
       state: { currentId: "source" }, rememberPromptHistory: noop,
       clearInput: () => { value = ""; },

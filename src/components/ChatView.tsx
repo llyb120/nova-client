@@ -353,24 +353,17 @@ export function ChatView() {
     }
     return chain.sort((a, b) => a.createdAt - b.createdAt);
   });
-  /** 是否工作流/Fire/员工事件链的会话标题（决定导航栏是否从第一个节点起就显示）。 */
+  /** 是否 Fire/员工事件链的会话标题（决定导航栏是否从第一个节点起就显示）。 */
   const isStageTitle = (title: string) =>
-    /^\[WF\]/.test(title) ||
-    /^\[Hard\]/.test(title) ||
     /^\[Fire\]/.test(title) ||
     /\]\s*(Wake|Do|Dream|巡查)/.test(title);
   const showStageRail = () => {
     const threads = stageThreads();
-    // 链上有多个会话，或链本身就是工作流/Fire/员工事件链（从第一个节点起就显示）。
+    // 链上有多个会话，或链本身就是 Fire/员工事件链（从第一个节点起就显示）。
     return threads.length > 1 || threads.some((thread) => thread.subagent || isStageTitle(thread.title));
   };
   const stageName = (thread: (typeof state.threads)[number]) => {
     if (thread.subagent) return thread.title.replace(/^\[Agent\]\s*/, "").trim() || "子 Agent";
-    // 工作流节点：[WF] 节点名 · 第N次（· 待补充等状态后缀），显示节点名。
-    const hardStage = thread.title.match(/^\[Hard\]\s*(.+?)\s*$/);
-    if (hardStage) return hardStage[1].trim() || "Hard";
-    const wfStage = thread.title.match(/^\[WF\]\s*(.+?)(?:\s+·\s+.*)?$/);
-    if (wfStage) return wfStage[1].trim() || "节点";
     if (/\]\s*Wake/.test(thread.title)) return "Wake";
     if (/\]\s*Do/.test(thread.title)) return "Do";
     if (/\]\s*Dream/.test(thread.title)) return "Dream";
@@ -382,7 +375,7 @@ export function ChatView() {
     if (/^\[Fire\]/.test(thread.title)) return "目标";
     // 普通 /stage 会话显示自己的会话名，不再显示泛化的「事件」。
     if (thread.stageSourceThreadId) return thread.title.replace(/^\[Stage\]\s*/, "").trim() || "Stage";
-    // 工作流链的起点会话（用户输入目标的会话）显示为「目标」。
+    // Fire/员工事件链的起点会话显示为「目标」。
     if (!thread.parentThreadId && stageThreads().some((t) => isStageTitle(t.title))) return "目标";
     return thread.title || "会话";
   };

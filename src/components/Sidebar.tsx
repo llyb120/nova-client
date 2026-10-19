@@ -10,7 +10,6 @@ import {
   closeThread,
   deleteProjectThreads,
   deleteThread,
-  liveWorkflowStage,
   markThreadSwitchPointerDown,
   openNewSession,
   openThread,
@@ -123,7 +122,6 @@ export function Sidebar(props: {
   };
   const openHome = () => openNewSession();
   const openClues = () => switchView("clues");
-  const openWorkflows = () => switchView("workflows");
 
   // 运行中任务链（含父子接力整条链）：整链的忙碌态与「正在运行的任务数」徽标沿用这套口径。
   const chainInfo = createMemo(() => runningTaskChains());
@@ -402,12 +400,7 @@ export function Sidebar(props: {
       }
       return chain;
     });
-    // 整条链的忙碌态：工作流阶段接力空档里没有任何会话 running，
-    // 只看 state.running 会让侧栏转圈在刷新/回合结束时闪断，这里并入任务链运行口径。
-    const running = () => {
-      const { busy } = chainInfo();
-      return chainThreads().some((thread) => !!state.running[thread.id] || busy.has(thread.id));
-    };
+    const running = () => chainThreads().some((thread) => !!state.running[thread.id]);
     // 运行状态直接标在模型徽标上（发光 + 流线扫圈），不再占用右侧文字空间
     const runChild = () => !!(props.mergedChild && state.running[props.mergedChild.id]);
     const runSelf = () => running() && !runChild();
@@ -438,7 +431,6 @@ export function Sidebar(props: {
               (id) => !!state.running[id],
               (id) => state.unreadTurns[id] ?? 0,
               "running",
-              liveWorkflowStage(t.id),
             )?.id ?? activeThread().id,
           )
         }
@@ -589,10 +581,6 @@ export function Sidebar(props: {
               </span>
             </Show>
           </button>
-          <button title="工作流" aria-label="工作流" classList={{ active: state.view === "workflows" }} onClick={openWorkflows}>
-            <IconMerge size={18} />
-            <Show when={state.workflowInbox.length > 0}><span class="sidebar-rail-dot" /></Show>
-          </button>
           <button title="证据链" aria-label="证据链" classList={{ active: state.view === "clues" }} onClick={openClues}>
             <IconClue size={18} />
             <Show when={state.unreadClueMentions.length > 0}><span class="sidebar-rail-dot" /></Show>
@@ -734,22 +722,6 @@ export function Sidebar(props: {
               title="普通模式：查看你自己的会话"
             >
               普通模式
-            </button>
-            <button
-              class="mode-seg-btn"
-              classList={{ active: state.view === "workflows" }}
-              onClick={openWorkflows}
-              title={
-                state.workflowInbox.length > 0
-                  ? `有 ${state.workflowInbox.length} 个队友分享的工作流待接收`
-                  : "配置可编排的工作流：阶段接力、转移条件与提示词模板"
-              }
-            >
-              <IconMerge size={14} />
-              工作流
-              <Show when={state.workflowInbox.length > 0}>
-                <span class="badge-count">{state.workflowInbox.length}</span>
-              </Show>
             </button>
             <button
               class="mode-seg-btn"

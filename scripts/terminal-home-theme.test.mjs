@@ -185,7 +185,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.evaluate(() => window.homeTest.newSession());
   await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
   assert.equal(await page.evaluate(() => window.homeTest.created.length),3);
-  for(const view of ['workflows','clues']) {
+  for(const view of ['clues']) {
     await page.evaluate(view=>window.homeTest.route(null,view),view);
     await page.keyboard.press('Control+Backquote');
     assert.equal(await page.locator('.workspace-terminal').count(),0);
