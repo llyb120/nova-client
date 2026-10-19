@@ -1,6 +1,6 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 21) return;
+  if (globalThis.__novaWebview?.apiVersion === 22) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   // Icon-only controls (sort carets, filter funnels, close ×) carry their meaning in class names.
   const iconHint = e => {
@@ -152,8 +152,17 @@
     return entry;
   };
   const api = {
-    apiVersion: 21,
+    apiVersion: 22,
     stamp,
+    // Observed refs of the node and its ancestors (nearest first), so a refused coordinate click can name a DOM ref.
+    refsOf(node) {
+      const refs=[];
+      for (let e=node;e;e=e.parentElement||e.getRootNode?.()?.host) {
+        const id=identities.get(e),ref=id&&documentId?`${documentId.slice(0,6)}.${id}`:null;
+        if (ref && entries.get(ref)?.e===e) refs.push(ref);
+      }
+      return refs;
+    },
     // After an input: wait until the observed roots stop mutating (SPA renders after XHR), bounded.
     async settle(quietMs=250, budgetMs=1000) {
       const started=performance.now();let last=revision,since=started;

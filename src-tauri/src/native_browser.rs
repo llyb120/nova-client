@@ -28,6 +28,8 @@ struct BrowserState {
     gate: tokio::sync::Mutex<()>,
     frame_sessions: Mutex<std::collections::HashMap<String, String>>,
     observations: Mutex<std::collections::HashMap<String, Observation>>,
+    /// Last click point refused by the pixel guard, per tab: (url, pageX, pageY).
+    guard_misses: Mutex<std::collections::HashMap<String, (String, f64, f64)>>,
 }
 
 fn active_label(_app: &AppHandle) -> Result<String, String> {
@@ -653,6 +655,15 @@ async fn apply(
         Action::ClickAt {x,y,..} | Action::Move {x,y} | Action::Drag {x,y,..} | Action::ScrollAt {x,y,..} => {
             if observation.full_page && matches!(action,Action::Drag{..}) { return Err("拖动请使用 fullPage=false 的视口截图".into()); }
             let p=coordinate(app,observation,*x,*y,image_id).await?;
+            // Re-sending a coordinate the guard just refused usually hits the same churn; send the model to the DOM ref.
+            let here=spot(observation,&p);
+            if matches!(action,Action::ClickAt{..}) {
+                let label=active_label(app)?;
+                let repeated=here.as_ref().is_some_and(|h| app.state::<BrowserState>().guard_misses.lock().unwrap().get(&label).is_some_and(|m|same_spot(m,h)));
+                if repeated { if let Some(click)=ref_at(app,observation,&p).await {
+                    return Err(format!("该坐标刚因落点附近画面变化被拦截，本次未点击；不要原样重试坐标，改用 {click}"));
+                }}
+            }
             if !matches!(action,Action::Move{..}) { guard_coordinate(app,observation,&p,*x,*y,image_id).await?; }
             if matches!(action,Action::ClickAt{..}|Action::ScrollAt{..}|Action::Drag{..}) {
                 progress.attempted=true;
@@ -665,7 +676,10 @@ async fn apply(
                 }
             }
             match action {
-                Action::ClickAt {button,click_count,..} => mouse(app,s,&p,button.as_deref().unwrap_or("left"),click_count.unwrap_or(1),progress).await?,
+                Action::ClickAt {button,click_count,..} => {
+                    mouse(app,s,&p,button.as_deref().unwrap_or("left"),click_count.unwrap_or(1),progress).await?;
+                    if let Ok(label)=active_label(app) { app.state::<BrowserState>().guard_misses.lock().unwrap().remove(&label); }
+                },
                 Action::Move{..} => { progress.attempted=true; cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseMoved","x":p["x"],"y":p["y"]}),None,Some(s.cancel.clone())).await?; },
                 Action::ScrollAt{delta,delta_x,..} => { progress.attempted=true; cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseWheel","x":p["x"],"y":p["y"],"deltaX":delta_x.unwrap_or(0),"deltaY":delta}),None,Some(s.cancel.clone())).await?; },
                 Action::Drag{to_x,to_y,duration_ms,..} => {
@@ -783,9 +797,37 @@ async fn guard_coordinate(app:&AppHandle, observation:&Observation, point:&Value
     let expected=xcap::image::imageops::crop_imm(&expected,left,top,width,height).to_image();
     let actual=capture_viewport(app,&observation.pages["pages"][0]["viewport"],
         vx+(left as f64-px)*sx,vy+(top as f64-py)*sy,width as f64*sx,height as f64*sy).await?.to_rgba8();
-    if crate::visual_guard::patch_changed(&expected,&actual) { return Err("落点附近画面已变化，未点击；请根据新截图重新定位，不要原样重试同一坐标，细小目标先用 screenshot(region) 局部放大".into()); }
+    if crate::visual_guard::patch_changed(&expected,&actual) {
+        if let (Some(miss),Ok(label))=(spot(observation,point),active_label(app)) { app.state::<BrowserState>().guard_misses.lock().unwrap().insert(label,miss); }
+        return Err(match ref_at(app,observation,point).await {
+            Some(click)=>format!("落点附近画面已变化，未点击；落点元素在 DOM 中可定位，改用 {click}，不要再用坐标"),
+            None=>"落点附近画面已变化，未点击；请根据新截图重新定位，不要原样重试同一坐标，细小目标先用 screenshot(region) 局部放大".into(),
+        });
+    }
     if evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?!=point["stamp"] {return Err("落点校验期间视口已变化，停止点击".into());}
     Ok(())
+}
+
+fn spot(observation:&Observation, point:&Value) -> Option<(String,f64,f64)> {
+    Some((observation.pages["pages"][0]["url"].as_str()?.to_owned(),point["pageX"].as_f64()?,point["pageY"].as_f64()?))
+}
+fn same_spot(a:&(String,f64,f64), b:&(String,f64,f64)) -> bool { a.0==b.0 && (a.1-b.1).abs()<=4. && (a.2-b.2).abs()<=4. }
+
+/// DOM click for the actionable element under a viewport point, if the observation lists it (best effort;
+/// cross-process iframes are not descended).
+async fn ref_at(app:&AppHandle, observation:&Observation, point:&Value) -> Option<String> {
+    let hit=cdp(app,"DOM.getNodeForLocation",json!({"x":point["x"].as_f64()?.floor(),"y":point["y"].as_f64()?.floor()}),None,None).await.ok()?;
+    let index=observation.frames.iter().position(|f|f.session.is_none() && hit["frameId"].as_str()==Some(f.id.as_str()))?;
+    let frame=&observation.frames[index];
+    let node=cdp(app,"DOM.resolveNode",json!({"backendNodeId":hit["backendNodeId"],"executionContextId":frame.context}),None,None).await.ok()?;
+    let object=node["object"]["objectId"].as_str()?.to_owned();
+    let refs=cdp(app,"Runtime.callFunctionOn",json!({"objectId":object,"returnByValue":true,"functionDeclaration":"function(){return globalThis.__novaWebview?.refsOf(this)??[]}"}),None,None).await;
+    let _=cdp(app,"Runtime.releaseObject",json!({"objectId":object}),None,None).await;
+    let items=observation.pages["pages"][index]["items"].as_array()?;
+    refs.ok()?["result"]["value"].as_array()?.iter().filter_map(Value::as_str).find_map(|r| items.iter().find(|item| item["ref"].as_str()==Some(r)
+        && item["disabled"]!=true && item["scroll"].is_null() && item["canvas"].is_null()
+        && (item["actionable"]==true || matches!(item["role"].as_str(),Some("button"|"a"|"link"|"input"|"select"|"textarea"|"summary"|"tab"|"checkbox"|"radio"|"combobox"|"option"|"menuitem"|"li")))))
+        .map(|item| format!("{{\"action\":\"click\",\"frame\":{index},\"ref\":{}}}（{} {}）",item["ref"],item["role"].as_str().unwrap_or(""),json!(item["name"].as_str().unwrap_or(""))))
 }
 
 async fn coordinate(
@@ -1739,6 +1781,14 @@ fn state_dir(app: &AppHandle) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_miss_repeat_is_same_page_and_spot() {
+        let miss=("https://a.test/".to_string(),100.,60.);
+        assert!(same_spot(&miss,&("https://a.test/".into(),103.,57.)));
+        assert!(!same_spot(&miss,&("https://a.test/".into(),110.,60.)));
+        assert!(!same_spot(&miss,&("https://b.test/".into(),100.,60.)));
+    }
 
     #[test]
     fn inline_summary_lists_compact_elements_and_act_deltas() {

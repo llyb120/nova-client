@@ -67,6 +67,15 @@ try {
     assert.equal(ready.loading,false);
     assert.equal(target(ready,'PC & Console').actionable,true);
   });
+  await run('a refused coordinate maps back to the observed ref under it',async()=>{
+    const obs=await fixture('<header style="padding:20px"><button><span>Run</span></button></header>');
+    const item=target(obs,'Run');
+    const p=await call('prepare',item.ref);
+    const {backendNodeId}=await cdp.send('DOM.getNodeForLocation',{x:Math.floor(p.x),y:Math.floor(p.y)});
+    const {object}=await cdp.send('DOM.resolveNode',{backendNodeId,executionContextId:world});
+    const {result}=await cdp.send('Runtime.callFunctionOn',{objectId:object.objectId,returnByValue:true,functionDeclaration:'function(){return globalThis.__novaWebview?.refsOf(this)??[]}'});
+    assert.equal(result.value[0],item.ref);
+  });
   await run('framework date presets use clickable anchors without href',async()=>{
     const obs=await fixture('<div><p style="cursor:pointer">Last 26 Weeks</p><a style="cursor:pointer">Last 12 Weeks</a><a>Plain text</a><div style="opacity:0">Invisible tooltip</div></div>');
     assert.equal(target(obs,'Last 26 Weeks').actionable,true);
@@ -195,7 +204,7 @@ try {
     assert.equal((await fixture('<table aria-rowcount="0" style="width:100px;height:10px"></table>')).tables[0].totalRows,0);
     await evaluate('Object.defineProperty(globalThis,"__novaWebview",{value:{apiVersion:7},configurable:true}); true');
     await evaluate(engine);
-    assert.equal(await evaluate('__novaWebview.apiVersion'),21,'Existing Chrome worlds must upgrade to current DOM hints');
+    assert.equal(await evaluate('__novaWebview.apiVersion'),22,'Existing Chrome worlds must upgrade to current DOM hints');
     assert.equal((await call('observe',randomUUID())).tables[0].totalRows,0);
   });
   await run('native and ARIA checkboxes expose role and current selection',async()=>{
