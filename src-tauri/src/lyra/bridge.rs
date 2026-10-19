@@ -97,7 +97,7 @@ pub(crate) fn fit_image(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
 }
 
 /// 把协议 parts 转为 (文本, 图片)（local_image 读文件转 base64）。
-fn prompt_input(parts: &[Value]) -> (String, Vec<Value>) {
+pub(crate) fn prompt_input(parts: &[Value]) -> (String, Vec<Value>) {
     let mut texts = Vec::new();
     let mut images = Vec::new();
     for part in parts {

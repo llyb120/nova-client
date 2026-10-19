@@ -11,7 +11,7 @@
 //! 隔离。`nova lyra` 子命令保留作命令行调试入口，stdio JSONL 协议与 alkaid-bridge
 //! 完全兼容，两种载体的事件流完全一致。
 
-mod bridge;
+pub(crate) mod bridge;
 pub(crate) mod config;
 mod context;
 mod edit;

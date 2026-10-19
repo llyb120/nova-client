@@ -308,6 +308,8 @@ recent=false 的会话一律不可 append，即使用户点名也按新会话 cr
 用户原文由程序自动附上，不可篡改任务或扩大授权。
 仅用户请求搜索时可 search；为判断是否延续最近会话也可 search，最多两次；多个都符合时选最近更新的那个。
 不得在 chat 中声称已创建、追加、排队、执行成功或任务完成，真实回执由程序生成。
+用户附带的图片会随本条消息提供，用来理解意图；图片同样会随 append/create 投递给会话，涉及图片内容的工作照常调度。
+运行中的会话 append 后会立即作为引导插入当前轮次，不必等它结束。
 搜索结果 matchedIn=title 仅命中标题，不能声称搜到了正文；content 是正文命中片段，不代表整段历史。
 依据上下文语义寻找会话，不要求用户提供完整标题或 UUID；例如“刚才做蝴蝶那个会话再加 tab”应搜索关键词后判断。
 chat 只用于纯寒暄或无法理解的输入，一句话，像同事一样自然口语，不罗列会话。
@@ -359,7 +361,19 @@ fn lightweight_model(app: &tauri::AppHandle) -> Result<String, String> {
     Ok(model)
 }
 
-async fn complete_reply(app: &tauri::AppHandle, model: &str, seed: String) -> Result<String, String> {
+/// Image parts the decision model can see; non-image files stay listed by name in the text.
+fn vision_parts(images: &[PromptImage]) -> Vec<Value> {
+    let parts: Vec<Value> = images.iter().filter_map(|image| match (&image.data, &image.uri) {
+        (Some(data), _) if image.mime_type.starts_with("image/") =>
+            Some(json!({"type":"image_data","mime":image.mime_type,"data":data})),
+        (_, Some(uri)) => Some(json!({"type":"local_image",
+            "path": crate::threads::file_uri_to_local_path(uri).unwrap_or_else(|| uri.clone())})),
+        _ => None,
+    }).collect();
+    crate::lyra::bridge::prompt_input(&parts).1
+}
+
+async fn complete_reply(app: &tauri::AppHandle, model: &str, seed: String, images: &[Value]) -> Result<String, String> {
     use crate::lyra::{config, provider::{self, StreamEvent}};
     let state = app.state::<AppState>();
     let config = config::Roots::borrowed(state.config_dir.clone()).load_config(None)?;
@@ -370,7 +384,7 @@ async fn complete_reply(app: &tauri::AppHandle, model: &str, seed: String) -> Re
     resolved.model.extra_options.clear();
     let proxy = state.settings.lock().map_err(|e| e.to_string())?.lyra_proxy.clone();
     let http = provider::client_for_proxy(proxy.trim());
-    let messages = [json!({"role":"user", "content":[{"type":"text","text":seed}]})];
+    let messages = [crate::lyra::history::user_message(&seed, images)];
     let cancel = Arc::new(AtomicBool::new(false));
     let mut text = String::new();
     let mut collect = |event| { if let StreamEvent::TextDelta(delta) = event { text.push_str(&delta); } };
@@ -388,7 +402,7 @@ async fn complete_reply(app: &tauri::AppHandle, model: &str, seed: String) -> Re
 }
 
 /// `text` is what the model reads; `original` (with full 星屑 text) is what the session receives.
-async fn decide(app: &tauri::AppHandle, rt: &Runtime, text: &str, original: &str, model: &str)
+async fn decide(app: &tauri::AppHandle, rt: &Runtime, text: &str, original: &str, model: &str, images: &[Value])
     -> Result<(String, Option<String>, Option<Job>), String>
 {
     let (context, mut allowed, projects) = context(app, rt)?;
@@ -396,7 +410,7 @@ async fn decide(app: &tauri::AppHandle, rt: &Runtime, text: &str, original: &str
     let state = app.state::<AppState>();
     for turn in 0..3 {
         let seed = json!({"context":context,"searchResults":searches,"latestUserMessage":text}).to_string();
-        let raw = complete_reply(app, model, seed).await?;
+        let raw = complete_reply(app, model, seed, images).await?;
         if raw.len() > MAX_TEXT { return Err("轻量助理输出过长，未调度".into()); }
         let decision: Decision = serde_json::from_str(raw.trim())
             .map_err(|_| "轻量助理未返回有效白名单动作，未调度".to_string())?;
@@ -485,9 +499,10 @@ pub(crate) async fn taskbar_assistant_send(app: tauri::AppHandle, text: String, 
     let model = lightweight_model(&app)?;
     if rt.journal.lock().map_err(|e| e.to_string())?.in_flight.is_some() { return Err("助理正在回复，请稍后再发".into()); }
     let count = capsules.len();
-    let (capsule_text, images) = if count + uploads.len() == 0 { (String::new(), vec![]) } else {
+    let (capsule_text, images, vision) = if count + uploads.len() == 0 { (String::new(), vec![], vec![]) } else {
         let handle = app.clone();
-        tokio::task::spawn_blocking(move || super::capsules::assistant_attachments(&handle, &capsules, uploads))
+        tokio::task::spawn_blocking(move || super::capsules::assistant_attachments(&handle, &capsules, uploads)
+            .map(|(text, images)| { let vision = vision_parts(&images); (text, images, vision) }))
             .await.map_err(|e| e.to_string())??
     };
     // The journal is rewritten whole on every change; keep queued originals small.
@@ -512,7 +527,7 @@ pub(crate) async fn taskbar_assistant_send(app: tauri::AppHandle, text: String, 
     // The task owns AppHandle + Runtime. Dropping/hiding the webview or this receiver
     // does not cancel generation, the persisted reply, or the durable dispatch queue.
     tauri::async_runtime::spawn(async move {
-        let outcome = decide(&app, &rt, &brief, &original, &model).await;
+        let outcome = decide(&app, &rt, &brief, &original, &model, &vision).await;
         let (text, thread_id, mut job) = outcome.unwrap_or_else(|e|
             (format!("这次没安排成：{e}"), None, None));
         // Dispatched: the placeholder turns into the session's "typing" message, rewritten
@@ -569,10 +584,12 @@ fn poll_job(app: &tauri::AppHandle, rt: &Runtime, job: &Job) -> Result<(), Strin
                 let rest = &thread.items[at + 1..];
                 rest.iter().position(|i| matches!(i, Item::Turn { .. })).map(|end| conclusion(&rest[..=end]))
             });
-            (running, baseline, received.is_some(), outcome)
+            // Kimi cannot steer a running turn (dispatch_prompt rejects it); it waits for idle.
+            let steerable = !matches!(thread.agent_kind, AgentKind::Kimi);
+            (running, steerable, baseline, received.is_some(), outcome)
         })
     };
-    let Some((running, baseline, received, outcome)) = snapshot else {
+    let Some((running, steerable, baseline, received, outcome)) = snapshot else {
         return finish_job(app, rt, job, "error", "目标会话已经删了或不支持调度，这条没发出去，也没另开会话。".into());
     };
     if let Some((_, at)) = job.submitted {
@@ -593,7 +610,8 @@ fn poll_job(app: &tauri::AppHandle, rt: &Runtime, job: &Job) -> Result<(), Strin
         }
         return Ok(());
     }
-    if running { return Ok(()); }
+    // Running sessions get the task immediately as a steer into the current turn.
+    if running && !steerable { return Ok(()); }
     // Persist intent BEFORE dispatch. After a crash, submitted jobs are reconciled
     // against a real User item, never replayed on the strength of an LLM's reply.
     rt.update(|j| {
@@ -601,18 +619,16 @@ fn poll_job(app: &tauri::AppHandle, rt: &Runtime, job: &Job) -> Result<(), Strin
         pending.submitted = Some((baseline, now_ms()));
         Ok(())
     })?;
-    // Recheck after disk I/O: a frontend sender may have started this session meanwhile.
-    if crate::running_by_id(&state, &job.thread_id) {
+    // Recheck after disk I/O: a session that just started cannot take a Kimi prompt yet.
+    if !steerable && crate::running_by_id(&state, &job.thread_id) {
         rt.update(|j| {
             if let Some(pending) = j.queue.iter_mut().find(|p| p.id == job.id) { pending.submitted = None; }
             Ok(())
         })?;
         return Ok(());
     }
-    // Shared dispatch supplies Stage/auto-mode context and selects the right backend.
-    // ponytail: external send_prompt has no atomic idle-only admission; a simultaneous
-    // external sender can still race this last check. Upgrade the shared dispatcher to
-    // an idle-only reservation API before promising cross-entrypoint serialization.
+    // Shared dispatch supplies Stage/auto-mode context, selects the backend, and steers
+    // when the session is running.
     if let Err(error) = crate::dispatch_prompt(app, job.thread_id.clone(), job.text.clone(), job.images.clone()) {
         finish_job(app, rt, job, "error", format!("没能发给会话：{error}。没有自动重发。"))?;
     }
@@ -742,5 +758,20 @@ mod tests {
         // Old journals: in_flight pointed at a user message, which is never overwritten.
         settle(&mut j, Some(&user.id), Message::new("assistant", "late".into(), None));
         assert_eq!((j.messages.len(), j.messages[1].text.as_str()), (3, "hi"));
+    }
+
+    #[test]
+    fn attached_images_reach_the_decision_model_but_other_files_do_not() {
+        let dir = std::env::temp_dir().join(format!("tb-assistant-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (png, txt) = (dir.join("shot.png"), dir.join("notes.txt"));
+        std::fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
+        std::fs::write(&txt, "x").unwrap();
+        let image = |name: &str, mime: &str, path: &std::path::Path| PromptImage { name: name.into(), mime_type: mime.into(),
+            data: None, uri: Some(path.to_string_lossy().into_owned()), size: None };
+        let parts = vision_parts(&[image("shot.png", "image/png", &png), image("notes.txt", "text/plain", &txt)]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(parts.len(), 1);
+        assert_eq!((parts[0]["type"].as_str(), parts[0]["mimeType"].as_str()), (Some("image"), Some("image/png")));
     }
 }
