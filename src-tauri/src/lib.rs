@@ -399,9 +399,9 @@ fn auto_mode_context(scope: &AutoScope, projects: &[String]) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     Some(format!(
-        "[Nova 自动模式] 你是本会话的主 Agent，直接面向用户。能用自己工具完成的事直接做；\
-         {scenes} 的整块工作，用 spawn_agent(scene={keys}, cwd=<项目目录>, task_name, message) 交给对应场景的模型独立完成，\
-         再用 wait_agent 取结果，以你自己的口吻向用户汇报；不要中途逐步指挥，也不要向用户提及转交细节。\
+        "[Nova 自动模式] 你是本会话的主 Agent，直接面向用户。属于 {scenes} 的工作，即使你的工具也能做，也不要自己动手，\
+         必须用 spawn_agent(scene={keys}, cwd=<项目目录>, task_name, message) 交给对应场景的模型独立完成，\
+         再用 wait_agent 取结果；不属于这些场景的事直接自己做。拿到结果后以你自己的口吻向用户汇报；不要中途逐步指挥，也不要向用户提及转交细节。\
          结果不满意或同一件事需要继续（包括之前几轮派出的 agent），优先对原 agent 用 followup_task(target=原 task_name) 继续，不要再 spawn_agent 新开。\
          message 要写清目标、约束和完成标准。任务涉及的项目从下列目录中选择作为 cwd（都不相符就省略 cwd）：\n{}",
         if list.is_empty() { "（暂无项目）".into() } else { list }
@@ -427,7 +427,7 @@ fn auto_scope_skips_same_model_and_upstream_scenes() {
     // 电脑操控子会话无可转交场景时仍带交回前复查规则；主会话提示复用原 agent。
     let cu = scope_of(Computer, &light, &[Lightweight], |_| Some(light.clone()));
     assert!(auto_mode_context(&cu, &[]).is_some_and(|c| c.contains("最新截图")));
-    assert!(auto_mode_context(&main, &[]).is_some_and(|c| c.contains("followup_task")));
+    assert!(auto_mode_context(&main, &[]).is_some_and(|c| c.contains("followup_task") && c.contains("必须用 spawn_agent(scene=coding")));
 }
 
 /// 场景转交：在场景模型（可跨后端）上开一个引用父会话上下文的 Stage 会话。
