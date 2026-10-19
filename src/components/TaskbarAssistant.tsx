@@ -5,7 +5,7 @@ import { marked } from "marked";
 import { createEffect, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { fileToAttachment } from "./ImageAttachmentStrip";
-import { captureCapsule, titleOf, type Capsule } from "./ThoughtCapsules";
+import { titleOf, type Capsule } from "./ThoughtCapsules";
 import "./TaskbarAssistant.css";
 
 type Kind = "running" | "waiting" | "done" | "error";
@@ -139,25 +139,23 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
   createEffect(() => persist("text", text()));
   createEffect(() => persist("uploads", uploads()));
   createEffect(() => persist("picked", picked()));
-  /** On close, a draft of only text or only files becomes a capsule; anything else stays as the draft. */
+  /** Alt+Enter: the text and each attachment become separate capsules; picked capsules stay in the draft.
+   * Closing the panel keeps the draft as is. */
   const stash = async () => {
     const value = text();
     const files = uploads();
-    if (sending() || picked().length || !value.trim() === !files.length) return;
+    if (busy() || composing || (!value.trim() && !files.length)) return;
+    setSending(true);
+    setSendError("");
+    setMenu("");
     try {
-      if (files.length) await invoke("capsule_capture", { text: "", paths: [], uploads: files.map(({ name, data }) => ({ name, data })) });
-      else await captureCapsule(value);
+      await invoke("capsule_capture", { text: value.trim() ? value : "", paths: [], uploads: files.map(({ name, data }) => ({ name, data })) });
       // Clear only what was captured; anything added meanwhile stays in the draft.
       if (text() === value) setText("");
       if (uploads() === files) setUploads([]);
-    } catch (error) { setSendError(`未能存为星屑，已保留草稿：${String(error)}`); }
+    } catch (error) { if (!disposed) setSendError(`未能存为星屑，已保留草稿：${String(error)}`); }
+    finally { setSending(false); }
   };
-  let wasShown = false;
-  createEffect(() => {
-    const shown = props.shown;
-    if (wasShown && !shown) void stash();
-    wasShown = shown;
-  });
 
   const readView = (): View => {
     if (!history.clientHeight) return view;
@@ -429,7 +427,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
         </Show>
         <input ref={imagePicker} type="file" accept="image/*" multiple hidden onChange={(event) => { void addFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ""; }} />
         <input ref={filePicker} type="file" multiple hidden onChange={(event) => { void addFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ""; }} />
-        <textarea ref={input} class="tb-input ta-input" rows={1} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" title="Enter 发送 · Shift+Enter 换行 · 可粘贴图片和文件" value={text()}
+        <textarea ref={input} class="tb-input ta-input" rows={1} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" title="Enter 发送 · Alt+Enter 存为星屑 · Shift+Enter 换行 · 可粘贴图片和文件" value={text()}
           onInput={(event) => setText(event.currentTarget.value)}
           onPaste={(event) => {
             const files = Array.from(event.clipboardData?.files ?? []);
@@ -442,7 +440,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229 && !composing) {
               event.preventDefault();
-              void send();
+              void (event.altKey ? stash() : send());
             }
           }}
         />
