@@ -26,9 +26,10 @@ type Card = {
 };
 /** `light`: the Windows taskbar theme, so cards match the Butterfly they pop out of.
  *  `panel`: hover must not focus; a click focuses the assistant after placement. */
-type Payload = { cards: Card[]; permissions: Permission[]; light: boolean; panel?: boolean; captureError?: string | null } & Partial<PanelData>;
+type Payload = { cards: Card[]; permissions: Permission[]; light: boolean; panel?: boolean; tab?: Tab; captureError?: string | null } & Partial<PanelData>;
 
 type PanelData = { jianpu: { recording: boolean; id?: string; elapsedMs?: number } };
+/** `tab`: the Butterfly's left click opens the assistant, its right click the quick actions. */
 type Tab = "assistant" | "session" | "capsules" | "quick";
 const TABS: [Tab, string, string][] = [
   ["assistant", "助理", "M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1L5 10.5l5.1-1.9zM18.5 15.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"],
@@ -41,6 +42,8 @@ const icon = (d: string, size = 22) => (
   <svg viewBox="0 0 24 24" width={size} height={size} aria-hidden="true"><path d={d} fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" /></svg>
 );
 const ICONS = {
+  plus: "M12 5v14M5 12h14",
+  app: "M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z",
   brush: "M4 20l4.5-1.2L19 8.3a2.1 2.1 0 00-3-3L5.5 15.8 4 20zM14.5 6.8l3 3",
   stop: "M7 7h10v10H7z",
   graph: "M6 7a2 2 0 100-.01M18 6a2 2 0 100-.01M12 18a2 2 0 100-.01M7.6 8.2l3.2 7.8M16.4 7.2l-3.2 8.8M8 6.6h8",
@@ -49,6 +52,28 @@ const ICONS = {
 /** One persistent panel, independent of session keys and native show/hide cycles. */
 function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Tab) => void; session: JSX.Element; active: boolean; focusRequest: number; permissionCount: number; onClose: () => void; reload: () => void }) {
   const [error, setError] = createSignal("");
+  const [miniApps, setMiniApps] = createSignal<{ id: string; name: string; version?: number }[]>([]);
+  const loadMiniApps = () => {
+    try {
+      const stored: unknown = JSON.parse(localStorage.getItem("nova:miniapps:v1") ?? "[]");
+      setMiniApps(Array.isArray(stored) ? stored
+        .filter(app => typeof app?.id === "string" && app.id.length === 36
+          && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(app.id)
+          && typeof app?.published?.name === "string")
+        .map(app => ({ id: app.id, name: app.published.name, version: Number.isInteger(app.publishedVersion) ? app.publishedVersion : undefined })) : []);
+    } catch {
+      // Storage is read-only here; malformed/unavailable data must not hide the fixed actions.
+      setMiniApps([]);
+    }
+  };
+  onMount(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (!event.key || event.key === "nova:miniapps:v1") loadMiniApps();
+    };
+    window.addEventListener("storage", onStorage);
+    loadMiniApps();
+    onCleanup(() => window.removeEventListener("storage", onStorage));
+  });
   const run = async (action: string) => {
     setError("");
     try {
@@ -62,6 +87,7 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
   // Fixed button nodes with reactive labels: the 1s refresh (recording clock) must not rebuild the DOM
   // under the pointer, or a click spanning the refresh is lost.
   const tiles = [
+    { action: "miniapps", label: () => "创建应用", icon: () => ICONS.plus, hot: () => false },
     { action: "jianpu", label: () => (rec() ? `停止 ${clock(props.data.jianpu.elapsedMs)}` : "剑谱录制"), icon: () => (rec() ? ICONS.stop : ICONS.brush), hot: rec },
     { action: "knowledge", label: () => "知识图谱", icon: () => ICONS.graph, hot: () => false },
   ];
@@ -106,6 +132,14 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
                 <button class="tb-tile" classList={{ hot: t.hot() }} onClick={() => void run(t.action)}>
                   {icon(t.icon())}
                   <span>{t.label()}</span>
+                </button>
+              )}
+            </For>
+            <For each={miniApps()}>
+              {app => (
+                <button type="button" class="tb-tile" style={{ "min-width": "0" }} title={`${app.name || "未命名应用"}${app.version ? ` · v${app.version}` : ""}`} onClick={() => void run(`miniapp:${app.id}`)}>
+                  {icon(ICONS.app)}
+                  <span style={{ "max-width": "100%", overflow: "hidden", "text-overflow": "ellipsis" }}>{app.name || "未命名应用"}</span>
                 </button>
               )}
             </For>
@@ -366,8 +400,9 @@ export default function TaskbarBubble() {
     if (!next?.cards.length) { setActive(false); return hide(); }
     setPanel({ jianpu: next.jianpu ?? { recording: false } });
     if (fresh) {
-      focusPending = next.panel === false;
-      setTab("assistant");
+      const quick = next.tab === "quick";
+      focusPending = next.panel === false && !quick;
+      setTab(quick ? "quick" : "assistant");
     }
     if (next.captureError) setCaptureError(next.captureError);
     fresh = false;

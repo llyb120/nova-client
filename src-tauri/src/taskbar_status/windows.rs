@@ -843,15 +843,18 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
-        WM_LBUTTONDOWN => {
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
             CLICKED.with(|clicked| *clicked.borrow_mut() = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone())));
             on_app(|app| { super::bubble::window(app); });
             0
         }
-        WM_LBUTTONUP => {
-            if DOUBLE.replace(false) { return 0; }
-            // Only a click opens the panel (no hover preview). A double click still hands over to Nova and closes the panel it just opened.
-            if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open(app, anchor)); }
+        // Handled without DefWindowProc, so no WM_CONTEXTMENU reaches the taskbar's own menu.
+        WM_LBUTTONUP | WM_RBUTTONUP => {
+            if message == WM_LBUTTONUP && DOUBLE.replace(false) { return 0; }
+            // Only a click opens the panel (no hover preview): left on the assistant, right on the quick actions.
+            // A double click still hands over to Nova and closes the panel it just opened.
+            let quick = message == WM_RBUTTONUP;
+            if let Some(anchor) = anchor(hwnd) { on_app(move |app| super::bubble::open(app, anchor, quick)); }
             0
         }
         WM_LBUTTONDBLCLK => {

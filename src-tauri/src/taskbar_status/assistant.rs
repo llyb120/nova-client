@@ -3,10 +3,10 @@
 //! `changed` is an invalidation event (payload `{}`). History is oldest-first; its
 //! exclusive cursor is a message ID, not a timestamp. Send returns one assistant message.
 //! Admission/storage failures reject the invoke; model/dispatch failures appear in history.
-//! No agent runtime is used for the assistant: native stream_chat has an empty tool
-//! list and bounded output. Only the decoded actions below cross this boundary.
+//! The lightweight scene selects the backend and model. Decision generation is
+//! tool-restricted; only the decoded actions below may dispatch work to a session.
 
-use std::{collections::HashSet, path::PathBuf, sync::{atomic::AtomicBool, Arc, Mutex}, time::Duration};
+use std::{collections::HashSet, path::PathBuf, sync::{Arc, Mutex}, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
@@ -200,6 +200,7 @@ pub(crate) fn taskbar_assistant_history(
 fn eligible(thread: &Thread) -> bool {
     !thread.subagent && !thread.ephemeral && !thread.experience_thread
         && !thread.employee_thread && !thread.is_roaming_guest()
+        && thread.agent_kind != AgentKind::Unsupported
 }
 
 fn short(text: &str, limit: usize) -> String { text.chars().take(limit).collect() }
@@ -350,17 +351,6 @@ fn context(app: &tauri::AppHandle, rt: &Runtime) -> Result<(Value, HashSet<Strin
         "candidates":candidates,"projects":projects}), allowed, projects))
 }
 
-// Native title-generation pattern, without the inline-completion 48-token/64-char cap.
-// Only the first available lightweight backend is honored; never silently skip a
-// configured non-Lyra backend or fall back to a fully privileged agent runtime.
-fn lightweight_model(app: &tauri::AppHandle) -> Result<String, String> {
-    let (kind, model) = app.state::<AppState>().scene_model(Scene::Lightweight)?;
-    if kind != AgentKind::Lyra {
-        return Err(format!("轻量化场景首选后端是 {}；蝴蝶助理当前仅支持 Lyra 原生无工具生成。请将 Lyra 放在首位，不会跳过首选或启用全工具 Agent。", kind.label()));
-    }
-    Ok(model)
-}
-
 /// Image parts the decision model can see; non-image files stay listed by name in the text.
 fn vision_parts(images: &[PromptImage]) -> Vec<Value> {
     let parts: Vec<Value> = images.iter().filter_map(|image| match (&image.data, &image.uri) {
@@ -373,36 +363,19 @@ fn vision_parts(images: &[PromptImage]) -> Vec<Value> {
     crate::lyra::bridge::prompt_input(&parts).1
 }
 
-async fn complete_reply(app: &tauri::AppHandle, model: &str, seed: String, images: &[Value]) -> Result<String, String> {
-    use crate::lyra::{config, provider::{self, StreamEvent}};
-    let state = app.state::<AppState>();
-    let config = config::Roots::borrowed(state.config_dir.clone()).load_config(None)?;
-    let mut resolved = config::resolve_model(&config, Some(model).filter(|s| !s.is_empty()), &config::process_env())?;
-    resolved.model.max_output_tokens = resolved.model.max_output_tokens.min(2048);
-    // Provider options may override tools/messages/token caps. Do not forward arbitrary
-    // extra fields at this restricted boundary; sampling, headers, proxy remain resolved.
-    resolved.model.extra_options.clear();
-    let proxy = state.settings.lock().map_err(|e| e.to_string())?.lyra_proxy.clone();
-    let http = provider::client_for_proxy(proxy.trim());
-    let messages = [crate::lyra::history::user_message(&seed, images)];
-    let cancel = Arc::new(AtomicBool::new(false));
-    let mut text = String::new();
-    let mut collect = |event| { if let StreamEvent::TextDelta(delta) = event { text.push_str(&delta); } };
-    let result = tokio::time::timeout(Duration::from_secs(15), provider::stream_chat(
-        &http, &resolved.model, &resolved.api_key, Some("off"), POLICY, &messages,
-        &[], None, &cancel, &mut collect,
-    )).await.map_err(|_| "轻量助理响应超时，未自动重试".to_string())??;
-    if result.error_message.is_some() || matches!(result.stop_reason.as_str(), "error" | "aborted" | "length") {
-        return Err(result.error_message.unwrap_or_else(|| format!("轻量助理未正常完成：{}", result.stop_reason)));
+async fn complete_reply(app: &tauri::AppHandle, target: &(AgentKind, String), seed: String, images: &[Value]) -> Result<String, String> {
+    let (kind, model) = target;
+    if *kind == AgentKind::Unsupported {
+        return Err("已移除后端不可用，请重新配置轻量化场景".into());
     }
-    if result.content.iter().any(|part| part["type"] == "toolCall") {
-        return Err("纯文本助理返回了未授权工具调用，已拒绝".into());
-    }
-    Ok(text)
+    app.state::<AppState>().generate_text_once(kind, model, &seed, crate::text_generation::GenerateTextOptions {
+        system: POLICY, images, max_output_tokens: Some(2048), max_output_bytes: MAX_TEXT,
+        timeout: Duration::from_secs(if *kind == AgentKind::Lyra { 15 } else { 60 }),
+    }).await
 }
 
 /// `text` is what the model reads; `original` (with full 星屑 text) is what the session receives.
-async fn decide(app: &tauri::AppHandle, rt: &Runtime, text: &str, original: &str, model: &str, images: &[Value])
+async fn decide(app: &tauri::AppHandle, rt: &Runtime, text: &str, original: &str, model: &(AgentKind, String), images: &[Value])
     -> Result<(String, Option<String>, Option<Job>), String>
 {
     let (context, mut allowed, projects) = context(app, rt)?;
@@ -496,7 +469,7 @@ pub(crate) async fn taskbar_assistant_send(app: tauri::AppHandle, text: String, 
         return Err("消息须为 1–16000 字节，或附带文件/星屑".into());
     }
     let rt = runtime(&app)?;
-    let model = lightweight_model(&app)?;
+    let model = app.state::<AppState>().scene_model(Scene::Lightweight)?;
     if rt.journal.lock().map_err(|e| e.to_string())?.in_flight.is_some() { return Err("助理正在回复，请稍后再发".into()); }
     let count = capsules.len();
     let (capsule_text, images, vision) = if count + uploads.len() == 0 { (String::new(), vec![], vec![]) } else {
@@ -739,6 +712,14 @@ mod logic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn removed_backend_cannot_be_scheduled() {
+        let mut thread = Thread::new(".".into(), AgentKind::Lyra, None, None, None, false);
+        assert!(eligible(&thread));
+        thread.agent_kind = AgentKind::Unsupported;
+        assert!(!eligible(&thread));
+    }
+
     #[test]
     fn unknown_tools_and_extra_arguments_are_rejected() {
         assert!(serde_json::from_str::<Decision>(r#"{"action":"bash","command":"whoami"}"#).is_err());

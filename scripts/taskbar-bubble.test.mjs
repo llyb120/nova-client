@@ -138,6 +138,15 @@ resolvePayload({ cards: [{ key: 'late' }], permissions: [], light: false, panel:
 rendered.length = 0;
 assert.equal(await stale, false);
 assert.deepEqual(rendered, []);
+// Right click opens on the quick actions without focusing the hidden assistant input; left click returns to it.
+for (const [native, expected, focus] of [['quick', 'quick', 0], [undefined, 'assistant', 1]]) {
+  const before = focusRequest;
+  loadContext.invoke = async () => ({ cards: [{ key: 'live:' }], permissions: [], light: false, panel: false, tab: native });
+  loadContext.fresh = true;
+  assert.equal(await reloadCard(), true);
+  assert.equal(tab, expected);
+  assert.equal(focusRequest - before, focus);
+}
 
 // Native placement must reject post-hide ResizeObserver notifications before touching HWND
 // geometry. No AppHandle/HWND is available in this headless check, so pin the guard's ordering.

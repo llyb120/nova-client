@@ -37,6 +37,8 @@ static CAPTURE_ERROR: Mutex<Option<String>> = Mutex::new(None);
 /// Clicking inside pins the panel for keyboard input until blur or explicit dismissal.
 static PANEL: AtomicBool = AtomicBool::new(false);
 static PANEL_WATCH: AtomicBool = AtomicBool::new(false);
+/// Opened by a right click: start on the quick actions instead of the assistant.
+static QUICK: AtomicBool = AtomicBool::new(false);
 /// Bumped by hide(): a watcher outliving a quick hide/reopen restarts its bookkeeping.
 static OPENED: AtomicUsize = AtomicUsize::new(0);
 static BUILD: Mutex<()> = Mutex::new(());
@@ -95,8 +97,9 @@ pub(super) fn capture_error(app: &AppHandle, error: &str) {
     let _ = app.emit_to(LABEL, "capsules:error", json!({ "error": error }));
 }
 
-pub(super) fn open(app: &AppHandle, anchor: Anchor) {
+pub(super) fn open(app: &AppHandle, anchor: Anchor, quick: bool) {
     PANEL.store(false, Ordering::Release);
+    QUICK.store(quick, Ordering::Release);
     *ANCHOR.lock().unwrap() = Some(anchor);
     WANTED.store(true, Ordering::Release);
     // A freshly built page places itself on mount; a warm one reloads on this event.
@@ -108,6 +111,7 @@ pub(super) fn open(app: &AppHandle, anchor: Anchor) {
 pub(super) fn open_panel(app: &AppHandle, anchor: Anchor) {
     if WANTED.load(Ordering::Acquire) { return; }
     PANEL.store(true, Ordering::Release);
+    QUICK.store(false, Ordering::Release);
     *ANCHOR.lock().unwrap() = Some(anchor);
     WANTED.store(true, Ordering::Release);
     if window(app).is_some() { let _ = app.emit_to(LABEL, "taskbar-bubble:open", ()); }
@@ -346,15 +350,21 @@ fn name(kind: Kind) -> &'static str {
 
 /// Panel quick actions. Anything that needs the full window hands over to it and closes the panel.
 pub(super) fn quick(app: &AppHandle, action: &str) -> Result<Value, String> {
-    match action {
+    let request = match action {
         "jianpu" => return crate::jianpu::toggle(),
-        _ => {}
-    }
+        "knowledge" => json!({ "view": "knowledge" }),
+        "miniapps" => json!({ "view": "miniapps", "create": true }),
+        _ => {
+            let id = action.strip_prefix("miniapp:")
+                .ok_or_else(|| format!("未知快捷操作：{action}"))?;
+            hide(app);
+            crate::miniapp_window::open(app, id)?;
+            return Ok(Value::Null);
+        }
+    };
     hide(app);
-    match action {
-        "knowledge" => { crate::sys_notify::focus_main_window(app); let _ = app.emit("nova:open-view", json!({ "view": "knowledge" })); }
-        _ => return Err(format!("未知快捷操作：{action}")),
-    }
+    crate::sys_notify::focus_main_window(app);
+    app.emit("nova:open-view", request).map_err(|e| e.to_string())?;
     Ok(Value::Null)
 }
 
@@ -385,9 +395,10 @@ pub(super) fn payload(app: &AppHandle) -> Value {
     };
     permissions.sort_by(|a, b| a["requestKey"].as_str().cmp(&b["requestKey"].as_str()));
     // Cards follow the taskbar they pop out of, like Windows' own taskbar flyouts.
-    // Both hover and click default to the assistant; `panel` only controls focus behavior.
+    // `tab`: left click/hover open the assistant, right click the quick actions; `panel` only controls focus behavior.
     let capture_error = if cards.is_empty() { None } else { CAPTURE_ERROR.lock().unwrap().take() };
-    json!({ "cards": cards, "permissions": permissions, "light": super::windows::light_theme(), "panel": PANEL.load(Ordering::Acquire), "captureError": capture_error,
+    let tab = if QUICK.load(Ordering::Acquire) { "quick" } else { "assistant" };
+    json!({ "cards": cards, "permissions": permissions, "light": super::windows::light_theme(), "panel": PANEL.load(Ordering::Acquire), "tab": tab, "captureError": capture_error,
         "jianpu": crate::jianpu::status() })
 }
 
