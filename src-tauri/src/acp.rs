@@ -3665,6 +3665,7 @@ impl AcpManager {
         }
         // 图片可读成 image block；普通文件只作为 resource_link 传给 devin，不在客户端展开内容。
         let mut saved: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
         for img in images {
             if img.mime_type.starts_with("image/") {
                 if let Some(data) = prompt_image_data(img) {
@@ -3694,6 +3695,8 @@ impl AcpManager {
                     .map(|p| format!("file:///{}", p.replace('\\', "/")))
             };
             if let Some(uri) = file_uri {
+                // CodeBuddy 会把 file:// resource_link 压成「@文件名」，路径丢失、模型找不到文件；另附明文路径兜底。
+                files.extend(file_uri_to_path(&uri));
                 let mut block = json!({
                     "type": "resource_link",
                     "uri": uri,
@@ -3716,6 +3719,12 @@ impl AcpManager {
                     saved.len(),
                     saved.join("\n")
                 )
+            }));
+        }
+        if !files.is_empty() {
+            prompt.push(json!({
+                "type": "text",
+                "text": format!("（用户随消息附带了 {} 个文件，本地文件路径：\n{}\n请用读取工具直接打开。）", files.len(), files.join("\n"))
             }));
         }
         prompt
@@ -4691,6 +4700,20 @@ fn subagent_child_thread(parent: &Thread, name: &str, task: &str) -> Thread {
 #[cfg(test)]
 mod subagent_stage_tests {
     use super::*;
+
+    #[test]
+    fn file_attachment_path_survives_codebuddy_name_collapse() {
+        let img = PromptImage {
+            name: "用例模板.xmind".into(),
+            mime_type: "application/octet-stream".into(),
+            data: None,
+            uri: Some("file:///C:/Users/u/Desktop/%E7%94%A8%E4%BE%8B%E6%A8%A1%E6%9D%BF.xmind".into()),
+            size: Some(1),
+        };
+        let blocks = AcpManager::build_prompt_blocks("hi", &[img]);
+        let text = blocks.last().unwrap()["text"].as_str().unwrap();
+        assert!(text.contains("Desktop") && text.contains("用例模板.xmind"), "{text}");
+    }
 
     #[test]
     fn subagent_child_thread_is_readonly_sibling_with_task_note() {
