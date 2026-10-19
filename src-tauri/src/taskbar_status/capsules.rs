@@ -590,9 +590,10 @@ pub(crate) async fn capsule_capture(app: AppHandle, text: String, paths: Vec<Str
     Ok(created)
 }
 
-pub(crate) fn capture_drop(app: AppHandle, text: String, paths: Vec<String>) {
+/// Background capture for a native drop or a smart paste; errors surface in the panel.
+pub(crate) fn capture_drop(app: AppHandle, text: String, paths: Vec<String>, uploads: Option<Vec<CapsuleUpload>>) {
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = capsule_capture(app.clone(), text, paths, None).await { emit_error(&app, error); }
+        if let Err(error) = capsule_capture(app.clone(), text, paths, uploads).await { emit_error(&app, error); }
     });
 }
 

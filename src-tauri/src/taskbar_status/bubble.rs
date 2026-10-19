@@ -132,6 +132,12 @@ pub(super) fn activate(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(LABEL) { focus(&window); }
 }
 
+/// The panel (not just its hover preview) holds the foreground.
+pub(super) fn focused(app: &AppHandle) -> bool {
+    WANTED.load(Ordering::Acquire) && app.get_webview_window(LABEL).and_then(|w| w.hwnd().ok())
+        .is_some_and(|hwnd| unsafe { GetForegroundWindow() } == hwnd.0 as HWND)
+}
+
 /// Show and focus natively. Hover shows with ShowWindow, so tao's VISIBLE flag lags; tao's
 /// show() would then flip it and re-apply the window style with SWP_FRAMECHANGED, which
 /// flashes the transparent WebView on every click into the panel. hide() already hides
