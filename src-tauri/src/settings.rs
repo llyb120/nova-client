@@ -5,15 +5,6 @@ use std::path::PathBuf;
 /// 默认中转服务地址。relay_server 为空时回退到它；空字符串表示必须用户自填。
 pub const DEFAULT_RELAY_SERVER: &str = "";
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct CursorModelContextRule {
-    /// 不区分大小写的 Cursor 模型 id 匹配串（包含匹配）。
-    pub prefix: String,
-    /// 模型上下文窗口，单位 token。
-    pub context_window: u32,
-}
-
 /// 新建会话 / 会话页快捷键：一键切到指定项目或模型、快速新会话、插入文本。
 /// Esc 终止回合为内置行为，不作为可配置项。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -156,20 +147,6 @@ pub struct Settings {
     /// WorkBuddy 安装目录或内置 CodeBuddy CLI；空 = 自动发现，不回退到普通 CodeBuddy。
     pub workbuddy_path: String,
     pub workbuddy_proxy: String,
-    /// 兼容旧配置；Cursor 后端已改为仅使用官方 SDK，不再依赖本机 CLI
-    pub cursor_path: String,
-    /// 旧版 Cursor ACP 启动参数，仅用于兼容已有设置。
-    pub cursor_args: String,
-    /// Cursor 代理地址
-    pub cursor_proxy: String,
-    /// Cursor SDK API Key；空 = 使用 CURSOR_API_KEY 环境变量。
-    pub cursor_sdk_api_key: String,
-    /// 是否写入 Cursor 全局 hook 以阻止 Task/subagent；默认关闭。
-    pub cursor_disable_subagents: bool,
-    /// Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。
-    pub cursor_model_contexts: Vec<CursorModelContextRule>,
-    /// Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。
-    pub cursor_context_mode: String,
     /// Codex CLI 可执行文件路径（默认 codex，依赖 PATH）
     pub codex_path: String,
     /// Codex app-server 启动参数
@@ -240,11 +217,9 @@ pub struct Settings {
     pub codebuddy_enabled: bool,
     pub codebuddyplus_enabled: bool,
     pub workbuddy_enabled: bool,
-    pub cursor_enabled: bool,
     /// 各后端接入方式：app-server / sdk / acp。Codex 固定使用 app-server。
     pub codex_integration: String,
     pub codebuddy_integration: String,
-    pub cursor_integration: String,
     /// worktree 工作目录的根（空 = 应用数据目录下的 worktrees/）。
     /// 会话开启「在 worktree 中执行」时，在此目录下为其创建独立工作目录。
     pub worktree_dir: String,
@@ -282,13 +257,6 @@ impl Default for Settings {
             codebuddy_proxy: String::new(),
             workbuddy_path: String::new(),
             workbuddy_proxy: String::new(),
-            cursor_path: "cursor-agent".into(),
-            cursor_args: "acp".into(),
-            cursor_proxy: String::new(),
-            cursor_sdk_api_key: String::new(),
-            cursor_disable_subagents: false,
-            cursor_model_contexts: Vec::new(),
-            cursor_context_mode: "default".into(),
             codex_path: "codex".into(),
             codex_args: "app-server --stdio".into(),
             codex_proxy: String::new(),
@@ -324,10 +292,8 @@ impl Default for Settings {
             codebuddy_enabled: false,
             codebuddyplus_enabled: false,
             workbuddy_enabled: false,
-            cursor_enabled: false,
             codex_integration: "app-server".into(),
             codebuddy_integration: "acp".into(),
-            cursor_integration: "sdk".into(),
             worktree_dir: String::new(),
             update_channel: "release".into(),
             session_auto_cleanup_enabled: false,
@@ -473,14 +439,24 @@ mod tests {
     }
 
     #[test]
-    fn cursor_model_context_rules_round_trip() {
-        let settings: Settings = serde_json::from_str(
-            r#"{"cursorModelContexts":[{"prefix":"claude-4","contextWindow":200000}]}"#,
-        )
-        .unwrap();
-        assert_eq!(settings.cursor_model_contexts.len(), 1);
-        assert_eq!(settings.cursor_model_contexts[0].prefix, "claude-4");
-        assert_eq!(settings.cursor_model_contexts[0].context_window, 200_000);
+    fn removed_cursor_settings_are_ignored() {
+        let settings: Settings = serde_json::from_str(r#"{
+            "cursorPath":"cursor-agent",
+            "cursorArgs":"acp",
+            "cursorProxy":"http://localhost:1234",
+            "cursorSdkApiKey":"legacy-key",
+            "cursorDisableSubagents":true,
+            "cursorModelContexts":[{"prefix":"claude-4","contextWindow":200000}],
+            "cursorContextMode":"super",
+            "cursorEnabled":true,
+            "cursorIntegration":"sdk",
+            "codexPath":"custom-codex",
+            "lyraProxy":"http://localhost:5678"
+        }"#).unwrap();
+        assert_eq!(settings.codex_path, "custom-codex");
+        assert_eq!(settings.lyra_proxy, "http://localhost:5678");
+        let saved = serde_json::to_value(settings).unwrap();
+        assert!(saved.as_object().unwrap().keys().all(|key| !key.starts_with("cursor")));
     }
 
     #[test]
@@ -513,32 +489,12 @@ mod tests {
     }
 
     #[test]
-    fn cursor_subagent_hook_is_disabled_by_default_and_round_trips() {
-        let defaults = Settings::default();
-        assert!(!defaults.cursor_disable_subagents);
-        let settings: Settings =
-            serde_json::from_str(r#"{"cursorDisableSubagents":true}"#).unwrap();
-        assert!(settings.cursor_disable_subagents);
-    }
-
-    #[test]
-    fn context_modes_default_and_round_trip() {
-        let defaults = Settings::default();
-        assert_eq!(defaults.cursor_context_mode, "default");
-        let settings: Settings =
-            serde_json::from_str(r#"{"cursorContextMode":"super","vegaContextMode":"super"}"#)
-                .unwrap();
-        assert_eq!(settings.cursor_context_mode, "super");
-    }
-
-    #[test]
     fn vega_and_external_backends_are_disabled_by_default() {
         let settings = Settings::default();
         assert!(!settings.vega_enabled);
         assert!(!settings.devin_enabled);
         assert!(!settings.codex_enabled);
         assert!(!settings.codebuddy_enabled);
-        assert!(!settings.cursor_enabled);
     }
 
     #[test]
@@ -619,7 +575,6 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.codex_integration, "app-server");
         assert_eq!(settings.codebuddy_integration, "acp");
-        assert_eq!(settings.cursor_integration, "sdk");
     }
 
     #[test]
@@ -631,8 +586,7 @@ mod tests {
             r#"{
                 "codexIntegration":"sdk",
                 "codebuddyIntegration":"sdk",
-                "codebuddyplusEnabled":true,
-                "cursorIntegration":"acp"
+                "codebuddyplusEnabled":true
             }"#,
         )
         .unwrap();
@@ -642,7 +596,6 @@ mod tests {
         assert_eq!(settings.codex_integration, "app-server");
         assert_eq!(settings.codebuddy_integration, "acp");
         assert!(!settings.codebuddyplus_enabled);
-        assert_eq!(settings.cursor_integration, "sdk");
         fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -735,15 +688,11 @@ impl Settings {
         settings.codexplus_enabled = false;
         settings.codebuddyplus_enabled = false;
         // SDK bridge 已移除：CodeBuddy 固定走官方 HTTP 传输（`codebuddy --serve`
-        // + /api/v1/acp）；Codex 固定走 app-server，其余后端使用 SDK。
+        // + /api/v1/acp）；Codex 固定走 app-server。
         settings.codex_integration = "app-server".into();
         settings.codebuddy_integration = "acp".into();
-        settings.cursor_integration = "sdk".into();
         // Vega 已移除：旧的开关与 alkaid 键统一迁移到 Lyra。
         settings.migrate_legacy_vega();
-        if settings.cursor_context_mode != "super" {
-            settings.cursor_context_mode = "default".into();
-        }
         settings
     }
 

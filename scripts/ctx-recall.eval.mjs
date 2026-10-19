@@ -234,19 +234,6 @@ const CASES = [
     expect: ["src/workflow/types.ts", "src/workflow/runtime.ts", "src/components/WorkflowCanvas.tsx", "src/components/WorkflowSettingsPanel.tsx"],
     min: 0.75,
   },
-  {
-    // 真实任务“那就加一句保底”，原录制 3 目标只召回 1：测试文件不进闭包。
-    // 期望实现文件与其测试文件一并召回。
-    name: "真实回放：提示词保底（测试文件召回）",
-    args: {
-      files: ["scripts/cursor-context-reasonix.mjs", "scripts/cursor-filesystem-tools.mjs", "docs/architecture.md"],
-      keywords: ["cursorSystemPrompt", "cursorPromptPrefix", "同轮并行"],
-      task: "在并行工具规则里加一句保底说明",
-      budget: 800,
-    },
-    expect: ["scripts/cursor-context-reasonix.mjs", "scripts/cursor-context-super.test.mjs"],
-    min: 1,
-  },
 ];
 
 const SELF_PATH = "scripts/ctx-recall.eval.mjs";

@@ -14,7 +14,6 @@ const TRIGGERS_FILE: &str = "prompt-triggers.json";
 const TRIGGERS_DIR: &str = "prompt-triggers";
 const BLOCK_START: &str = "<!-- NOVA_GLOBAL_INSTRUCTIONS_START -->";
 const BLOCK_END: &str = "<!-- NOVA_GLOBAL_INSTRUCTIONS_END -->";
-const CURSOR_MARKER: &str = "<!-- NOVA_GLOBAL_INSTRUCTIONS_CURSOR -->";
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -51,17 +50,10 @@ struct AdapterPreferences {
     disabled_agent_kinds: HashSet<String>,
 }
 
-#[derive(Clone, Copy)]
-enum TargetFormat {
-    Markdown,
-    CursorRule,
-}
-
 struct Target {
     kind: AgentKind,
     label: &'static str,
     path: PathBuf,
-    format: TargetFormat,
 }
 
 pub fn get_global_instructions(config_dir: &Path) -> GlobalAgentInstructions {
@@ -89,9 +81,7 @@ pub fn set_global_instructions(
     enabled_agent_kinds: &[String],
     triggers: &[PromptTrigger],
 ) -> Result<GlobalAgentInstructions, String> {
-    let has_marker = |text: &str| {
-        text.contains(BLOCK_START) || text.contains(BLOCK_END) || text.contains(CURSOR_MARKER)
-    };
+    let has_marker = |text: &str| text.contains(BLOCK_START) || text.contains(BLOCK_END);
     if has_marker(content)
         || triggers
             .iter()
@@ -269,7 +259,6 @@ fn normal_targets(config_dir: &Path) -> Result<Vec<Target>, String> {
         AgentKind::Codex,
         AgentKind::CodeBuddy,
         AgentKind::WorkBuddy,
-        AgentKind::Cursor,
     ]
     .iter()
     .map(|kind| target_for(kind, &env))
@@ -281,20 +270,18 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
         .or_else(|| configured_dir(overrides, "HOME"))
         .or_else(user_home_dir)
         .ok_or("无法确定用户主目录")?;
-    let (label, path, format) = match kind {
+    let (label, path) = match kind {
         AgentKind::Claude => (
             kind.label(),
             configured_dir(overrides, "CLAUDE_CONFIG_DIR")
                 .unwrap_or_else(|| home.join(".claude"))
                 .join("CLAUDE.md"),
-            TargetFormat::Markdown,
         ),
         AgentKind::Kimi => (
             kind.label(),
             configured_dir(overrides, "KIMI_CODE_HOME")
                 .unwrap_or_else(|| home.join(".kimi-code"))
                 .join("AGENTS.md"),
-            TargetFormat::Markdown,
         ),
         // Lyra 沿用旧 Vega 数据目录与 AGENTS.md。
         AgentKind::Lyra => (
@@ -303,7 +290,6 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
                 .unwrap_or_else(|| home.join(".nova"))
                 .join("alkaid")
                 .join("AGENTS.md"),
-            TargetFormat::Markdown,
         ),
         AgentKind::Devin => {
             #[cfg(windows)]
@@ -313,16 +299,12 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
             let root = configured_dir(overrides, "APPDATA")
                 .or_else(|| configured_dir(overrides, "XDG_CONFIG_HOME"))
                 .unwrap_or_else(|| home.join(".config"));
-            (
-                "Devin",
-                root.join("devin").join("AGENTS.md"),
-                TargetFormat::Markdown,
-            )
+            ("Devin", root.join("devin").join("AGENTS.md"))
         }
         AgentKind::Codex | AgentKind::CodexPlus => {
             let root =
                 configured_dir(overrides, "CODEX_HOME").unwrap_or_else(|| home.join(".codex"));
-            (kind.label(), root.join("AGENTS.md"), TargetFormat::Markdown)
+            (kind.label(), root.join("AGENTS.md"))
         }
         AgentKind::WorkBuddy => (
             kind.label(),
@@ -330,32 +312,18 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
                 .or_else(crate::workbuddy::config_dir)
                 .unwrap_or_else(|| home.join(".workbuddy"))
                 .join("CODEBUDDY.md"),
-            TargetFormat::Markdown,
         ),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
             let root = configured_dir(overrides, "CODEBUDDY_CONFIG_DIR")
                 .unwrap_or_else(|| home.join(".codebuddy"));
-            (
-                kind.label(),
-                root.join("CODEBUDDY.md"),
-                TargetFormat::Markdown,
-            )
+            (kind.label(), root.join("CODEBUDDY.md"))
         }
-        AgentKind::Cursor => {
-            let root = configured_dir(overrides, "CURSOR_CONFIG_DIR")
-                .unwrap_or_else(|| home.join(".cursor"));
-            (
-                "Cursor",
-                root.join("rules").join("nova-global.mdc"),
-                TargetFormat::CursorRule,
-            )
-        }
+        AgentKind::Unsupported => return Err("该后端已不受支持".into()),
     };
     Ok(Target {
         kind: kind.clone(),
         label,
         path,
-        format,
     })
 }
 
@@ -378,11 +346,7 @@ fn user_home_dir() -> Option<PathBuf> {
 }
 
 fn sync_target(target: &Target, content: &str, enabled: bool) -> AgentInstructionTarget {
-    let result = match target.format {
-        TargetFormat::Markdown => sync_markdown(&target.path, content),
-        TargetFormat::CursorRule => sync_cursor_rule(&target.path, content),
-    };
-    match result {
+    match sync_markdown(&target.path, content) {
         Ok((status, detail)) => target_status(target, status, detail, enabled),
         Err(error) => target_status(target, "error", error.to_string(), enabled),
     }
@@ -409,24 +373,13 @@ fn inspect_target(target: &Target, active: bool, enabled: bool) -> AgentInstruct
             true,
         );
     };
-    let managed = match target.format {
-        TargetFormat::Markdown => existing.contains(BLOCK_START) && existing.contains(BLOCK_END),
-        TargetFormat::CursorRule => existing.contains(CURSOR_MARKER),
-    };
-    if managed {
+    if existing.contains(BLOCK_START) && existing.contains(BLOCK_END) {
         target_status(target, "managed", "已由 Nova 托管".into(), true)
-    } else if matches!(target.format, TargetFormat::Markdown) {
+    } else {
         target_status(
             target,
             "pending",
             "保存时保留原内容并合并 Nova 指令".into(),
-            true,
-        )
-    } else {
-        target_status(
-            target,
-            "conflict",
-            "同名 Cursor Rule 已存在，未覆盖".into(),
             true,
         )
     }
@@ -481,33 +434,6 @@ fn sync_markdown(path: &Path, content: &str) -> Result<(&'static str, String), S
     ))
 }
 
-fn sync_cursor_rule(path: &Path, content: &str) -> Result<(&'static str, String), String> {
-    if is_symlink(path) {
-        return Ok(("conflict", "目标是符号链接，未覆盖".into()));
-    }
-    if content.trim().is_empty() {
-        if !path.exists() {
-            return Ok(("inactive", "未启用".into()));
-        }
-        let existing = fs::read_to_string(path).unwrap_or_default();
-        if existing.contains(CURSOR_MARKER) {
-            fs::write(path, "").map_err(|e| e.to_string())?;
-            return Ok(("inactive", "已移除 Nova Cursor Rule，保留目标文件".into()));
-        }
-        return Ok(("inactive", "未修改现有配置".into()));
-    }
-    if path.exists() {
-        let existing =
-            fs::read_to_string(path).map_err(|_| "现有 Cursor Rule 不是可管理的 UTF-8 文本")?;
-        if !existing.contains(CURSOR_MARKER) {
-            return Ok(("conflict", "同名 Cursor Rule 已存在，未覆盖".into()));
-        }
-    }
-    ensure_parent(path)?;
-    fs::write(path, cursor_rule_content(content)).map_err(|e| e.to_string())?;
-    Ok(("managed", "已生成 alwaysApply 全局 Rule".into()))
-}
-
 fn managed_block(content: &str) -> String {
     format!("{BLOCK_START}\n{}\n{BLOCK_END}\n", content.trim_end())
 }
@@ -537,13 +463,6 @@ fn remove_managed_block(existing: &str) -> (String, bool) {
     } else {
         (format!("{trimmed}\n"), true)
     }
-}
-
-fn cursor_rule_content(content: &str) -> String {
-    format!(
-        "---\ndescription: Nova global agent instructions\nalwaysApply: true\n---\n{CURSOR_MARKER}\n{}\n",
-        content.trim_end()
-    )
 }
 
 fn ensure_parent(path: &Path) -> Result<(), String> {
@@ -609,22 +528,6 @@ mod tests {
         fs::write(&path, managed_block("Nova rule")).unwrap();
 
         sync_markdown(&path, "").unwrap();
-
-        assert!(path.exists());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "");
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn cursor_adapter_is_always_apply_and_disabling_keeps_target_file() {
-        let rule = cursor_rule_content("Use Chinese.");
-        assert!(rule.contains("alwaysApply: true"));
-        assert!(rule.contains(CURSOR_MARKER));
-
-        let path =
-            std::env::temp_dir().join(format!("nova-agent-config-{}.mdc", uuid::Uuid::new_v4()));
-        fs::write(&path, rule).unwrap();
-        sync_cursor_rule(&path, "").unwrap();
 
         assert!(path.exists());
         assert_eq!(fs::read_to_string(&path).unwrap(), "");

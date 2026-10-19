@@ -41,7 +41,7 @@ export function normalizePolarisArgs(params = {}) {
 
 
 /**
- * Shared Nova context tools for Cursor customTools and Devin ACP MCP.
+ * Shared Nova context tools for MCP backends.
  * @param {string} cwd
  * @param {{ readOnly?: boolean, fastContext?: boolean, toolEnv?: Record<string, string> }} [options]
  */
@@ -113,8 +113,8 @@ export function createNovaBatchTools(cwd, options = {}) {
   if (fastContext) {
     tools.polaris = {
       description: process.env.NOVA_MCP_DIRECT === "1"
-        ? `Nova 上下文工具。需要跨文件查找、分析修改位置或读取多个文件时直接调用，禁止经过任何中间工具。${POLARIS_DESCRIPTION} 必须提供 keywords、query、task 或 files 至少一个；例如 {"query":"cursor bridge"}。`
-        : `远程 MCP 端点，只能通过 Devin 顶层 mcp_call_tool 调用：server_name="nova-tools", tool_name="polaris"；禁止把 polaris 当作顶层工具直接调用。${POLARIS_DESCRIPTION} 必须提供 keywords、query、task 或 files 至少一个；例如 {"query":"cursor bridge"}。`,
+        ? `Nova 上下文工具。需要跨文件查找、分析修改位置或读取多个文件时直接调用，禁止经过任何中间工具。${POLARIS_DESCRIPTION} 必须提供 keywords、query、task 或 files 至少一个；例如 {"query":"context service"}。`
+        : `远程 MCP 端点，只能通过 Devin 顶层 mcp_call_tool 调用：server_name="nova-tools", tool_name="polaris"；禁止把 polaris 当作顶层工具直接调用。${POLARIS_DESCRIPTION} 必须提供 keywords、query、task 或 files 至少一个；例如 {"query":"context service"}。`,
       inputSchema: {
         type: "object",
         properties: {
@@ -125,7 +125,7 @@ export function createNovaBatchTools(cwd, options = {}) {
             ],
             description: "关键词或符号名；字符串自动转单项数组，超过 5 项默认取前 5 项",
           },
-          query: { type: "string", minLength: 1, description: "简短检索词；兼容单字符串调用，如 cursor" },
+          query: { type: "string", minLength: 1, description: "简短检索词；兼容单字符串调用，如 context" },
           task: { type: "string", minLength: 1, description: "自然语言任务描述，将自动提取检索词" },
           files: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "明确要纳入上下文的仓库相对文件路径" },
           maxChars: { type: "integer", minimum: 4000, maximum: 80000, description: "输出字节硬上限（兼容 maxBytes），默认 12288（12KB），不凑满；通常无需设置" },
@@ -160,7 +160,7 @@ export function novaDevinBatchToolPolicy(options = {}) {
     if (readOnly) lines.push("Current mode is plan/read-only: analyze only; do not modify files.");
     return lines.join("\n");
   }
-  const example = JSON.stringify({ server_name: "nova-tools", tool_name: fastContext ? "polaris" : "generate_image", arguments: fastContext ? { query: "cursor" } : { prompt: "图片描述" } });
+  const example = JSON.stringify({ server_name: "nova-tools", tool_name: fastContext ? "polaris" : "generate_image", arguments: fastContext ? { query: "context" } : { prompt: "图片描述" } });
   const novaToolsPhrase = toolNames.length
     ? `You have Nova MCP endpoints from server nova-tools (${toolNames.join(", ")}) plus Devin built-in tools. In this Devin version, ${toolNames.join(", ")} are remote MCP tool names, NOT top-level callable Devin tools.`
     : "Nova MCP server nova-tools exposes no tools in this mode; use Devin built-in tools.";

@@ -906,7 +906,6 @@ fn config(app: &AppHandle) -> Option<RemoteConfig> {
             &s.devin_proxy,
             &s.codex_proxy,
             &s.codebuddy_proxy,
-            &s.cursor_proxy,
             &s.workbuddy_proxy,
         ]
         .into_iter()
@@ -1007,7 +1006,6 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
-        AgentKind::Cursor,
         AgentKind::WorkBuddy,
     ] {
         if !state.agent_enabled(&kind) {
@@ -1031,7 +1029,7 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
             AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.get_model_options(),
             AgentKind::WorkBuddy => state.workbuddy.get_model_options(),
-            AgentKind::Cursor => state.cursorplus.get_model_options(),
+            AgentKind::Unsupported => continue,
         }
         .unwrap_or_else(|| json!({ "configOptions": [], "modes": null }));
         out.insert(kind.as_str().to_string(), value);
@@ -1332,9 +1330,9 @@ mod tests {
     fn model_signature_does_not_depend_on_hashmap_order() {
         let mut left = HashMap::new();
         left.insert("codex".to_string(), json!({ "models": ["gpt-5"] }));
-        left.insert("cursor".to_string(), json!({ "models": ["kimi"] }));
+        left.insert("lyra".to_string(), json!({ "models": ["kimi"] }));
         let mut right = HashMap::new();
-        right.insert("cursor".to_string(), json!({ "models": ["kimi"] }));
+        right.insert("lyra".to_string(), json!({ "models": ["kimi"] }));
         right.insert("codex".to_string(), json!({ "models": ["gpt-5"] }));
 
         assert_eq!(model_signature_for(&left), model_signature_for(&right));
@@ -1674,6 +1672,13 @@ async fn execute_command(
     if !remote_control_enabled(app) {
         return fail("本机未允许远程控制".into());
     }
+    if matches!(cmd.kind.as_str(), "send" | "queue_send_now") {
+        let state = app.state::<AppState>();
+        let store = state.store.lock().unwrap();
+        if store.get(&cmd.thread_id).is_some_and(|t| t.agent_kind == AgentKind::Unsupported) {
+            return fail("已移除后端不可用，请先选择其他后端".into());
+        }
+    }
     match cmd.kind.as_str() {
         "create" => match create_thread(app, cmd).and_then(|thread| {
             send_prompt(app, &thread.id, &cmd.text, cmd.images.clone())?;
@@ -1939,6 +1944,9 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
             AgentKind::from_str(&cmd.agent_kind)
                 .ok_or_else(|| format!("未知后端: {}", cmd.agent_kind))?
         };
+        if new_kind == AgentKind::Unsupported {
+            return Err("已移除后端不可用，请先选择其他后端".into());
+        }
         old_kind = thread.agent_kind.clone();
         agent_changed = old_kind != new_kind;
         if agent_changed
@@ -1997,7 +2005,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
                 state.codebuddy.forget_session_of_thread(&cmd.thread_id)
             }
             AgentKind::WorkBuddy => state.workbuddy.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Unsupported => {},
             AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
         }
         if let Some(item) = switched_item {
@@ -2022,7 +2030,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
                 state.codebuddy.forget_session_of_thread(&cmd.thread_id)
             }
             AgentKind::WorkBuddy => state.workbuddy.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Unsupported => {},
         }
     }
     Ok(())
@@ -2053,11 +2061,7 @@ async fn respond_remote_permission(
             .codebuddy
             .respond_permission(request_key, option_id)
             .await
-    } else if request_key.starts_with("cup-") {
-        state
-            .cursorplus
-            .respond_permission(request_key, option_id)
-            .await
+
     } else if request_key.starts_with("codex-") {
         state.codex.respond_permission(request_key, option_id).await
     } else {
@@ -2468,6 +2472,9 @@ fn send_prompt(
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
+        if thread.agent_kind == AgentKind::Unsupported {
+            return Err("已移除后端不可用，请先选择其他后端".into());
+        }
     }
     // 有界面时先交给前端统一输入入口，让远程文本与桌面 Composer 一样处理
     // `/easy`、`/plan`、工作流触发器等客户端指令；前端展开后再经 IPC 投递。
@@ -2516,6 +2523,9 @@ pub(crate) fn route_fire_command(
         let thread = store.get(thread_id).ok_or("会话不存在")?;
         if thread.roaming_role.is_some() {
             return Err("/fire 仅支持本地普通会话".into());
+        }
+        if thread.agent_kind == AgentKind::Unsupported {
+            return Err("已移除后端不可用，请先选择其他后端".into());
         }
         if is_running(&state, thread) {
             return Err("请等待当前会话结束后再启动 /fire".into());
@@ -2618,7 +2628,7 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.cancel(thread_id).await,
         AgentKind::WorkBuddy => state.workbuddy.cancel(thread_id).await,
-        AgentKind::Cursor => state.cursorplus.cancel(thread_id).await,
+        AgentKind::Unsupported => return Err("已移除后端不可用".into()),
     };
     Ok(())
 }

@@ -13,15 +13,14 @@ export function agentLabel(kind: AgentKind): string {
       return "CodeBuddy";
     case "workbuddy":
       return "WorkBuddy";
-    case "cursor":
-      return "Cursor";
-    default:
+    case "devin":
       return "Devin";
+    default:
+      return "已移除的后端";
   }
 }
 
-/** agent 单字徽标（侧边栏紧凑展示）：Lyra=L / Devin=D / Codex=C / CodeBuddy=B /
- *  WorkBuddy=W / Cursor=CS */
+/** agent 单字徽标（侧边栏紧凑展示）；未知/已移除后端显示问号。 */
 export function agentShort(kind: AgentKind): string {
   if (kind === "claude") return "CC";
   if (kind === "kimi") return "K";
@@ -34,10 +33,10 @@ export function agentShort(kind: AgentKind): string {
       return "B";
     case "workbuddy":
       return "W";
-    case "cursor":
-      return "CS";
-    default:
+    case "devin":
       return "D";
+    default:
+      return "?";
   }
 }
 

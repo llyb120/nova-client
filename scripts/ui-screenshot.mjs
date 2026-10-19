@@ -50,18 +50,15 @@ const threadMeta = {
 
 const mockSettings = {
   devinPath: "", acpArgs: "", devinProxy: "", codebuddyPath: "", codebuddyProxy: "",
-  cursorProxy: "",
-  cursorPath: "", cursorSdkApiKey: "", cursorDisableSubagents: false,
-    autoChangeProjectEnabled: true,
+  autoChangeProjectEnabled: true,
   codexPath: "", codexProxy: "", lyraProxy: "", windowsShellShimEnabled: false,
   defaultMode: "build",
   sceneModels: { lightweight: [{ agentKind: "lyra", model: "" }], coding: [{ agentKind: "lyra", model: "" }], computer: [{ agentKind: "lyra", model: "" }] },
   editor: "cursor", theme: "", historyDisplayMode: "project",
   relayServer: "", relayToken: "", relayGroups: "", remoteControlEnabled: false,
   devinEnabled: true, codexEnabled: true,
-  codebuddyEnabled: false, cursorEnabled: false,
+  codebuddyEnabled: false,
   codexIntegration: "app-server", codebuddyIntegration: "sdk",
-  cursorIntegration: "sdk",
   worktreeDir: "", sessionAutoCleanupEnabled: false, sessionAutoCleanupHours: 720,
   semanticEnabled: false, embedEndpoint: "", embedModel: "", embedApiKey: "",
 };

@@ -1,6 +1,12 @@
 import type { WorkflowDef } from "./workflow/types";
 
-export type AgentKind = "claude" | "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "workbuddy" | "cursor";
+/** unsupported 仅用于读取历史记录，不可选择或执行。 */
+export type AgentKind = "claude" | "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "workbuddy" | "unsupported";
+
+/** 可执行后端的固定展示顺序；未知/已移除后端不能回退到其它后端。 */
+export const ALL_AGENT_KINDS: AgentKind[] = ["lyra", "devin", "kimi", "claude", "codex", "codebuddy", "workbuddy"];
+export const isSupportedAgentKind = (kind: unknown): kind is Exclude<AgentKind, "unsupported"> =>
+  ALL_AGENT_KINDS.some((supported) => supported === kind);
 
 export interface SlashCommand {
   name: string;
@@ -24,7 +30,7 @@ export const SCENES: { key: SceneKey; label: string; hint: string }[] = [
   { key: "computer", label: "剑来", hint: "操作桌面应用与浏览器" },
 ];
 export const scenesReady = (scenes?: Partial<SceneModels>) =>
-  SCENES.every(({ key }) => (scenes?.[key]?.length ?? 0) > 0);
+  SCENES.every(({ key }) => scenes?.[key]?.some((target) => isSupportedAgentKind(target.agentKind)));
 
 /** worktree 执行信息：会话在为某 git 仓库创建的独立 worktree（分支 + 工作目录）中运行 */
 export interface Worktree {
@@ -383,13 +389,6 @@ export interface PermissionRequest {
   questions?: QuestionInfo[];
 }
 
-export interface CursorModelContextRule {
-  /** Case-insensitive substring matched against model id, for example `claude-4` or `gpt-5`. */
-  prefix: string;
-  /** Model context window in tokens. */
-  contextWindow: number;
-}
-
 export type SessionShortcutAction =
   | "selectProject"
   | "selectModel"
@@ -441,16 +440,6 @@ export interface Settings {
   /** 空 = 自动查找 Windows 默认安装目录；支持安装目录、WorkBuddy.exe（仅定位内置 CLI）或内置 CodeBuddy CLI 路径。 */
   workbuddyPath: string;
   workbuddyProxy: string;
-  cursorProxy: string;
-  /** 兼容旧配置；Cursor 后端仅使用官方 SDK，不再依赖本机 CLI */
-  cursorPath: string;
-  cursorSdkApiKey: string;
-  /** 是否通过 Cursor 全局 hook 阻止 Task/subagent；默认关闭。 */
-  cursorDisableSubagents: boolean;
-  /** Cursor 模型 id 包含匹配到上下文窗口的映射；最长匹配串优先。 */
-  cursorModelContexts: CursorModelContextRule[];
-  /** Cursor 上下文机制：default = Reasonix，super = 改造前的超级上下文。 */
-  cursorContextMode: "default" | "super";
   codexPath: string;
   codexProxy: string;
   /** Lyra provider 代理地址 */
@@ -509,10 +498,8 @@ export interface Settings {
   codebuddyEnabled: boolean;
   /** WorkBuddy 本机后端，默认关闭。 */
   workbuddyEnabled: boolean;
-  cursorEnabled: boolean;
   codexIntegration: "app-server";
   codebuddyIntegration: "sdk" | "acp";
-  cursorIntegration: "sdk";
   /** worktree 工作目录根（空 = 应用数据目录下 worktrees/） */
   worktreeDir: string;
   /** 更新通道：正式版或预发布版。 */

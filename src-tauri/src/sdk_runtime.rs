@@ -2,7 +2,7 @@ use crate::threads::{compact_tool_value, compact_tool_values};
 #[cfg(test)]
 use crate::threads::TOOL_OUTPUT_LIMIT;
 use crate::acp::{
-    apply_proxy_env, resolve_program_on_path, EV_LOG, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
+    apply_proxy_env, EV_LOG, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
 };
 use crate::codex_radar;
 use crate::model_cache;
@@ -15,17 +15,18 @@ use crate::{nova_data_dir, AppState};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::Command;
 
-/// 预热保留位：idle_children 里不属于任何线程的预热 bridge 用这个键存放，
-/// 新线程首轮 prompt 直接认领，避免 Node 启动 + Agent.create 冷启动。
-const PREWARM_KEY: &str = "__nova_prewarm__";
+// Codex owns its app-server process; this guard owns only the temporary workspace.
+struct TextSessionDir(PathBuf);
+
+impl Drop for TextSessionDir {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
 
 fn is_codex_model_resume_warning(value: &Value) -> bool {
     if value.get("type").and_then(Value::as_str) != Some("error") {
@@ -42,42 +43,21 @@ fn is_codex_model_resume_warning(value: &Value) -> bool {
         })
 }
 
-/// 回合控制通道：进程桥写 stdin，进程内桥写 mpsc（同样的 JSONL 控制行）。
-#[derive(Clone)]
-enum BridgeControl {
-    Process(Arc<tokio::sync::Mutex<ChildStdin>>),
-    InProcess(tokio::sync::mpsc::UnboundedSender<String>),
-}
-
 struct RunningBridge {
-    control: BridgeControl,
-    pid: Option<u32>,
-    /// 进程内桥的注册代数（run_epoch），用于区分同一 session 的新旧回合；进程桥为 0。
+    control: tokio::sync::mpsc::UnboundedSender<String>,
+    /// 注册代数（run_epoch），用于区分同一 session 的新旧回合。
     registration: u64,
-    /// 进程内任务的 abort 句柄，等价于进程桥的 kill。
-    abort: Option<tokio::task::AbortHandle>,
+    abort: tokio::task::AbortHandle,
 }
 
 impl RunningBridge {
-    fn identity(&self) -> (Option<u32>, u64) {
-        (self.pid, self.registration)
+    fn identity(&self) -> u64 {
+        self.registration
     }
 }
 
 fn kill_running(bridge: &RunningBridge) {
-    if let Some(pid) = bridge.pid {
-        crate::acp::kill_process_tree(pid);
-    }
-    if let Some(abort) = &bridge.abort {
-        abort.abort();
-    }
-}
-
-struct IdleBridge {
-    child: Child,
-    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
-    stdout: BufReader<tokio::process::ChildStdout>,
-    stderr: Arc<Mutex<Vec<String>>>,
+    bridge.abort.abort();
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -86,32 +66,11 @@ enum ReadEventsOutcome {
     Superseded,
 }
 
-/// 回合事件行来源：进程桥 stdout 或进程内 mpsc 通道，均为 JSONL。
-enum EventSource<'a> {
-    Process(&'a mut BufReader<tokio::process::ChildStdout>),
-    Channel(tokio::sync::mpsc::UnboundedReceiver<String>),
-}
-
-impl EventSource<'_> {
-    async fn next_line(&mut self) -> Result<Option<String>, String> {
-        match self {
-            EventSource::Process(reader) => {
-                reader.lines().next_line().await.map_err(|e| e.to_string())
-            }
-            EventSource::Channel(rx) => Ok(rx.recv().await),
-        }
-    }
-}
-
 pub struct SdkManager {
     app: AppHandle,
     adapter: Arc<dyn SdkAdapter>,
     launch_env: HashMap<String, String>,
     running_children: Mutex<HashMap<String, RunningBridge>>,
-    idle_children: Mutex<HashMap<String, IdleBridge>>,
-    /// 最新一次预热请求（后到覆盖先到）；持有 prewarm_gate 的循环负责逐个消化。
-    prewarm_pending: Mutex<Option<Value>>,
-    prewarm_gate: tokio::sync::Mutex<()>,
     running: Mutex<HashSet<String>>,
     turn_started: Mutex<HashMap<String, Instant>>,
     pending_permissions: Mutex<HashMap<String, (String, String)>>,
@@ -139,9 +98,6 @@ impl SdkManager {
             adapter: Arc::new(adapter),
             launch_env,
             running_children: Mutex::new(HashMap::new()),
-            idle_children: Mutex::new(HashMap::new()),
-            prewarm_pending: Mutex::new(None),
-            prewarm_gate: tokio::sync::Mutex::new(()),
             running: Mutex::new(HashSet::new()),
             turn_started: Mutex::new(HashMap::new()),
             pending_permissions: Mutex::new(HashMap::new()),
@@ -152,13 +108,6 @@ impl SdkManager {
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
         })
-    }
-
-    /// 主运行时用进程内原生 agent：adapter 声明支持且非借用额度隔离运行时。
-    /// 进程内原生 agent（Lyra）：主运行时与借用额度运行时都在本进程 tokio 任务中运行。
-    /// 借用额度只换数据根（不同凭证），无需进程隔离。
-    fn use_inprocess(&self) -> bool {
-        self.adapter.runs_inprocess()
     }
 
     /// 借用额度运行时的隔离数据根（launch_env 中的 NOVA_DATA_DIR）；主运行时为 None。
@@ -372,7 +321,7 @@ impl SdkManager {
             "parts": parts
         });
         let mut outcome = self
-            .run_prompt_bridge(&thread_id, &cwd, request.clone(), user_item_id, run_epoch)
+            .run_prompt_inprocess(&thread_id, request.clone(), user_item_id, run_epoch)
             .await;
         if !self.is_current_run(&thread_id, run_epoch) {
             return;
@@ -389,7 +338,7 @@ impl SdkManager {
             request["restoreAt"] = Value::Null;
             request["parts"] = Value::Array(fallback_parts);
             outcome = self
-                .run_prompt_bridge(&thread_id, &cwd, request, user_item_id, run_epoch)
+                .run_prompt_inprocess(&thread_id, request, user_item_id, run_epoch)
                 .await;
         }
         if !self.is_current_run(&thread_id, run_epoch) {
@@ -402,19 +351,6 @@ impl SdkManager {
                 format!("{} 请求失败：{error}", self.adapter.label()),
                 "error",
             );
-            // Cursor super context keeps its own completed-history lifecycle. Treat an SDK error
-            // as an unfinished same-agent handoff so the next prompt also receives the failed user
-            // request and every assistant/tool item that reached Thread before the bridge exited.
-            let state = self.app.state::<AppState>();
-            let cursor_super_context = self.adapter.agent_kind() == AgentKind::Cursor
-                && state.settings.lock().unwrap().cursor_context_mode == "super";
-            if cursor_super_context {
-                let mut store = state.store.lock().unwrap();
-                if let Some(thread) = store.get_mut(&thread_id) {
-                    thread.handoff_from = Some(AgentKind::Cursor);
-                }
-                store.save_thread(&thread_id);
-            }
         }
         self.finish_turn_if_current(
             &thread_id,
@@ -459,38 +395,31 @@ impl SdkManager {
                 .flatten()
         };
         if let Some(bridge) = bridge {
-            let in_process = matches!(bridge.control, BridgeControl::InProcess(_));
             kill_running(&bridge);
             // 进程内（Lyra）bridge 的中断轨迹（pendingMessages）只在轮次收尾时写盘；
             // 宽限期内没能自行结束（典型：卡在长时间工具执行里，工具不响应取消），
             // 被强制 abort 意味着这次中断内容没来得及持久化。回退到 Nova 侧接力上下文，
             // 把已流出的中断轮注入下一条提示，避免续聊时上下文退回上次结论。
-            if in_process {
-                let state = self.app.state::<AppState>();
-                let mut store = state.store.lock().unwrap();
-                if let Some(thread) = store.get_mut(thread_id) {
-                    thread.handoff_from = Some(self.adapter.agent_kind());
-                }
-                store.save_thread(&thread_id);
+            let state = self.app.state::<AppState>();
+            let mut store = state.store.lock().unwrap();
+            if let Some(thread) = store.get_mut(thread_id) {
+                thread.handoff_from = Some(self.adapter.agent_kind());
             }
+            store.save_thread(&thread_id);
         }
         self.finish_turn(thread_id, "cancelled", None);
     }
 
-    /// 支持原生 steer 的 SDK 直接把用户消息排入当前 Agent run；其他 SDK
-    /// （如 Cursor：复用 live Agent session，但无原生 steer）仍静默结束当前流，再开新 turn。
+    /// 原生 steer 直接把用户消息排入当前 Agent run；空闲时开启新轮次。
     pub async fn steer_prompt(
         self: &Arc<Self>,
         thread_id: String,
         text: String,
         images: Vec<PromptImage>,
     ) {
-        if self.is_running(&thread_id) && self.adapter.supports_native_steer() {
+        if self.is_running(&thread_id) {
             self.native_steer_prompt(&thread_id, text, images).await;
             return;
-        }
-        if self.is_running(&thread_id) {
-            self.interrupt_for_steer(&thread_id).await;
         }
         self.clone().run_prompt(thread_id, text, images).await;
     }
@@ -546,50 +475,9 @@ impl SdkManager {
         }
     }
 
-    async fn interrupt_for_steer(&self, thread_id: &str) {
-        // 先让旧轮次失效。即使旧 bridge 随后返回迟到事件，也不能结束新轮次。
-        self.run_epochs.lock().unwrap().remove(thread_id);
-        let bridge = self
-            .running_children
-            .lock()
-            .unwrap()
-            .get(thread_id)
-            .map(|bridge| (bridge.control.clone(), bridge.pid, bridge.abort.clone()));
-        if let Some((control, pid, abort)) = bridge {
-            // Bridge cancellation and persistence are best-effort only. The replacement prompt
-            // receives the already-streamed transcript from Thread, so do not wait for SDK cleanup.
-            if let Some(pid) = pid {
-                crate::acp::kill_process_tree(pid);
-            } else if let Some(abort) = abort {
-                abort.abort();
-            } else {
-                let _ = write_control(&control, &json!({ "action": "cancel" })).await;
-            }
-            self.running_children.lock().unwrap().remove(thread_id);
-        }
-        self.running.lock().unwrap().remove(thread_id);
-
-        // 工具卡片不能永远停留在进行中，但不插入 cancelled turn 或系统提示。
-        let state = self.app.state::<AppState>();
-        let mut store = state.store.lock().unwrap();
-        if let Some(thread) = store.get_mut(thread_id) {
-            for item in complete_pending_tools(thread) {
-                let _ = self.emit_update(thread_id, &item);
-            }
-            // Force the replacement prompt through Nova's handoff renderer. This captures the
-            // interrupted user message plus all assistant/tool events already streamed to Thread,
-            // independently of the cancelled provider run or its asynchronous memory file.
-            thread.handoff_from = Some(self.adapter.agent_kind());
-        }
-        store.save_thread(thread_id);
-    }
-
     pub fn forget_session_of_thread(&self, thread_id: &str) {
         if let Some(bridge) = self.running_children.lock().unwrap().remove(thread_id) {
             kill_running(&bridge);
-        }
-        if let Some(mut bridge) = self.idle_children.lock().unwrap().remove(thread_id) {
-            kill_child(&mut bridge.child);
         }
     }
 
@@ -620,9 +508,6 @@ impl SdkManager {
         for bridge in std::mem::take(&mut *self.running_children.lock().unwrap()).into_values() {
             kill_running(&bridge);
         }
-        for mut bridge in std::mem::take(&mut *self.idle_children.lock().unwrap()).into_values() {
-            kill_child(&mut bridge.child);
-        }
     }
 
     pub fn seed_model_options(&self, value: Value) {
@@ -647,7 +532,7 @@ impl SdkManager {
     }
 
     /// 本地 `config.jsonc` 发生变化时调用。当前正在执行的任务不打断，
-    /// 但会让下一轮请求、模型列表和预热实例使用新配置。
+    /// 但会让下一轮请求和模型列表使用新配置。
     pub fn notify_config_changed(self: &Arc<Self>) {
         if self.adapter.agent_kind() != AgentKind::Lyra {
             return;
@@ -666,9 +551,6 @@ impl SdkManager {
                 "options": self.pending_model_options(),
             }),
         );
-        for mut bridge in std::mem::take(&mut *self.idle_children.lock().unwrap()).into_values() {
-            kill_child(&mut bridge.child);
-        }
         self.refresh_model_options_soon();
     }
 
@@ -799,6 +681,51 @@ impl SdkManager {
         });
     }
 
+    /// Lyra 一次性全长无工具生成，不使用行内补全的短输出限制。
+    pub async fn generate_text_once(&self, model: &str, prompt: String) -> Result<String, String> {
+        let output = crate::lyra::run_oneshot(
+            &self.native_http(),
+            &json!({ "action": "generate", "model": model, "prompt": prompt }),
+            self.borrowed_root(),
+        ).await?;
+        output.as_str().map(str::to_owned)
+            .ok_or_else(|| "Lyra 文本生成返回了非文本结果".to_string())
+    }
+
+    /// 无工具设计轮次：完整历史按原生 role 顺序发送，不创建工具会话。
+    pub(crate) async fn generate_design_once(
+        &self,
+        model: &str,
+        prompt: String,
+        history: &[crate::miniapp_design::DesignMessage],
+    ) -> Result<String, String> {
+        let output = crate::lyra::run_oneshot(
+            &self.native_http(),
+            &json!({ "action": "generate", "model": model, "prompt": prompt, "history": history }),
+            self.borrowed_root(),
+        ).await?;
+        output.as_str().map(str::to_owned)
+            .ok_or_else(|| "Lyra 文本生成返回了非文本结果".to_string())
+    }
+
+    /// Simulate one-shot with a private Codex thread/start + turn/start lifecycle.
+    pub(crate) async fn generate_text(&self, model: &str, prompt: String, images: &[Value], deadline: std::time::Duration) -> Result<String, String> {
+        if self.adapter.agent_kind() != AgentKind::Codex { return Err("此会话生成入口仅供 Codex 使用".into()); }
+        let dir = TextSessionDir(std::env::temp_dir().join(format!("nova-text-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir(&dir.0).map_err(|e| e.to_string())?;
+        let cwd = dir.0.to_string_lossy().into_owned();
+        let (mut command, options) = self.codex_launch(&cwd, true)?;
+        command.env_remove("NOVA_CONTEXT_SERVICE_ENDPOINT").env_remove("NOVA_CONTEXT_SERVICE_TOKEN");
+        let (model, _) = split_codex_effort(model).unwrap_or((model, ""));
+        let mut parts = vec![json!({"type":"text", "text":prompt})];
+        parts.extend(images.iter().map(|image| json!({"type":"image_data", "mime":image["mimeType"], "data":image["data"]})));
+        let (_tx, controls) = tokio::sync::mpsc::unbounded_channel();
+        let output = crate::codex_app_server::run(command,
+            json!({"action":"complete_text", "cwd":cwd, "model":model, "parts":parts, "timeoutMs":deadline.as_millis().min(u64::MAX as u128) as u64}),
+            options, controls, |_| {}).await?;
+        output.as_str().map(str::to_owned).ok_or_else(|| "Codex 生成返回了非文本结果".into())
+    }
+
     /// 一次性行内补全：Rust 直连 provider HTTP（不冷启 Node）。
     /// 仅 openai-completions / openai-responses；其它协议再回退 bridge。
     pub async fn complete_once(
@@ -844,170 +771,11 @@ impl SdkManager {
             let (_tx, controls) = tokio::sync::mpsc::unbounded_channel();
             return crate::codex_app_server::run(command, request, options, controls, |_| {}).await;
         }
-        if self.use_inprocess() {
-            return crate::lyra::run_oneshot(&self.native_http(), &request, self.borrowed_root())
-                .await;
-        }
-        let mut child = self.spawn_bridge(cwd)?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("{} bridge stdin 不可用", self.adapter.label()))?;
-        stdin
-            .write_all(format!("{request}\n").as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        drop(stdin);
-        let output = child.wait_with_output().await.map_err(|e| e.to_string())?;
-        parse_bridge_output(
-            &String::from_utf8_lossy(&output.stdout),
-            self.adapter.label(),
-        )
-    }
-
-    async fn run_prompt_bridge(
-        &self,
-        thread_id: &str,
-        cwd: &str,
-        request: Value,
-        user_item_id: u64,
-        run_epoch: u64,
-    ) -> Result<(), String> {
-        if self.use_inprocess() {
-            return self
-                .run_prompt_inprocess(thread_id, request, user_item_id, run_epoch)
-                .await;
-        }
-        let cached_bridge = self
-            .adapter
-            .keeps_bridge_alive()
-            .then(|| {
-                let mut idle = self.idle_children.lock().unwrap();
-                idle.remove(thread_id)
-                    // 新线程首轮：认领草稿页空闲期预热好的 bridge（进程 + Agent 已就绪）。
-                    .or_else(|| idle.remove(PREWARM_KEY))
-            })
-            .flatten();
-        let reused_cached_bridge = cached_bridge.is_some();
-        let mut bridge = match cached_bridge {
-            Some(bridge) => bridge,
-            None => self.spawn_idle_bridge(cwd)?,
-        };
-        let mut pid = bridge.child.id();
-        self.running_children.lock().unwrap().insert(
-            thread_id.to_string(),
-            RunningBridge {
-                control: BridgeControl::Process(bridge.stdin.clone()),
-                pid,
-                registration: 0,
-                abort: None,
-            },
-        );
-        if let Err(first_error) = write_line(&bridge.stdin, &request).await {
-            {
-                let mut running = self.running_children.lock().unwrap();
-                if running
-                    .get(thread_id)
-                    .is_some_and(|running_bridge| running_bridge.pid == pid)
-                {
-                    running.remove(thread_id);
-                }
-            }
-            kill_child(&mut bridge.child);
-            // A kept-alive Cursor bridge can exit between turns (or while an interrupted turn is
-            // being replaced). Treat that cached pipe as stale and retry once with a fresh bridge.
-            if !reused_cached_bridge || !self.is_current_run(thread_id, run_epoch) {
-                return Err(first_error);
-            }
-            bridge = self.spawn_idle_bridge(cwd)?;
-            pid = bridge.child.id();
-            self.running_children.lock().unwrap().insert(
-                thread_id.to_string(),
-                RunningBridge {
-                    control: BridgeControl::Process(bridge.stdin.clone()),
-                    pid,
-                    registration: 0,
-                    abort: None,
-                },
-            );
-            if let Err(error) = write_line(&bridge.stdin, &request).await {
-                let mut running = self.running_children.lock().unwrap();
-                if running
-                    .get(thread_id)
-                    .is_some_and(|running_bridge| running_bridge.pid == pid)
-                {
-                    running.remove(thread_id);
-                }
-                drop(running);
-                kill_child(&mut bridge.child);
-                return Err(error);
-            }
-        }
-        let mut source = EventSource::Process(&mut bridge.stdout);
-        let event_result = self
-            .read_events(thread_id, user_item_id, run_epoch, &mut source)
-            .await;
-        let completed = matches!(&event_result, Ok(ReadEventsOutcome::Completed));
-        let still_owned = {
-            let mut running = self.running_children.lock().unwrap();
-            if running
-                .get(thread_id)
-                .is_some_and(|running_bridge| running_bridge.pid == pid)
-            {
-                running.remove(thread_id);
-                true
-            } else {
-                false
-            }
-        };
-        let result = event_result.map(|_| ()).map_err(|error| {
-            let status = bridge
-                .child
-                .try_wait()
-                .ok()
-                .flatten()
-                .map(|status| status.to_string());
-            let stderr = bridge.stderr.lock().unwrap().join("\n");
-            if status.is_none() && stderr.is_empty() {
-                return error;
-            }
-            format!(
-                "{error}{}{}",
-                status
-                    .map(|value| format!("；退出状态：{value}"))
-                    .unwrap_or_default(),
-                (!stderr.is_empty())
-                    .then(|| format!("；stderr：{stderr}"))
-                    .unwrap_or_default()
-            )
-        });
-        let reusable = self.adapter.keeps_bridge_alive()
-            && completed
-            && still_owned
-            && bridge.child.try_wait().ok().flatten().is_none();
-        if reusable {
-            // `done` clears this run's epoch before event reading returns. Holding the epoch lock
-            // while caching closes the window where a newer run could start and miss this bridge.
-            let epochs = self.run_epochs.lock().unwrap();
-            if epochs.contains_key(thread_id) {
-                drop(epochs);
-                kill_child(&mut bridge.child);
-            } else {
-                self.idle_children
-                    .lock()
-                    .unwrap()
-                    .insert(thread_id.to_string(), bridge);
-            }
-        } else if result.is_err() || !still_owned || !completed {
-            // Superseded runs can return successfully after observing their invalidated epoch, but
-            // their bridge is being cancelled and must never be cached for the replacement turn.
-            kill_child(&mut bridge.child);
-        }
-        result
+        crate::lyra::run_oneshot(&self.native_http(), &request, self.borrowed_root()).await
     }
 
     /// 原生会话控制在同进程 tokio 任务中执行（Codex 直接管理 app-server 子进程），
-    /// 事件/控制行走 mpsc 通道，事件处理与进程桥完全同一路径。
+    /// 事件/控制行走 mpsc 通道。
     async fn run_prompt_inprocess(
         &self,
         thread_id: &str,
@@ -1039,14 +807,13 @@ impl SdkManager {
         self.running_children.lock().unwrap().insert(
             thread_id.to_string(),
             RunningBridge {
-                control: BridgeControl::InProcess(session.control.clone()),
-                pid: None,
+                control: session.control.clone(),
                 registration: run_epoch,
-                abort: Some(abort.clone()),
+                abort: abort.clone(),
             },
         );
         let crate::lyra::InProcessSession { events, task, .. } = session;
-        let mut source = EventSource::Channel(events);
+        let mut source = events;
         let event_result = self
             .read_events(thread_id, user_item_id, run_epoch, &mut source)
             .await;
@@ -1055,7 +822,7 @@ impl SdkManager {
             let mut running = self.running_children.lock().unwrap();
             if running
                 .get(thread_id)
-                .is_some_and(|bridge| bridge.identity() == (None, run_epoch))
+                .is_some_and(|bridge| bridge.identity() == run_epoch)
             {
                 running.remove(thread_id);
             }
@@ -1077,152 +844,15 @@ impl SdkManager {
         }
     }
 
-    fn spawn_idle_bridge(&self, cwd: &str) -> Result<IdleBridge, String> {
-        let mut child = self.spawn_bridge(cwd)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("{} bridge stdin 不可用", self.adapter.label()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("{} bridge stdout 不可用", self.adapter.label()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| format!("{} bridge stderr 不可用", self.adapter.label()))?;
-        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
-        let captured = stderr_lines.clone();
-        tauri::async_runtime::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.contains("ExperimentalWarning: SQLite is an experimental feature")
-                    || line.contains("node --trace-warnings")
-                {
-                    continue;
-                }
-                let mut captured = captured.lock().unwrap();
-                captured.push(line);
-                if captured.len() > 20 {
-                    captured.remove(0);
-                }
-            }
-        });
-        Ok(IdleBridge {
-            child,
-            stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
-            stdout: BufReader::new(stdout),
-            stderr: stderr_lines,
-        })
-    }
-
-    /// 草稿页空闲期预热：提前拉起 bridge（Node 进程）并完成 SDK Agent.create，
-    /// 把首轮关键路径上的进程启动与 Agent 创建开销提前到用户还在选项目/模型时。
-    /// 最新请求生效：模型/cwd/模式连续变化时，飞行中的循环会接着处理最新一条。
-    pub fn prewarm_idle(self: &Arc<Self>, cwd: String, model: String, mode: String) {
-        if !self.adapter.supports_idle_prewarm() {
-            return;
-        }
-        // Cursor 用空字符串表示 Auto；bridge 会把它转换为 { id: "auto" }。这里不能把空值
-        // 当成“未选模型”跳过，否则最常用的 Auto 首轮永远无法预热，Agent.create 会阻塞首字。
-        let request = json!({
-            "action": "prewarm",
-            "cwd": cwd,
-            "model": model,
-            "mode": mode,
-        });
-        *self.prewarm_pending.lock().unwrap() = Some(request);
-        let manager = self.clone();
-        tauri::async_runtime::spawn(async move {
-            manager.prewarm_idle_loop().await;
-        });
-    }
-
-    async fn prewarm_idle_loop(&self) {
-        // 已有一个循环在飞时直接退出：它每轮都会取走最新的 pending 请求。
-        let Ok(_gate) = self.prewarm_gate.try_lock() else {
-            return;
-        };
-        loop {
-            let Some(request) = self.prewarm_pending.lock().unwrap().take() else {
-                break;
-            };
-            let cwd = request["cwd"].as_str().unwrap_or_default().to_string();
-            let label = self.adapter.label();
-            match self.prewarm_once(&cwd, &request).await {
-                Ok((ready, elapsed_ms)) => {
-                    let _ = self.app.emit(
-                        EV_LOG,
-                        format!("[{label}][timing] prewarm {elapsed_ms}ms ready={ready}"),
-                    );
-                }
-                Err(error) => {
-                    let _ = self
-                        .app
-                        .emit(EV_LOG, format!("[{label}] 预热失败：{error}"));
-                }
-            }
-        }
-    }
-
-    async fn prewarm_once(&self, cwd: &str, request: &Value) -> Result<(bool, u64), String> {
-        let mut bridge = match self.idle_children.lock().unwrap().remove(PREWARM_KEY) {
-            Some(bridge) => bridge,
-            None => self.spawn_idle_bridge(cwd)?,
-        };
-        if let Err(error) = write_line(&bridge.stdin, request).await {
-            kill_child(&mut bridge.child);
-            return Err(error);
-        }
-        let read = async {
-            let stdout = &mut bridge.stdout;
-            let mut lines = stdout.lines();
-            while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
-                let event: Value = serde_json::from_str(&line)
-                    .map_err(|e| format!("解析预热事件失败：{e}；输出：{line}"))?;
-                if event.get("ok").and_then(Value::as_bool) == Some(false) {
-                    return Err(event["error"]
-                        .as_str()
-                        .unwrap_or("SDK bridge 预热失败")
-                        .to_string());
-                }
-                if event.get("type").and_then(Value::as_str) == Some("prewarmed") {
-                    let ready = event.get("ready").and_then(Value::as_bool).unwrap_or(false);
-                    let elapsed_ms = event.get("elapsedMs").and_then(Value::as_u64).unwrap_or(0);
-                    return Ok((ready, elapsed_ms));
-                }
-            }
-            Err("bridge 在预热完成前退出".to_string())
-        };
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(45), read).await;
-        match outcome {
-            Ok(Ok(result)) => {
-                self.idle_children
-                    .lock()
-                    .unwrap()
-                    .insert(PREWARM_KEY.to_string(), bridge);
-                Ok(result)
-            }
-            Ok(Err(error)) => {
-                kill_child(&mut bridge.child);
-                Err(error)
-            }
-            Err(_) => {
-                kill_child(&mut bridge.child);
-                Err("预热超时".to_string())
-            }
-        }
-    }
-
     async fn read_events(
         &self,
         thread_id: &str,
         user_item_id: u64,
         run_epoch: u64,
-        source: &mut EventSource<'_>,
+        source: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
     ) -> Result<ReadEventsOutcome, String> {
         let mut item_ids = HashMap::new();
-        while let Some(line) = source.next_line().await? {
+        while let Some(line) = source.recv().await {
             let event: Value = serde_json::from_str(&line).map_err(|e| {
                 format!("解析 {} 事件失败：{e}；输出：{line}", self.adapter.label())
             })?;
@@ -1306,84 +936,6 @@ impl SdkManager {
             }
         }
         Err(format!("{} bridge 意外退出", self.adapter.label()))
-    }
-
-    fn spawn_bridge(&self, cwd: &str) -> Result<Child, String> {
-        let launch = {
-            let state = self.app.state::<AppState>();
-            let settings = state.settings.lock().unwrap();
-            self.adapter.launch_config(&settings)
-        };
-        let program = resolve_program_on_path(&launch.program)
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or(launch.program);
-        // Rust 原生 agent（如 Lyra）：直接以应用自身子命令启动，不经 Node bridge。
-        let native_subcommand = self.adapter.native_subcommand();
-        let mut command = if let Some(subcommand) = native_subcommand {
-            let exe =
-                std::env::current_exe().map_err(|e| format!("定位应用可执行文件失败：{e}"))?;
-            let mut command = Command::new(exe);
-            command.arg(subcommand);
-            command
-        } else {
-            let node = resolve_program_on_path("node").ok_or_else(|| {
-                format!(
-                    "未找到 Node.js，{} 需要 Node.js 运行官方 SDK",
-                    self.adapter.label()
-                )
-            })?;
-            let bridge = bridge_path(&self.app, self.adapter.as_ref())?;
-            let mut command = Command::new(node);
-            command.arg(bridge);
-            command
-        };
-        command
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env(launch.path_env, &program)
-            // Node bridges also persist app-owned state. Pin them to the same profile-specific
-            // root as Rust so debug builds never fall back to the release ~/.nova directory.
-            .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
-        {
-            let state = self.app.state::<AppState>();
-            let settings = state.settings.lock().unwrap();
-            command
-                .env(
-                    "NOVA_CONTEXT_SERVICE_ENDPOINT",
-                    state.context_service.endpoint(),
-                )
-                .env("NOVA_CONTEXT_SERVICE_TOKEN", state.context_service.token())
-                .env(
-                    "NOVA_CONTEXT_RETRIEVAL_MODE",
-                    settings.context_retrieval_mode.as_str(),
-                );
-        }
-        command.envs(&self.launch_env);
-        command.envs(launch.extra_env);
-        apply_proxy_env(&mut command, &launch.proxy);
-        if self.launch_env.is_empty() {
-            if let Some((name, value)) = launch.api_key {
-                command.env(name, value);
-            }
-        }
-        // SDK 后端统一由这个 Node bridge 启动；必须在 bridge 进程环境中注入 shim，
-        // 才能覆盖 Cursor SDK 等后续创建的 cmd / powershell / pwsh 孙进程。
-        #[cfg(windows)]
-        if self.app.state::<AppState>().windows_shell_shim_enabled {
-            crate::windows_shell_shim::apply(&self.app, &mut command, &self.launch_env)
-                .map_err(|e| format!("应用 Windows shell shim 失败：{e}"))?;
-        }
-        #[cfg(windows)]
-        command.creation_flags(0x0800_0000);
-        command.spawn().map_err(|e| {
-            if native_subcommand.is_some() {
-                format!("启动 {} 原生进程失败：{e}", self.adapter.label())
-            } else {
-                format!("启动 {} Node bridge 失败：{e}", self.adapter.label())
-            }
-        })
     }
 
     /// Native Codex launch: preserve the process-local credential/proxy/shim environment.
@@ -1821,27 +1373,6 @@ impl Drop for SdkManager {
     }
 }
 
-fn bridge_path(app: &AppHandle, adapter: &dyn SdkAdapter) -> Result<PathBuf, String> {
-    let (name, bridge) = adapter.bridge();
-    let dir = crate::nova_data_dir(app).join("runtime");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("创建 {} 运行目录失败：{e}", adapter.label()))?;
-    let path = dir.join(name);
-    if std::fs::read(&path).ok().as_deref() != Some(bridge) {
-        std::fs::write(&path, bridge)
-            .map_err(|e| format!("释放 {} bridge 失败：{e}", adapter.label()))?;
-    }
-    for (sidecar_name, sidecar) in adapter.bridge_sidecars() {
-        let sidecar_path = dir.join(sidecar_name);
-        if std::fs::read(&sidecar_path).ok().as_deref() != Some(sidecar) {
-            std::fs::write(&sidecar_path, sidecar).map_err(|e| {
-                format!("释放 {} sidecar {sidecar_name} 失败：{e}", adapter.label())
-            })?;
-        }
-    }
-    Ok(path)
-}
-
 fn prompt_parts(adapter: &dyn SdkAdapter, text: &str, images: &[PromptImage]) -> Vec<Value> {
     let mut parts = Vec::new();
     if !text.is_empty() {
@@ -1867,51 +1398,13 @@ fn prompt_parts(adapter: &dyn SdkAdapter, text: &str, images: &[PromptImage]) ->
     parts
 }
 
-async fn write_control(control: &BridgeControl, line: &Value) -> Result<(), String> {
-    match control {
-        BridgeControl::Process(stdin) => write_line(stdin, line).await,
-        BridgeControl::InProcess(tx) => tx
-            .send(line.to_string())
-            .map_err(|_| "Lyra 会话控制通道已关闭".to_string()),
-    }
-}
-
-async fn write_line(
-    stdin: &Arc<tokio::sync::Mutex<ChildStdin>>,
-    request: &Value,
+async fn write_control(
+    control: &tokio::sync::mpsc::UnboundedSender<String>,
+    line: &Value,
 ) -> Result<(), String> {
-    let mut stdin = stdin.lock().await;
-    stdin
-        .write_all(format!("{request}\n").as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    stdin.flush().await.map_err(|e| e.to_string())
-}
-
-fn kill_child(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        crate::acp::kill_process_tree(pid);
-    }
-    let _ = child.start_kill();
-}
-
-fn parse_bridge_output(output: &str, label: &str) -> Result<Value, String> {
-    let line = output
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| format!("{label} bridge 未返回结果"))?;
-    let response: Value = serde_json::from_str(line)
-        .map_err(|e| format!("解析 {} bridge 响应失败：{e}；输出：{line}", label))?;
-    if response.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(response["error"]
-            .as_str()
-            .unwrap_or("SDK bridge 执行失败")
-            .into());
-    }
-    response
-        .get("data")
-        .cloned()
-        .ok_or_else(|| format!("{label} bridge 响应缺少 data"))
+    control
+        .send(line.to_string())
+        .map_err(|_| "会话控制通道已关闭".to_string())
 }
 
 pub(crate) fn display_working_directory(path: &std::path::Path) -> String {
@@ -2086,10 +1579,10 @@ fn codex_todo_plan(value: &Value) -> Option<Value> {
 mod tests {
     use super::{
         codex_todo_plan, complete_pending_tools, derive_title, display_working_directory,
-        is_codex_model_resume_warning, normalize_title, parse_bridge_output, resolve_codex_model,
-        text_snapshot_change, tool_call, TextSnapshotChange, TOOL_OUTPUT_LIMIT,
+        is_codex_model_resume_warning, normalize_title, resolve_codex_model,
+        text_snapshot_change, tool_call, write_control, TextSnapshotChange, TOOL_OUTPUT_LIMIT,
     };
-    use crate::sdk_adapters::{CodexAdapter, CursorAdapter, LyraAdapter, SdkAdapter};
+    use crate::sdk_adapters::{CodexAdapter, LyraAdapter, SdkAdapter};
     use crate::threads::{now_ms, AgentKind, CodexUsageSnapshot, Item, Thread, ToolCall};
     use serde_json::json;
 
@@ -2224,28 +1717,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_usage_maps_disjoint_bridge_usage_and_includes_cached_input() {
-        let raw = json!({
-            "inputTokens": 100,
-            "outputTokens": 20,
-            "cacheReadTokens": 300,
-            "cacheWriteTokens": 40
-        });
-        let (usage, _) = CursorAdapter.normalize_usage(Some(&raw), None, None);
-
-        assert_eq!(
-            usage,
-            Some(json!({
-                "inputTokens": 440,
-                "outputTokens": 20,
-                "totalTokens": 460,
-                "cacheReadTokens": 300,
-                "cacheWriteTokens": 40
-            }))
-        );
-    }
-
-    #[test]
     fn working_directory_hides_windows_verbatim_prefix() {
         assert_eq!(
             display_working_directory(std::path::Path::new(r"\\?\D:\code\nova-client")),
@@ -2257,12 +1728,21 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_control_forwards_messages_and_reports_closed_channel() {
+        let (control, mut events) = tokio::sync::mpsc::unbounded_channel();
+        for request in [json!({"action":"cancel"}), json!({"action":"steer","parts":[]})] {
+            write_control(&control, &request).await.unwrap();
+            assert_eq!(events.recv().await.unwrap(), request.to_string());
+        }
+        drop(events);
+        assert!(write_control(&control, &json!({"action":"cancel"})).await.is_err());
+    }
+
     #[test]
-    fn parses_and_normalizes_title_response() {
-        let output =
-            parse_bridge_output(r#"{"ok":true,"data":"`修复标题路由。`"}"#, "Codex+").unwrap();
+    fn normalizes_title_response() {
         assert_eq!(
-            normalize_title(output.as_str().unwrap(), "fallback"),
+            normalize_title("`修复标题路由。`", "fallback"),
             "修复标题路由"
         );
         assert_eq!(normalize_title("  ", "fallback"), "fallback");
@@ -2270,7 +1750,7 @@ mod tests {
 
     #[test]
     fn turn_completion_finishes_pending_sdk_tools() {
-        let mut thread = Thread::new(".".into(), AgentKind::Cursor, None, None, None, false);
+        let mut thread = Thread::new(".".into(), AgentKind::Lyra, None, None, None, false);
         thread.items.push(Item::Tool {
             id: 1,
             ts: now_ms(),
@@ -2349,43 +1829,6 @@ mod tests {
             codex_todo_plan(&json!({ "id": "tool", "type": "web_search" })),
             None
         );
-    }
-
-    #[test]
-    fn cursor_tools_show_the_specific_operation() {
-        let shell = tool_call(&json!({
-            "id": "shell", "type": "mcp_tool_call", "server": "Cursor", "tool": "shell",
-            "arguments": { "command": "python inspect_excel.py 1.xlsx" }, "status": "in_progress"
-        }));
-        assert_eq!(
-            shell.title,
-            "Cursor / shell · python inspect_excel.py 1.xlsx"
-        );
-        assert_eq!(shell.kind, "execute");
-
-        let read = tool_call(&json!({
-            "id": "read", "type": "mcp_tool_call", "server": "Cursor", "tool": "read",
-            "arguments": { "path": "C:/Users/1/Desktop/1.xlsx" }, "status": "completed"
-        }));
-        assert_eq!(read.title, "Cursor / read · C:/Users/1/Desktop/1.xlsx");
-        assert_eq!(read.kind, "read");
-        assert_eq!(read.locations[0]["path"], "C:/Users/1/Desktop/1.xlsx");
-
-        let read_files = tool_call(&json!({
-            "id": "read-files", "type": "mcp_tool_call", "server": "Cursor", "tool": "mcp",
-            "arguments": {
-                "args": { "paths": [
-                    { "path": "src/a.ts", "offset": 10, "limit": 20 },
-                    "src/b.ts"
-                ] },
-                "providerIdentifier": "custom-user-tools",
-                "toolName": "read_files"
-            }, "status": "completed"
-        }));
-        assert_eq!(read_files.title, "Cursor / read_files · src/a.ts");
-        assert_eq!(read_files.kind, "read");
-        assert_eq!(read_files.locations[0]["path"], "src/a.ts");
-        assert_eq!(read_files.locations[1]["path"], "src/b.ts");
     }
 
     #[test]

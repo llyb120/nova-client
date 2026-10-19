@@ -61,7 +61,7 @@ pub use server::maybe_run_management_command as maybe_run_server_command;
 use acp::AcpManager;
 use codex::CodexManager;
 use relay::{RelayManager, Share, WorkflowShare};
-use sdk_adapters::{CodexAdapter, CursorAdapter, LyraAdapter};
+use sdk_adapters::{CodexAdapter, LyraAdapter};
 use sdk_runtime::SdkManager;
 use serde_json::{json, Value};
 use settings::Settings;
@@ -104,7 +104,6 @@ pub struct AppState {
     pub lyra: Arc<SdkManager>,
     /// Codex app-server 对话后端，复用公共桥接运行时；不依赖 Codex SDK。
     pub codexplus: Arc<SdkManager>,
-    pub cursorplus: Arc<SdkManager>,
     pub relay: Arc<RelayManager>,
     pub config_dir: PathBuf,
     /// 用户最近一次操作的时间戳（ms）。前端把鼠标/键盘等交互节流上报到这里，
@@ -149,7 +148,7 @@ impl AppState {
             AgentKind::CodeBuddy => s.codebuddy_enabled,
             AgentKind::CodeBuddyPlus => s.codebuddyplus_enabled,
             AgentKind::WorkBuddy => s.workbuddy_enabled,
-            AgentKind::Cursor => s.cursor_enabled,
+            AgentKind::Unsupported => false,
         }
     }
 
@@ -210,21 +209,6 @@ impl AppState {
             .scene_model(settings::Scene::Lightweight)
             .map(|(kind, model)| (kind.as_str().to_string(), model))
             .unwrap_or_default();
-        if AgentKind::from_str(&agent_raw) == Some(AgentKind::Cursor)
-            && self.agent_enabled(&AgentKind::Cursor)
-        {
-            self.cursorplus
-                .generate_title_async(thread_id, prompt, fallback, model);
-            return;
-        }
-        if agent_raw.is_empty()
-            && origin == &AgentKind::Cursor
-            && self.agent_enabled(&AgentKind::Cursor)
-        {
-            self.cursorplus
-                .generate_title_async(thread_id, prompt, fallback, String::new());
-            return;
-        }
         if AgentKind::from_str(&agent_raw) == Some(AgentKind::Lyra)
             && self.agent_enabled(&AgentKind::Lyra)
         {
@@ -305,7 +289,7 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.is_running(&thread.id),
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.is_running(&thread.id),
         AgentKind::WorkBuddy => state.workbuddy.is_running(&thread.id),
-        AgentKind::Cursor => state.cursorplus.is_running(&thread.id),
+        AgentKind::Unsupported => false,
     }
 }
 
@@ -627,7 +611,6 @@ pub(crate) async fn shutdown_agent_processes(state: &AppState) {
     state.codex.kill_conn().await;
     state.codexplus.shutdown();
     state.codebuddy.shutdown();
-    state.cursorplus.shutdown();
 }
 
 fn agent_kind_for_thread(state: &AppState, thread_id: &str) -> Result<AgentKind, String> {
@@ -945,11 +928,10 @@ fn normalize_global_shortcut(keys: &str) -> String {
 pub const EV_BACKENDS: &str = "backends:availability";
 
 /// 判断后端是否应出现在可选列表。
-/// 内置 SDK bridge 后端不依赖设置里的旧 CLI 路径；真正启动 bridge 时仍会检查
-/// Node.js / 凭据并返回明确错误。其余后端按 CLI 路径检测。
+/// Lyra 进程内运行，不依赖 CLI 路径；其余支持的后端按 CLI 路径检测。
 fn backend_is_available(kind: &AgentKind, program: &str) -> bool {
-    matches!(kind, AgentKind::Lyra | AgentKind::Cursor)
-        || acp::resolve_program_on_path(program).is_some()
+    *kind == AgentKind::Lyra
+        || (*kind != AgentKind::Unsupported && acp::resolve_program_on_path(program).is_some())
 }
 
 #[cfg(test)]
@@ -959,9 +941,8 @@ mod backend_availability_tests {
     #[test]
     fn sdk_backends_are_available_without_legacy_cli_paths() {
         let missing = "__nova_missing_backend_executable__";
-        for kind in [AgentKind::Lyra, AgentKind::Cursor] {
-            assert!(backend_is_available(&kind, missing), "{kind:?}");
-        }
+        assert!(backend_is_available(&AgentKind::Lyra, missing));
+        assert!(!backend_is_available(&AgentKind::Unsupported, missing));
         assert!(!backend_is_available(&AgentKind::Devin, missing));
         // CodeBuddy 走 ACP 模式时直接启动 CLI（`codebuddy --acp`），必须真实可解析。
         assert!(!backend_is_available(&AgentKind::CodeBuddy, missing));
@@ -973,8 +954,8 @@ mod backend_availability_tests {
     }
 }
 
-/// 并发检测各后端 CLI 是否可用：只在 PATH / 具体路径上解析可执行文件（不拉起进程、零成本，
-/// 对 Cursor 也不会产生任何用量）。结果写入 state 并广播，启动后与保存设置后各触发一次。
+/// 并发检测各后端 CLI 是否可用：只在 PATH / 具体路径上解析可执行文件，不拉起进程。
+/// 结果写入 state 并广播，启动后与保存设置后各触发一次。
 fn spawn_backend_availability_check(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         let (paths, settings) = {
@@ -988,7 +969,6 @@ fn spawn_backend_availability_check(app: tauri::AppHandle) {
                 (AgentKind::Claude, s.claude_path.clone()),
                 (AgentKind::Codex, s.codex_path.clone()),
                 (AgentKind::CodeBuddy, s.codebuddy_path.clone()),
-                (AgentKind::Cursor, s.cursor_path.clone()),
             ];
             (paths, s.clone())
         };
@@ -1497,14 +1477,12 @@ fn remove_project(state: State<'_, AppState>, cwd: String) {
     state.relay.publish_folders();
 }
 
-/// 预热某个项目目录的 agent（草稿页选定项目/模型/模式时调用）：
-/// CodeBuddy 启动官方 one-shot 预热进程；Cursor 预热 idle bridge 与 Agent.create。
+/// 预热某个项目目录的 ACP agent（草稿页选定项目/模式时调用）。
 #[tauri::command]
 fn prewarm(
     state: State<'_, AppState>,
     cwd: String,
     agent_kind: Option<AgentKind>,
-    model: Option<String>,
     mode: Option<String>,
 ) {
     if !std::path::Path::new(&cwd).is_dir() {
@@ -1527,15 +1505,6 @@ fn prewarm(
         tauri::async_runtime::spawn(async move {
             mgr.prewarm(cwd, mode).await;
         });
-        return;
-    }
-    // SDK 后端：把 Node bridge 启动与 Agent.create 提前到空闲期，首轮不再冷启动。
-    let manager: Option<Arc<SdkManager>> = match agent_kind {
-        AgentKind::Cursor => Some(state.cursorplus.clone()),
-        _ => None,
-    };
-    if let Some(manager) = manager {
-        manager.prewarm_idle(cwd, model.unwrap_or_default(), mode.unwrap_or_default());
     }
 }
 
@@ -1881,6 +1850,9 @@ async fn create_thread(
         cwd.clone(),
         agent_kind,
         model.filter(|s| !s.is_empty()),
+    if agent_kind == AgentKind::Unsupported {
+        return Err("该后端已移除，请选择其他后端".into());
+    }
         mode.filter(|s| !s.is_empty())
             .or(Some(default_mode).filter(|s| !s.is_empty())),
         reasoning_effort.filter(|s| !s.is_empty()),
@@ -2359,11 +2331,8 @@ async fn merge_worktree_thread(
                         mgr.run_prompt(thread_id, prompt, vec![]).await;
                     });
                 }
-                AgentKind::Cursor => {
-                    let mgr = state.cursorplus.clone();
-                    tauri::async_runtime::spawn(async move {
-                        mgr.run_prompt(thread_id, prompt, vec![]).await;
-                    });
+                AgentKind::Unsupported => {
+                    return Err("此会话的后端已移除，请先切换后端再处理合并冲突".into());
                 }
             }
             Ok("conflict".into())
@@ -2670,7 +2639,6 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
         state.codexplus.forget_session_of_thread(id);
         state.codebuddy.forget_session_of_thread(id);
         state.workbuddy.forget_session_of_thread(id);
-        state.cursorplus.forget_session_of_thread(id);
     }
     // 自动清理的普通会话仍保留在回收站一个周期，session 要等彻底过期再删；
     // 手动删除、worktree 删除及训练会话清理则没有回收站，立即清理。
@@ -3461,7 +3429,7 @@ fn delete_time_machine_context(
         (agent_kind, timeline)
     };
 
-    // Lyra / Cursor 的下一轮会从编辑后的 transcript 直接重建精简上下文；其余后端
+    // Lyra 的下一轮会从编辑后的 transcript 直接重建精简上下文；其余后端
     // 作废原生 session，并通过一次无感接力在新 session 中继续。旧压缩摘要也随之失效。
     match agent_kind {
         AgentKind::Lyra => state.lyra.forget_session_of_thread(&thread_id),
@@ -3475,7 +3443,7 @@ fn delete_time_machine_context(
             state.codebuddy.forget_session_of_thread(&thread_id)
         }
         AgentKind::WorkBuddy => state.workbuddy.forget_session_of_thread(&thread_id),
-        AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&thread_id),
+        AgentKind::Unsupported => {}
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
     Ok(time_machine::RestoreResult {
@@ -3591,8 +3559,7 @@ fn set_thread_model(
             AgentKind::Codex | AgentKind::CodexPlus => {
                 state.codexplus.forget_session_of_thread(&thread_id)
             }
-            AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&thread_id),
-            AgentKind::Devin | AgentKind::Kimi | AgentKind::Claude | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::WorkBuddy => {}
+            AgentKind::Devin | AgentKind::Kimi | AgentKind::Claude | AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::WorkBuddy | AgentKind::Unsupported => {}
         }
     }
     Ok(())
@@ -3708,6 +3675,9 @@ fn set_thread_agent(
     // 新模型从下一轮生效。跨后端切换涉及运行路由迁移，仍需等待当前轮结束。
     if running_by_id(&state, &thread_id) {
         let current_kind = {
+    if agent_kind == AgentKind::Unsupported {
+        return Err("该后端已移除，请选择其他后端".into());
+    }
             let store = state.store.lock().unwrap();
             store
                 .get(&thread_id)
@@ -3782,7 +3752,6 @@ fn set_thread_agent(
                 AgentKind::Codex => state.codexplus.forget_session_of_thread(&thread_id),
                 AgentKind::CodeBuddy => state.codebuddy.forget_session_of_thread(&thread_id),
                 AgentKind::WorkBuddy => state.workbuddy.forget_session_of_thread(&thread_id),
-                AgentKind::Cursor => state.cursorplus.forget_session_of_thread(&thread_id),
                 _ => {}
             }
         }
@@ -3818,7 +3787,7 @@ async fn get_model_options(
             state.codebuddy.ensure_model_options().await.map(Some)
         }
         AgentKind::WorkBuddy => state.workbuddy.ensure_model_options().await.map(Some),
-        AgentKind::Cursor => state.cursorplus.ensure_model_options().await.map(Some),
+        AgentKind::Unsupported => Err("该后端已移除，请选择其他后端".into()),
     }
 }
 
@@ -3902,7 +3871,7 @@ async fn get_slash_commands(
             Ok(commands.as_array().cloned().unwrap_or_default())
         }
         AgentKind::Codex | AgentKind::CodexPlus => Ok(list_codex_skill_commands(&state.config_dir)),
-        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::Cursor => Ok(Vec::new()),
+        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus | AgentKind::Unsupported => Ok(Vec::new()),
     }
 }
 
@@ -3977,6 +3946,9 @@ pub(crate) fn dispatch_prompt(
     };
     // 内置 /fire：任意入口（IPC、远程、后台重发、worktree 补发若未在前端拦截等）
     // 都交前端编排，禁止把字面量丢给模型；子 Agent 必须在路由前拒绝。
+        if t.agent_kind == AgentKind::Unsupported {
+            return Err("此会话的后端已移除，请先切换到其他后端".into());
+        }
     if remote::route_fire_command(app, &thread_id, &text, &images)? {
         return Ok(());
     }
@@ -4050,20 +4022,7 @@ pub(crate) fn dispatch_prompt(
                 });
             }
         }
-        AgentKind::Cursor => {
-            // Cursor 复用同一 live Agent session；运行中引导仍需静默打断后开新 turn，
-            // 因为 Cursor SDK 没有原生 steer。
-            let mgr = state.cursorplus.clone();
-            if mgr.is_running(&thread_id) {
-                tauri::async_runtime::spawn(async move {
-                    mgr.steer_prompt(thread_id, text, images).await;
-                });
-            } else {
-                tauri::async_runtime::spawn(async move {
-                    mgr.run_prompt(thread_id, text, images).await;
-                });
-            }
-        }
+        AgentKind::Unsupported => return Err("此会话的后端已移除，请先切换到其他后端".into()),
         AgentKind::Devin | AgentKind::WorkBuddy => {
             let mgr = state.acp_for(&agent_kind).unwrap();
             if mgr.is_running(&thread_id) {
@@ -4172,7 +4131,6 @@ fn truncate_thread(
     state.codexplus.forget_session_of_thread(&thread_id);
     state.codebuddy.forget_session_of_thread(&thread_id);
     state.workbuddy.forget_session_of_thread(&thread_id);
-    state.cursorplus.forget_session_of_thread(&thread_id);
 
     let _ = app.emit(acp::EV_THREADS, json!({}));
     let images = images.unwrap_or_default();
@@ -4307,7 +4265,7 @@ async fn cancel_turn(
         AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(&thread_id).await,
         AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.cancel(&thread_id).await,
         AgentKind::WorkBuddy => state.workbuddy.cancel(&thread_id).await,
-        AgentKind::Cursor => state.cursorplus.cancel(&thread_id).await,
+        AgentKind::Unsupported => {}
     }
     Ok(())
 }
@@ -4340,11 +4298,6 @@ async fn respond_permission(
         // cbp- 前缀由 CodeBuddy ACP 管理器（kind=CodeBuddy）使用。
         state
             .codebuddy
-            .respond_permission(&request_key, &option_id)
-            .await
-    } else if request_key.starts_with("cup-") {
-        state
-            .cursorplus
             .respond_permission(&request_key, &option_id)
             .await
     } else if request_key.starts_with("codex-") {
@@ -4425,7 +4378,6 @@ async fn apply_runtime_settings(
         restart_kimi,
         restart_codebuddy,
         restart_workbuddy,
-        restart_cursor,
         restart_codex,
         restart_relay,
         recheck_availability,
@@ -4479,17 +4431,6 @@ async fn apply_runtime_settings(
             || s.workbuddy_path != settings.workbuddy_path
             || s.workbuddy_proxy != settings.workbuddy_proxy
             || s.workbuddy_enabled != settings.workbuddy_enabled;
-        // API Key 也是 bridge 的启动环境：改了必须重启后端并重拉模型列表，
-        // 否则新 Key 要等下次开应用才生效。
-        let restart_cursor = restart_all_agents
-            || context_runtime_changed
-            || s.cursor_path != settings.cursor_path
-            || s.cursor_proxy != settings.cursor_proxy
-            || s.cursor_sdk_api_key != settings.cursor_sdk_api_key
-            || s.cursor_disable_subagents != settings.cursor_disable_subagents
-            || s.cursor_model_contexts != settings.cursor_model_contexts
-            || s.cursor_context_mode != settings.cursor_context_mode
-            || s.cursor_enabled != settings.cursor_enabled;
         let restart_codex = restart_all_agents
             || s.codex_path != settings.codex_path
             || s.codex_args != settings.codex_args
@@ -4502,7 +4443,6 @@ async fn apply_runtime_settings(
         let recheck_availability = restart_claude || restart_kimi || restart_devin
             || restart_codebuddy
             || restart_workbuddy
-            || restart_cursor
             || restart_codex;
         *s = settings;
         if persist {
@@ -4515,7 +4455,6 @@ async fn apply_runtime_settings(
             restart_kimi,
             restart_codebuddy,
             restart_workbuddy,
-            restart_cursor,
             restart_codex,
             restart_relay,
             recheck_availability,
@@ -4540,10 +4479,6 @@ async fn apply_runtime_settings(
     }
     if restart_workbuddy {
         state.workbuddy.restart().await;
-    }
-    if restart_cursor {
-        state.cursorplus.shutdown();
-        state.cursorplus.refresh_model_options_soon();
     }
     if restart_codex {
         state.codexplus.shutdown();
@@ -4716,12 +4651,8 @@ async fn run_auxiliary_prompt(
                 .run_prompt(thread_id, prompt, Vec::new())
                 .await
         }
-        AgentKind::Cursor => {
-            state
-                .cursorplus
-                .clone()
-                .run_prompt(thread_id, prompt, Vec::new())
-                .await
+        AgentKind::Unsupported => {
+            append_thread_error(app, &thread_id, "该后端已移除，请选择其他后端".into());
         }
     }
 }
@@ -4775,7 +4706,6 @@ async fn auxiliary_complete(
         state.codexplus.forget_session_of_thread(&run_id);
         state.codebuddy.forget_session_of_thread(&run_id);
         state.workbuddy.forget_session_of_thread(&run_id);
-        state.cursorplus.forget_session_of_thread(&run_id);
         let _ = app.emit(acp::EV_THREADS, json!({}));
         if output.is_some() {
             return output;
@@ -4795,7 +4725,7 @@ fn auto_failover(app: tauri::AppHandle, state: State<'_, AppState>, thread_id: S
         let store = state.store.lock().unwrap();
         let thread = store.get(&thread_id).ok_or("线程不存在")?;
         let Some(scene) = thread.auto_scene.as_deref().and_then(settings::Scene::parse) else { return Ok(false) };
-        if thread.stage_source_thread_id.is_some() {
+        if thread.stage_source_thread_id.is_some() || thread.agent_kind == AgentKind::Unsupported {
             return Ok(false);
         }
         let Some(last_user) = thread.items.iter().rposition(|item| matches!(item, Item::User { .. })) else { return Ok(false) };
@@ -5213,7 +5143,6 @@ async fn restart_devin(state: State<'_, AppState>) -> Result<(), String> {
     state.codex.restart().await;
     state.codexplus.shutdown();
     state.codebuddy.shutdown();
-    state.cursorplus.shutdown();
     Ok(())
 }
 
@@ -5556,7 +5485,6 @@ pub fn run() {
             // （debug 构建不回退到 release 的 ~/.nova）。
             lyra::set_nova_root(dir.clone());
             let codexplus = SdkManager::new(app.handle().clone(), CodexAdapter);
-            let cursorplus = SdkManager::new(app.handle().clone(), CursorAdapter);
             let relay = RelayManager::new(app.handle().clone(), dir.clone());
 
             app.manage(AppState {
@@ -5577,7 +5505,6 @@ pub fn run() {
                 workbuddy,
                 lyra,
                 codexplus,
-                cursorplus,
                 relay: relay.clone(),
                 config_dir: dir.clone(),
                 // 启动即视为一次活动，避免刚开机就触发静默升级
@@ -5648,21 +5575,10 @@ pub fn run() {
                 if let Some(v) = model_cache::load(&dir, AgentKind::WorkBuddy.as_str()) {
                     state.workbuddy.seed_model_options(v);
                 }
-                for (kind, manager) in [(AgentKind::Cursor, &state.cursorplus)] {
-                    if let Some(v) = model_cache::load(&dir, kind.as_str()) {
-                        if kind == AgentKind::Cursor
-                            && v.get("novaCursorModelSchema").and_then(Value::as_u64) != Some(2)
-                        {
-                            continue;
-                        }
-                        manager.seed_model_options(v);
-                    }
-                }
                 let default_kind = [
                     AgentKind::Devin,
                     AgentKind::Codex,
                     AgentKind::CodeBuddy,
-                    AgentKind::Cursor,
                     AgentKind::WorkBuddy,
                 ]
                 .into_iter()
@@ -5683,9 +5599,6 @@ pub fn run() {
                     }
                     if state.agent_enabled(&AgentKind::WorkBuddy) {
                         state.workbuddy.spawn_revalidate_model_options();
-                    }
-                    if state.agent_enabled(&AgentKind::Cursor) {
-                        state.cursorplus.spawn_revalidate_model_options();
                     }
                 } else {
                     // 与 get_model_options 共用 refreshing 闸门，避免桌面启动时双开探测 session

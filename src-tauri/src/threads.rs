@@ -58,8 +58,9 @@ pub enum AgentKind {
     CodeBuddy,
     CodeBuddyPlus,
     WorkBuddy,
-    Cursor,
     Lyra,
+    /// 仅用于保留、展示已移除或未知后端的历史，不可用于执行。
+    Unsupported,
 }
 
 impl Default for AgentKind {
@@ -68,12 +69,11 @@ impl Default for AgentKind {
     }
 }
 
-/// 反序列化走 from_str，从而兼容历史数据里的 "alkaid"（一律映射为 Lyra）。
+/// 保留历史数据：兼容 "alkaid" 别名，未知后端仅反序列化为展示占位。
 impl<'de> Deserialize<'de> for AgentKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        AgentKind::from_str(&raw)
-            .ok_or_else(|| serde::de::Error::custom(format!("未知后端：{raw}")))
+        Ok(AgentKind::from_str(&raw).unwrap_or(AgentKind::Unsupported))
     }
 }
 
@@ -93,12 +93,12 @@ impl AgentKind {
             AgentKind::CodeBuddy => "codebuddy",
             AgentKind::CodeBuddyPlus => "codebuddyplus",
             AgentKind::WorkBuddy => "workbuddy",
-            AgentKind::Cursor => "cursor",
             AgentKind::Lyra => "lyra",
+            AgentKind::Unsupported => "unsupported",
         }
     }
 
-    /// 从字符串解析后端标识（大小写不敏感）；无法识别返回 None。
+    /// 从字符串解析后端标识（大小写不敏感）；历史占位及未知后端返回 None。
     pub fn from_str(s: &str) -> Option<AgentKind> {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" => Some(AgentKind::Claude),
@@ -111,7 +111,6 @@ impl AgentKind {
             "codebuddy" => Some(AgentKind::CodeBuddy),
             "codebuddyplus" => Some(AgentKind::CodeBuddyPlus),
             "workbuddy" => Some(AgentKind::WorkBuddy),
-            "cursor" => Some(AgentKind::Cursor),
             "lyra" => Some(AgentKind::Lyra),
             _ => None,
         }
@@ -128,8 +127,8 @@ impl AgentKind {
             AgentKind::CodeBuddy => "CodeBuddy",
             AgentKind::CodeBuddyPlus => "CodeBuddy",
             AgentKind::WorkBuddy => "WorkBuddy",
-            AgentKind::Cursor => "Cursor",
             AgentKind::Lyra => "Lyra",
+            AgentKind::Unsupported => "已移除的后端",
         }
     }
 }
@@ -1739,8 +1738,8 @@ pub fn render_handoff_context(
     let mut turn_conclusion: Option<String> = None;
     let mut completed_turns = 0;
     // Everything after the last normally completed turn is an unfinished native trajectory.
-    // Under the handoff budget it takes priority over old completed history, so a cancelled Vega
-    // or Cursor turn keeps its assistant/tool state instead of looking like a new conversation.
+    // Under the handoff budget it takes priority over old completed history, so a cancelled
+    // turn keeps its assistant/tool state instead of looking like a new conversation.
     let unfinished_item_start = items
         .iter()
         .rposition(|item| {
@@ -2068,6 +2067,102 @@ mod tests {
     }
 
     #[test]
+    fn unknown_agent_kinds_are_history_only() {
+        for raw in ["cursor", " CURSOR ", "future-backend", "unsupported"] {
+            assert_eq!(AgentKind::from_str(raw), None);
+            let kind: AgentKind = serde_json::from_value(serde_json::json!(raw)).unwrap();
+            assert_eq!(kind, AgentKind::Unsupported);
+            assert_eq!(kind.as_str(), "unsupported");
+            assert_eq!(kind.label(), "已移除的后端");
+            assert_eq!(serde_json::to_value(kind).unwrap(), "unsupported");
+        }
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Kimi,
+            AgentKind::Devin,
+            AgentKind::Codex,
+            AgentKind::CodexPlus,
+            AgentKind::CodeBuddy,
+            AgentKind::CodeBuddyPlus,
+            AgentKind::WorkBuddy,
+            AgentKind::Lyra,
+        ] {
+            let raw = kind.as_str();
+            assert_eq!(AgentKind::from_str(raw), Some(kind.clone()));
+            assert_eq!(AgentKind::from_str(&format!(" {} ", raw.to_uppercase())), Some(kind.clone()));
+            assert_eq!(serde_json::to_value(&kind).unwrap(), raw);
+            assert_eq!(serde_json::from_value::<AgentKind>(serde_json::json!(raw)).unwrap(), kind);
+        }
+        assert_eq!(AgentKind::from_str("alkaid"), Some(AgentKind::Lyra));
+        assert_eq!(serde_json::from_str::<AgentKind>("\"alkaid\"").unwrap(), AgentKind::Lyra);
+    }
+
+    #[test]
+    fn unknown_backend_history_survives_split_and_legacy_store_roundtrips() {
+        let originals: Vec<Value> = ["cursor", "future-backend", "lyra"]
+            .into_iter()
+            .map(|raw| {
+                let mut thread = Thread::new("project".into(), AgentKind::Lyra, None, None, None, false);
+                thread.title = format!("{raw} history");
+                thread.push_user("保留用户消息".into(), Vec::new());
+                thread.items.push(Item::Assistant {
+                    id: thread.next_item_id(),
+                    text: "保留助手回复".into(),
+                    ts: now_ms(),
+                });
+                thread.record_provider_checkpoint(1, "session".into(), "position".into());
+                let mut value = serde_json::to_value(thread).unwrap();
+                value["agentKind"] = raw.into();
+                value["handoffFrom"] = raw.into();
+                value["providerCheckpoints"][0]["agentKind"] = raw.into();
+                value
+            })
+            .collect();
+        for legacy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let data_dir = dir.path().to_path_buf();
+            if legacy {
+                fs::write(
+                    data_dir.join("threads.json"),
+                    serde_json::to_vec(&serde_json::json!({ "threads": originals })).unwrap(),
+                ).unwrap();
+            } else {
+                fs::create_dir_all(data_dir.join("threads")).unwrap();
+                for value in &originals {
+                    let id = value["id"].as_str().unwrap();
+                    fs::write(
+                        data_dir.join("threads").join(ThreadStore::thread_file_name(id)),
+                        serde_json::to_vec(value).unwrap(),
+                    ).unwrap();
+                }
+            }
+            let store = ThreadStore::load(data_dir.clone());
+            store.save();
+            let mut snapshot = store.take_persist_snapshot().unwrap();
+            ThreadStore::write_persist_snapshot(&mut snapshot).unwrap();
+            for loaded in [store, ThreadStore::load(data_dir.clone())] {
+                assert_eq!(loaded.threads.len(), originals.len());
+                for original in &originals {
+                    let id = original["id"].as_str().unwrap();
+                    let mut expected = original.clone();
+                    if expected["agentKind"] != "lyra" {
+                        expected["agentKind"] = "unsupported".into();
+                        expected["handoffFrom"] = "unsupported".into();
+                        expected["providerCheckpoints"][0]["agentKind"] = "unsupported".into();
+                    }
+                    assert_eq!(serde_json::to_value(loaded.get(id).unwrap()).unwrap(), expected);
+                }
+            }
+            if legacy {
+                let backup: Value = serde_json::from_slice(
+                    &fs::read(data_dir.join("threads.json.backup")).unwrap(),
+                ).unwrap();
+                assert_eq!(backup["threads"], serde_json::json!(originals));
+            }
+        }
+    }
+
+    #[test]
     fn legacy_threads_json_is_migrated_to_one_file_per_thread() {
         let data_dir = temp_thread_store_dir();
         let mut first = Thread::new(
@@ -2320,7 +2415,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_to_cursor_preserves_history_once() {
+    fn handoff_to_lyra_preserves_history_once() {
         let mut thread = Thread::new(
             "D:/project".into(),
             AgentKind::Devin,
@@ -2335,19 +2430,19 @@ mod tests {
             text: "已经定位到旧会话状态。".into(),
             ts: now_ms(),
         });
-        thread.agent_kind = AgentKind::Cursor;
+        thread.agent_kind = AgentKind::Lyra;
         thread.acp_session_id = None;
         thread.handoff_from = Some(AgentKind::Devin);
 
         let context = thread
-            .take_prompt_context("Cursor")
-            .expect("跨后端切换应把已有历史交给 Cursor");
+            .take_prompt_context("Lyra")
+            .expect("跨后端切换应把已有历史交给 Lyra");
 
-        assert!(context.contains("此前由 Devin 处理，现在改由你（Cursor）接手"));
+        assert!(context.contains("此前由 Devin 处理，现在改由你（Lyra）接手"));
         assert!(context.contains("用户：\n请修复这个问题"));
         assert!(context.contains("Devin：\n已经定位到旧会话状态。"));
         assert_eq!(thread.handoff_from, None);
-        assert!(thread.take_prompt_context("Cursor").is_none());
+        assert!(thread.take_prompt_context("Lyra").is_none());
     }
 
     #[test]
@@ -2394,7 +2489,7 @@ mod tests {
             });
         }
 
-        let context = render_handoff_context(&items, None, "Vega", "Cursor").unwrap();
+        let context = render_handoff_context(&items, None, "Devin", "Lyra").unwrap();
 
         assert!(context.contains("提示 1"));
         assert!(context.contains("结论 10"));
@@ -2431,9 +2526,9 @@ mod tests {
             },
         ];
 
-        let context = render_handoff_context(&items, None, "Cursor+", "Cursor+").unwrap();
+        let context = render_handoff_context(&items, None, "Lyra", "Lyra").unwrap();
 
-        assert!(context.contains("Cursor+ 推理：\n需要先读取配置文件"));
+        assert!(context.contains("Lyra 推理：\n需要先读取配置文件"));
         assert!(context.contains("检查并修复问题"));
         assert!(context.contains("read"));
     }
@@ -2457,10 +2552,10 @@ mod tests {
     }
 
     #[test]
-    fn edited_cursor_prompt_replays_retained_history_once() {
+    fn edited_lyra_prompt_replays_retained_history_once() {
         let mut thread = Thread::new(
             "D:/project".into(),
-            AgentKind::Cursor,
+            AgentKind::Lyra,
             None,
             None,
             None,
@@ -2472,26 +2567,26 @@ mod tests {
             text: "问题位于会话恢复逻辑。".into(),
             ts: now_ms(),
         });
-        thread.handoff_from = Some(AgentKind::Cursor);
+        thread.handoff_from = Some(AgentKind::Lyra);
 
         let context = thread
-            .take_prompt_context("Cursor")
-            .expect("重编辑后应把截断点前的历史交给新的 Cursor 会话");
+            .take_prompt_context("Lyra")
+            .expect("重编辑后应把截断点前的历史交给新的 Lyra 会话");
 
         assert!(context.contains("用户：\n先定位问题"));
-        assert!(context.contains("Cursor：\n问题位于会话恢复逻辑。"));
-        assert!(thread.take_prompt_context("Cursor").is_none());
+        assert!(context.contains("Lyra：\n问题位于会话恢复逻辑。"));
+        assert!(thread.take_prompt_context("Lyra").is_none());
 
         thread.items.clear();
         thread.handoff_from = None;
-        assert!(thread.take_prompt_context("Cursor").is_none());
+        assert!(thread.take_prompt_context("Lyra").is_none());
     }
 
     #[test]
     fn checkpoint_before_uses_latest_position_from_current_backend() {
         let mut thread = Thread::new(
             "D:/project".into(),
-            AgentKind::Cursor,
+            AgentKind::CodeBuddyPlus,
             None,
             None,
             None,

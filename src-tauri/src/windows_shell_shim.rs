@@ -3,9 +3,6 @@
 //! 父进程的 `CREATE_NO_WINDOW` 不会强制继承给孙进程；Node `child_process` 补丁也覆盖不到
 //! node-pty / ConPTY 等原生启动路径。构建时生成一个纯 std 的 GUI-subsystem helper，嵌入
 //! Nova.exe，运行时按内容哈希释放，并以硬链接映射为 cmd/powershell/pwsh/bash。主发布包仍是单文件。
-//!
-//! Bash 额外放到 `<shim>/git/bin/bash.exe`：Cursor SDK 在 Windows 上只认路径匹配
-//! `/git.*bash/i` 的 Bash，根目录的 `bash.exe` 会被直接跳过并导致 bridge 退出。
 #![cfg(windows)]
 
 use std::collections::HashMap;
@@ -29,8 +26,6 @@ const PWSH_SHIM: &str = "NOVA_SHELL_SHIM_PWSH";
 #[derive(Clone)]
 struct ShellShim {
     dir: PathBuf,
-    /// Cursor SDK 在 Windows 上只认 `/git.*bash/i`；bash 别名放在 `<shim>/git/bin`。
-    bash_shim_dir: PathBuf,
     cmd: PathBuf,
     powershell: PathBuf,
     pwsh: Option<PathBuf>,
@@ -144,11 +139,6 @@ fn ensure_alias(helper: &Path, dir: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Cursor SDK 探测 Bash 时要求完整路径匹配 `/git.*bash/i`（例如 `...\Git\bin\bash.exe`）。
-fn cursor_compatible_bash_shim_dir(shim_dir: &Path) -> PathBuf {
-    shim_dir.join("git").join("bin")
-}
-
 fn init(app: &AppHandle, launch_env: &HashMap<String, String>) -> Result<ShellShim, String> {
     let dir = crate::nova_data_dir(app)
         .join("runtime")
@@ -163,18 +153,13 @@ fn init(app: &AppHandle, launch_env: &HashMap<String, String>) -> Result<ShellSh
     if pwsh.is_some() {
         ensure_alias(&helper, &dir, "pwsh.exe")?;
     }
-    // Lyra / Cursor 可能用绝对路径启动 Git Bash，单纯覆盖 PATH 无法拦截。
-    // 为它们提供 bash helper；Cursor 还要求路径看起来像 Git Bash，因此放到 git\bin 下。
-    // 同时保留根目录 bash.exe，兼容只查 PATH 裸名、不校验 git 路径的后端。
+    // 为绝对路径启动 Git Bash 的后端提供 helper，同时支持 PATH 裸名查找。
     let bash = real_bash(launch_env);
-    let bash_shim_dir = cursor_compatible_bash_shim_dir(&dir);
     if bash.is_some() {
         ensure_alias(&helper, &dir, "bash.exe")?;
-        ensure_alias(&helper, &bash_shim_dir, "bash.exe")?;
     }
     Ok(ShellShim {
         dir,
-        bash_shim_dir,
         cmd: real_cmd(),
         powershell: real_powershell(),
         pwsh,
@@ -202,8 +187,7 @@ pub(crate) fn apply(
     }
     if let Some(bash) = shim.bash.as_ref() {
         command.env(BASH_REAL, bash);
-        // 指向 git\bin 下的别名，绝对路径改写后仍能通过 Cursor 的路径过滤。
-        command.env(BASH_SHIM, shim.bash_shim_dir.join("bash.exe"));
+        command.env(BASH_SHIM, shim.dir.join("bash.exe"));
     }
 
     let base_path = launch_env
@@ -212,20 +196,8 @@ pub(crate) fn apply(
         .map(|(_, value)| value.clone())
         .or_else(|| std::env::var("PATH").ok())
         .unwrap_or_default();
-    // PATH 顺序：
-    // 1) shim 根目录 —— cmd/powershell/pwsh 裸名
-    // 2) shim\git\bin —— 满足 Cursor `/git.*bash/i` 探测
-    // 3) 真实 Git\bin（若可识别）—— Cursor 若跳过 shim 仍能找到合法 Bash；spawn guard 会改回 shim
-    // 4) 启动时 PATH
+    // shim 优先于启动时 PATH，所有 shell 别名共用同一目录。
     let mut paths = vec![shim.dir.clone()];
-    if shim.bash.is_some() {
-        paths.push(shim.bash_shim_dir.clone());
-        if let Some(real_bin) = shim.bash.as_ref().and_then(|bash| bash.parent()) {
-            if real_bin != shim.dir.as_path() && real_bin != shim.bash_shim_dir.as_path() {
-                paths.push(real_bin.to_path_buf());
-            }
-        }
-    }
     paths.extend(std::env::split_paths(&base_path));
     let joined = std::env::join_paths(paths)
         .map_err(|e| format!("拼接 Windows shell shim PATH 失败：{e}"))?;
@@ -276,51 +248,6 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(root.join("bash.exe")).unwrap(),
-            SHELL_SHIM_EXE
-        );
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    fn matches_cursor_git_bash_filter(path: &str) -> bool {
-        // Mirrors Cursor SDK: /git.*bash/i (detection) and /git.*bash\.exe$/i (shell kind).
-        let lower = path.to_ascii_lowercase();
-        let Some(git) = lower.find("git") else {
-            return false;
-        };
-        lower[git..].contains("bash")
-    }
-
-    #[test]
-    fn cursor_compatible_bash_shim_path_matches_git_bash_filter() {
-        let root = PathBuf::from(r"C:\Users\demo\.nova\runtime\windows-shell-shim\deadbeef");
-        let bash = cursor_compatible_bash_shim_dir(&root).join("bash.exe");
-        let path = bash.to_string_lossy();
-        assert!(
-            matches_cursor_git_bash_filter(&path),
-            "shim bash path must satisfy Cursor git.*bash filter: {path}"
-        );
-        assert!(
-            path.to_ascii_lowercase().ends_with("bash.exe"),
-            "shim bash path must end with bash.exe: {path}"
-        );
-        // Root alias alone is what used to break Cursor+ with the shim enabled.
-        let root_bash = root.join("bash.exe").to_string_lossy().into_owned();
-        assert!(
-            !matches_cursor_git_bash_filter(&root_bash),
-            "root bash.exe must remain non-matching so the regression stays visible: {root_bash}"
-        );
-    }
-
-    #[test]
-    fn installs_cursor_compatible_bash_alias_under_git_bin() {
-        let root =
-            std::env::temp_dir().join(format!("nova-shell-shim-git-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let helper = write_helper(&root).unwrap();
-        let bash_dir = cursor_compatible_bash_shim_dir(&root);
-        ensure_alias(&helper, &bash_dir, "bash.exe").unwrap();
-        assert_eq!(
-            std::fs::read(bash_dir.join("bash.exe")).unwrap(),
             SHELL_SHIM_EXE
         );
         std::fs::remove_dir_all(root).ok();

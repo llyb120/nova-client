@@ -25,7 +25,7 @@ assert.equal(units.length, names.size);
 const code = ts.transpileModule(units.join("\n").replace(/export function/g, "function"), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
-const kinds = ["lyra", "devin", "codex", "codebuddy", "workbuddy", "cursor", "kimi", "claude"];
+const kinds = ["lyra", "devin", "codex", "codebuddy", "workbuddy", "kimi", "claude"];
 const efforts = {};
 new Function("exports", ts.transpileModule(readFileSync(
   new URL("../src/modelEfforts.ts", import.meta.url), "utf8",
@@ -34,6 +34,7 @@ const select = new Function("props", "ALL_AGENT_KINDS", "foldModelEfforts", "spl
   const createMemo = f => f;
   const state = { modelCosts: props.modelCosts };
   const agentLabel = k => k;
+  const isSupportedAgentKind = kind => ALL_AGENT_KINDS.includes(kind);
   const modelChoices = (kind, source) => source ?? [];
   const groupOf = () => "models";
   ${code}

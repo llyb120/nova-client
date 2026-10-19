@@ -93,8 +93,8 @@ export const api = {
     invoke<TimeMachineRestoreResult>("delete_time_machine_context", { threadId, prompts }),
   listProjects: () => invoke<ProjectEntry[]>("list_projects"),
   removeProject: (cwd: string) => invoke<void>("remove_project", { cwd }),
-  prewarm: (cwd: string, agentKind: AgentKind, model?: string | null, mode?: string | null) =>
-    invoke<void>("prewarm", { cwd, agentKind, model, mode }),
+  prewarm: (cwd: string, agentKind: AgentKind, mode?: string | null) =>
+    invoke<void>("prewarm", { cwd, agentKind, mode }),
   /** 工作流提示词模式连线判断（轻量模型）；返回选中的连线 id，无法判断返回空串 */
   judgeWorkflowRoute: (conclusion: string, options: { id: string; label: string }[]) =>
     invoke<string>("judge_workflow_route", { conclusion, options }),

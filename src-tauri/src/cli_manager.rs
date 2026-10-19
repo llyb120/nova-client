@@ -50,8 +50,8 @@ fn configured_cli_program(configured: &str, expected_names: &[&str], fallback: &
     }
 }
 
-fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
-    match kind {
+fn spec_for(kind: &AgentKind, settings: &Settings) -> Option<CliSpec> {
+    Some(match kind {
         AgentKind::Claude => CliSpec {
             kind: kind.clone(),
             cli_name: "claude-agent-acp",
@@ -112,15 +112,8 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> CliSpec {
             install_command: String::new(),
             proxy: settings.workbuddy_proxy.clone(),
         },
-        AgentKind::Cursor => CliSpec {
-            kind: kind.clone(),
-            cli_name: "cursor-sdk",
-            program: "node".into(),
-            version_args: vec!["--version".into()],
-            install_command: String::new(),
-            proxy: settings.cursor_proxy.clone(),
-        },
-    }
+        AgentKind::Unsupported => return None,
+    })
 }
 
 fn all_specs(settings: &Settings) -> Vec<CliSpec> {
@@ -133,7 +126,7 @@ fn all_specs(settings: &Settings) -> Vec<CliSpec> {
         AgentKind::WorkBuddy,
     ]
     .iter()
-    .map(|kind| spec_for(kind, settings))
+    .filter_map(|kind| spec_for(kind, settings))
     .collect()
 }
 
@@ -288,13 +281,13 @@ pub async fn statuses(settings: &Settings) -> Vec<CliStatus> {
 }
 
 pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
-    if matches!(kind, AgentKind::Cursor | AgentKind::Lyra) {
+    if *kind == AgentKind::Lyra {
         return true;
     }
     if *kind == AgentKind::WorkBuddy {
         return crate::workbuddy::command(&settings.workbuddy_path).is_ok();
     }
-    resolve_program_on_path(&spec_for(kind, settings).program).is_some()
+    spec_for(kind, settings).is_some_and(|spec| resolve_program_on_path(&spec.program).is_some())
 }
 
 #[cfg(test)]
@@ -309,17 +302,19 @@ mod tests {
             AgentKind::Codex,
             AgentKind::CodeBuddy,
         ] {
-            assert!(!spec_for(&kind, &settings).install_command.is_empty());
+            assert!(!spec_for(&kind, &settings).unwrap().install_command.is_empty());
         }
-        assert!(spec_for(&AgentKind::CodeBuddy, &settings).install_command
+        assert!(spec_for(&AgentKind::CodeBuddy, &settings).unwrap().install_command
             .contains("@tencent-ai/codebuddy-code@latest"));
     }
 
     #[test]
-    fn cursor_is_sdk_only_and_skips_cli_status() {
-        assert!(is_installed(&AgentKind::Cursor, &Settings::default()));
-        assert!(!all_specs(&Settings::default())
+    fn removed_backend_is_unavailable_and_skips_cli_status() {
+        let settings = Settings::default();
+        assert!(spec_for(&AgentKind::Unsupported, &settings).is_none());
+        assert!(!is_installed(&AgentKind::Unsupported, &settings));
+        assert!(!all_specs(&settings)
             .iter()
-            .any(|spec| matches!(spec.kind, AgentKind::Cursor)));
+            .any(|spec| matches!(spec.kind, AgentKind::Unsupported)));
     }
 }

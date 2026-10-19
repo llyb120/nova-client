@@ -1,5 +1,4 @@
-use super::{canonical_usage, LaunchConfig, SdkAdapter};
-use crate::settings::Settings;
+use super::{canonical_usage, SdkAdapter};
 use crate::threads::{AgentKind, CodexUsageSnapshot};
 use serde_json::Value;
 
@@ -14,44 +13,8 @@ impl SdkAdapter for CodexAdapter {
         "Codex app-server"
     }
 
-    fn bridge(&self) -> (&'static str, &'static [u8]) {
-        ("", &[])
-    }
-
-    fn runs_inprocess(&self) -> bool {
-        true
-    }
-
-    fn launch_config(&self, settings: &Settings) -> LaunchConfig {
-        LaunchConfig {
-            program: settings.codex_path.clone(),
-            proxy: settings.codex_proxy.clone(),
-            path_env: "NOVA_CODEX_PATH",
-            api_key: None,
-            extra_env: vec![
-                (
-                    "NOVA_PONYTAIL",
-                    if settings.ponytail_enabled { "1" } else { "0" }.into(),
-                ),
-                (
-                    "NOVA_FAST_CONTEXT",
-                    if settings.context_tools_enabled() {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                    .into(),
-                ),
-            ],
-        }
-    }
-
     fn done_is_cancelled(&self, event: &Value) -> bool {
         event["cancelled"].as_bool().unwrap_or(false)
-    }
-
-    fn supports_native_steer(&self) -> bool {
-        true
     }
 
     fn cancel_grace_attempts(&self) -> usize {

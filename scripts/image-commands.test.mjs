@@ -32,7 +32,7 @@ test("setup-image requires models and discovers compatible image models before r
 test("image commands are available to every backend and keep credentials out of generation instructions", () => {
   const prompts = exportsOf(read("../src/builtinPrompts.ts"));
   const suggestions = exportsOf(read("../src/components/slashSuggestions.ts"), { "../utils": { agentLabel: (id) => id } });
-  for (const backend of ["lyra", "codex", "devin", "codebuddy", "cursor", "kimi", "claude"]) {
+  for (const backend of ["lyra", "codex", "devin", "codebuddy", "kimi", "claude"]) {
     const commands = suggestions.getSlashSuggestions(backend, [], "image").map((v) => v.title);
     assert.ok(commands.includes("/setup-image"));
     assert.ok(commands.includes("/generate-image"));
@@ -70,7 +70,10 @@ test("generate-image forwards reference attachments and includes their paths in 
   const context = { configPath: "D:/config.json", models: ["image"], referenceImages: ["D:/My Images/参考.png"] };
   let delivered;
   const body = source.slice(source.indexOf("async function tryBuiltinPrompt("), source.indexOf("  const stage = parseStageInput(builtInInput);", source.indexOf("async function tryBuiltinPrompt("))) + "return false; }";
-  const deps = { ...prompts, assertBuiltinPrompt, api: { imageCommandContext: async (configured, attachments) => {
+  const { isSupportedAgentKind } = exportsOf(read("../src/types.ts"));
+  const deps = { ...prompts, assertBuiltinPrompt, isSupportedAgentKind,
+    state: { currentId: "thread", agentKind: "lyra" },
+    api: { imageCommandContext: async (configured, attachments) => {
     assert.equal(configured, true);
     assert.deepEqual(attachments, images);
     return context;

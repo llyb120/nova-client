@@ -81,19 +81,6 @@ function quotaPercent(value: number): number {
 
 const DEFAULT_RELAY_SERVER = "";
 const RELAY_SERVER_PLACEHOLDER = "http://127.0.0.1:8320";
-const CURSOR_CONTEXT_WINDOW_OPTIONS = [
-  { value: 16_000, label: "16K tokens" },
-  { value: 32_000, label: "32K tokens" },
-  { value: 64_000, label: "64K tokens" },
-  { value: 100_000, label: "100K tokens" },
-  { value: 128_000, label: "128K tokens" },
-  { value: 200_000, label: "200K tokens" },
-  { value: 256_000, label: "256K tokens" },
-  { value: 400_000, label: "400K tokens" },
-  { value: 512_000, label: "512K tokens" },
-  { value: 1_000_000, label: "1M tokens" },
-  { value: 2_000_000, label: "2M tokens" },
-];
 
 /** 点击后按下组合键录制快捷键。 */
 function ShortcutKeyCapture(props: {
@@ -314,14 +301,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
   const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
   const [workbuddyProxy, setWorkbuddyProxy] = createSignal(s?.workbuddyProxy ?? "");
-  const [cursorProxy, setCursorProxy] = createSignal(s?.cursorProxy ?? "");
-  const [cursorSdkApiKey, setCursorSdkApiKey] = createSignal(s?.cursorSdkApiKey ?? "");
-  const [cursorDisableSubagents, setCursorDisableSubagents] = createSignal(
-    s?.cursorDisableSubagents ?? false,
-  );
-  const [cursorModelContexts, setCursorModelContexts] = createSignal(
-    (s?.cursorModelContexts ?? []).map((rule) => ({ ...rule })),
-  );
   const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(
     (s?.sessionShortcuts ?? []).map((item) => ({ ...item })),
   );
@@ -331,9 +310,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [meteorPasteShortcut, setMeteorPasteShortcut] = createSignal(s?.meteorPasteShortcut ?? "Alt+V");
   const [jianpuShortcut, setJianpuShortcut] = createSignal(s?.jianpuShortcut ?? "Alt+R");
   const [tryingMeteor, setTryingMeteor] = createSignal(false);
-  const [cursorContextMode, setCursorContextMode] = createSignal<"default" | "super">(
-    s?.cursorContextMode === "super" ? "super" : "default",
-  );
   const [customEnvVars, setCustomEnvVars] = createSignal<{ name: string; value: string }[]>(
     Object.entries(s?.customEnvVars ?? {}).map(([name, value]) => ({ name, value })),
   );
@@ -342,7 +318,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
   const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
   const [workbuddyEnabled, setWorkbuddyEnabled] = createSignal(s?.workbuddyEnabled === true);
-  const [cursorEnabled, setCursorEnabled] = createSignal(s?.cursorEnabled !== false);
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
   const [sceneModels, setSceneModels] = createSignal<SceneModels>(
     Object.fromEntries(SCENES.map(({ key }) => [key, (s?.sceneModels?.[key] ?? []).map((t) => ({ ...t }))])) as SceneModels,
@@ -448,12 +423,11 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       codexEnabled(),
       codebuddyEnabled(),
       workbuddyEnabled(),
-      cursorEnabled(),
     ].filter(Boolean).length;
 
   const sceneAgentKinds = createMemo(() => ALL_AGENT_KINDS.filter((kind) => ({
     lyra: lyraEnabled(), devin: devinEnabled(), claude: claudeEnabled(), kimi: kimiEnabled(),
-    codex: codexEnabled(), codebuddy: codebuddyEnabled(), workbuddy: workbuddyEnabled(), cursor: cursorEnabled(),
+    codex: codexEnabled(), codebuddy: codebuddyEnabled(), workbuddy: workbuddyEnabled(), unsupported: false,
   })[kind]));
 
   const sceneRowKinds = (kind: AgentKind): AgentKind[] =>
@@ -468,16 +442,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       [next[index], next[target]] = [next[target], next[index]];
       return next;
     });
-  const updateCursorModelContext = (index: number, patch: { prefix?: string; contextWindow?: number }) => {
-    setCursorModelContexts((current) => current.map((rule, ruleIndex) =>
-      ruleIndex === index ? { ...rule, ...patch } : rule));
-  };
-  const addCursorModelContext = () => {
-    setCursorModelContexts((current) => [...current, { prefix: "", contextWindow: 128_000 }]);
-  };
-  const removeCursorModelContext = (index: number) => {
-    setCursorModelContexts((current) => current.filter((_, ruleIndex) => ruleIndex !== index));
-  };
   const updateSessionShortcut = (
     index: number,
     patch: Partial<Pick<SessionShortcut, "keys" | "action" | "target">>,
@@ -677,8 +641,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     acpArgs: acpArgs().trim() || "acp",
     codebuddyPath: codebuddyPath().trim() || "codebuddy",
     workbuddyPath: workbuddyPath().trim(),
-    // Cursor 仅走官方 SDK，不再依赖本机 cursor-agent；保留字段兼容旧配置。
-    cursorPath: s?.cursorPath?.trim() || "cursor-agent",
     codexPath: codexPath().trim() || "codex",
     codexProxy: codexProxy().trim(),
     lyraProxy: lyraProxy().trim(),
@@ -692,13 +654,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     devinProxy: devinProxy().trim(),
     codebuddyProxy: codebuddyProxy().trim(),
     workbuddyProxy: workbuddyProxy().trim(),
-    cursorProxy: cursorProxy().trim(),
-    cursorSdkApiKey: cursorSdkApiKey().trim(),
-    cursorDisableSubagents: cursorDisableSubagents(),
-    cursorModelContexts: cursorModelContexts()
-      .map((rule) => ({ prefix: rule.prefix.trim(), contextWindow: rule.contextWindow }))
-      .filter((rule) => rule.prefix.length > 0),
-    cursorContextMode: cursorContextMode(),
     defaultMode: "build",
     sceneModels: sceneModels(),
     editor: editor().trim() || "code",
@@ -721,10 +676,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     codexEnabled: codexEnabled(),
     codebuddyEnabled: codebuddyEnabled(),
     workbuddyEnabled: workbuddyEnabled(),
-    cursorEnabled: cursorEnabled(),
     codexIntegration: "app-server",
     codebuddyIntegration: "acp",
-    cursorIntegration: "sdk",
     worktreeDir: worktreeDir().trim(),
     updateChannel: updateChannel(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
@@ -1573,22 +1526,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
             <section class="settings-group">
               <h3 class="settings-group-title">上下文机制</h3>
               <label class="field">
-                <span class="field-label">Cursor 上下文</span>
-                <select
-                  class="field-input"
-                  value={cursorContextMode()}
-                  onChange={(e) =>
-                    setCursorContextMode(e.currentTarget.value === "super" ? "super" : "default")
-                  }
-                >
-                  <option value="default">默认</option>
-                  <option value="super">超级（旧版超级上下文）</option>
-                </select>
-                <span class="field-hint">
-                  默认复用 live Cursor session；超级切换到改造前备份的 fresh Agent、compact memory 与自动摘要实现。
-                </span>
-              </label>
-              <label class="field">
                 <span class="field-label">代码上下文检索</span>
                 <select
                   class="field-input"
@@ -1904,91 +1841,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 </label>
               </div>
               <ProxyField value={codexProxy()} onInput={setCodexProxy} />
-            </div>
-
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class={`agent-badge cursor`}>{agentLabel("cursor")}</span>
-                <span class="fixed-integration">SDK</span>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={cursorEnabled()}
-                    disabled={cursorEnabled() && enabledCount() === 1}
-                    onChange={(e) => setCursorEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-              </div>
-              <div class="backend-fields">
-                <label class="backend-field backend-field-wide">
-                  <span class="field-label">Cursor API Key</span>
-                  <input class="field-input" value={cursorSdkApiKey()} onInput={(e) => setCursorSdkApiKey(e.currentTarget.value)} placeholder="留空使用 CURSOR_API_KEY" />
-                </label>
-              </div>
-              <ProxyField value={cursorProxy()} onInput={setCursorProxy} />
-              <label class="backend-switch" style={{ "align-self": "flex-start" }}>
-                <input
-                  type="checkbox"
-                  checked={cursorDisableSubagents()}
-                  onChange={(e) => setCursorDisableSubagents(e.currentTarget.checked)}
-                />
-                <span>阻止 Task / subagent</span>
-              </label>
-              <div class="field-hint">
-                默认关闭。开启后写入 Cursor 全局 hook；关闭会清除 Nova 写入的 hook 和脚本，并保留其他 hook。
-              </div>
-              <div class="cursor-context-config">
-                <div class="cursor-context-head">
-                  <div>
-                    <div class="field-label">模型上下文窗口</div>
-                    <div class="field-hint">按模型 ID 包含匹配，最长匹配串优先；未匹配时使用 128K。</div>
-                  </div>
-                  <button type="button" class="btn secondary cursor-context-add" onClick={addCursorModelContext}>
-                    添加
-                  </button>
-                </div>
-                <Show when={cursorModelContexts().length > 0} fallback={
-                  <div class="cursor-context-empty">暂无自定义规则。</div>
-                }>
-                  <div class="cursor-context-list">
-                    <Index each={cursorModelContexts()}>
-                      {(rule, index) => (
-                        <div class="cursor-context-row">
-                          <input
-                            class="field-input"
-                            value={rule().prefix}
-                            onInput={(event) => updateCursorModelContext(index, { prefix: event.currentTarget.value })}
-                            placeholder="模型匹配串，如 claude-4"
-                            aria-label="Cursor 模型匹配串"
-                          />
-                          <select
-                            class="field-input"
-                            value={String(rule().contextWindow)}
-                            onChange={(event) => updateCursorModelContext(index, {
-                              contextWindow: Number(event.currentTarget.value),
-                            })}
-                            aria-label="Cursor 模型上下文窗口"
-                          >
-                            <For each={CURSOR_CONTEXT_WINDOW_OPTIONS}>
-                              {(option) => <option value={option.value}>{option.label}</option>}
-                            </For>
-                          </select>
-                          <button
-                            type="button"
-                            class="icon-btn cursor-context-remove"
-                            onClick={() => removeCursorModelContext(index)}
-                            aria-label="删除模型上下文规则"
-                            title="删除"
-                          >
-                            <IconX size={14} />
-                          </button>
-                        </div>
-                      )}
-                    </Index>
-                  </div>
-                </Show>
-              </div>
             </div>
 
             <p class="field-hint">
@@ -2465,7 +2317,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               </div>
               <span class="field-hint">
                 Skill 统一放在 <code>~/.nova/skills</code>。启动各后端时会以软链接（macOS/Linux）或目录联接（Windows）同步到
-                Codex / Cursor / agents 的全局 skills 目录，不拷贝文件。
+                各后端的全局 skills 目录，不拷贝文件。
               </span>
             </div>
 

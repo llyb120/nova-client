@@ -44,7 +44,8 @@ import type {
   UpdateOp,
   UpdateProgress,
 } from "./types";
-import { SCENES, type ModelTarget, type SceneKey } from "./types";
+import { ALL_AGENT_KINDS, isSupportedAgentKind, SCENES, type ModelTarget, type SceneKey } from "./types";
+export { ALL_AGENT_KINDS } from "./types";
 import { isScratch, scratchParent } from "./utils";
 import { taskChains } from "./taskChains";
 import {
@@ -233,7 +234,7 @@ export const [state, setState] = createStore<AppStore>({
     codex: null,
     codebuddy: null,
     workbuddy: null,
-    cursor: null,
+    unsupported: null,
   },
   logs: [],
   loadingThread: false,
@@ -251,7 +252,7 @@ export const [state, setState] = createStore<AppStore>({
     codex: [],
     codebuddy: [],
     workbuddy: [],
-    cursor: [],
+    unsupported: [],
   },
   updateProgress: null,
   relay: { enabled: false, connected: false },
@@ -350,7 +351,7 @@ export function modelChoices(
 
 /** 在可选列表中解析应使用的模型。
  *  优先 preferred；明确模型即使暂不在列表也必须保留，避免异步加载时被覆盖；
- *  仅 preferred 为空时才回退上次模型 / 第一项（跳过 Cursor「Auto」这类 value="" 入口）。 */
+ *  仅 preferred 为空时才回退上次模型 / 第一项（跳过 value="" 入口）。 */
 export function resolveAvailableModel(
   agentKind: AgentKind,
   preferred: string,
@@ -363,13 +364,7 @@ export function resolveAvailableModel(
   if (preferred) return preferred;
   const previous = lastUsed.model(agentKind);
   if (previous && choices.some((c) => c.value === previous)) return previous;
-  // 跳过 Cursor「Auto」哨兵入口（非空但不选具体模型），保持默认落到第一个具体模型；
-  // 显式选中过 Auto 的走上面 previous 分支保留。
-  return (
-    choices.find((c) => c.value && c.value !== "__cursor_auto__")?.value ??
-    choices[0]?.value ??
-    ""
-  );
+  return choices.find((c) => c.value)?.value ?? choices[0]?.value ?? "";
 }
 
 /** 界面可选会话模式：仅 Build。Plan 不进选择器，只由 /plan 隐式启动；
@@ -462,6 +457,7 @@ function setModelOptions(agentKind: AgentKind, opts: ModelOptions | null) {
 }
 
 export async function ensureModelOptions(agentKind: AgentKind) {
+  if (!isSupportedAgentKind(agentKind)) return;
   // pending 是后端「还没拉到」的占位：缓存它会让填完 API Key 后永远停在空列表，
   // 所以只有拿到真实列表才算加载完成。
   const cached = state.modelOptions[agentKind];
@@ -482,18 +478,6 @@ export async function ensureModelOptions(agentKind: AgentKind) {
   }
 }
 
-/** 模型后端固定展示顺序 */
-export const ALL_AGENT_KINDS: AgentKind[] = [
-  "lyra",
-  "devin",
-  "kimi",
-  "claude",
-  "codex",
-  "codebuddy",
-  "workbuddy",
-  "cursor",
-];
-
 /** 某后端在设置里是否启用。Claude / Kimi / WorkBuddy 默认关闭，其余缺字段按启用处理。 */
 function agentEnabled(s: Settings, k: AgentKind): boolean {
   switch (k) {
@@ -511,8 +495,8 @@ function agentEnabled(s: Settings, k: AgentKind): boolean {
       return s.codebuddyEnabled !== false;
     case "workbuddy":
       return s.workbuddyEnabled === true;
-    case "cursor":
-      return s.cursorEnabled !== false;
+    default:
+      return false;
   }
 }
 
@@ -537,6 +521,7 @@ export function sceneModel(scene: SceneKey): ModelTarget {
 
 /** 把 agentKind 收敛到「已启用」集合：已启用则原样返回，否则回退到第一个启用项 */
 export function resolveEnabledAgentKind(kind: AgentKind): AgentKind {
+  if (!isSupportedAgentKind(kind)) return "unsupported";
   const list = enabledAgentKinds();
   return list.includes(kind) ? kind : (list[0] ?? kind);
 }
@@ -1681,7 +1666,8 @@ export const lastUsed = {
   agentKind: (): AgentKind => {
     const raw = localStorage.getItem("fd:lastAgentKind") as AgentKind | null;
     // Vega 已移除：旧的 alkaid 选择指向 Lyra。
-    return !raw || raw === ("alkaid" as AgentKind) ? "lyra" : raw;
+    if (!raw || raw === ("alkaid" as AgentKind)) return "lyra";
+    return isSupportedAgentKind(raw) ? raw : "unsupported";
   },
   setAgentKind: (v: AgentKind) => localStorage.setItem("fd:lastAgentKind", v),
   model: (agentKind: AgentKind = "devin") => {
@@ -2020,6 +2006,12 @@ async function tryBuiltinPrompt(
   text: string,
   images: PromptImage[],
 ): Promise<boolean> {
+  const agentKind = threadId === state.currentId
+    ? state.agentKind
+    : state.threads.find((thread) => thread.id === threadId)?.agentKind ?? (await api.getThread(threadId)).agentKind;
+  if (!isSupportedAgentKind(agentKind)) {
+    throw new Error("此后端已移除，请先选择其他后端后再发送");
+  }
   const builtInInput = text.trim();
   if (/^\/(?:setup-image|generate-image|edit-image)(?:\s|$)/i.test(builtInInput)) {
     assertBuiltinPrompt(text, images);
@@ -3047,6 +3039,7 @@ function normalizeSlashCommands(commands: unknown): SlashCommand[] {
 }
 
 export async function refreshSlashCommands(agentKind: AgentKind) {
+  if (!isSupportedAgentKind(agentKind)) return;
   try {
     const commands = await api.getSlashCommands(agentKind);
     const list = normalizeSlashCommands(commands);
@@ -3228,7 +3221,10 @@ export async function initStore() {
           void action.catch((error) => console.error("Fire relay failed", error));
         }
         // 自动模式：本轮出错且无回复时，后端按场景列表切到下一个模型重发（非自动会话直接返回 false）。
-        if (e.payload.stopReason === "error") {
+        const failedAgent = threadId === state.currentId
+          ? state.agentKind
+          : state.threads.find((thread) => thread.id === threadId)?.agentKind;
+        if (e.payload.stopReason === "error" && isSupportedAgentKind(failedAgent)) {
           void api.autoFailover(threadId).catch((error) => console.error("Auto failover failed", error));
         }
         // 通用工作流（/run）与 Fire 互斥：非 Fire 会话才会被其接管。

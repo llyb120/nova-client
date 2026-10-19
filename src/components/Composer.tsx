@@ -41,7 +41,7 @@ import {
   STAGE_COMMAND_PATTERN,
   state,
 } from "../store";
-import type { AgentKind, PromptImage } from "../types";
+import { isSupportedAgentKind, type AgentKind, type PromptImage } from "../types";
 import { agentLabel } from "../utils";
 import {
   abandonWorkflow,
@@ -163,17 +163,15 @@ export function Composer() {
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
+  const backendAvailable = () => isSupportedAgentKind(state.agentKind);
   // 原生注入当前轮：Lyra / Codex / Devin / CodeBuddy / WorkBuddy / Claude。
-  const supportsLiveSteer = () =>
+  const supportsSteer = () =>
     state.agentKind === "lyra" ||
     state.agentKind === "codex" ||
     state.agentKind === "codebuddy" ||
     state.agentKind === "workbuddy" ||
     state.agentKind === "claude" ||
     state.agentKind === "devin";
-  // 打断当前轮后以新 turn 继续：Cursor（Agent.create + slim memory）。
-  const supportsInterruptSteer = () => state.agentKind === "cursor";
-  const supportsSteer = () => supportsLiveSteer() || supportsInterruptSteer();
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
   const activeClue = createMemo(() => {
     const cardId = state.threads.find((item) => item.id === state.currentId)?.activeClueCardId;
@@ -376,7 +374,7 @@ export function Composer() {
   const shouldQueue = (value: string) => running() && !STAGE_COMMAND_PATTERN.test(value);
   const submit = () => {
     const value = text().trim();
-    if (empty()) return;
+    if (empty() || !backendAvailable()) return;
     const images = attach.images().map((image) => ({ ...image }));
     const currentId = state.currentId;
     if (!currentId) return;
@@ -757,7 +755,9 @@ export function Composer() {
           ref={textareaRef}
           class="composer-input"
           placeholder={
-            running()
+            !backendAvailable()
+              ? "此后端已移除，请先选择其他后端后再发送"
+              : running()
               ? supportsSteer()
                 ? `${providerName()} 正在工作…输入并回车加入队列；输入为空时回车可立即引导`
                 : `${providerName()} 正在工作…输入并回车加入队列，任务结束后自动发送`
@@ -825,9 +825,9 @@ export function Composer() {
           </span>
           <button
             class="composer-btn send"
-            disabled={empty()}
+            disabled={empty() || !backendAvailable()}
             onClick={submit}
-            title={shouldQueue(text().trim()) ? "加入提示词队列" : "发送"}
+            title={!backendAvailable() ? "请先选择其他后端后再发送" : shouldQueue(text().trim()) ? "加入提示词队列" : "发送"}
           >
             <IconSend size={16} />
           </button>

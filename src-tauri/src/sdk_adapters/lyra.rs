@@ -1,10 +1,9 @@
 //! Lyra：Rust 原生 agent，不走 Node bridge。主运行时与借用额度运行时都在应用进程内
-//! 以 tokio 任务直接运行（runs_inprocess；借用额度只换数据根即不同凭证，无需进程隔离）；
+//! 以 tokio 任务直接运行（借用额度只换数据根即不同凭证，无需进程隔离）；
 //! `nova lyra` 子命令保留作命令行调试入口，stdio 协议与旧 alkaid-bridge 兼容；
 //! 配置/会话/技能目录沿用 ~/.nova/alkaid/。
 
-use super::{canonical_usage, LaunchConfig, SdkAdapter};
-use crate::settings::Settings;
+use super::{canonical_usage, SdkAdapter};
 use crate::threads::{AgentKind, CodexUsageSnapshot, ToolCall};
 use serde_json::{json, Value};
 
@@ -19,70 +18,11 @@ impl SdkAdapter for LyraAdapter {
         "Lyra"
     }
 
-    fn bridge(&self) -> (&'static str, &'static [u8]) {
-        // 原生 agent 无内嵌 bridge 脚本；spawn 走 native_subcommand。
-        ("lyra-bridge.mjs", &[])
-    }
-
-    fn native_subcommand(&self) -> Option<&'static str> {
-        Some("lyra")
-    }
-
-    fn runs_inprocess(&self) -> bool {
-        true
-    }
-
-    fn launch_config(&self, settings: &Settings) -> LaunchConfig {
-        LaunchConfig {
-            program: "lyra".into(),
-            proxy: settings.lyra_proxy.clone(),
-            path_env: "LYRA_RUNTIME",
-            api_key: None,
-            extra_env: vec![
-                (
-                    "NOVA_AUTO_CHANGE_PROJECT",
-                    if settings.auto_change_project_enabled {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                    .into(),
-                ),
-                (
-                    "NOVA_FAST_CONTEXT",
-                    if settings.context_tools_enabled() {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                    .into(),
-                ),
-                (
-                    "NOVA_CONTEXT_RETRIEVAL_MODE",
-                    settings.context_retrieval_mode.as_str().into(),
-                ),
-                (
-                    "NOVA_POWERSHELL_UTF8",
-                    if settings.powershell_utf8_enabled {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                    .into(),
-                ),
-            ],
-        }
-    }
-
     fn permission_prefix(&self) -> &'static str {
         "lyr"
     }
 
     fn generates_title(&self) -> bool {
-        true
-    }
-
-    fn supports_native_steer(&self) -> bool {
         true
     }
 

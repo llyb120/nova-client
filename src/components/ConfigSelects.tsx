@@ -7,7 +7,7 @@ import {
   resolveAvailableModel,
   state,
 } from "../store";
-import type { AgentKind, ModelCost, ModelOptions } from "../types";
+import { isSupportedAgentKind, type AgentKind, type ModelCost, type ModelOptions } from "../types";
 import { agentLabel } from "../utils";
 import { foldEfforts as foldModelEfforts, splitEffort } from "../modelEfforts";
 import { SearchSelect, type SelectOption } from "./SearchSelect";
@@ -34,7 +34,6 @@ function groupOf(value: string, name: string, cost?: ModelCost): string {
   const byProvider = cost?.provider && PROVIDER_LABEL[cost.provider];
   if (byProvider) return byProvider;
   const v = `${value} ${name}`.toLowerCase();
-  if (v.includes("composer") || v.includes("cheetah")) return "Cursor";
   if (v.includes("claude") || v.includes("fable") || v.includes("opus") || v.includes("sonnet"))
     return "Claude";
   if (v.includes("gpt") || v.includes("codex") || v.includes("openai")) return "GPT";
@@ -116,6 +115,7 @@ export function modelOptionsOf(
   source?: ModelOptions | null,
   foldEfforts = false,
 ): SelectOption[] {
+  if (!isSupportedAgentKind(agentKind)) return [];
   const costs = state.modelCosts;
   const encode = (value: string) => (merged ? encodeModelValue(agentKind, value) : value);
   const config = (source !== undefined ? source : state.modelOptions[agentKind])?.configOptions;
@@ -202,7 +202,7 @@ export function ModelPicker(props: {
   /** 显示模型收藏入口。 */
   favorites?: boolean;
 }) {
-  const kinds = createMemo(() => props.agentKinds ?? [props.agentKind]);
+  const kinds = createMemo(() => (props.agentKinds ?? [props.agentKind]).filter(isSupportedAgentKind));
   // 调用方显式给出后端列表时始终保留「后端」一级，即使只有一个后端或模型尚未加载。
   // 这样设置里启用的后端不会因为模型探测失败而从选择器中完全消失。
   const merged = createMemo(() => props.agentKinds !== undefined);
@@ -266,6 +266,7 @@ export function ModelPicker(props: {
   };
 
   const fallbackLabel = createMemo(() => {
+    if (!isSupportedAgentKind(props.agentKind)) return agentLabel(props.agentKind);
     if (props.modelSource) return undefined;
     const name = lastUsed.modelName(props.agentKind);
     return props.model && name ? name : undefined;

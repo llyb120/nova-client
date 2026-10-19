@@ -39,7 +39,7 @@ import {
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import { setHomeTerminalCwd } from "../workspaceLayout";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
-import type { AgentKind, Peer } from "../types";
+import { isSupportedAgentKind, type AgentKind, type Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
 import { enabledWorkflows } from "../workflow/storage";
 import { peerWorkflows } from "../workflow/roaming";
@@ -138,7 +138,6 @@ export function HomeView() {
   type PrewarmTarget = {
     cwd?: string;
     agentKind?: AgentKind;
-    model?: string;
     mode?: string;
   };
 
@@ -268,16 +267,16 @@ export function HomeView() {
     const p = target.cwd ?? cwd();
     if (!p) return;
     const nextAgentKind = target.agentKind ?? agentKind();
-    const nextModel = target.model ?? model();
+    if (!isSupportedAgentKind(nextAgentKind)) return;
     const nextMode = target.mode ?? mode();
-    const key = `${nextAgentKind}\n${p}\n${nextModel}\n${nextMode}`;
+    const key = `${nextAgentKind}\n${p}\n${nextMode}`;
     if (key === lastPrewarmKey && Date.now() - lastPrewarmAt < 15_000) return;
     lastPrewarmKey = key;
     lastPrewarmAt = Date.now();
     const shouldRestoreFocus = document.activeElement === textareaRef;
     const selectionStart = textareaRef?.selectionStart ?? null;
     const selectionEnd = textareaRef?.selectionEnd ?? null;
-    void api.prewarm(p, nextAgentKind, nextModel || null, nextMode || null).catch((error) => {
+    void api.prewarm(p, nextAgentKind, nextMode || null).catch((error) => {
       if (lastPrewarmKey === key) lastPrewarmKey = "";
       console.warn("prewarm failed", error);
     }).finally(() => {
@@ -292,7 +291,7 @@ export function HomeView() {
   // 恢复项目/草稿和切换模式也要预热，把用户阅读、输入的时间用于启动 ACP。
   createEffect(() => {
     if (!state.settings || roam()) return;
-    const target = { cwd: cwd(), agentKind: agentKind(), model: model(), mode: mode() };
+    const target = { cwd: cwd(), agentKind: agentKind(), mode: mode() };
     if (!target.cwd) return;
     const timer = setTimeout(() => prewarmCurrent(target), 150);
     onCleanup(() => clearTimeout(timer));
@@ -340,10 +339,10 @@ export function HomeView() {
   const peerReady = () => !usesPeerModels() || !!peerModels();
   // ConfigSelects 的后端列表：漫游用对端已启用的后端，否则本机已启用的
   const configAgentKinds = () =>
-    usesPeerModels() ? peerModels()?.backends ?? [] : enabledAgentKinds();
+    usesPeerModels() ? (peerModels()?.backends ?? []).filter(isSupportedAgentKind) : enabledAgentKinds();
   // 模型选项来源：漫游取对端列表（缺失返回 null → 空列表），否则用本机全局
   const peerModelSource = (k: AgentKind) => peerModels()?.options[k] ?? null;
-  // 空值才落到可用项；已有选择即使暂不在列表也保留（Cursor 目录未就绪等中间态不应重置成 Auto）。
+  // 空值才落到可用项；已有选择即使模型列表尚未就绪也保留。
   createEffect(() => {
     if (usesPeerModels()) return;
     const choices = modelChoices(agentKind());
@@ -363,8 +362,9 @@ export function HomeView() {
     }
     ensurePeerModels(t);
     const pm = state.peerModels[t];
-    if (!pm) return;
-    const backend = pm.backends.includes(agentKind()) ? agentKind() : pm.backends[0];
+    if (!pm || !isSupportedAgentKind(agentKind())) return;
+    const backends = pm.backends.filter(isSupportedAgentKind);
+    const backend = backends.find((kind) => kind === agentKind()) ?? backends[0];
     if (!backend) return;
     if (backend !== agentKind()) setAgentKind(backend);
 
@@ -613,6 +613,9 @@ export function HomeView() {
     rememberPromptHistory(t, images);
     setBusy(true);
     try {
+      if (!autoMode && !isSupportedAgentKind(agentKind())) {
+        throw new Error("此后端已移除，请先选择其他后端后再发送");
+      }
       if (autoMode) {
         // 直接以轻量化场景模型开局：由它判断是否把整块工作按场景转交，并选择项目目录。
         const { agentKind: autoKind, model: autoModel } = sceneModel("lightweight");
@@ -667,8 +670,7 @@ export function HomeView() {
         const workflowId = workflow?.id ?? null;
         if (workflowId) {
           // 工作流：会话需先建好再启动工作流，沿用同步创建，不乐观跳转。
-          // 首节点配置了后端/模型时直接以其创建会话，避免创建后再 setThreadModel
-          // 时首轮仍命中按旧模型预热的 bridge（Cursor 等 keeps_bridge_alive 后端）。
+          // 首节点配置了后端/模型时直接以其创建会话；后续跟随节点仍使用用户的选择。
           const entry = workflow?.stages.find((stage) => stage.id === workflow.entry);
           const entryAgentKind = entry?.agentKind ?? agentKind();
           const entryModel = entry?.agentKind
