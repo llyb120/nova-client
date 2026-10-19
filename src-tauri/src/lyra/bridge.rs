@@ -70,30 +70,42 @@ async fn settle_pending_input(command_busy: &AtomicBool, command_revision: &Atom
 /// 本地按同一上限预缩，模型所见不变，请求体却小得多（大图原样上传会拖到网关超时）。
 const IMAGE_MAX_EDGE: f64 = 1568.0;
 const IMAGE_MAX_PIXELS: f64 = 1_150_000.0;
+/// 无损编码超过此大小（照片类 PNG 缩小后仍可达数 MB）改用 JPEG：截图历史每轮重发，
+/// 数 MB 请求体在不稳定链路上传会卡住直到响应头超时。
+// ponytail: 转 JPEG 丢弃透明通道；大图透明的场景少，需要时再按白底合成。
+const IMAGE_MAX_LOSSLESS_BYTES: usize = 1024 * 1024;
 
-/// 超出上限时等比缩小并重新编码（PNG 保持无损，JPEG 用 q90）；未超限或无法解码返回 None，调用方沿用原图。
+/// 超出视觉上限时等比缩小；非 JPEG 结果超过无损上限则改编码为 JPEG q90。
+/// 无需处理或无法解码返回 None，调用方沿用原图。
 pub(crate) fn fit_image(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
     let format = image::guess_format(bytes).ok()?;
     let img = image::load_from_memory_with_format(bytes, format).ok()?;
     let (w, h) = (img.width() as f64, img.height() as f64);
     let scale = (IMAGE_MAX_EDGE / w.max(h)).min((IMAGE_MAX_PIXELS / (w * h)).sqrt());
-    if scale >= 1.0 {
+    let lossless = format != image::ImageFormat::Jpeg;
+    if scale >= 1.0 && !(lossless && bytes.len() > IMAGE_MAX_LOSSLESS_BYTES) {
         return None;
     }
-    let resized = img.resize_exact(
-        ((w * scale).round() as u32).max(1),
-        ((h * scale).round() as u32).max(1),
-        image::imageops::FilterType::Lanczos3,
-    );
-    let mut out = Vec::new();
-    if format == image::ImageFormat::Jpeg {
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
-        resized.to_rgb8().write_with_encoder(encoder).ok()?;
-        Some((out, "image/jpeg"))
+    let img = if scale < 1.0 {
+        img.resize_exact(
+            ((w * scale).round() as u32).max(1),
+            ((h * scale).round() as u32).max(1),
+            image::imageops::FilterType::Lanczos3,
+        )
     } else {
-        resized.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
-        Some((out, "image/png"))
+        img
+    };
+    if lossless && scale < 1.0 {
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
+        if out.len() <= IMAGE_MAX_LOSSLESS_BYTES {
+            return Some((out, "image/png"));
+        }
     }
+    let mut out = Vec::new();
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
+    img.to_rgb8().write_with_encoder(encoder).ok()?;
+    Some((out, "image/jpeg"))
 }
 
 /// 把协议 parts 转为 (文本, 图片)（local_image 读文件转 base64）。
