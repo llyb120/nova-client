@@ -444,7 +444,8 @@ async fn handle_prompt(
         context,
         cancelled: cancelled.clone(),
         steer: steer.clone(),
-        agents: Some(session::root_handle(&ctx.session_id).with_stage(
+        agents: Some(session::root_handle(&request.get("novaThreadId").and_then(Value::as_str)
+            .map(|id| format!("thread:{id}")).unwrap_or_else(|| ctx.session_id.clone())).with_stage(
             app.zip(request.get("novaThreadId").and_then(Value::as_str).map(str::to_owned)),
         )),
     };

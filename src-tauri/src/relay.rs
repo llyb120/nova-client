@@ -2633,6 +2633,7 @@ impl RelayManager {
                 let mgr = state.lyra.clone();
                 tauri::async_runtime::spawn(async move {
                     if host_prompt_is_current(&prompt_epoch) {
+                        crate::lyra::session::resume_for_thread(&host_thread_id);
                         mgr.run_prompt(host_thread_id, text, images).await;
                     }
                 });
@@ -2643,6 +2644,7 @@ impl RelayManager {
                     if !host_prompt_is_current(&prompt_epoch) {
                         return;
                     }
+                    crate::lyra::session::resume_for_thread(&host_thread_id);
                     mgr.run_prompt(host_thread_id, text, images).await;
                 });
             }
@@ -2650,6 +2652,7 @@ impl RelayManager {
                 let mgr = state.codexplus.clone();
                 tauri::async_runtime::spawn(async move {
                     if host_prompt_is_current(&prompt_epoch) {
+                        crate::lyra::session::resume_for_thread(&host_thread_id);
                         mgr.run_prompt(host_thread_id, text, images).await;
                     }
                 });
@@ -2661,6 +2664,7 @@ impl RelayManager {
                         if !host_prompt_is_current(&prompt_epoch) {
                             return;
                         }
+                        crate::lyra::session::resume_for_thread(&host_thread_id);
                         mgr.steer_prompt(host_thread_id, text, images).await;
                     });
                 } else {
@@ -2668,6 +2672,7 @@ impl RelayManager {
                         if !host_prompt_is_current(&prompt_epoch) {
                             return;
                         }
+                        crate::lyra::session::resume_for_thread(&host_thread_id);
                         mgr.run_prompt(host_thread_id, text, images).await;
                     });
                 }
@@ -2678,6 +2683,7 @@ impl RelayManager {
                     if !host_prompt_is_current(&prompt_epoch) {
                         return;
                     }
+                    crate::lyra::session::resume_for_thread(&host_thread_id);
                     if agent_kind == AgentKind::WorkBuddy && mgr.is_running(&host_thread_id) {
                         mgr.steer_prompt(host_thread_id, text, images).await;
                     } else {
@@ -2715,36 +2721,17 @@ impl RelayManager {
                 .fetch_add(1, Ordering::SeqCst);
         }
         let state = self.app.state::<AppState>();
-        if !crate::is_running(
-            &state,
-            state.store.lock().unwrap().get(&host_thread_id).unwrap(),
-        ) {
+        if !crate::running_by_id(&state, &host_thread_id) {
             self.forward_local_turn(&host_thread_id, false, &json!("force_cancelled"));
+        }
+        if agent_kind == AgentKind::Unsupported {
+            self.fail_roaming_workflow(&host_thread_id, "该后端不可用");
             return;
         }
-        match agent_kind {
-            AgentKind::Lyra => {
-                let mgr = state.lyra.clone();
-                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
-            }
-            AgentKind::Devin => {
-                let mgr = state.acp.clone();
-                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
-            }
-            AgentKind::Kimi | AgentKind::Claude | AgentKind::WorkBuddy => {
-                let mgr = state.acp_for(&agent_kind).unwrap();
-                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
-            }
-            AgentKind::Codex | AgentKind::CodexPlus => {
-                let mgr = state.codexplus.clone();
-                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
-            }
-            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                let mgr = state.codebuddy.clone();
-                tauri::async_runtime::spawn(async move { mgr.cancel(&host_thread_id).await });
-            }
-            AgentKind::Unsupported => self.fail_roaming_workflow(&host_thread_id, "该后端不可用"),
-        };
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = crate::cancel_turn(app.clone(), app.state(), host_thread_id, None, None).await;
+        });
     }
 
     /// host：guest 主动召回漫游会话。校验请求者确实是该会话的漫游对端后，

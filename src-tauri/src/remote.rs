@@ -2612,25 +2612,17 @@ fn strip_fire_prefix(input: &str) -> &str {
 
 async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let kind = {
+    {
         let store = state.store.lock().unwrap();
         let thread = store.get(thread_id).ok_or("会话不存在")?;
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
-        thread.agent_kind.clone()
-    };
-    match kind {
-        AgentKind::Lyra => state.lyra.cancel(thread_id).await,
-        AgentKind::Devin => state.acp.cancel(thread_id).await,
-        AgentKind::Kimi => state.kimi.cancel(thread_id).await,
-        AgentKind::Claude => state.claude.cancel(thread_id).await,
-        AgentKind::Codex | AgentKind::CodexPlus => state.codexplus.cancel(thread_id).await,
-        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.cancel(thread_id).await,
-        AgentKind::WorkBuddy => state.workbuddy.cancel(thread_id).await,
-        AgentKind::Unsupported => return Err("已移除后端不可用".into()),
-    };
-    Ok(())
+        if thread.agent_kind == AgentKind::Unsupported {
+            return Err("已移除后端不可用".into());
+        }
+    }
+    crate::cancel_turn(app.clone(), state, thread_id.to_string(), None, None).await
 }
 
 fn basename(path: &str) -> String {

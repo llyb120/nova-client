@@ -13,7 +13,7 @@ use crate::lyra::stage::Stage;
 use crate::settings::Scene;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,8 @@ const ROOT: &str = "/root";
 struct Child {
     /// pending_init / running / completed / errored / interrupted / shutdown
     status: Mutex<(String, Option<String>)>,
-    tasks: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Value>>>,
+    tasks: Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u64, Value)>>>,
+    task_revision: AtomicU64,
     steer: Arc<Mutex<VecDeque<Value>>>,
     cancelled: Arc<AtomicBool>,
     stage: Option<Stage>,
@@ -53,6 +54,7 @@ impl Child {
 #[derive(Default)]
 struct Registry {
     agents: Mutex<HashMap<String, Arc<Child>>>,
+    stopped: AtomicBool,
     changed: tokio::sync::Notify,
 }
 
@@ -63,9 +65,31 @@ pub struct AgentHandle {
     stage_parent: Option<(tauri::AppHandle, String)>,
 }
 
+static REGISTRIES: OnceLock<Mutex<HashMap<String, Arc<Registry>>>> = OnceLock::new();
+
+/// 停止调度器和已排队的工作；后端的停止命令由公共 cancel_turn 并行发出。
+pub(crate) fn stop_for_thread(thread_id: &str) -> Vec<String> {
+    let handle = root_handle(&format!("thread:{thread_id}"));
+    let agents = handle.registry.agents.lock().unwrap();
+    handle.registry.stopped.store(true, Ordering::SeqCst);
+    let mut scenes = Vec::new();
+    for child in agents.values() {
+        let _sender = child.tasks.lock().unwrap();
+        child.task_revision.fetch_add(1, Ordering::SeqCst);
+        child.cancelled.store(true, Ordering::SeqCst);
+        if let Some(id) = child.scene_thread.lock().unwrap().clone() { scenes.push(id); }
+    }
+    handle.registry.changed.notify_waiters();
+    scenes
+}
+
+/// 只有新一轮明确投递的任务才重新开放调度；停止中的旧工具调用不得自行恢复。
+pub(crate) fn resume_for_thread(thread_id: &str) {
+    root_handle(&format!("thread:{thread_id}")).registry.stopped.store(false, Ordering::SeqCst);
+}
+
 // ponytail: 注册表按根会话常驻进程内存、不回收；进程内子 agent 随 close_agent 或进程退出结束，场景子任务可从落盘的 Stage 会话找回。
 pub fn root_handle(session_id: &str) -> AgentHandle {
-    static REGISTRIES: OnceLock<Mutex<HashMap<String, Arc<Registry>>>> = OnceLock::new();
     let registry = REGISTRIES
         .get_or_init(Default::default)
         .lock()
@@ -273,6 +297,7 @@ fn control(handle: &AgentHandle, name: &str, args: &Value) -> Result<Value, Stri
     let target = args.get("target").and_then(Value::as_str).unwrap_or_default();
     let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
     handle.resolve(target).and_then(|(path, child)| {
+        let stop_scene = matches!(name, "interrupt_agent" | "close_agent") && child.active();
         match name {
             "send_message" if child.scene_thread.lock().unwrap().is_some() => {
                 return Err("场景子任务独立闭环，不接收中途插话；需要追加工作请用 followup_task".into());
@@ -284,7 +309,10 @@ fn control(handle: &AgentHandle, name: &str, args: &Value) -> Result<Value, Stri
                 child.steer.lock().unwrap().push_back(user_message(message, &[]));
             }
             "followup_task" => {
-                let sent = child.tasks.lock().unwrap().as_ref().map(|tx| tx.send(user_message(message, &[])));
+                let _agents = handle.registry.agents.lock().unwrap();
+                if handle.registry.stopped.load(Ordering::SeqCst) { return Err("本轮调度已停止，请等待用户继续任务".into()); }
+                let sent = child.tasks.lock().unwrap().as_ref().map(|tx|
+                    tx.send((child.task_revision.load(Ordering::SeqCst), user_message(message, &[]))));
                 if !matches!(sent, Some(Ok(()))) {
                     return Err(format!("{path} is shut down"));
                 }
@@ -307,6 +335,15 @@ fn control(handle: &AgentHandle, name: &str, args: &Value) -> Result<Value, Stri
                 handle.registry.agents.lock().unwrap().remove(&path);
             }
         }
+        if stop_scene {
+            if let (Some((app, _)), Some(thread_id)) = (&handle.stage_parent, child.scene_thread.lock().unwrap().clone()) {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    let _ = crate::cancel_turn(app.clone(), app.state(), thread_id, None, None).await;
+                });
+            }
+        }
         Ok(json!({ "path": path, "status": child.status().0 }))
     })
 }
@@ -322,6 +359,7 @@ fn reserve<'a>(handle: &'a AgentHandle, args: &'a Value) -> Result<(&'a str, &'a
     let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
     let path = format!("{ROOT}/{task_name}");
     let mut agents = handle.registry.agents.lock().unwrap();
+    if handle.registry.stopped.load(Ordering::SeqCst) { return Err("本轮调度已停止，请等待用户继续任务".into()); }
     if handle.lookup(&mut agents, &path).is_some_and(|c| c.status().0 != "shutdown") {
         return Err(format!("{path} already exists; use followup_task or pick another task_name"));
     }
@@ -331,14 +369,15 @@ fn reserve<'a>(handle: &'a AgentHandle, args: &'a Value) -> Result<(&'a str, &'a
     Ok((task_name, message, path, agents))
 }
 
-fn new_child(message: Option<&str>, stage: Option<Stage>, scene_thread: Option<String>) -> Result<(Arc<Child>, tokio::sync::mpsc::UnboundedReceiver<Value>), String> {
+fn new_child(message: Option<&str>, stage: Option<Stage>, scene_thread: Option<String>) -> Result<(Arc<Child>, tokio::sync::mpsc::UnboundedReceiver<(u64, Value)>), String> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     if let Some(message) = message {
-        tx.send(user_message(message, &[])).map_err(|e| e.to_string())?;
+        tx.send((0, user_message(message, &[]))).map_err(|e| e.to_string())?;
     }
     let child = Arc::new(Child {
         status: Mutex::new(("pending_init".into(), None)),
         tasks: Mutex::new(Some(tx)),
+        task_revision: AtomicU64::new(0),
         steer: Arc::new(Mutex::new(VecDeque::new())),
         cancelled: Arc::new(AtomicBool::new(false)),
         stage,
@@ -382,11 +421,21 @@ async fn scene_loop(
     scene: Scene,
     name: String,
     cwd: Option<String>,
-    mut tasks: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    mut tasks: tokio::sync::mpsc::UnboundedReceiver<(u64, Value)>,
     registry: Arc<Registry>,
 ) {
-    while let Some(task) = tasks.recv().await {
-        child.cancelled.store(false, Ordering::SeqCst);
+    while let Some((revision, task)) = tasks.recv().await {
+        {
+            let sender = child.tasks.lock().unwrap();
+            if sender.is_none() { break; }
+            if revision != child.task_revision.load(Ordering::SeqCst) {
+                *child.status.lock().unwrap() = ("interrupted".into(), None);
+                registry.changed.notify_waiters();
+                continue;
+            }
+            child.cancelled.store(false, Ordering::SeqCst);
+            if let Some(id) = child.scene_thread.lock().unwrap().as_deref() { resume_for_thread(id); }
+        }
         *child.status.lock().unwrap() = ("running".into(), None);
         let text = text_content(&task["content"]);
         let mut attempt = 0;
@@ -420,13 +469,14 @@ async fn run_scene_turn(app: &tauri::AppHandle, thread_id: &str, text: &str, can
     use tauri::Manager;
     let state = app.state::<crate::AppState>();
     let before = state.store.lock().unwrap().get(thread_id).map_or(0, |t| t.items.len());
-    crate::dispatch_prompt(app, thread_id.to_string(), text.to_string(), Vec::new())?;
+    if cancelled.load(Ordering::SeqCst) { return Ok(None); }
+    crate::dispatch_scene_prompt(app, thread_id.to_string(), text.to_string(), Vec::new())?;
     let started = Instant::now();
     let mut seen_running = false;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if cancelled.load(Ordering::SeqCst) {
-            let _ = crate::cancel_turn(app.clone(), app.state(), thread_id.to_string(), None, None).await;
+            let _ = crate::cancel_single_turn(app, &state, thread_id.to_string()).await;
             break;
         }
         let running = crate::running_by_id(&state, thread_id);
@@ -505,12 +555,21 @@ fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, 
 fn child_loop(
     child: Arc<Child>,
     mut session: Session,
-    mut tasks: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    mut tasks: tokio::sync::mpsc::UnboundedReceiver<(u64, Value)>,
     registry: Arc<Registry>,
 ) -> BoxFuture<'static, ()> {
     Box::pin(async move {
-        while let Some(task) = tasks.recv().await {
-            session.cancelled.store(false, Ordering::SeqCst);
+        while let Some((revision, task)) = tasks.recv().await {
+            {
+                let sender = child.tasks.lock().unwrap();
+                if sender.is_none() { break; }
+                if revision != child.task_revision.load(Ordering::SeqCst) {
+                    *child.status.lock().unwrap() = ("interrupted".into(), None);
+                    registry.changed.notify_waiters();
+                    continue;
+                }
+                session.cancelled.store(false, Ordering::SeqCst);
+            }
             *child.status.lock().unwrap() = ("running".into(), None);
             if let Some(stage) = &child.stage {
                 stage.begin(&task);
@@ -586,6 +645,42 @@ async fn wait(handle: &AgentHandle, cancelled: Option<&AtomicBool>, args: &Value
 mod tests {
     use super::*;
     use crate::lyra::turn::tests::{scripted_server, test_session, text_reply};
+
+    #[tokio::test]
+    async fn auto_cancel_stops_schedulers_and_discards_queued_work() {
+        let thread_id = "auto-cancel-thread-test";
+        let lyra = root_handle(&format!("thread:{thread_id}"));
+        let mcp = root_handle(&format!("thread:{thread_id}"));
+        let mut children = Vec::new();
+        for handle in [&lyra, &mcp] {
+            let (child, rx) = new_child(Some("must not run"), None, None).unwrap();
+            let path = format!("/root/pending_{}", children.len());
+            handle.registry.agents.lock().unwrap().insert(path, child.clone());
+            children.push((child, rx, handle.registry.clone()));
+        }
+        stop_for_thread(thread_id);
+        assert!(reserve(&mcp, &json!({"task_name":"late", "message":"must not spawn"})).is_err());
+        assert!(control(&mcp, "followup_task", &json!({"target":"pending_0", "message":"must not queue"})).is_err());
+        resume_for_thread(thread_id);
+        assert!(reserve(&mcp, &json!({"task_name":"new_turn", "message":"allowed"})).is_ok());
+        for (child, rx, registry) in children {
+            assert!(child.cancelled.load(Ordering::SeqCst));
+            assert_eq!(child.task_revision.load(Ordering::SeqCst), 1);
+            let url = scripted_server(vec![text_reply("resumed")]).await;
+            let mut session = test_session(url, std::env::temp_dir());
+            session.cancelled = child.cancelled.clone();
+            let worker = tokio::spawn(child_loop(child.clone(), session, rx, registry));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while child.status().0 != "interrupted" { tokio::task::yield_now().await; }
+            }).await.expect("queued work must be discarded without starting a model");
+            child.tasks.lock().unwrap().as_ref().unwrap().send((1, user_message("continue", &[]))).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while child.status().1.as_deref() != Some("resumed") { tokio::task::yield_now().await; }
+            }).await.expect("an explicit followup after stopping must still work");
+            child.tasks.lock().unwrap().take();
+            worker.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn spawned_agent_completes_and_wait_reports_its_message() {

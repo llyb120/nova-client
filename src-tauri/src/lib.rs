@@ -3935,6 +3935,17 @@ pub(crate) fn dispatch_prompt(
     text: String,
     images: Vec<PromptImage>,
 ) -> Result<(), String> {
+    lyra::session::resume_for_thread(&thread_id);
+    dispatch_scene_prompt(app, thread_id, text, images)
+}
+
+/// 调度中的场景任务不能像用户的新消息一样，重新开放已停止的调度器。
+fn dispatch_scene_prompt(
+    app: &tauri::AppHandle,
+    thread_id: String,
+    text: String,
+    images: Vec<PromptImage>,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let text = text.trim().to_string();
     if text.is_empty() && images.is_empty() {
@@ -4226,6 +4237,77 @@ fn truncate_thread(
     Ok(())
 }
 
+/// 仅联动自动场景转交链，不把手动 Stage、普通分支或其他自动任务一起停止。
+fn auto_cancel_thread_ids(threads: &[Thread], thread_id: &str) -> Vec<String> {
+    let automatic: HashMap<&str, &Thread> = threads.iter()
+        .filter(|t| t.auto_scene.is_some() && !t.subagent)
+        .map(|t| (t.id.as_str(), t)).collect();
+    let Some(mut root) = automatic.get(thread_id).map(|t| t.id.as_str()) else {
+        return vec![thread_id.to_string()];
+    };
+    let mut ancestors = HashSet::from([root]);
+    while let Some(parent) = automatic[root].stage_source_thread_id.as_deref().filter(|p| automatic.contains_key(p)) {
+        if !ancestors.insert(parent) { break; }
+        root = parent;
+    }
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for thread in threads.iter().filter(|t| automatic.contains_key(t.id.as_str())) {
+        if let Some(parent) = thread.stage_source_thread_id.as_deref() {
+            children.entry(parent).or_default().push(&thread.id);
+        }
+    }
+    // 先封住上游，再停止下游，防止下游刚接受的任务把已停止的调度器重新打开。
+    let mut ids = vec![root];
+    let mut seen = HashSet::from([root]);
+    let mut index = 0;
+    while index < ids.len() {
+        if let Some(descendants) = children.get(ids[index]) {
+            for &id in descendants {
+                if seen.insert(id) { ids.push(id); }
+            }
+        }
+        index += 1;
+    }
+    ids.into_iter().map(str::to_string).collect()
+}
+
+#[test]
+fn auto_cancel_covers_only_the_connected_scene_chain() {
+    fn thread(id: &str, source: Option<&str>, automatic: bool) -> Thread {
+        let mut t = Thread::new(".".into(), AgentKind::Lyra, None, None, None, false);
+        t.id = id.into();
+        t.stage_source_thread_id = source.map(str::to_string);
+        t.parent_thread_id = source.map(str::to_string);
+        t.auto_scene = automatic.then(|| "coding".into());
+        t
+    }
+    let mut threads = vec![
+        thread("main", None, true),
+        thread("code", Some("main"), true),
+        thread("computer", Some("code"), true),
+        thread("sibling", Some("main"), true),
+        thread("manual", Some("main"), false),
+        thread("other", None, true),
+        thread("readonly", Some("main"), true),
+    ];
+    threads[6].subagent = true;
+    let expected: HashSet<_> = ["main", "code", "computer", "sibling"].map(str::to_string).into();
+    for id in ["main", "code", "computer", "sibling"] {
+        assert_eq!(auto_cancel_thread_ids(&threads, id)[0], "main");
+        assert_eq!(auto_cancel_thread_ids(&threads, id).into_iter().collect::<HashSet<_>>(), expected);
+    }
+    assert_eq!(auto_cancel_thread_ids(&threads, "manual"), ["manual"]);
+    assert_eq!(auto_cancel_thread_ids(&threads, "other"), ["other"]);
+    threads.reverse();
+    let ordered = auto_cancel_thread_ids(&threads, "computer");
+    assert_eq!(ordered[0], "main");
+    assert!(ordered.iter().position(|id| id == "code") < ordered.iter().position(|id| id == "computer"));
+    threads.reverse();
+    // 损坏的父子循环不能使停止操作卡死。
+    threads[0].stage_source_thread_id = Some("computer".into());
+    assert_eq!(auto_cancel_thread_ids(&threads, "code").into_iter().collect::<HashSet<_>>(), expected);
+}
+
 #[tauri::command]
 async fn cancel_turn(
     app: tauri::AppHandle,
@@ -4234,10 +4316,42 @@ async fn cancel_turn(
     _stop_reason: Option<String>,
     _delete_work: Option<bool>,
 ) -> Result<(), String> {
-    // 子 Stage 只有观察用 running，没有可取消的主会话 bridge；不能伪造结束事件。
-    if state.store.lock().unwrap().get(&thread_id).is_some_and(|t| t.subagent) {
-        return Err("子 Agent 执行记录只读，请回主会话调度".into());
+    let mut ids = {
+        let store = state.store.lock().unwrap();
+        // 子 Stage 只有观察用 running，没有可取消的主会话 bridge；不能伪造结束事件。
+        if store.get(&thread_id).is_some_and(|t| t.subagent) {
+            return Err("子 Agent 执行记录只读，请回主会话调度".into());
+        }
+        auto_cancel_thread_ids(&store.threads, &thread_id)
+    };
+    // 不持有 store 锁：场景转交会先锁注册表再访问 store。
+    // 先封住调度和待执行队列，避免停止过程被当成模型失效，再启动其他模型。
+    let mut seen: HashSet<String> = ids.iter().cloned().collect();
+    let mut index = 0;
+    while index < ids.len() {
+        let id = &ids[index];
+        let automatic = state.store.lock().unwrap().get(id).is_some_and(|t| t.auto_scene.is_some());
+        if automatic {
+            // 锁住调度器后再取它的子任务，覆盖最初快照之后刚派出的 Stage。
+            for child in lyra::session::stop_for_thread(id) {
+                if seen.insert(child.clone()) { ids.push(child); }
+            }
+        }
+        index += 1;
     }
+    let targets: Vec<_> = ids.into_iter()
+        .filter(|id| id == &thread_id || running_by_id(&state, id)).collect();
+    let results = futures_util::future::join_all(targets.into_iter()
+        .map(|id| cancel_single_turn(&app, &state, id))).await;
+    // 一个后端停止失败也不能阻止其他后端收到停止请求。
+    results.into_iter().collect()
+}
+
+async fn cancel_single_turn(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    thread_id: String,
+) -> Result<(), String> {
     if state
         .pending_prompt_restores
         .lock()
