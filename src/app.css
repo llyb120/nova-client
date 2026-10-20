@@ -6750,19 +6750,19 @@ button.clue-bar-item:hover,
 
 /* About / update channel: make channel identity and the selected side unmistakable. */
 .update-channel-field { gap: 9px; }
-.update-channel-card { display: flex; align-items: stretch; justify-content: space-between; gap: 18px; padding: 14px; border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border)); border-radius: 12px; background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 7%, var(--panel)), var(--panel)); }
+.update-channel-card { display: flex; align-items: stretch; justify-content: space-between; gap: 18px; padding: 14px; border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border)); border-radius: 12px; background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 7%, var(--bg-panel)), var(--bg-panel)); }
 .update-channel-status { display: flex; align-items: center; min-width: 0; gap: 10px; }
 .update-channel-status > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
 .update-channel-status strong { color: var(--text); font-size: 13px; }
-.update-channel-status span:not(.update-channel-dot) { color: var(--muted); font-size: 11px; line-height: 1.45; }
-.update-channel-dot { width: 10px; height: 10px; flex: 0 0 auto; border: 2px solid color-mix(in srgb, var(--accent) 28%, var(--panel)); border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent), 0 0 14px color-mix(in srgb, var(--accent) 45%, transparent); }
+.update-channel-status span:not(.update-channel-dot) { color: var(--text-muted); font-size: 11px; line-height: 1.45; }
+.update-channel-dot { width: 10px; height: 10px; flex: 0 0 auto; border: 2px solid color-mix(in srgb, var(--accent) 28%, var(--bg-panel)); border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent), 0 0 14px color-mix(in srgb, var(--accent) 45%, transparent); }
 .update-channel-dot.pre-release { background: #c58cff; box-shadow: 0 0 0 4px rgba(197,140,255,.12), 0 0 14px rgba(197,140,255,.45); }
 .update-channel-control { display: grid; width: 270px; flex: 0 0 auto; grid-template-columns: 1fr 1fr; gap: 5px; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--bg) 65%, transparent); }
-.update-channel-control button { display: flex; min-height: 48px; flex-direction: column; align-items: flex-start; justify-content: center; gap: 2px; padding: 7px 11px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font: inherit; text-align: left; transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease; }
+.update-channel-control button { display: flex; min-height: 48px; flex-direction: column; align-items: flex-start; justify-content: center; gap: 2px; padding: 7px 11px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text-muted); cursor: pointer; font: inherit; text-align: left; transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease; }
 .update-channel-control button span { font-size: 12px; font-weight: 700; }
 .update-channel-control button small { font-size: 10px; opacity: .75; }
-.update-channel-control button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
-.update-channel-control button.active { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: color-mix(in srgb, var(--accent) 18%, var(--panel)); color: var(--accent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 14%, transparent), 0 3px 10px color-mix(in srgb, var(--accent) 10%, transparent); }
+.update-channel-control button:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+.update-channel-control button.active { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: color-mix(in srgb, var(--accent) 18%, var(--bg-panel)); color: var(--accent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 14%, transparent), 0 3px 10px color-mix(in srgb, var(--accent) 10%, transparent); }
 .update-channel-control button:disabled { cursor: wait; opacity: .6; }
 @media (max-width: 760px) { .update-channel-card { flex-direction: column; } .update-channel-control { width: 100%; } }
 
