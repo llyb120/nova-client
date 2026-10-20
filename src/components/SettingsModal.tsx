@@ -213,21 +213,22 @@ export type SettingsTab =
   | "env"
   | "about";
 
-const TABS: { id: SettingsTab; name: string }[] = [
-  { id: "general", name: "通用" },
-  { id: "scenes", name: "场景模型" },
-  { id: "meteor", name: "Meteor" },
-  { id: "jianlai", name: "剑来" },
-  { id: "advanced", name: "高级" },
-  { id: "lyra", name: "Lyra" },
-  { id: "backends", name: "模型后端" },
-  { id: "instructions", name: "Agent 配置" },
-  { id: "appearance", name: "外观" },
-  { id: "team", name: "团队" },
-  { id: "worktree", name: "Worktree" },
-  { id: "skills", name: "Skills" },
-  { id: "env", name: "环境变量" },
-  { id: "about", name: "关于" },
+// 左侧导航按用途分组，同类设置挨在一起；group 为空的项单独成段（如「关于」）。
+const TABS: { id: SettingsTab; name: string; group: string }[] = [
+  { id: "general", name: "通用", group: "常规" },
+  { id: "appearance", name: "外观", group: "常规" },
+  { id: "advanced", name: "高级", group: "常规" },
+  { id: "env", name: "环境变量", group: "常规" },
+  { id: "scenes", name: "场景模型", group: "模型与 Agent" },
+  { id: "lyra", name: "Lyra", group: "模型与 Agent" },
+  { id: "backends", name: "模型后端", group: "模型与 Agent" },
+  { id: "instructions", name: "Agent 配置", group: "模型与 Agent" },
+  { id: "skills", name: "Skills", group: "模型与 Agent" },
+  { id: "meteor", name: "Meteor", group: "工具与协作" },
+  { id: "jianlai", name: "剑来", group: "工具与协作" },
+  { id: "worktree", name: "Worktree", group: "工具与协作" },
+  { id: "team", name: "团队", group: "工具与协作" },
+  { id: "about", name: "关于", group: "" },
 ];
 
 // 首次运行引导：第 1 步配置后端（含 Lyra），第 2 步配置场景模型。
@@ -1058,19 +1059,25 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           </Show>
         </div>
 
-        <div class="settings-tabs">
+        <nav class="settings-tabs" aria-label="设置分类">
           <For each={visibleTabs()}>
-            {(t) => (
-              <button
-                type="button"
-                classList={{ "settings-tab": true, active: tab() === t.id }}
-                onClick={() => setTab(t.id)}
-              >
-                {t.name}
-              </button>
+            {(t, i) => (
+              <>
+                <Show when={i() === 0 || visibleTabs()[i() - 1].group !== t.group}>
+                  <div class="settings-tab-group" classList={{ gap: !t.group }}>{t.group}</div>
+                </Show>
+                <button
+                  type="button"
+                  classList={{ "settings-tab": true, active: tab() === t.id }}
+                  aria-current={tab() === t.id ? "page" : undefined}
+                  onClick={() => setTab(t.id)}
+                >
+                  {t.name}
+                </button>
+              </>
             )}
           </For>
-        </div>
+        </nav>
 
         <div class="modal-body">
           <Show when={props.onboarding}>
