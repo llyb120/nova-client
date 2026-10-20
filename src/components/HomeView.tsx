@@ -986,7 +986,7 @@ export function HomeView() {
           </div>
           <div class="composer-bar">
             <label class="pill composer-auto" title="以轻量化模型开局，按需把编码或剑来工作交给对应场景模型（设置 → 场景模型）">
-              <input type="checkbox" checked={auto()} onChange={(e) => toggleAuto(e.currentTarget.checked)} />
+              <input type="checkbox" role="switch" checked={auto()} onChange={(e) => toggleAuto(e.currentTarget.checked)} />
               自动模式
             </label>
             <Show when={!auto()}>
