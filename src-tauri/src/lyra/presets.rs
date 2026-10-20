@@ -280,7 +280,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         // 转换规则升级：旧缓存缺少模型私有参数，不能继续沿用六小时。
         let headers = provider["options"]["headers"].to_string();
         let local_models = if local_source(preset.id).is_some() { provider["models"].to_string() } else { String::new() };
-        let print = fingerprint(&["8", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
+        let print = fingerprint(&["9", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
         if !force && cache_fresh(&cache[id.as_str()], &print, now) {
             continue;
         }
@@ -434,6 +434,8 @@ fn npm_api(npm: &str) -> Option<&'static str> {
 /// /models 列表 + 可选 models.dev provider 条目 → Lyra models 配置。
 /// 有 models.dev 时只保留它认识的模型（滤掉嵌入、绘图等非对话模型），/models 不可用则整份采用。
 fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_id: &str) -> Map<String, Value> {
+    // 兼容端点也优先使用自身的目录条目；其他渠道的输出上限不代表当前端点。
+    let meta = meta.or_else(|| catalog.and_then(|all| all.get(preset_id)));
     let known = meta.and_then(|m| m["models"].as_object());
     let provider_npm = meta.and_then(|m| m["npm"].as_str()).unwrap_or("");
     let null = Value::Null;
@@ -834,6 +836,37 @@ env_key = "TEST_KEY"
             "api": "anthropic-messages", "name": "M3",
             "options": { "requiresReasoningContentOnAssistantMessages": true },
         }}));
+    }
+
+    #[test]
+    fn compatible_provider_uses_its_own_output_limit_before_cross_provider_catalog() {
+        let id = "deepseek/deepseek-v4.1-flash";
+        let catalog = json!({
+            "deepseek": { "models": { "deepseek-v4.1-flash": {
+                "limit": { "context": 1_048_576, "output": 1_048_576 }
+            } } },
+            "commandcode": { "models": { id: {
+                "canonical_model_id": "deepseek/deepseek-v4.1-flash",
+                "limit": { "context": 1_000_000, "output": 384_000 },
+                "reasoning": true, "reasoning_options": [{ "type": "effort", "values": ["high"] }]
+            } } }
+        });
+        let mut list = json!({ "data": [{ "id": id, "context_length": 1_000_000,
+            "supported_endpoints": ["/chat/completions"] }] });
+        let models = convert(&list, None, Some(&catalog), "commandcode");
+        assert_eq!(models[id]["limit"], json!({ "context": 1_000_000, "output": 384_000 }));
+        assert!(models[id].get("api").is_none(), "catalog must not switch the live endpoint's protocol");
+        assert_eq!(models[id]["variants"]["high"]["reasoningEffort"], "high");
+        let config = json!({ "provider": { "cc": { "api": DEFAULT_API, "options": { "baseURL": "https://api.commandcode.ai/provider/v1" }, "models": models } } });
+        let resolved = super::super::config::resolve_model(&config, Some(&format!("cc/{id}")), &Default::default()).unwrap();
+        assert_eq!(resolved.model.context_window, 1_000_000);
+        assert_eq!(resolved.model.max_output_tokens, 384_000);
+        // /models 的显式值仍优先，不能被目录中的旧上限压低。
+        list["data"][0]["top_provider"] = json!({ "max_completion_tokens": 393_216 });
+        assert_eq!(convert(&list, None, Some(&catalog), "commandcode")[id]["limit"]["output"], 393_216);
+        assert_eq!(convert(&list, None, Some(&catalog), "unknown")[id]["limit"]["output"], 393_216);
+        list["data"][0].as_object_mut().unwrap().remove("top_provider");
+        assert_eq!(convert(&list, None, Some(&catalog), "unknown")[id]["limit"]["output"], 1_048_576);
     }
 
     #[test]
