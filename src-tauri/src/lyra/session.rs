@@ -118,7 +118,7 @@ pub fn is_agent_tool(name: &str) -> bool {
 fn scene_param(handoff: &[Scene]) -> (String, Value) {
     let scenes = handoff.iter().map(|s| format!("{}={}（{}）", s.key(), s.label(), s.when())).collect::<Vec<_>>().join("；");
     (
-        " Auto mode: when a whole chunk of work fits one of the scene options, pass scene to hand it off to that scene's model in its own Stage session (it sees this conversation and closes the loop itself); then wait_agent for the final result instead of directing it step by step. To continue or correct an existing scene agent (even from an earlier turn), use followup_task on its task_name instead of spawning another.".into(),
+        " Auto mode: when a whole chunk of work fits one of the scene options, pass scene to hand it off to that scene's model in its own Stage session (it sees this conversation and closes the loop itself); then wait_agent for the final result instead of directing it step by step. If the result says escalated, this session itself switches to that scene's model after your turn: tell the user in one sentence and end the turn instead of wait_agent. To continue or correct an existing scene agent (even from an earlier turn), use followup_task on its task_name instead of spawning another.".into(),
         json!({ "type": "string", "enum": handoff.iter().map(|s| s.key()).collect::<Vec<_>>(), "description": format!("optional handoff scene: {scenes}. Omit for an in-process helper on this model.") }),
     )
 }
@@ -394,6 +394,13 @@ fn scene_spawn(handle: &AgentHandle, app: &tauri::AppHandle, parent_id: &str, ar
         .and_then(Scene::parse)
         .ok_or("scene must be lightweight, coding or computer")?;
     let cwd = args.get("cwd").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
+    {
+        use tauri::Manager;
+        let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
+        if crate::request_escalation(&app.state(), parent_id, scene, cwd.as_deref(), message)? {
+            return Ok(json!({ "ok": true, "escalated": true, "next": "已登记切换为编码模型：本轮结束后本会话会切换到编码模型，带着全部上下文按 message 继续。现在用一句话告诉用户马上开始动手，然后立即结束本轮；不要再调用工具，也不要 wait_agent。" }));
+        }
+    }
     let (task_name, message, path, mut agents) = reserve(handle, args)?;
     let Some(thread_id) = crate::create_scene_stage(app, parent_id, scene, task_name, cwd.as_deref(), 0)? else {
         return Ok(json!({ "ok": false, "next": "该场景的模型与当前会话相同，不要转交，直接在本会话完成。" }));

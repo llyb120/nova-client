@@ -4733,6 +4733,18 @@ impl AcpManager {
         Ok(json!([server]))
     }
 
+    /// 空闲线程换目录：等旧连接关掉并解除挂载（保留 acp_session_id），下次发送在新目录经 session/load 续接。
+    pub async fn release_thread_conn(&self, thread_id: &str) {
+        self.unmount_thread_sessions(thread_id);
+        let key = self.conn_key_for_thread(thread_id);
+        if let Some(slot) = self.slot_opt(&key) {
+            if let Some(conn) = slot.lock().await.take() {
+                conn.kill();
+            }
+        }
+        self.slots.lock().unwrap().remove(&key);
+    }
+
     pub fn forget_session_of_thread(self: &Arc<Self>, thread_id: &str) {
         self.routes
             .lock()
