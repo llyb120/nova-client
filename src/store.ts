@@ -1417,6 +1417,8 @@ export async function createThread(
 
 /** 待创建会话的占位 id 前缀：永不落库，仅用于乐观进入聊天页。 */
 export const PENDING_THREAD_PREFIX = "__pending__";
+/** 乐观会话交接：真实 id → 占位 id。交接只是换名，界面不能当作切会话清屏重排。 */
+export const optimisticHandoffs = new Map<string, string>();
 
 export function isPendingThreadId(id: string | null | undefined): boolean {
   return !!id && id.startsWith(PENDING_THREAD_PREFIX);
@@ -1563,6 +1565,7 @@ export function createThreadOptimistic(
       }
       // 用户可能已切走：仅在仍停留在该占位会话时才接管界面。
       if (state.currentId === pendingId) {
+        optimisticHandoffs.set(t.id, pendingId);
         setState({
           currentId: t.id,
           items: t.items,

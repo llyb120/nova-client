@@ -9,7 +9,7 @@ import { clearCanvasChatSelection, setCanvasChatSelection } from "../chatSelecti
 import { api, fileUriPath } from "../ipc";
 import { linkedFile, openWorkspaceFile as openInEditor } from "../workspaceLinks";
 import { localImagePath, transcriptImageSrc } from "../transcriptImage";
-import { editUserMessage, expandedRevision, isExpanded, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
+import { editUserMessage, expandedRevision, isExpanded, optimisticHandoffs, state, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { visibleGroupRange, groupAtY } from "../transcriptViewport";
 import { LruMap } from "../lruMap";
 import { promptDisplayOf } from "../promptDisplay";
@@ -3941,6 +3941,9 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     void props.preview;
     void props.emptyHint;
     void editing()?.id;
+    // 乐观新建会话拿到真实 id 只是换名：沿用已解码图片和当前画面。若按切会话处理，
+    // 交接瞬间的空 items 会先清屏，等图片重新解码后消息才再出现（闪一下）。
+    if (threadId && renderedThreadId && optimisticHandoffs.get(threadId) === renderedThreadId) renderedThreadId = threadId;
     const switchedThread = threadId !== renderedThreadId;
     const warmSwitch = switchedThread && groups.length > 0;
     if (switchedThread) waitingForInitialSnapshot = groups.length === 0;

@@ -10,15 +10,17 @@ try {
   await writeFile(`${name}.html`, `<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
 import { render } from 'solid-js/web';
-import { createEffect, createSignal } from 'solid-js';
+import { batch, createEffect, createSignal } from 'solid-js';
 import { CanvasTranscript } from './src/components/CanvasTranscript';
 import { prewarmAttachmentImages } from './src/components/ImageAttachmentStrip';
+import { optimisticHandoffs } from './src/store';
 import './src/app.css';
 const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400"><rect width="800" height="400" fill="blue"/></svg>';
 const image = {name:'pic',mimeType:'image/svg+xml',data:btoa(svg),size:svg.length};
 const hist = Array.from({length:40},(_,i)=>({user:{type:'user',id:i*3+1,text:'q'+i,images:[],ts:0},
   body:[{type:'assistant',id:i*3+2,text:'answer '.repeat(80),ts:0}],turn:{type:'turn',id:i*3+3,ts:0,stopReason:'end'}}));
 const [groups, setGroups] = createSignal(hist);
+const [tid, setTid] = createSignal('t');
 let handle; window.frames = [];
 const clear = CanvasRenderingContext2D.prototype.clearRect, fill = CanvasRenderingContext2D.prototype.fillText;
 const mine = c => c.canvas.classList.contains('transcript-canvas-only');
@@ -30,10 +32,22 @@ window.send = (text = 'new message') => {
   setGroups([...groups(), {user:{type:'user',id:-groups().length,text,images:[{...image}],ts:1},body:[],turn:{type:'turn',id:-1000-groups().length,ts:0,stopReason:'end'}}]);
   document.getElementById('fx').style.height = '680px';
 };
+// 首页乐观新建：占位会话拿到真实 id 时 items 会先清空、微任务内再补回乐观消息。
+const hsvg = svg.replace('blue', 'green');
+const himage = {name:'h',mimeType:'image/svg+xml',data:btoa(hsvg),size:hsvg.length};
+const hmsg = id => ({user:{type:'user',id,text:'handoff message',images:[{...himage}],ts:1},body:[],turn:{type:'turn',id:id-1000,ts:0,stopReason:'end'}});
+window.attachHandoff = () => prewarmAttachmentImages([himage]);
+window.enterPending = () => { setTid('__pending__x'); setGroups([hmsg(-5)]); };
+window.handoff = () => {
+  window.frames = [];
+  optimisticHandoffs.set('real', '__pending__x');
+  batch(() => { setTid('real'); setGroups([]); });
+  queueMicrotask(() => setGroups([hmsg(-6)]));
+};
 render(() => {
   createEffect(() => { groups(); queueMicrotask(() => handle?.scrollToBottom()); });
   return <div id="fx" style="height:600px;width:900px;display:flex"><CanvasTranscript ref={v=>handle=v}
-    threadId="t" groups={groups()} loading={false} permissions={[]}
+    threadId={tid()} groups={groups()} loading={false} permissions={[]}
     running={true} preview={false} onReturnToCurrent={()=>{}} emptyHint="empty"/></div>;
 },document.getElementById('root'));
 `);
@@ -74,6 +88,15 @@ render(() => {
   await page.waitForFunction(() => window.frames.at(-1)?.texts.includes("second message"), null, { timeout: 2000 });
   assert.ok((await page.evaluate(() => window.frames)).every(frame => frame.texts.length > 0),
     "Jumping to an unlaid-out bottom must keep the old pixels instead of painting a blank frame");
+  await page.evaluate(() => window.attachHandoff());
+  await page.waitForTimeout(200);
+  await page.evaluate(() => window.enterPending());
+  await page.waitForFunction(() => window.frames.at(-1)?.texts.includes("handoff message"), null, { timeout: 2000 });
+  await page.waitForTimeout(200);
+  await page.evaluate(() => window.handoff());
+  await page.waitForTimeout(500);
+  assert.ok((await page.evaluate(() => window.frames)).every(frame => frame.texts.includes("handoff message")),
+    "Optimistic thread handoff must not clear the sent image message and repaint it after decoding");
   assert.deepEqual(errors, []);
   console.log("Canvas send image regression passed");
 } finally {
