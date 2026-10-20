@@ -218,6 +218,31 @@ test('incognito permission, window isolation and tab filtering',async()=>{
   await assert.rejects(run('open',{incognito:'true'}),/boolean/);
 });
 
+test('miniapp launches carry the sender tab stable tag, never an active or message-provided target',async()=>{
+  const event=()=>({addListener(){}}), posts=[];
+  const source={id:11,url:'https://example.com/work/1',title:'Work',active:false};
+  let tabs=[source,{id:22,url:source.url,title:source.title,active:true}];
+  const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>tabs,onRemoved:event(),onReplaced:event(),onUpdated:event()},
+    debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={inventory,launchMiniapp,instances};',scope);
+  const initial=await scope.api.inventory();
+  scope.api.instances.set('fixture',async(path,body)=>{posts.push({path,body});return {ok:true};});
+  const message={origin:'fixture',appId:'app',tabTag:initial[1].tag,url:'https://wrong.example/'};
+  await scope.api.launchMiniapp(message,source);
+  await scope.api.launchMiniapp(message,source);
+  assert.equal(posts.length,2);
+  for(const {path,body} of posts){
+    assert.equal(path,'/miniapp/launch');
+    assert.equal(body.tabTag,initial[0].tag);
+    assert.equal(body.url,source.url);
+    assert.equal(body.title,source.title);
+  }
+  tabs=tabs.filter(tab=>tab.id!==source.id);
+  await assert.rejects(scope.api.launchMiniapp(message,source),/标签页已关闭/);
+  assert.equal(posts.length,2,'a disappeared source must not fall back to its same-URL sibling');
+});
+
 test('miniapp page patterns match the whole URL with * as the only wildcard',async()=>{
   const event=()=>({addListener(){}});
   const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>[],onRemoved:event(),onReplaced:event(),onUpdated:event()},

@@ -44,6 +44,20 @@ pub(crate) fn browser_triggers() -> Value {
     serde_json::to_value(&*TRIGGERS.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or_default()
 }
 
+fn browser_context(body: &Value) -> Result<Value, String> {
+    let url = body["url"].as_str()
+        .filter(|u| u.len() <= 8192 && (u.starts_with("http://") || u.starts_with("https://")))
+        .ok_or("网页地址无效")?;
+    let title: String = body["title"].as_str().unwrap_or_default().chars().take(1000).collect();
+    // Older extensions omit the tag; keep it unknown rather than choosing an active tab.
+    let tag = body.get("tabTag");
+    if tag.is_some_and(|value| !value.as_str().is_some_and(|s| s.len() <= 80 && s.starts_with('C')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))) {
+        return Err("启动网页的 tabTag 无效，请更新并重新加载 Nova Chrome 扩展".into());
+    }
+    Ok(json!({"url": url, "title": title, "tabTag": tag}))
+}
+
 /// A user click on the Chrome page icon: remember the page, then open the app window.
 pub(crate) async fn browser_launch(app: &AppHandle, body: &Value) -> Result<(), String> {
     let app_id = body["appId"].as_str().unwrap_or_default().to_string();
@@ -51,11 +65,7 @@ pub(crate) async fn browser_launch(app: &AppHandle, body: &Value) -> Result<(), 
     if !TRIGGERS.lock().map_err(|_| "网页激活锁不可用")?.iter().any(|t| t.app_id == app_id) {
         return Err("该应用未发布网页激活配置".into());
     }
-    let url = body["url"].as_str()
-        .filter(|u| u.len() <= 8192 && (u.starts_with("http://") || u.starts_with("https://")))
-        .ok_or("网页地址无效")?;
-    let title: String = body["title"].as_str().unwrap_or_default().chars().take(1000).collect();
-    let context = json!({"url": url, "title": title});
+    let context = browser_context(body)?;
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || launch(&handle, id, &app_id, context)).await.map_err(|e| e.to_string())?
 }
@@ -242,6 +252,18 @@ mod tests {
         }
         let json: BrowserTrigger = serde_json::from_value(json!({"appId": APP, "name": "a", "match": ["https://a/*"]})).unwrap();
         assert_eq!(serde_json::to_value(json).unwrap()["match"][0], "https://a/*");
+    }
+
+    #[test]
+    fn browser_context_keeps_the_source_tag_and_supports_older_extensions_without_guessing() {
+        let mut body = json!({"url":"https://example.com/work/1", "title":"Work", "tabTag":"C2-abc123"});
+        assert_eq!(browser_context(&body).unwrap(), body);
+        body.as_object_mut().unwrap().remove("tabTag");
+        assert!(browser_context(&body).unwrap()["tabTag"].is_null());
+        for tag in [json!(123), json!(null), json!(""), json!("C1\nother"), json!("tab-1"), json!("C".repeat(81))] {
+            body["tabTag"] = tag;
+            assert!(browser_context(&body).is_err());
+        }
     }
 
     #[test]

@@ -162,7 +162,10 @@ async function miniappMatches(url) {
 async function launchMiniapp(message, tab) {
   const post = instances.get(message.origin);
   if (!post || !tab) throw Error('Nova 未连接');
-  const response = await post('/miniapp/launch', {appId: message.appId, url: tab.url, title: tab.title || ''});
+  await inventory();
+  const tabTag = model.tabs[tab.id]?.tag;
+  if (!tabTag) throw Error('启动应用的标签页已关闭，请重新打开页面');
+  const response = await post('/miniapp/launch', {appId: message.appId, url: tab.url, title: tab.title || '', tabTag});
   if (!response.ok) throw Error((await response.json().catch(() => ({}))).error || `HTTP ${response.status}`);
   return {ok: true};
 }

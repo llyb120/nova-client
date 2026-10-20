@@ -52,10 +52,10 @@ function mount(t, items, overrides = {}, props = {}) {
     },
     batch: fn => fn(), createMemo: fn => fn, createEffect: fn => effects.push(fn),
     onMount: fn => mounts.push(fn), onCleanup: fn => cleanups.push(fn),
-    window: { addEventListener() {}, removeEventListener() {}, setInterval: () => 1, clearInterval() {} },
+    window: { addEventListener() {}, removeEventListener() {}, setInterval: () => 1, clearInterval() {}, setTimeout, clearTimeout },
     state: { permissions: [], settings: {} },
     sceneModel: () => ({ agentKind: 'lyra', model: 'mock-model' }),
-    getCurrentWindow: () => ({ setTitle: async title => { titles.push(title); } }),
+    getCurrentWindow: () => ({ setTitle: async title => { titles.push(title); }, onCloseRequested: async () => () => {} }),
     listen: (event, handler) => {
       listeners.set(event, handler);
       return Promise.resolve(() => listeners.delete(event));
@@ -70,7 +70,11 @@ function mount(t, items, overrides = {}, props = {}) {
   for (const [target, names] of [[dependencies, ['invoke', 'sceneModel', 'sendPromptTo', 'openThread', 'refreshThreads']], [dependencies.api, Object.keys(dependencies.api)]]) {
     for (const name of names) {
       const original = target[name];
-      target[name] = (...args) => { calls.push(name === 'invoke' ? args[0] : name); return original(...args); };
+      target[name] = (...args) => {
+        if (name === 'invoke' && args[0] === 'miniapp_take_launch') return Promise.resolve(overrides.launch?.() ?? null);
+        calls.push(name === 'invoke' ? args[0] : name);
+        return original(...args);
+      };
     }
   }
   const view = new Function(...Object.keys(dependencies), compiled)(...Object.values(dependencies));
@@ -493,6 +497,65 @@ test('missing or unpublished runtime apps report an error without selecting or c
     assert.equal(view.doc(), undefined);
     assert.deepEqual(view.persisted(), [entry]);
     assert.deepEqual(view.calls, []);
+  });
+});
+
+test('page launches supply tabTag without field bindings, keep it for later actions and replace only on accepted launches', async t => {
+  for (const automatic of [false, true]) await t.test(automatic ? 'automatic action' : 'manual action', async t => {
+    const entry = saved({ published: clone(model.DEMO_APP) });
+    entry.published.browser = { match: ['https://example.com/*'], ...(automatic ? { actionId: 'draft' } : {}) };
+    entry.published.pages[1].blocks.find(block => block.id === 'tasks').value = 'Runtime input';
+    const first = { url: 'https://example.com/work/1', title: 'Work "data"', tabTag: 'C1-source' };
+    const second = { ...first, tabTag: 'C2-other' };
+    let launch = first;
+    const sent = [];
+    const view = mount(t, [entry], {
+      launch: () => { const context = launch; launch = null; return context; },
+      invoke: async command => {
+        assert.equal(command, 'miniapp_scene_model');
+        return { agentKind: 'lyra', model: 'runtime-model' };
+      },
+      api: { sendPrompt: async (_id, prompt, images) => { sent.push({ prompt, images }); },
+        listThreads: async () => [{ id: 'mock-thread', running: false }],
+        getThreadView: async () => ({ items: [answer('done'), turn()] }) },
+    }, { runtimeAppId: entry.id });
+    await settle();
+    if (!automatic) view.activate('draft');
+    await settle();
+    assert.equal(sent.length, 1, view.error());
+    assert.ok(sent[0].prompt.includes(JSON.stringify(first)));
+    assert.match(sent[0].prompt, /必须携带上面的 tabTag/);
+    assert.equal(view.values().tasks, 'Runtime input', 'source context does not overwrite user fields');
+    assert.deepEqual(sent[0].images, []);
+
+    launch = second;
+    view.emit('miniapp:launch');
+    await settle();
+    assert.match(view.error(), /正在执行/);
+    assert.equal(sent.length, 1, 'a busy launch does not run or change the current source');
+    await view.pollRun();
+    view.activate('draft');
+    await settle();
+    assert.ok(sent.at(-1).prompt.includes(JSON.stringify(first)), 'later actions retain the original page');
+    await view.pollRun();
+
+    for (const context of [second, { url: first.url, title: first.title }, {}]) {
+      launch = context;
+      view.emit('miniapp:launch');
+      await settle();
+      if (!view.locked()) view.activate('draft');
+      await settle();
+      const prompt = sent.at(-1).prompt;
+      assert.doesNotMatch(prompt, /C1-source/);
+      if (context.tabTag) assert.ok(prompt.includes(JSON.stringify(second)));
+      else if (context.url) {
+        assert.match(prompt, /当前扩展未提供 tabTag/);
+        assert.match(prompt, /不得猜测当前激活页/);
+        assert.doesNotMatch(prompt, /C2-other/);
+      } else assert.doesNotMatch(prompt, /启动网页上下文|C2-other/);
+      await view.pollRun();
+    }
+    assert.doesNotMatch(view.storage.getItem(KEY), /C1-source|C2-other/, 'source identity is launch-local, never an app setting');
   });
 });
 
