@@ -75,6 +75,7 @@ nova-image-*.png
 
 # bench scratch
 bench/work/
+bench/webview-probe/
 bench/results-*.json
 
 icon-work/**
