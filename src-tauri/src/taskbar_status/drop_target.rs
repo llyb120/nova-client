@@ -30,10 +30,10 @@ const MAX_PATH_UNITS: usize = MAX_PATH_BYTES;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 const MAX_TEXT_UNITS: usize = MAX_TEXT_BYTES;
 const MAX_FILE_BYTES: usize = size_of::<DROPFILES>() + (MAX_FILES * (MAX_PATH_UNITS + 1) + 1) * 2;
-const INVALID_DATA: &str = "拖入内容为空、格式无效或无法读取；星屑未保存。";
-const FILE_LIMIT: &str = "一次最多拖入 16 个文件；星屑未保存，未截断文件列表。";
-const PATH_LIMIT: &str = "文件路径无效或超过 8192 字节（UTF-8）；星屑未保存。";
-const TEXT_LIMIT: &str = "拖入文本上限为 256 KiB（UTF-8）；星屑未保存，未截断文本。";
+const INVALID_DATA: &str = "拖入内容为空、格式无效或无法读取；星尘未保存。";
+const FILE_LIMIT: &str = "一次最多拖入 16 个文件；星尘未保存，未截断文件列表。";
+const PATH_LIMIT: &str = "文件路径无效或超过 8192 字节（UTF-8）；星尘未保存。";
+const TEXT_LIMIT: &str = "拖入文本上限为 256 KiB（UTF-8）；星尘未保存，未截断文本。";
 
 static HOVER_REVISION: AtomicU64 = AtomicU64::new(0);
 // ponytail: serialize this one chip's UI workers so a slow Enter cannot reopen a panel after
@@ -149,7 +149,7 @@ impl IDropTarget_Impl for Target_Impl {
         let allowed = copy_effect(*effect, true);
         *effect = DROPEFFECT_NONE;
         let copied = if allowed == DROPEFFECT_NONE {
-            Err("拖动来源不允许复制；星屑未保存。")
+            Err("拖动来源不允许复制；星尘未保存。")
         } else {
             data.as_ref().ok_or(INVALID_DATA).and_then(|data| copy_data(data, self.urls))
         };
@@ -218,7 +218,7 @@ fn bytes(data: &IDataObject, format: u16, limit: usize, oversized: &'static str)
 
 fn copy_data(data: &IDataObject, urls: [u16; 2]) -> std::result::Result<(String, Vec<String>), &'static str> {
     // Explorer's text representation is redundant: prefer its actual file list.
-    if let Some(bytes) = bytes(data, CF_HDROP.0, MAX_FILE_BYTES, "文件列表数据超过原生读取上限；星屑未保存。")? {
+    if let Some(bytes) = bytes(data, CF_HDROP.0, MAX_FILE_BYTES, "文件列表数据超过原生读取上限；星尘未保存。")? {
         return Ok((String::new(), file_paths(&bytes)?));
     }
     for (format, unicode) in [(CF_UNICODETEXT.0, true), (urls[0], true), (urls[1], false)] {
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(wide_paths(&path), Err(PATH_LIMIT));
         assert_eq!(text_payload(&[0xd800, 0]), Err(INVALID_DATA));
         for error in [INVALID_DATA, FILE_LIMIT, PATH_LIMIT, TEXT_LIMIT] {
-            assert!(error.contains("星屑未保存"));
+            assert!(error.contains("星尘未保存"));
         }
     }
 

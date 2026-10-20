@@ -34,7 +34,7 @@ type Tab = "assistant" | "session" | "capsules" | "quick";
 const TABS: [Tab, string, string][] = [
   ["assistant", "助理", "M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1L5 10.5l5.1-1.9zM18.5 15.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"],
   ["session", "会话", "M5.5 5h13A1.5 1.5 0 0120 6.5v8a1.5 1.5 0 01-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 014 14.5v-8A1.5 1.5 0 015.5 5zM8.5 10.5h7"],
-  ["capsules", "星屑", "M12 3.8l2.5 5.1 5.6.8-4 4 .9 5.6-5-2.6-5 2.6.9-5.6-4-4 5.6-.8z"],
+  ["capsules", "星尘", "M12 3.8l2.5 5.1 5.6.8-4 4 .9 5.6-5-2.6-5 2.6.9-5.6-4-4 5.6-.8z"],
   ["quick", "快捷", "M5 4.5h4.5A.5.5 0 0110 5v4.5a.5.5 0 01-.5.5H5a.5.5 0 01-.5-.5V5a.5.5 0 01.5-.5zM14.5 4.5H19a.5.5 0 01.5.5v4.5a.5.5 0 01-.5.5h-4.5a.5.5 0 01-.5-.5V5a.5.5 0 01.5-.5zM5 14h4.5a.5.5 0 01.5.5V19a.5.5 0 01-.5.5H5a.5.5 0 01-.5-.5v-4.5A.5.5 0 015 14zM14.5 14H19a.5.5 0 01.5.5V19a.5.5 0 01-.5.5h-4.5a.5.5 0 01-.5-.5v-4.5a.5.5 0 01.5-.5z"],
 ];
 const clock = (ms = 0) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
@@ -112,7 +112,7 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
       <div class="tb-panel-main">
         <header class="tb-head">
           <Butterfly />
-          <span class="tb-state">{props.tab === "assistant" ? "Nova 助理" : props.tab === "capsules" ? "星屑" : LABEL[props.card?.kind ?? "idle"]}</span>
+          <span class="tb-state">{props.tab === "assistant" ? "Nova 助理" : props.tab === "capsules" ? "星尘" : LABEL[props.card?.kind ?? "idle"]}</span>
           <Show when={props.tab === "session" && props.card?.trailing}>
             <span class="tb-time">{props.card?.trailing}</span>
           </Show>
@@ -351,7 +351,7 @@ export default function TaskbarBubble() {
     setDragging(false);
     const data = event.dataTransfer;
     if (!data) return;
-    if (capturing()) { setCaptureError("上一份星屑仍在保存，请完成后重新拖入。"); return; }
+    if (capturing()) { setCaptureError("上一份星尘仍在保存，请完成后重新拖入。"); return; }
     // Snapshot while the drag data is readable. Wry's native handler is disabled on this
     // WebView so text, links and files all arrive here once; the chip still uses native OLE.
     const files = Array.from(data.files);
@@ -478,8 +478,8 @@ export default function TaskbarBubble() {
       onDragOver={(event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = "copy"; setDragging(true); }}
       onDragLeave={(event) => { if (!shell.contains(event.relatedTarget as Node | null)) setDragging(false); }}
       onDrop={(event) => void capture(event)}>
-      <Show when={dragging()}><div class="tb-capsule-drop" role="status"><span>✦</span><strong>松手，收好这一刻</strong><small>文字、链接、文件 · 收集成星屑</small></div></Show>
-      <Show when={capturing()}><div class="tb-capture-progress" role="status">正在收好星屑…</div></Show>
+      <Show when={dragging()}><div class="tb-capsule-drop" role="status"><span>✦</span><strong>松手，收好这一刻</strong><small>文字、链接、文件 · 收集成星尘</small></div></Show>
+      <Show when={capturing()}><div class="tb-capture-progress" role="status">正在收好星尘…</div></Show>
       <Show when={captureError()}><div class="tb-capture-error" role="alert">{captureError()}<button aria-label="关闭错误提示" onClick={() => setCaptureError("")}>×</button></div></Show>
       <Panel card={cards[0]} data={panel()} tab={tab()} setTab={setTab} active={active()} focusRequest={focusRequest()} permissionCount={permissions().length} onClose={() => cards[0] ? dismiss(cards[0]) : hide()} reload={() => void load()} session={
       <For each={cards} fallback={<div class="tb-activity">暂无会话</div>}>

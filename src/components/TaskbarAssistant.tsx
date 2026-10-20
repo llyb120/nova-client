@@ -153,7 +153,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
       // Clear only what was captured; anything added meanwhile stays in the draft.
       if (text() === value) setText("");
       if (uploads() === files) setUploads([]);
-    } catch (error) { if (!disposed) setSendError(`未能存为星屑，已保留草稿：${String(error)}`); }
+    } catch (error) { if (!disposed) setSendError(`未能存为星尘，已保留草稿：${String(error)}`); }
     finally { setSending(false); }
   };
 
@@ -387,7 +387,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
               {(capsule) => (
                 <span class="ta-chip capsule" title={titleOf(capsule)}>
                   <span class="ta-chip-icon" aria-hidden="true">✦</span><span class="ta-chip-name">{titleOf(capsule)}</span>
-                  <button type="button" aria-label={`移除星屑 ${titleOf(capsule)}`} onClick={() => toggleCapsule(capsule)}>×</button>
+                  <button type="button" aria-label={`移除星尘 ${titleOf(capsule)}`} onClick={() => toggleCapsule(capsule)}>×</button>
                 </span>
               )}
             </For>
@@ -404,19 +404,19 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
             </For>
           </div>
         </Show>
-        <button type="button" class="ta-plus" classList={{ open: !!menu() }} title="添加图片、文件或星屑" aria-label="添加附件" aria-expanded={!!menu()} onClick={() => setMenu(menu() ? "" : "menu")}>
+        <button type="button" class="ta-plus" classList={{ open: !!menu() }} title="添加图片、文件或星尘" aria-label="添加附件" aria-expanded={!!menu()} onClick={() => setMenu(menu() ? "" : "menu")}>
           <svg viewBox="0 0 12 12" width="13" height="13" aria-hidden="true"><path d="M6 2v8M2 6h8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
         </button>
         <Show when={menu() === "menu"}>
           <div class="ta-menu" role="menu">
             <button type="button" role="menuitem" onClick={() => { setMenu(""); imagePicker.click(); }}>图片</button>
             <button type="button" role="menuitem" onClick={() => { setMenu(""); filePicker.click(); }}>文件</button>
-            <button type="button" role="menuitem" onClick={() => void openCapsules()}>星屑</button>
+            <button type="button" role="menuitem" onClick={() => void openCapsules()}>星尘</button>
           </div>
         </Show>
         <Show when={menu() === "capsules"}>
-          <div class="ta-menu ta-capsule-menu" role="listbox" aria-multiselectable="true" aria-label="选择星屑">
-            <For each={capsules()} fallback={<div class="ta-empty">还没有星屑，可以拖入文字或文件收集</div>}>
+          <div class="ta-menu ta-capsule-menu" role="listbox" aria-multiselectable="true" aria-label="选择星尘">
+            <For each={capsules()} fallback={<div class="ta-empty">还没有星尘，可以拖入文字或文件收集</div>}>
               {(capsule) => (
                 <button type="button" role="option" aria-selected={picked().some((c) => c.id === capsule.id)} onClick={() => toggleCapsule(capsule)}>
                   <span class="ta-check" aria-hidden="true" />{titleOf(capsule)}
@@ -427,7 +427,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
         </Show>
         <input ref={imagePicker} type="file" accept="image/*" multiple hidden onChange={(event) => { void addFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ""; }} />
         <input ref={filePicker} type="file" multiple hidden onChange={(event) => { void addFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ""; }} />
-        <textarea ref={input} class="tb-input ta-input" rows={1} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" title="Enter 发送 · Alt+Enter 存为星屑 · Shift+Enter 换行 · 可粘贴图片和文件" value={text()}
+        <textarea ref={input} class="tb-input ta-input" rows={1} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" title="Enter 发送 · Alt+Enter 存为星尘 · Shift+Enter 换行 · 可粘贴图片和文件" value={text()}
           onInput={(event) => setText(event.currentTarget.value)}
           onPaste={(event) => {
             const files = Array.from(event.clipboardData?.files ?? []);

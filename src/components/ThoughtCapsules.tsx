@@ -46,7 +46,7 @@ const paths = {
 };
 const icon = (name: keyof typeof paths) => <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={paths[name]} /></svg>;
 const excerpt = (text: string, length = 220) => text.length > length ? `${text.slice(0, length).replace(/[\uD800-\uDBFF]$/, "")}…` : text;
-export const titleOf = (capsule: Capsule) => capsule.title.trim() || excerpt(capsule.text.trim().split("\n", 1)[0], 50) || capsule.files[0]?.name || "未命名星屑";
+export const titleOf = (capsule: Capsule) => capsule.title.trim() || excerpt(capsule.text.trim().split("\n", 1)[0], 50) || capsule.files[0]?.name || "未命名星尘";
 const hasSummary = (capsule: Capsule) => capsule.status === "ready" && !!capsule.summary.trim() && capsule.summary.trim() !== capsule.text.trim();
 const matches = (capsule: Capsule, query: string) => [capsule.title, capsule.text, capsule.summary, ...capsule.files.map((f) => `${f.name}\n${f.path}`)].some((value) => value.toLocaleLowerCase().includes(query));
 const select = (previous: Set<string>, id: string) => {
@@ -191,7 +191,7 @@ export default function ThoughtCapsules(props: ThoughtCapsulesProps) {
       closeView();
       setCapsules(reconcile(capsules.filter((capsule) => !removed.has(capsule.id))));
       setSelected((previous) => new Set([...previous].filter((id) => !removed.has(id))));
-      setNotice(`已删除 ${confirmation.ids.length} 条星屑。`);
+      setNotice(`已删除 ${confirmation.ids.length} 条星尘。`);
       void refresh();
     } catch (e) {
       if (!disposed) setError(`删除失败，仍保留原有选择：${String(e)}`);
@@ -248,12 +248,12 @@ export default function ThoughtCapsules(props: ThoughtCapsulesProps) {
   onCleanup(() => { disposed = true; ++revision; unlisteners.forEach((off) => off()); });
 
   return (
-    <section class="tc-panel" hidden={!props.active} aria-label="星屑" onKeyDown={panelKeys}>
+    <section class="tc-panel" hidden={!props.active} aria-label="星尘" onKeyDown={panelKeys}>
       <div class="tc-main" inert={!!view()} aria-hidden={view() ? "true" : undefined}>
         <header class="tc-header">
           <span class="tc-emblem">{icon("spark")}</span>
-          <div class="tc-heading"><h2>星屑 <span class="tc-total">{capsules.length}</span></h2><p>先留住灵感，稍后再展开。</p></div>
-          <button type="button" class="tc-icon-button" classList={{ "tc-spinning": loading() }} aria-label="刷新星屑" title="刷新星屑" disabled={loading() || !!busy()} onClick={() => void refresh()}>{icon("refresh")}</button>
+          <div class="tc-heading"><h2>星尘 <span class="tc-total">{capsules.length}</span></h2><p>先留住灵感，稍后再展开。</p></div>
+          <button type="button" class="tc-icon-button" classList={{ "tc-spinning": loading() }} aria-label="刷新星尘" title="刷新星尘" disabled={loading() || !!busy()} onClick={() => void refresh()}>{icon("refresh")}</button>
         </header>
 
         <div class="tc-composer" aria-busy={busy() === "capture"}>
@@ -263,7 +263,7 @@ export default function ThoughtCapsules(props: ThoughtCapsulesProps) {
         </div>
 
         <div class="tc-search">
-          {icon("search")}<input type="search" aria-label="搜索星屑原文、摘要和文件" placeholder="搜索原文、摘要、文件…" value={query()} onInput={(event) => setQuery(event.currentTarget.value)} />
+          {icon("search")}<input type="search" aria-label="搜索星尘原文、摘要和文件" placeholder="搜索原文、摘要、文件…" value={query()} onInput={(event) => setQuery(event.currentTarget.value)} />
           <Show when={query()}><button type="button" class="tc-icon-button" aria-label="清除搜索" onClick={() => setQuery("")}>{icon("close")}</button></Show>
           <span class="tc-result-count">{filtered().length} 条</span>
         </div>
@@ -273,20 +273,20 @@ export default function ThoughtCapsules(props: ThoughtCapsulesProps) {
           <Show when={filtered().length} fallback={
             <div class="tc-empty" role="status">
               <span class="tc-empty-art" classList={{ "tc-pulse": loading() }}>{icon(query().trim() ? "search" : "spark")}</span>
-              <strong>{loading() && !loaded() ? "正在找回你的灵感…" : !loaded() && loadError() ? "暂时没能读取星屑" : query().trim() ? "没有找到这段灵感" : "一闪而过，也值得留下"}</strong>
-              <p>{!loaded() && loadError() ? "点击右上角刷新，已有内容不会丢失。" : query().trim() ? "换个关键词试试，已选星屑仍会保留。" : "写下一句，或拖入文字、链接与文件。"}</p>
-              <Show when={query().trim()}><button type="button" class="tc-text-button" onClick={() => setQuery("")}>查看全部星屑</button></Show>
+              <strong>{loading() && !loaded() ? "正在找回你的灵感…" : !loaded() && loadError() ? "暂时没能读取星尘" : query().trim() ? "没有找到这段灵感" : "一闪而过，也值得留下"}</strong>
+              <p>{!loaded() && loadError() ? "点击右上角刷新，已有内容不会丢失。" : query().trim() ? "换个关键词试试，已选星尘仍会保留。" : "写下一句，或拖入文字、链接与文件。"}</p>
+              <Show when={query().trim()}><button type="button" class="tc-text-button" onClick={() => setQuery("")}>查看全部星尘</button></Show>
             </div>
           }>
-            <ul class="tc-list" aria-label="星屑列表">
+            <ul class="tc-list" aria-label="星尘列表">
               <For each={filtered()}>{(capsule) => (
                 <li class="tc-card" classList={{ "tc-selected": selected().has(capsule.id) }}>
                   <label class="tc-check"><input type="checkbox" class="tc-checkbox" aria-label={`多选：${titleOf(capsule)}`} checked={selected().has(capsule.id)} disabled={!!busy()} onChange={() => choose(capsule.id)} /></label>
-                  <button type="button" class="tc-card-select" aria-pressed={selected().has(capsule.id)} aria-label={`选择星屑：${titleOf(capsule)}`} title="点击选择 / 取消，可多选" disabled={!!busy()}
+                  <button type="button" class="tc-card-select" aria-pressed={selected().has(capsule.id)} aria-label={`选择星尘：${titleOf(capsule)}`} title="点击选择 / 取消，可多选" disabled={!!busy()}
                     onClick={() => choose(capsule.id)}
                     onKeyDown={(event) => { if (event.key === " " || event.key === "Enter") { event.preventDefault(); event.stopPropagation(); if (!event.repeat) choose(capsule.id); } }}>
                     <span class="tc-card-title">{titleOf(capsule)}</span>
-                    <span class="tc-preview"><span class="tc-preview-label">{hasSummary(capsule) ? "摘要" : capsule.files.length ? "文件预览" : "原文"}</span>{excerpt(hasSummary(capsule) ? capsule.summary : capsule.text) || "这条星屑里装着文件，原件副本已收好。"}</span>
+                    <span class="tc-preview"><span class="tc-preview-label">{hasSummary(capsule) ? "摘要" : capsule.files.length ? "文件预览" : "原文"}</span>{excerpt(hasSummary(capsule) ? capsule.summary : capsule.text) || "这条星尘里装着文件，原件副本已收好。"}</span>
                     <Show when={isImage(capsule)}><Thumb id={capsule.id} /></Show>
                     <span class="tc-card-meta"><time title={new Date(capsule.createdAt).toLocaleString()}>{dateLabel(capsule.createdAt)}</time><Show when={capsule.files.length}><span class="tc-attachment">{icon("file")}{capsule.files.length} 个文件</span></Show><span class={`tc-state tc-state-${capsule.status}`} title={capsule.summaryError}>{capsule.status === "pending" ? "摘要中" : capsule.status === "unavailable" ? "原文已保存" : "已收好"}</span></span>
                   </button>
@@ -299,25 +299,25 @@ export default function ThoughtCapsules(props: ThoughtCapsulesProps) {
 
         <footer class="tc-footer">
           <div class="tc-selection"><span aria-live="polite">已选 <strong>{selected().size}</strong> 条<Show when={hiddenCount()}><span class="tc-hidden-count">含 {hiddenCount()} 条搜索隐藏项</span></Show></span><span class="tc-multiselect-hint">点击可多选</span><button type="button" class="tc-text-button" disabled={!selected().size || !!busy()} onClick={() => { setSelected(new Set<string>()); setNotice(""); }}>清空选择</button></div>
-          <div class="tc-actions"><button type="button" class="tc-delete" disabled={!selected().size || !!busy()} aria-label={`删除选中的 ${selected().size} 条星屑`} title="删除所选（需确认）" onClick={() => showView({ kind: "remove", ids: selectedIds(), hidden: hiddenCount() })}>{icon("trash")}</button><button type="button" class="tc-open" disabled={!selected().size || !!busy()} onKeyDown={(event) => { if (event.repeat && (event.key === "Enter" || event.key === " ")) event.preventDefault(); }} onClick={(event) => { if (event.detail < 2) void openSelected(); }}><span>{busy() === "open" ? "正在准备草稿…" : "带入新会话"}</span><small>仅草稿 · 不发送</small>{icon("arrow")}</button></div>
+          <div class="tc-actions"><button type="button" class="tc-delete" disabled={!selected().size || !!busy()} aria-label={`删除选中的 ${selected().size} 条星尘`} title="删除所选（需确认）" onClick={() => showView({ kind: "remove", ids: selectedIds(), hidden: hiddenCount() })}>{icon("trash")}</button><button type="button" class="tc-open" disabled={!selected().size || !!busy()} onKeyDown={(event) => { if (event.repeat && (event.key === "Enter" || event.key === " ")) event.preventDefault(); }} onClick={(event) => { if (event.detail < 2) void openSelected(); }}><span>{busy() === "open" ? "正在准备草稿…" : "带入新会话"}</span><small>仅草稿 · 不发送</small>{icon("arrow")}</button></div>
           <p class="tc-privacy" title="自动摘要交给轻量场景模型（任意后端），附带源文件由 agent 自行读取，请留意敏感信息。单文件最多 20 MiB，每次最多 16 个、合计 80 MiB；原文和文件副本独立保留。">{icon("shield")}自动摘要使用轻量场景模型 · 原文保留</p>
         </footer>
       </div>
 
       <Show when={view()}>
         <section class="tc-dialog" ref={dialog} role={removal() ? "alertdialog" : "dialog"} aria-modal="true" aria-labelledby={dialogTitle} aria-busy={!!busy()}>
-          <header class="tc-dialog-header"><span class="tc-emblem">{icon(removal() ? "trash" : "file")}</span><h3 id={dialogTitle}>{removal() ? "删除这些星屑？" : detail()?.files.length ? "文件内容预览" : "星屑原文"}</h3><button type="button" class="tc-icon-button" data-tc-initial={detail() ? "" : undefined} aria-label="返回星屑列表" disabled={!!busy()} onClick={() => closeView()}>{icon("close")}</button></header>
+          <header class="tc-dialog-header"><span class="tc-emblem">{icon(removal() ? "trash" : "file")}</span><h3 id={dialogTitle}>{removal() ? "删除这些星尘？" : detail()?.files.length ? "文件内容预览" : "星尘原文"}</h3><button type="button" class="tc-icon-button" data-tc-initial={detail() ? "" : undefined} aria-label="返回星尘列表" disabled={!!busy()} onClick={() => closeView()}>{icon("close")}</button></header>
           <Show when={shownError()}><div class="tc-message tc-error" role="alert">{shownError()}</div></Show>
-          <Show when={detail()}>{(capsule) => <div class="tc-detail-content" tabIndex={0} aria-label="完整星屑内容">
+          <Show when={detail()}>{(capsule) => <div class="tc-detail-content" tabIndex={0} aria-label="完整星尘内容">
             <div class="tc-detail-heading"><h4>{titleOf(capsule())}</h4><time>{new Date(capsule().createdAt).toLocaleString()}</time></div>
             <Show when={isImage(capsule())}><Thumb id={capsule().id} large /></Show>
-            <h5>{capsule().files.length ? "文件内容预览" : "完整原文"} <span>{capsule().files.length ? "完整内容保存在附件中" : "始终保留"}</span></h5><div class="tc-original">{capsule().text || (capsule().files.length ? "暂无文件内容预览，完整内容保存在附件中。" : "此星屑没有文字。")}</div>
+            <h5>{capsule().files.length ? "文件内容预览" : "完整原文"} <span>{capsule().files.length ? "完整内容保存在附件中" : "始终保留"}</span></h5><div class="tc-original">{capsule().text || (capsule().files.length ? "暂无文件内容预览，完整内容保存在附件中。" : "此星尘没有文字。")}</div>
             <Show when={capsule().files.length}><h5>文件副本 <span>{capsule().files.length} 个</span></h5><ul class="tc-files"><For each={capsule().files}>{(file) => <li>{icon("file")}<div><strong>{file.name}</strong><small>{fileSize(file.size)} · {file.mimeType || "文件"}</small><code>{file.path}</code></div></li>}</For></ul><p class="tc-detail-note">实际副本由后端保存；这里展示记录中的文件路径。</p></Show>
             <h5>自动摘要 <span>{capsule().status === "pending" ? "生成中" : capsule().status === "unavailable" ? "暂不可用" : "仅供预览"}</span></h5><div class="tc-summary">{capsule().summary || (capsule().status === "pending" ? "正在整理这段灵感，原文已安全收好。" : "暂无摘要，不影响查看原文或带入草稿。")}</div><Show when={capsule().summaryError}><p class="tc-detail-note">摘要提示：{capsule().summaryError}</p></Show>
           </div>}</Show>
           <Show when={removal()}>{(confirmation) => <>
-            <p class="tc-confirm-copy">将永久移除 <strong>{confirmation().ids.length}</strong> 条星屑记录。<Show when={confirmation().hidden}>其中 <strong>{confirmation().hidden}</strong> 条被当前搜索隐藏。</Show><br /><span>此操作无法撤销，请确认没有需要保留的灵感。</span></p>
-            <ul class="tc-delete-list" tabIndex={0} aria-label="即将删除的星屑"><For each={confirmation().ids}>{(id) => <li>{icon("file")}<span>{titleOf(capsules.find((capsule) => capsule.id === id)!)}</span></li>}</For></ul>
+            <p class="tc-confirm-copy">将永久移除 <strong>{confirmation().ids.length}</strong> 条星尘记录。<Show when={confirmation().hidden}>其中 <strong>{confirmation().hidden}</strong> 条被当前搜索隐藏。</Show><br /><span>此操作无法撤销，请确认没有需要保留的灵感。</span></p>
+            <ul class="tc-delete-list" tabIndex={0} aria-label="即将删除的星尘"><For each={confirmation().ids}>{(id) => <li>{icon("file")}<span>{titleOf(capsules.find((capsule) => capsule.id === id)!)}</span></li>}</For></ul>
             <div class="tc-confirm-actions"><button type="button" class="tc-secondary" data-tc-initial="" disabled={!!busy()} onClick={() => closeView()}>再想想</button><button type="button" class="tc-danger" disabled={!!busy()} onClick={() => void removeConfirmed()}>{busy() === "remove" ? "正在删除…" : `确认删除 ${confirmation().ids.length} 条`}</button></div>
           </>}</Show>
         </section>

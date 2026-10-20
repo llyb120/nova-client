@@ -78,8 +78,8 @@ fn valid_id(id: &str) -> bool {
 }
 
 fn validate_ids(ids: &[String]) -> Result<(), String> {
-    if ids.len() > MAX_CAPSULES { return Err("一次最多选择 512 个星屑".into()); }
-    if ids.iter().any(|id| !valid_id(id)) { return Err("非法星屑 id（必须为标准 UUID，不能包含路径）".into()); }
+    if ids.len() > MAX_CAPSULES { return Err("一次最多选择 512 个星尘".into()); }
+    if ids.iter().any(|id| !valid_id(id)) { return Err("非法星尘 id（必须为标准 UUID，不能包含路径）".into()); }
     Ok(())
 }
 
@@ -88,10 +88,10 @@ fn storage_dir(app: &AppHandle) -> PathBuf {
 }
 
 fn directory(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|e| format!("创建星屑目录失败：{e}"))?;
+    fs::create_dir_all(path).map_err(|e| format!("创建星尘目录失败：{e}"))?;
     let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Err("星屑存储目录不能是链接或非目录".into());
+        return Err("星尘存储目录不能是链接或非目录".into());
     }
     Ok(())
 }
@@ -138,7 +138,7 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, String> {
 }
 
 fn validate_store(root: &Path, items: &[Capsule]) -> Result<(), String> {
-    if items.len() > MAX_CAPSULES { return Err("星屑数量超过上限 512".into()); }
+    if items.len() > MAX_CAPSULES { return Err("星尘数量超过上限 512".into()); }
     let mut ids = BTreeSet::new();
     let mut total = 0;
     for item in items {
@@ -146,17 +146,17 @@ fn validate_store(root: &Path, items: &[Capsule]) -> Result<(), String> {
             || item.title.len() > 1024 || item.summary.len() > MAX_SUMMARY
             || item.summary_error.as_ref().is_some_and(|s| s.len() > MAX_ERROR)
             || item.files.len() > MAX_FILES {
-            return Err("星屑索引字段非法、重复或超出限制；未覆盖原存储".into());
+            return Err("星尘索引字段非法、重复或超出限制；未覆盖原存储".into());
         }
         for (index, file) in item.files.iter().enumerate() {
             if Path::new(&file.path) != file_path(root, &item.id, index)
                 || file.name.len() > 1024 || file.mime_type.len() > 256 || file.size > MAX_FILE {
-                return Err("星屑附件路径或字段非法；拒绝访问存储目录之外的文件".into());
+                return Err("星尘附件路径或字段非法；拒绝访问存储目录之外的文件".into());
             }
             total += file.size;
         }
     }
-    if total > MAX_TOTAL_BYTES { return Err("星屑附件总量上限为 512 MiB，请先删除部分星屑".into()); }
+    if total > MAX_TOTAL_BYTES { return Err("星尘附件总量上限为 512 MiB，请先删除部分星尘".into()); }
     Ok(())
 }
 
@@ -169,7 +169,7 @@ fn load(root: &Path) -> Result<Vec<Capsule>, String> {
         Ok(_) => {}
     }
     let bytes = read_bounded(&path, MAX_INDEX)?;
-    let items: Vec<Capsule> = serde_json::from_slice(&bytes).map_err(|e| format!("星屑索引 JSON 损坏，未覆盖原存储：{e}"))?;
+    let items: Vec<Capsule> = serde_json::from_slice(&bytes).map_err(|e| format!("星尘索引 JSON 损坏，未覆盖原存储：{e}"))?;
     validate_store(root, &items)?;
     Ok(items)
 }
@@ -177,7 +177,7 @@ fn load(root: &Path) -> Result<Vec<Capsule>, String> {
 fn save(root: &Path, items: &[Capsule]) -> Result<(), String> {
     validate_store(root, items)?;
     let bytes = serde_json::to_vec(items).map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_INDEX { return Err("星屑索引上限为 16 MiB，请先删除部分星屑".into()); }
+    if bytes.len() as u64 > MAX_INDEX { return Err("星尘索引上限为 16 MiB，请先删除部分星尘".into()); }
     crate::thread_storage::atomic_write(&root.join("index.json"), &bytes)
 }
 
@@ -319,12 +319,12 @@ fn capture(root: &Path, text: String, paths: Vec<String>, uploads: Vec<CapsuleUp
             return Err(format!("单个上传文件 base64 上限为 {MAX_ENCODED_FILE} 字节，解码后上限为 20 MiB"));
         }
     }
-    let mut active = STORE.lock().map_err(|_| "星屑存储锁不可用")?;
+    let mut active = STORE.lock().map_err(|_| "星尘存储锁不可用")?;
     let root = prepare(root)?;
     let mut items = load(&root)?;
     let has_text = !text.is_empty();
     if items.len() + paths.len() + uploads.len() + usize::from(has_text) > MAX_CAPSULES {
-        return Err("星屑数量上限为 512，请先删除部分星屑".into());
+        return Err("星尘数量上限为 512，请先删除部分星尘".into());
     }
     let mut created = Vec::new();
     let mut copied = Vec::new();
@@ -358,7 +358,7 @@ fn capture(root: &Path, text: String, paths: Vec<String>, uploads: Vec<CapsuleUp
             batch += size;
             total += size;
             if batch > MAX_BATCH_BYTES { return Err("批次文件总量上限为 80 MiB".into()); }
-            if total > MAX_TOTAL_BYTES { return Err("星屑附件总量上限为 512 MiB".into()); }
+            if total > MAX_TOTAL_BYTES { return Err("星尘附件总量上限为 512 MiB".into()); }
             let mut item = new_capsule(String::new(), name.chars().take(60).collect());
             let extension = Path::new(&name).extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
             // ponytail: PDF/Office extraction runs under the store lock; fine for the 20 MiB cap,
@@ -386,12 +386,12 @@ fn capture(root: &Path, text: String, paths: Vec<String>, uploads: Vec<CapsuleUp
             }
             let destination = file_path(&root, &item.id, 0);
             if destination.try_exists().map_err(|e| e.to_string())? {
-                return Err("星屑附件路径冲突，未覆盖已有文件".into());
+                return Err("星尘附件路径冲突，未覆盖已有文件".into());
             }
             copied.push(destination.clone());
             crate::thread_storage::atomic_write(&destination, &bytes)?;
             item.files.push(CapsuleFile { name: name.clone(), path: destination.to_str()
-                .ok_or("星屑存储路径不是 UTF-8")?.to_owned(), mime_type: crate::guess_attachment_mime_type(&name), size });
+                .ok_or("星尘存储路径不是 UTF-8")?.to_owned(), mime_type: crate::guess_attachment_mime_type(&name), size });
             created.push(item);
         }
         Ok::<(), String>(())
@@ -425,7 +425,7 @@ fn capture(root: &Path, text: String, paths: Vec<String>, uploads: Vec<CapsuleUp
 }
 
 fn list(root: &Path) -> Result<Vec<Capsule>, String> {
-    let active = STORE.lock().map_err(|_| "星屑存储锁不可用")?;
+    let active = STORE.lock().map_err(|_| "星尘存储锁不可用")?;
     let root = prepare(root)?;
     let mut items = load(&root)?;
     let mut changed = false;
@@ -441,7 +441,7 @@ fn list(root: &Path) -> Result<Vec<Capsule>, String> {
 }
 
 fn complete(root: &Path, id: &str, result: Result<String, String>) -> Result<bool, String> {
-    let mut active = STORE.lock().map_err(|_| "星屑存储锁不可用")?;
+    let mut active = STORE.lock().map_err(|_| "星尘存储锁不可用")?;
     active.remove(id);
     let root = prepare(root)?;
     let mut items = load(&root)?;
@@ -468,7 +468,7 @@ async fn summarize_once(app: &AppHandle, root: &Path, kind: AgentKind, model: St
     let state = app.state::<crate::AppState>();
     let mut thread = Thread::new(root.to_string_lossy().into_owned(), kind, Some(model).filter(|m| !m.is_empty()), Some("build".into()), None, true);
     thread.employee_thread = true;
-    thread.title = "星屑摘要".into();
+    thread.title = "星尘摘要".into();
     let thread_id = thread.id.clone();
     { let mut store = state.store.lock().map_err(|e| e.to_string())?; store.threads.push(thread); store.save(); }
     let _ = app.emit(crate::acp::EV_THREADS, serde_json::json!({}));
@@ -529,7 +529,7 @@ async fn summarize(app: AppHandle, root: PathBuf, id: String, sample: String, fi
     match update {
         Ok(Ok(true)) => { let _ = app.emit("capsules:changed", ()); }
         Ok(Ok(false)) => {} // Removed during summarization: never resurrect it.
-        other => emit_error(&app, format!("保存星屑摘要状态失败：{other:?}")),
+        other => emit_error(&app, format!("保存星尘摘要状态失败：{other:?}")),
     }
 }
 
@@ -552,10 +552,10 @@ const MAX_PREVIEW: u64 = 8 * 1024 * 1024;
 /// protocol (extension-scoped) cannot serve it; None when it is not an image or too large.
 fn preview(root: &Path, id: &str) -> Result<Option<String>, String> {
     validate_ids(&[id.to_owned()])?;
-    let _lock = STORE.lock().map_err(|_| "星屑存储锁不可用")?;
+    let _lock = STORE.lock().map_err(|_| "星尘存储锁不可用")?;
     let root = prepare(root)?;
     let items = load(&root)?;
-    let file = items.iter().find(|c| c.id == id).and_then(|c| c.files.first()).ok_or("星屑不存在")?;
+    let file = items.iter().find(|c| c.id == id).and_then(|c| c.files.first()).ok_or("星尘不存在")?;
     if !file.mime_type.starts_with("image/") || file.size > MAX_PREVIEW { return Ok(None); }
     check_copy(Path::new(&file.path), file.size)?;
     let bytes = read_bounded(Path::new(&file.path), MAX_PREVIEW)?;
@@ -598,9 +598,9 @@ pub(crate) fn capture_drop(app: AppHandle, text: String, paths: Vec<String>, upl
 }
 
 fn check_copy(path: &Path, size: u64) -> Result<(), String> {
-    let meta = fs::symlink_metadata(path).map_err(|e| format!("星屑副本不可用：{e}"))?;
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("星尘副本不可用：{e}"))?;
     if !meta.is_file() || meta.file_type().is_symlink() || meta.len() != size {
-        return Err("星屑副本已被替换、链接或大小变化；拒绝访问".into());
+        return Err("星尘副本已被替换、链接或大小变化；拒绝访问".into());
     }
     Ok(())
 }
@@ -609,7 +609,7 @@ fn check_copy(path: &Path, size: u64) -> Result<(), String> {
 /// Metadata commits before unlinking. On failure no still-referenced copy is deleted.
 fn remove(root: &Path, ids: &[String]) -> Result<Option<String>, String> {
     validate_ids(ids)?;
-    let mut active = STORE.lock().map_err(|_| "星屑存储锁不可用")?;
+    let mut active = STORE.lock().map_err(|_| "星尘存储锁不可用")?;
     let root = prepare(root)?;
     let mut items = load(&root)?;
     let selected: BTreeSet<_> = ids.iter().collect();
@@ -625,7 +625,7 @@ fn remove(root: &Path, ids: &[String]) -> Result<Option<String>, String> {
         // unlink only the exact validated owned path; never follow links or remove directories.
         if let Err(e) = fs::remove_file(path) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                error = Some(format!("星屑条目已删除，但持久副本清理失败：{e}"));
+                error = Some(format!("星尘条目已删除，但持久副本清理失败：{e}"));
             }
         }
     }
@@ -653,7 +653,7 @@ fn draft_file_name(index: usize, name: &str) -> String {
 
 fn compose(root: &Path, ids: &[String]) -> Result<Compose, String> {
     validate_ids(ids)?;
-    let _lock = STORE.lock().map_err(|_| "星屑存储锁不可用")?;
+    let _lock = STORE.lock().map_err(|_| "星尘存储锁不可用")?;
     let root = prepare(root)?;
     let items = load(&root)?;
     let mut payload = Compose { text: String::new(), images: Vec::new() };
@@ -662,7 +662,7 @@ fn compose(root: &Path, ids: &[String]) -> Result<Compose, String> {
     let mut total = 0;
     for id in ids {
         if !seen.insert(id) { continue; }
-        let item = items.iter().find(|c| &c.id == id).ok_or_else(|| format!("星屑不存在：{id}"))?;
+        let item = items.iter().find(|c| &c.id == id).ok_or_else(|| format!("星尘不存在：{id}"))?;
         if !item.text.is_empty() {
             if !payload.text.is_empty() { payload.text.push_str("\n\n"); }
             payload.text.push_str(&item.text); // Never substitute the model's summary.
@@ -679,7 +679,7 @@ fn compose(root: &Path, ids: &[String]) -> Result<Compose, String> {
     if !files.is_empty() {
         payload.images = draft(&root, files.into_iter().map(|file| {
             let bytes = read_bounded(Path::new(&file.path), MAX_FILE)?;
-            if bytes.len() as u64 != file.size { return Err("星屑副本在转移时发生变化".into()); }
+            if bytes.len() as u64 != file.size { return Err("星尘副本在转移时发生变化".into()); }
             Ok((file.name.clone(), bytes))
         }))?;
     }
@@ -691,7 +691,7 @@ fn compose(root: &Path, ids: &[String]) -> Result<Compose, String> {
 /// are retained (80 MiB per open/send); integrate reference-counted attachment GC before
 /// reclaiming abandoned drafts.
 fn draft(root: &Path, files: impl Iterator<Item = Result<(String, Vec<u8>), String>>) -> Result<Vec<PromptImage>, String> {
-    let attachments = root.parent().ok_or("星屑目录缺少父目录")?.join("capsule-attachments");
+    let attachments = root.parent().ok_or("星尘目录缺少父目录")?.join("capsule-attachments");
     directory(&attachments)?;
     let draft = attachments.join(uuid::Uuid::new_v4().to_string());
     fs::create_dir(&draft).map_err(|e| e.to_string())?;
@@ -849,12 +849,12 @@ mod tests {
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         writer.start_file("notes/灵感.md", options).unwrap();
-        writer.write_all("星屑 zip 内容".as_bytes()).unwrap();
+        writer.write_all("星尘 zip 内容".as_bytes()).unwrap();
         writer.start_file("bomb.bin", options).unwrap();
         writer.write_all(&vec![0u8; 4 * 1024 * 1024]).unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         let sample = zip_sample(&bytes).unwrap();
-        assert!(sample.contains("共 2 个条目") && sample.contains("bomb.bin (4194304 B)") && sample.contains("星屑 zip 内容"));
+        assert!(sample.contains("共 2 个条目") && sample.contains("bomb.bin (4194304 B)") && sample.contains("星尘 zip 内容"));
         assert!(sample.len() <= MAX_SAMPLE + 64);
         assert!(zip_sample(b"not a zip").is_none());
     }

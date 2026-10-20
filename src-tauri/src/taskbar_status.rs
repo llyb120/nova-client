@@ -29,7 +29,7 @@ pub(crate) fn taskbar_bubble_place(app: tauri::AppHandle, height: f64) -> bool {
     { let _ = (app, height); false }
 }
 
-/// Smart paste while the assistant panel is foreground: the clipboard becomes 星屑 (true) instead of a 星移 request.
+/// Smart paste while the assistant panel is foreground: the clipboard becomes 星尘 (true) instead of a 星移 request.
 #[cfg(windows)]
 pub(crate) fn capture_clipboard_if_focused(app: &tauri::AppHandle) -> bool {
     if !bubble::focused(app) { return false; }
@@ -41,7 +41,7 @@ pub(crate) fn capture_clipboard_if_focused(app: &tauri::AppHandle) -> bool {
             name: "剪贴板图片.png".into(), data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png) }])
     } else { None };
     if text.is_empty() && files.is_empty() && uploads.is_none() {
-        bubble::capture_error(app, "剪贴板为空或格式无法读取；星屑未保存。");
+        bubble::capture_error(app, "剪贴板为空或格式无法读取；星尘未保存。");
     } else {
         capsules::capture_drop(app.clone(), text, files, uploads);
     }

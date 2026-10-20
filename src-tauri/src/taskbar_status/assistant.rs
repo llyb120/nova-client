@@ -374,7 +374,7 @@ async fn complete_reply(app: &tauri::AppHandle, target: &(AgentKind, String), se
     }).await
 }
 
-/// `text` is what the model reads; `original` (with full 星屑 text) is what the session receives.
+/// `text` is what the model reads; `original` (with full 星尘 text) is what the session receives.
 async fn decide(app: &tauri::AppHandle, rt: &Runtime, text: &str, original: &str, model: &(AgentKind, String), images: &[Value])
     -> Result<(String, Option<String>, Option<Job>), String>
 {
@@ -466,7 +466,7 @@ pub(crate) async fn taskbar_assistant_send(app: tauri::AppHandle, text: String, 
     let text = text.trim().to_string();
     let (capsules, uploads) = (capsules.unwrap_or_default(), uploads.unwrap_or_default());
     if text.len() > MAX_TEXT || (text.is_empty() && capsules.is_empty() && uploads.is_empty()) {
-        return Err("消息须为 1–16000 字节，或附带文件/星屑".into());
+        return Err("消息须为 1–16000 字节，或附带文件/星尘".into());
     }
     let rt = runtime(&app)?;
     let model = app.state::<AppState>().scene_model(Scene::Lightweight)?;
@@ -479,13 +479,13 @@ pub(crate) async fn taskbar_assistant_send(app: tauri::AppHandle, text: String, 
             .await.map_err(|e| e.to_string())??
     };
     // The journal is rewritten whole on every change; keep queued originals small.
-    if capsule_text.len() > 4 * MAX_TEXT { return Err("星屑原文超过 64 KB，请在星屑页用“打开”转到 Nova 发送".into()); }
+    if capsule_text.len() > 4 * MAX_TEXT { return Err("星尘原文超过 64 KB，请在星尘页用“打开”转到 Nova 发送".into()); }
     let names: Vec<&str> = images.iter().map(|i| i.name.as_str()).collect();
-    let note = [(count > 0).then(|| format!("星屑 {count} 条")), (!names.is_empty()).then(|| names.join("、"))]
+    let note = [(count > 0).then(|| format!("星尘 {count} 条")), (!names.is_empty()).then(|| names.join("、"))]
         .into_iter().flatten().collect::<Vec<_>>().join(" · ");
     let shown = if note.is_empty() { text.clone() } else { format!("{text}\n附件：{note}").trim().to_string() };
-    let original = if capsule_text.is_empty() { shown.clone() } else { format!("{shown}\n\n星屑原文：\n{capsule_text}") };
-    let brief = if capsule_text.is_empty() { shown.clone() } else { format!("{shown}\n\n星屑原文节选：\n{}", short(&capsule_text, 1500)) };
+    let original = if capsule_text.is_empty() { shown.clone() } else { format!("{shown}\n\n星尘原文：\n{capsule_text}") };
+    let brief = if capsule_text.is_empty() { shown.clone() } else { format!("{shown}\n\n星尘原文节选：\n{}", short(&capsule_text, 1500)) };
     rt.update(|j| {
         if j.in_flight.is_some() { return Err("助理正在回复，请稍后再发".into()); }
         if j.queue.len() >= MAX_QUEUE { return Err("待调度队列已满，请等待已有任务处理".into()); }

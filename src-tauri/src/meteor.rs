@@ -308,7 +308,7 @@ pub(crate) async fn meteor_open(app: AppHandle, window: WebviewWindow) -> Result
 
 fn open(app: &AppHandle, paste: bool) -> Result<(), String> {
     ensure_allowed()?;
-    // Smart paste while the assistant panel is focused saves the clipboard as 星屑, no dialog.
+    // Smart paste while the assistant panel is focused saves the clipboard as 星尘, no dialog.
     #[cfg(windows)]
     if paste && crate::taskbar_status::capture_clipboard_if_focused(app) { return Ok(()); }
     if OPENING.swap(true, Ordering::AcqRel) { return Ok(()); }

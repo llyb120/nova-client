@@ -175,8 +175,8 @@ assert.deepEqual(dragAttributes, [], 'all DOM/native drops must reach the root s
 assert.match(source.text, /完整内容保存在附件中/);
 assert.match(source.text, /Ctrl \/ ⌘ 点击多选/);
 assert.match(source.text, /轻量场景模型/);
-assert.match(source.text, /<h2>星屑 /, 'the panel uses the new display name');
-assert.match(source.text, /aria-label="星屑"/);
+assert.match(source.text, /<h2>星尘 /, 'the panel uses the new display name');
+assert.match(source.text, /aria-label="星尘"/);
 assert.doesNotMatch(source.text, /\u80f6\u56ca/, 'no old display name remains in labels, messages or fallbacks');
 
 // Cleanup and rejected/out-of-order responses cannot change unmounted state.
@@ -186,4 +186,4 @@ const pendingList = unmounted.handlers.refresh(); unmounted.handlers.dispose();
 pending.resolve([capsule('late')]); await pendingList;
 assert.equal(unmounted.state.capsules.length, 0);
 assert.ok(!opened.state.calls.some(([command]) => /send/.test(command)), 'the component never sends a message');
-console.log('星屑: display name, capture validation, original preservation, selection/filtering, async ordering, deletion confirmation, root-owned drops and draft-only opening passed.');
+console.log('星尘: display name, capture validation, original preservation, selection/filtering, async ordering, deletion confirmation, root-owned drops and draft-only opening passed.');

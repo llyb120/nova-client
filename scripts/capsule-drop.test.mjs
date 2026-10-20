@@ -51,4 +51,4 @@ assert.match((await drop({ 'text/plain': original }, { fail: true })).errors.at(
 const native = readFileSync(new URL('../src-tauri/src/taskbar_status/bubble.rs', import.meta.url), 'utf8');
 assert.match(native, /\.disable_drag_drop_handler\(\)/, 'Wry native file-only handler must not consume text/URL drops');
 assert.doesNotMatch(native, /WindowEvent::DragDrop/, 'the panel must use one DOM drop path, not competing native + HTML handlers');
-console.log('星屑 drops preserve Unicode text, accept links/files once, reject oversized files/directories and expose failures.');
+console.log('星尘 drops preserve Unicode text, accept links/files once, reject oversized files/directories and expose failures.');
