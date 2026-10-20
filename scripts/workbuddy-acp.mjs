@@ -233,7 +233,7 @@ async function start() {
   const env = {
     ...process.env,
     WORKBUDDY_CONFIG_DIR: root, CODEBUDDY_CONFIG_DIR: root,
-    CODEBUDDY_HOST: 'workbuddy-desktop', CODEBUDDY_FORCE_HEADLESS_BUNDLE: '1',
+    CODEBUDDY_HOST: 'workbuddy-desktop', CODEBUDDY_FORCE_LITE_WB_BUNDLE: '1', // falls back to headless
     CODEBUDDY_GATEWAY_AUTH: 'password', CODEBUDDY_GATEWAY_PASSWORD: password,
     DISABLE_AUTOUPDATER: '1', CODEBUDDY_DEFER_TOOL_LOADING: '0',
     CODEBUDDY_CODE_SHELL: process.env.CODEBUDDY_CODE_SHELL || 'powershell',
@@ -243,7 +243,7 @@ async function start() {
   };
   // Discard stale desktop snapshots in favor of authenticated cloud policy.
   for (const key of Object.keys(env)) {
-    if (/FORCE_LITE_WB/i.test(key) || /^ACC_PRODUCT_CONFIG(?:_PATH|_V[23])?$/i.test(key)) delete env[key];
+    if (/^ACC_PRODUCT_CONFIG(?:_PATH|_V[23])?$/i.test(key)) delete env[key];
   }
   if (print) delete env.CODEBUDDY_SIDECAR_READY_SOCKET;
   const args = print ? cliArgs : ['--serve', '--port', '0', '--host', '127.0.0.1'];

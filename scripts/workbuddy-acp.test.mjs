@@ -174,7 +174,7 @@ async function fixture(t, options = {}) {
       FAKE_PORT: String(http.address().port), FAKE_REPORT: report, ...(options.workerExit ? { FAKE_EXIT: '1' } : {}),
       FAKE_PRINT_EXIT: String(options.printExit || 0), ...(options.hangCredentials ? { FAKE_HANG_CREDENTIALS: '1' } : {}),
       HTTPS_PROXY: 'http://127.0.0.1:9', CODEBUDDY_CODE_SHELL: 'custom-shell',
-      CODEBUDDY_GATEWAY_PASSWORD: 'OLD_PASSWORD', CODEBUDDY_FORCE_LITE_WB_BUNDLE: '1',
+      CODEBUDDY_GATEWAY_PASSWORD: 'OLD_PASSWORD', CODEBUDDY_FORCE_LITE_WB_BUNDLE: '0',
       ACC_PRODUCT_CONFIG_PATH: join(root, 'stale-desktop-policy.json'),
       ACC_PRODUCT_CONFIG_V3: '{"agents":[{"name":"cli","models":["stale"]}]}',
       ACC_PRODUCT_CONFIG_V2: '{}', ACC_PRODUCT_CONFIG: '{}' },
@@ -247,9 +247,8 @@ test('self-hosted worker: credential bootstrap, env, GET and POST forwarding, co
   assert.equal(env.CODEBUDDY_CODE_SHELL, 'custom-shell');
   assert.equal(env.CODEBUDDY_GATEWAY_AUTH, 'password');
   assert.match(env.CODEBUDDY_GATEWAY_PASSWORD, /^[a-f0-9]{64}$/);
-  assert.equal(env.CODEBUDDY_FORCE_HEADLESS_BUNDLE, '1');
   assert.equal(env.DISABLE_AUTOUPDATER, '1');
-  assert.equal(env.CODEBUDDY_FORCE_LITE_WB_BUNDLE, undefined);
+  assert.equal(env.CODEBUDDY_FORCE_LITE_WB_BUNDLE, '1');
   for (const key of ['ACC_PRODUCT_CONFIG_PATH', 'ACC_PRODUCT_CONFIG_V3', 'ACC_PRODUCT_CONFIG_V2', 'ACC_PRODUCT_CONFIG']) {
     assert.equal(env[key], undefined, 'Desktop bootstrap model policy must not override the authenticated cloud catalog');
   }
@@ -301,13 +300,13 @@ test('print reuses credentials and identity, preserves restricted args/cwd and r
   assert.equal(env.WORKBUDDY_CONFIG_DIR, f.root);
   assert.equal(env.CODEBUDDY_CONFIG_DIR, f.root);
   assert.equal(env.CODEBUDDY_HOST, 'workbuddy-desktop');
-  assert.equal(env.CODEBUDDY_FORCE_HEADLESS_BUNDLE, '1');
   assert.equal(env.DISABLE_AUTOUPDATER, '1');
   assert.equal(env.CODEBUDDY_DEFER_TOOL_LOADING, '0');
   assert.equal(env.WORKBUDDY_AT_REST_ENCRYPTION, 'fields');
   assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:9');
   assert.equal(env.CODEBUDDY_SIDECAR_READY_SOCKET, undefined);
-  assert.ok(!Object.keys(env).some(key => /^(NOVA_|ACC_PRODUCT_CONFIG)|FORCE_LITE_WB/i.test(key)));
+  assert.equal(env.CODEBUDDY_FORCE_LITE_WB_BUNDLE, '1');
+  assert.ok(!Object.keys(env).some(key => /^(NOVA_|ACC_PRODUCT_CONFIG)/i.test(key)));
   assert.equal(message.sessionId, env.CODEBUDDY_SIDECAR_READY_SESSION_ID);
   assert.equal(message.token, env.CODEBUDDY_SIDECAR_READY_TOKEN);
   assert.equal(message.pid, pid);
