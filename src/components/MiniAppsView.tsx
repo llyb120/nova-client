@@ -2,6 +2,7 @@ import { batch, createEffect, createMemo, createSignal, For, onCleanup, onMount,
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import type { ModelTarget, PermissionRequest } from "../types";
 import { api } from "../ipc";
 import { openThread, refreshThreads, sceneModel, sendPromptTo, state } from "../store";
@@ -358,11 +359,12 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       log("已从快捷区移除；版本仍保留，可随时重新设为快捷。");
     } catch (e) { setError(errorText(e)); }
   }
-  function removeApp(id: string) {
+  async function removeApp(id: string) {
     const app = apps().find(item => item.id === id);
     if (!app || locked() || props.runtimeAppId) return;
     if (app.run?.status === "running") { setError("这个应用仍在运行，请打开它并停止后再删除。"); return; }
-    if (!window.confirm(`删除「${appName(app)}」？草稿、全部版本和设计会话都会删除，快捷区同时移除，无法恢复。`)) return;
+    if (!await confirm(`删除「${appName(app)}」？草稿、全部版本和设计会话都会删除，快捷区同时移除，无法恢复。`, { title: "删除应用", kind: "warning" })) return;
+    if (locked() || !apps().some(item => item.id === id)) return;
     try {
       sync(id);
       const next = apps().filter(item => item.id !== id);
