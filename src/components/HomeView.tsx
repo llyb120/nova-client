@@ -42,7 +42,6 @@ import { agentLabel, isScratch } from "../utils";
 import { ConfigSelects } from "./ConfigSelects";
 import { IconClue, IconFile, IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
-import { HaibaraBubble } from "./HaibaraBubble";
 import { createNoteFlow } from "./NoteFlow";
 import { ProjectPicker } from "./ProjectPicker";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
@@ -867,7 +866,6 @@ export function HomeView() {
           class="home-composer"
           classList={{ "is-dragging": attach.dragging() }}
         >
-          <HaibaraBubble />
           <noteFlow.Notes />
           <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
           <Show when={quote()}>

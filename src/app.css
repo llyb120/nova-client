@@ -1779,61 +1779,6 @@ button {
   }
 }
 
-/* ===== 新会话灰原哀气泡 =====
-   锚定输入框（.home-composer）右上角上方悬浮，尖角指向输入框右上角。
-   作为 .home-composer 的绝对定位子元素，随 HomeView 挂载出现。 */
-.haibara-bubble {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 14px);
-  max-width: 320px;
-  background: var(--bg-float);
-  border: 1px solid var(--border-light);
-  border-radius: 12px;
-  padding: 10px 12px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
-  z-index: 5;
-}
-.haibara-bubble::after {
-  content: "";
-  position: absolute;
-  right: 26px;
-  bottom: -7px;
-  width: 12px;
-  height: 12px;
-  background: var(--bg-float);
-  border-right: 1px solid var(--border-light);
-  border-bottom: 1px solid var(--border-light);
-  transform: rotate(45deg);
-}
-.haibara-bubble-close {
-  position: absolute;
-  top: 6px;
-  right: 8px;
-  z-index: 1;
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  font-size: 14px;
-  line-height: 1;
-  padding: 2px 4px;
-  border-radius: 4px;
-}
-.haibara-bubble-close:hover {
-  color: var(--text);
-  background: var(--bg-hover);
-}
-.haibara-bubble-text {
-  position: relative;
-  z-index: 1;
-  margin: 0;
-  padding-right: 20px;
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--text-dim);
-}
-
 /* ===== Markdown ===== */
 .markdown {
   word-break: break-word;
