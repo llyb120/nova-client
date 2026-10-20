@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { chromium } from 'playwright-core';
@@ -100,10 +100,30 @@ try {
     assert.equal((await chromeUi('tabs')).tabs[0].tag,tag);
     await assert.rejects(chromeUi('inspect'),/tabTag/);
     const chromeObs=await chromeUi('inspect',{tabTag:tag});
-    const input=chromeObs.pages[0].items.find(i=>i.name==='订单号');assert(input);
+    const full=JSON.parse(await readFile(chromeObs.documentPath,'utf8'));
+    const input=full.pages[0].items.find(i=>i.name==='订单号');assert(input);
     const changed=await chromeUi('act',{tabTag:tag,snapshotId:chromeObs.snapshotId,action:{action:'fill',frame:0,ref:input.ref,text:'Chrome桥接验证'}});
     assert.equal(changed.status,'executed');assert.ok(changed.snapshotId);
     assert.equal(await page.evaluate(()=>document.querySelector('input').value),'Chrome桥接验证');
+    const script=`(() => { const n=document.createElement('aside'); n.className='nova-req-annot'; n.textContent='待确认'; document.body.append(n); return {count:document.querySelectorAll('.nova-req-annot').length}; })()`;
+    const missing=await chromeUi('evaluate',{tabTag:tag,expression:script});
+    assert.equal(missing.status,'not_executed');assert.ok(missing.snapshotId);
+    assert.equal(await page.locator('.nova-req-annot').count(),0);
+    const annotated=await chromeUi('evaluate',{tabTag:tag,snapshotId:missing.snapshotId,expression:script,feedback:'screenshot'});
+    assert.equal(annotated.status,'executed',JSON.stringify(annotated));assert.deepEqual(annotated.value,{count:1});
+    assert.ok(annotated.images.length);assert.ok(annotated.snapshotId);
+    const reused=await chromeUi('evaluate',{tabTag:tag,snapshotId:missing.snapshotId,expression:script});
+    assert.equal(reused.status,'not_executed');assert.equal(await page.locator('.nova-req-annot').count(),1);
+    const failed=await chromeUi('evaluate',{tabTag:tag,snapshotId:reused.snapshotId,expression:'document.querySelector(".nova-req-annot").dataset.checked="yes"; throw Error("partial script")'});
+    assert.equal(failed.status,'needs_review');assert.match(failed.reason,/partial script/);
+    assert.equal(await page.locator('.nova-req-annot').getAttribute('data-checked'),'yes');assert.ok(failed.snapshotId);
+    const readback=await chromeUi('evaluate',{tabTag:tag,snapshotId:failed.snapshotId,expression:'Promise.resolve(document.querySelectorAll(".nova-req-annot").length)',feedback:'none'});
+    assert.equal(readback.value,1);assert.equal(readback.snapshotId,undefined);
+    const consumed=await chromeUi('evaluate',{tabTag:tag,snapshotId:failed.snapshotId,expression:script});
+    assert.equal(consumed.status,'not_executed');assert.equal(await page.locator('.nova-req-annot').count(),1);
+    const waiting=await chromeUi('evaluate',{tabTag:tag,snapshotId:consumed.snapshotId,expression:'new Promise(resolve => setTimeout(() => resolve(1), 6000))'});
+    assert.equal(waiting.status,'needs_review');assert.match(waiting.reason,/5秒超时.*可能仍在运行/);
+    assert.equal(waiting.inputAttempted,true);
     const screenshot=await chromeUi('screenshot',{tabTag:tag,fullPage:false});
     assert.ok(screenshot.images.length);assert.equal(screenshot.browser,'chrome');
     // Compiled pixel preflight, image mapping and post-hover checks remain covered.
@@ -132,7 +152,7 @@ try {
     assert.equal(await page.evaluate(()=>window.optionClicked),6,'pre-existing visual changes still block input');
     if(pollingError)throw pollingError;
     await writeFile(join(output,'coordinate-report.json'),JSON.stringify({passed:true,modelCalls:0,coordinateHover:true,localCrop:true,stalePixels:true,chromeCaptures,profile},null,2));
-    console.log('PASS compiled Chrome bridge/DOM/images/coordinate hover/scaled crops/stale-pixel rejection; no sidebar browser');
+    console.log('PASS compiled Chrome bridge/evaluate annotations, readback, stale snapshots, partial failure and Promise timeout/DOM/images/coordinate guards; no sidebar browser');
   }finally{abort.abort();await polling.catch(()=>{});}
 } finally {
   await browser?.close();

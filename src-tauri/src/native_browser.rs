@@ -1210,6 +1210,16 @@ fn carry_screenshot(observation: &mut Observation, previous: Option<&Observation
     Some(observation.images.iter().map(|i| i.id.clone()).collect())
 }
 
+fn evaluation_args(args: &Value) -> Result<(&str, usize), String> {
+    let expression = args["expression"].as_str().filter(|s| !s.trim().is_empty() && s.chars().count() <= 32000)
+        .ok_or("evaluate 需非空 expression，最多32000字符；多条语句请用 IIFE 返回JSON结果")?;
+    let frame = match args.get("frame") {
+        None => 0,
+        Some(value) => value.as_u64().filter(|n| *n < 12).ok_or("frame 必须为观察返回的0–11整数")? as usize,
+    };
+    Ok((expression, frame))
+}
+
 async fn control_session(
     app: &AppHandle,
     mut s: Session,
@@ -1229,11 +1239,13 @@ async fn control_session(
     check(app, &s)?;
     let mut completed_action = None;
     let mut progress=InputProgress::default();
+    let mut desktop_invalidated = false;
     let task=CONTROL_TAB.scope(s.active_tab.clone(),async {
         let current=state.observations.lock().unwrap().get(&s.active_tab).cloned();
-        if operation!="act" {return Ok(snapshot(app,operation=="screenshot",args,current.as_ref()).await?.1);}
-        let mut actions=parse_actions(args, 16)?;
-        let all_dom=actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
+        if !matches!(operation,"act"|"evaluate") {return Ok(snapshot(app,operation=="screenshot",args,current.as_ref()).await?.1);}
+        let script = if operation == "evaluate" { Some(evaluation_args(args)?) } else { None };
+        let mut actions=if script.is_some() { Vec::new() } else { parse_actions(args, 16)? };
+        let all_dom=script.is_none() && actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
         let with_image=current.as_ref().is_some_and(|o|o.screenshot) || actions.iter().any(|a|matches!(a,Action::ClickAt{..}|Action::Move{..}|Action::Drag{..}|Action::ScrollAt{..}));
         let Some(observation)=current.clone().filter(|o|(args["snapshotId"].as_str()==Some(&o.id) || (all_dom && refs_in(o,&actions))) && (all_dom || o.captured.elapsed()<=Duration::from_secs(180))) else {
             // Nothing was sent; attach a fresh observation so the model re-decides in this round-trip.
@@ -1251,13 +1263,44 @@ async fn control_session(
         for action in &mut actions {
             preflight(&observation,action,args["imageId"].as_str())?;
         }
+        if let Some((_, frame)) = script {
+            if observation.frames.get(frame).is_none() { return Err("frame 不在该快照中，请按观察返回的frame执行".into()); }
+        }
         // Background tabs throttle animation/timer sampling, making stable DOM targets time out as "moving".
         // Activate the explicitly bound tab before live checks; stale geometry/identity is still checked by apply.
         crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
+        desktop_invalidated = crate::jianlai::invalidate_desktop("Chrome 已激活目标标签，旧桌面快照作废");
         state.observations.lock().unwrap().remove(&s.active_tab);
         let mut failure=None;
         let mut action_timings=Vec::new();
         let clipboard=crate::clipboard::sequence();
+        let mut script_value = None;
+        if let Some((expression, index)) = script {
+            // A script can change any DOM state; retire every owner's observation of this tab before dispatch.
+            let suffix = format!(":{}", s.active_tab.rsplit(':').next().unwrap());
+            state.observations.lock().unwrap().retain(|key, _| !key.ends_with(&suffix));
+            let frame = &observation.frames[index];
+            let page = &observation.pages["pages"][index];
+            let expression = format!("__novaWebview.evaluate({},{},{})", json!(expression), page["document"], page["url"]);
+            progress.attempted = true;
+            // CDP timeout stops synchronous JS, not an awaited Promise. Bound our wait too; async effects may continue.
+            let reply = tokio::time::timeout(Duration::from_secs(5), cdp(app, "Runtime.evaluate", json!({"expression":expression,"contextId":frame.context,
+                "returnByValue":true,"awaitPromise":true,"timeout":5000}), frame.session.as_deref(), Some(s.cancel.clone())))
+                .await.map_err(|_| "脚本等待5秒超时，可能已部分执行且异步脚本可能仍在运行；先观察确认，不要重放")??;
+            if reply.get("exceptionDetails").is_some() {
+                failure = Some(reply["exceptionDetails"]["exception"]["description"].as_str()
+                    .or(reply["exceptionDetails"]["text"].as_str()).unwrap_or("脚本执行失败，请观察确认，不要重放").to_string());
+            } else {
+                let outcome = &reply["result"]["value"];
+                if outcome["status"] == "executed" {
+                    progress.completed = 1;
+                    script_value = Some(outcome["value"].clone());
+                } else {
+                    progress.attempted = outcome["status"] != "not_executed";
+                    failure = Some(outcome["reason"].as_str().unwrap_or("脚本结果未知，请观察确认，不要重放").to_string());
+                }
+            }
+        }
         for action in &actions {
             let began=std::time::Instant::now();
             let applied=apply(app,&s,&observation,action,args["imageId"].as_str(),&mut progress).await;
@@ -1273,11 +1316,12 @@ async fn control_session(
             // The failing action itself sent no input (DOM preflight); earlier batch actions did complete.
             "failedAtPreflight":failure.is_some() && progress.dom_preflight,
             "reason":failure,"inputAttempted":progress.attempted,"completedActions":progress.completed,"actionTimingsMs":action_timings,"basedOnSnapshotId":observation.id,"verification":"unverified"});
+        if let Some(value) = script_value { result["value"] = value; }
         result["actionMs"] = json!(started.elapsed().as_millis());
         if args["snapshotId"].as_str()!=Some(&observation.id) {
             result["snapshotIdNote"]=json!(format!("传入的 snapshotId 不是最新观察（最新为 {}）；本批 ref 均属最新观察，已按 ref 执行。snapshotId 取工具返回的顶层 snapshotId，不是 ref", observation.id));
         }
-        result.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+        result.as_object_mut().unwrap().retain(|key, v| key == "value" || !v.is_null());
         completed_action = Some(result.clone());
         // A click/Enter often starts a navigation; feeding back the old DOM costs the model another
         // inspect round-trip. Wait (bounded) for the tab to finish loading before observing.
@@ -1302,7 +1346,7 @@ async fn control_session(
             if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
             let visual=args["feedback"]=="screenshot" || (args["feedback"].is_null() && observation.screenshot);
             // Feedback failure must never turn a completed mutation into a retryable action failure.
-            match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,Some(&observation))).await {
+            match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,if script.is_some() { None } else { Some(&observation) })).await {
                 Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
                 Ok(Err(error)) => result["observationError"] = json!(error),
                 Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
@@ -1311,7 +1355,7 @@ async fn control_session(
         // Read after feedback so pages that write the clipboard asynchronously have finished.
         if let Some(copied)=crate::clipboard::copied_since(clipboard) {result["clipboard"]=copied;}
         // Altair runs save their own verified route; everything else feeds the turn's auto trail.
-        if !crate::altair_run::executing_browser_action() {
+        if script.is_none() && !crate::altair_run::executing_browser_action() {
             let before = &observation.pages["pages"][0];
             let after = if result["pages"][0]["url"].is_string() { &result["pages"][0] } else { before };
             crate::tool_experience::record("chrome", &s.thread_id,
@@ -1322,15 +1366,15 @@ async fn control_session(
         Ok(result)
     });
     let mut result = tokio::select! {
-        r=tokio::time::timeout(Duration::from_secs(15),task)=>r.map_err(|_|"浏览器操作15秒超时，已停止；请重新观察确认结果".to_string()).and_then(|r|r),
-        _=async {while !s.cancel.load(Ordering::SeqCst) {tokio::time::sleep(Duration::from_millis(30)).await;}}=>Err("已停止浏览器操作，请检查页面确认结果".into()),
+        r=tokio::time::timeout(Duration::from_secs(15),task)=>r.map_err(|_|"浏览器操作15秒超时；已发送的脚本/动作可能仍在执行，请重新观察确认结果".to_string()).and_then(|r|r),
+        _=async {while !s.cancel.load(Ordering::SeqCst) {tokio::time::sleep(Duration::from_millis(30)).await;}}=>Err("已取消等待浏览器结果；已发送的脚本/动作可能仍在执行，请检查页面确认结果".into()),
     };
     if let (Err(error), Some(mut completed)) = (&result, completed_action) {
         completed["observationError"] = json!(error);
         result = Ok(completed);
     }
     s.cancel.store(true, Ordering::SeqCst);
-    if operation=="act" {
+    if matches!(operation,"act"|"evaluate") {
         if let Err(error)=&result {
             result=Ok(json!({"status":if progress.attempted {"needs_review"} else {"not_executed"},
                 "reason":error,"completedActions":progress.completed,"inputAttempted":progress.attempted,
@@ -1387,6 +1431,10 @@ async fn control_session(
         }
     }
     if let Ok(value) = &mut result {
+        if desktop_invalidated {
+            value["desktopSnapshotInvalidated"] = json!(true);
+            value["desktopNotice"] = json!("剑来旧快照已作废；需要剑来时先重新截图");
+        }
         value["durationMs"] = json!(started.elapsed().as_millis());
     }
     result
@@ -1402,11 +1450,12 @@ async fn resolve_targets(_root: &Path, args: &Value, _owner: &str, _tool: &str) 
 }
 
 /// A missing `operation` is inferred from the other fields instead of failing the call:
-/// plan → run, action(s) → act, url without target → open, target only → inspect, nothing → tabs.
+/// plan → run, action(s) → act, expression → evaluate, url without target → open, target only → inspect, nothing → tabs.
 fn infer_operation(args: &Value, target_key: &str) -> (Value, Option<&'static str>) {
     if args["operation"].as_str().is_some_and(|op| !op.is_empty()) || !args.is_object() { return (args.clone(), None); }
     let op = if args["plan"].is_object() { "run" }
         else if !args["action"].is_null() || !args["actions"].is_null() { "act" }
+        else if args["expression"].is_string() { "evaluate" }
         else if args["url"].is_string() { if target_key == "tabTag" && args[target_key].is_string() { "goto" } else { "open" } }
         else if args[target_key].is_string() { "inspect" }
         else { "tabs" };
@@ -1473,7 +1522,7 @@ fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashM
     let mut args = args.as_object().cloned().ok_or("chrome 参数必须是对象")?;
     match args.get("operation").and_then(Value::as_str).unwrap_or_default() {
         "connect" | "status" | "tabs" | "open" | "new_tab" | "downloads" | "experience_search" => return Ok(Value::Object(args)),
-        "inspect" | "screenshot" | "act" | "run" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
+        "inspect" | "screenshot" | "act" | "evaluate" | "run" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
         _ => return Err("缺少或无效 operation；先用 {\"operation\":\"tabs\"} 获取标签".into()),
     }
     let valid_tag = |tag: &str| tag.len() <= 80 && tag.starts_with('C')
@@ -1585,11 +1634,11 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     };
     // Anything that changes the real screen or focus shares one lease with jianlai; the other
     // tool's stale desktop snapshot is retired explicitly instead of failing mid-batch later.
-    let mutating = matches!(operation, "open" | "new_tab" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "act");
+    let mutating = matches!(operation, "open" | "new_tab" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "act" | "evaluate");
     let _lease = if mutating {
         match crate::jianlai::lease_input("chrome") {
             Ok(lease) => Some(lease),
-            Err(error) if operation == "act" => return Ok(json!({"status":"not_executed","completedActions":0,"inputAttempted":false,
+            Err(error) if matches!(operation, "act" | "evaluate") => return Ok(json!({"status":"not_executed","completedActions":0,"inputAttempted":false,
                 "reason":error,"basedOnSnapshotId":args["snapshotId"],"verification":"unverified","browser":"chrome","tabTag":args["tabTag"]})),
             Err(error) => return Err(error),
         }
@@ -1675,14 +1724,14 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
         }
         return Ok(value);
     }
-    if !matches!(operation, "inspect" | "screenshot" | "act") {
+    if !matches!(operation, "inspect" | "screenshot" | "act" | "evaluate") {
         return Err("未知 chrome 操作".into());
     }
     let mut value = control_session(app, chrome_session(&thread_id, tag), operation, args).await?;
-    if operation == "act" && value["status"] != "not_executed" { retire_desktop(&mut value); }
+    if matches!(operation, "act" | "evaluate") && value["status"] != "not_executed" { retire_desktop(&mut value); }
     value["tabTag"] = json!(tag);
     value["browser"] = json!("chrome");
-    if operation == "act" && value["status"] != "executed" { value = errors_first(value); }
+    if matches!(operation, "act" | "evaluate") && value["status"] != "executed" { value = errors_first(value); }
     Ok(value)
 }
 
@@ -1977,7 +2026,7 @@ mod tests {
         observations.insert("chrome:owner:C2-test".into(), second);
         assert!(chrome_args(&inspect, "owner", &observations).is_err());
         assert_eq!(chrome_args(&act, "owner", &observations).unwrap()["tabTag"], "C1-test");
-        for operation in ["run", "experience_save", "experience_feedback", "goto", "close_tab"] {
+        for operation in ["run", "evaluate", "experience_save", "experience_feedback", "goto", "close_tab"] {
             let args = json!({"operation":operation,"snapshotId":"second"});
             assert_eq!(chrome_args(&args, "owner", &observations).unwrap()["tabTag"], "C2-test");
         }
@@ -2072,6 +2121,20 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_validates_script_frame_and_tool_contract() {
+        assert_eq!(evaluation_args(&json!({"expression":"document.title"})).unwrap(), ("document.title", 0));
+        assert_eq!(evaluation_args(&json!({"expression":"1", "frame":11})).unwrap().1, 11);
+        for args in [json!({}), json!({"expression":" "}), json!({"expression":32}),
+            json!({"expression":"x".repeat(32001)}), json!({"expression":"1","frame":-1}),
+            json!({"expression":"1","frame":12}), json!({"expression":"1","frame":0.5})] {
+            assert!(evaluation_args(&args).is_err(), "{args}");
+        }
+        let schema = crate::chrome_browser::tool_definition();
+        assert!(schema["inputSchema"]["properties"]["operation"]["enum"].as_array().unwrap().contains(&json!("evaluate")));
+        assert_eq!(schema["inputSchema"]["properties"]["expression"]["maxLength"], 32000);
+    }
+
+    #[test]
     fn missing_operation_is_inferred() {
         let op = |v: Value, key| infer_operation(&v, key).1;
         assert_eq!(op(json!({"tabTag":"C1-a","action":{"action":"press","key":"Enter"}}), "tabTag"), Some("act"));
@@ -2080,6 +2143,7 @@ mod tests {
         assert_eq!(op(json!({"url":"https://a.com","tabTag":"C1-a"}), "tabTag"), Some("goto"));
         assert_eq!(op(json!({"url":"https://a.com","browserId":"b"}), "browserId"), Some("open"));
         assert_eq!(op(json!({"tabTag":"C1-a"}), "tabTag"), Some("inspect"));
+        assert_eq!(op(json!({"tabTag":"C1-a","expression":"document.title"}), "tabTag"), Some("evaluate"));
         assert_eq!(op(json!({}), "tabTag"), Some("tabs"));
         assert_eq!(op(json!({"operation":"tabs"}), "tabTag"), None);
     }

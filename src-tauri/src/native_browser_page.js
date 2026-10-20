@@ -1,6 +1,6 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 22) return;
+  if (globalThis.__novaWebview?.apiVersion === 23) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   // Icon-only controls (sort carets, filter funnels, close ×) carry their meaning in class names.
   const iconHint = e => {
@@ -152,8 +152,20 @@
     return entry;
   };
   const api = {
-    apiVersion: 22,
+    apiVersion: 23,
     stamp,
+    async evaluate(expression, expectedDocument, expectedUrl) {
+      // Check and start in the same JS turn: navigation must never redirect a script to a new document.
+      if (documentId !== expectedDocument || location.href !== expectedUrl) return {status:'not_executed',reason:'页面已导航，请重新观察后决策，脚本未执行'};
+      try {
+        const value = await (0, eval)(expression);
+        const encoded = JSON.stringify(value ?? null);
+        if (encoded === undefined || encoded.length > 65536) throw Error('脚本已执行，但结果不可序列化或超过64K字符；请返回简短JSON结果，不要重放脚本');
+        return {status:'executed',value:JSON.parse(encoded)};
+      } catch (error) {
+        return {status:'needs_review',reason:String(error?.stack || error).slice(0,4000)};
+      }
+    },
     // Observed refs of the node and its ancestors (nearest first), so a refused coordinate click can name a DOM ref.
     refsOf(node) {
       const refs=[];

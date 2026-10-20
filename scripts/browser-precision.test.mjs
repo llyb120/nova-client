@@ -40,6 +40,23 @@ try {
     return call('observe',randomUUID());
   };
   const target=(obs,name)=> {const e=obs.items.find(e=>e.name===name);assert.ok(e,`missing ${name}`);return e;};
+  await run('evaluate annotates shared DOM, returns JSON and refuses a different document or URL',async()=>{
+    const obs=await fixture('<main>Requirement</main>');
+    const expression=`(() => { const n=document.createElement('aside'); n.className='nova-req-annot'; n.textContent='待确认'; document.body.append(n); return {count:document.querySelectorAll('.nova-req-annot').length}; })()`;
+    assert.deepEqual(await call('evaluate',expression,'different-document',obs.url),{status:'not_executed',reason:'页面已导航，请重新观察后决策，脚本未执行'});
+    assert.equal((await call('evaluate',expression,obs.document,obs.url+'#changed')).status,'not_executed');
+    assert.equal(await page.locator('.nova-req-annot').count(),0);
+    assert.deepEqual(await call('evaluate',expression,obs.document,obs.url),{status:'executed',value:{count:1}});
+    assert.equal(await page.locator('.nova-req-annot').count(),1,'isolated-world DOM is visible to the page');
+    assert.deepEqual(await call('evaluate','Promise.resolve({ok:true})',obs.document,obs.url),{status:'executed',value:{ok:true}});
+    assert.deepEqual(await call('evaluate','undefined',obs.document,obs.url),{status:'executed',value:null});
+    for(const expression of ['throw Error("test-error")','1n','"x".repeat(65537)','(() => { const x={}; x.x=x; return x; })()']) {
+      const result=await call('evaluate',expression,obs.document,obs.url);
+      assert.equal(result.status,'needs_review');assert.ok(result.reason);
+    }
+    await call('evaluate',"document.querySelector('.nova-req-annot').remove()",obs.document,obs.url);
+    assert.equal(await page.locator('.nova-req-annot').count(),0);
+  });
   await run('trusted wheel reaches nested button-filled panes on both axes and RTL',async()=>{
     for(const horizontal of [false,true])for(const rtl of horizontal?[false,true]:[false]) {
       const obs=await fixture(`<aside aria-label="Results pane" style="width:240px;height:160px;overflow:auto;direction:${rtl?'rtl':'ltr'}"><button style="box-sizing:border-box;width:${horizontal?"1200px":"100%"};height:${horizontal?"100%":"900px"}" onclick="window.clicks++">Records</button></aside><script>window.clicks=0</script>`);
@@ -204,7 +221,7 @@ try {
     assert.equal((await fixture('<table aria-rowcount="0" style="width:100px;height:10px"></table>')).tables[0].totalRows,0);
     await evaluate('Object.defineProperty(globalThis,"__novaWebview",{value:{apiVersion:7},configurable:true}); true');
     await evaluate(engine);
-    assert.equal(await evaluate('__novaWebview.apiVersion'),22,'Existing Chrome worlds must upgrade to current DOM hints');
+    assert.equal(await evaluate('__novaWebview.apiVersion'),23,'Existing Chrome worlds must upgrade to current DOM hints');
     assert.equal((await call('observe',randomUUID())).tables[0].totalRows,0);
   });
   await run('native and ARIA checkboxes expose role and current selection',async()=>{
