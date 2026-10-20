@@ -35,7 +35,7 @@ const TABS: [Tab, string, string][] = [
   ["assistant", "助理", "M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1L5 10.5l5.1-1.9zM18.5 15.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"],
   ["session", "会话", "M5.5 5h13A1.5 1.5 0 0120 6.5v8a1.5 1.5 0 01-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 014 14.5v-8A1.5 1.5 0 015.5 5zM8.5 10.5h7"],
   ["capsules", "星尘", "M12 3.8l2.5 5.1 5.6.8-4 4 .9 5.6-5-2.6-5 2.6.9-5.6-4-4 5.6-.8z"],
-  ["quick", "快捷", "M5 4.5h4.5A.5.5 0 0110 5v4.5a.5.5 0 01-.5.5H5a.5.5 0 01-.5-.5V5a.5.5 0 01.5-.5zM14.5 4.5H19a.5.5 0 01.5.5v4.5a.5.5 0 01-.5.5h-4.5a.5.5 0 01-.5-.5V5a.5.5 0 01.5-.5zM5 14h4.5a.5.5 0 01.5.5V19a.5.5 0 01-.5.5H5a.5.5 0 01-.5-.5v-4.5A.5.5 0 015 14zM14.5 14H19a.5.5 0 01.5.5V19a.5.5 0 01-.5.5h-4.5a.5.5 0 01-.5-.5v-4.5a.5.5 0 01.5-.5z"],
+  ["quick", "星海", "M5 4.5h4.5A.5.5 0 0110 5v4.5a.5.5 0 01-.5.5H5a.5.5 0 01-.5-.5V5a.5.5 0 01.5-.5zM14.5 4.5H19a.5.5 0 01.5.5v4.5a.5.5 0 01-.5.5h-4.5a.5.5 0 01-.5-.5V5a.5.5 0 01.5-.5zM5 14h4.5a.5.5 0 01.5.5V19a.5.5 0 01-.5.5H5a.5.5 0 01-.5-.5v-4.5A.5.5 0 015 14zM14.5 14H19a.5.5 0 01.5.5V19a.5.5 0 01-.5.5h-4.5a.5.5 0 01-.5-.5v-4.5a.5.5 0 01.5-.5z"],
 ];
 const clock = (ms = 0) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
 const icon = (d: string, size = 22) => (
@@ -83,6 +83,45 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
     }
     props.reload();
   };
+  // 星海 apps can be dragged out of the card: release outside launches with a screenshot of that spot.
+  let card: HTMLDivElement | undefined;
+  let drag: { id: string; x: number; y: number; moved: boolean; cancelled?: boolean } | undefined;
+  let dragged = false;
+  const [dropHint, setDropHint] = createSignal<{ name: string; outside: boolean } | null>(null);
+  // A right click cancels: seen here while the pointer is captured, and by the native ripple tracker outside.
+  const cancelDrag = () => { if (drag?.moved) { drag.cancelled = true; setDropHint(null); } };
+  onMount(() => {
+    const off = listen("taskbar-bubble:drag-cancel", cancelDrag);
+    onCleanup(() => void off.then(remove => remove()));
+  });
+  const outsideCard = (event: PointerEvent) => {
+    const r = card!.getBoundingClientRect();
+    return event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom;
+  };
+  const dragHandlers = (app: { id: string; name: string }) => ({
+    onPointerDown: (event: PointerEvent) => {
+      if (event.button !== 0) return;
+      dragged = false;
+      drag = { id: app.id, x: event.clientX, y: event.clientY, moved: false };
+      (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    },
+    onPointerMove: (event: PointerEvent) => {
+      if (!drag || drag.id !== app.id || drag.cancelled || (!drag.moved && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 6)) return;
+      if (drag.moved && event.buttons & 2) return cancelDrag();
+      if (!drag.moved) void invoke("taskbar_quick", { action: "drag-start" }).catch(() => {}); // Ripple is decoration only.
+      drag.moved = true;
+      setDropHint({ name: app.name || "未命名应用", outside: outsideCard(event) });
+    },
+    onPointerUp: (event: PointerEvent) => {
+      const current = drag;
+      drag = undefined;
+      setDropHint(null);
+      if (!current?.moved) return;
+      dragged = true; // The capture still delivers a click to the tile; it is not a launch.
+      if (!current.cancelled && outsideCard(event)) void run(`miniapp-drop:${app.id}`);
+    },
+    onPointerCancel: () => { drag = undefined; setDropHint(null); },
+  });
   const rec = () => props.data.jianpu.recording;
   // Fixed button nodes with reactive labels: the 1s refresh (recording clock) must not rebuild the DOM
   // under the pointer, or a click spanning the refresh is lost.
@@ -92,7 +131,7 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
     { action: "knowledge", label: () => "知识图谱", icon: () => ICONS.graph, hot: () => false },
   ];
   return (
-    <div class={`tb-card tb-panel ${props.card?.kind ?? "idle"}`}>
+    <div ref={card} class={`tb-card tb-panel ${props.card?.kind ?? "idle"}`}>
       <nav class="tb-tabs" role="tablist" aria-label="蝴蝶面板" aria-orientation="vertical">
         <For each={TABS}>
           {([id, label, d]) => (
@@ -120,7 +159,7 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
             <svg viewBox="0 0 12 12" width="10" height="10"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
           </button>
         </header>
-        <TaskbarAssistant active={props.active && props.tab === "assistant"} shown={props.active} focusRequest={props.focusRequest} />
+        <TaskbarAssistant active={props.active && props.tab === "assistant"} shown={props.active} quick={props.tab === "quick"} focusRequest={props.focusRequest} />
         <div id="tb-pane-capsules" role="tabpanel" aria-labelledby="tb-tab-capsules" class="tb-capsules-pane" hidden={props.tab !== "capsules"}>
           <ThoughtCapsules active={props.active && props.tab === "capsules"} onCaptured={() => props.setTab("capsules")} />
         </div>
@@ -137,7 +176,9 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
             </For>
             <For each={miniApps()}>
               {app => (
-                <button type="button" class="tb-tile" style={{ "min-width": "0" }} title={`${app.name || "未命名应用"}${app.version ? ` · v${app.version}` : ""}`} onClick={() => void run(`miniapp:${app.id}`)}>
+                <button type="button" class="tb-tile" style={{ "min-width": "0", "touch-action": "none" }} title={`${app.name || "未命名应用"}${app.version ? ` · v${app.version}` : ""}\n拖到面板外松开：在该处启动并截图`} {...dragHandlers(app)}
+                  onClick={() => { if (dragged) { dragged = false; return; } void run(`miniapp:${app.id}`); }}
+                  onContextMenu={event => { if (dragged || drag?.moved) event.preventDefault(); }}>
                   {icon(ICONS.app)}
                   <span style={{ "max-width": "100%", overflow: "hidden", "text-overflow": "ellipsis" }}>{app.name || "未命名应用"}</span>
                 </button>
@@ -145,6 +186,7 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
             </For>
           </div>
         </div>
+        <Show when={dropHint()}>{hint => <div class="tb-drop-hint" role="status">{hint().outside ? `松开：启动「${hint().name}」，截取此处窗口作为会话附件` : "拖到面板外松开，即在该处启动并截图"}；右键取消</div>}</Show>
         <Show when={error()}>
           <div class="tb-reply-error" role="alert">{error()}</div>
         </Show>
@@ -401,7 +443,7 @@ export default function TaskbarBubble() {
     setPanel({ jianpu: next.jianpu ?? { recording: false } });
     if (fresh) {
       const quick = next.tab === "quick";
-      focusPending = next.panel === false && !quick;
+      focusPending = next.panel === false;
       setTab(quick ? "quick" : "assistant");
     }
     if (next.captureError) setCaptureError(next.captureError);

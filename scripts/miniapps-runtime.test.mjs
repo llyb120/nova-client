@@ -23,6 +23,7 @@ const compiled = stripTypeScriptTypes(
   source.slice(start, end).replace('export default function MiniAppsView', 'function MiniAppsView') + threadHelper + `
   return { apps, activeId, doc, values, setValues, error, logs, lastThread, locked, permissions, showThread,
     choose, switchMode, selectBlock, selectedIds, setPageId,
+    browserMatch, setBrowserMatch, saveBrowserConfig, undo,
     optionLoads, optionsKey, availableOptions, requestOptions, openOptions: block => (${optionsOpen})(),
     activate, test, checks, publish, publishLabel, pinVersion, restoreVersion, unpublish, startRun, pollRun, cancelRun,
     generate, instruction, setInstruction, designKeyDown, previewStyle, publishDisabled: () => (${publishDisabled}) };
@@ -118,6 +119,59 @@ test('the miniapp entry branch mounts only its runtime and never App or initStor
   const mainOnly = /\binitStore\b|import\(["']\.\/App["']\)|<App\b/;
   assert.doesNotMatch(branch[1], mainOnly);
   assert.doesNotMatch(entry.slice(0, entry.indexOf('\nif (')), /\b(?:App|initStore)\b/);
+});
+
+test('browser activation can be configured without AI, preserving bindings, publication and undo', t => {
+  const draft = clone(model.DEMO_APP);
+  draft.browser = { match: ['https://old.example/*'], actionId: 'draft', urlField: 'tasks', titleField: 'tasks' };
+  const item = saved({ draft, published: clone(draft) });
+  const view = mount(t, [item]);
+  assert.equal(view.browserMatch(), 'https://old.example/*');
+  view.calls.length = 0;
+  view.setBrowserMatch('  https://example.com/work/*  \r\n\n*://other.example/*\nhttps://example.com/work/*');
+  view.saveBrowserConfig();
+  assert.equal(view.error(), '');
+  const stored = view.persisted()[0];
+  assert.deepEqual(stored.draft.browser, { ...draft.browser, match: ['https://example.com/work/*', '*://other.example/*'] });
+  assert.deepEqual(stored.draft.pages, draft.pages);
+  assert.deepEqual(stored.draft.actions, draft.actions);
+  assert.deepEqual(stored.published, draft, 'configuration must not silently change the live version');
+  assert.deepEqual(stored.history, [draft]);
+  assert.deepEqual(view.calls, [], 'manual configuration must not invoke AI or tools');
+  assert.equal(view.publishDisabled(), false);
+  view.publish();
+  assert.deepEqual(model.browserTriggers(JSON.stringify(view.persisted()))[0].match, stored.draft.browser.match);
+  view.setBrowserMatch(' \n ');
+  view.saveBrowserConfig();
+  assert.equal(Object.hasOwn(view.persisted()[0].draft, 'browser'), false);
+  assert.ok(view.persisted()[0].published.browser, 'clearing the draft must not disable the live version before publishing');
+  view.undo();
+  assert.deepEqual(view.persisted()[0].draft.browser, stored.draft.browser);
+});
+
+test('browser configuration rejects invalid rules, respects read-only mode and reloads per app', t => {
+  const items = [saved(), saved()];
+  items[1].draft.browser = { match: ['https://second.example/*'] };
+  const view = mount(t, items);
+  const original = view.storage.getItem(KEY);
+  for (const text of ['file:///private', 'https://a b', Array.from({ length: 21 }, (_, i) => `https://example.com/${i}`).join('\n'), `https://example.com/${'x'.repeat(2048)}`]) {
+    view.setBrowserMatch(text);
+    view.saveBrowserConfig();
+    assert.ok(view.error());
+    assert.equal(view.storage.getItem(KEY), original);
+  }
+  view.choose(items[1].id);
+  view.flushEffects();
+  assert.equal(view.browserMatch(), 'https://second.example/*');
+  view.setBrowserMatch('https://changed.example/*');
+  view.saveBrowserConfig();
+  assert.equal(view.error(), '');
+  view.publish();
+  const published = view.storage.getItem(KEY);
+  view.switchMode('run');
+  view.setBrowserMatch('https://not-saved.example/*');
+  view.saveBrowserConfig();
+  assert.equal(view.storage.getItem(KEY), published);
 });
 
 test('design composer sends Enter, but Shift+Enter, held Enter and IME confirmation never submit', async t => {

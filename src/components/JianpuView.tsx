@@ -92,7 +92,7 @@ export default function JianpuView() {
     <Show when={error()}><p class="jianpu-error" role="alert">{error()}</p></Show>
     <div class="jianpu-body">
       <aside class="jianpu-list">
-        <For each={list()} fallback={<p class="jianpu-empty">还没有剑谱。在任意应用里按 {state.settings?.jianpuShortcut || "Alt+R"}，或在 Butterfly 面板「快捷」里点「剑谱录制」开始，演示完再按一次停止。</p>}>
+        <For each={list()} fallback={<p class="jianpu-empty">还没有剑谱。在任意应用里按 {state.settings?.jianpuShortcut || "Alt+R"}，或在 Butterfly 面板「星海」里点「剑谱录制」开始，演示完再按一次停止。</p>}>
           {item => <button class="jianpu-item" classList={{ active: selected() === item.id }} onClick={() => setSelected(item.id)}>
             <strong>{item.apps.join("、") || "未录到应用"}</strong>
             <small>{new Date(item.startedAt).toLocaleString()} · {item.steps} 步 · <span class={`jianpu-state ${item.state}`}>{STATE[item.state]}</span></small>

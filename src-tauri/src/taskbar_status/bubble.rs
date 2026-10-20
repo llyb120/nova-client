@@ -12,8 +12,8 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT},
     Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED},
-    UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
-    UI::WindowsAndMessaging::{GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowRect, GA_ROOTOWNER, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE},
+    UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON},
+    UI::WindowsAndMessaging::{GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GA_ROOT, GA_ROOTOWNER, GWL_EXSTYLE, GetWindowDisplayAffinity, HWND_TOPMOST, IsWindowVisible, WDA_EXCLUDEFROMCAPTURE, WindowFromPoint, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WS_EX_TOOLWINDOW},
 };
 
 const LABEL: &str = "taskbar-bubble";
@@ -136,12 +136,6 @@ pub(super) fn activate(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(LABEL) { focus(&window); }
 }
 
-/// The panel (not just its hover preview) holds the foreground.
-pub(super) fn focused(app: &AppHandle) -> bool {
-    WANTED.load(Ordering::Acquire) && app.get_webview_window(LABEL).and_then(|w| w.hwnd().ok())
-        .is_some_and(|hwnd| unsafe { GetForegroundWindow() } == hwnd.0 as HWND)
-}
-
 /// Show and focus natively. Hover shows with ShowWindow, so tao's VISIBLE flag lags; tao's
 /// show() would then flip it and re-apply the window style with SWP_FRAMECHANGED, which
 /// flashes the transparent WebView on every click into the panel. hide() already hides
@@ -203,7 +197,8 @@ fn watch_panel(app: &AppHandle) {
             let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
             (unsafe { IsWindowVisible(panel) }) != 0 && (unsafe { GetWindowRect(panel, &mut r) }) != 0 && inside((r.left, r.top, r.right, r.bottom), p)
         };
-        if inside((c.left, c.top, c.right, c.bottom), p) || over_panel { away = None; continue; }
+        // A held button may be a 星海 app dragged out of the panel: keep it until release.
+        if inside((c.left, c.top, c.right, c.bottom), p) || over_panel || held(VK_LBUTTON) { away = None; continue; }
         if away.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(300) {
             if PANEL.load(Ordering::Acquire) { hide(app); }
             break;
@@ -348,17 +343,138 @@ fn name(kind: Kind) -> &'static str {
     }
 }
 
+const WAND: &str = "drag-wand";
+/// Logical size of the magic-wand window centred on the pointer while a 星海 app is dragged out.
+const WAND_SIZE: f64 = 280.0;
+static WAND_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Bumped per drag: a lingering release burst never hides the next drag's wand.
+static WAND_DRAG: AtomicUsize = AtomicUsize::new(0);
+
+fn held(key: u16) -> bool { (unsafe { GetAsyncKeyState(key as i32) }) as u16 & 0x8000 != 0 }
+
+/// Click-through, never focused, excluded from every capture (so never in the drop screenshot).
+fn wand_window(app: &AppHandle) -> Option<WebviewWindow> {
+    if let Some(window) = app.get_webview_window(WAND) { return Some(window); }
+    // Empty title: xcap only skips untitled tool windows.
+    let window = tauri::WebviewWindowBuilder::new(app, WAND, tauri::WebviewUrl::App("drag-wand.html".into()))
+        .title("").decorations(false).resizable(false).shadow(false)
+        .transparent(true).background_color(tauri::window::Color(0, 0, 0, 0))
+        .always_on_top(true).skip_taskbar(true).visible(false).focused(false).focusable(false)
+        .content_protected(true).inner_size(WAND_SIZE, WAND_SIZE)
+        .build().map_err(|error| eprintln!("[taskbar-status] cannot create drag wand: {error}")).ok()?;
+    window.set_ignore_cursor_events(true).ok()?;
+    Some(window)
+}
+
+/// A 星海 app left the panel: a small magic wand rides the pointer (the window moves, the page only
+/// animates), scattering sparkles opposite to the motion. Release bursts; a right click cancels the
+/// drag and the panel is told so its release launches nothing.
+fn drag_start(app: &AppHandle) {
+    if WAND_ACTIVE.swap(true, Ordering::AcqRel) { return; }
+    let drag = WAND_DRAG.fetch_add(1, Ordering::AcqRel) + 1;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Some((window, hwnd)) = wand_window(&app).and_then(|w| { let h = w.hwnd().ok()?.0 as HWND; Some((w, h)) }) else {
+            WAND_ACTIVE.store(false, Ordering::Release);
+            return;
+        };
+        let size = (WAND_SIZE * ANCHOR.lock().unwrap().map_or(1.0, |anchor| anchor.scale)).round() as i32;
+        let _ = window.eval("window.wand && wand.reset()");
+        let excluded = unsafe {
+            // tao drops the added TOOLWINDOW when it recomputes styles; keep it off Alt+Tab.
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW as isize);
+            let mut affinity = 0;
+            GetWindowDisplayAffinity(hwnd, &mut affinity) != 0 && affinity == WDA_EXCLUDEFROMCAPTURE
+        };
+        let (mut p, mut shown, mut tick) = (POINT { x: 0, y: 0 }, false, 0u32);
+        let (mut previous, mut sent): (Option<POINT>, Option<(i32, i32)>) = (None, None);
+        let cancelled = loop {
+            if !held(VK_LBUTTON) { break false; }
+            if held(VK_RBUTTON) { break true; }
+            if unsafe { GetCursorPos(&mut p) } != 0 && previous.map_or(true, |q| q.x != p.x || q.y != p.y) {
+                previous = Some(p);
+                unsafe { SetWindowPos(hwnd, HWND_TOPMOST, p.x - size / 2, p.y - size / 2, size, size, SWP_NOACTIVATE | SWP_SHOWWINDOW); }
+                // Also through tao once: a Win32-only show leaves WebView2 thinking it is hidden, animations frozen.
+                if !shown { shown = true; let _ = window.show(); }
+            }
+            // The meteor tail needs the pointer path: screen position at ~60Hz, only when it changed.
+            tick += 1;
+            if tick % 2 == 0 && sent != Some((p.x, p.y)) && previous.is_some() {
+                sent = Some((p.x, p.y));
+                let _ = window.eval(format!("window.wand && wand.at({},{})", p.x, p.y));
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        };
+        WAND_ACTIVE.store(false, Ordering::Release);
+        let linger = if cancelled {
+            let _ = app.emit_to(LABEL, "taskbar-bubble:drag-cancel", ());
+            let _ = window.eval("window.wand && wand.cancel()");
+            250
+        } else {
+            let _ = window.eval("window.wand && wand.release()");
+            // Without capture exclusion the wand must be gone before the drop screenshot (150ms).
+            if excluded { 700 } else { 0 }
+        };
+        std::thread::sleep(Duration::from_millis(linger));
+        if WAND_DRAG.load(Ordering::Acquire) == drag {
+            let _ = window.hide();
+            unsafe { ShowWindow(hwnd, SW_HIDE); }
+        }
+    });
+}
+
+/// The window under a screen point (or its monitor, e.g. desktop/taskbar) as a prompt image.
+/// The caller hides the panel first, so it is never in the picture.
+fn capture_at(p: POINT) -> Result<Value, String> {
+    use base64::Engine;
+    use xcap::image::{codecs::jpeg::JpegEncoder, imageops, DynamicImage, ExtendedColorType};
+    let hwnd = unsafe { GetAncestor(WindowFromPoint(p), GA_ROOT) };
+    let mut image = xcap::Window::all().ok()
+        .and_then(|all| all.into_iter().find(|w| w.id().ok() == Some(hwnd as usize as u32)))
+        .and_then(|w| w.capture_image().ok())
+        .or_else(|| xcap::Monitor::from_point(p.x, p.y).ok()?.capture_image().ok())
+        .ok_or("无法截取松开位置的窗口")?;
+    let long = image.width().max(image.height());
+    if long > 2048 {
+        let k = 2048.0 / long as f32;
+        image = imageops::resize(&image, (image.width() as f32 * k) as u32, (image.height() as f32 * k) as u32, imageops::FilterType::Triangle);
+    }
+    let rgb = DynamicImage::ImageRgba8(image).into_rgb8();
+    let mut bytes = Vec::new();
+    JpegEncoder::new_with_quality(&mut bytes, 85)
+        .encode(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "name": "拖放位置截图.jpg", "mimeType": "image/jpeg", "size": bytes.len(),
+        "data": base64::engine::general_purpose::STANDARD.encode(&bytes) }))
+}
+
 /// Panel quick actions. Anything that needs the full window hands over to it and closes the panel.
 pub(super) fn quick(app: &AppHandle, action: &str) -> Result<Value, String> {
+    // A 星海 app dropped outside the panel: capture where it landed, then open the app with it.
+    if let Some(app_id) = action.strip_prefix("miniapp-drop:") {
+        let id = crate::miniapp_window::parse_id(app_id)?;
+        let mut p = POINT { x: 0, y: 0 };
+        unsafe { GetCursorPos(&mut p) };
+        hide(app);
+        // ponytail: one fixed wait for DWM to compose the hidden panel away; transitions are off,
+        // so a couple of frames suffice. Poll the screen if a slow machine still shows it.
+        std::thread::sleep(Duration::from_millis(150));
+        let context = capture_at(p).map(|image| json!({ "image": image })).unwrap_or_else(|error| json!({ "imageError": error }));
+        crate::miniapp_window::launch(app, id, app_id, context)?;
+        return Ok(Value::Null);
+    }
     let request = match action {
+        "drag-start" => { drag_start(app); return Ok(Value::Null); }
         "jianpu" => return crate::jianpu::toggle(),
         "knowledge" => json!({ "view": "knowledge" }),
         "miniapps" => json!({ "view": "miniapps", "create": true }),
         _ => {
             let id = action.strip_prefix("miniapp:")
                 .ok_or_else(|| format!("未知快捷操作：{action}"))?;
+            let uuid = crate::miniapp_window::parse_id(id)?;
             hide(app);
-            crate::miniapp_window::open(app, id)?;
+            // An empty launch context still marks a fresh start, so autoRun fires on every launch.
+            crate::miniapp_window::launch(app, uuid, id, json!({}))?;
             return Ok(Value::Null);
         }
     };

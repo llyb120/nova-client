@@ -162,7 +162,7 @@ impl IDropTarget_Impl for Target_Impl {
             // Capture silently in the background; only a failure surfaces the panel (on its
             // current tab). The persisted error also works for a cold page.
             match copied {
-                Ok((text, paths)) => super::capsules::capture_drop(app.clone(), text, paths, None),
+                Ok((text, paths)) => super::capsules::capture_drop(app.clone(), text, paths),
                 Err(error) => {
                     super::bubble::capture_error(app, error);
                     if let Some(anchor) = anchor { super::bubble::open_panel(app, anchor); }

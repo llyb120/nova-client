@@ -922,7 +922,7 @@ pub const EV_BACKENDS: &str = "backends:availability";
 /// Lyra 进程内运行，不依赖 CLI 路径；其余支持的后端按 CLI 路径检测。
 fn backend_is_available(kind: &AgentKind, program: &str) -> bool {
     *kind == AgentKind::Lyra
-        || (*kind != AgentKind::Unsupported && acp::resolve_program_on_path(program).is_some())
+        || (*kind != AgentKind::Unsupported && acp::program_available(program))
 }
 
 #[cfg(test)]
@@ -5731,6 +5731,8 @@ pub fn run() {
             miniapp_window::miniapp_scene_model,
             miniapp_window::miniapp_show_thread,
             miniapp_window::miniapp_pending_permissions,
+            miniapp_window::miniapp_browser_triggers,
+            miniapp_window::miniapp_take_launch,
             meteor::meteor_open,
             meteor::meteor_context,
             meteor::meteor_submit,

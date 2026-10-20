@@ -110,15 +110,26 @@
 .mini-preview-footer { padding-top: 32px; color: #626d80; font-size: 12px; text-align: center; }
 .mini-preview-footer span { margin: 0 6px; }
 .mini-copilot { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg-panel); border-left: 1px solid var(--border); }
-.mini-side-tabs { display: flex; gap: 4px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
-.mini-side-tabs button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1; padding: 7px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--text-muted); font-size: 12px; }
+.mini-side-tabs { display: flex; flex-wrap: wrap; gap: 4px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.mini-side-tabs button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1; padding: 7px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--text-muted); font-size: 12px; white-space: nowrap; }
 .mini-side-tabs button:hover { background: var(--bg-hover); }
 .mini-side-tabs button.active { background: var(--bg-active); color: var(--text); box-shadow: var(--shadow-sm); }
 .mini-side-tabs button > span:first-child { color: var(--accent); }
 .mini-count { min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--bg-input); color: var(--text-muted); font: 12px/18px var(--mono); }
 .mini-chat { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-.mini-chat[hidden], .mini-versions[hidden] { display: none; }
+.mini-chat[hidden], .mini-versions[hidden], .mini-browser-config[hidden] { display: none; }
+.mini-browser-config { flex: 1; min-height: 0; padding: 16px; overflow-y: auto; }
+.mini-browser-config label { display: block; font-size: 13px; font-weight: 600; }
+.mini-browser-help { color: var(--text-muted); font-size: 12px; line-height: 1.8; }
+.mini-browser-config textarea { box-sizing: border-box; width: 100%; resize: vertical; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-input); color: var(--text); font: 12px/1.8 var(--mono); }
+.mini-browser-config > button { margin-top: 12px; padding: 7px 12px; font-size: 13px; }
 .mini-versions { flex: 1; min-height: 0; padding: 16px; overflow-y: auto; }
+.mini-diagnosis { flex: 1; min-height: 0; padding: 16px; overflow-y: auto; }
+.mini-diagnosis textarea { box-sizing: border-box; width: 100%; resize: vertical; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-input); color: var(--text); font: inherit; font-size: 13px; line-height: 1.7; }
+.mini-diagnosis-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.mini-diagnosis-actions button:not(.mini-primary) { padding: 6px 10px; border: 1px solid var(--border); border-radius: 7px; background: transparent; color: var(--text-muted); font-size: 12px; }
+.mini-diagnosis-summary, .mini-diagnosis-note { color: var(--text-muted); font-size: 12px; line-height: 1.7; }
+.mini-diagnosis .mini-message .mini-primary { margin-top: 10px; }
 .mini-versions-intro, .mini-versions-empty { margin: 0 0 14px; color: var(--text-muted); font-size: 13px; line-height: 1.8; }
 .mini-version-list { list-style: none; display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; }
 .mini-version-list li { padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
@@ -204,4 +215,7 @@
 .mini-runtime .mini-preview { min-height: 0; max-width: none; padding: 0; border: none; border-radius: 0; box-shadow: none; }
 .mini-run-status { display: flex; justify-content: space-between; gap: 12px; padding: 10px 24px; border-top: 1px solid #e5e7ee; color: #697183; font-size: 12px; }
 .mini-run-status button { border: 0; background: none; color: #5d65d8; }
+.mini-drop-image { align-items: center; }
+.mini-drop-image img { width: 64px; height: 40px; object-fit: cover; border: 1px solid #e5e7ee; border-radius: 4px; }
+.mini-drop-image span { flex: 1; }
 @media (prefers-reduced-motion: reduce) { .mini-studio *, .mini-studio *::before { transition: none !important; animation: none !important; } }

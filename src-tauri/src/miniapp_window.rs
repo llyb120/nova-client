@@ -1,12 +1,88 @@
 //! Independent runtime windows; design sessions remain main-window-only.
 use crate::{settings::{ModelTarget, Scene}, AppState};
-use std::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{collections::HashMap, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow};
 use uuid::Uuid;
 
 // ponytail: serialize all runtime window creation to prevent duplicate labels;
 // use per-app locks if concurrent cold window creation becomes a bottleneck.
 static BUILD: Mutex<()> = Mutex::new(());
+/// Published apps that Nova Chrome may mount on matching pages (pushed by the main window).
+static TRIGGERS: Mutex<Vec<BrowserTrigger>> = Mutex::new(Vec::new());
+/// The latest launch context per app (page click or drop screenshot), consumed once by its runtime window.
+static LAUNCHES: Mutex<Option<HashMap<Uuid, Value>>> = Mutex::new(None);
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserTrigger {
+    app_id: String,
+    name: String,
+    #[serde(rename = "match")]
+    patterns: Vec<String>,
+}
+
+fn validate_triggers(triggers: &[BrowserTrigger]) -> Result<(), String> {
+    if triggers.len() > 100 {
+        return Err("网页激活应用最多 100 个".into());
+    }
+    for trigger in triggers {
+        parse_id(&trigger.app_id)?;
+        if trigger.name.chars().count() > 200 || trigger.patterns.is_empty() || trigger.patterns.len() > 20 {
+            return Err("网页激活配置无效".into());
+        }
+        if !trigger.patterns.iter().all(|p| p.len() <= 2048 && !p.chars().any(char::is_whitespace)
+            && ["http://", "https://", "*://"].iter().any(|scheme| p.starts_with(scheme) && p.len() > scheme.len())) {
+            return Err("网页激活网址模式无效".into());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn browser_triggers() -> Value {
+    serde_json::to_value(&*TRIGGERS.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or_default()
+}
+
+/// A user click on the Chrome page icon: remember the page, then open the app window.
+pub(crate) async fn browser_launch(app: &AppHandle, body: &Value) -> Result<(), String> {
+    let app_id = body["appId"].as_str().unwrap_or_default().to_string();
+    let id = parse_id(&app_id)?;
+    if !TRIGGERS.lock().map_err(|_| "网页激活锁不可用")?.iter().any(|t| t.app_id == app_id) {
+        return Err("该应用未发布网页激活配置".into());
+    }
+    let url = body["url"].as_str()
+        .filter(|u| u.len() <= 8192 && (u.starts_with("http://") || u.starts_with("https://")))
+        .ok_or("网页地址无效")?;
+    let title: String = body["title"].as_str().unwrap_or_default().chars().take(1000).collect();
+    let context = json!({"url": url, "title": title});
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || launch(&handle, id, &app_id, context)).await.map_err(|e| e.to_string())?
+}
+
+/// Open the app with a one-shot launch context. Call off the UI thread, like `open`.
+pub(crate) fn launch(app: &AppHandle, id: Uuid, app_id: &str, context: Value) -> Result<(), String> {
+    LAUNCHES.lock().map_err(|_| "启动信息锁不可用")?.get_or_insert_with(HashMap::new).insert(id, context);
+    open(app, app_id)?;
+    // A cold window takes the launch on mount; a warm one wakes up here.
+    app.emit("miniapp:launch", ()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn miniapp_browser_triggers(window: WebviewWindow, triggers: Vec<BrowserTrigger>) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("仅主窗口可以更新网页激活配置".into());
+    }
+    validate_triggers(&triggers)?;
+    *TRIGGERS.lock().map_err(|_| "网页激活锁不可用")? = triggers;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn miniapp_take_launch(window: WebviewWindow) -> Result<Option<Value>, String> {
+    let Some(id) = runtime_app_id(window.label())? else { return Ok(None) };
+    Ok(LAUNCHES.lock().map_err(|_| "网页激活锁不可用")?.as_mut().and_then(|launches| launches.remove(&id)))
+}
 
 pub(crate) fn parse_id(value: &str) -> Result<Uuid, String> {
     let id = Uuid::parse_str(value).map_err(|_| "appId/runId 必须是标准小写 UUID")?;
@@ -43,7 +119,7 @@ pub(crate) fn allows_command(label: &str, command: &str) -> bool {
     matches!(runtime_app_id(label), Ok(Some(_))) && matches!(command,
         "miniapp_open" | "miniapp_scene_model" | "miniapp_show_thread"
         | "miniapp_pending_permissions" | "miniapp_command_start"
-        | "miniapp_command_status" | "miniapp_command_cancel"
+        | "miniapp_command_status" | "miniapp_command_cancel" | "miniapp_take_launch"
         | "scratch_dir" | "create_thread" | "send_prompt" | "list_threads"
         | "get_thread_view" | "cancel_turn" | "respond_permission"
     )
@@ -65,7 +141,7 @@ pub(crate) fn open(app: &AppHandle, app_id: &str) -> Result<(), String> {
         tauri::WebviewWindowBuilder::new(app, &label, url)
             .title("观星台")
             .inner_size(900.0, 720.0)
-            .min_inner_size(600.0, 480.0)
+            .min_inner_size(320.0, 240.0)
             .center()
             .visible(false)
             .focused(false)
@@ -144,17 +220,28 @@ mod tests {
     #[test]
     fn runtime_command_allowlist_keeps_actions_but_denies_admin_commands() {
         let label = format!("miniapp-{APP}");
-        for command in ["miniapp_open", "miniapp_scene_model", "miniapp_show_thread", "miniapp_pending_permissions", "miniapp_command_start", "miniapp_command_status", "miniapp_command_cancel", "scratch_dir", "create_thread", "send_prompt", "list_threads", "get_thread_view", "cancel_turn", "respond_permission"] {
+        for command in ["miniapp_open", "miniapp_scene_model", "miniapp_show_thread", "miniapp_pending_permissions", "miniapp_command_start", "miniapp_command_status", "miniapp_command_cancel", "miniapp_take_launch", "scratch_dir", "create_thread", "send_prompt", "list_threads", "get_thread_view", "cancel_turn", "respond_permission"] {
             assert!(allows_command(&label, command), "{command}");
             assert!(!allows_command("miniapp-not-a-uuid", command));
             assert!(!allows_command(&format!("miniapp-{}", APP.to_uppercase()), command));
         }
-        for command in ["set_settings", "miniapp_generate", "delete_thread", "terminal_create", "get_settings", "miniapp_unknown", ""] {
+        for command in ["set_settings", "miniapp_generate", "miniapp_browser_triggers", "delete_thread", "terminal_create", "get_settings", "miniapp_unknown", ""] {
             assert!(!allows_command(&label, command), "{command}");
             for existing in ["main", "meteor", "taskbar-bubble"] {
                 assert!(allows_command(existing, command), "existing window {existing}");
             }
         }
+    }
+
+    #[test]
+    fn browser_triggers_accept_only_canonical_ids_and_web_patterns() {
+        let trigger = |id: &str, pattern: &str| BrowserTrigger { app_id: id.into(), name: "a".into(), patterns: vec![pattern.into()] };
+        assert!(validate_triggers(&[trigger(APP, "https://github.com/*/pull/*"), trigger(OTHER, "*://example.com/*")]).is_ok());
+        for (id, pattern) in [(APP, "file:///etc/*"), (APP, "https://"), (APP, "https://a b"), ("not-a-uuid", "https://a")] {
+            assert!(validate_triggers(&[trigger(id, pattern)]).is_err(), "{id} {pattern}");
+        }
+        let json: BrowserTrigger = serde_json::from_value(json!({"appId": APP, "name": "a", "match": ["https://a/*"]})).unwrap();
+        assert_eq!(serde_json::to_value(json).unwrap()["match"][0], "https://a/*");
     }
 
     #[test]

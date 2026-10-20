@@ -25,6 +25,8 @@ pub(crate) struct ChromeBridge {
     receiver: tokio::sync::Mutex<mpsc::Receiver<Value>>,
     pending: Mutex<Pending>,
     cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Opens miniapp windows for page-launcher clicks; unset in transport-only tests.
+    app: std::sync::OnceLock<AppHandle>,
 }
 impl ChromeBridge {
     fn new() -> Self {
@@ -37,6 +39,7 @@ impl ChromeBridge {
             receiver: tokio::sync::Mutex::new(receiver),
             pending: Mutex::new(HashMap::new()),
             cancellations: Mutex::new(HashMap::new()),
+            app: std::sync::OnceLock::new(),
         }
     }
     fn connected(&self) -> bool {
@@ -76,7 +79,9 @@ impl Drop for PendingCall {
     }
 }
 pub(crate) fn init(app: &AppHandle) {
-    app.manage(Arc::new(ChromeBridge::new()));
+    let bridge = Arc::new(ChromeBridge::new());
+    let _ = bridge.app.set(app.clone());
+    app.manage(bridge);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = connect(&app).await {
@@ -255,9 +260,10 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<ChromeBridge>) -> R
     if headers.get("authorization") != Some(&format!("Bearer {token}")) {
         return respond(&mut stream, 403, json!({"error":"Unauthorized"})).await;
     }
-    if !matches!(request, "POST /poll HTTP/1.1" | "POST /reply HTTP/1.1") {
+    if !matches!(request, "POST /poll HTTP/1.1" | "POST /reply HTTP/1.1" | "POST /miniapp/triggers HTTP/1.1" | "POST /miniapp/launch HTTP/1.1") {
         return respond(&mut stream, 404, json!({})).await;
     }
+    let request = request.to_owned(); // `bytes` grows below while the route is still needed.
     let poll = request == "POST /poll HTTP/1.1";
     let size = headers
         .get("content-length")
@@ -295,7 +301,8 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<ChromeBridge>) -> R
             *current = Some((client.into(), Instant::now()));
             true
         } else {
-            current.as_ref().is_some_and(|(id, _)| id == client)
+            // Page launchers may ask right after pairing, before the first poll registers the client.
+            request.starts_with("POST /miniapp/") || current.as_ref().is_some_and(|(id, _)| id == client)
         }
     };
     if !accepted {
@@ -305,6 +312,19 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<ChromeBridge>) -> R
             json!({"error":"Another Chrome client is connected"}),
         )
         .await;
+    }
+    if request == "POST /miniapp/triggers HTTP/1.1" {
+        return respond(&mut stream, 200, json!({"triggers": crate::miniapp_window::browser_triggers()})).await;
+    }
+    if request == "POST /miniapp/launch HTTP/1.1" {
+        let result = match state.app.get() {
+            Some(app) => crate::miniapp_window::browser_launch(app, &body).await,
+            None => Err("Nova 尚未就绪".into()),
+        };
+        return match result {
+            Ok(()) => respond(&mut stream, 200, json!({"ok": true})).await,
+            Err(error) => respond(&mut stream, 400, json!({"error": error})).await,
+        };
     }
     if poll {
         let command = tokio::time::timeout(Duration::from_secs(20), async {
@@ -372,11 +392,12 @@ pub async fn chrome_browser_ui(
     crate::native_browser::execute_chrome(&root, &args, &format!("ui:{id}")).await
 }
 
-const EXTENSION_FILES: [(&str, &str); 4] = [
+const EXTENSION_FILES: [(&str, &str); 5] = [
     ("manifest.json", include_str!("../../extensions/nova-chrome/manifest.json")),
     ("worker.js", include_str!("../../extensions/nova-chrome/worker.js")),
     ("popup.html", include_str!("../../extensions/nova-chrome/popup.html")),
     ("popup.js", include_str!("../../extensions/nova-chrome/popup.js")),
+    ("content.js", include_str!("../../extensions/nova-chrome/content.js")),
 ];
 
 fn find_chrome() -> Option<PathBuf> {
@@ -546,6 +567,10 @@ mod tests {
         assert!(response.status().is_success());
         assert_eq!(request.await.unwrap().unwrap()["tabs"][0]["tag"], "C1-test");
         assert!(state.pending.lock().unwrap().is_empty());
+        let triggers: Value = post("/miniapp/triggers", json!({"clientId":client_id})).send().await.unwrap().json().await.unwrap();
+        assert!(triggers["triggers"].is_array());
+        let launch = post("/miniapp/launch", json!({"clientId":client_id,"appId":"12345678-1234-4abc-8def-123456789abc","url":"https://a/"})).send().await.unwrap();
+        assert_eq!(launch.status(), 400, "unconfigured apps never open from a page");
         let other = post(
             "/poll",
             json!({"clientId":uuid::Uuid::new_v4().to_string()}),

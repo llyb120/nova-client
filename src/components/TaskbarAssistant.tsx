@@ -83,7 +83,7 @@ export function TaskbarSessions(props: { active: boolean }) {
   );
 }
 
-export default function TaskbarAssistant(props: { active: boolean; shown: boolean; focusRequest: number }) {
+export default function TaskbarAssistant(props: { active: boolean; shown: boolean; quick: boolean; focusRequest: number }) {
   const [messages, setMessages] = createStore<Message[]>([]);
   const [text, setText] = createSignal("");
   const [sending, setSending] = createSignal(false);
@@ -139,12 +139,14 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
   createEffect(() => persist("text", text()));
   createEffect(() => persist("uploads", uploads()));
   createEffect(() => persist("picked", picked()));
-  /** Alt+Enter: the text and each attachment become separate capsules; picked capsules stay in the draft.
-   * Closing the panel keeps the draft as is. */
+  /** Closing the panel on the quick tab files the draft as 星尘 (text and each attachment separately) and keeps no draft.
+   * Closing on any other tab keeps the draft as is. */
   const stash = async () => {
     const value = text();
     const files = uploads();
-    if (busy() || composing || (!value.trim() && !files.length)) return;
+    if (sending()) return;
+    setPicked([]);
+    if (!value.trim() && !files.length) { setText(""); return; }
     setSending(true);
     setSendError("");
     setMenu("");
@@ -156,6 +158,12 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
     } catch (error) { if (!disposed) setSendError(`未能存为星尘，已保留草稿：${String(error)}`); }
     finally { setSending(false); }
   };
+  let wasShown = false;
+  createEffect(() => {
+    const shown = props.shown;
+    if (wasShown && !shown && untrack(() => props.quick)) void stash();
+    wasShown = shown;
+  });
 
   const readView = (): View => {
     if (!history.clientHeight) return view;
@@ -427,7 +435,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
         </Show>
         <input ref={imagePicker} type="file" accept="image/*" multiple hidden onChange={(event) => { void addFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ""; }} />
         <input ref={filePicker} type="file" multiple hidden onChange={(event) => { void addFiles(Array.from(event.currentTarget.files ?? [])); event.currentTarget.value = ""; }} />
-        <textarea ref={input} class="tb-input ta-input" rows={1} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" title="Enter 发送 · Alt+Enter 存为星尘 · Shift+Enter 换行 · 可粘贴图片和文件" value={text()}
+        <textarea ref={input} class="tb-input ta-input" rows={1} aria-label="给助理的消息" placeholder="告诉助理要安排什么…" title="Enter 发送 · Shift+Enter 换行 · 可粘贴图片和文件" value={text()}
           onInput={(event) => setText(event.currentTarget.value)}
           onPaste={(event) => {
             const files = Array.from(event.clipboardData?.files ?? []);
@@ -440,7 +448,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229 && !composing) {
               event.preventDefault();
-              void (event.altKey ? stash() : send());
+              void send();
             }
           }}
         />

@@ -29,25 +29,6 @@ pub(crate) fn taskbar_bubble_place(app: tauri::AppHandle, height: f64) -> bool {
     { let _ = (app, height); false }
 }
 
-/// Smart paste while the assistant panel is foreground: the clipboard becomes 星尘 (true) instead of a 星移 request.
-#[cfg(windows)]
-pub(crate) fn capture_clipboard_if_focused(app: &tauri::AppHandle) -> bool {
-    if !bubble::focused(app) { return false; }
-    let files = crate::clipboard::file_paths();
-    let text = crate::clipboard::text().filter(|text| !text.trim().is_empty()).unwrap_or_default();
-    // Like Meteor's clipboard reference: the image only when there is no text or file.
-    let uploads = if text.is_empty() && files.is_empty() {
-        crate::clipboard::image_png().map(|png| vec![capsules::CapsuleUpload {
-            name: "剪贴板图片.png".into(), data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png) }])
-    } else { None };
-    if text.is_empty() && files.is_empty() && uploads.is_none() {
-        bubble::capture_error(app, "剪贴板为空或格式无法读取；星尘未保存。");
-    } else {
-        capsules::capture_drop(app.clone(), text, files, uploads);
-    }
-    true
-}
-
 #[tauri::command]
 pub(crate) fn taskbar_bubble_activate(app: tauri::AppHandle) {
     #[cfg(windows)]
@@ -90,7 +71,7 @@ pub(crate) fn taskbar_bubble_open(app: tauri::AppHandle, thread_id: Option<Strin
     let _ = (app, thread_id);
 }
 
-/// Butterfly 面板「快捷」标签的操作（剑谱录制、知识图谱）。
+/// Butterfly 面板「星海」标签的操作（剑谱录制、知识图谱）。
 #[tauri::command]
 pub(crate) async fn taskbar_quick(app: tauri::AppHandle, action: String) -> Result<serde_json::Value, String> {
     #[cfg(windows)]

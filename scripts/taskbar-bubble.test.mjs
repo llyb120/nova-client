@@ -138,8 +138,8 @@ resolvePayload({ cards: [{ key: 'late' }], permissions: [], light: false, panel:
 rendered.length = 0;
 assert.equal(await stale, false);
 assert.deepEqual(rendered, []);
-// Right click opens on the quick actions without focusing the hidden assistant input; left click returns to it.
-for (const [native, expected, focus] of [['quick', 'quick', 0], [undefined, 'assistant', 1]]) {
+// Right click opens on the quick actions, left click on the assistant; both focus the input below.
+for (const [native, expected, focus] of [['quick', 'quick', 1], [undefined, 'assistant', 1]]) {
   const before = focusRequest;
   loadContext.invoke = async () => ({ cards: [{ key: 'live:' }], permissions: [], light: false, panel: false, tab: native });
   loadContext.fresh = true;

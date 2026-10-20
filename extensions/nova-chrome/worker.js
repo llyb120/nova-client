@@ -1,6 +1,8 @@
 // Only Nova's authenticated loopback receiver supplies commands. Never infer a target from the active tab.
 let model, loading;
 const loops = new Set(), connections = new Set();
+// Paired instances (origin -> authenticated post), available before the first long poll returns.
+const instances = new Map();
 // ponytail: serialize individual browser commands across instances; use per-tab queues if contention grows.
 let commands = Promise.resolve();
 const attached = new Set();
@@ -138,6 +140,32 @@ async function execute(command) {
   }
   return {tabTag:args.tabTag,tabs:await inventory()};
 }
+const escapeRegExp = text => text.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+// `*` is the only wildcard; the whole URL (including query) must match.
+const globMatch = (pattern, url) => new RegExp('^' + pattern.split('*').map(escapeRegExp).join('.*') + '$').test(url);
+async function miniappMatches(url) {
+  if (!/^https?:\/\//i.test(url || '')) return [];
+  if (!instances.size) { void loop(); for (let i = 0; i < 15 && !instances.size; i++) await new Promise(resolve => setTimeout(resolve, 200)); }
+  const found = [];
+  await Promise.all([...instances].map(async ([origin, post]) => {
+    try {
+      const response = await post('/miniapp/triggers', {});
+      if (!response.ok) return;
+      const {triggers} = await response.json();
+      for (const trigger of Array.isArray(triggers) ? triggers : []) {
+        if (typeof trigger?.appId === 'string' && Array.isArray(trigger.match) && trigger.match.some(pattern => typeof pattern === 'string' && globMatch(pattern, url))) found.push({origin, appId: trigger.appId, name: String(trigger.name || '')});
+      }
+    } catch { /* An offline instance simply contributes no launcher. */ }
+  }));
+  return found;
+}
+async function launchMiniapp(message, tab) {
+  const post = instances.get(message.origin);
+  if (!post || !tab) throw Error('Nova 未连接');
+  const response = await post('/miniapp/launch', {appId: message.appId, url: tab.url, title: tab.title || ''});
+  if (!response.ok) throw Error((await response.json().catch(() => ({}))).error || `HTTP ${response.status}`);
+  return {ok: true};
+}
 function loop() {
   for (let port=47653; port<=47662; port++) void connect(`http://127.0.0.1:${port}`);
 }
@@ -152,6 +180,7 @@ async function connect(origin) {
     if(typeof token!=='string' || token.length<32)throw Error('无效的本机连接令牌');
     const config={origin,token};
     const post = (path,body) => fetch(`${config.origin}${path}`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${config.token}`},body:JSON.stringify({...body,clientId:model.clientId}),signal:AbortSignal.timeout(25000)});
+    instances.set(origin, post);
     for (;;) {
       const response = await post('/poll',{});
       if (!response.ok) throw Error(`连接被拒绝 HTTP ${response.status}；检查是否连接了另一个 Chrome 实例`);
@@ -169,7 +198,7 @@ async function connect(origin) {
     }
   } catch {
     // Retry discovery on the next alarm; never replay a command after a failed reply.
-  } finally { connections.delete(origin); loops.delete(origin); }
+  } finally { connections.delete(origin); instances.delete(origin); loops.delete(origin); }
 }
 chrome.debugger.onEvent.addListener((source,method,params)=>{
   if(method==='Target.attachedToTarget' && params.targetInfo?.type==='iframe') {
@@ -189,6 +218,8 @@ chrome.runtime.onMessage.addListener((message,sender,reply)=>{
   if(sender.id!==chrome.runtime.id)return;
   const task=async()=>{
     await ready();
+    if(message.type==='miniapp-match')return {apps:await miniappMatches(sender.tab?.url)};
+    if(message.type==='miniapp-launch')return launchMiniapp(message,sender.tab);
     if(message.type!=='status' && message.type!=='reconnect')throw Error('未知请求');
     void loop();
     const tabs=await inventory();
@@ -197,6 +228,8 @@ chrome.runtime.onMessage.addListener((message,sender,reply)=>{
   };
   task().then(reply,error=>reply({error:String(error?.message || error)}));return true;
 });
+// Single-page apps change URLs without reloading the content script.
+chrome.tabs.onUpdated.addListener((id,change)=>{if(change.url)void chrome.tabs.sendMessage(id,{type:'miniapp-refresh'}).catch(()=>{});});
 chrome.alarms.onAlarm.addListener(alarm=>{if(alarm.name==='nova-reconnect')void loop();});
 chrome.runtime.onInstalled.addListener(()=>{void chrome.alarms.create('nova-reconnect',{periodInMinutes:.5});void loop();});
 chrome.runtime.onStartup.addListener(()=>void loop());

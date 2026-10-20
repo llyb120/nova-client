@@ -18,7 +18,7 @@ try {
 } finally {
   await rm(directory, { recursive: true, force: true });
 }
-const { parseMiniApp, parseDesignReply, parseCommandOptions, validateMiniApp, initialValues, interpolate, assertActionInputs, commandInputs, executeLocal, checkMiniApp, makeDesignPrompt, makeDesignSummary, DEMO_APP } = api;
+const { browserTriggers, parseMiniApp, parseDesignReply, parseCommandOptions, validateMiniApp, initialValues, interpolate, assertActionInputs, commandInputs, executeLocal, checkMiniApp, makeDesignPrompt, makeDesignSummary, DEMO_APP } = api;
 
 function fixture() {
   return {
@@ -1330,4 +1330,40 @@ test('design summaries report actual control/action changes and names, never a f
   reordered.actions.reverse();
   assert.match(makeDesignSummary(next, reordered), /顺序改变/);
   assert.throws(() => makeDesignSummary(next, { ...next, fake: true }), /未知字段/);
+});
+
+test('window size and browser activation are validated and only published configs become triggers', () => {
+  const app = { ...fixture(), window: { width: 480, height: 360 }, browser: { match: ['https://github.com/*/pull/*'], actionId: 'novaDraft', urlField: 'subject' } };
+  assert.equal(validateMiniApp(app), app);
+  for (const bad of [{ window: { width: 100, height: 360 } }, { window: { width: 480.5, height: 360 } }, { window: { width: 480 } },
+    { browser: { match: [] } }, { browser: { match: ['file:///x'] } }, { browser: { match: ['https://a b'] } },
+    { browser: { match: ['https://a/*'], actionId: 'missing' } }, { browser: { match: ['https://a/*'], urlField: 'output' } }, { browser: { match: ['https://a/*'], extra: 1 } }]) {
+    assert.throws(() => validateMiniApp({ ...fixture(), ...bad }), undefined, JSON.stringify(bad));
+  }
+  assert.match(makeDesignSummary(fixture(), app), /window、browser/);
+  const id = '12345678-1234-4abc-8def-123456789abc';
+  const library = [{ id, draft: app, published: app }, { id: '87654321-4321-4abc-8def-123456789abc', draft: app, published: fixture() }, { id: 'bad', published: app }];
+  assert.deepEqual(browserTriggers(JSON.stringify(library)), [{ appId: id, name: '测试应用', match: ['https://github.com/*/pull/*'] }]);
+});
+
+test('closeAfter only references existing actions with a bounded delay', () => {
+  const app = { ...fixture(), closeAfter: { actionIds: ['setReport', 'novaDraft'], delaySeconds: 0 } };
+  assert.equal(validateMiniApp(app), app);
+  for (const closeAfter of [{ actionIds: [] }, { actionIds: ['missing'] }, { actionIds: ['setReport'], delaySeconds: 61 }, { actionIds: ['setReport'], delaySeconds: 1.5 }, { actionIds: ['setReport'], extra: 1 }]) {
+    assert.throws(() => validateMiniApp({ ...fixture(), closeAfter }), undefined, JSON.stringify(closeAfter));
+  }
+  assert.match(makeDesignSummary(fixture(), app), /closeAfter/);
+});
+
+test('autoRun references an action; diagnosis replies take the trailing json block', async () => {
+  const app = { ...fixture(), autoRun: 'novaDraft' };
+  assert.equal(validateMiniApp(app), app);
+  assert.throws(() => validateMiniApp({ ...fixture(), autoRun: 'missing' }));
+  const { makeDiagnosisPrompt, parseDiagnosisReply } = api;
+  const prompt = makeDiagnosisPrompt(app, '点了没反应', { lastRun: null }, 'powershell');
+  assert.match(prompt, /诊断会话/); assert.match(prompt, /autoRun\?:string/); assert.doesNotMatch(prompt, /不能调用 tools/);
+  const fixed = { ...app, name: '修复版' };
+  const reply = parseDiagnosisReply('根因：没有触发入口。\n```json\n{"message":"旧","app":null}\n```\n修复如下：\n```json\n' + JSON.stringify({ message: '补上 autoRun', app: fixed }) + '\n```');
+  assert.equal(reply.app.name, '修复版');
+  assert.throws(() => parseDiagnosisReply('只有说明，没有代码块'));
 });

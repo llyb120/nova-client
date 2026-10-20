@@ -107,6 +107,8 @@ export default function App() {
   onMount(() => {
     setShortcutRecordingActive(false);
     void initStore();
+    // Chrome page launchers follow the published library from startup, not only after visiting the studio.
+    void import("./miniapps").then(m => m.syncBrowserTriggers()).catch(() => {});
 
     // Native global shortcut events also arrive while the WebView is unfocused/minimized.
     let disposed = false;

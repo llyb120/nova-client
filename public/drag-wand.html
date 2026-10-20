@@ -1,0 +1,169 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- 星海应用拖出 Butterfly 面板时跟随指针的魔法棒。小窗口居中对准指针（棒尖即指针）、鼠标穿透、排除在截图外；
+     见 src-tauri/src/taskbar_status/bubble.rs。窗口跟着指针移动，页面只画棒子与星尘，不逐帧接收坐标。 -->
+<style>html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; } canvas { display: block; }</style>
+<canvas id="wand"></canvas>
+<script>
+  // 黑漆细杖：由柄向尖收细，侧光高光线；金色双箍与尾帽；杖尖一点星芒（四向细光 + 柔光晕）。
+  // 星尘以暖金、象牙白为主，少量淡紫；浅色桌面靠金色与极淡投影显形，深色桌面靠亮度。
+  const canvas = document.getElementById("wand");
+  const ctx = canvas.getContext("2d");
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const DUST = [[255, 214, 120], [255, 236, 186], [255, 250, 235], [232, 190, 92], [214, 196, 255]];
+  const ANGLE = Math.PI * 0.29, LENGTH = 66;
+  // 流星尾：指针最近 TAIL 秒的屏幕轨迹（物理像素），以杖尖为头画成由亮到暗、由粗到细的光迹。
+  const TAIL = 0.32;
+  let trail = [];
+  let dpr = 1, w = 0, h = 0, dust = [], dir = { x: 0.7, y: 0.7 }, fade = 1, fadeTo = 1, flareAt = 0;
+  let last = performance.now(), emit = 0;
+  function resize() {
+    dpr = devicePixelRatio || 1; w = innerWidth; h = innerHeight;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    canvas.style.width = w + "px"; canvas.style.height = h + "px";
+  }
+  const rand = (a, b) => a + Math.random() * (b - a);
+  function mote(speed = 1, angle) {
+    // 默认向移动的反方向飘出，带一点散开与轻微下坠。
+    const a = angle ?? Math.atan2(dir.y, dir.x) + rand(-0.75, 0.75);
+    const v = rand(10, 42) * speed;
+    const c = DUST[Math.random() * DUST.length | 0];
+    dust.push({ x: w / 2 + rand(-1.5, 1.5), y: h / 2 + rand(-1.5, 1.5), vx: Math.cos(a) * v, vy: Math.sin(a) * v,
+      life: rand(0.5, 1.15), age: 0, size: rand(0.55, 1.5), c, twinkle: Math.random() < 0.18, phase: rand(0, 6.3) });
+  }
+  // 四向星芒：细长菱形光线，中心最亮、向外渐隐。
+  function glint(x, y, long, short, width, rotation, rgb, alpha) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rotation);
+    for (let i = 0; i < 4; i++) {
+      const len = i % 2 ? short : long;
+      const g = ctx.createLinearGradient(0, 0, len, 0);
+      g.addColorStop(0, `rgba(${rgb},${alpha})`); g.addColorStop(1, `rgba(${rgb},0)`);
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.moveTo(0, -width); ctx.lineTo(len, 0); ctx.lineTo(0, width); ctx.closePath(); ctx.fill();
+      ctx.rotate(Math.PI / 2);
+    }
+    ctx.restore();
+  }
+  function drawTail(cx, cy, now) {
+    const t = now / 1000;
+    trail = trail.filter(p => t - p.t < TAIL);
+    if (trail.length < 2) return;
+    const head = trail[trail.length - 1];
+    // 窗口始终居中对准指针：轨迹点相对最新位置换算到本地坐标。
+    const pts = trail.map(p => ({ x: cx + (p.x - head.x) / dpr, y: cy + (p.y - head.y) / dpr, k: 1 - (t - p.t) / TAIL }));
+    // 靠近窗口边缘逐渐淡出，尾巴不会被窗口硬截断。
+    const reach = Math.min(w, h) / 2;
+    const edge = p => Math.max(0, Math.min(1, (reach * 0.95 - Math.hypot(p.x - cx, p.y - cy)) / (reach * 0.3)));
+    ctx.lineCap = "round"; ctx.lineJoin = "round";
+    for (const [width, rgb, alpha] of [[9, "255,196,92", 0.16], [3.2, "196,128,28", 0.4], [4.2, "255,224,150", 0.5], [1.6, "255,252,240", 0.95]]) {
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1], b = pts[i], k = (a.k + b.k) / 2;
+        const fadeOut = k * k * Math.min(edge(a), edge(b)) * fade;
+        if (fadeOut < 0.01) continue;
+        ctx.strokeStyle = `rgba(${rgb},${(alpha * fadeOut).toFixed(3)})`;
+        ctx.lineWidth = width * (0.2 + 0.8 * k);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      }
+    }
+    // 尾迹上偶尔掉落的碎星，留在原处缓缓消失。
+    if (!reduced && Math.random() < 0.5) {
+      const p = pts[Math.random() * (pts.length - 1) | 0];
+      if (edge(p) > 0.5 && p.k > 0.25) {
+        mote(0.25);
+        Object.assign(dust[dust.length - 1], { x: p.x + rand(-2, 2), y: p.y + rand(-2, 2) });
+      }
+    }
+  }
+  function drawWand(cx, cy, now) {
+    const ux = Math.cos(ANGLE), uy = Math.sin(ANGLE), nx = -uy, ny = ux;
+    const at = (t, side) => [cx + ux * (5 + LENGTH * t) + nx * side, cy + uy * (5 + LENGTH * t) + ny * side];
+    const half = t => 0.75 + 1.55 * t; // 由尖到柄收细：1.5px → 4.6px
+    // 杖身（含柄）：一次填充，投影极淡。
+    ctx.save();
+    ctx.shadowColor = "rgba(18,12,36,.32)"; ctx.shadowBlur = 4; ctx.shadowOffsetX = 1; ctx.shadowOffsetY = 2;
+    ctx.beginPath();
+    for (let i = 0; i <= 12; i++) { const t = i / 12; ctx.lineTo(...at(t, -half(t))); }
+    for (let i = 12; i >= 0; i--) { const t = i / 12; ctx.lineTo(...at(t, half(t))); }
+    ctx.closePath();
+    const [ax, ay] = at(0.5, -3), [bx, by] = at(0.5, 3);
+    const body = ctx.createLinearGradient(ax, ay, bx, by);
+    body.addColorStop(0, "#5a5478"); body.addColorStop(0.35, "#25213a"); body.addColorStop(1, "#0d0b16");
+    ctx.fillStyle = body; ctx.fill();
+    ctx.restore();
+    // 侧光高光线：沿杖身上缘的一道细亮线。
+    ctx.beginPath();
+    for (let i = 1; i <= 11; i++) { const t = i / 12; ctx.lineTo(...at(t, -half(t) * 0.45)); }
+    ctx.strokeStyle = "rgba(255,255,255,.38)"; ctx.lineWidth = 0.6; ctx.lineCap = "round"; ctx.stroke();
+    // 金箍与尾帽。
+    const gold = (t, width) => {
+      const [x1, y1] = at(t, -half(t) - 0.35), [x2, y2] = at(t, half(t) + 0.35);
+      const g = ctx.createLinearGradient(x1, y1, x2, y2);
+      g.addColorStop(0, "#fff1c4"); g.addColorStop(0.45, "#e2b65a"); g.addColorStop(1, "#8a6420");
+      ctx.strokeStyle = g; ctx.lineWidth = width; ctx.lineCap = "butt";
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    };
+    gold(0.6, 1.3); gold(0.645, 0.7);
+    const [ex, ey] = at(1, 0);
+    const cap = ctx.createRadialGradient(ex - 1, ey - 1, 0.3, ex, ey, half(1) + 0.6);
+    cap.addColorStop(0, "#fff3cf"); cap.addColorStop(0.5, "#e0b25a"); cap.addColorStop(1, "#7d5a1c");
+    ctx.fillStyle = cap; ctx.beginPath(); ctx.arc(ex, ey, half(1) + 0.6, 0, Math.PI * 2); ctx.fill();
+    // 杖尖星芒：柔光晕 + 四向细光缓慢转动、轻轻呼吸；松开时放大一闪。
+    const t = now / 1000;
+    const flare = flareAt ? Math.max(0, 1 - (now - flareAt) / 520) : 0;
+    const breath = reduced ? 1 : 1 + 0.12 * Math.sin(t * 4.2);
+    const halo = ctx.createRadialGradient(cx, cy, 0, cx, cy, 15 * breath + 22 * flare);
+    halo.addColorStop(0, "rgba(255,246,214,.95)"); halo.addColorStop(0.25, "rgba(255,214,120,.5)"); halo.addColorStop(1, "rgba(255,196,90,0)");
+    ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(cx, cy, 15 * breath + 22 * flare, 0, Math.PI * 2); ctx.fill();
+    const spin = reduced ? 0 : t * 0.5;
+    glint(cx, cy, (13 + 16 * flare) * breath, (7 + 9 * flare) * breath, 1.1, spin, "255,248,225", 0.95);
+    glint(cx, cy, 6 * breath, 6 * breath, 0.7, spin + Math.PI / 4, "255,226,150", 0.6);
+    ctx.fillStyle = "#fffdf6"; ctx.beginPath(); ctx.arc(cx, cy, 1.7 + flare, 0, Math.PI * 2); ctx.fill();
+  }
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    fade += (fadeTo - fade) * Math.min(1, dt * 10);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    if (!reduced && fadeTo > 0) for (emit += dt * 38; emit >= 1; emit--) mote();
+    // 星尘落在屏幕上：窗口随指针移动时反向平移，保持它们在屏幕中的位置。
+    const head = trail[trail.length - 1];
+    if (head && shift.head && (shift.head.x !== head.x || shift.head.y !== head.y)) {
+      const dx = (head.x - shift.head.x) / dpr, dy = (head.y - shift.head.y) / dpr;
+      for (const d of dust) { d.x -= dx; d.y -= dy; }
+    }
+    shift.head = head;
+    if (fade > 0.02) drawTail(w / 2, h / 2, now);
+    dust = dust.filter(d => (d.age += dt) < d.life);
+    for (const d of dust) {
+      d.vy += 16 * dt; d.vx *= 1 - dt * 1.2; d.vy *= 1 - dt * 1.2;
+      d.x += d.vx * dt; d.y += d.vy * dt;
+      const k = 1 - d.age / d.life;
+      const a = k * (0.55 + 0.45 * Math.sin(d.age * 24 + d.phase));
+      if (d.twinkle) glint(d.x, d.y, 3.6 * k + 1, 3.6 * k + 1, 0.55, d.phase, d.c.join(","), a);
+      ctx.fillStyle = `rgba(${d.c.join(",")},${a.toFixed(3)})`;
+      ctx.beginPath(); ctx.arc(d.x, d.y, d.size * (0.5 + 0.5 * k), 0, Math.PI * 2); ctx.fill();
+    }
+    if (fade > 0.02) { ctx.globalAlpha = fade; drawWand(w / 2, h / 2, now); ctx.globalAlpha = 1; }
+    requestAnimationFrame(frame);
+  }
+  const shift = { head: null };
+  window.wand = {
+    // 指针的屏幕位置（物理像素）：记入流星轨迹，星尘向移动的反方向飘出。
+    at(x, y) {
+      const t = performance.now() / 1000;
+      trail.push({ x, y, t });
+      const from = trail.find(p => t - p.t < 0.08) ?? trail[0];
+      const dx = x - from.x, dy = y - from.y, n = Math.hypot(dx, dy);
+      if (n > 2) dir = { x: -dx / n, y: -dy / n };
+    },
+    // 松开：星芒一闪，星尘向四周轻轻散开，杖身随后淡出。
+    release() { flareAt = performance.now(); if (!reduced) for (let i = 0; i < 28; i++) mote(1.6, i / 28 * Math.PI * 2 + rand(-0.1, 0.1)); fadeTo = 0; },
+    // 取消：杖与星尘很快消散，不闪。
+    cancel() { fadeTo = 0; dust.forEach(d => { d.life = Math.min(d.life, d.age + 0.2); }); },
+    reset() { dust = []; trail = []; shift.head = null; fade = fadeTo = 1; flareAt = 0; },
+  };
+  addEventListener("resize", resize);
+  resize();
+  requestAnimationFrame(frame);
+</script>

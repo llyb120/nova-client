@@ -9,9 +9,9 @@ try {
   const page = await browser.newPage({ viewport: { width: 1080, height: 800 } });
   await page.setContent(`<style>${theme}\n${css}</style>
     <main class="mini-studio">
-      <header class="mini-topbar"><div class="mini-brand"><strong>观星台</strong><small>每一颗星，都是灵光一闪</small></div><span class="mini-chip">快捷 v1</span></header>
+      <header class="mini-topbar"><div class="mini-brand"><strong>观星台</strong><small>每一颗星，都是灵光一闪</small></div><span class="mini-chip">星海 v1</span></header>
       <div class="mini-workbench">
-        <aside class="mini-library"><div class="mini-section-label">我的应用</div><button class="mini-new-app">＋ 新应用</button><div class="mini-app-meta"><strong>构建助手</strong><small>快捷 v1 · 有改动</small></div></aside>
+        <aside class="mini-library"><div class="mini-section-label">我的应用</div><button class="mini-new-app">＋ 新应用</button><div class="mini-app-meta"><strong>构建助手</strong><small>星海 v1 · 有改动</small></div></aside>
         <section class="mini-canvas"><div class="mini-canvas-toolbar"><div class="mini-segment"><button class="active">设计</button><button>试用草稿</button></div></div>
           <div class="mini-preview-scroll"><article class="mini-preview">
             <header class="mini-app-heading"><div><small>构建助手</small><h1>构建助手</h1><p>选择构建环境和分支，确认后由 Nova 触发构建。</p></div></header>

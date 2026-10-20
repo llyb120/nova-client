@@ -8,7 +8,7 @@ test('native downloads expose progress, interruption and completion without tab 
   const event=()=>({addListener(){}});let query,calls=0;
   let item={id:42,url:'blob:https://example.com/export',filename:'C:/Downloads/报告.csv',state:'in_progress',bytesReceived:0,totalBytes:-1,incognito:false};
   const chrome={downloads:{search:async q=>{query=q;calls++;return [item];}},
-    storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>[],onRemoved:event(),onReplaced:event()},
+    storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>[],onRemoved:event(),onReplaced:event(),onUpdated:event()},
     debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
   const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
   runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.run=args=>execute({operation:"downloads",args,expiresAt:Date.now()+3000});',scope);
@@ -34,7 +34,7 @@ test('screenshots reveal a minimized window or background tab instead of hanging
   const event=()=>({addListener(){}});const calls=[];
   let win={id:5,state:'minimized'};const tab={id:11,windowId:5,url:'https://example.com',active:false};
   const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},
-    tabs:{query:async()=>[tab],get:async()=>({...tab}),update:async(id,props)=>{calls.push(['tab',id,props]);Object.assign(tab,props);},onRemoved:event(),onReplaced:event()},
+    tabs:{query:async()=>[tab],get:async()=>({...tab}),update:async(id,props)=>{calls.push(['tab',id,props]);Object.assign(tab,props);},onRemoved:event(),onReplaced:event(),onUpdated:event()},
     windows:{get:async()=>({...win}),update:async(id,props)=>{calls.push(['window',id,props]);win={...win,...props};}},
     debugger:{attach:async()=>{},sendCommand:async(_t,method)=>{calls.push(['cdp',method]);return {data:'png'};},onEvent:event(),onDetach:event()},
     runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
@@ -54,7 +54,7 @@ test('a stuck debugger command times out, polling resumes and late results are n
   const chrome={
     extension:{isAllowedIncognitoAccess:async()=>false},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
-    tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event()},
+    tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event(),onUpdated:event()},
     debugger:{attach:async()=>{},sendCommand:()=>{calls++;return new Promise(resolve=>{finishCommand=resolve;});},onDetach:event(),onEvent:event()},
     runtime:{id:'test',onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()},
   };
@@ -94,7 +94,7 @@ test('stable tags, default access, auto-attached frames, expiry and worker resta
   const chrome={
     extension:{isAllowedIncognitoAccess:async()=>false},
     storage:{session:{get:async()=>structuredClone(persisted),set:async v=>Object.assign(persisted,structuredClone(v))},local:{set:async()=>{},get:async()=>({})}},
-    tabs:{query:async filter=>structuredClone(filter?.active?tabs.filter(t=>t.active):tabs),get:async id=>{const tab=tabs.find(t=>t.id===id);if(!tab)throw Error('closed');return tab;},onRemoved:event(),onReplaced:event()},
+    tabs:{query:async filter=>structuredClone(filter?.active?tabs.filter(t=>t.active):tabs),get:async id=>{const tab=tabs.find(t=>t.id===id);if(!tab)throw Error('closed');return tab;},onRemoved:event(),onReplaced:event(),onUpdated:event()},
     debugger:{attach:async target=>nativeCalls.push(['attach',target.tabId]),detach:async()=>{},sendCommand:async(target,method)=>{
       nativeCalls.push([method,target.tabId]);
       if(['Target.getTargets','Target.attachToTarget'].includes(method))throw Error('{"code":-32000,"message":"Not allowed"}');
@@ -149,7 +149,7 @@ test('multiple Nova instances route replies independently, serialize commands an
   const chrome={
     extension:{isAllowedIncognitoAccess:async()=>false},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
-    tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event()},
+    tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event(),onUpdated:event()},
     debugger:{attach:async()=>{attaches++;},sendCommand:async(_target,_method,params)=>{
       peak=Math.max(peak,++active);
       await new Promise(resolve=>setImmediate(resolve));
@@ -201,7 +201,7 @@ test('incognito permission, window isolation and tab filtering',async()=>{
   let tabs=[{id:1,windowId:10,url:'https://example.com',incognito:false}];
   const chrome={extension:{isAllowedIncognitoAccess:async()=>allowed},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
-    tabs:{query:async()=>tabs,get:async id=>tabs.find(t=>t.id===id),create:async args=>{created.push(args);return tabs[0];},onRemoved:event(),onReplaced:event()},
+    tabs:{query:async()=>tabs,get:async id=>tabs.find(t=>t.id===id),create:async args=>{created.push(args);return tabs[0];},onRemoved:event(),onReplaced:event(),onUpdated:event()},
     windows:{getAll:async()=>[{id:20,incognito:true},{id:10,incognito:false}],create:async args=>{created.push(args);const tab={id:2,windowId:20,url:args.url,incognito:args.incognito};tabs.push(tab);return {id:20,tabs:[tab]};}},
     debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
   const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
@@ -216,4 +216,17 @@ test('incognito permission, window isolation and tab filtering',async()=>{
   const privateTabs=await run('tabs',{incognito:true});assert.equal(privateTabs.tabs.length,1);assert.equal(privateTabs.tabs[0].incognito,true);
   await run('new_tab',{url:'https://example.org',incognito:false});assert.equal(created[1].windowId,10);
   await assert.rejects(run('open',{incognito:'true'}),/boolean/);
+});
+
+test('miniapp page patterns match the whole URL with * as the only wildcard',async()=>{
+  const event=()=>({addListener(){}});
+  const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>[],onRemoved:event(),onReplaced:event(),onUpdated:event()},
+    debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.match=globMatch;',scope);
+  assert.ok(scope.match('https://github.com/*/pull/*','https://github.com/a/b/pull/1?x=1'));
+  assert.ok(scope.match('*://example.com/*','http://example.com/'));
+  assert.ok(!scope.match('https://github.com/*/pull/*','https://github.com/a/b/issues/1'));
+  assert.ok(!scope.match('https://a.com/x.y','https://a.com/xzy'),'dots are literal');
+  assert.ok(!scope.match('https://a.com/','https://a.com/?evil'),'no implicit prefix match');
 });
