@@ -8,7 +8,7 @@ const picker = (label) => `<div class="sel wide"><button class="pill">
   <span class="pill-text">模型：${label}</span><svg width="12" height="12"></svg>
 </button></div>`;
 const number = '<span style="width:28px;flex-shrink:0">1</span>';
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({ headless: true, channel: process.env.PLAYWRIGHT_CHANNEL });
 try {
   const page = await browser.newPage();
   await page.setContent(`<style>${css}</style><div class="modal-backdrop">
