@@ -1,16 +1,20 @@
 <!doctype html>
 <meta charset="utf-8">
 <!-- 星海应用拖出 Butterfly 面板时跟随指针的魔法棒。小窗口居中对准指针（棒尖即指针）、鼠标穿透、排除在截图外；
-     见 src-tauri/src/taskbar_status/bubble.rs。窗口跟着指针移动，页面只画棒子与星尘，不逐帧接收坐标。 -->
+     见 src-tauri/src/taskbar_status/bubble.rs。窗口跟着指针移动；指针每次移动都推送屏幕坐标，用于画流星尾。 -->
 <style>html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; } canvas { display: block; }</style>
 <canvas id="wand"></canvas>
 <script>
   // 黑漆细杖：由柄向尖收细，侧光高光线；金色双箍与尾帽；杖尖一点星芒（四向细光 + 柔光晕）。
-  // 星尘以暖金、象牙白为主，少量淡紫；浅色桌面靠金色与极淡投影显形，深色桌面靠亮度。
+  // 光效用明亮的粉紫、淡紫、青色与白色：深色桌面上通透发光；浅色桌面靠一层极淡的紫色投影托住轮廓。
   const canvas = document.getElementById("wand");
   const ctx = canvas.getContext("2d");
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const DUST = [[255, 214, 120], [255, 236, 186], [255, 250, 235], [232, 190, 92], [214, 196, 255]];
+  const DUST = [[240, 171, 252], [216, 180, 254], [255, 255, 255], [103, 232, 249], [253, 230, 138]];
+  // 右键取消：杖尖一朵小烟花（约 50px 半径），糖果色、带拖影，末尾零星爆闪。
+  // 明亮饱和的糖果色（不用粉彩，否则白色桌面上看不见），每根火花再叠一道白芯提亮。
+  const FIRE = ["255,92,184", "255,184,28", "34,211,238", "167,123,255", "74,222,128", "255,120,90"];
+  let sparks = [], cancelAt = 0;
   const ANGLE = Math.PI * 0.29, LENGTH = 66;
   // 流星尾：指针最近 TAIL 秒的屏幕轨迹（物理像素），以杖尖为头画成由亮到暗、由粗到细的光迹。
   const TAIL = 0.32;
@@ -45,37 +49,108 @@
     }
     ctx.restore();
   }
+  function firework() {
+    if (reduced) return;
+    cancelAt = performance.now();
+    const cx = w / 2, cy = h / 2, inner = FIRE[Math.random() * FIRE.length | 0];
+    for (const [n, speed, offset] of [[24, 165, 0], [12, 85, 0.26]]) {
+      for (let i = 0; i < n; i++) {
+        const a = i / n * Math.PI * 2 + offset + rand(-0.07, 0.07), v = speed * rand(0.85, 1.1);
+        sparks.push({ x: cx, y: cy, vx: Math.cos(a) * v, vy: Math.sin(a) * v, age: 0, life: rand(0.55, 0.85),
+          c: n === 24 ? FIRE[i % FIRE.length] : inner, crackle: Math.random() < 0.3 });
+      }
+    }
+  }
+  function drawFirework(dt, now) {
+    sparks = sparks.filter(s => (s.age += dt) < s.life);
+    ctx.save();
+    ctx.shadowColor = "rgba(109,40,217,.4)"; ctx.shadowBlur = 3; ctx.lineCap = "round";
+    // 炸开瞬间的中心闪光。
+    const flash = cancelAt ? 1 - (now - cancelAt) / 220 : 0;
+    if (flash > 0) {
+      const g = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, 6 + 14 * (1 - flash));
+      g.addColorStop(0, `rgba(255,255,255,${flash})`); g.addColorStop(0.5, `rgba(249,168,212,${0.8 * flash})`); g.addColorStop(1, "rgba(249,168,212,0)");
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(w / 2, h / 2, 6 + 14 * (1 - flash), 0, Math.PI * 2); ctx.fill();
+    }
+    for (const s of sparks) {
+      // 强阻尼：迅速冲出后几乎停住，再轻轻下坠，范围留在杖尖附近。
+      s.vx *= 1 - Math.min(1, dt * 3.6); s.vy *= 1 - Math.min(1, dt * 3.6); s.vy += 45 * dt;
+      s.x += s.vx * dt; s.y += s.vy * dt;
+      const k = 1 - s.age / s.life;
+      ctx.strokeStyle = `rgba(${s.c},${k.toFixed(3)})`; ctx.lineWidth = 1 + 2.2 * k;
+      ctx.beginPath(); ctx.moveTo(s.x - s.vx * 0.07, s.y - s.vy * 0.07); ctx.lineTo(s.x, s.y); ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = `rgba(255,255,255,${(0.85 * k).toFixed(3)})`; ctx.lineWidth = 0.4 + 0.8 * k;
+      ctx.beginPath(); ctx.moveTo(s.x - s.vx * 0.03, s.y - s.vy * 0.03); ctx.lineTo(s.x, s.y); ctx.stroke();
+      ctx.shadowBlur = 3;
+      if (s.crackle && k < 0.45) glint(s.x, s.y, 2 + 5 * k, 2 + 5 * k, 0.6, s.age * 9, s.c, (k * 2 * (0.5 + 0.5 * Math.sin(s.age * 45))).toFixed(3));
+    }
+    ctx.restore();
+  }
+  // Chaikin 平滑：折线每段取 1/4、3/4 点，两轮后急转弯也变成圆弧；首尾保留。
+  function smooth(points, rounds) {
+    for (let r = 0; r < rounds && points.length > 2; r++) {
+      const out = [points[0]];
+      for (let i = 0; i < points.length - 1; i++) {
+        const p = points[i], q = points[i + 1], mix = (s) => ({ x: p.x + (q.x - p.x) * s, y: p.y + (q.y - p.y) * s, k: p.k + (q.k - p.k) * s });
+        out.push(mix(0.25), mix(0.75));
+      }
+      out.push(points[points.length - 1]);
+      points = out;
+    }
+    return points;
+  }
+  // 一层光带：沿平滑轨迹由头到尾收细的整块填充（无分段接缝），透明度按到杖尖的距离渐隐。
+  function ribbon(pts, cx, cy, width, stops, radius) {
+    const left = [], right = [];
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i], a = pts[Math.max(0, i - 1)], b = pts[Math.min(pts.length - 1, i + 1)];
+      const tx = b.x - a.x, ty = b.y - a.y, n = Math.hypot(tx, ty) || 1;
+      const half = width * (0.08 + 0.92 * p.k * p.k) / 2;
+      left.push([p.x - ty / n * half, p.y + tx / n * half]);
+      right.push([p.x + ty / n * half, p.y - tx / n * half]);
+    }
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+    for (const [at, color] of stops) g.addColorStop(at, color);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    for (const [x, y] of left) ctx.lineTo(x, y);
+    for (let i = right.length - 1; i >= 0; i--) ctx.lineTo(...right[i]);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, width / 2, 0, Math.PI * 2); ctx.fill();
+  }
   function drawTail(cx, cy, now) {
     const t = now / 1000;
     trail = trail.filter(p => t - p.t < TAIL);
     if (trail.length < 2) return;
     const head = trail[trail.length - 1];
-    // 窗口始终居中对准指针：轨迹点相对最新位置换算到本地坐标。
-    const pts = trail.map(p => ({ x: cx + (p.x - head.x) / dpr, y: cy + (p.y - head.y) / dpr, k: 1 - (t - p.t) / TAIL }));
-    // 靠近窗口边缘逐渐淡出，尾巴不会被窗口硬截断。
-    const reach = Math.min(w, h) / 2;
-    const edge = p => Math.max(0, Math.min(1, (reach * 0.95 - Math.hypot(p.x - cx, p.y - cy)) / (reach * 0.3)));
-    ctx.lineCap = "round"; ctx.lineJoin = "round";
-    for (const [width, rgb, alpha] of [[9, "255,196,92", 0.16], [3.2, "196,128,28", 0.4], [4.2, "255,224,150", 0.5], [1.6, "255,252,240", 0.95]]) {
-      for (let i = 1; i < pts.length; i++) {
-        const a = pts[i - 1], b = pts[i], k = (a.k + b.k) / 2;
-        const fadeOut = k * k * Math.min(edge(a), edge(b)) * fade;
-        if (fadeOut < 0.01) continue;
-        ctx.strokeStyle = `rgba(${rgb},${(alpha * fadeOut).toFixed(3)})`;
-        ctx.lineWidth = width * (0.2 + 0.8 * k);
-        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-      }
-    }
+    // 窗口始终居中对准指针：轨迹点相对最新位置换算到本地坐标；头尾按时间 k 从 1 降到 0。
+    let pts = trail.map(p => ({ x: cx + (p.x - head.x) / dpr, y: cy + (p.y - head.y) / dpr, k: 1 - (t - p.t) / TAIL }));
+    // 去掉几乎重合的点（停顿时的重复采样），再平滑。
+    pts = pts.filter((p, i) => i === pts.length - 1 || Math.hypot(p.x - pts[i + 1].x, p.y - pts[i + 1].y) > 0.8);
+    if (pts.length < 2) return;
+    pts = smooth(pts, 3);
+    // 渐隐半径：尾巴实际长度，但在窗口边缘前归零，不会被窗口硬截断。
+    const reach = Math.min(w, h) / 2 * 0.92;
+    const radius = Math.max(12, Math.min(reach, Math.max(...pts.map(p => Math.hypot(p.x - cx, p.y - cy)))));
+    ctx.save();
+    ctx.globalAlpha = fade;
+    // 外层柔光（浅色桌面靠极淡的紫色投影托住），中层明亮的粉紫→青色彩带，内层白芯。
+    ctx.shadowColor = "rgba(109,40,217,.35)"; ctx.shadowBlur = 6;
+    ribbon(pts, cx, cy, 11, [[0, "rgba(250,232,255,.55)"], [0.35, "rgba(240,171,252,.35)"], [1, "rgba(165,243,252,0)"]], radius);
+    ctx.shadowBlur = 0;
+    ribbon(pts, cx, cy, 4.6, [[0, "rgba(255,255,255,1)"], [0.18, "rgba(255,110,210,.95)"], [0.55, "rgba(160,120,255,.85)"], [1, "rgba(34,211,238,0)"]], radius);
+    ribbon(pts, cx, cy, 1.6, [[0, "rgba(255,255,255,1)"], [0.6, "rgba(255,255,255,.7)"], [1, "rgba(255,255,255,0)"]], radius * 0.85);
+    ctx.restore();
     // 尾迹上偶尔掉落的碎星，留在原处缓缓消失。
     if (!reduced && Math.random() < 0.5) {
       const p = pts[Math.random() * (pts.length - 1) | 0];
-      if (edge(p) > 0.5 && p.k > 0.25) {
+      if (Math.hypot(p.x - cx, p.y - cy) < reach * 0.8 && p.k > 0.25) {
         mote(0.25);
         Object.assign(dust[dust.length - 1], { x: p.x + rand(-2, 2), y: p.y + rand(-2, 2) });
       }
     }
-  }
-  function drawWand(cx, cy, now) {
+  }  function drawWand(cx, cy, now) {
     const ux = Math.cos(ANGLE), uy = Math.sin(ANGLE), nx = -uy, ny = ux;
     const at = (t, side) => [cx + ux * (5 + LENGTH * t) + nx * side, cy + uy * (5 + LENGTH * t) + ny * side];
     const half = t => 0.75 + 1.55 * t; // 由尖到柄收细：1.5px → 4.6px
@@ -113,12 +188,16 @@
     const flare = flareAt ? Math.max(0, 1 - (now - flareAt) / 520) : 0;
     const breath = reduced ? 1 : 1 + 0.12 * Math.sin(t * 4.2);
     const halo = ctx.createRadialGradient(cx, cy, 0, cx, cy, 15 * breath + 22 * flare);
-    halo.addColorStop(0, "rgba(255,246,214,.95)"); halo.addColorStop(0.25, "rgba(255,214,120,.5)"); halo.addColorStop(1, "rgba(255,196,90,0)");
+    halo.addColorStop(0, "rgba(255,255,255,1)"); halo.addColorStop(0.22, "rgba(244,170,255,.8)"); halo.addColorStop(0.6, "rgba(192,150,255,.32)"); halo.addColorStop(1, "rgba(165,243,252,0)");
+    ctx.save(); ctx.shadowColor = "rgba(109,40,217,.45)"; ctx.shadowBlur = 5;
     ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(cx, cy, 15 * breath + 22 * flare, 0, Math.PI * 2); ctx.fill();
     const spin = reduced ? 0 : t * 0.5;
-    glint(cx, cy, (13 + 16 * flare) * breath, (7 + 9 * flare) * breath, 1.1, spin, "255,248,225", 0.95);
-    glint(cx, cy, 6 * breath, 6 * breath, 0.7, spin + Math.PI / 4, "255,226,150", 0.6);
-    ctx.fillStyle = "#fffdf6"; ctx.beginPath(); ctx.arc(cx, cy, 1.7 + flare, 0, Math.PI * 2); ctx.fill();
+    // 粉紫星芒打底，白色细芒叠在上面；投影只用于浅色桌面上的轮廓。
+    glint(cx, cy, (15 + 16 * flare) * breath, (8 + 9 * flare) * breath, 1.7, spin, "240,171,252", 0.9);
+    ctx.restore();
+    glint(cx, cy, (13 + 16 * flare) * breath, (7 + 9 * flare) * breath, 0.9, spin, "255,255,255", 1);
+    glint(cx, cy, 6 * breath, 6 * breath, 0.8, spin + Math.PI / 4, "165,243,252", 0.85);
+    ctx.fillStyle = "#ffffff"; ctx.beginPath(); ctx.arc(cx, cy, 1.7 + flare, 0, Math.PI * 2); ctx.fill();
   }
   function frame(now) {
     const dt = Math.min(0.05, (now - last) / 1000); last = now;
@@ -135,6 +214,7 @@
     shift.head = head;
     if (fade > 0.02) drawTail(w / 2, h / 2, now);
     dust = dust.filter(d => (d.age += dt) < d.life);
+    ctx.save(); ctx.shadowColor = "rgba(109,40,217,.35)"; ctx.shadowBlur = 2;
     for (const d of dust) {
       d.vy += 16 * dt; d.vx *= 1 - dt * 1.2; d.vy *= 1 - dt * 1.2;
       d.x += d.vx * dt; d.y += d.vy * dt;
@@ -144,7 +224,9 @@
       ctx.fillStyle = `rgba(${d.c.join(",")},${a.toFixed(3)})`;
       ctx.beginPath(); ctx.arc(d.x, d.y, d.size * (0.5 + 0.5 * k), 0, Math.PI * 2); ctx.fill();
     }
+    ctx.restore();
     if (fade > 0.02) { ctx.globalAlpha = fade; drawWand(w / 2, h / 2, now); ctx.globalAlpha = 1; }
+    if (sparks.length || cancelAt) drawFirework(dt, now);
     requestAnimationFrame(frame);
   }
   const shift = { head: null };
@@ -160,8 +242,8 @@
     // 松开：星芒一闪，星尘向四周轻轻散开，杖身随后淡出。
     release() { flareAt = performance.now(); if (!reduced) for (let i = 0; i < 28; i++) mote(1.6, i / 28 * Math.PI * 2 + rand(-0.1, 0.1)); fadeTo = 0; },
     // 取消：杖与星尘很快消散，不闪。
-    cancel() { fadeTo = 0; dust.forEach(d => { d.life = Math.min(d.life, d.age + 0.2); }); },
-    reset() { dust = []; trail = []; shift.head = null; fade = fadeTo = 1; flareAt = 0; },
+    cancel() { fadeTo = 0; dust.forEach(d => { d.life = Math.min(d.life, d.age + 0.2); }); firework(); },
+    reset() { dust = []; trail = []; sparks = []; shift.head = null; fade = fadeTo = 1; flareAt = 0; cancelAt = 0; },
   };
   addEventListener("resize", resize);
   resize();

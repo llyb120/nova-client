@@ -386,8 +386,8 @@ fn drag_start(app: &AppHandle) {
             let mut affinity = 0;
             GetWindowDisplayAffinity(hwnd, &mut affinity) != 0 && affinity == WDA_EXCLUDEFROMCAPTURE
         };
-        let (mut p, mut shown, mut tick) = (POINT { x: 0, y: 0 }, false, 0u32);
-        let (mut previous, mut sent): (Option<POINT>, Option<(i32, i32)>) = (None, None);
+        let (mut p, mut shown) = (POINT { x: 0, y: 0 }, false);
+        let mut previous: Option<POINT> = None;
         let cancelled = loop {
             if !held(VK_LBUTTON) { break false; }
             if held(VK_RBUTTON) { break true; }
@@ -396,11 +396,8 @@ fn drag_start(app: &AppHandle) {
                 unsafe { SetWindowPos(hwnd, HWND_TOPMOST, p.x - size / 2, p.y - size / 2, size, size, SWP_NOACTIVATE | SWP_SHOWWINDOW); }
                 // Also through tao once: a Win32-only show leaves WebView2 thinking it is hidden, animations frozen.
                 if !shown { shown = true; let _ = window.show(); }
-            }
-            // The meteor tail needs the pointer path: screen position at ~60Hz, only when it changed.
-            tick += 1;
-            if tick % 2 == 0 && sent != Some((p.x, p.y)) && previous.is_some() {
-                sent = Some((p.x, p.y));
+                // The meteor tail is drawn relative to the newest point; send it with every window move,
+                // so the tail head never lags behind where the window already is.
                 let _ = window.eval(format!("window.wand && wand.at({},{})", p.x, p.y));
             }
             std::thread::sleep(Duration::from_millis(8));
@@ -409,7 +406,8 @@ fn drag_start(app: &AppHandle) {
         let linger = if cancelled {
             let _ = app.emit_to(LABEL, "taskbar-bubble:drag-cancel", ());
             let _ = window.eval("window.wand && wand.cancel()");
-            250
+            // Long enough for the small firework at the tip to burn out.
+            950
         } else {
             let _ = window.eval("window.wand && wand.release()");
             // Without capture exclusion the wand must be gone before the drop screenshot (150ms).
