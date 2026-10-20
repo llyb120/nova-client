@@ -4976,12 +4976,50 @@ fn codebuddy_command(program: &str, args: &[&str]) -> (String, tokio::process::C
             cmd.arg("/D").arg("/S").arg("/C").arg(path);
             cmd
         }
-        None => tokio::process::Command::new(program),
+        None => codebuddy_npm_command(program)
+            .unwrap_or_else(|| tokio::process::Command::new(program)),
     };
     cmd.args(args)
         .env("CODEBUDDY_DEFER_TOOL_LOADING", "0")
         .env("DISABLE_AUTOUPDATER", "1");
     (program.to_string(), cmd)
+}
+
+/// Windows 上 npm 全局升级常因文件被占用中途回滚，删掉 `%APPDATA%\npm\codebuddy.cmd` 等 shim，
+/// 包本体却还在；命令解析不到时直接定位包内 bin 脚本。
+// ponytail: 只认默认 npm 前缀和 node.exe 同目录前缀；自定义 prefix 仍需在设置里填路径。
+pub(crate) fn codebuddy_npm_script(program: &str) -> Option<PathBuf> {
+    // 只兼容裸命令名：具体路径（如 WorkBuddy 内置 CLI）绝不能退到全局 CodeBuddy。
+    if !cfg!(windows) || program.contains(['/', '\\']) {
+        return None;
+    }
+    let stem = std::path::Path::new(program).file_stem()?.to_str()?.to_ascii_lowercase();
+    let bin = match stem.as_str() {
+        "codebuddy" | "cbc" | "codebuddy-code" => "codebuddy",
+        "cbc-prewarm" => "cbc-prewarm",
+        _ => return None,
+    };
+    let npm = std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("npm"));
+    let node_dir = resolve_program_on_path("node").and_then(|node| node.parent().map(PathBuf::from));
+    [npm, node_dir]
+        .into_iter()
+        .flatten()
+        .map(|prefix| prefix.join("node_modules/@tencent-ai/codebuddy-code/bin").join(bin))
+        .find(|script| script.is_file())
+}
+
+/// shim 丢失时用 `node <包内脚本>` 启动，等价于 npm shim 的行为。
+#[cfg(windows)]
+pub(crate) fn codebuddy_npm_command(program: &str) -> Option<tokio::process::Command> {
+    let script = codebuddy_npm_script(program)?;
+    let mut cmd = tokio::process::Command::new("node");
+    cmd.arg(script);
+    Some(cmd)
+}
+
+/// 可执行文件在 PATH/具体路径上可解析，或 CodeBuddy 的 npm shim 丢失但包本体还在。
+pub(crate) fn program_available(program: &str) -> bool {
+    resolve_program_on_path(program).is_some() || codebuddy_npm_script(program).is_some()
 }
 
 /// 非 Windows：直接以给定程序与参数启动。
@@ -5324,6 +5362,30 @@ mod codebuddy_acp_tests {
             assert!(!super::replace_model_state(&mut result, &update));
             assert_eq!(result, known);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codebuddy_falls_back_to_npm_package_when_shim_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("npm").join("node_modules/@tencent-ai/codebuddy-code/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("cbc-prewarm"), "").unwrap();
+        let original = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", dir.path());
+        let script = super::codebuddy_npm_script("cbc-prewarm");
+        let unrelated = super::codebuddy_npm_script("kimi");
+        let full_path = super::codebuddy_npm_script(bin.join("cbc-prewarm").to_str().unwrap());
+        let command = super::codebuddy_npm_command("cbc-prewarm").unwrap();
+        match original {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        assert_eq!(script, Some(bin.join("cbc-prewarm")));
+        assert_eq!((unrelated, full_path), (None, None));
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(command.as_std().get_program(), "node");
+        assert_eq!(args, [bin.join("cbc-prewarm").as_os_str()]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::acp::{apply_proxy_env, resolve_program_on_path};
+use crate::acp::{apply_proxy_env, program_available};
 use crate::settings::Settings;
 use crate::threads::AgentKind;
 use serde::Serialize;
@@ -132,7 +132,7 @@ fn all_specs(settings: &Settings) -> Vec<CliSpec> {
 
 #[cfg(windows)]
 fn build_command(program: &str, args: &[String]) -> tokio::process::Command {
-    let resolved = resolve_program_on_path(program);
+    let resolved = crate::acp::resolve_program_on_path(program);
     let mut cmd = match resolved
         .as_ref()
         .and_then(|p| p.extension())
@@ -141,11 +141,14 @@ fn build_command(program: &str, args: &[String]) -> tokio::process::Command {
         Some(ext) if ext.eq_ignore_ascii_case("exe") => {
             tokio::process::Command::new(resolved.unwrap())
         }
-        _ => {
-            let mut cmd = tokio::process::Command::new("cmd.exe");
-            cmd.arg("/D").arg("/S").arg("/C").arg(program);
-            cmd
-        }
+        _ => match resolved.is_none().then(|| crate::acp::codebuddy_npm_command(program)).flatten() {
+            Some(cmd) => cmd,
+            None => {
+                let mut cmd = tokio::process::Command::new("cmd.exe");
+                cmd.arg("/D").arg("/S").arg("/C").arg(program);
+                cmd
+            }
+        },
     };
     cmd.args(args);
     cmd.creation_flags(0x0800_0000);
@@ -216,7 +219,7 @@ fn strip_ansi(input: &str) -> String {
 }
 
 async fn status_for(spec: CliSpec) -> CliStatus {
-    if resolve_program_on_path(&spec.program).is_none() {
+    if !program_available(&spec.program) {
         return CliStatus {
             agent_kind: spec.kind.as_str().into(),
             cli_name: spec.cli_name.into(),
@@ -287,7 +290,7 @@ pub fn is_installed(kind: &AgentKind, settings: &Settings) -> bool {
     if *kind == AgentKind::WorkBuddy {
         return crate::workbuddy::command(&settings.workbuddy_path).is_ok();
     }
-    spec_for(kind, settings).is_some_and(|spec| resolve_program_on_path(&spec.program).is_some())
+    spec_for(kind, settings).is_some_and(|spec| program_available(&spec.program))
 }
 
 #[cfg(test)]
