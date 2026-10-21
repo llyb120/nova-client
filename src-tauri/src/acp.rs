@@ -1454,38 +1454,11 @@ impl AcpManager {
             c.args(args_str.split_whitespace());
             c
         };
-        // Devin 的项目级 MCP 配置需要绑定到线程连接的启动目录；CodeBuddy 在
-        // session/new 时按标准 ACP mcpServers 注入，进程无需按目录分裂。
-        if matches!(self.kind, AgentKind::Kimi | AgentKind::Claude) {
+        // nova-tools 统一在 session/new / session/load 时按标准 ACP mcpServers 注入，
+        // 进程直接在会话目录启动，用户自己的 MCP 配置照常生效。
+        if matches!(self.kind, AgentKind::Kimi | AgentKind::Claude | AgentKind::Devin) {
             if let Some(cwd) = want_cwd {
                 cmd.current_dir(cwd);
-            }
-        }
-        if self.kind == AgentKind::Devin {
-            if let Some(cwd) = want_cwd {
-                // Devin 每个线程一条连接：自动模式的线程/场景环境既写进该连接的启动目录配置，
-                // 也设在 Devin 进程上，供 3000.3.x 共享的会话目录配置经环境继承拿到。
-                let thread_id = conn_key.strip_prefix("thread:");
-                let mut auto_env = thread_id
-                    .map(|id| crate::auto_tool_env(&self.app.state::<AppState>(), id))
-                    .unwrap_or_default();
-                if let Some(id) = thread_id.filter(|id| self.cwd_change_enabled(id)) {
-                    auto_env.push(("NOVA_CWD_CHANGE_SCOPE", self.cwd_change_scope(id)));
-                }
-                let launch_dir = prepare_devin_nova_tools_config(
-                    &self.app,
-                    conn_key,
-                    cwd,
-                    settings.context_retrieval_mode.as_str(),
-                    read_only,
-                    &auto_env,
-                )?;
-                cmd.envs(auto_env.iter().map(|(name, value)| (*name, value.as_str())));
-                cmd.current_dir(&launch_dir);
-                self.push_log(format!(
-                    "[nova] Devin 使用本地 nova-tools MCP 配置：{}",
-                    launch_dir.display()
-                ));
             }
         }
         cmd.stdin(std::process::Stdio::piped())
@@ -4682,16 +4655,22 @@ impl AcpManager {
         });
     }
 
-    /// session/new 与 session/load 携带的 MCP server 列表。
-    /// Devin 靠进程启动目录的本地 MCP 配置；CodeBuddy 按 ACP mcpServers 注入 Nova 工具。
+    /// session/new 与 session/load 携带的 MCP server 列表：按 ACP mcpServers 注入 Nova 工具。
     fn session_mcp_servers(
         &self,
         cwd: &str,
         read_only: bool,
         thread_id: &str,
     ) -> Result<Value, String> {
-        if !(self.kind.is_codebuddy() || matches!(self.kind, AgentKind::Kimi | AgentKind::Claude)) {
+        let devin = self.kind == AgentKind::Devin;
+        if !(devin || self.kind.is_codebuddy() || matches!(self.kind, AgentKind::Kimi | AgentKind::Claude)) {
             return Ok(json!([]));
+        }
+        if devin {
+            // 旧版本往项目 .devin/mcp_config.local.json 写过 nova-tools，残留会和注入的同名服务器冲突。
+            if let Err(e) = remove_devin_session_nova_tools(cwd) {
+                self.push_log(format!("[nova] 清理 Devin 项目内旧 nova-tools 配置失败：{e}"));
+            }
         }
         let state = self.app.state::<AppState>();
         let context_mode = {
@@ -4699,18 +4678,33 @@ impl AcpManager {
             settings.context_retrieval_mode.as_str().to_string()
         };
         let auto_change_project = self.cwd_change_enabled(thread_id);
-        if !auto_change_project && state.context_service.endpoint().is_empty()
+        if !devin && !auto_change_project && state.context_service.endpoint().is_empty()
         {
             return Ok(json!([]));
         }
-        let mut server = codebuddy_nova_tools_mcp_server(
-            &self.app,
-            cwd,
-            &context_mode,
-            read_only,
-            state.context_service.endpoint(),
-            state.context_service.token(),
-        )?;
+        let mut server = if devin {
+            let script = materialize_nova_tools_mcp(&self.app)?;
+            let node = resolve_program_on_path("node")
+                .ok_or_else(|| "未找到 Node.js，无法挂载 nova-tools MCP".to_string())?;
+            devin_acp_nova_tools_server(&devin_nova_tools_config(
+                &node,
+                &script,
+                cwd,
+                &context_mode,
+                read_only,
+                state.context_service.endpoint(),
+                state.context_service.token(),
+            ))
+        } else {
+            codebuddy_nova_tools_mcp_server(
+                &self.app,
+                cwd,
+                &context_mode,
+                read_only,
+                state.context_service.endpoint(),
+                state.context_service.token(),
+            )?
+        };
         if auto_change_project {
             server["env"].as_array_mut().unwrap().push(json!({
                 "name": "NOVA_CWD_CHANGE_SCOPE", "value": self.cwd_change_scope(thread_id)
@@ -5759,10 +5753,13 @@ mod codebuddy_acp_tests {
         assert!(rules.contains("crate::codex_app_server::rtk_guidance()"));
         assert!(rules.contains("ponytail_enabled"));
         assert!(rules.contains("crate::lyra::PONYTAIL_RULES"));
-        // Devin 自动模式线程：MCP 环境带 cwd scope，提示词宣传工具，切换请求不被拒。
+        // Devin 自动模式线程：cwd scope 随 session/new 注入的 MCP 环境下发，不再改写项目配置。
         let spawn = source.split("async fn spawn_conn(").nth(1).unwrap()
             .split("cmd.stdin(").next().unwrap();
-        assert!(spawn.contains("auto_env.push((\"NOVA_CWD_CHANGE_SCOPE\""));
+        assert!(!spawn.contains("prepare_devin_nova_tools_config"));
+        let servers = source.split("fn session_mcp_servers(").nth(1).unwrap()
+            .split("fn release_thread_conn(").next().unwrap();
+        assert!(servers.contains("\"NOVA_CWD_CHANGE_SCOPE\""));
         let enabled = source.split("fn cwd_change_enabled(").nth(1).unwrap()
             .split("fn cwd_change_scope(").next().unwrap();
         assert!(enabled.contains("self.kind == AgentKind::Devin"));
@@ -6169,146 +6166,90 @@ fn devin_nova_tools_config(
     })
 }
 
-/// Devin 3000.2.17 会启动 `session/new.mcpServers` 中的 stdio 进程，却不会把它加入
-/// mcp_list_tools / mcp_call_tool 的实际注册表。把同一配置写入隔离启动目录的项目级配置，
-/// 可兼容当前缺陷。
-/// Devin 3000.3.x 起 MCP 项目配置改名并改为按 session cwd 解析：
-/// `.devin/mcp_config.local.json`（启动目录的旧文件只会被启动、不会注册，
-/// mcp_call_tool 报 `Server 'nova-tools' not found. Available servers: []`）。
-/// 因此同时写两处：启动目录的 config.local.json 兼容 3000.2.x，
-/// 会话目录的 mcp_config.local.json 适配 3000.3.x（合并写入，保留用户已有服务器）。
-fn prepare_devin_nova_tools_config(
-    app: &AppHandle,
-    conn_key: &str,
-    cwd: &str,
-    context_mode: &str,
-    read_only: bool,
-    auto_env: &[(&'static str, String)],
-) -> Result<PathBuf, String> {
-    let script = materialize_nova_tools_mcp(app)?;
-    let node = resolve_program_on_path("node")
-        .ok_or_else(|| "未找到 Node.js，无法挂载 nova-tools MCP".to_string())?;
-    let safe_key: String = conn_key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
+/// Devin 3000.11 起 `session/new.mcpServers` 会正常注册（3000.2.x 只启动不注册，Nova 曾改写
+/// 项目 `.devin` 配置绕过，结果会把用户自己的 MCP 挤掉）。转成 ACP 的 stdio server 形状。
+fn devin_acp_nova_tools_server(config: &Value) -> Value {
+    let server = &config["mcpServers"]["nova-tools"];
+    let env: Vec<Value> = server["env"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, value)| json!({ "name": name, "value": value }))
         .collect();
-    let launch_dir = nova_data_dir(app)
-        .join("runtime")
-        .join("devin-mcp")
-        .join(safe_key);
-    let config_dir = launch_dir.join(".devin");
-    std::fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("创建 Devin MCP 配置目录失败：{e}"))?;
-    let state = app.state::<AppState>();
-    let config = devin_nova_tools_config(
-        &node,
-        &script,
-        cwd,
-        context_mode,
-        read_only,
-        state.context_service.endpoint(),
-        state.context_service.token(),
-    );
-    // 会话目录的配置可能被同目录的其它线程共用，只在本连接的启动目录配置里写线程级环境。
-    let mut launch_config = config.clone();
-    for (name, value) in auto_env {
-        launch_config["mcpServers"]["nova-tools"]["env"][*name] = Value::String(value.clone());
-    }
-    let bytes = serde_json::to_vec_pretty(&launch_config)
-        .map_err(|e| format!("序列化 Devin MCP 配置失败：{e}"))?;
-    let path = config_dir.join("config.local.json");
-    if std::fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
-        std::fs::write(&path, bytes).map_err(|e| format!("写入 Devin MCP 配置失败：{e}"))?;
-    }
-    // 3000.3.x 只认 session cwd 下的 mcp_config.local.json；写失败不阻断会话，仅记日志。
-    if let Err(e) = merge_devin_session_mcp_config(cwd, &config["mcpServers"]["nova-tools"]) {
-        let _ = app.emit(EV_LOG, format!("[nova] 写入 Devin 会话 MCP 配置失败：{e}"));
-    }
-    Ok(launch_dir)
+    json!({ "name": "nova-tools", "command": server["command"], "args": server["args"], "env": env })
 }
 
-/// 把 nova-tools 服务器合并进 session cwd 的 `.devin/mcp_config.local.json`（Devin 3000.3.x）。
-/// 已存在的其它服务器配置保留；内容未变时不重写。
-fn merge_devin_session_mcp_config(cwd: &str, server: &Value) -> Result<PathBuf, String> {
-    let config_dir = PathBuf::from(cwd).join(".devin");
-    std::fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("创建 Devin 会话 MCP 配置目录失败：{e}"))?;
-    let path = config_dir.join("mcp_config.local.json");
-    let mut doc = std::fs::read_to_string(&path)
+/// 去掉旧版本写进 session cwd `.devin/mcp_config.local.json` 的 nova-tools（只认 Nova 自己的脚本）；
+/// 其它服务器原样保留，文件解析失败时不动，只剩空壳时删除文件。
+fn remove_devin_session_nova_tools(cwd: &str) -> Result<(), String> {
+    let path = PathBuf::from(cwd).join(".devin").join("mcp_config.local.json");
+    let Some(mut doc) = std::fs::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .filter(|value| value.is_object())
-        .unwrap_or_else(|| json!({}));
-    if doc["mcpServers"]["nova-tools"] == *server {
-        return Ok(path);
+    else {
+        return Ok(());
+    };
+    let ours = doc["mcpServers"]["nova-tools"]["args"][0]
+        .as_str()
+        .is_some_and(|script| script.ends_with("nova-tools-mcp.mjs"));
+    let Some(servers) = doc.get_mut("mcpServers").and_then(Value::as_object_mut).filter(|_| ours) else {
+        return Ok(());
+    };
+    servers.remove("nova-tools");
+    if servers.is_empty() && doc.as_object().is_some_and(|o| o.len() == 1) {
+        return std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()));
     }
-    doc["mcpServers"]["nova-tools"] = server.clone();
-    let bytes = serde_json::to_vec_pretty(&doc)
-        .map_err(|e| format!("序列化 Devin 会话 MCP 配置失败：{e}"))?;
-    std::fs::write(&path, bytes).map_err(|e| format!("写入 Devin 会话 MCP 配置失败：{e}"))?;
-    Ok(path)
+    let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 #[cfg(test)]
 mod nova_tools_config_tests {
-    use super::{devin_nova_tools_config, merge_devin_session_mcp_config};
+    use super::{devin_acp_nova_tools_server, devin_nova_tools_config, remove_devin_session_nova_tools};
     use serde_json::{json, Value};
     use std::path::Path;
 
-    fn merge_test_dir(tag: &str) -> std::path::PathBuf {
+    fn test_dir(tag: &str) -> std::path::PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("nova-devin-mcp-merge-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("nova-devin-mcp-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join(".devin")).unwrap();
         dir
     }
 
     #[test]
-    fn session_mcp_config_merges_without_clobbering_existing_servers() {
-        let dir = merge_test_dir("merge");
-        let config_dir = dir.join(".devin");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let path = config_dir.join("mcp_config.local.json");
-        std::fs::write(
-            &path,
-            r#"{"mcpServers":{"mine":{"command":"foo"}},"other":1}"#,
-        )
-        .unwrap();
-        let server = json!({"command":"node","args":["nova-tools-mcp.mjs"],"transport":"stdio"});
-
-        merge_devin_session_mcp_config(dir.to_str().unwrap(), &server).unwrap();
+    fn legacy_nova_tools_removed_without_touching_user_servers() {
+        let dir = test_dir("keep");
+        let path = dir.join(".devin").join("mcp_config.local.json");
+        std::fs::write(&path, r#"{"mcpServers":{"mine":{"command":"foo"},"nova-tools":{"command":"node","args":["C:/x/nova-tools-mcp.mjs"]}},"other":1}"#).unwrap();
+        remove_devin_session_nova_tools(dir.to_str().unwrap()).unwrap();
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(doc["mcpServers"]["mine"]["command"], "foo");
-        assert_eq!(doc["other"], 1);
-        assert_eq!(doc["mcpServers"]["nova-tools"], server);
+        assert_eq!(doc, json!({"mcpServers":{"mine":{"command":"foo"}},"other":1}));
 
-        // 内容未变时不重写（mtime 不变）
-        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
-        merge_devin_session_mcp_config(dir.to_str().unwrap(), &server).unwrap();
-        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert_eq!(before, after);
+        // 只剩 Nova 写的空壳时删除文件
+        std::fs::write(&path, r#"{"mcpServers":{"nova-tools":{"command":"node","args":["nova-tools-mcp.mjs"]}}}"#).unwrap();
+        remove_devin_session_nova_tools(dir.to_str().unwrap()).unwrap();
+        assert!(!path.exists());
 
+        // 用户自己的同名服务器、无法解析的文件都不动
+        for text in [r#"{"mcpServers":{"nova-tools":{"command":"mine"}}}"#, "{ // jsonc\n}"] {
+            std::fs::write(&path, text).unwrap();
+            remove_devin_session_nova_tools(dir.to_str().unwrap()).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn session_mcp_config_replaces_unparseable_file() {
-        let dir = merge_test_dir("broken");
-        let config_dir = dir.join(".devin");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let path = config_dir.join("mcp_config.local.json");
-        std::fs::write(&path, "not json").unwrap();
-        let server = json!({"command":"node"});
-        merge_devin_session_mcp_config(dir.to_str().unwrap(), &server).unwrap();
-        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(doc["mcpServers"]["nova-tools"], server);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn devin_acp_server_uses_standard_env_array() {
+        let config = devin_nova_tools_config(Path::new("C:/node.exe"), Path::new("C:/nova-tools.mjs"), "D:/repo", "fast", false, "ep", "tk");
+        let server = devin_acp_nova_tools_server(&config);
+        assert_eq!(server["name"], "nova-tools");
+        assert_eq!(server["command"], "C:/node.exe");
+        assert_eq!(server["args"], json!(["C:/nova-tools.mjs"]));
+        let env = server["env"].as_array().unwrap();
+        assert!(env.contains(&json!({"name":"NOVA_TOOLS_CWD","value":"D:/repo"})));
+        assert!(!env.iter().any(|e| e["name"] == "NOVA_MCP_DIRECT"));
     }
 
     #[test]
