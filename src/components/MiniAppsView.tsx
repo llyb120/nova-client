@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import type { ModelTarget, PermissionRequest, PromptImage } from "../types";
+import type { ModelTarget, PermissionRequest, PromptImage, TeamMiniApp } from "../types";
 import { api } from "../ipc";
 import { openThread, refreshThreads, sceneModel, sendPromptTo, state } from "../store";
 import { PermissionCard } from "./PermissionCard";
@@ -24,7 +24,8 @@ type CommandSnapshot = { runId: string; status: Run["status"]; output: string; s
 const runtimeShell = () => /Win/i.test(navigator.platform) ? "powershell" as const : "bash" as const;
 type Version = { version: number; app: MiniApp; at: number };
 /** `published` is the single version on the quick panel (and in runtime windows); `versions` keeps every publication. */
-type SavedApp = { id: string; draft: MiniApp | null; published?: MiniApp; publishedVersion?: number; versions?: Version[]; updatedAt: number; messages: Message[]; history: MiniApp[]; run?: Run; diagnosis?: { threadId: string; at: number } };
+/** `teamId`: the team-library entry this app was shared as by this user; sharing again updates it. */
+type SavedApp = { id: string; teamId?: string; draft: MiniApp | null; published?: MiniApp; publishedVersion?: number; versions?: Version[]; updatedAt: number; messages: Message[]; history: MiniApp[]; run?: Run; diagnosis?: { threadId: string; at: number } };
 // ponytail: every version lives in localStorage (~5 MB quota, a failed write keeps the old library);
 // only the newest MAX_VERSIONS are kept. Move versions to app-data files if apps outgrow it.
 const MAX_VERSIONS = 20;
@@ -44,6 +45,7 @@ function readLibrary(raw: string | null): SavedApp[] {
   for (const item of saved) {
     if (!item || typeof item.id !== "string" || !/^[0-9a-f-]{36}$/i.test(item.id) || ids.has(item.id) || !Array.isArray(item.messages) || !Array.isArray(item.history)) throw new Error("应用库条目不完整，原数据已保留。");
     ids.add(item.id);
+    if (item.teamId !== undefined && typeof item.teamId !== "string") throw new Error("应用库条目不完整，原数据已保留。");
     if (item.draft !== null) validateMiniApp(item.draft);
     if (item.published) validateMiniApp(item.published);
     item.history.forEach(validateMiniApp);
@@ -245,14 +247,54 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
     void pollRun();
   }
   function create(app: MiniApp | null = null) {
-    if (locked() || props.runtimeAppId) return;
+    if (locked() || props.runtimeAppId) return false;
     try {
       sync();
       if (apps().length >= 100) throw new Error("预览版最多保存 100 个应用。");
       const item: SavedApp = { id: crypto.randomUUID(), draft: app, updatedAt: Date.now(), messages: [], history: [] };
       persist([...apps(), item]);
       choose(item.id);
-    } catch (e) { setError(errorText(e)); }
+      return true;
+    } catch (e) { setError(errorText(e)); return false; }
+  }
+  // 团队应用库：同组成员共享，只有发布者能更新或下架；导入得到本地草稿副本。
+  const [teamApps, setTeamApps] = createSignal<TeamMiniApp[]>([]);
+  const [teamNote, setTeamNote] = createSignal("");
+  const [teamBusy, setTeamBusy] = createSignal(false);
+  const myToken = () => state.settings?.relayToken ?? "";
+  const sharedEntry = (saved?: SavedApp) => saved?.teamId ? teamApps().find(item => item.id === saved.teamId && item.authorToken === myToken()) : undefined;
+  createEffect(() => { if (!props.runtimeAppId) void refreshTeam(); });
+  async function refreshTeam() {
+    if (!state.relay.enabled) { setTeamApps([]); return; }
+    try { setTeamApps((await api.teamMiniApps()).apps ?? []); setTeamNote(""); } catch (e) { setTeamNote(`团队应用库不可用：${errorText(e)}`); }
+  }
+  /** Shares the 星海 version (the draft if never published); a teammate's import is a plain draft, so nothing auto-runs. */
+  async function shareTeam() {
+    const saved = active();
+    const app = saved?.published ?? saved?.draft;
+    if (!saved || !app || teamBusy()) return;
+    setTeamBusy(true);
+    try {
+      const entry = await api.publishTeamMiniApp(sharedEntry(saved)?.id ?? null, validateMiniApp(app));
+      if (saved.teamId !== entry.id) update(saved.id, { teamId: entry.id });
+      log(`已把「${app.name}」${saved.published ? "星海版" : "草稿"}共享到团队应用库（第 ${entry.version} 版）`);
+      await refreshTeam();
+    } catch (e) { setError(`共享失败：${errorText(e)}`); } finally { setTeamBusy(false); }
+  }
+  async function importTeam(item: TeamMiniApp) {
+    if (teamBusy()) return;
+    setTeamBusy(true);
+    try {
+      const app = validateMiniApp((await api.teamMiniApp(item.id)).app);
+      const scripts = app.actions.filter(action => action.kind === "command").length;
+      if (!await confirm(`把 ${item.authorName} 共享的「${app.name}」导入为本地草稿？${scripts ? `\n\n其中有 ${scripts} 个脚本动作，试用时会以你的账号权限在本机执行，请先在设计模式检查。` : ""}`, { title: "导入团队应用", kind: "warning" })) return;
+      create(app);
+    } catch (e) { setError(`无法导入团队应用：${errorText(e)}`); } finally { setTeamBusy(false); }
+  }
+  async function removeTeam(item: TeamMiniApp) {
+    if (teamBusy() || !await confirm(`从团队应用库下架「${item.name}」？队友已导入的副本不受影响。`, { title: "下架团队应用", kind: "warning" })) return;
+    setTeamBusy(true);
+    try { await api.removeTeamMiniApp(item.id); await refreshTeam(); } catch (e) { setError(`下架失败：${errorText(e)}`); } finally { setTeamBusy(false); }
   }
   function consumeOpen() {
     try {
@@ -311,7 +353,10 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       void getCurrentWindow().onCloseRequested(async () => {
         if (active()?.run?.status === "running") await Promise.race([cancelRun(), new Promise(resolve => window.setTimeout(resolve, 2000))]);
       }).then(remove => disposed ? remove() : unlisten.push(remove));
-    } else window.addEventListener("nova:miniapps-open", consumeOpen);
+    } else {
+      window.addEventListener("nova:miniapps-open", consumeOpen);
+      void listen("relay:miniapps", () => void refreshTeam()).then(remove => disposed ? remove() : unlisten.push(remove));
+    }
     const timer = window.setInterval(() => { void pollRun(); void pollDiagnosis(); }, 1500);
     onCleanup(() => { disposed = true; window.clearInterval(timer); window.removeEventListener("nova:miniapps-open", consumeOpen); unlisten.forEach(remove => remove()); });
   });
@@ -882,6 +927,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       <div class="mini-top-actions">
         <button disabled={!active()?.history.length || locked() || mode() === "run"} onClick={undo}>撤销</button>
         <button disabled={!doc() || locked()} onClick={test}>检查</button>
+        <Show when={state.relay.enabled}><button title="共享星海版（未发布则共享草稿），同组队友可在团队应用库导入" disabled={!(active()?.published ?? active()?.draft) || locked() || teamBusy()} onClick={() => void shareTeam()}>{sharedEntry(active()) ? "更新团队版" : "共享到团队"}</button></Show>
         <button class="mini-primary" title="每次发布生成一个版本，星海只显示其中一个" disabled={!publishable() || locked() || mode() === "run"} onClick={publish}>{publishLabel()}</button>
       </div>
     </header></Show>
@@ -895,6 +941,13 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
           <button class="mini-app-remove" title="删除应用" aria-label={`删除 ${appName(item)}`} disabled={locked()} onClick={() => removeApp(item.id)}>×</button>
         </li>}</For></ul>
         <Show when={storageReady() && !apps().length}><p class="mini-library-empty">还没有应用。在右侧描述一个想法，或先体验示例。</p></Show>
+        <Show when={state.relay.enabled}><div class="mini-section-label mini-team-label">团队应用库 <span>{teamApps().length}<button class="mini-team-refresh" title="刷新团队应用库" aria-label="刷新团队应用库" onClick={() => void refreshTeam()}>↻</button></span></div>
+          <Show when={teamNote()}><p class="mini-library-empty" role="status">{teamNote()}</p></Show>
+          <ul class="mini-app-list"><For each={teamApps()}>{item => <li class="mini-app-item">
+            <button class="mini-app-open" title={item.description || "导入为本地草稿"} disabled={locked() || !storageReady() || teamBusy()} onClick={() => void importTeam(item)}><span class="mini-app-dot" aria-hidden="true">↓</span><span class="mini-app-meta"><strong>{item.name}</strong><small>{item.authorToken === myToken() ? "我" : item.authorName} · 第 {item.version} 版 · {formatTime(item.updatedAt)}</small></span></button>
+            <Show when={item.authorToken === myToken()}><button class="mini-app-remove" title="从团队应用库下架" aria-label={`下架 ${item.name}`} disabled={teamBusy()} onClick={() => void removeTeam(item)}>×</button></Show>
+          </li>}</For></ul>
+          <Show when={!teamApps().length && !teamNote()}><p class="mini-library-empty">团队还没有共享应用。选中一个应用后点「共享到团队」。</p></Show></Show>
       </aside></Show>
       <section class="mini-canvas">
         <Show when={!props.runtimeAppId}><div class="mini-canvas-toolbar"><div class="mini-segment" role="group" aria-label="工作台模式">

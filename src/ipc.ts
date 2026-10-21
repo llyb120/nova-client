@@ -13,6 +13,7 @@ import type {
   GlobalAgentInstructions,
   PromptTrigger,
   IncomingShare,
+  TeamMiniApp,
   ModelCost,
   ModelOptions,
   Peer,
@@ -312,6 +313,11 @@ export const api = {
   getRelayInbox: () => invoke<IncomingShare[]>("get_relay_inbox"),
   shareThread: (threadId: string, to: string) =>
     invoke<void>("share_thread", { threadId, to }),
+  /** 观星台团队应用库：不传 id 列元数据，传 id 取含定义的单个应用 */
+  teamMiniApps: () => invoke<{ apps: TeamMiniApp[] }>("team_miniapps", { id: null }),
+  teamMiniApp: (id: string) => invoke<TeamMiniApp & { app: unknown }>("team_miniapps", { id }),
+  publishTeamMiniApp: (id: string | null, app: unknown) => invoke<TeamMiniApp>("team_miniapp_publish", { id, app }),
+  removeTeamMiniApp: (id: string) => invoke<void>("team_miniapp_remove", { id }),
   advancedShare: (
     threadId: string,
     to: string,

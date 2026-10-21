@@ -24,6 +24,9 @@
 .mini-library { display: flex; flex-direction: column; gap: 8px; min-height: 0; padding: 18px 10px; background: color-mix(in srgb, var(--bg-sidebar) 65%, transparent); border-right: 1px solid var(--border); overflow-y: auto; }
 .mini-section-label { display: flex; justify-content: space-between; margin: 0 6px 4px; color: var(--text-muted); font-size: 12px; letter-spacing: 1px; }
 .mini-section-label span { color: var(--text-faint); font-family: var(--mono); }
+.mini-team-label { margin-top: 16px; }
+.mini-team-refresh { margin-left: 4px; padding: 0 4px; border: 0; border-radius: 4px; background: transparent; color: var(--text-faint); }
+.mini-team-refresh:hover { color: var(--text); background: var(--bg-hover, transparent); }
 .mini-new-app { flex-shrink: 0; padding: 9px 10px; border: 1px dashed var(--border-light); border-radius: 8px; background: transparent; color: var(--text-dim); font-size: 12px; text-align: left; }
 .mini-new-app:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
 .mini-app-list { list-style: none; display: flex; flex-direction: column; gap: 2px; margin: 4px 0 0; padding: 0; }

@@ -634,6 +634,18 @@ export interface IncomingRoamRequest {
   continuation?: boolean;
 }
 
+/** 观星台团队应用库的一条元数据（定义正文按需另取） */
+export interface TeamMiniApp {
+  id: string;
+  name: string;
+  description?: string;
+  authorToken: string;
+  authorName: string;
+  version: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 /** 收到的一条分享 */
 export interface IncomingShare {
   id: string;
