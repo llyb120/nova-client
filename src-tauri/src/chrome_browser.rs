@@ -93,8 +93,27 @@ fn bridge(app: &AppHandle) -> Arc<ChromeBridge> {
     app.state::<Arc<ChromeBridge>>().inner().clone()
 }
 pub(crate) fn tool_definition() -> Value {
-    serde_json::from_str(include_str!("../../scripts/chrome-tool.json"))
-        .expect("chrome tool schema")
+    tool_definition_for_jev(crate::jev::available())
+}
+
+// The bundled schema is the safe, non-JEV fallback. Only the serving Nova process
+// knows the live settings; standalone MCP adapters fetch tool_definition from it.
+pub(crate) fn tool_definition_for_jev(available: bool) -> Value {
+    let mut tool: Value = serde_json::from_str(include_str!("../../scripts/chrome-tool.json"))
+        .expect("chrome tool schema");
+    if available {
+        tool["description"] = tool["description"].as_str().unwrap()
+            .replace("run(tabTag,plan)按步骤连续执行；", "run(tabTag,plan)一次连续执行多步流程（筛选、表单、排序等≥3步时优先于逐步act，省去每步往返）；")
+            .replace(
+                "run传plan(task,steps)：把你已确认的连续DOM步骤（最多24步）一次交给本地执行，每步在最新DOM上绑定并等页面稳定，目标有歧义或expect不成立时返回guided.remainingSteps交回你；单步或同屏合批直接act。",
+                "run传plan(task,steps)：多步流程（打开面板/下拉→选择→确认→应用、排序、跨屏查找等）默认一次run交给本地连续执行，不要逐步act：steps按预期顺序写完整流程（最多24步），尚未出现的控件（下拉选项、弹层按钮）也直接描述，target按用户语言写即可；run在最新DOM上绑定并等页面稳定，拿不准时结合截图选控件、核验expect，仍不确定才返回guided.remainingSteps交回你；只有单步或同屏合批才直接act；同一标签连续2次点击/填写类act后第3次会被拒绝（not_executed，快照仍可用），须把剩余流程写成run，run交回后可再act兜底。",
+            ).into();
+        let plan = &mut tool["inputSchema"]["properties"]["plan"];
+        plan["description"] = "run的步骤计划：task一句话目标；steps为完成目标的预期步骤（1–24步，可含尚未出现的控件），本地在最新DOM上逐步绑定执行，拿不准时结合截图选择控件和核验。expectedText可选：给出时最后按页面文字核验，未给则执行完交回你判断。".into();
+        let steps = &mut plan["properties"]["steps"]["description"];
+        *steps = steps.as_str().unwrap().replace("按顺序写已确认的步骤", "按预期顺序写完整步骤").into();
+    }
+    tool
 }
 
 async fn bind_listener(
@@ -449,6 +468,31 @@ pub async fn chrome_dependency_status(app: AppHandle) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chrome_schema_tracks_jev_without_changing_parameters() {
+        let disabled = tool_definition_for_jev(false);
+        assert_eq!(disabled, serde_json::from_str::<Value>(include_str!("../../scripts/chrome-tool.json")).unwrap());
+        for available in [false, true] {
+            let mut tool = tool_definition_for_jev(available);
+            let description = tool["description"].as_str().unwrap();
+            for claim in ["≥3步时优先", "默认一次run", "第3次会被拒绝", "结合截图选控件", "尚未出现的控件"] {
+                assert_eq!(description.contains(claim), available, "{claim}");
+            }
+            assert_eq!(description.contains("目标有歧义或expect不成立"), !available);
+            let plan = &tool["inputSchema"]["properties"]["plan"];
+            assert_eq!(plan["description"].as_str().unwrap().contains("结合截图"), available);
+            assert_eq!(plan["description"].as_str().unwrap().contains("不调用模型决策"), !available);
+            assert!(plan["description"].as_str().unwrap().contains("按页面文字核验"));
+            assert_eq!(plan["properties"]["steps"]["description"].as_str().unwrap().contains("已确认"), !available);
+            // Both modes retain the exact same argument contract and unrelated instructions.
+            tool["description"] = disabled["description"].clone();
+            for path in ["/inputSchema/properties/plan/description", "/inputSchema/properties/plan/properties/steps/description"] {
+                *tool.pointer_mut(path).unwrap() = disabled.pointer(path).unwrap().clone();
+            }
+            assert_eq!(tool, disabled);
+        }
+    }
+
     #[tokio::test]
     async fn cdp_waits_for_busy_renderer_without_resending() {
         let state = Arc::new(ChromeBridge::new());

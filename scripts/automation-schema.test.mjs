@@ -3,6 +3,8 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile,mkdtemp,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
+import {createServer} from 'node:net';
+import {randomUUID} from 'node:crypto';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createNovaBatchTools} from './nova-batch-tools.mjs';
@@ -10,25 +12,54 @@ import {automationMcpResult} from './automation-mcp-result.mjs';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
 const tool = async name=>JSON.parse(await readFile(new URL(`./${name}-tool.json`,import.meta.url),'utf8'));
-test('embedded CodeBuddy MCP advertises the current browser schemas and instructions', {timeout:15000}, async()=>{
+test('embedded CodeBuddy MCP refreshes both JEV modes from Nova on every tools/list', {timeout:15000}, async()=>{
+  const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));
+  // The Rust dual-mode test covers real wording; here distinct server-owned descriptions
+  // prove the adapter forwards the entire schema rather than inferring state in the child.
+  const enabled=structuredClone(chrome);
+  enabled.description='serving Nova: JEV enabled';
+  enabled.inputSchema.properties.plan.description='server-owned JEV plan';
+  enabled.inputSchema.properties.plan.properties.steps.description='server-owned JEV steps';
+  let schema=chrome;
+  const calls=[];
+  const endpoint=process.platform==='win32' ? `\\\\.\\pipe\\nova-schema-${randomUUID()}` : join(tmpdir(),`nova-schema-${randomUUID()}.sock`);
+  const server=createServer(socket=>{
+    let line='';
+    socket.on('data',chunk=>{
+      line+=chunk;
+      if(!line.includes('\n'))return;
+      calls.push(JSON.parse(line.trim()));
+      socket.end(JSON.stringify(schema ? {ok:true,result:schema} : {ok:false,error:'unknown context service method'})+'\n');
+    });
+  });
+  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(endpoint,resolve);});
   const client=new Client({name:'nova-bundle-parity-test',version:'1.0'});
   const transport=new StdioClientTransport({command:process.execPath,
     args:[fileURLToPath(new URL('../src-tauri/resources/nova-tools-mcp.mjs',import.meta.url))],
-    env:{...process.env,NOVA_CONTEXT_SERVICE_ENDPOINT:'unused-test-endpoint',NOVA_CONTEXT_SERVICE_TOKEN:'unused-test-token',NOVA_TOOLS_READ_ONLY:'0'}});
+    env:{...process.env,NOVA_CONTEXT_SERVICE_ENDPOINT:endpoint,NOVA_CONTEXT_SERVICE_TOKEN:'schema-test',NOVA_TOOLS_READ_ONLY:'0',NOVA_DESKTOP:'1',NOVA_JEV:'off'}});
   try {
     await client.connect(transport);
-    const listed=(await client.listTools()).tools;
-    assert(!listed.some(t=>t.name==='webview'));
+    for(const current of [chrome,enabled,chrome,enabled,null,{}]) {
+      schema=current;
+      const listed=(await client.listTools()).tools;
+      assert(!listed.some(t=>t.name==='webview'));
+      for(const expected of [current?.name==='chrome' ? current : chrome,jianlai]) {
+        const actual=listed.find(t=>t.name===expected.name);
+        assert(actual,`missing bundled ${expected.name}`);
+        assert.deepEqual(actual.inputSchema,expected.inputSchema,'Run npm run build:nova-tools-mcp before compiling Nova');
+        assert.equal(actual.description,expected.description);
+      }
+    }
+    assert.equal(calls.length,6,'each tools/list must refresh, including after a previous JEV-enabled result');
+    for(const request of calls) {
+      assert.equal(request.method,'tool_schema');
+      assert.equal(request.token,'schema-test');
+      assert.deepEqual(request.params,{name:'chrome'});
+    }
     const removed=await client.callTool({name:'webview',arguments:{operation:'open',url:'https://example.com'}});
     assert.equal(removed.isError,true);
     assert.match(removed.content[0].text,/Unknown tool: webview/);
-    for(const name of ['chrome','jianlai']) {
-      const actual=listed.find(t=>t.name===name),expected=await tool(name);
-      assert(actual,`missing bundled ${name}`);
-      assert.deepEqual(actual.inputSchema,expected.inputSchema,'Run npm run build:nova-tools-mcp before compiling Nova');
-      assert.equal(actual.description,expected.description);
-    }
-  } finally {await client.close();}
+  } finally {await client.close();await new Promise(resolve=>server.close(resolve));}
 });
 test('Chrome retains image coordinates, fast scope and bounded batch schemas',async()=>{
   const chrome=await tool('chrome');

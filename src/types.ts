@@ -456,6 +456,11 @@ export interface Settings {
   defaultMode: string;
   /** 场景模型：轻量化 / 编码 / 剑来 */
   sceneModels: SceneModels;
+  /** jev 视觉决策：启用后按中转 → 本地 → 关闭选择；以下本地配置仅在未配置中转时使用，Key 留空复用 Lyra 的 Command Code */
+  jevVisionEnabled: boolean;
+  jevApiKey: string;
+  jevApiUrl: string;
+  jevModel: string;
   /** 打开文件用的编辑器命令（cursor / code / zed 等） */
   editor: string;
   /** 内嵌终端程序，空为系统默认 shell。 */

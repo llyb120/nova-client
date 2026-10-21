@@ -7,6 +7,7 @@ mod jianlai;
 mod jianpu;
 mod employee;
 mod altair_run;
+mod jev;
 mod tool_experience;
 mod cli_manager;
 mod clipboard;
@@ -4060,6 +4061,7 @@ pub(crate) fn dispatch_prompt(
     images: Vec<PromptImage>,
 ) -> Result<(), String> {
     lyra::session::resume_for_thread(&thread_id);
+    altair_run::reset_act_streaks();
     dispatch_scene_prompt(app, thread_id, text, images)
 }
 

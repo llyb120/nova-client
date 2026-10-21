@@ -44,6 +44,11 @@ pub(crate) fn init(app: &AppHandle) {
     let _ = APP.set(app.clone());
 }
 
+/// Live app settings for side services (jev); None outside the desktop app.
+pub(crate) fn settings() -> Option<crate::settings::Settings> {
+    APP.get().map(|app| app.state::<AppState>().settings.lock().unwrap().clone())
+}
+
 fn check(_app: &AppHandle, current: &Session) -> Result<(), String> {
     if current.cancel.load(Ordering::SeqCst) {
         return Err("已停止浏览器控制".into());
@@ -1345,6 +1350,7 @@ async fn control_session(
         desktop_invalidated = crate::jianlai::invalidate_desktop("Chrome 已激活目标标签，旧桌面快照作废");
         state.observations.lock().unwrap().remove(&s.active_tab);
         let mut failure=None;
+        let mut batch_settle=None;
         let mut action_timings=Vec::new();
         let clipboard=crate::clipboard::sequence();
         let mut script_value = None;
@@ -1374,7 +1380,7 @@ async fn control_session(
                 }
             }
         }
-        for action in &actions {
+        for (index, action) in actions.iter().enumerate() {
             let began=std::time::Instant::now();
             let applied=apply(app,&s,&observation,action,args["imageId"].as_str(),&mut progress).await;
             action_timings.push(began.elapsed().as_millis());
@@ -1382,9 +1388,22 @@ async fn control_session(
                 Ok(())=>progress.completed+=1,
                 Err(error)=>{failure=Some(error);break;},
             }
+            if crate::altair_run::executing_browser_action() && index + 1 < actions.len() && settle_ms > 0 {
+                // Count the input before waiting: cancellation/15s timeout must retain completedActions.
+                // Run batches only chain known inputs, but each can still trigger a render/animation.
+                let frame = match action { Action::Click{frame,..} | Action::Fill{frame,..} | Action::Scroll{frame,..} => *frame, _ => 0 };
+                let quiet = evaluate(app, &observation.frames[frame], format!("__novaWebview.settle(250,{settle_ms})")).await
+                    .unwrap_or_else(|error| json!({"quiet":false,"error":error}));
+                let ready = quiet["quiet"] == true;
+                batch_settle = Some(quiet);
+                if !ready {
+                    failure = Some("连续输入间页面未能稳定或已跳转；已完成动作不重放，后续动作未执行，请先观察确认".into());
+                    break;
+                }
+            }
         }
         let mut result=json!({"status":if failure.is_none(){"executed"}else if progress.attempted{"needs_review"}else{"not_executed"},
-            "scrollFeedback":progress.scroll_feedback,
+            "batchSettle":batch_settle,"scrollFeedback":progress.scroll_feedback,
             "canReobserve":failure.is_some() && progress.dom_preflight && progress.completed==0,
             // The failing action itself sent no input (DOM preflight); earlier batch actions did complete.
             "failedAtPreflight":failure.is_some() && progress.dom_preflight,
@@ -1399,12 +1418,13 @@ async fn control_session(
         // A click/Enter often starts a navigation; feeding back the old DOM costs the model another
         // inspect round-trip. Wait (bounded) for the tab to finish loading before observing.
         if failure.is_none() && settle_ms > 0 && args["feedback"] != "none" && !s.cancel.load(Ordering::SeqCst)
-            && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::ClickAt{..} | Action::Press{..})) {
+            && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::ClickAt{..} | Action::Press{..} | Action::Fill{..} | Action::Type{..})) {
             let tag = s.active_tab.rsplit(':').next().unwrap_or_default();
             result["settle"] = wait_for_tab_load(app, tag, Duration::from_millis(settle_ms)).await;
             // Loaded is not rendered: SPAs patch the DOM after their XHR. Wait for the DOM to go quiet
             // so the feedback shows the result instead of costing the model another observe round-trip.
-            let budget = settle_ms.saturating_sub(result["settle"]["waitedMs"].as_u64().unwrap_or(0)).min(1000);
+            // Typing settles too: search boxes filter after a debounce.
+            let budget = settle_ms.saturating_sub(result["settle"]["waitedMs"].as_u64().unwrap_or(0)).min(2500);
             if result["settle"]["status"] == "complete" && budget >= 100 {
                 // A navigation replaced the document (and our world): nothing to wait for there.
                 if let Ok(quiet) = evaluate(app, &observation.frames[0], format!("__novaWebview.settle(250,{budget})")).await { result["settle"]["dom"] = quiet; }
@@ -1646,6 +1666,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
     let args = &args;
     let normalized = chrome_args(args, &thread_id, &app.state::<BrowserState>().observations.lock().unwrap())?;
     let normalized = resolve_targets(root, &normalized, owner, "chrome").await?;
+    if let Some(refused) = crate::altair_run::act_gate(&thread_id, &normalized) { return Ok(refused); }
     let mut result = SHOT_OWNER.scope(owner.to_owned(), execute_chrome_inner(root, &normalized, owner)).await?;
     if let Some(op) = inferred { result["operationInferred"] = json!(op); }
     if args.get("tabTag").is_none() && normalized["tabTag"].is_string() {
@@ -1741,8 +1762,9 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
             if let Some(q) = args["query"].as_str().map(str::trim).filter(|q| !q.is_empty()) {
                 let q = q.to_lowercase();
                 let all = value["tabs"].as_array().cloned().unwrap_or_default();
-                let matched: Vec<Value> = all.iter().filter(|t| ["title", "url"].iter()
-                    .any(|k| t[*k].as_str().is_some_and(|s| s.to_lowercase().contains(&q)))).cloned().collect();
+                // Users paste the tag copied from the extension; it matches exactly, never as a substring.
+                let matched: Vec<Value> = all.iter().filter(|t| t["tag"].as_str().is_some_and(|tag| tag.eq_ignore_ascii_case(&q))
+                    || ["title", "url"].iter().any(|k| t[*k].as_str().is_some_and(|s| s.to_lowercase().contains(&q)))).cloned().collect();
                 let controllable: Vec<&Value> = matched.iter().filter(|t| t["controllable"] != false).collect();
                 value["totalTabs"] = json!(all.len());
                 value["query"] = json!(q);

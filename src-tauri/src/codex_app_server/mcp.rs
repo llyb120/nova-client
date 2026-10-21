@@ -29,9 +29,24 @@ fn available_tools() -> Vec<Value> {
     if std::env::var("NOVA_FAST_CONTEXT").as_deref() != Ok("0") { tools.push(tool()); }
     if std::env::var("NOVA_TOOLS_READ_ONLY").as_deref() != Ok("1") {
         tools.extend(crate::image_generation::tool_definitions());
-        tools.push(crate::chrome_browser::tool_definition());
+        tools.push(crate::chrome_browser::tool_definition_for_jev(false));
         tools.push(crate::jianlai::tool_definition());
         tools.push(crate::employee::tool_definition());
+    }
+    tools
+}
+
+async fn list_tools(config: Config) -> Vec<Value> {
+    let mut tools = available_tools();
+    if let Some(chrome) = tools.iter_mut().find(|tool| tool["name"] == "chrome") {
+        // This standalone process has no live settings. Ask the serving Nova on every list.
+        // Older/unreachable services leave the non-JEV fallback intact.
+        if let Ok(schema) = call(config, "tool_schema", json!({"name":"chrome"})).await {
+            if schema["name"] == "chrome" && schema["description"].is_string()
+                && schema["inputSchema"]["type"] == "object" {
+                *chrome = schema;
+            }
+        }
     }
     tools
 }
@@ -111,7 +126,7 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
 
 async fn call(config: Config, name: &str, args: Value) -> Result<Value, String> {
     let args = if name == "polaris" { normalize(args)? } else { args };
-    tokio::time::timeout(Duration::from_secs(if name == "polaris" { 120 } else { 610 }), async {
+    tokio::time::timeout(Duration::from_secs(if name == "tool_schema" { 3 } else if name == "polaris" { 120 } else { 610 }), async {
         let until = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             #[cfg(windows)]
@@ -210,7 +225,7 @@ pub(super) async fn serve<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         Some(response(id, json!({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"nova-tools","version":env!("CARGO_PKG_VERSION")}})))
                     }
                     "ping" => Some(response(id, json!({}))),
-                    "tools/list" => Some(response(id, json!({"tools":available_tools()}))),
+                    "tools/list" => Some(response(id, json!({"tools":list_tools(config.clone()).await}))),
                     "tools/call" => {
                         if tasks.len() >= 16 { Some(error(id, -32000, "Too many concurrent tool calls")) }
                         else {
@@ -334,7 +349,13 @@ mod tests {
             assert_eq!(value["id"], id);
             match id {
                 1 => assert_eq!(value["result"]["protocolVersion"], "2025-06-18"),
-                2 => assert_eq!(value["result"]["tools"][0]["name"], "polaris"),
+                2 => {
+                    assert_eq!(value["result"]["tools"][0]["name"], "polaris");
+                    if let Some(chrome) = value["result"]["tools"].as_array().unwrap().iter().find(|tool| tool["name"] == "chrome") {
+                        assert_eq!(*chrome, crate::chrome_browser::tool_definition_for_jev(false),
+                            "unreachable Nova must not advertise JEV from the MCP child's config");
+                    }
+                }
                 _ => assert_eq!(value["result"]["isError"], true),
             }
         }

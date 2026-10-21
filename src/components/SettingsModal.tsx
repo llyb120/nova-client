@@ -330,6 +330,10 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     s?.sessionAutoCleanupHours ?? 24 * 30,
   );
   const [knowledgeGraphEnabled, setKnowledgeGraphEnabled] = createSignal(s?.knowledgeGraphEnabled ?? false);
+  const [jevVisionEnabled, setJevVisionEnabled] = createSignal(s?.jevVisionEnabled ?? true);
+  const [jevApiKey, setJevApiKey] = createSignal(s?.jevApiKey ?? "");
+  const [jevApiUrl, setJevApiUrl] = createSignal(s?.jevApiUrl ?? "");
+  const [jevModel, setJevModel] = createSignal(s?.jevModel ?? "");
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
   );
@@ -681,6 +685,10 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
     knowledgeGraphEnabled: knowledgeGraphEnabled(),
+    jevVisionEnabled: jevVisionEnabled(),
+    jevApiKey: jevApiKey().trim(),
+    jevApiUrl: jevApiUrl().trim(),
+    jevModel: jevModel().trim(),
     historyDisplayMode: historyDisplayMode(),
     customEnvVars: Object.fromEntries(
       customEnvVars()
@@ -1237,6 +1245,32 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   </div>
                 )}
               </For>
+            </section>
+            <section class="settings-group">
+              <h3 class="settings-group-title">jev 视觉决策（可选）</h3>
+              <p class="settings-group-desc">
+                浏览器 run 在本地拿不准控件或结果时，带截图问 jev 选择和核验；启用时同一标签连续 2 次逐步点击/填写后要求改用 run。
+                启用后按「中转 → 本地 → 关闭」选择：已配置中转地址和 token 时优先使用中转；否则使用下方本地配置（Key 留空复用 Lyra 的 Command Code），均未配置则不调用 jev。
+              </p>
+              <label class="backend-switch">
+                <input type="checkbox" checked={jevVisionEnabled()} onChange={(e) => setJevVisionEnabled(e.currentTarget.checked)} />
+                <span>启用 jev</span>
+              </label>
+              <Show when={jevVisionEnabled()}>
+                <label class="field">
+                  <span class="field-label">本地 API Key</span>
+                  <input class="field-input" value={jevApiKey()} placeholder="留空复用 Command Code" onInput={(e) => setJevApiKey(e.currentTarget.value)} />
+                  <span class="field-hint">下方配置仅在未配置中转时使用。中转请求使用 gzip 压缩、模型 typesafe/jev-1.14.0；本地填写 Key 后默认使用 https://api.typesafe.ai/v1/systemone、模型 jev-1.14.0。</span>
+                </label>
+                <label class="field">
+                  <span class="field-label">API 地址</span>
+                  <input class="field-input" value={jevApiUrl()} placeholder="留空使用默认 /systemone 地址" onInput={(e) => setJevApiUrl(e.currentTarget.value)} />
+                </label>
+                <label class="field">
+                  <span class="field-label">模型</span>
+                  <input class="field-input" value={jevModel()} placeholder="留空：Command Code 用 typesafe/jev-1.14.0，直连用 jev-1.14.0" onInput={(e) => setJevModel(e.currentTarget.value)} />
+                </label>
+              </Show>
             </section>
           </Show>
           {/* ===== 通用 ===== */}

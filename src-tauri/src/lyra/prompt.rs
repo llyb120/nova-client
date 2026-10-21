@@ -459,6 +459,10 @@ Not lazy about: understanding the problem (read it fully and trace the real flow
 
 /// 稳定段在前、动态段在后，配合 session 级 prompt_cache_key 最大化前缀缓存命中。
 pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
+    build_system_prompt_with_jev(options, crate::jev::available())
+}
+
+fn build_system_prompt_with_jev(options: &SystemPromptOptions, jev_available: bool) -> String {
     let polaris = options.fast_context;
     let read_only = options.read_only;
     // 显式列出可用工具（按 Lyra 实际注册的工具集，只读模式无 bash/edit/write）。
@@ -468,6 +472,11 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         ),
         Some("- read: 读取单个文件（图片直接返回图像）"),
         (!read_only && options.desktop).then_some("- jianlai（剑来）: 仅在必须操作图形界面时用真实鼠标键盘与截图操作电脑；本地文件/图片用 read，命令能拿到的用 bash，Chrome 网页用 chrome"),
+        (!read_only && options.desktop).then_some(if jev_available {
+            "- chrome: 操作 Chrome 网页。硬性规则：需要≥3次点击/填写的网页流程（筛选、表单、排序等）必须先 open 看页面，再用一次 run 写完全部步骤（含打开下拉后才出现的选项、面板的确认按钮）交给本地执行，拿不准时它会看截图；只有 run 交回（handoff）后或单步操作才用 act"
+        } else {
+            "- chrome: 操作 Chrome 网页。run 只执行你已确认的连续 DOM 步骤；目标有歧义或 expect 不成立时交回主模型，expectedText 按页面文字核验；单步或同屏合批直接 act"
+        }),
         if read_only {
             None
         } else {
@@ -576,6 +585,29 @@ mod tests {
         let prompt = build_system_prompt(&options);
         assert!(!prompt.contains("change_working_directory"));
         assert!(!prompt.contains("jianlai"));
+    }
+
+    #[test]
+    fn chrome_prompt_tracks_jev_and_tool_visibility() {
+        let mut options = SystemPromptOptions {
+            cwd: "/tmp/project".into(), read_only: false, fast_context: false,
+            auto_change_project: false, shell: None, skills_text: String::new(),
+            custom_instructions: String::new(), ponytail: false, desktop: true,
+        };
+        for available in [false, true] {
+            let prompt = build_system_prompt_with_jev(&options, available);
+            assert!(prompt.contains("- chrome:"));
+            assert_eq!(prompt.contains("必须先 open"), available);
+            assert_eq!(prompt.contains("看截图"), available);
+            assert_eq!(prompt.contains("已确认的连续 DOM 步骤"), !available);
+            assert_eq!(prompt.contains("按页面文字核验"), !available);
+            options.desktop = false;
+            assert!(!build_system_prompt_with_jev(&options, available).contains("- chrome:"));
+            options.desktop = true;
+            options.read_only = true;
+            assert!(!build_system_prompt_with_jev(&options, available).contains("- chrome:"));
+            options.read_only = false;
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 24) return;
+  if (globalThis.__novaWebview?.apiVersion === 26) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   // Icon-only controls (sort carets, filter funnels, close ×) carry their meaning in class names.
   const iconHint = e => {
@@ -152,7 +152,7 @@
     return entry;
   };
   const api = {
-    apiVersion: 24,
+    apiVersion: 26,
     stamp,
     async evaluate(expression, expectedDocument, expectedUrl) {
       // Check and start in the same JS turn: navigation must never redirect a script to a new document.
@@ -175,14 +175,19 @@
       }
       return refs;
     },
-    // After an input: wait until the observed roots stop mutating (SPA renders after XHR), bounded.
+    // After an input: wait until the observed roots stop mutating (SPA renders after XHR) and no
+    // finite animation/transition is still running (menus sliding open, fades), bounded. Infinite
+    // ones (spinners, marquees) never end, so they do not hold the page.
     async settle(quietMs=250, budgetMs=1000) {
-      const started=performance.now();let last=revision,since=started;
-      while(performance.now()-started<budgetMs) {
-        await new Promise(resolve=>setTimeout(resolve,50));
+      const started=performance.now(),deadline=started+budgetMs;let last=revision,since=started;
+      // Document.getAnimations does not include shadow trees; reuse the roots already observed.
+      const animating=()=>(rootObservers.size?[...rootObservers.keys()]:[document]).some(root=>(root.getAnimations?.()??[]).some(a=>a.playState==='running'&&Number.isFinite(a.effect?.getComputedTiming?.().endTime)));
+      while(performance.now()<deadline) {
+        await new Promise(resolve=>setTimeout(resolve,Math.max(0,Math.min(50,deadline-performance.now()))));
+        if(performance.now()>=deadline) break;
         for(const observer of rootObservers.values()) if(observer.takeRecords().length) revision++;
         if(revision!==last) {last=revision;since=performance.now();}
-        else if(performance.now()-since>=quietMs) return {quiet:true,waitedMs:Math.round(performance.now()-started)};
+        else if(performance.now()-since>=quietMs&&!animating()&&performance.now()<deadline) return {quiet:true,waitedMs:Math.round(performance.now()-started)};
       }
       return {quiet:false,waitedMs:Math.round(performance.now()-started)};
     },
