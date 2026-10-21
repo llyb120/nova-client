@@ -38,6 +38,7 @@ use tokio::time::{sleep, timeout, Duration, Instant};
 use crate::acp::{EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS, EV_TURN, EV_UPDATE};
 
 pub const EV_RELAY_STATUS: &str = "relay:status";
+pub const EV_TEAM_MINIAPPS: &str = "relay:miniapps";
 pub const EV_RELAY_PEERS: &str = "relay:peers";
 pub const EV_RELAY_INBOX: &str = "relay:inbox";
 /// guest 侧：收到对端（host）回传的可选模型/模式列表，前端据此缓存并在漫游时选用对方的模型
@@ -574,6 +575,9 @@ impl RelayManager {
             "clue.mentioned" => self.on_clue_mentioned(&env),
             "remote.device" => crate::remote::publish_main_sse(env.data),
             "share" => self.on_share(&env),
+            "miniapps.changed" => {
+                let _ = self.app.emit(EV_TEAM_MINIAPPS, env.data);
+            }
             // guest -> host
             "roaming.create" => self.on_roaming_create(&env),
             "roaming.prompt" => self.on_roaming_prompt(&env),
@@ -907,6 +911,38 @@ impl RelayManager {
             .query(&[("name", name), ("groups", groups)])
             // 线索请求可能包含粘贴的图片或文件；给附件上传留出足够时间。
             .timeout(Duration::from_secs(60)))
+    }
+
+    // ---- 观星台团队应用库（按首个群组共享，只有发布者能更新/下架）----
+
+    /// id 为空列出元数据 `{apps:[...]}`；否则取单个应用（含定义 `app`）。
+    pub async fn team_miniapps(&self, id: Option<&str>) -> Result<Value, String> {
+        let mut request = self.clue_request(reqwest::Method::GET, "/v2/miniapps")?;
+        if let Some(id) = id {
+            request = request.query(&[("id", id)]);
+        }
+        decode_relay_json(request.send().await.map_err(|e| e.to_string())?).await
+    }
+
+    /// 新建（id 为空）或更新自己发布的应用，返回元数据。
+    pub async fn team_miniapp_publish(&self, id: Option<&str>, app: Value) -> Result<Value, String> {
+        let response = self
+            .clue_request(reqwest::Method::POST, "/v2/miniapps/publish")?
+            .json(&json!({ "id": id.unwrap_or_default(), "app": app }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        decode_relay_json(response).await
+    }
+
+    pub async fn team_miniapp_remove(&self, id: &str) -> Result<(), String> {
+        let response = self
+            .clue_request(reqwest::Method::POST, "/v2/miniapps/remove")?
+            .json(&json!({ "id": id }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        decode_relay_json::<Value>(response).await.map(|_| ())
     }
 
     pub async fn clue_list(&self, space: &str) -> Result<Vec<ClueNodeGroup>, String> {

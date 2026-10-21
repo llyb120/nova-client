@@ -225,9 +225,19 @@ fn get_blob(data_dir: &Path, hash: &str) -> Result<Vec<u8>, String> {
 /// 删除会话时连带清理其世界线数据：把这些会话从所在 timeline 摘掉；已无任何存活会话的
 /// timeline 整条移除，最后回收不再被任何 checkpoint 引用的 objects blob。
 pub fn remove_threads_data(data_dir: &Path, thread_ids: &HashSet<String>) {
-    if thread_ids.is_empty() {
-        return;
+    if !thread_ids.is_empty() {
+        drop_threads_data(data_dir, |id| thread_ids.contains(id));
     }
+}
+
+/// 对账兜底：只保留 keep 中会话的世界线。覆盖退出时清掉的临时会话、崩溃及旧版本遗留。
+pub fn retain_threads_data(data_dir: &Path, keep: &HashSet<String>) {
+    if store_path(data_dir).exists() {
+        drop_threads_data(data_dir, |id| !keep.contains(id));
+    }
+}
+
+fn drop_threads_data(data_dir: &Path, drop: impl Fn(&str) -> bool) {
     let mut store = match load_store(data_dir) {
         Ok(store) => store,
         Err(error) => {
@@ -240,13 +250,13 @@ pub fn remove_threads_data(data_dir: &Path, thread_ids: &HashSet<String>) {
     store.timelines.retain_mut(|timeline| {
         let heads_before = timeline.thread_heads.len();
         let threads_before = timeline.thread_ids.len();
-        timeline.thread_ids.retain(|id| !thread_ids.contains(id));
-        timeline.thread_heads.retain(|id, _| !thread_ids.contains(id));
+        timeline.thread_ids.retain(|id| !drop(id));
+        timeline.thread_heads.retain(|id, _| !drop(id));
         changed = changed
             || timeline.thread_ids.len() != threads_before
             || timeline.thread_heads.len() != heads_before;
         // root 被删但同线 fork 出的其它会话还在：timeline 留给它们继续导航。
-        !timeline.thread_ids.is_empty() || !thread_ids.contains(&timeline.root_thread_id)
+        !timeline.thread_ids.is_empty() || !drop(&timeline.root_thread_id)
     });
     changed = changed || store.timelines.len() != before;
     if !changed {

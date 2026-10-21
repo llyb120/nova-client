@@ -1345,6 +1345,35 @@ pub struct ThreadStore {
     save_notify: Arc<Notify>,
 }
 
+const THREAD_ARTIFACT_SUFFIXES: [&str; 3] = [".parts", ".json.previous", ".json.backup"];
+
+/// 删除会话索引 `<id>.json` 同名的分块目录与备份。
+fn remove_thread_artifacts(index: &Path) {
+    let base = index.with_extension("");
+    for suffix in THREAD_ARTIFACT_SUFFIXES {
+        let path = PathBuf::from(format!("{}{suffix}", base.display()));
+        let result = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+        match result {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                eprintln!("[threads] 清理会话残留 {} 失败：{error}", path.display())
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 没有存活索引的分块/备份永远不会被读取（已删除会话不得复活），只在启动时无并发写入时回收。
+fn sweep_orphan_thread_artifacts(dir: &Path) {
+    for path in fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()) {
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else { continue };
+        let Some(base) = THREAD_ARTIFACT_SUFFIXES.iter().find_map(|suffix| name.strip_suffix(suffix)) else { continue };
+        let index = dir.join(format!("{base}.json"));
+        if !base.is_empty() && !index.exists() {
+            remove_thread_artifacts(&index);
+        }
+    }
+}
+
 impl ThreadStore {
     pub fn load(data_dir: PathBuf) -> Self {
         let dir = data_dir.join("threads");
@@ -1413,6 +1442,12 @@ impl ThreadStore {
                 eprintln!("[threads] 旧会话备份失败：{error}");
             }
         }
+        // 启动时没有并发写入：回收旧版本删除会话后遗留的分块/备份。刚加载的会话条目都是内嵌数据，
+        // 还没有引用 thread-assets，此时回收长期未更新的展示缓存是安全的（查看时会按需重建）。
+        sweep_orphan_thread_artifacts(&store.dir);
+        if let Some(root) = store.dir.parent() {
+            crate::sweep_expired_entries(&root.join("thread-assets"), now_ms(), 24 * 7);
+        }
         // 上次进程未正常退出时残留的临时会话，启动时一并清掉
         if !store.purge_ephemeral().is_empty() {
             store.save();
@@ -1445,6 +1480,13 @@ impl ThreadStore {
             .collect();
         threads.sort_by_key(|thread| thread.created_at);
         threads
+    }
+
+    /// 磁盘上存在的会话索引 id（含无法读入内存的），供衍生数据对账时保守保留。
+    pub fn indexed_ids(&self) -> HashSet<String> {
+        fs::read_dir(&self.dir).into_iter().flatten().flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.strip_suffix(".json").map(str::to_owned))
+            .collect()
     }
 
     fn thread_file_name(id: &str) -> String {
@@ -1585,7 +1627,9 @@ impl ThreadStore {
                 && crate::thread_storage::read(&path).is_ok()
             {
                 fs::remove_file(&path).map_err(|e| e.to_string())?;
-                // Keep backups/assets for trash and recovery; the absent live index is the tombstone.
+                // The absent live index is the tombstone: read() never recovers without it and the
+                // trash keeps a self-contained snapshot, so the chunks and backups are garbage now.
+                remove_thread_artifacts(&path);
             }
         }
         *committed = snapshot.revision;
@@ -1924,6 +1968,24 @@ fn render_handoff_tool(call: &ToolCall) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_artifacts_without_a_live_index_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("live.json"), "{}").unwrap();
+        for name in ["live.parts", "gone.parts"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+            fs::write(root.join(name).join("object"), "x").unwrap();
+        }
+        for name in ["live.json.previous", "gone.json.previous", "gone.json.backup", ".parts"] {
+            fs::write(root.join(name), "x").unwrap();
+        }
+        sweep_orphan_thread_artifacts(root);
+        let mut left: Vec<_> = fs::read_dir(root).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, [".parts", "live.json", "live.json.previous", "live.parts"]);
+    }
 
     fn temp_thread_store_dir() -> PathBuf {
         let dir =

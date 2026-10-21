@@ -254,11 +254,22 @@ fn windows() -> Result<Value> {
     }
     Ok(json!({"windows":rows}))
 }
-fn shot_folder(owner: &str) -> std::path::PathBuf {
+/// Lyra 的 owner 就是会话的 `alkaid/tool-results/<session>` 目录：截图落在其下，随会话删除一并清理。
+/// 其它客户端（MCP 进程随机 owner）无法对应到会话，落全局目录，由自动清理按修改时间回收。
+pub(crate) fn shot_folder(owner: &str, kind: &str) -> std::path::PathBuf {
     use std::hash::{Hash, Hasher};
+    let path = std::path::Path::new(owner);
+    let name = |p: Option<&std::path::Path>| p.and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
+    if path.is_absolute()
+        && name(Some(path)).is_some_and(|id| crate::valid_lyra_session_id(&id))
+        && name(path.parent()).as_deref() == Some("tool-results")
+        && name(path.parent().and_then(|p| p.parent())).as_deref() == Some("alkaid")
+    {
+        return path.join(kind);
+    }
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     owner.hash(&mut hash);
-    crate::lyra::config::nova_root().join("desktop-shots").join(format!("{:016x}", hash.finish()))
+    crate::lyra::config::nova_root().join(kind).join(format!("{:016x}", hash.finish()))
 }
 
 fn cursor_position() -> Option<(i32, i32)> {
@@ -480,7 +491,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     if bg { background::check_scope(window_id.is_some())?; }
     let id = uuid::Uuid::new_v4().to_string();
     let sequence = OBSERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let folder = shot_folder(owner);
+    let folder = shot_folder(owner, "desktop-shots");
     std::fs::create_dir_all(&folder).map_err(err)?;
     let before = foreground()?;
     let cursor_before = cursor_position();
@@ -1297,7 +1308,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
         }
         "recall" => {
             let path = std::fs::canonicalize(request.image_path.ok_or("recall缺少imagePath")?).map_err(err)?;
-            let folder = std::fs::canonicalize(shot_folder(&owner)).map_err(err)?;
+            let folder = std::fs::canonicalize(shot_folder(&owner, "desktop-shots")).map_err(err)?;
             if !path.starts_with(folder) || !matches!(path.extension().and_then(|s| s.to_str()), Some("jpg" | "png")) {
                 return Err("只能回看本会话的桌面截图".into());
             }
@@ -1653,6 +1664,14 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lyra_shots_live_under_session_tool_results_and_others_stay_global() {
+        let session = std::env::temp_dir().join("alkaid").join("tool-results").join("abc-1");
+        assert_eq!(shot_folder(&session.to_string_lossy(), "browser-shots"), session.join("browser-shots"));
+        for owner in ["3f2a-uuid".into(), session.join("..").to_string_lossy().into_owned(), session.with_file_name("a b").to_string_lossy().into_owned()] {
+            assert!(!shot_folder(&owner, "desktop-shots").starts_with(session.parent().unwrap()), "{owner}");
+        }
+    }
     #[test]
     fn only_identical_bytes_of_the_same_image_count_as_unchanged() {
         let seen = vec![("window-1".to_string(), 7, std::path::PathBuf::from("a.jpg"))];

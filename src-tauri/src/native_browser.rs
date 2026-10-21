@@ -14,7 +14,7 @@ use std::{
 use tauri::{AppHandle, Manager};
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
-tokio::task_local! { static CONTROL_TAB: String; }
+tokio::task_local! { static CONTROL_TAB: String; static SHOT_OWNER: String; }
 const PAGE_SCRIPT: &str = include_str!("native_browser_page.js");
 
 struct Session {
@@ -924,7 +924,8 @@ async fn snapshot(
     let mut observation = observe(app,scope).await?;
     let auto_visual=!with_image && args["visual"]!="none" && observation.pages["pages"].as_array().is_some_and(|pages|pages.iter().any(|p|p["visualSuggested"]==true));
     let with_image=with_image || auto_visual;
-    let dir = state_dir(app).join("browser-shots");
+    let dir = SHOT_OWNER.try_with(|owner| crate::jianlai::shot_folder(owner, "browser-shots"))
+        .unwrap_or_else(|_| state_dir(app).join("browser-shots"));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let document_path = dir.join(format!("{}.json", observation.id));
     std::fs::write(
@@ -1645,7 +1646,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
     let args = &args;
     let normalized = chrome_args(args, &thread_id, &app.state::<BrowserState>().observations.lock().unwrap())?;
     let normalized = resolve_targets(root, &normalized, owner, "chrome").await?;
-    let mut result = execute_chrome_inner(root, &normalized, owner).await?;
+    let mut result = SHOT_OWNER.scope(owner.to_owned(), execute_chrome_inner(root, &normalized, owner)).await?;
     if let Some(op) = inferred { result["operationInferred"] = json!(op); }
     if args.get("tabTag").is_none() && normalized["tabTag"].is_string() {
         result["tabTag"] = normalized["tabTag"].clone();

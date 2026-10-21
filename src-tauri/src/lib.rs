@@ -615,41 +615,37 @@ fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
 
 fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
     let state = app.state::<AppState>();
-    let hours = {
+    let (enabled, hours) = {
         let settings = state.settings.lock().unwrap();
-        if !settings.session_auto_cleanup_enabled {
-            return 0;
-        }
-        settings.session_auto_cleanup_hours
+        (settings.session_auto_cleanup_enabled, settings.session_auto_cleanup_hours)
     };
     let now = now_ms();
-    let permanently_removed = state.thread_trash.lock().unwrap().purge_expired(now, hours);
-    let retained_session_ids = state
-        .store
-        .lock()
-        .unwrap()
-        .threads
-        .iter()
-        .filter_map(|thread| thread.acp_session_id.clone())
-        .chain(state.thread_trash.lock().unwrap().session_ids())
-        .collect();
+    let permanently_removed = if enabled {
+        state.thread_trash.lock().unwrap().purge_expired(now, hours)
+    } else {
+        Vec::new()
+    };
+    let (retained_session_ids, retained_thread_ids) = {
+        let store = state.store.lock().unwrap();
+        let trash = state.thread_trash.lock().unwrap();
+        let sessions: HashSet<String> = store.threads.iter().filter_map(|thread| thread.acp_session_id.clone()).chain(trash.session_ids()).collect();
+        let threads: HashSet<String> = store.threads.iter().map(|thread| thread.id.clone()).chain(trash.thread_ids()).chain(store.indexed_ids()).collect();
+        (sessions, threads)
+    };
     cleanup_lyra_session_files(
         &state.config_dir,
         &permanently_removed,
         &retained_session_ids,
     );
-    sweep_orphan_lyra_session_files(&state.config_dir, &retained_session_ids, now, hours);
-    time_machine::remove_threads_data(
-        &state.config_dir,
-        &permanently_removed
-            .iter()
-            .map(|thread| thread.id.clone())
-            .collect(),
-    );
+    // 不属于任何存活/回收站会话的衍生数据是垃圾，与「自动清理会话」开关无关，始终对账回收。
+    sweep_derived_files(&state.config_dir, &retained_session_ids, &retained_thread_ids, now);
     state.store.lock().unwrap().cleanup_unused_scratch_dirs(
         &permanently_removed,
         &state.thread_trash.lock().unwrap(),
     );
+    if !enabled {
+        return 0;
+    }
     let thread_ids = {
         let store = state.store.lock().unwrap();
         store
@@ -2660,6 +2656,61 @@ fn file_is_expired(path: &Path, now: i64, hours: u32) -> bool {
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|duration| i64::try_from(duration.as_millis()).ok());
     modified_ms.is_some_and(|ms| session_cleanup_is_expired(ms, now, hours))
+}
+
+/// 已移除功能留在数据目录里的文件（当前代码不再读写）：旧 bridge/上下文服务、浏览器录制、Cursor 记忆等。
+fn remove_legacy_data(dir: &Path) {
+    for name in ["browser-records", "browser-plans", "browser-runtime", "cursor-slim-memory", "alkaid/context-learning"] {
+        let _ = std::fs::remove_dir_all(dir.join(name));
+    }
+    const FILES: [&str; 10] = [
+        "alkaid-bridge.mjs", "claude-bridge.mjs", "codebuddy-bridge.cjs", "codex-bridge.mjs", "cursor-bridge.mjs",
+        "opencode-bridge.cjs", "nova-context-service.mjs", "nova-tools-napi.node", "nova-tools-napi.no-index.backup.node", "photon_rs_bg.wasm",
+    ];
+    for path in std::fs::read_dir(dir.join("runtime")).into_iter().flatten().flatten().map(|entry| entry.path()) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+        if FILES.contains(&name) || (name.starts_with("context-service-") && name.ends_with(".ready")) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// 衍生文件对账：定向清理只覆盖「本次删除」的会话，退出时丢弃的临时会话、崩溃和旧版本遗留靠这里收尾。
+/// 无法对应到会话的缓存按闲置时间回收，删掉后按需重建。
+fn sweep_derived_files(data_dir: &Path, sessions: &HashSet<String>, threads: &HashSet<String>, now: i64) {
+    const GRACE_HOURS: u32 = 24;
+    const WEEK: u32 = 24 * 7;
+    // 整份世界线索引要完整解析：启动时跑一次，之后每天至多一次。
+    static LAST_SWEEP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let last = LAST_SWEEP.load(Ordering::Relaxed);
+    if last != 0 && now - last < i64::from(GRACE_HOURS) * 3_600_000 {
+        return;
+    }
+    LAST_SWEEP.store(now, Ordering::Relaxed);
+    sweep_orphan_lyra_session_files(data_dir, sessions, now, GRACE_HOURS);
+    time_machine::retain_threads_data(data_dir, threads);
+    // Lyra 的截图在其 tool-results 下随会话删除；其它客户端及旧版平铺的截图无法对应到会话。
+    sweep_expired_entries(&data_dir.join("browser-shots"), now, WEEK);
+    sweep_expired_entries(&data_dir.join("desktop-shots"), now, WEEK);
+    // Devin 每个连接一个启动目录；运行中的进程占用目录时删除会失败并跳过。
+    sweep_expired_entries(&data_dir.join("runtime").join("devin-mcp"), now, WEEK);
+    // 代码索引按工作目录建立，临时目录/worktree 会话删除后不再使用；常用仓库被回收只是下次重建。
+    sweep_expired_entries(&data_dir.join("codemap-v3-native"), now, 24 * 30);
+}
+
+/// 删除长期未修改的直接子项；目录要求自身及其直接子项都已过期。
+pub(crate) fn sweep_expired_entries(dir: &Path, now: i64, hours: u32) {
+    for path in std::fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()) {
+        let expired = file_is_expired(&path, now, hours)
+            && (!path.is_dir() || std::fs::read_dir(&path).into_iter().flatten().flatten().all(|entry| file_is_expired(&entry.path(), now, hours)));
+        if !expired {
+            continue;
+        }
+        let removed = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        if let Err(error) = removed {
+            eprintln!("[cleanup] 清理过期文件 {} 失败：{error}", path.display());
+        }
+    }
 }
 
 /// 自动清理兜底：上面的定向清理只覆盖「本次被删会话」的文件；历史版本残留、进程崩溃
@@ -4763,6 +4814,28 @@ fn share_thread(state: State<'_, AppState>, thread_id: String, to: String) -> Re
     state.relay.share_thread(&thread_id, &to)
 }
 
+/// 观星台团队应用库：id 为空列出元数据，否则取单个应用定义（应用窗口不在命令白名单内）。
+#[tauri::command]
+async fn team_miniapps(state: State<'_, AppState>, id: Option<String>) -> Result<Value, String> {
+    if !state.relay.is_configured() {
+        return Err("团队应用库需要先配置团队中转站".into());
+    }
+    state.relay.team_miniapps(id.as_deref()).await
+}
+
+#[tauri::command]
+async fn team_miniapp_publish(state: State<'_, AppState>, id: Option<String>, app: Value) -> Result<Value, String> {
+    if !state.relay.is_configured() {
+        return Err("共享到团队需要先配置团队中转站".into());
+    }
+    state.relay.team_miniapp_publish(id.as_deref(), app).await
+}
+
+#[tauri::command]
+async fn team_miniapp_remove(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.relay.team_miniapp_remove(&id).await
+}
+
 /// 高级分享：用所选后端 + 模型（默认 Devin swe-1.6）按提示词处理会话，跑完自动分享结果
 #[tauri::command]
 fn advanced_share(
@@ -5623,6 +5696,8 @@ pub fn run() {
 
             // Tool API 已移除，清理旧版本遗留的失效连接信息。
             let _ = std::fs::remove_file(dir.join("tool-api.json"));
+            let legacy_dir = dir.clone();
+            tauri::async_runtime::spawn_blocking(move || remove_legacy_data(&legacy_dir));
 
             // 启动后并发检测各后端 CLI 可用性（只解析 PATH，零成本），
             // 前端据结果只显示真正可用的后端
@@ -5993,6 +6068,9 @@ pub fn run() {
             list_achievements,
             get_relay_inbox,
             share_thread,
+            team_miniapps,
+            team_miniapp_publish,
+            team_miniapp_remove,
             advanced_share,
             summarize_clue,
             auto_failover,
