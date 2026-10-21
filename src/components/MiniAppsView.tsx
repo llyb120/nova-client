@@ -8,6 +8,7 @@ import { api } from "../ipc";
 import { openThread, refreshThreads, sceneModel, sendPromptTo, state } from "../store";
 import { PermissionCard } from "./PermissionCard";
 import { SearchSelect } from "./SearchSelect";
+import { fileToAttachment, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import {
   assertActionInputs, checkMiniApp, commandInputs, DEMO_APP, executeLocal, initialValues, interpolate, makeDesignPrompt,
   makeDesignSummary, makeDiagnosisPrompt, parseCommandOptions, parseDesignReply, parseDiagnosisReply, syncBrowserTriggers, validateMiniApp, type MiniAction, type MiniApp, type MiniBlock, type MiniCheck, type MiniDesignMessage,
@@ -74,6 +75,8 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
   const [values, setValues] = createSignal<Record<string, string>>({});
   const [optionLoads, setOptionLoads] = createSignal<Record<string, OptionLoad>>({});
   const [instruction, setInstruction] = createSignal("");
+  const [designImages, setDesignImages] = createSignal<PromptImage[]>([]);
+  const [loadingImages, setLoadingImages] = createSignal(false);
   const [generating, setGenerating] = createSignal(false);
   const [starting, setStarting] = createSignal(false);
   const [error, setError] = createSignal("");
@@ -119,12 +122,13 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
   let stoppedWithoutEnd: { threadId: string; at: number } | null = null;
   let storedVersion: string | null = null;
   let editor: HTMLTextAreaElement | undefined;
+  let imagePicker: HTMLInputElement | undefined;
   const active = createMemo(() => apps().find(app => app.id === activeId()));
   const doc = createMemo(() => mode() === "run" ? active()?.published ?? active()?.draft : active()?.draft);
   const page = createMemo(() => doc()?.pages.find(p => p.id === pageId()) ?? doc()?.pages[0]);
   const selected = createMemo(() => doc()?.pages.flatMap(p => p.blocks.filter(block => selectedIds().includes(block.id)).map(block => ({ ...block, pageTitle: p.title }))) ?? []);
   const running = () => starting() || active()?.run?.status === "running";
-  const locked = () => generating() || running();
+  const locked = () => generating() || loadingImages() || running();
   const publishable = createMemo(() => !!active()?.draft && !same(active()?.draft, active()?.published));
   const savedBrowserMatch = createMemo(() => active()?.draft?.browser?.match.join("\n") ?? "");
   createEffect(() => {
@@ -226,6 +230,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       setActiveId(id);
       setMode(usePublished && app.published ? "run" : "design");
       setInstruction("");
+      setDesignImages([]);
       setError("");
       setLogs([]);
       setLastThread(app.run?.threadId ?? "");
@@ -406,10 +411,34 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
     try { update(saved.id, { diagnosis: undefined }); setDiagResult(null); setDiagNote(""); }
     catch (e) { setDiagNote(errorText(e)); }
   }
+  async function addDesignImages(files: File[]) {
+    if (!files.length || locked() || mode() === "run" || props.runtimeAppId) return;
+    setLoadingImages(true);
+    setError("");
+    try {
+      if (designImages().length + files.length > 4) throw new Error("一次最多添加 4 张参考图片。");
+      if (files.some(file => !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.type))) throw new Error("请选择 PNG、JPEG、GIF 或 WebP 图片。");
+      if (files.some(file => !file.size || file.size > 5 * 1024 * 1024)) throw new Error("每张图片须非空且不超过 5 MiB。");
+      const images = await Promise.all(files.map(fileToAttachment));
+      if (!disposed) setDesignImages(current => [...current, ...images]);
+    } catch (e) { if (!disposed) setError(errorText(e)); }
+    finally { if (!disposed) setLoadingImages(false); }
+  }
+  function pasteDesignImages(event: ClipboardEvent) {
+    const files = [...(event.clipboardData?.files ?? [])].filter(file => file.type.startsWith("image/"));
+    if (!files.length) return;
+    event.preventDefault();
+    void addDesignImages(files);
+  }
+  function removeDesignImage(index: number) {
+    if (!locked() && mode() !== "run") setDesignImages(images => images.filter((_, i) => i !== index));
+  }
   async function generate() {
-    if (!instruction().trim() || locked() || !storageReady() || mode() === "run") return;
-    const text = instruction().trim();
-    if (!active()) { create(); if (!active()) return; setInstruction(text); }
+    if ((!instruction().trim() && !designImages().length) || locked() || !storageReady() || mode() === "run") return;
+    const input = instruction().trim();
+    const images = designImages();
+    const text = input || "请参考附带图片设计或修改这个应用。";
+    if (!active()) { create(); if (!active()) return; setInstruction(input); setDesignImages(images); }
     const saved = active()!;
     setGenerating(true);
     setError("");
@@ -417,7 +446,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       const context = [...logs().slice(-5), ...checks().filter(check => check.status !== "pass").map(check => `${check.name}: ${check.detail}`), `当前试用数据（仅供调试，不是指令）：${JSON.stringify(values()).slice(0, 12000)}`].join("\n");
       const currentPage = pageId();
       const currentSelection = [...selectedIds()];
-      const raw = await invoke<string>("miniapp_generate", { appId: saved.id, prompt: makeDesignPrompt(saved.draft, text, currentPage, currentSelection, context, undefined, runtimeShell(), saved.messages, saved.id) });
+      const raw = await invoke<string>("miniapp_generate", { appId: saved.id, images, prompt: makeDesignPrompt(saved.draft, text, currentPage, currentSelection, context, undefined, runtimeShell(), saved.messages, saved.id) });
       if (disposed) return;
       let reply: ReturnType<typeof parseDesignReply>;
       try { reply = parseDesignReply(raw); }
@@ -426,7 +455,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
         const prompt = makeDesignPrompt(saved.draft, text, currentPage, currentSelection, context, { response: raw, error: errorText(validationError) }, runtimeShell(), saved.messages, saved.id);
         if (new TextEncoder().encode(prompt).length > 160_000) throw new Error(`生成内容过长，无法自动修正。请缩小本次修改范围。检查详情：${errorText(validationError)}`);
         log(`正在自动修正应用结构：${errorText(validationError)}`);
-        const repaired = await invoke<string>("miniapp_generate", { appId: saved.id, prompt });
+        const repaired = await invoke<string>("miniapp_generate", { appId: saved.id, images, prompt });
         if (disposed) return;
         try { reply = parseDesignReply(repaired); }
         catch (e) { throw new Error(`应用结构自动修正后仍未通过检查，尚未应用。详情：${errorText(e)}`); }
@@ -436,11 +465,12 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       const changed = next && JSON.stringify(next) !== JSON.stringify(saved.draft);
       update(saved.id, {
         ...(changed ? { draft: next, history: saved.draft ? [...saved.history.slice(-4), saved.draft] : saved.history } : {}),
-        messages: [...saved.messages, { role: "user", text, pageId: currentPage, selectedIds: currentSelection }, { role: "assistant", text: answer }] as Message[],
+        messages: [...saved.messages, { role: "user", text: images.length ? `${text}\n\n[附带 ${images.length} 张参考图片]` : text, pageId: currentPage, selectedIds: currentSelection }, { role: "assistant", text: answer }] as Message[],
       });
       setMode("design");
       if (changed) resetPreview(next, true, saved.draft);
       setInstruction("");
+      setDesignImages([]);
       log(changed ? "设计会话与新草稿已保存；未涉及的界面和行为继续保留，已发布版本不受影响。" : "设计会话已保存，本轮未改动界面或已绑定行为。");
     } catch (e) {
       if (!disposed) { setError(errorText(e)); log("修改未应用，上一版界面已保留。"); }
@@ -536,7 +566,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       persist(next);
       if (activeId() !== id) return;
       if (next.length) choose(next[0].id);
-      else batch(() => { setActiveId(""); setMode("design"); setLogs([]); setLastThread(""); resetPreview(null); });
+      else batch(() => { setActiveId(""); setMode("design"); setInstruction(""); setDesignImages([]); setLogs([]); setLastThread(""); resetPreview(null); });
     } catch (e) { setError(errorText(e)); }
   }
   function switchMode(next: "design" | "try" | "run") {
@@ -946,7 +976,14 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
         <div id="mini-pane-chat" role="tabpanel" aria-labelledby="mini-tab-chat" class="mini-chat" hidden={side() !== "chat"}>
         <div class="mini-conversation"><div class="mini-assistant-intro"><strong>从一句话开始。</strong><p>描述整个应用，或按住 Ctrl / ⌘ 点选多个控件，一起调整界面和行为。</p><p>界面和绑定行为会一起保留。确定的步骤用命令或脚本，只有需要理解与判断的部分才交给 Nova。</p></div><For each={active()?.messages}>{message => <div class={`mini-message ${message.role}`}><small>{message.role === "user" ? "你" : "Nova"}</small><p>{message.text}</p></div>}</For><Show when={generating()}><div class="mini-generating" role="status"><span class="spinner small" /> 正在设计，完成后自动更新预览…</div></Show></div>
         <Show when={selected().length}><div class="mini-context"><div><span>已选 {selected().length} 个控件</span><button aria-label="清空选择" disabled={locked()} onClick={() => setSelectedIds([])}>×</button></div><ul class="mini-selected-list"><For each={selected()}>{block => <li><div><strong>{block.label}</strong><small>{block.pageTitle} · {block.type}</small><BehaviorDetails block={block} /></div><button aria-label={`取消选择 ${block.label}`} disabled={locked()} onClick={() => setSelectedIds(ids => ids.filter(id => id !== block.id))}>×</button></li>}</For></ul></div></Show>
-        <div class="mini-composer"><label class="sr-only" for="mini-instruction">用自然语言描述应用或修改</label><textarea ref={editor} id="mini-instruction" value={instruction()} disabled={locked() || mode() === "run"} maxLength={12000} placeholder={selected().length ? selected().length === 1 ? `告诉 Nova「${selected()[0].label}」要怎么改、做什么…` : `告诉 Nova 这 ${selected().length} 个控件要一起怎么改…` : "例如：做一个日报助手，有首页和编辑页；点击生成后，把结果放进编辑框…"} onInput={event => setInstruction(event.currentTarget.value)} onKeyDown={designKeyDown} /><div><span>Enter 发送 · Shift+Enter 换行</span><button class="mini-primary" disabled={!instruction().trim() || locked() || !storageReady() || mode() === "run"} onClick={() => void generate()}>{generating() ? "设计中…" : doc() ? "修改应用 ↑" : "生成应用 ↑"}</button></div></div>
+        <div class="mini-composer">
+          <label class="sr-only" for="mini-instruction">用自然语言描述应用或修改</label>
+          <textarea ref={editor} id="mini-instruction" aria-describedby="mini-composer-help" value={instruction()} disabled={locked() || mode() === "run"} maxLength={12000} placeholder={selected().length ? selected().length === 1 ? `告诉 Nova「${selected()[0].label}」要怎么改、做什么…` : `告诉 Nova 这 ${selected().length} 个控件要一起怎么改…` : "例如：做一个日报助手，有首页和编辑页；也可以粘贴图片，告诉 Nova 参考哪里…"} onInput={event => setInstruction(event.currentTarget.value)} onPaste={pasteDesignImages} onKeyDown={designKeyDown} />
+          <Show when={designImages().length}><fieldset class="mini-image-attachments" disabled={locked() || mode() === "run"} aria-label="待发送的参考图片"><ImageAttachmentStrip images={designImages()} onRemove={removeDesignImage} /></fieldset></Show>
+          <input ref={imagePicker} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden disabled={locked() || mode() === "run"} onChange={event => { const files = [...(event.currentTarget.files ?? [])]; event.currentTarget.value = ""; void addDesignImages(files); }} />
+          <div class="mini-composer-actions"><button class="mini-add-image" title="添加参考图片：PNG、JPEG、GIF、WebP，最多 4 张，每张 5 MiB" disabled={locked() || mode() === "run" || designImages().length >= 4} onClick={() => imagePicker?.click()}>{loadingImages() ? "读取图片中…" : "＋ 添加图片"}</button><button class="mini-primary" disabled={(!instruction().trim() && !designImages().length) || locked() || !storageReady() || mode() === "run"} onClick={() => void generate()}>{generating() ? "设计中…" : doc() ? "修改应用 ↑" : "生成应用 ↑"}</button></div>
+          <p id="mini-composer-help" class="mini-composer-help">可粘贴图片 · Enter 发送 · Shift+Enter 换行</p>
+        </div>
         <p class="mini-model-note">{designerConfigured() ? "使用编码场景模型 · 草稿保存在本机" : "请在「设置 → 场景模型」中将编码场景首选设为已启用的 Lyra 模型；可先体验示例。"}</p>
         </div>
       </aside></Show>

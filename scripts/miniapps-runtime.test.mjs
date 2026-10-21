@@ -26,7 +26,8 @@ const compiled = stripTypeScriptTypes(
     browserMatch, setBrowserMatch, saveBrowserConfig, undo,
     optionLoads, optionsKey, availableOptions, requestOptions, openOptions: block => (${optionsOpen})(),
     activate, test, checks, publish, publishLabel, pinVersion, restoreVersion, unpublish, startRun, pollRun, cancelRun,
-    generate, instruction, setInstruction, designKeyDown, previewStyle, publishDisabled: () => (${publishDisabled}) };
+    generate, instruction, setInstruction, designImages, addDesignImages, pasteDesignImages, removeDesignImage,
+    designKeyDown, previewStyle, publishDisabled: () => (${publishDisabled}) };
 }
 `,
 ) + '\nreturn MiniAppsView(props);';
@@ -61,6 +62,7 @@ function mount(t, items, overrides = {}, props = {}) {
       return Promise.resolve(() => listeners.delete(event));
     },
     invoke: unexpected, sendPromptTo: unexpected, openThread: unexpected, refreshThreads: async () => {},
+    fileToAttachment: async file => ({ name: file.name, mimeType: file.type, size: file.size, data: Buffer.from(await file.arrayBuffer()).toString('base64') }),
     ...overrides,
     api: { scratchDir: async () => 'mock-dir', createThread: async () => ({ id: 'mock-thread' }),
       sendPrompt: unexpected, respondPermission: unexpected,
@@ -192,6 +194,111 @@ test('design composer sends Enter, but Shift+Enter, held Enter and IME confirmat
   assert.equal(sent, 1);
   assert.equal(view.instruction(), '');
   assert.equal(prevented, 2, 'only plain/held Enter suppress their default newline');
+});
+
+test('design composer accepts pasted images and sends image-only creation and repair with the same attachments', async t => {
+  const requests = [];
+  const view = mount(t, [], { invoke: async (command, args) => {
+    assert.equal(command, 'miniapp_generate');
+    requests.push(args);
+    return requests.length === 1 ? 'invalid app JSON' : JSON.stringify(model.DEMO_APP);
+  } });
+  let prevented = 0;
+  view.pasteDesignImages({ clipboardData: { files: [] }, preventDefault: () => prevented++ });
+  assert.equal(prevented, 0, 'ordinary text paste keeps its native behavior');
+  view.pasteDesignImages({ clipboardData: { files: [new File(['reference-image-data'], 'reference.png', { type: 'image/png' })] }, preventDefault: () => prevented++ });
+  await settle();
+  assert.equal(prevented, 1);
+  const images = view.designImages();
+  assert.equal(images.length, 1);
+  assert.equal(view.instruction(), '');
+  await view.generate();
+  assert.equal(view.error(), '');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].appId, requests[1].appId);
+  for (const request of requests) {
+    assert.deepEqual(request.images, images);
+    assert.match(request.prompt, /请参考附带图片设计或修改这个应用/);
+    assert.ok(!request.prompt.includes(images[0].data), 'images are multimodal attachments, not base64 prompt text');
+  }
+  assert.equal(view.designImages().length, 0);
+  assert.match(view.persisted()[0].messages[0].text, /附带 1 张参考图片/);
+  assert.ok(!view.storage.getItem(KEY).includes(images[0].data), 'image bytes must not exhaust localStorage');
+  assert.match(source, /onPaste=\{pasteDesignImages\}/);
+  assert.match(source, /type="file" accept="image\/png,image\/jpeg,image\/gif,image\/webp" multiple hidden/);
+  assert.match(source, /ImageAttachmentStrip images=\{designImages\(\)\} onRemove=\{removeDesignImage\}/);
+});
+
+test('design images survive transport/save failures and are cleared when choosing another app', async t => {
+  let fail = true;
+  const items = [saved(), saved()];
+  const view = mount(t, items, { invoke: async () => {
+    if (fail) throw new Error('network failed');
+    return JSON.stringify(model.DEMO_APP);
+  } });
+  await view.addDesignImages([new File(['data'], 'reference.webp', { type: 'image/webp' })]);
+  view.setInstruction('参考这张图调整布局');
+  await view.generate();
+  assert.match(view.error(), /network failed/);
+  assert.equal(view.instruction(), '参考这张图调整布局');
+  assert.equal(view.designImages().length, 1);
+  assert.deepEqual(view.persisted(), items);
+  fail = false;
+  const write = view.storage.setItem;
+  view.storage.setItem = () => { throw new Error('quota exceeded'); };
+  await view.generate();
+  assert.match(view.error(), /quota exceeded/);
+  assert.equal(view.designImages().length, 1, 'do not clear attachments before the result is saved');
+  assert.equal(view.instruction(), '参考这张图调整布局');
+  view.storage.setItem = write;
+  view.choose(items[1].id);
+  assert.equal(view.designImages().length, 0, 'never leak images to a different app');
+});
+
+test('image validation and read locks preserve existing attachments and block incomplete sends', async t => {
+  const pending = Promise.withResolvers();
+  const items = [saved(), saved()];
+  const image = { name: 'reference.png', mimeType: 'image/png', data: 'YQ==', size: 1 };
+  const view = mount(t, items, { fileToAttachment: () => pending.promise });
+  const adding = view.addDesignImages([new File(['a'], 'reference.png', { type: 'image/png' })]);
+  assert.equal(view.locked(), true);
+  view.setInstruction('edit');
+  await view.generate();
+  assert.ok(!view.calls.includes('miniapp_generate'));
+  view.choose(items[1].id);
+  assert.equal(view.activeId(), items[0].id);
+  pending.resolve(image);
+  await adding;
+  assert.equal(view.locked(), false);
+  assert.deepEqual(view.designImages(), [image]);
+  for (const [files, message] of [
+    [[{ type: 'image/svg+xml', size: 1 }], /PNG/],
+    [[{ type: 'image/png', size: 0 }], /5 MiB/],
+    [[{ type: 'image/jpeg', size: 5 * 1024 * 1024 + 1 }], /5 MiB/],
+    [Array(4).fill({ type: 'image/png', size: 1 }), /最多添加 4/],
+  ]) {
+    await view.addDesignImages(files);
+    assert.match(view.error(), message);
+    assert.deepEqual(view.designImages(), [image]);
+  }
+  view.publish();
+  view.switchMode('run');
+  await view.addDesignImages([new File(['a'], 'another.png', { type: 'image/png' })]);
+  view.removeDesignImage(0);
+  assert.deepEqual(view.designImages(), [image], 'published view must not edit pending images');
+  view.switchMode('design');
+  view.removeDesignImage(0);
+  assert.deepEqual(view.designImages(), []);
+});
+
+test('image read failure leaves text and prior attachments intact', async t => {
+  const view = mount(t, [saved()], { fileToAttachment: async () => { throw new Error('unreadable image'); } });
+  view.setInstruction('keep my input');
+  await view.addDesignImages([new File(['a'], 'reference.png', { type: 'image/png' })]);
+  assert.match(view.error(), /unreadable image/);
+  assert.equal(view.instruction(), 'keep my input');
+  assert.deepEqual(view.designImages(), []);
+  assert.equal(view.locked(), false);
 });
 
 test('preview maps validated layout styles without changing the bound action', t => {

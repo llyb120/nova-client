@@ -5047,8 +5047,9 @@ async fn miniapp_generate(
     state: State<'_, AppState>,
     app_id: String,
     prompt: String,
+    images: Option<Vec<threads::PromptImage>>,
 ) -> Result<String, String> {
-    miniapp_design::generate(window, state, app_id, prompt).await
+    miniapp_design::generate(window, state, app_id, prompt, images.unwrap_or_default()).await
 }
 
 #[cfg(test)]

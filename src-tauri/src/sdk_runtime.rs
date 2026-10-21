@@ -698,10 +698,11 @@ impl SdkManager {
         model: &str,
         prompt: String,
         history: &[crate::miniapp_design::DesignMessage],
+        images: &[Value],
     ) -> Result<String, String> {
         let output = crate::lyra::run_oneshot(
             &self.native_http(),
-            &json!({ "action": "generate", "model": model, "prompt": prompt, "history": history }),
+            &json!({ "action": "generate", "model": model, "prompt": prompt, "history": history, "images": images }),
             self.borrowed_root(),
         ).await?;
         output.as_str().map(str::to_owned)

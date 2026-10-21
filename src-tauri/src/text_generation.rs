@@ -56,7 +56,7 @@ impl AppState {
     }
 }
 
-fn validate(prompt: &str, options: &GenerateTextOptions<'_>) -> Result<(), String> {
+pub(crate) fn validate(prompt: &str, options: &GenerateTextOptions<'_>) -> Result<(), String> {
     use base64::Engine;
     if prompt.trim().is_empty() { return Err("一次性生成的 prompt 不能为空".into()); }
     if options.timeout.is_zero() || options.max_output_bytes == 0 || options.max_output_tokens == Some(0) {

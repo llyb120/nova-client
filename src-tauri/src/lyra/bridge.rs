@@ -584,18 +584,22 @@ async fn one_shot_text_data(
     } else {
         None
     };
+    let images: Vec<Value> = if history.is_some() {
+        request.get("images").map(|value| serde_json::from_value(value.clone()))
+            .transpose().map_err(|e| format!("设计 images 无效：{e}"))?.unwrap_or_default()
+    } else { Vec::new() };
     let mut messages = Vec::new();
     if let Some(history) = &history {
-        crate::miniapp_design::validate_history(history, prompt)?;
+        crate::miniapp_design::validate_request(history, prompt, &images)?;
         messages.extend(history.iter().map(|message| {
             if message.role == "user" {
-                user_message(&message.content, &[])
+                user_message(&message.content, &message.images)
             } else {
                 json!({"role": "assistant", "content": [{"type": "text", "text": message.content}]})
             }
         }));
     }
-    messages.push(user_message(prompt, &[]));
+    messages.push(user_message(prompt, &images));
     let system = if history.is_some() {
         crate::miniapp_design::DESIGN_SYSTEM
     } else {
@@ -608,6 +612,10 @@ async fn one_shot_text_data(
         request.get("model").and_then(Value::as_str),
         &env,
     )?;
+    if !resolved.model.supports_images && (!images.is_empty()
+        || history.as_ref().is_some_and(|history| history.iter().any(|message| !message.images.is_empty()))) {
+        return Err("编码场景模型未启用图片输入，无法读取参考图片；请在设置中选择支持图片的模型".into());
+    }
     let mut text = String::new();
     let cancel = Arc::new(AtomicBool::new(false));
     let mut oversized = false;
@@ -945,7 +953,10 @@ mod tests {
         std::fs::create_dir(root.path().join("alkaid")).unwrap();
         std::fs::write(root.path().join("alkaid/config.jsonc"), json!({
             "model": "local/m", "provider": {"local": {"api": "openai-completions",
-                "options": {"baseURL": url, "apiKey": "test-key"}, "models": {"m": {"name": "M"}}}}
+                "options": {"baseURL": url, "apiKey": "test-key"}, "models": {
+                    "m": {"name": "M", "modalities": {"input": ["text", "image"]}},
+                    "text-only": {"name": "Text only"}
+                }}}
         }).to_string()).unwrap();
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let run = |request: Value| {
@@ -967,13 +978,25 @@ mod tests {
         ] {
             assert!(run(json!({"action":"generate","prompt":"new","history":invalid})).await.is_err());
         }
-        assert!(bodies.lock().unwrap().is_empty(), "坏历史不得访问模型");
+        for invalid in [Value::Null, json!({}), json!([{"type":"toolCall","name":"bash"}]),
+            json!([{"type":"image","mimeType":"image/png","data":"!"}])] {
+            assert!(run(json!({"action":"generate","prompt":"new","history":[],"images":invalid})).await.is_err());
+        }
+        let image = json!({"type":"image","mimeType":"image/png","data":"aGVsbG8="});
+        for (history, images) in [
+            (json!([]), json!([image])),
+            (json!([{"role":"user","content":"old","images":[image]}, {"role":"assistant","content":"reply"}]), json!([])),
+        ] {
+            let error = run(json!({"action":"generate","model":"local/text-only","prompt":"new","history":history,"images":images})).await.unwrap_err();
+            assert!(error.contains("图片输入"), "{error}");
+        }
+        assert!(bodies.lock().unwrap().is_empty(), "坏历史、图片或不支持图片的模型不得访问 provider");
         assert_eq!(run(json!({"action":"generate","prompt":"first full prompt","history":[]})).await.unwrap(), raw);
         let history = json!([
-            {"role":"user","content":"first real selection and instruction"},
+            {"role":"user","content":"first real selection and instruction","images":[image]},
             {"role":"assistant","content":raw}
         ]);
-        assert_eq!(run(json!({"action":"generate","prompt":"full repair request","history":history})).await.unwrap(), repaired);
+        assert_eq!(run(json!({"action":"generate","prompt":"full repair request","history":history,"images":[image]})).await.unwrap(), repaired);
         let mut history = history.as_array().unwrap().clone();
         history.extend([
             json!({"role":"user","content":"repair.error: missing action"}),
@@ -997,6 +1020,13 @@ mod tests {
             assert_eq!(messages[0]["role"], "system");
             for (turn, message) in messages[1..].iter().enumerate() {
                 assert_eq!(message["role"], if turn % 2 == 0 { "user" } else { "assistant" });
+            }
+            if index == 1 || index == 2 || index == 6 {
+                assert_eq!(messages[1]["content"][1]["type"], "image_url");
+                assert_eq!(messages[1]["content"][1]["image_url"]["url"], "data:image/png;base64,aGVsbG8=");
+            }
+            if index == 1 {
+                assert_eq!(messages[3]["content"][1]["image_url"]["url"], "data:image/png;base64,aGVsbG8=");
             }
             if index == 2 {
                 assert!(messages[0]["content"].as_str().unwrap().contains("以最新请求currentApp为准，历史只保留约束"));

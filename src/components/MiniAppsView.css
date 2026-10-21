@@ -172,9 +172,12 @@
 .mini-composer textarea { display: block; width: 100%; min-height: 126px; resize: vertical; max-height: 300px; padding: 14px; font-size: 14px; line-height: 1.9; background: transparent; color: var(--text); border: none; border-radius: 12px 12px 0 0; }
 .mini-composer textarea:focus-visible { outline: none; }
 .mini-composer textarea::placeholder { color: var(--text-faint); }
-.mini-composer > div { display: flex; align-items: center; justify-content: space-between; padding: 10px; }
-.mini-composer > div > span { font-size: 12px; color: var(--text-faint); }
-.mini-composer button { padding: 8px 12px; font-size: 13px; }
+.mini-composer-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; padding: 10px; }
+.mini-composer-actions button { padding: 8px 12px; font-size: 13px; }
+.mini-add-image { border: 1px solid var(--border-light); border-radius: 8px; background: transparent; color: var(--text-dim); }
+.mini-add-image:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.mini-image-attachments { min-width: 0; margin: 0; padding: 0 10px; border: 0; }
+.mini-composer-help { margin: 0 10px 10px; font-size: 12px; color: var(--text-faint); }
 .mini-model-note { margin: 10px 20px 16px; font-size: 12px; line-height: 1.8; color: var(--text-faint); }
 .mini-debug { border-top: 1px solid var(--border); padding: 12px 20px; background: var(--bg-panel); max-height: 34%; overflow-y: auto; flex-shrink: 0; }
 .mini-debug header, .mini-debug header > div { display: flex; align-items: center; gap: 12px; }
