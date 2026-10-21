@@ -268,9 +268,9 @@ export function SearchSelect(props: {
   });
 
   // 思考强度列已展开时，从低处的模型斜向划向强度列（它从顶部起排），会先经过中间的其它模型行。
-  // 参考 Amazon 菜单的「安全三角」：以上一个鼠标位置为顶点、强度列左侧上下角为底边；
-  // 当前位置落在三角内说明正朝强度列移动，此时延迟切换（进入强度列即取消）；
-  // 否则是在模型列内正常浏览，立即切换。还没展开强度列时第一次悬停同样即时生效。
+  // 参考 Amazon 菜单的「安全三角」：以上一个鼠标位置为顶点、目标列左侧上下角为底边；
+  // 当前位置落在三角内说明正朝下一级移动，此时延迟切换（进入目标列即取消）；
+  // 否则是在当前列内正常浏览，立即切换。模型→强度保持原行为，厂商→模型复用判断。
   const HOVER_INTENT_MS = 300;
   let intentTimer: ReturnType<typeof setTimeout> | undefined;
   let effortRef: HTMLDivElement | undefined;
@@ -280,8 +280,8 @@ export function SearchSelect(props: {
     clearTimeout(intentTimer);
     intentTimer = undefined;
   };
-  const headingToEfforts = (e: MouseEvent) => {
-    const r = effortRef?.getBoundingClientRect();
+  const headingToPane = (e: MouseEvent, pane: HTMLDivElement | undefined) => {
+    const r = pane?.getBoundingClientRect();
     if (!r || !r.width || !lastPt) return false;
     const side = (ax: number, ay: number, bx: number, by: number) =>
       (e.clientX - bx) * (ay - by) - (ax - bx) * (e.clientY - by);
@@ -293,7 +293,7 @@ export function SearchSelect(props: {
   const scheduleActiveModel = (value: string, e: MouseEvent) => {
     cancelIntent();
     if (value === activeModel()) return;
-    if (!effortModel() || !headingToEfforts(e)) {
+    if (!effortModel() || !headingToPane(e, effortRef)) {
       setActiveModel(value);
       return;
     }
@@ -303,6 +303,31 @@ export function SearchSelect(props: {
     }, HOVER_INTENT_MS);
   };
   onCleanup(cancelIntent);
+
+  let modelsRef: HTMLDivElement | undefined;
+  let groupIntentTimer: ReturnType<typeof setTimeout> | undefined;
+  const cancelGroupIntent = () => {
+    clearTimeout(groupIntentTimer);
+    groupIntentTimer = undefined;
+  };
+  const scheduleActiveGroup = (name: string, current: string | undefined, e: MouseEvent) => {
+    cancelGroupIntent();
+    if (name === current) return;
+    if (!headingToPane(e, modelsRef)) {
+      setActiveGroup(name);
+      return;
+    }
+    groupIntentTimer = setTimeout(() => {
+      groupIntentTimer = undefined;
+      setActiveGroup(name);
+    }, HOVER_INTENT_MS);
+  };
+  onCleanup(cancelGroupIntent);
+  createEffect(() => {
+    opened();
+    query();
+    cancelGroupIntent();
+  });
 
   /** 直接选模型时沿用该模型上次选的强度（仍在档位里才用），没有记录才用默认 */
   const pickModel = (o: SelectOption) => {
@@ -503,6 +528,9 @@ export function SearchSelect(props: {
     <div
       ref={popRef}
       onMouseMove={(e) => (lastPt = { x: e.clientX, y: e.clientY })}
+      onMouseLeave={cancelGroupIntent}
+      onMouseDown={cancelGroupIntent}
+      onWheel={cancelGroupIntent}
       class={`sel-pop ${isThreeLevel() ? "three" : ""} ${hasEfforts() ? "efforts" : ""} ${
         isGrouped() || isThreeLevel() ? "grouped" : ""
       } ${!usePortal() && place().down ? "down" : ""} ${
@@ -554,7 +582,7 @@ export function SearchSelect(props: {
                 </For>
               </div>
               <Show when={!showingFavorites()}>
-                <div class="sel-groups sel-providers">
+                <div class="sel-groups sel-providers" onMouseLeave={cancelGroupIntent}>
                   <Show when={props.allowDefault}>
                     <div
                       class={`sel-item ${props.value === "" ? "active" : ""}`}
@@ -574,7 +602,8 @@ export function SearchSelect(props: {
                             ? "active"
                             : ""
                         }`}
-                        onMouseEnter={() => setActiveGroup(g.name)}
+                        onMouseEnter={(e) => scheduleActiveGroup(g.name, shownProvider(), e)}
+                        onMouseMove={(e) => scheduleActiveGroup(g.name, shownProvider(), e)}
                         onClick={() => setActiveGroup(g.name)}
                       >
                         <span class="sel-label">{g.name}</span>
@@ -585,7 +614,7 @@ export function SearchSelect(props: {
                   </For>
                 </div>
               </Show>
-              <div class="sel-list sel-models">
+              <div ref={modelsRef} class="sel-list sel-models" onMouseEnter={cancelGroupIntent}>
                 {/* 分开渲染收藏和普通后端，避免 For 复用模型行时残留后端标识。 */}
                 <Show
                   when={showingFavorites()}
@@ -601,7 +630,7 @@ export function SearchSelect(props: {
           {/* 二级面板：左侧厂商、右侧该厂商的模型 */}
           <Show when={isGrouped() && !isThreeLevel() && !query().trim()}>
             <div class="sel-panes">
-              <div class="sel-groups">
+              <div class="sel-groups" onMouseLeave={cancelGroupIntent}>
                 <Show when={props.allowDefault}>
                   <div
                     class={`sel-item ${props.value === "" ? "active" : ""}`}
@@ -619,7 +648,8 @@ export function SearchSelect(props: {
                       class={`sel-group-row ${shownGroup() === g.name ? "open" : ""} ${
                         currentGroup() === g.name ? "active" : ""
                       }`}
-                      onMouseEnter={() => setActiveGroup(g.name)}
+                      onMouseEnter={(e) => scheduleActiveGroup(g.name, shownGroup(), e)}
+                      onMouseMove={(e) => scheduleActiveGroup(g.name, shownGroup(), e)}
                       onClick={() => setActiveGroup(g.name)}
                     >
                       <span class="sel-label">{g.name}</span>
@@ -629,7 +659,7 @@ export function SearchSelect(props: {
                   )}
                 </For>
               </div>
-              <div class="sel-list sel-models">
+              <div ref={modelsRef} class="sel-list sel-models" onMouseEnter={cancelGroupIntent}>
                 <For each={shownItems()}>{(o) => itemRow(o)}</For>
               </div>
               {effortPane()}
