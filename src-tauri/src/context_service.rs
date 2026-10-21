@@ -106,14 +106,6 @@ fn dispatch(
         }));
     }
 
-    // Resolve capabilities in the serving process, not the MCP child's stale environment.
-    if request.method == "tool_schema" {
-        return match request.params["name"].as_str() {
-            Some("chrome") => Ok(crate::chrome_browser::tool_definition()),
-            _ => Err("unknown tool schema".into()),
-        };
-    }
-
     if request.method == "change_working_directory" {
         let scope = request.params["scope"]
             .as_str()
@@ -441,19 +433,6 @@ mod tests {
         );
         assert!(response.ok);
         assert_eq!(response.result.unwrap()["runtime"], "rust");
-    }
-
-    #[test]
-    fn chrome_schema_is_served_by_nova_and_requires_authentication() {
-        let request = |token: &str, name: &str| ContextRequest {
-            token: token.into(), method: "tool_schema".into(), root: String::new(),
-            owner: String::new(), params: serde_json::json!({"name": name}),
-        };
-        let changes = CwdChanges::default();
-        assert_eq!(dispatch(request("secret", "chrome"), "secret", &changes).unwrap(),
-            crate::chrome_browser::tool_definition());
-        assert!(dispatch(request("wrong", "chrome"), "secret", &changes).is_err());
-        assert!(dispatch(request("secret", "missing"), "secret", &changes).is_err());
     }
 
     #[test]

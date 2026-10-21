@@ -9,7 +9,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { createNovaBatchTools, listNovaBatchTools } from "./nova-batch-tools.mjs";
+import { createNovaBatchTools } from "./nova-batch-tools.mjs";
 import { automationMcpResult } from "./automation-mcp-result.mjs";
 
 const cwd = process.env.NOVA_TOOLS_CWD || process.cwd();
@@ -21,7 +21,11 @@ const server = new Server(
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: await listNovaBatchTools(tools, cwd),
+  tools: Object.entries(tools).map(([name, tool]) => ({
+    name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  })),
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {

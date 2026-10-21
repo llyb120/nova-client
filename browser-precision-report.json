@@ -1,250 +1,220 @@
 {
   "cases": [
     {
-      "name": "evaluate annotates shared DOM, returns JSON and refuses a different document or URL",
-      "passed": true,
-      "ms": 80.6
-    },
-    {
       "name": "trusted wheel reaches nested button-filled panes on both axes and RTL",
       "passed": true,
-      "ms": 441.4
+      "ms": 475.3
     },
     {
       "name": "SPA loading text keeps delegation alive until navigation renders",
       "passed": true,
-      "ms": 7.7
+      "ms": 8.3
     },
     {
       "name": "a refused coordinate maps back to the observed ref under it",
       "passed": true,
-      "ms": 29.9
+      "ms": 25.6
     },
     {
       "name": "framework date presets use clickable anchors without href",
       "passed": true,
-      "ms": 33.1
+      "ms": 32.2
     },
     {
       "name": "anonymous fields carry local context without merging adjacent inputs",
       "passed": true,
-      "ms": 9.2
+      "ms": 14.8
     },
     {
       "name": "date ranges retain Week versus Release Date context and endpoint identity",
       "passed": true,
-      "ms": 9.1
+      "ms": 10.9
     },
     {
       "name": "custom menus and duplicate sortable columns retain independent evidence",
       "passed": true,
-      "ms": 10.3
+      "ms": 10.8
     },
     {
       "name": "DOM hint identities survive observations but not node replacement",
       "passed": true,
-      "ms": 6.1
+      "ms": 7.7
     },
     {
-      "name": "settle returns early on an unchanged page",
+      "name": "settle waits until SPA-style mutations go quiet, bounded",
       "passed": true,
-      "ms": 295.5
-    },
-    {
-      "name": "settle waits until delayed SPA mutations go quiet",
-      "passed": true,
-      "ms": 698.1
-    },
-    {
-      "name": "settle waits for finite animations, CSS transitions and observed shadow animations",
-      "passed": true,
-      "ms": 1686.3
-    },
-    {
-      "name": "settle ignores infinite iterations and infinite duration",
-      "passed": true,
-      "ms": 598.2
-    },
-    {
-      "name": "settle times out on continuous mutations or long finite animations",
-      "passed": true,
-      "ms": 1213.3
-    },
-    {
-      "name": "settle cannot become quiet after its budget expires",
-      "passed": true,
-      "ms": 80.3
+      "ms": 1281.9
     },
     {
       "name": "hidden and offscreen bulk DOM cannot exhaust visible custom menu hints",
       "passed": true,
-      "ms": 174.2
+      "ms": 187.8
     },
     {
       "name": "control hints exclude inherited pointer labels and semantic wrappers",
       "passed": true,
-      "ms": 10.3
+      "ms": 11
     },
     {
       "name": "nested menus retain leaf choices instead of hinting their whole group",
       "passed": true,
-      "ms": 4.3
+      "ms": 4
     },
     {
       "name": "clickable children of duplicate headers retain their owning column",
       "passed": true,
-      "ms": 4.7
+      "ms": 6.5
     },
     {
       "name": "Top 5 survives Metrics 4, offscreen rows and explicit pagination totals",
       "passed": true,
-      "ms": 14
+      "ms": 16.7
     },
     {
       "name": "table previews exclude nested rows and do not assign ambiguous page totals",
       "passed": true,
-      "ms": 12.9
+      "ms": 14.2
     },
     {
       "name": "native and ARIA checkboxes expose role and current selection",
       "passed": true,
-      "ms": 44.6
+      "ms": 51.7
     },
     {
       "name": "accessible labels: aria-labelledby, multi-label fields, shadow roots",
       "passed": true,
-      "ms": 123.3
+      "ms": 118
     },
     {
       "name": "virtualized recycled node cannot change row identity unnoticed",
       "passed": true,
-      "ms": 20.1
+      "ms": 19
     },
     {
       "name": "detached / replaced same-name node is never silently retargeted",
       "passed": true,
-      "ms": 5
+      "ms": 5.1
     },
     {
       "name": "fieldset disabled, inherited aria-disabled and readonly are refused",
       "passed": true,
-      "ms": 4.9
+      "ms": 8.4
     },
     {
       "name": "partial occlusion chooses an exposed point; complete occlusion refuses",
       "passed": true,
-      "ms": 1265.8
+      "ms": 1262.8
     },
     {
       "name": "moving controls wait for geometry stability, without a fixed 600ms sleep",
       "passed": true,
-      "ms": 315.6
+      "ms": 318
     },
     {
       "name": "hover replacement / overlay is rechecked before mouse down",
       "passed": true,
-      "ms": 56.3
+      "ms": 50.1
     },
     {
       "name": "coordinate dropdown hover permits highlighting but refuses replacement, movement and overlays",
       "passed": true,
-      "ms": 258.9
+      "ms": 268.3
     },
     {
       "name": "fill focus checks catch application redirection, including shadow inputs",
       "passed": true,
-      "ms": 59.3
+      "ms": 53.2
     },
     {
       "name": "offscreen nested scroll target is reached without clicking its previous location",
       "passed": true,
-      "ms": 84.5
+      "ms": 80.8
     },
     {
       "name": "Canvas metadata, scaled display and trusted pixel-coordinate pointer events",
       "passed": true,
-      "ms": 63.2
+      "ms": 68.3
     },
     {
       "name": "isolated reference store survives page tampering; reinjection is idempotent",
       "passed": true,
-      "ms": 75.8
+      "ms": 65.9
     },
     {
       "name": "readonly inheritance and exact post-fill value verification",
       "passed": true,
-      "ms": 53.8
+      "ms": 51.3
     },
     {
       "name": "viewport fast path explicitly excludes offscreen references",
       "passed": true,
-      "ms": 18.5
+      "ms": 17.1
     },
     {
       "name": "stale screenshot viewport refuses after scrolling",
       "passed": true,
-      "ms": 7.9
+      "ms": 11.6
     },
     {
       "name": "production iframe transform mapping handles scale and refuses overlay / rotation",
       "passed": true,
-      "ms": 78.4
+      "ms": 56.1
     },
     {
       "name": "Canvas crop offsets, multiple output scales and drag/wheel stay in CSS coordinates",
       "passed": true,
-      "ms": 387
+      "ms": 346.6
     },
     {
       "name": "a form status update does not invalidate another identified field",
       "passed": true,
-      "ms": 40.7
+      "ms": 39.4
     },
     {
       "name": "semantic cache invalidates synchronously for label / row mutations",
       "passed": true,
-      "ms": 51.1
+      "ms": 35.7
     },
     {
       "name": "WebGL Canvas remains observable without reading its drawing implementation",
       "passed": true,
-      "ms": 107.1
+      "ms": 112.9
     }
   ],
   "benchmarks": {
     "after": {
       "scope": "all",
       "itemCount": 2000,
-      "coldMs": 103.20000000298023,
-      "medianMs": 42,
+      "coldMs": 116.30000001192093,
+      "medianMs": 46.60000002384186,
       "samplesMs": [
-        40,
-        40.3999999910593,
-        40.80000001192093,
-        42,
-        42.69999998807907,
-        43.20000000298023,
-        45.1000000089407
+        42.700000047683716,
+        45.30000001192093,
+        46.30000001192093,
+        46.60000002384186,
+        48.30000001192093,
+        64.40000003576279,
+        76.80000001192093
       ]
     },
     "viewport": {
       "scope": "viewport",
       "itemCount": 24,
-      "coldMs": 62.70000000298023,
-      "medianMs": 26.299999997019768,
+      "coldMs": 35.19999998807907,
+      "medianMs": 31.80000001192093,
       "samplesMs": [
-        26,
-        26,
-        26.19999998807907,
-        26.299999997019768,
-        26.399999991059303,
-        27.5,
-        28.799999997019768
+        26.5,
+        26.899999976158142,
+        28,
+        31.80000001192093,
+        32,
+        33.30000001192093,
+        38.80000001192093
       ]
     }
   },
   "node": "v24.19.0",
-  "engineSha256": "5d9da624d7380630b124cac418b37a07ab7ea5447fe2d47c4722dccec1a3c9f2",
+  "engineSha256": "60e181302faed26f3ce0cabc3e78a1a476111c58b8e8869d0b20f8436739927c",
   "scope": "Production page script and iframe mapping in real Chromium/CDP; not the compiled Rust/Tauri dispatch path.",
   "browser": "155.0.4283.62"
 }

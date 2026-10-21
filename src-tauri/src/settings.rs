@@ -183,14 +183,6 @@ pub struct Settings {
     pub default_mode: String,
     /// 场景模型：轻量化（标题/摘要/Stage/Butterfly/Meteor/员工）、编码、剑来。
     pub scene_models: SceneModels,
-    /// jev 视觉决策：浏览器 run 拿不准时看截图选控件/核验。默认开启；新字段名避开旧 JEV 的 jevEnabled（旧默认 false）。
-    pub jev_vision_enabled: bool,
-    /// 本地凭据（中转地址和 token 均配置时忽略）；留空复用 Lyra 的 Command Code，填写则直连（默认 TypeSafe）。
-    pub jev_api_key: String,
-    /// 本地地址，留空按凭据来源取默认 /systemone；中转固定使用 /cc/systemone。
-    pub jev_api_url: String,
-    /// 本地模型，留空按凭据来源取默认值（Command Code：typesafe/jev-1.14.0；直连：jev-1.14.0）。
-    pub jev_model: String,
     /// 打开文件用的编辑器命令（cursor / code / zed / windsurf 等，依赖 PATH）
     pub editor: String,
     pub terminal_shell: String,
@@ -318,10 +310,6 @@ impl Default for Settings {
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,
             knowledge_graph_enabled: false,
-            jev_vision_enabled: true,
-            jev_api_key: String::new(),
-            jev_api_url: String::new(),
-            jev_model: String::new(),
             context_retrieval_mode: ContextRetrievalMode::Fast,
             custom_env_vars: std::collections::HashMap::new(),
         }

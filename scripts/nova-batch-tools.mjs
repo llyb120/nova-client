@@ -146,24 +146,6 @@ export function createNovaBatchTools(cwd, options = {}) {
   return tools;
 }
 
-// Refresh on every tools/list: only Nova's serving process knows the live JEV settings.
-export async function listNovaBatchTools(tools, cwd) {
-  const definitions = Object.entries(tools).map(([name, { description, inputSchema }]) => ({ name, description, inputSchema }));
-  const chrome = definitions.find(tool => tool.name === "chrome");
-  if (chrome) {
-    try {
-      const schema = await callGlobalContextTool("tool_schema", cwd, { name: "chrome" });
-      if (schema?.name === "chrome" && typeof schema.description === "string" && schema.inputSchema?.type === "object") {
-        chrome.description = schema.description;
-        chrome.inputSchema = schema.inputSchema;
-      }
-    } catch {
-      // Older/unreachable Nova: retain the bundled non-JEV schema, never stale JEV claims.
-    }
-  }
-  return definitions;
-}
-
 /**
  * Hard tool-selection policy for Devin (ACP MCP). Injected on first prompt of a new session.
  */
