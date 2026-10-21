@@ -439,6 +439,10 @@
         "type": "boolean",
         "description": "screenshot默认整页；false为当前视口"
       },
+      "expandScroll": {
+        "type": "boolean",
+        "description": "screenshot时临时加高视口，把页面内部纵向滚动区（TAPD/Jira表格等）展开成原始清晰度长图，截完自动恢复；同时传ref（滚动容器或其外层，frame=0）则只截该区域的全部内容。返回scrollExpanded.complete=false表示仍未展开完；该图仅供阅读，不能用于坐标操作"
+      },
       "tileOffset": {
         "type": "integer",
         "minimum": 0,
@@ -649,7 +653,7 @@
         "type": "integer",
         "minimum": 0,
         "maximum": 3840,
-        "description": "截图长边，默认1600；0为原始精度"
+        "description": "截图长边，默认1600（expandScroll默认0，存无损PNG）；0为原始精度"
       },
       "incognito": {
         "type": "boolean",

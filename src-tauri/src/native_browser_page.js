@@ -1,6 +1,6 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 23) return;
+  if (globalThis.__novaWebview?.apiVersion === 24) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   // Icon-only controls (sort carets, filter funnels, close ×) carry their meaning in class names.
   const iconHint = e => {
@@ -152,7 +152,7 @@
     return entry;
   };
   const api = {
-    apiVersion: 23,
+    apiVersion: 24,
     stamp,
     async evaluate(expression, expectedDocument, expectedUrl) {
       // Check and start in the same JS turn: navigation must never redirect a script to a new document.
@@ -215,6 +215,26 @@
       }
       captureTimer=setTimeout(()=>api.captureLayout(false),20000);
       return true;
+    },
+    // Largest hidden vertical overflow among visible inner scrollers (the document's own scroll is
+    // covered by captureBeyondViewport). With ref: that element and its descendants only.
+    // ponytail: without ref, >=30% viewport width skips nav/side menus.
+    innerScrollOverflow(ref) {
+      const target=ref&&entryFor(ref).e;
+      let extra=0;
+      for (const e of target?[target,...target.querySelectorAll('*')]:document.querySelectorAll('*')) {
+        const over=e.scrollHeight-e.clientHeight;
+        if (over<=1 || e.clientHeight<50 || e===document.scrollingElement) continue;
+        if (!/^(auto|scroll|overlay)$/.test(getComputedStyle(e).overflowY)) continue;
+        const r=e.getBoundingClientRect();
+        if ((!target && r.width<innerWidth*0.3) || r.bottom<=0 || r.top>=innerHeight) continue;
+        extra=Math.max(extra,over);
+      }
+      return extra;
+    },
+    documentRect(ref) {
+      const r=entryFor(ref).e.getBoundingClientRect();
+      return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height};
     },
     observe(nonce, limit = 20000, scope = 'all') {
       const started=performance.now(), allRoots=roots();trackRoots(allRoots);

@@ -194,6 +194,39 @@ async fn capture_viewport(app:&AppHandle, viewport:&Value, x:f64, y:f64, w:f64, 
     Ok(xcap::image::load_from_memory(&bytes).map_err(|e|e.to_string())?.crop_imm(left,top,right-left,bottom-top))
 }
 
+// Inner scrollers (TAPD/Jira tables) clip rows that captureBeyondViewport never reaches: grow the
+// emulated viewport until they stop overflowing. Only viewport-sized scrollers grow, so a round
+// that gains nothing is reverted instead of padding blank space.
+// ponytail: 3 rounds and the GPU texture limit; taller content is reported as incomplete.
+async fn expand_inner_scroll(app:&AppHandle, frame:&Frame, dpr:f64, target:Option<&str>) -> Result<Option<(f64,bool)>,String> {
+    let script=format!("__novaWebview.innerScrollOverflow({})",json!(target));
+    let overflow=|| async { Ok::<f64,String>(evaluate(app,frame,script.clone()).await?.as_f64().unwrap_or(0.)) };
+    let mut over=overflow().await?;
+    if over<=1. {return Ok(None);}
+    let size=evaluate(app,frame,"[innerWidth,innerHeight]".into()).await?;
+    let width=size[0].as_f64().filter(|v|*v>0.).ok_or("无效视口")?;
+    let base=size[1].as_f64().filter(|v|*v>0.).ok_or("无效视口")?;
+    let limit=(MAX_FULL_PAGE_DEVICE_PX/dpr).floor();
+    let resize=|height:f64| cdp(app,"Emulation.setDeviceMetricsOverride",json!({"width":width,"height":height,"deviceScaleFactor":0,"mobile":false}),None,None);
+    let settle=|| evaluate(app,frame,"__novaWebview.settle(300,1500)".into());
+    let mut height=base;
+    for _ in 0..3 {
+        let next=(height+over).ceil().min(limit);
+        if next<=height {break;}
+        resize(next).await?;
+        settle().await?;
+        let after=overflow().await?;
+        if after>=over-1. {
+            if height==base {cdp(app,"Emulation.clearDeviceMetricsOverride",json!({}),None,None).await?;} else {resize(height).await?;}
+            settle().await?;
+            break;
+        }
+        (height,over)=(next,after);
+        if over<=1. {break;}
+    }
+    Ok((height>base).then_some((height,over<=1.)))
+}
+
 async fn observe(app: &AppHandle, scope: &str) -> Result<Observation, String> {
     fn collect(tree: &Value, session: Option<String>, frames: &mut Vec<Frame>) {
         if let Some(id) = tree["frame"]["id"].as_str() {
@@ -873,11 +906,18 @@ async fn snapshot(
     let mut region=args.get("region").filter(|v|!v.is_null()).cloned();
     if region.is_some() && args["ref"].is_string() {return Err("region 与 ref 裁剪不能同时提供".into());}
     if !with_image && (region.is_some() || args["ref"].is_string()) {return Err("region/ref 裁剪仅适用于 screenshot".into());}
+    // ref+expandScroll: capture that element's whole inner scroll content (main frame only).
+    let mut target=None;
     if let Some(reference)=args["ref"].as_str() {
         let previous=app.state::<BrowserState>().observations.lock().unwrap().get(&active_label(app)?).cloned().ok_or("目标裁剪需要最新 inspect/screenshot")?;
         if args["snapshotId"].as_str()!=Some(&previous.id) { return Err("目标裁剪 snapshotId 已失效".into()); }
-        let p=point(app,&previous,args["frame"].as_u64().unwrap_or(0) as usize,reference,"capture").await?;
-        region=Some(p["rect"].clone());
+        if args["expandScroll"]==true {
+            if args["frame"].as_u64().unwrap_or(0)!=0 {return Err("expandScroll 按 ref 截取仅支持主框架 frame=0".into());}
+            target=Some(reference);
+        } else {
+            let p=point(app,&previous,args["frame"].as_u64().unwrap_or(0) as usize,reference,"capture").await?;
+            region=Some(p["rect"].clone());
+        }
     }
     let scope=args["scope"].as_str().unwrap_or("all");
     if !matches!(scope,"all"|"viewport") {return Err("scope 必须为 all 或 viewport".into());}
@@ -899,11 +939,14 @@ async fn snapshot(
     result["visualReason"] = if auto_visual {json!("页面有大面积 Canvas，自动附可操作视口截图；图内控件不可由 DOM 枚举")} else {Value::Null};
     result["documentPath"] = json!(document_path);
     if with_image {
-        let edge=args["maxEdge"].as_u64().unwrap_or(1600);
+        // expandScroll output is meant to be read/shared: keep original pixels unless asked otherwise.
+        let keep_original=args["expandScroll"]==true;
+        let edge=args["maxEdge"].as_u64().unwrap_or(if keep_original {0} else {1600});
         if edge!=0 && !(320..=3840).contains(&edge) {return Err("maxEdge 必须为0或320–3840".into());}
-        observation.full_page = !auto_visual && region.is_none() && args["fullPage"] != false;
+        observation.full_page = !auto_visual && region.is_none() && (args["fullPage"] != false || target.is_some());
         let mut images = Vec::new();
         let mut document = None;
+        let mut expanded = None;
         if observation.full_page {
             // Retain the root world for cleanup even if capture is cancelled or times out.
             app.state::<BrowserState>()
@@ -917,6 +960,15 @@ async fn snapshot(
                 "__novaWebview.captureLayout(true)".into(),
             )
             .await?;
+            let dpr = evaluate(app, &observation.frames[0], "devicePixelRatio".into()).await?
+                .as_f64().filter(|v| v.is_finite() && *v > 0.).unwrap_or(1.);
+            if args["expandScroll"] == true {
+                expanded = expand_inner_scroll(app, &observation.frames[0], dpr, target).await?;
+            }
+            let element = match target {
+                Some(reference) => Some(evaluate(app, &observation.frames[0], format!("__novaWebview.documentRect({})", json!(reference))).await?),
+                None => None,
+            };
             let metrics = cdp(app, "Page.getLayoutMetrics", json!({}), None, None).await?;
             let size = metrics
                 .get("cssContentSize")
@@ -933,17 +985,26 @@ async fn snapshot(
                 .ceil();
             // captureBeyondViewport resizes the renderer to the document; past the GPU texture limit
             // (16384 device px) Chromium crashes the page/GPU process and weak GPUs can hang the system.
-            let dpr = evaluate(app, &observation.frames[0], "devicePixelRatio".into()).await?
-                .as_f64().filter(|v| v.is_finite() && *v > 0.).unwrap_or(1.);
+            let rect = |key: &str| element.as_ref().map_or(Ok(0.), |e| e[key].as_f64().filter(|v| v.is_finite()).ok_or("目标元素尺寸无效"));
+            let (left, top) = (rect("x")?.max(0.).floor(), rect("y")?.max(0.).floor());
+            let (width, height) = if element.is_some() {
+                ((rect("x")? + rect("width")?).min(width).ceil() - left, (rect("y")? + rect("height")?).min(height).ceil() - top)
+            } else { (width, height) };
+            if width < 1. || height < 1. { return Err("目标元素不可见".into()); }
             if width.max(height) * dpr > MAX_FULL_PAGE_DEVICE_PX {
+                if expanded.take().is_some() {cdp(app,"Emulation.clearDeviceMetricsOverride",json!({}),None,None).await?;}
+                if target.is_some() {
+                    evaluate(app, &observation.frames[0], "__novaWebview.captureLayout(false)".into()).await?;
+                    return Err("目标区域超出截图安全上限，请改用分页或读 DOM".into());
+                }
                 evaluate(app, &observation.frames[0], "__novaWebview.captureLayout(false)".into()).await?;
                 observation.full_page = false;
                 result["fullPageFallback"] = json!(format!("文档 {width}x{height} CSS像素超出整页截图安全上限，已改为视口截图；屏外内容请滚动后再截或读 DOM"));
             } else {
-                document = Some((width, height));
+                document = Some((left, top, width, height));
             }
         }
-        if let Some((width, height)) = document {
+        if let Some((left, top, width, height)) = document {
             let columns = (width / 2048.).ceil() as u64;
             let rows = (height / 4096.).ceil() as u64;
             let total = columns.checked_mul(rows).ok_or("文档尺寸过大")?;
@@ -953,18 +1014,29 @@ async fn snapshot(
             }
             // ponytail: at most 4 tiles / 32M CSS pixels per call; nextTile makes huge pages resumable, never silently cropped.
             for tile in offset..total.min(offset + 4) {
-                let x = (tile % columns) as f64 * 2048.;
-                let y = (tile / columns) as f64 * 4096.;
-                let w = (width - x).min(2048.);
-                let h = (height - y).min(4096.);
+                let (dx, dy) = ((tile % columns) as f64 * 2048., (tile / columns) as f64 * 4096.);
+                let (x, y, w, h) = (left + dx, top + dy, (width - dx).min(2048.), (height - dy).min(4096.));
                 let scale=if edge==0 {1.} else {(edge as f64/w.max(h)).min(1.)};
                 let shot=cdp(app,"Page.captureScreenshot",json!({"format":"png","fromSurface":true,"captureBeyondViewport":true,"clip":{"x":x,"y":y,"width":w,"height":h,"scale":scale}}),None,None).await?;
-                let path = dir.join(format!("{}-{tile}.jpg", observation.id));
-                let (bytes,pixels)=screenshot_bytes(shot["data"].as_str().ok_or("截图为空")?,edge as u32)?;
+                let data=shot["data"].as_str().ok_or("截图为空")?;
+                // Lossless PNG straight from CDP; the model-facing copy is still downscaled by the bridge.
+                let (bytes,pixels,ext)=if keep_original && edge==0 {
+                    use base64::Engine;
+                    let raw=base64::engine::general_purpose::STANDARD.decode(data).map_err(|e|e.to_string())?;
+                    let pixels=png_dimensions(&raw)?;
+                    (raw,pixels,"png")
+                } else { let (bytes,pixels)=screenshot_bytes(data,edge as u32)?; (bytes,pixels,"jpg") };
+                let path = dir.join(format!("{}-{tile}.{ext}", observation.id));
                 std::fs::write(&path,bytes).map_err(|e|e.to_string())?;
                 let image_id=format!("{}-{tile}",observation.id);
-                observation.images.push(ScreenshotImage{id:image_id.clone(),path:path.clone(),x,y,width:w,height:h,pixels});
+                // The expanded layout differs from the restored page: such tiles are read-only.
+                if expanded.is_none() {observation.images.push(ScreenshotImage{id:image_id.clone(),path:path.clone(),x,y,width:w,height:h,pixels});}
                 images.push(json!({"imageId":image_id,"path":path,"tile":tile,"x":x,"y":y,"width":w,"height":h,"pixelWidth":pixels.0,"pixelHeight":pixels.1}));
+            }
+            if let Some((viewport_height,complete))=expanded {
+                cdp(app,"Emulation.clearDeviceMetricsOverride",json!({}),None,None).await?;
+                result["scrollExpanded"]=json!({"viewportHeight":viewport_height,"complete":complete,
+                    "note":if complete {"已临时加高视口展开内部滚动区并恢复；图片仅供阅读，坐标操作请用 fullPage=false 截图"} else {"内部滚动区超出安全高度或无法随视口展开，长图仍不完整；图片仅供阅读"}});
             }
             let next = offset + images.len() as u64;
             result["documentSize"] = json!({"width":width,"height":height});
@@ -1393,7 +1465,7 @@ async fn control_session(
             if let Ok(value)=&mut result {value["status"]=json!("needs_review");value["inputReleaseErrors"]=json!(cleanup_errors);}
         }
     }
-    if operation == "screenshot" && args["fullPage"] != false {
+    if operation == "screenshot" && (args["fullPage"] != false || args["expandScroll"] == true) {
         let captured = state
             .observations
             .lock()
@@ -1403,6 +1475,10 @@ async fn control_session(
         if let Some(captured) = captured.filter(|o| o.full_page) {
             let restored = CONTROL_TAB
                 .scope(s.active_tab.clone(), async {
+                    // Also undo expandScroll's viewport override if capture failed or was cancelled.
+                    let cleared = if args["expandScroll"] == true {
+                        cdp(app, "Emulation.clearDeviceMetricsOverride", json!({}), None, None).await.map(|_| ())
+                    } else { Ok(()) };
                     // A viewport capture resets the full-page scrollbar/layout override.
                     let reset = cdp(
                         app,
@@ -1418,6 +1494,7 @@ async fn control_session(
                         "__novaWebview.captureLayout(false)".into(),
                     )
                     .await;
+                    cleared?;
                     reset?;
                     style?;
                     Ok::<_, String>(())

@@ -150,6 +150,21 @@ try {
     const refused=await chromeUi('act',{tabTag:tag,snapshotId:stale.snapshotId,action:{action:'click_at',x:340,y:220}});
     assert.equal(refused.status,'not_executed');assert.match(refused.reason,/画面已变化/);
     assert.equal(await page.evaluate(()=>window.optionClicked),6,'pre-existing visual changes still block input');
+    // expandScroll: an inner viewport-sized scroller (TAPD-like table) is captured in full, then restored.
+    await page.evaluate(()=>{document.documentElement.style.overflow='hidden';document.body.innerHTML='<div id="pane" style="position:fixed;top:40px;left:0;right:0;bottom:0;overflow:auto"><div style="height:3000px">rows</div></div>';});
+    const viewportHeight=await page.evaluate(()=>innerHeight);
+    const tall=await chromeUi('screenshot',{tabTag:tag,expandScroll:true,maxEdge:0});
+    assert.equal(tall.scrollExpanded?.complete,true,JSON.stringify(tall.scrollExpanded));
+    assert.ok(tall.documentSize.height>=3040,JSON.stringify(tall.documentSize));
+    assert.equal(await page.evaluate(()=>innerHeight),viewportHeight,'viewport override must be cleared');
+    const paneObs=await chromeUi('inspect',{tabTag:tag});
+    const pane=JSON.parse(await readFile(paneObs.documentPath,'utf8')).pages[0].items.find(i=>i.scroll);
+    assert(pane,'scroll container is observable');
+    const region=await chromeUi('screenshot',{tabTag:tag,snapshotId:paneObs.snapshotId,ref:pane.ref,expandScroll:true});
+    assert.match(region.images[0].path,/\.png$/,'expandScroll keeps the original lossless image by default');
+    assert.equal(region.scrollExpanded?.complete,true,JSON.stringify(region.scrollExpanded));
+    assert.equal(region.images[0].y,40);assert.ok(region.documentSize.height>=3000,JSON.stringify(region.documentSize));
+    assert.equal(await page.evaluate(()=>innerHeight),viewportHeight,'viewport override must be cleared');
     if(pollingError)throw pollingError;
     await writeFile(join(output,'coordinate-report.json'),JSON.stringify({passed:true,modelCalls:0,coordinateHover:true,localCrop:true,stalePixels:true,chromeCaptures,profile},null,2));
     console.log('PASS compiled Chrome bridge/evaluate annotations, readback, stale snapshots, partial failure and Promise timeout/DOM/images/coordinate guards; no sidebar browser');
