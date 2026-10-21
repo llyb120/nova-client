@@ -27,6 +27,8 @@ import { fmtDuration, fmtTokens, turnAvgTokensPerSec, turnTokenTitle } from "./T
 export interface CanvasTranscriptHandle {
   scrollToBottom(): void;
   scrollToGroup(index: number): void;
+  /** 搜索命中：展开所在折叠、滚到该消息并高亮 query（忽略大小写） */
+  revealMatch(itemId: number, query: string): void;
   scrollBy(delta: number): void;
   isAtBottom(): boolean;
   scrollTop(): number;
@@ -1161,6 +1163,8 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   let selMoved = false;
   /** 连击计数（双击选词 / 三击选行）：按时间间隔与位置抖动判定 */
   let lastClick = { t: 0, count: 0, x: 0, y: 0 };
+  /** 会话搜索高亮：pending 时下一次提交的布局里定位并滚到命中块 */
+  let searchMark: { itemId: number; query: string; groupIdx: number; pending: boolean } | null = null;
 
   // busy spinner 只重绘自身所在的工具头，不再以 20fps 光栅化整个视口。
   let busyTimer: number | undefined;
@@ -2267,6 +2271,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       imgCache.delete(source);
     }
 
+    if (searchMark) paintSearchMark(ctx);
     // selection overlay
     if (selection) paintSelection(ctx);
 
@@ -3059,39 +3064,59 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     for (let i = from; i <= to; i++) {
       const b = blocks[i];
       if (!b?.textLines || !b.selectable) continue;
-      const sOff = i === from ? fromOff : 0;
-      const eOff = i === to ? toOff : Number.POSITIVE_INFINITY;
-      const clipped = !!b.data?.clipped;
-      const bScr = clipped ? (blockScrolls.get(blockScrollKey(b)) || 0) : 0;
-      if (clipped) {
-        ctx.save();
-        roundRect(ctx, b.x, b.y - scrollY, b.w, b.h, b.borderRadius || 0);
-        ctx.clip();
-      }
-      for (const ln of b.textLines) {
-        const ly = ln.y - bScr;
-        const lineEnd = ln.offset + ln.text.length;
-        if (eOff <= ln.offset || sOff >= lineEnd) continue;
-        // 工具详情内部滚动后，裁切区外的行不再画高亮，避免漂到卡片上方
-        if (clipped && (ly + ln.lh <= b.y || ly >= b.y + b.h)) continue;
-        const a = Math.max(0, sOff - ln.offset);
-        const bEnd = Math.min(ln.text.length, eOff - ln.offset);
-        let x0: number, x1: number;
-        if (ln.charX) {
-          x0 = ln.x + (ln.charX[a] ?? 0);
-          x1 = ln.x + (ln.charX[bEnd] ?? ln.w);
-        } else {
-          x0 = ln.x + measure(ln.text.slice(0, a), ln.fs, b.font || pal.sans, b.fontWeight);
-          x1 = ln.x + measure(ln.text.slice(0, bEnd), ln.fs, b.font || pal.sans, b.fontWeight);
-        }
-        // 选区越过行尾换行符时，DOM 会在行尾多画一小段（换行符宽度），补一个空格宽
-        if (eOff > lineEnd) x1 += measure(" ", ln.fs, b.font || pal.sans, b.fontWeight);
-        // DOM 选区高亮覆盖整行 line-height，而不是字号高度
-        ctx.fillRect(x0, ly - scrollY, x1 - x0, ln.lh);
-      }
-      if (clipped) ctx.restore();
+      paintTextRange(ctx, b, i === from ? fromOff : 0, i === to ? toOff : Number.POSITIVE_INFINITY);
     }
     ctx.restore();
+  }
+
+  function paintSearchMark(ctx: CanvasRenderingContext2D) {
+    const mark = searchMark!;
+    ctx.save();
+    ctx.fillStyle = "#f5b800";
+    ctx.globalAlpha = 0.4;
+    for (const b of blocks) {
+      if (b.id !== mark.itemId || !b.selectable || !b.textLines?.length) continue;
+      // 按行 offset 还原块内文本，匹配下标即选区 offset；折行处缺失的字符补空格。
+      let full = "";
+      for (const ln of b.textLines) full = full.padEnd(ln.offset).slice(0, ln.offset) + ln.text;
+      const hay = full.toLowerCase();
+      for (let at = hay.indexOf(mark.query); at >= 0; at = hay.indexOf(mark.query, at + mark.query.length)) {
+        paintTextRange(ctx, b, at, at + mark.query.length);
+      }
+    }
+    ctx.restore();
+  }
+
+  function paintTextRange(ctx: CanvasRenderingContext2D, b: Block, sOff: number, eOff: number) {
+    const clipped = !!b.data?.clipped;
+    const bScr = clipped ? (blockScrolls.get(blockScrollKey(b)) || 0) : 0;
+    if (clipped) {
+      ctx.save();
+      roundRect(ctx, b.x, b.y - scrollY, b.w, b.h, b.borderRadius || 0);
+      ctx.clip();
+    }
+    for (const ln of b.textLines ?? []) {
+      const ly = ln.y - bScr;
+      const lineEnd = ln.offset + ln.text.length;
+      if (eOff <= ln.offset || sOff >= lineEnd) continue;
+      // 工具详情内部滚动后，裁切区外的行不再画高亮，避免漂到卡片上方
+      if (clipped && (ly + ln.lh <= b.y || ly >= b.y + b.h)) continue;
+      const a = Math.max(0, sOff - ln.offset);
+      const bEnd = Math.min(ln.text.length, eOff - ln.offset);
+      let x0: number, x1: number;
+      if (ln.charX) {
+        x0 = ln.x + (ln.charX[a] ?? 0);
+        x1 = ln.x + (ln.charX[bEnd] ?? ln.w);
+      } else {
+        x0 = ln.x + measure(ln.text.slice(0, a), ln.fs, b.font || pal.sans, b.fontWeight);
+        x1 = ln.x + measure(ln.text.slice(0, bEnd), ln.fs, b.font || pal.sans, b.fontWeight);
+      }
+      // 选区越过行尾换行符时，DOM 会在行尾多画一小段（换行符宽度），补一个空格宽
+      if (eOff > lineEnd) x1 += measure(" ", ln.fs, b.font || pal.sans, b.fontWeight);
+      // DOM 选区高亮覆盖整行 line-height，而不是字号高度
+      ctx.fillRect(x0, ly - scrollY, x1 - x0, ln.lh);
+    }
+    if (clipped) ctx.restore();
   }
 
   function blockScrollbarGeom(b: Block) {
@@ -3720,6 +3745,18 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       } else {
         scrollY = settled.scrollY;
       }
+      // 目标轮次已排版（非加载占位）才定位，找不到文字匹配时停在该消息开头。
+      const mark = searchMark;
+      if (mark?.pending && blocks.some((b) => b.groupIdx === mark.groupIdx && b.kind !== "hint")) {
+        mark.pending = false;
+        const own = blocks.filter((b) => b.id === mark.itemId && b.selectable);
+        const target = own.find((b) => b.text?.toLowerCase().includes(mark.query)) ?? own[0];
+        if (target) {
+          keepBottom = false;
+          scrollY = Math.max(0, Math.min(maxScroll, target.y - viewH / 3));
+          scheduleRebuild(false, true);
+        }
+      }
       applyEditStyle();
       props.onScroll?.(scrollY, maxScroll, false);
       holdingFrame = false;
@@ -3869,9 +3906,29 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     canvasEl.addEventListener("wheel", onWheel, { passive: false });
     canvasEl.addEventListener("copy", onCopy);
 
+    function scrollToGroup(idx: number) { if (props.groups[idx]) { jumpGroup = idx; scrollY = Math.max(0, Math.min(maxScroll, (groupYs[idx] ?? 24 + idx * 240) - 20)); keepBottom = false; applyEditStyle(); paintAll(); scheduleRebuild(false, true); props.onScroll?.(scrollY, maxScroll, false); } }
     props.ref?.({
       scrollToBottom() { jumpGroup = null; keepBottom = true; scrollY = maxScroll; applyEditStyle(); paintAll(); props.onScroll?.(scrollY, maxScroll, false); },
-      scrollToGroup(idx) { if (props.groups[idx]) { jumpGroup = idx; scrollY = Math.max(0, Math.min(maxScroll, (groupYs[idx] ?? 24 + idx * 240) - 20)); keepBottom = false; applyEditStyle(); paintAll(); scheduleRebuild(false, true); props.onScroll?.(scrollY, maxScroll, false); } },
+      scrollToGroup,
+      revealMatch(itemId, query) {
+        const gi = props.groups.findIndex((g) => g.user?.id === itemId || g.body.some((it) => it.id === itemId));
+        const g = props.groups[gi];
+        if (!g || !query) return;
+        const q = query.toLowerCase();
+        // 与 computeLayout 的折叠键保持一致：命中藏在折叠里时先展开。
+        if (g.user?.id === itemId) {
+          const typed = promptDisplayOf(g.user.text);
+          if (typed !== undefined && !typed.toLowerCase().includes(q)) toggleExpanded(`user-sys-${itemId}`, true);
+          if (g.user.text.length > 4000) toggleExpanded(`user-text-${itemId}`, true);
+        } else if (g.turn) {
+          const { process } = splitTurnBody(g.body, true);
+          if (process.some((it) => it.id === itemId)) {
+            toggleExpanded(`turn-${g.turn.id ?? g.user?.id ?? process[0]?.id ?? 0}`, true);
+          }
+        }
+        searchMark = { itemId, query: q, groupIdx: gi, pending: true };
+        scrollToGroup(gi);
+      },
       scrollBy(delta) { applyScrollY(scrollY + delta, true); },
       isAtBottom() { return maxScroll - scrollY <= 2; },
       scrollTop() { return scrollY; },
@@ -3964,6 +4021,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       selection = null;
       selecting = false;
       selStart = null;
+      searchMark = null;
       groupYs = [];
       imgCache.clear();
       imageSizes.clear();

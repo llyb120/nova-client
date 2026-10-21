@@ -299,6 +299,9 @@ export function isExpanded(key: number | string, fallback = false): boolean {
   return v === undefined ? fallback : !!v;
 }
 
+/** 会话搜索点击命中后，由 ChatView 滚到对应消息并高亮关键词。 */
+export const [searchReveal, setSearchReveal] = createSignal<{ threadId: string; itemId: number; query: string } | null>(null);
+
 const [expandedRevisionValue, setExpandedRevision] = createSignal(0);
 export const expandedRevision = expandedRevisionValue;
 

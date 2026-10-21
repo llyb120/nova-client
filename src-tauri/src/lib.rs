@@ -1126,6 +1126,20 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
     thread_metas(&state)
 }
 
+/// 按更新时间倒序返回命中会话及每个会话的前几条命中摘要；异步命令避免在主线程扫描全部历史。
+#[tauri::command]
+async fn search_threads(state: State<'_, AppState>, query: String) -> Result<Vec<threads::ThreadSearch>, String> {
+    let store = state.store.lock().unwrap();
+    let mut hits: Vec<&threads::Thread> = store.threads.iter()
+        .filter(|t| !t.experience_thread && !t.employee_thread)
+        .collect();
+    hits.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(hits.into_iter()
+        .filter_map(|t| threads::search_thread(t, &query, 5))
+        .take(50)
+        .collect())
+}
+
 fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
     // 会话自身没带 worktree 标注、但 cwd 正好是某条已知 worktree 工作目录时
     // （在项目选择器里直接选中 worktree 目录开的会话、员工 worktree 会话等），
@@ -5974,6 +5988,7 @@ pub fn run() {
             jianpu::jianpu_learn,
             image_generation::image_command_context,
             list_threads,
+            search_threads,
             load_threads,
             get_thread,
             get_thread_view,

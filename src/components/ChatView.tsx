@@ -20,7 +20,7 @@ import {
   timeMachineChangedSignal,
 } from "../store";
 import { mountSessionShortcuts, setShortcutCaptureActive } from "../sessionShortcuts";
-import { ensureHistoryItems } from "../store";
+import { ensureHistoryItems, searchReveal, setSearchReveal } from "../store";
 import { resolveUserScrollStick } from "../scrollStick";
 import type { AgentKind, Item, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
@@ -53,6 +53,7 @@ export function ChatView() {
   onMount(() => window.addEventListener("nova:preview-file", previewFile));
   onCleanup(() => window.removeEventListener("nova:preview-file", previewFile));
   let transcriptRef: CanvasTranscriptHandle | undefined;
+  const [transcriptReady, setTranscriptReady] = createSignal(false);
   const [stickToBottom, setStickToBottom] = createSignal(true);
 
   mountSessionShortcuts({
@@ -257,6 +258,15 @@ export function ChatView() {
     }
     return id;
   }, undefined);
+
+  // 会话搜索点击命中：等目标会话加载完成后退出吸底，滚到命中消息并高亮。
+  createEffect(() => {
+    const hit = searchReveal();
+    if (!hit || !transcriptReady() || hit.threadId !== state.currentId || state.loadingThread || previewItems()) return;
+    setSearchReveal(null);
+    cancelBottomFollow();
+    untrack(() => transcriptRef?.revealMatch(hit.itemId, hit.query));
+  });
 
   // 会话加载和新增轮次后，让“现在”刻度跟随最新用户轮次；回看过去时不抢走光标。
   createEffect(() => {
@@ -1068,7 +1078,7 @@ export function ChatView() {
         <div class="chat-primary">
       <div class="chat-body">
           <CanvasTranscript
-            ref={(handle) => { transcriptRef = handle; scheduleBottomPin(); }}
+            ref={(handle) => { transcriptRef = handle; setTranscriptReady(true); scheduleBottomPin(); }}
             threadId={state.currentId}
             groups={groups()}
             loadItems={ensureHistoryItems}

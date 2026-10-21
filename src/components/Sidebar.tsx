@@ -19,6 +19,7 @@ import {
   state,
 } from "../store";
 import { sidebarLayout, setSidebarLayout } from "../sidebarLayout";
+import { SessionSearchModal } from "./SessionSearchModal";
 import { agentLabel, agentShort, isScratch, scratchParent } from "../utils";
 import {
   IconBell,
@@ -32,6 +33,7 @@ import {
   IconLogo,
   IconMerge,
   IconPlus,
+  IconSearch,
   IconTerminal,
   IconTrash,
   IconTrophy,
@@ -145,6 +147,8 @@ export function Sidebar(props: {
     return children;
   });
   const threadOf = (id: string) => state.threads.find((item) => item.id === id);
+
+  const [searchOpen, setSearchOpen] = createSignal(false);
   const openHistoryThread = async (id: string) => {
     setView("home");
     // 打开时若链上仍有其它阶段未读，仅消费一条未读（聚合徽标 -1）；本 stage 自身清零。
@@ -694,6 +698,15 @@ export function Sidebar(props: {
           </Show>
           <button
             type="button"
+            class="sidebar-head-toggle sidebar-head-search"
+            title="搜索会话"
+            aria-label="搜索会话"
+            onClick={() => setSearchOpen(true)}
+          >
+            <IconSearch size={14} />
+          </button>
+          <button
+            type="button"
             class="sidebar-head-toggle"
             title={collapsed() ? "固定展开侧边栏" : "收起为图标栏"}
             aria-label={collapsed() ? "固定展开侧边栏" : "收起侧边栏"}
@@ -757,6 +770,9 @@ export function Sidebar(props: {
         </div>
       </div>
 
+      <Show when={searchOpen()}>
+        <SessionSearchModal onOpen={openHistoryThread} onClose={() => setSearchOpen(false)} />
+      </Show>
       <div class="thread-list">
         <Show
           when={currentGroups().length > 0}

@@ -988,6 +988,80 @@ pub fn render_stage_context(source: &Thread) -> String {
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub item_id: u64,
+    pub snippet: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSearch {
+    pub thread_id: String,
+    pub title_hit: bool,
+    /// 前 `max_hits` 条命中消息的摘要（每条消息取首个命中位置）
+    pub hits: Vec<SearchHit>,
+    /// 命中的消息总数
+    pub total: usize,
+}
+
+/// 会话搜索：只匹配标题、用户输入和助手正文（含中间分段结论），不含思考与工具。
+pub fn search_thread(thread: &Thread, query: &str, max_hits: usize) -> Option<ThreadSearch> {
+    // 逐字符折叠大小写，保证与原文字符一一对应，便于截取摘要。
+    let fold = |s: &str| -> Vec<char> {
+        s.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect()
+    };
+    let needle = fold(query.trim());
+    if needle.is_empty() {
+        return None;
+    }
+    let find = |text: &str| -> Option<String> {
+        let hay = fold(text);
+        let at = hay.windows(needle.len()).position(|w| w == needle.as_slice())?;
+        let chars: Vec<char> = text.chars().collect();
+        let start = at.saturating_sub(30);
+        let end = (at + needle.len() + 60).min(chars.len());
+        let body = chars[start..end].iter().collect::<String>();
+        let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        Some(format!(
+            "{}{body}{}",
+            if start > 0 { "…" } else { "" },
+            if end < chars.len() { "…" } else { "" }
+        ))
+    };
+    let title_hit = find(&thread.title).is_some();
+    let mut hits = Vec::new();
+    let mut total = 0;
+    for item in &thread.items {
+        let (Item::User { id, text, .. } | Item::Assistant { id, text, .. }) = item else { continue };
+        let Some(snippet) = find(text) else { continue };
+        total += 1;
+        if hits.len() < max_hits {
+            hits.push(SearchHit { item_id: *id, snippet });
+        }
+    }
+    (title_hit || total > 0).then(|| ThreadSearch { thread_id: thread.id.clone(), title_hit, hits, total })
+}
+
+#[test]
+fn search_snippet_skips_thoughts_and_tools() {
+    let mut thread = Thread::new(".".into(), AgentKind::Lyra, None, None, None, false);
+    thread.title = "Deploy Plan".into();
+    thread.push_user("帮我看看 nginx 配置".into(), Vec::new());
+    thread.items.push(Item::Thought { id: 90, text: "secret-thought".into(), ts: 0 });
+    thread.items.push(Item::Assistant { id: 91, text: "中间结论：端口是 8080".into(), ts: 0 });
+    thread.items.push(Item::Assistant { id: 92, text: "最终结论：nginx 已重启".into(), ts: 0 });
+    let snippets = |q: &str| search_thread(&thread, q, 5).map(|r| (r.title_hit, r.total, r.hits.into_iter().map(|h| (h.item_id, h.snippet)).collect::<Vec<_>>()));
+    assert_eq!(snippets("deploy"), Some((true, 0, vec![])));
+    let user_id = thread.items[0].id();
+    assert_eq!(snippets("NGINX"), Some((false, 2, vec![(user_id, "帮我看看 nginx 配置".into()), (92, "最终结论：nginx 已重启".into())])));
+    assert_eq!(snippets("8080"), Some((false, 1, vec![(91, "中间结论：端口是 8080".into())])));
+    assert_eq!(search_thread(&thread, "nginx", 1).map(|r| (r.total, r.hits.len())), Some((2, 1)));
+    assert!(snippets("secret").is_none());
+    assert!(snippets("  ").is_none());
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadMeta {
     pub id: String,
     pub title: String,
