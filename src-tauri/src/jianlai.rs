@@ -997,6 +997,38 @@ fn glide_at(from: (i32, i32), to: (i32, i32), bend: f64, t: f64) -> (i32, i32) {
         (u * u * fy + 2.0 * u * s * cy + s * s * to.1 as f64).round() as i32,
     )
 }
+#[cfg(windows)]
+fn bring_to_front(id: u32) {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, ShowWindow, SetForegroundWindow, SW_RESTORE};
+    let hwnd = id as usize as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        if IsIconic(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
+        if SetForegroundWindow(hwnd) == 0 {
+            // Unattended runs start with another app in front; the foreground lock refuses background callers.
+            // Sharing the foreground thread's input queue lifts it without injecting keys.
+            let fg = GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
+            let me = GetCurrentThreadId();
+            if fg != 0 && fg != me && AttachThreadInput(me, fg, 1) != 0 {
+                BringWindowToTop(hwnd);
+                SetForegroundWindow(hwnd);
+                AttachThreadInput(me, fg, 0);
+            }
+        }
+    }
+}
+/// 输入途中前台被通知、弹窗等其他窗口抢走：切回原前台继续，不算中断（只有用户按 Esc 才中断，由 Esc 监听直接停止）。
+/// 切不回来时才停，因为此时按键/点击会落到别的窗口。
+pub(super) fn regain(expected: Option<(u32, u32)>) -> Result<()> {
+    if foreground()? == expected { return Ok(()); }
+    #[cfg(windows)]
+    if let Some((id, _)) = expected {
+        bring_to_front(id);
+        std::thread::sleep(Duration::from_millis(150));
+        if foreground()? == expected { return Ok(()); }
+    }
+    Err("前台被其他窗口占用且切不回原窗口，已暂停后续输入（这不是用户接管）；请重新观察并切回目标窗口后继续".into())
+}
 fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32), expected_foreground: Option<(u32, u32)>) -> Result<()> {
     use rand_core::{OsRng, RngCore};
     let (ms, bend) = (glide_ms(from, to), (OsRng.next_u32() as f64 / u32::MAX as f64 - 0.5) * 0.2);
@@ -1004,7 +1036,7 @@ fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32), expected_foregroun
     loop {
         // Sample by elapsed time, not step count: coarse OS sleep granularity must not stretch the motion.
         let t = (started.elapsed().as_secs_f64() * 1000.0 / ms).min(1.0);
-        if foreground()? != expected_foreground { return Err("轨迹移动期间前台改变，停止输入".into()); }
+        regain(expected_foreground)?;
         let (x, y) = glide_at(from, to, bend, t);
         move_pointer(enigo, x, y, true)?;
         if t >= 1.0 { return Ok(()); }
@@ -1043,7 +1075,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
         let actual=enigo.location().map_err(err)?;
         if !pointer_matches((x,y),actual) {return Err(format!("系统鼠标落点与请求不符（请求{x},{y}，实际{},{}），未按下按钮；请根据新图继续",actual.0,actual.1));}
     }
-    if a.action!="wait" && foreground()?!=expected_foreground {return Err("鼠标移动后前台改变，停止后续输入".into());}
+    if a.action!="wait" { regain(expected_foreground)?; }
     if a.action != "wait" { check_overlay(shot, a, overlay_bounds(shot.desktop_capture))?; }
     match a.action.as_str() {
         "click" => click_button(enigo,button)?,
@@ -1062,7 +1094,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
                 let _=enigo.button(button,Direction::Release);return Err(err(error));
             }
             let moved = if a.glide == Some(true) { glide(enigo, (x, y), (tx, ty), expected_foreground) } else { (1..=12).try_for_each(|i| {
-                if foreground()?!=expected_foreground {return Err("拖动期间前台改变，释放按钮并停止".into());}
+                regain(expected_foreground)?;
                 move_pointer(enigo,
                     (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
                     (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
@@ -1105,7 +1137,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, expected_foreground: Option
             for i in 0..delta.unsigned_abs() {
                 if i > 0 {
                     std::thread::sleep(Duration::from_millis(8));
-                    if foreground()? != expected_foreground {return Err("滚动期间前台改变，停止后续滚动".into());}
+                    regain(expected_foreground)?;
                 }
                 enigo.scroll(delta.signum(), axis).map_err(err)?;
             }
@@ -1254,24 +1286,8 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let _lease = lease_input("jianlai")?;
             #[cfg(windows)]
             {
-                use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-                use windows_sys::Win32::UI::WindowsAndMessaging::{BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, ShowWindow, SetForegroundWindow, SW_RESTORE};
-                let hwnd = id as usize as windows_sys::Win32::Foundation::HWND;
                 *state = None;
-                unsafe {
-                    if IsIconic(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
-                    if SetForegroundWindow(hwnd) == 0 {
-                        // Unattended runs start with another app in front; the foreground lock refuses background callers.
-                        // Sharing the foreground thread's input queue lifts it without injecting keys.
-                        let fg = GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
-                        let me = GetCurrentThreadId();
-                        if fg != 0 && fg != me && AttachThreadInput(me, fg, 1) != 0 {
-                            BringWindowToTop(hwnd);
-                            SetForegroundWindow(hwnd);
-                            AttachThreadInput(me, fg, 0);
-                        }
-                    }
-                }
+                bring_to_front(id);
                 std::thread::sleep(Duration::from_millis(150));
                 if foreground()? != Some((id, target.pid().map_err(err)?)) {
                     return Err("系统未允许激活该窗口；请观察当前桌面，不要重复激活或发送按键".into());

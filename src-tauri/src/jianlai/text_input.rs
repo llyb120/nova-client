@@ -223,7 +223,8 @@ fn modifiers_released() -> Result<()> {
     } else { Ok(()) }
 }
 fn focus(expected: Option<(u32, u32)>) -> Result<HWND> {
-    if expected.is_none() || super::foreground()? != expected { return Err("前台窗口已改变，停止输入".into()); }
+    if expected.is_none() { return Err("无法确认前台窗口，停止输入".into()); }
+    super::regain(expected)?;
     let thread = unsafe { GetWindowThreadProcessId(GetForegroundWindow(), null_mut()) };
     let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
