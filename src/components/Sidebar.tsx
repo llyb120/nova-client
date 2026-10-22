@@ -641,12 +641,12 @@ export function Sidebar(props: {
           <span class="brand-spacer" />
           <Show when={state.relay.enabled}>
             <div class="relay-badge-wrap">
-              <span class={`head-badge relay ${state.relay.connected ? "on" : "off"}`}>
+              <button type="button" aria-label="在线成员" class={`head-badge relay ${state.relay.connected ? "on" : "off"}`}>
                 <IconBroadcast size={14} />
                 <Show when={state.relay.connected && onlineCount() > 0}>
                   <span class="relay-count">{onlineCount()}</span>
                 </Show>
-              </span>
+              </button>
               <div class="relay-pop">
                 <Show
                   when={state.relay.connected}
@@ -660,15 +660,21 @@ export function Sidebar(props: {
                     fallback={<div class="relay-pop-empty">暂无在线成员</div>}
                   >
                     <For each={onlinePeers()}>
-                      {(p) => (
-                        <div class="relay-pop-peer" title={p.name}>
-                          <span class="relay-pop-dot" />
-                          <span class="relay-pop-name">{p.name}</span>
-                          <Show when={p.token === myToken()}>
-                            <span class="relay-pop-me">我</span>
-                          </Show>
-                        </div>
-                      )}
+                      {(p) => {
+                        const peerVersion = () => (p.token === myToken() ? version() || p.version : p.version)?.trim();
+                        return (
+                          <div class="relay-pop-peer" title={p.name}>
+                            <span class="relay-pop-dot" />
+                            <span class="relay-pop-name">{p.name}</span>
+                            <Show when={p.token === myToken()}>
+                              <span class="relay-pop-me">我</span>
+                            </Show>
+                            <span class="relay-pop-version" title={peerVersion() ? `v${peerVersion()}` : "该客户端尚未上报版本"}>
+                              {peerVersion() ? `v${peerVersion()}` : "未上报"}
+                            </span>
+                          </div>
+                        );
+                      }}
                     </For>
                   </Show>
                 </Show>

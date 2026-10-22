@@ -455,6 +455,7 @@ impl RelayManager {
             .header("X-Relay-Name-Encoded", urlencode(name))
             .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
             .header("X-Relay-Device", &self.device_id)
+            .header("X-Relay-Version", self.app.package_info().version.to_string())
             .header("Accept", "text/event-stream")
             .header("Accept-Encoding", "identity")
             .header("X-Nova-SSE-Topics", "relay,remote")

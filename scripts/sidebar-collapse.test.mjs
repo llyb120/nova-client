@@ -18,23 +18,57 @@ try {
       onOpenAchievements={() => {}} onOpenUpdate={() => {}} onOpenInbox={() => {}} />
       <main style={{ flex: 1 }}><button id="content">主区域</button></main></div>, document.getElementById('root'));
   `);
-  server = await createServer({ server: { host: '127.0.0.1', port: 5199, strictPort: false } });
+  server = await createServer({ optimizeDeps: { entries: [`${name}.html`] }, server: { host: '127.0.0.1', port: 5199, strictPort: false } });
   await server.listen();
   browser = await chromium.launch({ channel: 'msedge', headless: true });
   const page = await browser.newPage({ viewport: { width: 1300, height: 800 } });
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.addInitScript(() => {
-    window.__TAURI_INTERNALS__ = { invoke: async command => command === 'plugin:app|version' ? 'test' : null };
+    window.__TAURI_INTERNALS__ = { invoke: async command => command === 'plugin:app|version' ? '0.1.624' : null };
   });
   await page.goto(`${server.resolvedUrls.local[0]}${name}.html`, { waitUntil: 'domcontentloaded', timeout: 90000 });
   const sidebar = page.locator('#main-sidebar');
-  const headToggle = page.locator('.sidebar-head-toggle');
+  const headToggle = page.locator('.sidebar-head-toggle[aria-controls="main-sidebar"]');
   const railPin = page.locator('.sidebar-rail-pin');
   await sidebar.waitFor({ state: 'visible' });
   const contentLeft = () => page.locator('main').evaluate(el => el.getBoundingClientRect().left);
   const pinnedLeft = await contentLeft();
   assert.ok(pinnedLeft >= 248);
+  await page.evaluate(() => {
+    window.setSidebarState('settings', { relayToken: 'me' });
+    window.setSidebarState('relay', { enabled: true, connected: true });
+    window.setSidebarState('peers', [
+      { token: 'teammate', name: 'a.long.teammate.name.to.check.ellipsis', online: true, version: '0.1.623' },
+      { token: 'me', name: 'bin.ge', online: true, version: '0.1.1' },
+      { token: 'legacy', name: 'legacy', online: true },
+      { token: 'offline', name: 'offline', online: false, version: '0.1.622' },
+    ]);
+  });
+  const relay = page.getByRole('button', { name: '在线成员', exact: true });
+  const popup = page.locator('.relay-pop');
+  const checkPopup = async () => {
+    await relay.hover();
+    await popup.waitFor({ state: 'visible' });
+    const badge = await relay.boundingBox(), box = await popup.boundingBox();
+    assert.ok(Math.abs(box.x - badge.x) < 1 && box.y >= badge.y + badge.height,
+      'online members open below the badge and extend to the right');
+    assert.ok(box.x >= 0 && box.x + box.width <= page.viewportSize().width,
+      'online members remain inside the window');
+    await popup.hover();
+    assert.equal(await popup.isVisible(), true, 'moving into the popup keeps it open');
+  };
+  await checkPopup();
+  assert.equal(await popup.locator('.relay-pop-peer').count(), 3);
+  assert.deepEqual(await popup.locator('.relay-pop-version').allTextContents(), ['v0.1.624', 'v0.1.623', '未上报']);
+  assert.equal(await popup.locator('.relay-pop-peer').first().locator('.relay-pop-me').textContent(), '我');
+  assert.ok(await popup.locator('.relay-pop-name').nth(1).evaluate(el => el.scrollWidth > el.clientWidth),
+    'long names truncate without squeezing the version');
+  if (process.env.SIDEBAR_SCREENSHOT) await page.screenshot({ path: process.env.SIDEBAR_SCREENSHOT });
+  await page.mouse.move(600, 300);
+  await popup.waitFor({ state: 'hidden' });
+  await relay.focus();
+  await popup.waitFor({ state: 'visible' });
   await headToggle.click();
   await sidebar.waitFor({ state: 'hidden' });
   assert.equal(await contentLeft(), 52, 'collapsed sidebar keeps only the compact icon rail');
@@ -92,6 +126,7 @@ try {
   await page.mouse.move(51, 300);
   await sidebar.waitFor({ state: 'visible' });
   assert.equal(await contentLeft(), 52, 'hover expansion overlays without shifting content');
+  await checkPopup();
   await page.mouse.move(120, 300);
   assert.equal(await sidebar.isVisible(), true, 'moving into the sidebar keeps it open');
   await page.mouse.move(600, 300);

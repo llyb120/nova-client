@@ -587,6 +587,8 @@ export interface Peer {
   token: string;
   name: string;
   online: boolean;
+  /** 客户端版本；旧客户端或旧中转站可能未上报。 */
+  version?: string;
   /** 中转站返回的归属群组；旧服务端可能缺省。 */
   groups?: string[];
   folders: RoamingFolder[];
