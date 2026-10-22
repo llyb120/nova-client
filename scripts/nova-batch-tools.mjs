@@ -46,7 +46,6 @@ export function normalizePolarisArgs(params = {}) {
  * @param {{ readOnly?: boolean, fastContext?: boolean, toolEnv?: Record<string, string> }} [options]
  */
 export function createNovaBatchTools(cwd, options = {}) {
-  const owner = randomUUID();
   const fastContext = fastContextEnabled(options);
   const readOnly = readOnlyEnabled(options);
   let root = resolve(cwd);
@@ -54,6 +53,8 @@ export function createNovaBatchTools(cwd, options = {}) {
   // 存在模型不同的场景时可按场景转交。
   const env = (name) => String(options.toolEnv?.[name] ?? process.env[name] ?? "");
   const threadId = env("NOVA_THREAD_ID");
+  // 已知会话时以它为 owner：Nova 据此认出数字员工任务的桌面操作与待确认来源。
+  const owner = threadId ? `thread:${threadId}` : randomUUID();
   const desktop = env("NOVA_DESKTOP") !== "0";
 
   /** @type {Record<string, { description: string, inputSchema: object, execute: (args: any) => Promise<string> }>} */
@@ -72,7 +73,7 @@ export function createNovaBatchTools(cwd, options = {}) {
       }
     }
     tools.employee = { ...employeeTool,
-      execute: async params => JSON.stringify(await callGlobalContextTool("employee", root, params)),
+      execute: async params => JSON.stringify(await callGlobalContextTool("employee", root, params, owner)),
     };
     // 非自动模式保持原工具顺序（jianlai、employee、chrome）。
     if (desktop) {

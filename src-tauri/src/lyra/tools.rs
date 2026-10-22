@@ -615,7 +615,7 @@ async fn execute_inner(
         }
         "employee" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，员工工具不可用"); }
-            match crate::employee::execute_tool(args) {
+            match crate::employee::execute_tool(args, owner) {
                 Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
                 Err(error) => ToolOutcome::error(error),
             }

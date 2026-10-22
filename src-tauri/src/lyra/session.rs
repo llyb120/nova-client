@@ -477,7 +477,13 @@ async fn run_scene_turn(app: &tauri::AppHandle, thread_id: &str, text: &str, can
     let state = app.state::<crate::AppState>();
     let before = state.store.lock().unwrap().get(thread_id).map_or(0, |t| t.items.len());
     if cancelled.load(Ordering::SeqCst) { return Ok(None); }
-    crate::dispatch_scene_prompt(app, thread_id.to_string(), text.to_string(), Vec::new())?;
+    // 数字员工的剑来会话是单独的电脑任务：排到桌面（必要时先问用户）才起跑，这一轮结束即让出。
+    let _desktop = match crate::employee::acquire_desktop(app, thread_id, cancelled).await {
+        Ok(lease) => lease,
+        Err(reason) => return Ok(Some(reason)),
+    };
+    let text = _desktop.as_ref().map_or_else(|| text.to_string(), |lease| format!("{}{text}", lease.note()));
+    crate::dispatch_scene_prompt(app, thread_id.to_string(), text, Vec::new())?;
     let started = Instant::now();
     let mut seen_running = false;
     loop {

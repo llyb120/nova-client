@@ -1642,6 +1642,12 @@ fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashM
 pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
     let thread_id = tool_owner(root, owner)?;
     let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
+    // 浏览器与桌面共用一块屏幕：数字员工任务同样排队、询问。
+    if !crate::tool_experience::is_operation(args) {
+        // 只读的查看标签/页面放行；会改变浏览器画面的操作前才征得用户同意。
+        let input = !matches!(args["operation"].as_str(), Some("tabs" | "inspect" | "screenshot" | "status" | "connect" | "downloads"));
+        crate::employee::claim_desktop(owner, input).await?;
+    }
     let (args, inferred) = infer_operation(args, "tabTag");
     let args = &args;
     let normalized = chrome_args(args, &thread_id, &app.state::<BrowserState>().observations.lock().unwrap())?;

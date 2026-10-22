@@ -88,7 +88,9 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     args: Value,
 ) -> Result<Value, String> {
     static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let owner = OWNER.get_or_init(|| uuid::Uuid::new_v4().to_string());
+    // 自动模式注入了会话 id 时以它为 owner，Nova 据此认出数字员工任务的桌面操作。
+    let owner = OWNER.get_or_init(|| std::env::var("NOVA_THREAD_ID").ok().filter(|id| !id.is_empty())
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), |id| format!("thread:{id}")));
     let message = json!({"token":config.token,"method":name,"root":config.root,"owner":owner,"params":args});
     stream
         .write_all(format!("{message}\n").as_bytes())

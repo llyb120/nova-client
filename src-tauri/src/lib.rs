@@ -330,7 +330,7 @@ fn scope_of(
 }
 
 pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope> {
-    let (scene, current, upstream) = {
+    let (scene, current, upstream, employee) = {
         let store = state.store.lock().unwrap();
         let thread = store.get(thread_id)?;
         let scene = thread.auto_scene.as_deref().and_then(settings::Scene::parse)?;
@@ -341,9 +341,18 @@ pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope>
             upstream.push(parent_scene);
             source = parent.stage_source_thread_id.clone();
         }
-        (scene, (thread.agent_kind.clone(), thread.model.clone().unwrap_or_default()), upstream)
+        (scene, (thread.agent_kind.clone(), thread.model.clone().unwrap_or_default()), upstream, thread.employee_thread)
     };
-    Some(scope_of(scene, &current, &upstream, |s| state.scene_model(s).ok()))
+    let mut scope = scope_of(scene, &current, &upstream, |s| state.scene_model(s).ok());
+    // 数字员工：操作电脑永远是单独的剑来会话（即使同一模型），由员工调度排队占用桌面。
+    let computer = settings::Scene::Computer;
+    if employee && scene != computer {
+        scope.covered.retain(|s| *s != computer);
+        if !upstream.contains(&computer) && !scope.handoff.contains(&computer) && state.scene_model(computer).is_ok() {
+            scope.handoff.push(computer);
+        }
+    }
+    Some(scope)
 }
 
 /// 自动模式会话首条消息的隐式说明：哪些场景可转交、主会话还附项目目录清单。无可转交场景时为 None。
@@ -450,12 +459,12 @@ pub(crate) fn create_scene_stage(
             return Err(format!("「{}」是上游会话的场景，不能转回；请在本会话完成后把结论交回", scene.label()));
         }
     }
-    let (cwd, worktree) = {
+    let (cwd, worktree, employee) = {
         let store = state.store.lock().unwrap();
         let parent = store.get(parent_id).ok_or("父会话不存在")?;
         // 指定项目目录时不沿用父会话的 worktree。
         let worktree = if cwd_override.is_some() { None } else { parent.worktree.clone() };
-        (cwd_override.map_or_else(|| parent.cwd.clone(), str::to_string), worktree)
+        (cwd_override.map_or_else(|| parent.cwd.clone(), str::to_string), worktree, parent.employee_thread)
     };
     // attempt 为失效切换序号：按场景列表顺序取下一个可用模型。
     let (scene_kind, scene_model) = match state.scene_models(scene).into_iter().nth(attempt) {
@@ -465,6 +474,8 @@ pub(crate) fn create_scene_stage(
     };
     let mut thread = Thread::new(cwd, scene_kind, Some(scene_model).filter(|m| !m.is_empty()), Some("build".into()), None, false);
     thread.worktree = worktree;
+    // 数字员工的场景子会话同样不进普通列表。
+    thread.employee_thread = employee;
     thread.parent_thread_id = Some(parent_id.into());
     thread.stage_source_thread_id = Some(parent_id.into());
     thread.auto_scene = Some(scene.key().into());
@@ -4519,6 +4530,7 @@ async fn cancel_single_turn(
 
 #[tauri::command]
 async fn respond_permission(
+    window: tauri::Window,
     state: State<'_, AppState>,
     request_key: String,
     option_id: String,
@@ -4529,6 +4541,11 @@ async fn respond_permission(
         .guest_respond_permission(&request_key, &option_id)
     {
         return Ok(());
+    }
+    if request_key.starts_with("employee-") {
+        // 排查“没点却被拒绝”：记下是哪个窗口、选了什么。
+        eprintln!("[employee] 接管询问 {request_key} 收到回应「{option_id}」，来自窗口 {}", window.label());
+        return employee::respond_takeover(&request_key, &option_id);
     }
     if state.workbuddy.has_pending_permission(&request_key) {
         state.workbuddy.respond_permission(&request_key, &option_id).await

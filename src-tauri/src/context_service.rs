@@ -150,7 +150,7 @@ fn dispatch(
         return tauri::async_runtime::block_on(crate::lyra::session::call_for_thread(app, thread_id, name, &params["args"]));
     }
     if request.method == "employee" {
-        return crate::employee::execute_tool(&params);
+        return crate::employee::execute_tool(&params, &request.owner);
     }
     if request.method == "chrome" {
         return tauri::async_runtime::block_on(crate::native_browser::execute_chrome(root, &params, &request.owner));

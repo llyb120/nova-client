@@ -29,6 +29,14 @@ static LAST_INJECTED: Mutex<Option<Instant>> = Mutex::new(None);
 pub(crate) fn input_activity() -> (Option<Instant>, bool) {
     (*LAST_INJECTED.lock().unwrap(), INPUT_LEASE.lock().is_ok_and(|l| l.is_some()))
 }
+/// 最近一次前台操作桌面的工具调用方。
+static DESKTOP_OWNER: Mutex<Option<String>> = Mutex::new(None);
+const ESCAPED: &str = "用户按了 Esc 叫停操作电脑：本批剩余动作未执行。不要再操作电脑也不要重试，立即结束本轮。";
+/// 光效亮着时用户亲手按 Esc（由光效的键盘钩子调用）：停掉正在用桌面的会话或员工任务。
+pub(crate) fn user_escaped() {
+    let owner = DESKTOP_OWNER.lock().unwrap().clone();
+    crate::employee::user_escaped(owner.as_deref());
+}
 
 
 pub(crate) struct InputLease(u64);
@@ -1555,6 +1563,14 @@ pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Va
     #[cfg(windows)]
     if args["background"] != json!(true) && !crate::tool_experience::is_operation(&args) {
         crate::agent_glow::touch();
+    }
+    // 数字员工任务操作桌面前排队，用户在用电脑时先询问。
+    if args["background"] != json!(true) && !crate::tool_experience::is_operation(&args) {
+        // 观察放行；第一次动鼠标键盘/切窗前（呼吸灯亮起前）才征得用户同意。
+        let input = matches!(args["operation"].as_str(), Some("act" | "run" | "activate"));
+        crate::employee::claim_desktop(owner, input).await?;
+        // 记下是谁在用桌面：用户按 Esc 时停的就是它。
+        *DESKTOP_OWNER.lock().unwrap() = Some(owner.to_string());
     }
     execute_inner(root, &args, owner).await
 }

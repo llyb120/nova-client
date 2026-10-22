@@ -1,18 +1,21 @@
 {
   "name": "employee",
-  "description": "Nova 数字员工的职责与待办。用户在任何会话里说“交给员工：xxx”时，调用 add(kind=todo,text=xxx) 记下后告知用户已交给员工，不要自己去做。list 查看职责/待办/最近运行/场景 scenes（预设场景名及适用条件），动态职责的 nextCheckAt 为下次检查的 UTC 毫秒时间戳；add 新增职责(kind=duty)或待办(kind=todo)；“隔一段时间”“每隔几分钟”等未指定数字的职责用动态调度（everyMinutes=0），每轮先判断执行条件，再用 nextCheckInMinutes 根据结果安排下次检查，可逐轮调快调慢；用户明确指定每隔 N 分钟/小时则用 everyMinutes 固定间隔，不得擅自调整；update 修改职责 text/enabled/everyMinutes/nextCheckInMinutes 或覆盖写 note（≤1KB，员工自己的备忘），修改 text 会清空旧备注、时间计划和固定间隔，需要保留或改设固定间隔时同次提供 everyMinutes；done 删除已处理的待办/待确认，或移除职责；stage 仅在员工执行任务时可用：按 profile 选场景，用该场景的模型直接开新会话（能看到本会话上下文）去做 text 描述的事，模型与当前会话相同时不要用，直接自己做；ask 把没有明确授权的不可逆操作（支付、删除、对外发送、提交审批等）记为待确认并通知用户，然后停止该操作。只能通过本工具修改员工数据。",
+  "description": "Nova 数字员工的职责、任务（待办）与长期记忆。职责只是触发的依据：做什么 + 何时触发，归用户所有；每次触发生成一条独立任务，续做、让出、重试都在任务上。员工是触发制的：每件事只在安排好的时间触发，触发时直接干活，没有会话去轮询“要不要做”。用户在任何会话里说“交给员工：xxx”时，调用 add(kind=todo,text=xxx) 记下后告知用户已交给员工，不要自己去做。list 查看当前时间 now、职责/任务与待确认 inbox/最近运行/记得最牢的 30 条记忆 memories（总数 memoryCount）/场景 scenes；add 新增职责(kind=duty)或待办(kind=todo)：职责的触发规则三选一——每天固定时刻给 times，用户明确“每隔 N 分钟/小时”给 everyMinutes（立即开始，之后距上次完成按间隔触发），条件型或时间不固定的为动态职责，用 nextAt 或 nextCheckInMinutes 安排首次执行；note 写用户对这条职责的细化要求，每次执行都会带上；待办默认立即处理，执行完自动移除，以后某时才做的给 nextAt；update 修改职责 text/note/profile/enabled/times/everyMinutes，或给动态职责 nextAt/nextCheckInMinutes；update 用户待办只能用 nextAt/nextCheckInMinutes 改期；done 删除待办/待确认，或移除职责；ask 把没有明确授权的不可逆操作（支付、删除、对外发送、提交审批等）记为待确认并通知用户，然后停止该操作；remember 记下跨任务有用的稳定信息（一条一事，≤200 字）：写前对照已有记忆，同一件事带 id 覆盖更新、新事实取代旧事实时覆盖或 forget 旧的、已记着的不重复写；forget 按 id 删除过时记忆。记忆会遗忘：长期没被任务用到的会变淡并自动删除，被用得越多越牢；每次任务只带上最相关的几条。权限：员工执行任务的会话只能 list/ask/remember/forget、add 待办，以及给自己所属的动态职责安排下次（nextAt/nextCheckInMinutes）或 enabled=false 停用；职责内容、备注和固定规则只有用户能改。",
   "inputSchema": {
     "type": "object",
     "properties": {
-      "action": { "type": "string", "enum": ["list", "add", "update", "done", "ask", "stage"] },
+      "action": { "type": "string", "enum": ["list", "add", "update", "done", "ask", "remember", "forget"] },
       "kind": { "type": "string", "enum": ["duty", "todo"], "description": "add 必填" },
-      "id": { "type": "string", "description": "update/done 的目标 id（来自 list）" },
-      "text": { "type": "string", "minLength": 1, "maxLength": 500, "description": "add/ask/stage 必填；update 可选" },
-      "note": { "type": "string", "maxLength": 1024, "description": "update 可选，覆盖写职责备注" },
-      "profile": { "type": "string", "description": "stage 必填，add/update 可选：场景名（轻量化/编码/剑来，见 list 的 scenes），该待办/职责会用该场景的模型开新会话；省略为轻量化。员工执行中事项符合某个场景时用 stage 直接交给它，不要记待办" },
-      "enabled": { "type": "boolean", "description": "update 可选，启用/停用职责" },
-      "everyMinutes": { "type": "integer", "minimum": 0, "maximum": 10080, "description": "职责 add/update 可选：大于 0 为固定间隔（距上次结束的分钟数），仅用于用户明确指定的频率；0 为动态调度（默认），员工每轮安排下次检查" },
-      "nextCheckInMinutes": { "type": "integer", "minimum": 1, "maximum": 10080, "description": "动态职责 add/update 可选：从本次调用起多少分钟后再检查；每轮根据职责时间要求和执行结果安排，即使本轮条件不满足也要安排。仅适用于 everyMinutes=0，不能与固定间隔同时设置" }
+      "id": { "type": "string", "description": "update/done/forget 的目标 id（来自 list）；remember 带 id 时覆盖该条记忆" },
+      "importance": { "type": "integer", "minimum": 1, "maximum": 3, "description": "remember 可选：1 普通（默认，约两周不用即淡忘）/ 2 重要（忘得慢一倍）/ 3 用户明确要求长期记住（不会自动遗忘）" },
+      "text": { "type": "string", "minLength": 1, "maxLength": 500, "description": "add/ask/remember 必填（记忆 ≤200 字）；update 可选" },
+      "note": { "type": "string", "maxLength": 1024, "description": "职责 add/update 可选：用户对这条职责的细化要求，每次执行都会带上；空串清除" },
+      "profile": { "type": "string", "description": "add/update 可选：开局场景名（轻量化/编码，见 list 的 scenes）；省略为轻量化。需要操作电脑的部分总会交给剑来场景会话排队执行" },
+      "enabled": { "type": "boolean", "description": "update 可选，启用/停用职责；停用会撤掉它还没开始的任务" },
+      "times": { "type": "array", "items": { "type": "string" }, "description": "职责 add/update 可选：每天触发的本地时刻 HH:MM 列表，如 [\"09:00\",\"14:30\"]；与 everyMinutes 二选一，空数组取消" },
+      "everyMinutes": { "type": "integer", "minimum": 0, "maximum": 10080, "description": "职责 add/update 可选：大于 0 为用户明确指定的固定间隔（距上次任务完成的分钟数）；0 取消" },
+      "nextAt": { "type": "string", "description": "下次执行的本地时间，格式 YYYY-MM-DD HH:MM，须晚于现在。用于动态职责（无 times/everyMinutes）安排下一次，以及待办定时/改期" },
+      "nextCheckInMinutes": { "type": "integer", "minimum": 1, "maximum": 10080, "description": "从现在起多少分钟后执行，nextAt 的相对写法；只用于动态职责与待办" }
     },
     "required": ["action"],
     "additionalProperties": false
