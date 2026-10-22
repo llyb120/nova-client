@@ -165,6 +165,13 @@ pub(super) fn start(app: tauri::AppHandle) {
     }
 }
 
+/// 主动弹出气泡时的锚点；蝴蝶未显示时为 None。
+pub(super) fn chip_anchor() -> Option<super::bubble::Anchor> {
+    let hwnd = WINDOW.load(Ordering::Acquire) as HWND;
+    if hwnd.is_null() || unsafe { IsWindowVisible(hwnd) } == 0 { return None; }
+    unsafe { anchor(hwnd) }
+}
+
 pub(super) fn wake() {
     let thread = THREAD.load(Ordering::Acquire);
     if thread != 0 { unsafe { PostThreadMessageW(thread, REFRESH, 0, 0); } }

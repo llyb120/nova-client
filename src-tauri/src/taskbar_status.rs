@@ -8,6 +8,8 @@ mod drop_target;
 #[cfg(windows)]
 mod bubble;
 #[cfg(windows)]
+mod ask;
+#[cfg(windows)]
 mod windows;
 
 /// Bubble data: the live card and pending confirmations (null when the Butterfly is off).
@@ -71,6 +73,24 @@ pub(crate) fn taskbar_bubble_open(app: tauri::AppHandle, thread_id: Option<Strin
     let _ = (app, thread_id);
 }
 
+/// 待确认小气泡的数据。
+#[tauri::command]
+pub(crate) fn taskbar_ask(app: tauri::AppHandle) -> serde_json::Value {
+    #[cfg(windows)]
+    return ask::payload(&app);
+    #[cfg(not(windows))]
+    { let _ = app; serde_json::Value::Null }
+}
+
+/// 待确认小气泡报告渲染高度，按蝴蝶位置显示。
+#[tauri::command]
+pub(crate) fn taskbar_ask_place(app: tauri::AppHandle, height: f64) -> bool {
+    #[cfg(windows)]
+    return ask::place(&app, height);
+    #[cfg(not(windows))]
+    { let _ = (app, height); false }
+}
+
 /// Butterfly 面板「星海」标签的操作（剑谱录制、知识图谱）。
 #[tauri::command]
 pub(crate) async fn taskbar_quick(app: tauri::AppHandle, action: String) -> Result<serde_json::Value, String> {
@@ -94,6 +114,13 @@ pub(crate) fn start(app: &tauri::AppHandle) {
     #[cfg(windows)]
     if !crate::server::is_headless() {
         windows::start(app.clone());
+        // 待确认直接在蝴蝶上方弹出，不用用户点过去看。
+        use tauri::Listener;
+        app.listen(crate::acp::EV_PERMISSION, |event| {
+            // 数字员工的接管询问只有气泡这一个入口（员工会话不在主窗口列表里），总是弹。
+            let always = event.payload().contains("\"employee-");
+            windows::on_app(move |app| ask::alert(app, always));
+        });
     }
     #[cfg(not(windows))]
     let _ = app;

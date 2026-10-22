@@ -269,7 +269,7 @@ pub(super) fn place(app: &AppHandle, css_height: f64) -> bool {
     let Some(window) = app.get_webview_window(LABEL) else { return false };
     let Ok(hwnd) = window.hwnd() else { return false };
     let hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
-    let (x, y, width, height) = frame(anchor, css_height);
+    let (x, y, width, height) = frame(anchor, WIDTH, css_height);
     // Not tauri's set_size/set_position: tao re-shows with activation on each resize.
     unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE); }
     let wanted = WANTED.load(Ordering::Acquire);
@@ -524,15 +524,15 @@ mod tests {
     fn bubble_hugs_the_taskbar_edge_and_stays_on_the_chip_monitor() {
         let work = Rect { left: -1920, top: 0, right: 0, bottom: 1032 };
         let chip = Rect { left: -60, top: 1040, right: -10, bottom: 1068 };
-        let (x, y, w, h) = frame(Anchor { chip, work, scale: 1.0 }, 300.0);
+        let (x, y, w, h) = frame(Anchor { chip, work, scale: 1.0 }, WIDTH, 300.0);
         assert_eq!((w, h, y + h), (560, 300, 1032), "bottom taskbar: above the work area edge");
         assert_eq!(x + w, -8, "clamped inside the right edge");
         let top = Anchor { chip: Rect { left: -1000, top: 6, right: -800, bottom: 34 }, work: Rect { top: 40, ..work }, scale: 1.5 };
-        let (x, y, w, h) = frame(top, 5000.0);
+        let (x, y, w, h) = frame(top, WIDTH, 5000.0);
         assert_eq!((y, w), (40, 840), "top taskbar: below it, scaled");
         assert!(h <= 1032 - 40 && x == -900 - w / 2);
         let narrow = Anchor { work: Rect { left: 0, top: 0, right: 480, bottom: 400 }, chip: Rect { left: 420, top: 400, right: 470, bottom: 430 }, scale: 1.0 };
-        let (x, y, w, h) = frame(narrow, 640.0);
+        let (x, y, w, h) = frame(narrow, WIDTH, 640.0);
         assert_eq!((x, w, h), (8, 464, 392));
         assert!(y >= narrow.work.top && y + h <= narrow.work.bottom);
     }

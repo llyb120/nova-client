@@ -561,3 +561,33 @@ export default function TaskbarBubble() {
     </div>
   );
 }
+
+/** 待确认小气泡（`?ask=1`）：只有要确认的事，弹在蝴蝶上方；作答后由原生端在全部处理完时收起。 */
+export function TaskbarAsk() {
+  const [permissions, setPermissions] = createSignal<Permission[]>([]);
+  let shell!: HTMLDivElement;
+  const place = () => void invoke("taskbar_ask_place", { height: shell.getBoundingClientRect().height }).catch(() => {});
+  const load = async () => {
+    const next = await invoke<{ permissions: Permission[]; light: boolean } | null>("taskbar_ask").catch(() => null);
+    if (!next) return;
+    document.documentElement.classList.toggle("light", next.light);
+    // 只在待确认集合变化时重建，保留正在填写的回答。
+    const keys = (list: Permission[]) => list.map((p) => p.requestKey).join("\n");
+    if (keys(next.permissions) !== keys(permissions())) setPermissions(next.permissions);
+    await new Promise(requestAnimationFrame);
+    place();
+  };
+  onMount(() => {
+    const observer = new ResizeObserver(place);
+    observer.observe(shell);
+    const off = listen("taskbar-ask:refresh", () => void load());
+    const timer = window.setInterval(() => void load(), 1000);
+    void load();
+    onCleanup(() => { observer.disconnect(); clearInterval(timer); void off.then((f) => f()); });
+  });
+  return (
+    <div class="tb-ask-shell" ref={shell}>
+      <For each={permissions()}>{(req) => <div class="tb-card waiting"><Ask req={req} onDone={() => void load()} /></div>}</For>
+    </div>
+  );
+}

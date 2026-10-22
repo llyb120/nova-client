@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "taskbar-bubble",
   "description": "Taskbar island bubble reloads when it is reopened or hidden",
-  "webviews": ["taskbar-bubble"],
+  "webviews": ["taskbar-bubble", "taskbar-ask"],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten"

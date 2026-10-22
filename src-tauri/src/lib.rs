@@ -5983,6 +5983,8 @@ pub fn run() {
             taskbar_status::assistant::taskbar_assistant_sessions,
             taskbar_status::taskbar_bubble,
             taskbar_status::taskbar_bubble_place,
+            taskbar_status::taskbar_ask,
+            taskbar_status::taskbar_ask_place,
             taskbar_status::taskbar_bubble_hide,
             taskbar_status::taskbar_bubble_activate,
             taskbar_status::taskbar_bubble_open,

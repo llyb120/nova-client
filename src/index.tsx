@@ -10,6 +10,11 @@ if (new URLSearchParams(window.location.search).get("meteor") === "1") {
   document.documentElement.classList.add("bubble-mode");
   const { default: TaskbarBubble } = await import("./components/TaskbarBubble");
   render(() => <TaskbarBubble />, document.getElementById("root")!);
+} else if (new URLSearchParams(window.location.search).get("ask") === "1") {
+  // 待确认小气泡：与蝴蝶面板同样的轻量隔离，只渲染要确认的事。
+  document.documentElement.classList.add("bubble-mode");
+  const { TaskbarAsk } = await import("./components/TaskbarBubble");
+  render(() => <TaskbarAsk />, document.getElementById("root")!);
 } else if (new URLSearchParams(window.location.search).has("miniapp")) {
   // A runtime renders only its app; never mount Nova's shell or prompt queues twice.
   const appId = new URLSearchParams(window.location.search).get("miniapp") || "invalid";

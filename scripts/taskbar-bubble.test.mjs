@@ -77,7 +77,7 @@ await replyCheck('existing', false);
 await replyCheck(null, true);
 // A completed reply may have exactly the same height as its streaming preview.
 // Every successful refresh must acknowledge the rendered card, not only a resize or close.
-const load = find('src/components/TaskbarBubble.tsx', n => ts.isVariableDeclaration(n) && n.name.getText() === 'load');
+const load = find('src/components/TaskbarBubble.tsx', n => ts.isVariableDeclaration(n) && n.name.getText() === 'load' && n.initializer?.getText().includes('"taskbar_bubble"'));
 const loadExpression = load.slice(load.indexOf('=') + 1);
 const rendered = [];
 let hasCard = true, panel = true, tab, active, focusRequest = 0;
