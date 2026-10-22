@@ -6981,15 +6981,6 @@ button:focus-visible {
 }
 .lyra-overview .lyra-heading h3 { font-size: 22px; }
 .lyra-heading p { margin: 5px 0 0; }
-.lyra-default-model {
-  padding: 18px 20px;
-  background: var(--accent-dim);
-  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
-  border-radius: var(--r-md);
-  margin-bottom: 8px;
-}
-.lyra-default-model .field-label { font-size: 14px; }
-.lyra-default-model select { margin-top: 5px; }
 .lyra-add-provider { width: 162px; max-width: 100%; }
 .lyra-provider {
   min-width: 0;
@@ -7109,7 +7100,6 @@ button:focus-visible {
   .lyra-provider > summary { padding: 14px; }
   .lyra-provider-body { padding: 14px; }
   .lyra-provider-meta { display: none; }
-  .lyra-default-model { padding: 16px; }
   .lyra-fetch { grid-template-columns: minmax(0, 1fr); }
   .lyra-fetch > .btn { justify-self: start; }
   .lyra-overview .backend-proxy-field { grid-template-columns: minmax(0, 1fr); }

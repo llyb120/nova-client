@@ -7,8 +7,6 @@ import {
   configFromDraft,
   draftFromConfig,
   hasVariants,
-  passesFilter,
-  isObject,
   isLocalPreset,
   modelDraft,
   providerDraft,
@@ -135,7 +133,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
     setDirty(false);
   });
 
-  // 「获取模型」结果，按 provider ID 记录；只用于展示和默认模型候选，模型本身由后端缓存合并。
+  // 「获取模型」结果，按 provider ID 记录；只用于展示，模型本身由后端缓存合并。
   const [fetched, setFetched] = createStore<Record<string, { busy?: boolean; error?: string; models?: Record<string, any> }>>({});
   const fetchModels = async (p: ProviderDraft) => {
     const id = p.id.trim();
@@ -150,19 +148,6 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
     }
   };
 
-  const modelChoices = () =>
-    draft.providers.flatMap((p) => {
-      const models = [
-        ...Object.entries(fetched[p.id]?.models ?? {}).filter(([mid]) => !p.models.some((m) => m.id === mid)),
-        ...p.models.map((m) => [m.id, m.raw] as const),
-      ];
-      return models.filter(([mid, raw]) => passesFilter(p, mid, raw?.name)).flatMap(([mid, raw]) => {
-        const base = `${p.id}/${mid}`;
-        const variants = isObject(raw?.variants) ? Object.keys(raw.variants) : [];
-        return [base, ...variants.map((v) => `${base}/variant/${v}`)];
-      });
-    });
-
   const addProvider = (presetId: string) => {
     let id = presetId === "openai-compatible" ? "" : presetId;
     for (let n = 2; id && draft.providers.some((p) => p.id === id); n++) id = `${presetId}-${n}`;
@@ -174,9 +159,6 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
       el?.querySelector<HTMLElement>("input:not([type=checkbox])")?.focus({ preventScroll: true });
     });
   };
-
-  // 预设 provider 的模型自动拉取，界面里看不到，选中的默认模型不应标为不存在。
-  const fetchedModel = (value: string) => draft.providers.some((p) => p.preset && value.startsWith(`${p.id}/`));
 
   const removeProvider = async (index: number) => {
     const p = draft.providers[index];
@@ -191,22 +173,10 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
         <span class="field-hint lyra-error" role="alert">{error()}</span>
       </Show>
       <Show when={loaded()}>
-        <label class="field lyra-default-model">
-          <span class="field-label">默认模型</span>
-          <span class="field-hint">新会话默认使用此模型，也可以在会话中切换。</span>
-          <select class="field-input" onChange={(e) => edit((d) => void (d.model = e.currentTarget.value))}>
-            <option value="" selected={!draft.model}>未设置（使用第一个模型）</option>
-            <Show when={draft.model && !modelChoices().includes(draft.model)}>
-              <option value={draft.model} selected>{draft.model}{fetchedModel(draft.model) ? "（自动拉取）" : "（不存在）"}</option>
-            </Show>
-            <For each={modelChoices()}>{(value) => <option value={value} selected={value === draft.model}>{value}</option>}</For>
-          </select>
-        </label>
-
         <div class="lyra-section-head lyra-providers-head">
           <div class="lyra-heading">
             <h3>模型服务商 <span class="lyra-count">{draft.providers.length}</span></h3>
-            <p class="field-hint">添加服务商、获取模型，再选择默认模型。</p>
+            <p class="field-hint">添加服务商并获取可用模型。</p>
           </div>
           <select
             class="field-input lyra-add-provider"

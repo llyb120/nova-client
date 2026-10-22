@@ -112,14 +112,14 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
   await firstModel.getByLabel("上下文窗口", { exact: true }).fill("256000");
   await firstModel.locator(":scope > summary").click();
   await primary.getByRole("button", { name: "获取模型", exact: true }).click();
-  await page.locator(".lyra-default-model select").selectOption("primary/fetched-0");
+  assert.equal(await page.locator(".lyra-default-model").count(), 0, "default model card is removed");
   assert.equal(await page.evaluate(() => window.testCalls().fetched[0].provider.options.apiKey), "sk-edited");
 
   await primary.getByRole("button", { name: "添加模型", exact: true }).click();
   const addedModel = primary.locator("details.lyra-model").last();
   assert.equal(await addedModel.evaluate(el => el.open), true, "new model opens for editing");
   await addedModel.getByLabel("模型 ID", { exact: true }).fill("temporary-model");
-  await addedModel.getByRole("button", { name: "删除模型", exact: true }).click();
+  await addedModel.getByRole("button", { name: "删除", exact: true }).click();
   assert.equal(await primary.locator("details.lyra-model").count(), 2);
   await page.getByLabel("添加 Provider", { exact: true }).selectOption("local-codex");
   const addedProvider = providers.last();
@@ -127,7 +127,7 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
   assert.equal(await addedProvider.getByLabel("API Key", { exact: true }).count(), 0, "local credentials need no key");
   await addedProvider.getByRole("combobox").first().selectOption("");
   assert.equal(await addedProvider.locator("details.lyra-advanced").filter({ has: page.getByLabel("ID", { exact: true }) }).evaluate(el => el.open), true, "switching to manual exposes required protocol settings");
-  await addedProvider.getByRole("button", { name: "删除 Provider", exact: true }).click();
+  await addedProvider.locator(":scope > summary").getByRole("button", { name: "删除", exact: true }).click();
   await page.waitForFunction(() => document.querySelectorAll("details.lyra-provider").length === 2);
   await page.getByLabel("添加 Provider", { exact: true }).selectOption("manual");
   const manual = providers.last();
@@ -135,14 +135,14 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
   assert.equal(await manualAdvanced.evaluate(el => el.open), true, "new manual provider exposes its required ID");
   await manualAdvanced.getByLabel("ID", { exact: true }).fill("manual-test");
   assert.equal(await manualAdvanced.evaluate(el => el.open), true, "editing required ID does not collapse advanced fields");
-  await manual.getByRole("button", { name: "删除 Provider", exact: true }).click();
+  await manual.locator(":scope > summary").getByRole("button", { name: "删除", exact: true }).click();
   await page.waitForFunction(() => document.querySelectorAll("details.lyra-provider").length === 2);
 
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await page.waitForFunction(() => window.testCalls().saved.length === 1);
   const saved = await page.evaluate(() => window.testCalls().saved[0]);
   assert.equal(saved.$schema, "keep-this-schema");
-  assert.equal(saved.model, "primary/fetched-0");
+  assert.equal(saved.model, "primary/gpt-5", "provider edits preserve the configured default model");
   assert.deepEqual(saved.provider.primary.options, { apiKey: "sk-edited", proxy: "http://127.0.0.1:7890", headers: { "X-Project": "nova" }, temperature: 0.7 });
   assert.equal(saved.provider.primary.models["gpt-5"].limit.context, 256000);
   assert.deepEqual(saved.provider.primary.models["gpt-5"].variants, { high: { reasoningEffort: "high" } });
