@@ -35,11 +35,20 @@ static LOADED: Mutex<String> = Mutex::new(String::new());
 static OVERLAY_OFF: AtomicBool = AtomicBool::new(false);
 /// 永久关闭的原因前缀（结构性问题）；其余失败当做一次性的，下次调用再试。
 const FATAL: &str = "不再重试：";
+/// 光效亮着时用户亲手按下 Esc 的时刻（毫秒，0 为没有）；剑来注入的 Esc 带 INJECTED 标记，不算。
+static ESC_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// 自 ms 起用户是否按 Esc 叫停过。
+pub(crate) fn escaped_since(ms: i64) -> bool {
+    let at = ESC_AT.load(Ordering::Acquire);
+    at != 0 && at >= ms
+}
 
 pub(crate) fn init(app: &AppHandle) {
     let _ = APP.set(app.clone());
     // ponytail: 进程被强杀时品牌指针会留到下次启动/注销；这里无条件恢复用户的指针方案。
     restore_cursor();
+    esc::install();
 }
 
 /// 只看窗口列表/截图不算接手：只给已点亮的光效续期，从不点亮。
@@ -103,7 +112,60 @@ fn wanted(holds: u32, idle: Duration, running: bool, saw_running: bool) -> bool 
     holds > 0 || idle < if running { IDLE_CAP } else if saw_running { Duration::ZERO } else { EXTERNAL_LINGER }
 }
 
+/// 正在亮着的光效轮数；>0 时用户按 Esc 才叫停（计数而非布尔：旧一轮收尾与新一轮点亮可能交错）。
+static LIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn watch() {
+    LIT.fetch_add(1, Ordering::AcqRel);
+    watch_lit();
+    LIT.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// 低级键盘钩子：常驻（启动时装好，避免光效刚亮时钩子还没就位、第一次按 Esc 落空），
+/// 只在光效亮着时处理用户亲手按的 Esc（注入的带 LLKHF_INJECTED），记下时刻并叫停剑来；这个 Esc 不再传给前台程序。
+mod esc {
+    use super::{ESC_AT, LIT};
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::{
+        Foundation::{LPARAM, LRESULT, WPARAM},
+        System::LibraryLoader::GetModuleHandleW,
+        UI::{Input::KeyboardAndMouse::VK_ESCAPE, WindowsAndMessaging::*},
+    };
+
+    pub(super) fn install() {
+        let _ = std::thread::Builder::new().name("nova-glow-esc".into()).spawn(|| unsafe {
+            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), GetModuleHandleW(std::ptr::null()), 0);
+            if hook.is_null() { eprintln!("[agent-glow] 无法监听 Esc"); return; }
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
+            UnhookWindowsHookEx(hook);
+        });
+    }
+
+    unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code >= 0 && LIT.load(Ordering::Acquire) > 0 && matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            let k = &*(lparam as *const KBDLLHOOKSTRUCT);
+            // 只认物理键盘：没有注入标记（含低完整性注入）、没有附加信息、扫描码就是 Esc 键本身。
+            // 远控/改键软件、输入法等生成的按键往往带其中某项，不当成用户叫停。
+            let physical = k.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) == 0 && k.dwExtraInfo == 0 && k.scanCode == 0x01;
+            if k.vkCode == VK_ESCAPE as u32 && !physical {
+                eprintln!("[agent-glow] 忽略非物理 Esc：flags={:#x} scan={:#x} extra={:#x}", k.flags, k.scanCode, k.dwExtraInfo);
+            }
+            if k.vkCode == VK_ESCAPE as u32 && physical {
+                eprintln!("[agent-glow] 用户按 Esc 叫停");
+                let now = crate::threads::now_ms();
+                // 按住不放的自动重复只算一次。
+                if now - ESC_AT.swap(now, Ordering::AcqRel) > 1000 {
+                    std::thread::spawn(crate::jianlai::user_escaped);
+                }
+                return 1;
+            }
+        }
+        CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+    }
+}
+
+fn watch_lit() {
     let Some(app) = APP.get() else { STATE.lock().unwrap().watching = false; return };
     let (mut shown, mut saw_running) = (0u64, false);
     loop {

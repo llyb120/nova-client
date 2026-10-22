@@ -61,6 +61,11 @@ pub(crate) fn lease_input(tool: &'static str) -> Result<InputLease> {
     if tool == "jianlai" && crate::jianpu::recording() {
         return Err("剑谱录制中，桌面正由用户演示，本次未执行；等用户停止录制（Alt+R 或 Butterfly 面板）后再调用".into());
     }
+    // 用户刚按 Esc 叫停：取消落地前模型的重试也不执行。
+    #[cfg(windows)]
+    if crate::agent_glow::escaped_since(crate::threads::now_ms() - 5000) {
+        return Err(ESCAPED.into());
+    }
     let mut lease = INPUT_LEASE.lock().map_err(|_| "输入闸门不可用")?;
     if let Some((holder, since, _)) = *lease {
         // A live call may exceed 30s (16 waits alone can take 32s); only Drop releases it.
@@ -1438,11 +1443,19 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             let mut snap = state.take().unwrap();
             let mut completed = 0;
             let mut failure = None;
+            #[cfg(windows)]
+            let batch_started = crate::threads::now_ms();
             let mut attempted = false;
             let mut clipboard = crate::clipboard::sequence();
             let mut copied_before_paste = None;
             let mut frames = Vec::new();
             for (index, a) in actions.iter().enumerate() {
+                // 光效亮着时用户亲手按了 Esc：立即停下，剩余动作不再执行。
+                #[cfg(windows)]
+                if !bg && crate::agent_glow::escaped_since(batch_started) {
+                    failure = Some(ESCAPED.to_string());
+                    break;
+                }
                 if a.action != "wait" {
                     // Earlier input (incl. hover from move) changes nearby pixels by design; relax to the target core.
                     let after_input = actions[..index].iter().any(|p| p.action != "wait");
