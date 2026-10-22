@@ -160,8 +160,8 @@ assert.match(construction, /let disabled = 1i32;[\s\S]*DwmSetWindowAttribute\(hw
   'the transparent flyout must not retain a native hide-animation surface');
 assert.match(placement, /WANTED\.load\(Ordering::Acquire\) && unsafe \{ IsWindowVisible\(hwnd\) \} != 0/,
   'only a genuinely visible bubble can mark its rendered revision seen');
-assert.match(placement, /Some\(\(thread, stamp\)\)[\s\S]*seen\.at\.entry\(thread\)[\s\S]*max\(stamp\)/,
-  'acknowledgement must use the rendered timestamp, without rolling back newer acknowledgements');
+assert.match(placement, /Some\(\(thread, stamp\)\)[\s\S]*mark_seen\(&mut store, &thread, Some\(stamp\)\)/,
+  'acknowledgement must persist the rendered timestamp');
 const closing = native.slice(native.indexOf('pub(super) fn hide('), native.indexOf('/// Close the card, optionally'));
 assert.doesNotMatch(closing, /mark_seen/, 'closing must not mark a newer, unrendered result read');
 console.log('Butterfly dispatch, reply collapse, visible-result acknowledgement and placement checks passed.');

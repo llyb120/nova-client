@@ -135,34 +135,22 @@ pub(crate) fn bounds() -> Option<Rect> {
 
 #[cfg(windows)]
 static ACTIVITY: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
-#[cfg(windows)]
-static SEEN: std::sync::Mutex<Seen> = std::sync::Mutex::new(Seen { at: std::collections::BTreeMap::new() });
-
-/// Only unread results reach the chip (reading in Nova clears unread); this tracks results
-/// already viewed on the island, at or after their last update. In memory only.
-#[cfg(any(windows, test))]
-#[derive(Default)]
-struct Seen { at: std::collections::BTreeMap<String, i64> }
-
-#[cfg(any(windows, test))]
-impl Seen {
-    fn viewed(&self, id: &str, updated_at: i64) -> bool { self.at.get(id).is_some_and(|&at| at >= updated_at) }
-}
 
 /// Keep an open card readable after marking it seen; the chip still skips viewed results.
 #[cfg(any(windows, test))]
-fn pick<'a>(threads: &[(&'a str, i64, u32)], seen: &Seen, shown: Option<&str>) -> Option<&'a str> {
+fn pick<'a>(threads: &[(&'a str, i64, u32, Option<i64>)], shown: Option<&str>) -> Option<&'a str> {
     if let Some(thread) = threads.iter().find(|t| Some(t.0) == shown) { return Some(thread.0); }
-    threads.iter().filter(|t| t.2 > 0 && !seen.viewed(t.0, t.1)).max_by_key(|t| t.1).map(|t| t.0)
+    threads.iter().filter(|t| t.2 > 0 && !t.3.is_some_and(|at| at >= t.1)).max_by_key(|t| t.1).map(|t| t.0)
 }
 
-/// Island click: the result it showed is now viewed.
-#[cfg(windows)]
-fn mark_seen(app: &tauri::AppHandle, thread: &str) {
-    use tauri::Manager;
-    let state = app.state::<crate::AppState>();
-    let stamp = state.store.lock().ok().and_then(|store| store.threads.iter().find(|t| t.id == thread).map(|t| t.updated_at));
-    if let (Some(stamp), Ok(mut seen)) = (stamp, SEEN.lock()) { seen.at.insert(thread.into(), stamp); }
+/// Acknowledge the rendered revision, or the current one when explicitly opening a session.
+#[cfg(any(windows, test))]
+fn mark_seen(store: &mut crate::threads::ThreadStore, thread: &str, stamp: Option<i64>) {
+    let Some(result) = store.get_mut(thread) else { return };
+    let stamp = stamp.unwrap_or(result.updated_at);
+    if result.taskbar_seen_at.is_some_and(|at| at >= stamp) { return; }
+    result.taskbar_seen_at = Some(stamp);
+    store.save_thread(thread);
 }
 
 pub(crate) struct Activity {
@@ -331,10 +319,9 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
     if let Some(activity) = desktop {
         return Some(Status::new(Kind::Running, format!("剑来 · {activity}"), String::new(), &["Nova 正在操作桌面"], None));
     }
-    let seen = SEEN.lock().ok()?;
     let candidates: Vec<_> = store.threads.iter().filter(|t| !t.items.is_empty())
-        .map(|t| (t.id.as_str(), t.updated_at, t.unread_turns)).collect();
-    let Some(thread) = pick(&candidates, &seen, shown).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
+        .map(|t| (t.id.as_str(), t.updated_at, t.unread_turns, t.taskbar_seen_at)).collect();
+    let Some(thread) = pick(&candidates, shown).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
         return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "单击向助理发消息 · 双击打开 Nova"], None));
     };
     // The last turn's final reply (or error) is the conclusion.
@@ -409,18 +396,48 @@ mod tests {
 
     #[test]
     fn viewed_results_give_way_to_other_unread_results() {
-        let mut seen = Seen::default();
-        let threads = [("old", 10, 0), ("a", 30, 1), ("b", 20, 2), ("latest", 40, 0)];
-        assert_eq!(pick(&threads, &seen, None), Some("a"), "unread beats a newer already-read thread");
-        seen.at.insert("a".into(), 30); // Result rendered in the open bubble.
-        assert_eq!(pick(&threads, &seen, None), Some("b"), "the chip advances immediately, without closing the bubble");
-        assert_eq!(pick(&threads, &seen, Some("a")), Some("a"), "reading or replying must not switch cards after marking seen");
-        assert_eq!(pick(&threads, &seen, Some("deleted")), Some("b"));
-        let threads = [("old", 10, 0), ("a", 30, 0), ("b", 20, 0), ("latest", 40, 0)];
-        assert_eq!(pick(&threads, &seen, None), None, "read in Nova (or never unread): the chip goes idle");
-        assert_eq!(pick(&threads, &seen, Some("latest")), Some("latest"), "an open card stays readable while the chip is idle");
-        let threads = [("a", 31, 1)];
-        assert_eq!(pick(&threads, &seen, None), Some("a"), "a newer unread update is shown again");
+        let mut threads = [("old", 10, 0, None), ("a", 30, 1, None), ("b", 20, 2, None), ("latest", 40, 0, None)];
+        assert_eq!(pick(&threads, None), Some("a"), "unread beats a newer already-read thread");
+        threads[1].3 = Some(30); // Result rendered in the open bubble.
+        assert_eq!(pick(&threads, None), Some("b"), "the chip advances immediately, without closing the bubble");
+        assert_eq!(pick(&threads, Some("a")), Some("a"), "reading or replying must not switch cards after marking seen");
+        assert_eq!(pick(&threads, Some("deleted")), Some("b"));
+        for thread in &mut threads { thread.2 = 0; }
+        assert_eq!(pick(&threads, None), None, "read in Nova (or never unread): the chip goes idle");
+        assert_eq!(pick(&threads, Some("latest")), Some("latest"), "an open card stays readable while the chip is idle");
+        let threads = [("a", 31, 1, Some(30))];
+        assert_eq!(pick(&threads, None), Some("a"), "a newer unread update is shown again");
+    }
+
+    #[test]
+    fn viewed_results_stay_seen_after_restart_without_hiding_new_updates() {
+        use crate::threads::{AgentKind, Thread, ThreadStore};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ThreadStore::load(dir.path().to_path_buf());
+        let mut thread = Thread::new(String::new(), AgentKind::Lyra, None, None, None, false);
+        thread.updated_at = 30;
+        thread.unread_turns = 1;
+        let id = thread.id.clone();
+        store.threads.push(thread);
+        mark_seen(&mut store, &id, Some(30));
+        let mut snapshot = store.take_persist_snapshot().expect("acknowledgement must request persistence");
+        ThreadStore::write_persist_snapshot(&mut snapshot).unwrap();
+        drop(store);
+
+        let mut store = ThreadStore::load(dir.path().to_path_buf());
+        let thread = store.get(&id).unwrap();
+        assert_eq!(thread.taskbar_seen_at, Some(30));
+        assert_eq!(thread.unread_turns, 1, "Butterfly acknowledgement preserves Nova's unread count");
+        assert_eq!(pick(&[(&id, thread.updated_at, thread.unread_turns, thread.taskbar_seen_at)], None), None);
+        mark_seen(&mut store, &id, Some(20));
+        assert!(store.take_persist_snapshot().is_none(), "stale acknowledgements neither roll back nor rewrite");
+
+        store.get_mut(&id).unwrap().updated_at = 31;
+        mark_seen(&mut store, &id, Some(30));
+        let thread = store.get(&id).unwrap();
+        assert_eq!(pick(&[(&id, thread.updated_at, thread.unread_turns, thread.taskbar_seen_at)], None), Some(id.as_str()), "an unrendered update stays visible");
+        mark_seen(&mut store, &id, None);
+        assert_eq!(store.get(&id).unwrap().taskbar_seen_at, Some(31), "opening a session acknowledges its current revision");
     }
 
     #[test]

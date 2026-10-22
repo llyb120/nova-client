@@ -634,6 +634,9 @@ pub struct Thread {
     /// 因此随会话文件落盘，由前端在计数变化时写回。
     #[serde(default)]
     pub unread_turns: u32,
+    /// Butterfly 已查看的结果版本；随会话保存，重启后不重复提醒。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taskbar_seen_at: Option<i64>,
     /// 漫游角色：None = 本地会话；Some("host") = 我替别人在本机执行；
     /// Some("guest") = 我在别人机器上执行、本机只接收展示
     #[serde(default)]
@@ -746,6 +749,7 @@ impl Thread {
             ephemeral,
             starred: false,
             unread_turns: 0,
+            taskbar_seen_at: None,
             roaming_role: None,
             roaming_peer: None,
             roaming_peer_name: None,
@@ -1817,6 +1821,7 @@ impl ThreadStore {
             copy.pending_stage_context = None;
             copy.handoff_from = (!copy.items.is_empty()).then(|| copy.agent_kind.clone());
             copy.unread_turns = 0;
+            copy.taskbar_seen_at = None;
             copy.ephemeral = false;
             copy.employee_thread = false;
             copy.experience_thread = false;
@@ -2804,6 +2809,7 @@ mod tests {
         let object = value.as_object_mut().expect("线程应序列化为对象");
         object.remove("starred");
         object.remove("unreadTurns");
+        object.remove("taskbarSeenAt");
         object.remove("providerCheckpoints");
         object.remove("pendingNativeRestore");
         object.remove("codexUsageSnapshot");
@@ -2811,6 +2817,7 @@ mod tests {
         let restored: Thread = serde_json::from_value(value).expect("旧线程应可反序列化");
         assert!(!restored.starred);
         assert_eq!(restored.unread_turns, 0);
+        assert_eq!(restored.taskbar_seen_at, None);
         assert!(restored.provider_checkpoints.is_empty());
         assert!(restored.pending_native_restore.is_none());
         assert!(restored.codex_usage_snapshot.is_none());

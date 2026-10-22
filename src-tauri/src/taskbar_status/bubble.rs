@@ -244,15 +244,17 @@ pub(super) fn hide(app: &AppHandle) {
 
 /// Close the card, optionally marking the supplied thread as viewed.
 pub(super) fn dismiss(app: &AppHandle, thread: Option<String>) {
-    if let Some(thread) = thread { super::mark_seen(app, &thread); }
+    if let Some(thread) = thread {
+        if let Ok(mut store) = app.state::<crate::AppState>().store.lock() { super::mark_seen(&mut store, &thread, None); }
+    }
     hide(app);
 }
 
 /// Size to the rendered cards and sit just above (or below) the taskbar, centred on the chip.
-fn frame(anchor: Anchor, css_height: f64) -> (i32, i32, i32, i32) {
+pub(super) fn frame(anchor: Anchor, css_width: f64, css_height: f64) -> (i32, i32, i32, i32) {
     let a = anchor;
     let margin = (8.0 * a.scale).round() as i32;
-    let width = ((WIDTH * a.scale).round() as i32).min((a.work.right - a.work.left - 2 * margin).max(1));
+    let width = ((css_width * a.scale).round() as i32).min((a.work.right - a.work.left - 2 * margin).max(1));
     let height = ((css_height.max(1.0) * a.scale).round() as i32).min((a.work.bottom - a.work.top - margin).max(1));
     let center = (a.chip.left + a.chip.right) / 2;
     let x = (center - width / 2).min(a.work.right - margin - width).max(a.work.left + margin);
@@ -284,8 +286,8 @@ pub(super) fn place(app: &AppHandle, css_height: f64) -> bool {
     if WANTED.load(Ordering::Acquire) && unsafe { IsWindowVisible(hwnd) } != 0 {
         // Acknowledge only the revision rendered by the page, not a newer store update.
         let shown = SHOWN.lock().unwrap().clone();
-        if let (Some((thread, stamp)), Ok(mut seen)) = (shown, super::SEEN.lock()) {
-            seen.at.entry(thread).and_modify(|at| *at = (*at).max(stamp)).or_insert(stamp);
+        if let Some((thread, stamp)) = shown {
+            if let Ok(mut store) = app.state::<crate::AppState>().store.lock() { super::mark_seen(&mut store, &thread, Some(stamp)); }
         }
         super::windows::wake();
     }
@@ -297,7 +299,7 @@ pub(super) fn open_thread(app: &AppHandle, thread: Option<String>) {
     hide(app);
     crate::sys_notify::focus_main_window(app);
     if let Some(thread) = thread {
-        super::mark_seen(app, &thread);
+        if let Ok(mut store) = app.state::<crate::AppState>().store.lock() { super::mark_seen(&mut store, &thread, None); }
         super::windows::wake();
         let _ = app.emit(crate::acp::EV_NOTIFY_OPEN, json!({ "threadId": thread }));
     }
