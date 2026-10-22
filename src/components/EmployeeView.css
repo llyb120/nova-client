@@ -164,3 +164,17 @@
 @media (max-width: 700px) {
   .employee-page { padding: 24px 16px; }
 }
+
+/* StarLink：本机 / 团队 */
+.employee-tabs { display: inline-flex; gap: 4px; padding: 3px; margin-bottom: 20px; border: 1px solid var(--border-light); border-radius: 10px; background: var(--bg-panel); }
+.employee-page .employee-tabs button { border: 0; padding: 5px 18px; background: transparent; }
+.employee-page .employee-tabs button[aria-selected=true] { background: var(--bg-active); font-weight: 600; }
+.employee-team { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; margin: 20px 0 12px; }
+.employee-page .employee-peer { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 16px 18px; text-align: left; }
+.employee-top.is-remote { grid-template-columns: minmax(0, 1fr); }
+.employee-public { flex-direction: row; align-items: center; }
+.employee-reply { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; margin-top: 6px; }
+.employee-reply button { padding: 4px 12px; font-size: 12px; }
+.employee-transcript { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; background: rgb(0 0 0 / .35); }
+.employee-transcript > section { width: min(820px, 90vw); max-height: 80vh; display: flex; flex-direction: column; gap: 12px; padding: 20px; border: 1px solid var(--border); border-radius: 14px; background: var(--bg-panel); }
+.employee-transcript pre { margin: 0; overflow: auto; white-space: pre-wrap; font: inherit; font-size: 13px; line-height: 1.7; }
