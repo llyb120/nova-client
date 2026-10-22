@@ -477,6 +477,7 @@ impl RelayManager {
         self.publish_folders();
         self.rebuild_hosted();
         self.resync_guest_threads();
+        crate::employee::resend_help();
 
         let mut decoder = SseDecoder::new();
         let result = loop {
@@ -602,6 +603,10 @@ impl RelayManager {
             "roaming.snapshot" => self.on_roaming_snapshot(&env),
             "roaming.title" => self.on_roaming_title(&env),
             "roaming.error" => self.on_roaming_error(&env),
+            // StarLink：团队里的数字员工
+            kind if kind.starts_with("starlink.") => {
+                crate::employee::on_message(&self.app, &env.from, &env.from_name, kind, env.data)
+            }
             _ => {}
         }
     }

@@ -5995,6 +5995,7 @@ pub fn run() {
             employee::employee_set,
             employee::employee_do,
             employee::employee_say,
+            employee::starlink_call,
             workspace_terminal::terminal_create,
             workspace_terminal::terminal_write,
             workspace_terminal::terminal_resize,
