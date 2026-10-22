@@ -56,6 +56,9 @@ struct Step {
     key: Option<String>,
     #[serde(default)]
     direction: Option<String>,
+    /// Predicted state required before this step; checked on fresh evidence, never by replaying input.
+    #[serde(default)]
+    when: Option<String>,
     /// Observable result that must hold before the next step: literal text/URL/title fragments,
     /// alternatives separated by `|`.
     #[serde(default)]
@@ -80,6 +83,7 @@ impl Step {
         if let Some(within) = &self.within { text += &format!(" 位于「{within}」"); }
         if let Some(value) = self.text.as_ref().filter(|_| values) { text += &format!(" 输入「{}」", short(value, 60)); }
         if let Some(key) = &self.key { text += &format!(" 按键 {key}"); }
+        if let Some(when) = &self.when { text += &format!(" 前提：{when}"); }
         if let Some(expect) = self.expect() { text += &format!(" → 期望：{expect}"); }
         text
     }
@@ -126,7 +130,7 @@ fn parse(args: &Value) -> Result<Plan, String> {
         || (matches!(s.action.as_str(), "click" | "fill") && !valid(&s.target, 300) && !optional(&s.name, 300))
         || (matches!(s.action.as_str(), "click" | "fill") && s.target.trim().is_empty() && s.name.is_none())
         || s.target.chars().count() > 300 || !optional(&s.name, 300) || !optional(&s.role, 80) || !optional(&s.within, 300)
-        || !optional(&s.expect, 500) || !optional(&s.expected_text, 500) || s.repeat > 3
+        || !optional(&s.when, 500) || !optional(&s.expect, 500) || !optional(&s.expected_text, 500) || s.repeat > 3
         || (s.action == "fill") != s.text.is_some() || s.text.as_ref().is_some_and(|t| t.chars().count() > 4000)
         || (s.action == "press") != s.key.is_some()
         || s.key.as_deref().is_some_and(|k| !matches!(k, "Enter" | "Tab" | "Escape" | "ArrowDown" | "ArrowUp" | "Space" | "Backspace"))
@@ -506,8 +510,8 @@ fn bind_step(step: &Step, index: usize, c: &Candidate) -> Candidate {
 
 /// Only steps that cannot change what the following targets mean may run back-to-back in one act:
 /// typing, Tab, and toggling a selection. Menus, links, submits and Enter end the batch.
-fn chains(step: &Step, bound: &Candidate) -> bool {
-    if step.expect().is_some() || step.repeat > 0 { return false; }
+fn chains(step: &Step, bound: &Candidate, next: &Step) -> bool {
+    if next.when.is_some() || step.expect().is_some() || step.repeat > 0 { return false; }
     let key: Value = serde_json::from_str(bound.key.split("|fill|").next().unwrap_or_default()).unwrap_or(Value::Null);
     match step.action.as_str() {
         "fill" => true,
@@ -775,14 +779,14 @@ impl Run<'_> {
 
     /// Waits (bounded) for an expectation to appear literally in page text, URL or title.
     /// Semantic judgement belongs to the main model: an unmet literal check hands back.
-    async fn verify(&mut self, expect: &str, step: usize) -> Result<bool, String> {
+    async fn verify(&mut self, expect: &str, step: usize, limit: Duration) -> Result<bool, String> {
         let begun = Instant::now();
         loop {
             let pages = self.pages()?;
             let loading = pages["pages"].as_array().into_iter().flatten().any(|p| p["loading"] == true);
-            // ponytail: 6s per expectation; slower jobs need an explicit wait step or a new run.
+            // ponytail: 6s per expectation (3s per `when`); slower jobs need an explicit wait step or a new run.
             let verdict = if !loading && literal_met(&pages, expect) { Some((true, "literal")) }
-                else if begun.elapsed() >= Duration::from_secs(6) { Some((false, "timeout")) } else { None };
+                else if begun.elapsed() >= limit { Some((false, "timeout")) } else { None };
             if let Some((met, by)) = verdict {
                 self.checks.push(json!({"step":step + 1,"expect":expect,"met":met,"by":by,"ms":begun.elapsed().as_millis() as u64}));
                 return Ok(met);
@@ -798,10 +802,22 @@ impl Run<'_> {
         let total = self.plan.steps.len();
         let (mut attempts, mut repeats, mut scrolled) = (0usize, 0usize, 0usize);
         let mut step_started = Instant::now();
+        // `when` is a precondition for the first attempt only: loading/late-render/retry loops and
+        // `repeat` re-enter the same step after it may already have run and consumed that state.
+        let mut when_checked = None;
         while self.step_index < total {
             let index = self.step_index;
             if started.elapsed() > RUN_BUDGET { return Err(format!("已达到连续执行时间预算（180秒），停在第{}步", index + 1)); }
             if self.executed >= self.plan.max_actions { return Err(format!("已达到动作预算 maxActions，停在第{}步", index + 1)); }
+            if when_checked != Some(index) {
+                if let Some(when) = self.plan.steps[index].when.clone() {
+                    // A wrong prediction should hand back fast; same window as late-render waits.
+                    if !self.verify(&when, index, Duration::from_secs(3)).await? {
+                        return Err(format!("第{}步预测条件未成立「{when}」；本步未执行，按最新观察重新规划", index + 1));
+                    }
+                }
+                when_checked = Some(index);
+            }
             let pages = self.pages()?;
             if origin(&pages)? != home { return Err("页面跨站，需主模型重新确认授权".into()); }
             if pages["pages"].as_array().into_iter().flatten().any(|p| p["loading"] == true) {
@@ -850,7 +866,8 @@ impl Run<'_> {
                 }
             };
             let mut batch = vec![first];
-            while batch.len() < 8 && index + batch.len() < total && chains(&self.plan.steps[index + batch.len() - 1], batch.last().unwrap()) {
+            while batch.len() < 8 && index + batch.len() < total
+                && chains(&self.plan.steps[index + batch.len() - 1], batch.last().unwrap(), &self.plan.steps[index + batch.len()]) {
                 let next_index = index + batch.len();
                 let next = &self.plan.steps[next_index];
                 let bound = if next.action == "press" { press_candidate(next, next_index) } else {
@@ -884,7 +901,7 @@ impl Run<'_> {
             }
             let last = index + done - 1;
             if let Some(expect) = self.plan.steps[last].expect().map(str::to_string) {
-                if !self.verify(&expect, last).await? {
+                if !self.verify(&expect, last, Duration::from_secs(6)).await? {
                     self.step_index = last;
                     if repeats < self.plan.steps[last].repeat {
                         repeats += 1;
@@ -903,7 +920,7 @@ impl Run<'_> {
         // All steps done: the main model's completion condition must hold on fresh evidence.
         // Without an explicit expectedText the task is not literal page text: the main model judges.
         let expected = self.plan.expected_text.clone();
-        if self.plan.check_goal && !self.verify(&expected, total).await? {
+        if self.plan.check_goal && !self.verify(&expected, total, Duration::from_secs(6)).await? {
             return Err(format!("需要按最新页面重新规划，但完成条件「{expected}」未通过核验；请核对最新页面后补充步骤"));
         }
         Ok(())
@@ -1272,17 +1289,35 @@ mod tests {
             {"action":"click","target":"排序图标","expect":"降序"}]}));
         let checkbox = Candidate::new(json!({"action":"click"}), json!({"role":"checkbox"}), json!(0), String::new(), "");
         let button = Candidate::new(json!({"action":"click"}), json!({"role":"button"}), json!(0), String::new(), "");
-        assert!(chains(&plan.steps[0], &checkbox));
-        assert!(chains(&plan.steps[1], &checkbox));
-        assert!(!chains(&plan.steps[2], &button));
-        assert!(!chains(&plan.steps[3], &press_candidate(&plan.steps[3], 3)));
-        assert!(!chains(&plan.steps[4], &checkbox), "a step with an expectation is always checked before continuing");
+        assert!(chains(&plan.steps[0], &checkbox, &plan.steps[1]));
+        assert!(chains(&plan.steps[1], &checkbox, &plan.steps[2]));
+        assert!(!chains(&plan.steps[2], &button, &plan.steps[3]));
+        assert!(!chains(&plan.steps[3], &press_candidate(&plan.steps[3], 3), &plan.steps[4]));
+        assert!(!chains(&plan.steps[4], &checkbox, &plan.steps[0]), "a step with an expectation is always checked before continuing");
         for invalid in [json!({"action":"press"}), json!({"action":"fill","target":"x"}), json!({"action":"hover","target":"x"}),
             json!({"action":"click"}), json!({"action":"click","target":"x","repeat":4}), json!({"action":"press","key":"F5"})] {
             assert!(parse(&json!({"plan":{"task":"t","authorization":"a","expectedText":"e","steps":[invalid]}})).is_err());
         }
         let pages = json!({"pages":[{"url":"https://x.test/?order=desc","visibleText":"Region United States","title":"Top"}]});
         assert!(literal_met(&pages, "美国|United States") && literal_met(&pages, "order=desc") && !literal_met(&pages, "Canada"));
+    }
+
+    #[test]
+    fn prediction_needs_no_experience_and_checks_before_chaining() {
+        let p = plan(json!({"task":"按地区查询","steps":[
+            {"action":"fill","target":"地区","text":"北京"},
+            {"action":"click","name":"查询","when":"已选择北京"}]}));
+        let field = Candidate::new(json!({"action":"fill"}), json!({"role":"textbox"}), json!(0), String::new(), "");
+        assert!(!chains(&p.steps[0], &field, &p.steps[1]), "predictive conditions must be checked after earlier input");
+        let before = json!({"pages":[{"visibleText":"请选择地区"}]});
+        let after = json!({"pages":[{"visibleText":"已选择北京"}]});
+        let when = p.steps[1].when.as_deref().unwrap();
+        assert!(!literal_met(&before, when));
+        assert!(literal_met(&after, when));
+        assert!(p.steps[1].describe().contains(when));
+        for when in [json!(""), json!(" "), json!("x".repeat(501)), json!(true)] {
+            assert!(parse(&json!({"plan":{"task":"查询","steps":[{"action":"press","key":"Enter","when":when}]}})).is_err());
+        }
     }
 
     #[test]

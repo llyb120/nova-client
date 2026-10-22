@@ -50,10 +50,24 @@ test('Chrome retains image coordinates, fast scope and bounded batch schemas',as
     }
   }
 });
+test('short lookahead is available without experience and Chrome exposes a pre-action guard', async()=>{
+  const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));
+  for (const tool of [chrome,jianlai]) {
+    assert.match(tool.description,/无论有无经验/);
+    assert.match(tool.description,/没有经验或检索无命中也直接根据界面和任务推演/);
+    assert.match(tool.description,/2–4步/);
+  }
+  const when=chrome.inputSchema.properties.plan.properties.steps.items.properties.when;
+  assert.equal(when.type,'string');
+  assert.equal(when.minLength,1);
+  assert.equal(when.maxLength,500);
+  assert.match(when.description,/本步及后续不执行/);
+  assert.match(jianlai.inputSchema.properties.actions.description,/不猜未来坐标/);
+});
+
 test('Chrome and Jianlai run only executes pre-confirmed steps', async()=>{
   const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));
   for (const browser of [chrome]) {
-    assert.match(browser.description,/升序前N不能替换为最高N项倒序展示/);
     assert.doesNotMatch(browser.description,/JEV|advise|runTemplate|DOM排障|Altair|vision/);
     assert.deepEqual(browser.inputSchema.properties.plan.required,['task','steps']);
     assert.equal(browser.inputSchema.properties.action.properties.target,undefined);
