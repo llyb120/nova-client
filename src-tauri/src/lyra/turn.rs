@@ -524,6 +524,7 @@ pub(crate) mod tests {
         let model = Resolved {
             model: ResolvedModel {
                 provider: "p".into(),
+                command_code: false,
                 id: "m".into(),
                 api: "openai-completions".into(),
                 base_url,

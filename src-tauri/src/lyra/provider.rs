@@ -323,8 +323,8 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
     }
     // CommandCode's OpenAI-compatible gateway accepts `off` (rejects `none`) and does not
     // disable DeepSeek via its native thinking.type alone. Keep native providers unchanged.
-    if !enabled && reqwest::Url::parse(&model.base_url).ok()
-        .is_some_and(|url| url.host_str() == Some("api.commandcode.ai")) {
+    if !enabled && (model.command_code || reqwest::Url::parse(&model.base_url).ok()
+        .is_some_and(|url| url.host_str() == Some("api.commandcode.ai"))) {
         body["reasoning_effort"] = json!("off");
     }
     // 与 thinking_format 无关：显式配置即下发 thinking.clear_thinking（Some(false) =
@@ -2086,6 +2086,9 @@ mod tests {
             assert_eq!(body["thinking"]["type"], "disabled");
             assert!(body.get("reasoning_effort").is_none(), "do not send the gateway enum to other providers");
         }
+        model.base_url = "https://relay.example/cc".into();
+        model.command_code = true;
+        assert_eq!(completions_body(&model, "test", &[], &[], Some("off"), None)["reasoning_effort"], "off");
     }
 
     #[tokio::test]
@@ -2203,6 +2206,7 @@ mod tests {
     fn test_model(api: &str) -> ResolvedModel {
         ResolvedModel {
             provider: "p".into(),
+            command_code: false,
             id: "m".into(),
             api: api.into(),
             base_url: "https://api.openai.com/v1".into(),

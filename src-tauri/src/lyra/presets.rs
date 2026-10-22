@@ -116,6 +116,7 @@ const fn preset(id: &'static str, name: &'static str, base_url: &'static str, mo
 
 /// Base URL 取自 models.dev 各 provider 的 api 字段，离线时也能直接用。
 const PRESETS: &[Preset] = &[
+    preset("server-support", "server support", "", false),
     preset("local-codex", "本地 Codex", "", false),
     preset("local-claude-code", "本地 Claude Code", "", false),
     preset("commandcode", "Command Code", "https://api.commandcode.ai/provider/v1", false),
@@ -150,18 +151,34 @@ pub(crate) fn list() -> Value {
 
 fn local_source(preset: &str) -> Option<&str> {
     match preset {
+        "server-support" => Some("server-support"),
         "local-codex" => Some("codex"),
         "local-claude-code" => Some("claude-code"),
         _ => None,
     }
 }
 
-fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap<String, String>) -> Result<Value, String> {
-    let (mut local, _) = local_provider::load(source, env)?;
+fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap<String, String>, nova_root: &Path) -> Result<Value, String> {
+    let mut local = if source == "server-support" {
+        let settings = crate::settings::Settings::load(&nova_root.to_path_buf());
+        let server = crate::relay::resolve_relay_server(&settings.relay_server);
+        let token = settings.relay_token.trim();
+        if server.is_empty() || token.is_empty() {
+            return Err("请先在团队设置中保存中转地址和团队 token".into());
+        }
+        let url = reqwest::Url::parse(&server).map_err(|_| "团队中转地址无效")?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || url.query().is_some() || url.fragment().is_some() {
+            return Err("团队中转地址必须是 HTTP(S) 地址，不能包含查询参数或片段".into());
+        }
+        json!({ "name": "server support", "api": DEFAULT_API,
+            "options": { "baseURL": format!("{server}/cc"), "apiKey": token }, "models": {} })
+    } else {
+        local_provider::load(source, env)?.0
+    };
     let mut options = local["options"].as_object().cloned().unwrap_or_default();
-    let mut headers = options["headers"].as_object().cloned().unwrap_or_default();
+    let mut headers = options.get("headers").and_then(Value::as_object).cloned().unwrap_or_default();
     if let Some(explicit) = provider["options"].as_object() {
-        // Key 始终跟随 CLI；其余手写选项仍可覆盖默认值。
+        // Key 始终跟随本地认证；其余手写选项仍可覆盖默认值。
         options.extend(explicit.iter().filter(|(key, _)| key.as_str() != "apiKey").map(|(k, v)| (k.clone(), v.clone())));
         if let Some(explicit) = explicit.get("headers").and_then(Value::as_object) { headers.extend(explicit.clone()); }
     }
@@ -204,7 +221,7 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
         let Some(preset) = preset_of(provider) else { continue };
         if let Some(source) = local_source(preset.id) {
             let explicit = provider["models"].as_object().cloned().unwrap_or_default();
-            match resolve_local(provider, source, &env) {
+            match resolve_local(provider, source, &env, nova_root) {
                 Ok(mut local) => {
                     let mut models = cache[id.as_str()]["models"].as_object().cloned().unwrap_or_default();
                     merge_local_models(&mut models, local["models"].as_object().unwrap());
@@ -257,7 +274,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         let Some(preset) = preset_of(provider) else { continue };
         let local;
         let provider = if let Some(source) = local_source(preset.id) {
-            local = match resolve_local(provider, source, &env) {
+            local = match resolve_local(provider, source, &env, nova_root) {
                 Ok(local) => local,
                 Err(error) => {
                     if force { errors.push(format!("{id}：{error}")); }
@@ -292,7 +309,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
                 &proxied
             }
         };
-        let result = if local_source(preset.id).is_some() {
+        let result = if local_source(preset.id).is_some() && preset.id != "server-support" {
             fetch_local_models(http, provider.clone(), &mut models_dev).await
         } else {
             fetch_models(http, preset, &base_url, &api_key, &mut models_dev).await
@@ -374,7 +391,8 @@ async fn fetch_models(
         }
     }
     if !preset.models_dev {
-        return Ok(convert(&list?, None, models_dev.as_ref(), preset.id));
+        let catalog_id = if preset.id == "server-support" { "commandcode" } else { preset.id };
+        return Ok(convert(&list?, None, models_dev.as_ref(), catalog_id));
     }
     let meta = models_dev.as_ref().and_then(|all| all.get(preset.id)).cloned().unwrap_or_default();
     // Coding Plan、Anthropic 协议端点等常不提供 /models，此时整份用 models.dev 的列表。
@@ -668,6 +686,42 @@ pub(crate) fn cache_mtime(nova_root: &Path) -> Option<SystemTime> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn server_support_follows_team_settings_and_preserves_model_protocols() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = json!({ "provider": { "team": { "preset": "server-support", "options": { "apiKey": "stale" } } } });
+        let mut config = raw.clone();
+        expand(&mut config, dir.path());
+        assert_eq!(config["provider"]["team"]["models"], json!({}));
+        assert!(resolve_local(&raw["provider"]["team"], "server-support", &Default::default(), dir.path()).is_err());
+        std::fs::create_dir_all(dir.path().join("alkaid")).unwrap();
+        let model_list = json!({ "data": [
+            { "id": "custom-chat", "supported_endpoints": ["/chat/completions"] },
+            { "id": "custom-responses", "supported_endpoints": ["/responses"] },
+            { "id": "custom-claude", "supported_endpoints": ["/messages"] }
+        ] });
+        let models = convert(&model_list, None, None, "commandcode");
+        std::fs::write(cache_path(dir.path()), json!({ "team": { "models": models } }).to_string()).unwrap();
+        for token in ["alice/first", "alice/rotated"] {
+            std::fs::write(dir.path().join("settings.json"), json!({ "relayServer": " http://localhost:8320/ ", "relayToken": token }).to_string()).unwrap();
+            let mut config = raw.clone();
+            expand(&mut config, dir.path());
+            let provider = &config["provider"]["team"];
+            assert_eq!(provider["options"]["baseURL"], "http://localhost:8320/cc");
+            assert_eq!(provider["options"]["apiKey"], token);
+            assert_eq!(provider["name"], "server support");
+            assert_eq!(provider["models"].as_object().unwrap().len(), 3);
+            for (id, api) in [("custom-chat", DEFAULT_API), ("custom-responses", "openai-responses"), ("custom-claude", "anthropic-messages")] {
+                let resolved = super::super::config::resolve_model(&config, Some(&format!("team/{id}")), &Default::default()).unwrap();
+                assert_eq!(resolved.api_key, token);
+                assert_eq!(resolved.model.api, api);
+                assert!(resolved.model.command_code);
+            }
+        }
+        assert_eq!(raw["provider"]["team"]["options"]["apiKey"], "stale", "runtime credentials are not persisted into provider config");
+        assert!(list().as_array().unwrap().iter().any(|p| p["id"] == "server-support" && p["local"] == true));
+    }
+
     #[tokio::test]
     async fn local_presets_fetch_all_pages_despite_selected_model_and_keep_private_options() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -700,7 +754,7 @@ env_key = "TEST_KEY"
             let config = json!({ "preset": format!("local-{source}"), "options": {
                 "apiKey": "stale-key", "temperature": 0.5, "headers": {"X-Route": "test"}
             }, "models": { "old-cache-only": {} } });
-            let provider = resolve_local(&config, source, &env).unwrap();
+            let provider = resolve_local(&config, source, &env, dir.path()).unwrap();
             assert_eq!(provider["api"], api);
             assert!(provider["models"].get("old-cache-only").is_none());
             assert_eq!(provider["options"]["temperature"], 0.5);

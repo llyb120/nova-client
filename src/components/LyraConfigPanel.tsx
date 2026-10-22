@@ -224,7 +224,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
         <Show when={!draft.providers.length}>
           <div class="lyra-empty">
             <span class="field-label">添加第一个模型服务商</span>
-            <span class="field-hint">选择预设后填写 API Key；本地 Codex / Claude Code 可直接沿用本机认证。</span>
+            <span class="field-hint">server support 使用团队中转和 token；本地 Codex / Claude Code 沿用本机认证，其他预设填写 API Key。</span>
           </div>
         </Show>
         <Index each={draft.providers}>
@@ -264,7 +264,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                   <h4>连接配置</h4>
                   <div class="backend-fields">
                     <label class="backend-field">
-                      <span class="field-label" title="选择 Provider 自动获取模型；本地 Codex / Claude Code 沿用本地认证，无需填写 Key">类型</span>
+                      <span class="field-label" title="选择 Provider 自动获取模型；server support 使用团队 token，本地预设沿用本机认证">类型</span>
                       <select class="field-input" onChange={(e) => setPreset(e.currentTarget.value)}>
                         <option value="" selected={!p().preset}>手动配置</option>
                         <Show when={p().preset && presets().length && !preset()}>
@@ -281,7 +281,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                   <div class="backend-fields">
                     <label class="backend-field">
                       <span class="field-label">Base URL</span>
-                      <input class="field-input" type="url" placeholder={local() ? "留空跟随本地配置" : preset()?.baseURL ? `留空使用 ${preset()!.baseURL}` : "https://api.openai.com/v1"} value={p().baseURL} onInput={(e) => setP((x) => (x.baseURL = e.currentTarget.value))} />
+                      <input class="field-input" type="url" placeholder={p().preset === "server-support" ? "留空使用团队中转地址 + /cc" : local() ? "留空跟随本地配置" : preset()?.baseURL ? `留空使用 ${preset()!.baseURL}` : "https://api.openai.com/v1"} value={p().baseURL} onInput={(e) => setP((x) => (x.baseURL = e.currentTarget.value))} />
                     </label>
                     <Show when={!local()}>
                       <label class="backend-field">
@@ -304,7 +304,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                         const names = () => Object.entries(result()?.models ?? {}).map(([mid, m]) => m?.name || mid);
                         return (
                           <div class="lyra-fetch">
-                            <span class="field-hint">{local() ? "沿用本机认证，无需填写 Key。" : "填写 API Key 后获取可用模型。"}模型每 6 小时自动更新，同 ID 的手动配置优先。</span>
+                            <span class="field-hint">{p().preset === "server-support" ? "使用已保存的团队中转地址和 token，无需填写 Key。" : local() ? "沿用本机认证，无需填写 Key。" : "填写 API Key 后获取可用模型。"}模型每 6 小时自动更新，同 ID 的手动配置优先。</span>
                             <button type="button" class="btn secondary" disabled={result()?.busy} onClick={() => void fetchModels(p())}>
                               {result()?.busy ? "获取中…" : "获取模型"}
                             </button>

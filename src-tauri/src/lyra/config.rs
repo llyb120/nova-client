@@ -75,6 +75,7 @@ pub fn process_env() -> HashMap<String, String> {
 #[derive(Debug, Clone)]
 pub struct ResolvedModel {
     pub provider: String,
+    pub command_code: bool,
     pub id: String,
     pub api: String,
     pub base_url: String,
@@ -583,6 +584,7 @@ pub fn resolve_model(
     Ok(Resolved {
         model: ResolvedModel {
             provider: provider_id.to_string(),
+            command_code: matches!(provider["preset"].as_str(), Some("commandcode" | "server-support")),
             id: model_id.to_string(),
             api,
             thinking_format,
