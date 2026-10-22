@@ -8,7 +8,7 @@ const name = 'knowledge-check-' + process.pid;
 const route = (id, task, conditions, steps) => ({ id, task, conditions, steps, checks: ['核对结果'], pitfalls: [], confidence: 'initial', successes: 1 });
 const data = [
   { tool: 'chrome', scope: 'https://example.com', graph: { routes: [
-    route('a', '完成归档', ['已登录项目'], ['打开菜单', '查看列表', '核对数据', '导出文件', '保存文件']),
+    { ...route('a', '完成归档', ['已登录项目'], ['打开菜单', '查看列表', '核对数据', '导出文件', '保存文件']), alternatives: [{ at: 1, actions: ['查看列表', '打开设置'] }] },
     route('b', '完成归档', ['从搜索进入'], ['搜索记录', '查看列表', '导出文件', '保存文件']),
     route('c', '修订资料', ['已登录项目'], ['打开菜单', '查看列表', '编辑资料', '查看列表']),
     route('d', '连续检查', ['已登录项目'], ['核对数据', '核对数据']),
@@ -33,10 +33,13 @@ for (const edge of graph.edges) {
   for (const occurrence of edge.occurrences) {
     const route = graph.routes.find(route => route.key === occurrence.routeKey);
     assert.equal(route.nodeIds[occurrence.step - 1], edge.source);
-    assert.equal(route.nodeIds[occurrence.step], edge.target);
+    if (edge.kind !== 'option') assert.equal(route.nodeIds[occurrence.step], edge.target);
   }
   assert.ok(!/NaN|Infinity/.test(graphEdgePath(edge, byId, true)));
 }
+const untried = graph.nodes.filter(node => node.untried);
+assert.deepEqual(untried.map(node => node.title), ['打开设置'], 'Observed options are marked untried; tried steps never are');
+assert.equal(graph.edges.filter(edge => edge.kind === 'option').length, 1, 'An option a route already took stays a tried step edge');
 const self = graph.edges.find(edge => edge.source === edge.target);
 assert.ok(self && graphEdgePath(self, byId, true).includes(' C '), 'Repeated operations draw a self-loop');
 const edit = graph.nodes.find(node => node.title === '编辑资料');
@@ -79,6 +82,8 @@ try {
   assert.equal(await page.locator('.knowledge-node').count(), graph.nodes.length);
   assert.equal(await page.locator('.knowledge-node[data-kind=start]').count(), graph.starts.length);
   assert.equal(await page.locator('.knowledge-edges > path').count(), graph.edges.length);
+  assert.equal(await page.locator('.knowledge-node.untried').count(), 1);
+  assert.equal(await page.locator('.knowledge-edges > path.option').count(), 1);
   assert.equal(await page.getByLabel('展开层数').count(), 0);
   await page.screenshot({ path: (process.env.TEMP || '/tmp') + '/nova-knowledge-graph.png' });
   await page.getByLabel('搜索全部图谱').fill('导出年度汇总');

@@ -99,40 +99,41 @@ export default function KnowledgeGraphView() {
           <div class="knowledge-world" style={{ "--label-scale": Math.max(1, Math.min(1.3, 1 / camera().scale)), transform: 'translate(' + (size().width / 2 + camera().x) + 'px, ' + (size().height / 2 + camera().y) + 'px) scale(' + camera().scale + ')' }}>
             <svg class="knowledge-edges"><defs><marker id="knowledge-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>
               <For each={graph().edges}>{edge => <path role="button" tabindex="0" aria-label={byId().get(edge.source)!.title + ' → ' + byId().get(edge.target)!.title}
-                classList={{ selected: edgeId() === edge.id || (!!routeKey() ? edge.occurrences.some(item => item.routeKey === routeKey()) : edge.source === selectedId() || edge.target === selectedId()), goal: edge.kind === "goal" }}
+                classList={{ selected: edgeId() === edge.id || (!!routeKey() ? edge.kind !== "option" && edge.occurrences.some(item => item.routeKey === routeKey()) : edge.source === selectedId() || edge.target === selectedId()), goal: edge.kind === "goal", option: edge.kind === "option" }}
                 d={graphEdgePath(edge, byId(), edgePairs().has(JSON.stringify([edge.target, edge.source])))} marker-end="url(#knowledge-arrow)"
                 onClick={() => selectEdge(edge)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectEdge(edge); } }}>
-                <title>{edge.kind === "goal" ? "达成目标" : "已记录的操作顺序"} · {new Set(edge.occurrences.map(item => item.routeKey)).size} 条来源路径</title>
+                <title>{edge.kind === "goal" ? "达成目标" : edge.kind === "option" ? "观测到但未尝试的操作" : "已走通的操作顺序"} · {new Set(edge.occurrences.map(item => item.routeKey)).size} 条来源路径</title>
               </path>}</For>
             </svg>
             <For each={graph().nodes}>{node => <button class="knowledge-node" data-kind={node.kind} data-node-id={node.id} data-color={node.color}
-              classList={{ root: node.kind === "start", selected: selectedId() === node.id, match: matchIds().has(node.id), "route-member": routeNodes().has(node.id) }}
+              classList={{ root: node.kind === "start", untried: !!node.untried, selected: selectedId() === node.id, match: matchIds().has(node.id), "route-member": routeNodes().has(node.id) }}
               style={{ left: node.x + 'px', top: node.y + 'px', width: node.radius * 2 + 'px', height: node.radius * 2 + 'px' }} title={node.title + ' · ' + source(node)} aria-pressed={selectedId() === node.id} onClick={() => locate(node)}>
               <span class="knowledge-node-symbol" aria-hidden="true">{node.kind === "start" ? "⌂" : node.kind === "goal" ? "✓" : "⑂"}</span>
-              <span class="knowledge-node-title">{node.title}</span><small>{node.kind === "start" ? "起点 · " + toolName(node.tool) : node.kind === "goal" ? "目标 · " + node.routeKeys.length + " 条路径" : (outgoingCounts().get(node.id) ?? 0) + " 个后续操作"}</small>
+              <span class="knowledge-node-title">{node.title}</span><small>{node.kind === "start" ? "起点 · " + toolName(node.tool) : node.untried ? "未尝试 · 仅观测到" : node.kind === "goal" ? "目标 · " + node.routeKeys.length + " 条路径" : (outgoingCounts().get(node.id) ?? 0) + " 个后续操作"}</small>
             </button>}</For>
           </div>
         </Show>
         <div class="knowledge-controls"><button aria-label="缩小" onClick={() => zoom(1 / 1.25)}>−</button><span>{Math.round(camera().scale * 100)}%</span><button aria-label="放大" onClick={() => zoom(1.25)}>＋</button><button onClick={fit}>适应画布</button></div>
-        <div class="knowledge-help">全量展示 · 拖动平移 · 滚轮缩放 · 点击节点或连线查看来源</div>
+        <div class="knowledge-help">实线为已走通的路径 · 灰色节点与点线为观测到但未尝试的操作 · 拖动平移 · 滚轮缩放 · 点击节点或连线查看来源</div>
       </div>
       <aside class="knowledge-detail" classList={{ idle: !selected() && !query().trim() }} aria-label="操作详情">
         <Show when={query().trim()}><section class="knowledge-search-results" aria-label="搜索结果"><h2 aria-live="polite">全部图谱 · {matches().length} 项结果</h2>
           <For each={matches()} fallback={<p>没有找到匹配的步骤或目标，请换个关键词。</p>}>{node => <button class="knowledge-next knowledge-search-result" onClick={() => locate(node)}><strong>{node.title}</strong><small>{source(node)}</small><span>定位到此处 ↗</span></button>}</For>
         </section></Show>
-        <Show when={selectedEdge()}>{edge => <section class="knowledge-edge-detail"><h2>连接来源</h2><p>{byId().get(edge().source)!.title} → {byId().get(edge().target)!.title}</p><p>{edge().kind === "goal" ? "目标关系" : "操作顺序"}</p><For each={edgeRoutes()}>{route => <button class="knowledge-next" onClick={() => setRouteKey(route.key)}>{route.task} · 第 {edge().occurrences.filter(item => item.routeKey === route.key).map(item => item.step).join("、")} 步</button>}</For></section>}</Show>
-        <Show when={selected()} fallback={<><h2>全部起点 · {graph().starts.length}</h2><p>实线表示记录中的操作顺序，虚线连接目标。同一应用内同名操作汇聚，不同来源可通过共同目标关联。</p>
+        <Show when={selectedEdge()}>{edge => <section class="knowledge-edge-detail"><h2>连接来源</h2><p>{byId().get(edge().source)!.title} → {byId().get(edge().target)!.title}</p><p>{edge().kind === "goal" ? "目标关系" : edge().kind === "option" ? "未尝试：走这些路径时在界面上看到的其它操作，未验证可用" : "已走通的操作顺序"}</p><For each={edgeRoutes()}>{route => <button class="knowledge-next" onClick={() => setRouteKey(route.key)}>{route.task} · {edge().kind === "option" ? "第 " + edge().occurrences.filter(item => item.routeKey === route.key).map(item => item.step - 1).join("、") + " 步后的界面" : "第 " + edge().occurrences.filter(item => item.routeKey === route.key).map(item => item.step).join("、") + " 步"}</button>}</For></section>}</Show>
+        <Show when={selected()} fallback={<><h2>全部起点 · {graph().starts.length}</h2><p>实线表示已走通的操作顺序，虚线连接目标，灰色点线与灰色节点是当时界面上看到但未尝试的操作。同一应用内同名操作汇聚，不同来源可通过共同目标关联。</p>
           <For each={graph().starts}>{node => <button class="knowledge-next knowledge-search-result" onClick={() => locate(node)}><strong>{node.title}</strong><small>{source(node)}</small></button>}</For>
         </>}>
           {node => <><h2>{node().title}</h2><p>{source(node())}</p>
             <h3>从哪里来 · {incoming().length}</h3><For each={incoming()}>{edge => <button class="knowledge-next" onClick={() => locate(byId().get(edge.source)!)}>{byId().get(edge.source)!.title}<span>定位</span></button>}</For>
-            <h3>接下来 · {outgoing().length}</h3><For each={outgoing()} fallback={<p>已到记录终点，请核对下方成功检查点。</p>}>{edge => <button class="knowledge-next" onClick={() => locate(byId().get(edge.target)!)}>{byId().get(edge.target)!.title}<span>{edge.kind === "goal" ? "查看目标" : "定位下一步"}</span></button>}</For>
+            <h3>接下来 · {outgoing().length}</h3><For each={outgoing()} fallback={<p>已到记录终点，请核对下方成功检查点。</p>}>{edge => <button class="knowledge-next" onClick={() => locate(byId().get(edge.target)!)}>{byId().get(edge.target)!.title}<span>{edge.kind === "goal" ? "查看目标" : edge.kind === "option" ? "未尝试" : "已走通 · 定位"}</span></button>}</For>
             <h3>来源路径与检查点</h3><p>同名操作表示共同概念。选择一条来源路径，核对入口条件与完整顺序。</p>
             <For each={selectedRoutes()}>{route => <details class="knowledge-route"><summary>{route.task}<small>{toolName(route.tool)} · {route.scope} · {route.source === "demo" ? "用户演示 · " : ""}{route.confidence === "reused" ? "多会话复用" : "首次验证"}</small></summary>
               <button class="btn" onClick={() => setRouteKey(route.key)}>高亮这条路径</button>
               <Show when={route.recordingId}>{id => <button class="btn" onClick={() => { setJianpuFocus(id()); setView("jianpu"); }}>查看剑谱</button>}</Show><p>入口：{route.conditions.join("；")}</p>
               <ol><For each={route.steps}>{(step, i) => <li><button class="knowledge-step-link" onClick={() => locate(byId().get(route.nodeIds[i() + 1])!)}>{step}</button></li>}</For></ol>
               <strong>成功检查点</strong><ul><For each={route.checks}>{check => <li>{check}</li>}</For></ul>
+              <Show when={route.alternatives?.length}><strong>途中看到但未尝试</strong><ul><For each={route.alternatives}>{alt => <li>{alt.at ? "第 " + alt.at + " 步后" : "入口"}：{alt.actions.join("、")}</li>}</For></ul></Show>
               <Show when={route.pitfalls.length}><strong>已知注意事项</strong><ul><For each={route.pitfalls}>{pitfall => <li>{pitfall}</li>}</For></ul></Show>
             </details>}</For>
           </>}

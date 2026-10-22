@@ -71,6 +71,9 @@
 
 .knowledge-edges > path { pointer-events: stroke; cursor: pointer; }
 .knowledge-edges > path.goal { stroke-dasharray: 6 5; }
+.knowledge-edges > path.option { stroke: #7d8c96; stroke-dasharray: 2 5; opacity: .45; }
+.knowledge-node.untried { --node-a: #6f7d87; --node-b: #4f5b64; color: #e1e8ed; border-style: dashed; opacity: .7; }
+.knowledge-node.untried small { color: #d3dce2; }
 .knowledge-edges > path:focus-visible { stroke: #fff; stroke-width: 5; outline: none; }
 .knowledge-node.route-member { box-shadow: 0 0 0 5px #ffffff60, 0 0 24px #92d7ee55; }
 .knowledge-step-link { border: 0; background: none; color: var(--accent); text-align: left; padding: 2px 0; }

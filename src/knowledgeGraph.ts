@@ -7,6 +7,8 @@ export interface KnowledgeRoute {
   steps: string[];
   checks: string[];
   pitfalls: string[];
+  /** Actions seen on the screen after step `at` (0 = entry) that the route never tried. */
+  alternatives?: { at: number; actions: string[] }[];
   confidence: string;
   successes: number;
   /** demo = 整理自用户演示的剑谱。 */
@@ -35,12 +37,14 @@ export interface GraphNode {
   y: number;
   radius: number;
   color: number;
+  /** Only ever observed as an option; no recorded route executed it. */
+  untried?: boolean;
 }
 export interface GraphEdge {
   id: string;
   source: string;
   target: string;
-  kind: 'step' | 'goal';
+  kind: 'step' | 'goal' | 'option';
   occurrences: { routeKey: string; step: number }[];
 }
 
@@ -66,16 +70,21 @@ export function buildKnowledgeGraph(groups: KnowledgeGroup[]) {
     };
     const nodeIds = [add('start', route.conditions, route.conditions.join('；') || '无额外入口条件'),
       ...route.steps.map(step => add('action', step, step)), add('goal', route.task, route.task)];
-    for (let step = 1; step < nodeIds.length; step++) {
-      const source = nodeIds[step - 1], target = nodeIds[step];
-      const kind = step === nodeIds.length - 1 ? 'goal' : 'step';
+    const link = (source: string, target: string, kind: GraphEdge['kind'], step: number) => {
       const id = JSON.stringify([source, target, kind]);
       let edge = edges.get(id);
       if (!edge) { edge = { id, source, target, kind, occurrences: [] }; edges.set(id, edge); }
       edge.occurrences.push({ routeKey: key, step });
-    }
+    };
+    for (let step = 1; step < nodeIds.length; step++) link(nodeIds[step - 1], nodeIds[step], step === nodeIds.length - 1 ? 'goal' : 'step', step);
+    // Option occurrence `step` points one past the screen it was seen on, like step edges do.
+    for (const alt of route.alternatives ?? []) if (alt.at <= route.steps.length) for (const action of alt.actions) link(nodeIds[alt.at], add('action', action, action), 'option', alt.at + 1);
     routes.push({ ...route, key, tool: group.tool, scope: group.scope, nodeIds });
   }
+  // An option some route actually executed is already a tried step; drop the duplicate dashed edge.
+  for (const [id, edge] of edges) if (edge.kind === 'option' && edges.has(JSON.stringify([edge.source, edge.target, 'step']))) edges.delete(id);
+  const tried = new Set(routes.flatMap(route => route.nodeIds));
+  for (const node of nodes.values()) if (!tried.has(node.id)) node.untried = true;
   const allNodes = [...nodes.values()], allEdges = [...edges.values()];
   const adjacent = new Map(allNodes.map(node => [node.id, new Set<string>()]));
   for (const edge of allEdges) {

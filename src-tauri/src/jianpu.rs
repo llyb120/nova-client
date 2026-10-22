@@ -217,7 +217,7 @@ const LEARN_RULES: &str = "你在整理一段用户亲手演示的桌面操作�
 1. 按 app 拆开（图谱按应用/网站隔离，不能跨应用拼接）；带 url 的步骤是在 Chrome 网页里的操作，按网站 origin 拆开，归为 chrome 经验；每个应用/网站按目标切成一条或多条路径，task 写成通用目标，如“给联系人发送文件”。\n\
 2. 对照截图把坐标写成语义步骤（如 点击「发送」按钮），去掉试错、绕路和撤销的操作；超过 12 步时合并相邻步骤。\n\
 3. 输入内容：必须输入指定内容的（命令、网址、路径、配置值、固定选项文字）在步骤里原样写出，如 输入「git status」并回车；每次会变的（搜索词、人名、日期、正文）只写方法，如 在搜索框输入要找的联系人名称。拿不准按会变处理。\n\
-4. 桌面应用的路径调用 jianlai operation=experience_save，scope 填该应用 app 原值；Chrome 网页里的路径调用 chrome operation=experience_save，scope 填网站 origin（如 https://github.com，取自 url），conditions 写起始页面路径，步骤按网页控件写（如 点击 button「提交」），不写坐标。experience 都带 recordingId、task、conditions（入口条件）、steps、checks（演示最后可见的结果）、pitfalls（演示中暴露的坑，可空）、evidence（简述演示终态）、outcome=success、redacted=true；不需要 snapshotId/tabTag。\n\
+4. 桌面应用的路径调用 jianlai operation=experience_save，scope 填该应用 app 原值；Chrome 网页里的路径调用 chrome operation=experience_save，scope 填网站 origin（如 https://github.com，取自 url），conditions 写起始页面路径，步骤按网页控件写（如 点击 button「提交」），不写坐标。experience 都带 recordingId、task、conditions（入口条件）、steps、checks（演示最后可见的结果）、pitfalls（演示中暴露的坑，可空）、alternatives（可空：截图里看得到但演示没点的其它操作，at=第几步之后的界面，0为入口）、evidence（简述演示终态）、outcome=success、redacted=true；不需要 snapshotId/tabTag。\n\
 5. 保存完用一两句话汇报存了哪几条路径。演示提炼不出可复用路径时直接说明原因，不保存。";
 
 pub(crate) fn learn(app: &AppHandle, id: &str) -> Result<String> {
