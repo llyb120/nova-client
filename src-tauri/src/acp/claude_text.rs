@@ -29,11 +29,11 @@ pub(super) fn args(model: &str) -> Vec<String> {
 /// The caller must apply the same backend launch_env and proxy before spawning this command.
 pub(super) fn command(adapter: &str, model: &str, cwd: &Path) -> Result<Command, String> {
     let adapter_path = super::resolve_program_on_path(adapter)
-        .and_then(|path| path.canonicalize().ok())
+        .and_then(|path| dunce::canonicalize(&path).ok())
         .ok_or("找不到配置的 Claude ACP adapter，未回退到全工具会话")?;
     let cli = sdk_cli(&adapter_path).or_else(|| {
         let sibling = super::resolve_sibling_program(adapter, "claude");
-        super::resolve_program_on_path(&sibling).and_then(|path| path.canonicalize().ok())
+        super::resolve_program_on_path(&sibling).and_then(|path| dunce::canonicalize(&path).ok())
     }).ok_or("找不到 Claude CLI 或 adapter 的 SDK CLI；请修复安装（保留 optional dependencies）")?;
     // Node's main-script loader (and cmd shims) reject canonicalize's verbatim paths.
     #[cfg(windows)]
@@ -42,7 +42,7 @@ pub(super) fn command(adapter: &str, model: &str, cwd: &Path) -> Result<Command,
     let mut cmd = if cli.extension().is_some_and(|ext| ext == "js") {
         let node = super::resolve_sibling_program(adapter, "node");
         let node = super::resolve_program_on_path(&node)
-            .and_then(|path| path.canonicalize().ok())
+            .and_then(|path| dunce::canonicalize(&path).ok())
             .ok_or("Claude SDK cli.js 需要 adapter 使用的 Node.js 运行时")?;
         let mut cmd = Command::new(node);
         cmd.arg(&cli);
@@ -68,7 +68,7 @@ fn native_sdk_cli() -> Option<String> {
 }
 
 fn sdk_cli(adapter: &Path) -> Option<PathBuf> {
-    let adapter = adapter.canonicalize().ok()?;
+    let adapter = dunce::canonicalize(&adapter).ok()?;
     // Only read the installed entry/shim, never user settings. This disambiguates co-installed
     // old/new npm scopes without evaluating shell code. Unix symlinks resolve to the entry itself.
     let mut shim = String::new();
@@ -85,7 +85,7 @@ fn sdk_cli(adapter: &Path) -> Option<PathBuf> {
         for root in package.as_deref().into_iter().chain(std::iter::once(dir)) {
             let sdk = root.join("node_modules/@anthropic-ai/claude-agent-sdk");
             if !sdk.join("package.json").is_file() { continue; }
-            let sdk = sdk.canonicalize().ok()?;
+            let sdk = dunce::canonicalize(&sdk).ok()?;
             if let Some(relative) = native_sdk_cli() {
                 // Node's dependency lookup: nested optional dependency, then hoisted ancestors.
                 for parent in sdk.ancestors().take(8) {
@@ -146,14 +146,14 @@ mod tests {
                 let legacy = sdk.join("cli.js");
                 file(&legacy, "// legacy SDK CLI");
                 for adapter in [&shim, &entry] {
-                    assert_eq!(sdk_cli(adapter), Some(legacy.canonicalize().unwrap()));
+                    assert_eq!(sdk_cli(adapter), Some(dunce::canonicalize(&legacy).unwrap()));
                 }
                 if let Some(relative) = native_sdk_cli() {
                     // Both SDK-local and hoisted native optional dependencies.
                     for native_root in [&sdk, root] {
                         let native = native_root.join("node_modules").join(&relative);
                         file(&native, "native fixture");
-                        assert_eq!(sdk_cli(&shim), Some(native.canonicalize().unwrap()));
+                        assert_eq!(sdk_cli(&shim), Some(dunce::canonicalize(&native).unwrap()));
                         std::fs::remove_file(native).unwrap();
                     }
                 }
@@ -210,7 +210,7 @@ console.log(JSON.stringify({args:process.argv.slice(2),cwd:process.cwd(),
         assert!(output.status.success(), "mock exited {}: {}", output.status, String::from_utf8_lossy(&output.stderr));
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["args"], serde_json::json!(args("custom model:high")));
-        assert_eq!(Path::new(result["cwd"].as_str().unwrap()).canonicalize().unwrap(), temp.path().canonicalize().unwrap());
+        assert_eq!(dunce::canonicalize(result["cwd"].as_str().unwrap()).unwrap(), dunce::canonicalize(temp.path()).unwrap());
         assert_eq!(result["inherited"], true);
         assert_eq!(result["nested"], false);
     }

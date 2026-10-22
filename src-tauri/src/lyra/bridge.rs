@@ -335,10 +335,7 @@ async fn handle_prompt(
             .unwrap_or("build")
             .to_string(),
     };
-    let cwd_path = std::path::PathBuf::from(&ctx.cwd);
-    let cwd_path = cwd_path
-        .canonicalize()
-        .unwrap_or_else(|_| std::path::PathBuf::from(&ctx.cwd));
+    let cwd_path = dunce::canonicalize(&ctx.cwd).unwrap_or_else(|_| std::path::PathBuf::from(&ctx.cwd));
 
     let env = config::process_env();
     let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;

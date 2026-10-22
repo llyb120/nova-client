@@ -348,8 +348,7 @@ fn trace(label: &str, start: Instant) {
 }
 
 fn normalize_root(root: &Path) -> String {
-    let value = root
-        .canonicalize()
+    let value = dunce::canonicalize(root)
         .unwrap_or_else(|_| root.to_path_buf())
         .to_string_lossy()
         .replace('\\', "/")

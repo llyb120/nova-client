@@ -1571,7 +1571,7 @@ pub(crate) fn tool_owner(root: &Path, owner: &str) -> Result<String, String> {
     if owner.trim().is_empty() || owner.len() > 4096 {
         return Err("缺少有效工具客户端标识，请重启工具客户端".into());
     }
-    let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let root = dunce::canonicalize(root).map_err(|e| e.to_string())?;
     if !root.is_dir() {
         return Err("工具工作目录不存在".into());
     }

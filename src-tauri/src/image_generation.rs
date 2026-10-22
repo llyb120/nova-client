@@ -105,7 +105,7 @@ async fn generate(http: &reqwest::Client, config: &Config, request: &Request) ->
     if !matches!(request.size.as_str(), "auto" | "1024x1024" | "1024x1536" | "1536x1024") {
         return Err("不支持的图片尺寸".into());
     }
-    let output_dir = request.output_dir.canonicalize().map_err(|_| "图片输出目录不存在")?;
+    let output_dir = dunce::canonicalize(&request.output_dir).map_err(|_| "图片输出目录不存在")?;
     if !output_dir.is_dir() { return Err("图片输出路径必须是目录".into()); }
     let base_url = config.base_url.trim_end_matches('/');
     let call = if request.reference_images.is_empty() {

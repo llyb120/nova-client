@@ -2089,7 +2089,7 @@ fn remote_file(app: &AppHandle, thread_id: &str, cwd: &str, path: &str) -> Resul
     } else {
         std::path::Path::new(&thread_cwd).join(requested)
     };
-    let abs = std::fs::canonicalize(abs).map_err(|_| "文件不存在")?;
+    let abs = dunce::canonicalize(abs).map_err(|_| "文件不存在")?;
     let meta = abs.metadata().map_err(|e| format!("读取文件失败：{e}"))?;
     if !meta.is_file() {
         return Err("目标不是文件".into());
@@ -2140,8 +2140,8 @@ fn remote_cwd_matches(thread_cwd: &str, command_cwd: &str) -> bool {
         return true;
     }
     match (
-        std::fs::canonicalize(thread_cwd),
-        std::fs::canonicalize(command_cwd),
+        dunce::canonicalize(thread_cwd),
+        dunce::canonicalize(command_cwd),
     ) {
         (Ok(thread_cwd), Ok(command_cwd)) => thread_cwd == command_cwd,
         _ => false,

@@ -27,7 +27,7 @@ static DROPPED_FILES: std::sync::LazyLock<std::sync::Mutex<std::collections::Has
 pub(crate) fn allow_dropped_files(paths: &[PathBuf]) {
     if let Ok(mut allowed) = DROPPED_FILES.lock() {
         for path in paths {
-            if let Ok(path) = path.canonicalize() {
+            if let Ok(path) = dunce::canonicalize(&path) {
                 if path.is_file() { allowed.insert(path); }
             }
         }
@@ -233,8 +233,8 @@ pub(crate) fn root(state: &AppState, id: &str) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
-    let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let path = root.join(path).canonicalize().map_err(|e| e.to_string())?;
+    let root = dunce::canonicalize(&root).map_err(|e| e.to_string())?;
+    let path = dunce::canonicalize(root.join(path)).map_err(|e| e.to_string())?;
     if !path.starts_with(&root) && (!path.is_file() || !DROPPED_FILES.lock().map_err(|e| e.to_string())?.contains(&path)) {
         return Err("只能操作当前工作目录内的文件".into());
     }
@@ -309,7 +309,7 @@ fn search_names(root: &Path, query: &str) -> Result<Listing, String> {
     if query.len() > 256 {
         return Err("搜索词过长".into());
     }
-    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let root = dunce::canonicalize(&root).map_err(|e| e.to_string())?;
     let start = std::time::Instant::now();
     let mut entries = Vec::new();
     let mut truncated = false;
@@ -599,7 +599,7 @@ mod tests {
         fs::write(&sibling, "private").unwrap();
         let preview = open_preview(workspace.path(), file.to_str().unwrap()).unwrap();
         assert_eq!(preview.kind, "external");
-        assert_eq!(PathBuf::from(preview.path), file.canonicalize().unwrap());
+        assert_eq!(PathBuf::from(preview.path), dunce::canonicalize(&file).unwrap());
         assert!(read_preview(workspace.path(), sibling.to_str().unwrap()).is_err());
         assert!(open_preview(workspace.path(), external.path().to_str().unwrap()).is_err());
     }

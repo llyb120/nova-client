@@ -6010,7 +6010,7 @@ fn resolve_changed_working_directory(current: &str, path: &str) -> Result<String
         return Err("change_working_directory 缺少 path".into());
     }
     let path = std::path::Path::new(current).join(path);
-    let canonical = std::fs::canonicalize(&path)
+    let canonical = dunce::canonicalize(&path)
         .map_err(|error| format!("无法访问工作目录 {}：{error}", path.display()))?;
     if !canonical.is_dir() {
         return Err(format!("工作目录不是文件夹：{}", path.display()));

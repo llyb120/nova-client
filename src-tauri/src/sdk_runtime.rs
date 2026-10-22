@@ -989,7 +989,7 @@ impl SdkManager {
 
     fn change_working_directory(&self, thread_id: &str, cwd: &str) {
         let path = std::path::PathBuf::from(cwd);
-        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+        let canonical = dunce::canonicalize(&path).unwrap_or(path);
         if !canonical.is_dir() {
             return;
         }

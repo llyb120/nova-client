@@ -366,7 +366,7 @@ fn resolve_target(root: &Path, input: &str) -> Result<PathBuf, String> {
     } else {
         root.join(input)
     };
-    Ok(target.canonicalize().unwrap_or(target))
+    Ok(dunce::canonicalize(&target).unwrap_or(target))
 }
 
 fn mutation_lock(target: &Path) -> Arc<Mutex<()>> {

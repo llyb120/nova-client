@@ -306,7 +306,7 @@ fn gc_unreferenced_objects(data_dir: &Path, store: &StoreFile) {
 
 fn workspace_root(cwd: &Path) -> Result<PathBuf, String> {
     let root =
-        fs::canonicalize(cwd).map_err(|e| format!("无法访问工作目录 {}：{e}", cwd.display()))?;
+        dunce::canonicalize(cwd).map_err(|e| format!("无法访问工作目录 {}：{e}", cwd.display()))?;
     if !root.is_dir() {
         return Err(format!("工作目录不是文件夹：{}", root.display()));
     }

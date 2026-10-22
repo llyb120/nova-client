@@ -92,14 +92,14 @@ pub fn project_root(dir: &str) -> Result<String, String> {
     } else {
         Path::new(dir).join(common_dir)
     };
-    let common_dir = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
+    let common_dir = dunce::canonicalize(&common_dir).unwrap_or(common_dir);
     if common_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
         return Ok(worktree_root);
     }
     let Some(root) = common_dir.parent() else {
         return Ok(worktree_root);
     };
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     Ok(canonical.to_string_lossy().into_owned())
 }
 

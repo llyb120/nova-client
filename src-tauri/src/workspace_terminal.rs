@@ -174,7 +174,7 @@ fn shell_command(
     }
     let mut command = CommandBuilder::new(shell);
     command.args(args);
-    command.cwd(cwd);
+    command.cwd(dunce::simplified(cwd));
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     Ok(command)

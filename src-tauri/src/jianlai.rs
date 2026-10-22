@@ -1307,8 +1307,8 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             Ok(result)
         }
         "recall" => {
-            let path = std::fs::canonicalize(request.image_path.ok_or("recall缺少imagePath")?).map_err(err)?;
-            let folder = std::fs::canonicalize(shot_folder(&owner, "desktop-shots")).map_err(err)?;
+            let path = dunce::canonicalize(request.image_path.ok_or("recall缺少imagePath")?).map_err(err)?;
+            let folder = dunce::canonicalize(shot_folder(&owner, "desktop-shots")).map_err(err)?;
             if !path.starts_with(folder) || !matches!(path.extension().and_then(|s| s.to_str()), Some("jpg" | "png")) {
                 return Err("只能回看本会话的桌面截图".into());
             }

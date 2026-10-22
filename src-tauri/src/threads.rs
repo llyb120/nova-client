@@ -726,6 +726,7 @@ impl Thread {
         ephemeral: bool,
     ) -> Self {
         let now = now_ms();
+        let cwd = plain_path(&cwd);
         Thread {
             id: uuid::Uuid::new_v4().to_string(),
             title: "新会话".into(),
@@ -1104,6 +1105,10 @@ pub struct ThreadMeta {
     pub active_clue_card_id: Option<String>,
 }
 
+fn plain_path(path: &str) -> String {
+    crate::sdk_runtime::display_working_directory(std::path::Path::new(path))
+}
+
 /// 最近项目列表（独立持久化，删除会话后仍保留）
 #[derive(Serialize, Deserialize, Default)]
 struct ProjectsFile {
@@ -1122,7 +1127,10 @@ impl ProjectStore {
             .ok()
             .and_then(|s| serde_json::from_str::<ProjectsFile>(&s).ok())
             .map(|f| f.projects)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .iter()
+            .map(|p| plain_path(p))
+            .collect();
         ProjectStore { path, projects }
     }
 
@@ -1142,7 +1150,7 @@ impl ProjectStore {
     pub fn touch(&mut self, cwd: &str) {
         let key = crate::project_path_key(cwd);
         self.projects.retain(|p| crate::project_path_key(p) != key);
-        self.projects.insert(0, cwd.to_string());
+        self.projects.insert(0, plain_path(cwd));
         self.projects.truncate(20);
         self.save();
     }
@@ -1172,7 +1180,10 @@ impl RoamingStore {
             .ok()
             .and_then(|s| serde_json::from_str::<RoamingFile>(&s).ok())
             .map(|f| f.folders)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .iter()
+            .map(|p| plain_path(p))
+            .collect();
         RoamingStore { path, folders }
     }
 
@@ -1482,6 +1493,25 @@ impl ThreadStore {
                 Err(error) => eprintln!("[threads] 无法读取旧会话，保留原文件：{error}"),
             }
         }
+        // 旧版本用 std canonicalize 存下了 \\?\ 前缀路径，cmd/资源管理器等不接受，加载时一次性修正。
+        let mut fixed_ids = Vec::new();
+        for thread in &mut threads {
+            let mut paths = vec![&mut thread.cwd];
+            if let Some(worktree) = thread.worktree.as_mut() {
+                paths.extend([&mut worktree.repo, &mut worktree.path]);
+            }
+            let mut fixed = false;
+            for path in paths {
+                let plain = plain_path(path);
+                if plain != *path {
+                    *path = plain;
+                    fixed = true;
+                }
+            }
+            if fixed {
+                fixed_ids.push(thread.id.clone());
+            }
+        }
         let mut store = ThreadStore {
             dir,
             threads,
@@ -1503,7 +1533,7 @@ impl ThreadStore {
                 }
             }
         }
-        for id in retry_ids {
+        for id in retry_ids.into_iter().chain(fixed_ids) {
             store.save_thread(&id);
         }
         if legacy && migrated {

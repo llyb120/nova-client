@@ -98,7 +98,7 @@ fn directory(path: &Path) -> Result<(), String> {
 
 fn prepare(root: &Path) -> Result<PathBuf, String> {
     directory(root)?;
-    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let root = dunce::canonicalize(&root).map_err(|e| e.to_string())?;
     directory(&root.join("files"))?;
     Ok(root)
 }

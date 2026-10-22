@@ -2896,6 +2896,8 @@ fn open_in_editor(
     if editor.is_empty() {
         return Err("未配置编辑器，请在设置中填写（如 cursor / code / zed）".into());
     }
+    #[cfg(windows)]
+    let path = explorer_path(&path);
     // 相对路径按线程工作目录解析
     let abs = {
         let p = std::path::Path::new(&path);
@@ -2912,9 +2914,9 @@ fn open_in_editor(
         return Err(format!("文件不存在：{abs}"));
     }
     let scratch = cwd.contains(SCRATCH_MARK);
-    let in_project = std::fs::canonicalize(&abs)
+    let in_project = dunce::canonicalize(&abs)
         .ok()
-        .zip(std::fs::canonicalize(&cwd).ok())
+        .zip(dunce::canonicalize(&cwd).ok())
         .is_some_and(|(file, project)| file.starts_with(project));
     let loc = match line {
         Some(l) => format!("{abs}:{l}"),
@@ -2954,6 +2956,7 @@ fn open_in_editor(
 }
 
 fn open_path_default(abs: &std::path::Path) -> Result<(), String> {
+    let abs = dunce::simplified(abs);
     if !abs.is_file() {
         return Err(format!("文件不存在：{}", abs.to_string_lossy()));
     }
@@ -3291,6 +3294,8 @@ fn open_in_explorer(path: String) -> Result<(), String> {
 /// 在终端中打开目录：Windows 优先 Windows Terminal；macOS 用 Terminal.app
 #[tauri::command]
 fn open_in_terminal(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    let path = explorer_path(&path);
     if !std::path::Path::new(&path).is_dir() {
         return Err(format!("目录不存在：{path}"));
     }
@@ -5387,7 +5392,7 @@ fn register_experience_trails(app: &tauri::AppHandle) {
         tauri::async_runtime::spawn_blocking(move || {
             // Chrome owners are "<mcp client id>:<canonical cwd>". ponytail: two sessions running
             // browser acts in the same directory at once share each other's trail.
-            let suffix = cwd.and_then(|c| std::fs::canonicalize(c).ok()).map(|c| format!(":{}", c.display()));
+            let suffix = cwd.and_then(|c| dunce::canonicalize(c).ok()).map(|c| format!(":{}", c.display()));
             tool_experience::finish_turn(&tool_experience::dir(),
                 |o| o == tid || suffix.as_deref().is_some_and(|s| o.ends_with(s)), keep);
         });

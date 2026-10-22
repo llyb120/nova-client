@@ -201,7 +201,7 @@ fn manage_projects(args: &[String]) -> Result<(), String> {
         }
         Some("add") => {
             let raw = args.get(1).ok_or("用法：Nova server project add <目录>")?;
-            let path = std::fs::canonicalize(raw)
+            let path = dunce::canonicalize(raw)
                 .map_err(|error| format!("项目目录不存在：{raw}（{error}）"))?;
             if !path.is_dir() {
                 return Err(format!("不是目录：{}", path.display()));
@@ -216,13 +216,13 @@ fn manage_projects(args: &[String]) -> Result<(), String> {
             let raw = args
                 .get(1)
                 .ok_or("用法：Nova server project remove <目录>")?;
-            let requested = std::fs::canonicalize(raw)
+            let requested = dunce::canonicalize(raw)
                 .unwrap_or_else(|_| PathBuf::from(raw))
                 .to_string_lossy()
                 .to_string();
             let before = store.projects.len();
             store.projects.retain(|stored| {
-                let normalized = std::fs::canonicalize(stored)
+                let normalized = dunce::canonicalize(stored)
                     .unwrap_or_else(|_| PathBuf::from(stored))
                     .to_string_lossy()
                     .to_string();
@@ -541,9 +541,9 @@ pub fn path_allowed(path: &str) -> bool {
     if roots.is_empty() {
         return false;
     }
-    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let candidate = dunce::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
     roots.into_iter().any(|root| {
-        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let root = dunce::canonicalize(&root).unwrap_or(root);
         candidate.starts_with(root)
     })
 }
