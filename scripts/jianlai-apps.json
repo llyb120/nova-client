@@ -3,7 +3,7 @@
     "app": "聊天类（微信/企业微信/QQ/钉钉/飞书）",
     "match": ["wechat", "weixin", "wxwork", "微信", "qq.exe", "tim.exe", "dingtalk", "钉钉", "feishu", "lark", "飞书"],
     "rules": [
-      "找人：点搜索框或 press Ctrl+F，type 姓名后 press Enter 选第一个结果；不在会话列表里滚动猜。",
+      "找人：目标已在当前可见的会话列表里就直接点它；否则点左上搜索框（企业微信不响应 Ctrl+F），type 姓名后 press Enter 选第一个结果；不在会话列表里滚动猜。",
       "发消息：先点一次底部输入区再 type；Enter 发送、Shift+Enter 换行；用户只要草稿时不要 press Enter。",
       "发送前核对标题栏/会话名是目标对话，群名与人名高度相似，发错不可撤。",
       "发图片或文件用输入区上方工具条的按钮，拖拽与剪贴板粘贴常不生效。",
