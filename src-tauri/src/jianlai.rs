@@ -871,7 +871,10 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
                 if other.id().map_err(err)? == id {
                     break;
                 }
-                if other.is_minimized().map_err(err)? {
+                // The app's own popups (search results, menus, dropdowns) are separate top-level windows;
+                // a screen-crop shot already shows them, so clicking them is what the model saw.
+                if other.is_minimized().map_err(err)?
+                    || (shot.desktop_capture && Some(other.pid().map_err(err)?) == shot.surface.pid) {
                     continue;
                 }
                 let r = window_surface(other)?;
@@ -928,7 +931,10 @@ fn action_delay(actions: &[Action], index: usize) -> Duration {
     // Explicit waits already provide settling time; pointer motion needs no extra delay.
     let redundant = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "wait" | "move")
         || actions.get(index + 1).is_some_and(|a| a.action == "wait");
-    Duration::from_millis(if redundant { 0 } else { 80 })
+    // A click may open/focus a popup and typed text may trigger search results; apps need time
+    // to react before the next input lands, or keystrokes go to a control that is not ready yet.
+    let reacts = matches!(actions[index].action.as_str(), "click" | "double_click" | "type");
+    Duration::from_millis(if redundant { 0 } else if reacts { 300 } else { 80 })
 }
 
 fn needs_stable_feedback(actions: &[Action], needs_review: bool) -> bool {
@@ -1940,7 +1946,13 @@ mod tests {
             {"action":"type","text":"next"}
         ])).unwrap();
         let delays: Vec<_> = (0..actions.len()).map(|i| action_delay(&actions, i).as_millis()).collect();
-        assert_eq!(delays, [0, 0, 0, 0, 0, 80, 0]);
+        assert_eq!(delays, [0, 0, 0, 0, 0, 300, 0]);
+        let chained: Vec<Action> = serde_json::from_value(json!([
+            {"action":"click","x":10,"y":10}, {"action":"type","text":"a"},
+            {"action":"press","key":"Enter"}, {"action":"press","key":"Tab"}
+        ])).unwrap();
+        let delays: Vec<_> = (0..chained.len()).map(|i| action_delay(&chained, i).as_millis()).collect();
+        assert_eq!(delays, [300, 300, 80, 0]);
         assert!(!needs_stable_feedback(&[], false));
         assert!(!needs_stable_feedback(&actions[4..5], false));
         assert!(needs_stable_feedback(&actions[4..5], true));
