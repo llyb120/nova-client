@@ -343,16 +343,12 @@ pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope>
         }
         (scene, (thread.agent_kind.clone(), thread.model.clone().unwrap_or_default()), upstream, thread.employee_thread)
     };
-    let mut scope = scope_of(scene, &current, &upstream, |s| state.scene_model(s).ok());
-    // 数字员工：操作电脑永远是单独的剑来会话（即使同一模型），由员工调度排队占用桌面。
-    let computer = settings::Scene::Computer;
-    if employee && scene != computer {
-        scope.covered.retain(|s| *s != computer);
-        if !upstream.contains(&computer) && !scope.handoff.contains(&computer) && state.scene_model(computer).is_ok() {
-            scope.handoff.push(computer);
-        }
+    // 数字员工不走 Stage 转交与升阶：每段会话只做本场景的事，换场景由员工调度接力成新会话（见 employee::relay）；
+    // 桌面/浏览器工具只给剑来段，它由员工调度排队占用桌面。
+    if employee {
+        return Some(AutoScope { scene, covered: vec![scene], handoff: Vec::new(), child: false });
     }
-    Some(scope)
+    Some(scope_of(scene, &current, &upstream, |s| state.scene_model(s).ok()))
 }
 
 /// 自动模式会话首条消息的隐式说明：哪些场景可转交、主会话还附项目目录清单。无可转交场景时为 None。

@@ -1,16 +1,18 @@
 {
   "name": "employee",
-  "description": "Nova 数字员工的职责、任务（待办）与长期记忆。职责只是触发的依据：做什么 + 何时触发，归用户所有；每次触发生成一条独立任务，续做、让出、重试都在任务上。员工是触发制的：每件事只在安排好的时间触发，触发时直接干活，没有会话去轮询“要不要做”。用户在任何会话里说“交给员工：xxx”时，调用 add(kind=todo,text=xxx) 记下后告知用户已交给员工，不要自己去做。list 查看当前时间 now、职责/任务与待确认 inbox/最近运行/记得最牢的 30 条记忆 memories（总数 memoryCount）/场景 scenes；add 新增职责(kind=duty)或待办(kind=todo)：职责的触发规则三选一——每天固定时刻给 times，用户明确“每隔 N 分钟/小时”给 everyMinutes（立即开始，之后距上次完成按间隔触发），条件型或时间不固定的为动态职责，用 nextAt 或 nextCheckInMinutes 安排首次执行；note 写用户对这条职责的细化要求，每次执行都会带上；待办默认立即处理，执行完自动移除，以后某时才做的给 nextAt；update 修改职责 text/note/profile/enabled/times/everyMinutes，或给动态职责 nextAt/nextCheckInMinutes；update 用户待办只能用 nextAt/nextCheckInMinutes 改期；done 删除待办/待确认，或移除职责；ask 把没有明确授权的不可逆操作（支付、删除、对外发送、提交审批等）记为待确认并通知用户，然后停止该操作；help 只在执行任务时用：缺少只有交代这件事的人才能提供的信息时，把要他补充的内容写进 text，任务挂起并通知他（团队成员由他的本地员工去查或他亲手回复），调用后结束本轮，补充到了会在原会话续做；remember 记下跨任务有用的稳定信息（一条一事，≤200 字）：写前对照已有记忆，同一件事带 id 覆盖更新、新事实取代旧事实时覆盖或 forget 旧的、已记着的不重复写；forget 按 id 删除过时记忆。记忆会遗忘：长期没被任务用到的会变淡并自动删除，被用得越多越牢；每次任务只带上最相关的几条。权限：员工执行任务的会话只能 list/ask/help/remember/forget、add 待办，以及给自己所属的动态职责安排下次（nextAt/nextCheckInMinutes）或 enabled=false 停用；职责内容、备注和固定规则只有用户能改。",
+  "description": "Nova 数字员工的职责、任务（待办）与长期记忆。职责只是触发的依据：做什么 + 何时触发，归用户所有；每次触发生成一条独立任务，续做、让出、重试都在任务上。员工是触发制的：每件事只在安排好的时间触发，触发时直接干活，没有会话去轮询“要不要做”。用户在任何会话里说“交给员工：xxx”时，调用 add(kind=todo,text=xxx) 记下后告知用户已交给员工，不要自己去做。list 查看当前时间 now、职责/任务与待确认 inbox/最近运行/记得最牢的 30 条记忆 memories（总数 memoryCount）/场景 scenes；add 新增职责(kind=duty)或待办(kind=todo)：职责的触发规则三选一——每天固定时刻给 times，用户明确“每隔 N 分钟/小时”给 everyMinutes（立即开始，之后距上次完成按间隔触发），条件型或时间不固定的为动态职责，用 nextAt 或 nextCheckInMinutes 安排首次执行；note 写用户对这条职责的细化要求，每次执行都会带上；待办默认立即处理，执行完自动移除，以后某时才做的给 nextAt；update 修改职责 text/note/profile/enabled/times/everyMinutes，或给动态职责 nextAt/nextCheckInMinutes；update 用户待办只能用 nextAt/nextCheckInMinutes 改期；done 删除待办/待确认，或移除职责；ask 把没有明确授权的不可逆操作（支付、删除、对外发送、提交审批等）记为待确认并通知用户，然后停止该操作；help 只在执行任务时用：缺少只有交代这件事的人才能提供的信息时，把要他补充的内容写进 text，任务挂起并通知他（团队成员由他的本地员工去查或他亲手回复），调用后结束本轮，补充到了会在原会话续做；relay 只在执行任务时用：需要另一个场景（scene=computer 操作电脑、coding 编码并给 cwd、lightweight 其余）或对话太长要换新会话时登记接力，把最后的回复写成交接说明后结束本轮，系统用该场景的模型新开一段会话接着做；remember 记下跨任务有用的稳定信息（一条一事，≤200 字）：写前对照已有记忆，同一件事带 id 覆盖更新、新事实取代旧事实时覆盖或 forget 旧的、已记着的不重复写；forget 按 id 删除过时记忆。记忆会遗忘：长期没被任务用到的会变淡并自动删除，被用得越多越牢；每次任务只带上最相关的几条。权限：员工执行任务的会话只能 list/ask/help/relay/remember/forget、add 待办，以及给自己所属的动态职责安排下次（nextAt/nextCheckInMinutes）或 enabled=false 停用；职责内容、备注和固定规则只有用户能改。",
   "inputSchema": {
     "type": "object",
     "properties": {
-      "action": { "type": "string", "enum": ["list", "add", "update", "done", "ask", "help", "remember", "forget"] },
+      "action": { "type": "string", "enum": ["list", "add", "update", "done", "ask", "help", "relay", "remember", "forget"] },
+      "scene": { "type": "string", "enum": ["lightweight", "coding", "computer"], "description": "relay 必填：接力给哪个场景的新会话" },
+      "cwd": { "type": "string", "description": "relay 可选：新会话的工作目录（已存在），编码时给项目目录；省略沿用当前会话的" },
       "kind": { "type": "string", "enum": ["duty", "todo"], "description": "add 必填" },
       "id": { "type": "string", "description": "update/done/forget 的目标 id（来自 list）；remember 带 id 时覆盖该条记忆" },
       "importance": { "type": "integer", "minimum": 1, "maximum": 3, "description": "remember 可选：1 普通（默认，约两周不用即淡忘）/ 2 重要（忘得慢一倍）/ 3 用户明确要求长期记住（不会自动遗忘）" },
       "text": { "type": "string", "minLength": 1, "maxLength": 500, "description": "add/ask/help/remember 必填（记忆 ≤200 字）；update 可选" },
       "note": { "type": "string", "maxLength": 1024, "description": "职责 add/update 可选：用户对这条职责的细化要求，每次执行都会带上；空串清除" },
-      "profile": { "type": "string", "description": "add/update 可选：开局场景名（轻量化/编码，见 list 的 scenes）；省略为轻量化。需要操作电脑的部分总会交给剑来场景会话排队执行" },
+      "profile": { "type": "string", "description": "add/update 可选：开局场景名（轻量化/编码，见 list 的 scenes）；省略为轻量化。需要操作电脑的部分总会接力给剑来场景会话排队执行" },
       "enabled": { "type": "boolean", "description": "update 可选，启用/停用职责；停用会撤掉它还没开始的任务" },
       "times": { "type": "array", "items": { "type": "string" }, "description": "职责 add/update 可选：每天触发的本地时刻 HH:MM 列表，如 [\"09:00\",\"14:30\"]；与 everyMinutes 二选一，空数组取消" },
       "everyMinutes": { "type": "integer", "minimum": 0, "maximum": 10080, "description": "职责 add/update 可选：大于 0 为用户明确指定的固定间隔（距上次任务完成的分钟数）；0 取消" },

@@ -12,7 +12,8 @@ type Duty = { id: string; text: string; enabled: boolean; note: string; everyMin
 type Todo = { id: string; text: string; confirm: boolean; dutyId?: string; failures?: number; profile?: string; createdAt: number; threadId?: string | null; nextCheckAt?: number; desktop?: boolean; askAfter?: number;
   owner?: Owner; waiting?: string; replyTo?: { token: string; name: string; id: string } | null };
 const from = (o?: Owner) => (o?.token ? o.name || o.token : "");
-type Run = { at: number; dutyId: string; label?: string; status?: string; result: string; threadId: string };
+/** chain：同一任务接力出的各段会话共用的首段会话 id，旧记录为空（自成一组）。 */
+type Run = { at: number; dutyId: string; label?: string; status?: string; result: string; threadId: string; chain?: string; scene?: string };
 type Memory = { id: string; text: string; at: number; importance?: number; strength?: number; usedAt?: number };
 const IMPORTANCE = ["", "", "重要", "长期"];
 // 与后端 Memory::retention 同一公式（MemoryBank 艾宾浩斯曲线），只用于展示。
@@ -179,14 +180,22 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
           const running = () => snap().tasks.filter((t) => !t.queued);
           const queued = () => snap().tasks.filter((t) => t.queued);
           const runOf = (threadId: string) => latest().find((r) => r.threadId === threadId);
+          // 同一任务接力出的各段会话归成一组（旧 → 新），按最新一段排序，组的状态看最新一段。
+          const groups = () => {
+            const by = new Map<string, Run[]>();
+            for (const r of latest()) by.set(r.chain || r.threadId, [r, ...(by.get(r.chain || r.threadId) ?? [])]);
+            return [...by.values()];
+          };
+          const last = (g: Run[]) => g[g.length - 1];
+          const segmentsOf = (threadId: string) => groups().find((g) => g.some((r) => r.threadId === threadId)) ?? [];
           const confirms = () => e().inbox.filter((t) => t.confirm);
           const waits = () => e().inbox.filter((t) => !t.confirm && t.waiting && !busyItems().has(t.id));
           const todos = () => e().inbox.filter((t) => !t.confirm && !t.waiting && !busyItems().has(t.id));
           // 职责是触发依据：它触发出的任务在跑时只显示任务卡片。
           const waitingDuties = () => e().duties.filter((d) => d.enabled && !e().inbox.some((t) => t.dutyId === d.id && busyItems().has(t.id)));
-          const done = () => latest().filter((r) => !live(r) && (!r.status || r.status === "done")).slice(0, SHOWN);
+          const done = () => groups().filter((g) => !live(last(g)) && (!last(g).status || last(g).status === "done")).slice(0, SHOWN);
           // 重启前未收尾的运行没有任务承接，也算已停止。
-          const stopped = () => latest().filter((r) => !live(r) && r.status && r.status !== "done").slice(0, SHOWN);
+          const stopped = () => groups().filter((g) => !live(last(g)) && last(g).status && last(g).status !== "done").slice(0, SHOWN);
           const pausedDuties = () => e().duties.filter((d) => !d.enabled);
           const pendingCount = () => confirms().length + waits().length + queued().length + todos().length + waitingDuties().length;
 
@@ -202,6 +211,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                       <div class="employee-task-tags"><span class="employee-tag desktop">等电脑空出</span></div>
                       <div class="employee-item-title">{runOf(task.threadId) ? label(runOf(task.threadId)!) : "任务"}</div>
                       <small>其他任务正在用电脑，空出后它的电脑操作立即开始</small>
+                      <Segments runs={segmentsOf(task.threadId)} current={task.threadId} open={open} />
                       <div class="employee-item-actions">
                         <button type="button" onClick={() => open(task.threadId)}>看会话</button>
                         <button type="button" onClick={() => void act("stop", task.threadId)}>停止</button>
@@ -240,7 +250,8 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                         <Show when={task.desktop}>{(d) => <span class="employee-tag desktop">{DESKTOP[d()]}</span>}</Show>
                       </div>
                       <div class="employee-item-title">{r() ? label(r()!) : "任务"}</div>
-                      <small>开始于 {time(r()?.at ?? 0)}</small>
+                      <small>开始于 {time(segmentsOf(task.threadId)[0]?.at ?? r()?.at ?? 0)}</small>
+                      <Segments runs={segmentsOf(task.threadId)} current={task.threadId} open={open} />
                       <div class="employee-item-actions">
                         <button type="button" onClick={() => open(task.threadId)}>看会话</button>
                         <button type="button" onClick={() => void act("stop", task.threadId)}>停止</button>
@@ -252,13 +263,13 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
             },
             {
               key: "done", title: "已完成", hint: `最近 ${SHOWN} 项`, count: () => done().length,
-              body: () => <For each={done()}>{(r) => <RunCard run={r} label={label(r)} open={open} />}</For>,
+              body: () => <For each={done()}>{(g) => <ChainCard runs={g} label={label(last(g))} open={open} />}</For>,
             },
             {
               key: "stopped", title: "已停止", hint: "被你停止、让出或中断的任务，以及停用的职责", count: () => stopped().length + pausedDuties().length,
               body: () => (
                 <>
-                  <For each={stopped()}>{(r) => <RunCard run={r} label={label(r)} open={open} />}</For>
+                  <For each={stopped()}>{(g) => <ChainCard runs={g} label={label(last(g))} open={open} />}</For>
                   <For each={pausedDuties()}>{(duty) => <DutyCard duty={duty} due={0} task={false} now={now()} run={run} act={act} />}</For>
                 </>
               ),
@@ -405,14 +416,40 @@ function HelpCard(props: { item: Todo; me: string; run: RunFn; open: Open }) {
   );
 }
 
-function RunCard(props: { run: Run; label: string; open: Open }) {
+const resultOf = (r: Run) => (r.status === "running" || r.status === "queued" ? "已中断（Nova 重启）" : r.result);
+const SEGMENT = { relayed: "已接力", running: "进行中", queued: "等电脑", stopped: "已停止", done: "完成" } as Record<string, string>;
+
+/** 一项任务接力出的各段会话（只有一段时不显示）：场景、状态、交接或结果，点击看该段会话。 */
+function Segments(props: { runs: Run[]; open: Open; current?: string }) {
   return (
-    <article class={`employee-task is-${props.run.status || "done"}`}>
-      <button type="button" class="employee-run" onClick={() => props.open(props.run.threadId)}>
-        <small>{time(props.run.at)}</small>
+    <Show when={props.runs.length > 1}>
+      <ol class="employee-segments" aria-label={`接力的 ${props.runs.length} 段会话`}>
+        <For each={props.runs}>{(r, i) => (
+          <li>
+            <button type="button" classList={{ "is-current": r.threadId === props.current }} title={r.result} onClick={() => props.open(r.threadId)}>
+              <span class="employee-segment-index">{i() + 1}</span>
+              <strong>{r.scene || "会话"}</strong>
+              <span class="employee-segment-status">{r.threadId === props.current ? "进行中" : SEGMENT[r.status || "done"] ?? r.status}</span>
+              <Show when={r.threadId !== props.current}><small>{resultOf(r)}</small></Show>
+            </button>
+          </li>
+        )}</For>
+      </ol>
+    </Show>
+  );
+}
+
+/** 已收尾的一项任务：接力过的把各段会话框在同一张卡片里。 */
+function ChainCard(props: { runs: Run[]; label: string; open: Open }) {
+  const run = () => props.runs[props.runs.length - 1];
+  return (
+    <article class={`employee-task is-${run().status || "done"}`} classList={{ "employee-chain": props.runs.length > 1 }}>
+      <button type="button" class="employee-run" onClick={() => props.open(run().threadId)}>
+        <small>{time(props.runs[0].at)}{props.runs.length > 1 ? ` · 接力 ${props.runs.length} 段` : ""}</small>
         <div class="employee-item-title">{props.label}</div>
-        <div class="employee-run-result">{props.run.status === "running" || props.run.status === "queued" ? "已中断（Nova 重启）" : props.run.result}</div>
+        <div class="employee-run-result">{resultOf(run())}</div>
       </button>
+      <Segments runs={props.runs} open={props.open} />
     </article>
   );
 }
