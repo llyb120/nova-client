@@ -43,9 +43,11 @@ const LEGACY = { inbox: "待办", say: "对员工说", approve: "批准执行" }
 const SHOWN = 30;
 const time = (ms: number) => (ms ? new Date(ms).toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—");
 
+// 放在模块里：进会话再返回时还是原来的 tab 和员工。
+const [tab, setTab] = createSignal<"local" | "team">("local");
+const [peer, setPeer] = createSignal<Peer | null>(null);
+
 export default function EmployeeView() {
-  const [tab, setTab] = createSignal<"local" | "team">("local");
-  const [peer, setPeer] = createSignal<Peer | null>(null);
   return (
     <div class="employee-page">
       <div class="employee-tabs" role="tablist" aria-label="数字员工">
@@ -135,7 +137,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
     // ponytail: 团队员工靠轮询全量快照；人多、快照大时改成对方变化时推送。
     const timer = setInterval(() => void refetch(), peer ? 10000 : 5000);
     // 「⋯」菜单是 <details>：点到菜单外部时关掉所有已展开的菜单。
-    const closeMenus = (ev: Event) => document.querySelectorAll<HTMLDetailsElement>(".employee-more[open]").forEach((d) => { if (!ev.target || !d.contains(ev.target as Node)) d.open = false; });
+    const closeMenus = (ev: Event) => document.querySelectorAll<HTMLDetailsElement>(".employee-more[open], .employee-pop[open]").forEach((d) => { if (!ev.target || !d.contains(ev.target as Node)) d.open = false; });
     const onKey = (ev: KeyboardEvent) => { if (ev.key === "Escape") { closeMenus(ev); setTranscript(null); } };
     document.addEventListener("click", closeMenus);
     document.addEventListener("keydown", onKey);
@@ -265,43 +267,41 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
 
           return (
             <div class="employee-content">
+              {/* 一行头部：标题、状态、开关与不常用的设置/记忆（弹出），把纵向空间留给看板。 */}
               <header class="employee-header">
-                <div>
-                  <div class="employee-title">
-                    <Show when={props.onBack}>{(back) => <button type="button" aria-label="返回团队列表" onClick={() => back()()}>←</button>}</Show>
-                    <h1>{peer ? `${peer.name} 的数字员工` : "数字员工"}</h1><span class={`employee-badge ${snap().status}`}>{STATUS[snap().status]}</span>
-                  </div>
-                  <p class="employee-hint">{peer ? "你交代的事归你：缺信息时会请你或你的本地员工补充，待确认事项由你批准。" : "把日常事务交给员工，专注更重要的事。"}</p>
+                <div class="employee-title">
+                  <Show when={props.onBack}>{(back) => <button type="button" aria-label="返回团队列表" onClick={() => back()()}>←</button>}</Show>
+                  <h1 title={peer ? "你交代的事归你：缺信息时会请你或你的本地员工补充，待确认事项由你或员工主人批准" : undefined}>{peer ? `${peer.name} 的数字员工` : "数字员工"}</h1>
+                  <span class={`employee-badge ${snap().status}`}>{STATUS[snap().status]}</span>
+                  <span class="employee-chip">下次触发<strong>{time(snap().nextCheckAt)}</strong></span>
+                  <span class="employee-chip">进行中<strong>{running().length} / {snap().parallel}</strong></span>
                 </div>
                 <div class="employee-header-actions">
                   <Show when={!peer}><label class="employee-toggle"><input type="checkbox" role="switch" checked={e().enabled}
                     onChange={(ev) => void set({ enabled: ev.currentTarget.checked })} /> 自动值班</label></Show>
                   <button type="button" title="不等触发时间，立即开始一件已到点的事项" onClick={() => void act("check")}>执行到点事项</button>
-                </div>
-              </header>
-              <div class="employee-status" role="group" aria-label="员工状态">
-                <span class="employee-chip">下次触发<strong>{time(snap().nextCheckAt)}</strong></span>
-                <span class="employee-chip">进行中<strong>{running().length} / {snap().parallel}</strong></span>
-                <Show when={!peer && !snap().idleSupported}>
-                  <span class="employee-hint">当前平台无法检测空闲：操作电脑前总会先询问你。</span>
-                </Show>
-              </div>
-
-              <div class="employee-top" classList={{ "is-remote": !!peer }}>
-                <form class="employee-say" onSubmit={(ev) => { ev.preventDefault(); void send(); }}>
-                  <label for="employee-message">{peer ? `交给 ${peer.name} 的员工一件事` : "交给员工一件事"}</label>
-                  <textarea id="employee-message" ref={sayInput} rows={3} placeholder="例如：每天 9 点检查未读邮件并汇总" aria-label="对员工说" title="Enter 发送，Shift+Enter 换行"
-                    value={say()} onInput={(ev) => setSay(ev.currentTarget.value)}
-                    onKeyDown={(ev) => { if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); void send(); } }} />
-                  <div class="employee-say-footer">
-                    <span class="employee-hint">新增职责、修改安排，或直接派活 <span class="employee-shortcut">· Enter 发送</span></span>
-                    <button type="submit" class="employee-primary" disabled={busy() || !say().trim()}>{busy() ? "发送中…" : "发送指令 ↑"}</button>
-                  </div>
-                </form>
-
-                <Show when={!peer}>
-                <section class="employee-card employee-settings" aria-labelledby="employee-settings-title">
-                  <div class="employee-section-heading"><h2 id="employee-settings-title">值班设置</h2><span class="employee-hint">自动保存</span></div>
+                  <details class="employee-pop employee-memory">
+                    <summary>记忆 <span class="employee-count">{e().memories?.length ?? 0}</span></summary>
+                    <div>
+                      <p class="employee-hint">跨任务共享的偏好和经验，用得越多越牢，对员工说“长期记住…”的不会忘。</p>
+                      <Show when={e().memories?.length} fallback={<p class="employee-empty employee-empty-inline">还没有记忆。员工在工作中发现以后用得上的信息会记在这里。</p>}>
+                        <ul class="employee-list">
+                          <For each={e().memories}>{(m) => (
+                            <li>
+                              <div class="employee-main"><div class="employee-item-title">{m.text}</div>
+                                <small>{IMPORTANCE[m.importance ?? 1] ? `${IMPORTANCE[m.importance ?? 1]} · ` : ""}用到 {(m.strength ?? 1) - 1} 次 · 最近 {time(m.usedAt || m.at)} · 记忆度 {Math.round(retention(m, now()) * 100)}%</small></div>
+                              <button type="button" onClick={() => void act("forget", m.id)}>忘掉</button>
+                            </li>
+                          )}</For>
+                        </ul>
+                      </Show>
+                    </div>
+                  </details>
+                  <Show when={!peer}>
+                  <details class="employee-pop employee-settings">
+                    <summary>值班设置</summary>
+                    <div>
+                  <Show when={!snap().idleSupported}><p class="employee-hint">当前平台无法检测空闲：操作电脑前总会先询问你。</p></Show>
                   <div class="employee-field">
                     <span id="employee-hours-label">工作时段</span>
                     <div class="employee-time-range" role="group" aria-labelledby="employee-hours-label">
@@ -319,17 +319,26 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                   <label class="employee-field employee-public" title="经团队中转站公开：团队成员都能查看并下达指令；谁交代的事缺信息时找谁补充，待确认由谁批准">
                     <input type="checkbox" role="switch" checked={!!e().public} onChange={(ev) => void set({ public: ev.currentTarget.checked })} /> 公开到团队（StarLink）
                   </label>
-                </section>
-                </Show>
-              </div>
+                    </div>
+                  </details>
+                  </Show>
+                </div>
+              </header>
+
+              <form class="employee-say" onSubmit={(ev) => { ev.preventDefault(); void send(); }}>
+                <textarea id="employee-message" ref={sayInput} rows={2} aria-label={peer ? `交给 ${peer.name} 的员工一件事` : "交给员工一件事"} title="Enter 发送，Shift+Enter 换行"
+                  placeholder={`${peer ? `交给 ${peer.name} 的员工一件事` : "交给员工一件事"}：新增职责、修改安排或直接派活，例如“每天 9 点检查未读邮件并汇总”。Enter 发送`}
+                  value={say()} onInput={(ev) => setSay(ev.currentTarget.value)}
+                  onKeyDown={(ev) => { if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); void send(); } }} />
+                <button type="submit" class="employee-primary" disabled={busy() || !say().trim()}>{busy() ? "发送中…" : "发送 ↑"}</button>
+              </form>
 
               <section class="employee-board" aria-label="任务看板">
                 <div class="employee-columns">
                   <For each={columns}>{(c) => (
                     <section class={`employee-column is-${c.key}`} aria-labelledby={`employee-col-${c.key}`}>
-                      <div class="employee-column-heading">
+                      <div class="employee-column-heading" title={c.hint}>
                         <h2 id={`employee-col-${c.key}`}>{c.title} <span class="employee-count">{c.count()}</span></h2>
-                        <span class="employee-hint">{c.hint}</span>
                       </div>
                       <div class="employee-column-body">
                         <Show when={c.count()} fallback={<p class="employee-empty">
@@ -342,29 +351,11 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                   )}</For>
                 </div>
               </section>
-
-              <details class="employee-card employee-memory">
-                <summary class="employee-section-heading">
-                  <h2>员工的记忆 <span class="employee-count">{e().memories?.length ?? 0}</span></h2>
-                  <span class="employee-hint">跨任务共享的偏好和经验，用得越多越牢，对员工说“长期记住…”的不会忘。<span class="employee-disclosure"> ▾</span></span>
-                </summary>
-                <Show when={e().memories?.length} fallback={<p class="employee-empty employee-empty-inline">还没有记忆。员工在工作中发现以后用得上的信息会记在这里。</p>}>
-                  <ul class="employee-list">
-                    <For each={e().memories}>{(m) => (
-                      <li>
-                        <div class="employee-main"><div class="employee-item-title">{m.text}</div>
-                          <small>{IMPORTANCE[m.importance ?? 1] ? `${IMPORTANCE[m.importance ?? 1]} · ` : ""}用到 {(m.strength ?? 1) - 1} 次 · 最近 {time(m.usedAt || m.at)} · 记忆度 {Math.round(retention(m, now()) * 100)}%</small></div>
-                        <button type="button" onClick={() => void act("forget", m.id)}>忘掉</button>
-                      </li>
-                    )}</For>
-                  </ul>
-                </Show>
-              </details>
               <Show when={transcript()}>{(t) => (
                 <div class="employee-transcript" role="dialog" aria-modal="true" aria-label={t().title}
                   onClick={(ev) => { if (ev.target === ev.currentTarget) setTranscript(null); }}>
                   <section>
-                    <div class="employee-section-heading"><h2>{t().title}</h2><button type="button" onClick={() => setTranscript(null)}>关闭</button></div>
+                    <div class="employee-transcript-head"><button type="button" aria-label="返回" onClick={() => setTranscript(null)}>← 返回</button><h2>{t().title}</h2></div>
                     <pre>{t().text || "（还没有内容）"}</pre>
                   </section>
                 </div>
@@ -429,8 +420,8 @@ function RunCard(props: { run: Run; label: string; open: Open }) {
 function ConfirmCard(props: { item: Todo; me: string; run: RunFn; act: Act; open: Open }) {
   // 补充说明放本地信号，轮询 reconcile 不会冲掉正在输入的内容。
   const [extra, setExtra] = createSignal("");
-  // 下指令的人来批。
-  const mine = () => (props.item.owner?.token ?? "") === props.me;
+  // 下指令的人来批；主机用户（本机看板，me 为空）可以替任何人批。
+  const mine = () => !props.me || (props.item.owner?.token ?? "") === props.me;
   return (
     <article class="employee-task needs-confirm">
       <div class="employee-task-tags">
@@ -445,7 +436,7 @@ function ConfirmCard(props: { item: Todo; me: string; run: RunFn; act: Act; open
           value={extra()} onInput={(ev) => setExtra(ev.currentTarget.value)} />
       </details>
       <div class="employee-item-actions">
-        <button type="button" class="employee-approve" disabled={!mine()} title={mine() ? undefined : "由下指令的人批准"}
+        <button type="button" class="employee-approve" disabled={!mine()} title={mine() ? undefined : "由下指令的人或员工主人批准"}
           onClick={() => void props.run("employee_do", { action: "approve", id: props.item.id, text: extra() })}>{mine() ? "批准执行" : `等 ${from(props.item.owner) || "本机用户"} 批准`}</button>
         <button type="button" onClick={() => void props.act("dismiss", props.item.id)}>驳回</button>
         <Show when={props.item.threadId}>{(id) => <button type="button" onClick={() => props.open(id())}>看会话</button>}</Show>

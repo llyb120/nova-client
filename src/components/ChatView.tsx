@@ -6,6 +6,7 @@ import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
 import { buildTimeNotesPrompt } from "../builtinPrompts";
 import {
   chatScrollToBottomSignal,
+  closeThread,
   createThread,
   deleteThread,
   isSubagentThread,
@@ -16,6 +17,7 @@ import {
   sendPrompt,
   setState,
   setTimeMachineEditTarget,
+  setView,
   state,
   timeMachineChangedSignal,
 } from "../store";
@@ -850,6 +852,11 @@ export function ChatView() {
   return (
     <main class="chat" style={`--time-width:${timeMachineWidth()}px`}>
       <header class="chat-head">
+        {/* 员工会话不在普通会话列表里：给个返回键回到数字员工页。 */}
+        <Show when={state.threads.find((t) => t.id === state.currentId)?.employeeThread}>
+          <button type="button" class="chat-head-back" aria-label="返回数字员工" title="返回数字员工"
+            onClick={() => { closeThread(); setView("employee"); }}>← 数字员工</button>
+        </Show>
         <Show
           when={editing()}
           fallback={

@@ -1565,10 +1565,13 @@ pub(crate) fn execute_tool(args: &Value, owner: &str) -> Result<Value, String> {
                 e.inbox.push(Todo { id: id.clone(), text: text.clone(), confirm: true, created_at: now_ms(), thread_id, owner: by.clone(), ..Default::default() });
                 Ok(id)
             })?;
+            // 下指令的人和主机用户都能批，都通知。
             if !by.token.is_empty() {
                 send_to(&by.token, "starlink.notify", json!({"text": format!("需要你确认（在数字员工 · 团队里批准）：{}", clip(&text, 80))}));
-            } else if let Some(app) = APP.get() {
-                crate::sys_notify::show(app, "数字员工需要你确认", &clip(&text, 80), false, None);
+            }
+            if let Some(app) = APP.get() {
+                let title = if by.token.is_empty() { "数字员工需要你确认".to_string() } else { format!("数字员工需要确认（{} 交代的）", owner_label(&by)) };
+                crate::sys_notify::show(app, &title, &clip(&text, 80), false, None);
             }
             Ok(json!({"ok": true, "id": id, "next": "已记为待确认并通知用户；不要执行该操作，结束本次任务。"}))
         }
@@ -1722,8 +1725,9 @@ async fn do_as(app: &AppHandle, action: &str, id: Option<String>, text: Option<S
         }
         "approve" => {
             let item = load()?.inbox.into_iter().find(|t| t.id == id).ok_or("这条已不存在")?;
-            if item.owner.token != who.token {
-                return Err(format!("这项由下指令的「{}」批准", owner_label(&item.owner)));
+            // 主机用户有绝对权限，可以替任何人批；团队成员只能批自己交代的。
+            if !local && item.owner.token != who.token {
+                return Err(format!("这项由下指令的「{}」或员工主人批准", owner_label(&item.owner)));
             }
             let extra = text.as_deref().map(str::trim).filter(|t| !t.is_empty())
                 .map(|t| format!("\n用户的补充说明（与上面冲突时以补充为准）：\n{t}")).unwrap_or_default();
