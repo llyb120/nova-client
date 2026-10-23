@@ -183,7 +183,18 @@
 .employee-public { flex-direction: row; align-items: center; }
 .employee-reply { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; margin-top: 6px; }
 .employee-reply button { padding: 4px 12px; font-size: 12px; }
+.employee-shot { display: block; max-width: 100%; max-height: 160px; margin-top: 6px; border: 1px solid var(--border, #ddd); border-radius: 6px; object-fit: contain; cursor: zoom-in; }
+.employee-shot.open { max-height: none; cursor: zoom-out; }
 .employee-transcript { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; background: rgb(0 0 0 / .35); }
 .employee-transcript > section { width: min(820px, 90vw); max-height: 80vh; display: flex; flex-direction: column; gap: 12px; padding: 20px; border: 1px solid var(--border); border-radius: 14px; background: var(--bg-panel); }
-.employee-transcript pre { margin: 0; overflow: auto; white-space: pre-wrap; font: inherit; font-size: 13px; line-height: 1.7; }
 .employee-transcript-head { display: flex; align-items: center; gap: 12px; }
+.employee-transcript-head h2 { margin: 0; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.employee-timeline { list-style: none; margin: 0; padding: 0 4px 0 0; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
+.employee-timeline > li { padding: 8px 12px; border-left: 3px solid var(--border-strong); border-radius: 0 8px 8px 0; background: var(--bg-subtle); }
+.employee-timeline > li.employee-timeline-person { border-left-color: var(--accent); }
+.employee-timeline > li.employee-timeline-employee { border-left-color: var(--seal); }
+.employee-timeline > li.employee-timeline-result { border-left-color: var(--ok); background: transparent; }
+.employee-timeline-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--text-muted); }
+.employee-timeline-head b { font-weight: 600; color: var(--text-dim); }
+.employee-timeline p { margin: 4px 0 0; white-space: pre-wrap; font-size: 13px; line-height: 1.6; }
+.employee-transcript-result { margin-top: 4px; font-size: 14px; line-height: 1.7; }

@@ -1,19 +1,23 @@
 import { createEffect, createSignal, For, JSX, on, onCleanup, onMount, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openThread, showToast, state } from "../store";
 import type { Peer } from "../types";
+import { Markdown } from "./Markdown";
 import "./EmployeeView.css";
 
 /** 交代的人；token 为空是员工所在机器的用户。 */
 type Owner = { token: string; name: string };
 type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; times?: string[]; nextCheckAt: number; lastRunAt: number; lastResult: string; owner?: Owner };
 type Todo = { id: string; text: string; confirm: boolean; dutyId?: string; failures?: number; profile?: string; createdAt: number; threadId?: string | null; nextCheckAt?: number; desktop?: boolean; askAfter?: number;
-  owner?: Owner; waiting?: string; replyTo?: { token: string; name: string; id: string } | null };
+  owner?: Owner; waiting?: string; replyTo?: { token: string; name: string; id: string } | null; shot?: string };
 const from = (o?: Owner) => (o?.token ? o.name || o.token : "");
 /** chain：同一任务接力出的各段会话共用的首段会话 id，旧记录为空（自成一组）。 */
 type Run = { at: number; dutyId: string; label?: string; status?: string; result: string; threadId: string; chain?: string; scene?: string };
+/** 团队成员查看员工会话：只有交代时的原文与这段的结论。 */
+type Entry = { kind: "ask" | "help" | "answer" | "confirm" | "approve" | "result"; who?: string; text: string; at: number; scene?: string; status?: string };
+type Transcript = { title: string; entries?: Entry[] };
 type Memory = { id: string; text: string; at: number; importance?: number; strength?: number; usedAt?: number };
 const IMPORTANCE = ["", "", "重要", "长期"];
 // 与后端 Memory::retention 同一公式（MemoryBank 艾宾浩斯曲线），只用于展示。
@@ -26,7 +30,7 @@ const retention = (m: Memory, now: number) => {
 type Task = { threadId: string; itemId: string; queued: boolean; desktop: "using" | "asking" | "reserved" | null };
 type Snapshot = {
   employee: {
-    enabled: boolean; workStart: string; workEnd: string; idleMinutes: number; public?: boolean;
+    enabled: boolean; workStart: string; workEnd: string; idleMinutes: number; takeoverSeconds?: number; public?: boolean;
     duties: Duty[]; inbox: Todo[]; runs: Run[]; memories?: Memory[];
   };
   status: "working" | "duty" | "rest";
@@ -126,11 +130,11 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
   void refetch();
   const [say, setSay] = createSignal("");
   const [busy, setBusy] = createSignal(false);
-  const [transcript, setTranscript] = createSignal<{ title: string; text: string } | null>(null);
+  const [transcript, setTranscript] = createSignal<Transcript | null>(null);
   let sayInput: HTMLTextAreaElement | undefined;
   // 团队员工的会话在对方机器上：取文字记录展示。
   const open = (threadId: string) => peer
-    ? void call<{ title: string; text: string }>("transcript", { threadId }).then(setTranscript, (error) => showToast(String(error)))
+    ? void call<Transcript>("transcript", { threadId }).then(setTranscript, (error) => showToast(String(error)))
     : void openThread(threadId);
 
   onMount(() => {
@@ -205,7 +209,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
               body: () => (
                 <>
                   <For each={confirms()}>{(item) => <ConfirmCard item={item} me={me} run={run} act={act} open={open} />}</For>
-                  <For each={waits()}>{(item) => <HelpCard item={item} me={me} run={run} open={open} />}</For>
+                  <For each={waits()}>{(item) => <HelpCard item={item} me={me} run={run} open={open} local={!peer} />}</For>
                   <For each={queued()}>{(task) => (
                     <article class="employee-task">
                       <div class="employee-task-tags"><span class="employee-tag desktop">等电脑空出</span></div>
@@ -227,6 +231,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                       </div>
                       <div class="employee-item-title">{item.text}</div>
                       <small>{time(item.createdAt)}{item.profile ? ` · ${item.profile}` : ""}{item.nextCheckAt && item.nextCheckAt > now() ? ` · ${item.failures ? `上次出错，${time(item.nextCheckAt)} 续做（第 ${item.failures} 次）` : `计划 ${time(item.nextCheckAt)}`}` : item.threadId ? " · 在原会话续做" : ""}</small>
+                      <Show when={!peer}><Shot path={item.shot} /></Show>
                       <Show when={item.replyTo && !peer}><ReplyBox id={item.id} run={run} label="也可以直接回复，结果回传给对方员工" /></Show>
                       <div class="employee-item-actions">
                         <button type="button" onClick={() => void act("dismiss", item.id)}>撤回</button>
@@ -325,7 +330,11 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                     <span class="employee-idle-input"><input type="number" min="1" max="1440" value={e().idleMinutes}
                       onChange={(ev) => void set({ idleMinutes: Number(ev.currentTarget.value) || 10 })} /> 分钟</span>
                   </label>
-                  <details class="employee-help"><summary>工作方式说明</summary><p class="employee-hint">每件事只在安排好的时间触发，触发就直接干活，不会空跑会话去检查。多件事并行处理；操作电脑是单独排队的一步，每次开始前都会在 Butterfly 上提示你，15 秒内不选择即开始。员工操作电脑时（屏幕边缘呼吸灯亮着）按 Esc 即可叫停；你拒绝或叫停后，员工会在你空闲时、或过一阵再问你，择机补做。</p>
+                  <label class="employee-field" title="操作电脑前会在 Butterfly 上询问你，这么久不选择就自动开始">多久不选自动接管电脑
+                    <span class="employee-idle-input"><input type="number" min="3" max="600" value={e().takeoverSeconds ?? 15}
+                      onChange={(ev) => void set({ takeoverSeconds: Number(ev.currentTarget.value) || 15 })} /> 秒</span>
+                  </label>
+                  <details class="employee-help"><summary>工作方式说明</summary><p class="employee-hint">每件事只在安排好的时间触发，触发就直接干活，不会空跑会话去检查。多件事并行处理；操作电脑是单独排队的一步，每次开始前都会在 Butterfly 上提示你，{e().takeoverSeconds ?? 15} 秒内不选择即开始。员工操作电脑时（屏幕边缘呼吸灯亮着）按 Esc 即可叫停；你拒绝或叫停后，员工会在你空闲时、或过一阵再问你，择机补做。</p>
                   <p class="employee-hint">员工从「设置 → 场景模型 → 轻量化」开局，编码交给编码场景，操作电脑交给剑来场景的模型。</p></details>
                   <label class="employee-field employee-public" title="经团队中转站公开：团队成员都能查看并下达指令；谁交代的事缺信息时找谁补充，待确认由谁批准">
                     <input type="checkbox" role="switch" checked={!!e().public} onChange={(ev) => void set({ public: ev.currentTarget.checked })} /> 公开到团队（StarLink）
@@ -366,8 +375,11 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                 <div class="employee-transcript" role="dialog" aria-modal="true" aria-label={t().title}
                   onClick={(ev) => { if (ev.target === ev.currentTarget) setTranscript(null); }}>
                   <section>
-                    <div class="employee-transcript-head"><button type="button" aria-label="返回" onClick={() => setTranscript(null)}>← 返回</button><h2>{t().title}</h2></div>
-                    <pre>{t().text || "（还没有内容）"}</pre>
+                    <div class="employee-transcript-head">
+                      <button type="button" aria-label="返回" onClick={() => setTranscript(null)}>← 返回</button>
+                      <h2>{t().title}</h2>
+                    </div>
+                    <Timeline entries={t().entries ?? []} />
                   </section>
                 </div>
               )}</Show>
@@ -396,7 +408,47 @@ function ReplyBox(props: { id: string; run: RunFn; label: string }) {
   );
 }
 
-function HelpCard(props: { item: Todo; me: string; run: RunFn; open: Open }) {
+/** 一条任务的关键内容：谁交代/补充了什么（原文）、员工问了什么、每段的结论；最后的结论完整展示。 */
+function Timeline(props: { entries: Entry[] }) {
+  const firstAsk = () => props.entries.findIndex((x) => x.kind === "ask");
+  const finalResult = () => props.entries.map((x) => x.kind === "result" && !!x.text).lastIndexOf(true);
+  const head = (x: Entry, i: number) => {
+    switch (x.kind) {
+      case "ask": return `${x.who} ${i === firstAsk() ? "交代" : "补充"}`;
+      case "help": return "员工请求补充信息";
+      case "answer": return `${x.who} 回复`;
+      case "confirm": return "员工请求确认";
+      case "approve": return `${x.who} 批准`;
+      default: return `${x.scene || "员工"} · ${x.status === "running" ? "进行中" : SEGMENT[x.status || "done"] ?? x.status}`;
+    }
+  };
+  return (
+    <ol class="employee-timeline">
+      <Show when={props.entries.length} fallback={<li class="employee-hint">（还没有内容）</li>}>
+        <For each={props.entries}>{(x, i) => (
+          <li class={`employee-timeline-${x.kind === "result" ? "result" : x.kind === "help" || x.kind === "confirm" ? "employee" : "person"}`}>
+            <div class="employee-timeline-head"><b>{head(x, i())}</b><Show when={x.kind !== "result" || x.status !== "running"}><small>{time(x.at)}</small></Show></div>
+            <Show when={i() === finalResult()} fallback={<Show when={x.text}><p>{x.text}</p></Show>}>
+              <div class="employee-transcript-result"><Markdown text={x.text} /></div>
+            </Show>
+          </li>
+        )}</For>
+      </Show>
+    </ol>
+  );
+}
+
+/** 补充请求的现场截图（本机路径，只在本机看板展示）；点击展开/收起。 */
+function Shot(props: { path?: string }) {
+  const [open, setOpen] = createSignal(false);
+  return (
+    <Show when={props.path}>{(path) => (
+      <img class="employee-shot" classList={{ open: open() }} src={convertFileSrc(path())} alt="现场截图" title="点击展开/收起" onClick={() => setOpen(!open())} />
+    )}</Show>
+  );
+}
+
+function HelpCard(props: { item: Todo; me: string; run: RunFn; open: Open; local: boolean }) {
   const mine = () => (props.item.owner?.token ?? "") === props.me;
   return (
     <article class="employee-task needs-confirm">
@@ -406,6 +458,7 @@ function HelpCard(props: { item: Todo; me: string; run: RunFn; open: Open }) {
       </div>
       <div class="employee-item-title">{props.item.waiting}</div>
       <small>任务：{props.item.text}</small>
+      <Show when={props.local}><Shot path={props.item.shot} /></Show>
       <Show when={mine()} fallback={<small>{props.item.owner?.token ? `已请 ${from(props.item.owner)} 补充：他的本地员工会去查，或由他直接回复` : "等本机用户补充"}</small>}>
         <ReplyBox id={props.item.id} run={props.run} label="补充它要的信息，提交后在原会话接着做" />
       </Show>
