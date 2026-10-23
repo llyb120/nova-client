@@ -21,6 +21,13 @@ function highlight(text: string, query: string) {
   return out;
 }
 
+function fmtTime(ts: number): string {
+  const d = new Date(ts);
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+    : d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
+}
+
 /** 会话搜索弹框：只搜标题、用户输入和 AI 正文（后端过滤掉思考与工具）。 */
 export function SessionSearchModal(props: { onOpen: (id: string) => Promise<void>; onClose: () => void }) {
   const [query, setQuery] = createSignal("");
@@ -28,6 +35,7 @@ export function SessionSearchModal(props: { onOpen: (id: string) => Promise<void
   const [searched, setSearched] = createSignal(false);
   let timer: number | undefined;
   let seq = 0;
+  const recent = () => [...state.threads].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 8);
   onCleanup(() => window.clearTimeout(timer));
 
   const search = (value: string) => {
@@ -71,11 +79,27 @@ export function SessionSearchModal(props: { onOpen: (id: string) => Promise<void
             onKeyDown={(e) => {
               if (e.key === "Escape") props.onClose();
               const first = results()[0];
-              if (e.key === "Enter" && first) void open(first.threadId, first.hits[0]?.itemId);
+              if (e.key === "Enter" && !query().trim() && recent()[0]) void open(recent()[0].id);
+              else if (e.key === "Enter" && first) void open(first.threadId, first.hits[0]?.itemId);
             }}
           />
         </label>
         <div class="session-search-results">
+          <Show when={!query().trim()}>
+            <div class="session-search-section">最近会话</div>
+            <For each={recent()}>
+              {(t) => (
+                <button type="button" class="session-search-recent" onClick={() => void open(t.id)}>
+                  <span class={`thread-agent ${t.agentKind}`} title={agentLabel(t.agentKind)}>{agentShort(t.agentKind)}</span>
+                  <span class="session-search-recent-main">
+                    <span class="session-search-title-text">{t.title || "未命名会话"}</span>
+                    <span class="session-search-recent-cwd">{t.cwd.split(/[\\/]/).filter(Boolean).pop() ?? t.cwd}</span>
+                  </span>
+                  <span class="session-search-count">{fmtTime(t.updatedAt)}</span>
+                </button>
+              )}
+            </For>
+          </Show>
           <For
             each={results()}
             fallback={<Show when={searched()}><div class="session-search-empty">没有匹配的会话</div></Show>}
