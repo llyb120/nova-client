@@ -55,6 +55,12 @@ Nova 与扩展需一起更新，在 `chrome://extensions` 重新加载扩展以�
 Chrome API 不提供可靠的来源标签 ID，所以结果标记 `scope:browser`，无需 tabTag；按时间、URL、文件名确认目标，可用 `incognito` 过滤，最多返回最新 100 条。长 URL 截至 4096 字符并标记 `urlTruncated`。
 保留浏览器自身的保存提示和安全检查，不自动重试或绕过拦截。空列表可能是网站仍在生成导出，页面稳定或点击执行成功不能代替下载完成；完成后还应核对文件内容。
 
+## DevTools 数据（扩展 0.1.9）
+
+`chrome({operation:"devtools",tabTag})` 只读返回该标签的 console 日志（含 JS 异常、浏览器 Log 条目）和网络请求（方法、URL、类型、状态码、耗时、失败原因、POST 数据），无需打开 DevTools 界面。可选参数放在 `devtools` 对象：`kind`（all/console/network）、`query`（文本/URL 子串）、`level`（error 同时筛出失败或 ≥400 的请求）、`limit`（每类最新 N 条，默认 100）、`requestId`（取响应体，最长 64K 字符）、`clear`（读后清空）。
+首次调用时经扩展调试会话启用 Runtime/Log/Network：console 会回放 V8 已缓存的历史，网络只记录此后的请求，需完整记录时先调用一次再 `reload`。每类保留最新 500 条，仅记录顶层框架会话（跨进程 iframe 不含），调试会话断开（stop、关闭标签）后清空。
+需要 DevTools 界面本身（Elements、Sources、Performance 等）时，Agent 用 jianlai 激活该 Chrome 窗口按 F12 打开，不让用户手动操作。
+
 ## 验证
 
 运行 node --test extensions/nova-chrome/worker.test.mjs scripts/nova-tools-mcp.test.mjs。
