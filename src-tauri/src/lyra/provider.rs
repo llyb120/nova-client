@@ -385,6 +385,8 @@ fn completions_body(
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.parameters,
+                    // Preserve optional arguments through gateways that convert to Responses.
+                    "strict": false,
                 }
             })
         })
@@ -2061,6 +2063,22 @@ mod tests {
     use super::*;
     use crate::lyra::config::ResolvedModel;
     use serde_json::Map;
+
+    #[test]
+    fn tool_payloads_preserve_optional_chrome_arguments() {
+        let chrome = crate::chrome_browser::tool_definition();
+        let tools = [Tool {
+            name: "chrome",
+            description: chrome["description"].as_str().unwrap().into(),
+            parameters: chrome["inputSchema"].clone(),
+        }];
+        let completions = completions_body(&test_model("openai-completions"), "", &[], &tools, Some("medium"), None);
+        let responses = responses_body(&test_model("openai-responses"), "", &[], &tools, Some("medium"), None);
+        for definition in [&completions["tools"][0]["function"], &responses["tools"][0]] {
+            assert_eq!(definition["strict"], false, "gateways must not make optional Chrome arguments required");
+            assert_eq!(definition["parameters"], chrome["inputSchema"]);
+        }
+    }
 
     #[test]
     fn commandcode_off_uses_gateway_enum_without_changing_native_thinking() {

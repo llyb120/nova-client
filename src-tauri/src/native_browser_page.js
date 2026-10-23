@@ -1,6 +1,6 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 24) return;
+  if (globalThis.__novaWebview?.apiVersion === 26) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   // Icon-only controls (sort carets, filter funnels, close ×) carry their meaning in class names.
   const iconHint = e => {
@@ -152,7 +152,7 @@
     return entry;
   };
   const api = {
-    apiVersion: 24,
+    apiVersion: 26,
     stamp,
     async evaluate(expression, expectedDocument, expectedUrl) {
       // Check and start in the same JS turn: navigation must never redirect a script to a new document.
@@ -296,18 +296,20 @@
         const visibility=getComputedStyle(e).visibility;
         if (visibility==='hidden' || visibility==='collapse') continue;
         total++;if (items.length >= limit) continue;
-        // Stable per document: unchanged elements keep their ref across observations, so replies can be deltas.
-        // entryFor() still re-checks the live fingerprint before every input.
-        const ref=`${documentId.slice(0,6)}.${identity(e)}`, isDisabled=disabled(e);
+        const isDisabled=disabled(e);
         // Cache semantics only, never geometry, hit tests, focus, values or
         // enabled state. prepare()/verifyPoint() always fingerprint live nodes.
         let cached=semanticCache.get(e);
         if(!cached || cached.revision!==revision) {
           const name=label(e,labels()),context=contextInfo(e,contextCache),region=context.region;
-          cached={revision,name,region,fingerprint:fingerprint(e,name,context.identity)};
+          const nextFingerprint=fingerprint(e,name,context.identity);
+          // Re-observing a recycled row must not make its old ref valid for a different record.
+          if (cached && cached.fingerprint!==nextFingerprint) identities.delete(e);
+          cached={revision,name,region,fingerprint:nextFingerprint};
           semanticCache.set(e,cached);
         }
         const {name,region}=cached;
+        const ref=`${documentId.slice(0,6)}.${identity(e)}`;
         entries.set(ref,{e,fingerprint:cached.fingerprint});
         // Most targets in a long document are offscreen. Keep their references
         // and geometry without probing client rects / hit-testing them twice.
@@ -421,13 +423,11 @@
         if (disabled(e)) reason='目标不可用';
         else {
           const p=wheel?wheelPoint(e,mode==='scroll_x'?'x':'y'):clickable(e),r=rect(e);
-          const moving=ancestors(e).some(node=>node.getAnimations?.().some(animation=>
-            (animation.pending || animation.playState==='running') && animation.effect?.getKeyframes?.().some(frame=>
-              Object.keys(frame).some(key=>/^(transform|translate|rotate|scale|left|right|top|bottom|width|height|offsetPath|fontSize|margin.*|padding.*)$/.test(key)))));
-          stableFrames=p && !moving && sameRect(previous,r) ? stableFrames+1 : 0;
-          if (stableFrames>=2) return {...p,localX:p.x,localY:p.y,rect:r,editable:editable(e),password:e.type==='password',canvas:e.tagName==='CANVAS',scroll:wheel?{left:e.scrollLeft,top:e.scrollTop}:undefined};
+          // Measure this target, not ancestor animation metadata (which can run forever without moving it).
+          stableFrames=p && sameRect(previous,r) ? stableFrames+1 : 0;
+          if (stableFrames>=2) return {...p,localX:p.x,localY:p.y,rect:r,identity:identity(e),editable:editable(e),password:e.type==='password',canvas:e.tagName==='CANVAS',scroll:wheel?{left:e.scrollLeft,top:e.scrollTop}:undefined};
           if (!p && !scrolled && !wheel) {e.scrollIntoView({block:'nearest',inline:'nearest',behavior:'instant'});scrolled=true;previous=undefined;}
-          else {previous=r;reason=p?'目标正在移动':'目标被遮挡或在视口之外';}
+          else {if (!stableFrames) previous=r;reason=p?'目标正在移动':'目标被遮挡或在视口之外';}
         }
         await tick();
       } while (performance.now()-started<1200);
@@ -474,7 +474,7 @@
         entries.set(ref,{e:target,fingerprint:fingerprint(target)});
         hoverTarget={ref,rect:rect(target)};
       }
-      return {x,y,stamp:stamp(),pageX:x+scrollX,pageY:y+scrollY,editable:!!e&&editable(e),password:e?.type==='password',canvas:e?.tagName==='CANVAS',hit:e?{tag:e.tagName.toLowerCase(),name:label(e)}:null,hoverTarget};
+      return {x,y,stamp:stamp(),pageX:x+scrollX,pageY:y+scrollY,identity:identity(e),editable:!!e&&editable(e),password:e?.type==='password',canvas:e?.tagName==='CANVAS',hit:e?{tag:e.tagName.toLowerCase(),name:label(e)}:null,hoverTarget};
     },
   };
   Object.defineProperty(globalThis,'__novaWebview',{value:api,configurable:true});

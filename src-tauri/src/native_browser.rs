@@ -480,14 +480,20 @@ fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String
     values.into_iter().map(|value| { let action=parse_action(&value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()))?; validate_action(&action)?; Ok(action) }).collect()
 }
 
-/// ref 同文档内稳定、执行前校验节点指纹：全部 ref 都在当前观察里即可执行，snapshotId 可不精确。
+/// Live refs are revalidated before input. Keyboard steps may follow an explicitly targeted field.
 fn refs_in(observation:&Observation, actions:&[Action]) -> bool {
-    !actions.is_empty() && actions.iter().all(|action| match action {
-        Action::Click{r#ref,..}|Action::Fill{r#ref,..}|Action::Scroll{r#ref:Some(r#ref),..} =>
-            observation.pages["pages"].as_array().is_some_and(|pages| pages.iter().any(|page|
-                page["items"].as_array().is_some_and(|items| items.iter().any(|item| item["ref"].as_str()==Some(r#ref.as_str()))))),
+    let (mut has_ref, mut field_focus) = (false, false);
+    actions.iter().all(|action| match action {
+        Action::Click{r#ref,..}|Action::Fill{r#ref,..}|Action::Scroll{r#ref:Some(r#ref),..} => {
+            let item=observation.pages["pages"].as_array().and_then(|pages| pages.iter().filter_map(|p|p["items"].as_array()).flatten().find(|i|i["ref"].as_str()==Some(r#ref.as_str())));
+            has_ref=true;
+            if matches!(action,Action::Click{..}|Action::Fill{..}) {field_focus=item.is_some_and(|i|i["editable"]==true);}
+            item.is_some()
+        },
+        Action::Type{..}|Action::Press{..} => field_focus,
+        Action::Wait{..} => true,
         _ => false,
-    })
+    }) && has_ref
 }
 
 fn preflight(observation:&Observation, action:&mut Action, image_id:Option<&str>) -> Result<(),String> {
@@ -595,6 +601,7 @@ async fn point(
 #[derive(Default)]
 struct InputProgress {
     attempted: bool,
+    focus: Option<(usize, Value)>,
     dom_preflight: bool,
     scroll_feedback: Option<Value>,
     completed: usize,
@@ -711,6 +718,7 @@ async fn apply(
             match action {
                 Action::ClickAt {button,click_count,..} => {
                     mouse(app,s,&p,button.as_deref().unwrap_or("left"),click_count.unwrap_or(1),progress).await?;
+                    progress.focus=(p["editable"]==true).then(||(0,p["identity"].clone()));
                     if let Ok(label)=active_label(app) { app.state::<BrowserState>().guard_misses.lock().unwrap().remove(&label); }
                 },
                 Action::Move{..} => { progress.attempted=true; cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseMoved","x":p["x"],"y":p["y"]}),None,Some(s.cancel.clone())).await?; },
@@ -748,7 +756,9 @@ async fn apply(
                 if !frame_has_focus(app,observation,index).await? {continue;}
                 if now["password"]==true { return Err("密码请手动输入".into()); }
                 if now["editable"]==true {
-                    if now["identity"]!=observation.pages["pages"][index]["focus"]["identity"] { return Err("输入焦点已变化，请重新观察后输入".into()); }
+                    let expected=progress.focus.as_ref().map(|(frame,identity)| if *frame==index {identity} else {&Value::Null})
+                        .unwrap_or(&observation.pages["pages"][index]["focus"]["identity"]);
+                    if now["identity"].is_null() || &now["identity"]!=expected { return Err("输入焦点已变化，请重新观察后输入".into()); }
                     focused=true;
                 }
             }
@@ -784,8 +794,18 @@ async fn apply(
             } else if let Action::Click{button,click_count,..}=action {
                 mouse(app,s,&p,button.as_deref().unwrap_or("left"),click_count.unwrap_or(1),progress).await?;
             }
+            // Remember the intended node, never whichever field a page handler redirected focus to.
+            progress.focus=(p["editable"]==true).then(||(*frame,p["identity"].clone()));
         }
-        Action::Press{key:name}=>key(app,s,name,progress).await?,
+        Action::Press{key:name}=>{
+            if let Some((index,identity))=&progress.focus {
+                let now=evaluate(app,&observation.frames[*index],"__novaWebview.inputState()".into()).await?;
+                if !frame_has_focus(app,observation,*index).await? || identity.is_null() || &now["identity"]!=identity {
+                    return Err("输入焦点已变化，停止后续按键；请根据新观察继续".into());
+                }
+            }
+            key(app,s,name,progress).await?;
+        },
         Action::Scroll{frame,r#ref,delta,delta_x}=>{
             progress.dom_preflight=true;
             let mode=if delta_x.unwrap_or(0)!=0 {"scroll_x"} else {"scroll_y"};
@@ -897,18 +917,43 @@ async fn coordinate(
     .await
 }
 
+fn snapshot_options(args: &Value, with_image: bool) -> Result<(Option<&Value>, Option<&str>), String> {
+    // Empty optional crop placeholders carry no target; never discard a non-empty crop.
+    let region = args.get("region").filter(|v| !v.is_null() && !v.as_object().is_some_and(|o| o.is_empty()));
+    let reference = match args.get("ref").filter(|v| !v.is_null()) {
+        Some(value) => Some(value.as_str().ok_or("ref 必须是最新观察中的引用字符串；不裁剪时省略")?).filter(|s| !s.trim().is_empty()),
+        None => None,
+    };
+    if !with_image && (region.is_some() || reference.is_some()) {
+        return Err("inspect 不接受 region/ref 裁剪；读页面只传 operation、tabTag 和可选 query；裁剪请用 screenshot".into());
+    }
+    if region.is_some() && reference.is_some() {
+        return Err("region 与 ref 裁剪不能同时提供；按坐标裁剪时省略 ref，按元素裁剪时省略 region".into());
+    }
+    if let Some(region) = region {
+        if !["x", "y", "width", "height"].iter().all(|key| region.get(*key).and_then(Value::as_f64)
+            .is_some_and(|v| v.is_finite() && if matches!(*key, "width" | "height") { v > 0. } else { v >= 0. })) {
+            return Err("region 需完整的有限数值 x/y/width/height：x/y≥0，width/height>0；不裁剪时省略 region".into());
+        }
+    }
+    if args.get("maxEdge").filter(|v| !v.is_null()).is_some_and(|v|
+        !v.as_u64().is_some_and(|edge| edge == 0 || (320..=3840).contains(&edge))) {
+        return Err("maxEdge 必须为整数0或320–3840；使用默认截图尺寸时省略 maxEdge".into());
+    }
+    Ok((region, reference))
+}
+
 async fn snapshot(
     app: &AppHandle,
     with_image: bool,
     args: &Value,
     previous: Option<&Observation>,
 ) -> Result<(Observation, Value), String> {
-    let mut region=args.get("region").filter(|v|!v.is_null()).cloned();
-    if region.is_some() && args["ref"].is_string() {return Err("region 与 ref 裁剪不能同时提供".into());}
-    if !with_image && (region.is_some() || args["ref"].is_string()) {return Err("region/ref 裁剪仅适用于 screenshot".into());}
+    let (region, reference) = snapshot_options(args, with_image)?;
+    let mut region = region.cloned();
     // ref+expandScroll: capture that element's whole inner scroll content (main frame only).
     let mut target=None;
-    if let Some(reference)=args["ref"].as_str() {
+    if let Some(reference)=reference {
         let previous=app.state::<BrowserState>().observations.lock().unwrap().get(&active_label(app)?).cloned().ok_or("目标裁剪需要最新 inspect/screenshot")?;
         if args["snapshotId"].as_str()!=Some(&previous.id) { return Err("目标裁剪 snapshotId 已失效".into()); }
         if args["expandScroll"]==true {
@@ -943,7 +988,6 @@ async fn snapshot(
         // expandScroll output is meant to be read/shared: keep original pixels unless asked otherwise.
         let keep_original=args["expandScroll"]==true;
         let edge=args["maxEdge"].as_u64().unwrap_or(if keep_original {0} else {1600});
-        if edge!=0 && !(320..=3840).contains(&edge) {return Err("maxEdge 必须为0或320–3840".into());}
         observation.full_page = !auto_visual && region.is_none() && (args["fullPage"] != false || target.is_some());
         let mut images = Vec::new();
         let mut document = None;
@@ -1169,8 +1213,7 @@ fn inline_summary(pages: &Value, args: &Value, base: Option<&Value>) -> Value {
             page["text"] = json!(text);
             listed.retain(|(_, item)| query.is_empty() || format!("{} {} {}", item["name"], item["region"], item["href"])
                 .to_lowercase().contains(&query));
-            // Filter before shortening context; keep actionable visible controls first, as before.
-            listed.sort_by_key(|(_, item)| (item["inView"] != true, item["blockedBy"].is_string()));
+            // Preserve observed order: an obscured first result must not become the last result.
             let total = listed.len();
             listed.truncate(remaining_items);
             remaining_items -= listed.len();
@@ -1318,9 +1361,9 @@ async fn control_session(
         if !matches!(operation,"act"|"evaluate") {return Ok(snapshot(app,operation=="screenshot",args,current.as_ref()).await?.1);}
         let script = if operation == "evaluate" { Some(evaluation_args(args)?) } else { None };
         let mut actions=if script.is_some() { Vec::new() } else { parse_actions(args, 16)? };
-        let all_dom=script.is_none() && actions.iter().all(|a|matches!(a,Action::Click{..}|Action::Fill{..}|Action::Scroll{r#ref:Some(_),..}));
+        let live_refs=script.is_none() && current.as_ref().is_some_and(|o|refs_in(o,&actions));
         let with_image=current.as_ref().is_some_and(|o|o.screenshot) || actions.iter().any(|a|matches!(a,Action::ClickAt{..}|Action::Move{..}|Action::Drag{..}|Action::ScrollAt{..}));
-        let Some(observation)=current.clone().filter(|o|(args["snapshotId"].as_str()==Some(&o.id) || (all_dom && refs_in(o,&actions))) && (all_dom || o.captured.elapsed()<=Duration::from_secs(180))) else {
+        let Some(observation)=current.clone().filter(|o|live_refs || (args["snapshotId"].as_str()==Some(&o.id) && o.captured.elapsed()<=Duration::from_secs(180))) else {
             // Nothing was sent; attach a fresh observation so the model re-decides in this round-trip.
             let mut observe_args=args.clone();
             if let Some(a)=observe_args.as_object_mut() {for key in ["ref","frame","region"] {a.remove(key);}}
@@ -1414,10 +1457,12 @@ async fn control_session(
         if (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
             let mut feedback_args = args.clone();
             feedback_args["fullPage"] = json!(false);
-            feedback_args["__delta"] = json!(true);
+            feedback_args["__delta"] = json!(failure.is_none());
             if let Some(args)=feedback_args.as_object_mut() {for key in ["ref","frame","region"] {args.remove(key);} }
             if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
-            let visual=args["feedback"]=="screenshot" || (args["feedback"].is_null() && observation.screenshot);
+            // Occlusion cannot be explained by an unchanged DOM delta; show the blocker.
+            let visual=args["feedback"]=="screenshot" || (args["feedback"].is_null() && observation.screenshot)
+                || failure.as_deref().is_some_and(|reason| reason.contains("目标被遮挡"));
             // Feedback failure must never turn a completed mutation into a retryable action failure.
             match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,if script.is_some() { None } else { Some(&observation) })).await {
                 Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
@@ -1600,7 +1645,12 @@ fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashM
     let mut args = args.as_object().cloned().ok_or("chrome 参数必须是对象")?;
     match args.get("operation").and_then(Value::as_str).unwrap_or_default() {
         "connect" | "status" | "tabs" | "open" | "new_tab" | "downloads" | "experience_search" => return Ok(Value::Object(args)),
-        "inspect" | "screenshot" | "devtools" | "act" | "evaluate" | "run" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
+        // Models may fill unrelated fields from the shared schema. Inspect only consumes read
+        // options; even non-empty screenshot/action placeholders must not prevent a DOM read.
+        "inspect" => args.retain(|key, _| matches!(key.as_str(),
+            "operation" | "tabTag" | "tabId" | "browserId" | "snapshotId" |
+            "query" | "scope" | "visual" | "maxItems" | "maxTextChars" | "maxEdge")),
+        "screenshot" | "devtools" | "act" | "evaluate" | "run" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
         _ => return Err("缺少或无效 operation；先用 {\"operation\":\"tabs\"} 获取标签".into()),
     }
     let valid_tag = |tag: &str| tag.len() <= 80 && tag.starts_with('C')
@@ -1651,6 +1701,15 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
     let (args, inferred) = infer_operation(args, "tabTag");
     let args = &args;
     let normalized = chrome_args(args, &thread_id, &app.state::<BrowserState>().observations.lock().unwrap())?;
+    if matches!(normalized["operation"].as_str(), Some("inspect" | "screenshot")) {
+        if let Err(reason) = snapshot_options(&normalized, normalized["operation"] == "screenshot") {
+            // Only argument failures before any browser command are safe to mark not_executed.
+            return Ok(json!({"status":"not_executed","error":"invalid_arguments","reason":reason,
+                "completedActions":0,"inputAttempted":false,"tabTag":normalized["tabTag"],
+                "next":"先用 nextCall 获取页面，再按目标选择 DOM 操作或一种截图裁剪；不要原样重试错误参数",
+                "nextCall":{"operation":"inspect","tabTag":normalized["tabTag"]}}));
+        }
+    }
     let normalized = resolve_targets(root, &normalized, owner, "chrome").await?;
     let mut result = SHOT_OWNER.scope(owner.to_owned(), execute_chrome_inner(root, &normalized, owner)).await?;
     if let Some(op) = inferred { result["operationInferred"] = json!(op); }
@@ -1964,6 +2023,13 @@ mod tests {
         assert_eq!(limited["pages"][0]["inlineTruncated"], true);
         assert_eq!(limited["pages"][0]["matchingItems"], 60);
 
+        let mut first = item(51, "Intelligence");
+        first["blockedBy"] = json!("Search suggestions");
+        let ordered = json!({"pages":[page(vec![first, item(1, "Intelligence")], "Results")]});
+        let first_only = inline_summary(&ordered, &json!({"query":"Intelligence","maxItems":1}), None);
+        let first_line = first_only["pages"][0]["elements"].as_str().unwrap();
+        assert!(first_line.contains("d.51 ") && !first_line.contains("d.1 "), "truncation must retain the first result even when it is blocked or offscreen");
+
         // After an act: same document → only changed elements, new text and changed tables.
         let mut after_items: Vec<Value> = (1..60).map(|n| item(n, &format!("Search {n}"))).collect();
         after_items[0]["value"] = json!("2027-01-01");
@@ -2061,19 +2127,30 @@ mod tests {
     fn preflight_corrects_frame_from_unique_ref() {
         let frame = |id: &str| Frame { id: id.into(), parent: None, session: None, context: 0 };
         let observation = Observation { frames: vec![frame("top"), frame("child")], id: "s".into(),
-            pages: json!({"pages":[{"items":[{"ref":"a:1"}]},{"items":[{"ref":"b:51"}]}]}),
+            pages: json!({"pages":[{"items":[{"ref":"a:1"}]},{"items":[{"ref":"b:51","editable":true}]}]}),
             captured: std::time::Instant::now(), screenshot: false, full_page: false, images: Vec::new() };
         let mut click = parse_action(r#"{"action":"click","frame":0,"ref":"b:51"}"#).unwrap();
         preflight(&observation, &mut click, None).unwrap();
         assert!(matches!(click, Action::Click { frame: 1, .. }));
         let mut fake = parse_action(r#"{"action":"click","frame":0,"ref":"c:1"}"#).unwrap();
         assert!(preflight(&observation, &mut fake, None).is_err());
-        // 纯 DOM 动作的 ref 均属当前观察即可执行；旧 ref、坐标/按键仍需精确 snapshotId。
+        // Keyboard actions need a preceding explicit field target to reuse an old snapshot.
         let act = |json: &str| vec![parse_action(json).unwrap()];
         assert!(refs_in(&observation, &act(r#"{"action":"click","frame":0,"ref":"b:51"}"#)));
         assert!(!refs_in(&observation, &act(r#"{"action":"click","frame":0,"ref":"c:1"}"#)));
         assert!(!refs_in(&observation, &act(r#"{"action":"press","key":"Enter"}"#)));
         assert!(!refs_in(&observation, &[]));
+        let batch=|text:&str| parse_actions(&serde_json::from_str::<Value>(text).unwrap(),16).unwrap();
+        for good in [
+            r#"{"actions":[{"action":"click","ref":"b:51"},{"action":"type","text":"query"},{"action":"press","key":"Enter"}]}"#,
+            r#"{"actions":[{"action":"fill","ref":"b:51","text":"query"},{"action":"wait","ms":10},{"action":"press","key":"Enter"}]}"#,
+        ] {assert!(refs_in(&observation,&batch(good)),"{good}");}
+        for bad in [
+            r#"{"actions":[{"action":"type","text":"query"},{"action":"click","ref":"b:51"}]}"#,
+            r#"{"actions":[{"action":"click","ref":"a:1"},{"action":"press","key":"Enter"}]}"#,
+            r#"{"actions":[{"action":"click","ref":"b:51"},{"action":"click_at","x":10,"y":10}]}"#,
+            r#"{"actions":[{"action":"wait","ms":10}]}"#,
+        ] {assert!(!refs_in(&observation,&batch(bad)),"{bad}");}
     }
 
     #[test]
@@ -2082,6 +2159,60 @@ mod tests {
         let ordered = errors_first(value.clone());
         assert_eq!(ordered, value);
         assert_eq!(ordered.as_object().unwrap().keys().take(3).collect::<Vec<_>>(), ["status", "reason", "snapshotId"]);
+    }
+
+    #[test]
+    fn snapshot_options_ignore_only_empty_placeholders_and_reject_invalid_crops() {
+        for args in [json!({}), json!({"region":null,"ref":null}), json!({"region":{},"ref":""}),
+            json!({"region":{},"ref":" \t","maxEdge":null})] {
+            for with_image in [false, true] {
+                assert_eq!(snapshot_options(&args, with_image).unwrap(), (None, None), "{args}");
+            }
+        }
+        let region = json!({"x":0,"y":20,"width":100,"height":80});
+        let args = json!({"region":region,"ref":""});
+        assert_eq!(snapshot_options(&args, true).unwrap(), (Some(&region), None));
+        assert!(snapshot_options(&args, false).unwrap_err().contains("inspect 不接受"));
+        let args = json!({"region":{},"ref":"observed:1"});
+        assert_eq!(snapshot_options(&args, true).unwrap(), (None, Some("observed:1")));
+        assert!(snapshot_options(&args, false).is_err());
+        let conflict = json!({"region":region,"ref":"observed:1"});
+        assert!(snapshot_options(&conflict, true).unwrap_err().contains("不能同时提供"));
+        assert!(snapshot_options(&json!({"ref":123}), true).is_err());
+        for region in [json!({"x":0}), json!({"x":0,"y":0,"width":0,"height":1}),
+            json!({"x":-1,"y":0,"width":1,"height":1}), json!({"x":0,"y":0,"width":1,"height":null}),
+            json!([]), json!(""), json!(false)] {
+            assert!(snapshot_options(&json!({"region":region}), true).is_err(), "{region}");
+        }
+        for edge in [json!(-1), json!(1), json!(319), json!(3841), json!(320.5), json!("1600")] {
+            assert!(snapshot_options(&json!({"maxEdge":edge}), true).is_err(), "{edge}");
+        }
+        for edge in [0, 320, 1600, 3840] {
+            assert!(snapshot_options(&json!({"maxEdge":edge}), true).is_ok());
+        }
+    }
+
+    #[test]
+    fn chrome_inspect_ignores_other_operations_fields_before_validation() {
+        let expected = json!({"operation":"inspect","tabTag":"C1-test","snapshotId":"old",
+            "query":"订单号","scope":"viewport","visual":"none","maxItems":10,"maxTextChars":500,"maxEdge":320});
+        let unrelated = json!({"region":{"x":0,"y":0,"width":0,"height":0},"ref":"placeholder","frame":99,
+            "fullPage":true,"expandScroll":true,"tileOffset":999,"imageId":"old-image",
+            "feedback":"unused","observe":"unused","settleMs":99999,
+            "action":{"action":"click","ref":"placeholder"},"expression":"throw Error('must not run')"});
+        let mut args = expected.clone();
+        args.as_object_mut().unwrap().extend(unrelated.as_object().unwrap().clone());
+        let normalized = chrome_args(&args, "owner", &HashMap::new()).unwrap();
+        assert_eq!(normalized, expected);
+        assert_eq!(snapshot_options(&normalized, false).unwrap(), (None, None));
+        // The same fields retain their meaning for operations that actually use them.
+        for operation in ["screenshot", "evaluate", "act"] {
+            args["operation"] = json!(operation);
+            assert_eq!(chrome_args(&args, "owner", &HashMap::new()).unwrap(), args);
+        }
+        args["operation"] = json!("screenshot");
+        let normalized = chrome_args(&args, "owner", &HashMap::new()).unwrap();
+        assert!(snapshot_options(&normalized, true).unwrap_err().contains("不能同时提供"));
     }
 
     #[test]

@@ -99,12 +99,84 @@ try {
     await until(async()=>(await chromeUi('status')).connected,'Chrome bridge');
     assert.equal((await chromeUi('tabs')).tabs[0].tag,tag);
     await assert.rejects(chromeUi('inspect'),/tabTag/);
-    const chromeObs=await chromeUi('inspect',{tabTag:tag});
+    // Reproduce models filling screenshot/action fields on an inspect call. It must return
+    // the page directly, even when those unrelated values are non-empty or invalid.
+    const chromeObs=await chromeUi('inspect',{tabTag:tag,query:'订单号',scope:'all',visual:'none',
+      region:{x:0,y:0,width:0,height:0},ref:'placeholder',frame:99,fullPage:true,expandScroll:true,tileOffset:999,
+      feedback:'unused',observe:'unused',settleMs:99999,
+      action:{action:'fill',ref:'placeholder',text:'must not run'},expression:'throw Error("must not run")'});
+    assert.ok(chromeObs.snapshotId,JSON.stringify(chromeObs));
+    assert.equal(chromeObs.error,undefined);
+    assert.equal(chromeCaptures.length,0,'DOM inspect must not turn into a screenshot');
+    assert.equal(await page.locator('input').inputValue(),'','inspect must not execute unrelated actions');
+    const conflict=await chromeUi('screenshot',{tabTag:tag,snapshotId:chromeObs.snapshotId,
+      region:{x:0,y:0,width:100,height:100},ref:'placeholder'});
+    assert.equal(conflict.status,'not_executed');
+    assert.equal(conflict.inputAttempted,false);
+    assert.match(conflict.reason,/不能同时提供/);
+    assert.deepEqual(conflict.nextCall,{operation:'inspect',tabTag:tag});
+    assert.equal(chromeCaptures.length,0,'conflicting screenshot crops must still fail before capture');
     const full=JSON.parse(await readFile(chromeObs.documentPath,'utf8'));
     const input=full.pages[0].items.find(i=>i.name==='订单号');assert(input);
     const changed=await chromeUi('act',{tabTag:tag,snapshotId:chromeObs.snapshotId,action:{action:'fill',frame:0,ref:input.ref,text:'Chrome桥接验证'}});
     assert.equal(changed.status,'executed');assert.ok(changed.snapshotId);
     assert.equal(await page.evaluate(()=>document.querySelector('input').value),'Chrome桥接验证');
+    // A popup appearing after observation must refuse input and show enough context to recover.
+    const button=full.pages[0].items.find(i=>i.name==='查询');assert(button);
+    await page.evaluate(()=>document.body.insertAdjacentHTML('beforeend','<div id="blocker" role="dialog" style="position:fixed;inset:0;background:white;z-index:99999">Search suggestions<button onclick="this.parentElement.remove()">Dismiss suggestions</button></div>'));
+    const blocked=await chromeUi('act',{tabTag:tag,snapshotId:changed.snapshotId,feedback:'inspect',action:{action:'click',ref:button.ref}});
+    assert.equal(blocked.status,'not_executed');assert.equal(blocked.inputAttempted,false);
+    assert.match(blocked.reason,/目标被遮挡/);assert.ok(blocked.images?.length,'occlusion feedback must include the actual screen');
+    assert.ok(blocked.pages.every(p=>!p.delta),'failure must return full context, not an empty delta');
+    assert.ok(blocked.pages.some(p=>p.elements.includes('Dismiss suggestions')));
+    const dismissal=JSON.parse(await readFile(blocked.documentPath,'utf8')).pages[0].items.find(i=>i.name==='Dismiss suggestions');
+    const recovered=await chromeUi('act',{tabTag:tag,snapshotId:blocked.snapshotId,feedback:'inspect',action:{action:'click',ref:dismissal.ref}});
+    assert.equal(recovered.status,'executed');assert.equal(await page.locator('#blocker').count(),0);
+    // A batch owns focus only when it clicked/filled that exact node. An old snapshot
+    // ID is harmless for those live refs; focus theft and partial batches still stop.
+    await page.setContent('<input id="first" aria-label="First"><input id="second" aria-label="Second"><output></output>');
+    await page.evaluate(()=>{
+      window.clicks=0;window.enters=0;
+      document.querySelector('#first').focus();
+      document.querySelector('#second').onclick=()=>window.clicks++;
+      document.querySelector('#second').onkeydown=e=>{if(e.key==='Enter')window.enters++;};
+    });
+    const beforeFocus=await chromeUi('inspect',{tabTag:tag,visual:'none'});
+    const focusedFields=JSON.parse(await readFile(beforeFocus.documentPath,'utf8')).pages[0].items;
+    const second=focusedFields.find(i=>i.name==='Second');assert(second);
+    const typed=await chromeUi('act',{tabTag:tag,snapshotId:beforeFocus.snapshotId,feedback:'inspect',actions:[
+      {action:'click',ref:second.ref},{action:'type',text:'one batch'},{action:'press',key:'Enter'}]});
+    assert.equal(typed.status,'executed',JSON.stringify(typed));
+    assert.equal(typed.completedActions,3);assert.equal(await page.locator('#second').inputValue(),'one batch');
+    const staleKeys=await chromeUi('act',{tabTag:tag,snapshotId:beforeFocus.snapshotId,action:{action:'press',key:'Enter'}});
+    assert.equal(staleKeys.status,'not_executed');assert.equal(staleKeys.inputAttempted,false);
+    const staleDom=await chromeUi('act',{tabTag:tag,snapshotId:beforeFocus.snapshotId,feedback:'inspect',actions:[
+      {action:'fill',ref:second.ref,text:'same live node'},{action:'press',key:'Enter'}]});
+    assert.equal(staleDom.status,'executed',JSON.stringify(staleDom));assert.equal(staleDom.completedActions,2);
+    assert.equal(await page.locator('#second').inputValue(),'same live node');
+    assert.equal(await page.evaluate(()=>window.enters),2,'stale snapshot recovery must not replay Enter');
+    await page.evaluate(()=>{document.querySelector('#second').onclick=()=>{window.clicks++;setTimeout(()=>document.querySelector('#first').focus(),100);};});
+    const stolen=await chromeUi('act',{tabTag:tag,snapshotId:staleDom.snapshotId,feedback:'inspect',actions:[
+      {action:'click',ref:second.ref},{action:'wait',ms:250},{action:'type',text:'must not leak'}]});
+    assert.equal(stolen.status,'needs_review');assert.equal(stolen.completedActions,2);assert.match(stolen.reason,/焦点/);
+    assert.equal(await page.locator('#first').inputValue(),'');
+    assert.equal(await page.locator('#second').inputValue(),'same live node');
+    assert.equal(await page.evaluate(()=>window.clicks),3,'a partially completed batch must never be replayed');
+    const stolenKey=await chromeUi('act',{tabTag:tag,snapshotId:stolen.snapshotId,actions:[
+      {action:'click',ref:second.ref},{action:'wait',ms:250},{action:'press',key:'Enter'}]});
+    assert.equal(stolenKey.status,'needs_review');assert.equal(stolenKey.completedActions,2);assert.match(stolenKey.reason,/焦点/);
+    assert.equal(await page.evaluate(()=>window.enters),2);
+    await page.evaluate(()=>{const e=document.querySelector('#second');e.replaceWith(e.cloneNode(true));});
+    const replaced=await chromeUi('act',{tabTag:tag,snapshotId:stolen.snapshotId,action:{action:'fill',ref:second.ref,text:'wrong node'}});
+    assert.equal(replaced.status,'not_executed');assert.equal(replaced.inputAttempted,false);assert.match(replaced.reason,/失效/);
+    assert.equal(await page.locator('#second').inputValue(),'same live node');
+    const fieldShot=await chromeUi('screenshot',{tabTag:tag,fullPage:false,maxEdge:0});
+    const fieldRect=await page.locator('#second').boundingBox();
+    const coordinateType=await chromeUi('act',{tabTag:tag,snapshotId:fieldShot.snapshotId,feedback:'inspect',actions:[
+      {action:'click_at',x:fieldRect.x+fieldRect.width/2,y:fieldRect.y+fieldRect.height/2},
+      {action:'press',key:'Ctrl+A'},{action:'type',text:'coordinate focus'}]});
+    assert.equal(coordinateType.status,'executed',JSON.stringify(coordinateType));
+    assert.equal(await page.locator('#second').inputValue(),'coordinate focus');
     const script=`(() => { const n=document.createElement('aside'); n.className='nova-req-annot'; n.textContent='待确认'; document.body.append(n); return {count:document.querySelectorAll('.nova-req-annot').length}; })()`;
     const missing=await chromeUi('evaluate',{tabTag:tag,expression:script});
     assert.equal(missing.status,'not_executed');assert.ok(missing.snapshotId);
@@ -167,7 +239,7 @@ try {
     assert.equal(await page.evaluate(()=>innerHeight),viewportHeight,'viewport override must be cleared');
     if(pollingError)throw pollingError;
     await writeFile(join(output,'coordinate-report.json'),JSON.stringify({passed:true,modelCalls:0,coordinateHover:true,localCrop:true,stalePixels:true,chromeCaptures,profile},null,2));
-    console.log('PASS compiled Chrome bridge/evaluate annotations, readback, stale snapshots, partial failure and Promise timeout/DOM/images/coordinate guards; no sidebar browser');
+    console.log('PASS compiled Chrome bridge/inspect parameter isolation/screenshot crop validation/evaluate annotations, readback, stale snapshots, partial failure and Promise timeout/DOM/images/coordinate guards; no sidebar browser');
   }finally{abort.abort();await polling.catch(()=>{});}
 } finally {
   await browser?.close();

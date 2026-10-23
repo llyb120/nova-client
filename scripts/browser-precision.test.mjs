@@ -221,7 +221,7 @@ try {
     assert.equal((await fixture('<table aria-rowcount="0" style="width:100px;height:10px"></table>')).tables[0].totalRows,0);
     await evaluate('Object.defineProperty(globalThis,"__novaWebview",{value:{apiVersion:7},configurable:true}); true');
     await evaluate(engine);
-    assert.equal(await evaluate('__novaWebview.apiVersion'),23,'Existing Chrome worlds must upgrade to current DOM hints');
+    assert.equal(await evaluate('__novaWebview.apiVersion'),26,'Existing Chrome worlds must upgrade to current DOM hints');
     assert.equal((await call('observe',randomUUID())).tables[0].totalRows,0);
   });
   await run('native and ARIA checkboxes expose role and current selection',async()=>{
@@ -246,6 +246,10 @@ try {
     const obs=await fixture('<table><tr><td id="row">客户甲</td><td><button>删除</button></td></tr></table>');
     await page.evaluate(()=>document.querySelector('#row').textContent='客户乙');
     await assert.rejects(call('prepare',target(obs,'删除').ref),/引用已失效/);
+    const refreshed=await call('observe',randomUUID());
+    assert.notEqual(target(refreshed,'删除').ref,target(obs,'删除').ref,'re-observation must retire the recycled record ref');
+    await assert.rejects(call('prepare',target(obs,'删除').ref),/引用已失效/);
+    await call('prepare',target(refreshed,'删除').ref);
   });
   await run('detached / replaced same-name node is never silently retargeted',async()=>{
     const obs=await fixture('<button id="old">确定</button>');
@@ -270,6 +274,17 @@ try {
     const start=performance.now();const p=await call('prepare',target(obs,'移动目标').ref);
     assert.equal(await page.evaluate(()=>window.movingDone),true);
     assert.ok(p.x>260);assert.ok(performance.now()-start<1200);
+  });
+  await run('stationary targets ignore ongoing animations; real movement still refuses input',async()=>{
+    const obs=await fixture('<section><input aria-label="Search"><button>Stable</button></section>');
+    await page.evaluate(()=>document.querySelector('section').animate([{marginRight:'0px'},{marginRight:'20px'}],{duration:300,iterations:Infinity}));
+    const input=target(obs,'Search'),button=target(obs,'Stable');
+    const p=await call('prepare',input.ref,'fill');
+    await click(button);
+    await page.locator('input').focus();
+    assert.equal((await call('inputState',input.ref)).identity,p.identity,'prepare returns the intended node, not the old focus');
+    await page.evaluate(()=>document.querySelector('button').animate([{transform:'translateX(0px)'},{transform:'translateX(500px)'}],{duration:500,iterations:Infinity}));
+    await assert.rejects(call('prepare',button.ref),/正在移动/);
   });
   await run('hover replacement / overlay is rechecked before mouse down',async()=>{
     const obs=await fixture('<button style="position:absolute;left:200px;top:300px" onmouseenter="this.style.transform=\'translateX(150px)\'">悬停变化</button>');
