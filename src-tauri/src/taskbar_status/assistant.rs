@@ -557,12 +557,10 @@ fn poll_job(app: &tauri::AppHandle, rt: &Runtime, job: &Job) -> Result<(), Strin
                 let rest = &thread.items[at + 1..];
                 rest.iter().position(|i| matches!(i, Item::Turn { .. })).map(|end| conclusion(&rest[..=end]))
             });
-            // Kimi cannot steer a running turn (dispatch_prompt rejects it); it waits for idle.
-            let steerable = !matches!(thread.agent_kind, AgentKind::Kimi);
-            (running, steerable, baseline, received.is_some(), outcome)
+            (running, baseline, received.is_some(), outcome)
         })
     };
-    let Some((running, steerable, baseline, received, outcome)) = snapshot else {
+    let Some((running, baseline, received, outcome)) = snapshot else {
         return finish_job(app, rt, job, "error", "目标会话已经删了或不支持调度，这条没发出去，也没另开会话。".into());
     };
     if let Some((_, at)) = job.submitted {
@@ -583,8 +581,6 @@ fn poll_job(app: &tauri::AppHandle, rt: &Runtime, job: &Job) -> Result<(), Strin
         }
         return Ok(());
     }
-    // Running sessions get the task immediately as a steer into the current turn.
-    if running && !steerable { return Ok(()); }
     // Persist intent BEFORE dispatch. After a crash, submitted jobs are reconciled
     // against a real User item, never replayed on the strength of an LLM's reply.
     rt.update(|j| {
@@ -592,14 +588,6 @@ fn poll_job(app: &tauri::AppHandle, rt: &Runtime, job: &Job) -> Result<(), Strin
         pending.submitted = Some((baseline, now_ms()));
         Ok(())
     })?;
-    // Recheck after disk I/O: a session that just started cannot take a Kimi prompt yet.
-    if !steerable && crate::running_by_id(&state, &job.thread_id) {
-        rt.update(|j| {
-            if let Some(pending) = j.queue.iter_mut().find(|p| p.id == job.id) { pending.submitted = None; }
-            Ok(())
-        })?;
-        return Ok(());
-    }
     // Shared dispatch supplies Stage/auto-mode context, selects the backend, and steers
     // when the session is running.
     if let Err(error) = crate::dispatch_prompt(app, job.thread_id.clone(), job.text.clone(), job.images.clone()) {

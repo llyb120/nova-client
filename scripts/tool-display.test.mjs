@@ -21,7 +21,7 @@ const context = vm.createContext({
   toolDisplayText, toolTextLayouts: new LruMap(32),
   imageSourceCache: new WeakMap(), convertFileSrc: path => { imageUrls++; return path; },
   measure: text => { measures++; return text.length * 7; },
-  pal: { mono: 'mono', sans: 'sans' }, state: { agentKind: 'kimi' },
+  pal: { mono: 'mono', sans: 'sans' }, state: { agentKind: 'claude' },
   isExpanded: () => true, expandCodeTabs: text => text,
   displayToolTitle: text => text, stripAnsi: text => text,
   blockScrolls: new Map(), blockScrollKey: () => 'tool', blockScrollbarGeom: () => null,

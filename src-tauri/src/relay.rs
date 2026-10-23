@@ -1391,7 +1391,7 @@ impl RelayManager {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
             }
-            AgentKind::Kimi | AgentKind::Claude | AgentKind::WorkBuddy => {
+            AgentKind::Claude | AgentKind::WorkBuddy => {
                 let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move {
                     mgr.run_prompt(run_id, seed, vec![]).await;
@@ -1838,7 +1838,6 @@ impl RelayManager {
                 [
                     (AgentKind::Lyra, s.lyra_enabled),
                     (AgentKind::Devin, s.devin_enabled),
-                    (AgentKind::Kimi, s.kimi_enabled),
                     (AgentKind::Claude, s.claude_enabled),
                     (AgentKind::Codex, s.codex_enabled),
                     (AgentKind::CodeBuddy, s.codebuddy_enabled),
@@ -1870,7 +1869,6 @@ impl RelayManager {
                     AgentKind::Unsupported => continue,
                     AgentKind::WorkBuddy => app.state::<AppState>().workbuddy.ensure_model_options().await,
                     AgentKind::Devin => app.state::<AppState>().acp.fetch_model_options().await,
-                    AgentKind::Kimi => app.state::<AppState>().kimi.fetch_model_options().await,
                     AgentKind::Claude => app.state::<AppState>().claude.fetch_model_options().await,
                 };
                 backends.push(kind.as_str());
@@ -2383,7 +2381,6 @@ impl RelayManager {
         }
         // 远端原生会话已不再对应截断后的历史，下一条 prompt 必须从接力上下文启动。
         state.acp.forget_session_of_thread(&host_thread_id);
-        state.kimi.forget_session_of_thread(&host_thread_id);
         state.claude.forget_session_of_thread(&host_thread_id);
         state.codex.forget_session_of_thread(&host_thread_id);
         state.codexplus.forget_session_of_thread(&host_thread_id);
@@ -2528,7 +2525,7 @@ impl RelayManager {
                     });
                 }
             }
-            AgentKind::Kimi | AgentKind::Claude | AgentKind::WorkBuddy => {
+            AgentKind::Claude | AgentKind::WorkBuddy => {
                 let mgr = state.acp_for(&agent_kind).unwrap();
                 tauri::async_runtime::spawn(async move {
                     if !host_prompt_is_current(&prompt_epoch) {
@@ -2657,11 +2654,6 @@ impl RelayManager {
         let state = self.app.state::<AppState>();
         if request_key.starts_with("claude-") {
             let mgr = state.claude.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        } else if request_key.starts_with("kimi-") {
-            let mgr = state.kimi.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = mgr.respond_permission(&request_key, &option_id).await;
             });
@@ -3809,7 +3801,7 @@ mod tests {
 
     #[test]
     fn relay_requests_reject_unavailable_backends_without_fallback() {
-        for agent in ["cursor", "unsupported", "unknown-backend", "", "   "] {
+        for agent in ["kimi", "cursor", "unsupported", "unknown-backend", "", "   "] {
             assert!(requested_agent_kind(agent).is_err(), "accepted {agent:?}");
         }
         assert_eq!(requested_agent_kind(" lyra ").unwrap(), AgentKind::Lyra);

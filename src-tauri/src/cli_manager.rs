@@ -60,14 +60,6 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> Option<CliSpec> {
             install_command: "npm install -g @agentclientprotocol/claude-agent-acp@latest".into(),
             proxy: settings.claude_proxy.clone(),
         },
-        AgentKind::Kimi => CliSpec {
-            kind: kind.clone(),
-            cli_name: "kimi-code",
-            program: settings.kimi_path.clone(),
-            version_args: vec!["--version".into()],
-            install_command: "npm install -g @moonshot-ai/kimi-code@latest".into(),
-            proxy: settings.kimi_proxy.clone(),
-        },
         AgentKind::Lyra => CliSpec {
             kind: kind.clone(),
             cli_name: "lyra",
@@ -119,7 +111,6 @@ fn spec_for(kind: &AgentKind, settings: &Settings) -> Option<CliSpec> {
 fn all_specs(settings: &Settings) -> Vec<CliSpec> {
     [
         AgentKind::Claude,
-        AgentKind::Kimi,
         AgentKind::Devin,
         AgentKind::Codex,
         AgentKind::CodeBuddy,

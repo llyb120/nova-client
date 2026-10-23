@@ -254,7 +254,6 @@ fn normal_targets(config_dir: &Path) -> Result<Vec<Target>, String> {
     [
         AgentKind::Lyra,
         AgentKind::Devin,
-        AgentKind::Kimi,
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
@@ -276,12 +275,6 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
             configured_dir(overrides, "CLAUDE_CONFIG_DIR")
                 .unwrap_or_else(|| home.join(".claude"))
                 .join("CLAUDE.md"),
-        ),
-        AgentKind::Kimi => (
-            kind.label(),
-            configured_dir(overrides, "KIMI_CODE_HOME")
-                .unwrap_or_else(|| home.join(".kimi-code"))
-                .join("AGENTS.md"),
         ),
         // Lyra 沿用旧 Vega 数据目录与 AGENTS.md。
         AgentKind::Lyra => (

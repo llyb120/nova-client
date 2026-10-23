@@ -45,7 +45,6 @@ impl AppState {
                 AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => self.codebuddy.generate_text(model, prompt, options.images, options.timeout).await,
                 AgentKind::WorkBuddy => self.workbuddy.generate_text(model, prompt, options.images, options.timeout).await,
                 AgentKind::Claude => self.claude.generate_text(model, prompt, options.images, options.timeout).await,
-                AgentKind::Kimi => self.kimi.generate_text(model, prompt, options.images, options.timeout).await,
                 AgentKind::Devin => self.acp.generate_text(model, prompt, options.images, options.timeout).await,
             }
         };

@@ -1002,7 +1002,6 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
     for kind in [
         AgentKind::Lyra,
         AgentKind::Devin,
-        AgentKind::Kimi,
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::CodeBuddy,
@@ -1024,7 +1023,6 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         let value = match kind {
             AgentKind::Lyra => state.lyra.get_model_options(),
             AgentKind::Devin => state.acp.get_model_options(),
-            AgentKind::Kimi => state.kimi.get_model_options(),
             AgentKind::Claude => state.claude.get_model_options(),
             AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
             AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.get_model_options(),
@@ -1997,7 +1995,6 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
         match old_kind {
             AgentKind::Claude => state.claude.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Kimi => state.kimi.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Codex | AgentKind::CodexPlus => {
                 state.codexplus.forget_session_of_thread(&cmd.thread_id)
             }
@@ -2022,7 +2019,6 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
             AgentKind::Claude => state.claude.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Kimi => state.kimi.forget_session_of_thread(&cmd.thread_id),
             AgentKind::Codex | AgentKind::CodexPlus => {
                 state.codexplus.forget_session_of_thread(&cmd.thread_id)
             }
@@ -2049,8 +2045,6 @@ async fn respond_remote_permission(
         state.workbuddy.respond_permission(request_key, option_id).await
     } else if request_key.starts_with("claude-") {
         state.claude.respond_permission(request_key, option_id).await
-    } else if request_key.starts_with("kimi-") {
-        state.kimi.respond_permission(request_key, option_id).await
     } else if request_key.starts_with("cdp-") {
         state
             .codexplus

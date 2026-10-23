@@ -1,7 +1,6 @@
-//! Single-turn Kimi/Devin decision transport. Never use the interactive ACP manager here.
+//! Single-turn Devin decision transport. Never use the interactive ACP manager here.
 //! The caller owns `cwd` (a fresh private temporary directory); this module owns the child.
 use super::{apply_proxy_env, assign_to_agent_job, codebuddy_command, kill_process_tree, split_model_effort};
-use crate::threads::AgentKind;
 use base64::Engine;
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs, path::{Path, PathBuf}, process::Stdio, time::Duration};
@@ -9,8 +8,6 @@ use tokio::{io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrit
 
 const INPUT_LIMIT: usize = 32 * 1024 * 1024;
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
-// Kimi Code's default profile is `agent`. ACP currently ignores CLI --agent-file.
-const KIMI_AGENT: &str = "---\nname: agent\ndescription: Restricted text generation\noverride: true\ntools: []\nsubagents: []\n---\nUse only the supplied input and return text in the requested format. You have no tools.\n";
 
 fn env_value(env: &HashMap<String, String>, name: &str) -> Option<String> {
     env.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone())
@@ -40,15 +37,6 @@ fn read_optional(path: &Path) -> Result<Option<String>, String> {
     Ok(Some(text))
 }
 
-fn kimi_config(text: &str) -> Result<String, String> {
-    let mut value: toml::Value = toml::from_str(text).map_err(|_| "Kimi 模型配置不是有效 TOML")?;
-    let table = value.as_table_mut().ok_or("Kimi 配置必须是表")?;
-    // No hooks, services, extra skill/agent directories, MCP, plugins or system prompt.
-    table.retain(|k, _| matches!(k, "providers" | "models" | "default_provider" | "default_model" | "thinking"));
-    table.insert("telemetry".into(), toml::Value::Boolean(false));
-    toml::to_string(&value).map_err(|_| "编码 Kimi 隔离配置失败".into())
-}
-
 fn devin_config(text: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(text).map_err(|_| "Devin 模型配置不是有效 JSON")?;
     let mut result = json!({"version":1});
@@ -71,30 +59,6 @@ fn devin_credentials(text: &str) -> Result<String, String> {
     }
     table.retain(|k, _| matches!(k, "windsurf_api_key" | "api_server_url" | "devin_webapp_host" | "devin_api_url"));
     toml::to_string(&value).map_err(|_| "编码 Devin 隔离凭据失败".into())
-}
-
-// Link only the OAuth store, not a whole user home: refreshes stay in the original
-// credential store rather than rotating a disposable copy and invalidating the login.
-fn link_credentials(source: &Path, target: &Path) -> Result<(), String> {
-    if !source.exists() { return Ok(()); }
-    #[cfg(unix)]
-    let result = std::os::unix::fs::symlink(source, target);
-    #[cfg(windows)]
-    let result = {
-        use std::os::windows::process::CommandExt;
-        std::os::windows::fs::symlink_dir(source, target).or_else(|_| {
-            // mklink /J needs no elevation. Reject cmd expansion characters; both paths
-            // are quoted, /D disables autorun and /V:OFF disables delayed expansion.
-            if [source, target].iter().any(|p| p.to_string_lossy().contains(['%', '"', '\r', '\n'])) {
-                return Err(std::io::Error::other("unsafe junction path"));
-            }
-            let status = std::process::Command::new("cmd.exe")
-                .raw_arg(format!("/D /V:OFF /C mklink /J \"{}\" \"{}\"", target.display(), source.display()))
-                .stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x0800_0000).status()?;
-            if status.success() { Ok(()) } else { Err(std::io::Error::other("junction failed")) }
-        })
-    };
-    result.map_err(|_| "无法连接 Kimi OAuth 凭据目录，未复制或修改凭据".into())
 }
 
 fn prompt_blocks(prompt: String, images: &[Value]) -> Result<Vec<Value>, String> {
@@ -131,10 +95,9 @@ impl Drop for Process {
 
 /// `cwd` must be a fresh caller-owned temporary directory, never a project directory.
 pub(super) async fn complete(
-    kind: &AgentKind, program: &str, model: &str, prompt: String, images: &[Value], cwd: &Path,
+    program: &str, model: &str, prompt: String, images: &[Value], cwd: &Path,
     launch_env: &HashMap<String, String>, proxy: &str, deadline: Duration,
 ) -> Result<String, String> {
-    if !matches!(kind, AgentKind::Kimi | AgentKind::Devin) { return Err("非 Kimi/Devin 受限入口".into()); }
     let blocks = prompt_blocks(prompt, images)?;
     let original_home = user_home(launch_env)?;
     let home = cwd.join("home");
@@ -152,16 +115,7 @@ pub(super) async fn complete(
         fs::create_dir_all(dir).map_err(|_| "创建后端隔离数据目录失败")?;
     }
     let (base_model, effort) = split_model_effort(Some(model.trim()));
-    let args = if *kind == AgentKind::Kimi {
-        let original = env_value(launch_env, "KIMI_CODE_HOME").map(PathBuf::from).unwrap_or_else(|| original_home.join(".kimi-code"));
-        write(&config.join("config.toml"), kimi_config(&read_optional(&original.join("config.toml"))?.unwrap_or_default())?)?;
-        write(&config.join("agents/agent.md"), KIMI_AGENT)?;
-        write(&config.join("mcp.json"), "{\"mcpServers\":{}}")?;
-        link_credentials(&original.join("credentials"), &config.join("credentials"))?;
-        // OAuth device identity is part of the existing login, not user instructions.
-        if let Some(id) = read_optional(&original.join("device_id"))? { write(&config.join("device_id"), id)?; }
-        vec!["acp".to_owned()]
-    } else {
+    let args = {
         let platform_config = if cfg!(windows) {
             env_value(launch_env, "APPDATA").map(PathBuf::from).ok_or("APPDATA 不可用")?
         } else {
@@ -186,7 +140,7 @@ pub(super) async fn complete(
         .env("APPDATA", &config).env("LOCALAPPDATA", &data)
         .env("XDG_CONFIG_HOME", &config).env("XDG_DATA_HOME", &data)
         .env("XDG_CACHE_HOME", home.join("cache"))
-        .env("KIMI_CODE_HOME", &config).env("DEVIN_CONFIG_HOME", &config)
+        .env("DEVIN_CONFIG_HOME", &config)
         .env_remove("NODE_OPTIONS").env_remove("DEVIN_REFUSAL_FALLBACK")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     apply_proxy_env(&mut command, proxy);
@@ -201,7 +155,7 @@ pub(super) async fn complete(
     let stderr = process.0.stderr.take().ok_or("助理 stderr 不可用")?;
     let result = tokio::time::timeout(deadline, async {
         tokio::select! {
-            result = exchange(&mut stdin, &mut stdout, kind, cwd, if *kind == AgentKind::Kimi { base_model.as_deref() } else { None }, effort.as_deref(), &blocks) => result,
+            result = exchange(&mut stdin, &mut stdout, cwd, effort.as_deref(), &blocks) => result,
             _ = async { let mut bytes = Vec::new(); stderr.take(256 * 1024 + 1).read_to_end(&mut bytes).await } =>
                 Err("受限 CLI 提前退出或诊断输出超限；请检查登录、模型及 CLI 版本".into()),
         }
@@ -250,28 +204,17 @@ async fn request<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 }
 
 async fn exchange<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
-    stdin: &mut W, stdout: &mut BufReader<R>, kind: &AgentKind, cwd: &Path, model: Option<&str>, effort: Option<&str>, blocks: &[Value],
+    stdin: &mut W, stdout: &mut BufReader<R>, cwd: &Path, effort: Option<&str>, blocks: &[Value],
 ) -> Result<String, String> {
     let mut size = 0;
     let mut text = String::new();
     let init = request(stdin, stdout, 1, "initialize", json!({"protocolVersion":1,"clientInfo":{"name":"nova-decision","version":"1"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}}), &mut size, &mut text, None).await?;
     if init["protocolVersion"] != 1 { return Err("受限 ACP 协议版本不兼容".into()); }
-    // ponytail: the Markdown empty-tools profile is verified for the Kimi Code 0.42 family.
-    // Accept patch updates; extend this compatibility range after an empty-tools/image probe.
-    // ACP has no effective-tool-list capability, so do not silently run an unknown profile loader.
-    if *kind == AgentKind::Kimi && (init["agentInfo"]["name"] != "Kimi Code CLI"
-        || !init["agentInfo"]["version"].as_str().and_then(|v| v.strip_prefix("0.42."))
-            .is_some_and(|patch| patch.parse::<u32>().is_ok())) {
-        return Err("Kimi 受限助理需要兼容的 Kimi Code CLI 0.42.x；当前版本的空工具配置尚未验证".into());
-    }
     if blocks.iter().any(|b| b["type"] == "image") && init["agentCapabilities"]["promptCapabilities"]["image"] != true {
         return Err("该后端未声明支持图片，未发送缺失图片的请求".into());
     }
     let session = request(stdin, stdout, 2, "session/new", json!({"cwd":cwd,"mcpServers":[]}), &mut size, &mut text, None).await?;
     let sid = session["sessionId"].as_str().filter(|s| !s.is_empty()).ok_or("受限 ACP 缺少 sessionId")?;
-    if let Some(model) = model {
-        request(stdin, stdout, 3, "session/set_model", json!({"sessionId":sid,"modelId":model}), &mut size, &mut text, Some(sid)).await?;
-    }
     if let Some(effort) = effort {
         let option = session["configOptions"].as_array().and_then(|xs| xs.iter().find(|x| {
             x["category"] == "thought_level" || matches!(x["id"].as_str(), Some("thinking" | "thought_level" | "reasoning_effort"))
@@ -291,29 +234,14 @@ mod tests {
     use super::*;
     #[test]
     fn isolated_config_keeps_models_not_extensions() {
-        let c: toml::Value = toml::from_str(&kimi_config("default_model='small'\nhooks=[]\nextra_skill_dirs=['secret']\n[providers.test]\napi_key='credential'\n[models.small]\nmodel='small'\n[mcp.evil]\ncommand='bad'\n").unwrap()).unwrap();
-        assert_eq!(c["default_model"].as_str(), Some("small"));
-        assert_eq!(c["providers"]["test"]["api_key"].as_str(), Some("credential"));
-        assert!(c.get("hooks").is_none() && c.get("extra_skill_dirs").is_none() && c.get("mcp").is_none());
         let d: Value = serde_json::from_str(&devin_config(r#"{"agent":{"model":"small","hooks":"bad"},"devin":{"org_id":"org"},"mcpServers":{"evil":{}}}"#).unwrap()).unwrap();
         assert_eq!(d["agent"]["model"], "small");
         assert!(d["agent"].get("hooks").is_none() && d.get("mcpServers").is_none());
-        assert!(KIMI_AGENT.contains("tools: []\nsubagents: []"));
         let credentials = devin_credentials("windsurf_api_key='test-key'\nrefresh_token='never-copy'\napi_server_url='https://example.test'\n").unwrap();
         assert!(credentials.contains("test-key") && credentials.contains("https://example.test"));
         assert!(!credentials.contains("never-copy") && !credentials.contains("refresh_token"));
         assert!(devin_credentials("refresh_token='never-copy'").is_err());
     }
-    #[test]
-    fn removing_isolated_home_preserves_original_credentials() {
-        let original = tempfile::tempdir().unwrap();
-        let isolated = tempfile::tempdir().unwrap();
-        fs::write(original.path().join("token"), "test-credential").unwrap();
-        link_credentials(original.path(), &isolated.path().join("credentials")).unwrap();
-        fs::remove_dir_all(isolated.path()).unwrap();
-        assert_eq!(fs::read_to_string(original.path().join("token")).unwrap(), "test-credential");
-    }
-
     #[test]
     fn images_are_inline_or_rejected_not_dropped() {
         let image = json!({"type":"image","mimeType":"image/png","data":"YQ==","uri":"file:///secret"});
@@ -344,13 +272,10 @@ mod tests {
             "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"s\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"OK\"}}}}\n",
             "{\"id\":5,\"result\":{\"stopReason\":\"end_turn\"}}\n");
         let mut out = Vec::new();
-        assert_eq!(exchange(&mut out, &mut BufReader::new(wire.as_bytes()), &AgentKind::Devin, Path::new("/isolated"), None, None, &[]).await.unwrap(), "OK");
+        assert_eq!(exchange(&mut out, &mut BufReader::new(wire.as_bytes()), Path::new("/isolated"), None, &[]).await.unwrap(), "OK");
         let sent = String::from_utf8(out).unwrap();
         assert!(sent.contains("\"mcpServers\":[]") && sent.contains("\"readTextFile\":false"));
         let partial = wire.replace("end_turn", "max_tokens");
-        assert!(exchange(&mut Vec::new(), &mut BufReader::new(partial.as_bytes()), &AgentKind::Devin, Path::new("/isolated"), None, None, &[]).await.is_err());
-        assert!(exchange(&mut Vec::new(), &mut BufReader::new(wire.as_bytes()), &AgentKind::Kimi, Path::new("/isolated"), None, None, &[]).await.is_err());
-        let kimi = wire.replace("\"protocolVersion\":1", "\"protocolVersion\":1,\"agentInfo\":{\"name\":\"Kimi Code CLI\",\"version\":\"0.42.1\"}");
-        assert_eq!(exchange(&mut Vec::new(), &mut BufReader::new(kimi.as_bytes()), &AgentKind::Kimi, Path::new("/isolated"), None, None, &[]).await.unwrap(), "OK");
+        assert!(exchange(&mut Vec::new(), &mut BufReader::new(partial.as_bytes()), Path::new("/isolated"), None, &[]).await.is_err());
     }
 }

@@ -51,7 +51,6 @@ pub fn session_cleanup_is_expired(timestamp: i64, now: i64, hours: u32) -> bool 
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     Claude,
-    Kimi,
     Devin,
     Codex,
     CodexPlus,
@@ -86,7 +85,6 @@ impl AgentKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
-            AgentKind::Kimi => "kimi",
             AgentKind::Devin => "devin",
             AgentKind::Codex => "codex",
             AgentKind::CodexPlus => "codexplus",
@@ -102,7 +100,6 @@ impl AgentKind {
     pub fn from_str(s: &str) -> Option<AgentKind> {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" => Some(AgentKind::Claude),
-            "kimi" => Some(AgentKind::Kimi),
             // Vega 已移除：旧的 alkaid 标识一律映射到 Lyra。
             "alkaid" => Some(AgentKind::Lyra),
             "devin" => Some(AgentKind::Devin),
@@ -120,7 +117,6 @@ impl AgentKind {
     pub fn label(&self) -> &'static str {
         match self {
             AgentKind::Claude => "Claude Code",
-            AgentKind::Kimi => "Kimi Code",
             AgentKind::Devin => "Devin",
             AgentKind::Codex => "Codex",
             AgentKind::CodexPlus => "Codex",
@@ -2243,7 +2239,7 @@ mod tests {
 
     #[test]
     fn unknown_agent_kinds_are_history_only() {
-        for raw in ["cursor", " CURSOR ", "future-backend", "unsupported"] {
+        for raw in ["kimi", " KIMI ", "cursor", " CURSOR ", "future-backend", "unsupported"] {
             assert_eq!(AgentKind::from_str(raw), None);
             let kind: AgentKind = serde_json::from_value(serde_json::json!(raw)).unwrap();
             assert_eq!(kind, AgentKind::Unsupported);
@@ -2253,7 +2249,6 @@ mod tests {
         }
         for kind in [
             AgentKind::Claude,
-            AgentKind::Kimi,
             AgentKind::Devin,
             AgentKind::Codex,
             AgentKind::CodexPlus,
@@ -2274,7 +2269,7 @@ mod tests {
 
     #[test]
     fn unknown_backend_history_survives_split_and_legacy_store_roundtrips() {
-        let originals: Vec<Value> = ["cursor", "future-backend", "lyra"]
+        let originals: Vec<Value> = ["kimi", "cursor", "future-backend", "lyra"]
             .into_iter()
             .map(|raw| {
                 let mut thread = Thread::new("project".into(), AgentKind::Lyra, None, None, None, false);

@@ -1,9 +1,9 @@
 
 /** unsupported 仅用于读取历史记录，不可选择或执行。 */
-export type AgentKind = "claude" | "kimi" | "lyra" | "devin" | "codex" | "codebuddy" | "workbuddy" | "unsupported";
+export type AgentKind = "claude" | "lyra" | "devin" | "codex" | "codebuddy" | "workbuddy" | "unsupported";
 
 /** 可执行后端的固定展示顺序；未知/已移除后端不能回退到其它后端。 */
-export const ALL_AGENT_KINDS: AgentKind[] = ["lyra", "devin", "kimi", "claude", "codex", "codebuddy", "workbuddy"];
+export const ALL_AGENT_KINDS: AgentKind[] = ["lyra", "devin", "claude", "codex", "codebuddy", "workbuddy"];
 export const isSupportedAgentKind = (kind: unknown): kind is Exclude<AgentKind, "unsupported"> =>
   ALL_AGENT_KINDS.some((supported) => supported === kind);
 
@@ -424,9 +424,6 @@ export interface Settings {
   claudePath: string;
   claudeProxy: string;
   claudeEnabled: boolean;
-  kimiPath: string;
-  kimiProxy: string;
-  kimiEnabled: boolean;
   devinPath: string;
   acpArgs: string;
   /** Devin 代理地址（空 = 不代理；下同：注入 HTTP(S)_PROXY 到该后端子进程） */

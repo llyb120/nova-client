@@ -207,7 +207,6 @@ export const [state, setState] = createStore<AppStore>({
   modelOptions: {
     lyra: null,
     devin: null,
-    kimi: null,
     claude: null,
     codex: null,
     codebuddy: null,
@@ -225,7 +224,6 @@ export const [state, setState] = createStore<AppStore>({
   slashCommands: {
     lyra: [],
     devin: [],
-    kimi: [],
     claude: [],
     codex: [],
     codebuddy: [],
@@ -458,13 +456,11 @@ export async function ensureModelOptions(agentKind: AgentKind) {
   }
 }
 
-/** 某后端在设置里是否启用。Claude / Kimi / WorkBuddy 默认关闭，其余缺字段按启用处理。 */
+/** 某后端在设置里是否启用。Claude / WorkBuddy 默认关闭，其余缺字段按启用处理。 */
 function agentEnabled(s: Settings, k: AgentKind): boolean {
   switch (k) {
     case "lyra":
       return s.lyraEnabled !== false;
-    case "kimi":
-      return s.kimiEnabled === true;
     case "claude":
       return s.claudeEnabled === true;
     case "devin":

@@ -25,7 +25,7 @@ assert.equal(units.length, names.size);
 const code = ts.transpileModule(units.join("\n").replace(/export function/g, "function"), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
-const kinds = ["lyra", "devin", "codex", "codebuddy", "workbuddy", "kimi", "claude"];
+const kinds = ["lyra", "devin", "codex", "codebuddy", "workbuddy", "claude"];
 const efforts = {};
 new Function("exports", ts.transpileModule(readFileSync(
   new URL("../src/modelEfforts.ts", import.meta.url), "utf8",

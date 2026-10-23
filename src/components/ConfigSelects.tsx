@@ -119,7 +119,7 @@ export function modelOptionsOf(
   const costs = state.modelCosts;
   const encode = (value: string) => (merged ? encodeModelValue(agentKind, value) : value);
   const config = (source !== undefined ? source : state.modelOptions[agentKind])?.configOptions;
-  const effortConfig = config?.find((o) => o.id === (agentKind === "kimi" ? "thinking" : "thought_level"));
+  const effortConfig = config?.find((o) => o.id === "thought_level");
   // 与 ACP 展开模型档位时的默认解析一致；漫游/共享使用传入的配置。
   const acpEffort = effortConfig
     ? ["low", "high", "max"].includes(effortConfig.currentValue ?? "") ? effortConfig.currentValue : "high"

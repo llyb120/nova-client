@@ -16,14 +16,14 @@ const { ALL_AGENT_KINDS, isSupportedAgentKind, scenesReady, SCENES, agentLabel, 
 const scenesWith = (agentKind) => Object.fromEntries(
   SCENES.map(({ key }) => [key, [{ agentKind, model: 'saved-model' }]]),
 );
-assert.deepEqual(ALL_AGENT_KINDS, ['lyra', 'devin', 'kimi', 'claude', 'codex', 'codebuddy', 'workbuddy']);
+assert.deepEqual(ALL_AGENT_KINDS, ['lyra', 'devin', 'claude', 'codex', 'codebuddy', 'workbuddy']);
 for (const kind of ALL_AGENT_KINDS) {
   assert.equal(isSupportedAgentKind(kind), true);
   assert.equal(scenesReady(scenesWith(kind)), true);
   assert.notEqual(agentLabel(kind), '已移除的后端');
   assert.notEqual(agentShort(kind), '?');
 }
-for (const kind of ['cursor', 'cursorplus', 'unsupported', 'unknown', '', null, undefined]) {
+for (const kind of ['kimi', 'cursor', 'cursorplus', 'unsupported', 'unknown', '', null, undefined]) {
   assert.equal(isSupportedAgentKind(kind), false);
   assert.equal(ALL_AGENT_KINDS.includes(kind), false);
   assert.equal(scenesReady(scenesWith(kind)), false);
