@@ -753,7 +753,7 @@ fn keys(raw: &str) -> Result<Vec<Key>> {
     }
     Ok(keys)
 }
-fn validate(a: &Action, shot: &Shot) -> Result<()> {
+fn validate(a: &Action, shot: Option<&Shot>) -> Result<()> {
     if !matches!(
         a.action.as_str(),
         "click" | "double_click" | "move" | "drag" | "type" | "press" | "scroll" | "wait"
@@ -779,10 +779,10 @@ fn validate(a: &Action, shot: &Shot) -> Result<()> {
         a.action.as_str(),
         "click" | "double_click" | "move" | "drag" | "scroll"
     ) {
-        point(shot, a.x, a.y)?;
+        point(shot.ok_or("坐标动作需要截图")?, a.x, a.y)?;
     }
     if a.action == "drag" {
-        point(shot, a.to_x, a.to_y)?;
+        point(shot.ok_or("坐标动作需要截图")?, a.to_x, a.to_y)?;
     }
     if a.action == "press" {
         keys(a.key.as_deref().ok_or("press 缺少key")?)?;
@@ -1177,6 +1177,8 @@ fn post_background(shot: &Shot, a: &Action) -> Result<()> {
     background::post(pid, shot.surface.id, at, to, a)
 }
 
+pub(crate) const COMPLETION_GUIDANCE: &str = "用最新截图（含动作自动反馈）核对用户要求的结果；可见证据已满足目标就立即结束，不为等待已读/回复或消除无关图标继续轮询。仅有明确未完成证据时才等待复查；连续两次没有新证据就换验证方法或如实报告未确认项，不重放输入。";
+
 fn run(owner: String, mut args: Value) -> Result<Value> {
     // Some clients omit the operation while supplying a complete action batch. Normalize the
     // unambiguous shape only; an explicitly supplied operation is never overridden.
@@ -1198,9 +1200,10 @@ fn run(owner: String, mut args: Value) -> Result<Value> {
     if is_act {
         result["basedOnSnapshotId"] = based_on;
         result["verification"] = json!("unverified");
+        if result["status"] == "not_executed" { result["inputAttempted"] = json!(false); }
     }
     if is_act || result.get("images").is_some() {
-        result["verificationNotice"] = json!("executed仅表示输入已发送；stable仅表示取样期间画面近似稳定，不证明加载完成或任务成功。核对最新图中的目标、选中项/筛选条件与正文是否一致；不符或timeout时重新观察，不重放输入。最终结论绑定snapshotId及可见证据；未覆盖完整范围不能断言全部或不存在。notes为模型记录，未经工具验证。");
+        result["verificationNotice"] = json!(format!("executed表示动作执行完毕，stable只表示画面近似稳定。{COMPLETION_GUIDANCE}未覆盖完整范围不能断言全部或不存在；notes未经工具验证。"));
     }
     if let Some(notes) = notes.filter(|v| v.as_str().is_some_and(|s| s.chars().count() <= 12000)) {
         result["notes"] = notes;
@@ -1208,7 +1211,17 @@ fn run(owner: String, mut args: Value) -> Result<Value> {
     Ok(result)
 }
 
-fn run_inner(owner: String, args: Value) -> Result<Value> {
+fn run_inner(owner: String, mut args: Value) -> Result<Value> {
+    // Read-only requests often inherit unrelated optional fields from a prior action.
+    // Keep the actual observation parameters strict, especially crop coordinates.
+    let operation = args["operation"].as_str().unwrap_or_default().to_owned();
+    if matches!(operation.as_str(), "windows" | "screenshot") {
+        if let Some(map) = args.as_object_mut() {
+            map.retain(|key, _| matches!(key.as_str(), "operation" | "windowId" | "maxEdge" | "background" | "notes")
+                || if operation == "windows" { matches!(key.as_str(), "query" | "observe") }
+                else { matches!(key.as_str(), "monitorId" | "region" | "regionSpace" | "snapshotId" | "imageId") });
+        }
+    }
     let is_act = args["operation"] == "act";
     let request: Request = match serde_json::from_value(args) {
         Ok(request) => request,
@@ -1282,7 +1295,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 }
                 result["windows"] = json!(matched);
             }
-            if request.observe == Some(true) {
+            if request.observe == Some(true) && (target.is_some() || request.query.as_deref().is_none_or(|q| q.trim().is_empty())) {
                 // Background windows capture via PrintWindow; the fallback is the focused window, then the desktop.
                 let focused = all.iter().find(|w| w["focused"] == true && w["minimized"] != true)
                     .and_then(|w| w["windowId"].as_u64()).map(|id| id as u32);
@@ -1293,6 +1306,9 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                         result.as_object_mut().unwrap().extend(observed.as_object().unwrap().clone());
                         result["observedWindowId"] = json!(window_id);
                         result["observedBy"] = json!(if target.is_some() {"query/windowId"} else if bg {"background"} else if focused.is_some() {"foreground"} else {"desktop"});
+                        if !bg && window_id.is_some() && window_id != focused {
+                            result["next"] = json!("目标窗口不在前台；输入前先 activate(windowId)，使用其返回的新图继续。");
+                        }
                     }
                     Err(e) => result["observationError"] = json!(e),
                 }
@@ -1351,6 +1367,36 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 "notice":"历史截图仅供阅读，不产生可操作快照；操作前请使用当前截图"}))
         }
         "act" => {
+            let actions = request.actions.as_deref().ok_or("缺少actions")?;
+            if actions.is_empty() || actions.len() > 16 {
+                return Err("每次需要1至16个动作".into());
+            }
+            if actions.iter().all(|a| a.action == "wait") {
+                // Waiting injects no input: old/cropped image IDs and age cannot make it unsafe.
+                // Preserve ownership/mode boundaries and observe the bound target, never chase focus.
+                let snap = state.as_ref();
+                if snap.is_some_and(|s| s.owner != owner || s.background != bg) {
+                    return Err("等待观察不能使用其它会话或不同background模式的快照，请先重新截图".into());
+                }
+                if snap.is_some_and(|s| s.window.is_some() && request.window_id.is_some() && s.window != request.window_id) {
+                    return Err("windowId与截图不符".into());
+                }
+                for (index, a) in actions.iter().enumerate() {
+                    validate(a, None).map_err(|e| format!("actions[{index}].{e}"))?;
+                }
+                let window_id = request.window_id.or_else(|| snap.and_then(|s| s.window));
+                let max_edge = request.max_edge.or_else(|| snap.map(|s| s.max_edge)).unwrap_or(1600);
+                for a in actions { std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))); }
+                let mut result = json!({"status":"executed","completedActions":actions.len(),"inputAttempted":false});
+                if request.feedback.as_deref() != Some("none") {
+                    let window_id = if request.feedback.as_deref() == Some("desktop") { None } else { window_id };
+                    match capture(&owner, window_id, None, None, max_edge, false, &mut state) {
+                        Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
+                        Err(e) => result["observationError"] = json!(e),
+                    }
+                }
+                return Ok(result);
+            }
             // 座席是 Xvfb（X11），与用户会话是否 Wayland 无关。
             if !bg && cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some() {
                 return Err(
@@ -1418,13 +1464,9 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
             if snap.window.is_some() && request.window_id.is_some() && request.window_id != snap.window {
                 return Err("windowId与截图不符".into());
             }
-            let actions = request.actions.ok_or("缺少actions")?;
             let shot = action_shot(&snap.shots, request.image_id.as_deref())?.clone();
-            if actions.is_empty() || actions.len() > 16 {
-                return Err("每次需要1至16个动作".into());
-            }
             for (index, a) in actions.iter().enumerate() {
-                if let Err(e) = validate(a, &shot).and_then(|_| if bg { background::validate(a) } else { Ok(()) }) {
+                if let Err(e) = validate(a, Some(&shot)).and_then(|_| if bg { background::validate(a) } else { Ok(()) }) {
                     return Ok(json!({"status":"not_executed","completedActions":0,
                         "error":format!("actions[{index}].{e}；本批次尚未执行")}));
                 }
@@ -1468,7 +1510,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                 if clipboard_paste {
                     if let Some(copied) = crate::clipboard::copied_since(clipboard) { copied_before_paste = Some(copied); }
                 }
-                attempted = true;
+                attempted |= a.action != "wait";
                 let sent = match enigo.as_mut() {
                     Some(enigo) => input(enigo, &shot, a, snap.foreground),
                     None => post_background(&shot, a),
@@ -1506,7 +1548,7 @@ fn run_inner(owner: String, args: Value) -> Result<Value> {
                     }
                 }
             }
-            let mut result = json!({"status":if failure.is_some(){if attempted {"needs_review"} else {"not_executed"}}else{"executed"},"completedActions":completed,"error":failure,"notes":request.notes});
+            let mut result = json!({"status":if failure.is_some(){if attempted {"needs_review"} else {"not_executed"}}else{"executed"},"completedActions":completed,"inputAttempted":attempted,"error":failure,"notes":request.notes});
             if shot.region.is_some() {
                 result["coordinateNotice"] = json!("局部操作后的反馈恢复完整窗口；使用新的imageId和完整图片坐标，不沿用局部坐标");
             }
@@ -2051,9 +2093,9 @@ mod tests {
         assert!(Region { width:0, ..region }.validate(shot.source_pixels).is_err());
         assert!(Region { y:2100, ..region }.validate(shot.source_pixels).is_err());
         let wait: Action = serde_json::from_value(json!({"action":"wait","ms":8000})).unwrap();
-        assert_eq!(validate(&wait, &shot).unwrap_err(), "ms=8000，允许范围为 0–2000");
-        assert!(validate(&serde_json::from_value(json!({"action":"wait","ms":2000})).unwrap(), &shot).is_ok());
-        assert!(validate(&serde_json::from_value(json!({"action":"drag","x":1,"y":1,"toX":2,"toY":2,"glide":true})).unwrap(), &shot).is_ok());
+        assert_eq!(validate(&wait, Some(&shot)).unwrap_err(), "ms=8000，允许范围为 0–2000");
+        assert!(validate(&serde_json::from_value(json!({"action":"wait","ms":2000})).unwrap(), None).is_ok());
+        assert!(validate(&serde_json::from_value(json!({"action":"drag","x":1,"y":1,"toX":2,"toY":2,"glide":true})).unwrap(), Some(&shot)).is_ok());
         assert_eq!(keys("Ctrl+Shift+S").unwrap().len(), 3);
         assert!(keys("Ctrl+unknown").is_err());
         assert!(keys("Ctrl+Shift+Alt+Meta+S").is_err());
@@ -2063,9 +2105,21 @@ mod tests {
             json!({"action":"drag","x":1,"y":1}),
             json!({"action":"scroll","x":1,"y":1,"delta":1,"glide":true}),
         ] {
-            assert!(validate(&serde_json::from_value(value).unwrap(), &shot).is_err());
+            assert!(validate(&serde_json::from_value(value).unwrap(), Some(&shot)).is_err());
         }
     }
+    #[test]
+    fn read_only_requests_ignore_unrelated_fields_but_validate_observation_parameters() {
+        let windows = run("validation".into(), json!({"operation":"windows","maxEdge":1,
+            "actions":"not an array","region":"not a region","snapshotId":123})).unwrap_err();
+        assert!(windows.contains("maxEdge"), "unrelated action/crop fields must not block windows: {windows}");
+        let screenshot = run("validation".into(), json!({"operation":"screenshot","actions":"not an array",
+            "observe":[],"query":{},"regionSpace":"invalid"})).unwrap_err();
+        assert!(screenshot.contains("regionSpace"));
+        let crop = run("validation".into(), json!({"operation":"screenshot","region":{"x":-1,"y":0,"width":1,"height":1}})).unwrap_err();
+        assert!(crop.contains("u32"), "crop coordinates must still be validated: {crop}");
+    }
+
     #[test]
     fn invalid_wait_rejects_whole_batch_before_input() {
         let shot = Shot { guard: None, overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
@@ -2145,7 +2199,32 @@ mod tests {
         assert_eq!(result["status"], "not_executed");
         assert_eq!(result["completedActions"], 0);
         assert!(result["error"].as_str().unwrap().contains("1至16"));
+        // Pure waits use no input lease or native input API, do not consume the image, and
+        // accept absent/old IDs even after cropping, expiry or browser invalidation.
+        {
+            let mut state = DESKTOP.lock().unwrap();
+            let snap = state.as_mut().unwrap();
+            snap.invalidated = Some("changed by browser".into());
+            snap.taken = original_taken - Duration::from_secs(181);
+        }
+        let _input_busy = lease_input("wait-test").unwrap();
+        for snapshot_id in [Value::Null, json!("before-crop")] {
+            let result = run("validation".into(), json!({"operation":"act","snapshotId":snapshot_id,
+                "imageId":"before-crop","feedback":"none","actions":[{"action":"wait","ms":0}]})).unwrap();
+            assert_eq!(result["status"], "executed");
+            assert_eq!(result["inputAttempted"], false);
+            assert_eq!(result["completedActions"], 1);
+            assert_eq!(DESKTOP.lock().unwrap().as_ref().unwrap().id, "validation");
+        }
+        let foreign = run("other-owner".into(), json!({"operation":"act","feedback":"none","actions":[{"action":"wait","ms":0}]})).unwrap();
+        assert_eq!(foreign["status"], "not_executed");
+        DESKTOP.lock().unwrap().as_mut().unwrap().background = true;
+        let wrong_mode = run("validation".into(), json!({"operation":"act","feedback":"none","actions":[{"action":"wait","ms":0}]})).unwrap();
+        assert_eq!(wrong_mode["status"], "not_executed");
         assert!(DESKTOP.lock().unwrap().take().is_some());
+        let wait = run("validation".into(), json!({"operation":"act","feedback":"none","actions":[{"action":"wait","ms":0}]})).unwrap();
+        assert_eq!(wait["status"], "executed");
+        assert!(DESKTOP.lock().unwrap().is_none());
         let invalid = run("validation".into(), json!({"operation":"act","actions":[{"action":"wait","ms":-1}]})).unwrap();
         assert_eq!(invalid["status"], "not_executed");
     }

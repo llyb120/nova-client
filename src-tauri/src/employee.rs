@@ -1057,8 +1057,8 @@ fn relay(app: &AppHandle, task: &Task, scene: Scene, cwd: Option<String>) -> Res
     let _ = app.emit(crate::acp::EV_THREADS, json!({}));
     let why = if failed.is_some() { "上一段会话出错中断，这是接力的新会话" } else { "这是本任务接力的新一段会话" };
     let computer = if scene == Scene::Computer {
-        "你是剑来段，负责电脑上的部分：结果要用最新截图确认确已达成，看到没刷新、没加载完等疑点时自己等待、刷新并复查，不要把未核实的状态交出去。\n"
-    } else { "" };
+        format!("你是剑来段，负责电脑上的部分：{}\n", crate::jianlai::COMPLETION_GUIDANCE)
+    } else { String::new() };
     let head = format!("（{why}（第 {} 段·{}），你看不到之前的对话：以任务原文和下面的交接内容为准接着做，不要重复已完成的部分。）\n{computer}{handoff}\n\n任务原文：\n",
         load().map_or(0, |e| { let chain = chain_of(&e, &from); e.runs.iter().filter(|r| r.chain == chain).count() }) + 1, scene.label());
     let started = update(|e| {
@@ -1528,7 +1528,7 @@ impl DesktopLease {
          只有用户按 Esc 才算接管，那时系统会直接停止你；前台改变、窗口失焦、弹窗或通知、轨迹被打断都不是用户接管，\
          重新观察或 activate 目标窗口后继续，不要因此放弃，也不要声称用户接管了电脑。\
          此前即使有过拒绝接管或 Esc 叫停，那一次已经处理完了；现在电脑重新排给你，照常继续，不要因为之前被拒绝或叫停而结束或改期。\
-         这项任务没有时间限制，把要求的范围全部做完再结束，不要因为耗时长或步骤多而提前收尾；确实做不完时如实写明原因，不要写成被中断或被接管。\n\n"
+         把要求的范围全部做完，不要因为耗时长或步骤多而提前收尾；可见证据已满足用户目标就立即结束，不额外等待已读、回复或反复检查无变化画面。确实做不完时如实写明原因，不要写成被中断或被接管。\n\n"
     }
 }
 

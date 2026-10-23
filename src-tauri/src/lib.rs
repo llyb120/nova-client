@@ -351,7 +351,7 @@ pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope>
 fn auto_mode_context(scope: &AutoScope, projects: &[String]) -> Option<String> {
     // 电脑操控子会话的交回规则不依赖是否可转交。
     let verify = if scope.child && scope.scene == settings::Scene::Computer {
-        "交回前必须用最新截图确认结果确已达成；看到“可能还没刷新/还没加载完”等疑点时，自己等待、刷新并重新截图复查，确认后再交回，不要把未核实的状态或“建议再检查”推给上游。"
+        crate::jianlai::COMPLETION_GUIDANCE
     } else {
         ""
     };
