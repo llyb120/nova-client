@@ -91,14 +91,13 @@ fn convert_local(mut provider: Value, selected: &str, list: &Value, catalog: Opt
 fn merge_local_models(models: &mut Map<String, Value>, explicit: &Map<String, Value>) {
     for (id, local) in explicit {
         let model = models.entry(id.clone()).or_insert_with(|| json!({}));
-        for field in ["options", "variants"] {
-            if let Some(values) = local[field].as_object() {
+        for (field, value) in local.as_object().into_iter().flatten() {
+            if let Some(values) = value.as_object() {
                 let mut merged = model[field].as_object().cloned().unwrap_or_default();
                 merged.extend(values.clone());
                 model[field] = json!(merged);
-            }
+            } else { model[field] = value.clone(); }
         }
-        if let Some(reasoning) = local.get("reasoning") { model["reasoning"] = reasoning.clone(); }
     }
 }
 
@@ -119,6 +118,9 @@ const PRESETS: &[Preset] = &[
     preset("server-support", "server support", "", false),
     preset("local-codex", "本地 Codex", "", false),
     preset("local-claude-code", "本地 Claude Code", "", false),
+    preset("devin", "Devin（本地 API）", "", false),
+    preset("codebuddy", "CodeBuddy（本地 API）", "", false),
+    preset("workbuddy", "WorkBuddy（本地 API）", "", false),
     preset("commandcode", "Command Code", "https://api.commandcode.ai/provider/v1", false),
     preset("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1", true),
     preset("opencode-go", "OpenCode Go", "https://opencode.ai/zen/go/v1", true),
@@ -154,6 +156,9 @@ fn local_source(preset: &str) -> Option<&str> {
         "server-support" => Some("server-support"),
         "local-codex" => Some("codex"),
         "local-claude-code" => Some("claude-code"),
+        "devin" => Some("devin"),
+        "codebuddy" => Some("codebuddy"),
+        "workbuddy" => Some("workbuddy"),
         _ => None,
     }
 }
@@ -172,6 +177,11 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
         }
         json!({ "name": "server support", "api": DEFAULT_API,
             "options": { "baseURL": format!("{server}/cc"), "apiKey": token }, "models": {} })
+    } else if source == "devin" {
+        super::devin_provider::load(nova_root, env)?
+    } else if matches!(source, "codebuddy" | "workbuddy") {
+        super::codebuddy_provider::load(nova_root, env, source)
+            .map_err(|error| if source == "workbuddy" { error.replace("CodeBuddy", "WorkBuddy") } else { error })?
     } else {
         local_provider::load(source, env)?.0
     };
@@ -187,6 +197,8 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
     if let Some(explicit) = provider.as_object() { local.as_object_mut().unwrap().extend(explicit.clone()); }
     local["options"] = json!(options);
     local["models"] = json!(models);
+    if matches!(source, "devin" | "codebuddy") { local["api"] = json!(source); }
+    if source == "workbuddy" { local["api"] = json!("codebuddy"); }
     super::config::resolve_config_env(&local, env)
 }
 
@@ -225,7 +237,9 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
                 Ok(mut local) => {
                     let mut models = cache[id.as_str()]["models"].as_object().cloned().unwrap_or_default();
                     merge_local_models(&mut models, local["models"].as_object().unwrap());
-                    models.extend(explicit);
+                    if matches!(source, "devin" | "codebuddy" | "workbuddy") {
+                        merge_local_models(&mut models, &explicit);
+                    } else { models.extend(explicit); }
                     local["models"] = json!(models);
                     *provider = local;
                 }
@@ -309,7 +323,11 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
                 &proxied
             }
         };
-        let result = if local_source(preset.id).is_some() && preset.id != "server-support" {
+        let result = if preset.id == "devin" {
+            super::devin_provider::models(&provider["options"], force).await
+        } else if matches!(preset.id, "codebuddy" | "workbuddy") {
+            super::codebuddy_provider::models(&provider["options"], force).await
+        } else if local_source(preset.id).is_some() && preset.id != "server-support" {
             fetch_local_models(http, provider.clone(), &mut models_dev).await
         } else {
             fetch_models(http, preset, &base_url, &api_key, &mut models_dev).await
@@ -685,6 +703,57 @@ pub(crate) fn cache_mtime(nova_root: &Path) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_native_model_options_preserve_catalog_capabilities() {
+        let mut models = json!({"alias":{"reasoning":true,"limit":{"context":1000000,"output":64000},
+            "modalities":{"input":["text","image"]},"options":{"supportsThinkingToggle":false}}}).as_object().unwrap().clone();
+        merge_local_models(&mut models,json!({"alias":{"limit":{"output":2048}}}).as_object().unwrap());
+        assert_eq!(models["alias"]["limit"]["output"],2048);
+        assert_eq!(models["alias"]["limit"]["context"],1000000);
+        assert_eq!(models["alias"]["reasoning"],true);
+        assert_eq!(models["alias"]["options"]["supportsThinkingToggle"],false);
+        assert_eq!(models["alias"]["modalities"]["input"],json!(["text","image"]));
+    }
+
+    #[test]
+    fn local_cli_apis_use_native_transport_and_cli_model_limits() {
+        for source in ["devin", "codebuddy"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("devin")).unwrap();
+            std::fs::write(dir.path().join("devin/credentials.toml"), "windsurf_api_key = 'native-key'\n").unwrap();
+            let path = dir.path().to_string_lossy().to_string();
+            let env = std::collections::HashMap::from([
+                ("APPDATA".into(), path.clone()), ("XDG_CONFIG_HOME".into(), path.clone()),
+                ("HOME".into(), path.clone()), ("USERPROFILE".into(), path.clone()),
+                ("CODEBUDDY_CONFIG_DIR".into(), path), ("CODEBUDDY_AUTH_TOKEN".into(), "native-key".into()),
+            ]);
+            let list = json!({ "data": [{ "id": "gpt-5-5-high", "name": "GPT-5.5 High Thinking",
+                "context_length": 272000, "top_provider": { "max_completion_tokens": 128000 }, "reasoning_options": [] }] });
+            let catalog = json!({ "openai": { "npm": "@ai-sdk/openai", "models": {
+                "gpt-5-5-high": { "reasoning": true, "reasoning_options": [{ "type": "effort", "values": ["low", "high"] }] }
+            } } });
+            let models = convert(&list, None, Some(&catalog), source);
+            let raw = json!({ "provider": { (source): { "preset": source, "options": { "apiKey": "stale-key" }, "models": models } } });
+            let mut local = resolve_local(&raw["provider"][source], source, &env, dir.path()).unwrap();
+            local["models"] = raw["provider"][source]["models"].clone();
+            let config = json!({ "provider": { (source): local } });
+            let resolved = super::super::config::resolve_model(&config, Some(&format!("{source}/gpt-5-5-high")), &Default::default()).unwrap();
+            assert!(resolved.model.base_url.starts_with("https://"));
+            assert_eq!(resolved.model.api, source);
+            assert!(!resolved.api_key.is_empty());
+            assert_ne!(resolved.api_key, "stale-key");
+            if source == "codebuddy" { assert!(resolved.model.requires_reasoning_content); }
+            assert_eq!(resolved.model.context_window, 272000);
+            assert_eq!(resolved.model.max_output_tokens, 128000);
+            assert!(!resolved.model.supports_reasoning_effort);
+            assert!(!resolved.model.supports_thinking_toggle);
+            assert!(config["provider"][source]["models"]["gpt-5-5-high"].get("variants").is_none());
+            assert_eq!(super::list().as_array().unwrap().iter().find(|p| p["id"] == source).unwrap()["local"], true);
+            assert_eq!(resolved.api_key, "native-key");
+            assert!(!dir.path().join("runtime").exists(), "native loading must not unpack or launch Node");
+        }
+    }
 
     #[test]
     fn server_support_follows_team_settings_and_preserves_model_protocols() {

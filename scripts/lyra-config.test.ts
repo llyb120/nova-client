@@ -69,7 +69,7 @@ assert.equal(savedImport.model, imported.model);
 assert.deepEqual(savedImport.provider["local-claude-code"].models.custom.variants, imported.provider["local-claude-code"].models.custom.variants);
 
 // 本地 provider 无需手填地址/协议/Key；凭证跟随 CLI，不能把旧导入的 Key 固化回去。
-for (const id of ["local-codex", "local-claude-code"]) {
+for (const id of ["local-codex", "local-claude-code", "devin", "codebuddy", "workbuddy"]) {
   const provider = providerDraft(id, { preset: id, options: { apiKey: "old-key" } });
   assert.equal(validate([provider], [{ id, name: id, baseURL: "", local: true }]), null);
   const config = configFromDraft({}, { model: "", providers: [provider] });

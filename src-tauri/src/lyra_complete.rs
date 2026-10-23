@@ -49,7 +49,7 @@ pub fn invalidate_config_cache() {
     *config_cache().lock().unwrap() = None;
 }
 
-/// 用已有 reqwest 连接池直调补全；仅支持 openai-completions / openai-responses。
+/// 用 Rust provider 直调补全。
 pub async fn complete_direct(
     http: &reqwest::Client,
     data_dir: &Path,
@@ -59,6 +59,27 @@ pub async fn complete_direct(
 ) -> Result<String, String> {
     let config = load_config(data_dir)?;
     let target = resolve_target(&config, model_selection, env)?;
+    if matches!(target.api.as_str(), "devin" | "codebuddy") {
+        let mut resolved = crate::lyra::config::resolve_model(&config, Some(model_selection), env)?;
+        // Mandatory-thinking models share the output budget with reasoning.
+        // ponytail: 2048 tokens bounds completion cost; select a faster model if its reasoning exceeds this budget.
+        resolved.model.max_output_tokens = if resolved.model.reasoning && !resolved.model.supports_thinking_toggle {
+            resolved.model.max_output_tokens.min(2048)
+        } else { COMPLETION_MAX_TOKENS as u64 };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let messages = [json!({"role":"user","content":prompt})];
+        let mut text = String::new();
+        let result = tokio::time::timeout(Duration::from_secs(12), crate::lyra::provider::stream_chat(
+            http, &resolved.model, &resolved.api_key, Some("none"), "", &messages, &[], None, &cancel, &mut |event| {
+                if let crate::lyra::provider::StreamEvent::TextDelta(delta) = event {
+                    text.push_str(&delta);
+                    if should_early_stop(&text) { cancel.store(true, std::sync::atomic::Ordering::SeqCst); }
+                }
+            },
+        )).await.map_err(|_| "补全请求超时")??;
+        if let Some(error) = result.error_message { return Err(error); }
+        return Ok(text.trim().to_string());
+    }
     // 模型在 config.jsonc 声明了 options.proxy 时改用按代理地址缓存的客户端。
     let proxied;
     let http = match target.proxy.as_deref() {
@@ -858,6 +879,42 @@ mod tests {
             "choices": [{ "message": { "content": "  world  " } }]
         });
         assert_eq!(extract_completions_text(&response).unwrap(), "world");
+    }
+
+    #[tokio::test]
+    async fn native_completion_reserves_thinking_budget_and_stops_on_text() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = "word ".repeat(15);
+        let output = expected.clone();
+        let server = std::thread::spawn(move || {
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut headers = Vec::new(); let mut byte = [0];
+                while !headers.ends_with(b"\r\n\r\n") { socket.read_exact(&mut byte).unwrap(); headers.push(byte[0]); }
+                let headers = String::from_utf8(headers).unwrap();
+                let length: usize = headers.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length: ").map(str::to_string)).unwrap_or("0".into()).parse().unwrap();
+                let mut body = vec![0; length]; socket.read_exact(&mut body).unwrap();
+                let (content_type, response) = if index == 0 {
+                    ("application/json", json!({"code":0,"data":{"models":[{"id":"m","maxOutputTokens":64000}]}}).to_string())
+                } else {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["max_tokens"], 2048, "48 tokens can be exhausted by mandatory reasoning");
+                    assert!(body.get("reasoning_effort").is_none());
+                    // No finish or [DONE]: enough completion text must cancel the native stream.
+                    ("text/event-stream", format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"reasoning_content":"thinking","content":output}}]})))
+                };
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap(); std::fs::create_dir(dir.path().join("alkaid")).unwrap();
+        std::fs::write(dir.path().join("alkaid/config.jsonc"), json!({"provider":{"p":{"api":"codebuddy",
+            "options":{"baseURL":format!("http://{address}/v2"),"apiKey":"test"},
+            "models":{"m":{"reasoning":true,"limit":{"output":64000},"options":{"supportsThinkingToggle":false}}}}}}).to_string()).unwrap();
+        let result = complete_direct(&reqwest::Client::new(),dir.path(),&HashMap::new(),"p/m","Continue briefly").await.unwrap();
+        assert_eq!(result,expected.trim()); server.join().unwrap();
     }
 
     #[test]

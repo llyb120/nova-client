@@ -194,7 +194,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
         <Show when={!draft.providers.length}>
           <div class="lyra-empty">
             <span class="field-label">添加第一个模型服务商</span>
-            <span class="field-hint">server support 使用团队中转和 token；本地 Codex / Claude Code 沿用本机认证，其他预设填写 API Key。</span>
+            <span class="field-hint">server support 使用团队中转和 token；本地 Codex / Claude Code / Devin / CodeBuddy / WorkBuddy 自动读取本机认证，其他预设填写 API Key。</span>
           </div>
         </Show>
         <Index each={draft.providers}>

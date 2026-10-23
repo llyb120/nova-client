@@ -36,6 +36,9 @@ api.getLyraConfig = async () => structuredClone(config);
 api.getLyraPresets = async () => [
   { id: 'commandcode', name: 'Command Code', baseURL: 'https://api.commandcode.ai/provider/v1' },
   { id: 'local-codex', name: '本地 Codex', baseURL: '', local: true },
+  { id: 'devin', name: 'Devin（本地 API）', baseURL: '', local: true },
+  { id: 'codebuddy', name: 'CodeBuddy（本地 API）', baseURL: '', local: true },
+  { id: 'workbuddy', name: 'WorkBuddy（本地 API）', baseURL: '', local: true },
   { id: 'openai-compatible', name: 'OpenAI 兼容', baseURL: '' },
 ];
 api.saveLyraConfig = async next => { config = structuredClone(next); calls.saved.push(config); };
@@ -121,13 +124,15 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
   await addedModel.getByLabel("模型 ID", { exact: true }).fill("temporary-model");
   await addedModel.getByRole("button", { name: "删除", exact: true }).click();
   assert.equal(await primary.locator("details.lyra-model").count(), 2);
-  await page.getByLabel("添加 Provider", { exact: true }).selectOption("local-codex");
-  const addedProvider = providers.last();
-  assert.equal(await addedProvider.evaluate(el => el.open), true, "new provider opens for editing");
-  assert.equal(await addedProvider.getByLabel("API Key", { exact: true }).count(), 0, "local credentials need no key");
-  await addedProvider.getByRole("combobox").first().selectOption("");
-  assert.equal(await addedProvider.locator("details.lyra-advanced").filter({ has: page.getByLabel("ID", { exact: true }) }).evaluate(el => el.open), true, "switching to manual exposes required protocol settings");
-  await addedProvider.locator(":scope > summary").getByRole("button", { name: "删除", exact: true }).click();
+  for (const presetId of ["local-codex", "devin", "codebuddy", "workbuddy"]) {
+    await page.getByLabel("添加 Provider", { exact: true }).selectOption(presetId);
+    const addedProvider = providers.last();
+    assert.equal(await addedProvider.evaluate(el => el.open), true, "new provider opens for editing");
+    assert.equal(await addedProvider.getByLabel("API Key", { exact: true }).count(), 0, "local credentials need no key");
+    await addedProvider.getByRole("combobox").first().selectOption("");
+    assert.equal(await addedProvider.locator("details.lyra-advanced").filter({ has: page.getByLabel("ID", { exact: true }) }).evaluate(el => el.open), true, "switching to manual exposes required protocol settings");
+    await addedProvider.locator(":scope > summary").getByRole("button", { name: "删除", exact: true }).click();
+  }
   await page.waitForFunction(() => document.querySelectorAll("details.lyra-provider").length === 2);
   await page.getByLabel("添加 Provider", { exact: true }).selectOption("manual");
   const manual = providers.last();

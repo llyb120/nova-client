@@ -22,6 +22,7 @@
 
 ## 能力与边界
 
+- Devin / CodeBuddy / WorkBuddy（本地 API）由 Rust 直接请求上游，无需填写 API Key、安装 Node 或手动启动代理。自动读取本机登录、模型目录和 Nova 中对应的代理设置，支持工具往返、流式输出及输入补全；WorkBuddy 加密登录通过其桌面版自带运行时读取。见 [Devin](devin-openai-api.md) / [CodeBuddy、WorkBuddy](codebuddy-openai-api.md)。
 - 本地 Codex / Claude Code 与其它 provider 共用添加、获取模型和缓存流程，无需在 Lyra 中填写 Key。运行时读取 CLI 的用户级 API 配置，始终请求完整 `/models` 列表（支持 Anthropic 分页），再合并本地选择及其私有参数；列表不可用时保留本地已配置模型。仍需 CLI 已配置 API 认证，订阅登录暂不支持。
 - 旧导入项在设置页自动转为对应预设，保存后生效；保留原 ID、默认模型及手写覆盖。JSONC 去注释/尾逗号时保留原始 UTF-8 字节，中文名称、路径不再二次转码；Lyra 冷启动从当前配置重新生成模型名称，替换旧乱码缓存。
 

@@ -13,7 +13,9 @@
 
 pub(crate) mod bridge;
 pub(crate) mod config;
+mod codebuddy_provider;
 mod context;
+mod devin_provider;
 mod edit;
 pub(crate) mod history;
 pub(crate) mod presets;

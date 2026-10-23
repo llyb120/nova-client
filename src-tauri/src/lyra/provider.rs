@@ -368,7 +368,7 @@ fn budget_output_tokens(body: &mut Value, model: &ResolvedModel, field: &str) {
     body[field] = json!(requested.min(available).max(16));
 }
 
-fn completions_body(
+pub(super) fn completions_body(
     model: &ResolvedModel,
     system_prompt: &str,
     messages: &[Value],
@@ -621,13 +621,13 @@ const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const SSE_IDLE_TIMEOUT: std::time::Duration = RESPONSE_HEADERS_TIMEOUT;
 const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-async fn wait_cancelled(cancel: &Arc<AtomicBool>) {
+pub(super) async fn wait_cancelled(cancel: &Arc<AtomicBool>) {
     while !cancel.load(Ordering::SeqCst) {
         tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
     }
 }
 
-async fn send_request(
+pub(super) async fn send_request(
     request: reqwest::RequestBuilder,
     cancel: &Arc<AtomicBool>,
 ) -> Result<reqwest::Response, String> {
@@ -703,6 +703,7 @@ async fn post_stream(
     let response = send_request(request, cancel).await?;
     let status = response.status();
     if !status.is_success() {
+        if model.api == "codebuddy" { return Err(format!("CodeBuddy upstream HTTP {}", status.as_u16())); }
         let text = response.text().await.unwrap_or_default();
         let message = text.trim();
         return Err(if message.is_empty() {
@@ -721,9 +722,11 @@ async fn post_stream(
 async fn read_sse(
     response: &mut reqwest::Response,
     cancel: &Arc<AtomicBool>,
+    require_done: bool,
     mut on_data: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<bool, String> {
     let mut decoder = SseDecoder::new();
+    let mut total = 0;
     loop {
         let chunk = tokio::select! {
             result = tokio::time::timeout(SSE_IDLE_TIMEOUT, response.chunk()) => {
@@ -739,6 +742,8 @@ async fn read_sse(
         };
         // 空负载仅为内部网络活动通知；SSE 解码仍按原协议进行。
         if chunk.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+            total += chunk.as_ref().unwrap().len();
+            if require_done && total > 32 * 1024 * 1024 { return Err("CodeBuddy 响应超过 32 MiB".into()); }
             on_data("")?;
         }
         let (events, finished) = match chunk {
@@ -762,12 +767,13 @@ async fn read_sse(
             on_data(&data)?;
         }
         if finished {
+            if require_done { return Err("CodeBuddy 响应中断：缺少 [DONE]".into()); }
             return Ok(false);
         }
     }
 }
 
-fn push_delta(
+pub(super) fn push_delta(
     result: &mut StreamResult,
     kind: &str,
     delta: &str,
@@ -831,6 +837,7 @@ fn completions_usage(usage: &Value) -> Value {
     let cached = usage
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
         .unwrap_or(0);
     json!({
         "input": prompt.saturating_sub(cached),
@@ -906,7 +913,7 @@ fn map_finish_reason(
     }
 }
 
-async fn stream_completions(
+pub(super) async fn stream_completions(
     http: &reqwest::Client,
     model: &ResolvedModel,
     api_key: &str,
@@ -916,16 +923,30 @@ async fn stream_completions(
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
     let url = crate::lyra_complete::join_url(&model.base_url, "chat/completions");
+    let strict = model.api == "codebuddy";
+    let supplied_tools = body["tools"].as_array().cloned().unwrap_or_default();
     let mut response = post_stream(http, &url, model, api_key, session_id, body, cancel).await?;
+    if strict && !response.headers().get("content-type").and_then(|h| h.to_str().ok()).is_some_and(|h| h.starts_with("text/event-stream")) {
+        return Err("CodeBuddy 响应不是 SSE".into());
+    }
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
     let mut finish_reason: Option<String> = None;
     let mut reasoning_details = Vec::new();
-    let cancelled = read_sse(&mut response, cancel, |data| {
+    let cancelled = read_sse(&mut response, cancel, strict, |data| {
         if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
+            if strict { return Err("CodeBuddy 流 JSON 无效".into()); }
             return Ok(());
         };
+        if strict {
+            if !value["error"].is_null() || value.get("code").is_some_and(|code| code != 0) {
+                return Err("CodeBuddy 返回上游流错误".into());
+            }
+            if value["choices"].as_array().is_some_and(|choices| choices.len() > 1 || choices.iter().any(|c| c.get("index").is_some_and(|i| i != 0))) {
+                return Err("CodeBuddy choice index 无效".into());
+            }
+        }
         // 非流式回退：偶发代理把 stream 请求按整包 JSON 返回
         if value.get("choices").is_some()
             && value.pointer("/choices/0/delta").is_none()
@@ -978,7 +999,9 @@ async fn stream_completions(
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
                     let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    if index >= calls.len() {
+                    // Bound allocation for untrusted upstream tool indices across all compatible providers.
+                    if index >= 4096 || (strict && call["index"].as_u64().is_none()) { return Err("provider tool index 无效".into()); }
+                    if !strict && index >= calls.len() {
                         if let Some(done) = calls.last().filter(|c| !c.name.is_empty()) {
                             on_event(StreamEvent::ToolCallDone {
                                 id: done.id.clone(),
@@ -997,8 +1020,12 @@ async fn stream_completions(
                     }
                     let accum = &mut calls[index];
                     if let Some(id) = call.get("id").and_then(Value::as_str) {
-                        accum.id.push_str(id);
+                        if strict {
+                            if !accum.id.is_empty() && accum.id != id { return Err("CodeBuddy 工具 ID 冲突".into()); }
+                            accum.id = id.into();
+                        } else { accum.id.push_str(id); }
                     }
+                    if strict && accum.id.is_empty() { return Err("CodeBuddy 工具参数缺少 ID".into()); }
                     if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
                         accum.name.push_str(name);
                     }
@@ -1013,7 +1040,7 @@ async fn stream_completions(
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
         {
-            finish_reason = Some(reason.to_string());
+            if !reason.is_empty() { finish_reason = Some(reason.to_string()); }
         }
         if let Some(error) = value.get("error") {
             let message = error
@@ -1032,6 +1059,25 @@ async fn stream_completions(
     if cancelled {
         result.stop_reason = "aborted".into();
         return Ok(result);
+    }
+    if strict {
+        if !matches!(finish_reason.as_deref(), Some("stop" | "length" | "tool_calls")) {
+            return Err("CodeBuddy 响应缺少有效结束状态".into());
+        }
+        if (finish_reason.as_deref() == Some("tool_calls") && calls.is_empty())
+            || (finish_reason.as_deref() == Some("length") && !calls.is_empty()) {
+            return Err("CodeBuddy 工具调用缺失或被截断，未执行工具".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        for call in &calls {
+            if call.id.is_empty() || !ids.insert(&call.id) || !supplied_tools.iter().any(|t| t["function"]["name"] == call.name)
+                || !serde_json::from_str::<Value>(&call.arguments).is_ok_and(|args| args.is_object()) {
+                return Err("CodeBuddy 工具名称或 JSON 参数无效，未执行工具".into());
+            }
+        }
+        for call in &calls {
+            on_event(StreamEvent::ToolCallDone { id: call.id.clone(), name: call.name.clone(), arguments: serde_json::from_str(&call.arguments).unwrap() });
+        }
     }
     let has_tool_calls = calls.iter().any(|call| !call.name.is_empty());
     let has_content = result.content.iter().any(|part| {
@@ -1090,7 +1136,7 @@ async fn stream_responses(
     let mut call_indices = HashMap::new();
     let mut terminal = false;
     let mut completed_items = std::collections::BTreeMap::new();
-    let cancelled = read_sse(&mut response, cancel, |data| {
+    let cancelled = read_sse(&mut response, cancel, false, |data| {
         if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return Ok(());
@@ -1349,6 +1395,14 @@ async fn stream_chat_once(
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
     match model.api.as_str() {
+        "codebuddy" => {
+            let body = completions_body(model, system_prompt, messages, tools, thinking_level, session_id);
+            super::codebuddy_provider::stream(model, api_key, body, session_id, cancel, on_event).await
+        }
+        "devin" => {
+            let body = completions_body(model, system_prompt, messages, tools, thinking_level, session_id);
+            super::devin_provider::stream(model, api_key, body, cancel, on_event).await
+        }
         "openai-completions" => {
             let body = completions_body(
                 model,
@@ -1391,10 +1445,19 @@ async fn stream_chat_once(
 /// 模型级 proxy 配置的 HTTP 客户端：按代理地址缓存并复用连接池。
 /// 无协议前缀按 http 代理处理；URL 无法解析时退化为直连（与全局 lyra-proxy 一致）。
 pub(crate) fn client_for_proxy(proxy: &str) -> reqwest::Client {
-    static CLIENTS: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+    proxy_client(proxy, false)
+}
+
+pub(super) fn local_api_client(proxy: &str) -> reqwest::Client {
+    proxy_client(proxy, true)
+}
+
+fn proxy_client(proxy: &str, local_login: bool) -> reqwest::Client {
+    static CLIENTS: OnceLock<Mutex<HashMap<(String, bool), reqwest::Client>>> = OnceLock::new();
     let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut clients = clients.lock().unwrap();
-    if let Some(client) = clients.get(proxy) {
+    let key = (proxy.to_string(), local_login);
+    if let Some(client) = clients.get(&key) {
         return client.clone();
     }
     let url = if proxy.contains("://") {
@@ -1407,11 +1470,13 @@ pub(crate) fn client_for_proxy(proxy: &str) -> reqwest::Client {
         .connect_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(4)
         .tcp_keepalive(std::time::Duration::from_secs(20));
+    // Devin embeds credentials in the protobuf body; never replay that body after a redirect.
+    if local_login { builder = builder.redirect(reqwest::redirect::Policy::none()); }
     if let Ok(parsed) = reqwest::Proxy::all(&url) {
         builder = builder.proxy(parsed);
     }
     let client = builder.build().expect("Lyra HTTP client");
-    clients.insert(proxy.to_string(), client.clone());
+    clients.insert(key, client.clone());
     client
 }
 
@@ -1894,7 +1959,7 @@ async fn stream_anthropic(
     let mut content_indices: HashMap<u64, usize> = HashMap::new();
     let mut initial_inputs: HashMap<u64, Value> = HashMap::new();
     let mut stop_reason: Option<String> = None;
-    let cancelled = read_sse(&mut response, cancel, |data| {
+    let cancelled = read_sse(&mut response, cancel, false, |data| {
         if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return Ok(());
@@ -2584,7 +2649,7 @@ mod tests {
         let mut response = reqwest::Client::builder().no_proxy().build().unwrap()
             .get(format!("http://{address}")).send().await.unwrap();
         let mut activity = 0;
-        read_sse(&mut response, &Arc::new(AtomicBool::new(false)), |data| {
+        read_sse(&mut response, &Arc::new(AtomicBool::new(false)), false, |data| {
             assert!(data.is_empty(), "注释心跳不能变成模型内容");
             activity += 1;
             Ok(())
