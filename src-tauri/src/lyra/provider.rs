@@ -2130,18 +2130,21 @@ mod tests {
     use serde_json::Map;
 
     #[test]
-    fn tool_payloads_preserve_optional_chrome_arguments() {
-        let chrome = crate::chrome_browser::tool_definition();
-        let tools = [Tool {
-            name: "chrome",
-            description: chrome["description"].as_str().unwrap().into(),
-            parameters: chrome["inputSchema"].clone(),
-        }];
+    fn tool_payloads_preserve_optional_automation_arguments() {
+        let schemas = [("chrome", crate::chrome_browser::tool_definition()),
+            ("jianlai", serde_json::from_str::<Value>(include_str!("../../../scripts/jianlai-tool.json")).unwrap())];
+        let tools = schemas.iter().map(|(name, schema)| Tool {
+            name,
+            description: schema["description"].as_str().unwrap().into(),
+            parameters: schema["inputSchema"].clone(),
+        }).collect::<Vec<_>>();
         let completions = completions_body(&test_model("openai-completions"), "", &[], &tools, Some("medium"), None);
         let responses = responses_body(&test_model("openai-responses"), "", &[], &tools, Some("medium"), None);
-        for definition in [&completions["tools"][0]["function"], &responses["tools"][0]] {
-            assert_eq!(definition["strict"], false, "gateways must not make optional Chrome arguments required");
-            assert_eq!(definition["parameters"], chrome["inputSchema"]);
+        for (index, (_, schema)) in schemas.iter().enumerate() {
+            for definition in [&completions["tools"][index]["function"], &responses["tools"][index]] {
+                assert_eq!(definition["strict"], false, "gateways must not make optional automation arguments required");
+                assert_eq!(definition["parameters"], schema["inputSchema"]);
+            }
         }
     }
 
