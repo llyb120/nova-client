@@ -96,9 +96,27 @@ const checkUrl = value => {
   if (!['http:','https:'].includes(url.protocol) || url.username || url.password) throw Error('只允许不含凭据的 HTTP(S) 地址');
   return url.href;
 };
+// Visible marker: tabs under debugger control sit in a blue "Nova" tab group; idle tabs detach so Chrome's debugging bar goes away.
+// ponytail: tabs with an active devtools recording never idle-detach (detaching would drop the log); idle timers die with the worker.
+const IDLE_DETACH_MS = 30000;
+const grouped = new Set(), idle = new Map();
+async function mark(tab) {
+  if (tab.groupId !== -1 || grouped.has(tab.id)) return;
+  try {
+    const [group] = await chrome.tabGroups.query({windowId:tab.windowId,title:'Nova'});
+    const groupId = await chrome.tabs.group(group ? {tabIds:tab.id,groupId:group.id} : {tabIds:tab.id,createProperties:{windowId:tab.windowId}});
+    if (!group) await chrome.tabGroups.update(groupId,{title:'Nova',color:'blue'});
+    grouped.add(tab.id);
+  } catch { /* Popup windows cannot be grouped; control still works. */ }
+}
+function forget(tabId) {
+  attached.delete(tabId); frameTargets.delete(tabId); devtools.delete(tabId); clearTimeout(idle.get(tabId)); idle.delete(tabId);
+  if (grouped.delete(tabId)) void chrome.tabs.ungroup(tabId).catch(()=>{});
+}
 async function detach(tabId) {
-  frameTargets.delete(tabId); devtools.delete(tabId);
-  if (attached.delete(tabId)) await chrome.debugger.detach({tabId}).catch(()=>{});
+  const was = attached.has(tabId);
+  forget(tabId);
+  if (was) await chrome.debugger.detach({tabId}).catch(()=>{});
 }
 async function debuggerCall(command, invoke) {
   const remaining = Math.min(10000, command.expiresAt - Date.now());
@@ -112,8 +130,11 @@ async function debuggerCall(command, invoke) {
   } finally { clearTimeout(timer); }
 }
 async function attach(command, tab) {
+  clearTimeout(idle.get(tab.id));
+  idle.set(tab.id,setTimeout(()=>{ if(!devtools.has(tab.id)) void detach(tab.id); },IDLE_DETACH_MS));
   if (attached.has(tab.id)) return;
   await debuggerCall(command,()=>chrome.debugger.attach({tabId:tab.id},'1.3')); attached.add(tab.id);
+  await mark(tab);
 }
 async function execute(command) {
   const {operation, args} = command;
@@ -137,7 +158,7 @@ async function execute(command) {
       error:d.error || null,paused:d.paused,canResume:d.canResume,exists:d.exists,danger:d.danger,mime:d.mime,incognito:d.incognito,
     })),notice:'Chrome 下载记录为浏览器范围，不能按 tabTag 归属；按时间、URL、文件名确认目标。空列表不代表导出失败，网页可能尚在生成文件。只有 state=complete 才表示下载完成。'};
   }
-  if (operation === 'status') return {incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess()};
+  if (operation === 'status') return {incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess(),version:chrome.runtime.getManifest?.().version};
   if (operation === 'tabs') return {tabs:(await inventory()).filter(tab=>args.incognito === undefined || tab.incognito === args.incognito),incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess()};
   if (operation === 'open' || operation === 'new_tab') {
     if (args.incognito !== undefined && typeof args.incognito !== 'boolean') throw Error('incognito必须为boolean');
@@ -276,10 +297,10 @@ chrome.debugger.onEvent.addListener((source,method,params)=>{
     for(const [id,frame] of frames || [])if(frame.sessionId===params.sessionId)frames.delete(id);
   }
 });
-chrome.debugger.onDetach.addListener(source=>{attached.delete(source.tabId);frameTargets.delete(source.tabId);devtools.delete(source.tabId);});
-chrome.tabs.onRemoved.addListener(id=>{attached.delete(id);frameTargets.delete(id);devtools.delete(id);void ready().then(async()=>{delete model.tabs[id];await save();});});
+chrome.debugger.onDetach.addListener(source=>forget(source.tabId));
+chrome.tabs.onRemoved.addListener(id=>{grouped.delete(id);forget(id);void ready().then(async()=>{delete model.tabs[id];await save();});});
 chrome.tabs.onReplaced.addListener((added,removed)=>{void ready().then(async()=>{
-  if(model.tabs[removed]){model.tabs[added]=model.tabs[removed];delete model.tabs[removed];await save();}attached.delete(removed);frameTargets.delete(removed);devtools.delete(removed);
+  if(model.tabs[removed]){model.tabs[added]=model.tabs[removed];delete model.tabs[removed];await save();}grouped.delete(removed);forget(removed);
 });});
 chrome.runtime.onMessage.addListener((message,sender,reply)=>{
   if(sender.id!==chrome.runtime.id)return;

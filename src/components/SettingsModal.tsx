@@ -1097,7 +1097,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                       Chrome：{dep().chromePath ?? "未找到，请先安装 Google Chrome"}
                       <br />
                       Nova Chrome 扩展：{dep().connected ? "已连接" : "未连接"}
-                      {dep().connected ? `（${dep().incognitoAllowed ? "已允许无痕" : "未允许无痕"}）` : ""}
+                      {dep().connected ? `（${dep().incognitoAllowed ? "已允许无痕" : "未允许无痕"}，版本 ${dep().installedVersion ?? "旧版"}${dep().outdated ? `，有新版 ${dep().bundledVersion}，点「用剑来自动安装」更新` : ""}）` : ""}
                       <br />
                       扩展目录：{dep().extensionDir}
                     </span>

@@ -432,15 +432,19 @@ pub async fn chrome_dependency_status(app: AppHandle) -> Result<Value, String> {
         std::fs::write(directory.join(name), content).map_err(|e| format!("释放 Chrome 扩展失败：{e}"))?;
     }
     let connected = connect(&app).await.map(|v| v["connected"] == true).unwrap_or(false);
-    let incognito_allowed = if connected {
-        request(&app, "status", json!({})).await.ok().map(|v| v["incognitoAllowed"] == true)
-    } else {
-        None
-    };
+    let status = if connected { request(&app, "status", json!({})).await.ok() } else { None };
+    let incognito_allowed = status.as_ref().map(|v| v["incognitoAllowed"] == true);
+    let bundled_version = serde_json::from_str::<Value>(EXTENSION_FILES[0].1).ok().and_then(|m| m["version"].as_str().map(String::from));
+    // 旧版扩展不上报 version，也视为过期。
+    let installed_version = status.as_ref().and_then(|v| v["version"].as_str().map(String::from));
+    let outdated = connected && installed_version != bundled_version;
     Ok(json!({
         "chromePath": find_chrome().map(|p| p.to_string_lossy().to_string()),
         "connected": connected,
         "incognitoAllowed": incognito_allowed,
+        "installedVersion": installed_version,
+        "bundledVersion": bundled_version,
+        "outdated": outdated,
         "extensionDir": directory.to_string_lossy(),
         "extensionId": EXTENSION_ID,
     }))

@@ -102,6 +102,9 @@ export const api = {
       chromePath: string | null;
       connected: boolean;
       incognitoAllowed: boolean | null;
+      installedVersion: string | null;
+      bundledVersion: string | null;
+      outdated: boolean;
       extensionDir: string;
       extensionId: string;
     }>(
