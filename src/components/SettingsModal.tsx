@@ -233,7 +233,7 @@ const TABS: { id: SettingsTab; name: string; group: string }[] = [
 
 // 首次运行引导：第 1 步配置后端（含 Lyra），第 2 步配置场景模型。
 const ONBOARDING_STEPS: { title: string; tabs: SettingsTab[] }[] = [
-  { title: "配置模型后端", tabs: ["lyra", "backends"] },
+  { title: "配置模型后端", tabs: ["lyra", "backends", "team"] },
   { title: "配置场景模型", tabs: ["scenes"] },
 ];
 
@@ -1076,7 +1076,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           <Show when={props.onboarding}>
             <p class="settings-group-desc">
               {step() === 0
-                ? "先启用并配置至少一个能提供模型的后端：在 Lyra 中添加模型服务商，或在「模型后端」中启用已安装并登录的 Claude Code、Codex 等。点「下一步」会保存并启动这些后端。"
+                ? "先启用并配置至少一个能提供模型的后端：在 Lyra 中添加模型服务商，或在「模型后端」中启用已安装并登录的 Claude Code、Codex 等。需要团队协作 / 漫游 / server 支持时，在「团队」中填写团队中转站地址和身份 token（可跳过）。点「下一步」会保存并启动这些后端。"
                 : "为每个场景选择至少一个模型。后端刚启动时模型列表可能需要稍等；仍没有可选模型时请返回上一步检查后端配置。以后可在「设置」中修改。"}
             </p>
           </Show>
