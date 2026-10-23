@@ -26,6 +26,8 @@ test('native downloads expose progress, interruption and completion without tab 
   delete chrome.downloads;await assert.rejects(scope.run({}),/0\.1\.6/);
   const schema=JSON.parse(await readFile(new URL('../../scripts/chrome-tool.json',import.meta.url),'utf8'));
   assert.ok(schema.inputSchema.properties.operation.enum.includes('downloads'));
+  assert.ok(schema.inputSchema.properties.operation.enum.includes('devtools'));
+  assert.match(schema.description,/jianlai.*F12/);
   assert.equal(schema.inputSchema.properties.downloadId.type,'string');
   assert.match(schema.description,/只有state=complete才算完成/);
 });
@@ -46,6 +48,47 @@ test('screenshots reveal a minimized window or background tab instead of hanging
   assert.equal(JSON.stringify(calls),JSON.stringify([['window',5,{state:'normal'}],['tab',11,{active:true}],['cdp','Page.captureScreenshot']]));
   calls.length=0;await scope.run('Page.captureScreenshot');await scope.run('Runtime.evaluate');
   assert.equal(JSON.stringify(calls),JSON.stringify([['cdp','Page.captureScreenshot'],['cdp','Runtime.evaluate']]),'visible tabs and other commands are left alone');
+});
+
+test('devtools records console replay, exceptions and network, filters, fetches bodies and resets on detach',async()=>{
+  const event=()=>({listeners:[],addListener(fn){this.listeners.push(fn);},emit(...args){for(const fn of this.listeners)fn(...args);}});
+  const tab={id:11,windowId:5,url:'https://example.com',active:true};const sent=[];
+  const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},
+    tabs:{query:async()=>[tab],get:async()=>({...tab}),onRemoved:event(),onReplaced:event(),onUpdated:event()},
+    debugger:{attach:async()=>{},sendCommand:async(target,method,params)=>{
+      sent.push(method);
+      const emit=(m,p)=>chrome.debugger.onEvent.emit({tabId:11},m,p);
+      if(method==='Runtime.enable')emit('Runtime.consoleAPICalled',{type:'log',args:[{type:'string',value:'old'},{type:'object',preview:{properties:[{name:'a',value:'1'}]}}],timestamp:1});
+      if(method==='Network.getResponseBody')return {body:'{"ok":1}',base64Encoded:false};
+      return {};
+    },onEvent:event(),onDetach:event()},
+    runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+
+    '\nglobalThis.run=async devtools=>execute({operation:"devtools",args:{tabTag:(await inventory())[0].tag,devtools},expiresAt:Date.now()+3000});',scope);
+  const first=await scope.run();
+  assert.equal(first.console.items[0].text,'old {a: 1}','console history replayed by Runtime.enable');
+  assert.equal(first.network.total,0);
+  const emit=(m,p,source={tabId:11})=>chrome.debugger.onEvent.emit(source,m,p);
+  emit('Runtime.exceptionThrown',{timestamp:2,exceptionDetails:{text:'Uncaught',exception:{description:'TypeError: x'},url:'https://example.com/a.js',lineNumber:9}});
+  emit('Network.requestWillBeSent',{requestId:'r1',request:{method:'POST',url:'https://example.com/api',postData:'q=1'},type:'XHR',timestamp:10,wallTime:1000});
+  emit('Network.responseReceived',{requestId:'r1',type:'XHR',response:{status:500,statusText:'Err',mimeType:'application/json'}});
+  emit('Network.loadingFinished',{requestId:'r1',timestamp:10.25,encodedDataLength:7});
+  emit('Network.requestWillBeSent',{requestId:'r2',request:{method:'GET',url:'https://example.com/ok.png'},type:'Image',timestamp:11,wallTime:1001});
+  emit('Runtime.consoleAPICalled',{type:'log',args:[{type:'string',value:'iframe'}],timestamp:3},{tabId:11,sessionId:'child'});
+  const errors=await scope.run({level:'error'});
+  assert.equal(errors.console.items.length,1);assert.equal(errors.console.items[0].text,'TypeError: x');assert.equal(errors.console.items[0].line,10);
+  assert.equal(errors.network.items.length,1);assert.equal(errors.network.items[0].status,500);assert.equal(errors.network.items[0].durationMs,250);assert.equal(errors.network.items[0].postData,'q=1');
+  assert.equal((await scope.run({kind:'network',query:'png'})).network.items[0].requestId,'r2');
+  assert.equal((await scope.run({kind:'network'})).console,undefined);
+  assert.equal((await scope.run({requestId:'r1'})).body,'{"ok":1}');
+  await assert.rejects(scope.run({requestId:'missing'}),/requestId/);
+  for(const bad of [{kind:'dom'},{limit:0},{query:1},[]])await assert.rejects(scope.run(bad));
+  assert.equal(sent.filter(m=>m.endsWith('.enable')).length,3,'domains are enabled once per debugger session');
+  assert.equal((await scope.run({clear:true})).console.total,2);
+  assert.equal((await scope.run()).console.total,0);
+  chrome.debugger.onDetach.emit({tabId:11});await scope.run();
+  assert.equal(sent.filter(m=>m.endsWith('.enable')).length,6,'re-enabled after detach');
 });
 
 test('a stuck debugger command times out, polling resumes and late results are not replayed',async()=>{
@@ -194,6 +237,22 @@ test('multiple Nova instances route replies independently, serialize commands an
   assert.equal(pairs.get(47654),1,'live poll is not duplicated');
   assert.equal(pairs.get(47655),1,'new instance is discovered while another is connected');
   assert.equal(replies.filter(value=>value.port===47653).length,1,'failed delivery is never replayed');
+});
+
+test('after a reload Nova still holds the old clientId: retry soon instead of waiting for the alarm',async()=>{
+  const event=()=>({addListener(){}});let polls=0;
+  const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>[],onRemoved:event(),onReplaced:event(),onUpdated:event()},
+    debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,clearTimeout,setTimeout:(fn,ms)=>setTimeout(fn,ms===5000?1:ms),fetch:async(url)=>{
+    const endpoint=new URL(url);
+    if(endpoint.port!=='47653')throw Error('offline');
+    if(endpoint.pathname==='/pair')return {ok:true,json:async()=>({token:'t'.repeat(32)})};
+    if(++polls<=2)return {ok:false,status:409};
+    return new Promise(()=>{});
+  }};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={connections};',scope);
+  for(let i=0;i<100 && polls<3;i++)await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(polls,3,'409 conflicts are retried without an alarm');
 });
 
 test('incognito permission, window isolation and tab filtering',async()=>{

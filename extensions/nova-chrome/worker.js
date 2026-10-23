@@ -7,6 +7,64 @@ const instances = new Map();
 let commands = Promise.resolve();
 const attached = new Set();
 const frameTargets = new Map();
+// DevTools data per tab, recorded only after the first `devtools` call enables the domains.
+// ponytail: top-frame session only, ring buffer of DEVTOOLS_LIMIT per kind; OOPIF iframes need per-session enable.
+const devtools = new Map();
+const DEVTOOLS_LIMIT = 500;
+const clip = (text, max = 2000) => { text = String(text ?? ''); return text.length > max ? text.slice(0, max) + `…(+${text.length - max})` : text; };
+const preview = p => p?.properties && (p.subtype === 'array' ? `[${p.properties.map(x => x.value).join(', ')}${p.overflow ? ', …' : ''}]` : `{${p.properties.map(x => `${x.name}: ${x.value}`).join(', ')}${p.overflow ? ', …' : ''}}`);
+const remoteText = arg => arg.type === 'string' ? arg.value : arg.unserializableValue ?? preview(arg.preview) ?? arg.description ?? (arg.value === undefined ? arg.type : JSON.stringify(arg.value));
+const frameAt = trace => { const f = trace?.callFrames?.[0]; return f ? {url:clip(f.url,2048),line:f.lineNumber + 1} : {}; };
+function recordDevtools(tabId, method, params) {
+  const log = devtools.get(tabId);
+  if (!log) return;
+  const push = entry => { log.console.push(entry); if (log.console.length > DEVTOOLS_LIMIT) log.console.shift(); };
+  if (method === 'Runtime.consoleAPICalled') push({source:'console',level:params.type,text:clip((params.args || []).map(remoteText).join(' ')),time:params.timestamp,...frameAt(params.stackTrace)});
+  else if (method === 'Runtime.exceptionThrown') { const d = params.exceptionDetails || {}; push({source:'exception',level:'error',text:clip(d.exception?.description || d.text),time:params.timestamp,url:clip(d.url,2048),line:d.lineNumber + 1}); }
+  else if (method === 'Log.entryAdded') { const e = params.entry; push({source:e.source,level:e.level,text:clip(e.text),time:e.timestamp,url:clip(e.url,2048),line:e.lineNumber === undefined ? undefined : e.lineNumber + 1}); }
+  else if (method === 'Network.requestWillBeSent') {
+    log.network.delete(params.requestId); // Redirects reuse the id: keep only the final hop.
+    log.network.set(params.requestId, {requestId:params.requestId,method:params.request.method,url:clip(params.request.url,2048),type:params.type,startedAt:Math.round(params.wallTime * 1000),start:params.timestamp,...(params.request.postData ? {postData:clip(params.request.postData)} : {})});
+    if (log.network.size > DEVTOOLS_LIMIT) log.network.delete(log.network.keys().next().value);
+  } else {
+    const request = log.network.get(params.requestId);
+    if (!request) return;
+    if (method === 'Network.responseReceived') Object.assign(request, {status:params.response.status,statusText:params.response.statusText,mimeType:params.response.mimeType,type:params.type});
+    else if (method === 'Network.loadingFinished') Object.assign(request, {finished:true,encodedBytes:params.encodedDataLength,durationMs:Math.round((params.timestamp - request.start) * 1000)});
+    else if (method === 'Network.loadingFailed') Object.assign(request, {failed:true,errorText:params.errorText,canceled:params.canceled,blockedReason:params.blockedReason,durationMs:Math.round((params.timestamp - request.start) * 1000)});
+  }
+}
+async function devtoolsData(command, tab) {
+  const options = command.args.devtools ?? {};
+  if (typeof options !== 'object' || Array.isArray(options)) throw Error('devtools 必须为对象');
+  const kind = options.kind ?? 'all';
+  if (!['all','console','network'].includes(kind)) throw Error('devtools.kind 必须为 all/console/network');
+  const limit = options.limit ?? 100;
+  if (!Number.isInteger(limit) || limit < 1 || limit > DEVTOOLS_LIMIT) throw Error(`devtools.limit 必须为 1–${DEVTOOLS_LIMIT} 的整数`);
+  for (const key of ['query','level','requestId']) if (options[key] !== undefined && typeof options[key] !== 'string') throw Error(`devtools.${key} 必须为字符串`);
+  await attach(command, tab);
+  let log = devtools.get(tab.id);
+  if (!log) {
+    // Runtime.enable replays console history V8 already holds; network has no history before enable.
+    devtools.set(tab.id, log = {since:Date.now(),console:[],network:new Map()});
+    try { for (const method of ['Runtime.enable','Log.enable','Network.enable']) await debuggerCall(command,()=>chrome.debugger.sendCommand({tabId:tab.id},method,{})); }
+    catch (error) { devtools.delete(tab.id); throw error; }
+  }
+  if (options.requestId) {
+    if (!log.network.has(options.requestId)) throw Error('requestId 不在已记录的网络请求中，请重新 devtools 查询');
+    const {body, base64Encoded} = await debuggerCall(command,()=>chrome.debugger.sendCommand({tabId:tab.id},'Network.getResponseBody',{requestId:options.requestId}));
+    return {tabTag:command.args.tabTag,requestId:options.requestId,base64Encoded,bodyLength:body.length,body:clip(body,65536)};
+  }
+  const query = options.query?.toLowerCase();
+  const keep = entry => (!query || [entry.text, entry.url].some(value => value?.toLowerCase().includes(query)))
+    && (!options.level || entry.level === options.level || (options.level === 'error' && entry.failed) || (options.level === 'error' && entry.status >= 400));
+  const pick = list => { const matched = list.filter(keep); return {total:matched.length,items:matched.slice(-limit).map(({start, ...entry}) => entry)}; };
+  const result = {tabTag:command.args.tabTag,recordingSince:log.since,notice:'console 含启用前 V8 已缓存的日志；网络只记录 recordingSince 之后的请求，需完整记录可先 devtools 再 reload。每类最多保留最新 500 条，不含跨进程 iframe。'};
+  if (kind !== 'network') result.console = pick(log.console);
+  if (kind !== 'console') result.network = pick([...log.network.values()]);
+  if (options.clear === true) { log.console = []; log.network.clear(); }
+  return result;
+}
 const ready = () => loading ??= chrome.storage.session.get('model').then(({model: saved}) => {
   model = saved ?? { clientId: crypto.randomUUID(), next: 1, tabs: {} };
   return model;
@@ -39,7 +97,7 @@ const checkUrl = value => {
   return url.href;
 };
 async function detach(tabId) {
-  frameTargets.delete(tabId);
+  frameTargets.delete(tabId); devtools.delete(tabId);
   if (attached.delete(tabId)) await chrome.debugger.detach({tabId}).catch(()=>{});
 }
 async function debuggerCall(command, invoke) {
@@ -52,6 +110,10 @@ async function debuggerCall(command, invoke) {
       new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Chrome 调试命令响应超时；结果可能已执行，请先观察，不要重放动作')), remaining); }),
     ]);
   } finally { clearTimeout(timer); }
+}
+async function attach(command, tab) {
+  if (attached.has(tab.id)) return;
+  await debuggerCall(command,()=>chrome.debugger.attach({tabId:tab.id},'1.3')); attached.add(tab.id);
 }
 async function execute(command) {
   const {operation, args} = command;
@@ -104,10 +166,9 @@ async function execute(command) {
     case 'forward': await chrome.tabs.goForward(tab.id); break;
     case 'reload': await chrome.tabs.reload(tab.id); break;
     case 'stop': await detach(tab.id); break;
+    case 'devtools': return devtoolsData(command, tab);
     case 'cdp': {
-      if (!attached.has(tab.id)) {
-        await debuggerCall(command,()=>chrome.debugger.attach({tabId:tab.id},'1.3')); attached.add(tab.id);
-      }
+      await attach(command, tab);
       // Recheck the tab after the asynchronous attach.
       await resolveTag(args.tabTag);
       if (Date.now() > command.expiresAt) throw Error('命令已过期，未执行');
@@ -172,7 +233,7 @@ async function launchMiniapp(message, tab) {
 function loop() {
   for (let port=47653; port<=47662; port++) void connect(`http://127.0.0.1:${port}`);
 }
-async function connect(origin) {
+async function connect(origin, attempt = 0) {
   if (loops.has(origin)) return;
   loops.add(origin);
   try {
@@ -186,7 +247,7 @@ async function connect(origin) {
     instances.set(origin, post);
     for (;;) {
       const response = await post('/poll',{});
-      if (!response.ok) throw Error(`连接被拒绝 HTTP ${response.status}；检查是否连接了另一个 Chrome 实例`);
+      if (!response.ok) throw Object.assign(Error(`连接被拒绝 HTTP ${response.status}；检查是否连接了另一个 Chrome 实例`),{conflict:response.status===409});
       connections.add(origin);
       const {command} = await response.json();
       if (!command) continue;
@@ -199,11 +260,14 @@ async function connect(origin) {
       const delivered = await post('/reply',reply);
       if(!delivered.ok)throw Error(`结果回传失败 HTTP ${delivered.status}；不重放操作`);
     }
-  } catch {
-    // Retry discovery on the next alarm; never replay a command after a failed reply.
+  } catch (error) {
+    // Reloading the extension clears session storage, so Nova sees a new clientId and keeps
+    // the old one for 45s: retry for ~60s instead of waiting for alarms. Never replay a command.
+    if (error?.conflict && attempt < 12) setTimeout(() => void connect(origin, attempt + 1), 5000);
   } finally { connections.delete(origin); instances.delete(origin); loops.delete(origin); }
 }
 chrome.debugger.onEvent.addListener((source,method,params)=>{
+  if(!source.sessionId)recordDevtools(source.tabId,method,params);
   if(method==='Target.attachedToTarget' && params.targetInfo?.type==='iframe') {
     if(!frameTargets.has(source.tabId))frameTargets.set(source.tabId,new Map());
     frameTargets.get(source.tabId).set(params.targetInfo.targetId,{targetInfo:params.targetInfo,sessionId:params.sessionId});
@@ -212,10 +276,10 @@ chrome.debugger.onEvent.addListener((source,method,params)=>{
     for(const [id,frame] of frames || [])if(frame.sessionId===params.sessionId)frames.delete(id);
   }
 });
-chrome.debugger.onDetach.addListener(source=>{attached.delete(source.tabId);frameTargets.delete(source.tabId);});
-chrome.tabs.onRemoved.addListener(id=>{attached.delete(id);frameTargets.delete(id);void ready().then(async()=>{delete model.tabs[id];await save();});});
+chrome.debugger.onDetach.addListener(source=>{attached.delete(source.tabId);frameTargets.delete(source.tabId);devtools.delete(source.tabId);});
+chrome.tabs.onRemoved.addListener(id=>{attached.delete(id);frameTargets.delete(id);devtools.delete(id);void ready().then(async()=>{delete model.tabs[id];await save();});});
 chrome.tabs.onReplaced.addListener((added,removed)=>{void ready().then(async()=>{
-  if(model.tabs[removed]){model.tabs[added]=model.tabs[removed];delete model.tabs[removed];await save();}attached.delete(removed);frameTargets.delete(removed);
+  if(model.tabs[removed]){model.tabs[added]=model.tabs[removed];delete model.tabs[removed];await save();}attached.delete(removed);frameTargets.delete(removed);devtools.delete(removed);
 });});
 chrome.runtime.onMessage.addListener((message,sender,reply)=>{
   if(sender.id!==chrome.runtime.id)return;

@@ -61,7 +61,7 @@ impl ChromeBridge {
         let _pending = PendingCall(self.clone(), id.clone());
         // A busy renderer can delay CDP while processing a large SPA; this is a
         // deadline, not a sleep, and commands are still sent exactly once.
-        let timeout = Duration::from_secs(if operation == "cdp" { 10 } else { 3 });
+        let timeout = Duration::from_secs(if matches!(operation, "cdp" | "devtools") { 10 } else { 3 });
         let expires = chrono::Utc::now().timestamp_millis() + timeout.as_millis() as i64;
         self.sender
             .try_send(json!({"id":id,"operation":operation,"args":args,"expiresAt":expires}))

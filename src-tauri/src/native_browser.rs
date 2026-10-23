@@ -1600,7 +1600,7 @@ fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashM
     let mut args = args.as_object().cloned().ok_or("chrome 参数必须是对象")?;
     match args.get("operation").and_then(Value::as_str).unwrap_or_default() {
         "connect" | "status" | "tabs" | "open" | "new_tab" | "downloads" | "experience_search" => return Ok(Value::Object(args)),
-        "inspect" | "screenshot" | "act" | "evaluate" | "run" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
+        "inspect" | "screenshot" | "devtools" | "act" | "evaluate" | "run" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
         _ => return Err("缺少或无效 operation；先用 {\"operation\":\"tabs\"} 获取标签".into()),
     }
     let valid_tag = |tag: &str| tag.len() <= 80 && tag.starts_with('C')
@@ -1645,7 +1645,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
     // 浏览器与桌面共用一块屏幕：数字员工任务同样排队、询问。
     if !crate::tool_experience::is_operation(args) {
         // 只读的查看标签/页面放行；会改变浏览器画面的操作前才征得用户同意。
-        let input = !matches!(args["operation"].as_str(), Some("tabs" | "inspect" | "screenshot" | "status" | "connect" | "downloads"));
+        let input = !matches!(args["operation"].as_str(), Some("tabs" | "inspect" | "screenshot" | "devtools" | "status" | "connect" | "downloads"));
         crate::employee::claim_desktop(owner, input).await?;
     }
     let (args, inferred) = infer_operation(args, "tabTag");
@@ -1773,6 +1773,13 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
         return Ok(value);
     }
     let tag = args["tabTag"].as_str().ok_or("缺少 tabTag")?;
+    if operation == "devtools" {
+        // Read-only: console/network recorded by the extension's debugger session, no screen change.
+        let mut params = args.clone();
+        strip_observe_keys(&mut params);
+        return crate::chrome_browser::request(app, operation, params).await
+            .map_err(|e| if e.contains("未知 Chrome 操作") { format!("{e}；devtools 需要 Nova Chrome 0.1.9，请更新并在 chrome://extensions 重新加载扩展") } else { e });
+    }
     if operation == "stop" {
         crate::chrome_browser::stop(app, tag);
         app.state::<BrowserState>().observations.lock().unwrap().remove(&format!("chrome:{thread_id}:{tag}"));
