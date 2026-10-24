@@ -342,12 +342,14 @@ fn rewrite_with_embedded_rtk(command: &str, shell: &crate::lyra::prompt::ShellCo
         return command.to_string();
     };
     let path = exe.to_string_lossy();
-    let prefix = match shell.kind {
-        // Wait for the GUI exe and preserve the caller's LASTEXITCODE.
-        ShellKind::PowerShell => format!(". {{ & '{}' @args | Out-String -Stream }} __rtk ", path.replace('\'', "''")),
-        ShellKind::Bash => format!("'{}' __rtk ", path.replace('\'', "'\\''")),
+    // 在本次 shell 里把 `rtk` 定义成调用 Nova 自身的函数，改写结果原样执行；
+    // 不做字符串替换，否则路径、引号里的 "rtk " 也会被改坏。
+    let define = match shell.kind {
+        // Wait for the GUI exe; $LASTEXITCODE is global, so the caller still sees its exit code.
+        ShellKind::PowerShell => format!("function rtk {{ & '{}' __rtk @args | Out-String -Stream }}; ", path.replace('\'', "''")),
+        ShellKind::Bash => format!("rtk() {{ '{}' __rtk \"$@\"; }}; ", path.replace('\'', "'\\''")),
     };
-    rewritten.replace("rtk ", &prefix)
+    format!("{define}{rewritten}")
 }
 
 // 高级设置「PowerShell UTF-8 输出」开启时，为 PowerShell 命令加一次性前缀，把该子进程
@@ -877,8 +879,11 @@ mod embedded_rtk_tests {
             },
         };
         let rewritten = rewrite_with_embedded_rtk("git status", &shell);
-        assert!(rewritten.contains("__rtk git status"), "{rewritten}");
-        assert!(!rewritten.starts_with("rtk "), "{rewritten}");
+        assert!(rewritten.ends_with("; rtk git status"), "{rewritten}");
+        // 只改写命令本身，路径和引号内的 "rtk " 原样保留。
+        let rewritten = rewrite_with_embedded_rtk("git add vendor/rtk && git commit -m 'bump rtk now'", &shell);
+        assert!(rewritten.contains("git add vendor/rtk && "), "{rewritten}");
+        assert!(rewritten.contains("'bump rtk now'"), "{rewritten}");
         for unsupported in [
             "echo hello",
             "git rev-parse HEAD",
