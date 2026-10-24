@@ -199,12 +199,6 @@ fn should_enforce_single_instance() -> bool {
 }
 
 fn main() {
-    let mut args = std::env::args_os();
-    let program = args.next().unwrap_or_else(|| "nova".into());
-    if args.next().as_deref() == Some(std::ffi::OsStr::new("__rtk")) {
-        std::process::exit(rtk::run_embedded(std::iter::once(program).chain(args)));
-    }
-
     if nova_lib::image_generation::maybe_run() { return; }
 
     // Finder / Dock 启动的 macOS .app 不继承终端 PATH。必须在任何 CLI 探测或

@@ -333,27 +333,6 @@ impl Drop for PidGuard {
     }
 }
 
-fn rewrite_with_embedded_rtk(command: &str, shell: &crate::lyra::prompt::ShellConfig) -> String {
-    use crate::lyra::prompt::ShellKind;
-    // 下面是全文替换 "rtk "；原命令自己带 rtk（路径、提交说明等）时会被改坏，直接不改写。
-    if command.contains("rtk") {
-        return command.to_string();
-    }
-    let Some(rewritten) = rtk::rewrite_command(command) else {
-        return command.to_string();
-    };
-    let Ok(exe) = std::env::current_exe() else {
-        return command.to_string();
-    };
-    let path = exe.to_string_lossy();
-    let prefix = match shell.kind {
-        // Wait for the GUI exe and preserve the caller's LASTEXITCODE.
-        ShellKind::PowerShell => format!(". {{ & '{}' @args | Out-String -Stream }} __rtk ", path.replace('\'', "''")),
-        ShellKind::Bash => format!("'{}' __rtk ", path.replace('\'', "'\\''")),
-    };
-    rewritten.replace("rtk ", &prefix)
-}
-
 // 高级设置「PowerShell UTF-8 输出」开启时，为 PowerShell 命令加一次性前缀，把该子进程
 // 控制台输出切到 UTF-8，避免 GBK(cp936) 与 UTF-8 解码错配乱码。赋值给 $null，不污染 stdout。
 const POWERSHELL_UTF8_PREFIX: &str =
@@ -429,7 +408,7 @@ async fn run_bash(
 ) -> Result<String, String> {
     use crate::lyra::prompt::ShellKind;
     let timeout_secs = timeout_secs.clamp(1, 600);
-    let command = apply_powershell_utf8(rewrite_with_embedded_rtk(command, shell), shell);
+    let command = apply_powershell_utf8(command.to_string(), shell);
     let mut process = match shell.kind {
         ShellKind::PowerShell => {
             let mut p = tokio::process::Command::new(&shell.program);
@@ -811,12 +790,8 @@ async fn execute_inner(
 }
 
 #[cfg(test)]
-mod embedded_rtk_tests {
-    use super::{
-        capture_bash_pipe, drain_bash_pipes,
-        rewrite_with_embedded_rtk, tool_set,
-    };
-    use crate::lyra::prompt::{ShellConfig, ShellKind};
+mod tool_tests {
+    use super::{capture_bash_pipe, drain_bash_pipes, tool_set};
     use serde_json::json;
 
     #[tokio::test]
@@ -863,69 +838,6 @@ mod embedded_rtk_tests {
         assert!(!polaris.description.contains("feedback_memory"));
 
         assert!(!polaris.description.contains("训练"));
-    }
-
-    #[test]
-    fn rewrites_supported_commands_without_external_rtk_binary() {
-        let shell = ShellConfig {
-            program: if cfg!(windows) {
-                "powershell.exe"
-            } else {
-                "bash"
-            }
-            .into(),
-            kind: if cfg!(windows) {
-                ShellKind::PowerShell
-            } else {
-                ShellKind::Bash
-            },
-        };
-        let rewritten = rewrite_with_embedded_rtk("git status", &shell);
-        assert!(rewritten.contains("__rtk git status"), "{rewritten}");
-        assert!(!rewritten.starts_with("rtk "), "{rewritten}");
-        for unsupported in [
-            "echo hello",
-            "git rev-parse HEAD",
-            "go version",
-            "npm install",
-            "git add vendor/rtk && git commit -m 'bump rtk now'",
-        ] {
-            assert_eq!(rewrite_with_embedded_rtk(unsupported, &shell), unsupported);
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn powershell_waits_for_gui_rtk_and_preserves_exit_code() {
-        use std::process::Command;
-
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("gui.rs");
-        let exe = temp.path().join("GUI 中文 ' probe.exe");
-        std::fs::write(&source, r#"
-#![windows_subsystem = "windows"]
-fn main() {
-    assert_eq!(std::env::args().skip(1).collect::<Vec<_>>(), ["__rtk", "git", "status"]);
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    println!("gui stdout");
-    eprintln!("gui stderr");
-    std::process::exit(7);
-}
-"#).unwrap();
-        let compiled = Command::new("rustc").arg(&source).arg("-o").arg(&exe).output().unwrap();
-        assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
-
-        let shell = ShellConfig { program: "powershell.exe".into(), kind: ShellKind::PowerShell };
-        let current = std::env::current_exe().unwrap().to_string_lossy().replace('\'', "''");
-        let replacement = exe.to_string_lossy().replace('\'', "''");
-        let rewritten = rewrite_with_embedded_rtk("git status", &shell).replace(&current, &replacement);
-        let output = Command::new(&shell.program)
-            .args(["-NoProfile", "-NonInteractive", "-Command"])
-            .arg(format!("{rewritten}; exit $LASTEXITCODE"))
-            .output().unwrap();
-        assert_eq!(output.status.code(), Some(7), "{output:?}");
-        assert!(String::from_utf8_lossy(&output.stdout).contains("gui stdout"), "{output:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("gui stderr"), "{output:?}");
     }
 
     #[tokio::test]

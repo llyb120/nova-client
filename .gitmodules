@@ -1,3 +1,0 @@
-[submodule "vendor/rtk"]
-	path = vendor/rtk
-	url = https://github.com/llyb120/rtk.git
