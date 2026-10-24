@@ -3540,6 +3540,27 @@ button {
 .sel-panes-3 .sel-providers {
   width: 150px;
 }
+/* 悬停哪栏就加宽哪栏，其余窄栏收缩；模型栏 flex:1 自动吸收剩余宽度。 */
+.sel-panes > .sel-groups,
+.sel-panes > .sel-efforts {
+  transition: width 0.18s ease;
+}
+.sel-panes:has(> :hover) > .sel-groups:not(:hover),
+.sel-panes:has(> :hover) > .sel-efforts:not(:hover) {
+  width: 88px;
+}
+.sel-panes > .sel-groups:hover {
+  width: 240px;
+}
+.sel-panes > .sel-efforts:hover {
+  width: 180px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sel-panes > .sel-groups,
+  .sel-panes > .sel-efforts {
+    transition: none;
+  }
+}
 /* 搜索结果里标注模型所属后端 */
 .sel-model-copy {
   display: flex;
