@@ -46,7 +46,7 @@ aho-corasick = "1"
 ignore = "0.4"
 wait-timeout = "0.2"
 portable-pty = "0.9"
-rtk = { path = "../vendor/rtk" }
+rtk = { path = "../vendor/rtk", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
