@@ -121,21 +121,18 @@ def validate_runtime(root: Path, kind: str, arch: str) -> None:
 
 
 def prepare_python(root: Path) -> None:
-    # Ignore build-machine Python configuration and install only bundled wheels.
+    # The NuGet package already ships pip in site-packages (no Scripts/), so ensurepip would
+    # be a no-op. Just verify it, ignoring build-machine Python configuration.
     env = {key: value for key, value in os.environ.items()
            if not key.upper().startswith(("PYTHON", "PIP_"))}
     python = str((root / "python.exe").resolve())
-    for args in (("-I", "-m", "ensurepip", "--upgrade", "--default-pip"),
-                 ("-I", "-m", "pip", "--version")):
-        result = subprocess.run([python, *args], env=env, cwd=root,
-                                capture_output=True, text=True, errors="replace", timeout=120)
-        if result.returncode:
-            raise RuntimeError(f"bundled Python {' '.join(args)} failed: "
-                               f"{result.stdout}\n{result.stderr}")
-    if not (root / "Scripts/pip.exe").is_file():
-        raise ValueError("ensurepip did not create Scripts/pip.exe")
+    result = subprocess.run([python, "-I", "-m", "pip", "--version"], env=env, cwd=root,
+                            capture_output=True, text=True, errors="replace", timeout=120)
+    if result.returncode:
+        raise RuntimeError(f"bundled Python pip --version failed: {result.stdout}\n{result.stderr}")
     shutil.copyfile(root / "python.exe", root / "python3.exe")
-    # ensurepip's .exe launchers embed the staging path. Relative .cmd wrappers move safely.
+    # Relative .cmd wrappers survive relocation (.exe launchers embed absolute paths).
+    (root / "Scripts").mkdir(exist_ok=True)
     for name in ("pip", "pip3", "pip3.13"):
         (root / "Scripts" / f"{name}.exe").unlink(missing_ok=True)
         (root / "Scripts" / f"{name}.cmd").write_text(

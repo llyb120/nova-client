@@ -74,20 +74,16 @@ class FullPackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "python.exe").write_bytes(pe())
-            (root / "Scripts").mkdir()
-            for name in ("pip", "pip3", "pip3.13"):
-                (root / "Scripts" / f"{name}.exe").write_bytes(b"absolute staging path")
             with patch.object(full.subprocess, "run") as run:
                 run.return_value.returncode = 0
                 full.prepare_python(root)
             self.assertEqual((root / "python3.exe").read_bytes(), pe())
-            self.assertIn("ensurepip", run.call_args_list[0].args[0])
-            self.assertIn("--default-pip", run.call_args_list[0].args[0])
+            self.assertEqual(run.call_args_list[0].args[0][1:], ["-I", "-m", "pip", "--version"])
             self.assertFalse(list((root / "Scripts").glob("*.exe")))
             self.assertIn('%~dp0..\\python.exe', (root / "Scripts/pip.cmd").read_text())
             with patch.object(full.subprocess, "run") as run:
                 run.return_value.returncode = 1
-                with self.assertRaisesRegex(RuntimeError, "ensurepip.*failed"):
+                with self.assertRaisesRegex(RuntimeError, "pip --version failed"):
                     full.prepare_python(root)
 
     def test_smoke_commands_and_failure(self):
