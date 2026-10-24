@@ -1,8 +1,8 @@
 :root {
-  /* ===== 字体：打包进应用的 Inter / 思源黑体 / JetBrains Mono（离线可用） =====
-     Inter 排最前负责拉丁字母与数字；中文落思源黑体；系统栈兜底 */
+  /* ===== 字体：打包进应用的 Inter / JetBrains Mono（离线可用） =====
+     Inter 排最前负责拉丁字母与数字；中文用系统字体（雅黑 / 苹方 / Noto CJK），不打包以控制体积 */
   --mono: "JetBrains Mono Variable", "Cascadia Mono", Consolas, monospace;
-  --sans: "Inter Variable", "Noto Sans SC Variable", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  --sans: "Inter Variable", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
 }
 
 /* 深色工作台：深侧栏、石墨内容底色、抬亮的交互面板。 */
@@ -6314,8 +6314,8 @@ button.clue-bar-item:hover,
   gap: 12px;
 }
 .achv-card {
-  /* 成就文案用 Nova 自带思源黑体，不走 Inter 拉丁优先栈 */
-  font-family: "Noto Sans SC Variable", "Noto Sans SC", sans-serif;
+  /* 成就文案用系统中文字体，不走 Inter 拉丁优先栈 */
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC", sans-serif;
   --achv-sheen: var(--seal);
   position: relative;
   overflow: hidden;

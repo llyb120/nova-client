@@ -727,7 +727,7 @@ export function paintStarMap(
   // ── 星座名称：最后压在所有星点之上，不被云气与亮星盖住 ────────────────
   {
     ctx.font =
-      '500 10.5px "Inter Variable","Noto Sans SC Variable","Segoe UI","Microsoft YaHei UI","PingFang SC",system-ui,sans-serif';
+      '500 10.5px "Inter Variable","Segoe UI","Microsoft YaHei UI","PingFang SC",system-ui,sans-serif';
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     // 字形下方垫一层紧贴的暗色柔影：银河亮区的雾气冲不淡字，

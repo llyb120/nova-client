@@ -15,7 +15,6 @@ import { render } from 'solid-js/web';
 import { api } from './src/ipc';
 import { LyraConfigPanel } from './src/components/LyraConfigPanel';
 import '@fontsource-variable/inter';
-import '@fontsource-variable/noto-sans-sc';
 import './src/app.css';
 let config = {
   $schema: 'keep-this-schema', model: 'primary/gpt-5',
