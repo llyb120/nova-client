@@ -1,15 +1,11 @@
 # Nova
 
-一个仿 Codex App 的本地桌面客户端，用图形界面驱动 [Devin CLI](https://devin.ai)（或任何 ACP 兼容 agent）。
+一个仿 Codex App 的本地桌面客户端，由 Lyra 原生代理引擎执行任务；Codex、Claude Code、Devin、CodeBuddy、WorkBuddy 的本地登录与 API 配置通过 Lyra provider 复用，不再提供独立 agent 后端。
 你选择项目目录、下达任务，agent 在本地 shell 中干活，所有过程（思考、工具调用、文件 diff、终端输出、权限审批）实时呈现在界面里。
 
 技术栈：**Rust (Tauri 2) + SolidJS + TypeScript**。
 
-Codex 后端由 Rust 直接启动和管理本机 `codex app-server`，通过 stdio JSON-RPC 接入，不经过 Node.js / `.mjs` 桥接，也不依赖 `@openai/codex-sdk`。
-对话、新建/恢复/分叉会话、标题生成、取消和运行中追加引导均使用 app-server；沿用本机 Codex 登录、代理与隔离凭证配置。
-开启上下文检索时，每次新建或恢复会话都会挂载 `nova-tools` MCP 的 Polaris 工具，并注入工具使用规则；Ponytail 引导遵循设置开关，计划模式保持只读。
-设置中的旧 `codexIntegration: "sdk"` 会自动迁移为 `"app-server"`。
-Codex 会话默认注入内置 RTK 的调用指令，使用 `nova __rtk` 压缩受支持命令的输出，无需额外安装 RTK。新建、恢复和分叉会话均适用，与 Polaris/Ponytail 开关无关；标题生成不注入。这与 RTK 上游的 Codex 接入方式一致，依赖模型遵循指令，并非 Lyra 的执行前强制重写；需要原始输出或不受支持的命令仍直接执行。
+## 工作原理
 
 SolidJS 前端通过 Tauri 命令与事件连接 Rust 后端：
 
@@ -37,9 +33,8 @@ SolidJS 前端通过 Tauri 命令与事件连接 Rust 后端：
 - 用量展示：每轮 token 消耗（折叠行，悬停看输入/输出明细）+ 会话累计 tokens（标题栏右侧）
 - **任务完成系统通知**：窗口不在前台时，任务结束（完成/出错/停止）会弹系统通知；Windows 点击通知可唤起窗口并跳转到对应会话，macOS 显示通知并可通过 Dock 唤起应用
 - **运行时防休眠**：只要仍有会话在运行，就阻止系统因空闲自动休眠；所有会话结束后自动恢复，不强制亮屏，也不拦截手动睡眠
-- 随时停止当前轮次（`session/cancel`，devin 不响应时 10 秒后强制本地结束）
-- 性能：应用启动即预启动 devin 进程；选定项目即预热 session，首条消息无建会话延迟
-- 设置：agent 可执行文件与 ACP 启动参数（可换成任何 ACP agent）、新会话默认模式、一键重启 agent 进程、日志查看
+- 随时停止当前轮次，由 Lyra 处理取消
+- 设置：Lyra provider、本地 provider 的路径（网络跟随系统代理）、新会话默认模式、日志查看
 - 工具输出自动剥离 ANSI 转义码，终端输出不再乱码
 - **跨平台**：Windows 与 macOS 共享同一套体验（Finder/资源管理器、终端、通知、自更新通道按平台分离）
 
@@ -51,9 +46,7 @@ SolidJS 前端通过 Tauri 命令与事件连接 Rust 后端：
 
 ### 本地 Codex / Claude Code
 
-1. 安装 adapter：`npm install -g @agentclientprotocol/claude-agent-acp@latest`。
-2. 运行 `claude-agent-acp --cli` 完成 Claude Code 登录，或在 Nova 环境变量中配置 `ANTHROPIC_API_KEY`。
-3. 设置 → 后端 → Claude Code，启用并保存。默认可执行文件是 `claude-agent-acp`（不是 `claude`），支持自定义路径与独立代理。
+在 Lyra 中添加对应本地 provider，优先读取 CLI 用户级自定义 API 配置；未配置 API 时读取本机订阅登录，由 Lyra 直接请求官方上游。不需要启动 `codex app-server` 或安装 Claude ACP adapter。
 
 配置来源、模型别名解析及认证边界见 [Lyra provider](docs/lyra-provider-models.md)。CLI 登录配置与凭据保留在原位置，不随独立后端清理而删除。
 
@@ -129,11 +122,7 @@ package.bat           # Windows
 会话与设置持久化在 `~/.nova/`（各平台一致）。
 ## 任务卡住怎么办
 
-devin 依赖其云端推理服务（windsurf.com），网络不通时 devin 会在内部反复重试，表现为任务一直转圈：
-
-1. 点输入框旁的**停止**按钮——若 devin 10 秒内不响应取消，应用会强制结束本轮
-2. 仍不行则在**设置 → 重启 devin 进程**，所有卡住的轮次立即结束，会话上下文下次发消息时自动恢复
-3. 根治需保证 devin 能访问其后端（必要时配置代理）
+先点输入框旁的**停止**按钮，再检查 Lyra provider 的网络、系统代理和登录状态。Devin / CodeBuddy / WorkBuddy 本地 API provider 仍需访问各自的云端推理服务；不要尝试重启已移除的独立 agent 后端。
 
 ## 目录结构
 
@@ -143,7 +132,7 @@ src/                  # SolidJS 前端
   store.ts            # 全局状态 + Tauri 事件桥
   ipc.ts              # invoke 封装
 src-tauri/src/
-  acp.rs              # ACP 客户端：进程管理、JSON-RPC、会话路由、权限/fs 代理
+  lyra/               # 原生代理引擎、模型 provider 与工具执行
   threads.rs          # 会话数据模型与本地持久化
   settings.rs         # 设置持久化
   lib.rs              # Tauri 命令与应用状态

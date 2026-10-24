@@ -3615,8 +3615,7 @@ fn get_lyra_presets() -> Value {
 /// 设置页「获取模型」：按编辑中的 provider（可未保存）立即拉取模型列表写入缓存并返回。
 #[tauri::command]
 async fn fetch_lyra_models(state: State<'_, AppState>, id: String, provider: Value) -> Result<Value, String> {
-    let proxy = state.settings.lock().unwrap().lyra_proxy.clone();
-    let http = lyra::provider::client_for_proxy(proxy.trim());
+    let http = lyra::provider::http_client();
     let root = lyra::config::nova_root();
     lyra::presets::refresh(&http, &root, &json!({ "provider": { id.clone(): provider } }), true).await?;
     // 已保存的 provider 立刻在模型选择器中可见。
@@ -4160,39 +4159,9 @@ async fn apply_runtime_settings(
             || context_runtime_changed
             || auto_change_project_changed
             || custom_env_changed
-            || s.lyra_proxy != settings.lyra_proxy
-            || s.lyra_enabled != settings.lyra_enabled;
-        let restart_claude = restart_all_agents
-            || custom_env_changed
-            || context_runtime_changed
-            || auto_change_project_changed
-            || s.claude_path != settings.claude_path
-            || s.claude_proxy != settings.claude_proxy
-            || s.claude_enabled != settings.claude_enabled;
-        let restart_devin = restart_all_agents
-            || context_runtime_changed
+            || s.lyra_enabled != settings.lyra_enabled
             || s.devin_path != settings.devin_path
-            || s.acp_args != settings.acp_args
-            || s.devin_proxy != settings.devin_proxy
-            || s.devin_enabled != settings.devin_enabled;
-        let restart_codebuddy = restart_all_agents
-            || context_runtime_changed
-            || auto_change_project_changed
-            || s.codebuddy_path != settings.codebuddy_path
-            || s.codebuddy_proxy != settings.codebuddy_proxy
-            || s.codebuddy_enabled != settings.codebuddy_enabled;
-        let restart_workbuddy = restart_all_agents
-            || custom_env_changed
-            || context_runtime_changed
-            || auto_change_project_changed
-            || s.workbuddy_path != settings.workbuddy_path
-            || s.workbuddy_proxy != settings.workbuddy_proxy
-            || s.workbuddy_enabled != settings.workbuddy_enabled;
-        let restart_codex = restart_all_agents
-            || s.codex_path != settings.codex_path
-            || s.codex_args != settings.codex_args
-            || s.codex_proxy != settings.codex_proxy
-            || s.codex_enabled != settings.codex_enabled;
+            || s.workbuddy_path != settings.workbuddy_path;
         let restart_relay = s.relay_server != settings.relay_server
             || s.relay_token != settings.relay_token
             || s.relay_groups != settings.relay_groups;

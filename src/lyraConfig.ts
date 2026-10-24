@@ -1,6 +1,7 @@
 // 图形化编辑 ~/.nova/alkaid/config.jsonc。只接管界面上的字段，其余键（npm、variants、
-// modalities.output 等）经 raw 原样写回；options 中除 baseURL/apiKey/proxy/headers 外
+// modalities.output 等）经 raw 原样写回；options 中除 baseURL/apiKey/headers 外
 // 的键都作为「自定义字段」展示（采样参数、厂商字段等），由后端透传或消费。
+// Lyra 跟随系统代理：旧配置里的 options.proxy 不展示，保存时丢弃。
 
 export type Kv = { key: string; value: string };
 export type ModelDraft = {
@@ -22,7 +23,6 @@ export type ProviderDraft = {
   api: string;
   baseURL: string;
   apiKey: string;
-  proxy: string;
   /** 模型关键词过滤（逗号分隔），空表示不过滤。 */
   modelFilter: string;
   headers: Kv[];
@@ -98,7 +98,6 @@ export function providerDraft(id: string, raw: Record<string, any>): ProviderDra
     api: raw.api ?? "",
     baseURL: options.baseURL ?? options.baseUrl ?? "",
     apiKey: options.apiKey ?? "",
-    proxy: options.proxy ?? "",
     modelFilter: Array.isArray(raw.modelFilter) ? raw.modelFilter.join(", ") : "",
     headers: toKv(options.headers),
     fields: fieldsOf(options, OPTION_KEYS),
@@ -149,7 +148,6 @@ export function serializeProvider(p: ProviderDraft) {
   // 预设的 Base URL 留空即用默认值，不写空串。
   if (p.preset) setOrDelete(options, "baseURL", options.baseURL);
   setOrDelete(options, "apiKey", isLocalPreset(p.preset) ? "" : p.apiKey.trim());
-  setOrDelete(options, "proxy", p.proxy.trim());
   out.options = { ...options, ...withHeaders(p.headers) };
   const models = Object.fromEntries(p.models.map((m) => [m.id.trim(), serializeModel(m)]));
   // 预设的模型自动拉取，手写模型只用于补充/覆盖，没有就不写。

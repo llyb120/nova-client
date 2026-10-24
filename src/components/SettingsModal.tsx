@@ -134,63 +134,6 @@ function ShortcutKeyCapture(props: {
   );
 }
 
-/** 后端代理输入框（每个后端进程可单独走代理） */
-function ProxyField(props: { value: string; onInput: (v: string) => void }) {
-  return (
-    <label class="backend-proxy-field">
-      <span class="field-label">代理</span>
-      <input
-        class="field-input"
-        value={props.value}
-        onInput={(e) => props.onInput(e.currentTarget.value)}
-        placeholder="留空直连；如 http://127.0.0.1:10808"
-      />
-    </label>
-  );
-}
-
-function CliManager(props: {
-  status?: CliStatus;
-  loading: boolean;
-}) {
-  const [copied, setCopied] = createSignal(false);
-  const command = () => props.status?.installCommand ?? "";
-  const copy = () => {
-    if (!command()) return;
-    void navigator.clipboard.writeText(command()).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
-    });
-  };
-  return (
-    <div class="cli-manager">
-      <div class="cli-manager-main">
-        <div class="cli-manager-info">
-          <span class="field-label">对应 CLI</span>
-          <span class="cli-manager-name">{props.status?.cliName ?? "检测中…"}</span>
-          <span
-            classList={{
-              "cli-manager-version": true,
-              missing: props.status?.installed === false,
-            }}
-            title={props.status?.detail || ""}
-          >
-            {props.loading ? "正在读取版本…" : (props.status?.version ?? "尚未检测")}
-          </span>
-        </div>
-      </div>
-      <Show when={command()}>
-        <div class="cli-install-row">
-          <code title={command()}>{command()}</code>
-          <button type="button" class="btn secondary cli-copy-btn" onClick={copy}>
-            {copied() ? "已复制" : "复制"}
-          </button>
-        </div>
-      </Show>
-    </div>
-  );
-}
-
 export type SettingsTab =
   | "general"
   | "scenes"
@@ -262,14 +205,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [tab, setTab] = createSignal<SettingsTab>(props.onboarding ? "lyra" : props.initialTab ?? "general");
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
-  const [claudePath, setClaudePath] = createSignal(s?.claudePath ?? "claude-agent-acp");
-  const [claudeProxy, setClaudeProxy] = createSignal(s?.claudeProxy ?? "");
-  const [claudeEnabled, setClaudeEnabled] = createSignal(s?.claudeEnabled === true);
   const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
   const [workbuddyPath, setWorkbuddyPath] = createSignal(s?.workbuddyPath ?? "");
-  const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
-  const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
-  const [lyraProxy, setLyraProxy] = createSignal(s?.lyraProxy ?? "");
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
   );
@@ -287,9 +224,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     s?.contextRetrievalMode === "none" ? "none" : "fast",
   );
 
-  const [devinProxy, setDevinProxy] = createSignal(s?.devinProxy ?? "");
-  const [codebuddyProxy, setCodebuddyProxy] = createSignal(s?.codebuddyProxy ?? "");
-  const [workbuddyProxy, setWorkbuddyProxy] = createSignal(s?.workbuddyProxy ?? "");
   const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(
     (s?.sessionShortcuts ?? []).map((item) => ({ ...item })),
   );
@@ -583,14 +517,11 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   };
 
   const draftSettings = (): Settings => ({
-    claudePath: claudePath().trim() || "claude-agent-acp",
-    claudeProxy: claudeProxy().trim(),
-    claudeEnabled: claudeEnabled(),
+    // 保留本地 provider 连接参数；独立 ACP/app-server 设置不再暴露。
+    claudePath: s?.claudePath ?? "claude-agent-acp",
     devinPath: devinPath().trim() || "devin",
     workbuddyPath: workbuddyPath().trim(),
-    codexPath: codexPath().trim() || "codex",
-    codexProxy: codexProxy().trim(),
-    lyraProxy: lyraProxy().trim(),
+    codexPath: s?.codexPath ?? "codex",
     windowsShellShimEnabled: windowsShellShimEnabled(),
     powershellUtf8Enabled: powershellUtf8Enabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
@@ -598,9 +529,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     checkpointEnabled: checkpointEnabled(),
     contextRetrievalMode: contextRetrievalMode(),
 
-    devinProxy: devinProxy().trim(),
-    codebuddyProxy: codebuddyProxy().trim(),
-    workbuddyProxy: workbuddyProxy().trim(),
     defaultMode: "build",
     sceneModels: sceneModels(),
     editor: editor().trim() || "code",
@@ -1556,43 +1484,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <span>启用 Lyra</span>
                 </label>
               </div>
-              <details class="lyra-advanced">
-                <summary>网络代理<span class="field-hint">{lyraProxy().trim() ? "已配置" : "默认直连"}</span></summary>
-                <div class="lyra-detail-body">
-                  <ProxyField value={lyraProxy()} onInput={setLyraProxy} />
-                  <span class="field-hint">作为所有 Lyra 服务商的默认代理，可在服务商设置中单独覆盖。</span>
-                </div>
-              </details>
-            </div>
-
-            <LyraConfigPanel onSaver={(fn) => (saveLyraConfig = fn)} />
-          </div>
-
-          {/* ===== 模型后端 ===== */}
-          <Show when={tab() === "backends"}>
-            <p class="field-hint">
-              每个后端可单独启用/关闭并配置启动方式。关闭的后端不会出现在新建/切换会话的后端列表里（历史会话仍可打开查看）。
-            </p>
-
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class="agent-badge claude">Claude Code</span>
-                <span class="fixed-integration">ACP</span>
-                <Show when={backendMissing("claude")}><span class="backend-missing">未检测到 ACP adapter</span></Show>
-                <label class="backend-switch">
-                  <input type="checkbox" checked={claudeEnabled()} disabled={claudeEnabled() && enabledCount() === 1} onChange={(e) => setClaudeEnabled(e.currentTarget.checked)} />
-                  <span>启用</span>
-                </label>
-              </div>
-              <CliManager status={cliStatuses().claude} loading={cliLoading()} />
-              <div class="backend-fields">
-                <label class="backend-field">
-                  <span class="field-label">ACP 可执行文件</span>
-                  <input class="field-input" value={claudePath()} onInput={(e) => setClaudePath(e.currentTarget.value)} placeholder="claude-agent-acp" />
-                </label>
-              </div>
-              <ProxyField value={claudeProxy()} onInput={setClaudeProxy} />
-              <p class="field-hint">需要 Node.js 22+。安装 ACP adapter，并先通过 Claude Code 登录，或在环境变量中配置 ANTHROPIC_API_KEY；此处填写 claude-agent-acp，而不是 claude。Nova 工具通过会话 MCP 自动挂载。</p>
             </div>
 
             <details class="lyra-advanced">
@@ -1609,36 +1500,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <span class="field-hint">支持安装目录、WorkBuddy.exe 或内置 CLI 路径；用于定位本地 provider 登录和连接信息。</span>
                 </label>
               </div>
-              <ProxyField value={workbuddyProxy()} onInput={setWorkbuddyProxy} />
-              <p class="field-hint">直接启动 WorkBuddy 内置的 CodeBuddy ACP，复用其登录态，无需 WorkBuddy 保持运行；需先在 WorkBuddy 中登录过一次。留空自动查找 Windows 默认安装目录，也可填写安装目录、WorkBuddy.exe 或内置 CLI 路径；不会自动启动桌面程序。当前支持 Windows。</p>
-            </div>
-
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class={`agent-badge codex`}>{agentLabel("codex")}</span>
-                <span class="fixed-integration">app-server</span>
-                <Show when={backendMissing("codex")}>
-                  <span class="backend-missing">未检测到 CLI</span>
-                </Show>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={codexEnabled()}
-                    disabled={codexEnabled() && enabledCount() === 1}
-                    onChange={(e) => setCodexEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-              </div>
-              <CliManager status={cliStatuses().codex} loading={cliLoading()} />
-              <div class="backend-fields">
-                <label class="backend-field">
-                  <span class="field-label">可执行文件</span>
-                  <input class="field-input" value={codexPath()} onInput={(e) => setCodexPath(e.currentTarget.value)} placeholder="codex" />
-                </label>
-              </div>
-              <ProxyField value={codexProxy()} onInput={setCodexProxy} />
-            </div>
+            </details>
+            <LyraConfigPanel onSaver={(fn) => (saveLyraConfig = fn)} />
+          </div>
 
           {/* ===== 模型后端 ===== */}
           <Show when={tab() === "backends"}>

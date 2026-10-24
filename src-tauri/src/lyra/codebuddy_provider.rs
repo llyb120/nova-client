@@ -123,7 +123,7 @@ pub(super) fn load(root: &Path, env: &HashMap<String, String>, source: &str) -> 
     }
     Ok(json!({ "name": format!("{label}（本地 API）"), "api": "codebuddy", "options": {
         "baseURL": format!("{}/v2", url.origin().ascii_serialization()), "apiKey": key, "headers": headers,
-        "codebuddySource": source, "codebuddyPackage": package, "codebuddyProxy": if workbuddy { nova_settings.workbuddy_proxy } else { nova_settings.codebuddy_proxy },
+        "codebuddySource": source, "codebuddyPackage": package,
         "codebuddyModel": env.get(&format!("{prefix}_MODEL")).map(String::as_str).or_else(|| settings["model"].as_str()),
         "requiresReasoningContentOnAssistantMessages": true
     }, "models": {} }))
@@ -196,13 +196,8 @@ fn convert(model: &Value) -> Value {
     })
 }
 
-fn client(options: &Value) -> reqwest::Client {
-    let proxy = options["proxy"].as_str().filter(|s| !s.is_empty()).or_else(|| options["codebuddyProxy"].as_str()).unwrap_or("");
-    provider::local_api_client(proxy)
-}
-
 pub(super) async fn models(options: &Value, force: bool) -> Result<Map<String, Value>, String> {
-    let catalog = catalog(&client(options), options, force).await?;
+    let catalog = catalog(&provider::local_api_client(), options, force).await?;
     let mut models: Map<String, Value> = catalog.iter().filter_map(|m| m["id"].as_str().map(|id| (id.into(), convert(m)))).collect();
     let default = options["codebuddyModel"].as_str().or_else(|| catalog.first().and_then(|m| m["id"].as_str())).ok_or("CodeBuddy 没有可用模型")?;
     let mut model = models.get(default).cloned().ok_or("CodeBuddy 默认模型不在当前账号模型列表中")?;
@@ -215,8 +210,7 @@ pub(super) async fn stream(model: &ResolvedModel, key: &str, mut body: Value, se
     cancel: &Arc<AtomicBool>, on_event: &mut (dyn FnMut(StreamEvent) + Send)) -> Result<StreamResult, String> {
     let mut options = json!(model.extra_options);
     options["baseURL"] = json!(model.base_url); options["apiKey"] = json!(key); options["headers"] = json!(model.headers);
-    if let Some(proxy) = &model.proxy { options["proxy"] = json!(proxy); }
-    let http = client(&options);
+    let http = provider::local_api_client();
     let catalog = tokio::select! { result = catalog(&http, &options, false) => result?, _ = provider::wait_cancelled(cancel) => return Err("CodeBuddy 请求已取消".into()) };
     let id = if model.id == options["codebuddySource"].as_str().unwrap_or("codebuddy") { options["codebuddyModel"].as_str().or_else(|| catalog.first().and_then(|m| m["id"].as_str())).unwrap_or("") } else { &model.id };
     let info = catalog.iter().find(|m| m["id"] == id).ok_or("CodeBuddy 模型不可用，请刷新模型列表")?;

@@ -14,7 +14,7 @@ WorkBuddy 复用同一传输，但使用 WorkBuddy 内置 CLI 的产品配置、
 
 ### WorkBuddy
 
-先安装并登录 WorkBuddy 桌面版，在 Lyra 中选择 **WorkBuddy（本地 API）**，保存并获取模型，无需填写密钥。模型别名为 `workbuddy`，跟随 WorkBuddy 设置中的默认模型。Nova 使用对应的 WorkBuddy 代理设置，输入补全和标题也走 Rust provider。
+先安装并登录 WorkBuddy 桌面版，在 Lyra 中选择 **WorkBuddy（本地 API）**，保存并获取模型，无需填写密钥。模型别名为 `workbuddy`，跟随 WorkBuddy 设置中的默认模型。网络跟随系统代理，输入补全和标题也走 Rust provider。
 
 已适配 Windows WorkBuddy 5.8.2 的加密登录。读取时短暂调用 WorkBuddy 自带运行时解密凭据；推理和 SSE 仍由 Rust 直接处理，无需另装 Node、启动本地代理或保持 WorkBuddy 窗口打开。不修改登录文件，不保存解密后的 token；注销、登录切换和过期都会在后续请求检查。其它平台和新的加密格式尚未验证。
 

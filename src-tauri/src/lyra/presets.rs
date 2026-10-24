@@ -20,7 +20,13 @@ fn local_models_request(http: &reqwest::Client, provider: &Value, env: &std::col
     if !matches!(url.scheme(), "http" | "https") {
         return Err("本地 API 的 Base URL 必须使用 HTTP 或 HTTPS".into());
     }
-    let anthropic = provider["api"] == "anthropic-messages";
+    let local_http;
+    let http = if source.is_some() {
+        local_http = super::provider::local_api_client();
+        &local_http
+    } else { http };
+    let auth = source.map(|source| super::local_auth::credentials(source, env)).transpose()?;
+    let anthropic = source.map_or(provider["api"] == "anthropic-messages", |s| s == "claude-code");
     let models_url = if anthropic && !base.ends_with("/v1") { format!("{base}/v1/models") } else { format!("{base}/models") };
     let mut request = http.get(models_url).timeout(Duration::from_secs(30));
     if source == Some("codex") {
@@ -447,14 +453,6 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         if !force && cache_fresh(&cache[id.as_str()], &print, now) {
             continue;
         }
-        let proxied;
-        let http = match option("proxy").trim() {
-            "" => http,
-            proxy => {
-                proxied = super::provider::client_for_proxy(proxy);
-                &proxied
-            }
-        };
         let result = if preset.id == "devin" {
             super::devin_provider::models(&provider["options"], force).await
         } else if matches!(preset.id, "codebuddy" | "workbuddy") {
@@ -1306,7 +1304,7 @@ env_key = "TEST_KEY"
                 "reasoning_options": [{"type":"effort","values":["low","high"]}]
             } } } }));
             let models = tokio::time::timeout(Duration::from_secs(5), fetch_local_models(
-                &reqwest::Client::builder().no_proxy().build().unwrap(), provider.clone(), &mut catalog
+                &reqwest::Client::builder().no_proxy().build().unwrap(), provider.clone(), &mut catalog, &env
             )).await.unwrap().unwrap();
             assert_eq!(models.len(), 2);
             assert_eq!(models["another"]["name"], "另一个模型");
@@ -1318,7 +1316,7 @@ env_key = "TEST_KEY"
             merge_local_models(&mut expanded, provider["models"].as_object().unwrap());
             assert_eq!(expanded, models, "展开本地选择不能丢掉缓存中的能力和档位");
             let failed = tokio::time::timeout(Duration::from_secs(5), fetch_local_models(
-                &reqwest::Client::builder().no_proxy().build().unwrap(), provider, &mut catalog
+                &reqwest::Client::builder().no_proxy().build().unwrap(), provider, &mut catalog, &env
             )).await.unwrap();
             assert!(failed.unwrap_err().contains("503"), "失败时不得返回单模型列表覆盖完整缓存");
             server.await.unwrap();

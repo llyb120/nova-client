@@ -49,9 +49,9 @@ const threadMeta = {
 };
 
 const mockSettings = {
-  devinPath: "", acpArgs: "", devinProxy: "", codebuddyPath: "", codebuddyProxy: "",
+  devinPath: "",
   autoChangeProjectEnabled: true,
-  codexPath: "", codexProxy: "", lyraProxy: "", windowsShellShimEnabled: false,
+  codexPath: "", windowsShellShimEnabled: false,
   defaultMode: "build",
   sceneModels: { lightweight: [{ agentKind: "lyra", model: "" }], coding: [{ agentKind: "lyra", model: "" }], computer: [{ agentKind: "lyra", model: "" }] },
   editor: "cursor", theme: "", historyDisplayMode: "project",

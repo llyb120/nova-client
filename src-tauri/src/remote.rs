@@ -900,20 +900,7 @@ fn config(app: &AppHandle) -> Option<RemoteConfig> {
         .or_else(|| std::env::var("HOSTNAME").ok())
         .or_else(|| std::env::var("USERNAME").ok())
         .unwrap_or_else(|| "Nova".into());
-    let proxy = crate::server::configured_proxy().unwrap_or_else(|| {
-        [
-            &s.lyra_proxy,
-            &s.devin_proxy,
-            &s.codex_proxy,
-            &s.codebuddy_proxy,
-            &s.workbuddy_proxy,
-        ]
-        .into_iter()
-        .map(|p| p.trim())
-        .find(|p| !p.is_empty())
-        .unwrap_or("")
-        .to_string()
-    });
+    let proxy = crate::server::configured_proxy().unwrap_or_default();
     Some(RemoteConfig {
         server,
         token,

@@ -76,10 +76,9 @@ async fn lyra_text(state: &AppState, model: &str, prompt: &str, options: &Genera
     let mut resolved = config::resolve_model(&config, Some(model).filter(|s| !s.is_empty()), &config::process_env())?;
     if let Some(limit) = options.max_output_tokens { resolved.model.max_output_tokens = resolved.model.max_output_tokens.min(limit); }
     // Arbitrary provider fields may override tools/messages/token limits; don't allow
-    // them through the no-tools boundary. Resolved sampling/headers/proxy are retained.
+    // them through the no-tools boundary. Resolved sampling/headers are retained.
     resolved.model.extra_options.clear();
-    let proxy = state.settings.lock().map_err(|e| e.to_string())?.lyra_proxy.clone();
-    let http = provider::client_for_proxy(proxy.trim());
+    let http = provider::http_client();
     let messages = [crate::lyra::history::user_message(prompt, options.images)];
     let cancel = Arc::new(AtomicBool::new(false));
     let mut text = String::new();

@@ -61,9 +61,8 @@ const HELP: &str = r#"Nova Headless Server
 可配置键：
   relay-server, token, groups, name, proxy, default-mode
   context（none / fast / super，默认 super）
-  devin-path, codex-path, codex-args, codebuddy-path, workbuddy-path
-  lyra-proxy, devin-proxy, codex-proxy, codebuddy-proxy, workbuddy-proxy
-  lyra-enabled, devin-enabled, codex-enabled, codebuddy-enabled, workbuddy-enabled
+  lyra-enabled（Lyra 跟随系统代理，无单独代理配置）
+  devin-path, workbuddy-path（仅 Lyra 本地 provider）
   env.<NAME>（例如 config.toml 中自定义 provider 的 env_key）
 
 环境变量：NOVA_SERVER_RELAY_URL、NOVA_SERVER_TOKEN、NOVA_SERVER_NAME、
@@ -294,11 +293,11 @@ fn show_config(show_token: bool) -> Result<(), String> {
         "defaultMode": settings.default_mode,
         "contextRetrievalMode": settings.context_retrieval_mode.as_str(),
         "agents": {
-            "lyra": { "enabled": settings.lyra_enabled, "proxy": settings.lyra_proxy },
-            "devin": { "enabled": settings.devin_enabled, "path": settings.devin_path, "proxy": settings.devin_proxy },
-            "codex": { "enabled": settings.codex_enabled, "path": settings.codex_path, "args": settings.codex_args, "proxy": settings.codex_proxy },
-            "codebuddy": { "enabled": settings.codebuddy_enabled, "path": settings.codebuddy_path, "proxy": settings.codebuddy_proxy },
-            "workbuddy": { "enabled": settings.workbuddy_enabled, "path": settings.workbuddy_path, "proxy": settings.workbuddy_proxy }
+            "lyra": { "enabled": settings.lyra_enabled }
+        },
+        "lyraLocalProviders": {
+            "devin": { "path": settings.devin_path },
+            "workbuddy": { "path": settings.workbuddy_path }
         }
     });
     println!(
@@ -316,7 +315,20 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     }
 }
 
+/// 已随独立后端移除的旧配置键：旧脚本仍可能设置，忽略并警告而不是失败。
+const REMOVED_CONFIG_KEYS: &[&str] = &[
+    "codex-path", "codex-args", "codebuddy-path", "codex-proxy",
+    "devin-enabled", "codex-enabled", "codebuddy-enabled", "workbuddy-enabled",
+    // Lyra 已改为跟随系统代理。
+    "lyra-proxy", "vega-proxy", "devin-proxy", "codebuddy-proxy", "workbuddy-proxy",
+];
+
 fn set_config(key: &str, value: &str) -> Result<(), String> {
+    let key = key.trim_start_matches("--");
+    if REMOVED_CONFIG_KEYS.contains(&key) {
+        eprintln!("警告：配置键 {key} 已移除，已忽略（Nova 只使用 Lyra，网络跟随系统代理）");
+        return Ok(());
+    }
     let dir = data_dir();
     let mut settings = Settings::load(&dir);
     let mut server = load_server_file();
@@ -345,11 +357,6 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
             }
             "devin-path" => settings.devin_path = value.into(),
             "workbuddy-path" => settings.workbuddy_path = value.into(),
-            "lyra-proxy" | "vega-proxy" => settings.lyra_proxy = value.into(),
-            "devin-proxy" => settings.devin_proxy = value.into(),
-            "codex-proxy" => settings.codex_proxy = value.into(),
-            "codebuddy-proxy" => settings.codebuddy_proxy = value.into(),
-            "workbuddy-proxy" => settings.workbuddy_proxy = value.into(),
             "lyra-enabled" | "vega-enabled" => settings.lyra_enabled = parse_bool(value)?,
             unknown => return Err(format!("未知配置键：{unknown}\n\n{HELP}")),
         }

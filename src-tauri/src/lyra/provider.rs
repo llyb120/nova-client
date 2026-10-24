@@ -1675,38 +1675,37 @@ async fn stream_chat_once(
     }
 }
 
-/// 模型级 proxy 配置的 HTTP 客户端：按代理地址缓存并复用连接池。
-/// 无协议前缀按 http 代理处理；URL 无法解析时退化为直连（与全局 lyra-proxy 一致）。
-pub(crate) fn client_for_proxy(proxy: &str) -> reqwest::Client {
-    proxy_client(proxy, false)
+/// Lyra 共享 HTTP 客户端：跟随系统代理（环境变量 / 平台代理设置），复用连接池。
+pub(crate) fn http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| build_client(false)).clone()
 }
 
-pub(super) fn local_api_client(proxy: &str) -> reqwest::Client {
-    proxy_client(proxy, true)
+/// 本地登录/订阅反代专用：同样跟随系统代理，但不跟随重定向。
+pub(super) fn local_api_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| build_client(true)).clone()
 }
 
-fn proxy_client(proxy: &str, local_login: bool) -> reqwest::Client {
-    static CLIENTS: OnceLock<Mutex<HashMap<(String, bool), reqwest::Client>>> = OnceLock::new();
-    let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut clients = clients.lock().unwrap();
-    let key = (proxy.to_string(), local_login);
-    if let Some(client) = clients.get(&key) {
-        return client.clone();
-    }
-    let url = if proxy.contains("://") {
-        proxy.to_string()
-    } else {
-        format!("http://{proxy}")
-    };
+fn build_client(local_login: bool) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
-        .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(4)
         .tcp_keepalive(std::time::Duration::from_secs(20));
     // Devin embeds credentials in the protobuf body; never replay that body after a redirect.
     if local_login { builder = builder.redirect(reqwest::redirect::Policy::none()); }
-    if let Ok(parsed) = reqwest::Proxy::all(&url) {
-        builder = builder.proxy(parsed);
+    builder.build().expect("Lyra HTTP client")
+}
+
+fn local_auth_error(source: &str, status: reqwest::StatusCode) -> String {
+    let hint = if matches!(status.as_u16(), 401 | 403) { "；请在对应 CLI 检查登录及订阅权限后重试" } else { "" };
+    format!("{source} 订阅反代 HTTP {}{hint}", status.as_u16())
+}
+
+fn local_auth_model(model: &ResolvedModel, headers: Map<String, Value>) -> Result<ResolvedModel, String> {
+    let source = model.local_auth.as_deref().ok_or("缺少本地登录来源")?;
+    if source == "claude-code" && matches!(model.id.strip_suffix("[1m]").unwrap_or(&model.id), "sonnet" | "opus" | "opusplan" | "haiku") {
+        return Err("Claude Code 模型别名尚未解析；请在 Lyra 设置中获取模型列表后重试".into());
     }
     let mut model = model.clone();
     model.base_url = super::local_auth::endpoint(source)?.into();
@@ -1732,16 +1731,27 @@ pub async fn stream_chat(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
-    // 模型在 config.jsonc 声明了 options.proxy 时改用按代理地址缓存的客户端；
-    // 未声明则沿用调用方客户端（已含全局 lyra-proxy 设置）。
-    let proxied;
-    let http = match model.proxy.as_deref() {
-        Some(proxy) => {
-            proxied = client_for_proxy(proxy);
-            &proxied
-        }
-        None => http,
-    };
+    // Local subscription transports never participate in stored HTTP continuation.
+    if model.local_auth.is_some() || cancel.load(Ordering::SeqCst) { response_state::reset(session_id); }
+    // 每次调用读取 CLI 当前登录，工具往返和长会话不会持有已经被 CLI 轮换的 token。
+    let local;
+    let credentials;
+    let (model, api_key) = if let Some(source) = &model.local_auth {
+        let source = source.clone();
+        credentials = tokio::select! {
+            result = tokio::task::spawn_blocking(move || super::local_auth::credentials(&source, &super::config::process_env())) =>
+                result.map_err(|_| "读取本地登录失败")??,
+            _ = wait_cancelled(cancel) => { let mut result = StreamResult::empty(); result.stop_reason = "aborted".into(); return Ok(result); }
+        };
+        local = local_auth_model(model, credentials.headers)?;
+        (&local, credentials.key.as_str())
+    } else { (model, api_key) };
+    // 订阅反代不跟随重定向；普通 API 使用调用方传入的客户端。
+    let local_http;
+    let http = if model.local_auth.is_some() {
+        local_http = local_api_client();
+        &local_http
+    } else { http };
     let result = stream_chat_once(
         http,
         model,
@@ -2650,60 +2660,34 @@ mod tests {
             supports_thinking_toggle: true,
             clear_thinking: None,
             extra_options: Map::new(),
-            proxy: None,
         }
     }
 
     #[test]
-    fn client_for_proxy_builds_caches_and_tolerates_invalid() {
-        let _ = client_for_proxy("http://127.0.0.1:10808");
-        let _ = client_for_proxy("http://127.0.0.1:10808"); // 命中缓存
-        let _ = client_for_proxy("127.0.0.1:10809"); // 无协议前缀按 http 处理
-        let _ = client_for_proxy("not a url"); // 无效代理退化为直连，不 panic
-    }
-
-    #[test]
-    fn backend_http_ignores_system_proxy_but_honors_explicit_proxy() {
+    fn lyra_http_follows_system_proxy() {
         const CHILD: &str = "NOVA_PROXY_POLICY_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "lyra::provider::tests::backend_http_ignores_system_proxy_but_honors_explicit_proxy", "--nocapture"])
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy = format!("http://{}", listener.local_addr().unwrap());
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lyra::provider::tests::lyra_http_follows_system_proxy", "--nocapture"])
                 .env(CHILD, "1")
-                .env("HTTP_PROXY", "http://127.0.0.1:9")
-                .env("HTTPS_PROXY", "http://127.0.0.1:9")
-                .env("ALL_PROXY", "http://127.0.0.1:9")
-                .env("http_proxy", "http://127.0.0.1:9")
-                .env("https_proxy", "http://127.0.0.1:9")
-                .env("all_proxy", "http://127.0.0.1:9")
+                .env("HTTP_PROXY", &proxy).env("http_proxy", &proxy)
                 .env_remove("NO_PROXY").env_remove("no_proxy")
-                .status().unwrap();
-            assert!(status.success());
+                .spawn().unwrap();
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let count = stream.read(&mut buffer).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+            assert!(String::from_utf8_lossy(&buffer[..count]).starts_with("GET http://nova-proxy-test.invalid/system "));
+            assert!(child.wait().unwrap().success());
             return;
         }
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                let mut requests = Vec::new();
-                for _ in 0..2 {
-                    let (mut stream, _) = listener.accept().await.unwrap();
-                    let mut buffer = [0; 4096];
-                    let count = stream.read(&mut buffer).await.unwrap();
-                    requests.push(String::from_utf8_lossy(&buffer[..count]).into_owned());
-                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
-                }
-                requests
-            });
-            let response = client_for_proxy("").get(format!("http://{address}/direct"))
+            let response = http_client().get("http://nova-proxy-test.invalid/system")
                 .timeout(std::time::Duration::from_secs(3)).send().await.unwrap();
             assert_eq!(response.text().await.unwrap(), "ok");
-            let response = client_for_proxy(&address.to_string()).get("http://nova-proxy-test.invalid/explicit")
-                .timeout(std::time::Duration::from_secs(3)).send().await.unwrap();
-            assert_eq!(response.text().await.unwrap(), "ok");
-            let requests = server.await.unwrap();
-            assert!(requests[0].starts_with("GET /direct "));
-            assert!(requests[1].starts_with("GET http://nova-proxy-test.invalid/explicit "));
         });
     }
 

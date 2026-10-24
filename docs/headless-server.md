@@ -79,8 +79,8 @@ Nova server config show
 `config show --show-token` 查看完整值。Linux 下 `server.json` 会以 `0600` 权限保存。
 可以通过 `config unset <键>` 清空字符串配置。使用单独数据目录时，在任意命令中加入
 `--data-dir /path/to/data`，或设置 `NOVA_DATA_DIR`。
-服务运行期间执行 `config set/unset` 会即时生效：Relay 配置会自动重连；agent 路径、代理、
-启用状态和 `env.<NAME>` 变化会让受影响的 agent 在下次使用时按新配置启动，无需重启 Nova。
+服务运行期间执行 `config set/unset` 会即时生效：Relay 配置会自动重连；本地 provider 路径、
+Lyra 启用状态和 `env.<NAME>` 变化会在后续请求中使用，无需重启 Nova。独立后端的启用键（如 `codex-enabled`）及 Lyra 代理键（`lyra-proxy`、`devin-proxy` 等，Lyra 现跟随系统代理）已移除，设置时仅警告并忽略。
 
 Nova Server 与桌面端一样会在后台定期检查并下载更新；当没有会话运行、也没有员工任务执行时，
 无头模式会跳过确认并直接安装、重启。安装目录必须对运行 Nova 的用户可写。

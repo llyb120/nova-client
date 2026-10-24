@@ -51,7 +51,7 @@ pub(super) fn load(root: &Path, env: &HashMap<String, String>) -> Result<Value, 
     let settings = crate::settings::Settings::load(&root.to_path_buf());
     Ok(json!({ "name": "Devin（本地 API）", "api": "devin", "options": {
         "baseURL": url, "apiKey": key, "devinCli": settings.devin_path,
-        "devinProxy": settings.devin_proxy, "devinModel": default_model,
+        "devinModel": default_model,
         "supportsReasoningEffort": false, "supportsThinkingToggle": false
     }, "models": {} }))
 }
@@ -59,12 +59,11 @@ pub(super) fn load(root: &Path, env: &HashMap<String, String>) -> Result<Value, 
 #[derive(Clone)]
 struct Catalog { families: Vec<Value>, version: String, loaded: Instant }
 
-async fn cli(binary: &str, proxy: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+async fn cli(binary: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let program = crate::acp::resolve_program_on_path(if binary.trim().is_empty() { "devin" } else { binary })
         .ok_or("未找到 Devin CLI，请检查 Devin 路径设置")?;
     let mut command = tokio::process::Command::new(program);
     command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
-    crate::acp::apply_proxy_env(&mut command, proxy);
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -83,20 +82,18 @@ async fn cli(binary: &str, proxy: &str, args: &[&str]) -> Result<Vec<u8>, String
 async fn catalog(options: &Value, force: bool) -> Result<Catalog, String> {
     static CACHE: OnceLock<Mutex<HashMap<String, Catalog>>> = OnceLock::new();
     let binary = options["devinCli"].as_str().unwrap_or("devin");
-    let proxy = options["proxy"].as_str().filter(|s| !s.trim().is_empty())
-        .or_else(|| options["devinProxy"].as_str()).unwrap_or("");
-    let key = (binary.to_string(), proxy.to_string());
+    let key = binary.to_string();
     let cache = CACHE.get_or_init(Default::default);
     if !force {
         if let Some(cached) = cache.lock().unwrap().get(&key).filter(|c| c.loaded.elapsed() < Duration::from_secs(60)) {
             return Ok(cached.clone());
         }
     }
-    let parsed: Value = serde_json::from_slice(&cli(binary, proxy, &["models", "list", "--format", "json"]).await?)
+    let parsed: Value = serde_json::from_slice(&cli(binary, &["models", "list", "--format", "json"]).await?)
         .map_err(|_| "Devin 模型目录不是有效 JSON")?;
     let families = parsed["families"].as_array().filter(|v| !v.is_empty()).ok_or("Devin 模型目录缺少 families")?
         .iter().filter(|family| family["slug"] != "fusion").cloned().collect();
-    let version = cli(binary, proxy, &["version"]).await?;
+    let version = cli(binary, &["version"]).await?;
     let version = regex::Regex::new(r"\d+\.\d+\.\d+").unwrap().find(&String::from_utf8_lossy(&version))
         .ok_or("无法解析 Devin CLI 版本")?.as_str().to_string();
     let result = Catalog { families, version, loaded: Instant::now() };
@@ -411,21 +408,20 @@ async fn inference(http: &reqwest::Client, model: &ResolvedModel, key: &str, bod
 pub(super) async fn stream(model: &ResolvedModel, key: &str, mut body: Value,
     cancel: &Arc<AtomicBool>, on_event: &mut (dyn FnMut(StreamEvent) + Send)) -> Result<StreamResult, String> {
     for option in model.extra_options.keys() {
+        // devinProxy 为旧配置遗留键：已忽略（跟随系统代理），保留放行避免旧配置报错。
         if !matches!(option.as_str(), "devinCli" | "devinProxy" | "devinModel" | "cacheRetention" | "reasoning_effort") {
             return Err(format!("Devin 原生协议不支持 options.{option}"));
         }
     }
     if model.service_tier.is_some() { return Err("Devin 请直接选择 priority 模型 ID，不支持 serviceTier 参数".into()); }
-    let mut options = json!(model.extra_options);
-    if let Some(proxy) = &model.proxy { options["proxy"] = json!(proxy); }
+    let options = json!(model.extra_options);
     let catalog = tokio::select! { result = catalog(&options, false) => result?, _ = provider::wait_cancelled(cancel) => return Err("Devin 请求已取消".into()) };
     let requested = if model.id == "devin" { options["devinModel"].as_str().unwrap_or("adaptive") } else { &model.id };
     let id = resolve_model(&catalog, requested, body["reasoning_effort"].as_str())?;
     let limit = catalog_models(&catalog)[&id]["limit"]["output"].as_u64().unwrap_or(128000);
     body["model"] = json!(id);
     body[model.max_tokens_field] = json!(body[model.max_tokens_field].as_u64().unwrap_or(128000).min(limit));
-    let proxy = model.proxy.as_deref().or_else(|| options["devinProxy"].as_str()).unwrap_or("");
-    let http = provider::local_api_client(proxy);
+    let http = provider::local_api_client();
     inference(&http, model, key, &body, &catalog.version, cancel, on_event).await
 }
 
@@ -568,7 +564,7 @@ mod tests {
             let wire = [envelope(&payload,0),envelope(b"{}",2)].concat();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/connect+proto\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",wire.len()).unwrap(); socket.write_all(&wire).unwrap();
         });
-        let http = provider::local_api_client(""); let model = model(&format!("http://{address}"));
+        let http = provider::local_api_client(); let model = model(&format!("http://{address}"));
         let body = json!({"model":"test","messages":[{"role":"user","content":"hello"}]});
         let result = inference(&http,&model,"secret",&body,"1.2.3",&Arc::new(AtomicBool::new(false)),&mut |_|{}).await.unwrap();
         assert_eq!(result.content[0]["text"],"hello"); server.join().unwrap();

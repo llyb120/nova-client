@@ -133,35 +133,10 @@ fn default_powershell_utf8() -> bool {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// Claude Code 的 ACP adapter（不是 claude CLI 本身）。
-    pub claude_path: String,
-    pub claude_proxy: String,
-    pub claude_enabled: bool,
-    /// ACP agent 可执行文件路径（默认 devin，依赖 PATH）
+    /// Lyra 本地 Devin provider 读取模型目录/版本所用的 CLI（默认 devin，依赖 PATH）。
     pub devin_path: String,
-    /// Devin ACP 启动参数（空格分隔）。
-    pub acp_args: String,
-    /// Devin 代理地址（空 = 直连，不继承系统代理；下同：注入 HTTP(S)_PROXY 等到该后端子进程）
-    pub devin_proxy: String,
-    /// CodeBuddy CLI 可执行文件路径（默认 codebuddy，依赖 PATH）
-    pub codebuddy_path: String,
-    /// 旧版 CodeBuddy ACP 启动参数（`--acp` 时代遗留）；当前走官方 HTTP 传输
-    /// （`codebuddy --serve` + /api/v1/acp），不再使用该字段，仅兼容反序列化。
-    pub codebuddy_args: String,
-    /// CodeBuddy 代理地址
-    pub codebuddy_proxy: String,
-    /// WorkBuddy 安装目录或内置 CodeBuddy CLI；空 = 自动发现，不回退到普通 CodeBuddy。
+    /// Lyra 本地 WorkBuddy provider 的安装目录或内置 CLI；空 = 自动发现。
     pub workbuddy_path: String,
-    pub workbuddy_proxy: String,
-    /// Codex CLI 可执行文件路径（默认 codex，依赖 PATH）
-    pub codex_path: String,
-    /// Codex app-server 启动参数
-    pub codex_args: String,
-    /// Codex 代理地址（空 = 直连，不继承系统代理）
-    pub codex_proxy: String,
-    /// Lyra provider 代理地址（空 = 直连，不继承系统代理）
-    #[serde(alias = "vegaProxy")]
-    pub lyra_proxy: String,
     /// Windows 下为 agent shell 子进程注入无窗口 shim（保存后重启应用生效）
     pub windows_shell_shim_enabled: bool,
     /// PowerShell 输出按 UTF-8 捕获（Lyra 的 bash 工具注入一次性前缀，把控制台
@@ -236,21 +211,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            claude_path: "claude-agent-acp".into(),
-            claude_proxy: String::new(),
-            claude_enabled: false,
             devin_path: "devin".into(),
-            acp_args: "acp".into(),
-            devin_proxy: String::new(),
-            codebuddy_path: "codebuddy".into(),
-            codebuddy_args: "--acp".into(),
-            codebuddy_proxy: String::new(),
             workbuddy_path: String::new(),
-            workbuddy_proxy: String::new(),
-            codex_path: "codex".into(),
-            codex_args: "app-server --stdio".into(),
-            codex_proxy: String::new(),
-            lyra_proxy: String::new(),
             windows_shell_shim_enabled: false,
             powershell_utf8_enabled: true,
             auto_change_project_enabled: true,
@@ -449,13 +411,11 @@ mod tests {
             "cursorContextMode":"super",
             "cursorEnabled":true,
             "cursorIntegration":"sdk",
-            "codexPath":"custom-codex",
-            "lyraProxy":"http://localhost:5678"
+            "lyraProxy":"http://localhost:5678",
+            "devinProxy":"http://localhost:8081"
         }"#).unwrap();
-        assert_eq!(settings.codex_path, "custom-codex");
-        assert_eq!(settings.lyra_proxy, "http://localhost:5678");
         let saved = serde_json::to_value(settings).unwrap();
-        assert!(saved.as_object().unwrap().keys().all(|key| !key.starts_with("cursor")));
+        assert!(saved.as_object().unwrap().keys().all(|key| !key.starts_with("cursor") && !key.ends_with("Proxy")));
     }
 
     #[test]
@@ -505,10 +465,11 @@ mod tests {
     #[test]
     fn only_lyra_runtime_settings_are_persisted() {
         let settings = Settings::default();
-        assert!(!settings.vega_enabled);
-        assert!(!settings.devin_enabled);
-        assert!(!settings.codex_enabled);
-        assert!(!settings.codebuddy_enabled);
+        assert!(settings.lyra_enabled);
+        let saved = serde_json::to_value(settings).unwrap();
+        for key in ["vegaEnabled", "claudeEnabled", "codexEnabled", "codexplusEnabled", "codexIntegration", "claudePath", "claudeProxy", "codexPath", "codexProxy"] {
+            assert!(saved.get(key).is_none());
+        }
     }
 
     #[test]
@@ -619,6 +580,42 @@ mod tests {
         assert!(saved.get("codebuddyIntegration").is_none());
         assert!(saved.get("codebuddyplusEnabled").is_none());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn removed_backend_settings_preserve_lyra_provider_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let legacy = serde_json::json!({
+            "claudeEnabled": true, "codexEnabled": true, "codexplusEnabled": true,
+            "codexIntegration": "app-server", "codexArgs": "app-server --stdio",
+            "claudePath": "/custom/claude", "claudeProxy": "http://localhost:8084",
+            "codexPath": "/custom/codex", "codexProxy": "http://localhost:8085",
+            "devinEnabled": true, "codebuddyEnabled": true, "workbuddyEnabled": true,
+            "codebuddyPath": "old-backend", "acpArgs": "acp", "codebuddyArgs": "--acp",
+            "devinPath": "/custom/devin", "devinProxy": "http://localhost:8081",
+            "codebuddyProxy": "http://localhost:8082", "workbuddyPath": "/custom/workbuddy",
+            "workbuddyProxy": "http://localhost:8083",
+            "sceneModels": {"coding": [
+                {"agentKind": "claude", "model": "old-claude"},
+                {"agentKind": "codex", "model": "old-codex"},
+                {"agentKind": "devin", "model": "old-model"},
+                {"agentKind": "lyra", "model": "devin/adaptive"}
+            ]}
+        });
+        fs::write(path.join("settings.json"), legacy.to_string()).unwrap();
+        let settings = Settings::load(&path);
+        settings.save(&path);
+        let saved = serde_json::to_value(Settings::load(&path)).unwrap();
+        for key in ["devinPath", "workbuddyPath"] {
+            assert_eq!(saved[key], legacy[key]);
+        }
+        // Lyra 跟随系统代理：旧代理键一并丢弃。
+        for key in ["devinProxy", "codebuddyProxy", "workbuddyProxy", "lyraProxy", "claudePath", "claudeProxy", "codexPath", "codexProxy", "claudeEnabled", "codexEnabled", "codexplusEnabled", "codexIntegration", "codexArgs", "devinEnabled", "codebuddyEnabled", "workbuddyEnabled", "codebuddyPath", "acpArgs", "codebuddyArgs"] {
+            assert!(saved.get(key).is_none());
+        }
+        // 此层只读取设置；旧独立后端模型由迁移模块处理，Lyra provider 模型保持原样。
+        assert_eq!(saved["sceneModels"]["coding"], legacy["sceneModels"]["coding"]);
     }
 }
 

@@ -273,6 +273,10 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                     </Show>
                   </div>
 
+                  <Show when={p().preset === "local-codex" || p().preset === "local-claude-code"}>
+                    <p class="field-hint">优先使用 CLI 自定义 API，否则使用内置订阅反代；无需 Node 或独立 Agent。订阅连接使用 Lyra 代理。凭据过期时请到对应 CLI 刷新登录；不会静默将订阅凭据发送给第三方。</p>
+                  </Show>
+
                   <section class="lyra-models">
                     <div class="lyra-section-head">
                       <h4>模型</h4>
@@ -395,10 +399,6 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                             </Show>
                             <For each={APIS}>{(a) => <option value={a} selected={a === p().api}>{a}</option>}</For>
                           </select>
-                        </label>
-                        <label class="backend-field">
-                          <span class="field-label">代理</span>
-                          <input class="field-input" placeholder="留空跟随 Lyra 全局代理" value={p().proxy} onInput={(e) => setP((x) => (x.proxy = e.currentTarget.value))} />
                         </label>
                         <label class="backend-field">
                           <span class="field-label" title="仅在模型选择器中保留 ID 或名称包含这些关键词的模型；多个用逗号分隔，不分大小写">模型关键词过滤</span>

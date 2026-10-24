@@ -4164,17 +4164,6 @@ button {
   min-width: 0;
 }
 
-.backend-proxy-field {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 10px;
-}
-
-.backend-proxy-field .field-input {
-  min-width: 0;
-}
-
 .session-shortcut-config {
   display: grid;
   gap: 10px;
@@ -4337,11 +4326,6 @@ button {
 @media (max-width: 680px) {
   .backend-field-wide {
     grid-column: auto;
-  }
-
-  .backend-proxy-field {
-    grid-template-columns: 1fr;
-    gap: 4px;
   }
 
   .session-shortcut-cols {
@@ -7066,7 +7050,6 @@ button:focus-visible {
   .lyra-provider-meta { display: none; }
   .lyra-fetch { grid-template-columns: minmax(0, 1fr); }
   .lyra-fetch > .btn { justify-self: start; }
-  .lyra-overview .backend-proxy-field { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* 模型右侧的思考强度列（第四级） */

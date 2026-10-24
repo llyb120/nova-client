@@ -8,7 +8,7 @@ Lyra 使用 Rust 原生实现，协议基于 Devin CLI 3000.11.205 验证，没�
 
 在「设置 → Lyra → 添加 Provider」中选择 **Devin（本地 API）** 后保存即可，无需填写地址、协议或 API Key，也无需运行 npm 命令。Nova 在 Rust 进程内直接请求 Devin 的 Connect/Protobuf 接口，自动读取本机 CLI 登录，不启动 Node 代理或监听本地端口。
 
-需要本机已有已登录的 Devin CLI。CLI 路径和上游代理沿用 Nova 的 Devin 设置。Lyra 自动使用 `devin` 原生协议；「获取模型」读取 CLI 目录。共享配置只需 `{"provider":{"devin":{"preset":"devin"}}}`，不依赖 Node.js、项目目录、`devin-api.json` 或固定端口。输入补全和标题生成也使用同一 Rust provider。
+需要本机已有已登录的 Devin CLI。CLI 路径沿用 Nova 的 Devin 设置，网络跟随系统代理。Lyra 自动使用 `devin` 原生协议；「获取模型」读取 CLI 目录。共享配置只需 `{"provider":{"devin":{"preset":"devin"}}}`，不依赖 Node.js、项目目录、`devin-api.json` 或固定端口。输入补全和标题生成也使用同一 Rust provider。
 
 不同思考档位直接选择对应模型 ID（如 `gpt-5-5-high`）；模型名称、上下文和输出限制从 Devin CLI 目录读取。目录未声明的图片能力可在模型设置中显式开启；`gpt-5-5-none` 已实测支持图片。
 

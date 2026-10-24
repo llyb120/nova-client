@@ -409,22 +409,11 @@ export interface PendingNewSessionSeed {
 
 export interface Settings {
   claudePath: string;
-  claudeProxy: string;
-  claudeEnabled: boolean;
+  /** 仅 Lyra 本地 provider 连接设置，不启用独立后端。 */
   devinPath: string;
-  acpArgs: string;
-  /** Devin 代理地址（空 = 不代理；下同：注入 HTTP(S)_PROXY 到该后端子进程） */
-  devinProxy: string;
-  /** CodeBuddy CLI 可执行文件 */
-  codebuddyPath: string;
-  codebuddyProxy: string;
   /** 空 = 自动查找 Windows 默认安装目录；支持安装目录、WorkBuddy.exe（仅定位内置 CLI）或内置 CodeBuddy CLI 路径。 */
   workbuddyPath: string;
-  workbuddyProxy: string;
   codexPath: string;
-  codexProxy: string;
-  /** Lyra provider 代理地址 */
-  lyraProxy: string;
   /** Windows shell 启动 shim（保存后重启应用生效） */
   windowsShellShimEnabled: boolean;
   /** PowerShell 输出按 UTF-8 捕获，避免 GBK 与 UTF-8 解码错配乱码；默认开启。 */
