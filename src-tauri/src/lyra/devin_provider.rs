@@ -81,7 +81,7 @@ async fn cli(binary: &str, proxy: &str, args: &[&str]) -> Result<Vec<u8>, String
 }
 
 async fn catalog(options: &Value, force: bool) -> Result<Catalog, String> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, String), Catalog>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<String, Catalog>>> = OnceLock::new();
     let binary = options["devinCli"].as_str().unwrap_or("devin");
     let proxy = options["proxy"].as_str().filter(|s| !s.trim().is_empty())
         .or_else(|| options["devinProxy"].as_str()).unwrap_or("");
@@ -517,6 +517,41 @@ mod tests {
         assert_eq!(resolve_model(&catalog,"alias",Some("high")).unwrap(), "gpt-high-priority");
         assert!(resolve_model(&catalog,"gpt",Some("max")).is_err());
         assert_eq!(catalog_models(&catalog)["gpt-low-priority"]["limit"]["output"],128000);
+    }
+
+    #[test]
+    fn migrated_efforts_reach_request_body_and_native_uid_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut migration = super::super::backend_migration::Migration::load(dir.path(), &HashMap::new()).unwrap();
+        let choices: Vec<_> = ["high", "low", "none"].into_iter().map(|effort| {
+            (effort, migration.target("devin", Some(&format!("gpt-low-priority:{effort}")), None).unwrap())
+        }).collect();
+        let default = migration.target("devin", Some("gpt-low-priority"), None).unwrap();
+        migration.save().unwrap();
+        let mut config: Value = serde_json::from_slice(&std::fs::read(dir.path().join("alkaid/config.jsonc")).unwrap()).unwrap();
+        let catalog = Catalog { loaded: Instant::now(), version: "1.2.3".into(), families: vec![json!({"slug":"gpt","variants":[
+            {"model_uid":"gpt-low-priority"}, {"model_uid":"gpt-high-priority"}, {"model_uid":"gpt-none-priority"}]})] };
+        let provider = &mut config["provider"]["devin"];
+        provider["api"] = json!("devin");
+        provider["options"] = json!({"baseURL":"https://example.invalid","supportsReasoningEffort":false,"supportsThinkingToggle":false});
+        // Fixture for expanded native config: catalog defaults, then explicit per-model overrides.
+        // The assertions below exercise real config resolution, request construction and UID resolution.
+        let mut models = catalog_models(&catalog);
+        for (id, model) in provider["models"].as_object().unwrap() {
+            models[id]["variants"] = model["variants"].clone();
+            models[id]["options"].as_object_mut().unwrap().extend(model["options"].as_object().unwrap().clone());
+        }
+        provider["models"] = json!(models);
+        for (effort, selected) in choices {
+            let resolved = super::super::config::resolve_model(&config, Some(&selected), &HashMap::new()).unwrap();
+            assert_eq!(resolved.model.id, "gpt-low-priority");
+            let body = provider::completions_body(&resolved.model, "test", &[], &[], resolved.thinking_level.as_deref(), None);
+            assert_eq!(body["reasoning_effort"], effort);
+            assert_eq!(resolve_model(&catalog, &resolved.model.id, body["reasoning_effort"].as_str()).unwrap(), format!("gpt-{effort}-priority"));
+        }
+        let resolved = super::super::config::resolve_model(&config, Some(&default), &HashMap::new()).unwrap();
+        let body = provider::completions_body(&resolved.model, "test", &[], &[], resolved.thinking_level.as_deref(), None);
+        assert!(body.get("reasoning_effort").is_none(), "explicit variants must not set a shared default effort");
     }
 
     #[tokio::test]

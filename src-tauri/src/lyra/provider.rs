@@ -10,7 +10,36 @@ use base64::Engine;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+#[path = "response_state.rs"]
+mod response_state;
+#[cfg(test)]
+#[path = "response_state_tests.rs"]
+mod response_state_tests;
+
+/// Optional integration hook for explicit session reset/close or cancellation between requests.
+/// In-flight leases are invalidated too; history-prefix checks handle ordinary compaction.
+pub(crate) fn reset_response_state(session_id: &str) {
+    response_state::reset(Some(session_id));
+}
+
+/// Read these from ResolvedModel.extra_options; never forward them to an upstream API.
+/// supportsPreviousResponseId is a retired switch: ignored, but still stripped so old configs don't 400.
+pub(super) fn client_only_option(key: &str) -> bool {
+    matches!(key, "tokenizer" | "responsesContinuation" | "supportsPreviousResponseId")
+}
+
+fn native_transport_model(model: &ResolvedModel) -> ResolvedModel {
+    let mut model = model.clone();
+    model.extra_options.retain(|key, _| !client_only_option(key));
+    model
+}
+
+pub(super) fn model_token_counter(model: &ResolvedModel) -> Result<super::tokens::TokenCounter, String> {
+    let tokenizer = model.extra_options.get("tokenizer").map(|value| value.as_str().ok_or("options.tokenizer must be a string")).transpose()?;
+    super::tokens::TokenCounter::for_model(&model.id, &model.api, tokenizer)
+}
 
 #[derive(Debug)]
 pub enum StreamEvent {
@@ -18,8 +47,8 @@ pub enum StreamEvent {
     Activity,
     TextDelta(String),
     ThinkingDelta(String),
-    /// 某个工具调用的参数已完整（anthropic content_block_stop / responses output_item.done /
-    /// completions 下一个调用开始）：turn 据此提前派发只读工具。
+    /// 工具参数已完整：Anthropic/completions 可提前派发；Responses 等完整成功终态再提交，
+    /// 避免取消、坏流或续接回退时重复执行。turn 按 ID 消化已派发的只读工具。
     ToolCallDone { id: String, name: String, arguments: Value },
 }
 
@@ -342,28 +371,48 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
     }
 }
 
-// ponytail: ~3 UTF-8 bytes per token conservatively bounds text tokens (CJK ≈ 3 bytes/char,
-// ASCII ≈ 4 bytes/token; raw byte counts overestimated 4x and starved long chats down to 16 output
-// tokens); image cost is a heuristic (8192 per image). Replace with provider token counting when available.
-fn request_input_budget(value: &Value) -> u64 {
-    match value {
-        Value::String(text) => (text.len() as u64).div_ceil(3),
-        Value::Array(items) => items.iter().map(request_input_budget).sum(),
-        Value::Object(fields) => {
-            if matches!(fields.get("type").and_then(Value::as_str),
-                Some("image" | "image_url" | "input_image")) {
-                return 8192;
+/// Unconfirmed vocabularies (e.g. Claude via cl100k fallback) undercount; budget conservatively.
+const UNKNOWN_TOKENIZER_MARGIN: f64 = 1.25;
+
+fn request_input_budget(model: &ResolvedModel, value: &Value) -> u64 {
+    // Count serialized wire content (including schemas/JSON escaping), not character classes.
+    // Invalid overrides are rejected by stream_chat_once before IO.
+    let counter = model_token_counter(model).unwrap_or_default();
+    use super::tokens::IMAGE_TOKENS;
+    fn remove_image_payloads(value: &mut Value) -> u64 {
+        match value {
+            Value::Array(items) => items.iter_mut().map(remove_image_payloads).sum(),
+            Value::Object(fields) => {
+                if matches!(fields.get("type").and_then(Value::as_str), Some("image" | "image_url" | "input_image")) {
+                    for key in ["source", "image_url", "data"] { fields.remove(key); }
+                    // Vision costs depend on resolution/tiling, not base64 bytes.
+                    return IMAGE_TOKENS;
+                }
+                fields.values_mut().map(remove_image_payloads).sum()
             }
-            fields.iter().map(|(key, value)| key.len() as u64 + request_input_budget(value) + 8).sum()
+            _ => 0,
         }
-        _ => 8,
     }
+    // Count top-level fields and array items (messages/input/tools) separately, memoized by content:
+    // append-only history only BPE-counts new items, and the whole body is never cloned.
+    let pieces: Vec<&Value> = match value {
+        // A bare content block (has "type") stays whole so image payloads are still recognized.
+        Value::Object(fields) if !fields.contains_key("type") => fields.values()
+            .flat_map(|v| match v { Value::Array(items) => items.iter().collect(), v => vec![v] }).collect(),
+        v => vec![v],
+    };
+    let raw: u64 = pieces.into_iter().map(|piece| counter.count_cached(piece, || {
+        let mut piece = piece.clone();
+        let images = remove_image_payloads(&mut piece);
+        counter.count_json(&piece).saturating_add(images)
+    })).sum();
+    if counter.tokenizer_known() { raw } else { (raw as f64 * UNKNOWN_TOKENIZER_MARGIN).ceil() as u64 }
 }
 
 fn budget_output_tokens(body: &mut Value, model: &ResolvedModel, field: &str) {
     let requested = body[field].as_u64().unwrap_or(model.max_output_tokens);
     let available = model.context_window
-        .saturating_sub(request_input_budget(body))
+        .saturating_sub(request_input_budget(model, body))
         .saturating_sub(8192);
     body[field] = json!(requested.min(available).max(16));
 }
@@ -404,7 +453,7 @@ pub(super) fn completions_body(
     // 用户在 options 里配置的非内置字段直接附加到请求体顶层（tool_stream 等）。
     if let Some(object) = body.as_object_mut() {
         for (key, value) in &model.extra_options {
-            if key != "cacheRetention" {
+            if key != "cacheRetention" && !client_only_option(key) {
                 object.insert(key.clone(), value.clone());
             }
         }
@@ -432,6 +481,9 @@ pub(super) fn completions_body(
 // ---------- responses ----------
 
 fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
+    // With store=false (default; always for Codex) item ids are not persisted upstream and replaying
+    // them fails with "not found"; encrypted_content and call_id carry the state instead.
+    let stored = model.local_auth.as_deref() != Some("codex") && model.extra_options.get("store") == Some(&Value::Bool(true));
     let mut out = Vec::new();
     let images_from = tool_images_from(messages);
     for (index, message) in messages.iter().enumerate() {
@@ -482,6 +534,8 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                             if let Some(item) = part.get("thinkingSignature").and_then(Value::as_str)
                                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                                 .filter(|v| v["type"] == "reasoning") {
+                                let mut item = item;
+                                if !stored { item.as_object_mut().map(|o| o.remove("id")); }
                                 out.push(item);
                             }
                         }
@@ -493,7 +547,7 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                             if same_model {
                                 if let Some(signature) = part.get("textSignature").and_then(Value::as_str)
                                     .and_then(|s| serde_json::from_str::<Value>(s).ok()) {
-                                    if let Some(id) = signature.get("id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 64) {
+                                    if let Some(id) = signature.get("id").and_then(Value::as_str).filter(|s| stored && !s.is_empty() && s.len() <= 64) {
                                         item["id"] = json!(id);
                                     }
                                     if let Some(phase) = signature.get("phase").filter(|p| *p == "commentary" || *p == "final_answer") {
@@ -511,7 +565,7 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                                 "name": part["name"],
                                 "arguments": serde_json::to_string(part.get("arguments").unwrap_or(&Value::Null)).unwrap(),
                             });
-                            if same_model && !item_id.is_empty() {
+                            if same_model && stored && !item_id.is_empty() {
                                 item["id"] = json!(item_id);
                             }
                             out.push(item);
@@ -574,7 +628,7 @@ fn responses_body(
     });
     if let Some(object) = body.as_object_mut() {
         object.extend(model.extra_options.iter()
-            .filter(|(key, _)| key.as_str() != "cacheRetention")
+            .filter(|(key, _)| key.as_str() != "cacheRetention" && !client_only_option(key))
             .map(|(key, value)| (key.clone(), value.clone())));
     }
     if !tool_defs.is_empty() {
@@ -610,6 +664,15 @@ fn responses_body(
         body["top_p"] = json!(top_p);
     }
     budget_output_tokens(&mut body, model, "max_output_tokens");
+    if model.local_auth.as_deref() == Some("codex") {
+        // ChatGPT 的 Codex 接口不是付费 Responses API，不接受这些通用参数。
+        for key in ["max_output_tokens", "temperature", "top_p", "prompt_cache_retention"] {
+            body.as_object_mut().unwrap().remove(key);
+        }
+        body["store"] = json!(false);
+        body["stream"] = json!(true);
+        body["parallel_tool_calls"] = json!(true);
+    }
     body
 }
 
@@ -704,6 +767,7 @@ async fn post_stream(
     let status = response.status();
     if !status.is_success() {
         if model.api == "codebuddy" { return Err(format!("CodeBuddy upstream HTTP {}", status.as_u16())); }
+        if let Some(source) = &model.local_auth { return Err(local_auth_error(source, status)); }
         let text = response.text().await.unwrap_or_default();
         let message = text.trim();
         return Err(if message.is_empty() {
@@ -902,7 +966,7 @@ fn map_finish_reason(
         Some("length") | Some("max_tokens") => ("length".into(), None),
         // 未知 finish_reason（如网关返回的 "other"）：已产出内容时按 stop 收尾，
         // 空响应才报错并交给外层重试。
-        Some(other) if has_tool_calls || has_content => (
+        Some(_) if has_tool_calls || has_content => (
             if has_tool_calls { "toolUse" } else { "stop" }.into(),
             None,
         ),
@@ -1120,6 +1184,8 @@ fn completion_reasoning(delta: &Value, result: &mut StreamResult, details: &mut 
     }
 }
 
+// Manual previous_response_id remains a raw passthrough, never an automatic checkpoint.
+// HTTP continuation requires stored responses; Codex subscription store=false is not this API.
 async fn stream_responses(
     http: &reqwest::Client,
     model: &ResolvedModel,
@@ -1129,22 +1195,133 @@ async fn stream_responses(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
+    use response_state::{fingerprint, Checkpoint, Lease};
+    let automatic = model.extra_options.get("responsesContinuation").and_then(Value::as_str) == Some("auto")
+        && body["store"] == true && model.local_auth.is_none()
+        && !model.extra_options.contains_key("previous_response_id")
+        && body.get("previous_response_id").is_none()
+        && body["input"].is_array() && session_id.is_some_and(|s| !s.is_empty());
+    let mut lease = if automatic {
+        // Hash actual request configuration and auth, never retain/log raw credentials.
+        // Output budget varies with history size; requested limits remain in the model/options.
+        let config: Map<String, Value> = body.as_object().unwrap().iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "input" | "max_output_tokens"))
+            .map(|(key, value)| (key.clone(), value.clone())).collect();
+        let scope = fingerprint(&(&model.provider, &model.api, &model.id, &model.base_url,
+            &model.headers, api_key, &model.extra_options, model.context_window,
+            model.max_output_tokens, model.supports_images, model.session_affinity_headers,
+            &model.session_affinity_format, config));
+        Some(Lease::begin(session_id.unwrap(), scope))
+    } else {
+        response_state::reset(session_id);
+        None
+    };
+    let mut request = body.clone();
+    if let Some(state) = &lease {
+        if let Some(prior) = state.checkpoint.as_ref().filter(|_| !state.disabled) {
+            let input = body["input"].as_array().unwrap();
+            if input.len() > prior.prefix_len && fingerprint(&&input[..prior.prefix_len]) == prior.prefix {
+                request["previous_response_id"] = json!(prior.id);
+                request["input"] = json!(input[prior.prefix_len..]);
+            }
+        }
+    }
+    let incremental = automatic && request.get("previous_response_id").is_some();
+    let mut meta = ResponsesMeta::default();
+    let mut outcome = stream_responses_once(http, model, api_key, request, session_id, cancel, on_event, &mut meta).await;
+    let rejected = incremental && meta.reference_rejected;
+    if rejected && !meta.generated && !cancel.load(Ordering::SeqCst) {
+        // Exactly one full retry, before any generated output/tool can have escaped.
+        meta = ResponsesMeta::default();
+        outcome = stream_responses_once(http, model, api_key, body.clone(), session_id, cancel, on_event, &mut meta).await;
+    }
+    if cancel.load(Ordering::SeqCst) {
+        let mut aborted = StreamResult::empty();
+        aborted.stop_reason = "aborted".into();
+        outcome = Ok(aborted);
+    }
+    if let Some(state) = lease.take() {
+        let disabled = state.disabled || rejected;
+        let checkpoint = outcome.as_ref().ok().filter(|result| !disabled && meta.replayable
+            && matches!(result.stop_reason.as_str(), "stop" | "toolUse") && result.error_message.is_none()
+            && result.content.iter().any(|p| p["type"] == "toolCall" || p["text"].as_str().is_some_and(|s| !s.trim().is_empty())))
+            .and_then(|result| meta.id.as_ref().map(|id| {
+                let mut prefix = body["input"].as_array().unwrap().clone();
+                // Compare with precisely the replay representation used by the next turn, not
+                // raw server output (which contains status/annotations absent from history).
+                prefix.extend(responses_input(&[json!({"role":"assistant", "content":result.content,
+                    "model":model.id, "provider":model.provider, "api":model.api})], model));
+                Checkpoint { id: id.clone(), prefix_len: prefix.len(), prefix: fingerprint(&prefix) }
+            }));
+        state.finish(checkpoint, disabled);
+    }
+    if let Ok(result) = &outcome {
+        if result.stop_reason == "toolUse" {
+            // Responses tools are committed only after a complete, validated stream. turn's
+            // early-result reconciliation consumes these same IDs, so each tool runs once.
+            for part in result.content.iter().filter(|p| p["type"] == "toolCall") {
+                on_event(StreamEvent::ToolCallDone { id: part["id"].as_str().unwrap().into(),
+                    name: part["name"].as_str().unwrap().into(), arguments: part["arguments"].clone() });
+            }
+        }
+    }
+    if cancel.load(Ordering::SeqCst) {
+        response_state::reset(session_id);
+        let mut aborted = StreamResult::empty();
+        aborted.stop_reason = "aborted".into();
+        return Ok(aborted);
+    }
+    outcome
+}
+
+#[derive(Default)]
+struct ResponsesMeta {
+    id: Option<String>,
+    generated: bool,
+    reference_rejected: bool,
+    replayable: bool,
+}
+
+fn response_reference_rejected(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("previous_response_id") || error.contains("response_not_found")
+        || error.contains("previous_response_not_found")
+}
+
+async fn stream_responses_once(
+    http: &reqwest::Client,
+    model: &ResolvedModel,
+    api_key: &str,
+    body: Value,
+    session_id: Option<&str>,
+    cancel: &Arc<AtomicBool>,
+    on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    meta: &mut ResponsesMeta,
+) -> Result<StreamResult, String> {
     let url = crate::lyra_complete::join_url(&model.base_url, "responses");
-    let mut response = post_stream(http, &url, model, api_key, session_id, body, cancel).await?;
+    let mut response = post_stream(http, &url, model, api_key, session_id, body, cancel).await.map_err(|error| {
+        meta.reference_rejected = ["HTTP 400", "HTTP 404", "HTTP 422"].iter().any(|s| error.starts_with(s))
+            && response_reference_rejected(&error);
+        error
+    })?;
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
     let mut call_indices = HashMap::new();
     let mut terminal = false;
+    let mut authoritative_output = false;
     let mut completed_items = std::collections::BTreeMap::new();
-    let cancelled = read_sse(&mut response, cancel, false, |data| {
+    let cancelled = read_responses_data(&mut response, cancel, |data| {
         if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
-        let Ok(value) = serde_json::from_str::<Value>(data) else {
-            return Ok(());
-        };
+        let value: Value = serde_json::from_str(data).map_err(|_| "provider stream error: invalid Responses JSON")?;
         let kind = value
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if kind.starts_with("response.output_") || kind.starts_with("response.function_call_")
+            || kind.starts_with("response.reasoning") || matches!(kind, "response.text.delta" | "response.refusal.delta") {
+            meta.generated = true;
+        }
+        if terminal { return Err("provider stream error: event after Responses terminal".into()); }
         match kind {
             "response.output_text.delta" | "response.text.delta" | "response.refusal.delta" => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
@@ -1203,39 +1380,22 @@ async fn stream_responses(
             "response.output_item.done" => {
                 let item = value.get("item").cloned().unwrap_or(Value::Null);
                 completed_items.insert(value.get("output_index").and_then(Value::as_u64).unwrap_or(0), item.clone());
-                if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                    if let Some(&index) = call_indices.get(&value.get("output_index").and_then(Value::as_u64).unwrap_or(0)) {
-                        if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
-                            if !arguments.is_empty() {
-                                calls[index].arguments = arguments.to_string();
-                            }
-                        }
-                        if calls[index].name.is_empty() {
-                            if let Some(name) = item.get("name").and_then(Value::as_str) {
-                                calls[index].name = name.to_string();
-                            }
-                        }
-                        // id 与 parse_responses_object 的最终 toolCall 保持一致（call_id|item_id）。
-                        let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or_default();
-                        let id = match item.get("id").and_then(Value::as_str) {
-                            Some(id) if id != call_id => format!("{call_id}|{id}"),
-                            _ => call_id.to_string(),
-                        };
-                        on_event(StreamEvent::ToolCallDone {
-                            id,
-                            name: calls[index].name.clone(),
-                            arguments: serde_json::from_str(&calls[index].arguments)
-                                .unwrap_or_else(|_| json!({ "__invalidJson": calls[index].arguments })),
-                        });
-                    }
-                }
             }
             "response.completed" | "response.incomplete" => {
                 terminal = true;
-                if let Some(output) = value.pointer("/response/output").and_then(Value::as_array).filter(|v| !v.is_empty()) {
-                    // 终态是权威版本：部分服务只在这里提供 encrypted_content。
+                if kind == "response.completed" {
+                    if value.pointer("/response/status").and_then(Value::as_str).is_some_and(|s| s != "completed") {
+                        return Err("provider stream error: inconsistent Responses terminal status".into());
+                    }
+                    meta.id = response_id(&value["response"]);
+                }
+                if let Some(output) = value.pointer("/response/output").and_then(Value::as_array) {
+                    // Even [] is authoritative; never execute stale output_item.done calls.
+                    authoritative_output = true;
+                    meta.replayable = replayable_response_output(output);
                     completed_items = output.iter().cloned().enumerate().map(|(i, v)| (i as u64, v)).collect();
                 }
+                if value.pointer("/response/store") == Some(&Value::Bool(false)) { meta.id = None; }
                 if let Some(usage) = value.pointer("/response/usage") {
                     result.usage = responses_usage(usage);
                 }
@@ -1244,6 +1404,7 @@ async fn stream_responses(
                 }
             }
             "response.failed" | "error" => {
+                meta.reference_rejected = response_reference_rejected(&value.to_string());
                 let message = value
                     .pointer("/response/error/message")
                     .or_else(|| value.pointer("/error/message"))
@@ -1256,6 +1417,13 @@ async fn stream_responses(
                 // 非流式整包回退
                 if value.get("output").is_some() || value.get("output_text").is_some() {
                     terminal = true;
+                    meta.generated = true;
+                    if value["status"] == "completed" {
+                        if value["store"] != false { meta.id = response_id(&value); }
+                        meta.replayable = value["output"].as_array().is_some_and(|output| replayable_response_output(output));
+                    } else if !matches!(value["status"].as_str(), Some("incomplete" | "failed" | "cancelled")) {
+                        return Err("provider stream error: Responses object missing terminal status".into());
+                    }
                     parse_responses_object(&value, &mut result, &mut calls);
                 }
             }
@@ -1263,24 +1431,87 @@ async fn stream_responses(
         Ok(())
     })
     .await?;
-    if cancelled {
+    if cancelled || cancel.load(Ordering::SeqCst) {
+        result.content.retain(|p| p["type"] != "toolCall");
         result.stop_reason = "aborted".into();
         return Ok(result);
     }
     if !terminal {
         return Err("provider stream error: Responses 流在终止事件之前结束".into());
     }
-    if !completed_items.is_empty() {
+    if !authoritative_output && calls.len() > completed_items.values().filter(|item| item["type"] == "function_call").count() {
+        return Err("provider stream error: Responses tool output missing completion".into());
+    }
+    if authoritative_output || !completed_items.is_empty() {
         result.content.clear();
         calls.clear();
         parse_responses_object(&json!({"output": completed_items.into_values().collect::<Vec<_>>()}), &mut result, &mut calls);
     }
-    let has_tool_calls = !calls.is_empty() || result.content.iter().any(|p| p["type"] == "toolCall");
     finalize_tool_calls(calls, &mut result);
+    if matches!(result.stop_reason.as_str(), "length" | "error") {
+        result.content.retain(|p| p["type"] != "toolCall");
+    }
+    let mut seen = HashMap::new();
+    let mut unique = Vec::new();
+    for part in result.content.drain(..) {
+        if part["type"] == "toolCall" {
+            let id = part["id"].as_str().filter(|s| !s.is_empty()).ok_or("Responses tool call missing ID")?;
+            if !part["name"].as_str().is_some_and(|s| !s.is_empty()) || !part["arguments"].is_object()
+                || part["arguments"].get("__invalidJson").is_some() {
+                return Err("Responses tool call has invalid name or arguments".into());
+            }
+            let call_id = id.split('|').next().unwrap();
+            if let Some(prior) = seen.insert(call_id.to_string(), part.clone()) {
+                if prior != part { return Err("Responses tool call has conflicting duplicate ID".into()); }
+                continue;
+            }
+        }
+        unique.push(part);
+    }
+    result.content = unique;
     if result.stop_reason.is_empty() {
-        result.stop_reason = if has_tool_calls { "toolUse" } else { "stop" }.into();
+        result.stop_reason = if seen.is_empty() { "stop" } else { "toolUse" }.into();
     }
     Ok(result)
+}
+
+async fn read_responses_data(
+    response: &mut reqwest::Response,
+    cancel: &Arc<AtomicBool>,
+    mut on_data: impl FnMut(&str) -> Result<(), String>,
+) -> Result<bool, String> {
+    if !response.headers().get("content-type").and_then(|h| h.to_str().ok())
+        .is_some_and(|h| h.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json")) {
+        return read_sse(response, cancel, false, on_data).await;
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            _ = wait_cancelled(cancel) => return Ok(true),
+            chunk = tokio::time::timeout(SSE_IDLE_TIMEOUT, response.chunk()) =>
+                chunk.map_err(|_| "provider Responses JSON timeout")?.map_err(|_| "provider Responses JSON read error")?,
+        };
+        let Some(chunk) = chunk else { break; };
+        on_data("")?;
+        if bytes.len() + chunk.len() > 32 * 1024 * 1024 { return Err("provider Responses JSON exceeds 32 MiB".into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    on_data(std::str::from_utf8(&bytes).map_err(|_| "provider Responses JSON invalid UTF-8")?)?;
+    Ok(cancel.load(Ordering::SeqCst))
+}
+
+fn replayable_response_output(output: &[Value]) -> bool {
+    // Server-only output types (hosted tools, audio, etc.) are not preserved in Lyra history.
+    // Do not attach hidden context that a later full replay could not reconstruct.
+    output.iter().all(|item| match item["type"].as_str() {
+        Some("reasoning" | "function_call") => true,
+        Some("message") => item["content"].as_array().is_some_and(|parts| parts.iter().all(|p| p["type"] == "output_text" || p["type"] == "refusal")),
+        _ => false,
+    })
+}
+
+fn response_id(response: &Value) -> Option<String> {
+    response["id"].as_str().filter(|s| !s.is_empty() && s.len() <= 512).map(str::to_owned)
 }
 
 fn parse_responses_object(
@@ -1394,14 +1625,16 @@ async fn stream_chat_once(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
+    model_token_counter(model)?;
+    if model.api != "openai-responses" { response_state::reset(session_id); }
     match model.api.as_str() {
         "codebuddy" => {
             let body = completions_body(model, system_prompt, messages, tools, thinking_level, session_id);
-            super::codebuddy_provider::stream(model, api_key, body, session_id, cancel, on_event).await
+            super::codebuddy_provider::stream(&native_transport_model(model), api_key, body, session_id, cancel, on_event).await
         }
         "devin" => {
             let body = completions_body(model, system_prompt, messages, tools, thinking_level, session_id);
-            super::devin_provider::stream(model, api_key, body, cancel, on_event).await
+            super::devin_provider::stream(&native_transport_model(model), api_key, body, cancel, on_event).await
         }
         "openai-completions" => {
             let body = completions_body(
@@ -1516,6 +1749,9 @@ pub async fn stream_chat(
         on_event,
     )
     .await;
+    if result.as_ref().map_or(true, |result| matches!(result.stop_reason.as_str(), "aborted" | "error" | "length")) {
+        response_state::reset(session_id);
+    }
     match result {
         Err(_) if cancel.load(Ordering::SeqCst) => {
             let mut result = StreamResult::empty();
@@ -1538,6 +1774,7 @@ pub async fn stream_chat(
                     result.stop_reason
                 ));
                 result.stop_reason = "error".into();
+                response_state::reset(session_id);
             }
             Ok(result)
         }
@@ -1741,7 +1978,7 @@ fn anthropic_body(
     }
     // 与其它协议一致，厂商参数透传；显式 thinking/output_config 不被默认值覆盖。
     for (key, value) in &model.extra_options {
-        body[key] = value.clone();
+        if !client_only_option(key) { body[key] = value.clone(); }
     }
     // cacheRetention 是客户端策略，不是 Anthropic 请求字段。
     let retention = body.as_object_mut().unwrap().remove("cacheRetention");
@@ -1751,7 +1988,7 @@ fn anthropic_body(
         let mut cache = json!({ "type": "ephemeral" });
         let official = reqwest::Url::parse(&model.base_url).ok()
             .is_some_and(|url| url.host_str() == Some("api.anthropic.com"));
-        if retention == "long" && (official || model.supports_long_cache_retention) {
+        if retention == "long" && model.local_auth.is_none() && (official || model.supports_long_cache_retention) {
             cache["ttl"] = json!("1h");
         }
         // 用 get_mut：`body["tools"]` 的 IndexMut 会插入 null，无工具请求（如摘要）就被拒为 tools must be an array。
@@ -1775,7 +2012,6 @@ fn anthropic_body(
             }
         }
     }
-    budget_output_tokens(&mut body, model, "max_tokens");
     let thinking_level = thinking_level.filter(|l| !matches!(*l, "off" | "none") || model.supports_thinking_toggle);
     let minimax = model.thinking_format.as_deref() == Some("minimax");
     if matches!(thinking_level, Some("off" | "none")) {
@@ -1809,14 +2045,6 @@ fn anthropic_body(
         } };
         body["output_config"]["effort"] = json!(effort);
     }
-    if body["thinking"]["type"] == "enabled" {
-        let max = body["max_tokens"].as_u64().unwrap();
-        if max <= 1024 {
-            body.as_object_mut().unwrap().remove("thinking");
-        } else if let Some(budget) = body["thinking"]["budget_tokens"].as_u64() {
-            body["thinking"]["budget_tokens"] = json!(budget.max(1024).min(max - 1));
-        }
-    }
     let thinking = matches!(body["thinking"]["type"].as_str(), Some("enabled" | "adaptive"));
     if thinking && !minimax {
         // pi 默认请求可见摘要；保留用户显式的 omitted，不展示加密签名。
@@ -1838,6 +2066,15 @@ fn anthropic_body(
     // OpenAI 的 flex/priority 不是 Anthropic 合法值，不能跨协议照搬。
     if let Some(tier @ ("auto" | "standard_only")) = model.service_tier.as_deref() {
         body["service_tier"] = json!(tier);
+    }
+    budget_output_tokens(&mut body, model, "max_tokens");
+    if body["thinking"]["type"] == "enabled" {
+        let max = body["max_tokens"].as_u64().unwrap();
+        if max <= 1024 {
+            body.as_object_mut().unwrap().remove("thinking");
+        } else if let Some(budget) = body["thinking"]["budget_tokens"].as_u64() {
+            body["thinking"]["budget_tokens"] = json!(budget.max(1024).min(max - 1));
+        }
     }
     body
 }
@@ -1875,7 +2112,7 @@ fn map_anthropic_stop(
         None if has_tool_calls => ("toolUse".into(), None),
         None => ("stop".into(), None),
         // 未知 stop_reason：已产出内容时按 stop/toolUse 收尾，空响应才报错重试。
-        Some(other) if has_tool_calls || has_content => (
+        Some(_) if has_tool_calls || has_content => (
             if has_tool_calls { "toolUse" } else { "stop" }.into(),
             None,
         ),
@@ -1902,7 +2139,7 @@ async fn stream_anthropic(
     } else {
         format!("{base}/v1/messages")
     };
-    let oauth = api_key.starts_with("sk-ant-oat");
+    let oauth = model.local_auth.as_deref() == Some("claude-code") || api_key.starts_with("sk-ant-oat");
     let thinking_enabled = body["thinking"]["type"] == "enabled";
     let mut request = http
         .post(&url)
@@ -1928,18 +2165,21 @@ async fn stream_anthropic(
     if oauth {
         betas.push("oauth-2025-04-20");
     }
-    if !betas.is_empty() {
-        request = request.header("anthropic-beta", betas.join(","));
-    }
     for (key, value) in &model.headers {
         if let Some(text) = value.as_str() {
-            request = request.header(key.as_str(), text);
+            if key.eq_ignore_ascii_case("anthropic-beta") {
+                for beta in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if !betas.contains(&beta) { betas.push(beta); }
+                }
+            } else { request = request.header(key.as_str(), text); }
         }
     }
+    if !betas.is_empty() { request = request.header("anthropic-beta", betas.join(",")); }
     request = apply_opencode_session_header(request, model, session_id);
     let mut response = send_request(request, cancel).await?;
     let status = response.status();
     if !status.is_success() {
+        if let Some(source) = &model.local_auth { return Err(local_auth_error(source, status)); }
         let text = response.text().await.unwrap_or_default();
         let message = text.trim();
         return Err(if message.is_empty() {
@@ -2149,6 +2389,89 @@ mod tests {
     }
 
     #[test]
+    fn subscription_transport_pins_origin_and_keeps_native_payloads_separate() {
+        let mut model = test_model("openai-responses");
+        let ordinary = responses_body(&model, "instructions", &[], &[], None, None);
+        assert!(ordinary.get("max_output_tokens").is_some());
+        model.local_auth = Some("codex".into());
+        model.base_url = "https://untrusted.example".into();
+        model.headers.insert("Host".into(), json!("untrusted.example"));
+        model.extra_options.insert("store".into(), json!(true));
+        model.extra_options.insert("stream".into(), json!(false));
+        let model = local_auth_model(&model, Map::from_iter([("chatgpt-account-id".into(), json!("account"))])).unwrap();
+        assert_eq!(model.base_url, "https://chatgpt.com/backend-api/codex");
+        assert!(model.headers.get("Host").is_none());
+        let body = responses_body(&model, "instructions", &[], &[], Some("high"), Some("session"));
+        for key in ["max_output_tokens", "temperature", "top_p", "prompt_cache_retention"] { assert!(body.get(key).is_none(), "{key}"); }
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["instructions"], "instructions");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["prompt_cache_key"], "session");
+
+        let mut claude = test_model("openai-completions");
+        claude.local_auth = Some("claude-code".into());
+        let claude = local_auth_model(&claude, Map::new()).unwrap();
+        assert_eq!(claude.api, "anthropic-messages");
+        assert_eq!(claude.base_url, "https://api.anthropic.com");
+        let body = anthropic_body(&claude, "instructions", &[], &[], Some("none"));
+        assert!(body["system"][0]["cache_control"].get("ttl").is_none());
+        let mut alias = claude;
+        alias.id = "sonnet[1m]".into();
+        assert!(local_auth_model(&alias, Map::new()).unwrap_err().contains("获取模型"));
+    }
+
+    #[tokio::test]
+    async fn subscription_http_preserves_beta_headers_and_redacts_errors_without_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (source, status) in [("codex", 302), ("claude-code", 401)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0; 2048];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length: usize = headers.lines().find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse().ok())).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
+                    }
+                }
+                let request = String::from_utf8(request).unwrap().to_lowercase();
+                assert!(request.contains("authorization: bearer local-secret\r\n"));
+                if source == "claude-code" {
+                    assert!(!request.contains("x-api-key:"));
+                    let beta = request.lines().find(|l| l.starts_with("anthropic-beta:")).unwrap();
+                    for value in ["oauth-2025-04-20", "context-1m-2025-08-07", "interleaved-thinking-2025-05-14", "custom-beta"] { assert!(beta.contains(value)); }
+                }
+                let body = "do not leak local-secret";
+                socket.write_all(format!("HTTP/1.1 {status} Error\r\nLocation: http://127.0.0.1:1/leak\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let mut model = test_model(if source == "codex" { "openai-responses" } else { "anthropic-messages" });
+            model.local_auth = Some(source.into());
+            model.base_url = format!("http://{address}");
+            model.id = "claude-test[1m]".into();
+            model.headers.insert("anthropic-beta".into(), json!("custom-beta,oauth-2025-04-20"));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let client = local_api_client();
+            let result = if source == "codex" {
+                stream_responses(&client, &model, "local-secret", json!({}), None, &cancel, &mut |_| {}).await
+            } else {
+                stream_anthropic(&client, &model, "local-secret", json!({"thinking":{"type":"enabled"}}), None, &cancel, &mut |_| {}).await
+            };
+            let error = result.err().unwrap();
+            assert!(error.contains(&format!("HTTP {status}")));
+            assert!(!error.contains("local-secret"));
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
     fn commandcode_off_uses_gateway_enum_without_changing_native_thinking() {
         let mut model = test_model("openai-completions");
         model.reasoning = true;
@@ -2261,9 +2584,9 @@ mod tests {
     #[test]
     fn output_budget_reserves_context_for_growing_tool_history() {
         let mut model = test_model("openai-completions");
-        model.context_window = 1_048_576;
+        model.context_window = 262_144;
         model.max_output_tokens = 943_718;
-        let messages = vec![json!({"role":"user", "content":"x".repeat(360_000)})];
+        let messages = vec![json!({"role":"user", "content":"fn main() { println!(\"hello\"); }\n".repeat(8000)})];
         for (body, field) in [
             (completions_body(&model, "sys", &messages, &[], None, None), "max_completion_tokens"),
             (responses_body(&model, "sys", &messages, &[], None, None), "max_output_tokens"),
@@ -2271,28 +2594,35 @@ mod tests {
         ] {
             let output = body[field].as_u64().unwrap();
             assert!(output < model.max_output_tokens);
-            assert!(output + request_input_budget(&body) < model.context_window);
+            assert!(output + request_input_budget(&model, &body) < model.context_window);
         }
-        // A long CJK chat (~720KB, ~180k real tokens) must still get the full output budget.
+        // A long CJK chat with realistic word/line boundaries still gets its output budget.
         let mut kimi = test_model("openai-completions");
         kimi.context_window = 512_000;
         kimi.max_output_tokens = 65_536;
-        let long = vec![json!({"role":"user", "content":"中".repeat(240_000)})];
+        let long = vec![json!({"role":"user", "content":"中文对话记录。\n".repeat(30_000)})];
         assert_eq!(completions_body(&kimi, "sys", &long, &[], None, None)["max_completion_tokens"], 65_536);
+        model.max_output_tokens = 32_000;
         let short = completions_body(&model, "sys", &[], &[], None, None);
         assert_eq!(short["max_completion_tokens"], model.max_output_tokens);
         // Base64 bytes are not text tokens, and must not exhaust the window.
-        assert_eq!(request_input_budget(&json!({"type":"input_image", "image_url":"x".repeat(1_000_000)})), 8192);
+        assert!(request_input_budget(&model, &json!({"type":"input_image", "image_url":"x".repeat(1_000_000)})) < 2 * super::super::tokens::IMAGE_TOKENS);
+        // Unconfirmed tokenizers (Claude on cl100k fallback) get a safety margin over raw BPE.
+        let claude = test_model("anthropic-messages");
+        let body = json!({"messages": [{"role":"user","content":"fn main() { println!(\"hello\"); }\n".repeat(200)}]});
+        let raw = model_token_counter(&claude).unwrap().count_json(&body["messages"][0]);
+        assert!(request_input_budget(&claude, &body) as f64 >= raw as f64 * UNKNOWN_TOKENIZER_MARGIN);
         model.context_window = 100;
         let small = anthropic_body(&model, "sys", &messages, &[], Some("high"));
         assert_eq!(small["max_tokens"], 16);
         assert!(small.get("thinking").is_none());
     }
 
-    fn test_model(api: &str) -> ResolvedModel {
+    pub(super) fn test_model(api: &str) -> ResolvedModel {
         ResolvedModel {
             provider: "p".into(),
             command_code: false,
+            local_auth: None,
             id: "m".into(),
             api: api.into(),
             base_url: "https://api.openai.com/v1".into(),
@@ -2623,7 +2953,8 @@ mod tests {
         assert_eq!(body["max_output_tokens"], 16);
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["input"][0]["encrypted_content"], "opaque");
-        assert_eq!(body["input"][1]["id"], "fc_1");
+        assert!(body["input"][1].get("id").is_none(), "store=false must not replay item ids");
+        assert_eq!(body["input"][1]["call_id"], "call_1");
         assert_eq!(body["input"][1]["call_id"], body["input"][2]["call_id"]);
         model.id = "other".into();
         let input = responses_input(&messages, &model);
@@ -2717,6 +3048,13 @@ mod tests {
         let messages = vec![json!({"role":"assistant", "model":"m", "provider":"p", "api":"openai-responses", "content":result.content}),
             json!({"role":"toolResult", "toolCallId":"call_1|fc_1", "content":[]})];
         let replay = responses_input(&messages, &model);
+        // store=false: no item ids (upstream would 404), but encrypted reasoning and call_id survive.
+        assert!(replay.iter().all(|item| item.get("id").is_none()));
+        assert_eq!(replay[0]["encrypted_content"], "opaque");
+        assert_eq!(replay[2]["call_id"], "call_1");
+        let mut stored = model.clone();
+        stored.extra_options.insert("store".into(), json!(true));
+        let replay = responses_input(&messages, &stored);
         assert_eq!(replay[0], output["output"][0]);
         assert_eq!(replay[1]["phase"], "commentary");
         assert_eq!(replay[1]["id"], "msg_1");

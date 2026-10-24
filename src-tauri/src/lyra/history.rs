@@ -55,12 +55,9 @@ impl History {
     }
 }
 
-/// provider 尚未返回 usage 时的保守估算：ASCII 约 4 字符/token，非 ASCII 约 1 字符/token。
+/// 兼容旧调用：默认 o200k BPE 文本计数；未知模型的实际 prompt 仍是估算。
 pub(crate) fn estimate_text_tokens(text: &str) -> u64 {
-    let (ascii, non_ascii) = text
-        .chars()
-        .fold((0_u64, 0_u64), |(a, n), ch| if ch.is_ascii() { (a + 1, n) } else { (a, n + 1) });
-    ascii.div_ceil(4).saturating_add(non_ascii)
+    crate::lyra::tokens::TokenCounter::default().count_text(text)
 }
 
 pub fn user_message(text: &str, images: &[Value]) -> Value {

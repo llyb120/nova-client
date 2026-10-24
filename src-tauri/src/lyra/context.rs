@@ -2,7 +2,8 @@
 //! 发给模型的是「投影」——被折叠的前缀换成一条 `<compaction-summary>` 用户消息，
 //! 其后接规范历史未覆盖的尾部。投影与账本另存 `<id>.context.json`，校验失败即回退规范历史。
 
-use crate::lyra::history::{estimate_text_tokens, now_ms, text_content};
+use crate::lyra::history::{now_ms, text_content, History};
+use crate::lyra::tokens::{TokenBreakdown, TokenCounter, IMAGE_TOKENS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -21,14 +22,14 @@ const PINNED_FIRST_USER_TOKENS: u64 = 1500;
 const PINNED_FIRST_USER_FRAC: f64 = 0.15;
 const KEPT_USER_TURNS_FRAC: f64 = 0.05;
 const PROTOCOL_RESERVE: u64 = 256;
+/// 输出预留最多占窗口的比例：max_output_tokens 接近窗口时仍给输入留出折叠空间。
+const MAX_OUTPUT_RESERVE_RATIO: f64 = 0.25;
 const MIN_FOLD_TOKENS: u64 = 100;
 const MIN_SUMMARY_SPAN: u64 = 4000;
 const SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const RECALL_RATIO: f64 = 0.10;
 const MIN_RECALL_TOKENS: u64 = 2000;
 const NOTICE_RUNGS: [f64; 2] = [0.75, 0.92];
-const IMAGE_TOKENS: u64 = 1200;
-const MESSAGE_OVERHEAD: u64 = 4;
 const MIN_PRUNE_BYTES: usize = 1024;
 
 const TAG_OPEN: &str = "<compaction-summary>";
@@ -105,6 +106,9 @@ struct State {
     projection: Option<Projection>,
     /// provider 实测 prompt tokens / 本地估算，校准后续估算。
     calibration: f64,
+    /// 旧字符启发式/其它模型的校准不能应用到当前 BPE 基线；不改变投影版本。
+    accounting_key: String,
+    last_actual_usage: Option<Value>,
     notice_rung: usize,
     recall_spent: u64,
     last_receipt: Option<Receipt>,
@@ -118,8 +122,12 @@ pub fn context_path(root: &Path, session_id: &str) -> PathBuf {
 
 pub struct ContextWindow {
     window: u64,
-    /// 系统提示词 + 工具定义的估算 token，计入每次请求。
-    overhead: u64,
+    counter: TokenCounter,
+    fixed: TokenBreakdown,
+    reserved_output: u64,
+    completed_before: usize,
+    strip_reasoning: bool,
+    accounting_key: String,
     path: Option<PathBuf>,
     state: State,
 }
@@ -133,12 +141,45 @@ impl ContextWindow {
             .and_then(|text| serde_json::from_str::<State>(&text).ok())
             .filter(|state| state.version == STATE_VERSION)
             .unwrap_or_default();
-        Self { window, overhead, path: Some(path), state }
+        Self { path: Some(path), state, ..Self::ephemeral(window, overhead) }
     }
 
-    /// 子 agent 用：只在内存里。
+    /// 子 agent 用：只在内存里；旧调用的合计开销仍有效，但无法拆为 system/tools。
     pub fn ephemeral(window: u64, overhead: u64) -> Self {
-        Self { window, overhead, path: None, state: State::default() }
+        let counter = TokenCounter::default();
+        let fixed = TokenBreakdown { overhead, ..TokenBreakdown::default() };
+        let accounting_key = hash_values(&[counter.metadata(), json!(false)]);
+        Self { window, counter, fixed, reserved_output: 0, completed_before: 0, strip_reasoning: false, accounting_key, path: None, state: State::default() }
+    }
+
+    /// tools 应传实际工具定义 JSON，而非已编码的 JSON 字符串。替代旧 overhead，不重复累计。
+    pub fn configure_tokens(&mut self, counter: TokenCounter, system: &str, tools: &Value, reserved_output: u64) {
+        self.fixed = TokenBreakdown {
+            system: counter.count_text(system),
+            tools: if tools.is_null() || tools.as_array().is_some_and(Vec::is_empty) { 0 } else { counter.count_json(tools) },
+            overhead: if system.is_empty() { 3 } else { 7 }, // 回复前缀 + system 消息封装，仍是估算。
+            ..TokenBreakdown::default()
+        };
+        self.accounting_key = hash_values(&[counter.metadata(), json!(self.strip_reasoning)]);
+        self.counter = counter;
+        self.reserved_output = reserved_output;
+    }
+
+    /// 每轮折叠检查前设置；completed_before 是规范历史下标，不是投影后的下标。
+    pub fn set_prompt_policy(&mut self, completed_before: usize, strip_reasoning: bool) {
+        self.completed_before = completed_before;
+        self.strip_reasoning = strip_reasoning;
+        self.accounting_key = hash_values(&[self.counter.metadata(), json!(strip_reasoning)]);
+    }
+
+    fn normalize_prompt(&self, messages: &[Value], completed_before: usize) -> Vec<Value> {
+        coalesce_user_runs(History::for_prompt(messages, completed_before, self.strip_reasoning))
+    }
+
+    /// 折叠预算与实际发送共用此视图；record_usage 必须接收该请求的同一份 messages。
+    pub fn prompt_view(&self, canonical: &[Value]) -> Vec<Value> {
+        let completed = self.view_index(canonical, self.completed_before).unwrap_or(0);
+        self.normalize_prompt(&self.view(canonical), completed)
     }
 
     fn save(&mut self) {
@@ -155,8 +196,12 @@ impl ContextWindow {
         self.window
     }
 
+    pub fn set_window(&mut self, window: u64) {
+        self.window = window;
+    }
+
     pub fn overhead(&self) -> u64 {
-        self.overhead
+        self.fixed.total()
     }
 
     pub fn generation(&self) -> u64 {
@@ -164,7 +209,9 @@ impl ContextWindow {
     }
 
     fn calibration(&self) -> f64 {
-        if self.state.calibration > 0.0 { self.state.calibration } else { 1.0 }
+        if self.state.accounting_key == self.accounting_key && (0.2..5.0).contains(&self.state.calibration) {
+            self.state.calibration
+        } else { 1.0 }
     }
 
     fn scaled(&self, fixed: u64) -> u64 {
@@ -172,36 +219,71 @@ impl ContextWindow {
     }
 
     fn text_tokens(&self, text: &str) -> u64 {
-        self.scaled(estimate_text_tokens(text))
+        self.scaled(self.counter.count_text(text))
     }
 
-    /// 这些消息作为一次请求的估算 prompt tokens（含系统提示与工具定义）。
+    /// 已规范化请求的原始 BPE 分项 + 图像/协议估算；不含校准或预留输出。
+    pub fn token_breakdown(&self, messages: &[Value]) -> TokenBreakdown {
+        let mut parts = self.counter.count_messages(messages);
+        parts.system += self.fixed.system;
+        parts.tools += self.fixed.tools;
+        parts.overhead += self.fixed.overhead;
+        parts
+    }
+
+    /// 已规范化 messages 作为一次请求的估算 prompt tokens（含系统提示与工具定义）。
     pub fn prompt_tokens(&self, messages: &[Value]) -> u64 {
-        self.scaled(self.overhead + fixed_tokens_all(messages))
+        self.scaled(self.token_breakdown(messages).total())
     }
 
     fn messages_tokens(&self, messages: &[Value]) -> u64 {
-        self.scaled(fixed_tokens_all(messages))
+        self.scaled(self.counter.count_messages(messages).total())
     }
 
-    /// 用 provider 实际计费的 prompt tokens 校准估算；比值离谱时忽略。
+    /// 保留旧接口。这里只收到 prompt 总数，不虚构 output/cache usage。
     pub fn calibrate(&mut self, sent: &[Value], prompt_tokens: u64) {
-        let fixed = self.overhead + fixed_tokens_all(sent);
-        if fixed == 0 || prompt_tokens == 0 {
-            return;
-        }
+        if prompt_tokens == 0 { return; }
+        let fixed = self.token_breakdown(sent).total();
         let ratio = prompt_tokens as f64 / fixed as f64;
-        if (0.2..5.0).contains(&ratio) {
+        let accepted = fixed > 0 && (0.2..5.0).contains(&ratio);
+        if accepted {
             self.state.calibration = ratio;
+            self.state.accounting_key = self.accounting_key.clone();
         }
+        self.state.last_actual_usage = Some(json!({
+            "promptTokens": prompt_tokens, "localUncalibratedPromptTokens": fixed,
+            "calibrationAccepted": accepted, "tokenizer": self.counter.metadata(), "at": now_ms()
+        }));
+        self.save();
+    }
+
+    /// 现有标准化 usage：input 不含 cacheRead/cacheWrite；reasoning 是 output 子集。
+    /// 空/全零 usage 不覆盖上次实测，不能以本地估算冒充 provider 实测。
+    pub fn record_usage(&mut self, sent: &[Value], usage: &Value) {
+        let n = |key: &str| usage[key].as_u64().unwrap_or(0);
+        let prompt = n("input").saturating_add(n("cacheRead")).saturating_add(n("cacheWrite"));
+        if prompt == 0 { return; }
+        self.calibrate(sent, prompt);
+        if let Some(last) = self.state.last_actual_usage.as_mut() {
+            last["usage"] = usage.clone();
+        }
+        self.save();
     }
 
     pub fn trigger_tokens(&self) -> u64 {
-        (self.window as f64 * COMPACT_RATIO) as u64
+        ((self.window as f64 * COMPACT_RATIO) as u64).min(self.hard_ceiling())
+    }
+
+    fn output_reserve(&self) -> u64 {
+        self.reserved_output.min((self.window as f64 * MAX_OUTPUT_RESERVE_RATIO) as u64)
     }
 
     fn hard_ceiling(&self) -> u64 {
-        self.window.saturating_sub(PROTOCOL_RESERVE)
+        self.window.saturating_sub(self.output_reserve()).saturating_sub(PROTOCOL_RESERVE)
+    }
+
+    fn input_budget_exhausted(&self) -> bool {
+        self.window > 0 && self.hard_ceiling() <= self.scaled(self.overhead())
     }
 
     fn tail_budget(&self) -> u64 {
@@ -244,16 +326,16 @@ impl ContextWindow {
     }
 
     pub fn should_compact(&self, canonical: &[Value]) -> bool {
-        self.window > 0 && self.prompt_tokens(&self.view(canonical)) >= self.trigger_tokens()
+        self.window > 0 && !self.input_budget_exhausted() && self.prompt_tokens(&self.prompt_view(canonical)) >= self.trigger_tokens()
     }
 
     /// 快到阈值时提醒模型收拢（75% / 92%，每代每档一次）。
     pub fn budget_notice(&mut self, canonical: &[Value]) -> Option<String> {
-        if self.window == 0 {
+        if self.window == 0 || self.input_budget_exhausted() {
             return None;
         }
         let trigger = self.trigger_tokens();
-        let used = self.prompt_tokens(&self.view(canonical));
+        let used = self.prompt_tokens(&self.prompt_view(canonical));
         let rung = NOTICE_RUNGS.iter().rposition(|r| used as f64 >= trigger as f64 * r)? + 1;
         if rung <= self.state.notice_rung {
             return None;
@@ -262,25 +344,42 @@ impl ContextWindow {
         self.save();
         let room = trigger.saturating_sub(used);
         Some(if rung == 1 {
-            format!("<context-budget>\nAbout {room} tokens of room remain before this conversation is automatically compacted ({used} used of a {} -token window; the fold triggers at {trigger}).\nCompaction folds earlier assistant and tool messages into a summary. The user's own turns stay verbatim, but anything you are holding only in your own earlier replies — exact paths, line numbers, a half-finished plan — survives only if you restate it or put it in the todo list.\nWork narrower from here: scope searches, read ranges rather than whole files, and do not start work whose output you cannot finish reading. Call context_budget when you need the current figure.\n</context-budget>", self.window)
+            format!("<context-budget>\nAbout {room} tokens of room remain before this conversation is automatically compacted ({used} used of a {} -token window; the fold triggers at {trigger}).\nCompaction folds earlier assistant and tool messages into a summary. Selected user turns stay verbatim within the retention budget; other turns may be summarized. Anything you are holding only in your own earlier replies — exact paths, line numbers, a half-finished plan — survives only if you restate it or put it in the todo list.\nWork narrower from here: scope searches, read ranges rather than whole files, and do not start work whose output you cannot finish reading. Call context_budget when you need the current figure.\n</context-budget>", self.window)
         } else {
             format!("<context-budget>\nAbout {room} tokens of room remain before this conversation is automatically compacted.\nLand what you know now: state the current result, the exact next step, and any path, identifier, or number the summary would otherwise have to carry for you.\n</context-budget>")
         })
     }
 
-    /// `context_budget` 工具的回答。
+    /// `context_budget` 工具的回答：分项保持原始口径，校准差额单列，不能把总量称为精确。
     pub fn budget_report(&self, canonical: &[Value]) -> String {
-        if self.window == 0 {
-            return "This model declares no context window, so automatic compaction is off.".into();
-        }
-        let used = self.prompt_tokens(&self.view(canonical));
+        let parts = self.token_breakdown(&self.prompt_view(canonical));
+        let raw = parts.total();
+        let used = self.scaled(raw);
         let trigger = self.trigger_tokens();
-        format!(
-            "About {} tokens of room remain before automatic compaction ({used} used of a {}-token window; the fold triggers at {trigger}; {} folds so far).",
-            trigger.saturating_sub(used),
-            self.window,
-            self.state.generation
-        )
+        let recall_budget = MIN_RECALL_TOKENS.max((self.window as f64 * RECALL_RATIO) as u64);
+        let report = json!({
+            "tokenizer": self.counter.metadata(),
+            "contextWindow": self.window,
+            "automaticCompaction": self.window > 0 && !self.input_budget_exhausted(),
+            "inputBudgetExhausted": self.input_budget_exhausted(),
+            "promptNormalization": { "completedBefore": self.completed_before, "stripReasoning": self.strip_reasoning },
+            "foldTrigger": trigger,
+            "remainingBeforeCompaction": if self.window > 0 { Some(trigger.saturating_sub(used)) } else { None },
+            "breakdown": parts,
+            "uncalibratedPromptTokens": raw,
+            "calibrationFactor": self.calibration(),
+            "calibrationAdjustment": used as i128 - raw as i128,
+            "estimatedPromptTokens": used,
+            "reservedOutputTokens": self.output_reserve(),
+            "protocolReserveTokens": PROTOCOL_RESERVE,
+            "estimatedTotalWithReserves": used.saturating_add(self.output_reserve()).saturating_add(PROTOCOL_RESERVE),
+            "remainingContextAfterReserves": if self.window > 0 { Some(self.hard_ceiling().saturating_sub(used)) } else { None },
+            "folds": self.state.generation,
+            "recall": { "budget": recall_budget, "spent": self.state.recall_spent, "remaining": recall_budget.saturating_sub(self.state.recall_spent) },
+            "lastActualUsage": self.state.last_actual_usage,
+            "notes": format!("Breakdown fields are uncalibrated and additive (messageCount/imageCount/unknownPartCount are counts). Images ({IMAGE_TOKENS} each, including candidate screenshot paths), protocol overhead, reasoning replay and unknown content are estimates; final provider serialization may differ. JSON BPE is not the server's model-input serialization. Legacy constructors leave system/tools unsplit in overhead until configured. Last actual usage belongs to its previous request, not necessarily this projection. No declared window disables automatic compaction; exhausted input budget means the fixed system prompt/tools fill the window."),
+        });
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
     }
 
     fn receipt(&self, status: &str, trigger: Trigger, reason: impl Into<String>) -> Receipt {
@@ -309,6 +408,10 @@ impl ContextWindow {
         if self.window == 0 {
             return Ok(self.receipt("noop", trigger, "no context window declared"));
         }
+        // 溢出恢复不看本地预算：provider 已拒绝，只能尽量折叠。
+        if self.input_budget_exhausted() && trigger != Trigger::Overflow {
+            return Ok(self.receipt("rejected", trigger, "fixed system prompt/tools exhaust the context window"));
+        }
         let (body_len, prior_covered, projected) = match self.valid_projection(canonical) {
             Some(p) => (p.messages.len(), p.covered_count, true),
             None => (0, 0, false),
@@ -320,7 +423,8 @@ impl ContextWindow {
                 return Ok(self.receipt("noop", trigger, "view unchanged since the last fold"));
             }
         }
-        let source = self.prompt_tokens(&visible);
+        let completed = self.view_index(canonical, self.completed_before).unwrap_or(0);
+        let source = self.prompt_tokens(&self.normalize_prompt(&visible, completed));
         if trigger == Trigger::Auto && source < self.trigger_tokens() {
             return Ok(self.receipt("noop", trigger, "below trigger"));
         }
@@ -350,7 +454,7 @@ impl ContextWindow {
                 fold.push(message.clone());
             }
         }
-        if fold.is_empty() || fixed_tokens_all(&fold) < MIN_FOLD_TOKENS {
+        if fold.is_empty() || self.messages_tokens(&fold) < MIN_FOLD_TOKENS {
             return Ok(self.receipt("noop", trigger, "fold too small to be worth a summary"));
         }
         let (fold, prior_index) = strip_fold_index(&fold);
@@ -363,7 +467,8 @@ impl ContextWindow {
             }
         };
         let entries = build_fold_index(region, &keep, origin);
-        if self.overhead + self.messages_tokens(&visible[..head]) >= self.trigger_tokens() {
+        let fixed_prefix = self.prompt_tokens(&self.normalize_prompt(&visible[..head], completed));
+        if fixed_prefix >= self.trigger_tokens() {
             return Ok(self.receipt("noop", trigger, "fixed prefix alone exceeds the trigger"));
         }
 
@@ -396,8 +501,8 @@ impl ContextWindow {
         let covered = prior_covered + start.saturating_sub(body_len);
         let mut candidate = body.clone();
         candidate.extend_from_slice(&canonical[covered..]);
-        let result = self.prompt_tokens(&candidate);
-        let fixed_prefix = self.overhead + self.messages_tokens(&visible[..head]);
+        let completed = self.completed_before.checked_sub(covered).map_or(0, |i| body.len() + i);
+        let result = self.prompt_tokens(&self.normalize_prompt(&candidate, completed));
         if let Err(reason) = self.accept(result, source, fixed_prefix, trigger == Trigger::Manual, must_free) {
             let mut receipt = self.receipt("rejected", trigger, reason);
             receipt.input_hash = input_hash;
@@ -460,7 +565,7 @@ impl ContextWindow {
             PINNED_FIRST_USER_TOKENS
         };
         match messages.first() {
-            Some(m) if role(m) == "user" && !is_summary(m) && fixed_tokens(m) <= limit => 1,
+            Some(m) if role(m) == "user" && !is_summary(m) && self.messages_tokens(std::slice::from_ref(m)) <= limit => 1,
             _ => 0,
         }
     }
@@ -470,7 +575,7 @@ impl ContextWindow {
         let mut start = messages.len();
         let mut acc = 0;
         while start > head {
-            let cost = self.scaled(fixed_tokens(&messages[start - 1]));
+            let cost = self.messages_tokens(&messages[start - 1..start]);
             if acc + cost > budget && messages.len() - start >= MIN_RECENT_KEEP {
                 break;
             }
@@ -502,7 +607,7 @@ impl ContextWindow {
             if keep[i] || role(m) != "user" || is_summary(m) {
                 continue;
             }
-            let cost = fixed_tokens(m);
+            let cost = self.messages_tokens(std::slice::from_ref(m));
             if spent + cost <= budget {
                 spent += cost;
                 keep[i] = true;
@@ -744,32 +849,6 @@ fn is_error_result(m: &Value) -> bool {
 fn has_keep_marker(m: &Value) -> bool {
     let text = text_content(&m["content"]).to_lowercase();
     ["[[keep]]", "[keep]", "<keep>", "<!-- keep -->"].iter().any(|marker| text.contains(marker))
-}
-
-/// 不校准的固定估算：正文 + 工具名与参数（不计 reasoning），图片按固定成本。
-fn fixed_tokens(m: &Value) -> u64 {
-    let content = &m["content"];
-    let body: u64 = match content {
-        Value::String(text) => estimate_text_tokens(text),
-        Value::Array(parts) => parts
-            .iter()
-            .map(|p| match p.get("type").and_then(Value::as_str) {
-                Some("text") => estimate_text_tokens(p.get("text").and_then(Value::as_str).unwrap_or_default()),
-                Some("toolCall") => {
-                    estimate_text_tokens(p.get("name").and_then(Value::as_str).unwrap_or_default())
-                        + estimate_text_tokens(&p.get("arguments").map(Value::to_string).unwrap_or_default())
-                }
-                Some("image") => IMAGE_TOKENS,
-                _ => 0,
-            })
-            .sum(),
-        _ => 0,
-    };
-    body + MESSAGE_OVERHEAD
-}
-
-fn fixed_tokens_all(messages: &[Value]) -> u64 {
-    messages.iter().map(fixed_tokens).sum()
 }
 
 /// 前缀内所有工具调用都已有结果的最长长度。
@@ -1193,12 +1272,125 @@ mod tests {
         json!({ "role": "toolResult", "toolCallId": id, "toolName": name, "content": [{ "type": "text", "text": text }], "isError": error })
     }
 
+    #[test]
+    fn bpe_budget_matches_text_tools_and_actual_usage() {
+        use crate::lyra::history::estimate_text_tokens;
+        fn thread_safe<T: Send + Sync>() {}
+        thread_safe::<TokenCounter>();
+        let text = "Hello, world! 中文代码：fn main() { println!(\"你好\"); } <|endoftext|>";
+        let args = json!({ "path": "src/中文.rs", "content": text });
+        let tools = json!([{ "name": "write", "description": "写代码", "parameters": {
+            "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }
+        }}]);
+        let messages = vec![user(text), call("c1", "write", args.clone()), result("c1", "write", "完成 done", false),
+            json!({ "role": "user", "content": [{ "type": "image", "data": "not-tokenized-as-base64" }] })];
+        for encoding in ["o200k_base", "cl100k_base"] {
+            let counter = TokenCounter::for_model("gpt-4o", "openai-responses", Some(encoding)).unwrap();
+            let bpe = if encoding == "o200k_base" { tiktoken_rs::o200k_base_singleton() } else { tiktoken_rs::cl100k_base_singleton() };
+            assert_eq!(counter.count_text("Hello, world!"), 4);
+            assert_eq!(counter.count_text(text), bpe.encode_ordinary(text).len() as u64);
+            assert_eq!(counter.count_text(""), 0);
+            assert_eq!(counter.count_json(&args), bpe.encode_ordinary(&args.to_string()).len() as u64);
+            let mut ctx = ContextWindow::ephemeral(4096, 999);
+            ctx.configure_tokens(counter.clone(), "系统 system", &tools, 512);
+            let parts = ctx.token_breakdown(&messages);
+            assert_eq!(parts.system, counter.count_text("系统 system"));
+            assert_eq!(parts.tools, counter.count_json(&tools));
+            assert_eq!(parts.messages_text, counter.count_text(text));
+            assert_eq!(parts.tool_arguments, counter.count_json(&args));
+            assert_eq!(parts.tool_results, counter.count_text("完成 done"));
+            assert_eq!(parts.images, IMAGE_TOKENS);
+            assert_eq!(parts.image_count, 1);
+            assert_eq!(parts.message_count, 4);
+            let raw = parts.total();
+            assert_eq!(ctx.prompt_tokens(&messages), raw);
+            let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
+            assert_eq!(report["uncalibratedPromptTokens"], raw);
+            assert_eq!(report["estimatedTotalWithReserves"], raw + 512 + PROTOCOL_RESERVE);
+            assert_eq!(report["foldTrigger"], 3328);
+            assert_eq!(report["tokenizer"]["promptExact"], false);
+            assert!(report["lastActualUsage"].is_null());
+            // 旧账本兼容且不误用字符估算时代的校准；usage 中 cache 只计入 prompt 一次。
+            ctx.state = serde_json::from_value(json!({ "version": 1, "calibration": 4.0, "recallSpent": 7 })).unwrap();
+            assert_eq!(ctx.prompt_tokens(&messages), raw);
+            ctx.record_usage(&messages, &json!({ "input": raw - 30, "cacheRead": 20, "cacheWrite": 10, "output": 8, "reasoning": 3 }));
+            let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
+            assert_eq!(report["lastActualUsage"]["promptTokens"], raw);
+            assert_eq!(report["lastActualUsage"]["usage"]["reasoning"], 3);
+            assert_eq!(report["recall"]["spent"], 7);
+            ctx.state = serde_json::from_str(&serde_json::to_string(&ctx.state).unwrap()).unwrap();
+            ctx.calibrate(&messages, raw * 2);
+            assert_eq!(ctx.prompt_tokens(&messages), raw * 2);
+            let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
+            assert_eq!(report["calibrationAdjustment"], raw);
+            assert_eq!(report["breakdown"]["messagesText"], counter.count_text(text));
+            ctx.configure_tokens(TokenCounter::default(), "different system", &Value::Null, 512);
+            assert_eq!(ctx.calibration(), 1.0);
+        }
+        let mut screenshots = result("c1", "chrome", "page", false);
+        screenshots["details"] = json!({ "images": [{ "path": "/does/not/need/to/exist.png" }, { "imageId": "repeat-without-image" }] });
+        let parts = TokenCounter::default().count_messages(&[screenshots]);
+        assert_eq!((parts.image_count, parts.images), (1, IMAGE_TOKENS));
+        assert_eq!(estimate_text_tokens(text), tiktoken_rs::o200k_base_singleton().encode_ordinary(text).len() as u64);
+        assert_eq!(TokenCounter::for_model("gpt-4", "openai-completions", None).unwrap().metadata()["encoding"], "cl100k_base");
+        assert_eq!(TokenCounter::for_model("gpt-5.2", "openai-responses", None).unwrap().metadata()["encoding"], "o200k_base");
+        for model in ["claude-sonnet-4", "unknown-deployment"] {
+            let counter = TokenCounter::for_model(model, "openai-completions", Some("o200k_base")).unwrap();
+            assert_eq!(counter.metadata()["modelTokenizerKnown"], false);
+        }
+        assert_eq!(TokenCounter::for_model("gpt-4o", "anthropic-messages", None).unwrap().metadata()["source"], "fallback");
+        assert!(TokenCounter::for_model("gpt-4o", "openai-responses", Some("bogus")).is_err());
+        let alias = TokenCounter::for_model("gpt-4o-private-deployment", "openai-responses", None).unwrap().metadata();
+        assert_eq!(alias["source"], "inferred");
+        assert_eq!(alias["modelTokenizerKnown"], false);
+        let unknown_media = |data: &str| json!({ "role": "user", "content": [{ "type": "input_audio", "data": data }] });
+        let counter = TokenCounter::default();
+        assert_eq!(counter.count_messages(&[unknown_media("tiny")]).total(), counter.count_messages(&[unknown_media(&"abc".repeat(10000))]).total());
+        assert_eq!(counter.count_messages(&[unknown_media("data")]).unknown_part_count, 1);
+        // 折叠预算与校准基线必须是同一份去 reasoning/修复配对/合并 user 后的视图。
+        let canonical = vec![user("old"), json!({ "role": "assistant", "content": [
+            { "type": "thinking", "thinking": "private reasoning" }, { "type": "text", "text": "answer" }
+        ] }), user("next"), user("steer")];
+        let mut ctx = ContextWindow::ephemeral(4096, 0);
+        ctx.configure_tokens(counter, "system", &Value::Null, 512);
+        ctx.set_prompt_policy(2, true);
+        let sent = ctx.prompt_view(&canonical);
+        assert_eq!(sent, coalesce_user_runs(History::for_prompt(&canonical, 2, true)));
+        assert_eq!(ctx.token_breakdown(&sent).reasoning, 0);
+        assert_eq!(sent.len(), 3);
+        let raw = ctx.prompt_tokens(&sent);
+        ctx.record_usage(&sent, &json!({ "input": raw - 3, "cacheRead": 2, "cacheWrite": 1, "output": 9, "reasoning": 5 }));
+        let report: Value = serde_json::from_str(&ctx.budget_report(&canonical)).unwrap();
+        assert_eq!(report["uncalibratedPromptTokens"], raw);
+        assert_eq!(report["lastActualUsage"]["localUncalibratedPromptTokens"], raw);
+        assert_eq!(report["calibrationFactor"], 1.0);
+        // 系统提示变化不使校准作废；只有词表/去 reasoning 策略变化才作废。
+        ctx.calibrate(&sent, raw * 2);
+        ctx.configure_tokens(TokenCounter::default(), "system prompt changed: 2030-01-01 /tmp", &Value::Null, 512);
+        assert_eq!(ctx.calibration(), ctx.state.calibration);
+        assert!(ctx.calibration() > 1.0);
+        ctx.state.calibration = 1.0;
+        // 输出预留封顶为窗口的一定比例：max_output_tokens 接近窗口不应卡死自动折叠。
+        for reserved in [4096 - PROTOCOL_RESERVE, 8192, u64::MAX] {
+            ctx.configure_tokens(TokenCounter::default(), "system", &Value::Null, reserved);
+            assert_eq!(ctx.trigger_tokens(), 4096 - 1024 - PROTOCOL_RESERVE);
+            let report: Value = serde_json::from_str(&ctx.budget_report(&canonical)).unwrap();
+            assert_eq!(report["inputBudgetExhausted"], false);
+            assert_eq!(report["automaticCompaction"], true);
+            assert_eq!(report["reservedOutputTokens"], 1024);
+        }
+        // 只有固定提示本身占满窗口才算耗尽。
+        let exhausted = ContextWindow::ephemeral(4096, 4000);
+        assert!(exhausted.input_budget_exhausted() && !exhausted.should_compact(&canonical));
+    }
+
     #[tokio::test]
     async fn folds_into_projection_with_index_recall_and_reload() {
         let root = std::env::temp_dir().join(format!("lyra-context-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let filler = "x".repeat(6000);
+        // 真实 BPE 下仍超过触发线；有分词边界，避免长串重复字符的最坏性能。
+        let filler = "context line\n".repeat(500);
         let mut canonical = vec![user("fix the parser")];
         canonical.push(call("e1", "edit", json!({ "path": "src/parser.rs", "edits": [] })));
         canonical.push(result("e1", "edit", "ok", false));
@@ -1217,8 +1409,16 @@ mod tests {
         canonical.push(user("keep going"));
         canonical.push(json!({ "role": "assistant", "content": [{ "type": "text", "text": "done" }] }));
 
+        let mut exhausted = ContextWindow::ephemeral(4096, 4000);
+        let rejected = exhausted.compact(&canonical, None, Trigger::Manual, |_, _| async { panic!("must not summarize with no input budget") }).await.unwrap();
+        assert_eq!(rejected.status, "rejected");
+        // provider 已报溢出时仍要尝试折叠，不能因本地预算耗尽拒绝。
+        let overflow = exhausted.compact(&canonical, None, Trigger::Overflow, |_, _| async { Err("offline".to_string()) }).await.unwrap();
+        assert_ne!(overflow.reason, rejected.reason, "{overflow:?}");
         let mut ctx = ContextWindow::load(&root, "s", 20_000, 500);
+        ctx.set_prompt_policy(canonical.len() - 2, true);
         assert!(ctx.should_compact(&canonical));
+        let source_tokens = ctx.prompt_tokens(&ctx.prompt_view(&canonical));
         let receipt = ctx
             .compact(&canonical, Some(canonical.len() - 2), Trigger::Auto, |system, transcript| async move {
                 assert!(system.contains("## Pending & next step"));
@@ -1228,6 +1428,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receipt.status, "applied", "{receipt:?}");
+        assert_eq!(receipt.source_tokens, source_tokens);
+        assert_eq!(receipt.result_tokens, ctx.prompt_tokens(&ctx.prompt_view(&canonical)));
         let view = ctx.view(&canonical);
         assert!(view.len() < canonical.len());
         assert_eq!(view[0], canonical[0], "small first user turn stays pinned");

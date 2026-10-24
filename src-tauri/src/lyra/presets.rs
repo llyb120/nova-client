@@ -9,9 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[path = "local_provider.rs"]
 mod local_provider;
 
-/// 导入为普通 provider，后续由现有设置编辑/保存；不把本机配置引用写入可共享配置。
-async fn fetch_local_models(http: &reqwest::Client, provider: Value, catalog: &mut Option<Value>) -> Result<Map<String, Value>, String> {
-    let base = provider["options"]["baseURL"].as_str().unwrap_or("").trim_end_matches('/');
+/// 订阅凭据只进入官方请求；不能沿用调用方可能跟随重定向的通用客户端。
+fn local_models_request(http: &reqwest::Client, provider: &Value, env: &std::collections::HashMap<String, String>) -> Result<reqwest::RequestBuilder, String> {
+    let source = provider["localAuth"].as_str();
+    let base = match source {
+        Some(source) => super::local_auth::endpoint(source)?,
+        None => provider["options"]["baseURL"].as_str().unwrap_or(""),
+    }.trim_end_matches('/');
     let url = reqwest::Url::parse(base).map_err(|_| "本地 API 的 Base URL 无效")?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("本地 API 的 Base URL 必须使用 HTTP 或 HTTPS".into());
@@ -19,12 +23,17 @@ async fn fetch_local_models(http: &reqwest::Client, provider: Value, catalog: &m
     let anthropic = provider["api"] == "anthropic-messages";
     let models_url = if anthropic && !base.ends_with("/v1") { format!("{base}/v1/models") } else { format!("{base}/models") };
     let mut request = http.get(models_url).timeout(Duration::from_secs(30));
-    let key = provider["options"]["apiKey"].as_str().unwrap_or("");
+    if source == Some("codex") {
+        // ponytail: Codex 目录按 CLI 版本返回；上游变更契约时同步升级此版本及离线样例。
+        request = request.query(&[("client_version", "0.134.0")]);
+    }
+    let key = auth.as_ref().map(|a| a.key.as_str()).unwrap_or_else(|| provider["options"]["apiKey"].as_str().unwrap_or(""));
     if !key.is_empty() {
-        request = if anthropic { request.header("x-api-key", key) } else { request.bearer_auth(key) };
+        request = if anthropic && auth.is_none() { request.header("x-api-key", key) } else { request.bearer_auth(key) };
     }
     if anthropic { request = request.header("anthropic-version", "2023-06-01"); }
-    if let Some(headers) = provider["options"]["headers"].as_object() {
+    let headers = auth.as_ref().map(|a| &a.headers).or_else(|| provider["options"]["headers"].as_object());
+    if let Some(headers) = headers {
         for (name, value) in headers {
             if value.is_null() { continue; }
             let value = value.as_str().ok_or("本地 API 请求头必须是字符串")?;
@@ -33,25 +42,64 @@ async fn fetch_local_models(http: &reqwest::Client, provider: Value, catalog: &m
             request = request.header(name, value);
         }
     }
-    let list = async {
-        let mut entries = Vec::new();
-        let mut cursors = std::collections::HashSet::new();
-        let mut cursor = None;
-        loop {
-            let mut page = request.try_clone().ok_or("无法复制模型列表请求")?;
-            if let Some(cursor) = &cursor { page = page.query(&[("after_id", cursor)]); }
-            let page: Value = page.send().await.map_err(|_| "无法连接本地配置的模型 API")?
-                .error_for_status().map_err(|e| format!("模型 API 返回 {}", e.status().unwrap()))?
-                .json().await.map_err(|_| "模型 API 返回的 JSON 无效")?;
-            entries.extend(page["data"].as_array().ok_or("模型 API 缺少 data 列表")?.iter().cloned());
-            if page["has_more"] != true { break; }
-            let next = page["last_id"].as_str().filter(|id| !id.is_empty()).ok_or("模型列表分页缺少 last_id")?;
-            if !cursors.insert(next.to_string()) { return Err("模型列表分页游标重复".to_string()); }
-            cursor = Some(next.to_string());
+    Ok(request)
+}
+
+async fn local_model_pages(request: reqwest::RequestBuilder, codex: bool) -> Result<Value, String> {
+    let mut entries = Vec::new();
+    let mut cursors = std::collections::HashSet::new();
+    let mut cursor = None;
+    let mut remaining_bytes = 16_usize * 1024 * 1024;
+    let mut pages = 0;
+    loop {
+        if pages == 1000 { return Err("模型列表超过 1000 页上限".into()); }
+        pages += 1;
+        let mut page = request.try_clone().ok_or("无法复制模型列表请求")?;
+        if let Some(cursor) = &cursor { page = page.query(&[("after_id", cursor)]); }
+        let mut response = page.send().await.map_err(|_| "无法连接本地配置的模型 API")?;
+        // error_for_status 不拒绝 3xx；禁止把重定向或错误正文当目录，也不回显可能含凭据的 URL/正文。
+        if !response.status().is_success() { return Err(format!("模型 API 返回 {}", response.status())); }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| "无法读取模型 API 响应")? {
+            // 按解压后的实际字节累计，不能信任 Content-Length，也不能先 json()/bytes() 全量分配。
+            remaining_bytes = remaining_bytes.checked_sub(chunk.len()).ok_or("模型列表累计响应超过 16 MiB 上限")?;
+            body.extend_from_slice(&chunk);
         }
-        Ok::<_, String>(json!({ "data": entries }))
+        let page: Value = serde_json::from_slice(&body).map_err(|_| "模型 API 返回的 JSON 无效")?;
+        if codex {
+            for model in page["models"].as_array().ok_or("模型 API 缺少 models 列表")? {
+                if model["visibility"] == "hide" { continue; }
+                let mut entry = json!({ "id": model["slug"], "name": model["display_name"],
+                    "context_length": model["context_window"], "architecture": { "input_modalities": model["input_modalities"] } });
+                if let Some(levels) = model["supported_reasoning_levels"].as_array() {
+                    let efforts: Vec<&str> = levels.iter().filter_map(|level| level["effort"].as_str()).filter(|s| !s.trim().is_empty()).collect();
+                    entry["reasoning"] = json!(!efforts.is_empty());
+                    entry["reasoning_options"] = if efforts.is_empty() { json!([]) } else { json!([{ "type": "effort", "values": efforts }]) };
+                }
+                entries.push(entry);
+            }
+            break;
+        }
+        entries.extend(page["data"].as_array().ok_or("模型 API 缺少 data 列表")?.iter().cloned().map(|mut entry| {
+            if entry["name"].is_null() && entry["display_name"].is_string() { entry["name"] = entry["display_name"].clone(); }
+            entry
+        }));
+        if page["has_more"] != true { break; }
+        let next = page["last_id"].as_str().filter(|id| !id.is_empty()).ok_or("模型列表分页缺少 last_id")?;
+        if !cursors.insert(next.to_string()) { return Err("模型列表分页游标重复".to_string()); }
+        cursor = Some(next.to_string());
+    }
+    Ok(json!({ "data": entries }))
+}
+
+async fn fetch_local_models(http: &reqwest::Client, provider: Value, catalog: &mut Option<Value>, env: &std::collections::HashMap<String, String>) -> Result<Map<String, Value>, String> {
+    // 凭据读取是文件 IO/macOS 钥匙串（最长约 5s），不能阻塞 async 运行时。
+    let request = {
+        let (http, provider, env) = (http.clone(), provider.clone(), env.clone());
+        tokio::task::spawn_blocking(move || local_models_request(&http, &provider, &env)).await
+            .map_err(|_| "读取本地登录失败")??
     };
-    let (list, meta) = tokio::join!(list, async {
+    let (list, meta) = tokio::join!(local_model_pages(request, provider["localAuth"] == "codex"), async {
         if catalog.is_none() { get_json(http, "https://models.dev/api.json", "").await.ok() } else { None }
     });
     if let Some(meta) = meta { *catalog = Some(meta); }
@@ -59,10 +107,22 @@ async fn fetch_local_models(http: &reqwest::Client, provider: Value, catalog: &m
     Ok(convert_local(provider, "", &list?, catalog.as_ref())?["provider"]["models"].as_object().unwrap().clone())
 }
 
+fn claude_alias_family(id: &str) -> Option<&'static str> {
+    match id.strip_suffix("[1m]").unwrap_or(id) {
+        "sonnet" => Some("sonnet"),
+        "opus" | "opusplan" => Some("opus"),
+        "haiku" => Some("haiku"),
+        _ => None,
+    }
+}
+
 fn convert_local(mut provider: Value, selected: &str, list: &Value, catalog: Option<&Value>) -> Result<Value, String> {
     let explicit = provider["models"].as_object().cloned().unwrap_or_default();
+    let claude = provider["localAuth"] == "claude-code";
     let mut entries = list["data"].as_array().cloned().unwrap_or_default();
     for id in explicit.keys() {
+        // CLI alias 不是 API 模型 ID；只能由成功拉取的真实目录生成映射。
+        if claude && claude_alias_family(id).is_some() { continue; }
         if !entries.iter().any(|entry| entry["id"] == id.as_str()) { entries.push(json!({ "id": id })); }
     }
     let preset_id = PRESETS.iter().find(|p| provider["options"]["baseURL"].as_str()
@@ -75,6 +135,31 @@ fn convert_local(mut provider: Value, selected: &str, list: &Value, catalog: Opt
                     .and_then(|entry| entry["reasoning_options"].as_array())
                     .or_else(|| reasoning_catalog_model(catalog, id).and_then(|info| info["reasoning_options"].as_array())));
         }
+    }
+    let mut explicit = explicit;
+    if claude {
+        for (alias, local) in &mut explicit {
+            let Some(family) = claude_alias_family(alias) else { continue };
+            // /v1/models 的 created_at 决定新旧，不能从版本号/日期后缀猜测未发布的模型。
+            let latest = entries.iter().filter_map(|entry| {
+                let id = entry["id"].as_str()?;
+                if !id.starts_with("claude-") || !id.split('-').any(|part| part == family) || !models.contains_key(id) { return None; }
+                let created = chrono::DateTime::parse_from_rfc3339(entry["created_at"].as_str()?).ok()?;
+                Some((created, id))
+            }).max_by_key(|(created, _)| *created);
+            if let Some((_, id)) = latest {
+                let mut model = models[id].clone();
+                model["localModel"] = json!(format!("{id}{}", if alias.ends_with("[1m]") { "[1m]" } else { "" }));
+                if alias.ends_with("[1m]") {
+                    if !model["limit"].is_object() { model["limit"] = json!({}); }
+                    model["limit"]["context"] = json!(1_000_000);
+                }
+                models.insert(alias.clone(), model);
+            }
+            // 旧缓存或手写 localModel 不能覆盖本次目录产生的映射。
+            if let Some(local) = local.as_object_mut() { local.remove("localModel"); }
+        }
+        explicit.retain(|id, _| claude_alias_family(id).is_none() || models.contains_key(id));
     }
     merge_local_models(&mut models, &explicit);
     if models.is_empty() {
@@ -185,18 +270,36 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
     } else {
         local_provider::load(source, env)?.0
     };
+    let subscription = local["localAuth"].is_string();
     let mut options = local["options"].as_object().cloned().unwrap_or_default();
     let mut headers = options.get("headers").and_then(Value::as_object).cloned().unwrap_or_default();
     if let Some(explicit) = provider["options"].as_object() {
-        // Key 始终跟随本地认证；其余手写选项仍可覆盖默认值。
-        options.extend(explicit.iter().filter(|(key, _)| key.as_str() != "apiKey").map(|(k, v)| (k.clone(), v.clone())));
-        if let Some(explicit) = explicit.get("headers").and_then(Value::as_object) { headers.extend(explicit.clone()); }
+        // Key 始终跟随本地认证；订阅的官方地址/请求头也只能来自 load。
+        options.extend(explicit.iter().filter(|(key, _)| key.as_str() != "apiKey"
+            && !(subscription && matches!(key.as_str(), "baseURL" | "baseUrl" | "headers"))).map(|(k, v)| (k.clone(), v.clone())));
+        if !subscription {
+            if let Some(explicit) = explicit.get("headers").and_then(Value::as_object) { headers.extend(explicit.clone()); }
+        }
     }
     options.insert("headers".into(), json!(headers));
     let models = local["models"].clone();
-    if let Some(explicit) = provider.as_object() { local.as_object_mut().unwrap().extend(explicit.clone()); }
+    if let Some(explicit) = provider.as_object() {
+        // localAuth 必须由本次 load 决定；切回自定义 API 时丢弃旧标记，不能带着订阅 token 直连。
+        local.as_object_mut().unwrap().extend(explicit.iter().filter(|(key, _)| key.as_str() != "localAuth"
+            && !(subscription && key.as_str() == "api")).map(|(k, v)| (k.clone(), v.clone())));
+    }
     local["options"] = json!(options);
     local["models"] = json!(models);
+    if local["localAuth"] == "claude-code" {
+        // 手写 alias 也需要目录映射，但不导入其它旧缓存模型作为显式模型。
+        if let Some(explicit) = provider["models"].as_object() {
+            let aliases = explicit.iter().filter(|(id, _)| claude_alias_family(id).is_some()).map(|(id, model)| (id.clone(), model.clone())).collect();
+            merge_local_models(local["models"].as_object_mut().unwrap(), &aliases);
+        }
+        for model in local["models"].as_object_mut().unwrap().values_mut() {
+            if let Some(model) = model.as_object_mut() { model.remove("localModel"); }
+        }
+    }
     if matches!(source, "devin" | "codebuddy") { local["api"] = json!(source); }
     if source == "workbuddy" { local["api"] = json!("codebuddy"); }
     super::config::resolve_config_env(&local, env)
@@ -237,9 +340,19 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
                 Ok(mut local) => {
                     let mut models = cache[id.as_str()]["models"].as_object().cloned().unwrap_or_default();
                     merge_local_models(&mut models, local["models"].as_object().unwrap());
-                    if matches!(source, "devin" | "codebuddy" | "workbuddy") {
+                    if local["localAuth"] == "claude-code" {
+                        let mut explicit = explicit;
+                        for (id, model) in &mut explicit {
+                            if claude_alias_family(id).is_some() {
+                                if let Some(model) = model.as_object_mut() { model.remove("localModel"); }
+                            }
+                        }
                         merge_local_models(&mut models, &explicit);
-                    } else { models.extend(explicit); }
+                        // 未获取目录的 alias 保留选择，但没有 localModel；stream 必须拒绝而非发送 alias。
+                    } else {
+                        // 迁移项只声明原模型/档位；不能用这个稀疏定义抹掉目录中的模态和限额。
+                        merge_local_models(&mut models, &explicit);
+                    }
                     local["models"] = json!(models);
                     *provider = local;
                 }
@@ -272,6 +385,12 @@ fn fingerprint(parts: &[&str]) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     parts.hash(&mut hasher);
     format!("{:x}", hasher.finish())
+}
+
+fn local_auth_fingerprint(source: &str, env: &std::collections::HashMap<String, String>) -> Result<String, String> {
+    let auth = super::local_auth::credentials(source, env)?;
+    // 仅哈希进入缓存指纹；账号 routing headers 或登录 token 变化都必须使 TTL 失效。
+    Ok(fingerprint(&[&auth.key, &json!(auth.headers).to_string()]))
 }
 
 /// 拉取过期（超过 TTL 或 Base URL/Key 变化）的预设 provider 模型列表并写回缓存，失败保留旧缓存。
@@ -311,7 +430,20 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         // 转换规则升级：旧缓存缺少模型私有参数，不能继续沿用六小时。
         let headers = provider["options"]["headers"].to_string();
         let local_models = if local_source(preset.id).is_some() { provider["models"].to_string() } else { String::new() };
-        let print = fingerprint(&["9", preset.id, &base_url, &api_key, &headers, &local_models, provider["api"].as_str().unwrap_or("")]);
+        let auth_print = if let Some(source) = provider["localAuth"].as_str() {
+            let (source, env) = (source.to_string(), env.clone());
+            match tokio::task::spawn_blocking(move || local_auth_fingerprint(&source, &env)).await
+                .unwrap_or_else(|_| Err("读取本地登录失败".into())) {
+                Ok(print) => print,
+                Err(error) => {
+                    if force { errors.push(format!("{id}：{error}")); }
+                    else { eprintln!("[lyra] {id}：{error}"); }
+                    continue; // 登录失效仍保留旧目录，但不能以 TTL 新鲜为由跳过认证检查。
+                }
+            }
+        } else { String::new() };
+        let print = fingerprint(&["10", preset.id, &base_url, &api_key, &headers, &local_models,
+            provider["api"].as_str().unwrap_or(""), provider["localAuth"].as_str().unwrap_or(""), &auth_print]);
         if !force && cache_fresh(&cache[id.as_str()], &print, now) {
             continue;
         }
@@ -328,7 +460,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         } else if matches!(preset.id, "codebuddy" | "workbuddy") {
             super::codebuddy_provider::models(&provider["options"], force).await
         } else if local_source(preset.id).is_some() && preset.id != "server-support" {
-            fetch_local_models(http, provider.clone(), &mut models_dev).await
+            fetch_local_models(http, provider.clone(), &mut models_dev, &env).await
         } else {
             fetch_models(http, preset, &base_url, &api_key, &mut models_dev).await
         };
@@ -704,6 +836,274 @@ pub(crate) fn cache_mtime(nova_root: &Path) -> Option<SystemTime> {
 mod tests {
     use super::*;
 
+    fn subscription_env(source: &str, root: &Path) -> std::collections::HashMap<String, String> {
+        let variable = if source == "codex" {
+            use base64::Engine as _;
+            let expires = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+            let token = format!("e30.{}.subscription-secret", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json!({"exp":expires}).to_string()));
+            std::fs::write(root.join("auth.json"), json!({"tokens": {
+                "access_token": token, "account_id": "private-account"
+            }}).to_string()).unwrap();
+            "CODEX_HOME"
+        } else {
+            std::fs::write(root.join("settings.json"), json!({"env": {
+                "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-subscription-secret"
+            }}).to_string()).unwrap();
+            "CLAUDE_CONFIG_DIR"
+        };
+        std::collections::HashMap::from([(variable.into(), root.to_string_lossy().into_owned())])
+    }
+
+    #[test]
+    fn subscription_merge_pins_transport_and_drops_stale_auth_for_direct_apis() {
+        for source in ["codex", "claude-code"] {
+            let dir = tempfile::tempdir().unwrap();
+            let cli = dir.path().join("cli");
+            std::fs::create_dir(&cli).unwrap();
+            let env = subscription_env(source, &cli);
+            let mut raw = json!({"preset":format!("local-{source}"),"localAuth":"untrusted","api":"openai-completions",
+                "options":{"baseURL":"https://untrusted.invalid","baseUrl":"https://alias.invalid", "apiKey":"stale-key",
+                    "headers":{"Authorization":"Bearer stale-key","Host":"untrusted.invalid"},"temperature":0.5},
+                "models":{"sonnet":{"localModel":"untrusted-model","options":{"reasoningEffort":"high"}}}});
+            {
+                let local = resolve_local(&raw, source, &env, dir.path()).unwrap();
+                assert_eq!(local["localAuth"], source);
+                assert_eq!(local["api"], if source == "codex" { "openai-responses" } else { "anthropic-messages" });
+                assert_eq!(local["options"]["baseURL"], super::super::local_auth::endpoint(source).unwrap());
+                assert!(local["options"]["baseUrl"].is_null());
+                assert_eq!(local["options"]["apiKey"], "");
+                assert_eq!(local["options"]["headers"], json!({}));
+                assert_eq!(local["options"]["temperature"], 0.5);
+                assert!(local["options"]["proxy"].is_null(), "Lyra 跟随系统代理，不再固化代理");
+                assert!(local["models"]["sonnet"]["localModel"].is_null());
+                assert!(!local.to_string().contains("subscription-secret"));
+            }
+            if source == "codex" {
+                std::fs::write(cli.join("config.toml"), "[model_providers.openai]\nbase_url='http://127.0.0.1:1234/v1'\n").unwrap();
+            } else {
+                std::fs::write(cli.join("settings.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:1234","ANTHROPIC_API_KEY":"direct-key"}}"#).unwrap();
+            }
+            raw["localAuth"] = json!(source);
+            let direct = resolve_local(&raw, source, &env, dir.path()).unwrap();
+            assert!(direct.get("localAuth").is_none(), "切换到直连不得保留订阅标记");
+            assert_eq!(direct["api"], "openai-completions");
+            assert_eq!(direct["options"]["baseURL"], "https://untrusted.invalid");
+            assert_eq!(direct["options"]["headers"]["Host"], "untrusted.invalid");
+            assert_ne!(direct["options"]["apiKey"], "stale-key");
+        }
+    }
+
+    // 先构造生产请求并核对官方 pin，然后仅在测试中改为 loopback；保留生产客户端的代理/redirect 策略。
+    fn mock_subscription_request(provider: &Value, env: &std::collections::HashMap<String, String>, address: std::net::SocketAddr) -> reqwest::RequestBuilder {
+        let mut untrusted = provider.clone();
+        untrusted["api"] = json!("openai-completions");
+        untrusted["options"]["baseURL"] = json!("https://untrusted.invalid");
+        untrusted["options"]["apiKey"] = json!("stale-key");
+        untrusted["options"]["headers"] = json!({"Host":"untrusted.invalid","Authorization":"Bearer stale-key"});
+        let (client, request) = local_models_request(&reqwest::Client::new(), &untrusted, env).unwrap().build_split();
+        let mut request = request.unwrap();
+        let expected = if provider["localAuth"] == "codex" { "https://chatgpt.com/backend-api/codex/models?client_version=0.134.0" }
+            else { "https://api.anthropic.com/v1/models" };
+        assert_eq!(request.url().as_str(), expected);
+        let mut url = reqwest::Url::parse(&format!("http://{address}")).unwrap();
+        url.set_path(request.url().path());
+        url.set_query(request.url().query());
+        *request.url_mut() = url;
+        reqwest::RequestBuilder::from_parts(client, request)
+    }
+
+    #[tokio::test]
+    async fn subscription_catalogs_use_bearer_headers_pagination_and_never_leak_or_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for source in ["codex", "claude-code"] {
+            let dir = tempfile::tempdir().unwrap();
+            let env = subscription_env(source, dir.path());
+            let provider = resolve_local(&json!({}), source, &env, dir.path()).unwrap();
+            let credentials = super::super::local_auth::credentials(source, &env).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let codex = source == "codex";
+            let server = tokio::spawn(async move {
+                let pages = if codex { vec![json!({"models":[
+                    {"slug":"gpt-test","display_name":"GPT Test","context_window":272000,
+                        "supported_reasoning_levels":[{"effort":"low"},{"effort":"xhigh"}],"input_modalities":["text","image"],"visibility":"list"},
+                    {"slug":"no-thinking","supported_reasoning_levels":[],"visibility":"list"},
+                    {"slug":"hidden","visibility":"hide"}
+                ]})] } else { vec![
+                    json!({"data":[{"id":"claude-sonnet-new","display_name":"Sonnet New","created_at":"2026-01-01T00:00:00Z"}],"has_more":true,"last_id":"claude-sonnet-new"}),
+                    json!({"data":[{"id":"claude-sonnet-old","display_name":"Sonnet Old","created_at":"2025-01-01T00:00:00Z"}],"has_more":false})
+                ] };
+                for page in 0..pages.len() + 3 {
+                    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                    let mut request = Vec::new();
+                    let mut buf = [0; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert!(n > 0);
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                    let path = if codex { "/backend-api/codex/models?client_version=0.134.0" }
+                        else if page == 1 { "/v1/models?after_id=claude-sonnet-new" } else { "/v1/models" };
+                    assert!(request.starts_with(&format!("get {path} ")), "unexpected request: {}", request.lines().next().unwrap());
+                    assert_eq!(request.matches(&format!("authorization: bearer {}\r\n", credentials.key.to_ascii_lowercase())).count(), 1);
+                    assert!(!request.contains("x-api-key:") && !request.contains("stale-key") && !request.contains("untrusted.invalid"));
+                    for (name, value) in &credentials.headers {
+                        assert!(request.contains(&format!("{}: {}\r\n", name.to_ascii_lowercase(), value.as_str().unwrap().to_ascii_lowercase())));
+                    }
+                    if !codex {
+                        assert_eq!(request.matches("anthropic-version: 2023-06-01\r\n").count(), 1);
+                        assert!(request.contains("anthropic-beta:") && request.contains("oauth-"));
+                    }
+                    let (status, extra, body) = if page < pages.len() {
+                        ("200 OK", String::new(), pages[page].to_string())
+                    } else if page == pages.len() {
+                        ("307 Temporary Redirect", format!("location: http://{address}/leak?token=subscription-secret\r\n"), String::new())
+                    } else if page == pages.len() + 1 {
+                        ("503 Unavailable", String::new(), "subscription-secret".into())
+                    } else { ("200 OK", String::new(), "subscription-secret".into()) };
+                    socket.write_all(format!("HTTP/1.1 {status}\r\n{extra}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let list = tokio::time::timeout(Duration::from_secs(5), local_model_pages(
+                mock_subscription_request(&provider, &env, address), codex
+            )).await.unwrap().unwrap();
+            let catalog = json!({"anthropic":{"models":{"claude-sonnet-new":{
+                "reasoning":true,"reasoning_options":[{"type":"effort","values":["low","high"]}]
+            }}}});
+            let converted = convert_local(provider.clone(), "", &list, Some(&catalog)).unwrap();
+            let models = &converted["provider"]["models"];
+            if codex {
+                assert_eq!(models.as_object().unwrap().len(), 2);
+                assert_eq!(models["gpt-test"]["name"], "GPT Test");
+                assert_eq!(models["gpt-test"]["limit"]["context"], 272000);
+                assert_eq!(models["gpt-test"]["modalities"]["input"], json!(["text","image"]));
+                assert_eq!(models["gpt-test"]["variants"]["xhigh"]["reasoningEffort"], "xhigh");
+                assert_eq!(models["gpt-test"]["options"]["supportsThinkingToggle"], false);
+                assert!(models["no-thinking"]["reasoning"].is_null());
+                assert!(models["hidden"].is_null());
+            } else {
+                assert_eq!(models["claude-sonnet-new"]["name"], "Sonnet New");
+                assert!(models["claude-sonnet-old"].is_object());
+                assert_eq!(models["sonnet"]["localModel"], "claude-sonnet-new");
+                assert_eq!(models["sonnet"]["variants"]["low"]["reasoningEffort"], "low");
+            }
+            std::fs::create_dir(dir.path().join("alkaid")).unwrap();
+            std::fs::write(cache_path(dir.path()), json!({"local":{"models":models}}).to_string()).unwrap();
+            for serialized in [provider.to_string(), converted.to_string(), read_cache(dir.path()).to_string()] {
+                assert!(!serialized.contains("subscription-secret") && !serialized.contains("private-account"));
+            }
+            for expected in ["307", "503", "JSON"] {
+                let error = tokio::time::timeout(Duration::from_secs(5), local_model_pages(
+                    mock_subscription_request(&provider, &env, address), codex
+                )).await.unwrap().unwrap_err();
+                assert!(error.contains(expected), "{error}");
+                assert!(!error.contains("subscription-secret") && !error.contains("/leak"));
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_model_pages_enforce_cumulative_bytes_and_page_limits() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (pages, padding, expected) in [(2, 8 * 1024 * 1024, "16 MiB"), (1000, 0, "1000 页")] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/models", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                for page in 0..pages {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut buf = [0; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        assert!(n > 0);
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    let body = format!("{}{}", json!({"data":[],"has_more":true,"last_id":page.to_string()}), " ".repeat(padding));
+                    // 超限时客户端会提前关闭，write_all 失败是预期行为。
+                    let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                }
+            });
+            let error = tokio::time::timeout(Duration::from_secs(15), local_model_pages(
+                reqwest::Client::builder().no_proxy().build().unwrap().get(url), false
+            )).await.unwrap().unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn subscription_fingerprint_tracks_login_and_account_without_persisting_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = subscription_env("codex", dir.path());
+        let path = dir.path().join("auth.json");
+        let mut auth: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let original = local_auth_fingerprint("codex", &env).unwrap();
+        let cached = json!({"fingerprint":original,"fetchedAt":1000});
+        assert!(cache_fresh(&cached, &original, 1001));
+        for (field, value) in [("account_id", "other-account".to_string()),
+            ("access_token", format!("{}-rotated", auth["tokens"]["access_token"].as_str().unwrap()))] {
+            let mut changed = auth.clone();
+            changed["tokens"][field] = json!(value);
+            std::fs::write(&path, changed.to_string()).unwrap();
+            let print = local_auth_fingerprint("codex", &env).unwrap();
+            assert!(!cache_fresh(&cached, &print, 1001));
+            assert!(!print.contains("subscription-secret") && !print.contains("account"));
+        }
+        auth["tokens"]["access_token"] = json!("expired");
+        std::fs::write(&path, auth.to_string()).unwrap();
+        assert!(local_auth_fingerprint("codex", &env).is_err());
+        let provider = resolve_local(&json!({}), "codex", &env, dir.path()).unwrap();
+        assert_eq!(provider["models"], json!({}), "无 config.model 不生成虚构模型");
+        assert!(convert_local(provider, "", &json!({"data":[]}), None).unwrap_err().contains("未返回可用模型"));
+    }
+
+    #[test]
+    fn claude_subscription_aliases_use_catalog_dates_and_preserve_effort_and_1m() {
+        let mut provider = json!({"localAuth":"claude-code","api":"anthropic-messages", "options":{"baseURL":"https://api.anthropic.com"},"models":{}});
+        for alias in ["sonnet","opus","opusplan","haiku","sonnet[1m]","opus[1m]","opusplan[1m]","haiku[1m]"] {
+            provider["models"][alias] = json!({"localModel":"stale-model", "options":{"reasoningEffort":"high"},
+                "variants":{"high":{"reasoningEffort":"high"}}});
+        }
+        let list = json!({"data":[
+            {"id":"claude-sonnet-99","created_at":"2024-01-01T00:00:00Z"},
+            {"id":"claude-sonnet-2","created_at":"2025-01-01T00:00:00Z"},
+            {"id":"claude-sonnet-100"},
+            {"id":"claude-opus-2","created_at":"2025-02-01T00:00:00Z"},
+            {"id":"claude-opus-99","created_at":"2024-02-01T00:00:00Z"},
+            {"id":"claude-haiku-2","created_at":"2025-01-01T00:00:00Z"}
+        ]});
+        let catalog = json!({"anthropic":{"models":{"claude-sonnet-2":{
+            "reasoning":true,"limit":{"context":200000,"output":64000},"modalities":{"input":["text","image"]},
+            "reasoning_options":[{"type":"effort","values":["low","high"]}]
+        }}}});
+        let converted = convert_local(provider.clone(), "sonnet[1m]", &list, Some(&catalog)).unwrap();
+        let models = converted["provider"]["models"].as_object().unwrap();
+        for alias in provider["models"].as_object().unwrap().keys() {
+            let family = claude_alias_family(alias).unwrap();
+            assert_eq!(models[alias]["localModel"], format!("claude-{family}-2{}", if alias.ends_with("[1m]") { "[1m]" } else { "" }));
+            assert_eq!(models[alias]["options"]["reasoningEffort"], "high");
+        }
+        assert_eq!(models["sonnet[1m]"]["limit"], json!({"context":1000000,"output":64000}));
+        assert_eq!(models["sonnet"]["variants"]["low"]["reasoningEffort"], "low");
+        assert_eq!(models["sonnet"]["modalities"]["input"], json!(["text","image"]));
+        let config = json!({"provider":{"local":converted["provider"]}});
+        let resolved = super::super::config::resolve_model(&config, Some("local/sonnet[1m]/variant/high"), &Default::default()).unwrap();
+        assert_eq!(resolved.model.id, "claude-sonnet-2[1m]");
+        assert_eq!(resolved.thinking_level.as_deref(), Some("high"));
+        let mut expanded = models.clone();
+        let mut explicit = provider["models"].as_object().unwrap().clone();
+        for model in explicit.values_mut() { model.as_object_mut().unwrap().remove("localModel"); }
+        merge_local_models(&mut expanded, &explicit);
+        assert_eq!(expanded, *models, "本地 effort 占位不能抹掉目录映射/能力");
+        let unavailable = convert_local(provider.clone(), "", &json!({"data":[{"id":"other"}]}), None).unwrap();
+        assert_eq!(unavailable["provider"]["models"], json!({"other":{}}));
+        assert!(convert_local(provider, "", &json!({"data":[]}), None).is_err());
+        let direct = convert_local(json!({"api":"anthropic-messages","options":{},"models":{"sonnet":{}}}), "", &Value::Null, None).unwrap();
+        assert_eq!(direct["provider"]["models"], json!({"sonnet":{}}), "自定义直连 alias 原样保留");
+    }
+
     #[test]
     fn partial_native_model_options_preserve_catalog_capabilities() {
         let mut models = json!({"alias":{"reasoning":true,"limit":{"context":1000000,"output":64000},
@@ -714,6 +1114,51 @@ mod tests {
         assert_eq!(models["alias"]["reasoning"],true);
         assert_eq!(models["alias"]["options"]["supportsThinkingToggle"],false);
         assert_eq!(models["alias"]["modalities"]["input"],json!(["text","image"]));
+    }
+
+    #[test]
+    fn sparse_local_models_keep_cached_capabilities_through_expand() {
+        const CHILD: &str = "NOVA_PRESETS_SPARSE_MODEL_TEST_ROOT";
+        if std::env::var_os(CHILD).is_none() {
+            // expand reads process_env: isolate fixtures without racing other tests or reading user credentials.
+            let root = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "lyra::presets::tests::sparse_local_models_keep_cached_capabilities_through_expand", "--nocapture"])
+                .env_clear().env(CHILD, root.path());
+            for key in ["HOME", "USERPROFILE", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "NOVA_DATA_DIR"] {
+                child.env(key, root.path());
+            }
+            if let Some(system_root) = std::env::var_os("SystemRoot") { child.env("SystemRoot", system_root); }
+            assert!(child.status().unwrap().success());
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        std::fs::write(root.join("config.toml"), "model_provider='fixture'\n[model_providers.fixture]\nbase_url='http://127.0.0.1:9/v1'\nexperimental_bearer_token='fixture-key'\n").unwrap();
+        std::fs::write(root.join("settings.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:9","ANTHROPIC_API_KEY":"fixture-key"}}"#).unwrap();
+        let cached = json!({"m":{
+            "limit":{"context":200000,"output":64000}, "modalities":{"input":["text","image"]},
+            "reasoning":true, "options":{"supportsThinkingToggle":false},
+            "variants":{"low":{"reasoningEffort":"low"}}
+        }});
+        std::fs::create_dir(root.join("alkaid")).unwrap();
+        std::fs::write(cache_path(&root), json!({"local":{"models":cached}}).to_string()).unwrap();
+        for source in ["codex", "claude-code"] {
+            let mut config = json!({"provider":{"local":{"preset":format!("local-{source}"),
+                "models":{"m":{"variants":{"high":{"reasoningEffort":"high"}},"limit":{"output":2048}}}
+            }}});
+            expand(&mut config, &root);
+            let model = &config["provider"]["local"]["models"]["m"];
+            assert_eq!(model["limit"], json!({"context":200000,"output":2048}), "{source}");
+            for field in ["modalities", "reasoning", "options"] {
+                assert_eq!(model[field], cached["m"][field], "{source}: {field}");
+            }
+            assert_eq!(model["variants"], json!({"low":{"reasoningEffort":"low"},"high":{"reasoningEffort":"high"}}));
+            let selected = super::super::config::resolve_model(&config, Some("local/m/variant/high"), &Default::default()).unwrap();
+            assert_eq!(selected.model.context_window, 200000);
+            assert_eq!(selected.model.max_output_tokens, 2048);
+            assert!(selected.model.supports_images);
+            assert_eq!(selected.thinking_level.as_deref(), Some("high"));
+        }
     }
 
     #[test]

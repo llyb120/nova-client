@@ -1,6 +1,6 @@
 # CodeBuddy / WorkBuddy → OpenAI 兼容接口
 
-Lyra 的 Rust provider 直接调用 CodeBuddy CLI 使用的 `/v2/chat/completions` 模型接口，复用本机登录和现有 Rust SSE 处理，工具交给 Lyra 执行，没有新增依赖。供其他客户端使用的独立 Node.js 服务仍保留在下方。
+Lyra 的 Rust provider 直接调用 CodeBuddy CLI 使用的 `/v2/chat/completions` 模型接口，复用本机登录和现有 Rust SSE 处理，工具交给 Lyra 执行，没有新增依赖。Nova 已移除 CodeBuddy / WorkBuddy 独立 agent 后端，但保留这些 Lyra provider，以及下方供其他客户端使用和协议验证的可选 Node.js 兼容服务。
 
 WorkBuddy 复用同一传输，但使用 WorkBuddy 内置 CLI 的产品配置、独立登录和账号模型列表，不混用全局 CodeBuddy 凭据。
 

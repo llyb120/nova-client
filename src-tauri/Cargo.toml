@@ -42,6 +42,7 @@ regex = "1"
 walkdir = "2"
 similar = "2"
 unicode-normalization = "0.1"
+tiktoken-rs = { version = "0.9.1", default-features = false }
 aho-corasick = "1"
 ignore = "0.4"
 wait-timeout = "0.2"

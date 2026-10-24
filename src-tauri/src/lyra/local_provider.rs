@@ -1,4 +1,4 @@
-//! 将本地 CLI 的 API 设置导入为普通 Lyra provider；不读取订阅登录 token 或执行密钥脚本。
+//! 优先直连本地 CLI 的自定义 API；未配置时由 Lyra 内置反代使用订阅登录。
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -102,12 +102,15 @@ fn codex(env: &HashMap<String, String>) -> Result<(Value, String), String> {
         let auth = read_json(&root.join("auth.json"))?;
         text(&auth["OPENAI_API_KEY"]).or_else(|| env_value(env, "OPENAI_API_KEY")).unwrap_or("").to_string()
     };
-    if key.is_empty() && !headers.keys().any(|name| name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("api-key")) {
-        return Err("本地 Codex 未配置 API Key；订阅登录不能作为 Lyra API provider 导入".into());
-    }
+    let direct = provider_id != "openai" || text(&settings["base_url"]).is_some()
+        || env_value(env, "OPENAI_BASE_URL").is_some() || !key.is_empty()
+        || headers.keys().any(|name| matches!(name.to_ascii_lowercase().as_str(), "authorization" | "api-key" | "x-api-key"));
     let model = text(&config["model"]).unwrap_or("").to_string();
-    let mut provider = json!({ "name": "本地 Codex", "api": api,
-        "options": { "baseURL": base, "apiKey": key, "headers": headers }, "models": {} });
+    let mut provider = if direct {
+        // 自定义端点可以无密钥；不能把订阅 token 当作缺失 Key 的替代品发到自定义地址。
+        json!({ "name": "本地 Codex", "api": api,
+            "options": { "baseURL": base, "apiKey": key, "headers": headers }, "models": {} })
+    } else { subscription("codex")? };
     add_model(&mut provider, &model, text(&config["model_reasoning_effort"]));
     Ok((provider, model))
 }
@@ -153,7 +156,7 @@ env_http_headers = { "X-Workspace" = "WORKSPACE_ID" }
     }
 
     #[test]
-    fn codex_api_login_is_supported_but_subscription_tokens_are_not_imported() {
+    fn codex_api_login_wins_and_subscription_secrets_stay_out_of_provider() {
         let dir = tempfile::tempdir().unwrap();
         let env = HashMap::from([("CODEX_HOME".into(), dir.path().to_string_lossy().into_owned())]);
         std::fs::write(dir.path().join("config.toml"), "model = 'test-model'").unwrap();
@@ -164,8 +167,17 @@ env_http_headers = { "X-Workspace" = "WORKSPACE_ID" }
         assert_eq!(provider["options"]["baseURL"], "https://api.openai.com/v1");
         assert_eq!(provider["options"]["apiKey"], "api-key");
         std::fs::write(&auth, r#"{"tokens":{"access_token":"subscription-secret"}}"#).unwrap();
-        let error = load("codex", &env).unwrap_err();
-        assert!(error.contains("API Key") && !error.contains("subscription-secret"));
+        let (provider, _) = load("codex", &env).unwrap();
+        assert_eq!(provider["localAuth"], "codex");
+        assert_eq!(provider["api"], "openai-responses");
+        assert!(!provider.to_string().contains("subscription-secret"));
+        std::fs::write(dir.path().join("config.toml"), "[model_providers.openai]\nhttp_headers = { 'X-Client' = 'cli' }\n").unwrap();
+        assert_eq!(load("codex", &env).unwrap().0["localAuth"], "codex");
+        std::fs::write(dir.path().join("config.toml"), "[model_providers.openai]\nbase_url = 'http://localhost:9000/v1'\n").unwrap();
+        let (provider, _) = load("codex", &env).unwrap();
+        assert!(provider["localAuth"].is_null());
+        assert_eq!(provider["options"]["apiKey"], "");
+        assert_eq!(provider["options"]["baseURL"], "http://localhost:9000/v1");
         std::fs::write(dir.path().join("config.toml"), "api_key = 'secret\n").unwrap();
         assert!(!load("codex", &env).unwrap_err().contains("secret"));
     }
@@ -205,9 +217,22 @@ env_http_headers = { "X-Workspace" = "WORKSPACE_ID" }
         assert!(load("claude-code", &env).is_err());
         std::fs::write(&path, r#"{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"subscription-secret"}}"#).unwrap();
         let env = HashMap::from([("CLAUDE_CONFIG_DIR".into(), dir.path().to_string_lossy().into_owned())]);
-        assert!(load("claude-code", &env).is_err());
+        let (provider, _) = load("claude-code", &env).unwrap();
+        assert_eq!(provider["localAuth"], "claude-code");
+        assert!(!provider.to_string().contains("subscription-secret"));
+        std::fs::write(&path, r#"{"env":{"ANTHROPIC_CUSTOM_HEADERS":"X-Client: cli"}}"#).unwrap();
+        assert_eq!(load("claude-code", &env).unwrap().0["localAuth"], "claude-code");
         assert!(load("unknown", &env).is_err());
     }
+}
+
+fn subscription(source: &str) -> Result<Value, String> {
+    // 只保留来源标识；凭据不进入配置/模型缓存，转发每次重新读取登录。
+    // 过期登录在请求时报告，不应让已经缓存的模型从会话/选择器消失。
+    let codex = source == "codex";
+    Ok(json!({ "name": if codex { "本地 Codex" } else { "本地 Claude Code" },
+        "api": if codex { "openai-responses" } else { "anthropic-messages" }, "localAuth": source,
+        "options": { "baseURL": super::super::local_auth::endpoint(source)?, "apiKey": "" }, "models": {} }))
 }
 
 fn claude(env: &HashMap<String, String>) -> Result<(Value, String), String> {
@@ -234,21 +259,27 @@ fn claude(env: &HashMap<String, String>) -> Result<(Value, String), String> {
     let key = if let Some(token) = get("ANTHROPIC_AUTH_TOKEN") {
         headers.insert("Authorization".into(), json!(format!("Bearer {token}")));
         ""
-    } else {
-        get("ANTHROPIC_API_KEY").ok_or("本地 Claude Code 未配置 API Key / AUTH_TOKEN；订阅登录不能作为 Lyra API provider 导入")?
-    };
-    let mut provider = json!({ "name": "本地 Claude Code", "api": "anthropic-messages",
-        "options": { "baseURL": get("ANTHROPIC_BASE_URL").unwrap_or("https://api.anthropic.com"),
-            "apiKey": key, "headers": headers }, "models": {} });
+    } else { get("ANTHROPIC_API_KEY").unwrap_or("") };
+    let direct = get("ANTHROPIC_BASE_URL").is_some() || !key.is_empty()
+        || headers.keys().any(|name| matches!(name.to_ascii_lowercase().as_str(), "authorization" | "x-api-key"));
+    if !direct && text(&settings["apiKeyHelper"]).is_some() {
+        return Err("Claude Code 配置了 apiKeyHelper；请通过环境变量提供 API 认证（Lyra 不执行密钥脚本）".into());
+    }
+    let mut provider = if direct {
+        json!({ "name": "本地 Claude Code", "api": "anthropic-messages",
+            "options": { "baseURL": get("ANTHROPIC_BASE_URL").unwrap_or("https://api.anthropic.com"),
+                "apiKey": key, "headers": headers }, "models": {} })
+    } else { subscription("claude-code")? };
     let selected = get("ANTHROPIC_MODEL").or_else(|| text(&settings["model"]))
         .or_else(|| get("ANTHROPIC_DEFAULT_MODEL")).unwrap_or("sonnet");
-    let alias = match selected {
+    let alias = match selected.strip_suffix("[1m]").unwrap_or(selected) {
         "sonnet" => Some("ANTHROPIC_DEFAULT_SONNET_MODEL"),
         "opus" | "opusplan" => Some("ANTHROPIC_DEFAULT_OPUS_MODEL"),
         "haiku" => Some("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
         _ => None,
     };
-    let model = alias.map(|key| get(key).unwrap_or("")).unwrap_or(selected).to_string();
+    let mut model = alias.map(|key| get(key).unwrap_or(if direct { "" } else { selected })).unwrap_or(selected).to_string();
+    if !model.is_empty() && selected.ends_with("[1m]") && !model.ends_with("[1m]") { model.push_str("[1m]"); }
     for variable in ["ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"] {
         if let Some(id) = get(variable) { add_model(&mut provider, id, None); }
     }

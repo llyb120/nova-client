@@ -2,7 +2,7 @@
 
 本地服务直接调用 Devin CLI 使用的 Connect/Protobuf 模型接口，复用已有 Devin 登录。模型推理不再经过 ACP summarizer，也不会在本机执行模型提出的工具。CLI 只用于读取可用模型、版本和默认模型设置。
 
-Lyra 使用 Rust 原生实现，协议基于 Devin CLI 3000.11.205 验证，没有新增依赖。供其他客户端使用的独立 Node.js 服务仍保留在下方。
+Lyra 使用 Rust 原生实现，协议基于 Devin CLI 3000.11.205 验证，没有新增依赖。Nova 已移除 Devin 独立 ACP 后端，但保留此 Lyra provider，以及下方供其他客户端使用和协议验证的可选 Node.js 兼容服务。
 
 ## Lyra 自动接入
 
@@ -29,7 +29,7 @@ npm run devin:api
 - 模型：`devin` 使用配置的默认模型；或选择 `GET /v1/models` 返回的实际模型 ID
 - 协议：Chat Completions 或 Responses
 
-独立服务首次启动自动生成密钥，重启复用，且不会在日志中打印密钥。连接信息保存到 `NOVA_DATA_DIR/alkaid/devin-api.json`（默认 `~/.nova`）；这与 Lyra 管理的临时后台接口相互独立。
+独立服务首次启动自动生成密钥，重启复用，且不会在日志中打印密钥。连接信息保存到 `NOVA_DATA_DIR/alkaid/devin-api.json`（默认 `~/.nova`）；Lyra 原生 provider 不启动或依赖此服务。
 
 ## 已支持能力
 

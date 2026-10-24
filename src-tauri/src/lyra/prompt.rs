@@ -203,8 +203,6 @@ pub fn is_context_window_error(error: &str) -> bool {
         || (message.contains("no actionable output") && message.contains("stop_reason=length"))
 }
 
-pub const PROVIDER_RETRY_DELAYS_MS: &[u64] = &[1_000, 3_000];
-
 /// 按 PI 约定累加一次 agent 轮内多次模型请求的用量。
 pub fn merge_usage(total: &mut Value, usage: &Value) {
     for key in ["input", "output", "cacheRead", "cacheWrite"] {
@@ -478,6 +476,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
                 _ => "- bash: 执行 Bash 命令",
             })
         },
+        (!read_only).then_some("- exec_command / write_stdin: 交互或长任务使用持久命令会话；exec_command 返回 session_id 后仅轮询/输入同一会话，不要重启命令。需要终端行规程才开 tty；结束或不再需要时取消。会话只在当前 Nova 进程内有效，重启后不得当作仍在运行。"),
         polaris.then_some(
             "- polaris: 默认快速概览，每处1–2行命中+必要签名/定位及 IMPACT/SIG；不递归依赖、不追踪别名调用或 Git 历史，正文按需 read 补读；仅确需深度关系时传 deep=true（较慢）；默认12KB硬上限、不凑满，不自动展开完整函数",
         ),
@@ -508,6 +507,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         .into(),
         if options.auto_change_project { "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。" } else { "" }.into(),
         "先理解再修改，保持改动聚焦。".into(),
+        "子 agent 的 send_message 在运行中注入、空闲时启动新一轮；followup_task 排队并显式计入待完成工作。主任务最终交付前必须收齐所需子任务结果，不需要的任务应主动 interrupt_agent/close_agent；运行时也会等待剩余任务，不能把仍在排队当作完成。重启后恢复子 agent 只会执行本次明确追加的任务，不自动重放旧工具调用。".into(),
         if options.ponytail { PONYTAIL_RULES.into() } else { String::new() },
         "最终回复采用例外汇报，而不是完整工作报告。先直接给出用户可感知的结果；只有信息会影响结果判断、下一步行动、风险认知或可信度时，才写入最终回复。默认省略文件/函数/行号清单、搜索和工具调用过程、常规实现细节、具体测试命令、成功步骤清单、无实际影响的注意事项、泛化建议、‘无风险’声明，以及对同一结果的重复总结。正常成功时用 1～3 句话，不强制使用标题或列表；存在失败、未验证、行为变化、兼容性风险或用户必须操作的事项时，只围绕这些例外按需展开。用户明确询问实现细节时才提供详细报告。".into(),
         "完成修改后按需验证：改动小、影响明确时做成本最低的检查即可，影响面大或不确定时再按需扩大到受影响单元及直接使用方；禁止遍历或列出完整仓库、无依据扩大范围。最终回复只需说明验证是否通过，不列具体命令和逐项过程；仅当验证失败、无法验证或结果存在关键限制时补充原因与影响。".into(),
