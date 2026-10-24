@@ -326,7 +326,8 @@ impl ResponseState {
                 3 | 9 => provider::push_delta(&mut self.result, if field == 9 { "thinking" } else { "text" }, value.text()?, on_event),
                 5 => {
                     let stop = value.number()?;
-                    if !matches!(stop, 0 | 1 | 2 | 3 | 10) { return Err(format!("Unknown Devin stop reason: {stop}")); }
+                    // Claude 系模型经 Devin 正常结束时返回 4（实测 claude-haiku-5-5），等同普通停止。
+                    if !matches!(stop, 0 | 1 | 2 | 3 | 4 | 10) { return Err(format!("Unknown Devin stop reason: {stop}")); }
                     // SWE-2 sends 10 before its function name/arguments. Keep reading to the trailer.
                     if matches!(stop, 3 | 10) || self.stop.is_none() { self.stop = Some(stop); }
                 }
@@ -500,6 +501,8 @@ mod tests {
         }
         for bad in [vec![0], vec![8,128], vec![10,3,1], vec![8,255,255,255,255,255,255,255,255,255,2]] { assert!(decode(&bad).is_err()); }
         let mut state = ResponseState::default(); assert!(state.frame(&[40,99], &mut |_| {}).unwrap_err().contains("99"));
+        let mut state = ResponseState::default(); state.frame(&[40,4], &mut |_| {}).unwrap();
+        assert_eq!(state.finish(&tool_body(), &mut |_| {}).unwrap().stop_reason, "stop");
         let mut decoder = ConnectDecoder::default(); decoder.push(&envelope(b"",0)).unwrap(); assert!(decoder.finish().is_err());
         let mut decoder = ConnectDecoder::default(); decoder.push(&envelope(b"{}",2)).unwrap(); assert!(decoder.push(&envelope(b"",0)).is_err());
         let mut decoder = ConnectDecoder::default();
