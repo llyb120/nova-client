@@ -130,6 +130,7 @@ pub(crate) fn migrate(root: &Path, store: &mut ThreadStore, settings: &mut Setti
     for thread in &store.threads {
         if !matches!(thread.agent_kind, AgentKind::Legacy(_)) { continue; }
         if thread.is_roaming_guest() { continue; } // The execution host owns its provider configuration.
+        if thread.experience_thread { continue; } // 已移除的训练/演进会话：由会话清理删除，不再迁移报错。
         match thread_target(root, &mut migration, thread) {
             Ok(model) => plans.push((thread.id.clone(), model)),
             Err(error) => {
@@ -211,6 +212,17 @@ mod tests {
         assert!(thread_target(root.path(), &mut migration, &thread).unwrap().ends_with("/uncached-model/variant/high"));
         thread.model = Some("uncached-model".into());
         assert!(thread_target(root.path(), &mut migration, &thread).unwrap().ends_with("/uncached-model/variant/medium"));
+    }
+
+    #[test]
+    fn removed_experience_threads_are_not_migrated_or_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ThreadStore::load(root.path().to_path_buf());
+        let mut thread = Thread::new(".".into(), AgentKind::Legacy("codex".into()), None, None, None, false);
+        thread.experience_thread = true;
+        store.threads.push(thread);
+        assert!(migrate(root.path(), &mut store, &mut Settings::default()).unwrap().is_empty());
+        assert!(store.threads[0].items.is_empty());
     }
 
     #[test]

@@ -483,6 +483,10 @@ fn is_normal_thread_for_auto_cleanup(thread: &Thread) -> bool {
     !thread.experience_thread && !thread.starred
 }
 
+fn is_hidden_auto_thread_expired(thread: &Thread, now: i64, hours: u32) -> bool {
+    thread.employee_thread && thread_is_expired(thread.updated_at, now, hours)
+}
+
 fn thread_is_expired(updated_at: i64, now: i64, hours: u32) -> bool {
     session_cleanup_is_expired(updated_at, now, hours)
 }
@@ -493,7 +497,30 @@ fn run_session_auto_cleanup(app: &tauri::AppHandle) -> usize {
         let settings = state.settings.lock().unwrap();
         (settings.session_auto_cleanup_enabled, settings.session_auto_cleanup_hours)
     };
+    // 训练/世代演进功能已移除：遗留会话无法再执行，与自动清理开关无关，直接永久删除（含子会话）。
+    let legacy: Vec<String> = state.store.lock().unwrap().threads.iter()
+        .filter(|thread| thread.experience_thread).map(|thread| thread.id.clone()).collect();
+    if !legacy.is_empty() {
+        let deletable = collect_deletable_thread_ids(&state, legacy, false);
+        remove_threads(app, &state, deletable);
+    }
     let now = now_ms();
+    // 数字员工等自动运行、不进列表的会话：用户看不到也不会手动删，不受自动清理开关限制，
+    // 按同一保留时长永久删除。员工待办仍要续做的会话保留。
+    // employee.json 读不出来时不知道哪些要续做，宁可本轮不删。
+    let hidden: Vec<String> = match employee::load() {
+        Ok(e) => {
+            let pending: HashSet<String> = e.inbox.into_iter().filter_map(|todo| todo.thread_id).collect();
+            state.store.lock().unwrap().threads.iter()
+                .filter(|thread| is_hidden_auto_thread_expired(thread, now, hours) && !pending.contains(&thread.id))
+                .map(|thread| thread.id.clone()).collect()
+        }
+        Err(_) => Vec::new(),
+    };
+    if !hidden.is_empty() {
+        let deletable = collect_deletable_thread_ids(&state, hidden, false);
+        remove_threads(app, &state, deletable);
+    }
     let permanently_removed = if enabled {
         state.thread_trash.lock().unwrap().purge_expired(now, hours)
     } else {
@@ -600,7 +627,7 @@ fn agent_kind_for_thread(state: &AppState, thread_id: &str) -> Result<AgentKind,
 mod session_auto_cleanup_tests {
     use super::{
         cleanup_lyra_session_files,
-        is_normal_thread_for_auto_cleanup, is_starrable_thread, now_ms,
+        is_hidden_auto_thread_expired, is_normal_thread_for_auto_cleanup, is_starrable_thread, now_ms,
         sweep_orphan_lyra_session_files, thread_is_expired, tree_contains_starred_thread,
         AgentKind, Thread,
     };
@@ -655,6 +682,14 @@ mod session_auto_cleanup_tests {
         thread.experience_thread = true;
         assert!(!is_normal_thread_for_auto_cleanup(&thread));
         thread.experience_thread = false;
+        let now = now_ms();
+        thread.updated_at = now - 30 * 24 * 60 * 60 * 1000;
+        assert!(!is_hidden_auto_thread_expired(&thread, now, 24));
+        thread.employee_thread = true;
+        assert!(is_hidden_auto_thread_expired(&thread, now, 24));
+        thread.updated_at = now;
+        assert!(!is_hidden_auto_thread_expired(&thread, now, 24));
+        thread.employee_thread = false;
         // 漫游会话（两种角色）不豁免自动清理
         thread.roaming_role = Some("host".into());
         assert!(is_normal_thread_for_auto_cleanup(&thread));
