@@ -31,9 +31,10 @@ fn github_repo() -> &'static str {
 }
 
 fn github_api_latest(channel: &str) -> String {
-    if channel == "pre-release" {
+    if channel != "release" {
+        // 三个通道各保留 10 个发布，拉取 100 条避免其它通道挤掉目标版本。
         format!(
-            "https://api.github.com/repos/{}/releases?per_page=20",
+            "https://api.github.com/repos/{}/releases?per_page=100",
             github_repo()
         )
     } else {
@@ -45,12 +46,7 @@ fn github_api_latest(channel: &str) -> String {
 }
 
 fn selected_update_channel(app: &AppHandle) -> String {
-    let settings = crate::settings::Settings::load(&crate::nova_data_dir(app));
-    if settings.update_channel == "pre-release" {
-        "pre-release".into()
-    } else {
-        "release".into()
-    }
+    crate::settings::Settings::load(&crate::nova_data_dir(app)).update_channel
 }
 
 fn compiled_update_channel() -> &'static str {
@@ -58,7 +54,8 @@ fn compiled_update_channel() -> &'static str {
 }
 
 fn select_release(value: Value, channel: &str) -> Option<Value> {
-    if channel == "pre-release" {
+    if channel != "release" {
+        let prefix = if channel == "develop" { "dev-v" } else { "pre-v" };
         value
             .as_array()?
             .iter()
@@ -67,7 +64,7 @@ fn select_release(value: Value, channel: &str) -> Option<Value> {
                     && release["draft"].as_bool() != Some(true)
                     && release["tag_name"]
                         .as_str()
-                        .is_some_and(|tag| tag.starts_with("pre-v"))
+                        .is_some_and(|tag| tag.starts_with(prefix))
             })
             .cloned()
     } else {
@@ -81,6 +78,7 @@ fn release_version(release: &Value) -> String {
         .unwrap_or_default()
         .trim()
         .trim_start_matches("pre-")
+        .trim_start_matches("dev-")
         .trim_start_matches('v')
         .to_string()
 }
@@ -1007,11 +1005,11 @@ fn release_tag_from_feed(feed: &str, channel: &str) -> Option<String> {
         let id = entry.split_once("<id>")?.1.split_once("</id>")?.0.trim();
         let repository_and_tag = id.split_once("Repository/")?.1;
         let tag = repository_and_tag.split_once('/')?.1.trim();
-        let matches_channel = if channel == "pre-release" {
-            tag.starts_with("pre-v")
-        } else {
-            tag.starts_with('v')
-        };
+        let matches_channel = tag.starts_with(match channel {
+            "develop" => "dev-v",
+            "pre-release" => "pre-v",
+            _ => "v",
+        });
         matches_channel.then(|| tag.to_string())
     })
 }
@@ -1020,6 +1018,7 @@ fn release_from_tag(tag: &str, channel: &str) -> Option<Value> {
     let version = tag
         .trim()
         .trim_start_matches("pre-")
+        .trim_start_matches("dev-")
         .trim_start_matches('v');
     if version.is_empty() {
         return None;
@@ -1027,7 +1026,7 @@ fn release_from_tag(tag: &str, channel: &str) -> Option<Value> {
     let asset = asset_name_for(version);
     Some(json!({
         "tag_name": tag,
-        "prerelease": channel == "pre-release",
+        "prerelease": channel != "release",
         "draft": false,
         "assets": [{
             "name": asset,
@@ -1045,7 +1044,7 @@ async fn github_web_release(
     client: &reqwest::Client,
     channel: &str,
 ) -> Result<Option<Value>, String> {
-    let tag = if channel == "pre-release" {
+    let tag = if channel != "release" {
         let response = client
             .get(format!(
                 "https://github.com/{}/releases.atom",
@@ -1708,13 +1707,15 @@ pub fn cleanup_old() {
 #[cfg(test)]
 mod tests {
     use super::{
-        release_tag_from_feed, should_retry_update_without_proxy, staged_is_latest_discovered,
+        asset_name_for, github_api_latest, release_from_tag, release_tag_from_feed, release_version,
+        select_release, should_retry_update_without_proxy, staged_is_latest_discovered,
     };
     use reqwest::StatusCode;
 
     #[test]
     fn release_feed_selects_the_requested_channel() {
         let feed = r#"
+            <entry><id>tag:github.com,2008:Repository/1/dev-v1.2.5</id></entry>
             <entry><id>tag:github.com,2008:Repository/1/v1.2.3</id></entry>
             <entry><id>tag:github.com,2008:Repository/1/pre-v1.2.4</id></entry>
         "#;
@@ -1726,6 +1727,53 @@ mod tests {
             release_tag_from_feed(feed, "pre-release").as_deref(),
             Some("pre-v1.2.4")
         );
+        assert_eq!(
+            release_tag_from_feed(feed, "develop").as_deref(),
+            Some("dev-v1.2.5")
+        );
+        assert!(release_tag_from_feed("", "develop").is_none());
+    }
+
+    #[test]
+    fn update_channels_select_releases_and_resolve_assets() {
+        let releases = serde_json::json!([
+            {"tag_name": "dev-v1.2.6", "prerelease": true, "draft": true},
+            {"tag_name": "dev-v1.2.6", "prerelease": false},
+            {"tag_name": "pre-v1.2.4", "prerelease": true},
+            {"tag_name": "v1.2.3", "prerelease": false},
+            {"tag_name": "dev-v1.2.5", "prerelease": true},
+            {"tag_name": "dev-v1.2.4", "prerelease": true}
+        ]);
+        for (channel, tag, version) in [
+            ("release", "v1.2.3", "1.2.3"),
+            ("pre-release", "pre-v1.2.4", "1.2.4"),
+            ("develop", "dev-v1.2.5", "1.2.5"),
+        ] {
+            let input = if channel == "release" {
+                releases[3].clone()
+            } else {
+                releases.clone()
+            };
+            let release = select_release(input, channel).unwrap();
+            assert_eq!(release["tag_name"], tag);
+            assert_eq!(release_version(&release), version);
+            assert!(github_api_latest(channel).ends_with(if channel == "release" {
+                "/releases/latest"
+            } else {
+                "/releases?per_page=100"
+            }));
+            let fallback = release_from_tag(tag, channel).unwrap();
+            let asset = asset_name_for(version);
+            assert_eq!(fallback["assets"][0]["name"], asset);
+            assert_eq!(fallback["prerelease"], channel != "release");
+            assert!(fallback["assets"][0]["browser_download_url"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("/{tag}/{asset}")));
+        }
+        assert!(select_release(serde_json::json!([]), "develop").is_none());
+        assert!(select_release(serde_json::json!([releases[2]]), "develop").is_none());
+        assert!(select_release(serde_json::json!([releases[4]]), "pre-release").is_none());
     }
 
     #[test]

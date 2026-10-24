@@ -1,8 +1,13 @@
-name: Pre-release
+name: Pre-release / Develop
+run-name: ${{ github.ref_name }} build
 
 on:
   push:
-    branches: [pre-release]
+    branches: [pre-release, develop]
+
+env:
+  TAG_PREFIX: ${{ github.ref_name == 'develop' && 'dev-v' || 'pre-v' }}
+  RELEASE_CHANNEL: ${{ github.ref_name }}
 
 permissions:
   contents: write
@@ -23,8 +28,8 @@ jobs:
         run: |
           set -euo pipefail
           CUR=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
-          # 远端已存在的 pre-v 标签受保护、不能覆盖，所以取「文件版本」与「远端最高 pre-v 标签」的较大者再 +1
-          REMOTE=$(git ls-remote --tags origin 'refs/tags/pre-v*' | sed -n 's#.*refs/tags/pre-v\([0-9][0-9.]*\)$#\1#p' | sort -V | tail -1)
+          # 远端已存在的渠道标签受保护、不能覆盖，所以取「文件版本」与「本渠道远端最高标签版本」的较大者再 +1
+          REMOTE=$(git ls-remote --tags origin "refs/tags/${TAG_PREFIX}*" | sed -n "s#.*refs/tags/${TAG_PREFIX}\([0-9][0-9.]*\)\$#\1#p" | sort -V | tail -1)
           BASE=$(printf '%s\n%s\n' "$CUR" "$REMOTE" | grep -v '^$' | sort -V | tail -1)
           IFS=. read -r A B C <<< "$BASE"
           NEW="${A:-0}.${B:-0}.$((${C:-0}+1))"
@@ -43,7 +48,7 @@ jobs:
           - { name: linux, os: ubuntu-24.04, target: "" }
     runs-on: ${{ matrix.os }}
     env:
-      NOVA_BUILD_CHANNEL: pre-release
+      NOVA_BUILD_CHANNEL: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -89,18 +94,18 @@ jobs:
           fi
       - uses: actions/upload-artifact@v4
         with:
-          name: pre-update-${{ matrix.name }}
+          name: ${{ env.RELEASE_CHANNEL }}-update-${{ matrix.name }}
           path: release/*.zip
           if-no-files-found: error
       - if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: Nova-pre-${{ matrix.name }}-dmg
+          name: Nova-${{ env.RELEASE_CHANNEL }}-${{ matrix.name }}-dmg
           path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
       - if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: Nova-pre-linux
+          name: Nova-${{ env.RELEASE_CHANNEL }}-linux
           path: |
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
@@ -121,20 +126,20 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src-tauri/tauri.conf.json package.json
           if ! git diff --staged --quiet; then
-            git commit -m "chore: pre-release v${VER} [skip ci]"
-            git push origin "HEAD:pre-release"
+            git commit -m "chore: ${RELEASE_CHANNEL} v${VER} [skip ci]"
+            git push origin "HEAD:${RELEASE_CHANNEL}"
           fi
-          git tag "pre-v${VER}"
-          git push origin "pre-v${VER}"
+          git tag "${TAG_PREFIX}${VER}"
+          git push origin "${TAG_PREFIX}${VER}"
       - uses: actions/download-artifact@v4
         with:
           path: dist
       - name: Create draft prerelease and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: pre-v${{ needs.prepare.outputs.version }}
-          name: Nova pre-release v${{ needs.prepare.outputs.version }}
-          target_commitish: pre-release
+          tag_name: ${{ env.TAG_PREFIX }}${{ needs.prepare.outputs.version }}
+          name: Nova ${{ env.RELEASE_CHANNEL }} v${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ github.ref_name }}
           draft: true
           prerelease: true
           generate_release_notes: true
@@ -150,23 +155,23 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "pre-v${{ needs.prepare.outputs.version }}" --draft=false --prerelease
+        run: gh release edit "${TAG_PREFIX}${{ needs.prepare.outputs.version }}" --draft=false --prerelease
 
-      - name: Keep only the 10 most recent pre-releases
+      - name: Keep only the 10 most recent ${{ env.RELEASE_CHANNEL }} releases
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # 只看预发布通道（pre-v*），按 createdAt 升序取除最新 10 个之外的 release
+          # 只看本渠道标签，按 createdAt 升序取除最新 10 个之外的 release
           mapfile -t TO_DELETE < <(gh release list --limit 1000 \
             --json createdAt,tagName \
-            --jq 'map(select(.tagName | startswith("pre-v"))) | sort_by(.createdAt) | .[:-10] | .[].tagName')
+            --jq "map(select(.tagName | startswith(\"${TAG_PREFIX}\"))) | sort_by(.createdAt) | .[:-10] | .[].tagName")
           if [ ${#TO_DELETE[@]} -eq 0 ]; then
-            echo "无需清理（pre-release 数量 ≤ 10）"
+            echo "无需清理（${RELEASE_CHANNEL} 数量 ≤ 10）"
             exit 0
           fi
           for tag in "${TO_DELETE[@]}"; do
-            echo "删除旧 pre-release: $tag"
+            echo "删除旧 ${RELEASE_CHANNEL} release: $tag"
             gh release delete "$tag" --cleanup-tag -y || echo "警告：删除 $tag 失败"
           done
