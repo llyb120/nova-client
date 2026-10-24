@@ -4,8 +4,8 @@
 
 `context_budget` 返回 JSON 分项：system、tools、messagesText、toolArguments、toolResults、reasoning、images、other、overhead，以及校准差额、输出预留、协议余量和上次服务端 usage。
 
-- 普通文本使用缓存的 BPE tokenizer，不再按字符长度除以常数。自动选择 `o200k_base` / `cl100k_base`；可在 provider/model 的 `options.tokenizer` 显式覆盖。省略表示自动选择，不接受 `"auto"`。
-- BPE 只对**指定文本和所选词表**精确；未知/闭源模型、别名、图片、协议封装与服务端工具转换仍是估算。`promptExact:false` 和 `modelTokenizerKnown` 明示这一边界。最终以服务端实际 usage 为准，缓存输入不重复累加。
+- 以服务端实际 usage 为准：上次请求实测的 prompt tokens（缓存输入不重复累加）作为锚点，当前视图仍以该次已发送消息开头时，只对之后新增的消息做本地估算；折叠或去 reasoning 改写前缀后回退为校准后的整体估算（`anchoredToActualUsage` 标明）。
+- 本地估算为字符启发式（ASCII 约 4 字符/token，其它字符约 1 token），不内置 BPE 词表；`options.tokenizer` 已废弃并被忽略（仍不外发）。图片、协议封装与未知内容为占位估算，`promptExact:false`。
 - 请求预算与折叠使用规范化后的消息视图，输出预留取模型配置（封顶窗口 25%）。固定提示已耗尽窗口时报告 `inputBudgetExhausted`，需缩短固定提示，不反复无效自动折叠。
 - JSON BPE 计数不是服务端模型输入序列化的精确计数；图片、音频等载荷不能按 base64 长度当作 token（图片统一按每张 1600 估算）。
 - 输出预留取 `min(max_output_tokens, 窗口×25%)`，输出上限接近窗口时自动折叠仍可用；provider 报溢出时的恢复折叠不受本地预算限制。

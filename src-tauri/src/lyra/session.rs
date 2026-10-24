@@ -72,7 +72,7 @@ impl ChildSettings {
             http: parent.http.clone(), model: parent.model.clone(), summarizer: parent.summarizer.clone(),
             system_prompt: parent.system_prompt.clone(), tools, read_only, cwd: parent.cwd.clone(),
             shell: (!read_only).then(|| parent.shell.clone()).flatten(),
-            counter: crate::lyra::provider::model_token_counter(&parent.model.model)?,
+            counter: Default::default(),
             mcp_config: parent.mcp_config.clone(),
         })
     }

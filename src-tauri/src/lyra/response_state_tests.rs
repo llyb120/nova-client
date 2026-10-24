@@ -365,8 +365,5 @@ fn client_options_are_retained_for_counting_but_never_forwarded() {
     assert!(native.extra_options.keys().all(|key| !client_only_option(key)));
     assert_eq!(model.extra_options["tokenizer"], "o200k_base");
     let body = json!({"messages":[{"role":"user","content":"code \\ \"中文\" <|endoftext|>"}],"tools":[{"schema":{"type":"object"}}]});
-    assert_eq!(request_input_budget(&model, &body), model_token_counter(&model).unwrap().count_json(&body));
-    let mut invalid = model;
-    invalid.extra_options.insert("tokenizer".into(), json!("typo"));
-    assert!(model_token_counter(&invalid).is_err());
+    assert!(request_input_budget(&body) >= crate::lyra::tokens::TokenCounter.count_json(&body));
 }

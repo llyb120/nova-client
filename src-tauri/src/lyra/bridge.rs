@@ -420,9 +420,8 @@ async fn handle_prompt(
         requested_id.is_some(),
         request.get("restoreAt").and_then(Value::as_str),
     )?;
-    let counter = crate::lyra::provider::model_token_counter(&resolved.model)?;
     let mut context = ContextWindow::load(&sessions_root, &ctx.session_id, resolved.model.context_window, 0);
-    context.configure_tokens(counter, &system_prompt, &tool_definitions, resolved.model.max_output_tokens);
+    context.configure_tokens(Default::default(), &system_prompt, &tool_definitions, resolved.model.max_output_tokens);
     emit(&json!({
         "type": "timing",
         "phase": "context_shape",

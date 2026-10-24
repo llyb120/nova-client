@@ -55,7 +55,7 @@ impl History {
     }
 }
 
-/// 兼容旧调用：默认 o200k BPE 文本计数；未知模型的实际 prompt 仍是估算。
+/// provider 尚未返回 usage 时的估算：ASCII 约 4 字符/token，非 ASCII 约 1 字符/token。
 pub(crate) fn estimate_text_tokens(text: &str) -> u64 {
     crate::lyra::tokens::TokenCounter::default().count_text(text)
 }

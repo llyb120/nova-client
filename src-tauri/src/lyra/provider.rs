@@ -36,11 +36,6 @@ fn native_transport_model(model: &ResolvedModel) -> ResolvedModel {
     model
 }
 
-pub(super) fn model_token_counter(model: &ResolvedModel) -> Result<super::tokens::TokenCounter, String> {
-    let tokenizer = model.extra_options.get("tokenizer").map(|value| value.as_str().ok_or("options.tokenizer must be a string")).transpose()?;
-    super::tokens::TokenCounter::for_model(&model.id, &model.api, tokenizer)
-}
-
 #[derive(Debug)]
 pub enum StreamEvent {
     /// 收到网络数据（包括 SSE 注释心跳），不代表已输出内容。
@@ -371,13 +366,12 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
     }
 }
 
-/// Unconfirmed vocabularies (e.g. Claude via cl100k fallback) undercount; budget conservatively.
+/// The character heuristic can undercount code/JSON; budget the output cap conservatively.
 const UNKNOWN_TOKENIZER_MARGIN: f64 = 1.25;
 
-fn request_input_budget(model: &ResolvedModel, value: &Value) -> u64 {
-    // Count serialized wire content (including schemas/JSON escaping), not character classes.
-    // Invalid overrides are rejected by stream_chat_once before IO.
-    let counter = model_token_counter(model).unwrap_or_default();
+fn request_input_budget(value: &Value) -> u64 {
+    // Count serialized wire content (including schemas/JSON escaping).
+    let counter = super::tokens::TokenCounter;
     use super::tokens::IMAGE_TOKENS;
     fn remove_image_payloads(value: &mut Value) -> u64 {
         match value {
@@ -393,26 +387,25 @@ fn request_input_budget(model: &ResolvedModel, value: &Value) -> u64 {
             _ => 0,
         }
     }
-    // Count top-level fields and array items (messages/input/tools) separately, memoized by content:
-    // append-only history only BPE-counts new items, and the whole body is never cloned.
+    // Count top-level fields and array items separately so the whole body is never cloned at once.
     let pieces: Vec<&Value> = match value {
         // A bare content block (has "type") stays whole so image payloads are still recognized.
         Value::Object(fields) if !fields.contains_key("type") => fields.values()
             .flat_map(|v| match v { Value::Array(items) => items.iter().collect(), v => vec![v] }).collect(),
         v => vec![v],
     };
-    let raw: u64 = pieces.into_iter().map(|piece| counter.count_cached(piece, || {
+    let raw: u64 = pieces.into_iter().map(|piece| {
         let mut piece = piece.clone();
         let images = remove_image_payloads(&mut piece);
         counter.count_json(&piece).saturating_add(images)
-    })).sum();
-    if counter.tokenizer_known() { raw } else { (raw as f64 * UNKNOWN_TOKENIZER_MARGIN).ceil() as u64 }
+    }).sum();
+    (raw as f64 * UNKNOWN_TOKENIZER_MARGIN).ceil() as u64
 }
 
 fn budget_output_tokens(body: &mut Value, model: &ResolvedModel, field: &str) {
     let requested = body[field].as_u64().unwrap_or(model.max_output_tokens);
     let available = model.context_window
-        .saturating_sub(request_input_budget(model, body))
+        .saturating_sub(request_input_budget(body))
         .saturating_sub(8192);
     body[field] = json!(requested.min(available).max(16));
 }
@@ -1625,7 +1618,6 @@ async fn stream_chat_once(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
-    model_token_counter(model)?;
     if model.api != "openai-responses" { response_state::reset(session_id); }
     match model.api.as_str() {
         "codebuddy" => {
@@ -2610,7 +2602,7 @@ mod tests {
         ] {
             let output = body[field].as_u64().unwrap();
             assert!(output < model.max_output_tokens);
-            assert!(output + request_input_budget(&model, &body) < model.context_window);
+            assert!(output + request_input_budget(&body) < model.context_window);
         }
         // A long CJK chat with realistic word/line boundaries still gets its output budget.
         let mut kimi = test_model("openai-completions");
@@ -2622,12 +2614,11 @@ mod tests {
         let short = completions_body(&model, "sys", &[], &[], None, None);
         assert_eq!(short["max_completion_tokens"], model.max_output_tokens);
         // Base64 bytes are not text tokens, and must not exhaust the window.
-        assert!(request_input_budget(&model, &json!({"type":"input_image", "image_url":"x".repeat(1_000_000)})) < 2 * super::super::tokens::IMAGE_TOKENS);
-        // Unconfirmed tokenizers (Claude on cl100k fallback) get a safety margin over raw BPE.
-        let claude = test_model("anthropic-messages");
+        assert!(request_input_budget(&json!({"type":"input_image", "image_url":"x".repeat(1_000_000)})) < 2 * super::super::tokens::IMAGE_TOKENS);
+        // The heuristic gets a safety margin for the output cap.
         let body = json!({"messages": [{"role":"user","content":"fn main() { println!(\"hello\"); }\n".repeat(200)}]});
-        let raw = model_token_counter(&claude).unwrap().count_json(&body["messages"][0]);
-        assert!(request_input_budget(&claude, &body) as f64 >= raw as f64 * UNKNOWN_TOKENIZER_MARGIN);
+        let raw = super::super::tokens::TokenCounter.count_json(&body["messages"][0]);
+        assert!(request_input_budget(&body) as f64 >= raw as f64 * UNKNOWN_TOKENIZER_MARGIN);
         model.context_window = 100;
         let small = anthropic_body(&model, "sys", &messages, &[], Some("high"));
         assert_eq!(small["max_tokens"], 16);

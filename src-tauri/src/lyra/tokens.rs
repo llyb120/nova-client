@@ -1,45 +1,14 @@
-//! 本地 BPE 计数。文本在所选词表下精确；服务端封装、闭源词表和多模态成本不是精确值。
+//! 本地 token 估算（字符启发式）。只用于发送前预算；provider 返回的 usage 才是实测，
+//! 由 ContextWindow 以上次实测为锚点，只对其后新增的消息做估算。
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::{LazyLock, Mutex};
-use tiktoken_rs::tokenizer::{get_tokenizer, Tokenizer};
 
 /// 每张图片的视觉 token 估算；本地预算与 provider 出站计数共用。
 // ponytail: 视觉成本取决于分辨率/服务商切块，1600≈Claude 单图上限；接入原生 count API 后替换。
 pub const IMAGE_TOKENS: u64 = 1600;
 
-// ponytail: 进程级 (词表, 内容 hash) → 计数缓存，满 CACHE_LIMIT 整体清空；
-// 仍需每次序列化+hash（O(字节)，远低于 BPE）。真成瓶颈再按历史下标增量维护。
-const CACHE_LIMIT: usize = 16_384;
-static MESSAGE_CACHE: LazyLock<Mutex<HashMap<u64, TokenBreakdown>>> = LazyLock::new(Default::default);
-static JSON_CACHE: LazyLock<Mutex<HashMap<u64, u64>>> = LazyLock::new(Default::default);
-
-fn memo<T: Clone>(cache: &Mutex<HashMap<u64, T>>, key: u64, count: impl FnOnce() -> T) -> T {
-    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) { return hit; }
-    let value = count();
-    if let Ok(mut c) = cache.lock() {
-        if c.len() >= CACHE_LIMIT { c.clear(); }
-        c.insert(key, value.clone());
-    }
-    value
-}
-
-#[derive(Clone, Debug)]
-pub struct TokenCounter {
-    model: String,
-    api: String,
-    o200k: bool,
-    source: &'static str,
-    model_tokenizer_known: bool,
-}
-
-impl Default for TokenCounter {
-    fn default() -> Self {
-        Self { model: String::new(), api: String::new(), o200k: true, source: "fallback", model_tokenizer_known: false }
-    }
-}
+#[derive(Clone, Debug, Default)]
+pub struct TokenCounter;
 
 /// 分项均未校准，互不重复；total() 是它们的和。数量字段不计入 token 总数。
 #[derive(Clone, Debug, Default, Serialize)]
@@ -74,84 +43,28 @@ impl TokenBreakdown {
 }
 
 impl TokenCounter {
-    /// options.tokenizer 覆盖选择，但不证明闭源/代理模型真的使用该词表。
-    pub fn for_model(model: &str, api: &str, tokenizer_override: Option<&str>) -> Result<Self, String> {
-        let name = model.to_ascii_lowercase();
-        let api = api.to_ascii_lowercase();
-        let openai = matches!(api.as_str(), "openai-completions" | "openai-responses" | "openai" | "responses" | "completions");
-        let known = if openai {
-            // tiktoken-rs 0.9 的映射早于 GPT-5.x；这些模型的普通文本仍用 o200k。
-            if name.starts_with("gpt-5.") { Some(Tokenizer::O200kBase) } else { get_tokenizer(&name) }
-        } else { None };
-        let known = match known {
-            Some(Tokenizer::O200kBase) => Some(true),
-            Some(Tokenizer::Cl100kBase) => Some(false),
-            _ => None,
-        };
-        // 前缀命中可能只是自定义别名（如 gpt-4o-private），不能宣称其词表已知。
-        let exact_model = matches!(name.as_str(), "gpt-4" | "gpt-3.5-turbo" | "gpt-35-turbo"
-            | "gpt-4o" | "gpt-4o-mini" | "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano"
-            | "gpt-5" | "gpt-5-mini" | "gpt-5-nano" | "gpt-5.1" | "gpt-5.2" | "o1" | "o3" | "o3-mini" | "o4-mini");
-        let (o200k, source) = match tokenizer_override {
-            Some(value) => (match value.trim().to_ascii_lowercase().as_str() {
-                "o200k" | "o200k_base" => true,
-                "cl100k" | "cl100k_base" => false,
-                _ => return Err(format!("unsupported options.tokenizer {value:?}; use o200k_base or cl100k_base")),
-            }, "override"),
-            None => (known.unwrap_or(!api.starts_with("anthropic")),
-                if known.is_some() && exact_model { "model" } else if known.is_some() { "inferred" } else { "fallback" }),
-        };
-        Ok(Self { model: model.into(), api, o200k, source, model_tokenizer_known: exact_model && known == Some(o200k) })
-    }
-
-    /// 词表是否确认为该模型所用；否则 BPE 只是近似（如 Claude 走 cl100k 回退）。
-    pub fn tokenizer_known(&self) -> bool {
-        self.model_tokenizer_known
-    }
-
-    fn key(&self, text: &str) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (self.o200k, text).hash(&mut h);
-        h.finish()
-    }
-
-    /// 按 value 内容缓存 `count` 的结果（同词表下同内容计数相同）。
-    pub fn count_cached(&self, value: &Value, count: impl FnOnce() -> u64) -> u64 {
-        memo(&JSON_CACHE, self.key(&value.to_string()), count)
-    }
-
     pub fn metadata(&self) -> Value {
         json!({
-            "model": self.model, "api": self.api,
-            "encoding": if self.o200k { "o200k_base" } else { "cl100k_base" },
-            "source": self.source, "textBpeExact": true,
-            "modelTokenizerKnown": self.model_tokenizer_known, "promptExact": false,
-            "jsonCountScope": "BPE of Value::to_string() JSON text, NOT the server's model-input serialization or multimodal token cost",
-            "limitations": "BPE counts are exact only for the supplied text and selected vocabulary. Model aliases/closed tokenizers, server framing, tool rendering and multimodal tokens remain estimates; provider usage is authoritative."
+            "method": "heuristic", "promptExact": false,
+            "limitations": "ASCII ~4 chars/token, other chars ~1 token each; images/unknown parts are placeholders. Provider usage is authoritative and anchors the estimate."
         })
     }
 
+    // ponytail: 字符启发式，单条文本误差约 ±20%（CJK 偏保守）；长会话由实测 usage 锚定，只有新增部分是估算。
     pub fn count_text(&self, text: &str) -> u64 {
-        if text.is_empty() { return 0; }
-        // 库的线程安全 singleton 只加载一次内嵌词表，不为每次请求重新构造 tokenizer。
-        let bpe = if self.o200k { tiktoken_rs::o200k_base_singleton() } else { tiktoken_rs::cl100k_base_singleton() };
-        // 普通用户文本中的 <|...|> 不能被当作协议 special token。
-        bpe.encode_ordinary(text).len() as u64
+        let (ascii, other) = text.chars().fold((0_u64, 0_u64), |(a, o), ch| if ch.is_ascii() { (a + 1, o) } else { (a, o + 1) });
+        ascii.div_ceil(4) + other
     }
 
-    /// 精确计数 Value::to_string() 的 BPE，而非服务端 prompt tokens。
-    /// provider 应传最终出站请求；base64 图片 JSON 字节不等于视觉 token。
+    /// 估算 Value::to_string()，而非服务端 prompt tokens；base64 图片 JSON 字节不等于视觉 token。
     pub fn count_json(&self, value: &Value) -> u64 {
         self.count_text(&value.to_string())
     }
 
-    /// Lyra 规范消息分项，不替代 provider 对最终序列化请求的计数。
-    /// 按消息内容缓存：历史只追加时每次往返只对新消息做 BPE。
+    /// Lyra 规范消息分项，不替代 provider 实测。
     pub fn count_messages(&self, messages: &[Value]) -> TokenBreakdown {
         let mut out = TokenBreakdown::default();
-        for message in messages {
-            out.add(&memo(&MESSAGE_CACHE, self.key(&message.to_string()), || self.count_message(message)));
-        }
+        for message in messages { out.add(&self.count_message(message)); }
         out
     }
 

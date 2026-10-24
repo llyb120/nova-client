@@ -106,12 +106,24 @@ struct State {
     projection: Option<Projection>,
     /// provider 实测 prompt tokens / 本地估算，校准后续估算。
     calibration: f64,
-    /// 旧字符启发式/其它模型的校准不能应用到当前 BPE 基线；不改变投影版本。
+    /// 估算口径（计数方法 + 去 reasoning 策略）变化时校准作废；不改变投影版本。
     accounting_key: String,
     last_actual_usage: Option<Value>,
+    /// 上次 provider 实测对应的已发送前缀；当前视图仍以它开头时以实测为准，只估算新增部分。
+    anchor: Option<Anchor>,
     notice_rung: usize,
     recall_spent: u64,
     last_receipt: Option<Receipt>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct Anchor {
+    count: usize,
+    prefix_hash: String,
+    prompt_tokens: u64,
+    /// 实测时的 system/tools 估算，用于系统提示变化后补差额。
+    fixed: u64,
 }
 
 const STATE_VERSION: u32 = 1;
@@ -231,9 +243,23 @@ impl ContextWindow {
         parts
     }
 
-    /// 已规范化 messages 作为一次请求的估算 prompt tokens（含系统提示与工具定义）。
+    /// 视图仍以上次实测请求开头时返回该锚点。
+    // ponytail: 每次对已发送前缀做一次 sha256（O(历史大小)）；真成瓶颈再缓存 (len, hash)。
+    fn anchor(&self, messages: &[Value]) -> Option<&Anchor> {
+        self.state.anchor.as_ref()
+            .filter(|a| a.count <= messages.len() && hash_values(&messages[..a.count]) == a.prefix_hash)
+    }
+
+    /// 已规范化 messages 作为一次请求的 prompt tokens（含系统提示与工具定义）：
+    /// 有实测锚点时 = 实测 + 新增消息估算 + 固定开销差额；否则为校准后的整体估算。
     pub fn prompt_tokens(&self, messages: &[Value]) -> u64 {
-        self.scaled(self.token_breakdown(messages).total())
+        match self.anchor(messages) {
+            Some(a) => {
+                let fixed_delta = (self.fixed.total() as f64 - a.fixed as f64) * self.calibration();
+                (a.prompt_tokens as f64 + fixed_delta).max(0.0).ceil() as u64 + self.messages_tokens(&messages[a.count..])
+            }
+            None => self.scaled(self.token_breakdown(messages).total()),
+        }
     }
 
     fn messages_tokens(&self, messages: &[Value]) -> u64 {
@@ -250,6 +276,7 @@ impl ContextWindow {
             self.state.calibration = ratio;
             self.state.accounting_key = self.accounting_key.clone();
         }
+        self.state.anchor = Some(Anchor { count: sent.len(), prefix_hash: hash_values(sent), prompt_tokens, fixed: self.fixed.total() });
         self.state.last_actual_usage = Some(json!({
             "promptTokens": prompt_tokens, "localUncalibratedPromptTokens": fixed,
             "calibrationAccepted": accepted, "tokenizer": self.counter.metadata(), "at": now_ms()
@@ -352,9 +379,10 @@ impl ContextWindow {
 
     /// `context_budget` 工具的回答：分项保持原始口径，校准差额单列，不能把总量称为精确。
     pub fn budget_report(&self, canonical: &[Value]) -> String {
-        let parts = self.token_breakdown(&self.prompt_view(canonical));
+        let view = self.prompt_view(canonical);
+        let parts = self.token_breakdown(&view);
         let raw = parts.total();
-        let used = self.scaled(raw);
+        let used = self.prompt_tokens(&view);
         let trigger = self.trigger_tokens();
         let recall_budget = MIN_RECALL_TOKENS.max((self.window as f64 * RECALL_RATIO) as u64);
         let report = json!({
@@ -369,6 +397,7 @@ impl ContextWindow {
             "uncalibratedPromptTokens": raw,
             "calibrationFactor": self.calibration(),
             "calibrationAdjustment": used as i128 - raw as i128,
+            "anchoredToActualUsage": self.anchor(&view).is_some(),
             "estimatedPromptTokens": used,
             "reservedOutputTokens": self.output_reserve(),
             "protocolReserveTokens": PROTOCOL_RESERVE,
@@ -377,7 +406,7 @@ impl ContextWindow {
             "folds": self.state.generation,
             "recall": { "budget": recall_budget, "spent": self.state.recall_spent, "remaining": recall_budget.saturating_sub(self.state.recall_spent) },
             "lastActualUsage": self.state.last_actual_usage,
-            "notes": format!("Breakdown fields are uncalibrated and additive (messageCount/imageCount/unknownPartCount are counts). Images ({IMAGE_TOKENS} each, including candidate screenshot paths), protocol overhead, reasoning replay and unknown content are estimates; final provider serialization may differ. JSON BPE is not the server's model-input serialization. Legacy constructors leave system/tools unsplit in overhead until configured. Last actual usage belongs to its previous request, not necessarily this projection. No declared window disables automatic compaction; exhausted input budget means the fixed system prompt/tools fill the window."),
+            "notes": format!("Breakdown fields are uncalibrated and additive (messageCount/imageCount/unknownPartCount are counts). Counts are character-heuristic estimates; images ({IMAGE_TOKENS} each, including candidate screenshot paths), protocol overhead, reasoning replay and unknown content are placeholders. When anchoredToActualUsage is true, estimatedPromptTokens is the last provider-measured prompt plus estimates for messages added since. Legacy constructors leave system/tools unsplit in overhead until configured. Last actual usage belongs to its previous request, not necessarily this projection. No declared window disables automatic compaction; exhausted input budget means the fixed system prompt/tools fill the window."),
         });
         serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
     }
@@ -1273,10 +1302,8 @@ mod tests {
     }
 
     #[test]
-    fn bpe_budget_matches_text_tools_and_actual_usage() {
+    fn token_budget_counts_parts_and_anchors_to_actual_usage() {
         use crate::lyra::history::estimate_text_tokens;
-        fn thread_safe<T: Send + Sync>() {}
-        thread_safe::<TokenCounter>();
         let text = "Hello, world! 中文代码：fn main() { println!(\"你好\"); } <|endoftext|>";
         let args = json!({ "path": "src/中文.rs", "content": text });
         let tools = json!([{ "name": "write", "description": "写代码", "parameters": {
@@ -1284,65 +1311,59 @@ mod tests {
         }}]);
         let messages = vec![user(text), call("c1", "write", args.clone()), result("c1", "write", "完成 done", false),
             json!({ "role": "user", "content": [{ "type": "image", "data": "not-tokenized-as-base64" }] })];
-        for encoding in ["o200k_base", "cl100k_base"] {
-            let counter = TokenCounter::for_model("gpt-4o", "openai-responses", Some(encoding)).unwrap();
-            let bpe = if encoding == "o200k_base" { tiktoken_rs::o200k_base_singleton() } else { tiktoken_rs::cl100k_base_singleton() };
-            assert_eq!(counter.count_text("Hello, world!"), 4);
-            assert_eq!(counter.count_text(text), bpe.encode_ordinary(text).len() as u64);
-            assert_eq!(counter.count_text(""), 0);
-            assert_eq!(counter.count_json(&args), bpe.encode_ordinary(&args.to_string()).len() as u64);
-            let mut ctx = ContextWindow::ephemeral(4096, 999);
-            ctx.configure_tokens(counter.clone(), "系统 system", &tools, 512);
-            let parts = ctx.token_breakdown(&messages);
-            assert_eq!(parts.system, counter.count_text("系统 system"));
-            assert_eq!(parts.tools, counter.count_json(&tools));
-            assert_eq!(parts.messages_text, counter.count_text(text));
-            assert_eq!(parts.tool_arguments, counter.count_json(&args));
-            assert_eq!(parts.tool_results, counter.count_text("完成 done"));
-            assert_eq!(parts.images, IMAGE_TOKENS);
-            assert_eq!(parts.image_count, 1);
-            assert_eq!(parts.message_count, 4);
-            let raw = parts.total();
-            assert_eq!(ctx.prompt_tokens(&messages), raw);
-            let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
-            assert_eq!(report["uncalibratedPromptTokens"], raw);
-            assert_eq!(report["estimatedTotalWithReserves"], raw + 512 + PROTOCOL_RESERVE);
-            assert_eq!(report["foldTrigger"], 3328);
-            assert_eq!(report["tokenizer"]["promptExact"], false);
-            assert!(report["lastActualUsage"].is_null());
-            // 旧账本兼容且不误用字符估算时代的校准；usage 中 cache 只计入 prompt 一次。
-            ctx.state = serde_json::from_value(json!({ "version": 1, "calibration": 4.0, "recallSpent": 7 })).unwrap();
-            assert_eq!(ctx.prompt_tokens(&messages), raw);
-            ctx.record_usage(&messages, &json!({ "input": raw - 30, "cacheRead": 20, "cacheWrite": 10, "output": 8, "reasoning": 3 }));
-            let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
-            assert_eq!(report["lastActualUsage"]["promptTokens"], raw);
-            assert_eq!(report["lastActualUsage"]["usage"]["reasoning"], 3);
-            assert_eq!(report["recall"]["spent"], 7);
-            ctx.state = serde_json::from_str(&serde_json::to_string(&ctx.state).unwrap()).unwrap();
-            ctx.calibrate(&messages, raw * 2);
-            assert_eq!(ctx.prompt_tokens(&messages), raw * 2);
-            let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
-            assert_eq!(report["calibrationAdjustment"], raw);
-            assert_eq!(report["breakdown"]["messagesText"], counter.count_text(text));
-            ctx.configure_tokens(TokenCounter::default(), "different system", &Value::Null, 512);
-            assert_eq!(ctx.calibration(), 1.0);
-        }
+        let counter = TokenCounter;
+        assert_eq!(counter.count_text("Hello, world!"), 4);
+        assert_eq!(counter.count_text("中文"), 2);
+        assert_eq!(counter.count_text(""), 0);
+        assert_eq!(estimate_text_tokens(text), counter.count_text(text));
+        let mut ctx = ContextWindow::ephemeral(4096, 999);
+        ctx.configure_tokens(counter.clone(), "系统 system", &tools, 512);
+        let parts = ctx.token_breakdown(&messages);
+        assert_eq!(parts.system, counter.count_text("系统 system"));
+        assert_eq!(parts.tools, counter.count_json(&tools));
+        assert_eq!(parts.messages_text, counter.count_text(text));
+        assert_eq!(parts.tool_arguments, counter.count_json(&args));
+        assert_eq!(parts.tool_results, counter.count_text("完成 done"));
+        assert_eq!(parts.images, IMAGE_TOKENS);
+        assert_eq!(parts.image_count, 1);
+        assert_eq!(parts.message_count, 4);
+        let raw = parts.total();
+        assert_eq!(ctx.prompt_tokens(&messages), raw);
+        let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
+        assert_eq!(report["uncalibratedPromptTokens"], raw);
+        assert_eq!(report["estimatedTotalWithReserves"], raw + 512 + PROTOCOL_RESERVE);
+        assert_eq!(report["foldTrigger"], 3328);
+        assert_eq!(report["tokenizer"]["promptExact"], false);
+        assert!(report["lastActualUsage"].is_null());
+        // 旧账本（BPE 时代的校准）不误用；usage 中 cache 只计入 prompt 一次。
+        ctx.state = serde_json::from_value(json!({ "version": 1, "calibration": 4.0, "recallSpent": 7 })).unwrap();
+        assert_eq!(ctx.prompt_tokens(&messages), raw);
+        ctx.record_usage(&messages, &json!({ "input": raw - 30, "cacheRead": 20, "cacheWrite": 10, "output": 8, "reasoning": 3 }));
+        let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
+        assert_eq!(report["lastActualUsage"]["promptTokens"], raw);
+        assert_eq!(report["lastActualUsage"]["usage"]["reasoning"], 3);
+        assert_eq!(report["recall"]["spent"], 7);
+        ctx.state = serde_json::from_str(&serde_json::to_string(&ctx.state).unwrap()).unwrap();
+        // 实测 = 3×估算：已发送前缀直接用实测，新增消息按校准系数估算。
+        ctx.calibrate(&messages, raw * 3);
+        assert_eq!(ctx.prompt_tokens(&messages), raw * 3);
+        let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
+        assert_eq!(report["calibrationAdjustment"], raw * 2);
+        assert_eq!(report["anchoredToActualUsage"], true);
+        let mut next = messages.clone();
+        next.push(user("next turn"));
+        let tail = ctx.token_breakdown(&next).total() - raw;
+        assert_eq!(ctx.prompt_tokens(&next), raw * 3 + tail * 3);
+        // 前缀被改写（折叠/去 reasoning）时锚点失效，回退为校准后的整体估算。
+        assert_eq!(ctx.prompt_tokens(&next[1..]), ctx.token_breakdown(&next[1..]).total() * 3);
+        // 系统提示变化只调整固定开销差额，不丢弃实测。
+        ctx.configure_tokens(counter.clone(), "系统 system 加长了", &tools, 512);
+        let grown = (counter.count_text("系统 system 加长了") - counter.count_text("系统 system")) * 3;
+        assert_eq!(ctx.prompt_tokens(&messages), raw * 3 + grown);
         let mut screenshots = result("c1", "chrome", "page", false);
         screenshots["details"] = json!({ "images": [{ "path": "/does/not/need/to/exist.png" }, { "imageId": "repeat-without-image" }] });
         let parts = TokenCounter::default().count_messages(&[screenshots]);
         assert_eq!((parts.image_count, parts.images), (1, IMAGE_TOKENS));
-        assert_eq!(estimate_text_tokens(text), tiktoken_rs::o200k_base_singleton().encode_ordinary(text).len() as u64);
-        assert_eq!(TokenCounter::for_model("gpt-4", "openai-completions", None).unwrap().metadata()["encoding"], "cl100k_base");
-        assert_eq!(TokenCounter::for_model("gpt-5.2", "openai-responses", None).unwrap().metadata()["encoding"], "o200k_base");
-        for model in ["claude-sonnet-4", "unknown-deployment"] {
-            let counter = TokenCounter::for_model(model, "openai-completions", Some("o200k_base")).unwrap();
-            assert_eq!(counter.metadata()["modelTokenizerKnown"], false);
-        }
-        assert_eq!(TokenCounter::for_model("gpt-4o", "anthropic-messages", None).unwrap().metadata()["source"], "fallback");
-        assert!(TokenCounter::for_model("gpt-4o", "openai-responses", Some("bogus")).is_err());
-        let alias = TokenCounter::for_model("gpt-4o-private-deployment", "openai-responses", None).unwrap().metadata();
-        assert_eq!(alias["source"], "inferred");
-        assert_eq!(alias["modelTokenizerKnown"], false);
         let unknown_media = |data: &str| json!({ "role": "user", "content": [{ "type": "input_audio", "data": data }] });
         let counter = TokenCounter::default();
         assert_eq!(counter.count_messages(&[unknown_media("tiny")]).total(), counter.count_messages(&[unknown_media(&"abc".repeat(10000))]).total());

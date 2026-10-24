@@ -73,7 +73,7 @@ const HEADER_HINT = "支持 {env:NAME} 占位符；模型级同名头覆盖 Prov
 const FIELD_HINT =
   "写入 options，未知键原样透传到请求体顶层（如 tool_stream、thinking_budget），内置键如 temperature、topP、clearThinking 由 Lyra 消费。值按 JSON 解析（0.7、true、{...}），失败按字符串；要发送字符串 \"123\" 请带引号。";
 const ACCOUNTING_HINT =
-  'tokenizer 不填时自动选择，也可在此处 options 填 "o200k_base" 或 "cl100k_base"（不支持 "auto"）。仅所选词表的文本 BPE 可精确计数；完整请求、多模态及闭源模型仍是估算，以服务商 usage 为准。responsesContinuation 默认关闭；仅支持 previous_response_id 的 OpenAI Responses 服务可设置为 "auto"，同时需要 store=true。store=true 会让服务商保存响应，请先确认隐私策略；本地 Codex 订阅不适用。';
+  '上下文用量以服务商返回的 usage 为准，只对之后新增的内容做本地估算。responsesContinuation 默认关闭；仅支持 previous_response_id 的 OpenAI Responses 服务可设置为 "auto"，同时需要 store=true。store=true 会让服务商保存响应，请先确认隐私策略；本地 Codex 订阅不适用。';
 
 /** onSaver 注册给设置弹窗的统一「保存」：未加载或未修改时为空操作。 */
 export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) => void }) {
