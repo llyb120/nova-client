@@ -112,6 +112,9 @@ def validate_runtime(root: Path, kind: str, arch: str) -> None:
     if kind == "python" and not list((root / "Lib/ensurepip/_bundled").glob("pip-*.whl")):
         raise ValueError("Python runtime has no bundled pip wheel")
     for path in root.rglob("*"):
+        # pip's distlib ships launcher templates for every arch (t32/w64-arm.exe...).
+        if path.parent.name == "distlib" and path.parent.parent.name == "_vendor":
+            continue
         if path.suffix.lower() in (".exe", ".dll", ".pyd"):
             if pe_arch(path.read_bytes()) != arch:
                 raise ValueError(f"{kind} architecture mismatch ({arch} required): {path.name}")
