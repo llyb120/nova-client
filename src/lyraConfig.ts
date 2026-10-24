@@ -179,19 +179,107 @@ export function validate(providers: ProviderDraft[], presets: Preset[]): string 
   return null;
 }
 
-export type LyraDraft = { model: string; providers: ProviderDraft[] };
+/** MCP 是用户信任的程序/服务；不从服务端 annotations 推断只读授权。 */
+export function parseMcpServers(text: string): Record<string, any> {
+  let servers: unknown;
+  try {
+    servers = JSON.parse(text);
+  } catch {
+    throw new Error("MCP：请输入有效 JSON（不支持注释）；用 {} 清空服务器。");
+  }
+  if (!isObject(servers)) throw new Error("MCP：mcpServers 必须是服务器名称到配置的 JSON 对象，不能是数组或 null。");
+  if (Object.keys(servers).length > 64) throw new Error("MCP：最多配置 64 个服务器（包括禁用项）。");
+  // 与 lyra/mcp/configuration.rs 一致（后端为准），长度按 UTF-8 字节计，不展开凭据。
+  const encoder = new TextEncoder();
+  const validText = (value: unknown, max: number): value is string =>
+    typeof value === "string" && encoder.encode(value).length <= max && !value.includes("\0");
+  const keys = ["enabled", "command", "args", "env", "cwd", "url", "headers", "startup_timeout_ms", "request_timeout_ms", "readOnlyTools"];
+  for (const [name, server] of Object.entries(servers)) {
+    const fail = (message: string): never => { throw new Error(`MCP「${name}」：${message}`); };
+    if (!name.trim()) fail("服务器名称不能为空。");
+    if (name.length > 128 || /[^A-Za-z0-9._-]/.test(name)) fail("服务器名称限 1–128 个 ASCII 字母、数字或 ._-。");
+    if (!isObject(server)) fail("服务器配置必须是对象。");
+    if (Object.values(server).some((value) => value === null)) fail("字段值不能为 null；不需要的字段请删除。");
+    if (typeof server.enabled !== "boolean") fail("enabled 必须明确填写 true 或 false。");
+    if (Object.hasOwn(server, "readOnly")) fail("不再支持 readOnly；请改用 readOnlyTools 数组逐个授权工具，不能授权整个服务器。");
+    const unknown = Object.keys(server).find((key) => !keys.includes(key));
+    if (unknown !== undefined) fail(`不支持的服务器字段：${unknown}。`);
+    if (server.readOnlyTools !== undefined && (!Array.isArray(server.readOnlyTools) || server.readOnlyTools.some((tool: unknown) => !validText(tool, 128) || !tool.trim() || /[\x00-\x1f\x7f-\x9f]/.test(tool)) || new Set(server.readOnlyTools).size > 64)) {
+      fail("readOnlyTools 最多包含 64 个不同工具名；每项须为 1–128 字节的非空字符串，不含控制字符。省略或 [] 表示不授权只读调用。");
+    }
+    for (const key of ["startup_timeout_ms", "request_timeout_ms"]) {
+      if (server[key] !== undefined && (!Number.isSafeInteger(server[key]) || server[key] < 1 || server[key] > 600_000)) {
+        fail(`${key} 必须是 1–600000 的整数（毫秒）。`);
+      }
+    }
+    const command = Object.hasOwn(server, "command");
+    const url = Object.hasOwn(server, "url");
+    if (command === url) fail("command（stdio）和 url（HTTP）必须且只能填写一个。");
+    const endpoint = command ? "command" : "url";
+    if (typeof server[endpoint] !== "string" || !server[endpoint].trim()) fail(`${endpoint} 必须是非空字符串。`);
+    if (url) {
+      const parsed = URL.canParse(server.url) ? new URL(server.url) : null;
+      if (!parsed) fail("url 必须是完整的 http:// 或 https:// 地址，不能含凭据或 # 片段。");
+      else {
+        if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password || server.url.includes("#")) {
+          fail("url 必须包含主机，且不能含凭据或片段。");
+        }
+        // URL 解析已规范化主机（127.1 → 127.0.0.1，小写）。
+        const loopback = parsed.hostname === "localhost" || parsed.hostname === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(parsed.hostname);
+        if (parsed.protocol === "http:" && !loopback) fail("非本机（localhost/127.x/[::1]）服务必须使用 https://。");
+      }
+    }
+    for (const key of command ? ["headers"] : ["args", "env", "cwd"]) {
+      if (Object.hasOwn(server, key)) fail(`${endpoint} 配置不能包含 ${key}，请勿混合 stdio 和 HTTP 字段。`);
+    }
+    if (command && !validText(server.command, 4096)) fail("command 最多 4096 字节，不能含 NUL。");
+    if (server.cwd !== undefined && (typeof server.cwd !== "string" || !/^(\/|[A-Za-z]:[\\/]|\\\\)/.test(server.cwd) || server.cwd.includes("\0"))) fail("cwd 必须是绝对目录路径，不能含 NUL；省略时固定为会话初始目录。");
+    if (server.args !== undefined && (!Array.isArray(server.args) || server.args.length > 128 || server.args.some((arg: unknown) => !validText(arg, 65_536)))) {
+      fail("args 必须是最多 128 项的字符串数组，每项最多 65536 字节且不含 NUL。");
+    }
+    for (const key of ["env", "headers"]) {
+      if (server[key] === undefined) continue;
+      if (!isObject(server[key]) || Object.keys(server[key]).length > 64) fail(`${key} 必须是最多 64 项的字符串值对象。`);
+      const names = new Set<string>();
+      for (const [name, value] of Object.entries(server[key])) {
+        if (!validText(value, 65_536)) fail(`${key} 的值须为字符串，最多 65536 字节且不含 NUL。`);
+        if (key === "env" && (!name || !validText(name, 256) || name.includes("="))) fail("env 名称须为 1–256 字节，不含 = 或 NUL。");
+        if (key === "headers") {
+          const lower = name.toLowerCase();
+          if (!name || /[^!#$%&'*+.^_`|~0-9A-Za-z-]/.test(name)) fail("headers 包含无效的 HTTP 头名称。");
+          if (names.has(lower) || ["host", "content-length", "transfer-encoding", "connection", "content-type", "accept", "mcp-session-id", "mcp-protocol-version"].includes(lower)) {
+            fail("headers 不能覆盖协议保留头，或包含大小写重复的名称。");
+          }
+          names.add(lower);
+        }
+        const unresolved = (value as string).replace(/\{env:([^}]*)(\}|$)/g, (_, name: string, closing: string) => {
+          if (closing !== "}" || !name || name.length > 256 || /[^A-Za-z0-9_]/.test(name)) fail(`${key} 包含无效或未闭合的 {env:NAME} 占位符。`);
+          return "placeholder";
+        });
+        if (!validText(unresolved, 65_536)) fail(`${key} 占位符替换后的值超过 65536 字节。`);
+        if (key === "headers" && /[^\x20-\x7e\t]/.test(unresolved)) fail("headers 的值只能含可见 ASCII 字符、空格或制表符。");
+      }
+    }
+  }
+  return servers;
+}
+
+export type LyraDraft = { model: string; providers: ProviderDraft[]; mcpServers: string };
 
 export function draftFromConfig(raw: Record<string, any>): LyraDraft {
   const providers = isObject(raw.provider) ? raw.provider : {};
   return {
     model: typeof raw.model === "string" ? raw.model : "",
     providers: Object.entries(providers).map(([id, p]) => providerDraft(id, isObject(p) ? p : {})),
+    mcpServers: JSON.stringify(raw.mcpServers === undefined ? {} : raw.mcpServers, null, 2),
   };
 }
 
 /** raw 为加载时的完整配置，未接管的顶层键原样保留。 */
 export function configFromDraft(raw: Record<string, any>, draft: LyraDraft) {
+  const mcpServers = parseMcpServers(draft.mcpServers);
   const config: Record<string, any> = { ...raw };
+  if (Object.keys(mcpServers).length || Object.hasOwn(raw, "mcpServers")) config.mcpServers = mcpServers;
   setOrDelete(config, "model", draft.model);
   config.provider = Object.fromEntries(draft.providers.map((p) => [p.id.trim(), serializeProvider(p)]));
   return config;

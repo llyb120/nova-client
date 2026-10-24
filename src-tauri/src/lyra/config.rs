@@ -76,6 +76,8 @@ pub fn process_env() -> HashMap<String, String> {
 pub struct ResolvedModel {
     pub provider: String,
     pub command_code: bool,
+    /// 本地订阅反代来源；不是密钥，不允许通过模型 options 改写目标地址。
+    pub local_auth: Option<String>,
     pub id: String,
     pub api: String,
     pub base_url: String,
@@ -537,7 +539,7 @@ pub fn resolve_model(
                 .map(|variants| !variants.is_empty())
                 .unwrap_or(false)
         });
-    let mut headers = resolve_headers(model, provider, env)?;
+    let headers = resolve_headers(model, provider, env)?;
     let url_lower = base_url.to_lowercase();
     let official_openai = url_lower.contains("api.openai.com");
     // 默认不注入会话亲和 header；仅 provider/model 显式声明时发送。
@@ -585,7 +587,10 @@ pub fn resolve_model(
         model: ResolvedModel {
             provider: provider_id.to_string(),
             command_code: matches!(provider["preset"].as_str(), Some("commandcode" | "server-support")),
-            id: model_id.to_string(),
+            local_auth: provider["localAuth"].as_str().map(str::to_string),
+            id: if provider["localAuth"] == "claude-code" {
+                model["localModel"].as_str().unwrap_or(model_id).to_string()
+            } else { model_id.to_string() },
             api,
             thinking_format,
             max_tokens_field: detect_max_tokens_field(&base_url, model, provider),

@@ -1,5 +1,5 @@
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { createSignal, For, Index, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, Index, onMount, Show } from "solid-js";
 import { createStore, produce, unwrap } from "solid-js/store";
 import { api } from "../ipc";
 import {
@@ -9,6 +9,7 @@ import {
   hasVariants,
   isLocalPreset,
   modelDraft,
+  parseMcpServers,
   providerDraft,
   serializeProvider,
   validate,
@@ -71,12 +72,23 @@ function KvEditor(props: {
 const HEADER_HINT = "支持 {env:NAME} 占位符；模型级同名头覆盖 Provider 级，值填 null 可删除继承的头。";
 const FIELD_HINT =
   "写入 options，未知键原样透传到请求体顶层（如 tool_stream、thinking_budget），内置键如 temperature、topP、clearThinking 由 Lyra 消费。值按 JSON 解析（0.7、true、{...}），失败按字符串；要发送字符串 \"123\" 请带引号。";
+const ACCOUNTING_HINT =
+  'tokenizer 不填时自动选择，也可在此处 options 填 "o200k_base" 或 "cl100k_base"（不支持 "auto"）。仅所选词表的文本 BPE 可精确计数；完整请求、多模态及闭源模型仍是估算，以服务商 usage 为准。responsesContinuation 默认关闭；仅支持 previous_response_id 的 OpenAI Responses 服务可设置为 "auto"，同时需要 store=true。store=true 会让服务商保存响应，请先确认隐私策略；本地 Codex 订阅不适用。';
 
 /** onSaver 注册给设置弹窗的统一「保存」：未加载或未修改时为空操作。 */
 export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) => void }) {
   const [draft, setDraft] = createStore<LyraDraft>({
     model: "",
     providers: [],
+    mcpServers: "{}",
+  });
+  const mcpError = createMemo(() => {
+    try {
+      parseMcpServers(draft.mcpServers);
+      return "";
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
   });
   const [error, setError] = createSignal("");
   const [loaded, setLoaded] = createSignal(false);
@@ -349,7 +361,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                                 <summary>高级参数<span class="field-hint">{m().headers.length + m().fields.length} 项自定义配置</span></summary>
                                 <div class="lyra-detail-body">
                                   <KvEditor title="自定义请求头" hint="覆盖 Provider 级同名头。" rows={m().headers} keyPlaceholder="Header 名" valuePlaceholder="值" onChange={(fn) => setM((x) => fn(x.headers))} />
-                                  <KvEditor title="自定义字段" hint="覆盖 Provider 级同名字段。" rows={m().fields} keyPlaceholder="字段名" valuePlaceholder="值" onChange={(fn) => setM((x) => fn(x.fields))} />
+                                  <KvEditor title="自定义字段" hint={`覆盖 Provider 级同名字段。${ACCOUNTING_HINT}`} rows={m().fields} keyPlaceholder="字段名" valuePlaceholder="值" onChange={(fn) => setM((x) => fn(x.fields))} />
                                 </div>
                               </details>
                             </div>
@@ -394,7 +406,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                         </label>
                       </div>
                       <KvEditor title="自定义请求头" hint={HEADER_HINT} rows={p().headers} keyPlaceholder="Header 名，如 X-Api-Version" valuePlaceholder="值" onChange={(fn) => setP((x) => fn(x.headers))} />
-                      <KvEditor title="自定义字段" hint={FIELD_HINT} rows={p().fields} keyPlaceholder="字段名，如 temperature" valuePlaceholder="值，如 0.7" onChange={(fn) => setP((x) => fn(x.fields))} />
+                      <KvEditor title="自定义字段" hint={`${FIELD_HINT} ${ACCOUNTING_HINT}`} rows={p().fields} keyPlaceholder="字段名，如 temperature" valuePlaceholder="值，如 0.7" onChange={(fn) => setP((x) => fn(x.fields))} />
                     </div>
                   </details>
                   <div class="lyra-provider-footer">
@@ -405,6 +417,39 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
             );
           }}
         </Index>
+        <details class="lyra-file-settings">
+          <summary>MCP 服务器（独立于模型服务商）</summary>
+          <div class="lyra-detail-body">
+            <p class="field-hint" id="lyra-mcp-hint">编辑顶层 mcpServers 的值：服务器名称到配置的 JSON 对象，不要再包一层 mcpServers；用 {"{}"} 清空。修改后点击底部「保存」生效。</p>
+            <p class="field-hint">渐进披露：只在需要某个工具时加载其 schema，不把全部工具 schema 预先注入模型上下文。</p>
+            <p class="field-hint">服务器是你信任的本地可执行程序或远程服务，可能读取文件、使用凭据、联网或修改数据。enabled 必须明确填写布尔值。readOnlyTools 按精确工具名逐个授权只读会话调用，可选，默认 []（不授权任何工具）；不再支持 readOnly 布尔值，不授予整个服务器只读权限，也不信任服务器的 annotations 自动授权。这不是沙箱或工具只读保证，请勿启用不信任的服务器。</p>
+            <label class="field" for="lyra-mcp-json">
+              <span class="field-label">mcpServers JSON</span>
+              <textarea
+                id="lyra-mcp-json"
+                class="field-input"
+                rows={14}
+                spellcheck={false}
+                autocomplete="off"
+                style={{ "font-family": "monospace", resize: "vertical" }}
+                aria-describedby="lyra-mcp-hint lyra-mcp-error"
+                aria-invalid={!!mcpError()}
+                value={draft.mcpServers}
+                onInput={(e) => edit((d) => { d.mcpServers = e.currentTarget.value; })}
+              />
+            </label>
+            <span id="lyra-mcp-error" class="field-hint lyra-error" role="status" aria-live="polite">{mcpError()}</span>
+            <details class="lyra-advanced">
+              <summary>stdio / Streamable HTTP 配置示例（默认禁用）</summary>
+              <pre style={{ "white-space": "pre-wrap" }}>{JSON.stringify({
+                local: { command: "/absolute/path/to/mcp-server", args: [], env: { API_TOKEN: "{env:MY_MCP_TOKEN}" }, cwd: "/absolute/project/path", enabled: false, readOnlyTools: [], startup_timeout_ms: 10000, request_timeout_ms: 30000 },
+                remote: { url: "https://mcp.example.com/mcp", headers: { Authorization: "{env:MCP_AUTHORIZATION}" }, enabled: false, readOnlyTools: [], startup_timeout_ms: 10000, request_timeout_ms: 30000 },
+              }, null, 2)}</pre>
+              <p class="field-hint">支持 stdio 与 Streamable HTTP：stdio 使用 command、args、env、cwd（可选，须为绝对路径；省略时固定为会话初始目录）；Streamable HTTP 使用 url、headers（http:// 仅限本机地址），不可混填，字段值不能为 null。不支持旧 SSE 入口、OAuth、resources、prompts 或 sampling。env 与 headers 支持 {"{env:NAME}"} 占位符，保存时保留引用、不展开环境变量。服务器配置仅接受这些字段及 enabled、readOnlyTools、两个超时字段；最多 64 个服务器。</p>
+              <p class="field-hint">startup_timeout_ms（启动）与 request_timeout_ms（请求）单位为毫秒，可选，默认分别为 10000、30000，范围 1–600000。启用前请替换示例地址或命令并确认权限；JSON 会以明文保存在配置文件中，敏感值优先使用环境变量引用，不要分享含密钥的配置。</p>
+            </details>
+          </div>
+        </details>
       </Show>
       <details class="lyra-file-settings" open={!loaded()}>
         <summary>配置文件与重新加载</summary>

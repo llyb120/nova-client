@@ -12,6 +12,10 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+#[path = "exec.rs"]
+pub mod exec;
+
 const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析。仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。目标行段已明确时直接按行段 read。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
@@ -87,6 +91,7 @@ pub fn tool_set(
         })),
     });
     if !read_only {
+        tools.extend(exec::tool_definitions());
         let desktop = crate::jianlai::tool_definition();
         tools.push(Tool { name: "jianlai", description: desktop["description"].as_str().unwrap().into(), parameters: schema(desktop["inputSchema"].clone()) });
         let employee = crate::employee::tool_definition();
@@ -266,7 +271,7 @@ fn compact_browser_result(value: &Value, max_bytes: usize) -> String {
     }
 }
 
-fn govern(
+pub(super) fn govern(
     outcome: ToolOutcome,
     name: &str,
     call_id: &str,
@@ -338,7 +343,7 @@ fn rewrite_with_embedded_rtk(command: &str, shell: &crate::lyra::prompt::ShellCo
     };
     let path = exe.to_string_lossy();
     let prefix = match shell.kind {
-        // Match rtk_guidance: wait for the GUI exe and preserve the caller's LASTEXITCODE.
+        // Wait for the GUI exe and preserve the caller's LASTEXITCODE.
         ShellKind::PowerShell => format!(". {{ & '{}' @args | Out-String -Stream }} __rtk ", path.replace('\'', "''")),
         ShellKind::Bash => format!("'{}' __rtk ", path.replace('\'', "'\\''")),
     };
@@ -576,6 +581,8 @@ fn cancel_message(stdout: &[u8], stderr: &[u8]) -> String {
     text
 }
 
+/// session_id is the independent main/child agent owner for persistent exec only.
+/// Other tools retain their archive-path owner (experience finish matching).
 pub async fn execute(
     root: &Path,
     name: &str,
@@ -584,8 +591,13 @@ pub async fn execute(
     archive_dir: Option<&Path>,
     call_id: &str,
     cancelled: Option<&Arc<AtomicBool>>,
+    session_id: &str,
 ) -> ToolOutcome {
-    let owner = archive_dir.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
+    let owner = if matches!(name, "exec_command" | "write_stdin") {
+        session_id.to_owned()
+    } else {
+        archive_dir.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()
+    };
     let outcome = execute_inner(root, name, args, shell, cancelled, &owner).await;
     govern(outcome, name, call_id, archive_dir)
 }
@@ -599,6 +611,17 @@ async fn execute_inner(
     owner: &str,
 ) -> ToolOutcome {
     match name {
+        "exec_command" | "write_stdin" => {
+            match exec::execute(root, name, args, shell, owner, cancelled.cloned()).await {
+                Ok(value) => {
+                    let is_error = matches!(value["status"].as_str(), Some("failed" | "cancelled" | "timed_out"));
+                    let mut outcome = ToolOutcome::text(value.to_string()).with_details(value);
+                    outcome.is_error = is_error;
+                    outcome
+                }
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
         "chrome" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，Chrome 控制不可用"); }
             match crate::native_browser::execute_chrome(root, args, owner).await {
@@ -706,6 +729,7 @@ async fn execute_inner(
             }
         }
         "edit" => {
+            if shell.is_none() { return ToolOutcome::error("当前为只读模式，edit 不可用"); }
             let Some(path) = args.get("path").and_then(Value::as_str) else {
                 return ToolOutcome::error("edit 缺少 path");
             };
@@ -740,6 +764,7 @@ async fn execute_inner(
             }
         }
         "write" => {
+            if shell.is_none() { return ToolOutcome::error("当前为只读模式，write 不可用"); }
             let Some(path) = args.get("path").and_then(Value::as_str) else {
                 return ToolOutcome::error("write 缺少 path");
             };
@@ -794,7 +819,7 @@ mod embedded_rtk_tests {
     async fn image_tools_work_without_polaris_and_are_blocked_in_read_only_mode() {
         for read_only in [false, true] {
             let tools = tool_set(read_only, false, false);
-            for name in ["generate_image", "edit_image", "jianlai", "chrome"] {
+            for name in ["generate_image", "edit_image", "jianlai", "chrome", "exec_command", "write_stdin"] {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
             assert!(tools.iter().all(|tool| tool.name != "webview"));
@@ -806,6 +831,22 @@ mod embedded_rtk_tests {
         let removed = super::execute_inner(root.path(), "webview", &json!({}), Some(&crate::lyra::prompt::detect_shell()), None, "test").await;
         assert!(removed.is_error);
         assert_eq!(removed.content[0]["text"], "未知工具：webview");
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_refuse_read_only_without_touching_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("existing.txt");
+        std::fs::write(&path, "before").unwrap();
+        for (name, args) in [
+            ("write", json!({"path":"existing.txt","content":"after"})),
+            ("edit", json!({"path":"existing.txt","edits":[{"oldText":"before","newText":"after"}]})),
+        ] {
+            let result = super::execute_inner(root.path(), name, &args, None, None, "guard-test").await;
+            assert!(result.is_error);
+            assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+        }
     }
 
     #[test]
@@ -873,20 +914,13 @@ fn main() {
         let current = std::env::current_exe().unwrap().to_string_lossy().replace('\'', "''");
         let replacement = exe.to_string_lossy().replace('\'', "''");
         let rewritten = rewrite_with_embedded_rtk("git status", &shell).replace(&current, &replacement);
-        let guidance = crate::codex_app_server::rtk_guidance();
-        let prefix = guidance.lines().find_map(|line| line.strip_prefix("PowerShell: ")).unwrap();
-        let guided = format!("{} git status", prefix.replace(
-            &current.trim_start_matches(r"\\?\").replace('\\', "/"), &replacement,
-        ));
-        for command in [rewritten, guided] {
-            let output = Command::new(&shell.program)
-                .args(["-NoProfile", "-NonInteractive", "-Command"])
-                .arg(format!("{command}; exit $LASTEXITCODE"))
-                .output().unwrap();
-            assert_eq!(output.status.code(), Some(7), "{output:?}");
-            assert!(String::from_utf8_lossy(&output.stdout).contains("gui stdout"), "{output:?}");
-            assert!(String::from_utf8_lossy(&output.stderr).contains("gui stderr"), "{output:?}");
-        }
+        let output = Command::new(&shell.program)
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!("{rewritten}; exit $LASTEXITCODE"))
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(7), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("gui stdout"), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("gui stderr"), "{output:?}");
     }
 
     #[tokio::test]

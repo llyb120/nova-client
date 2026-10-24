@@ -13,27 +13,27 @@
 
 pub(crate) mod bridge;
 pub(crate) mod config;
+pub(crate) mod backend_migration;
 mod codebuddy_provider;
 mod context;
 mod devin_provider;
 mod edit;
+mod local_auth;
+pub(crate) mod mcp;
 pub(crate) mod history;
 pub(crate) mod presets;
 pub(crate) mod prompt;
 pub(crate) mod provider;
 mod read;
 mod rollout;
+pub(crate) mod runtime;
 pub(crate) mod session;
 mod stage;
+mod tokens;
 mod tools;
 mod turn;
 
-pub use prompt::{
-    is_retryable_provider_error, PROVIDER_RETRY_DELAYS_MS,
-};
-
 pub use bridge::{run_oneshot, spawn_prompt, InProcessSession};
-pub(crate) use prompt::PONYTAIL_RULES;
 pub use config::set_nova_root;
 
 /// 若 argv 命中 `lyra` 子命令则执行 stdio bridge 协议并返回 true（调用方随后直接退出）。
