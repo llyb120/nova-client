@@ -335,6 +335,10 @@ impl Drop for PidGuard {
 
 fn rewrite_with_embedded_rtk(command: &str, shell: &crate::lyra::prompt::ShellConfig) -> String {
     use crate::lyra::prompt::ShellKind;
+    // 下面是全文替换 "rtk "；原命令自己带 rtk（路径、提交说明等）时会被改坏，直接不改写。
+    if command.contains("rtk") {
+        return command.to_string();
+    }
     let Some(rewritten) = rtk::rewrite_command(command) else {
         return command.to_string();
     };
@@ -884,6 +888,7 @@ mod embedded_rtk_tests {
             "git rev-parse HEAD",
             "go version",
             "npm install",
+            "git add vendor/rtk && git commit -m 'bump rtk now'",
         ] {
             assert_eq!(rewrite_with_embedded_rtk(unsupported, &shell), unsupported);
         }
