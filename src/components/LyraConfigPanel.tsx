@@ -245,11 +245,11 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
   const addProvider = (presetId: string) => {
     let id = presetId === "openai-compatible" ? "" : presetId;
     for (let n = 2; id && draft.providers.some((p) => p.id === id); n++) id = `${presetId}-${n}`;
-    edit((d) => void d.providers.push(presetId === "manual" ? providerDraft("", { api: APIS[0] }) : providerDraft(id, { preset: presetId })));
-    // 新项在列表末尾，自动滚动到并聚焦，省去手动翻页。
+    // 新项插到最前，紧跟「添加」按钮，服务商再多也不用翻到底。
+    edit((d) => void d.providers.unshift(presetId === "manual" ? providerDraft("", { api: APIS[0] }) : providerDraft(id, { preset: presetId })));
     requestAnimationFrame(() => {
-      const el = root?.querySelector<HTMLElement>(".lyra-provider:last-of-type");
-      el?.scrollIntoView({ block: "center", behavior: "smooth" });
+      const el = root?.querySelector<HTMLElement>(".lyra-provider");
+      el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
       el?.querySelector<HTMLElement>("input:not([type=checkbox])")?.focus({ preventScroll: true });
     });
   };
@@ -291,9 +291,12 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
             <span class="field-hint">server support 使用团队中转和 token；本地 Codex / Claude Code / Devin / CodeBuddy / WorkBuddy 自动读取本机认证，其他预设填写 API Key。</span>
           </div>
         </Show>
-        <Index each={draft.providers}>
-          {(p, pi) => {
-            const setP = (fn: (p: ProviderDraft) => void) => edit((d) => fn(d.providers[pi]));
+        {/* For 按对象跟踪：头部插入时各项的展开状态不会错位。 */}
+        <For each={draft.providers}>
+          {(item, index) => {
+            const p = () => item;
+            const pi = index();
+            const setP = (fn: (p: ProviderDraft) => void) => edit((d) => fn(d.providers[index()]));
             const preset = () => presets().find((x) => x.id === p().preset);
             const local = () => isLocalPreset(p().preset);
             const advancedInitiallyOpen = !p().id;
@@ -318,7 +321,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                     class="link-btn lyra-del"
                     onClick={(e) => {
                       e.preventDefault();
-                      void removeProvider(pi);
+                      void removeProvider(index());
                     }}
                   >
                     删除
@@ -505,7 +508,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
               </details>
             );
           }}
-        </Index>
+        </For>
         <details class="lyra-file-settings">
           <summary>MCP 服务器（独立于模型服务商）</summary>
           <div class="lyra-detail-body">
