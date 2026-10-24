@@ -1,5 +1,5 @@
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { createMemo, createSignal, For, Index, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
 import { createStore, produce, unwrap } from "solid-js/store";
 import { api } from "../ipc";
 import {
@@ -19,6 +19,88 @@ import {
   type Preset,
   type ProviderDraft,
 } from "../lyraConfig";
+
+const LOGIN_PRESETS = new Set(["devin", "codebuddy", "workbuddy"]);
+/** 可在 Nova 里网页登录的预设。 */
+const WEB_LOGIN = LOGIN_PRESETS;
+
+/** 本机有可用 CLI 登录就直接用；没有时用浏览器登录。新添加且未登录时自动发起。 */
+function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () => void }) {
+  const [status, setStatus] = createSignal<{ ok: boolean; error?: string } | null>(null);
+  const [site, setSite] = createSignal("cn");
+  const [waiting, setWaiting] = createSignal(false);
+  const [error, setError] = createSignal("");
+  // Devin 登录后跳回本机；浏览器在另一台机器时由用户粘贴跳转地址。
+  const [pasted, setPasted] = createSignal("");
+  let cancelled = false;
+  onCleanup(() => (cancelled = true));
+  const check = async () => {
+    const next = await api.lyraLoginStatus(props.preset).catch((e) => ({ ok: false, error: String(e) }));
+    setStatus(next);
+    return next.ok;
+  };
+  const login = async () => {
+    setError("");
+    setWaiting(true);
+    setPasted("");
+    cancelled = false;
+    try {
+      const { state, url } = await api.lyraLoginStart(props.preset, site());
+      await api.openUrl(url);
+      // 与 CLI 一致：最多等 5 分钟。
+      for (const end = Date.now() + 5 * 60_000; Date.now() < end && !cancelled; ) {
+        await new Promise((r) => setTimeout(r, 1500));
+        if (!cancelled && (await api.lyraLoginPoll(props.preset, site(), state, /[?&]code=[^&]+.*state=|state=.*[?&]code=/.test(pasted()) ? pasted() : ""))) {
+          if (await check()) props.onLoggedIn();
+          return;
+        }
+      }
+      if (!cancelled) setError("登录超时，请重试");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setWaiting(false);
+    }
+  };
+  onMount(async () => {
+    if (!(await check()) && props.autoStart && WEB_LOGIN.has(props.preset)) void login();
+  });
+  return (
+    <div class="lyra-fetch">
+      <span class="field-hint" role="status">
+        {waiting()
+          ? "已在浏览器打开登录页，完成登录后自动继续…"
+          : status() === null ? "检查登录状态…"
+          : status()!.ok ? "已登录（优先使用本机 CLI 登录）。"
+          : WEB_LOGIN.has(props.preset) ? "未登录：本机没有可用的 CLI 登录，可直接用浏览器登录。"
+          : `未登录：${status()!.error ?? ""}`}
+        <Show when={error()}><span class="lyra-error"> {error()}</span></Show>
+      </span>
+      <Show when={WEB_LOGIN.has(props.preset) && !status()?.ok}>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <Show when={props.preset === "codebuddy"}>
+            <select class="field-input" aria-label="登录站点" value={site()} disabled={waiting()} onChange={(e) => setSite(e.currentTarget.value)}>
+              <option value="cn">国内站</option>
+              <option value="intl">国际站</option>
+            </select>
+          </Show>
+          <Show when={waiting()} fallback={<button type="button" class="btn secondary" onClick={() => void login()}>登录</button>}>
+            <button type="button" class="btn secondary" onClick={() => (cancelled = true)}>取消</button>
+          </Show>
+        </div>
+        <Show when={waiting() && props.preset === "devin"}>
+          <input
+            class="field-input"
+            placeholder="登录后页面打不开？把地址栏里 http://127.0.0.1…/callback?code=… 粘贴到这里"
+            aria-label="Devin 登录跳转地址"
+            value={pasted()}
+            onInput={(e) => setPasted(e.currentTarget.value)}
+          />
+        </Show>
+      </Show>
+    </div>
+  );
+}
 
 function KvEditor(props: {
   title: string;
@@ -273,6 +355,13 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                     </Show>
                   </div>
 
+                  <Show when={LOGIN_PRESETS.has(p().preset)}>
+                    <LocalLogin
+                      preset={p().preset}
+                      autoStart={!Object.hasOwn(raw.provider ?? {}, p().id)}
+                      onLoggedIn={() => void fetchModels(p())}
+                    />
+                  </Show>
                   <Show when={p().preset === "local-codex" || p().preset === "local-claude-code"}>
                     <p class="field-hint">优先使用 CLI 自定义 API，否则使用内置订阅反代；无需 Node 或独立 Agent。订阅连接使用 Lyra 代理。凭据过期时请到对应 CLI 刷新登录；不会静默将订阅凭据发送给第三方。</p>
                   </Show>

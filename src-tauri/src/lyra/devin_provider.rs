@@ -19,6 +19,8 @@ const RPC: &str = "/exa.api_server_pb.ApiServerService/GetChatMessage";
 /// ponytail: 离线快照不会自动更新；Devin 上新模型后用 `devin models list --format json` 重新生成。
 const SNAPSHOT_VERSION: &str = "3000.11.205";
 const SNAPSHOT: &str = include_str!("devin_models.json");
+/// 在 Nova 里网页登录得到的凭据（与 CLI credentials.toml 同格式），位于 ~/.nova。
+const LOGIN_FILE: &str = "devin-login.toml";
 
 fn read_config(path: &Path) -> Result<String, String> {
     let file = std::fs::File::open(path).map_err(|_| "无法读取 Devin 配置，请先运行 devin auth login")?;
@@ -35,7 +37,16 @@ pub(super) fn load(root: &Path, env: &HashMap<String, String>) -> Result<Value, 
         env.get("XDG_CONFIG_HOME").map(PathBuf::from)
             .or_else(|| env.get("HOME").map(|home| Path::new(home).join(".config")))
     }.ok_or("无法定位 Devin 配置目录")?;
-    let credentials: toml::Value = toml::from_str(&read_config(&config_root.join("devin/credentials.toml"))?)
+    let home = env.get("HOME").or_else(|| env.get("USERPROFILE")).map(PathBuf::from);
+    // CLI 把登录写在数据目录（Linux ~/.local/share、macOS Application Support），配置在配置目录。
+    let data_root = if cfg!(windows) { env.get("APPDATA").map(PathBuf::from) }
+        else if cfg!(target_os = "macos") { home.map(|h| h.join("Library/Application Support")) }
+        else { env.get("XDG_DATA_HOME").map(PathBuf::from).or_else(|| home.map(|h| h.join(".local/share"))) };
+    // CLI 登录优先，其次是在 Nova 里网页登录保存的凭据。
+    let credentials_path = [Some(config_root.join("devin/credentials.toml")), data_root.map(|d| d.join("devin/credentials.toml")), Some(root.join(LOGIN_FILE))]
+        .into_iter().flatten().find(|path| path.is_file())
+        .ok_or("未登录 Devin：请在 Lyra 设置里登录，或运行 devin auth login")?;
+    let credentials: toml::Value = toml::from_str(&read_config(&credentials_path)?)
         .map_err(|_| "Devin credentials.toml 格式无效")?;
     let key = credentials.get("windsurf_api_key").and_then(toml::Value::as_str)
         .filter(|s| !s.trim().is_empty()).ok_or("Devin 登录缺少 windsurf_api_key，请先运行 devin auth login")?;
@@ -62,6 +73,84 @@ pub(super) fn load(root: &Path, env: &HashMap<String, String>) -> Result<Value, 
 
 #[derive(Clone)]
 struct Catalog { families: Vec<Value>, version: String, loaded: Instant }
+
+// ---------- 网页登录（本机没有 CLI 登录时） ----------
+// 与 CLI 3000.11.205 相同的 PKCE：浏览器登录 → 跳回本机回调（或用户粘贴跳转地址）→ 换 session token。
+// windsurf_api_key 即 `devin-session-token$<token>`，已用真实账号验证。
+
+struct PendingLogin { verifier: String, code: Arc<Mutex<Option<String>>>, task: tokio::task::JoinHandle<()>, created: Instant }
+static PENDING: OnceLock<Mutex<HashMap<String, PendingLogin>>> = OnceLock::new();
+
+fn b64url(bytes: &[u8]) -> String { base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes) }
+
+pub(super) async fn login_start() -> Result<Value, String> {
+    use sha2::Digest;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|_| "无法启动登录回调")?;
+    let port = listener.local_addr().map_err(|_| "无法启动登录回调")?.port();
+    let verifier = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let challenge = b64url(&sha2::Sha256::digest(verifier.as_bytes()));
+    let state = uuid::Uuid::new_v4().simple().to_string();
+    let code = Arc::new(Mutex::new(None));
+    let task = tokio::spawn(serve_callback(listener, state.clone(), code.clone()));
+    let mut pending = PENDING.get_or_init(Default::default).lock().unwrap();
+    pending.retain(|_, p| { let alive = p.created.elapsed() < Duration::from_secs(600); if !alive { p.task.abort(); } alive });
+    pending.insert(state.clone(), PendingLogin { verifier, code, task, created: Instant::now() });
+    let url = reqwest::Url::parse_with_params("https://app.devin.ai/auth/cli/continue", [
+        ("redirect_uri", format!("http://127.0.0.1:{port}/callback")), ("state", state.clone()), ("prompt", "select_account".into()),
+        ("code_challenge", challenge), ("code_challenge_method", "S256".into()),
+    ]).unwrap();
+    Ok(json!({ "state": state, "url": url.as_str() }))
+}
+
+/// 取跳转地址里与 state 匹配的 code。
+fn callback_code(url: &str, state: &str) -> Option<String> {
+    let url = reqwest::Url::parse(url.trim()).ok()?;
+    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    (query.get("state").map(String::as_str) == Some(state)).then(|| query.get("code").cloned()).flatten().filter(|c| !c.is_empty())
+}
+
+async fn serve_callback(listener: tokio::net::TcpListener, state: String, slot: Arc<Mutex<Option<String>>>) {
+    use tokio::io::AsyncWriteExt;
+    while let Ok((mut socket, _)) = listener.accept().await {
+        let mut buffer = vec![0; 8192];
+        let Ok(Ok(read)) = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buffer)).await else { continue };
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let path = request.split_whitespace().nth(1).unwrap_or("");
+        let code = callback_code(&format!("http://127.0.0.1{path}"), &state);
+        let body = if code.is_some() { "Devin 登录完成，可以关闭此页返回 Nova。" } else { "登录链接无效，请回到 Nova 重新登录。" };
+        let _ = socket.write_all(format!("HTTP/1.1 {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            if code.is_some() { "200 OK" } else { "400 Bad Request" }, body.len()).as_bytes()).await;
+        if let Some(code) = code { *slot.lock().unwrap() = Some(code); return; }
+    }
+}
+
+/// 轮询一次：回调或粘贴的跳转地址拿到 code 后换取凭据并保存，返回 true。
+pub(super) async fn login_poll(root: &Path, state: &str, pasted: Option<&str>) -> Result<bool, String> {
+    let (verifier, code) = {
+        let pending = PENDING.get_or_init(Default::default).lock().unwrap();
+        let login = pending.get(state).ok_or("登录已失效，请重新登录")?;
+        let code = match pasted.filter(|s| !s.trim().is_empty()) {
+            Some(url) => Some(callback_code(url, state).ok_or("粘贴的地址不是本次登录的跳转地址")?),
+            None => login.code.lock().unwrap().clone(),
+        };
+        (login.verifier.clone(), code)
+    };
+    let Some(code) = code else { return Ok(false) };
+    let response = provider::local_api_client().post("https://api.devin.ai/auth/cli/token")
+        .json(&json!({ "code": code, "code_verifier": verifier })).timeout(Duration::from_secs(30)).send().await
+        .map_err(|_| "无法连接 Devin 登录服务")?;
+    if let Some(login) = PENDING.get_or_init(Default::default).lock().unwrap().remove(state) { login.task.abort(); }
+    if !response.status().is_success() { return Err("Devin 登录已过期或无效，请重新登录".into()); }
+    let data: Value = response.json().await.map_err(|_| "Devin 登录返回格式无效")?;
+    let token = data["token"].as_str().filter(|t| !t.is_empty()).ok_or("Devin 登录未返回凭据")?;
+    let host = data["webapp_host"].as_str().filter(|h| h.ends_with("devin.ai")).unwrap_or("app.devin.ai");
+    let credentials: toml::Table = [
+        ("windsurf_api_key", format!("devin-session-token${token}")), ("api_server_url", "https://server.codeium.com".into()),
+        ("devin_webapp_host", host.into()), ("devin_api_url", "https://api.devin.ai".into()),
+    ].into_iter().map(|(k, v)| (k.to_string(), toml::Value::String(v))).collect();
+    super::codebuddy_provider::write_private(&root.join(LOGIN_FILE), credentials.to_string().as_bytes())?;
+    Ok(true)
+}
 
 async fn cli(binary: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let program = crate::acp::resolve_program_on_path(if binary.trim().is_empty() { "devin" } else { binary })
@@ -526,6 +615,14 @@ mod tests {
         let mut decoder = ConnectDecoder::default(); decoder.push(&envelope(b"{}",2)).unwrap(); assert!(decoder.push(&envelope(b"",0)).is_err());
         let mut decoder = ConnectDecoder::default();
         let error = decoder.push(&envelope(br#"{"error":{"code":"secret","message":"secret"}}"#,2)).unwrap_err(); assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn login_callback_requires_matching_state() {
+        assert_eq!(callback_code("http://127.0.0.1:1/callback?code=abc&state=s1", "s1").as_deref(), Some("abc"));
+        assert!(callback_code("http://127.0.0.1:1/callback?code=abc&state=other", "s1").is_none());
+        assert!(callback_code("http://127.0.0.1:1/callback?state=s1", "s1").is_none());
+        assert!(callback_code("not a url", "s1").is_none());
     }
 
     #[test]

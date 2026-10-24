@@ -84,30 +84,46 @@ pub(super) fn load(root: &Path, env: &HashMap<String, String>, source: &str) -> 
         env.get("WORKBUDDY_AUTH_TOKEN").or_else(|| env.get("WORKBUDDY_API_KEY")).map(String::as_str)
             .or_else(|| settings["env"]["CODEBUDDY_AUTH_TOKEN"].as_str()).or_else(|| settings["env"]["CODEBUDDY_API_KEY"].as_str())
     } else { variable("CODEBUDDY_AUTH_TOKEN").or_else(|| variable("CODEBUDDY_API_KEY")) }.filter(|s| !s.trim().is_empty());
-    let mut session = if explicit_key.is_some() { json!({}) } else {
-        let mut marker = auth_path.as_os_str().to_os_string(); marker.push(".logged-out");
-        if Path::new(&marker).exists() { return Err("CodeBuddy 已注销，请先在 CLI 登录".into()); }
-        json_file(&auth_path, false)?
-    };
     let nova_settings = crate::settings::Settings::load(&root.to_path_buf());
-    let (package, version) = if workbuddy {
+    let workbuddy_package = || -> Result<(PathBuf, Value), String> {
         let cli = crate::workbuddy::program(env.get("WORKBUDDY_EXE").map(String::as_str).unwrap_or(&nova_settings.workbuddy_path));
         let package = env.get("NOVA_WORKBUDDY_PACKAGE").map(PathBuf::from)
             .or_else(|| Path::new(&cli).parent().and_then(Path::parent).map(Path::to_path_buf)).ok_or("未找到 WorkBuddy 内置 CLI")?;
         let product = json_file(&package.join("product.json"), false)?;
         if product["authentication"]["id"] != "workbuddy-desktop" { return Err("请选择 WorkBuddy 内置 CLI，而不是全局 CodeBuddy".into()); }
+        Ok((package, product))
+    };
+    // 优先用可用的 CLI/桌面端登录；没有时用在 Nova 里网页登录保存的会话。
+    let cli_session = || -> Result<(Value, Option<PathBuf>, String), String> {
+        let mut marker = auth_path.as_os_str().to_os_string(); marker.push(".logged-out");
+        if Path::new(&marker).exists() { return Err("CodeBuddy 已注销，请先在 CLI 登录".into()); }
+        let mut session = json_file(&auth_path, false)?;
+        if session["auth"]["expiresAt"].as_u64().is_some_and(|expiry| expiry <= now_ms()) {
+            return Err("CodeBuddy 登录已过期，请打开 CLI 刷新登录".into());
+        }
+        if !workbuddy { let (package, version) = installed(env); return Ok((session, package, version)); }
+        let (package, product) = workbuddy_package()?;
         if session["auth"]["accessToken"].is_object() {
             let exe = env.get("WORKBUDDY_EXE").map(PathBuf::from).unwrap_or_else(|| package.join("../../../WorkBuddy.exe"));
             session["auth"]["accessToken"] = json!(workbuddy_token(&auth_path, &exe, &session["auth"]["accessToken"], env)?);
         }
-        (Some(package), product["genieVersion"].as_str().unwrap_or("5.8.2").to_string())
-    } else { installed(env) };
+        Ok((session, Some(package), product["genieVersion"].as_str().unwrap_or(WORKBUDDY_VERSION).to_string()))
+    };
+    let (session, package, version) = if explicit_key.is_some() {
+        let (package, version) = if workbuddy { workbuddy_package().map(|(p, product)| (Some(p), product["genieVersion"].as_str().unwrap_or(WORKBUDDY_VERSION).to_string()))? } else { installed(env) };
+        (json!({}), package, version)
+    } else {
+        match cli_session() {
+            Ok(found) => found,
+            Err(error) => {
+                let session = nova_session(root, source).map_err(|_| format!("{error}；也可以在 Lyra 设置里登录 {label}"))?;
+                let fallback = if workbuddy { (None, WORKBUDDY_VERSION.to_string()) } else { installed(env) };
+                (session, fallback.0, fallback.1)
+            }
+        }
+    };
     let key = explicit_key.or_else(|| session["auth"]["accessToken"].as_str()).filter(|s| !s.trim().is_empty())
         .ok_or("CodeBuddy 登录缺失或已加密，请先在 CLI 登录")?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-    if explicit_key.is_none() && session["auth"]["expiresAt"].as_u64().is_some_and(|expiry| expiry <= now) {
-        return Err("CodeBuddy 登录已过期，请打开 CLI 刷新登录".into());
-    }
     let endpoint = env.get(&format!("NOVA_{prefix}_ENDPOINT")).cloned().unwrap_or_else(|| format!("https://{}", session["auth"]["domain"].as_str().unwrap_or(if workbuddy { "www.workbuddy.cn" } else { "www.codebuddy.ai" })));
     let url = reqwest::Url::parse(&endpoint).map_err(|_| "CodeBuddy API 地址无效")?;
     if !(url.scheme() == "https" || (url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"))))
@@ -127,6 +143,109 @@ pub(super) fn load(root: &Path, env: &HashMap<String, String>, source: &str) -> 
         "codebuddyModel": env.get(&format!("{prefix}_MODEL")).map(String::as_str).or_else(|| settings["model"].as_str()),
         "requiresReasoningContentOnAssistantMessages": true
     }, "models": {} }))
+}
+
+const WORKBUDDY_VERSION: &str = "5.8.2";
+
+fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
+
+// ---------- 网页登录（本机没有可用 CLI 时） ----------
+// 与 CodeBuddy CLI 2.174.0 相同的外链登录：申请 state → 浏览器登录 → 轮询 token → 取账号。
+// 会话按 CLI 的 {auth, account} 形状存在 ~/.nova/<source>-login.json，复用上面的解析。
+
+fn login_file(root: &Path, source: &str) -> PathBuf { root.join(format!("{source}-login.json")) }
+
+pub(crate) fn login_origin(source: &str, site: &str) -> &'static str {
+    match (source, site) { ("workbuddy", _) => "https://www.workbuddy.cn", (_, "cn") => "https://www.codebuddy.cn", _ => "https://www.codebuddy.ai" }
+}
+
+/// 读取 Nova 登录会话，快过期时用 refreshToken 续期并写回。
+fn nova_session(root: &Path, source: &str) -> Result<Value, String> {
+    let path = login_file(root, source);
+    let mut session = json_file(&path, false)?;
+    if !session["auth"]["accessToken"].is_string() { return Err("登录会话无效".into()); }
+    if session["auth"]["expiresAt"].as_u64().is_some_and(|expiry| expiry <= now_ms() + 5 * 60_000) {
+        let origin = session["origin"].as_str().unwrap_or("").to_string();
+        let auth = session["auth"].clone();
+        // load 是同步的且可能运行在 tokio 线程上，blocking client 只能在独立线程里用。
+        let refreshed = std::thread::spawn(move || refresh_blocking(&origin, &auth)).join().map_err(|_| "续期线程异常")??;
+        session["auth"] = refreshed;
+        save_session(&path, &session)?;
+    }
+    Ok(session)
+}
+
+fn refresh_blocking(origin: &str, auth: &Value) -> Result<Value, String> {
+    let error = "登录已过期且续期失败，请在 Lyra 设置里重新登录";
+    let refresh = auth["refreshToken"].as_str().ok_or(error)?;
+    let response: Value = reqwest::blocking::Client::builder().timeout(Duration::from_secs(20)).build().map_err(|_| error)?
+        .post(format!("{origin}/v2/plugin/auth/token/refresh")).json(&json!({}))
+        .bearer_auth(auth["accessToken"].as_str().unwrap_or("")).header("X-Refresh-Token", refresh).header("X-Auth-Refresh-Source", "plugin")
+        .header("X-Domain", auth["domain"].as_str().unwrap_or(""))
+        .send().and_then(|r| r.error_for_status()).and_then(|r| r.json()).map_err(|_| error)?;
+    normalize_auth(&response["data"], auth["domain"].as_str().unwrap_or("")).ok_or_else(|| error.into())
+}
+
+/// 与 CLI 一致：只有 expiresIn 时换算成绝对时间；补上 domain 供后续请求定位站点。
+fn normalize_auth(data: &Value, domain: &str) -> Option<Value> {
+    let mut auth = data.clone();
+    auth["accessToken"].as_str().filter(|s| !s.is_empty())?;
+    let now = now_ms();
+    if auth["expiresAt"].is_null() { if let Some(s) = auth["expiresIn"].as_u64() { auth["expiresAt"] = json!(now + s * 1000); } }
+    if auth["refreshExpiresAt"].is_null() { if let Some(s) = auth["refreshExpiresIn"].as_u64() { auth["refreshExpiresAt"] = json!(now + s * 1000); } }
+    if auth["domain"].as_str().is_none_or(str::is_empty) { auth["domain"] = json!(domain); }
+    Some(auth)
+}
+
+fn save_session(path: &Path, session: &Value) -> Result<(), String> {
+    write_private(path, &serde_json::to_vec_pretty(session).unwrap())
+}
+
+/// 登录凭据原子写入并仅当前用户可读。
+pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    crate::thread_storage::atomic_write(path, bytes).map_err(|e| format!("保存登录凭据失败：{e}"))?;
+    #[cfg(unix)]
+    { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)); }
+    Ok(())
+}
+
+fn no_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request.header("X-No-Authorization", "true").header("X-No-User-Id", "true").header("X-No-Enterprise-Id", "true").header("X-No-Department-Info", "true")
+}
+
+/// 申请登录：返回要在浏览器打开的登录页和轮询用的 state。
+pub(crate) async fn login_start(source: &str, site: &str) -> Result<Value, String> {
+    let origin = login_origin(source, site);
+    let response: Value = no_auth(provider::local_api_client().post(format!("{origin}/v2/plugin/auth/state?platform=CLI")).json(&json!({})))
+        .timeout(Duration::from_secs(20)).send().await.and_then(|r| r.error_for_status()).map_err(|_| "无法连接登录服务，请检查网络")?
+        .json().await.map_err(|_| "登录服务返回格式无效")?;
+    let (state, url) = (response["data"]["state"].as_str(), response["data"]["authUrl"].as_str());
+    let (Some(state), Some(url)) = (state, url) else { return Err("登录服务未返回登录地址".into()) };
+    // 只打开本站的 HTTPS 登录页，防止被响应引导到任意地址。
+    if reqwest::Url::parse(url).ok().map(|u| u.origin().ascii_serialization()).as_deref() != Some(origin) { return Err("登录地址不是官方站点".into()); }
+    Ok(json!({ "state": state, "url": url }))
+}
+
+/// 轮询一次：未完成返回 false；完成则取账号、保存会话并返回 true。
+pub(crate) async fn login_poll(root: &Path, source: &str, site: &str, state: &str) -> Result<bool, String> {
+    let origin = login_origin(source, site);
+    let http = provider::local_api_client();
+    let url = reqwest::Url::parse_with_params(&format!("{origin}/v2/plugin/auth/token"), [("state", state)]).map_err(|_| "登录状态无效")?;
+    let response: Value = no_auth(http.get(url)).timeout(Duration::from_secs(20)).send().await.map_err(|_| "无法连接登录服务")?
+        .json().await.map_err(|_| "登录服务返回格式无效")?;
+    if response["code"] == 11217 { return Ok(false); }
+    let domain = reqwest::Url::parse(origin).unwrap().host_str().unwrap_or("").to_string();
+    let auth = normalize_auth(&response["data"], &domain).ok_or_else(|| format!("登录失败：{}", response["msg"].as_str().unwrap_or("未返回凭据")))?;
+    let mut account = Value::Null;
+    for _ in 0..10 {
+        let response: Value = http.get(format!("{origin}/v2/plugin/account")).bearer_auth(auth["accessToken"].as_str().unwrap()).header("X-Domain", &domain)
+            .timeout(Duration::from_secs(20)).send().await.map_err(|_| "无法读取账号信息")?.json().await.map_err(|_| "账号信息格式无效")?;
+        if response["code"] != 12151 { account = response["data"].clone(); break; }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    if !account.is_object() { return Err("登录成功但读取账号信息失败，请重试".into()); }
+    save_session(&login_file(root, source), &json!({ "origin": origin, "auth": auth, "account": account }))?;
+    Ok(true)
 }
 
 fn merge_catalog(config: &Value, defaults: &[Value]) -> Result<Vec<Value>, String> {
@@ -243,6 +362,24 @@ pub(super) async fn stream(model: &ResolvedModel, key: &str, mut body: Value, se
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn nova_login_session_is_used_when_cli_login_is_missing() {
+        assert!(normalize_auth(&json!({"refreshToken":"r"}), "d").is_none());
+        let auth = normalize_auth(&json!({"accessToken":"tok","expiresIn":3600}), "www.codebuddy.cn").unwrap();
+        assert_eq!(auth["domain"], "www.codebuddy.cn");
+        assert!(auth["expiresAt"].as_u64().unwrap() > now_ms() + 3_000_000);
+        let root = tempfile::tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), root.path().to_string_lossy().into_owned());
+        env.insert("NOVA_CODEBUDDY_AUTH_FILE".to_string(), root.path().join("missing.info").to_string_lossy().into_owned());
+        assert!(load(root.path(), &env, "codebuddy").unwrap_err().contains("Lyra 设置里登录"));
+        save_session(&login_file(root.path(), "codebuddy"), &json!({"origin":"https://www.codebuddy.cn","auth":auth,"account":{"uid":"u1"}})).unwrap();
+        let provider = load(root.path(), &env, "codebuddy").unwrap();
+        assert_eq!(provider["options"]["apiKey"], "tok");
+        assert_eq!(provider["options"]["baseURL"], "https://www.codebuddy.cn/v2");
+        assert_eq!(provider["options"]["headers"]["X-User-Id"], "u1");
+    }
 
     #[test]
     fn workbuddy_login_stays_separate_from_codebuddy() {

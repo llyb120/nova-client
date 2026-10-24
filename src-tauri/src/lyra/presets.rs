@@ -242,6 +242,31 @@ pub(crate) fn list() -> Value {
     PRESETS.iter().map(|p| json!({ "id": p.id, "name": p.name, "baseURL": p.base_url, "local": local_source(p.id).is_some() })).collect()
 }
 
+/// 本地登录型预设当前是否可用（CLI 登录或 Nova 内登录任一有效）；错误即不可用原因。
+pub(crate) fn login_status(preset: &str, nova_root: &Path) -> Result<(), String> {
+    let source = local_source(preset).ok_or("该服务商不需要登录")?;
+    resolve_local(&json!({}), source, &super::config::process_env(), nova_root).map(|_| ())
+}
+
+/// 网页登录第一步：返回 { state, url }。
+pub(crate) async fn login_start(preset: &str, site: &str) -> Result<Value, String> {
+    match preset {
+        "codebuddy" | "workbuddy" => super::codebuddy_provider::login_start(preset, site).await,
+        "devin" => super::devin_provider::login_start().await,
+        _ => Err("该服务商暂不支持在 Nova 里登录".into()),
+    }
+}
+
+/// 网页登录轮询：完成并保存后返回 true。
+/// pasted：浏览器没能跳回本机时，用户粘贴的跳转地址（仅 Devin）。
+pub(crate) async fn login_poll(preset: &str, site: &str, state: &str, pasted: Option<&str>, nova_root: &Path) -> Result<bool, String> {
+    match preset {
+        "codebuddy" | "workbuddy" => super::codebuddy_provider::login_poll(nova_root, preset, site, state).await,
+        "devin" => super::devin_provider::login_poll(nova_root, state, pasted).await,
+        _ => Err("该服务商暂不支持在 Nova 里登录".into()),
+    }
+}
+
 fn local_source(preset: &str) -> Option<&str> {
     match preset {
         "server-support" => Some("server-support"),

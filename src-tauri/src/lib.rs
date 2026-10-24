@@ -3631,6 +3631,27 @@ fn get_lyra_presets() -> Value {
     lyra::presets::list()
 }
 
+/// 本地登录型 provider（Devin / CodeBuddy / WorkBuddy）是否已可用；不可用时返回原因。
+#[tauri::command]
+fn lyra_login_status(preset: String) -> Value {
+    match lyra::presets::login_status(&preset, &lyra::config::nova_root()) {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => json!({ "ok": false, "error": error }),
+    }
+}
+
+#[tauri::command]
+async fn lyra_login_start(preset: String, site: String) -> Result<Value, String> {
+    lyra::presets::login_start(&preset, &site).await
+}
+
+#[tauri::command]
+async fn lyra_login_poll(state: State<'_, AppState>, preset: String, site: String, login_state: String, pasted: Option<String>) -> Result<bool, String> {
+    let done = lyra::presets::login_poll(&preset, &site, &login_state, pasted.as_deref(), &lyra::config::nova_root()).await?;
+    if done { state.lyra.notify_config_changed(); }
+    Ok(done)
+}
+
 /// 设置页「获取模型」：按编辑中的 provider（可未保存）立即拉取模型列表写入缓存并返回。
 #[tauri::command]
 async fn fetch_lyra_models(state: State<'_, AppState>, id: String, provider: Value) -> Result<Value, String> {
@@ -5379,6 +5400,9 @@ pub fn run() {
             get_lyra_config,
             get_lyra_presets,
             fetch_lyra_models,
+            lyra_login_status,
+            lyra_login_start,
+            lyra_login_poll,
             save_lyra_config,
             get_slash_commands,
             send_prompt,
