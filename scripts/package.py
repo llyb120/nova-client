@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # 打包 Nova 更新 zip（由 GitHub Release 分发，不上传私服）
-# Windows：Nova.exe → nova-{ver}.zip
+# Windows：Nova.exe → nova-{ver}.zip + nova-full-{ver}.zip（官方运行时）
 # macOS：Nova → nova-macos-{arch}-{ver}.zip
 # Linux：Nova → nova-linux-{arch}-{ver}.zip
 from __future__ import annotations
@@ -75,7 +75,7 @@ def pe_machine_name(machine: int) -> str:
     return {0x014C: "x86", 0x8664: "x64", 0xAA64: "arm64"}.get(machine, "unknown")
 
 
-def validate_pe_image(data: bytes) -> None:
+def validate_pe_image(data: bytes, expected: int | None = None) -> None:
     if len(data) < 0x40:
         raise ValueError("文件太小")
     if data[:2] != b"MZ":
@@ -86,7 +86,8 @@ def validate_pe_image(data: bytes) -> None:
     if data[pe_offset : pe_offset + 4] != b"PE\0\0":
         raise ValueError("缺少 PE 文件头")
     machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
-    expected = expected_pe_machine()
+    if expected is None:
+        expected = expected_pe_machine()
     if expected is not None and machine != expected:
         raise ValueError(
             f"架构不匹配，包内是 {pe_machine_name(machine)}，当前需要 {pe_machine_name(expected)}"
@@ -97,7 +98,7 @@ def validate_pe_image(data: bytes) -> None:
     optional_header_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
     optional_header_start = pe_offset + 24
     optional_header_end = optional_header_start + optional_header_size
-    if optional_header_end > len(data):
+    if optional_header_size < 2 or optional_header_end > len(data):
         raise ValueError("可选头不完整")
     magic = struct.unpack_from("<H", data, optional_header_start)[0]
     if magic not in (0x010B, 0x020B):
@@ -284,7 +285,16 @@ def main() -> None:
         zf.write(exe, exe.name)
     validate_update_zip(zip_path, bin_name, args.target)
     print(f"\n[OK] 打包完成: {zip_path} ({zip_path.stat().st_size / 1048576:.1f} MB)")
-    print("用 GitHub Actions Release 或 gh release upload 发布该 zip。")
+    if is_windows():
+        from package_full import build_full_zip
+
+        full_path = out_dir / f"nova-full-{new}.zip"
+        try:
+            build_full_zip(exe, full_path)
+        except Exception as exc:
+            sys.exit(f"[FAIL] Windows 全环境包失败（普通包已生成；旧全包如存在则未更新）: {exc}")
+        print(f"[OK] 全环境包: {full_path} ({full_path.stat().st_size / 1048576:.1f} MB)")
+    print("用 GitHub Actions Release 或 gh release upload 发布生成的 zip。")
 
 
 if __name__ == "__main__":

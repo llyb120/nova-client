@@ -66,8 +66,36 @@ fn init_windows_process_path() {
         std::env::var_os("FNM_DIR").map(PathBuf::from),
         std::env::var_os("FNM_MULTISHELL_PATH").map(PathBuf::from),
     ) {
+        let path = bundled_runtime_path(
+            &path,
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(PathBuf::from)),
+        );
         std::env::set_var("PATH", path);
     }
+}
+
+// Resolve relative to Nova.exe, never the project cwd. Ordinary packages have no runtimes.
+#[cfg(any(windows, test))]
+fn bundled_runtime_path(current: &OsStr, app_dir: Option<PathBuf>) -> OsString {
+    let mut paths = Vec::new();
+    if let Some(root) = app_dir.map(|dir| dir.join("runtimes")) {
+        let node = root.join("node");
+        if node.join("node.exe").is_file() {
+            paths.push(node);
+        }
+        let python = root.join("python");
+        if python.join("python.exe").is_file() {
+            paths.push(python.join("Scripts"));
+            paths.push(python);
+        }
+    }
+    paths.extend(std::env::split_paths(current));
+    std::env::join_paths(paths)
+        .ok()
+        .and_then(|path| merge_paths([path.as_os_str()]))
+        .unwrap_or_else(|| current.to_os_string())
 }
 
 #[cfg(any(windows, test))]
@@ -422,7 +450,7 @@ fn append_matching_dirs(paths: &mut Vec<PathBuf>, root: PathBuf, suffix: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_marked_path, merge_paths, windows_process_path};
+    use super::{bundled_runtime_path, extract_marked_path, merge_paths, windows_process_path};
     use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
@@ -452,6 +480,27 @@ mod tests {
                 PathBuf::from("fallback")
             ]
         );
+    }
+
+    #[test]
+    fn bundled_runtimes_take_priority_and_survive_refresh_without_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Nova 用户 space");
+        let system = temp.path().join("system");
+        let current = std::env::join_paths([&system]).unwrap();
+        assert_eq!(bundled_runtime_path(&current, Some(app.clone())), current);
+        let node = app.join("runtimes/node");
+        let python = app.join("runtimes/python");
+        for (dir, exe) in [(&node, "node.exe"), (&python, "python.exe")] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(exe), b"test").unwrap();
+        }
+        let path = bundled_runtime_path(&current, Some(app.clone()));
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            vec![node, python.join("Scripts"), python, system],
+        );
+        assert_eq!(bundled_runtime_path(&path, Some(app)), path);
     }
 
     #[test]
