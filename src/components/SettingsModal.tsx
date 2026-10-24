@@ -152,21 +152,28 @@ export type SettingsTab =
 
 // 左侧导航按用途分组，同类设置挨在一起；group 为空的项单独成段（如「关于」）。
 const TABS: { id: SettingsTab; name: string; group: string }[] = [
+  // 从常用到少用：先配模型，再是日常偏好和工具，高级项沉底。
+  { id: "lyra", name: "Lyra", group: "模型与 Agent" },
+  { id: "scenes", name: "场景模型", group: "模型与 Agent" },
   { id: "general", name: "通用", group: "常规" },
   { id: "appearance", name: "外观", group: "常规" },
-  { id: "advanced", name: "高级", group: "常规" },
-  { id: "env", name: "环境变量", group: "常规" },
-  { id: "scenes", name: "场景模型", group: "模型与 Agent" },
-  { id: "lyra", name: "Lyra", group: "模型与 Agent" },
-  { id: "backends", name: "Lyra 维护", group: "模型与 Agent" },
-  { id: "instructions", name: "Agent 配置", group: "模型与 Agent" },
-  { id: "skills", name: "Skills", group: "模型与 Agent" },
   { id: "meteor", name: "Meteor", group: "工具与协作" },
   { id: "jianlai", name: "剑来", group: "工具与协作" },
   { id: "worktree", name: "Worktree", group: "工具与协作" },
   { id: "team", name: "团队", group: "工具与协作" },
+  { id: "advanced", name: "高级选项", group: "高级" },
+  { id: "env", name: "环境变量", group: "高级" },
   { id: "about", name: "关于", group: "" },
 ];
+
+// Lyra 相关页并入左侧「Lyra」，在右侧用页签切换。
+const LYRA_TABS: { id: SettingsTab; name: string }[] = [
+  { id: "lyra", name: "模型服务" },
+  { id: "skills", name: "Skills" },
+  { id: "instructions", name: "Agent 配置" },
+  { id: "backends", name: "维护" },
+];
+const navTab = (id: SettingsTab): SettingsTab => (LYRA_TABS.some((t) => t.id === id) ? "lyra" : id);
 
 // 首次运行引导：第 1 步配置后端（含 Lyra），第 2 步配置场景模型。
 const ONBOARDING_STEPS: { title: string; tabs: SettingsTab[] }[] = [
@@ -920,8 +927,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 </Show>
                 <button
                   type="button"
-                  classList={{ "settings-tab": true, active: tab() === t.id }}
-                  aria-current={tab() === t.id ? "page" : undefined}
+                  classList={{ "settings-tab": true, active: navTab(tab()) === t.id }}
+                  aria-current={navTab(tab()) === t.id ? "page" : undefined}
                   onClick={() => setTab(t.id)}
                 >
                   {t.name}
@@ -938,6 +945,23 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 ? "在 Lyra 中添加模型服务商。本地 Codex / Claude Code 优先使用 CLI 自定义 API，否则使用内置订阅反代，无需 Node 或独立 Agent。需要团队协作 / 漫游 / server 支持时，在「团队」中填写中转站地址和身份 token（可跳过）。点「下一步」会保存配置并加载模型。"
                 : "为每个场景选择至少一个模型。后端刚启动时模型列表可能需要稍等；仍没有可选模型时请返回上一步检查后端配置。以后可在「设置」中修改。"}
             </p>
+          </Show>
+          <Show when={!props.onboarding && navTab(tab()) === "lyra"}>
+            <div class="theme-seg" role="tablist" aria-label="Lyra 设置" style={{ "margin-bottom": "16px" }}>
+              <For each={LYRA_TABS}>
+                {(t) => (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={tab() === t.id}
+                    classList={{ "theme-seg-btn": true, active: tab() === t.id }}
+                    onClick={() => setTab(t.id)}
+                  >
+                    {t.name}
+                  </button>
+                )}
+              </For>
+            </div>
           </Show>
           <Show when={tab() === "jianlai"}>
             <section class="settings-group">

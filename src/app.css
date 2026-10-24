@@ -4010,12 +4010,16 @@ button {
   border-right: 1px solid var(--border);
 }
 
+/* 分组标题是次级标注（小、淡），页签才是主体（正文色）；选中项加左侧色条。 */
 .settings-tab-group {
-  padding: 14px 10px 6px;
+  padding: 16px 10px 4px;
   color: var(--text-faint);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500;
   letter-spacing: 0.04em;
+}
+.settings-tab-group:first-child {
+  padding-top: 8px;
 }
 .settings-tab-group.gap {
   padding: 0;
@@ -4032,7 +4036,7 @@ button {
   border: none;
   border-radius: var(--r-sm);
   background: transparent;
-  color: var(--text-dim);
+  color: var(--text);
   font-size: 13px;
   text-align: left;
   cursor: pointer;
@@ -4046,8 +4050,9 @@ button {
 
 .settings-tab.active {
   background: var(--accent-dim);
+  box-shadow: inset 2px 0 0 var(--accent);
   color: var(--text);
-  font-weight: 550;
+  font-weight: 600;
 }
 
 /* 窄窗口退回顶部换行的横排页签，把宽度留给表单。 */
