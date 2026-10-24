@@ -201,6 +201,10 @@ pub(crate) struct AutoScope {
 }
 
 impl AutoScope {
+    pub fn desktop(&self) -> bool {
+        self.covered.contains(&settings::Scene::Computer)
+    }
+
     /// 轻量主会话需要编码时不开 Stage，而是升阶：本会话切到编码模型带上下文继续。
     pub fn escalates(&self) -> bool {
         !self.child && self.scene == settings::Scene::Lightweight && self.handoff.contains(&settings::Scene::Coding)
