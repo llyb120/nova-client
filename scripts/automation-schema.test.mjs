@@ -10,7 +10,7 @@ import {automationMcpResult} from './automation-mcp-result.mjs';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
 const tool = async name=>JSON.parse(await readFile(new URL(`./${name}-tool.json`,import.meta.url),'utf8'));
-test('embedded CodeBuddy MCP advertises the current browser schemas and instructions', {timeout:15000}, async()=>{
+test('embedded Nova MCP advertises the current browser schemas and instructions', {timeout:15000}, async()=>{
   const client=new Client({name:'nova-bundle-parity-test',version:'1.0'});
   const transport=new StdioClientTransport({command:process.execPath,
     args:[fileURLToPath(new URL('../src-tauri/resources/nova-tools-mcp.mjs',import.meta.url))],

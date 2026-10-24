@@ -11,37 +11,30 @@ Codex 后端由 Rust 直接启动和管理本机 `codex app-server`，通过 std
 设置中的旧 `codexIntegration: "sdk"` 会自动迁移为 `"app-server"`。
 Codex 会话默认注入内置 RTK 的调用指令，使用 `nova __rtk` 压缩受支持命令的输出，无需额外安装 RTK。新建、恢复和分叉会话均适用，与 Polaris/Ponytail 开关无关；标题生成不注入。这与 RTK 上游的 Codex 接入方式一致，依赖模型遵循指令，并非 Lyra 的执行前强制重写；需要原始输出或不受支持的命令仍直接执行。
 
-修改接入代码后可运行 `npm run test:codex-app-server`，验证原生 stdio 协议、流式输出、恢复、取消、引导、审批、标题、分叉和图片清理。安装 Codex CLI 并执行 `cargo build --manifest-path src-tauri/Cargo.toml --bin nova` 后，运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib codex_app_server::tests::live -- --ignored` 可验证真实 app-server 对话与原生 Polaris MCP 调用（使用本地模拟模型，不访问真实模型服务）。Codex 的 Polaris MCP 由 `nova __codex-mcp` 原生子命令提供，复用 Rust 上下文服务及索引缓存；Codex 对话和 Polaris 均不依赖 Node。
+SolidJS 前端通过 Tauri 命令与事件连接 Rust 后端：
 
-## 工作原理
+- **Lyra** 直接请求配置的模型 provider，由 Nova 执行工具并管理会话上下文。
+- 每个会话（线程）绑定你选择的工作目录，流式文字、思考、工具调用与计划实时推送给前端。
+- 敏感操作通过权限卡片审批；会话上下文由 Lyra 管理。
+- 会话历史持久化在本地 `~/.nova/`。旧版本的数据目录标识是 `com.fuckdevin.desktop` / `com.nova.desktop`；升级到 Nova 后**首次启动会自动把旧目录数据拷贝到 `~/.nova`**，保留旧目录不删；旧后端的模型迁移另按以下规则处理。
 
-应用不调用任何 HTTP API，而是把本机的 `devin` CLI 作为子进程拉起：
+### 旧后端自动迁移
 
-```
-┌──────────────┐  Tauri 命令/事件   ┌──────────────┐  JSON-RPC (stdio)  ┌─────────────┐
-│ SolidJS 前端 │ ◄───────────────► │  Rust 后端    │ ◄────────────────► │  devin acp  │
-└──────────────┘                   └──────────────┘                     └─────────────┘
-```
+启动时会将能够确认等价 provider 的旧会话历史、场景模型、模型收藏、选模型快捷键，以及前端 local storage 中的模型选择自动迁移到 Lyra，保留原模型与思考档位（effort），而不是统一换成默认模型。迁移成功后可由 Lyra 继续会话，不再启动旧后端。
 
-- 后端通过 `devin acp` 启动一个 **ACP（Agent Client Protocol）服务进程**，用 stdio 上的 JSON-RPC 通信。
-- 每个会话（线程）对应一个 ACP session，绑定你选择的工作目录。
-- Devin 的流式输出（`session/update` 通知）被解析为消息块、思考块、工具调用、计划等，实时推送给前端。
-- Devin 请求敏感操作权限时（`session/request_permission`），界面弹出审批卡片，由你点击放行或拒绝。
-- 应用进程重启后，旧会话通过 `session/load` 恢复上下文，可以继续对话。
-- 会话历史持久化在本地（`~/.nova/threads.json`）。旧版本的数据目录标识是 `com.fuckdevin.desktop` / `com.nova.desktop`；升级到 Nova 后**首次启动会自动把旧目录数据拷贝到 `~/.nova`**（保留旧目录不删，可安全回退），会话/设置无缝延续。
+不迁移 Kimi / Cursor。其他支持迁移的旧后端若模型来源、别名、Auto 实际模型或 effort 无法确认，会保留原会话和选择并提示待处理，不猜测映射或静默换模型。请在 Lyra 配置对应 provider，然后在该会话的模型选择器中选择一个 Lyra 模型完成改绑（历史保留）；用户的 CLI 配置和凭据不会被删除。详见 [迁移边界](docs/lyra-provider-models.md#旧后端选择迁移)。
 
 ## 功能
 
 - codex 风格首页：选择项目（最近项目可搜索 / 浏览文件夹 / **临时会话**——不关联项目，自动在系统临时目录建空工作区）+ 输入任务直接开干
 - 多会话管理：按项目目录分组的会话列表，新建 / 删除 / 重命名（双击标题）
-- 每个会话独立的**模型**（可搜索，列表来自 devin 实时返回）与**模式**（Code / Ask / Plan / Bypass），聊天中途可切换、即时生效；新会话默认沿用上次选择
+- 每个会话独立的**模型**（可搜索，列表来自 Lyra provider）与**模式**，新会话默认沿用上次选择
 - 流式 transcript：Markdown 渲染、可折叠思考过程、工具调用卡片（含状态、文件位置、终端输出、原始入参/出参）
 - 文件改动以 diff 形式展示（增删行高亮）
-- 计划（Plan）卡片实时展示 Devin 的 todo 进度
+- 计划（Plan）卡片实时展示 agent 的任务进度
 - 权限审批：允许一次 / 总是允许 / 拒绝
 - codex 式轮次折叠：每轮完成后，思考/工具调用过程自动折叠为「已处理 Xs · N tokens」行，与结论区分开，点击可展开回看
 - 用量展示：每轮 token 消耗（折叠行，悬停看输入/输出明细）+ 会话累计 tokens（标题栏右侧）
-- **剩余额度**：侧栏左下角实时显示日/周限额剩余百分比（直接调用 windsurf 后端 GetUserStatus，复用 devin 登录凭证；悬停看重置时间与按量积分，点击刷新，每 10 分钟自动更新，低于 20% 标红）
 - **任务完成系统通知**：窗口不在前台时，任务结束（完成/出错/停止）会弹系统通知；Windows 点击通知可唤起窗口并跳转到对应会话，macOS 显示通知并可通过 Dock 唤起应用
 - **运行时防休眠**：只要仍有会话在运行，就阻止系统因空闲自动休眠；所有会话结束后自动恢复，不强制亮屏，也不拦截手动睡眠
 - 随时停止当前轮次（`session/cancel`，devin 不响应时 10 秒后强制本地结束）
@@ -50,27 +43,24 @@ Codex 会话默认注入内置 RTK 的调用指令，使用 `nova __rtk` 压缩�
 - 工具输出自动剥离 ANSI 转义码，终端输出不再乱码
 - **跨平台**：Windows 与 macOS 共享同一套体验（Finder/资源管理器、终端、通知、自更新通道按平台分离）
 
-## 关于 Windsurf Cascade
+## Lyra 本地 API provider
 
-Windsurf 已更名为 **Devin Desktop**（2026-06），其本地 agent Cascade 将于 **2026-07-01 EOL**，由 Devin Local 取代，且 Cascade 从未提供独立 CLI——所以无法也没必要接入。
-本应用使用的 `devin` CLI 正是 Cognition（Windsurf 母公司）官方的 agent 入口，与 Devin Desktop 共用同一后端与模型池（Claude / Gemini / GPT / SWE 系列）。
+在「设置 → Lyra → 添加 Provider」选择 Devin / CodeBuddy / WorkBuddy（本地 API），复用对应 CLI 或桌面版的本机登录。推理由 Rust 直接请求上游，工具由 Lyra 执行；WorkBuddy 的加密登录仍通过其自带运行时读取，不依赖独立 ACP 桥。
 
-## Claude Code（ACP）
+接入说明见 [Lyra provider](docs/lyra-provider-models.md)、[Devin](docs/devin-openai-api.md) 和 [CodeBuddy / WorkBuddy](docs/codebuddy-openai-api.md)。面向其他客户端的可选 OpenAI 兼容服务及协议测试仍保留；运行 `npm run test:lyra-providers` 可检查原生 provider 连接点、兼容接口与 WorkBuddy 登录解密，避免清理独立后端时误删。
 
-Claude Code 有独立后端，不需要占用 Devin 配置。需要 Node.js 22+：
+### 本地 Codex / Claude Code
 
 1. 安装 adapter：`npm install -g @agentclientprotocol/claude-agent-acp@latest`。
 2. 运行 `claude-agent-acp --cli` 完成 Claude Code 登录，或在 Nova 环境变量中配置 `ANTHROPIC_API_KEY`。
 3. 设置 → 后端 → Claude Code，启用并保存。默认可执行文件是 `claude-agent-acp`（不是 `claude`），支持自定义路径与独立代理。
 
-复用 ACP 的流式消息、工具展示、图片、权限审批、Build/Plan、模型与思考强度、恢复、取消、预热、标题、接力、漫游和历史编辑。Nova 的 Polaris、剑来、Chrome、图片生成/编辑及工作目录切换通过会话 MCP 自动挂载；Plan 模式不开放写入类 Nova 工具。全局指令同步到 `CLAUDE.md`，skills 同步到 Claude 配置目录。
-
-额度租借仅支持显式 API Key / Token，不自动导出系统钥匙串中的登录凭证。ACP 不提供通用运行中引导接口，Claude 忙碌时使用消息队列。
+配置来源、模型别名解析及认证边界见 [Lyra provider](docs/lyra-provider-models.md)。CLI 登录配置与凭据保留在原位置，不随独立后端清理而删除。
 
 ## 运行前提
 
-- 已安装 [Devin CLI](https://docs.devin.ai/) 且 `devin` 在 PATH 中（或在设置里指定完整路径）
-- 已完成 `devin` 登录认证（先在终端跑一次 `devin` 确认可用）
+- 使用 Lyra 普通 API provider 时配置模型服务凭据即可；仅使用本地 provider 时需要对应 CLI/桌面版的配置或登录
+- 仅使用 Devin 本地 API provider 时需要已登录的 [Devin CLI](https://docs.devin.ai/)（`devin auth login`）
 - Node.js ≥ 20、Rust ≥ 1.80
   - **Windows**：需 MSVC 工具链
   - **macOS**：需 Xcode Command Line Tools（`xcode-select --install`）
@@ -110,6 +100,8 @@ npm run tauri build
 ```
 
 产物在 `src-tauri/target/release/bundle/` 下。
+
+构建前仅生成通用 `nova-tools-mcp`，保留其 `@modelcontextprotocol/sdk` 依赖；WorkBuddy 登录辅助脚本由 Rust 内嵌。本地 provider 不使用已移除的 agent SDK/ACP 桥。Tauri 未配置整目录资源打包，更新 zip 只收录 Nova 二进制；清理旧脚本或未引用的生成资源不等于安装包会按其文件大小缩减。
 
 **Linux 无界面服务器：**
 
@@ -160,5 +152,4 @@ src-tauri/src/
 ## 注意
 
 - 想全自动不弹审批：在**设置 → 新会话默认模式**选 `Bypass Permissions`（或在会话里手动切换模式）。该模式会自动批准包括写文件、执行命令在内的所有工具调用，请只在可信目录使用。
-- Windows 上 Nova 会在 Devin 新 ACP 会话的首条提示词中隐式注入 PowerShell 5.1 约束，避免 agent 把 `ls -la` 等 Unix 命令交给 PowerShell；该上下文不会显示或保存为用户消息。
-- 修改设置会重启 agent 进程；进行中的轮次会被打断，历史上下文在下次发消息时自动恢复。
+- 修改模型连接或认证配置前，先停止进行中的轮次，避免请求被中断。

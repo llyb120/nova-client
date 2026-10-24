@@ -26,7 +26,7 @@ export interface SelectOption {
   group?: string;
   /** 后端（agentKind）；任一选项带后端时切换为三级面板：后端 → 厂商 → 模型 */
   backend?: string;
-  /** 后端显示名（如 Devin / Codex / CodeBuddy），三级面板左栏使用 */
+  /** 后端显示名（如 Lyra / Codex / Claude Code），三级面板左栏使用 */
   backendLabel?: string;
   /** 该项是某后端的「默认」（跟随 agent 默认模型）入口，三级面板里置顶直接可选 */
   isDefault?: boolean;
@@ -136,7 +136,7 @@ export function SearchSelect(props: {
       }
       return label;
     }
-    // 值非空但未命中列表（如 codebuddy 云端清单未就绪时的中间态）：用友好名/原值显示，
+    // 值非空但未命中列表（如云端清单未就绪时的中间态）：用友好名/原值显示，
     // 不回退到第一项，否则触发器会显示成别的模型（显示与实际选择不一致）。
     if (props.value) return props.fallbackLabel ?? props.value;
     return defaultLabel();

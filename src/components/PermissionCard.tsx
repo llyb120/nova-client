@@ -28,7 +28,7 @@ function buttonClass(kind: string): string {
 
 export function PermissionCard(props: { req: PermissionRequest }) {
   const preview = () => inputPreview(props.req.toolCall?.rawInput);
-  const agent = () => agentLabel(props.req.agentKind ?? "devin");
+  const agent = () => agentLabel(props.req.agentKind ?? "lyra");
   const [answers, setAnswers] = createSignal<string[][]>(
     props.req.questions?.map(() => []) ?? [],
   );

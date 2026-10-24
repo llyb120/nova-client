@@ -8,7 +8,6 @@ import { automationMcpResult } from './automation-mcp-result.mjs';
 import {
   createNovaBatchTools,
   normalizePolarisArgs,
-  novaDevinBatchToolPolicy,
 } from "./nova-batch-tools.mjs";
 
 function withContextService(run) {
@@ -111,18 +110,10 @@ test("polaris keywords normalize to top five", () => {
   assert(schema.anyOf.some((option) => option.type === "string"));
 });
 
-test("CodeBuddy direct mode describes polaris as a direct tool", () => {
-  const previous = process.env.NOVA_MCP_DIRECT;
-  process.env.NOVA_MCP_DIRECT = "1";
-  try {
-    const tool = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }).polaris);
-    assert.match(tool.description, /直接调用/);
-    assert.doesNotMatch(tool.description, /mcp_call_tool/);
-    assert.doesNotMatch(tool.description, /ToolSearch|DeferExecuteTool/);
-  } finally {
-    if (previous === undefined) delete process.env.NOVA_MCP_DIRECT;
-    else process.env.NOVA_MCP_DIRECT = previous;
-  }
+test("MCP polaris describes the tool without a removed backend's routing wrapper", () => {
+  const tool = withContextService(() => createNovaBatchTools(process.cwd(), { fastContext: true }).polaris);
+  assert.match(tool.description, /调用 polaris/);
+  assert.doesNotMatch(tool.description, /mcp_call_tool|ToolSearch|DeferExecuteTool|Devin|CodeBuddy/);
 });
 
 test("desktop optimizations are shared by custom tools and MCP, not Lyra-only", async () => {
@@ -186,21 +177,13 @@ test("desktop optimizations are shared by custom tools and MCP, not Lyra-only", 
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("devin policy routes context through MCP when the native service exists", () => {
-  const policy = withContextService(() => novaDevinBatchToolPolicy({ fastContext: true }));
-  assert.match(policy, /mcp_call_tool/);
-  assert.match(policy, /polaris/);
-  assert.match(policy, /Devin native edit tools/);
-  assert.doesNotMatch(policy, /webview/i);
-});
-
-test("directory switching is session scoped, works without polaris, and updates its root only on success", async () => {
+test("MCP omits legacy directory switching, preserves its configured root, and never retries mutations", async () => {
   const endpoint = process.platform === "win32"
-    ? `\\\\.\\pipe\\nova-cwd-test-${process.pid}`
-    : join(tmpdir(), `nova-cwd-test-${process.pid}.sock`);
+    ? `\\\\.\\pipe\\nova-mcp-test-${process.pid}`
+    : join(tmpdir(), `nova-mcp-test-${process.pid}.sock`);
   const previous = { ...process.env };
   const calls = [];
-  const target = resolve("new project");
+  const root = resolve("scripts");
   const server = createServer((socket) => {
     let line = "";
     socket.on("data", (chunk) => {
@@ -209,10 +192,9 @@ test("directory switching is session scoped, works without polaris, and updates 
       const request = JSON.parse(line.trim());
       calls.push(request);
       if (request.params.prompt === "lost response" || ["chrome", "jianlai"].includes(request.method)) { socket.destroy(); return; }
-      const rejected = request.params.path === "missing";
-      socket.end(JSON.stringify(rejected
-        ? { ok: false, error: "directory missing" }
-        : { ok: true, result: request.method === "polaris" ? "context" : request.method.endsWith("_image") ? { path: "C:/images/result.png" } : { cwd: target, changed: true } }) + "\n");
+      socket.end(JSON.stringify({ ok: true,
+        result: request.method === "polaris" ? "context" : { path: "C:/images/result.png" },
+      }) + "\n");
     });
   });
   try {
@@ -220,23 +202,19 @@ test("directory switching is session scoped, works without polaris, and updates 
     process.env.NOVA_CONTEXT_SERVICE_ENDPOINT = endpoint;
     process.env.NOVA_CONTEXT_SERVICE_TOKEN = "secret";
     delete process.env.NOVA_CWD_CHANGE_SCOPE;
-    assert.equal(createNovaBatchTools(process.cwd()).change_working_directory, undefined);
+    assert.equal(createNovaBatchTools(root).change_working_directory, undefined);
     process.env.NOVA_CWD_CHANGE_SCOPE = "session-A";
-    const tools = createNovaBatchTools(process.cwd(), { fastContext: true });
-    assert(createNovaBatchTools(process.cwd(), { fastContext: false }).change_working_directory);
-    await assert.rejects(tools.change_working_directory.execute({ path: " " }), /缺少 path/);
-    assert.equal(calls.length, 0);
-    await assert.rejects(tools.change_working_directory.execute({ path: "missing" }), /directory missing/);
-    await tools.polaris.execute({ query: "Widget" });
-    assert.equal(calls.at(-1).root, process.cwd());
-    await tools.change_working_directory.execute({ path: "../new project" });
-    assert.deepEqual(calls.at(-1).params, { scope: "session-A", path: "../new project" });
-    await tools.polaris.execute({ query: "Widget" });
-    assert.equal(calls.at(-1).root, target);
+    const tools = createNovaBatchTools(root, { fastContext: true });
+    assert.equal(tools.change_working_directory, undefined);
+    assert.equal(createNovaBatchTools(root, { fastContext: false }).change_working_directory, undefined);
+    assert.equal(createNovaBatchTools(root, { readOnly: true }).change_working_directory, undefined);
+    assert.equal(await tools.polaris.execute({ query: "Widget" }), "context");
+    assert.equal(calls.at(-1).method, "polaris");
+    assert.equal(calls.at(-1).root, root);
     const args = { prompt: "blue background", referenceImages: ["original.png"] };
     assert.deepEqual(JSON.parse(await tools.edit_image.execute(args)), { path: "C:/images/result.png" });
     assert.equal(calls.at(-1).method, "edit_image");
-    assert.equal(calls.at(-1).root, target);
+    assert.equal(calls.at(-1).root, root);
     assert.deepEqual(calls.at(-1).params, args);
     const before = calls.length;
     await assert.rejects(tools.generate_image.execute({ prompt: "lost response" }));

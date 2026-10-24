@@ -1306,7 +1306,7 @@ impl RelayManager {
         self.emit_inbox();
     }
 
-    /// 高级分享：用指定模型（默认 swe-1.6）对会话执行一段提示词，
+    /// 高级分享：用指定模型（默认轻量化场景）对会话执行一段提示词，
     /// 在本机起一个会话跑出结果，跑完后自动把结果分享给目标。返回处理线程供前端打开观看。
     pub fn advanced_share(
         self: &Arc<Self>,
@@ -1385,31 +1385,7 @@ impl RelayManager {
                     mgr.run_prompt(run_id, seed, vec![]).await;
                 });
             }
-            AgentKind::Devin => {
-                let mgr = state.acp.clone();
-                tauri::async_runtime::spawn(async move {
-                    mgr.run_prompt(run_id, seed, vec![]).await;
-                });
-            }
-            AgentKind::Claude | AgentKind::WorkBuddy => {
-                let mgr = state.acp_for(&agent_kind).unwrap();
-                tauri::async_runtime::spawn(async move {
-                    mgr.run_prompt(run_id, seed, vec![]).await;
-                });
-            }
-            AgentKind::Codex | AgentKind::CodexPlus => {
-                let mgr = state.codexplus.clone();
-                tauri::async_runtime::spawn(async move {
-                    mgr.run_prompt(run_id, seed, vec![]).await;
-                });
-            }
-            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                let mgr = state.codebuddy.clone();
-                tauri::async_runtime::spawn(async move {
-                    mgr.run_prompt(run_id, seed, vec![]).await;
-                });
-            }
-            AgentKind::Unsupported => return Err("该后端不可用".into()),
+            _ => return Err("该后端已移除，请使用 Lyra".into()),
         }
         let state = self.app.state::<AppState>();
         let store = state.store.lock().unwrap();
@@ -1450,8 +1426,8 @@ impl RelayManager {
         if self.cfg().is_none() {
             return Err("未配置中转站 token".into());
         }
-        if agent_kind == AgentKind::Unsupported {
-            return Err("该后端不可用".into());
+        if agent_kind != AgentKind::Lyra {
+            return Err("该模型尚未迁移到 Lyra".into());
         }
         let mut thread = Thread::new(
             folder.clone(),
@@ -1552,7 +1528,7 @@ impl RelayManager {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             let t = store.get(thread_id).ok_or("线程不存在")?;
-            if t.agent_kind == AgentKind::Unsupported {
+            if t.agent_kind != AgentKind::Lyra {
                 return Err("该后端不可用".into());
             }
             if !t.is_roaming_guest() {
@@ -1777,8 +1753,6 @@ impl RelayManager {
         mirror.items.clear();
         mirror.plan = None;
         mirror.acp_session_id = None;
-        mirror.provider_checkpoints.clear();
-        mirror.pending_native_restore = None;
         mirror.clue_context = None;
         self.spawn_send_now(peer, "roaming.stage", json!({
             "guestThreadId": guest_id, "parentGuestThreadId": parent_guest_id, "thread": mirror,
@@ -1837,11 +1811,6 @@ impl RelayManager {
                 let avail = state.backend_availability.lock().unwrap();
                 [
                     (AgentKind::Lyra, s.lyra_enabled),
-                    (AgentKind::Devin, s.devin_enabled),
-                    (AgentKind::Claude, s.claude_enabled),
-                    (AgentKind::Codex, s.codex_enabled),
-                    (AgentKind::CodeBuddy, s.codebuddy_enabled),
-                    (AgentKind::WorkBuddy, s.workbuddy_enabled),
                 ]
                 .into_iter()
                 // 可用性未检测完（map 为空/无该键）时按可用处理，避免误伤
@@ -1849,29 +1818,11 @@ impl RelayManager {
                 .map(|(k, _)| k)
                 .collect()
             };
-            let mut backends: Vec<&str> = Vec::new();
+            let mut backends: Vec<String> = Vec::new();
             let mut options = serde_json::Map::new();
             for kind in kinds {
-                let fetched = match kind {
-                    AgentKind::Lyra => app.state::<AppState>().lyra.ensure_model_options().await,
-                    AgentKind::Codex | AgentKind::CodexPlus => {
-                        app.state::<AppState>()
-                            .codexplus
-                            .ensure_model_options()
-                            .await
-                    }
-                    AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                        app.state::<AppState>()
-                            .codebuddy
-                            .ensure_model_options()
-                            .await
-                    }
-                    AgentKind::Unsupported => continue,
-                    AgentKind::WorkBuddy => app.state::<AppState>().workbuddy.ensure_model_options().await,
-                    AgentKind::Devin => app.state::<AppState>().acp.fetch_model_options().await,
-                    AgentKind::Claude => app.state::<AppState>().claude.fetch_model_options().await,
-                };
-                backends.push(kind.as_str());
+                let fetched = app.state::<AppState>().lyra.ensure_model_options().await;
+                backends.push(kind.as_str().to_string());
                 if let Ok(v) = fetched {
                     options.insert(kind.as_str().into(), v);
                 }
@@ -2370,21 +2321,12 @@ impl RelayManager {
             thread.items = retained_items;
             thread.plan = None;
             thread.acp_session_id = None;
-            thread.pending_native_restore = None;
-            thread.codex_usage_snapshot = None;
-            thread
-                .provider_checkpoints
-                .retain(|checkpoint| checkpoint.user_item_id < item_id);
             thread.handoff_from = (!thread.items.is_empty()).then(|| thread.agent_kind.clone());
             thread.updated_at = now_ms();
             store.save();
         }
         // 远端原生会话已不再对应截断后的历史，下一条 prompt 必须从接力上下文启动。
-        state.acp.forget_session_of_thread(&host_thread_id);
-        state.claude.forget_session_of_thread(&host_thread_id);
-        state.codex.forget_session_of_thread(&host_thread_id);
-        state.codexplus.forget_session_of_thread(&host_thread_id);
-        state.codebuddy.forget_session_of_thread(&host_thread_id);
+        state.lyra.forget_session_of_thread(&host_thread_id);
     }
 
     fn on_roaming_prompt(&self, env: &InEnvelope) {
@@ -2486,60 +2428,7 @@ impl RelayManager {
                     }
                 });
             }
-            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                let mgr = state.codebuddy.clone();
-                tauri::async_runtime::spawn(async move {
-                    if !host_prompt_is_current(&prompt_epoch) {
-                        return;
-                    }
-                    crate::lyra::session::resume_for_thread(&host_thread_id);
-                    mgr.run_prompt(host_thread_id, text, images).await;
-                });
-            }
-            AgentKind::Codex | AgentKind::CodexPlus => {
-                let mgr = state.codexplus.clone();
-                tauri::async_runtime::spawn(async move {
-                    if host_prompt_is_current(&prompt_epoch) {
-                        crate::lyra::session::resume_for_thread(&host_thread_id);
-                        mgr.run_prompt(host_thread_id, text, images).await;
-                    }
-                });
-            }
-            AgentKind::Devin => {
-                let mgr = state.acp.clone();
-                if mgr.is_running(&host_thread_id) {
-                    tauri::async_runtime::spawn(async move {
-                        if !host_prompt_is_current(&prompt_epoch) {
-                            return;
-                        }
-                        crate::lyra::session::resume_for_thread(&host_thread_id);
-                        mgr.steer_prompt(host_thread_id, text, images).await;
-                    });
-                } else {
-                    tauri::async_runtime::spawn(async move {
-                        if !host_prompt_is_current(&prompt_epoch) {
-                            return;
-                        }
-                        crate::lyra::session::resume_for_thread(&host_thread_id);
-                        mgr.run_prompt(host_thread_id, text, images).await;
-                    });
-                }
-            }
-            AgentKind::Claude | AgentKind::WorkBuddy => {
-                let mgr = state.acp_for(&agent_kind).unwrap();
-                tauri::async_runtime::spawn(async move {
-                    if !host_prompt_is_current(&prompt_epoch) {
-                        return;
-                    }
-                    crate::lyra::session::resume_for_thread(&host_thread_id);
-                    if agent_kind == AgentKind::WorkBuddy && mgr.is_running(&host_thread_id) {
-                        mgr.steer_prompt(host_thread_id, text, images).await;
-                    } else {
-                        mgr.run_prompt(host_thread_id, text, images).await;
-                    }
-                });
-            }
-            AgentKind::Unsupported => self.send_roaming_error(&host_thread_id, "该后端不可用"),
+            _ => self.send_roaming_error(&host_thread_id, "该后端已移除，请使用 Lyra"),
         }
     }
 
@@ -2572,7 +2461,7 @@ impl RelayManager {
         if !crate::running_by_id(&state, &host_thread_id) {
             self.forward_local_turn(&host_thread_id, false, &json!("force_cancelled"));
         }
-        if agent_kind == AgentKind::Unsupported {
+        if agent_kind != AgentKind::Lyra {
             self.send_roaming_error(&host_thread_id, "该后端不可用");
             return;
         }
@@ -2642,37 +2531,8 @@ impl RelayManager {
         }
     }
 
-    fn on_roaming_permission_response(&self, env: &InEnvelope) {
-        let request_key = env.data["requestKey"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let option_id = env.data["optionId"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let state = self.app.state::<AppState>();
-        if request_key.starts_with("claude-") {
-            let mgr = state.claude.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        } else if request_key.starts_with("cbp-") {
-            let mgr = state.codebuddy.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        } else if request_key.starts_with("codex-") {
-            let mgr = state.codex.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        } else {
-            let mgr = state.acp.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = mgr.respond_permission(&request_key, &option_id).await;
-            });
-        }
+    fn on_roaming_permission_response(&self, _env: &InEnvelope) {
+        // 独立后端权限协议已移除；旧客户端响应不再路由到任何运行时。
     }
 
     fn on_roaming_config(&self, env: &InEnvelope) {
@@ -2685,27 +2545,16 @@ impl RelayManager {
         }
         let model = env.data["model"].as_str().map(|s| s.to_string());
         let mode = env.data["mode"].as_str().map(|s| s.to_string());
-        let agent_kind = {
-            let state = self.app.state::<AppState>();
-            let mut store = state.store.lock().unwrap();
-            let Some(t) = store.get_mut(&host_thread_id) else {
-                return;
-            };
-            if t.model != model {
-                t.clear_auto_route();
-            }
-            t.model = model;
-            t.mode = mode;
-            let ak = t.agent_kind.clone();
-            store.save();
-            ak
-        };
         let state = self.app.state::<AppState>();
-        if let Some(mgr) = state.acp_for(&agent_kind) {
-            tauri::async_runtime::spawn(async move {
-                mgr.sync_thread_config(&host_thread_id).await;
-            });
+        let mut store = state.store.lock().unwrap();
+        let Some(t) = store.get_mut(&host_thread_id) else {
+            return;
+        };
+        if t.model != model {
         }
+        t.model = model;
+        t.mode = mode;
+        store.save();
     }
 
     fn on_roaming_resync(&self, env: &InEnvelope) {
@@ -3801,11 +3650,10 @@ mod tests {
 
     #[test]
     fn relay_requests_reject_unavailable_backends_without_fallback() {
-        for agent in ["kimi", "cursor", "unsupported", "unknown-backend", "", "   "] {
+        for agent in ["claude", "codex", "codexplus", "devin", "codebuddy", "codebuddyplus", "workbuddy", "kimi", "cursor", "unsupported", "unknown-backend", "", "   "] {
             assert!(requested_agent_kind(agent).is_err(), "accepted {agent:?}");
         }
         assert_eq!(requested_agent_kind(" lyra ").unwrap(), AgentKind::Lyra);
-        assert_eq!(requested_agent_kind("devin").unwrap(), AgentKind::Devin);
     }
 
     #[test]

@@ -211,26 +211,12 @@ pub struct Settings {
     pub meteor_paste_shortcut: String,
     /// 剑谱录制开关的全局组合键；空值关闭。
     pub jianpu_shortcut: String,
-    /// 是否启用各模型后端（仅影响前端可选性：关闭后不在新建/切换会话的后端列表里出现，
-    /// 已存在的该后端历史会话仍可打开查看）
-    pub devin_enabled: bool,
-    /// 旧 Vega 开关，仅兼容反序列化（迁移到 lyra_enabled 后忽略）。
-    pub vega_enabled: bool,
     /// Lyra Rust 原生 agent（进程内运行，不经 Node bridge）。
     pub lyra_enabled: bool,
-    pub codex_enabled: bool,
-    /// 旧版独立 SDK 后端开关，仅用于兼容反序列化。
-    pub codexplus_enabled: bool,
-    pub codebuddy_enabled: bool,
-    pub codebuddyplus_enabled: bool,
-    pub workbuddy_enabled: bool,
-    /// 各后端接入方式：app-server / sdk / acp。Codex 固定使用 app-server。
-    pub codex_integration: String,
-    pub codebuddy_integration: String,
     /// worktree 工作目录的根（空 = 应用数据目录下的 worktrees/）。
     /// 会话开启「在 worktree 中执行」时，在此目录下为其创建独立工作目录。
     pub worktree_dir: String,
-    /// 更新通道：release / pre-release。
+    /// 更新通道：release / pre-release / develop。
     pub update_channel: String,
     /// 是否自动清理长期未更新的会话。
     pub session_auto_cleanup_enabled: bool,
@@ -288,16 +274,7 @@ impl Default for Settings {
             meteor_clipboard: false,
             meteor_paste_shortcut: "Alt+V".into(),
             jianpu_shortcut: "Alt+R".into(),
-            devin_enabled: false,
-            vega_enabled: false,
             lyra_enabled: true,
-            codex_enabled: false,
-            codexplus_enabled: false,
-            codebuddy_enabled: false,
-            codebuddyplus_enabled: false,
-            workbuddy_enabled: false,
-            codex_integration: "app-server".into(),
-            codebuddy_integration: "acp".into(),
             worktree_dir: String::new(),
             update_channel: "release".into(),
             session_auto_cleanup_enabled: false,
@@ -333,6 +310,24 @@ mod tests {
     fn removed_taskbar_status_toggle_still_loads() {
         // Butterfly is always on; old configs carrying the toggle must still parse.
         assert!(serde_json::from_str::<Settings>(r#"{"taskbarStatusEnabled":false}"#).is_ok());
+    }
+
+    #[test]
+    fn update_channels_survive_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        assert_eq!(Settings::load(&dir).update_channel, "release");
+        for channel in ["release", "pre-release", "develop", "unknown"] {
+            let settings = Settings {
+                update_channel: channel.into(),
+                ..Settings::default()
+            };
+            settings.save(&dir);
+            assert_eq!(
+                Settings::load(&dir).update_channel,
+                if channel == "unknown" { "release" } else { channel }
+            );
+        }
     }
 
     #[test]
@@ -508,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn vega_and_external_backends_are_disabled_by_default() {
+    fn only_lyra_runtime_settings_are_persisted() {
         let settings = Settings::default();
         assert!(!settings.vega_enabled);
         assert!(!settings.devin_enabled);
@@ -519,8 +514,6 @@ mod tests {
     #[test]
     fn vega_config_migrates_to_lyra() {
         let mut settings = Settings::default();
-        settings.vega_enabled = true;
-        settings.lyra_enabled = false;
         settings.scene_models.coding.push(ModelTarget {
             agent_kind: "alkaid".into(),
             model: "p/m".into(),
@@ -532,18 +525,28 @@ mod tests {
             action: "selectModel".into(),
             target: "alkaid:p/m".into(),
         });
+        settings.session_shortcuts.push(SessionShortcut { id: "2".into(), keys: "Ctrl+2".into(), action: "insertText".into(), target: "alkaid:p/m".into() });
         settings.migrate_legacy_vega();
-        assert!(settings.lyra_enabled);
-        assert!(!settings.vega_enabled);
+        assert_eq!(settings.session_shortcuts[1].target, "alkaid:p/m");
         assert_eq!(settings.scene_models.coding[0].agent_kind, "lyra");
         assert_eq!(settings.model_favorites[0], "lyra:p/m");
         assert_eq!(settings.session_shortcuts[0].target, "lyra:p/m");
     }
 
     #[test]
-    fn legacy_vega_switch_enables_lyra() {
-        let settings: Settings = serde_json::from_str(r#"{"vegaEnabled":true}"#).unwrap();
-        assert!(settings.vega_enabled);
+    fn legacy_vega_switch_migrates_on_load_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        for legacy in [serde_json::json!(true), serde_json::json!(false), serde_json::Value::Null, serde_json::json!("true")] {
+            let raw = serde_json::json!({"vegaEnabled": legacy, "lyraEnabled": false});
+            fs::write(path.join("settings.json"), raw.to_string()).unwrap();
+            let settings = Settings::load(&path);
+            assert_eq!(settings.lyra_enabled, legacy.as_bool() == Some(true));
+            settings.save(&path);
+            let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(path.join("settings.json")).unwrap()).unwrap();
+            assert!(saved.get("vegaEnabled").is_none());
+            assert_eq!(Settings::load(&path).lyra_enabled, settings.lyra_enabled);
+        }
     }
 
     #[test]
@@ -592,8 +595,7 @@ mod tests {
     #[test]
     fn sdk_integration_defaults_match_backend_policy() {
         let settings = Settings::default();
-        assert_eq!(settings.codex_integration, "app-server");
-        assert_eq!(settings.codebuddy_integration, "acp");
+        assert!(serde_json::to_value(settings).unwrap().get("codexIntegration").is_none());
     }
 
     #[test]
@@ -612,9 +614,10 @@ mod tests {
 
         let settings = Settings::load(&dir);
 
-        assert_eq!(settings.codex_integration, "app-server");
-        assert_eq!(settings.codebuddy_integration, "acp");
-        assert!(!settings.codebuddyplus_enabled);
+        let saved = serde_json::to_value(settings).unwrap();
+        assert!(saved.get("codexIntegration").is_none());
+        assert!(saved.get("codebuddyIntegration").is_none());
+        assert!(saved.get("codebuddyplusEnabled").is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -641,12 +644,8 @@ fn migrate_alkaid_target(target: &mut String) {
 }
 
 impl Settings {
-    /// Vega 已移除：旧的开关与 alkaid 键统一迁移到 Lyra。
+    /// Vega 已移除：旧 alkaid 键统一迁移到 Lyra。
     fn migrate_legacy_vega(&mut self) {
-        if self.vega_enabled {
-            self.lyra_enabled = true;
-            self.vega_enabled = false;
-        }
         let scenes = &mut self.scene_models;
         for target in scenes.lightweight.iter_mut().chain(&mut scenes.coding).chain(&mut scenes.computer) {
             if target.agent_kind.trim() == "alkaid" {
@@ -655,7 +654,7 @@ impl Settings {
         }
         migrate_alkaid_keys(&mut self.model_favorites);
         for shortcut in &mut self.session_shortcuts {
-            migrate_alkaid_target(&mut shortcut.target);
+            if shortcut.action == "selectModel" { migrate_alkaid_target(&mut shortcut.target); }
         }
     }
 
@@ -695,7 +694,7 @@ impl Settings {
                 settings.scene_models.lightweight.push(ModelTarget { agent_kind, model });
             }
         }
-        if settings.update_channel != "pre-release" {
+        if !matches!(settings.update_channel.as_str(), "pre-release" | "develop") {
             settings.update_channel = "release".into();
         }
         if settings.session_auto_cleanup_hours == 0 {
@@ -703,14 +702,10 @@ impl Settings {
                 .map(|days| days.saturating_mul(24))
                 .unwrap_or(24 * 30);
         }
-        // 旧版把 SDK 暴露为独立 “+” 后端；升级后折叠为同一后端的接入方式。
-        settings.codexplus_enabled = false;
-        settings.codebuddyplus_enabled = false;
-        // SDK bridge 已移除：CodeBuddy 固定走官方 HTTP 传输（`codebuddy --serve`
-        // + /api/v1/acp）；Codex 固定走 app-server。
-        settings.codex_integration = "app-server".into();
-        settings.codebuddy_integration = "acp".into();
-        // Vega 已移除：旧的开关与 alkaid 键统一迁移到 Lyra。
+        // 旧开关只从原始配置迁移，不再进入运行时 Settings 或写回磁盘。
+        if raw_value.as_ref().and_then(|value| value["vegaEnabled"].as_bool()) == Some(true) {
+            settings.lyra_enabled = true;
+        }
         settings.migrate_legacy_vega();
         settings
     }

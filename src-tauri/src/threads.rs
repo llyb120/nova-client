@@ -47,68 +47,58 @@ pub fn session_cleanup_is_expired(timestamp: i64, now: i64, hours: u32) -> bool 
     elapsed_ms > timeout_ms
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AgentKind {
-    Claude,
-    Devin,
-    Codex,
-    CodexPlus,
-    CodeBuddy,
-    CodeBuddyPlus,
-    WorkBuddy,
     Lyra,
-    /// 仅用于保留、展示已移除或未知后端的历史，不可用于执行。
+    /// 一次性迁移的来源标识，不可用于执行。
+    Legacy(String),
+    /// 未知或缺失的后端标识，不可用于执行。
     Unsupported,
+}
+
+impl Serialize for AgentKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+fn legacy_devin() -> AgentKind {
+    AgentKind::Legacy("devin".into())
 }
 
 impl Default for AgentKind {
     fn default() -> Self {
-        AgentKind::Devin
+        // 缺失标识不能静默改由 Lyra 执行。
+        AgentKind::Unsupported
     }
 }
 
-/// 保留历史数据：兼容 "alkaid" 别名，未知后端仅反序列化为展示占位。
+/// 已知退休来源保留到迁移完成；执行入口仍须使用 from_str 或显式检查 Lyra。
 impl<'de> Deserialize<'de> for AgentKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        Ok(AgentKind::from_str(&raw).unwrap_or(AgentKind::Unsupported))
+        let raw = String::deserialize(deserializer)?.trim().to_ascii_lowercase();
+        Ok(match raw.as_str() {
+            "lyra" | "alkaid" => AgentKind::Lyra,
+            "claude" | "claudecode" | "codex" | "codexplus" | "devin" | "codebuddy" | "codebuddyplus"
+            | "workbuddy" | "opencode" | "opencodeplus" => AgentKind::Legacy(raw),
+            _ => AgentKind::Unsupported,
+        })
     }
 }
 
 impl AgentKind {
-    /// 同一 CodeBuddy ACP 协议，不代表共用进程或登录凭据。
-    pub fn is_codebuddy(&self) -> bool {
-        matches!(self, Self::CodeBuddy | Self::CodeBuddyPlus | Self::WorkBuddy)
-    }
-
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
-            AgentKind::Claude => "claude",
-            AgentKind::Devin => "devin",
-            AgentKind::Codex => "codex",
-            AgentKind::CodexPlus => "codexplus",
-            AgentKind::CodeBuddy => "codebuddy",
-            AgentKind::CodeBuddyPlus => "codebuddyplus",
-            AgentKind::WorkBuddy => "workbuddy",
             AgentKind::Lyra => "lyra",
+            AgentKind::Legacy(source) => source,
             AgentKind::Unsupported => "unsupported",
         }
     }
 
-    /// 从字符串解析后端标识（大小写不敏感）；历史占位及未知后端返回 None。
+    /// 从字符串解析后端标识（大小写不敏感）；未知后端返回 None。
     pub fn from_str(s: &str) -> Option<AgentKind> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "claude" => Some(AgentKind::Claude),
-            // Vega 已移除：旧的 alkaid 标识一律映射到 Lyra。
-            "alkaid" => Some(AgentKind::Lyra),
-            "devin" => Some(AgentKind::Devin),
-            "codex" => Some(AgentKind::Codex),
-            "codexplus" => Some(AgentKind::CodexPlus),
-            "codebuddy" => Some(AgentKind::CodeBuddy),
-            "codebuddyplus" => Some(AgentKind::CodeBuddyPlus),
-            "workbuddy" => Some(AgentKind::WorkBuddy),
-            "lyra" => Some(AgentKind::Lyra),
+            "lyra" | "alkaid" => Some(AgentKind::Lyra),
             _ => None,
         }
     }
@@ -116,15 +106,9 @@ impl AgentKind {
     /// 展示用名称（注入接力上下文 / 系统提示用）
     pub fn label(&self) -> &'static str {
         match self {
-            AgentKind::Claude => "Claude Code",
-            AgentKind::Devin => "Devin",
-            AgentKind::Codex => "Codex",
-            AgentKind::CodexPlus => "Codex",
-            AgentKind::CodeBuddy => "CodeBuddy",
-            AgentKind::CodeBuddyPlus => "CodeBuddy",
-            AgentKind::WorkBuddy => "WorkBuddy",
             AgentKind::Lyra => "Lyra",
-            AgentKind::Unsupported => "已移除的后端",
+            AgentKind::Legacy(_) => "待迁移后端",
+            AgentKind::Unsupported => "不支持的后端",
         }
     }
 }
@@ -231,7 +215,7 @@ fn deduplicate_tool_output(call: &mut ToolCall) {
     }
 }
 
-/// 工具详情展示上限。CodeBuddy 等 SDK 后端的 read 结果可能携带整块大文件文本甚至
+/// 工具详情展示上限。后端的 read 结果可能携带整块大文件文本甚至
 /// 图片 base64，不经截断就进 ToolCall 会让前端详情渲染、画布布局签名和会话落盘全部卡死。
 pub(crate) const TOOL_OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -263,8 +247,7 @@ pub(crate) fn compact_tool_value(value: &Value) -> Value {
     match value {
         Value::String(s) => {
             // ACP 还会把 MCP 图片块序列化进 text，先保留 JSON 结构中的有效元数据。
-            if (s.trim_start().starts_with('{') || s.trim_start().starts_with('['))
-            {
+            if s.trim_start().starts_with('{') || s.trim_start().starts_with('[') {
                 if let Ok(parsed) = serde_json::from_str::<Value>(s) {
                     // Unwrap nested ACP/MCP JSON before limiting any strings. Limiting the
                     // serialized envelope loses status/snapshot/path fields and can leave only base64.
@@ -515,9 +498,6 @@ pub enum Item {
         cache_read_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_write_tokens: Option<u64>,
-        /// Auto 模式在本轮实际路由到的模型及推理档位。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actual_model: Option<String>,
         stop_reason: String,
     },
 }
@@ -550,76 +530,36 @@ pub struct Worktree {
     pub branch: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderCheckpoint {
-    pub user_item_id: u64,
-    pub agent_kind: AgentKind,
-    pub session_id: String,
-    pub position: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingNativeRestore {
-    pub session_id: String,
-    pub position: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct CodexUsageSnapshot {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    #[serde(default)]
-    pub cache_read_tokens: u64,
-    #[serde(default)]
-    pub cache_write_tokens: u64,
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: String,
     pub title: String,
     pub cwd: String,
-    #[serde(default)]
+    /// 早期会话文件缺省 agentKind 时实际是 Devin，需进入迁移而不是被跳过。
+    #[serde(default = "legacy_devin")]
     pub agent_kind: AgentKind,
     #[serde(default)]
     pub acp_session_id: Option<String>,
-    /// 会话使用的模型（None = devin 默认）
+    /// 会话使用的模型（None = 后端默认）
     #[serde(default)]
     pub model: Option<String>,
-    /// 会话模式：统一为 build / plan（历史数据可能还存着后端原生模式，如 bypass / accept-edits）
+    /// 会话模式：build / plan。
     #[serde(default)]
     pub mode: Option<String>,
-    /// Codex 思考强度（None = Codex 模型默认）
+    /// 思考强度（None = 模型配置默认）。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-    /// Auto 模式首次查询后缓存的实际模型 value；后续轮次不再抓取雷达。
+    /// 一次性迁移输入：旧 Auto 路由实际选中的模型，成功迁移后清除。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_routed_model: Option<String>,
-    /// 与缓存对应的 Auto 选项（按性价比 / 按智商）。
+    /// 一次性迁移输入：上述模型对应的旧选项，不再参与运行时路由。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_route_selection: Option<String>,
-    /// 会话和轮次中展示的实际模型名称。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_routed_label: Option<String>,
-    /// 上下文接力：跨 agent 切换时记录切换前的 agent；下一条消息发送时据此把历史
-    /// 注入新 agent 的输入，随后清除。None = 无待接力的上下文。
+    /// 上下文接力：fork、编辑或恢复后，下一条消息发送时把历史
+    /// 注入新会话的输入，随后清除。None = 无待接力的上下文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_from: Option<AgentKind>,
-    /// 支持历史节点分叉的 SDK 后端在每轮完成后记录的远端位置。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub provider_checkpoints: Vec<ProviderCheckpoint>,
-    /// CodeBuddy 在下一条 prompt 启动时执行的原生分叉位置。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_native_restore: Option<PendingNativeRestore>,
-    /// Codex app-server 返回会话累计量；保留上次快照以换算本轮增量。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_usage_snapshot: Option<CodexUsageSnapshot>,
     /// 临时会话：程序关闭时自动删除，不跨重启持久化
     #[serde(default)]
     pub ephemeral: bool,
@@ -704,18 +644,6 @@ fn subagent_metadata_defaults_and_roundtrips() {
 }
 
 impl Thread {
-    pub fn cached_auto_model(&self, selection: &str) -> Option<String> {
-        (self.auto_route_selection.as_deref() == Some(selection))
-            .then(|| self.auto_routed_model.clone())
-            .flatten()
-    }
-
-    pub fn clear_auto_route(&mut self) {
-        self.auto_routed_model = None;
-        self.auto_route_selection = None;
-        self.auto_routed_label = None;
-    }
-
     pub fn new(
         cwd: String,
         agent_kind: AgentKind,
@@ -737,11 +665,7 @@ impl Thread {
             reasoning_effort,
             auto_routed_model: None,
             auto_route_selection: None,
-            auto_routed_label: None,
             handoff_from: None,
-            provider_checkpoints: Vec::new(),
-            pending_native_restore: None,
-            codex_usage_snapshot: None,
             ephemeral,
             starred: false,
             unread_turns: 0,
@@ -766,6 +690,22 @@ impl Thread {
             items: Vec::new(),
             plan: None,
         }
+    }
+
+    /// 调用方须先成功持久化 provider 配置，将思考档位编码进模型 selector，再迁移并保存线程。
+    /// 只处理 Legacy，重复调用不会清除已迁移 Lyra 会话的新 session。
+    pub fn migrate_to_lyra(&mut self, model: Option<String>) -> bool {
+        if !matches!(&self.agent_kind, AgentKind::Legacy(_)) {
+            return false;
+        }
+        self.agent_kind = AgentKind::Lyra;
+        self.model = model;
+        self.reasoning_effort = None;
+        self.acp_session_id = None;
+        self.auto_routed_model = None;
+        self.auto_route_selection = None;
+        self.handoff_from = (!self.items.is_empty()).then_some(AgentKind::Lyra);
+        true
     }
 
     /// 是否为漫游 guest 会话（本机只接收展示，真正执行在对端）
@@ -801,33 +741,6 @@ impl Thread {
         self.items.push(item.clone());
         self.updated_at = now_ms();
         item
-    }
-
-    pub fn record_provider_checkpoint(
-        &mut self,
-        user_item_id: u64,
-        session_id: String,
-        position: String,
-    ) {
-        self.provider_checkpoints.retain(|checkpoint| {
-            checkpoint.user_item_id != user_item_id || checkpoint.agent_kind != self.agent_kind
-        });
-        self.provider_checkpoints.push(ProviderCheckpoint {
-            user_item_id,
-            agent_kind: self.agent_kind.clone(),
-            session_id,
-            position,
-        });
-    }
-
-    pub fn checkpoint_before(&self, item_id: u64) -> Option<ProviderCheckpoint> {
-        self.provider_checkpoints
-            .iter()
-            .filter(|checkpoint| {
-                checkpoint.user_item_id < item_id && checkpoint.agent_kind == self.agent_kind
-            })
-            .max_by_key(|checkpoint| checkpoint.user_item_id)
-            .cloned()
     }
 
     /// guest 漫游会话专用：本地乐观落用户消息，id 取高位区间避免与 host 条目冲突
@@ -895,11 +808,6 @@ impl Thread {
                 "cache_read_input_tokens",
             ]),
             cache_write_tokens: g(&["cacheWriteTokens", "cache_creation_input_tokens"]),
-            actual_model: self
-                .model
-                .as_deref()
-                .filter(|model| model.starts_with("__nova_auto_"))
-                .and_then(|_| self.auto_routed_label.clone()),
             stop_reason: stop_reason.into(),
         };
         self.items.push(item.clone());
@@ -1106,7 +1014,7 @@ pub struct ThreadMeta {
 }
 
 fn plain_path(path: &str) -> String {
-    crate::sdk_runtime::display_working_directory(std::path::Path::new(path))
+    crate::lyra::runtime::display_working_directory(std::path::Path::new(path))
 }
 
 /// 最近项目列表（独立持久化，删除会话后仍保留）
@@ -1809,11 +1717,8 @@ impl ThreadStore {
             if source.id == root.id {
                 copy.title = title.to_string();
             }
-            // 不复用 provider session/checkpoint：下一次发送走现有历史接力，不能写入源 session。
+            // 不复用 session：下一次发送走现有历史接力，不能写入源 session。
             copy.acp_session_id = None;
-            copy.provider_checkpoints.clear();
-            copy.pending_native_restore = None;
-            copy.codex_usage_snapshot = None;
             copy.pending_stage_context = None;
             copy.handoff_from = (!copy.items.is_empty()).then(|| copy.agent_kind.clone());
             copy.unread_turns = 0;
@@ -2106,9 +2011,6 @@ mod tests {
         let mut root = Thread::new("project".into(), AgentKind::Lyra, Some("model".into()), Some("plan".into()), None, true);
         root.title = "original".into();
         root.acp_session_id = Some("original-provider".into());
-        root.record_provider_checkpoint(0, "original-provider".into(), "position".into());
-        root.pending_native_restore = Some(PendingNativeRestore { session_id: "original-provider".into(), position: "position".into() });
-        root.codex_usage_snapshot = Some(CodexUsageSnapshot::default());
         root.pending_stage_context = Some("stale context".into());
         root.unread_turns = 3;
         root.plan = Some(serde_json::json!([{ "step": "test", "status": "pending" }]));
@@ -2129,7 +2031,7 @@ mod tests {
         child.parent_thread_id = Some(stage.id.clone());
         child.stage_source_thread_id = Some(stage.id.clone());
         child.subagent = true;
-        let unrelated = Thread::new("other".into(), AgentKind::Codex, None, None, None, false);
+        let unrelated = Thread::new("other".into(), AgentKind::Lyra, None, None, None, false);
         store.threads = vec![root, stage, sibling, child, unrelated];
         store.save_now();
         let originals = serde_json::to_value(&store.threads).unwrap();
@@ -2150,8 +2052,7 @@ mod tests {
         assert_eq!(child_copy.stage_source_thread_id, child_copy.parent_thread_id);
         for copy in copies {
             assert!(!store.threads[..5].iter().any(|t| t.id == copy.id));
-            assert!(copy.acp_session_id.is_none() && copy.pending_native_restore.is_none());
-            assert!(copy.provider_checkpoints.is_empty() && copy.codex_usage_snapshot.is_none());
+            assert!(copy.acp_session_id.is_none());
             assert!(copy.pending_stage_context.is_none() && copy.handoff_from == Some(AgentKind::Lyra));
             assert!(!copy.ephemeral && copy.unread_turns == 0);
             assert_eq!(copy.cwd, "project");
@@ -2238,98 +2139,70 @@ mod tests {
     }
 
     #[test]
-    fn unknown_agent_kinds_are_history_only() {
-        for raw in ["kimi", " KIMI ", "cursor", " CURSOR ", "future-backend", "unsupported"] {
+    fn only_lyra_is_an_executable_agent_kind() {
+        for raw in ["lyra", " LYRA ", "alkaid"] {
+            assert_eq!(AgentKind::from_str(raw), Some(AgentKind::Lyra));
+            assert_eq!(serde_json::from_value::<AgentKind>(serde_json::json!(raw)).unwrap(), AgentKind::Lyra);
+        }
+        assert_eq!(serde_json::to_value(AgentKind::Lyra).unwrap(), "lyra");
+        for raw in ["", "unknown-backend", "unsupported"] {
             assert_eq!(AgentKind::from_str(raw), None);
             let kind: AgentKind = serde_json::from_value(serde_json::json!(raw)).unwrap();
             assert_eq!(kind, AgentKind::Unsupported);
             assert_eq!(kind.as_str(), "unsupported");
-            assert_eq!(kind.label(), "已移除的后端");
-            assert_eq!(serde_json::to_value(kind).unwrap(), "unsupported");
+            assert_eq!(kind.label(), "不支持的后端");
         }
-        for kind in [
-            AgentKind::Claude,
-            AgentKind::Devin,
-            AgentKind::Codex,
-            AgentKind::CodexPlus,
-            AgentKind::CodeBuddy,
-            AgentKind::CodeBuddyPlus,
-            AgentKind::WorkBuddy,
-            AgentKind::Lyra,
-        ] {
-            let raw = kind.as_str();
-            assert_eq!(AgentKind::from_str(raw), Some(kind.clone()));
-            assert_eq!(AgentKind::from_str(&format!(" {} ", raw.to_uppercase())), Some(kind.clone()));
-            assert_eq!(serde_json::to_value(&kind).unwrap(), raw);
-            assert_eq!(serde_json::from_value::<AgentKind>(serde_json::json!(raw)).unwrap(), kind);
-        }
-        assert_eq!(AgentKind::from_str("alkaid"), Some(AgentKind::Lyra));
-        assert_eq!(serde_json::from_str::<AgentKind>("\"alkaid\"").unwrap(), AgentKind::Lyra);
     }
 
     #[test]
-    fn unknown_backend_history_survives_split_and_legacy_store_roundtrips() {
-        let originals: Vec<Value> = ["kimi", "cursor", "future-backend", "lyra"]
-            .into_iter()
-            .map(|raw| {
-                let mut thread = Thread::new("project".into(), AgentKind::Lyra, None, None, None, false);
-                thread.title = format!("{raw} history");
-                thread.push_user("保留用户消息".into(), Vec::new());
-                thread.items.push(Item::Assistant {
-                    id: thread.next_item_id(),
-                    text: "保留助手回复".into(),
-                    ts: now_ms(),
-                });
-                thread.record_provider_checkpoint(1, "session".into(), "position".into());
-                let mut value = serde_json::to_value(thread).unwrap();
-                value["agentKind"] = raw.into();
-                value["handoffFrom"] = raw.into();
-                value["providerCheckpoints"][0]["agentKind"] = raw.into();
-                value
-            })
-            .collect();
-        for legacy in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let data_dir = dir.path().to_path_buf();
-            if legacy {
-                fs::write(
-                    data_dir.join("threads.json"),
-                    serde_json::to_vec(&serde_json::json!({ "threads": originals })).unwrap(),
-                ).unwrap();
-            } else {
-                fs::create_dir_all(data_dir.join("threads")).unwrap();
-                for value in &originals {
-                    let id = value["id"].as_str().unwrap();
-                    fs::write(
-                        data_dir.join("threads").join(ThreadStore::thread_file_name(id)),
-                        serde_json::to_vec(value).unwrap(),
-                    ).unwrap();
-                }
-            }
-            let store = ThreadStore::load(data_dir.clone());
-            store.save();
-            let mut snapshot = store.take_persist_snapshot().unwrap();
-            ThreadStore::write_persist_snapshot(&mut snapshot).unwrap();
-            for loaded in [store, ThreadStore::load(data_dir.clone())] {
-                assert_eq!(loaded.threads.len(), originals.len());
-                for original in &originals {
-                    let id = original["id"].as_str().unwrap();
-                    let mut expected = original.clone();
-                    if expected["agentKind"] != "lyra" {
-                        expected["agentKind"] = "unsupported".into();
-                        expected["handoffFrom"] = "unsupported".into();
-                        expected["providerCheckpoints"][0]["agentKind"] = "unsupported".into();
-                    }
-                    assert_eq!(serde_json::to_value(loaded.get(id).unwrap()).unwrap(), expected);
-                }
-            }
-            if legacy {
-                let backup: Value = serde_json::from_slice(
-                    &fs::read(data_dir.join("threads.json.backup")).unwrap(),
-                ).unwrap();
-                assert_eq!(backup["threads"], serde_json::json!(originals));
-            }
+    fn legacy_agent_sources_roundtrip_without_becoming_executable() {
+        for source in ["claude", "claudecode", "codex", "codexplus", "devin", "codebuddy", "codebuddyplus", "workbuddy", "opencode", "opencodeplus"] {
+            let raw = format!(" {} ", source.to_uppercase());
+            let kind: AgentKind = serde_json::from_value(serde_json::json!(raw)).unwrap();
+            assert_eq!(kind, AgentKind::Legacy(source.into()));
+            assert_eq!(kind.as_str(), source);
+            assert_eq!(kind.label(), "待迁移后端");
+            assert_eq!(serde_json::to_value(&kind).unwrap(), source);
+            assert_eq!(AgentKind::from_str(&raw), None);
         }
+    }
+
+    #[test]
+    fn migration_preserves_inputs_until_commit_and_seeds_history_once() {
+        let mut source = Thread::new("project".into(), AgentKind::Legacy("codex".into()), Some("auto".into()), Some("plan".into()), Some("high".into()), false);
+        source.auto_routed_model = Some("original-model:high".into());
+        source.auto_route_selection = Some("auto".into());
+        source.acp_session_id = Some("old-session".into());
+        source.push_user("保留这段上下文".into(), Vec::new());
+        source.plan = Some(serde_json::json!([{ "content": "待完成工作", "status": "pending" }]));
+        source.updated_at = 12_345;
+        let raw = serde_json::to_value(&source).unwrap();
+        let mut thread: Thread = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&thread).unwrap(), raw);
+
+        assert!(thread.migrate_to_lyra(Some("local-provider/original-model:high".into())));
+        assert_eq!(thread.agent_kind, AgentKind::Lyra);
+        assert_eq!(thread.model.as_deref(), Some("local-provider/original-model:high"));
+        assert!(thread.reasoning_effort.is_none());
+        assert_eq!(thread.created_at, source.created_at);
+        assert_eq!(thread.updated_at, source.updated_at);
+        assert_eq!(thread.mode, source.mode);
+        assert_eq!(thread.plan, source.plan);
+        assert_eq!(serde_json::to_value(&thread.items).unwrap(), raw["items"]);
+        assert!(thread.acp_session_id.is_none());
+        assert!(thread.auto_routed_model.is_none() && thread.auto_route_selection.is_none());
+        let migrated = serde_json::to_value(&thread).unwrap();
+        assert!(migrated.get("autoRoutedModel").is_none());
+        assert!(migrated.get("autoRouteSelection").is_none());
+        assert!(thread.take_prompt_context("Lyra").unwrap().contains("保留这段上下文"));
+        assert!(thread.take_prompt_context("Lyra").is_none());
+
+        thread.acp_session_id = Some("lyra-session".into());
+        let before = serde_json::to_value(&thread).unwrap();
+        assert!(!thread.migrate_to_lyra(None));
+        assert_eq!(serde_json::to_value(&thread).unwrap(), before);
+        let mut unsupported = Thread::new("project".into(), AgentKind::Unsupported, None, None, None, false);
+        assert!(!unsupported.migrate_to_lyra(None));
     }
 
     #[test]
@@ -2346,7 +2219,7 @@ mod tests {
         first.title = "First".into();
         let mut second = Thread::new(
             "/tmp/project-b".into(),
-            AgentKind::Codex,
+            AgentKind::Lyra,
             None,
             None,
             None,
@@ -2397,7 +2270,7 @@ mod tests {
         let first_id = first.id.clone();
         let mut second = Thread::new(
             "/tmp/project-b".into(),
-            AgentKind::Codex,
+            AgentKind::Lyra,
             None,
             None,
             None,
@@ -2447,7 +2320,7 @@ mod tests {
         let first_id = first.id.clone();
         let second = Thread::new(
             "/tmp/project-b".into(),
-            AgentKind::Codex,
+            AgentKind::Lyra,
             None,
             None,
             None,
@@ -2556,66 +2429,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_route_cache_is_reused_and_written_to_turns() {
-        let mut thread = Thread::new(
-            "D:/project".into(),
-            AgentKind::Codex,
-            Some("__nova_auto_iq__".into()),
-            None,
-            None,
-            false,
-        );
-        thread.auto_route_selection = Some("__nova_auto_iq__".into());
-        thread.auto_routed_model = Some("gpt-5.6-sol:max".into());
-        thread.auto_routed_label = Some("gpt-5.6-sol · max".into());
-
-        assert_eq!(
-            thread.cached_auto_model("__nova_auto_iq__").as_deref(),
-            Some("gpt-5.6-sol:max")
-        );
-        assert!(thread.cached_auto_model("__nova_auto_value__").is_none());
-        let turn = thread.push_turn(1, None, "end_turn");
-        assert!(matches!(
-            turn,
-            Item::Turn {
-                actual_model: Some(model),
-                ..
-            } if model == "gpt-5.6-sol · max"
-        ));
-    }
-
-    #[test]
-    fn handoff_to_lyra_preserves_history_once() {
-        let mut thread = Thread::new(
-            "D:/project".into(),
-            AgentKind::Devin,
-            None,
-            None,
-            None,
-            false,
-        );
-        thread.push_user("请修复这个问题".into(), Vec::new());
-        thread.items.push(Item::Assistant {
-            id: thread.next_item_id(),
-            text: "已经定位到旧会话状态。".into(),
-            ts: now_ms(),
-        });
-        thread.agent_kind = AgentKind::Lyra;
-        thread.acp_session_id = None;
-        thread.handoff_from = Some(AgentKind::Devin);
-
-        let context = thread
-            .take_prompt_context("Lyra")
-            .expect("跨后端切换应把已有历史交给 Lyra");
-
-        assert!(context.contains("此前由 Devin 处理，现在改由你（Lyra）接手"));
-        assert!(context.contains("用户：\n请修复这个问题"));
-        assert!(context.contains("Devin：\n已经定位到旧会话状态。"));
-        assert_eq!(thread.handoff_from, None);
-        assert!(thread.take_prompt_context("Lyra").is_none());
-    }
-
-    #[test]
     fn handoff_uses_two_stage_context_compaction() {
         let mut items = Vec::new();
         for index in 1..=10 {
@@ -2654,12 +2467,11 @@ mod tests {
                 output_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
-                actual_model: None,
                 stop_reason: "end_turn".into(),
             });
         }
 
-        let context = render_handoff_context(&items, None, "Devin", "Lyra").unwrap();
+        let context = render_handoff_context(&items, None, "Lyra", "Lyra").unwrap();
 
         assert!(context.contains("提示 1"));
         assert!(context.contains("结论 10"));
@@ -2753,69 +2565,27 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_before_uses_latest_position_from_current_backend() {
-        let mut thread = Thread::new(
-            "D:/project".into(),
-            AgentKind::CodeBuddyPlus,
-            None,
-            None,
-            None,
-            false,
-        );
-        thread.record_provider_checkpoint(1, "open-session".into(), "message-1".into());
-        thread.record_provider_checkpoint(5, "open-session".into(), "message-5".into());
-        thread.agent_kind = AgentKind::CodeBuddy;
-        thread.record_provider_checkpoint(3, "buddy-session".into(), "message-3".into());
-
-        assert_eq!(
-            thread.checkpoint_before(5),
-            Some(ProviderCheckpoint {
-                user_item_id: 3,
-                agent_kind: AgentKind::CodeBuddy,
-                session_id: "buddy-session".into(),
-                position: "message-3".into(),
-            })
-        );
-        assert!(thread.checkpoint_before(1).is_none());
+    fn missing_backend_is_legacy_devin_not_lyra() {
+        let thread = Thread::new(String::new(), AgentKind::Lyra, None, None, None, false);
+        let mut value = serde_json::to_value(thread).unwrap();
+        value.as_object_mut().unwrap().remove("agentKind");
+        let restored: Thread = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.agent_kind, AgentKind::Legacy("devin".into()));
     }
 
     #[test]
-    fn recording_checkpoint_replaces_same_turn_position() {
-        let mut thread = Thread::new(
-            "D:/project".into(),
-            AgentKind::CodeBuddy,
-            None,
-            None,
-            None,
-            false,
-        );
-        thread.record_provider_checkpoint(2, "old-session".into(), "old-message".into());
-        thread.record_provider_checkpoint(2, "new-session".into(), "new-message".into());
-
-        assert_eq!(thread.provider_checkpoints.len(), 1);
-        assert_eq!(thread.provider_checkpoints[0].session_id, "new-session");
-        assert_eq!(thread.provider_checkpoints[0].position, "new-message");
-    }
-
-    #[test]
-    fn legacy_thread_defaults_new_persistence_fields() {
-        let thread = Thread::new(String::new(), AgentKind::Devin, None, None, None, false);
+    fn thread_defaults_optional_persistence_fields() {
+        let thread = Thread::new(String::new(), AgentKind::Lyra, None, None, None, false);
         let mut value = serde_json::to_value(thread).expect("线程应可序列化");
         let object = value.as_object_mut().expect("线程应序列化为对象");
         object.remove("starred");
         object.remove("unreadTurns");
         object.remove("taskbarSeenAt");
-        object.remove("providerCheckpoints");
-        object.remove("pendingNativeRestore");
-        object.remove("codexUsageSnapshot");
 
         let restored: Thread = serde_json::from_value(value).expect("旧线程应可反序列化");
         assert!(!restored.starred);
         assert_eq!(restored.unread_turns, 0);
         assert_eq!(restored.taskbar_seen_at, None);
-        assert!(restored.provider_checkpoints.is_empty());
-        assert!(restored.pending_native_restore.is_none());
-        assert!(restored.codex_usage_snapshot.is_none());
     }
 }
 

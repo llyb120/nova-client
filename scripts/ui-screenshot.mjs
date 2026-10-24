@@ -56,9 +56,8 @@ const mockSettings = {
   sceneModels: { lightweight: [{ agentKind: "lyra", model: "" }], coding: [{ agentKind: "lyra", model: "" }], computer: [{ agentKind: "lyra", model: "" }] },
   editor: "cursor", theme: "", historyDisplayMode: "project",
   relayServer: "", relayToken: "", relayGroups: "", remoteControlEnabled: false,
-  devinEnabled: true, codexEnabled: true,
-  codebuddyEnabled: false,
-  codexIntegration: "app-server", codebuddyIntegration: "sdk",
+  lyraEnabled: true, codexEnabled: true,
+  codexIntegration: "app-server",
   worktreeDir: "", sessionAutoCleanupEnabled: false, sessionAutoCleanupHours: 720,
   semanticEnabled: false, embedEndpoint: "", embedModel: "", embedApiKey: "",
 };

@@ -254,7 +254,7 @@ function Ask(props: { req: Permission; onDone: () => void }) {
     <section class="tb-ask">
       <div class="tb-ask-head">
         <span class="tb-ask-badge">{props.req.questions ? "需要你回答" : "需要你确认"}</span>
-        <span class="tb-ask-agent">{agentLabel(props.req.agentKind ?? "devin")}</span>
+        <span class="tb-ask-agent">{agentLabel(props.req.agentKind ?? "lyra")}</span>
       </div>
       <Show when={props.req.threadTitle}>
         <div class="tb-ask-thread">{props.req.threadTitle}</div>

@@ -1,5 +1,5 @@
 /**
- * Nova context tools MCP stdio server for Devin ACP (session/new mcpServers).
+ * Shared Nova tools MCP stdio server for external agent adapters.
  * Tools: optional polaris.
  *
  * Env:

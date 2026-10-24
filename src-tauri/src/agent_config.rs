@@ -251,14 +251,7 @@ fn normal_targets(config_dir: &Path) -> Result<Vec<Target>, String> {
         "NOVA_DATA_DIR".to_string(),
         config_dir.to_string_lossy().into_owned(),
     );
-    [
-        AgentKind::Lyra,
-        AgentKind::Devin,
-        AgentKind::Claude,
-        AgentKind::Codex,
-        AgentKind::CodeBuddy,
-        AgentKind::WorkBuddy,
-    ]
+    [AgentKind::Lyra]
     .iter()
     .map(|kind| target_for(kind, &env))
     .collect()
@@ -270,12 +263,6 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
         .or_else(user_home_dir)
         .ok_or("无法确定用户主目录")?;
     let (label, path) = match kind {
-        AgentKind::Claude => (
-            kind.label(),
-            configured_dir(overrides, "CLAUDE_CONFIG_DIR")
-                .unwrap_or_else(|| home.join(".claude"))
-                .join("CLAUDE.md"),
-        ),
         // Lyra 沿用旧 Vega 数据目录与 AGENTS.md。
         AgentKind::Lyra => (
             "Lyra",
@@ -284,34 +271,7 @@ fn target_for(kind: &AgentKind, overrides: &HashMap<String, String>) -> Result<T
                 .join("alkaid")
                 .join("AGENTS.md"),
         ),
-        AgentKind::Devin => {
-            #[cfg(windows)]
-            let root = configured_dir(overrides, "APPDATA")
-                .unwrap_or_else(|| home.join("AppData").join("Roaming"));
-            #[cfg(not(windows))]
-            let root = configured_dir(overrides, "APPDATA")
-                .or_else(|| configured_dir(overrides, "XDG_CONFIG_HOME"))
-                .unwrap_or_else(|| home.join(".config"));
-            ("Devin", root.join("devin").join("AGENTS.md"))
-        }
-        AgentKind::Codex | AgentKind::CodexPlus => {
-            let root =
-                configured_dir(overrides, "CODEX_HOME").unwrap_or_else(|| home.join(".codex"));
-            (kind.label(), root.join("AGENTS.md"))
-        }
-        AgentKind::WorkBuddy => (
-            kind.label(),
-            configured_dir(overrides, "WORKBUDDY_CONFIG_DIR")
-                .or_else(crate::workbuddy::config_dir)
-                .unwrap_or_else(|| home.join(".workbuddy"))
-                .join("CODEBUDDY.md"),
-        ),
-        AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-            let root = configured_dir(overrides, "CODEBUDDY_CONFIG_DIR")
-                .unwrap_or_else(|| home.join(".codebuddy"));
-            (kind.label(), root.join("CODEBUDDY.md"))
-        }
-        AgentKind::Unsupported => return Err("该后端已不受支持".into()),
+        _ => return Err("该后端已不受支持".into()),
     };
     Ok(Target {
         kind: kind.clone(),
@@ -474,6 +434,25 @@ fn is_symlink(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_supported_backends_receive_global_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = normal_targets(dir.path()).unwrap();
+        assert_eq!(
+            targets.iter().map(|target| target.kind.as_str()).collect::<Vec<_>>(),
+            ["lyra"]
+        );
+        let overrides = HashMap::from([
+            ("HOME".into(), dir.path().to_string_lossy().into_owned()),
+            ("USERPROFILE".into(), dir.path().to_string_lossy().into_owned()),
+            ("CODEX_HOME".into(), dir.path().join("codex").to_string_lossy().into_owned()),
+        ]);
+        for source in ["claude", "codex", "codexplus"] {
+            assert!(target_for(&AgentKind::Legacy(source.into()), &overrides).is_err());
+        }
+        assert!(target_for(&AgentKind::Unsupported, &overrides).is_err());
+    }
 
     #[test]
     fn managed_block_preserves_existing_content_and_updates_in_place() {

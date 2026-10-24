@@ -34,8 +34,6 @@ import {
   pickThreadModel,
   refreshSlashCommands,
   refreshThreads,
-  reasoningEffortChoices,
-  setThreadReasoningEffort,
   sendPrompt,
   setView,
   STAGE_COMMAND_PATTERN,
@@ -156,14 +154,8 @@ export function Composer() {
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
   const backendAvailable = () => isSupportedAgentKind(state.agentKind);
-  // 原生注入当前轮：Lyra / Codex / Devin / CodeBuddy / WorkBuddy / Claude。
-  const supportsSteer = () =>
-    state.agentKind === "lyra" ||
-    state.agentKind === "codex" ||
-    state.agentKind === "codebuddy" ||
-    state.agentKind === "workbuddy" ||
-    state.agentKind === "claude" ||
-    state.agentKind === "devin";
+  // 当前可执行后端均支持原生注入当前轮。
+  const supportsSteer = backendAvailable;
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
   const activeClue = createMemo(() => {
     const cardId = state.threads.find((item) => item.id === state.currentId)?.activeClueCardId;
@@ -623,7 +615,7 @@ export function Composer() {
       <Show when={slashQuery() !== null}>
         <div ref={slashMenuRef} class="slash-menu">
           <div class="slash-menu-head">
-            {providerName()} {state.agentKind === "codex" ? "skills / commands" : "commands"}
+            {providerName()} commands
           </div>
           <Show
             when={slashSuggestions().length > 0}
@@ -681,7 +673,7 @@ export function Composer() {
           class="composer-input"
           placeholder={
             !backendAvailable()
-              ? "此后端已移除，请先选择其他后端后再发送"
+              ? `${providerName()}：迁移未完成，在下方模型选择器选择 Lyra 模型即可改绑并保留历史`
               : running()
               ? supportsSteer()
                 ? `${providerName()} 正在工作…输入并回车加入队列；输入为空时回车可立即引导`
@@ -707,17 +699,6 @@ export function Composer() {
           anchorTo=".composer"
           favorites
         />
-        <Show when={state.agentKind === "claude" && reasoningEffortChoices().length > 0 && !usesPeerModels()}>
-          <select
-            aria-label="Claude 思考强度"
-            title="Claude 思考强度（当前模型支持的档位）"
-            value={state.reasoningEffort || "default"}
-            disabled={running()}
-            onChange={(e) => void setThreadReasoningEffort(e.currentTarget.value)}
-          >
-            <For each={reasoningEffortChoices()}>{(choice) => <option value={choice.value}>{choice.name}</option>}</For>
-          </select>
-        </Show>
         <Show when={running()}>
           <span class="composer-run-stats" title={`本轮已运行 ${runElapsed()}`}>
             <span class="composer-run-dot" aria-hidden="true" />
@@ -752,7 +733,7 @@ export function Composer() {
             class="composer-btn send"
             disabled={empty() || !backendAvailable()}
             onClick={submit}
-            title={!backendAvailable() ? "请先选择其他后端后再发送" : shouldQueue(text().trim()) ? "加入提示词队列" : "发送"}
+            title={!backendAvailable() ? "后端未识别或迁移未完成：先在模型选择器选择 Lyra 模型" : shouldQueue(text().trim()) ? "加入提示词队列" : "发送"}
           >
             <IconSend size={16} />
           </button>

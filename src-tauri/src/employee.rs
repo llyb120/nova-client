@@ -1604,7 +1604,7 @@ async fn ask_takeover(app: &AppHandle, root: &str) -> bool {
     let (title, kind) = {
         let state = app.state::<AppState>();
         let store = state.store.lock().unwrap();
-        store.get(root).map(|t| (t.title.clone(), t.agent_kind.as_str())).unwrap_or_default()
+        store.get(root).map(|t| (t.title.clone(), t.agent_kind.as_str().to_string())).unwrap_or_default()
     };
     let _ = app.emit(crate::acp::EV_PERMISSION, json!({
         "threadId": root,

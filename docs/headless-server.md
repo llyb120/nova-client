@@ -6,7 +6,7 @@ Nova Web 的远程控制。服务器只发起出站 HTTPS 连接（普通 HTTP �
 ## 依赖
 
 - `xvfb`（Nova 自动创建私有虚拟显示，窗口始终不可见）
-- 至少一个已安装并登录的 Agent CLI（Codex、Devin、CodeBuddy 等）
+- 至少一个可用的 Lyra provider；普通 API provider 只需服务凭据，本地 provider 需对应 CLI/桌面版配置或登录
 - 可访问的 Nova Relay/Web 服务、身份 Token
 
 Ubuntu/Debian 安装运行依赖：
@@ -69,7 +69,7 @@ Nova server config set relay-server https://relay.example.com
 Nova server config set token replace-with-secret
 Nova server config set name build-server-01
 Nova server config set codex-path /usr/local/bin/codex
-Nova server config set codex-enabled true
+Nova server config set lyra-enabled true
 # 名称必须与 ~/.codex/config.toml 中 model_providers.<id>.env_key 完全一致
 Nova server config set env.MY_CODEX_PROVIDER_KEY replace-with-provider-secret
 Nova server config show

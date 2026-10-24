@@ -1,12 +1,11 @@
-//! Shared tool-restricted one-shot API. Callers choose a backend/model, not a transport.
-//! Native generation/print is preferred; otherwise a private backend session is created
-//! and disposed after one turn. User conversations are never reused or added to the UI.
+//! Tool-restricted one-shot Lyra generation. User conversations are never reused
+//! or added to the UI.
 use crate::{threads::AgentKind, AppState};
 use serde_json::Value;
 use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::Duration};
 
-/// Limits apply to the entire call, including backend startup. Native token limits
-/// are forwarded where supported; `max_output_bytes` is enforced for every backend.
+/// Limits apply to the entire call. Token limits are forwarded to the provider;
+/// `max_output_bytes` is enforced locally.
 pub(crate) struct GenerateTextOptions<'a> {
     pub system: &'a str,
     /// Inline images: {type:"image", mimeType:"image/png", data:"base64..."}.
@@ -32,23 +31,10 @@ impl AppState {
         &self, kind: &AgentKind, model: &str, prompt: &str, options: GenerateTextOptions<'_>,
     ) -> Result<String, String> {
         validate(prompt, &options)?;
-        let reply = async {
-            if *kind == AgentKind::Lyra {
-                return lyra_text(self, model, prompt, &options).await;
-            }
-            let prompt = if options.system.is_empty() { prompt.to_owned() }
-                else { format!("{}\n\n{prompt}", options.system) };
-            match kind {
-                AgentKind::Lyra => unreachable!(),
-                AgentKind::Codex | AgentKind::CodexPlus => self.codexplus.generate_text(model, prompt, options.images, options.timeout).await,
-                AgentKind::Unsupported => Err("该后端已移除，请选择其他后端".into()),
-                AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => self.codebuddy.generate_text(model, prompt, options.images, options.timeout).await,
-                AgentKind::WorkBuddy => self.workbuddy.generate_text(model, prompt, options.images, options.timeout).await,
-                AgentKind::Claude => self.claude.generate_text(model, prompt, options.images, options.timeout).await,
-                AgentKind::Devin => self.acp.generate_text(model, prompt, options.images, options.timeout).await,
-            }
-        };
-        let text = tokio::time::timeout(options.timeout, reply).await
+        if *kind != AgentKind::Lyra {
+            return Err("不支持的后端，请选择 Lyra".into());
+        }
+        let text = tokio::time::timeout(options.timeout, lyra_text(self, model, prompt, &options)).await
             .map_err(|_| format!("{} 一次性生成超时，已取消，未自动重试", kind.label()))??;
         validate_output(&text, options.max_output_bytes)?;
         Ok(text)

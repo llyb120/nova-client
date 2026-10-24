@@ -1,41 +1,13 @@
-import type { AgentKind, ToolContent, ToolItem } from "./types";
+import type { AgentKind } from "./types";
 
-/** agent 展示名（徽标 / 标题 / 提示文案统一用） */
+/** agent 展示名；未迁移/未知标识原样显示，不能伪装成 Lyra。 */
 export function agentLabel(kind: AgentKind): string {
-  if (kind === "claude") return "Claude Code";
-  switch (kind) {
-    case "lyra":
-      return "Lyra";
-    case "codex":
-      return "Codex";
-    case "codebuddy":
-      return "CodeBuddy";
-    case "workbuddy":
-      return "WorkBuddy";
-    case "devin":
-      return "Devin";
-    default:
-      return "已移除的后端";
-  }
+  return kind === "lyra" ? "Lyra" : `不支持的后端（${kind || "未指定"}）`;
 }
 
-/** agent 单字徽标（侧边栏紧凑展示）；未知/已移除后端显示问号。 */
+/** agent 单字徽标（侧边栏紧凑展示）。 */
 export function agentShort(kind: AgentKind): string {
-  if (kind === "claude") return "CC";
-  switch (kind) {
-    case "lyra":
-      return "L";
-    case "codex":
-      return "C";
-    case "codebuddy":
-      return "B";
-    case "workbuddy":
-      return "W";
-    case "devin":
-      return "D";
-    default:
-      return "?";
-  }
+  return kind === "lyra" ? "L" : "?";
 }
 
 // 剥离 ANSI 转义序列（颜色/光标控制等），终端输出在 GUI 里直接显示会变乱码
@@ -64,10 +36,6 @@ export function displayToolTitle(title: string): string {
 
 // ─── 工具调用摘要展示（canvas 工具行使用） ───────────────────────────────────
 
-function isRecordValue(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
 /** 输入值紧凑展示：剥 ANSI、对象 JSON 化、压空白、限长 */
 export function compactToolValue(value: unknown): string {
   if (value == null) return "";
@@ -81,33 +49,6 @@ export function compactToolValue(value: unknown): string {
   }
   text = stripAnsi(text).replace(/\s+/g, " ").trim();
   return text.length > 180 ? `${text.slice(0, 180)}...` : text;
-}
-
-function toolInputValue(input: unknown, keys: string[]): string {
-  if (!isRecordValue(input)) return "";
-  for (const key of keys) {
-    const value = compactToolValue(input[key]);
-    if (value) return value;
-  }
-  return "";
-}
-
-function isCommandTool(item: ToolItem): boolean {
-  const title = stripAnsi(item.title || "").trim();
-  return item.kind === "execute" || /^(?:ran|run|running|execute(?:d|ing)?) command$/i.test(title);
-}
-
-/** 工具标题旁的详情文本：命令类工具取 command，否则取 path/query 等 */
-export function toolHeadlineDetail(item: ToolItem): string {
-  if (isCommandTool(item)) return toolInputValue(item.rawInput, ["command", "cmd"]);
-  return toolInputValue(item.rawInput, ["path", "file_path", "query", "q", "url", "symbol"]);
-}
-
-/** 成功完成的 "Exited with code 0" 属噪声输出，不算有效正文 */
-export function isTrivialToolOutput(item: ToolItem, block: ToolContent): boolean {
-  if (item.status !== "completed" || block.type !== "content") return false;
-  const inner = (block as { content?: { type?: string; text?: string } }).content;
-  return inner?.type === "text" && /^Exited with code 0\.?$/i.test(stripAnsi(inner.text ?? "").trim());
 }
 
 const SCRATCH_MARK = "Nova-scratch";

@@ -1,4 +1,4 @@
-use crate::threads::{now_ms, Item, Thread};
+use crate::threads::{now_ms, AgentKind, Item, Thread};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -671,9 +671,6 @@ pub fn rewrite_after_context_edit(
     for checkpoint in &mut timeline.checkpoints {
         if remove_prompt_turns(&mut checkpoint.thread_snapshot, prompts) > 0 {
             checkpoint.thread_snapshot.acp_session_id = None;
-            checkpoint.thread_snapshot.provider_checkpoints.clear();
-            checkpoint.thread_snapshot.pending_native_restore = None;
-            checkpoint.thread_snapshot.codex_usage_snapshot = None;
             checkpoint.thread_snapshot.handoff_from =
                 Some(checkpoint.thread_snapshot.agent_kind.clone());
             checkpoint.title = latest_prompt_title(&checkpoint.thread_snapshot);
@@ -904,6 +901,29 @@ pub fn restore_checkpoint(
         .position(|cp| cp.id == checkpoint_id)
         .ok_or("时间点不存在")?;
 
+    let target = store.timelines[timeline_index].checkpoints[checkpoint_index].clone();
+    let mut thread = target.thread_snapshot.clone();
+    // data_dir 即 AppState.config_dir。迁移失败必须在恢复工作区之前返回，
+    // 不能先改文件，再发现旧来源或原模型无法解析。
+    match &thread.agent_kind {
+        AgentKind::Lyra => {}
+        AgentKind::Legacy(_) => {
+            // 与启动迁移一致：叠加设置中的自定义环境变量（data_dir 即 settings.json 所在目录）。
+            let settings = crate::settings::Settings::load(&data_dir.to_path_buf());
+            let mut migration = crate::lyra::backend_migration::Migration::load(
+                data_dir,
+                &crate::backend_migration::env(&settings),
+            )?;
+            let selector = crate::backend_migration::thread_target(data_dir, &mut migration, &thread)?;
+            migration.save()?;
+            thread.migrate_to_lyra(Some(selector));
+            store.timelines[timeline_index].checkpoints[checkpoint_index].thread_snapshot = thread.clone();
+        }
+        AgentKind::Unsupported => {
+            return Err("无法恢复时间点：后端来源未知或缺失，不能迁移到默认模型".into());
+        }
+    }
+
     let should_auto_save = {
         let timeline = &store.timelines[timeline_index];
         let current_head = timeline
@@ -937,12 +957,10 @@ pub fn restore_checkpoint(
         )?;
     }
 
-    let target = store.timelines[timeline_index].checkpoints[checkpoint_index].clone();
     if restore_files && target.workspace_captured && !current_thread.is_roaming_guest() {
         restore_manifest(data_dir, &target)?;
     }
 
-    let mut thread = target.thread_snapshot.clone();
     // guest 的 host 路由绑定现有 guest thread id；恢复时原位替换镜像，不能生成一个
     // 收不到 host 增量的新 id。普通本地/host/worktree 会话仍创建独立会话分支。
     thread.id = if current_thread.is_roaming_guest() {
@@ -951,9 +969,6 @@ pub fn restore_checkpoint(
         uuid::Uuid::new_v4().to_string()
     };
     thread.acp_session_id = None;
-    thread.provider_checkpoints.clear();
-    thread.pending_native_restore = None;
-    thread.codex_usage_snapshot = None;
     thread.handoff_from = Some(thread.agent_kind.clone());
     thread.created_at = now_ms();
     thread.updated_at = thread.created_at;
@@ -1410,7 +1425,7 @@ mod tests {
 
         let thread = Thread::new(
             project.to_string_lossy().to_string(),
-            crate::threads::AgentKind::Codex,
+            crate::threads::AgentKind::Lyra,
             None,
             None,
             None,
@@ -1457,7 +1472,7 @@ mod tests {
 
         let thread = Thread::new(
             project.to_string_lossy().to_string(),
-            crate::threads::AgentKind::Codex,
+            crate::threads::AgentKind::Lyra,
             None,
             None,
             None,
@@ -1490,7 +1505,7 @@ mod tests {
         let data = root.join("data");
         let mut thread = Thread::new(
             root.join("missing-project").to_string_lossy().to_string(),
-            crate::threads::AgentKind::Codex,
+            crate::threads::AgentKind::Lyra,
             None,
             None,
             None,
@@ -1523,7 +1538,7 @@ mod tests {
         let data = root.join("data");
         let mut thread = Thread::new(
             "/path/that/only/exists/on/host".into(),
-            crate::threads::AgentKind::Codex,
+            crate::threads::AgentKind::Lyra,
             None,
             None,
             None,
@@ -1560,7 +1575,7 @@ mod tests {
 
         let thread = Thread::new(
             project.to_string_lossy().to_string(),
-            crate::threads::AgentKind::Codex,
+            crate::threads::AgentKind::Lyra,
             None,
             None,
             None,
@@ -1590,7 +1605,7 @@ mod tests {
         fs::write(project.join("file.txt"), b"working\n").unwrap();
         let mut thread = Thread::new(
             project.to_string_lossy().to_string(),
-            crate::threads::AgentKind::Codex,
+            crate::threads::AgentKind::Lyra,
             None,
             None,
             None,
@@ -1630,7 +1645,7 @@ mod tests {
         fs::write(project.join("file.txt"), b"branch point\n").unwrap();
         let thread = Thread::new(
             project.to_string_lossy().to_string(),
-            crate::threads::AgentKind::Codex,
+            crate::threads::AgentKind::Lyra,
             None,
             None,
             None,
@@ -1667,14 +1682,16 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         fs::write(repo.join("tracked.txt"), b"base\n").unwrap();
 
-        let thread = Thread::new(
+        let mut thread = Thread::new(
             repo.to_string_lossy().to_string(),
-            crate::threads::AgentKind::Codex,
+            crate::threads::AgentKind::Lyra,
             None,
             None,
             None,
             false,
         );
+        thread.acp_session_id = Some("original-session".into());
+        thread.push_user("恢复这段历史".into(), Vec::new());
         fs::write(repo.join("tracked.txt"), b"checkpoint-a\n").unwrap();
         fs::write(repo.join("new-a.txt"), b"new-a\n").unwrap();
         let first = create_checkpoint(&data, &thread, true).unwrap();
@@ -1687,7 +1704,11 @@ mod tests {
         let second_id = second.current_checkpoint_id.unwrap();
         assert_ne!(first_id, second_id);
 
-        let (fork, restored) = restore_checkpoint(&data, &first_id, &thread, true).unwrap();
+        let (mut fork, restored) = restore_checkpoint(&data, &first_id, &thread, true).unwrap();
+        assert!(fork.acp_session_id.is_none());
+        assert_eq!(fork.handoff_from, Some(crate::threads::AgentKind::Lyra));
+        assert!(fork.take_prompt_context("Lyra").unwrap().contains("恢复这段历史"));
+        assert!(fork.take_prompt_context("Lyra").is_none());
         assert_eq!(
             fs::read(repo.join("tracked.txt")).unwrap(),
             b"checkpoint-a\n"
@@ -1708,6 +1729,55 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_snapshot_backend_does_not_restore_files_or_change_timeline() {
+        for (kind, model, expected_error) in [
+            (AgentKind::Unsupported, "model", "来源未知"),
+            (AgentKind::Legacy("codex".into()), "__nova_auto_iq__", "缺少缓存的实际模型"),
+            (AgentKind::Legacy("codex".into()), "__auto_value__", "缺少缓存的实际模型"),
+            (AgentKind::Legacy("codex".into()), "__codex_auto_fast__", "缺少缓存的实际模型"),
+            (AgentKind::Legacy("codex".into()), " \t", "缺少缓存的实际模型"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path().join("data");
+            let project = root.path().join("project");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join("file.txt"), b"snapshot").unwrap();
+            let mut thread = Thread::new(project.to_string_lossy().into_owned(), kind, Some(model.into()), None, None, false);
+            thread.auto_route_selection = Some("__nova_auto_iq__".into());
+            thread.auto_routed_model = Some(" ".into());
+            thread.push_user("checkpoint history".into(), Vec::new());
+            let checkpoint = create_checkpoint(&data, &thread, true).unwrap();
+            let id = checkpoint.current_checkpoint_id.unwrap();
+            let timeline_path = time_machine_dir(&data).join("timelines.json");
+            let before = fs::read(&timeline_path).unwrap();
+            fs::write(project.join("file.txt"), b"current workspace").unwrap();
+            thread.push_user("current history".into(), Vec::new());
+
+            let error = restore_checkpoint(&data, &id, &thread, true).unwrap_err();
+            assert!(error.contains(expected_error), "{error}");
+            assert_eq!(fs::read(project.join("file.txt")).unwrap(), b"current workspace");
+            assert_eq!(fs::read(timeline_path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_restore_uses_settings_custom_env_vars() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let codex_home = root.path().join("codex-home");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("config.toml"), "model='custom-env-model'\n").unwrap();
+        fs::write(data.join("settings.json"), serde_json::json!({ "customEnvVars": { "CODEX_HOME": codex_home } }).to_string()).unwrap();
+        let mut thread = Thread::new(root.path().to_string_lossy().into_owned(), AgentKind::Legacy("codex".into()), None, None, None, false);
+        thread.push_user("checkpoint history".into(), Vec::new());
+        let id = create_checkpoint(&data, &thread, false).unwrap().current_checkpoint_id.unwrap();
+        let (restored, _) = restore_checkpoint(&data, &id, &thread, false).unwrap();
+        assert_eq!(restored.agent_kind, AgentKind::Lyra);
+        assert_eq!(restored.model.as_deref(), Some("local-codex/custom-env-model"));
+    }
+
+    #[test]
     fn training_digest_covers_tree_edges_and_outcome_labels() {
         let root = std::env::temp_dir().join(format!(
             "nova-time-machine-digest-test-{}",
@@ -1719,7 +1789,7 @@ mod tests {
 
         let mut thread = Thread::new(
             project.to_string_lossy().to_string(),
-            crate::threads::AgentKind::Codex,
+            crate::threads::AgentKind::Lyra,
             None,
             None,
             None,

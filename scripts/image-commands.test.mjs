@@ -32,7 +32,7 @@ test("setup-image requires models and discovers compatible image models before r
 test("image commands are available to every backend and keep credentials out of generation instructions", () => {
   const prompts = exportsOf(read("../src/builtinPrompts.ts"));
   const suggestions = exportsOf(read("../src/components/slashSuggestions.ts"), { "../utils": { agentLabel: (id) => id } });
-  for (const backend of ["lyra", "codex", "devin", "codebuddy", "workbuddy", "claude"]) {
+  for (const backend of ["lyra"]) {
     const commands = suggestions.getSlashSuggestions(backend, [], "image").map((v) => v.title);
     assert.ok(commands.includes("/setup-image"));
     assert.ok(commands.includes("/generate-image"));
@@ -78,7 +78,8 @@ test("generate-image forwards reference attachments and includes their paths in 
     assert.deepEqual(attachments, images);
     return context;
   } }, deliverPrompt: async (...args) => { delivered = args; } };
-  const { tryBuiltinPrompt } = exportsOf(`const { ${Object.keys(deps).join(", ")} } = require("test");\n${body}\nexport { tryBuiltinPrompt };`, { test: deps });
+  const backendGuard = source.slice(source.indexOf("async function assertThreadBackend("), source.indexOf("async function tryBuiltinPrompt("));
+  const { tryBuiltinPrompt } = exportsOf(`const { ${Object.keys(deps).join(", ")} } = require("test");\n${backendGuard}\n${body}\nexport { tryBuiltinPrompt };`, { test: deps });
   assert.equal(await tryBuiltinPrompt("thread", "/generate-image 改成水彩", images), true);
   assert.deepEqual(delivered[2], images);
   assert.ok(delivered[1].includes(JSON.stringify(context.referenceImages)));
@@ -107,6 +108,7 @@ test("canvas recognizes generated image blocks without swallowing them into pros
 test("new-thread send failures restore the draft, stop running and show the actual error", { timeout: 5000 }, async () => {
   const source = read("../src/store.ts");
   const body = source.slice(source.indexOf("export function createThreadOptimistic("), source.indexOf("export const lastUsed"));
+  const { isSupportedAgentKind, normalizeAgentKind } = exportsOf(read("../src/types.ts"));
   for (const stage of ["create", "send", "switched"]) {
     const state = { currentId: null, items: [], running: {} };
     let draft;
@@ -115,7 +117,8 @@ test("new-thread send failures restore the draft, stop running and show the actu
     const done = new Promise((resolve) => { finished = resolve; });
     const noop = () => {};
     const deps = {
-      state, PENDING_THREAD_PREFIX: "pending-",
+      state, isSupportedAgentKind, normalizeAgentKind, PENDING_THREAD_PREFIX: "pending-",
+      optimisticHandoffs: new Map(),
       reconcile: (v) => v, bumpChatScrollToBottom: noop,
       setState: (...args) => {
         if (typeof args[0] === "object") Object.assign(state, args[0]);
@@ -124,7 +127,7 @@ test("new-thread send failures restore the draft, stop running and show the actu
       },
       api: { createThread: async () => {
         if (stage === "create") throw "create failed";
-        return { id: "created", items: [], cwd: "D:/repo", agentKind: "codebuddy" };
+        return { id: "created", items: [], cwd: "D:/repo", agentKind: "lyra" };
       } },
       threadEffort: noop, rememberThreadSnapshot: noop,
       lastUsed: { setMode: noop }, reportActivity: noop,
@@ -139,9 +142,9 @@ test("new-thread send failures restore the draft, stop running and show the actu
       console: { error: () => finished() },
     };
     const { createThreadOptimistic } = exportsOf(`const { ${Object.keys(deps).join(", ")} } = require("test");\n${body}`, { test: deps });
-    createThreadOptimistic("D:/repo", "codebuddy", "model", "build", "", "/generate-image 一只猫", [], false, "");
+    createThreadOptimistic("D:/repo", "lyra", "model", "build", "", "/generate-image 一只猫", [], false, "");
     await done;
-    assert.ok(toast.includes(stage === "create" ? "create failed" : "/setup-image"));
+    assert.ok(toast.includes(stage === "create" ? "create failed" : "/setup-image"), toast);
     if (stage !== "create") {
       assert.equal(state.running.created, false);
       assert.equal(deps.optimisticRunningThreads.has("created"), false);

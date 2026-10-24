@@ -999,14 +999,7 @@ fn projects(app: &AppHandle) -> Vec<RemoteProject> {
 fn models(app: &AppHandle) -> HashMap<String, Value> {
     let state = app.state::<AppState>();
     let mut out = HashMap::new();
-    for kind in [
-        AgentKind::Lyra,
-        AgentKind::Devin,
-        AgentKind::Claude,
-        AgentKind::Codex,
-        AgentKind::CodeBuddy,
-        AgentKind::WorkBuddy,
-    ] {
+    for kind in [AgentKind::Lyra] {
         if !state.agent_enabled(&kind) {
             continue;
         }
@@ -1020,16 +1013,8 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         if !available {
             continue;
         }
-        let value = match kind {
-            AgentKind::Lyra => state.lyra.get_model_options(),
-            AgentKind::Devin => state.acp.get_model_options(),
-            AgentKind::Claude => state.claude.get_model_options(),
-            AgentKind::Codex | AgentKind::CodexPlus => state.codex.get_model_options(),
-            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => state.codebuddy.get_model_options(),
-            AgentKind::WorkBuddy => state.workbuddy.get_model_options(),
-            AgentKind::Unsupported => continue,
-        }
-        .unwrap_or_else(|| json!({ "configOptions": [], "modes": null }));
+        let value = state.lyra.get_model_options()
+            .unwrap_or_else(|| json!({ "configOptions": [], "modes": null }));
         out.insert(kind.as_str().to_string(), value);
     }
     out
@@ -1386,7 +1371,7 @@ mod tests {
 
     #[test]
     fn checkpoint_covers_visible_text_and_plan() {
-        let mut thread = Thread::new("C:/work".into(), AgentKind::Codex, None, None, None, false);
+        let mut thread = Thread::new("C:/work".into(), AgentKind::Lyra, None, None, None, false);
         thread.items.push(Item::Assistant {
             id: 1,
             text: "first".into(),
@@ -1399,7 +1384,7 @@ mod tests {
 
     #[test]
     fn remote_thread_snapshot_omits_clue_context() {
-        let mut thread = Thread::new("C:/work".into(), AgentKind::Codex, None, None, None, false);
+        let mut thread = Thread::new("C:/work".into(), AgentKind::Lyra, None, None, None, false);
         thread.active_clue_card_id = Some("card-1".into());
         thread.clue_context = serde_json::from_value(json!({
             "rootCardId": "card-1",
@@ -1538,7 +1523,7 @@ mod tests {
 
     #[test]
     fn running_delta_keeps_sort_timestamp_stable_until_completion() {
-        let mut previous = Thread::new("C:/work".into(), AgentKind::Codex, None, None, None, false);
+        let mut previous = Thread::new("C:/work".into(), AgentKind::Lyra, None, None, None, false);
         previous.updated_at = 10;
         let mut current = previous.clone();
         current.updated_at = 20;
@@ -1673,7 +1658,7 @@ async fn execute_command(
     if matches!(cmd.kind.as_str(), "send" | "queue_send_now") {
         let state = app.state::<AppState>();
         let store = state.store.lock().unwrap();
-        if store.get(&cmd.thread_id).is_some_and(|t| t.agent_kind == AgentKind::Unsupported) {
+        if store.get(&cmd.thread_id).is_some_and(|t| t.agent_kind != AgentKind::Lyra) {
             return fail("已移除后端不可用，请先选择其他后端".into());
         }
     }
@@ -1942,7 +1927,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
             AgentKind::from_str(&cmd.agent_kind)
                 .ok_or_else(|| format!("未知后端: {}", cmd.agent_kind))?
         };
-        if new_kind == AgentKind::Unsupported {
+        if new_kind != AgentKind::Lyra {
             return Err("已移除后端不可用，请先选择其他后端".into());
         }
         old_kind = thread.agent_kind.clone();
@@ -1950,14 +1935,12 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
         if agent_changed
             || (!cmd.model.trim().is_empty() && thread.model.as_deref() != Some(cmd.model.trim()))
         {
-            thread.clear_auto_route();
+            thread.auto_routed_model = None;
+            thread.auto_route_selection = None;
         }
         if agent_changed {
             // 旧 remote session 属于旧 agent，作废；下次发消息时新 agent 重新建会话
             thread.acp_session_id = None;
-            thread.pending_native_restore = None;
-            thread.provider_checkpoints.clear();
-            thread.codex_usage_snapshot = None;
             thread.agent_kind = new_kind.clone();
             // 标记上下文接力：仅当已有历史时才有意义
             thread.handoff_from = if thread.items.is_empty() {
@@ -1992,18 +1975,8 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
     if agent_changed {
         // 旧 remote session 只属于切换前的后端，清理旧 agent 的 session 缓存。
         // 不能清理目标后端：独占连接的 manager 会异步杀连接，可能误杀新连接。
-        match old_kind {
-            AgentKind::Claude => state.claude.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Codex | AgentKind::CodexPlus => {
-                state.codexplus.forget_session_of_thread(&cmd.thread_id)
-            }
-            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                state.codebuddy.forget_session_of_thread(&cmd.thread_id)
-            }
-            AgentKind::WorkBuddy => state.workbuddy.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Unsupported => {},
-            AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
+        if old_kind == AgentKind::Lyra {
+            state.lyra.forget_session_of_thread(&cmd.thread_id);
         }
         if let Some(item) = switched_item {
             let _ = app.emit(
@@ -2015,52 +1988,19 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
     } else if !cmd.model.trim().is_empty() {
         // 同 agent 仅切模型：作废旧 session 让新模型生效。
         // 仅切 mode 不需要作废 session（mode 每轮下发，不绑定 session）。
-        match new_kind {
-            AgentKind::Claude => state.claude.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Devin => state.acp.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Codex | AgentKind::CodexPlus => {
-                state.codexplus.forget_session_of_thread(&cmd.thread_id)
-            }
-            AgentKind::CodeBuddy | AgentKind::CodeBuddyPlus => {
-                state.codebuddy.forget_session_of_thread(&cmd.thread_id)
-            }
-            AgentKind::WorkBuddy => state.workbuddy.forget_session_of_thread(&cmd.thread_id),
-            AgentKind::Unsupported => {},
+        if new_kind == AgentKind::Lyra {
+            state.lyra.forget_session_of_thread(&cmd.thread_id);
         }
     }
     Ok(())
 }
 
 async fn respond_remote_permission(
-    app: &AppHandle,
-    request_key: &str,
-    option_id: &str,
+    _app: &AppHandle,
+    _request_key: &str,
+    _option_id: &str,
 ) -> Result<(), String> {
-    if request_key.trim().is_empty() {
-        return Err("缺少权限请求标识".into());
-    }
-    let state = app.state::<AppState>();
-    if state.workbuddy.has_pending_permission(request_key) {
-        state.workbuddy.respond_permission(request_key, option_id).await
-    } else if request_key.starts_with("claude-") {
-        state.claude.respond_permission(request_key, option_id).await
-    } else if request_key.starts_with("cdp-") {
-        state
-            .codexplus
-            .respond_permission(request_key, option_id)
-            .await
-    } else if request_key.starts_with("cbp-") {
-        state
-            .codebuddy
-            .respond_permission(request_key, option_id)
-            .await
-
-    } else if request_key.starts_with("codex-") {
-        state.codex.respond_permission(request_key, option_id).await
-    } else {
-        state.acp.respond_permission(request_key, option_id).await
-    }
+    Err("未知或已移除后端的权限请求".into())
 }
 
 fn remote_file(app: &AppHandle, thread_id: &str, cwd: &str, path: &str) -> Result<Value, String> {
@@ -2466,7 +2406,7 @@ fn send_prompt(
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
-        if thread.agent_kind == AgentKind::Unsupported {
+        if thread.agent_kind != AgentKind::Lyra {
             return Err("已移除后端不可用，请先选择其他后端".into());
         }
     }
@@ -2518,7 +2458,7 @@ pub(crate) fn route_fire_command(
         if thread.roaming_role.is_some() {
             return Err("/fire 仅支持本地普通会话".into());
         }
-        if thread.agent_kind == AgentKind::Unsupported {
+        if thread.agent_kind != AgentKind::Lyra {
             return Err("已移除后端不可用，请先选择其他后端".into());
         }
         if is_running(&state, thread) {
@@ -2612,7 +2552,7 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
-        if thread.agent_kind == AgentKind::Unsupported {
+        if thread.agent_kind != AgentKind::Lyra {
             return Err("已移除后端不可用".into());
         }
     }

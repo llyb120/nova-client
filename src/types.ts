@@ -1,11 +1,10 @@
 
-/** unsupported 仅用于读取历史记录，不可选择或执行。 */
-export type AgentKind = "claude" | "lyra" | "devin" | "codex" | "codebuddy" | "workbuddy" | "unsupported";
+/** IPC 保留原始后端标识供迁移错误定位；执行前必须通过 isSupportedAgentKind。 */
+export type AgentKind = string;
 
 /** 可执行后端的固定展示顺序；未知/已移除后端不能回退到其它后端。 */
-export const ALL_AGENT_KINDS: AgentKind[] = ["lyra", "devin", "claude", "codex", "codebuddy", "workbuddy"];
-export const isSupportedAgentKind = (kind: unknown): kind is Exclude<AgentKind, "unsupported"> =>
-  ALL_AGENT_KINDS.some((supported) => supported === kind);
+export const ALL_AGENT_KINDS: AgentKind[] = ["lyra"];
+export const isSupportedAgentKind = (kind: unknown): kind is "lyra" => kind === "lyra";
 
 export interface SlashCommand {
   name: string;
@@ -286,15 +285,9 @@ export interface Thread {
   title: string;
   cwd: string;
   agentKind: AgentKind;
-  acpSessionId?: string | null;
   model?: string | null;
   mode?: string | null;
   reasoningEffort?: string | null;
-  /** Auto 模式首次查询后缓存的实际模型 value */
-  autoRoutedModel?: string | null;
-  autoRouteSelection?: string | null;
-  /** Auto 模式实际模型的展示名称 */
-  autoRoutedLabel?: string | null;
   ephemeral?: boolean;
   starred?: boolean;
   roamingRole?: string | null;
@@ -324,16 +317,10 @@ export interface Thread {
 export interface ModelChoice {
   value: string;
   name: string;
-  /** 选项描述；CodeBuddy 在此下发费用（积分倍率），如 "x0.79 credits" */
+  /** 选项描述；本地 CodeBuddy provider 可在此下发费用（积分倍率），如 "x0.79 credits" */
   description?: string;
-  /** devin 在选项上附带的元数据，如 cognition.ai/supportsImages */
+  /** 模型能力与默认思考强度等元数据。 */
   _meta?: Record<string, unknown>;
-}
-
-export interface EffortChoice {
-  value: string;
-  name: string;
-  description?: string;
 }
 
 export interface ModeChoice {
@@ -341,7 +328,7 @@ export interface ModeChoice {
   name: string;
 }
 
-/** devin 返回的可用模型与会话模式（来自 session/new 的 configOptions） */
+/** 后端返回的可用模型与会话模式（configOptions） */
 export interface ModelOptions {
   configOptions:
     | {
@@ -486,18 +473,11 @@ export interface Settings {
   /** 剑谱录制开关的全局组合键，默认 Alt+R；空值关闭 */
   jianpuShortcut?: string;
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
-  devinEnabled: boolean;
   lyraEnabled: boolean;
-  codexEnabled: boolean;
-  codebuddyEnabled: boolean;
-  /** WorkBuddy 本机后端，默认关闭。 */
-  workbuddyEnabled: boolean;
-  codexIntegration: "app-server";
-  codebuddyIntegration: "sdk" | "acp";
   /** worktree 工作目录根（空 = 应用数据目录下 worktrees/） */
   worktreeDir: string;
   /** 更新通道：正式版或预发布版。 */
-  updateChannel: "release" | "pre-release";
+  updateChannel: "release" | "pre-release" | "develop";
   /** 是否自动清理长期未更新的会话 */
   sessionAutoCleanupEnabled: boolean;
   /** 自动清理会话的保留时长（小时） */
@@ -536,15 +516,6 @@ export interface SkillInfo {
   path: string;
 }
 
-export interface CliStatus {
-  agentKind: AgentKind;
-  cliName: string;
-  installed: boolean;
-  version: string;
-  installCommand: string;
-  detail: string;
-}
-
 /** worktree「基于分支」下拉的数据：当前分支 + 本地分支列表 */
 export interface BranchList {
   current: string;
@@ -573,7 +544,7 @@ export interface RoamingFolder {
 /** 漫游：对端（host）回传的可选模型/模式列表，按其已启用的后端归档。
  *  漫游在对方机器上执行，本机的模型对方不一定有，所以选择器用这份数据。 */
 export interface PeerModels {
-  /** 对端已启用的后端（按 devin → codex → codebuddy 顺序） */
+  /** 对端已启用的后端（按固定展示顺序） */
   backends: AgentKind[];
   /** 各后端的模型/模式选项（缺失的后端为 undefined） */
   options: Partial<Record<AgentKind, ModelOptions | null>>;
@@ -678,18 +649,7 @@ export interface RevertResult {
 export interface Status {
   connected: boolean;
   agent: { name?: string; title?: string; version?: string } | null;
-}
-
-/** 模型费用信息（来自 windsurf 后端 GetCliModelConfigs，按 modelUid 索引） */
-export interface ModelCost {
-  /** 积分倍率；protobuf 省略零值，null 即 0（促销免费） */
-  multiplier: number | null;
-  provider: string;
-  supportsImages: boolean;
-  tier: string;
-  pricing: string;
-  /** token 单价（美元 / 1M tokens）；部分模型（促销/私有）没有 */
-  prices: { input?: number; cached?: number; output?: number } | null;
+  migrationWarnings?: string[];
 }
 
 /** 更新检查结果 */
@@ -709,16 +669,6 @@ export interface UpdateProgress {
   downloaded: number;
   total: number;
   version?: string;
-}
-
-/** devin 剩余额度（来自 windsurf 后端 GetUserStatus） */
-export interface Quota {
-  plan: string | null;
-  dailyPercent: number;
-  weeklyPercent: number;
-  dailyResetAt: number | null;
-  weeklyResetAt: number | null;
-  flexCredits: number | null;
 }
 
 /** 轮次进行中的实时累计用量（未落库；Turn 落定后由 TurnItem 接管展示） */

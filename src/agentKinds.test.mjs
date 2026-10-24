@@ -16,18 +16,18 @@ const { ALL_AGENT_KINDS, isSupportedAgentKind, scenesReady, SCENES, agentLabel, 
 const scenesWith = (agentKind) => Object.fromEntries(
   SCENES.map(({ key }) => [key, [{ agentKind, model: 'saved-model' }]]),
 );
-assert.deepEqual(ALL_AGENT_KINDS, ['lyra', 'devin', 'claude', 'codex', 'codebuddy', 'workbuddy']);
+assert.deepEqual(ALL_AGENT_KINDS, ['lyra']);
 for (const kind of ALL_AGENT_KINDS) {
   assert.equal(isSupportedAgentKind(kind), true);
   assert.equal(scenesReady(scenesWith(kind)), true);
-  assert.notEqual(agentLabel(kind), '已移除的后端');
+  assert.equal(agentLabel(kind), 'Lyra');
   assert.notEqual(agentShort(kind), '?');
 }
-for (const kind of ['kimi', 'cursor', 'cursorplus', 'unsupported', 'unknown', '', null, undefined]) {
+for (const kind of ['claude', 'codex', 'codexplus', 'devin', 'codebuddy', 'codebuddyplus', 'workbuddy', 'kimi', 'cursor', 'cursorplus', 'unsupported', 'unknown', '', null, undefined]) {
   assert.equal(isSupportedAgentKind(kind), false);
   assert.equal(ALL_AGENT_KINDS.includes(kind), false);
   assert.equal(scenesReady(scenesWith(kind)), false);
-  assert.equal(agentLabel(kind), '已移除的后端');
+  assert.equal(agentLabel(kind), `不支持的后端（${kind || '未指定'}）`);
   assert.equal(agentShort(kind), '?');
 }
 assert.equal(scenesReady(), false);
@@ -35,4 +35,4 @@ assert.equal(scenesReady({}), false);
 const mixed = scenesWith('unsupported');
 for (const targets of Object.values(mixed)) targets.push({ agentKind: 'lyra', model: 'selected-model' });
 assert.equal(scenesReady(mixed), true);
-console.log('Supported backends and unavailable historical backend handling passed.');
+console.log('Supported backend and unmapped backend rejection passed.');

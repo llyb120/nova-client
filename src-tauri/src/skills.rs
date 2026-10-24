@@ -97,28 +97,8 @@ fn is_skill_dir(dir: &Path) -> bool {
 /// 各后端用户级 skills 根目录（全局）。
 pub fn backend_skill_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
-        roots.push(home.join("skills"));
-    }
-    if let Some(root) = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| user_home_dir().map(|home| home.join(".claude")))
-    {
-        roots.push(root.join("skills"));
-    }
-    // CodeBuddy 的用户级 skills 目录在其配置根下（默认 ~/.codebuddy，可被 CODEBUDDY_CONFIG_DIR 覆盖）。
-    if let Some(root) = std::env::var_os("CODEBUDDY_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| user_home_dir().map(|home| home.join(".codebuddy")))
-    {
-        roots.push(root.join("skills"));
-    }
-    if let Some(root) = crate::workbuddy::config_dir() {
-        roots.push(root.join("skills"));
-    }
     if let Some(home) = user_home_dir() {
         roots.push(home.join(".nova").join("alkaid").join("skills"));
-        roots.push(home.join(".codex").join("skills"));
         roots.push(home.join(".agents").join("skills"));
     }
     roots.sort();
@@ -427,16 +407,6 @@ pub fn remove_skill(config_dir: &Path, name: &str) -> Result<(), String> {
     }
     let _ = sync_skills_to_backends(config_dir);
     Ok(())
-}
-
-/// 启动后端时调用：从当前构建的数据目录同步 skills。
-pub fn sync_skills_from_home() {
-    if cfg!(debug_assertions) {
-        return;
-    }
-    if let Some(home) = user_home_dir() {
-        let _ = sync_skills_to_backends(&home.join(crate::nova_data_dir_name()));
-    }
 }
 
 /// 把 `~/.nova/skills/<name>` 以软链接/目录联接同步到各后端全局 skills 目录。

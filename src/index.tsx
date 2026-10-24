@@ -25,10 +25,12 @@ if (new URLSearchParams(window.location.search).get("meteor") === "1") {
   initTheme();
   render(() => <MiniAppsView runtimeAppId={appId} />, document.getElementById("root")!);
 } else {
-  const [{ default: App }, { initTheme }] = await Promise.all([
+  const [{ default: App }, { initTheme, migrateLocalModelSelections }] = await Promise.all([
     import("./App"), import("./store"), import("./app.css"),
     import("@fontsource-variable/inter"), import("@fontsource-variable/noto-sans-sc"), import("@fontsource-variable/jetbrains-mono"),
   ]);
   initTheme();
+  // HomeView reads lastUsed when constructed, before App.onMount/initStore.
+  await migrateLocalModelSelections();
   render(() => <App />, document.getElementById("root")!);
 }

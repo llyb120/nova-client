@@ -20,8 +20,8 @@ import {
   run,
 } from './ctx-index.mjs';
 
-// esbuild's CJS output replaces import.meta with an empty shim. Nova's CodeBuddy bridge is
-// bundled as CJS, so prefer Node's real CJS filename there while retaining import.meta.url in ESM.
+// esbuild's CJS output replaces import.meta with an empty shim; prefer Node's real
+// CJS filename when bundled that way while retaining import.meta.url in ESM.
 const moduleLocation = typeof __filename === "string" ? __filename : import.meta.url;
 const require = createRequire(moduleLocation);
 

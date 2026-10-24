@@ -1,47 +1,18 @@
-use crate::threads::{compact_tool_value, compact_tool_values};
-#[cfg(test)]
-use crate::threads::TOOL_OUTPUT_LIMIT;
 use crate::acp::{
-    apply_proxy_env, EV_LOG, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
+    EV_LOG, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
 };
-use crate::codex_radar;
 use crate::model_cache;
-use crate::sdk_adapters::SdkAdapter;
 use crate::threads::{
-    file_uri_to_local_path, now_ms, save_attachment_to_temp, AgentKind, CodexUsageSnapshot, Item,
+    file_uri_to_local_path, now_ms, save_attachment_to_temp, AgentKind, Item,
     PromptImage, ToolCall,
 };
 use crate::{nova_data_dir, AppState};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::process::Command;
-
-// Codex owns its app-server process; this guard owns only the temporary workspace.
-struct TextSessionDir(PathBuf);
-
-impl Drop for TextSessionDir {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
-}
-
-fn is_codex_model_resume_warning(value: &Value) -> bool {
-    if value.get("type").and_then(Value::as_str) != Some("error") {
-        return false;
-    }
-    value
-        .get("message")
-        .and_then(Value::as_str)
-        .is_some_and(|message| {
-            message.starts_with("This session was recorded with model `")
-                && message.contains("` but is resuming with `")
-                && message.contains("`. Consider switching back to `")
-                && message.ends_with("` as it may affect Codex performance.")
-        })
-}
 
 struct RunningBridge {
     control: tokio::sync::mpsc::UnboundedSender<String>,
@@ -66,10 +37,8 @@ enum ReadEventsOutcome {
     Superseded,
 }
 
-pub struct SdkManager {
+pub struct LyraRuntime {
     app: AppHandle,
-    adapter: Arc<dyn SdkAdapter>,
-    launch_env: HashMap<String, String>,
     running_children: Mutex<HashMap<String, RunningBridge>>,
     running: Mutex<HashSet<String>>,
     turn_started: Mutex<HashMap<String, Instant>>,
@@ -83,20 +52,10 @@ pub struct SdkManager {
     run_epochs: Mutex<HashMap<String, u64>>,
 }
 
-impl SdkManager {
-    pub fn new<A: SdkAdapter + 'static>(app: AppHandle, adapter: A) -> Arc<Self> {
-        Self::new_with_env(app, adapter, HashMap::new())
-    }
-
-    pub fn new_with_env<A: SdkAdapter + 'static>(
-        app: AppHandle,
-        adapter: A,
-        launch_env: HashMap<String, String>,
-    ) -> Arc<Self> {
+impl LyraRuntime {
+    pub fn new(app: AppHandle) -> Arc<Self> {
         Arc::new(Self {
             app,
-            adapter: Arc::new(adapter),
-            launch_env,
             running_children: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
             turn_started: Mutex::new(HashMap::new()),
@@ -110,19 +69,9 @@ impl SdkManager {
         })
     }
 
-    /// 借用额度运行时的隔离数据根（launch_env 中的 NOVA_DATA_DIR）；主运行时为 None。
-    fn borrowed_root(&self) -> Option<PathBuf> {
-        self.launch_env.get("NOVA_DATA_DIR").map(PathBuf::from)
-    }
-
     /// 按当前设置复用 provider 连接池；代理修改后下一次请求立即使用新配置。
     fn native_http(&self) -> reqwest::Client {
-        let proxy = {
-            let state = self.app.state::<AppState>();
-            let proxy = state.settings.lock().unwrap().lyra_proxy.clone();
-            proxy
-        };
-        crate::lyra::provider::client_for_proxy(proxy.trim())
+        crate::lyra::provider::http_client()
     }
 
     pub fn is_running(&self, thread_id: &str) -> bool {
@@ -146,34 +95,22 @@ impl SdkManager {
             return;
         }
         let mut title_job: Option<(String, String)> = None;
-        let (
-            cwd,
-            mut model,
-            mode,
-            mut reasoning_effort,
-            context,
-            session_id,
-            native_restore,
-            user_item_id,
-            cached_auto_model,
-        ) = {
+        let (cwd, model, mode, reasoning_effort, context, session_id) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&thread_id) else {
                 return;
             };
-            let context = thread.take_prompt_context(self.adapter.label());
-            let native_restore = thread.pending_native_restore.take();
-            let session_id = native_restore
-                .as_ref()
-                .map(|restore| restore.session_id.clone())
-                .or_else(|| thread.acp_session_id.clone());
-            if self.adapter.uses_codex_model_routing() && session_id.is_none() {
-                thread.codex_usage_snapshot = Some(CodexUsageSnapshot::default());
+            if thread.agent_kind != AgentKind::Lyra {
+                drop(store);
+                self.push_system(&thread_id, "该模型尚未迁移到 Lyra，未执行请求".into(), "error");
+                self.set_running(&thread_id, false, Some("error"));
+                return;
             }
+            let context = thread.take_prompt_context("Lyra");
+            let session_id = thread.acp_session_id.clone();
             let item = thread.push_user(text.clone(), images.clone());
-            let user_item_id = item.id();
-            if self.adapter.generates_title() && thread.title == "新会话" {
+            if thread.title == "新会话" {
                 let fallback = derive_title(&text, !images.is_empty());
                 thread.title = fallback.clone();
                 title_job = Some((text.clone(), fallback));
@@ -187,19 +124,13 @@ impl SdkManager {
                 thread.reasoning_effort.clone(),
                 context,
                 session_id,
-                native_restore,
-                user_item_id,
-                thread
-                    .model
-                    .as_deref()
-                    .and_then(|selection| thread.cached_auto_model(selection)),
             );
             store.save_thread(&thread_id);
             values
         };
         if let Some((prompt, fallback)) = title_job {
             self.app.state::<AppState>().generate_title(
-                &self.adapter.agent_kind(),
+                &AgentKind::Lyra,
                 thread_id.clone(),
                 prompt,
                 fallback,
@@ -211,105 +142,17 @@ impl SdkManager {
             .unwrap()
             .insert(thread_id.clone(), run_epoch);
         self.set_running(&thread_id, true, None);
-        if self.adapter.uses_codex_model_routing()
-            && model.as_deref().is_some_and(codex_radar::is_auto_model)
-        {
-            if let Some(cached) = cached_auto_model {
-                model = Some(cached);
-            } else {
-                let selection = model.clone().unwrap_or_default();
-                self.push_system(
-                    &thread_id,
-                    format!(
-                        "正在查询 Codex 雷达，为本会话选择{}第一名…",
-                        codex_radar::selection_label(&selection)
-                    ),
-                    "info",
-                );
-                let manager = self.app.state::<AppState>().codex.clone();
-                let options_result = manager.ensure_model_options().await;
-                if !self.is_current_run(&thread_id, run_epoch) {
-                    return;
-                }
-                let options = match options_result {
-                    Ok(options) => options,
-                    Err(error) => {
-                        self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
-                        self.finish_turn_if_current(&thread_id, run_epoch, "error", None);
-                        return;
-                    }
-                };
-                let resolved = codex_radar::resolve_auto_model(&selection, &options).await;
-                if !self.is_current_run(&thread_id, run_epoch) {
-                    return;
-                }
-                match resolved {
-                    Ok(resolved) => {
-                        model = Some(resolved.value.clone());
-                        let state = self.app.state::<AppState>();
-                        let mut store = state.store.lock().unwrap();
-                        if let Some(thread) = store.get_mut(&thread_id) {
-                            thread.auto_route_selection = Some(selection);
-                            thread.auto_routed_model = Some(resolved.value);
-                            thread.auto_routed_label = Some(resolved.label.clone());
-                            let item = thread.push_system(
-                                format!("Auto 路由完成，实际使用模型：{}", resolved.label),
-                                "info",
-                            );
-                            let _ = self.emit_update(&thread_id, &item);
-                        }
-                        store.save_thread(&thread_id);
-                    }
-                    Err(error) => {
-                        self.push_system(&thread_id, format!("Auto 路由失败：{error}"), "error");
-                        self.finish_turn_if_current(&thread_id, run_epoch, "error", None);
-                        return;
-                    }
-                }
-            }
-        }
-        if self.adapter.uses_codex_model_routing() {
-            let state = self.app.state::<AppState>();
-            if let (Some(selected), Some(options)) =
-                (model.as_deref(), state.codex.get_model_options())
-            {
-                match resolve_codex_model(&options, selected, reasoning_effort.as_deref()) {
-                    Some((resolved_model, resolved_effort)) => {
-                        model = Some(resolved_model);
-                        reasoning_effort = resolved_effort;
-                    }
-                    None => {
-                        model = None;
-                        reasoning_effort = None;
-                        let mut store = state.store.lock().unwrap();
-                        if let Some(thread) = store.get_mut(&thread_id) {
-                            thread.clear_auto_route();
-                            thread.model = None;
-                            thread.reasoning_effort = None;
-                        }
-                        store.save_thread(&thread_id);
-                    }
-                }
-            }
-        }
         let mut parts = Vec::new();
-        if native_restore.is_none() {
-            if let Some(context) = context.as_ref() {
-                parts.push(json!({ "type": "text", "text": context }));
-            }
+        if let Some(context) = context {
+            parts.push(json!({ "type": "text", "text": context }));
         }
-        parts.extend(prompt_parts(self.adapter.as_ref(), &text, &images));
-        let lightweight_model = if self.adapter.agent_kind() == AgentKind::Lyra {
-            self.app.state::<AppState>().lyra_lightweight_model()
-        } else {
-            None
-        };
-        let mut request = json!({
+        parts.extend(prompt_parts(&text, &images));
+        let lightweight_model = self.app.state::<AppState>().lyra_lightweight_model();
+        let request = json!({
             "action": "prompt",
             "threadId": thread_id,
             "cwd": cwd,
             "sessionId": session_id,
-            "restoreAt": native_restore.as_ref().map(|restore| &restore.position),
             "model": model,
             "mode": mode,
             "reasoningEffort": reasoning_effort,
@@ -320,27 +163,9 @@ impl SdkManager {
                 .collect::<serde_json::Map<_, _>>(),
             "parts": parts
         });
-        let mut outcome = self
-            .run_prompt_inprocess(&thread_id, request.clone(), user_item_id, run_epoch)
+        let outcome = self
+            .run_prompt_inprocess(&thread_id, request, run_epoch)
             .await;
-        if !self.is_current_run(&thread_id, run_epoch) {
-            return;
-        }
-        if outcome.is_err() && native_restore.is_some() {
-            self.forget_session_of_thread(&thread_id);
-            self.clear_session_id(&thread_id);
-            let mut fallback_parts = Vec::new();
-            if let Some(context) = context {
-                fallback_parts.push(json!({ "type": "text", "text": context }));
-            }
-            fallback_parts.extend(request["parts"].as_array().cloned().unwrap_or_default());
-            request["sessionId"] = Value::Null;
-            request["restoreAt"] = Value::Null;
-            request["parts"] = Value::Array(fallback_parts);
-            outcome = self
-                .run_prompt_inprocess(&thread_id, request, user_item_id, run_epoch)
-                .await;
-        }
         if !self.is_current_run(&thread_id, run_epoch) {
             return;
         }
@@ -348,7 +173,7 @@ impl SdkManager {
         if let Err(error) = outcome {
             self.push_system(
                 &thread_id,
-                format!("{} 请求失败：{error}", self.adapter.label()),
+                format!("Lyra 请求失败：{error}"),
                 "error",
             );
         }
@@ -373,7 +198,7 @@ impl SdkManager {
         let target = bridge.as_ref().map(|(_, identity)| *identity);
         if let Some((control, _)) = bridge {
             let _ = write_control(&control, &json!({ "action": "cancel" })).await;
-            for _ in 0..self.adapter.cancel_grace_attempts() {
+            for _ in 0..20 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let target_is_running = self
                     .running_children
@@ -403,7 +228,7 @@ impl SdkManager {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             if let Some(thread) = store.get_mut(thread_id) {
-                thread.handoff_from = Some(self.adapter.agent_kind());
+                thread.handoff_from = Some(AgentKind::Lyra);
             }
             store.save_thread(&thread_id);
         }
@@ -467,7 +292,7 @@ impl SdkManager {
             store.save_thread(thread_id);
         }
 
-        let parts = prompt_parts(self.adapter.as_ref(), &text, &images);
+        let parts = prompt_parts(&text, &images);
         if let Err(error) =
             write_control(&control, &json!({ "action": "steer", "parts": parts })).await
         {
@@ -501,7 +326,7 @@ impl SdkManager {
         value
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| "Codex fork 未返回新会话 ID".into())
+            .ok_or_else(|| "Lyra fork 未返回新会话 ID".into())
     }
 
     pub fn shutdown(&self) {
@@ -534,9 +359,6 @@ impl SdkManager {
     /// 本地 `config.jsonc` 发生变化时调用。当前正在执行的任务不打断，
     /// 但会让下一轮请求和模型列表使用新配置。
     pub fn notify_config_changed(self: &Arc<Self>) {
-        if self.adapter.agent_kind() != AgentKind::Lyra {
-            return;
-        }
         self.invalidate_lyra_config();
     }
 
@@ -547,7 +369,7 @@ impl SdkManager {
         let _ = self.app.emit(
             EV_OPTIONS,
             json!({
-                "agentKind": self.adapter.agent_kind().as_str(),
+                "agentKind": "lyra",
                 "options": self.pending_model_options(),
             }),
         );
@@ -573,7 +395,7 @@ impl SdkManager {
             if let Err(error) = manager.refresh_model_options().await {
                 let _ = manager.app.emit(
                     EV_LOG,
-                    format!("[{}] 拉取模型列表失败：{error}", manager.adapter.label()),
+                    format!("[Lyra] 拉取模型列表失败：{error}"),
                 );
             }
             manager
@@ -591,18 +413,14 @@ impl SdkManager {
         Ok(self.pending_model_options())
     }
 
-    fn empty_model_options(&self) -> Value {
-        self.adapter.empty_model_options()
-    }
-
     /// 真实列表还没拉到时给前端的占位。带 pending 标记，前端才知道这不是最终结果，
     /// 下次打开选择器可以再问一次，而不是把空列表当成已加载缓存住。
     fn pending_model_options(&self) -> Value {
-        let mut value = self.empty_model_options();
-        if let Some(object) = value.as_object_mut() {
-            object.insert("pending".into(), Value::Bool(true));
-        }
-        value
+        json!({
+            "configOptions": [{ "id": "model", "name": "Model", "currentValue": "", "options": [] }],
+            "modes": null,
+            "pending": true,
+        })
     }
 
     async fn refresh_model_options(&self) -> Result<Value, String> {
@@ -618,14 +436,11 @@ impl SdkManager {
             return Err("Lyra 配置已更新，丢弃旧模型列表".into());
         }
         *self.model_options.lock().unwrap() = Some(value.clone());
-        let kind = self.adapter.agent_kind();
-        if self.borrowed_root().is_none() {
-            model_cache::save(&crate::nova_data_dir(&self.app), kind.as_str(), &value);
-            let _ = self.app.emit(
-                EV_OPTIONS,
-                json!({ "agentKind": kind.as_str(), "options": value }),
-            );
-        }
+        model_cache::save(&crate::nova_data_dir(&self.app), "lyra", &value);
+        let _ = self.app.emit(
+            EV_OPTIONS,
+            json!({ "agentKind": "lyra", "options": value }),
+        );
         self.model_options_revalidated.store(true, Ordering::SeqCst);
         Ok(value)
     }
@@ -637,22 +452,12 @@ impl SdkManager {
         fallback: String,
         model: String,
     ) {
-        if !self.adapter.generates_title() {
-            return;
-        }
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
             let cwd = std::env::current_dir()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            let model = if manager.adapter.uses_codex_model_routing() {
-                split_codex_effort(&model)
-                    .map(|(model, _)| model)
-                    .unwrap_or(&model)
-            } else {
-                &model
-            };
             let request = json!({
                 "action": "title",
                 "cwd": cwd,
@@ -686,7 +491,7 @@ impl SdkManager {
         let output = crate::lyra::run_oneshot(
             &self.native_http(),
             &json!({ "action": "generate", "model": model, "prompt": prompt }),
-            self.borrowed_root(),
+            None,
         ).await?;
         output.as_str().map(str::to_owned)
             .ok_or_else(|| "Lyra 文本生成返回了非文本结果".to_string())
@@ -703,28 +508,10 @@ impl SdkManager {
         let output = crate::lyra::run_oneshot(
             &self.native_http(),
             &json!({ "action": "generate", "model": model, "prompt": prompt, "history": history, "images": images }),
-            self.borrowed_root(),
+            None,
         ).await?;
         output.as_str().map(str::to_owned)
             .ok_or_else(|| "Lyra 文本生成返回了非文本结果".to_string())
-    }
-
-    /// Simulate one-shot with a private Codex thread/start + turn/start lifecycle.
-    pub(crate) async fn generate_text(&self, model: &str, prompt: String, images: &[Value], deadline: std::time::Duration) -> Result<String, String> {
-        if self.adapter.agent_kind() != AgentKind::Codex { return Err("此会话生成入口仅供 Codex 使用".into()); }
-        let dir = TextSessionDir(std::env::temp_dir().join(format!("nova-text-{}", uuid::Uuid::new_v4())));
-        std::fs::create_dir(&dir.0).map_err(|e| e.to_string())?;
-        let cwd = dir.0.to_string_lossy().into_owned();
-        let (mut command, options) = self.codex_launch(&cwd, true)?;
-        command.env_remove("NOVA_CONTEXT_SERVICE_ENDPOINT").env_remove("NOVA_CONTEXT_SERVICE_TOKEN");
-        let (model, _) = split_codex_effort(model).unwrap_or((model, ""));
-        let mut parts = vec![json!({"type":"text", "text":prompt})];
-        parts.extend(images.iter().map(|image| json!({"type":"image_data", "mime":image["mimeType"], "data":image["data"]})));
-        let (_tx, controls) = tokio::sync::mpsc::unbounded_channel();
-        let output = crate::codex_app_server::run(command,
-            json!({"action":"complete_text", "cwd":cwd, "model":model, "parts":parts, "timeoutMs":deadline.as_millis().min(u64::MAX as u128) as u64}),
-            options, controls, |_| {}).await?;
-        output.as_str().map(str::to_owned).ok_or_else(|| "Codex 生成返回了非文本结果".into())
     }
 
     /// 一次性行内补全：Rust 直连 provider HTTP（不冷启 Node）。
@@ -735,13 +522,11 @@ impl SdkManager {
         model: &str,
         prompt: String,
     ) -> Result<String, String> {
-        let data_dir = self
-            .borrowed_root()
-            .unwrap_or_else(|| nova_data_dir(&self.app));
+        let data_dir = nova_data_dir(&self.app);
         match crate::lyra_complete::complete_direct(
             &self.native_http(),
             &data_dir,
-            &self.launch_env,
+            &HashMap::new(),
             model,
             &prompt,
         )
@@ -766,22 +551,15 @@ impl SdkManager {
         Ok(output.as_str().unwrap_or_default().trim().to_string())
     }
 
-    async fn run_bridge(&self, cwd: &str, request: Value) -> Result<Value, String> {
-        if self.adapter.agent_kind() == AgentKind::Codex {
-            let (command, options) = self.codex_launch(cwd, request["action"] == "title")?;
-            let (_tx, controls) = tokio::sync::mpsc::unbounded_channel();
-            return crate::codex_app_server::run(command, request, options, controls, |_| {}).await;
-        }
-        crate::lyra::run_oneshot(&self.native_http(), &request, self.borrowed_root()).await
+    async fn run_bridge(&self, _cwd: &str, request: Value) -> Result<Value, String> {
+        crate::lyra::run_oneshot(&self.native_http(), &request, None).await
     }
 
-    /// 原生会话控制在同进程 tokio 任务中执行（Codex 直接管理 app-server 子进程），
-    /// 事件/控制行走 mpsc 通道。
+    /// 原生会话控制在同进程 tokio 任务中执行，事件/控制行走 mpsc 通道。
     async fn run_prompt_inprocess(
         &self,
         thread_id: &str,
         mut request: Value,
-        user_item_id: u64,
         run_epoch: u64,
     ) -> Result<(), String> {
         let context_tools = {
@@ -791,19 +569,13 @@ impl SdkManager {
         };
         // Lyra 子 agent 的 Stage 只用于展示，不经主轮次的短生命周期事件通道。
         request["novaThreadId"] = json!(thread_id);
-        let session = if self.adapter.agent_kind() == AgentKind::Codex {
-            let (command, options) =
-                self.codex_launch(request["cwd"].as_str().unwrap_or_default(), false)?;
-            crate::codex_app_server::spawn_prompt(command, request, options)
-        } else {
-            crate::lyra::spawn_prompt(
-                self.native_http(),
-                request,
-                context_tools,
-                self.borrowed_root(),
-                Some(self.app.clone()),
-            )
-        };
+        let session = crate::lyra::spawn_prompt(
+            self.native_http(),
+            request,
+            context_tools,
+            None,
+            Some(self.app.clone()),
+        );
         let abort = session.task.abort_handle();
         self.running_children.lock().unwrap().insert(
             thread_id.to_string(),
@@ -816,7 +588,7 @@ impl SdkManager {
         let crate::lyra::InProcessSession { events, task, .. } = session;
         let mut source = events;
         let event_result = self
-            .read_events(thread_id, user_item_id, run_epoch, &mut source)
+            .read_events(thread_id, run_epoch, &mut source)
             .await;
         // 仅当注册项仍属于本回合时才移除（新回合可能已重新注册）。
         {
@@ -848,19 +620,18 @@ impl SdkManager {
     async fn read_events(
         &self,
         thread_id: &str,
-        user_item_id: u64,
         run_epoch: u64,
         source: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
     ) -> Result<ReadEventsOutcome, String> {
         let mut item_ids = HashMap::new();
         while let Some(line) = source.recv().await {
             let event: Value = serde_json::from_str(&line).map_err(|e| {
-                format!("解析 {} 事件失败：{e}；输出：{line}", self.adapter.label())
+                format!("解析 Lyra 事件失败：{e}；输出：{line}")
             })?;
             if event.get("ok").and_then(Value::as_bool) == Some(false) {
                 return Err(event["error"]
                     .as_str()
-                    .unwrap_or("SDK bridge 执行失败")
+                    .unwrap_or("Lyra 任务执行失败")
                     .into());
             }
             let event_type = event.get("type").and_then(Value::as_str);
@@ -888,17 +659,14 @@ impl SdkManager {
                         .unwrap_or_default();
                     let _ = self.app.emit(
                         EV_LOG,
-                        format!(
-                            "[{}][timing] {phase} {elapsed_ms}ms{cancelled_runs}",
-                            self.adapter.label()
-                        ),
+                        format!("[Lyra][timing] {phase} {elapsed_ms}ms{cancelled_runs}"),
                     );
                     // provider 出错后 turn 会退避重试（每次可能等满 180s），只写日志时界面像卡死。
                     if phase == "provider_retry" {
                         let error = event.get("error").and_then(Value::as_str).unwrap_or("未知错误");
                         self.push_system(
                             thread_id,
-                            format!("{} 请求出错，正在自动重试：{error}", self.adapter.label()),
+                            format!("Lyra 请求出错，正在自动重试：{error}"),
                             "warn",
                         );
                     }
@@ -910,14 +678,12 @@ impl SdkManager {
                     }
                 }
                 Some("plan") => self.apply_plan(thread_id, &event["plan"]),
-                Some("checkpoint") => self.save_checkpoint(thread_id, user_item_id, &event),
                 Some("permission") => self.emit_permission(thread_id, &event["permission"]),
                 Some("usage") => {
                     // 本轮进行中的累计用量（bridge 可选上报）：只推给前端实时展示，不落库；
                     // Turn 落库时前端清零该值，避免与轮次用量重复计。
                     if let Some(raw) = event.get("usage") {
-                        let (usage, _) = self.adapter.normalize_usage(Some(raw), None, None);
-                        if let Some(usage) = usage {
+                        if let Some(usage) = normalize_usage(Some(raw)) {
                             let _ =
                                 self.emit_op(thread_id, json!({ "t": "usage", "usage": usage }));
                         }
@@ -925,7 +691,7 @@ impl SdkManager {
                 }
                 Some("done") => {
                     let usage = event.get("usage").cloned();
-                    let stop_reason = if self.adapter.done_is_cancelled(&event) {
+                    let stop_reason = if event.get("cancelled").and_then(Value::as_bool) == Some(true) {
                         "cancelled"
                     } else {
                         "end_turn"
@@ -936,55 +702,7 @@ impl SdkManager {
                 _ => {}
             }
         }
-        Err(format!("{} bridge 意外退出", self.adapter.label()))
-    }
-
-    /// Native Codex launch: preserve the process-local credential/proxy/shim environment.
-    /// Polaris runs as a lightweight native MCP subprocess of the same application.
-    fn codex_launch(
-        &self,
-        cwd: &str,
-        title: bool,
-    ) -> Result<(Command, crate::codex_app_server::Options), String> {
-        let state = self.app.state::<AppState>();
-        let settings = state.settings.lock().unwrap();
-        let executable = crate::codex_app_server::executable(&settings.codex_path)?;
-        let mut command = Command::new(executable);
-        command
-            .arg("app-server")
-            .current_dir(cwd)
-            .env("NOVA_DATA_DIR", nova_data_dir(&self.app));
-        command.envs(&self.launch_env);
-        apply_proxy_env(&mut command, &settings.codex_proxy);
-        #[cfg(windows)]
-        if state.windows_shell_shim_enabled {
-            crate::windows_shell_shim::apply(&self.app, &mut command, &self.launch_env)
-                .map_err(|e| format!("应用 Windows shell shim 失败：{e}"))?;
-        }
-        let polaris = if !title {
-            if state.context_service.endpoint().is_empty()
-                || state.context_service.token().is_empty()
-            {
-                return Err("Nova 工具服务不可用".into());
-            }
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            Some(
-                json!({"command":exe,"args":["__codex-mcp"],"tool_timeout_sec":610,"required":true,"enabled":true,"env":{
-                    "NOVA_CONTEXT_SERVICE_ENDPOINT":state.context_service.endpoint(),
-                    "NOVA_CONTEXT_SERVICE_TOKEN":state.context_service.token(),
-                    "NOVA_FAST_CONTEXT":if settings.context_tools_enabled() { "1" } else { "0" }
-                }}),
-            )
-        } else {
-            None
-        };
-        Ok((
-            command,
-            crate::codex_app_server::Options {
-                ponytail: settings.ponytail_enabled,
-                polaris,
-            },
-        ))
+        Err("Lyra 事件通道意外关闭".into())
     }
 
     fn change_working_directory(&self, thread_id: &str, cwd: &str) {
@@ -1016,66 +734,15 @@ impl SdkManager {
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
-            if self.adapter.uses_codex_model_routing() {
-                if let Some(snapshot) = thread.codex_usage_snapshot.as_mut() {
-                    if snapshot
-                        .session_id
-                        .as_deref()
-                        .is_some_and(|id| id != session_id)
-                    {
-                        *snapshot = CodexUsageSnapshot::default();
-                    }
-                    snapshot.session_id = Some(session_id.to_string());
-                }
-            }
             thread.acp_session_id = Some(session_id.to_string());
         }
         store.save_thread(thread_id);
     }
 
-    fn clear_session_id(&self, thread_id: &str) {
-        let state = self.app.state::<AppState>();
-        let mut store = state.store.lock().unwrap();
-        if let Some(thread) = store.get_mut(thread_id) {
-            thread.acp_session_id = None;
-            if self.adapter.uses_codex_model_routing() {
-                thread.codex_usage_snapshot = None;
-            }
-        }
-        store.save_thread(thread_id);
-    }
-
-    fn save_checkpoint(&self, thread_id: &str, user_item_id: u64, event: &Value) {
-        let Some(session_id) = event.get("sessionId").and_then(Value::as_str) else {
-            return;
-        };
-        let Some(position) = event.get("position").and_then(Value::as_str) else {
-            return;
-        };
-        let state = self.app.state::<AppState>();
-        let mut store = state.store.lock().unwrap();
-        if let Some(thread) = store.get_mut(thread_id) {
-            thread.record_provider_checkpoint(
-                user_item_id,
-                session_id.to_string(),
-                position.to_string(),
-            );
-        }
-        store.save_thread(thread_id);
-    }
-
     pub(crate) fn apply_item(&self, thread_id: &str, value: &Value, ids: &mut HashMap<String, u64>) {
-        if self.adapter.uses_codex_model_routing() && is_codex_model_resume_warning(value) {
-            return;
-        }
         let Some(remote_id) = value.get("id").and_then(Value::as_str) else {
             return;
         };
-        let plan = self
-            .adapter
-            .uses_codex_model_routing()
-            .then(|| codex_todo_plan(value))
-            .flatten();
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         let Some(thread) = store.get_mut(thread_id) else {
@@ -1117,25 +784,10 @@ impl SdkManager {
                         ts: now_ms(),
                     })
             }
-            Some("command_execution")
-            | Some("file_change")
-            | Some("mcp_tool_call")
-            | Some("web_search")
-            | Some("todo_list") => Some(Item::Tool {
-                id,
-                ts: now_ms(),
-                call: self
-                    .adapter
-                    .map_tool_call(value)
-                    .unwrap_or_else(|| tool_call(value)),
-            }),
             Some(_) => Some(Item::Tool {
                 id,
                 ts: now_ms(),
-                call: self
-                    .adapter
-                    .map_tool_call(value)
-                    .unwrap_or_else(|| tool_call(value)),
+                call: map_tool_call(value),
             }),
             None => None,
         };
@@ -1158,16 +810,12 @@ impl SdkManager {
                         set_tool_duration(call, now_ms().saturating_sub(*started_at) as u64);
                     }
                 }
-                update = if self.adapter.uses_text_deltas() {
-                    match text_snapshot_change(slot, &item) {
-                        TextSnapshotChange::Delta(delta) => {
-                            Some(json!({ "t": "delta", "itemId": id, "text": delta }))
-                        }
-                        TextSnapshotChange::Unchanged => None,
-                        TextSnapshotChange::Replace => Some(json!({ "t": "upsert", "item": item })),
+                update = match text_snapshot_change(slot, &item) {
+                    TextSnapshotChange::Delta(delta) => {
+                        Some(json!({ "t": "delta", "itemId": id, "text": delta }))
                     }
-                } else {
-                    Some(json!({ "t": "upsert", "item": item }))
+                    TextSnapshotChange::Unchanged => None,
+                    TextSnapshotChange::Replace => Some(json!({ "t": "upsert", "item": item })),
                 };
                 *slot = item.clone();
             }
@@ -1175,15 +823,9 @@ impl SdkManager {
             ids.insert(remote_id.into(), id);
             thread.items.push(item.clone());
         }
-        if let Some(plan) = &plan {
-            thread.plan = Some(plan.clone());
-        }
         thread.updated_at = now_ms();
         if let Some(op) = update {
             let _ = self.emit_op(thread_id, op);
-        }
-        if let Some(plan) = plan {
-            let _ = self.emit_op(thread_id, json!({ "t": "plan", "plan": plan }));
         }
         store.save_thread(thread_id);
     }
@@ -1208,16 +850,14 @@ impl SdkManager {
         let Some(request_id) = permission.get("id").and_then(Value::as_str) else {
             return;
         };
-        let prefix = self.adapter.permission_prefix();
-        let agent_kind = self.adapter.agent_kind();
-        let request_key = format!("{prefix}-perm-{thread_id}-{request_id}");
+        let request_key = format!("lyr-perm-{thread_id}-{request_id}");
         self.pending_permissions.lock().unwrap().insert(
             request_key.clone(),
             (thread_id.to_string(), request_id.to_string()),
         );
         let _ = self.app.emit(crate::acp::EV_PERMISSION, json!({
             "threadId": thread_id,
-            "agentKind": agent_kind.as_str(),
+            "agentKind": "lyra",
             "requestKey": request_key,
             "toolCall": {
                 "title": permission.get("permission").and_then(Value::as_str).unwrap_or("工具调用"),
@@ -1248,7 +888,7 @@ impl SdkManager {
             .unwrap()
             .get(&thread_id)
             .map(|bridge| bridge.control.clone())
-            .ok_or_else(|| format!("{} 会话已结束", self.adapter.label()))?;
+            .ok_or("Lyra 会话已结束")?;
         write_control(&control, &json!({ "action": "permission", "requestId": request_id, "reply": if option_id == "reject" { "reject" } else { "once" } })).await?;
         let _ = self.app.emit(
             crate::acp::EV_PERMISSION_RESOLVED,
@@ -1304,14 +944,7 @@ impl SdkManager {
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
-            let (usage, snapshot) = self.adapter.normalize_usage(
-                usage.as_ref(),
-                thread.codex_usage_snapshot.as_ref(),
-                thread.acp_session_id.as_deref(),
-            );
-            if let Some(snapshot) = snapshot {
-                thread.codex_usage_snapshot = Some(snapshot);
-            }
+            let usage = normalize_usage(usage.as_ref());
             for item in complete_pending_tools(thread) {
                 let _ = self.emit_update(thread_id, &item);
             }
@@ -1368,19 +1001,183 @@ impl SdkManager {
     }
 }
 
-impl Drop for SdkManager {
+impl Drop for LyraRuntime {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-fn prompt_parts(adapter: &dyn SdkAdapter, text: &str, images: &[PromptImage]) -> Vec<Value> {
+fn normalize_usage(usage: Option<&Value>) -> Option<Value> {
+    let usage = usage?;
+    let input = usage.get("input").and_then(Value::as_u64)?;
+    let output = usage.get("output").and_then(Value::as_u64)?;
+    let cache_read = usage.get("cacheRead").and_then(Value::as_u64);
+    let cache_write = usage.get("cacheWrite").and_then(Value::as_u64);
+    let input = input.saturating_add(cache_read.unwrap_or(0).saturating_add(cache_write.unwrap_or(0)));
+    let mut normalized = json!({
+        "inputTokens": input,
+        "outputTokens": output,
+        "totalTokens": input.saturating_add(output),
+    });
+    if let Some(value) = cache_read { normalized["cacheReadTokens"] = value.into(); }
+    if let Some(value) = cache_write { normalized["cacheWriteTokens"] = value.into(); }
+    if let Some(value) = usage.get("contextTokens").and_then(Value::as_u64) {
+        normalized["contextTokens"] = value.into();
+    }
+    Some(normalized)
+}
+
+fn map_tool_call(value: &Value) -> ToolCall {
+    let item_type = value.get("type").and_then(Value::as_str).unwrap_or("tool");
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed")
+        .to_string();
+    let arguments = value.get("arguments").cloned();
+    let result = value.get("result").or_else(|| value.get("error")).cloned();
+    if item_type == "command_execution" {
+        let command = value
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("bash");
+        let output = value
+            .get("aggregated_output")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return ToolCall {
+            tool_call_id: value["id"].as_str().unwrap_or("tool").into(),
+            title: command.into(),
+            kind: "execute".into(),
+            status,
+            content: text_content(output),
+            locations: Vec::new(),
+            raw_input: arguments.or_else(|| Some(json!({ "command": command }))),
+            raw_output: result,
+        };
+    }
+    if item_type == "file_change" {
+        let changes = value
+            .get("changes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let locations = changes
+            .iter()
+            .filter_map(|change| change.get("path").and_then(Value::as_str))
+            .map(|path| json!({ "path": path }))
+            .collect();
+        let title = if changes.len() == 1 {
+            format!("修改 {}", changes[0]["path"].as_str().unwrap_or("文件"))
+        } else {
+            format!("修改 {} 个文件", changes.len())
+        };
+        return ToolCall {
+            tool_call_id: value["id"].as_str().unwrap_or("tool").into(),
+            title,
+            kind: "edit".into(),
+            status,
+            content: Vec::new(),
+            locations,
+            raw_input: arguments,
+            raw_output: result,
+        };
+    }
+    let server = value
+        .get("server")
+        .and_then(Value::as_str)
+        .unwrap_or("Lyra");
+    let tool = value.get("tool").and_then(Value::as_str).unwrap_or("tool");
+    let detail = tool_detail(tool, value.get("arguments"));
+    let output = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| value.get("result").and_then(result_text));
+    ToolCall {
+        tool_call_id: value["id"].as_str().unwrap_or("tool").into(),
+        title: format!(
+            "{server} / {tool}{}",
+            detail
+                .map(|detail| format!(" · {detail}"))
+                .unwrap_or_default()
+        ),
+        kind: match tool {
+            "bash" | "shell" => "execute",
+            "read" | "load_skill" => "read",
+            "edit" | "write" => "edit",
+            "grep" | "find" | "ls" | "glob" => "search",
+            _ => "other",
+        }
+        .into(),
+        status,
+        content: output
+            .map(|output| text_content(&output))
+            .unwrap_or_default(),
+        locations: argument_paths(value.get("arguments")),
+        raw_input: arguments,
+        raw_output: result,
+    }
+}
+
+fn tool_detail(tool: &str, arguments: Option<&Value>) -> Option<String> {
+    let arguments = arguments?;
+    let value = match tool {
+        "read" | "edit" | "write" | "ls" => arguments.get("path")?.as_str()?.to_string(),
+        "grep" | "find" => arguments.get("pattern")?.as_str()?.to_string(),
+        "load_skill" => arguments.get("name")?.as_str()?.to_string(),
+        _ => return None,
+    };
+    Some(value.chars().take(160).collect())
+}
+
+fn argument_paths(arguments: Option<&Value>) -> Vec<Value> {
+    let Some(arguments) = arguments else {
+        return Vec::new();
+    };
+    if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+        return vec![json!({ "path": path })];
+    }
+    arguments
+        .get("paths")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|path| {
+            path.as_str()
+                .or_else(|| path.get("path").and_then(Value::as_str))
+                .map(|path| json!({ "path": path }))
+        })
+        .collect()
+}
+
+fn result_text(result: &Value) -> Option<String> {
+    let text = result
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn text_content(text: &str) -> Vec<Value> {
+    if text.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "type": "content", "content": { "type": "text", "text": text } })]
+    }
+}
+
+fn prompt_parts(text: &str, images: &[PromptImage]) -> Vec<Value> {
     let mut parts = Vec::new();
     if !text.is_empty() {
         parts.push(json!({ "type": "text", "text": text }));
     }
     for image in images {
-        if adapter.accepts_data_image(&image.mime_type) {
+        if image.mime_type.starts_with("image/") {
             if let Some(data) = &image.data {
                 parts.push(json!({
                     "type": "image_data", "name": image.name, "mime": image.mime_type, "data": data
@@ -1432,55 +1229,6 @@ fn normalize_title(output: &str, fallback: &str) -> String {
     }
 }
 
-fn resolve_codex_model(
-    options: &Value,
-    selected: &str,
-    reasoning_effort: Option<&str>,
-) -> Option<(String, Option<String>)> {
-    let models = options["configOptions"]
-        .as_array()
-        .and_then(|configs| configs.iter().find(|config| config["id"] == "model"))
-        .and_then(|config| config["options"].as_array())?;
-    let exact = models
-        .iter()
-        .find(|option| option["value"].as_str() == Some(selected));
-    if let Some(option) = exact {
-        let effort = option["_meta"]["codex.ai/effort"]
-            .as_str()
-            .or_else(|| split_codex_effort(selected).map(|(_, effort)| effort))
-            .or(reasoning_effort);
-        let model = effort
-            .and_then(|effort| selected.strip_suffix(&format!(":{effort}")))
-            .unwrap_or(selected);
-        return Some((model.to_string(), effort.map(str::to_string)));
-    }
-    if let Some(effort) = reasoning_effort {
-        let combined = format!("{selected}:{effort}");
-        if models
-            .iter()
-            .any(|option| option["value"].as_str() == Some(&combined))
-        {
-            return Some((selected.to_string(), Some(effort.to_string())));
-        }
-    }
-    models
-        .iter()
-        .any(|option| {
-            option["value"].as_str().is_some_and(|value| {
-                value
-                    .strip_prefix(selected)
-                    .is_some_and(|suffix| suffix.starts_with(':'))
-            })
-        })
-        .then(|| (selected.to_string(), None))
-}
-
-fn split_codex_effort(value: &str) -> Option<(&str, &str)> {
-    const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
-    let (model, effort) = value.rsplit_once(':')?;
-    EFFORTS.contains(&effort).then_some((model, effort))
-}
-
 fn derive_title(text: &str, has_images: bool) -> String {
     let title: String = text
         .lines()
@@ -1529,7 +1277,7 @@ enum TextSnapshotChange<'a> {
     Replace,
 }
 
-/// Codex app-server 桥接层输出累计文本快照。把纯追加部分转换成前端 delta，
+/// Lyra 事件流输出累计文本快照。把纯追加部分转换成前端 delta，
 /// 同文快照不重复刷新；若服务端改写了既有文本，则回退到整条 upsert。
 fn text_snapshot_change<'a>(previous: &Item, next: &'a Item) -> TextSnapshotChange<'a> {
     let texts = match (previous, next) {
@@ -1550,42 +1298,52 @@ fn text_snapshot_change<'a>(previous: &Item, next: &'a Item) -> TextSnapshotChan
         .unwrap_or(TextSnapshotChange::Replace)
 }
 
-/// 旧版 Codex 桥接层用 `todo_list` 快照表达计划进度；转换成 Nova 各后端共用的计划结构。
-fn codex_todo_plan(value: &Value) -> Option<Value> {
-    if value.get("type").and_then(Value::as_str) != Some("todo_list") {
-        return None;
-    }
-    let entries = value
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| {
-            let content = item.get("text")?.as_str()?.trim();
-            if content.is_empty() {
-                return None;
-            }
-            let status = if item.get("completed").and_then(Value::as_bool) == Some(true) {
-                "completed"
-            } else {
-                "pending"
-            };
-            Some(json!({ "content": content, "status": status }))
-        })
-        .collect::<Vec<_>>();
-    Some(json!(entries))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_todo_plan, complete_pending_tools, derive_title, display_working_directory,
-        is_codex_model_resume_warning, normalize_title, resolve_codex_model,
-        text_snapshot_change, tool_call, write_control, TextSnapshotChange, TOOL_OUTPUT_LIMIT,
+        complete_pending_tools, derive_title, display_working_directory, normalize_title,
+        text_snapshot_change, write_control, TextSnapshotChange,
     };
-    use crate::sdk_adapters::{CodexAdapter, LyraAdapter, SdkAdapter};
-    use crate::threads::{now_ms, AgentKind, CodexUsageSnapshot, Item, Thread, ToolCall};
+    use super::{map_tool_call, normalize_usage, prompt_parts};
+    use crate::threads::{now_ms, AgentKind, Item, Thread, ToolCall};
     use serde_json::json;
+
+    #[test]
+    fn maps_tool_items() {
+        let tool = map_tool_call(&json!({
+            "id": "call-1", "type": "mcp_tool_call", "server": "Lyra", "tool": "read",
+            "arguments": { "path": "src/main.rs" }, "status": "completed",
+            "result": { "content": [{ "type": "text", "text": "ok" }] }
+        }));
+        assert_eq!(tool.kind, "read");
+        assert!(tool.title.starts_with("Lyra / read"));
+        let bash = map_tool_call(&json!({
+            "id": "call-2", "type": "command_execution", "status": "completed",
+            "command": "ls", "aggregated_output": "a.rs"
+        }));
+        assert_eq!(bash.kind, "execute");
+        assert_eq!(bash.raw_input.as_ref().unwrap()["command"], "ls");
+        assert_eq!(bash.content[0]["content"]["text"], "a.rs");
+        let edit = map_tool_call(&json!({
+            "id": "call-3", "type": "file_change", "status": "completed",
+            "changes": [{"path": "src/main.rs"}]
+        }));
+        assert_eq!(edit.kind, "edit");
+        assert_eq!(edit.locations, vec![json!({"path": "src/main.rs"})]);
+    }
+
+    #[test]
+    fn prompt_keeps_inline_images_and_file_uris() {
+        let images: Vec<crate::threads::PromptImage> = serde_json::from_value(json!([
+            {"name":"screen.png", "mimeType":"image/png", "data":"cG5n"},
+            {"name":"photo.jpg", "mimeType":"image/jpeg", "uri":"file:///tmp/photo.jpg"}
+        ])).unwrap();
+        assert_eq!(prompt_parts("read these", &images), vec![
+            json!({"type":"text", "text":"read these"}),
+            json!({"type":"image_data", "name":"screen.png", "mime":"image/png", "data":"cG5n"}),
+            json!({"type":"local_image", "path":"/tmp/photo.jpg"})
+        ]);
+    }
 
     #[test]
     fn title_fallback_uses_first_prompt_line_or_image() {
@@ -1598,112 +1356,15 @@ mod tests {
     }
 
     #[test]
-    fn codex_model_resolution_splits_combined_values() {
-        let options = json!({
-            "configOptions": [{
-                "id": "model",
-                "options": [
-                    { "value": "gpt-5.6-sol:low", "_meta": { "codex.ai/effort": "low" } },
-                    { "value": "gpt-5.6-sol:medium", "_meta": { "codex.ai/effort": "medium" } },
-                    { "value": "gpt-5.6-sol:high", "_meta": { "codex.ai/effort": "high" } },
-                    { "value": "gpt-5.6-sol:xhigh", "_meta": { "codex.ai/effort": "xhigh" } },
-                    { "value": "gpt-5.6-sol:max", "_meta": { "codex.ai/effort": "max" } },
-                    { "value": "gpt-5.6-sol:ultra", "_meta": { "codex.ai/effort": "ultra" } },
-                    { "value": "gpt-5.6-terra:max" }
-                ]
-            }]
-        });
-        for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
-            assert_eq!(
-                resolve_codex_model(&options, &format!("gpt-5.6-sol:{effort}"), None),
-                Some(("gpt-5.6-sol".into(), Some(effort.into())))
-            );
-        }
-        assert_eq!(
-            resolve_codex_model(&options, "gpt-5.6-sol", Some("high")),
-            Some(("gpt-5.6-sol".into(), Some("high".into())))
-        );
-        assert_eq!(
-            resolve_codex_model(&options, "gpt-5.6-terra:max", None),
-            Some(("gpt-5.6-terra".into(), Some("max".into())))
-        );
-        assert_eq!(resolve_codex_model(&options, "gpt-5.4-minilow", None), None);
-    }
-
-    #[test]
-    fn codex_model_resume_warning_is_nonfatal() {
-        assert!(is_codex_model_resume_warning(&json!({
-            "type": "error",
-            "message": "This session was recorded with model `gpt-5.6-terra` but is resuming with `gpt-5.6-sol`. Consider switching back to `gpt-5.6-terra` as it may affect Codex performance."
-        })));
-        assert!(!is_codex_model_resume_warning(&json!({
-            "type": "error",
-            "message": "Codex transport failed"
-        })));
-    }
-
-    #[test]
-    fn codex_usage_is_the_delta_between_cumulative_snapshots() {
-        let baseline = CodexUsageSnapshot {
-            session_id: Some("thread-1".into()),
-            input_tokens: 1_000,
-            output_tokens: 100,
-            cache_read_tokens: 200,
-            cache_write_tokens: 0,
-        };
-        let (usage, snapshot) = CodexAdapter.normalize_usage(
-            Some(&json!({
-                "input_tokens": 1_600,
-                "cached_input_tokens": 500,
-                "output_tokens": 180,
-                "reasoning_output_tokens": 40
-            })),
-            Some(&baseline),
-            Some("thread-1"),
-        );
-
-        assert_eq!(
-            usage,
-            Some(json!({
-                "inputTokens": 600,
-                "outputTokens": 80,
-                "totalTokens": 680,
-                "cacheReadTokens": 300,
-                "cacheWriteTokens": 0
-            }))
-        );
-        let snapshot = snapshot.unwrap();
-        assert_eq!(snapshot.input_tokens, 1_600);
-        assert_eq!(snapshot.cache_read_tokens, 500);
-    }
-
-    #[test]
-    fn codex_usage_without_a_matching_baseline_is_not_counted() {
-        let raw = json!({ "input_tokens": 1_600, "output_tokens": 180 });
-        let (missing, snapshot) = CodexAdapter.normalize_usage(Some(&raw), None, Some("thread-1"));
-        assert!(missing.is_none());
-        assert_eq!(snapshot.unwrap().output_tokens, 180);
-
-        let other_session = CodexUsageSnapshot {
-            session_id: Some("thread-0".into()),
-            input_tokens: 1_000,
-            output_tokens: 100,
-            ..Default::default()
-        };
-        let (mismatched, _) =
-            CodexAdapter.normalize_usage(Some(&raw), Some(&other_session), Some("thread-1"));
-        assert!(mismatched.is_none());
-    }
-
-    #[test]
     fn lyra_usage_includes_pi_cached_input() {
         let raw = json!({
             "input": 100,
             "output": 20,
             "cacheRead": 300,
-            "cacheWrite": 40
+            "cacheWrite": 40,
+            "contextTokens": 50
         });
-        let (usage, _) = LyraAdapter.normalize_usage(Some(&raw), None, None);
+        let usage = normalize_usage(Some(&raw));
 
         assert_eq!(
             usage,
@@ -1712,9 +1373,14 @@ mod tests {
                 "outputTokens": 20,
                 "totalTokens": 460,
                 "cacheReadTokens": 300,
-                "cacheWriteTokens": 40
+                "cacheWriteTokens": 40,
+                "contextTokens": 50
             }))
         );
+        for raw in [serde_json::Value::Null, json!({"input": 1}), json!({"input": -1, "output": 2})] {
+            assert!(normalize_usage(Some(&raw)).is_none());
+        }
+        assert!(normalize_usage(None).is_none());
     }
 
     #[test]
@@ -1776,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_text_snapshots_become_deltas_when_they_only_append() {
+    fn lyra_text_snapshots_become_deltas_when_they_only_append() {
         let previous = Item::Assistant {
             id: 1,
             text: "你好".into(),
@@ -1808,354 +1474,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn codex_todo_list_becomes_the_shared_plan_shape() {
-        let plan = codex_todo_plan(&json!({
-            "id": "todo-1",
-            "type": "todo_list",
-            "items": [
-                { "text": " inspect repository ", "completed": true },
-                { "text": "Implement fix", "completed": false },
-                { "text": "  ", "completed": false }
-            ]
-        }));
-        assert_eq!(
-            plan,
-            Some(json!([
-                { "content": "inspect repository", "status": "completed" },
-                { "content": "Implement fix", "status": "pending" }
-            ]))
-        );
-        assert_eq!(
-            codex_todo_plan(&json!({ "id": "tool", "type": "web_search" })),
-            None
-        );
-    }
-
-    #[test]
-    fn sdk_tools_preserve_available_details() {
-        let command = tool_call(&json!({
-            "id": "command", "type": "command_execution", "command": "git status",
-            "aggregated_output": " M src/main.rs\n", "exit_code": 0, "status": "completed"
-        }));
-        assert_eq!(command.raw_input.unwrap()["command"], "git status");
-        assert_eq!(command.raw_output.as_ref().unwrap()["exitCode"], 0);
-        assert_eq!(command.content[0]["content"]["text"], " M src/main.rs\n");
-
-        let files = tool_call(&json!({
-            "id": "files", "type": "file_change", "status": "completed", "changes": [
-                { "path": "src/main.rs", "kind": "update" },
-                { "path": "src/new.rs", "kind": "add" }
-            ]
-        }));
-        assert_eq!(files.title, "修改 2 个文件");
-        assert_eq!(files.locations[0]["path"], "src/main.rs");
-        assert_eq!(
-            files.content[0]["content"]["text"],
-            "更新 src/main.rs\n新增 src/new.rs"
-        );
-
-        let mcp = tool_call(&json!({
-            "id": "mcp", "type": "mcp_tool_call", "server": "files", "tool": "read",
-            "arguments": { "path": "README.md" }, "status": "completed",
-            "result": {
-                "content": [{ "type": "text", "text": "hello" }],
-                "structured_content": { "lines": 1 }
-            }
-        }));
-        assert_eq!(mcp.content[0]["content"]["text"], "hello");
-        assert_eq!(mcp.raw_output.unwrap()["structured_content"]["lines"], 1);
-
-        let future = tool_call(&json!({
-            "id": "future", "type": "image_generation", "status": "completed",
-            "result": { "path": "out.png" }
-        }));
-        assert_eq!(future.title, "image generation");
-        assert_eq!(future.raw_output.unwrap()["result"]["path"], "out.png");
-    }
-
-    #[test]
-    fn oversized_tool_output_is_truncated_and_image_data_replaced() {
-        let huge = format!("开头{}", "界".repeat(TOOL_OUTPUT_LIMIT));
-        let read = tool_call(&json!({
-            "id": "read", "type": "mcp_tool_call", "server": "CodeBuddy", "tool": "read",
-            "arguments": { "file_path": "big.log" }, "status": "completed",
-            "result": { "content": [
-                { "type": "text", "text": huge },
-                { "type": "image", "data": "A".repeat(TOOL_OUTPUT_LIMIT * 2), "mimeType": "image/png" }
-            ] }
-        }));
-        let text = read.content[0]["content"]["text"].as_str().unwrap();
-        assert!(text.starts_with("[输出过长"));
-        assert!(text.len() <= TOOL_OUTPUT_LIMIT + 128);
-        assert!(text.ends_with('界'));
-        let raw = read.raw_output.unwrap();
-        let data = raw["content"][1]["data"].as_str().unwrap();
-        assert!(data.contains("图片数据已省略"));
-        // 未超限的字段原样保留
-        assert_eq!(raw["content"][1]["mimeType"], "image/png");
-    }
-}
-
-fn compact_tool_detail(value: &str) -> String {
-    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = value.chars();
-    let detail = chars.by_ref().take(160).collect::<String>();
-    if chars.next().is_some() {
-        format!("{detail}…")
-    } else {
-        detail
-    }
-}
-
-fn text_content(text: String) -> Vec<Value> {
-    if text.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![json!({ "type": "content", "content": { "type": "text", "text": text } })]
-    }
-}
-
-fn display_file_change(kind: &str, path: &str) -> String {
-    let action = match kind {
-        "add" => "新增",
-        "delete" => "删除",
-        "update" => "更新",
-        _ => kind,
-    };
-    format!("{action} {path}")
-}
-
-fn mcp_result_text(result: &Value) -> Option<String> {
-    let content = result.get("content")?.as_array()?;
-    let text = content
-        .iter()
-        .filter_map(|block| {
-            (block.get("type").and_then(Value::as_str) == Some("text"))
-                .then(|| block.get("text").and_then(Value::as_str))
-                .flatten()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!text.is_empty()).then_some(text)
-}
-
-fn tool_call(value: &Value) -> ToolCall {
-    let kind = value.get("type").and_then(Value::as_str).unwrap_or("tool");
-    let status = value
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("completed");
-    let (title, tool_kind, locations, raw_input, raw_output, content) = match kind {
-        "command_execution" => {
-            let output = value
-                .get("aggregated_output")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            (
-                value
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Command")
-                    .to_string(),
-                "execute",
-                Vec::new(),
-                Some(json!({ "command": value.get("command").cloned().unwrap_or(Value::Null) })),
-                Some(json!({
-                    "aggregatedOutput": value.get("aggregated_output").cloned().unwrap_or(Value::Null),
-                    "exitCode": value.get("exit_code").cloned().unwrap_or(Value::Null)
-                })),
-                text_content(output.to_string()),
-            )
-        }
-        "file_change" => {
-            let changes = value
-                .get("changes")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let locations = changes
-                .iter()
-                .filter_map(|change| change.get("path").and_then(Value::as_str))
-                .map(|path| json!({ "path": path }))
-                .collect();
-            let details = changes
-                .iter()
-                .filter_map(|change| {
-                    Some(display_file_change(
-                        change.get("kind")?.as_str()?,
-                        change.get("path")?.as_str()?,
-                    ))
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let title = if changes.len() == 1 {
-                changes[0]
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(|path| format!("修改 {path}"))
-                    .unwrap_or_else(|| "修改文件".into())
-            } else {
-                format!("修改 {} 个文件", changes.len())
-            };
-            (
-                title,
-                "edit",
-                locations,
-                Some(json!({ "changes": changes })),
-                None,
-                text_content(details),
-            )
-        }
-        "mcp_tool_call" => {
-            let server = value.get("server").and_then(Value::as_str).unwrap_or("MCP");
-            let raw_arguments = value.get("arguments");
-            let envelope = raw_arguments
-                .filter(|arguments| arguments.get("toolName").and_then(Value::as_str).is_some());
-            let tool = envelope
-                .and_then(|arguments| arguments.get("toolName"))
-                .and_then(Value::as_str)
-                .or_else(|| value.get("tool").and_then(Value::as_str))
-                .unwrap_or("tool");
-            let arguments = envelope
-                .and_then(|arguments| arguments.get("args"))
-                .or(raw_arguments);
-            let detail = match tool {
-                "shell" => arguments.and_then(|args| args.get("command")),
-                "read" | "edit" | "write" | "delete" | "ls" => {
-                    arguments.and_then(|args| args.get("path"))
-                }
-                "glob" => arguments.and_then(|args| args.get("globPattern")),
-                "grep" => arguments.and_then(|args| args.get("pattern")),
-                "semSearch" => arguments.and_then(|args| args.get("query")),
-                "read_files" => arguments
-                    .and_then(|args| args.get("paths"))
-                    .and_then(Value::as_array)
-                    .and_then(|paths| paths.first())
-                    .and_then(|path| {
-                        if path.is_string() {
-                            Some(path)
-                        } else {
-                            path.get("path")
-                        }
-                    }),
-                _ => None,
-            }
-            .and_then(Value::as_str)
-            .map(compact_tool_detail)
-            .filter(|detail| !detail.is_empty());
-            let locations = arguments
-                .and_then(|args| args.get("paths"))
-                .and_then(Value::as_array)
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter_map(|path| {
-                            path.as_str()
-                                .or_else(|| path.get("path").and_then(Value::as_str))
-                        })
-                        .map(|path| json!({ "path": path }))
-                        .collect::<Vec<_>>()
-                })
-                .filter(|locations| !locations.is_empty())
-                .or_else(|| {
-                    arguments
-                        .and_then(|args| args.get("path"))
-                        .and_then(Value::as_str)
-                        .map(|path| vec![json!({ "path": path })])
-                })
-                .unwrap_or_default();
-            let result = value.get("result").or_else(|| value.get("error")).cloned();
-            let output = value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| value.get("result").and_then(mcp_result_text));
-            (
-                format!(
-                    "{server} / {tool}{}",
-                    detail
-                        .map(|detail| format!(" · {detail}"))
-                        .unwrap_or_default()
-                ),
-                match tool {
-                    "shell" => "execute",
-                    "read" | "read_files" => "read",
-                    "edit" | "write" | "edit_files" => "edit",
-                    "delete" => "delete",
-                    "glob" | "grep" | "semSearch" | "ls" => "search",
-                    "createPlan" | "updateTodos" => "think",
-                    _ => "other",
-                },
-                locations,
-                arguments.cloned(),
-                result,
-                output.map(text_content).unwrap_or_default(),
-            )
-        }
-        "web_search" => (
-            value
-                .get("query")
-                .and_then(Value::as_str)
-                .map(|query| format!("搜索 {query}"))
-                .unwrap_or_else(|| "网页搜索".into()),
-            "search",
-            Vec::new(),
-            Some(json!({ "query": value.get("query").cloned().unwrap_or(Value::Null) })),
-            None,
-            Vec::new(),
-        ),
-        "todo_list" => {
-            let items = value
-                .get("items")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let text = items
-                .iter()
-                .filter_map(|item| {
-                    let text = item.get("text")?.as_str()?;
-                    let mark = if item.get("completed").and_then(Value::as_bool) == Some(true) {
-                        "x"
-                    } else {
-                        " "
-                    };
-                    Some(format!("[{mark}] {text}"))
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            (
-                "Todo list".into(),
-                "think",
-                Vec::new(),
-                Some(json!({ "items": items })),
-                None,
-                text_content(text),
-            )
-        }
-        _ => (
-            kind.replace('_', " "),
-            "other",
-            Vec::new(),
-            None,
-            Some(value.clone()),
-            Vec::new(),
-        ),
-    };
-    ToolCall {
-        tool_call_id: value.get("id").and_then(Value::as_str).unwrap_or("").into(),
-        title,
-        kind: tool_kind.into(),
-        status: match status {
-            "failed" => "failed",
-            "in_progress" => "in_progress",
-            _ => "completed",
-        }
-        .into(),
-        content: compact_tool_values(&content),
-        locations,
-        raw_input: raw_input.map(|value| compact_tool_value(&value)),
-        raw_output: raw_output.map(|value| compact_tool_value(&value)),
-    }
 }

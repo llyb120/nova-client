@@ -320,7 +320,6 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
     let dir = data_dir();
     let mut settings = Settings::load(&dir);
     let mut server = load_server_file();
-    let key = key.trim_start_matches("--");
     if let Some(name) = key.strip_prefix("env.") {
         validate_environment_name(name)?;
         if value.is_empty() {
@@ -345,9 +344,6 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
                 }
             }
             "devin-path" => settings.devin_path = value.into(),
-            "codex-path" => settings.codex_path = value.into(),
-            "codex-args" => settings.codex_args = value.into(),
-            "codebuddy-path" => settings.codebuddy_path = value.into(),
             "workbuddy-path" => settings.workbuddy_path = value.into(),
             "lyra-proxy" | "vega-proxy" => settings.lyra_proxy = value.into(),
             "devin-proxy" => settings.devin_proxy = value.into(),
@@ -355,10 +351,6 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
             "codebuddy-proxy" => settings.codebuddy_proxy = value.into(),
             "workbuddy-proxy" => settings.workbuddy_proxy = value.into(),
             "lyra-enabled" | "vega-enabled" => settings.lyra_enabled = parse_bool(value)?,
-            "devin-enabled" => settings.devin_enabled = parse_bool(value)?,
-            "codex-enabled" => settings.codex_enabled = parse_bool(value)?,
-            "codebuddy-enabled" => settings.codebuddy_enabled = parse_bool(value)?,
-            "workbuddy-enabled" => settings.workbuddy_enabled = parse_bool(value)?,
             unknown => return Err(format!("未知配置键：{unknown}\n\n{HELP}")),
         }
     }
@@ -587,6 +579,14 @@ mod tests {
         assert_eq!(mask_secret(""), "");
         assert_eq!(mask_secret("short"), "****");
         assert_eq!(mask_secret("abcd-very-secret-wxyz"), "abcd****wxyz");
+    }
+
+    #[test]
+    fn removed_backend_config_keys_are_ignored_successfully() {
+        // 提前返回，不读写数据目录。
+        for key in ["codex-path", "--codex-enabled", "workbuddy-enabled"] {
+            assert_eq!(set_config(key, "x"), Ok(()));
+        }
     }
 
     #[test]

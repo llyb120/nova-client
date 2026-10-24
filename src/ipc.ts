@@ -5,7 +5,6 @@ import type {
   AgentKind,
   BranchList,
   CaptureClueResult,
-  CliStatus,
   ClueAiSummary,
   ClueAttachment,
   ClueContextSnapshot,
@@ -14,12 +13,10 @@ import type {
   PromptTrigger,
   IncomingShare,
   TeamMiniApp,
-  ModelCost,
   ModelOptions,
   Peer,
   ProjectEntry,
   PromptImage,
-  Quota,
   RelayStatus,
   RevertChange,
   RevertResult,
@@ -37,6 +34,7 @@ import type {
   WorktreeRecord,
 } from "./types";
 import type { Preset } from "./lyraConfig";
+import type { ModelSelectionMigrationTarget, ModelSelectionMigrationResult } from "./modelSelectionMigration";
 
 export function fileUriPath(uri: string) {
   const raw = uri.replace(/^file:\/\//, "");
@@ -94,8 +92,6 @@ export const api = {
     invoke<TimeMachineRestoreResult>("delete_time_machine_context", { threadId, prompts }),
   listProjects: () => invoke<ProjectEntry[]>("list_projects"),
   removeProject: (cwd: string) => invoke<void>("remove_project", { cwd }),
-  prewarm: (cwd: string, agentKind: AgentKind, mode?: string | null) =>
-    invoke<void>("prewarm", { cwd, agentKind, mode }),
   scratchDir: () => invoke<string>("scratch_dir"),
   chromeDependencyStatus: () =>
     invoke<{
@@ -112,8 +108,6 @@ export const api = {
     ),
   directoryExists: (path: string) => invoke<boolean>("directory_exists", { path }),
   clipboardFilePaths: () => invoke<string[]>("clipboard_file_paths"),
-  getQuota: () => invoke<Quota>("get_quota"),
-  getModelCosts: () => invoke<Record<string, ModelCost>>("get_model_costs"),
   checkUpdate: () => invoke<UpdateInfo>("check_update"),
   downloadStagedUpdate: () =>
     invoke<{ ready: boolean; hasUpdate?: boolean; version?: string }>("download_staged_update"),
@@ -233,22 +227,15 @@ export const api = {
     invoke<RevertResult>("revert_file_changes", { threadId, changes }),
   setThreadModel: (threadId: string, model: string | null) =>
     invoke<void>("set_thread_model", { threadId, model }),
+  /** 自动迁移未完成的旧会话手动改绑到所选 Lyra 模型（保留历史）。 */
+  bindThreadToLyra: (threadId: string, model: string) =>
+    invoke<void>("bind_thread_to_lyra", { threadId, model }),
   setThreadMode: (threadId: string, mode: string | null) =>
     invoke<void>("set_thread_mode", { threadId, mode }),
-  setThreadReasoningEffort: (threadId: string, reasoningEffort: string | null) =>
-    invoke<void>("set_thread_reasoning_effort", { threadId, reasoningEffort }),
   setThreadStarred: (threadId: string, starred: boolean) =>
     invoke<void>("set_thread_starred", { threadId, starred }),
   setThreadUnread: (threadId: string, unread: number) =>
     invoke<void>("set_thread_unread", { threadId, unread }),
-  setThreadAgent: (
-    threadId: string,
-    agentKind: AgentKind,
-    model: string | null,
-    mode: string | null,
-    reasoningEffort: string | null,
-  ) =>
-    invoke<void>("set_thread_agent", { threadId, agentKind, model, mode, reasoningEffort }),
   getModelOptions: (agentKind: AgentKind) =>
     invoke<ModelOptions | null>("get_model_options", { agentKind }),
   /** 设置页手动刷新 Lyra 本地配置：重读 config.jsonc 并后台重拉模型列表。 */
@@ -286,6 +273,8 @@ export const api = {
   respondPermission: (requestKey: string, optionId: string) =>
     invoke<void>("respond_permission", { requestKey, optionId }),
   getSettings: () => invoke<Settings>("get_settings"),
+  migrateModelSelections: (targets: ModelSelectionMigrationTarget[]) =>
+    invoke<ModelSelectionMigrationResult[]>("migrate_model_selections", { targets }),
   openMeteor: () => invoke<void>("meteor_open"),
   setMeteorShortcutRecording: (active: boolean) => invoke<void>("meteor_set_shortcut_recording", { active }),
   getWindowLayout: () => invoke<{width: number; height: number; maximized: boolean; remember: boolean}>("get_window_layout"),
@@ -303,9 +292,7 @@ export const api = {
   /** 后端可用性检测结果（agentKind → 是否可用）；空 map = 尚未检测完成 */
   getBackendAvailability: () =>
     invoke<Record<string, boolean>>("get_backend_availability"),
-  getCliStatuses: (settings: Settings) =>
-    invoke<CliStatus[]>("get_cli_statuses", { settings }),
-  restartDevin: () => invoke<void>("restart_devin"),
+  restartAgents: () => invoke<void>("restart_agents"),
   getStatus: () => invoke<Status>("get_status"),
   getLogs: () => invoke<string[]>("get_logs"),
 

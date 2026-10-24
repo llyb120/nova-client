@@ -5,6 +5,7 @@ import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { LruMap } from "./lruMap";
 import { api } from "./ipc";
+import { migrateStoredModelSelections } from "./modelSelectionMigration";
 import { rememberPromptDraft, saveSessionDraft, takeSessionDraft } from "./promptDraft";
 import type {
   Achievement,
@@ -14,13 +15,11 @@ import type {
   ClueAttachment,
   ClueCard,
   ClueNodeGroup,
-  EffortChoice,
   IncomingRoamRequest,
   IncomingShare,
   Item,
   LiveUsage,
   ModelChoice,
-  ModelCost,
   ModelOptions,
   ModeChoice,
   Peer,
@@ -30,7 +29,6 @@ import type {
   PlanEntry,
   ProjectEntry,
   PromptImage,
-  Quota,
   RelayStatus,
   Settings,
   SlashCommand,
@@ -97,6 +95,20 @@ function readModelFavorites(): string[] {
 /** 模型收藏以 settings.json 为可靠存储，localStorage 仅用于升级兼容和即时兜底。 */
 export const [modelFavoriteIds, setModelFavoriteIds] = createSignal(readModelFavorites());
 
+let localModelMigration: Promise<void> | undefined;
+let modelMigrationWarnings: string[] = [];
+let localModelMigrationFailed = false;
+/** Main-window bootstrap awaits this before HomeView reads lastUsed. */
+export function migrateLocalModelSelections(): Promise<void> {
+  return localModelMigration ??= migrateStoredModelSelections(localStorage, api.migrateModelSelections)
+    .then(warnings => { modelMigrationWarnings = warnings; })
+    .catch(error => {
+      localModelMigrationFailed = true;
+      modelMigrationWarnings = [`本地模型选择迁移失败：${String(error)}`];
+    })
+    .then(() => { setModelFavoriteIds(readModelFavorites()); });
+}
+
 export function toggleModelFavorite(id: string) {
   const next = modelFavoriteIds().includes(id)
     ? modelFavoriteIds().filter((favorite) => favorite !== id)
@@ -148,8 +160,6 @@ interface AppStore {
   logs: string[];
   loadingThread: boolean;
   liveUsage: LiveUsage | null;
-  quota: Quota | null;
-  modelCosts: Record<string, ModelCost> | null;
   update: UpdateInfo | null;
   updateStaging: boolean;
   updatePromptAt: number;
@@ -193,7 +203,7 @@ export const [state, setState] = createStore<AppStore>({
   proposedPlan: null,
   cwd: "",
   title: "",
-  agentKind: "devin",
+  agentKind: "lyra",
   model: "",
   mode: "",
   reasoningEffort: "",
@@ -204,32 +214,14 @@ export const [state, setState] = createStore<AppStore>({
   connected: false,
   agent: null,
   settings: null,
-  modelOptions: {
-    lyra: null,
-    devin: null,
-    claude: null,
-    codex: null,
-    codebuddy: null,
-    workbuddy: null,
-    unsupported: null,
-  },
+  modelOptions: { lyra: null },
   logs: [],
   loadingThread: false,
   liveUsage: null,
-  quota: null,
-  modelCosts: null,
   update: null,
   updateStaging: false,
   updatePromptAt: 0,
-  slashCommands: {
-    lyra: [],
-    devin: [],
-    claude: [],
-    codex: [],
-    codebuddy: [],
-    workbuddy: [],
-    unsupported: [],
-  },
+  slashCommands: { lyra: [] },
   updateProgress: null,
   relay: { enabled: false, connected: false },
   peers: [],
@@ -314,7 +306,7 @@ function resetExpanded(): void {
   setExpandedRevision((revision) => revision + 1);
 }
 
-/** 可选模型列表（来自 devin）。
+/** 可选模型列表（来自各后端）。
  *  source 显式传入时用它（漫游用对端列表；传 null 表示对端该后端无列表 → 空）；
  *  不传则用本机全局 modelOptions。 */
 export function modelChoices(
@@ -370,61 +362,6 @@ export function normalizeUnifiedMode(m?: string | null): "build" | undefined {
   return undefined;
 }
 
-function selectedModelChoice(agentKind: AgentKind, model: string): ModelChoice | undefined {
-  const choices = modelChoices(agentKind);
-  return (
-    choices.find((m) => m.value === model) ??
-    choices.find(
-      (m) =>
-        m._meta?.["codex.ai/default"] === true ||
-        m._meta?.["codebuddy.ai/default"] === true,
-    ) ??
-    choices[0]
-  );
-}
-
-/** Claude / CodeBuddy 等 ACP 后端的档位已折进模型选项，不再单独下发。 */
-const EFFORT_AGENT_KINDS: AgentKind[] = ["codex"];
-
-/** 建会话/切后端时随线程下发的思考强度；不支持的后端传 null。 */
-function threadEffort(agentKind: AgentKind, reasoningEffort: string): string | null {
-  return EFFORT_AGENT_KINDS.includes(agentKind) ? reasoningEffort || null : null;
-}
-
-export function reasoningEffortChoices(
-  agentKind: AgentKind = state.agentKind,
-  model: string = state.model,
-): EffortChoice[] {
-  if (!EFFORT_AGENT_KINDS.includes(agentKind)) return [];
-  if (agentKind === "codex") {
-    const selected = selectedModelChoice(agentKind, model);
-    const raw = selected?._meta?.["codex.ai/supportedReasoningEfforts"];
-    if (Array.isArray(raw)) {
-      return raw
-        .map((e) => {
-          if (typeof e === "string") return { value: e, name: e } satisfies EffortChoice;
-          if (e && typeof e === "object") {
-            const obj = e as Record<string, unknown>;
-            const value = obj.value ?? obj.reasoningEffort;
-            const name = obj.name ?? value;
-            if (typeof value === "string" && typeof name === "string") {
-              return {
-                value,
-                name,
-                description:
-                  typeof obj.description === "string" ? obj.description : undefined,
-              } satisfies EffortChoice;
-            }
-          }
-          return null;
-        })
-        .filter((e): e is EffortChoice => !!e);
-    }
-  }
-  const opts = state.modelOptions[agentKind]?.configOptions?.find((o) => o.id === "effort");
-  return ((opts?.options as EffortChoice[] | undefined) ?? []).filter((e) => !!e.value);
-}
-
 const modelOptionsLoading = new Set<AgentKind>();
 /** Lyra 配置文件当前声明的默认模型；用于配置热更新时同步新会话页。 */
 export const [lyraConfigDefaultModel, setLyraConfigDefaultModel] = createSignal("");
@@ -456,24 +393,9 @@ export async function ensureModelOptions(agentKind: AgentKind) {
   }
 }
 
-/** 某后端在设置里是否启用。Claude / WorkBuddy 默认关闭，其余缺字段按启用处理。 */
+/** 只有 Lyra 可启用；未知或未迁移的后端不能执行。 */
 function agentEnabled(s: Settings, k: AgentKind): boolean {
-  switch (k) {
-    case "lyra":
-      return s.lyraEnabled !== false;
-    case "claude":
-      return s.claudeEnabled === true;
-    case "devin":
-      return s.devinEnabled !== false;
-    case "codex":
-      return s.codexEnabled !== false;
-    case "codebuddy":
-      return s.codebuddyEnabled !== false;
-    case "workbuddy":
-      return s.workbuddyEnabled === true;
-    default:
-      return false;
-  }
+  return k === "lyra" && s.lyraEnabled !== false;
 }
 
 /** 设置中已启用的模型后端（按固定顺序）。
@@ -493,13 +415,6 @@ export function sceneModel(scene: SceneKey): ModelTarget {
   if (target) return target;
   const label = SCENES.find((item) => item.key === scene)?.label ?? scene;
   throw new Error(`「${label}」场景没有可用模型，请在设置 → 场景模型中配置`);
-}
-
-/** 把 agentKind 收敛到「已启用」集合：已启用则原样返回，否则回退到第一个启用项 */
-export function resolveEnabledAgentKind(kind: AgentKind): AgentKind {
-  if (!isSupportedAgentKind(kind)) return "unsupported";
-  const list = enabledAgentKinds();
-  return list.includes(kind) ? kind : (list[0] ?? kind);
 }
 
 let refreshThreadsRequest = 0;
@@ -559,22 +474,6 @@ export async function refreshThreads() {
 
 export async function refreshProjects() {
   setState("projects", await api.listProjects());
-}
-
-export async function refreshQuota() {
-  try {
-    setState("quota", await api.getQuota());
-  } catch {
-    // 网络不可用等场景静默失败，保留上次数据
-  }
-}
-
-export async function refreshModelCosts() {
-  try {
-    setState("modelCosts", await api.getModelCosts());
-  } catch {
-    // 拉取失败仅丢失费用展示，不影响选模型
-  }
 }
 
 function normalizePeers(raw: { peers: Peer[] } | Peer[]): Peer[] {
@@ -995,6 +894,7 @@ export async function createRoamingThread(
   worktreeBranch = "",
   worktreeBase = "",
 ): Promise<string> {
+  if (!isSupportedAgentKind(agentKind)) throw new Error(`不支持的后端：${agentKind || "未指定"}，迁移未完成`);
   const t = await api.createRoamingThread(
     peer.token,
     peer.name,
@@ -1017,17 +917,17 @@ export async function createRoamingThread(
     proposedPlan: null,
     cwd: t.cwd,
     title: t.title,
-    agentKind: t.agentKind ?? agentKind,
+    agentKind: t.agentKind,
     model: t.model ?? "",
     mode: t.mode ?? "",
-    reasoningEffort: "",
+    reasoningEffort: t.reasoningEffort ?? "",
     roamingPeer: peer.token,
     loadingThread: false,
   });
   setState("running", t.id, false);
   reportActivity(true);
   void refreshThreads();
-  void ensureModelOptions(t.agentKind ?? agentKind);
+  void ensureModelOptions(t.agentKind);
   ensurePeerModels(peer.token);
   return t.id;
 }
@@ -1085,7 +985,7 @@ function rememberCurrentThreadSnapshot() {
 
 function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileItems = false) {
   batch(() => {
-    const agentKind = thread.agentKind ?? "devin";
+    const agentKind = thread.agentKind;
     if (reconcileItems) {
       setState("items", reconcile(thread.items, { key: "id" }));
     }
@@ -1261,7 +1161,7 @@ export async function openThread(id: string) {
         proposedPlan: null,
         cwd: meta?.cwd ?? "",
         title: meta?.title ?? "",
-        agentKind: meta?.agentKind ?? state.agentKind,
+        agentKind: meta?.agentKind ?? "",
         model: meta?.model ?? "",
         mode: "",
         reasoningEffort: "",
@@ -1289,7 +1189,7 @@ export async function openThread(id: string) {
     if (request !== openThreadRequest) return;
     // 空闲子 Agent 仍可收到排队消息/关闭日志，不一定伴随新轮次使缓存失效。
     if (cached && switching && !cached.subagent && !staleThreadSnapshots.has(id)) {
-      const agentKind = cached.agentKind ?? "devin";
+      const agentKind = cached.agentKind;
       const roamingPeer = cached.roamingRole === "guest" ? cached.roamingPeer ?? null : null;
       if (roamingPeer) ensurePeerModels(roamingPeer);
       else void ensureModelOptions(agentKind);
@@ -1299,7 +1199,7 @@ export async function openThread(id: string) {
     traceThreadSwitch(id, "getThread(IPC) 返回");
     if (request !== openThreadRequest) return;
     rememberThreadSnapshot(t);
-    const agentKind = t.agentKind ?? "devin";
+    const agentKind = t.agentKind;
     if (cached) {
       if (state.currentId !== id) return;
       showThreadSnapshot(t, false, true);
@@ -1374,12 +1274,13 @@ export async function createThread(
   worktreeBase = "",
   clueCardId = "",
 ): Promise<string> {
+  if (!isSupportedAgentKind(agentKind)) throw new Error(`不支持的后端：${agentKind || "未指定"}，迁移未完成`);
   const t = await api.createThread(
     cwd,
     agentKind,
     model || null,
     mode || null,
-    threadEffort(agentKind, reasoningEffort),
+    reasoningEffort || null,
     ephemeral,
     worktree,
     worktreeBranch.trim() || null,
@@ -1387,11 +1288,9 @@ export async function createThread(
     clueCardId || null,
   );
   rememberThreadSnapshot(t);
-  const storedAgentKind = t.agentKind ?? agentKind;
+  const storedAgentKind = t.agentKind;
   lastUsed.setMode(storedAgentKind, t.mode ?? "");
-  if (EFFORT_AGENT_KINDS.includes(storedAgentKind)) {
-    lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
-  }
+  lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
   setState("expanded", reconcile({}));
   setState({
     currentId: t.id,
@@ -1514,6 +1413,7 @@ export function createThreadOptimistic(
   clueCardId: string,
   autoScene = "",
 ): void {
+  if (!isSupportedAgentKind(agentKind)) throw new Error(`不支持的后端：${agentKind || "未指定"}，迁移未完成`);
   const pendingId = PENDING_THREAD_PREFIX + crypto.randomUUID();
   setState("expanded", reconcile({}));
   setState({
@@ -1546,7 +1446,7 @@ export function createThreadOptimistic(
         agentKind,
         model || null,
         mode || null,
-        threadEffort(agentKind, reasoningEffort),
+        reasoningEffort || null,
         ephemeral,
         false,
         null,
@@ -1557,11 +1457,9 @@ export function createThreadOptimistic(
       );
       createdId = t.id;
       rememberThreadSnapshot(t);
-      const storedAgentKind = t.agentKind ?? agentKind;
+      const storedAgentKind = t.agentKind;
       lastUsed.setMode(storedAgentKind, t.mode ?? "");
-      if (storedAgentKind === "codex") {
-        lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
-      }
+      lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
       // 用户可能已切走：仅在仍停留在该占位会话时才接管界面。
       if (state.currentId === pendingId) {
         optimisticHandoffs.set(t.id, pendingId);
@@ -1609,33 +1507,22 @@ export function createThreadOptimistic(
 /** 记住最近一次选择的模型/模式，作为新会话默认值 */
 export const lastUsed = {
   agentKind: (): AgentKind => {
-    const raw = localStorage.getItem("fd:lastAgentKind") as AgentKind | null;
-    // Vega 已移除：旧的 alkaid 选择指向 Lyra。
-    if (!raw || raw === ("alkaid" as AgentKind)) return "lyra";
-    return isSupportedAgentKind(raw) ? raw : "unsupported";
+    const kind = localStorage.getItem("fd:lastAgentKind");
+    // alkaid 是 Lyra 旧名；孤立的 lastUsedModel 来源未知，不能默认挂到 Lyra。
+    return kind === "alkaid" ? "lyra" : kind ?? (localStorage.getItem("fd:lastUsedModel") !== null ? "" : "lyra");
   },
   setAgentKind: (v: AgentKind) => localStorage.setItem("fd:lastAgentKind", v),
-  model: (agentKind: AgentKind = "devin") => {
+  model: (agentKind: AgentKind = "lyra") => {
     if (agentKind !== lastUsed.agentKind()) return "";
-    return (
-      localStorage.getItem("fd:lastUsedModel") ??
-      localStorage.getItem(`fd:${agentKind}:lastModel`) ??
-      (agentKind === "devin" ? localStorage.getItem("fd:lastModel") ?? "" : "")
-    );
+    return localStorage.getItem("fd:lastUsedModel") ?? localStorage.getItem(`fd:${agentKind}:lastModel`) ?? "";
   },
   /** 与 lastModel 成对保存的友好名；选项未到时触发器先显示它，避免闪裸 id */
-  modelName: (agentKind: AgentKind = "devin") => {
+  modelName: (agentKind: AgentKind = "lyra") => {
     if (agentKind !== lastUsed.agentKind()) return "";
-    return (
-      localStorage.getItem("fd:lastUsedModelName") ??
-      localStorage.getItem(`fd:${agentKind}:lastModelName`) ??
-      (agentKind === "devin" ? localStorage.getItem("fd:lastModelName") ?? "" : "")
-    );
+    return localStorage.getItem("fd:lastUsedModelName") ?? localStorage.getItem(`fd:${agentKind}:lastModelName`) ?? "";
   },
-  mode: (agentKind: AgentKind = "devin") =>
-    localStorage.getItem(`fd:${agentKind}:lastMode`) ??
-    (agentKind === "devin" ? localStorage.getItem("fd:lastMode") ?? "" : ""),
-  reasoningEffort: (agentKind: AgentKind = "codex") =>
+  mode: (agentKind: AgentKind = "lyra") => localStorage.getItem(`fd:${agentKind}:lastMode`) ?? "",
+  reasoningEffort: (agentKind: AgentKind = "lyra") =>
     localStorage.getItem(`fd:${agentKind}:lastReasoningEffort`) ?? "",
   setModel: (agentKind: AgentKind, v: string, name?: string | null) => {
     const prevModel = lastUsed.model(agentKind);
@@ -1687,6 +1574,7 @@ export function isSubagentThread(id: string | null = state.currentId): boolean {
 export async function setThreadModel(model: string) {
   const id = state.currentId;
   if (!id || isSubagentThread(id)) return;
+  await assertThreadBackend(id);
   setState("model", model);
   try {
     await api.setThreadModel(id, model || null);
@@ -1697,34 +1585,29 @@ export async function setThreadModel(model: string) {
   }
 }
 
-/** 进行中的会话切换模型：同 agent 仅换模型；跨 agent（Devin⇄Codex）连同 agent 一起切，
- *  旧 remote 会话作废、上下文不互通，由后端补一条系统提示。 */
+/** 只切换 Lyra 模型。自动迁移未完成的旧会话在此由用户显式选择 Lyra 模型改绑，
+ *  后端校验来源（仅待迁移旧会话）并保留历史。 */
 export async function pickThreadModel(agentKind: AgentKind, model: string) {
+  if (!isSupportedAgentKind(agentKind)) throw new Error(`不支持的后端：${agentKind || "未指定"}，迁移未完成`);
   const id = state.currentId;
-  if (!id || isSubagentThread(id)) return;
-  if (agentKind === state.agentKind) {
-    await setThreadModel(model);
+  if (id && !isSubagentThread(id) && !isSupportedAgentKind(state.agentKind)) {
+    try {
+      if (!model) throw new Error("请选择一个具体的 Lyra 模型以完成迁移");
+      await api.bindThreadToLyra(id, model);
+    } catch (error) {
+      void message(String(error), { kind: "error" });
+      throw error;
+    }
+    await openThread(id);
     return;
   }
-  const mode = lastUsed.mode(agentKind);
-  const reasoningEffort = EFFORT_AGENT_KINDS.includes(agentKind)
-    ? lastUsed.reasoningEffort(agentKind)
-    : "";
-  setState({ agentKind, model, mode, reasoningEffort });
-  void ensureModelOptions(agentKind);
-  void refreshSlashCommands(agentKind);
-  try {
-    await api.setThreadAgent(id, agentKind, model || null, mode || null, reasoningEffort || null);
-  } catch {
-    // 切换失败（如运行中）：以后端状态为准，重新加载会话恢复一致
-    await openThread(id);
-  }
+  await setThreadModel(model);
 }
 
 /** 后端主导的后端/模型变更（场景模型失效自动切换、自动模式转交）不经过 pickThreadModel，
  *  按列表 meta 同步当前会话，否则输入栏仍停留在切换前的后端与模型。 */
 function syncThreadAgentFromMeta(meta: ThreadMeta) {
-  const agentKind = meta.agentKind ?? state.agentKind;
+  const agentKind = meta.agentKind;
   if (agentKind === state.agentKind && (meta.model ?? "") === state.model) return;
   const switched = agentKind !== state.agentKind;
   setState({ agentKind, model: meta.model ?? "" });
@@ -1737,6 +1620,7 @@ function syncThreadAgentFromMeta(meta: ThreadMeta) {
 export async function setThreadMode(mode: string) {
   const id = state.currentId;
   if (!id || isSubagentThread(id)) return;
+  await assertThreadBackend(id);
   setState("mode", mode);
   lastUsed.setMode(state.agentKind, mode);
   await api.setThreadMode(id, mode || null);
@@ -1753,14 +1637,6 @@ export async function implementProposedPlan() {
 
 export function dismissProposedPlan() {
   setState("proposedPlan", null);
-}
-
-export async function setThreadReasoningEffort(reasoningEffort: string) {
-  const id = state.currentId;
-  if (!id || isSubagentThread(id)) return;
-  setState("reasoningEffort", reasoningEffort);
-  lastUsed.setReasoningEffort(state.agentKind, reasoningEffort);
-  await api.setThreadReasoningEffort(id, reasoningEffort || null);
 }
 
 export async function deleteThread(id: string) {
@@ -1848,18 +1724,22 @@ async function startStageThread(
   }
 }
 
+async function assertThreadBackend(threadId: string) {
+  const agentKind = threadId === state.currentId
+    ? state.agentKind
+    : state.threads.find((thread) => thread.id === threadId)?.agentKind ?? (await api.getThread(threadId)).agentKind;
+  if (!isSupportedAgentKind(agentKind)) {
+    throw new Error(`不支持的后端：${agentKind || "未指定"}，迁移未完成，不能发送；请在模型选择器中选择 Lyra 模型改绑后继续`);
+  }
+}
+
 /** 处理 /stage、/stage2、/fire、/plan 等内置命令。返回 true 表示已消费。 */
 async function tryBuiltinPrompt(
   threadId: string,
   text: string,
   images: PromptImage[],
 ): Promise<boolean> {
-  const agentKind = threadId === state.currentId
-    ? state.agentKind
-    : state.threads.find((thread) => thread.id === threadId)?.agentKind ?? (await api.getThread(threadId)).agentKind;
-  if (!isSupportedAgentKind(agentKind)) {
-    throw new Error("此后端已移除，请先选择其他后端后再发送");
-  }
+  await assertThreadBackend(threadId);
   const builtInInput = text.trim();
   if (/^\/(?:setup-image|generate-image|edit-image)(?:\s|$)/i.test(builtInInput)) {
     assertBuiltinPrompt(text, images);
@@ -1963,6 +1843,7 @@ export function assertBuiltinPrompt(text: string, images: PromptImage[] = []) {
  */
 async function deliverPrompt(threadId: string, text: string, images: PromptImage[], typed = text) {
   if (isSubagentThread(threadId)) return;
+  await assertThreadBackend(threadId);
   rememberPromptDisplay(text, typed);
   // 后端 user 事件到达前先把用户刚发送的内容上屏，避免首轮仍显示“请在下方输入”。
   // applyUpsert 收到真实 user item 后会移除这个负 id 临时项。
@@ -2187,6 +2068,7 @@ async function createFireThread(
   prompt: string,
 ): Promise<string> {
   const root = await api.getThread(step.rootId);
+  if (!isSupportedAgentKind(root.agentKind)) throw new Error(`不支持的后端：${root.agentKind || "未指定"}，迁移未完成`);
   const thread = await api.createThread(
     root.cwd,
     root.agentKind,
@@ -2293,6 +2175,7 @@ export async function startFireRelay(
   // 首页刚创建会话后会立即发送首条提示，此时异步 refreshThreads 可能尚未完成；
   // 直接读取后端快照，不能依赖列表中已经出现该会话。
   const root = await api.getThread(rootId);
+  if (!isSupportedAgentKind(root.agentKind)) throw new Error(`不支持的后端：${root.agentKind || "未指定"}，迁移未完成`);
   if (root.roamingRole) {
     throw new Error("/fire 仅支持本地普通会话");
   }
@@ -2441,6 +2324,7 @@ export async function installChromeExtensionWithJianlai(status: { chromePath: st
 export async function editUserMessage(itemId: number, text: string, images: PromptImage[] = []) {
   let id = state.currentId;
   if (!id || isSubagentThread(id) || (!text.trim() && images.length === 0)) return;
+  await assertThreadBackend(id);
   assertBuiltinPrompt(text, images);
   // 历史分支预览中发生编辑时，先恢复对应快照；随后的 truncate_thread 会自动
   // 从被编辑提示词处截断并创建新分支，无需用户先手动执行时间跳跃。
@@ -2766,11 +2650,6 @@ type OptionsEvent =
       options: ModelOptions;
     };
 
-type CommandsEvent = {
-  agentKind: AgentKind;
-  commands: unknown;
-};
-
 function firstString(...values: unknown[]): string | undefined {
   return values.find((v): v is string => typeof v === "string");
 }
@@ -2815,6 +2694,8 @@ export const [restoreSettled, setRestoreSettled] = createSignal(false);
 export async function initStore() {
   if (initialized) return;
   initialized = true;
+  await migrateLocalModelSelections();
+  if (modelMigrationWarnings.length) showToast(modelMigrationWarnings.join("；"), 10_000);
   // 无新消息也结算采样窗口：首块及时显示，工具执行/等待期间归零。
   setInterval(() => {
     for (const threadId of rateWindows.keys()) {
@@ -2827,15 +2708,12 @@ export async function initStore() {
   // 重验可能在其余监听串行注册期间完成，磁盘已更新但当前窗口仍停在旧列表。
   await listen<OptionsEvent>("acp:options", (e) => {
     const payload = e.payload;
-    if ("options" in payload && "agentKind" in payload) {
+    if ("options" in payload && "agentKind" in payload && isSupportedAgentKind(payload.agentKind)) {
       setModelOptions(payload.agentKind, payload.options);
       syncLyraConfigDefaultModel(payload.agentKind, payload.options);
       const model = lastUsed.model(payload.agentKind);
       const name = modelChoices(payload.agentKind).find((c) => c.value === model)?.name;
       if (model && name) lastUsed.setModelName(payload.agentKind, name);
-    } else {
-      setModelOptions("devin", payload as ModelOptions);
-      syncLyraConfigDefaultModel("devin", payload as ModelOptions);
     }
   });
 
@@ -2843,29 +2721,26 @@ export async function initStore() {
   // 后面的 listen 仍照常尽早注册；但不会再因为逐个 await listen 而拖慢设置页回显。
   const settingsReady = api.getSettings().then((settings) => {
     let resolvedSettings = settings;
-    if (settings.modelFavorites.length > 0) {
-      setModelFavoriteIds(settings.modelFavorites);
-      localStorage.setItem(MODEL_FAVORITES_KEY, JSON.stringify(settings.modelFavorites));
-    } else if (modelFavoriteIds().length > 0) {
-      resolvedSettings = { ...settings, modelFavorites: modelFavoriteIds() };
-      void api.setSettings(resolvedSettings).catch(() => {});
+    // Rust migrates settings; bootstrap migrates localStorage. Preserve both sources,
+    // including unmapped favorites, rather than overwriting the latter with settings.
+    const favorites = [...new Set([...settings.modelFavorites, ...modelFavoriteIds()])];
+    setModelFavoriteIds(favorites);
+    if (!localModelMigrationFailed) localStorage.setItem(MODEL_FAVORITES_KEY, JSON.stringify(favorites));
+    if (!localModelMigrationFailed && JSON.stringify(favorites) !== JSON.stringify(settings.modelFavorites)) {
+      resolvedSettings = { ...settings, modelFavorites: favorites };
+      void api.setSettings(resolvedSettings).catch(error => {
+        showToast(`模型收藏保存失败，本地副本已保留：${String(error)}`, 10_000);
+      });
     }
     const preferredAgent = lastUsed.agentKind();
-    const initialAgent = agentEnabled(resolvedSettings, preferredAgent)
+    const initialAgent = !isSupportedAgentKind(preferredAgent) || agentEnabled(resolvedSettings, preferredAgent)
       ? preferredAgent
       : (ALL_AGENT_KINDS.find((kind) => agentEnabled(resolvedSettings, kind)) ?? preferredAgent);
     if (isThemePref(resolvedSettings.theme) && resolvedSettings.theme !== state.theme) {
       setTheme(resolvedSettings.theme);
     }
     setState({ settings: resolvedSettings, agentKind: initialAgent });
-    // 后端先返回上次缓存，并在进程内只后台重验一次；CodeBuddy / WorkBuddy 即使不是当前后端也要
-    // 静默同步云端动态模型，选择器打开时继续展示旧列表，不清空、不阻塞。
     void ensureModelOptions(initialAgent);
-    for (const kind of ["codebuddy", "workbuddy"] as const) {
-      if (initialAgent !== kind && agentEnabled(resolvedSettings, kind)) {
-        void ensureModelOptions(kind);
-      }
-    }
     return { settings: resolvedSettings, initialAgent };
   }).catch((error: unknown) => {
     // 设置读取失败也不能让窗口永久隐藏；此时沿用 localStorage 的首帧主题。
@@ -3042,14 +2917,6 @@ export async function initStore() {
         "permissions",
         state.permissions.filter((p) => p.requestKey !== e.payload.requestKey),
       );
-    }),
-
-    listen<Status>("acp:status", (e) => {
-      setState({ connected: e.payload.connected, agent: e.payload.agent });
-    }),
-
-    listen<CommandsEvent>("acp:commands", (e) => {
-      setState("slashCommands", e.payload.agentKind, normalizeSlashCommands(e.payload.commands));
     }),
 
     // 后端可用性只用于设置页的 CLI 缺失提示；选择器是否展示完全由启用开关决定。
@@ -3277,21 +3144,18 @@ export async function initStore() {
   // 的关键路径阻塞 settings/团队状态/会话列表。
   void api
     .getStatus()
-    .then((status) => setState({ connected: status.connected, agent: status.agent }))
+    .then((status) => {
+      setState({ connected: status.connected, agent: status.agent });
+      const warnings = [...new Set([...modelMigrationWarnings, ...(status.migrationWarnings ?? [])])];
+      if (warnings.length) showToast(`模型迁移提示：${warnings.join("；")}`, 10_000);
+    })
     .catch(() => {
-      // 连接状态拉取失败不影响使用，后端连上后会通过 acp:status 事件补正
+      // Status failure must not hide local migration errors.
+      if (modelMigrationWarnings.length) showToast(modelMigrationWarnings.join("；"), 10_000);
     });
   void api.getLogs().then((logs) => setState("logs", logs)).catch(() => {});
   // 其他后端在用户切换或打开模型选择器时按需加载。
   void refreshSlashCommands(initialAgent);
-
-  // 额度：启动拉取一次，之后每 10 分钟刷新；模型费用基本不变，失败时随额度周期重试
-  void refreshQuota();
-  void refreshModelCosts();
-  setInterval(() => {
-    void refreshQuota();
-    if (!state.modelCosts) void refreshModelCosts();
-  }, 10 * 60 * 1000);
 
   // 漫游模型后台静默「更新」：每 5 分钟强制刷新一轮在线队友的模型列表，
   // 让对端后端配置变化（启用/关闭某后端、换模型）能被及时同步，而无需用户手动重试。

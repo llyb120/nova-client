@@ -1708,9 +1708,15 @@ fn proxy_client(proxy: &str, local_login: bool) -> reqwest::Client {
     if let Ok(parsed) = reqwest::Proxy::all(&url) {
         builder = builder.proxy(parsed);
     }
-    let client = builder.build().expect("Lyra HTTP client");
-    clients.insert(key, client.clone());
-    client
+    let mut model = model.clone();
+    model.base_url = super::local_auth::endpoint(source)?.into();
+    model.api = if source == "codex" { "openai-responses" } else { "anthropic-messages" }.into();
+    // 认证只发往固定上游，不继承第三方路由、Host、Authorization 或模型覆盖的 headers。
+    model.headers = headers;
+    model.session_affinity_headers = source == "codex";
+    model.session_affinity_format = "openai".into();
+    model.supports_long_cache_retention = false;
+    Ok(model)
 }
 
 /// 一次流式模型调用，不在此重试：重试统一由 turn 循环按退避处理。取消时返回 stop_reason = aborted。

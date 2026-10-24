@@ -79,7 +79,7 @@ findListener(init);
 const timer = init.body.statements.find((node) => ts.isExpressionStatement(node)
   && node.expression.expression?.getText(file) === "setInterval");
 assert.ok(listener && timer);
-for (const backend of ["lyra", "codebuddy"]) {
+for (const backend of ["lyra", "snapshot"]) {
   let receive, tick;
   const view = { currentId: backend, running: { [backend]: true }, items: [], loadingThread: false };
   const runtime = vm.createContext({

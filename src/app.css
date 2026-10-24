@@ -842,22 +842,6 @@ button {
   background: color-mix(in srgb, var(--tea) 14%, transparent);
 }
 
-.thread-agent.devin,
-.agent-badge.devin {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 36%, transparent);
-  background: color-mix(in srgb, var(--accent) 13%, transparent);
-}
-
-.thread-agent.codebuddy,
-.agent-badge.codebuddy,
-.thread-agent.workbuddy,
-.agent-badge.workbuddy {
-  color: var(--yellow);
-  border-color: color-mix(in srgb, var(--yellow) 36%, transparent);
-  background: color-mix(in srgb, var(--yellow) 13%, transparent);
-}
-
 .thread-ephemeral {
   flex-shrink: 0;
   height: 16px;
@@ -4119,40 +4103,6 @@ button {
   color: var(--text-muted);
 }
 
-/* Devin 后端内的紧凑额度信息 */
-.backend-quota-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-height: 28px;
-  padding-top: 4px;
-  border-top: 1px solid var(--card-border);
-}
-.backend-quota-value {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text-dim);
-}
-.backend-quota-value.low {
-  color: var(--red);
-}
-.backend-quota-refresh {
-  margin-left: auto;
-  flex-shrink: 0;
-  white-space: nowrap;
-  font-size: 11.5px;
-}
-
-.backend-quota-row .field-label {
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-
-.backend-quota-row .field-hint {
-  flex: 1;
-  min-width: 0;
-}
-
 /* 模型后端配置卡片 */
 .backend-card {
   display: flex;
@@ -6805,14 +6755,15 @@ button.clue-bar-item:hover,
 
 /* About / update channel: make channel identity and the selected side unmistakable. */
 .update-channel-field { gap: 9px; }
-.update-channel-card { display: flex; align-items: stretch; justify-content: space-between; gap: 18px; padding: 14px; border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border)); border-radius: 12px; background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 7%, var(--bg-panel)), var(--bg-panel)); }
+.update-channel-card { display: flex; flex-wrap: wrap; align-items: stretch; justify-content: space-between; gap: 18px; padding: 14px; border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border)); border-radius: 12px; background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 7%, var(--bg-panel)), var(--bg-panel)); }
 .update-channel-status { display: flex; align-items: center; min-width: 0; gap: 10px; }
 .update-channel-status > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
 .update-channel-status strong { color: var(--text); font-size: 13px; }
 .update-channel-status span:not(.update-channel-dot) { color: var(--text-muted); font-size: 11px; line-height: 1.45; }
 .update-channel-dot { width: 10px; height: 10px; flex: 0 0 auto; border: 2px solid color-mix(in srgb, var(--accent) 28%, var(--bg-panel)); border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent), 0 0 14px color-mix(in srgb, var(--accent) 45%, transparent); }
 .update-channel-dot.pre-release { background: #c58cff; box-shadow: 0 0 0 4px rgba(197,140,255,.12), 0 0 14px rgba(197,140,255,.45); }
-.update-channel-control { display: grid; width: 270px; flex: 0 0 auto; grid-template-columns: 1fr 1fr; gap: 5px; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--bg) 65%, transparent); }
+.update-channel-dot.develop { background: #f0ad4e; box-shadow: 0 0 0 4px rgba(240,173,78,.12), 0 0 14px rgba(240,173,78,.45); }
+.update-channel-control { display: grid; width: min(360px, 100%); flex: 0 0 auto; grid-template-columns: repeat(3, 1fr); gap: 5px; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--bg) 65%, transparent); }
 .update-channel-control button { display: flex; min-height: 48px; flex-direction: column; align-items: flex-start; justify-content: center; gap: 2px; padding: 7px 11px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text-muted); cursor: pointer; font: inherit; text-align: left; transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease; }
 .update-channel-control button span { font-size: 12px; font-weight: 700; }
 .update-channel-control button small { font-size: 10px; opacity: .75; }

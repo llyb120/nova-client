@@ -2,7 +2,7 @@
 use super::bridge::Emit;
 use super::history::text_content;
 use super::turn::TurnOutcome;
-use crate::sdk_runtime::SdkManager;
+use super::runtime::LyraRuntime;
 use crate::threads::{AgentKind, Thread};
 use crate::AppState;
 use serde_json::{json, Value};
@@ -13,7 +13,7 @@ use tauri::{Emitter, Manager};
 #[derive(Clone)]
 pub(super) struct Stage {
     app: tauri::AppHandle,
-    manager: Arc<SdkManager>,
+    manager: Arc<LyraRuntime>,
     thread_id: String,
 }
 

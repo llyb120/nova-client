@@ -25,7 +25,6 @@ import {
   openThread,
   refreshSlashCommands,
   resolveAvailableModel,
-  resolveEnabledAgentKind,
   roamingPeers,
   sendPrompt,
   setView,
@@ -68,7 +67,7 @@ export function HomeView() {
   );
   createEffect(() => setHomeTerminalCwd(cwd()));
   const [agentKind, setAgentKind] = createSignal<AgentKind>(
-    resolveEnabledAgentKind(sessionSeed?.agentKind ?? lastUsed.agentKind()),
+    sessionSeed?.agentKind ?? lastUsed.agentKind(),
   );
   // 默认沿用上一次使用的模型；模式固定 Build（Plan 仅由 /plan 启动）。
   const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(agentKind()));
@@ -97,19 +96,12 @@ export function HomeView() {
   let wtBranchRef: HTMLInputElement | undefined;
   // 漫游首次同步时优先保留从当前会话继承的模型。
   let preferSeedModelOnRoamSync = !!sessionSeed?.roam && !!sessionSeed.model;
-  let lastPrewarmKey = "";
-  let lastPrewarmAt = 0;
   let lastRoamModelSyncKey = "";
   let scratchLoading = false;
   let submittingPrompt = false;
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
-  type PrewarmTarget = {
-    cwd?: string;
-    agentKind?: AgentKind;
-    mode?: string;
-  };
 
   const resizeInput = () => {
     if (!textareaRef) return;
@@ -208,41 +200,6 @@ export function HomeView() {
       ro?.disconnect();
       window.removeEventListener("resize", sync);
     });
-  });
-
-  const prewarmCurrent = (target: PrewarmTarget = {}) => {
-    if (!state.settings || roam()) return;
-    const p = target.cwd ?? cwd();
-    if (!p) return;
-    const nextAgentKind = target.agentKind ?? agentKind();
-    if (!isSupportedAgentKind(nextAgentKind)) return;
-    const nextMode = target.mode ?? mode();
-    const key = `${nextAgentKind}\n${p}\n${nextMode}`;
-    if (key === lastPrewarmKey && Date.now() - lastPrewarmAt < 15_000) return;
-    lastPrewarmKey = key;
-    lastPrewarmAt = Date.now();
-    const shouldRestoreFocus = document.activeElement === textareaRef;
-    const selectionStart = textareaRef?.selectionStart ?? null;
-    const selectionEnd = textareaRef?.selectionEnd ?? null;
-    void api.prewarm(p, nextAgentKind, nextMode || null).catch((error) => {
-      if (lastPrewarmKey === key) lastPrewarmKey = "";
-      console.warn("prewarm failed", error);
-    }).finally(() => {
-      if (!shouldRestoreFocus || !textareaRef) return;
-      textareaRef.focus();
-      if (selectionStart !== null && selectionEnd !== null) {
-        textareaRef.setSelectionRange(selectionStart, selectionEnd);
-      }
-    });
-  };
-
-  // 恢复项目/草稿和切换模式也要预热，把用户阅读、输入的时间用于启动 ACP。
-  createEffect(() => {
-    if (!state.settings || roam()) return;
-    const target = { cwd: cwd(), agentKind: agentKind(), mode: mode() };
-    if (!target.cwd) return;
-    const timer = setTimeout(() => prewarmCurrent(target), 150);
-    onCleanup(() => clearTimeout(timer));
   });
 
   const pickModel = (v: string) => {
@@ -344,13 +301,6 @@ export function HomeView() {
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => {
     if (!usesPeerModels()) void ensureModelOptions(agentKind());
-  });
-
-  // 当前选中的后端若被设置里关闭，回退到第一个启用的后端（漫游时后端由对端决定，跳过）
-  createEffect(() => {
-    if (usesPeerModels()) return;
-    const next = resolveEnabledAgentKind(agentKind());
-    if (next !== agentKind()) pickModelAgent(next);
   });
 
   // worktree 是否可用：漫游（对方仓库交给 host 校验）或本地当前目录是 git 仓库
@@ -510,7 +460,6 @@ export function HomeView() {
     noteFlow.bump();
     if (typedSlash) void refreshSlashCommands(agentKind());
     updateSlashState(el, typedSlash || trackingSlash);
-    if (el.value.trim()) prewarmCurrent();
   };
 
   const composerPlaceholder = () => {
@@ -905,9 +854,7 @@ export function HomeView() {
           <Show when={slashQuery() !== null}>
             <div ref={slashMenuRef} class="slash-menu">
               <div class="slash-menu-head">
-                {agentKind() === "codex"
-                  ? "Codex skills / commands"
-                  : `${agentLabel(agentKind())} commands`}
+                {agentLabel(agentKind())} commands
               </div>
               <Show
                 when={slashSuggestions().length > 0}

@@ -7,7 +7,7 @@ import {
   resolveAvailableModel,
   state,
 } from "../store";
-import { isSupportedAgentKind, type AgentKind, type ModelCost, type ModelOptions } from "../types";
+import { isSupportedAgentKind, type AgentKind, type ModelOptions } from "../types";
 import { agentLabel } from "../utils";
 import { foldEfforts as foldModelEfforts, splitEffort } from "../modelEfforts";
 import { SearchSelect, type SelectOption } from "./SearchSelect";
@@ -15,24 +15,8 @@ import { SearchSelect, type SelectOption } from "./SearchSelect";
 /** 模型/模式选项来源：漫游时返回对端（host）的列表；返回 undefined 表示用本机全局列表。 */
 export type ModelOptionsSource = (agentKind: AgentKind) => ModelOptions | null | undefined;
 
-const PROVIDER_LABEL: Record<string, string> = {
-  MODEL_PROVIDER_ANTHROPIC: "Claude",
-  MODEL_PROVIDER_OPENAI: "GPT",
-  MODEL_PROVIDER_GOOGLE: "Gemini",
-  MODEL_PROVIDER_WINDSURF: "Windsurf",
-  MODEL_PROVIDER_MOONSHOT: "Kimi",
-  MODEL_PROVIDER_DEEPSEEK: "DeepSeek",
-  MODEL_PROVIDER_XAI: "Grok",
-  MODEL_PROVIDER_ZHIPU: "GLM",
-};
-
-/** 厂商分组：优先用后端 provider 字段，缺失时按命名启发式归类 */
-function groupOf(value: string, name: string, cost?: ModelCost): string {
-  // Codex Radar Auto ultimately selects a GPT model, so keep it alongside the
-  // GPT choices instead of creating a separate group.
-  if (value.startsWith("__nova_auto_")) return "GPT";
-  const byProvider = cost?.provider && PROVIDER_LABEL[cost.provider];
-  if (byProvider) return byProvider;
+/** 厂商分组：按模型名称归类，Lyra provider 在上一级展示。 */
+function groupOf(value: string, name: string): string {
   const v = `${value} ${name}`.toLowerCase();
   if (v.includes("claude") || v.includes("fable") || v.includes("opus") || v.includes("sonnet"))
     return "Claude";
@@ -65,22 +49,7 @@ function decodeModelValue(value: string): { agentKind: AgentKind; model: string 
   return { agentKind, model: decodeURIComponent(value.slice(i + 1)) };
 }
 
-/** 积分倍率文案；Devin 已直接提供 token 单价，不再展示模型乘数。 */
-function multiplierText(agentKind: AgentKind, cost?: ModelCost): string | undefined {
-  if (agentKind === "devin") return undefined;
-  if (!cost) return undefined;
-  if (cost.pricing && cost.pricing !== "MODEL_PRICING_TYPE_STATIC_CREDIT") return undefined;
-  return `${cost.multiplier ?? 0}×`;
-}
-
-/** token 单价文案（输入/输出，美元每 1M tokens） */
-function priceText(cost?: ModelCost): string | undefined {
-  const p = cost?.prices;
-  if (!p || (p.input == null && p.output == null)) return undefined;
-  return `$${fmt(p.input ?? 0)}/$${fmt(p.output ?? 0)}`;
-}
-
-/** CodeBuddy / WorkBuddy 的积分倍率随 description 下发："x0.79 credits" 或 "x0.79"。 */
+/** 本地 CodeBuddy / WorkBuddy provider 的积分倍率随 description 下发。 */
 function creditsText(description?: string): string | undefined {
   if (!description) return undefined;
   const m = description.match(/^\s*[x×]\s*(\d+(?:\.\d+)?)\s*$/i)
@@ -88,21 +57,6 @@ function creditsText(description?: string): string | undefined {
   if (!m) return /credits/i.test(description) ? description.trim() : undefined;
   const n = Number(m[1]);
   return Number.isFinite(n) ? `${fmt(n)}×` : `${m[1]}×`;
-}
-
-/** 附注悬停说明：完整单价 + 倍率参考 */
-function detailTitle(agentKind: AgentKind, cost?: ModelCost): string | undefined {
-  if (!cost) return undefined;
-  const parts: string[] = [];
-  const p = cost.prices;
-  if (p && (p.input != null || p.output != null)) {
-    parts.push(
-      `每 1M tokens：输入 $${fmt(p.input ?? 0)} · 缓存命中 $${fmt(p.cached ?? 0)} · 输出 $${fmt(p.output ?? 0)}`,
-    );
-  }
-  const mult = multiplierText(agentKind, cost);
-  if (mult) parts.push(`积分倍率：${mult}（参考）`);
-  return parts.length ? parts.join("\n") : undefined;
 }
 
 /** 把某后端的模型列表映射为下拉选项；merged 时附带后端信息并编码 value。
@@ -116,7 +70,6 @@ export function modelOptionsOf(
   foldEfforts = false,
 ): SelectOption[] {
   if (!isSupportedAgentKind(agentKind)) return [];
-  const costs = state.modelCosts;
   const encode = (value: string) => (merged ? encodeModelValue(agentKind, value) : value);
   const config = (source !== undefined ? source : state.modelOptions[agentKind])?.configOptions;
   const effortConfig = config?.find((o) => o.id === "thought_level");
@@ -130,31 +83,21 @@ export function modelOptionsOf(
     if (typeof effort === "string" && effort) {
       defaultEfforts.set(splitEffort(m.value, agentKind === "lyra")?.[0] ?? m.value, effort);
     }
-    // Devin 的 ACP 思考档位是合成后缀，费用表仍按基础 modelUid 索引。
-    const cost = costs?.[m.value] ?? (agentKind === "devin"
-      ? costs?.[splitEffort(m.value, false)?.[0] ?? m.value]
-      : undefined);
     const metaVision =
       m._meta?.["cognition.ai/supportsImages"] ?? m._meta?.["codex.ai/supportsImages"];
-    const price = priceText(cost);
-    const mult = multiplierText(agentKind, cost);
-    // CodeBuddy / WorkBuddy 使用模型 description 里的积分倍率
+    // 本地 provider 使用模型 description 里的积分倍率
     const credits = creditsText(m.description);
     return {
       value: encode(m.value),
       label: m.name,
       title: m.value,
-      group: groupOf(m.value, m.name, cost),
+      group: groupOf(m.value, m.name),
       // 在折叠强度前展开 provider，确保父模型与各档位指向同一个一级分组。
-      backend: merged ? (agentKind === "lyra" ? `lyra:${m.value.split("/")[0]}` : agentKind) : undefined,
+      backend: merged ? `lyra:${m.value.split("/")[0]}` : undefined,
       backendLabel: merged ? agentLabel(agentKind) : undefined,
-      // token 单价为主；没有单价的模型（促销/私有）退回显示倍率；CodeBuddy 退回积分倍率
-      detail: price ?? mult ?? credits,
-      detail2: price ? mult : undefined,
-      detailTitle:
-        detailTitle(agentKind, cost) ??
-        (credits && m.description ? `积分倍率：${m.description.trim()}` : undefined),
-      vision: cost?.supportsImages ?? (typeof metaVision === "boolean" ? metaVision : false),
+      detail: credits,
+      detailTitle: credits && m.description ? `积分倍率：${m.description.trim()}` : undefined,
+      vision: typeof metaVision === "boolean" ? metaVision : false,
       favoriteId: `${agentKind}:${encodeURIComponent(m.value)}`,
     };
   });
@@ -213,7 +156,6 @@ export function ModelPicker(props: {
   };
   const backendOptions = createMemo(() =>
     kinds().flatMap((kind) => {
-      if (kind !== "lyra") return [{ id: kind, label: agentLabel(kind) }];
       const seen = new Map<string, string>();
       for (const o of modelOptionsOf("lyra", true, props.modelSource?.("lyra"), true)) {
         const p = lyraProviders(o);
@@ -266,10 +208,10 @@ export function ModelPicker(props: {
   };
 
   const fallbackLabel = createMemo(() => {
-    if (!isSupportedAgentKind(props.agentKind)) return agentLabel(props.agentKind);
+    if (!isSupportedAgentKind(props.agentKind)) return `${agentLabel(props.agentKind)}${props.model ? ` / ${props.model}` : ""}`;
     if (props.modelSource) return undefined;
     const name = lastUsed.modelName(props.agentKind);
-    return props.model && name ? name : undefined;
+    return props.model && props.model === lastUsed.model(props.agentKind) && name ? name : undefined;
   });
 
   return (

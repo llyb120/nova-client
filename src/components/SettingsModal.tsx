@@ -12,7 +12,6 @@ import {
   deleteThreads,
   enabledAgentKinds,
   installChromeExtensionWithJianlai,
-  refreshQuota,
   refreshRelayStatus,
   setState,
   setTheme,
@@ -37,7 +36,6 @@ import type {
   AgentInstructionTarget,
   PromptTrigger,
   AgentKind,
-  CliStatus,
   Peer,
   SessionShortcut,
   SessionShortcutAction,
@@ -72,10 +70,6 @@ function resolveShortcutRoam(target: string): { peer: Peer; folder: string } | n
       } satisfies Peer),
     folder: parsed.folder,
   };
-}
-
-function quotaPercent(value: number): number {
-  return Math.max(0, Math.min(100, Math.round(value)));
 }
 
 const DEFAULT_RELAY_SERVER = "";
@@ -221,7 +215,7 @@ const TABS: { id: SettingsTab; name: string; group: string }[] = [
   { id: "env", name: "环境变量", group: "常规" },
   { id: "scenes", name: "场景模型", group: "模型与 Agent" },
   { id: "lyra", name: "Lyra", group: "模型与 Agent" },
-  { id: "backends", name: "模型后端", group: "模型与 Agent" },
+  { id: "backends", name: "Lyra 维护", group: "模型与 Agent" },
   { id: "instructions", name: "Agent 配置", group: "模型与 Agent" },
   { id: "skills", name: "Skills", group: "模型与 Agent" },
   { id: "meteor", name: "Meteor", group: "工具与协作" },
@@ -233,7 +227,7 @@ const TABS: { id: SettingsTab; name: string; group: string }[] = [
 
 // 首次运行引导：第 1 步配置后端（含 Lyra），第 2 步配置场景模型。
 const ONBOARDING_STEPS: { title: string; tabs: SettingsTab[] }[] = [
-  { title: "配置模型后端", tabs: ["lyra", "backends", "team"] },
+  { title: "配置 Lyra", tabs: ["lyra", "team"] },
   { title: "配置场景模型", tabs: ["scenes"] },
 ];
 
@@ -272,8 +266,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [claudeProxy, setClaudeProxy] = createSignal(s?.claudeProxy ?? "");
   const [claudeEnabled, setClaudeEnabled] = createSignal(s?.claudeEnabled === true);
   const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
-  const [acpArgs, setAcpArgs] = createSignal(s?.acpArgs ?? "acp");
-  const [codebuddyPath, setCodebuddyPath] = createSignal(s?.codebuddyPath ?? "codebuddy");
   const [workbuddyPath, setWorkbuddyPath] = createSignal(s?.workbuddyPath ?? "");
   const [codexPath, setCodexPath] = createSignal(s?.codexPath ?? "codex");
   const [codexProxy, setCodexProxy] = createSignal(s?.codexProxy ?? "");
@@ -310,11 +302,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [customEnvVars, setCustomEnvVars] = createSignal<{ name: string; value: string }[]>(
     Object.entries(s?.customEnvVars ?? {}).map(([name, value]) => ({ name, value })),
   );
-  const [devinEnabled, setDevinEnabled] = createSignal(s?.devinEnabled !== false);
   const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
-  const [codexEnabled, setCodexEnabled] = createSignal(s?.codexEnabled !== false);
-  const [codebuddyEnabled, setCodebuddyEnabled] = createSignal(s?.codebuddyEnabled !== false);
-  const [workbuddyEnabled, setWorkbuddyEnabled] = createSignal(s?.workbuddyEnabled === true);
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
   const [sceneModels, setSceneModels] = createSignal<SceneModels>(
     Object.fromEntries(SCENES.map(({ key }) => [key, (s?.sceneModels?.[key] ?? []).map((t) => ({ ...t }))])) as SceneModels,
@@ -367,25 +355,12 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [environmentRefreshing, setEnvironmentRefreshing] = createSignal(false);
   const [environmentRefreshMsg, setEnvironmentRefreshMsg] = createSignal("");
   const [environmentRefreshFailed, setEnvironmentRefreshFailed] = createSignal(false);
-  const [cliStatuses, setCliStatuses] = createSignal<Partial<Record<AgentKind, CliStatus>>>({});
-  const [cliLoading, setCliLoading] = createSignal(false);
-  const [quotaRefreshing, setQuotaRefreshing] = createSignal(false);
-
-  const reloadQuota = async () => {
-    setQuotaRefreshing(true);
-    try {
-      await refreshQuota();
-    } finally {
-      setQuotaRefreshing(false);
-    }
-  };
-
 
   const restartAgents = async () => {
     setRestarting(true);
     setRestartMsg("");
     try {
-      await api.restartDevin();
+      await api.restartAgents();
       setRestartMsg("已重启所有 agent 进程");
       setTimeout(() => setRestartMsg(""), 4000);
     } catch (e) {
@@ -410,24 +385,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     }
   };
 
-  // 至少保留一个启用的后端：是最后一个时不允许关闭
-  const enabledCount = () =>
-    [
-      devinEnabled(),
-      claudeEnabled(),
-      lyraEnabled(),
-      codexEnabled(),
-      codebuddyEnabled(),
-      workbuddyEnabled(),
-    ].filter(Boolean).length;
+  const sceneAgentKinds = createMemo(() => lyraEnabled() ? ALL_AGENT_KINDS : []);
 
-  const sceneAgentKinds = createMemo(() => ALL_AGENT_KINDS.filter((kind) => ({
-    lyra: lyraEnabled(), devin: devinEnabled(), claude: claudeEnabled(),
-    codex: codexEnabled(), codebuddy: codebuddyEnabled(), workbuddy: workbuddyEnabled(), unsupported: false,
-  })[kind]));
-
-  const sceneRowKinds = (kind: AgentKind): AgentKind[] =>
-    sceneAgentKinds().includes(kind) ? sceneAgentKinds() : [...sceneAgentKinds(), kind];
+  const sceneRowKinds = (_kind: AgentKind): AgentKind[] => sceneAgentKinds();
   const editScene = (key: SceneKey, edit: (list: SceneModels[SceneKey]) => SceneModels[SceneKey]) =>
     setSceneModels((current) => ({ ...current, [key]: edit(current[key]) }));
   const moveSceneModel = (key: SceneKey, index: number, delta: number) =>
@@ -578,8 +538,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     }
   };
 
-  // 后端可用性检测结果：false = 已检测且未找到 CLI（卡片上提示，仍可手动改路径）
-  const backendMissing = (kind: string) => state.backendAvailability[kind] === false;
 
   const verifyRelay = async () => {
     setVerifying(true);
@@ -602,11 +560,11 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [version, setVersion] = createSignal("");
   const [checking, setChecking] = createSignal(false);
   const [checkResult, setCheckResult] = createSignal("");
-  const [updateChannel, setUpdateChannel] = createSignal<"release" | "pre-release">(
-    s?.updateChannel === "pre-release" ? "pre-release" : "release",
+  const [updateChannel, setUpdateChannel] = createSignal<Settings["updateChannel"]>(
+    s?.updateChannel ?? "release",
   );
   onMount(() => void getVersion().then(setVersion));
-  const changeUpdateChannel = (channel: "release" | "pre-release") => {
+  const changeUpdateChannel = (channel: Settings["updateChannel"]) => {
     if (channel === updateChannel()) return;
     // 这里只修改设置草稿；取消弹窗不会切换通道，也不会触发下载。
     setUpdateChannel(channel);
@@ -629,8 +587,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     claudeProxy: claudeProxy().trim(),
     claudeEnabled: claudeEnabled(),
     devinPath: devinPath().trim() || "devin",
-    acpArgs: acpArgs().trim() || "acp",
-    codebuddyPath: codebuddyPath().trim() || "codebuddy",
     workbuddyPath: workbuddyPath().trim(),
     codexPath: codexPath().trim() || "codex",
     codexProxy: codexProxy().trim(),
@@ -662,13 +618,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     meteorClipboard: meteorClipboard(),
     meteorPasteShortcut: meteorPasteShortcut().trim(),
     jianpuShortcut: jianpuShortcut().trim(),
-    devinEnabled: devinEnabled(),
     lyraEnabled: lyraEnabled(),
-    codexEnabled: codexEnabled(),
-    codebuddyEnabled: codebuddyEnabled(),
-    workbuddyEnabled: workbuddyEnabled(),
-    codexIntegration: "app-server",
-    codebuddyIntegration: "acp",
     worktreeDir: worktreeDir().trim(),
     updateChannel: updateChannel(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
@@ -680,26 +630,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
         .map((item) => [item.name.trim(), item.value] as const)
         .filter(([name]) => name.length > 0),
     ),
-  });
-
-  const refreshCliStatuses = async () => {
-    setCliLoading(true);
-    try {
-      const statuses = await api.getCliStatuses(draftSettings());
-      const next: Partial<Record<AgentKind, CliStatus>> = {};
-      for (const status of statuses) next[status.agentKind] = status;
-      setCliStatuses(next);
-    } finally {
-      setCliLoading(false);
-    }
-  };
-
-  let backendsLoaded = false;
-  createEffect(() => {
-    if (tab() !== "backends" || backendsLoaded) return;
-    backendsLoaded = true;
-    void refreshCliStatuses();
-    void reloadQuota();
   });
 
   createEffect(() => {
@@ -981,7 +911,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       // 先写 Lyra 配置：校验失败时整体中止，不会只保存一半。
       await saveLyraConfig?.();
       await api.setSettings(settings);
-      setState("settings", settings);
+      // 后端不再推送连接状态；Lyra 开关即连接状态（与 get_status 的 agent_enabled 一致）。
+      setState({ settings, connected: settings.lyraEnabled !== false });
       // 只有设置成功持久化后才确认通道切换；检查与下载在后台进行，不阻塞保存或关闭弹窗。
       if (updateChannelChanged) {
         void checkAndStageUpdate().catch((error) =>
@@ -1076,7 +1007,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           <Show when={props.onboarding}>
             <p class="settings-group-desc">
               {step() === 0
-                ? "先启用并配置至少一个能提供模型的后端：在 Lyra 中添加模型服务商，或在「模型后端」中启用已安装并登录的 Claude Code、Codex 等。需要团队协作 / 漫游 / server 支持时，在「团队」中填写团队中转站地址和身份 token（可跳过）。点「下一步」会保存并启动这些后端。"
+                ? "在 Lyra 中添加模型服务商。本地 Codex / Claude Code 优先使用 CLI 自定义 API，否则使用内置订阅反代，无需 Node 或独立 Agent。需要团队协作 / 漫游 / server 支持时，在「团队」中填写中转站地址和身份 token（可跳过）。点「下一步」会保存配置并加载模型。"
                 : "为每个场景选择至少一个模型。后端刚启动时模型列表可能需要稍等；仍没有可选模型时请返回上一步检查后端配置。以后可在「设置」中修改。"}
             </p>
           </Show>
@@ -1537,7 +1468,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  默认开启，支持 Lyra 和 CodeBuddy。切换后会更新会话目录及所属项目；CodeBuddy 会恢复会话并继续任务。关闭后不提供目录切换工具。
+                  默认开启，支持 Lyra。切换后会更新会话目录及所属项目。关闭后不提供目录切换工具。
                 </span>
               </div>
               <div class="field">
@@ -1619,7 +1550,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <input
                     type="checkbox"
                     checked={lyraEnabled()}
-                    disabled={lyraEnabled() && enabledCount() === 1}
+                    disabled={lyraEnabled()}
                     onChange={(e) => setLyraEnabled(e.currentTarget.checked)}
                   />
                   <span>启用 Lyra</span>
@@ -1664,111 +1595,18 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               <p class="field-hint">需要 Node.js 22+。安装 ACP adapter，并先通过 Claude Code 登录，或在环境变量中配置 ANTHROPIC_API_KEY；此处填写 claude-agent-acp，而不是 claude。Nova 工具通过会话 MCP 自动挂载。</p>
             </div>
 
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class={`agent-badge devin`}>{agentLabel("devin")}</span>
-                <span class="fixed-integration">ACP</span>
-                <Show when={backendMissing("devin")}>
-                  <span class="backend-missing">未检测到 CLI</span>
-                </Show>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={devinEnabled()}
-                    disabled={devinEnabled() && enabledCount() === 1}
-                    onChange={(e) => setDevinEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-              </div>
-              <CliManager status={cliStatuses().devin} loading={cliLoading()} />
-              <div class="backend-fields">
-                <label class="backend-field">
-                  <span class="field-label">可执行文件</span>
+            <details class="lyra-advanced">
+              <summary>本地 provider 连接设置</summary>
+              <div class="lyra-detail-body">
+                <p class="field-hint">以下设置仅用于 Lyra 的本地 provider，不会启用独立后端。需先在对应产品中登录，再在下方添加 provider。</p>
+                <label class="field">
+                  <span class="field-label">Devin 可执行文件</span>
                   <input class="field-input" value={devinPath()} onInput={(e) => setDevinPath(e.currentTarget.value)} placeholder="devin" />
                 </label>
-                <label class="backend-field">
-                  <span class="field-label">启动参数</span>
-                  <input class="field-input" value={acpArgs()} onInput={(e) => setAcpArgs(e.currentTarget.value)} placeholder="acp" />
-                </label>
-              </div>
-              <ProxyField value={devinProxy()} onInput={setDevinProxy} />
-              <div class="backend-quota-row">
-                <span class="field-label">额度</span>
-                <Show
-                  when={state.quota}
-                  fallback={<span class="field-hint">{quotaRefreshing() ? "读取中…" : "暂不可用"}</span>}
-                >
-                  <span classList={{ "backend-quota-value": true, low: state.quota!.dailyPercent < 20 }}>
-                    日 {quotaPercent(state.quota!.dailyPercent)}%
-                  </span>
-                  <span classList={{ "backend-quota-value": true, low: state.quota!.weeklyPercent < 20 }}>
-                    周 {quotaPercent(state.quota!.weeklyPercent)}%
-                  </span>
-                  <Show when={state.quota!.flexCredits != null}>
-                    <span class="backend-quota-value">积分 {state.quota!.flexCredits}</span>
-                  </Show>
-                </Show>
-                <button
-                  type="button"
-                  class="link-btn backend-quota-refresh"
-                  disabled={quotaRefreshing()}
-                  onClick={() => void reloadQuota()}
-                >
-                  {quotaRefreshing() ? "刷新中…" : "刷新"}
-                </button>
-              </div>
-            </div>
-
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class={`agent-badge codebuddy`}>{agentLabel("codebuddy")}</span>
-                <span class="fixed-integration">SDK</span>
-                <Show when={backendMissing("codebuddy")}>
-                  <span class="backend-missing">未检测到 CLI</span>
-                </Show>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={codebuddyEnabled()}
-                    disabled={codebuddyEnabled() && enabledCount() === 1}
-                    onChange={(e) => setCodebuddyEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-              </div>
-              <CliManager status={cliStatuses().codebuddy} loading={cliLoading()} />
-              <div class="backend-fields">
-                <label class="backend-field">
-                  <span class="field-label">可执行文件</span>
-                  <input class="field-input" value={codebuddyPath()} onInput={(e) => setCodebuddyPath(e.currentTarget.value)} placeholder="codebuddy" />
-                </label>
-              </div>
-              <ProxyField value={codebuddyProxy()} onInput={setCodebuddyProxy} />
-            </div>
-
-            <div class="backend-card">
-              <div class="backend-card-head">
-                <span class="agent-badge workbuddy">{agentLabel("workbuddy")}</span>
-                <span class="fixed-integration">ACP</span>
-                <Show when={backendMissing("workbuddy")}>
-                  <span class="backend-missing">未检测到 CLI</span>
-                </Show>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={workbuddyEnabled()}
-                    disabled={workbuddyEnabled() && enabledCount() === 1}
-                    onChange={(e) => setWorkbuddyEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-              </div>
-              <CliManager status={cliStatuses().workbuddy} loading={cliLoading()} />
-              <div class="backend-fields">
-                <label class="backend-field">
+                <label class="field">
                   <span class="field-label">WorkBuddy 路径</span>
                   <input class="field-input" value={workbuddyPath()} onInput={(e) => setWorkbuddyPath(e.currentTarget.value)} placeholder="留空自动查找 WorkBuddy" />
+                  <span class="field-hint">支持安装目录、WorkBuddy.exe 或内置 CLI 路径；用于定位本地 provider 登录和连接信息。</span>
                 </label>
               </div>
               <ProxyField value={workbuddyProxy()} onInput={setWorkbuddyProxy} />
@@ -1802,10 +1640,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               <ProxyField value={codexProxy()} onInput={setCodexProxy} />
             </div>
 
-            <p class="field-hint">
-              修改后端配置会重启对应 agent 进程，进行中的会话将被打断（上下文下次发消息时自动恢复）。
-              未检测到 CLI 的后端不会出现在新建会话的后端列表里（保存后会自动重新检测）。
-            </p>
+          {/* ===== 模型后端 ===== */}
+          <Show when={tab() === "backends"}>
+            <p class="field-hint">仅支持 Lyra。Codex / Claude Code 通过本地 provider 使用；历史会话由启动迁移接入，无法映射的模型不会自动替换。</p>
             <div class="field">
               <button
                 class="btn secondary"
@@ -2453,8 +2290,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 <div class="update-channel-status">
                   <span class={`update-channel-dot ${updateChannel()}`} aria-hidden="true" />
                   <div>
-                    <strong>{updateChannel() === "release" ? "正式版通道" : "预发布版通道"}</strong>
-                    <span>{updateChannel() === "release" ? "稳定更新，适合日常使用" : "优先体验新功能，可能包含未完全验证的改动"}</span>
+                    <strong>{updateChannel() === "release" ? "正式版通道" : updateChannel() === "develop" ? "开发版通道" : "预发布版通道"}</strong>
+                    <span>{updateChannel() === "release" ? "稳定更新，适合日常使用" : updateChannel() === "develop" ? "跟随 develop 分支的最新构建，可能不稳定" : "优先体验新功能，可能包含未完全验证的改动"}</span>
                   </div>
                 </div>
                 <div class="seg-control update-channel-control" role="radiogroup" aria-label="更新通道">
@@ -2480,9 +2317,20 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                     <span>Pre-release</span>
                     <small>预发布版</small>
                   </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={updateChannel() === "develop"}
+                    classList={{ active: updateChannel() === "develop" }}
+                    disabled={checking()}
+                    onClick={() => void changeUpdateChannel("develop")}
+                  >
+                    <span>Develop</span>
+                    <small>开发版</small>
+                  </button>
                 </div>
               </div>
-              <span class="field-hint">切换后会立即检查并下载目标通道的最新版，版本号较低时也会切换。</span>
+              <span class="field-hint">保存设置后会立即检查并下载目标通道的最新版，版本号较低时也会切换。</span>
             </div>
 
             <div class="field">

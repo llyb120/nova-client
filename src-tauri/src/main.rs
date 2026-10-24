@@ -205,14 +205,10 @@ fn main() {
         std::process::exit(rtk::run_embedded(std::iter::once(program).chain(args)));
     }
 
-    // MCP stdio must run before GUI setup and single-instance enforcement.
     if nova_lib::image_generation::maybe_run() { return; }
-    if nova_lib::maybe_run_codex_mcp() {
-        return;
-    }
 
     // Finder / Dock 启动的 macOS .app 不继承终端 PATH。必须在任何 CLI 探测或
-    // 后端线程启动前恢复，否则已安装的 codex、npx 等都会被误判为不可用。
+    // 后端线程启动前恢复，否则 Lyra 的 shell 工具无法使用终端中的程序。
     nova_lib::init_process_path();
 
     if let Some(result) = nova_lib::maybe_run_server_command() {

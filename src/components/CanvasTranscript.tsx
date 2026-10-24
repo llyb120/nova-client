@@ -16,7 +16,7 @@ import { promptDisplayOf } from "../promptDisplay";
 import { advanceStreamText, latestStreamTextItem, STREAM_PREBUFFER_MS } from "../streamReveal";
 import { resolveExpandScroll, resolveScrollAfterLayout, resolveUserScrollStick } from "../scrollStick";
 import type { Item, PermissionRequest, PromptImage, ToolItem, UserItem } from "../types";
-import { displayToolTitle, isTrivialToolOutput, stripAnsi, toolHeadlineDetail, toolDisplayText } from "../utils";
+import { displayToolTitle, stripAnsi, toolDisplayText } from "../utils";
 import { createFileContextMenu } from "./FileContextMenu";
 import { createImageAttachments, ImageAttachmentStrip, takeWarmImage } from "./ImageAttachmentStrip";
 import type { Group } from "./TurnGroup";
@@ -1926,18 +1926,12 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     const busy = item.status === "pending" || item.status === "in_progress";
     const defaultOpen = active || busy;
     const open = isExpanded(key, defaultOpen);
-    // 摘要展示优化仅对 Devin 生效
-    const isDevin = state.agentKind === "devin";
-    const contentBlocks = isDevin
-      ? item.content.filter((block) => !isTrivialToolOutput(item, block))
-      : item.content;
+    const contentBlocks = item.content;
     const hasBody = contentBlocks.length > 0 || item.locations.length > 0
       || item.rawInput !== undefined || item.rawOutput !== undefined;
 
-    // Canvas 的 fillText 不会按制表位展开；工具标题（以及 Devin 的独立详情）
-    // 可能直接带有命令参数中的真实 tab，先展开后再测量和绘制，避免详情错位。
+    // Canvas 的 fillText 不会按制表位展开，工具标题中的真实 tab 先展开再测量和绘制。
     const label = expandCodeTabs(displayToolTitle(stripAnsi(item.title || item.kind)));
-    const detail = isDevin ? expandCodeTabs(toolHeadlineDetail(item)) : "";
     // .tool-row margin 1px 0; .tool-line padding 3px 8px; min-height 26; gap 8
     const toolH = 26;
 
@@ -1955,7 +1949,7 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
       fontSize: 12, font: p.mono, hoverBg: busy ? undefined : p.hover, borderRadius: 7,
       cursor: hasBody ? "pointer" : "default",
       data: {
-        open, busy, hasBody, kind: item.kind, status: item.status, detail,
+        open, busy, hasBody, kind: item.kind, status: item.status,
         durationMs, startedAt: item.ts,
       },
       clickAction: hasBody ? () => {
@@ -2418,11 +2412,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
   }
 
   function paintToolHeader(ctx: CanvasRenderingContext2D, b: Block, bx: number, by: number, p: Palette) {
-    const { open, busy, hasBody, kind, status, detail, durationMs, startedAt } = b.data as {
+    const { open, busy, hasBody, kind, status, durationMs, startedAt } = b.data as {
       open: boolean; busy: boolean; hasBody: boolean; kind: string; status: string;
-      detail?: string; durationMs?: number; startedAt?: number;
+      durationMs?: number; startedAt?: number;
     };
-    // padding 3px 8px; gap 8 — match DOM .tool-line: icon → title/detail → duration → status → chevron
+    // padding 3px 8px; gap 8 — match DOM .tool-line: icon → title → duration → status → chevron
     const padX = 8;
     const gap = 8;
     const midY = snap(by + b.h / 2);
@@ -2452,37 +2446,11 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     ctx.fillStyle = b.color || p.dim;
     ctx.textBaseline = "middle";
     const maxTextW = Math.max(20, b.w - (textX - bx) - trailReserve);
-    // 有 detail 时标题只占部分宽度，给详情文本留空间（对齐 DOM .tool-headline-detail）
-    const labelMaxW = detail ? Math.max(60, Math.floor(maxTextW * 0.45)) : maxTextW;
-    const label = ellipsize(b.text!, labelMaxW, b.fontSize!, b.font!);
+    const label = ellipsize(b.text!, maxTextW, b.fontSize!, b.font!);
     fillTextCrisp(ctx, label, textX, midY);
 
-    const labelW = measure(label, b.fontSize!, b.font!);
-    let detailEndX = textX + labelW;
-    // detail：标题后 gap 8 + 1px 分隔线 + padding 8（对齐 DOM .tool-title + .tool-headline-detail）
-    if (detail) {
-      const sepX = textX + labelW + gap;
-      const detailX = sepX + 1 + 8;
-      const detailMaxW = bx + b.w - trailReserve - detailX;
-      if (detailMaxW > 24) {
-        const text = ellipsize(detail, detailMaxW, b.fontSize!, b.font!);
-        ctx.save();
-        ctx.strokeStyle = p.border;
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        const sx = snap(sepX);
-        ctx.moveTo(sx, midY - 6);
-        ctx.lineTo(sx, midY + 6);
-        ctx.stroke();
-        ctx.restore();
-        ctx.fillStyle = p.faint;
-        fillTextCrisp(ctx, text, detailX, midY);
-        detailEndX = detailX + measure(text, b.fontSize!, b.font!);
-      }
-    }
-
     // trailing duration / status / chevron sit after the visible headline (not flush-right)
-    let nextX = detailEndX + gap;
+    let nextX = textX + measure(label, b.fontSize!, b.font!) + gap;
     if (durationText) {
       ctx.font = `${durationFontSize}px ${p.mono}`;
       ctx.fillStyle = p.faint;
