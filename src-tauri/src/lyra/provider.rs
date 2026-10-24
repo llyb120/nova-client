@@ -1792,6 +1792,17 @@ pub async fn stream_chat(
 
 // ---------- anthropic-messages ----------
 
+/// 从 claude-opus-4-6 / claude-sonnet-4.6 / claude-5-fable / claude-3-5-sonnet 等 ID 取 (主, 次) 版本；
+/// 日期后缀（claude-sonnet-4-20250514）不算次版本。
+fn claude_version(id: &str) -> Option<(u32, u32)> {
+    let id = id.to_ascii_lowercase();
+    let rest = &id[id.find("claude")? + 6..];
+    let mut parts = rest.split(['-', '.', '_']).filter(|p| !p.is_empty()).skip_while(|p| !p.as_bytes()[0].is_ascii_digit());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|p| p.parse().ok()).filter(|m| *m < 100).unwrap_or(0);
+    Some((major, minor))
+}
+
 fn anthropic_thinking_budget(level: Option<&str>, max_output_tokens: u64) -> Option<u64> {
     if max_output_tokens <= 1024 {
         return None;
@@ -2032,10 +2043,9 @@ fn anthropic_body(
             if let Some(level) = thinking_level { body["output_config"]["effort"] = json!(level); }
         }
     } else if model.reasoning && body.get("thinking").is_none() {
-        // ponytail: 无模型能力目录时仅识别已知 4.6 系列；新模型可显式配置 thinking.type。
+        // 无模型能力目录时按 ID 里的版本号判断：Claude 4.6 起为 adaptive thinking。
         let adaptive = model.thinking_format.as_deref() == Some("anthropic")
-            || model.id.contains("opus-4-6") || model.id.contains("opus-4.6")
-            || model.id.contains("sonnet-4-6") || model.id.contains("sonnet-4.6");
+            || claude_version(&model.id).is_some_and(|v| v >= (4, 6));
         if adaptive {
             body["thinking"] = json!({ "type": "adaptive" });
         } else if let Some(budget) = anthropic_thinking_budget(thinking_level, body["max_tokens"].as_u64().unwrap()) {
@@ -2045,6 +2055,9 @@ fn anthropic_body(
     if !minimax && body["thinking"]["type"] == "adaptive" && body.pointer("/output_config/effort").is_none() {
         let effort = if model.thinking_format.as_deref() == Some("anthropic") {
             thinking_level.unwrap_or("high")
+        } else if claude_version(&model.id).is_some_and(|v| v >= (4, 7)) {
+            // 4.7 起 low/medium/high/xhigh/max 各档独立，不能折叠。
+            match thinking_level.unwrap_or("high") { "minimal" => "low", level => level }
         } else { match thinking_level.unwrap_or("high") {
             "minimal" | "low" => "low",
             "medium" => "medium",
@@ -3249,6 +3262,23 @@ mod tests {
         assert_eq!(body["reasoning_effort"], json!("max"));
         assert!(body.get("thinking").is_none());
         assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn claude_versions_pick_adaptive_thinking_and_keep_xhigh() {
+        for (id, version) in [("claude-opus-4-6", Some((4, 6))), ("claude-sonnet-4.6", Some((4, 6))), ("claude-opus-5-5", Some((5, 5))),
+            ("claude-5-fable-low", Some((5, 0))), ("claude-3-5-sonnet-20241022", Some((3, 5))), ("claude-sonnet-4-20250514", Some((4, 0))),
+            ("anthropic/claude-haiku-4-5", Some((4, 5))), ("gpt-5", None)] {
+            assert_eq!(claude_version(id), version, "{id}");
+        }
+        let mut model = test_model("anthropic-messages");
+        model.id = "claude-opus-5-5".into();
+        let xhigh = anthropic_body(&model, "", &[], &[], Some("xhigh"));
+        assert_eq!(xhigh["thinking"]["type"], "adaptive");
+        assert_eq!(xhigh["output_config"]["effort"], "xhigh");
+        assert_eq!(anthropic_body(&model, "", &[], &[], Some("max"))["output_config"]["effort"], "max");
+        model.id = "claude-sonnet-4-5".into();
+        assert_eq!(anthropic_body(&model, "", &[], &[], Some("high"))["thinking"]["type"], "enabled");
     }
 
     #[test]
