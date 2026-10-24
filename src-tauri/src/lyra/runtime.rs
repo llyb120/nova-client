@@ -157,10 +157,6 @@ impl LyraRuntime {
             "mode": mode,
             "reasoningEffort": reasoning_effort,
             "lightweightModel": lightweight_model,
-            "novaToolEnv": crate::auto_tool_env(&self.app.state::<AppState>(), &thread_id)
-                .into_iter()
-                .map(|(name, value)| (name.to_string(), Value::String(value)))
-                .collect::<serde_json::Map<_, _>>(),
             "parts": parts
         });
         let outcome = self

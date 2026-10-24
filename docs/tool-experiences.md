@@ -93,4 +93,4 @@
 - 按网站origin/应用精确隔离，再按中英文词项匹配目标、入口条件与步骤；不做向量检索。同工具不同应用不会混用。最多300条、8MiB；满300条时新保存淘汰最不可信的一条（优先已失效，其次自动轨迹，再次未复用且最旧），若全部已多次验证则报错且原数据保留；需要时可在停止调用后备份并编辑该JSON清理记录。
 - 跨进程文件锁防止多个Nova实例丢失更新；临时文件完整写入后替换，解析失败不覆盖原文件。本机文件不加入漫游同步。
 
-验证：`cargo test --manifest-path src-tauri/Cargo.toml --lib tool_experience`、`node --test scripts/process-display.test.mjs scripts/nova-tools-mcp.test.mjs`。
+验证：`cargo test --manifest-path src-tauri/Cargo.toml --lib tool_experience`、`node --test scripts/process-display.test.mjs`。

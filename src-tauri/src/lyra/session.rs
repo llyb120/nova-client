@@ -501,18 +501,6 @@ pub async fn call(handle: &AgentHandle, parent: &Session, name: &str, args: &Val
     }
 }
 
-/// nova-tools MCP 入口：非 Lyra 后端的自动模式会话只能按场景转交（子任务在场景模型的 Stage 会话里闭环）。
-pub async fn call_for_thread(app: &tauri::AppHandle, thread_id: &str, name: &str, args: &Value) -> Result<Value, String> {
-    let handle = root_handle(&format!("thread:{thread_id}")).with_stage(Some((app.clone(), thread_id.to_string())));
-    match name {
-        "spawn_agent" => scene_spawn(&handle, app, thread_id, args),
-        "list_agents" => Ok(handle.report(args.get("path_prefix").and_then(Value::as_str))),
-        // MCP 客户端单次调用约 120s 超时，等待上限留足余量。
-        "wait_agent" => wait(&handle, None, args, 90_000).await,
-        _ if is_agent_tool(name) => control(&handle, name, args),
-        _ => Err(format!("unknown agent tool: {name}")),
-    }
-}
 
 fn control(handle: &AgentHandle, name: &str, args: &Value) -> Result<Value, String> {
     control_with_parent(handle, None, name, args)

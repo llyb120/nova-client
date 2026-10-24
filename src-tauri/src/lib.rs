@@ -188,9 +188,6 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
     }
 }
 
-/// 供无 AppHandle 上下文的后台入口（如 nova-tools MCP 的场景转交）使用。
-pub(crate) static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
-
 /// 自动模式会话的场景范围。
 #[derive(Debug, PartialEq)]
 pub(crate) struct AutoScope {
@@ -204,10 +201,6 @@ pub(crate) struct AutoScope {
 }
 
 impl AutoScope {
-    pub fn desktop(&self) -> bool {
-        self.covered.contains(&settings::Scene::Computer)
-    }
-
     /// 轻量主会话需要编码时不开 Stage，而是升阶：本会话切到编码模型带上下文继续。
     pub fn escalates(&self) -> bool {
         !self.child && self.scene == settings::Scene::Lightweight && self.handoff.contains(&settings::Scene::Coding)
@@ -318,11 +311,11 @@ fn auto_scope_skips_same_model_and_upstream_scenes() {
     // 剑来与轻量化同模型：轻量主会话自己操作电脑，只转交编码。
     let first = |s: settings::Scene| Some(if s == Coding { code.clone() } else { light.clone() });
     let main = scope_of(Lightweight, &light, &[], first);
-    assert_eq!((main.covered.clone(), main.handoff.clone(), main.desktop(), main.escalates()), (vec![Lightweight, Computer], vec![Coding], true, true));
+    assert_eq!((main.covered.clone(), main.handoff.clone(), main.escalates()), (vec![Lightweight, Computer], vec![Coding], true));
     // 编码子会话需要操作电脑：剑来模型不同且不在上游链上，可以转交；不能推回上游的轻量化。
     let first = |s: settings::Scene| Some(match s { Coding => code.clone(), Computer => (AgentKind::Lyra, "cu".into()), Lightweight => light.clone() });
     let child = scope_of(Coding, &code, &[Lightweight], first);
-    assert_eq!((child.handoff.clone(), child.desktop(), child.escalates(), child.child), (vec![Computer], false, false, true));
+    assert_eq!((child.handoff.clone(), child.escalates(), child.child), (vec![Computer], false, true));
     // 切换为编码模型后的主会话：只能转交剑来，不转回轻量化。
     let escalated = scope_of(Coding, &code, &[], first);
     assert_eq!((escalated.handoff.clone(), escalated.escalates()), (vec![Computer], false));
@@ -466,19 +459,6 @@ fn register_auto_escalation(app: &tauri::AppHandle) {
             }
         });
     });
-}
-
-/// 自动模式会话注入 nova-tools 的环境：线程 id、是否提供桌面/浏览器工具、是否可按场景转交。普通会话为空。
-pub(crate) fn auto_tool_env(state: &AppState, thread_id: &str) -> Vec<(&'static str, String)> {
-    let Some(scope) = auto_scope(state, thread_id) else { return Vec::new() };
-    let mut env = vec![
-        ("NOVA_THREAD_ID", thread_id.to_string()),
-        ("NOVA_DESKTOP", if scope.desktop() { "1" } else { "0" }.into()),
-    ];
-    if !scope.handoff.is_empty() {
-        env.push(("NOVA_SCENE_HANDOFF", "1".into()));
-    }
-    env
 }
 
 pub(crate) fn running_by_id(state: &AppState, thread_id: &str) -> bool {
@@ -5153,7 +5133,6 @@ pub fn run() {
             // server 侧远程会话：空闲只做命令长轮询；运行中按全量 + 增量同步。
             remote::start(app.handle().clone());
             employee::start(app.handle().clone());
-            let _ = APP_HANDLE.set(app.handle().clone());
             // `Nova server config/project ...` 由独立管理进程写盘；运行实例监听提交标记，
             // 无需重启即可同步设置、环境变量与项目白名单。
             start_headless_config_watcher(app.handle().clone());

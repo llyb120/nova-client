@@ -33,7 +33,8 @@ for (const file of ['cli_manager.rs', 'codex_app_server.rs', 'codex_app_server',
 const pkg = JSON.parse(read('package.json'));
 const lock = JSON.parse(read('package-lock.json'));
 assert.ok(pkg.dependencies['@modelcontextprotocol/sdk']);
-assert.ok(pkg.scripts['build:nova-tools-mcp']);
+assert.equal(pkg.scripts['build:nova-tools-mcp'], undefined);
+assert.equal(existsSync(new URL('../scripts/nova-tools-mcp.mjs', import.meta.url)), false, 'Node MCP bridge must stay removed');
 assert.equal(pkg.scripts['test:codex-app-server'], undefined);
 for (const name of ['@tencent-ai/agent-sdk', '@agentclientprotocol/sdk']) {
   assert.equal(pkg.dependencies[name], undefined);

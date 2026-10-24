@@ -94,7 +94,7 @@ npm run tauri build
 
 产物在 `src-tauri/target/release/bundle/` 下。
 
-构建前仅生成通用 `nova-tools-mcp`，保留其 `@modelcontextprotocol/sdk` 依赖；WorkBuddy 登录辅助脚本由 Rust 内嵌。本地 provider 不使用已移除的 agent SDK/ACP 桥。Tauri 未配置整目录资源打包，更新 zip 只收录 Nova 二进制；清理旧脚本或未引用的生成资源不等于安装包会按其文件大小缩减。
+构建只需前端打包，不再生成 Node 版 MCP 桥；WorkBuddy 登录辅助脚本由 Rust 内嵌。本地 provider 不使用已移除的 agent SDK/ACP 桥。Tauri 未配置整目录资源打包，更新 zip 只收录 Nova 二进制；清理旧脚本或未引用的生成资源不等于安装包会按其文件大小缩减。
 
 **Linux 无界面服务器：**
 

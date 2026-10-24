@@ -124,7 +124,7 @@ chrome 的 `press` 支持 Ctrl/Shift/Alt/Meta 与字母、数字、F1–F12、�
 快速测试：
 
 ```text
-node --test scripts/automation-schema.test.mjs scripts/nova-tools-mcp.test.mjs extensions/nova-chrome/worker.test.mjs
+node --test scripts/automation-schema.test.mjs extensions/nova-chrome/worker.test.mjs
 node scripts/browser-precision.test.mjs
 ```
 

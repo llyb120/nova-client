@@ -39,7 +39,7 @@ Nova 和 Chrome 扩展需要同步更新，已安装的扩展请更新至 0.1.9�
 
 ## 验证
 
-运行 node --test extensions/nova-chrome/worker.test.mjs scripts/nova-tools-mcp.test.mjs。
+运行 node --test extensions/nova-chrome/worker.test.mjs。
 Rust 检查使用 cargo test 的 chrome_browser::tests。
 Windows 集成脚本 `node scripts/native-browser-smoke.mjs src-tauri/target/debug/nova.exe` 使用隔离 Nova 配置、独立无头 Chromium fixture 与模拟扩展，验证握手、DOM 输入、图片回传、缩放/裁剪坐标和陈旧画面拒绝；不依赖已移除的内置浏览器。`TEST_BROWSER` 可指定 Chromium/Chrome/Edge 可执行文件，Playwright 仅作测试驱动。真实 Chrome 扩展端到端验证需另行加载扩展。
 

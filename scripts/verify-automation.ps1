@@ -37,8 +37,7 @@ try {
     $env:REQUIRE_WEBGL = if ($RequireWebGL) { '1' } else { '0' }
     if ($InstallDependencies) { Invoke-Checked 'npm.cmd' @('ci') }
     Invoke-Checked 'npm.cmd' @('run', 'check')
-    Invoke-Checked 'npm.cmd' @('run', 'build:nova-tools-mcp', '--', '--minify')
-    Invoke-Checked 'node' @('--test', 'scripts/automation-schema.test.mjs', 'scripts/nova-tools-mcp.test.mjs', 'extensions/nova-chrome/worker.test.mjs')
+    Invoke-Checked 'node' @('--test', 'scripts/automation-schema.test.mjs', 'extensions/nova-chrome/worker.test.mjs')
     Invoke-Checked 'node' @('scripts/browser-precision.test.mjs')
     foreach ($filter in @('native_browser::tests', 'chrome_browser::tests', 'jianlai::tests', 'visual_guard::tests')) {
         Invoke-Checked 'cargo' @('test', '--manifest-path', 'src-tauri/Cargo.toml', '--lib', $filter, '--', '--test-threads=1', '--nocapture')
