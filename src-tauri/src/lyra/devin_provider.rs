@@ -1,4 +1,5 @@
 //! Native Devin inference. The CLI supplies its catalog/version; Rust owns HTTP and streaming.
+//! Without a usable CLI the bundled catalog snapshot (devin_models.json, CLI 3000.11.205) is used.
 //! ponytail: private Connect/Protobuf fields verified against CLI 3000.11.205;
 //! re-run the protocol checks and live tool round trip when Devin changes its wire format.
 use super::config::ResolvedModel;
@@ -15,6 +16,9 @@ use tokio::io::AsyncReadExt;
 
 const LIMIT: usize = 32 * 1024 * 1024;
 const RPC: &str = "/exa.api_server_pb.ApiServerService/GetChatMessage";
+/// ponytail: 离线快照不会自动更新；Devin 上新模型后用 `devin models list --format json` 重新生成。
+const SNAPSHOT_VERSION: &str = "3000.11.205";
+const SNAPSHOT: &str = include_str!("devin_models.json");
 
 fn read_config(path: &Path) -> Result<String, String> {
     let file = std::fs::File::open(path).map_err(|_| "无法读取 Devin 配置，请先运行 devin auth login")?;
@@ -89,6 +93,18 @@ async fn catalog(options: &Value, force: bool) -> Result<Catalog, String> {
             return Ok(cached.clone());
         }
     }
+    let result = match cli_catalog(binary).await {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("[lyra] Devin CLI 不可用，使用内置模型目录：{error}");
+            snapshot()
+        }
+    };
+    cache.lock().unwrap().insert(key, result.clone());
+    Ok(result)
+}
+
+async fn cli_catalog(binary: &str) -> Result<Catalog, String> {
     let parsed: Value = serde_json::from_slice(&cli(binary, &["models", "list", "--format", "json"]).await?)
         .map_err(|_| "Devin 模型目录不是有效 JSON")?;
     let families = parsed["families"].as_array().filter(|v| !v.is_empty()).ok_or("Devin 模型目录缺少 families")?
@@ -96,9 +112,12 @@ async fn catalog(options: &Value, force: bool) -> Result<Catalog, String> {
     let version = cli(binary, &["version"]).await?;
     let version = regex::Regex::new(r"\d+\.\d+\.\d+").unwrap().find(&String::from_utf8_lossy(&version))
         .ok_or("无法解析 Devin CLI 版本")?.as_str().to_string();
-    let result = Catalog { families, version, loaded: Instant::now() };
-    cache.lock().unwrap().insert(key, result.clone());
-    Ok(result)
+    Ok(Catalog { families, version, loaded: Instant::now() })
+}
+
+fn snapshot() -> Catalog {
+    let parsed: Value = serde_json::from_str(SNAPSHOT).expect("bundled Devin catalog");
+    Catalog { families: parsed["families"].as_array().cloned().unwrap_or_default(), version: SNAPSHOT_VERSION.into(), loaded: Instant::now() }
 }
 
 fn catalog_models(catalog: &Catalog) -> Map<String, Value> {
@@ -507,6 +526,14 @@ mod tests {
         let mut decoder = ConnectDecoder::default(); decoder.push(&envelope(b"{}",2)).unwrap(); assert!(decoder.push(&envelope(b"",0)).is_err());
         let mut decoder = ConnectDecoder::default();
         let error = decoder.push(&envelope(br#"{"error":{"code":"secret","message":"secret"}}"#,2)).unwrap_err(); assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn bundled_snapshot_resolves_default_and_effort_models() {
+        let catalog = snapshot();
+        assert!(catalog.families.len() > 10 && catalog.families.iter().all(|f| f["slug"] != "fusion"));
+        assert_eq!(resolve_model(&catalog, "swe-2", None).unwrap(), "swe-2-high");
+        assert!(catalog_models(&catalog).contains_key("claude-opus-4-8-high"));
     }
 
     #[test]
