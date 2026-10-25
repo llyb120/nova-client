@@ -496,7 +496,7 @@
       },
       "fullPage": {
         "type": "boolean",
-        "description": "screenshot默认整页；false为当前视口"
+        "description": "screenshot默认整页；false为当前视口。普通整页的每个文档分片及视口截图各自维护帧流，首次发关键帧，后续只发32×32网格变化块并合并相邻块，不跨未变块；模型上下文每条流只保留当前关键帧组。局部裁剪和expandScroll长图仍返回完整独立图片。增量块仅替换自身区域，latestDeltas按tileRevision叠加，重叠处以较新块为准，readOnly旧块仅供重建。Chrome增量无独立操作imageId：用本次snapshotId和deltaOf指向的基图imageId，块内坐标加该块x/y一次；不换算CSS/DPI。"
       },
       "expandScroll": {
         "type": "boolean",
@@ -545,7 +545,7 @@
           "screenshot",
           "none"
         ],
-        "description": "act/evaluate反馈：默认新DOM（上次有图则附图）；screenshot附视口图；none不返回观察（evaluate仍返回value）"
+        "description": "act/evaluate反馈：默认新DOM（上次有图则附图）；screenshot附视口图，沿用fullPage描述中的分块增量与坐标规则；none不返回观察（evaluate仍返回value）"
       },
       "actions": {
         "type": "array",

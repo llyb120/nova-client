@@ -222,8 +222,37 @@ try {
     const refused=await chromeUi('act',{tabTag:tag,snapshotId:stale.snapshotId,action:{action:'click_at',x:340,y:220}});
     assert.equal(refused.status,'not_executed');assert.match(refused.reason,/画面已变化/);
     assert.equal(await page.evaluate(()=>window.optionClicked),6,'pre-existing visual changes still block input');
+    // Default full-page screenshots use the same merged 32px deltas, per document tile.
+    await page.evaluate(()=>{
+      document.body.style.cssText='margin:0;height:5000px;background:white';
+      document.body.innerHTML='<div id="delta-top" style="position:absolute;left:64px;top:64px;width:64px;height:32px"></div><div id="delta-bottom" style="position:absolute;left:128px;top:4400px;width:32px;height:32px"></div>';
+      scrollTo(0,0);
+    });
+    const fullKey=await chromeUi('screenshot',{tabTag:tag,maxEdge:0});
+    assert.equal(fullKey.fullPage,true);
+    assert.equal(fullKey.totalTiles,2);
+    assert(fullKey.images.every(i=>i.keyframe===true && i.frameStream.includes(':document:')));
+    await page.evaluate(()=>{document.querySelector('#delta-top').style.background='black';document.querySelector('#delta-bottom').style.background='black';});
+    const fullDelta=await chromeUi('screenshot',{tabTag:tag,maxEdge:0});
+    assert.equal(fullDelta.totalTiles,2);assert.equal(fullDelta.nextTile,null);assert.equal(fullDelta.screenshotComplete,true);
+    const patches=fullDelta.images.filter(i=>i.deltaOf);
+    assert(patches.length>=2,JSON.stringify(fullDelta));
+    assert(patches.every(i=>i.pixelWidth<=96&&i.pixelHeight<=64),'distant document changes must not become one bounding box');
+    for(const base of fullDelta.images.filter(i=>!i.deltaOf)) {
+      assert.equal(base.path,undefined);assert.equal(base.frameGroup,fullKey.snapshotId);
+    }
+    const fullSame=await chromeUi('screenshot',{tabTag:tag,maxEdge:0});
+    assert(fullSame.images.every(i=>i.unchanged===true && !i.path));
+    assert.equal(fullSame.screenshotComplete,true);
+    // Script feedback consumes its input snapshot but retains a safe pixel-comparison baseline.
+    const viewKey=await chromeUi('screenshot',{tabTag:tag,fullPage:false,maxEdge:0});
+    const viewDelta=await chromeUi('evaluate',{tabTag:tag,snapshotId:viewKey.snapshotId,feedback:'screenshot',maxEdge:0,
+      expression:'document.querySelector("#delta-top").style.background="red"; true'});
+    assert.equal(viewDelta.status,'executed');
+    assert.equal(viewDelta.images[0].frameGroup,viewKey.images[0].frameGroup);
+    assert(viewDelta.images.some(i=>i.deltaOf),JSON.stringify(viewDelta));
     // expandScroll: an inner viewport-sized scroller (TAPD-like table) is captured in full, then restored.
-    await page.evaluate(()=>{document.documentElement.style.overflow='hidden';document.body.innerHTML='<div id="pane" style="position:fixed;top:40px;left:0;right:0;bottom:0;overflow:auto"><div style="height:3000px">rows</div></div>';});
+    await page.evaluate(()=>{document.documentElement.style.overflow='hidden';document.body.style.cssText='';document.body.innerHTML='<div id="pane" style="position:fixed;top:40px;left:0;right:0;bottom:0;overflow:auto"><div style="height:3000px">rows</div></div>';});
     const viewportHeight=await page.evaluate(()=>innerHeight);
     const tall=await chromeUi('screenshot',{tabTag:tag,expandScroll:true,maxEdge:0});
     assert.equal(tall.scrollExpanded?.complete,true,JSON.stringify(tall.scrollExpanded));

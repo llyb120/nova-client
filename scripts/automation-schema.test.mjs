@@ -44,6 +44,10 @@ test('Chrome retains image coordinates, fast scope and bounded batch schemas',as
   assert.equal(chrome.inputSchema.properties.actions.maxItems,16);
   assert.equal(chrome.inputSchema.properties.incognito.type,"boolean");
   assert.equal(chrome.inputSchema.properties.actions.items.properties.duration_ms.maximum,1500);
+  assert.match(chrome.inputSchema.properties.fullPage.description,/32×32.*合并相邻块/);
+  assert.match(chrome.inputSchema.properties.fullPage.description,/只保留当前关键帧组/);
+  assert.match(chrome.inputSchema.properties.fullPage.description,/deltaOf.*x\/y一次/);
+  assert.match(chrome.inputSchema.properties.fullPage.description,/expandScroll.*完整独立图片/);
 });
 test('short lookahead is available without experience and Chrome exposes a pre-action guard', async()=>{
   const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));

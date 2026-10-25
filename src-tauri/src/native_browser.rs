@@ -160,13 +160,13 @@ fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
     Ok((w, h))
 }
 
-fn screenshot_bytes(data:&str, edge:u32) -> Result<(Vec<u8>,(u32,u32)),String> {
+fn screenshot_pixels(data:&str, edge:u32) -> Result<xcap::image::RgbaImage,String> {
     use base64::Engine;
     let bytes=base64::engine::general_purpose::STANDARD.decode(data).map_err(|e|e.to_string())?;
     png_dimensions(&bytes)?;
     // CDP implementations do not all produce the same pixel dimensions for
     // clip.scale=1. Enforce the budget against the actual PNG, not guessed DPR.
-    encode_screenshot(xcap::image::load_from_memory(&bytes).map_err(|e|e.to_string())?,edge)
+    Ok(resize_screenshot(xcap::image::load_from_memory(&bytes).map_err(|e|e.to_string())?,edge))
 }
 
 fn resize_screenshot(image: xcap::image::DynamicImage, edge: u32) -> xcap::image::RgbaImage {
@@ -175,21 +175,17 @@ fn resize_screenshot(image: xcap::image::DynamicImage, edge: u32) -> xcap::image
     } else { image }.into_rgba8()
 }
 
-fn encode_screenshot(image:xcap::image::DynamicImage, edge:u32) -> Result<(Vec<u8>,(u32,u32)),String> {
-    let image = resize_screenshot(image, edge);
-    Ok((crate::visual_guard::encode_jpeg(&image)?, image.dimensions()))
-}
-
-fn deliver_viewport(observation: &mut Observation, previous: Option<&Observation>, stream: Option<String>,
+fn deliver_screenshot(observation: &mut Observation, previous: Option<&Observation>, stream: Option<String>,
     image: xcap::image::RgbaImage, path: std::path::PathBuf, (x, y, width, height): (f64, f64, f64, f64)) -> Result<Vec<Value>, String> {
     let page = &observation.pages["pages"][0];
-    // Navigation, scroll, zoom, viewport changes or expired captures must start a fresh keyframe.
-    // Crops and full-page tiles stay whole; only the normal viewport has a frame stream.
-    let prior = previous.filter(|p| p.captured.elapsed() <= Duration::from_secs(180)
+    // Both viewport and normal full-page tiles share merged 32px delivery. Crops/exports stay standalone.
+    // Match each document tile independently; identical pixel sizes alone do not prove identical coordinates.
+    let prior = previous.filter(|p| p.captured.elapsed() <= Duration::from_secs(180) && p.full_page == observation.full_page
         && page["stamp"].is_string() && p.pages["pages"][0]["stamp"] == page["stamp"]
         && p.pages["pages"][0]["document"] == page["document"])
-        .and_then(|p| p.images.iter().find_map(|i| i.delivered.as_ref()));
-    let id = format!("{}-0", observation.id);
+        .and_then(|p| p.images.iter().filter(|i| (i.x,i.y,i.width,i.height) == (x,y,width,height))
+            .filter_map(|i| i.delivered.as_ref()).find(|d| Some(&d.stream) == stream.as_ref()));
+    let id = format!("{}-{}", observation.id, observation.images.len());
     let pixels = image.dimensions();
     let mut entry = json!({"imageId":id,"snapshotId":observation.id,"x":x,"y":y,"width":width,"height":height,
         "pixelWidth":pixels.0,"pixelHeight":pixels.1});
@@ -1088,19 +1084,34 @@ async fn snapshot(
                 return Err("tileOffset超出整页截图范围".into());
             }
             // ponytail: at most 4 tiles / 32M CSS pixels per call; nextTile makes huge pages resumable, never silently cropped.
-            for tile in offset..total.min(offset + 4) {
+            let end = total.min(offset + 4);
+            let label = active_label(app)?;
+            let tag = label.rsplit(':').next().unwrap_or(&label);
+            for tile in offset..end {
                 let (dx, dy) = ((tile % columns) as f64 * 2048., (tile / columns) as f64 * 4096.);
                 let (x, y, w, h) = (left + dx, top + dy, (width - dx).min(2048.), (height - dy).min(4096.));
                 let scale=if edge==0 {1.} else {(edge as f64/w.max(h)).min(1.)};
                 let shot=cdp(app,"Page.captureScreenshot",json!({"format":"png","fromSurface":true,"captureBeyondViewport":true,"clip":{"x":x,"y":y,"width":w,"height":h,"scale":scale}}),None,None).await?;
                 let data=shot["data"].as_str().ok_or("截图为空")?;
-                // Lossless PNG straight from CDP; the model-facing copy is still downscaled by the bridge.
-                let (bytes,pixels,ext)=if keep_original && edge==0 {
+                if !keep_original {
+                    let path = dir.join(format!("{}-{tile}.jpg", observation.id));
+                    let pixels = screenshot_pixels(data, edge as u32)?;
+                    let mut parts = deliver_screenshot(&mut observation, previous, Some(format!("{tag}:document:{tile}")),
+                        pixels, path, (x,y,w,h))?;
+                    for part in &mut parts { part["tile"] = json!(tile); }
+                    images.extend(parts);
+                    continue;
+                }
+                // Expanded-scroll exports keep a complete standalone image; never reuse their temporary layout.
+                let (bytes,pixels,ext)=if edge==0 {
                     use base64::Engine;
                     let raw=base64::engine::general_purpose::STANDARD.decode(data).map_err(|e|e.to_string())?;
                     let pixels=png_dimensions(&raw)?;
                     (raw,pixels,"png")
-                } else { let (bytes,pixels)=screenshot_bytes(data,edge as u32)?; (bytes,pixels,"jpg") };
+                } else {
+                    let image = screenshot_pixels(data, edge as u32)?;
+                    (crate::visual_guard::encode_jpeg(&image)?, image.dimensions(), "jpg")
+                };
                 let path = dir.join(format!("{}-{tile}.{ext}", observation.id));
                 std::fs::write(&path,bytes).map_err(|e|e.to_string())?;
                 let image_id=format!("{}-{tile}",observation.id);
@@ -1113,7 +1124,8 @@ async fn snapshot(
                 result["scrollExpanded"]=json!({"viewportHeight":viewport_height,"complete":complete,
                     "note":if complete {"已临时加高视口展开内部滚动区并恢复；图片仅供阅读，坐标操作请用 fullPage=false 截图"} else {"内部滚动区超出安全高度或无法随视口展开，长图仍不完整；图片仅供阅读"}});
             }
-            let next = offset + images.len() as u64;
+            // Pagination counts document tiles, not the variable number of changed patches in images.
+            let next = end;
             result["documentSize"] = json!({"width":width,"height":height});
             result["totalTiles"] = json!(total);
             result["screenshotComplete"] = json!(offset == 0 && next == total);
@@ -1137,13 +1149,14 @@ async fn snapshot(
             let image = resize_screenshot(capture_viewport(app,viewport,x,y,w,h).await?,edge as u32);
             let after=evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?;
             if after!=observation.pages["pages"][0]["stamp"] {return Err("截图期间视口变化，请重新截图".into());}
-            images = deliver_viewport(&mut observation, previous, stream, image, path, (x,y,w,h))?;
-            if images[0]["unchanged"] == true {
-                result["unchangedNotice"] = json!("画面与已交付的关键帧及最新增量无明显差异，未重复发送图片；使用本次 snapshotId/imageId，坐标仍以完整视口图为准。这不代表动作失败，页面仍在加载时可 wait 后观察，不重放输入。回看需同时读 keyframePath 及 latestDeltas中的各块path，增量位置见 x/y。");
-            }
-            if images.iter().any(|i| i["deltaOf"].is_string()) {
-                result["deltaNotice"] = json!("只发送相对关键帧的累计变化区域，取代旧增量；区域外仍与关键帧一致。操作使用本次 snapshotId 和 deltaOf 对应的 imageId：增量图内坐标需加该图 x/y 偏移，区域外直接用关键帧坐标；不要换算 CSS/DPI。");
-            }
+            images = deliver_screenshot(&mut observation, previous, stream, image, path, (x,y,w,h))?;
+        }
+        let bases: Vec<&Value> = images.iter().filter(|i| !i["deltaOf"].is_string()).collect();
+        if !bases.is_empty() && bases.iter().all(|i| i["unchanged"] == true) {
+            result["unchangedNotice"] = json!("画面与已交付的关键帧及分块增量无明显差异，未重复发送图片；使用本次 snapshotId/imageId，坐标以对应完整基图为准。这不代表动作失败，页面仍在加载时可 wait 后观察，不重放输入。回看需同时读 keyframePath 及 latestDeltas中各块path，按tileRevision顺序叠加。");
+        }
+        if images.iter().any(|i| i["deltaOf"].is_string()) {
+            result["deltaNotice"] = json!("只发送本轮变化的32×32网格块，相邻变化块合并，不跨未变化块。每块仅更新自身区域，重叠处以较新tileRevision为准，其余区域保留基图和其它增量；latestDeltas按更新顺序保存，readOnly旧块仅供重建。操作使用本次snapshotId及该块deltaOf指向的完整基图imageId：图内坐标加该块x/y偏移一次，不换算CSS/DPI；完整图坐标直接用基图imageId。");
         }
         result["path"] = images[0]["path"].clone();
         result["images"] = json!(images);
@@ -1492,14 +1505,17 @@ async fn control_session(
         if (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
             let mut feedback_args = args.clone();
             feedback_args["fullPage"] = json!(false);
-            feedback_args["__delta"] = json!(failure.is_none());
+            feedback_args["__delta"] = json!(failure.is_none() && script.is_none());
             if let Some(args)=feedback_args.as_object_mut() {for key in ["ref","frame","region"] {args.remove(key);} }
             if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
             // Occlusion cannot be explained by an unchanged DOM delta; show the blocker.
             let visual=args["feedback"]=="screenshot" || (args["feedback"].is_null() && observation.screenshot)
                 || failure.as_deref().is_some_and(|reason| reason.contains("目标被遮挡"));
             // Feedback failure must never turn a completed mutation into a retryable action failure.
-            match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,if script.is_some() { None } else { Some(&observation) })).await {
+            // A script retires input snapshots, not the comparison baseline. Fresh document/stamp/geometry
+            // checks in deliver_screenshot still reset the group after navigation or viewport changes.
+            match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,
+                if script.is_none() || visual { Some(&observation) } else { None })).await {
                 Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
                 Ok(Err(error)) => result["observationError"] = json!(error),
                 Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
@@ -2174,7 +2190,7 @@ mod tests {
             captured: std::time::Instant::now(), screenshot: true, full_page: false, images: Vec::new() };
         let deliver = |o: &mut Observation, p: Option<&Observation>, stream: Option<&str>, pixels: RgbaImage| {
             let path = dir.path().join(format!("{}.jpg", o.id));
-            deliver_viewport(o, p, stream.map(str::to_owned), pixels, path, (0., 0., 640., 640.)).unwrap()
+            deliver_screenshot(o, p, stream.map(str::to_owned), pixels, path, (0., 0., 640., 640.)).unwrap()
         };
         let mut first = observed("first");
         let key = deliver(&mut first, None, Some("C1:viewport"), page.clone());
@@ -2258,6 +2274,56 @@ mod tests {
         let ordered = errors_first(value.clone());
         assert_eq!(ordered, value);
         assert_eq!(ordered.as_object().unwrap().keys().take(3).collect::<Vec<_>>(), ["status", "reason", "snapshotId"]);
+    }
+
+    #[test]
+    fn full_page_tiles_share_deltas_without_crossing_coordinate_bases() {
+        use xcap::image::{Rgba, RgbaImage};
+        let dir = tempfile::tempdir().unwrap();
+        let page = RgbaImage::from_pixel(128, 96, Rgba([255,255,255,255]));
+        let observed = |id: &str, full_page| Observation { frames: Vec::new(), id: id.into(),
+            pages: json!({"pages":[{"stamp":"same-url-scroll-zoom","document":"doc"}]}),
+            captured: std::time::Instant::now(), screenshot: true, full_page, images: Vec::new() };
+        let deliver = |o: &mut Observation, p: Option<&Observation>, stream: &str, xywh, pixels: RgbaImage| {
+            let path = dir.path().join(format!("{}-{}.jpg",o.id,o.images.len()));
+            deliver_screenshot(o,p,Some(stream.into()),pixels,path,xywh).unwrap()
+        };
+        let mut first = observed("first", true);
+        let top = deliver(&mut first,None,"C1:document:0",(0.,0.,256.,192.),page.clone());
+        let bottom = deliver(&mut first,None,"C1:document:1",(0.,192.,256.,192.),page.clone());
+        assert_ne!(top[0]["imageId"],bottom[0]["imageId"]);
+        let mut changed = page.clone();
+        changed.put_pixel(16,16,Rgba([0,0,0,255]));
+        changed.put_pixel(48,16,Rgba([0,0,0,255]));
+        changed.put_pixel(112,80,Rgba([0,0,0,255]));
+        let mut second = observed("second", true);
+        let unchanged = deliver(&mut second,Some(&first),"C1:document:0",(0.,0.,256.,192.),page.clone());
+        let patches = deliver(&mut second,Some(&first),"C1:document:1",(0.,192.,256.,192.),changed.clone());
+        assert_eq!(unchanged[0]["unchanged"],true);
+        assert_eq!(patches.len(),3,"base metadata plus two separate merged change areas");
+        assert_eq!(patches[0]["frameStream"],"C1:document:1");
+        assert_eq!(patches[0]["frameGroup"],"first");
+        assert!(patches[0]["path"].is_null() && !dir.path().join("second-1.jpg").exists());
+        assert_eq!((patches[1]["width"].as_u64(),patches[1]["height"].as_u64()),(Some(64),Some(32)));
+        assert_eq!((patches[2]["x"].as_u64(),patches[2]["y"].as_u64()),(Some(96),Some(64)));
+        assert_eq!(patches[2]["deltaOf"],"second-1");
+        assert_eq!(second.images[1].point(112.,80.).unwrap(),(224.,352.),"delta offsets are image pixels, not document CSS coordinates");
+        assert_eq!(second.images[1].delivered.as_ref().unwrap().seen.as_ref(),&changed);
+        let mut third = observed("third", true);
+        let unchanged = deliver(&mut third,Some(&second),"C1:document:1",(0.,192.,256.,192.),changed.clone());
+        assert_eq!(unchanged.len(),1);
+        assert_eq!(unchanged[0]["latestDeltas"].as_array().unwrap().len(),2);
+        assert_eq!(unchanged[0]["latestDeltas"][1]["deltaOf"],"third-0");
+        assert_eq!(unchanged[0]["latestDeltas"][1]["path"],patches[2]["path"]);
+        // Geometry changes must reset even when the scaled image dimensions happen to match.
+        for (full_page, xywh) in [(true,(0.,128.,256.,192.)),(true,(0.,192.,128.,96.)),(false,(0.,192.,256.,192.))] {
+            let mut resized=observed("reset",full_page);
+            let reset=deliver(&mut resized,Some(&third),"C1:document:1",xywh,changed.clone());
+            assert_eq!(reset[0]["keyframe"],true);
+        }
+        let mut viewport=observed("viewport",false);
+        let key=deliver(&mut viewport,Some(&second),"C1:viewport",(0.,0.,256.,192.),page);
+        assert_eq!(key[0]["keyframe"],true,"action feedback cannot use a document tile as its viewport basis");
     }
 
     #[test]
@@ -2409,13 +2475,12 @@ mod tests {
         xcap::image::DynamicImage::ImageRgba8(image)
             .write_to(&mut png, xcap::image::ImageFormat::Png).unwrap();
         let encoded = base64::engine::general_purpose::STANDARD.encode(png.get_ref());
-        let (resized, pixels) = screenshot_bytes(&encoded, 1600).unwrap();
-        assert_eq!(pixels, (1600, 800));
-        assert_eq!(xcap::image::load_from_memory(&resized).unwrap().to_rgba8().dimensions(), pixels);
-        let (unchanged, pixels) = screenshot_bytes(&encoded, 0).unwrap();
-        assert_eq!(pixels, (2400, 1200));
-        assert!(unchanged.starts_with(b"\xff\xd8\xff"), "screenshots are stored as JPEG");
-        assert!(screenshot_bytes("not-base64", 1600).is_err());
+        let resized = screenshot_pixels(&encoded, 1600).unwrap();
+        assert_eq!(resized.dimensions(), (1600, 800));
+        let unchanged = screenshot_pixels(&encoded, 0).unwrap();
+        assert_eq!(unchanged.dimensions(), (2400, 1200));
+        assert!(crate::visual_guard::encode_jpeg(&unchanged).unwrap().starts_with(b"\xff\xd8\xff"));
+        assert!(screenshot_pixels("not-base64", 1600).is_err());
     }
     #[test]
     fn native_browser_rejects_unsafe_urls_and_unstructured_actions() {
