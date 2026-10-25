@@ -2,7 +2,7 @@
 use xcap::image::RgbaImage;
 
 /// Half-open rectangle in original image pixels, never display/cropped-image coordinates.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct PixelRect {
     pub left: u32,
     pub top: u32,
@@ -23,6 +23,7 @@ pub(crate) struct VisualGuard {
     source: (u32, u32),
     step: u32,
     pixels: std::sync::Arc<Vec<[u8; 3]>>,
+    unobserved: Vec<PixelRect>,
 }
 impl VisualGuard {
     // At most 1600^2 RGB samples (~7.7 MB); clones share the backing storage.
@@ -34,8 +35,11 @@ impl VisualGuard {
             let p = image.get_pixel(x * step, y * step);
             [p[0], p[1], p[2]]
         })).collect();
-        Self { width, height, source: image.dimensions(), step, pixels: std::sync::Arc::new(pixels) }
+        Self { width, height, source: image.dimensions(), step, pixels: std::sync::Arc::new(pixels), unobserved: Vec::new() }
     }
+
+    /// Delivery exclusions may have refreshed without reaching the model; require a fresh crop before input there.
+    pub(crate) fn mark_unobserved(&mut self, regions: Vec<PixelRect>) { self.unobserved = regions; }
 
     /// `core_only`: the batch's own earlier input legitimately changed the neighbourhood
     /// (typed text, ticked checkbox); only an overlay or shift right under the target counts.
@@ -47,6 +51,7 @@ impl VisualGuard {
     pub(crate) fn changed_near_excluding(&self, current: &RgbaImage, x: f64, y: f64, core_only: bool, exclude: Option<PixelRect>) -> bool {
         if current.dimensions() != self.source || !x.is_finite() || !y.is_finite()
             || x < 0. || y < 0. || x >= self.source.0 as f64 || y >= self.source.1 as f64
+            || self.unobserved.iter().any(|r| r.contains(x, y))
             || exclude.is_some_and(|r| r.contains(x, y)) {
             return true;
         }
@@ -85,49 +90,67 @@ pub(crate) fn encode_jpeg(image: &RgbaImage) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// What the model holds for one screen/tab stream, before any cursor annotation.
+/// Delivered comparison pixels before cursor annotation; ignored self-UI regions may be masked.
 #[derive(Clone)]
 pub(crate) struct Delivered {
     pub stream: String,
     pub group: String,
     pub keyframe_id: String,
     pub basis: serde_json::Value,
-    pub keyframe: std::sync::Arc<RgbaImage>,
     pub keyframe_path: std::path::PathBuf,
     pub seen: std::sync::Arc<RgbaImage>,
-    pub seen_path: std::path::PathBuf,
-    pub delta: Option<PixelRect>,
+    /// Saved patches in delivery order; partially overwritten patches remain for reconstruction only.
+    pub tiles: Vec<DeliveredTile>,
     pub deltas: u8,
+}
+
+#[derive(Clone)]
+pub(crate) struct DeliveredTile {
+    pub rect: PixelRect,
+    pub path: std::path::PathBuf,
+    pub revision: u8,
+    pub read_only: bool,
 }
 
 pub(crate) const MAX_DELTAS: u8 = 8;
 const TILE: u32 = 32;
-pub(crate) enum Delivery { Unchanged, Delta(PixelRect), Keyframe }
+pub(crate) enum Delivery { Unchanged, Delta(Vec<PixelRect>), Keyframe }
 
-/// Compare to the last delivered pixels; deltas accumulate against the keyframe, including
-/// reverted areas. Bound both crop area and group length to keep context and prompt-cache churn small.
+/// Send only grid tiles changed since their last delivery. Earlier tiles remain valid independently.
 pub(crate) fn plan_delivery(prior: Option<&Delivered>, pixels: &RgbaImage) -> Delivery {
     let Some(p) = prior.filter(|p| p.seen.dimensions() == pixels.dimensions()) else { return Delivery::Keyframe };
-    if changed_tiles(&p.seen, pixels, None).is_some_and(|t| !t.contains(&true)) { return Delivery::Unchanged; }
+    let Some(changed) = changed_tiles(&p.seen, pixels, None) else { return Delivery::Keyframe };
+    if !changed.contains(&true) { return Delivery::Unchanged; }
     if p.deltas >= MAX_DELTAS { return Delivery::Keyframe; }
-    let (w, h) = pixels.dimensions();
-    let fresh = changed_tiles(&p.keyframe, pixels, None).and_then(|t| changed_box(&t, (w, h)));
-    let b = match (fresh, p.delta) {
-        (Some(a), Some(b)) => PixelRect { left: a.left.min(b.left), top: a.top.min(b.top),
-            right: a.right.max(b.right), bottom: a.bottom.max(b.bottom) },
-        (a, b) => match a.or(b) { Some(r) => r, None => return Delivery::Keyframe },
-    };
-    // ponytail: one bounding box; far-apart changes exceed the quarter-image cap and become a keyframe.
-    if (b.right - b.left) as u64 * (b.bottom - b.top) as u64 * 4 <= w as u64 * h as u64 { Delivery::Delta(b) } else { Delivery::Keyframe }
+    Delivery::Delta(merge_changed_tiles(&changed, pixels.dimensions()))
 }
 
-fn changed_box(tiles: &[bool], (w, h): (u32, u32)) -> Option<PixelRect> {
+/// Merge horizontal runs, then vertically extend matching runs. Never include an unchanged grid cell.
+fn merge_changed_tiles(changed: &[bool], (w, h): (u32, u32)) -> Vec<PixelRect> {
     let cols = w.div_ceil(TILE) as usize;
-    let mut changed = tiles.iter().enumerate().filter(|(_, c)| **c).map(|(i, _)| ((i % cols) as u32, (i / cols) as u32));
-    let (x, y) = changed.next()?;
-    let (l, t, r, b) = changed.fold((x, y, x, y), |(l, t, r, b), (x, y)| (l.min(x), t.min(y), r.max(x), b.max(y)));
-    Some(PixelRect { left: l.saturating_sub(1) * TILE, top: t.saturating_sub(1) * TILE,
-        right: ((r + 2) * TILE).min(w), bottom: ((b + 2) * TILE).min(h) })
+    let mut blocks: Vec<PixelRect> = Vec::new();
+    let mut previous: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+    for (y, row) in changed.chunks(cols).enumerate() {
+        let mut active = std::collections::HashMap::new();
+        let mut x = 0;
+        while x < row.len() {
+            if !row[x] { x += 1; continue; }
+            let start = x;
+            while x < row.len() && row[x] { x += 1; }
+            let bottom = ((y as u32 + 1) * TILE).min(h);
+            let index = if let Some(&index) = previous.get(&(start, x)) {
+                blocks[index].bottom = bottom;
+                index
+            } else {
+                blocks.push(PixelRect { left: start as u32 * TILE, top: y as u32 * TILE,
+                    right: (x as u32 * TILE).min(w), bottom });
+                blocks.len() - 1
+            };
+            active.insert((start, x), index);
+        }
+        previous = active;
+    }
+    blocks
 }
 
 /// Which 32×32 blocks visibly changed (any RGB channel > 16).
@@ -156,7 +179,7 @@ pub(crate) fn changed_tiles(a: &RgbaImage, b: &RgbaImage, exclude: Option<PixelR
 /// the complete image; callers may register delta IDs that map local crop coordinates automatically.
 pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
     plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf)
-    -> Result<(Option<Delivered>, Option<serde_json::Value>), String> {
+    -> Result<(Option<Delivered>, Vec<serde_json::Value>), String> {
     use serde_json::json;
     let mark = |entry: &mut serde_json::Value, p: &Delivered| {
         entry["frameStream"] = json!(p.stream);
@@ -164,42 +187,87 @@ pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delive
         entry["keyframeImageId"] = json!(p.keyframe_id);
         entry["keyframePath"] = json!(p.keyframe_path);
     };
-    let delta_entry = |p: &Delivered, b: PixelRect, path: &std::path::Path| {
-        let mut delta = json!({"deltaOf":entry["imageId"],"path":path,"x":b.left,"y":b.top,
+    let base_id = entry["imageId"].clone();
+    let delta_entry = |p: &Delivered, tile: &DeliveredTile| {
+        let b = tile.rect;
+        let mut delta = json!({"deltaOf":base_id,"path":tile.path,"x":b.left,"y":b.top,"tileRevision":tile.revision,
             "width":b.right-b.left,"height":b.bottom-b.top,"pixelWidth":b.right-b.left,"pixelHeight":b.bottom-b.top});
-        if let (Some(x), Some(y)) = (entry["cursor"]["x"].as_u64(), entry["cursor"]["y"].as_u64()) {
-            if b.contains(x as f64, y as f64) {
-                delta["cursor"] = entry["cursor"].clone();
-                delta["cursor"]["x"] = json!(x - b.left as u64);
-                delta["cursor"]["y"] = json!(y - b.top as u64);
-            }
-        }
+        if tile.read_only { delta["readOnly"] = json!(true); }
         mark(&mut delta, p);
         delta
     };
     // Equal resized dimensions alone do not prove the same monitor geometry or source scale.
-    let basis = json!([entry["desktopBounds"], entry["originalWidth"], entry["originalHeight"]]);
+    // Changed exclusion geometry must reveal newly exposed areas with a fresh, unmasked keyframe.
+    let basis = json!([entry["desktopBounds"], entry["originalWidth"], entry["originalHeight"], entry["ignoredRegions"]]);
     let prior = prior.filter(|p| Some(&p.stream) == stream.as_ref() && p.basis == basis);
     let image = annotated.unwrap_or(&plain);
     match plan_delivery(prior, &plain) {
         Delivery::Unchanged => {
             let p = prior.unwrap();
-            let latest = p.delta.map(|b| delta_entry(p, b, &p.seen_path));
             entry["unchanged"] = json!(true);
-            entry["samePixelsAs"] = json!(p.seen_path);
             mark(entry, p);
-            // Reattach this only if compaction also removed the most recent delta.
-            if let Some(latest) = latest { entry["latestDelta"] = latest; }
-            Ok((Some(p.clone()), None))
+            entry["latestDeltas"] = json!(p.tiles.iter().map(|tile| delta_entry(p, tile)).collect::<Vec<_>>());
+            Ok((Some(p.clone()), Vec::new()))
         }
-        Delivery::Delta(b) => {
+        Delivery::Delta(blocks) => {
             let p = prior.unwrap();
-            let crop = xcap::image::imageops::crop_imm(image, b.left, b.top, b.right-b.left, b.bottom-b.top).to_image();
-            let path = path.with_file_name(format!("{}-delta.jpg", path.file_stem().unwrap_or_default().to_string_lossy()));
-            std::fs::write(&path, encode_jpeg(&crop)?).map_err(|e| e.to_string())?;
-            let delta = delta_entry(p, b, &path);
-            mark(entry, p);
-            Ok((Some(Delivered { seen: plain.into(), seen_path: path, delta: Some(b), deltas: p.deltas+1, ..p.clone() }), Some(delta)))
+            let mut next = p.clone();
+            next.deltas += 1;
+            // Merged shapes may change across frames. Keep surviving old portions in order, but
+            // never authorize coordinates from a patch partially overwritten by newer patches.
+            let cols = plain.width().div_ceil(TILE) as usize;
+            let mut revisions = vec![0; cols * plain.height().div_ceil(TILE) as usize];
+            for (r, revision) in next.tiles.iter().map(|t| (t.rect, t.revision))
+                .chain(blocks.iter().map(|r| (*r, next.deltas))) {
+                for y in r.top / TILE..r.bottom.div_ceil(TILE) {
+                    for x in r.left / TILE..r.right.div_ceil(TILE) {
+                        revisions[y as usize * cols + x as usize] = revision;
+                    }
+                }
+            }
+            next.tiles.retain_mut(|tile| {
+                let r = tile.rect;
+                let (mut current, mut overwritten) = (false, false);
+                for y in r.top / TILE..r.bottom.div_ceil(TILE) {
+                    for x in r.left / TILE..r.right.div_ceil(TILE) {
+                        let newer = revisions[y as usize * cols + x as usize] > tile.revision;
+                        current |= !newer;
+                        overwritten |= newer;
+                    }
+                }
+                tile.read_only = overwritten;
+                current
+            });
+            let mut seen = (*p.seen).clone();
+            let mut deltas = Vec::new();
+            for b in blocks {
+                let crop = xcap::image::imageops::crop_imm(image, b.left, b.top, b.right-b.left, b.bottom-b.top).to_image();
+                let path = path.with_file_name(format!("{}-delta-{}-{}.jpg", path.file_stem().unwrap_or_default().to_string_lossy(), b.left, b.top));
+                std::fs::write(&path, encode_jpeg(&crop)?).map_err(|e| e.to_string())?;
+                let tile = DeliveredTile { rect: b, path, revision: next.deltas, read_only: false };
+                let mut delta = delta_entry(&next, &tile);
+                if let (Some(x), Some(y)) = (entry["cursor"]["x"].as_u64(), entry["cursor"]["y"].as_u64()) {
+                    if b.contains(x as f64, y as f64) {
+                        delta["cursor"] = entry["cursor"].clone();
+                        delta["cursor"]["x"] = json!(x - b.left as u64);
+                        delta["cursor"]["y"] = json!(y - b.top as u64);
+                    }
+                }
+                deltas.push(delta);
+                next.tiles.push(tile);
+                // Preserve undelivered pixels so small differences cannot drift forever below the threshold.
+                let w = plain.width() as usize;
+                let raw: &mut [u8] = seen.as_mut();
+                for y in b.top..b.bottom {
+                    let range = (y as usize * w + b.left as usize) * 4..(y as usize * w + b.right as usize) * 4;
+                    raw[range.clone()].copy_from_slice(&plain.as_raw()[range]);
+                }
+            }
+            next.seen = seen.into();
+            mark(entry, &next);
+            // Complete tile state permits recovery after any prefix of this group is compacted.
+            entry["latestDeltas"] = json!(next.tiles.iter().map(|tile| delta_entry(&next, tile)).collect::<Vec<_>>());
+            Ok((Some(next), deltas))
         }
         Delivery::Keyframe => {
             std::fs::write(&path, encode_jpeg(image)?).map_err(|e| e.to_string())?;
@@ -207,13 +275,13 @@ pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delive
             let delivered = stream.map(|stream| {
                 let plain = std::sync::Arc::new(plain);
                 let p = Delivered { stream, group: entry["snapshotId"].as_str().unwrap_or_default().into(),
-                    keyframe_id: entry["imageId"].as_str().unwrap_or_default().into(), basis, keyframe: plain.clone(),
-                    keyframe_path: path.clone(), seen: plain, seen_path: path, delta: None, deltas: 0 };
+                    keyframe_id: entry["imageId"].as_str().unwrap_or_default().into(), basis,
+                    keyframe_path: path, seen: plain, tiles: Vec::new(), deltas: 0 };
                 entry["keyframe"] = json!(true);
                 mark(entry, &p);
                 p
             });
-            Ok((delivered, None))
+            Ok((delivered, Vec::new()))
         }
     }
 }
@@ -242,14 +310,106 @@ mod tests {
         annotated.put_pixel(150, 150, Rgba([0, 100, 255, 255]));
         let mut same = entry("same");
         let (_, delta) = deliver_frame(&mut same, prior.as_ref(), Some("window".into()), page.clone(), Some(&annotated), dir.path().join("same.jpg")).unwrap();
-        assert!(same["unchanged"] == true && delta.is_none(), "cursor annotation alone is not a change");
+        assert!(same["unchanged"] == true && delta.is_empty(), "cursor annotation alone is not a change");
         let mut changed = page;
         changed.put_pixel(150, 150, Rgba([0, 0, 0, 255]));
         let mut next = entry("delta");
         let (seen, delta) = deliver_frame(&mut next, prior.as_ref(), Some("window".into()), changed.clone(), Some(&annotated), dir.path().join("delta.jpg")).unwrap();
-        let delta = delta.unwrap();
-        assert_eq!((delta["cursor"]["x"].as_u64(), delta["cursor"]["y"].as_u64()), (Some(54), Some(54)));
+        assert_eq!(delta.len(), 1);
+        assert_eq!((delta[0]["cursor"]["x"].as_u64(), delta[0]["cursor"]["y"].as_u64()), (Some(22), Some(22)));
         assert_eq!(seen.unwrap().seen.as_ref(), &changed, "guard pixels never contain the cursor marker");
+    }
+
+    #[test]
+    fn tile_delivery_sends_only_new_blocks_and_restores_reverts() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let page = RgbaImage::from_pixel(800, 600, Rgba([255,255,255,255]));
+        let deliver = |id: &str, prior: Option<&Delivered>, pixels: RgbaImage| {
+            let mut entry = json!({"imageId":id,"snapshotId":id});
+            let (frame, blocks) = deliver_frame(&mut entry, prior, Some("screen".into()), pixels, None, dir.path().join(format!("{id}.jpg"))).unwrap();
+            (entry, frame.unwrap(), blocks)
+        };
+        let (_, key, _) = deliver("key", None, page.clone());
+        let mut pixels = page.clone();
+        pixels.put_pixel(16,16,Rgba([0,0,0,255]));
+        let (_, first, a) = deliver("a", Some(&key), pixels.clone());
+        pixels.put_pixel(799,599,Rgba([0,0,0,255]));
+        let (entry, second, b) = deliver("b", Some(&first), pixels.clone());
+        assert_eq!((a.len(),b.len(),entry["latestDeltas"].as_array().unwrap().len()),(1,1,2));
+        assert_eq!((b[0]["x"].as_u64(),b[0]["y"].as_u64(),b[0]["width"].as_u64(),b[0]["height"].as_u64()),(Some(768),Some(576),Some(32),Some(24)));
+        assert_eq!(entry["latestDeltas"][0]["path"],a[0]["path"]);
+        assert_eq!(entry["latestDeltas"][0]["deltaOf"],"b");
+        let (same, _, blocks) = deliver("same", Some(&second), pixels.clone());
+        assert!(blocks.is_empty() && same["unchanged"] == true);
+        pixels.put_pixel(16,16,*page.get_pixel(16,16));
+        let (entry, reverted, blocks) = deliver("revert", Some(&second), pixels.clone());
+        assert_eq!(blocks.len(),1);
+        assert_eq!((blocks[0]["x"].as_u64(),blocks[0]["y"].as_u64()),(Some(0),Some(0)));
+        assert_eq!(entry["latestDeltas"][0]["path"],b[0]["path"]);
+        assert_eq!(entry["latestDeltas"][1]["path"],blocks[0]["path"]);
+        assert_ne!(entry["latestDeltas"][1]["path"],a[0]["path"]);
+        assert_eq!(reverted.seen.as_ref(),&pixels);
+        let saved = xcap::image::open(blocks[0]["path"].as_str().unwrap()).unwrap().to_rgba8();
+        assert!(saved.get_pixel(16,16)[0] > 240);
+        // Reconstruct with the latest saved tiles only: no distant unchanged gap was sent.
+        let area: u32 = reverted.tiles.iter().map(|t|(t.rect.right-t.rect.left)*(t.rect.bottom-t.rect.top)).sum();
+        assert_eq!(area,32*32+32*24);
+    }
+
+    #[test]
+    fn merged_tiles_cover_exactly_the_changed_cells() {
+        let size = (70,65); // clipped tiles at the right and bottom edges
+        assert_eq!(merge_changed_tiles(&[true;9],size),vec![PixelRect{left:0,top:0,right:70,bottom:65}]);
+        assert_eq!(merge_changed_tiles(&[true,true,false,true,true,false,false,false,false],size),
+            vec![PixelRect{left:0,top:0,right:64,bottom:64}]);
+        for mask in 0..512 {
+            let changed: Vec<bool> = (0..9).map(|i| mask & (1<<i) != 0).collect();
+            let blocks = merge_changed_tiles(&changed,size);
+            for r in &blocks {
+                assert!(r.left < r.right && r.top < r.bottom && r.right <= size.0 && r.bottom <= size.1);
+            }
+            for (i, &changed) in changed.iter().enumerate() {
+                let (x,y)=((i%3) as f64*32.,(i/3) as f64*32.);
+                assert_eq!(blocks.iter().filter(|r|r.contains(x,y)).count(),usize::from(changed),
+                    "mask={mask}: gaps/diagonal neighbours must not be filled and patches must not overlap");
+            }
+        }
+    }
+
+    #[test]
+    fn merged_patches_preserve_partial_updates_in_delivery_order() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let blank = RgbaImage::from_pixel(128,64,Rgba([255,255,255,255]));
+        let mut pixels = RgbaImage::from_fn(128,64,|x,y| if x<96 && y<32 { Rgba([0,0,0,255]) } else { Rgba([255,255,255,255]) });
+        let deliver = |id: &str, prior: Option<&Delivered>, image: &RgbaImage| {
+            let mut entry=json!({"imageId":"monitor-1","snapshotId":id});
+            let (frame,blocks)=deliver_frame(&mut entry,prior,Some("screen".into()),image.clone(),None,dir.path().join(format!("{id}.jpg"))).unwrap();
+            (entry,frame.unwrap(),blocks)
+        };
+        let (_,key,_) = deliver("key",None,&blank);
+        let (_,first,blocks) = deliver("merged",Some(&key),&pixels);
+        assert_eq!(blocks.len(),1);
+        assert_eq!((blocks[0]["width"].as_u64(),blocks[0]["height"].as_u64()),(Some(96),Some(32)));
+        for y in 0..32 { for x in 32..64 { pixels.put_pixel(x,y,Rgba([255,255,255,255])); } }
+        let (entry,second,blocks) = deliver("middle",Some(&first),&pixels);
+        assert_eq!(blocks.len(),1);
+        assert_eq!(entry["latestDeltas"][0]["readOnly"],true);
+        assert_eq!(second.tiles.len(),2);
+        let mut restored=blank.clone();
+        for tile in &second.tiles {
+            let patch=xcap::image::open(&tile.path).unwrap().to_rgba8();
+            xcap::image::imageops::replace(&mut restored,&patch,tile.rect.left as i64,tile.rect.top as i64);
+        }
+        assert!(changed_tiles(&pixels,&restored,None).unwrap().iter().all(|c|!c),"restoration must apply newer overlap last");
+        let (entry,third,blocks) = deliver("sides",Some(&second),&blank);
+        assert_eq!(blocks.len(),2,"unchanged middle must not be included");
+        assert_eq!(third.tiles.len(),3);
+        assert!(third.tiles.iter().all(|t|t.revision>1 && !t.read_only),"fully covered original patch must be discarded");
+        assert!(entry["latestDeltas"].as_array().unwrap().windows(2).all(|pair|pair[0]["tileRevision"].as_u64()<=pair[1]["tileRevision"].as_u64()));
+        let (entry,_,blocks) = deliver("same",Some(&third),&blank);
+        assert!(blocks.is_empty() && entry["unchanged"]==true);
     }
 
     #[test]

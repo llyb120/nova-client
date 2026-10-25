@@ -10,6 +10,7 @@ use std::{
 use xcap::{Monitor, Window};
 
 mod background;
+mod nova_regions;
 #[cfg(windows)]
 mod text_input;
 
@@ -472,6 +473,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     std::fs::create_dir_all(&folder).map_err(err)?;
     let before = foreground()?;
     let cursor_before = cursor_position();
+    let nova_bounds = if !bg && region.is_none() { nova_regions::visible() } else { Vec::new() };
     let mut shots = Vec::new();
     let mut images = Vec::new();
     let mut save = |surface: Surface, image: xcap::image::RgbaImage, stability: Value, overlay, desktop_capture| -> Result<()> {
@@ -492,8 +494,16 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             image_id.push_str(&format!("-region-{}-{}-{}-{}", r.x, r.y, r.width, r.height));
         }
         let original_pixels = image.dimensions();
-        // Retain bounded unannotated pixel samples, never the cursor ring or a guessed target.
-        let guard = Some(crate::visual_guard::VisualGuard::new(&image));
+        let ignored_bounds = if desktop_capture && region.is_none() {
+            // Mask only stable, actually visible Nova regions; never hide a foreign window above Nova.
+            let mut bounds = if nova_bounds == nova_regions::visible() { nova_bounds.clone() } else { Vec::new() };
+            bounds.extend(overlay);
+            bounds
+        } else { Vec::new() };
+        // Retain real source pixels for safety; ignored UI cannot be clicked using a stale retained image.
+        let mut guard = crate::visual_guard::VisualGuard::new(&image);
+        guard.mark_unobserved(ignored_bounds.iter().filter_map(|r| overlay_region(&surface, original_pixels, Some(*r))).collect());
+        let guard = Some(guard);
         let image = if let Some(r) = region {
             r.validate(original_pixels)?;
             xcap::image::imageops::crop_imm(&image, r.x, r.y, r.width, r.height).to_image()
@@ -508,7 +518,9 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
                 xcap::image::imageops::FilterType::Triangle).into_rgba8()
         } else { image };
         resize_ms += resize_started.elapsed().as_millis();
-        let plain = image.clone();
+        let ignored: Vec<_> = ignored_bounds.into_iter()
+            .filter_map(|r| overlay_region(&surface, image.dimensions(), Some(r))).collect();
+        let plain = nova_regions::comparison_pixels(&image, &ignored);
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
@@ -521,6 +533,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             "region":region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height})),
             "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}});
         entry["monitorId"] = json!(window_id.is_none().then_some(surface.id));
+        if !ignored.is_empty() { entry["ignoredRegions"] = json!(ignored); }
         // Full image and delta each have their own input ID; both share the same native pixel guard.
         let stream = region.is_none().then(|| image_id.clone());
         let prior = previous.iter().find(|p| Some(&p.stream) == stream.as_ref());
@@ -531,10 +544,10 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             region, delta: None, guard, overlay, desktop_capture,
         };
         if let Some(frame) = &frame {
-            let delta = delta_entry.as_mut().or_else(|| entry.get_mut("latestDelta"));
-            if let Some(delta) = delta {
+            for delta in entry.get_mut("latestDeltas").and_then(Value::as_array_mut).into_iter().flatten() {
                 if let Some(crop) = delta_shot(&shot, frame, &id, delta) { shots.push(crop); }
             }
+            for delta in &mut delta_entry { delta_shot(&shot, frame, &id, delta); }
         }
         delivered.extend(frame);
         encode_ms += encode_started.elapsed().as_millis();
@@ -610,22 +623,25 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let deltas: Vec<String> = images.iter().filter_map(|i| Some(format!("{} 属于 {}，偏移({},{})、大小{}×{}",
         i["imageId"].as_str()?, i["deltaOf"].as_str()?, i["x"], i["y"], i["width"], i["height"]))).collect();
     if !deltas.is_empty() {
-        result["deltaNotice"] = json!(format!("画面局部变化，只发了增量图：{}。用本次snapshotId和增量图自己的imageId，直接填写图内坐标；工具自动处理偏移与缩放，不要自行相加。区域外用完整图imageId（deltaOf）和完整图坐标。各显示器基线独立；最新增量取代同一基线的旧增量。", deltas.join("；")));
+        result["deltaNotice"] = json!(format!("画面局部变化，只发了增量图：{}。用本次snapshotId和增量图自己的imageId，直接填写图内坐标；工具自动处理偏移与缩放，不要自行相加。区域外用完整图imageId（deltaOf）和完整图坐标。各显示器基线独立；每块只更新自身区域；重叠处以较新的tileRevision为准。latestDeltas按更新顺序保存，readOnly旧块仅供重建，操作用非readOnly块或合成画面的整屏坐标。", deltas.join("；")));
     }
     if !unchanged.is_empty() {
-        result["unchangedNotice"] = json!(format!("{} 与你已看到的画面（关键帧及最新增量）无明显像素差异（剑形指针位置以cursor字段为准），未重复发送图片：直接沿用已看到的画面判断，坐标对本次snapshotId/imageId同样有效。动作后出现此提示只表示本次取图尚无可见变化，不代表动作失败；若目标仍在加载可显式wait后观察，不重放输入或循环截图；上下文缺图时用recall分别回看keyframePath和latestDelta.path（如有），不能把samePixelsAs的增量裁剪图当作整屏。", unchanged.join("、")));
+        result["unchangedNotice"] = json!(format!("{} 与你已看到的画面（关键帧及最新增量）无明显像素差异（剑形指针位置以cursor字段为准），未重复发送图片：直接沿用已看到的画面判断，坐标对本次snapshotId/imageId同样有效。动作后出现此提示只表示本次取图尚无可见变化，不代表动作失败；若目标仍在加载可显式wait后观察，不重放输入或循环截图；上下文缺图时用recall回看keyframePath和latestDeltas中各path，不能把单块增量当作整屏。", unchanged.join("、")));
     }
     Ok(result)
 }
 
 fn delta_shot(shot: &Shot, frame: &Delivered, snapshot: &str, entry: &mut Value) -> Option<Shot> {
-    let b = frame.delta?;
-    let image_id = format!("{}-{}-delta-{}", shot.image_id, frame.group, frame.deltas);
+    if entry["readOnly"] == true { return None; }
+    let r = Region { x:entry["x"].as_u64()?.try_into().ok()?, y:entry["y"].as_u64()?.try_into().ok()?,
+        width:entry["pixelWidth"].as_u64()?.try_into().ok()?, height:entry["pixelHeight"].as_u64()?.try_into().ok()? };
+    r.validate(shot.pixels).ok()?;
+    let image_id = format!("{}-{}-delta-{}-{}-{}", shot.image_id, frame.group, entry["tileRevision"].as_u64()?, r.x, r.y);
     entry["imageId"] = json!(image_id);
     entry["snapshotId"] = json!(snapshot);
     entry["monitorId"] = json!(shot.surface.pid.is_none().then_some(shot.surface.id));
     entry["coordinateSpace"] = json!("image-pixels");
-    Some(Shot { image_id, delta: Some(Region { x:b.left, y:b.top, width:b.right-b.left, height:b.bottom-b.top }), ..shot.clone() })
+    Some(Shot { image_id, delta: Some(r), ..shot.clone() })
 }
 
 fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>) -> Result<&'a Shot> {
@@ -786,7 +802,7 @@ fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, after
     let mut points=vec![source_point(shot,action.x.unwrap(),action.y.unwrap())];
     if action.action=="drag" {points.push(source_point(shot,action.to_x.unwrap(),action.to_y.unwrap()));}
     if points.iter().any(|&(x,y)|guard.changed_near_excluding(image,x,y,after_input,exclude)) {
-        return Err("落点附近画面已变化，停止旧坐标输入；请用返回的新图重新定位，不要原样重试同一坐标，细小目标使用 regionSpace=image 局部截图".into());
+        return Err("落点附近画面已变化或该区域未随增量更新，停止旧坐标输入；请用返回的新图重新定位，不要原样重试同一坐标；细小目标或ignoredRegions内的目标须使用 regionSpace=image 局部截图".into());
     }
     Ok(())
 }
@@ -851,6 +867,24 @@ fn action_delay(actions: &[Action], index: usize) -> Duration {
     // Slower apps need an explicit wait; animations never extend this pause.
     let reacts = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "click" | "double_click" | "type" | "scroll");
     Duration::from_millis(if redundant { 0 } else if reacts { 300 } else { 80 })
+}
+
+// 只概括已完成的输入；notes 是调用方的意图，不是业务成功证明。
+fn executed_notice(actions: &[Action], completed: usize, notes: Option<&str>) -> Option<String> {
+    let done: Vec<String> = actions.iter().take(completed).filter_map(|a| Some(match a.action.as_str() {
+        "click" | "double_click" | "move" => format!("{}({},{})", a.action, a.x?, a.y?),
+        "drag" => format!("drag({},{}→{},{})", a.x?, a.y?, a.to_x?, a.to_y?),
+        "type" => format!("type({}字符)", a.text.as_deref()?.chars().count()),
+        "press" => format!("press({})", a.key.as_deref()?),
+        "scroll" => format!("scroll({},{})", a.axis.as_deref().unwrap_or("vertical"), a.delta?),
+        _ => return None,
+    })).collect();
+    if done.is_empty() { return None; }
+    let mut notice = format!("本批已执行：{}。", done.join("、"));
+    if let Some(intent) = notes.map(str::trim).filter(|n| !n.is_empty()) {
+        notice.push_str(&format!("你为这次操作写的意图：{intent}"));
+    }
+    Some(notice)
 }
 
 fn scroll_frame_index(actions: &[Action], index: usize, feedback: Option<&str>) -> Option<usize> {
@@ -1441,6 +1475,9 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             snap.invalidated = Some("动作已执行，请先观察新画面，不重放输入".into());
             *state = Some(snap);
             let mut result = json!({"status":if failure.is_some(){if attempted {"needs_review"} else {"not_executed"}}else{"executed"},"completedActions":completed,"inputAttempted":attempted,"error":failure,"notes":request.notes});
+            if let Some(notice) = executed_notice(actions, completed, request.notes.as_deref()) {
+                result["executedNotice"] = json!(notice);
+            }
             if shot.region.is_some() {
                 result["coordinateNotice"] = json!("局部操作后的反馈恢复所属完整屏幕（显式后台模式为原目标）；按新返回的imageId使用对应图片内坐标");
             }
@@ -1459,7 +1496,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             if !frames.is_empty() {
                 frames.extend(result["images"].as_array().cloned().unwrap_or_default());
                 result["images"] = json!(frames);
-                result["framesNotice"] = json!("images中带frame的是第frame个scroll后的只读中间帧，仅供阅读；act只用顶层snapshotId及最后一张图的坐标");
+                result["framesNotice"] = json!("images中带frame的是第frame个scroll后的只读中间帧，仅供阅读；act用顶层最新snapshotId及最终观察的不带frame的基图/块imageId，各块坐标独立");
             }
             Ok(result)
         }
@@ -1646,28 +1683,66 @@ mod tests {
         }
     }
     #[test]
-    fn keyframe_then_cumulative_deltas() {
+    fn nova_refreshes_do_not_expand_desktop_deltas() {
         use xcap::image::{Rgba, RgbaImage};
         use crate::visual_guard::PixelRect;
-        let page = RgbaImage::from_pixel(320, 320, Rgba([255, 255, 255, 255]));
-        let p0 = Delivered { stream: "window".into(), group: "snap".into(), keyframe_id: "window-1".into(), basis: Value::Null, keyframe: page.clone().into(), keyframe_path: "k.jpg".into(),
-            seen: page.clone().into(), seen_path: "k.jpg".into(), delta: None, deltas: 0 };
+        let dir = tempfile::tempdir().unwrap();
+        let page = RgbaImage::from_pixel(640, 480, Rgba([255, 255, 255, 255]));
+        let ignored = [PixelRect { left:0, top:0, right:96, bottom:480 },
+            PixelRect { left:560, top:400, right:640, bottom:480 }];
+        let deliver = |id: &str, prior: Option<&Delivered>, image: &RgbaImage, regions: &[PixelRect]| {
+            let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"ignoredRegions":regions});
+            let (frame, delta) = crate::visual_guard::deliver_frame(&mut entry, prior, Some("monitor-1".into()),
+                nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.jpg"))).unwrap();
+            (entry, frame.unwrap(), delta)
+        };
+        let (_, base, _) = deliver("key", None, &page, &ignored);
+        let mut guard = crate::visual_guard::VisualGuard::new(&page);
+        guard.mark_unobserved(ignored.to_vec());
+        assert!(guard.changed_near(&page, 48., 32., false), "stale ignored UI is not actionable");
+        assert!(!guard.changed_near(&page, 320., 240., false), "target app stays actionable");
+        let saved = xcap::image::open(&base.keyframe_path).unwrap().to_rgba8();
+        assert!(saved.get_pixel(48, 32)[0] > 240, "actual screenshot must not be blacked out");
+        let mut refresh = page.clone();
+        refresh.put_pixel(48, 32, Rgba([0,0,0,255]));
+        refresh.put_pixel(608, 448, Rgba([0,0,0,255]));
+        let (same, _, delta) = deliver("refresh", Some(&base), &refresh, &ignored);
+        assert_eq!(same["unchanged"], true);
+        assert!(delta.is_empty());
+        refresh.put_pixel(320, 240, Rgba([0,0,0,255]));
+        let (_, next, delta) = deliver("target", Some(&base), &refresh, &ignored);
+        assert_eq!(delta.len(), 1);
+        let bounds = next.tiles[0].rect;
+        assert!(bounds.contains(320., 240.) && !bounds.contains(48., 32.) && !bounds.contains(608., 448.));
+        // Moving/removing an exclusion must expose the real scene, not preserve stale hidden pixels.
+        let (revealed, _, delta) = deliver("revealed", Some(&next), &refresh, &[]);
+        assert_eq!(revealed["keyframe"], true);
+        assert!(delta.is_empty());
+    }
+
+    #[test]
+    fn keyframe_then_independent_tiles() {
+        use xcap::image::{Rgba, RgbaImage};
+        use crate::visual_guard::PixelRect;
+        let page = RgbaImage::from_pixel(800, 600, Rgba([255, 255, 255, 255]));
+        let p0 = Delivered { stream: "window".into(), group: "snap".into(), keyframe_id: "window-1".into(), basis: Value::Null,
+            keyframe_path: "k.jpg".into(), seen: page.clone().into(), tiles: Vec::new(), deltas: 0 };
         let rect = |l, t, r, b| PixelRect { left: l, top: t, right: r, bottom: b };
         assert!(matches!(plan_delivery(None, &page), Delivery::Keyframe));
         assert!(matches!(plan_delivery(Some(&p0), &page), Delivery::Unchanged));
-        assert!(matches!(plan_delivery(Some(&p0), &RgbaImage::new(321, 320)), Delivery::Keyframe), "resized window");
+        assert!(matches!(plan_delivery(Some(&p0), &RgbaImage::new(321, 320)), Delivery::Keyframe));
         let mut typed = page.clone();
         typed.put_pixel(150, 150, Rgba([0, 0, 0, 255]));
-        assert!(matches!(plan_delivery(Some(&p0), &typed), Delivery::Delta(b) if b == rect(96, 96, 192, 192)), "a single glyph or animation frame is sent");
-        // After a delta, a revert to the keyframe resends the old box so the latest delta stays authoritative.
-        let p1 = Delivered { seen: typed.clone().into(), delta: Some(rect(96, 96, 192, 192)), deltas: 1, ..p0.clone() };
+        assert!(matches!(plan_delivery(Some(&p0), &typed), Delivery::Delta(b) if b == vec![rect(128, 128, 160, 160)]));
+        let p1 = Delivered { seen: typed.clone().into(), deltas: 1, ..p0.clone() };
         assert!(matches!(plan_delivery(Some(&p1), &typed), Delivery::Unchanged));
-        assert!(matches!(plan_delivery(Some(&p1), &page), Delivery::Delta(b) if b == rect(96, 96, 192, 192)));
-        // Change accumulates against the keyframe; over a quarter of the image becomes a new keyframe.
-        let mut more = typed.clone();
-        more.put_pixel(40, 40, Rgba([0, 0, 0, 255]));
-        assert!(matches!(plan_delivery(Some(&p1), &more), Delivery::Keyframe));
-        let capped = Delivered { deltas: MAX_DELTAS, ..p1.clone() };
+        assert!(matches!(plan_delivery(Some(&p1), &page), Delivery::Delta(b) if b == vec![rect(128, 128, 160, 160)]), "reverts resend only the changed tile");
+        typed.put_pixel(799, 599, Rgba([0, 0, 0, 255]));
+        assert!(matches!(plan_delivery(Some(&p0), &typed), Delivery::Delta(b) if b == vec![rect(128, 128, 160, 160), rect(768, 576, 800, 600)]), "no rectangle bridging distant changes");
+        assert!(matches!(plan_delivery(Some(&p1), &typed), Delivery::Delta(b) if b == vec![rect(768, 576, 800, 600)]), "old tiles are not resent");
+        let black = RgbaImage::from_pixel(800, 600, Rgba([0, 0, 0, 255]));
+        assert!(matches!(plan_delivery(Some(&p0), &black), Delivery::Delta(b) if b == vec![rect(0, 0, 800, 600)]), "all adjacent changed tiles merge, without becoming a keyframe");
+        let capped = Delivered { deltas: MAX_DELTAS, ..p1 };
         assert!(matches!(plan_delivery(Some(&capped), &page), Delivery::Keyframe));
     }
     #[test]
@@ -1690,25 +1765,25 @@ mod tests {
         let mut changed = page.clone();
         changed.put_pixel(150,150,Rgba([0,0,0,255]));
         let (_, frame, delta) = deliver(&shot,Some(&first),"delta",changed.clone());
-        let mut delta = delta.unwrap();
+        let mut delta = delta.into_iter().next().unwrap();
         let crop = delta_shot(&shot,&frame,"delta",&mut delta).unwrap();
-        assert_eq!((delta["x"].as_u64(),delta["y"].as_u64()),(Some(96),Some(96)));
+        assert_eq!((delta["x"].as_u64(),delta["y"].as_u64()),(Some(128),Some(128)));
         assert_eq!(delta["deltaOf"],shot.image_id);
         assert_eq!(delta["monitorId"],1);
         assert_ne!(delta["imageId"],delta["deltaOf"]);
         // Local delta coordinates map exactly like full-image coordinates, even at fractional scale
         // and with a negative monitor origin. Do not round the crop into source pixels first.
-        for (x,y) in [(0,0),(54,54),(95,95)] {
-            assert_eq!(point(&crop,Some(x),Some(y)).unwrap(),point(&shot,Some(x+96),Some(y+96)).unwrap());
-            assert_eq!(source_point(&crop,x,y),source_point(&shot,x+96,y+96));
+        for (x,y) in [(0,0),(22,22),(31,31)] {
+            assert_eq!(point(&crop,Some(x),Some(y)).unwrap(),point(&shot,Some(x+128),Some(y+128)).unwrap());
+            assert_eq!(source_point(&crop,x,y),source_point(&shot,x+128,y+128));
         }
-        assert_eq!(point(&crop,Some(54),Some(54)).unwrap(),(-1020,406));
-        assert!(point(&crop,Some(96),Some(0)).is_err());
+        assert_eq!(point(&crop,Some(22),Some(22)).unwrap(),(-1020,406));
+        assert!(point(&crop,Some(32),Some(0)).is_err());
         assert!(point(&crop,Some(-1),Some(0)).is_err());
-        let drag:Action = serde_json::from_value(json!({"action":"drag","x":1,"y":1,"toX":95,"toY":95})).unwrap();
+        let drag:Action = serde_json::from_value(json!({"action":"drag","x":1,"y":1,"toX":31,"toY":31})).unwrap();
         assert!(validate(&drag,Some(&crop)).is_ok());
         let zoom=image_region(&crop,Region{x:1,y:2,width:10,height:20}).unwrap();
-        let base_zoom=image_region(&shot,Region{x:97,y:98,width:10,height:20}).unwrap();
+        let base_zoom=image_region(&shot,Region{x:129,y:130,width:10,height:20}).unwrap();
         assert_eq!((zoom.x,zoom.y,zoom.width,zoom.height),(base_zoom.x,base_zoom.y,base_zoom.width,base_zoom.height));
         let shots=vec![shot.clone(),crop.clone()];
         assert!(action_shot(&shots,None).is_err(),"base and delta coordinates are ambiguous without imageId");
@@ -1717,18 +1792,30 @@ mod tests {
         // The full-source guard checks the same point for both IDs.
         let source=RgbaImage::from_pixel(3840,2160,Rgba([20,20,20,255]));
         let guarded=Shot{guard:Some(crate::visual_guard::VisualGuard::new(&source)),..crop.clone()};
-        let click:Action=serde_json::from_value(json!({"action":"click","x":54,"y":54})).unwrap();
+        let click:Action=serde_json::from_value(json!({"action":"click","x":22,"y":22})).unwrap();
         assert!(guard_target(&guarded,&click,&source,false,None).is_ok());
         let moved=RgbaImage::from_pixel(3840,2160,Rgba([200,200,200,255]));
         assert!(guard_target(&guarded,&click,&moved,true,None).is_err());
         // Unchanged pixels keep the delta ID while refreshing snapshotId; the other monitor is untouched.
-        let (mut unchanged, same, none)=deliver(&shot,Some(&frame),"unchanged",changed);
-        assert!(unchanged["unchanged"] == true && none.is_none());
-        let same_crop=delta_shot(&shot,&same,"unchanged",&mut unchanged["latestDelta"]).unwrap();
+        let (mut unchanged, same, none)=deliver(&shot,Some(&frame),"unchanged",changed.clone());
+        assert!(unchanged["unchanged"] == true && none.is_empty());
+        let same_crop=delta_shot(&shot,&same,"unchanged",&mut unchanged["latestDeltas"][0]).unwrap();
         assert_eq!(same_crop.image_id,crop.image_id);
-        assert_eq!(unchanged["latestDelta"]["snapshotId"],"unchanged");
+        assert_eq!(unchanged["latestDeltas"][0]["snapshotId"],"unchanged");
+        changed.put_pixel(319,319,Rgba([0,0,0,255]));
+        let (mut metadata, frame2, patches)=deliver(&shot,Some(&same),"corner",changed);
+        assert_eq!(patches.len(),1);
+        assert_eq!(metadata["latestDeltas"].as_array().unwrap().len(),2);
+        let corner=delta_shot(&shot,&frame2,"corner",&mut metadata["latestDeltas"][1]).unwrap();
+        assert_ne!(corner.image_id,crop.image_id);
+        assert_eq!(point(&corner,Some(31),Some(31)).unwrap(),point(&shot,Some(319),Some(319)).unwrap());
+        assert!(point(&corner,Some(32),Some(0)).is_err());
+        let mut partial = metadata["latestDeltas"][0].clone();
+        partial["readOnly"] = json!(true);
+        assert!(delta_shot(&shot,&frame2,"corner",&mut partial).is_none(), "partially overwritten patches cannot authorize stale coordinates");
+        assert_eq!(delta_shot(&shot,&frame2,"corner",&mut metadata["latestDeltas"][0]).unwrap().image_id,crop.image_id);
         let (other_entry, other_frame, none)=deliver(&other,Some(&second),"other",page.clone());
-        assert!(other_entry["unchanged"] == true && none.is_none());
+        assert!(other_entry["unchanged"] == true && none.is_empty());
         assert_eq!(other_frame.group,second.group);
         let (wrong, _, _)=deliver(&other,Some(&first),"wrong-stream",page.clone());
         assert_eq!(wrong["keyframe"],true);
@@ -2000,6 +2087,26 @@ mod tests {
         assert!(!guarded_pointer(&scroll) && guarded_pointer(&actions[0]));
         assert_eq!(action_delay(&[scroll, chained.into_iter().next().unwrap()], 0).as_millis(), 300);
     }
+    #[test]
+    fn executed_notice_reports_only_completed_inputs_and_intent() {
+        let actions: Vec<Action> = serde_json::from_value(json!([
+            {"action":"click","x":649,"y":341}, {"action":"wait","ms":200},
+            {"action":"press","key":"Enter"}])).unwrap();
+        assert_eq!(executed_notice(&actions, 2, Some("发送搜索结果里的表情")).as_deref(),
+            Some("本批已执行：click(649,341)。你为这次操作写的意图：发送搜索结果里的表情"));
+        assert_eq!(executed_notice(&actions, 1, None).as_deref(), Some("本批已执行：click(649,341)。"));
+        assert_eq!(executed_notice(&actions, 3, Some(" ")).as_deref(),
+            Some("本批已执行：click(649,341)、press(Enter)。"));
+        assert!(executed_notice(&actions, 0, Some("发送")).is_none());
+        assert!(executed_notice(&actions[1..2], 1, None).is_none());
+        let others: Vec<Action> = serde_json::from_value(json!([
+            {"action":"drag","x":1,"y":2,"toX":3,"toY":4},
+            {"action":"scroll","x":5,"y":6,"delta":-2,"axis":"horizontal"},
+            {"action":"type","text":"你好🦀"}])).unwrap();
+        assert_eq!(executed_notice(&others, 3, None).as_deref(),
+            Some("本批已执行：drag(1,2→3,4)、scroll(horizontal,-2)、type(3字符)。"));
+    }
+
     #[test]
     fn scroll_frames_respect_feedback_and_skip_trailing_waits() {
         let actions: Vec<Action> = serde_json::from_value(json!([

@@ -205,10 +205,18 @@ pub(super) fn bounds() -> Option<Rect> {
                 if above.is_null() || remaining == 0 { return None; }
                 remaining -= 1;
                 if IsWindowVisible(above) != 0 && IsIconic(above) == 0 {
-                    let r = window_rect(above)?;
-                    if r.left < rect.right && r.right > rect.left && r.top < rect.bottom && r.bottom > rect.top {
-                        let mut cloaked = 0u32;
-                        if DwmGetWindowAttribute(above, DWMWA_CLOAKED as u32, &mut cloaked as *mut _ as _, 4) < 0 || cloaked == 0 { return None; }
+                    let mut pid = 0;
+                    let mut affinity = 0;
+                    // Our click-through glow spans the desktop but is absent from screenshots and input hit-testing.
+                    let glow = GetWindowThreadProcessId(above, &mut pid) != 0 && pid == std::process::id()
+                        && GetWindowLongPtrW(above, GWL_EXSTYLE) & WS_EX_TRANSPARENT as isize != 0
+                        && GetWindowDisplayAffinity(above, &mut affinity) != 0 && affinity == WDA_EXCLUDEFROMCAPTURE;
+                    if !glow {
+                        let r = window_rect(above)?;
+                        if r.left < rect.right && r.right > rect.left && r.top < rect.bottom && r.bottom > rect.top {
+                            let mut cloaked = 0u32;
+                            if DwmGetWindowAttribute(above, DWMWA_CLOAKED as u32, &mut cloaked as *mut _ as _, 4) < 0 || cloaked == 0 { return None; }
+                        }
                     }
                 }
                 above = GetWindow(above, GW_HWNDNEXT);

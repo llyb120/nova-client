@@ -1139,7 +1139,7 @@ async fn snapshot(
             if after!=observation.pages["pages"][0]["stamp"] {return Err("截图期间视口变化，请重新截图".into());}
             images = deliver_viewport(&mut observation, previous, stream, image, path, (x,y,w,h))?;
             if images[0]["unchanged"] == true {
-                result["unchangedNotice"] = json!("画面与已交付的关键帧及最新增量无明显差异，未重复发送图片；使用本次 snapshotId/imageId，坐标仍以完整视口图为准。这不代表动作失败，页面仍在加载时可 wait 后观察，不重放输入。回看需同时读 keyframePath 及 latestDelta.path（如有），增量位置见 x/y。");
+                result["unchangedNotice"] = json!("画面与已交付的关键帧及最新增量无明显差异，未重复发送图片；使用本次 snapshotId/imageId，坐标仍以完整视口图为准。这不代表动作失败，页面仍在加载时可 wait 后观察，不重放输入。回看需同时读 keyframePath 及 latestDeltas中的各块path，增量位置见 x/y。");
             }
             if images.iter().any(|i| i["deltaOf"].is_string()) {
                 result["deltaNotice"] = json!("只发送相对关键帧的累计变化区域，取代旧增量；区域外仍与关键帧一致。操作使用本次 snapshotId 和 deltaOf 对应的 imageId：增量图内坐标需加该图 x/y 偏移，区域外直接用关键帧坐标；不要换算 CSS/DPI。");
@@ -2187,8 +2187,8 @@ mod tests {
         assert_eq!(delta.len(), 2);
         assert!(delta[0]["path"].is_null());
         assert_eq!(delta[1]["deltaOf"], "next-0");
-        assert_eq!((delta[1]["x"].as_u64(), delta[1]["y"].as_u64()), (Some(96), Some(96)));
-        assert_eq!(xcap::image::open(delta[1]["path"].as_str().unwrap()).unwrap().width(), 96);
+        assert_eq!((delta[1]["x"].as_u64(), delta[1]["y"].as_u64()), (Some(128), Some(128)));
+        assert_eq!(xcap::image::open(delta[1]["path"].as_str().unwrap()).unwrap().width(), 32);
         assert!(!dir.path().join("next.jpg").exists(), "no redundant full-image encoding");
         assert_eq!(next.images[0].point(150., 150.).unwrap(), (300., 300.));
         assert_eq!(next.images[0].pixels, (320, 320));
@@ -2198,11 +2198,11 @@ mod tests {
         assert_eq!(same.len(), 1);
         assert_eq!(same[0]["unchanged"], true);
         assert!(same[0]["path"].is_null());
-        assert_eq!(same[0]["latestDelta"]["path"], delta[1]["path"]);
-        assert_eq!(same[0]["latestDelta"]["deltaOf"], "unchanged-0");
+        assert_eq!(same[0]["latestDeltas"][0]["path"], delta[1]["path"]);
+        assert_eq!(same[0]["latestDeltas"][0]["deltaOf"], "unchanged-0");
         let mut reverted = observed("reverted");
         let restored = deliver(&mut reverted, Some(&unchanged), Some("C1:viewport"), page.clone());
-        assert_eq!(restored[1]["x"], delta[1]["x"], "reverts resend the cumulative box");
+        assert_eq!(restored[1]["x"], delta[1]["x"], "reverts resend only their changed tile");
         assert_eq!(restored[0]["frameGroup"], "first");
         for case in ["scroll", "document", "expired", "tab", "size"] {
             let mut prior = first.clone();
