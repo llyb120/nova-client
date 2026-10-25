@@ -138,6 +138,7 @@ struct ScreenshotImage {
     width: f64,
     height: f64,
     pixels: (u32, u32),
+    delivered: Option<crate::visual_guard::Delivered>,
 }
 impl ScreenshotImage {
     fn point(&self, x: f64, y: f64) -> Result<(f64, f64), String> {
@@ -168,12 +169,36 @@ fn screenshot_bytes(data:&str, edge:u32) -> Result<(Vec<u8>,(u32,u32)),String> {
     encode_screenshot(xcap::image::load_from_memory(&bytes).map_err(|e|e.to_string())?,edge)
 }
 
+fn resize_screenshot(image: xcap::image::DynamicImage, edge: u32) -> xcap::image::RgbaImage {
+    if edge > 0 && image.width().max(image.height()) > edge {
+        image.resize(edge, edge, xcap::image::imageops::FilterType::Triangle)
+    } else { image }.into_rgba8()
+}
+
 fn encode_screenshot(image:xcap::image::DynamicImage, edge:u32) -> Result<(Vec<u8>,(u32,u32)),String> {
-    let image=if edge>0 && image.width().max(image.height())>edge {
-        image.resize(edge,edge,xcap::image::imageops::FilterType::Triangle)
-    } else {image};
-    let pixels=(image.width(),image.height());
-    Ok((crate::visual_guard::encode_jpeg(&image.into_rgba8())?,pixels))
+    let image = resize_screenshot(image, edge);
+    Ok((crate::visual_guard::encode_jpeg(&image)?, image.dimensions()))
+}
+
+fn deliver_viewport(observation: &mut Observation, previous: Option<&Observation>, stream: Option<String>,
+    image: xcap::image::RgbaImage, path: std::path::PathBuf, (x, y, width, height): (f64, f64, f64, f64)) -> Result<Vec<Value>, String> {
+    let page = &observation.pages["pages"][0];
+    // Navigation, scroll, zoom, viewport changes or expired captures must start a fresh keyframe.
+    // Crops and full-page tiles stay whole; only the normal viewport has a frame stream.
+    let prior = previous.filter(|p| p.captured.elapsed() <= Duration::from_secs(180)
+        && page["stamp"].is_string() && p.pages["pages"][0]["stamp"] == page["stamp"]
+        && p.pages["pages"][0]["document"] == page["document"])
+        .and_then(|p| p.images.iter().find_map(|i| i.delivered.as_ref()));
+    let id = format!("{}-0", observation.id);
+    let pixels = image.dimensions();
+    let mut entry = json!({"imageId":id,"snapshotId":observation.id,"x":x,"y":y,"width":width,"height":height,
+        "pixelWidth":pixels.0,"pixelHeight":pixels.1});
+    let (delivered, delta) = crate::visual_guard::deliver_frame(&mut entry, prior, stream, image, None, path.clone())?;
+    let path = delivered.as_ref().map_or(path, |p| p.keyframe_path.clone());
+    observation.images.push(ScreenshotImage { id, path, x, y, width, height, pixels, delivered });
+    let mut images = vec![entry];
+    images.extend(delta);
+    Ok(images)
 }
 
 async fn capture_viewport(app:&AppHandle, viewport:&Value, x:f64, y:f64, w:f64, h:f64) -> Result<xcap::image::DynamicImage,String> {
@@ -846,8 +871,13 @@ async fn guard_coordinate(app:&AppHandle, observation:&Observation, point:&Value
     let bottom=(py+(24./sy).ceil()+1.).ceil().min((py+(vh-vy)/sy).floor()).min(image.pixels.1 as f64) as u32;
     if right<=left || bottom<=top {return Err("截图在落点附近分辨率不足，请截取局部高分辨率图片".into());}
     let (width,height)=(right-left,bottom-top);
-    let expected=xcap::image::open(&image.path).map_err(|e|e.to_string())?.to_rgba8();
-    let expected=xcap::image::imageops::crop_imm(&expected,left,top,width,height).to_image();
+    // A delta file is only a crop. Guard against the complete latest delivered pixels, never
+    // the old keyframe or a crop interpreted as a full viewport.
+    let expected = match &image.delivered {
+        Some(frame) => frame.seen.clone(),
+        None => std::sync::Arc::new(xcap::image::open(&image.path).map_err(|e| e.to_string())?.to_rgba8()),
+    };
+    let expected=xcap::image::imageops::crop_imm(expected.as_ref(),left,top,width,height).to_image();
     let actual=capture_viewport(app,&observation.pages["pages"][0]["viewport"],
         vx+(left as f64-px)*sx,vy+(top as f64-py)*sy,width as f64*sx,height as f64*sy).await?.to_rgba8();
     if crate::visual_guard::patch_changed(&expected,&actual) {
@@ -1075,7 +1105,7 @@ async fn snapshot(
                 std::fs::write(&path,bytes).map_err(|e|e.to_string())?;
                 let image_id=format!("{}-{tile}",observation.id);
                 // The expanded layout differs from the restored page: such tiles are read-only.
-                if expanded.is_none() {observation.images.push(ScreenshotImage{id:image_id.clone(),path:path.clone(),x,y,width:w,height:h,pixels});}
+                if expanded.is_none() {observation.images.push(ScreenshotImage{id:image_id.clone(),path:path.clone(),x,y,width:w,height:h,pixels,delivered:None});}
                 images.push(json!({"imageId":image_id,"path":path,"tile":tile,"x":x,"y":y,"width":w,"height":h,"pixelWidth":pixels.0,"pixelHeight":pixels.1}));
             }
             if let Some((viewport_height,complete))=expanded {
@@ -1095,6 +1125,8 @@ async fn snapshot(
         } else {
             let viewport=&observation.pages["pages"][0]["viewport"];
             let vw=viewport["width"].as_f64().ok_or("无效视口")?;let vh=viewport["height"].as_f64().ok_or("无效视口")?;
+            let stream = region.is_none().then(|| active_label(app)).transpose()?
+                .map(|label| format!("{}:viewport", label.rsplit(':').next().unwrap_or(&label)));
             let (x,y,w,h)=if let Some(region)=region {
                 let get=|key:&str|region[key].as_f64().filter(|v|v.is_finite()).ok_or("region 必须包含有限的 x/y/width/height");
                 let (x,y,w,h)=(get("x")?,get("y")?,get("width")?,get("height")?);
@@ -1102,13 +1134,16 @@ async fn snapshot(
                 (x.max(0.),y.max(0.),(x+w).min(vw)-x.max(0.),(y+h).min(vh)-y.max(0.))
             } else {(0.,0.,vw,vh)};
             let path=dir.join(format!("{}.jpg",observation.id));
-            let (bytes,pixels)=encode_screenshot(capture_viewport(app,viewport,x,y,w,h).await?,edge as u32)?;
-            std::fs::write(&path,bytes).map_err(|e|e.to_string())?;
-            let image_id=format!("{}-0",observation.id);
-            observation.images.push(ScreenshotImage{id:image_id.clone(),path:path.clone(),x,y,width:w,height:h,pixels});
-            images.push(json!({"imageId":image_id,"path":path,"x":x,"y":y,"width":w,"height":h,"pixelWidth":pixels.0,"pixelHeight":pixels.1}));
+            let image = resize_screenshot(capture_viewport(app,viewport,x,y,w,h).await?,edge as u32);
             let after=evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?;
             if after!=observation.pages["pages"][0]["stamp"] {return Err("截图期间视口变化，请重新截图".into());}
+            images = deliver_viewport(&mut observation, previous, stream, image, path, (x,y,w,h))?;
+            if images[0]["unchanged"] == true {
+                result["unchangedNotice"] = json!("画面与已交付的关键帧及最新增量无明显差异，未重复发送图片；使用本次 snapshotId/imageId，坐标仍以完整视口图为准。这不代表动作失败，页面仍在加载时可 wait 后观察，不重放输入。回看需同时读 keyframePath 及 latestDelta.path（如有），增量位置见 x/y。");
+            }
+            if images.iter().any(|i| i["deltaOf"].is_string()) {
+                result["deltaNotice"] = json!("只发送相对关键帧的累计变化区域，取代旧增量；区域外仍与关键帧一致。操作使用本次 snapshotId 和 deltaOf 对应的 imageId：增量图内坐标需加该图 x/y 偏移，区域外直接用关键帧坐标；不要换算 CSS/DPI。");
+            }
         }
         result["path"] = images[0]["path"].clone();
         result["images"] = json!(images);
@@ -2114,7 +2149,7 @@ mod tests {
     fn dom_refresh_keeps_screenshot_only_for_the_same_viewport() {
         let observed = |id: &str, stamp: Value, shot: bool| Observation { frames: Vec::new(), id: id.into(),
             pages: json!({"pages":[{"stamp":stamp}]}), captured: std::time::Instant::now(), screenshot: shot, full_page: false,
-            images: if shot { vec![ScreenshotImage { id: format!("{id}-0"), path: "a.png".into(), x: 0., y: 0., width: 10., height: 10., pixels: (10, 10) }] } else { Vec::new() } };
+            images: if shot { vec![ScreenshotImage { id: format!("{id}-0"), path: "a.png".into(), x: 0., y: 0., width: 10., height: 10., pixels: (10, 10), delivered: None }] } else { Vec::new() } };
         let shot = observed("old", json!("[\"u\",0]"), true);
         let mut same = observed("new", json!("[\"u\",0]"), false);
         assert_eq!(carry_screenshot(&mut same, Some(&shot)), Some(vec!["old-0".to_string()]));
@@ -2127,6 +2162,64 @@ mod tests {
             assert_eq!(carry_screenshot(&mut next, previous), None);
             assert_eq!(next.screenshot, had);
         }
+    }
+
+    #[test]
+    fn viewport_frames_share_delivery_without_losing_coordinates_or_scope() {
+        use xcap::image::{Rgba, RgbaImage};
+        let dir = tempfile::tempdir().unwrap();
+        let page = RgbaImage::from_pixel(320, 320, Rgba([255, 255, 255, 255]));
+        let observed = |id: &str| Observation { frames: Vec::new(), id: id.into(),
+            pages: json!({"pages":[{"stamp":"same-url-scroll-zoom","document":"doc"}]}),
+            captured: std::time::Instant::now(), screenshot: true, full_page: false, images: Vec::new() };
+        let deliver = |o: &mut Observation, p: Option<&Observation>, stream: Option<&str>, pixels: RgbaImage| {
+            let path = dir.path().join(format!("{}.jpg", o.id));
+            deliver_viewport(o, p, stream.map(str::to_owned), pixels, path, (0., 0., 640., 640.)).unwrap()
+        };
+        let mut first = observed("first");
+        let key = deliver(&mut first, None, Some("C1:viewport"), page.clone());
+        assert_eq!(key[0]["keyframe"], true);
+        assert_eq!(key[0]["frameGroup"], "first");
+        let mut typed = page.clone();
+        typed.put_pixel(150, 150, Rgba([0, 0, 0, 255]));
+        let mut next = observed("next");
+        let delta = deliver(&mut next, Some(&first), Some("C1:viewport"), typed.clone());
+        assert_eq!(delta.len(), 2);
+        assert!(delta[0]["path"].is_null());
+        assert_eq!(delta[1]["deltaOf"], "next-0");
+        assert_eq!((delta[1]["x"].as_u64(), delta[1]["y"].as_u64()), (Some(96), Some(96)));
+        assert_eq!(xcap::image::open(delta[1]["path"].as_str().unwrap()).unwrap().width(), 96);
+        assert!(!dir.path().join("next.jpg").exists(), "no redundant full-image encoding");
+        assert_eq!(next.images[0].point(150., 150.).unwrap(), (300., 300.));
+        assert_eq!(next.images[0].pixels, (320, 320));
+        assert_eq!(next.images[0].delivered.as_ref().unwrap().seen.get_pixel(150, 150), typed.get_pixel(150, 150), "preflight sees the complete current image, not the keyframe or crop");
+        let mut unchanged = observed("unchanged");
+        let same = deliver(&mut unchanged, Some(&next), Some("C1:viewport"), typed.clone());
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0]["unchanged"], true);
+        assert!(same[0]["path"].is_null());
+        assert_eq!(same[0]["latestDelta"]["path"], delta[1]["path"]);
+        assert_eq!(same[0]["latestDelta"]["deltaOf"], "unchanged-0");
+        let mut reverted = observed("reverted");
+        let restored = deliver(&mut reverted, Some(&unchanged), Some("C1:viewport"), page.clone());
+        assert_eq!(restored[1]["x"], delta[1]["x"], "reverts resend the cumulative box");
+        assert_eq!(restored[0]["frameGroup"], "first");
+        for case in ["scroll", "document", "expired", "tab", "size"] {
+            let mut prior = first.clone();
+            let mut fresh = observed(case);
+            if case == "scroll" { fresh.pages["pages"][0]["stamp"] = json!("new-scroll"); }
+            if case == "document" { fresh.pages["pages"][0]["document"] = json!("new-doc"); }
+            if case == "expired" { prior.captured -= Duration::from_secs(181); }
+            let stream = if case == "tab" { "C2:viewport" } else { "C1:viewport" };
+            let pixels = if case == "size" { RgbaImage::new(321, 320) } else { page.clone() };
+            let images = deliver(&mut fresh, Some(&prior), Some(stream), pixels);
+            assert_eq!(images[0]["keyframe"], true, "{case}");
+            assert_eq!(images[0]["frameGroup"], case);
+        }
+        let mut crop = observed("crop");
+        let images = deliver(&mut crop, Some(&first), None, page);
+        assert!(images[0]["path"].is_string() && images[0]["frameStream"].is_null());
+        assert!(crop.images[0].delivered.is_none(), "explicit crops always remain standalone");
     }
 
     #[test]
@@ -2291,7 +2384,7 @@ mod tests {
 
     #[test]
     fn pixel_crop_mapping_and_action_batches_are_bounded() {
-        let image=ScreenshotImage{id:"image".into(),path:"unused.png".into(),x:100.,y:300.,width:600.,height:400.,pixels:(1200,800)};
+        let image=ScreenshotImage{id:"image".into(),path:"unused.png".into(),x:100.,y:300.,width:600.,height:400.,pixels:(1200,800),delivered:None};
         assert_eq!(image.point(400.,200.).unwrap(),(300.,400.));
         assert!(image.point(1200.,0.).is_err());assert!(image.point(-1.,0.).is_err());assert!(image.point(f64::NAN,0.).is_err());
         let small=ScreenshotImage{pixels:(300,200),..image};assert_eq!(small.point(100.,50.).unwrap(),(300.,400.));

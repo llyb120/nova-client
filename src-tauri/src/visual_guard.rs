@@ -1,4 +1,4 @@
-//! Bounded pixel-only stale-target checks. This is not OCR or object recognition.
+//! Shared screenshot delivery and bounded pixel-only stale-target checks. No OCR or object recognition.
 use xcap::image::RgbaImage;
 
 /// Half-open rectangle in original image pixels, never display/cropped-image coordinates.
@@ -85,6 +85,139 @@ pub(crate) fn encode_jpeg(image: &RgbaImage) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// What the model holds for one screen/tab stream, before any cursor annotation.
+#[derive(Clone)]
+pub(crate) struct Delivered {
+    pub stream: String,
+    pub group: String,
+    pub keyframe_id: String,
+    pub basis: serde_json::Value,
+    pub keyframe: std::sync::Arc<RgbaImage>,
+    pub keyframe_path: std::path::PathBuf,
+    pub seen: std::sync::Arc<RgbaImage>,
+    pub seen_path: std::path::PathBuf,
+    pub delta: Option<PixelRect>,
+    pub deltas: u8,
+}
+
+pub(crate) const MAX_DELTAS: u8 = 8;
+const TILE: u32 = 32;
+pub(crate) enum Delivery { Unchanged, Delta(PixelRect), Keyframe }
+
+/// Compare to the last delivered pixels; deltas accumulate against the keyframe, including
+/// reverted areas. Bound both crop area and group length to keep context and prompt-cache churn small.
+pub(crate) fn plan_delivery(prior: Option<&Delivered>, pixels: &RgbaImage) -> Delivery {
+    let Some(p) = prior.filter(|p| p.seen.dimensions() == pixels.dimensions()) else { return Delivery::Keyframe };
+    if changed_tiles(&p.seen, pixels, None).is_some_and(|t| !t.contains(&true)) { return Delivery::Unchanged; }
+    if p.deltas >= MAX_DELTAS { return Delivery::Keyframe; }
+    let (w, h) = pixels.dimensions();
+    let fresh = changed_tiles(&p.keyframe, pixels, None).and_then(|t| changed_box(&t, (w, h)));
+    let b = match (fresh, p.delta) {
+        (Some(a), Some(b)) => PixelRect { left: a.left.min(b.left), top: a.top.min(b.top),
+            right: a.right.max(b.right), bottom: a.bottom.max(b.bottom) },
+        (a, b) => match a.or(b) { Some(r) => r, None => return Delivery::Keyframe },
+    };
+    // ponytail: one bounding box; far-apart changes exceed the quarter-image cap and become a keyframe.
+    if (b.right - b.left) as u64 * (b.bottom - b.top) as u64 * 4 <= w as u64 * h as u64 { Delivery::Delta(b) } else { Delivery::Keyframe }
+}
+
+fn changed_box(tiles: &[bool], (w, h): (u32, u32)) -> Option<PixelRect> {
+    let cols = w.div_ceil(TILE) as usize;
+    let mut changed = tiles.iter().enumerate().filter(|(_, c)| **c).map(|(i, _)| ((i % cols) as u32, (i / cols) as u32));
+    let (x, y) = changed.next()?;
+    let (l, t, r, b) = changed.fold((x, y, x, y), |(l, t, r, b), (x, y)| (l.min(x), t.min(y), r.max(x), b.max(y)));
+    Some(PixelRect { left: l.saturating_sub(1) * TILE, top: t.saturating_sub(1) * TILE,
+        right: ((r + 2) * TILE).min(w), bottom: ((b + 2) * TILE).min(h) })
+}
+
+/// Which 32×32 blocks visibly changed (any RGB channel > 16).
+pub(crate) fn changed_tiles(a: &RgbaImage, b: &RgbaImage, exclude: Option<PixelRect>) -> Option<Vec<bool>> {
+    let (w, h) = a.dimensions();
+    if b.dimensions() != (w, h) || w == 0 || h == 0 { return None; }
+    let cols = w.div_ceil(TILE) as usize;
+    let mut tiles = vec![false; cols * h.div_ceil(TILE) as usize];
+    let (ra, rb) = (a.as_raw(), b.as_raw());
+    // memcmp before per-pixel scans keeps unoptimized NovaDev builds fast.
+    if ra == rb { return Some(tiles); }
+    for y in 0..h as usize { for col in 0..cols {
+        let t = y / TILE as usize * cols + col;
+        let x0 = col * TILE as usize;
+        let span = (y * w as usize + x0) * 4..(y * w as usize + (x0 + TILE as usize).min(w as usize)) * 4;
+        if tiles[t] || ra[span.clone()] == rb[span.clone()] { continue; }
+        tiles[t] = ra[span.clone()].chunks_exact(4).zip(rb[span].chunks_exact(4)).enumerate().any(|(i, (p, q))| {
+            (0..3).any(|c| p[c].abs_diff(q[c]) > 16)
+                && !exclude.is_some_and(|r| r.contains((x0 + i) as f64, y as f64))
+        });
+    } }
+    Some(tiles)
+}
+
+/// Shared desktop/browser delivery. No `path` means no repeated attachment. The base entry describes
+/// the complete image; callers may register delta IDs that map local crop coordinates automatically.
+pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
+    plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf)
+    -> Result<(Option<Delivered>, Option<serde_json::Value>), String> {
+    use serde_json::json;
+    let mark = |entry: &mut serde_json::Value, p: &Delivered| {
+        entry["frameStream"] = json!(p.stream);
+        entry["frameGroup"] = json!(p.group);
+        entry["keyframeImageId"] = json!(p.keyframe_id);
+        entry["keyframePath"] = json!(p.keyframe_path);
+    };
+    let delta_entry = |p: &Delivered, b: PixelRect, path: &std::path::Path| {
+        let mut delta = json!({"deltaOf":entry["imageId"],"path":path,"x":b.left,"y":b.top,
+            "width":b.right-b.left,"height":b.bottom-b.top,"pixelWidth":b.right-b.left,"pixelHeight":b.bottom-b.top});
+        if let (Some(x), Some(y)) = (entry["cursor"]["x"].as_u64(), entry["cursor"]["y"].as_u64()) {
+            if b.contains(x as f64, y as f64) {
+                delta["cursor"] = entry["cursor"].clone();
+                delta["cursor"]["x"] = json!(x - b.left as u64);
+                delta["cursor"]["y"] = json!(y - b.top as u64);
+            }
+        }
+        mark(&mut delta, p);
+        delta
+    };
+    // Equal resized dimensions alone do not prove the same monitor geometry or source scale.
+    let basis = json!([entry["desktopBounds"], entry["originalWidth"], entry["originalHeight"]]);
+    let prior = prior.filter(|p| Some(&p.stream) == stream.as_ref() && p.basis == basis);
+    let image = annotated.unwrap_or(&plain);
+    match plan_delivery(prior, &plain) {
+        Delivery::Unchanged => {
+            let p = prior.unwrap();
+            let latest = p.delta.map(|b| delta_entry(p, b, &p.seen_path));
+            entry["unchanged"] = json!(true);
+            entry["samePixelsAs"] = json!(p.seen_path);
+            mark(entry, p);
+            // Reattach this only if compaction also removed the most recent delta.
+            if let Some(latest) = latest { entry["latestDelta"] = latest; }
+            Ok((Some(p.clone()), None))
+        }
+        Delivery::Delta(b) => {
+            let p = prior.unwrap();
+            let crop = xcap::image::imageops::crop_imm(image, b.left, b.top, b.right-b.left, b.bottom-b.top).to_image();
+            let path = path.with_file_name(format!("{}-delta.jpg", path.file_stem().unwrap_or_default().to_string_lossy()));
+            std::fs::write(&path, encode_jpeg(&crop)?).map_err(|e| e.to_string())?;
+            let delta = delta_entry(p, b, &path);
+            mark(entry, p);
+            Ok((Some(Delivered { seen: plain.into(), seen_path: path, delta: Some(b), deltas: p.deltas+1, ..p.clone() }), Some(delta)))
+        }
+        Delivery::Keyframe => {
+            std::fs::write(&path, encode_jpeg(image)?).map_err(|e| e.to_string())?;
+            entry["path"] = json!(path);
+            let delivered = stream.map(|stream| {
+                let plain = std::sync::Arc::new(plain);
+                let p = Delivered { stream, group: entry["snapshotId"].as_str().unwrap_or_default().into(),
+                    keyframe_id: entry["imageId"].as_str().unwrap_or_default().into(), basis, keyframe: plain.clone(),
+                    keyframe_path: path.clone(), seen: plain, seen_path: path, delta: None, deltas: 0 };
+                entry["keyframe"] = json!(true);
+                mark(entry, &p);
+                p
+            });
+            Ok((delivered, None))
+        }
+    }
+}
+
 pub(crate) fn patch_changed(before: &RgbaImage, after: &RgbaImage) -> bool {
     if before.width() == 0 || before.height() == 0 || after.width() == 0 || after.height() == 0 { return true; }
     let after = if before.dimensions() == after.dimensions() { after.clone() } else {
@@ -97,6 +230,28 @@ pub(crate) fn patch_changed(before: &RgbaImage, after: &RgbaImage) -> bool {
 mod tests {
     use super::*;
     use xcap::image::Rgba;
+    #[test]
+    fn delivery_compares_plain_pixels_and_keeps_cursor_in_crop_coordinates() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let page = RgbaImage::from_pixel(320, 320, Rgba([255, 255, 255, 255]));
+        let entry = |id| json!({"imageId":"window-1","snapshotId":id,"cursor":{"x":150,"y":150,"marker":"sword-tip"}});
+        let mut first = entry("key");
+        let (prior, _) = deliver_frame(&mut first, None, Some("window".into()), page.clone(), None, dir.path().join("key.jpg")).unwrap();
+        let mut annotated = page.clone();
+        annotated.put_pixel(150, 150, Rgba([0, 100, 255, 255]));
+        let mut same = entry("same");
+        let (_, delta) = deliver_frame(&mut same, prior.as_ref(), Some("window".into()), page.clone(), Some(&annotated), dir.path().join("same.jpg")).unwrap();
+        assert!(same["unchanged"] == true && delta.is_none(), "cursor annotation alone is not a change");
+        let mut changed = page;
+        changed.put_pixel(150, 150, Rgba([0, 0, 0, 255]));
+        let mut next = entry("delta");
+        let (seen, delta) = deliver_frame(&mut next, prior.as_ref(), Some("window".into()), changed.clone(), Some(&annotated), dir.path().join("delta.jpg")).unwrap();
+        let delta = delta.unwrap();
+        assert_eq!((delta["cursor"]["x"].as_u64(), delta["cursor"]["y"].as_u64()), (Some(54), Some(54)));
+        assert_eq!(seen.unwrap().seen.as_ref(), &changed, "guard pixels never contain the cursor marker");
+    }
+
     #[test]
     fn jpeg_screenshot_noise_is_not_a_visual_change() {
         // 密集细字 + 彩色控件：JPEG 最容易产生振铃的画面。

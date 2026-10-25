@@ -4,9 +4,9 @@
 
 系统级桌面工具，和 `chrome` 并存；浏览器网页操作仅用 `chrome`。通过 Enigo 注入原生鼠标键盘事件，通过 XCap 获取程序窗口和显示器截图；不使用 Playwright、DOM 或辅助模型。
 
-- `windows`：列出程序名称、窗口标题、PID、windowId、尺寸及monitorId；1x1等辅助窗口不适合交互。
-- `screenshot`：优先传 windowId 截目标窗口；省略则返回全部显示器独立图片（最多16屏）；已知monitorId时可只截一屏，不能同时传windowId。默认长边最多1600像素；`maxEdge: 0` 使用原分辨率，否则允许640–3840。
-- `act`：传 snapshotId、imageId 和 actions（1–16项），默认返回实际前台应用窗口的新截图，自动跟随新窗口/弹窗；任务视图等不可独立捕获的系统界面回退桌面。feedback=desktop可保留操作屏幕以观察窗口外菜单。返回imageId/坐标范围可能变化，下一步必须使用新图坐标。`feedback: "none"` 可省略截图，但下次操作前必须重新截图。
+- `windows`：列出程序名称、窗口标题、PID、windowId、尺寸及monitorId；1x1等辅助窗口不适合交互。普通模式 `observe:true` 时，windowId或query唯一命中只定位窗口所在显示器并截整屏，不裁窗口；指定query无匹配或有歧义时只返回候选信息，未指定目标时返回所有显示器。
+- `screenshot`：普通模式传windowId时截窗口当前所在显示器的整屏，不裁窗口；不传windowId/monitorId时返回全部显示器独立图片（最多16屏），每屏独立帧流；monitorId可只选一屏，不能同时传windowId。默认长边最多1600像素；`maxEdge: 0` 使用原分辨率，否则允许640–3840。显式 `background:true` 的独立模式见下文。
+- `act`：传 snapshotId、imageId 和 actions（1–16项）。普通模式默认 `feedback=screenshot` 返回所选图片对应显示器的整屏，`feedback=desktop` 返回所有显示器；均不追随前台窗口，不裁窗口，窗口外菜单已包含在整屏中。返回imageId/坐标范围可能变化，下一步必须使用对应新图坐标。`feedback: "none"` 可省略截图，但下次操作前必须重新截图。
 - 点击、双击、移动、拖拽、Unicode文本输入、组合键、双轴滚动和有界等待均为真实系统输入。坐标以**实际返回的图片像素**为准，服务端同步映射缩放、负坐标屏幕和Retina坐标；act继承快照的maxEdge。
 - `wait.ms` 仅允许0–2000，默认250。整批预校验：`actions[1].ms=8000，允许范围为 0–2000；本批次尚未执行` 意味着前面的点击也没执行。
 - `recall(imagePath)` 回看本会话历史结果的图片，不创建可操作快照，也不改变当前快照。旧图仅用于阅读，操作必须绑定当前观察。
@@ -17,12 +17,12 @@
 ```json
 {"operation":"windows"}
 {"operation":"screenshot","windowId":123}
-{"operation":"act","snapshotId":"上次返回值","imageId":"window-123","actions":[{"action":"click","x":180,"y":90},{"action":"type","text":"你好"}]}
+{"operation":"act","snapshotId":"上次返回值","imageId":"返回图片的imageId","actions":[{"action":"click","x":180,"y":90},{"action":"type","text":"你好"}]}
 ```
 
-窗口输入要求目标在前台；后台窗口可以截图，但不能盲目操作。窗口截图不会激活窗口。Windows上用activate(windowId)切到前台并直接返回新图；系统拒绝激活时才截桌面，用Win+Tab加wait 250ms显示任务视图或点击可见任务栏图标。不要盲目循环切窗或猜应用热键，同一路径连续失败两次应报告阻碍。用户指定剑来时，整个桌面任务只用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation及终端脚本操控应用。窗口位置/尺寸、焦点、显示器布局发生变化会拒绝旧坐标。快照180秒过期、仅消费一次，并绑定当前Nova会话。全局锁防止剑来并行操作同一桌面。批量动作只用于已确定的连续步骤；需要根据画面判断时拆分调用。批次内焦点改变且仍有后续输入时停止并返回新图，不把剩余键盘输入送进未知窗口。用户同时移动窗口/输入仍可能产生竞态，请操作时避免争用桌面。
+普通模式指针操作按当前整屏图片的可见像素定位，不区分窗口前后台，不因焦点隐式activate，也不能操作被遮挡内容；截图不会激活窗口。type/press要求焦点与观察一致，不一致拒绝输入，不自动切回或恢复。Windows上确需切窗时显式activate(windowId)，随后用返回的新图重新观察；系统拒绝激活时不继续发送按键，不盲目循环切窗或猜应用热键，同一路径连续失败两次应报告阻碍。用户指定剑来时，整个桌面任务只用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation及终端脚本操控应用。显示器布局、落点像素或键盘目标校验失败时拒绝相应输入。快照180秒过期、仅消费一次，并绑定当前Nova会话。全局锁防止剑来并行操作同一桌面。批量动作只用于已确定的连续步骤；需要根据画面判断时拆分调用。批次内焦点改变且仍有后续键盘输入时停止并返回新图，不把剩余按键送进未知窗口。用户同时移动窗口/输入仍可能产生竞态，请操作时避免争用桌面。
 
-`not_executed` 表示尚未发送输入。焦点、窗口几何或快照过期等目标校验失败会直接附带当前截图、新snapshotId、foreground与desktopBounds（即使feedback=none），不自动重放；窗口失焦、关闭或最小化时跟随实际前台窗口，无法捕获时改为桌面观察，原因保留在windowObservationError。不能根据焦点变化猜测是哪一个程序抢焦点。
+`not_executed` 表示尚未发送输入。焦点、显示器布局、落点像素或快照过期等校验失败会附恢复观察（即使feedback=none），不自动重放。普通模式恢复图仍按已选显示器/桌面范围取整屏，不因窗口失焦、关闭或最小化追随新的前台窗口，也不自动恢复焦点。不能根据焦点变化猜测是哪一个程序抢焦点。
 
 `executed` 表示输入已发送，不表示应用任务成功；`needs_review` 表示可能部分执行，检查completedActions/error和随附新图，禁止重放整个批次。观察失败会单独返回observationError，不掩盖执行状态。
 
@@ -48,9 +48,9 @@
 
 保留基本输入节拍：批次末尾的非 move/wait 动作后固定留300ms给应用绘制及异步剪贴板更新，不随动画延长；后接显式wait时不重复等待。纯move无额外等待，悬停菜单等需要时用move + wait。模型根据目标是否已就绪决定继续还是显式wait后观察；无关动画不等于未就绪，静止画面也不等于加载完成。不因反馈暂未变化而重放输入。
 
-分块增量截图继续保留：按32×32块比较RGB通道差异（阈值16），未变时复用已见画面，局部变化返回累计增量，变化包围盒超过画面四分之一则返回完整关键帧。动画也按真实变化发送，不再推测并隐藏动态区域。点击前的局部像素、窗口几何、焦点和快照校验不变；移除的是截图稳定门槛，不是输入安全校验。
+分块增量截图继续保留：普通模式按显示器维护独立流，按32×32块比较RGB通道差异（阈值16），未变时复用已见画面，局部变化返回累计增量，变化包围盒超过画面四分之一则返回完整关键帧。动画也按真实变化发送，不再推测并隐藏动态区域。增量图有自己的imageId，deltaOf是整屏基图ID，x/y是相对基图的偏移元数据，pixelWidth/pixelHeight是增量图尺寸，并附snapshotId。使用增量图自己的imageId与图内坐标时，工具自动映射偏移、缩放和DPI，不手加偏移；整屏坐标使用基图ID。像素未变时增量imageId保持稳定，unchanged结果中的latestDelta同样配最新snapshotId可用。像素、显示器布局、键盘焦点和快照校验仍保留；移除的是截图稳定门槛，不是输入安全校验。
 
-新图通过 snapshotId 标识一次观察，observationSequence 是进程内递增序号（重启重置）；每张图附 snapshotId、capturedAt（UTC）和单帧取样统计，窗口/屏幕范围沿用 windowId、imageId 与 desktopBounds。operation 标明来源，操作结果的 basedOnSnapshotId 指向输入依据。historical=false 仅表示本次新采集，并非永远有效；recall 仍标记 historical=true，不伪造原图采集时间或新快照。
+新图通过 snapshotId 标识一次观察，observationSequence 是进程内递增序号（重启重置）；每张图附 snapshotId、capturedAt（UTC）和单帧取样统计，普通模式屏幕范围由monitorId、imageId与desktopBounds标识，windowId只用于定位显示器。operation 标明来源，操作结果的 basedOnSnapshotId 指向输入依据。historical=false 仅表示本次新采集，并非永远有效；recall 仍标记 historical=true，不伪造原图采集时间或新快照。
 
 所有操作结果均为 verification=unverified：工具能确认输入执行状态，业务目标需模型依据最新图判断，但该字段不要求额外检查。速度优先：最新动作反馈已满足目标就立即汇报并结束，禁止再截图、查状态、等待或二次确认；仅有明确未完成证据时才做一次针对性复查，没有新信息就报告未确认项，不循环截图。结论须绑定已有截图及可见证据；未检查完整范围不能声称“全部”或“不存在”。notes 仍原样返回，须记录来源snapshotId和页面范围，不能跨页面混用；工具不验证笔记内容。本改动不删除、裁剪或压缩任何宿主的历史上下文。
 
@@ -60,11 +60,11 @@
 
 **本次不实施历史图片裁剪，也不要求宿主淘汰旧图。** 各后端仍按各自原有机制管理历史、请求组装、缓存策略、容量统计及上下文压缩。优化仅从新截图的尺寸、目标范围、调用策略和失败恢复入手，因此历史截图累计问题并未由本次改动解决。
 
-滚动阅读先写notes，未记录信息可recall回看。一批act里连放多个scroll时，每个非末尾scroll后自动附一张只读中间帧；若紧跟显式wait，则等这些wait执行完再取图（`images[].frame`仍为该scroll的序号，附`framesNotice`），一次调用读完多屏；中间帧只供阅读，后续act仍只用顶层snapshotId与最后一张图的坐标。不会删除本地旧图或重开会话来伪装上下文优化。
+滚动阅读先写notes，未记录信息可recall回看。一批act里连放多个scroll时，每个非末尾scroll后自动附一张只读中间帧；若紧跟显式wait，则等这些wait执行完再取图（`images[].frame`仍为该scroll的序号，附`framesNotice`），一次调用读完多屏；中间帧只供阅读、不参与普通帧流替换；后续act使用顶层最新snapshotId与最终观察中所选图片的imageId和坐标，不使用中间帧。不会删除本地旧图或重开会话来伪装上下文优化。
 
 ## 耗时诊断
 
-NovaDev对xcap、image、png及压缩依赖启用优化编译；分块变化检测先做整帧字节相等比较，静止画面无需逐像素扫描；缩放通过DynamicImage进入依赖内的优化实现，保留Triangle算法和相同像素尺寸。目标校验复用同一次窗口枚举完成几何与遮挡检查，不缓存到下一动作。纯图像基准可运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::screenshot_pipeline_benchmark -- --ignored --nocapture`，输出缩放/编码耗时，并验证与原缩放实现及PNG解码结果逐像素一致；此测试不操作桌面。
+NovaDev对xcap、image、png及压缩依赖启用优化编译；分块变化检测先做整帧字节相等比较，静止画面无需逐像素扫描；缩放通过DynamicImage进入依赖内的优化实现，保留Triangle算法和相同像素尺寸。输入校验按当前显示器布局、落点像素和键盘焦点执行，不以旧窗口裁剪范围代替当前屏幕观察。纯图像基准可运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::screenshot_pipeline_benchmark -- --ignored --nocapture`，输出缩放/编码耗时，并验证与原缩放实现及PNG解码结果逐像素一致；此测试不操作桌面。
 
 截图返回timingsMs：capture（系统捕获）、resize、encodeAndSave（PNG编码及落盘）、other（窗口枚举、焦点校验等）和total。MCP传输适配另返回deliveryTimingsMs（read/base64/total）及deliveredImageBytes；不包含网络及模型耗时。Windows前台身份检查直接读取窗口句柄与PID，避免每个动作多次枚举所有窗口及其元数据；这是只读状态检查，不负责激活。先比较这些分段数据，再决定是否换捕获后端/编码器，不据单次总耗时猜测瓶颈。
 
@@ -87,7 +87,7 @@ NovaDev对xcap、image、png及压缩依赖启用优化编译；分块变化检�
 
 ## 操作调度与定位
 
-批次内点击/双击和输入文字之后保留300ms，让应用弹出搜索框、下拉或刷新搜索结果后再接收下一个输入；按键、滚动等之后保留80ms基础处理时间；显式wait前后、move之后不叠加80ms，最后一项动作之后直接进入原有反馈取样，不再多等80ms。无需每个动作都追加400–900ms等待；只有已观察到加载或动画时再加短等待。scroll必须直接提供x/y/delta，自带鼠标定位，无需先move。click/double_click/move/drag 默认走拟人轨迹（`glide:false` 瞬移，scroll 始终瞬移定位）：时长随距离按 Fitts 定律在80–400ms内增长，最小加加速度缓动，随机±10%弧度，按实际耗时取样以免粗粒度 sleep 拉长；终点精确落在目标后仍做落点读回校验。默认开启以便用户看清指针去向；途中经过的元素会收到悬停，途经区域的悬停会弹出干扰浮层时改用 `glide:false`。drag 的按下段仍只在显式 `glide:true` 时走轨迹，否则沿用12步直线。相同已确认输入区的点击与输入可合批，跨页面、弹窗、对象确认仍拆分观察。输入框点击编辑区内部，避开工具栏；不清楚时先用窗口图定位，不盲点。窗口切换后的windowId仅选择反馈范围，不会通过系统API激活窗口。
+批次内点击/双击和输入文字之后保留300ms，让应用弹出搜索框、下拉或刷新搜索结果后再接收下一个输入；按键、滚动等之后保留80ms基础处理时间；显式wait前后、move之后不叠加80ms，最后一项动作之后直接进入原有反馈取样，不再多等80ms。无需每个动作都追加400–900ms等待；只有已观察到加载或动画时再加短等待。scroll必须直接提供x/y/delta，自带鼠标定位，无需先move。click/double_click/move/drag 默认走拟人轨迹（`glide:false` 瞬移，scroll 始终瞬移定位）：时长随距离按 Fitts 定律在80–400ms内增长，最小加加速度缓动，随机±10%弧度，按实际耗时取样以免粗粒度 sleep 拉长；终点精确落在目标后仍做落点读回校验。默认开启以便用户看清指针去向；途中经过的元素会收到悬停，途经区域的悬停会弹出干扰浮层时改用 `glide:false`。drag 的按下段仍只在显式 `glide:true` 时走轨迹，否则沿用12步直线。相同已确认输入区的点击与输入可合批，跨页面、弹窗、对象确认仍拆分观察。输入框点击编辑区内部，避开工具栏；不清楚时先用整屏图或显式局部截图定位，不盲点。普通捕获中的windowId只定位显示器，不会通过系统API激活窗口；act反馈也不随前台窗口切换。
 
 ## 应用规则的渐进式披露
 
@@ -97,27 +97,27 @@ NovaDev对xcap、image、png及压缩依赖启用优化编译；分块变化检�
 
 Windows截图会在系统读取的实际鼠标位置绘制与系统指针同款的剑形标记（系统截图本身不含指针），剑尖即落点，`images[].cursor`给出剑尖在当前图片内的坐标。标记只绘制在反馈图中，剑身会遮住剑尖右下方约20像素；剑尖光晕在反馈图里刻意比真实指针淡得多（`MARKER_GLOW` 对 `CURSOR_GLOW`），压住的内容仍可读，不干扰模型判断；点击前的像素守卫仍比较未绘制标记的原图。截取前后鼠标位置不同、鼠标在图外或截图为后台窗口时不标记。小目标或定位不确定时先单独move，看新图确认落点后再click；不要把待确认的move与click合批，也无需给每次点击增加往返。标记只证明鼠标落点，不证明识别的目标正确。
 
-Windows前台窗口从所在显示器的实际画面裁剪，保留窗口范围内独立弹出的候选框，避免PrintWindow截图遗漏浮层。窗口外菜单仍用feedback=desktop；跨屏、部分离屏或像素比例不一致时窗口裁剪拒绝执行，自动反馈回退桌面，显式screenshot可改用monitorId。后台窗口仍可独立截图，不能据此操作被遮挡内容。
+普通模式截图直接取显示器实际画面的整屏。windowId解析窗口的current_monitor，只选择该屏，不裁窗口；不指定windowId/monitorId时取所有显示器，不选择前台窗口。窗口外菜单、独立候选框和弹窗只要在屏幕上可见就包含在整屏中。显式background:true仍按上文独立后台/隔离规则执行，不把普通模式变成后台窗口操作。
 
 Windows的press字母/数字按虚拟键发送，Ctrl+A与Ctrl+a等价；大小写文本使用type，组合键的大写由显式Shift控制，避免Enigo将大写字符的修饰位误当成键码。
 
-`screenshot`指定windowId时可加`region:{x,y,width,height}`，区域以原始窗口图片originalWidth/originalHeight像素为准，先裁剪再按maxEdge缩放。返回图可直接用局部图片坐标act，工具负责偏移、缩放与负屏幕坐标映射；窗口几何校验仍检查完整窗口。act后的反馈恢复完整前台窗口，必须按新图重新定位。局部截图不读取DOM、UIAutomation或其它语义控件接口。
+`screenshot`可显式传`region:{x,y,width,height}`裁剪；普通模式`regionSpace=source`以所选显示器原始图片originalWidth/originalHeight像素为准，即使通过windowId选屏也不是窗口内坐标。先裁剪再按maxEdge缩放，返回图可直接用局部图片坐标act，工具负责偏移、缩放与负屏幕坐标映射，不手加region偏移。act的screenshot反馈恢复所选显示器整屏，desktop反馈取所有显示器，必须按对应新图重新定位。局部截图不读取DOM、UIAutomation或其它语义控件接口。
 
-缺少或误用旧snapshotId时，若本会话、同模式的最新快照未过期且未作废，act返回not_executed、snapshotPreserved和nextArguments，不重新截图、不延长快照寿命。使用已有最新图重新决策剩余动作，不重放已执行动作；下一次输入仍检查前台、几何和落点。没有可用快照或确实失效时才获取新观察。另一会话持有的快照仍拒绝访问，不覆盖它。只允许最新截图操作，查看其它窗口会替换当前快照；旧图回看使用recall。
+缺少或误用旧snapshotId时，若本会话、同模式的最新快照未过期且未作废，act返回not_executed、snapshotPreserved和nextArguments，不重新截图、不延长快照寿命。使用已有最新图重新决策剩余动作，不重放已执行动作；下一次输入仍按动作类型检查显示器布局、落点像素和键盘焦点。没有可用快照或确实失效时才获取新观察。另一会话持有的快照仍拒绝访问，不覆盖它。只允许最新截图操作，查看其它窗口会替换当前快照；旧图回看使用recall。
 
 窄输入栏或地址看不清时先局部截图；一次误点后不要继续猜坐标。联系人以完整地址和已提交标签核实，红色错误标签不算成功；下拉列表变化后重新定位。正文在确认焦点后整段输入，误输入先确定内容和选区，不靠盲目Backspace试错。用户要求只准备草稿时，禁止发送和发送快捷键。
 
 ## 精准定位增强
 
-`regionSpace=image` 可按最新返回图片的像素给出局部裁剪区域，必须同时提供该图的 `snapshotId/imageId`；工具反算裁剪和缩放，重新采集细节图。默认 `regionSpace=source` 兼容原始图片坐标，需要 `windowId` 或 `monitorId`。局部图生成后旧快照失效。
+`regionSpace=image` 可按最新返回图片的像素给出局部裁剪区域，必须同时提供该图的 `snapshotId/imageId`；工具反算裁剪和缩放，重新采集细节图。默认 `regionSpace=source` 在普通模式使用原始显示器图片坐标，需要 `windowId` 或 `monitorId` 选屏；显式background:true的macOS窗口截图仍使用原始窗口图片坐标。局部图生成后旧快照失效。
 
-点击/双击/拖动前检查未绘制鼠标标记的原始落点邻域（滚动不检查：同一点连续滚动必然改变画面，且滚动可逆）。Windows瞬移用SetCursorPos直接接受桌面坐标；拟人轨迹及拖动的路径点先发送按虚拟桌面归一化的SendInput真实输入，再用SetCursorPos校正，避免Enigo按主屏归一化造成多屏偏移；移动后读取系统实际位置，各轴允许最多2个原生像素的舍入误差，超过仍停止按钮输入，不做猜测补偿。轨迹移动、落点后、拖动、滚动和输入文字期间前台被其他窗口（通知、弹窗）抢走时切回原前台继续，切不回才停止，不当作用户中断（只有用户按 Esc 才中断）；动作开始前前台已与截图不一致时，窗口快照的报错直接提示 activate(windowId)，无需先重新截图；第一次点击后前台变化也不继续双击第二次。保留原有反馈稳定检查。像素守卫是启发式，不是控件识别，不承诺捕获所有视觉变化或竞态。
+点击/双击/拖动前检查未绘制鼠标标记的原始落点邻域；glide移动到落点后再次检查，双击第一次点击后、第二次点击前也复查，像素不符就停止后续按钮输入（滚动不检查：同一点连续滚动必然改变画面，且滚动可逆）。Windows瞬移用SetCursorPos直接接受桌面坐标；拟人轨迹及拖动的路径点先发送按虚拟桌面归一化的SendInput真实输入，再用SetCursorPos校正，避免Enigo按主屏归一化造成多屏偏移；移动后读取系统实际位置，各轴允许最多2个原生像素的舍入误差，超过仍停止按钮输入，不做猜测补偿。普通指针输入不根据窗口焦点隐式activate；键盘输入前焦点与观察不符时拒绝输入，不切回原前台继续，也不自动恢复。批次内焦点改变且还有剩余键盘输入时停止并返回新图；确需切窗时显式activate后重新观察，再决定后续动作。反馈只采一帧，不等待稳定。像素守卫是启发式，不是控件识别，不承诺捕获所有视觉变化或竞态。
 
 本轮未在 Windows 编译和执行原生输入链；新原生单元测试和验收入口见 [精准交互说明](automation-precision.md)。
 
 ### 切窗和裁剪恢复
 
-Windows 用 activate(windowId) 激活 windows 返回的窗口并取得新截图；windowId 不是 pid。系统拒绝激活时不会发送后续按键。单图快照的纯 press/type/wait 批次可以省略 imageId；坐标动作、多图和显式错误 ID 不做猜测。ID 错误返回当前可用 ID，无需额外截图。裁剪图坐标从左上角 (0,0) 开始，不加 region 偏移；以返回的 width/height 为准，操作后反馈恢复完整窗口。
+Windows 用显式 activate(windowId) 激活 windows 返回的窗口并取得所在显示器的整屏新图；windowId 不是 pid。系统拒绝激活时不会发送后续按键。需要输入的act仅在当前快照恰好一张图片时可省略imageId；基图+增量图仍是两张，必须明确imageId，不因属于同一显示器就猜选。错误ID返回当前可用ID，无需额外截图。纯wait不授权输入，可用有效imageId选择观察显示器；无效/旧ID忽略并默认观察可用显示器。裁剪图坐标从左上角(0,0)开始，不加region偏移；以返回图片的像素尺寸为准，操作后的screenshot反馈恢复所选显示器整屏。
 
 ### 局部放大与失败反馈
 

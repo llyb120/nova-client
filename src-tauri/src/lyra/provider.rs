@@ -102,12 +102,18 @@ fn tool_result_text(message: &Value) -> String {
 
 fn screenshot_caption(message: &Value) -> String {
     let details = &message["details"];
-    let images: Vec<Value> = details["images"].as_array().into_iter().flatten().take(16)
-        .map(|image| json!({"imageId":image["imageId"],"pixelWidth":image["pixelWidth"],"pixelHeight":image["pixelHeight"]})).collect();
+    let images: Vec<Value> = detail_images(message).iter()
+        .flat_map(|image| std::iter::once(image).chain(image.get("latestDelta")).map(move |part| {
+            let mut metadata = json!({"imageId":part["imageId"],"deltaOf":part["deltaOf"],"x":part["x"],"y":part["y"],
+                "monitorId":part.get("monitorId").unwrap_or(&image["monitorId"]),
+                "pixelWidth":part["pixelWidth"],"pixelHeight":part["pixelHeight"]});
+            if let Some(frame) = part.get("frame") { metadata["frame"] = frame.clone(); }
+            metadata
+        })).collect();
     let frames = if detail_images(message).iter().any(|i| frame_of(message, i).is_some()) {
-        " Exception for desktop frame groups: a keyframe's coordinates stay valid with the latest snapshotId and imageId of the same screen, and a delta crop's coordinates need its stated offset added."
+        " Exception for screenshot frame groups: within the same tool, frameStream and frameGroup, a keyframe's coordinates stay valid with the latest snapshotId and the full/base imageId (deltaOf for a delta), not the delta crop's own imageId."
     } else { "" };
-    format!("Browser screenshots for toolCallId={}, snapshotId={}; images in order: {}. With imageId, use coordinates measured directly on that returned image in image pixels. NEVER rescale using CSS viewport dimensions, DPI or crop offsets: the tool maps these automatically. Do not reuse coordinates from another image.{frames} {}",
+    format!("Tool screenshot metadata for toolCallId={}, snapshotId={}: {}. Metadata may describe retained images, not attachments; latestDelta on unchanged results is also usable with this snapshotId. Intermediate scroll images marked with frame are READ-ONLY, never action targets. Use image-pixel coordinates with imageId; NEVER rescale using CSS viewport dimensions or DPI. Standalone crops and DELTA crops with their own imageId use local image pixels directly; the tool maps offsets automatically. Only DELTA crops without their own imageId add their stated x/y pixel offset once and use deltaOf as imageId. Do not reuse coordinates from another image.{frames} {}",
         message["toolCallId"], details["snapshotId"], json!(images), details["coordinateSpace"].as_str().unwrap_or_default())
 }
 
@@ -118,29 +124,30 @@ fn detail_images(message: &Value) -> &[Value] {
     message.pointer("/details/images").and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
-/// 剑来截图的 (frameStream, frameGroup)：每块屏幕/窗口流各自分组。其他工具的图片没有分组。
-fn frame_of<'a>(message: &Value, image: &'a Value) -> Option<(&'a str, &'a str)> {
-    if message["role"] != "toolResult" || message["toolName"] != "jianlai" { return None; }
-    Some((image["frameStream"].as_str()?, image["frameGroup"].as_str()?))
+/// Chrome/webview/剑来截图的 ((toolName, frameStream), frameGroup)：流按工具隔离，缺少分组元数据或带 frame 的只读中间图不参与。
+fn frame_of<'a>(message: &'a Value, image: &'a Value) -> Option<((&'a str, &'a str), &'a str)> {
+    let tool = message["toolName"].as_str()?;
+    if message["role"] != "toolResult" || !matches!(tool, "chrome" | "webview" | "jianlai") || image.get("frame").is_some() { return None; }
+    Some(((tool, image["frameStream"].as_str()?), image["frameGroup"].as_str()?))
 }
 
-/// 每条消息里 details.images 各张图是否内嵌。剑来每条流只内嵌当前关键帧组（关键帧及其增量）：组内不滑动，
-/// 换新关键帧时旧组一次性换成路径，提示缓存每组只失效一次。其他图片（其他工具、剑来局部截图）始终留在原位。
+/// 每条消息里 details.images 各张图是否内嵌。受支持工具的每条流只内嵌当前关键帧组（关键帧及其增量）：组内不滑动，
+/// 换新关键帧时旧组一次性换成路径，提示缓存每组只失效一次。未分组图片（含普通工具图片、局部截图）始终留在原位。
 fn tool_image_embeds(messages: &[Value]) -> Vec<Vec<Embed>> {
     let frames = |m| detail_images(m).iter().map(move |i| frame_of(m, i).map(|f| (f, i)));
-    let current: std::collections::HashMap<&str, &str> = messages.iter().flat_map(frames).flatten().map(|(f, _)| f).collect();
+    let current: HashMap<(&str, &str), &str> = messages.iter().flat_map(frames).flatten().map(|(f, _)| f).collect();
     // 压缩可能折叠掉当前关键帧：在该组第一张上按 keyframePath 补回，增量才有参照。
-    let mut anchored: std::collections::HashSet<&str> = messages.iter().flat_map(frames).flatten()
+    let mut anchored: std::collections::HashSet<(&str, &str)> = messages.iter().flat_map(frames).flatten()
         .filter(|((s, g), i)| current.get(s) == Some(g) && i["keyframe"] == true && i["path"].is_string())
         .map(|((s, _), _)| s).collect();
     messages.iter().map(|m| frames(m).map(|f| match f {
         None => Embed::Image,
-        Some(((s, g), _)) if current.get(s) == Some(&g) => if anchored.insert(s) { Embed::WithKeyframe } else { Embed::Image },
+        Some(((s, g), _)) if current.get(&s) == Some(&g) => if anchored.insert(s) { Embed::WithKeyframe } else { Embed::Image },
         Some(_) => Embed::Omit,
     }).collect()).collect()
 }
 
-/// 413 兜底时保留的非剑来分组带图工具结果条数。
+/// 413 兜底时保留的带未分组图片的工具结果条数。
 const RECENT_TOOL_IMAGES: usize = 3;
 
 pub(crate) fn is_payload_too_large(error: &str) -> bool {
@@ -148,7 +155,7 @@ pub(crate) fn is_payload_too_large(error: &str) -> bool {
     ["http 413", "payload too large", "request entity too large", "request_too_large"].iter().any(|f| message.contains(f))
 }
 
-/// 413 后改写上下文时使用：剑来分组以外的带图工具结果只留最近 RECENT_TOOL_IMAGES 条，更早的换成路径说明；没有可省的图时返回 None。
+/// 413 后改写上下文时使用：未分组图片只留最近 RECENT_TOOL_IMAGES 条带图工具结果，更早的换成路径说明；关键帧组不动，没有可省的图时返回 None。
 pub(crate) fn drop_old_tool_images(messages: &[Value]) -> Option<Vec<Value>> {
     let loose = |m: &Value, i: &Value| frame_of(m, i).is_none() && i["path"].is_string();
     let has_images = |m: &Value| m["role"] == "toolResult"
@@ -185,7 +192,7 @@ pub(crate) fn drop_old_tool_images(messages: &[Value]) -> Option<Vec<Value>> {
     Some(out)
 }
 
-/// 工具结果文本与要内嵌的图片；剑来旧关键帧组的图换成路径/imageId 说明，需要时由模型再读。
+/// 工具结果文本与要内嵌的图片；受支持工具的旧关键帧组换成路径/imageId 说明，需要时由模型再读。
 fn tool_result_parts(message: &Value, model: &ResolvedModel, embeds: &[Embed]) -> (String, Vec<Value>) {
     let mut text = tool_result_text(message);
     if !model.supports_images && (message["content"].as_array().is_some_and(|parts|
@@ -201,7 +208,7 @@ fn tool_result_parts(message: &Value, model: &ResolvedModel, embeds: &[Embed]) -
         } else { format!("imageId={} path={path}", image["imageId"]) }))
         .collect();
     if model.supports_images && !omitted.is_empty() {
-        text.push_str(&format!("\n\n[Earlier screenshot omitted from context: a newer keyframe of the same screen replaced it: {}. Use read on the path if you need to look again; its imageId is stale, act only on the latest screenshot.]", omitted.join("; ")));
+        text.push_str(&format!("\n\n[Earlier screenshot omitted from context: a newer keyframe in the same tool and frame stream replaced it: {}. Use read on the path if you need to look again; its imageId is stale, act only on the latest screenshot.]", omitted.join("; ")));
     }
     (text, tool_result_images(message, model, embeds))
 }
@@ -229,20 +236,35 @@ fn tool_result_images(message: &Value, model: &ResolvedModel, embeds: &[Embed]) 
         }))
     };
     let plans = embeds.iter().copied().chain(std::iter::repeat(Embed::Image));
-    for (metadata, embed) in detail_images(message).iter().zip(plans).take(16) {
+    for (metadata, embed) in detail_images(message).iter().zip(plans) {
         if embed == Embed::Omit { continue; }
+        let monitor_id = metadata.get("monitorId");
+        let monitor = monitor_id.map(|id| format!("; monitorId={id}")).unwrap_or_default();
         if let Some(path) = metadata["keyframePath"].as_str().filter(|_| embed == Embed::WithKeyframe) {
-            images.extend(file(path, format!("Keyframe re-attached (its original message was compacted): the latest full image of this screen (imageId={} when captured) that later deltas apply to; its coordinates stay valid with the latest snapshotId and imageId.",
-                metadata["keyframeImageId"])));
+            images.extend(file(path, format!("Keyframe re-attached (its original message was compacted): the full image of this frame group (imageId={} when captured) that later deltas apply to; snapshotId={snapshot}{monitor}. For full-keyframe coordinates use imageId={}, not a delta crop's imageId, in the same tool, frameStream and frameGroup.",
+                metadata["keyframeImageId"], metadata.get("deltaOf").filter(|id| id.is_string()).unwrap_or(&metadata["imageId"]))));
         }
-        let Some(path) = metadata["path"].as_str() else { continue };
-        images.extend(file(path, if metadata["deltaOf"].is_string() {
-            format!("This image: DELTA crop of this screen's keyframe (imageId={kid} when captured), {}×{} image pixels whose (0,0) is ({x},{y}) in the keyframe, same scale; snapshotId={snapshot}. It supersedes earlier deltas and everything outside it equals the keyframe. To click inside it use imageId={k} with (x+{x}, y+{y}); outside it use keyframe coordinates directly with imageId={k}.",
-                metadata["pixelWidth"], metadata["pixelHeight"], kid=metadata["keyframeImageId"], k=metadata["deltaOf"], x=metadata["x"], y=metadata["y"])
-        } else {
-            format!("This image: imageId={}, {}×{} image pixels; snapshotId={snapshot}. Use these image pixels directly with imageId, without CSS/DPI conversion.",
-                metadata["imageId"], metadata["pixelWidth"], metadata["pixelHeight"])
-        }));
+        // 压缩后首条可能是 unchanged：只在补关键帧时重附最后的增量，正常上下文不重复发图。
+        for metadata in metadata.get("latestDelta").filter(|_| embed == Embed::WithKeyframe)
+            .into_iter().chain(std::iter::once(metadata)) {
+            let Some(path) = metadata["path"].as_str() else { continue };
+            let monitor = metadata.get("monitorId").or(monitor_id).map(|id| format!("; monitorId={id}")).unwrap_or_default();
+            images.extend(file(path, if let Some(frame) = metadata.get("frame") {
+                format!("This image: READ-ONLY intermediate scroll frame={frame}, {}×{} image pixels; snapshotId={snapshot}{monitor}. For reading only; do not use its imageId or coordinates for actions.",
+                    metadata["pixelWidth"], metadata["pixelHeight"])
+            } else if metadata["deltaOf"].is_string() {
+                let coordinates = if metadata["imageId"].is_string() {
+                    format!("To act inside it use imageId={} with local crop pixels directly; the tool maps the x/y offset and DPI automatically. Do not add offsets.", metadata["imageId"])
+                } else {
+                    format!("This legacy DELTA has no imageId of its own. To act inside it use imageId={} with (x+{}, y+{}); add the offset exactly once.", metadata["deltaOf"], metadata["x"], metadata["y"])
+                };
+                format!("This image: DELTA crop of this frame group's keyframe (imageId={kid} when captured), {}×{} image pixels whose (0,0) is ({x},{y}) in the keyframe, same scale; snapshotId={snapshot}{monitor}. It supersedes earlier deltas and everything outside it equals the keyframe. {coordinates} Outside it use keyframe coordinates directly with imageId={k}.",
+                    metadata["pixelWidth"], metadata["pixelHeight"], kid=metadata["keyframeImageId"], k=metadata["deltaOf"], x=metadata["x"], y=metadata["y"])
+            } else {
+                format!("This image: imageId={}, {}×{} image pixels; snapshotId={snapshot}{monitor}. Use these image pixels directly with imageId, without CSS/DPI conversion.",
+                    metadata["imageId"], metadata["pixelWidth"], metadata["pixelHeight"])
+            }));
+        }
     }
     if let Some(path) = message.pointer("/details/imagePath").and_then(Value::as_str) {
         images.extend(file(path, format!("This image: imageId=null, null×null image pixels; snapshotId={snapshot}. Use these image pixels directly with imageId, without CSS/DPI conversion.")));
@@ -2675,45 +2697,164 @@ mod tests {
     }
 
     #[test]
-    fn desktop_frame_groups_replace_only_their_own_stream() {
+    fn screenshot_frame_groups_replace_only_their_own_stream() {
         use Embed::*;
         let model = test_model("openai-completions");
-        let shot = |i: usize, images: Value| json!({"role":"toolResult","toolName":"jianlai","toolCallId":format!("call-{i}"),
-            "content":[{"type":"text","text":"ok"}],"details":{"snapshotId":format!("snap{i}"),"images":images}});
-        let key = |stream: &str, group: &str| json!({"imageId":format!("{stream}-0"),"path":format!("C:/shots/{group}.png"),
-            "frameStream":stream,"frameGroup":group,"keyframe":true,"keyframeImageId":format!("{stream}-0"),"keyframePath":format!("C:/shots/{group}.png")});
-        let full = |stream: &str, group: &str| json!({"imageId":format!("{stream}-0"),"frameStream":stream,"frameGroup":group,
-            "keyframeImageId":format!("{stream}-0"),"keyframePath":format!("C:/shots/{group}.png")});
-        let delta = |stream: &str, group: &str, n: usize| json!({"deltaOf":format!("{stream}-0"),"path":format!("C:/shots/{group}-d{n}.png"),
-            "x":10,"y":20,"frameStream":stream,"frameGroup":group,"keyframeImageId":format!("{stream}-0"),"keyframePath":format!("C:/shots/{group}.png")});
-        let browser = json!({"role":"toolResult","toolName":"chrome","toolCallId":"b","content":[],
-            "details":{"images":[{"imageId":"tab-0","path":"C:/shots/tab.png","frameStream":"window","frameGroup":"x"}]}});
-        let messages = vec![
-            shot(0, json!([key("monitor-1","a"), key("monitor-2","m")])),
-            shot(1, json!([full("monitor-1","a"), delta("monitor-1","a",1), full("monitor-2","m")])),
-            browser.clone(),
-            shot(3, json!([key("monitor-1","b"), full("monitor-2","m"), delta("monitor-2","m",1)])),
-            shot(4, json!([full("monitor-1","b"), delta("monitor-1","b",1)])),
-        ];
-        // Monitor 1's old group is replaced once; monitor 2's group and other tools' images stay put.
-        assert_eq!(tool_image_embeds(&messages), vec![vec![Omit, Image], vec![Omit, Omit, Image], vec![Image],
-            vec![Image, Image, Image], vec![Image, Image]]);
-        let (text, images) = tool_result_parts(&messages[1], &model, &[Omit, Omit, Image]);
-        assert!(images.is_empty() && text.contains("C:/shots/a-d1.png") && text.contains("delta of imageId"), "{text}");
-        // A compacted keyframe is re-attached on its group's first remaining image.
-        assert_eq!(tool_image_embeds(&messages[4..]), vec![vec![WithKeyframe, Image]]);
-        assert_eq!(tool_image_embeds(&[browser.clone()]), vec![vec![Image]], "other tools never join frame groups");
+        for tool in ["chrome", "webview", "jianlai"] {
+            let shot = |i: usize, images: Value| json!({"role":"toolResult","toolName":tool,"toolCallId":format!("call-{i}"),
+                "content":[{"type":"text","text":"ok"}],"details":{"snapshotId":format!("snap{i}"),"images":images}});
+            let key = |stream: &str, group: &str| json!({"imageId":format!("{stream}-0"),"path":format!("C:/shots/{group}.png"),
+                "frameStream":stream,"frameGroup":group,"keyframe":true,"keyframeImageId":format!("{stream}-0"),"keyframePath":format!("C:/shots/{group}.png")});
+            let full = |stream: &str, group: &str| json!({"imageId":format!("{stream}-0"),"frameStream":stream,"frameGroup":group,
+                "keyframeImageId":format!("{stream}-0"),"keyframePath":format!("C:/shots/{group}.png")});
+            let delta = |stream: &str, group: &str, n: usize| json!({"deltaOf":format!("{stream}-0"),"path":format!("C:/shots/{group}-d{n}.png"),
+                "x":10,"y":20,"frameStream":stream,"frameGroup":group,"keyframeImageId":format!("{stream}-0"),"keyframePath":format!("C:/shots/{group}.png")});
+            let plain = shot(2, json!([{"imageId":"plain-0","path":"C:/shots/plain.png"}]));
+            let messages = vec![
+                shot(0, json!([key("tab-1","a"), key("tab-2","m")])),
+                shot(1, json!([full("tab-1","a"), delta("tab-1","a",1), full("tab-2","m")])),
+                plain.clone(),
+                shot(3, json!([key("tab-1","b"), full("tab-2","m"), delta("tab-2","m",1)])),
+                shot(4, json!([full("tab-1","b"), delta("tab-1","b",1)])),
+            ];
+            // A new group on tab 1 replaces only that tab's old group; tab 2 and ungrouped images stay.
+            assert_eq!(tool_image_embeds(&messages), vec![vec![Omit, Image], vec![Omit, Omit, Image], vec![Image],
+                vec![Image, Image, Image], vec![Image, Image]], "{tool}");
+            let (text, images) = tool_result_parts(&messages[1], &model, &[Omit, Omit, Image]);
+            assert!(images.is_empty() && text.contains("C:/shots/a-d1.png") && text.contains("delta of imageId"), "{text}");
+            // A compacted keyframe is re-attached on its group's first remaining image.
+            assert_eq!(tool_image_embeds(&messages[4..]), vec![vec![WithKeyframe, Image]], "{tool}");
+            assert_eq!(tool_image_embeds(&[plain.clone()]), vec![vec![Image]], "ungrouped images stay unchanged");
+            assert!(screenshot_caption(&messages[0]).contains("Exception for screenshot frame groups"));
+            assert!(!screenshot_caption(&plain).contains("Exception"));
+            // A scratch scroll keyframe must not join the monitor stream or be omitted by the final unchanged group.
+            let mut intermediate = key("tab-1", "scratch");
+            intermediate["frame"] = json!(0);
+            let scrolling = shot(6, json!([intermediate, full("tab-1", "b")]));
+            assert!(frame_of(&scrolling, &scrolling["details"]["images"][0]).is_none());
+            assert_eq!(tool_image_embeds(&[shot(5, json!([key("tab-1", "b")])), scrolling]),
+                vec![vec![Image], vec![Image, Image]], "{tool}: intermediate frames stay standalone");
 
-        // 413 fallback: only other tools' images beyond the latest three are dropped; frame groups stay.
-        assert!(is_payload_too_large("HTTP 413 Payload Too Large") && !is_payload_too_large("HTTP 429"));
-        let mut history = messages.clone();
-        history.extend((0..3).map(|i| { let mut b = browser.clone(); b["details"]["images"][0]["path"] = json!(format!("C:/shots/tab{i}.png")); b }));
-        let trimmed = drop_old_tool_images(&history).unwrap();
-        assert!(trimmed[2]["details"]["images"][0]["path"].is_null());
-        assert!(trimmed[2]["content"].to_string().contains("C:/shots/tab.png"));
-        assert_eq!(trimmed[3], history[3], "desktop frame groups are untouched");
-        assert_eq!(&trimmed[5..], &history[5..]);
-        assert!(drop_old_tool_images(&history[5..]).is_none());
+            // 413 fallback drops only ungrouped images beyond the latest three, never the current frame group.
+            assert!(is_payload_too_large("HTTP 413 Payload Too Large") && !is_payload_too_large("HTTP 429"));
+            let mut history = messages.clone();
+            history.extend((0..3).map(|i| { let mut p = plain.clone(); p["details"]["images"][0]["path"] = json!(format!("C:/shots/plain{i}.png")); p }));
+            let trimmed = drop_old_tool_images(&history).unwrap();
+            assert!(trimmed[2]["details"]["images"][0]["path"].is_null());
+            assert!(trimmed[2]["content"].to_string().contains("C:/shots/plain.png"));
+            assert_eq!(&trimmed[..2], &history[..2], "{tool} frame groups are untouched");
+            assert_eq!(&trimmed[3..], &history[3..], "{tool} current keyframe and deltas stay");
+            assert_eq!(tool_image_embeds(&trimmed), tool_image_embeds(&history));
+            assert!(drop_old_tool_images(&trimmed).is_none());
+        }
+    }
+
+    #[test]
+    fn screenshot_frame_streams_are_isolated_by_tool() {
+        use Embed::*;
+        let shot = |tool: &str, group: &str, keyframe: bool| json!({"role":"toolResult","toolName":tool,"content":[],
+            "details":{"images":[{"path":"C:/shots/frame.png","frameStream":"shared","frameGroup":group,"keyframe":keyframe,
+                "keyframePath":"C:/shots/key.png","keyframeImageId":"key-0"}]}});
+        let messages = vec![
+            shot("jianlai", "a", true), shot("chrome", "old", true), shot("webview", "b", true),
+            shot("chrome", "a", false), shot("chrome", "a", false), shot("read", "other", false),
+        ];
+        // Both latest-group selection and missing-keyframe detection must use the tool namespace.
+        assert_eq!(tool_image_embeds(&messages), vec![vec![Image], vec![Omit], vec![Image],
+            vec![WithKeyframe], vec![Image], vec![Image]]);
+        assert!(drop_old_tool_images(&messages).is_none(), "frame groups do not consume the loose-image budget");
+        let mut incomplete = messages[3].clone();
+        for field in ["frameStream", "frameGroup"] {
+            incomplete["details"]["images"][0][field] = Value::Null;
+            assert_eq!(tool_image_embeds(&[incomplete.clone()]), vec![vec![Image]], "missing {field}");
+            incomplete = messages[3].clone();
+        }
+    }
+
+    #[test]
+    fn screenshot_frame_keyframes_are_reattached_after_compaction() {
+        let dir = std::env::temp_dir().join(format!("nova-provider-frames-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&dir).unwrap();
+        let key = dir.join("key.png");
+        let delta = dir.join("delta.png");
+        std::fs::write(&key, b"keyframe").unwrap();
+        std::fs::write(&delta, b"delta").unwrap();
+        let model = test_model("openai-completions");
+        for tool in ["chrome", "webview", "jianlai"] {
+            let base = json!({"imageId":"full-0","frameStream":"tab","frameGroup":"group","keyframePath":key,"keyframeImageId":"key-0","monitorId":7});
+            let mut crop = json!({"frameStream":"tab","frameGroup":"group","path":delta,"deltaOf":"full-0","monitorId":7,
+                "keyframePath":key,"keyframeImageId":"key-0","x":10,"y":20,"pixelWidth":30,"pixelHeight":40});
+            let actionable = tool == "jianlai";
+            if actionable { crop["imageId"] = json!("delta-0"); }
+            let messages: Vec<Value> = (0..2).map(|n| json!({"role":"toolResult","toolName":tool,"toolCallId":format!("call-{n}"),
+                "content":[],"details":{"snapshotId":format!("snap-{n}"),"images":[base, crop]}})).collect();
+            // A delta alone must re-attach the full keyframe with the BASE id, never the crop id.
+            let mut delta_only = messages[0].clone();
+            delta_only["details"]["images"] = json!([crop]);
+            let attached = tool_result_images(&delta_only, &model, &[Embed::WithKeyframe]);
+            let key_caption = attached[0]["caption"].as_str().unwrap();
+            assert!(key_caption.contains("For full-keyframe coordinates use imageId=\"full-0\""), "{key_caption}");
+            let delta_caption = attached[1]["caption"].as_str().unwrap();
+            assert_eq!(delta_caption.contains("use imageId=\"delta-0\" with local crop pixels directly"), actionable, "{delta_caption}");
+            assert_eq!(delta_caption.contains("use imageId=\"full-0\" with (x+10, y+20)"), !actionable, "{delta_caption}");
+            for caption in [key_caption, delta_caption] {
+                assert!(caption.contains("snapshotId=\"snap-0\"") && caption.contains("monitorId=7"), "{caption}");
+            }
+            let mut readonly = delta_only.clone();
+            readonly["details"]["images"][0]["frame"] = json!(0);
+            let caption = screenshot_caption(&readonly);
+            assert!(caption.contains("\"frame\":0") && caption.contains("READ-ONLY"), "{caption}");
+            let attached = tool_result_images(&readonly, &model, &[Embed::Image]);
+            assert_eq!(attached.len(), 1);
+            let caption = attached[0]["caption"].as_str().unwrap();
+            assert!(caption.contains("READ-ONLY intermediate scroll frame=0") && !caption.contains("To act"), "{caption}");
+            let mut unchanged = messages[1].clone();
+            unchanged["details"]["images"] = json!([base]);
+            unchanged["details"]["images"][0]["samePixelsAs"] = json!("delta-0");
+            unchanged["details"]["images"][0]["latestDelta"] = crop;
+            unchanged["details"]["images"][0]["latestDelta"].as_object_mut().unwrap().remove("monitorId");
+            let caption = screenshot_caption(&unchanged);
+            assert!(caption.contains("DELTA crops with their own imageId use local image pixels directly"), "{caption}");
+            assert!(caption.contains("Only DELTA crops without their own imageId add"), "{caption}");
+            assert_eq!(caption.contains("\"imageId\":\"delta-0\""), actionable, "{caption}");
+            assert_eq!(caption.matches("\"monitorId\":7").count(), 2, "latestDelta inherits its monitor: {caption}");
+            let restored = tool_result_images(&unchanged, &model, &[Embed::WithKeyframe]);
+            assert!(restored[1]["caption"].as_str().unwrap().contains("snapshotId=\"snap-1\"; monitorId=7"));
+            assert!(tool_result_images(&unchanged, &model, &[Embed::Image]).is_empty(), "normal unchanged results send no extra image");
+            assert_eq!(tool_image_embeds(&messages), vec![vec![Embed::WithKeyframe, Embed::Image], vec![Embed::Image, Embed::Image]]);
+            let compacted = vec![unchanged.clone(), unchanged.clone()];
+            assert_eq!(tool_image_embeds(&compacted), vec![vec![Embed::WithKeyframe], vec![Embed::Image]]);
+            let mut original = unchanged.clone();
+            original["details"]["images"] = json!([base]);
+            original["details"]["images"][0]["path"] = json!(key);
+            original["details"]["images"][0]["keyframe"] = json!(true);
+            let intact = vec![original, messages[0].clone(), unchanged];
+            assert_eq!(tool_image_embeds(&intact), vec![vec![Embed::Image], vec![Embed::Image, Embed::Image], vec![Embed::Image]]);
+            for (history, delta_count, reattached) in [(messages, 2, true), (compacted, 1, true), (intact, 1, false)] {
+                for output in [json!(completions_messages("", &history, &model)), json!(responses_input(&history, &model)),
+                    json!(anthropic_messages(&history, &model))] {
+                    let text = output.to_string();
+                    assert_eq!(text.matches(&base64::engine::general_purpose::STANDARD.encode(b"keyframe")).count(), 1, "{tool}: {text}");
+                    assert_eq!(text.matches(&base64::engine::general_purpose::STANDARD.encode(b"delta")).count(), delta_count, "{tool}: {text}");
+                    assert_eq!(text.contains("Keyframe re-attached"), reattached, "{tool}: {text}");
+                    assert_eq!(text.contains("x+10, y+20"), !actionable, "{tool}: {text}");
+                    assert_eq!(text.contains("Do not add offsets."), actionable, "{tool}: {text}");
+                }
+            }
+        }
+        // Scroll intermediates must not truncate the final full image + delta for any of sixteen monitors.
+        let mut images: Vec<Value> = (0..16).map(|frame| json!({"frame":frame,"path":key})).collect();
+        images.extend((0..16).flat_map(|monitor| [
+            json!({"imageId":format!("full-{monitor}"),"monitorId":monitor,"path":key}),
+            json!({"imageId":format!("delta-{monitor}"),"deltaOf":format!("full-{monitor}"),"monitorId":monitor,"path":delta}),
+        ]));
+        let message = json!({"role":"toolResult","toolName":"jianlai","details":{"images":images}});
+        assert!(screenshot_caption(&message).contains("\"imageId\":\"delta-15\""));
+        let attached = tool_result_images(&message, &model, &[]);
+        assert_eq!(attached.len(), 48);
+        assert!(attached.last().unwrap()["caption"].as_str().unwrap().contains("imageId=\"delta-15\""));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
