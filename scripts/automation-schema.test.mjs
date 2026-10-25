@@ -81,7 +81,10 @@ test('Chrome and Jianlai run only executes pre-confirmed steps', async()=>{
   assert(jianlai.description.length<650,'Keep operation-specific instructions beside their parameters');
   assert.match(jianlai.description,/已满足就立即汇报并结束/);
   assert.match(jianlai.description,/verification=unverified不要求额外检查/);
+  assert.match(jianlai.description,/executed只表示输入已发送，不代表界面加载完成或业务成功/);
   assert.match(jianlai.description,/禁止再截图、查状态/);
+  assert.match(jianlai.inputSchema.properties.feedback.description,/截图只采一帧.*显式wait后观察/);
+  assert.match(jianlai.inputSchema.properties.notes.description,/原样返回，未经工具验证/);
   assert.match(jianlai.inputSchema.properties.experience.description,/返回accepted即可收尾/);
   assert.match(jianlai.inputSchema.properties.observe.description,/无匹配或有歧义/);
   assert.equal(jianlai.inputSchema.properties.plan,undefined);

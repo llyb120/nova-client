@@ -1275,9 +1275,6 @@ fn run(owner: String, mut args: Value) -> Result<Value> {
         result["verification"] = json!("unverified");
         if result["status"] == "not_executed" { result["inputAttempted"] = json!(false); }
     }
-    if is_act || result.get("images").is_some() {
-        result["verificationNotice"] = json!(format!("executed只表示输入已发送，不代表界面加载完成或业务成功。{COMPLETION_GUIDANCE}未覆盖完整范围不能断言全部或不存在；notes未经工具验证。"));
-    }
     if let Some(notes) = notes.filter(|v| v.as_str().is_some_and(|s| s.chars().count() <= 12000)) {
         result["notes"] = notes;
     }
@@ -1968,10 +1965,16 @@ mod tests {
         let (frame, _, _) = sample_image(|| Ok(old), None).unwrap();
         assert_ne!(frame, new);
         assert!(matches!(sample_image(|| Err("capture failed".into()), None), Err(e) if e == "capture failed"));
-        let result = run("validation".into(), json!({"operation":"act", "snapshotId":"old", "unexpected":true})).unwrap();
+        let result = run("validation".into(), json!({"operation":"act", "snapshotId":"old", "unexpected":true, "notes":"unverified notes"})).unwrap();
         assert_eq!(result["operation"], "act");
         assert_eq!(result["basedOnSnapshotId"], "old");
         assert_eq!(result["verification"], "unverified");
+        assert!(result.get("verificationNotice").is_none());
+        assert_eq!(result["status"], "not_executed");
+        assert_eq!(result["completedActions"], 0);
+        assert_eq!(result["inputAttempted"], false);
+        assert!(result["error"].is_string());
+        assert_eq!(result["notes"], "unverified notes");
     }
     #[test]
     fn taskbar_overlay_updates_only_exempt_unchanged_geometry() {
