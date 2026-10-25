@@ -175,6 +175,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
   });
   const [error, setError] = createSignal("");
   const [loaded, setLoaded] = createSignal(false);
+  const [sub, setSub] = createSignal<"providers" | "mcp">("providers");
   const [dirty, setDirty] = createSignal(false);
   const [presets, setPresets] = createSignal<Preset[]>([]);
   let raw: Record<string, any> = {};
@@ -267,7 +268,16 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
       <Show when={error()}>
         <span class="field-hint lyra-error" role="alert">{error()}</span>
       </Show>
+      <div class="lyra-subtabs" role="tablist" aria-label="Lyra 配置分类">
+        <button type="button" role="tab" class="lyra-subtab" classList={{ active: sub() === "providers" }} aria-selected={sub() === "providers"} onClick={() => setSub("providers")}>
+          模型服务商<Show when={loaded()}><span class="lyra-count">{draft.providers.length}</span></Show>
+        </button>
+        <button type="button" role="tab" class="lyra-subtab" classList={{ active: sub() === "mcp" }} aria-selected={sub() === "mcp"} onClick={() => setSub("mcp")}>
+          MCP 服务器
+        </button>
+      </div>
       <Show when={loaded()}>
+        <div class="lyra-pane" hidden={sub() !== "providers"}>
         <div class="lyra-section-head lyra-providers-head">
           <div class="lyra-heading">
             <h3>模型服务商 <span class="lyra-count">{draft.providers.length}</span></h3>
@@ -510,8 +520,12 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
             );
           }}
         </For>
-        <details class="lyra-file-settings">
-          <summary>MCP 服务器（独立于模型服务商）</summary>
+        </div>
+        <div class="lyra-pane" hidden={sub() !== "mcp"}>
+          <div class="lyra-heading">
+            <h3>MCP 服务器</h3>
+            <p class="field-hint">独立于模型服务商的工具扩展。</p>
+          </div>
           <div class="lyra-detail-body">
             <p class="field-hint" id="lyra-mcp-hint">编辑顶层 mcpServers 的值：服务器名称到配置的 JSON 对象，不要再包一层 mcpServers；用 {"{}"} 清空。修改后点击底部「保存」生效。</p>
             <p class="field-hint">渐进披露：只在需要某个工具时加载其 schema，不把全部工具 schema 预先注入模型上下文。</p>
@@ -541,7 +555,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
               <p class="field-hint">支持 stdio 与 Streamable HTTP：stdio 使用 command、args、env、cwd（可选，须为绝对路径；省略时固定为会话初始目录）；Streamable HTTP 使用 url、headers（http:// 仅限本机地址），不可混填，字段值不能为 null。不支持旧 SSE 入口、OAuth、resources、prompts 或 sampling。env 与 headers 支持 {"{env:NAME}"} 占位符，保存时保留引用、不展开环境变量。服务器配置仅接受这些字段及 enabled、readOnlyTools、两个超时字段；最多 64 个服务器。</p>
               <p class="field-hint">startup_timeout_ms（启动）与 request_timeout_ms（请求）单位为毫秒，可选，默认分别为 10000、30000，范围 1–600000。启用前请替换示例地址或命令并确认权限；JSON 会以明文保存在配置文件中，敏感值优先使用环境变量引用，不要分享含密钥的配置。</p>
             </details>
-          </div>
+        </div>
         </details>
       </Show>
       <details class="lyra-file-settings" open={!loaded()}>
@@ -552,7 +566,8 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
           <span class="field-hint" role="status" aria-live="polite">{reloadMsg()}</span>
         </div>
       </details>
+        </div>
+      </Show>
     </section>
   );
 }
-                  <span class="lyra-avatar" aria-hidden="true">{(p().name || p().id || preset()?.name || "?").trim().charAt(0).toUpperCase()}</span>
