@@ -946,8 +946,10 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
         {
             return Err(format!("目标窗口失焦、移动或尺寸改变；失焦时直接 activate(windowId={id}) 切到前台并返回新图，移动或尺寸改变时重新截图"));
         }
-        // Reject an overlapping higher window before coordinate input; window screenshots may include occluded content.
-        if !bg && a.x.is_some() {
+        // Only own-pixel window captures (PrintWindow/macOS/Linux) can show occluded content. A screen-crop shot
+        // shows exactly what is on top (emoji picker, IME, other apps' popups), and the visual guard below
+        // rejects anything that appeared after the shot, so window enumeration would only add false positives.
+        if !bg && !shot.desktop_capture && a.x.is_some() {
             let p = point(shot, a.x, a.y)?;
             let end = if a.action == "drag" {
                 point(shot, a.to_x, a.to_y)?
@@ -958,10 +960,7 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
                 if other.id().map_err(err)? == id {
                     break;
                 }
-                // The app's own popups (search results, menus, dropdowns) are separate top-level windows;
-                // a screen-crop shot already shows them, so clicking them is what the model saw.
-                if other.is_minimized().map_err(err)?
-                    || (shot.desktop_capture && Some(other.pid().map_err(err)?) == shot.surface.pid) {
+                if other.is_minimized().map_err(err)? {
                     continue;
                 }
                 let r = window_surface(other)?;
@@ -971,7 +970,9 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
                         && (x as i64) < r.x as i64 + r.width as i64
                         && (y as i64) < r.y as i64 + r.height as i64
                 }) {
-                    return Err("目标坐标被其它窗口遮挡，请使用桌面截图".into());
+                    // Name the occluder: without it a false positive (overlay, floating toolbar) is undiagnosable.
+                    return Err(format!("目标坐标被其它窗口遮挡（{} 「{}」 windowId={}），请使用桌面截图",
+                        other.app_name().unwrap_or_default(), other.title().unwrap_or_default(), r.id));
                 }
             }
         }
