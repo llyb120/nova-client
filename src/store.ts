@@ -2301,7 +2301,8 @@ export async function sendPromptTo(threadId: string, text: string, images: Promp
 }
 
 /** 用上一次会话的模型在临时目录开新会话，由剑来把自带的 Nova Chrome 扩展装进 Chrome 并允许无痕。 */
-export async function installChromeExtensionWithJianlai(status: { chromePath: string | null; extensionDir: string; extensionId: string; installedVersion?: string | null; bundledVersion?: string | null }) {
+export async function installChromeExtensionWithJianlai(status: { chromePath: string | null; extensionDir: string; extensionId: string; installedVersion?: string | null; bundledVersion?: string | null; extensions?: { browser: string; version: string | null; outdated: boolean }[] }) {
+  const others = (status.extensions ?? []).filter((e) => e.outdated && e.browser !== "Google Chrome");
   const agentKind = lastUsed.agentKind();
   const id = await createThread(
     await api.scratchDir(),
@@ -2316,7 +2317,8 @@ export async function installChromeExtensionWithJianlai(status: { chromePath: st
     "2. 若右上角「开发者模式」未开启，先开启。",
     `3. 若列表中已有 Nova Chrome（ID ${status.extensionId}），先确认其来源路径是否为下述目录：是则点重新加载按钮；不是（旧位置或损坏）则先「移除」再加载；列表中没有则点击「加载已解压的扩展程序」，在文件夹选择对话框中选择目录：${status.extensionDir}`,
     "4. 打开 Nova Chrome 的「详细信息」，开启「在无痕模式下启用」。",
-    `5. 确认 Nova Chrome 已启用，再用 chrome 工具的 status 确认已连接 Nova、incognitoAllowed 为 true，且返回的 version 等于 ${status.bundledVersion ?? "Nova 自带版本"}（当前已装：${status.installedVersion ?? "未知/旧版"}）；不一致说明没更新成功，请重复第 3 步（必要时先移除再加载）直到一致。不要因为已连接就跳过更新。`,
+    ...(others.length ? [`另有 ${others.map((e) => `${e.browser}（当前 ${e.version ?? "未知/旧版"}）`).join("、")} 也装了该扩展且已过期：对每个浏览器同样执行第 2–3 步（在其自己的扩展页操作，Edge 为 edge://extensions；若它在后台没有窗口，用 shell 启动其可执行文件并传入扩展页地址）。`] : []),
+    `5. 确认 Nova Chrome 已启用，再用 chrome 工具的 status 确认已连接 Nova、incognitoAllowed 为 true，且返回的 version 等于 ${status.bundledVersion ?? "Nova 自带版本"}（当前已装：${status.installedVersion ?? "未知/旧版"}）${others.length ? "，且返回的 extensions 列表里每个浏览器的 version 都等于该版本" : ""}；不一致说明没更新成功，请重复第 3 步（必要时先移除再加载）直到一致。不要因为已连接就跳过更新。`,
   ].join("\n"), []);
 }
 

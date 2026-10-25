@@ -217,6 +217,8 @@ fn catalog_models(catalog: &Catalog) -> Map<String, Value> {
             "name": variant["label"].as_str().unwrap_or(id),
             "limit": { "context": variant["max_context_tokens"].as_u64().unwrap_or(128000),
                 "output": variant["max_output_tokens"].as_u64().unwrap_or(128000).min(128000) },
+            // 目录不含模态信息；Devin 后端统一接收图片，缺省会被当成纯文本模型而丢掉截图。
+            "modalities": { "input": ["text", "image"] },
             "options": { "supportsReasoningEffort": false, "supportsThinkingToggle": false }
         }));
     }
@@ -640,6 +642,7 @@ mod tests {
         assert_eq!(resolve_model(&catalog,"alias",Some("high")).unwrap(), "gpt-high-priority");
         assert!(resolve_model(&catalog,"gpt",Some("max")).is_err());
         assert_eq!(catalog_models(&catalog)["gpt-low-priority"]["limit"]["output"],128000);
+        assert_eq!(catalog_models(&catalog)["gpt-low-priority"]["modalities"]["input"], json!(["text","image"]));
     }
 
     #[test]

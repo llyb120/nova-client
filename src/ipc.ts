@@ -101,6 +101,7 @@ export const api = {
       installedVersion: string | null;
       bundledVersion: string | null;
       outdated: boolean;
+      extensions: { browser: string; version: string | null; incognitoAllowed: boolean; outdated: boolean }[];
       extensionDir: string;
       extensionId: string;
     }>(

@@ -1764,8 +1764,14 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
         let mut connection = connection;
         if connection["connected"] == true {
             match crate::chrome_browser::request(app, "status", json!({})).await {
-                Ok(capabilities) => connection["incognitoAllowed"] = capabilities["incognitoAllowed"].clone(),
+                Ok(capabilities) => {
+                    connection["incognitoAllowed"] = capabilities["incognitoAllowed"].clone();
+                    connection["version"] = capabilities["version"].clone();
+                }
                 Err(error) => connection["capabilityError"] = json!(format!("{error}；请重新加载Nova Chrome扩展")),
+            }
+            if connection["browsers"].as_array().is_some_and(|b| b.len() > 1) {
+                connection["extensions"] = json!(crate::chrome_browser::extension_statuses(app).await);
             }
         }
         return Ok(connection);
