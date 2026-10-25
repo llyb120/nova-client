@@ -44,11 +44,13 @@
 
 ## 观察与结果验证
 
-纯 move 定位反馈直接返回单帧（not_checked），不增加稳定等待；需等待悬停菜单/提示时使用 move + wait。包含其他动作或执行状态为 needs_review 的反馈仍做稳定取样。稳定取样在编码前每隔约150ms取样，至少观察600ms，并要求连续450ms画面近似稳定；2秒取样预算耗尽返回最后一帧及 images[].stability.status=timeout。单次系统抓屏耗时无法中断，失败后的桌面回退另有一次预算。中间帧不落盘、不发送；主动 screenshot 和未执行输入的恢复截图保持单帧，标记 not_checked。feedback=none 仍不取图。
+所有观察（主动截图、动作反馈、滚动中间帧及失败恢复）均只采一帧，不再等待画面稳定；动图、视频、加载圈不会触发反复取样或2秒稳定超时。保留 images[].stability 字段，固定 status=not_checked、samples=1，elapsedMs 记录单次采样耗时。单次系统抓屏耗时仍取决于平台，无法中断；feedback=none 仍不取图。
 
-比较使用原始像素、忽略透明度，允许0.05%的像素发生明显颜色变化，以容忍光标闪烁和微小噪声。此启发式可能漏掉很小的更新，也可能被持续动画拖到超时；stable 不代表网络请求结束。必须继续核对目标、选中项/筛选条件与正文一致，无法确认时只重新观察，不重放操作。
+保留基本输入节拍：批次末尾的非 move/wait 动作后固定留300ms给应用绘制及异步剪贴板更新，不随动画延长；后接显式wait时不重复等待。纯move无额外等待，悬停菜单等需要时用move + wait。模型根据目标是否已就绪决定继续还是显式wait后观察；无关动画不等于未就绪，静止画面也不等于加载完成。不因反馈暂未变化而重放输入。
 
-新图通过 snapshotId 标识一次观察，observationSequence 是进程内递增序号（重启重置）；每张图附 snapshotId、capturedAt（UTC）和稳定取样统计，窗口/屏幕范围沿用 windowId、imageId 与 desktopBounds。operation 标明来源，操作结果的 basedOnSnapshotId 指向输入依据。historical=false 仅表示本次新采集，并非永远有效；recall 仍标记 historical=true，不伪造原图采集时间或新快照。
+分块增量截图继续保留：按32×32块比较RGB通道差异（阈值16），未变时复用已见画面，局部变化返回累计增量，变化包围盒超过画面四分之一则返回完整关键帧。动画也按真实变化发送，不再推测并隐藏动态区域。点击前的局部像素、窗口几何、焦点和快照校验不变；移除的是截图稳定门槛，不是输入安全校验。
+
+新图通过 snapshotId 标识一次观察，observationSequence 是进程内递增序号（重启重置）；每张图附 snapshotId、capturedAt（UTC）和单帧取样统计，窗口/屏幕范围沿用 windowId、imageId 与 desktopBounds。operation 标明来源，操作结果的 basedOnSnapshotId 指向输入依据。historical=false 仅表示本次新采集，并非永远有效；recall 仍标记 historical=true，不伪造原图采集时间或新快照。
 
 所有操作结果均为 verification=unverified：工具能确认输入执行状态，业务目标需模型依据最新图判断，但该字段不要求额外检查。速度优先：最新动作反馈已满足目标就立即汇报并结束，禁止再截图、查状态、等待或二次确认；仅有明确未完成证据时才做一次针对性复查，没有新信息就报告未确认项，不循环截图。结论须绑定已有截图及可见证据；未检查完整范围不能声称“全部”或“不存在”。notes 仍原样返回，须记录来源snapshotId和页面范围，不能跨页面混用；工具不验证笔记内容。本改动不删除、裁剪或压缩任何宿主的历史上下文。
 
@@ -58,11 +60,11 @@
 
 **本次不实施历史图片裁剪，也不要求宿主淘汰旧图。** 各后端仍按各自原有机制管理历史、请求组装、缓存策略、容量统计及上下文压缩。优化仅从新截图的尺寸、目标范围、调用策略和失败恢复入手，因此历史截图累计问题并未由本次改动解决。
 
-滚动阅读先写notes，未记录信息可recall回看。一批act里连放多个scroll时，每个非末尾scroll后自动附一张只读中间帧（`images[].frame`为该scroll的序号，附`framesNotice`），一次调用读完多屏；中间帧只供阅读，后续act仍只用顶层snapshotId与最后一张图的坐标。不会删除本地旧图或重开会话来伪装上下文优化。
+滚动阅读先写notes，未记录信息可recall回看。一批act里连放多个scroll时，每个非末尾scroll后自动附一张只读中间帧；若紧跟显式wait，则等这些wait执行完再取图（`images[].frame`仍为该scroll的序号，附`framesNotice`），一次调用读完多屏；中间帧只供阅读，后续act仍只用顶层snapshotId与最后一张图的坐标。不会删除本地旧图或重开会话来伪装上下文优化。
 
 ## 耗时诊断
 
-NovaDev对xcap、image、png及压缩依赖启用优化编译；稳定取样先做整帧字节相等比较，静止画面无需逐像素扫描；缩放通过DynamicImage进入依赖内的优化实现，保留Triangle算法和相同像素尺寸。目标校验复用同一次窗口枚举完成几何与遮挡检查，不缓存到下一动作。纯图像基准可运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::screenshot_pipeline_benchmark -- --ignored --nocapture`，输出缩放/编码耗时，并验证与原缩放实现及PNG解码结果逐像素一致；此测试不操作桌面。
+NovaDev对xcap、image、png及压缩依赖启用优化编译；分块变化检测先做整帧字节相等比较，静止画面无需逐像素扫描；缩放通过DynamicImage进入依赖内的优化实现，保留Triangle算法和相同像素尺寸。目标校验复用同一次窗口枚举完成几何与遮挡检查，不缓存到下一动作。纯图像基准可运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::screenshot_pipeline_benchmark -- --ignored --nocapture`，输出缩放/编码耗时，并验证与原缩放实现及PNG解码结果逐像素一致；此测试不操作桌面。
 
 截图返回timingsMs：capture（系统捕获）、resize、encodeAndSave（PNG编码及落盘）、other（窗口枚举、焦点校验等）和total。MCP传输适配另返回deliveryTimingsMs（read/base64/total）及deliveredImageBytes；不包含网络及模型耗时。Windows前台身份检查直接读取窗口句柄与PID，避免每个动作多次枚举所有窗口及其元数据；这是只读状态检查，不负责激活。先比较这些分段数据，再决定是否换捕获后端/编码器，不据单次总耗时猜测瓶颈。
 

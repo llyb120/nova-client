@@ -171,16 +171,16 @@ const MAX_DELTAS: u8 = 8;
 
 enum Delivery { Unchanged, Delta(crate::visual_guard::PixelRect), Keyframe }
 
-/// Unchanged when nothing differs from what the model already sees (`motion` = caret/animation the
-/// settle loop proved keeps moving). Otherwise a delta: the box of all change since the keyframe,
+/// Unchanged when nothing differs from what the model already sees.
+/// Otherwise a delta: the box of all change since the keyframe,
 /// including the previous delta's box (its content may have reverted), so the latest delta alone
 /// plus the keyframe describes the screen. Over a quarter of the image means a new keyframe.
-fn plan_delivery(prior: Option<&Delivered>, pixels: &xcap::image::RgbaImage, motion: Option<crate::visual_guard::PixelRect>) -> Delivery {
+fn plan_delivery(prior: Option<&Delivered>, pixels: &xcap::image::RgbaImage) -> Delivery {
     let Some(p) = prior.filter(|p| p.seen.dimensions() == pixels.dimensions()) else { return Delivery::Keyframe };
-    if changed_tiles(&p.seen, pixels, motion).is_some_and(|t| !t.contains(&true)) { return Delivery::Unchanged; }
+    if changed_tiles(&p.seen, pixels, None).is_some_and(|t| !t.contains(&true)) { return Delivery::Unchanged; }
     if p.deltas >= MAX_DELTAS { return Delivery::Keyframe; }
     let (w, h) = pixels.dimensions();
-    let fresh = changed_tiles(&p.keyframe, pixels, motion).and_then(|t| changed_box(&t, (w, h)));
+    let fresh = changed_tiles(&p.keyframe, pixels, None).and_then(|t| changed_box(&t, (w, h)));
     let b = match (fresh, p.delta) {
         (Some(a), Some(b)) => crate::visual_guard::PixelRect { left: a.left.min(b.left), top: a.top.min(b.top),
             right: a.right.max(b.right), bottom: a.bottom.max(b.bottom) },
@@ -200,19 +200,6 @@ fn changed_box(tiles: &[bool], (w, h): (u32, u32)) -> Option<crate::visual_guard
         right: ((r + 2) * TILE).min(w), bottom: ((b + 2) * TILE).min(h) })
 }
 
-/// settled_image's ignoredMotion (source pixels) mapped into the delivered, cropped and resized image.
-fn motion_in(stability: &Value, region: Option<Region>, source: (u32, u32), delivered: (u32, u32)) -> Option<crate::visual_guard::PixelRect> {
-    let m = stability.get("ignoredMotion")?;
-    let (ox, oy, cw) = region.map_or((0, 0, source.0), |r| (r.x, r.y, r.width));
-    let s = delivered.0 as f64 / cw.max(1) as f64;
-    let at = |key: &str, origin: u32, extra: &str, round: fn(f64) -> f64| -> Option<u32> {
-        let v = m[key].as_u64()? + if extra.is_empty() { 0 } else { m[extra].as_u64()? };
-        Some(round(v.saturating_sub(origin as u64) as f64 * s) as u32)
-    };
-    let r = crate::visual_guard::PixelRect { left: at("x", ox, "", f64::floor)?, top: at("y", oy, "", f64::floor)?,
-        right: at("x", ox, "width", f64::ceil)?.min(delivered.0), bottom: at("y", oy, "height", f64::ceil)?.min(delivered.1) };
-    (r.left < r.right && r.top < r.bottom).then_some(r)
-}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Request {
@@ -514,77 +501,21 @@ fn changed_tiles(a: &xcap::image::RgbaImage, b: &xcap::image::RgbaImage, exclude
     Some(tiles)
 }
 
-fn settled_image(mut grab: impl FnMut() -> Result<xcap::image::RgbaImage>, settle: bool, desktop_surface: Option<&Surface>)
+/// Capture once; animations and loading indicators are for the model to interpret, not a wait gate.
+fn sample_image(grab: impl FnOnce() -> Result<xcap::image::RgbaImage>, desktop_surface: Option<&Surface>)
     -> Result<(xcap::image::RgbaImage, Value, Option<crate::taskbar_status::Rect>)> {
     let started = Instant::now();
-    let mut sample = || -> Result<_> {
-        let relevant_overlay = || desktop_surface.and_then(|s| overlay_on_surface(s, overlay_bounds(true)));
-        let overlay = relevant_overlay();
-        let image = grab()?;
-        if overlay != relevant_overlay() {
-            return Err("取样期间任务栏状态条范围改变，请重新截图".into());
-        }
-        Ok((image, overlay))
-    };
-    let (mut image, mut overlay) = sample()?;
-    let mut samples = 1;
-    let mut status = "not_checked";
-    let mut ignored: Vec<bool> = Vec::new();
-    if settle {
-        let mut anchor = image.clone();
-        let mut anchor_overlay = overlay;
-        let mut quiet_since = Instant::now();
-        // Per-tile count of samples that differed from the anchor: a one-shot change resets the anchor
-        // and stays at 1, while carets/spinners/clocks keep differing and reach 2 within ~200ms.
-        let mut hits: Vec<u8> = Vec::new();
-        loop {
-            let elapsed = started.elapsed();
-            if elapsed >= Duration::from_millis(2000) { status = "timeout"; break; }
-            std::thread::sleep(Duration::from_millis(100).min(Duration::from_millis(2000) - elapsed));
-            (image, overlay) = sample()?;
-            samples += 1;
-            let exclude = desktop_surface.and_then(|s| overlay_region(s, image.dimensions(), overlay));
-            // Compare against the quiet-period anchor so gradual changes cannot accumulate unnoticed.
-            let changed = changed_tiles(&anchor, &image, exclude).filter(|_| overlay == anchor_overlay);
-            let moving = changed.as_ref().is_none_or(|changed| {
-                if hits.len() != changed.len() { hits = vec![0; changed.len()]; }
-                for (h, c) in hits.iter_mut().zip(changed) { if *c { *h = h.saturating_add(1); } }
-                let animated: Vec<bool> = hits.iter().map(|h| *h >= 2).collect();
-                // ponytail: like a person, tune out small areas that keep moving (≤5% of the frame);
-                // a small spinner is tuned out too, so ignoredMotion is reported for the model to judge.
-                let small = animated.iter().filter(|a| **a).count() * 20 <= animated.len();
-                ignored = if small { animated } else { Vec::new() };
-                changed.iter().zip(&hits).any(|(c, h)| *c && !(small && *h >= 2))
-            });
-            if moving {
-                if changed.is_none() { hits.clear(); ignored.clear(); }
-                anchor = image.clone();
-                anchor_overlay = overlay;
-                quiet_since = Instant::now();
-            }
-            if started.elapsed() >= Duration::from_millis(2000) { status = "timeout"; break; }
-            if started.elapsed() >= Duration::from_millis(300)
-                && quiet_since.elapsed() >= Duration::from_millis(300) {
-                status = "stable";
-                break;
-            }
-        }
+    let relevant_overlay = || desktop_surface.and_then(|s| overlay_on_surface(s, overlay_bounds(true)));
+    let overlay = relevant_overlay();
+    let image = grab()?;
+    if overlay != relevant_overlay() {
+        return Err("取样期间任务栏状态条范围改变，请重新截图".into());
     }
-    let mut report = json!({"status":status,"samples":samples,"elapsedMs":started.elapsed().as_millis()});
-    let cols = image.width().div_ceil(TILE) as usize;
-    let tiles: Vec<(u32, u32)> = ignored.iter().enumerate().filter(|(_, a)| **a)
-        .map(|(i, _)| ((i % cols) as u32 * TILE, (i / cols) as u32 * TILE)).collect();
-    if !tiles.is_empty() {
-        let (x, y) = (tiles.iter().map(|t| t.0).min().unwrap(), tiles.iter().map(|t| t.1).min().unwrap());
-        let right = (tiles.iter().map(|t| t.0).max().unwrap() + TILE).min(image.width());
-        let bottom = (tiles.iter().map(|t| t.1).max().unwrap() + TILE).min(image.height());
-        report["ignoredMotion"] = json!({"x":x,"y":y,"width":right - x,"height":bottom - y,"space":"originalPixels",
-            "notice":"此范围内持续变化的小块（光标/动画/加载圈）未计入稳定判断；若是加载中请再观察"});
-    }
+    let report = json!({"status":"not_checked","samples":1,"elapsedMs":started.elapsed().as_millis()});
     Ok((image, report, overlay))
 }
 
-fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, settle: bool, state: &mut Option<Snapshot>) -> Result<Value> {
+fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, state: &mut Option<Snapshot>) -> Result<Value> {
     let _activity = crate::taskbar_status::activity("截取画面");
     let started = Instant::now();
     let mut capture_ms = 0;
@@ -642,7 +573,6 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         } else { image };
         resize_ms += resize_started.elapsed().as_millis();
         let plain = image.clone();
-        let motion = motion_in(&stability, region, original_pixels, image.dimensions());
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
@@ -666,7 +596,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             entry["keyframePath"] = json!(p.keyframe_path);
         };
         let mut delta_entry = None;
-        match plan_delivery(prior, &plain, motion) {
+        match plan_delivery(prior, &plain) {
             Delivery::Unchanged => {
                 let p = prior.unwrap();
                 // No path means hosts attach no image; samePixelsAs stays readable through recall.
@@ -727,7 +657,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         // PrintWindow omits separate popup windows (e.g. recipient suggestions).
         // Foreground input must observe the pixels that will actually receive it.
         let desktop_capture = !bg && before == Some((surface.id, surface.pid.unwrap()));
-        let (image, stability, overlay) = settled_image(|| {
+        let (image, stability, overlay) = sample_image(|| {
             if foreground()? != before || window_surface(&w)? != surface {
                 return Err("取样期间窗口或焦点改变，请重新截图".into());
             }
@@ -741,7 +671,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             #[cfg(not(windows))]
             let image = w.capture_image().map_err(err)?;
             Ok(image)
-        }, settle, desktop_capture.then_some(&surface))?;
+        }, desktop_capture.then_some(&surface))?;
         capture_ms += capture_started.elapsed().as_millis();
         if window_surface(&w)? != surface {
             return Err("截图期间窗口移动，请重新截图".into());
@@ -751,7 +681,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         // Linux 座席：像素来自私有 X 服务器；xcap 只读进程的 DISPLAY，不能用于它。
         let surface = background::seat_surface()?;
         let capture_started = Instant::now();
-        let (image, stability, overlay) = settled_image(background::seat_grab, settle, None)?;
+        let (image, stability, overlay) = sample_image(background::seat_grab, None)?;
         capture_ms += capture_started.elapsed().as_millis();
         save(surface, image, stability, overlay, false)?;
     } else {
@@ -763,12 +693,12 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             let surface = monitor_surface(&m)?;
             if monitor_id.is_some_and(|id| id != surface.id) { continue; }
             let capture_started = Instant::now();
-            let (image, stability, overlay) = settled_image(|| {
+            let (image, stability, overlay) = sample_image(|| {
                 if foreground()? != before || monitor_surface(&m)? != surface {
                     return Err("取样期间屏幕或焦点改变，请重新截图".into());
                 }
                 m.capture_image().map_err(err)
-            }, settle, Some(&surface))?;
+            }, Some(&surface))?;
             capture_ms += capture_started.elapsed().as_millis();
             save(surface, image, stability, overlay, true)?;
         }
@@ -803,7 +733,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         result["deltaNotice"] = json!(format!("画面局部变化，只发了增量图：{}。增量图与关键帧同比例，是该区域的最新内容并取代之前的增量；区域外与关键帧（同一屏幕或窗口流最近的完整图）一致。点击一律用本次snapshotId和deltaOf的imageId：区域外直接用关键帧坐标，区域内坐标=增量图内坐标+起点偏移。", deltas.join("；")));
     }
     if !unchanged.is_empty() {
-        result["unchangedNotice"] = json!(format!("{} 与你已看到的画面（关键帧及最新增量）相同（至多光标/动画等持续变化的小块不同，剑形指针位置以cursor字段为准），未重复发送图片：直接沿用已看到的画面判断，坐标对本次snapshotId/imageId同样有效。动作后出现此提示说明该动作没有产生可见变化，换方法而不是重复同一输入或反复截图；上一张已不在上下文时用recall(imagePath=samePixelsAs)回看。", unchanged.join("、")));
+        result["unchangedNotice"] = json!(format!("{} 与你已看到的画面（关键帧及最新增量）无明显像素差异（剑形指针位置以cursor字段为准），未重复发送图片：直接沿用已看到的画面判断，坐标对本次snapshotId/imageId同样有效。动作后出现此提示只表示本次取图尚无可见变化，不代表动作失败；若目标仍在加载可显式wait后观察，不重放输入或循环截图；上一张已不在上下文时用recall(imagePath=samePixelsAs)回看。", unchanged.join("、")));
     }
     Ok(result)
 }
@@ -1085,22 +1015,20 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
 }
 
 fn action_delay(actions: &[Action], index: usize) -> Duration {
-    // Explicit waits already provide settling time; pointer motion needs no extra delay.
-    let redundant = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "wait" | "move")
+    // Explicit waits already provide reaction time; pointer motion needs no extra delay.
+    let redundant = matches!(actions[index].action.as_str(), "wait" | "move")
         || actions.get(index + 1).is_some_and(|a| a.action == "wait");
-    // A click may open/focus a popup and typed text may trigger search results; apps need time
-    // to react before the next input lands, or keystrokes go to a control that is not ready yet.
-    let reacts = matches!(actions[index].action.as_str(), "click" | "double_click" | "type");
+    // ponytail: a fixed 300ms reaction pause for rendering/clipboard writes, not a readiness guarantee.
+    // Slower apps need an explicit wait; animations never extend this pause.
+    let reacts = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "click" | "double_click" | "type" | "scroll");
     Duration::from_millis(if redundant { 0 } else if reacts { 300 } else { 80 })
 }
 
-fn needs_stable_feedback(actions: &[Action], needs_review: bool) -> bool {
-    // Pure positioning gets an immediate frame; hover-dependent UI must use move + wait.
-    needs_review || actions.iter().any(|a| a.action != "move")
-}
-fn needs_scroll_frame(actions: &[Action], index: usize, feedback: Option<&str>) -> bool {
-    feedback != Some("none") && actions[index].action == "scroll"
-        && actions[index + 1..].iter().any(|a| a.action != "wait")
+fn scroll_frame_index(actions: &[Action], index: usize, feedback: Option<&str>) -> Option<usize> {
+    if feedback == Some("none") || actions.get(index + 1).is_some_and(|a| a.action == "wait")
+        || !actions[index + 1..].iter().any(|a| a.action != "wait") { return None; }
+    // Honour explicit waits before the intermediate frame, but label it with the originating scroll.
+    actions[..=index].iter().rposition(|a| a.action != "wait").filter(|&i| actions[i].action == "scroll")
 }
 /// Desktop pixel -> SendInput VIRTUALDESK normalized value; ceil so floor(n*size/65536) lands on the pixel.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -1321,7 +1249,7 @@ fn post_background(shot: &Shot, a: &Action) -> Result<()> {
     background::post(pid, shot.surface.id, at, to, a)
 }
 
-pub(crate) const COMPLETION_GUIDANCE: &str = "速度优先：用最新截图（含动作自动反馈）核对用户要求的结果；证据已满足目标就立即汇报并结束，禁止再截图、查状态、等待或二次确认；verification=unverified不要求额外检查。仅有明确未完成证据时才做一次针对性复查；没有新信息就如实报告未确认项，不轮询、不重放输入。";
+pub(crate) const COMPLETION_GUIDANCE: &str = "截图只采一帧，不等待画面稳定；动图/视频不妨碍已就绪目标的操作，目标仍在加载或过渡时由模型决定显式wait后再观察。速度优先：用最新截图（含动作自动反馈）核对用户要求的结果；证据已满足目标就立即汇报并结束，禁止再截图、查状态、等待或二次确认；verification=unverified不要求额外检查。仅有明确未完成证据时才做一次针对性复查；没有新信息就如实报告未确认项，不轮询、不重放输入。";
 
 fn run(owner: String, mut args: Value) -> Result<Value> {
     // Some clients omit the operation while supplying a complete action batch. Normalize the
@@ -1347,7 +1275,7 @@ fn run(owner: String, mut args: Value) -> Result<Value> {
         if result["status"] == "not_executed" { result["inputAttempted"] = json!(false); }
     }
     if is_act || result.get("images").is_some() {
-        result["verificationNotice"] = json!(format!("executed表示动作执行完毕，stable只表示画面近似稳定。{COMPLETION_GUIDANCE}未覆盖完整范围不能断言全部或不存在；notes未经工具验证。"));
+        result["verificationNotice"] = json!(format!("executed只表示输入已发送，不代表界面加载完成或业务成功。{COMPLETION_GUIDANCE}未覆盖完整范围不能断言全部或不存在；notes未经工具验证。"));
     }
     if let Some(notes) = notes.filter(|v| v.as_str().is_some_and(|s| s.chars().count() <= 12000)) {
         result["notes"] = notes;
@@ -1445,7 +1373,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     .and_then(|w| w["windowId"].as_u64()).map(|id| id as u32);
                 // 后台没有「前台窗口」可回退：只观察指定目标（Linux 座席为桌面）。
                 let window_id = if bg { target } else { target.or(focused) };
-                match capture(&owner, window_id, None, None, max_edge, false, &mut state) {
+                match capture(&owner, window_id, None, None, max_edge, &mut state) {
                     Ok(observed) => {
                         result.as_object_mut().unwrap().extend(observed.as_object().unwrap().clone());
                         result["observedWindowId"] = json!(window_id);
@@ -1471,7 +1399,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 if foreground()? != Some((id, target.pid().map_err(err)?)) {
                     return Err("系统未允许激活该窗口；请观察当前桌面，不要重复激活或发送按键".into());
                 }
-                let mut result = capture(&owner, Some(id), None, None, max_edge, false, &mut state)?;
+                let mut result = capture(&owner, Some(id), None, None, max_edge, &mut state)?;
                 result["activated"] = json!(true);
                 Ok(result)
             }
@@ -1494,7 +1422,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 if request.region.is_some() && request.window_id.is_none() && request.monitor_id.is_none() {return Err("原始像素region需要windowId或monitorId".into());}
                 (request.window_id,request.monitor_id,request.region)
             };
-            let mut result = capture(&owner, wid, mid, region, max_edge, false, &mut state)?;
+            let mut result = capture(&owner, wid, mid, region, max_edge, &mut state)?;
             result["notes"] = json!(request.notes);
             if region.is_some() {
                 result["coordinateNotice"] = json!("这是新裁剪图：act坐标从此图左上角(0,0)开始，禁止加region偏移或使用显示放大后的坐标；按images中的width/height定位。新snapshotId/imageId替换旧图，act反馈恢复完整窗口。");
@@ -1534,7 +1462,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 let mut result = json!({"status":"executed","completedActions":actions.len(),"inputAttempted":false});
                 if request.feedback.as_deref() != Some("none") {
                     let window_id = if request.feedback.as_deref() == Some("desktop") { None } else { window_id };
-                    match capture(&owner, window_id, None, None, max_edge, false, &mut state) {
+                    match capture(&owner, window_id, None, None, max_edge, &mut state) {
                         Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
                         Err(e) => result["observationError"] = json!(e),
                     }
@@ -1575,7 +1503,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             }
             if state.is_none() {
                 let mut result = json!({"status":"not_executed","completedActions":0,"error":"没有可用快照，附当前观察；基于新图重新决策"});
-                observe(&owner, request.window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, false, &mut state, &mut result);
+                observe(&owner, request.window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
                 return Ok(result);
             }
             let snap = state.as_ref().unwrap();
@@ -1587,7 +1515,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 let max_edge = snap.max_edge;
                 let mut result = json!({"status":"not_executed","completedActions":0,
                     "error":"旧snapshotId已失效，附当前观察；请基于新图重新决策，不自动重放"});
-                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, false, &mut state, &mut result);
+                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
                 return Ok(result);
             }
             if let Some(reason) = snap.invalidated.clone() {
@@ -1595,7 +1523,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 let max_edge = snap.max_edge;
                 let mut result = json!({"status":"not_executed","completedActions":0,
                     "error":format!("快照在截图后被其它工具改变的画面作废：{reason}；附当前观察，请基于新图重新决策")});
-                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, false, &mut state, &mut result);
+                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
                 return Ok(result);
             }
             if snap.background != bg {
@@ -1668,11 +1596,11 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 completed += 1;
                 std::thread::sleep(action_delay(&actions, index));
                 // Keep reading frames between inputs, but never duplicate the final scroll + wait feedback.
-                if needs_scroll_frame(&actions, index, request.feedback.as_deref()) {
+                if let Some(scroll_index) = scroll_frame_index(&actions, index, request.feedback.as_deref()) {
                     let (mut frame, mut scratch) = (json!({}), None);
-                    observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, true, &mut scratch, &mut frame);
+                    observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, &mut scratch, &mut frame);
                     for mut image in frame["images"].as_array().cloned().unwrap_or_default() {
-                        image["frame"] = json!(index);
+                        image["frame"] = json!(scroll_index);
                         frames.push(image);
                     }
                 }
@@ -1697,16 +1625,15 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 result["coordinateNotice"] = json!("局部操作后的反馈恢复完整窗口；使用新的imageId和完整图片坐标，不沿用局部坐标");
             }
             if failure.is_some() || request.feedback.as_deref() != Some("none") {
-                let settle = attempted && needs_stable_feedback(&actions[..completed], result["status"] == "needs_review");
-                observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, settle, &mut state, &mut result);
+                observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
             }
             if direct {
-                // 反馈取样已等过界面稳定；此时再读真实前台，才能发现应用收到点击后自行激活。
+                // 输入节拍和反馈截图后再读真实前台，检测应用收到点击后是否自行激活。
                 if let Some(changed) = background::foreground_notice(foreground_before, real_foreground().ok().flatten()) {
                     result["foregroundChanged"] = changed;
                 }
             }
-            // Read after feedback settling so apps that write the clipboard asynchronously have finished.
+            // Read after the fixed reaction pause and capture; clipboard writes may be asynchronous.
             if let Some(copied) = crate::clipboard::copied_since(clipboard).or(copied_before_paste) { result["clipboard"] = copied; }
             // One fresh feedback is enough on failure; request a native crop only if more detail is needed.
             if !frames.is_empty() {
@@ -1720,10 +1647,10 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
     }
 }
 // Observation never retries input; follow the foreground and fall back to desktop if needed.
-fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, desktop: bool, max_edge: u32, settle: bool, state: &mut Option<Snapshot>, result: &mut Value) {
+fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, desktop: bool, max_edge: u32, state: &mut Option<Snapshot>, result: &mut Value) {
     if background::active() {
         // 后台没有「前台」可跟随：始终重拍同一目标（macOS 的同一窗口 / Linux 座席桌面），不回退到用户的桌面。
-        match capture(owner, previous_window, None, None, max_edge, settle, state) {
+        match capture(owner, previous_window, None, None, max_edge, state) {
             Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
             Err(e) => result["observationError"] = json!(e),
         }
@@ -1740,10 +1667,10 @@ fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, d
         result["observationScopeChanged"] = json!(true);
         result["coordinateNotice"] = json!("截图范围已变化，必须使用本次imageId和图片内坐标，不沿用上一张图坐标");
     }
-    let observation = capture(owner, window_id, if window_id.is_some() { None } else { monitor_id }, None, max_edge, settle, state).or_else(|e| {
+    let observation = capture(owner, window_id, if window_id.is_some() { None } else { monitor_id }, None, max_edge, state).or_else(|e| {
         if window_id.is_none() && monitor_id.is_none() { return Err(e); }
         result["windowObservationError"] = json!(e);
-        capture(owner, None, monitor_id, None, max_edge, settle, state)
+        capture(owner, None, monitor_id, None, max_edge, state)
     });
     match observation {
         Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
@@ -1920,28 +1847,22 @@ mod tests {
         let p0 = Delivered { stream: "window".into(), group: "snap".into(), keyframe_id: "window-1".into(), keyframe: page.clone(), keyframe_path: "k.jpg".into(),
             seen: page.clone(), seen_path: "k.jpg".into(), delta: None, deltas: 0 };
         let rect = |l, t, r, b| PixelRect { left: l, top: t, right: r, bottom: b };
-        assert!(matches!(plan_delivery(None, &page, None), Delivery::Keyframe));
-        assert!(matches!(plan_delivery(Some(&p0), &page, None), Delivery::Unchanged));
-        assert!(matches!(plan_delivery(Some(&p0), &RgbaImage::new(321, 320), None), Delivery::Keyframe), "resized window");
+        assert!(matches!(plan_delivery(None, &page), Delivery::Keyframe));
+        assert!(matches!(plan_delivery(Some(&p0), &page), Delivery::Unchanged));
+        assert!(matches!(plan_delivery(Some(&p0), &RgbaImage::new(321, 320)), Delivery::Keyframe), "resized window");
         let mut typed = page.clone();
         typed.put_pixel(150, 150, Rgba([0, 0, 0, 255]));
-        assert!(matches!(plan_delivery(Some(&p0), &typed, None), Delivery::Delta(b) if b == rect(96, 96, 192, 192)), "a single glyph is sent");
-        // Only motion the settle loop proved animated is tolerated, mapped from source into delivered pixels.
-        let stability = json!({"ignoredMotion":{"x":288,"y":288,"width":32,"height":32}});
-        let motion = motion_in(&stability, None, (640, 640), (320, 320));
-        assert_eq!(motion, Some(rect(144, 144, 160, 160)));
-        assert!(matches!(plan_delivery(Some(&p0), &typed, motion), Delivery::Unchanged));
-        assert_eq!(motion_in(&stability, Some(Region { x:0, y:0, width:100, height:100 }), (640, 640), (100, 100)), None);
+        assert!(matches!(plan_delivery(Some(&p0), &typed), Delivery::Delta(b) if b == rect(96, 96, 192, 192)), "a single glyph or animation frame is sent");
         // After a delta, a revert to the keyframe resends the old box so the latest delta stays authoritative.
         let p1 = Delivered { seen: typed.clone(), delta: Some(rect(96, 96, 192, 192)), deltas: 1, ..p0.clone() };
-        assert!(matches!(plan_delivery(Some(&p1), &typed, None), Delivery::Unchanged));
-        assert!(matches!(plan_delivery(Some(&p1), &page, None), Delivery::Delta(b) if b == rect(96, 96, 192, 192)));
+        assert!(matches!(plan_delivery(Some(&p1), &typed), Delivery::Unchanged));
+        assert!(matches!(plan_delivery(Some(&p1), &page), Delivery::Delta(b) if b == rect(96, 96, 192, 192)));
         // Change accumulates against the keyframe; over a quarter of the image becomes a new keyframe.
         let mut more = typed.clone();
         more.put_pixel(40, 40, Rgba([0, 0, 0, 255]));
-        assert!(matches!(plan_delivery(Some(&p1), &more, None), Delivery::Keyframe));
+        assert!(matches!(plan_delivery(Some(&p1), &more), Delivery::Keyframe));
         let capped = Delivered { deltas: MAX_DELTAS, ..p1.clone() };
-        assert!(matches!(plan_delivery(Some(&capped), &page, None), Delivery::Keyframe));
+        assert!(matches!(plan_delivery(Some(&capped), &page), Delivery::Keyframe));
     }
     #[test]
     fn lone_action_becomes_a_one_item_batch() {
@@ -2015,49 +1936,37 @@ mod tests {
         assert_eq!(bad["status"],"not_executed");
     }
     #[test]
-    fn observation_waits_for_delayed_content_and_bounds_animation() {
+    fn observation_samples_once_even_with_animation_or_delayed_content() {
         use xcap::image::{Rgba, RgbaImage};
         let old = RgbaImage::from_pixel(100, 100, Rgba([255, 255, 255, 255]));
+        let new = RgbaImage::from_pixel(100, 100, Rgba([0, 0, 0, 255]));
         let mut caret = old.clone();
         caret.put_pixel(40, 5, Rgba([0, 0, 0, 255]));
         assert_eq!(changed_tiles(&old, &caret, None).unwrap().iter().filter(|c| **c).count(), 1);
         assert!(changed_tiles(&old, &caret, None).unwrap()[1]);
         assert!(changed_tiles(&old, &RgbaImage::new(101, 100), None).is_none());
 
-        // Header changes immediately; list remains old for the first two samples.
-        let new = RgbaImage::from_pixel(100, 100, Rgba([0, 0, 0, 255]));
-        let mut calls = 0;
-        let (frame, report, _) = settled_image(|| {
-            calls += 1;
-            Ok(if calls < 3 { old.clone() } else { new.clone() })
-        }, true, None).unwrap();
-        assert_eq!(frame, new);
-        assert_eq!(report["status"], "stable");
-        assert!(calls >= 6);
-
-        let mut last = old.clone();
-        let (_, report, _) = settled_image(|| {
-            last = if last == old { new.clone() } else { old.clone() };
-            Ok(last.clone())
-        }, true, None).unwrap();
-        assert_eq!(report["status"], "timeout");
-        assert!(report["elapsedMs"].as_u64().unwrap() >= 2000);
-        let (frame, report, _) = settled_image(|| Ok(old.clone()), false, None).unwrap();
-        assert_eq!(frame, old);
-        assert_eq!(report["samples"], 1);
-        assert_eq!(report["status"], "not_checked");
-
-        // A small block that keeps blinking (caret/spinner) is tuned out instead of forcing the 2s timeout.
-        let page = RgbaImage::from_pixel(640, 640, Rgba([255, 255, 255, 255]));
-        let mut blink = page.clone();
-        for y in 100..110 { for x in 200..210 { blink.put_pixel(x, y, Rgba([0, 0, 0, 255])); } }
-        let mut on = false;
-        let (_, report, _) = settled_image(|| { on = !on; Ok(if on { blink.clone() } else { page.clone() }) }, true, None).unwrap();
-        assert_eq!(report["status"], "stable");
-        assert!(report["elapsedMs"].as_u64().unwrap() < 1000);
-        assert_eq!(report["ignoredMotion"]["x"], 192);
-        assert_eq!(report["ignoredMotion"]["width"], 32);
-        assert!(settled_image(|| Err("capture failed".into()), true, None).is_err());
+        // Single-frame observation must not chase either a blinking caret or a full-screen animation.
+        for moving in [&caret, &new] {
+            let mut calls = 0;
+            for expected in [&old, moving, &old, moving] {
+                let before = calls;
+                let (frame, report, overlay) = sample_image(|| {
+                    calls += 1;
+                    Ok(if calls % 2 == 1 { old.clone() } else { moving.clone() })
+                }, None).unwrap();
+                assert_eq!(calls, before + 1);
+                assert_eq!(&frame, expected);
+                assert_eq!(report["samples"], 1);
+                assert_eq!(report["status"], "not_checked");
+                assert!(report.get("ignoredMotion").is_none());
+                assert!(overlay.is_none());
+            }
+        }
+        // Delayed content is not polled implicitly; return the current frame without claiming readiness.
+        let (frame, _, _) = sample_image(|| Ok(old), None).unwrap();
+        assert_ne!(frame, new);
+        assert!(matches!(sample_image(|| Err("capture failed".into()), None), Err(e) if e == "capture failed"));
         let result = run("validation".into(), json!({"operation":"act", "snapshotId":"old", "unexpected":true})).unwrap();
         assert_eq!(result["operation"], "act");
         assert_eq!(result["basedOnSnapshotId"], "old");
@@ -2199,26 +2108,25 @@ mod tests {
             {"action":"type","text":"next"}
         ])).unwrap();
         let delays: Vec<_> = (0..actions.len()).map(|i| action_delay(&actions, i).as_millis()).collect();
-        assert_eq!(delays, [0, 0, 0, 0, 0, 300, 0]);
+        assert_eq!(delays, [0, 0, 0, 0, 0, 300, 300]);
         let chained: Vec<Action> = serde_json::from_value(json!([
             {"action":"click","x":10,"y":10}, {"action":"type","text":"a"},
             {"action":"press","key":"Enter"}, {"action":"press","key":"Tab"}
         ])).unwrap();
         let delays: Vec<_> = (0..chained.len()).map(|i| action_delay(&chained, i).as_millis()).collect();
-        assert_eq!(delays, [300, 300, 80, 0]);
-        assert!(!needs_stable_feedback(&[], false));
-        assert!(!needs_stable_feedback(&actions[4..5], false));
-        assert!(needs_stable_feedback(&actions[4..5], true));
-        assert!(needs_stable_feedback(&actions[4..6], false));
-        assert!(needs_stable_feedback(&actions[3..5], false));
-        for action in ["click", "double_click", "drag", "type", "press", "scroll", "wait"] {
+        assert_eq!(delays, [300, 300, 80, 300]);
+        for action in ["click", "double_click", "drag", "type", "press", "scroll", "wait", "move"] {
             let batch: Vec<Action> = serde_json::from_value(json!([{ "action": action }])).unwrap();
-            assert!(needs_stable_feedback(&batch, false), "{action}");
+            assert_eq!(action_delay(&batch, 0).as_millis(), if matches!(action, "move" | "wait") { 0 } else { 300 }, "{action}");
         }
+        let explicit: Vec<Action> = serde_json::from_value(json!([{"action":"press","key":"Ctrl+C"},{"action":"wait","ms":400}])).unwrap();
+        assert_eq!(action_delay(&explicit, 0), Duration::ZERO);
+        assert_eq!(action_delay(&explicit, 1), Duration::ZERO);
         assert!(run("validation".into(), json!({"operation":"screenshot","windowId":1,"monitorId":2})).is_err());
         // Consecutive scrolls at one point must not be blocked by the pre-batch pixel guard.
         let scroll: Action = serde_json::from_value(json!({"action":"scroll","x":1,"y":1,"delta":3})).unwrap();
         assert!(!guarded_pointer(&scroll) && guarded_pointer(&actions[0]));
+        assert_eq!(action_delay(&[scroll, chained.into_iter().next().unwrap()], 0).as_millis(), 300);
     }
     #[test]
     fn scroll_frames_respect_feedback_and_skip_trailing_waits() {
@@ -2227,11 +2135,16 @@ mod tests {
             {"action":"scroll","x":1,"y":1,"delta":3}, {"action":"wait","ms":400}
         ])).unwrap();
         for feedback in [None, Some("screenshot"), Some("desktop")] {
-            let frames: Vec<_> = (0..actions.len()).filter(|&i| needs_scroll_frame(&actions, i, feedback)).collect();
-            assert_eq!(frames, [0]); // Last scroll is already covered by the final feedback.
+            let frames: Vec<_> = (0..actions.len()).filter_map(|i| scroll_frame_index(&actions, i, feedback).map(|s| (i, s))).collect();
+            assert_eq!(frames, [(1, 0)]); // Capture after wait; last scroll is covered by the final feedback.
         }
-        assert!((0..actions.len()).all(|i| !needs_scroll_frame(&actions, i, Some("none"))));
-        assert!(!needs_scroll_frame(&actions[..1], 0, None));
+        assert!((0..actions.len()).all(|i| scroll_frame_index(&actions, i, Some("none")).is_none()));
+        assert!(scroll_frame_index(&actions[..1], 0, None).is_none());
+        let consecutive: Vec<Action> = serde_json::from_value(json!([
+            {"action":"scroll"}, {"action":"scroll"}, {"action":"wait"}, {"action":"wait"}, {"action":"press"}
+        ])).unwrap();
+        let frames: Vec<_> = (0..consecutive.len()).filter_map(|i| scroll_frame_index(&consecutive, i, None).map(|s| (i, s))).collect();
+        assert_eq!(frames, [(0, 0), (3, 1)]);
     }
 
     #[test]
