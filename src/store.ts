@@ -2300,17 +2300,11 @@ export async function sendPromptTo(threadId: string, text: string, images: Promp
   await deliverPrompt(threadId, text, images);
 }
 
-/** 用上一次会话的模型在临时目录开新会话，由剑来把自带的 Nova Chrome 扩展装进 Chrome 并允许无痕。 */
+/** 用「剑来」场景模型在临时目录开新会话，由剑来把自带的 Nova Chrome 扩展装进 Chrome 并允许无痕。 */
 export async function installChromeExtensionWithJianlai(status: { chromePath: string | null; extensionDir: string; extensionId: string; installedVersion?: string | null; bundledVersion?: string | null; extensions?: { browser: string; version: string | null; outdated: boolean }[] }) {
   const others = (status.extensions ?? []).filter((e) => e.outdated && e.browser !== "Google Chrome");
-  const agentKind = lastUsed.agentKind();
-  const id = await createThread(
-    await api.scratchDir(),
-    agentKind,
-    lastUsed.model(agentKind),
-    "build",
-    lastUsed.reasoningEffort(agentKind),
-  );
+  const { agentKind, model } = sceneModel("computer");
+  const id = await createThread(await api.scratchDir(), agentKind, model, "build", "");
   await sendPromptTo(id, [
     "请用剑来（jianlai）操作桌面，为 Google Chrome 安装 Nova 自带的 Chrome 扩展。速度优先：已确定的动作尽量合批，直接使用 act 自动反馈，不额外截图；不要为经验搜索、保存或反馈增加任何检查：",
     `1. 打开 Chrome${status.chromePath ? `（路径：${status.chromePath}）` : ""}，在地址栏输入 chrome://extensions 并回车。chrome:// 页面无法用 chrome 工具操作，全程用剑来。`,

@@ -318,3 +318,15 @@ test('miniapp page patterns match the whole URL with * as the only wildcard',asy
   assert.ok(!scope.match('https://a.com/x.y','https://a.com/xzy'),'dots are literal');
   assert.ok(!scope.match('https://a.com/','https://a.com/?evil'),'no implicit prefix match');
 });
+
+test('self-reload only targets a numerically newer Nova-bundled version',async()=>{
+  const event=()=>({addListener(){}});
+  const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>[],onRemoved:event(),onReplaced:event(),onUpdated:event()},
+    debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.newer=newer;',scope);
+  assert.equal(scope.newer('0.1.12','0.1.11'),true);
+  assert.equal(scope.newer('0.1.10','0.1.9'),true,'numeric, not string, comparison');
+  assert.equal(scope.newer('0.1.11','0.1.11'),false);
+  assert.equal(scope.newer('0.1.9','0.1.10'),false,'an older Nova never downgrades the extension');
+});

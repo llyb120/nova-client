@@ -256,6 +256,7 @@ async function launchMiniapp(message, tab) {
 function loop() {
   for (let port=47653; port<=47662; port++) void connect(`http://127.0.0.1:${port}`);
 }
+const newer = (a, b) => { const [x, y] = [a, b].map(v => v.split('.').map(Number)); for (let i = 0; i < 4; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); return false; };
 async function connect(origin, attempt = 0) {
   if (loops.has(origin)) return;
   loops.add(origin);
@@ -272,7 +273,12 @@ async function connect(origin, attempt = 0) {
       const response = await post('/poll',{});
       if (!response.ok) throw Object.assign(Error(`连接被拒绝 HTTP ${response.status}；检查是否连接了另一个 Chrome 实例`),{conflict:response.status===409});
       connections.add(origin);
-      const {command} = await response.json();
+      const {command, version} = await response.json();
+      // Nova rewrites the unpacked files on update; every browser profile reloads itself once per target version.
+      if (version && newer(version, chrome.runtime.getManifest().version) && (await chrome.storage.local.get('reloadedFor')).reloadedFor !== version) {
+        await chrome.storage.local.set({reloadedFor: version});
+        chrome.runtime.reload();
+      }
       if (!command) continue;
       let reply;
       const result = commands.then(()=>execute(command));

@@ -126,6 +126,9 @@ pub(crate) fn init(app: &AppHandle) {
     let _ = bridge.app.set(app.clone());
     app.manage(bridge);
     let app = app.clone();
+    if let Err(error) = release_extension(&app) {
+        eprintln!("Chrome bridge: {error}");
+    }
     tauri::async_runtime::spawn(async move {
         if let Err(error) = connect(&app).await {
             eprintln!("Chrome bridge: {error}");
@@ -397,7 +400,7 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<ChromeBridge>) -> R
         })
         .await
         .ok();
-        respond(&mut stream, 200, json!({"command":command})).await
+        respond(&mut stream, 200, json!({"command":command,"version":bundled_version()})).await
     } else {
         let sender = body["id"]
             .as_str()
@@ -472,9 +475,12 @@ fn find_chrome() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-/// 检测 Chrome 依赖：Chrome 是否安装、扩展是否已连接及是否允许无痕；同时释放自带扩展到固定目录供「加载已解压的扩展程序」使用。
-#[tauri::command]
-pub async fn chrome_dependency_status(app: AppHandle) -> Result<Value, String> {
+fn bundled_version() -> Option<String> {
+    serde_json::from_str::<Value>(EXTENSION_FILES[0].1).ok().and_then(|m| m["version"].as_str().map(String::from))
+}
+
+/// 把自带扩展释放到固定目录；已装扩展据此在版本落后时自行重新加载。
+fn release_extension(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .state::<crate::AppState>()
         .config_dir
@@ -484,8 +490,15 @@ pub async fn chrome_dependency_status(app: AppHandle) -> Result<Value, String> {
     for (name, content) in EXTENSION_FILES {
         std::fs::write(directory.join(name), content).map_err(|e| format!("释放 Chrome 扩展失败：{e}"))?;
     }
+    Ok(directory)
+}
+
+/// 检测 Chrome 依赖：Chrome 是否安装、扩展是否已连接及是否允许无痕；同时释放自带扩展到固定目录供「加载已解压的扩展程序」使用。
+#[tauri::command]
+pub async fn chrome_dependency_status(app: AppHandle) -> Result<Value, String> {
+    let directory = release_extension(&app)?;
     let connected = connect(&app).await.map(|v| v["connected"] == true).unwrap_or(false);
-    let bundled_version = serde_json::from_str::<Value>(EXTENSION_FILES[0].1).ok().and_then(|m| m["version"].as_str().map(String::from));
+    let bundled_version = bundled_version();
     // 新文件已写入扩展目录：过期且认识 reload 的扩展直接自行重载升级，不动界面。
     // 重载后扩展以新 clientId 重连；从别的目录加载的重载后版本不变，仍留给剑来移除再加载。
     let mut upgraded = Vec::new();
