@@ -141,6 +141,7 @@ export type SettingsTab =
   | "jianlai"
   | "advanced"
   | "lyra"
+  | "mcp"
   | "backends"
   | "instructions"
   | "appearance"
@@ -169,6 +170,7 @@ const TABS: { id: SettingsTab; name: string; group: string }[] = [
 // Lyra 相关页并入左侧「Lyra」，在右侧用页签切换。
 const LYRA_TABS: { id: SettingsTab; name: string }[] = [
   { id: "lyra", name: "模型服务" },
+  { id: "mcp", name: "MCP" },
   { id: "skills", name: "Skills" },
   { id: "instructions", name: "Agent 配置" },
   { id: "backends", name: "维护" },
@@ -1498,8 +1500,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           </Show>
 
           {/* ===== Lyra（常驻挂载，切换 tab 不丢草稿） ===== */}
-          <div class="settings-tab-pane lyra-settings" hidden={tab() !== "lyra"}>
-            <div class="lyra-overview">
+          <div class="settings-tab-pane lyra-settings" hidden={tab() !== "lyra" && tab() !== "mcp"}>
+            <div class="lyra-overview" hidden={tab() !== "lyra"}>
               <div class="lyra-section-head">
                 <div class="lyra-heading">
                   <h3>Lyra</h3>
@@ -1517,7 +1519,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               </div>
             </div>
 
-            <details class="lyra-advanced">
+            <details class="lyra-advanced" hidden={tab() !== "lyra"}>
               <summary>本地 provider 连接设置</summary>
               <div class="lyra-detail-body">
                 <p class="field-hint">以下设置仅用于 Lyra 的本地 provider，不会启用独立后端。需先在对应产品中登录，再在下方添加 provider。</p>
@@ -1532,7 +1534,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 </label>
               </div>
             </details>
-            <LyraConfigPanel onSaver={(fn) => (saveLyraConfig = fn)} />
+            <LyraConfigPanel section={tab() === "mcp" ? "mcp" : "providers"} onSaver={(fn) => (saveLyraConfig = fn)} />
           </div>
 
           {/* ===== 模型后端 ===== */}

@@ -6922,7 +6922,8 @@ button:focus-visible {
   gap: 20px;
 }
 
-.settings-tab-pane[hidden] {
+.settings-tab-pane[hidden],
+.lyra-settings > [hidden] {
   display: none;
 }
 
@@ -7190,28 +7191,22 @@ button:focus-visible {
 .lyra-provider-footer { border-top: 0; padding-top: 0; justify-content: flex-end; }
 .lyra-empty { padding: 32px 24px; text-align: center; background: var(--bg-panel); }
 
-/* Lyra 二级页签：模型服务商 / MCP */
+/* 模型服务与 MCP 共用草稿，页面由 Lyra 顶层页签切换。 */
 .lyra-pane { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .lyra-pane[hidden] { display: none; }
-.lyra-subtabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); }
-.lyra-subtab {
-  appearance: none;
-  display: inline-flex;
+.lyra-mcp-server {
+  display: flex;
   align-items: center;
-  gap: 6px;
-  margin-bottom: -1px;
-  padding: 8px 14px;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 13px;
-  cursor: pointer;
-  transition: color 0.12s, border-color 0.12s;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--card-border);
+  border-radius: var(--r-md);
+  background: var(--bg-panel);
 }
-.lyra-subtab:hover { color: var(--text); }
-.lyra-subtab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
-.lyra-subtab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 4px; }
+.lyra-mcp-server .lyra-heading { display: flex; flex-direction: column; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.lyra-mcp-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* 设置弹窗全局精修：与 Lyra 服务商页统一的卡片、表单、开关和导航 */
 .settings-modal .modal-head { border-bottom: 1px solid var(--border); font-weight: 600; letter-spacing: 0.2px; }
