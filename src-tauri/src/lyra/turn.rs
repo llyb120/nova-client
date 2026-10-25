@@ -7,7 +7,7 @@ use crate::lyra::config::Resolved;
 use crate::lyra::context::{ContextWindow, Receipt, Trigger, SUMMARY_OUTPUT_MAX_TOKENS};
 use crate::lyra::history::{now_ms, user_message, History};
 use crate::lyra::prompt::{is_context_window_error, is_retryable_provider_error, ShellConfig};
-use crate::lyra::provider::{is_retryable_stream_error, stream_chat, StreamEvent};
+use crate::lyra::provider::{drop_old_tool_images, is_payload_too_large, is_retryable_stream_error, stream_chat, StreamEvent};
 use crate::lyra::session::{self, AgentHandle};
 use crate::lyra::tools::{execute, Tool, ToolOutcome};
 use serde_json::{json, Value};
@@ -228,6 +228,13 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
                     };
                     if s.cancelled.load(Ordering::SeqCst) {
                         return s.cancel();
+                    }
+                    // 其他工具的图片平时原样保留以护住缓存；请求体超限时先把更早的图换成路径并写回上下文，
+                    // 后续请求沿用；没有可省的图时再交给压缩。
+                    if is_payload_too_large(&error) && s.context.rewrite_view(s.history.items(), drop_old_tool_images) {
+                        crate::lyra::provider::reset_response_state(&s.session_id);
+                        on_event(TurnEvent::Retry { attempt: retries + 1, error, context_recovery: true });
+                        continue;
                     }
                     if is_context_window_error(&error) && !overflow_recovered {
                         overflow_recovered = true;

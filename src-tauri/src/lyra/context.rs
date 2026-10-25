@@ -343,6 +343,23 @@ impl ContextWindow {
         }
     }
 
+    /// 按 rewrite 改写模型可见视图（如 413 后省略旧图）并写入投影持久化，后续请求沿用；条数不变，无改动返回 false。
+    /// 投影只覆盖到最后一条被改写的消息，之后的规范历史照常追加，不改动折叠代数。
+    pub fn rewrite_view(&mut self, canonical: &[Value], rewrite: impl FnOnce(&[Value]) -> Option<Vec<Value>>) -> bool {
+        let view = self.view(canonical);
+        let Some(rewritten) = rewrite(&view).filter(|r| r.len() == view.len()) else { return false };
+        let Some(last) = (0..view.len()).rev().find(|&i| view[i] != rewritten[i]) else { return false };
+        let (prior, prior_covered) = self.valid_projection(canonical).map_or((0, 0), |p| (p.messages.len(), p.covered_count));
+        let covered = prior_covered + (last + 1).saturating_sub(prior);
+        self.state.projection = Some(Projection {
+            messages: rewritten[..prior + covered - prior_covered].to_vec(),
+            covered_count: covered,
+            covered_prefix_hash: hash_values(&canonical[..covered]),
+        });
+        self.save();
+        true
+    }
+
     /// 规范下标 → 视图下标；已被折叠（或保留在投影体里）的返回 None。
     pub fn view_index(&self, canonical: &[Value], index: usize) -> Option<usize> {
         match self.valid_projection(canonical) {
@@ -1288,6 +1305,24 @@ fn attach_fold_index(digest: &str, prior: &str, entries: &[IndexEntry], budget: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewritten_view_persists_and_later_history_still_appends() {
+        let mut ctx = ContextWindow::ephemeral(4096, 0);
+        let mut canonical: Vec<Value> = (0..4).map(|i| user(&format!("m{i}"))).collect();
+        assert!(!ctx.rewrite_view(&canonical, |v| Some(v.to_vec())), "no change, no projection");
+        assert!(!ctx.rewrite_view(&canonical, |_| None));
+        assert!(ctx.rewrite_view(&canonical, |v| { let mut v = v.to_vec(); v[1] = user("trimmed"); Some(v) }));
+        canonical.push(user("m4"));
+        let view = ctx.view(&canonical);
+        assert_eq!(view.len(), 5);
+        assert_eq!((view[1].clone(), view[2].clone(), view[4].clone()), (user("trimmed"), user("m2"), user("m4")));
+        assert_eq!(ctx.view_index(&canonical, 2), Some(2), "only the rewritten prefix is covered");
+        // A second rewrite inside the existing projection keeps its coverage.
+        assert!(ctx.rewrite_view(&canonical, |v| { let mut v = v.to_vec(); v[0] = user("t0"); Some(v) }));
+        assert_eq!(ctx.view(&canonical)[..3], [user("t0"), user("trimmed"), user("m2")]);
+        assert_eq!(ctx.view_index(&canonical, 2), Some(2));
+    }
 
     fn user(text: &str) -> Value {
         json!({ "role": "user", "content": [{ "type": "text", "text": text }] })

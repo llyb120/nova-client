@@ -147,30 +147,57 @@ struct Snapshot {
     delivered: Vec<Delivered>,
 }
 
-/// (imageId, JPEG digest, delivered path, delivered pixels before the cursor marker).
-type Delivered = (String, u64, std::path::PathBuf, xcap::image::RgbaImage);
-
-/// The previously delivered image this one repeats: identical bytes, or no visibly changed tile
-/// outside `motion` (the caret/animation area the settle loop proved keeps moving).
-fn unchanged_from<'a>(previous: &'a [Delivered], image_id: &str, digest: u64, pixels: &xcap::image::RgbaImage,
-    motion: Option<crate::visual_guard::PixelRect>) -> Option<&'a Delivered> {
-    previous.iter().find(|(id, d, _, seen)| id == image_id
-        && (*d == digest || changed_tiles(seen, pixels, motion).is_some_and(|t| !t.contains(&true))))
+/// What the model holds for one imageId: a keyframe (last full image) plus at most one live delta.
+/// Pixels are stored before the cursor marker.
+#[derive(Clone)]
+struct Delivered {
+    /// frameStream: one per monitor, plus one shared by all window captures — keyed by screen, not app,
+    /// so switching to a same-sized window is just another image change.
+    stream: String,
+    /// frameGroup = snapshotId of the keyframe capture; Lyra keeps each stream's latest group in context.
+    group: String,
+    keyframe_id: String,
+    keyframe: xcap::image::RgbaImage,
+    keyframe_path: std::path::PathBuf,
+    /// Keyframe with the latest delta applied, i.e. what the model currently believes is on screen.
+    seen: xcap::image::RgbaImage,
+    seen_path: std::path::PathBuf,
+    delta: Option<crate::visual_guard::PixelRect>,
+    deltas: u8,
 }
 
-/// Long edge of the overview sent with a local-change crop.
-const OVERVIEW_EDGE: u32 = 800;
+/// A group's deltas stay embedded until the next keyframe, so bound how many it can grow.
+const MAX_DELTAS: u8 = 8;
 
-/// Changed tiles' bounding box padded by one tile, if it covers at most a quarter of the image.
-fn local_change(tiles: &[bool], (w, h): (u32, u32)) -> Option<crate::visual_guard::PixelRect> {
+enum Delivery { Unchanged, Delta(crate::visual_guard::PixelRect), Keyframe }
+
+/// Unchanged when nothing differs from what the model already sees (`motion` = caret/animation the
+/// settle loop proved keeps moving). Otherwise a delta: the box of all change since the keyframe,
+/// including the previous delta's box (its content may have reverted), so the latest delta alone
+/// plus the keyframe describes the screen. Over a quarter of the image means a new keyframe.
+fn plan_delivery(prior: Option<&Delivered>, pixels: &xcap::image::RgbaImage, motion: Option<crate::visual_guard::PixelRect>) -> Delivery {
+    let Some(p) = prior.filter(|p| p.seen.dimensions() == pixels.dimensions()) else { return Delivery::Keyframe };
+    if changed_tiles(&p.seen, pixels, motion).is_some_and(|t| !t.contains(&true)) { return Delivery::Unchanged; }
+    if p.deltas >= MAX_DELTAS { return Delivery::Keyframe; }
+    let (w, h) = pixels.dimensions();
+    let fresh = changed_tiles(&p.keyframe, pixels, motion).and_then(|t| changed_box(&t, (w, h)));
+    let b = match (fresh, p.delta) {
+        (Some(a), Some(b)) => crate::visual_guard::PixelRect { left: a.left.min(b.left), top: a.top.min(b.top),
+            right: a.right.max(b.right), bottom: a.bottom.max(b.bottom) },
+        (a, b) => match a.or(b) { Some(r) => r, None => return Delivery::Keyframe },
+    };
+    // ponytail: one bounding box; far-apart changes (e.g. two corners) exceed the cap and become a keyframe.
+    if (b.right - b.left) as u64 * (b.bottom - b.top) as u64 * 4 <= w as u64 * h as u64 { Delivery::Delta(b) } else { Delivery::Keyframe }
+}
+
+/// Changed tiles' bounding box padded by one tile.
+fn changed_box(tiles: &[bool], (w, h): (u32, u32)) -> Option<crate::visual_guard::PixelRect> {
     let cols = w.div_ceil(TILE) as usize;
     let mut changed = tiles.iter().enumerate().filter(|(_, c)| **c).map(|(i, _)| ((i % cols) as u32, (i / cols) as u32));
     let (x, y) = changed.next()?;
     let (l, t, r, b) = changed.fold((x, y, x, y), |(l, t, r, b), (x, y)| (l.min(x), t.min(y), r.max(x), b.max(y)));
-    let rect = crate::visual_guard::PixelRect { left: l.saturating_sub(1) * TILE, top: t.saturating_sub(1) * TILE,
-        right: ((r + 2) * TILE).min(w), bottom: ((b + 2) * TILE).min(h) };
-    // ponytail: one bounding box; far-apart changes (e.g. two corners) exceed the cap and fall back to the full image.
-    ((rect.right - rect.left) as u64 * (rect.bottom - rect.top) as u64 * 4 <= w as u64 * h as u64).then_some(rect)
+    Some(crate::visual_guard::PixelRect { left: l.saturating_sub(1) * TILE, top: t.saturating_sub(1) * TILE,
+        right: ((r + 2) * TILE).min(w), bottom: ((b + 2) * TILE).min(h) })
 }
 
 /// settled_image's ignoredMotion (source pixels) mapped into the delivered, cropped and resized image.
@@ -567,7 +594,10 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     // Only this session's recent, same-mode observation counts as something the model has already seen.
     let previous = state.take().filter(|s| s.owner == owner && s.background == bg && s.taken.elapsed() <= Duration::from_secs(180))
         .map(|s| s.delivered).unwrap_or_default();
-    let mut delivered = Vec::new();
+    let mut delivered: Vec<Delivered> = Vec::new();
+    // ponytail: keyframe/delta only for a single full image; multi-monitor and region shots are always
+    // sent whole and ungrouped (Lyra keeps them by recency).
+
     if bg { background::check_scope(window_id.is_some())?; }
     let id = uuid::Uuid::new_v4().to_string();
     let sequence = OBSERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -616,78 +646,75 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
-        let path = folder.join(format!("{id}-{image_id}.jpg"));
         let encode_started = Instant::now();
-        let bytes = crate::visual_guard::encode_jpeg(&image)?;
-        let digest = { use std::hash::{Hash, Hasher}; let mut h = std::hash::DefaultHasher::new(); bytes.hash(&mut h); h.finish() };
-        let seen = unchanged_from(&previous, &image_id, digest, &plain, motion).cloned();
-        let same = seen.as_ref().map(|s| s.2.clone());
-        if same.is_none() { std::fs::write(&path, &bytes).map_err(err)?; }
-        encode_ms += encode_started.elapsed().as_millis();
-        let mut entry = json!({"imageId":image_id,"path":path,"width":image.width(),"height":image.height(),
+        let mut entry = json!({"imageId":image_id,"width":image.width(),"height":image.height(),
+            "pixelWidth":image.width(),"pixelHeight":image.height(),
             "snapshotId":id,"capturedAt":captured_at,"stability":stability,
             "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
             "cursor":cursor.map(|(x,y)| json!({"x":x,"y":y,"marker":"sword-tip","source":"system-pointer"})),
             "region":region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height})),
             "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}});
-        // No path means hosts attach no image; samePixelsAs stays readable through recall.
-        if let Some(same) = &same {
-            entry.as_object_mut().unwrap().remove("path");
-            entry["unchanged"] = json!(true);
-            entry["samePixelsAs"] = json!(same);
+        // The act snapshot always maps the full image: keyframe coordinates stay valid, delta coordinates
+        // are offset by the model; the pre-click pixel guard still checks the real current screen.
+        // Region zooms are sent whole and ungrouped.
+        let stream = region.is_none().then(|| if window_id.is_some() { "window".to_string() } else { image_id.clone() });
+        let prior = previous.iter().find(|p| Some(&p.stream) == stream.as_ref());
+        let mark = |entry: &mut Value, p: &Delivered| {
+            entry["frameStream"] = json!(p.stream);
+            entry["frameGroup"] = json!(p.group);
+            entry["keyframeImageId"] = json!(p.keyframe_id);
+            entry["keyframePath"] = json!(p.keyframe_path);
+        };
+        let mut delta_entry = None;
+        match plan_delivery(prior, &plain, motion) {
+            Delivery::Unchanged => {
+                let p = prior.unwrap();
+                // No path means hosts attach no image; samePixelsAs stays readable through recall.
+                entry["unchanged"] = json!(true);
+                entry["samePixelsAs"] = json!(p.seen_path);
+                mark(&mut entry, p);
+                delivered.push(p.clone());
+            }
+            Delivery::Delta(b) => {
+                let p = prior.unwrap();
+                let crop = xcap::image::imageops::crop_imm(&image, b.left, b.top, b.right - b.left, b.bottom - b.top).to_image();
+                let crop_path = folder.join(format!("{id}-{image_id}-delta.jpg"));
+                std::fs::write(&crop_path, crate::visual_guard::encode_jpeg(&crop)?).map_err(err)?;
+                mark(&mut entry, p);
+                let mut delta = json!({"deltaOf":image_id,"path":crop_path,"x":b.left,"y":b.top,
+                    "width":crop.width(),"height":crop.height(),"pixelWidth":crop.width(),"pixelHeight":crop.height(),
+                    "cursor":cursor.filter(|&(x, y)| b.contains(x as f64, y as f64))
+                        .map(|(x, y)| json!({"x":x - b.left,"y":y - b.top,"marker":"sword-tip","source":"system-pointer"}))});
+                mark(&mut delta, p);
+                delta_entry = Some(delta);
+                delivered.push(Delivered { seen: plain, seen_path: crop_path, delta: Some(b), deltas: p.deltas + 1, ..p.clone() });
+            }
+            Delivery::Keyframe => {
+                let path = folder.join(format!("{id}-{image_id}.jpg"));
+                std::fs::write(&path, crate::visual_guard::encode_jpeg(&image)?).map_err(err)?;
+                entry["path"] = json!(path);
+                if let Some(stream) = stream {
+                    let p = Delivered { stream, group: id.clone(), keyframe_id: image_id.clone(), keyframe: plain.clone(),
+                        keyframe_path: path.clone(), seen: plain, seen_path: path, delta: None, deltas: 0 };
+                    entry["keyframe"] = json!(true);
+                    mark(&mut entry, &p);
+                    delivered.push(p);
+                }
+            }
         }
-        // Local change after an action: a small overview keeps the layout, plus the changed area at full
-        // clarity; the rest equals the previous full image. Explicit screenshots always get the full image.
-        let local = (same.is_none() && settle && region.is_none() && image.width().max(image.height()) > OVERVIEW_EDGE)
-            .then(|| previous.iter().find(|p| p.0 == image_id)).flatten()
-            .and_then(|p| changed_tiles(&p.3, &plain, motion)).and_then(|t| local_change(&t, image.dimensions()));
-        let mut pixels = image.dimensions();
-        let mut extra = None;
-        if let Some(b) = local {
-            let s = image.width() as f64 / original_pixels.0 as f64;
-            let (x, y) = ((b.left as f64 / s) as u32, (b.top as f64 / s) as u32);
-            let r = Region { x, y, width: ((b.right as f64 / s).ceil() as u32).min(original_pixels.0) - x,
-                height: ((b.bottom as f64 / s).ceil() as u32).min(original_pixels.1) - y };
-            let crop = xcap::image::imageops::crop_imm(&image, b.left, b.top, b.right - b.left, b.bottom - b.top).to_image();
-            let t = OVERVIEW_EDGE as f64 / image.width().max(image.height()) as f64;
-            let overview = xcap::image::DynamicImage::ImageRgba8(image.clone()).resize_exact(
-                (image.width() as f64 * t).round().max(1.0) as u32, (image.height() as f64 * t).round().max(1.0) as u32,
-                xcap::image::imageops::FilterType::Triangle).into_rgba8();
-            let crop_id = format!("{image_id}-region-{}-{}-{}-{}", r.x, r.y, r.width, r.height);
-            let overview_path = folder.join(format!("{id}-{image_id}-overview.jpg"));
-            let crop_path = folder.join(format!("{id}-{crop_id}.jpg"));
-            std::fs::write(&overview_path, crate::visual_guard::encode_jpeg(&overview)?).map_err(err)?;
-            std::fs::write(&crop_path, crate::visual_guard::encode_jpeg(&crop)?).map_err(err)?;
-            entry["fullPath"] = entry["path"].take();
-            entry["path"] = json!(overview_path);
-            entry["width"] = json!(overview.width());
-            entry["height"] = json!(overview.height());
-            entry["overview"] = json!(true);
-            entry["cursor"] = json!(cursor.map(|(x, y)| json!({"x":(x as f64 * t) as u32,"y":(y as f64 * t) as u32,"marker":"sword-tip","source":"system-pointer"})));
-            pixels = overview.dimensions();
-            let crop_cursor = cursor.filter(|&(x, y)| b.contains(x as f64, y as f64))
-                .map(|(x, y)| json!({"x":x - b.left,"y":y - b.top,"marker":"sword-tip","source":"system-pointer"}));
-            extra = Some((json!({"imageId":crop_id,"path":crop_path,"width":crop.width(),"height":crop.height(),
-                "snapshotId":id,"capturedAt":captured_at,"originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
-                "cursor":crop_cursor,"region":{"x":r.x,"y":r.y,"width":r.width,"height":r.height},"changedArea":true,
-                "desktopBounds":entry["desktopBounds"].clone()}),
-                Shot { image_id: crop_id, surface: surface.clone(), pixels: crop.dimensions(), source_pixels: original_pixels,
-                    region: Some(r), guard: guard.clone(), overlay, desktop_capture }));
-        }
+        encode_ms += encode_started.elapsed().as_millis();
         images.push(entry);
-        // Keep comparing with what the model saw, so small changes cannot accumulate unsent.
-        delivered.push(seen.unwrap_or((image_id.clone(), digest, path, plain)));
+        images.extend(delta_entry);
         shots.push(Shot {
             image_id,
             surface,
-            pixels,
+            pixels: image.dimensions(),
             source_pixels: original_pixels,
             region,
             guard,
             overlay,
             desktop_capture,
         });
-        if let Some((entry, shot)) = extra { images.push(entry); shots.push(shot); }
         Ok(())
     };
     if let Some(wid) = window_id {
@@ -750,6 +777,8 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     if foreground()? != before {
         return Err("截图期间焦点改变，请重新截图".into());
     }
+    // Other images' keyframes stay usable when this capture targets something else (e.g. a zoom).
+    for p in previous { if !delivered.iter().any(|d| d.stream == p.stream) { delivered.push(p); } }
     *state = Some(Snapshot {
         id: id.clone(),
         owner: owner.into(),
@@ -768,12 +797,13 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
                 "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
                 "total":started.elapsed().as_millis()}});
-    let local: Vec<String> = images.iter().filter(|i| i["changedArea"] == true).filter_map(|i| i["imageId"].as_str().map(String::from)).collect();
-    if !local.is_empty() {
-        result["localChangeNotice"] = json!(format!("画面只有局部变化：带overview的是缩小的全图（看整体布局），{} 是变化区域的清晰图，其余区域与上一张全图一致。操作时用所点那张图的imageId和它自己的图片坐标（裁剪图从(0,0)起，不加region偏移）；变化区外的小目标在缩小图上看不清时先局部截图，不沿用旧图坐标。", local.join("、")));
+    let deltas: Vec<String> = images.iter().filter_map(|i| Some(format!("{} 的增量图对应关键帧(当时imageId={})的({},{})起 {}×{}",
+        i["deltaOf"].as_str()?, i["keyframeImageId"].as_str()?, i["x"], i["y"], i["width"], i["height"]))).collect();
+    if !deltas.is_empty() {
+        result["deltaNotice"] = json!(format!("画面局部变化，只发了增量图：{}。增量图与关键帧同比例，是该区域的最新内容并取代之前的增量；区域外与关键帧（同一屏幕或窗口流最近的完整图）一致。点击一律用本次snapshotId和deltaOf的imageId：区域外直接用关键帧坐标，区域内坐标=增量图内坐标+起点偏移。", deltas.join("；")));
     }
     if !unchanged.is_empty() {
-        result["unchangedNotice"] = json!(format!("{} 与上一张相同（至多光标/动画等持续变化的小块不同，剑形指针位置以cursor字段为准），未重复发送图片：直接沿用上一张图判断，坐标对本次snapshotId/imageId同样有效。动作后出现此提示说明该动作没有产生可见变化，换方法而不是重复同一输入或反复截图；上一张已不在上下文时用recall(imagePath=samePixelsAs)回看。", unchanged.join("、")));
+        result["unchangedNotice"] = json!(format!("{} 与你已看到的画面（关键帧及最新增量）相同（至多光标/动画等持续变化的小块不同，剑形指针位置以cursor字段为准），未重复发送图片：直接沿用已看到的画面判断，坐标对本次snapshotId/imageId同样有效。动作后出现此提示说明该动作没有产生可见变化，换方法而不是重复同一输入或反复截图；上一张已不在上下文时用recall(imagePath=samePixelsAs)回看。", unchanged.join("、")));
     }
     Ok(result)
 }
@@ -1883,31 +1913,35 @@ mod tests {
         }
     }
     #[test]
-    fn only_unchanged_pixels_of_the_same_image_count_as_unchanged() {
+    fn keyframe_then_cumulative_deltas() {
         use xcap::image::{Rgba, RgbaImage};
+        use crate::visual_guard::PixelRect;
         let page = RgbaImage::from_pixel(320, 320, Rgba([255, 255, 255, 255]));
-        let seen: Vec<Delivered> = vec![("window-1".to_string(), 7, std::path::PathBuf::from("a.jpg"), page.clone())];
-        let found = |id, digest, pixels: &RgbaImage, motion| unchanged_from(&seen, id, digest, pixels, motion).map(|s| s.2.clone());
-        assert_eq!(found("window-1", 7, &page, None), Some("a.jpg".into()));
-        assert_eq!(found("window-1", 8, &page, None), Some("a.jpg".into()), "re-encoding alone is not a change");
-        assert_eq!(found("window-1-region-0-0-10-10", 7, &page, None), None, "a crop is a different image");
+        let p0 = Delivered { stream: "window".into(), group: "snap".into(), keyframe_id: "window-1".into(), keyframe: page.clone(), keyframe_path: "k.jpg".into(),
+            seen: page.clone(), seen_path: "k.jpg".into(), delta: None, deltas: 0 };
+        let rect = |l, t, r, b| PixelRect { left: l, top: t, right: r, bottom: b };
+        assert!(matches!(plan_delivery(None, &page, None), Delivery::Keyframe));
+        assert!(matches!(plan_delivery(Some(&p0), &page, None), Delivery::Unchanged));
+        assert!(matches!(plan_delivery(Some(&p0), &RgbaImage::new(321, 320), None), Delivery::Keyframe), "resized window");
         let mut typed = page.clone();
         typed.put_pixel(150, 150, Rgba([0, 0, 0, 255]));
-        assert_eq!(found("window-1", 8, &typed, None), None, "a single typed glyph is always resent");
+        assert!(matches!(plan_delivery(Some(&p0), &typed, None), Delivery::Delta(b) if b == rect(96, 96, 192, 192)), "a single glyph is sent");
         // Only motion the settle loop proved animated is tolerated, mapped from source into delivered pixels.
         let stability = json!({"ignoredMotion":{"x":288,"y":288,"width":32,"height":32}});
         let motion = motion_in(&stability, None, (640, 640), (320, 320));
-        assert_eq!(motion, Some(crate::visual_guard::PixelRect { left:144, top:144, right:160, bottom:160 }));
-        assert_eq!(found("window-1", 8, &typed, motion), Some("a.jpg".into()));
+        assert_eq!(motion, Some(rect(144, 144, 160, 160)));
+        assert!(matches!(plan_delivery(Some(&p0), &typed, motion), Delivery::Unchanged));
         assert_eq!(motion_in(&stability, Some(Region { x:0, y:0, width:100, height:100 }), (640, 640), (100, 100)), None);
-
-        // A local change is sent as its padded box; a large or scattered change falls back to the full image.
-        let mut tiles = vec![false; 100];
-        assert_eq!(local_change(&tiles, (320, 320)), None);
-        tiles[5 * 10 + 5] = true;
-        assert_eq!(local_change(&tiles, (320, 320)), Some(crate::visual_guard::PixelRect { left:128, top:128, right:224, bottom:224 }));
-        tiles[0] = true;
-        assert_eq!(local_change(&tiles, (320, 320)), None);
+        // After a delta, a revert to the keyframe resends the old box so the latest delta stays authoritative.
+        let p1 = Delivered { seen: typed.clone(), delta: Some(rect(96, 96, 192, 192)), deltas: 1, ..p0.clone() };
+        assert!(matches!(plan_delivery(Some(&p1), &typed, None), Delivery::Unchanged));
+        assert!(matches!(plan_delivery(Some(&p1), &page, None), Delivery::Delta(b) if b == rect(96, 96, 192, 192)));
+        // Change accumulates against the keyframe; over a quarter of the image becomes a new keyframe.
+        let mut more = typed.clone();
+        more.put_pixel(40, 40, Rgba([0, 0, 0, 255]));
+        assert!(matches!(plan_delivery(Some(&p1), &more, None), Delivery::Keyframe));
+        let capped = Delivered { deltas: MAX_DELTAS, ..p1.clone() };
+        assert!(matches!(plan_delivery(Some(&capped), &page, None), Delivery::Keyframe));
     }
     #[test]
     fn lone_action_becomes_a_one_item_batch() {

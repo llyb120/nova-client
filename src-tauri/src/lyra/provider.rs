@@ -104,46 +104,103 @@ fn screenshot_caption(message: &Value) -> String {
     let details = &message["details"];
     let images: Vec<Value> = details["images"].as_array().into_iter().flatten().take(16)
         .map(|image| json!({"imageId":image["imageId"],"pixelWidth":image["pixelWidth"],"pixelHeight":image["pixelHeight"]})).collect();
-    format!("Browser screenshots for toolCallId={}, snapshotId={}; images in order: {}. With imageId, use coordinates measured directly on that returned image in image pixels. NEVER rescale using CSS viewport dimensions, DPI or crop offsets: the tool maps these automatically. Do not reuse coordinates from another image. {}",
+    let frames = if detail_images(message).iter().any(|i| frame_of(message, i).is_some()) {
+        " Exception for desktop frame groups: a keyframe's coordinates stay valid with the latest snapshotId and imageId of the same screen, and a delta crop's coordinates need its stated offset added."
+    } else { "" };
+    format!("Browser screenshots for toolCallId={}, snapshotId={}; images in order: {}. With imageId, use coordinates measured directly on that returned image in image pixels. NEVER rescale using CSS viewport dimensions, DPI or crop offsets: the tool maps these automatically. Do not reuse coordinates from another image.{frames} {}",
         message["toolCallId"], details["snapshotId"], json!(images), details["coordinateSpace"].as_str().unwrap_or_default())
 }
 
-/// 每次请求都会把历史截图从磁盘重读成 base64；只内嵌最近几次带图的工具结果，避免请求体 413。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Embed { Omit, Image, WithKeyframe }
+
+fn detail_images(message: &Value) -> &[Value] {
+    message.pointer("/details/images").and_then(Value::as_array).map_or(&[], Vec::as_slice)
+}
+
+/// 剑来截图的 (frameStream, frameGroup)：每块屏幕/窗口流各自分组。其他工具的图片没有分组。
+fn frame_of<'a>(message: &Value, image: &'a Value) -> Option<(&'a str, &'a str)> {
+    if message["role"] != "toolResult" || message["toolName"] != "jianlai" { return None; }
+    Some((image["frameStream"].as_str()?, image["frameGroup"].as_str()?))
+}
+
+/// 每条消息里 details.images 各张图是否内嵌。剑来每条流只内嵌当前关键帧组（关键帧及其增量）：组内不滑动，
+/// 换新关键帧时旧组一次性换成路径，提示缓存每组只失效一次。其他图片（其他工具、剑来局部截图）始终留在原位。
+fn tool_image_embeds(messages: &[Value]) -> Vec<Vec<Embed>> {
+    let frames = |m| detail_images(m).iter().map(move |i| frame_of(m, i).map(|f| (f, i)));
+    let current: std::collections::HashMap<&str, &str> = messages.iter().flat_map(frames).flatten().map(|(f, _)| f).collect();
+    // 压缩可能折叠掉当前关键帧：在该组第一张上按 keyframePath 补回，增量才有参照。
+    let mut anchored: std::collections::HashSet<&str> = messages.iter().flat_map(frames).flatten()
+        .filter(|((s, g), i)| current.get(s) == Some(g) && i["keyframe"] == true && i["path"].is_string())
+        .map(|((s, _), _)| s).collect();
+    messages.iter().map(|m| frames(m).map(|f| match f {
+        None => Embed::Image,
+        Some(((s, g), _)) if current.get(s) == Some(&g) => if anchored.insert(s) { Embed::WithKeyframe } else { Embed::Image },
+        Some(_) => Embed::Omit,
+    }).collect()).collect()
+}
+
+/// 413 兜底时保留的非剑来分组带图工具结果条数。
 const RECENT_TOOL_IMAGES: usize = 3;
 
-fn has_tool_images(message: &Value) -> bool {
-    message["role"] == "toolResult"
-        && (message["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"] == "image"))
-            // jianlai omits path for pixel-identical repeats; they carry no image and must not evict real ones.
-            || message.pointer("/details/images").and_then(Value::as_array).is_some_and(|a| a.iter().any(|i| i["path"].is_string()))
-            || message.pointer("/details/imagePath").and_then(Value::as_str).is_some())
+pub(crate) fn is_payload_too_large(error: &str) -> bool {
+    let message = error.to_lowercase();
+    ["http 413", "payload too large", "request entity too large", "request_too_large"].iter().any(|f| message.contains(f))
 }
 
-/// 下标不小于返回值的工具结果才内嵌图片。
-fn tool_images_from(messages: &[Value]) -> usize {
-    messages.iter().enumerate().rev().filter(|(_, m)| has_tool_images(m))
-        .nth(RECENT_TOOL_IMAGES - 1).map_or(0, |(i, _)| i)
-}
-
-/// 工具结果文本与要内嵌的图片；较早的图片换成路径/imageId 说明，需要时由模型再读。
-fn tool_result_parts(message: &Value, model: &ResolvedModel, embed: bool) -> (String, Vec<Value>) {
-    let text = tool_result_text(message);
-    if embed || !model.supports_images || !has_tool_images(message) {
-        return (text, tool_result_images(message, model));
+/// 413 后改写上下文时使用：剑来分组以外的带图工具结果只留最近 RECENT_TOOL_IMAGES 条，更早的换成路径说明；没有可省的图时返回 None。
+pub(crate) fn drop_old_tool_images(messages: &[Value]) -> Option<Vec<Value>> {
+    let loose = |m: &Value, i: &Value| frame_of(m, i).is_none() && i["path"].is_string();
+    let has_images = |m: &Value| m["role"] == "toolResult"
+        && (m["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"] == "image"))
+            || detail_images(m).iter().any(|i| loose(m, i))
+            || m.pointer("/details/imagePath").and_then(Value::as_str).is_some());
+    let old: Vec<usize> = messages.iter().enumerate().rev().filter(|(_, m)| has_images(m))
+        .skip(RECENT_TOOL_IMAGES).map(|(i, _)| i).collect();
+    if old.is_empty() { return None; }
+    let mut out = messages.to_vec();
+    for i in old {
+        let message = &out[i];
+        let mut paths: Vec<String> = detail_images(message).iter().filter(|i| loose(message, i))
+            .map(|i| format!("imageId={} path={}", i["imageId"], i["path"].as_str().unwrap_or_default())).collect();
+        paths.extend(message.pointer("/details/imagePath").and_then(Value::as_str).map(|p| format!("path={p}")));
+        let keep: Vec<bool> = detail_images(message).iter().map(|i| !loose(message, i)).collect();
+        let message = &mut out[i];
+        if let Some(images) = message.pointer_mut("/details/images").and_then(Value::as_array_mut) {
+            for (image, keep) in images.iter_mut().zip(keep) {
+                if !keep { image.as_object_mut().map(|o| o.remove("path")); }
+            }
+        }
+        message.pointer_mut("/details").and_then(Value::as_object_mut).map(|d| d.remove("imagePath"));
+        let note = if paths.is_empty() {
+            "[Earlier image omitted from context because the request was too large; rerun the tool if you need to see it again.]".to_string()
+        } else {
+            format!("[Earlier screenshot omitted from context because the request was too large: {}. Use read on the path if you need to look again; its imageId is stale, take a fresh screenshot before acting on coordinates.]", paths.join("; "))
+        };
+        if !message["content"].is_array() { message["content"] = json!([]); }
+        let parts = message["content"].as_array_mut().unwrap();
+        parts.retain(|p| p["type"] != "image");
+        parts.push(json!({"type":"text","text":note}));
     }
-    let paths: Vec<String> = message.pointer("/details/images").and_then(Value::as_array).into_iter().flatten()
-        .filter_map(|image| image["path"].as_str().map(|path| format!("imageId={} path={path}", image["imageId"])))
-        .chain(message.pointer("/details/imagePath").and_then(Value::as_str).map(|path| format!("path={path}")))
-        .collect();
-    let note = if paths.is_empty() {
-        "[Earlier image omitted from context to save space; rerun the tool if you need to see it again.]".to_string()
-    } else {
-        format!("[Earlier screenshot omitted from context to save space: {}. Use read on the path if you need to look again; its imageId is stale, take a fresh screenshot before acting on coordinates.]", paths.join("; "))
-    };
-    (format!("{text}\n\n{note}"), Vec::new())
+    Some(out)
 }
 
-fn tool_result_images(message: &Value, model: &ResolvedModel) -> Vec<Value> {
+/// 工具结果文本与要内嵌的图片；剑来旧关键帧组的图换成路径/imageId 说明，需要时由模型再读。
+fn tool_result_parts(message: &Value, model: &ResolvedModel, embeds: &[Embed]) -> (String, Vec<Value>) {
+    let mut text = tool_result_text(message);
+    let omitted: Vec<String> = detail_images(message).iter().zip(embeds)
+        .filter(|(_, e)| **e == Embed::Omit)
+        .filter_map(|(image, _)| image["path"].as_str().map(|path| if image["deltaOf"].is_string() {
+            format!("delta of imageId={} path={path}", image["deltaOf"])
+        } else { format!("imageId={} path={path}", image["imageId"]) }))
+        .collect();
+    if model.supports_images && !omitted.is_empty() {
+        text.push_str(&format!("\n\n[Earlier screenshot omitted from context: a newer keyframe of the same screen replaced it: {}. Use read on the path if you need to look again; its imageId is stale, act only on the latest screenshot.]", omitted.join("; ")));
+    }
+    (text, tool_result_images(message, model, embeds))
+}
+
+fn tool_result_images(message: &Value, model: &ResolvedModel, embeds: &[Embed]) -> Vec<Value> {
     if !model.supports_images {
         return Vec::new();
     }
@@ -155,19 +212,34 @@ fn tool_result_images(message: &Value, model: &ResolvedModel) -> Vec<Value> {
         .filter(|part| part.get("type").and_then(Value::as_str) == Some("image"))
         .cloned()
         .collect();
-    let paths = message.pointer("/details/images").and_then(Value::as_array)
-        .into_iter().flatten().filter_map(|image| image["path"].as_str().map(|path| (path,image.clone())))
-        .chain(message.pointer("/details/imagePath").and_then(Value::as_str).map(|path| (path,json!({}))));
-    for (path, metadata) in paths.take(16) {
-        if let Ok(data) = std::fs::read(path) {
-            images.push(json!({
-                "type": "image",
-                "mimeType": crate::lyra::prompt::image_media_type(path).unwrap_or("image/png"),
-                "data": base64::engine::general_purpose::STANDARD.encode(data),
-                "caption":format!("This image: imageId={}, {}×{} image pixels; snapshotId={}. Use these image pixels directly with imageId, without CSS/DPI conversion.",
-                    metadata["imageId"],metadata["pixelWidth"],metadata["pixelHeight"],message["details"]["snapshotId"]),
-            }));
+    let snapshot = &message["details"]["snapshotId"];
+    let file = |path: &str, caption: String| -> Option<Value> {
+        let data = std::fs::read(path).ok()?;
+        Some(json!({
+            "type": "image",
+            "mimeType": crate::lyra::prompt::image_media_type(path).unwrap_or("image/png"),
+            "data": base64::engine::general_purpose::STANDARD.encode(data),
+            "caption": caption,
+        }))
+    };
+    let plans = embeds.iter().copied().chain(std::iter::repeat(Embed::Image));
+    for (metadata, embed) in detail_images(message).iter().zip(plans).take(16) {
+        if embed == Embed::Omit { continue; }
+        if let Some(path) = metadata["keyframePath"].as_str().filter(|_| embed == Embed::WithKeyframe) {
+            images.extend(file(path, format!("Keyframe re-attached (its original message was compacted): the latest full image of this screen (imageId={} when captured) that later deltas apply to; its coordinates stay valid with the latest snapshotId and imageId.",
+                metadata["keyframeImageId"])));
         }
+        let Some(path) = metadata["path"].as_str() else { continue };
+        images.extend(file(path, if metadata["deltaOf"].is_string() {
+            format!("This image: DELTA crop of this screen's keyframe (imageId={kid} when captured), {}×{} image pixels whose (0,0) is ({x},{y}) in the keyframe, same scale; snapshotId={snapshot}. It supersedes earlier deltas and everything outside it equals the keyframe. To click inside it use imageId={k} with (x+{x}, y+{y}); outside it use keyframe coordinates directly with imageId={k}.",
+                metadata["pixelWidth"], metadata["pixelHeight"], kid=metadata["keyframeImageId"], k=metadata["deltaOf"], x=metadata["x"], y=metadata["y"])
+        } else {
+            format!("This image: imageId={}, {}×{} image pixels; snapshotId={snapshot}. Use these image pixels directly with imageId, without CSS/DPI conversion.",
+                metadata["imageId"], metadata["pixelWidth"], metadata["pixelHeight"])
+        }));
+    }
+    if let Some(path) = message.pointer("/details/imagePath").and_then(Value::as_str) {
+        images.extend(file(path, format!("This image: imageId=null, null×null image pixels; snapshotId={snapshot}. Use these image pixels directly with imageId, without CSS/DPI conversion.")));
     }
     images
 }
@@ -181,7 +253,7 @@ fn completions_messages(
 ) -> Vec<Value> {
     let mut out = vec![json!({ "role": "system", "content": system_prompt })];
     let mut screenshots = Vec::new();
-    let images_from = tool_images_from(messages);
+    let embeds = tool_image_embeds(messages);
     for (index, message) in messages.iter().enumerate() {
         // 截图是额外的 user 消息，不能打断同一轮连续的 tool 回复。
         if message.get("role").and_then(Value::as_str) != Some("toolResult") {
@@ -280,7 +352,7 @@ fn completions_messages(
                 out.push(Value::Object(item));
             }
             Some("toolResult") => {
-                let (text, images) = tool_result_parts(message, model, index >= images_from);
+                let (text, images) = tool_result_parts(message, model, &embeds[index]);
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": replay_tool_id(message.get("toolCallId").and_then(Value::as_str).unwrap_or_default()),
@@ -478,7 +550,7 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
     // them fails with "not found"; encrypted_content and call_id carry the state instead.
     let stored = model.local_auth.as_deref() != Some("codex") && model.extra_options.get("store") == Some(&Value::Bool(true));
     let mut out = Vec::new();
-    let images_from = tool_images_from(messages);
+    let embeds = tool_image_embeds(messages);
     for (index, message) in messages.iter().enumerate() {
         match message.get("role").and_then(Value::as_str) {
             Some("user") => {
@@ -568,7 +640,7 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                 }
             }
             Some("toolResult") => {
-                let (text, images) = tool_result_parts(message, model, index >= images_from);
+                let (text, images) = tool_result_parts(message, model, &embeds[index]);
                 out.push(json!({
                     "type": "function_call_output",
                     "call_id": message.get("toolCallId").and_then(Value::as_str).unwrap_or_default().split('|').next().unwrap_or_default(),
@@ -1840,7 +1912,7 @@ fn unsigned_thinking(messages: &[Value]) -> Vec<Value> {
 fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let mut screenshots: Vec<Value> = Vec::new();
-    let images_from = tool_images_from(messages);
+    let embeds = tool_image_embeds(messages);
     // 并行工具的 tool_result 必须连续排在同一条 user 消息开头，截图只能跟在全部结果之后。
     let flush = |out: &mut Vec<Value>, screenshots: &mut Vec<Value>| {
         if let Some(content) = out.last_mut().and_then(|m| m["content"].as_array_mut()) {
@@ -1933,7 +2005,7 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
             }
             Some("toolResult") => {
                 let is_error = message.get("isError").and_then(Value::as_bool) == Some(true);
-                let (text, images) = tool_result_parts(message, model, index >= images_from);
+                let (text, images) = tool_result_parts(message, model, &embeds[index]);
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": replay_tool_id(message.get("toolCallId").and_then(Value::as_str).unwrap_or_default()),
@@ -2591,15 +2663,45 @@ mod tests {
     }
 
     #[test]
-    fn only_recent_tool_images_are_embedded() {
-        let shot = |i: usize| json!({"role":"toolResult","toolCallId":format!("call-{i}"),"content":[{"type":"text","text":"ok"}],
-            "details":{"snapshotId":format!("snap{i}"),"images":[{"imageId":format!("snap{i}-0"),"path":format!("C:/shots/{i}.png")}]}});
-        let messages: Vec<Value> = (0..5).map(shot).collect();
-        assert_eq!(tool_images_from(&messages), 2);
+    fn desktop_frame_groups_replace_only_their_own_stream() {
+        use Embed::*;
         let model = test_model("openai-completions");
-        let (text, images) = tool_result_parts(&messages[0], &model, false);
-        assert!(images.is_empty() && text.contains("C:/shots/0.png") && text.contains("snap0-0"), "{text}");
-        assert_eq!(tool_result_parts(&messages[4], &model, true).0, "ok");
+        let shot = |i: usize, images: Value| json!({"role":"toolResult","toolName":"jianlai","toolCallId":format!("call-{i}"),
+            "content":[{"type":"text","text":"ok"}],"details":{"snapshotId":format!("snap{i}"),"images":images}});
+        let key = |stream: &str, group: &str| json!({"imageId":format!("{stream}-0"),"path":format!("C:/shots/{group}.png"),
+            "frameStream":stream,"frameGroup":group,"keyframe":true,"keyframeImageId":format!("{stream}-0"),"keyframePath":format!("C:/shots/{group}.png")});
+        let full = |stream: &str, group: &str| json!({"imageId":format!("{stream}-0"),"frameStream":stream,"frameGroup":group,
+            "keyframeImageId":format!("{stream}-0"),"keyframePath":format!("C:/shots/{group}.png")});
+        let delta = |stream: &str, group: &str, n: usize| json!({"deltaOf":format!("{stream}-0"),"path":format!("C:/shots/{group}-d{n}.png"),
+            "x":10,"y":20,"frameStream":stream,"frameGroup":group,"keyframeImageId":format!("{stream}-0"),"keyframePath":format!("C:/shots/{group}.png")});
+        let browser = json!({"role":"toolResult","toolName":"chrome","toolCallId":"b","content":[],
+            "details":{"images":[{"imageId":"tab-0","path":"C:/shots/tab.png","frameStream":"window","frameGroup":"x"}]}});
+        let messages = vec![
+            shot(0, json!([key("monitor-1","a"), key("monitor-2","m")])),
+            shot(1, json!([full("monitor-1","a"), delta("monitor-1","a",1), full("monitor-2","m")])),
+            browser.clone(),
+            shot(3, json!([key("monitor-1","b"), full("monitor-2","m"), delta("monitor-2","m",1)])),
+            shot(4, json!([full("monitor-1","b"), delta("monitor-1","b",1)])),
+        ];
+        // Monitor 1's old group is replaced once; monitor 2's group and other tools' images stay put.
+        assert_eq!(tool_image_embeds(&messages), vec![vec![Omit, Image], vec![Omit, Omit, Image], vec![Image],
+            vec![Image, Image, Image], vec![Image, Image]]);
+        let (text, images) = tool_result_parts(&messages[1], &model, &[Omit, Omit, Image]);
+        assert!(images.is_empty() && text.contains("C:/shots/a-d1.png") && text.contains("delta of imageId"), "{text}");
+        // A compacted keyframe is re-attached on its group's first remaining image.
+        assert_eq!(tool_image_embeds(&messages[4..]), vec![vec![WithKeyframe, Image]]);
+        assert_eq!(tool_image_embeds(&[browser.clone()]), vec![vec![Image]], "other tools never join frame groups");
+
+        // 413 fallback: only other tools' images beyond the latest three are dropped; frame groups stay.
+        assert!(is_payload_too_large("HTTP 413 Payload Too Large") && !is_payload_too_large("HTTP 429"));
+        let mut history = messages.clone();
+        history.extend((0..3).map(|i| { let mut b = browser.clone(); b["details"]["images"][0]["path"] = json!(format!("C:/shots/tab{i}.png")); b }));
+        let trimmed = drop_old_tool_images(&history).unwrap();
+        assert!(trimmed[2]["details"]["images"][0]["path"].is_null());
+        assert!(trimmed[2]["content"].to_string().contains("C:/shots/tab.png"));
+        assert_eq!(trimmed[3], history[3], "desktop frame groups are untouched");
+        assert_eq!(&trimmed[5..], &history[5..]);
+        assert!(drop_old_tool_images(&history[5..]).is_none());
     }
 
     #[test]
