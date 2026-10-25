@@ -143,13 +143,48 @@ struct Snapshot {
     invalidated: Option<String>,
     /// 后台截图：act 必须同样带 background，两种模式的快照互不通用。
     background: bool,
-    /// (imageId, JPEG digest, path the model actually received) per image, so identical repeats are not resent.
-    delivered: Vec<(String, u64, std::path::PathBuf)>,
+    /// What the model actually received per image, so unchanged repeats are not resent.
+    delivered: Vec<Delivered>,
 }
 
-/// The previously delivered image this one repeats pixel for pixel (same imageId and encoded bytes).
-fn unchanged_from<'a>(previous: &'a [(String, u64, std::path::PathBuf)], image_id: &str, digest: u64) -> Option<&'a std::path::PathBuf> {
-    previous.iter().find(|(id, d, _)| id == image_id && *d == digest).map(|(_, _, path)| path)
+/// (imageId, JPEG digest, delivered path, delivered pixels before the cursor marker).
+type Delivered = (String, u64, std::path::PathBuf, xcap::image::RgbaImage);
+
+/// The previously delivered image this one repeats: identical bytes, or no visibly changed tile
+/// outside `motion` (the caret/animation area the settle loop proved keeps moving).
+fn unchanged_from<'a>(previous: &'a [Delivered], image_id: &str, digest: u64, pixels: &xcap::image::RgbaImage,
+    motion: Option<crate::visual_guard::PixelRect>) -> Option<&'a Delivered> {
+    previous.iter().find(|(id, d, _, seen)| id == image_id
+        && (*d == digest || changed_tiles(seen, pixels, motion).is_some_and(|t| !t.contains(&true))))
+}
+
+/// Long edge of the overview sent with a local-change crop.
+const OVERVIEW_EDGE: u32 = 800;
+
+/// Changed tiles' bounding box padded by one tile, if it covers at most a quarter of the image.
+fn local_change(tiles: &[bool], (w, h): (u32, u32)) -> Option<crate::visual_guard::PixelRect> {
+    let cols = w.div_ceil(TILE) as usize;
+    let mut changed = tiles.iter().enumerate().filter(|(_, c)| **c).map(|(i, _)| ((i % cols) as u32, (i / cols) as u32));
+    let (x, y) = changed.next()?;
+    let (l, t, r, b) = changed.fold((x, y, x, y), |(l, t, r, b), (x, y)| (l.min(x), t.min(y), r.max(x), b.max(y)));
+    let rect = crate::visual_guard::PixelRect { left: l.saturating_sub(1) * TILE, top: t.saturating_sub(1) * TILE,
+        right: ((r + 2) * TILE).min(w), bottom: ((b + 2) * TILE).min(h) };
+    // ponytail: one bounding box; far-apart changes (e.g. two corners) exceed the cap and fall back to the full image.
+    ((rect.right - rect.left) as u64 * (rect.bottom - rect.top) as u64 * 4 <= w as u64 * h as u64).then_some(rect)
+}
+
+/// settled_image's ignoredMotion (source pixels) mapped into the delivered, cropped and resized image.
+fn motion_in(stability: &Value, region: Option<Region>, source: (u32, u32), delivered: (u32, u32)) -> Option<crate::visual_guard::PixelRect> {
+    let m = stability.get("ignoredMotion")?;
+    let (ox, oy, cw) = region.map_or((0, 0, source.0), |r| (r.x, r.y, r.width));
+    let s = delivered.0 as f64 / cw.max(1) as f64;
+    let at = |key: &str, origin: u32, extra: &str, round: fn(f64) -> f64| -> Option<u32> {
+        let v = m[key].as_u64()? + if extra.is_empty() { 0 } else { m[extra].as_u64()? };
+        Some(round(v.saturating_sub(origin as u64) as f64 * s) as u32)
+    };
+    let r = crate::visual_guard::PixelRect { left: at("x", ox, "", f64::floor)?, top: at("y", oy, "", f64::floor)?,
+        right: at("x", ox, "width", f64::ceil)?.min(delivered.0), bottom: at("y", oy, "height", f64::ceil)?.min(delivered.1) };
+    (r.left < r.right && r.top < r.bottom).then_some(r)
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -428,23 +463,28 @@ fn overlay_region(surface: &Surface, pixels: (u32, u32), bounds: Option<crate::t
     (left < right && top < bottom).then_some(crate::visual_guard::PixelRect { left, top, right, bottom })
 }
 
-fn visually_similar(a: &xcap::image::RgbaImage, b: &xcap::image::RgbaImage, exclude: Option<crate::visual_guard::PixelRect>) -> bool {
-    if a.dimensions() != b.dimensions() || a.is_empty() { return false; }
-    let excluded = exclude.map_or(0, |r| {
-        r.right.min(a.width()).saturating_sub(r.left) as usize
-            * r.bottom.min(a.height()).saturating_sub(r.top) as usize
-    });
-    let compared = a.as_raw().len() / 4 - excluded;
-    if compared == 0 { return false; }
-    // memcmp fast path for truly static frames; the per-pixel scan is slow in unoptimized NovaDev builds.
-    if a.as_raw() == b.as_raw() { return true; }
-    // ponytail: tolerate 0.05% changed pixels for caret/noise; this can miss tiny updates.
-    // Visual quiet is not application readiness; use semantic result checks, not a looser threshold.
-    let allowance = compared / 2000;
-    a.pixels().zip(b.pixels()).enumerate().filter(|(i, (x, y))| {
-        (0..3).any(|c| x[c].abs_diff(y[c]) > 16)
-            && !exclude.is_some_and(|r| r.contains((*i % a.width() as usize) as f64, (*i / a.width() as usize) as f64))
-    }).take(allowance + 1).count() <= allowance
+const TILE: u32 = 32;
+
+/// Which TILE×TILE blocks visibly changed (any channel > 16); None when frames are not comparable.
+fn changed_tiles(a: &xcap::image::RgbaImage, b: &xcap::image::RgbaImage, exclude: Option<crate::visual_guard::PixelRect>) -> Option<Vec<bool>> {
+    let (w, h) = a.dimensions();
+    if b.dimensions() != (w, h) || w == 0 || h == 0 { return None; }
+    let cols = w.div_ceil(TILE) as usize;
+    let mut tiles = vec![false; cols * h.div_ceil(TILE) as usize];
+    let (ra, rb) = (a.as_raw(), b.as_raw());
+    // memcmp per frame and per tile row first; the per-pixel scan is slow in unoptimized NovaDev builds.
+    if ra == rb { return Some(tiles); }
+    for y in 0..h as usize { for col in 0..cols {
+        let t = y / TILE as usize * cols + col;
+        let x0 = col * TILE as usize;
+        let span = (y * w as usize + x0) * 4..(y * w as usize + (x0 + TILE as usize).min(w as usize)) * 4;
+        if tiles[t] || ra[span.clone()] == rb[span.clone()] { continue; }
+        tiles[t] = ra[span.clone()].chunks_exact(4).zip(rb[span].chunks_exact(4)).enumerate().any(|(i, (p, q))| {
+            (0..3).any(|c| p[c].abs_diff(q[c]) > 16)
+                && !exclude.is_some_and(|r| r.contains((x0 + i) as f64, y as f64))
+        });
+    } }
+    Some(tiles)
 }
 
 fn settled_image(mut grab: impl FnMut() -> Result<xcap::image::RgbaImage>, settle: bool, desktop_surface: Option<&Surface>)
@@ -462,32 +502,59 @@ fn settled_image(mut grab: impl FnMut() -> Result<xcap::image::RgbaImage>, settl
     let (mut image, mut overlay) = sample()?;
     let mut samples = 1;
     let mut status = "not_checked";
+    let mut ignored: Vec<bool> = Vec::new();
     if settle {
         let mut anchor = image.clone();
         let mut anchor_overlay = overlay;
         let mut quiet_since = Instant::now();
+        // Per-tile count of samples that differed from the anchor: a one-shot change resets the anchor
+        // and stays at 1, while carets/spinners/clocks keep differing and reach 2 within ~200ms.
+        let mut hits: Vec<u8> = Vec::new();
         loop {
             let elapsed = started.elapsed();
             if elapsed >= Duration::from_millis(2000) { status = "timeout"; break; }
-            std::thread::sleep(Duration::from_millis(150).min(Duration::from_millis(2000) - elapsed));
+            std::thread::sleep(Duration::from_millis(100).min(Duration::from_millis(2000) - elapsed));
             (image, overlay) = sample()?;
             samples += 1;
             let exclude = desktop_surface.and_then(|s| overlay_region(s, image.dimensions(), overlay));
-            if overlay != anchor_overlay || !visually_similar(&anchor, &image, exclude) {
+            // Compare against the quiet-period anchor so gradual changes cannot accumulate unnoticed.
+            let changed = changed_tiles(&anchor, &image, exclude).filter(|_| overlay == anchor_overlay);
+            let moving = changed.as_ref().is_none_or(|changed| {
+                if hits.len() != changed.len() { hits = vec![0; changed.len()]; }
+                for (h, c) in hits.iter_mut().zip(changed) { if *c { *h = h.saturating_add(1); } }
+                let animated: Vec<bool> = hits.iter().map(|h| *h >= 2).collect();
+                // ponytail: like a person, tune out small areas that keep moving (≤5% of the frame);
+                // a small spinner is tuned out too, so ignoredMotion is reported for the model to judge.
+                let small = animated.iter().filter(|a| **a).count() * 20 <= animated.len();
+                ignored = if small { animated } else { Vec::new() };
+                changed.iter().zip(&hits).any(|(c, h)| *c && !(small && *h >= 2))
+            });
+            if moving {
+                if changed.is_none() { hits.clear(); ignored.clear(); }
                 anchor = image.clone();
                 anchor_overlay = overlay;
                 quiet_since = Instant::now();
             }
-            // Compare against the quiet-period anchor so gradual changes cannot accumulate unnoticed.
             if started.elapsed() >= Duration::from_millis(2000) { status = "timeout"; break; }
-            if started.elapsed() >= Duration::from_millis(600)
-                && quiet_since.elapsed() >= Duration::from_millis(450) {
+            if started.elapsed() >= Duration::from_millis(300)
+                && quiet_since.elapsed() >= Duration::from_millis(300) {
                 status = "stable";
                 break;
             }
         }
     }
-    Ok((image, json!({"status":status,"samples":samples,"elapsedMs":started.elapsed().as_millis()}), overlay))
+    let mut report = json!({"status":status,"samples":samples,"elapsedMs":started.elapsed().as_millis()});
+    let cols = image.width().div_ceil(TILE) as usize;
+    let tiles: Vec<(u32, u32)> = ignored.iter().enumerate().filter(|(_, a)| **a)
+        .map(|(i, _)| ((i % cols) as u32 * TILE, (i / cols) as u32 * TILE)).collect();
+    if !tiles.is_empty() {
+        let (x, y) = (tiles.iter().map(|t| t.0).min().unwrap(), tiles.iter().map(|t| t.1).min().unwrap());
+        let right = (tiles.iter().map(|t| t.0).max().unwrap() + TILE).min(image.width());
+        let bottom = (tiles.iter().map(|t| t.1).max().unwrap() + TILE).min(image.height());
+        report["ignoredMotion"] = json!({"x":x,"y":y,"width":right - x,"height":bottom - y,"space":"originalPixels",
+            "notice":"此范围内持续变化的小块（光标/动画/加载圈）未计入稳定判断；若是加载中请再观察"});
+    }
+    Ok((image, report, overlay))
 }
 
 fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, settle: bool, state: &mut Option<Snapshot>) -> Result<Value> {
@@ -544,6 +611,8 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
                 xcap::image::imageops::FilterType::Triangle).into_rgba8()
         } else { image };
         resize_ms += resize_started.elapsed().as_millis();
+        let plain = image.clone();
+        let motion = motion_in(&stability, region, original_pixels, image.dimensions());
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
@@ -551,7 +620,8 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         let encode_started = Instant::now();
         let bytes = crate::visual_guard::encode_jpeg(&image)?;
         let digest = { use std::hash::{Hash, Hasher}; let mut h = std::hash::DefaultHasher::new(); bytes.hash(&mut h); h.finish() };
-        let same = unchanged_from(&previous, &image_id, digest).cloned();
+        let seen = unchanged_from(&previous, &image_id, digest, &plain, motion).cloned();
+        let same = seen.as_ref().map(|s| s.2.clone());
         if same.is_none() { std::fs::write(&path, &bytes).map_err(err)?; }
         encode_ms += encode_started.elapsed().as_millis();
         let mut entry = json!({"imageId":image_id,"path":path,"width":image.width(),"height":image.height(),
@@ -566,18 +636,58 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             entry["unchanged"] = json!(true);
             entry["samePixelsAs"] = json!(same);
         }
+        // Local change after an action: a small overview keeps the layout, plus the changed area at full
+        // clarity; the rest equals the previous full image. Explicit screenshots always get the full image.
+        let local = (same.is_none() && settle && region.is_none() && image.width().max(image.height()) > OVERVIEW_EDGE)
+            .then(|| previous.iter().find(|p| p.0 == image_id)).flatten()
+            .and_then(|p| changed_tiles(&p.3, &plain, motion)).and_then(|t| local_change(&t, image.dimensions()));
+        let mut pixels = image.dimensions();
+        let mut extra = None;
+        if let Some(b) = local {
+            let s = image.width() as f64 / original_pixels.0 as f64;
+            let (x, y) = ((b.left as f64 / s) as u32, (b.top as f64 / s) as u32);
+            let r = Region { x, y, width: ((b.right as f64 / s).ceil() as u32).min(original_pixels.0) - x,
+                height: ((b.bottom as f64 / s).ceil() as u32).min(original_pixels.1) - y };
+            let crop = xcap::image::imageops::crop_imm(&image, b.left, b.top, b.right - b.left, b.bottom - b.top).to_image();
+            let t = OVERVIEW_EDGE as f64 / image.width().max(image.height()) as f64;
+            let overview = xcap::image::DynamicImage::ImageRgba8(image.clone()).resize_exact(
+                (image.width() as f64 * t).round().max(1.0) as u32, (image.height() as f64 * t).round().max(1.0) as u32,
+                xcap::image::imageops::FilterType::Triangle).into_rgba8();
+            let crop_id = format!("{image_id}-region-{}-{}-{}-{}", r.x, r.y, r.width, r.height);
+            let overview_path = folder.join(format!("{id}-{image_id}-overview.jpg"));
+            let crop_path = folder.join(format!("{id}-{crop_id}.jpg"));
+            std::fs::write(&overview_path, crate::visual_guard::encode_jpeg(&overview)?).map_err(err)?;
+            std::fs::write(&crop_path, crate::visual_guard::encode_jpeg(&crop)?).map_err(err)?;
+            entry["fullPath"] = entry["path"].take();
+            entry["path"] = json!(overview_path);
+            entry["width"] = json!(overview.width());
+            entry["height"] = json!(overview.height());
+            entry["overview"] = json!(true);
+            entry["cursor"] = json!(cursor.map(|(x, y)| json!({"x":(x as f64 * t) as u32,"y":(y as f64 * t) as u32,"marker":"sword-tip","source":"system-pointer"})));
+            pixels = overview.dimensions();
+            let crop_cursor = cursor.filter(|&(x, y)| b.contains(x as f64, y as f64))
+                .map(|(x, y)| json!({"x":x - b.left,"y":y - b.top,"marker":"sword-tip","source":"system-pointer"}));
+            extra = Some((json!({"imageId":crop_id,"path":crop_path,"width":crop.width(),"height":crop.height(),
+                "snapshotId":id,"capturedAt":captured_at,"originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
+                "cursor":crop_cursor,"region":{"x":r.x,"y":r.y,"width":r.width,"height":r.height},"changedArea":true,
+                "desktopBounds":entry["desktopBounds"].clone()}),
+                Shot { image_id: crop_id, surface: surface.clone(), pixels: crop.dimensions(), source_pixels: original_pixels,
+                    region: Some(r), guard: guard.clone(), overlay, desktop_capture }));
+        }
         images.push(entry);
-        delivered.push((image_id.clone(), digest, same.unwrap_or(path)));
+        // Keep comparing with what the model saw, so small changes cannot accumulate unsent.
+        delivered.push(seen.unwrap_or((image_id.clone(), digest, path, plain)));
         shots.push(Shot {
             image_id,
             surface,
-            pixels: image.dimensions(),
+            pixels,
             source_pixels: original_pixels,
             region,
             guard,
             overlay,
             desktop_capture,
         });
+        if let Some((entry, shot)) = extra { images.push(entry); shots.push(shot); }
         Ok(())
     };
     if let Some(wid) = window_id {
@@ -658,8 +768,12 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
                 "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
                 "total":started.elapsed().as_millis()}});
+    let local: Vec<String> = images.iter().filter(|i| i["changedArea"] == true).filter_map(|i| i["imageId"].as_str().map(String::from)).collect();
+    if !local.is_empty() {
+        result["localChangeNotice"] = json!(format!("画面只有局部变化：带overview的是缩小的全图（看整体布局），{} 是变化区域的清晰图，其余区域与上一张全图一致。操作时用所点那张图的imageId和它自己的图片坐标（裁剪图从(0,0)起，不加region偏移）；变化区外的小目标在缩小图上看不清时先局部截图，不沿用旧图坐标。", local.join("、")));
+    }
     if !unchanged.is_empty() {
-        result["unchangedNotice"] = json!(format!("{} 与上一张逐像素相同，未重复发送图片：直接沿用上一张图判断，坐标对本次snapshotId/imageId同样有效。动作后出现此提示说明该动作没有产生可见变化，换方法而不是重复同一输入或反复截图；上一张已不在上下文时用recall(imagePath=samePixelsAs)回看。", unchanged.join("、")));
+        result["unchangedNotice"] = json!(format!("{} 与上一张相同（至多光标/动画等持续变化的小块不同，剑形指针位置以cursor字段为准），未重复发送图片：直接沿用上一张图判断，坐标对本次snapshotId/imageId同样有效。动作后出现此提示说明该动作没有产生可见变化，换方法而不是重复同一输入或反复截图；上一张已不在上下文时用recall(imagePath=samePixelsAs)回看。", unchanged.join("、")));
     }
     Ok(result)
 }
@@ -1766,11 +1880,31 @@ mod tests {
         }
     }
     #[test]
-    fn only_identical_bytes_of_the_same_image_count_as_unchanged() {
-        let seen = vec![("window-1".to_string(), 7, std::path::PathBuf::from("a.jpg"))];
-        assert_eq!(unchanged_from(&seen, "window-1", 7), Some(&std::path::PathBuf::from("a.jpg")));
-        assert_eq!(unchanged_from(&seen, "window-1", 8), None, "changed pixels are always resent");
-        assert_eq!(unchanged_from(&seen, "window-1-region-0-0-10-10", 7), None, "a crop is a different image");
+    fn only_unchanged_pixels_of_the_same_image_count_as_unchanged() {
+        use xcap::image::{Rgba, RgbaImage};
+        let page = RgbaImage::from_pixel(320, 320, Rgba([255, 255, 255, 255]));
+        let seen: Vec<Delivered> = vec![("window-1".to_string(), 7, std::path::PathBuf::from("a.jpg"), page.clone())];
+        let found = |id, digest, pixels: &RgbaImage, motion| unchanged_from(&seen, id, digest, pixels, motion).map(|s| s.2.clone());
+        assert_eq!(found("window-1", 7, &page, None), Some("a.jpg".into()));
+        assert_eq!(found("window-1", 8, &page, None), Some("a.jpg".into()), "re-encoding alone is not a change");
+        assert_eq!(found("window-1-region-0-0-10-10", 7, &page, None), None, "a crop is a different image");
+        let mut typed = page.clone();
+        typed.put_pixel(150, 150, Rgba([0, 0, 0, 255]));
+        assert_eq!(found("window-1", 8, &typed, None), None, "a single typed glyph is always resent");
+        // Only motion the settle loop proved animated is tolerated, mapped from source into delivered pixels.
+        let stability = json!({"ignoredMotion":{"x":288,"y":288,"width":32,"height":32}});
+        let motion = motion_in(&stability, None, (640, 640), (320, 320));
+        assert_eq!(motion, Some(crate::visual_guard::PixelRect { left:144, top:144, right:160, bottom:160 }));
+        assert_eq!(found("window-1", 8, &typed, motion), Some("a.jpg".into()));
+        assert_eq!(motion_in(&stability, Some(Region { x:0, y:0, width:100, height:100 }), (640, 640), (100, 100)), None);
+
+        // A local change is sent as its padded box; a large or scattered change falls back to the full image.
+        let mut tiles = vec![false; 100];
+        assert_eq!(local_change(&tiles, (320, 320)), None);
+        tiles[5 * 10 + 5] = true;
+        assert_eq!(local_change(&tiles, (320, 320)), Some(crate::visual_guard::PixelRect { left:128, top:128, right:224, bottom:224 }));
+        tiles[0] = true;
+        assert_eq!(local_change(&tiles, (320, 320)), None);
     }
     #[test]
     fn lone_action_becomes_a_one_item_batch() {
@@ -1848,11 +1982,10 @@ mod tests {
         use xcap::image::{Rgba, RgbaImage};
         let old = RgbaImage::from_pixel(100, 100, Rgba([255, 255, 255, 255]));
         let mut caret = old.clone();
-        for y in 0..5 { caret.put_pixel(0, y, Rgba([0, 0, 0, 255])); }
-        assert!(visually_similar(&old, &caret, None));
-        caret.put_pixel(0, 5, Rgba([0, 0, 0, 255]));
-        assert!(!visually_similar(&old, &caret, None));
-        assert!(!visually_similar(&old, &RgbaImage::new(101, 100), None));
+        caret.put_pixel(40, 5, Rgba([0, 0, 0, 255]));
+        assert_eq!(changed_tiles(&old, &caret, None).unwrap().iter().filter(|c| **c).count(), 1);
+        assert!(changed_tiles(&old, &caret, None).unwrap()[1]);
+        assert!(changed_tiles(&old, &RgbaImage::new(101, 100), None).is_none());
 
         // Header changes immediately; list remains old for the first two samples.
         let new = RgbaImage::from_pixel(100, 100, Rgba([0, 0, 0, 255]));
@@ -1876,6 +2009,17 @@ mod tests {
         assert_eq!(frame, old);
         assert_eq!(report["samples"], 1);
         assert_eq!(report["status"], "not_checked");
+
+        // A small block that keeps blinking (caret/spinner) is tuned out instead of forcing the 2s timeout.
+        let page = RgbaImage::from_pixel(640, 640, Rgba([255, 255, 255, 255]));
+        let mut blink = page.clone();
+        for y in 100..110 { for x in 200..210 { blink.put_pixel(x, y, Rgba([0, 0, 0, 255])); } }
+        let mut on = false;
+        let (_, report, _) = settled_image(|| { on = !on; Ok(if on { blink.clone() } else { page.clone() }) }, true, None).unwrap();
+        assert_eq!(report["status"], "stable");
+        assert!(report["elapsedMs"].as_u64().unwrap() < 1000);
+        assert_eq!(report["ignoredMotion"]["x"], 192);
+        assert_eq!(report["ignoredMotion"]["width"], 32);
         assert!(settled_image(|| Err("capture failed".into()), true, None).is_err());
         let result = run("validation".into(), json!({"operation":"act", "snapshotId":"old", "unexpected":true})).unwrap();
         assert_eq!(result["operation"], "act");
@@ -1902,8 +2046,9 @@ mod tests {
         assert!(shot.guard.as_ref().unwrap().changed_near(&updated,96.,100.,false));
         assert!(guard_target(&shot,&action,&updated,false,Some(bounds)).is_ok());
         assert!(guard_target(&shot,&action,&updated,true,Some(bounds)).is_ok());
-        assert!(visually_similar(&original,&updated,Some(exclude)));
-        assert!(!visually_similar(&original,&updated,None));
+        let still = |a: &RgbaImage, b: &RgbaImage, ex| !changed_tiles(a, b, ex).unwrap().contains(&true);
+        assert!(still(&original,&updated,Some(exclude)));
+        assert!(!still(&original,&updated,None));
         // Comparisons never mask or alter the pixels returned to the model.
         assert_eq!(updated.get_pixel(100,100).0,[220,220,220,255]);
         for current in [None, Some(Rect{left:-49,..bounds}), Some(Rect{right:-19,..bounds}),
@@ -1922,7 +2067,7 @@ mod tests {
         for y in 96..105 { for x in 92..100 { updated.put_pixel(x,y,Rgba([200,0,0,255])); } }
         assert!(guard_target(&shot,&action,&updated,false,Some(bounds)).is_err());
         assert!(guard_target(&shot,&action,&updated,true,Some(bounds)).is_err());
-        assert!(!visually_similar(&original,&updated,Some(exclude)));
+        assert!(!still(&original,&updated,Some(exclude)));
         let other_monitor = Surface { x:0,y:0,..shot.surface.clone() };
         assert!(overlay_region(&other_monitor,shot.source_pixels,Some(bounds)).is_none());
         let other_shot = Shot { surface:other_monitor, overlay:None, ..shot.clone() };
