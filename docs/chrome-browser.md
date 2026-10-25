@@ -79,4 +79,4 @@ Canvas 观察包含显示尺寸和绘图尺寸；大面积 Canvas 的 `inspect` 
 
 ### 无痕模式
 
-在 chrome://extensions → Nova Chrome → 详情开启“允许在无痕模式下运行”，更新扩展后点击重新加载。工具 status/tabs 返回 incognitoAllowed；open/new_tab 传 incognito:true 新建无痕窗口并返回 tabTag，后续 inspect/act 使用该标签。tabs(incognito:true) 仅列出无痕标签，每项包含 incognito。未授权会报错，不降级到普通窗口；省略 incognito 创建普通标签。扩展使用 spanning，共用连接和标签身份。无痕浏览不意味着 Nova 不记录会话和截图。
+在 chrome://extensions → Nova Chrome → 详情开启“允许在无痕模式下运行”，更新扩展后点击重新加载。工具 status 返回 incognitoAllowed 和扩展 version，tabs 返回 incognitoAllowed；多个浏览器（如 Chrome 与 Edge）可同时连接，网页操作发给 status.browser 所示浏览器（优先 Google Chrome），连接多个时 status 另附 extensions 列出各浏览器的版本与无痕权限；open/new_tab 传 incognito:true 新建无痕窗口并返回 tabTag，后续 inspect/act 使用该标签。tabs(incognito:true) 仅列出无痕标签，每项包含 incognito。未授权会报错，不降级到普通窗口；省略 incognito 创建普通标签。扩展使用 spanning，共用连接和标签身份。无痕浏览不意味着 Nova 不记录会话和截图。

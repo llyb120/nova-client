@@ -159,6 +159,8 @@ async function execute(command) {
     })),notice:'Chrome 下载记录为浏览器范围，不能按 tabTag 归属；按时间、URL、文件名确认目标。空列表不代表导出失败，网页可能尚在生成文件。只有 state=complete 才表示下载完成。'};
   }
   if (operation === 'status') return {incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess(),version:chrome.runtime.getManifest?.().version};
+  // Nova 已把新文件写入加载目录；先回传结果再重载，重载后以新 clientId 自动重连。
+  if (operation === 'reload') { setTimeout(()=>chrome.runtime.reload(),300); return {reloading:true}; }
   if (operation === 'tabs') return {tabs:(await inventory()).filter(tab=>args.incognito === undefined || tab.incognito === args.incognito),incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess()};
   if (operation === 'open' || operation === 'new_tab') {
     if (args.incognito !== undefined && typeof args.incognito !== 'boolean') throw Error('incognito必须为boolean');

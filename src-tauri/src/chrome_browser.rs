@@ -230,11 +230,13 @@ pub(crate) async fn request(
 }
 /// 每个已连接扩展各自的浏览器、版本与无痕权限；查询失败的扩展 version 为 null（视为过期）。
 pub(crate) async fn extension_statuses(app: &AppHandle) -> Vec<Value> {
-    let state = bridge(app);
+    client_statuses(&bridge(app)).await.into_iter().map(|(_, status)| status).collect()
+}
+async fn client_statuses(state: &Arc<ChromeBridge>) -> Vec<(String, Value)> {
     let mut statuses = Vec::new();
     for (client, browser) in state.live_clients() {
         let status = state.request_to(&client, "status", json!({})).await.unwrap_or(Value::Null);
-        statuses.push(json!({"browser":browser,"version":status["version"],"incognitoAllowed":status["incognitoAllowed"] == true}));
+        statuses.push((client, json!({"browser":browser,"version":status["version"],"incognitoAllowed":status["incognitoAllowed"] == true})));
     }
     statuses
 }
@@ -483,9 +485,31 @@ pub async fn chrome_dependency_status(app: AppHandle) -> Result<Value, String> {
         std::fs::write(directory.join(name), content).map_err(|e| format!("释放 Chrome 扩展失败：{e}"))?;
     }
     let connected = connect(&app).await.map(|v| v["connected"] == true).unwrap_or(false);
+    let bundled_version = serde_json::from_str::<Value>(EXTENSION_FILES[0].1).ok().and_then(|m| m["version"].as_str().map(String::from));
+    // 新文件已写入扩展目录：过期且认识 reload 的扩展直接自行重载升级，不动界面。
+    // 重载后扩展以新 clientId 重连；从别的目录加载的重载后版本不变，仍留给剑来移除再加载。
+    let mut upgraded = Vec::new();
+    if connected {
+        let state = bridge(&app);
+        let before = state.live_clients().len();
+        for (client, status) in client_statuses(&state).await {
+            if status["version"].as_str() != bundled_version.as_deref()
+                && state.request_to(&client, "reload", json!({})).await.is_ok()
+            {
+                state.clients.lock().unwrap().remove(&client);
+                upgraded.push(status["browser"].clone());
+            }
+        }
+        if !upgraded.is_empty() {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while state.live_clients().len() < before && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
+    let connected = connect(&app).await.map(|v| v["connected"] == true).unwrap_or(false);
     let status = if connected { request(&app, "status", json!({})).await.ok() } else { None };
     let incognito_allowed = status.as_ref().map(|v| v["incognitoAllowed"] == true);
-    let bundled_version = serde_json::from_str::<Value>(EXTENSION_FILES[0].1).ok().and_then(|m| m["version"].as_str().map(String::from));
     // 旧版扩展不上报 version，也视为过期；任一已连接浏览器过期都需要更新。
     let installed_version = status.as_ref().and_then(|v| v["version"].as_str().map(String::from));
     let extensions: Vec<Value> = extension_statuses(&app).await.into_iter()
@@ -499,6 +523,7 @@ pub async fn chrome_dependency_status(app: AppHandle) -> Result<Value, String> {
         "installedVersion": installed_version,
         "bundledVersion": bundled_version,
         "outdated": outdated,
+        "upgraded": upgraded,
         "extensions": extensions,
         "extensionDir": directory.to_string_lossy(),
         "extensionId": EXTENSION_ID,

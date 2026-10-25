@@ -256,17 +256,21 @@ test('after a reload Nova still holds the old clientId: retry soon instead of wa
 });
 
 test('incognito permission, window isolation and tab filtering',async()=>{
-  const event=()=>({addListener(){}});let allowed=false,created=[];
+  const event=()=>({addListener(){}});let allowed=false,created=[],reloads=0;
   let tabs=[{id:1,windowId:10,url:'https://example.com',incognito:false}];
   const chrome={extension:{isAllowedIncognitoAccess:async()=>allowed},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
     tabs:{query:async()=>tabs,get:async id=>tabs.find(t=>t.id===id),create:async args=>{created.push(args);return tabs[0];},onRemoved:event(),onReplaced:event(),onUpdated:event()},
     windows:{getAll:async()=>[{id:20,incognito:true},{id:10,incognito:false}],create:async args=>{created.push(args);const tab={id:2,windowId:20,url:args.url,incognito:args.incognito};tabs.push(tab);return {id:20,tabs:[tab]};}},
-    debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+    debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event(),reload:()=>reloads++},alarms:{onAlarm:event()}};
   const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
   runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={execute};',scope);
   const run=(operation,args={})=>scope.api.execute({operation,args,expiresAt:Date.now()+3000});
   assert.equal((await run('status')).incognitoAllowed,false);
+  assert.equal((await run('reload')).reloading,true);
+  assert.equal(reloads,0,'reply first, reload after');
+  await new Promise(resolve=>setTimeout(resolve,400));
+  assert.equal(reloads,1);
   await assert.rejects(run('open',{url:'https://example.com',incognito:true}),/允许在无痕/);
   assert.equal(created.length,0);
   allowed=true;

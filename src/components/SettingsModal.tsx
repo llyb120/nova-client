@@ -199,7 +199,14 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const installChromeDep = async () => {
     setChromeDepBusy(true);
     try {
-      await installChromeExtensionWithJianlai(chromeDep() ?? (await api.chromeDependencyStatus()));
+      // 检测时会先把能自行重载的扩展直接升级；已是最新且允许无痕就不开剑来会话。
+      const dep = await api.chromeDependencyStatus();
+      setChromeDep(dep);
+      if (dep.connected && !dep.outdated && dep.incognitoAllowed) {
+        void message(dep.upgraded.length ? `已直接升级到 ${dep.bundledVersion}：${dep.upgraded.join("、")}` : "Nova Chrome 扩展已是最新且允许无痕，无需安装。", { kind: "info" });
+        return;
+      }
+      await installChromeExtensionWithJianlai(dep);
       props.onClose();
     } catch (error) {
       void message(`启动安装会话失败：${String(error)}`, { kind: "error" });
@@ -980,7 +987,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                       Chrome：{dep().chromePath ?? "未找到，请先安装 Google Chrome"}
                       <br />
                       Nova Chrome 扩展：{dep().connected ? "已连接" : "未连接"}
-                      {dep().connected ? `（${dep().incognitoAllowed ? "已允许无痕" : "未允许无痕"}，版本 ${dep().installedVersion ?? "旧版"}${dep().outdated ? `，有新版 ${dep().bundledVersion}，点「用剑来自动安装」更新` : ""}）` : ""}
+                      {dep().connected ? `（${dep().incognitoAllowed ? "已允许无痕" : "未允许无痕"}，版本 ${dep().installedVersion ?? "旧版"}${dep().outdated ? `，有新版 ${dep().bundledVersion}，点「用剑来自动安装」更新` : ""}${dep().upgraded.length ? `，已直接升级：${dep().upgraded.join("、")}` : ""}）` : ""}
                       <br />
                       扩展目录：{dep().extensionDir}
                     </span>
