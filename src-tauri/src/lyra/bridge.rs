@@ -1171,6 +1171,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// 手动真实会话：不在用户提示里指定 parallel，观察模型是否主动合批以及实际请求轮次。
+    #[tokio::test]
+    #[ignore = "需要真实 provider 配置，会产生模型费用"]
+    async fn inprocess_parallel_live_smoke() {
+        use super::*;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let config = Roots::global().load_config(None).unwrap();
+        let model = std::env::var("NOVA_PARALLEL_LIVE_MODEL").ok()
+            .unwrap_or_else(|| config::default_model(&config).unwrap());
+        let request = json!({
+            "action":"prompt", "cwd":root, "mode":"build", "model":model,
+            "parts":[{"type":"text","text":"请帮我检查当前项目的三项测试：node --experimental-strip-types scripts/process-display.test.mjs；node --experimental-strip-types scripts/tool-display.test.mjs；node --test scripts/tool-completion-switch.test.mjs。三条命令都已确认可独立执行，每条分别使用一次 bash 调用，以便单独核对输出，不要合成一条 shell 命令；如何调度由你决定。只运行这三项，不读源码、不修改文件、不使用子 agent、不追加检查。最后简短汇报三项各自是否通过；失败如实报告，不修复。"}]
+        });
+        let mut session = super::spawn_prompt(super::super::provider::http_client(), request, true, None, None);
+        let started = Instant::now();
+        let mut rounds = 0;
+        let mut completed = Vec::new();
+        let mut batches = 0;
+        let mut done = false;
+        let mut answer = String::new();
+        let mut failure = None;
+        let observed = tokio::time::timeout(Duration::from_secs(180), async {
+            while let Some(line) = session.events.recv().await {
+                let event: Value = serde_json::from_str(&line).unwrap();
+                if event["type"] == "timing" && event["phase"] == "provider_turn" { rounds += 1; }
+                if event["ok"] == false { failure = event["error"].as_str().map(str::to_owned); }
+                if event["type"] == "done" { done = event["cancelled"] == false; }
+                let item = &event["item"];
+                if item["type"] == "agent_message" { answer = item["text"].as_str().unwrap_or_default().into(); }
+                if item["status"] == "completed" {
+                    if item["tool"] == "parallel" { batches += 1; }
+                    let row = json!({"tool":item["tool"],"elapsedMs":started.elapsed().as_millis(),
+                        "isError":item.get("isError").cloned().unwrap_or(json!(false)),"command":item["command"]});
+                    println!("LIVE_TOOL {row}");
+                    completed.push(row);
+                }
+            }
+        }).await;
+        if observed.is_err() {
+            let _ = session.control.send(json!({"action":"cancel"}).to_string());
+            if tokio::time::timeout(Duration::from_secs(5), &mut session.task).await.is_err() { session.task.abort(); }
+            panic!("真实会话超过 180 秒，已取消；模型轮次={rounds}");
+        }
+        session.task.await.unwrap();
+        println!("LIVE_SUMMARY {}", json!({"model":model,"providerRequests":rounds,"parallelBatches":batches,
+            "elapsedMs":started.elapsed().as_millis(),"completedTools":completed.len(),"done":done,"answer":answer}));
+        assert!(failure.is_none(), "真实 provider 失败：{failure:?}");
+        assert!(done, "真实会话未正常完成");
+        assert_eq!(completed.iter().filter(|row| row["tool"] == "bash").count(), 3, "没有执行三项独立检查");
+        assert!(batches > 0, "模型没有主动使用 parallel；真实会话请求数={rounds}");
+    }
+
     /// 手动端到端验证（需真实 provider 配置）：进程内 spawn_prompt 全事件流 + run_oneshot。
     #[tokio::test]
     #[ignore = "需要真实 provider 配置，手动验证用"]

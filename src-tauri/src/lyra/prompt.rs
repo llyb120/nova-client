@@ -465,6 +465,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目",
         ),
         Some("- read: 读取单个文件（图片直接返回图像）"),
+        Some("- parallel: 一次提交多项参数已知、互不依赖的工具调用，并发执行后统一返回，避免逐项往返模型"),
         (!read_only && options.desktop).then_some("- jianlai（剑来）: 仅在必须操作图形界面时用真实鼠标键盘与截图操作电脑；本地文件/图片用 read，命令能拿到的用 bash，Chrome 网页用 chrome"),
         if read_only {
             None
@@ -507,6 +508,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
         .into(),
         if options.auto_change_project { "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。" } else { "" }.into(),
         "先理解再修改，保持改动聚焦。".into(),
+        "减少模型往返：每次调用前，把当前已能确定参数、无结果依赖且不争用资源的工作一起提交给 parallel，而不是每完成一项再决定执行另一项；适用于独立命令检查、不同服务查询和独立子任务启动，不限于文件读写。每项仍遵守原工具的授权与使用规则，不能把有依赖的步骤硬塞并行，也不能猜下一步参数。浏览器已确认的连续步骤用 run，一次执行到需要新信息的节点。spawn_agent 后有独立工作就继续，不立即 wait_agent；需要结果时再等待。不为凑批次创建无关工作；批次部分失败只处理失败项，不重放成功项。".into(),
         "子 agent 的 send_message 在运行中注入、空闲时启动新一轮；followup_task 排队并显式计入待完成工作。主任务最终交付前必须收齐所需子任务结果，不需要的任务应主动 interrupt_agent/close_agent；运行时也会等待剩余任务，不能把仍在排队当作完成。重启后恢复子 agent 只会执行本次明确追加的任务，不自动重放旧工具调用。".into(),
         if options.ponytail { PONYTAIL_RULES.into() } else { String::new() },
         "最终回复采用例外汇报，而不是完整工作报告。先直接给出用户可感知的结果；只有信息会影响结果判断、下一步行动、风险认知或可信度时，才写入最终回复。默认省略文件/函数/行号清单、搜索和工具调用过程、常规实现细节、具体测试命令、成功步骤清单、无实际影响的注意事项、泛化建议、‘无风险’声明，以及对同一结果的重复总结。正常成功时用 1～3 句话，不强制使用标题或列表；存在失败、未验证、行为变化、兼容性风险或用户必须操作的事项时，只围绕这些例外按需展开。用户明确询问实现细节时才提供详细报告。".into(),
@@ -576,6 +578,7 @@ mod tests {
         let prompt = build_system_prompt(&options);
         assert!(!prompt.contains("change_working_directory"));
         assert!(!prompt.contains("jianlai"));
+        assert!(prompt.contains("- parallel:") && prompt.contains("减少模型往返"));
     }
 
     #[test]

@@ -66,7 +66,7 @@ impl ChildSettings {
         let read_only = parent.read_only || record.is_some_and(|r| r.read_only);
         let tools = parent.tools.iter().filter(|t| {
             !is_agent_tool(t.name) && t.name != crate::lyra::scene::TOOL && record.is_none_or(|r| r.tools.iter().any(|name| name == t.name))
-                && (!read_only || matches!(t.name, "read" | "polaris" | "recall" | "context_budget" | "change_working_directory" | "mcp"))
+                && (!read_only || matches!(t.name, "read" | "polaris" | "recall" | "context_budget" | "change_working_directory" | "mcp" | "parallel"))
         }).map(|t| Tool { name: t.name, description: t.description.clone(), parameters: t.parameters.clone() }).collect();
         Ok(Self {
             http: parent.http.clone(), model: parent.model.clone(), summarizer: parent.summarizer.clone(),
@@ -248,7 +248,7 @@ pub fn agent_tools() -> Vec<Tool> {
     let target_only = json!({ "type": "object", "properties": { "target": target }, "required": ["target"] });
     let spawn = Tool {
         name: "spawn_agent",
-        description: format!("Start a sub-agent on a self-contained task; it runs in the background with your tools and working directory. Use for independent work that can proceed in parallel, then wait_agent for results. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
+        description: format!("Start a sub-agent on a self-contained task; it runs in the background with your tools and working directory. Submit independent spawns together via parallel, then continue other independent work; use wait_agent only when its results are needed. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -908,6 +908,9 @@ mod tests {
         let settings = ChildSettings::from_parent(&parent, Some(&record)).unwrap();
         assert!(settings.read_only);
         assert_eq!(settings.tools.iter().map(|t| t.name).collect::<Vec<_>>(), vec!["mcp"]);
+        record.tools = vec!["parallel".into()];
+        let settings = ChildSettings::from_parent(&parent, Some(&record)).unwrap();
+        assert_eq!(settings.tools.iter().map(|t| t.name).collect::<Vec<_>>(), vec!["parallel"]);
         record.tools.clear();
         assert!(ChildSettings::from_parent(&parent, Some(&record)).unwrap().tools.is_empty());
     }

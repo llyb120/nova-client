@@ -213,6 +213,23 @@ fn tool_result_parts(message: &Value, model: &ResolvedModel, embeds: &[Embed]) -
     (text, tool_result_images(message, model, embeds))
 }
 
+/// 批量工具仍保留图片及其定位说明；不能只把嵌套 toolResult 序列化成文本。
+pub(super) fn batch_result_content(message: &Value, model: &ResolvedModel) -> Vec<Value> {
+    let mut image_model = model.clone();
+    image_model.supports_images = true; // 是否省略图片仍由最终 provider 编码决定，历史不能提前丢图。
+    // 包装后不再属于原工具的截图流；每项自带关键帧，避免只剩无法还原的 delta。
+    let embeds: Vec<_> = detail_images(message).iter().map(|image| {
+        if image["deltaOf"].is_string() || image.get("latestDelta").is_some() { Embed::WithKeyframe } else { Embed::Image }
+    }).collect();
+    let (mut text, images) = tool_result_parts(message, &image_model, &embeds);
+    if !detail_images(message).is_empty() {
+        text.push_str(&format!("\n{}", screenshot_caption(message)));
+    }
+    let mut content = vec![json!({"type":"text", "text":text})];
+    content.extend(images);
+    content
+}
+
 fn tool_result_images(message: &Value, model: &ResolvedModel, embeds: &[Embed]) -> Vec<Value> {
     if !model.supports_images {
         return Vec::new();
@@ -3214,6 +3231,43 @@ mod tests {
                     assert_eq!(out[6]["content"][0]["text"], "继续");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn parallel_results_keep_images_and_snapshot_metadata_in_all_protocols() {
+        let dir = tempfile::tempdir().unwrap();
+        let keyframe = dir.path().join("base.png");
+        let delta = dir.path().join("delta.png");
+        std::fs::write(&keyframe, b"BASE").unwrap();
+        std::fs::write(&delta, b"DELTA").unwrap();
+        let result = json!({"toolCallId":"batch-0", "toolName":"chrome",
+            "content":[{"type":"text","text":"observed"}],
+            "details":{"snapshotId":"snap", "images":[{
+                "path":delta,"imageId":"delta","deltaOf":"base","keyframePath":keyframe,
+                "keyframeImageId":"base","pixelWidth":10,"pixelHeight":10,"x":0,"y":0
+            }]}});
+        let mut model = test_model("openai-completions");
+        let mut full = result.clone();
+        full["details"]["images"][0]["deltaOf"] = Value::Null;
+        full["details"]["images"][0]["path"] = full["details"]["images"][0]["keyframePath"].clone();
+        assert_eq!(batch_result_content(&full, &model).iter().filter(|part| part["type"] == "image").count(), 1);
+        let content = batch_result_content(&result, &model);
+        assert_eq!(content.iter().filter(|part| part["type"] == "image").count(), 2);
+        assert!(content[0]["text"].as_str().unwrap().contains("snap"));
+        let messages = vec![
+            json!({"role":"assistant","content":[{"type":"toolCall","id":"batch","name":"parallel","arguments":{}}]}),
+            json!({"role":"toolResult","toolCallId":"batch","toolName":"parallel","content":content})
+        ];
+        for api in ["openai-completions", "openai-responses", "anthropic-messages"] {
+            model.api = api.into();
+            let body = match api {
+                "openai-completions" => completions_body(&model, "sys", &messages, &[], None, None),
+                "openai-responses" => responses_body(&model, "sys", &messages, &[], None, None),
+                _ => anthropic_body(&model, "sys", &messages, &[], None),
+            }.to_string();
+            assert!(body.contains("QkFTRQ==") && body.contains("REVMVEE="), "{api}: {body}");
+            assert!(body.contains("snap"));
         }
     }
 

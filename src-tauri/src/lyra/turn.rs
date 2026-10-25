@@ -10,6 +10,7 @@ use crate::lyra::prompt::{is_context_window_error, is_retryable_provider_error, 
 use crate::lyra::provider::{drop_old_tool_images, is_payload_too_large, is_retryable_stream_error, stream_chat, StreamEvent};
 use crate::lyra::session::{self, AgentHandle};
 use crate::lyra::tools::{execute, Tool, ToolOutcome};
+use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -92,9 +93,24 @@ fn screen_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// 上下文机制自带的工具：`recall` 读回折叠原文，`context_budget` 报告剩余空间。
+/// 会话内置工具：上下文管理与一次请求内的独立工具批量执行。
 pub fn context_tools() -> Vec<Tool> {
     vec![
+        Tool {
+            name: "parallel",
+            description: "一次提交 2–8 项互不依赖的工具调用，运行时最多同时执行 4 项，全部结束后一次返回结果，减少模型往返。tool 必须是当前已声明工具名，arguments 使用该工具原有参数。仅当各项参数已知、无结果依赖且不争用文件/终端/页面等资源时使用；不要把修改和验证、启动任务和等待结果放在一起。禁止嵌套 parallel、切目录、切模型、recall、wait_agent；浏览器/桌面工具每批最多一项，连续界面步骤用其 run。批次有错误不自动重试成功项。".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "calls": {
+                    "type": "array", "minItems": 2, "maxItems": 8,
+                    "items": { "type": "object", "properties": {
+                        "tool": { "type": "string" },
+                        "arguments": { "type": "object" }
+                    }, "required": ["tool", "arguments"], "additionalProperties": false }
+                } },
+                "required": ["calls"], "additionalProperties": false
+            }),
+        },
         Tool {
             name: "recall",
             description: "Read back messages that compaction folded out of your context. The fold summary indexes them as #n; pass those numbers in `positions` to read the originals, or pass `query` to search the folded part. Budgeted per fold, so ask only for what you need.".into(),
@@ -388,6 +404,8 @@ async fn run_tools(
             }]
         } else if run == 1 && calls[i].1 == "recall" && s.tools.iter().any(|tool| tool.name == "recall") {
             vec![recall(s, &calls[i].2)]
+        } else if calls[i].1 == "parallel" && s.tools.iter().any(|tool| tool.name == "parallel") {
+            vec![run_parallel(s, &calls[i].0, &calls[i].2, on_event).await]
         } else {
             let handles: Vec<_> = batch
                 .iter()
@@ -450,6 +468,65 @@ fn finish(id: &str, name: &str, outcome: ToolOutcome, on_event: Sink<'_>) -> Val
     });
     on_event(TurnEvent::ToolEnd { id: id.to_string(), outcome: message.clone() });
     message
+}
+
+async fn run_parallel(s: &Session, id: &str, args: &Value, on_event: Sink<'_>) -> ToolOutcome {
+    let Some(calls) = args.get("calls").and_then(Value::as_array).filter(|calls| (2..=8).contains(&calls.len())) else {
+        return text_outcome("parallel 需要 2–8 项 calls；本批未执行", true);
+    };
+    // 先验证整批再启动，不能执行了一部分才发现越权或会话屏障。
+    let mut screens = 0;
+    for call in calls {
+        let Some(name) = call.get("tool").and_then(Value::as_str) else {
+            return text_outcome("parallel 每项需要 tool 和对象类型 arguments；本批未执行", true);
+        };
+        if !call.get("arguments").is_some_and(Value::is_object) {
+            return text_outcome("parallel 每项需要对象类型 arguments；本批未执行", true);
+        }
+        if !s.tools.iter().any(|tool| tool.name == name) {
+            return text_outcome(format!("当前会话未授权工具：{name}；本批未执行"), true);
+        }
+        if matches!(name, "parallel" | "change_working_directory" | "recall" | "wait_agent") || name == crate::lyra::scene::TOOL {
+            return text_outcome(format!("{name} 必须在 parallel 外单独调用；本批未执行"), true);
+        }
+        screens += usize::from(screen_tool(name));
+        if screens > 1 {
+            return text_outcome("parallel 每批最多一项浏览器/桌面调用；连续界面步骤请用 run；本批未执行", true);
+        }
+    }
+    // ponytail: 独立性由调用方声明，不推断任意 shell/MCP 的副作用；需要自动判定时再引入资源声明。
+    let mut running = stream::iter(calls.iter().enumerate().map(|(index, call)| {
+        let sub_id = format!("{id}-{index}");
+        let name = call["tool"].as_str().unwrap();
+        on_event(TurnEvent::ToolStart { id: sub_id.clone(), name: name.into(), args: call["arguments"].clone() });
+        async move {
+            let outcome = if s.cancelled.load(Ordering::SeqCst) {
+                text_outcome(CANCELLED_TEXT, true)
+            } else {
+                call_tool(s, &sub_id, name, &call["arguments"]).await
+            };
+            (index, sub_id, name, outcome)
+        }
+    }).collect::<Vec<_>>()).buffer_unordered(4);
+    let mut results = vec![Value::Null; calls.len()];
+    while let Some((index, sub_id, name, outcome)) = running.next().await {
+        results[index] = finish(&sub_id, name, outcome, on_event);
+    }
+    let mut content = Vec::new();
+    for (index, result) in results.iter().enumerate() {
+        content.push(json!({"type":"text", "text":format!("[parallel {}: {} — {}]", index + 1,
+            result["toolName"].as_str().unwrap(), if result["isError"] == true { "error" } else { "ok" })}));
+        content.extend(crate::lyra::provider::batch_result_content(result, &s.model.model));
+    }
+    let is_error = results.iter().any(|result| result["isError"] == true);
+    let statuses: Vec<_> = results.iter().enumerate().map(|(index, result)| json!({
+        "index":index + 1, "tool":result["toolName"], "isError":result["isError"]
+    })).collect();
+    let mut outcome = crate::lyra::tools::govern(ToolOutcome { content, details: Some(json!({"results":results})), is_error },
+        "parallel", id, s.archive_dir.as_deref());
+    // 状态摘要不参与正文裁剪，防止中间成功项被截掉后误重放。
+    outcome.content.insert(0, json!({"type":"text", "text":format!("parallel results: {}. Only retry failed items; do not replay successful calls.", json!(statuses))}));
+    outcome
 }
 
 async fn call_tool(s: &Session, id: &str, name: &str, args: &Value) -> ToolOutcome {
@@ -662,6 +739,104 @@ pub(crate) mod tests {
         let result = call_tool(&s, "blocked", "write", &json!({"path":"blocked.txt","content":"no"})).await;
         assert!(result.is_error);
         assert!(!dir.path().join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn parallel_preflights_the_whole_batch_and_respects_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+        s.tools.extend(crate::lyra::tools::tool_set(true, false, false));
+        for invalid in [
+            json!({"tool":"write","arguments":{"path":"blocked.txt","content":"no"}}),
+            json!({"tool":"parallel","arguments":{"calls":[]}}),
+            json!({"tool":"recall","arguments":{}}),
+            json!({"tool":"read","arguments":"not an object"}),
+        ] {
+            let mut starts = 0;
+            let result = run_parallel(&s, "batch", &json!({"calls":[
+                {"tool":"context_budget","arguments":{}}, invalid
+            ]}), &mut |event| { if matches!(event, TurnEvent::ToolStart { .. }) { starts += 1; } }).await;
+            assert!(result.is_error);
+            assert_eq!(starts, 0, "invalid batches must not partially execute");
+        }
+        assert!(!dir.path().join("blocked.txt").exists());
+        for name in ["chrome", "jianlai", "wait_agent", "change_working_directory", crate::lyra::scene::TOOL] {
+            s.tools.push(Tool { name, description: String::new(), parameters: json!({}) });
+        }
+        for calls in [
+            json!([]),
+            json!(vec![json!({"tool":"context_budget","arguments":{}}); 9]),
+            json!([{"tool":"chrome","arguments":{}},{"tool":"jianlai","arguments":{}}]),
+            json!([{"tool":"context_budget","arguments":{}},{"tool":"wait_agent","arguments":{}}]),
+            json!([{"tool":"context_budget","arguments":{}},{"tool":"change_working_directory","arguments":{"path":"/tmp"}}]),
+            json!([{"tool":"context_budget","arguments":{}},{"tool":crate::lyra::scene::TOOL,"arguments":{}}]),
+        ] {
+            let result = run_parallel(&s, "invalid", &json!({"calls":calls}), &mut |_| panic!("invalid batch started")).await;
+            assert!(result.is_error);
+        }
+        s.cancelled.store(true, Ordering::SeqCst);
+        let result = run_parallel(&s, "cancelled", &json!({"calls":[
+            {"tool":"context_budget","arguments":{}}, {"tool":"read","arguments":{"path":"missing"}}
+        ]}), &mut |_| {}).await;
+        assert!(result.is_error);
+        assert!(result.details.unwrap()["results"].as_array().unwrap().iter()
+            .all(|result| result["content"][0]["text"] == CANCELLED_TEXT));
+    }
+
+    #[tokio::test]
+    async fn parallel_preserves_every_status_when_combined_output_is_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("large.txt"), "x".repeat(30_000)).unwrap();
+        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+        s.tools.extend(crate::lyra::tools::tool_set(true, false, false));
+        let result = run_parallel(&s, "large", &json!({"calls":[
+            {"tool":"read","arguments":{"path":"large.txt"}},
+            {"tool":"read","arguments":{"path":"missing.txt"}},
+            {"tool":"read","arguments":{"path":"large.txt"}}
+        ]}), &mut |_| {}).await;
+        assert!(result.is_error);
+        let summary = result.content[0]["text"].as_str().unwrap();
+        assert!(summary.contains(r#""index":1,"isError":false"#));
+        assert!(summary.contains(r#""index":2,"isError":true"#));
+        assert!(summary.contains(r#""index":3,"isError":false"#));
+        assert!(result.details.unwrap()["originalBytes"].as_u64().unwrap() > 32 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parallel_overlaps_commands_and_returns_all_results_in_one_model_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        // 两条命令相互等待对方的信号：串行执行会超时，不能拿耗时阈值冒充并发检查。
+        let args = json!({"calls":[
+            {"tool":"bash","arguments":{"command":"touch a; while [ ! -f b ]; do sleep 0.01; done; printf alpha","timeout":5}},
+            {"tool":"bash","arguments":{"command":"touch b; while [ ! -f a ]; do sleep 0.01; done; printf bravo","timeout":5}}
+        ]});
+        let (url, bodies) = capturing_server(vec![Some(vec![json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"batch","function":{"name":"parallel","arguments":args.to_string()}}
+        ]},"finish_reason":"tool_calls"}]})]), text_reply("done")]).await;
+        let mut s = test_session(url, dir.path().into());
+        s.shell = Some(crate::lyra::prompt::detect_shell());
+        s.read_only = false;
+        s.tools.extend(crate::lyra::tools::tool_set(false, false, false));
+        let mut ended = Vec::new();
+        let outcome = run_turn(&mut s, Some(user_message("run independent checks", &[])), &mut |event| {
+            if let TurnEvent::ToolEnd { id, .. } = event { ended.push(id); }
+        }).await;
+        assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+        let batch = &s.history.items()[2];
+        assert_eq!(batch["isError"], false, "{batch}");
+        let text = batch["content"].to_string();
+        assert!(text.contains("alpha") && text.contains("bravo"));
+        assert_eq!(ended.last().map(String::as_str), Some("batch"));
+        assert_eq!(ended.len(), 3);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "one dispatch request and one final-answer request, no per-tool roundtrip");
+        let next: Value = serde_json::from_str(&bodies[1]).unwrap();
+        let replies: Vec<_> = next["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["tool_call_id"], "batch");
+        assert!(replies[0]["content"].as_str().unwrap().contains("alpha"));
+        assert!(replies[0]["content"].as_str().unwrap().contains("bravo"));
     }
 
     #[tokio::test]
