@@ -554,3 +554,4 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
     </section>
   );
 }
+                  <span class="lyra-avatar" aria-hidden="true">{(p().name || p().id || preset()?.name || "?").trim().charAt(0).toUpperCase()}</span>

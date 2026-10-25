@@ -7098,3 +7098,213 @@ button:focus-visible {
 .sel-item.open.active {
   color: var(--accent);
 }
+/* Lyra 设置页视觉精修：卡片层次、头像、徽标、下拉箭头、表单分组 */
+.lyra-config { gap: 14px; }
+.lyra-providers-head { border-bottom: 1px solid var(--border); margin-bottom: 2px; padding-bottom: 14px; }
+.lyra-heading h3 { font-size: 16px; letter-spacing: 0.2px; }
+.lyra-add-provider {
+  width: 188px;
+  font-weight: 550;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background-color: var(--accent-dim);
+  cursor: pointer;
+}
+.lyra-config select.field-input {
+  padding-right: 32px;
+  cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 17px) 52%, calc(100% - 12px) 52%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+.lyra-config .field-input { border-radius: var(--r-sm); padding: 8px 11px; font-size: 13px; }
+.lyra-config .field-label { font-size: 12px; color: var(--text-dim); font-weight: 500; }
+.lyra-config .backend-field { gap: 6px; }
+.lyra-provider {
+  overflow: hidden;
+  box-shadow: var(--inset-hi), 0 1px 2px rgba(0, 0, 0, 0.12);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.lyra-provider:hover { border-color: var(--border-strong); }
+.lyra-provider[open] { border-color: color-mix(in srgb, var(--accent) 35%, var(--card-border)); }
+.lyra-provider > summary {
+  flex-wrap: nowrap;
+  gap: 10px;
+  padding: 13px 16px;
+  background: color-mix(in srgb, var(--bg-hover) 55%, transparent);
+}
+.lyra-provider > summary:hover { background: var(--bg-hover); }
+.lyra-avatar {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: var(--on-accent);
+  font-size: 13px;
+  font-weight: 700;
+}
+.lyra-provider-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lyra-provider-meta { white-space: nowrap; }
+.lyra-count { white-space: nowrap; border-radius: 999px; padding: 2px 9px; }
+.lyra-provider > summary > .lyra-count {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+.lyra-del { padding: 3px 9px; border-radius: 6px; }
+.lyra-del:hover { background: color-mix(in srgb, var(--red) 14%, transparent); text-decoration: none; }
+.lyra-provider-body { padding: 18px 20px 16px; gap: 14px; }
+.lyra-config h4 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+}
+.lyra-provider-body > h4::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.lyra-models { gap: 10px; padding-top: 14px; }
+.lyra-models .btn { border-radius: 999px; padding: 5px 12px; }
+.lyra-fetch {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg-input);
+}
+.lyra-model-names span { border-radius: 999px; background: var(--bg-hover); border-color: transparent; padding: 3px 10px; }
+.lyra-model { border: 1px solid var(--border); border-radius: var(--r-sm); }
+.lyra-model[open] { border-color: var(--border-light); }
+.lyra-model > .lyra-detail-body { padding: 4px 14px 14px; }
+.lyra-model .field-input { background: var(--bg-panel); }
+.lyra-advanced,
+.lyra-file-settings { border-top: 1px dashed var(--border); }
+.lyra-advanced > summary,
+.lyra-file-settings > summary { font-weight: 550; }
+.lyra-advanced > summary .field-hint,
+.lyra-file-settings > summary .field-hint { font-weight: 400; margin-left: 4px; }
+.lyra-file-settings { margin-top: 4px; }
+.lyra-provider-footer { border-top: 0; padding-top: 0; justify-content: flex-end; }
+.lyra-empty { padding: 32px 24px; text-align: center; background: var(--bg-panel); }
+
+/* Lyra 二级页签：模型服务商 / MCP */
+.lyra-pane { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.lyra-pane[hidden] { display: none; }
+.lyra-subtabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); }
+.lyra-subtab {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: -1px;
+  padding: 8px 14px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+}
+.lyra-subtab:hover { color: var(--text); }
+.lyra-subtab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
+.lyra-subtab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 4px; }
+
+/* 设置弹窗全局精修：与 Lyra 服务商页统一的卡片、表单、开关和导航 */
+.settings-modal .modal-head { border-bottom: 1px solid var(--border); font-weight: 600; letter-spacing: 0.2px; }
+.settings-modal .modal-body { gap: 16px; padding: 24px 32px 28px; }
+.settings-tabs { padding: 8px 10px 14px; background: color-mix(in srgb, var(--bg-panel) 45%, var(--bg)); }
+.settings-tab-group { padding: 18px 10px 6px; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
+.settings-tab { height: 34px; padding: 0 12px; color: var(--text-dim); border-radius: 8px; }
+.settings-tab:hover { color: var(--text); }
+.settings-tab.active { color: var(--text); box-shadow: inset 2px 0 0 var(--accent), var(--inset-hi); }
+.settings-modal .modal-foot { border-top: 1px solid var(--border); }
+
+.settings-group {
+  gap: 18px;
+  padding: 20px 22px;
+  border-radius: var(--r-md);
+  box-shadow: var(--inset-hi), 0 1px 2px rgba(0, 0, 0, 0.12);
+  transition: border-color 0.15s;
+}
+.settings-group:hover { border-color: var(--border-strong); }
+.settings-group-title { padding-bottom: 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
+.settings-group-desc { margin: -6px 0 0; }
+
+.settings-modal .field { gap: 6px; }
+.settings-modal .field-label { font-size: 12px; font-weight: 500; color: var(--text-dim); }
+.settings-modal .field-input { border-radius: var(--r-sm); padding: 8px 11px; font-size: 13px; }
+.settings-modal select.field-input {
+  padding-right: 32px;
+  cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 17px) 52%, calc(100% - 12px) 52%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+.settings-modal .field > .sel.wide .pill { border-radius: var(--r-sm); padding: 8px 11px; font-size: 13px; }
+.settings-modal .btn.secondary { border-radius: var(--r-sm); }
+
+/* 「启用」类复选框 → 拨动开关 */
+.settings-modal .backend-switch input[type="checkbox"] {
+  appearance: none;
+  position: relative;
+  flex-shrink: 0;
+  width: 30px;
+  height: 18px;
+  margin: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg-input);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.settings-modal .backend-switch input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: transform 0.15s, background 0.15s;
+}
+.settings-modal .backend-switch input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.settings-modal .backend-switch input[type="checkbox"]:checked::after {
+  background: var(--on-accent);
+  transform: translateX(12px);
+}
+.settings-modal .backend-switch input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* 列表行、分段页签 */
+.wt-row { border-radius: var(--r-sm); background: var(--bg-input); padding: 10px 12px; transition: border-color 0.12s; }
+.wt-row:hover { border-color: var(--border-light); }
+.settings-modal .theme-seg[role="tablist"] {
+  gap: 2px;
+  padding: 3px;
+  width: fit-content;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-input);
+}
+.settings-modal .theme-seg[role="tablist"] .theme-seg-btn {
+  flex: none;
+  padding: 6px 16px;
+  border-color: transparent;
+  border-radius: 7px;
+  background: transparent;
+}
+.settings-modal .theme-seg[role="tablist"] .theme-seg-btn.active {
+  background: var(--bg-active);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--inset-hi), 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+
