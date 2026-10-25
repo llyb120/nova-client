@@ -50,7 +50,7 @@
 
 新图通过 snapshotId 标识一次观察，observationSequence 是进程内递增序号（重启重置）；每张图附 snapshotId、capturedAt（UTC）和稳定取样统计，窗口/屏幕范围沿用 windowId、imageId 与 desktopBounds。operation 标明来源，操作结果的 basedOnSnapshotId 指向输入依据。historical=false 仅表示本次新采集，并非永远有效；recall 仍标记 historical=true，不伪造原图采集时间或新快照。
 
-所有操作结果均为 verification=unverified：工具能确认输入执行状态，业务目标需模型依据最新图验证。结论须绑定截图及可见证据；未检查完整范围不能声称“全部”或“不存在”。notes 仍原样返回，须记录来源snapshotId和页面范围，不能跨页面混用；工具不验证笔记内容。本改动不删除、裁剪或压缩任何宿主的历史上下文。
+所有操作结果均为 verification=unverified：工具能确认输入执行状态，业务目标需模型依据最新图判断，但该字段不要求额外检查。速度优先：最新动作反馈已满足目标就立即汇报并结束，禁止再截图、查状态、等待或二次确认；仅有明确未完成证据时才做一次针对性复查，没有新信息就报告未确认项，不循环截图。结论须绑定已有截图及可见证据；未检查完整范围不能声称“全部”或“不存在”。notes 仍原样返回，须记录来源snapshotId和页面范围，不能跨页面混用；工具不验证笔记内容。本改动不删除、裁剪或压缩任何宿主的历史上下文。
 
 ## 上下文机制与适用范围
 

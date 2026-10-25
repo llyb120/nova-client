@@ -329,7 +329,7 @@ pub async fn knowledge_graph(webview: tauri::Webview) -> Result<Value> {
         .await.map_err(err)?
 }
 
-pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observed_scope: Option<&str>) -> Result<Value> {
+fn validate_request(tool: &str, args: &Value, observed_scope: Option<&str>) -> Result<(Request, String)> {
     let operation = args["operation"].as_str().unwrap_or_default();
     if !matches!(operation, "experience_search" | "experience_save" | "experience_feedback") {
         return Err("未知经验操作".into());
@@ -355,6 +355,43 @@ pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observe
             return Err("反馈需reason及outcome=success/transient/precondition/invalid；超时用transient，确认路径失效才用invalid".into());
         }
     }
+    Ok((request, scope))
+}
+
+/// 普通剑来经验保存：参数和观察来源先同步校验，磁盘写入在后台完成。
+pub(crate) fn execute_async(dir: &Path, tool: &str, owner: &str, args: &Value, observed_scope: Option<&str>) -> Result<Value> {
+    if args["operation"] != "experience_save" { return Err("仅经验保存支持异步".into()); }
+    validate_request(tool, args, observed_scope)?;
+    let dir = dir.to_path_buf();
+    let tool = tool.to_string();
+    let owner = owner.to_string();
+    let args = args.clone();
+    let observed_scope = observed_scope.map(str::to_string);
+    let _ = std::thread::spawn(move || {
+        // 没有同步调用方可重试，瞬时锁冲突由后台做有界等待。
+        let mut retries = 0;
+        loop {
+            match execute(&dir, &tool, &owner, &args, observed_scope.as_deref()) {
+                Ok(_) => break,
+                Err(e) if e.contains("经验库忙") && retries < 20 => {
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    eprintln!("[experience] 异步保存失败：{e}");
+                    break;
+                }
+            }
+        }
+    });
+    Ok(json!({"operation":"experience_save","accepted":true,"async":true,
+        "notice":"经验已校验，正在后台保存；无需等待落盘、补图或复查，直接收尾。"}))
+}
+
+pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observed_scope: Option<&str>) -> Result<Value> {
+    let operation = args["operation"].as_str().unwrap_or_default();
+    let (request, scope) = validate_request(tool, args, observed_scope)?;
+    let writing = operation != "experience_search";
     let (_lock, mut entries) = read_entries(dir)?;
     if !writing {
         let query = terms(&request.task);
@@ -454,6 +491,32 @@ pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_save_validates_first_and_persists_in_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = json!({"operation":"experience_save","snapshotId":"s","experience":{
+            "scope":"chrome","task":"安装扩展","conditions":["扩展管理页"],"steps":["加载扩展"],
+            "checks":["扩展已启用"],"evidence":"扩展已启用","outcome":"success","redacted":true}});
+        let (lock, _) = read_entries(dir.path()).unwrap();
+        let accepted = execute_async(dir.path(), "jianlai", "one", &args, Some("chrome")).unwrap();
+        assert_eq!((accepted["accepted"].clone(), accepted["async"].clone()), (json!(true), json!(true)));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(lock);
+        let mut saved = None;
+        for _ in 0..200 {
+            if let Ok((_lock, entries)) = read_entries(dir.path()) {
+                if !entries.is_empty() { saved = Some(entries); break; }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let entries = saved.expect("background save should persist");
+        assert_eq!(entries[0].task, "安装扩展");
+        let mut invalid = args;
+        invalid["experience"]["redacted"] = json!(false);
+        assert!(execute_async(dir.path(), "jianlai", "one", &invalid, Some("chrome")).is_err());
+    }
+
     #[test]
     fn wording_drift_merges_hint_shows_once_and_full_store_evicts_unproven() {
         let dir = tempfile::tempdir().unwrap();

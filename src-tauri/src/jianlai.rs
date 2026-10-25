@@ -1291,7 +1291,7 @@ fn post_background(shot: &Shot, a: &Action) -> Result<()> {
     background::post(pid, shot.surface.id, at, to, a)
 }
 
-pub(crate) const COMPLETION_GUIDANCE: &str = "用最新截图（含动作自动反馈）核对用户要求的结果；可见证据已满足目标就立即结束，不为等待已读/回复或消除无关图标继续轮询。仅有明确未完成证据时才等待复查；连续两次没有新证据就换验证方法或如实报告未确认项，不重放输入。";
+pub(crate) const COMPLETION_GUIDANCE: &str = "速度优先：用最新截图（含动作自动反馈）核对用户要求的结果；证据已满足目标就立即汇报并结束，禁止再截图、查状态、等待或二次确认；verification=unverified不要求额外检查。仅有明确未完成证据时才做一次针对性复查；没有新信息就如实报告未确认项，不轮询、不重放输入。";
 
 fn run(owner: String, mut args: Value) -> Result<Value> {
     // Some clients omit the operation while supplying a complete action batch. Normalize the
@@ -1846,6 +1846,9 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
                 let id = snap.window.or(snap.foreground.map(|(id, _)| id)).ok_or("请截目标应用窗口后记录经验")?;
                 Some(crate::tool_experience::scope("jianlai", &window(id)?.app_name().map_err(err)?)?)
             };
+            if args["operation"] == "experience_save" {
+                return crate::tool_experience::execute_async(&crate::tool_experience::dir(), "jianlai", &owner, &args, observed.as_deref());
+            }
             return crate::tool_experience::execute(&crate::tool_experience::dir(), "jianlai", &owner, &args, observed.as_deref());
         }
         let entering = matches!(args["operation"].as_str(), Some("windows" | "screenshot" | "activate"));
