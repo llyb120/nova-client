@@ -1,5 +1,4 @@
-import assert from "node:assert";
-import { foldEfforts } from "../src/modelEfforts.ts";
+import { foldEfforts, splitEffort } from "../src/modelEfforts.ts";
 
 const opt = (value: string, label: string) => ({ value, label, title: value });
 const fold = (flat: ReturnType<typeof opt>[], lyra: boolean, defaults = new Map<string, string>()) =>
@@ -27,7 +26,15 @@ const lyra = fold([
 ], true);
 assert.deepEqual(lyra.map((o) => [o.value, o.efforts?.length]), [["p/qwen3:max", undefined], ["p/gpt", 2]]);
 assert.equal(lyra[0].selectedLabel, undefined, "没有档位的模型不追加强度");
-assert.equal(lyra[1].selectedLabel, "GPT · 默认", "未知默认强度不能猜测");
+assert.equal(lyra[1].selectedLabel, "GPT", "未知默认强度不能猜测");
+
+// 强度按档位由弱到强排，不跟随后端给的顺序；未知档位排最后。
+const unsorted = fold([
+  opt("m", "M"),
+  ...["high", "none", "max", "low", "weird", "minimal", "xhigh", "medium"].map((e) => opt(`m/variant/${e}`, `M · ${e}`)),
+], true);
+assert.deepEqual(unsorted[0].efforts!.map((o) => splitEffort(o.title!, true)![1]),
+  ["none", "minimal", "low", "medium", "high", "xhigh", "max", "weird"]);
 
 // 截图中的 CodeBuddy 裸模型默认，以及 Lyra 的模型/variant 编码。
 for (const isLyra of [false, true]) {

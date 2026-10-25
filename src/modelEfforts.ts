@@ -1,5 +1,15 @@
 import type { SelectOption } from "./components/SearchSelect";
 
+/** 强度档位由弱到强，与后端 backend_migration::EFFORTS 一致；未知档位（厂商自定义）
+ *  排在已知档位之后并保持原有相对次序。 */
+const EFFORT_RANK = ["none", "minimal", "default", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+/** 排序用：后端给的顺序不稳定（JSON 对象无键序、各家自排），展示时统一按档位强弱排。 */
+export const effortRank = (effort: string) => {
+  const i = EFFORT_RANK.indexOf(effort);
+  return i < 0 ? EFFORT_RANK.length : i;
+};
+
 /** 各后端把思考强度折进模型 value：`<model>:<effort>`（Codex / ACP）或
  *  `<provider>/<model>/variant/<name>`（Lyra，模型 ID 可能自带 `:max` 之类，不按冒号拆）。
  *  拆出 [基础模型, 强度]，不是强度选项返回 null。 */
@@ -50,9 +60,11 @@ export function foldEfforts(
     parent.efforts!.push({ ...option, short: cut > 0 ? option.label.slice(cut + 3) : effort });
   }
   for (const [base, parent] of parents) {
+    const rankOf = (o: SelectOption) => effortRank(splitEffort(o.title!, lyra)?.[1] ?? "");
+    parent.efforts!.sort((a, b) => rankOf(a) - rankOf(b));
     const effort = defaultEfforts.get(base);
     const selected = parent.efforts!.find((o) => splitEffort(o.title!, lyra)?.[1] === effort);
-    parent.selectedLabel = selected?.label ?? effort ? `${parent.label} · ${effort}` : parent.label;
+    parent.selectedLabel = selected?.label ?? (effort ? `${parent.label} · ${effort}` : parent.label);
   }
   return out;
 }

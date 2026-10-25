@@ -19,6 +19,7 @@ import {
   type Preset,
   type ProviderDraft,
 } from "../lyraConfig";
+import { effortRank } from "../modelEfforts";
 
 const LOGIN_PRESETS = new Set(["devin", "codebuddy", "workbuddy"]);
 /** 可在 Nova 里网页登录的预设。 */
@@ -450,7 +451,7 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
                                   <input type="checkbox" checked={m().image} onChange={(e) => setM((x) => (x.image = e.currentTarget.checked))} /> 支持图片输入
                                 </label>
                                 <Show when={hasVariants(m().raw)}>
-                                  <span class="field-hint">思考强度：{Object.keys(m().raw.variants).join(" / ")}</span>
+                                  <span class="field-hint">思考强度：{[...Object.keys(m().raw.variants)].sort((a, b) => effortRank(a) - effortRank(b)).join(" / ")}</span>
                                 </Show>
                               </div>
                               <details class="lyra-advanced">
