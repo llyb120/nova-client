@@ -2376,13 +2376,13 @@ mod tests {
         // A departed target must yield an actionable desktop, not its old window image.
         let mut observation = json!({});
         let mut snapshot = None;
-        observe("test", Some(u32::MAX), None, true, 1600, false, &mut snapshot, &mut observation);
+        observe("test", Some(u32::MAX), None, true, 1600, &mut snapshot, &mut observation);
         assert!(observation["windowId"].is_null());
         assert!(snapshot.is_some(), "{observation}");
         assert!(snapshot.unwrap().window.is_none());
         let mut focused_result = json!({});
         let mut focused_snapshot = None;
-        observe("test", None, None, false, 1600, false, &mut focused_snapshot, &mut focused_result);
+        observe("test", None, None, false, 1600, &mut focused_snapshot, &mut focused_result);
         assert!(focused_snapshot.is_some(), "{focused_result}");
         if let Some(id) = focused_result["windowId"].as_u64() {
             assert_eq!(focused_result["foreground"][0], id);
