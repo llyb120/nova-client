@@ -62,6 +62,8 @@ pub struct Session {
     pub steer: Arc<Mutex<VecDeque<Value>>>,
     /// 多 agent 控制面；子 agent 为 None（深度上限 1）。
     pub agents: Option<AgentHandle>,
+    /// 仅自动主会话启用，临时模型栈不写入线程配置或分叉历史。
+    pub scenes: Option<crate::lyra::scene::Routing>,
 }
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -151,6 +153,18 @@ impl Session {
 
 /// 跑一轮：`input` 为本轮用户消息（None 表示只消化 steer 继续）。返回 BoxFuture 以便子 agent 递归派生。
 pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>) -> BoxFuture<'a, TurnOutcome> {
+    Box::pin(async move {
+        // 包括 future 被 drop/abort：借用结束必须恢复原模型，不能依赖模型主动切回。
+        struct Restore<'a>(&'a mut Session);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) { while crate::lyra::scene::restore(self.0) {} }
+        }
+        let guard = Restore(s);
+        run_turn_inner(&mut *guard.0, input, on_event).await
+    })
+}
+
+fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>) -> BoxFuture<'a, TurnOutcome> {
     Box::pin(async move {
         if let Some(input) = input {
             s.history.record(input);
@@ -250,6 +264,12 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
                         tokio::time::sleep(backoff(retries)).await;
                         continue;
                     }
+                    if crate::lyra::scene::fallback(s) {
+                        retries = 0;
+                        overflow_recovered = false;
+                        on_event(TurnEvent::Retry { attempt: 0, error, context_recovery: false });
+                        continue;
+                    }
                     // 普通 provider 错误（如 429）只结束本轮；子 agent/后台命令/MCP 仅在取消或会话关闭时清理。
                     crate::lyra::provider::reset_response_state(&s.session_id);
                     return TurnOutcome { cancelled: false, error: Some(error) };
@@ -274,6 +294,7 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
                 ));
             }
             let aborted = result.stop_reason == "aborted";
+            let truncated = result.stop_reason == "length";
             if !(aborted && content.is_empty()) {
                 s.history.record(json!({
                     "role": "assistant",
@@ -291,7 +312,18 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
                 early.iter().for_each(|(.., handle)| handle.abort());
                 return s.cancel();
             }
+            if truncated && s.scenes.is_some() {
+                early.iter().for_each(|(.., handle)| handle.abort());
+                crate::lyra::provider::reset_response_state(&s.session_id);
+                s.history.close_pending_calls("模型输出截断，未执行此工具调用");
+                return TurnOutcome { cancelled: false, error: Some("模型输出截断，任务尚未确认完成；可继续本会话。".into()) };
+            }
             if calls.is_empty() {
+                if crate::lyra::scene::resume(s) {
+                    overflow_recovered = false;
+                    s.history.record(user_message("[Nova 场景工作结束] 已自动恢复之前的模型。以上结论和工具记录属于同一个会话；继续尚未完成的用户任务或直接交付，不要重做已完成工作，不要重复已有汇报，也不要提及内部模型切换。", &[]));
+                    continue;
+                }
                 if !s.steer.lock().unwrap().is_empty() { continue; }
                 if let Some(agents) = &s.agents {
                     if let Some(report) = agents.await_pending(&s.cancelled, &s.steer).await {
@@ -306,7 +338,7 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
                 return TurnOutcome::default();
             }
             // ponytail: 预算提醒按工具执行前的历史估算，最多晚一轮出现。
-            let notice = s.context.budget_notice(s.history.items());
+            let notice = if calls.iter().any(|(_, name, _)| name == crate::lyra::scene::TOOL) { None } else { s.context.budget_notice(s.history.items()) };
             let mut results = run_tools(s, &calls, early, on_event).await;
             if let (Some(notice), Some(last)) = (notice, results.last_mut()) {
                 if let Some(parts) = last.get_mut("content").and_then(Value::as_array_mut) {
@@ -314,6 +346,9 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
                 }
             }
             for message in results {
+                if message["toolName"] == crate::lyra::scene::TOOL && message["isError"] == false {
+                    overflow_recovered = false;
+                }
                 s.history.record(message);
             }
         }
@@ -345,7 +380,13 @@ async fn run_tools(
             1
         };
         let batch = &calls[i..i + run];
-        let outcomes: Vec<ToolOutcome> = if run == 1 && calls[i].1 == "recall" && s.tools.iter().any(|tool| tool.name == "recall") {
+        let outcomes: Vec<ToolOutcome> = if calls[i].1 == crate::lyra::scene::TOOL && s.tools.iter().any(|tool| tool.name == crate::lyra::scene::TOOL) {
+            vec![if calls.len() != 1 {
+                text_outcome("switch_scene 必须单独调用，不能与其他工具合批；本次未切换模型。", true)
+            } else {
+                crate::lyra::scene::switch(s, &calls[i].2)
+            }]
+        } else if run == 1 && calls[i].1 == "recall" && s.tools.iter().any(|tool| tool.name == "recall") {
             vec![recall(s, &calls[i].2)]
         } else {
             let handles: Vec<_> = batch
@@ -383,6 +424,7 @@ async fn run_tools(
                         Ok(next) => *s.mcp.get_mut() = next,
                         Err(error) => {
                             s.tools.retain(|tool| tool.name != crate::lyra::mcp::TOOL_NAME);
+                            crate::lyra::scene::disable_tool(s, crate::lyra::mcp::TOOL_NAME);
                             outcome.content.push(json!({ "type": "text", "text": format!("工作目录已切换；MCP 重新初始化失败，已禁用：{error}") }));
                         }
                     }
@@ -609,6 +651,7 @@ pub(crate) mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
             steer: Arc::new(Mutex::new(VecDeque::new())),
             agents: None,
+            scenes: None,
         }
     }
 

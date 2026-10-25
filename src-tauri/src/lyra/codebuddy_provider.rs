@@ -476,7 +476,7 @@ mod tests {
             let model = super::super::config::resolve_model(&json!({"provider":{"codebuddy":{"api":"codebuddy","options":{"baseURL":format!("http://{address}/v2"),
                 "requiresReasoningContentOnAssistantMessages":true},"models":{"codebuddy":{}}}}}),Some("codebuddy/codebuddy"),&HashMap::new()).unwrap().model;
             let mut body = provider::completions_body(&model,"system",&[
-                json!({"role":"assistant","content":[{"type":"thinking","thinking":"先读文件"},{"type":"toolCall","id":"prior","name":"read","arguments":{"path":"prior"}}]}),
+                json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,"content":[{"type":"thinking","thinking":"先读文件"},{"type":"toolCall","id":"prior","name":"read","arguments":{"path":"prior"}}]}),
                 json!({"role":"toolResult","toolCallId":"prior","content":[{"type":"text","text":"previous output"}]}),
             ],&[],None,Some("session"));
             body["tools"] = json!([{"function":{"name":"read","parameters":{"type":"object"}}}]);

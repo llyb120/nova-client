@@ -72,7 +72,7 @@ pub fn process_env() -> HashMap<String, String> {
     std::env::vars().collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedModel {
     pub provider: String,
     pub command_code: bool,
@@ -115,7 +115,7 @@ pub struct ResolvedModel {
     pub extra_options: Map<String, Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Resolved {
     pub model: ResolvedModel,
     pub api_key: String,

@@ -192,9 +192,9 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
 #[derive(Debug, PartialEq)]
 pub(crate) struct AutoScope {
     pub scene: settings::Scene,
-    /// 首选模型就是当前模型的场景（含本会话场景）：自己做，不切 Stage，相应工具也直接给。
+    /// 首选模型就是当前模型的场景（含本会话场景）：自己做，不切模型，相应工具也直接给。
     pub covered: Vec<settings::Scene>,
-    /// 可转交的场景：首选模型与当前不同，且不在上游转交链上（防止来回推）。
+    /// 可切换的场景：首选模型与当前不同；旧场景子会话还排除上游转交链。
     pub handoff: Vec<settings::Scene>,
     /// 是否为场景子会话（结论交回上游）。
     pub child: bool,
@@ -203,11 +203,6 @@ pub(crate) struct AutoScope {
 impl AutoScope {
     pub fn desktop(&self) -> bool {
         self.covered.contains(&settings::Scene::Computer)
-    }
-
-    /// 轻量主会话需要编码时不开 Stage，而是升阶：本会话切到编码模型带上下文继续。
-    pub fn escalates(&self) -> bool {
-        !self.child && self.scene == settings::Scene::Lightweight && self.handoff.contains(&settings::Scene::Coding)
     }
 }
 
@@ -222,7 +217,7 @@ fn scope_of(
     for other in settings::Scene::ALL.into_iter().filter(|s| *s != scene) {
         match first(other) {
             Some(target) if target == *current => covered.push(other),
-            // 轻量化只做主会话开局，不作为转交目标（升阶后的编码主会话不再转回）。
+            // 轻量化只做主会话开局，不作为显式切换目标；恢复之前模型由运行时负责。
             Some(_) if other != settings::Scene::Lightweight && !upstream.contains(&other) => handoff.push(other),
             _ => {}
         }
@@ -244,7 +239,7 @@ pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope>
         }
         (scene, (thread.agent_kind.clone(), thread.model.clone().unwrap_or_default()), upstream, thread.employee_thread)
     };
-    // 数字员工不走 Stage 转交与升阶：每段会话只做本场景的事，换场景由员工调度接力成新会话（见 employee::relay）；
+    // 数字员工不走普通自动模式的场景切换：每段会话只做本场景的事，换场景由员工调度接力成新会话（见 employee::relay）；
     // 桌面/浏览器工具只给剑来段，它由员工调度排队占用桌面。
     if employee {
         return Some(AutoScope { scene, covered: vec![scene], handoff: Vec::new(), child: false });
@@ -252,45 +247,17 @@ pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope>
     Some(scope_of(scene, &current, &upstream, |s| state.scene_model(s).ok()))
 }
 
-/// 自动模式会话首条消息的隐式说明：哪些场景可转交、主会话还附项目目录清单。无可转交场景时为 None。
+/// 自动模式首条消息只说明场景切换的一般语义，不把当前模型/场景写进历史消息。
 fn auto_mode_context(scope: &AutoScope, projects: &[String]) -> Option<String> {
-    // 电脑操控子会话的交回规则不依赖是否可转交。
+    // 旧电脑操控子会话仍需在交回结论前复查，无论是否有可切换场景。
     let verify = if scope.child && scope.scene == settings::Scene::Computer {
         crate::jianlai::COMPLETION_GUIDANCE
     } else {
         ""
     };
     if scope.handoff.is_empty() {
-        return (!verify.is_empty())
-            .then(|| format!("[Nova 自动模式] 你是「{}」场景会话，负责把交给你的整块工作做完并给出结论（结论会交回上游会话）。{verify}", scope.scene.label()));
+        return (!verify.is_empty()).then(|| format!("[Nova 自动模式] {verify}"));
     }
-    // 轻量主会话的编码工作走切换模型，其余场景整块转交。
-    let handoff: Vec<_> = scope.handoff.iter().filter(|s| !(scope.escalates() && **s == settings::Scene::Coding)).collect();
-    let scenes = handoff.iter().map(|s| format!("{}（{}）", s.key(), s.when())).collect::<Vec<_>>().join("、");
-    let keys = handoff.iter().map(|s| s.key()).collect::<Vec<_>>().join("|");
-    if scope.child {
-        return Some(format!(
-            "[Nova 自动模式] 你是「{}」场景会话，负责把交给你的整块工作做完并给出结论（结论会交回上游会话）。\
-             过程中遇到 {scenes} 的整块工作，用 spawn_agent(scene={keys}, task_name, message) 转交给该场景的模型独立完成，\
-             再用 wait_agent 取结果后继续；不要中途逐步指挥。{verify}",
-            scope.scene.label()
-        ));
-    }
-    let mut rules = Vec::new();
-    if scope.escalates() {
-        rules.push(format!(
-            "需要编码（{}）时不要自己做，调用 spawn_agent(scene=coding, cwd=<项目目录>, task_name, message) 切换为编码模型：本轮结束后本会话会切换到编码模型，\
-             带着全部上下文按 message 继续；调用后用一句话告诉用户马上开始动手并立即结束本轮，不要 wait_agent。",
-            settings::Scene::Coding.when()
-        ));
-    }
-    if !handoff.is_empty() {
-        rules.push(format!(
-            "属于 {scenes} 的工作，即使你的工具也能做，也不要自己动手，\
-             必须用 spawn_agent(scene={keys}, cwd=<项目目录>, task_name, message) 交给对应场景的模型独立完成，再用 wait_agent 取结果。"
-        ));
-    }
-    let rules = rules.concat();
     let list = projects
         .iter()
         .filter(|p| Path::new(p).is_dir())
@@ -298,10 +265,11 @@ fn auto_mode_context(scope: &AutoScope, projects: &[String]) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     Some(format!(
-        "[Nova 自动模式] 你是本会话的主 Agent，直接面向用户。{rules}不属于这些场景的事直接自己做。\
-         拿到结果后以你自己的口吻向用户汇报；不要中途逐步指挥，也不要向用户提及转交细节。\
-         结果不满意或同一件事需要继续（包括之前几轮派出的 agent），优先对原 agent 用 followup_task(target=原 task_name) 继续，不要再 spawn_agent 新开。\
-         message 要写清目标、约束和完成标准。任务涉及的项目从下列目录中选择作为 cwd（都不相符就省略 cwd）：\n{}",
+        "[Nova 自动模式] 场景切换使用内部工具 switch_scene(scene=\"coding\"|\"computer\", message=\"目标、约束和完成标准\")，\
+         在本会话内临时换模型，带着全部上下文继续。message 要写清目标、约束和完成标准。\
+         场景阶段以无工具回复给出结论时，运行时会自动恢复之前的模型继续用户任务；最终完成、出错或取消时自动恢复初始模型，无需自行切回。\
+         场景切换不创建子 Agent，不调用 wait_agent；不要向用户提及模型切换，不要为切换结束用户任务。普通子 Agent 的调度规则不变。{verify}\
+         任务涉及的项目可从下列目录中选择；需要换工作目录时使用 change_working_directory，不要给 switch_scene 传 cwd：\n{}",
         if list.is_empty() { "（暂无项目）".into() } else { list }
     ))
 }
@@ -312,24 +280,46 @@ fn auto_scope_skips_same_model_and_upstream_scenes() {
     use settings::Scene::*;
     let light = (AgentKind::Lyra, "light".to_string());
     let code = (AgentKind::Lyra, "code".to_string());
-    // 剑来与轻量化同模型：轻量主会话自己操作电脑，只转交编码。
+    // 剑来与轻量化同模型：轻量主会话自己操作电脑，只需切换编码。
     let first = |s: settings::Scene| Some(if s == Coding { code.clone() } else { light.clone() });
     let main = scope_of(Lightweight, &light, &[], first);
-    assert_eq!((main.covered.clone(), main.handoff.clone(), main.escalates()), (vec![Lightweight, Computer], vec![Coding], true));
-    // 编码子会话需要操作电脑：剑来模型不同且不在上游链上，可以转交；不能推回上游的轻量化。
+    assert_eq!((main.covered.clone(), main.handoff.clone()), (vec![Lightweight, Computer], vec![Coding]));
+    // 旧编码子会话仍排除上游场景，但路由提示改为同会话内部切换。
     let first = |s: settings::Scene| Some(match s { Coding => code.clone(), Computer => (AgentKind::Lyra, "cu".into()), Lightweight => light.clone() });
     let child = scope_of(Coding, &code, &[Lightweight], first);
-    assert_eq!((child.handoff.clone(), child.escalates(), child.child), (vec![Computer], false, true));
-    // 切换为编码模型后的主会话：只能转交剑来，不转回轻量化。
-    let escalated = scope_of(Coding, &code, &[], first);
-    assert_eq!((escalated.handoff.clone(), escalated.escalates()), (vec![Computer], false));
-    assert!(auto_mode_context(&escalated, &[]).is_some_and(|c| c.contains("必须用 spawn_agent(scene=computer, cwd=<项目目录>") && !c.contains("切换为编码模型")));
-    // 三个场景同模型：什么都不转交。
-    assert!(scope_of(Lightweight, &light, &[], |_| Some(light.clone())).handoff.is_empty());
-    // 电脑操控子会话无可转交场景时仍带交回前复查规则；主会话提示复用原 agent。
+    assert_eq!((child.handoff.clone(), child.child), (vec![Computer], true));
+    assert!(scope_of(Coding, &code, &[Lightweight, Computer], first).handoff.is_empty());
+    let coding = scope_of(Coding, &code, &[], first);
+    assert_eq!((coding.handoff.clone(), coding.child), (vec![Computer], false));
+    let main_context = auto_mode_context(&main, &[]).unwrap();
+    let child_context = auto_mode_context(&child, &[]).unwrap();
+    let coding_context = auto_mode_context(&coding, &[]).unwrap();
+    // 历史提示不绑定当前场景或角色，临时模型看到相同的一般切换语义。
+    assert_eq!(main_context, coding_context);
+    assert_eq!(main_context, child_context);
+    let both = scope_of(Lightweight, &light, &[], first);
+    assert_eq!(auto_mode_context(&both, &[]).unwrap(), main_context);
+    assert!(main_context.contains("switch_scene(scene=\"coding\"|\"computer\", message="));
+    assert!(!main_context.contains("你是") && main_context.contains("（暂无项目）"));
+    for context in [&main_context, &child_context, &coding_context] {
+        assert!(context.contains("目标、约束和完成标准") && context.contains("在本会话内临时换模型"));
+        assert!(context.contains("无工具回复") && context.contains("自动恢复之前的模型继续用户任务"));
+        assert!(context.contains("最终完成、出错或取消时自动恢复初始模型"));
+        assert!(context.contains("不要向用户提及模型切换") && context.contains("不要为切换结束用户任务"));
+        assert!(context.contains("不调用 wait_agent") && context.contains("普通子 Agent 的调度规则不变"));
+        assert!(!context.contains("spawn_agent") && !context.contains("followup_task"));
+    }
+    // 三个场景同模型：直接执行，无需切换提示。
+    let same = scope_of(Lightweight, &light, &[], |_| Some(light.clone()));
+    assert!(same.handoff.is_empty() && auto_mode_context(&same, &[]).is_none());
+    // 旧电脑操控子会话无可切换场景时仍带交回前复查规则。
     let cu = scope_of(Computer, &light, &[Lightweight], |_| Some(light.clone()));
-    assert!(auto_mode_context(&cu, &[]).is_some_and(|c| c.contains("最新截图")));
-    assert!(auto_mode_context(&main, &[]).is_some_and(|c| c.contains("followup_task") && c.contains("spawn_agent(scene=coding, cwd=<项目目录>") && c.contains("切换为编码模型")));
+    assert!(auto_mode_context(&cu, &[]).is_some_and(|c| c.contains("最新截图") && !c.contains("你是") && !c.contains("switch_scene")));
+    let cu = scope_of(Computer, &light, &[Lightweight], first);
+    assert!(auto_mode_context(&cu, &[]).is_some_and(|c| c.contains("最新截图") && c.contains("switch_scene")));
+    // 员工沿用隔离调度，无场景转交时不注入切换说明。
+    let employee = AutoScope { scene: Coding, covered: vec![Coding], handoff: vec![], child: false };
+    assert!(auto_mode_context(&employee, &[]).is_none());
 }
 
 /// 场景转交：在场景模型（可跨后端）上开一个引用父会话上下文的 Stage 会话。
@@ -385,84 +375,6 @@ pub(crate) fn create_scene_stage(
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
     Ok(Some(id))
-}
-
-/// 登记升阶（见 AutoScope::escalates）：本轮正常结束后由 register_auto_escalation 切模型继续。返回 false 表示不适用。
-pub(crate) fn request_escalation(state: &AppState, thread_id: &str, scene: settings::Scene, cwd: Option<&str>, message: &str) -> Result<bool, String> {
-    if scene != settings::Scene::Coding || !auto_scope(state, thread_id).is_some_and(|scope| scope.escalates()) {
-        return Ok(false);
-    }
-    if let Some(dir) = cwd.filter(|dir| !Path::new(dir).is_dir()) {
-        return Err(format!("目录不存在：{dir}"));
-    }
-    if message.trim().is_empty() {
-        return Err("message 不能为空：写清目标、约束和完成标准".into());
-    }
-    let mut store = state.store.lock().unwrap();
-    store.get_mut(thread_id).ok_or("线程不存在")?.pending_escalation = Some((cwd.map(str::to_string), message.to_string()));
-    Ok(true)
-}
-
-/// 升阶：主会话切到编码场景模型（可换项目目录）后继续登记的任务。同后端只换模型、沿用原会话；
-/// 跨后端由 set_thread_agent 把历史作为接力上下文交给新后端。
-async fn escalate(app: &tauri::AppHandle, thread_id: &str, (cwd, message): (Option<String>, String)) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let scene = settings::Scene::Coding;
-    let (kind, model) = state.scene_model(scene)?;
-    let (mode, effort) = {
-        let store = state.store.lock().unwrap();
-        let thread = store.get(thread_id).ok_or("线程不存在")?;
-        (thread.mode.clone(), thread.reasoning_effort.clone())
-    };
-    set_thread_agent(app.clone(), app.state(), thread_id.to_string(), kind.clone(), Some(model.clone()), mode, effort)?;
-    let (item, moved) = {
-        let mut store = state.store.lock().unwrap();
-        let thread = store.get_mut(thread_id).ok_or("线程不存在")?;
-        thread.auto_scene = Some(scene.key().into());
-        let moved = cwd.filter(|cwd| *cwd != thread.cwd);
-        if let Some(cwd) = &moved {
-            thread.cwd = cwd.clone();
-        }
-        let label = if model.is_empty() { format!("{} 默认模型", kind.label()) } else { format!("{} · {model}", kind.label()) };
-        let item = thread.push_system(format!("已切换为编码模型 {label}，接着本会话继续。"), "info");
-        store.save_thread(thread_id);
-        (item, moved)
-    };
-    let _ = app.emit(acp::EV_UPDATE, json!({ "threadId": thread_id, "op": { "t": "upsert", "item": item } }));
-    if let Some(cwd) = &moved {
-        state.projects.lock().unwrap().touch(cwd);
-        let _ = app.emit("projects:changed", json!({}));
-        let _ = app.emit("thread:cwd-changed", json!({ "threadId": thread_id, "cwd": cwd }));
-    }
-    let _ = app.emit(acp::EV_THREADS, json!({}));
-    let text = format!("[Nova 自动模式] 本会话已切换为编码模型，由你直接完成下面的任务（不要再切换或转交编码）：\n\n{message}");
-    dispatch_scene_prompt(app, thread_id.to_string(), text, Vec::new())
-}
-
-/// 本轮结束时执行登记的升阶；取消或出错则放弃（取消尊重用户，出错交给失效切换）。
-fn register_auto_escalation(app: &tauri::AppHandle) {
-    let handle = app.clone();
-    app.listen(acp::EV_TURN, move |e| {
-        let Ok(v) = serde_json::from_str::<Value>(e.payload()) else { return };
-        let Some(tid) = v["threadId"].as_str().map(str::to_owned) else { return };
-        if v["running"].as_bool().unwrap_or(false) { return; }
-        let state = handle.state::<AppState>();
-        let pending = state.store.lock().unwrap().get_mut(&tid).and_then(|t| t.pending_escalation.take());
-        let Some(pending) = pending.filter(|_| matches!(v["stopReason"].as_str(), Some("end_turn" | "max_turn_requests"))) else { return };
-        let app = handle.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = escalate(&app, &tid, pending).await {
-                let state = app.state::<AppState>();
-                let mut store = state.store.lock().unwrap();
-                if let Some(thread) = store.get_mut(&tid) {
-                    thread.push_system(format!("切换为编码模型失败：{error}"), "error");
-                    store.save_thread(&tid);
-                }
-                drop(store);
-                let _ = app.emit(acp::EV_THREADS, json!({}));
-            }
-        });
-    });
 }
 
 pub(crate) fn running_by_id(state: &AppState, thread_id: &str) -> bool {
@@ -3791,7 +3703,7 @@ fn dispatch_scene_prompt(
         return Ok(());
     }
     // Stage 引用不是一次性快照：每次投递都从源会话最新 items 重建。
-    // 自动模式会话的首条消息另注入场景转交说明（主会话附可选项目目录）。
+    // 自动模式会话的首条消息另注入场景切换的一般说明及可选项目目录。
     let projects: Vec<String> = state.projects.lock().unwrap().projects.iter().take(50).cloned().collect();
     let auto = auto_scope(&state, &thread_id);
     {
@@ -3809,7 +3721,7 @@ fn dispatch_scene_prompt(
         } else {
             None
         };
-        // 跨 Agent 接力（含场景模型失效切换）时新 Agent 没见过首条消息的转交说明，需重新注入，否则它会自己干完整块编码。
+        // 跨 Agent 接力（含场景模型失效切换）时新 Agent 没见过首条消息的场景切换说明，需重新注入。
         let first_message = store
             .get(&thread_id)
             .is_some_and(|t| t.handoff_from.is_some() || !t.items.iter().any(|item| matches!(item, Item::User { .. })));
@@ -4434,8 +4346,9 @@ async fn auxiliary_complete(
     None
 }
 
-/// 自动模式主会话的失效切换：本轮出错且没有任何回复时，按场景列表切到下一个模型并重发该提示词。
-/// 返回是否已切换。场景子会话的失效切换在 lyra::session::scene_loop 里处理。
+/// 员工等旧路径的失效切换：无回复时按场景列表换模型并重发；返回是否已切换。
+/// 普通 Lyra 自动会话由运行时在原会话内部 fallback，退出恢复初始模型；外部不可重发或改基准模型。
+/// 旧场景子会话仍由 lyra::session::scene_loop 处理。
 #[tauri::command]
 fn auto_failover(app: tauri::AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<bool, String> {
     if running_by_id(&state, &thread_id) {
@@ -4445,6 +4358,10 @@ fn auto_failover(app: tauri::AppHandle, state: State<'_, AppState>, thread_id: S
         let store = state.store.lock().unwrap();
         let thread = store.get(&thread_id).ok_or("线程不存在")?;
         let Some(scene) = thread.auto_scene.as_deref().and_then(settings::Scene::parse) else { return Ok(false) };
+        // 场景和 root fallback 均由 Lyra 运行时处理，只重试下一请求，不重放用户提示或已执行工具。
+        if thread.agent_kind == AgentKind::Lyra && !thread.employee_thread {
+            return Ok(false);
+        }
         if thread.stage_source_thread_id.is_some() || thread.agent_kind == AgentKind::Unsupported {
             return Ok(false);
         }
@@ -5184,7 +5101,6 @@ pub fn run() {
 
             // 漫游 host：把本机被漫游会话的更新/轮次/权限事件转发给 guest
             register_experience_trails(app.handle());
-            register_auto_escalation(app.handle());
             register_roaming_forwarders(app.handle(), relay.clone());
             register_remote_permission_capture(app.handle());
             taskbar_status::start(app.handle());

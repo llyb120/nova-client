@@ -24,6 +24,7 @@ const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement.
 const WRITE_DESCRIPTION: &str =
     "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
 
+#[derive(Clone)]
 pub struct Tool {
     pub name: &'static str,
     pub description: String,

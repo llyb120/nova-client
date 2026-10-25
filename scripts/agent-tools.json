@@ -1,23 +1,10 @@
 [
   {
     "name": "spawn_agent",
-    "description": "自动模式场景转交：当一整块工作符合另一个场景时，用 scene 把它交给该场景的模型，在独立的 Stage 会话里执行（能看到本会话上下文，由它自己闭环完成），然后用 wait_agent 取最终结果；不要中途逐步指挥。场景：lightweight=轻量化（简单问答、整理总结等轻量事务）；coding=编码（写代码、改仓库、调试或运行构建测试）；computer=剑来（操作桌面应用或浏览器）。返回 ok=false 表示该场景模型与当前会话相同，直接自己完成。",
+    "description": "启动普通子 Agent 执行可独立并行的任务，沿用当前工具和工作目录，再用 wait_agent 取结果；子 Agent 不能继续派生子 Agent。自动模式场景切换由内部工具 switch_scene 在原会话内临时换模型，不通过 spawn_agent，也不需要 wait_agent。",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "scene": {
-          "type": "string",
-          "enum": [
-            "lightweight",
-            "coding",
-            "computer"
-          ],
-          "description": "转交到的场景"
-        },
-        "cwd": {
-          "type": "string",
-          "description": "转交会话的项目目录（绝对路径）；默认沿用当前会话目录"
-        },
         "task_name": {
           "type": "string",
           "pattern": "^[a-z0-9_]+$",
@@ -27,10 +14,13 @@
           "type": "string",
           "minLength": 1,
           "description": "完整任务描述：目标、约束、完成标准"
+        },
+        "fork_turns": {
+          "type": "string",
+          "description": "提供给子 Agent 的历史：none（默认）、all 或最近用户轮次数"
         }
       },
       "required": [
-        "scene",
         "task_name",
         "message"
       ],
@@ -39,7 +29,7 @@
   },
   {
     "name": "wait_agent",
-    "description": "等待转交的场景子任务结束（任一目标结束或超时即返回），返回各目标的状态、最终回复与会话 threadId；timedOut=true 时可再次调用继续等。",
+    "description": "等待普通子 Agent 完成（任一目标结束或超时即返回），返回各目标的状态和最终回复；timedOut=true 时可再次调用继续等。不用于 switch_scene。",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -62,7 +52,7 @@
   },
   {
     "name": "list_agents",
-    "description": "列出转交的场景子任务及其状态和最终回复。",
+    "description": "列出普通子 Agent 及其状态和最终回复。",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -75,7 +65,7 @@
   },
   {
     "name": "followup_task",
-    "description": "子任务结束后，在同一个场景会话里追加下一项工作（不是中途插话）。",
+    "description": "子任务结束后，向同一个子 Agent 追加下一项工作；重启后显式恢复已有历史和上下文，不重放旧队列。已关闭的子 Agent 不可恢复。",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -96,7 +86,7 @@
   },
   {
     "name": "interrupt_agent",
-    "description": "中断正在执行的场景子任务，之后仍可 followup_task。",
+    "description": "中断正在执行的普通子 Agent，之后仍可 followup_task。",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -112,7 +102,7 @@
   },
   {
     "name": "close_agent",
-    "description": "中断并关闭场景子任务；其 Stage 会话保留供查看。",
+    "description": "中断并关闭普通子 Agent；其只读执行记录保留供查看。",
     "inputSchema": {
       "type": "object",
       "properties": {

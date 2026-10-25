@@ -212,6 +212,15 @@ impl ContextWindow {
         self.window = window;
     }
 
+    /// 模型切换保留折叠账本，但旧模型的实测 token 校准不能跨模型沿用。
+    pub fn reset_model_usage(&mut self) {
+        self.state.anchor = None;
+        self.state.calibration = 1.0;
+        self.state.notice_rung = 0;
+        self.state.last_actual_usage = None;
+        self.save();
+    }
+
     pub fn overhead(&self) -> u64 {
         self.fixed.total()
     }

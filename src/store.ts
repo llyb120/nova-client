@@ -2849,7 +2849,7 @@ export async function initStore() {
             : suspendFireRelay(e.payload.threadId, manuallyInterrupted);
           void action.catch((error) => console.error("Fire relay failed", error));
         }
-        // 自动模式：本轮出错且无回复时，后端按场景列表切到下一个模型重发（非自动会话直接返回 false）。
+        // 兼容独立场景/员工入口；普通 Lyra 自动会话由运行时临时换模，后端拒绝这里的重发。
         const failedAgent = threadId === state.currentId
           ? state.agentKind
           : state.threads.find((thread) => thread.id === threadId)?.agentKind;

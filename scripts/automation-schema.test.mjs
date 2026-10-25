@@ -3,6 +3,39 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 const tool = async name=>JSON.parse(await readFile(new URL(`./${name}-tool.json`,import.meta.url),'utf8'));
+test('ordinary agents stay separate from internal scene switching and fallback', async()=>{
+  const read = path=>readFile(new URL(`../${path}`,import.meta.url),'utf8');
+  const [agentJson,session,lib,threads] = await Promise.all([
+    'scripts/agent-tools.json','src-tauri/src/lyra/session.rs','src-tauri/src/lib.rs','src-tauri/src/threads.rs'
+  ].map(read));
+  const agents = JSON.parse(agentJson);
+  const spawn = agents.find(tool=>tool.name==='spawn_agent');
+  assert.deepEqual(Object.keys(spawn.inputSchema.properties).sort(),['fork_turns','message','task_name']);
+  assert.deepEqual(spawn.inputSchema.required,['task_name','message']);
+  assert.match(spawn.description,/普通子 Agent/);
+  assert.match(spawn.description,/switch_scene/);
+  assert.doesNotMatch(agentJson,/独立的 Stage 会话|转交的场景子任务|同一个场景会话/);
+  assert.match(session,/pub fn agent_tools\(\) -> Vec<Tool>/);
+  const nativeSpawn = session.match(/let spawn = Tool \{([\s\S]*?)\n    \};/)?.[1];
+  assert.ok(nativeSpawn,'ordinary spawn schema must remain available');
+  assert.doesNotMatch(nativeSpawn,/"scene"|"cwd"|handoff/);
+  assert.match(nativeSpawn,/"fork_turns"/);
+  assert.doesNotMatch(session,/fn scene_spawn\(/);
+  assert.doesNotMatch(lib+threads,/request_escalation|register_auto_escalation|pending_escalation|fn escalates?\(/);
+  const context = lib.match(/fn auto_mode_context\([\s\S]*?\n\}/)?.[0];
+  assert.ok(context);
+  assert.match(context,/switch_scene/);
+  assert.match(context,/自动恢复之前的模型继续用户任务/);
+  assert.doesNotMatch(context,/scope\.scene\.label\(\)|结论会交回上游|spawn_agent/);
+  const fallback = lib.match(/fn auto_failover\([\s\S]*?\n\}/)?.[0];
+  assert.ok(fallback);
+  const guard = /if thread\.agent_kind == AgentKind::Lyra && !thread\.employee_thread \{\s*return Ok\(false\);\s*\}/;
+  assert.match(fallback,guard,'ordinary Lyra fallback must stay inside the runtime, not replay via IPC');
+  const guardAt = fallback.search(guard);
+  for (const effect of ['thread.items','set_thread_agent(','dispatch_prompt(']) {
+    assert.ok(fallback.indexOf(effect)>guardAt,`${effect} must stay after the non-employee guard`);
+  }
+});
 test('Chrome retains image coordinates, fast scope and bounded batch schemas',async()=>{
   const chrome=await tool('chrome');
   for(const name of ['action','imageId','scope','region','visual','maxEdge']) assert(chrome.inputSchema.properties[name]);

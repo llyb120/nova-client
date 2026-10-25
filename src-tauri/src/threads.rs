@@ -604,12 +604,9 @@ pub struct Thread {
     /// Stage 会话引用的源会话。每次发送前都会从源会话最新时间线重建上下文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_source_thread_id: Option<String>,
-    /// 自动模式会话的场景 key；None = 普通会话，场景转交与失效切换不生效。
+    /// 自动模式会话的场景 key；None = 普通会话，场景切换与失效切换不生效。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_scene: Option<String>,
-    /// 自动模式轻量主会话登记的升阶 (cwd, message)：本轮结束后把本会话切到编码模型继续，不新开 Stage。
-    #[serde(skip)]
-    pub pending_escalation: Option<(Option<String>, String)>,
     /// 仅供下一次 prompt 隐式注入，不持久化到会话文件或前端快照。
     #[serde(skip)]
     pub pending_stage_context: Option<String>,
@@ -681,7 +678,6 @@ impl Thread {
             parent_thread_id: None,
             stage_source_thread_id: None,
             auto_scene: None,
-            pending_escalation: None,
             pending_stage_context: None,
             active_clue_card_id: None,
             clue_context: None,

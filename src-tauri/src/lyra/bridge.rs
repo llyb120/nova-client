@@ -252,11 +252,13 @@ pub(super) fn turn_event_sink<'a>(
             }));
         }
         TurnEvent::ToolStart { id, name, args } => {
+            if name == crate::lyra::scene::TOOL { return; }
             let item = started_tool_item(&id, &name, &args);
             started_tools.insert(id, item.clone());
             emit(&json!({ "type": "item", "item": item }));
         }
         TurnEvent::ToolEnd { id, outcome } => {
+            if outcome["toolName"] == crate::lyra::scene::TOOL { return; }
             let started = started_tools
                 .get(&id)
                 .cloned()
@@ -375,12 +377,19 @@ async fn handle_prompt(
     let agent_instructions = load_agent_instructions(roots);
     let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
     let auto_change_project = settings.auto_change_project_enabled;
-    // 自动模式：当前模型不是剑来场景的模型时不给桌面/浏览器工具，转交给剑来场景闭环。
+    // 自动模式在本会话内临时切场景模型；员工保留独立的场景/桌面排队约束。
     let auto = app.as_ref().zip(request.get("novaThreadId").and_then(Value::as_str)).and_then(|(app, id)| {
         use tauri::Manager;
         crate::auto_scope(&app.state::<crate::AppState>(), id)
     });
-    let desktop = auto.as_ref().is_none_or(crate::AutoScope::desktop);
+    let routing = app.as_ref().zip(request.get("novaThreadId").and_then(Value::as_str)).and_then(|(app, id)| {
+        use tauri::Manager;
+        let state = app.state::<crate::AppState>();
+        let enabled = state.store.lock().unwrap().get(id).is_some_and(|t| !t.employee_thread);
+        enabled.then(|| auto.as_ref().map(|scope| (scope.scene, crate::settings::Scene::ALL.into_iter()
+            .map(|scene| (scene, state.scene_models(scene).into_iter().map(|(_, model)| model).collect())).collect::<Vec<_>>()))).flatten()
+    });
+    let desktop = routing.is_some() || auto.as_ref().is_none_or(crate::AutoScope::desktop);
     let shell = (!read_only).then(prompt::detect_shell);
     let prompt_options = SystemPromptOptions {
         cwd: cwd_path.display().to_string(),
@@ -407,7 +416,8 @@ async fn handle_prompt(
     if !desktop {
         tools.retain(|tool| !matches!(tool.name, "jianlai" | "chrome"));
     }
-    tools.extend(session::agent_tools(auto.map(|scope| scope.handoff).filter(|handoff| !handoff.is_empty())));
+    tools.extend(session::agent_tools());
+    let routing = routing.map(|(scene, targets)| crate::lyra::scene::Routing::new(scene, targets, &config_value, &env, system_prompt.clone(), tools.clone()));
     let tool_definitions = json!(tools.iter()
         .map(|tool| json!({ "name": tool.name, "description": tool.description, "parameters": tool.parameters }))
         .collect::<Vec<_>>());
@@ -454,7 +464,9 @@ async fn handle_prompt(
             .map(|id| format!("thread:{id}")).unwrap_or_else(|| ctx.session_id.clone())).with_stage(
             app.zip(request.get("novaThreadId").and_then(Value::as_str).map(str::to_owned)),
         ).with_persistence(&sessions_root)?),
+        scenes: None,
     };
+    if let Some(routing) = routing { routing.install(&mut session); }
 
     if let Some(agents) = &session.agents {
         if read_only { agents.cancel_all(); }
@@ -863,6 +875,8 @@ mod tests {
         sink(TurnEvent::MessageStart);
         sink(TurnEvent::TextDelta("hello".into()));
         sink(TurnEvent::TextDelta(" world".into()));
+        sink(TurnEvent::ToolStart { id: "route".into(), name: crate::lyra::scene::TOOL.into(), args: json!({"scene":"coding","message":"task"}) });
+        sink(TurnEvent::ToolEnd { id: "route".into(), outcome: json!({"toolName":crate::lyra::scene::TOOL,"isError":false}) });
         sink(TurnEvent::ToolStart { id: "t1".into(), name: "read".into(), args: json!({"path":"missing"}) });
         sink(TurnEvent::ToolEnd { id: "t1".into(), outcome: json!({"isError":true,"content":[{"type":"text","text":"not found"}]}) });
         sink(TurnEvent::Steer(user_message("check again", &[])));
@@ -873,6 +887,7 @@ mod tests {
         drop(sink);
         let events = events.lock().unwrap();
         let items: Vec<_> = events.iter().filter(|e| e["type"] == "item").map(|e| &e["item"]).collect();
+        assert_eq!(items.len(), 5, "internal scene switches must not create visible tool cards");
         assert_eq!(items[0]["id"], items[1]["id"]);
         assert_eq!(items[1]["text"], "hello world");
         assert_eq!(items[2]["status"], "in_progress");

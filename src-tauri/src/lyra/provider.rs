@@ -188,6 +188,12 @@ pub(crate) fn drop_old_tool_images(messages: &[Value]) -> Option<Vec<Value>> {
 /// 工具结果文本与要内嵌的图片；剑来旧关键帧组的图换成路径/imageId 说明，需要时由模型再读。
 fn tool_result_parts(message: &Value, model: &ResolvedModel, embeds: &[Embed]) -> (String, Vec<Value>) {
     let mut text = tool_result_text(message);
+    if !model.supports_images && (message["content"].as_array().is_some_and(|parts|
+        parts.iter().any(|part| matches!(part["type"].as_str(), Some("image" | "image_url"))))
+        || !detail_images(message).is_empty()
+        || message.pointer("/details/imagePath").is_some_and(Value::is_string)) {
+        text.push_str("\n\n[历史图片已省略：当前模型不支持图片输入]");
+    }
     let omitted: Vec<String> = detail_images(message).iter().zip(embeds)
         .filter(|(_, e)| **e == Embed::Omit)
         .filter_map(|(image, _)| image["path"].as_str().map(|path| if image["deltaOf"].is_string() {
@@ -329,10 +335,12 @@ fn completions_messages(
                         .filter_map(|part| part.get("thinking").and_then(Value::as_str))
                         .collect::<Vec<_>>()
                         .concat();
-                    // DeepSeek/Console Go 的 thinking 模式要求每条带 tool_calls 的 assistant
-                    // 历史都显式回传 reasoning_content；运行时合成工具调用可能只有决策轨迹。
+                    // 带 tool_calls 的历史必须显式回传 reasoning_content；异源或来源未知时
+                    // 保留空字段，不能把其他模型的思考当作当前模型的推理轨迹。
                     if !thinking.is_empty() || !tool_calls.is_empty() {
-                        item.insert("reasoning_content".into(), json!(thinking));
+                        let same_model = message["api"] == model.api && message["provider"] == model.provider
+                            && message["model"] == model.id;
+                        item.insert("reasoning_content".into(), json!(if same_model { thinking } else { String::new() }));
                     }
                 }
                 if model.thinking_format.as_deref() == Some("openrouter")
@@ -1936,13 +1944,17 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                                     "type": "text",
                                     "text": block.get("text").and_then(Value::as_str).unwrap_or_default()
                                 })),
-                                Some("image") => parts.push(json!({
+                                Some("image") if model.supports_images => parts.push(json!({
                                     "type": "image",
                                     "source": {
                                         "type": "base64",
                                         "media_type": block.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
                                         "data": block.get("data").and_then(Value::as_str).unwrap_or_default(),
                                     }
+                                })),
+                                Some("image" | "image_url") if !model.supports_images => parts.push(json!({
+                                    "type": "text",
+                                    "text": "[历史图片已省略：当前模型不支持图片输入]"
                                 })),
                                 _ => {}
                             }
@@ -2916,16 +2928,71 @@ mod tests {
 
     #[test]
     fn text_only_model_downgrades_legacy_images() {
-        let mut model = test_model("openai-completions");
-        model.supports_images = false;
         let messages = vec![json!({ "role": "user", "content": [
             { "type": "text", "text": "看图" },
             { "type": "image", "mimeType": "image/png", "data": "QUJD" },
             { "type": "image_url", "image_url": { "url": "data:image/png;base64,QUJD" } }
         ]})];
-        let out = completions_messages("sys", &messages, &model);
-        assert_eq!(out[1]["content"][1]["type"], "text");
-        assert_eq!(out[1]["content"][2]["type"], "text");
+        let original = messages.clone();
+        for api in ["openai-completions", "openai-responses", "anthropic-messages"] {
+            let mut model = test_model(api);
+            model.supports_images = false;
+            let parts = match api {
+                "openai-completions" => completions_messages("sys", &messages, &model)[1]["content"].clone(),
+                "openai-responses" => responses_input(&messages, &model)[0]["content"].clone(),
+                _ => anthropic_messages(&messages, &model)[0]["content"].clone(),
+            };
+            let kind = if api == "openai-responses" { "input_text" } else { "text" };
+            assert_eq!(parts, json!([
+                {"type":kind,"text":"看图"},
+                {"type":kind,"text":"[历史图片已省略：当前模型不支持图片输入]"},
+                {"type":kind,"text":"[历史图片已省略：当前模型不支持图片输入]"}
+            ]), "{api}");
+            // 切回视觉模型时，原始图片仍可发送。
+            model.supports_images = true;
+            let image_only = [json!({"role":"user","content":[messages[0]["content"][1]]})];
+            let image = match api {
+                "openai-completions" => completions_messages("", &image_only, &model)[1]["content"][0]["image_url"]["url"].clone(),
+                "openai-responses" => responses_input(&image_only, &model)[0]["content"][0]["image_url"].clone(),
+                _ => anthropic_messages(&image_only, &model)[0]["content"][0]["source"]["data"].clone(),
+            };
+            assert_eq!(image, if api == "anthropic-messages" { "QUJD" } else { "data:image/png;base64,QUJD" });
+        }
+        assert_eq!(messages, original);
+    }
+
+    #[test]
+    fn text_only_tool_images_are_explicitly_omitted_in_all_protocols() {
+        for (image, details) in [
+            (json!({"type":"image","mimeType":"image/png","data":"QUJD"}), Value::Null),
+            (json!({"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}), Value::Null),
+            (Value::Null, json!({"images":[{"path":"screenshot.png","imageId":"shot"}]})),
+            (Value::Null, json!({"imagePath":"screenshot.png"})),
+            (Value::Null, Value::Null),
+        ] {
+            let has_image = !image.is_null() || !details.is_null();
+            let mut message = json!({"role":"toolResult","toolCallId":"call-1","toolName":"read",
+                "content":[{"type":"text","text":"tool text"}],"details":details});
+            if !image.is_null() { message["content"].as_array_mut().unwrap().push(image); }
+            let original = message.clone();
+            let messages = std::slice::from_ref(&message);
+            let expected = if has_image { "tool text\n\n[历史图片已省略：当前模型不支持图片输入]" } else { "tool text" };
+            for api in ["openai-completions", "openai-responses", "anthropic-messages"] {
+                let mut model = test_model(api);
+                model.supports_images = false;
+                match api {
+                    "openai-completions" => {
+                        let out = completions_messages("", messages, &model);
+                        assert_eq!(&out[1..], &[json!({"role":"tool","tool_call_id":"call-1","content":expected})]);
+                    }
+                    "openai-responses" => assert_eq!(responses_input(messages, &model), vec![json!({
+                        "type":"function_call_output","call_id":"call-1","output":expected})]),
+                    _ => assert_eq!(anthropic_messages(messages, &model), vec![json!({"role":"user","content":[{
+                        "type":"tool_result","tool_use_id":"call-1","content":[{"type":"text","text":expected}],"is_error":false}]})]),
+                }
+            }
+            assert_eq!(message, original);
+        }
     }
 
     #[test]
@@ -3481,7 +3548,43 @@ mod tests {
         completion_reasoning(&json!({"reasoning_content":"original\ntext"}), &mut result, &mut Vec::new(), &mut |_| {});
         model.requires_reasoning_content = true;
         result.content.push(json!({"type":"thinking","thinking":"tail"}));
-        assert_eq!(completions_messages("", &[json!({"role":"assistant","content":result.content})], &model)[1]["reasoning_content"], "original\ntexttail");
+        let message = json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,"content":result.content});
+        assert_eq!(completions_messages("", &[message], &model)[1]["reasoning_content"], "original\ntexttail");
+    }
+
+    #[test]
+    fn completions_reasoning_content_is_scoped_to_source_model() {
+        let mut model = test_model("openai-completions");
+        model.requires_reasoning_content = true;
+        let message = json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,"content":[
+            {"type":"thinking","thinking":"private reasoning"},
+            {"type":"text","text":"visible reply"},
+            {"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"a"}}
+        ]});
+        let original = message.clone();
+        let mut expected = completions_messages("", std::slice::from_ref(&message), &model)[1].clone();
+        assert_eq!(expected["reasoning_content"], "private reasoning");
+        expected["reasoning_content"] = json!("");
+        for key in ["api", "provider", "model"] {
+            for replacement in [Some("other"), None] {
+                let mut foreign = message.clone();
+                match replacement {
+                    Some(value) => { foreign[key] = json!(value); }
+                    None => { foreign.as_object_mut().unwrap().remove(key); }
+                }
+                let before = foreign.clone();
+                assert_eq!(completions_messages("", std::slice::from_ref(&foreign), &model)[1], expected, "{key}: {replacement:?}");
+                assert_eq!(foreign, before);
+            }
+        }
+        let mut no_thinking = message.clone();
+        no_thinking["content"].as_array_mut().unwrap().remove(0);
+        assert_eq!(completions_messages("", &[no_thinking], &model)[1], expected);
+        let foreign_text = json!({"role":"assistant","content":[
+            {"type":"thinking","thinking":"private reasoning"},{"type":"text","text":"visible reply"}]});
+        assert_eq!(completions_messages("", &[foreign_text], &model)[1], json!({
+            "role":"assistant","content":"visible reply","reasoning_content":""}));
+        assert_eq!(message, original);
     }
 
     #[test]

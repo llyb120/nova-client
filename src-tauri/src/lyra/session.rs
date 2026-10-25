@@ -2,7 +2,7 @@
 //! 用 send_message / followup_task / wait_agent / list_agents / interrupt_agent / close_agent 协作。
 //! 子 agent 继承主 agent 的模型、工具与工作目录，独立 rollout/context；重启后仅显式 followup 恢复，深度上限 1。
 //! Nova 中额外把任务和执行事件投影到只读 Stage，展示记录落盘，不参与调度。
-//! 场景转交子任务的 Stage 会话本身落盘：注册表里找不到时（如 Nova 重启后）按 task_name 从会话存储找回继续用。
+//! 兼容旧场景 Stage 记录的显式 followup；新场景工作在父会话内临时切模型，不再创建 Stage。
 
 use crate::lyra::context::ContextWindow;
 use crate::lyra::history::{text_content, user_message, History};
@@ -65,7 +65,7 @@ impl ChildSettings {
     fn from_parent(parent: &Session, record: Option<&AgentRecord>) -> Result<Self, String> {
         let read_only = parent.read_only || record.is_some_and(|r| r.read_only);
         let tools = parent.tools.iter().filter(|t| {
-            !is_agent_tool(t.name) && record.is_none_or(|r| r.tools.iter().any(|name| name == t.name))
+            !is_agent_tool(t.name) && t.name != crate::lyra::scene::TOOL && record.is_none_or(|r| r.tools.iter().any(|name| name == t.name))
                 && (!read_only || matches!(t.name, "read" | "polaris" | "recall" | "context_budget" | "change_working_directory" | "mcp"))
         }).map(|t| Tool { name: t.name, description: t.description.clone(), parameters: t.parameters.clone() }).collect();
         Ok(Self {
@@ -238,20 +238,7 @@ pub fn is_agent_tool(name: &str) -> bool {
     AGENT_TOOLS.contains(&name)
 }
 
-/// 自动模式会话可按场景转交：spawn_agent 增加 scene 参数，只列出模型不同且不在上游链上的场景。
-fn scene_param(handoff: &[Scene]) -> (String, Value) {
-    let scenes = handoff.iter().map(|s| format!("{}={}（{}）", s.key(), s.label(), s.when())).collect::<Vec<_>>().join("；");
-    (
-        " Auto mode: when a whole chunk of work fits one of the scene options, pass scene to hand it off to that scene's model in its own Stage session (it sees this conversation and closes the loop itself); then wait_agent for the final result instead of directing it step by step. If the result says escalated, this session itself switches to that scene's model after your turn: tell the user in one sentence and end the turn instead of wait_agent. To continue or correct an existing scene agent (even from an earlier turn), use followup_task on its task_name instead of spawning another.".into(),
-        json!({ "type": "string", "enum": handoff.iter().map(|s| s.key()).collect::<Vec<_>>(), "description": format!("optional handoff scene: {scenes}. Omit for an in-process helper on this model.") }),
-    )
-}
-
-fn cwd_param() -> Value {
-    json!({ "type": "string", "description": "with scene: absolute project directory for the handoff session; default is this session's directory" })
-}
-
-pub fn agent_tools(handoff: Option<Vec<Scene>>) -> Vec<Tool> {
+pub fn agent_tools() -> Vec<Tool> {
     let target = json!({ "type": "string", "description": "agent path from spawn_agent/list_agents, or its task_name" });
     let target_and_message = json!({
         "type": "object",
@@ -259,7 +246,7 @@ pub fn agent_tools(handoff: Option<Vec<Scene>>) -> Vec<Tool> {
         "required": ["target", "message"]
     });
     let target_only = json!({ "type": "object", "properties": { "target": target }, "required": ["target"] });
-    let mut spawn = Tool {
+    let spawn = Tool {
         name: "spawn_agent",
         description: format!("Start a sub-agent on a self-contained task; it runs in the background with your tools and working directory. Use for independent work that can proceed in parallel, then wait_agent for results. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
         parameters: json!({
@@ -272,12 +259,6 @@ pub fn agent_tools(handoff: Option<Vec<Scene>>) -> Vec<Tool> {
             "required": ["task_name", "message"]
         }),
     };
-    if let Some(handoff) = handoff {
-        let (hint, param) = scene_param(&handoff);
-        spawn.description.push_str(&hint);
-        spawn.parameters["properties"]["scene"] = param;
-        spawn.parameters["properties"]["cwd"] = cwd_param();
-    }
     vec![
         spawn,
         Tool {
@@ -485,10 +466,7 @@ pub async fn call(handle: &AgentHandle, parent: &Session, name: &str, args: &Val
     }
     let result = match name {
         "spawn_agent" if args.get("scene").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) => {
-            match &handle.stage_parent {
-                Some((app, parent_id)) => scene_spawn(handle, app, parent_id, args),
-                None => Err("scene handoff requires a Nova session".into()),
-            }
+            Err("场景不再创建子会话：使用 switch_scene 在本会话临时切模型；没有该工具时请直接完成。".into())
         }
         "spawn_agent" => spawn(handle, parent, args),
         "list_agents" => Ok(handle.report(args.get("path_prefix").and_then(Value::as_str))),
@@ -634,41 +612,6 @@ fn new_child(message: Option<&str>, stage: Option<Stage>, scene_thread: Option<S
         scene_thread: Mutex::new(scene_thread),
     });
     Ok((child, rx))
-}
-
-/// 场景转交：子任务在场景模型（可跨后端）的 Stage 会话里独立闭环，主 agent 只等最终结果。
-fn scene_spawn(handle: &AgentHandle, app: &tauri::AppHandle, parent_id: &str, args: &Value) -> Result<Value, String> {
-    let scene = args
-        .get("scene")
-        .and_then(Value::as_str)
-        .and_then(Scene::parse)
-        .ok_or("scene must be lightweight, coding or computer")?;
-    let cwd = args.get("cwd").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
-    {
-        use tauri::Manager;
-        let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
-        if crate::request_escalation(&app.state(), parent_id, scene, cwd.as_deref(), message)? {
-            return Ok(json!({ "ok": true, "escalated": true, "next": "已登记切换为编码模型：本轮结束后本会话会切换到编码模型，带着全部上下文按 message 继续。现在用一句话告诉用户马上开始动手，然后立即结束本轮；不要再调用工具，也不要 wait_agent。" }));
-        }
-    }
-    let (task_name, message, path, mut agents) = reserve(handle, args)?;
-    let Some(thread_id) = crate::create_scene_stage(app, parent_id, scene, task_name, cwd.as_deref(), 0)? else {
-        return Ok(json!({ "ok": false, "next": "该场景的模型与当前会话相同，不要转交，直接在本会话完成。" }));
-    };
-    let (child, rx) = new_child(Some(message), None, Some(thread_id.clone()))?;
-    agents.insert(path.clone(), child.clone());
-    drop(agents);
-    tauri::async_runtime::spawn(scene_loop(
-        child,
-        app.clone(),
-        parent_id.to_string(),
-        scene,
-        task_name.to_string(),
-        cwd,
-        rx,
-        handle.registry.clone(),
-    ));
-    Ok(json!({ "path": path, "status": "pending_init", "threadId": thread_id }))
 }
 
 async fn scene_loop(
@@ -833,7 +776,7 @@ fn child_session(parent: &Session, child: &Child, fresh: Option<(String, Vec<Val
         system_prompt: settings.system_prompt, tools: settings.tools, read_only: settings.read_only,
         cwd: settings.cwd, shell: settings.shell, session_id, sessions_root: parent.sessions_root.clone(),
         archive_dir, history, context, mcp_config, mcp,
-        cancelled: child.cancelled.clone(), steer: child.steer.clone(), agents: None,
+        cancelled: child.cancelled.clone(), steer: child.steer.clone(), agents: None, scenes: None,
     })
 }
 
