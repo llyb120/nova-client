@@ -555,8 +555,8 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
               <p class="field-hint">支持 stdio 与 Streamable HTTP：stdio 使用 command、args、env、cwd（可选，须为绝对路径；省略时固定为会话初始目录）；Streamable HTTP 使用 url、headers（http:// 仅限本机地址），不可混填，字段值不能为 null。不支持旧 SSE 入口、OAuth、resources、prompts 或 sampling。env 与 headers 支持 {"{env:NAME}"} 占位符，保存时保留引用、不展开环境变量。服务器配置仅接受这些字段及 enabled、readOnlyTools、两个超时字段；最多 64 个服务器。</p>
               <p class="field-hint">startup_timeout_ms（启动）与 request_timeout_ms（请求）单位为毫秒，可选，默认分别为 10000、30000，范围 1–600000。启用前请替换示例地址或命令并确认权限；JSON 会以明文保存在配置文件中，敏感值优先使用环境变量引用，不要分享含密钥的配置。</p>
             </details>
+          </div>
         </div>
-        </details>
       </Show>
       <details class="lyra-file-settings" open={!loaded()}>
         <summary>配置文件与重新加载</summary>
@@ -566,8 +566,6 @@ export function LyraConfigPanel(props: { onSaver: (save: () => Promise<void>) =>
           <span class="field-hint" role="status" aria-live="polite">{reloadMsg()}</span>
         </div>
       </details>
-        </div>
-      </Show>
     </section>
   );
 }
