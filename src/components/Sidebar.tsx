@@ -465,6 +465,9 @@ export function Sidebar(props: {
         <Show when={activeThread().agentKind === "lyra"}>
           <span class="thread-agent lyra lyra-thread-logo" title="Lyra">
             <IconLyra size={15} />
+            <Show when={unreadCount() > 0}>
+              <span class="thread-unread-badge">{unreadCount() > 9 ? "9+" : unreadCount()}</span>
+            </Show>
           </span>
         </Show>
         <span class="thread-content">
@@ -506,7 +509,7 @@ export function Sidebar(props: {
             临时
           </span>
         </Show>
-        <Show when={unreadCount() > 0}>
+        <Show when={unreadCount() > 0 && activeThread().agentKind !== "lyra"}>
           <span class="thread-unread-badge">
             {unreadCount() > 9 ? "9+" : unreadCount()}
           </span>

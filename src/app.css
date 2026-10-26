@@ -832,6 +832,7 @@ button {
 }
 
 .thread-item .lyra-thread-logo {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -843,6 +844,10 @@ button {
 }
 .lyra-thread-logo svg {
   display: block;
+}
+/* Lyra 徽标上的未读数沿用角标样式，覆盖侧栏的行内规则 */
+.thread-item .lyra-thread-logo .thread-unread-badge {
+  position: absolute;
 }
 
 .auto-mode-badge {
