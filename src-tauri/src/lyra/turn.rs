@@ -1,6 +1,6 @@
 //! Codex 式 turn 循环：规范历史 → 上下文视图 → 流式请求 → 工具派发 → 追加结果，直到模型不再调用工具
-//! 且没有待消化的 steer。只读工具在参数完整时（`ToolCallDone`）即提前派发；有副作用的工具按出现顺序
-//! 串行，且其后的调用不再提前派发，保证“先改后读”看到新内容。provider 失败最多重试 5 次（指数退避 +
+//! 且没有待消化的 steer。只读工具在参数完整时（`ToolCallDone`）即提前派发；同轮独立命令自动并发，
+//! 文件修改、会话状态和共享屏幕保留顺序，副作用之后不再提前派发。provider 失败最多重试 5 次（指数退避 +
 //! 抖动），上下文超限先按 Reasonix 折叠再重试一次。失败的 assistant 占位从不入史，重试无需回滚。
 
 use crate::lyra::config::Resolved;
@@ -10,7 +10,7 @@ use crate::lyra::prompt::{is_context_window_error, is_retryable_provider_error, 
 use crate::lyra::provider::{drop_old_tool_images, is_payload_too_large, is_retryable_stream_error, stream_chat, StreamEvent};
 use crate::lyra::session::{self, AgentHandle};
 use crate::lyra::tools::{execute, Tool, ToolOutcome};
-use futures_util::{stream, StreamExt};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -78,9 +78,36 @@ fn early_safe(name: &str) -> bool {
     matches!(name, "read" | "polaris")
 }
 
-/// 可与相邻同类调用并发执行的工具（只读、不改会话状态）。
-fn parallel_safe(name: &str) -> bool {
-    early_safe(name) || matches!(name, "context_budget" | "list_agents" | "wait_agent")
+const MAX_CONCURRENT_TOOLS: usize = 4;
+
+fn tool_barrier(name: &str) -> bool {
+    !matches!(name, "read" | "polaris" | "edit" | "write" | "bash" | "exec_command" | "write_stdin"
+        | "chrome" | "jianlai" | "generate_image" | "edit_image" | "context_budget" | "spawn_agent")
+}
+
+/// 确知的共享资源按出现顺序执行；不透明命令的业务依赖由模型用 _after 声明。
+fn tools_conflict(left: &(String, String, Value), right: &(String, String, Value)) -> bool {
+    let (a, b) = (left.1.as_str(), right.1.as_str());
+    if screen_tool(a) && screen_tool(b) { return true; }
+    // ponytail: 文件修改与文件读取/检索保守互斥（不同文件也串行）；按真实路径建锁后可放宽。
+    let file = |name| matches!(name, "read" | "polaris" | "write" | "edit");
+    let mutation = |name| matches!(name, "write" | "edit");
+    if file(a) && file(b) && (mutation(a) || mutation(b)) { return true; }
+    let key = match (a, b) {
+        ("bash" | "exec_command", "bash" | "exec_command") => "command",
+        ("write_stdin", "write_stdin") => "session_id",
+        ("spawn_agent", "spawn_agent") => "task_name",
+        _ => return false,
+    };
+    left.2.get(key).is_none() || right.2.get(key).is_none() || left.2[key] == right.2[key]
+}
+
+fn tool_dependencies(args: &Value, index: usize) -> Result<Vec<usize>, String> {
+    let Some(value) = args.get("_after") else { return Ok(Vec::new()); };
+    let deps = value.as_array().filter(|deps| deps.len() <= 64)
+        .ok_or("_after 必须是最多 64 项的前置调用序号数组；本项未执行")?;
+    deps.iter().map(|value| value.as_u64().filter(|n| *n > 0 && *n <= index as u64)
+        .map(|n| n as usize - 1).ok_or_else(|| "_after 只能引用本轮更早的调用（从 1 开始），不得引用自身或未来调用；本项未执行".into())).collect()
 }
 
 /// 操作同一块屏幕的工具跨 agent 互斥。
@@ -93,24 +120,9 @@ fn screen_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// 会话内置工具：上下文管理与一次请求内的独立工具批量执行。
+/// 上下文机制自带的工具：`recall` 读回折叠原文，`context_budget` 报告剩余空间。
 pub fn context_tools() -> Vec<Tool> {
     vec![
-        Tool {
-            name: "parallel",
-            description: "一次提交 2–8 项互不依赖的工具调用，运行时最多同时执行 4 项，全部结束后一次返回结果，减少模型往返。tool 必须是当前已声明工具名，arguments 使用该工具原有参数。仅当各项参数已知、无结果依赖且不争用文件/终端/页面等资源时使用；不要把修改和验证、启动任务和等待结果放在一起。禁止嵌套 parallel、切目录、切模型、recall、wait_agent；浏览器/桌面工具每批最多一项，连续界面步骤用其 run。批次有错误不自动重试成功项。".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "calls": {
-                    "type": "array", "minItems": 2, "maxItems": 8,
-                    "items": { "type": "object", "properties": {
-                        "tool": { "type": "string" },
-                        "arguments": { "type": "object" }
-                    }, "required": ["tool", "arguments"], "additionalProperties": false }
-                } },
-                "required": ["calls"], "additionalProperties": false
-            }),
-        },
         Tool {
             name: "recall",
             description: "Read back messages that compaction folded out of your context. The fold summary indexes them as #n; pass those numbers in `positions` to read the originals, or pass `query` to search the folded part. Budgeted per fold, so ask only for what you need.".into(),
@@ -197,6 +209,13 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 on_event(TurnEvent::Steer(message.clone()));
                 s.history.record(message);
             }
+            // 每轮重新检查，覆盖切换场景后替换的工具集；元数据仅供调度，调用前剥离。
+            for tool in &mut s.tools {
+                if let Some(properties) = tool.parameters.get_mut("properties").and_then(Value::as_object_mut) {
+                    properties.entry("_after").or_insert_with(|| json!({"type":"array", "items":{"type":"integer","minimum":1},
+                        "maxItems":64, "description":"可选：必须先成功完成的本轮工具调用序号（从1开始，仅限更早调用）。省略表示独立，可自动并发。参数已知的依赖步骤可同轮提交；依赖失败则本项跳过。界面/agent/MCP结果须模型确认，不能作为自动后继的前置。不传给实际工具。"}));
+                }
+            }
             s.context.set_prompt_policy(turn_start, s.strips_reasoning());
             if s.context.should_compact(s.history.items()) {
                 compact(s, Trigger::Auto, on_event).await;
@@ -226,7 +245,8 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                         StreamEvent::TextDelta(delta) => on_event(TurnEvent::TextDelta(delta)),
                         StreamEvent::ThinkingDelta(delta) => on_event(TurnEvent::ThinkingDelta(delta)),
                         StreamEvent::ToolCallDone { id, name, arguments } => {
-                            blocked |= !early_safe(&name) || id.is_empty() || !allowed.contains(&name.as_str());
+                            blocked |= !early_safe(&name) || arguments.get("_after").is_some()
+                                || id.is_empty() || !allowed.contains(&name.as_str()) || early.len() >= MAX_CONCURRENT_TOOLS;
                             if blocked {
                                 return;
                             }
@@ -371,89 +391,102 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
     })
 }
 
-/// 按顺序执行：相邻的可并发调用一起跑（提前派发的直接取结果），其余逐个串行。
+/// 原生调用按依赖就绪即启动，长任务不阻塞无关短链；完成即上报、按原序入史。
 async fn run_tools(
     s: &mut Session,
     calls: &[(String, String, Value)],
     mut early: Vec<(String, String, Value, tokio::task::JoinHandle<ToolOutcome>)>,
     on_event: Sink<'_>,
 ) -> Vec<Value> {
-    for (id, name, args) in calls {
-        on_event(TurnEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-    }
-    let mut results = Vec::new();
-    let mut i = 0;
-    while i < calls.len() {
-        if s.cancelled.load(Ordering::SeqCst) {
-            for (id, name, _) in &calls[i..] {
-                results.push(finish(id, name, text_outcome(CANCELLED_TEXT, true), on_event));
+    let deps: Vec<_> = calls.iter().enumerate().map(|(i, (_, _, args))| tool_dependencies(args, i)).collect();
+    let mut results: Vec<Option<Value>> = vec![None; calls.len()];
+    let mut launched = vec![false; calls.len()];
+    let mut start = 0;
+    while start < calls.len() {
+        let blocked = |i: usize, results: &[Option<Value>]| -> Option<String> {
+            if s.cancelled.load(Ordering::SeqCst) { return Some(CANCELLED_TEXT.into()); }
+            match &deps[i] {
+                Err(error) => Some(error.clone()),
+                Ok(deps) if deps.iter().any(|&d| results[d].as_ref().is_some_and(|r| r["isError"] == true)) =>
+                    Some("前置调用失败或被跳过，本项未执行；不要重放已经成功的调用".into()),
+                Ok(deps) if deps.iter().any(|&d| results[d].as_ref().is_some_and(|r| r["details"]["status"] == "running")) =>
+                    Some("前置命令仍在后台运行，本项未执行；先用 write_stdin 确认完成，不能把启动成功当作任务完成".into()),
+                Ok(deps) if deps.iter().any(|&d| screen_tool(&calls[d].1) || session::is_agent_tool(&calls[d].1)
+                    || calls[d].1 == crate::lyra::mcp::TOOL_NAME) =>
+                    Some("前置界面/agent/MCP 调用需回读结果确认业务成功，本项未执行；不能把工具返回当作任务成功".into()),
+                _ => None,
             }
-            break;
-        }
-        let run = if parallel_safe(&calls[i].1) {
-            calls[i..].iter().take_while(|(_, name, _)| parallel_safe(name)).count()
-        } else {
-            1
         };
-        let batch = &calls[i..i + run];
-        let outcomes: Vec<ToolOutcome> = if calls[i].1 == crate::lyra::scene::TOOL && s.tools.iter().any(|tool| tool.name == crate::lyra::scene::TOOL) {
-            vec![if calls.len() != 1 {
-                text_outcome("switch_scene 必须单独调用，不能与其他工具合批；本次未切换模型。", true)
+        if tool_barrier(&calls[start].1) {
+            let (id, name, args) = &calls[start];
+            on_event(TurnEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
+            let error = blocked(start, &results);
+            let mut outcome = if let Some(error) = error {
+                text_outcome(error, true)
+            } else if !s.tools.iter().any(|tool| tool.name == name) {
+                text_outcome(format!("当前会话未授权工具：{name}"), true)
+            } else if name == crate::lyra::scene::TOOL {
+                if calls.len() != 1 { text_outcome("switch_scene 必须单独调用，不能与其他工具合批；本次未切换模型。", true) }
+                else { crate::lyra::scene::switch(s, args) }
+            } else if name == "recall" {
+                recall(s, args)
             } else {
-                crate::lyra::scene::switch(s, &calls[i].2)
-            }]
-        } else if run == 1 && calls[i].1 == "recall" && s.tools.iter().any(|tool| tool.name == "recall") {
-            vec![recall(s, &calls[i].2)]
-        } else if calls[i].1 == "parallel" && s.tools.iter().any(|tool| tool.name == "parallel") {
-            vec![run_parallel(s, &calls[i].0, &calls[i].2, on_event).await]
-        } else {
-            let handles: Vec<_> = batch
-                .iter()
-                .map(|(id, name, args)| {
-                    early
-                        .iter()
-                        .position(|(eid, ename, eargs, _)| eid == id && ename == name && eargs == args)
-                        .map(|at| early.swap_remove(at).3)
-                })
-                .collect();
-            let shared: &Session = s;
-            futures_util::future::join_all(batch.iter().zip(handles).map(|((id, name, args), handle)| async move {
-                match handle {
-                    Some(handle) => handle
-                        .await
-                        .unwrap_or_else(|error| text_outcome(format!("工具执行失败：{error}"), true)),
-                    None => call_tool(shared, id, name, args).await,
-                }
-            }))
-            .await
-        };
-        for ((id, name, _), mut outcome) in batch.iter().zip(outcomes) {
+                call_tool(s, id, name, args).await
+            };
             if name == "change_working_directory" && !outcome.is_error {
-                if let Some(cwd) = outcome
-                    .details
-                    .as_ref()
-                    .and_then(|d| d.get("workingDirectory"))
-                    .and_then(Value::as_str)
-                {
+                if let Some(cwd) = outcome.details.as_ref().and_then(|d| d.get("workingDirectory")).and_then(Value::as_str) {
                     s.cwd = PathBuf::from(cwd);
-                    // 新目录下重新初始化按需连接，旧 schema 授权不能跨目录复用。
                     s.mcp.get_mut().close();
                     match crate::lyra::mcp::McpSession::new(s.mcp_config.clone(), s.cwd.clone(), s.read_only) {
                         Ok(next) => *s.mcp.get_mut() = next,
                         Err(error) => {
                             s.tools.retain(|tool| tool.name != crate::lyra::mcp::TOOL_NAME);
                             crate::lyra::scene::disable_tool(s, crate::lyra::mcp::TOOL_NAME);
-                            outcome.content.push(json!({ "type": "text", "text": format!("工作目录已切换；MCP 重新初始化失败，已禁用：{error}") }));
+                            outcome.content.push(json!({"type":"text", "text":format!("工作目录已切换；MCP 重新初始化失败，已禁用：{error}")}));
                         }
                     }
                 }
             }
-            results.push(finish(id, name, outcome, on_event));
+            results[start] = Some(finish(id, name, outcome, on_event));
+            start += 1;
+            continue;
         }
-        i += run;
+        let end = (start..calls.len()).find(|&i| tool_barrier(&calls[i].1)).unwrap_or(calls.len());
+        let shared: &Session = s;
+        let mut running: FuturesUnordered<BoxFuture<'_, (usize, ToolOutcome)>> = FuturesUnordered::new();
+        loop {
+            // ponytail: 同轮调用通常很少，O(n²)扫描优先简单；大批量时改成入度/后继队列。
+            for i in start..end {
+                if launched[i] || results[i].is_some() { continue; }
+                let error = blocked(i, &results);
+                if error.is_none() && (deps[i].as_ref().unwrap().iter().any(|&d| results[d].is_none())
+                    || (start..i).any(|j| results[j].is_none() && tools_conflict(&calls[j], &calls[i]))) { continue; }
+                if error.is_none() && running.len() >= MAX_CONCURRENT_TOOLS { break; }
+                let (id, name, args) = &calls[i];
+                on_event(TurnEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
+                if let Some(error) = error {
+                    results[i] = Some(finish(id, name, text_outcome(error, true), on_event));
+                    continue;
+                }
+                launched[i] = true;
+                let handle = early.iter().position(|(eid, ename, eargs, _)| eid == id && ename == name && eargs == args)
+                    .map(|at| early.swap_remove(at).3);
+                running.push(Box::pin(async move {
+                    let outcome = match handle {
+                        Some(handle) => handle.await.unwrap_or_else(|error| text_outcome(format!("工具执行失败：{error}"), true)),
+                        None if shared.cancelled.load(Ordering::SeqCst) => text_outcome(CANCELLED_TEXT, true),
+                        None => call_tool(shared, id, name, args).await,
+                    };
+                    (i, outcome)
+                }));
+            }
+            let Some((i, outcome)) = running.next().await else { break; };
+            results[i] = Some(finish(&calls[i].0, &calls[i].1, outcome, on_event));
+        }
+        start = end;
     }
     early.iter().for_each(|(.., handle)| handle.abort());
-    results
+    results.into_iter().map(|result| result.expect("every scheduled call has a result")).collect()
 }
 
 fn finish(id: &str, name: &str, outcome: ToolOutcome, on_event: Sink<'_>) -> Value {
@@ -470,70 +503,15 @@ fn finish(id: &str, name: &str, outcome: ToolOutcome, on_event: Sink<'_>) -> Val
     message
 }
 
-async fn run_parallel(s: &Session, id: &str, args: &Value, on_event: Sink<'_>) -> ToolOutcome {
-    let Some(calls) = args.get("calls").and_then(Value::as_array).filter(|calls| (2..=8).contains(&calls.len())) else {
-        return text_outcome("parallel 需要 2–8 项 calls；本批未执行", true);
-    };
-    // 先验证整批再启动，不能执行了一部分才发现越权或会话屏障。
-    let mut screens = 0;
-    for call in calls {
-        let Some(name) = call.get("tool").and_then(Value::as_str) else {
-            return text_outcome("parallel 每项需要 tool 和对象类型 arguments；本批未执行", true);
-        };
-        if !call.get("arguments").is_some_and(Value::is_object) {
-            return text_outcome("parallel 每项需要对象类型 arguments；本批未执行", true);
-        }
-        if !s.tools.iter().any(|tool| tool.name == name) {
-            return text_outcome(format!("当前会话未授权工具：{name}；本批未执行"), true);
-        }
-        if matches!(name, "parallel" | "change_working_directory" | "recall" | "wait_agent") || name == crate::lyra::scene::TOOL {
-            return text_outcome(format!("{name} 必须在 parallel 外单独调用；本批未执行"), true);
-        }
-        screens += usize::from(screen_tool(name));
-        if screens > 1 {
-            return text_outcome("parallel 每批最多一项浏览器/桌面调用；连续界面步骤请用 run；本批未执行", true);
-        }
-    }
-    // ponytail: 独立性由调用方声明，不推断任意 shell/MCP 的副作用；需要自动判定时再引入资源声明。
-    let mut running = stream::iter(calls.iter().enumerate().map(|(index, call)| {
-        let sub_id = format!("{id}-{index}");
-        let name = call["tool"].as_str().unwrap();
-        on_event(TurnEvent::ToolStart { id: sub_id.clone(), name: name.into(), args: call["arguments"].clone() });
-        async move {
-            let outcome = if s.cancelled.load(Ordering::SeqCst) {
-                text_outcome(CANCELLED_TEXT, true)
-            } else {
-                call_tool(s, &sub_id, name, &call["arguments"]).await
-            };
-            (index, sub_id, name, outcome)
-        }
-    }).collect::<Vec<_>>()).buffer_unordered(4);
-    let mut results = vec![Value::Null; calls.len()];
-    while let Some((index, sub_id, name, outcome)) = running.next().await {
-        results[index] = finish(&sub_id, name, outcome, on_event);
-    }
-    let mut content = Vec::new();
-    for (index, result) in results.iter().enumerate() {
-        content.push(json!({"type":"text", "text":format!("[parallel {}: {} — {}]", index + 1,
-            result["toolName"].as_str().unwrap(), if result["isError"] == true { "error" } else { "ok" })}));
-        content.extend(crate::lyra::provider::batch_result_content(result, &s.model.model));
-    }
-    let is_error = results.iter().any(|result| result["isError"] == true);
-    let statuses: Vec<_> = results.iter().enumerate().map(|(index, result)| json!({
-        "index":index + 1, "tool":result["toolName"], "isError":result["isError"]
-    })).collect();
-    let mut outcome = crate::lyra::tools::govern(ToolOutcome { content, details: Some(json!({"results":results})), is_error },
-        "parallel", id, s.archive_dir.as_deref());
-    // 状态摘要不参与正文裁剪，防止中间成功项被截掉后误重放。
-    outcome.content.insert(0, json!({"type":"text", "text":format!("parallel results: {}. Only retry failed items; do not replay successful calls.", json!(statuses))}));
-    outcome
-}
-
 async fn call_tool(s: &Session, id: &str, name: &str, args: &Value) -> ToolOutcome {
     // 工具声明不是授权边界：兼容端点也可能返回未声明的调用，执行前统一拒绝。
     if !s.tools.iter().any(|tool| tool.name == name) {
         return text_outcome(format!("当前会话未授权工具：{name}"), true);
     }
+    if s.cancelled.load(Ordering::SeqCst) { return text_outcome(CANCELLED_TEXT, true); }
+    let mut args = args.clone();
+    if let Some(object) = args.as_object_mut() { object.remove("_after"); }
+    let args = &args;
     if name == "context_budget" {
         return text_outcome(s.context.budget_report(s.history.items()), false);
     }
@@ -548,7 +526,13 @@ async fn call_tool(s: &Session, id: &str, name: &str, args: &Value) -> ToolOutco
             None => text_outcome(format!("{name} 仅在主 agent 中可用"), true),
         };
     }
-    let _screen = if screen_tool(name) { Some(screen_lock().lock().await) } else { None };
+    let _screen = if screen_tool(name) {
+        Some(tokio::select! {
+            guard = screen_lock().lock() => guard,
+            _ = crate::lyra::provider::wait_cancelled(&s.cancelled) => return text_outcome(CANCELLED_TEXT, true),
+        })
+    } else { None };
+    if s.cancelled.load(Ordering::SeqCst) { return text_outcome(CANCELLED_TEXT, true); }
     execute(&s.cwd, name, args, s.shell.as_ref(), s.archive_dir.as_deref(), id, Some(&s.cancelled), &s.session_id).await
 }
 
@@ -741,102 +725,134 @@ pub(crate) mod tests {
         assert!(!dir.path().join("blocked.txt").exists());
     }
 
-    #[tokio::test]
-    async fn parallel_preflights_the_whole_batch_and_respects_cancellation() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
-        s.tools.extend(crate::lyra::tools::tool_set(true, false, false));
-        for invalid in [
-            json!({"tool":"write","arguments":{"path":"blocked.txt","content":"no"}}),
-            json!({"tool":"parallel","arguments":{"calls":[]}}),
-            json!({"tool":"recall","arguments":{}}),
-            json!({"tool":"read","arguments":"not an object"}),
-        ] {
-            let mut starts = 0;
-            let result = run_parallel(&s, "batch", &json!({"calls":[
-                {"tool":"context_budget","arguments":{}}, invalid
-            ]}), &mut |event| { if matches!(event, TurnEvent::ToolStart { .. }) { starts += 1; } }).await;
-            assert!(result.is_error);
-            assert_eq!(starts, 0, "invalid batches must not partially execute");
+    #[test]
+    fn native_dependencies_validate_and_conflicts_preserve_shared_resources() {
+        assert_eq!(tool_dependencies(&json!({"_after":[1,2]}), 2).unwrap(), vec![0,1]);
+        for value in [json!(null), json!("1"), json!([0]), json!([3]), json!([-1]), json!([1.5])] {
+            assert!(tool_dependencies(&json!({"_after":value}), 2).is_err());
         }
-        assert!(!dir.path().join("blocked.txt").exists());
-        for name in ["chrome", "jianlai", "wait_agent", "change_working_directory", crate::lyra::scene::TOOL] {
-            s.tools.push(Tool { name, description: String::new(), parameters: json!({}) });
-        }
-        for calls in [
-            json!([]),
-            json!(vec![json!({"tool":"context_budget","arguments":{}}); 9]),
-            json!([{"tool":"chrome","arguments":{}},{"tool":"jianlai","arguments":{}}]),
-            json!([{"tool":"context_budget","arguments":{}},{"tool":"wait_agent","arguments":{}}]),
-            json!([{"tool":"context_budget","arguments":{}},{"tool":"change_working_directory","arguments":{"path":"/tmp"}}]),
-            json!([{"tool":"context_budget","arguments":{}},{"tool":crate::lyra::scene::TOOL,"arguments":{}}]),
-        ] {
-            let result = run_parallel(&s, "invalid", &json!({"calls":calls}), &mut |_| panic!("invalid batch started")).await;
-            assert!(result.is_error);
-        }
-        s.cancelled.store(true, Ordering::SeqCst);
-        let result = run_parallel(&s, "cancelled", &json!({"calls":[
-            {"tool":"context_budget","arguments":{}}, {"tool":"read","arguments":{"path":"missing"}}
-        ]}), &mut |_| {}).await;
-        assert!(result.is_error);
-        assert!(result.details.unwrap()["results"].as_array().unwrap().iter()
-            .all(|result| result["content"][0]["text"] == CANCELLED_TEXT));
-    }
-
-    #[tokio::test]
-    async fn parallel_preserves_every_status_when_combined_output_is_trimmed() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("large.txt"), "x".repeat(30_000)).unwrap();
-        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
-        s.tools.extend(crate::lyra::tools::tool_set(true, false, false));
-        let result = run_parallel(&s, "large", &json!({"calls":[
-            {"tool":"read","arguments":{"path":"large.txt"}},
-            {"tool":"read","arguments":{"path":"missing.txt"}},
-            {"tool":"read","arguments":{"path":"large.txt"}}
-        ]}), &mut |_| {}).await;
-        assert!(result.is_error);
-        let summary = result.content[0]["text"].as_str().unwrap();
-        assert!(summary.contains(r#""index":1,"isError":false"#));
-        assert!(summary.contains(r#""index":2,"isError":true"#));
-        assert!(summary.contains(r#""index":3,"isError":false"#));
-        assert!(result.details.unwrap()["originalBytes"].as_u64().unwrap() > 32 * 1024);
+        let call = |name: &str, args| (String::new(), name.to_string(), args);
+        assert!(tools_conflict(&call("chrome", json!({})), &call("jianlai", json!({}))));
+        assert!(tools_conflict(&call("write_stdin", json!({"session_id":"a"})), &call("write_stdin", json!({"session_id":"a"}))));
+        assert!(!tools_conflict(&call("write_stdin", json!({"session_id":"a"})), &call("write_stdin", json!({"session_id":"b"}))));
+        assert!(tools_conflict(&call("write", json!({"path":"a"})), &call("read", json!({"path":"a"}))));
+        assert!(!context_tools().iter().any(|tool| tool.name == "parallel"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn parallel_overlaps_commands_and_returns_all_results_in_one_model_roundtrip() {
+    async fn native_long_task_and_short_chain_overlap_in_one_model_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        // 两条命令相互等待对方的信号：串行执行会超时，不能拿耗时阈值冒充并发检查。
-        let args = json!({"calls":[
-            {"tool":"bash","arguments":{"command":"touch a; while [ ! -f b ]; do sleep 0.01; done; printf alpha","timeout":5}},
-            {"tool":"bash","arguments":{"command":"touch b; while [ ! -f a ]; do sleep 0.01; done; printf bravo","timeout":5}}
-        ]});
-        let (url, bodies) = capturing_server(vec![Some(vec![json!({"choices":[{"delta":{"tool_calls":[
-            {"index":0,"id":"batch","function":{"name":"parallel","arguments":args.to_string()}}
-        ]},"finish_reason":"tool_calls"}]})]), text_reply("done")]).await;
+        // 长任务必须等短链最后一步，整批等待/串行都会超时；短链最后一步只依赖第二项。
+        let args = [
+            json!({"command":"touch long_started; while [ ! -f short_done ]; do sleep 0.01; done; printf long","timeout":5}),
+            json!({"command":"while [ ! -f long_started ]; do sleep 0.01; done; printf short","timeout":5}),
+            json!({"command":"touch short_done; printf chained","timeout":5,"_after":[2]}),
+        ];
+        let tool_calls: Vec<_> = args.iter().enumerate().map(|(i, args)| json!({"index":i,"id":format!("c{i}"),
+            "function":{"name":"bash","arguments":args.to_string()}})).collect();
+        let (url, bodies) = capturing_server(vec![Some(vec![json!({"choices":[{"delta":{"tool_calls":tool_calls},
+            "finish_reason":"tool_calls"}]})]), text_reply("done")]).await;
         let mut s = test_session(url, dir.path().into());
         s.shell = Some(crate::lyra::prompt::detect_shell());
         s.read_only = false;
         s.tools.extend(crate::lyra::tools::tool_set(false, false, false));
         let mut ended = Vec::new();
-        let outcome = run_turn(&mut s, Some(user_message("run independent checks", &[])), &mut |event| {
+        let outcome = run_turn(&mut s, Some(user_message("run work", &[])), &mut |event| {
             if let TurnEvent::ToolEnd { id, .. } = event { ended.push(id); }
         }).await;
         assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
-        let batch = &s.history.items()[2];
-        assert_eq!(batch["isError"], false, "{batch}");
-        let text = batch["content"].to_string();
-        assert!(text.contains("alpha") && text.contains("bravo"));
-        assert_eq!(ended.last().map(String::as_str), Some("batch"));
-        assert_eq!(ended.len(), 3);
+        assert_eq!(ended[0], "c1");
+        assert_eq!(ended[1], "c2");
+        assert_eq!(ended[2], "c0");
+        let results = &s.history.items()[2..5];
+        assert!(results.iter().all(|r| r["isError"] == false), "{results:?}");
+        assert_eq!(results.iter().map(|r| r["toolCallId"].as_str().unwrap()).collect::<Vec<_>>(), ["c0","c1","c2"]);
         let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 2, "one dispatch request and one final-answer request, no per-tool roundtrip");
+        assert_eq!(bodies.len(), 2);
+        let first: Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert!(first["tools"].as_array().unwrap().iter().all(|t| t["function"]["parameters"]["properties"]["_after"].is_object()));
         let next: Value = serde_json::from_str(&bodies[1]).unwrap();
-        let replies: Vec<_> = next["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").collect();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0]["tool_call_id"], "batch");
-        assert!(replies[0]["content"].as_str().unwrap().contains("alpha"));
-        assert!(replies[0]["content"].as_str().unwrap().contains("bravo"));
+        assert_eq!(next["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").count(), 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_dependencies_skip_failed_branches_and_cancel_queued_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+        s.shell = Some(crate::lyra::prompt::detect_shell());
+        s.tools.extend(crate::lyra::tools::tool_set(false, false, false));
+        let calls = vec![
+            ("fail".into(), "bash".into(), json!({"command":"exit 7"})),
+            ("skip".into(), "bash".into(), json!({"command":"touch should_not_exist","_after":[1]})),
+            ("good".into(), "bash".into(), json!({"command":"printf independent"})),
+            ("invalid".into(), "bash".into(), json!({"command":"touch invalid","_after":[4]})),
+        ];
+        let results = run_tools(&mut s, &calls, vec![], &mut |_| {}).await;
+        assert_eq!(results.iter().map(|r| r["isError"].as_bool().unwrap()).collect::<Vec<_>>(), [true,true,false,true]);
+        assert!(!dir.path().join("should_not_exist").exists() && !dir.path().join("invalid").exists());
+        s.cancelled.store(true, Ordering::SeqCst);
+        let results = run_tools(&mut s, &calls, vec![], &mut |_| {}).await;
+        assert!(results.iter().all(|r| r["content"][0]["text"] == CANCELLED_TEXT));
+    }
+
+    #[tokio::test]
+    async fn native_cancel_does_not_wait_for_or_execute_locked_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+        s.tools.push(Tool { name:"chrome", description:String::new(), parameters:json!({}) });
+        let _guard = screen_lock().lock().await;
+        let cancel = s.cancelled.clone();
+        let args = json!({});
+        let (outcome, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(1), call_tool(&s, "screen", "chrome", &args)),
+            async { tokio::time::sleep(Duration::from_millis(20)).await; cancel.store(true, Ordering::SeqCst); }
+        );
+        assert_eq!(outcome.unwrap().content[0]["text"], CANCELLED_TEXT);
+    }
+
+    #[tokio::test]
+    async fn native_directory_barrier_updates_once_before_following_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let next = dir.path().join("next");
+        std::fs::create_dir(&next).unwrap();
+        std::fs::write(dir.path().join("value"), "old").unwrap();
+        std::fs::write(next.join("value"), "new").unwrap();
+        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+        s.tools.extend(crate::lyra::tools::tool_set(true, false, true));
+        let calls = vec![
+            ("before".into(), "read".into(), json!({"path":"value"})),
+            ("switch".into(), "change_working_directory".into(), json!({"path":"next"})),
+            ("after".into(), "read".into(), json!({"path":"value"})),
+        ];
+        let mut ended = Vec::new();
+        let results = run_tools(&mut s, &calls, vec![], &mut |event| {
+            if let TurnEvent::ToolEnd { id, .. } = event { ended.push(id); }
+        }).await;
+        assert_eq!(ended, ["before", "switch", "after"]);
+        assert!(results[0]["content"].to_string().contains("old"));
+        assert!(results[2]["content"].to_string().contains("new"));
+        assert_eq!(s.cwd, next);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_dependency_does_not_treat_background_start_as_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+        s.session_id = uuid::Uuid::new_v4().to_string();
+        s.shell = Some(crate::lyra::prompt::detect_shell());
+        s.tools.extend(crate::lyra::tools::tool_set(false, false, false));
+        let calls = vec![
+            ("background".into(), "exec_command".into(), json!({"command":"sleep 30","yield_time_ms":0})),
+            ("dependent".into(), "bash".into(), json!({"command":"touch premature","_after":[1]})),
+        ];
+        let results = run_tools(&mut s, &calls, vec![], &mut |_| {}).await;
+        crate::lyra::tools::exec::cancel_owner(&s.session_id);
+        assert_eq!(results[0]["details"]["status"], "running");
+        assert_eq!(results[1]["isError"], true);
+        assert!(!dir.path().join("premature").exists());
     }
 
     #[tokio::test]

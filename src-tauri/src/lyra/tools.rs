@@ -406,7 +406,7 @@ async fn run_bash(
     command: &str,
     timeout_secs: u64,
     cancelled: Option<Arc<AtomicBool>>,
-) -> Result<String, String> {
+) -> Result<(String, i32, u64, u64), String> {
     use crate::lyra::prompt::ShellKind;
     let timeout_secs = timeout_secs.clamp(1, 600);
     let command = apply_powershell_utf8(command.to_string(), shell);
@@ -442,6 +442,7 @@ async fn run_bash(
     let mut child = process
         .spawn()
         .map_err(|e| format!("启动 shell 失败：{e}"))?;
+    let started_at = crate::lyra::history::now_ms();
     let mut guard = PidGuard(child.id());
     let (output_stdout, mut read_out) = capture_bash_pipe(child.stdout.take());
     let (output_stderr, mut read_err) = capture_bash_pipe(child.stderr.take());
@@ -471,6 +472,7 @@ async fn run_bash(
         }
     })
     .await;
+    let ended_at = crate::lyra::history::now_ms();
     let completion = match wait {
         Ok(Wait::Exited(result)) => {
             guard.disarm();
@@ -524,11 +526,7 @@ async fn run_bash(
         }
         text.push_str(&format!("Command exited with code {code}"));
     }
-    Ok(if text.trim().is_empty() {
-        "(no output)".into()
-    } else {
-        text
-    })
+    Ok((if text.trim().is_empty() { "(no output)".into() } else { text }, code, started_at, ended_at))
 }
 
 /// 超时错误：附带已产生的部分输出，便于模型判断现场。
@@ -708,7 +706,13 @@ async fn execute_inner(
             };
             let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(120);
             match run_bash(root, shell, command, timeout, cancelled.cloned()).await {
-                Ok(text) => ToolOutcome::text(clamp_tool_output_text(&text)),
+                Ok((text, code, started_at, ended_at)) => {
+                    let mut outcome = ToolOutcome::text(clamp_tool_output_text(&text)).with_details(json!({
+                        "exitCode":code, "executionStartedAt":started_at, "executionEndedAt":ended_at
+                    }));
+                    outcome.is_error = code != 0;
+                    outcome
+                }
                 Err(error) => ToolOutcome::error(error),
             }
         }
@@ -758,11 +762,11 @@ async fn execute_inner(
                 .unwrap_or_default();
             let target = resolve_path(root, path);
             if let Some(parent) = target.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
                     return ToolOutcome::error(format!("创建目录失败：{e}"));
                 }
             }
-            match std::fs::write(&target, content) {
+            match tokio::fs::write(&target, content).await {
                 Ok(()) => ToolOutcome::text(format!("已写入 {}（{} 字节）", path, content.len())),
                 Err(e) => ToolOutcome::error(format!("写入 {path} 失败：{e}")),
             }
