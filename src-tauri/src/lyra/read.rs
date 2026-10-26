@@ -46,7 +46,7 @@ fn path_candidates(root: &Path, input: &str) -> Vec<PathBuf> {
     candidates
 }
 
-fn resolve_read_path(root: &Path, input: &str) -> Result<PathBuf, String> {
+pub(super) fn resolve_read_path(root: &Path, input: &str) -> Result<PathBuf, String> {
     if input.trim().is_empty() {
         return Err("file path is empty".into());
     }

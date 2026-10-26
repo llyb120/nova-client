@@ -1,6 +1,6 @@
 //! Codex 式 turn 循环：规范历史 → 上下文视图 → 流式请求 → 工具派发 → 追加结果，直到模型不再调用工具
-//! 且没有待消化的 steer。只读工具在参数完整时（`ToolCallDone`）即提前派发；同轮独立命令自动并发，
-//! 文件修改、会话状态和共享屏幕保留顺序，副作用之后不再提前派发。provider 失败最多重试 5 次（指数退避 +
+//! 且没有待消化的 steer。只读工具在参数完整时（`ToolCallDone`）即提前派发；同轮独立工具自动并发，
+//! 同一文件的读写、会话状态和共享屏幕保留顺序，副作用之后不再提前派发。provider 失败最多重试 5 次（指数退避 +
 //! 抖动），上下文超限先按 Reasonix 折叠再重试一次。失败的 assistant 占位从不入史，重试无需回滚。
 
 use crate::lyra::config::Resolved;
@@ -14,7 +14,7 @@ use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -85,14 +85,47 @@ fn tool_barrier(name: &str) -> bool {
         | "chrome" | "jianlai" | "generate_image" | "edit_image" | "context_budget" | "spawn_agent")
 }
 
+/// 使用文件系统身份而非路径字符串，兼容相对路径、大小写、符号链接和硬链接。
+fn file_tool_identity(cwd: &Path, call: &(String, String, Value)) -> Option<(u64, u64)> {
+    let input = call.2.get("path")?.as_str().filter(|path| !path.trim().is_empty())?;
+    let path = if call.1 == "read" {
+        crate::lyra::read::resolve_read_path(cwd, input).ok()?
+    } else {
+        cwd.join(input)
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let file = std::fs::File::open(path).ok()?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 { return None; }
+        Some((info.dwVolumeSerialNumber as u64, (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64))
+    }
+    #[cfg(not(any(unix, windows)))]
+    { let _ = path; None }
+}
+
 /// 确知的共享资源按出现顺序执行；不透明命令的业务依赖由模型用 _after 声明。
-fn tools_conflict(left: &(String, String, Value), right: &(String, String, Value)) -> bool {
+fn tools_conflict(cwd: &Path, left: &(String, String, Value), right: &(String, String, Value)) -> bool {
     let (a, b) = (left.1.as_str(), right.1.as_str());
     if screen_tool(a) && screen_tool(b) { return true; }
-    // ponytail: 文件修改与文件读取/检索保守互斥（不同文件也串行）；按真实路径建锁后可放宽。
     let file = |name| matches!(name, "read" | "polaris" | "write" | "edit");
     let mutation = |name| matches!(name, "write" | "edit");
-    if file(a) && file(b) && (mutation(a) || mutation(b)) { return true; }
+    if file(a) && file(b) && (mutation(a) || mutation(b)) {
+        // ponytail: 检索范围及尚不存在/不可解析的文件仍保守串行；新文件可升级为父目录身份 + 文件名。
+        if a == "polaris" || b == "polaris" { return true; }
+        return match (file_tool_identity(cwd, left), file_tool_identity(cwd, right)) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+    }
     let key = match (a, b) {
         ("bash", "bash") => "command",
         ("spawn_agent", "spawn_agent") => "task_name",
@@ -450,7 +483,7 @@ async fn run_tools(
                 if launched[i] || results[i].is_some() { continue; }
                 let error = blocked(i, &results);
                 if error.is_none() && (deps[i].as_ref().unwrap().iter().any(|&d| results[d].is_none())
-                    || (start..i).any(|j| results[j].is_none() && tools_conflict(&calls[j], &calls[i]))) { continue; }
+                    || (start..i).any(|j| results[j].is_none() && tools_conflict(&shared.cwd, &calls[j], &calls[i]))) { continue; }
                 if error.is_none() && running.len() >= MAX_CONCURRENT_TOOLS { break; }
                 let (id, name, args) = &calls[i];
                 on_event(TurnEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
@@ -777,12 +810,80 @@ pub(crate) mod tests {
         for value in [json!(null), json!("1"), json!([0]), json!([3]), json!([-1]), json!([1.5])] {
             assert!(tool_dependencies(&json!({"_after":value}), 2).is_err());
         }
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(cwd.join("a"), "old").unwrap();
+        std::fs::write(cwd.join("b"), "old").unwrap();
+        std::fs::create_dir(cwd.join("sub")).unwrap();
+        std::fs::hard_link(cwd.join("a"), cwd.join("alias")).unwrap();
         let call = |name: &str, args| (String::new(), name.to_string(), args);
-        assert!(tools_conflict(&call("chrome", json!({})), &call("jianlai", json!({}))));
-        assert!(tools_conflict(&call("bash", json!({"_after":[1]})), &call("bash", json!({}))));
-        assert!(!tools_conflict(&call("bash", json!({"command":"a"})), &call("chrome", json!({}))));
-        assert!(tools_conflict(&call("write", json!({"path":"a"})), &call("read", json!({"path":"a"}))));
+        let conflict = |left, right| tools_conflict(cwd, &left, &right);
+        assert!(conflict(call("chrome", json!({})), call("jianlai", json!({}))));
+        assert!(conflict(call("bash", json!({"_after":[1]})), call("bash", json!({}))));
+        assert!(!conflict(call("bash", json!({"command":"a"})), call("chrome", json!({}))));
+        assert!(!conflict(call("write_stdin", json!({"session_id":"a"})), call("write_stdin", json!({"session_id":"b"}))));
+        for mutation in ["edit", "write"] {
+            for other in ["read", "edit", "write"] {
+                assert!(!conflict(call(mutation, json!({"path":"a"})), call(other, json!({"path":"b"}))));
+                for alias in [cwd.join("a"), PathBuf::from("./a"), PathBuf::from("sub/../a"), PathBuf::from("alias")] {
+                    assert!(conflict(call(mutation, json!({"path":"a"})), call(other, json!({"path":alias}))));
+                }
+                assert!(conflict(call(mutation, json!({"path":"missing"})), call(other, json!({"path":"b"}))));
+                assert!(conflict(call(mutation, json!({})), call(other, json!({"path":"b"}))));
+            }
+            assert!(conflict(call(mutation, json!({"path":"a"})), call("read", json!({"path":"@a"}))));
+            assert!(conflict(call(mutation, json!({"path":"a"})), call("polaris", json!({"files":["b"]}))));
+            #[cfg(windows)]
+            assert!(conflict(call(mutation, json!({"path":"a"})), call("read", json!({"path":"A"}))));
+            #[cfg(unix)]
+            {
+                let link = cwd.join(format!("symlink-{mutation}"));
+                std::os::unix::fs::symlink(cwd.join("a"), &link).unwrap();
+                assert!(conflict(call(mutation, json!({"path":"a"})), call("read", json!({"path":link}))));
+            }
+        }
+        assert!(!conflict(call("read", json!({"path":"a"})), call("read", json!({"path":"a"}))));
         assert!(!context_tools().iter().any(|tool| tool.name == "parallel"));
+    }
+
+    #[tokio::test]
+    async fn native_distinct_files_dispatch_together_and_same_file_stays_ordered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+        s.shell = Some(crate::lyra::prompt::detect_shell());
+        s.tools.extend(crate::lyra::tools::tool_set(false, false, false));
+        let mut calls = Vec::new();
+        for name in ["a", "b", "c", "d", "e"] {
+            std::fs::write(dir.path().join(name), "old").unwrap();
+            calls.push((name.into(), "edit".into(), json!({"path":name,"edits":[{"oldText":"old","newText":"new"}]})));
+        }
+        calls.extend([
+            ("read-a".into(), "read".into(), json!({"path":"@a"})),
+            ("write-a".into(), "write".into(), json!({"path":"./a","content":"final"})),
+            ("dependent".into(), "edit".into(), json!({"path":"b","edits":[{"oldText":"new","newText":"chained"}],"_after":[7]})),
+        ]);
+        let mut events = Vec::new();
+        let results = run_tools(&mut s, &calls, vec![], &mut |event| match event {
+            TurnEvent::ToolStart { id, .. } => events.push((id, true)),
+            TurnEvent::ToolEnd { id, .. } => events.push((id, false)),
+            _ => {}
+        }).await;
+        assert!(results.iter().all(|r| r["isError"] == false), "{results:?}");
+        // 验证调度器不再等待其它文件的结果才派发；不以事件代替工具体的执行计时。
+        assert_eq!(&events[..4], &[("a".into(), true), ("b".into(), true), ("c".into(), true), ("d".into(), true)]);
+        let at = |id: &str, start| events.iter().position(|event| event == &(id.into(), start)).unwrap();
+        assert!(at("a", false) < at("read-a", true));
+        assert!(at("read-a", false) < at("write-a", true));
+        assert!(at("write-a", false) < at("dependent", true));
+        let mut active = 0;
+        for (_, start) in &events {
+            if *start { active += 1; } else { active -= 1; }
+            assert!(active <= MAX_CONCURRENT_TOOLS);
+        }
+        assert_eq!(active, 0);
+        assert!(results[5]["content"].to_string().contains("new"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("a")).unwrap(), "final");
+        assert_eq!(std::fs::read_to_string(dir.path().join("b")).unwrap(), "chained");
     }
 
     #[cfg(unix)]
@@ -914,7 +1015,8 @@ pub(crate) mod tests {
         .await;
         assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
         assert_eq!(retries, vec![1]);
-        assert_eq!(ended, vec!["c0", "c1", "c2"]);
+        assert_eq!(ended.len(), 3);
+        assert!(ended.iter().position(|id| id == "c1").unwrap() < ended.iter().position(|id| id == "c2").unwrap());
         let roles: Vec<&str> = s.history.items().iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["user", "assistant", "toolResult", "toolResult", "toolResult", "assistant"]);
         let text = |i: usize| s.history.items()[i]["content"].to_string();
