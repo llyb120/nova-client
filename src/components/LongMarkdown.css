@@ -1,0 +1,6 @@
+/* Keep the existing Markdown typography/actions; these boxes only own windowing.
+   Flex preserves the transcript's non-collapsing block margins across chunks. */
+.md-virtual { display: flex; flex-direction: column; min-width: 0; }
+.markdown .md-virtual > .md-seg { display: flex; flex-direction: column; min-width: 0; flex: none; }
+/* Real mounted heights, not the obsolete content-visibility estimates. */
+.markdown .md-virtual > .md-seg > * { content-visibility: visible !important; }
