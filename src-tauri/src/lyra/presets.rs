@@ -292,7 +292,7 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
             return Err("团队中转地址必须是 HTTP(S) 地址，不能包含查询参数或片段".into());
         }
         json!({ "name": "server support", "api": DEFAULT_API,
-            "options": { "baseURL": format!("{server}/cc"), "apiKey": token }, "models": {} })
+            "relayServer": server, "options": { "baseURL": format!("{server}/cc"), "apiKey": token }, "models": {} })
     } else if source == "devin" {
         super::devin_provider::load(nova_root, env)?
     } else if matches!(source, "codebuddy" | "workbuddy") {
@@ -384,6 +384,14 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
                         // 迁移项只声明原模型/档位；不能用这个稀疏定义抹掉目录中的模态和限额。
                         merge_local_models(&mut models, &explicit);
                     }
+                    // 团队中转可有多个号池路径；模型走它所在号池的路径，缺省沿用 provider 的 /cc。
+                    if let Some(server) = local["relayServer"].as_str() {
+                        for model in models.values_mut() {
+                            if let Some(path) = model["relayPath"].as_str() {
+                                model["options"]["baseURL"] = json!(format!("{server}{path}"));
+                            }
+                        }
+                    }
                     local["models"] = json!(models);
                     *provider = local;
                 }
@@ -473,7 +481,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
                 }
             }
         } else { String::new() };
-        let print = fingerprint(&["10", preset.id, &base_url, &api_key, &headers, &local_models,
+        let print = fingerprint(&["11", preset.id, &base_url, &api_key, &headers, &local_models,
             provider["api"].as_str().unwrap_or(""), provider["localAuth"].as_str().unwrap_or(""), &auth_print]);
         if !force && cache_fresh(&cache[id.as_str()], &print, now) {
             continue;
@@ -482,7 +490,9 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
             super::devin_provider::models(&provider["options"], force).await
         } else if matches!(preset.id, "codebuddy" | "workbuddy") {
             super::codebuddy_provider::models(&provider["options"], force).await
-        } else if local_source(preset.id).is_some() && preset.id != "server-support" {
+        } else if preset.id == "server-support" {
+            fetch_team_models(http, preset, provider["relayServer"].as_str().unwrap_or(""), &api_key, &mut models_dev).await
+        } else if local_source(preset.id).is_some() {
             fetch_local_models(http, provider.clone(), &mut models_dev, &env).await
         } else {
             fetch_models(http, preset, &base_url, &api_key, &mut models_dev).await
@@ -542,6 +552,39 @@ async fn get_json(http: &reqwest::Client, url: &str, api_key: &str) -> Result<Va
         return Err(format!("{url} 返回 {status}"));
     }
     response.json().await.map_err(|e| format!("{url}：{e}"))
+}
+
+/// 团队中转的号池路径由服务端 /v2/pools 告知（旧服务端没有该接口，只有 /cc）；
+/// 每个号池各拉一份模型并记下路径，同名模型以先出现的号池为准。
+async fn fetch_team_models(
+    http: &reqwest::Client,
+    preset: &Preset,
+    server: &str,
+    api_key: &str,
+    models_dev: &mut Option<Value>,
+) -> Result<Map<String, Value>, String> {
+    let mut paths: Vec<String> = get_json(http, &format!("{server}/v2/pools"), api_key).await.ok()
+        .and_then(|list| list["paths"].as_array().map(|paths| paths.iter().filter_map(Value::as_str).map(str::to_string).collect()))
+        .unwrap_or_default();
+    if paths.is_empty() {
+        paths.push("/cc".into());
+    }
+    let mut out = Map::new();
+    let mut last_error = None;
+    for path in &paths {
+        match fetch_models(http, preset, &format!("{server}{path}"), api_key, models_dev).await {
+            Ok(models) => for (id, mut model) in models {
+                model["relayPath"] = json!(path);
+                out.entry(id).or_insert(model);
+            },
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) if out.is_empty() => Err(error),
+        Some(error) => { eprintln!("[lyra] 部分号池模型拉取失败：{error}"); Ok(out) }
+        None => Ok(out),
+    }
 }
 
 async fn fetch_models(
@@ -1237,7 +1280,8 @@ mod tests {
             { "id": "custom-responses", "supported_endpoints": ["/responses"] },
             { "id": "custom-claude", "supported_endpoints": ["/messages"] }
         ] });
-        let models = convert(&model_list, None, None, "commandcode");
+        let mut models = convert(&model_list, None, None, "commandcode");
+        models.get_mut("custom-responses").unwrap()["relayPath"] = json!("/gpt");
         std::fs::write(cache_path(dir.path()), json!({ "team": { "models": models } }).to_string()).unwrap();
         for token in ["alice/first", "alice/rotated"] {
             std::fs::write(dir.path().join("settings.json"), json!({ "relayServer": " http://localhost:8320/ ", "relayToken": token }).to_string()).unwrap();
@@ -1253,6 +1297,7 @@ mod tests {
                 assert_eq!(resolved.api_key, token);
                 assert_eq!(resolved.model.api, api);
                 assert!(resolved.model.command_code);
+                assert_eq!(resolved.model.base_url, if id == "custom-responses" { "http://localhost:8320/gpt" } else { "http://localhost:8320/cc" });
             }
         }
         assert_eq!(raw["provider"]["team"]["options"]["apiKey"], "stale", "runtime credentials are not persisted into provider config");

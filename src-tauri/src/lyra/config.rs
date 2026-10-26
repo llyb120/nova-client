@@ -430,11 +430,13 @@ pub fn resolve_model(
         .get("options")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    // 模型可指定自己的 baseURL（团队中转按号池路径分流），覆盖 provider 的。
     let base_url = resolve_env_string(
-        options
-            .get("baseURL")
-            .or_else(|| options.get("baseUrl"))
+        model
+            .pointer("/options/baseURL")
             .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .or_else(|| options.get("baseURL").or_else(|| options.get("baseUrl")).and_then(Value::as_str))
             .unwrap_or_default(),
         env,
     )?;
