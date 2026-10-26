@@ -31,6 +31,7 @@ import {
   IconFolder,
   IconGear,
   IconLogo,
+  IconLyra,
   IconMerge,
   IconPlus,
   IconSearch,
@@ -459,6 +460,11 @@ export function Sidebar(props: {
         <Show when={props.child}>
           <span class="thread-tree-mark" title="属于上方预检会话">
             └
+          </span>
+        </Show>
+        <Show when={activeThread().agentKind === "lyra"}>
+          <span class="thread-agent lyra lyra-thread-logo" title="Lyra">
+            <IconLyra size={15} />
           </span>
         </Show>
         <span class="thread-content">

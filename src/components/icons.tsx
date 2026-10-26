@@ -116,6 +116,15 @@ export const IconLogo = (p: P) =>
     <image href="/app-icon.png" width="24" height="24" />,
     p,
   );
+export const IconLyra = (p: P) =>
+  svg(
+    <>
+      <path d="M5 3h5v11l4 4H5V3Z" fill="currentColor" stroke="none" />
+      <path d="m10 14 4 4h7l-3-4h-8Z" fill="currentColor" stroke="none" opacity="0.72" />
+      <path d="m17 3 .9 2.1L20 6l-2.1.9L17 9l-.9-2.1L14 6l2.1-.9L17 3Z" fill="currentColor" stroke="none" />
+    </>,
+    p,
+  );
 export const IconTrophy = (p: P) =>
   svg(
     <>

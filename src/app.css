@@ -831,6 +831,20 @@ button {
   background: color-mix(in srgb, var(--tea) 14%, transparent);
 }
 
+.thread-item .lyra-thread-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 6px;
+  line-height: 1;
+}
+.lyra-thread-logo svg {
+  display: block;
+}
+
 .auto-mode-badge {
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 13%, transparent);
