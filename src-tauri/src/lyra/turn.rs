@@ -174,6 +174,42 @@ pub fn context_tools() -> Vec<Tool> {
     ]
 }
 
+/// ACP 模式的上下文工具：压缩由模型发起（见 context/acp.rs）。
+pub fn acp_tools() -> Vec<Tool> {
+    let range = json!({
+        "type": "object",
+        "properties": {
+            "startRef": { "type": "string", "description": "First ref of the span, e.g. m00012, or a block id bN" },
+            "endRef": { "type": "string", "description": "Last ref of the span (inclusive; its tool calls/replies come with it), e.g. m00031, or bN" },
+            "summary": { "type": "string", "description": "Self-contained briefing that replaces the span: paths, identifiers, numbers, commands + outcomes, decisions + reasons, errors + fixes, pending TODOs. Terse bullets; invent nothing." },
+            "topic": { "type": "string", "description": "Short label" }
+        },
+        "required": ["startRef", "endRef", "summary"]
+    });
+    vec![
+        Tool {
+            name: "compress",
+            description: "Fold finished work into a summary you write, to free context. Only finished spans outside the protected recent messages can be compressed; user messages inside stay verbatim. Reversible via decompress.".into(),
+            parameters: json!({ "type": "object", "properties": { "ranges": { "type": "array", "minItems": 1, "maxItems": 8, "items": range } }, "required": ["ranges"] }),
+        },
+        Tool {
+            name: "decompress",
+            description: "Restore the original messages of a compressed block (and re-activate the older blocks it had absorbed).".into(),
+            parameters: json!({ "type": "object", "properties": { "block": { "type": "string", "description": "Block id such as b3" } }, "required": ["block"] }),
+        },
+        Tool {
+            name: "search_context",
+            description: "Keyword search over compressed blocks: their summaries and the stored original messages.".into(),
+            parameters: json!({ "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }),
+        },
+        Tool {
+            name: "acp_status",
+            description: "Context usage, active blocks, and the ranges that can be compressed right now.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+    ]
+}
+
 pub fn text_outcome(text: impl Into<String>, is_error: bool) -> ToolOutcome {
     ToolOutcome { content: vec![json!({ "type": "text", "text": text.into() })], details: None, is_error }
 }
@@ -453,6 +489,8 @@ async fn run_tools(
                 else { crate::lyra::scene::switch(s, args) }
             } else if name == "recall" {
                 recall(s, args)
+            } else if matches!(name.as_str(), "compress" | "decompress" | "search_context" | "acp_status") {
+                acp_tool(s, name, args)
             } else {
                 call_tool(s, id, name, args).await
             };
@@ -551,6 +589,20 @@ async fn call_tool(s: &Session, id: &str, name: &str, args: &Value) -> ToolOutco
     } else { None };
     if s.cancelled.load(Ordering::SeqCst) { return text_outcome(CANCELLED_TEXT, true); }
     execute(&s.cwd, name, args, s.shell.as_ref(), s.archive_dir.as_deref(), id, Some(&s.cancelled), &s.session_id).await
+}
+
+fn acp_tool(s: &mut Session, name: &str, args: &Value) -> ToolOutcome {
+    let history = s.history.items();
+    let result = match name {
+        "compress" => s.context.acp_compress(history, args),
+        "decompress" => s.context.acp_decompress(history, args),
+        "search_context" => s.context.acp_search(history, args),
+        _ => Ok(s.context.acp_status(history)),
+    };
+    match result {
+        Ok(text) => text_outcome(text, false),
+        Err(error) => text_outcome(error, true),
+    }
 }
 
 fn recall(s: &mut Session, args: &Value) -> ToolOutcome {

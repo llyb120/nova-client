@@ -114,6 +114,7 @@ struct State {
     notice_rung: usize,
     recall_spent: u64,
     last_receipt: Option<Receipt>,
+    acp: acp::AcpState,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -127,6 +128,9 @@ struct Anchor {
 }
 
 const STATE_VERSION: u32 = 1;
+
+mod acp;
+pub use acp::GUIDE as ACP_GUIDE;
 
 pub fn context_path(root: &Path, session_id: &str) -> PathBuf {
     root.join(format!("{session_id}.context.json"))
@@ -142,6 +146,8 @@ pub struct ContextWindow {
     accounting_key: String,
     path: Option<PathBuf>,
     state: State,
+    /// ACP 模式：模型主动压缩，取代下面的自动摘要折叠（后者仅用于旧会话遗留的投影）。
+    acp_enabled: bool,
 }
 
 impl ContextWindow {
@@ -161,7 +167,7 @@ impl ContextWindow {
         let counter = TokenCounter::default();
         let fixed = TokenBreakdown { overhead, ..TokenBreakdown::default() };
         let accounting_key = hash_values(&[counter.metadata(), json!(false)]);
-        Self { window, counter, fixed, reserved_output: 0, completed_before: 0, strip_reasoning: false, accounting_key, path: None, state: State::default() }
+        Self { window, counter, fixed, reserved_output: 0, completed_before: 0, strip_reasoning: false, accounting_key, path: None, state: State::default(), acp_enabled: false }
     }
 
     /// tools 应传实际工具定义 JSON，而非已编码的 JSON 字符串。替代旧 overhead，不重复累计。
@@ -190,6 +196,10 @@ impl ContextWindow {
 
     /// 折叠预算与实际发送共用此视图；record_usage 必须接收该请求的同一份 messages。
     pub fn prompt_view(&self, canonical: &[Value]) -> Vec<Value> {
+        if self.acp_enabled {
+            let (view, map) = self.acp_view(canonical);
+            return self.normalize_prompt(&view, map.get(self.completed_before).copied().unwrap_or(0));
+        }
         let completed = self.view_index(canonical, self.completed_before).unwrap_or(0);
         self.normalize_prompt(&self.view(canonical), completed)
     }
@@ -342,6 +352,9 @@ impl ContextWindow {
 
     /// 模型可见视图：投影 + 规范历史未覆盖部分；投影无效时就是规范历史。
     pub fn view(&self, canonical: &[Value]) -> Vec<Value> {
+        if self.acp_enabled {
+            return self.acp_view(canonical).0;
+        }
         match self.valid_projection(canonical) {
             Some(p) => {
                 let mut out = p.messages.clone();
@@ -355,6 +368,18 @@ impl ContextWindow {
     /// 按 rewrite 改写模型可见视图（如 413 后省略旧图）并写入投影持久化，后续请求沿用；条数不变，无改动返回 false。
     /// 投影只覆盖到最后一条被改写的消息，之后的规范历史照常追加，不改动折叠代数。
     pub fn rewrite_view(&mut self, canonical: &[Value], rewrite: impl FnOnce(&[Value]) -> Option<Vec<Value>>) -> bool {
+        if self.acp_enabled {
+            // ACP 视图每次渲染时套用同一个图片裁剪（唯一调用方就是 drop_old_tool_images），这里只记开关。
+            if self.state.acp.trim_images { return false; }
+            let before = self.acp_view(canonical).0;
+            self.state.acp.trim_images = true;
+            if self.acp_view(canonical).0 == before {
+                self.state.acp.trim_images = false;
+                return false;
+            }
+            self.save();
+            return true;
+        }
         let view = self.view(canonical);
         let Some(rewritten) = rewrite(&view).filter(|r| r.len() == view.len()) else { return false };
         let Some(last) = (0..view.len()).rev().find(|&i| view[i] != rewritten[i]) else { return false };
@@ -371,6 +396,9 @@ impl ContextWindow {
 
     /// 规范下标 → 视图下标；已被折叠（或保留在投影体里）的返回 None。
     pub fn view_index(&self, canonical: &[Value], index: usize) -> Option<usize> {
+        if self.acp_enabled {
+            return self.acp_view(canonical).1.get(index).copied();
+        }
         match self.valid_projection(canonical) {
             Some(p) if index >= p.covered_count => Some(p.messages.len() + index - p.covered_count),
             Some(_) => None,
@@ -379,11 +407,18 @@ impl ContextWindow {
     }
 
     pub fn should_compact(&self, canonical: &[Value]) -> bool {
+        if self.acp_enabled {
+            return self.window > 0 && !self.input_budget_exhausted()
+                && self.prompt_tokens(&self.prompt_view(canonical)) >= self.acp_emergency_tokens();
+        }
         self.window > 0 && !self.input_budget_exhausted() && self.prompt_tokens(&self.prompt_view(canonical)) >= self.trigger_tokens()
     }
 
     /// 快到阈值时提醒模型收拢（75% / 92%，每代每档一次）。
     pub fn budget_notice(&mut self, canonical: &[Value]) -> Option<String> {
+        if self.acp_enabled {
+            return self.acp_nudge(canonical);
+        }
         if self.window == 0 || self.input_budget_exhausted() {
             return None;
         }
@@ -411,7 +446,7 @@ impl ContextWindow {
         let used = self.prompt_tokens(&view);
         let trigger = self.trigger_tokens();
         let recall_budget = MIN_RECALL_TOKENS.max((self.window as f64 * RECALL_RATIO) as u64);
-        let report = json!({
+        let mut report = json!({
             "tokenizer": self.counter.metadata(),
             "contextWindow": self.window,
             "automaticCompaction": self.window > 0 && !self.input_budget_exhausted(),
@@ -434,6 +469,10 @@ impl ContextWindow {
             "lastActualUsage": self.state.last_actual_usage,
             "notes": format!("Breakdown fields are uncalibrated and additive (messageCount/imageCount/unknownPartCount are counts). Counts are character-heuristic estimates; images ({IMAGE_TOKENS} each, including candidate screenshot paths), protocol overhead, reasoning replay and unknown content are placeholders. When anchoredToActualUsage is true, estimatedPromptTokens is the last provider-measured prompt plus estimates for messages added since. Legacy constructors leave system/tools unsplit in overhead until configured. Last actual usage belongs to its previous request, not necessarily this projection. No declared window disables automatic compaction; exhausted input budget means the fixed system prompt/tools fill the window."),
         });
+        if self.acp_enabled {
+            report["automaticCompaction"] = json!(false);
+            report["acp"] = self.acp_status_value(canonical);
+        }
         serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
     }
 
@@ -460,6 +499,9 @@ impl ContextWindow {
         F: FnOnce(String, String) -> Fut,
         Fut: Future<Output = Result<String, String>>,
     {
+        if self.acp_enabled {
+            return Ok(self.acp_emergency(canonical, trigger));
+        }
         if self.window == 0 {
             return Ok(self.receipt("noop", trigger, "no context window declared"));
         }
@@ -1032,7 +1074,7 @@ fn recall_span(canonical: &[Value], pos: usize) -> Vec<Value> {
 }
 
 fn read_only_tool(name: &str) -> bool {
-    matches!(name, "read" | "polaris" | "recall" | "context_budget" | "list_agents" | "wait_agent")
+    matches!(name, "read" | "polaris" | "recall" | "context_budget" | "search_context" | "acp_status" | "list_agents" | "wait_agent")
 }
 
 fn with_text(m: &Value, text: String) -> Value {
