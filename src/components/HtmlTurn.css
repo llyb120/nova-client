@@ -1,0 +1,168 @@
+/* Canvas geometry; the transcript container supplies horizontal gutters and the initial 24px. */
+.html-turn {
+  display: flow-root;
+  min-width: 0;
+  min-height: 1px;
+  margin: 0;
+  color: var(--canvas-text, var(--text));
+  font: 14px/1.7 var(--sans);
+  user-select: text;
+  overflow-wrap: anywhere;
+}
+.html-turn button { font-family: inherit; }
+.html-turn button:focus-visible,
+.html-turn [tabindex]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.html-turn button:disabled { opacity: .5; cursor: default; }
+.html-turn .ht-fold {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--canvas-text-dim, var(--text-dim));
+  text-align: left;
+  cursor: pointer;
+}
+.html-turn .ht-fold:hover { background: var(--bg-hover); }
+.html-turn .ht-fold > svg { flex: none; color: var(--canvas-text-faint, var(--text-faint)); }
+.ht-user { padding: 20px 0 16px; }
+.ht-user-display { display: flex; justify-content: flex-end; min-width: 0; }
+.ht-user-column { max-width: 85%; min-width: 34px; display: flex; flex-direction: column; align-items: flex-end; }
+.ht-bubble-wrap { position: relative; max-width: 100%; }
+.ht-bubble-wrap:has(.ht-bubble-images) { min-width: 72px; }
+.ht-user-bubble {
+  padding: 10px 16px;
+  min-height: 30px;
+  border-radius: 14px 14px 6px 14px;
+  background: var(--accent-dim);
+  /* Inset stroke leaves the Canvas 10/16 padding and text geometry unchanged. */
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent);
+  font-size: 14px;
+  line-height: 1.6;
+}
+/* Canvas measures text+34 but paints at bubbleX+16: the extra 2px belongs on the right. */
+.ht-user-text { display: block; padding-right: 2px; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Blocks end only at source newlines: no artificial breaks or changed paragraph indentation. */
+.ht-user-text-chunk { display: block; content-visibility: auto; }
+/* Keep the first bounded block measurable; skipped children must not collapse shrink-to-content width. */
+.ht-user-text-chunk:first-child { content-visibility: visible; }
+.ht-bubble-images { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; margin-bottom: 6px; }
+.ht-bubble-images img { display: block; flex: none; width: auto; height: auto; max-width: min(240px, 100%); max-height: 180px; object-fit: contain; border-radius: 10px; }
+.ht-bubble-images img.ht-image-broken { min-height: 22px; font: 12px/22px var(--sans); }
+.ht-clickable { cursor: pointer; }
+.ht-attachment { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; color: var(--blue); overflow-wrap: anywhere; }
+.ht-user-actions { position: absolute; display: flex; right: calc(100% + 4px); bottom: 4px; gap: 2px; opacity: 0; }
+/* Keep resend/edit in the Canvas gutter; copy overlays the bubble rather than stealing another 24px. */
+.ht-user-actions > button:first-child { position: absolute; left: calc(100% + 8px); bottom: 0; }
+.ht-user-column:has(.ht-long-prompt) .ht-user-actions > button:first-child { display: none; }
+.ht-user-actions button, .ht-copy-prompt { display: grid; place-items: center; flex: none; width: 24px; height: 24px; border-radius: 6px; color: var(--canvas-text-faint, var(--text-faint)); }
+.ht-user:hover .ht-user-actions, .ht-user:focus-within .ht-user-actions { opacity: 1; }
+.ht-user-actions button:hover, .ht-copy-prompt:hover { background: var(--bg-hover); color: var(--canvas-text, var(--text)); }
+.ht-user-actions button.copied { color: var(--accent); }
+.html-turn .ht-user-fold { min-height: 28px; margin-top: 4px; padding: 4px 8px; font-size: 13px; line-height: 20px; }
+.ht-user-column > .ht-user-fold { white-space: nowrap; }
+@media (max-width: 600px) { .ht-user-column > .ht-user-fold { white-space: normal; } }
+.ht-long-prompt { display: flex; align-items: center; gap: 8px; }
+.ht-long-prompt .ht-user-fold { flex: 1; min-width: 0; }
+.ht-long-prompt .ht-copy-prompt { margin-top: 4px; }
+.ht-user-column:has(> .ht-user-fold, > .ht-long-prompt) { padding-bottom: 4px; }
+.ht-model { display: table; max-width: 100%; margin: -8px 0 8px auto; padding: 2px 7px; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--border-light); background: var(--bg-panel); color: var(--canvas-text-faint, var(--text-faint)); font: 11px/14px var(--mono); }
+.ht-turn-marker { display: block; height: 0; }
+.html-turn .ht-turn-fold { display: flex; width: fit-content; max-width: min(100%, 400px); margin: 12px 0 2px -8px; padding: 4px 8px; min-height: 26px; border-radius: 7px; font-size: 13px; line-height: 18px; }
+.ht-turn-fold span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.ht-turn-process { margin: 4px 0 6px; padding: 2px 0 2px 12px; box-shadow: inset 2px 0 var(--border); }
+/* Block margins collapse here: include the fold's 2px tail in the following 4px process gap. */
+.ht-turn-fold + .ht-turn-process { margin-top: 6px; }
+.ht-process-segment { padding: 4px 0; }
+.html-turn .ht-process-fold { display: flex; flex-direction: column; align-items: stretch; width: calc(100% + 8px); max-width: none; margin-left: -8px; padding: 0 8px; gap: 0; font-size: 12px; line-height: 24px; color: var(--canvas-text-muted, var(--text-muted)); }
+.ht-process-line { display: flex; align-items: center; gap: 6px; height: 24px; min-width: 0; }
+.ht-process-line > span { max-width: calc(100% - 32px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ht-process-line > svg { flex: none; color: var(--canvas-text-faint, var(--text-faint)); }
+.ht-live-preview { display: flex; flex-direction: column; justify-content: flex-end; max-height: 48px; overflow: hidden; text-align: left; }
+/* The fold is W+8 with 16px padding, so subtract 32 here to obtain Canvas's W-40. */
+.ht-live-lines { display: block; flex: none; width: calc(100% - 32px); min-width: 1px; }
+.ht-live-line { display: block; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/24px var(--sans); }
+.ht-live-chevron { display: inline-block; position: relative; width: 0; height: 0; vertical-align: baseline; }
+.ht-live-chevron svg { position: absolute; left: 6px; bottom: -1px; color: var(--canvas-text-faint, var(--text-faint)); }
+.ht-process-items { padding-left: 4px; }
+.ht-assistant { padding: 6px 0; font-size: 14px; line-height: 1.7; }
+.ht-thought { padding: 6px 0; }
+.html-turn .ht-thought-fold { display: flex; width: fit-content; padding: 3px 6px; gap: 5px; min-height: 24px; font-size: 12px; line-height: 18px; color: var(--canvas-text-faint, var(--text-faint)); }
+.ht-thought-body { margin-top: 6px; padding: 8px 14px; box-shadow: inset 2px 0 var(--border-light); color: var(--canvas-text-dim, var(--text-dim)); font-size: 13px; line-height: 1.6; }
+.ht-thinking { height: 22px; font-size: 13px; line-height: 22px; color: var(--canvas-text-faint, var(--text-faint)); }
+.ht-system-space { padding: 10px 0; }
+.ht-system { margin: 0; padding: 8px 13px; border-radius: 8px; white-space: pre-wrap; font-size: 12.5px; line-height: 1.5; color: var(--canvas-text-faint, var(--text-faint)); }
+.ht-system[data-level="info"] { --ht-level: var(--accent); color: color-mix(in srgb, var(--accent) 80%, var(--text)); }
+.ht-system[data-level="warn"] { --ht-level: var(--yellow); color: var(--yellow); }
+.ht-system[data-level="error"] { --ht-level: var(--red); color: var(--red); }
+.ht-system:is([data-level="info"], [data-level="warn"], [data-level="error"]) { background: color-mix(in srgb, var(--ht-level) 8%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ht-level) 30%, transparent); }
+.ht-tool { padding: 1px 0; }
+.html-turn .ht-tool-line { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 26px; padding: 3px 8px; border-radius: 7px; color: var(--canvas-text-dim, var(--text-dim)); font: 12px/20px var(--mono); text-align: left; }
+.ht-tool-line:not([aria-disabled="true"]):hover { background: var(--bg-hover); }
+.ht-tool-line[aria-disabled="true"] { cursor: default; }
+.ht-tool-line > svg, .ht-tool-icon { display: flex; flex: none; color: var(--canvas-text-faint, var(--text-faint)); }
+.ht-tool-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; tab-size: 4; }
+.ht-tool-duration { flex: none; white-space: nowrap; color: var(--canvas-text-faint, var(--text-faint)); font: 11.5px/20px var(--mono); }
+.ht-tool-duration.busy { width: 7ch; }
+.ht-tool[data-status="failed"] > .ht-tool-line { color: var(--red); }
+.ht-failed { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--red); }
+.ht-spinner { flex: none; width: 12px; height: 12px; border: 2px solid color-mix(in srgb, var(--blue) 26%, transparent); border-top-color: var(--blue); border-right-color: var(--blue); border-radius: 50%; animation: ht-spin 1s linear infinite; }
+@keyframes ht-spin { to { transform: rotate(360deg); } }
+.ht-tool-body { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 8px 14px; padding: 4px 0 4px 14px; min-width: 0; box-shadow: inset 2px 0 var(--border); }
+.ht-locations { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.html-turn .ht-location { max-width: 100%; min-height: 20px; padding: 2px 9px; border-radius: 20px; background: var(--bg-panel); color: var(--blue); font: 11.5px/16px var(--mono); text-align: left; }
+.ht-location:hover, .ht-diff-path:hover { background: var(--bg-hover); text-decoration: underline; }
+.ht-tool-output { max-height: 320px; overflow: auto; overscroll-behavior: contain; contain: content; margin: 0; padding: 10px; border-radius: 7px; box-shadow: inset 0 0 0 1px var(--border); background: var(--bg-sidebar); color: var(--canvas-text-dim, var(--text-dim)); font: 12px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
+.ht-raw-output { max-height: 200px; padding: 8px; }
+.html-turn .ht-diff-path { display: block; width: 100%; min-height: 26px; padding: 6px 10px; border-radius: 7px 7px 0 0; box-shadow: inset 0 0 0 1px var(--border); background: var(--bg-panel); color: var(--blue); font: 11.5px/14px var(--mono); text-align: left; overflow-wrap: anywhere; }
+.ht-diff .ht-tool-output { border-radius: 0 0 7px 7px; }
+.ht-editor { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; border: 1px solid var(--border-light); border-radius: 14px; background: var(--bg-panel); }
+.ht-editor textarea { min-width: 0; min-height: 48px; max-height: min(240px, 36vh); padding: 0; resize: vertical; overflow: auto; border: 0; outline: 0; background: transparent; color: inherit; font: 14px/1.6 var(--sans); user-select: text; }
+.ht-editor-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ht-editor-actions > span { flex: 1; font-size: 12px; color: var(--canvas-text-faint, var(--text-faint)); }
+.ht-error { padding: 6px 0; color: var(--red); font-size: 12px; white-space: pre-wrap; }
+.ht-history { min-height: 240px; padding: 6px 0; color: var(--canvas-text-faint, var(--text-faint)); font-size: 13px; }
+.ht-history > span[role="alert"] { display: block; color: var(--red); }
+/* Override obsolete DOM typography with layoutItem's metrics; reuse Markdown's markup/actions. */
+/* Canvas adds each block's spacing; flex items prevent adjacent Markdown margins collapsing. */
+.html-turn .markdown { display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
+.html-turn .markdown :is(ul, ol) { margin: 0; padding: 0; list-style: none; }
+.html-turn .markdown li { position: relative; margin: 0; padding: 0 0 3px 22px; list-style: none; }
+.html-turn .markdown li::before { position: absolute; left: 0; top: 0; font: inherit; content: "•"; }
+.html-turn .markdown ol > li::before { content: counter(list-item) "."; }
+/* Parent text and every nested item each get exactly one 3px gap, never one per list container. */
+.html-turn .markdown li > :is(ul, ol) { margin-top: 3px; margin-bottom: -3px; }
+.html-turn .markdown li > p { margin: 0; }
+.html-turn .markdown h1, .html-turn .markdown h2, .html-turn .markdown h3, .html-turn .markdown h4, .html-turn .markdown h5, .html-turn .markdown h6 { font-weight: 700; line-height: 1.3; letter-spacing: normal; }
+.html-turn .markdown h3, .html-turn .markdown h4, .html-turn .markdown h5, .html-turn .markdown h6 { font-size: 1.05em; margin: 16px 0 8px; }
+.html-turn .markdown pre { border: 0; border-radius: 8px; box-shadow: inset 0 0 0 1px var(--border); white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.55 var(--mono); tab-size: 4; }
+.html-turn .markdown pre code { font: inherit; }
+/* paintStyledText reserves 5px gap + 7px chip padding on both sides. */
+.html-turn .markdown :not(pre) > code { margin: 0 5px; padding: 1px 7px; border: 0; box-shadow: 0 0 0 1px var(--border); }
+.html-turn .markdown blockquote { color: var(--canvas-text-dim, var(--text-dim)); line-height: 1.6; }
+.html-turn .markdown hr { height: 1px; border: 0; background: var(--border); margin: 12px 0; }
+/* Native auto-layout preserves short tables and content-driven columns; Canvas scales intrinsic columns proportionally. */
+.html-turn .markdown table { align-self: flex-start; width: auto; max-width: 100%; table-layout: auto; border-collapse: separate; border-spacing: 0; box-shadow: inset 1px 1px var(--border); font-size: 13px; line-height: 1.45; }
+.html-turn .markdown th { text-align: left; font-weight: 600; background: color-mix(in srgb, var(--bg-panel) 55%, transparent); }
+/* Canvas strokes the grid inside cells: a CSS border would add 1px per row/column. */
+.html-turn .markdown td, .html-turn .markdown th { border: 0; box-shadow: inset -1px -1px var(--border); overflow-wrap: anywhere; vertical-align: middle; }
+.ht-thought-body .markdown table { font-size: 12px; }
+.html-turn .markdown img { max-width: min(100%, 480px) !important; max-height: 300px !important; }
+.html-turn .markdown img[data-image-path] { cursor: pointer; }
+/* Canvas reserves a 300px image slot even when the source itself is smaller. */
+.html-turn .markdown .md-seg p:has(> img:only-child) { min-height: 300px; margin-bottom: 10px; }
+.html-turn .codeblock:focus-within .code-copy { opacity: 1; }
+.ht-thought-body .markdown pre { width: calc(100% + 14px); padding: 10px 12px; border-radius: 6px; background: var(--bg-sidebar); font-size: 12px; margin-bottom: 8px; }
+/* layoutItem renders thought prose (including headings/lists) as plain 13px blocks, 6px apart. */
+.ht-thought-body .markdown .md-seg :is(p, h1, h2, h3, h4, h5, h6, blockquote) { margin: 0 0 6px; padding: 0; border: 0; font-size: 13px; font-weight: 400; line-height: 1.6; }
+.ht-thought-body .markdown li { padding: 0 0 6px; }
+.ht-thought-body .markdown li::before { content: none; }
+.ht-thought-body .markdown li > :is(ul, ol) { margin-top: 6px; margin-bottom: -6px; }
+.ht-thought-body .markdown .md-seg li > p { margin: 0; }
+/* ponytail: large Markdown still parses to DOM once; skip offscreen block layout/paint.
+   Paragraph-level windowing would require changing Markdown's incremental renderer. */
+.ht-large-markdown .markdown .md-seg > :is(p, ul, ol, blockquote, table, .codeblock) { content-visibility: auto; contain-intrinsic-size: auto 24px; }
+@media (hover: none) { .ht-user-actions { opacity: 1; } .html-turn .codeblock .code-copy { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .ht-spinner { animation: none; } }

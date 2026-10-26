@@ -1,0 +1,43 @@
+.html-transcript {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  color: var(--canvas-text, var(--text));
+  /* Use the same brighter foreground as the former canvas, including nested Markdown. */
+  --text: var(--canvas-text, #d4d4d4);
+  --text-dim: var(--canvas-text-dim, #b8b8b8);
+  --text-muted: var(--canvas-text-muted, #8b8b8b);
+  --text-faint: var(--canvas-text-faint, #6e6e6e);
+  outline: none;
+}
+.html-transcript:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.html-transcript-space {
+  position: relative;
+  width: min(calc(100% + var(--transcript-gutter, 0px)), clamp(720px, 78vw, 980px));
+  margin-left: max(0px, calc((100% + var(--transcript-gutter, 0px) - clamp(720px, 78vw, 980px)) / 2));
+}
+.html-transcript-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  padding: 0 calc(clamp(14px, 3vw, 24px) + 10px);
+  display: flow-root;
+  /* Layout stays local, but do not paint-contain: menus and focus rings may escape. */
+  contain: layout style;
+}
+.html-transcript-loading { position: absolute; inset: 24px 34px auto; color: var(--text-faint); font-size: 13px; z-index: 1; }
+.html-transcript-empty {
+  padding: 24px calc(clamp(14px, 3vw, 24px) + 10px);
+  color: var(--text-faint);
+  font-size: 13px;
+}
+.html-transcript ::highlight(transcript-search) { color: inherit; background: color-mix(in srgb, var(--yellow) 50%, transparent); }
+.html-transcript .transcript-search-hit { outline: 1px solid color-mix(in srgb, var(--yellow) 45%, transparent); outline-offset: 3px; }

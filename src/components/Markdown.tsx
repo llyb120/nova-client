@@ -1,7 +1,9 @@
 import DOMPurify from "dompurify";
 import { Marked } from "marked";
 import { message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createSignal, onCleanup, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, onCleanup, Show, untrack } from "solid-js";
+import { LONG_MARKDOWN_THRESHOLD, type MarkdownChunk } from "../markdownChunks";
+import { LongMarkdown } from "./LongMarkdown";
 import { api } from "../ipc";
 import { linkedFile, openWorkspaceFile } from "../workspaceLinks";
 import { state } from "../store";
@@ -168,9 +170,9 @@ function withFileReferences(html: string): string {
   return template.innerHTML;
 }
 
-function renderMarkdown(src: string, markFiles: boolean): string {
+function renderMarkdown(src: string, markFiles: boolean, chunk?: MarkdownChunk): string {
   if (!src) return "";
-  const html = DOMPurify.sanitize(withCopyButtons(marked.parse(src, { async: false }) as string));
+  const html = DOMPurify.sanitize(withCopyButtons(chunk ? marked.parser(chunk.tokens) : marked.parse(src, { async: false }) as string));
   // 大多数回答没有文件路径，先用源文本做廉价预检，避免无意义地构建 template 并遍历整棵 DOM。
   return markFiles && FILE_REFERENCE_CANDIDATE_RE.test(src) ? withFileReferences(html) : html;
 }
@@ -207,11 +209,12 @@ function cachedRenderMarkdown(src: string, markFiles: boolean): string {
   return html;
 }
 
-export function Markdown(props: { text: string; markFiles?: boolean; live?: boolean }) {
+export function Markdown(props: { text: string; markFiles?: boolean; live?: boolean; virtual?: boolean }) {
   const fileMenu = createFileContextMenu();
   // 组件挂载时的内容属于已有快照（包括切换到仍在运行的会话），直接显示；
   // 只有同一实例后续收到的追加 delta 才进入预缓冲动画。
   const [shown, setShown] = createSignal(props.text);
+  const windowed = createMemo(() => !!props.virtual && shown().length > LONG_MARKDOWN_THRESHOLD);
   let revealRaf = 0;
   let lastTickAt = performance.now();
   let readyAt = 0;
@@ -268,7 +271,7 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
   // 否则中间帧会读到未追平的 shown 切片。
   createEffect(() => {
     const target = props.text;
-    if (props.live) return;
+    if (props.live || windowed()) return;
     const cur = untrack(shown);
     if (!target.startsWith(cur) || target !== cur) {
       stopTick();
@@ -286,6 +289,7 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
   const [tailHtml, setTailHtml] = createSignal("");
 
   createEffect(() => {
+    if (windowed()) { stableSrc = ""; return; }
     const full = shown();
     if (!full.startsWith(stableSrc)) {
       // 非纯追加更新（编辑消息 / 漫游重同步 / 组件被复用切换内容）：重置增量状态全量重渲
@@ -363,8 +367,13 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
   return (
     <>
       <div class="markdown" onClick={onClick} onContextMenu={onContextMenu}>
-        <div class="md-seg" ref={stableRef} />
-        <div class="md-seg" innerHTML={tailHtml()} />
+        <Show when={windowed()} fallback={<>
+          <div class="md-seg" ref={stableRef} />
+          <div class="md-seg" innerHTML={tailHtml()} />
+        </>}>
+          <LongMarkdown text={shown()} live={props.live} markFiles={props.markFiles} marked={marked}
+            render={(chunk, markFiles) => renderMarkdown(chunk.source, markFiles, chunk)} />
+        </Show>
       </div>
       <fileMenu.Menu />
     </>

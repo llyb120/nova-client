@@ -26,7 +26,7 @@ import { ensureHistoryItems, searchReveal, setSearchReveal } from "../store";
 import { resolveUserScrollStick } from "../scrollStick";
 import type { AgentKind, Item, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
-import { CanvasTranscript, type CanvasTranscriptHandle } from "./CanvasTranscript";
+import { HtmlTranscript, type HtmlTranscriptHandle } from "./HtmlTranscript";
 import { Composer } from "./Composer";
 import { IconBroadcast,IconCopy, IconDownload, IconFile, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
@@ -54,7 +54,7 @@ export function ChatView() {
   };
   onMount(() => window.addEventListener("nova:preview-file", previewFile));
   onCleanup(() => window.removeEventListener("nova:preview-file", previewFile));
-  let transcriptRef: CanvasTranscriptHandle | undefined;
+  let transcriptRef: HtmlTranscriptHandle | undefined;
   const [transcriptReady, setTranscriptReady] = createSignal(false);
   const [stickToBottom, setStickToBottom] = createSignal(true);
 
@@ -1084,7 +1084,7 @@ export function ChatView() {
       <div class="chat-shell">
         <div class="chat-primary">
       <div class="chat-body">
-          <CanvasTranscript
+          <HtmlTranscript
             ref={(handle) => { transcriptRef = handle; setTranscriptReady(true); scheduleBottomPin(); }}
             threadId={state.currentId}
             groups={groups()}
@@ -1097,7 +1097,7 @@ export function ChatView() {
             onReturnToCurrent={returnToCurrentTimeline}
             onScroll={(top, max, user) => {
               if (user) {
-                // 与 canvas 内部判定共用方向语义：上滚即解除吸底，下滚贴底才恢复。
+                // 与记录区共用方向语义：上滚即解除吸底，下滚贴底才恢复。
                 setStickToBottom(resolveUserScrollStick(lastScrollTop, top, max));
               }
               // user=false（rebuild 钉底/钳位）也要同步基准位置，

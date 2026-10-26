@@ -1,3 +1,4 @@
+// Reference renderer for the Canvas/HTML regression comparison; ChatView uses HtmlTranscript.
 import { processSegments, processSummary, processLiveLines, splitTurnBody } from "../processDisplay";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { message } from "@tauri-apps/plugin-dialog";
