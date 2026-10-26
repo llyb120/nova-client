@@ -438,9 +438,8 @@ fn sample_image(grab: impl FnOnce() -> Result<xcap::image::RgbaImage>, desktop_s
     let relevant_overlay = || desktop_surface.and_then(|s| overlay_on_surface(s, overlay_bounds(true)));
     let overlay = relevant_overlay();
     let image = grab()?;
-    if overlay != relevant_overlay() {
-        return Err("取样期间任务栏状态条范围改变，请重新截图".into());
-    }
+    // A changing self-UI overlay must not invalidate an unrelated screen observation.
+    let overlay = overlay.filter(|bounds| Some(*bounds) == relevant_overlay());
     let report = json!({"status":"not_checked","samples":1,"elapsedMs":started.elapsed().as_millis()});
     Ok((image, report, overlay))
 }
@@ -496,31 +495,36 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         let original_pixels = image.dimensions();
         let ignored_bounds = if desktop_capture && region.is_none() {
             // Mask only stable, actually visible Nova regions; never hide a foreign window above Nova.
-            let mut bounds = if nova_bounds == nova_regions::visible() { nova_bounds.clone() } else { Vec::new() };
-            bounds.extend(overlay);
-            bounds
+            // Butterfly children are included by Z order, independently of the input-guard hit test.
+            nova_regions::stable(&nova_bounds, &nova_regions::visible())
         } else { Vec::new() };
         // Retain real source pixels for safety; ignored UI cannot be clicked using a stale retained image.
         let mut guard = crate::visual_guard::VisualGuard::new(&image);
-        guard.mark_unobserved(ignored_bounds.iter().filter_map(|r| overlay_region(&surface, original_pixels, Some(*r))).collect());
+        let source_ignored: Vec<_> = ignored_bounds.iter().filter_map(|r| overlay_region(&surface, original_pixels, Some(*r))).collect();
+        guard.mark_unobserved(source_ignored.clone());
         let guard = Some(guard);
         let image = if let Some(r) = region {
             r.validate(original_pixels)?;
             xcap::image::imageops::crop_imm(&image, r.x, r.y, r.width, r.height).to_image()
         } else { image };
         let resize_started = Instant::now();
-        let mut image = if max_edge > 0 && (region.is_some() || image.width().max(image.height()) > max_edge) {
-            let scale = max_edge as f64 / image.width().max(image.height()) as f64;
-            let (width, height) = image.dimensions();
-            xcap::image::DynamicImage::ImageRgba8(image).resize_exact(
-                (width as f64 * scale).round().max(1.0) as u32,
-                (height as f64 * scale).round().max(1.0) as u32,
-                xcap::image::imageops::FilterType::Triangle).into_rgba8()
-        } else { image };
+        let resize = |image: xcap::image::RgbaImage| {
+            if max_edge > 0 && (region.is_some() || image.width().max(image.height()) > max_edge) {
+                let scale = max_edge as f64 / image.width().max(image.height()) as f64;
+                let (width, height) = image.dimensions();
+                xcap::image::DynamicImage::ImageRgba8(image).resize_exact(
+                    (width as f64 * scale).round().max(1.0) as u32,
+                    (height as f64 * scale).round().max(1.0) as u32,
+                    xcap::image::imageops::FilterType::Triangle).into_rgba8()
+            } else { image }
+        };
+        // Mask before filtering: animated self-UI edges must not bleed into neighbouring cells.
+        let plain = (!source_ignored.is_empty()).then(|| resize(nova_regions::comparison_pixels(&image, &source_ignored)));
+        let mut image = resize(image);
+        let plain = plain.unwrap_or_else(|| image.clone());
         resize_ms += resize_started.elapsed().as_millis();
         let ignored: Vec<_> = ignored_bounds.into_iter()
             .filter_map(|r| overlay_region(&surface, image.dimensions(), Some(r))).collect();
-        let plain = nova_regions::comparison_pixels(&image, &ignored);
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));

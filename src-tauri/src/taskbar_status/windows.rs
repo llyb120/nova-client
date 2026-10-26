@@ -477,7 +477,9 @@ unsafe fn refresh(shown: &mut Option<Status>) {
     let light = light_theme();
     if LIGHT.with(|l| l.replace(light)) != light { InvalidateRect(hwnd, null(), 0); }
     let current = window_rect(hwnd);
-    if IsWindowVisible(hwnd) == 0 || !current.as_ref().is_some_and(|r| same_rect(r, &layout.slot)) {
+    // Explorer may reorder its children without moving them. Keep our verified empty-slot
+    // chip above layout containers such as ReBar, never above the taskbar's top-level peers.
+    if IsWindowVisible(hwnd) == 0 || GetTopWindow(parent) != hwnd || !current.as_ref().is_some_and(|r| same_rect(r, &layout.slot)) {
         // UIA rectangles are physical; child placement is in its parent's client units.
         let previous = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(parent));
         if previous.is_null() { ShowWindow(hwnd, SW_HIDE); return; }
