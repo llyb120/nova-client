@@ -769,14 +769,14 @@ impl LyraRuntime {
                         ts: now_ms(),
                     })
             }
-            Some("error") => {
+            Some("error" | "system") => {
                 value
                     .get("message")
                     .and_then(Value::as_str)
                     .map(|text| Item::System {
                         id,
                         text: text.into(),
-                        level: "error".into(),
+                        level: if value["type"] == "error" { "error" } else { "info" }.into(),
                         ts: now_ms(),
                     })
             }

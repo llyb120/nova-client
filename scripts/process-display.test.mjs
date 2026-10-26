@@ -63,4 +63,17 @@ assert.deepEqual(splitTurnBody([reply(1, "结果"), reply(2, "补充")], true).c
 assert.deepEqual(splitTurnBody([body[2], memory(15)], true).conclusion.map(it => it.id), [12]);
 assert.deepEqual(splitTurnBody([body[2], {...tool(15, "other"), title: "save_memory"}, body.at(-1)], true).conclusion.map(it => it.id), [12, 16]);
 assert.deepEqual(splitTurnBody([], true), {process: [], conclusion: []});
+const modelLabel = (id, model) => ({type: "system", id, level: "info", text: `本段执行模型：${model}`});
+for (const finished of [false, true]) {
+  const noSwitch = splitTurnBody([modelLabel(1, "provider/light"), reply(2, "你好"), modelLabel(3, "provider/light")], finished);
+  assert.deepEqual([...noSwitch.process, ...noSwitch.conclusion], [reply(2, "你好")]);
+  const changed = splitTurnBody([modelLabel(1, "provider/light"), tool(2, "read"), modelLabel(3, "provider/code"),
+    modelLabel(4, "provider/code"), modelLabel(5, "provider/light"), reply(6, "完成")], finished);
+  assert.deepEqual([...changed.process, ...changed.conclusion].filter(it => it.type === "system").map(it => it.text),
+    ["模型切换：provider/light → provider/code", "模型切换：provider/code → provider/light"]);
+  const current = {type: "system", id: 1, text: "模型切换：provider/light → provider/code", level: "info"};
+  const warning = {type: "system", id: 2, text: "需要确认", level: "warn"};
+  const visible = splitTurnBody([current, warning, reply(3, "完成")], finished);
+  assert.deepEqual([...visible.process, ...visible.conclusion], [current, warning, reply(3, "完成")]);
+}
 console.log("process display checks passed");

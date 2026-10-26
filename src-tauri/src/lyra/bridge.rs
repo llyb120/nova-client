@@ -222,13 +222,21 @@ pub(super) fn turn_event_sink<'a>(
 ) -> impl FnMut(TurnEvent) + Send + 'a {
     let turn_started = Instant::now();
     let mut agent_message_index = 0u64;
+    let mut current_model = String::new();
     let mut current_text = String::new();
     let mut current_thinking = String::new();
     let mut started_tools = std::collections::HashMap::new();
     move |event| match event {
         TurnEvent::Steer(message) => emit(&json!({ "type": "steer", "message": message })),
-        TurnEvent::MessageStart => {
+        TurnEvent::MessageStart { model } => {
             agent_message_index += 1;
+            if !current_model.is_empty() && current_model != model {
+                emit(&json!({ "type": "item", "item": {
+                    "id": format!("model-{agent_message_index}"), "type": "system",
+                    "message": format!("模型切换：{current_model} → {model}")
+                } }));
+            }
+            current_model = model;
             emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
             current_text.clear();
             current_thinking.clear();
@@ -872,7 +880,7 @@ mod tests {
         let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
         let mut usage = json!({});
         let mut sink = turn_event_sink(&emit, "session", &mut usage);
-        sink(TurnEvent::MessageStart);
+        sink(TurnEvent::MessageStart { model: "provider/light".into() });
         sink(TurnEvent::TextDelta("hello".into()));
         sink(TurnEvent::TextDelta(" world".into()));
         sink(TurnEvent::ToolStart { id: "route".into(), name: crate::lyra::scene::TOOL.into(), args: json!({"scene":"coding","message":"task"}) });
@@ -881,12 +889,14 @@ mod tests {
         sink(TurnEvent::ToolEnd { id: "t1".into(), outcome: json!({"isError":true,"content":[{"type":"text","text":"not found"}]}) });
         sink(TurnEvent::Steer(user_message("check again", &[])));
         sink(TurnEvent::MessageEnd { usage: json!({"input":10,"output":2}) });
-        sink(TurnEvent::MessageStart);
+        sink(TurnEvent::MessageStart { model: "provider/light".into() });
         sink(TurnEvent::TextDelta("next".into()));
         sink(TurnEvent::MessageEnd { usage: json!({"input":20,"output":3}) });
         drop(sink);
         let events = events.lock().unwrap();
-        let items: Vec<_> = events.iter().filter(|e| e["type"] == "item").map(|e| &e["item"]).collect();
+        let model_items: Vec<_> = events.iter().filter(|e| e["type"] == "item" && e["item"]["type"] == "system").collect();
+        assert!(model_items.is_empty(), "initial and same-model requests are not switches");
+        let items: Vec<_> = events.iter().filter(|e| e["type"] == "item" && e["item"]["type"] != "system").map(|e| &e["item"]).collect();
         assert_eq!(items.len(), 5, "internal scene switches must not create visible tool cards");
         assert_eq!(items[0]["id"], items[1]["id"]);
         assert_eq!(items[1]["text"], "hello world");
@@ -900,6 +910,28 @@ mod tests {
         assert_eq!(usage["input"], 30);
         assert_eq!(usage["output"], 5);
         assert_eq!(usage["contextTokens"], 20);
+    }
+
+    #[test]
+    fn model_labels_only_mark_actual_changes_including_fallback_and_return() {
+        use super::*;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
+        let mut usage = json!({});
+        let mut sink = turn_event_sink(&emit, "models", &mut usage);
+        for model in ["light", "light", "code", "code", "backup", "light"] {
+            sink(TurnEvent::MessageStart { model: format!("provider/{model}") });
+        }
+        drop(sink);
+        let events = events.lock().unwrap();
+        let labels: Vec<_> = events.iter().filter(|e| e["type"] == "item")
+            .map(|e| e["item"]["message"].as_str().unwrap()).collect();
+        assert_eq!(labels, [
+            "模型切换：provider/light → provider/code",
+            "模型切换：provider/code → provider/backup",
+            "模型切换：provider/backup → provider/light",
+        ]);
     }
 
     #[tokio::test]

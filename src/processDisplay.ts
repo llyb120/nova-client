@@ -21,6 +21,16 @@ function memoryTool(item: ToolItem): "read" | "write" | null {
 
 /** Preserve the usual final-block folding, except for a short acknowledgement after memory maintenance. */
 export function splitTurnBody(body: Item[], finished: boolean): { process: Item[]; conclusion: Item[] } {
+  // 兼容旧记录：首个执行模型只是基线，不是切换；后续不同模型才展示，不修改存储记录。
+  let previousModel = "";
+  body = body.flatMap(item => {
+    if (item.type !== "system" || !item.text.startsWith("本段执行模型：")) return [item];
+    const model = item.text.slice("本段执行模型：".length).trim();
+    if (!model) return [];
+    const from = previousModel;
+    previousModel = model;
+    return from && from !== model ? [{ ...item, text: `模型切换：${from} → ${model}` }] : [];
+  });
   // 空思考与空/None 回复不渲染，却会切断过程折叠，导致连续工具被拆成多行“调用工具 ×1”。
   body = body.filter(item => (item.type !== "thought" && item.type !== "assistant") || !["", "None"].includes(item.text.trim()));
   if (!finished) return { process: body, conclusion: [] };

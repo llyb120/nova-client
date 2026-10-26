@@ -1900,6 +1900,15 @@ export function CanvasTranscript(props: CanvasTranscriptProps) {
     }
 
     if (item.type === "system") {
+      if (item.text.startsWith("模型切换：")) {
+        const model = item.text.split(" → ").at(-1)!.split("/").at(-1)!;
+        const text = ellipsize(`↪ ${model}`, Math.max(1, proseW - 2), 11.5, p.sans);
+        result.push({ kind: "system", id: item.id, groupIdx: gi,
+          x, y: y + 4, w: Math.min(proseW, measure(text, 11.5, p.sans) + 2), h: 24,
+          text, title: item.text, color: p.muted, fontSize: 11.5, font: p.sans,
+          selectable: true, data: { padX: 0, padY: 3 } });
+        return y + 32;
+      }
       const important = item.level === "error" || item.level === "warn" || item.level === "info";
       const color = item.level === "error" ? p.red : item.level === "warn" ? p.yellow
         : item.level === "info" ? `color-mix(in srgb, ${p.accent} 80%, ${p.text})` : p.faint;

@@ -25,7 +25,10 @@ test('ordinary agents stay separate from internal scene switching and fallback',
   const context = lib.match(/fn auto_mode_context\([\s\S]*?\n\}/)?.[0];
   assert.ok(context);
   assert.match(context,/switch_scene/);
-  assert.match(context,/自动恢复之前的模型继续用户任务/);
+  assert.match(context,/默认由目标场景完成剩余任务并直接交付/);
+  assert.match(context,/resume 参数写明具体后续工作/);
+  assert.match(context,/仅还原初始模型配置，不额外请求模型/);
+  assert.doesNotMatch(context,/自动恢复之前的模型继续用户任务/);
   assert.doesNotMatch(context,/scope\.scene\.label\(\)|结论会交回上游|spawn_agent/);
   const fallback = lib.match(/fn auto_failover\([\s\S]*?\n\}/)?.[0];
   assert.ok(fallback);
