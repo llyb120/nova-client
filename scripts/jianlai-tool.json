@@ -140,7 +140,7 @@
       "windowId": {
         "type": "integer",
         "minimum": 0,
-        "description": "windows返回的窗口ID（不是pid）：activate必填；普通screenshot/windows(observe)仅定位窗口所在显示器并截整屏，不裁窗口。显式background:true按background规则选择目标"
+        "description": "windows返回的窗口ID（不是pid）：activate必填；普通screenshot/windows(observe)仅定位窗口所在显示器并截整屏，不裁窗口、不激活窗口；需切换输入目标时按observe中的focused/observedWindowFocused规则处理。显式background:true按background规则选择目标"
       },
       "query": {
         "type": "string",
@@ -149,7 +149,7 @@
       },
       "observe": {
         "type": "boolean",
-        "description": "仅windows：普通模式同次调用附整屏截图，每屏独立流；优先windowId，其次query唯一命中来定位显示器，不裁窗口。指定query无匹配或有歧义时只返回候选信息；未指定windowId/query时返回所有显示器，不选择前台窗口所在屏幕。显式background:true按background规则观察。"
+        "description": "仅windows：普通模式查询不激活窗口；focused/observedWindowFocused=false且需操作目标窗口时先显式activate(windowId)并核对反馈，可按返回的nextCall调用；不得把命中窗口等同当前输入目标。同次调用附整屏截图，每屏独立流；优先windowId，其次query唯一命中来定位显示器，不裁窗口。指定query无匹配或有歧义时只返回候选信息；未指定windowId/query时返回所有显示器，不选择前台窗口所在屏幕。显式background:true按background规则观察。"
       },
       "background": {
         "type": "boolean",
@@ -168,7 +168,7 @@
       },
       "imagePath": {
         "type": "string",
-        "description": "recall：本会话旧截图path，仅回看，不可操作"
+        "description": "recall：本会话旧截图path，仅供阅读，不产生可操作快照；操作须用当前截图的snapshotId/imageId"
       },
       "notes": {
         "type": "string",

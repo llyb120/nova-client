@@ -94,6 +94,11 @@ test('Chrome and Jianlai run only executes pre-confirmed steps', async()=>{
   assert.match(jianlai.inputSchema.properties.notes.description,/原样返回，未经工具验证/);
   assert.match(jianlai.inputSchema.properties.experience.description,/返回accepted即可收尾/);
   assert.match(jianlai.inputSchema.properties.observe.description,/无匹配或有歧义/);
+  assert.match(jianlai.inputSchema.properties.observe.description,/普通模式查询不激活窗口.*focused\/observedWindowFocused=false.*先显式activate\(windowId\)并核对反馈.*nextCall.*不得把命中窗口等同当前输入目标/);
+  assert.match(jianlai.inputSchema.properties.windowId.description,/不激活窗口.*observe中的focused\/observedWindowFocused规则/);
+  assert.match(jianlai.inputSchema.properties.actions.description,/普通模式指针操作不因焦点隐式activate/);
+  assert.match(jianlai.inputSchema.properties.region.description,/新snapshotId\/imageId.*左上角\(0,0\).*images中的width\/height.*不加region偏移或使用显示放大后的坐标/);
+  assert.match(jianlai.inputSchema.properties.imagePath.description,/仅供阅读，不产生可操作快照.*当前截图的snapshotId\/imageId/);
   assert.equal(jianlai.inputSchema.properties.plan,undefined);
   assert.deepEqual(jianlai.inputSchema.properties.actions.items.allOf[0].then,{required:['x','y']});
   assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,24);

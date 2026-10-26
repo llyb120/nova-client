@@ -1129,6 +1129,19 @@ fn run(owner: String, mut args: Value) -> Result<Value> {
 }
 
 fn run_inner(owner: String, mut args: Value) -> Result<Value> {
+    // One physical coordinate plane for enumeration, capture, cursor readback and SendInput.
+    // Blocking-pool threads may inherit a different DPI context; restore it on every exit.
+    #[cfg(windows)]
+    let _dpi = {
+        use windows_sys::Win32::UI::HiDpi::*;
+        struct RestoreDpi(DPI_AWARENESS_CONTEXT);
+        impl Drop for RestoreDpi {
+            fn drop(&mut self) { unsafe { SetThreadDpiAwarenessContext(self.0); } }
+        }
+        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if previous.is_null() { return Err(format!("无法进入物理像素坐标模式：{}", std::io::Error::last_os_error())); }
+        RestoreDpi(previous)
+    };
     // Read-only requests often inherit unrelated optional fields from a prior action.
     // Keep the actual observation parameters strict, especially crop coordinates.
     let operation = args["operation"].as_str().unwrap_or_default().to_owned();
@@ -1219,6 +1232,11 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     Ok(observed) => {
                         result.as_object_mut().unwrap().extend(observed.as_object().unwrap().clone());
                         result["observedWindowId"] = json!(window_id);
+                        if let Some(id) = window_id.filter(|_| !bg) {
+                            let focused = result["foreground"][0].as_u64() == Some(id as u64);
+                            result["observedWindowFocused"] = json!(focused);
+                            if !focused { result["nextCall"] = json!({"operation":"activate","windowId":id}); }
+                        }
                         result["observedBy"] = json!(if target.is_some() {"query/windowId"} else if bg {"background"} else {"desktop"});
                     }
                     Err(e) => result["observationError"] = json!(e),
@@ -1263,19 +1281,15 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             };
             let mut result = capture(&owner, wid, mid, region, max_edge, &mut state)?;
             result["notes"] = json!(request.notes);
-            if region.is_some() {
-                result["coordinateNotice"] = json!("这是新裁剪图：act坐标从此图左上角(0,0)开始，禁止加region偏移或使用显示放大后的坐标；按images中的width/height定位。新snapshotId/imageId替换旧图，act反馈恢复所属完整屏幕（显式后台模式为原目标）。");
-            }
             Ok(result)
         }
         "recall" => {
             let path = dunce::canonicalize(request.image_path.ok_or("recall缺少imagePath")?).map_err(err)?;
             let folder = dunce::canonicalize(shot_folder(&owner, "desktop-shots")).map_err(err)?;
-            if !path.starts_with(folder) || !matches!(path.extension().and_then(|s| s.to_str()), Some("jpg" | "png")) {
+            if !path.starts_with(folder) || !matches!(path.extension().and_then(|s| s.to_str()), Some("webp" | "jpg" | "png")) {
                 return Err("只能回看本会话的桌面截图".into());
             }
-            Ok(json!({"images":[{"path":path}],"historical":true,
-                "notice":"历史截图仅供阅读，不产生可操作快照；操作前请使用当前截图"}))
+            Ok(json!({"images":[{"path":path}],"historical":true}))
         }
         "act" => {
             let actions = request.actions.as_deref().ok_or("缺少actions")?;
@@ -1472,9 +1486,6 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             if let Some(notice) = executed_notice(actions, completed, request.notes.as_deref()) {
                 result["executedNotice"] = json!(notice);
             }
-            if shot.region.is_some() {
-                result["coordinateNotice"] = json!("局部操作后的反馈恢复所属完整屏幕（显式后台模式为原目标）；按新返回的imageId使用对应图片内坐标");
-            }
             if failure.is_some() || request.feedback.as_deref() != Some("none") {
                 observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
             }
@@ -1490,7 +1501,6 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             if !frames.is_empty() {
                 frames.extend(result["images"].as_array().cloned().unwrap_or_default());
                 result["images"] = json!(frames);
-                result["framesNotice"] = json!("images中带frame的是第frame个scroll后的只读中间帧，仅供阅读；act用顶层最新snapshotId及最终观察的不带frame的基图/块imageId，各块坐标独立");
             }
             Ok(result)
         }
@@ -1676,6 +1686,23 @@ mod tests {
             assert!(!shot_folder(&owner, "desktop-shots").starts_with(session.parent().unwrap()), "{owner}");
         }
     }
+    #[cfg(windows)]
+    #[test]
+    fn desktop_requests_restore_the_callers_dpi_context_on_error() {
+        use windows_sys::Win32::UI::HiDpi::*;
+        unsafe {
+            let original = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+            assert!(!original.is_null());
+            let before = GetThreadDpiAwarenessContext();
+            // Rejected before capture or input: safe to run without touching the desktop.
+            let result = run_inner("dpi-test".into(),json!({"operation":"screenshot","maxEdge":1}));
+            let restored = AreDpiAwarenessContextsEqual(before,GetThreadDpiAwarenessContext());
+            SetThreadDpiAwarenessContext(original);
+            assert!(result.unwrap_err().contains("maxEdge"));
+            assert_ne!(restored,0,"blocking-pool callers must not inherit our physical coordinate scope");
+        }
+    }
+
     #[test]
     fn nova_refreshes_do_not_expand_desktop_deltas() {
         use xcap::image::{Rgba, RgbaImage};
