@@ -1,6 +1,10 @@
 // node scripts/markdown-chunks.test.mjs — real renderer, isolated browser; no user session/IPC.
 import assert from 'node:assert/strict';
-import { access, readFile, readdir } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+// Optional isolated comparison: LONG_MARKDOWN_REV=HEAD MARKDOWN_BENCH_OUTPUT=/tmp/md-before node scripts/markdown-chunks.test.mjs
+const revision = process.env.LONG_MARKDOWN_REV;
+const output = process.env.MARKDOWN_BENCH_OUTPUT;
 import { homedir } from 'node:os';
 import { createServer } from 'node:http';
 import { build } from 'esbuild';
@@ -57,7 +61,9 @@ const bundle = await build({
       FileContextMenu: 'export const createFileContextMenu=()=>({open(){},Menu:()=>null});',
     }[args.path], loader: 'js' }));
     builder.onLoad({ filter: /\.tsx$/ }, async ({path}) => {
-      const output = await transformAsync(await readFile(path, 'utf8'), {filename:path,configFile:false,babelrc:false,presets:[[solid,{generate:'dom'}]],parserOpts:{plugins:['jsx','typescript']}});
+      const source = revision && path.endsWith('/components/LongMarkdown.tsx')
+        ? execFileSync('git', ['show', `${revision}:src/components/LongMarkdown.tsx`], {encoding:'utf8'}) : await readFile(path, 'utf8');
+      const output = await transformAsync(source, {filename:path,configFile:false,babelrc:false,presets:[[solid,{generate:'dom'}]],parserOpts:{plugins:['jsx','typescript']}});
       return {contents:output.code,loader:'ts'};
     });
   }}],
@@ -84,8 +90,56 @@ try {
   await page.evaluate(text=>window.load(text),bounded);
   await page.waitForFunction(()=>document.querySelector('[data-markdown-chunk] p'));
   assert.ok(await page.locator('.markdown *').count()<1000,'Single 300k reply must have bounded DOM');
+  await page.waitForTimeout(100);
+  const emptyFrames=await page.evaluate(async()=>{
+    const root=document.querySelector('.html-transcript'),empty=[];
+    for(let frame=0;frame<60;frame++) {
+      await new Promise(requestAnimationFrame);
+      root.scrollTop+=300+(frame%6)*100;
+      // Sample each render opportunity, not a second rAF that masks cold blanks.
+      await new Promise(resolve=>setTimeout(resolve,0));
+      const viewport=root.getBoundingClientRect();
+      for(const chunk of root.querySelectorAll('[data-markdown-chunk]')) {
+        if(chunk.childElementCount)continue;
+        const rect=chunk.getBoundingClientRect();
+        if(rect.bottom>viewport.top&&rect.top<viewport.bottom)empty.push({frame,chunk:chunk.dataset.markdownChunk});
+      }
+    }
+    return empty;
+  });
+  assert.deepEqual(emptyFrames,[],'Fast cold scroll must not expose empty Markdown chunks');
   await page.evaluate(()=>document.querySelector('.html-transcript').scrollTop=180000);
   await page.waitForTimeout(160);
+  // Warm, real scroll frames: count native geometry/selection reads independently
+  // of noisy wall time. The fixture/driver are identical for HEAD and working tree.
+  const cdp=await page.context().newCDPSession(page);await cdp.send('Performance.enable');
+  const metrics=async()=>Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map(m=>[m.name,m.value]));
+  const beforeMetrics=await metrics();
+  const scroll=await page.evaluate(async()=>{
+    const root=document.querySelector('.html-transcript'),rect=Element.prototype.getBoundingClientRect,selection=window.getSelection;
+    let rectReads=0,selectionReads=0;const frames=[];
+    Element.prototype.getBoundingClientRect=function(){rectReads++;return rect.call(this)};
+    window.getSelection=function(){selectionReads++;return selection.call(window)};
+    try {
+      let previous=performance.now();
+      for(let i=0;i<180;i++) {
+        await new Promise(requestAnimationFrame);const now=performance.now();frames.push(now-previous);previous=now;
+        root.scrollTop+=i<90?24:-24;
+      }
+      await new Promise(requestAnimationFrame);
+      frames.sort((a,b)=>a-b);
+      return {rectReads,selectionReads,frames:frames.length,frameP95Ms:frames[Math.floor(frames.length*.95)],frameMaxMs:frames.at(-1)};
+    } finally {Element.prototype.getBoundingClientRect=rect;window.getSelection=selection}
+  });
+  const afterMetrics=await metrics();
+  const benchmark={revision:revision??'working',...scroll,scriptMs:(afterMetrics.ScriptDuration-beforeMetrics.ScriptDuration)*1000,
+    layoutMs:(afterMetrics.LayoutDuration-beforeMetrics.LayoutDuration)*1000,layouts:afterMetrics.LayoutCount-beforeMetrics.LayoutCount};
+  console.log('Markdown scroll:',JSON.stringify(benchmark));
+  if(!revision) {
+    assert.ok(scroll.rectReads<scroll.frames*8,`Scroll must use cached block geometry, got ${scroll.rectReads} reads`);
+    assert.ok(scroll.selectionReads<scroll.frames,`IO must not read selection per chunk, got ${scroll.selectionReads} reads`);
+  }
+  if(output){await mkdir(output,{recursive:true});await writeFile(`${output}/metrics.json`,JSON.stringify(benchmark,null,2));await page.screenshot({path:`${output}/scroll.png`})}
   const anchorBefore=await page.evaluate(()=>{
     const root=document.querySelector('.html-transcript'),top=root.getBoundingClientRect().top;
     window.anchorNode=[...document.querySelectorAll('.md-virtual p')].find(p=>p.getBoundingClientRect().bottom>top);
@@ -102,11 +156,25 @@ try {
   await page.waitForTimeout(100);
   const anchorAfter=await page.evaluate(()=>window.anchorNode.getBoundingClientRect().top-document.querySelector('.html-transcript').getBoundingClientRect().top);
   assert.ok(Math.abs(anchorBefore-anchorAfter)<2,`Internal reflow moved reading anchor by ${anchorAfter-anchorBefore}px`);
+  // The scroll's NEW reading block must already be remembered before a later
+  // animation-frame image/font resize, not the old block or post-resize geometry.
+  const race=await page.evaluate(async()=>{
+    const root=document.querySelector('.html-transcript');root.scrollTop+=120;
+    await new Promise(requestAnimationFrame);
+    const top=root.getBoundingClientRect().top;
+    window.anchorNode=[...document.querySelectorAll('.md-virtual p')].find(p=>p.getBoundingClientRect().bottom>top);
+    const before=window.anchorNode.getBoundingClientRect().top-top;
+    const above=window.anchorNode.previousElementSibling;
+    if(!above)throw Error('Expected a block immediately above the new reading anchor');
+    above.style.paddingTop='73px';return before;
+  });
+  await page.waitForTimeout(100);
+  assert.ok(Math.abs(await page.evaluate(()=>window.anchorNode.getBoundingClientRect().top-document.querySelector('.html-transcript').getBoundingClientRect().top)-race)<2,'Scroll followed by async reflow lost the new reading block');
   await page.evaluate(()=>document.querySelector('.html-transcript').style.width='480px');
   await page.waitForTimeout(140);
   assert.ok(await page.locator('.markdown *').count()<1000,'Resize must keep DOM bounded');
   const resizedAnchor=await page.evaluate(()=>window.anchorNode.getBoundingClientRect().top-document.querySelector('.html-transcript').getBoundingClientRect().top);
-  assert.ok(Math.abs(anchorBefore-resizedAnchor)<2,'Resize must retain the native reading block');
+  assert.ok(Math.abs(race-resizedAnchor)<2,'Resize must retain the native reading block');
   const found=await page.evaluate(()=>{
     const detail={query:'hidden alpha bold omega'};
     document.querySelector('[data-markdown-virtual]').dispatchEvent(new CustomEvent('markdown-reveal',{detail}));

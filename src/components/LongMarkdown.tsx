@@ -17,7 +17,8 @@ export function LongMarkdown(props: {
   marked: Marked;
   render: (chunk: MarkdownChunk, markFiles: boolean) => string;
 }) {
-  type Entry = { element: HTMLDivElement; chunk: MarkdownChunk; near: boolean; mounted: boolean; dirty: boolean; height: number; plain?: string };
+  type Block = { element: HTMLElement; top: number; bottom: number };
+  type Entry = { element: HTMLDivElement; chunk: MarkdownChunk; near: boolean; mounted: boolean; dirty: boolean; height: number; offset: number; blocks: Block[]; plain?: string };
   let host!: HTMLDivElement;
   let root: HTMLElement | null = null;
   let model = chunkMarkdown(props.marked, untrack(() => props.text));
@@ -33,26 +34,56 @@ export function LongMarkdown(props: {
   let anchor: { element: HTMLElement; offset: number } | undefined;
   let bottom = false;
   let anchorScrollTop = 0;
+  let scrollFrame = 0;
+  let margin = 0;
+
+  function indexHeights() {
+    // ponytail: O(chunks) only on geometry/source changes, never plain scroll;
+    // a prefix-sum tree is the upgrade if resize/streaming profiles warrant it.
+    let offset = 0;
+    for (const entry of entries) { entry.offset = offset; offset += entry.height; }
+  }
+
+  function measure(entry: Entry, height?: number) {
+    const rect = entry.element.getBoundingClientRect();
+    entry.height = height ?? rect.height;
+    entry.blocks = Array.from(entry.element.children, element => {
+      const block = element.getBoundingClientRect();
+      return { element: element as HTMLElement, top: block.top - rect.top, bottom: block.bottom - rect.top };
+    });
+  }
 
   function rememberAnchor() {
+    cancelAnimationFrame(scrollFrame); scrollFrame = 0;
     if (!root) return;
     anchorScrollTop = root.scrollTop;
-    const top = root.getBoundingClientRect().top;
-    const max = root.scrollHeight - root.clientHeight;
-    bottom = max > 0 && max - root.scrollTop <= 2;
+    // Only the host origin is live: a parent can move this reply without resizing
+    // its chunks. Block geometry stays pre-reflow until RO restores the anchor.
+    const top = root.getBoundingClientRect().top - host.getBoundingClientRect().top;
+    const height = root.clientHeight, max = root.scrollHeight - height;
+    bottom = max > 0 && max - anchorScrollTop <= 2;
     let lo = 0, hi = entries.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (entries[mid].element.getBoundingClientRect().bottom <= top) lo = mid + 1;
+      if (entries[mid].offset + entries[mid].height <= top) lo = mid + 1;
       else hi = mid;
     }
     const entry = entries[lo];
     anchor = undefined;
-    if (!entry || entry.element.getBoundingClientRect().top >= top + root.clientHeight) return;
-    // Anchor the first visible native block, not a whole multi-paragraph chunk.
-    const element = Array.from(entry.element.children).find(child => child.getBoundingClientRect().bottom > top) as HTMLElement | undefined;
-    const target = element ?? entry.element;
-    anchor = { element: target, offset: target.getBoundingClientRect().top - top };
+    if (!entry || entry.offset >= top + height) return;
+    // Direct children are vertically ordered by md-seg's flex column layout.
+    lo = 0; hi = entry.blocks.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (entry.offset + entry.blocks[mid].bottom <= top) lo = mid + 1;
+      else hi = mid;
+    }
+    const block = entry.blocks[lo];
+    anchor = { element: block?.element ?? entry.element, offset: entry.offset + (block?.top ?? 0) - top };
+  }
+
+  function scrolled() {
+    if (!scrollFrame) scrollFrame = requestAnimationFrame(rememberAnchor);
   }
 
   function restoreAnchor() {
@@ -68,10 +99,17 @@ export function LongMarkdown(props: {
     rememberAnchor();
   }
 
-  function refresh() { entries.forEach(paint); restoreAnchor(); }
+  function refresh(candidates: Iterable<Entry> = entries) {
+    if (root && Math.abs(root.scrollTop - anchorScrollTop) > 1) rememberAnchor();
+    const selection = window.getSelection(), active = document.activeElement;
+    const measured: Entry[] = [];
+    for (const entry of candidates) if (paint(entry, selection, active)) measured.push(entry);
+    // Batch writes before reads; ordinary scroll/IO never scans native children.
+    if (measured.length) { measured.forEach(entry => measure(entry)); indexHeights(); }
+    restoreAnchor();
+  }
 
-  function selected(entry: Entry) {
-    const selection = window.getSelection();
+  function selected(entry: Entry, selection: Selection | null) {
     if (!selection || selection.isCollapsed) return false;
     for (let i = 0; i < selection.rangeCount; i++) {
       if (selection.getRangeAt(i).intersectsNode(entry.element)) return true;
@@ -79,23 +117,26 @@ export function LongMarkdown(props: {
     return false;
   }
 
-  function paint(entry: Entry) {
-    const pin = selected(entry);
-    const wanted = entry.near || pin || searchPins.has(entry) || entry.element.contains(document.activeElement);
+  function paint(entry: Entry, selection: Selection | null, active: Element | null) {
+    const pin = selected(entry, selection), focused = entry.element.contains(active);
+    const wanted = entry.near || pin || searchPins.has(entry) || focused;
     if (wanted) {
-      if (!entry.mounted || (entry.dirty && !pin && !entry.element.contains(document.activeElement))) {
+      if (!entry.mounted || (entry.dirty && !pin && !focused)) {
         entry.element.innerHTML = props.render(entry.chunk, markFiles);
         entry.element.style.height = "";
         entry.mounted = true;
         entry.dirty = false;
-        sizes?.observe(entry.element);
+        sizes?.observe(entry.element, { box: "border-box" });
+        return true;
       }
     } else if (entry.mounted) {
       sizes?.unobserve(entry.element);
       entry.element.style.height = `${entry.height}px`;
       entry.element.replaceChildren();
       entry.mounted = false;
+      entry.blocks = [];
     }
+    return false;
   }
 
   function sync() {
@@ -116,7 +157,7 @@ export function LongMarkdown(props: {
         const lines = chunk.source.split("\n").reduce((n, line) => n + Math.max(1, Math.ceil(line.length * 8 / width)), 0);
         const height = Math.max(24, lines * 20);
         element.style.height = `${height}px`;
-        entry = { element, chunk, near: false, mounted: false, dirty: true, height };
+        entry = { element, chunk, near: false, mounted: false, dirty: true, height, offset: 0, blocks: [] };
         entries.push(entry);
         byElement.set(element, entry);
         host.append(element);
@@ -134,6 +175,7 @@ export function LongMarkdown(props: {
       searchPins.delete(entry);
       entry.element.remove();
     }
+    indexHeights();
     refresh();
   }
 
@@ -190,42 +232,51 @@ export function LongMarkdown(props: {
   }
 
   function observe() {
+    const height = root?.clientHeight || window.innerHeight;
+    // IO already tracks width/position changes; only its pixel margin needs a rebuild.
+    if (observer && margin === height) return;
+    margin = height;
     observer?.disconnect();
     observer = new IntersectionObserver(changes => {
-      // Read all outgoing sizes before DOM writes (including image/font reflow).
+      const changed: Entry[] = [];
       for (const change of changes) {
         const entry = byElement.get(change.target);
-        if (!entry) continue;
-        if (entry.mounted) entry.height = entry.element.getBoundingClientRect().height;
+        if (!entry || entry.near === change.isIntersecting) continue;
         entry.near = change.isIntersecting;
+        changed.push(entry);
       }
-      refresh();
-    }, { root, rootMargin: `${root?.clientHeight || window.innerHeight}px 0px` });
+      if (changed.length) refresh(changed);
+    }, { root, rootMargin: `${height * 2}px 0px` });
     entries.forEach(entry => observer!.observe(entry.element));
   }
 
   onMount(() => {
     root = host.closest<HTMLElement>(".html-transcript");
     sizes = new ResizeObserver(changes => {
+      // Scroll may precede RO (including a late image load). Capture its NEW
+      // reading block against the OLD cached geometry before replacing the cache.
+      if (root && Math.abs(root.scrollTop - anchorScrollTop) > 1) rememberAnchor();
+      let changed = false;
       for (const change of changes) {
         const entry = byElement.get(change.target);
-        if (entry?.mounted) entry.height = change.borderBoxSize[0]?.blockSize ?? change.contentRect.height;
+        if (!entry?.mounted) continue;
+        measure(entry, change.borderBoxSize[0]?.blockSize);
+        changed = true;
       }
-      restoreAnchor();
+      if (changed) { indexHeights(); restoreAnchor(); }
     });
     observe();
     sync();
     // First paint does not depend on IO delivery. Seed the local viewport using
     // placeholders; the transcript's initial bottom pass then triggers IO there.
-    const viewport = root?.getBoundingClientRect();
-    const top = viewport?.top ?? 0, height = root?.clientHeight || window.innerHeight;
+    const top = (root?.getBoundingClientRect().top ?? 0) - host.getBoundingClientRect().top;
+    const height = root?.clientHeight || window.innerHeight;
     for (const entry of entries) {
-      const rect = entry.element.getBoundingClientRect();
-      entry.near = rect.bottom >= top - height && rect.top <= top + height * 2;
+      entry.near = entry.offset + entry.height >= top - height * 2 && entry.offset <= top + height * 3;
     }
     refresh();
     ready = true;
-    root?.addEventListener("scroll", rememberAnchor, { passive: true });
+    root?.addEventListener("scroll", scrolled, { passive: true });
     rootSize = new ResizeObserver(observe);
     rootSize.observe(root ?? document.documentElement);
     document.addEventListener("selectionchange", selectionChanged);
@@ -234,9 +285,10 @@ export function LongMarkdown(props: {
   });
   onCleanup(() => {
     clearTimeout(timer);
+    cancelAnimationFrame(scrollFrame);
     observer?.disconnect(); sizes?.disconnect(); rootSize?.disconnect();
     document.removeEventListener("selectionchange", selectionChanged);
-    root?.removeEventListener("scroll", rememberAnchor);
+    root?.removeEventListener("scroll", scrolled);
     host?.removeEventListener("focusout", focusChanged);
     host?.removeEventListener("markdown-reveal", reveal);
   });

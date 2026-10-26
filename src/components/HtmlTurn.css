@@ -29,7 +29,7 @@
 .html-turn .ht-fold > svg { flex: none; color: var(--canvas-text-faint, var(--text-faint)); }
 .ht-user { padding: 20px 0 16px; }
 .ht-user-display { display: flex; justify-content: flex-end; min-width: 0; }
-.ht-user-column { max-width: 85%; min-width: 34px; display: flex; flex-direction: column; align-items: flex-end; }
+.ht-user-column { max-width: min(85%, calc(100% - 80px)); min-width: 34px; display: flex; flex-direction: column; align-items: flex-end; }
 .ht-bubble-wrap { position: relative; max-width: 100%; }
 .ht-bubble-wrap:has(.ht-bubble-images) { min-width: 72px; }
 .ht-user-bubble {
@@ -54,8 +54,6 @@
 .ht-clickable { cursor: pointer; }
 .ht-attachment { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; color: var(--blue); overflow-wrap: anywhere; }
 .ht-user-actions { position: absolute; display: flex; right: calc(100% + 4px); bottom: 4px; gap: 2px; opacity: 0; }
-/* Keep resend/edit in the Canvas gutter; copy overlays the bubble rather than stealing another 24px. */
-.ht-user-actions > button:first-child { position: absolute; left: calc(100% + 8px); bottom: 0; }
 .ht-user-column:has(.ht-long-prompt) .ht-user-actions > button:first-child { display: none; }
 .ht-user-actions button, .ht-copy-prompt { display: grid; place-items: center; flex: none; width: 24px; height: 24px; border-radius: 6px; color: var(--canvas-text-faint, var(--text-faint)); }
 .ht-user:hover .ht-user-actions, .ht-user:focus-within .ht-user-actions { opacity: 1; }
