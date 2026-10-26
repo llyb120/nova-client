@@ -1171,6 +1171,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// 手动真实会话：普通任务提示，不提供 parallel 包装，按真实命令执行区间验证原生并发。
+    #[tokio::test]
+    #[ignore = "需要真实 provider 配置，会产生模型费用"]
+    async fn inprocess_parallel_live_smoke() {
+        use super::*;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let config = Roots::global().load_config(None).unwrap();
+        let model = std::env::var("NOVA_PARALLEL_LIVE_MODEL").ok()
+            .unwrap_or_else(|| config::default_model(&config).unwrap());
+        let text = std::env::var("NOVA_PARALLEL_LIVE_PROMPT").unwrap_or_else(|_| "请帮我运行这三项测试，简短汇报各自是否通过：node --experimental-strip-types scripts/process-display.test.mjs；node --experimental-strip-types scripts/tool-display.test.mjs；node --test scripts/tool-completion-switch.test.mjs。只测试，不修改文件。".into());
+        let request = json!({
+            "action":"prompt", "cwd":root, "mode":"build", "model":model,
+            "parts":[{"type":"text","text":text}]
+        });
+        let mut session = super::spawn_prompt(super::super::provider::http_client(), request, true, None, None);
+        let started = Instant::now();
+        let mut rounds = 0;
+        let mut completed = Vec::new();
+        let mut batches = 0;
+        let mut done = false;
+        let mut answer = String::new();
+        let mut failure = None;
+        let mut command_output = String::new();
+        let observed = tokio::time::timeout(Duration::from_secs(180), async {
+            while let Some(line) = session.events.recv().await {
+                let event: Value = serde_json::from_str(&line).unwrap();
+                if event["type"] == "timing" && event["phase"] == "provider_turn" { rounds += 1; }
+                if event["ok"] == false { failure = event["error"].as_str().map(str::to_owned); }
+                if event["type"] == "done" { done = event["cancelled"] == false; }
+                let item = &event["item"];
+                if item["type"] == "agent_message" { answer = item["text"].as_str().unwrap_or_default().into(); }
+                if item["status"] == "completed" {
+                    if item["tool"] == "parallel" { batches += 1; }
+                    if matches!(item["tool"].as_str(), Some("bash" | "exec_command" | "write_stdin")) {
+                        command_output.push_str(item["aggregated_output"].as_str().unwrap_or_default());
+                        command_output.push_str(&item["result"].to_string());
+                    }
+                    let row = json!({"tool":item["tool"],"providerRound":rounds,"elapsedMs":started.elapsed().as_millis(),
+                        "isError":item.get("isError").cloned().unwrap_or(json!(false)),
+                        "command":item.get("command").unwrap_or(&item["arguments"]["command"]),
+                        "executionStartedAt":item["details"]["executionStartedAt"],
+                        "executionEndedAt":item["details"]["executionEndedAt"]});
+                    println!("LIVE_TOOL {row}");
+                    completed.push(row);
+                }
+            }
+        }).await;
+        if observed.is_err() {
+            let _ = session.control.send(json!({"action":"cancel"}).to_string());
+            if tokio::time::timeout(Duration::from_secs(5), &mut session.task).await.is_err() { session.task.abort(); }
+            panic!("真实会话超过 180 秒，已取消；模型轮次={rounds}");
+        }
+        session.task.await.unwrap();
+        let intervals: Vec<_> = completed.iter().filter_map(|row| Some((row["executionStartedAt"].as_u64()?, row["executionEndedAt"].as_u64()?))).collect();
+        let overlap = intervals.iter().enumerate().any(|(i, &(a, b))| intervals[i + 1..].iter().any(|&(c, d)| a < d && c < b));
+        println!("LIVE_SUMMARY {}", json!({"model":model,"providerRequests":rounds,"parallelBatches":batches,
+            "commandsOverlap":overlap,"elapsedMs":started.elapsed().as_millis(),"completedTools":completed.len(),"done":done,"answer":answer}));
+        assert!(failure.is_none(), "真实 provider 失败：{failure:?}");
+        assert!(done, "真实会话未正常完成");
+        if std::env::var("NOVA_PARALLEL_LIVE_PROMPT").is_err() {
+            for evidence in ["process display checks passed", "Tool display:", "冷切换先接通推流", "暖切换先接通推流"] {
+                assert!(command_output.contains(evidence), "缺少实际测试输出：{evidence}；结果：{command_output}");
+            }
+        }
+        assert_eq!(batches, 0, "不能依赖 parallel 包装");
+        assert!(overlap, "未观察到实际命令执行区间重叠；不能把少轮次当作真并发");
+    }
+
     /// 手动端到端验证（需真实 provider 配置）：进程内 spawn_prompt 全事件流 + run_oneshot。
     #[tokio::test]
     #[ignore = "需要真实 provider 配置，手动验证用"]

@@ -248,7 +248,7 @@ pub fn agent_tools() -> Vec<Tool> {
     let target_only = json!({ "type": "object", "properties": { "target": target }, "required": ["target"] });
     let spawn = Tool {
         name: "spawn_agent",
-        description: format!("Start a sub-agent on a self-contained task; it runs in the background with your tools and working directory. Use for independent work that can proceed in parallel, then wait_agent for results. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
+        description: format!("Start a sub-agent on a self-contained task; it runs in the background with your tools and working directory. Start independent tasks with multiple native spawn_agent calls in the same turn, then continue other independent work; use wait_agent only when its results are needed. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
         parameters: json!({
             "type": "object",
             "properties": {
