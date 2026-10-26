@@ -233,6 +233,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     s?.autoChangeProjectEnabled !== false,
   );
   const [ponytailEnabled, setPonytailEnabled] = createSignal(s?.ponytailEnabled ?? true);
+  const [ponytailLevel, setPonytailLevel] = createSignal<"lite" | "full" | "ultra">(
+    s?.ponytailLevel === "lite" ? "lite" : s?.ponytailLevel === "ultra" ? "ultra" : "full",
+  );
   const [checkpointEnabled, setCheckpointEnabled] = createSignal(
     s?.checkpointEnabled ?? false,
   );
@@ -542,6 +545,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     powershellUtf8Enabled: powershellUtf8Enabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
     ponytailEnabled: ponytailEnabled(),
+    ponytailLevel: ponytailLevel(),
     checkpointEnabled: checkpointEnabled(),
     contextRetrievalMode: contextRetrievalMode(),
 
@@ -1443,9 +1447,26 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  默认开启。让 Lyra 以“懒惰资深工程师”方式工作：能不写就不写，优先复用现有代码/标准库/原生能力，最小 diff、最少文件。保存后对新会话生效。
+                  默认开启。让 Lyra 以“懒惰资深工程师”方式工作，完成最小但完整的变更。保存后对新会话生效。
                 </span>
               </div>
+              <label class="field">
+                <span class="field-label">ponytail 强度</span>
+                <select
+                  class="field-input"
+                  value={ponytailLevel()}
+                  disabled={!ponytailEnabled()}
+                  onChange={(e) =>
+                    setPonytailLevel(
+                      e.currentTarget.value === "lite" ? "lite" : e.currentTarget.value === "ultra" ? "ultra" : "full",
+                    )
+                  }
+                >
+                  <option value="lite">lite：先给出更小方案</option>
+                  <option value="full">full：最小完整实现（默认）</option>
+                  <option value="ultra">ultra：同时质疑不必要需求</option>
+                </select>
+              </label>
               <div class="field">
                 <span class="field-label">PowerShell UTF-8 输出</span>
                 <label class="backend-switch">

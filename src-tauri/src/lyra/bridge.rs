@@ -408,6 +408,7 @@ async fn handle_prompt(
         skills_text: format_skills_prompt(&skills),
         custom_instructions: agent_instructions,
         ponytail: settings.ponytail_enabled,
+        ponytail_level: settings.ponytail_level.clone(),
         desktop,
     };
     let mut system_prompt = build_system_prompt(&prompt_options);
