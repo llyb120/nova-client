@@ -545,7 +545,7 @@
           "screenshot",
           "none"
         ],
-        "description": "act/evaluate反馈：默认新DOM（上次有图则附图）；screenshot附视口图，沿用fullPage描述中的分块增量与坐标规则；none不返回观察（evaluate仍返回value）"
+        "description": "act/evaluate反馈：默认新DOM（上次有图则附图）；screenshot附视口图，沿用fullPage描述中的分块增量与坐标规则；none不返回观察（evaluate仍返回value）。act/evaluate返回的openedTabs是本次由源页新开的标签/窗口；默认仅对唯一active且可操作的新页自动观察并返回新的tabTag，sourceTabTag记录原输入页；多个、后台或不可操作候选不猜，按openedTabs选择；不要把旧页未变化视为点击失败。feedback=none不自动观察。按新tabTag/snapshotId继续，不重放开页动作。"
       },
       "actions": {
         "type": "array",

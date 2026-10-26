@@ -47,10 +47,14 @@ test('Chrome retains image coordinates, fast scope and bounded batch schemas',as
   assert.equal(chrome.inputSchema.properties.actions.maxItems,16);
   assert.equal(chrome.inputSchema.properties.incognito.type,"boolean");
   assert.equal(chrome.inputSchema.properties.actions.items.properties.duration_ms.maximum,1500);
-  assert.match(chrome.inputSchema.properties.fullPage.description,/32×32.*合并相邻块/);
-  assert.match(chrome.inputSchema.properties.fullPage.description,/只保留当前关键帧组/);
+  assert.match(chrome.inputSchema.properties.fullPage.description,/3×3九宫格.*最多9块.*先横后竖.*不跨未变格/);
+  assert.doesNotMatch(chrome.inputSchema.properties.fullPage.description,/32×32/);
+  assert.match(chrome.inputSchema.properties.fullPage.description,/只保留当前关键帧组.*各流独立保留.*压缩后自动补回.*无需read\/recall/);
   assert.match(chrome.inputSchema.properties.fullPage.description,/deltaOf.*x\/y一次/);
   assert.match(chrome.inputSchema.properties.fullPage.description,/expandScroll.*完整独立图片/);
+  assert.match(chrome.inputSchema.properties.feedback.description,/openedTabs.*本次由源页新开.*唯一active且可操作.*自动观察.*新的tabTag.*sourceTabTag记录原输入页.*多个、后台或不可操作候选不猜.*按openedTabs选择.*不要把旧页未变化视为点击失败.*feedback=none不自动观察.*按新tabTag\/snapshotId继续，不重放开页动作/);
+  assert.match(chrome.inputSchema.properties.fullPage.description,/images\[\]\.unchanged=true.*未重复附图.*本次snapshotId\/imageId.*不代表动作失败.*不重放输入或循环截图/);
+  assert.doesNotMatch(await readFile(new URL('../src-tauri/src/native_browser.rs',import.meta.url),'utf8'),/"(?:deltaNotice|unchangedNotice)"/);
 });
 test('short lookahead is available without experience and Chrome exposes a pre-action guard', async()=>{
   const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));

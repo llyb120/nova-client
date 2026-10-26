@@ -208,6 +208,11 @@ pub(crate) fn executing_browser_action() -> bool {
 }
 
 async fn execute_browser(root: &Path, args: &Value, owner: &str, tool: &str) -> Result<Value, String> {
+    #[cfg(test)]
+    if let Ok(result) = tests::ACTION_RESULT.try_with(Clone::clone) {
+        assert_eq!(args["operation"], "act", "new-tab handoff must not re-observe");
+        return Ok(result);
+    }
     BROWSER_ACTION.scope(args["operation"] == "act", async { match tool {
         "chrome" => Box::pin(crate::native_browser::execute_chrome(root, args, owner)).await,
         _ => Err("不支持的浏览器".into()),
@@ -716,6 +721,17 @@ impl Run<'_> {
             "actions":batch.iter().map(|c| c.label.clone()).collect::<Vec<_>>(),"status":result["status"],
             "completedActions":completed,"scrollFeedback":result["scrollFeedback"],"reason":result["reason"],"basedOnSnapshotId":self.snapshot}));
         self.latest = result.clone();
+        if result["openedTabs"].as_array().is_some_and(|tabs| !tabs.is_empty()) {
+            // Only the transport chooses an observed target; never pick from openedTabs here.
+            if let Some(target) = result[self.target_key].as_str() { self.target = target.to_string(); }
+            self.snapshot = result["snapshotId"].clone(); // No observation also invalidates the old snapshot.
+            if node == "step" {
+                let index = self.step_index;
+                self.step_index += completed;
+                if let Some(last) = self.history.last_mut() { last["steps"] = json!((index + 1..=self.step_index).collect::<Vec<_>>()); }
+            }
+            return Err("操作打开新标签页，已停止后续步骤；交回主模型，按 openedTabs 确认目标及对应观察，不重放已执行步骤".into());
+        }
         if result["canReobserve"] == true && self.preflight < 3 {
             // Only DOM preflight failed: nothing was pressed or typed. Never replay the old ref.
             self.preflight += 1;
@@ -973,8 +989,10 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
             .map(|v| json!({"saved":true,"id":v["experience"]["id"]})).unwrap_or_else(|e| json!({"saved":false,"error":e}))
     } else { Value::Null };
     let handoff = outcome.is_err();
-    if handoff {
-        // Hand back with fresh evidence: the main model continues from the latest observation.
+    let opened_tabs = latest["openedTabs"].as_array().is_some_and(|tabs| !tabs.is_empty());
+    if handoff && !opened_tabs {
+        // Preserve new-tab evidence, including ambiguous candidates without an observation.
+        // Otherwise hand back with fresh evidence for the current target.
         match execute_browser(root, &run.inspect_args(), owner, tool).await {
             Ok(observed) => latest.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default()),
             Err(error) => latest["observationError"] = json!(error),
@@ -1003,7 +1021,8 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
         "experience":saved,
         // Diagnostics only matter on handoff; a completed run stays small for the main model.
         "trace":if handoff { json!(run.trace.iter().rev().take(12).rev().collect::<Vec<_>>()) } else { Value::Null },
-        "next":if handoff { "按 reason 处理：用最新 snapshotId 直接 act，或修正 guided.remainingSteps 后重新 run；不重放已执行步骤。" }
+        "next":if opened_tabs { "按 openedTabs 确认继续操作的标签页；只使用该 tabTag 对应的 snapshotId，没有对应观察时先 inspect；不重放已完成步骤。" }
+            else if handoff { "按 reason 处理：用最新 snapshotId 直接 act，或修正 guided.remainingSteps 后重新 run；不重放已执行步骤。" }
             else if run.plan.check_goal { "步骤与完成条件已按页面文字核验；最终答案仍须核对真实数据、筛选与排序。" }
             else { "步骤已全部执行（未给 expectedText，未做完成核验）；按返回的观察/vision 自行判断结果。" },
         "notice":"run 只按主模型给出的 steps 在最新 DOM 上执行并做文字核验，不替主模型决策。history[].effect 是实际变化，不等于目标完成。"});
@@ -1016,6 +1035,58 @@ mod tests {
 
     fn hints(pages: &Value, used: &HashSet<String>) -> Vec<Candidate> { candidates(pages, used).unwrap() }
     fn plan(value: Value) -> Plan { parse(&json!({"plan":value})).unwrap() }
+
+    tokio::task_local! { pub(super) static ACTION_RESULT: Value; }
+
+    #[tokio::test]
+    async fn opened_tabs_handoff_keeps_target_progress_and_stops() {
+        let raw_steps = json!([{"action":"press","key":"Tab"},
+            {"action":"click","name":"Open"},{"action":"press","key":"Enter"}]);
+        for (opened, target, snapshot) in [
+            (json!([{"tabTag":"child","active":true,"controllable":true}]), "child", json!("child-snapshot")),
+            (json!([{"tabTag":"child","active":true,"controllable":true},
+                {"tabTag":"other","active":false,"controllable":true}]), "source", Value::Null),
+            (json!([{"tabTag":"child","active":false,"controllable":true}]), "source", Value::Null),
+            (json!([{"tabTag":"child","active":true,"controllable":false}]), "source", Value::Null),
+        ] {
+            for (node, completed) in [("step", 0usize), ("step", 1), ("step", 2), ("reveal", 1)] {
+                let mut result = json!({"status":"needs_review","completedActions":completed,
+                    "tabTag":target,"openedTabs":opened});
+                if snapshot.is_string() {
+                    result["snapshotId"] = snapshot.clone();
+                    result["sourceTabTag"] = json!("source");
+                    result["pages"] = json!([{"url":"https://child.test/"}]);
+                }
+                let mut run = Run {
+                    root: Path::new("."), owner: "test", tool: "chrome", target_key: "tabTag", target: "source".into(),
+                    plan: plan(json!({"task":"Open a new tab","steps":raw_steps})),
+                    snapshot: json!("source-snapshot"), latest: Value::Null,
+                    history: Vec::new(), trace: Vec::new(),
+                    refreshes: 0, executed: 0, preflight_recoveries: 0, preflight: 0,
+                    used: HashSet::new(), state_actions: HashMap::new(), baseline: None, loading_since: None,
+                    raw_steps: raw_steps.clone(), step_index: 1, resolved_locally: 0,
+                    checks: Vec::new(), step_candidates: Vec::new(),
+                };
+                let batch = vec![Candidate::new(json!({"action":"click","ref":"open"}), json!("open"),
+                    json!("open"), "Open".into(), "Open"), press_candidate(&run.plan.steps[2], 2)];
+                let error = ACTION_RESULT.scope(result.clone(),
+                    run.perform(&json!({}), "source-state", HashSet::new(), batch, node)).await.unwrap_err();
+                assert!(error.contains("新标签页"), "{error}");
+                assert_eq!(run.target, target);
+                assert_eq!(run.inspect_args()["tabTag"], target);
+                assert_eq!(run.snapshot, snapshot, "never retain the source snapshot without feedback");
+                assert_eq!(run.latest, result, "preserve the act evidence without guessing a candidate");
+                assert_eq!(run.executed, completed);
+                assert_eq!(run.refreshes, 0);
+                assert_eq!(run.history.len(), 1);
+                assert_eq!(run.history[0]["completedActions"], completed);
+                let resume = if node == "step" { 1 + completed } else { 1 };
+                assert_eq!(run.step_index, resume);
+                assert_eq!(run.history[0]["steps"], if node == "step" { json!((2..=resume).collect::<Vec<_>>()) } else { Value::Null });
+                assert_eq!(run.raw_steps.as_array().unwrap()[run.step_index..], raw_steps.as_array().unwrap()[resume..]);
+            }
+        }
+    }
 
     #[test]
     fn run_requires_main_model_steps() {

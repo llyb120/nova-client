@@ -1422,6 +1422,13 @@ async fn control_session(
         if let Some((_, frame)) = script {
             if observation.frames.get(frame).is_none() { return Err("frame 不在该快照中，请按观察返回的frame执行".into()); }
         }
+        // Compare inventories, not foreground focus: unrelated/user-created tabs must never become our target.
+        let opens_tab = |action: &Action| matches!(action, Action::Click{..} | Action::ClickAt{..} | Action::Press{..});
+        let source_tag = s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?;
+        let before_tabs = if script.is_some() || actions.iter().any(opens_tab) {
+            Some(crate::chrome_browser::request(app, "tabs", json!({})).await?)
+        } else { None };
+        let mut opened = Vec::new();
         // Background tabs throttle animation/timer sampling, making stable DOM targets time out as "moving".
         // Activate the explicitly bound tab before live checks; stale geometry/identity is still checked by apply.
         crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
@@ -1457,13 +1464,25 @@ async fn control_session(
                 }
             }
         }
-        for action in &actions {
+        for (index, action) in actions.iter().enumerate() {
             let began=std::time::Instant::now();
             let applied=apply(app,&s,&observation,action,args["imageId"].as_str(),&mut progress).await;
             action_timings.push(began.elapsed().as_millis());
             match applied {
                 Ok(())=>progress.completed+=1,
                 Err(error)=>{failure=Some(error);break;},
+            }
+            if index + 1 < actions.len() {
+                if let Some(before) = &before_tabs {
+                    match crate::chrome_browser::request(app, "tabs", json!({})).await {
+                        Ok(after) => opened = opened_tabs(before, &after, source_tag),
+                        Err(error) => { failure = Some(format!("动作后标签查询失败，余下动作未执行：{error}")); break; }
+                    }
+                    if !opened.is_empty() {
+                        failure = Some("动作已打开新标签页或窗口，余下动作未执行".into());
+                        break;
+                    }
+                }
             }
         }
         let mut result=json!({"status":if failure.is_none(){"executed"}else if progress.attempted{"needs_review"}else{"not_executed"},
@@ -1494,7 +1513,25 @@ async fn control_session(
             }
             completed_action = Some(result.clone());
         }
-        if (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
+        if progress.attempted && !s.cancel.load(Ordering::SeqCst) {
+            if let Some(before) = &before_tabs {
+                match crate::chrome_browser::request(app, "tabs", json!({})).await {
+                    Ok(after) => {
+                        let latest = opened_tabs(before, &after, source_tag);
+                        if !latest.is_empty() { opened = latest; }
+                    }
+                    Err(error) => result["tabDiscoveryError"] = json!(error),
+                }
+            }
+        }
+        if !opened.is_empty() {
+            result["openedTabs"] = json!(opened);
+            result["sourceTabTag"] = json!(source_tag);
+            completed_action = Some(result.clone());
+        }
+        // Capturing the source would reactivate it over the popup. Observe a proven new target
+        // after releasing this session's gate; ambiguous targets return only the new-tab inventory.
+        if opened.is_empty() && (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
             let mut feedback_args = args.clone();
             feedback_args["fullPage"] = json!(false);
             feedback_args["__delta"] = json!(failure.is_none() && script.is_none());
@@ -1757,7 +1794,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
     let mut result = SHOT_OWNER.scope(owner.to_owned(), execute_chrome_inner(root, &normalized, owner)).await?;
     if let Some(op) = inferred { result["operationInferred"] = json!(op); }
     if args.get("tabTag").is_none() && normalized["tabTag"].is_string() {
-        result["tabTag"] = normalized["tabTag"].clone();
+        if !result["tabTag"].is_string() { result["tabTag"] = normalized["tabTag"].clone(); }
         result["targetResolvedFrom"] = json!(if args.get("snapshotId").is_some() { "snapshotId" } else { "sessionObservation" });
     }
     Ok(with_experience_hint("chrome", &thread_id, result))
@@ -1930,6 +1967,16 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     if matches!(operation, "act" | "evaluate") && value["status"] != "not_executed" { retire_desktop(&mut value); }
     value["tabTag"] = json!(tag);
     value["browser"] = json!("chrome");
+    if matches!(operation, "act" | "evaluate") && args["feedback"] != "none" {
+        if let Some(target) = opened_tab_target(&value).map(str::to_owned) {
+            let mode = if args["feedback"] == "screenshot" { "screenshot" } else { "inspect" };
+            let mut observe_args = args.clone();
+            if mode == "inspect" { observe_args["visual"] = json!("none"); }
+            let observed = observe_tab(app, &thread_id, &target, &observe_args, mode, Duration::from_secs(8)).await;
+            value.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
+            value["tabTag"] = json!(target);
+        }
+    }
     if matches!(operation, "act" | "evaluate") && value["status"] != "executed" { value = errors_first(value); }
     Ok(value)
 }
@@ -1959,6 +2006,21 @@ fn chrome_session(thread_id: &str, tag: &str) -> Session {
         thread_id: thread_id.into(),
         active_tab: format!("chrome:{thread_id}:{tag}"),
         cancel: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+fn opened_tabs(before: &Value, after: &Value, source: &str) -> Vec<Value> {
+    let Some(before) = before["tabs"].as_array() else { return Vec::new() };
+    let known: std::collections::HashSet<_> = before.iter().filter_map(|tab| tab["tag"].as_str()).collect();
+    after["tabs"].as_array().into_iter().flatten().filter(|tab|
+        tab["openerTag"] == source && tab["tag"].as_str().is_some_and(|tag| !known.contains(tag)))
+        .cloned().collect()
+}
+
+fn opened_tab_target(result: &Value) -> Option<&str> {
+    match result["openedTabs"].as_array()?.as_slice() {
+        [tab] if tab["active"] == true && tab["controllable"] == true && tab["allowed"] != false => tab["tag"].as_str(),
+        _ => None,
     }
 }
 
@@ -2029,6 +2091,29 @@ fn state_dir(app: &AppHandle) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_feedback_follows_only_one_new_active_child() {
+        let before = json!({"tabs":[{"tag":"source"},{"tag":"old-child","openerTag":"source"}]});
+        for window in [1, 2] {
+            let child = json!({"tag":"new-child","openerTag":"source","active":true,"controllable":true,"windowId":window});
+            let after = json!({"tabs":[{"tag":"source"},{"tag":"old-child","openerTag":"source"},
+                {"tag":"unrelated","openerTag":"other","active":true},child]});
+            let opened = opened_tabs(&before, &after, "source");
+            assert_eq!(opened, vec![child.clone()], "tabs and separate popup windows share opener-based discovery");
+            let mut result = json!({"openedTabs":opened});
+            assert_eq!(opened_tab_target(&result), Some("new-child"));
+            for (key, value) in [("active",false),("controllable",false),("allowed",false)] {
+                let mut blocked = result.clone();
+                blocked["openedTabs"][0][key] = json!(value);
+                assert_eq!(opened_tab_target(&blocked),None,"{key}: never guess or focus a background/restricted tab");
+            }
+            result["openedTabs"].as_array_mut().unwrap().push(json!({"tag":"second-child","active":true,"controllable":true}));
+            assert_eq!(opened_tab_target(&result),None,"multiple children require a model decision");
+            assert!(opened_tabs(&after,&after,"source").is_empty(),"old children are not a new action effect");
+            assert!(opened_tabs(&json!({}),&after,"source").is_empty(),"missing baseline cannot prove a new tab");
+        }
+    }
 
     #[test]
     fn guard_miss_repeat_is_same_page_and_spot() {
