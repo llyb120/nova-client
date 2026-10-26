@@ -24,6 +24,7 @@ import {
 import { mountSessionShortcuts, setShortcutCaptureActive } from "../sessionShortcuts";
 import { ensureHistoryItems, searchReveal, setSearchReveal } from "../store";
 import { resolveUserScrollStick } from "../scrollStick";
+import { groupAtY } from "../transcriptViewport";
 import type { AgentKind, Item, ThreadMeta, TimeMachineCheckpoint, TimeMachinePrompt, TimeMachineTimeline } from "../types";
 import { agentLabel } from "../utils";
 import { HtmlTranscript, type HtmlTranscriptHandle } from "./HtmlTranscript";
@@ -89,6 +90,7 @@ export function ChatView() {
       return [{ index, turn, label: text || `第 ${turn} 轮` }];
     });
   });
+  const timeStopIndices = createMemo(() => timeStops().map(stop => stop.index));
   const [activeTimeIndex, setActiveTimeIndex] = createSignal(-1);
   const latestTimeIndex = () => timeStops().at(-1)?.index ?? -1;
 
@@ -97,12 +99,7 @@ export function ChatView() {
     if (stops.length === 0) { setActiveTimeIndex(-1); return; }
     if (!transcriptRef) return;
     const groupIndex = transcriptRef.activeGroup();
-    let best = 0;
-    for (const stop of stops) {
-      if (stop.index > groupIndex) break;
-      best = stop.index;
-    }
-    setActiveTimeIndex(best);
+    setActiveTimeIndex(stops[groupAtY(timeStopIndices(), groupIndex)].index);
   };
 
   const travelTo = (index: number) => {

@@ -2,6 +2,8 @@
 // node scripts/html-transcript.test.mjs --renderer=both --output=/tmp/transcript-baseline
 // node scripts/html-transcript.test.mjs --renderer=html --build-only
 // --only=deferred,inline-search runs named top-level scenario prefixes (reported as partial coverage).
+// --only=scroll-hotpath --renderer=both [--revision=HEAD] profiles frozen git source or the current worktree.
+// CPU/trace and text-coverage replays are separate; structural failures are saved, not hidden by timing gates.
 // TEST_BROWSER overrides Chromium; TEST_NODE_MODULES supports a sibling worktree.
 // Screenshots compare content/anchors, not pixel equality (HTML and Canvas have different rasterization).
 import assert from 'node:assert/strict';
@@ -12,10 +14,12 @@ import { createServer } from 'node:http';
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
+import { installScrollProbe, scrollHotpath } from './transcript-scroll-perf.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const args = process.argv.slice(2);
-assert.ok(args.every(arg => arg === '--build-only' || /^(--renderer|--output|--only)=.+$/.test(arg)), 'Options: --build-only --renderer=html|canvas|both --output=PATH --only=PREFIX,...');
+assert.ok(args.every(arg => arg === '--build-only' || /^(--renderer|--output|--only|--revision)=.+$/.test(arg)), 'Options: --build-only --renderer=html|canvas|both --output=PATH --only=PREFIX,... --revision=HEAD');
 const selectedChecks = args.find(arg => arg.startsWith('--only='))?.slice('--only='.length).split(',') ?? [];
 const rendererArg = args.find(arg => arg.startsWith('--renderer='))?.split('=')[1] ?? 'html';
 assert.ok(['html', 'canvas', 'both'].includes(rendererArg), 'Unknown renderer');
@@ -24,6 +28,16 @@ const buildOnly = args.includes('--build-only');
 const outputArg = args.find(arg => arg.startsWith('--output='))?.slice('--output='.length);
 const output = outputArg ? path.resolve(outputArg) : await mkdtemp(path.join(tmpdir(), 'html-transcript-'));
 await mkdir(output, { recursive: true });
+const revision = args.find(arg => arg.startsWith('--revision='))?.slice('--revision='.length);
+let sourceRoot = root;
+const sourceCommit = execFileSync('git', ['rev-parse', '--verify', `${revision || 'HEAD'}^{commit}`], { cwd: root, encoding: 'utf8' }).trim();
+if (revision) {
+  sourceRoot = await mkdtemp(path.join(tmpdir(), 'transcript-revision-'));
+  // Read-only git archive: never stash, checkout, or rewrite the working tree.
+  const archive = execFileSync('git', ['archive', '--format=tar', sourceCommit, 'src'], { cwd: root, maxBuffer: 64 * 1024 * 1024 });
+  execFileSync('tar', ['-x', '-C', sourceRoot], { input: archive });
+}
+const source = { commit: sourceCommit, revision: revision || null, worktree: !revision };
 let deps;
 for (const candidate of [process.env.TEST_NODE_MODULES, path.join(root, 'node_modules'), path.resolve(root, '../nova-client/node_modules')].filter(Boolean)) {
   try { await access(path.join(candidate, 'esbuild/package.json')); deps = path.resolve(candidate); break; } catch {}
@@ -73,7 +87,7 @@ const cancelBottomFollow=()=>{stickToBottom=false;};
 const pinBottom=()=>{if(stickToBottom&&handle){parentPins++;handle.scrollToBottom();lastScrollTop=handle.scrollTop();}};
 const scheduleBottomPin=()=>{if(scrollQueued)return;scrollQueued=true;queueMicrotask(()=>{scrollQueued=false;pinBottom();});};
 const enableBottomFollow=()=>{stickToBottom=true;scheduleBottomPin();};
-const onScroll=(top,max,user)=>{if(user){parentUserScrolls++;stickToBottom=resolveUserScrollStick(lastScrollTop,top,max);}lastScrollTop=top;};
+const onScroll=(top,max,user)=>{window.__scrollProbe?.notifyScroll(user);if(user){parentUserScrolls++;stickToBottom=resolveUserScrollStick(lastScrollTop,top,max);}lastScrollTop=top;};
 let phaseStart=performance.now(), lastFrame=phaseStart, gaps=[], longTasks=[], peakRows=0, peakElements=0;
 const host=()=>document.getElementById('fixture');
 const dom=()=>({rows:host()?.querySelectorAll('.html-transcript-row[data-group-index]').length||0,
@@ -86,6 +100,7 @@ function frame(){const now=performance.now();gaps.push(now-lastFrame);lastFrame=
     paintedFrames.push({visible,top:handle?.scrollTop(),max:handle?.maxScrollTop(),text:renderer==='canvas'?paints.map(p=>p.text).join(' ').slice(-300):''});
   },0);}
 }
+window.__scrollProbe?.ignore(frame);
 requestAnimationFrame(frame);
 if(PerformanceObserver.supportedEntryTypes.includes('longtask'))new PerformanceObserver(list=>{
   longTasks.push(...list.getEntries().filter(e=>e.startTime>=phaseStart).map(e=>e.duration));
@@ -134,6 +149,67 @@ function loadItems(ids){
 }
 window.test={
   load(count){replace(Array.from({length:count},(_,i)=>group(i)));},
+  position(){return {top:handle.scrollTop(),max:handle.maxScrollTop()};},
+  scrollTop(){return handle.scrollTop();},
+  async prepareScroll(kind){
+    if(kind==='markdown')this.largeMarkdown();
+    else if(kind==='dense')replace(Array.from({length:2000},(_,i)=>({body:[{type:'assistant',id:i+1,ts:0,text:'short-message-'+i}]})),'dense-scroll');
+    else this.load(2000);
+    for(let i=0;i<12;i++)await nextFrame();
+    this.jump(kind==='markdown'?0:kind==='dense'?100:750);
+    for(let i=0;i<12;i++)await nextFrame();
+    if(kind==='markdown')this.scroll(20000);
+    let previous='',stable=0;
+    for(let i=0;i<120&&stable<8;i++){
+      await nextFrame();
+      const current=JSON.stringify(this.position());stable=current===previous?stable+1:0;previous=current;
+    }
+    if(stable<8)throw Error('Scroll geometry did not converge before '+kind);
+  },
+  scrollAnchor(){return renderer==='html'?anchor():{index:handle.activeGroup(),offset:handle.scrollTop()};},
+  scrollCoverage(){
+    const position=this.position();
+    if(renderer==='canvas'){
+      const canvas=host().querySelector('canvas.transcript-canvas-only'),height=canvas?.clientHeight||0;
+      const visible=paints.filter(p=>p.text.trim()&&p.y>0&&p.y<height);
+      return {...position,visibleText:visible.length,example:visible[0]?.text};
+    }
+    const root=host().querySelector('.html-transcript'),bounds=root.getBoundingClientRect();
+    let visibleText=0,example='',visibleRows=0;
+    const rowRects=[],emptyChunks=[];
+    const space=root.querySelector('.html-transcript-space');
+    if(getComputedStyle(space).visibility==='hidden')return {...position,visibleText,visibleRows,example};
+    for(const row of root.querySelectorAll('.html-transcript-row[data-group-index]')){
+      const box=row.getBoundingClientRect();if(box.bottom<=bounds.top||box.top>=bounds.bottom)continue;
+      visibleRows++;
+      rowRects.push({index:Number(row.dataset.groupIndex),top:box.top-bounds.top,bottom:box.bottom-bounds.top});
+      for(const chunk of row.querySelectorAll('[data-markdown-chunk]')){
+        const rect=chunk.getBoundingClientRect();
+        if(rect.bottom>bounds.top&&rect.top<bounds.bottom&&!chunk.childElementCount)emptyChunks.push(Number(chunk.dataset.markdownChunk));
+      }
+      const walker=document.createTreeWalker(row,NodeFilter.SHOW_TEXT);
+      let node;
+      while((node=walker.nextNode())){
+        if(!node.textContent.trim()||node.parentElement.closest('button,[aria-hidden="true"]')||getComputedStyle(node.parentElement).visibility==='hidden')continue;
+        const range=document.createRange();range.selectNodeContents(node);
+        if([...range.getClientRects()].some(rect=>rect.width>0&&rect.bottom>bounds.top&&rect.top<bounds.bottom)){
+          visibleText++;example||=node.textContent.slice(0,80);
+        }
+      }
+    }
+    rowRects.sort((a,b)=>a.index-b.index);
+    const start=rowRects[0]?.index===0?Math.max(0,24-position.top):0;
+    const end=bounds.height-(rowRects.at(-1)?.index===session().groups.length-1?Math.max(0,16-(position.max-position.top)):0);
+    let cursor=start,coveredPx=0,maxGapPx=0,maxOverlapPx=0,readingOrder=true;
+    for(let i=0;i<rowRects.length;i++){
+      const row=rowRects[i],top=Math.max(start,row.top),bottom=Math.min(end,row.bottom);
+      maxGapPx=Math.max(maxGapPx,top-cursor);
+      if(i){maxOverlapPx=Math.max(maxOverlapPx,Math.min(cursor,bottom)-top);if(row.top<rowRects[i-1].top)readingOrder=false;}
+      coveredPx+=Math.max(0,bottom-Math.max(cursor,top));cursor=Math.max(cursor,bottom);
+    }
+    maxGapPx=Math.max(maxGapPx,end-cursor);
+    return {...position,visibleText,visibleRows,example,rowRects,coveredPx,expectedPx:end-start,maxGapPx,maxOverlapPx,readingOrder,emptyChunks};
+  },
   visual(){const groups=Array.from({length:3},(_,i)=>({...group(i,'请检查这段代码'),body:[{type:'assistant',id:i*3+2,ts:0,text:'answer-'+i+' **bold** 中文 😀 and [link](https://example.invalid)\\n\\n- Markdown list\\n- native content\\n\\n~~~js\\nconst round = '+i+';\\n~~~\\n\\nanswer-end-'+i}]}));replace(groups,'visual');},
   rich(){
     const g={user:{type:'user',id:101,ts:0,text:'请检查变更并给出结果。\\n保留原生选择、图片和工具详情。',images:[{name:'fixture.svg',mimeType:'image/svg+xml',data:btoa('<svg xmlns="http://www.w3.org/2000/svg" width="240" height="80"><rect width="240" height="80" fill="#41609a"/><text x="20" y="48" fill="white">image fixture</text></svg>')}]},body:[
@@ -239,7 +315,7 @@ render(()=>{
     if(!up&&!down)return;event.preventDefault();handle.scrollBy(down?100:-100);
     if(down&&handle.isAtBottom()&&!stickToBottom)enableBottomFollow();else if(!handle.isAtBottom())cancelBottomFollow();
   },true);
-  queueMicrotask(()=>new MutationObserver(sampleDom).observe(host(),{childList:true,subtree:true}));
+  if(!window.__scrollProbe)queueMicrotask(()=>new MutationObserver(sampleDom).observe(host(),{childList:true,subtree:true}));
   return <div id="fixture"><Transcript ref={value=>{handle=value;scheduleBottomPin();}} threadId={session().id}
     groups={session().groups} running={session().running} loading={session().loading} permissions={[]} loadItems={loadItems}
     onScroll={onScroll} onBrowseDetail={cancelBottomFollow}
@@ -256,7 +332,7 @@ async function solid(source, filename) {
 
 async function bundle(renderer) {
   const outdir = path.join(output, `.bundle-${renderer}`);
-  return build({ absWorkingDir: root, stdin: { contents: await solid(fixture(renderer), path.join(root, 'fixture.tsx')), resolveDir: root, sourcefile: 'fixture.tsx', loader: 'ts' },
+  return build({ absWorkingDir: sourceRoot, stdin: { contents: await solid(fixture(renderer), path.join(sourceRoot, 'fixture.tsx')), resolveDir: sourceRoot, sourcefile: 'fixture.tsx', loader: 'ts' },
     bundle: true, write: false, outdir, entryNames: 'bundle', platform: 'browser', format: 'esm', target: 'es2022',
     conditions: ['browser'], nodePaths: [deps], define: { 'import.meta.env.DEV': 'false', 'import.meta.env.PROD': 'true' },
     loader: { '.woff2': 'file', '.woff': 'file', '.ttf': 'file', '.svg': 'file', '.png': 'file', '.webp': 'file' },
@@ -288,6 +364,7 @@ async function run(browser, renderer, port, report) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1, reducedMotion: 'reduce' });
   // Fixtures contain no remote images: prevent accidental IPC/provider/network side effects.
   await context.route('**/*', route => new URL(route.request().url()).origin === `http://127.0.0.1:${port}` ? route.continue() : route.abort());
+  if (selectedChecks.some(prefix => prefix.startsWith('scroll-hotpath'))) await context.addInitScript(installScrollProbe);
   const page = await context.newPage();
   report.parentContract = 'ChatView onScroll/direction, microtask bottom pin, browse-detail cancellation, input keyboard guard; no full App/Tauri backend';
   const errors = [];
@@ -338,6 +415,9 @@ async function run(browser, renderer, port, report) {
     if (renderer === 'html') {
       assert.equal(await page.locator('#fixture canvas').count(), 0, 'HTML transcript must not paint text into a canvas');
       assert.equal(await page.locator('.html-transcript').getAttribute('tabindex'), '0', 'Transcript must be keyboard focusable');
+    }
+    if (selectedChecks.some(prefix => prefix.startsWith('scroll-hotpath'))) {
+      await check('scroll-hotpath', () => scrollHotpath({ page, context, renderer, output, report, check, settle }));
     }
     for (const theme of ['ink-dark', 'ink-light']) for (const width of [1280, 980]) {
       await check(`visual-${theme}-${width}`, async () => {
@@ -837,11 +917,13 @@ try {
   }
   const comparison = reports.length === 2 ? reports[1].scenarios.flatMap(html => {
     const canvas = reports[0].scenarios.find(row => row.name === html.name);
-    return canvas ? [{ scenario: html.name, htmlP95Ms: html.frameP95Ms, canvasP95Ms: canvas.frameP95Ms,
-      p95Ratio: canvas.frameP95Ms ? html.frameP95Ms / canvas.frameP95Ms : null,
-      htmlElements: html.peakElements, canvasElements: canvas.peakElements }] : [];
+    return canvas ? [{ scenario: html.name, htmlP95Ms: html.frameP95Ms ?? html.frameGapMs?.p95, canvasP95Ms: canvas.frameP95Ms ?? canvas.frameGapMs?.p95,
+      p95Ratio: (html.frameP95Ms ?? html.frameGapMs?.p95) / (canvas.frameP95Ms ?? canvas.frameGapMs?.p95) || null,
+      htmlElements: html.peakElements, canvasElements: canvas.peakElements,
+      ...(html.metrics ? { htmlMetricsPerFrame: html.metricsPerFrame, canvasMetricsPerFrame: canvas.metricsPerFrame,
+        htmlRowReads: html.work.rectReads.row, canvasRowReads: canvas.work.rectReads.row } : {}) }] : [];
   }) : [];
-  const result = { buildOnly, selectedChecks, partialCoverage: selectedChecks.length > 0, browserPath, viewport: { width: 1280, height: 800, deviceScaleFactor: 1 }, limits, reports, comparison };
+  const result = { buildOnly, source, selectedChecks, partialCoverage: selectedChecks.length > 0, browserPath, viewport: { width: 1280, height: 800, deviceScaleFactor: 1 }, limits, reports, comparison };
   await writeFile(path.join(output, 'results.json'), JSON.stringify(result, null, 2) + '\n');
   if (!buildOnly) {
     const images=(await readdir(output)).filter(name=>name.endsWith('.png')).sort();
@@ -852,5 +934,6 @@ try {
   if (reports.some(report => !report.passed)) process.exitCode = 1;
 } finally {
   await browser?.close();
+  if (revision) await rm(sourceRoot, { recursive: true, force: true });
   if (buildOnly && !outputArg) await rm(output, { recursive: true, force: true });
 }

@@ -47,6 +47,9 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   let space!: HTMLDivElement;
   const heights = new TranscriptHeights();
   const rows = new Map<number, HTMLDivElement>();
+  const rowIndices = new WeakMap<Element, number>();
+  const measurements = new Map<number, number>();
+  const unmeasured = new Set<number>();
   const [revision, setRevision] = createSignal(0);
   const [session, setSession] = createSignal({});
   const [imagesLoading, setImagesLoading] = createSignal(false);
@@ -55,11 +58,16 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   });
   let frame = 0;
   let firstLayoutQueued = false;
+  let measureQueued = false;
+  let windowQueued = false;
   let imageGeneration = 0;
   let imageTimeout: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
   let observer: ResizeObserver | undefined;
   let width = 0;
+  let viewHeight = 0;
+  let windowStart = 0, windowEnd = 0;
+  let pinsChanged = true;
   let keepBottom = true;
   let lastTop = 0;
   let expectedTop: number | undefined;
@@ -79,14 +87,39 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   const at = (top: number) => heights.at(Math.max(0, top - TOP));
 
   function setTop(top: number) {
-    host.scrollTop = Math.max(0, Math.min(maxScroll(), top));
+    const next = Math.max(0, Math.min(maxScroll(), top));
+    // Even an unchanged scrollTop write can cancel native trackpad momentum in WebKit.
+    if (Math.abs(host.scrollTop - next) > .5) host.scrollTop = next;
     expectedTop = lastTop = host.scrollTop;
   }
 
-  function updateWindow(top: number) {
-    if (!heights.length) { setVisible([]); return; }
-    let start = at(Math.max(0, top - host.clientHeight));
-    let end = at(top + host.clientHeight * 2) + 1;
+  function updateWindow(top: number, force = false) {
+    if (!heights.length) { windowStart = windowEnd = 0; setVisible([]); return; }
+    const height = viewHeight || host.clientHeight;
+    // Refill at the inner half-screen boundary, not on every row boundary.
+    // This hysteresis keeps native scrolling DOM-free inside the mounted buffer.
+    if (!force && !pinsChanged && windowEnd > windowStart
+      && (windowStart === 0 || offset(windowStart) <= top - height / 2)
+      && (windowEnd === heights.length || offset(windowEnd) >= top + height * 1.5)) return;
+    pinsChanged = false;
+    let start = at(Math.max(0, top - height * 1.5));
+    let end = at(top + height * 2.5) + 1;
+    // Unknown history is estimated at 240px. In a run of tiny messages that
+    // would refill only a handful per layout. Use adjacent measured density to
+    // mount the next buffer in one batch, without reading any offscreen text.
+    if (windowEnd > windowStart && start < windowEnd && end > windowStart) {
+      let sum = 0, count = 0;
+      for (const index of rows.keys()) {
+        if (index >= windowStart && index < windowEnd && !unmeasured.has(index)) { sum += heights.get(index); count++; }
+      }
+      if (count) {
+        const average = Math.max(24, sum / count);
+        if (end > windowEnd) end = Math.min(heights.length, windowEnd + Math.ceil(Math.max(0, top + height * 2.5 - offset(windowEnd)) / average));
+        if (start < windowStart) start = Math.max(0, windowStart - Math.ceil(Math.max(0, offset(windowStart) - (top - height * 1.5)) / average));
+      }
+    }
+    windowStart = start;
+    windowEnd = end;
     // ponytail: explicit cross-screen selection retains selected turns for native copy;
     // enormous selections can grow DOM. Upgrade to source-offset selection if needed.
     if (selected) { start = Math.min(start, selected[0]); end = Math.max(end, selected[1] + 1); }
@@ -156,9 +189,15 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     const anchor = readingAnchor?.index ?? at(host.scrollTop + 32);
     const anchorOffset = readingAnchor?.inset ?? host.scrollTop - offset(anchor);
     let changed = false;
-    // Read in a batch, then write: no per-row read/write layout thrashing.
-    const measured = [...rows].map(([index, row]) => [index, row.getBoundingClientRect().height] as const);
-    for (const [index, height] of measured) if (height > 0) changed = heights.set(index, height) || changed;
+    // ResizeObserver supplies measured sizes. Only a newly mounted row without an
+    // observer delivery needs a synchronous first measurement; scrolling never remeasures it.
+    for (const index of unmeasured) {
+      const row = rows.get(index);
+      if (row && !measurements.has(index)) measurements.set(index, row.getBoundingClientRect().height);
+    }
+    unmeasured.clear();
+    for (const [index, height] of measurements) if (height > 0 && rows.has(index)) changed = heights.set(index, height) || changed;
+    measurements.clear();
     if (changed) setRevision(value => value + 1);
     if (jump !== null) {
       setTop(offset(jump) - 20);
@@ -171,7 +210,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     readingAnchor = null;
     markMatch();
     updateWindow(host.scrollTop);
-    props.onScroll?.(host.scrollTop, maxScroll(), false);
+    if (changed || expectedTop !== undefined) props.onScroll?.(host.scrollTop, maxScroll(), false);
     if (props.groups.length) traceThreadSwitchLayoutDone(props.threadId, props.groups.length);
   }
 
@@ -201,6 +240,9 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
         finished = true;
         clearTimeout(imageTimeout);
         cancelAnimationFrame(frame);
+        // decode resolves before ResizeObserver's delivery. Measure just this
+        // initial window once so its first visible frame has final image sizes.
+        for (const index of rows.keys()) { unmeasured.add(index); measurements.delete(index); }
         layout();
         setImagesLoading(false);
       };
@@ -259,15 +301,24 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     const top = host.scrollTop;
     const user = expectedTop === undefined || Math.abs(top - expectedTop) > 1;
     expectedTop = undefined;
-    if (user) {
-      keepBottom = resolveUserScrollStick(lastTop, top, maxScroll());
-      jump = null;
-      detailAnchor = readingAnchor = null;
-      releaseSearch();
-    }
+    // Programmatic writes already notified/scheduled their own pass. Native echo
+    // must not duplicate that work (keyboard scrolling also gets this event).
+    if (!user) { lastTop = top; return; }
+    keepBottom = resolveUserScrollStick(lastTop, top, maxScroll());
+    jump = null;
+    detailAnchor = readingAnchor = null;
+    releaseSearch();
     lastTop = top;
-    updateWindow(top);
     props.onScroll?.(top, maxScroll(), user);
+    // Coalesce native/keyboard events without mounting DOM in the event handler.
+    // Refill before paint, not a frame later: fast wheels can cross the overscan.
+    if (!windowQueued) {
+      windowQueued = true;
+      queueMicrotask(() => {
+        windowQueued = false;
+        if (!disposed) updateWindow(host.scrollTop);
+      });
+    }
     schedule();
   }
 
@@ -293,6 +344,10 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     const firstContent = (id !== threadId && !handoff) || (!previous.length && groups.length > 0);
     if (id !== threadId && !handoff) {
       heights.reset(groups.length);
+      measurements.clear();
+      unmeasured.clear();
+      windowStart = windowEnd = 0;
+      pinsChanged = true;
       keepBottom = true;
       jump = focused = null;
       selected = detailAnchor = readingAnchor = match = null;
@@ -309,7 +364,10 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       for (let i = 0; i < groups.length; i++) {
         const old = previous[i], next = groups[i];
         // Keep a growing turn's measured height; replacing history/preview invalidates only changed rows.
-        if (old && old !== next && (old.user?.id !== next.user?.id || old.turn || next.turn)) heights.set(i, 240);
+        if (old && old !== next && (old.user?.id !== next.user?.id || old.turn || next.turn)) {
+          if (rows.has(i)) unmeasured.add(i);
+          else heights.set(i, 240);
+        }
       }
     }
     previous = groups;
@@ -318,7 +376,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     untrack(() => {
       if (host) {
         if (keepBottom) setTop(maxScroll());
-        updateWindow(host.scrollTop);
+        updateWindow(host.scrollTop, true);
         if (match?.pending) revealMatch(match.itemId, match.query);
       }
       if (firstContent) initialLayout();
@@ -328,22 +386,41 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
 
   onMount(() => {
     observer = new ResizeObserver(entries => {
-      host.style.setProperty("--transcript-gutter", `${host.offsetWidth - host.clientWidth}px`);
+      let viewportChanged = false;
+      for (const entry of entries) {
+        const index = rowIndices.get(entry.target);
+        if (index !== undefined) {
+          const height = entry.borderBoxSize[0]?.blockSize ?? entry.contentRect.height;
+          if (height > 0 && Math.abs(height - heights.get(index)) > .01) measurements.set(index, height);
+          unmeasured.delete(index);
+        } else if (entry.target === host) {
+          const next = host.clientHeight;
+          viewportChanged = next !== viewHeight;
+          viewHeight = next;
+          const gutter = `${host.offsetWidth - host.clientWidth}px`;
+          if (host.style.getPropertyValue("--transcript-gutter") !== gutter) host.style.setProperty("--transcript-gutter", gutter);
+        }
+      }
       if (entries.some(entry => entry.target === space) && width !== space.clientWidth) {
         const anchor = at(host.scrollTop + 32);
         const inset = host.scrollTop - offset(anchor);
         width = space.clientWidth;
         heights.reset(props.groups.length);
-        // Preserve a tall visible turn before calculating the new window; an estimated
-        // 240px height could otherwise move its in-turn anchor into unrelated history.
-        for (const [index, row] of rows) heights.set(index, row.getBoundingClientRect().height);
+        // Width changes are rare and invalidate all wrapping. Preserve a tall visible
+        // turn's measured in-turn anchor before using estimates for unseen history.
+        for (const [index, row] of rows) heights.set(index, measurements.get(index) ?? row.getBoundingClientRect().height);
+        measurements.clear();
+        unmeasured.clear();
         setRevision(value => value + 1);
         if (!keepBottom) setTop(offset(anchor) + Math.min(inset, heights.get(anchor) - 1));
+        viewportChanged = true;
       }
-      schedule();
+      if (viewportChanged) pinsChanged = true;
+      if (viewportChanged || measurements.size) schedule();
     });
     host.style.setProperty("--transcript-gutter", `${host.offsetWidth - host.clientWidth}px`);
     width = space.clientWidth;
+    viewHeight = host.clientHeight;
     observer.observe(host);
     observer.observe(space);
     for (const row of rows.values()) observer.observe(row);
@@ -351,10 +428,12 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       const selection = window.getSelection();
       const a = rowIndex(selection?.anchorNode ?? null), b = rowIndex(selection?.focusNode ?? null);
       selected = selection && !selection.isCollapsed && a !== null && b !== null ? [Math.min(a, b), Math.max(a, b)] : null;
+      pinsChanged = true;
       schedule();
     };
     const focusChanged = () => {
       focused = host.contains(document.activeElement) ? rowIndex(document.activeElement) : null;
+      pinsChanged = true;
       schedule();
     };
     const markdownAnchor = (event: Event) => {
@@ -366,6 +445,12 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       }
       schedule();
     };
+    const wheel = (event: WheelEvent) => {
+      if (event.deltaY < 0) { keepBottom = false; props.onBrowseDetail?.(); }
+    };
+    // No preventDefault: keep trackpad/wheel scrolling on the compositor, even
+    // when a newly visible Markdown row is being mounted on the main thread.
+    host.addEventListener("wheel", wheel, { passive: true });
     document.addEventListener("selectionchange", selectionChanged);
     document.addEventListener("focusin", focusChanged);
     host.addEventListener("click", browseDetail, true);
@@ -396,6 +481,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       document.removeEventListener("selectionchange", selectionChanged);
       document.removeEventListener("focusin", focusChanged);
       host.removeEventListener("click", browseDetail, true);
+      host.removeEventListener("wheel", wheel);
       host.removeEventListener("markdown-anchor", markdownAnchor);
     });
   });
@@ -411,8 +497,29 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
 
   function Row(rowProps: { index: number }) {
     let element!: HTMLDivElement;
-    onMount(() => { rows.set(rowProps.index, element); observer?.observe(element); schedule(); });
-    onCleanup(() => { rows.delete(rowProps.index); observer?.unobserve(element); });
+    onMount(() => {
+      rows.set(rowProps.index, element);
+      rowIndices.set(element, rowProps.index);
+      unmeasured.add(rowProps.index);
+      observer?.observe(element);
+      // A row can be much shorter than its estimate. Settle new sizes before
+      // paint so a fast cold scroll never shows holes or overlapping messages.
+      if (!measureQueued) {
+        measureQueued = true;
+        queueMicrotask(() => {
+          measureQueued = false;
+          if (disposed) return;
+          cancelAnimationFrame(frame);
+          layout();
+        });
+      }
+    });
+    onCleanup(() => {
+      rows.delete(rowProps.index);
+      unmeasured.delete(rowProps.index);
+      measurements.delete(rowProps.index);
+      observer?.unobserve(element);
+    });
     return <div ref={element} class="html-transcript-row" data-group-index={rowProps.index}
       style={{ transform: `translateY(${(revision(), offset(rowProps.index))}px)` }}>
       <Show when={props.groups[rowProps.index]}>
@@ -424,8 +531,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     </div>;
   }
 
-  return <div ref={host} class="html-transcript" tabindex="0" role="region" aria-label="会话记录" onScroll={onScroll}
-    onWheel={event => { if (event.deltaY < 0) { keepBottom = false; props.onBrowseDetail?.(); } }}>
+  return <div ref={host} class="html-transcript" tabindex="0" role="region" aria-label="会话记录" onScroll={onScroll}>
     <Show when={imagesLoading()}><div class="html-transcript-loading" role="status">正在加载会话…</div></Show>
     <div ref={space} class="html-transcript-space" aria-busy={imagesLoading()}
       style={{ height: `${(revision(), heights.total + TOP + BOTTOM)}px`, visibility: imagesLoading() ? "hidden" : undefined }}>

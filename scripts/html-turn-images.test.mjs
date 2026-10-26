@@ -1,4 +1,5 @@
-// Real Solid DOM + native image layout; private headless Chromium, no app/IPC/GUI.
+// Real Solid DOM + native layout; private headless Chromium, no app/IPC/GUI.
+// Run just the bounded toolbar regression: node scripts/html-turn-images.test.mjs --user-actions-only
 import assert from 'node:assert/strict';
 import { access, readFile, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -46,10 +47,14 @@ const bundle = await build({
         const [session, setSession] = createSignal({ id: 'empty', groups: [] });
         let handle;
         render(() => HtmlTranscript({ get groups() { return session().groups; }, get threadId() { return session().id; },
-          permissions: [], running: false, loading: false, preview: false, emptyHint: 'empty',
+          get running() { return session().mode === 'running'; }, get readOnly() { return session().mode === 'readOnly'; },
+          permissions: [], loading: false, preview: false, emptyHint: 'empty',
           ref: value => { handle = value; }, onReturnToCurrent() {} }), document.getElementById('root'));
         window.gate = {
           frames: [],
+          prompt(text, mode) {
+            setSession({ id: 'thread', mode, groups: [{ user: { id: 1, type: 'user', text, ts: 0 }, body: [] }] });
+          },
           switch(id, image) {
             this.frames = [];
             setSession({ id, groups: Array.from({ length: 8 }, (_,i) => ({ user: {
@@ -130,6 +135,11 @@ try {
   });
   await page.goto(origin);
   await page.waitForFunction(() => window.test?.image()?.naturalWidth > 0);
+  const frames = async (count = 5) => page.evaluate(async count => {
+    for (let i = 0; i < count; i++) await new Promise(requestAnimationFrame);
+    return gate.frames;
+  }, count);
+  if (!process.argv.includes('--user-actions-only')) {
   const size = () => page.evaluate(() => {
     const img = test.image(), rect = img.getBoundingClientRect();
     return { width: rect.width, height: rect.height, widthAttr: img.width, heightAttr: img.height };
@@ -186,10 +196,6 @@ try {
   await page.waitForFunction(() => test.image().naturalWidth === 800 && test.image().getAttribute('width') === '800');
   console.log('HtmlTurn image DOM checks passed (stable slot/size, latest actions, decode failure, identity reset, cold load, stale errors).');
 
-  const frames = async (count = 5) => page.evaluate(async count => {
-    for (let i = 0; i < count; i++) await new Promise(requestAnimationFrame);
-    return gate.frames;
-  }, count);
   const assertHidden = samples => {
     assert.ok(samples.length >= 3, 'sample multiple pending paint frames');
     assert.ok(samples.every(s => !s.visible && s.loading), JSON.stringify(samples));
@@ -231,6 +237,95 @@ try {
   assert.ok(await page.locator('.ht-image-broken').count(), 'a failed image releases the gate and displays its fallback');
   assert.deepEqual(errors, []);
   console.log('HtmlTranscript cold image gate checks passed (hidden pending frames, correct first-visible geometry/anchor, stale session completion, broken image release).');
+  } else await page.evaluate(() => test.mountTranscript());
+
+  // Reuse the real transcript/turn and production reset/theme/gutters, not a toolbar replica.
+  await page.addStyleTag({ content: await readFile('src/app.css', 'utf8') });
+  page.setDefaultTimeout(5000);
+  await page.evaluate(() => {
+    document.getElementById('root').style.height = '560px';
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      writeText: async text => { window.copiedText = text; },
+    } });
+  });
+  const wrapped = 'This deliberately wrapped prompt keeps its full text and spacing while copy stays beside edit, outside the bubble. '.repeat(3) + '\n  中文 👋\tend  \n';
+  const prompts = { short: '  Copy 👋  ', wrapped, collapsed: wrapped.repeat(15) + '\nfull-text tail 👋  ' };
+  const user = page.locator('.ht-user');
+  const snapshot = () => user.evaluate(user => {
+    const rect = node => node.getBoundingClientRect().toJSON();
+    const row = user.closest('.html-transcript-row'), host = row.closest('.html-transcript');
+    const padding = getComputedStyle(row), text = user.querySelector('.ht-user-text');
+    return {
+      bubble: rect(user.querySelector('.ht-user-bubble')), text: text.textContent,
+      textSize: [text.clientWidth, text.clientHeight], lineHeight: parseFloat(getComputedStyle(text).lineHeight),
+      content: { left: rect(row).left + parseFloat(padding.paddingLeft), right: rect(row).right - parseFloat(padding.paddingRight) },
+      host: { left: rect(host).left, right: rect(host).left + host.clientWidth },
+      buttons: [...user.querySelectorAll('button')].filter(button => button.getBoundingClientRect().width > 0)
+        .map(button => ({ ...rect(button), label: button.getAttribute('aria-label'), toolbar: !!button.closest('.ht-user-actions') })),
+      opacity: getComputedStyle(user.querySelector('.ht-user-actions')).opacity,
+      hovered: user.matches(':hover'), focused: !!user.querySelector(':focus-visible'),
+    };
+  });
+  const assertLayout = (s, label) => {
+    for (const b of s.buttons) {
+      assert.ok(b.width > 0 && b.height > 0, `${label}: nonempty button`);
+      assert.ok(b.left >= s.content.left - 1 && b.right <= s.content.right + 1, `${label}: button inside transcript content`);
+      assert.ok(b.left >= s.host.left && b.right <= s.host.right, `${label}: button not clipped by transcript`);
+      if (b.toolbar) assert.ok(b.right <= s.bubble.left - 3, `${label}: toolbar must be outside bubble, not over text`);
+      else assert.ok(b.top >= s.bubble.bottom - 1, `${label}: long-prompt controls remain below bubble`);
+    }
+    for (let i = 0; i < s.buttons.length; i++) for (const b of s.buttons.slice(i + 1)) {
+      const a = s.buttons[i];
+      assert.ok(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top, `${label}: buttons must not overlap`);
+    }
+  };
+  const artifact = process.env.HTML_USER_ACTIONS_SCREENSHOT || '/tmp/html-user-actions-320.png';
+  for (const width of [800, 320]) for (const [kind, text] of Object.entries(prompts)) for (const mode of ['normal', 'readOnly', 'running']) {
+    const label = `${width}px/${kind}/${mode}`, collapsed = kind === 'collapsed';
+    await page.mouse.move(0, 0);
+    // Narrow chat in a desktop viewport retains the real desktop transcript gutters.
+    await page.evaluate(({ width, text, mode }) => {
+      document.getElementById('root').style.width = width + 'px';
+      document.activeElement?.blur(); window.copiedText = null; gate.prompt(text, mode);
+    }, { width, text, mode });
+    assert.equal(await page.locator('.html-transcript').evaluate(host => host.getBoundingClientRect().width), width);
+    await frames(2);
+    const before = await snapshot();
+    const expectedText = collapsed ? text.slice(0, 1000).replace(/[\uD800-\uDBFF]$/, '') + '…' : text;
+    assert.equal(before.text, expectedText, `${label}: rendered prompt is unchanged`);
+    assert.equal(before.opacity, '0', `${label}: toolbar hidden until hover/focus`);
+    assert.deepEqual(before.buttons.filter(b => b.toolbar).map(b => b.label), [
+      ...(!collapsed ? ['复制完整提示词'] : []), ...(mode === 'normal' ? ['原样重发此消息', '编辑消息'] : []),
+    ], `${label}: edit policy and separate long-prompt copy`);
+    if (kind !== 'short') assert.ok(before.textSize[1] > before.lineHeight * 2, `${label}: fixture actually wraps`);
+    assertLayout(before, label);
+
+    await page.locator('.ht-user-bubble').hover();
+    const hovered = await snapshot();
+    assert.equal(hovered.opacity, '1', `${label}: hover reveals toolbar`);
+    assertLayout(hovered, label);
+    const copy = page.locator(collapsed ? '.ht-copy-prompt' : '.ht-user-actions > button').first();
+    assert.equal(await page.locator('.ht-copy-prompt').count(), collapsed ? 1 : 0);
+    await page.mouse.move(0, 0);
+    await page.locator('.html-transcript').focus();
+    // Tab through actual focus order, including resend/edit/fold for a collapsed prompt.
+    for (let i = 0; i < (collapsed ? before.buttons.length : 1); i++) await page.keyboard.press('Tab');
+    assert.ok(await copy.evaluate(button => button === document.activeElement), `${label}: copy is keyboard reachable`);
+    const focused = await snapshot();
+    assert.ok(!focused.hovered && focused.focused, `${label}: focus-visible without hover`);
+    assert.equal(focused.opacity, '1', `${label}: keyboard focus reveals toolbar`);
+    assertLayout(focused, label);
+    if (width === 320 && kind === 'wrapped' && mode === 'normal') await page.locator('#root').screenshot({ path: artifact });
+
+    await copy.click();
+    assert.equal(await page.evaluate(() => window.copiedText), text, `${label}: clipboard receives exact full text, not preview`);
+    const after = await snapshot();
+    assert.equal(after.text, before.text, `${label}: copy never mutates prompt`);
+    assert.deepEqual(after.textSize, before.textSize, `${label}: copy feedback does not reflow text`);
+    assertLayout(after, label);
+  }
+  assert.deepEqual(errors, []);
+  console.log(`HtmlTurn user action checks passed (18 cases: wide/320px, short/wrapped/collapsed, normal/readOnly/running, hover/keyboard/copy). Screenshot: ${artifact}`);
 } finally {
   await browser.close();
 }
