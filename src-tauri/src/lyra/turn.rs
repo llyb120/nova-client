@@ -527,10 +527,7 @@ async fn call_tool(s: &Session, id: &str, name: &str, args: &Value) -> ToolOutco
         }).await;
     }
     if session::is_agent_tool(name) {
-        return match &s.agents {
-            Some(agents) => session::call(agents, s, name, args).await,
-            None => text_outcome(format!("{name} 仅在主 agent 中可用"), true),
-        };
+        return session::call(s, name, args).await;
     }
     let _screen = if screen_tool(name) {
         Some(tokio::select! {

@@ -459,8 +459,11 @@ impl AgentHandle {
     }
 }
 
-pub async fn call(handle: &AgentHandle, parent: &Session, name: &str, args: &Value) -> ToolOutcome {
-    if handle.owner != parent.session_id { return text_outcome("agent owner must match parent session_id", true); }
+pub async fn call(parent: &Session, name: &str, args: &Value) -> ToolOutcome {
+    // 桌面归属键是 thread:<id>，不同于模型 session_id；只使用父会话持有的句柄。
+    let Some(handle) = &parent.agents else {
+        return text_outcome(format!("{name} 仅在主 agent 中可用"), true);
+    };
     if let Some(root) = &parent.sessions_root {
         if let Err(error) = handle.clone().with_persistence(root) { return text_outcome(error, true); }
     }
@@ -976,7 +979,8 @@ mod tests {
         assert!(ChildSettings::from_parent(&parent, Some(&readonly_record)).unwrap().read_only, "a writable parent cannot upgrade a readonly child");
         parent.read_only = true;
         drop(restored);
-        let result = call(&handle, &parent, "followup_task", &json!({"target":"probe", "message":"explicit new task"})).await;
+        parent.agents = Some(handle.clone());
+        let result = call(&parent, "followup_task", &json!({"target":"probe", "message":"explicit new task"})).await;
         assert!(!result.is_error, "{:?}", result.content);
         assert!(handle.has_pending());
         let report = tokio::time::timeout(Duration::from_secs(5), handle.await_pending(&parent.cancelled, &parent.steer)).await.unwrap().unwrap();
@@ -1176,23 +1180,34 @@ mod tests {
     async fn spawned_agent_completes_and_wait_reports_its_message() {
         let url = scripted_server(vec![text_reply("child done"), text_reply("idle message done"), text_reply("followup done")]).await;
         let mut parent = test_session(url, std::env::temp_dir());
-        let handle = root_handle("session-test-root");
+        let handle = root_handle("thread:session-test-root");
         parent.session_id = "session-test-root".into();
         parent.agents = Some(handle.clone());
         parent.history.record(user_message("earlier", &[]));
-        let spawned = call(&handle, &parent, "spawn_agent", &json!({ "task_name": "probe", "message": "do it", "fork_turns": "all" })).await;
+        let spawned = call(&parent, "spawn_agent", &json!({ "task_name": "probe", "message": "do it", "fork_turns": "all" })).await;
         assert!(!spawned.is_error, "{:?}", spawned.content);
-        let again = call(&handle, &parent, "spawn_agent", &json!({ "task_name": "probe", "message": "x" })).await;
+        // 即使模型 session_id 相同，另一线程也不能读取或控制这里的子 Agent。
+        let mut other = test_session("http://unused".into(), std::env::temp_dir());
+        other.session_id = parent.session_id.clone();
+        other.agents = Some(isolated_handle("thread:other"));
+        assert_eq!(call(&other, "list_agents", &json!({})).await.content[0]["text"], "[]");
+        assert!(call(&other, "close_agent", &json!({"target":"probe"})).await.is_error);
+        // 子 Agent 没有管理句柄，不能再派生子 Agent。
+        other.agents = None;
+        assert!(call(&other, "spawn_agent", &json!({"task_name":"nested","message":"no"})).await.is_error);
+        let again = call(&parent, "spawn_agent", &json!({ "task_name": "probe", "message": "x" })).await;
         assert!(again.is_error, "duplicate task names are rejected");
-        let waited = call(&handle, &parent, "wait_agent", &json!({ "timeout_ms": 5000 })).await;
+        let waited = call(&parent, "wait_agent", &json!({ "timeout_ms": 5000 })).await;
         let text = waited.content[0]["text"].as_str().unwrap();
         assert!(text.contains("\"completed\"") && text.contains("child done") && text.contains("/root/probe"), "{text}");
         assert!(handle.await_pending(&parent.cancelled, &parent.steer).await.is_none());
-        // 主会话下一轮仍能使用原来的子 Agent；只读展示不创建另一套执行会话。
-        let next_handle = root_handle("session-test-root");
-        let sent = call(&next_handle, &parent, "send_message", &json!({"target":"probe","message":"extra context"})).await;
+        // 模型会话变化后仍按线程复用子 Agent，不创建另一套执行会话。
+        parent.session_id = "session-test-next".into();
+        let next_handle = root_handle("thread:session-test-root");
+        parent.agents = Some(next_handle.clone());
+        let sent = call(&parent, "send_message", &json!({"target":"probe","message":"extra context"})).await;
         assert!(!sent.is_error);
-        let followup = call(&next_handle, &parent, "followup_task", &json!({"target":"probe","message":"continue"})).await;
+        let followup = call(&parent, "followup_task", &json!({"target":"probe","message":"continue"})).await;
         assert!(!followup.is_error);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1204,9 +1219,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("followup completes on the existing agent");
-        let closed = call(&handle, &parent, "close_agent", &json!({ "target": "probe" })).await;
+        let closed = call(&parent, "close_agent", &json!({ "target": "probe" })).await;
         assert!(!closed.is_error);
-        let listed = call(&handle, &parent, "list_agents", &json!({})).await;
+        let listed = call(&parent, "list_agents", &json!({})).await;
         assert_eq!(listed.content[0]["text"], "[]");
     }
 }
