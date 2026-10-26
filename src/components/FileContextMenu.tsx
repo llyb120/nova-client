@@ -3,7 +3,6 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { api } from "../ipc";
-import { openWorkspaceFile } from "../workspaceLinks";
 import { state } from "../store";
 import { IconCopy, IconFolder } from "./icons";
 
@@ -72,11 +71,6 @@ export function createFileContextMenu() {
         element.style.top = `${Math.max(0, Math.min(entry.y, window.innerHeight - height))}px`;
       });
       return <Portal><div ref={element} class="ctx-menu" style={{ left: `${entry.x}px`, top: `${entry.y}px` }}>
-        <button class="ctx-item" onClick={() => {
-          const path = menu()!.path;
-          closeMenu();
-          openWorkspaceFile(path);
-        }}>在侧栏预览</button>
         <Show when={COPYABLE_IMAGE.test(menu()!.path)}>
           <button
             class="ctx-item"
