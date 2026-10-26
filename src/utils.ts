@@ -34,7 +34,7 @@ export function displayToolTitle(title: string): string {
   return title.replace(/^(?:Alkaid|Vega)(\s*\/)/, "Lyra$1");
 }
 
-// ─── 工具调用摘要展示（canvas 工具行使用） ───────────────────────────────────
+// ─── 工具调用摘要展示（会话记录工具行使用） ───────────────────────────────────
 
 /** 输入值紧凑展示：剥 ANSI、对象 JSON 化、压空白、限长 */
 export function compactToolValue(value: unknown): string {

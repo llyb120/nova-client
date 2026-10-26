@@ -24,7 +24,7 @@
 cargo test --manifest-path src-tauri/Cargo.toml --lib thread_storage::tests
 cargo test --manifest-path src-tauri/Cargo.toml --lib threads::tests
 node --test scripts/history-loading.test.mjs scripts/tool-completion-switch.test.mjs
-node scripts/long-session-render.test.mjs
+node scripts/html-transcript.test.mjs
 npm run check
 ```
 

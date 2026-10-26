@@ -718,7 +718,7 @@ export function ChatView() {
       return;
     }
 
-    // 从旁支预览切回主线时，先恢复当前会话，再在 Canvas 新布局中定位提示词。
+    // 从旁支预览切回主线时，先恢复当前会话，再在新布局中定位提示词。
     previewTimer = setTimeout(() => {
       setPreviewItems(null);
       setPreviewCheckpointId(null);

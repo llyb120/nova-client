@@ -77,7 +77,7 @@ export function groupItems(items: Item[], prev: Group[] = []): Group[] {
     }
   }
 
-  // 重建出的尾部分组若内容与旧对象一致，复用旧对象身份，避免Canvas 重复排版。
+  // 重建出的尾部分组若内容与旧对象一致，复用旧对象身份，避免会话记录重复渲染。
   for (let j = rebuiltStart; j < result.length; j++) {
     const prevGroup = prev[j];
     if (prevGroup && sameGroup(result[j], prevGroup)) result[j] = prevGroup;

@@ -82,9 +82,9 @@ export function attachmentPreviewSrc(image: PromptImage) {
     : convertFileSrc(fileUriPath(image.uri ?? ""));
 }
 
-// 附件进输入框时就预解码：发送后 Canvas 首帧即拿到尺寸和位图，不必先等解码再整帧提交
+// 附件进输入框时就预解码：发送后气泡首帧即拿到尺寸和位图，不必先等解码再提交
 // （等待期间输入框收起、旧画面下移，消息随后才出现，表现为发送后画面闪一下）。
-// ponytail: 只留最近 8 张；更大批量的附件回退到 Canvas 自己解码。
+// ponytail: 只留最近 8 张；更大批量的附件回退到气泡自己解码。
 const warmImages = new Map<string, HTMLImageElement>();
 const decodedImages = new WeakSet<HTMLImageElement>();
 

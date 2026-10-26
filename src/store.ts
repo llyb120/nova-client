@@ -292,18 +292,13 @@ export function isExpanded(key: number | string, fallback = false): boolean {
 /** 会话搜索点击命中后，由 ChatView 滚到对应消息并高亮关键词。 */
 export const [searchReveal, setSearchReveal] = createSignal<{ threadId: string; itemId: number; query: string } | null>(null);
 
-const [expandedRevisionValue, setExpandedRevision] = createSignal(0);
-export const expandedRevision = expandedRevisionValue;
-
 export function toggleExpanded(key: number | string, value?: boolean) {
   const k = String(key);
   setState("expanded", k, value ?? !state.expanded[k]);
-  setExpandedRevision((revision) => revision + 1);
 }
 
 function resetExpanded(): void {
   setState("expanded", reconcile({}));
-  setExpandedRevision((revision) => revision + 1);
 }
 
 /** 可选模型列表（来自各后端）。
@@ -1148,7 +1143,7 @@ export async function openThread(id: string) {
   };
 
   // 缓存未命中也要在本次同步调用内切走旧 transcript；否则 await IPC 期间
-  // currentId/items 仍指向旧会话，Canvas/DOM 会再绘制一帧旧内容后才换新。
+  // currentId/items 仍指向旧会话，会话记录会再绘制一帧旧内容后才换新。
   if (switching && !cached) {
     const meta = state.threads.find((thread) => thread.id === id);
     discardPendingStreamUpdates();

@@ -1,11 +1,11 @@
-// Isolated renderer regression/performance harness; never connects to the user's browser.
-// node scripts/html-transcript.test.mjs --renderer=both --output=/tmp/transcript-baseline
-// node scripts/html-transcript.test.mjs --renderer=html --build-only
+// Isolated HtmlTranscript regression/performance harness; never connects to the user's browser.
+// node scripts/html-transcript.test.mjs --output=/tmp/transcript-baseline
+// node scripts/html-transcript.test.mjs --build-only
 // --only=deferred,inline-search runs named top-level scenario prefixes (reported as partial coverage).
-// --only=scroll-hotpath --renderer=both [--revision=HEAD] profiles frozen git source or the current worktree.
+// --only=scroll-hotpath [--revision=HEAD] profiles frozen git source or the current worktree.
 // CPU/trace and text-coverage replays are separate; structural failures are saved, not hidden by timing gates.
 // TEST_BROWSER overrides Chromium; TEST_NODE_MODULES supports a sibling worktree.
-// Screenshots compare content/anchors, not pixel equality (HTML and Canvas have different rasterization).
+// Screenshots are review artifacts for content/anchors, not pixel-equality tests.
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
@@ -19,11 +19,8 @@ import { installScrollProbe, scrollHotpath } from './transcript-scroll-perf.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const args = process.argv.slice(2);
-assert.ok(args.every(arg => arg === '--build-only' || /^(--renderer|--output|--only|--revision)=.+$/.test(arg)), 'Options: --build-only --renderer=html|canvas|both --output=PATH --only=PREFIX,... --revision=HEAD');
+assert.ok(args.every(arg => arg === '--build-only' || /^(--output|--only|--revision)=.+$/.test(arg)), 'Options: --build-only --output=PATH --only=PREFIX,... --revision=HEAD');
 const selectedChecks = args.find(arg => arg.startsWith('--only='))?.slice('--only='.length).split(',') ?? [];
-const rendererArg = args.find(arg => arg.startsWith('--renderer='))?.split('=')[1] ?? 'html';
-assert.ok(['html', 'canvas', 'both'].includes(rendererArg), 'Unknown renderer');
-const renderers = rendererArg === 'both' ? ['canvas', 'html'] : [rendererArg];
 const buildOnly = args.includes('--build-only');
 const outputArg = args.find(arg => arg.startsWith('--output='))?.slice('--output='.length);
 const output = outputArg ? path.resolve(outputArg) : await mkdtemp(path.join(tmpdir(), 'html-transcript-'));
@@ -35,7 +32,8 @@ if (revision) {
   sourceRoot = await mkdtemp(path.join(tmpdir(), 'transcript-revision-'));
   // Read-only git archive: never stash, checkout, or rewrite the working tree.
   const archive = execFileSync('git', ['archive', '--format=tar', sourceCommit, 'src'], { cwd: root, maxBuffer: 64 * 1024 * 1024 });
-  execFileSync('tar', ['-x', '-C', sourceRoot], { input: archive });
+  // -f - : Windows bsdtar otherwise reads from \\.\tape0 instead of stdin.
+  execFileSync('tar', ['-x', '-f', '-', '-C', sourceRoot], { input: archive });
 }
 const source = { commit: sourceCommit, revision: revision || null, worktree: !revision };
 let deps;
@@ -67,20 +65,19 @@ async function executable() {
   throw Error('No Chromium found; set TEST_BROWSER (no browser is installed automatically)');
 }
 
-function fixture(renderer) {
-  const component = renderer === 'html' ? 'HtmlTranscript' : 'CanvasTranscript';
+function fixture() {
   return `
 import { render } from 'solid-js/web';
 import { createSignal, createEffect } from 'solid-js';
-import { ${component} as Transcript } from './src/components/${component}';
+import { HtmlTranscript as Transcript } from './src/components/HtmlTranscript';
 import { state, setState, toggleExpanded } from './src/store';
 import { selectedChatText } from './src/chatSelection';
 import { resolveUserScrollStick } from './src/scrollStick';
 import './src/app.css';
-const renderer = ${JSON.stringify(renderer)};
 const [session, setSession] = createSignal({id:'empty',groups:[],running:false,loading:false});
-let handle, serial=0, stream, streamTicks=0, reads=new Set(), paints=[], canvasCalls=0;
-let loadCalls=[], pendingLoads=new Map(), hydrationCount=0, hydrationLarge=false, captureFrames=0, paintedFrames=[];
+let handle, serial=0, stream, streamTicks=0, reads=new Set();
+let loadCalls=[], pendingLoads=new Map(), hydrationCount=0, hydrationLarge=false, captureFrames=0, paintedFrames=[], previews=[];
+window.addEventListener('nova:preview-file',event=>previews.push(event.detail));
 // Mirror ChatView's parent contract, reusing its direction helper. This is not a full App/Tauri fixture.
 let stickToBottom=true,lastScrollTop=0,scrollQueued=false,parentPins=0,parentUserScrolls=0;
 const cancelBottomFollow=()=>{stickToBottom=false;};
@@ -93,11 +90,11 @@ const host=()=>document.getElementById('fixture');
 const dom=()=>({rows:host()?.querySelectorAll('.html-transcript-row[data-group-index]').length||0,
   elements:host()?.querySelectorAll('*').length||0});
 const sampleDom=()=>{const d=dom(); peakRows=Math.max(peakRows,d.rows);peakElements=Math.max(peakElements,d.elements);return d;};
-const reset=()=>{phaseStart=performance.now();lastFrame=phaseStart;gaps=[];longTasks=[];peakRows=peakElements=canvasCalls=0;};
+const reset=()=>{phaseStart=performance.now();lastFrame=phaseStart;gaps=[];longTasks=[];peakRows=peakElements=0;};
 function frame(){const now=performance.now();gaps.push(now-lastFrame);lastFrame=now;requestAnimationFrame(frame);
   if(captureFrames>0){captureFrames--;setTimeout(()=>{
-    const visible=renderer==='html'?[...host().querySelectorAll('[data-group-index]')].filter(row=>{const r=row.getBoundingClientRect(),b=host().getBoundingClientRect();return r.bottom>b.top&&r.top<b.bottom;}).map(row=>Number(row.dataset.groupIndex)):[];
-    paintedFrames.push({visible,top:handle?.scrollTop(),max:handle?.maxScrollTop(),text:renderer==='canvas'?paints.map(p=>p.text).join(' ').slice(-300):''});
+    const visible=[...host().querySelectorAll('[data-group-index]')].filter(row=>{const r=row.getBoundingClientRect(),b=host().getBoundingClientRect();return r.bottom>b.top&&r.top<b.bottom;}).map(row=>Number(row.dataset.groupIndex));
+    paintedFrames.push({visible,top:handle?.scrollTop(),max:handle?.maxScrollTop()});
   },0);}
 }
 window.__scrollProbe?.ignore(frame);
@@ -105,9 +102,6 @@ requestAnimationFrame(frame);
 if(PerformanceObserver.supportedEntryTypes.includes('longtask'))new PerformanceObserver(list=>{
   longTasks.push(...list.getEntries().filter(e=>e.startTime>=phaseStart).map(e=>e.duration));
 }).observe({entryTypes:['longtask']});
-const clear=CanvasRenderingContext2D.prototype.clearRect, fill=CanvasRenderingContext2D.prototype.fillText;
-CanvasRenderingContext2D.prototype.clearRect=function(...args){if(this.canvas.classList.contains('transcript-canvas-only'))paints=[];return clear.apply(this,args);};
-CanvasRenderingContext2D.prototype.fillText=function(text,x,y,...args){if(this.canvas.classList.contains('transcript-canvas-only')){canvasCalls++;paints.push({text:String(text),x,y});}return fill.call(this,text,x,y,...args);};
 const nextFrame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
 const stop=()=>{clearInterval(stream);stream=undefined;};
 function group(i, prefix='round'){
@@ -119,17 +113,16 @@ function group(i, prefix='round'){
     turn:{type:'turn',id:i*3+3,ts:0,durationMs:1000,stopReason:'end'}};
 }
 function replace(groups,kind='session',loading=false){
-  stop();streamTicks=0;reads.clear();paints=[];reset();
-  // openThread clears expansion before committing a new snapshot; do not invent renderer ownership.
+  stop();streamTicks=0;reads.clear();reset();
+  // openThread clears expansion before committing a new snapshot; do not invent transcript ownership.
   for(const key of Object.keys(state.expanded))toggleExpanded(key,false);
   const id=kind+'-'+ ++serial;
   setState('currentId',id);
   setSession({id,groups,running:false,loading});
   enableBottomFollow();
 }
-const text=()=>renderer==='html'?(host()?.innerText||''):paints.map(p=>p.text).join('\\n');
+const text=()=>host()?.innerText||'';
 const anchor=()=>{
-  if(renderer!=='html')return null;
   const bounds=document.querySelector('.html-transcript').getBoundingClientRect();
   const rows=[...host().querySelectorAll('.html-transcript-row[data-group-index]')];
   const row=rows.find(el=>{const r=el.getBoundingClientRect();return r.bottom>bounds.top+32&&r.top<bounds.bottom;});
@@ -166,14 +159,9 @@ window.test={
     }
     if(stable<8)throw Error('Scroll geometry did not converge before '+kind);
   },
-  scrollAnchor(){return renderer==='html'?anchor():{index:handle.activeGroup(),offset:handle.scrollTop()};},
+  scrollAnchor(){return anchor();},
   scrollCoverage(){
     const position=this.position();
-    if(renderer==='canvas'){
-      const canvas=host().querySelector('canvas.transcript-canvas-only'),height=canvas?.clientHeight||0;
-      const visible=paints.filter(p=>p.text.trim()&&p.y>0&&p.y<height);
-      return {...position,visibleText:visible.length,example:visible[0]?.text};
-    }
     const root=host().querySelector('.html-transcript'),bounds=root.getBoundingClientRect();
     let visibleText=0,example='',visibleRows=0;
     const rowRects=[],emptyChunks=[];
@@ -271,6 +259,32 @@ window.test={
         chunkHeight:chunk?.getBoundingClientRect().height}:null};
   },
   switchRace(){handle.scrollToGroup(0);replace([group(0,'replacement')],'replacement');},
+  fileLinks(){
+    previews=[];const groups=Array.from({length:3},(_,i)=>group(i,'links'));
+    groups[2].body=[{type:'assistant',id:8,ts:0,text:'links [\`a.ts\`](D:/proj/src/a.ts) [b](b.ts:12) [c](file:///D:/x/c.ts#L3) [web](https://example.invalid) see src/d.ts:5\\n\\nlinks-end'}];
+    replace(groups,'links');
+  },
+  previews(){return previews;},
+  // Samples each painted frame after a session switch (rAF, then a task after that frame's paint).
+  async switchFrames(kind){
+    const count={short:3,images:40}[kind]??2000,frames=[];
+    const groups=Array.from({length:count},(_,i)=>group(i,kind));
+    if(kind==='images')for(const [i,g] of groups.slice(-6).entries())g.body=[{...g.body[0],text:'image answer '+i+'\\n\\n![chart '+i+']('+location.origin+'/img-'+i+'.svg)\\n\\nimage-end-'+i}];
+    // The last turn exceeds the 128-item history tail: its process items arrive deferred, like getThreadView;
+    // the previous turn's answer is deferred too and is visible above it.
+    if(kind==='deferred'){const g=groups.at(-1),prev=groups.at(-2);g.body=[{type:'thought',id:900001,ts:0,text:'',deferred:true},{type:'tool',id:900002,ts:0,title:'fixture tool',kind:'execute',status:'completed',toolCallId:'tail-tool',content:[],locations:[],deferred:true},...g.body];prev.body=[{...prev.body[0],text:'',deferred:true}];}
+    replace(groups,'switch-'+kind);
+    if(kind==='deferred')setTimeout(()=>this.releaseLoads(),50);
+    for(let i=0;i<10;i++){
+      await new Promise(resolve=>requestAnimationFrame(()=>setTimeout(resolve,0)));
+      const root=host().querySelector('.html-transcript'),space=root.querySelector('.html-transcript-space');
+      const c=this.scrollCoverage();
+      frames.push({hidden:getComputedStyle(space).visibility==='hidden',status:root.querySelector('[role=status]')?.textContent||'',placeholder:!!root.querySelector('[data-history-loading]'),
+        top:Math.round(c.top),max:Math.round(c.max),rows:(c.rowRects||[]).map(r=>r.index),gap:Math.round(c.maxGapPx??0),overlap:Math.round(c.maxOverlapPx??0),
+        stale:[...root.querySelectorAll('.ht-user-text')].some(el=>!el.textContent.startsWith(kind+'-'))});
+    }
+    return frames;
+  },
   cold(){replace([],'cold',true);},
   finishCold(){setSession(s=>({...s,groups:[group(0,'cold-ready')],loading:false}));},
   jump(index){cancelBottomFollow();handle.scrollToGroup(index);}, bottom(){enableBottomFollow();pinBottom();},
@@ -292,8 +306,7 @@ window.test={
   sameIds(label){const groups=session().groups.map(g=>({...g,user:g.user?{...g.user,text:label+' '+g.user.text}:undefined}));replace(groups,label);},
   stats(){const d=sampleDom();return {...d,peakRows,peakElements,reads:reads.size,readIndices:[...reads],
     top:handle?.scrollTop(),max:handle?.maxScrollTop(),active:handle?.activeGroup(),bottom:handle?.isAtBottom(),
-    focused:handle?.hasFocusedInput(),streamTicks,canvasCalls,parentPins,parentUserScrolls,stickToBottom,elapsed:performance.now()-phaseStart,gaps:[...gaps],longTasks:[...longTasks]};},
-  painted(label){return paints.find(p=>p.text.includes(label));},
+    focused:handle?.hasFocusedInput(),streamTicks,parentPins,parentUserScrolls,stickToBottom,elapsed:performance.now()-phaseStart,gaps:[...gaps],longTasks:[...longTasks]};},
   async scrollFrames(count=180){
     cancelBottomFollow();handle.scrollToGroup(Math.floor(session().groups.length/2));
     for(let i=0;i<8;i++)await nextFrame();
@@ -330,9 +343,9 @@ async function solid(source, filename) {
   return result.code;
 }
 
-async function bundle(renderer) {
-  const outdir = path.join(output, `.bundle-${renderer}`);
-  return build({ absWorkingDir: sourceRoot, stdin: { contents: await solid(fixture(renderer), path.join(sourceRoot, 'fixture.tsx')), resolveDir: sourceRoot, sourcefile: 'fixture.tsx', loader: 'ts' },
+async function bundle() {
+  const outdir = path.join(output, '.bundle');
+  return build({ absWorkingDir: sourceRoot, stdin: { contents: await solid(fixture(), path.join(sourceRoot, 'fixture.tsx')), resolveDir: sourceRoot, sourcefile: 'fixture.tsx', loader: 'ts' },
     bundle: true, write: false, outdir, entryNames: 'bundle', platform: 'browser', format: 'esm', target: 'es2022',
     conditions: ['browser'], nodePaths: [deps], define: { 'import.meta.env.DEV': 'false', 'import.meta.env.PROD': 'true' },
     loader: { '.woff2': 'file', '.woff': 'file', '.ttf': 'file', '.svg': 'file', '.png': 'file', '.webp': 'file' },
@@ -347,7 +360,7 @@ function summarize(stats) {
   const percentile = p => sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * p) - 1)] ?? 0;
   return { elapsedMs: stats.elapsed, frames: sorted.length, frameP95Ms: percentile(.95), frameP99Ms: percentile(.99),
     frameMaxMs: Math.max(0, ...sorted), longTasks: stats.longTasks.length, longestTaskMs: Math.max(0, ...stats.longTasks),
-    rows: stats.rows, elements: stats.elements, peakRows: stats.peakRows, peakElements: stats.peakElements, readGroups: stats.reads, canvasCalls: stats.canvasCalls };
+    rows: stats.rows, elements: stats.elements, peakRows: stats.peakRows, peakElements: stats.peakElements, readGroups: stats.reads };
 }
 function checkBounded(stats, label) {
   assert.ok(stats.peakRows <= limits.rows, `${label}: ${stats.peakRows} mounted rows > ${limits.rows}`);
@@ -360,7 +373,7 @@ function checkFrames(stats, label) {
   assert.ok(m.frameMaxMs <= limits.frameMaxMs, `${label}: worst frame ${m.frameMaxMs.toFixed(1)}ms > ${limits.frameMaxMs}ms`);
 }
 
-async function run(browser, renderer, port, report) {
+async function run(browser, port, report) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1, reducedMotion: 'reduce' });
   // Fixtures contain no remote images: prevent accidental IPC/provider/network side effects.
   await context.route('**/*', route => new URL(route.request().url()).origin === `http://127.0.0.1:${port}` ? route.continue() : route.abort());
@@ -375,7 +388,7 @@ async function run(browser, renderer, port, report) {
   const stats = () => page.evaluate(() => window.test.stats());
   const settle = () => page.evaluate(async () => { for (let i = 0; i < 8; i++) await new Promise(requestAnimationFrame); });
   const waitBottom = () => page.waitForFunction(() => { const s=window.test.stats();return s.max-s.top<=2; });
-  const screenshot = name => page.locator('#fixture').screenshot({ path: path.join(output, `${renderer}-${name}.png`) });
+  const screenshot = name => page.locator('#fixture').screenshot({ path: path.join(output, `${name}.png`) });
   let checkDepth = 0;
   async function check(name, fn) {
     if (!checkDepth && selectedChecks.length && !selectedChecks.some(prefix => name.startsWith(prefix))) {
@@ -390,34 +403,18 @@ async function run(browser, renderer, port, report) {
     } finally { checkDepth--; }
   }
   async function openEditor(index) {
-    if (renderer === 'html') await page.locator(`[data-group-index="${index}"]`).getByRole('button', { name: '编辑消息', exact: true }).click();
-    else {
-      const point = await page.evaluate(index => window.test.painted('round-'+index), index);
-      assert.ok(point, 'Canvas user bubble must be painted before editing');
-      const bounds = await page.locator('canvas.transcript-canvas-only').boundingBox();
-      // Canvas's existing edit icon is left of the prompt bubble; no renderer internals are exposed.
-      await page.mouse.click(bounds.x + point.x - 30, bounds.y + point.y);
-    }
+    await page.locator(`[data-group-index="${index}"]`).getByRole('button', { name: '编辑消息', exact: true }).click();
   }
   async function clickLabel(label) {
-    if (renderer === 'html') {
-      await page.locator('#fixture').getByRole('button', { name: new RegExp(label) }).first().click();
-    } else {
-      await page.waitForFunction(label => !!window.test.painted(label), label);
-      const point = await page.evaluate(label => window.test.painted(label), label);
-      const bounds = await page.locator('canvas.transcript-canvas-only').boundingBox();
-      await page.mouse.click(bounds.x + point.x + 5, bounds.y + point.y - 3);
-    }
+    await page.locator('#fixture').getByRole('button', { name: new RegExp(label) }).first().click();
   }
   try {
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
     await page.waitForFunction(() => window.test?.stats().top !== undefined);
-    if (renderer === 'html') {
-      assert.equal(await page.locator('#fixture canvas').count(), 0, 'HTML transcript must not paint text into a canvas');
-      assert.equal(await page.locator('.html-transcript').getAttribute('tabindex'), '0', 'Transcript must be keyboard focusable');
-    }
+    assert.equal(await page.locator('#fixture canvas').count(), 0, 'HTML transcript must not paint text into a canvas');
+    assert.equal(await page.locator('.html-transcript').getAttribute('tabindex'), '0', 'Transcript must be keyboard focusable');
     if (selectedChecks.some(prefix => prefix.startsWith('scroll-hotpath'))) {
-      await check('scroll-hotpath', () => scrollHotpath({ page, context, renderer, output, report, check, settle }));
+      await check('scroll-hotpath', () => scrollHotpath({ page, context, output, report, check, settle }));
     }
     for (const theme of ['ink-dark', 'ink-light']) for (const width of [1280, 980]) {
       await check(`visual-${theme}-${width}`, async () => {
@@ -447,14 +444,12 @@ async function run(browser, renderer, port, report) {
       await waitBottom();
       await settle();
       const loaded = await stats();
-      checkBounded(loaded, `${renderer}/${count}/initial`);
+      checkBounded(loaded, `${count}/initial`);
       assert.ok(loaded.reads < 100, `Offscreen history eagerly read: ${loaded.reads}/${count}`);
       report.scenarios.push({ name: `load-${count}`, ...summarize(loaded) });
-      if (renderer === 'html') {
-        assert.equal(await page.locator('#fixture canvas').count(), 0, 'Loaded HTML transcript must remain canvas-free');
-        assert.ok(loaded.rows > 0 && loaded.rows < count, 'Real DOM turns must be mounted and virtualized');
-        assert.ok(await page.locator('.html-transcript-row').filter({ hasText: `answer-${count - 1}` }).count(), 'Visible answer must exist as DOM text');
-      }
+      assert.equal(await page.locator('#fixture canvas').count(), 0, 'Loaded HTML transcript must remain canvas-free');
+      assert.ok(loaded.rows > 0 && loaded.rows < count, 'Real DOM turns must be mounted and virtualized');
+      assert.ok(await page.locator('.html-transcript-row').filter({ hasText: `answer-${count - 1}` }).count(), 'Visible answer must exist as DOM text');
       await screenshot(`${count}-bottom`);
       for (const index of [0, Math.floor(count / 2), count - 1]) await check(`jump-${count}-${index}`, async () => {
         await page.evaluate(index => window.test.jump(index), index);
@@ -462,12 +457,12 @@ async function run(browser, renderer, port, report) {
         await settle();
         const jumped = await stats();
         if (index !== count - 1) assert.equal(jumped.active, index, 'Jump must retain exact group anchor');
-        checkBounded(jumped, `${renderer}/${count}/jump-${index}`);
+        checkBounded(jumped, `${count}/jump-${index}`);
       });
       const metrics = await page.evaluate(() => window.test.scrollFrames());
       report.scenarios.push({ name: `scroll-${count}`, ...summarize(metrics) });
-      checkBounded(metrics, `${renderer}/${count}/scroll`);
-      if (renderer === 'html') checkFrames(metrics, `${renderer}/${count}/scroll`);
+      checkBounded(metrics, `${count}/scroll`);
+      checkFrames(metrics, `${count}/scroll`);
       await page.evaluate(count => window.test.jump(count / 2), count);
       await waitText(`round-${count / 2}`);
       await settle();
@@ -516,46 +511,91 @@ async function run(browser, renderer, port, report) {
     await screenshot('resized-anchor');
     });
     await page.setViewportSize({ width: 1280, height: 800 });
-    if (renderer === 'html') {
-      await check('first-paint-tail', async () => {
-        await page.evaluate(() => window.test.firstPaint());
-        await page.waitForFunction(() => window.test.paintedFrames().length>=8);
-        const frames=await page.evaluate(() => window.test.paintedFrames());
-        report.firstVisibleFrames=frames;
-        const first=frames.find(frame=>frame.visible.length);
-        assert.ok(first, 'No visible transcript frame sampled');
-        assert.ok(first.visible.includes(1999), `First visible frame showed history instead of tail: ${JSON.stringify(first)}`);
-        assert.ok(first.max-first.top<=2, 'First visible content frame was not pinned to tail');
-      });
-      await check('resize-tall-group', async () => {
-        await page.evaluate(() => window.test.tall());
-        await page.evaluate(() => window.test.search(92,'tall-line-350 stable reading anchor'));
-        await page.waitForFunction(() => window.test.highlights().some(hit=>hit.text==='tall-line-350 stable reading anchor'));
-        await settle();
-        const row=page.locator('[data-group-index="30"]');
-        assert.ok((await row.boundingBox()).height>5000,'Tall fixture must exceed 5000px');
-        const before=await page.evaluate(() => window.test.highlights()[0]);
-        assert.ok(before.top>=0&&before.top<700,'Tall group midpoint was not visible');
-        await page.setViewportSize({width:980,height:720});
-        await settle();
-        const after=await page.evaluate(() => window.test.highlights()[0]);
-        assert.equal((await stats()).active,30,'Resize lost the tall group');
-        assert.ok(after && Math.abs(after.top-before.top)<=limits.anchorPx,`Resize lost tall-group internal anchor: ${before.top} -> ${after?.top}`);
-        await screenshot('resize-tall-group');
-      });
-      await page.setViewportSize({width:1280,height:800});
-    }
+    await check('first-paint-tail', async () => {
+      await page.evaluate(() => window.test.firstPaint());
+      await page.waitForFunction(() => window.test.paintedFrames().length>=8);
+      const frames=await page.evaluate(() => window.test.paintedFrames());
+      report.firstVisibleFrames=frames;
+      const first=frames.find(frame=>frame.visible.length);
+      assert.ok(first, 'No visible transcript frame sampled');
+      assert.ok(first.visible.includes(1999), `First visible frame showed history instead of tail: ${JSON.stringify(first)}`);
+      assert.ok(first.max-first.top<=2, 'First visible content frame was not pinned to tail');
+    });
+    await check('resize-tall-group', async () => {
+      await page.evaluate(() => window.test.tall());
+      await page.evaluate(() => window.test.search(92,'tall-line-350 stable reading anchor'));
+      await page.waitForFunction(() => window.test.highlights().some(hit=>hit.text==='tall-line-350 stable reading anchor'));
+      await settle();
+      const row=page.locator('[data-group-index="30"]');
+      assert.ok((await row.boundingBox()).height>5000,'Tall fixture must exceed 5000px');
+      const before=await page.evaluate(() => window.test.highlights()[0]);
+      assert.ok(before.top>=0&&before.top<700,'Tall group midpoint was not visible');
+      await page.setViewportSize({width:980,height:720});
+      await settle();
+      const after=await page.evaluate(() => window.test.highlights()[0]);
+      assert.equal((await stats()).active,30,'Resize lost the tall group');
+      assert.ok(after && Math.abs(after.top-before.top)<=limits.anchorPx,`Resize lost tall-group internal anchor: ${before.top} -> ${after?.top}`);
+      await screenshot('resize-tall-group');
+    });
+    await page.setViewportSize({width:1280,height:800});
     await check('search', async () => {
     await page.evaluate(() => window.test.load(2000)); await waitText('answer-end-1999');
     await page.evaluate(() => window.test.search(3692, 'NEEDLE-1230-TARGET'));
     await waitText('needle-1230-target');
     await settle();
-    if (renderer === 'html') {
-      const hits = await page.evaluate(() => window.test.highlights());
-      assert.ok(hits.some(hit => /needle-1230-target/i.test(hit.text)), 'Search must create native CSS Highlight ranges');
-      assert.ok(hits.some(hit => hit.top >= 0 && hit.top < 700), 'Search highlight must be in the viewport');
-    }
+    const hits = await page.evaluate(() => window.test.highlights());
+    assert.ok(hits.some(hit => /needle-1230-target/i.test(hit.text)), 'Search must create native CSS Highlight ranges');
+    assert.ok(hits.some(hit => hit.top >= 0 && hit.top < 700), 'Search highlight must be in the viewport');
     await screenshot('search');
+    });
+
+    await check('session-switch-frames', async () => {
+      // Every painted frame after a switch shows only the new session, pinned to its tail with final geometry:
+      // no stale rows, no history placeholders swapping in place, no cold image growth after reveal.
+      await page.evaluate(() => window.test.load(2000)); await waitText('answer-end-1999'); await waitBottom(); await settle();
+      const log = report.switchFrames = {};
+      for (const [n, [from, to]] of [['long','next'],['next','short'],['short','long'],['long','images'],['images','long'],['long','images'],['images','deferred']].entries()) {
+        const frames = await page.evaluate(kind => window.test.switchFrames(kind), to);
+        log[`${n}:${from}->${to}`] = frames;
+        const shown = frames.filter(f => !f.hidden);
+        assert.ok(shown.length, `${from}->${to}: never revealed`);
+        assert.ok(frames.findIndex(f => !f.hidden) <= frames.findLastIndex(f => f.hidden) + 1, `${from}->${to}: hidden again after reveal`);
+        for (const f of frames) assert.ok(!f.stale, `${from}->${to}: stale session text painted ${JSON.stringify(frames)}`);
+        for (const f of shown) {
+          assert.ok(!f.placeholder, `${from}->${to}: history placeholder painted ${JSON.stringify(frames)}`);
+          assert.ok(f.max - f.top <= 2 && f.gap <= 2 && f.overlap <= 2, `${from}->${to}: unpinned or broken frame ${JSON.stringify(frames)}`);
+        }
+        assert.ok(shown.every(f => JSON.stringify(f.rows) === JSON.stringify(shown[0].rows) && f.top === shown[0].top), `${from}->${to}: geometry moved after reveal ${JSON.stringify(frames)}`);
+        await settle();
+      }
+    });
+
+    await check('file-links-and-menu', async () => {
+      await page.evaluate(() => window.test.fileLinks());
+      await waitText('links-end');
+      await settle();
+      const refs = page.locator('#fixture .md-file-ref');
+      // Sanitizing must not drop drive-letter/file:/`name:line` targets or shorten a linked label to its basename.
+      assert.deepEqual(await refs.evaluateAll(els => els.map(el => [el.dataset.path, el.dataset.line ?? null])),
+        [['D:/proj/src/a.ts', null], ['b.ts', '12'], ['D:/x/c.ts', '3'], ['src/d.ts', '5']]);
+      await refs.nth(0).click();
+      await refs.nth(1).click();
+      assert.deepEqual(await page.evaluate(() => window.test.previews()), [{ path: 'D:/proj/src/a.ts', line: undefined }, { path: 'b.ts', line: 12 }]);
+      const menuAt = async (x, y) => {
+        await refs.nth(2).evaluate((el, [x, y]) => el.dispatchEvent(new MouseEvent('contextmenu', { clientX: x, clientY: y, button: 2, bubbles: true, cancelable: true })), [x, y]);
+        return page.locator('.ctx-menu').evaluate(el => {
+          const r = el.getBoundingClientRect(), hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+          return { body: el.parentElement?.parentElement === document.body, topmost: el.contains(hit), left: r.left, top: r.top, right: r.right, bottom: r.bottom, w: innerWidth, h: innerHeight };
+        });
+      };
+      const box = await refs.nth(2).boundingBox();
+      const menu = await menuAt(box.x + 4, box.y + 4);
+      assert.ok(menu.body && menu.topmost, `File menu must be a top-level layer above transcript rows: ${JSON.stringify(menu)}`);
+      assert.ok(Math.abs(menu.left - box.x - 4) <= 1 && Math.abs(menu.top - box.y - 4) <= 1, `File menu must open at the pointer: ${JSON.stringify(menu)}`);
+      await page.keyboard.press('Escape');
+      const edge = await menuAt(1279, 799);
+      assert.ok(edge.right <= edge.w && edge.bottom <= edge.h && edge.left >= 0 && edge.top >= 0, `File menu must stay inside the viewport: ${JSON.stringify(edge)}`);
+      await page.keyboard.press('Escape');
     });
 
     await check('session-switch-race', async () => {
@@ -595,7 +635,7 @@ async function run(browser, renderer, port, report) {
       await page.waitForFunction(() => !window.test.expanded(13));
       await settle();
       assert.equal((await stats()).active, 4, 'Collapse must return to the original group');
-      if (renderer === 'html') assert.ok(summarize(expanded).frameMaxMs <= limits.frameMaxMs, `Expanded 724k ${kind}: ${summarize(expanded).frameMaxMs.toFixed(1)}ms main-thread gap > ${limits.frameMaxMs}ms`);
+      assert.ok(summarize(expanded).frameMaxMs <= limits.frameMaxMs, `Expanded 724k ${kind}: ${summarize(expanded).frameMaxMs.toFixed(1)}ms main-thread gap > ${limits.frameMaxMs}ms`);
     });
 
     for (const kind of ['continuous', 'paragraphs', 'reply']) await check(`single-${kind}`, async () => {
@@ -610,134 +650,132 @@ async function run(browser, renderer, port, report) {
       await screenshot(`single-${kind}`);
     });
 
-    if (renderer === 'html') {
-      const loadMarkdown = async () => {
-        await page.evaluate(() => window.test.largeMarkdown());
-        await waitText('large-markdown-tail');
-        await waitBottom();
+    const loadMarkdown = async () => {
+      await page.evaluate(() => window.test.largeMarkdown());
+      await waitText('large-markdown-tail');
+      await waitBottom();
+      await settle();
+      assert.equal(await page.locator('[data-markdown-virtual]').count(), 1, 'Large reply must use the Markdown window');
+      checkBounded(await stats(), 'large-markdown/initial');
+    };
+    const markdownSnapshot = capture => page.evaluate(capture => window.test.markdownSnapshot(capture), !!capture);
+    const scrollMarkdown = (index, position) => page.evaluate(({index,position}) => {
+      const root=document.querySelector('.html-transcript');
+      const chunk=root.querySelector(`[data-markdown-chunk="${index}"]`);
+      if (!chunk?.childElementCount) throw Error(`Expected mounted reading chunk ${index}`);
+      const blocks=[...chunk.children],block=blocks[Math.floor((blocks.length-1)*position)];
+      window.test.scroll(block.getBoundingClientRect().top-root.getBoundingClientRect().top+8);
+      return window.test.markdownSnapshot(true);
+    }, {index,position});
+    const assertMarkdownAnchor = (before, after, label) => {
+      assert.ok(before.reading && after.reading?.connected, `${label}: reading block unmounted`);
+      assert.equal(after.reading.text, before.reading.text, `${label}: reading block replaced`);
+      assert.ok(Math.abs(after.reading.offset-before.reading.offset)<=limits.anchorPx,
+        `${label}: chunk ${before.reading.chunk}, inset ${before.reading.inset}, offset ${before.reading.offset} -> ${after.reading.offset}`);
+    };
+    for (const [name,query] of [
+      ['early','markdown-early-unique'], ['middle','markdown-middle-6000'], ['end','markdown-end-unique'],
+      ['inline','markdown-middle-6000 alpha bold emphasis code omega'],
+    ]) await check(`large-markdown-search-${name}`, async () => {
+      await loadMarkdown();
+      if (name==='end') {
+        await page.evaluate(() => window.test.jump(0));
+        await waitText('markdown-paragraph-0 ');
         await settle();
-        assert.equal(await page.locator('[data-markdown-virtual]').count(), 1, 'Large reply must use the Markdown window');
-        checkBounded(await stats(), 'large-markdown/initial');
-      };
-      const markdownSnapshot = capture => page.evaluate(capture => window.test.markdownSnapshot(capture), !!capture);
-      const scrollMarkdown = (index, position) => page.evaluate(({index,position}) => {
-        const root=document.querySelector('.html-transcript');
-        const chunk=root.querySelector(`[data-markdown-chunk="${index}"]`);
-        if (!chunk?.childElementCount) throw Error(`Expected mounted reading chunk ${index}`);
-        const blocks=[...chunk.children],block=blocks[Math.floor((blocks.length-1)*position)];
-        window.test.scroll(block.getBoundingClientRect().top-root.getBoundingClientRect().top+8);
-        return window.test.markdownSnapshot(true);
-      }, {index,position});
-      const assertMarkdownAnchor = (before, after, label) => {
-        assert.ok(before.reading && after.reading?.connected, `${label}: reading block unmounted`);
-        assert.equal(after.reading.text, before.reading.text, `${label}: reading block replaced`);
-        assert.ok(Math.abs(after.reading.offset-before.reading.offset)<=limits.anchorPx,
-          `${label}: chunk ${before.reading.chunk}, inset ${before.reading.inset}, offset ${before.reading.offset} -> ${after.reading.offset}`);
-      };
-      for (const [name,query] of [
-        ['early','markdown-early-unique'], ['middle','markdown-middle-6000'], ['end','markdown-end-unique'],
-        ['inline','markdown-middle-6000 alpha bold emphasis code omega'],
-      ]) await check(`large-markdown-search-${name}`, async () => {
-        await loadMarkdown();
-        if (name==='end') {
-          await page.evaluate(() => window.test.jump(0));
-          await waitText('markdown-paragraph-0 ');
-          await settle();
-        }
-        assert.ok(!(await page.evaluate(() => window.test.text())).includes(query), `${name}: search fixture must start with a hidden match`);
-        await page.evaluate(query => window.test.search(2,query), query);
-        await page.waitForFunction(query => window.test.highlights().some(hit=>hit.text===query), query);
+      }
+      assert.ok(!(await page.evaluate(() => window.test.text())).includes(query), `${name}: search fixture must start with a hidden match`);
+      await page.evaluate(query => window.test.search(2,query), query);
+      await page.waitForFunction(query => window.test.highlights().some(hit=>hit.text===query), query);
+      await settle();
+      const hits=await page.evaluate(() => window.test.highlights());
+      const state=await markdownSnapshot(true),metrics=await stats();
+      report.scenarios.push({name:`large-markdown-search-${name}`,query,hits,...state,...summarize(metrics)});
+      assert.equal(hits.filter(hit=>hit.text===query).length,1, `${name}: expected one unique native highlight`);
+      assert.ok(hits.some(hit=>hit.text===query&&hit.top>=0&&hit.top<700), `${name}: hidden chunk match is still offscreen: ${JSON.stringify(hits)}`);
+      assert.ok(state.mounted.length<state.chunks, `${name}: search mounted every chunk`);
+      checkBounded(metrics, `large-markdown/search-${name}`);
+      await screenshot(`large-markdown-search-${name}`);
+    });
+    await check('large-markdown-scroll-anchor', async () => {
+      await loadMarkdown();
+      await page.evaluate(() => window.test.search(2,'markdown-middle-6000'));
+      await page.waitForFunction(() => window.test.highlights().some(hit=>hit.text==='markdown-middle-6000'));
+      await settle();
+      await page.evaluate(() => document.querySelector('[data-markdown-virtual]').dispatchEvent(new CustomEvent('markdown-reveal',{detail:{query:''}})));
+      await settle();
+      const initial=await markdownSnapshot(true),trace=[];
+      assert.ok(initial.reading?.chunk>0, 'Scroll must start in a deep Markdown chunk');
+      report.scenarios.push({name:'large-markdown-scroll-anchor',trace});
+      let index=initial.reading.chunk,loads=0,unloads=0;
+      for (const direction of [1,1,1,-1,-1,-1]) {
+        const previous=await markdownSnapshot();
+        const before=await scrollMarkdown(index,direction>0?1:0);
         await settle();
-        const hits=await page.evaluate(() => window.test.highlights());
-        const state=await markdownSnapshot(true),metrics=await stats();
-        report.scenarios.push({name:`large-markdown-search-${name}`,query,hits,...state,...summarize(metrics)});
-        assert.equal(hits.filter(hit=>hit.text===query).length,1, `${name}: expected one unique native highlight`);
-        assert.ok(hits.some(hit=>hit.text===query&&hit.top>=0&&hit.top<700), `${name}: hidden chunk match is still offscreen: ${JSON.stringify(hits)}`);
-        assert.ok(state.mounted.length<state.chunks, `${name}: search mounted every chunk`);
-        checkBounded(metrics, `large-markdown/search-${name}`);
-        await screenshot(`large-markdown-search-${name}`);
-      });
-      await check('large-markdown-scroll-anchor', async () => {
-        await loadMarkdown();
-        await page.evaluate(() => window.test.search(2,'markdown-middle-6000'));
-        await page.waitForFunction(() => window.test.highlights().some(hit=>hit.text==='markdown-middle-6000'));
-        await settle();
-        await page.evaluate(() => document.querySelector('[data-markdown-virtual]').dispatchEvent(new CustomEvent('markdown-reveal',{detail:{query:''}})));
-        await settle();
-        const initial=await markdownSnapshot(true),trace=[];
-        assert.ok(initial.reading?.chunk>0, 'Scroll must start in a deep Markdown chunk');
-        report.scenarios.push({name:'large-markdown-scroll-anchor',trace});
-        let index=initial.reading.chunk,loads=0,unloads=0;
-        for (const direction of [1,1,1,-1,-1,-1]) {
-          const previous=await markdownSnapshot();
-          const before=await scrollMarkdown(index,direction>0?1:0);
+        const after=await markdownSnapshot(),metrics=await stats();
+        loads+=after.mounted.filter(n=>!previous.mounted.includes(n)).length;
+        unloads+=previous.mounted.filter(n=>!after.mounted.includes(n)).length;
+        trace.push({direction,before,after,...summarize(metrics)});
+        assertMarkdownAnchor(before,after, 'Adjacent chunk load/unload moved the reading block');
+        checkBounded(metrics,'large-markdown/scroll');
+        index+=direction;
+      }
+      assert.ok(loads>0&&unloads>0, `Scroll did not exercise both loading and unloading: ${loads}/${unloads}`);
+      await screenshot('large-markdown-scroll-anchor');
+    });
+    await check('large-markdown-resize-anchor', async () => {
+      await loadMarkdown();
+      await page.evaluate(() => window.test.search(2,'markdown-middle-6000'));
+      await page.waitForFunction(() => window.test.highlights().some(hit=>hit.text==='markdown-middle-6000'));
+      await settle();
+      const initial=await markdownSnapshot(true);
+      assert.ok(initial.reading?.chunk>0, 'Resize must start in a deep Markdown chunk');
+      await scrollMarkdown(initial.reading.chunk,.75);
+      await settle();
+      const before=await markdownSnapshot(true),trace=[];
+      assert.ok(before.reading.inset>800, 'Resize must exercise an internal block, not the chunk boundary');
+      report.scenarios.push({name:'large-markdown-resize-anchor',before,trace});
+      try {
+        for (const width of [760,1280]) {
+          await page.setViewportSize({width,height:720});
           await settle();
           const after=await markdownSnapshot(),metrics=await stats();
-          loads+=after.mounted.filter(n=>!previous.mounted.includes(n)).length;
-          unloads+=previous.mounted.filter(n=>!after.mounted.includes(n)).length;
-          trace.push({direction,before,after,...summarize(metrics)});
-          assertMarkdownAnchor(before,after, 'Adjacent chunk load/unload moved the reading block');
-          checkBounded(metrics,'large-markdown/scroll');
-          index+=direction;
+          trace.push({width,after,...summarize(metrics)});
+          assertMarkdownAnchor(before,after,'Resize lost deep-chunk reading anchor');
+          checkBounded(metrics,'large-markdown/resize');
         }
-        assert.ok(loads>0&&unloads>0, `Scroll did not exercise both loading and unloading: ${loads}/${unloads}`);
-        await screenshot('large-markdown-scroll-anchor');
-      });
-      await check('large-markdown-resize-anchor', async () => {
-        await loadMarkdown();
+        await screenshot('large-markdown-resize-anchor');
+      } finally { await page.setViewportSize({width:1280,height:800}); }
+    });
+    await check('large-markdown-stream-tail', async () => {
+      await loadMarkdown();
+      const initial=await stats();
+      try {
+        await page.evaluate(() => window.test.startStream());
+        await page.waitForFunction(() => window.test.stats().streamTicks>=12);
+        await waitBottom();
+        const tail=await stats();
+        report.scenarios.push({name:'large-markdown-stream-tail',...summarize(tail)});
+        assert.ok(tail.max>initial.max,'Large Markdown streaming must grow the tail');
+        checkBounded(tail,'large-markdown/stream-tail');
         await page.evaluate(() => window.test.search(2,'markdown-middle-6000'));
         await page.waitForFunction(() => window.test.highlights().some(hit=>hit.text==='markdown-middle-6000'));
         await settle();
-        const initial=await markdownSnapshot(true);
-        assert.ok(initial.reading?.chunk>0, 'Resize must start in a deep Markdown chunk');
-        await scrollMarkdown(initial.reading.chunk,.75);
-        await settle();
-        const before=await markdownSnapshot(true),trace=[];
-        assert.ok(before.reading.inset>800, 'Resize must exercise an internal block, not the chunk boundary');
-        report.scenarios.push({name:'large-markdown-resize-anchor',before,trace});
-        try {
-          for (const width of [760,1280]) {
-            await page.setViewportSize({width,height:720});
-            await settle();
-            const after=await markdownSnapshot(),metrics=await stats();
-            trace.push({width,after,...summarize(metrics)});
-            assertMarkdownAnchor(before,after,'Resize lost deep-chunk reading anchor');
-            checkBounded(metrics,'large-markdown/resize');
-          }
-          await screenshot('large-markdown-resize-anchor');
-        } finally { await page.setViewportSize({width:1280,height:800}); }
-      });
-      await check('large-markdown-stream-tail', async () => {
-        await loadMarkdown();
-        const initial=await stats();
-        try {
-          await page.evaluate(() => window.test.startStream());
-          await page.waitForFunction(() => window.test.stats().streamTicks>=12);
-          await waitBottom();
-          const tail=await stats();
-          report.scenarios.push({name:'large-markdown-stream-tail',...summarize(tail)});
-          assert.ok(tail.max>initial.max,'Large Markdown streaming must grow the tail');
-          checkBounded(tail,'large-markdown/stream-tail');
-          await page.evaluate(() => window.test.search(2,'markdown-middle-6000'));
-          await page.waitForFunction(() => window.test.highlights().some(hit=>hit.text==='markdown-middle-6000'));
-          await settle();
-          const before=await markdownSnapshot(true),browsing=await stats();
-          await page.waitForFunction(n => window.test.stats().streamTicks>=n+12,browsing.streamTicks);
-          const after=await markdownSnapshot(),streamed=await stats();
-          report.scenarios.push({name:'large-markdown-stream-browse',before,after,...summarize(streamed)});
-          assert.equal(streamed.stickToBottom,false,'Large Markdown tail stole free-browse mode');
-          assertMarkdownAnchor(before,after,'Streaming tail moved the middle reading block');
-          checkBounded(streamed,'large-markdown/stream-browse');
-        } finally { await page.evaluate(() => window.test.stopStream()); }
-        const completed=await stats();
-        await page.evaluate(() => window.test.bottom());
-        await waitText(`stream-${completed.streamTicks}`);
-        await waitBottom();
-        await settle();
-        checkBounded(await stats(),'large-markdown/stream-complete');
-        await screenshot('large-markdown-stream-tail');
-      });
-    }
+        const before=await markdownSnapshot(true),browsing=await stats();
+        await page.waitForFunction(n => window.test.stats().streamTicks>=n+12,browsing.streamTicks);
+        const after=await markdownSnapshot(),streamed=await stats();
+        report.scenarios.push({name:'large-markdown-stream-browse',before,after,...summarize(streamed)});
+        assert.equal(streamed.stickToBottom,false,'Large Markdown tail stole free-browse mode');
+        assertMarkdownAnchor(before,after,'Streaming tail moved the middle reading block');
+        checkBounded(streamed,'large-markdown/stream-browse');
+      } finally { await page.evaluate(() => window.test.stopStream()); }
+      const completed=await stats();
+      await page.evaluate(() => window.test.bottom());
+      await waitText(`stream-${completed.streamTicks}`);
+      await waitBottom();
+      await settle();
+      checkBounded(await stats(),'large-markdown/stream-complete');
+      await screenshot('large-markdown-stream-tail');
+    });
 
     await check('editing', async () => {
     // Exercise the actual editor without submitting a message or invoking the backend.
@@ -761,115 +799,113 @@ async function run(browser, renderer, port, report) {
     await waitText('round-10');
     });
 
-    if (renderer === 'html') {
-      await check('inline-search', async () => {
-        await page.evaluate(() => window.test.inline());
-        await page.evaluate(() => window.test.search(2, 'alpha bold omega'));
-        await page.waitForFunction(() => window.test.highlights().some(hit => hit.text==='alpha bold omega'));
-        const hits=await page.evaluate(() => window.test.highlights());
-        assert.ok(hits.some(hit=>hit.top>=0&&hit.top<700), 'Cross-inline highlight is offscreen');
-        await screenshot('inline-search');
+    await check('inline-search', async () => {
+      await page.evaluate(() => window.test.inline());
+      await page.evaluate(() => window.test.search(2, 'alpha bold omega'));
+      await page.waitForFunction(() => window.test.highlights().some(hit => hit.text==='alpha bold omega'));
+      const hits=await page.evaluate(() => window.test.highlights());
+      assert.ok(hits.some(hit=>hit.top>=0&&hit.top<700), 'Cross-inline highlight is offscreen');
+      await screenshot('inline-search');
+    });
+    for (const kind of ['thought','tool']) await check(`deferred-search-${kind}`, async () => {
+      await page.evaluate(kind => window.test.deferred(kind), kind);
+      await waitText('answer-end-79');
+      assert.equal((await page.evaluate(() => window.test.loadStats())).calls.length,0,'Offscreen deferred history was eagerly requested');
+      const id=kind==='tool'?9002:9001, query=kind==='tool'?'deferred-tool-target':'deferred thought target';
+      await page.evaluate(({id,query})=>window.test.search(id,query),{id,query});
+      await page.waitForFunction(() => window.test.loadStats().pending>0);
+      await settle();
+      assert.ok((await page.evaluate(() => window.test.loadStats())).calls.flat().includes(id),'Target was not requested');
+      await page.evaluate(() => window.test.releaseLoads());
+      await page.waitForFunction(query=>window.test.highlights().some(hit=>hit.text===query),query);
+      await settle();
+      const hits=await page.evaluate(() => window.test.highlights());
+      assert.ok(hits.some(hit=>hit.top>=0&&hit.top<700),'Hydrated match must scroll into view, not just highlight hidden content');
+      assert.equal((await page.evaluate(() => window.test.loadStats())).hydrationCount,1);
+      assert.equal((await stats()).active,30,'Hydration replaced the target reading group');
+      await screenshot(`deferred-${kind}`);
+    });
+    await check('deferred-above-reading-anchor', async () => {
+      await page.evaluate(() => {window.test.deferred('above');window.test.jump(30);});
+      await page.waitForFunction(() => window.test.loadStats().pending>0);
+      await page.evaluate(() => window.test.jump(31));
+      await settle();
+      const before=await page.evaluate(() => window.test.anchor());
+      assert.equal(before?.index,31,'Fixture must browse the group after deferred content');
+      await page.evaluate(() => window.test.releaseLoads());
+      await page.waitForFunction(() => window.test.loadStats().hydrationCount===1);
+      await settle();
+      const after=await page.evaluate(() => window.test.anchor());
+      assert.equal(after?.index,before.index,'Hydration above reading changed the active group');
+      assert.ok(Math.abs(after.offset-before.offset)<=limits.anchorPx,`Hydration above shifted reading offset ${before.offset} -> ${after.offset}`);
+      await screenshot('deferred-above-anchor');
+    });
+    await check('deferred-search-browse-away', async () => {
+      await page.evaluate(() => {window.test.deferred('thought');window.test.search(9001,'deferred thought target');});
+      await page.waitForFunction(() => window.test.loadStats().pending>0);
+      await page.evaluate(() => window.test.jump(40));
+      await settle();
+      const before=await page.evaluate(() => window.test.anchor());
+      await page.evaluate(() => window.test.releaseLoads());
+      await settle();
+      const after=await page.evaluate(() => window.test.anchor());
+      assert.equal(after?.index,before?.index,'Resolved pending search stole later explicit navigation');
+    });
+    await check('deferred-late-session-switch', async () => {
+      await page.evaluate(() => {window.test.deferred('tool');window.test.search(9002,'deferred-tool-target');});
+      await page.waitForFunction(() => window.test.loadStats().pending>0);
+      await page.evaluate(() => window.test.sameIds('replacement-deferred'));
+      await page.evaluate(() => window.test.load(3));
+      await page.evaluate(() => window.test.releaseLoads());
+      await settle();
+      assert.deepEqual(await page.evaluate(() => window.test.highlights()),[],'Late hydration resurrected an abandoned search');
+      assert.equal(await page.locator('[data-item-id="9002"]').count(),0,'Abandoned deferred item leaked into new session');
+    });
+    await check('native-selection-new-session-helper', async () => {
+      await page.evaluate(() => window.test.load(3));
+      await page.evaluate(() => window.test.jump(1));
+      await settle();
+      const selected = await page.evaluate(() => {
+        const element=document.querySelector('[data-group-index="1"] .ht-user-text');
+        const range=document.createRange();range.selectNodeContents(element);
+        const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
+        return {native:selection.toString(),helper:window.test.selectedChatText()};
       });
-      for (const kind of ['thought','tool']) await check(`deferred-search-${kind}`, async () => {
-        await page.evaluate(kind => window.test.deferred(kind), kind);
-        await waitText('answer-end-79');
-        assert.equal((await page.evaluate(() => window.test.loadStats())).calls.length,0,'Offscreen deferred history was eagerly requested');
-        const id=kind==='tool'?9002:9001, query=kind==='tool'?'deferred-tool-target':'deferred thought target';
-        await page.evaluate(({id,query})=>window.test.search(id,query),{id,query});
-        await page.waitForFunction(() => window.test.loadStats().pending>0);
-        await settle();
-        assert.ok((await page.evaluate(() => window.test.loadStats())).calls.flat().includes(id),'Target was not requested');
-        await page.evaluate(() => window.test.releaseLoads());
-        await page.waitForFunction(query=>window.test.highlights().some(hit=>hit.text===query),query);
-        await settle();
-        const hits=await page.evaluate(() => window.test.highlights());
-        assert.ok(hits.some(hit=>hit.top>=0&&hit.top<700),'Hydrated match must scroll into view, not just highlight hidden content');
-        assert.equal((await page.evaluate(() => window.test.loadStats())).hydrationCount,1);
-        assert.equal((await stats()).active,30,'Hydration replaced the target reading group');
-        await screenshot(`deferred-${kind}`);
-      });
-      await check('deferred-above-reading-anchor', async () => {
-        await page.evaluate(() => {window.test.deferred('above');window.test.jump(30);});
-        await page.waitForFunction(() => window.test.loadStats().pending>0);
-        await page.evaluate(() => window.test.jump(31));
-        await settle();
-        const before=await page.evaluate(() => window.test.anchor());
-        assert.equal(before?.index,31,'Fixture must browse the group after deferred content');
-        await page.evaluate(() => window.test.releaseLoads());
-        await page.waitForFunction(() => window.test.loadStats().hydrationCount===1);
-        await settle();
-        const after=await page.evaluate(() => window.test.anchor());
-        assert.equal(after?.index,before.index,'Hydration above reading changed the active group');
-        assert.ok(Math.abs(after.offset-before.offset)<=limits.anchorPx,`Hydration above shifted reading offset ${before.offset} -> ${after.offset}`);
-        await screenshot('deferred-above-anchor');
-      });
-      await check('deferred-search-browse-away', async () => {
-        await page.evaluate(() => {window.test.deferred('thought');window.test.search(9001,'deferred thought target');});
-        await page.waitForFunction(() => window.test.loadStats().pending>0);
-        await page.evaluate(() => window.test.jump(40));
-        await settle();
-        const before=await page.evaluate(() => window.test.anchor());
-        await page.evaluate(() => window.test.releaseLoads());
-        await settle();
-        const after=await page.evaluate(() => window.test.anchor());
-        assert.equal(after?.index,before?.index,'Resolved pending search stole later explicit navigation');
-      });
-      await check('deferred-late-session-switch', async () => {
-        await page.evaluate(() => {window.test.deferred('tool');window.test.search(9002,'deferred-tool-target');});
-        await page.waitForFunction(() => window.test.loadStats().pending>0);
-        await page.evaluate(() => window.test.sameIds('replacement-deferred'));
-        await page.evaluate(() => window.test.load(3));
-        await page.evaluate(() => window.test.releaseLoads());
-        await settle();
-        assert.deepEqual(await page.evaluate(() => window.test.highlights()),[],'Late hydration resurrected an abandoned search');
-        assert.equal(await page.locator('[data-item-id="9002"]').count(),0,'Abandoned deferred item leaked into new session');
-      });
-      await check('native-selection-new-session-helper', async () => {
-        await page.evaluate(() => window.test.load(3));
-        await page.evaluate(() => window.test.jump(1));
-        await settle();
-        const selected = await page.evaluate(() => {
-          const element=document.querySelector('[data-group-index="1"] .ht-user-text');
-          const range=document.createRange();range.selectNodeContents(element);
-          const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
-          return {native:selection.toString(),helper:window.test.selectedChatText()};
-        });
-        assert.deepEqual(selected, { native: 'round-1', helper: 'round-1' }, 'New-session shortcut must receive the native chat selection');
-        await screenshot('native-selection');
-        await page.evaluate(() => window.test.sameIds('next-thread'));
-        await settle();
-        assert.equal(await page.evaluate(() => window.test.selectedChatText()), '', 'Old selection leaked into a new session');
-      });
-      await check('same-ids-edit-and-search', async () => {
-        await page.evaluate(() => window.test.load(3));
-        await page.evaluate(() => window.test.search(4, 'round-1'));
-        await settle();
-        await openEditor(1);
-        await page.locator('#fixture textarea').fill('OLD SESSION DRAFT');
-        await page.evaluate(() => window.test.sameIds('next-thread'));
-        await settle();
-        assert.equal(await page.locator('#fixture textarea').count(), 0, 'Same indices/item IDs reused old editing state');
-        assert.deepEqual(await page.evaluate(() => window.test.highlights()), [], 'Search highlight leaked into new session');
-        assert.equal(await page.locator('.transcript-search-hit').count(), 0, 'Old search-hit class leaked');
-        await page.evaluate(() => window.test.jump(1));
-        await settle();
-        await openEditor(1);
-        assert.equal(await page.locator('#fixture textarea').inputValue(), 'next-thread round-1', 'New editor resurrected old draft');
-        await page.locator('#fixture textarea').press('Escape');
-      });
-      await check('same-ids-expanded', async () => {
-        await page.evaluate(() => window.test.loadFold('paragraphs'));
-        await page.evaluate(() => window.test.jump(4));
-        await settle();
-        await clickLabel('展开完整提示词');
-        await page.waitForFunction(() => window.test.expanded(13));
-        await page.evaluate(() => window.test.sameIds('next-thread'));
-        await page.evaluate(() => window.test.jump(4));
-        await settle();
-        const fold=page.locator('[data-group-index="4"] button[aria-expanded]').filter({hasText:/提示词/}).first();
-        assert.equal(await fold.getAttribute('aria-expanded'), 'false', 'Expanded state for reused item ID leaked across sessions');
-      });
-    }
+      assert.deepEqual(selected, { native: 'round-1', helper: 'round-1' }, 'New-session shortcut must receive the native chat selection');
+      await screenshot('native-selection');
+      await page.evaluate(() => window.test.sameIds('next-thread'));
+      await settle();
+      assert.equal(await page.evaluate(() => window.test.selectedChatText()), '', 'Old selection leaked into a new session');
+    });
+    await check('same-ids-edit-and-search', async () => {
+      await page.evaluate(() => window.test.load(3));
+      await page.evaluate(() => window.test.search(4, 'round-1'));
+      await settle();
+      await openEditor(1);
+      await page.locator('#fixture textarea').fill('OLD SESSION DRAFT');
+      await page.evaluate(() => window.test.sameIds('next-thread'));
+      await settle();
+      assert.equal(await page.locator('#fixture textarea').count(), 0, 'Same indices/item IDs reused old editing state');
+      assert.deepEqual(await page.evaluate(() => window.test.highlights()), [], 'Search highlight leaked into new session');
+      assert.equal(await page.locator('.transcript-search-hit').count(), 0, 'Old search-hit class leaked');
+      await page.evaluate(() => window.test.jump(1));
+      await settle();
+      await openEditor(1);
+      assert.equal(await page.locator('#fixture textarea').inputValue(), 'next-thread round-1', 'New editor resurrected old draft');
+      await page.locator('#fixture textarea').press('Escape');
+    });
+    await check('same-ids-expanded', async () => {
+      await page.evaluate(() => window.test.loadFold('paragraphs'));
+      await page.evaluate(() => window.test.jump(4));
+      await settle();
+      await clickLabel('展开完整提示词');
+      await page.waitForFunction(() => window.test.expanded(13));
+      await page.evaluate(() => window.test.sameIds('next-thread'));
+      await page.evaluate(() => window.test.jump(4));
+      await settle();
+      const fold=page.locator('[data-group-index="4"] button[aria-expanded]').filter({hasText:/提示词/}).first();
+      assert.equal(await fold.getAttribute('aria-expanded'), 'false', 'Expanded state for reused item ID leaked across sessions');
+    });
     assert.deepEqual(errors, [], 'Renderer emitted uncaught browser errors');
     report.passed = report.checks.every(check => check.passed || check.skipped);
   } catch (error) {
@@ -887,12 +923,11 @@ let browser;
 const reports = [];
 try {
   const browserPath = buildOnly ? null : await executable();
-  for (const renderer of renderers) {
-    const report = { renderer, passed: false, scenarios: [] };
+  for (const report of [{ passed: false, scenarios: [] }]) {
     reports.push(report);
     let server;
     try {
-      const built = await bundle(renderer);
+      const built = await bundle();
       if (buildOnly) { report.passed = true; report.buildOnly = true; continue; }
       const files = new Map(built.outputFiles.map(file => ['/' + path.basename(file.path), file.contents]));
       server = createServer((req, res) => {
@@ -900,6 +935,10 @@ try {
         if (pathname === '/') {
           res.setHeader('Content-Type', 'text/html; charset=utf-8');
           res.end('<!doctype html><html data-theme="ink-dark"><head><meta charset="utf-8"><link rel="stylesheet" href="/bundle.css"><style>html,body,#root{margin:0;width:100%;height:100%;overflow:hidden}#fixture{height:calc(100vh - 100px);width:100%;display:flex;min-height:0}*{scroll-behavior:auto!important}</style></head><body><div id="root"></div><script type="module" src="/bundle.js"></script></body></html>');
+        } else if (pathname.startsWith('/img-')) {
+          // Delayed like an asset:// disk read, so the first switch to an image session is cold.
+          setTimeout(() => { res.setHeader('Content-Type', 'image/svg+xml'); res.setHeader('Cache-Control', 'max-age=3600');
+            res.end('<svg xmlns="http://www.w3.org/2000/svg" width="240" height="160"><rect width="240" height="160" fill="#41609a"/></svg>'); }, 40);
         } else if (files.has(pathname)) {
           res.setHeader('Content-Type', pathname.endsWith('.css') ? 'text/css' : pathname.endsWith('.js') ? 'text/javascript' : 'application/octet-stream');
           res.end(files.get(pathname));
@@ -907,27 +946,19 @@ try {
       });
       await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
       browser ??= await chromium.launch({ executablePath: browserPath, headless: true });
-      await run(browser, renderer, server.address().port, report);
+      await run(browser, server.address().port, report);
     } catch (error) {
       report.error = error.stack || String(error);
-      console.error(`${renderer}: ${report.error}`);
+      console.error(report.error);
     } finally {
       if (server) await new Promise(resolve => server.close(resolve));
     }
   }
-  const comparison = reports.length === 2 ? reports[1].scenarios.flatMap(html => {
-    const canvas = reports[0].scenarios.find(row => row.name === html.name);
-    return canvas ? [{ scenario: html.name, htmlP95Ms: html.frameP95Ms ?? html.frameGapMs?.p95, canvasP95Ms: canvas.frameP95Ms ?? canvas.frameGapMs?.p95,
-      p95Ratio: (html.frameP95Ms ?? html.frameGapMs?.p95) / (canvas.frameP95Ms ?? canvas.frameGapMs?.p95) || null,
-      htmlElements: html.peakElements, canvasElements: canvas.peakElements,
-      ...(html.metrics ? { htmlMetricsPerFrame: html.metricsPerFrame, canvasMetricsPerFrame: canvas.metricsPerFrame,
-        htmlRowReads: html.work.rectReads.row, canvasRowReads: canvas.work.rectReads.row } : {}) }] : [];
-  }) : [];
-  const result = { buildOnly, source, selectedChecks, partialCoverage: selectedChecks.length > 0, browserPath, viewport: { width: 1280, height: 800, deviceScaleFactor: 1 }, limits, reports, comparison };
+  const result = { buildOnly, source, selectedChecks, partialCoverage: selectedChecks.length > 0, browserPath, viewport: { width: 1280, height: 800, deviceScaleFactor: 1 }, limits, reports };
   await writeFile(path.join(output, 'results.json'), JSON.stringify(result, null, 2) + '\n');
   if (!buildOnly) {
     const images=(await readdir(output)).filter(name=>name.endsWith('.png')).sort();
-    await writeFile(path.join(output,'index.html'),'<!doctype html><meta charset="utf-8"><title>Transcript comparison</title><style>body{font:14px system-ui;background:#ddd}section{display:flex;gap:12px;align-items:start}figure{margin:8px;width:48%}img{width:100%}</style><h1>Transcript renderer comparison</h1><p>Read results.json for assertions and partial coverage. Images are same-data references, not pixel-equality tests.</p>'+images.filter(name=>name.startsWith('html-')).map(name=>{const other=name.replace(/^html-/,'canvas-');return '<h2>'+name.slice(5,-4)+'</h2><section>'+[other,name].filter(n=>images.includes(n)).map(n=>'<figure><figcaption>'+n+'</figcaption><img src="'+n+'"></figure>').join('')+'</section>';}).join(''));
+    await writeFile(path.join(output,'index.html'),'<!doctype html><meta charset="utf-8"><title>Transcript screenshots</title><style>body{font:14px system-ui;background:#ddd}figure{margin:8px;display:inline-block;width:48%;vertical-align:top}img{width:100%}</style><h1>HtmlTranscript screenshots</h1><p>Read results.json for assertions and partial coverage.</p>'+images.map(n=>'<figure><figcaption>'+n+'</figcaption><img src="'+n+'"></figure>').join(''));
   }
   console.log(JSON.stringify(result, null, 2));
   console.log(`Artifacts: ${output}`);

@@ -114,7 +114,7 @@ export function installScrollProbe() {
 const metricNames = ['LayoutCount', 'LayoutDuration', 'RecalcStyleCount', 'RecalcStyleDuration', 'TaskDuration', 'ScriptDuration'];
 const metricMap = result => Object.fromEntries(result.metrics.map(metric => [metric.name, metric.value]));
 
-export async function scrollHotpath({ page, context, renderer, output, report, check, settle }) {
+export async function scrollHotpath({ page, context, output, report, check, settle }) {
   const cdp = await context.newCDPSession(page);
   await cdp.send('Performance.enable');
   const getMetrics = async () => metricMap(await cdp.send('Performance.getMetrics'));
@@ -144,7 +144,7 @@ export async function scrollHotpath({ page, context, renderer, output, report, c
     const workload = await page.evaluate(steps => window.__scrollProbe.drive({ steps }), sequence);
     const after = await getMetrics();
     const work = await page.evaluate(() => window.__scrollProbe.stop());
-    const traceFile = trace ? `${renderer}-${name}.trace.json` : undefined;
+    const traceFile = trace ? `${name}.trace.json` : undefined;
     if (trace) await endTrace(traceFile);
     const metrics = Object.fromEntries(metricNames.map(key => [key, key.endsWith('Duration')
       ? (after[key] - before[key]) * 1000 : after[key] - before[key]]));
@@ -152,13 +152,13 @@ export async function scrollHotpath({ page, context, renderer, output, report, c
     const result = { name, metricDurationUnit: 'ms', metrics, metricsPerFrame, work, ...workload, traceFile };
     report.scenarios.push(result);
     // Persist after each phase, including failing structural baselines.
-    await writeFile(path.join(output, `${renderer}-scroll-hotpath.json`), JSON.stringify(report.scenarios, null, 2) + '\n');
+    await writeFile(path.join(output, 'scroll-hotpath.json'), JSON.stringify(report.scenarios, null, 2) + '\n');
     return result;
   }
   try {
     report.scrollProtocol = { targetHz: 60, deltaPx: [300, 800], maxPhaseMs: 2850,
       timingGates: false, trace: 'normal cold only, <= ~3s; includes tracing overhead',
-      coverage: 'separate post-render text/row union-gap-overlap/order/chunk-emptiness replay at rAF cadence; Canvas paint text only, not compositor pixel proof',
+      coverage: 'separate post-render text/row union-gap-overlap/order/chunk-emptiness replay at rAF cadence; not compositor pixel proof',
       geometry: 'Element.getBoundingClientRect calls only; duration includes native forced layout when present',
       callbackGate: 'same named scroll/layout rAF callback identity at most once per render timestamp' };
     for (const kind of ['normal', 'dense', 'markdown']) {
@@ -198,13 +198,11 @@ export async function scrollHotpath({ page, context, renderer, output, report, c
         assert.equal(coverage.coverageSamples.length, coverage.frames, 'Missing post-render samples');
         assert.deepEqual(coverage.blanks, [], 'A rendered frame had no visible text (mounted DOM alone is insufficient)');
         assert.ok(coverage.maxSpeedErrorPx <= 1, 'Fast scrolling clamped or lost requested pixels');
-        if (renderer === 'html') {
-          const bad = coverage.coverageSamples.map((sample, frame) => ({ frame, ...sample })).filter(sample =>
-            sample.maxGapPx > 2 || sample.maxOverlapPx > 2 || sample.readingOrder === false || sample.emptyChunks?.length);
-          assert.deepEqual(bad.slice(0, 3), [], `${bad.length} rendered frames had row gaps/overlaps, wrong reading order, or empty visible Markdown chunks; full frames saved in JSON`);
-        }
+        const bad = coverage.coverageSamples.map((sample, frame) => ({ frame, ...sample })).filter(sample =>
+          sample.maxGapPx > 2 || sample.maxOverlapPx > 2 || sample.readingOrder === false || sample.emptyChunks?.length);
+        assert.deepEqual(bad.slice(0, 3), [], `${bad.length} rendered frames had row gaps/overlaps, wrong reading order, or empty visible Markdown chunks; full frames saved in JSON`);
       });
-      await writeFile(path.join(output, `${renderer}-scroll-hotpath.json`), JSON.stringify(report.scenarios, null, 2) + '\n');
+      await writeFile(path.join(output, 'scroll-hotpath.json'), JSON.stringify(report.scenarios, null, 2) + '\n');
     }
     // One native mouse gesture, not a serial Playwright wheel RPC for every frame.
     await page.evaluate(() => window.test.prepareScroll('normal'));
@@ -228,9 +226,9 @@ export async function scrollHotpath({ page, context, renderer, output, report, c
         if (/scroll|layout/i.test(name)) assert.ok(callback.maxPerFrame <= 1, `${name}: duplicate native scroll callback`);
       }
     });
-    await writeFile(path.join(output, `${renderer}-scroll-hotpath.json`), JSON.stringify(report.scenarios, null, 2) + '\n');
+    await writeFile(path.join(output, 'scroll-hotpath.json'), JSON.stringify(report.scenarios, null, 2) + '\n');
   } finally {
-    if (tracing) await endTrace(`${renderer}-interrupted.trace.json`).catch(() => {});
+    if (tracing) await endTrace('interrupted.trace.json').catch(() => {});
     await cdp.detach();
   }
 }

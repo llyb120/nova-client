@@ -21,7 +21,7 @@
   /* 表单输入内凹于面板，和外部内容区域保持区分。 */
   --bg-input: #191d24;
   --card-border: #343c48;
-  /* DOM 与 Canvas 使用协调的文字明度阶梯。 */
+  /* 通用 DOM 与会话记录（--canvas-text*，沿用旧名）使用协调的文字明度阶梯。 */
   --text: #edf0f5;
   --text-dim: #bac3d0;
   --text-muted: #959faf;
@@ -92,7 +92,7 @@
   --border-strong: #8e9aaf;
   --bg-input: #f2f4f7;
   --card-border: #e5e7ec;
-  /* Canvas 使用略柔和的独立文字阶，降低亮底高对比笔画的锐利感，不影响 DOM。 */
+  /* 会话记录（--canvas-text*）使用略柔和的独立文字阶，降低亮底高对比笔画的锐利感。 */
   --text: #202938;
   --text-dim: #4a586c;
   --text-muted: #647187;
@@ -1115,66 +1115,6 @@ button {
   min-height: 0;
   display: flex;
 }
-/* Canvas 会话区：背景星图与前景正文分层，仅编辑态使用 DOM overlay */
-.canvas-transcript-host {
-  position: relative;
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-  /* 背景交给全局星野画布；正文画布是透明层，透明到这里才能看到银河。 */
-  background: transparent;
-}
-.transcript-canvas-only {
-  position: absolute;
-  inset: 0;
-  display: block;
-  width: 100%;
-  height: 100%;
-  outline: none;
-  cursor: default;
-  -webkit-font-smoothing: antialiased;
-  font-smooth: always;
-}
-.canvas-prompt-editor {
-  position: absolute;
-  z-index: 10;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-height: calc(100% - 16px);
-  overflow: hidden;
-  background: var(--bg-panel);
-  border: 1px solid var(--border-light);
-  border-radius: 14px;
-  padding: 12px 14px;
-  box-sizing: border-box;
-}
-.canvas-prompt-editor textarea {
-  background: none;
-  border: none;
-  outline: none;
-  resize: vertical;
-  color: var(--text);
-  font-family: var(--sans);
-  font-size: 14px;
-  line-height: 1.6;
-  min-height: 48px;
-  max-height: min(240px, 36vh);
-  overflow: auto;
-  user-select: text;
-}
-.canvas-prompt-editor > div:last-child {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.canvas-prompt-editor > div:last-child > span {
-  flex: 1;
-  font-size: 12px;
-  color: var(--text-faint);
-}
-
 /* 会话世界线：Lyra 已持有完整上下文，因此把每轮提示词变成可穿梭的时间刻度。 */
 .time-rail {
   position: relative;
@@ -6755,26 +6695,6 @@ button.clue-bar-item:hover,
   color: var(--text-muted);
   font-size: 11px;
   text-align: left;
-}
-
-/* ===== canvas transcript (qwen)：feat/glm_canvas 分支的独立 canvas 渲染，样式与默认 canvas 互不影响 ===== */
-.transcript-canvas-host {
-  position: relative;
-  overflow: hidden;
-}
-.transcript-canvas-host > canvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  display: block;
-}
-.transcript-canvas-host > .transcript-canvas-backdrop {
-  pointer-events: none;
-}
-.canvas-float {
-  position: absolute;
-  z-index: 6;
 }
 
 /* About / update channel: make channel identity and the selected side unmistakable. */

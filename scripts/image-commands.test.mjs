@@ -95,16 +95,6 @@ test("generate-image forwards reference attachments and includes their paths in 
   assert.ok(editWithoutAttachment.includes("[]"));
 });
 
-test("canvas recognizes generated image blocks without swallowing them into prose or code", () => {
-  const source = read("../src/components/CanvasTranscript.tsx");
-  const parserStart = source.indexOf("interface MdBlock");
-  const end = source.indexOf("const TABLE_FS", parserStart);
-  const parser = exportsOf(source.slice(parserStart, end) + "\nexport { parseMarkdownBlocks }; ").parseMarkdownBlocks;
-  const blocks = parser("已生成\n![图片](<D:/My Images/cat.png>)\n\n```md\n![example](x.png)\n```");
-  assert.deepEqual(blocks.map((v) => v.type), ["paragraph", "image", "code"]);
-  assert.equal(blocks[1].raw, "D:/My Images/cat.png");
-});
-
 test("new-thread send failures restore the draft, stop running and show the actual error", { timeout: 5000 }, async () => {
   const source = read("../src/store.ts");
   const body = source.slice(source.indexOf("export function createThreadOptimistic("), source.indexOf("export const lastUsed"));

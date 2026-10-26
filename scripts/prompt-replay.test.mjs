@@ -106,10 +106,8 @@ const cancel = lib.slice(cancelStart, lib.indexOf('\n#[tauri::command]', cancelS
 assert.match(cancel, /is_some_and\(\|t\| t\.subagent\)\s*\{\s*return Err\(/);
 assert.ok(cancel.indexOf('t.subagent') < cancel.indexOf('.pending_prompt_restores'), 'reject before clearing restores or emitting running=false');
 const chat = readFileSync(new URL('../src/components/ChatView.tsx', import.meta.url), 'utf8');
-const canvas = readFileSync(new URL('../src/components/CanvasTranscript.tsx', import.meta.url), 'utf8');
 assert.match(chat, /readOnly=\{isSubagent\(\)\}/);
 assert.match(chat, /when=\{!isSubagent\(\)\} fallback=\{/);
 assert.match(chat, /子 Agent 执行记录 · 由主会话调度/);
 assert.match(chat, /openThread\(parentId\(\)\)/);
-assert.match(canvas, /if \(!props\.running && !props\.readOnly\)/);
 console.log('Prompt replay and subagent read-only entry checks passed.');
