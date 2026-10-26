@@ -2022,14 +2022,11 @@ fn say_as(app: &AppHandle, text: &str, who: &Owner) -> Result<(), String> {
          用户交代的长期偏好或事实用 remember 记下。除非用户要求立刻去做，否则只改配置不执行。",
         now_text());
     let item = format!("say:{}", who.token);
-    if let Some(root) = runtime(|rt| rt.tasks.iter().find(|t| t.item_id.starts_with(&item)).map(|t| t.thread_id.clone())) {
+    if let Some(root) = runtime(|rt| rt.tasks.iter()
+        .find(|t| t.item_id.starts_with("say:") && t.owner.token == who.token)
+        .map(|t| t.thread_id.clone())) {
         update(|e| { add_note(e, &root, "ask", &owner_label(who), text); Ok(()) })?;
-        let state = app.state::<AppState>();
-        let acp = state.acp.clone();
-        tauri::async_runtime::spawn(async move {
-            acp.steer_prompt(root, prompt, Vec::new()).await;
-        });
-        return Ok(());
+        return crate::dispatch_prompt(app, root, prompt, Vec::new());
     }
     let item = update(|e| Ok(e.new_id(&item)))?;
     let label = if local { format!("对员工说：{}", clip(text, 30)) } else { format!("{} 说：{}", owner_label(who), clip(text, 30)) };

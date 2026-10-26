@@ -8,15 +8,21 @@ const lib = read('src-tauri/src/lib.rs');
 const relay = read('src-tauri/src/relay.rs');
 const remote = read('src-tauri/src/remote.rs');
 const sdk = read('src-tauri/src/lyra/runtime.rs');
+const employee = read('src-tauri/src/employee.rs');
 assert.doesNotMatch(sdk, /SdkAdapter|LyraAdapter|self\.adapter|new_with_env|borrowed_root/);
 assert.doesNotMatch(lib, /\bprewarm\b|\bmod sdk_(?:adapters|runtime)\b/);
 for (const path of ['src-tauri/src/sdk_runtime.rs', 'src-tauri/src/sdk_adapters']) {
   assert.equal(existsSync(new URL(`../${path}`, import.meta.url)), false, `${path} must stay removed`);
 }
-for (const source of [lib, relay, remote, sdk]) {
-  assert.doesNotMatch(source, /\bacp_for\b|\b(?:state|self)\s*\.\s*(?:claude|codexplus|codex)\b/);
-  assert.doesNotMatch(source, /\.state::<AppState>\(\)\s*\.\s*(?:claude|codexplus|codex)\b/);
+for (const source of [lib, relay, remote, sdk, employee]) {
+  assert.doesNotMatch(source, /\bacp_for\b|\b(?:state|self)\s*\.\s*(?:acp|claude|codexplus|codex)\b/);
+  assert.doesNotMatch(source, /\.state::<AppState>\(\)\s*\.\s*(?:acp|claude|codexplus|codex)\b/);
 }
+// Employee follow-ups use the same Lyra route as new prompts, isolated by sender.
+const say = employee.split('fn say_as(')[1].split('// ---------- StarLink')[0];
+assert.match(say, /t\.item_id\.starts_with\("say:"\) && t\.owner\.token == who\.token/);
+assert.match(say, /return crate::dispatch_prompt\(app, root, prompt, Vec::new\(\)\);/);
+assert.doesNotMatch(say, /\.steer_prompt\(/);
 assert.doesNotMatch(lib, /AcpManager::new|CodexManager::new|CodexAdapter|pub (?:claude|codex|codexplus):/);
 assert.doesNotMatch(lib, /\b(?:cli_manager|codex_app_server|codex_radar)\b/);
 assert.match(lib, /\*kind == AgentKind::Lyra && self\.settings\.lock\(\)\.unwrap\(\)\.lyra_enabled/);
