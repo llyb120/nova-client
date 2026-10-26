@@ -510,7 +510,7 @@
       },
       "fullPage": {
         "type": "boolean",
-        "description": "screenshot默认整页；false为当前视口。各标签页的普通整页文档分片及视口截图各自维护帧流，按64×64像素细网格检测，先横后竖合并相邻变化格成不等大矩形，不跨未变格；每条流每轮最多9块，超过9块或变化面积超过约六成改发新关键帧；首次发关键帧，后续只发变化区域。images[].unchanged=true表示该图无明显像素变化、未重复附图；沿用已见画面及本次snapshotId/imageId，不代表动作失败，不重放输入或循环截图；仍在加载时可wait后观察。模型上下文每条流只保留当前关键帧组的基线及仍有效增量，各流独立保留，压缩后自动补回，图片直接进入上下文，无需read/recall重复加载。局部裁剪和expandScroll长图仍返回完整独立图片。增量块仅替换自身区域，latestDeltas按tileRevision叠加，重叠处以较新块为准，部分覆盖的readOnly旧块仅供重建，完全覆盖的旧块移除。非readOnly增量块有自己的imageId，配本次snapshotId直接用块内像素坐标，工具自动映射偏移，不手加x/y；块外用deltaOf指向的基图imageId；不换算CSS/DPI。"
+        "description": "screenshot默认整页；false为当前视口。各标签页的普通整页文档分片及视口截图各自维护帧流，每次返回完整图。images[].unchanged=true表示该图无明显像素变化（按32×32格比较，RGB通道差异阈值16），复用已交付的同一文件；沿用已见画面及本次snapshotId/imageId，不代表动作失败，不重放输入或循环截图；仍在加载时可wait后观察。模型上下文中同一工具同一帧流只保留最新2张不同内容的完整图，更早的换成路径说明，图片直接进入上下文，无需read/recall重复加载；操作用最新snapshotId与最新完整图的imageId，不换算CSS/DPI。局部裁剪和expandScroll长图仍返回完整独立图片。"
       },
       "expandScroll": {
         "type": "boolean",
@@ -559,7 +559,7 @@
           "screenshot",
           "none"
         ],
-        "description": "act/evaluate反馈：默认新DOM（上次有图则附图）；screenshot附视口图，沿用fullPage描述中的分块增量与坐标规则；act传none仍按inspect返回新DOM和snapshotId，避免消费快照后下一步必然失效；evaluate传none只返回value，不返回新观察，继续操作须先inspect。act/evaluate返回的openedTabs是本次由源页新开的标签/窗口；默认仅对唯一active且可操作的新页自动观察并返回新的tabTag，sourceTabTag记录原输入页；多个、后台或不可操作候选不猜，按openedTabs选择；不要把旧页未变化视为点击失败。仅evaluate的feedback=none不自动观察。按新tabTag/snapshotId继续，不重放开页动作。"
+        "description": "act/evaluate反馈：默认新DOM（上次有图则附图）；screenshot附视口图，沿用fullPage描述中的完整图保留与坐标规则；act传none仍按inspect返回新DOM和snapshotId，避免消费快照后下一步必然失效；evaluate传none只返回value，不返回新观察，继续操作须先inspect。act/evaluate返回的openedTabs是本次由源页新开的标签/窗口；默认仅对唯一active且可操作的新页自动观察并返回新的tabTag，sourceTabTag记录原输入页；多个、后台或不可操作候选不猜，按openedTabs选择；不要把旧页未变化视为点击失败。仅evaluate的feedback=none不自动观察。按新tabTag/snapshotId继续，不重放开页动作。"
       },
       "actions": {
         "type": "array",
