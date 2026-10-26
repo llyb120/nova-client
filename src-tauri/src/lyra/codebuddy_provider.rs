@@ -440,11 +440,21 @@ mod tests {
             + &tool(0,None,"","\"a\"}") + &tool(1,None,"","\"b\"}");
         let usage = sse(json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,"prompt_cache_hit_tokens":5}}));
         let success = delta(json!({"reasoning_content":"思考","content":"你好"})) + &calls + &ending + &usage + "data: [DONE]\r\n\r\n";
+        // 与 CLI 的 normalizeStreamingToolCallIds 一致：index 归并分片，重复 ID 不判冲突。
+        let repeated = tool(0,Some("a"),"read","{\"path\":")
+            + &tool(1,Some("a"),"read","{\"path\":")
+            + &tool(0,Some("chunk-a"),"read","\"a\"}")
+            + &tool(1,Some("chunk-b"),"read","\"b\"}");
+        let wrapped = tool(0,Some("a"),"re",&serde_json::to_string("{\"path\":\"a\"}").unwrap())
+            + &tool(0,Some("later-id"),"ad","")
+            + &tool(1,Some("b"),"read","{\"path\":\"b\"}");
         for (wire, good, effort, summary) in [
             (success.clone(),true,None,None),
             (success.clone(),true,Some("high"),None),
             (success.clone(),true,Some("none"),None),
             (success,true,Some("high"),Some("detailed")),
+            (delta(json!({"reasoning_content":"思考"}))+&repeated+&ending+&usage+"data: [DONE]\r\n\r\n",true,None,None),
+            (delta(json!({"reasoning_content":"思考"}))+&wrapped+&ending+&usage+"data: [DONE]\r\n\r\n",true,None,None),
             (calls.clone()+&ending,false,None,None),
             (tool(0,Some("a"),"read","{")+&ending+"data: [DONE]\r\n\r\n",false,None,None),
             (sse(json!({"error":{"message":"upstream-secret"}}))+"data: [DONE]\r\n\r\n",false,None,None),
@@ -490,6 +500,7 @@ mod tests {
                 assert!(result.content.iter().any(|part| *part == json!({"type":"thinking","thinking":"思考"})));
                 let calls: Vec<_> = result.content.iter().filter(|p|p["type"]=="toolCall").collect();
                 assert_eq!(calls.len(),2); assert_eq!(calls[0]["arguments"]["path"],"a"); assert_eq!(calls[1]["arguments"]["path"],"b");
+                assert_ne!(calls[0]["id"], calls[1]["id"]);
                 assert_eq!(events.iter().filter(|e|matches!(e,StreamEvent::ToolCallDone{..})).count(),2);
             } else {
                 assert!(!result.unwrap_err().contains("upstream-secret"));

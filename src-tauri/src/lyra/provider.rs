@@ -1023,6 +1023,69 @@ struct ToolCallAccum {
     arguments: String,
 }
 
+/// 只解开可证明的重复封装，不补全缺失字段或截断的 JSON。
+pub(super) fn parse_native_tool_arguments(raw: &str) -> Option<Value> {
+    fn object(value: Value) -> Option<Value> {
+        match value {
+            Value::Object(_) => Some(value),
+            Value::String(encoded) => serde_json::from_str(&encoded).ok().filter(Value::is_object),
+            _ => None,
+        }
+    }
+    let mut values = serde_json::Deserializer::from_str(raw).into_iter::<Value>();
+    let first = object(values.next()?.ok()?)?;
+    let Some(second) = values.next() else { return Some(first); };
+    if values.next().is_some() { return None; }
+    let second = object(second.ok()?)?;
+    (second == first).then_some(first)
+}
+
+/// CodeBuddy 的 index 才是分片的稳定键；ID、完整名称/参数快照可能在后续帧重复。
+fn merge_codebuddy_call(calls: &mut Vec<ToolCallAccum>, index: usize, call: &Value, tools: &[Value]) -> Result<(), String> {
+    if index >= 4096 { return Err("provider tool index 无效".into()); }
+    while calls.len() <= index { calls.push(ToolCallAccum { id: String::new(), name: String::new(), arguments: String::new() }); }
+    let accum = &mut calls[index];
+    if accum.id.is_empty() {
+        if let Some(id) = call.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) { accum.id = id.into(); }
+    }
+    if let Some(name) = call.pointer("/function/name").and_then(Value::as_str).filter(|name| !name.is_empty()) {
+        let known = |name: &str| tools.iter().any(|tool| tool["function"]["name"] == name);
+        if accum.name.is_empty() { accum.name = name.into(); }
+        else if accum.name == name || (accum.name.starts_with(name) && known(&accum.name)) {}
+        else if name.starts_with(&accum.name) && known(name) { accum.name = name.into(); }
+        else if known(name) && !known(&accum.name) { accum.name = name.into(); }
+        else if known(name) && known(&accum.name) { return Err("CodeBuddy 工具名称冲突，未执行工具".into()); }
+        else { accum.name.push_str(name); }
+    }
+    match call.pointer("/function/arguments") {
+        Some(Value::String(delta)) if !delta.is_empty() => {
+            if accum.arguments.is_empty() || delta.starts_with(&accum.arguments) { accum.arguments = delta.clone(); }
+            else if accum.arguments != *delta { accum.arguments.push_str(delta); }
+        }
+        Some(value @ Value::Object(_)) => {
+            if !accum.arguments.is_empty() && parse_native_tool_arguments(&accum.arguments).is_none() {
+                return Err("CodeBuddy 工具参数快照冲突，未执行工具".into());
+            }
+            accum.arguments = value.to_string();
+        }
+        None | Some(Value::Null) | Some(Value::String(_)) => {}
+        _ => return Err("CodeBuddy 工具参数格式无效，未执行工具".into()),
+    }
+    Ok(())
+}
+
+fn codebuddy_arguments(call: &ToolCallAccum, tools: &[Value]) -> Result<Value, String> {
+    let tool = tools.iter().find(|tool| tool["function"]["name"] == call.name)
+        .ok_or("CodeBuddy 工具名称无效，未执行工具")?;
+    if call.arguments.trim().is_empty() {
+        if tool["function"]["parameters"]["required"].as_array().is_some_and(|required| !required.is_empty()) {
+            return Err("CodeBuddy 工具参数缺失，未执行工具".into());
+        }
+        return Ok(json!({}));
+    }
+    parse_native_tool_arguments(&call.arguments).ok_or_else(|| "CodeBuddy 工具 JSON 参数无效，未执行工具".into())
+}
+
 fn completions_usage(usage: &Value) -> Value {
     let prompt = usage
         .get("prompt_tokens")
@@ -1156,7 +1219,8 @@ pub(super) async fn stream_completions(
                 push_delta(&mut result, "text", text, on_event);
             }
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-                for call in tool_calls {
+                for (index, call) in tool_calls.iter().enumerate() {
+                    if strict { merge_codebuddy_call(&mut calls, index, call, &supplied_tools)?; continue; }
                     calls.push(ToolCallAccum {
                         id: call
                             .get("id")
@@ -1216,14 +1280,9 @@ pub(super) async fn stream_completions(
                             arguments: String::new(),
                         });
                     }
+                    if strict { merge_codebuddy_call(&mut calls, index, call, &supplied_tools)?; continue; }
                     let accum = &mut calls[index];
-                    if let Some(id) = call.get("id").and_then(Value::as_str) {
-                        if strict {
-                            if !accum.id.is_empty() && accum.id != id { return Err("CodeBuddy 工具 ID 冲突".into()); }
-                            accum.id = id.into();
-                        } else { accum.id.push_str(id); }
-                    }
-                    if strict && accum.id.is_empty() { return Err("CodeBuddy 工具参数缺少 ID".into()); }
+                    if let Some(id) = call.get("id").and_then(Value::as_str) { accum.id.push_str(id); }
                     if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
                         accum.name.push_str(name);
                     }
@@ -1267,11 +1326,14 @@ pub(super) async fn stream_completions(
             return Err("CodeBuddy 工具调用缺失或被截断，未执行工具".into());
         }
         let mut ids = std::collections::HashSet::new();
-        for call in &calls {
-            if call.id.is_empty() || !ids.insert(&call.id) || !supplied_tools.iter().any(|t| t["function"]["name"] == call.name)
-                || !serde_json::from_str::<Value>(&call.arguments).is_ok_and(|args| args.is_object()) {
-                return Err("CodeBuddy 工具名称或 JSON 参数无效，未执行工具".into());
+        for (index, call) in calls.iter_mut().enumerate() {
+            let id = if call.id.is_empty() { format!("codebuddy-call-{index}") } else { call.id.clone() };
+            if ids.insert(id.clone()) { call.id = id; }
+            else {
+                call.id = format!("{id}-{index}");
+                if !ids.insert(call.id.clone()) { return Err("CodeBuddy 工具 ID 无法归一，未执行工具".into()); }
             }
+            call.arguments = codebuddy_arguments(call, &supplied_tools)?.to_string();
         }
         for call in &calls {
             on_event(StreamEvent::ToolCallDone { id: call.id.clone(), name: call.name.clone(), arguments: serde_json::from_str(&call.arguments).unwrap() });

@@ -213,6 +213,7 @@ fn catalog_models(catalog: &Catalog) -> Map<String, Value> {
     let mut models = Map::new();
     for variant in catalog.families.iter().filter_map(|f| f["variants"].as_array()).flatten() {
         let Some(id) = variant["model_uid"].as_str().filter(|s| !s.is_empty()) else { continue };
+        if id == "adaptive" { continue; }
         models.insert(id.into(), json!({
             "name": variant["label"].as_str().unwrap_or(id),
             "limit": { "context": variant["max_context_tokens"].as_u64().unwrap_or(128000),
@@ -228,10 +229,14 @@ fn catalog_models(catalog: &Catalog) -> Map<String, Value> {
 pub(super) async fn models(options: &Value, force: bool) -> Result<Map<String, Value>, String> {
     let catalog = catalog(options, force).await?;
     let mut models = catalog_models(&catalog);
-    let id = resolve_model(&catalog, options["devinModel"].as_str().unwrap_or("adaptive"), None)?;
-    let mut default = models.get(&id).cloned().ok_or("Devin 模型目录为空")?;
-    default["name"] = json!("Devin（跟随 CLI 默认模型）");
-    models.insert("devin".into(), default);
+    let requested = options["devinModel"].as_str().unwrap_or("adaptive");
+    // Adaptive 需要 AssignModel + assignment JWT；未实现该路由协议前不提供自动模型。
+    if requested != "adaptive" {
+        let id = resolve_model(&catalog, requested, None)?;
+        let mut default = models.get(&id).cloned().ok_or("Devin 默认模型不可用，请选择具体模型")?;
+        default["name"] = json!("Devin（跟随 CLI 默认模型）");
+        models.insert("devin".into(), default);
+    }
     Ok(models)
 }
 
@@ -243,6 +248,9 @@ fn resolve_model(catalog: &Catalog, requested: &str, effort: Option<&str>) -> Re
         if let Some(family) = catalog.families.iter().find(|f| f["slug"] == id || f["aliases"].as_array().is_some_and(|a| a.iter().any(|v| v == &id))) {
             id = family["variants"][0]["model_uid"].as_str().unwrap_or("").to_string();
         }
+    }
+    if id == "adaptive" {
+        return Err("Devin Adaptive 是自动路由，当前不支持，请选择具体模型".into());
     }
     if let Some(effort) = effort {
         if !matches!(effort, "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
@@ -407,7 +415,7 @@ impl ConnectDecoder {
                         Some("unauthenticated") => "unauthenticated (401)", Some("permission_denied") => "permission_denied (403)",
                         Some("resource_exhausted") => "resource_exhausted (429)", Some("invalid_argument") => "invalid_argument (400)", _ => "upstream_error"
                     };
-                    return Err(format!("Devin 拒绝请求：{code}，请检查登录、模型权限和参数"));
+                    return Err(format!("Devin 拒绝请求：{code}，请检查登录、模型权限和参数{}", if code == "upstream_error" { "；safe to retry" } else { "" }));
                 }
                 self.ended = true;
             } else { frames.push(payload); }
@@ -478,8 +486,7 @@ impl ResponseState {
             if !body["tools"].as_array().is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == name)) {
                 return Err("Devin 返回了未提供的工具名称".into());
             }
-            let arguments: Value = serde_json::from_str(&arguments).map_err(|_| "Devin 工具参数不是完整 JSON，未执行工具")?;
-            if !arguments.is_object() { return Err("Devin 工具参数必须是 JSON 对象".into()); }
+            let arguments = provider::parse_native_tool_arguments(&arguments).ok_or("Devin 工具参数不是完整 JSON 对象，未执行工具")?;
             self.result.content.push(json!({ "type": "toolCall", "id": id, "name": name, "arguments": arguments }));
         }
         for part in &self.result.content {
@@ -603,6 +610,27 @@ mod tests {
     }
 
     #[test]
+    fn native_arguments_accept_only_unambiguous_wrappers() {
+        let plain = json!({"path":"a"}).to_string();
+        let wrapped = serde_json::to_string(&plain).unwrap();
+        for (raw, expected) in [
+            (plain.clone(), true),
+            (wrapped, true),
+            (format!("{plain}{plain}"), true),
+            ("{\"path\":".into(), false),
+            ("{\"path\": \"a\"}".into(), true),
+            ("{\"path\":\"a\"}{\"path\":\"b\"}".into(), false),
+            ("null".into(), false),
+        ] {
+            let mut state = ResponseState::default();
+            state.frame(&call("a", "read", &raw), &mut |_| {}).unwrap();
+            let result = state.finish(&tool_body(), &mut |_| {});
+            assert_eq!(result.is_ok(), expected, "{raw}");
+            if let Ok(result) = result { assert_eq!(result.content[0]["arguments"]["path"], "a"); }
+        }
+    }
+
+    #[test]
     fn malformed_or_truncated_stream_never_dispatches_tools() {
         for (stop, call) in [(10, vec![]), (3, call("a","read","{}")), (10, call("a","read","{")), (10, call("a","unknown","{}"))] {
             let mut state = ResponseState::default(); let mut frame = Vec::new(); number(&mut frame, 5, stop); frame.extend(call);
@@ -617,6 +645,12 @@ mod tests {
         let mut decoder = ConnectDecoder::default(); decoder.push(&envelope(b"{}",2)).unwrap(); assert!(decoder.push(&envelope(b"",0)).is_err());
         let mut decoder = ConnectDecoder::default();
         let error = decoder.push(&envelope(br#"{"error":{"code":"secret","message":"secret"}}"#,2)).unwrap_err(); assert!(!error.contains("secret"));
+        let upstream = decoder.push(&envelope(br#"{"error":{"code":"unknown"}}"#,2)).unwrap_err();
+        assert!(upstream.contains("upstream_error") && crate::lyra::prompt::is_retryable_provider_error(&upstream));
+        for code in ["unauthenticated", "permission_denied", "invalid_argument"] {
+            let error = ConnectDecoder::default().push(&envelope(format!("{{\"error\":{{\"code\":\"{code}\"}}}}").as_bytes(),2)).unwrap_err();
+            assert!(!crate::lyra::prompt::is_retryable_provider_error(&error));
+        }
     }
 
     #[test]
@@ -633,6 +667,8 @@ mod tests {
         assert!(catalog.families.len() > 10 && catalog.families.iter().all(|f| f["slug"] != "fusion"));
         assert_eq!(resolve_model(&catalog, "swe-2", None).unwrap(), "swe-2-high");
         assert!(catalog_models(&catalog).contains_key("claude-opus-4-8-high"));
+        assert!(!catalog_models(&catalog).contains_key("adaptive"));
+        assert!(resolve_model(&catalog, "adaptive", None).unwrap_err().contains("自动路由"));
     }
 
     #[test]
