@@ -566,7 +566,7 @@ impl LyraRuntime {
         // Lyra 子 agent 的 Stage 只用于展示，不经主轮次的短生命周期事件通道。
         request["novaThreadId"] = json!(thread_id);
         let session = crate::lyra::spawn_prompt(
-            self.native_http(),
+            None,
             request,
             context_tools,
             None,

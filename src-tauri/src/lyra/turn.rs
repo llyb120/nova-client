@@ -42,7 +42,8 @@ pub struct TurnOutcome {
 
 /// 一个 agent 的全部运行态（根会话与子 agent 共用）。
 pub struct Session {
-    pub http: reqwest::Client,
+    /// None 跟随当前系统代理；Some 仅用于显式注入固定传输（如本地测试）。
+    pub http: Option<reqwest::Client>,
     pub model: Resolved,
     /// 折叠摘要用的模型（轻量模型或主模型）。
     pub summarizer: Resolved,
@@ -158,6 +159,10 @@ fn backoff(attempt: usize) -> Duration {
 }
 
 impl Session {
+    fn http(&self) -> reqwest::Client {
+        self.http.clone().unwrap_or_else(super::provider::http_client)
+    }
+
     fn last_user_index(&self) -> Option<usize> {
         self.history
             .items()
@@ -225,6 +230,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
             on_event(TurnEvent::MessageStart);
             let mut early: Vec<(String, String, Value, tokio::task::JoinHandle<ToolOutcome>)> = Vec::new();
             let result = {
+                let http = s.http();
                 let (cwd, shell, archive, cancelled, owner) =
                     (s.cwd.clone(), s.shell.clone(), s.archive_dir.clone(), s.cancelled.clone(), s.session_id.clone());
                 let mut blocked = false;
@@ -232,7 +238,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 let early = &mut early;
                 let on_event = &mut *on_event;
                 stream_chat(
-                    &s.http,
+                    &http,
                     &s.model.model,
                     &s.model.api_key,
                     s.model.thinking_level.as_deref(),
@@ -555,7 +561,7 @@ fn recall(s: &mut Session, args: &Value) -> ToolOutcome {
 /// 折叠一次；摘要走无工具的流式请求，用轻量模型（若配置）且关闭思考。
 async fn compact(s: &mut Session, trigger: Trigger, on_event: Sink<'_>) -> Option<Receipt> {
     let active = s.last_user_index();
-    let http = s.http.clone();
+    let http = s.http();
     let mut model = s.summarizer.clone();
     if model.model.max_output_tokens == 0 || model.model.max_output_tokens > SUMMARY_OUTPUT_MAX_TOKENS {
         model.model.max_output_tokens = SUMMARY_OUTPUT_MAX_TOKENS;
@@ -694,7 +700,7 @@ pub(crate) mod tests {
             thinking_level: None,
         };
         Session {
-            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            http: Some(reqwest::Client::builder().no_proxy().build().unwrap()),
             summarizer: model.clone(),
             model,
             system_prompt: "sys".into(),
@@ -713,6 +719,69 @@ pub(crate) mod tests {
             steer: Arc::new(Mutex::new(VecDeque::new())),
             agents: None,
             scenes: None,
+    #[test]
+    fn proxy_changes_reach_running_sessions() {
+        const CHILD: &str = "NOVA_LYRA_PROXY_REFRESH_TEST_CHILD";
+        // 环境变量是进程级状态；隔离运行，避免影响并行测试和用户的系统代理。
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "lyra::turn::tests::proxy_changes_reach_running_sessions", "--nocapture"])
+                .env(CHILD, "1");
+            for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
+                child.env_remove(key);
+            }
+            assert!(child.status().unwrap().success());
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            async fn server(label: &'static str) -> String {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                tokio::spawn(async move {
+                    loop {
+                        let (socket, _) = listener.accept().await.unwrap();
+                        tokio::spawn(async move {
+                            let mut socket = BufReader::new(socket);
+                            loop {
+                                let mut line = String::new();
+                                if socket.read_line(&mut line).await.unwrap() == 0 { break; }
+                                assert!(line.starts_with(if label == "direct" { "GET /system " } else { "GET http://" }));
+                                loop {
+                                    line.clear();
+                                    if socket.read_line(&mut line).await.unwrap() == 0 { return; }
+                                    if line == "\r\n" { break; }
+                                }
+                                // 保留连接，确保切换代理时不会误用旧连接池。
+                                socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{label}", label.len()).as_bytes()).await.unwrap();
+                            }
+                        });
+                    }
+                });
+                url
+            }
+            let target = format!("{}/system", server("direct").await);
+            let a = server("a").await;
+            let b = server("b").await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = test_session(target.clone(), dir.path().into());
+            let fixed_http = session.http.take().unwrap();
+            for (proxy, bypass, expected) in [(&a, "127.0.0.1", "direct"), (&a, "no-match.invalid", "a"),
+                (&b, "no-match.invalid", "b"), (&b, "127.0.0.1", "direct"), (&a, "no-match.invalid", "a")] {
+                for key in ["HTTP_PROXY", "http_proxy"] { std::env::set_var(key, proxy); }
+                for key in ["NO_PROXY", "no_proxy"] { std::env::set_var(key, bypass); }
+                // 同一 Session（含工具往返/重试/摘要）和订阅传输都必须获取当前代理。
+                for http in [session.http(), super::super::provider::local_api_client()] {
+                    let response = http.get(&target).timeout(Duration::from_secs(3)).send().await.unwrap();
+                    assert_eq!(response.text().await.unwrap(), expected);
+                }
+            }
+            session.http = Some(fixed_http);
+            let response = session.http().get(&target).timeout(Duration::from_secs(3)).send().await.unwrap();
+            assert_eq!(response.text().await.unwrap(), "direct", "显式注入的传输不被系统代理替换");
+        });
+    }
+
         }
     }
 

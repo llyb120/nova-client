@@ -49,7 +49,7 @@ struct Task {
 
 /// 只在内存中的当前授权快照，绝不写入 manifest；每次 followup 都重新继承父配置。
 struct ChildSettings {
-    http: reqwest::Client,
+    http: Option<reqwest::Client>,
     model: crate::lyra::config::Resolved,
     summarizer: crate::lyra::config::Resolved,
     system_prompt: String,

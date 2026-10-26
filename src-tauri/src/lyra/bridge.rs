@@ -309,7 +309,7 @@ struct PromptContext {
 }
 
 async fn handle_prompt(
-    http: &reqwest::Client,
+    http: Option<&reqwest::Client>,
     request: &Value,
     emit: &Emit,
     fast_context: bool,
@@ -443,7 +443,7 @@ async fn handle_prompt(
     let cancelled = Arc::new(AtomicBool::new(false));
     let steer = Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let mut session = Session {
-        http: http.clone(),
+        http: http.cloned(),
         summarizer: lightweight.unwrap_or_else(|| resolved.clone()),
         model: resolved,
         system_prompt,
@@ -728,7 +728,7 @@ pub struct InProcessSession {
 }
 
 pub fn spawn_prompt(
-    http: reqwest::Client,
+    http: Option<reqwest::Client>,
     request: Value,
     fast_context: bool,
     borrowed_root: Option<PathBuf>,
@@ -754,7 +754,7 @@ pub fn spawn_prompt(
             }
         });
         if let Err(error) =
-            handle_prompt(&http, &request, &emit, fast_context, &roots, line_rx, app).await
+            handle_prompt(http.as_ref(), &request, &emit, fast_context, &roots, line_rx, app).await
         {
             emit(&json!({ "ok": false, "error": error }));
         }
@@ -786,7 +786,7 @@ async fn dispatch(http: &reqwest::Client, request: &Value) -> Result<(), String>
                     }
                 }
             });
-            handle_prompt(http, request, &emit, fast_context, &roots, line_rx, None).await
+            handle_prompt(None, request, &emit, fast_context, &roots, line_rx, None).await
         }
         Some("models") => {
             let data = models_data(http, request, &roots).await?;
@@ -1151,7 +1151,7 @@ mod tests {
                 request["sessionId"] = serde_json::json!(id);
             }
             let http = reqwest::Client::builder().no_proxy().build().unwrap();
-            let mut session = super::spawn_prompt(http, request, false, Some(root.clone()), None);
+            let mut session = super::spawn_prompt(Some(http), request, false, Some(root.clone()), None);
             async move {
                 let mut events = Vec::new();
                 while let Some(line) = session.events.recv().await {
@@ -1185,7 +1185,7 @@ mod tests {
             "action":"prompt", "cwd":root, "mode":"build", "model":model,
             "parts":[{"type":"text","text":text}]
         });
-        let mut session = super::spawn_prompt(super::super::provider::http_client(), request, true, None, None);
+        let mut session = super::spawn_prompt(None, request, true, None, None);
         let started = Instant::now();
         let mut rounds = 0;
         let mut completed = Vec::new();
@@ -1250,7 +1250,7 @@ mod tests {
         assert!(models.get("configOptions").is_some());
 
         let session = super::spawn_prompt(
-            http,
+            None,
             serde_json::json!({
                 "action": "prompt",
                 "cwd": std::env::current_dir().unwrap(),

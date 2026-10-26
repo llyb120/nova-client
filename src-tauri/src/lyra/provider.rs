@@ -10,7 +10,7 @@ use base64::Engine;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[path = "response_state.rs"]
 mod response_state;
@@ -1784,14 +1784,67 @@ async fn stream_chat_once(
 
 /// Lyra 共享 HTTP 客户端：跟随系统代理（环境变量 / 平台代理设置），复用连接池。
 pub(crate) fn http_client() -> reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| build_client(false)).clone()
+    cached_client(false)
 }
 
 /// 本地登录/订阅反代专用：同样跟随系统代理，但不跟随重定向。
 pub(super) fn local_api_client() -> reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| build_client(true)).clone()
+    cached_client(true)
+}
+
+/// reqwest 只在建客户端时读一次系统代理，而用户会在运行中开关代理软件；
+/// 因此按代理设置指纹缓存客户端，设置一变下一次请求就用新设置（旧客户端由在途请求自然回收）。
+fn cached_client(local_login: bool) -> reqwest::Client {
+    static CACHE: OnceLock<Mutex<[Option<(String, reqwest::Client)>; 2]>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new([None, None]))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let slot = &mut cache[usize::from(local_login)];
+    let fingerprint = system_proxy_fingerprint();
+    if let Some((cached, client)) = slot {
+        if *cached == fingerprint {
+            return client.clone();
+        }
+    }
+    let client = build_client(local_login);
+    *slot = Some((fingerprint, client.clone()));
+    client
+}
+
+/// 影响 reqwest 系统代理判定的设置：环境变量 + 平台代理设置。
+fn system_proxy_fingerprint() -> String {
+    const ENV: [&str; 9] = [
+        "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "REQUEST_METHOD",
+    ];
+    let mut parts = ENV.map(|key| format!("{key}={:?}", std::env::var_os(key)));
+    #[cfg(windows)]
+    {
+        parts[0].push_str(&format!("\n{:?}", windows_system_proxy()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // 复用 reqwest 的系统代理解析，覆盖 macOS 运行时修改的 HTTP/HTTPS 主机和端口。
+        parts[0].push_str(&format!("\n{:?}", hyper_util::client::proxy::matcher::Matcher::from_system()));
+    }
+    parts.join("\n")
+}
+
+#[cfg(windows)]
+fn windows_system_proxy() -> (u32, String, String, String) {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let Ok(settings) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+    else {
+        return (0, String::new(), String::new(), String::new());
+    };
+    (
+        settings.get_value("ProxyEnable").unwrap_or(0),
+        settings.get_value("ProxyServer").unwrap_or_default(),
+        settings.get_value("ProxyOverride").unwrap_or_default(),
+        settings.get_value("AutoConfigURL").unwrap_or_default(),
+    )
 }
 
 fn build_client(local_login: bool) -> reqwest::Client {
