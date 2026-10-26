@@ -529,7 +529,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
         let encode_started = Instant::now();
-        let mut entry = json!({"imageId":image_id,"width":image.width(),"height":image.height(),"deltaPolicy":"nine-grid",
+        let mut entry = json!({"imageId":image_id,"width":image.width(),"height":image.height(),"deltaPolicy":"adaptive-grid",
             "pixelWidth":image.width(),"pixelHeight":image.height(),
             "snapshotId":id,"capturedAt":captured_at,"stability":stability,
             "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
@@ -1712,7 +1712,7 @@ mod tests {
         let ignored = [PixelRect { left:0, top:0, right:96, bottom:480 },
             PixelRect { left:560, top:400, right:640, bottom:480 }];
         let deliver = |id: &str, prior: Option<&Delivered>, image: &RgbaImage, regions: &[PixelRect]| {
-            let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"ignoredRegions":regions,"deltaPolicy":"nine-grid"});
+            let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"ignoredRegions":regions,"deltaPolicy":"adaptive-grid"});
             let (frame, delta) = crate::visual_guard::deliver_frame(&mut entry, prior, Some("monitor-1".into()),
                 nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.webp"))).unwrap();
             (entry, frame.unwrap(), delta)

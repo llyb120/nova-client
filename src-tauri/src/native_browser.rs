@@ -176,7 +176,7 @@ fn resize_screenshot(image: xcap::image::DynamicImage, edge: u32) -> xcap::image
 fn deliver_screenshot(observation: &mut Observation, previous: Option<&Observation>, stream: Option<String>,
     image: xcap::image::RgbaImage, path: std::path::PathBuf, (x, y, width, height): (f64, f64, f64, f64)) -> Result<Vec<Value>, String> {
     let page = &observation.pages["pages"][0];
-    // Viewports and normal full-page tiles share Jianlai's nine-grid delivery. Crops/exports stay standalone.
+    // Viewports and normal full-page tiles share Jianlai's adaptive-grid delivery. Crops/exports stay standalone.
     // Match each document tile independently; identical pixel sizes alone do not prove identical coordinates.
     let prior = previous.filter(|p| p.captured.elapsed() <= Duration::from_secs(180) && p.full_page == observation.full_page
         && page["stamp"].is_string() && p.pages["pages"][0]["stamp"] == page["stamp"]
@@ -186,7 +186,7 @@ fn deliver_screenshot(observation: &mut Observation, previous: Option<&Observati
     let id = format!("{}-{}", observation.id, observation.images.len());
     let pixels = image.dimensions();
     let mut entry = json!({"imageId":id,"snapshotId":observation.id,"x":x,"y":y,"width":width,"height":height,
-        "pixelWidth":pixels.0,"pixelHeight":pixels.1,"deltaPolicy":"nine-grid"});
+        "pixelWidth":pixels.0,"pixelHeight":pixels.1,"deltaPolicy":"adaptive-grid"});
     let (delivered, delta) = crate::visual_guard::deliver_frame(&mut entry, prior, stream, image, None, path.clone())?;
     let path = delivered.as_ref().map_or(path, |p| p.keyframe_path.clone());
     observation.images.push(ScreenshotImage { id, path, x, y, width, height, pixels, delivered });
@@ -2272,7 +2272,7 @@ mod tests {
         let mut first = observed("first");
         let key = deliver(&mut first, None, Some("C1:viewport"), page.clone());
         assert_eq!(key[0]["keyframe"], true);
-        assert_eq!(key[0]["deltaPolicy"], "nine-grid");
+        assert_eq!(key[0]["deltaPolicy"], "adaptive-grid");
         assert_eq!(key[0]["frameGroup"], "first");
         let mut typed = page.clone();
         typed.put_pixel(150, 150, Rgba([0, 0, 0, 255]));
@@ -2281,8 +2281,8 @@ mod tests {
         assert_eq!(delta.len(), 2);
         assert!(delta[0]["path"].is_null());
         assert_eq!(delta[1]["deltaOf"], "next-0");
-        assert_eq!((delta[1]["x"].as_u64(), delta[1]["y"].as_u64()), (Some(107), Some(107)));
-        assert_eq!(xcap::image::open(delta[1]["path"].as_str().unwrap()).unwrap().width(), 107);
+        assert_eq!((delta[1]["x"].as_u64(), delta[1]["y"].as_u64()), (Some(64), Some(64)));
+        assert_eq!(xcap::image::open(delta[1]["path"].as_str().unwrap()).unwrap().width(), 192);
         assert!(!dir.path().join("next.webp").exists(), "no redundant full-image encoding");
         assert_eq!(next.images[0].point(150., 150.).unwrap(), (300., 300.));
         assert_eq!(next.images[0].pixels, (320, 320));
@@ -2358,7 +2358,7 @@ mod tests {
     fn full_page_tiles_share_deltas_without_crossing_coordinate_bases() {
         use xcap::image::{Rgba, RgbaImage};
         let dir = tempfile::tempdir().unwrap();
-        let page = RgbaImage::from_pixel(128, 96, Rgba([255,255,255,255]));
+        let page = RgbaImage::from_pixel(512, 384, Rgba([255,255,255,255]));
         let observed = |id: &str, full_page| Observation { frames: Vec::new(), id: id.into(),
             pages: json!({"pages":[{"stamp":"same-url-scroll-zoom","document":"doc"}]}),
             captured: std::time::Instant::now(), screenshot: true, full_page, images: Vec::new() };
@@ -2371,9 +2371,9 @@ mod tests {
         let bottom = deliver(&mut first,None,"C1:document:1",(0.,192.,256.,192.),page.clone());
         assert_ne!(top[0]["imageId"],bottom[0]["imageId"]);
         let mut changed = page.clone();
-        changed.put_pixel(16,16,Rgba([0,0,0,255]));
-        changed.put_pixel(48,16,Rgba([0,0,0,255]));
-        changed.put_pixel(112,80,Rgba([0,0,0,255]));
+        changed.put_pixel(70,70,Rgba([0,0,0,255]));
+        changed.put_pixel(140,70,Rgba([0,0,0,255]));
+        changed.put_pixel(400,300,Rgba([0,0,0,255]));
         let mut second = observed("second", true);
         let unchanged = deliver(&mut second,Some(&first),"C1:document:0",(0.,0.,256.,192.),page.clone());
         let patches = deliver(&mut second,Some(&first),"C1:document:1",(0.,192.,256.,192.),changed.clone());
@@ -2382,11 +2382,12 @@ mod tests {
         assert_eq!(patches[0]["frameStream"],"C1:document:1");
         assert_eq!(patches[0]["frameGroup"],"first");
         assert!(patches[0]["path"].is_null() && !dir.path().join("second-1.webp").exists());
-        assert_eq!((patches[1]["width"].as_u64(),patches[1]["height"].as_u64()),(Some(86),Some(32)));
-        assert_eq!((patches[2]["x"].as_u64(),patches[2]["y"].as_u64()),(Some(86),Some(64)));
-        assert_eq!((patches[2]["width"].as_u64(),patches[2]["height"].as_u64()),(Some(42),Some(32)),"edge cells clip to the image size");
+        assert_eq!((patches[1]["x"].as_u64(),patches[1]["y"].as_u64()),(Some(0),Some(0)));
+        assert_eq!((patches[1]["width"].as_u64(),patches[1]["height"].as_u64()),(Some(256),Some(192)));
+        assert_eq!((patches[2]["x"].as_u64(),patches[2]["y"].as_u64()),(Some(320),Some(192)));
+        assert_eq!((patches[2]["width"].as_u64(),patches[2]["height"].as_u64()),(Some(192),Some(192)),"edge cells clip to the image size");
         assert_eq!(patches[2]["deltaOf"],"second-1");
-        assert_eq!(second.images[1].point(112.,80.).unwrap(),(224.,352.),"delta offsets are image pixels, not document CSS coordinates");
+        assert_eq!(second.images[1].point(70.,70.).unwrap(),(35.,227.),"delta offsets are image pixels, not document CSS coordinates");
         assert_eq!(second.images[1].delivered.as_ref().unwrap().seen.as_ref(),&changed);
         let mut third = observed("third", true);
         let unchanged = deliver(&mut third,Some(&second),"C1:document:1",(0.,192.,256.,192.),changed.clone());
@@ -2395,7 +2396,7 @@ mod tests {
         assert_eq!(unchanged[0]["latestDeltas"][1]["deltaOf"],"third-0");
         assert_eq!(unchanged[0]["latestDeltas"][1]["path"],patches[2]["path"]);
         let mut partial = changed.clone();
-        partial.put_pixel(48,16,Rgba([255,255,255,255]));
+        partial.put_pixel(140,70,Rgba([255,255,255,255]));
         let mut fourth = observed("fourth", true);
         let updated = deliver(&mut fourth,Some(&third),"C1:document:1",(0.,192.,256.,192.),partial);
         assert_eq!(updated.len(),2);
@@ -2404,12 +2405,12 @@ mod tests {
         assert_eq!(retained[0]["path"],patches[1]["path"]);
         assert_eq!(retained[0]["readOnly"],true,"partially overwritten patches are reconstruction-only");
         assert_eq!(retained[1]["path"],patches[2]["path"],"unaffected cells stay attached");
-        assert_eq!((updated[1]["x"].as_u64(),updated[1]["width"].as_u64()),(Some(43),Some(43)));
+        assert_eq!((updated[1]["x"].as_u64(),updated[1]["width"].as_u64()),(Some(64),Some(192)));
         let mut fifth = observed("fifth", true);
-        let replaced = deliver(&mut fifth,Some(&fourth),"C1:document:1",(0.,192.,256.,192.),RgbaImage::new(128,96));
-        assert_eq!(replaced.len(),2);
-        assert_eq!(replaced[0]["frameGroup"],"first","even full-area changes remain merged deltas, not new keyframes");
-        assert_eq!(replaced[0]["latestDeltas"].as_array().unwrap().len(),1,"fully overwritten patches are removed");
+        let replaced = deliver(&mut fifth,Some(&fourth),"C1:document:1",(0.,192.,256.,192.),RgbaImage::new(512,384));
+        assert_eq!(replaced.len(),1);
+        assert_eq!(replaced[0]["keyframe"],true,"full-area changes fall back to a keyframe");
+        assert_eq!(replaced[0]["latestDeltas"].as_array().map_or(0,Vec::len),0,"a new keyframe drops stale patches");
         // Geometry changes must reset even when the scaled image dimensions happen to match.
         for (full_page, xywh) in [(true,(0.,128.,256.,192.)),(true,(0.,192.,128.,96.)),(false,(0.,192.,256.,192.))] {
             let mut resized=observed("reset",full_page);

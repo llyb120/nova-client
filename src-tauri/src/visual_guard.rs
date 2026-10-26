@@ -111,6 +111,10 @@ pub(crate) struct DeliveredTile {
 
 pub(crate) const MAX_DELTAS: u8 = 8;
 const TILE: u32 = 32;
+const ADAPTIVE_TILE: u32 = 64;
+const MAX_ADAPTIVE_PATCHES: usize = 9;
+const MAX_ADAPTIVE_CANDIDATES: usize = 64;
+const MAX_DELTA_AREA_PERCENT: u64 = 60;
 pub(crate) enum Delivery { Unchanged, Delta(Vec<PixelRect>), Keyframe }
 
 /// Send only grid tiles changed since their last delivery. Earlier tiles remain valid independently.
@@ -158,6 +162,82 @@ fn merge_grid(changed: &[bool], (w, h): (u32, u32), (tw, th): (u32, u32)) -> Vec
         previous = active;
     }
     blocks
+}
+
+fn rect_area(rect: PixelRect) -> u64 {
+    u64::from(rect.right - rect.left) * u64::from(rect.bottom - rect.top)
+}
+
+fn rect_union(a: PixelRect, b: PixelRect) -> PixelRect {
+    PixelRect { left: a.left.min(b.left), top: a.top.min(b.top),
+        right: a.right.max(b.right), bottom: a.bottom.max(b.bottom) }
+}
+
+fn rects_overlap(a: PixelRect, b: PixelRect) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// Padding and cost-based merging may overlap. Coalesce overlaps so each delivery is a set of
+/// disjoint rectangles and historical tile revisions retain their existing reconstruction semantics.
+fn coalesce_overlaps(mut blocks: Vec<PixelRect>) -> Vec<PixelRect> {
+    loop {
+        let mut merged = false;
+        'pairs: for i in 0..blocks.len() {
+            for j in i + 1..blocks.len() {
+                if rects_overlap(blocks[i], blocks[j]) {
+                    blocks[i] = rect_union(blocks[i], blocks[j]);
+                    blocks.remove(j);
+                    merged = true;
+                    break 'pairs;
+                }
+            }
+        }
+        if !merged { return blocks; }
+    }
+}
+
+fn delta_area(blocks: &[PixelRect]) -> u64 { blocks.iter().map(|b| rect_area(*b)).sum() }
+
+/// Fine-grained detection with bounded, context-padded output. A keyframe is preferable to dropping
+/// changes, emitting excessive fragments, or spending unbounded time on pathological screen changes.
+fn adaptive_blocks(changed: &[bool], (w, h): (u32, u32)) -> Option<Vec<PixelRect>> {
+    let tile = (ADAPTIVE_TILE, ADAPTIVE_TILE);
+    let exact = merge_grid(changed, (w, h), tile);
+    if exact.len() > MAX_ADAPTIVE_CANDIDATES { return None; }
+    let mut blocks = coalesce_overlaps(exact.into_iter().map(|b| PixelRect {
+        left: b.left.saturating_sub(ADAPTIVE_TILE), top: b.top.saturating_sub(ADAPTIVE_TILE),
+        right: (b.right + ADAPTIVE_TILE).min(w), bottom: (b.bottom + ADAPTIVE_TILE).min(h),
+    }).collect());
+    let full_area = u64::from(w) * u64::from(h);
+    let too_large = |blocks: &[PixelRect]| delta_area(blocks) * 100 >= full_area * MAX_DELTA_AREA_PERCENT;
+    if too_large(&blocks) { return None; }
+    while blocks.len() > MAX_ADAPTIVE_PATCHES {
+        let mut best = None;
+        for i in 0..blocks.len() {
+            for j in i + 1..blocks.len() {
+                let merged = rect_union(blocks[i], blocks[j]);
+                let cost = rect_area(merged) - rect_area(blocks[i]) - rect_area(blocks[j]);
+                if best.is_none_or(|(best_cost, _, _, _)| cost < best_cost) {
+                    best = Some((cost, i, j, merged));
+                }
+            }
+        }
+        let (_, i, j, merged) = best.expect("more than nine blocks always has a pair");
+        blocks[i] = merged;
+        blocks.remove(j);
+        blocks = coalesce_overlaps(blocks);
+    }
+    if too_large(&blocks) { None } else { Some(blocks) }
+}
+
+fn plan_adaptive_delivery(prior: Option<&Delivered>, pixels: &RgbaImage) -> Delivery {
+    let Some(p) = prior.filter(|p| p.seen.dimensions() == pixels.dimensions()) else { return Delivery::Keyframe };
+    let Some(changed) = changed_grid(&p.seen, pixels, None, (ADAPTIVE_TILE, ADAPTIVE_TILE)) else { return Delivery::Keyframe };
+    if !changed.contains(&true) { return Delivery::Unchanged; }
+    if p.deltas >= MAX_DELTAS { return Delivery::Keyframe; }
+    match adaptive_blocks(&changed, pixels.dimensions()) {
+        Some(blocks) => Delivery::Delta(blocks), None => Delivery::Keyframe,
+    }
 }
 
 /// Which 32×32 blocks visibly changed (any RGB channel > 16).
@@ -214,11 +294,15 @@ pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delive
     let basis = json!([entry["desktopBounds"], entry["originalWidth"], entry["originalHeight"], entry["ignoredRegions"], entry["deltaPolicy"]]);
     let prior = prior.filter(|p| Some(&p.stream) == stream.as_ref() && p.basis == basis);
     let image = annotated.unwrap_or(&plain);
-    // Desktop screens and browser viewport/document streams opt into at most 3×3 cells.
-    let (tw, th) = if entry["deltaPolicy"] == "nine-grid" {
-        (plain.width().div_ceil(3).max(1), plain.height().div_ceil(3).max(1))
-    } else { (TILE, TILE) };
-    match plan_grid_delivery(prior, &plain, (tw, th)) {
+    let adaptive = entry["deltaPolicy"] == "adaptive-grid";
+    // The policy participates in `basis`, so changing it always starts a fresh keyframe/history.
+    let (tw, th) = if adaptive { (ADAPTIVE_TILE, ADAPTIVE_TILE) }
+        else if entry["deltaPolicy"] == "nine-grid" {
+            (plain.width().div_ceil(3).max(1), plain.height().div_ceil(3).max(1))
+        } else { (TILE, TILE) };
+    let delivery = if adaptive { plan_adaptive_delivery(prior, &plain) }
+        else { plan_grid_delivery(prior, &plain, (tw, th)) };
+    match delivery {
         Delivery::Unchanged => {
             let p = prior.unwrap();
             entry["unchanged"] = json!(true);
@@ -432,6 +516,69 @@ mod tests {
             let cells = changed_grid(&blank,&edge,None,grid).unwrap();
             assert!(cells.len() <= 9 && cells.last() == Some(&true));
         }
+    }
+
+    #[test]
+    fn adaptive_grid_pads_context_and_bounds_output_without_losing_changes() {
+        let size = (4096, 4096);
+        let cols = size.0 as usize / ADAPTIVE_TILE as usize;
+        let mut changed = vec![false; cols * cols];
+        changed[2 * cols + 2] = true;
+        let blocks = adaptive_blocks(&changed, size).unwrap();
+        assert_eq!(blocks, vec![PixelRect { left:64, top:64, right:256, bottom:256 }]);
+
+        let mut changed = vec![false; cols * cols];
+        let changed_cells = (0..10).map(|x| (x * 6, 30)).collect::<Vec<_>>();
+        for &(x, y) in &changed_cells { changed[y * cols + x] = true; }
+        let blocks = adaptive_blocks(&changed, size).unwrap();
+        assert!(blocks.len() <= MAX_ADAPTIVE_PATCHES);
+        for &(x, y) in &changed_cells {
+            let rect = PixelRect { left:x as u32 * 64, top:y as u32 * 64,
+                right:(x as u32 + 1) * 64, bottom:(y as u32 + 1) * 64 };
+            assert!(blocks.iter().any(|b| b.left <= rect.left && b.top <= rect.top
+                && b.right >= rect.right && b.bottom >= rect.bottom), "dropped changed cell {x},{y}");
+        }
+        for (i, a) in blocks.iter().enumerate() {
+            assert!(!blocks[i + 1..].iter().any(|b| rects_overlap(*a, *b)), "overlapping output patches");
+        }
+        let bridged = coalesce_overlaps(vec![
+            PixelRect { left:0, top:0, right:4, bottom:4 },
+            PixelRect { left:0, top:8, right:10, bottom:12 },
+            PixelRect { left:8, top:0, right:12, bottom:10 },
+        ]);
+        assert_eq!(bridged, vec![PixelRect { left:0, top:0, right:12, bottom:12 }],
+            "a newly formed bounding box must be checked against earlier rectangles");
+    }
+
+    #[test]
+    fn adaptive_policy_change_starts_a_new_keyframe() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let page = RgbaImage::from_pixel(512, 512, Rgba([255,255,255,255]));
+        let mut old = json!({"imageId":"monitor","snapshotId":"old","deltaPolicy":"nine-grid"});
+        let (prior, _) = deliver_frame(&mut old, None, Some("monitor".into()), page.clone(), None,
+            dir.path().join("old.webp")).unwrap();
+        let mut changed = page.clone();
+        changed.put_pixel(100, 100, Rgba([0,0,0,255]));
+        let mut new = json!({"imageId":"monitor","snapshotId":"new","deltaPolicy":"adaptive-grid"});
+        let (next, patches) = deliver_frame(&mut new, prior.as_ref(), Some("monitor".into()), changed, None,
+            dir.path().join("new.webp")).unwrap();
+        assert_eq!(new["keyframe"], true);
+        assert!(patches.is_empty());
+        assert_eq!(next.unwrap().basis[4], "adaptive-grid");
+    }
+
+    #[test]
+    fn adaptive_grid_falls_back_for_fragments_and_large_areas() {
+        let size = (8192, 8192);
+        let cols = size.0 as usize / ADAPTIVE_TILE as usize;
+        let mut changed = vec![false; cols * cols];
+        for i in 0..=MAX_ADAPTIVE_CANDIDATES { changed[(i / 16) * 8 * cols + (i % 16) * 8] = true; }
+        assert!(adaptive_blocks(&changed, size).is_none(), "fragment storms need a bounded keyframe fallback");
+
+        let size = (512, 512);
+        let changed = vec![true; 64];
+        assert!(adaptive_blocks(&changed, size).is_none(), "large deltas should not cost more than a keyframe");
     }
 
     #[test]
