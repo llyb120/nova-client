@@ -299,6 +299,9 @@ function HtmlItem(props: DetailProps & { item: Item; active: boolean }) {
     <Match when={props.item.type === "tool"}>
       <HtmlTool item={props.item as ToolItem} active={props.active} onBrowseDetail={props.onBrowseDetail} onFileMenu={props.onFileMenu} />
     </Match>
+    <Match when={props.item.type === "system" && text().startsWith("模型切换：")}>
+      <div class="ht-model-switch" data-item-id={props.item.id} title={text()}>↪ {text().split(" → ").at(-1)!.split("/").at(-1)}</div>
+    </Match>
     <Match when={props.item.type === "system"}>
       <div class="ht-system-space" data-item-id={props.item.id}>
         <div class="ht-system" data-level={props.item.type === "system" ? props.item.level : ""}>{text()}</div>

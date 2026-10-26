@@ -91,6 +91,7 @@
 .ht-thought-body { margin-top: 6px; padding: 8px 14px; box-shadow: inset 2px 0 var(--border-light); color: var(--canvas-text-dim, var(--text-dim)); font-size: 13px; line-height: 1.6; }
 .ht-thinking { height: 22px; font-size: 13px; line-height: 22px; color: var(--canvas-text-faint, var(--text-faint)); }
 .ht-system-space { padding: 10px 0; }
+.ht-model-switch { padding: 7px 0; font-size: 11.5px; line-height: 1.5; color: var(--canvas-text-muted, var(--text-muted)); overflow-wrap: anywhere; }
 .ht-system { margin: 0; padding: 8px 13px; border-radius: 8px; white-space: pre-wrap; font-size: 12.5px; line-height: 1.5; color: var(--canvas-text-faint, var(--text-faint)); }
 .ht-system[data-level="info"] { --ht-level: var(--accent); color: color-mix(in srgb, var(--accent) 80%, var(--text)); }
 .ht-system[data-level="warn"] { --ht-level: var(--yellow); color: var(--yellow); }
