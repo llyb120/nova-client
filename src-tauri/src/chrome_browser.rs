@@ -507,7 +507,7 @@ pub async fn chrome_dependency_status(app: AppHandle) -> Result<Value, String> {
         let before = state.live_clients().len();
         for (client, status) in client_statuses(&state).await {
             if status["version"].as_str() != bundled_version.as_deref()
-                && state.request_to(&client, "reload", json!({})).await.is_ok()
+                && state.request_to(&client, "reload", json!({"extension":true})).await.is_ok()
             {
                 state.clients.lock().unwrap().remove(&client);
                 upgraded.push(status["browser"].clone());

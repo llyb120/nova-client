@@ -430,6 +430,11 @@ enum Action {
         r#ref: String,
         text: String,
     },
+    Upload {
+        frame: usize,
+        selector: String,
+        files: Vec<String>,
+    },
     Press {
         key: String,
     },
@@ -462,7 +467,7 @@ fn normalize_action(mut value: Value) -> Value {
     let Some(map) = value.as_object_mut() else { return value };
     if !map.contains_key("action") { if let Some(kind) = map.remove("type").filter(Value::is_string) { map.insert("action".into(), kind); } }
     match map.get("action").and_then(Value::as_str).unwrap_or_default() {
-        "click" | "fill" | "scroll" => { map.entry("frame").or_insert(json!(0)); }
+        "click" | "fill" | "scroll" | "upload" => { map.entry("frame").or_insert(json!(0)); }
         "press" | "wait" | "type" | "move" | "click_at" | "drag" | "scroll_at" => { map.remove("frame"); map.remove("ref"); }
         _ => {}
     }
@@ -474,6 +479,7 @@ fn validate_action(action: &Action) -> Result<(), String> {
         Action::Click { button, click_count, .. } | Action::ClickAt { button, click_count, .. } => {
             if button.as_deref().is_some_and(|b| !matches!(b, "left"|"right"|"middle")) || click_count.is_some_and(|n| !(1..=2).contains(&n)) { return Err("button 或 click_count 无效".into()); }
         }
+        Action::Upload { selector, files, .. } if selector.trim().is_empty() || selector.len() > 2000 || files.is_empty() || files.len() > 16 => return Err("upload需要明确selector及1–16个文件".into()),
         Action::Type { text } | Action::Fill { text, .. } if text.len() > 16000 => return Err("输入过长".into()),
         Action::Wait { ms } if *ms > 2000 => return Err("wait.ms 必须为 0–2000".into()),
         Action::Scroll { delta, .. } | Action::ScrollAt { delta, .. } if delta.unsigned_abs() > 1200 => return Err("单次滚动不能超过1200像素".into()),
@@ -490,6 +496,37 @@ fn validate_action(action: &Action) -> Result<(), String> {
     }
     if let Action::ScrollAt { delta_x:Some(x), .. } | Action::Scroll { delta_x:Some(x), .. } = action { if x.unsigned_abs()>1200 { return Err("delta_x 超过1200像素".into()); } }
     Ok(())
+}
+
+fn upload_files(root: &Path, files: &[String]) -> Result<Vec<String>, String> {
+    let root = dunce::canonicalize(root).map_err(|e| format!("上传目录不可用：{e}"))?;
+    files.iter().map(|file| {
+        if file.trim().is_empty() { return Err("上传路径不能为空".into()); }
+        let path = dunce::canonicalize(root.join(file)).map_err(|e| format!("上传文件不可用：{e}"))?;
+        if !path.starts_with(&root) || !path.is_file() {
+            return Err("只能上传当前工作目录内的普通文件；目录外文件请先由用户明确授权复制进来".into());
+        }
+        std::fs::File::open(&path).map_err(|e| format!("上传文件不可读：{e}"))?;
+        path.to_str().map(str::to_owned).ok_or_else(|| "上传路径必须为有效Unicode".into())
+    }).collect()
+}
+
+#[cfg(test)]
+#[test]
+fn upload_rejects_paths_outside_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("input.txt"), "upload").unwrap();
+    std::fs::write(dir.path().join("outside.txt"), "private").unwrap();
+    assert_eq!(upload_files(&root, &["input.txt".into()]).unwrap().len(), 1);
+    for path in ["", ".", "missing.txt", "../outside.txt"] {
+        assert!(upload_files(&root, &[path.into()]).is_err());
+    }
+    assert!(upload_files(&root, &[dir.path().join("outside.txt").to_str().unwrap().into()]).is_err());
+    let action = parse_action(r#"{"action":"upload","selector":"input[type=file]","files":["input.txt"]}"#).unwrap();
+    assert!(matches!(action, Action::Upload { frame: 0, .. }));
+    assert!(parse_actions(&json!({"action":{"action":"upload","selector":"input[type=file]","files":[]}}), 16).is_err());
 }
 
 fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String> {
@@ -525,6 +562,7 @@ fn preflight(observation:&Observation, action:&mut Action, image_id:Option<&str>
                 *frame=(0..observation.frames.len()).find(|f|has(*f)).ok_or("ref 不在当前快照的任何 frame 中；ref 必须原样复制 elements 行首的 ref，不能拼造。这不等于快照过期；先核对已有观察中的真实 ref，不要直接重试或无故重新截图")?;
             }
         }
+        Action::Upload{frame,..} if observation.frames.get(*frame).is_none()=>return Err("upload.frame 不在当前观察中".into()),
         Action::Scroll{frame,..} if *frame!=0=>return Err("子框架滚动需要明确 ref".into()),
         Action::ClickAt{x,y,..}|Action::Move{x,y}|Action::Drag{x,y,..}|Action::ScrollAt{x,y,..}=>{
             if !observation.screenshot {return Err(format!("坐标操作需要截图：当前 snapshotId={} 没有图片。调用 screenshot 后同时使用它返回的新 snapshotId 和 imageId；不要将旧 imageId 与新 DOM 快照混用。", observation.id));}
@@ -708,7 +746,7 @@ async fn require_focus(app:&AppHandle, observation:&Observation, index:usize, re
 
 async fn apply(
     app: &AppHandle, s: &Session, observation: &Observation, action: &Action,
-    image_id: Option<&str>, progress: &mut InputProgress,
+    image_id: Option<&str>, progress: &mut InputProgress, root: &Path,
 ) -> Result<(), String> {
     check(app,s)?;
     match action {
@@ -816,6 +854,22 @@ async fn apply(
             }
             // Remember the intended node, never whichever field a page handler redirected focus to.
             progress.focus=(p["editable"]==true).then(||(*frame,p["identity"].clone()));
+        }
+        Action::Upload{frame,selector,files} => {
+            let files = upload_files(root, files)?;
+            let frame = &observation.frames[*frame];
+            // Resolve a unique file input in the observed isolated world, including hidden inputs.
+            let expression = format!("(() => {{ const nodes=document.querySelectorAll({}); if(nodes.length!==1) throw Error('upload selector必须唯一匹配'); const el=nodes[0]; if(!(el instanceof HTMLInputElement)||el.type!=='file'||el.disabled||el.webkitdirectory||(!el.multiple&&{}>1)) throw Error('目标不是可用的文件input或不支持所选文件数量'); return el; }})()", json!(selector), files.len());
+            let reply = cdp(app,"Runtime.evaluate",json!({"expression":expression,"contextId":frame.context,"returnByValue":false}),frame.session.as_deref(),Some(s.cancel.clone())).await?;
+            if reply.get("exceptionDetails").is_some() {
+                return Err(reply["exceptionDetails"]["exception"]["description"].as_str().unwrap_or("上传目标校验失败").into());
+            }
+            let object = reply["result"]["objectId"].as_str().ok_or("未取得文件input，未上传")?;
+            check(app,s)?;
+            progress.attempted=true;
+            let uploaded = cdp(app,"DOM.setFileInputFiles",json!({"objectId":object,"files":files}),frame.session.as_deref(),Some(s.cancel.clone())).await;
+            let _ = cdp(app,"Runtime.releaseObject",json!({"objectId":object}),frame.session.as_deref(),None).await;
+            uploaded?;
         }
         Action::Press{key:name}=>{
             if let Some((index,identity))=&progress.focus {
@@ -1378,6 +1432,7 @@ fn evaluation_args(args: &Value) -> Result<(&str, usize), String> {
 
 async fn control_session(
     app: &AppHandle,
+    root: &Path,
     mut s: Session,
     operation: &str,
     args: &Value,
@@ -1418,12 +1473,13 @@ async fn control_session(
         // before every individual input. Never retarget by matching its label.
         for action in &mut actions {
             preflight(&observation,action,args["imageId"].as_str())?;
+            if let Action::Upload{files,..} = action { *files = upload_files(root, files)?; }
         }
         if let Some((_, frame)) = script {
             if observation.frames.get(frame).is_none() { return Err("frame 不在该快照中，请按观察返回的frame执行".into()); }
         }
         // Compare inventories, not foreground focus: unrelated/user-created tabs must never become our target.
-        let opens_tab = |action: &Action| matches!(action, Action::Click{..} | Action::ClickAt{..} | Action::Press{..});
+        let opens_tab = |action: &Action| matches!(action, Action::Click{..} | Action::ClickAt{..} | Action::Press{..} | Action::Upload{..});
         let source_tag = s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?;
         let before_tabs = if script.is_some() || actions.iter().any(opens_tab) {
             Some(crate::chrome_browser::request(app, "tabs", json!({})).await?)
@@ -1466,7 +1522,7 @@ async fn control_session(
         }
         for (index, action) in actions.iter().enumerate() {
             let began=std::time::Instant::now();
-            let applied=apply(app,&s,&observation,action,args["imageId"].as_str(),&mut progress).await;
+            let applied=apply(app,&s,&observation,action,args["imageId"].as_str(),&mut progress,root).await;
             action_timings.push(began.elapsed().as_millis());
             match applied {
                 Ok(())=>progress.completed+=1,
@@ -1801,6 +1857,10 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
 }
 
 async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
+    // An act consumes its input snapshot; always return a real observation, never mint a stale ID.
+    let mut args = args.clone();
+    if args["operation"] == "act" && args["feedback"] == "none" { args["feedback"] = json!("inspect"); }
+    let args = &args;
     let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
     let thread_id = tool_owner(root, owner)?;
     let operation = args["operation"].as_str().unwrap_or_default();
@@ -1963,7 +2023,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     if !matches!(operation, "inspect" | "screenshot" | "act" | "evaluate") {
         return Err("未知 chrome 操作".into());
     }
-    let mut value = control_session(app, chrome_session(&thread_id, tag), operation, args).await?;
+    let mut value = control_session(app, root, chrome_session(&thread_id, tag), operation, args).await?;
     if matches!(operation, "act" | "evaluate") && value["status"] != "not_executed" { retire_desktop(&mut value); }
     value["tabTag"] = json!(tag);
     value["browser"] = json!("chrome");
