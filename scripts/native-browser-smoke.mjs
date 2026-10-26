@@ -86,8 +86,23 @@ try {
         else {
           assert.equal(command.args.tabTag,tag);assert.equal(command.operation,'cdp');
           assert(command.args.sessionId == null,'fixture has no cross-process iframe');
-          if(command.args.method==='Page.captureScreenshot')chromeCaptures.push(command.args.params);
+          if(command.args.method==='Page.captureScreenshot') {
+            chromeCaptures.push(command.args.params);
+            assert.equal(command.args.params.format,'webp');
+            assert.equal(command.args.params.quality,100,'Chrome WebP capture must be lossless');
+          }
           result=await cdp.send(command.args.method,command.args.params);
+          if(command.args.method==='Page.captureScreenshot') {
+            const bytes=Buffer.from(result.data,'base64');
+            assert.equal(bytes.toString('ascii',0,4),'RIFF');
+            assert.equal(bytes.toString('ascii',8,12),'WEBP');
+            const chunks=[];
+            for(let p=12;p+8<=bytes.length;) {
+              chunks.push(bytes.toString('ascii',p,p+4));
+              const size=bytes.readUInt32LE(p+4);p+=8+size+(size&1);
+            }
+            assert(chunks.includes('VP8L')&&!chunks.includes('VP8 '),'Chrome must return a lossless WebP bitstream');
+          }
         }
         reply={id:command.id,result};
       }catch(error){reply={id:command.id,error:String(error)};}
@@ -262,7 +277,7 @@ try {
     const pane=JSON.parse(await readFile(paneObs.documentPath,'utf8')).pages[0].items.find(i=>i.scroll);
     assert(pane,'scroll container is observable');
     const region=await chromeUi('screenshot',{tabTag:tag,snapshotId:paneObs.snapshotId,ref:pane.ref,expandScroll:true});
-    assert.match(region.images[0].path,/\.png$/,'expandScroll keeps the original lossless image by default');
+    assert.match(region.images[0].path,/\.webp$/,'expandScroll keeps the original lossless image by default');
     assert.equal(region.scrollExpanded?.complete,true,JSON.stringify(region.scrollExpanded));
     assert.equal(region.images[0].y,40);assert.ok(region.documentSize.height>=3000,JSON.stringify(region.documentSize));
     assert.equal(await page.evaluate(()=>innerHeight),viewportHeight,'viewport override must be cleared');

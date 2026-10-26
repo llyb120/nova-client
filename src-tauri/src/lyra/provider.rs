@@ -101,14 +101,17 @@ fn tool_result_text(message: &Value) -> String {
 }
 
 fn saved_deltas(image: &Value) -> impl Iterator<Item = &Value> {
-    // Keep old single-crop histories readable after upgrading to tiled delivery.
-    image.get("latestDelta").into_iter().chain(image["latestDeltas"].as_array().into_iter().flatten())
+    // A complete tile list (even empty) supersedes the legacy single-crop state.
+    image["latestDeltas"].as_array().into_iter().flatten()
+        .chain(image.get("latestDelta").filter(|_| !image["latestDeltas"].is_array()))
 }
 
-fn screenshot_caption(message: &Value) -> String {
+fn screenshot_caption(message: &Value, embeds: &[Embed]) -> String {
     let details = &message["details"];
     let images: Vec<Value> = detail_images(message).iter()
-        .flat_map(|image| std::iter::once(image).chain(saved_deltas(image)).map(move |part| {
+        .zip(embeds.iter().copied().chain(std::iter::repeat(Embed::Image)))
+        .filter(|(_, embed)| *embed != Embed::Omit)
+        .flat_map(|(image, _)| std::iter::once(image).chain(saved_deltas(image)).map(move |part| {
             let mut metadata = json!({"imageId":part["imageId"],"deltaOf":part["deltaOf"],"x":part["x"],"y":part["y"],
                 "monitorId":part.get("monitorId").unwrap_or(&image["monitorId"]),
                 "pixelWidth":part["pixelWidth"],"pixelHeight":part["pixelHeight"]});
@@ -118,38 +121,51 @@ fn screenshot_caption(message: &Value) -> String {
             metadata
         })).collect();
     let frames = if detail_images(message).iter().any(|i| frame_of(message, i).is_some()) {
-        " Exception for screenshot frame groups: within the same tool and frameStream, only the CURRENT frameGroup's keyframe coordinates stay valid with the latest snapshotId and the full/base imageId (deltaOf for a delta), not the delta crop's own imageId. Only the current frame group is retained, including its keyframe and tile updates."
+        " Exception for screenshot frame groups: within the same tool and frameStream, the CURRENT frameGroup's full-image coordinates use the latest snapshotId and full/base imageId (deltaOf); a delta with its own imageId uses local crop pixels instead. Only the current frame group is retained independently for EACH screen, including its keyframe and tile updates; observing another screen never discards it."
     } else { "" };
-    format!("Tool screenshot metadata for toolCallId={}, snapshotId={}: {}. Metadata may describe retained images, not attachments; latestDeltas (legacy: latestDelta) list retained patches; only non-readOnly patches are actionable with this snapshotId. Intermediate scroll images marked with frame are READ-ONLY, never action targets. Use image-pixel coordinates with imageId; NEVER rescale using CSS viewport dimensions or DPI. Standalone crops and DELTA crops with their own imageId use local image pixels directly; the tool maps offsets automatically. Only DELTA crops without their own imageId add their stated x/y pixel offset once and use deltaOf as imageId. Do not reuse coordinates from another image.{frames} {}",
+    format!("Tool screenshot metadata for toolCallId={}, snapshotId={}: {}. Metadata may describe retained images, not new attachments; screenshots enter context automatically, including each screen's current keyframe and retained patches after compaction. Do not call read/recall just to load them or treat keyframePath alone as the updated screen. latestDeltas (legacy: latestDelta) list retained patches; only non-readOnly patches are actionable with this snapshotId. Intermediate scroll images marked with frame are READ-ONLY, never action targets. Use image-pixel coordinates with imageId; NEVER rescale using CSS viewport dimensions or DPI. Standalone crops and DELTA crops with their own imageId use local image pixels directly; the tool maps offsets automatically. Only DELTA crops without their own imageId add their stated x/y pixel offset once and use deltaOf as imageId. Do not reuse coordinates from another image.{frames} {}",
         message["toolCallId"], details["snapshotId"], json!(images), details["coordinateSpace"].as_str().unwrap_or_default())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Embed { Omit, Image, WithKeyframe }
+enum Embed { Omit, Image, WithKeyframe, Patches }
 
 fn detail_images(message: &Value) -> &[Value] {
     message.pointer("/details/images").and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
 /// Chrome/webview/剑来截图的 ((toolName, frameStream), frameGroup)：流按工具隔离，缺少分组元数据或带 frame 的只读中间图不参与。
-fn frame_of<'a>(message: &'a Value, image: &'a Value) -> Option<((&'a str, &'a str), &'a str)> {
+pub(super) fn frame_of<'a>(message: &'a Value, image: &'a Value) -> Option<((&'a str, &'a str), &'a str)> {
     let tool = message["toolName"].as_str()?;
     if message["role"] != "toolResult" || !matches!(tool, "chrome" | "webview" | "jianlai") || image.get("frame").is_some() { return None; }
     Some(((tool, image["frameStream"].as_str()?), image["frameGroup"].as_str()?))
 }
 
-/// 每条流只保留当前关键帧组及其块更新；换组时旧组全部换成路径。
+/// 每条流只保留当前关键帧组；完整块状态之前的更新由最新 latestDeltas 取代。
 /// 未分组图片（含普通工具图片、局部截图）始终留在原位。
 fn tool_image_embeds(messages: &[Value]) -> Vec<Vec<Embed>> {
     let frames = |m| detail_images(m).iter().map(move |i| frame_of(m, i).map(|f| (f, i)));
     let current: HashMap<(&str, &str), &str> = messages.iter().flat_map(frames).flatten().map(|(f, _)| f).collect();
-    // 压缩可能折叠掉当前关键帧：在该组第一条剩余记录上补回基图及其保存的块状态。
+    let mut states = HashMap::new();
+    for (mi, message) in messages.iter().enumerate() {
+        for (ii, entry) in frames(message).enumerate() {
+            if let Some((frame, image)) = entry {
+                if image["latestDeltas"].is_array() { states.insert(frame, (mi, ii)); }
+            }
+        }
+    }
     let mut anchored: std::collections::HashSet<((&str, &str), &str)> = messages.iter().flat_map(frames).flatten()
         .filter(|(_, i)| i["keyframe"] == true && i["path"].is_string())
         .map(|(frame, _)| frame).collect();
-    messages.iter().map(|m| frames(m).map(|f| match f {
+    messages.iter().enumerate().map(|(mi, m)| frames(m).enumerate().map(|(ii, f)| match f {
         None => Embed::Image,
-        Some(((s, g), _)) if current.get(&s) == Some(&g) => if anchored.insert((s, g)) { Embed::WithKeyframe } else { Embed::Image },
+        Some((frame @ (s, g), image)) if current.get(&s) == Some(&g) => match states.get(&frame) {
+            // Use the latest metadata too: surviving partial patches may now be readOnly.
+            Some(&position) if position == (mi, ii) => if anchored.insert(frame) { Embed::WithKeyframe } else { Embed::Patches },
+            Some(&(last, _)) if mi <= last && !(image["keyframe"] == true && image["path"].is_string()) => Embed::Omit,
+            // Legacy/no-state histories and updates AFTER the last complete state stay conservative.
+            _ => if anchored.insert(frame) { Embed::WithKeyframe } else { Embed::Image },
+        },
         Some(_) => Embed::Omit,
     }).collect()).collect()
 }
@@ -208,14 +224,18 @@ fn tool_result_parts(message: &Value, model: &ResolvedModel, embeds: &[Embed]) -
         || message.pointer("/details/imagePath").is_some_and(Value::is_string)) {
         text.push_str("\n\n[历史图片已省略：当前模型不支持图片输入]");
     }
+    // Top-level copies of the selected state's patches are omitted only to avoid duplicate attachments.
+    let retained: std::collections::HashSet<&str> = detail_images(message).iter().zip(embeds)
+        .filter(|(_, e)| matches!(e, Embed::WithKeyframe | Embed::Patches))
+        .flat_map(|(image, _)| saved_deltas(image).filter_map(|delta| delta["path"].as_str())).collect();
     let omitted: Vec<String> = detail_images(message).iter().zip(embeds)
         .filter(|(_, e)| **e == Embed::Omit)
-        .filter_map(|(image, _)| image["path"].as_str().map(|path| if image["deltaOf"].is_string() {
+        .filter_map(|(image, _)| image["path"].as_str().filter(|path| !retained.contains(path)).map(|path| if image["deltaOf"].is_string() {
             format!("delta of imageId={} path={path}", image["deltaOf"])
         } else { format!("imageId={} path={path}", image["imageId"]) }))
         .collect();
     if model.supports_images && !omitted.is_empty() {
-        text.push_str(&format!("\n\n[Earlier screenshot omitted from context: only the current keyframe group in the same tool and frame stream is retained: {}. Use read on the path if you need to look again; its imageId is stale, act only on the latest screenshot.]", omitted.join("; ")));
+        text.push_str(&format!("\n\n[Earlier screenshot omitted from context: only the current keyframe group and its retained patches in the same tool and frame stream are retained: {}. These paths are historical, not needed to reconstruct the current screen; current images are attached automatically. Its imageId is stale, act only on the latest screenshot.]", omitted.join("; ")));
     }
     (text, tool_result_images(message, model, embeds))
 }
@@ -243,19 +263,25 @@ fn tool_result_images(message: &Value, model: &ResolvedModel, embeds: &[Embed]) 
         }))
     };
     let plans = embeds.iter().copied().chain(std::iter::repeat(Embed::Image));
+    let mut attached = std::collections::HashSet::new();
     for (metadata, embed) in detail_images(message).iter().zip(plans) {
         if embed == Embed::Omit { continue; }
+        let frame = frame_of(message, metadata);
         let monitor_id = metadata.get("monitorId");
         let monitor = monitor_id.map(|id| format!("; monitorId={id}")).unwrap_or_default();
         if let Some(path) = metadata["keyframePath"].as_str().filter(|_| embed == Embed::WithKeyframe) {
+            if let Some(frame) = frame { attached.insert((frame, path)); }
             images.extend(file(path, format!("Keyframe re-attached (its original message was compacted): the full image of this frame group (imageId={} when captured) that later deltas apply to; snapshotId={snapshot}{monitor}. For full-keyframe coordinates use imageId={}, not a delta crop's imageId, in the same tool, frameStream and frameGroup.",
                 metadata["keyframeImageId"], metadata.get("deltaOf").filter(|id| id.is_string()).unwrap_or(&metadata["imageId"]))));
         }
-        // Recover all tiles lost with the prefix, but do not attach tiles already present in this result twice.
-        for metadata in saved_deltas(metadata).filter(|delta| embed == Embed::WithKeyframe
-            && !detail_images(message).iter().any(|i| i["path"].is_string() && i["path"] == delta["path"]))
+        // Complete state supplies both pixels and current readOnly/coordinate metadata.
+        // Legacy single-crop recovery still defers to a directly attached crop when present.
+        for metadata in saved_deltas(metadata).filter(|delta| matches!(embed, Embed::WithKeyframe | Embed::Patches)
+            && (metadata["latestDeltas"].is_array()
+                || !detail_images(message).iter().any(|i| i["path"].is_string() && i["path"] == delta["path"])))
             .chain(std::iter::once(metadata)) {
             let Some(path) = metadata["path"].as_str() else { continue };
+            if frame.is_some_and(|frame| !attached.insert((frame, path))) { continue; }
             let monitor = metadata.get("monitorId").or(monitor_id).map(|id| format!("; monitorId={id}")).unwrap_or_default();
             images.extend(file(path, if let Some(frame) = metadata.get("frame") {
                 format!("This image: READ-ONLY intermediate scroll frame={frame}, {}×{} image pixels; snapshotId={snapshot}{monitor}. For reading only; do not use its imageId or coordinates for actions.",
@@ -403,7 +429,7 @@ fn completions_messages(
                 }));
                 if !images.is_empty() {
                     let mut parts = Vec::new();
-                    parts.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
+                    parts.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message, &embeds[index]),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
                         "type": "image_url",
                         "image_url": { "url": format!("data:{};base64,{}",
                             image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
@@ -691,7 +717,7 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                 }));
                 if !images.is_empty() {
                     let mut content = Vec::new();
-                    content.extend(images.into_iter().flat_map(|image| [json!({"type":"input_text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
+                    content.extend(images.into_iter().flat_map(|image| [json!({"type":"input_text","text":format!("{}\n{}",screenshot_caption(message, &embeds[index]),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
                         "type": "input_image",
                         "image_url": format!("data:{};base64,{}",
                             image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
@@ -2117,7 +2143,7 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                     _ => out.push(json!({ "role": "user", "content": [block] })),
                 }
                 if !images.is_empty() {
-                    screenshots.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
+                    screenshots.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message, &embeds[index]),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
                         "type": "image",
                         "source": {
                             "type": "base64",
@@ -2763,6 +2789,44 @@ mod tests {
     }
 
     #[test]
+    fn monitor_images_embed_independently_without_read_and_recover_after_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..4).map(|i| {
+            let path = dir.path().join(format!("{i}.png"));
+            xcap::image::RgbaImage::from_pixel(2,1,xcap::image::Rgba([i*60,0,0,255])).save(&path).unwrap();
+            path
+        }).collect();
+        let message = |id: &str, images: Value| json!({"role":"toolResult","toolName":"jianlai","toolCallId":id,
+            "content":[],"details":{"snapshotId":id,"images":images}});
+        let key = |screen: &str, group: &str, path: &std::path::Path| json!({"imageId":screen,"frameStream":screen,"frameGroup":group,
+            "monitorId":screen,"keyframe":true,"path":path,"keyframePath":path,"keyframeImageId":screen,"pixelWidth":2,"pixelHeight":1});
+        let first = message("first",json!([key("monitor-1","a",&paths[0]),key("monitor-2","b",&paths[1])]));
+        let patch = json!({"imageId":"patch-2","deltaOf":"monitor-2","frameStream":"monitor-2","frameGroup":"b",
+            "keyframePath":paths[1],"keyframeImageId":"monitor-2","path":paths[2],"x":1,"y":0,"pixelWidth":1,"pixelHeight":1,"tileRevision":1});
+        let update = message("update",json!([{"imageId":"monitor-2","frameStream":"monitor-2","frameGroup":"b",
+            "keyframeImageId":"monitor-2","keyframePath":paths[1],"latestDeltas":[patch]},patch]));
+        let next = message("next",json!([key("monitor-1","c",&paths[3])]));
+        let model = test_model("openai-completions");
+        let history = [first,update.clone(),next.clone()];
+        let embeds = tool_image_embeds(&history);
+        assert_eq!(embeds[0],vec![Embed::Omit,Embed::Image],"screen 1's new baseline must not evict screen 2");
+        assert_eq!(history.iter().zip(&embeds).map(|(m,e)|tool_result_images(m,&model,e).len()).sum::<usize>(),3);
+        let compacted = [update,next];
+        let embeds = tool_image_embeds(&compacted);
+        assert_eq!(tool_result_images(&compacted[0],&model,&embeds[0]).len(),2,"recover screen 2's baseline plus patch exactly once");
+        assert_eq!(tool_result_images(&compacted[1],&model,&embeds[1]).len(),1);
+        for output in [json!(completions_messages("",&compacted,&model)),json!(responses_input(&compacted,&model)),json!(anthropic_messages(&compacted,&model))] {
+            let text = output.to_string();
+            for path in &paths[1..] {
+                let bytes = base64::engine::general_purpose::STANDARD.encode(std::fs::read(path).unwrap());
+                assert_eq!(text.matches(&bytes).count(),1,"every provider directly embeds each current image once");
+            }
+            assert!(text.contains("Do not call read/recall"));
+        }
+        assert!(drop_old_tool_images(&compacted).is_none(),"413 fallback never trades one screen for another");
+    }
+
+    #[test]
     fn screenshot_frame_groups_replace_only_their_own_stream() {
         use Embed::*;
         let model = test_model("openai-completions");
@@ -2794,9 +2858,9 @@ mod tests {
             // A compacted keyframe is re-attached on its group's first remaining image.
             assert_eq!(tool_image_embeds(&messages[4..5]), vec![vec![WithKeyframe, Image]], "{tool}");
             assert_eq!(tool_image_embeds(&[plain.clone()]), vec![vec![Image]], "ungrouped images stay unchanged");
-            assert!(screenshot_caption(&messages[0]).contains("Exception for screenshot frame groups"));
-            assert!(screenshot_caption(&messages[0]).contains("Only the current frame group is retained"));
-            assert!(!screenshot_caption(&plain).contains("Exception"));
+            assert!(screenshot_caption(&messages[0], &[]).contains("Exception for screenshot frame groups"));
+            assert!(screenshot_caption(&messages[0], &[]).contains("Only the current frame group is retained"));
+            assert!(!screenshot_caption(&plain, &[]).contains("Exception"));
             // A scratch scroll keyframe must not join the monitor stream or be omitted by the final unchanged group.
             let mut intermediate = key("tab-1", "scratch");
             intermediate["frame"] = json!(0);
@@ -2873,7 +2937,7 @@ mod tests {
             }
             let mut readonly = delta_only.clone();
             readonly["details"]["images"][0]["frame"] = json!(0);
-            let caption = screenshot_caption(&readonly);
+            let caption = screenshot_caption(&readonly, &[]);
             assert!(caption.contains("\"frame\":0") && caption.contains("READ-ONLY"), "{caption}");
             let attached = tool_result_images(&readonly, &model, &[Embed::Image]);
             assert_eq!(attached.len(), 1);
@@ -2884,7 +2948,7 @@ mod tests {
             unchanged["details"]["images"][0]["samePixelsAs"] = json!("delta-0");
             unchanged["details"]["images"][0]["latestDelta"] = crop;
             unchanged["details"]["images"][0]["latestDelta"].as_object_mut().unwrap().remove("monitorId");
-            let caption = screenshot_caption(&unchanged);
+            let caption = screenshot_caption(&unchanged, &[]);
             assert!(caption.contains("DELTA crops with their own imageId use local image pixels directly"), "{caption}");
             assert!(caption.contains("Only DELTA crops without their own imageId add"), "{caption}");
             assert_eq!(caption.contains("\"imageId\":\"delta-0\""), actionable, "{caption}");
@@ -2926,7 +2990,7 @@ mod tests {
             json!({"imageId":format!("delta-{monitor}"),"deltaOf":format!("full-{monitor}"),"monitorId":monitor,"path":delta}),
         ]));
         let message = json!({"role":"toolResult","toolName":"jianlai","details":{"images":images}});
-        assert!(screenshot_caption(&message).contains("\"imageId\":\"delta-15\""));
+        assert!(screenshot_caption(&message, &[]).contains("\"imageId\":\"delta-15\""));
         let attached = tool_result_images(&message, &model, &[]);
         assert_eq!(attached.len(), 48);
         assert!(attached.last().unwrap()["caption"].as_str().unwrap().contains("imageId=\"delta-15\""));
@@ -2950,7 +3014,7 @@ mod tests {
             let id = format!("snap-{i}");
             let mut base = json!({"imageId":"monitor-1","snapshotId":id,"monitorId":7});
             let (frame, deltas) = crate::visual_guard::deliver_frame(&mut base, prior.as_ref(), Some("monitor-1".into()),
-                page.clone(), None, dir.path().join(format!("{id}.jpg"))).unwrap();
+                page.clone(), None, dir.path().join(format!("{id}.webp"))).unwrap();
             prior = frame;
             let mut images = vec![base];
             images.extend(deltas);
@@ -2966,7 +3030,7 @@ mod tests {
                 i["caption"].as_str().unwrap().contains("replaces only its own rectangle")));
             for output in [json!(completions_messages("",messages,&model)),json!(responses_input(messages,&model)),json!(anthropic_messages(messages,&model))] {
                 let text=output.to_string();
-                assert_eq!(text.matches("data:image/jpeg;base64,").count()+text.matches("\"media_type\":\"image/jpeg\"").count(),count);
+                assert_eq!(text.matches("data:image/webp;base64,").count()+text.matches("\"media_type\":\"image/webp\"").count(),count);
             }
         }
         let latest = &history[4]["details"]["images"][0]["latestDeltas"];
@@ -2976,6 +3040,131 @@ mod tests {
         assert!(restored[1]["caption"].as_str().unwrap().contains("READ-ONLY partially overwritten patch"));
         for (image,tile) in restored[1..].iter().zip(latest.as_array().unwrap()) {
             assert_eq!(image["data"],base64::engine::general_purpose::STANDARD.encode(std::fs::read(tile["path"].as_str().unwrap()).unwrap()));
+        }
+    }
+
+    #[test]
+    fn screenshot_current_patches_replace_covered_tiles_on_each_monitor() {
+        use xcap::image::{Rgba, RgbaImage};
+        let dir = tempfile::tempdir().unwrap();
+        let mut page = RgbaImage::from_pixel(90,90,Rgba([255,255,255,255]));
+        let mut prior = None;
+        let mut history = Vec::new();
+        for step in 0..5 {
+            if step == 1 { page = RgbaImage::from_pixel(90,90,Rgba([0,0,0,255])); }
+            if step == 2 {
+                page.put_pixel(0,0,Rgba([255,255,255,255]));
+                page.put_pixel(89,89,Rgba([255,255,255,255]));
+            }
+            if step == 3 { page = RgbaImage::from_pixel(90,90,Rgba([127,127,127,255])); }
+            let id = format!("snap-{step}");
+            let mut base = json!({"imageId":"monitor-1","snapshotId":id,"monitorId":1,"deltaPolicy":"nine-grid"});
+            let (frame, mut deltas) = crate::visual_guard::deliver_frame(&mut base, prior.as_ref(), Some("monitor-1".into()),
+                page.clone(), None, dir.path().join(format!("{id}.webp"))).unwrap();
+            prior = frame;
+            for patch in base["latestDeltas"].as_array_mut().into_iter().flatten().chain(deltas.iter_mut()) {
+                patch["imageId"] = json!(format!("patch-{}-{}-{}",patch["tileRevision"],patch["x"],patch["y"]));
+            }
+            let mut images = vec![base];
+            images.extend(deltas);
+            if step == 0 {
+                let mut other = json!({"imageId":"monitor-2","snapshotId":id,"monitorId":2,"deltaPolicy":"nine-grid"});
+                crate::visual_guard::deliver_frame(&mut other,None,Some("monitor-2".into()),
+                    RgbaImage::from_pixel(90,90,Rgba([0,0,255,255])),None,dir.path().join("other.webp")).unwrap();
+                images.push(other);
+            }
+            history.push(json!({"role":"toolResult","toolName":"jianlai","toolCallId":id,"content":[],
+                "details":{"snapshotId":id,"images":images}}));
+        }
+        assert_eq!(detail_images(&history[1]).len(),2,"one full-screen patch");
+        assert_eq!(detail_images(&history[2]).len(),3,"two small patches");
+        assert_eq!(history[2]["details"]["images"][0]["latestDeltas"][0]["readOnly"],true);
+        assert_eq!(history[3]["details"]["images"][0]["latestDeltas"].as_array().unwrap().len(),1);
+        let model = test_model("openai-completions");
+        for (end,count) in [(3,5),(4,3),(5,3)] {
+            let messages = &history[..end];
+            let plans = tool_image_embeds(messages);
+            let images: Vec<_> = messages.iter().zip(&plans).flat_map(|(m,p)|tool_result_images(m,&model,p)).collect();
+            assert_eq!(images.len(),count,"two bases plus only surviving patches, never six historical images");
+            let old_path = history[1]["details"]["images"][1]["path"].as_str().unwrap();
+            let old_bytes = base64::engine::general_purpose::STANDARD.encode(std::fs::read(old_path).unwrap());
+            if end == 3 {
+                let patch = images.iter().find(|i| i["data"] == old_bytes).unwrap();
+                let caption = patch["caption"].as_str().unwrap();
+                assert!(caption.contains("READ-ONLY partially overwritten patch") && !caption.contains("To act inside it"));
+                let caption = screenshot_caption(&messages[1],&plans[1]);
+                assert!(!caption.contains("patch-1-0-0"),"superseded actionable metadata must also be omitted");
+            } else {
+                assert!(images.iter().all(|i| i["data"] != old_bytes),"fully covered patch must be gone");
+            }
+            if end == 4 {
+                let (text, _) = tool_result_parts(&messages[3],&model,&plans[3]);
+                assert!(!text.contains("Earlier screenshot omitted"),"deduplicating the current patch must not label it stale");
+            }
+            for output in [json!(completions_messages("",messages,&model)),json!(responses_input(messages,&model)),json!(anthropic_messages(messages,&model))] {
+                let text = output.to_string();
+                assert_eq!(text.matches("data:image/webp;base64,").count()+text.matches("\"media_type\":\"image/webp\"").count(),count);
+            }
+        }
+    }
+
+    #[test]
+    fn screenshot_current_patches_restore_each_monitor_after_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..7).map(|n| {
+            let path = dir.path().join(format!("{n}.png"));
+            std::fs::write(&path,format!("unique screenshot bytes {n}")).unwrap();
+            path
+        }).collect();
+        let bytes: Vec<_> = paths.iter().map(|p| base64::engine::general_purpose::STANDARD.encode(std::fs::read(p).unwrap())).collect();
+        let model = test_model("openai-completions");
+        for tool in ["jianlai","chrome","webview"] {
+            let message = |id: usize, images: Value| json!({"role":"toolResult","toolName":tool,"toolCallId":format!("call-{id}"),
+                "content":[],"details":{"snapshotId":format!("snap-{id}"),"images":images}});
+            let base = |screen: usize| json!({"imageId":format!("monitor-{screen}"),"monitorId":screen,
+                "frameStream":format!("monitor-{screen}"),"frameGroup":"same-group","keyframePath":paths[screen],"keyframeImageId":format!("monitor-{screen}")});
+            let patch = |screen: usize, n: usize| {
+                let mut p = base(screen);
+                p["path"] = json!(paths[n]); p["deltaOf"] = p["imageId"].take(); p["tileRevision"] = json!(n);
+                if tool == "jianlai" { p["imageId"] = json!(format!("patch-{n}")); }
+                p
+            };
+            let state = |screen: usize, n: usize| {
+                let mut b = base(screen);
+                b["latestDeltas"] = json!([patch(screen,n)]);
+                b
+            };
+            let keys: Vec<_> = (0..2).map(|screen| {
+                let mut b = base(screen); b["keyframe"] = json!(true); b["path"] = json!(paths[screen]); b
+            }).collect();
+            let mut history = vec![message(0,json!(keys)),message(1,json!([state(0,2),patch(0,2)])),
+                message(2,json!([state(1,3),patch(1,3)])),message(3,json!([state(0,4),patch(0,4)])),
+                message(4,json!([state(1,5),patch(1,5)])),message(5,json!([state(0,4)])),message(6,json!([state(1,5)]))];
+            // Complete state wins even when a legacy field still refers to an evicted patch.
+            history[5]["details"]["images"][0]["latestDelta"] = patch(0,2);
+            for start in 0..=5 {
+                let messages = &history[start..];
+                let plans = tool_image_embeds(messages);
+                let images: Vec<_> = messages.iter().zip(&plans).flat_map(|(m,p)|tool_result_images(m,&model,p)).collect();
+                assert_eq!(images.len(),4,"{tool}, compacted prefix {start}: two independent bases and current patches");
+                for output in [json!(completions_messages("",messages,&model)),json!(responses_input(messages,&model)),json!(anthropic_messages(messages,&model))] {
+                    let text = output.to_string();
+                    for (n,data) in bytes.iter().enumerate() {
+                        assert_eq!(text.matches(data.as_str()).count(),usize::from(matches!(n,0|1|4|5)),"{tool}, prefix {start}, image {n}");
+                    }
+                }
+            }
+            let mut mixed = history.clone();
+            mixed.push(message(7,json!([patch(0,6)])));
+            let plans = tool_image_embeds(&mixed);
+            assert_eq!(mixed.iter().zip(&plans).map(|(m,p)|tool_result_images(m,&model,p).len()).sum::<usize>(),5,
+                "later updates without complete state must not be evicted using an older list");
+            history[5]["details"]["images"][0]["latestDeltas"] = json!([]);
+            let messages = &history[1..];
+            let plans = tool_image_embeds(messages);
+            let images: Vec<_> = messages.iter().zip(&plans).flat_map(|(m,p)|tool_result_images(m,&model,p)).collect();
+            assert_eq!(images.len(),3,"empty complete state must not restore latestDelta or an older prefix's patches");
+            assert!(images.iter().all(|i| i["data"] != bytes[2] && i["data"] != bytes[4]));
         }
     }
 

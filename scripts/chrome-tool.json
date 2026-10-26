@@ -496,7 +496,7 @@
       },
       "fullPage": {
         "type": "boolean",
-        "description": "screenshot默认整页；false为当前视口。普通整页的每个文档分片及视口截图各自维护帧流，首次发关键帧，后续只发32×32网格变化块并合并相邻块，不跨未变块；模型上下文每条流只保留当前关键帧组。局部裁剪和expandScroll长图仍返回完整独立图片。增量块仅替换自身区域，latestDeltas按tileRevision叠加，重叠处以较新块为准，readOnly旧块仅供重建。Chrome增量无独立操作imageId：用本次snapshotId和deltaOf指向的基图imageId，块内坐标加该块x/y一次；不换算CSS/DPI。"
+        "description": "screenshot默认整页；false为当前视口。各标签页的普通整页文档分片及视口截图各自维护帧流，按3×3九宫格检测（边缘格按实际尺寸，每条流每轮最多9块），先横后竖合并相邻变化格，不跨未变格；首次发关键帧，后续只发变化区域。images[].unchanged=true表示该图无明显像素变化、未重复附图；沿用已见画面及本次snapshotId/imageId，不代表动作失败，不重放输入或循环截图；仍在加载时可wait后观察。模型上下文每条流只保留当前关键帧组的基线及仍有效增量，各流独立保留，压缩后自动补回，图片直接进入上下文，无需read/recall重复加载。局部裁剪和expandScroll长图仍返回完整独立图片。增量块仅替换自身区域，latestDeltas按tileRevision叠加，重叠处以较新块为准，部分覆盖的readOnly旧块仅供重建，完全覆盖的旧块移除。Chrome增量无独立操作imageId：用本次snapshotId和deltaOf指向的基图imageId，块内坐标加该块x/y一次；不换算CSS/DPI。"
       },
       "expandScroll": {
         "type": "boolean",
@@ -715,7 +715,7 @@
           { "const": 0 },
           { "minimum": 320, "maximum": 3840 }
         ],
-        "description": "截图长边：0为原始精度，或320–3840；默认1600，expandScroll默认0（无损PNG）"
+        "description": "截图长边：0为原始精度，或320–3840；默认1600，expandScroll默认0（无损WebP）"
       },
       "incognito": {
         "type": "boolean",

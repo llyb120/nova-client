@@ -499,7 +499,7 @@ impl ContextWindow {
         }
 
         let region = &visible[head..start];
-        let keep = self.keep_indexes(region, active.filter(|a| (head..start).contains(a)).map(|a| a - head));
+        let keep = self.keep_indexes(region, active.filter(|a| (head..start).contains(a)).map(|a| a - head), &visible[start..]);
         let mut kept = Vec::new();
         let mut fold = Vec::new();
         for (message, keep) in region.iter().zip(&keep) {
@@ -645,9 +645,21 @@ impl ContextWindow {
 
     /// 区间内必须原样保留的消息：失败的工具结果（连同调用组）、`[[keep]]` 用户消息、
     /// 当前轮用户消息，以及预算内（窗口 5%）从旧到新的用户原话。上一份摘要之前的不再保留。
-    fn keep_indexes(&self, region: &[Value], active: Option<usize>) -> Vec<bool> {
+    fn keep_indexes(&self, region: &[Value], active: Option<usize>, tail: &[Value]) -> Vec<bool> {
         let n = region.len();
         let mut keep = vec![false; n];
+        // Keep the latest complete state for EACH screenshot stream, isolated by toolName + frameStream.
+        // Later tail records supersede the same stream only. Provider restores its baseline + patches.
+        let mut screens = std::collections::HashSet::new();
+        for index in (0..n + tail.len()).rev() {
+            let message = if index < n { &region[index] } else { &tail[index - n] };
+            for image in message.pointer("/details/images").and_then(Value::as_array).into_iter().flatten() {
+                if image["deltaOf"].is_string() { continue; }
+                if let Some((stream, _)) = super::provider::frame_of(message, image) {
+                    if screens.insert(stream) && index < n { keep[index] = true; }
+                }
+            }
+        }
         let policy_start = region.iter().rposition(is_summary).map_or(0, |i| i + 1);
         for i in policy_start..n {
             let m = &region[i];
@@ -1447,6 +1459,50 @@ mod tests {
         // 只有固定提示本身占满窗口才算耗尽。
         let exhausted = ContextWindow::ephemeral(4096, 4000);
         assert!(exhausted.input_budget_exhausted() && !exhausted.should_compact(&canonical));
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_each_screenshot_streams_latest_state_and_call_pair() {
+        let root = tempfile::tempdir().unwrap();
+        let shot = |id: &str, tool: &str, stream: &str, group: &str| {
+            let mut m = result(id,tool,"observed",false);
+            m["details"] = json!({"snapshotId":id,"images":[{"imageId":stream,"frameStream":stream,"frameGroup":group,
+                "keyframePath":format!("{stream}-{group}.jpg"),"keyframeImageId":stream,
+                "latestDeltas":[{"path":format!("{stream}-{group}-patch.jpg"),"tileRevision":1}]}]});
+            m
+        };
+        for (session, streams) in [
+            ("screens", [("jianlai","monitor-1"),("jianlai","monitor-2"),("jianlai","monitor-3")]),
+            ("tabs", [("chrome","tab-a:document-0"),("chrome","tab-a:document-1"),("chrome","tab-b:document-0")]),
+            ("tools", [("chrome","shared"),("webview","shared"),("jianlai","shared")]),
+        ] {
+            let mut canonical = vec![user("observe screenshot streams")];
+            for (id,(tool,stream),group) in [
+                ("old",streams[0],"a"),("second",streams[1],"b"),("third",streams[2],"c"),("new",streams[0],"d"),
+            ] {
+                canonical.push(call(id,tool,json!({"operation":"screenshot"})));
+                canonical.push(shot(id,tool,stream,group));
+            }
+            let mut ctx = ContextWindow::load(root.path(),session,20_000,500);
+            let keep = ctx.keep_indexes(&canonical[1..7],None,&canonical[7..]);
+            assert_eq!(keep,vec![false,false,true,true,true,true],"{session}: a tail screenshot replaces only its own stream and keeps the others' callers");
+            let filler = "context line\n".repeat(500);
+            for i in 0..12 {
+                canonical.push(call(&format!("r{i}"),"read",json!({"path":"notes.txt"})));
+                canonical.push(result(&format!("r{i}"),"read",&filler,false));
+            }
+            canonical.push(user("continue"));
+            let receipt = ctx.compact(&canonical,None,Trigger::Manual,|_,_|async { Ok("Continue with all screenshot streams.".into()) }).await.unwrap();
+            assert_eq!(receipt.status,"applied","{session}: {receipt:?}");
+            let view = ctx.prompt_view(&canonical);
+            for id in ["second","third","new"] {
+                assert_eq!(view.iter().find(|m|m["toolCallId"] == id),canonical.iter().find(|m|m["toolCallId"] == id),"{session}: preserve the complete latest state");
+                assert_eq!(view.iter().find(|m|tool_calls(m).any(|(cid,_,_)|cid == id)),canonical.iter().find(|m|tool_calls(m).any(|(cid,_,_)|cid == id)),"{session}: preserve real tool pairs, not synthetic orphan results");
+            }
+            assert!(!view.iter().any(|m|m["toolCallId"] == "old"),"{session}: superseded state is folded");
+            let reloaded = ContextWindow::load(root.path(),session,20_000,500);
+            assert_eq!(reloaded.prompt_view(&canonical),view,"{session}: screenshot state survives projection persistence");
+        }
     }
 
     #[tokio::test]

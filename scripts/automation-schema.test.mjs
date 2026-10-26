@@ -110,3 +110,34 @@ test('Chrome and Jianlai run only executes pre-confirmed steps', async()=>{
     assert.equal(tool.inputSchema.properties.look,undefined);
   }
 });
+
+test('Jianlai keeps each screen and its nine-grid image context independent', async()=>{
+  const [jianlai, source, nova, provider, context, taskbar] = await Promise.all([
+    tool('jianlai'),
+    readFile(new URL('../src-tauri/src/jianlai.rs',import.meta.url),'utf8'),
+    readFile(new URL('../src-tauri/src/jianlai/nova_regions.rs',import.meta.url),'utf8'),
+    readFile(new URL('../src-tauri/src/lyra/provider.rs',import.meta.url),'utf8'),
+    readFile(new URL('../src-tauri/src/lyra/context.rs',import.meta.url),'utf8'),
+    readFile(new URL('../src-tauri/src/taskbar_status/windows.rs',import.meta.url),'utf8'),
+  ]);
+  assert.match(jianlai.description,/不跨屏拼接.*每屏最近基线及增量独立保留.*无需read\/recall/);
+  assert.match(jianlai.inputSchema.properties.imageId.description,/3×3九宫格.*最多9块.*先横后竖/);
+  assert.match(jianlai.inputSchema.properties.feedback.description,/Butterfly.*与Nova是否前台无关/);
+  assert.match(jianlai.inputSchema.properties.feedback.description,/images\[\]\.unchanged=true.*未重复附图.*本次snapshotId\/imageId.*不代表动作失败.*不重放输入或循环截图/);
+  assert.match(jianlai.inputSchema.properties.feedback.description,/局部操作后也回整屏.*background:true仍反馈原目标/);
+  assert.match(jianlai.inputSchema.properties.actions.description,/images\[\]\.frame.*scroll在actions中的0起始下标.*仅供阅读、不参与普通帧流替换或定位/);
+  assert.match(jianlai.inputSchema.properties.imageId.description,/顶层最新snapshotId.*最终观察中不带frame/);
+  assert.doesNotMatch(source,/"(?:deltaNotice|unchangedNotice|framesNotice|coordinateNotice)"|局部操作后的反馈恢复所属完整屏幕|历史截图仅供阅读，不产生可操作快照/);
+  assert.match(source,/"deltaPolicy":"nine-grid"/);
+  assert.match(source,/resize\(nova_regions::comparison_pixels\(&image, &source_ignored\)\)/);
+  assert.match(source,/DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2/);
+  assert.doesNotMatch(source,/mod desktop|desktop::compose|context-region/);
+  assert.doesNotMatch(nova,/GetForegroundWindow/);
+  assert.match(nova,/GetTopWindow\(parent\)/);
+  assert.match(nova,/TrayClockWClass/);
+  assert.match(source,/nova_regions::stable\(&nova_bounds, &nova_regions::visible\(\)\)/);
+  assert.match(taskbar,/IsWindowVisible\(hwnd\) == 0 \|\| GetTopWindow\(parent\) != hwnd/,'restore the chip after Explorer changes sibling Z order without moving it');
+  assert.match(provider,/Do not call read\/recall/);
+  assert.doesNotMatch(provider,/stream\.starts_with\("monitor-"\).*"desktop"/);
+  assert.match(context,/screens\.insert\(stream\).*keep\[index\] = true/);
+});

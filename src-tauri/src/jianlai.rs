@@ -529,7 +529,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
         let encode_started = Instant::now();
-        let mut entry = json!({"imageId":image_id,"width":image.width(),"height":image.height(),
+        let mut entry = json!({"imageId":image_id,"width":image.width(),"height":image.height(),"deltaPolicy":"nine-grid",
             "pixelWidth":image.width(),"pixelHeight":image.height(),
             "snapshotId":id,"capturedAt":captured_at,"stability":stability,
             "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
@@ -542,7 +542,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         let stream = region.is_none().then(|| image_id.clone());
         let prior = previous.iter().find(|p| Some(&p.stream) == stream.as_ref());
         let (frame, mut delta_entry) = crate::visual_guard::deliver_frame(&mut entry, prior, stream, plain,
-            Some(&image), folder.join(format!("{id}-{image_id}.jpg")))?;
+            Some(&image), folder.join(format!("{id}-{image_id}.webp")))?;
         let shot = Shot {
             image_id, surface, pixels: image.dimensions(), source_pixels: original_pixels,
             region, delta: None, guard, overlay, desktop_capture,
@@ -618,21 +618,11 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         background: bg,
         delivered,
     });
-    let unchanged: Vec<&str> = images.iter().filter(|i| i["unchanged"] == true).filter_map(|i| i["imageId"].as_str()).collect();
-    let mut result = json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
+    Ok(json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
             "foreground":before,"maxEdge":max_edge,
             "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
                 "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
-                "total":started.elapsed().as_millis()}});
-    let deltas: Vec<String> = images.iter().filter_map(|i| Some(format!("{} 属于 {}，偏移({},{})、大小{}×{}",
-        i["imageId"].as_str()?, i["deltaOf"].as_str()?, i["x"], i["y"], i["width"], i["height"]))).collect();
-    if !deltas.is_empty() {
-        result["deltaNotice"] = json!(format!("画面局部变化，只发了增量图：{}。用本次snapshotId和增量图自己的imageId，直接填写图内坐标；工具自动处理偏移与缩放，不要自行相加。区域外用完整图imageId（deltaOf）和完整图坐标。各显示器基线独立；每块只更新自身区域；重叠处以较新的tileRevision为准。latestDeltas按更新顺序保存，readOnly旧块仅供重建，操作用非readOnly块或合成画面的整屏坐标。", deltas.join("；")));
-    }
-    if !unchanged.is_empty() {
-        result["unchangedNotice"] = json!(format!("{} 与你已看到的画面（关键帧及最新增量）无明显像素差异（剑形指针位置以cursor字段为准），未重复发送图片：直接沿用已看到的画面判断，坐标对本次snapshotId/imageId同样有效。动作后出现此提示只表示本次取图尚无可见变化，不代表动作失败；若目标仍在加载可显式wait后观察，不重放输入或循环截图；上下文缺图时用recall回看keyframePath和latestDeltas中各path，不能把单块增量当作整屏。", unchanged.join("、")));
-    }
-    Ok(result)
+                "total":started.elapsed().as_millis()}}))
 }
 
 fn delta_shot(shot: &Shot, frame: &Delivered, snapshot: &str, entry: &mut Value) -> Option<Shot> {
@@ -1695,9 +1685,9 @@ mod tests {
         let ignored = [PixelRect { left:0, top:0, right:96, bottom:480 },
             PixelRect { left:560, top:400, right:640, bottom:480 }];
         let deliver = |id: &str, prior: Option<&Delivered>, image: &RgbaImage, regions: &[PixelRect]| {
-            let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"ignoredRegions":regions});
+            let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"ignoredRegions":regions,"deltaPolicy":"nine-grid"});
             let (frame, delta) = crate::visual_guard::deliver_frame(&mut entry, prior, Some("monitor-1".into()),
-                nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.jpg"))).unwrap();
+                nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.webp"))).unwrap();
             (entry, frame.unwrap(), delta)
         };
         let (_, base, _) = deliver("key", None, &page, &ignored);
@@ -1706,7 +1696,7 @@ mod tests {
         assert!(guard.changed_near(&page, 48., 32., false), "stale ignored UI is not actionable");
         assert!(!guard.changed_near(&page, 320., 240., false), "target app stays actionable");
         let saved = xcap::image::open(&base.keyframe_path).unwrap().to_rgba8();
-        assert!(saved.get_pixel(48, 32)[0] > 240, "actual screenshot must not be blacked out");
+        assert_eq!(saved, page, "actual screenshot must not be blacked out or lose pixels");
         let mut refresh = page.clone();
         refresh.put_pixel(48, 32, Rgba([0,0,0,255]));
         refresh.put_pixel(608, 448, Rgba([0,0,0,255]));
@@ -1730,7 +1720,7 @@ mod tests {
         use crate::visual_guard::PixelRect;
         let page = RgbaImage::from_pixel(800, 600, Rgba([255, 255, 255, 255]));
         let p0 = Delivered { stream: "window".into(), group: "snap".into(), keyframe_id: "window-1".into(), basis: Value::Null,
-            keyframe_path: "k.jpg".into(), seen: page.clone().into(), tiles: Vec::new(), deltas: 0 };
+            keyframe_path: "k.webp".into(), seen: page.clone().into(), tiles: Vec::new(), deltas: 0 };
         let rect = |l, t, r, b| PixelRect { left: l, top: t, right: r, bottom: b };
         assert!(matches!(plan_delivery(None, &page), Delivery::Keyframe));
         assert!(matches!(plan_delivery(Some(&p0), &page), Delivery::Unchanged));
@@ -1758,10 +1748,10 @@ mod tests {
             pixels:(320,320), source_pixels:(3840,2160), region:None, delta:None, guard:None, overlay:None, desktop_capture:true };
         let other = Shot { image_id:"monitor-2".into(), surface:Surface{id:2,x:0,y:0,..shot.surface.clone()}, ..shot.clone() };
         let deliver = |shot: &Shot, prior: Option<&Delivered>, name: &str, pixels: RgbaImage| {
-            let mut entry = json!({"imageId":shot.image_id,"snapshotId":name,
+            let mut entry = json!({"imageId":shot.image_id,"snapshotId":name,"deltaPolicy":"nine-grid",
                 "desktopBounds":{"x":shot.surface.x,"y":shot.surface.y,"width":shot.surface.width,"height":shot.surface.height},
                 "originalWidth":shot.source_pixels.0,"originalHeight":shot.source_pixels.1});
-            let (frame, delta) = crate::visual_guard::deliver_frame(&mut entry,prior,Some(shot.image_id.clone()),pixels,None,dir.path().join(format!("{name}.jpg"))).unwrap();
+            let (frame, delta) = crate::visual_guard::deliver_frame(&mut entry,prior,Some(shot.image_id.clone()),pixels,None,dir.path().join(format!("{name}.webp"))).unwrap();
             (entry, frame.unwrap(), delta)
         };
         let (_, first, _) = deliver(&shot,None,"first",page.clone());
@@ -1771,23 +1761,23 @@ mod tests {
         let (_, frame, delta) = deliver(&shot,Some(&first),"delta",changed.clone());
         let mut delta = delta.into_iter().next().unwrap();
         let crop = delta_shot(&shot,&frame,"delta",&mut delta).unwrap();
-        assert_eq!((delta["x"].as_u64(),delta["y"].as_u64()),(Some(128),Some(128)));
+        assert_eq!((delta["x"].as_u64(),delta["y"].as_u64()),(Some(107),Some(107)));
         assert_eq!(delta["deltaOf"],shot.image_id);
         assert_eq!(delta["monitorId"],1);
         assert_ne!(delta["imageId"],delta["deltaOf"]);
         // Local delta coordinates map exactly like full-image coordinates, even at fractional scale
         // and with a negative monitor origin. Do not round the crop into source pixels first.
-        for (x,y) in [(0,0),(22,22),(31,31)] {
-            assert_eq!(point(&crop,Some(x),Some(y)).unwrap(),point(&shot,Some(x+128),Some(y+128)).unwrap());
-            assert_eq!(source_point(&crop,x,y),source_point(&shot,x+128,y+128));
+        for (x,y) in [(0,0),(43,43),(106,106)] {
+            assert_eq!(point(&crop,Some(x),Some(y)).unwrap(),point(&shot,Some(x+107),Some(y+107)).unwrap());
+            assert_eq!(source_point(&crop,x,y),source_point(&shot,x+107,y+107));
         }
-        assert_eq!(point(&crop,Some(22),Some(22)).unwrap(),(-1020,406));
-        assert!(point(&crop,Some(32),Some(0)).is_err());
+        assert_eq!(point(&crop,Some(43),Some(43)).unwrap(),(-1020,406));
+        assert!(point(&crop,Some(107),Some(0)).is_err());
         assert!(point(&crop,Some(-1),Some(0)).is_err());
         let drag:Action = serde_json::from_value(json!({"action":"drag","x":1,"y":1,"toX":31,"toY":31})).unwrap();
         assert!(validate(&drag,Some(&crop)).is_ok());
         let zoom=image_region(&crop,Region{x:1,y:2,width:10,height:20}).unwrap();
-        let base_zoom=image_region(&shot,Region{x:129,y:130,width:10,height:20}).unwrap();
+        let base_zoom=image_region(&shot,Region{x:108,y:109,width:10,height:20}).unwrap();
         assert_eq!((zoom.x,zoom.y,zoom.width,zoom.height),(base_zoom.x,base_zoom.y,base_zoom.width,base_zoom.height));
         let shots=vec![shot.clone(),crop.clone()];
         assert!(action_shot(&shots,None).is_err(),"base and delta coordinates are ambiguous without imageId");
@@ -1812,8 +1802,8 @@ mod tests {
         assert_eq!(metadata["latestDeltas"].as_array().unwrap().len(),2);
         let corner=delta_shot(&shot,&frame2,"corner",&mut metadata["latestDeltas"][1]).unwrap();
         assert_ne!(corner.image_id,crop.image_id);
-        assert_eq!(point(&corner,Some(31),Some(31)).unwrap(),point(&shot,Some(319),Some(319)).unwrap());
-        assert!(point(&corner,Some(32),Some(0)).is_err());
+        assert_eq!(point(&corner,Some(105),Some(105)).unwrap(),point(&shot,Some(319),Some(319)).unwrap());
+        assert!(point(&corner,Some(106),Some(0)).is_err());
         let mut partial = metadata["latestDeltas"][0].clone();
         partial["readOnly"] = json!(true);
         assert!(delta_shot(&shot,&frame2,"corner",&mut partial).is_none(), "partially overwritten patches cannot authorize stale coordinates");
@@ -2028,10 +2018,10 @@ mod tests {
             let resize_ms = started.elapsed().as_millis();
             assert_eq!(resized, expected);
             let started = Instant::now();
-            let encoded = crate::visual_guard::encode_jpeg(&resized).unwrap();
+            let encoded = crate::visual_guard::encode_webp(&resized).unwrap();
             let encode_ms = started.elapsed().as_millis();
-            assert_eq!(xcap::image::load_from_memory(&encoded).unwrap().to_rgba8().dimensions(), resized.dimensions());
-            eprintln!("screenshot pipeline: resize={resize_ms}ms encode={encode_ms}ms bytes={}", encoded.len());
+            assert_eq!(xcap::image::load_from_memory(&encoded).unwrap().to_rgba8(), resized);
+            eprintln!("screenshot pipeline (lossless WebP): resize={resize_ms}ms encode={encode_ms}ms bytes={}", encoded.len());
         }
     }
     #[cfg(windows)]

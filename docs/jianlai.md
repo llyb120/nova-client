@@ -48,7 +48,11 @@
 
 保留基本输入节拍：批次末尾的非 move/wait 动作后固定留300ms给应用绘制及异步剪贴板更新，不随动画延长；后接显式wait时不重复等待。纯move无额外等待，悬停菜单等需要时用move + wait。模型根据目标是否已就绪决定继续还是显式wait后观察；无关动画不等于未就绪，静止画面也不等于加载完成。不因反馈暂未变化而重放输入。
 
-分块增量截图继续保留：普通模式按显示器维护独立流，按32×32块比较RGB通道差异（阈值16），未变时复用已见画面，局部变化返回累计增量，变化包围盒超过画面四分之一则返回完整关键帧。动画也按真实变化发送，不再推测并隐藏动态区域。增量图有自己的imageId，deltaOf是整屏基图ID，x/y是相对基图的偏移元数据，pixelWidth/pixelHeight是增量图尺寸，并附snapshotId。使用增量图自己的imageId与图内坐标时，工具自动映射偏移、缩放和DPI，不手加偏移；整屏坐标使用基图ID。像素未变时增量imageId保持稳定，unchanged结果中的latestDelta同样配最新snapshotId可用。像素、显示器布局、键盘焦点和快照校验仍保留；移除的是截图稳定门槛，不是输入安全校验。
+分块增量截图按显示器维护独立流，不跨屏拼接：每屏分成3×3九宫格（边缘格按实际尺寸），比较RGB通道差异（阈值16）。本轮只发送变化格，先合并横向连续格，再合并上下同宽连续区域，不跨未变化格；每屏每轮最多9块，不按变化面积回退整屏。无变化时不重复附图，达到8轮增量上限或尺寸、显示器坐标、排除区域改变时更新该屏基线。动画按真实变化发送。
+
+增量图有自己的imageId，deltaOf是该屏基图ID，x/y是基图内偏移元数据，pixelWidth/pixelHeight是块尺寸。使用块自己的imageId与局部坐标，工具自动处理偏移、缩放和DPI，禁止手加偏移；整屏坐标使用该屏基图ID。Windows普通操作在同一Per-Monitor V2物理像素坐标作用域中完成枚举、截图、输入与鼠标回读，退出恢复线程原有DPI上下文。像素、显示器布局、键盘焦点和快照安全校验仍保留。
+
+Windows整屏增量检测排除Nova及Butterfly自身的可见区域（包括Dev实例及运行计时），与Nova是否前台无关；另外仅按真实原生时钟控件边界排除系统时钟，不屏蔽整条任务栏或通知区。按真实窗口遮挡关系处理，不忽略覆盖其上的其他程序；取样前后的排除区域按交集保留，一块区域或另一屏变化不再使所有排除失效。先在原始像素上屏蔽比较副本，再缩放，避免动画边缘渗入相邻检测格。实际截图不涂黑；排除区域可能未刷新，不能直接沿用旧图点击，操作Nova时需先局部截图（后台及局部截图不排除）。排除区域移动或消失时重建该屏基线以显示新露出的内容。
 
 新图通过 snapshotId 标识一次观察，observationSequence 是进程内递增序号（重启重置）；每张图附 snapshotId、capturedAt（UTC）和单帧取样统计，普通模式屏幕范围由monitorId、imageId与desktopBounds标识，windowId只用于定位显示器。operation 标明来源，操作结果的 basedOnSnapshotId 指向输入依据。historical=false 仅表示本次新采集，并非永远有效；recall 仍标记 historical=true，不伪造原图采集时间或新快照。
 
@@ -58,15 +62,17 @@
 
 缩放、坐标映射、校验与恢复、回看、notes以及截图耗时均在共享jianlai服务层实现，Lyra原生工具和MCP调用使用同一套契约与策略说明。
 
-**模型请求中每个工具的每条截图流只保留当前关键帧组**（基图及该组块更新）；新关键帧出现后旧组换成路径说明，本地文件不删除。增量按32×32图像像素网格检测，横向连续变化块合并，上下同宽连续区域再合并；仅发送相对上一有效画面发生变化的区域，不填补块间未变化区域，也不设置面积回退阈值。每块只更新自身区域，`latestDeltas`按更新顺序保存，重叠处以较新的`tileRevision`为准；部分被覆盖的旧块标记`readOnly`，保留用于压缩恢复但不能直接操作。剑来每块独立imageId及图内坐标，浏览器仍按完整视口坐标。首次截图、基准变化及组长度上限仍会触发关键帧。
+**各屏分别保留最近基线及仍有效的增量**：新基线只替换同一工具、同一frameStream的旧组，不影响其他显示器。同组也以最新`latestDeltas`为准：完全覆盖的旧增量不再附入模型请求，部分覆盖的块以最新`readOnly`元数据保留用于重建；不会累计附入同组全部历史增量。图片由Lyra直接附入上下文，不需要read/recall重复读取。压缩保留每屏最新完整状态的工具结果及其调用配对，基图被折叠时自动补回keyframePath和latestDeltas，避免只保留最后操作的屏幕；413回退也不淘汰当前帧组。旧组仅保留路径说明，本地文件不删除。
 
-滚动阅读先写notes，未记录信息可recall回看。一批act里连放多个scroll时，每个非末尾scroll后自动附一张只读中间帧；若紧跟显式wait，则等这些wait执行完再取图（`images[].frame`仍为该scroll的序号，附`framesNotice`），一次调用读完多屏；中间帧只供阅读、不参与普通帧流替换；后续act使用顶层最新snapshotId与最终观察中所选图片的imageId和坐标，不使用中间帧。不会删除本地旧图或重开会话来伪装上下文优化。
+剑来每屏与Chrome每个视口/文档分片均使用3×3九宫格检测，每条流每轮最多9块，各流最近基线及仍有效增量独立保留，压缩后自动补回。每块只更新自身区域，`latestDeltas`按更新顺序保存，重叠处以较新的`tileRevision`为准；部分被覆盖的旧块标记`readOnly`，保留用于重建但不能直接操作，完全覆盖的旧块移除。剑来每块独立imageId及图内坐标；Chrome仍使用对应完整基图imageId，块内坐标加x/y偏移一次。
+
+滚动阅读先写notes，未记录信息可recall回看。一批act里连放多个scroll时，每个非末尾scroll后自动附一张只读中间帧；若紧跟显式wait，则等这些wait执行完再取图（`images[].frame`仍为该scroll在actions中的0起始下标），一次调用读完多屏；中间帧只供阅读、不参与普通帧流替换；后续act使用顶层最新snapshotId与最终观察中不带frame的图片imageId和坐标，不使用中间帧。不会删除本地旧图或重开会话来伪装上下文优化。
 
 ## 耗时诊断
 
-NovaDev对xcap、image、png及压缩依赖启用优化编译；分块变化检测先做整帧字节相等比较，静止画面无需逐像素扫描；缩放通过DynamicImage进入依赖内的优化实现，保留Triangle算法和相同像素尺寸。输入校验按当前显示器布局、落点像素和键盘焦点执行，不以旧窗口裁剪范围代替当前屏幕观察。纯图像基准可运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::screenshot_pipeline_benchmark -- --ignored --nocapture`，输出缩放/编码耗时，并验证与原缩放实现及PNG解码结果逐像素一致；此测试不操作桌面。
+NovaDev对xcap、image、image-webp、png及压缩依赖启用优化编译；分块变化检测先做整帧字节相等比较，静止画面无需逐像素扫描；缩放通过DynamicImage进入依赖内的优化实现，保留Triangle算法和相同像素尺寸。输入校验按当前显示器布局、落点像素和键盘焦点执行，不以旧窗口裁剪范围代替当前屏幕观察。纯图像基准可运行 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::screenshot_pipeline_benchmark -- --ignored --nocapture`，输出缩放/编码耗时，并验证与原缩放实现及PNG解码结果逐像素一致；此测试不操作桌面。
 
-截图返回timingsMs：capture（系统捕获）、resize、encodeAndSave（PNG编码及落盘）、other（窗口枚举、焦点校验等）和total。MCP传输适配另返回deliveryTimingsMs（read/base64/total）及deliveredImageBytes；不包含网络及模型耗时。Windows前台身份检查直接读取窗口句柄与PID，避免每个动作多次枚举所有窗口及其元数据；这是只读状态检查，不负责激活。先比较这些分段数据，再决定是否换捕获后端/编码器，不据单次总耗时猜测瓶颈。
+截图返回timingsMs：capture（系统捕获）、resize、encodeAndSave（无损WebP编码及落盘）、other（窗口枚举、焦点校验等）和total。MCP传输适配另返回deliveryTimingsMs（read/base64/total）及deliveredImageBytes；不包含网络及模型耗时。Windows前台身份检查直接读取窗口句柄与PID，避免每个动作多次枚举所有窗口及其元数据；这是只读状态检查，不负责激活。先比较这些分段数据，再决定是否换捕获后端/编码器，不据单次总耗时猜测瓶颈。
 
 ## 平台与构建
 
