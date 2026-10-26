@@ -130,6 +130,24 @@ test('a stuck debugger command times out, polling resumes and late results are n
   assert.equal(slowCalls,1,'a busy renderer reply must not require resending');
 });
 
+test('navigation target events identify noopener children without scanning active tabs',async()=>{
+  const event=()=>({listeners:[],addListener(fn){this.listeners.push(fn);},emit(...args){for(const fn of this.listeners)fn(...args);}});
+  const tabs=[{id:11,windowId:5,url:'https://example.com/source',active:true}];
+  const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},
+    tabs:{query:async()=>tabs,onRemoved:event(),onReplaced:event(),onUpdated:event()},
+    webNavigation:{onCreatedNavigationTarget:event()},debugger:{onEvent:event(),onDetach:event()},
+    runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={inventory};',scope);
+  const [source]=await scope.api.inventory();
+  chrome.webNavigation.onCreatedNavigationTarget.emit({tabId:22,sourceTabId:11,sourceFrameId:0,url:'https://example.com/child'});
+  tabs.push({id:22,windowId:5,url:'https://example.com/child',active:true}); // rel=noopener: no openerTabId.
+  const child=(await scope.api.inventory()).find(tab=>tab.tag!==source.tag);
+  assert.equal(child.openerTag,source.tag);
+  const manifest=JSON.parse(await readFile(new URL('./manifest.json',import.meta.url),'utf8'));
+  assert.ok(manifest.permissions.includes('webNavigation'));
+});
+
 test('stable tags, default access, auto-attached frames, expiry and worker restart',async()=>{
   const persisted={};let nativeCalls=[];const discovery=[];
   let tabs=[{id:11,url:'https://example.com/a',title:'A',active:true},{id:22,url:'https://example.org/b',title:'B',active:false}];

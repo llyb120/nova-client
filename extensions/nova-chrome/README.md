@@ -25,7 +25,9 @@ Nova 启动时依次尝试 127.0.0.1:47653–47662，跳过已占用端口。扩
 
 支持同时运行开发版、正式版等多个 Nova，扩展弹窗显示连接数量。命令结果回传给发起它的实例，单条浏览器命令串行执行；多个任务操作同一标签页仍会共享页面状态，建议使用不同标签页。显式设置 NOVA_CHROME_PORT 时只监听指定端口（0 表示系统分配，供测试使用），扩展仅自动发现上述默认范围。
 
-Nova 和 Chrome 扩展需要同步更新，已安装的扩展请更新至 0.1.9，并在 chrome://extensions 重新加载。
+Nova 和 Chrome 扩展需要同步更新，已安装的扩展请更新至 0.1.13，并在 chrome://extensions 重新加载。
+
+0.1.13 通过 `webNavigation.onCreatedNavigationTarget` 直接识别新标签/窗口的来源，覆盖 `rel=noopener` 等没有 `openerTabId` 的打开方式；Nova 仍只在本次动作产生唯一 active 且可操作的新页时自动跟进，多个候选不猜测。
 
 0.1.9 新增 `operation=devtools`：经已有调试会话读取标签的 console 日志、JS 异常与网络请求（可按 requestId 取响应体），无需新增权限。网络只记录首次调用之后的请求；需要 DevTools 界面时由 Agent 用 jianlai 按 F12 打开。详见 docs/chrome-browser.md。
 

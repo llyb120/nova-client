@@ -7,6 +7,8 @@ const instances = new Map();
 let commands = Promise.resolve();
 const attached = new Set();
 const frameTargets = new Map();
+// Navigation ancestry comes from Chrome itself, including rel=noopener where openerTabId is absent.
+const navigationOpeners = new Map();
 // DevTools data per tab, recorded only after the first `devtools` call enables the domains.
 // ponytail: top-frame session only, ring buffer of DEVTOOLS_LIMIT per kind; OOPIF iframes need per-session enable.
 const devtools = new Map();
@@ -81,7 +83,10 @@ async function inventory() {
   }
   await save();
   // `loading` lets Nova wait for a navigation to settle instead of costing the model another inspect.
-  return tabs.map(tab=>({tag:model.tabs[tab.id].tag,title:tab.title || '',url:tab.url || tab.pendingUrl || '',active:tab.active,incognito:!!tab.incognito,windowId:tab.windowId,allowed:true,controllable:permittedUrl(tab.url || tab.pendingUrl),openerTag:model.tabs[tab.openerTabId]?.tag,status:tab.status || 'unknown',loading:tab.status!=='complete' || Boolean(tab.pendingUrl)}));
+  return tabs.map(tab=>{
+    const openerId = navigationOpeners.get(tab.id) ?? tab.openerTabId;
+    return {tag:model.tabs[tab.id].tag,title:tab.title || '',url:tab.url || tab.pendingUrl || '',active:tab.active,incognito:!!tab.incognito,windowId:tab.windowId,allowed:true,controllable:permittedUrl(tab.url || tab.pendingUrl),openerTag:model.tabs[openerId]?.tag,status:tab.status || 'unknown',loading:tab.status!=='complete' || Boolean(tab.pendingUrl)};
+  });
 }
 async function resolveTag(tag) {
   await ready();
@@ -306,8 +311,11 @@ chrome.debugger.onEvent.addListener((source,method,params)=>{
   }
 });
 chrome.debugger.onDetach.addListener(source=>forget(source.tabId));
-chrome.tabs.onRemoved.addListener(id=>{grouped.delete(id);forget(id);void ready().then(async()=>{delete model.tabs[id];await save();});});
+chrome.webNavigation?.onCreatedNavigationTarget.addListener(({tabId,sourceTabId})=>navigationOpeners.set(tabId,sourceTabId));
+chrome.tabs.onRemoved.addListener(id=>{navigationOpeners.delete(id);grouped.delete(id);forget(id);void ready().then(async()=>{delete model.tabs[id];await save();});});
 chrome.tabs.onReplaced.addListener((added,removed)=>{void ready().then(async()=>{
+  const opener=navigationOpeners.get(removed);
+  if(opener!==undefined){navigationOpeners.set(added,opener);navigationOpeners.delete(removed);}
   if(model.tabs[removed]){model.tabs[added]=model.tabs[removed];delete model.tabs[removed];await save();}grouped.delete(removed);forget(removed);
 });});
 chrome.runtime.onMessage.addListener((message,sender,reply)=>{
