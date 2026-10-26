@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[path = "exec.rs"]
-pub mod exec;
 
 const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析。仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。目标行段已明确时直接按行段 read。";
 
@@ -92,7 +91,6 @@ pub fn tool_set(
         })),
     });
     if !read_only {
-        tools.extend(exec::tool_definitions());
         let desktop = crate::jianlai::tool_definition();
         tools.push(Tool { name: "jianlai", description: desktop["description"].as_str().unwrap().into(), parameters: schema(desktop["inputSchema"].clone()) });
         let employee = crate::employee::tool_definition();
@@ -563,8 +561,8 @@ fn cancel_message(stdout: &[u8], stderr: &[u8]) -> String {
     text
 }
 
-/// session_id is the independent main/child agent owner for persistent exec only.
-/// Other tools retain their archive-path owner (experience finish matching).
+/// session_id is the independent main/child agent owner; other tools use the
+/// archive-path owner (experience finish matching) unless they opt out.
 pub async fn execute(
     root: &Path,
     name: &str,
@@ -575,11 +573,8 @@ pub async fn execute(
     cancelled: Option<&Arc<AtomicBool>>,
     session_id: &str,
 ) -> ToolOutcome {
-    let owner = if matches!(name, "exec_command" | "write_stdin") {
-        session_id.to_owned()
-    } else {
-        archive_dir.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()
-    };
+    let _ = session_id;
+    let owner = archive_dir.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
     let outcome = execute_inner(root, name, args, shell, cancelled, &owner).await;
     govern(outcome, name, call_id, archive_dir)
 }
@@ -593,17 +588,6 @@ async fn execute_inner(
     owner: &str,
 ) -> ToolOutcome {
     match name {
-        "exec_command" | "write_stdin" => {
-            match exec::execute(root, name, args, shell, owner, cancelled.cloned()).await {
-                Ok(value) => {
-                    let is_error = matches!(value["status"].as_str(), Some("failed" | "cancelled" | "timed_out"));
-                    let mut outcome = ToolOutcome::text(value.to_string()).with_details(value);
-                    outcome.is_error = is_error;
-                    outcome
-                }
-                Err(error) => ToolOutcome::error(error),
-            }
-        }
         "chrome" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，Chrome 控制不可用"); }
             match crate::native_browser::execute_chrome(root, args, owner).await {
@@ -803,7 +787,7 @@ mod tool_tests {
     async fn image_tools_work_without_polaris_and_are_blocked_in_read_only_mode() {
         for read_only in [false, true] {
             let tools = tool_set(read_only, false, false);
-            for name in ["generate_image", "edit_image", "jianlai", "chrome", "exec_command", "write_stdin"] {
+            for name in ["generate_image", "edit_image", "jianlai", "chrome"] {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
             assert!(tools.iter().all(|tool| tool.name != "webview"));

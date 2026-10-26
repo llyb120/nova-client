@@ -2423,7 +2423,6 @@ impl RelayManager {
                 let mgr = state.lyra.clone();
                 tauri::async_runtime::spawn(async move {
                     if host_prompt_is_current(&prompt_epoch) {
-                        crate::lyra::session::resume_for_thread(&host_thread_id);
                         mgr.run_prompt(host_thread_id, text, images).await;
                     }
                 });

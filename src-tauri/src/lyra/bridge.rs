@@ -10,7 +10,6 @@ use crate::lyra::prompt::{
 };
 use crate::lyra::provider::{stream_chat, StreamEvent};
 use crate::lyra::rollout::Rollout;
-use crate::lyra::session;
 use crate::lyra::tools::tool_set;
 use crate::lyra::turn::{context_tools, run_turn, Session, TurnEvent};
 use serde_json::{json, Value};
@@ -425,7 +424,6 @@ async fn handle_prompt(
     if !desktop {
         tools.retain(|tool| !matches!(tool.name, "jianlai" | "chrome"));
     }
-    tools.extend(session::agent_tools());
     let routing = routing.map(|(scene, targets)| crate::lyra::scene::Routing::new(scene, targets, &config_value, &env, system_prompt.clone(), tools.clone()));
     let tool_definitions = json!(tools.iter()
         .map(|tool| json!({ "name": tool.name, "description": tool.description, "parameters": tool.parameters }))
@@ -469,19 +467,10 @@ async fn handle_prompt(
         context,
         cancelled: cancelled.clone(),
         steer: steer.clone(),
-        agents: Some(session::root_handle(&request.get("novaThreadId").and_then(Value::as_str)
-            .map(|id| format!("thread:{id}")).unwrap_or_else(|| ctx.session_id.clone())).with_stage(
-            app.zip(request.get("novaThreadId").and_then(Value::as_str).map(str::to_owned)),
-        ).with_persistence(&sessions_root)?),
         scenes: None,
     };
     if let Some(routing) = routing { routing.install(&mut session); }
 
-    if let Some(agents) = &session.agents {
-        if read_only { agents.cancel_all(); }
-        agents.resume();
-    }
-    if read_only { crate::lyra::tools::exec::cancel_owner(&ctx.session_id); }
     emit(&json!({ "type": "ready", "sessionId": ctx.session_id }));
 
     // ---- steer / cancel 控制行消费（行源由调用方提供：stdin 或进程内通道） ----
@@ -1237,7 +1226,7 @@ mod tests {
                 if item["type"] == "agent_message" { answer = item["text"].as_str().unwrap_or_default().into(); }
                 if item["status"] == "completed" {
                     if item["tool"] == "parallel" { batches += 1; }
-                    if matches!(item["tool"].as_str(), Some("bash" | "exec_command" | "write_stdin")) {
+                    if matches!(item["tool"].as_str(), Some("bash")) {
                         command_output.push_str(item["aggregated_output"].as_str().unwrap_or_default());
                         command_output.push_str(&item["result"].to_string());
                     }
