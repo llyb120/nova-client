@@ -141,6 +141,7 @@ pub(crate) fn migrate(root: &Path, store: &mut ThreadStore, settings: &mut Setti
         }
     }
     // Commit providers first: a crash can leave an unused provider, never a dangling selection.
+    migration.use_refreshed_models()?;
     migration.save()?;
     if settings_changed || !plans.is_empty() {
         next.lyra_enabled = true;
@@ -174,6 +175,7 @@ pub(crate) fn selections(root: &Path, env: &std::collections::HashMap<String, St
             Err(error) => json!({"error":error}),
         }
     }).collect();
+    migration.use_refreshed_models()?;
     migration.save()?;
     Ok(results)
 }
@@ -240,6 +242,36 @@ mod tests {
         let mut unknown = Thread::new(".".into(), AgentKind::Unsupported, None, None, None, false);
         assert!(bind_thread(&mut unknown, "p/model").is_err());
         assert_eq!(unknown.agent_kind, AgentKind::Unsupported);
+    }
+
+    #[test]
+    fn codebuddy_and_devin_migration_discards_explicit_models_and_expires_catalogs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alkaid")).unwrap();
+        std::fs::write(root.path().join("alkaid/config.jsonc"), r#"{"provider":{
+            "devin":{"preset":"devin","models":{"stale":{}}},
+            "codebuddy":{"preset":"codebuddy","models":{"stale":{}}},
+            "other":{"preset":"local-codex","models":{"keep":{}}}
+        }}"#).unwrap();
+        std::fs::write(root.path().join("alkaid/models-cache.json"), json!({
+            "devin": {"fetchedAt":u64::MAX,"models":{"stale":{}}},
+            "codebuddy": {"fetchedAt":u64::MAX,"models":{"stale":{}}},
+            "other": {"fetchedAt":u64::MAX,"models":{"keep":{}}}
+        }).to_string()).unwrap();
+        let mut store = ThreadStore::load(root.path().to_path_buf());
+        for source in ["devin", "codebuddy"] {
+            store.threads.push(Thread::new(".".into(), AgentKind::Legacy(source.into()), Some("current".into()), None, None, false));
+        }
+        migrate(root.path(), &mut store, &mut Settings::default()).unwrap();
+        let config: Value = serde_json::from_slice(&std::fs::read(root.path().join("alkaid/config.jsonc")).unwrap()).unwrap();
+        assert_eq!(config["provider"]["devin"]["models"], json!({}));
+        assert_eq!(config["provider"]["codebuddy"]["models"], json!({}));
+        assert!(config["provider"]["other"]["models"]["keep"].is_object());
+        let cache: Value = serde_json::from_slice(&std::fs::read(root.path().join("alkaid/models-cache.json")).unwrap()).unwrap();
+        assert_eq!(cache["devin"]["fetchedAt"], 0);
+        assert_eq!(cache["codebuddy"]["fetchedAt"], 0);
+        assert_eq!(cache["other"]["fetchedAt"], json!(u64::MAX));
+        assert!(cache["devin"]["models"]["stale"].is_object(), "刷新失败时保留旧目录回退");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Offline migration only: callers must save providers successfully before changing targets.
 use serde_json::{json, Value};
-use std::{cell::RefCell, collections::HashMap, fs, io::{Read, Write}, path::{Path, PathBuf}};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, fs, io::{Read, Write}, path::{Path, PathBuf}};
 
 const EFFORTS: &[&str] = &["none", "minimal", "default", "low", "medium", "high", "xhigh", "max", "ultra"];
 
@@ -9,6 +9,7 @@ pub(crate) struct Migration {
     env: HashMap<String, String>,
     config: Value,
     saved: RefCell<(Option<Vec<u8>>, Value)>,
+    refetch_providers: HashSet<String>,
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -42,7 +43,7 @@ impl Migration {
             return Err("Lyra provider 必须是对象，未执行迁移".into());
         }
         Ok(Self { root: root.into(), env: env.clone(),
-            saved: RefCell::new((raw, config.clone())), config })
+            saved: RefCell::new((raw, config.clone())), config, refetch_providers: HashSet::new() })
     }
 
     /// Returns the actual provider key, never a guessed vendor/model mapping.
@@ -122,6 +123,7 @@ impl Migration {
             providers.insert(key.clone(), json!({ "preset": preset, "models": {} }));
             key
         });
+        if matches!(canonical, "devin" | "codebuddy") { self.refetch_providers.insert(key.clone()); }
         let provider = &mut providers[&key];
         if provider.get("models").is_none() { provider["models"] = json!({}); }
         let entry = provider["models"].as_object_mut().unwrap().entry(id.to_owned()).or_insert_with(|| json!({}));
@@ -201,6 +203,30 @@ impl Migration {
             if defaults.len() == 1 { return Ok((defaults[0].into(), effort)); }
         }
         Err(format!("{source} 未指定模型，且本地模型配置/缓存没有明确选择；未猜测默认模型"))
+    }
+
+    /// 自动迁移不把旧选择写成长期模型覆盖；目录缓存仅过期，拉取失败时仍可回退。
+    pub(crate) fn use_refreshed_models(&mut self) -> Result<(), String> {
+        if self.refetch_providers.is_empty() { return Ok(()); }
+        for key in &self.refetch_providers { self.config["provider"][key]["models"] = json!({}); }
+        let path = super::presets::cache_path(&self.root);
+        let mut cache = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("读取 Lyra 模型缓存失败，未保存迁移".into()),
+        };
+        let mut changed = false;
+        for key in &self.refetch_providers {
+            if let Some(entry) = cache.get_mut(key).filter(|entry| entry.is_object()) {
+                entry["fetchedAt"] = json!(0);
+                changed = true;
+            }
+        }
+        if changed {
+            let bytes = serde_json::to_vec_pretty(&cache).map_err(|_| "无法编码 Lyra 模型缓存")?;
+            crate::thread_storage::atomic_write(&path, &bytes)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn changed(&self) -> bool { self.config != self.saved.borrow().1 }
