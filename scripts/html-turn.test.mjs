@@ -110,6 +110,12 @@ assert.match(render({ body: [{ ...assistant, text: 'large markdown\n'.repeat(300
 assert.match(render({ body: [{ ...assistant, deferred: true }] }), /data-item-id="4"/);
 assert.match(render({ body: [{ ...assistant, deferred: true }] }), /data-history-loading/);
 assert.doesNotMatch(render({ body: [{ ...assistant, deferred: true }] }), /final answer/);
+// Deferred tools/thoughts in a collapsed turn are not painted: render the turn instead of a placeholder.
+const deferredProcess = { user, body: [{ ...thought, text: '', deferred: true }, { ...tool, content: [], deferred: true }, assistant], turn };
+assert.doesNotMatch(render(deferredProcess), /data-history-loading/);
+assert.match(render(deferredProcess), /final answer/);
+assert.match(render(deferredProcess, { 'turn-5': true }), /data-history-loading/, 'an opened fold still waits for its bodies');
+assert.match(render({ user, body: [tool, { ...assistant, text: '', deferred: true }], turn }), /data-history-loading/, 'a deferred answer is visible content');
 
 const source = await readFile(new URL('../src/components/HtmlTurn.tsx', import.meta.url), 'utf8');
 const css = await readFile(new URL('../src/components/HtmlTurn.css', import.meta.url), 'utf8');

@@ -42,6 +42,11 @@ export function HtmlTurn(props: HtmlTurnProps) {
     isExpanded(item.type === "tool" ? `tool-${item.id}` : item.type === "thought" ? `thought-${item.id}` : String(item.id))));
   const foldedTurn = () => !!props.group.turn && body().process.length > 0;
   const deferredIds = createMemo(() => props.group.body.filter(item => item.deferred).map(item => item.id));
+  // Deferred tools/thoughts inside a collapsed turn are never painted: show the turn and hydrate them silently,
+  // instead of swapping the whole turn for a placeholder (a visible flash when switching sessions).
+  // Deferred answers/system text are dropped by splitTurnBody, so they still need the placeholder.
+  const deferredHidden = () => foldedTurn() && !turnOpen()
+    && props.group.body.every(item => !item.deferred || item.type === "tool" || item.type === "thought");
   const [loadError, setLoadError] = createSignal("");
   const [loading, setLoading] = createSignal(false);
   let loadGeneration = 0;
@@ -65,7 +70,7 @@ export function HtmlTurn(props: HtmlTurnProps) {
   };
 
   return <section class="html-turn" aria-label="对话轮次">
-    <Show when={!deferredIds().length} fallback={
+    <Show when={!deferredIds().length || deferredHidden()} fallback={
       <div class="ht-history" data-history-loading aria-busy={loading()}>
         <For each={deferredIds()}>{id => <span data-item-id={id} />}</For>
         <button type="button" disabled={loading() || !props.loadItems} onClick={() => void load()}>
