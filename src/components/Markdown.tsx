@@ -11,10 +11,16 @@ import { localImagePath, transcriptImageSrc } from "../transcriptImage";
 import { advanceStreamText, STREAM_PREBUFFER_MS } from "../streamReveal";
 import { createFileContextMenu } from "./FileContextMenu";
 
+const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const marked = new Marked({ gfm: true, breaks: true });
 marked.use({ renderer: {
+  link({ href, tokens }) {
+    const file = linkedFile(href);
+    if (!file) return false;
+    // DOMPurify drops file:, drive-letter and `a.ts:12` hrefs; keep local links as file buttons before sanitizing.
+    return `<button type="button" class="md-file-ref" data-path="${escape(file.path)}"${file.line ? ` data-line="${file.line}"` : ""} title="${escape(`打开文件 ${file.path}${file.line ? `:${file.line}` : ""}`)}">${FILE_SVG}<span>${this.parser.parseInline(tokens)}</span></button>`;
+  },
   image({ href, text }) {
-    const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const src = transcriptImageSrc(href);
     if (!src) return escape(text);
     const path = localImagePath(href);
@@ -136,7 +142,8 @@ function withFileReferences(html: string): string {
   const template = document.createElement("template");
   template.innerHTML = html;
 
-  for (const code of template.content.querySelectorAll("code:not(pre code)")) {
+  // Link labels are already file buttons; replacing their code with the bare name would lose the link's directory.
+  for (const code of template.content.querySelectorAll("code:not(pre code):not(a code):not(button code)")) {
     const path = code.textContent?.trim();
     if (path && WHOLE_FILE_REFERENCE_RE.test(path)) code.replaceWith(fileReference(path));
   }
