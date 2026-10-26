@@ -1,6 +1,7 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { createSignal, onCleanup, Show } from "solid-js";
+import { createSignal, onCleanup, onMount, Show } from "solid-js";
+import { Portal } from "solid-js/web";
 import { api } from "../ipc";
 import { openWorkspaceFile } from "../workspaceLinks";
 import { state } from "../store";
@@ -57,16 +58,20 @@ export function createFileContextMenu() {
   const open = (e: MouseEvent, path: string) => {
     e.preventDefault();
     e.stopPropagation();
-    setMenu({
-      x: Math.min(e.clientX, window.innerWidth - 190),
-      y: Math.max(0, Math.min(e.clientY, window.innerHeight - (COPYABLE_IMAGE.test(path) ? 156 : 120))),
-      path: absolutePath(path),
-    });
+    setMenu({ x: e.clientX, y: e.clientY, path: absolutePath(path) });
   };
 
+  // Portal: transcript rows are transformed/contained, which would anchor `position: fixed` to the row
+  // and let later rows paint over the menu.
   const Menu = () => (
-    <Show when={menu()}>
-      <div class="ctx-menu" style={{ left: `${menu()!.x}px`, top: `${menu()!.y}px` }}>
+    <Show when={menu()} keyed>{entry => {
+      let element!: HTMLDivElement;
+      onMount(() => {
+        const { width, height } = element.getBoundingClientRect();
+        element.style.left = `${Math.max(0, Math.min(entry.x, window.innerWidth - width))}px`;
+        element.style.top = `${Math.max(0, Math.min(entry.y, window.innerHeight - height))}px`;
+      });
+      return <Portal><div ref={element} class="ctx-menu" style={{ left: `${entry.x}px`, top: `${entry.y}px` }}>
         <button class="ctx-item" onClick={() => {
           const path = menu()!.path;
           closeMenu();
@@ -107,8 +112,8 @@ export function createFileContextMenu() {
           <IconCopy size={13} />
           复制文件地址
         </button>
-      </div>
-    </Show>
+      </div></Portal>;
+    }}</Show>
   );
 
   return { open, Menu };
