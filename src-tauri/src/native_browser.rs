@@ -140,15 +140,19 @@ struct ScreenshotImage {
     height: f64,
     pixels: (u32, u32),
     delivered: Option<crate::visual_guard::Delivered>,
+    /// Delta IDs use crop-local pixels, while all geometry and guards remain those of the full base.
+    delta: Option<crate::visual_guard::PixelRect>,
 }
 impl ScreenshotImage {
     fn point(&self, x: f64, y: f64) -> Result<(f64, f64), String> {
+        let (ox, oy, width, height) = self.delta.map_or((0., 0., self.pixels.0, self.pixels.1), |r|
+            (r.left as f64, r.top as f64, r.right - r.left, r.bottom - r.top));
         if !x.is_finite() || !y.is_finite() || x < 0. || y < 0.
-            || x >= self.pixels.0 as f64 || y >= self.pixels.1 as f64 {
+            || x >= width as f64 || y >= height as f64 {
             return Err("图片坐标越界，请使用该 imageId 的 pixelWidth/pixelHeight".into());
         }
-        Ok((self.x + x * self.width / self.pixels.0 as f64,
-            self.y + y * self.height / self.pixels.1 as f64))
+        Ok((self.x + (x + ox) * self.width / self.pixels.0 as f64,
+            self.y + (y + oy) * self.height / self.pixels.1 as f64))
     }
 }
 fn webp_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
@@ -177,6 +181,7 @@ fn deliver_screenshot(observation: &mut Observation, previous: Option<&Observati
     image: xcap::image::RgbaImage, path: std::path::PathBuf, (x, y, width, height): (f64, f64, f64, f64)) -> Result<Vec<Value>, String> {
     let page = &observation.pages["pages"][0];
     // Viewports and normal full-page tiles share Jianlai's adaptive-grid delivery. Crops/exports stay standalone.
+    // Actionable retained patches receive stable IDs; their local coordinates still guard against the full base.
     // Match each document tile independently; identical pixel sizes alone do not prove identical coordinates.
     let prior = previous.filter(|p| p.captured.elapsed() <= Duration::from_secs(180) && p.full_page == observation.full_page
         && page["stamp"].is_string() && p.pages["pages"][0]["stamp"] == page["stamp"]
@@ -187,9 +192,31 @@ fn deliver_screenshot(observation: &mut Observation, previous: Option<&Observati
     let pixels = image.dimensions();
     let mut entry = json!({"imageId":id,"snapshotId":observation.id,"x":x,"y":y,"width":width,"height":height,
         "pixelWidth":pixels.0,"pixelHeight":pixels.1,"deltaPolicy":"adaptive-grid"});
-    let (delivered, delta) = crate::visual_guard::deliver_frame(&mut entry, prior, stream, image, None, path.clone())?;
+    let (delivered, mut delta) = crate::visual_guard::deliver_frame(&mut entry, prior, stream, image, None, path.clone())?;
+    let rect = |patch: &Value| Some(crate::visual_guard::PixelRect {
+        left: patch["x"].as_u64()?.try_into().ok()?, top: patch["y"].as_u64()?.try_into().ok()?,
+        right: patch["x"].as_u64()?.checked_add(patch["pixelWidth"].as_u64()?)?.try_into().ok()?,
+        bottom: patch["y"].as_u64()?.checked_add(patch["pixelHeight"].as_u64()?)?.try_into().ok()?,
+    });
+    if let Some(frame) = delivered.as_ref() {
+        for patch in entry["latestDeltas"].as_array_mut().into_iter().flatten().chain(delta.iter_mut()) {
+            let r = rect(patch).ok_or("无效增量截图边界")?;
+            patch["imageId"] = json!(format!("{}-delta-{}-{}-{}", frame.keyframe_id,
+                patch["tileRevision"].as_u64().ok_or("缺少增量版本")?, r.left, r.top));
+            patch["snapshotId"] = json!(observation.id);
+            patch["coordinateSpace"] = json!("image-pixels");
+        }
+    }
     let path = delivered.as_ref().map_or(path, |p| p.keyframe_path.clone());
-    observation.images.push(ScreenshotImage { id, path, x, y, width, height, pixels, delivered });
+    observation.images.push(ScreenshotImage { id, path, x, y, width, height, pixels, delivered: delivered.clone(), delta: None });
+    if let Some(frame) = delivered {
+        for patch in entry["latestDeltas"].as_array().into_iter().flatten().filter(|p| p["readOnly"] != true) {
+            let r = rect(patch).ok_or("无效增量截图边界")?;
+            observation.images.push(ScreenshotImage { id: patch["imageId"].as_str().ok_or("缺少增量 imageId")?.into(),
+                path: patch["path"].as_str().ok_or("缺少增量路径")?.into(), x, y, width, height, pixels,
+                delivered: Some(frame.clone()), delta: Some(r) });
+        }
+    }
     let mut images = vec![entry];
     images.extend(delta);
     Ok(images)
@@ -1115,7 +1142,7 @@ async fn snapshot(
                 std::fs::write(&path,bytes).map_err(|e|e.to_string())?;
                 let image_id=format!("{}-{tile}",observation.id);
                 // The expanded layout differs from the restored page: such tiles are read-only.
-                if expanded.is_none() {observation.images.push(ScreenshotImage{id:image_id.clone(),path:path.clone(),x,y,width:w,height:h,pixels,delivered:None});}
+                if expanded.is_none() {observation.images.push(ScreenshotImage{id:image_id.clone(),path:path.clone(),x,y,width:w,height:h,pixels,delivered:None,delta:None});}
                 images.push(json!({"imageId":image_id,"path":path,"tile":tile,"x":x,"y":y,"width":w,"height":h,"pixelWidth":pixels.0,"pixelHeight":pixels.1}));
             }
             if let Some((viewport_height,complete))=expanded {
@@ -2242,7 +2269,7 @@ mod tests {
     fn dom_refresh_keeps_screenshot_only_for_the_same_viewport() {
         let observed = |id: &str, stamp: Value, shot: bool| Observation { frames: Vec::new(), id: id.into(),
             pages: json!({"pages":[{"stamp":stamp}]}), captured: std::time::Instant::now(), screenshot: shot, full_page: false,
-            images: if shot { vec![ScreenshotImage { id: format!("{id}-0"), path: "a.png".into(), x: 0., y: 0., width: 10., height: 10., pixels: (10, 10), delivered: None }] } else { Vec::new() } };
+            images: if shot { vec![ScreenshotImage { id: format!("{id}-0"), path: "a.png".into(), x: 0., y: 0., width: 10., height: 10., pixels: (10, 10), delivered: None, delta: None }] } else { Vec::new() } };
         let shot = observed("old", json!("[\"u\",0]"), true);
         let mut same = observed("new", json!("[\"u\",0]"), false);
         assert_eq!(carry_screenshot(&mut same, Some(&shot)), Some(vec!["old-0".to_string()]));
@@ -2281,10 +2308,13 @@ mod tests {
         assert_eq!(delta.len(), 2);
         assert!(delta[0]["path"].is_null());
         assert_eq!(delta[1]["deltaOf"], "next-0");
+        assert!(delta[1]["imageId"].as_str().unwrap().starts_with("first-0-delta-1-64-64"));
         assert_eq!((delta[1]["x"].as_u64(), delta[1]["y"].as_u64()), (Some(64), Some(64)));
         assert_eq!(xcap::image::open(delta[1]["path"].as_str().unwrap()).unwrap().width(), 192);
         assert!(!dir.path().join("next.webp").exists(), "no redundant full-image encoding");
         assert_eq!(next.images[0].point(150., 150.).unwrap(), (300., 300.));
+        assert_eq!(next.images[1].point(86., 86.).unwrap(), (300., 300.), "delta IDs accept crop-local pixels");
+        assert!(next.images[1].point(192., 0.).is_err());
         assert_eq!(next.images[0].pixels, (320, 320));
         assert_eq!(next.images[0].delivered.as_ref().unwrap().seen.get_pixel(150, 150), typed.get_pixel(150, 150), "preflight sees the complete current image, not the keyframe or crop");
         let mut unchanged = observed("unchanged");
@@ -2294,6 +2324,8 @@ mod tests {
         assert!(same[0]["path"].is_null());
         assert_eq!(same[0]["latestDeltas"][0]["path"], delta[1]["path"]);
         assert_eq!(same[0]["latestDeltas"][0]["deltaOf"], "unchanged-0");
+        assert_eq!(same[0]["latestDeltas"][0]["imageId"], delta[1]["imageId"], "unchanged patches keep their IDs");
+        assert_eq!(unchanged.images[1].id, delta[1]["imageId"].as_str().unwrap());
         let mut reverted = observed("reverted");
         let restored = deliver(&mut reverted, Some(&unchanged), Some("C1:viewport"), page.clone());
         assert_eq!(restored[1]["x"], delta[1]["x"], "reverts resend only their changed tile");
@@ -2395,6 +2427,9 @@ mod tests {
         assert_eq!(unchanged[0]["latestDeltas"].as_array().unwrap().len(),2);
         assert_eq!(unchanged[0]["latestDeltas"][1]["deltaOf"],"third-0");
         assert_eq!(unchanged[0]["latestDeltas"][1]["path"],patches[2]["path"]);
+        assert_eq!(unchanged[0]["latestDeltas"][0]["imageId"],patches[1]["imageId"]);
+        assert_eq!(unchanged[0]["latestDeltas"][1]["imageId"],patches[2]["imageId"]);
+        assert_eq!(third.images[2].id,patches[2]["imageId"].as_str().unwrap());
         let mut partial = changed.clone();
         partial.put_pixel(140,70,Rgba([255,255,255,255]));
         let mut fourth = observed("fourth", true);
@@ -2406,6 +2441,13 @@ mod tests {
         assert_eq!(retained[0]["readOnly"],true,"partially overwritten patches are reconstruction-only");
         assert_eq!(retained[1]["path"],patches[2]["path"],"unaffected cells stay attached");
         assert_eq!((updated[1]["x"].as_u64(),updated[1]["width"].as_u64()),(Some(64),Some(192)));
+        assert!(fourth.images.iter().all(|image| image.id != patches[1]["imageId"].as_str().unwrap()),
+            "readOnly patches are not actionable in the current snapshot");
+        assert!(fourth.images.iter().any(|image| image.id == patches[2]["imageId"].as_str().unwrap()));
+        let active = fourth.images.iter().find(|image| image.id == updated[1]["imageId"].as_str().unwrap()).unwrap();
+        assert_eq!(active.point(76.,70.).unwrap(),(70.,227.),"new patch coordinates include exactly one offset");
+        assert!(active.delivered.as_ref().unwrap().seen.dimensions() == (512,384),
+            "delta guards retain the complete base image");
         let mut fifth = observed("fifth", true);
         let replaced = deliver(&mut fifth,Some(&fourth),"C1:document:1",(0.,192.,256.,192.),RgbaImage::new(512,384));
         assert_eq!(replaced.len(),1);
@@ -2546,7 +2588,7 @@ mod tests {
 
     #[test]
     fn pixel_crop_mapping_and_action_batches_are_bounded() {
-        let image=ScreenshotImage{id:"image".into(),path:"unused.png".into(),x:100.,y:300.,width:600.,height:400.,pixels:(1200,800),delivered:None};
+        let image=ScreenshotImage{id:"image".into(),path:"unused.png".into(),x:100.,y:300.,width:600.,height:400.,pixels:(1200,800),delivered:None,delta:None};
         assert_eq!(image.point(400.,200.).unwrap(),(300.,400.));
         assert!(image.point(1200.,0.).is_err());assert!(image.point(-1.,0.).is_err());assert!(image.point(f64::NAN,0.).is_err());
         let small=ScreenshotImage{pixels:(300,200),..image};assert_eq!(small.point(100.,50.).unwrap(),(300.,400.));

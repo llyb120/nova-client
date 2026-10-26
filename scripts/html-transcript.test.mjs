@@ -33,9 +33,15 @@ let sourceRoot = root;
 const sourceCommit = execFileSync('git', ['rev-parse', '--verify', `${revision || 'HEAD'}^{commit}`], { cwd: root, encoding: 'utf8' }).trim();
 if (revision) {
   sourceRoot = await mkdtemp(path.join(tmpdir(), 'transcript-revision-'));
-  // Read-only git archive: never stash, checkout, or rewrite the working tree.
-  const archive = execFileSync('git', ['archive', '--format=tar', sourceCommit, 'src'], { cwd: root, maxBuffer: 64 * 1024 * 1024 });
-  execFileSync('tar', ['-x', '-C', sourceRoot], { input: archive });
+  // Read-only git extraction without a platform-specific tar executable: never stash,
+  // checkout, or rewrite the working tree. `show` also preserves binary fixture bytes.
+  const files = execFileSync('git', ['ls-tree', '-r', '--name-only', '-z', sourceCommit, '--', 'src'], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+    .split('\0').filter(Boolean);
+  for (const file of files) {
+    const destination = path.join(sourceRoot, file);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, execFileSync('git', ['show', `${sourceCommit}:${file}`], { cwd: root, maxBuffer: 64 * 1024 * 1024 }));
+  }
 }
 const source = { commit: sourceCommit, revision: revision || null, worktree: !revision };
 let deps;
@@ -149,6 +155,7 @@ function loadItems(ids){
 }
 window.test={
   load(count){replace(Array.from({length:count},(_,i)=>group(i)));},
+  modelSwitch(){replace([{body:[{type:'system',id:1,ts:0,level:'info',text:'模型切换：provider/light → provider/code'}]}],'model-switch');},
   position(){return {top:handle.scrollTop(),max:handle.maxScrollTop()};},
   scrollTop(){return handle.scrollTop();},
   async prepareScroll(kind){
@@ -739,6 +746,19 @@ async function run(browser, renderer, port, report) {
       });
     }
 
+    if (renderer === 'html') await check('model-switch', async () => {
+      await page.evaluate(() => window.test.modelSwitch());
+      await settle();
+      const item = await page.locator('.ht-model-switch').evaluate(element => ({
+        text: element.textContent, title: element.getAttribute('title'), width: element.getBoundingClientRect().width,
+        parentWidth: element.parentElement.getBoundingClientRect().width,
+        fontSize: getComputedStyle(element).fontSize,
+      }));
+      assert.equal(item.text, '↪ code');
+      assert.equal(item.title, '模型切换：provider/light → provider/code');
+      assert.ok(item.width < item.parentWidth / 2 && item.fontSize === '11.5px', 'Model switch should be compact');
+      await screenshot('model-switch');
+    });
     await check('editing', async () => {
     // Exercise the actual editor without submitting a message or invoking the backend.
     await page.evaluate(() => window.test.load(30));

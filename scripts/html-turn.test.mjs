@@ -106,6 +106,9 @@ assert.match(render({ user: { ...user, text: rewritten }, body: [] }, { 'user-sy
 assert.match(render({ user: { ...user, text: '', images: [{ name: 'attached.png', mimeType: 'image/png', data: 'AA==' }] }, body: [] }), /alt="attached.png"/);
 assert.doesNotMatch(render({ body: [{ ...assistant, text: ' None ' }, { ...thought, text: '' }] }), /ht-assistant|ht-thought|ht-process-fold/);
 assert.match(render({ body: [{ id: 8, type: 'system', text: '<script>unsafe</script>', level: 'error', ts: 0 }] }), /&lt;script/);
+const switched = render({ body: [{ id: 9, type: 'system', text: '模型切换：provider/light → provider/code', level: 'info', ts: 0 }] });
+assert.match(switched, /class="ht-system ht-model-switch" title="模型切换：provider\/light → provider\/code">↪ code</);
+assert.doesNotMatch(switched, />模型切换：provider\/light → provider\/code</);
 assert.match(render({ body: [{ ...assistant, text: 'large markdown\n'.repeat(3000) }] }), /ht-large-markdown/);
 assert.match(render({ body: [{ ...assistant, deferred: true }] }), /data-item-id="4"/);
 assert.match(render({ body: [{ ...assistant, deferred: true }] }), /data-history-loading/);

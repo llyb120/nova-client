@@ -274,6 +274,7 @@ function HtmlItems(props: DetailProps & { items: Item[] }) {
 
 function HtmlItem(props: DetailProps & { item: Item; active: boolean }) {
   const text = () => "text" in props.item ? props.item.text : "";
+  const switchedModel = () => text().startsWith("模型切换：") ? text().split(" → ").at(-1)?.split("/").at(-1) : undefined;
   const thoughtKey = () => `thought-${props.item.id}`;
   const thoughtOpen = () => isExpanded(thoughtKey(), props.active);
   return <Switch>
@@ -296,7 +297,9 @@ function HtmlItem(props: DetailProps & { item: Item; active: boolean }) {
     </Match>
     <Match when={props.item.type === "system"}>
       <div class="ht-system-space" data-item-id={props.item.id}>
-        <div class="ht-system" data-level={props.item.type === "system" ? props.item.level : ""}>{text()}</div>
+        <Show when={switchedModel()} fallback={<div class="ht-system" data-level={props.item.type === "system" ? props.item.level : ""}>{text()}</div>}>
+          {model => <div class="ht-system ht-model-switch" title={text()}>↪ {model()}</div>}
+        </Show>
       </div>
     </Match>
   </Switch>;

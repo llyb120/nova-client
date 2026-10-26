@@ -299,7 +299,10 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
 
   function onScroll() {
     const top = host.scrollTop;
-    const user = expectedTop === undefined || Math.abs(top - expectedTop) > 1;
+    // Streaming Markdown can temporarily shrink. The browser then clamps a bottom-pinned
+    // scrollTop to the new, smaller maximum; that native clamp is not a user scroll up.
+    const clampedToBottom = keepBottom && top < lastTop && Math.abs(top - maxScroll()) <= 1;
+    const user = !clampedToBottom && (expectedTop === undefined || Math.abs(top - expectedTop) > 1);
     expectedTop = undefined;
     // Programmatic writes already notified/scheduled their own pass. Native echo
     // must not duplicate that work (keyboard scrolling also gets this event).
