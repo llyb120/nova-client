@@ -34,6 +34,9 @@
   contain: layout style;
 }
 .html-transcript-loading { position: absolute; inset: 24px 34px auto; color: var(--text-faint); font-size: 13px; z-index: 1; }
+/* Fast switches resolve within a few frames: only reveal the loading text once it is a real wait, not a flash. */
+.html-transcript-loading, .html-transcript-empty[aria-busy="true"] { animation: html-transcript-loading-delay 200ms step-end both; }
+@keyframes html-transcript-loading-delay { from { visibility: hidden; } }
 .html-transcript-empty {
   padding: 24px calc(clamp(14px, 3vw, 24px) + 10px);
   color: var(--text-faint);

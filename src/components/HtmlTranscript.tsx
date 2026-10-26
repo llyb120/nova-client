@@ -52,7 +52,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   const unmeasured = new Set<number>();
   const [revision, setRevision] = createSignal(0);
   const [session, setSession] = createSignal({});
-  const [imagesLoading, setImagesLoading] = createSignal(false);
+  const [windowLoading, setWindowLoading] = createSignal(false);
   const [visible, setVisible] = createSignal<number[]>([], {
     equals: (a, b) => a.length === b.length && a.every((value, i) => value === b[i]),
   });
@@ -62,6 +62,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   let windowQueued = false;
   let imageGeneration = 0;
   let imageTimeout: ReturnType<typeof setTimeout> | undefined;
+  let gateCheck: (() => void) | null = null;
   let disposed = false;
   let observer: ResizeObserver | undefined;
   let width = 0;
@@ -212,6 +213,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     updateWindow(host.scrollTop);
     if (changed || expectedTop !== undefined) props.onScroll?.(host.scrollTop, maxScroll(), false);
     if (props.groups.length) traceThreadSwitchLayoutDone(props.threadId, props.groups.length);
+    gateCheck?.();
   }
 
   function schedule() {
@@ -223,31 +225,47 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     firstLayoutQueued = true;
     const generation = ++imageGeneration;
     clearTimeout(imageTimeout);
-    setImagesLoading(false);
+    gateCheck = null;
+    setWindowLoading(false);
     queueMicrotask(() => {
       firstLayoutQueued = false;
       if (disposed || generation !== imageGeneration) return;
       cancelAnimationFrame(frame);
       layout();
-      const images = [...space.querySelectorAll<HTMLImageElement>("img")].filter(image => !image.complete);
-      if (!images.length) return;
-      // Cold images must contribute their real sizes before the first content frame.
-      // Only the mounted window is decoded; a failed/slow image cannot block a session indefinitely.
-      setImagesLoading(true);
+      // Cold images and history still hydrating must contribute their real content before the first
+      // content frame; otherwise a switch paints placeholders, then jumps. Only this initial window is
+      // awaited (later rows never extend it), and a failed/slow load cannot block a session indefinitely.
+      const gated = [...rows.values()];
+      const decoding = new WeakSet<HTMLImageElement>();
+      const waiting = () => {
+        const live = gated.filter(row => row.isConnected);
+        const images = live.flatMap(row => [...row.querySelectorAll("img")]).filter(image => !image.complete);
+        for (const image of images) {
+          if (decoding.has(image)) continue;
+          decoding.add(image);
+          image.loading = "eager";
+          void image.decode().catch(() => {}).then(() => gateCheck?.());
+        }
+        return images.length > 0 || live.some(row => row.querySelector('[data-history-loading][aria-busy="true"]'));
+      };
+      if (!waiting()) return;
+      setWindowLoading(true);
       let finished = false;
       const finish = () => {
         if (finished || disposed || generation !== imageGeneration) return;
         finished = true;
+        gateCheck = null;
         clearTimeout(imageTimeout);
         cancelAnimationFrame(frame);
         // decode resolves before ResizeObserver's delivery. Measure just this
-        // initial window once so its first visible frame has final image sizes.
+        // initial window once so its first visible frame has final sizes.
         for (const index of rows.keys()) { unmeasured.add(index); measurements.delete(index); }
         layout();
-        setImagesLoading(false);
+        setWindowLoading(false);
       };
+      // Hydration re-renders rows and schedules layout(), which re-checks the gate.
+      gateCheck = () => { if (generation === imageGeneration && !waiting()) finish(); };
       imageTimeout = setTimeout(finish, 10_000);
-      void Promise.all(images.map(image => { image.loading = "eager"; return image.decode().catch(() => {}); })).then(finish);
     });
   }
 
@@ -299,7 +317,9 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
 
   function onScroll() {
     const top = host.scrollTop;
-    const user = expectedTop === undefined || Math.abs(top - expectedTop) > 1;
+    // Content shrinking under a programmatic write clamps scrollTop to the new max; that is not a user scroll.
+    const clamped = expectedTop !== undefined && top < expectedTop && maxScroll() - top <= 1;
+    const user = !clamped && (expectedTop === undefined || Math.abs(top - expectedTop) > 1);
     expectedTop = undefined;
     // Programmatic writes already notified/scheduled their own pass. Native echo
     // must not duplicate that work (keyboard scrolling also gets this event).
@@ -489,6 +509,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   onCleanup(() => {
     disposed = true;
     imageGeneration++;
+    gateCheck = null;
     clearTimeout(imageTimeout);
     cancelAnimationFrame(frame);
     observer?.disconnect();
@@ -532,10 +553,10 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   }
 
   return <div ref={host} class="html-transcript" tabindex="0" role="region" aria-label="会话记录" onScroll={onScroll}>
-    <Show when={imagesLoading()}><div class="html-transcript-loading" role="status">正在加载会话…</div></Show>
-    <div ref={space} class="html-transcript-space" aria-busy={imagesLoading()}
-      style={{ height: `${(revision(), heights.total + TOP + BOTTOM)}px`, visibility: imagesLoading() ? "hidden" : undefined }}>
-      <Show when={props.groups.length} fallback={<div class="html-transcript-empty" role="status">{props.loading ? "正在加载会话…" : props.emptyHint}</div>}>
+    <Show when={windowLoading()}><div class="html-transcript-loading" role="status">正在加载会话…</div></Show>
+    <div ref={space} class="html-transcript-space" aria-busy={windowLoading()}
+      style={{ height: `${(revision(), heights.total + TOP + BOTTOM)}px`, visibility: windowLoading() ? "hidden" : undefined }}>
+      <Show when={props.groups.length} fallback={<div class="html-transcript-empty" role="status" aria-busy={props.loading}>{props.loading ? "正在加载会话…" : props.emptyHint}</div>}>
         <Show when={session()} keyed><For each={visible()}>{index => <Row index={index} />}</For></Show>
       </Show>
     </div>
