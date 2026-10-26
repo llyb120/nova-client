@@ -2187,8 +2187,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 <div class="update-channel-status">
                   <span class={`update-channel-dot ${updateChannel()}`} aria-hidden="true" />
                   <div>
-                    <strong>{updateChannel() === "release" ? "正式版通道" : updateChannel() === "develop" ? "开发版通道" : "预发布版通道"}</strong>
-                    <span>{updateChannel() === "release" ? "稳定更新，适合日常使用" : updateChannel() === "develop" ? "跟随 develop 分支的最新构建，可能不稳定" : "优先体验新功能，可能包含未完全验证的改动"}</span>
+                    <strong>{updateChannel() === "release" ? "正式版通道" : "开发版通道"}</strong>
+                    <span>{updateChannel() === "release" ? "稳定更新，适合日常使用" : "跟随 develop 分支的最新构建，可能不稳定"}</span>
                   </div>
                 </div>
                 <div class="seg-control update-channel-control" role="radiogroup" aria-label="更新通道">
@@ -2202,17 +2202,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   >
                     <span>Release</span>
                     <small>正式版</small>
-                  </button>
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={updateChannel() === "pre-release"}
-                    classList={{ active: updateChannel() === "pre-release" }}
-                    disabled={checking()}
-                    onClick={() => void changeUpdateChannel("pre-release")}
-                  >
-                    <span>Pre-release</span>
-                    <small>预发布版</small>
                   </button>
                   <button
                     type="button"

@@ -465,8 +465,8 @@ export interface Settings {
   lyraEnabled: boolean;
   /** worktree 工作目录根（空 = 应用数据目录下 worktrees/） */
   worktreeDir: string;
-  /** 更新通道：正式版或预发布版。 */
-  updateChannel: "release" | "pre-release" | "develop";
+  /** 更新通道：正式版或开发版。 */
+  updateChannel: "release" | "develop";
   /** 是否自动清理长期未更新的会话 */
   sessionAutoCleanupEnabled: boolean;
   /** 自动清理会话的保留时长（小时） */

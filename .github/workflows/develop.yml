@@ -1,19 +1,19 @@
-name: Pre-release / Develop
+name: Develop
 run-name: ${{ github.ref_name }} build
 
 on:
   push:
-    branches: [pre-release, develop]
+    branches: [develop]
 
 env:
-  TAG_PREFIX: ${{ github.ref_name == 'develop' && 'dev-v' || 'pre-v' }}
-  RELEASE_CHANNEL: ${{ github.ref_name }}
+  TAG_PREFIX: dev-v
+  RELEASE_CHANNEL: develop
 
 permissions:
   contents: write
 
 concurrency:
-  group: pre-release-${{ github.ref }}
+  group: develop-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

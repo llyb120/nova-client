@@ -191,7 +191,7 @@ pub struct Settings {
     /// worktree 工作目录的根（空 = 应用数据目录下的 worktrees/）。
     /// 会话开启「在 worktree 中执行」时，在此目录下为其创建独立工作目录。
     pub worktree_dir: String,
-    /// 更新通道：release / pre-release / develop。
+    /// 更新通道：release / develop。
     pub update_channel: String,
     /// 是否自动清理长期未更新的会话。
     pub session_auto_cleanup_enabled: bool,
@@ -279,7 +279,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_path_buf();
         assert_eq!(Settings::load(&dir).update_channel, "release");
-        for channel in ["release", "pre-release", "develop", "unknown"] {
+        for channel in ["release", "develop", "unknown"] {
             let settings = Settings {
                 update_channel: channel.into(),
                 ..Settings::default()
@@ -691,7 +691,7 @@ impl Settings {
                 settings.scene_models.lightweight.push(ModelTarget { agent_kind, model });
             }
         }
-        if !matches!(settings.update_channel.as_str(), "pre-release" | "develop") {
+        if settings.update_channel != "develop" {
             settings.update_channel = "release".into();
         }
         if settings.session_auto_cleanup_hours == 0 {

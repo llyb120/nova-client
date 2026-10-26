@@ -208,7 +208,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # 只看正式通道（v*，排除 pre-v*），按 createdAt 升序取除最新 10 个之外的 release
+          # 只看正式通道（v* 前缀），按 createdAt 升序取除最新 10 个之外的 release
           mapfile -t TO_DELETE < <(gh release list --limit 1000 \
             --json createdAt,tagName \
             --jq 'map(select(.tagName | startswith("v"))) | sort_by(.createdAt) | .[:-10] | .[].tagName')

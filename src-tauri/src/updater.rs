@@ -54,22 +54,20 @@ fn compiled_update_channel() -> &'static str {
 }
 
 fn select_release(value: Value, channel: &str) -> Option<Value> {
-    if channel != "release" {
-        let prefix = if channel == "develop" { "dev-v" } else { "pre-v" };
-        value
-            .as_array()?
-            .iter()
-            .find(|release| {
-                release["prerelease"].as_bool() == Some(true)
-                    && release["draft"].as_bool() != Some(true)
-                    && release["tag_name"]
-                        .as_str()
-                        .is_some_and(|tag| tag.starts_with(prefix))
-            })
-            .cloned()
-    } else {
-        Some(value)
+    if channel == "release" {
+        return Some(value);
     }
+    value
+        .as_array()?
+        .iter()
+        .find(|release| {
+            release["prerelease"].as_bool() == Some(true)
+                && release["draft"].as_bool() != Some(true)
+                && release["tag_name"]
+                    .as_str()
+                    .is_some_and(|tag| tag.starts_with("dev-v"))
+        })
+        .cloned()
 }
 
 fn release_version(release: &Value) -> String {
@@ -77,7 +75,6 @@ fn release_version(release: &Value) -> String {
         .as_str()
         .unwrap_or_default()
         .trim()
-        .trim_start_matches("pre-")
         .trim_start_matches("dev-")
         .trim_start_matches('v')
         .to_string()
@@ -1007,7 +1004,6 @@ fn release_tag_from_feed(feed: &str, channel: &str) -> Option<String> {
         let tag = repository_and_tag.split_once('/')?.1.trim();
         let matches_channel = tag.starts_with(match channel {
             "develop" => "dev-v",
-            "pre-release" => "pre-v",
             _ => "v",
         });
         matches_channel.then(|| tag.to_string())
@@ -1017,7 +1013,6 @@ fn release_tag_from_feed(feed: &str, channel: &str) -> Option<String> {
 fn release_from_tag(tag: &str, channel: &str) -> Option<Value> {
     let version = tag
         .trim()
-        .trim_start_matches("pre-")
         .trim_start_matches("dev-")
         .trim_start_matches('v');
     if version.is_empty() {
@@ -1724,10 +1719,6 @@ mod tests {
             Some("v1.2.3")
         );
         assert_eq!(
-            release_tag_from_feed(feed, "pre-release").as_deref(),
-            Some("pre-v1.2.4")
-        );
-        assert_eq!(
             release_tag_from_feed(feed, "develop").as_deref(),
             Some("dev-v1.2.5")
         );
@@ -1746,7 +1737,6 @@ mod tests {
         ]);
         for (channel, tag, version) in [
             ("release", "v1.2.3", "1.2.3"),
-            ("pre-release", "pre-v1.2.4", "1.2.4"),
             ("develop", "dev-v1.2.5", "1.2.5"),
         ] {
             let input = if channel == "release" {
@@ -1773,7 +1763,7 @@ mod tests {
         }
         assert!(select_release(serde_json::json!([]), "develop").is_none());
         assert!(select_release(serde_json::json!([releases[2]]), "develop").is_none());
-        assert!(select_release(serde_json::json!([releases[4]]), "pre-release").is_none());
+        assert!(select_release(serde_json::json!([releases[1]]), "develop").is_none());
     }
 
     #[test]

@@ -3,7 +3,7 @@ name: Terminal UI regression
 on:
   workflow_dispatch:
   pull_request:
-    branches: [pre-release]
+    branches: [develop]
     paths:
       - 'src/App.tsx'
       - 'src/workspaceLayout.ts'
