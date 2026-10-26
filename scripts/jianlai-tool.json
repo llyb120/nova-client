@@ -181,7 +181,7 @@
       },
       "imageId": {
         "type": "string",
-        "description": "act用顶层最新snapshotId及最终观察中不带frame的图片imageId；仅当前快照恰好一张图时可省略，基图+增量图仍是多图，省略会拒绝输入。坐标取该图片内像素，换图不沿用旧坐标。增量按每屏3×3九宫格检测（边缘格按实际尺寸，每屏每轮最多9块），先横后竖合并相邻变化格：横向连续格先合并，上下同宽连续区域再合并，不跨未变化格。只发本轮变化的区域，不重发未变块。每块有自己的imageId，deltaOf是整屏基图ID，x/y为偏移元数据，pixelWidth/pixelHeight为块尺寸；用该块自己的imageId和图内坐标，工具自动映射偏移/DPI，不手加偏移。未变且未被覆盖的块imageId保持稳定；latestDeltas按tileRevision顺序重建，重叠处以较新块为准。readOnly旧块可能仅部分仍有效，禁止用其坐标操作；操作用非readOnly块或结合基图和块后的整屏坐标，均配最新snapshotId。天蓝剑形指针的剑尖是实际鼠标位置。纯wait可用有效imageId选择要观察的显示器，仅用于观察、不授权输入；无效/旧ID忽略并默认观察可用显示器。"
+        "description": "act用顶层最新snapshotId及最终观察中不带frame的图片imageId；仅当前快照恰好一张图时可省略，基图+增量图仍是多图，省略会拒绝输入。坐标取该图片内像素，换图不沿用旧坐标。增量按每屏64×64像素细网格检测，先横后竖合并相邻变化格成不等大矩形：横向连续格先合并，上下同宽连续区域再合并，不跨未变化格；每屏每轮最多9块，超过9块或变化面积超过约六成改发新基图。只发本轮变化的区域，不重发未变块。每块有自己的imageId，deltaOf是整屏基图ID，x/y为偏移元数据，pixelWidth/pixelHeight为块尺寸；用该块自己的imageId和图内坐标，工具自动映射偏移/DPI，不手加偏移。未变且未被覆盖的块imageId保持稳定；latestDeltas按tileRevision顺序重建，重叠处以较新块为准。readOnly旧块可能仅部分仍有效，禁止用其坐标操作；操作用非readOnly块或结合基图和块后的整屏坐标，均配最新snapshotId。天蓝剑形指针的剑尖是实际鼠标位置。纯wait可用有效imageId选择要观察的显示器，仅用于观察、不授权输入；无效/旧ID忽略并默认观察可用显示器。"
       },
       "feedback": {
         "type": "string",

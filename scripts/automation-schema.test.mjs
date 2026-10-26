@@ -47,10 +47,10 @@ test('Chrome retains image coordinates, fast scope and bounded batch schemas',as
   assert.equal(chrome.inputSchema.properties.actions.maxItems,16);
   assert.equal(chrome.inputSchema.properties.incognito.type,"boolean");
   assert.equal(chrome.inputSchema.properties.actions.items.properties.duration_ms.maximum,1500);
-  assert.match(chrome.inputSchema.properties.fullPage.description,/3×3九宫格.*最多9块.*先横后竖.*不跨未变格/);
+  assert.match(chrome.inputSchema.properties.fullPage.description,/64×64.*先横后竖.*不等大矩形.*不跨未变格.*最多9块.*新关键帧/);
   assert.doesNotMatch(chrome.inputSchema.properties.fullPage.description,/32×32/);
   assert.match(chrome.inputSchema.properties.fullPage.description,/只保留当前关键帧组.*各流独立保留.*压缩后自动补回.*无需read\/recall/);
-  assert.match(chrome.inputSchema.properties.fullPage.description,/deltaOf.*x\/y一次/);
+  assert.match(chrome.inputSchema.properties.fullPage.description,/增量块有自己的imageId.*不手加x\/y/);
   assert.match(chrome.inputSchema.properties.fullPage.description,/expandScroll.*完整独立图片/);
   assert.match(chrome.inputSchema.properties.feedback.description,/openedTabs.*本次由源页新开.*唯一active且可操作.*自动观察.*新的tabTag.*sourceTabTag记录原输入页.*多个、后台或不可操作候选不猜.*按openedTabs选择.*不要把旧页未变化视为点击失败.*feedback=none不自动观察.*按新tabTag\/snapshotId继续，不重放开页动作/);
   assert.match(chrome.inputSchema.properties.fullPage.description,/images\[\]\.unchanged=true.*未重复附图.*本次snapshotId\/imageId.*不代表动作失败.*不重放输入或循环截图/);
@@ -120,7 +120,7 @@ test('Chrome and Jianlai run only executes pre-confirmed steps', async()=>{
   }
 });
 
-test('Jianlai keeps each screen and its nine-grid image context independent', async()=>{
+test('Jianlai keeps each screen and its adaptive-grid image context independent', async()=>{
   const [jianlai, source, nova, provider, context, taskbar] = await Promise.all([
     tool('jianlai'),
     readFile(new URL('../src-tauri/src/jianlai.rs',import.meta.url),'utf8'),
@@ -130,14 +130,14 @@ test('Jianlai keeps each screen and its nine-grid image context independent', as
     readFile(new URL('../src-tauri/src/taskbar_status/windows.rs',import.meta.url),'utf8'),
   ]);
   assert.match(jianlai.description,/不跨屏拼接.*每屏最近基线及增量独立保留.*无需read\/recall/);
-  assert.match(jianlai.inputSchema.properties.imageId.description,/3×3九宫格.*最多9块.*先横后竖/);
+  assert.match(jianlai.inputSchema.properties.imageId.description,/64×64.*先横后竖.*最多9块.*新基图/);
   assert.match(jianlai.inputSchema.properties.feedback.description,/Butterfly.*与Nova是否前台无关/);
   assert.match(jianlai.inputSchema.properties.feedback.description,/images\[\]\.unchanged=true.*未重复附图.*本次snapshotId\/imageId.*不代表动作失败.*不重放输入或循环截图/);
   assert.match(jianlai.inputSchema.properties.feedback.description,/局部操作后也回整屏.*background:true仍反馈原目标/);
   assert.match(jianlai.inputSchema.properties.actions.description,/images\[\]\.frame.*scroll在actions中的0起始下标.*仅供阅读、不参与普通帧流替换或定位/);
   assert.match(jianlai.inputSchema.properties.imageId.description,/顶层最新snapshotId.*最终观察中不带frame/);
   assert.doesNotMatch(source,/"(?:deltaNotice|unchangedNotice|framesNotice|coordinateNotice)"|局部操作后的反馈恢复所属完整屏幕|历史截图仅供阅读，不产生可操作快照/);
-  assert.match(source,/"deltaPolicy":"nine-grid"/);
+  assert.match(source,/"deltaPolicy":"adaptive-grid"/);
   assert.match(source,/resize\(nova_regions::comparison_pixels\(&image, &source_ignored\)\)/);
   assert.match(source,/DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2/);
   assert.doesNotMatch(source,/mod desktop|desktop::compose|context-region/);

@@ -111,20 +111,29 @@ pub(crate) struct DeliveredTile {
 
 pub(crate) const MAX_DELTAS: u8 = 8;
 const TILE: u32 = 32;
+/// `deltaPolicy: adaptive-grid`: fine detection cells, merged into at most this many unequal patches.
+const ADAPTIVE_TILE: u32 = 64;
+const MAX_PATCHES: usize = 9;
 pub(crate) enum Delivery { Unchanged, Delta(Vec<PixelRect>), Keyframe }
 
 /// Send only grid tiles changed since their last delivery. Earlier tiles remain valid independently.
 #[cfg(test)]
 pub(crate) fn plan_delivery(prior: Option<&Delivered>, pixels: &RgbaImage) -> Delivery {
-    plan_grid_delivery(prior, pixels, (TILE, TILE))
+    plan_grid_delivery(prior, pixels, (TILE, TILE), false)
 }
 
-fn plan_grid_delivery(prior: Option<&Delivered>, pixels: &RgbaImage, tile: (u32, u32)) -> Delivery {
+fn plan_grid_delivery(prior: Option<&Delivered>, pixels: &RgbaImage, tile: (u32, u32), capped: bool) -> Delivery {
     let Some(p) = prior.filter(|p| p.seen.dimensions() == pixels.dimensions()) else { return Delivery::Keyframe };
     let Some(changed) = changed_grid(&p.seen, pixels, None, tile) else { return Delivery::Keyframe };
     if !changed.contains(&true) { return Delivery::Unchanged; }
     if p.deltas >= MAX_DELTAS { return Delivery::Keyframe; }
-    Delivery::Delta(merge_grid(&changed, pixels.dimensions(), tile))
+    let blocks = merge_grid(&changed, pixels.dimensions(), tile);
+    // Many fragments or most of the image cost more than one fresh keyframe, which also resets patch history.
+    let area: u64 = blocks.iter().map(|r| u64::from(r.right - r.left) * u64::from(r.bottom - r.top)).sum();
+    if capped && (blocks.len() > MAX_PATCHES || area * 10 > u64::from(pixels.width()) * u64::from(pixels.height()) * 6) {
+        return Delivery::Keyframe;
+    }
+    Delivery::Delta(blocks)
 }
 
 /// Merge horizontal runs, then vertically extend matching runs. Never include an unchanged grid cell.
@@ -214,11 +223,10 @@ pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delive
     let basis = json!([entry["desktopBounds"], entry["originalWidth"], entry["originalHeight"], entry["ignoredRegions"], entry["deltaPolicy"]]);
     let prior = prior.filter(|p| Some(&p.stream) == stream.as_ref() && p.basis == basis);
     let image = annotated.unwrap_or(&plain);
-    // Desktop screens and browser viewport/document streams opt into at most 3×3 cells.
-    let (tw, th) = if entry["deltaPolicy"] == "nine-grid" {
-        (plain.width().div_ceil(3).max(1), plain.height().div_ceil(3).max(1))
-    } else { (TILE, TILE) };
-    match plan_grid_delivery(prior, &plain, (tw, th)) {
+    // Desktop screens and browser viewport/document streams opt into capped adaptive patches.
+    let adaptive = entry["deltaPolicy"] == "adaptive-grid";
+    let (tw, th) = if adaptive { (ADAPTIVE_TILE, ADAPTIVE_TILE) } else { (TILE, TILE) };
+    match plan_grid_delivery(prior, &plain, (tw, th), adaptive) {
         Delivery::Unchanged => {
             let p = prior.unwrap();
             entry["unchanged"] = json!(true);
@@ -386,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn nine_grid_covers_edges_merges_in_order_and_retains_partial_patches() {
+    fn adaptive_grid_covers_edges_merges_in_order_and_caps_patches() {
         use serde_json::json;
         let size = (11, 8);
         let tile = (4, 3);
@@ -401,18 +409,19 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let deliver = |id: &str, prior: Option<&Delivered>, image: RgbaImage| {
-            let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"deltaPolicy":"nine-grid"});
+            let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"deltaPolicy":"adaptive-grid"});
             let (frame, blocks) = deliver_frame(&mut entry, prior, Some("monitor-1".into()), image, None, dir.path().join(format!("{id}.webp"))).unwrap();
             (entry, frame.unwrap(), blocks)
         };
+        let size = (640, 384); // 10×6 cells of 64px
         let mut page = RgbaImage::from_pixel(size.0, size.1, Rgba([255,255,255,255]));
         let (_, base, _) = deliver("base", None, page.clone());
-        for (x,y) in [(0,0),(4,0),(0,3),(4,3),(10,7)] { page.put_pixel(x,y,Rgba([0,0,0,255])); }
+        for (x,y) in [(0,0),(64,0),(0,64),(64,64),(639,383)] { page.put_pixel(x,y,Rgba([0,0,0,255])); }
         let (_, first, blocks) = deliver("first", Some(&base), page.clone());
-        assert_eq!(blocks.len(), 2, "horizontal runs merge vertically only when widths match");
-        assert_eq!(first.tiles[0].rect, PixelRect { left:0, top:0, right:8, bottom:6 });
-        assert_eq!(first.tiles[1].rect, PixelRect { left:8, top:6, right:11, bottom:8 });
-        page.put_pixel(4,0,Rgba([255,255,255,255]));
+        assert_eq!(blocks.len(), 2, "nearby cells merge, distant changes stay separate");
+        assert_eq!(first.tiles[0].rect, PixelRect { left:0, top:0, right:128, bottom:128 });
+        assert_eq!(first.tiles[1].rect, PixelRect { left:576, top:320, right:640, bottom:384 });
+        page.put_pixel(64,0,Rgba([255,255,255,255]));
         let (_, second, blocks) = deliver("second", Some(&first), page.clone());
         assert_eq!(blocks.len(), 1);
         assert!(second.tiles[0].read_only, "partially overwritten patches are reconstruction-only");
@@ -420,17 +429,20 @@ mod tests {
         assert_eq!(second.seen.as_ref(), &page);
         let (same, _, blocks) = deliver("same", Some(&second), page.clone());
         assert!(same["unchanged"] == true && blocks.is_empty());
+        // Ten isolated changes exceed the patch cap: one fresh keyframe, never a dropped change.
+        let mut scattered = page.clone();
+        for (x,y) in (0..5).flat_map(|i| [(i*128+100,200),(i*128+100,328)]) { scattered.put_pixel(x,y,Rgba([0,0,0,255])); }
+        let (entry, _, blocks) = deliver("scattered", Some(&second), scattered);
+        assert!(entry["keyframe"] == true && blocks.is_empty());
         let black = RgbaImage::from_pixel(size.0, size.1, Rgba([0,0,0,255]));
-        let (_, full, blocks) = deliver("full", Some(&second), black);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(full.tiles.len(), 1, "fully overwritten old patches are removed");
+        let (entry, full, blocks) = deliver("full", Some(&second), black);
+        assert!(entry["keyframe"] == true && blocks.is_empty() && full.tiles.is_empty(), "most-of-image changes resend a keyframe");
         for size in [(1,1),(2,2),(641,479)] {
             let blank = RgbaImage::new(size.0,size.1);
             let mut edge = blank.clone();
             edge.put_pixel(size.0-1,size.1-1,Rgba([255,255,255,255]));
-            let grid = (size.0.div_ceil(3).max(1),size.1.div_ceil(3).max(1));
-            let cells = changed_grid(&blank,&edge,None,grid).unwrap();
-            assert!(cells.len() <= 9 && cells.last() == Some(&true));
+            let cells = changed_grid(&blank,&edge,None,(ADAPTIVE_TILE,ADAPTIVE_TILE)).unwrap();
+            assert_eq!(cells.last(), Some(&true), "clipped edge cells are still detected");
         }
     }
 

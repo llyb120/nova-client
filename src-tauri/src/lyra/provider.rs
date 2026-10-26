@@ -3120,7 +3120,7 @@ mod tests {
             }
             if step == 3 { page = RgbaImage::from_pixel(90,90,Rgba([127,127,127,255])); }
             let id = format!("snap-{step}");
-            let mut base = json!({"imageId":"monitor-1","snapshotId":id,"monitorId":1,"deltaPolicy":"nine-grid"});
+            let mut base = json!({"imageId":"monitor-1","snapshotId":id,"monitorId":1});
             let (frame, mut deltas) = crate::visual_guard::deliver_frame(&mut base, prior.as_ref(), Some("monitor-1".into()),
                 page.clone(), None, dir.path().join(format!("{id}.webp"))).unwrap();
             prior = frame;
@@ -3130,7 +3130,7 @@ mod tests {
             let mut images = vec![base];
             images.extend(deltas);
             if step == 0 {
-                let mut other = json!({"imageId":"monitor-2","snapshotId":id,"monitorId":2,"deltaPolicy":"nine-grid"});
+                let mut other = json!({"imageId":"monitor-2","snapshotId":id,"monitorId":2});
                 crate::visual_guard::deliver_frame(&mut other,None,Some("monitor-2".into()),
                     RgbaImage::from_pixel(90,90,Rgba([0,0,255,255])),None,dir.path().join("other.webp")).unwrap();
                 images.push(other);

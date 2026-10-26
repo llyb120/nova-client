@@ -529,7 +529,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
         let encode_started = Instant::now();
-        let mut entry = json!({"imageId":image_id,"width":image.width(),"height":image.height(),"deltaPolicy":"nine-grid",
+        let mut entry = json!({"imageId":image_id,"width":image.width(),"height":image.height(),"deltaPolicy":"adaptive-grid",
             "pixelWidth":image.width(),"pixelHeight":image.height(),
             "snapshotId":id,"capturedAt":captured_at,"stability":stability,
             "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
@@ -1712,7 +1712,7 @@ mod tests {
         let ignored = [PixelRect { left:0, top:0, right:96, bottom:480 },
             PixelRect { left:560, top:400, right:640, bottom:480 }];
         let deliver = |id: &str, prior: Option<&Delivered>, image: &RgbaImage, regions: &[PixelRect]| {
-            let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"ignoredRegions":regions,"deltaPolicy":"nine-grid"});
+            let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"ignoredRegions":regions,"deltaPolicy":"adaptive-grid"});
             let (frame, delta) = crate::visual_guard::deliver_frame(&mut entry, prior, Some("monitor-1".into()),
                 nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.webp"))).unwrap();
             (entry, frame.unwrap(), delta)
@@ -1775,7 +1775,7 @@ mod tests {
             pixels:(320,320), source_pixels:(3840,2160), region:None, delta:None, guard:None, overlay:None, desktop_capture:true };
         let other = Shot { image_id:"monitor-2".into(), surface:Surface{id:2,x:0,y:0,..shot.surface.clone()}, ..shot.clone() };
         let deliver = |shot: &Shot, prior: Option<&Delivered>, name: &str, pixels: RgbaImage| {
-            let mut entry = json!({"imageId":shot.image_id,"snapshotId":name,"deltaPolicy":"nine-grid",
+            let mut entry = json!({"imageId":shot.image_id,"snapshotId":name,"deltaPolicy":"adaptive-grid",
                 "desktopBounds":{"x":shot.surface.x,"y":shot.surface.y,"width":shot.surface.width,"height":shot.surface.height},
                 "originalWidth":shot.source_pixels.0,"originalHeight":shot.source_pixels.1});
             let (frame, delta) = crate::visual_guard::deliver_frame(&mut entry,prior,Some(shot.image_id.clone()),pixels,None,dir.path().join(format!("{name}.webp"))).unwrap();
@@ -1788,23 +1788,23 @@ mod tests {
         let (_, frame, delta) = deliver(&shot,Some(&first),"delta",changed.clone());
         let mut delta = delta.into_iter().next().unwrap();
         let crop = delta_shot(&shot,&frame,"delta",&mut delta).unwrap();
-        assert_eq!((delta["x"].as_u64(),delta["y"].as_u64()),(Some(107),Some(107)));
+        assert_eq!((delta["x"].as_u64(),delta["y"].as_u64()),(Some(128),Some(128)));
         assert_eq!(delta["deltaOf"],shot.image_id);
         assert_eq!(delta["monitorId"],1);
         assert_ne!(delta["imageId"],delta["deltaOf"]);
         // Local delta coordinates map exactly like full-image coordinates, even at fractional scale
         // and with a negative monitor origin. Do not round the crop into source pixels first.
-        for (x,y) in [(0,0),(43,43),(106,106)] {
-            assert_eq!(point(&crop,Some(x),Some(y)).unwrap(),point(&shot,Some(x+107),Some(y+107)).unwrap());
-            assert_eq!(source_point(&crop,x,y),source_point(&shot,x+107,y+107));
+        for (x,y) in [(0,0),(22,22),(63,63)] {
+            assert_eq!(point(&crop,Some(x),Some(y)).unwrap(),point(&shot,Some(x+128),Some(y+128)).unwrap());
+            assert_eq!(source_point(&crop,x,y),source_point(&shot,x+128,y+128));
         }
-        assert_eq!(point(&crop,Some(43),Some(43)).unwrap(),(-1020,406));
-        assert!(point(&crop,Some(107),Some(0)).is_err());
+        assert_eq!(point(&crop,Some(22),Some(22)).unwrap(),(-1020,406));
+        assert!(point(&crop,Some(64),Some(0)).is_err());
         assert!(point(&crop,Some(-1),Some(0)).is_err());
         let drag:Action = serde_json::from_value(json!({"action":"drag","x":1,"y":1,"toX":31,"toY":31})).unwrap();
         assert!(validate(&drag,Some(&crop)).is_ok());
         let zoom=image_region(&crop,Region{x:1,y:2,width:10,height:20}).unwrap();
-        let base_zoom=image_region(&shot,Region{x:108,y:109,width:10,height:20}).unwrap();
+        let base_zoom=image_region(&shot,Region{x:129,y:130,width:10,height:20}).unwrap();
         assert_eq!((zoom.x,zoom.y,zoom.width,zoom.height),(base_zoom.x,base_zoom.y,base_zoom.width,base_zoom.height));
         let shots=vec![shot.clone(),crop.clone()];
         assert!(action_shot(&shots,None).is_err(),"base and delta coordinates are ambiguous without imageId");
@@ -1829,8 +1829,8 @@ mod tests {
         assert_eq!(metadata["latestDeltas"].as_array().unwrap().len(),2);
         let corner=delta_shot(&shot,&frame2,"corner",&mut metadata["latestDeltas"][1]).unwrap();
         assert_ne!(corner.image_id,crop.image_id);
-        assert_eq!(point(&corner,Some(105),Some(105)).unwrap(),point(&shot,Some(319),Some(319)).unwrap());
-        assert!(point(&corner,Some(106),Some(0)).is_err());
+        assert_eq!(point(&corner,Some(63),Some(63)).unwrap(),point(&shot,Some(319),Some(319)).unwrap());
+        assert!(point(&corner,Some(64),Some(0)).is_err());
         let mut partial = metadata["latestDeltas"][0].clone();
         partial["readOnly"] = json!(true);
         assert!(delta_shot(&shot,&frame2,"corner",&mut partial).is_none(), "partially overwritten patches cannot authorize stale coordinates");
