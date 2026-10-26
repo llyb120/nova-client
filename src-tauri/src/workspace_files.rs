@@ -454,6 +454,20 @@ fn open_preview(root: &Path, path: &str) -> Result<Preview, String> {
     if Path::new(path).is_absolute() {
         allow_dropped_files(&[PathBuf::from(path)]);
     }
+    // 相对路径 / 裸文件名在工作区根下不存在时，按唯一后缀匹配在工作区内查找。
+    if !Path::new(path).is_absolute() && !root.join(path).exists() {
+        let rel = path.trim_start_matches("./").replace('/', "\\").to_lowercase();
+        if let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) {
+            let hits: Vec<_> = search_names(root, name)?
+                .entries
+                .into_iter()
+                .filter(|e| e.path.to_lowercase().ends_with(&format!("\\{rel}")))
+                .collect();
+            if let [hit] = hits.as_slice() {
+                return read_preview(root, &hit.path);
+            }
+        }
+    }
     read_preview(root, path)
 }
 
