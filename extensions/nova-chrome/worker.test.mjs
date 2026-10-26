@@ -38,7 +38,7 @@ test('screenshots reveal a minimized window or background tab instead of hanging
   const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},
     tabs:{query:async()=>[tab],get:async()=>({...tab}),update:async(id,props)=>{calls.push(['tab',id,props]);Object.assign(tab,props);},onRemoved:event(),onReplaced:event(),onUpdated:event()},
     windows:{get:async()=>({...win}),update:async(id,props)=>{calls.push(['window',id,props]);win={...win,...props};}},
-    debugger:{attach:async()=>{},sendCommand:async(_t,method)=>{calls.push(['cdp',method]);return {data:'png'};},onEvent:event(),onDetach:event()},
+    debugger:{attach:async()=>{},detach:async()=>{},sendCommand:async(_t,method)=>{calls.push(['cdp',method]);return {data:'png'};},onEvent:event(),onDetach:event()},
     runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
   const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
   runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+
@@ -98,7 +98,7 @@ test('a stuck debugger command times out, polling resumes and late results are n
     extension:{isAllowedIncognitoAccess:async()=>false},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
     tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event(),onUpdated:event()},
-    debugger:{attach:async()=>{},sendCommand:()=>{calls++;return new Promise(resolve=>{finishCommand=resolve;});},onDetach:event(),onEvent:event()},
+    debugger:{attach:async()=>{},detach:async()=>{},sendCommand:()=>{calls++;return new Promise(resolve=>{finishCommand=resolve;});},onDetach:event(),onEvent:event()},
     runtime:{id:'test',onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()},
   };
   const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async(url,options)=>{
@@ -211,7 +211,7 @@ test('multiple Nova instances route replies independently, serialize commands an
     extension:{isAllowedIncognitoAccess:async()=>false},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
     tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event(),onUpdated:event()},
-    debugger:{attach:async()=>{attaches++;},sendCommand:async(_target,_method,params)=>{
+    debugger:{attach:async()=>{attaches++;},detach:async()=>{},sendCommand:async(_target,_method,params)=>{
       peak=Math.max(peak,++active);
       await new Promise(resolve=>setImmediate(resolve));
       active--; return {text:params.text};
@@ -273,19 +273,23 @@ test('after a reload Nova still holds the old clientId: retry soon instead of wa
   assert.equal(polls,3,'409 conflicts are retried without an alarm');
 });
 
-test('incognito permission, window isolation and tab filtering',async()=>{
-  const event=()=>({addListener(){}});let allowed=false,created=[],reloads=0;
+test('incognito permission, window isolation, page reload and tab filtering',async()=>{
+  const event=()=>({addListener(){}});let allowed=false,created=[],reloads=0,tabReloads=0;
   let tabs=[{id:1,windowId:10,url:'https://example.com',incognito:false}];
   const chrome={extension:{isAllowedIncognitoAccess:async()=>allowed},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
-    tabs:{query:async()=>tabs,get:async id=>tabs.find(t=>t.id===id),create:async args=>{created.push(args);return tabs[0];},onRemoved:event(),onReplaced:event(),onUpdated:event()},
+    tabs:{query:async()=>tabs,get:async id=>tabs.find(t=>t.id===id),reload:async()=>{tabReloads++;},create:async args=>{created.push(args);return tabs[0];},onRemoved:event(),onReplaced:event(),onUpdated:event()},
     windows:{getAll:async()=>[{id:20,incognito:true},{id:10,incognito:false}],create:async args=>{created.push(args);const tab={id:2,windowId:20,url:args.url,incognito:args.incognito};tabs.push(tab);return {id:20,tabs:[tab]};}},
     debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event(),reload:()=>reloads++},alarms:{onAlarm:event()}};
   const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async()=>{throw Error('offline');}};
   runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={execute};',scope);
   const run=(operation,args={})=>scope.api.execute({operation,args,expiresAt:Date.now()+3000});
   assert.equal((await run('status')).incognitoAllowed,false);
-  assert.equal((await run('reload')).reloading,true);
+  const listed=await run('tabs');
+  await run('reload',{tabTag:listed.tabs[0].tag});
+  assert.equal(tabReloads,1,'ordinary reload refreshes the page');
+  assert.equal(reloads,0,'ordinary reload never reloads the extension');
+  assert.equal((await run('reload',{extension:true})).reloading,true);
   assert.equal(reloads,0,'reply first, reload after');
   await new Promise(resolve=>setTimeout(resolve,400));
   assert.equal(reloads,1);

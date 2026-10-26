@@ -258,6 +258,9 @@
       let pointerScanned=0,customTargetsTruncated=false;
       for (const root of allRoots) {
         for (const e of root.querySelectorAll(selector)) { if (!seen.has(e)) {seen.add(e);candidates.push(e);} }
+        // File inputs are often visually hidden behind a custom upload button. They still need a
+        // stable ref for DOM.setFileInputFiles; this never opens a native file picker.
+        for (const e of root.querySelectorAll('input[type=file]')) { if (!seen.has(e)) {seen.add(e);candidates.push(e);} }
         // ponytail: O(n) geometry/visibility scan, at most 4000 visible custom nodes; huge DOMs need a spatial index.
         for (const e of root.querySelectorAll('*')) {
           if (e.matches(controlSelector)) continue;
@@ -289,12 +292,12 @@
       for (const e of candidates) {
         // A semantic span wrapping another control is a likely duplicate, as in Vimium's false-positive pass.
         if (e.tagName==='SPAN' && e.querySelector(controlSelector)) continue;
-        const r=e.getBoundingClientRect();
-        const inView=r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth;
-        if (scope==='viewport' && !inView) continue;
-        if (!r.width || !r.height) continue;
+        const r=e.getBoundingClientRect(),fileInput=e.matches('input[type=file]');
+        const inView=fileInput||(r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth);
+        if (!fileInput && scope==='viewport' && !inView) continue;
+        if (!fileInput && (!r.width || !r.height)) continue;
         const visibility=getComputedStyle(e).visibility;
-        if (visibility==='hidden' || visibility==='collapse') continue;
+        if (!fileInput && (visibility==='hidden' || visibility==='collapse')) continue;
         total++;if (items.length >= limit) continue;
         const isDisabled=disabled(e);
         // Cache semantics only, never geometry, hit tests, focus, values or
@@ -411,6 +414,13 @@
         documentSize:{width:Math.max(document.documentElement.scrollWidth,document.body?.scrollWidth||0),height:Math.max(document.documentElement.scrollHeight,document.body?.scrollHeight||0)},
         viewport:{width:innerWidth,height:innerHeight,scrollX,scrollY,minScrollX:getComputedStyle(document.scrollingElement).direction==='rtl'?Math.min(0,innerWidth-document.scrollingElement.scrollWidth):0,devicePixelRatio,scale:visualViewport?.scale||1},
         timingsMs:{observe:performance.now()-started},scannedRoots:allRoots.length};
+    },
+    fileInput(ref,fileCount) {
+      const e=entryFor(ref).e;
+      if(!e.matches('input[type=file]'))throw Error('upload 的 ref 必须指向观察中的 input[type=file]，隐藏文件框也会列出');
+      if(disabled(e))throw Error('文件输入框不可用');
+      if(fileCount>1&&!e.multiple)throw Error('该文件输入框不允许多文件，请只传一个文件');
+      return e;
     },
     async prepare(ref, mode='click') {
       const wheel=mode==='scroll_x'||mode==='scroll_y';

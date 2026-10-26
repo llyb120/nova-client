@@ -23,6 +23,13 @@ struct Session {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct NoProgress {
+    signature: String,
+    stamp: String,
+    attempts: u8,
+}
+
 #[derive(Default)]
 struct BrowserState {
     gate: tokio::sync::Mutex<()>,
@@ -30,6 +37,8 @@ struct BrowserState {
     observations: Mutex<std::collections::HashMap<String, Observation>>,
     /// Last click point refused by the pixel guard, per tab: (url, pageX, pageY).
     guard_misses: Mutex<std::collections::HashMap<String, (String, f64, f64)>>,
+    /// Repeated DOM clicks whose page stamp and URL did not change, per tab.
+    no_progress: Mutex<std::collections::HashMap<String, NoProgress>>,
 }
 
 fn active_label(_app: &AppHandle) -> Result<String, String> {
@@ -457,6 +466,11 @@ enum Action {
         r#ref: String,
         text: String,
     },
+    Upload {
+        frame: usize,
+        r#ref: String,
+        files: Vec<String>,
+    },
     Press {
         key: String,
     },
@@ -489,7 +503,7 @@ fn normalize_action(mut value: Value) -> Value {
     let Some(map) = value.as_object_mut() else { return value };
     if !map.contains_key("action") { if let Some(kind) = map.remove("type").filter(Value::is_string) { map.insert("action".into(), kind); } }
     match map.get("action").and_then(Value::as_str).unwrap_or_default() {
-        "click" | "fill" | "scroll" => { map.entry("frame").or_insert(json!(0)); }
+        "click" | "fill" | "scroll" | "upload" => { map.entry("frame").or_insert(json!(0)); }
         "press" | "wait" | "type" | "move" | "click_at" | "drag" | "scroll_at" => { map.remove("frame"); map.remove("ref"); }
         _ => {}
     }
@@ -502,6 +516,9 @@ fn validate_action(action: &Action) -> Result<(), String> {
             if button.as_deref().is_some_and(|b| !matches!(b, "left"|"right"|"middle")) || click_count.is_some_and(|n| !(1..=2).contains(&n)) { return Err("button 或 click_count 无效".into()); }
         }
         Action::Type { text } | Action::Fill { text, .. } if text.len() > 16000 => return Err("输入过长".into()),
+        Action::Upload { files, .. } if files.is_empty() || files.len() > 8
+            || files.iter().any(|path| path.trim().is_empty() || path.len() > 4096 || path.contains('\0')) =>
+            return Err("upload.files 需为 1–8 个非空文件路径，每个最多 4096 字节".into()),
         Action::Wait { ms } if *ms > 2000 => return Err("wait.ms 必须为 0–2000".into()),
         Action::Scroll { delta, .. } | Action::ScrollAt { delta, .. } if delta.unsigned_abs() > 1200 => return Err("单次滚动不能超过1200像素".into()),
         Action::Press { key } if key_spec(key).is_none() => return Err("不支持的按键".into()),
@@ -519,6 +536,37 @@ fn validate_action(action: &Action) -> Result<(), String> {
     Ok(())
 }
 
+fn click_progress(actions: &[Action], pages: &Value) -> Option<(String, String)> {
+    use std::hash::{Hash, Hasher};
+    let [Action::Click { frame, r#ref, .. }] = actions else { return None; };
+    let page = &pages["pages"][0];
+    let url = page["url"].as_str()?;
+    page["stamp"].as_str()?;
+    // `stamp` only covers navigation/viewport. Include observable DOM evidence as well, otherwise
+    // a menu that legitimately opens and closes would look like three blocked clicks.
+    let mut evidence = std::collections::hash_map::DefaultHasher::new();
+    for key in ["stamp", "text", "visibleText", "items", "tables", "documentSize"] {
+        serde_json::to_string(&page[key]).unwrap_or_default().hash(&mut evidence);
+    }
+    Some((format!("{frame}:{ref}"), format!("{url}\n{:016x}", evidence.finish())))
+}
+
+fn no_progress_notice(result: &mut Value) {
+    result["termination"] = json!("no_progress");
+    result["next"] = json!("同一 DOM 目标已连续三次执行但 URL/页面状态完全不变，停止重复操作；不要重试该动作。检查业务拦截、权限或前置条件，改走不同路径，无法继续时向用户说明未完成原因");
+}
+
+fn upload_paths(root: &Path, files: &[String]) -> Result<Vec<String>, String> {
+    let root = dunce::canonicalize(root).map_err(|e| format!("工作目录不可访问：{e}"))?;
+    files.iter().map(|file| {
+        let path = dunce::canonicalize(root.join(file)).map_err(|_| format!("上传文件不存在或不可访问：{file}"))?;
+        if !path.starts_with(&root) || !path.is_file() {
+            return Err("upload 只允许当前工作目录内的普通文件；不能上传目录、工作目录外路径或经符号链接跳出目录的文件".into());
+        }
+        Ok(path.to_string_lossy().into_owned())
+    }).collect()
+}
+
 fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String> {
     if !args["action"].is_null() && !args["actions"].is_null() { return Err("action 和 actions 不能同时提供：单步仅传 action，多步仅传 actions；删除另一个字段。本批次未执行。".into()); }
     let values = if let Some(values)=args["actions"].as_array() { values.clone() } else { vec![args["action"].clone()] };
@@ -531,7 +579,7 @@ fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String
 fn refs_in(observation:&Observation, actions:&[Action]) -> bool {
     let (mut has_ref, mut field_focus) = (false, false);
     actions.iter().all(|action| match action {
-        Action::Click{r#ref,..}|Action::Fill{r#ref,..}|Action::Scroll{r#ref:Some(r#ref),..} => {
+        Action::Click{r#ref,..}|Action::Fill{r#ref,..}|Action::Upload{r#ref,..}|Action::Scroll{r#ref:Some(r#ref),..} => {
             let item=observation.pages["pages"].as_array().and_then(|pages| pages.iter().filter_map(|p|p["items"].as_array()).flatten().find(|i|i["ref"].as_str()==Some(r#ref.as_str())));
             has_ref=true;
             if matches!(action,Action::Click{..}|Action::Fill{..}) {field_focus=item.is_some_and(|i|i["editable"]==true);}
@@ -545,7 +593,7 @@ fn refs_in(observation:&Observation, actions:&[Action]) -> bool {
 
 fn preflight(observation:&Observation, action:&mut Action, image_id:Option<&str>) -> Result<(),String> {
     match action {
-        Action::Click{frame,r#ref,..}|Action::Fill{frame,r#ref,..}|Action::Scroll{frame,r#ref:Some(r#ref),..}=>{
+        Action::Click{frame,r#ref,..}|Action::Fill{frame,r#ref,..}|Action::Upload{frame,r#ref,..}|Action::Scroll{frame,r#ref:Some(r#ref),..}=>{
             let has=|f:usize| observation.pages["pages"][f]["items"].as_array().is_some_and(|items|items.iter().any(|item|item["ref"].as_str()==Some(r#ref.as_str())));
             if !has(*frame) {
                 // ref 带文档前缀、跨 frame 唯一：模型常照示例填 frame 0，按 ref 实际所在 frame 纠正。
@@ -734,7 +782,7 @@ async fn require_focus(app:&AppHandle, observation:&Observation, index:usize, re
 }
 
 async fn apply(
-    app: &AppHandle, s: &Session, observation: &Observation, action: &Action,
+    app: &AppHandle, root: &Path, s: &Session, observation: &Observation, action: &Action,
     image_id: Option<&str>, progress: &mut InputProgress,
 ) -> Result<(), String> {
     check(app,s)?;
@@ -812,6 +860,25 @@ async fn apply(
             if !focused { return Err("没有已确认的可编辑焦点；请先 click 或使用 fill".into()); }
             check(app,s)?; progress.attempted=true;
             cdp(app,"Input.insertText",json!({"text":text}),None,Some(s.cancel.clone())).await?;
+        }
+        Action::Upload{frame,r#ref,files} => {
+            // Resolve every path before touching the page. Canonicalization also prevents a symlink
+            // inside the workspace from turning this action into an arbitrary local-file read.
+            let files=upload_paths(root,files)?;
+            let frame=observation.frames.get(*frame).ok_or("frame 不在该快照中")?;
+            progress.dom_preflight=true;
+            let node=cdp(app,"Runtime.evaluate",json!({"expression":format!("__novaWebview.fileInput({},{})",json!(r#ref),files.len()),
+                "contextId":frame.context,"returnByValue":false}),frame.session.as_deref(),Some(s.cancel.clone())).await?;
+            if node.get("exceptionDetails").is_some() {
+                return Err(node["exceptionDetails"]["exception"]["description"].as_str()
+                    .or(node["exceptionDetails"]["text"].as_str()).unwrap_or("目标不是可用的文件输入框").into());
+            }
+            let object=node["result"]["objectId"].as_str().ok_or("文件输入框已失效，请重新观察")?;
+            progress.dom_preflight=false;
+            progress.attempted=true;
+            let set=cdp(app,"DOM.setFileInputFiles",json!({"files":files,"objectId":object}),frame.session.as_deref(),Some(s.cancel.clone())).await;
+            let released=cdp(app,"Runtime.releaseObject",json!({"objectId":object}),frame.session.as_deref(),None).await;
+            set?; released?;
         }
         Action::Click{frame,r#ref,..} | Action::Fill{frame,r#ref,..} => {
             progress.dom_preflight=true;
@@ -1405,6 +1472,7 @@ fn evaluation_args(args: &Value) -> Result<(&str, usize), String> {
 
 async fn control_session(
     app: &AppHandle,
+    root: &Path,
     mut s: Session,
     operation: &str,
     args: &Value,
@@ -1448,6 +1516,20 @@ async fn control_session(
         }
         if let Some((_, frame)) = script {
             if observation.frames.get(frame).is_none() { return Err("frame 不在该快照中，请按观察返回的frame执行".into()); }
+        }
+        if let Some((signature, stamp)) = click_progress(&actions, &observation.pages) {
+            let repeated = state.no_progress.lock().unwrap().get(&s.active_tab)
+                .is_some_and(|last| last.attempts >= 3 && last.signature == signature && last.stamp == stamp);
+            if repeated {
+                let mut stopped = inline_summary(&observation.pages, args, None);
+                stopped["snapshotId"] = json!(observation.id);
+                stopped["status"] = json!("not_executed");
+                stopped["completedActions"] = json!(0);
+                stopped["inputAttempted"] = json!(false);
+                stopped["reason"] = json!("已因同一目标连续无进展而停止，本批次未执行");
+                no_progress_notice(&mut stopped);
+                return Ok(stopped);
+            }
         }
         // Compare inventories, not foreground focus: unrelated/user-created tabs must never become our target.
         let opens_tab = |action: &Action| matches!(action, Action::Click{..} | Action::ClickAt{..} | Action::Press{..});
@@ -1493,7 +1575,7 @@ async fn control_session(
         }
         for (index, action) in actions.iter().enumerate() {
             let began=std::time::Instant::now();
-            let applied=apply(app,&s,&observation,action,args["imageId"].as_str(),&mut progress).await;
+            let applied=apply(app,root,&s,&observation,action,args["imageId"].as_str(),&mut progress).await;
             action_timings.push(began.elapsed().as_millis());
             match applied {
                 Ok(())=>progress.completed+=1,
@@ -1558,12 +1640,15 @@ async fn control_session(
         }
         // Capturing the source would reactivate it over the popup. Observe a proven new target
         // after releasing this session's gate; ambiguous targets return only the new-tab inventory.
-        if opened.is_empty() && (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
+        // Even feedback=none must refresh the consumed snapshot: otherwise the next evaluate/act
+        // is guaranteed to fail on the pre-action ID. None suppresses observation content, not the
+        // fresh snapshotId needed to continue safely.
+        if opened.is_empty() && !s.cancel.load(Ordering::SeqCst) {
             let mut feedback_args = args.clone();
             feedback_args["fullPage"] = json!(false);
             feedback_args["__delta"] = json!(failure.is_none() && script.is_none());
             if let Some(args)=feedback_args.as_object_mut() {for key in ["ref","frame","region"] {args.remove(key);} }
-            if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
+            if matches!(args["feedback"].as_str(),Some("inspect"|"none")) {feedback_args["visual"]=json!("none");}
             // Occlusion cannot be explained by an unchanged DOM delta; show the blocker.
             let visual=args["feedback"]=="screenshot" || (args["feedback"].is_null() && observation.screenshot)
                 || failure.as_deref().is_some_and(|reason| reason.contains("目标被遮挡"));
@@ -1572,9 +1657,34 @@ async fn control_session(
             // checks in deliver_screenshot still reset the group after navigation or viewport changes.
             match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,
                 if script.is_none() || visual { Some(&observation) } else { None })).await {
+                Ok(Ok((_, feedback))) if args["feedback"] == "none" => {
+                    result["snapshotId"] = feedback["snapshotId"].clone();
+                    result["snapshotRefreshed"] = json!(true);
+                }
                 Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
                 Ok(Err(error)) => result["observationError"] = json!(error),
                 Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
+            }
+        }
+        // Jianlai's completion rule is evidence-based: an executed input is not business success.
+        // Add a hard stop for the special case of the same DOM click producing no observable state
+        // change three times; scrolling, waiting, coordinates and changing pages are never counted.
+        if let Some(after) = state.observations.lock().unwrap().get(&s.active_tab).cloned() {
+            let before_key = click_progress(&actions, &observation.pages);
+            let after_key = click_progress(&actions, &after.pages);
+            let unchanged = failure.is_none() && progress.completed == actions.len()
+                && before_key.as_ref().is_some_and(|before| Some(before) == after_key.as_ref());
+            let mut tracker = state.no_progress.lock().unwrap();
+            if unchanged {
+                let (signature, stamp) = before_key.unwrap();
+                let entry = tracker.entry(s.active_tab.clone()).or_insert(NoProgress { signature: signature.clone(), stamp: stamp.clone(), attempts: 0 });
+                if entry.signature != signature || entry.stamp != stamp {
+                    *entry = NoProgress { signature, stamp, attempts: 0 };
+                }
+                entry.attempts = entry.attempts.saturating_add(1);
+                if entry.attempts >= 3 { no_progress_notice(&mut result); }
+            } else {
+                tracker.remove(&s.active_tab);
             }
         }
         // Read after feedback so pages that write the clipboard asynchronously have finished.
@@ -1937,7 +2047,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
             if args["url"].is_string() { target = value["tabTag"].as_str().map(str::to_owned); }
         }
         if let (Some(tag), false) = (target, observe == "none") {
-            let observed = observe_tab(app, &thread_id, &tag, &observe_args, observe, Duration::from_secs(8)).await;
+            let observed = observe_tab(app, root, &thread_id, &tag, &observe_args, observe, Duration::from_secs(8)).await;
             value.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
             value["tabTag"] = json!(tag);
             value["browser"] = json!("chrome");
@@ -1980,7 +2090,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
         if mutating { retire_desktop(&mut value); }
         // Navigation returns the loaded page directly: no separate inspect round-trip.
         if matches!(operation, "select_tab" | "goto" | "back" | "forward" | "reload") && observe != "none" {
-            let observed = observe_tab(app, &thread_id, tag, args, observe, Duration::from_secs(8)).await;
+            let observed = observe_tab(app, root, &thread_id, tag, args, observe, Duration::from_secs(8)).await;
             value.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
             value["tabTag"] = json!(tag);
             value["browser"] = json!("chrome");
@@ -1990,7 +2100,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     if !matches!(operation, "inspect" | "screenshot" | "act" | "evaluate") {
         return Err("未知 chrome 操作".into());
     }
-    let mut value = control_session(app, chrome_session(&thread_id, tag), operation, args).await?;
+    let mut value = control_session(app, root, chrome_session(&thread_id, tag), operation, args).await?;
     if matches!(operation, "act" | "evaluate") && value["status"] != "not_executed" { retire_desktop(&mut value); }
     value["tabTag"] = json!(tag);
     value["browser"] = json!("chrome");
@@ -1999,7 +2109,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
             let mode = if args["feedback"] == "screenshot" { "screenshot" } else { "inspect" };
             let mut observe_args = args.clone();
             if mode == "inspect" { observe_args["visual"] = json!("none"); }
-            let observed = observe_tab(app, &thread_id, &target, &observe_args, mode, Duration::from_secs(8)).await;
+            let observed = observe_tab(app, root, &thread_id, &target, &observe_args, mode, Duration::from_secs(8)).await;
             value.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
             value["tabTag"] = json!(target);
         }
@@ -2082,7 +2192,7 @@ async fn wait_for_tab_load(app: &AppHandle, tag: &str, budget: Duration) -> Valu
 /// Observe a tab right after a navigation-style operation so the caller gets snapshotId/DOM in
 /// the same reply. Load waits and "not ready" retries share one bounded budget; observation
 /// failure is reported alongside the completed operation, never as an operation failure.
-async fn observe_tab(app: &AppHandle, thread_id: &str, tag: &str, args: &Value, mode: &str, budget: Duration) -> Value {
+async fn observe_tab(app: &AppHandle, root: &Path, thread_id: &str, tag: &str, args: &Value, mode: &str, budget: Duration) -> Value {
     let started = std::time::Instant::now();
     let mut result = json!({"load": wait_for_tab_load(app, tag, budget).await});
     if result["load"]["status"] == "closed" {
@@ -2095,7 +2205,7 @@ async fn observe_tab(app: &AppHandle, thread_id: &str, tag: &str, args: &Value, 
         if let Some(value) = args.get(key).filter(|v| !v.is_null()) { observe_args[key] = value.clone(); }
     }
     loop {
-        match control_session(app, chrome_session(thread_id, tag), mode, &observe_args).await {
+        match control_session(app, root, chrome_session(thread_id, tag), mode, &observe_args).await {
             Ok(observed) => {
                 result.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
                 result["observed"] = json!(mode);
@@ -2647,6 +2757,39 @@ mod tests {
         assert!(matches!(parse_action(r#"{"action":"click","ref":"v1:0"}"#), Ok(Action::Click { frame: 0, .. })));
         assert!(matches!(parse_action(r#"{"type":"fill","ref":"v1:0","text":"x"}"#), Ok(Action::Fill { frame: 0, .. })));
         assert_eq!(parse_actions(&json!({"action":"{\"action\":\"wait\",\"ms\":10}"}), 8).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn uploads_stay_inside_the_workspace_and_accept_file_input_refs() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(root.path().join("report.txt"), b"ok").unwrap();
+        std::fs::create_dir(root.path().join("folder")).unwrap();
+        let paths = upload_paths(root.path(), &["report.txt".into()]).unwrap();
+        assert_eq!(paths, vec![dunce::canonicalize(root.path().join("report.txt")).unwrap().to_string_lossy().into_owned()]);
+        assert!(upload_paths(root.path(), &[outside.path().to_string_lossy().into_owned()]).is_err());
+        assert!(upload_paths(root.path(), &["../outside.txt".into()]).is_err());
+        assert!(upload_paths(root.path(), &["folder".into()]).is_err());
+        assert!(matches!(parse_action(r#"{"action":"upload","ref":"v1:0","files":["report.txt"]}"#),
+            Ok(Action::Upload { frame: 0, .. })));
+        assert!(parse_action(r#"{"action":"upload","ref":"v1:0","files":[]}"#).is_err());
+        let schema = crate::chrome_browser::tool_definition();
+        assert!(schema["inputSchema"]["properties"]["action"]["properties"]["action"]["enum"].as_array().unwrap().contains(&json!("upload")));
+    }
+
+    #[test]
+    fn no_progress_stop_is_explicit_and_does_not_claim_business_failure() {
+        let mut result = json!({"status":"executed"});
+        no_progress_notice(&mut result);
+        assert_eq!(result["status"], "executed");
+        assert_eq!(result["termination"], "no_progress");
+        assert!(result["next"].as_str().unwrap().contains("停止重复操作"));
+        let actions = vec![parse_action(r#"{"action":"click","ref":"a:1"}"#).unwrap()];
+        let pages = json!({"pages":[{"url":"https://example.com","stamp":"same"}]});
+        let before = click_progress(&actions, &pages).unwrap();
+        assert_eq!(before.0, "0:a:1");
+        let changed = json!({"pages":[{"url":"https://example.com","stamp":"same","text":"业务已完成"}]});
+        assert_ne!(before.1, click_progress(&actions, &changed).unwrap().1);
     }
 
     #[test]

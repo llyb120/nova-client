@@ -57,6 +57,25 @@ try {
     await call('evaluate',"document.querySelector('.nova-req-annot').remove()",obs.document,obs.url);
     assert.equal(await page.locator('.nova-req-annot').count(),0);
   });
+  await run('hidden file inputs keep refs and accept CDP files without a picker',async()=>{
+    const obs=await fixture('<input aria-label="Attachment" type="file" style="display:none"><input aria-label="Many" type="file" multiple style="display:none">');
+    const one=target(obs,'Attachment'),many=target(obs,'Many');
+    assert.equal(one.tag,'input');
+    const resolve=async item=>{
+      const r=await cdp.send('Runtime.evaluate',{expression:`__novaWebview.fileInput(${JSON.stringify(item.ref)},1)`,contextId:world,returnByValue:false});
+      assert.equal(r.exceptionDetails,undefined);return r.result.objectId;
+    };
+    await writeFile('/tmp/nova-upload-one.txt','one');
+    await writeFile('/tmp/nova-upload-two.txt','two');
+    const objectId=await resolve(one);
+    await cdp.send('DOM.setFileInputFiles',{objectId,files:['/tmp/nova-upload-one.txt']});
+    assert.equal(await page.locator('input').first().evaluate(e=>e.files[0].name),'nova-upload-one.txt');
+    const multi=await cdp.send('Runtime.evaluate',{expression:`__novaWebview.fileInput(${JSON.stringify(many.ref)},2)`,contextId:world,returnByValue:false});
+    await cdp.send('DOM.setFileInputFiles',{objectId:multi.result.objectId,files:['/tmp/nova-upload-one.txt','/tmp/nova-upload-two.txt']});
+    assert.equal(await page.locator('input').nth(1).evaluate(e=>e.files.length),2);
+    const rejected=await cdp.send('Runtime.evaluate',{expression:`__novaWebview.fileInput(${JSON.stringify(one.ref)},2)`,contextId:world,returnByValue:false});
+    assert.match(rejected.exceptionDetails.exception.description,/不允许多文件/);
+  });
   await run('trusted wheel reaches nested button-filled panes on both axes and RTL',async()=>{
     for(const horizontal of [false,true])for(const rtl of horizontal?[false,true]:[false]) {
       const obs=await fixture(`<aside aria-label="Results pane" style="width:240px;height:160px;overflow:auto;direction:${rtl?'rtl':'ltr'}"><button style="box-sizing:border-box;width:${horizontal?"1200px":"100%"};height:${horizontal?"100%":"900px"}" onclick="window.clicks++">Records</button></aside><script>window.clicks=0</script>`);
