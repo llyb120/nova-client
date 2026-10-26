@@ -7,7 +7,7 @@
   overflow-x: hidden;
   overflow-y: auto;
   overflow-anchor: none;
-  overscroll-behavior: contain;
+  overscroll-behavior: none;
   scrollbar-gutter: stable;
   color: var(--canvas-text, var(--text));
   /* Use the same brighter foreground as the former canvas, including nested Markdown. */
@@ -17,7 +17,6 @@
   --text-faint: var(--canvas-text-faint, #6e6e6e);
   outline: none;
 }
-.html-transcript:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
 .html-transcript-space {
   position: relative;
   width: min(calc(100% + var(--transcript-gutter, 0px)), clamp(720px, 78vw, 980px));
