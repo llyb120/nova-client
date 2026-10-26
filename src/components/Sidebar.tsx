@@ -20,7 +20,7 @@ import {
 } from "../store";
 import { sidebarLayout, setSidebarLayout } from "../sidebarLayout";
 import { SessionSearchModal } from "./SessionSearchModal";
-import { agentLabel, agentShort, isScratch, scratchParent } from "../utils";
+import { isScratch, scratchParent } from "../utils";
 import {
   IconBell,
   IconBroadcast,
@@ -405,10 +405,7 @@ export function Sidebar(props: {
       return chain;
     });
     const running = () => chainThreads().some((thread) => !!state.running[thread.id]);
-    // 运行状态直接标在模型徽标上（发光 + 流线扫圈），不再占用右侧文字空间
-    const runChild = () => !!(props.mergedChild && state.running[props.mergedChild.id]);
-    const runSelf = () => running() && !runChild();
-    // 链上任一会话有未读的新轮次结论 → 在模型徽标右上角显示未读数
+    // 链上任一会话有未读的新轮次结论 → 在会话行右侧显示未读数
     const unreadCount = () =>
       active()
         ? 0
@@ -464,33 +461,6 @@ export function Sidebar(props: {
             └
           </span>
         </Show>
-        <span
-          class={`thread-agent ${t.agentKind}`}
-          classList={{ running: runSelf(), unread: unreadCount() > 0 && !runChild() }}
-          title={`Wake · ${agentLabel(t.agentKind)}`}
-        >
-          {agentShort(t.agentKind)}
-          <Show when={unreadCount() > 0 && !runChild()}>
-            <span class="thread-unread-badge">
-              {unreadCount() > 9 ? "9+" : unreadCount()}
-            </span>
-          </Show>
-        </span>
-        <Show when={props.mergedChild}>
-          <span class="thread-pair-arrow">→</span>
-          <span
-            class={`thread-agent ${props.mergedChild!.agentKind}`}
-            classList={{ running: runChild(), unread: unreadCount() > 0 && runChild() }}
-            title={`Do · ${agentLabel(props.mergedChild!.agentKind)}`}
-          >
-            {agentShort(props.mergedChild!.agentKind)}
-            <Show when={unreadCount() > 0 && runChild()}>
-              <span class="thread-unread-badge">
-                {unreadCount() > 9 ? "9+" : unreadCount()}
-              </span>
-            </Show>
-          </span>
-        </Show>
         <span class="thread-content">
           <TypewriterText
             class="thread-title"
@@ -520,9 +490,19 @@ export function Sidebar(props: {
             预检 · {props.childCount}
           </span>
         </Show>
+        <Show when={activeThread().autoScene && !activeThread().employeeThread}>
+          <span class="agent-badge auto-mode-badge" title="自动模式会话：可按任务切换场景模型，失败时切换备用模型">
+            自动
+          </span>
+        </Show>
         <Show when={t.ephemeral}>
           <span class="thread-ephemeral" title="临时会话：程序关闭时自动删除">
             临时
+          </span>
+        </Show>
+        <Show when={unreadCount() > 0}>
+          <span class="thread-unread-badge">
+            {unreadCount() > 9 ? "9+" : unreadCount()}
           </span>
         </Show>
         <Show when={running()} fallback={<span class="thread-time">{fmtTime(updatedAt())}</span>}>

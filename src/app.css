@@ -729,14 +729,6 @@ button {
 .thread-item.history-time {
   height: 42px;
 }
-/* 两行布局下模型徽标放大到两行内容的高度，成小方块主图标 */
-.thread-item.history-time .thread-agent {
-  width: 22px;
-  height: 22px;
-  line-height: 22px;
-  font-size: 12px;
-  border-radius: 6px;
-}
 .thread-history-meta {
   display: block;
   min-width: 0;
@@ -798,25 +790,7 @@ button {
   border: 1px solid var(--border-light);
 }
 
-/* 侧栏会话徽标移到最左侧，单字母 C/D 紧凑方块（设置弹窗里的 .tm-row 仍用全称，不受影响） */
-.thread-item .thread-agent {
-  width: 18px;
-  padding: 0;
-  text-align: center;
-  font-size: 11px;
-}
-
-.thread-pair-arrow {
-  flex-shrink: 0;
-  margin: 0 -4px;
-  color: var(--text-faint);
-  font-size: 10px;
-}
-
-/* 未读新轮次结论：徽标右上角数字角标（stage 链多次完成会累计） */
-.thread-item .thread-agent.unread {
-  position: relative;
-}
+/* 未读新轮次结论：角标数字（stage 链多次完成会累计） */
 .thread-unread-badge {
   position: absolute;
   top: -6px;
@@ -837,6 +811,11 @@ button {
   pointer-events: none;
   z-index: 1;
 }
+/* 侧栏不显示后端徽标，未读数改为行内展示。 */
+.thread-item .thread-unread-badge {
+  position: static;
+  flex-shrink: 0;
+}
 
 .thread-agent.codex,
 .agent-badge.codex {
@@ -850,6 +829,12 @@ button {
   color: var(--tea);
   border-color: color-mix(in srgb, var(--tea) 40%, transparent);
   background: color-mix(in srgb, var(--tea) 14%, transparent);
+}
+
+.auto-mode-badge {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
 }
 
 .thread-ephemeral {

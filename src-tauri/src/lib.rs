@@ -848,6 +848,7 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
             subagent: t.subagent,
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
+            auto_scene: t.auto_scene.clone(),
             active_clue_card_id: t.active_clue_card_id.clone(),
         })
         .collect();

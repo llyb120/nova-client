@@ -1005,6 +1005,9 @@ pub struct ThreadMeta {
     /// /stage 引用的源会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_source_thread_id: Option<String>,
+    /// 自动模式标记随会话列表返回，供界面区分普通会话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_scene: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_clue_card_id: Option<String>,
 }
