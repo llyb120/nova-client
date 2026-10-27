@@ -305,10 +305,13 @@ pub fn refresh(app: &AppHandle, thread: &str) {
         loop {
             if let Some((prompt, key)) = build_refresh(&app, &thread) {
                 emit(json!({"kind": "refreshing", "threadId": thread, "on": true}));
-                let result = crate::lyra::run_oneshot(&reqwest::Client::new(), &json!({"action": "generate", "model": light_model(), "prompt": prompt}), None).await;
-                if let Some(Value::Object(all)) = result.as_ref().ok().and_then(Value::as_str).and_then(lenient_object) {
-                    // 失败不记指纹，下次触发时重试。
-                    let _ = apply_refresh(&thread, all, key, session_value(&app, &thread));
+                // 失败不记指纹；轻量模型偶发失败时立即再试一次，免得看板空着等用户切换会话才重新触发。
+                for _ in 0..2 {
+                    let result = crate::lyra::run_oneshot(&reqwest::Client::new(), &json!({"action": "generate", "model": light_model(), "prompt": prompt}), None).await;
+                    if let Some(Value::Object(all)) = result.as_ref().ok().and_then(Value::as_str).and_then(lenient_object) {
+                        let _ = apply_refresh(&thread, all, key, session_value(&app, &thread));
+                        break;
+                    }
                 }
             }
             let again = with_refresh(&thread, |s| {

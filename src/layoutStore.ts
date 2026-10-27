@@ -36,9 +36,13 @@ export const [layoutState, setLayoutState] = createStore<{
   presets: LayoutPreset[];
 }>({ byThread: {}, presets: [] });
 
+const fetchSeq: Record<string, number> = {};
 async function fetchState(threadId: string) {
+  const seq = (fetchSeq[threadId] = (fetchSeq[threadId] ?? 0) + 1);
   try {
     const got = await cmd<ThreadLayouts & { presets: LayoutPreset[] }>("get", { threadId });
+    // 较早发出的读取若晚于数据事件返回，会把看板数据回退成旧值，只认最新一次。
+    if (seq !== fetchSeq[threadId]) return;
     if (threadId) setLayoutState("byThread", threadId, reconcile({ active: got.active, layouts: got.layouts }));
     setLayoutState("presets", reconcile(got.presets));
   } catch {
@@ -80,6 +84,7 @@ export function initLayoutEvents() {
       // 只推数据：直接打补丁，不重取整份 HTML。
       const index = layoutState.byThread[threadId]?.layouts.findIndex((l) => l.id === layoutId) ?? -1;
       if (index < 0) return void fetchState(threadId);
+      fetchSeq[threadId] = (fetchSeq[threadId] ?? 0) + 1; // 作废还在路上的旧读取
       setLayoutState("byThread", threadId, "layouts", index, "data", reconcile(data ?? {}));
       if (active) setLayoutState("byThread", threadId, "active", active);
     } else if (kind === "presets") {

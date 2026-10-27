@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, lazy, onCleanup, Show, Suspense, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, For, lazy, onCleanup, Show, Suspense } from "solid-js";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   layoutApi, layoutRefreshing, layoutState, layoutSrcdoc, layoutTabOpen, loadLayouts, presetsOpen, setPresetsOpen, showLayouts,
@@ -101,25 +101,14 @@ function LayoutColumn(props: { threadId: string; layout: LayoutItem }) {
   let frame: HTMLIFrameElement | undefined;
   const act = (run: () => Promise<unknown>) => void run().catch(() => {});
 
-  // 页面已烘焙了载入时的数据：之后只有数据真的变了才推送，避免无谓重绘。
-  let shown = "";
-  let ready = false;
-  const srcdoc = createMemo(() => {
-    const html = props.layout.html;
-    shown = JSON.stringify(untrack(() => props.layout.data));
-    ready = false;
-    return layoutSrcdoc(html);
-  });
-  const post = () => {
-    const json = JSON.stringify(props.layout.data);
-    if (!ready || json === shown) return;
-    shown = json;
-    frame?.contentWindow?.postMessage({ type: "nova-layout-data", data: JSON.parse(json) }, "*");
-  };
+  // 页面烘焙的数据可能落后于 store（get 与数据事件交错），所以不做去重/就绪门闩：
+  // 数据变化时直接推送，页面每次就绪时再无条件推送一次（推给未加载完的文档只会被丢弃）。
+  const srcdoc = createMemo(() => layoutSrcdoc(props.layout.html));
+  const post = () => frame?.contentWindow?.postMessage({ type: "nova-layout-data", data: JSON.parse(JSON.stringify(props.layout.data)) }, "*");
   createEffect(post);
   const postTheme = () => frame?.contentWindow?.postMessage({ type: "nova-layout-theme", theme: themePayload() }, "*");
   const onMessage = (event: MessageEvent) => {
-    if (event.source === frame?.contentWindow && event.data?.type === "nova-layout-ready") { ready = true; postTheme(); post(); }
+    if (event.source === frame?.contentWindow && event.data?.type === "nova-layout-ready") { postTheme(); post(); }
   };
   onCleanup(watchTheme(postTheme));
   window.addEventListener("message", onMessage);
