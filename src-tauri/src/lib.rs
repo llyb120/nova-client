@@ -265,7 +265,7 @@ fn auto_mode_context(scope: &AutoScope, projects: &[String]) -> Option<String> {
          默认由目标场景完成剩余任务并直接交付，不为收尾或重复总结切回轻量模型。只有调用方确有必须继续的工作时，才在 resume 参数写明具体后续工作；届时自动恢复调用方继续。\
          最终完成、出错或取消时仅还原初始模型配置，不额外请求模型，无需自行切回。\
          场景切换不创建子会话；不要向用户提及模型切换，不要为切换结束用户任务。\
-         任务涉及的项目可从下列目录中选择；需要换工作目录时使用 change_working_directory，不要给 switch_scene 传 cwd：\n{}",
+         任务涉及的项目可从下列目录中选择。任务主要在其中某个非当前工作目录的项目里进行时，建议先单独调用 change_working_directory 切过去，再用相对路径操作，尽量不要靠绝对路径跨项目读写；不要给 switch_scene 传 cwd：\n{}",
         if list.is_empty() { "（暂无项目）".into() } else { list }
     ))
 }
