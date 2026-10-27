@@ -773,11 +773,22 @@ fn check_overlay(shot: &Shot, action: &Action, current: Option<crate::taskbar_st
 
 // after_input: earlier actions of this batch already changed the screen, so only the target's core is compared.
 fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, after_input:bool, overlay:Option<crate::taskbar_status::Rect>) -> Result<()> {
+    guard_target_moving(shot,action,image,None,after_input,overlay)
+}
+// Live capture: a stale verdict may just be a GIF/video near the target, so on failure take a second
+// frame and re-judge with the pixels that moved between the two frames masked out.
+fn guard_target_live(shot:&Shot, action:&Action, capture:&dyn Fn()->Result<xcap::image::RgbaImage>, after_input:bool, overlay:Option<crate::taskbar_status::Rect>) -> Result<()> {
+    let first=capture()?;
+    let Err(stale)=guard_target(shot,action,&first,after_input,overlay) else {return Ok(());};
+    std::thread::sleep(Duration::from_millis(150));
+    guard_target_moving(shot,action,&capture()?,Some(&first),after_input,overlay).map_err(|_|stale)
+}
+fn guard_target_moving(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, prev:Option<&xcap::image::RgbaImage>, after_input:bool, overlay:Option<crate::taskbar_status::Rect>) -> Result<()> {
     let exclude = check_overlay(shot, action, overlay)?;
     let Some(guard)=&shot.guard else {return Ok(());};
     let mut points=vec![source_point(shot,action.x.unwrap() as f64+0.5,action.y.unwrap() as f64+0.5)];
     if action.action=="drag" {points.push(source_point(shot,action.to_x.unwrap() as f64+0.5,action.to_y.unwrap() as f64+0.5));}
-    if points.iter().any(|&(x,y)|guard.changed_near_excluding(image,x,y,after_input,exclude)) {
+    if points.iter().any(|&(x,y)|guard.changed_near_moving(image,prev,x,y,after_input,exclude)) {
         return Err("落点附近画面已变化或该区域未随增量更新，停止旧坐标输入；请用返回的新图重新定位，不要原样重试同一坐标；细小目标或ignoredRegions内的目标须使用 regionSpace=image 局部截图".into());
     }
     Ok(())
@@ -804,7 +815,7 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
             return Err("后台窗口已最小化、移动或尺寸改变，请重新截图".into());
         }
         if guarded_pointer(a) && shot.guard.is_some() {
-            guard_target(shot,a,&w.capture_image().map_err(err)?,after_input,overlay)?;
+            guard_target_live(shot,a,&|| w.capture_image().map_err(err),after_input,overlay)?;
             if window_surface(&w)?!=shot.surface {return Err("落点校验期间窗口改变，请重新观察".into());}
         }
     } else if bg {
@@ -813,7 +824,7 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
             return Err("座席已重启或尺寸改变，请重新截图".into());
         }
         if guarded_pointer(a) && shot.guard.is_some() {
-            guard_target(shot, a, &background::seat_grab()?, after_input, overlay)?;
+            guard_target_live(shot, a, &|| background::seat_grab(), after_input, overlay)?;
         }
     } else {
         let monitors = Monitor::all().map_err(err)?;
@@ -827,7 +838,7 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
         }
         if guarded_pointer(a) && shot.guard.is_some() {
             let monitor=monitors.iter().find(|m|m.id().ok()==Some(shot.surface.id)).ok_or("显示器已改变")?;
-            guard_target(shot,a,&monitor.capture_image().map_err(err)?,after_input,overlay)?;
+            guard_target_live(shot,a,&|| monitor.capture_image().map_err(err),after_input,overlay)?;
             if monitor_surface(monitor)?!=shot.surface {return Err("落点校验期间屏幕改变，请重新观察".into());}
         }
     }
