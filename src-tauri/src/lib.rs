@@ -126,6 +126,19 @@ impl AppState {
             .collect()
     }
 
+    /// 自动模式里请求失败的模型自动排到场景末尾并落盘，通知前端同步（避免设置页回写旧顺序）。
+    pub fn demote_scene_model(&self, app: &tauri::AppHandle, scene: settings::Scene, model: &str) {
+        let scenes = {
+            let mut settings = self.settings.lock().unwrap();
+            if !settings.scene_models.demote(scene, model) {
+                return;
+            }
+            settings.save(&self.config_dir);
+            settings.scene_models.clone()
+        };
+        let _ = app.emit("settings:scene-models", scenes);
+    }
+
     pub fn scene_model(&self, scene: settings::Scene) -> Result<(AgentKind, String), String> {
         self.scene_models(scene).into_iter().next().ok_or_else(|| {
             format!("「{}」场景没有可用模型，请在设置 → 场景模型中配置", scene.label())

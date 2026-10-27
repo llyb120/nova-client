@@ -42,7 +42,7 @@ import type {
   UpdateOp,
   UpdateProgress,
 } from "./types";
-import { ALL_AGENT_KINDS, isSupportedAgentKind, SCENES, type ModelTarget, type SceneKey } from "./types";
+import { ALL_AGENT_KINDS, isSupportedAgentKind, SCENES, type ModelTarget, type SceneKey, type SceneModels } from "./types";
 export { ALL_AGENT_KINDS } from "./types";
 import { isScratch, scratchParent } from "./utils";
 import { taskChains } from "./taskChains";
@@ -2954,6 +2954,11 @@ export async function initStore() {
       window.setTimeout(() => {
         setState("titleTyping", id, false);
       }, 3000);
+    }),
+
+    // 自动模式失败的模型被后端降到场景末尾：同步本地设置，避免之后保存设置时回写旧顺序。
+    listen<SceneModels>("settings:scene-models", (event) => {
+      if (state.settings) setState("settings", "sceneModels", event.payload);
     }),
 
     listen("threads:changed", () => {

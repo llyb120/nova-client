@@ -98,6 +98,22 @@ impl SceneModels {
         }
     }
 
+    /// 请求失败的模型自动降到场景列表末尾（用户可在设置里改回）；返回顺序是否变化。
+    pub fn demote(&mut self, scene: Scene, model: &str) -> bool {
+        let list = match scene {
+            Scene::Lightweight => &mut self.lightweight,
+            Scene::Coding => &mut self.coding,
+            Scene::Computer => &mut self.computer,
+        };
+        let Some(index) = list.iter().position(|t| t.agent_kind.trim() == "lyra" && t.model.trim() == model.trim()) else { return false };
+        if index + 1 == list.len() {
+            return false;
+        }
+        let target = list.remove(index);
+        list.push(target);
+        true
+    }
+
     /// 先决条件：三个场景都至少配置一个模型。
     pub fn ready(&self) -> bool {
         Scene::ALL.into_iter().all(|scene| !self.get(scene).is_empty())
@@ -349,6 +365,15 @@ mod tests {
         assert_eq!(std::env::var(&keep).as_deref(), Ok("new"));
         assert!(std::env::var_os(&removed).is_none());
         std::env::remove_var(&keep);
+    }
+
+    #[test]
+    fn demote_moves_failed_model_to_end() {
+        let target = |m: &str| ModelTarget { agent_kind: "lyra".into(), model: m.into() };
+        let mut scenes = super::SceneModels { coding: vec![target("a"), target("b"), target("c")], ..Default::default() };
+        assert!(scenes.demote(Scene::Coding, "a"));
+        assert_eq!(scenes.coding, vec![target("b"), target("c"), target("a")]);
+        assert!(!scenes.demote(Scene::Coding, "a") && !scenes.demote(Scene::Coding, "x"));
     }
 
     #[test]

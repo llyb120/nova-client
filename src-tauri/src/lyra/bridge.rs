@@ -447,7 +447,16 @@ async fn handle_prompt(
     if !desktop {
         tools.retain(|tool| !matches!(tool.name, "jianlai" | "chrome"));
     }
-    let routing = routing.map(|(scene, targets)| crate::lyra::scene::Routing::new(scene, targets, &config_value, &env, system_prompt.clone(), tools.clone()));
+    let routing = routing.map(|(scene, targets)| {
+        let mut routing = crate::lyra::scene::Routing::new(scene, targets, &config_value, &env, system_prompt.clone(), tools.clone());
+        if let Some(app) = app.clone() {
+            routing.on_failed = Some(std::sync::Arc::new(move |scene, model| {
+                use tauri::Manager;
+                app.state::<crate::AppState>().demote_scene_model(&app, scene, model);
+            }));
+        }
+        routing
+    });
     let tool_definitions = json!(tools.iter()
         .map(|tool| json!({ "name": tool.name, "description": tool.description, "parameters": tool.parameters }))
         .collect::<Vec<_>>());

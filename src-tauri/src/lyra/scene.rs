@@ -25,6 +25,11 @@ pub struct Routing {
     active: Scene,
     attempt: usize,
     targets: Vec<(Scene, Vec<Result<Resolved, String>>)>,
+    /// 与 targets 对应的模型名，失败降级时按名字回写设置。
+    names: Vec<(Scene, Vec<String>)>,
+    /// 本轮已请求失败的 (场景, 下标)，fallback 环绕时不再重试。
+    failed: Vec<(Scene, usize)>,
+    pub on_failed: Option<std::sync::Arc<dyn Fn(Scene, &str) + Send + Sync>>,
     stack: Vec<Frame>,
     system_prompt: String,
     tools: Vec<Tool>,
@@ -34,6 +39,7 @@ impl Routing {
     pub fn new(active: Scene, targets: Vec<(Scene, Vec<String>)>, config: &Value, env: &HashMap<String, String>, system_prompt: String, tools: Vec<Tool>) -> Self {
         Self {
             active, attempt: 0, stack: Vec::new(), system_prompt, tools,
+            names: targets.clone(), failed: Vec::new(), on_failed: None,
             targets: targets.into_iter().map(|(scene, models)| (scene, models.into_iter()
                 .map(|model| config::resolve_model(config, (!model.is_empty()).then_some(model.as_str()), env)).collect())).collect(),
         }
@@ -142,7 +148,14 @@ pub fn switch(session: &mut Session, args: &Value) -> ToolOutcome {
 /// 仅切换下一次模型请求，不重放历史工具或新建 Stage。
 pub fn fallback(session: &mut Session) -> bool {
     let Some(mut routing) = session.scenes.take() else { return false };
-    let next = routing.model(routing.active, routing.attempt.checked_add(1).unwrap_or(0)).ok();
+    let active = routing.active;
+    let failed = routing.names.iter().find(|(s, _)| *s == active).and_then(|(_, names)| names.get(routing.attempt)).cloned();
+    if routing.attempt != usize::MAX { routing.failed.push((active, routing.attempt)); }
+    // 先试后面的，再环绕到前面（失败过的已被降到末尾，会话起手模型可能排在最后）。
+    let len = routing.targets.iter().find(|(s, _)| *s == active).map_or(0, |(_, m)| m.len());
+    let start = routing.attempt.checked_add(1).unwrap_or(0);
+    let next = (start..len).chain(0..start.min(len)).filter(|i| !routing.failed.contains(&(active, *i)))
+        .find_map(|i| routing.model(active, i).ok().filter(|(found, _)| *found == i));
     let changed = if let Some((attempt, model)) = next {
         if routing.stack.is_empty() {
             routing.stack.push(Frame {
@@ -154,6 +167,7 @@ pub fn fallback(session: &mut Session) -> bool {
         session.model = model;
         session.tools = routing.tools_for(&session.model);
         configure(session, true);
+        if let (Some(hook), Some(name)) = (&routing.on_failed, &failed) { hook(active, name); }
         true
     } else { false };
     session.scenes = Some(routing);
@@ -208,6 +222,7 @@ mod tests {
         let tools = session.tools.clone();
         Routing {
             active: Scene::Lightweight, attempt: 0, stack: Vec::new(),
+            names: Vec::new(), failed: Vec::new(), on_failed: None,
             targets: vec![(Scene::Coding, vec![Ok(coding)]), (Scene::Computer, vec![Ok(computer)])],
             system_prompt: session.system_prompt.clone(), tools,
         }.install(session);
