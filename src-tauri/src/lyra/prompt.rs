@@ -458,9 +458,7 @@ Take the first option that fully works:
 - Lazy code without its check is unfinished: new non-trivial logic (a branch, a loop, a parser, money or security, or a whole new script or app) leaves one small test or an assert-based self-check. Trivial changes need none.
 - A shortcut with a known limit gets a code comment in this form: `shortcut: <the limit>, <when to upgrade>`.
 
-Never cut: validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs, anything the user asked for.
-
-(Yes, this file also applies to agents working on the ponytail repo itself. Especially to them.)"#;
+Never cut: validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs, anything the user asked for."#;
 
 pub const PONYTAIL_LEVELS: &str = r#"## Levels
 
@@ -514,28 +512,35 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     .into_iter()
     .flatten()
     .collect();
+    let ponytail = ponytail_prompt(options.ponytail, &options.ponytail_level);
     let mut stable: Vec<String> = vec![
-        "你是 Lyra：高效、简单、面向软件工程结果。".into(),
         format!("Available tools:\n{}", tool_lines.join("\n")),
 
         if polaris {
-            "你拥有 Lyra 的原生 read、bash、edit、write 工具。以下工具选择规则是硬性约束。读取内容遵循最小必要原则：已知目标行范围时，只读取相关行段；需要更多上下文时再按需读取相邻行段。需要理解大文件整体结构时改用 polaris。任务涉及跨文件查找或修改（含分析要改哪里）且现有上下文不足时，先调用一次 polaris；已展示且未失效的上下文足够时直接回答或修改，不重复检索；一次调用通常替代 5–10 轮 rg+read 往返。拿不准修改位置且现有上下文不足时先调用 polaris；优先传用户明确提到的模块名、符号和文件路径，不堆叠猜测的泛词。定位后仍需阅读两个及以上文件正文时，把文件清单传给 polaris 的 files 一次打包，不要逐个 read。仅实际展示的行段视为已读，依赖/SIG/IMPACT 仅在确需正文时按 path:line 精确补读；大文件禁止无目的全量读取。修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再执行，可在参数已知时同轮用 _after 表达依赖。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。编辑已有文件时，只要 oldText 能引用 polaris 已展示内容、上次 edit 返回的 diff 或用户消息原文，就跳过 read 直接 edit：edit 是原子操作，失败报错会给出最接近匹配的真实内容与行号，据此修正一次即可。edit 结果已含 diff 与变更后内容，禁止为确认改动重复 read 同一文件。无相互依赖的 bash 检查同轮分别调用以便真正并发；有依赖的步骤用 _after 或同一命令内的成功短路串联，不要无故拆成多轮。"
+            "读取与搜索（硬性约束）：\n- 已知路径和行段时直接 read 相关行段，需要时再读相邻行段；大文件禁止无目的全量读取，需要整体结构时用 polaris。\n- 跨文件查找或修改（含分析要改哪里）且现有上下文不足时，先调用一次 polaris（一次通常替代 5–10 轮 rg+read），优先传用户明确提到的模块名、符号和文件路径，不堆叠猜测的泛词；已展示且未失效的上下文足够时直接回答或修改，不重复检索。\n- 定位后仍需读两个及以上文件正文时，把文件清单传给 polaris 的 files 一次打包，不要逐个 read。\n- polaris 仅实际展示的行段视为已读；依赖/SIG/IMPACT 仅在确需正文时按 path:line 精确补读。\n- 调用 polaris 后不要对同一批关键词再用 `rg`/`git grep` 重复发现，也不要仅为看更多内容放大预算重调；返回 CTX MISS 时按 next 提示修正符号名或用 files 指定入口文件重试一次，不要退回 rg/grep 逐个搜索。"
         } else {
-            "你拥有 Lyra 的原生 read、bash、edit、write 工具。未知目标位置时，先用搜索工具定位行号，再读取命中位置附近的必要上下文；大文件禁止无目的全量读取。修改已有文件时使用原生 edit；同一文件的多处修改必须合并进同一次 edit 调用的 edits 数组；多个互不依赖的文件可在同轮并行发起多个 edit 调用，但禁止对同一文件并发 edit；后续 edit 的 oldText 若依赖前一个 edit 写出的内容，必须等前者完成后再执行，可在参数已知时同轮用 _after 表达依赖。已知多个独立路径时，同轮并行发多个 read。仅在存在先后依赖或目标重叠时串行调用工具。编辑已有文件时，只要 oldText 能引用对话中已有内容（搜索结果、上次 edit 返回的 diff、用户消息原文），就跳过 read 直接 edit：edit 是原子操作，失败报错会给出最接近匹配的真实内容与行号，据此修正一次即可。edit 结果已含 diff 与变更后内容，禁止为确认改动重复 read 同一文件。无相互依赖的 bash 检查同轮分别调用以便真正并发；有依赖的步骤用 _after 或同一命令内的成功短路串联，不要无故拆成多轮。"
+            "读取与搜索（硬性约束）：\n- 未知目标位置时先用 `rg`（遵守 `.gitignore`；只搜已跟踪文件时用 `git grep`）定位行号，再读命中位置附近的必要上下文；大文件禁止无目的全量读取。"
         }
         .into(),
-        if polaris {
-            "搜索与遍历必须成本有界。路径和行段已明确且只需少量行段时直接 read；任务涉及跨文件查找或修改（含分析要改哪里）且现有上下文不足时，先调用一次 polaris（高相关命中行（每处1–2行）+必要签名/定位及 IMPACT/SIG；依赖默认仅签名/位置，按需 read 补读；默认12KB硬上限、不凑满；内部批量 rg 与增量符号索引，一次调用通常替代 5–10 轮 rg+read 往返）。polaris 仅实际展示的行段视为已读；依赖/SIG/IMPACT 仅在确需正文时按 path:line 精确补读。调用后不要对同一批关键词再用 bash 中的 `rg`/`git grep` 重复发现，也不要仅为查看更多内容放大预算重调；返回 CTX MISS 时按输出中的 next 提示修正符号名或用 files 指定入口文件重试一次，不要退回 rg/grep 逐个搜索。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；兜底搜索默认遵守 `.gitignore`。除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。"
+        "- 搜索与遍历必须成本有界：禁止 `grep -r`/`grep -R` 对仓库或源码根目录无排除递归；除非任务明确要求，不扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。\n- `| head`、`| tail` 和输出截断只限制展示，不限制工作量；递归命令须限定路径、glob、文件类型或排除目录并设较短 timeout；超时后不得原样重试，须缩小范围或换更合适的工具。".into(),
+        if read_only {
+            String::new()
         } else {
-            "搜索与遍历必须成本有界。禁止使用 `grep -r` 或 `grep -R` 对仓库根目录或源码根目录进行无排除的递归搜索；优先使用 `rg`（遵守 `.gitignore`），仅在需要只搜已跟踪文件时回退 `git grep`。除非任务明确要求，不得扫描构建产物、依赖、缓存、生成文件或大型二进制资源目录。`| head`、`| tail` 和输出截断只限制结果展示，不属于工作量限制；递归命令必须通过限定路径、glob、文件类型或排除目录缩小实际扫描范围，并设置较短的 timeout。递归命令超时后不得原样重试，必须缩小范围或改用更合适的搜索工具。"
-        }
-        .into(),
+            format!(
+                "修改文件：\n- 修改已有文件用 edit；同一文件的多处修改合并进一次 edit 的 edits 数组，禁止对同一文件并发 edit；不同文件可同轮并行 edit。\n- oldText 能引用对话中已有内容（{}、上次 edit 返回的 diff、用户消息原文）时直接 edit，不先 read；edit 是原子操作，失败报错会给出最接近的真实内容与行号，据此修正一次。\n- edit 结果已含 diff 与变更后内容，禁止为确认改动重复 read 同一文件。",
+                if polaris { "polaris 已展示内容" } else { "搜索结果" }
+            )
+        },
         if options.auto_change_project { "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。" } else { "" }.into(),
         "先理解再修改，保持改动聚焦。".into(),
-        "减少模型往返并真正并发：每轮先找出所有当前参数已知的工作，一次提交尽可能多的原生工具调用，运行时最多同时执行4项，不需要包装工具。互不依赖的检查分别发出，不能只用分号或 && 合成一条串行命令冒充并行。参数已知但有顺序要求的步骤也应同轮提交，用可选 _after:[序号] 声明必须先成功的本轮调用（从1计数，只能引用更早项）；前置失败会跳过后继，无关分支继续。例：第1项长任务、第2项短任务、第3项短任务依赖第2项，则只给第3项 _after:[2]；第2项完成后立即启动第3项，不等第1项。命令可能改文件时，后续读取/验证必须显式依赖它；共用输出目录、数据库或其他资源的操作不得当作独立。只有下一步参数必须依赖尚未知的结果或工具要求单独调用时才回模型再决定，不猜参数、不扩大授权、不为凑批次造工作。已有连续界面步骤用 run；界面、agent、MCP 的返回不等于业务成功，不用 _after 自动推进其后继，先回读结果确认。长任务若会阻塞后续需要模型决策的工作，用 exec_command 起持久会话后继续独立工作，真正需要结果时再轮询。失败只处理失败分支，不重放成功项。".into(),
-        "子 agent 的多轮协作（同时进行多路探索、在单个 agent 内完成并验证完整任务）。".into(),
-        ponytail_prompt(options.ponytail, &options.ponytail_level),
-        "最终回复采用例外汇报，而不是完整工作报告。先直接给出用户可感知的结果；只有信息会影响结果判断、下一步行动、风险认知或可信度时，才写入最终回复。默认省略文件/函数/行号清单、搜索和工具调用过程、常规实现细节、具体测试命令、成功步骤清单、无实际影响的注意事项、泛化建议、‘无风险’声明，以及对同一结果的重复总结。正常成功时用 1～3 句话，不强制使用标题或列表；存在失败、未验证、行为变化、兼容性风险或用户必须操作的事项时，只围绕这些例外按需展开。用户明确询问实现细节时才提供详细报告。".into(),
+        "减少模型往返、真正并发：\n- 每轮先找出所有参数已知的工作，一次提交尽可能多的工具调用（运行时最多同时执行 4 项）；只有下一步参数依赖未知结果或工具要求单独调用时才回模型决定，不猜参数、不扩大授权、不为凑批次造工作。\n- 互不依赖的调用分别发出（如多个独立路径同轮并行 read），不要用分号或 && 合成一条串行命令冒充并行。\n- 有顺序要求的步骤也同轮提交，用可选 _after:[序号] 声明必须先成功的本轮调用（从 1 计数，只能引用更早项）；前置失败会跳过后继，无关分支继续。例：第1项长任务、第2项短任务、第3项依赖第2项，则只给第3项 _after:[2]，它在第2项完成后立即启动。\n- 命令或 edit 会改文件时，依赖其结果的读取、验证或后续 edit 必须显式 _after 它；共用输出目录、数据库或其他资源的操作不算独立。\n- 界面工具和 MCP 工具的返回不等于业务成功，不要用 _after 自动推进其后继，先回读结果确认；已确定的连续界面步骤用界面工具的 run 操作。\n- 失败只处理失败分支，不重放成功项。".into(),
+        // ponytail 开启时其“末尾写跳过项与风险”优先，汇报规则不再禁止这类声明。
+        format!(
+            "最终回复采用例外汇报，而不是完整工作报告。先直接给出用户可感知的结果；只有信息会影响结果判断、下一步行动、风险认知或可信度时，才写入最终回复。默认省略文件/函数/行号清单、搜索和工具调用过程、常规实现细节、具体测试命令、成功步骤清单、无实际影响的注意事项、泛化建议{}，以及对同一结果的重复总结。正常成功时用 1～3 句话，不强制使用标题或列表；存在失败、未验证、行为变化、兼容性风险或用户必须操作的事项时，只围绕这些例外按需展开。用户明确询问实现细节时才提供详细报告。{}",
+            if ponytail.is_empty() { "、‘无风险’声明" } else { "" },
+            if ponytail.is_empty() { "" } else { "结尾按 ponytail 规则用一两行写明跳过或未检查的内容及用户须知的风险；与本条冲突时以 ponytail 为准。" }
+        ),
+        ponytail,
         "完成修改后按需验证：改动小、影响明确时做成本最低的检查即可，影响面大或不确定时再按需扩大到受影响单元及直接使用方；禁止遍历或列出完整仓库、无依据扩大范围。最终回复只需说明验证是否通过，不列具体命令和逐项过程；仅当验证失败、无法验证或结果存在关键限制时补充原因与影响。".into(),
         match &options.shell {
             Some(shell) if shell.kind == ShellKind::PowerShell => format!(
@@ -606,6 +611,10 @@ mod tests {
         assert!(!prompt.contains("jianlai"));
         assert!(!prompt.contains("- parallel:"));
         assert!(prompt.contains("减少模型往返") && prompt.contains("_after:[2]"));
+        assert!(!prompt.contains("你是 Lyra") && !prompt.contains("exec_command"));
+        assert!(prompt.contains("‘无风险’声明") && !prompt.contains("Ponytail"));
+        let prompt = build_system_prompt(&SystemPromptOptions { ponytail: true, ..options });
+        assert!(!prompt.contains("‘无风险’声明") && prompt.contains("以 ponytail 为准"));
     }
 
     #[test]
