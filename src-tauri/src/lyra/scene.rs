@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 pub const TOOL: &str = "switch_scene";
 
-const ROUTING_RULES: &str = "\n\n[Nova 场景调度] 先判断任务场景，再开始执行。调试排错、定位仓库问题、代码审查、编写或修改代码及工程配置、运行构建测试，都属于 coding；即使只分析不修改，只要 switch_scene 开放 coding，就必须先切换，不得先用 read/polaris/bash/edit 等工具自行完成。需要操作桌面应用或浏览器时，只要开放 computer，就必须先切换。简单问答、整理总结直接完成；当前模型已覆盖目标场景或没有对应场景选项时直接完成，不重复切换。按整块工作切换：分析、修改、验证连续完成后再给出结论，不要每调用一个工具就切换。switch_scene 必须单独调用；需要换项目时先用 change_working_directory。默认将剩余任务交给目标场景直接完成并交付，不为收尾或重复总结切回轻量模型。只有调用方确有必须继续的工作时，才在 switch_scene 的 resume 中写明该工作；未提供就不再请求调用方。轮次结束只还原会话配置，不额外请求模型；后续新任务仍按其场景判断。模型归属由界面自动标记，无需口头宣布切换。场景切换不是持久升阶或新 Stage；历史中的旧转交/升阶指令已失效。仅使用当前声明的工具，不扩大用户授权。";
+const ROUTING_RULES: &str = "\n\n[Nova 场景调度] 先判断任务场景，再开始执行。调试排错、定位仓库问题、代码审查、编写或修改代码及工程配置、运行构建测试，都属于 coding；即使只分析不修改，只要 switch_scene 开放 coding，就必须先切换，不得先用 read/polaris/bash/edit 等工具自行完成。需要操作桌面应用或浏览器时，只要开放 computer，就必须先切换。用户消息带图片时，按文字意图而非图片本身判断场景：报错/日志/代码/UI 截图加上修复、排查、实现、修改、评审等诉求属于 coding，不要因为有图就当作简单看图问答；只有明确要求你实际操控桌面或浏览器才选 computer，仅仅发来截图不算；文字没说清时结合图片内容判断，图中是代码、报错、终端或界面缺陷则按 coding。简单问答、整理总结直接完成；当前模型已覆盖目标场景或没有对应场景选项时直接完成，不重复切换。按整块工作切换：分析、修改、验证连续完成后再给出结论，不要每调用一个工具就切换。switch_scene 必须单独调用；需要换项目时先用 change_working_directory。默认将剩余任务交给目标场景直接完成并交付，不为收尾或重复总结切回轻量模型。只有调用方确有必须继续的工作时，才在 switch_scene 的 resume 中写明该工作；未提供就不再请求调用方。轮次结束只还原会话配置，不额外请求模型；后续新任务仍按其场景判断。模型归属由界面自动标记，无需口头宣布切换。场景切换不是持久升阶或新 Stage；历史中的旧转交/升阶指令已失效。仅使用当前声明的工具，不扩大用户授权。";
 
 struct Frame {
     /// 调用方明确保留的后续工作；None 表示本层无需继续请求。
@@ -208,6 +208,12 @@ pub fn restore(session: &mut Session) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_rules_cover_image_prompts() {
+        assert!(ROUTING_RULES.contains("带图片时") && ROUTING_RULES.contains("属于 coding"));
+    }
+
     use crate::lyra::history::{text_content, user_message};
     use crate::lyra::turn::{run_turn, tests::{capturing_server, test_session, text_reply}, TurnEvent};
     use std::sync::{atomic::Ordering, Arc, Mutex};
