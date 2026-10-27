@@ -174,9 +174,12 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
 
 pub fn is_retryable_provider_error(error: &str) -> bool {
     let message = error.to_lowercase();
-    !is_context_window_error(error) && RETRYABLE_FRAGMENTS
-        .iter()
-        .any(|fragment| message.contains(fragment))
+    // refusal 是模型确定性拒答，重试同一请求不会变；交给 scene fallback 或直接结束本轮。
+    !is_context_window_error(error)
+        && !message.contains("stop_reason: refusal")
+        && RETRYABLE_FRAGMENTS
+            .iter()
+            .any(|fragment| message.contains(fragment))
 }
 
 /// Provider 对上下文超限的文案并不统一；单独识别后由 Reasonix 强制收缩轨迹并重试一次。
@@ -661,7 +664,7 @@ mod tests {
         ));
         assert!(is_retryable_provider_error("provider SSE 连续 90s 无数据"));
         assert!(is_retryable_provider_error("provider finish_reason: other"));
-        assert!(is_retryable_provider_error("provider stop_reason: refusal"));
+        assert!(!is_retryable_provider_error("provider stop_reason: refusal"));
         assert!(is_retryable_provider_error(
             "provider stream idle timeout: 90s 无增量事件"
         ));
