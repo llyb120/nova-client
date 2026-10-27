@@ -269,6 +269,13 @@ pub(super) fn turn_event_sink<'a>(
             started_tools.insert(id, item.clone());
             emit(&json!({ "type": "item", "item": item }));
         }
+        TurnEvent::ToolProgress { id, output } => {
+            if let Some(started) = started_tools.get(&id) {
+                let mut item = started.clone();
+                item["aggregated_output"] = json!(output);
+                emit(&json!({ "type": "item", "item": item }));
+            }
+        }
         TurnEvent::ToolEnd { id, outcome } => {
             if outcome["toolName"] == crate::lyra::scene::TOOL { return; }
             let started = started_tools

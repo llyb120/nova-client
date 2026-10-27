@@ -18,7 +18,7 @@ use std::sync::Arc;
 const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析。仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。目标行段已明确时直接按行段 read。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
-const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。禁止无排除的递归搜索（grep -r 等）。";
+const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。禁止无排除的递归搜索（grep -r 等）。";
 const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 const WRITE_DESCRIPTION: &str =
     "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
@@ -391,6 +391,25 @@ async fn drain_bash_pipes(
     }
 }
 
+// 运行中只回传各管道输出尾部，避免长命令在界面上像卡死；最终结果仍走完整输出。
+fn bash_progress_tail(outputs: [&Arc<std::sync::Mutex<Vec<u8>>>; 2]) -> (usize, String) {
+    const TAIL_BYTES: usize = 4096;
+    const TAIL_LINES: usize = 20;
+    let mut total = 0;
+    let mut text = String::new();
+    for output in outputs {
+        let output = output.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        total += output.len();
+        let chunk = String::from_utf8_lossy(&output[output.len().saturating_sub(TAIL_BYTES)..]);
+        let lines: Vec<&str> = chunk.lines().collect();
+        for line in &lines[lines.len().saturating_sub(TAIL_LINES)..] {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    (total, text)
+}
+
 fn captured_bash_output(output: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<u8> {
     output
         .lock()
@@ -404,6 +423,7 @@ async fn run_bash(
     command: &str,
     timeout_secs: u64,
     cancelled: Option<Arc<AtomicBool>>,
+    progress: Option<&(dyn Fn(String) + Send + Sync)>,
 ) -> Result<(String, i32, u64, u64), String> {
     use crate::lyra::prompt::ShellKind;
     let timeout_secs = timeout_secs.clamp(1, 600);
@@ -455,6 +475,8 @@ async fn run_bash(
     }
     // PI 语义：取消信号穿透到工具，bash 轮询取消标志，命中即强杀整棵进程树。
     let wait = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        let (mut ticks, mut last_total, mut last_text) = (0u32, 0usize, String::new());
+        let mut quiet_since = std::time::Instant::now();
         loop {
             tokio::select! {
                 result = child.wait() => break Wait::Exited(result),
@@ -464,6 +486,22 @@ async fn run_bash(
                         .is_some_and(|flag| flag.load(Ordering::SeqCst))
                     {
                         break Wait::Cancelled;
+                    }
+                    ticks += 1;
+                    // 约每秒回传一次输出尾部；长时间无输出时附提示，便于区分编译中/等锁/卡死。
+                    if let Some(progress) = progress.filter(|_| ticks % 20 == 0) {
+                        let (total, mut text) = bash_progress_tail([&output_stdout, &output_stderr]);
+                        if total != last_total {
+                            (last_total, quiet_since) = (total, std::time::Instant::now());
+                        }
+                        let quiet = quiet_since.elapsed().as_secs();
+                        if quiet >= 15 {
+                            text.push_str(&format!("（{quiet} 秒无新输出）"));
+                        }
+                        if text != last_text {
+                            progress(text.clone());
+                            last_text = text;
+                        }
                     }
                 }
             }
@@ -572,10 +610,11 @@ pub async fn execute(
     call_id: &str,
     cancelled: Option<&Arc<AtomicBool>>,
     session_id: &str,
+    progress: Option<&(dyn Fn(String) + Send + Sync)>,
 ) -> ToolOutcome {
     let _ = session_id;
     let owner = archive_dir.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
-    let outcome = execute_inner(root, name, args, shell, cancelled, &owner).await;
+    let outcome = execute_inner(root, name, args, shell, cancelled, &owner, progress).await;
     govern(outcome, name, call_id, archive_dir)
 }
 
@@ -586,6 +625,7 @@ async fn execute_inner(
     shell: Option<&crate::lyra::prompt::ShellConfig>,
     cancelled: Option<&Arc<AtomicBool>>,
     owner: &str,
+    progress: Option<&(dyn Fn(String) + Send + Sync)>,
 ) -> ToolOutcome {
     match name {
         "chrome" => {
@@ -693,7 +733,7 @@ async fn execute_inner(
                 return ToolOutcome::error("当前为只读模式，bash 不可用");
             };
             let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(120);
-            match run_bash(root, shell, command, timeout, cancelled.cloned()).await {
+            match run_bash(root, shell, command, timeout, cancelled.cloned(), progress).await {
                 Ok((text, code, started_at, ended_at)) => {
                     let mut outcome = ToolOutcome::text(clamp_tool_output_text(&text)).with_details(json!({
                         "exitCode":code, "executionStartedAt":started_at, "executionEndedAt":ended_at
@@ -797,10 +837,10 @@ mod tool_tests {
             assert!(tools.iter().all(|tool| tool.name != "webview"));
         }
         let root = tempfile::tempdir().unwrap();
-        let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, "test").await;
+        let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, "test", None).await;
         assert!(result.is_error);
         assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
-        let removed = super::execute_inner(root.path(), "webview", &json!({}), Some(&crate::lyra::prompt::detect_shell()), None, "test").await;
+        let removed = super::execute_inner(root.path(), "webview", &json!({}), Some(&crate::lyra::prompt::detect_shell()), None, "test", None).await;
         assert!(removed.is_error);
         assert_eq!(removed.content[0]["text"], "未知工具：webview");
     }
@@ -814,7 +854,7 @@ mod tool_tests {
             ("write", json!({"path":"existing.txt","content":"after"})),
             ("edit", json!({"path":"existing.txt","edits":[{"oldText":"before","newText":"after"}]})),
         ] {
-            let result = super::execute_inner(root.path(), name, &args, None, None, "guard-test").await;
+            let result = super::execute_inner(root.path(), name, &args, None, None, "guard-test", None).await;
             assert!(result.is_error);
             assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
@@ -893,6 +933,7 @@ mod tests {
             "sleep 300 & echo $! > child.pid; wait",
             1,
             None,
+            None,
         )
         .await
         .expect_err("必须超时");
@@ -921,6 +962,7 @@ mod tests {
                 &shell(),
                 "setsid sh -c 'echo $$ > detached.pid; exec sleep 300' & wait",
                 1,
+                None,
                 None,
             ),
         )
@@ -953,6 +995,7 @@ mod tests {
                 "sleep 300 & echo $! > child.pid; wait",
                 600,
                 None,
+                None,
             )
             .await
         });
@@ -980,6 +1023,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 运行中进度只取各管道最后 20 行，并报告累计字节数用于判断是否有新输出。
+    #[test]
+    fn bash_progress_tail_keeps_last_lines() {
+        let out = Arc::new(std::sync::Mutex::new(
+            (0..30).map(|i| format!("o{i}\r\n")).collect::<String>().into_bytes(),
+        ));
+        let err = Arc::new(std::sync::Mutex::new(b"e1\n".to_vec()));
+        let (total, text) = super::bash_progress_tail([&out, &err]);
+        assert_eq!(total, out.lock().unwrap().len() + 3);
+        assert!(text.starts_with("o10\n") && text.ends_with("o29\ne1\n"), "{text}");
+    }
+
     /// 取消标志：运行中置位后 bash 必须尽快退出并清理整棵进程树（PI 的 signal 语义）。
     #[tokio::test]
     async fn bash_cancel_flag_kills_process_tree() {
@@ -994,6 +1049,7 @@ mod tests {
                 "sleep 300 & echo $! > child.pid; wait",
                 600,
                 Some(cancel),
+                None,
             )
             .await
         });

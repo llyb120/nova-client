@@ -27,6 +27,8 @@ pub enum TurnEvent {
     TextDelta(String),
     ThinkingDelta(String),
     ToolStart { id: String, name: String, args: Value },
+    /// 运行中工具的输出尾部（目前仅 bash），仅供展示。
+    ToolProgress { id: String, output: String },
     /// `outcome` 是入史的 toolResult 消息。
     ToolEnd { id: String, outcome: Value },
     MessageEnd { usage: Value },
@@ -325,7 +327,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                                 (cwd.clone(), shell.clone(), archive.clone(), cancelled.clone(), owner.clone());
                             let (task_name, task_args, task_id) = (name.clone(), arguments.clone(), id.clone());
                             let handle = tokio::spawn(async move {
-                                execute(&cwd, &task_name, &task_args, shell.as_ref(), archive.as_deref(), &task_id, Some(&cancelled), &owner).await
+                                execute(&cwd, &task_name, &task_args, shell.as_ref(), archive.as_deref(), &task_id, Some(&cancelled), &owner, None).await
                             });
                             early.push((id, name, arguments, handle));
                         }
@@ -492,7 +494,7 @@ async fn run_tools(
             } else if matches!(name.as_str(), "compress" | "decompress" | "search_context" | "acp_status") {
                 acp_tool(s, name, args)
             } else {
-                call_tool(s, id, name, args).await
+                call_tool(s, id, name, args, None).await
             };
             if name == "change_working_directory" && !outcome.is_error {
                 if let Some(cwd) = outcome.details.as_ref().and_then(|d| d.get("workingDirectory")).and_then(Value::as_str) {
@@ -514,6 +516,7 @@ async fn run_tools(
         }
         let end = (start..calls.len()).find(|&i| tool_barrier(&calls[i].1)).unwrap_or(calls.len());
         let shared: &Session = s;
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, String)>();
         let mut running: FuturesUnordered<BoxFuture<'_, (usize, ToolOutcome)>> = FuturesUnordered::new();
         loop {
             // ponytail: 同轮调用通常很少，O(n²)扫描优先简单；大批量时改成入度/后继队列。
@@ -532,16 +535,28 @@ async fn run_tools(
                 launched[i] = true;
                 let handle = early.iter().position(|(eid, ename, eargs, _)| eid == id && ename == name && eargs == args)
                     .map(|at| early.swap_remove(at).3);
+                let tx = progress_tx.clone();
                 running.push(Box::pin(async move {
+                    let progress = move |output: String| { let _ = tx.send((i, output)); };
                     let outcome = match handle {
                         Some(handle) => handle.await.unwrap_or_else(|error| text_outcome(format!("工具执行失败：{error}"), true)),
                         None if shared.cancelled.load(Ordering::SeqCst) => text_outcome(CANCELLED_TEXT, true),
-                        None => call_tool(shared, id, name, args).await,
+                        None => call_tool(shared, id, name, args, Some(&progress)).await,
                     };
                     (i, outcome)
                 }));
             }
-            let Some((i, outcome)) = running.next().await else { break; };
+            let next = loop {
+                tokio::select! {
+                    next = running.next() => break next,
+                    Some((p, output)) = progress_rx.recv() => on_event(TurnEvent::ToolProgress { id: calls[p].0.clone(), output }),
+                }
+            };
+            let Some((i, outcome)) = next else { break; };
+            // 先转发已排队的进度，避免完成事件之后再来一条 in_progress 把状态刷回去。
+            while let Ok((p, output)) = progress_rx.try_recv() {
+                on_event(TurnEvent::ToolProgress { id: calls[p].0.clone(), output });
+            }
             results[i] = Some(finish(&calls[i].0, &calls[i].1, outcome, on_event));
         }
         start = end;
@@ -564,7 +579,7 @@ fn finish(id: &str, name: &str, outcome: ToolOutcome, on_event: Sink<'_>) -> Val
     message
 }
 
-async fn call_tool(s: &Session, id: &str, name: &str, args: &Value) -> ToolOutcome {
+async fn call_tool(s: &Session, id: &str, name: &str, args: &Value, progress: Option<&(dyn Fn(String) + Send + Sync)>) -> ToolOutcome {
     // 工具声明不是授权边界：兼容端点也可能返回未声明的调用，执行前统一拒绝。
     if !s.tools.iter().any(|tool| tool.name == name) {
         return text_outcome(format!("当前会话未授权工具：{name}"), true);
@@ -588,7 +603,7 @@ async fn call_tool(s: &Session, id: &str, name: &str, args: &Value) -> ToolOutco
         })
     } else { None };
     if s.cancelled.load(Ordering::SeqCst) { return text_outcome(CANCELLED_TEXT, true); }
-    execute(&s.cwd, name, args, s.shell.as_ref(), s.archive_dir.as_deref(), id, Some(&s.cancelled), &s.session_id).await
+    execute(&s.cwd, name, args, s.shell.as_ref(), s.archive_dir.as_deref(), id, Some(&s.cancelled), &s.session_id, progress).await
 }
 
 fn acp_tool(s: &mut Session, name: &str, args: &Value) -> ToolOutcome {
@@ -851,7 +866,7 @@ pub(crate) mod tests {
     async fn rejects_undeclared_mutation_tools_before_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         let s = test_session("http://127.0.0.1:1".into(), dir.path().into());
-        let result = call_tool(&s, "blocked", "write", &json!({"path":"blocked.txt","content":"no"})).await;
+        let result = call_tool(&s, "blocked", "write", &json!({"path":"blocked.txt","content":"no"}), None).await;
         assert!(result.is_error);
         assert!(!dir.path().join("blocked.txt").exists());
     }
@@ -1005,7 +1020,7 @@ pub(crate) mod tests {
         let cancel = s.cancelled.clone();
         let args = json!({});
         let (outcome, ()) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(1), call_tool(&s, "screen", "chrome", &args)),
+            tokio::time::timeout(Duration::from_secs(1), call_tool(&s, "screen", "chrome", &args, None)),
             async { tokio::time::sleep(Duration::from_millis(20)).await; cancel.store(true, Ordering::SeqCst); }
         );
         assert_eq!(outcome.unwrap().content[0]["text"], CANCELLED_TEXT);
