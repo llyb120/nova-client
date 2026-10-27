@@ -495,8 +495,17 @@ fn release_extension(app: &AppHandle) -> Result<PathBuf, String> {
 
 /// 检测 Chrome 依赖：Chrome 是否安装、扩展是否已连接及是否允许无痕；同时释放自带扩展到固定目录供「加载已解压的扩展程序」使用。
 #[tauri::command]
-pub async fn chrome_dependency_status(app: AppHandle) -> Result<Value, String> {
+pub async fn chrome_dependency_status(app: AppHandle, quick: Option<bool>) -> Result<Value, String> {
     let directory = release_extension(&app)?;
+    // quick：只返回安装所需的静态信息；连接检测与升级交给会话里的 AI，避免点击后久无响应。
+    if quick == Some(true) {
+        return Ok(json!({
+            "chromePath": find_chrome().map(|p| p.to_string_lossy().to_string()),
+            "bundledVersion": bundled_version(),
+            "extensionDir": directory.to_string_lossy(),
+            "extensionId": EXTENSION_ID,
+        }));
+    }
     let connected = connect(&app).await.map(|v| v["connected"] == true).unwrap_or(false);
     let bundled_version = bundled_version();
     // 新文件已写入扩展目录：过期且认识 reload 的扩展直接自行重载升级，不动界面。

@@ -93,7 +93,7 @@ export const api = {
   listProjects: () => invoke<ProjectEntry[]>("list_projects"),
   removeProject: (cwd: string) => invoke<void>("remove_project", { cwd }),
   scratchDir: () => invoke<string>("scratch_dir"),
-  chromeDependencyStatus: () =>
+  chromeDependencyStatus: (quick?: boolean) =>
     invoke<{
       chromePath: string | null;
       connected: boolean;
@@ -107,6 +107,7 @@ export const api = {
       extensionId: string;
     }>(
       "chrome_dependency_status",
+      { quick },
     ),
   directoryExists: (path: string) => invoke<boolean>("directory_exists", { path }),
   clipboardFilePaths: () => invoke<string[]>("clipboard_file_paths"),
