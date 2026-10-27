@@ -344,7 +344,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
 
   function browseDetail(event: MouseEvent) {
     const button = (event.target as Element).closest<HTMLElement>("button[aria-expanded]");
-    if (!button) return;
+    if (!button || keepBottom) return; // 吸底时展开/折叠详情继续贴底
     keepBottom = false;
     detailAnchor = { element: button, offset: button.getBoundingClientRect().top - host.getBoundingClientRect().top };
     props.onBrowseDetail?.();
@@ -547,7 +547,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
         <HtmlTurn group={props.groups[rowProps.index]} running={props.running} readOnly={props.readOnly}
           preview={props.preview} threadId={props.threadId} loadItems={props.loadItems}
           onReturnToCurrent={props.onReturnToCurrent}
-          onBrowseDetail={() => { keepBottom = false; props.onBrowseDetail?.(); schedule(); }} />
+          onBrowseDetail={() => { if (keepBottom) return; keepBottom = false; props.onBrowseDetail?.(); schedule(); }} />
       </Show>
     </div>;
   }
