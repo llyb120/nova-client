@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
-use crate::clues::ClueContextSnapshot;
 
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -610,12 +609,6 @@ pub struct Thread {
     /// 仅供下一次 prompt 隐式注入，不持久化到会话文件或前端快照。
     #[serde(skip)]
     pub pending_stage_context: Option<String>,
-    /// 本会话从哪张线索卡发起；后续生成线索时默认以它为当前位置。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_clue_card_id: Option<String>,
-    /// 发起会话时固定的证据链上下文快照。节点组是内部结构，快照只包含用户可见卡片。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clue_context: Option<ClueContextSnapshot>,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default)]
@@ -679,8 +672,6 @@ impl Thread {
             stage_source_thread_id: None,
             auto_scene: None,
             pending_stage_context: None,
-            active_clue_card_id: None,
-            clue_context: None,
             created_at: now,
             updated_at: now,
             items: Vec::new(),
@@ -818,26 +809,11 @@ impl Thread {
         render_handoff_context(&self.items, self.plan.as_ref(), from.label(), to_label)
     }
 
-    /// 当前 prompt 需要额外注入的上下文：
-    /// - 从线索发起的新会话首条消息注入固定 Paper Trail；
-    /// - 跨 Agent 接力时再次携带该 Trail，并拼接原有会话历史。
+    /// 当前 prompt 需要额外注入的上下文：跨 Agent 接力时拼接原有会话历史，以及 Stage 引用。
     pub fn take_prompt_context(&mut self, to_label: &str) -> Option<String> {
-        let has_user_message = self
-            .items
-            .iter()
-            .any(|item| matches!(item, Item::User { .. }));
-        let has_handoff = self.handoff_from.is_some();
-        let clue = if !has_user_message || has_handoff {
-            self.clue_context
-                .as_ref()
-                .map(|context| truncate_middle(context.rendered_context.trim(), CLUE_CONTEXT_MAX))
-                .filter(|context| !context.is_empty())
-        } else {
-            None
-        };
         let handoff = self.take_handoff_context(to_label);
         let stage = self.pending_stage_context.take();
-        [clue, handoff, stage]
+        [handoff, stage]
             .into_iter()
             .flatten()
             .reduce(|left, right| format!("{left}\n\n{right}"))
@@ -1008,8 +984,6 @@ pub struct ThreadMeta {
     /// 自动模式标记随会话列表返回，供界面区分普通会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_scene: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_clue_card_id: Option<String>,
 }
 
 fn plain_path(path: &str) -> String {
@@ -1753,17 +1727,6 @@ impl ThreadStore {
         }
     }
 
-    pub fn clear_active_clue_card(&mut self, card_id: &str) -> bool {
-        let mut changed = false;
-        for thread in &mut self.threads {
-            if thread.active_clue_card_id.as_deref() == Some(card_id) {
-                thread.active_clue_card_id = None;
-                changed = true;
-            }
-        }
-        changed
-    }
-
     pub fn thread_by_session_mut(&mut self, session_id: &str) -> Option<&mut Thread> {
         self.threads
             .iter_mut()
@@ -1777,7 +1740,6 @@ const HANDOFF_USER_MAX: usize = 4000;
 const HANDOFF_ASSISTANT_MAX: usize = 6000;
 const HANDOFF_TOOL_OUTPUT_MAX: usize = 800;
 const HANDOFF_TOTAL_BUDGET: usize = 48000;
-const CLUE_CONTEXT_MAX: usize = 4000;
 const HANDOFF_FULL_TURNS: usize = 10;
 const HANDOFF_CONTEXT_THRESHOLD: usize = HANDOFF_TOTAL_BUDGET * 4 / 5;
 

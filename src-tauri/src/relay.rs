@@ -13,7 +13,6 @@
 //! 断线重连：SSE 断开后指数退避重连；每条定向消息有服务端分配的 seq，重连时带
 //! since=<最后 seq> 补发漏掉的消息，保证不丢、不影响使用。HTTP 上行使用 messageId 幂等重试。
 
-use crate::clues::{CaptureClueResult, ClueContextSnapshot, ClueNodeGroup, EV_CLUES};
 use crate::http_stream::{decode_sse_json, SseDecoder, SSE_IDLE_TIMEOUT_SECS};
 use crate::settings::Settings;
 use crate::threads::{now_ms, AgentKind, Item, PromptImage, Thread, Worktree};
@@ -68,7 +67,6 @@ struct PendingRoam {
     agent_kind: AgentKind,
     model: Option<String>,
     mode: Option<String>,
-    clue_context: Option<ClueContextSnapshot>,
     /// guest 是否要求在 worktree 中执行（host 侧在自己仓库代建）
     worktree: bool,
     /// worktree 分支名（guest 手填）
@@ -128,8 +126,6 @@ pub struct Share {
     pub items: Value,
     #[serde(default)]
     pub plan: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_clue_card_id: Option<String>,
     /// 漫游召回自动回传的快照（前端标注「召回」并自动弹出收件箱）
     #[serde(default)]
     pub recall: bool,
@@ -159,16 +155,6 @@ struct InEnvelope {
     kind: String,
     #[serde(default)]
     data: Value,
-}
-
-#[derive(Deserialize)]
-struct RelayClueList {
-    groups: Vec<ClueNodeGroup>,
-}
-
-#[derive(Deserialize)]
-struct RelayClueAssociate {
-    group: ClueNodeGroup,
 }
 
 pub struct RelayManager {
@@ -571,10 +557,6 @@ impl RelayManager {
                 *self.peers.lock().unwrap() = peers.clone();
                 let _ = self.app.emit(EV_RELAY_PEERS, peers);
             }
-            "clues.changed" => {
-                let _ = self.app.emit(EV_CLUES, env.data);
-            }
-            "clue.mentioned" => self.on_clue_mentioned(&env),
             "remote.device" => crate::remote::publish_main_sse(env.data),
             "share" => self.on_share(&env),
             "miniapps.changed" => {
@@ -609,29 +591,6 @@ impl RelayManager {
             }
             _ => {}
         }
-    }
-
-    fn on_clue_mentioned(&self, env: &InEnvelope) {
-        let card_id = env.data["cardId"].as_str().unwrap_or_default();
-        if card_id.is_empty() {
-            return;
-        }
-        let _ = self
-            .app
-            .emit("clues:mentioned", json!({ "cardId": card_id }));
-        crate::sys_notify::notify_clue_mention(
-            &self.app,
-            card_id,
-            if env.from_name.trim().is_empty() {
-                "队友"
-            } else {
-                &env.from_name
-            },
-            env.data["title"].as_str().unwrap_or("未命名线索"),
-            env.data["kind"].as_str().unwrap_or("publish"),
-            env.data["content"].as_str().unwrap_or_default(),
-            crate::clues::EV_CLUE_MENTION_OPEN,
-        );
     }
 
     // ===== 发送 =====
@@ -902,7 +861,7 @@ impl RelayManager {
             .unwrap_or_default())
     }
 
-    fn clue_request(
+    fn team_request(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -915,7 +874,6 @@ impl RelayManager {
             .header("Authorization", format!("Bearer {token}"))
             .header("X-Relay-Device", &self.device_id)
             .query(&[("name", name), ("groups", groups)])
-            // 线索请求可能包含粘贴的图片或文件；给附件上传留出足够时间。
             .timeout(Duration::from_secs(60)))
     }
 
@@ -923,7 +881,7 @@ impl RelayManager {
 
     /// id 为空列出元数据 `{apps:[...]}`；否则取单个应用（含定义 `app`）。
     pub async fn team_miniapps(&self, id: Option<&str>) -> Result<Value, String> {
-        let mut request = self.clue_request(reqwest::Method::GET, "/v2/miniapps")?;
+        let mut request = self.team_request(reqwest::Method::GET, "/v2/miniapps")?;
         if let Some(id) = id {
             request = request.query(&[("id", id)]);
         }
@@ -933,7 +891,7 @@ impl RelayManager {
     /// 新建（id 为空）或更新自己发布的应用，返回元数据。
     pub async fn team_miniapp_publish(&self, id: Option<&str>, app: Value) -> Result<Value, String> {
         let response = self
-            .clue_request(reqwest::Method::POST, "/v2/miniapps/publish")?
+            .team_request(reqwest::Method::POST, "/v2/miniapps/publish")?
             .json(&json!({ "id": id.unwrap_or_default(), "app": app }))
             .send()
             .await
@@ -943,175 +901,12 @@ impl RelayManager {
 
     pub async fn team_miniapp_remove(&self, id: &str) -> Result<(), String> {
         let response = self
-            .clue_request(reqwest::Method::POST, "/v2/miniapps/remove")?
+            .team_request(reqwest::Method::POST, "/v2/miniapps/remove")?
             .json(&json!({ "id": id }))
             .send()
             .await
             .map_err(|e| e.to_string())?;
         decode_relay_json::<Value>(response).await.map(|_| ())
-    }
-
-    pub async fn clue_list(&self, space: &str) -> Result<Vec<ClueNodeGroup>, String> {
-        let response = self
-            .clue_request(reqwest::Method::GET, "/v2/clues")?
-            .query(&[("space", space)])
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueList>(response).await?.groups)
-    }
-
-    pub async fn clue_capture(
-        &self,
-        thread_id: Option<&str>,
-        title: &str,
-        content: &str,
-        placement: &str,
-        target_card_id: Option<&str>,
-        mention_tokens: &[String],
-        attachments: &[crate::clues::ClueAttachment],
-        space: &str,
-    ) -> Result<CaptureClueResult, String> {
-        let author_name = self.cfg().map(|(_, _, name)| name).unwrap_or_default();
-        let response = self
-            .clue_request(reqwest::Method::POST, "/v2/clues/capture")?
-            .query(&[("space", space)])
-            .json(&json!({
-                "threadId": thread_id.unwrap_or_default(),
-                "title": title,
-                "content": content,
-                "placement": placement,
-                "targetCardId": target_card_id.unwrap_or_default(),
-                "authorName": author_name,
-                "mentionTokens": mention_tokens,
-                "attachments": attachments,
-                "space": space,
-            }))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        decode_relay_json(response).await
-    }
-
-    pub async fn clue_comment(
-        &self,
-        card_id: &str,
-        content: &str,
-        parent_comment_id: Option<&str>,
-        mention_tokens: &[String],
-        space: &str,
-    ) -> Result<(), String> {
-        let response = self
-            .clue_request(reqwest::Method::POST, "/v2/clues/comment")?
-            .query(&[("space", space)])
-            .json(&json!({
-                "cardId": card_id,
-                "content": content,
-                "parentCommentId": parent_comment_id.unwrap_or_default(),
-                "mentionTokens": mention_tokens,
-                "space": space,
-            }))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        decode_relay_json::<Value>(response).await?;
-        Ok(())
-    }
-
-    pub async fn clue_associate(
-        &self,
-        before_card_id: &str,
-        after_card_id: &str,
-        space: &str,
-    ) -> Result<ClueNodeGroup, String> {
-        let response = self
-            .clue_request(reqwest::Method::POST, "/v2/clues/associate")?
-            .query(&[("space", space)])
-            .json(&json!({
-                "beforeCardId": before_card_id,
-                "afterCardId": after_card_id,
-                "space": space,
-            }))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response)
-            .await?
-            .group)
-    }
-
-    pub async fn clue_disassociate(
-        &self,
-        before_card_id: &str,
-        after_card_id: &str,
-        space: &str,
-    ) -> Result<ClueNodeGroup, String> {
-        let response = self
-            .clue_request(reqwest::Method::POST, "/v2/clues/disassociate")?
-            .query(&[("space", space)])
-            .json(&json!({
-                "beforeCardId": before_card_id,
-                "afterCardId": after_card_id,
-                "space": space,
-            }))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response)
-            .await?
-            .group)
-    }
-
-    pub async fn clue_split(&self, card_id: &str, space: &str) -> Result<ClueNodeGroup, String> {
-        let response = self
-            .clue_request(reqwest::Method::POST, "/v2/clues/split")?
-            .query(&[("space", space)])
-            .json(&json!({ "cardId": card_id, "space": space }))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response)
-            .await?
-            .group)
-    }
-
-    pub async fn clue_stack(
-        &self,
-        card_ids: &[String],
-        space: &str,
-    ) -> Result<ClueNodeGroup, String> {
-        let response = self
-            .clue_request(reqwest::Method::POST, "/v2/clues/stack")?
-            .query(&[("space", space)])
-            .json(&json!({ "cardIds": card_ids, "space": space }))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(decode_relay_json::<RelayClueAssociate>(response)
-            .await?
-            .group)
-    }
-
-    pub async fn clue_delete(&self, card_id: &str, space: &str) -> Result<(), String> {
-        let response = self
-            .clue_request(reqwest::Method::POST, "/v2/clues/delete")?
-            .query(&[("space", space)])
-            .json(&json!({ "cardId": card_id, "space": space }))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        decode_relay_json::<Value>(response).await?;
-        Ok(())
-    }
-
-    pub async fn clue_context(&self, card_id: &str) -> Result<ClueContextSnapshot, String> {
-        let response = self
-            .clue_request(reqwest::Method::GET, "/v2/clues/context")?
-            .query(&[("cardId", card_id)])
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        decode_relay_json(response).await
     }
 
     /// 中转站是否已配置（用于判断能否使用共享账本）。
@@ -1183,7 +978,7 @@ impl RelayManager {
 
     /// 把会话快照发给 to。recall=true 表示这是漫游召回的自动回传（对方前端标注「召回」）。
     fn send_share(&self, thread_id: &str, to: &str, recall: bool) -> Result<(), String> {
-        let (title, agent_kind, items, plan, active_clue_card_id) = {
+        let (title, agent_kind, items, plan) = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             let t = store.get(thread_id).ok_or("线程不存在")?;
@@ -1195,7 +990,6 @@ impl RelayManager {
                 t.agent_kind.clone(),
                 serde_json::to_value(&items).unwrap_or(json!([])),
                 t.plan.clone().unwrap_or(json!(null)),
-                t.active_clue_card_id.clone(),
             )
         };
         self.enqueue(
@@ -1206,7 +1000,6 @@ impl RelayManager {
                 "agentKind": agent_kind,
                 "items": items,
                 "plan": plan,
-                "activeClueCardId": active_clue_card_id,
                 "recall": recall,
             }),
         );
@@ -1223,7 +1016,6 @@ impl RelayManager {
                 .unwrap_or(AgentKind::Unsupported),
             items: env.data["items"].clone(),
             plan: env.data["plan"].clone(),
-            active_clue_card_id: env.data["activeClueCardId"].as_str().map(str::to_string),
             recall: env.data["recall"].as_bool().unwrap_or(false),
             ts: now_ms(),
         };
@@ -1285,7 +1077,6 @@ impl RelayManager {
         } else {
             Some(share.plan)
         };
-        thread.active_clue_card_id = share.active_clue_card_id;
         let thread_id = thread.id.clone();
         {
             let state = self.app.state::<AppState>();
@@ -1319,15 +1110,11 @@ impl RelayManager {
         if self.cfg().is_none() {
             return Err("未配置中转站 token".into());
         }
-        let (src_cwd, transcript, active_clue_card_id) = {
+        let (src_cwd, transcript) = {
             let state = self.app.state::<AppState>();
             let store = state.store.lock().unwrap();
             let t = store.get(thread_id).ok_or("线程不存在")?;
-            (
-                t.cwd.clone(),
-                build_transcript(&t.items),
-                t.active_clue_card_id.clone(),
-            )
+            (t.cwd.clone(), build_transcript(&t.items))
         };
         if transcript.trim().is_empty() {
             return Err("会话还没有内容可处理".into());
@@ -1360,7 +1147,6 @@ impl RelayManager {
         };
         let model_opt = if model.is_empty() { None } else { Some(model) };
         let mut thread = Thread::new(cwd, agent_kind.clone(), model_opt, None, None, true);
-        thread.active_clue_card_id = active_clue_card_id;
         thread.title = format!("高级分享 · {}", first_line(&prompt, 24));
         let new_id = thread.id.clone();
         {
@@ -1418,7 +1204,6 @@ impl RelayManager {
         model: Option<String>,
         mode: Option<String>,
         first_prompt: Option<String>,
-        clue_context: Option<ClueContextSnapshot>,
         worktree: bool,
         worktree_branch: Option<String>,
         worktree_base: Option<String>,
@@ -1440,10 +1225,6 @@ impl RelayManager {
         thread.roaming_role = Some("guest".into());
         thread.roaming_peer = Some(peer_token.clone());
         thread.roaming_peer_name = Some(peer_name.clone());
-        if let Some(context) = clue_context.clone() {
-            thread.active_clue_card_id = Some(context.root_card_id.clone());
-            thread.clue_context = Some(context);
-        }
         thread.title = format!("漫游 · {}", basename(&folder));
         if worktree {
             // guest 侧只是展示壳，真实 worktree 由 host 在自己仓库创建；这里仅记录分支用于界面标注
@@ -1486,7 +1267,6 @@ impl RelayManager {
                 "mode": mode,
                 // 首条提示词随请求发给 host，仅用于审批确认框展示「谁要做什么」
                 "prompt": first_prompt,
-                "clueContext": clue_context,
                 // worktree：让 host 在自己仓库为这次漫游创建独立工作目录 + 分支
                 "worktree": worktree,
                 "worktreeBranch": worktree_branch,
@@ -1728,8 +1508,6 @@ impl RelayManager {
         thread.roaming_peer_name = parent.roaming_peer_name;
         thread.roaming_remote_id = Some(uuid::Uuid::new_v4().to_string());
         thread.worktree = parent.worktree;
-        thread.active_clue_card_id = parent.active_clue_card_id;
-        thread.clue_context = parent.clue_context;
         self.hosted.lock().unwrap().insert(thread.id.clone(), RoamGuest {
             token: guest.token,
             guest_thread_id: thread.roaming_remote_id.clone().unwrap(),
@@ -1753,7 +1531,6 @@ impl RelayManager {
         mirror.items.clear();
         mirror.plan = None;
         mirror.acp_session_id = None;
-        mirror.clue_context = None;
         self.spawn_send_now(peer, "roaming.stage", json!({
             "guestThreadId": guest_id, "parentGuestThreadId": parent_guest_id, "thread": mirror,
         }));
@@ -2028,22 +1805,6 @@ impl RelayManager {
         let agent_kind_str = agent_kind.as_str();
         let model = env.data["model"].as_str().map(|s| s.to_string());
         let mode = env.data["mode"].as_str().map(|s| s.to_string());
-        let clue_context = match env.data.get("clueContext") {
-            Some(value) if !value.is_null() => {
-                match serde_json::from_value::<ClueContextSnapshot>(value.clone()) {
-                    Ok(context) => Some(context),
-                    Err(_) => {
-                        self.spawn_send_now(
-                            env.from.clone(),
-                            "roaming.created",
-                            json!({ "reqId": req_id, "ok": false, "error": "证据链上下文格式无效" }),
-                        );
-                        return;
-                    }
-                }
-            }
-            _ => None,
-        };
         let worktree = env.data["worktree"].as_bool().unwrap_or(false);
         let worktree_branch = env.data["worktreeBranch"].as_str().map(|s| s.to_string());
         let worktree_base = env.data["worktreeBase"].as_str().map(|s| s.to_string());
@@ -2069,7 +1830,6 @@ impl RelayManager {
                 agent_kind: agent_kind.clone(),
                 model,
                 mode,
-                clue_context,
                 worktree,
                 worktree_branch: worktree_branch.clone(),
                 worktree_base,
@@ -2194,10 +1954,6 @@ impl RelayManager {
         thread.roaming_peer = Some(pending.from.clone());
         thread.roaming_peer_name = Some(pending.from_name.clone());
         thread.roaming_remote_id = Some(pending.guest_thread_id.clone());
-        if let Some(context) = pending.clue_context {
-            thread.active_clue_card_id = Some(context.root_card_id.clone());
-            thread.clue_context = Some(context);
-        }
         thread.title = format!("漫游@{} · {}", pending.from_name, basename(&pending.folder));
         let host_thread_id = thread.id.clone();
         // worktree：host 在自己仓库为这次漫游创建独立工作目录 + 分支，会话在其中执行。
@@ -2369,7 +2125,6 @@ impl RelayManager {
                     agent_kind: agent_kind.clone(),
                     model: model.clone(),
                     mode: mode.clone(),
-                    clue_context: None,
                     worktree: false,
                     worktree_branch: None,
                     worktree_base: None,

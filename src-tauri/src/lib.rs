@@ -11,7 +11,6 @@ mod layout;
 mod altair_run;
 mod tool_experience;
 mod clipboard;
-mod clues;
 mod context_service;
 mod gitwt;
 mod http_stream;
@@ -76,8 +75,6 @@ pub struct AppState {
     pub store: Mutex<ThreadStore>,
     /// 自动清理会话的延迟删除回收站（thread-trash.json）。
     pub thread_trash: Mutex<ThreadTrashStore>,
-    /// 证据链本地存储：未配置 Relay 时是真相来源；配置后作为团队数据缓存。
-    pub clues: Mutex<clues::ClueStore>,
     pub projects: Mutex<ProjectStore>,
     pub settings: Mutex<Settings>,
     /// 应用启动时读取的 Windows shell shim 开关；运行中改设置只会在下次重启时生效。
@@ -863,204 +860,10 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             auto_scene: t.auto_scene.clone(),
-            active_clue_card_id: t.active_clue_card_id.clone(),
         })
         .collect();
     metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     metas
-}
-
-#[tauri::command]
-async fn list_clue_groups(
-    state: State<'_, AppState>,
-    space: Option<String>,
-) -> Result<Vec<clues::ClueNodeGroup>, String> {
-    if !state.relay.is_configured() {
-        return Err("云端证据链需要先配置团队中转站".into());
-    }
-    state
-        .relay
-        .clue_list(space.as_deref().unwrap_or("personal"))
-        .await
-}
-
-#[tauri::command]
-async fn get_clue_context(
-    state: State<'_, AppState>,
-    card_id: String,
-) -> Result<clues::ClueContextSnapshot, String> {
-    if state.relay.is_configured() {
-        state.relay.clue_context(&card_id).await
-    } else {
-        state.clues.lock().unwrap().snapshot(&card_id)
-    }
-}
-
-#[tauri::command]
-async fn capture_clue(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    thread_id: Option<String>,
-    title: String,
-    content: String,
-    placement: String,
-    target_card_id: Option<String>,
-    mention_tokens: Vec<String>,
-    attachments: Vec<clues::ClueAttachment>,
-    space: Option<String>,
-) -> Result<clues::CaptureClueResult, String> {
-    if let Some(thread_id) = thread_id.as_deref() {
-        let store = state.store.lock().unwrap();
-        if store.get(thread_id).is_none() {
-            return Err("线程不存在".into());
-        }
-    }
-    if !state.relay.is_configured() {
-        return Err("云端证据链需要先配置团队中转站".into());
-    }
-    let clue_space = space.as_deref().unwrap_or("personal");
-    let result = state
-        .relay
-        .clue_capture(
-            thread_id.as_deref(),
-            &title,
-            &content,
-            &placement,
-            target_card_id.as_deref(),
-            &mention_tokens,
-            &attachments,
-            clue_space,
-        )
-        .await?;
-    if let Some(thread_id) = thread_id {
-        let mut store = state.store.lock().unwrap();
-        if let Some(thread) = store.get_mut(&thread_id) {
-            thread.active_clue_card_id = Some(result.card.id.clone());
-            thread.updated_at = now_ms();
-            store.save();
-        }
-        let _ = app.emit(acp::EV_THREADS, json!({}));
-    }
-    let _ = app.emit(clues::EV_CLUES, json!({}));
-    Ok(result)
-}
-
-#[tauri::command]
-async fn add_clue_comment(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    card_id: String,
-    content: String,
-    parent_comment_id: Option<String>,
-    mention_tokens: Vec<String>,
-    space: Option<String>,
-) -> Result<(), String> {
-    if !state.relay.is_configured() {
-        return Err("云端证据链需要先配置团队中转站".into());
-    }
-    state
-        .relay
-        .clue_comment(
-            &card_id,
-            &content,
-            parent_comment_id.as_deref(),
-            &mention_tokens,
-            space.as_deref().unwrap_or("personal"),
-        )
-        .await?;
-    let _ = app.emit(clues::EV_CLUES, json!({}));
-    Ok(())
-}
-
-#[tauri::command]
-async fn associate_clues(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    before_card_id: String,
-    after_card_id: String,
-    space: Option<String>,
-) -> Result<clues::ClueNodeGroup, String> {
-    let group = state
-        .relay
-        .clue_associate(
-            &before_card_id,
-            &after_card_id,
-            space.as_deref().unwrap_or("personal"),
-        )
-        .await?;
-    let _ = app.emit(clues::EV_CLUES, json!({}));
-    Ok(group)
-}
-
-#[tauri::command]
-async fn disassociate_clues(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    before_card_id: String,
-    after_card_id: String,
-    space: Option<String>,
-) -> Result<clues::ClueNodeGroup, String> {
-    let group = state
-        .relay
-        .clue_disassociate(
-            &before_card_id,
-            &after_card_id,
-            space.as_deref().unwrap_or("personal"),
-        )
-        .await?;
-    let _ = app.emit(clues::EV_CLUES, json!({}));
-    Ok(group)
-}
-
-#[tauri::command]
-async fn split_clue(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    card_id: String,
-    space: Option<String>,
-) -> Result<clues::ClueNodeGroup, String> {
-    let group = state
-        .relay
-        .clue_split(&card_id, space.as_deref().unwrap_or("personal"))
-        .await?;
-    let _ = app.emit(clues::EV_CLUES, json!({}));
-    Ok(group)
-}
-
-#[tauri::command]
-async fn stack_clues(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    card_ids: Vec<String>,
-    space: Option<String>,
-) -> Result<clues::ClueNodeGroup, String> {
-    let group = state
-        .relay
-        .clue_stack(&card_ids, space.as_deref().unwrap_or("personal"))
-        .await?;
-    let _ = app.emit(clues::EV_CLUES, json!({}));
-    Ok(group)
-}
-
-#[tauri::command]
-async fn delete_clue(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    card_id: String,
-    space: Option<String>,
-) -> Result<(), String> {
-    state
-        .relay
-        .clue_delete(&card_id, space.as_deref().unwrap_or("personal"))
-        .await?;
-    let mut store = state.store.lock().unwrap();
-    if store.clear_active_clue_card(&card_id) {
-        store.save();
-        let _ = app.emit(acp::EV_THREADS, json!({}));
-    }
-    drop(store);
-    let _ = app.emit(clues::EV_CLUES, json!({}));
-    Ok(())
 }
 
 #[tauri::command]
@@ -1585,7 +1388,6 @@ async fn create_thread(
     worktree: Option<bool>,
     worktree_branch: Option<String>,
     worktree_base: Option<String>,
-    clue_card_id: Option<String>,
     parent_thread_id: Option<String>,
     auto_scene: Option<String>,
 ) -> Result<Thread, String> {
@@ -1613,15 +1415,6 @@ async fn create_thread(
     );
     thread.parent_thread_id = parent_thread_id.filter(|id| !id.trim().is_empty());
     thread.auto_scene = auto_scene.as_deref().and_then(settings::Scene::parse).map(|s| s.key().into());
-    if let Some(card_id) = clue_card_id.filter(|value| !value.trim().is_empty()) {
-        let snapshot = if state.relay.is_configured() {
-            state.relay.clue_context(&card_id).await?
-        } else {
-            state.clues.lock().unwrap().snapshot(&card_id)?
-        };
-        thread.active_clue_card_id = Some(card_id);
-        thread.clue_context = Some(snapshot);
-    }
     // worktree：在独立工作目录 + 分支中执行，不动主工作区。
     // 大仓库 `git worktree add` 很慢，改为后台创建：会话先落库返回、前端立即进入，
     // 就绪后再把 cwd 切到 worktree 并由前端补发首条提示词，避免卡住界面。
@@ -2590,37 +2383,7 @@ fn open_file_default(
     open_path_default(&abs)
 }
 
-/// 打开线索附件。粘贴附件先还原到临时目录，路径附件直接交给系统默认程序。
-#[tauri::command]
-fn open_clue_attachment(
-    name: String,
-    data: Option<String>,
-    path: Option<String>,
-) -> Result<(), String> {
-    let abs = if let Some(data) = data.filter(|value| !value.is_empty()) {
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|error| format!("附件数据损坏：{error}"))?;
-        let safe_name = std::path::Path::new(&name)
-            .file_name()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or("attachment");
-        let dir = std::env::temp_dir().join("nova-clue-attachments");
-        std::fs::create_dir_all(&dir).map_err(|error| format!("创建附件临时目录失败：{error}"))?;
-        let abs = dir.join(format!("{}-{safe_name}", uuid::Uuid::new_v4()));
-        std::fs::write(&abs, bytes).map_err(|error| format!("还原附件失败：{error}"))?;
-        abs
-    } else if let Some(path) = path.filter(|value| !value.is_empty()) {
-        std::path::PathBuf::from(path)
-    } else {
-        return Err("附件没有可打开的数据".into());
-    };
-    open_path_default(&abs)
-}
-
-/// 按扩展名猜测附件 MIME 类型（选择本地文件作附件时使用）。
+/// 按扩展名猜测附件 MIME 类型。
 fn guess_attachment_mime_type(name: &str) -> String {
     let ext = std::path::Path::new(name)
         .extension()
@@ -2646,9 +2409,9 @@ fn guess_attachment_mime_type(name: &str) -> String {
     mime.to_string()
 }
 
-/// 读取本地文件并转换为内嵌（base64）线索附件，供线索弹窗「添加附件」选择任意文件。
+/// 读取本地文件并转换为内嵌（base64）附件，供输入框「添加附件」选择任意文件。
 #[tauri::command]
-fn read_local_attachment(path: String) -> Result<clues::ClueAttachment, String> {
+fn read_local_attachment(path: String) -> Result<PromptImage, String> {
     const MAX_SIZE: u64 = 20 * 1024 * 1024;
     let abs = std::path::PathBuf::from(&path);
     let meta = std::fs::metadata(&abs).map_err(|error| format!("读取文件失败：{error}"))?;
@@ -2667,40 +2430,13 @@ fn read_local_attachment(path: String) -> Result<clues::ClueAttachment, String> 
         .to_string();
     use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(clues::ClueAttachment {
+    Ok(PromptImage {
         mime_type: guess_attachment_mime_type(&name),
         name,
         data: Some(data),
         uri: None,
         size: Some(meta.len()),
     })
-}
-
-/// 把线索附件保存到指定路径（下载）：内嵌 base64 数据先还原，路径附件直接复制。
-#[tauri::command]
-fn save_clue_attachment(
-    data: Option<String>,
-    path: Option<String>,
-    target: String,
-) -> Result<(), String> {
-    let bytes = if let Some(data) = data.filter(|value| !value.is_empty()) {
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|error| format!("附件数据损坏：{error}"))?
-    } else if let Some(path) = path.filter(|value| !value.is_empty()) {
-        std::fs::read(path).map_err(|error| format!("读取附件原文件失败：{error}"))?
-    } else {
-        return Err("附件没有可下载的数据".into());
-    };
-    let target = std::path::PathBuf::from(target);
-    if let Some(parent) = target.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("创建下载目录失败：{error}"))?;
-        }
-    }
-    std::fs::write(&target, bytes).map_err(|error| format!("保存附件失败：{error}"))
 }
 
 /// 撤销目标：一个文件回滚到本轮编辑前的内容
@@ -3193,24 +2929,6 @@ fn rename_thread(
     Ok(())
 }
 
-/// 移除会话的证据链引用（位置与注入给 agent 的上下文快照一并清掉）。
-#[tauri::command]
-fn clear_thread_clue(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    thread_id: String,
-) -> Result<(), String> {
-    {
-        let mut store = state.store.lock().unwrap();
-        let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
-        thread.active_clue_card_id = None;
-        thread.clue_context = None;
-        store.save();
-    }
-    let _ = app.emit(acp::EV_THREADS, json!({}));
-    Ok(())
-}
-
 /// 为阶段会话按任务生成标题；生成失败时保留现有标题。
 #[tauri::command]
 fn generate_thread_title(state: State<'_, AppState>, thread_id: String, prompt: String) {
@@ -3582,19 +3300,6 @@ fn send_prompt(
     images: Option<Vec<PromptImage>>,
 ) -> Result<(), String> {
     dispatch_prompt(&app, thread_id, text, images.unwrap_or_default())
-}
-
-fn append_thread_error(app: &tauri::AppHandle, thread_id: &str, error: String) {
-    let state = app.state::<AppState>();
-    {
-        let mut store = state.store.lock().unwrap();
-        let Some(thread) = store.get_mut(thread_id) else {
-            return;
-        };
-        thread.push_system(error, "error");
-        store.save();
-    }
-    let _ = app.emit(relay::EV_RELAY_RELOAD, json!({ "threadId": thread_id }));
 }
 
 pub(crate) fn dispatch_prompt(
@@ -4186,85 +3891,6 @@ fn advanced_share(
     )
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClueAiSummary {
-    title: String,
-    content: String,
-}
-
-async fn run_auxiliary_prompt(
-    kind: &AgentKind,
-    app: &tauri::AppHandle,
-    thread_id: String,
-    prompt: String,
-) {
-    let state = app.state::<AppState>();
-    match kind {
-        AgentKind::Lyra => {
-            state
-                .lyra
-                .clone()
-                .run_prompt(thread_id, prompt, Vec::new())
-                .await
-        }
-        _ => {
-            append_thread_error(app, &thread_id, "该后端已移除，请选择其他后端".into());
-        }
-    }
-}
-
-fn last_assistant_text(app: &tauri::AppHandle, thread_id: &str) -> Option<String> {
-    let state = app.state::<AppState>();
-    let store = state.store.lock().unwrap();
-    store
-        .get(thread_id)?
-        .items
-        .iter()
-        .rev()
-        .find_map(|item| match item {
-            Item::Assistant { text, .. } if !text.trim().is_empty() => {
-                Some(text.trim().to_string())
-            }
-            _ => None,
-        })
-}
-
-/// 按顺序用临时辅助会话跑一次提示词，返回第一个非空回复；每次尝试后清理辅助会话。
-async fn auxiliary_complete(
-    app: &tauri::AppHandle,
-    cwd: &str,
-    title: &str,
-    attempts: Vec<(AgentKind, Option<String>)>,
-    seed: &str,
-) -> Option<String> {
-    let state = app.state::<AppState>();
-    for (agent_kind, model_opt) in attempts {
-        let mut thread = Thread::new(cwd.to_string(), agent_kind.clone(), model_opt, None, None, true);
-        thread.title = title.into();
-        let run_id = thread.id.clone();
-        {
-            let mut store = state.store.lock().unwrap();
-            store.threads.push(thread);
-            store.save();
-        }
-        let _ = app.emit(acp::EV_THREADS, json!({}));
-        run_auxiliary_prompt(&agent_kind, app, run_id.clone(), seed.to_string()).await;
-        let output = last_assistant_text(app, &run_id).filter(|text| !text.trim().is_empty());
-        {
-            let mut store = state.store.lock().unwrap();
-            store.threads.retain(|t| t.id != run_id);
-            store.save();
-        }
-        state.lyra.forget_session_of_thread(&run_id);
-        let _ = app.emit(acp::EV_THREADS, json!({}));
-        if output.is_some() {
-            return output;
-        }
-    }
-    None
-}
-
 /// 员工等旧路径的失效切换：无回复时按场景列表换模型并重发；返回是否已切换。
 /// 普通 Lyra 自动会话由运行时在原会话内部 fallback，退出恢复初始模型；外部不可重发或改基准模型。
 /// 旧场景子会话仍由 lyra::session::scene_loop 处理。
@@ -4310,103 +3936,6 @@ fn auto_failover(app: tauri::AppHandle, state: State<'_, AppState>, thread_id: S
     let _ = app.emit(acp::EV_THREADS, json!({}));
     dispatch_prompt(&app, thread_id, text, images)?;
     Ok(true)
-}
-
-/// 优先用轻量级模型总结会话核心内容，失败时回退到原会话模型。
-#[tauri::command]
-async fn summarize_clue(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    thread_id: String,
-) -> Result<ClueAiSummary, String> {
-    let (src_cwd, transcript, fallback_title, origin_agent, origin_model) = {
-        let store = state.store.lock().unwrap();
-        let t = store.get(&thread_id).ok_or("线程不存在")?;
-        (
-            t.cwd.clone(),
-            relay::build_transcript(&t.items),
-            t.title.clone(),
-            t.agent_kind.clone(),
-            t.model.clone(),
-        )
-    };
-    if transcript.trim().is_empty() {
-        return Err("会话还没有内容可总结".into());
-    }
-
-    // 轻量化场景按顺序尝试，最后回退到原会话模型。
-    let mut attempts: Vec<(AgentKind, Option<String>)> = state
-        .scene_models(settings::Scene::Lightweight)
-        .into_iter()
-        .map(|(kind, model)| (kind, Some(model).filter(|m| !m.is_empty())))
-        .collect();
-    if !attempts.contains(&(origin_agent.clone(), origin_model.clone())) {
-        attempts.push((origin_agent, origin_model));
-    }
-
-    let cwd = if std::path::Path::new(&src_cwd).is_dir() {
-        src_cwd
-    } else {
-        let name = format!("clue-sum-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let dir = std::env::temp_dir().join(SCRATCH_MARK).join(name);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
-        dir.to_string_lossy().to_string()
-    };
-    let seed = format!(
-        "请总结下面这段会话的核心内容，用于保存为「线索」。\n\
-         严格按以下格式输出，不要其它前言或解释：\n\n\
-         标题：一句话概括（不超过50字）\n\
-         内容：\n\
-         结论、关键证据/产物、验证结果与下一步（可多段）\n\n\
-         ----\n会话记录：\n\n{transcript}"
-    );
-
-    let raw = auxiliary_complete(&app, &cwd, "线索 AI 总结", attempts, &seed).await;
-    let raw = raw.ok_or_else(|| "总结失败：轻量模型和原模型均没有返回内容".to_string())?;
-    Ok(parse_clue_ai_summary(&raw, &fallback_title))
-}
-
-fn parse_clue_ai_summary(raw: &str, fallback_title: &str) -> ClueAiSummary {
-    let text = raw.trim();
-    let (mut title, mut content) = if let Some(rest) = text
-        .strip_prefix("标题：")
-        .or_else(|| text.strip_prefix("标题:"))
-    {
-        let rest = rest.trim_start();
-        if let Some((t, c)) = rest
-            .split_once("\n内容：")
-            .or_else(|| rest.split_once("\n内容:"))
-        {
-            (
-                t.lines().next().unwrap_or("").trim().to_string(),
-                c.trim().to_string(),
-            )
-        } else if let Some((t, c)) = rest.split_once('\n') {
-            (t.trim().to_string(), c.trim().to_string())
-        } else {
-            (rest.trim().to_string(), String::new())
-        }
-    } else {
-        let mut lines = text.lines();
-        let first = lines.next().unwrap_or("").trim().to_string();
-        let rest = lines.collect::<Vec<_>>().join("\n").trim().to_string();
-        if rest.is_empty() {
-            (String::new(), text.to_string())
-        } else {
-            (first, rest)
-        }
-    };
-
-    if title.is_empty() {
-        title = fallback_title.trim().to_string();
-    }
-    if title.chars().count() > 100 {
-        title = title.chars().take(100).collect();
-    }
-    if content.is_empty() {
-        content = text.to_string();
-    }
-    ClueAiSummary { title, content }
 }
 
 fn miniapp_validate_text(text: &str, max_bytes: usize) -> Result<(), String> {
@@ -4521,7 +4050,6 @@ async fn create_roaming_thread(
     model: Option<String>,
     mode: Option<String>,
     first_prompt: Option<String>,
-    clue_card_id: Option<String>,
     worktree: Option<bool>,
     worktree_branch: Option<String>,
     worktree_base: Option<String>,
@@ -4534,10 +4062,6 @@ async fn create_roaming_thread(
     let mode = mode
         .filter(|s| !s.is_empty())
         .or(Some(default_mode).filter(|s| !s.is_empty()));
-    let clue_context = match clue_card_id.filter(|value| !value.trim().is_empty()) {
-        Some(card_id) => Some(state.relay.clue_context(&card_id).await?),
-        None => None,
-    };
     relay
         .create_roaming_thread(
             peer_token,
@@ -4547,7 +4071,6 @@ async fn create_roaming_thread(
             model.filter(|s| !s.is_empty()),
             mode,
             first_prompt.filter(|s| !s.trim().is_empty()),
-            clue_context,
             worktree.unwrap_or(false),
             worktree_branch.filter(|s| !s.trim().is_empty()),
             worktree_base.filter(|s| !s.trim().is_empty()),
@@ -4845,7 +4368,6 @@ pub fn run() {
 
             let mut store = ThreadStore::load(dir.clone());
             let thread_trash = ThreadTrashStore::load(&dir);
-            let clues = clues::ClueStore::load(&dir);
             let mut projects = ProjectStore::load(&dir);
             // 迁移：项目列表为空时从既有会话提取目录
             if projects.projects.is_empty() && !store.threads.is_empty() {
@@ -4906,7 +4428,6 @@ pub fn run() {
             app.manage(AppState {
                 store: Mutex::new(store),
                 thread_trash: Mutex::new(thread_trash),
-                clues: Mutex::new(clues),
                 projects: Mutex::new(projects),
                 settings: Mutex::new(settings),
                 windows_shell_shim_enabled,
@@ -5171,15 +4692,6 @@ pub fn run() {
             get_thread,
             get_thread_view,
             get_thread_items,
-            list_clue_groups,
-            get_clue_context,
-            capture_clue,
-            add_clue_comment,
-            associate_clues,
-            disassociate_clues,
-            split_clue,
-            stack_clues,
-            delete_clue,
             list_projects,
             remove_project,
             scratch_dir,
@@ -5206,9 +4718,7 @@ pub fn run() {
             workspace_files::workspace_git_image,
             workspace_files::save_workspace_file,
             workspace_files::search_workspace_files,
-            open_clue_attachment,
             read_local_attachment,
-            save_clue_attachment,
             revert_file_changes,
             open_in_explorer,
             open_in_terminal,
@@ -5222,7 +4732,6 @@ pub fn run() {
             delete_time_machine_context,
             fork_thread,
             rename_thread,
-            clear_thread_clue,
             notify_fire_done,
             set_prompt_queue_pending,
             set_thread_model,
@@ -5266,7 +4775,6 @@ pub fn run() {
             team_miniapp_publish,
             team_miniapp_remove,
             advanced_share,
-            summarize_clue,
             auto_failover,
             generate_thread_title,
             miniapp_generate,

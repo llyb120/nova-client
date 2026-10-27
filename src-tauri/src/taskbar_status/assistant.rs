@@ -443,7 +443,7 @@ async fn create(app: &tauri::AppHandle, text: &str, context: &str, cwd: Option<S
     let cwd = match cwd { Some(cwd) => cwd, None => crate::scratch_dir()? };
     let (kind, model) = app.state::<AppState>().scene_model(Scene::Lightweight)?;
     let thread = crate::create_thread(app.clone(), app.state(), cwd, Some(kind), Some(model),
-        Some("build".into()), None, Some(false), Some(false), None, None, None, None,
+        Some("build".into()), None, Some(false), Some(false), None, None, None,
         Some(Scene::Lightweight.key().into())).await?;
     scheduled(thread.id, text, context)
 }
