@@ -107,6 +107,11 @@ pub(super) fn open(app: &AppHandle, anchor: Anchor, quick: bool) {
     watch(app);
 }
 
+pub(super) fn toggle(app: &AppHandle) {
+    if WANTED.load(Ordering::Acquire) { return hide(app); }
+    if let Some(anchor) = super::windows::chip_anchor() { open(app, anchor, false); }
+}
+
 /// Unfocused preview after a failed drop: show the assistant unless the panel is already open.
 pub(super) fn open_panel(app: &AppHandle, anchor: Anchor) {
     if WANTED.load(Ordering::Acquire) { return; }

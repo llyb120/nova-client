@@ -69,7 +69,7 @@ impl Scene {
         match self {
             Scene::Lightweight => "简单问答、整理总结、标题摘要等轻量事务",
             Scene::Coding => "需要写代码、改仓库、调试或运行构建测试",
-            Scene::Computer => "需要操作桌面应用或浏览器（截图、点击、输入）",
+            Scene::Computer => "需要实际操控桌面应用或浏览器（点击、输入、截屏取证）；用户只是发来图片不算",
         }
     }
 
@@ -219,7 +219,7 @@ pub struct Settings {
     pub session_shortcuts: Vec<SessionShortcut>,
     /// Meteor 屏幕标注入口；开发实例运行时正式版自动让出触发权。
     pub meteor_enabled: bool,
-    /// Alt+Alt 表示连续两次纯 Alt；其它值为全局组合键。
+    /// 全局组合键；空表示不设置快捷键（连按两次 Alt 固定用于 Butterfly）。
     pub meteor_shortcut: String,
     /// Meteor 提交时附加触发时的最近剪贴板（文字/图片/文件路径）；默认关闭。
     pub meteor_clipboard: bool,
@@ -276,7 +276,7 @@ impl Default for Settings {
             model_favorites: Vec::new(),
             session_shortcuts: Vec::new(),
             meteor_enabled: true,
-            meteor_shortcut: "Alt+Alt".into(),
+            meteor_shortcut: String::new(),
             meteor_clipboard: false,
             meteor_paste_shortcut: "Alt+V".into(),
             jianpu_shortcut: "Alt+R".into(),
@@ -493,7 +493,7 @@ mod tests {
     fn meteor_defaults_and_configuration_round_trip() {
         for settings in [Settings::default(), serde_json::from_str::<Settings>(r#"{}"#).unwrap()] {
             assert!(settings.meteor_enabled);
-            assert_eq!(settings.meteor_shortcut, "Alt+Alt");
+            assert_eq!(settings.meteor_shortcut, "");
             assert!(!settings.meteor_clipboard);
             assert_eq!(settings.meteor_paste_shortcut, "Alt+V");
         }
@@ -775,6 +775,8 @@ impl Settings {
             settings.lyra_enabled = true;
         }
         settings.migrate_legacy_vega();
+        // 连按两次 Alt 现在固定用于弹出/关闭 Butterfly，不再是流星快捷键。
+        if settings.meteor_shortcut.trim().eq_ignore_ascii_case("Alt+Alt") { settings.meteor_shortcut.clear(); }
         settings
     }
 

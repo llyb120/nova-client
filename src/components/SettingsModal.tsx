@@ -244,7 +244,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     (s?.sessionShortcuts ?? []).map((item) => ({ ...item })),
   );
   const [meteorEnabled, setMeteorEnabled] = createSignal(s?.meteorEnabled ?? true);
-  const [meteorShortcut, setMeteorShortcut] = createSignal(s?.meteorShortcut ?? "Alt+Alt");
+  const [meteorShortcut, setMeteorShortcut] = createSignal(s?.meteorShortcut === "Alt+Alt" ? "" : s?.meteorShortcut ?? "");
   const [meteorClipboard, setMeteorClipboard] = createSignal(s?.meteorClipboard ?? false);
   const [meteorPasteShortcut, setMeteorPasteShortcut] = createSignal(s?.meteorPasteShortcut ?? "Alt+V");
   const [jianpuShortcut, setJianpuShortcut] = createSignal(s?.jianpuShortcut ?? "Alt+R");
@@ -823,8 +823,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       const keys = meteorShortcut().trim().toLowerCase();
       const pasteKeys = meteorPasteShortcut().trim().toLowerCase();
       const sessionKeys = withDefaultSessionShortcuts(draftedShortcuts).map((item) => item.keys.trim().toLowerCase());
-      const error = !keys ? "请为 Meteor 录制快捷键，或恢复连按两次 Alt。"
-        : sessionKeys.includes(keys)
+      const error = sessionKeys.includes(keys) && keys
           ? "Meteor 快捷键与会话快捷键冲突，请修改后再保存。"
           : pasteKeys && (pasteKeys === keys || sessionKeys.includes(pasteKeys))
             ? "星移快捷键与 Meteor 或会话快捷键冲突，请修改后再保存。" : "";
@@ -1017,10 +1016,10 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               <div class="field">
                 <span class="field-label">全局快捷键</span>
                 <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
-                  <ShortcutKeyCapture value={meteorShortcut() === "Alt+Alt" ? "连按两次 Alt" : meteorShortcut()} onChange={setMeteorShortcut} />
-                  <button type="button" class="btn secondary" onClick={() => setMeteorShortcut("Alt+Alt")}>恢复双 Alt</button>
+                  <ShortcutKeyCapture value={meteorShortcut() || "未设置"} onChange={setMeteorShortcut} />
+                  <button type="button" class="btn secondary" onClick={() => setMeteorShortcut("")}>清除</button>
                 </div>
-                <span class="field-hint">目前支持 Windows。默认快速按下并松开两次 Alt；点击上方按钮可录制其他组合键（需包含 Ctrl、Alt、Shift 或 Win，以系统全局快捷键注册），Esc 取消录制。若组合键已被其他程序占用会提示注册失败，请换一个。</span>
+                <span class="field-hint">目前支持 Windows。默认不设置（连按两次 Alt 用于弹出/关闭 Butterfly）；点击上方按钮可录制组合键（需包含 Ctrl、Alt、Shift 或 Win，以系统全局快捷键注册），Esc 取消录制。若组合键已被其他程序占用会提示注册失败，请换一个。</span>
               </div>
               <div class="field">
                 <span class="field-label">星移（StartShift）快捷键</span>

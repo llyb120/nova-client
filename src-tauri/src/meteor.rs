@@ -257,24 +257,25 @@ pub(crate) fn validate(settings: &crate::settings::Settings) -> Result<(), Strin
     validate_shortcut(&settings.meteor_shortcut)?;
     #[cfg(windows)]
     {
-        let binding = platform::parse_shortcut(&settings.meteor_shortcut)?;
-        if settings.session_shortcuts.iter().any(|shortcut| platform::parse_shortcut(&shortcut.keys).ok() == Some(binding)) {
+        let binding = platform::parse_optional(&settings.meteor_shortcut)?;
+        let paste = platform::parse_paste_shortcut(&settings.meteor_paste_shortcut)?;
+        let session = |chord| settings.session_shortcuts.iter().any(|shortcut| platform::parse_shortcut(&shortcut.keys).ok() == Some(chord));
+        if binding.is_some_and(session) {
             return Err("Meteor 快捷键与会话快捷键冲突，请修改其中一个".into());
         }
-        if let Some(paste) = platform::parse_paste_shortcut(&settings.meteor_paste_shortcut)?.map(platform::Binding::Hotkey) {
-            if binding == paste || settings.session_shortcuts.iter().any(|shortcut| platform::parse_shortcut(&shortcut.keys).ok() == Some(paste)) {
-                return Err("星移快捷键与 Meteor 或会话快捷键冲突，请修改其中一个".into());
-            }
+        if paste.is_some_and(|paste| binding == Some(paste) || session(paste)) {
+            return Err("星移快捷键与 Meteor 或会话快捷键冲突，请修改其中一个".into());
         }
     }
     Ok(())
 }
 
+/// Empty means no Meteor shortcut (double Alt is reserved for the Butterfly).
 pub(crate) fn validate_shortcut(keys: &str) -> Result<(), String> {
     #[cfg(windows)]
-    return platform::parse_shortcut(keys).map(|_| ());
+    return platform::parse_optional(keys).map(|_| ());
     #[cfg(not(windows))]
-    if keys.trim().is_empty() { Err("快捷键不能为空".into()) } else { Ok(()) }
+    { let _ = keys; Ok(()) }
 }
 
 fn dismiss(app: &AppHandle) {
@@ -824,11 +825,9 @@ mod platform {
     static STARTED: AtomicBool = AtomicBool::new(false);
     /// The worker's message-only window, 0 until it exists.
     static WORKER: AtomicUsize = AtomicUsize::new(0);
-    #[derive(Clone, Copy, PartialEq)]
-    pub(super) enum Binding { DoubleAlt, Hotkey(Shortcut) }
-    /// The configured binding. The worker keeps the system registration in line with it,
+    /// The configured Meteor chord. The worker keeps the system registration in line with it,
     /// the enable switch, dev priority and settings recording.
-    static WANTED: Mutex<Option<Binding>> = Mutex::new(None);
+    static WANTED: Mutex<Option<Shortcut>> = Mutex::new(None);
     /// Smart-paste chord; follows Meteor's availability and never steals the main binding.
     static WANTED_PASTE: Mutex<Option<Shortcut>> = Mutex::new(None);
 
@@ -921,25 +920,24 @@ mod platform {
         Ok((point.x, point.y))
     }
     /// Chords are system hotkeys (RegisterHotKey). Double Alt, which no hotkey can express, is read
-    /// from passive raw input. Neither is a keyboard hook that Windows can time out and remove.
-    pub(super) fn parse_shortcut(keys: &str) -> Result<Binding, String> {
-        if keys.trim().eq_ignore_ascii_case("Alt+Alt") { return Ok(Binding::DoubleAlt); }
+    /// from passive raw input for the Butterfly. Neither is a keyboard hook that Windows can time out and remove.
+    pub(super) fn parse_shortcut(keys: &str) -> Result<Shortcut, String> {
+        if keys.trim().eq_ignore_ascii_case("Alt+Alt") { return Err("连按两次 Alt 已固定用于 Butterfly，请录制组合键".into()); }
         let shortcut = crate::normalize_global_shortcut(keys).parse::<Shortcut>().map_err(|e| format!("Meteor 快捷键无效：{e}"))?;
         if shortcut.mods.is_empty() { return Err("Meteor 全局快捷键至少需要 Ctrl、Alt、Shift 或 Win 修饰键".into()); }
-        Ok(Binding::Hotkey(shortcut))
+        Ok(shortcut)
     }
-    /// Empty disables smart paste; double Alt is reserved for the main binding.
+    /// Empty means unset.
+    pub(super) fn parse_optional(keys: &str) -> Result<Option<Shortcut>, String> {
+        if keys.trim().is_empty() { Ok(None) } else { parse_shortcut(keys).map(Some) }
+    }
+    /// Empty disables smart paste.
     pub(super) fn parse_paste_shortcut(keys: &str) -> Result<Option<Shortcut>, String> {
-        if keys.trim().is_empty() { return Ok(None); }
-        match parse_shortcut(keys) {
-            Ok(Binding::Hotkey(shortcut)) => Ok(Some(shortcut)),
-            Ok(Binding::DoubleAlt) => Err("星移不支持连按两次 Alt，请录制组合键".into()),
-            Err(error) => Err(format!("星移：{error}")),
-        }
+        parse_optional(keys).map_err(|error| format!("星移：{error}"))
     }
     pub(super) fn configure(keys: &str, paste: &str) -> Result<(), String> {
-        let binding = parse_shortcut(keys);
-        *WANTED.lock().unwrap() = binding.as_ref().ok().copied();
+        let binding = parse_optional(keys);
+        *WANTED.lock().unwrap() = binding.as_ref().ok().copied().flatten();
         let paste = parse_paste_shortcut(paste);
         *WANTED_PASTE.lock().unwrap() = paste.as_ref().ok().copied().flatten();
         binding.map(|_| ()).and(paste.map(|_| ()))
@@ -992,14 +990,17 @@ mod platform {
     impl Listener {
         fn sync(&mut self, app: &AppHandle) {
             let allowed = ensure_allowed().is_ok();
-            let want = WANTED.lock().unwrap().filter(|_| allowed && !RECORDING.load(Ordering::Acquire));
-            let hotkey = match want { Some(Binding::Hotkey(shortcut)) => Some(shortcut), _ => None };
-            let paste = WANTED_PASTE.lock().unwrap().filter(|shortcut| want.is_some() && hotkey != Some(*shortcut));
-            let result = (|| {
-                self.listen(want == Some(Binding::DoubleAlt))?;
-                register(app, &mut self.registered, hotkey, false)?;
-                register(app, &mut self.paste, paste, true)
-            })();
+            let active = allowed && !RECORDING.load(Ordering::Acquire);
+            let hotkey = WANTED.lock().unwrap().filter(|_| active);
+            let paste = WANTED_PASTE.lock().unwrap().filter(|shortcut| active && hotkey != Some(*shortcut));
+            // The Butterfly toggle is independent of Meteor's switch; only dev priority and recording pause it.
+            let tap = !RECORDING.load(Ordering::Acquire) && (cfg!(debug_assertions) || !dev_present());
+            let result = {
+                let listen = self.listen(tap);
+                let main = register(app, &mut self.registered, hotkey, false);
+                let paste = register(app, &mut self.paste, paste, true);
+                listen.and(main).and(paste)
+            };
             match result {
                 Ok(()) => self.failures = 0,
                 // A dev/release hand-over frees the key within a tick or two; report only a lasting
@@ -1022,20 +1023,20 @@ mod platform {
                 hwndTarget: if on { self.window } else { std::ptr::null_mut() },
             };
             if unsafe { RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) } == 0 {
-                return Err(format!("Meteor 无法监听连按两次 Alt（Windows {}），可在设置中改用组合键", unsafe { GetLastError() }));
+                return Err(format!("无法监听连按两次 Alt（Windows {}），Butterfly 快捷弹出不可用", unsafe { GetLastError() }));
             }
             self.listening = on;
             self.taps = DoubleAlt::default();
             Ok(())
         }
-        fn key(&mut self, app: &AppHandle, input: LPARAM, time: u32) {
+        fn key(&mut self, input: LPARAM, time: u32) {
             if !self.listening { return; }
             let Some((vk, down, injected)) = read_key(input) else { return; };
             let held = |vk| unsafe { GetAsyncKeyState(vk) } < 0;
             let modifiers = held(0x10) || held(0x11) || held(0x5B) || held(0x5C);
-            if self.taps.key(vk, down, injected, modifiers, u64::from(time)) && ensure_allowed().is_ok() {
+            if self.taps.key(vk, down, injected, modifiers, u64::from(time)) {
                 grant_foreground();
-                trigger(app, false);
+                crate::taskbar_status::toggle_bubble();
             }
         }
     }
@@ -1068,7 +1069,7 @@ mod platform {
             let mut message = MSG::default();
             while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
                 match message.message {
-                    WM_INPUT => listener.key(&app, message.lParam, message.time),
+                    WM_INPUT => listener.key(message.lParam, message.time),
                     WM_TIMER | WAKE => listener.sync(&app),
                     _ => {}
                 }
@@ -1413,7 +1414,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn shortcut_parser_reuses_standard_names_but_rejects_plain_typing() {
-        assert!(validate_shortcut("Alt+Alt").is_ok());
+        assert!(validate_shortcut("").is_ok());
+        assert!(validate_shortcut("Alt+Alt").is_err());
         assert!(validate_shortcut("Ctrl+Shift+M").is_ok());
         assert!(validate_shortcut("Meta+F12").is_ok());
         assert!(validate_shortcut("M").is_err());

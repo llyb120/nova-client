@@ -374,7 +374,7 @@ export interface Settings {
   sessionShortcuts: SessionShortcut[];
   /** Meteor 屏幕标注入口；dev 实例运行时非 dev 实例自动停用 */
   meteorEnabled: boolean;
-  /** Alt+Alt 表示连按两次 Alt，其余为系统全局组合键（必须带修饰键） */
+  /** 系统全局组合键（必须带修饰键）；空表示不设置 */
   meteorShortcut: string;
   /** Meteor 提交时附加最近剪贴板；默认关闭 */
   meteorClipboard?: boolean;

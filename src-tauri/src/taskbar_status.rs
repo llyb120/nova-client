@@ -108,6 +108,12 @@ pub(crate) struct Rect {
     pub bottom: i32,
 }
 
+/// Alt Alt: open the Butterfly panel, or close it when already open.
+#[cfg(windows)]
+pub(crate) fn toggle_bubble() {
+    windows::on_app(bubble::toggle);
+}
+
 pub(crate) fn start(app: &tauri::AppHandle) {
     // Resume accepted assistant tasks even before the next panel is opened.
     if let Err(error) = assistant::start(app) { eprintln!("[taskbar-assistant] {error}"); }
