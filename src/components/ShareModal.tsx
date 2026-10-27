@@ -93,7 +93,6 @@ export function ShareModal(props: {
           </div>
         </div>
 
-        <>
           <div class="modal-body">
             <Show
               when={canShare()}
@@ -183,7 +182,6 @@ export function ShareModal(props: {
                     : "分享"}
             </button>
           </div>
-        </>
       </div>
     </div>
   );
