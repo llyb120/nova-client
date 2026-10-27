@@ -428,6 +428,8 @@ export interface Settings {
   checkpointEnabled: boolean;
   /** 代码上下文检索模式：无 / FastContext。 */
   contextRetrievalMode: "none" | "fast";
+  /** Lyra 上下文压缩：模型主动压缩（acp，默认）/ 旧的自动摘要折叠。 */
+  contextCompaction: "acp" | "legacy";
   defaultMode: string;
   /** 场景模型：轻量化 / 编码 / 剑来 */
   sceneModels: SceneModels;

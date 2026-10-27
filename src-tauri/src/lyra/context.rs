@@ -219,7 +219,8 @@ impl ContextWindow {
     }
 
     pub fn set_window(&mut self, window: u64) {
-        self.window = window;
+        // ACP 模式下没有声明窗口的模型按 200k 算。
+        self.window = if window == 0 && self.acp_enabled { acp::DEFAULT_WINDOW } else { window };
     }
 
     /// 模型切换保留折叠账本，但旧模型的实测 token 校准不能跨模型沿用。

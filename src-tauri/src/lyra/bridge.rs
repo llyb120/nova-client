@@ -417,8 +417,8 @@ async fn handle_prompt(
     let mcp = crate::lyra::mcp::McpSession::new(mcp_config.clone(), cwd_path.clone(), read_only)?;
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
-    // ACP（模型主动压缩）取代 Lyra 自动摘要折叠；NOVA_LYRA_COMPACTION=legacy 可回退。
-    let acp = std::env::var("NOVA_LYRA_COMPACTION").ok().as_deref() != Some("legacy");
+    // ACP（模型主动压缩）取代 Lyra 自动摘要折叠，设置里可切回 legacy。
+    let acp = settings.context_compaction == crate::settings::ContextCompaction::Acp;
     if acp {
         tools.extend(acp_tools());
         system_prompt.push_str(crate::lyra::context::ACP_GUIDE);

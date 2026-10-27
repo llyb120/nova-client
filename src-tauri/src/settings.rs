@@ -124,6 +124,25 @@ impl ContextRetrievalMode {
     }
 }
 
+/// Lyra 上下文压缩方式：acp = 模型主动 compress（默认），legacy = 旧的自动摘要折叠。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextCompaction {
+    Legacy,
+    #[default]
+    #[serde(other)]
+    Acp,
+}
+
+impl ContextCompaction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Acp => "acp",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -207,6 +226,8 @@ pub struct Settings {
     pub knowledge_graph_enabled: bool,
     /// 上下文检索：none / fast。旧配置中的 super 会在加载时迁移为 fast。
     pub context_retrieval_mode: ContextRetrievalMode,
+    /// Lyra 上下文压缩：acp（默认）/ legacy。对新启动的会话生效。
+    pub context_compaction: ContextCompaction,
 
     /// 用户自定义追加的环境变量（覆盖同名用户/系统变量），
     /// 注入所有 agent 子进程。
@@ -250,6 +271,7 @@ impl Default for Settings {
             session_auto_cleanup_hours: 24 * 30,
             knowledge_graph_enabled: false,
             context_retrieval_mode: ContextRetrievalMode::Fast,
+            context_compaction: ContextCompaction::Acp,
             custom_env_vars: std::collections::HashMap::new(),
         }
     }
@@ -411,6 +433,16 @@ mod tests {
             let decoded: super::ContextRetrievalMode = serde_json::from_str(&text).unwrap();
             assert_eq!(decoded, mode);
         }
+    }
+
+    #[test]
+    fn context_compaction_defaults_to_acp_and_round_trips() {
+        assert_eq!(super::Settings::default().context_compaction, super::ContextCompaction::Acp);
+        let old: super::Settings = serde_json::from_str(r#"{"contextRetrievalMode":"fast"}"#).unwrap();
+        assert_eq!(old.context_compaction, super::ContextCompaction::Acp);
+        let legacy: super::Settings = serde_json::from_str(r#"{"contextCompaction":"legacy"}"#).unwrap();
+        assert_eq!(legacy.context_compaction, super::ContextCompaction::Legacy);
+        assert_eq!(serde_json::to_string(&legacy.context_compaction).unwrap(), "\"legacy\"");
     }
 
     #[test]

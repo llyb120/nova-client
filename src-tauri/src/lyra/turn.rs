@@ -435,7 +435,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 return TurnOutcome::default();
             }
             // ponytail: 预算提醒按工具执行前的历史估算，最多晚一轮出现。
-            let notice = if calls.iter().any(|(_, name, _)| name == crate::lyra::scene::TOOL) { None } else { s.context.budget_notice(s.history.items()) };
+            let notice = if calls.iter().any(|(_, name, _)| name == crate::lyra::scene::TOOL || name == "compress") { None } else { s.context.budget_notice(s.history.items()) };
             let mut results = run_tools(s, &calls, early, on_event).await;
             if let (Some(notice), Some(last)) = (notice, results.last_mut()) {
                 if let Some(parts) = last.get_mut("content").and_then(Value::as_array_mut) {

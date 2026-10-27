@@ -242,6 +242,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [contextRetrievalMode, setContextRetrievalMode] = createSignal<"none" | "fast">(
     s?.contextRetrievalMode === "none" ? "none" : "fast",
   );
+  const [contextCompaction, setContextCompaction] = createSignal<"acp" | "legacy">(
+    s?.contextCompaction === "legacy" ? "legacy" : "acp",
+  );
 
   const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(
     (s?.sessionShortcuts ?? []).map((item) => ({ ...item })),
@@ -548,6 +551,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     ponytailLevel: ponytailLevel(),
     checkpointEnabled: checkpointEnabled(),
     contextRetrievalMode: contextRetrievalMode(),
+    contextCompaction: contextCompaction(),
 
     defaultMode: "build",
     sceneModels: sceneModels(),
@@ -1415,6 +1419,22 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 </select>
                 <span class="field-hint">
                   FastContext 使用原生常驻服务和增量索引。保存后重启相关 Agent 生效。
+                </span>
+              </label>
+              <label class="field">
+                <span class="field-label">Lyra 上下文压缩</span>
+                <select
+                  class="field-input"
+                  value={contextCompaction()}
+                  onChange={(e) =>
+                    setContextCompaction(e.currentTarget.value === "legacy" ? "legacy" : "acp")
+                  }
+                >
+                  <option value="acp">ACP 主动压缩（默认）</option>
+                  <option value="legacy">旧版自动摘要折叠</option>
+                </select>
+                <span class="field-hint">
+                  ACP：模型自己决定何时、压缩哪一段并撰写摘要，可还原，临近上限时自动截断兜底。旧版：达到阈值后由系统自动折叠。只对新开始的会话生效。
                 </span>
               </label>
 

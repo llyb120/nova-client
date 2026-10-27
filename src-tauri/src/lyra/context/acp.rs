@@ -1,7 +1,7 @@
 //! ACP（Active Context Pruning）的 Rust 实现，机制取自 ranxianglei/billion-context 的 acp-kernel：
 //! 由模型决定何时、压缩哪一段，摘要也由模型撰写；宿主只负责引用编号、区间校验、块账本、提示（nudge）
 //! 与兜底截断。规范历史仍只追加；块按规范下标记账，渲染时叠加在 Lyra 旧投影（若有）之后。
-//! 与原 acp-kernel 的差异（shortcut）：无 young/old 分代与批量合并——要再压缩旧块，把 bN 作为新区间端点；
+//! 与原 acp-kernel 的差异（shortcut）：kernel 的 young/old 分代只是没人读取的标签，未实现；旧块的再压缩走 tier 机制（bN 作区间端点）；
 //! 用户消息在块里原文保留（Lyra 一贯做法），不由模型转述。
 
 use super::*;
@@ -9,13 +9,14 @@ use std::collections::HashSet;
 
 /// 末尾这么多个单元不可压缩（正在进行的工作）。
 const PRESERVE_UNITS: usize = 2;
-// 提示节奏取自 acp-kernel 的 decideNudge；窗口相关的绝对值（kernel 固定 50000/20000 tokens）按窗口缩放，
-// 以便小窗口模型也能触发。kernel 的按块数触发（tier2Trigger/tier3Trigger）默认关闭，这里不实现。
+// 提示节奏取自 acp-kernel 的 decideNudge，数值同 kernel 默认；kernel 的按块数触发（tier2Trigger/tier3Trigger）默认关闭，这里不实现。
+/// 模型没有声明上下文窗口时按这个值算。
+pub(super) const DEFAULT_WINDOW: u64 = 200_000;
 const NUDGE_MIN: f64 = 0.45;
 const NUDGE_MAX: f64 = 0.75;
-const GROWTH_RATIO: f64 = 0.125;
-const GROWTH_MIN: u64 = 4_000;
-const GROWTH_MAX: u64 = 50_000;
+const GROWTH_TOKENS: u64 = 50_000;
+const MIN_GROWTH_FLOOR: u64 = 20_000;
+const MIN_PRESSURE_BENEFIT: u64 = 5_000;
 const GROWTH_FLOOR_RATIO: f64 = 0.45;
 const TIER_MASS_MULTIPLIER: f64 = 1.5;
 const MAX_TIER: u8 = 3;
@@ -240,6 +241,7 @@ fn snippet(text: &str, needle: &str) -> Option<String> {
 impl ContextWindow {
     pub fn enable_acp(&mut self) {
         self.acp_enabled = true;
+        self.set_window(self.window);
     }
 
     pub fn acp_enabled(&self) -> bool {
@@ -358,9 +360,9 @@ impl ContextWindow {
         }
         let used = self.prompt_tokens(&self.prompt_view(canonical));
         let usage = used as f64 / self.window as f64;
-        let growth = ((self.window as f64 * GROWTH_RATIO) as u64).clamp(GROWTH_MIN, GROWTH_MAX);
-        let floor = (growth as f64 * GROWTH_FLOOR_RATIO) as u64;
-        let min_benefit = (self.window / 100).max(1000);
+        let growth = GROWTH_TOKENS;
+        let floor = MIN_GROWTH_FLOOR.max((growth as f64 * GROWTH_FLOOR_RATIO) as u64);
+        let min_benefit = MIN_PRESSURE_BENEFIT.max(self.window / 100);
 
         let mut runs = self.acp_runs(canonical);
         let groups = [self.tier_groups(canonical, 1), self.tier_groups(canonical, 2)];
@@ -552,10 +554,10 @@ impl ContextWindow {
         } else {
             1
         };
-        let mut block = Block {
+        let block = Block {
             id: self.state.acp.next_id + 1, start: s, end: e, hash: hash_values(&canonical[s..=e]),
             topic: get(&["topic"]).unwrap_or_default().to_string(), summary: summary.to_string(),
-            active: true, children, at: now_ms(), ..Block::default()
+            active: true, children, tier, at: now_ms(), ..Block::default()
         };
         // 当前可见内容 = 原文 − 已并入旧块多占的部分（旧块以其渲染计）。
         let mut current = self.messages_tokens(&canonical[s..=e]);
@@ -567,7 +569,6 @@ impl ContextWindow {
         if new as f64 > current as f64 * MAX_BLOCK_RATIO {
             return Err(format!("the block (~{new} tokens incl. kept user messages) is not much smaller than the ~{current} tokens it replaces; write a denser summary or take a larger range"));
         }
-        block.mechanical = false;
         self.commit_block(block);
         Ok(format!("Compressed {} messages into b{} (~{current} → ~{new} tokens).", e - s + 1, self.state.acp.next_id))
     }
@@ -692,7 +693,7 @@ impl ContextWindow {
                 let (s, e) = (first.start, last.end - 1);
                 let block = Block {
                     id: self.state.acp.next_id + 1, start: s, end: e, hash: hash_values(&canonical[s..=e]),
-                    summary: mechanical_summary(&canonical[s..=e]), active: true, mechanical: true, at: now_ms(), ..Block::default()
+                    summary: mechanical_summary(&canonical[s..=e]), active: true, mechanical: true, tier: 1, at: now_ms(), ..Block::default()
                 };
                 self.commit_block(block);
                 folded = e - s + 1;
@@ -817,12 +818,33 @@ mod tests {
     }
 
     #[test]
-    fn nudge_lists_ranges_and_waits_for_growth() {
+    fn nudge_in_pressure_band_lists_ranges() {
         let canon = convo();
-        let mut c = ctx(16_000);
-        let note = c.budget_notice(&canon).expect("over soft threshold");
-        assert!(note.contains("m00000..m00006"), "{note}");
+        let mut c = ctx(10_000); // ~81% used: pressure band ignores the growth gate
+        let note = c.budget_notice(&canon).expect("pressure nudge");
+        assert!(note.contains("m00000..m00006") && note.contains("overflow soon"), "{note}");
+    }
+
+    #[test]
+    fn nudge_below_pressure_waits_for_growth() {
+        let huge = "some line of output\n".repeat(10_000); // ~50k tokens each
+        let canon = vec![user("go"), call("a", "read"), result("a", &huge), call("b", "read"), result("b", &huge),
+            call("c", "read"), result("c", &huge), call("d", "read"), result("d", &huge), said("ok"), user("next")];
+        let mut c = ctx(400_000); // ~50% used: needs 50k pending and growth
+        let note = c.budget_notice(&canon).expect("first-sight nudge");
+        assert!(note.contains("m00000..m00006") && !note.contains("overflow soon"), "{note}");
         assert!(c.budget_notice(&canon).is_none(), "no growth since the last notice");
+    }
+
+    #[test]
+    fn missing_window_defaults_to_200k_in_acp_mode() {
+        let mut c = ContextWindow::ephemeral(0, 0);
+        c.enable_acp();
+        assert_eq!(c.window(), 200_000);
+        c.set_window(0);
+        assert_eq!(c.window(), 200_000);
+        c.set_window(64_000);
+        assert_eq!(c.window(), 64_000);
     }
 
     #[test]
@@ -835,6 +857,35 @@ mod tests {
         assert_eq!(receipt.status, "applied", "{receipt:?}");
         assert!(receipt.degraded, "truncation alone cannot free this much");
         assert!(c.prompt_tokens(&c.prompt_view(&canon)) < before / 2);
+    }
+
+    #[test]
+    fn block_boundaries_distill_into_higher_tiers() {
+        let canon = convo();
+        let mut c = ctx(100_000);
+        let ask = |a: &str, b: &str| json!({ "ranges": [{ "startRef": a, "endRef": b, "summary": SUMMARY }] });
+        c.acp_compress(&canon, &ask("m00002", "m00002")).unwrap();
+        c.acp_compress(&canon, &ask("m00004", "m00004")).unwrap();
+        let tiers = |c: &ContextWindow| c.state.acp.blocks.iter().map(|b| (b.id, b.tier, b.active)).collect::<Vec<_>>();
+        assert_eq!(tiers(&c), vec![(1, 1, true), (2, 1, true)]);
+        let groups = c.tier_groups(&canon, 1);
+        assert_eq!((groups.len(), groups[0].first, groups[0].last, groups[0].count), (1, 1, 2, 2));
+        c.acp_compress(&canon, &ask("b1", "b2")).unwrap();
+        assert_eq!(tiers(&c), vec![(1, 1, false), (2, 1, false), (3, 2, true)]);
+        assert!(c.tier_groups(&canon, 1).is_empty());
+        // 按消息引用压缩不升层；用块 id 做端点才升层，最高 3 层。
+        c.acp_compress(&canon, &ask("b3", "m00006")).unwrap();
+        assert_eq!(c.state.acp.blocks.last().unwrap().tier, 3);
+    }
+
+    #[test]
+    fn nudge_stamps_reset_after_compress() {
+        let canon = convo();
+        let mut c = ctx(10_000);
+        c.budget_notice(&canon).expect("first nudge");
+        assert!(c.state.acp.nudge_shown > 0 && c.state.acp.shown_by_tier[1] > 0);
+        c.acp_compress(&canon, &json!({ "ranges": [{ "startRef": "m00002", "endRef": "m00004", "summary": SUMMARY }] })).unwrap();
+        assert_eq!((c.state.acp.baseline, c.state.acp.nudge_shown, c.state.acp.shown_by_tier), (0, 0, [0; 4]));
     }
 
     #[test]

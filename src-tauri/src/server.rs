@@ -292,6 +292,7 @@ fn show_config(show_token: bool) -> Result<(), String> {
         "environment": environment,
         "defaultMode": settings.default_mode,
         "contextRetrievalMode": settings.context_retrieval_mode.as_str(),
+        "contextCompaction": settings.context_compaction.as_str(),
         "agents": {
             "lyra": { "enabled": settings.lyra_enabled }
         },
@@ -353,6 +354,12 @@ fn set_config(key: &str, value: &str) -> Result<(), String> {
                 settings.context_retrieval_mode = match value.trim().to_ascii_lowercase().as_str() {
                     "none" => crate::settings::ContextRetrievalMode::None,
                     _ => crate::settings::ContextRetrievalMode::Fast,
+                }
+            }
+            "context-compaction" => {
+                settings.context_compaction = match value.trim().to_ascii_lowercase().as_str() {
+                    "legacy" => crate::settings::ContextCompaction::Legacy,
+                    _ => crate::settings::ContextCompaction::Acp,
                 }
             }
             "devin-path" => settings.devin_path = value.into(),
