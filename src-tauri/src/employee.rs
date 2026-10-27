@@ -1449,7 +1449,7 @@ fn fmt_ms(ms: i64) -> String {
 // ---------- 桌面：排队、询问、接管 ----------
 
 /// 工具调用方 → 会话：MCP 后端的 owner 为 `thread:<id>`；Lyra 的 owner 是以会话 id 结尾的归档目录。
-fn owner_thread(state: &AppState, owner: &str) -> Option<String> {
+pub(crate) fn owner_thread(state: &AppState, owner: &str) -> Option<String> {
     if let Some(id) = owner.strip_prefix("thread:") {
         return Some(id.into());
     }

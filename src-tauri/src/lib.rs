@@ -7,6 +7,7 @@ mod backend_migration;
 mod jianlai;
 mod jianpu;
 mod employee;
+mod layout;
 mod altair_run;
 mod tool_experience;
 mod clipboard;
@@ -5014,6 +5015,7 @@ pub fn run() {
             // server 侧远程会话：空闲只做命令长轮询；运行中按全量 + 增量同步。
             remote::start(app.handle().clone());
             employee::start(app.handle().clone());
+            layout::start(app.handle().clone());
             // `Nova server config/project ...` 由独立管理进程写盘；运行实例监听提交标记，
             // 无需重启即可同步设置、环境变量与项目白名单。
             start_headless_config_watcher(app.handle().clone());
@@ -5128,6 +5130,7 @@ pub fn run() {
             taskbar_status::taskbar_bubble_dismiss,
             taskbar_status::taskbar_bubble_reply,
             taskbar_status::taskbar_quick,
+            layout::layout_cmd,
             employee::employee_get,
             employee::employee_set,
             employee::employee_do,

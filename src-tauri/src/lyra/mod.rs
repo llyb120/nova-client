@@ -30,7 +30,7 @@ mod rollout;
 pub(crate) mod runtime;
 pub(crate) mod session;
 mod tokens;
-mod tools;
+pub(crate) mod tools;
 mod turn;
 
 pub use bridge::{run_oneshot, spawn_prompt, InProcessSession};

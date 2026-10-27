@@ -31,6 +31,7 @@ import { HtmlTranscript, type HtmlTranscriptHandle } from "./HtmlTranscript";
 import { Composer } from "./Composer";
 import { IconBroadcast,IconCopy, IconDownload, IconFile, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
+import { LayoutPanel } from "./LayoutPanel";
 import { PlanActionCard } from "./PlanActionCard";
 import { ShareModal } from "./ShareModal";
 import { TimeNotesModal } from "./TimeNotesModal";
@@ -1085,6 +1086,7 @@ export function ChatView() {
 
       <div class="chat-shell">
         <div class="chat-primary">
+      <Show keyed when={!isSubagent() && state.currentId}>{(id) => <LayoutPanel threadId={id} />}</Show>
       <div class="chat-body">
           <HtmlTranscript
             ref={(handle) => { transcriptRef = handle; setTranscriptReady(true); scheduleBottomPin(); }}

@@ -1,0 +1,24 @@
+.layout-panel { flex: none; display: flex; flex-direction: column; margin: 0 12px 8px; border: 1px solid var(--border-light); border-radius: var(--r-lg); background: var(--bg-panel); overflow: hidden; }
+.layout-panel:not(.collapsed) { height: 320px; min-height: 120px; max-height: 70%; resize: vertical; }
+.layout-bar { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 8px; border-bottom: 1px solid var(--border-light); }
+.layout-panel.collapsed .layout-bar { border-bottom: 0; }
+.layout-tabs { display: flex; align-items: center; gap: 4px; min-width: 0; overflow-x: auto; }
+.layout-tab { flex: none; padding: 3px 10px; border: 0; border-radius: 999px; background: transparent; color: var(--text-faint); font-size: 12px; cursor: pointer; }
+.layout-tab:hover { color: var(--text); }
+.layout-tab.active { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--text); }
+.layout-tab-busy { margin-left: 6px; color: var(--accent); font-size: 11px; }
+.layout-rename { width: 110px; padding: 2px 6px; font-size: 12px; }
+.layout-actions { flex: none; display: flex; align-items: center; gap: 2px; }
+.layout-icon-btn { padding: 2px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--text-faint); font-size: 12px; cursor: pointer; }
+.layout-icon-btn:hover { color: var(--text); background: color-mix(in srgb, var(--text) 8%, transparent); }
+.layout-icon-btn.on { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.layout-add { position: relative; }
+.layout-menu { position: absolute; z-index: 20; top: 100%; left: 0; min-width: 140px; padding: 4px; display: flex; flex-direction: column; border: 1px solid var(--border-light); border-radius: 8px; background: var(--bg-panel); box-shadow: var(--shadow-md); }
+.layout-menu button { padding: 5px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text); font-size: 12px; text-align: left; cursor: pointer; }
+.layout-menu button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.layout-menu-head { padding: 4px 10px 2px; color: var(--text-faint); font-size: 11px; }
+.layout-stage { flex: 1; min-height: 0; display: flex; }
+.layout-stage iframe { flex: 1; width: 100%; border: 0; background: transparent; color-scheme: normal; }
+.layout-empty { flex: 1; display: grid; place-items: center; padding: 16px; color: var(--text-faint); font-size: 12px; text-align: center; }
+.composer.design-mode { border-color: color-mix(in srgb, var(--accent) 70%, var(--border-light)); }
+.composer-design-tag { align-self: flex-start; margin: -4px 0 6px; padding: 1px 8px; border-radius: 999px; background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); font-size: 11px; }

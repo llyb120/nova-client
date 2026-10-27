@@ -13,6 +13,7 @@ import { Sidebar } from "./components/Sidebar";
 import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
 import "./promptQueue";
+import { initLayoutEvents } from "./layoutStore";
 import { scenesReady } from "./types";
 import { selectedChatText } from "./chatSelection";
 import { closeThread, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal } from "./store";
@@ -23,6 +24,7 @@ const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"))
 const JianpuView = lazy(() => import("./components/JianpuView"));
 const EmployeeView = lazy(() => import("./components/EmployeeView"));
 const MiniAppsView = lazy(() => import("./components/MiniAppsView"));
+const LayoutPresetsView = lazy(() => import("./components/LayoutPresetsView"));
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
   return (
@@ -107,6 +109,7 @@ export default function App() {
   onMount(() => {
     setShortcutRecordingActive(false);
     void initStore();
+    initLayoutEvents();
     // Chrome page launchers follow the published library from startup, not only after visiting the studio.
     void import("./miniapps").then(m => m.syncBrowserTriggers()).catch(() => {});
 
@@ -175,7 +178,11 @@ export default function App() {
             <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={
               <Show when={state.view === "employee"} fallback={
                 <Show when={state.view === "jianpu"} fallback={
-                  <Show when={state.view === "miniapps"} fallback={<HomeView />}>
+                  <Show when={state.view === "miniapps"} fallback={
+                    <Show when={state.view === "layouts"} fallback={<HomeView />}>
+                      <Suspense><LayoutPresetsView /></Suspense>
+                    </Show>
+                  }>
                     <Suspense><MiniAppsView /></Suspense>
                   </Show>
                 }>

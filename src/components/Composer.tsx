@@ -20,6 +20,7 @@ import {
 } from "../promptQueue";
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import { api } from "../ipc";
+import { designMode, sendDesign, toggleDesignMode } from "../layoutStore";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import {
   cancelTurn,
@@ -36,6 +37,7 @@ import {
   refreshThreads,
   sendPrompt,
   setView,
+  showToast,
   STAGE_COMMAND_PATTERN,
   state,
 } from "../store";
@@ -362,6 +364,13 @@ export function Composer() {
     const images = attach.images().map((image) => ({ ...image }));
     const currentId = state.currentId;
     if (!currentId) return;
+    // 设计模式：提示词交给并行的设计会话，用于设计或调整布局，不进入主会话。
+    if (designMode(currentId)) {
+      rememberPromptHistory(value, images);
+      clearInput();
+      void sendDesign(currentId, value).catch((error) => showToast(`设计失败：${error}`));
+      return;
+    }
     rememberPromptHistory(value, images);
     clearInput();
     if (shouldQueue(value)) {
@@ -486,6 +495,12 @@ export function Composer() {
         return;
       }
     }
+    // Tab（菜单未打开时）：在普通 / 设计模式之间切换。
+    if (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing && slashQuery() === null && !historyOpen()) {
+      e.preventDefault();
+      toggleDesignMode(state.currentId);
+      return;
+    }
     if (e.key === "Escape" && slashQuery() !== null) {
       e.preventDefault();
       setSlashStart(null);
@@ -587,7 +602,7 @@ export function Composer() {
       </Show>
     <div
       class="composer"
-      classList={{ "is-dragging": attach.dragging() }}
+      classList={{ "is-dragging": attach.dragging(), "design-mode": designMode(state.currentId) }}
     >
       <noteFlow.Notes />
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
@@ -667,12 +682,17 @@ export function Composer() {
           </For>
         </div>
       </Show>
+      <Show when={designMode(state.currentId)}>
+        <span class="composer-design-tag" title="提示词将用于设计或调整布局，交给并行的设计会话；Tab 切回普通模式">设计模式 · Tab 切回</span>
+      </Show>
       <div class="composer-input-wrap">
         <textarea
           ref={textareaRef}
           class="composer-input"
           placeholder={
-            !backendAvailable()
+            designMode(state.currentId)
+              ? "描述要设计或调整的布局，Enter 发送给设计会话（Tab 切回普通模式）"
+              : !backendAvailable()
               ? `${providerName()}：迁移未完成，在下方模型选择器选择 Lyra 模型即可改绑并保留历史`
               : running()
               ? supportsSteer()

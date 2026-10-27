@@ -609,6 +609,10 @@ async fn execute_inner(
                 Err(error) => ToolOutcome::error(error),
             }
         }
+        "layout_create" | "layout_update" | "layout_submit" => match crate::layout::execute(name, args, owner) {
+            Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
+            Err(error) => ToolOutcome::error(error),
+        },
         "generate_image" | "edit_image" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，图片工具不可用"); }
             match crate::image_generation::execute_tool(&crate::lyra::config::nova_root(), root, name, args).await {
