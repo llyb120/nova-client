@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { processSegments, processSummary, processLiveLines, splitTurnBody } from "../src/processDisplay.ts";
+import { liveModel, processSegments, processSummary, processLiveLines, splitTurnBody } from "../src/processDisplay.ts";
 
 const thought = (id, text = "分析\n下一步") => ({ type: "thought", id, text });
 const tool = (id, kind, status = "completed") => ({ type: "tool", id, kind, status, title: `${kind}\nfile.ts` });
@@ -76,4 +76,6 @@ for (const finished of [false, true]) {
   const visible = splitTurnBody([current, warning, reply(3, "完成")], finished);
   assert.deepEqual([...visible.process, ...visible.conclusion], [current, warning, reply(3, "完成")]);
 }
+assert.equal(liveModel([{type:"user",id:1,text:"a"},modelLabel(2,"provider/light"),modelLabel(3,"provider/code")]), "provider/code");
+assert.equal(liveModel([modelLabel(1,"provider/code"),{type:"user",id:2,text:"b"}]), "");
 console.log("process display checks passed");

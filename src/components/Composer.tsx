@@ -20,6 +20,7 @@ import {
 } from "../promptQueue";
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import { LayoutPicker } from "./LayoutPicker";
+import { liveModel } from "../processDisplay";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import {
   cancelTurn,
@@ -111,6 +112,11 @@ export function Composer() {
   attach.set(initialDraft?.images ?? []);
 
   const running = () => !!(state.currentId && state.running[state.currentId]);
+  // 自动模式场景切换只改本轮会话模型、不落线程配置；运行中让选择器跟随，轮次结束自动回到线程模型。
+  const shownModel = () => {
+    const live = running() ? liveModel(state.items) : "";
+    return !live || state.model === live || state.model.startsWith(`${live}/`) ? state.model : live;
+  };
   const [runClock, setRunClock] = createSignal(Date.now());
   // 从会话尾部向前找本轮 user 项作为计时起点。找不到返回 null 的两种情形：
   // - 尾部已是收尾的 turn（轮次未开始/已结束）；
@@ -650,11 +656,12 @@ export function Composer() {
         <ConfigSelects
           agentKind={state.agentKind}
           agentKinds={agentKinds()}
-          model={state.model}
+          model={shownModel()}
           modelSource={usesPeerModels() ? guestModelSource : undefined}
           onPickModel={(k, m) => void pickThreadModel(k, m)}
           anchorTo=".composer"
           favorites
+          disabled={running()}
         />
         <LayoutPicker threadId={state.currentId} />
         <Show when={running()}>

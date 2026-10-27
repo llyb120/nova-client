@@ -144,6 +144,8 @@ export function ModelPicker(props: {
   defaultLabel?: string;
   /** 显示模型收藏入口。 */
   favorites?: boolean;
+  /** 运行中禁止手动切换模型 */
+  disabled?: boolean;
 }) {
   const kinds = createMemo(() => (props.agentKinds ?? [props.agentKind]).filter(isSupportedAgentKind));
   // 调用方显式给出后端列表时始终保留「后端」一级，即使只有一个后端或模型尚未加载。
@@ -232,8 +234,8 @@ export function ModelPicker(props: {
       portal={props.portal}
       anchorTo={props.anchorTo}
       allowDefault={props.allowDefault}
-      defaultLabel={props.defaultLabel}
       favorites={props.favorites}
+      disabled={props.disabled}
     />
   );
 }
@@ -254,6 +256,8 @@ export function ConfigSelects(props: {
   anchorTo?: string;
   /** 显示模型收藏入口。 */
   favorites?: boolean;
+  /** 运行中禁止手动切换模型 */
+  disabled?: boolean;
 }) {
   return (
     <ModelPicker
@@ -265,6 +269,7 @@ export function ConfigSelects(props: {
       portal={props.portal}
       anchorTo={props.anchorTo}
       favorites={props.favorites}
+      disabled={props.disabled}
     />
   );
 }

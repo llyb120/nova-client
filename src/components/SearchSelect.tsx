@@ -76,6 +76,8 @@ export function SearchSelect(props: {
   anchorTo?: string;
   /** 为模型项显示持久化收藏按钮，并在分组首项展示收藏模型。 */
   favorites?: boolean;
+  /** 禁用触发器（运行中禁止手动切换模型） */
+  disabled?: boolean;
 }) {
   const [opened, setOpened] = createSignal(false);
   const [query, setQuery] = createSignal("");
@@ -695,7 +697,7 @@ export function SearchSelect(props: {
 
   return (
     <div class={`sel ${props.wide ? "wide" : ""}`} ref={rootRef}>
-      <button class="pill" onClick={toggle} title={props.title}>
+      <button class="pill" onClick={toggle} title={props.title} disabled={props.disabled}>
         <span class="pill-text">
           {props.prefix}：{currentLabel()}
         </span>
