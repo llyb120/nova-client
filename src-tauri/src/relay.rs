@@ -256,9 +256,16 @@ impl RelayManager {
         let worker = mgr.clone();
         tauri::async_runtime::spawn(async move {
             let mut rx = out_rx;
+            let mut last_flush: Option<Instant> = None;
             while let Some(first) = rx.recv().await {
-                // 排空当前已积压的消息（非阻塞），不做人为等待——首字/低频零额外延迟；
-                // 高负载时一次发送耗时约一个 RTT，期间自然积压，下一轮一次性合批发出。
+                // 流式窗口：空闲后的第一条立即发（首字零延迟），之后两次发送至少间隔 OUT_WINDOW，
+                // 窗口内的增量积压后合批；非 roaming.update（提示词/控制消息）不等待。
+                if first.1 == "roaming.update" {
+                    if let Some(t) = last_flush {
+                        sleep(OUT_WINDOW.saturating_sub(t.elapsed())).await;
+                    }
+                }
+                last_flush = Some(Instant::now());
                 let mut batch = vec![first];
                 while batch.len() < 512 {
                     match rx.try_recv() {
@@ -3113,6 +3120,22 @@ pub(crate) fn gzip_json(value: &Value) -> Result<Vec<u8>, String> {
     enc.finish().map_err(|e| e.to_string())
 }
 
+/// 流式增量的最小发送间隔。
+const OUT_WINDOW: Duration = Duration::from_millis(150);
+
+/// 追加一条 op；与上一条同 itemId 的 delta 直接拼接文本（apply 是纯追加，结果等价）。
+fn push_op(ops: &mut Vec<Value>, op: Value) {
+    if let (Some(last), Some(text)) = (ops.last_mut(), op["text"].as_str()) {
+        if op["t"] == "delta" && last["t"] == "delta" && last["itemId"] == op["itemId"] {
+            if let Some(prev) = last["text"].as_str() {
+                last["text"] = Value::String(format!("{prev}{text}"));
+                return;
+            }
+        }
+    }
+    ops.push(op);
+}
+
 /// 把一批出站消息里「连续、同目标、同会话」的 roaming.update 合并成一条（ops 数组），
 /// 其余消息原样保留。保持原始顺序，既减少往返又不破坏增量顺序。
 fn coalesce_outbound(batch: Vec<(String, String, Value)>) -> Vec<(String, String, Value)> {
@@ -3125,7 +3148,7 @@ fn coalesce_outbound(batch: Vec<(String, String, Value)>) -> Vec<(String, String
                     && pdata["guestThreadId"] == data["guestThreadId"]
                 {
                     if let Some(arr) = pdata["ops"].as_array_mut() {
-                        arr.push(data["op"].clone());
+                        push_op(arr, data["op"].clone());
                         continue;
                     }
                 }
@@ -3408,6 +3431,21 @@ mod tests {
             assert!(requested_agent_kind(agent).is_err(), "accepted {agent:?}");
         }
         assert_eq!(requested_agent_kind(" lyra ").unwrap(), AgentKind::Lyra);
+    }
+
+    #[test]
+    fn coalesce_merges_adjacent_deltas_only() {
+        let m = |op: Value| ("p".to_string(), "roaming.update".to_string(), json!({"guestThreadId": "g", "op": op}));
+        let out = coalesce_outbound(vec![
+            m(json!({"t":"delta","itemId":1,"text":"a"})),
+            m(json!({"t":"delta","itemId":1,"text":"b"})),
+            m(json!({"t":"delta","itemId":2,"text":"c"})),
+            m(json!({"t":"delta","itemId":1,"text":"d"})),
+        ]);
+        assert_eq!(out.len(), 1);
+        let ops = out[0].2["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0]["text"], "ab");
     }
 
     #[test]
