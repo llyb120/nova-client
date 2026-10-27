@@ -108,7 +108,7 @@ const CHECK_SVG =
 const FILE_SVG =
   '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>';
 const FILE_EXTENSIONS =
-  "7z|avif|avi|bmp|c|cc|cfg|conf|cpp|cs|css|csv|docx?|env|fig|gif|go|gz|h|hpp|html?|ico|ini|java|jpe?g|js|json|jsx|lock|log|md|mjs|mov|mp3|mp4|pdf|php|png|pptx?|ps1|psd|py|rar|rb|rs|scss|sh|sql|svg|tar|toml|ts|tsx|txt|vue|wav|webm|webp|xlsx?|xml|ya?ml|zip";
+  "7z|avif|avi|bat|bmp|c|cc|cfg|cmd|conf|cpp|cs|css|csv|docx?|env|fig|gif|gitattributes|gitignore|gitmodules|go|gz|h|hpp|html?|ico|ini|java|jpe?g|js|json|jsx|lock|log|md|mjs|mov|mp3|mp4|pdf|php|png|pptx?|ps1|psd|py|rar|rb|rs|scss|sh|sql|svg|tar|toml|ts|tsx|txt|vue|wav|webm|webp|xlsx?|xml|ya?ml|zip";
 export const FILE_REFERENCE_RE = new RegExp(
   String.raw`(?:[A-Za-z]:[\\/]|(?:\.{1,2})?[\\/])?[^\s<>"'\x60()[\]{}，。；：！？、]+(?:[\\/][^\s<>"'\x60()[\]{}，。；：！？、]+)*\.(?:${FILE_EXTENSIONS})(?::\d+)?(?![\w./\\:-])`,
   "gi",
