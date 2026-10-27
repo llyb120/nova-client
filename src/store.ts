@@ -12,10 +12,6 @@ import type {
   Achievement,
   AgentKind,
   BranchList,
-  CaptureClueResult,
-  ClueAttachment,
-  ClueCard,
-  ClueNodeGroup,
   IncomingRoamRequest,
   IncomingShare,
   Item,
@@ -55,26 +51,6 @@ export type ThemePref = "ink-dark" | "ink-light";
 
 const THEME_KEY = "fd:theme";
 const MODEL_FAVORITES_KEY = "fd:modelFavorites";
-const UNREAD_CLUE_MENTIONS_KEY = "fd:unreadClueMentions:v1";
-
-/** 证据链 @提及红点只存内存时，重启会把还没看过的提及抹掉；读卡 id 写入本地。 */
-function readUnreadClueMentions(): string[] {
-  try {
-    const value = JSON.parse(localStorage.getItem(UNREAD_CLUE_MENTIONS_KEY) ?? "[]");
-    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
-function setUnreadClueMentions(ids: string[]) {
-  setState("unreadClueMentions", ids);
-  try {
-    localStorage.setItem(UNREAD_CLUE_MENTIONS_KEY, JSON.stringify(ids));
-  } catch {
-    // 落盘失败只丢跨重启持久化，本次窗口内的红点仍按内存状态展示。
-  }
-}
 
 function readThemePref(): ThemePref {
   return localStorage.getItem(THEME_KEY) === "ink-light" ? "ink-light" : "ink-dark";
@@ -181,16 +157,9 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
-  view: "home" | "clues" | "knowledge" | "employee" | "jianpu" | "miniapps";
-  /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
-  clueSpace: "personal" | "team";
-  /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
-  clueGroups: ClueNodeGroup[];
-  pendingClueCard: { id: string; title: string } | null;
+  view: "home" | "knowledge" | "employee" | "jianpu" | "miniapps";
   pendingNewSessionSeed: PendingNewSessionSeed | null;
   homeComposerFocusAt: number;
-  clueOpenRequest: string | null;
-  unreadClueMentions: string[];
   theme: ThemePref;
   backendAvailability: Record<string, boolean>;
 }
@@ -240,13 +209,8 @@ export const [state, setState] = createStore<AppStore>({
   titleTyping: {},
   unreadTurns: {},
   view: "home",
-  clueSpace: "personal",
-  clueGroups: [],
-  pendingClueCard: null,
   pendingNewSessionSeed: null,
   homeComposerFocusAt: 0,
-  clueOpenRequest: null,
-  unreadClueMentions: readUnreadClueMentions(),
   theme: readThemePref(),
   backendAvailability: {},
 });
@@ -492,21 +456,6 @@ export async function refreshRelayStatus() {
   }
 }
 
-export function clueMentionPeers(): Peer[] {
-  const ownToken = state.settings?.relayToken ?? "";
-  const firstGroup =
-    (state.settings?.relayGroups ?? "")
-      .split(/[,;\s]+/)
-      .map((group) => group.trim())
-      .find(Boolean) ?? "";
-  return state.peers.filter((peer) => {
-    if (peer.token === ownToken) return false;
-    if (!Array.isArray(peer.groups)) return true;
-    const groups = peer.groups.length > 0 ? peer.groups : [""];
-    return groups.includes(firstGroup);
-  });
-}
-
 export async function refreshInbox() {
   try {
     setState("inbox", await api.getRelayInbox());
@@ -620,109 +569,6 @@ export function setView(view: AppStore["view"]) {
   setState("view", view);
 }
 
-export function clueCurrentVersion(card: ClueCard) {
-  return card.versions.find((version) => version.id === card.currentVersionId) ?? card.versions.at(-1);
-}
-
-export function clueCardById(cardId: string | null | undefined): ClueCard | undefined {
-  if (!cardId) return undefined;
-  for (const group of state.clueGroups) {
-    const card = group.cards.find((item) => item.id === cardId);
-    if (card) return card;
-  }
-  return undefined;
-}
-
-export async function refreshClueGroups() {
-  const space = state.clueSpace;
-  const groups = await api.listClueGroups(space);
-  if (state.clueSpace === space) setState("clueGroups", reconcile(groups));
-}
-
-export async function setClueSpace(space: "personal" | "team") {
-  if (space === state.clueSpace) return;
-  setState({ clueSpace: space, clueGroups: [] });
-  await refreshClueGroups();
-}
-
-export async function captureClue(
-  threadId: string | null,
-  title: string,
-  content: string,
-  placement: "update" | "parallel" | "new",
-  targetCardId: string | null,
-  mentionTokens: string[] = [],
-  attachments: ClueAttachment[] = [],
-  spaceOverride?: "personal" | "team",
-): Promise<CaptureClueResult> {
-  const space = spaceOverride ?? state.clueSpace;
-  const result = await api.captureClue(
-    threadId, title, content, placement, targetCardId, mentionTokens, attachments, space,
-  );
-  // 只把结果合并进当前正在查看的空间；Flow 弹窗可保存到另一个空间。
-  if (state.clueSpace === space) {
-    const index = state.clueGroups.findIndex((group) => group.id === result.group.id);
-    if (index >= 0) setState("clueGroups", index, reconcile(result.group));
-    else setState("clueGroups", (groups) => [result.group, ...groups]);
-  }
-  return result;
-}
-
-export async function addClueComment(
-  cardId: string,
-  content: string,
-  parentCommentId: string | null,
-  mentionTokens: string[] = [],
-) {
-  await api.addClueComment(cardId, content, parentCommentId, mentionTokens, state.clueSpace);
-  await refreshClueGroups();
-}
-
-/** 用轻量级模型总结会话，失败时回退原模型，供线索表单填入 */
-export async function summarizeClue(threadId: string) {
-  return api.summarizeClue(threadId);
-}
-
-export async function associateClues(beforeCardId: string, afterCardId: string) {
-  await api.associateClues(beforeCardId, afterCardId, state.clueSpace);
-  await refreshClueGroups();
-}
-
-export async function disassociateClues(beforeCardId: string, afterCardId: string) {
-  await api.disassociateClues(beforeCardId, afterCardId, state.clueSpace);
-  await refreshClueGroups();
-}
-
-export async function splitClue(cardId: string) {
-  await api.splitClue(cardId, state.clueSpace);
-  await refreshClueGroups();
-}
-
-export async function stackClues(cardIds: string[]) {
-  await api.stackClues(cardIds, state.clueSpace);
-  await refreshClueGroups();
-}
-
-export async function deleteClue(cardId: string) {
-  await api.deleteClue(cardId, state.clueSpace);
-  // 卡片已不存在时，不能留下一个永远消费不掉的未读点。
-  if (state.unreadClueMentions.includes(cardId)) {
-    setUnreadClueMentions(state.unreadClueMentions.filter((id) => id !== cardId));
-  }
-  await Promise.all([refreshClueGroups(), refreshThreads()]);
-}
-
-export function startSessionFromClue(card: ClueCard) {
-  const version = clueCurrentVersion(card);
-  setState("pendingClueCard", { id: card.id, title: version?.title || "未命名线索" });
-  closeThread();
-  setView("home");
-}
-
-export function clearPendingClueCard() {
-  setState("pendingClueCard", null);
-}
-
 /** 打开新会话页；若当前在会话中，把工作目录与模型带给 HomeView。 */
 export function openNewSession(quote = "") {
   const id = state.currentId;
@@ -758,23 +604,6 @@ export function takePendingNewSessionSeed(): PendingNewSessionSeed | null {
   const seed = state.pendingNewSessionSeed;
   if (seed) setState("pendingNewSessionSeed", null);
   return seed;
-}
-
-export function openClueCard(cardId: string) {
-  if (!cardId) return;
-  setUnreadClueMentions(state.unreadClueMentions.filter((id) => id !== cardId));
-  setView("clues");
-  closeThread();
-  setState("clueOpenRequest", cardId);
-  void refreshClueGroups();
-}
-
-export function clearClueOpenRequest(cardId: string) {
-  if (state.clueOpenRequest === cardId) setState("clueOpenRequest", null);
-}
-
-export function markClueMentionRead(cardId: string) {
-  setUnreadClueMentions(state.unreadClueMentions.filter((id) => id !== cardId));
 }
 
 /** 在线的其他人（排除自己）。漫游只能选择对方已共享（上报）的目录，不再支持手输路径；
@@ -885,7 +714,6 @@ export async function createRoamingThread(
   model: string,
   mode: string,
   firstPrompt = "",
-  clueCardId = "",
   worktree = false,
   worktreeBranch = "",
   worktreeBase = "",
@@ -899,7 +727,6 @@ export async function createRoamingThread(
     model || null,
     mode || null,
     firstPrompt.trim() || null,
-    clueCardId || null,
     worktree,
     worktreeBranch.trim() || null,
     worktreeBase.trim() || null,
@@ -1268,7 +1095,6 @@ export async function createThread(
   worktree = false,
   worktreeBranch = "",
   worktreeBase = "",
-  clueCardId = "",
 ): Promise<string> {
   if (!isSupportedAgentKind(agentKind)) throw new Error(`不支持的后端：${agentKind || "未指定"}，迁移未完成`);
   const t = await api.createThread(
@@ -1281,7 +1107,6 @@ export async function createThread(
     worktree,
     worktreeBranch.trim() || null,
     worktreeBase.trim() || null,
-    clueCardId || null,
   );
   rememberThreadSnapshot(t);
   void applyPendingPreset(t.id);
@@ -1407,7 +1232,6 @@ export function createThreadOptimistic(
   text: string,
   images: PromptImage[],
   ephemeral: boolean,
-  clueCardId: string,
   autoScene = "",
 ): void {
   if (!isSupportedAgentKind(agentKind)) throw new Error(`不支持的后端：${agentKind || "未指定"}，迁移未完成`);
@@ -1448,7 +1272,6 @@ export function createThreadOptimistic(
         false,
         null,
         null,
-        clueCardId || null,
         null,
         autoScene || null,
       );
@@ -2075,7 +1898,6 @@ async function createFireThread(
     null,
     false,
     false,
-    null,
     null,
     null,
     step.rootId,
@@ -2981,20 +2803,6 @@ export async function initStore() {
       void refreshProjects();
     }),
 
-    listen("clues:changed", () => {
-      void refreshClueGroups();
-    }),
-
-    listen<{ cardId: string }>("clues:mention-open", (e) => {
-      openClueCard(e.payload.cardId);
-    }),
-
-    listen<{ cardId: string }>("clues:mentioned", (e) => {
-      const cardId = e.payload.cardId;
-      if (!cardId || state.unreadClueMentions.includes(cardId)) return;
-      setUnreadClueMentions([...state.unreadClueMentions, cardId]);
-    }),
-
     // 系统通知点击：跳转到对应会话
     listen<{ threadId: string }>("acp:notify-open", (e) => {
       void openThread(e.payload.threadId);
@@ -3136,7 +2944,6 @@ export async function initStore() {
   // 成就后台预拉：有新成就时侧栏入口直接亮角标，不必等用户打开成就页
   void refreshAchievements();
   void refreshRoamingFolders();
-  void refreshClueGroups();
 
   // 会话/项目列表也是快的本地读取；升级重启后的会话恢复依赖 threads 已就绪，故这里 await 等它俩。
   await Promise.all([refreshThreads(), refreshProjects()]);

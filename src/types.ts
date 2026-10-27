@@ -43,85 +43,6 @@ export interface ProjectEntry {
   worktree?: { repo: string; branch: string } | null;
 }
 
-export interface ClueMention {
-  token: string;
-  name: string;
-}
-
-export interface ClueAttachment {
-  name: string;
-  mimeType: string;
-  /** 粘贴进来的附件以内嵌 base64 保存；本机文件也可保留 file:// URI。 */
-  data?: string;
-  uri?: string;
-  size?: number;
-}
-
-export interface ClueCardVersion {
-  id: string;
-  title: string;
-  content: string;
-  authorName?: string;
-  sourceThreadId?: string | null;
-  mentions: ClueMention[];
-  attachments: ClueAttachment[];
-  createdAt: number;
-}
-
-export interface ClueComment {
-  id: string;
-  parentCommentId?: string | null;
-  content: string;
-  authorToken?: string | null;
-  authorName?: string;
-  mentions: ClueMention[];
-  createdAt: number;
-}
-
-export interface ClueCard {
-  id: string;
-  currentVersionId: string;
-  versions: ClueCardVersion[];
-  comments: ClueComment[];
-  createdAt: number;
-  updatedAt: number;
-}
-
-/** 内部节点组；界面只把 cards 展示为共享前置线索的平行后续卡片。 */
-export interface ClueNodeGroup {
-  id: string;
-  parentCardIds: string[];
-  cards: ClueCard[];
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface ClueContextCard {
-  cardId: string;
-  versionId: string;
-  title: string;
-  content: string;
-  parentCardIds: string[];
-}
-
-export interface ClueContextSnapshot {
-  rootCardId: string;
-  cards: ClueContextCard[];
-  renderedContext: string;
-  createdAt: number;
-}
-
-export interface CaptureClueResult {
-  group: ClueNodeGroup;
-  card: ClueCard;
-}
-
-/** 线索 AI 总结：轻量级模型（失败时回退原模型）产出的标题与内容 */
-export interface ClueAiSummary {
-  title: string;
-  content: string;
-}
-
 export interface ThreadMeta {
   id: string;
   title: string;
@@ -155,8 +76,6 @@ export interface ThreadMeta {
   /** 自动模式会话的场景 key；普通会话为空 */
   autoScene?: string | null;
   stageSourceThreadId?: string | null;
-  /** 当前会话在证据链中的线索位置 */
-  activeClueCardId?: string | null;
 }
 
 /** 用户随 prompt 带上的附件。图片可带 base64，普通文件走 file:// resource_link。 */
@@ -306,8 +225,6 @@ export interface Thread {
   parentThreadId?: string | null;
   /** Stage 会话动态引用的源会话。 */
   stageSourceThreadId?: string | null;
-  activeClueCardId?: string | null;
-  clueContext?: ClueContextSnapshot | null;
   createdAt: number;
   updatedAt: number;
   items: Item[];
@@ -618,7 +535,6 @@ export interface IncomingShare {
   agentKind: AgentKind;
   items: Item[];
   plan?: PlanEntry[] | null;
-  activeClueCardId?: string | null;
   /** 漫游召回自动回传的快照（收件箱标注「召回」并自动弹出） */
   recall?: boolean;
   ts: number;

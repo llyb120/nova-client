@@ -3,20 +3,19 @@ import { createMemo, createSignal, For, Show } from "solid-js";
 import { api } from "../ipc";
 import { enabledAgentKinds, openThread, refreshThreads, sceneModel, state } from "../store";
 import type { AgentKind, Peer } from "../types";
-import { ClueCaptureModal } from "./ClueCaptureModal";
 import { ModelPicker } from "./ConfigSelects";
 import { IconBroadcast, IconX } from "./icons";
 
-type Mode = "clue" | "quick" | "advanced";
+type Mode = "quick" | "advanced";
 
-/** Flow 对话框：线索（默认）/ 快速分享 / 高级分享 */
+/** Flow 对话框：快速分享（默认）/ 高级分享 */
 export function ShareModal(props: {
   threadId: string;
-  /** 进入时默认 tab；默认线索 */
+  /** 进入时默认 tab；默认快速分享 */
   initialMode?: Mode;
   onClose: () => void;
 }) {
-  const [mode, setMode] = createSignal<Mode>(props.initialMode ?? "clue");
+  const [mode, setMode] = createSignal<Mode>(props.initialMode ?? "quick");
   const [target, setTarget] = createSignal<string>("");
   const [prompt, setPrompt] = createSignal("总结这段会话的要点");
   // 高级分享仍可临时选择处理模型，默认使用轻量化场景的第一个可用模型。
@@ -69,11 +68,7 @@ export function ShareModal(props: {
       // 用 mousedown 判断遮罩关闭，避免在弹窗内选中文字后拖到遮罩上松开时触发 click 关闭。
       onMouseDown={(e) => e.target === e.currentTarget && props.onClose()}
     >
-      <div
-        class="modal"
-        classList={{ "clue-capture-modal": mode() === "clue" }}
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div class="modal" onClick={(e) => e.stopPropagation()}>
         <div class="modal-head">
           <span>Flow</span>
           <button class="icon-btn" onClick={props.onClose}>
@@ -83,12 +78,6 @@ export function ShareModal(props: {
 
         <div class="share-modal-tabbar">
           <div class="share-seg">
-            <button
-              class={`share-seg-btn ${mode() === "clue" ? "active" : ""}`}
-              onClick={() => setMode("clue")}
-            >
-              线索
-            </button>
             <button
               class={`share-seg-btn ${mode() === "quick" ? "active" : ""}`}
               onClick={() => setMode("quick")}
@@ -104,16 +93,7 @@ export function ShareModal(props: {
           </div>
         </div>
 
-        <Show when={mode() === "clue"}>
-          <ClueCaptureModal
-            threadId={props.threadId}
-            sessionMode
-            embedded
-            onClose={props.onClose}
-          />
-        </Show>
-
-        <Show when={mode() !== "clue"}>
+        <>
           <div class="modal-body">
             <Show
               when={canShare()}
@@ -203,7 +183,7 @@ export function ShareModal(props: {
                     : "分享"}
             </button>
           </div>
-        </Show>
+        </>
       </div>
     </div>
   );

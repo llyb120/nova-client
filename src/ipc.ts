@@ -4,11 +4,6 @@ import type {
   Achievement,
   AgentKind,
   BranchList,
-  CaptureClueResult,
-  ClueAiSummary,
-  ClueAttachment,
-  ClueContextSnapshot,
-  ClueNodeGroup,
   GlobalAgentInstructions,
   PromptTrigger,
   IncomingShare,
@@ -130,7 +125,6 @@ export const api = {
     worktree = false,
     worktreeBranch: string | null = null,
     worktreeBase: string | null = null,
-    clueCardId: string | null = null,
     parentThreadId: string | null = null,
     autoScene: string | null = null,
   ) =>
@@ -144,61 +138,12 @@ export const api = {
       worktree,
       worktreeBranch,
       worktreeBase,
-      clueCardId,
       parentThreadId,
       autoScene,
     }),
   autoFailover: (threadId: string) => invoke<boolean>("auto_failover", { threadId }),
   createStageThread: (sourceThreadId: string, inheritSourceModel = false) =>
     invoke<Thread>("create_stage_thread", { sourceThreadId, inheritSourceModel }),
-  listClueGroups: (space: "personal" | "team" = "personal") =>
-    invoke<ClueNodeGroup[]>("list_clue_groups", { space }),
-  getClueContext: (cardId: string) =>
-    invoke<ClueContextSnapshot>("get_clue_context", { cardId }),
-  captureClue: (
-    threadId: string | null,
-    title: string,
-    content: string,
-    placement: "update" | "parallel" | "new",
-    targetCardId: string | null,
-    mentionTokens: string[],
-    attachments: ClueAttachment[],
-    space: "personal" | "team" = "personal",
-  ) =>
-    invoke<CaptureClueResult>("capture_clue", {
-      threadId,
-      title,
-      content,
-      placement,
-      targetCardId,
-      mentionTokens,
-      attachments,
-      space,
-    }),
-  addClueComment: (
-    cardId: string,
-    content: string,
-    parentCommentId: string | null,
-    mentionTokens: string[],
-    space: "personal" | "team" = "personal",
-  ) =>
-    invoke<void>("add_clue_comment", {
-      cardId,
-      content,
-      parentCommentId,
-      mentionTokens,
-      space,
-    }),
-  associateClues: (beforeCardId: string, afterCardId: string, space: "personal" | "team") =>
-    invoke<ClueNodeGroup>("associate_clues", { beforeCardId, afterCardId, space }),
-  disassociateClues: (beforeCardId: string, afterCardId: string, space: "personal" | "team") =>
-    invoke<ClueNodeGroup>("disassociate_clues", { beforeCardId, afterCardId, space }),
-  splitClue: (cardId: string, space: "personal" | "team") =>
-    invoke<ClueNodeGroup>("split_clue", { cardId, space }),
-  stackClues: (cardIds: string[], space: "personal" | "team") =>
-    invoke<ClueNodeGroup>("stack_clues", { cardIds, space }),
-  deleteClue: (cardId: string, space: "personal" | "team") =>
-    invoke<void>("delete_clue", { cardId, space }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
   deleteThreads: (threadIds: string[]) => invoke<number>("delete_threads", { threadIds }),
   deleteProjectThreads: (threadIds: string[]) =>
@@ -210,22 +155,9 @@ export const api = {
     invoke<void>("open_in_editor", { threadId, path, line }),
   openFileDefault: (threadId: string, path: string) =>
     invoke<void>("open_file_default", { threadId, path }),
-  openClueAttachment: (attachment: ClueAttachment) =>
-    invoke<void>("open_clue_attachment", {
-      name: attachment.name,
-      data: attachment.data ?? null,
-      path: attachment.uri ? fileUriPath(attachment.uri) : null,
-    }),
-  /** 读取本地文件为内嵌（base64）线索附件。 */
+  /** 读取本地文件为内嵌（base64）附件。 */
   readLocalAttachment: (path: string) =>
-    invoke<ClueAttachment>("read_local_attachment", { path }),
-  /** 把线索附件保存（下载）到指定路径。 */
-  saveClueAttachment: (attachment: ClueAttachment, target: string) =>
-    invoke<void>("save_clue_attachment", {
-      data: attachment.data ?? null,
-      path: attachment.uri ? fileUriPath(attachment.uri) : null,
-      target,
-    }),
+    invoke<PromptImage>("read_local_attachment", { path }),
   revertFileChanges: (threadId: string, changes: RevertChange[]) =>
     invoke<RevertResult>("revert_file_changes", { threadId, changes }),
   setThreadModel: (threadId: string, model: string | null) =>
@@ -260,7 +192,6 @@ export const api = {
     invoke<void>("rename_thread", { threadId, title }),
   forkThread: (threadId: string, title: string) =>
     invoke<Thread>("fork_thread", { threadId, title }),
-  clearThreadClue: (threadId: string) => invoke<void>("clear_thread_clue", { threadId }),
   /** 为阶段会话按任务生成标题。 */
   generateThreadTitle: (threadId: string, prompt: string) =>
     invoke<void>("generate_thread_title", { threadId, prompt }),
@@ -325,7 +256,6 @@ export const api = {
     agent: string | null,
     model: string | null,
   ) => invoke<Thread>("advanced_share", { threadId, to, prompt, agent, model }),
-  summarizeClue: (threadId: string) => invoke<ClueAiSummary>("summarize_clue", { threadId }),
   acceptShare: (id: string, cwd: string, ephemeral = false) =>
     invoke<string>("accept_share", { id, cwd, ephemeral }),
   declineShare: (id: string) => invoke<void>("decline_share", { id }),
@@ -343,7 +273,6 @@ export const api = {
     model: string | null,
     mode: string | null,
     firstPrompt: string | null,
-    clueCardId: string | null = null,
     worktree = false,
     worktreeBranch: string | null = null,
     worktreeBase: string | null = null,
@@ -356,7 +285,6 @@ export const api = {
       model,
       mode,
       firstPrompt,
-      clueCardId,
       worktree,
       worktreeBranch,
       worktreeBase,

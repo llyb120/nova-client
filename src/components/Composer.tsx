@@ -19,24 +19,17 @@ import {
   removeQueuedPrompt,
 } from "../promptQueue";
 import { mountSessionShortcuts } from "../sessionShortcuts";
-import { api } from "../ipc";
 import { LayoutPicker } from "./LayoutPicker";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import {
   cancelTurn,
-  clueCardById,
-  clueCurrentVersion,
-  closeThread,
   enabledAgentKinds,
   ensureModelOptions,
   ensurePeerModels,
   getOutputRate,
-  openClueCard,
   pickThreadModel,
   refreshSlashCommands,
-  refreshThreads,
   sendPrompt,
-  setView,
   showToast,
   STAGE_COMMAND_PATTERN,
   state,
@@ -44,7 +37,7 @@ import {
 import { isSupportedAgentKind, type AgentKind, type PromptImage } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects } from "./ConfigSelects";
-import { IconClue, IconFile, IconX, IconSend, IconStop, IconUndo } from "./icons";
+import { IconFile, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
@@ -159,23 +152,6 @@ export function Composer() {
   // 当前可执行后端均支持原生注入当前轮。
   const supportsSteer = backendAvailable;
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
-  const activeClue = createMemo(() => {
-    const cardId = state.threads.find((item) => item.id === state.currentId)?.activeClueCardId;
-    if (!cardId) return null;
-    const card = clueCardById(cardId);
-    const version = card ? clueCurrentVersion(card) : undefined;
-    return { id: cardId, title: version?.title || "未命名线索" };
-  });
-  const openEvidenceChain = () => {
-    const clue = activeClue();
-    if (clue) {
-      openClueCard(clue.id);
-      return;
-    }
-    // ChatView 优先于 view：必须先关闭会话才能进入证据链页（与侧栏一致）。
-    closeThread();
-    setView("clues");
-  };
   const requestStop = () => {
     holdPromptQueue(state.currentId);
     void cancelTurn();
@@ -593,27 +569,6 @@ export function Composer() {
     >
       <noteFlow.Notes />
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
-      <Show when={activeClue()}>
-        {(clue) => (
-          <div class="clue-context-chip" title={`本会话引用线索：${clue().title}`}>
-            <IconClue size={13} />
-            <span class="clue-context-label">证据链</span>
-            <span class="clue-context-separator" aria-hidden="true" />
-            <span class="clue-context-title">{clue().title}</span>
-            <button
-              type="button"
-              aria-label="移除线索上下文"
-              title="移除线索上下文"
-              onClick={() => {
-                const id = state.currentId;
-                if (id) void api.clearThreadClue(id).then(refreshThreads);
-              }}
-            >
-              <IconX size={12} />
-            </button>
-          </div>
-        )}
-      </Show>
       <Show when={slashQuery() !== null}>
         <div ref={slashMenuRef} class="slash-menu">
           <div class="slash-menu-head">
@@ -713,15 +668,6 @@ export function Composer() {
           </span>
         </Show>
         <div class="composer-actions">
-          <button
-            type="button"
-            class="composer-btn clue"
-            classList={{ active: !!activeClue() }}
-            title={activeClue() ? "查看本会话证据链" : "打开证据链"}
-            onClick={openEvidenceChain}
-          >
-            <IconClue size={16} />
-          </button>
           <span class="composer-stop-slot" classList={{ hidden: !running() }}>
             <button
               class="composer-btn stop"

@@ -116,8 +116,6 @@ try {
     window.setSidebarState('threads', []);
   });
   assert.equal(await rail.getByRole('button', { name: '工作流', exact: true }).count(), 0);
-  await rail.getByRole('button', { name: '证据链', exact: true }).click();
-  assert.equal(await rail.getByRole('button', { name: '证据链', exact: true }).evaluate(el => el.classList.contains('active')), true);
   assert.equal(await sidebar.isVisible(), false, 'routine icon actions do not force the full sidebar open');
   await rail.getByRole('button', { name: '设置', exact: true }).click();
   assert.equal(await page.evaluate(() => window.settingsOpened), 1);

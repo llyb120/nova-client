@@ -66,7 +66,7 @@ for (const kind of ['claude', 'codex', 'codexplus', 'devin', 'codebuddy', 'codeb
   await assert.rejects(store.createRoamingThread({}, '.', kind, '', '', 'hello'), /不支持的后端/);
   await assert.rejects(store.startFireRelay('task', null, 'background'), /不支持的后端/);
   await assert.rejects(store.createFireThread({ rootId: 'background' }, 'stage', 'task'), /不支持的后端/);
-  assert.throws(() => store.createThreadOptimistic('.', kind, '', '', '', 'hello', [], false, ''), /不支持的后端/);
+  assert.throws(() => store.createThreadOptimistic('.', kind, '', '', '', 'hello', [], false), /不支持的后端/);
   await assert.rejects(store.pickThreadModel(kind, ''), /不支持的后端/);
   // Legacy sessions are rebound only via the explicit backend command; unknown kinds stay rejected.
   bound.length = 0;

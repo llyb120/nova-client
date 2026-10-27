@@ -26,7 +26,6 @@ import {
   IconBroadcast,
   IconCheck,
   IconChevron,
-  IconClue,
   IconDownload,
   IconFolder,
   IconGear,
@@ -118,13 +117,12 @@ export function Sidebar(props: {
     );
   });
   const onlineCount = createMemo(() => onlinePeers().length);
-  // 主区域切换：证据链只是右侧页面；左侧仍沿用普通会话卷宗。
+  // 主区域切换
   const switchView = (view: typeof state.view) => {
     setView(view);
     closeThread();
   };
   const openHome = () => openNewSession();
-  const openClues = () => switchView("clues");
 
   // 运行中任务链（含父子接力整条链）：整链的忙碌态与「正在运行的任务数」徽标沿用这套口径。
   const chainInfo = createMemo(() => runningTaskChains());
@@ -574,10 +572,6 @@ export function Sidebar(props: {
               </span>
             </Show>
           </button>
-          <button title="证据链" aria-label="证据链" classList={{ active: state.view === "clues" }} onClick={openClues}>
-            <IconClue size={18} />
-            <Show when={state.unreadClueMentions.length > 0}><span class="sidebar-rail-dot" /></Show>
-          </button>
           <button type="button" title="观星台" aria-label="观星台"
             classList={{ active: state.view === "miniapps" }} aria-current={state.view === "miniapps" ? "page" : undefined}
             onClick={() => switchView("miniapps")}>
@@ -722,28 +716,6 @@ export function Sidebar(props: {
           新对话
         </button>
         <div class="mode-stack" role="tablist" aria-label="主区域">
-          <div class="mode-seg">
-            <button
-              class="mode-seg-btn"
-              classList={{ active: state.view === "home" }}
-              onClick={openHome}
-              title="普通模式：查看你自己的会话"
-            >
-              普通模式
-            </button>
-            <button
-              class="mode-seg-btn"
-              classList={{ active: state.view === "clues" }}
-              onClick={openClues}
-              title="打开证据链页面"
-            >
-              <IconClue size={14} />
-              证据链
-              <Show when={state.unreadClueMentions.length > 0}>
-                <span class="mode-seg-badge alert">{state.unreadClueMentions.length}</span>
-              </Show>
-            </button>
-          </div>
           <div class="mode-seg secondary">
             <Show when={state.settings?.knowledgeGraphEnabled}>
               <button class="mode-seg-btn" classList={{ active: state.view === "knowledge" || state.view === "jianpu" }}

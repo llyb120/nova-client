@@ -85,7 +85,6 @@ const tauriMock = `
         get_skills_dir: "D:/skills",
         get_global_agent_instructions: { content: "", path: "", targets: [] },
         semantic_status: { ok: false, dim: 0 },
-        list_clue_groups: [],
         take_restore_thread: null,
       };
       return Promise.resolve(cmd in mocks ? mocks[cmd] : null);

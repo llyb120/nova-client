@@ -3,7 +3,6 @@ import { listen } from "@tauri-apps/api/event";
 import { AchievementsModal } from "./components/AchievementsModal";
 import { ChatView } from "./components/ChatView";
 import { SkyBackdrop } from "./components/SkyBackdrop";
-import { EvidenceChainView } from "./components/EvidenceChainView";
 import { HomeView } from "./components/HomeView";
 import { ExclusiveChatMark } from "./components/ExclusiveChatMark";
 import { RoamRequestModal } from "./components/RoamRequestModal";
@@ -173,24 +172,20 @@ export default function App() {
       <Show
         when={state.currentId}
         fallback={
-          <Show when={state.view === "clues"} fallback={
-            <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={
-              <Show when={state.view === "employee"} fallback={
-                <Show when={state.view === "jianpu"} fallback={
-                  <Show when={state.view === "miniapps"} fallback={<HomeView />}>
-                    <Suspense><MiniAppsView /></Suspense>
-                  </Show>
-                }>
-                  <Suspense><JianpuView /></Suspense>
+          <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={
+            <Show when={state.view === "employee"} fallback={
+              <Show when={state.view === "jianpu"} fallback={
+                <Show when={state.view === "miniapps"} fallback={<HomeView />}>
+                  <Suspense><MiniAppsView /></Suspense>
                 </Show>
               }>
-                <Suspense><EmployeeView /></Suspense>
+                <Suspense><JianpuView /></Suspense>
               </Show>
             }>
-              <Suspense><KnowledgeGraphView /></Suspense>
+              <Suspense><EmployeeView /></Suspense>
             </Show>
           }>
-            <EvidenceChainView />
+            <Suspense><KnowledgeGraphView /></Suspense>
           </Show>
         }
       >

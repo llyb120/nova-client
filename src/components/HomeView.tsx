@@ -14,7 +14,6 @@ import {
   createThread,
   createThreadOptimistic,
   sceneModel,
-  clearPendingClueCard,
   enabledAgentKinds,
   ensureModelOptions,
   ensurePeerBranches,
@@ -27,7 +26,6 @@ import {
   resolveAvailableModel,
   roamingPeers,
   sendPrompt,
-  setView,
   state,
   stashWorktreePrompt,
   takePendingNewSessionSeed,
@@ -481,7 +479,6 @@ export function HomeView() {
     const images = attach.images();
     const autoMode = auto();
     const target = autoMode ? null : roam();
-    const clue = state.pendingClueCard;
     if (
       (!t && images.length === 0) ||
       busy() ||
@@ -503,10 +500,8 @@ export function HomeView() {
       if (autoMode) {
         // 直接以轻量化场景模型开局：由它判断是否把整块工作按场景转交，并选择项目目录。
         const { agentKind: autoKind, model: autoModel } = sceneModel("lightweight");
-        const clueId = clue?.id ?? "";
-        if (clue) clearPendingClueCard();
         createThreadOptimistic(await api.scratchDir(), autoKind, autoModel, mode(), "", prompt, images,
-          opts.ephemeral ?? false, clueId, "lightweight");
+          opts.ephemeral ?? false, "lightweight");
       } else if (target) {
         await createRoamingThread(
           target.peer,
@@ -515,12 +510,10 @@ export function HomeView() {
           model(),
           mode(),
           prompt,
-          clue?.id ?? "",
           wtOn,
           branch,
           base,
         );
-        if (clue) clearPendingClueCard();
         await sendPrompt(prompt, images);
       } else if (wtOn) {
         // 本地 worktree：后台创建、界面立即进入会话，就绪后再自动补发首条提示词。
@@ -536,16 +529,12 @@ export function HomeView() {
           true,
           branch,
           base,
-          clue?.id ?? "",
         );
-        if (clue) clearPendingClueCard();
         stashWorktreePrompt(id, prompt, images);
       } else {
         const ephemeral = opts.ephemeral ?? false;
         // 乐观进入聊天页：消息立即上屏，后台建会话并补发，失败回退。
         if (!ephemeral) lastUsed.setModel(agentKind(), model());
-        const clueId = clue?.id ?? "";
-        if (clue) clearPendingClueCard();
         createThreadOptimistic(
           cwd(),
           agentKind(),
@@ -555,7 +544,6 @@ export function HomeView() {
           prompt,
           images,
           ephemeral,
-          clueId,
         );
       }
       setText("");
@@ -563,7 +551,6 @@ export function HomeView() {
       setSlashStart(null);
       setRoam(null);
       attach.clear();
-      clearPendingClueCard();
       if (textareaRef) textareaRef.style.height = "auto";
       submittingPrompt = false;
     } catch (error) {
@@ -834,24 +821,6 @@ export function HomeView() {
               </button>
             </div>
           </Show>
-          <Show when={state.pendingClueCard}>
-            {(clue) => (
-              <div class="clue-context-chip" title={`引用线索：${clue().title}`}>
-                <IconClue size={13} />
-                <span class="clue-context-label">证据链</span>
-                <span class="clue-context-separator" aria-hidden="true" />
-                <span class="clue-context-title">{clue().title}</span>
-                <button
-                  type="button"
-                  aria-label="移除线索上下文"
-                  title="移除线索上下文"
-                  onClick={clearPendingClueCard}
-                >
-                  <IconX size={12} />
-                </button>
-              </div>
-            )}
-          </Show>
           <Show when={slashQuery() !== null}>
             <div ref={slashMenuRef} class="slash-menu">
               <div class="slash-menu-head">
@@ -963,14 +932,6 @@ export function HomeView() {
             </Show>
             <LayoutPicker threadId={null} />
             <div class="composer-actions">
-              <button
-                type="button"
-                class="composer-btn clue"
-                title={state.pendingClueCard ? "查看或更换证据链" : "从证据链发起会话"}
-                onClick={() => setView("clues")}
-              >
-                <IconClue size={16} />
-              </button>
               <button
                 class="composer-btn send"
                 disabled={
