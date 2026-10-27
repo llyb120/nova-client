@@ -49,7 +49,15 @@ impl VisualGuard {
 
     /// The caller must verify that the excluded overlay's geometry has not changed.
     pub(crate) fn changed_near_excluding(&self, current: &RgbaImage, x: f64, y: f64, core_only: bool, exclude: Option<PixelRect>) -> bool {
-        if current.dimensions() != self.source || !x.is_finite() || !y.is_finite()
+        self.changed_near_moving(current, None, x, y, core_only, exclude)
+    }
+
+    /// `prev`: an earlier live frame; samples that differ between it and `current` are animation
+    /// (GIF, video, spinner) and are left out of the comparison instead of counting as a stale target.
+    /// shortcut: one 2-frame gap only catches animation faster than that gap; a fully animated
+    /// neighbourhood is allowed through (nothing left to judge), so a fade-in popup over a GIF can slip.
+    pub(crate) fn changed_near_moving(&self, current: &RgbaImage, prev: Option<&RgbaImage>, x: f64, y: f64, core_only: bool, exclude: Option<PixelRect>) -> bool {
+        if current.dimensions() != self.source || prev.is_some_and(|p| p.dimensions() != self.source) || !x.is_finite() || !y.is_finite()
             || x < 0. || y < 0. || x >= self.source.0 as f64 || y >= self.source.1 as f64
             || self.unobserved.iter().any(|r| r.contains(x, y))
             || exclude.is_some_and(|r| r.contains(x, y)) {
@@ -58,6 +66,7 @@ impl VisualGuard {
         let cx = (x / self.step as f64) as i64;
         let cy = (y / self.step as f64) as i64;
         let (mut total, mut changed, mut core, mut core_changed) = (0, 0, 0, 0);
+        let (mut moving, mut core_moving) = (0, 0);
         for dy in -24i64..=24 {
             for dx in -24i64..=24 {
                 let (px, py) = (cx + dx, cy + dy);
@@ -66,6 +75,11 @@ impl VisualGuard {
                 if exclude.is_some_and(|r| r.contains(sx as f64, sy as f64)) { continue; }
                 let old = self.pixels[(py * self.width as i64 + px) as usize];
                 let new = current.get_pixel(sx, sy);
+                if prev.is_some_and(|p| { let q = p.get_pixel(sx, sy); (0..3).any(|c| q[c].abs_diff(new[c]) > 24) }) {
+                    moving += 1;
+                    if dx.abs() <= 4 && dy.abs() <= 4 { core_moving += 1; }
+                    continue;
+                }
                 let different = (0..3).any(|c| old[c].abs_diff(new[c]) > 24);
                 total += 1;
                 changed += u32::from(different);
@@ -74,7 +88,9 @@ impl VisualGuard {
         }
         // Ignore small anti-aliasing/caret noise and unrelated animation elsewhere.
         // A changed centre or substantially changed neighbourhood requires a new observation.
-        total == 0 || core == 0 || (!core_only && changed * 100 > total * 12) || core_changed * 100 > core * 35
+        if total == 0 { return moving == 0; }
+        let core_bad = if core == 0 { core_moving == 0 } else { core_changed * 100 > core * 35 };
+        core_bad || (!core_only && changed * 100 > total * 12)
     }
 }
 
@@ -233,6 +249,24 @@ mod tests {
         assert!(guard.changed_near(&current, 30., 60., true));
         assert!(guard.changed_near(&current, f64::NAN, 60., false));
         assert!(guard.changed_near(&RgbaImage::new(240,141),30.,60.,false));
+    }
+    #[test]
+    fn animation_beside_target_is_masked_but_real_change_is_not() {
+        let original = RgbaImage::from_pixel(240, 140, Rgba([80, 80, 80, 255]));
+        let guard = VisualGuard::new(&original);
+        let paint = |c: u8, x0: u32, x1: u32, y0: u32, y1: u32| { let mut i = original.clone(); for y in y0..y1 { for x in x0..x1 { i.put_pixel(x, y, Rgba([c, c, c, 255])); } } i };
+        // GIF filling the target's neighbourhood: two frames differ, both differ from the baseline.
+        let (a, b) = (paint(250, 20, 90, 30, 100), paint(10, 20, 90, 30, 100));
+        assert!(guard.changed_near(&b, 50., 60., false));
+        assert!(!guard.changed_near_moving(&b, Some(&a), 50., 60., false, None));
+        // Static change (popup) that is identical in both live frames is still stale.
+        assert!(guard.changed_near_moving(&a, Some(&a), 50., 60., false, None));
+        // GIF on one side, popup right under the target: still stale.
+        let mut c = paint(10, 20, 90, 30, 100);
+        for y in 55..65 { for x in 45..55 { c.put_pixel(x, y, Rgba([255, 0, 0, 255])); } }
+        let mut d = paint(250, 20, 40, 30, 100);
+        for y in 55..65 { for x in 45..55 { d.put_pixel(x, y, Rgba([255, 0, 0, 255])); } }
+        assert!(guard.changed_near_moving(&c, Some(&d), 50., 60., false, None));
     }
     #[test]
     fn explicit_exclusion_keeps_nearby_targets_guarded() {
