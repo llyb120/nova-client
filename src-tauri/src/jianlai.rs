@@ -634,10 +634,11 @@ fn point(shot: &Shot, x: Option<i32>, y: Option<i32>) -> Result<(i32, i32)> {
     let (x, y) = (x as i128, y as i128);
     let s = &shot.surface;
     let r = shot.region.unwrap_or(Region { x:0, y:0, width:shot.source_pixels.0, height:shot.source_pixels.1 });
-    let px = s.x as i128 + (r.x as i128 * pw as i128 + x as i128 * r.width as i128)
-        * s.width as i128 / (pw as i128 * shot.source_pixels.0 as i128);
-    let py = s.y as i128 + (r.y as i128 * ph as i128 + y as i128 * r.height as i128)
-        * s.height as i128 / (ph as i128 * shot.source_pixels.1 as i128);
+    // Aim at the image pixel's centre (x+0.5): flooring the corner biases clicks up-left on downscaled shots.
+    let px = s.x as i128 + (2 * r.x as i128 * pw as i128 + (2 * x + 1) * r.width as i128)
+        * s.width as i128 / (2 * pw as i128 * shot.source_pixels.0 as i128);
+    let py = s.y as i128 + (2 * r.y as i128 * ph as i128 + (2 * y + 1) * r.height as i128)
+        * s.height as i128 / (2 * ph as i128 * shot.source_pixels.1 as i128);
     Ok((
         i32::try_from(px).map_err(err)?,
         i32::try_from(py).map_err(err)?,
@@ -736,15 +737,15 @@ fn validate(a: &Action, shot: Option<&Shot>) -> Result<()> {
     }
     Ok(())
 }
-fn source_point(shot: &Shot, x: i32, y: i32) -> (f64, f64) {
+fn source_point(shot: &Shot, x: f64, y: f64) -> (f64, f64) {
     let r=shot.region.unwrap_or(Region{x:0,y:0,width:shot.source_pixels.0,height:shot.source_pixels.1});
     (r.x as f64+x as f64*r.width as f64/shot.pixels.0 as f64,
      r.y as f64+y as f64*r.height as f64/shot.pixels.1 as f64)
 }
 fn image_region(shot: &Shot, region: Region) -> Result<Region> {
     region.validate(shot.pixels)?;
-    let (x,y)=source_point(shot,region.x as i32,region.y as i32);
-    let (right,bottom)=source_point(shot,(region.x+region.width) as i32,(region.y+region.height) as i32);
+    let (x,y)=source_point(shot,region.x as f64,region.y as f64);
+    let (right,bottom)=source_point(shot,(region.x+region.width) as f64,(region.y+region.height) as f64);
     let crop=Region{x:x.floor() as u32,y:y.floor() as u32,width:right.ceil() as u32-x.floor() as u32,height:bottom.ceil() as u32-y.floor() as u32};
     crop.validate(shot.source_pixels)?;
     Ok(crop)
@@ -768,8 +769,8 @@ fn check_overlay(shot: &Shot, action: &Action, current: Option<crate::taskbar_st
 fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, after_input:bool, overlay:Option<crate::taskbar_status::Rect>) -> Result<()> {
     let exclude = check_overlay(shot, action, overlay)?;
     let Some(guard)=&shot.guard else {return Ok(());};
-    let mut points=vec![source_point(shot,action.x.unwrap(),action.y.unwrap())];
-    if action.action=="drag" {points.push(source_point(shot,action.to_x.unwrap(),action.to_y.unwrap()));}
+    let mut points=vec![source_point(shot,action.x.unwrap() as f64+0.5,action.y.unwrap() as f64+0.5)];
+    if action.action=="drag" {points.push(source_point(shot,action.to_x.unwrap() as f64+0.5,action.to_y.unwrap() as f64+0.5));}
     if points.iter().any(|&(x,y)|guard.changed_near_excluding(image,x,y,after_input,exclude)) {
         return Err("落点附近画面已变化或该区域未随增量更新，停止旧坐标输入；请用返回的新图重新定位，不要原样重试同一坐标；细小目标或ignoredRegions内的目标须使用 regionSpace=image 局部截图".into());
     }
@@ -1742,7 +1743,7 @@ mod tests {
             assert!(entry["unchanged"].is_null());
         }
         // Full-image coordinates map through a fractional scale and negative monitor origin.
-        assert_eq!(point(&shot,Some(150),Some(150)).unwrap(),(-1020,406));
+        assert_eq!(point(&shot,Some(150),Some(150)).unwrap(),(-1017,407));
         assert!(point(&shot,Some(320),Some(0)).is_err());
         assert!(point(&shot,Some(-1),Some(0)).is_err());
         assert!(action_shot(&[shot.clone(),other.clone()],None).is_err());
@@ -2079,8 +2080,8 @@ mod tests {
         assert!(point(&shot, Some(-1), Some(0)).is_err());
         assert!(point(&shot, None, Some(0)).is_err());
         let scaled = Shot { guard: None, pixels: (960, 540), ..shot.clone() };
-        assert_eq!(point(&scaled, Some(480), Some(270)).unwrap(), (-960, 540));
-        assert_eq!(point(&scaled, Some(959), Some(539)).unwrap(), (-2, 1078));
+        assert_eq!(point(&scaled, Some(480), Some(270)).unwrap(), (-959, 541));
+        assert_eq!(point(&scaled, Some(959), Some(539)).unwrap(), (-1, 1079));
         let desktop = Shot { guard: None, surface: Surface { x:0, y:0, ..shot.surface.clone() }, pixels:(1600,900), ..shot.clone() };
         // The reported click was on the toolbar in the source image, not a DPI offset.
         assert_eq!(point(&desktop, Some(860), Some(520)).unwrap(), (1032, 624));
