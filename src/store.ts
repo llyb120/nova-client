@@ -4,6 +4,7 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { batch, createSignal } from "solid-js";
 import { createStore, produce, reconcile, unwrap } from "solid-js/store";
 import { LruMap } from "./lruMap";
+import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
 import { migrateStoredModelSelections } from "./modelSelectionMigration";
 import { rememberPromptDraft, saveSessionDraft, takeSessionDraft } from "./promptDraft";
@@ -180,7 +181,7 @@ interface AppStore {
   expanded: Record<string, boolean>;
   titleTyping: Record<string, boolean>;
   /** 主区域视图（currentId 非空时优先显示会话，与本字段无关） */
-  view: "home" | "clues" | "knowledge" | "employee" | "jianpu" | "miniapps" | "layouts";
+  view: "home" | "clues" | "knowledge" | "employee" | "jianpu" | "miniapps";
   /** 当前证据链空间。个人空间始终本地保存，团队空间通过中转站共享。 */
   clueSpace: "personal" | "team";
   /** 证据链的隐藏节点组；界面只渲染其中的 ClueCard。 */
@@ -1283,6 +1284,7 @@ export async function createThread(
     clueCardId || null,
   );
   rememberThreadSnapshot(t);
+  void applyPendingPreset(t.id);
   const storedAgentKind = t.agentKind;
   lastUsed.setMode(storedAgentKind, t.mode ?? "");
   lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
@@ -1452,6 +1454,7 @@ export function createThreadOptimistic(
       );
       createdId = t.id;
       rememberThreadSnapshot(t);
+      void applyPendingPreset(t.id);
       const storedAgentKind = t.agentKind;
       lastUsed.setMode(storedAgentKind, t.mode ?? "");
       lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
@@ -2295,19 +2298,21 @@ export async function sendPromptTo(threadId: string, text: string, images: Promp
   await deliverPrompt(threadId, text, images);
 }
 
-/** 用「剑来」场景模型在临时目录开新会话，由剑来把自带的 Nova Chrome 扩展装进 Chrome 并允许无痕。 */
-export async function installChromeExtensionWithJianlai(status: { chromePath: string | null; extensionDir: string; extensionId: string; installedVersion?: string | null; bundledVersion?: string | null; extensions?: { browser: string; version: string | null; outdated: boolean }[] }) {
-  const others = (status.extensions ?? []).filter((e) => e.outdated && e.browser !== "Google Chrome");
+/** 用「剑来」场景模型在临时目录开新会话：先由 AI 检测依赖，缺失或过期时再由剑来把自带的 Nova Chrome 扩展装进 Chrome 并允许无痕。 */
+export async function installChromeExtensionWithJianlai(status: { chromePath: string | null; extensionDir: string; extensionId: string; bundledVersion?: string | null }) {
+  const version = status.bundledVersion ?? "Nova 自带版本";
   const { agentKind, model } = sceneModel("computer");
   const id = await createThread(await api.scratchDir(), agentKind, model, "build", "");
   await sendPromptTo(id, [
-    "请用剑来（jianlai）操作桌面，为 Google Chrome 安装 Nova 自带的 Chrome 扩展。速度优先：已确定的动作尽量合批，直接使用 act 自动反馈，不额外截图；不要为经验搜索、保存或反馈增加任何检查：",
+    `请为 Google Chrome 安装 Nova 自带的 Chrome 扩展（目标版本 ${version}）。速度优先：已确定的动作尽量合批，不为经验搜索、保存或反馈增加任何检查。`,
+    `0. 先用 chrome 工具的 status 检测：若 connected 为 true、incognitoAllowed 为 true，且 version 等于 ${version}（若返回 extensions 列表，其中每个浏览器的 version 也都等于它），则已是最新，用一句话汇报并立即结束，不要用剑来。否则记下不符合的项（未连接/过期/未允许无痕/哪些浏览器），继续下面的步骤；status 报错或无法连接也视为未安装。`,
+    `以下用剑来（jianlai）操作桌面，直接使用 act 自动反馈，不额外截图：`,
     `1. 打开 Chrome${status.chromePath ? `（路径：${status.chromePath}）` : ""}，在地址栏输入 chrome://extensions 并回车。chrome:// 页面无法用 chrome 工具操作，全程用剑来。`,
     "2. 若右上角「开发者模式」未开启，先开启。",
     `3. 若列表中已有 Nova Chrome（ID ${status.extensionId}），先确认其来源路径是否为下述目录：是则点重新加载按钮；不是（旧位置或损坏）则先「移除」再加载；列表中没有则点击「加载已解压的扩展程序」，在文件夹选择对话框中选择目录：${status.extensionDir}`,
     "4. 打开 Nova Chrome 的「详细信息」，开启「在无痕模式下启用」。",
-    ...(others.length ? [`另有 ${others.map((e) => `${e.browser}（当前 ${e.version ?? "未知/旧版"}）`).join("、")} 也装了该扩展且已过期：对每个浏览器同样执行第 2–3 步（在其自己的扩展页操作，Edge 为 edge://extensions；若它在后台没有窗口，用 shell 启动其可执行文件并传入扩展页地址）。`] : []),
-    `5. 最后用 chrome 工具的 status 核对：connected 为 true、incognitoAllowed 为 true，且 version 等于 ${status.bundledVersion ?? "Nova 自带版本"}（当前已装：${status.installedVersion ?? "未知/旧版"}）${others.length ? "，返回的 extensions 列表里每个浏览器的 version 也都等于该版本" : ""}。都符合时任务已经完成，立即用一句话汇报并结束，禁止再截图、查询状态或做其他检查。只有明确不符合时才针对失败项修正一次并再核对一次；仍不符合就报告具体失败项，禁止循环重载、等待或反复检查。`,
+    "若第 0 步发现 Edge 等其它浏览器也装了该扩展且已过期：对每个浏览器同样执行第 2–3 步（在其自己的扩展页操作，Edge 为 edge://extensions；若它在后台没有窗口，用 shell 启动其可执行文件并传入扩展页地址）。",
+    `5. 最后再用 chrome 工具的 status 核对：connected 为 true、incognitoAllowed 为 true，且 version 等于 ${version}（有 extensions 列表时每项也等于它）。都符合时任务已经完成，立即用一句话汇报并结束，禁止再截图、查询状态或做其他检查。只有明确不符合时才针对失败项修正一次并再核对一次；仍不符合就报告具体失败项，禁止循环重载、等待或反复检查。`,
   ].join("\n"), []);
 }
 

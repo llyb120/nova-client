@@ -39,6 +39,7 @@ import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFil
 import { isSupportedAgentKind, type AgentKind, type Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
 import { ConfigSelects } from "./ConfigSelects";
+import { LayoutPicker } from "./LayoutPicker";
 import { IconClue, IconFile, IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
@@ -960,6 +961,7 @@ export function HomeView() {
               />
             </Show>
             </Show>
+            <LayoutPicker threadId={null} />
             <div class="composer-actions">
               <button
                 type="button"

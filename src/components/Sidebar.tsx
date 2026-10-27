@@ -585,13 +585,6 @@ export function Sidebar(props: {
               <path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z" />
             </svg>
           </button>
-          <button type="button" title="预设布局" aria-label="预设布局"
-            classList={{ active: state.view === "layouts" }} aria-current={state.view === "layouts" ? "page" : undefined}
-            onClick={() => switchView("layouts")}>
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true">
-              <rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 10h18M9 10v10" />
-            </svg>
-          </button>
           <div class="sidebar-rail-spacer" />
           <Show when={state.inbox.length > 0}>
             <button title="收件箱" aria-label="收件箱" onClick={props.onOpenInbox}>
@@ -766,11 +759,6 @@ export function Sidebar(props: {
               aria-current={state.view === "miniapps" ? "page" : undefined}
               onClick={() => switchView("miniapps")} title="观星台：创建和打开应用">
               观星台
-            </button>
-            <button type="button" class="mode-seg-btn" classList={{ active: state.view === "layouts" }}
-              aria-current={state.view === "layouts" ? "page" : undefined}
-              onClick={() => switchView("layouts")} title="预设布局：预先设计呈现布局，会话里可直接使用">
-              布局
             </button>
           </div>
 

@@ -24,7 +24,6 @@ const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"))
 const JianpuView = lazy(() => import("./components/JianpuView"));
 const EmployeeView = lazy(() => import("./components/EmployeeView"));
 const MiniAppsView = lazy(() => import("./components/MiniAppsView"));
-const LayoutPresetsView = lazy(() => import("./components/LayoutPresetsView"));
 
 function SettingsLoadingModal(props: { onClose: () => void }) {
   return (
@@ -178,11 +177,7 @@ export default function App() {
             <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={
               <Show when={state.view === "employee"} fallback={
                 <Show when={state.view === "jianpu"} fallback={
-                  <Show when={state.view === "miniapps"} fallback={
-                    <Show when={state.view === "layouts"} fallback={<HomeView />}>
-                      <Suspense><LayoutPresetsView /></Suspense>
-                    </Show>
-                  }>
+                  <Show when={state.view === "miniapps"} fallback={<HomeView />}>
                     <Suspense><MiniAppsView /></Suspense>
                   </Show>
                 }>

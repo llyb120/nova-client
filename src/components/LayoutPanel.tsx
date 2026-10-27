@@ -1,129 +1,166 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, lazy, onCleanup, Show, Suspense, untrack } from "solid-js";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
-  designMode, layoutApi, layoutState, layoutSrcdoc, loadLayouts, setDesignTarget, toggleDesignMode,
+  layoutApi, layoutRefreshing, layoutState, layoutSrcdoc, layoutTabOpen, loadLayouts, presetsOpen, setPresetsOpen, showLayouts,
+  themePayload, watchTheme, type LayoutItem,
 } from "../layoutStore";
 import "./LayoutPanel.css";
 
-/** 会话里的呈现布局：沙箱 iframe + 布局切换 + 预设。主会话只通过 layout_update 推数据。 */
-export function LayoutPanel(props: { threadId: string }) {
-  const [collapsed, setCollapsed] = createSignal(false);
-  const [menu, setMenu] = createSignal(false);
-  const [renaming, setRenaming] = createSignal<string | null>(null);
-  let frame: HTMLIFrameElement | undefined;
+const LayoutPresetsView = lazy(() => import("./LayoutPresetsView"));
 
+/**
+ * 有看板但侧栏没显示看板页时，聊天区右上角的「看板」入口；
+ * 会话里新增了看板（选择预设）时自动打开侧栏的看板页。
+ */
+export function LayoutBack(props: { threadId: string }) {
+  createEffect(() => void loadLayouts(props.threadId));
+  const count = () => layoutState.byThread[props.threadId]?.layouts.length ?? 0;
+  let seen: number | undefined;
+  createEffect(() => {
+    const n = count();
+    // 首次载入只记录，不自动打开；之后增加才打开。
+    if (seen !== undefined && n > seen) showLayouts();
+    if (layoutState.byThread[props.threadId]) seen = n;
+  });
+  return (
+    <Show when={count() > 0 && !layoutTabOpen()}>
+      <button type="button" class="layout-back" onClick={() => showLayouts()} title="在侧栏显示看板">▦ 看板</button>
+    </Show>
+  );
+}
+
+/**
+ * 侧栏「看板」页：本会话选择的看板并排显示。每个看板是后端持久化在磁盘上的页面（模板 + 数据，
+ * 见 layout.rs save_doc），数据由后端按会话内容自动生成后再推送。「配置」切到预设的设计与管理。
+ */
+export function LayoutPanel(props: { threadId: string }) {
+  const [menu, setMenu] = createSignal(false);
   const info = () => layoutState.byThread[props.threadId];
   const layouts = () => info()?.layouts ?? [];
-  const active = createMemo(() => layouts().find((l) => l.id === info()?.active) ?? layouts()[0]);
-  const visible = () => layouts().length > 0 || designMode(props.threadId);
+  const presets = () => layoutState.presets.filter((p) => p.html);
 
   createEffect(() => void loadLayouts(props.threadId));
 
-  const post = () => {
-    const layout = active();
-    frame?.contentWindow?.postMessage({ type: "nova-layout-data", data: layout ? JSON.parse(JSON.stringify(layout.data)) : {} }, "*");
-  };
-  // 数据变化只推数据，不重载 iframe；HTML 变化（srcdoc 变）才重载，重载后靠 ready / load 补发。
-  createEffect(() => {
-    JSON.stringify(active()?.data);
-    post();
-  });
-  const onMessage = (event: MessageEvent) => {
-    if (event.source === frame?.contentWindow && event.data?.type === "nova-layout-ready") post();
-  };
-  window.addEventListener("message", onMessage);
-  onCleanup(() => window.removeEventListener("message", onMessage));
-
   const act = (run: () => Promise<unknown>) => void run().catch(() => {});
-  const newLayout = () => {
-    setDesignTarget(props.threadId, "new");
-    if (!designMode(props.threadId)) toggleDesignMode(props.threadId);
-    setMenu(false);
-  };
-  const remove = async () => {
-    const layout = active();
-    if (layout && (await confirm(`删除布局「${layout.name}」？`, { title: "删除布局", kind: "warning" }))) {
-      act(() => layoutApi.remove(props.threadId, layout.id));
-    }
-  };
+
+  // 只有用户真的在看看板（窗口可见、不在配置页）时后端才生成数据；离开时撤销，回来时后端补一次。
+  const [pageVisible, setPageVisible] = createSignal(!document.hidden);
+  const onVisibility = () => setPageVisible(!document.hidden);
+  document.addEventListener("visibilitychange", onVisibility);
+  onCleanup(() => document.removeEventListener("visibilitychange", onVisibility));
+  createEffect(() => act(() => layoutApi.viewing(pageVisible() && !presetsOpen() ? props.threadId : null)));
+  onCleanup(() => act(() => layoutApi.viewing(null)));
 
   return (
-    <Show when={visible()}>
-      <section class="layout-panel" classList={{ collapsed: collapsed() }} aria-label="呈现布局">
+    <section class="layout-pane" aria-label="看板">
         <div class="layout-bar">
-          <div class="layout-tabs" role="tablist">
-            <For each={layouts()}>
-              {(layout) => (
-                <Show
-                  when={renaming() === layout.id}
-                  fallback={
-                    <button type="button" role="tab" class="layout-tab" classList={{ active: layout.id === active()?.id }}
-                      aria-selected={layout.id === active()?.id}
-                      title="单击切换，双击重命名"
-                      onClick={() => act(() => layoutApi.switch(props.threadId, layout.id))}
-                      onDblClick={() => setRenaming(layout.id)}>
-                      {layout.name}
-                      <Show when={layout.designing}><span class="layout-tab-busy">设计中…</span></Show>
-                    </button>
-                  }
-                >
-                  <input class="layout-rename" value={layout.name} ref={(el) => queueMicrotask(() => el.select())}
-                    onBlur={(e) => {
-                      const name = e.currentTarget.value.trim();
-                      setRenaming(null);
-                      if (name && name !== layout.name) act(() => layoutApi.rename(props.threadId, layout.id, name));
-                    }}
-                    onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") setRenaming(null); }} />
-                </Show>
-              )}
-            </For>
+          <Show when={!presetsOpen()} fallback={<span class="layout-bar-title">看板配置</span>}>
             <div class="layout-add">
-              <button type="button" class="layout-icon-btn" title="新建布局 / 使用预设" aria-label="新建布局" aria-expanded={menu()} onClick={() => setMenu(!menu())}>＋</button>
+              <button type="button" class="layout-icon-btn" title="添加看板" aria-expanded={menu()} onClick={() => setMenu(!menu())}>＋ 添加看板</button>
               <Show when={menu()}>
                 <div class="layout-menu" onMouseLeave={() => setMenu(false)}>
-                  <button type="button" onClick={newLayout}>设计新布局…</button>
-                  <Show when={layoutState.presets.some((p) => p.html)}>
-                    <div class="layout-menu-head">预设布局</div>
-                    <For each={layoutState.presets.filter((p) => p.html)}>
-                      {(preset) => (
-                        <button type="button" onClick={() => { setMenu(false); act(() => layoutApi.usePreset(props.threadId, preset.id)); }}>{preset.name}</button>
-                      )}
-                    </For>
-                  </Show>
+                  <For each={presets()} fallback={<div class="layout-menu-head">还没有预设，先在「配置」里设计一个</div>}>
+                    {(preset) => (
+                      <button type="button" onClick={() => { setMenu(false); act(() => layoutApi.usePreset(props.threadId, preset.id)); }}>{preset.name}</button>
+                    )}
+                  </For>
                 </div>
               </Show>
             </div>
-          </div>
-          <div class="layout-actions">
-            <Show when={active()?.html}>
-              <button type="button" class="layout-icon-btn" title="存为预设布局" onClick={() => act(() => layoutApi.saveAsPreset(props.threadId, active()!.id))}>存为预设</button>
-              <button type="button" class="layout-icon-btn" title="清空布局数据" onClick={() => act(() => layoutApi.clearData(props.threadId, active()!.id))}>清空</button>
-            </Show>
-            <Show when={active()}>
-              <button type="button" class="layout-icon-btn" title="删除布局" onClick={() => void remove()}>删除</button>
-            </Show>
-            <button type="button" class="layout-icon-btn" classList={{ on: designMode(props.threadId) }} title="设计模式（输入框内按 Tab 切换）：提示词用于设计或调整布局"
-              onClick={() => toggleDesignMode(props.threadId)}>设计模式</button>
-            <button type="button" class="layout-icon-btn" aria-label={collapsed() ? "展开布局" : "收起布局"} onClick={() => setCollapsed(!collapsed())}>{collapsed() ? "▾" : "▴"}</button>
-          </div>
+          </Show>
+          <Show when={!presetsOpen() && layoutRefreshing(props.threadId)}>
+            <span class="layout-refreshing" role="status"><span class="layout-spinner small" />正在根据会话更新…</span>
+          </Show>
+          <button type="button" class="layout-icon-btn" classList={{ on: presetsOpen() }} aria-pressed={presetsOpen()}
+            title={presetsOpen() ? "返回本会话的看板" : "设计和管理看板预设"} onClick={() => setPresetsOpen(!presetsOpen())}>
+            {presetsOpen() ? "← 返回" : "⚙ 配置"}
+          </button>
         </div>
-        <Show when={!collapsed()}>
-          <div class="layout-stage">
-            <Show
-              when={active()?.html}
-              fallback={
-                <div class="layout-empty">
-                  {active()?.designing ? "设计会话正在设计布局…" : "还没有布局。按 Tab 进入设计模式，描述你想要的呈现方式；或点「＋」使用预设。"}
-                </div>
-              }
-            >
-              {/* sandbox 不含 allow-same-origin：页面拿不到应用上下文，只能通过 postMessage 收数据 */}
-              <iframe ref={frame} title={active()!.name} sandbox="allow-scripts" referrerpolicy="no-referrer"
-                srcdoc={layoutSrcdoc(active()!.html)} onLoad={post} />
-            </Show>
-          </div>
+        <Show when={presetsOpen()}>
+          <Suspense><LayoutPresetsView /></Suspense>
         </Show>
+        <div class="layout-cols" style={{ display: presetsOpen() ? "none" : undefined }}>
+          <For each={layouts()} fallback={
+            <div class="layout-empty">
+              <div class="layout-empty-title">还没有看板</div>
+              <div>从「＋ 添加看板」选择一个预设，系统会根据会话内容自动填充并持续更新。</div>
+            </div>
+          }>
+            {(layout) => <LayoutColumn threadId={props.threadId} layout={layout} />}
+          </For>
+        </div>
       </section>
-    </Show>
+  );
+}
+
+
+/** 一个看板：标题 + 沙箱 iframe。 */
+function LayoutColumn(props: { threadId: string; layout: LayoutItem }) {
+  const [more, setMore] = createSignal(false);
+  const [renaming, setRenaming] = createSignal(false);
+  let frame: HTMLIFrameElement | undefined;
+  const act = (run: () => Promise<unknown>) => void run().catch(() => {});
+
+  // 页面已烘焙了载入时的数据：之后只有数据真的变了才推送，避免无谓重绘。
+  let shown = "";
+  let ready = false;
+  const srcdoc = createMemo(() => {
+    const html = props.layout.html;
+    shown = JSON.stringify(untrack(() => props.layout.data));
+    ready = false;
+    return layoutSrcdoc(html);
+  });
+  const post = () => {
+    const json = JSON.stringify(props.layout.data);
+    if (!ready || json === shown) return;
+    shown = json;
+    frame?.contentWindow?.postMessage({ type: "nova-layout-data", data: JSON.parse(json) }, "*");
+  };
+  createEffect(post);
+  const postTheme = () => frame?.contentWindow?.postMessage({ type: "nova-layout-theme", theme: themePayload() }, "*");
+  const onMessage = (event: MessageEvent) => {
+    if (event.source === frame?.contentWindow && event.data?.type === "nova-layout-ready") { ready = true; postTheme(); post(); }
+  };
+  onCleanup(watchTheme(postTheme));
+  window.addEventListener("message", onMessage);
+  onCleanup(() => window.removeEventListener("message", onMessage));
+
+  const remove = async () => {
+    if (await confirm(`从本会话移除看板「${props.layout.name}」？`, { title: "移除看板", kind: "warning" })) act(() => layoutApi.remove(props.threadId, props.layout.id));
+  };
+
+  return (
+    <div class="layout-col" classList={{ refreshing: layoutRefreshing(props.threadId) }} aria-busy={layoutRefreshing(props.threadId)}>
+      <div class="layout-col-head">
+        <Show when={renaming()} fallback={
+          <span class="layout-col-name" title="双击重命名" onDblClick={() => setRenaming(true)}>{props.layout.name}</span>
+        }>
+          <input class="layout-rename" value={props.layout.name} ref={(el) => queueMicrotask(() => el.select())}
+            onBlur={(e) => {
+              const name = e.currentTarget.value.trim();
+              setRenaming(false);
+              if (name && name !== props.layout.name) act(() => layoutApi.rename(props.threadId, props.layout.id, name));
+            }}
+            onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") setRenaming(false); }} />
+        </Show>
+        <div class="layout-add">
+          <button type="button" class="layout-icon-btn" aria-label="看板操作" aria-expanded={more()} onClick={() => setMore(!more())}>⋯</button>
+          <Show when={more()}>
+            <div class="layout-menu right" onMouseLeave={() => setMore(false)}>
+              <button type="button" onClick={() => { setMore(false); setRenaming(true); }}>重命名</button>
+              <button type="button" title="清空后按会话内容重新生成" onClick={() => { setMore(false); act(() => layoutApi.clearData(props.threadId, props.layout.id)); }}>重新生成数据</button>
+              <button type="button" class="danger" onClick={() => { setMore(false); void remove(); }}>移除看板</button>
+            </div>
+          </Show>
+        </div>
+      </div>
+      <div class="layout-stage">
+        <Show when={props.layout.html} fallback={<div class="layout-empty">这个看板没有内容</div>}>
+          {/* sandbox 不含 allow-same-origin：页面拿不到应用上下文，只能通过 postMessage 收数据 */}
+          <iframe ref={frame} title={props.layout.name} sandbox="allow-scripts" referrerpolicy="no-referrer"
+            srcdoc={srcdoc()} />
+        </Show>
+      </div>
+    </div>
   );
 }

@@ -609,7 +609,7 @@ async fn execute_inner(
                 Err(error) => ToolOutcome::error(error),
             }
         }
-        "layout_create" | "layout_update" | "layout_submit" => match crate::layout::execute(name, args, owner) {
+        "layout_submit" => match crate::layout::execute(name, args, owner) {
             Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
             Err(error) => ToolOutcome::error(error),
         },

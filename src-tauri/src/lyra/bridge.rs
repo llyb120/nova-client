@@ -67,8 +67,8 @@ async fn settle_pending_input(command_busy: &AtomicBool, command_revision: &Atom
 
 /// 模型侧视觉上限：Claude 会把长边 >1568 或总像素超约 115 万的图先缩小再看，
 /// 本地按同一上限预缩，模型所见不变，请求体却小得多（大图原样上传会拖到网关超时）。
-const IMAGE_MAX_EDGE: f64 = 1568.0;
-const IMAGE_MAX_PIXELS: f64 = 1_150_000.0;
+pub(crate) const IMAGE_MAX_EDGE: f64 = 1568.0;
+pub(crate) const IMAGE_MAX_PIXELS: f64 = 1_150_000.0;
 /// 无损编码超过此大小（照片类 PNG 缩小后仍可达数 MB）改用 JPEG：截图历史每轮重发，
 /// 数 MB 请求体在不稳定链路上传会卡住直到响应头超时。
 // ponytail: 转 JPEG 丢弃透明通道；大图透明的场景少，需要时再按白底合成。
@@ -420,7 +420,7 @@ async fn handle_prompt(
     if let Some(id) = request.get("novaThreadId").and_then(Value::as_str) {
         let (layout_tools, note) = crate::layout::tools_for(id);
         tools.extend(layout_tools);
-        system_prompt.push_str(note);
+        system_prompt.push_str(&note);
     }
     // ACP（模型主动压缩）取代 Lyra 自动摘要折叠，设置里可切回 legacy。
     let acp = settings.context_compaction == crate::settings::ContextCompaction::Acp;

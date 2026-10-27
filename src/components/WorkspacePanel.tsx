@@ -14,6 +14,7 @@ import { collectWorkspaceArtifacts } from "../workspaceArtifacts";
 import { localImagePath } from "../transcriptImage";
 import { absolutePath, createFileContextMenu } from "./FileContextMenu";
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconX, IconCopy, IconBrowser, IconGear, IconTerminal } from "./icons";
+import { LayoutPanel } from "./LayoutPanel";
 import "./WorkspacePanel.css";
 
 const WorkspaceTerminal = lazy(() => import("./WorkspaceTerminal"));
@@ -108,6 +109,18 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     try { await sheetEditor?.flush(); return true; }
     catch (e) { setError(String(e)); return false; }
   };
+  // Esc 关闭侧栏：只在没有别的东西处理 Esc（菜单、弹窗、输入法）且不在终端里时生效。
+  const onEscape = (e: KeyboardEvent) => {
+    if (e.key !== "Escape" || e.defaultPrevented || e.isComposing || saving() || closing()) return;
+    const target = e.target as Element | null;
+    if (target?.closest?.(".xterm") || document.querySelector('.modal-backdrop, [aria-modal="true"]')) return;
+    // 侧栏内正在编辑（文件编辑器、看板配置输入框）时不关，免得丢掉输入。
+    if (target && panel.contains(target) && target.closest('input, textarea, [contenteditable="true"], .cm-editor')) return;
+    e.preventDefault();
+    void commitSheet().then((ok) => { if (ok) props.onClose(); });
+  };
+  window.addEventListener("keydown", onEscape);
+  onCleanup(() => window.removeEventListener("keydown", onEscape));
   let picker!: HTMLDivElement;
   onMount(() => {
     let disposed = false;
@@ -418,7 +431,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     if (tab) activate(tab);
   }
   return <aside ref={panel} class="workspace-panel" classList={{ 'is-dragging': dragging() }} style={{ width: `${width()}px` }} aria-label="产物、项目文件与终端"
-    onKeyDown={e => { if (mode() !== "terminal" && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
+    onKeyDown={e => { if (mode() !== "terminal" && mode() !== "layout" && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
     <div class="workspace-resize" role="separator" aria-label="调整文件面板宽度" aria-orientation="vertical" tabindex="0"
       aria-valuenow={width()} onKeyDown={e => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); resize(width() + (e.key === "ArrowLeft" ? 24 : -24)); } }}
       onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); }}
@@ -428,14 +441,16 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         cancelAnimationFrame(frame); frame = requestAnimationFrame(() => resize(value));
       }} />
     <nav class="workspace-toolbar workspace-modes" aria-label="文件来源">
+      <button aria-pressed={mode() === "layout"} title="本会话的看板：根据会话内容自动更新" onClick={() => { setMode("layout"); setBrowse(false); }}>看板</button>
       <button class="workspace-picker-toggle" aria-pressed={mode() === "files"} onClick={() => { setMode("files"); setBrowse(true); }}>文件</button>
       <button aria-pressed={mode() === "artifacts"} onClick={() => { setMode("artifacts"); setBrowse(false); refreshArtifacts(); }}>产物 · {artifacts().length}</button>
       <button aria-pressed={mode() === "git"} onClick={() => { setMode("git"); setBrowse(false); }}>Git 变动</button>
       <button aria-pressed={mode() === "terminal"} title="终端 (Ctrl+`)" onClick={() => { setMode("terminal"); setBrowse(false); }}>终端</button>
       <button class="workspace-panel-close" aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={async () => { if (await commitSheet()) props.onClose(); }}><IconX size={14} /></button>
     </nav>
+    <Show when={mode() === "layout"}><LayoutPanel threadId={threadId} /></Show>
     <Show when={mode() === "terminal"}><Suspense fallback={<p role="status">正在加载终端…</p>}><WorkspaceTerminal threadId={threadId} cwd={state.cwd} /></Suspense></Show>
-    <header class="workspace-toolbar workspace-tabbar" style={{ display: mode() === "terminal" ? "none" : undefined }}>
+    <header class="workspace-toolbar workspace-tabbar" style={{ display: mode() === "terminal" || mode() === "layout" ? "none" : undefined }}>
       <span class="workspace-open-label">已打开</span>
       <div class="workspace-tabs" role="tablist" aria-label="已打开文件" onWheel={e => {
         const el = e.currentTarget;
@@ -465,7 +480,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <button class="workspace-picker-toggle" aria-label="打开文件" title="从目录树打开文件" onClick={() => { setMode("files"); setBrowse(true); }}>＋</button>
     </header>
     <Show when={mode() === "git"}><WorkspaceGit threadId={threadId} onOpen={(path, line) => { setMode("files"); void open(path, false, line); }} /></Show>
-    <div class="workspace-file-view" style={{ display: mode() === "git" || mode() === "terminal" ? "none" : undefined }}>
+    <div class="workspace-file-view" style={{ display: mode() === "git" || mode() === "terminal" || mode() === "layout" ? "none" : undefined }}>
     <div class="workspace-toolbar workspace-location" onContextMenu={e => menu.open(e, preview()?.path ?? state.cwd)}>
       <button class="workspace-picker-toggle workspace-breadcrumb" aria-label="切换目录栏" aria-expanded={mode() === "files" && browse()} title={preview()?.path ?? state.cwd} onClick={() => { if (mode() !== "files") { setMode("files"); setBrowse(true); } else setBrowse(v => !v); }}>
         <IconFolder size={16} /><span class="workspace-breadcrumb-text">{preview()?.path ?? state.cwd}</span><IconChevron size={14} open={mode() === "files" && browse()} />
