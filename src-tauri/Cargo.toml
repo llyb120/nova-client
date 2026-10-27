@@ -98,6 +98,10 @@ strip = true
 lto = true
 codegen-units = 1
 
+# 依赖不生成调试信息：显著缩短 dev/test 链接时间与 target 体积；本 crate 仍保留完整调试信息。
+[profile.dev.package."*"]
+debug = false
+
 # 会话读写（JSON 序列化、SHA-256、压缩、base64）每次切会话/落盘都在热路径上；dev 下未优化会慢一个数量级。
 [profile.dev.package.serde_json]
 opt-level = 3
