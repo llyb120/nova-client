@@ -412,10 +412,10 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                     </label>
                   </div>
                   <div class="backend-fields">
-                    <label class="backend-field">
+                    <Show when={p().preset !== "server-support"}><label class="backend-field">
                       <span class="field-label">Base URL</span>
-                      <input class="field-input" type="url" placeholder={p().preset === "server-support" ? "留空使用团队中转地址 + /cc" : local() ? "留空跟随本地配置" : preset()?.baseURL ? `留空使用 ${preset()!.baseURL}` : "https://api.openai.com/v1"} value={p().baseURL} onInput={(e) => setP((x) => (x.baseURL = e.currentTarget.value))} />
-                    </label>
+                      <input class="field-input" type="url" placeholder={local() ? "留空跟随本地配置" : preset()?.baseURL ? `留空使用 ${preset()!.baseURL}` : "https://api.openai.com/v1"} value={p().baseURL} onInput={(e) => setP((x) => (x.baseURL = e.currentTarget.value))} />
+                    </label></Show>
                     <Show when={!local()}>
                       <label class="backend-field">
                         <span class="field-label">API Key</span>
