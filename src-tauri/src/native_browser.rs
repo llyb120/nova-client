@@ -176,6 +176,12 @@ fn resize_screenshot(image: xcap::image::DynamicImage, edge: u32) -> xcap::image
 fn deliver_screenshot(observation: &mut Observation, previous: Option<&Observation>, stream: Option<String>,
     image: xcap::image::RgbaImage, path: std::path::PathBuf, (x, y, width, height): (f64, f64, f64, f64)) -> Result<Vec<Value>, String> {
     let page = &observation.pages["pages"][0];
+    // Images the model addresses by pixel must fit its vision cap; otherwise it sees a second downscale.
+    let scale = crate::lyra::bridge::vision_scale(image.width() as f64, image.height() as f64);
+    let image = if scale < 1.0 {
+        xcap::image::imageops::resize(&image, ((image.width() as f64 * scale).round() as u32).max(1),
+            ((image.height() as f64 * scale).round() as u32).max(1), xcap::image::imageops::FilterType::Triangle)
+    } else { image };
     // Viewports and normal full-page tiles share Jianlai's unchanged-frame reuse. Crops/exports stay standalone.
     // Match each document tile independently; identical pixel sizes alone do not prove identical coordinates.
     let prior = previous.filter(|p| p.captured.elapsed() <= Duration::from_secs(180) && p.full_page == observation.full_page

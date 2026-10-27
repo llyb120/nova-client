@@ -743,7 +743,7 @@
           { "const": 0 },
           { "minimum": 320, "maximum": 3840 }
         ],
-        "description": "截图长边：0为原始精度，或320–3840；默认1600，expandScroll默认0（无损WebP）"
+        "description": "截图长边：0为原始精度，或320–3840；默认1600，expandScroll默认0（无损WebP）。可坐标操作的视口图和整页分片不超过模型视觉上限（长边1568、约115万像素），返回图即模型所见"
       },
       "incognito": {
         "type": "boolean",

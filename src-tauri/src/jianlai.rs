@@ -514,8 +514,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             let requested = if max_edge > 0 && (region.is_some() || long > max_edge as f64) { max_edge as f64 / long } else { 1.0 };
             // The model is shown at most this many pixels; any larger image gets downscaled again before it sees it,
             // so its coordinates would no longer match the image pixels it addresses.
-            let scale = requested.min(crate::lyra::bridge::IMAGE_MAX_EDGE / long)
-                .min((crate::lyra::bridge::IMAGE_MAX_PIXELS / (width as f64 * height as f64)).sqrt());
+            let scale = requested.min(crate::lyra::bridge::vision_scale(width as f64, height as f64));
             if scale != 1.0 {
                 xcap::image::DynamicImage::ImageRgba8(image).resize_exact(
                     (width as f64 * scale).round().max(1.0) as u32,

@@ -67,12 +67,17 @@ async fn settle_pending_input(command_busy: &AtomicBool, command_revision: &Atom
 
 /// 模型侧视觉上限：Claude 会把长边 >1568 或总像素超约 115 万的图先缩小再看，
 /// 本地按同一上限预缩，模型所见不变，请求体却小得多（大图原样上传会拖到网关超时）。
-pub(crate) const IMAGE_MAX_EDGE: f64 = 1568.0;
-pub(crate) const IMAGE_MAX_PIXELS: f64 = 1_150_000.0;
+const IMAGE_MAX_EDGE: f64 = 1568.0;
+const IMAGE_MAX_PIXELS: f64 = 1_150_000.0;
 /// 无损编码超过此大小（照片类 PNG 缩小后仍可达数 MB）改用 JPEG：截图历史每轮重发，
 /// 数 MB 请求体在不稳定链路上传会卡住直到响应头超时。
 // ponytail: 转 JPEG 丢弃透明通道；大图透明的场景少，需要时再按白底合成。
 const IMAGE_MAX_LOSSLESS_BYTES: usize = 1024 * 1024;
+
+/// 把 w×h 缩到视觉上限内的比例（可能 >1）。截图工具据此预缩，模型所见就是坐标所指的像素。
+pub(crate) fn vision_scale(w: f64, h: f64) -> f64 {
+    (IMAGE_MAX_EDGE / w.max(h)).min((IMAGE_MAX_PIXELS / (w * h)).sqrt())
+}
 
 /// 超出视觉上限时等比缩小；非 JPEG 结果超过无损上限则改编码为 JPEG q90。
 /// 无需处理或无法解码返回 None，调用方沿用原图。
@@ -80,7 +85,7 @@ pub(crate) fn fit_image(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
     let format = image::guess_format(bytes).ok()?;
     let img = image::load_from_memory_with_format(bytes, format).ok()?;
     let (w, h) = (img.width() as f64, img.height() as f64);
-    let scale = (IMAGE_MAX_EDGE / w.max(h)).min((IMAGE_MAX_PIXELS / (w * h)).sqrt());
+    let scale = vision_scale(w, h);
     let lossless = format != image::ImageFormat::Jpeg;
     if scale >= 1.0 && !(lossless && bytes.len() > IMAGE_MAX_LOSSLESS_BYTES) {
         return None;
@@ -849,6 +854,11 @@ pub async fn run() -> i32 {
 mod tests {
     #[test]
     fn fit_image_downscales_only_oversized_images() {
+        // Screenshot tools pre-fit with vision_scale; the result must pass through fit_image untouched.
+        let s = super::vision_scale(1920.0, 1080.0);
+        let (w, h): (f64, f64) = ((1920.0 * s).round(), (1080.0 * s).round());
+        assert_eq!((w, h), (1430.0, 804.0));
+        assert!(super::vision_scale(w, h) >= 1.0);
         let png = |w, h| {
             let mut out = Vec::new();
             image::DynamicImage::new_rgb8(w, h)
