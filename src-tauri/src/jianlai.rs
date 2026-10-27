@@ -306,7 +306,9 @@ fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u
     let width = r.width as i128 * surface.width as i128;
     let height = r.height as i128 * surface.height as i128;
     if x < 0 || y < 0 || x >= width || y >= height { return None; }
-    let (x, y) = ((x * image.width() as i128 / width) as i32, (y * image.height() as i128 / height) as i32);
+    // Map the desktop pixel's centre (like point()), so a click at image (x,y) is marked at (x,y), not one pixel up-left.
+    let to_image = |v: i128, pixel: u32, size: i128, edge: u32| ((2 * v + pixel as i128) * edge as i128 / (2 * size)).min(edge as i128 - 1) as i32;
+    let (x, y) = (to_image(x, source.0, width, image.width()), to_image(y, source.1, height, image.height()));
     // 与系统指针同款的剑（系统截图本就不含真实指针），剑尖即热点；光晕在反馈图里刻意很淡，
     // 压住的内容仍然可读，不干扰模型对目标的判断。
     let hot = POINTER_TIP as i32;
@@ -507,9 +509,14 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         } else { image };
         let resize_started = Instant::now();
         let resize = |image: xcap::image::RgbaImage| {
-            if max_edge > 0 && (region.is_some() || image.width().max(image.height()) > max_edge) {
-                let scale = max_edge as f64 / image.width().max(image.height()) as f64;
-                let (width, height) = image.dimensions();
+            let (width, height) = image.dimensions();
+            let long = width.max(height) as f64;
+            let requested = if max_edge > 0 && (region.is_some() || long > max_edge as f64) { max_edge as f64 / long } else { 1.0 };
+            // The model is shown at most this many pixels; any larger image gets downscaled again before it sees it,
+            // so its coordinates would no longer match the image pixels it addresses.
+            let scale = requested.min(crate::lyra::bridge::IMAGE_MAX_EDGE / long)
+                .min((crate::lyra::bridge::IMAGE_MAX_PIXELS / (width as f64 * height as f64)).sqrt());
+            if scale != 1.0 {
                 xcap::image::DynamicImage::ImageRgba8(image).resize_exact(
                     (width as f64 * scale).round().max(1.0) as u32,
                     (height as f64 * scale).round().max(1.0) as u32,
@@ -1936,6 +1943,10 @@ mod tests {
         assert_eq!(mark_cursor(&mut image, &surface, (3840,2160), Some(region), (-1821,-50)), None);
         assert_eq!(mark_cursor(&mut image, &surface, (3840,2160), Some(region), (-1420,-50)), None);
         assert_eq!(image, unchanged);
+        // Round trip with a 1920→1600 downscale: image (485,151) clicks desktop (582,181) and is marked back there.
+        let full = Surface { id:1, pid:None, x:0, y:0, width:1920, height:1080 };
+        let mut shot = xcap::image::RgbaImage::new(1600, 900);
+        assert_eq!(mark_cursor(&mut shot, &full, (1920,1080), None, (582,181)), Some((485,151)));
     }
     // Deterministic screenshot pipeline benchmark; no desktop input or live capture.
     #[test]
