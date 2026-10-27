@@ -381,8 +381,9 @@ export function SearchSelect(props: {
     if (anchor) {
       // 对齐容器（composer）：宽度不超过容器，优先与触发器左对齐、右缘不越出容器，
       // 撑满时与容器边缘齐平，观感与输入框成一体
-      w = Math.min(w, anchor.width);
-      left = Math.max(anchor.left, Math.min(r.left, anchor.right - w));
+      // 分组/三级面板需要足够列宽，容器过窄时允许超出容器（由下方视口夹取兜底），否则列被裁掉
+      if (!big) w = Math.min(w, anchor.width);
+      left = big ? anchor.left : Math.max(anchor.left, Math.min(r.left, anchor.right - w));
     } else {
       left = right ? Math.max(8, r.right - w) : r.left;
     }
