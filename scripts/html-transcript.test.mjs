@@ -206,7 +206,7 @@ window.test={
       {type:'tool',id:104,ts:0,title:'Check result',kind:'execute',status:'failed',toolCallId:'visual-failed',locations:[],content:[{type:'content',content:{type:'text',text:'exit 1: validation example'}}]},
       {type:'assistant',id:105,ts:0,text:'## 检查结果\\n\\nText with **bold**, *emphasis*, \`inline code\`, and [link](https://example.invalid).\\n\\n1. First numbered item\\n2. Second item\\n   - Nested bullet\\n\\n> A quoted result\\n\\n| Key | Value |\\n| --- | --- |\\n| DOM | native |\\n| Anchor | stable |\\n\\n~~~ts\\nconst ok = true;\\nconsole.log(ok);\\n~~~\\n\\nrich-end'}],turn:{type:'turn',id:106,ts:0,durationMs:1250,totalTokens:1234,stopReason:'end'}};
     replace([g],'rich');
-    for(const key of ['turn-106','process-102-done','thought-102','tool-103','tool-104'])toggleExpanded(key,true);
+    for(const key of ['turn-106','process-102','thought-102','tool-103','tool-104'])toggleExpanded(key,true);
   },
   inline(){const g=group(0);g.body=[{type:'assistant',id:2,ts:0,text:'Search alpha **bold** omega tail'}];replace([g],'inline');},
   tall(){const groups=Array.from({length:60},(_,i)=>group(i));groups[30]={...groups[30],body:[{type:'assistant',id:92,ts:0,text:Array.from({length:700},(_,i)=>'tall-line-'+i+' stable reading anchor').join('\\n\\n')}]};replace(groups,'tall');},
@@ -218,9 +218,9 @@ window.test={
       {type:'thought',id:9001,ts:0,text:'',deferred:true},
       {type:'tool',id:9002,ts:0,title:'fixture tool',kind:'execute',status:'completed',toolCallId:'fixture-tool',content:[],locations:[],deferred:true},
       {type:'assistant',id:9003,ts:0,text:'deferred conclusion'}],turn:{type:'turn',id:9004,ts:0,durationMs:1000,stopReason:'end'}};
-    for(const key of ['turn-9004','process-9001-done','process-9002-done','thought-9001','tool-9002'])toggleExpanded(key,false);
+    for(const key of ['turn-9004','process-9001','process-9002','thought-9001','tool-9002'])toggleExpanded(key,false);
     replace(groups,'deferred-'+kind);
-    if(kind==='above')for(const key of ['turn-9004','process-9001-done','thought-9001'])toggleExpanded(key,true);
+    if(kind==='above')for(const key of ['turn-9004','process-9001','thought-9001'])toggleExpanded(key,true);
   },
   releaseLoads(){for(const pending of [...pendingLoads.values()])pending.release();},
   loadStats(){return {calls:loadCalls,pending:pendingLoads.size,hydrationCount};},

@@ -65,14 +65,14 @@ assert.doesNotMatch(html, /private reasoning|TOOL DETAIL|data-item-id="[23]"/);
 html = render(group, { 'turn-5': true });
 assert.match(html, /读取文件 ×1（1 项失败）/);
 assert.doesNotMatch(html, /TOOL DETAIL|data-item-id="[23]"/);
-html = render(group, { 'turn-5': true, 'process-2-done': true });
+html = render(group, { 'turn-5': true, 'process-2': true });
 assert.match(html, /data-item-id="2"/);
 assert.match(html, /data-item-id="3"/);
 assert.match(html, /data-status="failed"/);
 assert.match(html, /aria-label="失败"/);
 assert.match(html, /1\.50s/);
 assert.doesNotMatch(html, /private reasoning|TOOL DETAIL|\x1b/);
-html = render(group, { 'turn-5': true, 'process-2-done': true, 'thought-2': true, 'tool-3': true });
+html = render(group, { 'turn-5': true, 'process-2': true, 'thought-2': true, 'tool-3': true });
 assert.match(html, /private reasoning/);
 assert.match(html, /file.ts:12/);
 assert(html.includes(output.trim()), 'open tool output retains all text, not only its visible 320px');
@@ -84,7 +84,7 @@ assert.match(html, /进行中/);
 assert.match(html, /class="ht-live-preview"/);
 assert.match(html, /class="ht-live-lines"/);
 assert.doesNotMatch(html, /TOOL DETAIL|data-item-id="3"/);
-html = render(live, { 'process-2-live': true }, { running: true });
+html = render(live, { 'process-2': true }, { running: true });
 assert.match(html, /TOOL DETAIL/);
 assert.match(html, /aria-label="进行中"/);
 assert.doesNotMatch(html, /aria-label="编辑消息"/);
@@ -133,3 +133,7 @@ assert.match(source, /img\.currentSrc === shown\(\)\.src && img\.complete && !im
 assert.equal([...source.matchAll(/<Markdown[^>]*\bvirtual\b/g)].length, 2, 'assistant and thought Markdown both opt into virtual chunks');
 assert.match(css, /\.ht-bubble-images img\s*\{[^}]*flex: none;/);
 console.log('HtmlTurn headless checks passed (folding/search keys, lazy bodies, full output, images, preview/edit policy, stats, placeholders and large-message guards).');
+
+// 展开状态不能随 live→done 切换丢失（否则流式结束或后续消息出现时展开被收起）
+assert.match(render({ user, body: [thought, tool] }, { 'process-2': true }), /data-item-id="3"/);
+assert.match(render(live, { 'process-2': true }, { running: true }), /TOOL DETAIL/);

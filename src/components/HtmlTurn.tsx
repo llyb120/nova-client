@@ -242,7 +242,7 @@ function HtmlProcess(props: DetailProps & { items: Item[]; live: boolean }) {
     const segment = () => segments().get(id)!;
     const items = () => (segment() as Extract<ProcessSegment, { type: "process" }>).items;
     const live = () => props.live && id === ids().at(-1);
-    const key = () => `process-${id}-${live() ? "live" : "done"}`;
+    const key = () => `process-${id}`;
     const lines = () => live() ? processLiveLines(items()) : [processSummary(items())];
     return <Show when={segment().type === "process"} fallback={
       <HtmlItem item={(segment() as Extract<ProcessSegment, { type: "item" }>).item} active={props.live && id === props.items.at(-1)?.id}

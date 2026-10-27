@@ -303,8 +303,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       if (group.turn && process.some(it => it.id === itemId)) toggleExpanded(`turn-${group.turn.id}`, true);
       for (const segment of processSegments(process)) {
         if (segment.type === "process" && segment.items.some(it => it.id === itemId)) {
-          toggleExpanded(`process-${segment.id}-done`, true);
-          toggleExpanded(`process-${segment.id}-live`, true);
+          toggleExpanded(`process-${segment.id}`, true);
         }
       }
       const item = group.body.find(it => it.id === itemId);
