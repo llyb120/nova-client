@@ -228,7 +228,7 @@ pub fn model_options(config: &Value) -> Vec<Value> {
             let context_window = model
                 .pointer("/limit/context")
                 .and_then(Value::as_u64)
-                .unwrap_or(128_000);
+                .unwrap_or(200_000);
             let meta = json!({
                 "codex.ai/supportsImages": supports_images,
                 "contextWindow": context_window,
@@ -582,7 +582,7 @@ pub fn resolve_model(
             context_window: model
                 .pointer("/limit/context")
                 .and_then(Value::as_u64)
-                .unwrap_or(128_000),
+                .unwrap_or(200_000),
             max_output_tokens: model
                 .pointer("/limit/output")
                 .and_then(Value::as_u64)
