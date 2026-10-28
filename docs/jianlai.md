@@ -144,7 +144,6 @@ Windows 用显式 activate(windowId) 激活 windows 返回的窗口并取得所�
 
 已知上限：截图在按下后由后台线程截取，菜单在按下时就弹出的应用会拍到已变化的画面；UIA 读值是异步的，回车即发送并清空的输入框可能读不到 `value`（仍保留按键文字）；ToUnicodeEx 用不改内核键盘状态的标志（Win10 1607+），更早系统上死键组合可能被打断。
 
-## 可选后端
+## 截图后端
 
-- **截图**：Windows 显示器默认走 DXGI Desktop Duplication（`jianlai/dxgi.rs`）；旋转屏、HDR、静止画面超时或安全桌面等失败时自动回退 xcap（stderr 有日志）。验证：`cargo test --lib dxgi_matches_xcap -- --ignored`。
-- **输入**：Windows 设置 `NOVA_JIANLAI_INPUT=interception` 后，桌面模式的鼠标键盘改走 [Interception](https://github.com/oblitum/Interception) 驱动（`jianlai/interception.rs`），事件不带 `INJECTED` 标志。需先装驱动并重启，`interception.dll` 放在 Nova 旁或 PATH 中；固定发给第 1 个键盘/第 1 个鼠标设备。后台座席模式不使用。失败时直接报错，不回退 SendInput。
+Windows 显示器默认走 DXGI Desktop Duplication（`jianlai/dxgi.rs`）；旋转屏、HDR、静止画面超时或安全桌面等失败时自动回退 xcap（stderr 有日志）。验证：`cargo test --lib dxgi_matches_xcap -- --ignored`。

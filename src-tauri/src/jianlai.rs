@@ -12,8 +12,6 @@ use xcap::{Monitor, Window};
 mod background;
 #[cfg(windows)]
 mod dxgi;
-#[cfg(windows)]
-mod interception;
 mod nova_regions;
 #[cfg(windows)]
 mod text_input;
@@ -868,25 +866,7 @@ fn virtual_desk_coordinate(p: i32, origin: i32, size: i32) -> i32 {
     ((p as i64 - origin as i64) * 65536 + size as i64 - 1).div_euclid(size as i64).clamp(0, 65535) as i32
 }
 /// `input_event`: glide/drag path points must be real input (hover, drag thresholds, hooks, raw input).
-fn key_event(enigo: &mut Enigo, key: Key, direction: Direction) -> Result<()> {
-    #[cfg(windows)]
-    if interception::enabled() { return interception::key(key, direction); }
-    enigo.key(key, direction).map_err(err)
-}
-fn button_event(enigo: &mut Enigo, button: Button, direction: Direction) -> Result<()> {
-    #[cfg(windows)]
-    if interception::enabled() { return interception::button(button, direction); }
-    enigo.button(button, direction).map_err(err)
-}
-fn scroll_event(enigo: &mut Enigo, length: i32, axis: Axis) -> Result<()> {
-    #[cfg(windows)]
-    if interception::enabled() { return interception::scroll(length, axis == Axis::Horizontal); }
-    enigo.scroll(length, axis).map_err(err)
-}
 fn move_pointer(_enigo: &mut Enigo, x: i32, y: i32, input_event: bool) -> Result<()> {
-    // The driver injects below SendInput; SetCursorPos would be software input again.
-    #[cfg(windows)]
-    if interception::enabled() { return interception::move_to(x, y); }
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
@@ -915,9 +895,9 @@ fn move_pointer(_enigo: &mut Enigo, x: i32, y: i32, input_event: bool) -> Result
 fn click_button(enigo: &mut Enigo, button: Button) -> Result<()> {
     // Keep the native down/up pair together on the successful fast path.
     // A failed reply can still mean partial input: release, but never replay.
-    if let Err(error) = button_event(enigo, button, Direction::Click) {
-        let _ = button_event(enigo, button, Direction::Release);
-        return Err(error);
+    if let Err(error) = enigo.button(button, Direction::Click) {
+        let _ = enigo.button(button, Direction::Release);
+        return Err(err(error));
     }
     Ok(())
 }
@@ -1023,8 +1003,8 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "drag" => {
             let (x, y) = point(shot, a.x, a.y)?;
             let (tx, ty) = point(shot, a.to_x, a.to_y)?;
-            if let Err(error)=button_event(enigo,button,Direction::Press) {
-                let _=button_event(enigo,button,Direction::Release);return Err(error);
+            if let Err(error)=enigo.button(button,Direction::Press) {
+                let _=enigo.button(button,Direction::Release);return Err(err(error));
             }
             let moved = if a.glide == Some(true) { glide(enigo, (x, y), (tx, ty)) } else { (1..=12).try_for_each(|i| {
                 move_pointer(enigo,
@@ -1035,7 +1015,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
                 std::thread::sleep(Duration::from_millis(16));
                 Ok::<_, String>(())
             }) };
-            let released = button_event(enigo, button, Direction::Release);
+            let released = enigo.button(button, Direction::Release).map_err(err);
             moved?;
             released?;
         }
@@ -1049,11 +1029,11 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
             let keys = keys(a.key.as_deref().unwrap())?;
             let pressed = keys
                 .iter()
-                .try_for_each(|k| key_event(enigo, *k, Direction::Press));
+                .try_for_each(|k| enigo.key(*k, Direction::Press).map_err(err));
             let mut release_error = None;
             for k in keys.iter().rev() {
-                if let Err(e) = key_event(enigo, *k, Direction::Release) {
-                    release_error = Some(e);
+                if let Err(e) = enigo.key(*k, Direction::Release) {
+                    release_error = Some(err(e));
                 }
             }
             pressed?;
@@ -1070,7 +1050,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
                 if i > 0 {
                     std::thread::sleep(Duration::from_millis(8));
                 }
-                scroll_event(enigo, delta.signum(), axis)?;
+                enigo.scroll(delta.signum(), axis).map_err(err)?;
             }
         }
         "wait" => std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))),
@@ -1400,8 +1380,6 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             let monitor_id = snap.window.is_none().then_some(shot.surface.id);
             // macOS 后台按进程投递事件：不创建 Enigo（它只发给 HID 层，还会弹权限提示）。
             let direct = bg && cfg!(target_os = "macos");
-            #[cfg(windows)]
-            interception::set_active(!bg);
             let mut enigo = if direct { None } else {
                 Some(Enigo::new(&if bg { background::seat_settings()? } else { Settings::default() }).map_err(err)?)
             };
