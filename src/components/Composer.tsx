@@ -112,9 +112,12 @@ export function Composer() {
   attach.set(initialDraft?.images ?? []);
 
   const running = () => !!(state.currentId && state.running[state.currentId]);
-  // 自动模式场景切换只改本轮会话模型、不落线程配置；运行中让选择器跟随，轮次结束自动回到线程模型。
+  // 自动模式场景切换只改本轮会话模型、不落线程配置；选择器跟随最近一轮实际使用的模型（含轮次结束后），
+  // 直到用户手动选择或开始新一轮。
+  const [picked, setPicked] = createSignal(false);
+  createEffect(() => { state.currentId; running(); setPicked(false); });
   const shownModel = () => {
-    const live = running() ? liveModel(state.items) : "";
+    const live = picked() ? "" : liveModel(state.items);
     return !live || state.model === live || state.model.startsWith(`${live}/`) ? state.model : live;
   };
   const [runClock, setRunClock] = createSignal(Date.now());
@@ -658,7 +661,7 @@ export function Composer() {
           agentKinds={agentKinds()}
           model={shownModel()}
           modelSource={usesPeerModels() ? guestModelSource : undefined}
-          onPickModel={(k, m) => void pickThreadModel(k, m)}
+          onPickModel={(k, m) => { setPicked(true); void pickThreadModel(k, m); }}
           anchorTo=".composer"
           favorites
           disabled={running()}
