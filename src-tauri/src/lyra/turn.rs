@@ -138,8 +138,18 @@ fn tools_conflict(cwd: &Path, left: &(String, String, Value), right: &(String, S
 
 fn tool_dependencies(args: &Value, index: usize) -> Result<Vec<usize>, String> {
     let Some(value) = args.get("_after") else { return Ok(Vec::new()); };
-    let deps = value.as_array().filter(|deps| deps.len() <= 64)
-        .ok_or("_after 必须是最多 64 项的前置调用序号数组；本项未执行")?;
+    // 模型常把可选数组写成 null、单个数字或 "[1]" 字符串：宽容接受这些形态，范围错误仍严格拒绝。
+    let parsed = match value {
+        Value::String(s) => serde_json::from_str(s.trim()).unwrap_or_else(|_| value.clone()),
+        other => other.clone(),
+    };
+    let deps = match parsed {
+        Value::Null => Vec::new(),
+        Value::Array(deps) => deps,
+        n @ Value::Number(_) => vec![n],
+        _ => return Err("_after 必须是最多 64 项的前置调用序号数组；本项未执行".into()),
+    };
+    if deps.len() > 64 { return Err("_after 必须是最多 64 项的前置调用序号数组；本项未执行".into()); }
     deps.iter().map(|value| value.as_u64().filter(|n| *n > 0 && *n <= index as u64)
         .map(|n| n as usize - 1).ok_or_else(|| "_after 只能引用本轮更早的调用（从 1 开始），不得引用自身或未来调用；本项未执行".into())).collect()
 }
@@ -874,7 +884,10 @@ pub(crate) mod tests {
     #[test]
     fn native_dependencies_validate_and_conflicts_preserve_shared_resources() {
         assert_eq!(tool_dependencies(&json!({"_after":[1,2]}), 2).unwrap(), vec![0,1]);
-        for value in [json!(null), json!("1"), json!([0]), json!([3]), json!([-1]), json!([1.5])] {
+        for value in [json!(null), json!("1"), json!(2), json!("[1,2]")] {
+            assert!(tool_dependencies(&json!({"_after":value}), 2).is_ok());
+        }
+        for value in [json!("x"), json!({}), json!(true), json!([0]), json!([3]), json!([-1]), json!([1.5])] {
             assert!(tool_dependencies(&json!({"_after":value}), 2).is_err());
         }
         let dir = tempfile::tempdir().unwrap();

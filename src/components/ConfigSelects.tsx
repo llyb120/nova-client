@@ -234,6 +234,7 @@ export function ModelPicker(props: {
       portal={props.portal}
       anchorTo={props.anchorTo}
       allowDefault={props.allowDefault}
+      defaultLabel={props.defaultLabel}
       favorites={props.favorites}
       disabled={props.disabled}
     />

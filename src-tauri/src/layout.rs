@@ -309,8 +309,8 @@ pub fn refresh(app: &AppHandle, thread: &str) {
                 for _ in 0..2 {
                     let result = crate::lyra::run_oneshot(&reqwest::Client::new(), &json!({"action": "generate", "model": light_model(), "prompt": prompt}), None).await;
                     if let Some(Value::Object(all)) = result.as_ref().ok().and_then(Value::as_str).and_then(lenient_object) {
-                        let _ = apply_refresh(&thread, all, key, session_value(&app, &thread));
-                        break;
+                        // 模型漏了某个看板（键名写错等）算失败：不记指纹，立刻重试，否则要等用户手动重新生成。
+                        if apply_refresh(&thread, all, key, session_value(&app, &thread)).unwrap_or(true) { break; }
                     }
                 }
             }
@@ -331,10 +331,12 @@ fn set_viewing(app: &AppHandle, thread: &str) {
     *VIEWING.lock().unwrap() = thread.to_string();
     if !thread.is_empty() { refresh(app, thread); }
 }
-fn apply_refresh(thread: &str, all: Map<String, Value>, key: u64, session: Value) -> Result<(), String> {
-    let changed = update(|s| {
+/// 返回是否每个看板都拿到了数据；不完整时不记指纹，下次触发还会再生成。
+fn apply_refresh(thread: &str, all: Map<String, Value>, key: u64, session: Value) -> Result<bool, String> {
+    let (changed, complete) = update(|s| {
         let t = s.threads.get_mut(thread).ok_or("布局已删除")?;
-        t.input = key;
+        let complete = t.layouts.iter().filter(|l| !l.html.is_empty()).all(|l| all.get(&l.id).is_some_and(Value::is_object));
+        if complete { t.input = key; }
         let mut changed = Vec::new();
         for l in t.layouts.iter_mut() {
             let Some(Value::Object(mut data)) = all.get(&l.id).cloned() else { continue };
@@ -344,12 +346,12 @@ fn apply_refresh(thread: &str, all: Map<String, Value>, key: u64, session: Value
             save_doc(thread, l);
             changed.push((l.id.clone(), l.data.clone()));
         }
-        Ok(changed)
+        Ok((changed, complete))
     })?;
     for (id, data) in changed {
         emit(json!({"kind": "data", "threadId": thread, "layoutId": id, "data": data}));
     }
-    Ok(())
+    Ok(complete)
 }
 
 /// 用户在看的会话：运行中每 10 秒刷新一次；一轮结束时再刷新一次拿最终结果。
