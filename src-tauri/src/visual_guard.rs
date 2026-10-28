@@ -23,7 +23,6 @@ pub(crate) struct VisualGuard {
     source: (u32, u32),
     step: u32,
     pixels: std::sync::Arc<Vec<[u8; 3]>>,
-    unobserved: Vec<PixelRect>,
 }
 impl VisualGuard {
     // At most 1600^2 RGB samples (~7.7 MB); clones share the backing storage.
@@ -35,62 +34,31 @@ impl VisualGuard {
             let p = image.get_pixel(x * step, y * step);
             [p[0], p[1], p[2]]
         })).collect();
-        Self { width, height, source: image.dimensions(), step, pixels: std::sync::Arc::new(pixels), unobserved: Vec::new() }
+        Self { width, height, source: image.dimensions(), step, pixels: std::sync::Arc::new(pixels) }
     }
 
-    /// Delivery exclusions may have refreshed without reaching the model; require a fresh crop before input there.
-    pub(crate) fn mark_unobserved(&mut self, regions: Vec<PixelRect>) { self.unobserved = regions; }
-
-    /// `core_only`: the batch's own earlier input legitimately changed the neighbourhood
-    /// (typed text, ticked checkbox); only an overlay or shift right under the target counts.
-    pub(crate) fn changed_near(&self, current: &RgbaImage, x: f64, y: f64, core_only: bool) -> bool {
-        self.changed_near_excluding(current, x, y, core_only, None)
-    }
-
-    /// The caller must verify that the excluded overlay's geometry has not changed.
-    pub(crate) fn changed_near_excluding(&self, current: &RgbaImage, x: f64, y: f64, core_only: bool, exclude: Option<PixelRect>) -> bool {
-        self.changed_near_moving(current, None, x, y, core_only, exclude)
-    }
-
-    /// `prev`: an earlier live frame; samples that differ between it and `current` are animation
-    /// (GIF, video, spinner) and are left out of the comparison instead of counting as a stale target.
-    /// shortcut: one 2-frame gap only catches animation faster than that gap; a fully animated
-    /// neighbourhood is allowed through (nothing left to judge), so a fade-in popup over a GIF can slip.
-    pub(crate) fn changed_near_moving(&self, current: &RgbaImage, prev: Option<&RgbaImage>, x: f64, y: f64, core_only: bool, exclude: Option<PixelRect>) -> bool {
-        if current.dimensions() != self.source || prev.is_some_and(|p| p.dimensions() != self.source) || !x.is_finite() || !y.is_finite()
-            || x < 0. || y < 0. || x >= self.source.0 as f64 || y >= self.source.1 as f64
-            || self.unobserved.iter().any(|r| r.contains(x, y))
-            || exclude.is_some_and(|r| r.contains(x, y)) {
+    pub(crate) fn changed_near(&self, current: &RgbaImage, x: f64, y: f64) -> bool {
+        if current.dimensions() != self.source || !x.is_finite() || !y.is_finite()
+            || x < 0. || y < 0. || x >= self.source.0 as f64 || y >= self.source.1 as f64 {
             return true;
         }
         let cx = (x / self.step as f64) as i64;
         let cy = (y / self.step as f64) as i64;
         let (mut total, mut changed, mut core, mut core_changed) = (0, 0, 0, 0);
-        let (mut moving, mut core_moving) = (0, 0);
         for dy in -24i64..=24 {
             for dx in -24i64..=24 {
                 let (px, py) = (cx + dx, cy + dy);
                 if px < 0 || py < 0 || px >= self.width as i64 || py >= self.height as i64 { continue; }
-                let (sx, sy) = (px as u32 * self.step, py as u32 * self.step);
-                if exclude.is_some_and(|r| r.contains(sx as f64, sy as f64)) { continue; }
                 let old = self.pixels[(py * self.width as i64 + px) as usize];
-                let new = current.get_pixel(sx, sy);
-                if prev.is_some_and(|p| { let q = p.get_pixel(sx, sy); (0..3).any(|c| q[c].abs_diff(new[c]) > 24) }) {
-                    moving += 1;
-                    if dx.abs() <= 4 && dy.abs() <= 4 { core_moving += 1; }
-                    continue;
-                }
+                let new = current.get_pixel(px as u32 * self.step, py as u32 * self.step);
                 let different = (0..3).any(|c| old[c].abs_diff(new[c]) > 24);
                 total += 1;
                 changed += u32::from(different);
                 if dx.abs() <= 4 && dy.abs() <= 4 { core += 1; core_changed += u32::from(different); }
             }
         }
-        // Ignore small anti-aliasing/caret noise and unrelated animation elsewhere.
-        // A changed centre or substantially changed neighbourhood requires a new observation.
-        if total == 0 { return moving == 0; }
-        let core_bad = if core == 0 { core_moving == 0 } else { core_changed * 100 > core * 35 };
-        core_bad || (!core_only && changed * 100 > total * 12)
+        // Ignore small anti-aliasing/caret noise; a changed centre or substantially changed neighbourhood counts.
+        core == 0 || core_changed * 100 > core * 35 || changed * 100 > total * 12
     }
 }
 
@@ -164,7 +132,7 @@ pub(crate) fn patch_changed(before: &RgbaImage, after: &RgbaImage) -> bool {
     let after = if before.dimensions() == after.dimensions() { after.clone() } else {
         xcap::image::imageops::resize(after, before.width(), before.height(), xcap::image::imageops::FilterType::Triangle)
     };
-    VisualGuard::new(before).changed_near(&after, before.width() as f64 / 2., before.height() as f64 / 2., false)
+    VisualGuard::new(before).changed_near(&after, before.width() as f64 / 2., before.height() as f64 / 2.)
 }
 
 #[cfg(test)]
@@ -236,66 +204,25 @@ mod tests {
         let guard = VisualGuard::new(&original);
         let mut current = original.clone();
         for y in 0..40 { for x in 180..240 { current.put_pixel(x,y,Rgba([255,0,0,255])); } }
-        assert!(!guard.changed_near(&current, 30., 60., false));
+        assert!(!guard.changed_near(&current, 30., 60.));
         for y in 52..68 { current.put_pixel(30,y,Rgba([255,255,255,255])); }
-        assert!(!guard.changed_near(&current, 30., 60., false));
-        // Typed text beside the target: stale for a fresh batch, fine after the batch's own input.
+        assert!(!guard.changed_near(&current, 30., 60.));
+        // Typed text beside the target counts as a change.
         let mut typed = original.clone();
         for y in 40..56 { for x in 10..60 { typed.put_pixel(x,y,Rgba([0,0,0,255])); } }
-        assert!(guard.changed_near(&typed, 30., 60., false));
-        assert!(!guard.changed_near(&typed, 30., 60., true));
+        assert!(guard.changed_near(&typed, 30., 60.));
         for y in 56..65 { for x in 26..35 { current.put_pixel(x,y,Rgba([0,255,0,255])); } }
-        assert!(guard.changed_near(&current, 30., 60., false));
-        assert!(guard.changed_near(&current, 30., 60., true));
-        assert!(guard.changed_near(&current, f64::NAN, 60., false));
-        assert!(guard.changed_near(&RgbaImage::new(240,141),30.,60.,false));
-    }
-    #[test]
-    fn animation_beside_target_is_masked_but_real_change_is_not() {
-        let original = RgbaImage::from_pixel(240, 140, Rgba([80, 80, 80, 255]));
-        let guard = VisualGuard::new(&original);
-        let paint = |c: u8, x0: u32, x1: u32, y0: u32, y1: u32| { let mut i = original.clone(); for y in y0..y1 { for x in x0..x1 { i.put_pixel(x, y, Rgba([c, c, c, 255])); } } i };
-        // GIF filling the target's neighbourhood: two frames differ, both differ from the baseline.
-        let (a, b) = (paint(250, 20, 90, 30, 100), paint(10, 20, 90, 30, 100));
-        assert!(guard.changed_near(&b, 50., 60., false));
-        assert!(!guard.changed_near_moving(&b, Some(&a), 50., 60., false, None));
-        // Static change (popup) that is identical in both live frames is still stale.
-        assert!(guard.changed_near_moving(&a, Some(&a), 50., 60., false, None));
-        // GIF on one side, popup right under the target: still stale.
-        let mut c = paint(10, 20, 90, 30, 100);
-        for y in 55..65 { for x in 45..55 { c.put_pixel(x, y, Rgba([255, 0, 0, 255])); } }
-        let mut d = paint(250, 20, 40, 30, 100);
-        for y in 55..65 { for x in 45..55 { d.put_pixel(x, y, Rgba([255, 0, 0, 255])); } }
-        assert!(guard.changed_near_moving(&c, Some(&d), 50., 60., false, None));
-    }
-    #[test]
-    fn explicit_exclusion_keeps_nearby_targets_guarded() {
-        let original = RgbaImage::from_pixel(100, 100, Rgba([20,20,20,255]));
-        let guard = VisualGuard::new(&original);
-        let rect = PixelRect { left:50, top:20, right:80, bottom:80 };
-        let mut current = original.clone();
-        for y in rect.top..rect.bottom { for x in rect.left..rect.right {
-            current.put_pixel(x, y, Rgba([220,220,220,255]));
-        } }
-        assert!(guard.changed_near(&current, 48., 50., false));
-        for core_only in [false, true] {
-            assert!(!guard.changed_near_excluding(&current, 48., 50., core_only, Some(rect)));
-            assert!(guard.changed_near_excluding(&current, 50., 50., core_only, Some(rect)));
-        }
-        for y in 46..55 { for x in 44..50 { current.put_pixel(x, y, Rgba([200,0,0,255])); } }
-        assert!(guard.changed_near_excluding(&current, 48., 50., false, Some(rect)));
-        assert!(guard.changed_near_excluding(&current, 48., 50., true, Some(rect)));
-        // No exemptions for the browser caller or an image whose dimensions changed.
-        assert!(patch_changed(&original, &current));
-        assert!(guard.changed_near_excluding(&RgbaImage::new(101,100), 48., 50., false, Some(rect)));
+        assert!(guard.changed_near(&current, 30., 60.));
+        assert!(guard.changed_near(&current, f64::NAN, 60.));
+        assert!(guard.changed_near(&RgbaImage::new(240,141),30.,60.));
     }
     #[test]
     fn high_dpi_and_image_boundaries_are_bounded() {
         let original=RgbaImage::from_pixel(3840,2160,Rgba([15,15,15,255]));
         let guard=VisualGuard::new(&original);
         assert!(guard.pixels.len() <= 1600 * 1600);
-        assert!(!guard.changed_near(&original,3839.,2159.,false));
-        assert!(guard.changed_near(&original,3840.,2159.,false));
+        assert!(!guard.changed_near(&original,3839.,2159.));
+        assert!(guard.changed_near(&original,3840.,2159.));
         let a=RgbaImage::from_pixel(48,48,Rgba([15,15,15,255]));
         let b=RgbaImage::from_pixel(96,96,Rgba([15,15,15,255]));
         assert!(!patch_changed(&a,&b));

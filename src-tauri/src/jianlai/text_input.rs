@@ -2,7 +2,7 @@
 //! Key-based input is rewritten/swallowed by active CJK IMEs (dropped 我/回, ，→ ,), so there is
 //! deliberately no typing fallback. The text is offered by delayed rendering: the target asking
 //! for it is a real paste acknowledgement, and the user's clipboard is restored only afterwards.
-use enigo::{Direction, Enigo, Key, Keyboard};
+use enigo::{Direction, Enigo, Key};
 use std::{cell::{Cell, RefCell}, ptr::{null, null_mut}, thread::sleep, time::{Duration, Instant}};
 use windows_sys::Win32::{
     Foundation::{GetLastError, GlobalFree, SetLastError, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM},
@@ -273,10 +273,10 @@ pub(super) fn type_text(enigo: &mut Enigo, text: &str, expected_foreground: Opti
         attempted = true; // Any key error may still mean partial input. Never retry or fall back.
         ARMED.with(|armed| armed.set(true));
         let keys = [Key::Control, Key::Other(0x56)];
-        let pressed = keys.iter().try_for_each(|key| enigo.key(*key, Direction::Press).map_err(|e| e.to_string()));
+        let pressed = keys.iter().try_for_each(|key| super::key_event(enigo, *key, Direction::Press));
         let mut released = Ok(());
         for key in keys.iter().rev() {
-            if let Err(error) = enigo.key(*key, Direction::Release) { released = Err(error.to_string()); }
+            if let Err(error) = super::key_event(enigo, *key, Direction::Release) { released = Err(error); }
         }
         // The clipboard is restored only after the target actually read our text, however slow it is.
         let acknowledged = wait_for_render(PASTE_ACK);

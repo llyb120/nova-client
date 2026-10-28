@@ -10,6 +10,10 @@ use std::{
 use xcap::{Monitor, Window};
 
 mod background;
+#[cfg(windows)]
+mod dxgi;
+#[cfg(windows)]
+mod interception;
 mod nova_regions;
 #[cfg(windows)]
 mod text_input;
@@ -116,7 +120,6 @@ struct Shot {
     pixels: (u32, u32),
     source_pixels: (u32, u32),
     region: Option<Region>,
-    guard: Option<crate::visual_guard::VisualGuard>,
     overlay: Option<crate::taskbar_status::Rect>,
     /// Only visible desktop pixels contain the taskbar; PrintWindow/private seats do not.
     desktop_capture: bool,
@@ -217,6 +220,17 @@ fn monitor_surface(m: &Monitor) -> Result<Surface> {
         width: (m.width().map_err(err)? as f64 * scale).round() as u32,
         height: (m.height().map_err(err)? as f64 * scale).round() as u32,
     })
+}
+/// Desktop Duplication on Windows; xcap (GDI) when DXGI cannot serve this monitor.
+fn capture_monitor(m: &Monitor) -> Result<xcap::image::RgbaImage> {
+    #[cfg(windows)]
+    if let Ok(s) = monitor_surface(m) {
+        match dxgi::grab(s.x, s.y, s.width, s.height) {
+            Ok(image) => return Ok(image),
+            Err(error) => eprintln!("[jianlai] DXGI截图失败，改用xcap：{error}"),
+        }
+    }
+    m.capture_image().map_err(err)
 }
 fn window(id: u32) -> Result<Window> {
     Window::all()
@@ -500,10 +514,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             nova_regions::stable(&nova_bounds, &nova_regions::visible())
         } else { Vec::new() };
         // Retain real source pixels for safety; ignored UI cannot be clicked using a stale retained image.
-        let mut guard = crate::visual_guard::VisualGuard::new(&image);
         let source_ignored: Vec<_> = ignored_bounds.iter().filter_map(|r| overlay_region(&surface, original_pixels, Some(*r))).collect();
-        guard.mark_unobserved(source_ignored.clone());
-        let guard = Some(guard);
         let image = if let Some(r) = region {
             r.validate(original_pixels)?;
             xcap::image::imageops::crop_imm(&image, r.x, r.y, r.width, r.height).to_image()
@@ -549,7 +560,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             Some(&image), folder.join(format!("{id}-{image_id}.webp")))?;
         let shot = Shot {
             image_id, surface, pixels: image.dimensions(), source_pixels: original_pixels,
-            region, guard, overlay, desktop_capture,
+            region, overlay, desktop_capture,
         };
         delivered.extend(frame);
         encode_ms += encode_started.elapsed().as_millis();
@@ -591,7 +602,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
                 if foreground()? != before || monitor_surface(&m)? != surface {
                     return Err("取样期间屏幕或焦点改变，请重新截图".into());
                 }
-                m.capture_image().map_err(err)
+                capture_monitor(&m)
             }, Some(&surface))?;
             capture_ms += capture_started.elapsed().as_millis();
             save(surface, image, stability, overlay, true)?;
@@ -628,7 +639,10 @@ fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>) -> Result<&'a Shot
     } else if let [only] = shots {
         return Ok(only);
     }
-    Err(format!("imageId缺失或不属于此截图；可用imageId：{}。沿用当前snapshotId并修正imageId，无需重新截图", shots.iter().map(|s| s.image_id.as_str()).collect::<Vec<_>>().join(", ")))
+    // Coordinates are per image: list each id with its pixel size/region so the caller can re-map x,y instead of guessing.
+    let list = shots.iter().map(|s| format!("{}（{}x{}{}）", s.image_id, s.pixels.0, s.pixels.1,
+        s.region.map(|r| format!("，原始区域x{} y{} {}x{}", r.x, r.y, r.width, r.height)).unwrap_or_default())).collect::<Vec<_>>().join(", ");
+    Err(format!("imageId缺失或不属于此截图；可用imageId：{list}。x/y须按所选图片的像素坐标重算；沿用当前snapshotId并修正imageId，无需重新截图"))
 }
 
 fn point(shot: &Shot, x: Option<i32>, y: Option<i32>) -> Result<(i32, i32)> {
@@ -772,35 +786,13 @@ fn check_overlay(shot: &Shot, action: &Action, current: Option<crate::taskbar_st
     Ok((shot.overlay == current).then(|| overlay_region(&shot.surface, shot.source_pixels, current)).flatten())
 }
 
-// after_input: earlier actions of this batch already changed the screen, so only the target's core is compared.
-fn guard_target(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, after_input:bool, overlay:Option<crate::taskbar_status::Rect>) -> Result<()> {
-    guard_target_moving(shot,action,image,None,after_input,overlay)
-}
-// Live capture: a stale verdict may just be a GIF/video near the target, so on failure take a second
-// frame and re-judge with the pixels that moved between the two frames masked out.
-fn guard_target_live(shot:&Shot, action:&Action, capture:&dyn Fn()->Result<xcap::image::RgbaImage>, after_input:bool, overlay:Option<crate::taskbar_status::Rect>) -> Result<()> {
-    let first=capture()?;
-    let Err(stale)=guard_target(shot,action,&first,after_input,overlay) else {return Ok(());};
-    std::thread::sleep(Duration::from_millis(150));
-    guard_target_moving(shot,action,&capture()?,Some(&first),after_input,overlay).map_err(|_|stale)
-}
-fn guard_target_moving(shot:&Shot, action:&Action, image:&xcap::image::RgbaImage, prev:Option<&xcap::image::RgbaImage>, after_input:bool, overlay:Option<crate::taskbar_status::Rect>) -> Result<()> {
-    let exclude = check_overlay(shot, action, overlay)?;
-    let Some(guard)=&shot.guard else {return Ok(());};
-    let mut points=vec![source_point(shot,action.x.unwrap() as f64+0.5,action.y.unwrap() as f64+0.5)];
-    if action.action=="drag" {points.push(source_point(shot,action.to_x.unwrap() as f64+0.5,action.to_y.unwrap() as f64+0.5));}
-    if points.iter().any(|&(x,y)|guard.changed_near_moving(image,prev,x,y,after_input,exclude)) {
-        return Err("落点附近画面已变化或该区域未随增量更新，停止旧坐标输入；请用返回的新图重新定位，不要原样重试同一坐标；细小目标或ignoredRegions内的目标须使用 regionSpace=image 局部截图".into());
-    }
-    Ok(())
-}
-// Scroll is excluded: a batch's earlier scroll always changes pixels under the same point, and scrolling is reversible.
+// Scroll is excluded: it never lands on the taskbar status strip in a harmful way and is reversible.
 fn guarded_pointer(action:&Action) -> bool {matches!(action.action.as_str(),"click"|"double_click"|"drag")}
 fn pointer_matches(expected:(i32,i32),actual:(i32,i32)) -> bool {
     // Allow native rounding (e.g. a late SendInput normalization), not a wrong monitor or DPI mapping.
     (expected.0 as i64-actual.0 as i64).abs()<=2 && (expected.1 as i64-actual.1 as i64).abs()<=2
 }
-fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> Result<()> {
+fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, _after_input: bool) -> Result<()> {
     if snap.taken.elapsed() > Duration::from_secs(180) {
         return Err("截图已过期".into());
     }
@@ -815,17 +807,10 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
         if w.is_minimized().map_err(err)? || window_surface(&w)? != shot.surface {
             return Err("后台窗口已最小化、移动或尺寸改变，请重新截图".into());
         }
-        if guarded_pointer(a) && shot.guard.is_some() {
-            guard_target_live(shot,a,&|| w.capture_image().map_err(err),after_input,overlay)?;
-            if window_surface(&w)?!=shot.surface {return Err("落点校验期间窗口改变，请重新观察".into());}
-        }
     } else if bg {
         let seat = background::seat_surface()?;
         if snap.shots.iter().any(|s| s.surface != seat) {
             return Err("座席已重启或尺寸改变，请重新截图".into());
-        }
-        if guarded_pointer(a) && shot.guard.is_some() {
-            guard_target_live(shot, a, &|| background::seat_grab(), after_input, overlay)?;
         }
     } else {
         let monitors = Monitor::all().map_err(err)?;
@@ -836,11 +821,6 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, after_input: bool) -> 
         if snap.shots.iter().any(|s| !current.contains(&s.surface))
         {
             return Err("显示器布局已改变，请重新截图".into());
-        }
-        if guarded_pointer(a) && shot.guard.is_some() {
-            let monitor=monitors.iter().find(|m|m.id().ok()==Some(shot.surface.id)).ok_or("显示器已改变")?;
-            guard_target_live(shot,a,&|| monitor.capture_image().map_err(err),after_input,overlay)?;
-            if monitor_surface(monitor)?!=shot.surface {return Err("落点校验期间屏幕改变，请重新观察".into());}
         }
     }
     if overlay != overlay_on_surface(&shot.surface, overlay_bounds(shot.desktop_capture)) { return Err("落点校验期间任务栏状态条范围改变，请重新截图".into()); }
@@ -888,7 +868,25 @@ fn virtual_desk_coordinate(p: i32, origin: i32, size: i32) -> i32 {
     ((p as i64 - origin as i64) * 65536 + size as i64 - 1).div_euclid(size as i64).clamp(0, 65535) as i32
 }
 /// `input_event`: glide/drag path points must be real input (hover, drag thresholds, hooks, raw input).
+fn key_event(enigo: &mut Enigo, key: Key, direction: Direction) -> Result<()> {
+    #[cfg(windows)]
+    if interception::enabled() { return interception::key(key, direction); }
+    enigo.key(key, direction).map_err(err)
+}
+fn button_event(enigo: &mut Enigo, button: Button, direction: Direction) -> Result<()> {
+    #[cfg(windows)]
+    if interception::enabled() { return interception::button(button, direction); }
+    enigo.button(button, direction).map_err(err)
+}
+fn scroll_event(enigo: &mut Enigo, length: i32, axis: Axis) -> Result<()> {
+    #[cfg(windows)]
+    if interception::enabled() { return interception::scroll(length, axis == Axis::Horizontal); }
+    enigo.scroll(length, axis).map_err(err)
+}
 fn move_pointer(_enigo: &mut Enigo, x: i32, y: i32, input_event: bool) -> Result<()> {
+    // The driver injects below SendInput; SetCursorPos would be software input again.
+    #[cfg(windows)]
+    if interception::enabled() { return interception::move_to(x, y); }
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
@@ -917,9 +915,9 @@ fn move_pointer(_enigo: &mut Enigo, x: i32, y: i32, input_event: bool) -> Result
 fn click_button(enigo: &mut Enigo, button: Button) -> Result<()> {
     // Keep the native down/up pair together on the successful fast path.
     // A failed reply can still mean partial input: release, but never replay.
-    if let Err(error) = enigo.button(button, Direction::Click) {
-        let _ = enigo.button(button, Direction::Release);
-        return Err(err(error));
+    if let Err(error) = button_event(enigo, button, Direction::Click) {
+        let _ = button_event(enigo, button, Direction::Release);
+        return Err(error);
     }
     Ok(())
 }
@@ -1025,8 +1023,8 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "drag" => {
             let (x, y) = point(shot, a.x, a.y)?;
             let (tx, ty) = point(shot, a.to_x, a.to_y)?;
-            if let Err(error)=enigo.button(button,Direction::Press) {
-                let _=enigo.button(button,Direction::Release);return Err(err(error));
+            if let Err(error)=button_event(enigo,button,Direction::Press) {
+                let _=button_event(enigo,button,Direction::Release);return Err(error);
             }
             let moved = if a.glide == Some(true) { glide(enigo, (x, y), (tx, ty)) } else { (1..=12).try_for_each(|i| {
                 move_pointer(enigo,
@@ -1037,7 +1035,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
                 std::thread::sleep(Duration::from_millis(16));
                 Ok::<_, String>(())
             }) };
-            let released = enigo.button(button, Direction::Release).map_err(err);
+            let released = button_event(enigo, button, Direction::Release);
             moved?;
             released?;
         }
@@ -1051,11 +1049,11 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
             let keys = keys(a.key.as_deref().unwrap())?;
             let pressed = keys
                 .iter()
-                .try_for_each(|k| enigo.key(*k, Direction::Press).map_err(err));
+                .try_for_each(|k| key_event(enigo, *k, Direction::Press));
             let mut release_error = None;
             for k in keys.iter().rev() {
-                if let Err(e) = enigo.key(*k, Direction::Release) {
-                    release_error = Some(err(e));
+                if let Err(e) = key_event(enigo, *k, Direction::Release) {
+                    release_error = Some(e);
                 }
             }
             pressed?;
@@ -1072,7 +1070,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
                 if i > 0 {
                     std::thread::sleep(Duration::from_millis(8));
                 }
-                enigo.scroll(delta.signum(), axis).map_err(err)?;
+                scroll_event(enigo, delta.signum(), axis)?;
             }
         }
         "wait" => std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))),
@@ -1402,6 +1400,8 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             let monitor_id = snap.window.is_none().then_some(shot.surface.id);
             // macOS 后台按进程投递事件：不创建 Enigo（它只发给 HID 层，还会弹权限提示）。
             let direct = bg && cfg!(target_os = "macos");
+            #[cfg(windows)]
+            interception::set_active(!bg);
             let mut enigo = if direct { None } else {
                 Some(Enigo::new(&if bg { background::seat_settings()? } else { Settings::default() }).map_err(err)?)
             };
@@ -1712,10 +1712,6 @@ mod tests {
             (entry, frame.unwrap())
         };
         let (_, base) = deliver("key", None, &page, &ignored);
-        let mut guard = crate::visual_guard::VisualGuard::new(&page);
-        guard.mark_unobserved(ignored.to_vec());
-        assert!(guard.changed_near(&page, 48., 32., false), "stale ignored UI is not actionable");
-        assert!(!guard.changed_near(&page, 320., 240., false), "target app stays actionable");
         let saved = xcap::image::open(&base.path).unwrap().to_rgba8();
         assert_eq!(saved, page, "actual screenshot must not be blacked out or lose pixels");
         let mut refresh = page.clone();
@@ -1737,7 +1733,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let page = RgbaImage::from_pixel(320, 320, Rgba([255,255,255,255]));
         let shot = Shot { image_id:"monitor-1".into(), surface:Surface{id:1,pid:None,x:-1920,y:-100,width:1920,height:1080},
-            pixels:(320,320), source_pixels:(3840,2160), region:None, guard:None, overlay:None, desktop_capture:true };
+            pixels:(320,320), source_pixels:(3840,2160), region:None,  overlay:None, desktop_capture:true };
         let other = Shot { image_id:"monitor-2".into(), surface:Surface{id:2,x:0,y:0,..shot.surface.clone()}, ..shot.clone() };
         let deliver = |shot: &Shot, prior: Option<&Delivered>, name: &str, pixels: &RgbaImage| {
             let mut entry = json!({"imageId":shot.image_id,"snapshotId":name,
@@ -1766,12 +1762,6 @@ mod tests {
         assert!(point(&shot,Some(-1),Some(0)).is_err());
         assert!(action_shot(&[shot.clone(),other.clone()],None).is_err());
         assert_eq!(action_shot(&[shot.clone(),other],Some("monitor-1")).unwrap().image_id,"monitor-1");
-        let source=RgbaImage::from_pixel(3840,2160,Rgba([20,20,20,255]));
-        let guarded=Shot{guard:Some(crate::visual_guard::VisualGuard::new(&source)),..shot};
-        let click:Action=serde_json::from_value(json!({"action":"click","x":22,"y":22})).unwrap();
-        assert!(guard_target(&guarded,&click,&source,false,None).is_ok());
-        let moved=RgbaImage::from_pixel(3840,2160,Rgba([200,200,200,255]));
-        assert!(guard_target(&guarded,&click,&moved,true,None).is_err());
     }
     #[test]
     fn lone_action_becomes_a_one_item_batch() {
@@ -1811,12 +1801,12 @@ mod tests {
         assert!(!has_target(&json!({"actions":[{"action":"click","x":1,"y":2}]})));
         // Image pixel (800,400) → desktop surface, through the same region/DPI mapping as x/y input.
         let shot = Shot { image_id:"crop".into(), surface:Surface{id:1,pid:None,x:-1920,y:-100,width:1920,height:1080},
-            pixels:(1600,800),source_pixels:(3840,2160),region:Some(Region{x:200,y:100,width:800,height:400}),guard:None,overlay:None,desktop_capture:false };
+            pixels:(1600,800),source_pixels:(3840,2160),region:Some(Region{x:200,y:100,width:800,height:400}),overlay:None,desktop_capture:false };
         assert_eq!(point(&shot, Some(800), Some(400)).unwrap(), (-1620,50));
     }    #[test]
     fn local_image_regions_and_actual_pointer_validation() {
         let shot=Shot {image_id:"crop".into(),surface:Surface{id:1,pid:None,x:-1920,y:-100,width:1920,height:1080},
-            pixels:(400,200),source_pixels:(3840,2160),region:Some(Region{x:200,y:100,width:800,height:400}),guard:None,overlay:None,desktop_capture:false};
+            pixels:(400,200),source_pixels:(3840,2160),region:Some(Region{x:200,y:100,width:800,height:400}),overlay:None,desktop_capture:false};
         let region=image_region(&shot,Region{x:50,y:25,width:100,height:50}).unwrap();
         assert_eq!((region.x,region.y,region.width,region.height),(300,150,200,100));
         assert!(image_region(&shot,Region{x:399,y:0,width:2,height:1}).is_err());
@@ -1834,13 +1824,6 @@ mod tests {
         assert_eq!(virtual_desk_coordinate(-5000, -1920, 4480), 0);
         assert!(!pointer_matches((2250,55),(2054,188))); // Reported multi-monitor miss is not rounding.
         assert!(!pointer_matches((i32::MIN,0),(i32::MAX,0)));
-        let original=xcap::image::RgbaImage::from_pixel(200,100,xcap::image::Rgba([20,20,20,255]));
-        let guarded=Shot{pixels:(200,100),source_pixels:(200,100),region:None,guard:Some(crate::visual_guard::VisualGuard::new(&original)),..shot};
-        let action:Action=serde_json::from_value(json!({"action":"click","x":80,"y":60})).unwrap();
-        assert!(guard_target(&guarded,&action,&original,false,None).is_ok());
-        let changed=xcap::image::RgbaImage::from_pixel(200,100,xcap::image::Rgba([200,200,200,255]));
-        assert!(guard_target(&guarded,&action,&changed,false,None).is_err());
-        assert!(guard_target(&guarded,&action,&changed,true,None).is_err());
         let bad=run("test".into(),json!({"operation":"act","regionSpace":"unknown"})).unwrap();
         assert_eq!(bad["status"],"not_executed");
     }
@@ -1895,7 +1878,7 @@ mod tests {
         let bounds = Rect { left:-50, top:-30, right:-20, bottom:30 };
         let shot = Shot { image_id:"crop".into(), surface:Surface{id:1,pid:None,x:-100,y:-50,width:100,height:100},
             pixels:(100,100), source_pixels:(200,200), region:Some(Region{x:40,y:40,width:100,height:100}),
-            guard:Some(crate::visual_guard::VisualGuard::new(&original)), overlay:Some(bounds), desktop_capture:true };
+            overlay:Some(bounds), desktop_capture:true };
         let exclude = overlay_region(&shot.surface, shot.source_pixels, shot.overlay).unwrap();
         assert_eq!(exclude, crate::visual_guard::PixelRect { left:100, top:40, right:160, bottom:160 });
         let mut updated = original.clone();
@@ -1904,9 +1887,6 @@ mod tests {
         } }
         let action:Action = serde_json::from_value(json!({"action":"click","x":56,"y":60})).unwrap();
         assert_eq!(point(&shot,action.x,action.y).unwrap(),(-52,0));
-        assert!(shot.guard.as_ref().unwrap().changed_near(&updated,96.,100.,false));
-        assert!(guard_target(&shot,&action,&updated,false,Some(bounds)).is_ok());
-        assert!(guard_target(&shot,&action,&updated,true,Some(bounds)).is_ok());
         let still = |a: &RgbaImage, b: &RgbaImage, ex| !changed_tiles(a, b, ex).unwrap().contains(&true);
         assert!(still(&original,&updated,Some(exclude)));
         assert!(!still(&original,&updated,None));
@@ -1915,19 +1895,15 @@ mod tests {
         for current in [None, Some(Rect{left:-49,..bounds}), Some(Rect{right:-19,..bounds}),
             Some(Rect{top:-29,..bounds}), Some(Rect{bottom:31,..bounds})] {
             assert!(check_overlay(&shot,&action,current).unwrap().is_none());
-            assert!(guard_target(&shot,&action,&updated,false,current).is_err());
         }
         let absent = Shot { overlay:None, ..shot.clone() };
         assert!(check_overlay(&absent,&action,Some(bounds)).unwrap().is_none());
-        assert!(guard_target(&absent,&action,&updated,false,Some(bounds)).is_err());
         for value in [json!({"action":"click","x":60,"y":60}),
             json!({"action":"drag","x":56,"y":60,"toX":60,"toY":60})] {
             let inside:Action = serde_json::from_value(value).unwrap();
-            assert!(guard_target(&shot,&inside,&original,false,Some(bounds)).is_err());
+            assert!(check_overlay(&shot,&inside,Some(bounds)).is_err());
         }
         for y in 96..105 { for x in 92..100 { updated.put_pixel(x,y,Rgba([200,0,0,255])); } }
-        assert!(guard_target(&shot,&action,&updated,false,Some(bounds)).is_err());
-        assert!(guard_target(&shot,&action,&updated,true,Some(bounds)).is_err());
         assert!(!still(&original,&updated,Some(exclude)));
         let other_monitor = Surface { x:0,y:0,..shot.surface.clone() };
         assert!(overlay_region(&other_monitor,shot.source_pixels,Some(bounds)).is_none());
@@ -2079,7 +2055,7 @@ mod tests {
 
     #[test]
     fn coordinates_keys_and_validation() {
-        let shot = Shot { guard: None, overlay:None, desktop_capture:false,
+        let shot = Shot { overlay:None, desktop_capture:false,
             image_id: "test".into(),
             surface: Surface {
                 id: 1,
@@ -2101,15 +2077,15 @@ mod tests {
         assert!(point(&shot, Some(3840), Some(0)).is_err());
         assert!(point(&shot, Some(-1), Some(0)).is_err());
         assert!(point(&shot, None, Some(0)).is_err());
-        let scaled = Shot { guard: None, pixels: (960, 540), ..shot.clone() };
+        let scaled = Shot { pixels: (960, 540), ..shot.clone() };
         assert_eq!(point(&scaled, Some(480), Some(270)).unwrap(), (-959, 541));
         assert_eq!(point(&scaled, Some(959), Some(539)).unwrap(), (-1, 1079));
-        let desktop = Shot { guard: None, surface: Surface { x:0, y:0, ..shot.surface.clone() }, pixels:(1600,900), ..shot.clone() };
+        let desktop = Shot { surface: Surface { x:0, y:0, ..shot.surface.clone() }, pixels:(1600,900), ..shot.clone() };
         // The reported click was on the toolbar in the source image, not a DPI offset.
         assert_eq!(point(&desktop, Some(860), Some(520)).unwrap(), (1032, 624));
         let region = Region { x:200, y:100, width:800, height:400 };
         region.validate(shot.source_pixels).unwrap();
-        let cropped = Shot { guard: None, region:Some(region), pixels:(400,200), ..shot.clone() };
+        let cropped = Shot { region:Some(region), pixels:(400,200), ..shot.clone() };
         assert_eq!(point(&cropped, Some(0), Some(0)).unwrap(), (-1820,50));
         assert_eq!(point(&cropped, Some(200), Some(100)).unwrap(), (-1620,150));
         assert!(point(&cropped, Some(400), Some(0)).is_err());
@@ -2147,7 +2123,7 @@ mod tests {
 
     #[test]
     fn invalid_wait_rejects_whole_batch_before_input() {
-        let shot = Shot { guard: None, overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
+        let shot = Shot { overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
             taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false,delivered:vec![]});
