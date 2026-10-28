@@ -105,11 +105,12 @@ export function processLiveLines(items: ProcessItem[], wrap = (text: string) => 
   return lines;
 }
 
-/** 本轮正在使用的模型（取最近的切换标记目标，遇到用户消息即停）；无切换返回空串。 */
+/** 本轮使用的模型（取最近的切换标记目标，遇到上一轮的收尾项即停）；无切换返回空串。 */
 export function liveModel(items: Item[]): string {
   for (let i = items.length - 1; i >= 0; i--) {
     const item = items[i];
-    if (item.type === "user") return "";
+    // 轮中追加的 steer 也是 user 项，不能当作本轮起点；只在上一轮的 turn 收尾项处截止（末尾本轮自己的 turn 项除外）。
+    if (item.type === "turn" && i < items.length - 1) return "";
     if (item.type !== "system") continue;
     if (item.text.startsWith("模型切换：")) return item.text.split("→").at(-1)!.trim();
     if (item.text.startsWith("本段执行模型：")) return item.text.slice("本段执行模型：".length).trim();

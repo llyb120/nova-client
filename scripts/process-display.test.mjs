@@ -77,5 +77,8 @@ for (const finished of [false, true]) {
   assert.deepEqual([...visible.process, ...visible.conclusion], [current, warning, reply(3, "完成")]);
 }
 assert.equal(liveModel([{type:"user",id:1,text:"a"},modelLabel(2,"provider/light"),modelLabel(3,"provider/code")]), "provider/code");
-assert.equal(liveModel([modelLabel(1,"provider/code"),{type:"user",id:2,text:"b"}]), "");
+const endTurn = id => ({type:"turn",id});
+assert.equal(liveModel([modelLabel(1,"provider/code"),endTurn(2),{type:"user",id:3,text:"b"}]), "");
+// 轮中 steer 的 user 项不能截断搜索，收尾后选择器仍显示本轮模型
+assert.equal(liveModel([{type:"user",id:1,text:"a"},modelLabel(2,"provider/code"),{type:"user",id:3,text:"steer"},endTurn(4)]), "provider/code");
 console.log("process display checks passed");
