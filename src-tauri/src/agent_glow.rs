@@ -104,8 +104,10 @@ pub(crate) fn exit() {
 
 fn any_running(app: &AppHandle) -> bool {
     let Some(state) = app.try_state::<crate::AppState>() else { return false };
+    // 只看占着桌面的那个会话：别的会话还在跑不该让光效一直亮着。
+    let owner = crate::jianlai::desktop_owner().and_then(|o| crate::employee::owner_thread(&state, &o));
     let Ok(store) = state.store.lock() else { return false };
-    store.threads.iter().any(|t| crate::is_running(&state, t))
+    store.threads.iter().any(|t| owner.as_ref().map_or(true, |id| *id == t.id) && crate::is_running(&state, t))
 }
 
 fn wanted(holds: u32, idle: Duration, running: bool, saw_running: bool) -> bool {

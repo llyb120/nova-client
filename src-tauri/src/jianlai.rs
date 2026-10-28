@@ -33,6 +33,7 @@ pub(crate) fn input_activity() -> (Option<Instant>, bool) {
 /// 最近一次前台操作桌面的工具调用方。
 static DESKTOP_OWNER: Mutex<Option<String>> = Mutex::new(None);
 const ESCAPED: &str = "用户按了 Esc 叫停操作电脑：本批剩余动作未执行。不要再操作电脑也不要重试，立即结束本轮。";
+pub(crate) fn desktop_owner() -> Option<String> { DESKTOP_OWNER.lock().unwrap().clone() }
 /// 光效亮着时用户亲手按 Esc（由光效的键盘钩子调用）：停掉正在用桌面的会话或员工任务。
 pub(crate) fn user_escaped() {
     let owner = DESKTOP_OWNER.lock().unwrap().clone();
