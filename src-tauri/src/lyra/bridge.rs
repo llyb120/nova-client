@@ -396,19 +396,25 @@ async fn handle_prompt(
     let agent_instructions = load_agent_instructions(roots);
     let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
     let auto_change_project = settings.auto_change_project_enabled;
-    // 自动模式在本会话内临时切场景模型；员工保留独立的场景/桌面排队约束。
+    // 自动模式在本会话内临时切场景模型（含请求失败时的同场景模型降级）。
     let auto = app.as_ref().zip(request.get("novaThreadId").and_then(Value::as_str)).and_then(|(app, id)| {
         use tauri::Manager;
         crate::auto_scope(&app.state::<crate::AppState>(), id)
     });
-    let routing = app.as_ref().zip(request.get("novaThreadId").and_then(Value::as_str)).and_then(|(app, id)| {
+    // 员工的剑来场景要先排队占用桌面，只能经 employee relay 换段，不参与会话内切换；其余场景与普通自动模式一致。
+    use crate::settings::Scene;
+    let employee = app.as_ref().zip(request.get("novaThreadId").and_then(Value::as_str)).is_some_and(|(app, id)| {
+        use tauri::Manager;
+        app.state::<crate::AppState>().store.lock().unwrap().get(id).is_some_and(|t| t.employee_thread)
+    });
+    let routing = app.as_ref().and_then(|app| {
         use tauri::Manager;
         let state = app.state::<crate::AppState>();
-        let enabled = state.store.lock().unwrap().get(id).is_some_and(|t| !t.employee_thread);
-        enabled.then(|| auto.as_ref().map(|scope| (scope.scene, crate::settings::Scene::ALL.into_iter()
-            .map(|scene| (scene, state.scene_models(scene).into_iter().map(|(_, model)| model).collect())).collect::<Vec<_>>()))).flatten()
+        auto.as_ref().filter(|scope| !employee || scope.scene != Scene::Computer).map(|scope| (scope.scene, Scene::ALL.into_iter()
+            .filter(|scene| !employee || *scene != Scene::Computer)
+            .map(|scene| (scene, state.scene_models(scene).into_iter().map(|(_, model)| model).collect())).collect::<Vec<_>>()))
     });
-    let desktop = routing.is_some() || auto.as_ref().is_none_or(crate::AutoScope::desktop);
+    let desktop = (routing.is_some() && !employee) || auto.as_ref().is_none_or(crate::AutoScope::desktop);
     let shell = (!read_only).then(prompt::detect_shell);
     let prompt_options = SystemPromptOptions {
         cwd: cwd_path.display().to_string(),

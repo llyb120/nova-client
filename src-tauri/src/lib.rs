@@ -240,8 +240,8 @@ pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope>
         let scene = thread.auto_scene.as_deref().and_then(settings::Scene::parse)?;
         (scene, (thread.agent_kind.clone(), thread.model.clone().unwrap_or_default()), thread.employee_thread)
     };
-    // 数字员工不走普通自动模式的场景切换：每段会话只做本场景的事，换场景由员工调度接力成新会话（见 employee::relay）；
-    // 桌面/浏览器工具只给剑来段，它由员工调度排队占用桌面。
+    // 数字员工的剑来段只有员工调度能开（要先排队占用桌面，见 employee::relay），不许会话内切到它；
+    // 其余场景照普通自动模式在会话内切换，后续在 lyra::bridge 里去掉 Computer。
     if employee {
         return Some(AutoScope { scene, covered: vec![scene], handoff: Vec::new() });
     }

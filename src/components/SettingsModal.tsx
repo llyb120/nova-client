@@ -1079,8 +1079,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                               agentKind={target().agentKind}
                               agentKinds={sceneRowKinds(target().agentKind)}
                               model={target().model}
-                              allowDefault
-                              defaultLabel={`${agentLabel(target().agentKind)} 默认模型`}
                               onPickModel={(agentKind, model) =>
                                 editScene(scene.key, (list) => list.map((t, i) => (i === index ? { agentKind, model } : t)))
                               }
