@@ -14,6 +14,7 @@ import {
   makeDesignSummary, makeDiagnosisPrompt, parseCommandOptions, parseDesignReply, parseDiagnosisReply, syncBrowserTriggers, validateMiniApp, type MiniAction, type MiniApp, type MiniBlock, type MiniCheck, type MiniDesignMessage,
 } from "../miniapps";
 import "./MiniAppsView.css";
+import { TitleBarPortal } from "./TitleBar";
 
 const STORAGE = "nova:miniapps:v1";
 const OPEN_REQUEST = "nova:miniapps:open";
@@ -921,7 +922,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
   }
 
   return <main class="mini-studio" classList={{ "mini-runtime": !!props.runtimeAppId }}>
-    <Show when={!props.runtimeAppId}><header class="mini-topbar">
+    <Show when={!props.runtimeAppId}><TitleBarPortal><header class="mini-topbar">
       <div class="mini-brand"><span class="mini-mark" aria-hidden="true">✦</span><div><strong>观星台</strong><small>每一颗星，都是灵光一闪</small></div><span class="mini-beta">预览版</span></div>
       <Show when={active()}>{saved => <div class="mini-current"><strong title={appName(saved())}>{appName(saved())}</strong><span class="mini-chip" classList={{ live: !!saved().published }}>{appStatus(saved())}</span></div>}</Show>
       <div class="mini-top-actions">
@@ -930,7 +931,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
         <Show when={state.relay.enabled}><button title="共享星海版（未发布则共享草稿），同组队友可在团队应用库导入" disabled={!(active()?.published ?? active()?.draft) || locked() || teamBusy()} onClick={() => void shareTeam()}>{sharedEntry(active()) ? "更新团队版" : "共享到团队"}</button></Show>
         <button class="mini-primary" title="每次发布生成一个版本，星海只显示其中一个" disabled={!publishable() || locked() || mode() === "run"} onClick={publish}>{publishLabel()}</button>
       </div>
-    </header></Show>
+    </header></TitleBarPortal></Show>
     <Show when={error()}><div class="mini-error" role="alert"><span>{error()}</span><button aria-label="关闭错误提示" onClick={() => setError("")}>×</button></div></Show>
     <div class="mini-workbench">
       <Show when={!props.runtimeAppId}><aside class="mini-library" aria-label="应用库">

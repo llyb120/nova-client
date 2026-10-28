@@ -39,6 +39,7 @@ export const IconTrash = (p: P) =>
   svg(<><path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></>, p);
 export const IconChevron = (p: P & { open?: boolean }) =>
   svg(<path d={p.open ? "m6 9 6 6 6-6" : "m9 6 6 6-6 6"} />, p);
+export const IconChevronLeft = (p: P) => svg(<path d="m15 6-6 6 6 6" />, p);
 export const IconTerminal = (p: P) => svg(<><path d="m4 17 6-6-6-6" /><path d="M12 19h8" /></>, p);
 export const IconFile = (p: P) =>
   svg(<><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" /><path d="M14 2v4a2 2 0 0 0 2 2h4" /></>, p);
@@ -109,11 +110,18 @@ export const IconUsers = (p: P) =>
   svg(<><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13A4 4 0 0 1 16 11" /></>, p);
 export const IconBroadcast = (p: P) =>
   svg(<><circle cx="12" cy="12" r="2" /><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14" /></>, p);
-// 与桌面应用共用图标源文件（public/app-icon.png 是 app-icon.png 的 128px 派生图，
-// 直接走 URL 而不是打包进 JS，避免把 1254px 母图塞进安装包）。
+// 首页沿用应用图标；标题栏使用独立矢量标记，避免小尺寸位图模糊。
 export const IconLogo = (p: P) =>
   svg(
     <image href="/app-icon.png" width="24" height="24" />,
+    p,
+  );
+export const IconNovaMark = (p: P) =>
+  svg(
+    <>
+      <path d="M5 18V6l14 12V6" />
+      <path d="M18.5 2v4M16.5 4h4" />
+    </>,
     p,
   );
 export const IconLyra = (p: P) =>

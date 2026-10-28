@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { jianpuFocus, setFocusRouteId, setJianpuFocus } from "../knowledgeGraph";
 import { openThread, setView, state } from "../store";
 import "./JianpuView.css";
+import { TitleBarPortal } from "./TitleBar";
 
 type Summary = { id: string; startedAt: number; endedAt: number; steps: number; apps: string[]; state: "recorded" | "learning" | "learned"; learnThread: string | null; routes: string[] };
 type Step = { at: number; kind: string; app: string; title: string; image?: string; x?: number; y?: number; toX?: number; toY?: number; text?: string; value?: string; key?: string; amount?: number };
@@ -78,7 +79,7 @@ export default function JianpuView() {
   const showRoute = (id: string) => { setFocusRouteId(id); setView("knowledge"); };
 
   return <main class="jianpu-page">
-    <header class="jianpu-header">
+    <TitleBarPortal><header class="jianpu-header">
       <div><h1>剑谱</h1><p>你演示的桌面操作，交给 AI 整理成知识图谱路径；打字内容按原文保存在本机。</p></div>
       <div class="jianpu-header-actions">
         <Show when={state.settings?.knowledgeGraphEnabled}>
@@ -88,7 +89,7 @@ export default function JianpuView() {
           {recording() ? "■ 停止录制" : "● 开始录制"}
         </button>
       </div>
-    </header>
+    </header></TitleBarPortal>
     <Show when={error()}><p class="jianpu-error" role="alert">{error()}</p></Show>
     <div class="jianpu-body">
       <aside class="jianpu-list">

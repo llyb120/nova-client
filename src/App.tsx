@@ -11,6 +11,7 @@ import { ShareInboxModal } from "./components/ShareInboxModal";
 import { Sidebar } from "./components/Sidebar";
 import { SignatureSplash } from "./components/SignatureSplash";
 import { UpdateModal } from "./components/UpdateModal";
+import { TitleBar } from "./components/TitleBar";
 import "./promptQueue";
 import { initLayoutEvents } from "./layoutStore";
 import { scenesReady } from "./types";
@@ -163,7 +164,9 @@ export default function App() {
       {/* 全局星野：整扇窗口一张画布，压在应用层之下，暗色主题才出银河 */}
       <SkyBackdrop />
       <ExclusiveChatMark token={state.settings?.relayToken || ""} />
-      <Sidebar
+      <TitleBar />
+      <div class="app-body">
+        <Sidebar
         onOpenSettings={() => setShowSettings(true)}
         onOpenAchievements={() => setShowAchievements(true)}
         onOpenUpdate={() => setShowUpdate(true)}
@@ -194,6 +197,7 @@ export default function App() {
       <Show when={homeTerminal.open()}>
         <Suspense><HomeTerminalPanel onClose={homeTerminal.close} /></Suspense>
       </Show>
+      </div>
       <Show when={showSettings() || scenesMissing()}>
         <Show
           when={state.settings}

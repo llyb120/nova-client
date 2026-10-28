@@ -6,6 +6,7 @@ import { openThread, showToast, state } from "../store";
 import type { Peer } from "../types";
 import { Markdown } from "./Markdown";
 import "./EmployeeView.css";
+import { TitleBarPortal } from "./TitleBar";
 
 /** 交代的人；token 为空是员工所在机器的用户。 */
 type Owner = { token: string; name: string };
@@ -83,13 +84,13 @@ function TeamList(props: { onPick: (peer: Peer) => void }) {
   const probing = () => peers().some((p) => info[p.token] === undefined);
   return (
     <div class="employee-content">
-      <header class="employee-header">
+      <TitleBarPortal><header class="employee-header">
         <div>
           <div class="employee-title"><h1>团队的数字员工</h1></div>
           <p class="employee-hint">团队成员公开的员工（StarLink），在对方电脑或云端按同样的规则运行。你交代的事缺信息时会请你或你的本地员工补充，待确认事项由你批准。</p>
         </div>
         <div class="employee-header-actions"><button type="button" onClick={probe}>刷新</button></div>
-      </header>
+      </header></TitleBarPortal>
       <Show when={state.settings?.relayToken?.trim()} fallback={<p class="employee-empty">先在「设置」里配置团队中转站，才能看到团队的数字员工。</p>}>
         <div class="employee-team">
           <For each={shown()}>{(p) => {
@@ -284,7 +285,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
           return (
             <div class="employee-content">
               {/* 一行头部：标题、状态、开关与不常用的设置/记忆（弹出），把纵向空间留给看板。 */}
-              <header class="employee-header">
+              <TitleBarPortal><header class="employee-header">
                 <div class="employee-title">
                   <Show when={props.onBack}>{(back) => <button type="button" aria-label="返回团队列表" onClick={() => back()()}>←</button>}</Show>
                   <h1 title={peer ? "你交代的事归你：缺信息时会请你或你的本地员工补充，待确认事项由你或员工主人批准" : undefined}>{peer ? `${peer.name} 的数字员工` : "数字员工"}</h1>
@@ -343,7 +344,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                   </details>
                   </Show>
                 </div>
-              </header>
+              </header></TitleBarPortal>
 
               <form class="employee-say" onSubmit={(ev) => { ev.preventDefault(); void send(); }}>
                 <textarea id="employee-message" ref={sayInput} rows={2} aria-label={peer ? `交给 ${peer.name} 的员工一件事` : "交给员工一件事"} title="Enter 发送，Shift+Enter 换行"

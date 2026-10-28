@@ -1,6 +1,7 @@
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, lazy, onCleanup, onMount, Show, Suspense, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
+import { titlebarView, TitleBarPortal } from "./TitleBar";
 import { api } from "../ipc";
 import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
 import { buildTimeNotesPrompt } from "../builtinPrompts";
@@ -849,12 +850,14 @@ export function ChatView() {
 
   return (
     <main class="chat" style={`--time-width:${timeMachineWidth()}px`}>
+      <TitleBarPortal>
       <header class="chat-head">
         {/* 员工会话不在普通会话列表里：给个返回键回到数字员工页。 */}
         <Show when={state.threads.find((t) => t.id === state.currentId)?.employeeThread}>
           <button type="button" class="chat-head-back" aria-label="返回数字员工" title="返回数字员工"
             onClick={() => { closeThread(); setView("employee"); }}>← 数字员工</button>
         </Show>
+        <div class="chat-context">
         <Show
           when={editing()}
           fallback={
@@ -891,9 +894,6 @@ export function ChatView() {
             <IconStar size={15} filled={!!currentMeta()?.starred} />
           </button>
         </Show>
-        <span class={`agent-badge ${state.agentKind}`}>
-          {agentLabel(state.agentKind)}
-        </span>
         <Show when={currentMeta()?.autoScene && !currentMeta()?.employeeThread}>
           <span class="agent-badge auto-mode-badge" title="自动模式会话：可按任务切换场景模型，失败时切换备用模型">
             自动模式
@@ -931,6 +931,8 @@ export function ChatView() {
             <span class="chat-cwd-wt">⎇ {currentMeta()!.worktree!.branch}</span>
           </Show>
         </div>
+        </div>
+        <div class="chat-actions">
         <span
           class="chat-tokens"
           classList={{
@@ -1014,7 +1016,9 @@ export function ChatView() {
             <IconFile size={15} />
           </button>
         </Show>
+        </div>
       </header>
+      </TitleBarPortal>
       <Show when={forkSourceId()}>
         <Portal>
           <dialog

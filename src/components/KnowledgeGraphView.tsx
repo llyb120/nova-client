@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { buildKnowledgeGraph, focusRouteId, graphEdgePath, setFocusRouteId, setJianpuFocus, type GraphNode, type KnowledgeGroup, type GraphEdge } from "../knowledgeGraph";
 import { setView } from "../store";
 import "./KnowledgeGraphView.css";
+import { TitleBarPortal } from "./TitleBar";
 
 const toolName = (tool: string) => ({ jianlai: "剑来", chrome: "Chrome", webview: "WebView" })[tool] ?? tool;
 export default function KnowledgeGraphView() {
@@ -82,7 +83,7 @@ export default function KnowledgeGraphView() {
     observer.observe(canvas); onCleanup(() => observer.disconnect());
   });
   return <main class="knowledge-page">
-    <header class="knowledge-header"><div><h1>知识图谱</h1><p>所有起点、操作与目标，在一张图里连接</p></div><div class="knowledge-header-actions"><button class="btn" onClick={() => setView("jianpu")} title="录下你的桌面操作，交给 AI 学成图谱路径">剑谱</button><button class="btn" disabled={groups.loading} onClick={() => void refetch()}>刷新记录</button></div></header>
+    <TitleBarPortal><header class="knowledge-header"><div><h1>知识图谱</h1><p>所有起点、操作与目标，在一张图里连接</p></div><div class="knowledge-header-actions"><button class="btn" onClick={() => setView("jianpu")} title="录下你的桌面操作，交给 AI 学成图谱路径">剑谱</button><button class="btn" disabled={groups.loading} onClick={() => void refetch()}>刷新记录</button></div></header></TitleBarPortal>
     <div class="knowledge-toolbar"><button class="btn" onClick={overview}>全图总览</button>
       <input type="search" aria-label="搜索全部图谱" placeholder="搜索步骤、目标、应用或网站…" value={query()} onInput={event => setQuery(event.currentTarget.value)} />
       <span class="knowledge-count">全部来源 · {graph().starts.length} 个起点 · {graph().nodes.length} 个节点 · {graph().edges.length} 条连接 · {graph().routes.length} 条路径</span>

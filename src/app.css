@@ -178,8 +178,219 @@ button {
 
 .app {
   display: flex;
+  flex-direction: column;
   height: 100%;
 }
+.app-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 自定义标题栏：左列延续侧栏（品牌行），右侧承载当前会话头部；空白处拖拽，双击切换最大化。 */
+.window-titlebar {
+  position: relative;
+  z-index: 30;
+  display: flex;
+  flex: none;
+  height: 46px;
+  /* 标题栏保留当前配色，工作区继续使用原有主题变量。 */
+  --accent: #8da5f5;
+  --text-muted: #8d98a8;
+  --text-faint: #778397;
+  background: #1d2026;
+}
+:root[data-theme="ink-light"] .window-titlebar { background: #edf1f6; }
+.titlebar-side {
+  display: flex;
+  align-items: center;
+  flex: none;
+  width: clamp(248px, 20vw, 256px);
+  padding: 0 12px 0 16px;
+  border-right: 1px solid var(--border);
+}
+.titlebar-side > div { display: contents; }
+.titlebar-side .brand { flex: 1; min-width: 0; padding: 0; gap: 8px; }
+.titlebar-side .brand-icon { padding: 0; background: none; box-shadow: none; color: var(--accent); }
+.titlebar-side .brand-name { font-size: 14px; line-height: 1.15; letter-spacing: -.015em; }
+.titlebar-side .brand-text { position: relative; flex-direction: row; align-items: baseline; }
+.titlebar-side .brand-version {
+  position: absolute;
+  left: calc(100% + 6px);
+  top: 1px;
+  max-width: none;
+  padding: 0;
+  font-size: 9px;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.15s;
+}
+.titlebar-side .brand-text:hover .brand-version,
+.titlebar-side .brand-version:focus-visible {
+  opacity: .72;
+  visibility: visible;
+  pointer-events: auto;
+}
+.titlebar-side .sidebar-head-toggle { width: 24px; height: 24px; }
+.titlebar-side .sidebar-head-toggle svg { transform: none; }
+.titlebar-side .sidebar-head-search svg { transform: none; }
+/* 侧栏收起为图标栏时，左列同步收窄到图标栏宽度，只保留 Logo。 */
+.titlebar-side.collapsed { width: 52px; justify-content: center; padding: 0; }
+.titlebar-side.collapsed .brand { flex: none; }
+.titlebar-side.collapsed .brand > :not(.brand-icon) { display: none; }
+.titlebar-main {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+}
+.titlebar-drag-space { flex: 1; align-self: stretch; }
+/* Portal 会多包一层 div，用 contents 让会话头部直接参与标题栏的布局。 */
+.titlebar-view {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  align-self: stretch;
+}
+.titlebar-staging {
+  position: fixed;
+  left: -10000px;
+  top: 0;
+  width: 1100px;
+  height: 46px;
+  visibility: hidden;
+  pointer-events: none;
+}
+/* 标题文字、路径和容器间隙均可拖窗；交互控件由捕获阶段的事件逻辑排除。 */
+.titlebar-view > div { display: contents; }
+.titlebar-view .chat-head {
+  flex: 1;
+  align-self: stretch;
+  min-width: 0;
+  height: auto;
+  gap: 12px;
+  padding: 0 10px 0 18px;
+  border: 0;
+  background: transparent;
+}
+.titlebar-view .chat-context { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
+.titlebar-view .chat-actions { display: flex; align-items: center; gap: 2px; flex: none; margin-left: auto; }
+.titlebar-view .chat-title { flex: 0 1 auto; min-width: 48px; max-width: 280px; font-size: 13px; font-weight: 550; }
+.titlebar-view .chat-title-input { flex: 0 1 240px; min-width: 120px; padding: 3px 8px; font-size: 13px; }
+.titlebar-view .chat-star { flex-basis: 26px; width: 26px; height: 26px; margin-left: 0; }
+.titlebar-view .auto-mode-badge {
+  height: 20px;
+  padding: 0 3px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 20px;
+}
+.titlebar-view .chat-cwd {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 260px;
+  margin-left: 5px;
+  padding-left: 11px;
+  border-left: 1px solid var(--border);
+  font-size: 11px;
+}
+.titlebar-view .chat-tokens { margin-right: 6px; font-size: 10.5px; }
+.titlebar-view .chat-tokens-empty { display: none; }
+/* 会话操作统一为 28px 幽灵按钮：无描边，悬停出底色，与世界线/文件图标按钮同高。 */
+.titlebar-view .chat-share-btn {
+  flex: none;
+  height: 28px;
+  margin-left: 0;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 7px;
+  font-size: 12px;
+}
+.titlebar-view .chat-share-btn + .chat-share-btn { margin-left: -4px; }
+.titlebar-view .chat-head-back { padding: 3px 8px; font-size: 12px; }
+.titlebar-window-controls {
+  display: flex;
+  align-items: stretch;
+  align-self: stretch;
+  flex: none;
+}
+/* 与会话操作之间留一道细分隔，窗口按钮不和业务按钮混在一起。 */
+.titlebar-view + .titlebar-window-controls::before {
+  content: "";
+  align-self: center;
+  width: 1px;
+  height: 16px;
+  margin-right: 6px;
+  background: var(--border-light);
+}
+.titlebar-window-btn {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  color: var(--text-muted);
+  transition: background 0.12s, color 0.12s;
+}
+.titlebar-window-btn:hover { background: var(--bg-hover); color: var(--text); }
+.titlebar-window-btn.close:hover { background: #e81123; color: #fff; }
+.titlebar-window-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.titlebar-window-btn svg {
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1;
+}
+
+/* 其它主页面复用同一标题栏：仅压缩原有页头，页面正文样式不变。 */
+.titlebar-view :is(.knowledge-header, .jianpu-header, .employee-header, .mini-topbar) {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  align-self: stretch;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 12px 0 18px;
+  gap: 12px;
+  border: 0;
+  background: transparent;
+}
+.titlebar-view :is(.knowledge-header, .jianpu-header, .employee-header) > div:first-child { min-width: 0; }
+.titlebar-view :is(.knowledge-header, .jianpu-header) h1,
+.titlebar-view .employee-title h1,
+.titlebar-view .mini-brand strong { font-size: 13px; font-weight: 550; white-space: nowrap; }
+.titlebar-view :is(.knowledge-header, .jianpu-header) p,
+.titlebar-view .employee-header > div > .employee-hint,
+.titlebar-view .mini-brand small,
+.titlebar-view .mini-beta { display: none; }
+.titlebar-view :is(.knowledge-header-actions, .jianpu-header-actions, .employee-header-actions, .mini-top-actions) {
+  display: flex;
+  align-items: center;
+  flex: none;
+  flex-wrap: nowrap;
+  gap: 5px;
+  margin-left: auto;
+}
+.titlebar-view :is(.knowledge-header, .jianpu-header, .employee-header) button,
+.titlebar-view .mini-top-actions button {
+  min-height: 27px;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.titlebar-view .employee-title { flex-wrap: nowrap; min-width: 0; }
+.titlebar-view .employee-title h1 { overflow: hidden; text-overflow: ellipsis; }
+.titlebar-view .employee-chip { padding: 2px 6px; font-size: 10.5px; white-space: nowrap; }
+.titlebar-view .employee-chip strong { font-size: 11px; }
+.titlebar-view .employee-toggle { font-size: 11px; white-space: nowrap; }
+.titlebar-view .employee-pop > summary { font-size: 11.5px; white-space: nowrap; }
+.titlebar-view .mini-brand { gap: 7px; }
+.titlebar-view .mini-current { min-width: 0; padding-left: 10px; }
+.titlebar-view .mini-current strong { font-size: 12px; font-weight: 500; }
 
 /* 全局星野背景：整扇窗口一张画布，压在应用层之下（负 z-index）。
    拖动窗口期间由 CSS 拉伸旧位图，停手后再按新尺寸重绘。 */
@@ -5941,6 +6152,9 @@ button:focus-visible {
 }
 
 @media (max-width: 1100px) {
+  .titlebar-view .chat-cwd,
+  .titlebar-view .chat-tokens { display: none; }
+  .titlebar-window-btn { width: 42px; }
   .sidebar {
     width: 248px;
   }
@@ -5949,10 +6163,6 @@ button:focus-visible {
   }
   .home-composer {
     padding: 14px 12px 10px;
-  }
-  .chat-head {
-    padding: 0 20px;
-    gap: 8px;
   }
 }
 @media (max-width: 760px) {

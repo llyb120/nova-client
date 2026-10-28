@@ -1,6 +1,8 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { Portal } from "solid-js/web";
+import { titlebarSide } from "./TitleBar";
 import { api } from "../ipc";
 import { chainGroupAnchor, latestFireStage } from "../threadDisplay";
 import type { ThreadMeta, Worktree } from "../types";
@@ -26,12 +28,14 @@ import {
   IconBroadcast,
   IconCheck,
   IconChevron,
+  IconChevronLeft,
   IconDownload,
   IconFolder,
   IconGear,
   IconLogo,
   IconLyra,
   IconMerge,
+  IconNovaMark,
   IconPlus,
   IconSearch,
   IconTerminal,
@@ -606,8 +610,9 @@ export function Sidebar(props: {
       }}
     >
       <div class="sidebar-head">
+        <Show when={titlebarSide()} keyed>{(mount) => <Portal mount={mount}>
         <div class="brand">
-          <IconLogo size={20} class="brand-icon" />
+          <IconNovaMark size={20} class="brand-icon" />
           <div class="brand-text">
             <span class="brand-name">Nova</span>
             <Show when={version()}>
@@ -708,9 +713,10 @@ export function Sidebar(props: {
               setKeyboardFocus(false);
             }}
           >
-            <IconChevron size={14} />
+            <IconChevronLeft size={14} />
           </button>
         </div>
+        </Portal>}</Show>
         <button class="new-thread-btn" onClick={openHome}>
           <IconPlus size={15} />
           新对话
@@ -733,7 +739,6 @@ export function Sidebar(props: {
               观星台
             </button>
           </div>
-
         </div>
       </div>
 
