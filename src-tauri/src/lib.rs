@@ -3301,7 +3301,18 @@ fn send_prompt(
     text: String,
     images: Option<Vec<PromptImage>>,
 ) -> Result<(), String> {
-    dispatch_prompt(&app, thread_id, text, images.unwrap_or_default())
+    dispatch_user_prompt(&app, thread_id, text, images.unwrap_or_default())
+}
+
+/// 用户明确续发才重接员工任务；系统重试/接力仍必须先由员工调度登记。
+pub(crate) fn dispatch_user_prompt(
+    app: &tauri::AppHandle,
+    thread_id: String,
+    text: String,
+    images: Vec<PromptImage>,
+) -> Result<(), String> {
+    if employee::resume_prompt(app, &thread_id, &text, &images)? { return Ok(()); }
+    dispatch_prompt(app, thread_id, text, images)
 }
 
 pub(crate) fn dispatch_prompt(
@@ -3478,7 +3489,7 @@ fn truncate_thread(
             let prompt = prompt.unwrap_or_default();
             // 恢复完成后与 Composer 共用前端命令展开及模式设置入口。
             let result = if server::is_headless() {
-                dispatch_prompt(&background_app, thread_id.clone(), prompt, images)
+                dispatch_user_prompt(&background_app, thread_id.clone(), prompt, images)
             } else {
                 background_app.emit(
                     remote::EV_REMOTE_PROMPT_DISPATCH,
@@ -3893,7 +3904,7 @@ fn advanced_share(
     )
 }
 
-/// 员工等旧路径的失效切换：无回复时按场景列表换模型并重发；返回是否已切换。
+/// 旧场景路径的失效切换；员工只由 employee 调度重试，不能在此脱离任务重发。
 /// 普通 Lyra 自动会话由运行时在原会话内部 fallback，退出恢复初始模型；外部不可重发或改基准模型。
 /// 旧场景子会话仍由 lyra::session::scene_loop 处理。
 #[tauri::command]
@@ -3905,6 +3916,8 @@ fn auto_failover(app: tauri::AppHandle, state: State<'_, AppState>, thread_id: S
         let store = state.store.lock().unwrap();
         let thread = store.get(&thread_id).ok_or("线程不存在")?;
         let Some(scene) = thread.auto_scene.as_deref().and_then(settings::Scene::parse) else { return Ok(false) };
+        // 员工只由任务调度退避/换段自愈，不能在普通聊天入口另起一轮孤立重试。
+        if thread.employee_thread { return Ok(false); }
         // 场景和 root fallback 均由 Lyra 运行时处理，只重试下一请求，不重放用户提示或已执行工具。
         if thread.agent_kind == AgentKind::Lyra && !thread.employee_thread {
             return Ok(false);
@@ -4660,6 +4673,7 @@ pub fn run() {
             taskbar_status::taskbar_bubble_place,
             taskbar_status::taskbar_ask,
             taskbar_status::taskbar_ask_place,
+            taskbar_status::taskbar_ask_hide,
             taskbar_status::taskbar_bubble_hide,
             taskbar_status::taskbar_bubble_activate,
             taskbar_status::taskbar_bubble_open,

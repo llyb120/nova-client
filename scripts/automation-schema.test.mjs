@@ -39,6 +39,133 @@ test('ordinary agents stay separate from internal scene switching and fallback',
     assert.ok(fallback.indexOf(effect)>guardAt,`${effect} must stay after the non-employee guard`);
   }
 });
+test('employee continuation and retry keep scheduler ownership', async()=>{
+  const [lib, remote, employee] = await Promise.all(['src-tauri/src/lib.rs', 'src-tauri/src/remote.rs', 'src-tauri/src/employee.rs']
+    .map(path=>readFile(new URL(`../${path}`,import.meta.url),'utf8')));
+  const fallback = lib.match(/fn auto_failover\([\s\S]*?\n\}/)?.[0];
+  assert.ok(fallback);
+  const employeeGuard = /if thread\.employee_thread \{\s*return Ok\(false\);\s*\}/;
+  assert.match(fallback,employeeGuard,'employee retries must be owned by its scheduler, never detached IPC replays');
+  for (const effect of ['thread.items','set_thread_agent(','dispatch_prompt(']) {
+    assert.ok(fallback.indexOf(effect)>fallback.search(employeeGuard),`${effect} must stay after the employee guard`);
+  }
+  const dispatch = lib.match(/pub\(crate\) fn dispatch_user_prompt\([\s\S]*?\n\}/)?.[0];
+  assert.ok(dispatch);
+  assert.match(dispatch,/employee::resume_prompt\(app, &thread_id, &text, &images\)\?/);
+  assert.ok(dispatch.indexOf('employee::resume_prompt(') < dispatch.indexOf('dispatch_prompt('));
+  assert.match(lib,/dispatch_user_prompt\(&app, thread_id, text, images\.unwrap_or_default\(\)\)/);
+  assert.match(remote,/crate::dispatch_user_prompt\(app, thread_id\.to_string\(\), text\.to_string\(\), images\)/);
+  assert.match(employee,/start_segment\(app, &thread_id, text, images\)\?/);
+  assert.match(employee,/acquire_desktop\(&app, &id, &cancelled\)/);
+  assert.match(employee,/DISPATCH_LOCK\.lock\(\)/);
+  assert.match(employee,/load\(\)\?\.require_live_task\(&item\)\?/);
+  assert.match(employee,/action == "sequence_stop"/);
+  for (const call of ['dispatch_active(app, thread_id, text, images)', 'dispatch_active(&app, &id, text, images)',
+    'dispatch_active(app, root, text, Vec::new())', 'dispatch_active(app, &task.thread_id, ASK_NUDGE.into(), Vec::new())']) {
+    assert.ok(employee.includes(call), `missing cancellation gate: ${call}`);
+  }
+});
+test('employee shared context is advertised and refreshed for starts and relays', async()=>{
+  const schema = JSON.parse(await readFile(new URL('../scripts/employee-tool.json',import.meta.url),'utf8'));
+  const employee = await readFile(new URL('../src-tauri/src/employee.rs',import.meta.url),'utf8');
+  assert.ok(schema.inputSchema.properties.action.enum.includes('context'));
+  assert.match(schema.description,/context 查看本轮序列共享上下文/);
+  assert.match(schema.inputSchema.properties.id.description,/context/);
+  assert.match(employee,/segment_prompt\(e, item_id, prompt, head\)/);
+  assert.match(employee,/segment_prompt\(e, &item, &task\.prompt, &head\)/);
+  assert.match(employee,/sequence_context\(&e, item, selected\.as_deref\(\)\)/);
+  assert.doesNotMatch(employee,/只做下面这一件事，最后用一句话总结结果/);
+});
+test('employee development follows user workspace requirements without automatic git operations', async()=>{
+  const schema = await tool('employee');
+  const employee = await readFile(new URL('../src-tauri/src/employee.rs',import.meta.url),'utf8');
+  const runtime = employee.split('#[cfg(test)]')[0];
+  assert.ok(!schema.inputSchema.properties.action.enum.includes('worktree'));
+  assert.match(schema.description,/只有用户明确要求时才用常规 Git 工具创建或复用 worktree/);
+  assert.match(schema.inputSchema.properties.cwd.description,/原样使用用户要求的目录/);
+  assert.doesNotMatch(runtime,/crate::gitwt::|fn (?:ensure_worktree|sync_worktree|commit_worktree|remove_worktrees|git_ident)\(/);
+  assert.doesNotMatch(runtime,/employee action=worktree|本轮结束时系统自动提交/);
+  assert.match(runtime,/未要求 worktree 就在用户指定的项目目录工作/);
+  assert.match(runtime,/旧步骤模板、交接或记忆中的.*不是用户授权/);
+  assert.match(runtime,/t\.relay = Some\(\(scene, cwd\)\)/);
+  assert.match(runtime,/cwd\.unwrap_or\(prev_cwd\)/);
+  assert.match(runtime,/历史工作树记录/);
+});
+test('employee external waits remain visible without looking completed', async()=>{
+  const ts = (await import('typescript')).default;
+  const view = await readFile(new URL('../src/components/EmployeeView.tsx',import.meta.url),'utf8');
+  const labels = view.match(/const NODE:[\s\S]*?\n\};/)?.[0];
+  const classifier = view.match(/function nodeState\([\s\S]*?\n\}/)?.[0];
+  assert.ok(labels && classifier);
+  const js = ts.transpileModule(`${labels}\n${classifier}`, {compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const stateOf = new Function(`${js}\nreturn nodeState;`)();
+  const build = {id:'build',threadId:'session',checkpoint:'build #42 submitted',nextCheckAt:300_000};
+  const verify = {id:'verify',after:['build']};
+  assert.equal(stateOf(build,[build,verify],[],1),'deferred');
+  assert.equal(stateOf(verify,[build,verify],[],1),'deps');
+  assert.equal(stateOf(build,[build],[],300_000),'resume');
+  assert.equal(stateOf(build,[build],[{itemId:'build',queued:false}],1),'running');
+  assert.equal(stateOf({...build,failures:1},[build],[],1),'resume');
+  assert.equal(stateOf({...build,waiting:'need input'},[build],[],1),'help');
+  assert.equal(stateOf({...build,status:'done'},[build],[],1),'done');
+  assert.match(labels,/deferred: \{ label: "等待外部结果"/);
+});
+test('employee trees show serial, relayed and parallel execution paths', async()=>{
+  const ts = (await import('typescript')).default;
+  const view = await readFile(new URL('../src/components/EmployeeView.tsx',import.meta.url),'utf8');
+  const constants = view.match(/const \[NODE_W,[^\n]+;/)?.[0];
+  const helpers = ['sortSiblings','layoutTree','flowDash','sequenceRoot'].map(name=>view.match(new RegExp(`function ${name}\\([\\s\\S]*?\\n\\}`))?.[0]);
+  assert.ok(constants && helpers.every(Boolean));
+  const js = ts.transpileModule(`${constants}\n${helpers.join('\n')}`, {compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const {place,dash,rootOf,w,h,gap,pad} = new Function(`${js}\nreturn {place:layoutTree,dash:flowDash,rootOf:sequenceRoot,w:NODE_W,h:NODE_H,gap:GAP_Y,pad:PAD};`)();
+  const root = {id:'root',createdAt:0};
+  const steps = Array.from({length:80},(_,i)=>({id:`s${i}`,parent:root.id,after:i?[`s${i-1}`]:[],createdAt:80-i}));
+  const {placed:chain,links} = place(root,[root,...steps]);
+  assert.equal(chain.length,81);
+  assert.deepEqual(chain.map(p=>p.t.id),['root',...steps.map(t=>t.id)]);
+  assert.equal(new Set(chain.map(p=>p.x)).size,1,'a serial chain including the root occupies one vertical column');
+  assert.equal(Math.max(...chain.map(p=>p.x))+w+pad,2*pad+w);
+  assert.ok(chain.every((p,i)=>!i || p.y>=chain[i-1].y+h+gap));
+  assert.deepEqual(links.filter(l=>l.from==='root').map(l=>l.to),['s0'],'the root connects only to the first step');
+  const nodes = [root,{id:'a',parent:'root',createdAt:1},{id:'b',parent:'root',createdAt:2},
+    {id:'join',parent:'root',after:['a','b'],createdAt:3}, {id:'detached',origin:'a',createdAt:4}];
+  for(let i=0;i<15;i++) nodes.push({id:`deep${i}`,parent:i?`deep${i-1}`:'a',createdAt:i});
+  const branched = place(root,nodes);
+  assert.equal(branched.placed.length,nodes.length,'deep children and independent sequences remain visible');
+  const at = id=>branched.placed.find(p=>p.t.id===id);
+  assert.equal(at('a').y,at('b').y,'parallel steps occupy the same row');
+  assert.notEqual(at('a').x,at('b').x);
+  assert.ok(at('join').y>at('deep14').y && at('join').y>at('b').y,'join waits for entire predecessor subflows');
+  assert.deepEqual(branched.links.filter(l=>l.to==='join').map(l=>l.from).sort(),['b','deep14']);
+  assert.ok(branched.links.find(l=>l.from==='a' && l.to==='detached').detached);
+  for(const a of branched.placed) for(const b of branched.placed) if(a!==b) {
+    assert.ok(a.x+w<=b.x || b.x+w<=a.x || a.y+h<=b.y || b.y+h<=a.y,'cards do not overlap');
+  }
+  const relayed = place(root,[root,{id:'step1',parent:'root',createdAt:1,relayed:true},
+    {id:'relay',parent:'step1',createdAt:2},{id:'step2',parent:'root',after:['step1'],createdAt:3}]);
+  assert.deepEqual(relayed.links.map(l=>`${l.from}->${l.to}`).sort(),['root->step1','step1->relay','relay->step2'].sort());
+  assert.equal(new Set(relayed.placed.map(p=>p.x)).size,1,'relay segments are inline, not side branches');
+  assert.deepEqual(dash({}, {status:'done'}),[]);
+  assert.deepEqual(dash({}, {threadId:'live'}),[]);
+  assert.deepEqual(dash({}, {}),[5,4]);
+  assert.deepEqual(dash({detached:true}, {status:'done'}),[2,4]);
+  assert.equal(rootOf('deep14',nodes).id,'root');
+  assert.equal(rootOf('detached',nodes).id,'detached','stopping does not follow origin');
+  assert.deepEqual(place(undefined,nodes),{placed:[],links:[]});
+  const cycleRoot = {id:'root',parent:'a',createdAt:0};
+  assert.equal(place(cycleRoot,[cycleRoot,nodes[1]]).placed.length,2);
+  assert.match(view,/props\.act\("sequence_stop", root\.id\)/);
+  assert.match(view,/停止本轮序列/);
+  assert.match(view,/disabled=\{stopping\(\)\}/);
+});
+test('employee board and tree details use separate responsive horizontal panes', async()=>{
+  const css = await readFile(new URL('../src/components/EmployeeView.css',import.meta.url),'utf8');
+  assert.match(css,/\.employee-layout \{[^}]*grid-template-columns: clamp\(220px, 26%, 300px\) minmax\(0, 1fr\)/);
+  assert.match(css,/@container employee-board \(max-width: 640px\)/);
+  assert.match(css,/\.employee-tree \{[^}]*display: grid;[^}]*grid-template-columns: minmax\(240px, \.9fr\) minmax\(0, 1\.1fr\)/);
+  assert.match(css,/@container employee-detail \(max-width: 520px\)/);
+  assert.match(css,/\.employee-tree-detail \{[^}]*overflow: auto/);
+});
 test('Chrome retains image coordinates, fast scope and bounded batch schemas',async()=>{
   const chrome=await tool('chrome');
   for(const name of ['action','imageId','scope','region','visual','maxEdge']) assert(chrome.inputSchema.properties[name]);

@@ -2392,7 +2392,7 @@ fn send_prompt(
         .map_err(|error| format!("转交远程提示词失败: {error}"))?;
         return Ok(());
     }
-    crate::dispatch_prompt(app, thread_id.to_string(), text.to_string(), images)
+    crate::dispatch_user_prompt(app, thread_id.to_string(), text.to_string(), images)
 }
 
 /// 识别并投递 `/fire`。`Ok(true)` 表示已交给前端；`Ok(false)` 表示非 Fire 指令。
