@@ -65,7 +65,7 @@ fn watch(app: &AppHandle) {
         while SHOWN.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(200));
             let fresh = ALERTED.lock().unwrap().is_some_and(|at| at.elapsed() < Duration::from_secs(2));
-            if !fresh && permissions(&app).is_empty() { hide(&app); }
+            if !fresh && permissions(&app).is_empty() && crate::employee::local_helps().is_empty() { hide(&app); }
         }
         WATCHING.store(false, Ordering::Release);
     });
@@ -79,7 +79,7 @@ fn hide(app: &AppHandle) {
 }
 
 pub(super) fn payload(app: &AppHandle) -> Value {
-    json!({ "permissions": permissions(app), "light": super::windows::light_theme() })
+    json!({ "permissions": permissions(app), "helps": crate::employee::local_helps(), "light": super::windows::light_theme() })
 }
 
 /// 页面报告卡片高度：按蝴蝶位置摆好并不激活地显示。

@@ -23,10 +23,14 @@ export function TitleBarPortal(props: { children: JSX.Element }) {
     // 新页头先在下屏暂存区渲染，等到真实 DOM 存在才替换旧页头，切页不再闪空白。
     const prepared = staging;
     if (!prepared?.firstElementChild) return;
+    let moved: ChildNode[] = [];
     const commit = () => {
       if (revision !== titlebarRevision || !prepared.firstElementChild) return;
-      host.replaceChildren(...Array.from(prepared.childNodes));
+      moved = Array.from(prepared.childNodes);
+      host.replaceChildren(...moved);
     };
+    // 页面卸载后页头已被搬进标题栏，Portal 清理管不到；不清掉会残留到没有页头的页面（如新建会话），连带展开的弹层。
+    onCleanup(() => moved.forEach(node => { if (node.parentNode === host) node.remove(); }));
     if (document.fonts.status === "loaded") commit();
     else void document.fonts.ready.then(commit);
   });

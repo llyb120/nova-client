@@ -132,6 +132,14 @@ pub(crate) fn start(app: &tauri::AppHandle) {
     let _ = app;
 }
 
+/// 数字员工要本机用户补充信息：在蝴蝶上方弹出带回复框的小卡片。
+pub(crate) fn alert_help(app: &tauri::AppHandle) {
+    #[cfg(windows)]
+    if !crate::server::is_headless() { windows::on_app(|app| ask::alert(app, true)); }
+    #[cfg(not(windows))]
+    let _ = app;
+}
+
 pub(crate) fn bounds() -> Option<Rect> {
     #[cfg(windows)]
     return windows::bounds();

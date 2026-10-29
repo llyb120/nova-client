@@ -28,7 +28,7 @@ export default function VaultPop() {
     invoke("vault_delete", { id: i.id }).then(() => void refresh(), (e) => showToast(String(e)));
   };
   return (
-    <details class="employee-pop employee-memory" onToggle={(ev) => { if (ev.currentTarget.open) void refresh(); }}>
+    <details class="employee-pop employee-memory" onToggle={(ev) => { if (ev.currentTarget.open) void refresh(); else setDraft(null); }}>
       <summary>密码本 <span class="employee-count">{items().length}</span></summary>
       <div>
         <p class="employee-hint">员工需要账号密码时先查这里，条件符合才会取用；密码加密保存，员工只在输入时用，远程员工要用时加密传输、不暴露明文。</p>

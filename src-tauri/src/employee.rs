@@ -2210,7 +2210,14 @@ fn request_help(todo: &Todo) {
         send_to(&todo.owner.token, "starlink.help", json!({"id": todo.id, "task": todo.text, "question": todo.waiting, "shot": shot, "vaultKey": todo.vault_pk}));
     } else if let Some(app) = APP.get() {
         crate::sys_notify::show(app, "数字员工需要你补充信息", &clip(&todo.waiting, 80), false, None);
+        crate::taskbar_status::alert_help(app);
     }
+}
+
+/// 在等本机用户补充的任务：Butterfly 待确认小气泡据此弹出卡片，在那里直接回复。
+pub(crate) fn local_helps() -> Vec<Value> {
+    load().map(|e| e.inbox.iter().filter(|t| !t.waiting.is_empty() && t.owner.token.is_empty())
+        .map(|t| json!({"id": t.id, "task": clip(&t.text, 120), "question": t.waiting})).collect()).unwrap_or_default()
 }
 
 /// 中转站连上时重发还在等的补充请求：离线时发丢的不会让任务永远卡住，对方按 id 去重。

@@ -567,18 +567,49 @@ export default function TaskbarBubble() {
   );
 }
 
+/** 数字员工在等本机用户补充的信息：在这里直接回复，续做由后端接着办。 */
+type Help = { id: string; task: string; question: string };
+function HelpAsk(props: { help: Help; onDone: () => void }) {
+  const [text, setText] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal("");
+  const submit = async () => {
+    if (busy() || !text().trim()) return;
+    setBusy(true);
+    try {
+      await invoke("employee_do", { action: "reply", id: props.help.id, text: text() });
+      props.onDone();
+    } catch (e) { setError(String(e)); }
+    setBusy(false);
+  };
+  return (
+    <section class="tb-ask">
+      <div class="tb-ask-head"><span class="tb-ask-badge">需要你补充信息</span><span class="tb-ask-agent">数字员工</span></div>
+      <div class="tb-ask-title">{props.help.question}</div>
+      <div class="tb-ask-thread">任务：{props.help.task}</div>
+      <form class="tb-reply" onSubmit={(ev) => { ev.preventDefault(); void submit(); }}>
+        <textarea class="tb-input tb-reply-input" rows={2} placeholder="补充它要的信息，提交后接着做" value={text()} onInput={(ev) => setText(ev.currentTarget.value)} />
+        <button type="submit" class="tb-btn allow" disabled={busy() || !text().trim()}>提交</button>
+        <Show when={error()}><div class="tb-reply-error" role="alert">{error()}</div></Show>
+      </form>
+    </section>
+  );
+}
+
 /** 待确认小气泡（`?ask=1`）：只有要确认的事，弹在蝴蝶上方；作答后由原生端在全部处理完时收起。 */
 export function TaskbarAsk() {
   const [permissions, setPermissions] = createSignal<Permission[]>([]);
+  const [helps, setHelps] = createSignal<Help[]>([]);
   let shell!: HTMLDivElement;
   const place = () => void invoke("taskbar_ask_place", { height: shell.getBoundingClientRect().height }).catch(() => {});
   const load = async () => {
-    const next = await invoke<{ permissions: Permission[]; light: boolean } | null>("taskbar_ask").catch(() => null);
+    const next = await invoke<{ permissions: Permission[]; helps: Help[]; light: boolean } | null>("taskbar_ask").catch(() => null);
     if (!next) return;
     document.documentElement.classList.toggle("light", next.light);
     // 只在待确认集合变化时重建，保留正在填写的回答。
     const keys = (list: Permission[]) => list.map((p) => p.requestKey).join("\n");
     if (keys(next.permissions) !== keys(permissions())) setPermissions(next.permissions);
+    if (next.helps.map((h) => h.id).join() !== helps().map((h) => h.id).join()) setHelps(next.helps);
     await new Promise(requestAnimationFrame);
     place();
   };
@@ -593,6 +624,7 @@ export function TaskbarAsk() {
   return (
     <div class="tb-ask-shell" ref={shell}>
       <For each={permissions()}>{(req) => <div class="tb-card waiting"><Ask req={req} onDone={() => void load()} /></div>}</For>
+      <For each={helps()}>{(help) => <div class="tb-card waiting"><HelpAsk help={help} onDone={() => void load()} /></div>}</For>
     </div>
   );
 }

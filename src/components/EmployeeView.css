@@ -12,8 +12,8 @@
 }
 /* 宽屏：看板填满剩余高度，各列内部滚动；窄屏回到整页滚动（见末尾）。 */
 .employee-content { width: 100%; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 12px; }
-.employee-page button, .employee-page input, .employee-page textarea { font: inherit; }
-.employee-page button {
+:is(.employee-page, .employee-header) button, :is(.employee-page, .employee-header) input, :is(.employee-page, .employee-header) textarea { font: inherit; }
+:is(.employee-page, .employee-header) button {
   cursor: pointer;
   border: 1px solid var(--border-light);
   border-radius: 8px;
@@ -23,10 +23,10 @@
   font-size: 13px;
   line-height: 1.5;
 }
-.employee-page button:hover { background: var(--bg-hover); border-color: var(--border-strong); }
-.employee-page button:disabled { opacity: .45; cursor: default; }
-.employee-page :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.employee-page input:not([type=checkbox]), .employee-page textarea {
+:is(.employee-page, .employee-header) button:hover { background: var(--bg-hover); border-color: var(--border-strong); }
+:is(.employee-page, .employee-header) button:disabled { opacity: .45; cursor: default; }
+:is(.employee-page, .employee-header) :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+:is(.employee-page, .employee-header) input:not([type=checkbox]), :is(.employee-page, .employee-header) textarea {
   min-width: 0;
   border: 1px solid var(--border-light);
   border-radius: 8px;
@@ -35,9 +35,9 @@
   padding: 8px 10px;
   font-size: 13px;
 }
-.employee-page input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; flex-shrink: 0; cursor: pointer; }
-.employee-page textarea { width: 100%; resize: vertical; line-height: 1.7; }
-.employee-page textarea::placeholder, .employee-page input::placeholder { color: var(--text-muted); }
+:is(.employee-page, .employee-header) input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; flex-shrink: 0; cursor: pointer; }
+:is(.employee-page, .employee-header) textarea { width: 100%; resize: vertical; line-height: 1.7; }
+:is(.employee-page, .employee-header) textarea::placeholder, :is(.employee-page, .employee-header) input::placeholder { color: var(--text-muted); }
 .employee-page h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -.3px; white-space: nowrap; }
 .employee-page h2 { margin: 0; display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 650; }
 
@@ -74,6 +74,9 @@
 .employee-pop > div { position: absolute; right: 0; top: calc(100% + 6px); z-index: 20; width: 320px; max-width: calc(100vw - 80px); max-height: 70vh; overflow-y: auto; padding: 14px 16px; border: 1px solid var(--border-light); border-radius: 12px; background: var(--bg-float); box-shadow: var(--shadow-md); }
 .employee-memory > div { width: 440px; }
 .employee-memory .employee-hint { margin-bottom: 10px; }
+.employee-memory form > .employee-field:first-child { margin-top: 0; }
+.employee-memory .employee-edit-actions { margin-top: 14px; }
+.employee-memory .employee-list + p { margin: 10px 0 0; }
 .employee-time-range, .employee-idle-input { display: flex; align-items: center; gap: 8px; color: var(--text-dim); }
 .employee-time-range input { flex: 1; width: 0; padding: 7px; }
 .employee-idle-input input { width: 76px; }
