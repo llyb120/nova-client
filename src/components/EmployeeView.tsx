@@ -7,10 +7,11 @@ import type { Peer } from "../types";
 import { Markdown } from "./Markdown";
 import "./EmployeeView.css";
 import { TitleBarPortal } from "./TitleBar";
+import VaultPop from "./VaultPop";
 
 /** 交代的人；token 为空是员工所在机器的用户。 */
 type Owner = { token: string; name: string };
-type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; times?: string[]; nextCheckAt: number; lastRunAt: number; lastResult: string; owner?: Owner };
+type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; times?: string[]; events?: string[]; nextCheckAt: number; lastRunAt: number; lastResult: string; owner?: Owner };
 type Todo = { id: string; text: string; confirm: boolean; dutyId?: string; failures?: number; profile?: string; createdAt: number; threadId?: string | null; nextCheckAt?: number; desktop?: boolean; askAfter?: number;
   owner?: Owner; waiting?: string; replyTo?: { token: string; name: string; id: string } | null; shot?: string };
 const from = (o?: Owner) => (o?.token ? o.name || o.token : "");
@@ -20,6 +21,8 @@ type Run = { at: number; dutyId: string; label?: string; status?: string; result
 type Entry = { kind: "ask" | "help" | "answer" | "confirm" | "approve" | "result"; who?: string; text: string; at: number; scene?: string; status?: string };
 type Transcript = { title: string; entries?: Entry[] };
 type Memory = { id: string; text: string; at: number; importance?: number; strength?: number; usedAt?: number };
+/** 可订阅的事件（与后端 employee::EVENTS 一致）。 */
+const EVENTS: [string, string][] = [["orbit.added", "星轨新增事项"], ["orbit.done", "星轨事项完成"], ["orbit.changed", "星轨任何更新"]];
 const IMPORTANCE = ["", "", "重要", "长期"];
 // 与后端 Memory::retention 同一公式（MemoryBank 艾宾浩斯曲线），只用于展示。
 const retention = (m: Memory, now: number) => {
@@ -314,6 +317,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                       </Show>
                     </div>
                   </details>
+                  <Show when={!peer}><VaultPop /></Show>
                   <Show when={!peer}>
                   <details class="employee-pop employee-settings">
                     <summary>值班设置</summary>
@@ -553,8 +557,13 @@ function DutyCard(props: { duty: Duty; due: number; task: boolean; now: number; 
     setNoteDraft(null);
   };
   const times = () => duty.times ?? [];
-  const dynamic = () => duty.everyMinutes === 0 && times().length === 0;
-  const rule = () => duty.everyMinutes > 0 ? `每 ${duty.everyMinutes} 分钟` : times().length ? `每天 ${times().join("、")}` : "按安排触发";
+  const events = () => duty.events ?? [];
+  const dynamic = () => duty.everyMinutes === 0 && times().length === 0 && events().length === 0;
+  const rule = () => [
+    duty.everyMinutes > 0 && `每 ${duty.everyMinutes} 分钟`,
+    times().length > 0 && `每天 ${times().join("、")}`,
+    events().length > 0 && `事件：${events().map((ev) => EVENTS.find(([k]) => k === ev)?.[1] ?? ev).join("、")}`,
+  ].filter(Boolean).join("；") || "按安排触发";
   // 职责只负责触发：本次任务没收尾前不再触发；动态职责没安排下一次就不会再触发，要让用户一眼看到。
   const next = () => !duty.enabled ? "—"
     : props.task ? "本次任务处理中，收尾后按规则触发"
@@ -576,6 +585,14 @@ function DutyCard(props: { duty: Duty; due: number; task: boolean; now: number; 
             <label class="employee-interval" title="留空或 0：不按间隔；填入数字：每次任务结束后等待固定分钟数（与每天时刻二选一）">执行间隔（分钟）<input type="number" min="0" max="10080" placeholder="自动"
               value={duty.everyMinutes || ""} aria-label="执行间隔（分钟）"
               onChange={(ev) => void props.run("employee_do", { action: "duty_every", id: duty.id, text: ev.currentTarget.value })} /></label>
+            <fieldset class="employee-events" title="订阅的事件一发生就触发一次，可与定时并存">
+              <legend>事件触发</legend>
+              <For each={EVENTS}>{([key, label]) => (
+                <label><input type="checkbox" checked={events().includes(key)}
+                  onChange={(ev) => void props.run("employee_do", { action: "duty_events", id: duty.id,
+                    text: (ev.currentTarget.checked ? [...events(), key] : events().filter((k) => k !== key)).join(",") })} /> {label}</label>
+              )}</For>
+            </fieldset>
             <button type="button" onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; setDraft(duty.text); }}>编辑</button>
             <button type="button" onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; setNoteDraft(duty.note); }}>补充要求</button>
             <button type="button" onClick={() => void props.act("duty_run", duty.id)}>立即执行</button>

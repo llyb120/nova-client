@@ -8,6 +8,7 @@ import type { PermissionRequest } from "../types";
 import { agentLabel, stripAnsi } from "../utils";
 import TaskbarAssistant, { TaskbarSessions } from "./TaskbarAssistant";
 import ThoughtCapsules, { captureCapsule } from "./ThoughtCapsules";
+import OrbitTodo from "./OrbitTodo";
 import { fileToAttachment } from "./ImageAttachmentStrip";
 import "./TaskbarBubble.css";
 
@@ -30,11 +31,12 @@ type Payload = { cards: Card[]; permissions: Permission[]; light: boolean; panel
 
 type PanelData = { jianpu: { recording: boolean; id?: string; elapsedMs?: number } };
 /** `tab`: the Butterfly's left click opens the assistant, its right click the quick actions. */
-type Tab = "assistant" | "session" | "capsules" | "quick";
+type Tab = "assistant" | "session" | "capsules" | "orbit" | "quick";
 const TABS: [Tab, string, string][] = [
   ["assistant", "助理", "M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1L5 10.5l5.1-1.9zM18.5 15.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"],
   ["session", "会话", "M5.5 5h13A1.5 1.5 0 0120 6.5v8a1.5 1.5 0 01-1.5 1.5H11l-4 3.5V16H5.5A1.5 1.5 0 014 14.5v-8A1.5 1.5 0 015.5 5zM8.5 10.5h7"],
   ["capsules", "星尘", "M12 3.8l2.5 5.1 5.6.8-4 4 .9 5.6-5-2.6-5 2.6.9-5.6-4-4 5.6-.8z"],
+  ["orbit", "星轨", "M9.5 6.5H20M9.5 12H20M9.5 17.5H20M4 6.2l1.2 1.3 2.1-2.5M4 11.7l1.2 1.3 2.1-2.5M4 17.2l1.2 1.3 2.1-2.5"],
   ["quick", "星海", "M5 4.5h4.5A.5.5 0 0110 5v4.5a.5.5 0 01-.5.5H5a.5.5 0 01-.5-.5V5a.5.5 0 01.5-.5zM14.5 4.5H19a.5.5 0 01.5.5v4.5a.5.5 0 01-.5.5h-4.5a.5.5 0 01-.5-.5V5a.5.5 0 01.5-.5zM5 14h4.5a.5.5 0 01.5.5V19a.5.5 0 01-.5.5H5a.5.5 0 01-.5-.5v-4.5A.5.5 0 015 14zM14.5 14H19a.5.5 0 01.5.5V19a.5.5 0 01-.5.5h-4.5a.5.5 0 01-.5-.5v-4.5a.5.5 0 01.5-.5z"],
 ];
 const clock = (ms = 0) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
@@ -151,7 +153,7 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
       <div class="tb-panel-main">
         <header class="tb-head">
           <Butterfly />
-          <span class="tb-state">{props.tab === "assistant" ? "Nova 助理" : props.tab === "capsules" ? "星尘" : LABEL[props.card?.kind ?? "idle"]}</span>
+          <span class="tb-state">{props.tab === "assistant" ? "Nova 助理" : props.tab === "capsules" ? "星尘" : props.tab === "orbit" ? "星轨" : LABEL[props.card?.kind ?? "idle"]}</span>
           <Show when={props.tab === "session" && props.card?.trailing}>
             <span class="tb-time">{props.card?.trailing}</span>
           </Show>
@@ -162,6 +164,9 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
         <TaskbarAssistant active={props.active && props.tab === "assistant"} shown={props.active} quick={props.tab === "quick"} focusRequest={props.focusRequest} />
         <div id="tb-pane-capsules" role="tabpanel" aria-labelledby="tb-tab-capsules" class="tb-capsules-pane" hidden={props.tab !== "capsules"}>
           <ThoughtCapsules active={props.active && props.tab === "capsules"} onCaptured={() => props.setTab("capsules")} />
+        </div>
+        <div id="tb-pane-orbit" role="tabpanel" aria-labelledby="tb-tab-orbit" class="tb-capsules-pane" hidden={props.tab !== "orbit"}>
+          <OrbitTodo active={props.active && props.tab === "orbit"} />
         </div>
         <div id="tb-pane-session" role="tabpanel" aria-labelledby="tb-tab-session" class="tb-session-list" hidden={props.tab !== "session"}>{props.session}<TaskbarSessions active={props.active && props.tab === "session"} /></div>
         <div id="tb-pane-quick" role="tabpanel" aria-labelledby="tb-tab-quick" hidden={props.tab !== "quick"}>

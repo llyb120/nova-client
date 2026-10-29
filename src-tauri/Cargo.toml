@@ -35,6 +35,9 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # 星尘 PDF 文本提取（纯 Rust）。
 pdf-extract = "0.12"
 sha2 = "0.10"
+# 密码本：落盘加密（AES-256-GCM）与跨机传输（X25519 密钥协商）。
+aes-gcm = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 keepawake = "0.6"
 bincode = "1.3"

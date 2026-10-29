@@ -7,6 +7,8 @@ mod backend_migration;
 mod jianlai;
 mod jianpu;
 mod employee;
+mod orbit;
+mod vault;
 mod layout;
 mod altair_run;
 mod tool_experience;
@@ -4670,6 +4672,15 @@ pub fn run() {
             employee::employee_do,
             employee::employee_say,
             employee::starlink_call,
+            vault::vault_list,
+            vault::vault_save,
+            vault::vault_delete,
+            orbit::orbit_list,
+            orbit::orbit_add,
+            orbit::orbit_done,
+            orbit::orbit_edit,
+            orbit::orbit_remove,
+            orbit::orbit_clear_done,
             workspace_terminal::terminal_create,
             workspace_terminal::terminal_write,
             workspace_terminal::terminal_resize,
