@@ -53,12 +53,14 @@ export default function OrbitTodo(props: { active: boolean }) {
   };
   const toggle = (item: Item) => {
     // 先在界面上翻转，手感更跟手；失败时 run 会重新同步。
-    setItems((i) => i.id === item.id, { done: !item.done, doneAt: item.done ? 0 : Date.now() });
-    void run(invoke("orbit_done", { id: item.id, done: !item.done }));
+    const done = !item.done; // item 是 store 代理，setItems 后再读会拿到翻转后的值
+    setItems((i) => i.id === item.id, { done, doneAt: done ? Date.now() : 0 });
+    void run(invoke("orbit_done", { id: item.id, done }));
   };
   const star = (item: Item) => {
-    setItems((i) => i.id === item.id, "star", !item.star);
-    void run(invoke("orbit_edit", { id: item.id, patch: { star: !item.star } }));
+    const next = !item.star;
+    setItems((i) => i.id === item.id, "star", next);
+    void run(invoke("orbit_edit", { id: item.id, patch: { star: next } }));
   };
   const commit = () => {
     const e = editing();
