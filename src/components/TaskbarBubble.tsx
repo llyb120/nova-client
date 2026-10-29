@@ -569,7 +569,7 @@ export default function TaskbarBubble() {
 
 /** 数字员工在等本机用户补充的信息：在这里直接回复，续做由后端接着办。 */
 type Help = { id: string; task: string; question: string };
-function HelpAsk(props: { help: Help; onDone: () => void }) {
+function HelpAsk(props: { help: Help; onDone: () => void; onClose: () => void }) {
   const [text, setText] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
@@ -584,7 +584,8 @@ function HelpAsk(props: { help: Help; onDone: () => void }) {
   };
   return (
     <section class="tb-ask">
-      <div class="tb-ask-head"><span class="tb-ask-badge">需要你补充信息</span><span class="tb-ask-agent">数字员工</span></div>
+      <div class="tb-ask-head"><span class="tb-ask-badge">需要你补充信息</span><span class="tb-ask-agent">数字员工</span>
+        <button type="button" class="tb-close" title="关闭（可在数字员工页面里回复）" aria-label="关闭" onClick={props.onClose}>×</button></div>
       <div class="tb-ask-title">{props.help.question}</div>
       <div class="tb-ask-thread">任务：{props.help.task}</div>
       <form class="tb-reply" onSubmit={(ev) => { ev.preventDefault(); void submit(); }}>
@@ -600,6 +601,9 @@ function HelpAsk(props: { help: Help; onDone: () => void }) {
 export function TaskbarAsk() {
   const [permissions, setPermissions] = createSignal<Permission[]>([]);
   const [helps, setHelps] = createSignal<Help[]>([]);
+  // 关掉的补充请求不再弹；同一任务问了新问题照常弹。
+  const closed = new Set<string>();
+  const key = (h: Help) => `${h.id}\n${h.question}`;
   let shell!: HTMLDivElement;
   const place = () => void invoke("taskbar_ask_place", { height: shell.getBoundingClientRect().height }).catch(() => {});
   const load = async () => {
@@ -609,7 +613,8 @@ export function TaskbarAsk() {
     // 只在待确认集合变化时重建，保留正在填写的回答。
     const keys = (list: Permission[]) => list.map((p) => p.requestKey).join("\n");
     if (keys(next.permissions) !== keys(permissions())) setPermissions(next.permissions);
-    if (next.helps.map((h) => h.id).join() !== helps().map((h) => h.id).join()) setHelps(next.helps);
+    const open = next.helps.filter((h) => !closed.has(key(h)));
+    if (open.map(key).join() !== helps().map(key).join()) setHelps(open);
     await new Promise(requestAnimationFrame);
     place();
   };
@@ -624,7 +629,11 @@ export function TaskbarAsk() {
   return (
     <div class="tb-ask-shell" ref={shell}>
       <For each={permissions()}>{(req) => <div class="tb-card waiting"><Ask req={req} onDone={() => void load()} /></div>}</For>
-      <For each={helps()}>{(help) => <div class="tb-card waiting"><HelpAsk help={help} onDone={() => void load()} /></div>}</For>
+      <For each={helps()}>{(help) => <div class="tb-card waiting"><HelpAsk help={help} onDone={() => void load()} onClose={() => {
+        closed.add(key(help));
+        setHelps(helps().filter((h) => h !== help));
+        if (!permissions().length && !helps().length) void invoke("taskbar_ask_hide").catch(() => {});
+      }} /></div>}</For>
     </div>
   );
 }

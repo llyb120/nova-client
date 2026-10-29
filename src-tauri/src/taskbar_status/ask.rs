@@ -71,7 +71,7 @@ fn watch(app: &AppHandle) {
     });
 }
 
-fn hide(app: &AppHandle) {
+pub(super) fn hide(app: &AppHandle) {
     SHOWN.store(false, Ordering::Release);
     if let Some(Ok(hwnd)) = app.get_webview_window(LABEL).map(|w| w.hwnd()) {
         unsafe { ShowWindow(hwnd.0 as _, SW_HIDE); }

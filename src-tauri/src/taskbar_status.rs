@@ -91,6 +91,15 @@ pub(crate) fn taskbar_ask_place(app: tauri::AppHandle, height: f64) -> bool {
     { let _ = (app, height); false }
 }
 
+/// 用户关掉待确认小气泡：收起，有新的待确认时再弹。
+#[tauri::command]
+pub(crate) fn taskbar_ask_hide(app: tauri::AppHandle) {
+    #[cfg(windows)]
+    ask::hide(&app);
+    #[cfg(not(windows))]
+    let _ = app;
+}
+
 /// Butterfly 面板「星海」标签的操作（剑谱录制、知识图谱）。
 #[tauri::command]
 pub(crate) async fn taskbar_quick(app: tauri::AppHandle, action: String) -> Result<serde_json::Value, String> {
@@ -134,10 +143,9 @@ pub(crate) fn start(app: &tauri::AppHandle) {
 
 /// 数字员工要本机用户补充信息：在蝴蝶上方弹出带回复框的小卡片。
 pub(crate) fn alert_help(app: &tauri::AppHandle) {
+    let _ = app;
     #[cfg(windows)]
     if !crate::server::is_headless() { windows::on_app(|app| ask::alert(app, true)); }
-    #[cfg(not(windows))]
-    let _ = app;
 }
 
 pub(crate) fn bounds() -> Option<Rect> {
