@@ -194,7 +194,7 @@
       // Input may legitimately change its accessible name/context, so compare
       // the original node and actual value, not the pre-edit text fingerprint.
       const e=entries.get(ref)?.e;
-      if (!e?.isConnected || !editable(e) || e.type==='password' || active()!==e) throw Error('填写后目标或焦点已变化，请重新观察');
+      if (!e?.isConnected || !editable(e) || active()!==e) throw Error('填写后目标或焦点已变化，请重新观察');
       const value=e.isContentEditable ? e.innerText : e.value;
       return {matches:String(value??'').replace(/\r\n/g,'\n')===expected.replace(/\r\n/g,'\n')};
     },

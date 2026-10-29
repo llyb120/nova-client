@@ -28,8 +28,6 @@ struct BrowserState {
     gate: tokio::sync::Mutex<()>,
     frame_sessions: Mutex<std::collections::HashMap<String, String>>,
     observations: Mutex<std::collections::HashMap<String, Observation>>,
-    /// Last click point refused by the pixel guard, per tab: (url, pageX, pageY).
-    guard_misses: Mutex<std::collections::HashMap<String, (String, f64, f64)>>,
 }
 
 fn active_label(_app: &AppHandle) -> Result<String, String> {
@@ -743,7 +741,7 @@ async fn require_focus(app:&AppHandle, observation:&Observation, index:usize, re
     let frame=observation.frames.get(index).ok_or("frame 不存在")?;
     if !frame_has_focus(app,observation,index).await? {return Err("焦点已离开目标框架，停止填写".into());}
     let state=evaluate(app,frame,format!("__novaWebview.inputState({})",json!(reference))).await?;
-    if state["matches"]!=true || state["editable"]!=true || state["password"]==true { return Err("目标焦点已改变或不可编辑，停止输入；请根据新观察继续".into()); }
+    if state["matches"]!=true || state["editable"]!=true { return Err("目标焦点已改变或不可编辑，停止输入；请根据新观察继续".into()); }
     Ok(())
 }
 
@@ -756,37 +754,23 @@ async fn apply(
         Action::ClickAt {x,y,..} | Action::Move {x,y} | Action::Drag {x,y,..} | Action::ScrollAt {x,y,..} => {
             if observation.full_page && matches!(action,Action::Drag{..}) { return Err("拖动请使用 fullPage=false 的视口截图".into()); }
             let p=coordinate(app,observation,*x,*y,image_id).await?;
-            // Re-sending a coordinate the guard just refused usually hits the same churn; send the model to the DOM ref.
-            let here=spot(observation,&p);
-            if matches!(action,Action::ClickAt{..}) {
-                let label=active_label(app)?;
-                let repeated=here.as_ref().is_some_and(|h| app.state::<BrowserState>().guard_misses.lock().unwrap().get(&label).is_some_and(|m|same_spot(m,h)));
-                if repeated { if let Some(click)=ref_at(app,observation,&p).await {
-                    return Err(format!("该坐标刚因落点附近画面变化被拦截，本次未点击；不要原样重试坐标，改用 {click}"));
-                }}
-            }
-            if !matches!(action,Action::Move{..}) { guard_coordinate(app,observation,&p,*x,*y,image_id).await?; }
             if matches!(action,Action::ClickAt{..}|Action::ScrollAt{..}|Action::Drag{..}) {
                 progress.attempted=true;
                 cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseMoved","x":p["x"],"y":p["y"]}),None,Some(s.cancel.clone())).await?;
                 if p["hoverTarget"]["ref"].is_string() {
                     evaluate(app,&observation.frames[0],format!("__novaWebview.verifyPoint({},{},{},{})",p["hoverTarget"]["ref"],p["x"],p["y"],p["hoverTarget"]["rect"])).await?;
                     if evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?!=p["stamp"] {return Err("悬停期间视口已变化，停止点击".into());}
-                } else {
-                    guard_coordinate(app,observation,&p,*x,*y,image_id).await?;
                 }
             }
             match action {
                 Action::ClickAt {button,click_count,..} => {
                     mouse(app,s,&p,button.as_deref().unwrap_or("left"),click_count.unwrap_or(1),progress).await?;
                     progress.focus=(p["editable"]==true).then(||(0,p["identity"].clone()));
-                    if let Ok(label)=active_label(app) { app.state::<BrowserState>().guard_misses.lock().unwrap().remove(&label); }
                 },
                 Action::Move{..} => { progress.attempted=true; cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseMoved","x":p["x"],"y":p["y"]}),None,Some(s.cancel.clone())).await?; },
                 Action::ScrollAt{delta,delta_x,..} => { progress.attempted=true; cdp(app,"Input.dispatchMouseEvent",json!({"type":"mouseWheel","x":p["x"],"y":p["y"],"deltaX":delta_x.unwrap_or(0),"deltaY":delta}),None,Some(s.cancel.clone())).await?; },
                 Action::Drag{to_x,to_y,duration_ms,..} => {
                     let end=coordinate(app,observation,*to_x,*to_y,image_id).await?;
-                    guard_coordinate(app,observation,&end,*to_x,*to_y,image_id).await?;
                     let (x,y)=(p["x"].as_f64().ok_or("无效坐标")?,p["y"].as_f64().ok_or("无效坐标")?);
                     let (tx,ty)=(end["x"].as_f64().ok_or("无效终点")?,end["y"].as_f64().ok_or("无效终点")?);
                     let duration=duration_ms.unwrap_or(160); let steps=(duration/16).clamp(5,24);
@@ -815,7 +799,6 @@ async fn apply(
             for (index,frame) in observation.frames.iter().enumerate() {
                 let now=evaluate(app,frame,"__novaWebview.inputState()".into()).await?;
                 if !frame_has_focus(app,observation,index).await? {continue;}
-                if now["password"]==true { return Err("密码请手动输入".into()); }
                 if now["editable"]==true {
                     let expected=progress.focus.as_ref().map(|(frame,identity)| if *frame==index {identity} else {&Value::Null})
                         .unwrap_or(&observation.pages["pages"][index]["focus"]["identity"]);
@@ -843,7 +826,6 @@ async fn apply(
             }
             progress.dom_preflight=false;
             if let Action::Fill{text,..}=action {
-                if p["password"]==true { return Err("密码请手动输入".into()); }
                 mouse(app,s,&p,"left",1,progress).await?;
                 require_focus(app,observation,*frame,r#ref).await?;
                 key(app,s,"Control+A",progress).await?;
@@ -907,62 +889,6 @@ fn image_point(observation: &Observation, x:f64, y:f64, image_id:Option<&str>) -
         None=>Ok((x,y)), // Backwards-compatible CSS coordinates; new clients should supply imageId.
     }
 }
-async fn guard_coordinate(app:&AppHandle, observation:&Observation, point:&Value, x:f64, y:f64, image_id:Option<&str>) -> Result<(),String> {
-    let (cx,cy)=image_point(observation,x,y,image_id)?;
-    let image=observation.images.iter().find(|i| image_id.map_or(cx>=i.x&&cy>=i.y&&cx<i.x+i.width&&cy<i.y+i.height, |id| i.id==id)).ok_or("坐标不在已返回的截图分片内，请重新截图")?;
-    let (px,py)=((cx-image.x)*image.pixels.0 as f64/image.width,(cy-image.y)*image.pixels.1 as f64/image.height);
-    let sx=image.width/image.pixels.0 as f64;let sy=image.height/image.pixels.1 as f64;
-    let vx=point["x"].as_f64().ok_or("缺少视口落点")?;let vy=point["y"].as_f64().ok_or("缺少视口落点")?;
-    let vw=observation.pages["pages"][0]["viewport"]["width"].as_f64().ok_or("缺少视口尺寸")?;
-    let vh=observation.pages["pages"][0]["viewport"]["height"].as_f64().ok_or("缺少视口尺寸")?;
-    // Compare only actually visible source pixels. A downscaled full-page tile
-    // must not turn a 24px guard into a huge offscreen screenshot.
-    let left=(px-(24./sx).ceil()).floor().max((px-vx/sx).ceil()).max(0.) as u32;
-    let top=(py-(24./sy).ceil()).floor().max((py-vy/sy).ceil()).max(0.) as u32;
-    let right=(px+(24./sx).ceil()+1.).ceil().min((px+(vw-vx)/sx).floor()).min(image.pixels.0 as f64) as u32;
-    let bottom=(py+(24./sy).ceil()+1.).ceil().min((py+(vh-vy)/sy).floor()).min(image.pixels.1 as f64) as u32;
-    if right<=left || bottom<=top {return Err("截图在落点附近分辨率不足，请截取局部高分辨率图片".into());}
-    let (width,height)=(right-left,bottom-top);
-    let expected = match &image.delivered {
-        Some(frame) => frame.seen.clone(),
-        None => std::sync::Arc::new(xcap::image::open(&image.path).map_err(|e| e.to_string())?.to_rgba8()),
-    };
-    let expected=xcap::image::imageops::crop_imm(expected.as_ref(),left,top,width,height).to_image();
-    let actual=capture_viewport(app,&observation.pages["pages"][0]["viewport"],
-        vx+(left as f64-px)*sx,vy+(top as f64-py)*sy,width as f64*sx,height as f64*sy).await?.to_rgba8();
-    if crate::visual_guard::patch_changed(&expected,&actual) {
-        if let (Some(miss),Ok(label))=(spot(observation,point),active_label(app)) { app.state::<BrowserState>().guard_misses.lock().unwrap().insert(label,miss); }
-        return Err(match ref_at(app,observation,point).await {
-            Some(click)=>format!("落点附近画面已变化，未点击；落点元素在 DOM 中可定位，改用 {click}，不要再用坐标"),
-            None=>"落点附近画面已变化，未点击；请根据新截图重新定位，不要原样重试同一坐标，细小目标先用 screenshot(region) 局部放大".into(),
-        });
-    }
-    if evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?!=point["stamp"] {return Err("落点校验期间视口已变化，停止点击".into());}
-    Ok(())
-}
-
-fn spot(observation:&Observation, point:&Value) -> Option<(String,f64,f64)> {
-    Some((observation.pages["pages"][0]["url"].as_str()?.to_owned(),point["pageX"].as_f64()?,point["pageY"].as_f64()?))
-}
-fn same_spot(a:&(String,f64,f64), b:&(String,f64,f64)) -> bool { a.0==b.0 && (a.1-b.1).abs()<=4. && (a.2-b.2).abs()<=4. }
-
-/// DOM click for the actionable element under a viewport point, if the observation lists it (best effort;
-/// cross-process iframes are not descended).
-async fn ref_at(app:&AppHandle, observation:&Observation, point:&Value) -> Option<String> {
-    let hit=cdp(app,"DOM.getNodeForLocation",json!({"x":point["x"].as_f64()?.floor(),"y":point["y"].as_f64()?.floor()}),None,None).await.ok()?;
-    let index=observation.frames.iter().position(|f|f.session.is_none() && hit["frameId"].as_str()==Some(f.id.as_str()))?;
-    let frame=&observation.frames[index];
-    let node=cdp(app,"DOM.resolveNode",json!({"backendNodeId":hit["backendNodeId"],"executionContextId":frame.context}),None,None).await.ok()?;
-    let object=node["object"]["objectId"].as_str()?.to_owned();
-    let refs=cdp(app,"Runtime.callFunctionOn",json!({"objectId":object,"returnByValue":true,"functionDeclaration":"function(){return globalThis.__novaWebview?.refsOf(this)??[]}"}),None,None).await;
-    let _=cdp(app,"Runtime.releaseObject",json!({"objectId":object}),None,None).await;
-    let items=observation.pages["pages"][index]["items"].as_array()?;
-    refs.ok()?["result"]["value"].as_array()?.iter().filter_map(Value::as_str).find_map(|r| items.iter().find(|item| item["ref"].as_str()==Some(r)
-        && item["disabled"]!=true && item["scroll"].is_null() && item["canvas"].is_null()
-        && (item["actionable"]==true || matches!(item["role"].as_str(),Some("button"|"a"|"link"|"input"|"select"|"textarea"|"summary"|"tab"|"checkbox"|"radio"|"combobox"|"option"|"menuitem"|"li")))))
-        .map(|item| format!("{{\"action\":\"click\",\"frame\":{index},\"ref\":{}}}（{} {}）",item["ref"],item["role"].as_str().unwrap_or(""),json!(item["name"].as_str().unwrap_or(""))))
-}
-
 async fn coordinate(
     app: &AppHandle,
     observation: &Observation,
@@ -1201,8 +1127,6 @@ async fn snapshot(
             } else {(0.,0.,vw,vh)};
             let path=dir.join(format!("{}.webp",observation.id));
             let image = resize_screenshot(capture_viewport(app,viewport,x,y,w,h).await?,edge as u32);
-            let after=evaluate(app,&observation.frames[0],"__novaWebview.stamp()".into()).await?;
-            if after!=observation.pages["pages"][0]["stamp"] {return Err("截图期间视口变化，请重新截图".into());}
             images = deliver_screenshot(&mut observation, previous, stream, image, path, (x,y,w,h))?;
         }
         result["path"] = images[0]["path"].clone();
@@ -1451,7 +1375,6 @@ async fn control_session(
     check(app, &s)?;
     let mut completed_action = None;
     let mut progress=InputProgress::default();
-    let mut desktop_invalidated = false;
     let task=CONTROL_TAB.scope(s.active_tab.clone(),async {
         let current=state.observations.lock().unwrap().get(&s.active_tab).cloned();
         if !matches!(operation,"act"|"evaluate") {return Ok(snapshot(app,operation=="screenshot",args,current.as_ref()).await?.1);}
@@ -1489,7 +1412,6 @@ async fn control_session(
         // Background tabs throttle animation/timer sampling, making stable DOM targets time out as "moving".
         // Activate the explicitly bound tab before live checks; stale geometry/identity is still checked by apply.
         crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
-        desktop_invalidated = crate::jianlai::invalidate_desktop("Chrome 已激活目标标签，旧桌面快照作废");
         state.observations.lock().unwrap().remove(&s.active_tab);
         let mut failure=None;
         let mut action_timings=Vec::new();
@@ -1691,10 +1613,6 @@ async fn control_session(
         }
     }
     if let Ok(value) = &mut result {
-        if desktop_invalidated {
-            value["desktopSnapshotInvalidated"] = json!(true);
-            value["desktopNotice"] = json!("剑来旧快照已作废；需要剑来时先重新截图");
-        }
         value["durationMs"] = json!(started.elapsed().as_millis());
     }
     result
@@ -1711,6 +1629,21 @@ async fn resolve_targets(_root: &Path, args: &Value, _owner: &str, _tool: &str) 
 
 /// A missing `operation` is inferred from the other fields instead of failing the call:
 /// plan → run, action(s) → act, expression → evaluate, url without target → open, target only → inspect, nothing → tabs.
+/// Drop default-valued fields and cap long URLs (login redirects) so multi-tab results stay small.
+fn compact_tab(mut tab: Value) -> Value {
+    if let Some(o) = tab.as_object_mut() {
+        for (k, v) in [("allowed", json!(true)), ("controllable", json!(true)), ("loading", json!(false)), ("status", json!("complete")), ("incognito", json!(false))] {
+            if o.get(k) == Some(&v) { o.remove(k); }
+        }
+        o.remove("windowId");
+        if let Some(url) = o.get("url").and_then(Value::as_str).filter(|u| u.chars().count() > 120) {
+            let short: String = url.chars().take(120).collect();
+            o.insert("url".into(), json!(format!("{short}…")));
+        }
+    }
+    tab
+}
+
 fn infer_operation(args: &Value, target_key: &str) -> (Value, Option<&'static str>) {
     if args["operation"].as_str().is_some_and(|op| !op.is_empty()) || !args.is_object() { return (args.clone(), None); }
     let op = if args["plan"].is_object() { "run" }
@@ -1780,7 +1713,8 @@ pub(crate) fn altair_observation(root: &Path, args: &Value, owner: &str, tool: &
 
 fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashMap<String, Observation>) -> Result<Value, String> {
     let mut args = args.as_object().cloned().ok_or("chrome 参数必须是对象")?;
-    match args.get("operation").and_then(Value::as_str).unwrap_or_default() {
+    let operation = args.get("operation").and_then(Value::as_str).unwrap_or_default().to_owned();
+    match operation.as_str() {
         "connect" | "status" | "tabs" | "open" | "new_tab" | "downloads" | "experience_search" => return Ok(Value::Object(args)),
         // Models may fill unrelated fields from the shared schema. Inspect only consumes read
         // options; even non-empty screenshot/action placeholders must not prevent a DOM read.
@@ -1788,7 +1722,7 @@ fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashM
             "operation" | "tabTag" | "tabId" | "browserId" | "snapshotId" |
             "query" | "scope" | "visual" | "maxItems" | "maxTextChars" | "maxEdge")),
         "screenshot" | "devtools" | "act" | "evaluate" | "run" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "stop" | "experience_save" | "experience_feedback" => {},
-        _ => return Err("缺少或无效 operation；先用 {\"operation\":\"tabs\"} 获取标签".into()),
+        _ => return Err(format!("operation {operation:?} 无效；可用：tabs/inspect/act/screenshot/evaluate/run/open/goto/select_tab/close_tab/back/forward/reload/devtools/status 等。click/fill 是 act 的 action，不是 operation；不知道目标时先 {{\"operation\":\"tabs\",\"query\":\"关键词\"}}")),
     }
     let valid_tag = |tag: &str| tag.len() <= 80 && tag.starts_with('C')
         && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
@@ -1933,12 +1867,6 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
             Err(error) => return Err(error),
         }
     } else { None };
-    let retire_desktop = |value: &mut Value| {
-        if crate::jianlai::invalidate_desktop(&format!("chrome {operation} 已改变屏幕内容")) {
-            value["desktopSnapshotInvalidated"] = json!(true);
-            value["desktopNotice"] = json!("剑来旧快照已作废；需要剑来时先重新截图");
-        }
-    };
     if matches!(operation, "tabs" | "open" | "new_tab") {
         let mut params = args.clone();
         if let Some(url) = args["url"].as_str() {
@@ -1961,13 +1889,12 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
                 match controllable.as_slice() {
                     [one] => { value["tabTag"] = one["tag"].clone(); target = one["tag"].as_str().map(str::to_owned); }
                     [] => value["next"] = json!("没有可操作标签匹配 query；换关键词，或 open(url) 新开标签"),
-                    _ => value["next"] = json!("query 匹配到多个标签，请从 tabs 中选定 tabTag 后 inspect"),
+                    _ => value["next"] = json!("query 匹配到多个标签：按 title/url 选一个 tabTag 再 inspect；重复标签优先选 active:true 的，或换更具体的 query"),
                 }
-                value["tabs"] = json!(matched);
+                value["tabs"] = json!(matched.into_iter().map(compact_tab).collect::<Vec<_>>());
                 if let Some(a) = observe_args.as_object_mut() { a.remove("query"); }
             }
         } else {
-            retire_desktop(&mut value);
             if args["url"].is_string() { target = value["tabTag"].as_str().map(str::to_owned); }
         }
         if let (Some(tag), false) = (target, observe == "none") {
@@ -2011,7 +1938,6 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
                 .unwrap()
                 .retain(|key, _| !key.ends_with(&format!(":{tag}")));
         }
-        if mutating { retire_desktop(&mut value); }
         // Navigation returns the loaded page directly: no separate inspect round-trip.
         if matches!(operation, "select_tab" | "goto" | "back" | "forward" | "reload") && observe != "none" {
             let observed = observe_tab(app, root, &thread_id, tag, args, observe, Duration::from_secs(8)).await;
@@ -2025,7 +1951,6 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
         return Err("未知 chrome 操作".into());
     }
     let mut value = control_session(app, root, chrome_session(&thread_id, tag), operation, args).await?;
-    if matches!(operation, "act" | "evaluate") && value["status"] != "not_executed" { retire_desktop(&mut value); }
     value["tabTag"] = json!(tag);
     value["browser"] = json!("chrome");
     if matches!(operation, "act" | "evaluate") && args["feedback"] != "none" {
@@ -2174,14 +2099,6 @@ mod tests {
             assert!(opened_tabs(&after,&after,"source").is_empty(),"old children are not a new action effect");
             assert!(opened_tabs(&json!({}),&after,"source").is_empty(),"missing baseline cannot prove a new tab");
         }
-    }
-
-    #[test]
-    fn guard_miss_repeat_is_same_page_and_spot() {
-        let miss=("https://a.test/".to_string(),100.,60.);
-        assert!(same_spot(&miss,&("https://a.test/".into(),103.,57.)));
-        assert!(!same_spot(&miss,&("https://a.test/".into(),110.,60.)));
-        assert!(!same_spot(&miss,&("https://b.test/".into(),100.,60.)));
     }
 
     #[test]

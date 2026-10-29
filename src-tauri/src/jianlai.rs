@@ -85,19 +85,6 @@ pub(crate) fn lease_input(tool: &'static str) -> Result<InputLease> {
     if tool == "jianlai" { crate::agent_glow::hold(); }
     Ok(InputLease(id))
 }
-/// Called by chrome after it changed what is on screen (tab switch, navigation, input). The stale
-/// desktop snapshot then fails explicitly with this reason and a fresh observation instead of
-/// tripping the foreground/pixel guards mid-batch. Returns whether a live snapshot was affected.
-pub(crate) fn invalidate_desktop(reason: &str) -> bool {
-    match DESKTOP.try_lock() {
-        Ok(mut state) => match state.as_mut() {
-            Some(snap) if snap.invalidated.is_none() => { snap.invalidated = Some(reason.to_string()); true }
-            _ => false,
-        },
-        Err(_) => false,
-    }
-}
-
 pub(crate) fn tool_definition() -> Value {
     serde_json::from_str(include_str!("../../scripts/jianlai-tool.json")).unwrap()
 }
