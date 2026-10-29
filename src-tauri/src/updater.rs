@@ -782,6 +782,9 @@ fn restore_window_layout(win: &tauri::Window) -> bool {
     let Ok(hwnd) = win.hwnd() else { return false; };
     // SetWindowPlacement 负责最大化还原尺寸、工作区坐标及屏幕变化后的可见位置。
     if unsafe { SetWindowPlacement(hwnd.0 as _, &placement) } == 0 { return false; }
+    // SetWindowPlacement 只在原生层显示了窗口，tao 仍记着「隐藏」；不同步的话，第一次最大化/最小化时
+    // tao 按自己的状态重刷样式会把窗口连同任务栏图标一起藏掉。SW_SHOW 不改变最大化/最小化状态。
+    let _ = win.show();
     if saved.show_cmd != 2 { let _ = win.set_focus(); }
     true
 }
