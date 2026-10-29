@@ -66,19 +66,39 @@ export function TitleBar() {
   };
   const isInteractive = (target: EventTarget | null) =>
     target instanceof Element && !!target.closest('button, input, textarea, select, a, summary, label, [role="button"], [contenteditable="true"]');
-  const handleDrag = (event: MouseEvent) => {
+  // 按下后真正移动才开始原生拖动：按下就拖会进入系统移动循环、吞掉鼠标抬起，双击就识别不到了。
+  let pressed = false;
+  const handleDown = (event: MouseEvent) => {
     if (event.button !== 0 || isInteractive(event.target)) return;
-    // 捕获阶段统一接管标题/目录/空白，避免文字选择与局部处理器抢先。
+    // 捕获阶段统一接管标题/目录/空白，避免文字选择与局部处理器抢先；
+    // 同时拦下 Tauri 注入的 data-tauri-drag-region 脚本，否则它会再切换一次最大化。
     event.preventDefault();
-    if (event.detail === 2) {
-      if (event.target instanceof Element && event.target.closest(".chat-title")) return;
-      void toggleMaximize();
-    } else void appWindow.startDragging();
+    event.stopPropagation();
+    pressed = true;
+  };
+  const handleMove = (event: MouseEvent) => {
+    if (!pressed) return;
+    pressed = false;
+    if (event.buttons & 1) void appWindow.startDragging();
+  };
+  const handleUp = () => { pressed = false; };
+  const handleDoubleClick = (event: MouseEvent) => {
+    if (event.button !== 0 || isInteractive(event.target)) return;
+    if (event.target instanceof Element && event.target.closest(".chat-title")) return;
+    void toggleMaximize();
   };
   let titlebarElement: HTMLElement | undefined;
   onMount(() => {
-    titlebarElement?.addEventListener("mousedown", handleDrag, true);
-    onCleanup(() => titlebarElement?.removeEventListener("mousedown", handleDrag, true));
+    titlebarElement?.addEventListener("mousedown", handleDown, true);
+    titlebarElement?.addEventListener("mousemove", handleMove, true);
+    titlebarElement?.addEventListener("dblclick", handleDoubleClick);
+    window.addEventListener("mouseup", handleUp, true);
+    onCleanup(() => {
+      titlebarElement?.removeEventListener("mousedown", handleDown, true);
+      titlebarElement?.removeEventListener("mousemove", handleMove, true);
+      titlebarElement?.removeEventListener("dblclick", handleDoubleClick);
+      window.removeEventListener("mouseup", handleUp, true);
+    });
   });
 
   return (
