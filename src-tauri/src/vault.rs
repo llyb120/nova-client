@@ -1,5 +1,5 @@
-//! 密码本：`~/.nova/vault.json` 保存账号密码，每条都带“使用条件”，员工需要账号密码时先查它。
-//! 密码落盘时用本机随机密钥（`vault.key`）AES-256-GCM 加密，员工读文件也只看到密文，只能经 `employee` 工具的 vault_* 取用。
+//! 密码本：`~/.nova/vault.json` 保存自由文本凭据（账号密码、密钥等），每条都带“使用条件”。
+//! 凭据落盘时用本机随机密钥（`vault.key`）AES-256-GCM 加密，员工读文件也只看到密文，只能经 `employee` 工具的 vault_* 取用。
 //! 远程员工要本机密码本里的凭据时，用 X25519 密钥协商加密传输（中转站只见密文）；收到的凭据只作为临时条目存放，任务结束即删。
 //! shortcut: 密钥文件与密文同在 ~/.nova，防的是误读与误传而非本机恶意程序；要更强再换系统凭据库（DPAPI / Keychain）。
 //! shortcut: 密钥协商没有身份认证，信任中转站不换公钥；要防恶意中转站就得带外核对指纹。
@@ -18,6 +18,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_ENTRIES: usize = 200;
 const MAX_FIELD_CHARS: usize = 500;
+const MAX_CONTENT_CHARS: usize = 16_000;
 /// 收到的临时凭据超过这么久还在（任务没正常收尾）就清掉。
 const TEMP_TTL_MS: i64 = 24 * 3600 * 1000;
 
@@ -28,8 +29,10 @@ struct Entry {
     name: String,
     /// 使用条件：什么情况下员工才可以用这条凭据（必填）。
     condition: String,
+    /// 兼容旧条目的账号；新凭据整体加密存在 secret 中。
+    #[serde(skip_serializing_if = "String::is_empty")]
     username: String,
-    /// 密码密文（base64 的 nonce‖密文）。
+    /// 凭据内容密文（base64 的 nonce‖密文）。
     secret: String,
     /// 允许经 StarLink 加密发给远程员工。
     share: bool,
@@ -93,7 +96,7 @@ fn b32(s: &str) -> Result<[u8; 32], String> {
 fn local_key() -> Result<[u8; 32], String> {
     let path = dir().join("vault.key");
     if let Ok(raw) = std::fs::read_to_string(&path) {
-        return b32(raw.trim()).map_err(|_| "vault.key 损坏：删除它会让已存的密码无法解密".into());
+        return b32(raw.trim()).map_err(|_| "vault.key 损坏：删除它会让已存的凭据无法解密".into());
     }
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
@@ -127,10 +130,15 @@ fn update<T>(f: impl FnOnce(&mut Book) -> Result<T, String>) -> Result<T, String
     Ok(out)
 }
 
-/// 给界面和模型看的视图：永远不含密码。
+/// 给界面和模型看的视图：永远不含凭据内容。
 fn view(e: &Entry) -> Value {
-    json!({"id": e.id, "name": e.name, "condition": e.condition, "username": e.username, "share": e.share,
+    json!({"id": e.id, "name": e.name, "condition": e.condition, "share": e.share,
         "temp": !e.temp_for.is_empty(), "createdAt": e.created_at, "usedAt": e.used_at, "usedFor": e.used_for})
+}
+
+fn decrypt_content(e: &Entry, key: &[u8; 32]) -> Result<String, String> {
+    let content = String::from_utf8(decrypt(key, b"vault", &e.secret)?).map_err(|_| "凭据内容损坏")?;
+    Ok(if e.username.is_empty() { content } else { format!("账号：{}\n密码：{content}", e.username) })
 }
 
 pub(crate) fn list() -> Result<Vec<Value>, String> {
@@ -142,31 +150,33 @@ pub(crate) fn list() -> Result<Vec<Value>, String> {
     Ok(load()?.entries.iter().map(view).collect())
 }
 
-/// 新增或修改（带 id）：name / condition 必填；修改时 password 留空表示不改。
+/// 新增或修改（带 id）：name / condition 必填；修改时 content 留空表示不改。
 pub(crate) fn save(args: &Value) -> Result<Value, String> {
     let name = text(args, "name", 100)?;
     let condition = text(args, "condition", MAX_FIELD_CHARS)?;
-    if name.is_empty() { return Err("缺少 name（这条密码叫什么、用在哪）".into()); }
-    if condition.is_empty() { return Err("缺少 condition：每条密码都要写明什么情况下员工才可以使用".into()); }
-    let username = text(args, "username", 200)?;
-    let password = args["password"].as_str().unwrap_or_default();
-    if password.chars().count() > 1000 { return Err("password 太长".into()); }
+    if name.is_empty() { return Err("缺少 name（这条凭据叫什么、用在哪）".into()); }
+    if condition.is_empty() { return Err("缺少 condition：每条凭据都要写明什么情况下员工才可以使用".into()); }
+    let content = match args.get("content") {
+        None => "",
+        Some(value) => value.as_str().ok_or("content 必须为文本")?,
+    };
+    if content.chars().count() > MAX_CONTENT_CHARS { return Err(format!("content 太长（最多 {MAX_CONTENT_CHARS} 字）")); }
     let share = args["share"].as_bool();
     let key = local_key()?;
     let id = args["id"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     update(|b| {
-        let secret = if password.is_empty() { None } else { Some(encrypt(&key, b"vault", password.as_bytes())?) };
+        let secret = if content.is_empty() { None } else { Some(encrypt(&key, b"vault", content.as_bytes())?) };
         if let Some(id) = &id {
-            let e = b.entries.iter_mut().find(|e| e.id == *id).ok_or("没有这条密码")?;
-            (e.name, e.condition, e.username) = (name, condition, username);
-            if let Some(s) = secret { e.secret = s; }
+            let e = b.entries.iter_mut().find(|e| e.id == *id).ok_or("没有这条凭据")?;
+            (e.name, e.condition) = (name, condition);
+            if let Some(s) = secret { e.secret = s; e.username.clear(); }
             if let Some(v) = share { e.share = v; }
             return Ok(json!({"ok": true, "id": id}));
         }
-        let secret = secret.ok_or("新增密码需要 password")?;
+        let secret = secret.ok_or("新增凭据需要 content")?;
         if b.entries.len() >= MAX_ENTRIES { return Err(format!("密码本最多 {MAX_ENTRIES} 条")); }
         let id = format!("v{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        b.entries.push(Entry { id: id.clone(), name, condition, username, secret, share: share.unwrap_or(false), created_at: now(), ..Default::default() });
+        b.entries.push(Entry { id: id.clone(), name, condition, secret, share: share.unwrap_or(false), created_at: now(), ..Default::default() });
         Ok(json!({"ok": true, "id": id}))
     })
 }
@@ -175,20 +185,20 @@ pub(crate) fn delete(id: &str) -> Result<(), String> {
     update(|b| {
         let before = b.entries.len();
         b.entries.retain(|e| e.id != id);
-        if before == b.entries.len() { Err("没有这条密码".into()) } else { Ok(()) }
+        if before == b.entries.len() { Err("没有这条凭据".into()) } else { Ok(()) }
     })
 }
 
-/// 员工取用：返回账号密码，同时记下用途。使用条件是否满足由调用方（员工）按条件原文判断，随结果一并带回。
+/// 员工取用：返回凭据内容，同时记下用途。使用条件是否满足由调用方（员工）按条件原文判断，随结果一并带回。
 pub(crate) fn get(id: &str, purpose: &str) -> Result<Value, String> {
     let key = local_key()?;
     update(|b| {
-        let e = b.entries.iter_mut().find(|e| e.id == id).ok_or("没有这条密码，先 vault_list 查看")?;
-        let password = String::from_utf8(decrypt(&key, b"vault", &e.secret)?).map_err(|_| "密码内容损坏")?;
+        let e = b.entries.iter_mut().find(|e| e.id == id).ok_or("没有这条凭据，先 vault_list 查看")?;
+        let content = decrypt_content(e, &key)?;
         e.used_at = now();
         e.used_for = purpose.chars().take(100).collect();
-        Ok(json!({"name": e.name, "condition": e.condition, "username": e.username, "password": password,
-            "next": "仅当当前这件事符合上面的使用条件才可以使用；密码只用于输入，不要写进回复、备注、记忆或交接说明。"}))
+        Ok(json!({"name": e.name, "condition": e.condition, "content": content,
+            "next": "仅当当前这件事符合上面的使用条件才可以使用；凭据内容只用于当前授权操作，不要写进回复、备注、记忆或交接说明。"}))
     })
 }
 
@@ -211,13 +221,14 @@ pub(crate) fn valid_pk(pk: &str) -> bool {
 pub(crate) fn seal_for(id: &str, req_id: &str, their_pk: &str) -> Result<(String, Value), String> {
     let their = b32(their_pk)?;
     let key = local_key()?;
-    let entry = load()?.entries.into_iter().find(|e| e.id == id).ok_or("没有这条密码")?;
+    let entry = load()?.entries.into_iter().find(|e| e.id == id).ok_or("没有这条凭据")?;
     if !entry.share { return Err(format!("「{}」没有设为允许发给远程员工，不能发送", entry.name)); }
     if !entry.temp_for.is_empty() { return Err("临时凭据不能再转发".into()); }
-    let password = String::from_utf8(decrypt(&key, b"vault", &entry.secret)?).map_err(|_| "密码内容损坏")?;
+    let content = decrypt_content(&entry, &key)?;
     let eph = StaticSecret::random_from_rng(OsRng);
     let k = shared_key(eph.to_bytes(), their);
-    let plain = json!({"name": entry.name, "username": entry.username, "password": password}).to_string();
+    // 保留旧传输字段名，让旧版本接收端也能收到完整内容。
+    let plain = json!({"name": entry.name, "password": content}).to_string();
     let sealed = json!({"epk": B64.encode(PublicKey::from(&eph).as_bytes()), "data": encrypt(&k, req_id.as_bytes(), plain.as_bytes())?});
     update(|b| {
         if let Some(e) = b.entries.iter_mut().find(|e| e.id == id) { e.used_at = now(); e.used_for = "加密发给远程员工".into(); }
@@ -295,10 +306,25 @@ mod tests {
     }
 
     #[test]
-    fn entries_never_expose_the_password_and_need_a_condition() {
-        let e = Entry { id: "v1".into(), name: "n".into(), condition: "c".into(), secret: "xxx".into(), ..Default::default() };
-        assert!(!view(&e).to_string().contains("xxx"));
-        assert!(save(&json!({"name": "n", "password": "p"})).is_err());
+    fn freeform_content_preserves_whitespace_and_legacy_accounts() {
+        let key = [7u8; 32];
+        let content = "  -----BEGIN PRIVATE KEY-----\n密钥内容\n-----END PRIVATE KEY-----\n";
+        let e = Entry { secret: encrypt(&key, b"vault", content.as_bytes()).unwrap(), ..Default::default() };
+        assert_eq!(decrypt_content(&e, &key).unwrap(), content);
+        let legacy: Entry = serde_json::from_value(json!({"username": "alice", "secret": encrypt(&key, b"vault", b" p ").unwrap()})).unwrap();
+        assert_eq!(decrypt_content(&legacy, &key).unwrap(), "账号：alice\n密码： p ");
+        assert!(decrypt_content(&e, &[8u8; 32]).is_err());
+    }
+
+    #[test]
+    fn entries_never_expose_content_and_validate_inputs() {
+        let e = Entry { id: "v1".into(), name: "n".into(), condition: "c".into(), username: "alice".into(), secret: "xxx".into(), ..Default::default() };
+        let listed = view(&e);
+        assert!(listed.get("username").is_none() && listed.get("content").is_none() && listed.get("secret").is_none());
+        assert!(!listed.to_string().contains("xxx"));
+        assert!(save(&json!({"name": "n", "content": "p"})).is_err());
+        assert!(save(&json!({"name": "n", "condition": "c", "content": 123})).unwrap_err().contains("content 必须为文本"));
+        assert!(save(&json!({"name": "n", "condition": "c", "content": "x".repeat(MAX_CONTENT_CHARS + 1)})).unwrap_err().contains("content 太长"));
         assert!(valid_pk(&B64.encode([7u8; 32])) && !valid_pk("abc"));
     }
 }
