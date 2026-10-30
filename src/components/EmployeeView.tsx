@@ -13,11 +13,11 @@ import VaultPop from "./VaultPop";
 
 /** 交代的人；token 为空是员工所在机器的用户。 */
 type Owner = { token: string; name: string };
-type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; times?: string[]; events?: string[]; nextCheckAt: number; lastRunAt: number; lastResult: string; owner?: Owner };
+type Duty = { id: string; text: string; enabled: boolean; manual?: boolean; note: string; everyMinutes: number; times?: string[]; events?: string[]; nextCheckAt: number; lastRunAt: number; lastResult: string; owner?: Owner };
 /** 任务是扁平的：origin 派生出它的任务（只用于展示）、fromDuty 派生它的职责、progress 它自己标记的进度（最后一条是当前步骤）；status 非空为已收尾（在 finished 里）。
  *  parent / after / relayed / planning 只在旧版任务树数据里出现。 */
 type Todo = { id: string; text: string; confirm: boolean; dutyId?: string; fromDuty?: string; key?: string; failures?: number; profile?: string; createdAt: number; threadId?: string | null; nextCheckAt?: number; desktop?: boolean; askAfter?: number;
-  owner?: Owner; waiting?: string; replyTo?: { token: string; name: string; id: string } | null; shot?: string; progress?: { at: number; text: string }[]; plan?: PlanEntry[]; planStep?: number;
+  owner?: Owner; waiting?: string; approval?: string; replyTo?: { token: string; name: string; id: string } | null; shot?: string; progress?: { at: number; text: string }[]; plan?: PlanEntry[]; planStep?: number;
   parent?: string; after?: string[]; origin?: string; branch?: string; status?: string; result?: string; finishedAt?: number; relayed?: boolean; planning?: boolean; checkpoint?: string };
 const from = (o?: Owner) => (o?.token ? o.name || o.token : "");
 /** chain：同一任务接力出的各段会话共用的首段会话 id，旧记录为空（自成一组）。 */
@@ -62,13 +62,16 @@ const time = (ms: number) => (ms ? new Date(ms).toLocaleString(undefined, { mont
 const [tab, setTab] = createSignal<"local" | "team">("local");
 const [peer, setPeer] = createSignal<Peer | null>(null);
 
+function EmployeeTabs() {
+  return <div class="employee-tabs" role="group" aria-label="数字员工范围">
+    <button type="button" aria-pressed={tab() === "local"} onClick={() => setTab("local")}>本机</button>
+    <button type="button" aria-pressed={tab() === "team"} onClick={() => setTab("team")}>团队</button>
+  </div>;
+}
+
 export default function EmployeeView() {
   return (
     <div class="employee-page">
-      <div class="employee-tabs" role="tablist" aria-label="数字员工">
-        <button type="button" role="tab" aria-selected={tab() === "local"} onClick={() => setTab("local")}>本机</button>
-        <button type="button" role="tab" aria-selected={tab() === "team"} onClick={() => setTab("team")}>团队</button>
-      </div>
       <Show when={tab() === "team"} fallback={<EmployeeBoard />}>
         <Show when={peer()} keyed fallback={<TeamList onPick={setPeer} />}>
           {(p) => <EmployeeBoard peer={p} onBack={() => setPeer(null)} />}
@@ -95,7 +98,7 @@ function TeamList(props: { onPick: (peer: Peer) => void }) {
     <div class="employee-content">
       <TitleBarPortal><header class="employee-header">
         <div>
-          <div class="employee-title"><h1>团队的数字员工</h1></div>
+          <div class="employee-title"><EmployeeTabs /></div>
           <p class="employee-hint">团队成员公开的员工（StarLink），在对方电脑或云端按同样的规则运行。你交代的事缺信息时会请你或你的本地员工补充，待确认事项由你批准。</p>
         </div>
         <div class="employee-header-actions"><button type="button" onClick={probe}>刷新</button></div>
@@ -154,6 +157,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
   const [addingDuty, setAddingDuty] = createSignal(false);
   const [historyFilter, setHistoryFilter] = createSignal("all");
   const [historyLimit, setHistoryLimit] = createSignal(SHOWN);
+  const [section, setSection] = createSignal<"tasks" | "duties" | "history">("tasks");
   const [transcript, setTranscript] = createSignal<Transcript | null>(null);
   // 右侧详情选中的任务 / 职责 / 会话；模块级的不用：换了员工（团队）就该重新选。
   const [pick, setPick] = createSignal<Pick | null>(null);
@@ -197,7 +201,10 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
   };
 
   return (
-      <Show when={data()} fallback={<p class="employee-empty">{failed() || "加载中…"}</p>}>
+      <Show when={data()} fallback={<>
+        <TitleBarPortal><header class="employee-header"><div class="employee-title"><EmployeeTabs /></div></header></TitleBarPortal>
+        <p class="employee-empty">{failed() || "加载中…"}</p>
+      </>}>
         {(snap) => {
           const e = () => snap().employee;
           const label = (r: Run) => r.label || flat(e().duties.find((d) => d.id === r.dutyId)?.text ?? "") || LEGACY[r.dutyId] || r.dutyId;
@@ -229,7 +236,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
           const sequenceRow = (top: Todo): Row => {
             const all = sequences().members.get(top.id)!;
             const states = all.map(stateOf);
-            const state = ["planning", "running", "queued", "help", "deferred"].find((s) => states.includes(s))
+            const state = ["planning", "running", "queued", "confirm", "help", "deferred"].find((s) => states.includes(s))
               ?? (top.status && all.some((t) => !t.status) ? "kids" : stateOf(top));
             const finished = states.filter((s) => s === "done").length;
             const desk = snap().tasks.find((x) => x.desktop && all.some((t) => t.id === x.itemId))?.desktop;
@@ -247,7 +254,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
             const state = task ? (task.queued ? "queued" : "running") : !r.status || r.status === "done" ? "done" : ["failed", "cancelled"].includes(r.status) ? r.status : "stopped";
             return { key: r.threadId, title: label(r), state, meta: time(g[0].at), pick: { kind: "run", id: r.threadId } };
           };
-          const RANK: Record<string, number> = { planning: 0, running: 0, queued: 1, help: 2, kids: 3, relayed: 3, resume: 4, deferred: 5, deps: 5, future: 6 };
+          const RANK: Record<string, number> = { planning: 0, running: 0, queued: 1, confirm: 2, help: 2, kids: 3, relayed: 3, resume: 4, deferred: 5, deps: 5, future: 6 };
           const active = (top: Todo) => sequences().members.get(top.id)!.some((t) => !t.status);
           // 任务：还没收尾的独立序列，加上不在任务树里、正在跑的会话（对员工说、已批准的事项）。
           const taskRows = createMemo(() => [
@@ -260,10 +267,16 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
             ...groups().filter((g) => !live(last(g)) && !nodeOf(last(g).dutyId)).map((g) => ({ row: runRow(g), at: last(g).ended ?? last(g).at })),
           ].sort((a, b) => b.at - a.at).map((x) => x.row));
           const filteredRows = createMemo(() => recentRows().filter((r) => historyFilter() === "all" || r.state === historyFilter()));
+          const selectSection = (value: "tasks" | "duties" | "history") => {
+            setSection(value);
+            setPick(value === "tasks" ? taskRows()[0]?.pick ?? null
+              : value === "duties" ? (duties()[0] ? { kind: "duty", id: duties()[0].id } : null)
+              : recentRows()[0]?.pick ?? null);
+          };
           const dutyRow = (duty: Duty): Row => {
             const tasks = tops().filter((t) => active(t) && (t.dutyId === duty.id || t.fromDuty === duty.id));
             const due = snap().dues?.[duty.id] ?? 0;
-            const meta = !duty.enabled ? "已停用" : [tasks.length ? `${tasks.length} 轮处理中` : "", due ? `下次 ${time(due)}` : duty.events?.length ? "等事件触发" : tasks.length ? "" : "未安排"].filter(Boolean).join(" · ");
+            const meta = !duty.enabled ? "已停用" : [tasks.length ? `${tasks.length} 轮处理中` : "", duty.manual ? "不定时 · 不自动触发" : due ? `下次 ${time(due)}` : duty.events?.length ? "等事件触发" : tasks.length ? "" : "未安排"].filter(Boolean).join(" · ");
             return { key: duty.id, title: flat(duty.text), state: !duty.enabled ? "stopped" : tasks.length ? sequenceRow(tasks[tasks.length - 1]).state : "future", meta, pick: { kind: "duty", id: duty.id } };
           };
           // 右侧详情：选中的已不存在时回到第一项任务（没有就第一条职责）。
@@ -271,10 +284,26 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
             const p = pick();
             const exists = p && (p.kind === "duty" ? e().duties.some((d) => d.id === p.id) : p.kind === "task" ? !!nodeOf(p.id) : e().runs.some((r) => r.threadId === p.id));
             if (exists) return p;
-            return taskRows()[0]?.pick ?? (duties()[0] ? { kind: "duty", id: duties()[0].id } : recentRows()[0]?.pick ?? null);
+            if (section() === "duties") return duties()[0] ? { kind: "duty", id: duties()[0].id } : null;
+            if (section() === "history") return recentRows()[0]?.pick ?? null;
+            return taskRows()[0]?.pick ?? null;
           });
           const currentKey = createMemo(() => { const c = current(); return c ? `${c.kind}:${c.id}` : ""; });
-          const row = (r: Row) => <RowItem row={r} active={currentKey() === `${r.pick.kind}:${r.pick.id}`} onPick={() => setPick(r.pick)} />;
+          const row = (r: Row) => <RowItem row={r} active={currentKey() === `${r.pick.kind}:${r.pick.id}`
+            || r.pick.kind === "task" && current()?.kind === "task" && sequences().rootById.get(current()!.id)?.id === r.pick.id} onPick={() => setPick(r.pick)} />;
+          const jumpTask = (id: string) => {
+            const root = sequences().rootById.get(id);
+            if (!root) { showToast("这项任务记录已清理"); return; }
+            batch(() => {
+              setSection(active(root) ? "tasks" : "history");
+              if (!active(root)) {
+                setHistoryFilter("all");
+                setHistoryLimit(Math.max(historyLimit(), recentRows().findIndex((r) => r.key === root.id) + 1));
+              }
+              setPick({ kind: "task", id });
+              setTranscript(null);
+            });
+          };
           const treeProps = { now, open, act, run, local: !peer, me };
           const dutyDetail = (id: string) => {
             const duty = () => e().duties.find((d) => d.id === id);
@@ -320,21 +349,36 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
           };
 
           return (
-            <div class="employee-content">
+            <div class="employee-content" ref={(el) => {
+              const relink = () => {
+                if (!el.isConnected) return;
+                observer.disconnect();
+                linkTaskReferences(el, sequences().byId);
+                observer.observe(el, { childList: true, subtree: true, characterData: true });
+              };
+              const observer = new MutationObserver(relink);
+              createEffect(() => { sequences(); queueMicrotask(relink); });
+              onCleanup(() => observer.disconnect());
+            }} onClick={(ev) => {
+              const id = (ev.target as Element).closest<HTMLAnchorElement>("a[data-employee-task]")?.dataset.employeeTask;
+              if (!id) return;
+              ev.preventDefault();
+              jumpTask(id);
+              const detail = ev.currentTarget.querySelector<HTMLElement>(".employee-detail");
+              if (detail) { detail.scrollTop = 0; detail.focus({ preventScroll: true }); }
+            }}>
               {/* 一行头部：标题、状态、开关与不常用的设置/记忆（弹出），把纵向空间留给看板。 */}
               <TitleBarPortal><header class="employee-header">
                 <div class="employee-title">
                   <Show when={props.onBack}>{(back) => <button type="button" aria-label="返回团队列表" onClick={() => back()()}>←</button>}</Show>
-                  <h1 title={peer ? "你交代的事归你：缺信息时会请你或你的本地员工补充，待确认事项由你或员工主人批准" : undefined}>{peer ? `${peer.name} 的数字员工` : "数字员工"}</h1>
-                  <span class={`employee-badge ${snap().status}`}>{STATUS[snap().status]}</span>
-                  <span class="employee-chip">下次触发<strong>{time(snap().nextCheckAt)}</strong></span>
-                  <span class="employee-chip">进行中<strong>{running().length} / {snap().parallel}</strong></span>
-                  <Show when={(e().desktopAskAfter ?? 0) > now()}><span class="employee-chip" title="所有电脑任务共用冷却期；期间新申请自动拒绝并刷新 5 分钟，不弹窗、不接管；轻量和编码任务照常执行">电脑暂停至<strong>{time(e().desktopAskAfter!)}</strong></span></Show>
+                  <Show when={peer}><h1 title="你交代的事归你：缺信息时会请你或你的本地员工补充，待确认事项由你或员工主人批准">{peer!.name} 的数字员工</h1></Show>
+                  <EmployeeTabs />
+                  <span class={`employee-badge ${snap().status}`} title={`执行中 ${running().length} / ${snap().parallel} · 下次触发 ${time(snap().nextCheckAt)}${(e().desktopAskAfter ?? 0) > now() ? ` · 电脑暂停至 ${time(e().desktopAskAfter!)}` : ""}`}>{running().length ? `${running().length} 项执行中` : STATUS[snap().status]}</span>
+                  <Show when={confirms().length + waits().length}><button type="button" class="employee-attention-link" onClick={() => selectSection("tasks")}>{confirms().length + waits().length} 项待处理</button></Show>
                 </div>
                 <div class="employee-header-actions">
                   <Show when={!peer}><label class="employee-toggle"><input type="checkbox" role="switch" checked={e().enabled}
                     onChange={(ev) => void set({ enabled: ev.currentTarget.checked })} /> 自动值班</label></Show>
-                  <button type="button" title="不等触发时间，立即开始一件已到点的事项" onClick={() => void act("check")}>执行到点事项</button>
                   <details class="employee-pop employee-memory">
                     <summary>记忆 <span class="employee-count">{e().memories?.length ?? 0}</span></summary>
                     <div>
@@ -387,47 +431,67 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
 
               <div class="employee-layout">
                 <aside class="employee-side" aria-label="任务与职责">
+                  <nav class="employee-nav" aria-label="工作分类">
+                    <button type="button" aria-pressed={section() === "tasks"} onClick={() => selectSection("tasks")}>任务 <span>{taskRows().length}</span></button>
+                    <button type="button" aria-pressed={section() === "duties"} onClick={() => selectSection("duties")}>职责</button>
+                    <button type="button" aria-pressed={section() === "history"} onClick={() => selectSection("history")}>记录</button>
+                  </nav>
+                  <div class="employee-side-list">
+                    <Show when={section() === "tasks"}>
+                      <Show when={confirms().length + waits().length}>
+                        <section class="employee-section employee-attention" aria-labelledby="employee-sec-attention">
+                          <h2 id="employee-sec-attention">需要你处理 <span class="employee-count is-alert">{confirms().length + waits().length}</span></h2>
+                          <For each={confirms()}>{(item) => <ConfirmCard item={item} me={me} run={run} act={act} open={open} />}</For>
+                          <For each={waits()}>{(item) => <HelpCard item={item} me={me} run={run} open={open} local={!peer} />}</For>
+                        </section>
+                      </Show>
+                      <section class="employee-section employee-current-section" aria-labelledby="employee-sec-tasks">
+                        <h2 id="employee-sec-tasks" title={`最多同时进行 ${snap().parallel} 项，只有操作电脑时排队`}>当前任务
+                          <button type="button" class="employee-text-button" title="立即开始一件已到点的事项" onClick={() => void act("check")}>执行到点事项</button>
+                        </h2>
+                        <Show when={taskRows().length} fallback={<p class="employee-empty employee-empty-inline">暂无任务，在下方交给员工一件事。</p>}>
+                          <div class="employee-rows"><For each={taskRows()}>{row}</For></div>
+                        </Show>
+                      </section>
+                    </Show>
+                    <Show when={section() === "duties"}>
+                      <section class="employee-section" aria-labelledby="employee-sec-duties">
+                        <h2 id="employee-sec-duties" title="做什么 + 何时触发；每次触发生成一项任务">职责 <span class="employee-count">{e().duties.length}</span>
+                          <Show when={!peer && !addingDuty()}><button type="button" class="employee-text-button" onClick={() => setAddingDuty(true)}>+ 新增</button></Show>
+                        </h2>
+                        <Show when={addingDuty()}><DutyForm run={run} onClose={() => setAddingDuty(false)} /></Show>
+                        <Show when={duties().length} fallback={<p class="employee-empty employee-empty-inline">暂无职责，可新增定期或事件触发的安排。</p>}>
+                          <div class="employee-rows"><For each={duties()}>{(d) => row(dutyRow(d))}</For></div>
+                        </Show>
+                      </section>
+                    </Show>
+                    <Show when={section() === "history"}>
+                      <section class="employee-section" aria-labelledby="employee-sec-recent">
+                        <h2 id="employee-sec-recent">任务记录 <span class="employee-count">{filteredRows().length}</span></h2>
+                        <div class="employee-history-filters" role="group" aria-label="筛选任务记录">
+                          <For each={HISTORY_FILTERS}>{([value, label]) => <button type="button" aria-pressed={historyFilter() === value}
+                            onClick={() => { setHistoryFilter(value); setHistoryLimit(SHOWN); }}>{label}</button>}</For>
+                        </div>
+                        <Show when={filteredRows().length} fallback={<p class="employee-hint">暂无{historyFilter() === "all" ? "" : HISTORY_FILTERS.find(([value]) => value === historyFilter())?.[1]}记录。</p>}>
+                          <div class="employee-rows"><For each={filteredRows().slice(0, historyLimit())}>{row}</For></div>
+                          <Show when={filteredRows().length > historyLimit()}><button type="button" class="employee-text-button" onClick={() => setHistoryLimit((n) => n + SHOWN)}>显示更多</button></Show>
+                        </Show>
+                        <p class="employee-hint">任务与运行记录各保留最近 200 条；删除记录后无法恢复。</p>
+                      </section>
+                    </Show>
+                  </div>
                   <form class="employee-say" onSubmit={(ev) => { ev.preventDefault(); void send(); }}>
+                    <label for="employee-message">交给员工一件事</label>
                     <textarea id="employee-message" ref={sayInput} rows={2} aria-label={peer ? `交给 ${peer.name} 的员工一件事` : "交给员工一件事"} title="Enter 发送，Shift+Enter 换行"
-                      placeholder={`${peer ? `交给 ${peer.name} 的员工一件事` : "交给员工一件事"}：派活、新增职责或修改安排，Enter 发送`}
+                      placeholder="描述任务，或修改安排…"
                       value={say()} onInput={(ev) => setSay(ev.currentTarget.value)}
                       onKeyDown={(ev) => { if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); void send(); } }} />
-                    <button type="submit" class="employee-primary" disabled={busy() || !say().trim()}>{busy() ? "发送中…" : "发送"}</button>
-                  </form>
-                  <Show when={confirms().length + waits().length}>
-                    <section class="employee-section" aria-labelledby="employee-sec-attention">
-                      <h2 id="employee-sec-attention">需要你处理 <span class="employee-count is-alert">{confirms().length + waits().length}</span></h2>
-                      <For each={confirms()}>{(item) => <ConfirmCard item={item} me={me} run={run} act={act} open={open} />}</For>
-                      <For each={waits()}>{(item) => <HelpCard item={item} me={me} run={run} open={open} local={!peer} />}</For>
-                    </section>
-                  </Show>
-                  <section class="employee-section" aria-labelledby="employee-sec-tasks">
-                    <h2 id="employee-sec-tasks" title={`最多同时进行 ${snap().parallel} 项，只有操作电脑时排队`}>任务 <span class="employee-count">{taskRows().length}</span></h2>
-                    <Show when={taskRows().length} fallback={<p class="employee-hint">暂无。<button type="button" class="employee-text-button" onClick={() => sayInput?.focus()}>交给员工一件事</button></p>}>
-                      <div class="employee-rows"><For each={taskRows()}>{row}</For></div>
-                    </Show>
-                  </section>
-                  <section class="employee-section" aria-labelledby="employee-sec-duties">
-                    <h2 id="employee-sec-duties" title="做什么 + 何时触发；每次触发生成一项任务">职责 <span class="employee-count">{e().duties.length}</span>
-                      <Show when={!peer && !addingDuty()}><button type="button" class="employee-text-button" onClick={() => setAddingDuty(true)}>+ 新增</button></Show>
-                    </h2>
-                    <Show when={addingDuty()}><DutyForm run={run} onClose={() => setAddingDuty(false)} /></Show>
-                    <div class="employee-rows"><For each={duties()}>{(d) => row(dutyRow(d))}</For></div>
-                  </section>
-                  <section class="employee-section" aria-labelledby="employee-sec-recent">
-                    <h2 id="employee-sec-recent">任务记录 <span class="employee-count">{filteredRows().length}</span></h2>
-                    <div class="employee-history-filters" role="group" aria-label="筛选任务记录">
-                      <For each={HISTORY_FILTERS}>{([value, label]) => <button type="button" aria-pressed={historyFilter() === value}
-                        onClick={() => { setHistoryFilter(value); setHistoryLimit(SHOWN); }}>{label}</button>}</For>
+                    <div class="employee-say-footer"><small>Enter 发送 · Shift+Enter 换行</small>
+                      <button type="submit" class="employee-primary" disabled={busy() || !say().trim()}>{busy() ? "发送中…" : "交给员工"}</button>
                     </div>
-                    <Show when={filteredRows().length} fallback={<p class="employee-hint">暂无{historyFilter() === "all" ? "" : HISTORY_FILTERS.find(([value]) => value === historyFilter())?.[1]}记录。</p>}>
-                      <div class="employee-rows"><For each={filteredRows().slice(0, historyLimit())}>{row}</For></div>
-                      <Show when={filteredRows().length > historyLimit()}><button type="button" class="employee-text-button" onClick={() => setHistoryLimit((n) => n + SHOWN)}>显示更多</button></Show>
-                    </Show>
-                    <p class="employee-hint">任务与运行记录各保留最近 200 条；删除记录后无法恢复。</p>
-                  </section>
+                  </form>
                 </aside>
-                <section class="employee-detail" aria-label="详情">
+                <section class="employee-detail" aria-label="详情" tabIndex={-1}>
                   <Show when={currentKey()} keyed fallback={<p class="employee-hint">从左边选一个任务或职责，这里会画出它的任务树。</p>}>
                     {(_key) => {
                       const c = current()!;
@@ -478,7 +542,7 @@ function TaskRecordActions(props: { task: Todo; me: string; act: Act }) {
         title="保留原会话、计划与恢复点；先核对实际进度，只继续未完成部分。所属职责须先启用。"
         onClick={() => void restore(false)}>{pending() === "resume" ? "正在恢复…" : "继续执行"}</button>
     </Show>
-    <button type="button" disabled={!!pending() || !mine()} title={mine() ? "新建任务，旧记录不变；所属职责须先启用" : "仅交代这项任务的人或员工主人能操作"}
+    <button type="button" class="employee-secondary-action" classList={{ "employee-approve": props.task.status === "done" || !!props.task.parent }} disabled={!!pending() || !mine()} title={mine() ? "新建任务，旧记录不变；所属职责须先启用" : "仅交代这项任务的人或员工主人能操作"}
       onClick={() => void restore(true)}>{pending() === "restart" ? "正在派发…" : "重新派发"}</button>
   </>;
 }
@@ -496,7 +560,7 @@ function DeleteTaskButton(props: { id: string; act: Act }) {
     } catch (error) { showToast(String(error)); }
     finally { setDeleting(false); }
   };
-  return <button type="button" disabled={deleting()} onClick={() => void remove()}>{deleting() ? "正在删除…" : "删除记录"}</button>;
+  return <button type="button" class="employee-danger" disabled={deleting()} onClick={() => void remove()}>{deleting() ? "正在删除…" : "删除记录"}</button>;
 }
 
 /** 补充信息：等补充的任务（交代的人填），或替团队员工补充的本地待办（直接回复并回传）。 */
@@ -600,6 +664,7 @@ const NODE: Record<string, { label: string; color: string; virtual?: boolean }> 
   planning: { label: "规划中", color: "--accent" },
   running: { label: "执行中", color: "--accent" },
   queued: { label: "等电脑", color: "--seal" },
+  confirm: { label: "等待批准", color: "--seal" },
   help: { label: "等补充信息", color: "--seal" },
   deferred: { label: "等待外部结果", color: "--text-dim", virtual: true },
   kids: { label: "等子任务", color: "--accent" },
@@ -621,6 +686,7 @@ function nodeState(t: Todo, nodes: Todo[], tasks: Task[], now: number) {
     if (!owner || owner.status === "done") return "unverified";
     return nodeState(owner, nodes, tasks, now);
   }
+  if (t.approval) return "confirm";
   const task = tasks.find((x) => x.itemId === t.id);
   if (task) return task.queued ? "queued" : t.planning ? "planning" : "running";
   if (t.relayed) return "relayed";
@@ -727,6 +793,37 @@ function layoutTree(top: Todo | undefined, nodes: Todo[]) {
 /** 线型只表达是否走到该步骤；依赖关系本身不是“虚线”。 */
 function flowDash(target: Todo) {
   return target.threadId || target.status === "done" || target.status === "failed" ? [] : [5, 4];
+}
+
+function linkTaskReferences(container: HTMLElement, byId: ReadonlyMap<string, Todo>) {
+  for (const link of container.querySelectorAll<HTMLAnchorElement>("a[data-employee-task]")) {
+    if (!byId.has(link.dataset.employeeTask!)) link.replaceWith(document.createTextNode(link.textContent ?? ""));
+  }
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+  const nodes: Text[] = [];
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    if (node.parentElement?.closest(".employee-transcript-result") && !node.parentElement.closest("pre, a, button, svg")) nodes.push(node);
+  }
+  for (const node of nodes) {
+    const matches = [...node.data.matchAll(/(?<![\w/\\])t\d+(?![\w/\\])/g)].filter((m) => byId.has(m[0]));
+    if (!matches.length) continue;
+    const fragment = document.createDocumentFragment();
+    let end = 0;
+    for (const match of matches) {
+      const id = match[0];
+      const link = document.createElement("a");
+      link.href = `#employee-task-${id}`;
+      link.dataset.employeeTask = id;
+      link.className = "employee-task-link";
+      link.title = `跳转到任务 ${id}`;
+      link.textContent = id;
+      fragment.append(node.data.slice(end, match.index), link);
+      end = match.index + id.length;
+    }
+    fragment.append(node.data.slice(end));
+    node.replaceWith(fragment);
+  }
 }
 
 /** origin 是独立序列，停止范围只沿 parent 上溯。 */
@@ -896,25 +993,42 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
     try { await props.act("sequence_stop", root.id); } finally { setStopping(false); }
   };
   return (
-    <div class="employee-tree">
+    <div class="employee-tree" classList={{ "employee-tree-single": !top()?.plan?.length && members().length <= 1 }}>
       <div class="employee-detail-head">
-        <h2>{flat(top()?.text ?? "")}</h2>
-        <small>{counts()}</small>
-        <Show when={!top()?.plan?.length && members().length <= 1}><small>尚未登记步骤计划；下次执行需补录完整流程，旧日志不代表未来步骤。</small></Show>
-        <div class="employee-item-actions">
+        <div class="employee-detail-heading">
+          <span class="employee-eyebrow">{top()?.status ? "任务记录" : "当前任务"}</span>
+          <h2 title={flat(top()?.text ?? "")}>{flat(top()?.text.split(/\r?\n/)[0] ?? "")}</h2>
+          <small>{counts()}</small>
+        </div>
+        <div class="employee-item-actions employee-task-toolbar" aria-label="任务操作">
+          <Show when={!props.readonly && top()?.status && ["done", "stopped", "failed", "cancelled"].includes(top()!.status!)}>
+            <TaskRecordActions task={top()!} me={props.me} act={props.act} />
+          </Show>
           <Show when={canStop()}><button type="button" class="employee-sequence-stop" disabled={stopping()}
             title="停止选中的任务；保留已完成成果，不影响其它任务和职责下次触发。已提交的外部作业不会自动取消。"
             onClick={() => void stopSequence()}>{stopping() ? "正在停止…" : "停止任务"}</button></Show>
-          <Show when={!props.readonly && top()}><DeleteTaskButton id={top()!.id} act={props.act} /></Show>
+          <Show when={!props.readonly && top()}>
+            <details class="employee-more employee-task-more">
+              <summary aria-label="更多任务操作">⋯</summary>
+              <div><DeleteTaskButton id={top()!.id} act={props.act} /></div>
+            </details>
+          </Show>
         </div>
+        <Show when={!top()?.plan?.length && members().length <= 1}><small class="employee-plan-hint">尚未登记步骤计划；下次执行需补录完整流程，旧日志不代表未来步骤。</small></Show>
       </div>
-      <div class="employee-tree-legend" aria-hidden="true">
-        <span>实线：已开始的流程 · 虚线：未执行 · 并排：可并行</span>
-        <For each={Object.values(NODE)}>{(look) => <span><i classList={{ virtual: !!look.virtual }} style={{ "--c": `var(${look.color})` }} />{look.label}</span>}</For>
-      </div>
+      <Show when={top()?.plan?.length || members().length > 1}>
+      <details class="employee-tree-guide">
+        <summary>流程图说明</summary>
+        <div class="employee-tree-legend" aria-hidden="true">
+          <span>实线：已开始的流程 · 虚线：未执行 · 并排：可并行</span>
+          <For each={Object.values(NODE)}>{(look) => <span><i classList={{ virtual: !!look.virtual }} style={{ "--c": `var(${look.color})` }} />{look.label}</span>}</For>
+        </div>
+      </details>
       <div class="employee-tree-canvas">
+        <div class="employee-pane-title">执行流程 <small>点击步骤查看详情</small></div>
         <canvas ref={canvas} role="img" aria-label={`任务树：${counts()}。${displayNodes().map((t) => `${t.text}：${NODE[state(t)].label}`).join("；")}。点节点查看详情`} onClick={pick} />
       </div>
+      </Show>
       <Show when={sel()}>{(t) => {
         const s = () => state(t());
         const task = () => taskOf(t().id);
@@ -927,6 +1041,7 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
         };
         return (
           <div class="employee-tree-detail">
+            <div class="employee-pane-title">任务详情</div>
             <Show when={planSelection()}>{(step) => <div class="employee-note"><strong>{NODE[state(step())].label} · {step().text}</strong></div>}</Show>
             <div class="employee-task-tags">
               <span class="employee-tag" style={{ color: `var(${NODE[s()].color})` }}>{NODE[s()].label}</span>
@@ -945,11 +1060,14 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
             </Show>
             <Show when={t().waiting}><small class="employee-note">在等补充：{t().waiting}</small></Show>
             <Show when={t().progress?.length}>
-              <ol class="employee-progress" aria-label="进度">
-                <For each={t().progress}>{(p, i) => (
-                  <li classList={{ current: !t().status && i() === t().progress!.length - 1 }}><small>{time(p.at)}</small> {p.text}</li>
-                )}</For>
-              </ol>
+              <details class="employee-progress-log">
+                <summary><span>最近进度</span><strong>{t().progress![t().progress!.length - 1].text}</strong><small>展开 {t().progress!.length} 条记录</small></summary>
+                <ol class="employee-progress" aria-label="进度">
+                  <For each={t().progress}>{(p, i) => (
+                    <li classList={{ current: !t().status && i() === t().progress!.length - 1 }}><small>{time(p.at)}</small> {p.text}</li>
+                  )}</For>
+                </ol>
+              </details>
             </Show>
             <Show when={t().nextCheckAt && t().nextCheckAt! > props.now() && !t().status}>
               <small>{t().failures ? `上次出错，${time(t().nextCheckAt!)} 续做（第 ${t().failures} 次）` : t().checkpoint ? `${time(t().nextCheckAt!)} 再检查；本轮结束后让出电脑与执行名额` : `计划 ${time(t().nextCheckAt!)}`}</small>
@@ -960,7 +1078,7 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
             <Show when={t().result}><div class="employee-transcript-result"><Show when={!t().status}><small>上次收尾说明</small></Show><Markdown text={t().result!} /></div></Show>
             <Show when={!props.readonly}>
               <div class="employee-item-actions">
-                <Show when={t().status && ["done", "stopped", "failed", "cancelled"].includes(t().status!)}>
+                <Show when={t().id !== top()?.id && t().status && ["done", "stopped", "failed", "cancelled"].includes(t().status!)}>
                   <TaskRecordActions task={t()} me={props.me} act={props.act} />
                 </Show>
                 <Show when={thread()}>{(id) => <button type="button" onClick={() => props.open(id())}>看会话</button>}</Show>
@@ -990,7 +1108,7 @@ function DutyForm(props: { run: RunFn; onClose: () => void; duty?: Duty }) {
   const [text, setText] = createSignal(d?.text ?? "");
   const [note, setNote] = createSignal(d?.note ?? "");
   const [preview, setPreview] = createSignal(false);
-  const [mode, setMode] = createSignal<"times" | "every" | "events">("times");
+  const [mode, setMode] = createSignal<"times" | "every" | "events" | "manual">("times");
   const [times, setTimes] = createSignal("09:00");
   const [every, setEvery] = createSignal(60);
   const [events, setEvents] = createSignal<string[]>([]);
@@ -1002,7 +1120,7 @@ function DutyForm(props: { run: RunFn; onClose: () => void; duty?: Duty }) {
     const t = text().trim(), n = note().trim();
     if (!d) {
       const rule = mode() === "times" ? { times: times().split(/[,，、\s]+/).filter(Boolean) }
-        : mode() === "every" ? { everyMinutes: every() } : { events: events() };
+        : mode() === "every" ? { everyMinutes: every() } : mode() === "events" ? { events: events() } : { manual: true };
       if (await props.run("employee_do", { action: "duty_add", id: null, text: JSON.stringify({ text: t, note: n, ...rule }) })) props.onClose();
       return;
     }
@@ -1038,7 +1156,8 @@ function DutyForm(props: { run: RunFn; onClose: () => void; duty?: Duty }) {
             <small class="employee-duty-count">{text().length} / 8000 · Ctrl+Enter 保存</small>
             <Show when={!d}>
               <div class="employee-duty-rule">
-                <select aria-label="触发方式" value={mode()} onChange={(ev) => setMode(ev.currentTarget.value as "times" | "every" | "events")}>
+                <select aria-label="触发方式" value={mode()} onChange={(ev) => setMode(ev.currentTarget.value as "times" | "every" | "events" | "manual")}>
+                  <option value="manual">不定时（不自动触发）</option>
                   <option value="times">每天定时</option>
                   <option value="every">固定间隔</option>
                   <option value="events">星轨事件</option>
@@ -1046,6 +1165,7 @@ function DutyForm(props: { run: RunFn; onClose: () => void; duty?: Duty }) {
                 <Show when={mode() === "times"}><input aria-label="每天触发时刻" placeholder="09:00,14:30" value={times()} onInput={(ev) => setTimes(ev.currentTarget.value)} /></Show>
                 <Show when={mode() === "every"}><span class="employee-idle-input">每<input type="number" min="1" max="10080" aria-label="间隔分钟" value={every()} onInput={(ev) => setEvery(Number(ev.currentTarget.value) || 0)} />分钟</span></Show>
               </div>
+              <Show when={mode() === "manual"}><small>仅手动执行或交付任务匹配时使用；已触发任务仍会自愈、续做。</small></Show>
               <Show when={mode() === "events"}>
                 <fieldset class="employee-events"><legend>触发事件</legend>
                   <For each={EVENTS}>{([key, label]) => (
@@ -1102,13 +1222,14 @@ function DutyCard(props: { duty: Duty; due: number; task: boolean; now: number; 
   const [editing, setEditing] = createSignal(false);
   const times = () => duty.times ?? [];
   const events = () => duty.events ?? [];
-  const dynamic = () => duty.everyMinutes === 0 && times().length === 0 && events().length === 0;
-  const rule = () => [
+  const dynamic = () => !duty.manual && duty.everyMinutes === 0 && times().length === 0 && events().length === 0;
+  const rule = () => duty.manual ? "不定时（不自动触发）" : [
     duty.everyMinutes > 0 && `每 ${duty.everyMinutes} 分钟`,
     times().length > 0 && `每天 ${times().join("、")}`,
     events().length > 0 && `事件：${events().map((ev) => EVENTS.find(([k]) => k === ev)?.[1] ?? ev).join("、")}`,
   ].filter(Boolean).join("；") || "按安排触发";
   const next = () => !duty.enabled ? "—"
+    : duty.manual ? "仅手动或任务匹配；已有任务仍会自愈、续做"
     : props.due ? (props.due > props.now ? time(props.due) : "已到点，将新建一轮序列")
     : props.task && duty.everyMinutes > 0 ? "本轮结束后按间隔新建下一轮"
     : events().length ? "等事件触发新一轮"
@@ -1124,6 +1245,8 @@ function DutyCard(props: { duty: Duty; due: number; task: boolean; now: number; 
         <details class="employee-more">
           <summary aria-label={`更多操作：${flat(duty.text).slice(0, 40)}`}>⋯</summary>
           <div>
+            <button type="button" disabled={duty.manual} title="清除自动触发规则，不停止已有任务"
+              onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; void props.act("duty_manual", duty.id); }}>设为不定时（不自动触发）</button>
             <label class="employee-interval" title="每天固定时刻，多个用逗号分隔，如 09:00,14:30；留空取消">每天几点<input type="text" placeholder="如 09:00"
               value={times().join(",")} aria-label="每天触发时刻"
               onChange={(ev) => void props.run("employee_do", { action: "duty_times", id: duty.id, text: ev.currentTarget.value })} /></label>
@@ -1138,7 +1261,7 @@ function DutyCard(props: { duty: Duty; due: number; task: boolean; now: number; 
                     text: (ev.currentTarget.checked ? [...events(), key] : events().filter((k) => k !== key)).join(",") })} /> {label}</label>
               )}</For>
             </fieldset>
-            <button type="button" onClick={() => void props.act("duty_run", duty.id)}>立即执行</button>
+            <button type="button" onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; void props.act("duty_run", duty.id); }}>立即执行</button>
             <button type="button" onClick={() => void props.act("duty_delete", duty.id)}>删除</button>
           </div>
         </details>
