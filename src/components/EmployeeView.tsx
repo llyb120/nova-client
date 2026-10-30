@@ -1,10 +1,11 @@
-import { createEffect, createSignal, For, JSX, on, onCleanup, onMount, Show } from "solid-js";
+import { batch, createEffect, createMemo, createSignal, For, JSX, on, onCleanup, onMount, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { Portal } from "solid-js/web";
 import { openThread, showToast, state } from "../store";
-import type { Peer } from "../types";
+import type { Peer, PlanEntry } from "../types";
 import { Markdown } from "./Markdown";
 import "./EmployeeView.css";
 import { TitleBarPortal } from "./TitleBar";
@@ -12,10 +13,11 @@ import VaultPop from "./VaultPop";
 
 /** 交代的人；token 为空是员工所在机器的用户。 */
 type Owner = { token: string; name: string };
-type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; times?: string[]; events?: string[]; nextCheckAt: number; lastRunAt: number; lastResult: string; owner?: Owner; plan?: Todo[] };
-/** 待办即任务树节点：parent 上级、after 先完成的兄弟、origin 衍生出它的节点；status 非空为已收尾（在 finished 里）。 */
-type Todo = { id: string; text: string; confirm: boolean; dutyId?: string; failures?: number; profile?: string; createdAt: number; threadId?: string | null; nextCheckAt?: number; desktop?: boolean; askAfter?: number;
-  owner?: Owner; waiting?: string; replyTo?: { token: string; name: string; id: string } | null; shot?: string;
+type Duty = { id: string; text: string; enabled: boolean; note: string; everyMinutes: number; times?: string[]; events?: string[]; nextCheckAt: number; lastRunAt: number; lastResult: string; owner?: Owner };
+/** 任务是扁平的：origin 派生出它的任务（只用于展示）、fromDuty 派生它的职责、progress 它自己标记的进度（最后一条是当前步骤）；status 非空为已收尾（在 finished 里）。
+ *  parent / after / relayed / planning 只在旧版任务树数据里出现。 */
+type Todo = { id: string; text: string; confirm: boolean; dutyId?: string; fromDuty?: string; key?: string; failures?: number; profile?: string; createdAt: number; threadId?: string | null; nextCheckAt?: number; desktop?: boolean; askAfter?: number;
+  owner?: Owner; waiting?: string; replyTo?: { token: string; name: string; id: string } | null; shot?: string; progress?: { at: number; text: string }[]; plan?: PlanEntry[]; planStep?: number;
   parent?: string; after?: string[]; origin?: string; branch?: string; status?: string; result?: string; finishedAt?: number; relayed?: boolean; planning?: boolean; checkpoint?: string };
 const from = (o?: Owner) => (o?.token ? o.name || o.token : "");
 /** chain：同一任务接力出的各段会话共用的首段会话 id，旧记录为空（自成一组）。 */
@@ -37,7 +39,7 @@ const retention = (m: Memory, now: number) => {
 type Task = { threadId: string; itemId: string; queued: boolean; desktop: "using" | "asking" | "reserved" | null };
 type Snapshot = {
   employee: {
-    enabled: boolean; workStart: string; workEnd: string; idleMinutes: number; takeoverSeconds?: number; public?: boolean;
+    enabled: boolean; workStart: string; workEnd: string; idleMinutes: number; takeoverSeconds?: number; desktopAskAfter?: number; public?: boolean;
     duties: Duty[]; inbox: Todo[]; runs: Run[]; memories?: Memory[]; finished?: Todo[];
   };
   status: "working" | "duty" | "rest";
@@ -53,6 +55,7 @@ const STATUS = { working: "工作中", duty: "值班中", rest: "休息中" } as
 const DESKTOP = { using: "正在操作电脑", asking: "等你确认操作电脑", reserved: "电脑已排给它，动手前会问你" } as const;
 const LEGACY = { inbox: "待办", say: "对员工说", approve: "批准执行" } as Record<string, string>;
 const SHOWN = 30;
+const HISTORY_FILTERS = [["all", "全部"], ["done", "已完成"], ["stopped", "已停止"], ["failed", "失败"], ["cancelled", "已取消"]] as const;
 const time = (ms: number) => (ms ? new Date(ms).toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—");
 
 // 放在模块里：进会话再返回时还是原来的 tab 和员工。
@@ -130,14 +133,27 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
   const [now, setNow] = createSignal(Date.now());
   const [failed, setFailed] = createSignal("");
   const data = () => store.snap;
-  const refetch = () => call<Snapshot>("employee_get").then(
-    (snap) => { setStore("snap", reconcile(snap)); setNow(Date.now()); setFailed(""); },
-    (error) => { setFailed(`读取员工数据失败：${String(error)}`); if (!peer) showToast(failed()); },
-  );
+  let fetching = false, refreshAgain = false, disposed = false;
+  const refetch = async () => {
+    if (disposed) return;
+    if (fetching) { refreshAgain = true; return; }
+    fetching = true;
+    try {
+      const snap = await call<Snapshot>("employee_get");
+      if (!disposed) batch(() => { setStore("snap", reconcile(snap)); setNow(Date.now()); setFailed(""); });
+    } catch (error) {
+      if (!disposed) { setFailed(`读取员工数据失败：${String(error)}`); if (!peer) showToast(failed()); }
+    } finally {
+      fetching = false;
+      if (refreshAgain && !disposed) { refreshAgain = false; void refetch(); }
+    }
+  };
   void refetch();
   const [say, setSay] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [addingDuty, setAddingDuty] = createSignal(false);
+  const [historyFilter, setHistoryFilter] = createSignal("all");
+  const [historyLimit, setHistoryLimit] = createSignal(SHOWN);
   const [transcript, setTranscript] = createSignal<Transcript | null>(null);
   // 右侧详情选中的任务 / 职责 / 会话；模块级的不用：换了员工（团队）就该重新选。
   const [pick, setPick] = createSignal<Pick | null>(null);
@@ -157,7 +173,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
     const onKey = (ev: KeyboardEvent) => { if (ev.key === "Escape") { closeMenus(ev); setTranscript(null); } };
     document.addEventListener("click", closeMenus);
     document.addEventListener("keydown", onKey);
-    onCleanup(() => { void unlisten.then((off) => off()); clearInterval(timer); document.removeEventListener("click", closeMenus); document.removeEventListener("keydown", onKey); });
+    onCleanup(() => { disposed = true; void unlisten.then((off) => off()); clearInterval(timer); document.removeEventListener("click", closeMenus); document.removeEventListener("keydown", onKey); });
   });
 
   const run = async (command: string, args: Record<string, unknown>) => {
@@ -186,101 +202,96 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
           const e = () => snap().employee;
           const label = (r: Run) => r.label || flat(e().duties.find((d) => d.id === r.dutyId)?.text ?? "") || LEGACY[r.dutyId] || r.dutyId;
           // 每个会话只看最新一条运行记录（续做会在同一会话追加记录）。
-          const latest = () => {
+          const latest = createMemo(() => {
             const seen = new Set<string>();
             return [...e().runs].reverse().filter((r) => !seen.has(r.threadId) && !!seen.add(r.threadId));
-          };
+          });
           const live = (r: Run) => snap().tasks.some((t) => t.threadId === r.threadId);
-          const busyItems = () => new Set(snap().tasks.map((t) => t.itemId));
-          const running = () => snap().tasks.filter((t) => !t.queued);
-          const queued = () => snap().tasks.filter((t) => t.queued);
-          const runOf = (threadId: string) => latest().find((r) => r.threadId === threadId);
+          const busyItems = createMemo(() => new Set(snap().tasks.map((t) => t.itemId)));
+          const running = createMemo(() => snap().tasks.filter((t) => !t.queued));
           // 同一任务接力出的各段会话归成一组（旧 → 新），按最新一段排序，组的状态看最新一段。
-          const groups = () => {
+          const groups = createMemo(() => {
             const by = new Map<string, Run[]>();
             for (const r of latest()) by.set(r.chain || r.threadId, [r, ...(by.get(r.chain || r.threadId) ?? [])]);
             return [...by.values()];
-          };
+          });
           const last = (g: Run[]) => g[g.length - 1];
-          const segmentsOf = (threadId: string) => groups().find((g) => g.some((r) => r.threadId === threadId)) ?? [];
-          const confirms = () => e().inbox.filter((t) => t.confirm);
-          const waits = () => e().inbox.filter((t) => !t.confirm && t.waiting && !busyItems().has(t.id));
-          const nodes = () => [...e().inbox, ...(e().finished ?? [])].filter((t) => !t.confirm);
-          const nodeOf = (id: string) => nodes().find((t) => t.id === id);
-          const stateOf = (t: Todo) => nodeState(t, nodes(), snap().tasks, now());
-          const duties = () => [...e().duties].sort((a, b) => Number(b.enabled) - Number(a.enabled));
-          // 每个任务家族（树根 + 它衍生出的独立任务树）在列表里占一行。
-          const tops = () => {
-            const seen = new Set<string>();
-            return nodes().map((t) => familyTop(t.id, nodes())).filter((t): t is Todo => !!t && !seen.has(t.id) && !!seen.add(t.id));
-          };
-          const familyRow = (top: Todo): Row => {
-            const all = familyNodes(top, nodes());
+          const confirms = createMemo(() => e().inbox.filter((t) => t.confirm));
+          const waits = createMemo(() => e().inbox.filter((t) => !t.confirm && t.waiting && !busyItems().has(t.id)));
+          const nodes = createMemo(() => [...e().inbox, ...(e().finished ?? [])].filter((t) => !t.confirm));
+          const sequences = createMemo(() => indexSequences(nodes()));
+          const nodeOf = (id: string) => sequences().byId.get(id);
+          const states = createMemo(() => new Map(nodes().map((t) => [t.id, nodeState(t, nodes(), snap().tasks, now())])));
+          const stateOf = (t: Todo) => states().get(t.id)!;
+          const duties = createMemo(() => [...e().duties].sort((a, b) => Number(b.enabled) - Number(a.enabled)));
+          // 每个独立序列占一行；origin 只记录来源，不合并序列。
+          const tops = () => sequences().tops;
+          const sequenceRow = (top: Todo): Row => {
+            const all = sequences().members.get(top.id)!;
             const states = all.map(stateOf);
             const state = ["planning", "running", "queued", "help", "deferred"].find((s) => states.includes(s))
               ?? (top.status && all.some((t) => !t.status) ? "kids" : stateOf(top));
             const finished = states.filter((s) => s === "done").length;
             const desk = snap().tasks.find((x) => x.desktop && all.some((t) => t.id === x.itemId))?.desktop;
             const checkAt = Math.min(...all.filter((t) => stateOf(t) === "deferred").map((t) => t.nextCheckAt!));
-            const meta = [top.dutyId ? "职责" : top.origin ? "衍生" : "待办", all.length > 1 ? `${finished}/${all.length} 完成` : "",
+            const completed = top.plan?.filter((step) => step.status === "completed").length ?? finished;
+            const total = top.plan?.length ?? all.length;
+            const meta = [top.dutyId ? "职责" : top.origin ? "衍生" : "待办", total > 1 ? `${completed}/${total} 完成` : "",
+              top.status ? "" : top.progress?.[top.progress.length - 1]?.text ?? "",
               Number.isFinite(checkAt) ? `${time(checkAt)} 检查` : "", desk ? DESKTOP[desk] : "", time(top.finishedAt || top.createdAt)];
             return { key: top.id, title: flat(top.text), state, meta: meta.filter(Boolean).join(" · "), pick: { kind: "task", id: top.id } };
           };
           const runRow = (g: Run[]): Row => {
             const r = last(g);
             const task = snap().tasks.find((t) => t.threadId === r.threadId);
-            const state = task ? (task.queued ? "queued" : "running") : !r.status || r.status === "done" ? "done" : "stopped";
+            const state = task ? (task.queued ? "queued" : "running") : !r.status || r.status === "done" ? "done" : ["failed", "cancelled"].includes(r.status) ? r.status : "stopped";
             return { key: r.threadId, title: label(r), state, meta: time(g[0].at), pick: { kind: "run", id: r.threadId } };
           };
           const RANK: Record<string, number> = { planning: 0, running: 0, queued: 1, help: 2, kids: 3, relayed: 3, resume: 4, deferred: 5, deps: 5, future: 6 };
-          const active = (top: Todo) => familyNodes(top, nodes()).some((t) => !t.status);
-          // 任务：还没收尾的任务家族，加上不在任务树里、正在跑的会话（对员工说、已批准的事项）。
-          const taskRows = () => [
-            ...tops().filter(active).map(familyRow),
+          const active = (top: Todo) => sequences().members.get(top.id)!.some((t) => !t.status);
+          // 任务：还没收尾的独立序列，加上不在任务树里、正在跑的会话（对员工说、已批准的事项）。
+          const taskRows = createMemo(() => [
+            ...tops().filter(active).map(sequenceRow),
             ...groups().filter((g) => live(last(g)) && !nodeOf(last(g).dutyId)).map(runRow),
-          ].sort((a, b) => (RANK[a.state] ?? 9) - (RANK[b.state] ?? 9));
-          // 最近：已经整体收尾的任务家族，加上不在任务树里的已结束会话。
-          const recentRows = () => [
-            ...tops().filter((t) => !active(t)).map((t) => ({ row: familyRow(t), at: t.finishedAt ?? 0 })),
+          ].sort((a, b) => (RANK[a.state] ?? 9) - (RANK[b.state] ?? 9)));
+          // 任务记录：先筛选再分页，已取消和更早的记录也能找到。
+          const recentRows = createMemo(() => [
+            ...tops().filter((t) => !active(t)).map((t) => ({ row: sequenceRow(t), at: t.finishedAt ?? 0 })),
             ...groups().filter((g) => !live(last(g)) && !nodeOf(last(g).dutyId)).map((g) => ({ row: runRow(g), at: last(g).ended ?? last(g).at })),
-          ].sort((a, b) => b.at - a.at).slice(0, SHOWN).map((x) => x.row);
+          ].sort((a, b) => b.at - a.at).map((x) => x.row));
+          const filteredRows = createMemo(() => recentRows().filter((r) => historyFilter() === "all" || r.state === historyFilter()));
           const dutyRow = (duty: Duty): Row => {
-            const tasks = e().inbox.filter((t) => t.dutyId === duty.id);
+            const tasks = tops().filter((t) => active(t) && (t.dutyId === duty.id || t.fromDuty === duty.id));
             const due = snap().dues?.[duty.id] ?? 0;
             const meta = !duty.enabled ? "已停用" : [tasks.length ? `${tasks.length} 轮处理中` : "", due ? `下次 ${time(due)}` : duty.events?.length ? "等事件触发" : tasks.length ? "" : "未安排"].filter(Boolean).join(" · ");
-            return { key: duty.id, title: flat(duty.text), state: !duty.enabled ? "stopped" : tasks.length ? familyRow(tasks[tasks.length - 1]).state : "future", meta, pick: { kind: "duty", id: duty.id } };
+            return { key: duty.id, title: flat(duty.text), state: !duty.enabled ? "stopped" : tasks.length ? sequenceRow(tasks[tasks.length - 1]).state : "future", meta, pick: { kind: "duty", id: duty.id } };
           };
           // 右侧详情：选中的已不存在时回到第一项任务（没有就第一条职责）。
-          const current = (): Pick | null => {
+          const current = createMemo((): Pick | null => {
             const p = pick();
             const exists = p && (p.kind === "duty" ? e().duties.some((d) => d.id === p.id) : p.kind === "task" ? !!nodeOf(p.id) : e().runs.some((r) => r.threadId === p.id));
             if (exists) return p;
-            return taskRows()[0]?.pick ?? (duties()[0] ? { kind: "duty", id: duties()[0].id } : null);
-          };
-          const currentKey = () => { const c = current(); return c ? `${c.kind}:${c.id}` : ""; };
+            return taskRows()[0]?.pick ?? (duties()[0] ? { kind: "duty", id: duties()[0].id } : recentRows()[0]?.pick ?? null);
+          });
+          const currentKey = createMemo(() => { const c = current(); return c ? `${c.kind}:${c.id}` : ""; });
           const row = (r: Row) => <RowItem row={r} active={currentKey() === `${r.pick.kind}:${r.pick.id}`} onPick={() => setPick(r.pick)} />;
-          const treeProps = { now, open, act, run, local: !peer };
+          const treeProps = { now, open, act, run, local: !peer, me };
           const dutyDetail = (id: string) => {
             const duty = () => e().duties.find((d) => d.id === id);
-            const tasks = () => e().inbox.filter((t) => t.dutyId === id).sort((a, b) => b.createdAt - a.createdAt);
-            const history = () => tops().filter((t) => t.dutyId === id && !active(t)).sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0)).slice(0, 10);
+            // 职责只列序列入口，选中后单独展示，不把所有任务树堆到一起。
+            const tasks = createMemo(() => tops().filter((t) => active(t) && (t.dutyId === id || t.fromDuty === id)).sort((a, b) => b.createdAt - a.createdAt));
+            const history = createMemo(() => tops().filter((t) => (t.dutyId === id || t.fromDuty === id) && !active(t)).sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0)).slice(0, 10));
             return (
               <Show when={duty()}>{(d) => (
                 <>
                   <DutyCard duty={d()} due={d().enabled ? snap().dues?.[d().id] ?? 0 : 0} task={tasks().length > 0} now={now()} run={run} act={act} />
-                  <For each={tasks()}>{(t) => <>
-                    <h3 class="employee-detail-sub">本轮序列 · {time(t.createdAt)}</h3>
-                    <Show when={t.planning}><p class="employee-hint">正在规划本轮步骤与依赖，规划完成后才开始执行；不是接着旧任务做。</p></Show>
-                    <TaskTree id={t.id} nodes={nodes()} {...treeProps} tasks={snap().tasks} />
-                  </>}</For>
-                  <h3 class="employee-detail-sub">下次触发的参考序列</h3>
-                  <Show when={d().plan?.length} fallback={<p class="employee-hint">首次触发会先生成并保存完整步骤，再开始执行；规划完成后这里即可预览，不必等整轮做完。</p>}>
-                    <p class="employee-hint">最近规划的步骤模板。下次触发会新建独立序列，按当次情况重新规划；运行中随步骤结果调整，不继承旧会话或完成状态。</p>
-                    <TaskTree id={`plan:${id}`} nodes={planNodes(d())} readonly {...treeProps} tasks={[]} />
+                  <Show when={tasks().length}>
+                    <h3 class="employee-detail-sub">进行中的独立序列</h3>
+                    <div class="employee-rows"><For each={tasks()}>{(t) => row(sequenceRow(t))}</For></div>
                   </Show>
                   <Show when={history().length}>
                     <h3 class="employee-detail-sub">最近执行</h3>
-                    <div class="employee-rows"><For each={history()}>{(t) => row(familyRow(t))}</For></div>
+                    <div class="employee-rows"><For each={history()}>{(t) => row(sequenceRow(t))}</For></div>
                   </Show>
                 </>
               )}</Show>
@@ -301,6 +312,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                   <div class="employee-item-actions">
                     <button type="button" onClick={() => open(x().threadId)}>看会话</button>
                     <Show when={task()}>{(t) => <button type="button" onClick={() => void act("stop", t().threadId)}>停止</button>}</Show>
+                    <Show when={!peer}><DeleteTaskButton id={x().threadId} act={act} /></Show>
                   </div>
                 </>
               )}</Show>
@@ -317,6 +329,7 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                   <span class={`employee-badge ${snap().status}`}>{STATUS[snap().status]}</span>
                   <span class="employee-chip">下次触发<strong>{time(snap().nextCheckAt)}</strong></span>
                   <span class="employee-chip">进行中<strong>{running().length} / {snap().parallel}</strong></span>
+                  <Show when={(e().desktopAskAfter ?? 0) > now()}><span class="employee-chip" title="所有电脑任务共用冷却期；期间新申请自动拒绝并刷新 5 分钟，不弹窗、不接管；轻量和编码任务照常执行">电脑暂停至<strong>{time(e().desktopAskAfter!)}</strong></span></Show>
                 </div>
                 <div class="employee-header-actions">
                   <Show when={!peer}><label class="employee-toggle"><input type="checkbox" role="switch" checked={e().enabled}
@@ -361,8 +374,8 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                     <span class="employee-idle-input"><input type="number" min="3" max="600" value={e().takeoverSeconds ?? 15}
                       onChange={(ev) => void set({ takeoverSeconds: Number(ev.currentTarget.value) || 15 })} /> 秒</span>
                   </label>
-                  <details class="employee-help"><summary>工作方式说明</summary><p class="employee-hint">每件事只在安排好的时间触发；职责先规划独立序列再执行，运行中按步骤结果调整后续计划，不会空跑会话去检查。多件事并行处理；操作电脑是单独排队的一步，每次开始前都会在 Butterfly 上提示你，{e().takeoverSeconds ?? 15} 秒内不选择即开始。员工操作电脑时（屏幕边缘呼吸灯亮着）按 Esc 即可叫停；你拒绝或叫停后，员工会在你空闲时、或过一阵再问你，择机补做。</p>
-                  <p class="employee-hint">员工从「设置 → 场景模型 → 轻量化」开局，编码交给编码场景，操作电脑交给剑来场景的模型。</p></details>
+                  <details class="employee-help"><summary>工作方式说明</summary><p class="employee-hint">每件事只在安排好的时间触发；每次触发生成一项任务，最多复用两个会话（轻量/编码主会话、独立电脑会话），并标记当前做到哪一步；要逐个处理的事（如每个需求单）各派生一项任务。多件事并行处理，等构建等外部结果时让出名额；电脑同一时间只给一项任务，被占时另一项自动退出、空出后接着做。第一次动电脑前会在 Butterfly 上提示你，{e().takeoverSeconds ?? 15} 秒内不选择即开始。员工操作电脑时（屏幕边缘呼吸灯亮着）按 Esc 即可叫停；你拒绝或叫停后，所有电脑任务冷却 5 分钟；期间新的占用申请自动拒绝，并从该申请重新计时 5 分钟，不弹窗、不接管。调度检查不刷新计时，冷却结束后再择机补做。</p>
+                  <p class="employee-hint">员工从「设置 → 场景模型 → 轻量化」开局，轻量与编码通过 Stage 在主会话内切换；电脑操作交给独立的剑来会话，工具和历史隔离，完成后回到原主会话。两侧会话在后续步骤中复用。</p></details>
                   <label class="employee-field employee-public" title="经团队中转站公开：团队成员都能查看并下达指令；谁交代的事缺信息时找谁补充，待确认由谁批准">
                     <input type="checkbox" role="switch" checked={!!e().public} onChange={(ev) => void set({ public: ev.currentTarget.checked })} /> 公开到团队（StarLink）
                   </label>
@@ -401,12 +414,18 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                     <Show when={addingDuty()}><DutyForm run={run} onClose={() => setAddingDuty(false)} /></Show>
                     <div class="employee-rows"><For each={duties()}>{(d) => row(dutyRow(d))}</For></div>
                   </section>
-                  <Show when={recentRows().length}>
-                    <section class="employee-section" aria-labelledby="employee-sec-recent">
-                      <h2 id="employee-sec-recent">最近</h2>
-                      <div class="employee-rows"><For each={recentRows()}>{row}</For></div>
-                    </section>
-                  </Show>
+                  <section class="employee-section" aria-labelledby="employee-sec-recent">
+                    <h2 id="employee-sec-recent">任务记录 <span class="employee-count">{filteredRows().length}</span></h2>
+                    <div class="employee-history-filters" role="group" aria-label="筛选任务记录">
+                      <For each={HISTORY_FILTERS}>{([value, label]) => <button type="button" aria-pressed={historyFilter() === value}
+                        onClick={() => { setHistoryFilter(value); setHistoryLimit(SHOWN); }}>{label}</button>}</For>
+                    </div>
+                    <Show when={filteredRows().length} fallback={<p class="employee-hint">暂无{historyFilter() === "all" ? "" : HISTORY_FILTERS.find(([value]) => value === historyFilter())?.[1]}记录。</p>}>
+                      <div class="employee-rows"><For each={filteredRows().slice(0, historyLimit())}>{row}</For></div>
+                      <Show when={filteredRows().length > historyLimit()}><button type="button" class="employee-text-button" onClick={() => setHistoryLimit((n) => n + SHOWN)}>显示更多</button></Show>
+                    </Show>
+                    <p class="employee-hint">任务与运行记录各保留最近 200 条；删除记录后无法恢复。</p>
+                  </section>
                 </aside>
                 <section class="employee-detail" aria-label="详情">
                   <Show when={currentKey()} keyed fallback={<p class="employee-hint">从左边选一个任务或职责，这里会画出它的任务树。</p>}>
@@ -440,6 +459,45 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
 type RunFn = (command: string, args: Record<string, unknown>) => Promise<boolean>;
 type Act = (action: string, id?: string) => Promise<boolean>;
 type Open = (threadId: string) => void;
+
+function TaskRecordActions(props: { task: Todo; me: string; act: Act }) {
+  const [pending, setPending] = createSignal("");
+  const mine = () => !props.me || (props.task.owner?.token ?? "") === props.me;
+  const restore = async (restart: boolean) => {
+    if (pending() || !mine()) return;
+    setPending(restart ? "restart" : "resume");
+    try {
+      if (restart && !await confirm("按原任务内容另建一项任务，从头执行？旧记录保持不变，不复制原会话、进度和批准。\n\n这可能重复已做过的发送、部署等操作，请先核对外部状态。", { title: "重新派发任务", kind: "warning", okLabel: "重新派发", cancelLabel: "取消" })) return;
+      await props.act(restart ? "task_restart" : "task_resume", props.task.id);
+    } catch (error) { showToast(String(error)); }
+    finally { setPending(""); }
+  };
+  return <>
+    <Show when={["stopped", "failed", "cancelled"].includes(props.task.status ?? "") && !props.task.parent}>
+      <button type="button" class="employee-approve" disabled={!!pending() || !mine()}
+        title="保留原会话、计划与恢复点；先核对实际进度，只继续未完成部分。所属职责须先启用。"
+        onClick={() => void restore(false)}>{pending() === "resume" ? "正在恢复…" : "继续执行"}</button>
+    </Show>
+    <button type="button" disabled={!!pending() || !mine()} title={mine() ? "新建任务，旧记录不变；所属职责须先启用" : "仅交代这项任务的人或员工主人能操作"}
+      onClick={() => void restore(true)}>{pending() === "restart" ? "正在派发…" : "重新派发"}</button>
+  </>;
+}
+
+function DeleteTaskButton(props: { id: string; act: Act }) {
+  const [deleting, setDeleting] = createSignal(false);
+  const remove = async () => {
+    if (deleting()) return;
+    const id = props.id;
+    setDeleting(true);
+    try {
+      if (await confirm("删除这项任务及其执行记录？正在执行的任务会停止，删除后无法恢复。\n\n不会删除职责、会话和项目文件，也不会影响其它独立任务。已提交的外部作业不会自动取消。", { title: "删除任务", kind: "warning", okLabel: "删除", cancelLabel: "取消" })) {
+        await props.act("task_delete", id);
+      }
+    } catch (error) { showToast(String(error)); }
+    finally { setDeleting(false); }
+  };
+  return <button type="button" disabled={deleting()} onClick={() => void remove()}>{deleting() ? "正在删除…" : "删除记录"}</button>;
+}
 
 /** 补充信息：等补充的任务（交代的人填），或替团队员工补充的本地待办（直接回复并回传）。 */
 function ReplyBox(props: { id: string; run: RunFn; label: string }) {
@@ -517,7 +575,7 @@ function HelpCard(props: { item: Todo; me: string; run: RunFn; open: Open; local
 }
 
 const resultOf = (r: Run) => (r.status === "running" || r.status === "queued" ? "已中断（Nova 重启）" : r.result);
-const SEGMENT = { relayed: "已接力", running: "进行中", queued: "等电脑", deferred: "已挂起", stopped: "已停止", done: "完成" } as Record<string, string>;
+const SEGMENT = { relayed: "已接力", running: "进行中", queued: "等电脑", deferred: "已挂起", stopped: "已停止", cancelled: "已取消", done: "完成" } as Record<string, string>;
 
 /** 左侧列表的一行：任务家族、职责或不在任务树里的会话。 */
 type Pick = { kind: "task" | "duty" | "run"; id: string };
@@ -549,62 +607,60 @@ const NODE: Record<string, { label: string; color: string; virtual?: boolean }> 
   resume: { label: "待续做", color: "--text-dim" },
   deps: { label: "等前置任务", color: "--text-dim", virtual: true },
   future: { label: "待执行", color: "--text-dim", virtual: true },
-  failed: { label: "出错放弃", color: "--red" },
+  failed: { label: "执行失败", color: "--red" },
   stopped: { label: "已停止", color: "--text-dim" },
+  cancelled: { label: "已取消", color: "--text-dim" },
   blocked: { label: "受阻没做", color: "--red", virtual: true },
+  unverified: { label: "未确认完成", color: "--text-dim", virtual: true },
 };
 
 function nodeState(t: Todo, nodes: Todo[], tasks: Task[], now: number) {
   if (t.status) return NODE[t.status] ? t.status : "stopped";
+  if (t.planStep !== undefined) {
+    const owner = nodes.find((n) => n.id === t.parent);
+    if (!owner || owner.status === "done") return "unverified";
+    return nodeState(owner, nodes, tasks, now);
+  }
   const task = tasks.find((x) => x.itemId === t.id);
   if (task) return task.queued ? "queued" : t.planning ? "planning" : "running";
   if (t.relayed) return "relayed";
   if (t.waiting) return "help";
   if (t.planning) return "planning";
   if (t.checkpoint && !t.failures && (t.nextCheckAt ?? 0) > now) return "deferred";
+  if (t.desktop && t.threadId) return "queued";
   if (t.after?.some((a) => nodes.some((k) => k.id === a && !k.status))) return "deps";
   if (!t.threadId) return "future";
   return nodes.some((k) => k.parent === t.id && !k.status) ? "kids" : "resume";
 }
 
-/** 家族最上面的根：沿上级与衍生来源往上找。 */
-function familyTop(id: string, nodes: Todo[]) {
-  const map = new Map(nodes.map((t) => [t.id, t]));
-  let top = map.get(id);
-  for (let i = 0; top && i < 50; i++) {
-    const up = map.get(top.parent || top.origin || "");
-    if (!up) break;
-    top = up;
+/** 一次建立序列归属与成员索引，不能在每行、每个节点上重建全表 Map。 */
+function indexSequences(nodes: Todo[]) {
+  const byId = new Map(nodes.map((t) => [t.id, t]));
+  const rootById = new Map<string, Todo>();
+  const members = new Map<string, Todo[]>();
+  for (const t of nodes) {
+    const root = sequenceRoot(t.id, byId)!;
+    rootById.set(t.id, root);
+    const group = members.get(root.id);
+    if (group) group.push(t); else members.set(root.id, [t]);
   }
-  return top;
+  return { byId, rootById, members, tops: [...members.keys()].map((id) => byId.get(id)!) };
 }
 
-/** 家族里各棵树的根：最上面的根，加上其中节点衍生出的独立任务树（逐层）。 */
-function familyRoots(top: Todo, nodes: Todo[]) {
-  const roots = [top];
-  const ids = new Set<string>();
-  const collect = (id: string) => { ids.add(id); for (const k of nodes) if (k.parent === id && !ids.has(k.id)) collect(k.id); };
-  for (let i = 0; i < roots.length; i++) {
-    collect(roots[i].id);
-    for (const t of nodes) if (!t.parent && t.origin && ids.has(t.origin) && !roots.includes(t)) roots.push(t);
-  }
-  return { roots, ids };
-}
-
-function familyNodes(top: Todo, nodes: Todo[]) {
-  const { ids } = familyRoots(top, nodes);
-  return nodes.filter((t) => ids.has(t.id));
-}
-
-/** 职责记住的序列画成虚的树：树根是职责本身，步骤 parent 为空即挂在树根下。 */
-function planNodes(duty: Duty): Todo[] {
-  const root: Todo = { id: `plan:${duty.id}`, text: duty.text, confirm: false, dutyId: duty.id, createdAt: 0 };
-  return [root, ...(duty.plan ?? []).map((s) => ({ ...s, parent: s.parent || root.id }))];
+/** 计划节点仅用于画图，不能成为调度任务、独立会话或编辑/停止目标。 */
+function executionNodes(top: Todo | undefined, nodes: Todo[]): Todo[] {
+  if (!top?.plan?.length) return nodes;
+  const statuses: Record<string, string> = { pending: "future", completed: "done", failed: "failed", blocked: "blocked" };
+  return [top, ...top.plan.map((step, i) => ({
+    id: `${top.id}/plan/${i}`, text: `${i + 1}. ${step.content}`, confirm: false, createdAt: i,
+    parent: top.id, after: i ? [`${top.id}/plan/${i - 1}`] : [], planStep: i,
+    status: statuses[step.status], threadId: step.status === "in_progress" ? top.threadId : undefined,
+  }))];
 }
 
 const [NODE_W, NODE_H, GAP_X, GAP_Y, PAD] = [200, 64, 40, 40, 24];
 type Placed = { t: Todo; x: number; y: number };
-type FlowLink = { from: string; to: string; detached?: boolean };
+type FlowLink = { from: string; to: string };
 
 /** 同一上级下的兄弟：同一条依赖链排在一起（前置在上，等它的紧跟其后），其余按创建时间。 */
 function sortSiblings(list: Todo[]) {
@@ -630,7 +686,7 @@ function layoutTree(top: Todo | undefined, nodes: Todo[]) {
   const seen = new Set<string>();
   const build = (t: Todo): Block => {
     seen.add(t.id);
-    const children = sortSiblings(nodes.filter((k) => k.parent === t.id || (!k.parent && k.origin === t.id)));
+    const children = sortSiblings(nodes.filter((k) => k.parent === t.id));
     const blocks = new Map<string, Block>();
     const ranks = new Map<string, number>();
     for (const child of children) {
@@ -652,10 +708,9 @@ function layoutTree(top: Todo | undefined, nodes: Todo[]) {
         const block = blocks.get(child.id)!;
         placed.push(...block.placed.map((p) => ({ ...p, x: p.x + x, y: p.y + y })));
         links.push(...block.links);
-        const detached = !child.parent && !!child.origin;
         const deps = (child.after ?? []).filter((id) => blocks.has(id) && ranks.get(id)! < rank);
         const from = deps.length ? deps.flatMap((id) => blocks.get(id)!.exits) : [t.id];
-        links.push(...from.map((id) => ({ from: id, to: child.id, detached })));
+        links.push(...from.map((id) => ({ from: id, to: child.id })));
         x += block.width + GAP_X;
       }
       height = y + Math.max(...row.map((child) => blocks.get(child.id)!.height));
@@ -670,14 +725,12 @@ function layoutTree(top: Todo | undefined, nodes: Todo[]) {
 }
 
 /** 线型只表达是否走到该步骤；依赖关系本身不是“虚线”。 */
-function flowDash(link: FlowLink, target: Todo) {
-  if (link.detached) return [2, 4];
+function flowDash(target: Todo) {
   return target.threadId || target.status === "done" || target.status === "failed" ? [] : [5, 4];
 }
 
 /** origin 是独立序列，停止范围只沿 parent 上溯。 */
-function sequenceRoot(id: string, nodes: Todo[]) {
-  const byId = new Map(nodes.map((t) => [t.id, t]));
+function sequenceRoot(id: string, byId: ReadonlyMap<string, Todo>) {
   let root = byId.get(id);
   const seen = new Set<string>();
   while (root?.parent && !seen.has(root.id)) {
@@ -708,20 +761,26 @@ function wrap(ctx: CanvasRenderingContext2D, text: string, width: number, max: n
   return lines;
 }
 
-/** 任务树详情：canvas 画出整棵树（含衍生出的独立任务树）——已完成、执行中、出错的实线，还没开始的虚线；
+/** 任务树详情：canvas 只画当前序列——已完成、执行中、出错的实线，还没开始的虚线；
  *  点节点看详情、改或删没开始的。`readonly`：职责记住的序列预览，只看不改。 */
-function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => number; open: Open; act: Act; run: RunFn; local: boolean; readonly?: boolean }) {
+function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => number; open: Open; act: Act; run: RunFn; local: boolean; me: string; readonly?: boolean }) {
   const [selected, setSelected] = createSignal(props.id);
+  const [selectedPlan, setSelectedPlan] = createSignal<number | null>(null);
   const [draft, setDraft] = createSignal<string | null>(null);
   const [stopping, setStopping] = createSignal(false);
-  const byId = () => new Map(props.nodes.map((t) => [t.id, t]));
+  const sequences = createMemo(() => indexSequences(props.nodes));
+  const byId = () => sequences().byId;
   const taskOf = (id: string) => props.tasks.find((x) => x.itemId === id);
-  const state = (t: Todo) => nodeState(t, props.nodes, props.tasks, props.now());
-  const top = () => familyTop(props.id, props.nodes);
+  const state = (t: Todo) => nodeState(t, displayNodes(), props.tasks, props.now());
+  const top = () => sequences().rootById.get(props.id);
+  const members = createMemo(() => sequences().members.get(top()?.id ?? "") ?? []);
+  const displayNodes = createMemo(() => executionNodes(top(), members()));
+  const layout = createMemo(() => layoutTree(top(), displayNodes()));
+  const planSelection = () => displayNodes().find((t) => t.planStep === selectedPlan());
   let canvas!: HTMLCanvasElement;
   let placed: Placed[] = [];
   const draw = () => {
-    const flow = layoutTree(top(), props.nodes);
+    const flow = layout();
     placed = flow.placed;
     if (!canvas || !placed.length) return;
     const width = Math.max(...placed.map((p) => p.x)) + NODE_W + PAD;
@@ -755,8 +814,8 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
       const x1 = from.x + NODE_W / 2, y1 = from.y + NODE_H;
       const x2 = to.x + NODE_W / 2, y2 = to.y;
       ctx.beginPath();
-      ctx.setLineDash(flowDash(link, to.t));
-      ctx.strokeStyle = color(link.detached ? "--seal" : "--text-dim");
+      ctx.setLineDash(flowDash(to.t));
+      ctx.strokeStyle = color("--text-dim");
       ctx.lineWidth = 1.5;
       ctx.moveTo(x1, y1);
       // 相邻层直接折线分叉/汇合；跨层边走画布外缘，不能穿过居中的后续卡片。
@@ -784,7 +843,7 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
       const s = state(p.t);
       const look = NODE[s];
       const tint = color(look.color);
-      if (p.t.id === selected()) {
+      if (selectedPlan() === null ? p.t.id === selected() : p.t.planStep === selectedPlan()) {
         ctx.setLineDash([]);
         ctx.strokeStyle = color("--accent");
         ctx.lineWidth = 2;
@@ -815,17 +874,21 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
   createEffect(draw);
   const pick = (ev: MouseEvent) => {
     const hit = placed.find((p) => ev.offsetX >= p.x && ev.offsetX <= p.x + NODE_W && ev.offsetY >= p.y && ev.offsetY <= p.y + NODE_H);
-    if (hit) { setSelected(hit.t.id); setDraft(null); }
+    if (hit) {
+      setSelected(hit.t.planStep === undefined ? hit.t.id : top()!.id);
+      setSelectedPlan(hit.t.planStep ?? null);
+      setDraft(null);
+    }
   };
-  const members = () => { const t = top(); return t ? familyNodes(t, props.nodes) : []; };
-  const counts = () => {
+  const counts = createMemo(() => {
     const by = new Map<string, number>();
-    for (const t of members()) by.set(state(t), (by.get(state(t)) ?? 0) + 1);
+    const steps = top()?.plan?.length ? displayNodes().filter((t) => t.planStep !== undefined) : members();
+    for (const t of steps) by.set(state(t), (by.get(state(t)) ?? 0) + 1);
     return [...by].map(([s, n]) => `${NODE[s].label} ${n}`).join("，");
-  };
+  });
   const sel = () => byId().get(selected()) ?? top();
-  const sequence = () => sequenceRoot(sel()?.id ?? props.id, props.nodes);
-  const canStop = () => !props.readonly && props.nodes.some((t) => !t.status && sequenceRoot(t.id, props.nodes)?.id === sequence()?.id);
+  const sequence = () => sequences().rootById.get(sel()?.id ?? props.id);
+  const canStop = () => !props.readonly && members().some((t) => !t.status);
   const stopSequence = async () => {
     const root = sequence();
     if (!root || stopping()) return;
@@ -837,16 +900,20 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
       <div class="employee-detail-head">
         <h2>{flat(top()?.text ?? "")}</h2>
         <small>{counts()}</small>
-        <Show when={canStop()}><button type="button" class="employee-sequence-stop" disabled={stopping()}
-          title="停止选中节点所属的本轮序列及所有子步骤；保留已完成成果，不影响其它轮次和职责下次触发。已提交的外部作业不会自动取消。"
-          onClick={() => void stopSequence()}>{stopping() ? "正在停止…" : "停止本轮序列"}</button></Show>
+        <Show when={!top()?.plan?.length && members().length <= 1}><small>尚未登记步骤计划；下次执行需补录完整流程，旧日志不代表未来步骤。</small></Show>
+        <div class="employee-item-actions">
+          <Show when={canStop()}><button type="button" class="employee-sequence-stop" disabled={stopping()}
+            title="停止选中的任务；保留已完成成果，不影响其它任务和职责下次触发。已提交的外部作业不会自动取消。"
+            onClick={() => void stopSequence()}>{stopping() ? "正在停止…" : "停止任务"}</button></Show>
+          <Show when={!props.readonly && top()}><DeleteTaskButton id={top()!.id} act={props.act} /></Show>
+        </div>
       </div>
       <div class="employee-tree-legend" aria-hidden="true">
-        <span>实线：已开始的流程 · 虚线：未执行 · 点线：独立衍生序列 · 并排：可并行</span>
+        <span>实线：已开始的流程 · 虚线：未执行 · 并排：可并行</span>
         <For each={Object.values(NODE)}>{(look) => <span><i classList={{ virtual: !!look.virtual }} style={{ "--c": `var(${look.color})` }} />{look.label}</span>}</For>
       </div>
       <div class="employee-tree-canvas">
-        <canvas ref={canvas} role="img" aria-label={`任务树：${counts()}。点节点查看详情`} onClick={pick} />
+        <canvas ref={canvas} role="img" aria-label={`任务树：${counts()}。${displayNodes().map((t) => `${t.text}：${NODE[state(t)].label}`).join("；")}。点节点查看详情`} onClick={pick} />
       </div>
       <Show when={sel()}>{(t) => {
         const s = () => state(t());
@@ -860,10 +927,11 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
         };
         return (
           <div class="employee-tree-detail">
+            <Show when={planSelection()}>{(step) => <div class="employee-note"><strong>{NODE[state(step())].label} · {step().text}</strong></div>}</Show>
             <div class="employee-task-tags">
               <span class="employee-tag" style={{ color: `var(${NODE[s()].color})` }}>{NODE[s()].label}</span>
               <Show when={from(t().owner)}>{(n) => <span class="employee-tag">来自 {n()}</span>}</Show>
-              <Show when={t().desktop && !t().status}><span class="employee-tag desktop" title="你一空闲就续做；一直忙则到时再问你">等你空闲 · {t().askAfter && t().askAfter! > props.now() ? `${time(t().askAfter!)} 再问` : "可以问你"}</span></Show>
+              <Show when={t().desktop && !t().status}><span class="employee-tag desktop" title="全局电脑冷却结束后，空闲时续做；一直忙则到时再问你">等你空闲 · {t().askAfter && t().askAfter! > props.now() ? `${time(t().askAfter!)} 再问` : "可以问你"}</span></Show>
               <Show when={byId().get(t().parent ?? "")}>{(p) => <button type="button" class="employee-text-button" onClick={() => setSelected(p().id)}>上级：{flat(p().text).slice(0, 30)}</button>}</Show>
               <Show when={!props.readonly}><small>{t().finishedAt ? `收尾于 ${time(t().finishedAt!)}` : `创建于 ${time(t().createdAt)}`}</small></Show>
             </div>
@@ -876,15 +944,25 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
               <small>先完成：{t().after!.map((id) => (byId().get(id) ? flat(byId().get(id)!.text).slice(0, 20) : id)).join("、")}</small>
             </Show>
             <Show when={t().waiting}><small class="employee-note">在等补充：{t().waiting}</small></Show>
+            <Show when={t().progress?.length}>
+              <ol class="employee-progress" aria-label="进度">
+                <For each={t().progress}>{(p, i) => (
+                  <li classList={{ current: !t().status && i() === t().progress!.length - 1 }}><small>{time(p.at)}</small> {p.text}</li>
+                )}</For>
+              </ol>
+            </Show>
             <Show when={t().nextCheckAt && t().nextCheckAt! > props.now() && !t().status}>
               <small>{t().failures ? `上次出错，${time(t().nextCheckAt!)} 续做（第 ${t().failures} 次）` : t().checkpoint ? `${time(t().nextCheckAt!)} 再检查；本轮结束后让出电脑与执行名额` : `计划 ${time(t().nextCheckAt!)}`}</small>
             </Show>
             <Show when={t().checkpoint}><div class="employee-note"><strong>恢复点</strong><Markdown text={t().checkpoint!} /></div></Show>
             <Show when={props.local}><Shot path={t().shot} /></Show>
             <Show when={t().replyTo && props.local && !t().status}><ReplyBox id={t().id} run={props.run} label="也可以直接回复，结果回传给对方员工" /></Show>
-            <Show when={t().result}><div class="employee-transcript-result"><Markdown text={t().result!} /></div></Show>
+            <Show when={t().result}><div class="employee-transcript-result"><Show when={!t().status}><small>上次收尾说明</small></Show><Markdown text={t().result!} /></div></Show>
             <Show when={!props.readonly}>
               <div class="employee-item-actions">
+                <Show when={t().status && ["done", "stopped", "failed", "cancelled"].includes(t().status!)}>
+                  <TaskRecordActions task={t()} me={props.me} act={props.act} />
+                </Show>
                 <Show when={thread()}>{(id) => <button type="button" onClick={() => props.open(id())}>看会话</button>}</Show>
                 <Show when={task()}>{(x) => <button type="button" onClick={() => void props.act("stop", x().threadId)}>停止此步骤</button>}</Show>
                 <Show when={pending() && !t().threadId && !t().dutyId}>
@@ -894,7 +972,7 @@ function TaskTree(props: { id: string; nodes: Todo[]; tasks: Task[]; now: () => 
                   </Show>
                 </Show>
                 <Show when={pending()}>
-                  <button type="button" title="连同它没开始的子任务一起撤掉；等它的兄弟任务不再等它" onClick={() => void props.act("dismiss", t().id)}>撤回</button>
+                  <button type="button" title="取消后保留任务记录，可在记录中继续执行" onClick={() => void props.act("dismiss", t().id)}>取消任务</button>
                 </Show>
               </div>
             </Show>

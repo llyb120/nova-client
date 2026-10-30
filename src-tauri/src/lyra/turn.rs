@@ -264,10 +264,10 @@ impl Session {
 /// 跑一轮：`input` 为本轮用户消息（None 表示只消化 steer 继续）。返回 BoxFuture 以便子 agent 递归派生。
 pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>) -> BoxFuture<'a, TurnOutcome> {
     Box::pin(async move {
-        // 包括 future 被 drop/abort：借用结束必须恢复原模型，不能依赖模型主动切回。
+        // 包括 future 被 drop/abort：普通聊天恢复借用前模型，员工保留同一任务的执行场景。
         struct Restore<'a>(&'a mut Session);
         impl Drop for Restore<'_> {
-            fn drop(&mut self) { while crate::lyra::scene::restore(self.0) {} }
+            fn drop(&mut self) { crate::lyra::scene::finish_turn(self.0); }
         }
         let guard = Restore(s);
         run_turn_inner(&mut *guard.0, input, on_event).await

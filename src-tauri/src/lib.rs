@@ -242,12 +242,9 @@ pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope>
         let scene = thread.auto_scene.as_deref().and_then(settings::Scene::parse)?;
         (scene, (thread.agent_kind.clone(), thread.model.clone().unwrap_or_default()), thread.employee_thread)
     };
-    // 数字员工的剑来段只有员工调度能开（要先排队占用桌面，见 employee::relay），不许会话内切到它；
-    // 其余场景照普通自动模式在会话内切换，后续在 lyra::bridge 里去掉 Computer。
-    if employee {
-        return Some(AutoScope { scene, covered: vec![scene], handoff: Vec::new() });
-    }
-    Some(scope_of(scene, &current, |s| state.scene_model(s).ok()))
+    Some(scope_of(scene, &current, |s| {
+        (!employee || employee::same_session(scene, s)).then(|| state.scene_model(s).ok()).flatten()
+    }))
 }
 
 /// 自动模式首条消息只说明场景切换的一般语义，不把当前模型/场景写进历史消息。
@@ -262,7 +259,7 @@ fn auto_mode_context(scope: &AutoScope, projects: &[String]) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     Some(format!(
-        "[Nova 自动模式] 场景切换使用内部工具 switch_scene(scene=\"coding\"|\"computer\", message=\"目标、约束和完成标准\")，\
+        "[Nova 自动模式] 场景切换使用内部工具 switch_scene(scene=当前开放的场景, message=\"目标、约束和完成标准\")，\
          在本会话内临时换模型，带着全部上下文继续。message 要写清目标、约束和完成标准。\
          默认由目标场景完成剩余任务并直接交付，不为收尾或重复总结切回轻量模型。只有调用方确有必须继续的工作时，才在 resume 参数写明具体后续工作；届时自动恢复调用方继续。\
          最终完成、出错或取消时仅还原初始模型配置，不额外请求模型，无需自行切回。\
@@ -289,7 +286,7 @@ fn auto_scope_skips_same_model_scenes() {
     let coding_context = auto_mode_context(&coding, &[]).unwrap();
     // 历史提示不绑定当前场景，临时模型看到相同的一般切换语义。
     assert_eq!(main_context, coding_context);
-    assert!(main_context.contains("switch_scene(scene=\"coding\"|\"computer\", message="));
+    assert!(main_context.contains("switch_scene(scene=当前开放的场景, message="));
     assert!(!main_context.contains("你是") && main_context.contains("（暂无项目）"));
     for context in [&main_context, &coding_context] {
         assert!(context.contains("目标、约束和完成标准") && context.contains("在本会话内临时换模型"));
@@ -303,9 +300,16 @@ fn auto_scope_skips_same_model_scenes() {
     // 三个场景同模型：直接执行，无需切换提示。
     let same = scope_of(Lightweight, &light, |_| Some(light.clone()));
     assert!(same.handoff.is_empty() && auto_mode_context(&same, &[]).is_none());
-    // 员工沿用隔离调度，无场景转交时不注入切换说明。
-    let employee = AutoScope { scene: Coding, covered: vec![Coding], handoff: vec![] };
-    assert!(auto_mode_context(&employee, &[]).is_none());
+    // 员工即使共用模型配置，也只能在轻量/编码之间共享工具和历史。
+    for scene in settings::Scene::ALL {
+        let scope = scope_of(scene, &light, |target| employee::same_session(scene, target).then(|| light.clone()));
+        assert_eq!(scope.desktop(), scene == Computer);
+        assert!(scope.handoff.is_empty());
+    }
+    let employee = scope_of(Lightweight, &light, |target| {
+        employee::same_session(Lightweight, target).then(|| (AgentKind::Lyra, target.key().into()))
+    });
+    assert_eq!(employee.handoff, vec![Coding]);
 }
 
 pub(crate) fn running_by_id(state: &AppState, thread_id: &str) -> bool {

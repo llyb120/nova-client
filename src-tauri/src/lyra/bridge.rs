@@ -401,8 +401,7 @@ async fn handle_prompt(
         use tauri::Manager;
         crate::auto_scope(&app.state::<crate::AppState>(), id)
     });
-    // 员工的剑来场景要先排队占用桌面，只能经 employee relay 换段，不参与会话内切换；其余场景与普通自动模式一致。
-    use crate::settings::Scene;
+    // 员工主会话只切轻量/编码；电脑会话独立，不能因配置了相同模型而跨边界暴露工具。
     let employee = app.as_ref().zip(request.get("novaThreadId").and_then(Value::as_str)).is_some_and(|(app, id)| {
         use tauri::Manager;
         app.state::<crate::AppState>().store.lock().unwrap().get(id).is_some_and(|t| t.employee_thread)
@@ -410,11 +409,12 @@ async fn handle_prompt(
     let routing = app.as_ref().and_then(|app| {
         use tauri::Manager;
         let state = app.state::<crate::AppState>();
-        auto.as_ref().filter(|scope| !employee || scope.scene != Scene::Computer).map(|scope| (scope.scene, Scene::ALL.into_iter()
-            .filter(|scene| !employee || *scene != Scene::Computer)
+        auto.as_ref().map(|scope| (scope.scene, crate::settings::Scene::ALL.into_iter()
+            .filter(|scene| !employee || crate::employee::same_session(scope.scene, *scene))
             .map(|scene| (scene, state.scene_models(scene).into_iter().map(|(_, model)| model).collect())).collect::<Vec<_>>()))
     });
-    let desktop = (routing.is_some() && !employee) || auto.as_ref().is_none_or(crate::AutoScope::desktop);
+    let desktop = if employee { auto.as_ref().is_some_and(crate::AutoScope::desktop) }
+        else { routing.is_some() || auto.as_ref().is_none_or(crate::AutoScope::desktop) };
     let shell = (!read_only).then(prompt::detect_shell);
     let prompt_options = SystemPromptOptions {
         cwd: cwd_path.display().to_string(),
@@ -455,6 +455,15 @@ async fn handle_prompt(
     }
     let routing = routing.map(|(scene, targets)| {
         let mut routing = crate::lyra::scene::Routing::new(scene, targets, &config_value, &env, system_prompt.clone(), tools.clone());
+        routing.retain_scene = employee;
+        if employee {
+            if let Some((app, id)) = app.clone().zip(request.get("novaThreadId").and_then(Value::as_str)) {
+                let id = id.to_string();
+                routing.on_selected = Some(std::sync::Arc::new(move |scene, model| {
+                    crate::employee::persist_scene(&app, &id, scene, model);
+                }));
+            }
+        }
         if let Some(app) = app.clone() {
             routing.on_failed = Some(std::sync::Arc::new(move |scene, model| {
                 use tauri::Manager;

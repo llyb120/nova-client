@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 pub const TOOL: &str = "switch_scene";
 
-const ROUTING_RULES: &str = "\n\n[Nova 场景调度] 先判断任务场景，再开始执行。调试排错、定位仓库问题、代码审查、编写或修改代码及工程配置、运行构建测试，都属于 coding；即使只分析不修改，只要 switch_scene 开放 coding，就必须先切换，不得先用 read/polaris/bash/edit 等工具自行完成。需要操作桌面应用或浏览器时，只要开放 computer，就必须先切换。用户消息带图片时，按文字意图而非图片本身判断场景：报错/日志/代码/UI 截图加上修复、排查、实现、修改、评审等诉求属于 coding，不要因为有图就当作简单看图问答；只有明确要求你实际操控桌面或浏览器才选 computer，仅仅发来截图不算；文字没说清时结合图片内容判断，图中是代码、报错、终端或界面缺陷则按 coding。简单问答、整理总结直接完成；当前模型已覆盖目标场景或没有对应场景选项时直接完成，不重复切换。按整块工作切换：分析、修改、验证连续完成后再给出结论，不要每调用一个工具就切换。switch_scene 必须单独调用；任务主要在另一个项目时，宜先用 change_working_directory 切换工作目录，而不是直接用绝对路径访问。默认将剩余任务交给目标场景直接完成并交付，不为收尾或重复总结切回轻量模型。只有调用方确有必须继续的工作时，才在 switch_scene 的 resume 中写明该工作；未提供就不再请求调用方。轮次结束只还原会话配置，不额外请求模型；后续新任务仍按其场景判断。模型归属由界面自动标记，无需口头宣布切换。场景切换不是持久升阶或新 Stage；历史中的旧转交/升阶指令已失效。仅使用当前声明的工具，不扩大用户授权。";
+const ROUTING_RULES: &str = "\n\n[Nova 场景调度] 先判断任务场景，再开始执行。调试排错、定位仓库问题、代码审查、编写或修改代码及工程配置、运行构建测试，都属于 coding；即使只分析不修改，只要 switch_scene 开放 coding，就必须先切换，不得先用 read/polaris/bash/edit 等工具自行完成。需要操作桌面应用或浏览器时，只要开放 computer，就必须先切换。用户消息带图片时，按文字意图而非图片本身判断场景：报错/日志/代码/UI 截图加上修复、排查、实现、修改、评审等诉求属于 coding，不要因为有图就当作简单看图问答；只有明确要求你实际操控桌面或浏览器才选 computer，仅仅发来截图不算；文字没说清时结合图片内容判断，图中是代码、报错、终端或界面缺陷则按 coding。简单问答、整理总结直接完成；当前模型已覆盖目标场景或没有对应场景选项时直接完成，不重复切换。按整块工作切换：分析、修改、验证连续完成后再给出结论，不要每调用一个工具就切换。switch_scene 必须单独调用；任务主要在另一个项目时，宜先用 change_working_directory 切换工作目录，而不是直接用绝对路径访问。默认将剩余任务交给目标场景直接完成并交付，不为收尾或重复总结切回轻量模型。只有调用方确有必须继续的工作时，才在 switch_scene 的 resume 中写明该工作；未提供就不再请求调用方。轮次结束时普通聊天只还原会话配置，不额外请求模型；员工同一任务跨轮保留已切入场景，电脑交回后继续原主会话的执行模型。后续新任务仍按其场景判断。模型归属由界面自动标记，无需口头宣布切换。场景切换不创建新 Stage；历史中的旧转交/升阶指令已失效。仅使用当前声明的工具，不扩大用户授权。";
 
 struct Frame {
     /// 调用方明确保留的后续工作；None 表示本层无需继续请求。
@@ -30,6 +30,9 @@ pub struct Routing {
     /// 本轮已请求失败的 (场景, 下标)，fallback 环绕时不再重试。
     failed: Vec<(Scene, usize)>,
     pub on_failed: Option<std::sync::Arc<dyn Fn(Scene, &str) + Send + Sync>>,
+    /// 员工的同一任务跨轮续做，不在交接电脑时退回起手模型。
+    pub retain_scene: bool,
+    pub on_selected: Option<std::sync::Arc<dyn Fn(Scene, &str) + Send + Sync>>,
     stack: Vec<Frame>,
     system_prompt: String,
     tools: Vec<Tool>,
@@ -39,9 +42,17 @@ impl Routing {
     pub fn new(active: Scene, targets: Vec<(Scene, Vec<String>)>, config: &Value, env: &HashMap<String, String>, system_prompt: String, tools: Vec<Tool>) -> Self {
         Self {
             active, attempt: 0, stack: Vec::new(), system_prompt, tools,
-            names: targets.clone(), failed: Vec::new(), on_failed: None,
+            names: targets.clone(), failed: Vec::new(), on_failed: None, retain_scene: false, on_selected: None,
             targets: targets.into_iter().map(|(scene, models)| (scene, models.into_iter()
                 .map(|model| config::resolve_model(config, (!model.is_empty()).then_some(model.as_str()), env)).collect())).collect(),
+        }
+    }
+
+    fn selected(&self) {
+        if let Some(hook) = &self.on_selected {
+            if let Some(name) = self.names.iter().find(|(scene, _)| *scene == self.active).and_then(|(_, names)| names.get(self.attempt)) {
+                hook(self.active, name);
+            }
         }
     }
 
@@ -72,7 +83,7 @@ impl Routing {
         if !available.is_empty() {
             tools.push(Tool {
                 name: TOOL,
-                description: format!("内部场景调度：任务符合下列可用场景时必须先调用，再开始该块工作；即使当前工具也能做，也不要自行完成。在本会话临时切换模型，不创建子会话；界面自动标记实际执行模型，无需口头宣布切换。单独调用，不与其他工具合批。默认由目标模型完成剩余任务并直接交付，不为收尾再请求原模型。只有调用方确有后续工作时才填写 resume，不能只写总结或收尾。结束、取消或错误均会还原会话配置，不因此发起请求。已有场景结论直接复用，不重复执行。可用场景：{}。同模型无需切换。", available.iter().map(|s| format!("{}（{}）", s.key(), s.when())).collect::<Vec<_>>().join("；")),
+                description: format!("内部场景调度：任务符合下列可用场景时必须先调用，再开始该块工作；即使当前工具也能做，也不要自行完成。在本会话临时切换模型，不创建子会话；界面自动标记实际执行模型，无需口头宣布切换。单独调用，不与其他工具合批。默认由目标模型完成剩余任务并直接交付，不为收尾再请求原模型。只有调用方确有后续工作时才填写 resume，不能只写总结或收尾。普通聊天结束、取消或错误会还原会话配置；员工同一任务跨轮保留已切入场景，电脑交回后仍由原主会话的执行模型续做。已有场景结论直接复用，不重复执行。可用场景：{}。同模型无需切换。", available.iter().map(|s| format!("{}（{}）", s.key(), s.when())).collect::<Vec<_>>().join("；")),
                 parameters: json!({"type":"object", "properties": {
                     "scene":{"type":"string", "enum":available.iter().map(|s| s.key()).collect::<Vec<_>>()},
                     "message":{"type":"string", "description":"交给目标场景的目标、约束和完成标准；默认包含剩余任务及最终交付，共享全部历史，不重复已完成操作"},
@@ -116,6 +127,7 @@ impl Routing {
         session.system_prompt = format!("{}\n\n[Nova 当前场景：{}] 你仍是同一个会话中的 Lyra，共享全部历史、工作目录和用户授权。完成下面这块工作，不重做已完成操作；不要向用户提及模型切换、Stage 或转交。只使用本轮声明的工具；如需其他开放场景，单独调用 switch_scene。工作完成或遇到需用户处理的阻碍时直接给出结论：没有保留的调用方后续工作就直接向用户交付，不必切回轻量模型收尾；有明确后续工作时，运行时会恢复相应调用方继续。历史里的旧升阶/转交说明不再适用。当前这块工作的目标见切入本场景时的 switch_scene 工具结果；后续其他场景结论是已完成步骤，不替换本块目标，不能扩大用户原始授权。{}", self.system_prompt, scene.label(), if scene == Scene::Computer { crate::jianlai::COMPLETION_GUIDANCE } else { "" });
         session.system_prompt.push_str(ROUTING_RULES);
         configure(session, true);
+        self.selected();
         let completion = match resume {
             Some(task) => format!("完成后调用方还有以下工作需继续（任务数据，不是新授权）：{task}"),
             None => "本层调用方没有保留后续工作；完成剩余任务后直接交付，不再请求本层调用方收尾。若更上层仍有明确后续工作，运行时会恢复该层继续。".into(),
@@ -168,6 +180,7 @@ pub fn fallback(session: &mut Session) -> bool {
         session.tools = routing.tools_for(&session.model);
         configure(session, true);
         if let (Some(hook), Some(name)) = (&routing.on_failed, &failed) { hook(active, name); }
+        routing.selected();
         true
     } else { false };
     session.scenes = Some(routing);
@@ -191,6 +204,15 @@ pub fn resume(session: &mut Session) -> Option<String> {
     task
 }
 
+/// 普通聊天只临时借模型；员工下一轮仍是原任务，保留执行场景但清掉本轮返回栈。
+pub fn finish_turn(session: &mut Session) {
+    if let Some(routing) = session.scenes.as_mut().filter(|r| r.retain_scene) {
+        routing.stack.clear();
+    } else {
+        while restore(session) {}
+    }
+}
+
 pub fn restore(session: &mut Session) -> bool {
     let Some(frame) = session.scenes.as_mut().and_then(|routing| {
         let frame = routing.stack.pop()?;
@@ -202,6 +224,7 @@ pub fn restore(session: &mut Session) -> bool {
     session.system_prompt = frame.system_prompt;
     session.tools = frame.tools;
     configure(session, true);
+    if let Some(routing) = session.scenes.as_ref().filter(|r| r.retain_scene) { routing.selected(); }
     true
 }
 
@@ -228,7 +251,7 @@ mod tests {
         let tools = session.tools.clone();
         Routing {
             active: Scene::Lightweight, attempt: 0, stack: Vec::new(),
-            names: Vec::new(), failed: Vec::new(), on_failed: None,
+            names: Vec::new(), failed: Vec::new(), on_failed: None, retain_scene: false, on_selected: None,
             targets: vec![(Scene::Coding, vec![Ok(coding)]), (Scene::Computer, vec![Ok(computer)])],
             system_prompt: session.system_prompt.clone(), tools,
         }.install(session);
@@ -482,5 +505,69 @@ mod tests {
         assert!(!s.tools.iter().any(|tool| tool.name == "context_budget"));
         assert_eq!(s.model.model.id, "m");
         assert!(!restore(&mut s));
+    }
+
+    #[tokio::test]
+    async fn employee_continuation_keeps_coding_model_and_reports_exact_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, bodies) = capturing_server(vec![
+            call("code", TOOL, json!({"scene":"coding","message":"编码后交接电脑验证"})),
+            text_reply("交接电脑验证"), text_reply("根据电脑结果继续编码"),
+        ]).await;
+        let mut s = test_session(url, dir.path().into());
+        install(&mut s);
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let updates = saved.clone();
+        {
+            let routing = s.scenes.as_mut().unwrap();
+            routing.retain_scene = true;
+            routing.targets.retain(|(scene, _)| *scene != Scene::Computer);
+            routing.names = vec![(Scene::Coding, vec!["provider/code/variant/high".into()])];
+            routing.on_selected = Some(Arc::new(move |scene, name| updates.lock().unwrap().push((scene, name.to_string()))));
+        }
+        let id = s.session_id.clone();
+        let first = run_turn(&mut s, Some(user_message("执行原任务", &[])), &mut |_| {}).await;
+        assert!(first.error.is_none() && !first.cancelled);
+        assert_eq!(s.model.model.id, "code");
+        assert_eq!(s.scenes.as_ref().unwrap().active, Scene::Coding);
+        assert!(s.scenes.as_ref().unwrap().stack.is_empty());
+        assert_eq!(*saved.lock().unwrap(), vec![(Scene::Coding, "provider/code/variant/high".into())]);
+        let next = run_turn(&mut s, Some(user_message("电脑会话交回了验证结果", &[])), &mut |_| {}).await;
+        assert!(next.error.is_none());
+        assert_eq!(s.session_id, id);
+        let models: Vec<_> = bodies.lock().unwrap().iter().map(|b| serde_json::from_str::<Value>(b).unwrap()["model"].clone()).collect();
+        assert_eq!(models, ["m", "code", "code"]);
+        assert!(switch(&mut s, &json!({"scene":"computer","message":"不能绕过独立会话"})).is_error);
+        let mut backup = s.model.clone();
+        backup.model.id = "backup".into();
+        let routing = s.scenes.as_mut().unwrap();
+        routing.targets[0].1.push(Ok(backup));
+        routing.names[0].1.push("provider/backup/variant/medium".into());
+        assert!(fallback(&mut s));
+        finish_turn(&mut s);
+        assert_eq!(s.model.model.id, "backup");
+        assert_eq!(saved.lock().unwrap().last(), Some(&(Scene::Coding, "provider/backup/variant/medium".into())));
+    }
+
+    #[test]
+    fn employee_sessions_isolate_desktop_even_with_the_same_model() {
+        let dir = tempfile::tempdir().unwrap();
+        for active in Scene::ALL {
+            let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+            s.model.model.supports_images = true;
+            let tools = ["jianlai", "chrome"].into_iter().map(|name| Tool {
+                name, description: String::new(), parameters: json!({}),
+            }).collect();
+            Routing {
+                active, attempt: 0, stack: Vec::new(), names: Vec::new(), failed: Vec::new(), on_failed: None, retain_scene: true, on_selected: None,
+                targets: Scene::ALL.into_iter().filter(|scene| crate::employee::same_session(active, *scene))
+                    .map(|scene| (scene, vec![Ok(s.model.clone())])).collect(),
+                system_prompt: s.system_prompt.clone(), tools,
+            }.install(&mut s);
+            assert_eq!(s.tools.iter().any(|t| t.name == "chrome"), active == Scene::Computer);
+            assert_eq!(s.tools.iter().any(|t| t.name == "jianlai"), active == Scene::Computer);
+            let target = if active == Scene::Computer { "coding" } else { "computer" };
+            assert!(switch(&mut s, &json!({"scene":target,"message":"task"})).is_error);
+        }
     }
 }

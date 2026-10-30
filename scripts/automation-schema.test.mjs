@@ -55,25 +55,35 @@ test('employee continuation and retry keep scheduler ownership', async()=>{
   assert.ok(dispatch.indexOf('employee::resume_prompt(') < dispatch.indexOf('dispatch_prompt('));
   assert.match(lib,/dispatch_user_prompt\(&app, thread_id, text, images\.unwrap_or_default\(\)\)/);
   assert.match(remote,/crate::dispatch_user_prompt\(app, thread_id\.to_string\(\), text\.to_string\(\), images\)/);
-  assert.match(employee,/start_segment\(app, &thread_id, text, images\)\?/);
-  assert.match(employee,/acquire_desktop\(&app, &id, &cancelled\)/);
+  assert.match(employee,/dispatch_active\(app, &thread_id, text, images\)\?/);
   assert.match(employee,/DISPATCH_LOCK\.lock\(\)/);
   assert.match(employee,/load\(\)\?\.require_live_task\(&item\)\?/);
   assert.match(employee,/action == "sequence_stop"/);
-  for (const call of ['dispatch_active(app, thread_id, text, images)', 'dispatch_active(&app, &id, text, images)',
-    'dispatch_active(app, root, text, Vec::new())', 'dispatch_active(app, &task.thread_id, ASK_NUDGE.into(), Vec::new())']) {
+  for (const call of ['dispatch_active(app, &thread_id, text, images)', 'dispatch_active(app, root, ASK_NUDGE.into(), Vec::new())']) {
     assert.ok(employee.includes(call), `missing cancellation gate: ${call}`);
   }
 });
-test('employee shared context is advertised and refreshed for starts and relays', async()=>{
+test('employee tasks reuse two isolated sessions, mark progress and share one desktop', async()=>{
   const schema = JSON.parse(await readFile(new URL('../scripts/employee-tool.json',import.meta.url),'utf8'));
-  const employee = await readFile(new URL('../src-tauri/src/employee.rs',import.meta.url),'utf8');
-  assert.ok(schema.inputSchema.properties.action.enum.includes('context'));
-  assert.match(schema.description,/context 查看本轮序列共享上下文/);
-  assert.match(schema.inputSchema.properties.id.description,/context/);
-  assert.match(employee,/segment_prompt\(e, item_id, prompt, head\)/);
-  assert.match(employee,/segment_prompt\(e, &item, &task\.prompt, &head\)/);
-  assert.match(employee,/sequence_context\(&e, item, selected\.as_deref\(\)\)/);
+  const [employee, bridge] = await Promise.all(['src-tauri/src/employee.rs', 'src-tauri/src/lyra/bridge.rs']
+    .map(path=>readFile(new URL(`../${path}`,import.meta.url),'utf8')));
+  const actions = schema.inputSchema.properties.action.enum;
+  assert.ok(actions.includes('progress') && actions.includes('defer'));
+  assert.ok(actions.includes('relay') && !actions.includes('context'));
+  assert.deepEqual(schema.inputSchema.properties.scene.enum, ['computer']);
+  assert.match(schema.description,/最多两个固定会话/);
+  assert.ok(schema.inputSchema.properties.key);
+  assert.match(employee,/segment_prompt\(e, &prompt, head\)/);
+  assert.match(employee,/Outcome::DeskBusy/);
+  assert.match(employee,/t\.session_thread\(computer\)/);
+  assert.match(employee,/t\.finish_segment\(computer, outcome, task\.started_ms, &full\)/);
+  assert.match(bridge,/crate::employee::same_session\(scope\.scene, \*scene\)/);
+  assert.match(bridge,/if employee \{ auto\.as_ref\(\)\.is_some_and\(crate::AutoScope::desktop\) \}/);
+  assert.doesNotMatch(bridge,/computer_gate|desktop_gate/);
+  assert.match(employee,/root\.as_deref\(\) != Some\(thread\.as_str\(\)\)/, 'idle computer sessions must not borrow their parent task');
+  const launch = employee.match(/fn launch\([\s\S]*?\n\}/)?.[0];
+  assert.ok(launch);
+  assert.doesNotMatch(launch,/stage_source_thread_id|fork_thread/);
   assert.doesNotMatch(employee,/只做下面这一件事，最后用一句话总结结果/);
 });
 test('employee development follows user workspace requirements without automatic git operations', async()=>{
@@ -82,14 +92,10 @@ test('employee development follows user workspace requirements without automatic
   const runtime = employee.split('#[cfg(test)]')[0];
   assert.ok(!schema.inputSchema.properties.action.enum.includes('worktree'));
   assert.match(schema.description,/只有用户明确要求时才用常规 Git 工具创建或复用 worktree/);
-  assert.match(schema.inputSchema.properties.cwd.description,/原样使用用户要求的目录/);
   assert.doesNotMatch(runtime,/crate::gitwt::|fn (?:ensure_worktree|sync_worktree|commit_worktree|remove_worktrees|git_ident)\(/);
   assert.doesNotMatch(runtime,/employee action=worktree|本轮结束时系统自动提交/);
   assert.match(runtime,/未要求 worktree 就在用户指定的项目目录工作/);
-  assert.match(runtime,/旧步骤模板、交接或记忆中的.*不是用户授权/);
-  assert.match(runtime,/t\.relay = Some\(\(scene, cwd\)\)/);
-  assert.match(runtime,/cwd\.unwrap_or\(prev_cwd\)/);
-  assert.match(runtime,/历史工作树记录/);
+  assert.match(runtime,/记忆中的.*不是用户授权/);
 });
 test('employee external waits remain visible without looking completed', async()=>{
   const ts = (await import('typescript')).default;
@@ -131,13 +137,14 @@ test('employee trees show serial, relayed and parallel execution paths', async()
     {id:'join',parent:'root',after:['a','b'],createdAt:3}, {id:'detached',origin:'a',createdAt:4}];
   for(let i=0;i<15;i++) nodes.push({id:`deep${i}`,parent:i?`deep${i-1}`:'a',createdAt:i});
   const branched = place(root,nodes);
-  assert.equal(branched.placed.length,nodes.length,'deep children and independent sequences remain visible');
+  assert.equal(branched.placed.length,nodes.length-1,'deep children stay visible without merging independent sequences');
   const at = id=>branched.placed.find(p=>p.t.id===id);
   assert.equal(at('a').y,at('b').y,'parallel steps occupy the same row');
   assert.notEqual(at('a').x,at('b').x);
   assert.ok(at('join').y>at('deep14').y && at('join').y>at('b').y,'join waits for entire predecessor subflows');
   assert.deepEqual(branched.links.filter(l=>l.to==='join').map(l=>l.from).sort(),['b','deep14']);
-  assert.ok(branched.links.find(l=>l.from==='a' && l.to==='detached').detached);
+  assert.ok(!branched.placed.some(p=>p.t.id==='detached'));
+  assert.deepEqual(place(nodes.find(t=>t.id==='detached'),nodes).placed.map(p=>p.t.id),['detached']);
   for(const a of branched.placed) for(const b of branched.placed) if(a!==b) {
     assert.ok(a.x+w<=b.x || b.x+w<=a.x || a.y+h<=b.y || b.y+h<=a.y,'cards do not overlap');
   }
@@ -145,18 +152,276 @@ test('employee trees show serial, relayed and parallel execution paths', async()
     {id:'relay',parent:'step1',createdAt:2},{id:'step2',parent:'root',after:['step1'],createdAt:3}]);
   assert.deepEqual(relayed.links.map(l=>`${l.from}->${l.to}`).sort(),['root->step1','step1->relay','relay->step2'].sort());
   assert.equal(new Set(relayed.placed.map(p=>p.x)).size,1,'relay segments are inline, not side branches');
-  assert.deepEqual(dash({}, {status:'done'}),[]);
-  assert.deepEqual(dash({}, {threadId:'live'}),[]);
-  assert.deepEqual(dash({}, {}),[5,4]);
-  assert.deepEqual(dash({detached:true}, {status:'done'}),[2,4]);
-  assert.equal(rootOf('deep14',nodes).id,'root');
-  assert.equal(rootOf('detached',nodes).id,'detached','stopping does not follow origin');
+  assert.deepEqual(dash({status:'done'}),[]);
+  assert.deepEqual(dash({threadId:'live'}),[]);
+  assert.deepEqual(dash({}),[5,4]);
+  assert.equal(rootOf('deep14',new Map(nodes.map(t=>[t.id,t]))).id,'root');
+  assert.equal(rootOf('detached',new Map(nodes.map(t=>[t.id,t]))).id,'detached','stopping does not follow origin');
   assert.deepEqual(place(undefined,nodes),{placed:[],links:[]});
   const cycleRoot = {id:'root',parent:'a',createdAt:0};
   assert.equal(place(cycleRoot,[cycleRoot,nodes[1]]).placed.length,2);
   assert.match(view,/props\.act\("sequence_stop", root\.id\)/);
-  assert.match(view,/停止本轮序列/);
+  assert.match(view,/停止任务/);
   assert.match(view,/disabled=\{stopping\(\)\}/);
+});
+test('employee sequences stay separate even with a shared duty or derived origin', async()=>{
+  const ts = (await import('typescript')).default;
+  const view = await readFile(new URL('../src/components/EmployeeView.tsx',import.meta.url),'utf8');
+  const helpers = ['sequenceRoot','indexSequences'].map(name=>view.match(new RegExp(`function ${name}\\([\\s\\S]*?\\n\\}`))?.[0]);
+  assert.ok(helpers.every(Boolean));
+  const js = ts.transpileModule(helpers.join('\n'), {compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const index = new Function(`${js}\nreturn indexSequences;`)();
+  const nodes = [
+    {id:'first',dutyId:'duty',status:'done'},
+    {id:'second',dutyId:'duty'},
+    {id:'derived',origin:'first',fromDuty:'duty'},
+    {id:'nested',origin:'derived',fromDuty:'duty'},
+    {id:'step',parent:'derived'},
+  ];
+  const grouped = index(nodes);
+  assert.deepEqual(grouped.tops.map(t=>t.id),['first','second','derived','nested']);
+  assert.deepEqual(grouped.members.get('first').map(t=>t.id),['first'],'finished sources are not kept active by independent tasks');
+  assert.deepEqual(grouped.members.get('derived').map(t=>t.id),['derived','step']);
+  assert.equal(grouped.rootById.get('step').id,'derived');
+  assert.doesNotMatch(view,/familyTop|familyRoots|familyNodes|sequenceNodes/);
+  assert.match(view,/const sequences = createMemo\(\(\) => indexSequences\(nodes\(\)\)\)/);
+  assert.match(view,/const layout = createMemo\(\(\) => layoutTree\(top\(\), displayNodes\(\)\)\)/);
+  for (const name of ['taskRows','recentRows','current','currentKey']) {
+    assert.match(view,new RegExp(`const ${name} = createMemo\\(`),'row bindings must reuse computed lists and selection');
+  }
+  let reads = 0;
+  const many = Array.from({length:300},(_,i)=>({get id(){reads++;return `t${i}`;},createdAt:i}));
+  const full = index(many);
+  for (const root of full.tops) assert.equal(full.members.get(root.id).length,1);
+  assert.ok(reads < many.length * 12,`flat sequences must build one index, not scan the full list per row (${reads} reads)`);
+  const orphan = {id:'orphan',parent:'gone'};
+  assert.equal(index([orphan]).rootById.get('orphan'),orphan);
+  assert.deepEqual(index([]).tops,[]);
+  const cycle = index([{id:'a',parent:'b'},{id:'b',parent:'a'}]);
+  assert.equal(cycle.rootById.size,2,'malformed legacy data must not loop forever');
+});
+test('employee plans draw future steps inside one task without pretending logs are a plan', async()=>{
+  const ts = (await import('typescript')).default;
+  const view = await readFile(new URL('../src/components/EmployeeView.tsx',import.meta.url),'utf8');
+  const schema = await tool('employee');
+  assert.ok(schema.inputSchema.properties.plan);
+  assert.deepEqual(schema.inputSchema.properties.plan.items.required,['content','status']);
+  const constants = [view.match(/const NODE:[\s\S]*?\n\};/)?.[0],view.match(/const \[NODE_W,[^\n]+;/)?.[0]];
+  const helpers = ['nodeState','executionNodes','sortSiblings','layoutTree'].map(name=>view.match(new RegExp(`function ${name}\\([\\s\\S]*?\\n\\}`))?.[0]);
+  assert.ok(constants.every(Boolean) && helpers.every(Boolean));
+  const js = ts.transpileModule([...constants,...helpers].join('\n'),{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const {nodesFor,place,stateOf} = new Function(`${js}\nreturn {nodesFor:executionNodes,place:layoutTree,stateOf:nodeState};`)();
+  const top = {id:'t',text:'整个任务',threadId:'work',createdAt:1,plan:[
+    {content:'读需求',status:'completed'},{content:'编码',status:'in_progress'},
+    {content:'构建',status:'pending'},{content:'验证',status:'pending'}]};
+  const original = JSON.stringify(top);
+  const nodes = nodesFor(top,[top]);
+  assert.equal(nodes.length,5);
+  assert.equal(JSON.stringify(top),original,'diagram projection does not create or mutate scheduled tasks');
+  const flow = place(top,nodes);
+  assert.equal(flow.placed.length,5);
+  assert.deepEqual(flow.links.map(l=>[l.from,l.to]),[['t','t/plan/0'],['t/plan/0','t/plan/1'],['t/plan/1','t/plan/2'],['t/plan/2','t/plan/3']]);
+  assert.deepEqual(nodes.slice(1).map(t=>stateOf(t,nodes,[{itemId:'t',queued:false}],1)),['done','running','future','future']);
+  top.waiting = '验证码';
+  assert.equal(stateOf(nodes[2],nodes,[],1),'help');
+  top.waiting = '';
+  top.status = 'done';
+  assert.equal(stateOf(nodes[2],nodes,[],1),'unverified','task completion cannot invent unreported step completion');
+  assert.equal(stateOf(nodes[4],nodes,[],1),'future');
+  const legacy = [{id:'old',text:'一项任务',progress:[{text:'3/3 某次操作结束'}]}];
+  assert.equal(nodesFor(legacy[0],legacy),legacy,'no invented plan from a free-text progress counter');
+  assert.match(view,/尚未登记步骤计划/);
+  assert.match(view,/setSelected\(hit\.t\.planStep === undefined \? hit\.t\.id : top\(\)!\.id\)/,'step clicks still act on the single task');
+});
+test('employee task deletion confirms once, covers active and finished details, and revokes runtime before cancellation', async()=>{
+  const ts = (await import('typescript')).default;
+  const [view,employee] = await Promise.all(['src/components/EmployeeView.tsx','src-tauri/src/employee.rs']
+    .map(path=>readFile(new URL(`../${path}`,import.meta.url),'utf8')));
+  const component = view.match(/function DeleteTaskButton\([\s\S]*?\n\}/)?.[0];
+  assert.ok(component);
+  const logic = `${component.slice(0,component.indexOf('  return <button'))}\n  return {remove,deleting};\n}`;
+  const js = ts.transpileModule(logic,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const signal = value=>[()=>value,next=>{value=next;}];
+  const createButton = new Function('createSignal','confirm','showToast',`${js}\nreturn DeleteTaskButton;`);
+  let requested = 0;
+  const cancelled = createButton(signal,async()=>false,()=>assert.fail('unexpected toast'))({id:'t',act:async()=>{requested++;}});
+  await cancelled.remove();
+  assert.equal(requested,0,'cancelling confirmation must not delete');
+  assert.equal(cancelled.deleting(),false);
+  let confirmCount = 0, approve, finish;
+  const calls = [];
+  const active = createButton(signal,()=>{confirmCount++;return new Promise(resolve=>{approve=resolve;});},()=>assert.fail('unexpected toast'))({
+    id:'task',act:(...args)=>{calls.push(args);return new Promise(resolve=>{finish=resolve;});},
+  });
+  const pending = active.remove();
+  assert.equal(active.deleting(),true);
+  await active.remove();
+  assert.equal(confirmCount,1,'double clicks must not open multiple dialogs');
+  approve(true);
+  await new Promise(setImmediate);
+  assert.deepEqual(calls,[['task_delete','task']]);
+  assert.equal(active.deleting(),true,'disable the button until deletion finishes');
+  finish(true);
+  await pending;
+  assert.equal(active.deleting(),false);
+  let selectedId = 'confirmed-task', decide;
+  const refreshing = createButton(signal,()=>new Promise(resolve=>{decide=resolve;}),error=>assert.fail(error))({
+    get id(){return selectedId;},act:async(...args)=>{calls.push(args);},
+  });
+  const deleting = refreshing.remove();
+  selectedId = 'another-task';
+  decide(true);
+  await deleting;
+  assert.deepEqual(calls.at(-1),['task_delete','confirmed-task'],'refreshing the selected task during confirmation must not change the authorized deletion target');
+  const errors = [];
+  const failed = createButton(signal,async()=>{throw new Error('dialog unavailable');},error=>errors.push(error))({id:'t',act:async()=>assert.fail('no confirmation')});
+  await failed.remove();
+  assert.equal(failed.deleting(),false);
+  assert.match(errors[0],/dialog unavailable/);
+  assert.match(view,/<Show when=\{!peer\}><DeleteTaskButton id=\{x\(\)\.threadId\} act=\{act\}/,'legacy run details have deletion too');
+  assert.match(view,/<Show when=\{!props\.readonly && top\(\)\}><DeleteTaskButton id=\{top\(\)!\.id\}/,'finished tasks must not lose their delete action');
+  assert.match(component,/disabled=\{deleting\(\)\}/);
+  const remove = employee.match(/async fn delete_task\([\s\S]*?\n\}/)?.[0];
+  assert.ok(remove);
+  assert.match(remove,/DISPATCH_LOCK\.lock\(\)/);
+  assert.ok(remove.indexOf('e.delete_task(id, who, now_ms())') < remove.indexOf('rt.release('));
+  assert.ok(remove.indexOf('rt.release(') < remove.indexOf('crate::cancel_turn('),'in-flight tools must lose authorization before async cancellation');
+  assert.match(remove,/crate::vault::drop_temp/);
+  assert.doesNotMatch(remove,/remove_threads|std::fs::remove|delete_thread/,'task deletion must preserve conversations and workspace files');
+  assert.match(employee,/action == "task_delete"/);
+});
+test('employee history filters before paging and recovery actions confirm and submit once', async()=>{
+  const ts = (await import('typescript')).default;
+  const [view,employee,schema] = await Promise.all(['src/components/EmployeeView.tsx','src-tauri/src/employee.rs','scripts/employee-tool.json']
+    .map(path=>readFile(new URL(`../${path}`,import.meta.url),'utf8')));
+  const filtered = view.match(/const filteredRows = createMemo\([^\n]+;/)?.[0];
+  assert.ok(filtered);
+  const rows = [...Array.from({length:35},(_,i)=>({key:`done${i}`,state:'done'})),{key:'cancelled',state:'cancelled'},{key:'failed',state:'failed'},{key:'stopped',state:'stopped'}];
+  const filterJs = ts.transpileModule(filtered,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const filter = new Function('createMemo','recentRows','historyFilter',`${filterJs}\nreturn filteredRows();`);
+  for(const state of ['done','cancelled','failed','stopped']) {
+    assert.deepEqual(filter(fn=>fn,()=>rows,()=>state),rows.filter(r=>r.state===state));
+  }
+  assert.deepEqual(filter(fn=>fn,()=>rows,()=>'all'),rows);
+  assert.match(view,/filteredRows\(\)\.slice\(0, historyLimit\(\)\)/);
+  assert.doesNotMatch(view,/\.slice\(0, SHOWN\)\.map\(\(x\) => x\.row\)/);
+  assert.match(view,/任务记录/);
+  assert.match(view,/cancelled: \{ label: "已取消"/);
+  const component = view.match(/function TaskRecordActions\([\s\S]*?\n\}/)?.[0];
+  assert.ok(component);
+  const logic = `${component.slice(0,component.indexOf('  return <>'))}\n  return {restore,pending};\n}`;
+  const js = ts.transpileModule(logic,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const signal = value=>[()=>value,next=>{value=next;}];
+  const button = new Function('createSignal','confirm','showToast',`${js}\nreturn TaskRecordActions;`);
+  const calls = [];
+  const cancelled = button(signal,async()=>false,()=>assert.fail('unexpected toast'))({task:{id:'t'},me:'',act:async(...args)=>calls.push(args)});
+  await cancelled.restore(true);
+  assert.deepEqual(calls,[]);
+  assert.equal(cancelled.pending(),'');
+  const resume = button(signal,()=>assert.fail('continuation is not a restart'),()=>assert.fail('unexpected toast'))({task:{id:'t'},me:'',act:async(...args)=>calls.push(args)});
+  await resume.restore(false);
+  assert.deepEqual(calls,[['task_resume','t']]);
+  let confirmed = 0,approve,finish;
+  const restart = button(signal,()=>{confirmed++;return new Promise(resolve=>{approve=resolve;});},()=>assert.fail('unexpected toast'))({task:{id:'t'},me:'',act:(...args)=>{calls.push(args);return new Promise(resolve=>{finish=resolve;});}});
+  const pending = restart.restore(true);
+  await restart.restore(true);
+  await restart.restore(false);
+  assert.equal(confirmed,1);
+  approve(true);
+  await new Promise(setImmediate);
+  assert.deepEqual(calls,[['task_resume','t'],['task_restart','t']]);
+  assert.equal(restart.pending(),'restart');
+  finish(true);
+  await pending;
+  assert.equal(restart.pending(),'');
+  const denied = button(signal,()=>assert.fail('not owner'),()=>assert.fail('unexpected toast'))({task:{id:'t',owner:{token:'alice'}},me:'bob',act:()=>assert.fail('not owner')});
+  await denied.restore(false);
+  await denied.restore(true);
+  const errors = [];
+  const failed = button(signal,async()=>{throw new Error('dialog unavailable');},error=>errors.push(error))({task:{id:'t'},me:'',act:()=>assert.fail('no confirmation')});
+  await failed.restore(true);
+  assert.equal(failed.pending(),'');
+  assert.match(errors[0],/dialog unavailable/);
+  const reopen = employee.match(/^fn reopen_task\([\s\S]*?^\}/m)?.[0];
+  assert.ok(reopen);
+  for(const guard of ['DISPATCH_LOCK.lock()', 'rt.tasks.iter().any', 'crate::running_by_id', 'store.get(th).is_none()']) {
+    assert.ok(reopen.indexOf(guard)>=0 && reopen.indexOf(guard)<reopen.indexOf('e.reopen_task('),`${guard} must run before reopening the record`);
+  }
+  assert.match(employee,/action, "task_resume" \| "task_restart"/);
+  assert.match(JSON.parse(schema).description,/done 取消待办\/驳回待确认并保留记录/);
+});
+test('employee scene retention is separate from ordinary temporary routing', async()=>{
+  const [bridge,scene,turn,employee] = await Promise.all(['src-tauri/src/lyra/bridge.rs','src-tauri/src/lyra/scene.rs','src-tauri/src/lyra/turn.rs','src-tauri/src/employee.rs']
+    .map(path=>readFile(new URL(`../${path}`,import.meta.url),'utf8')));
+  assert.match(bridge,/routing\.retain_scene = employee/);
+  assert.match(bridge,/if employee \{[\s\S]*?crate::employee::persist_scene\(&app, &id, scene, model\)/);
+  assert.match(turn,/scene::finish_turn\(self\.0\)/);
+  assert.match(scene,/retain_scene: false/);
+  const finish = scene.match(/pub fn finish_turn\([\s\S]*?\n\}/)?.[0];
+  assert.match(finish,/routing\.stack\.clear\(\)/);
+  assert.match(finish,/while restore\(session\)/);
+  const persist = employee.match(/pub\(crate\) fn persist_scene\([\s\S]*?\n\}/)?.[0];
+  assert.match(persist,/store\.save_thread\(id\)/);
+  assert.doesNotMatch(persist,/set_thread_agent|fork_thread|new_thread/);
+});
+test('employee refreshes coalesce in flight without dropping the last update', async()=>{
+  const ts = (await import('typescript')).default;
+  const view = await readFile(new URL('../src/components/EmployeeView.tsx',import.meta.url),'utf8');
+  const start = view.indexOf('  let fetching =');
+  assert.ok(start>=0);
+  const code = view.slice(start,view.indexOf('  void refetch();',start));
+  const js = ts.transpileModule(code,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const pending = [], snapshots = [], errors = [];
+  let failure = '';
+  const {refresh,dispose} = new Function('call','setStore','reconcile','setNow','setFailed','peer','showToast','failed','batch',
+    `${js}\nreturn {refresh:refetch,dispose:()=>{disposed=true;}};`)(
+      ()=>new Promise((resolve,reject)=>pending.push({resolve,reject})),
+      (_,snap)=>snapshots.push(snap),v=>v,()=>{},v=>{failure=v;},false,v=>errors.push(v),()=>failure,fn=>fn());
+  const first = refresh();
+  await Promise.all(Array.from({length:5},()=>refresh()));
+  assert.equal(pending.length,1,'polls and change events share the current request');
+  pending[0].resolve({version:1});
+  await first;
+  assert.equal(pending.length,2,'events during a request get exactly one trailing refresh');
+  pending[1].resolve({version:2});
+  await new Promise(setImmediate);
+  assert.deepEqual(snapshots,[{version:1},{version:2}]);
+  const failing = refresh();
+  pending[2].reject(new Error('offline'));
+  await failing;
+  assert.equal(errors.length,1);
+  assert.match(failure,/offline/);
+  const retry = refresh();
+  pending[3].resolve({version:3});
+  await retry;
+  assert.equal(failure,'','a failed request must not lock future refreshes');
+  const leaving = refresh();
+  await refresh();
+  dispose();
+  pending[4].resolve({version:4});
+  await leaving;
+  await refresh();
+  assert.equal(pending.length,5,'unmount cancels the trailing refresh');
+  assert.equal(snapshots.length,3,'late replies cannot mutate a disposed board');
+});
+test('employee desktop cooldown is enforced before dispatch and each tool claim', async()=>{
+  const employee = await readFile(new URL('../src-tauri/src/employee.rs',import.meta.url),'utf8');
+  const respond = employee.match(/pub\(crate\) fn respond_takeover\([\s\S]*?\n\}/)?.[0];
+  assert.ok(respond.indexOf('e.pause_desktop(') < respond.indexOf('tx.send('));
+  const claim = employee.match(/pub\(crate\) async fn claim_desktop\([\s\S]*?\n\}/)?.[0];
+  assert.ok(claim.indexOf('take_desktop(&root)?') < claim.indexOf('Step::Go => return Ok(())'));
+  const take = employee.match(/fn take_desktop\([\s\S]*?\n\}/)?.[0];
+  assert.match(take,/now_ms\(\) < e\.desktop_ask_after/);
+  assert.match(take,/!cooling && !locked/);
+  assert.match(take,/e\.defer_desktop_request\(now_ms\(\)\)/);
+  const relay = employee.slice(employee.indexOf('"relay" => {'),employee.indexOf('"progress" => {'));
+  assert.match(relay,/e\.defer_desktop_request\(now_ms\(\)\)/);
+  for (const name of ['next_due','triggers','sleep_for']) {
+    const scheduler = employee.match(new RegExp(`fn ${name}[\\s\\S]*?\\n\\}`))?.[0];
+    assert.ok(scheduler);
+    assert.doesNotMatch(scheduler,/pause_desktop|defer_desktop_request/);
+  }
+  assert.match(employee,/if outcome == Outcome::Yielded \{ e\.pause_desktop\(now\); \}/);
 });
 test('employee board and tree details use separate responsive horizontal panes', async()=>{
   const css = await readFile(new URL('../src/components/EmployeeView.css',import.meta.url),'utf8');
