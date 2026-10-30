@@ -44,7 +44,7 @@ let handler,stops=0,toggles=0;
 class Element { constructor(terminal=false) { this.terminal=terminal; this.tagName='TEXTAREA'; } closest() { return this.terminal?this:null; } }
 const state={settings:{sessionShortcuts:[]}};
 const meteorRecording=[];
-const shortcuts=load('../src/sessionShortcuts.ts',{'solid-js':{onMount:cb=>cb(),onCleanup:()=>{}},'./store':{ALL_AGENT_KINDS:[],state},'./ipc':{api:{setMeteorShortcutRecording:async active=>meteorRecording.push(active)}}},{HTMLElement:Element,window:{__TAURI_INTERNALS__:{},addEventListener:(_event,cb)=>handler=cb,removeEventListener:()=>{}}});
+const shortcuts=load('../src/sessionShortcuts.ts',{'solid-js':{onSettled:cb=>cb()},'./store':{ALL_AGENT_KINDS:[],state},'./ipc':{api:{setMeteorShortcutRecording:async active=>meteorRecording.push(active)}}},{HTMLElement:Element,window:{__TAURI_INTERNALS__:{},addEventListener:(_event,cb)=>handler=cb,removeEventListener:()=>{}}});
 const event=(key,patch={})=>({key,code:'',ctrlKey:false,altKey:false,shiftKey:false,metaKey:false,target:new Element(),preventDefault(){this.defaultPrevented=true;},stopPropagation(){},...patch});
 const defaults=shortcuts.withDefaultSessionShortcuts([]);
 assert.equal(shortcuts.findSessionShortcut(event('`',{ctrlKey:true,code:'Backquote'}),defaults).action,'toggleTerminal');

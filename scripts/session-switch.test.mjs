@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { transformSync } from "esbuild";
-import { createEffect, createMemo, createRoot, createSignal } from "solid-js/dist/solid.js";
-import { createStore, reconcile } from "solid-js/store/dist/store.js";
+import { createEffect, createMemo, createRoot, createSignal, createStore, flush, reconcile } from "@solidjs/signals";
 import { taskChains } from "../src/taskChains.ts";
 
 const store = readFileSync(new URL("../src/store.ts", import.meta.url), "utf8");
@@ -22,24 +21,25 @@ test("文件面板开关跨会话保持，重新挂载恢复全局偏好", () =>
   const state = { get currentId() { return currentId(); } };
   const mount = () => createRoot(dispose => ({ dispose, ...new Function('createSignal', 'createEffect', 'state', 'workspaceLayout', 'setWorkspaceLayout', `${js(source)}; return {workspaceOpen, setWorkspaceOpen, workspaceRequest, setWorkspaceRequest};`)(createSignal, createEffect, state, layout.workspaceLayout, layout.setWorkspaceLayout) }));
   let panel = mount();
+  flush();
   try {
     assert.equal(panel.workspaceOpen(), false);
     panel.setWorkspaceOpen(true);
     panel.setWorkspaceRequest({path:'a.rs'});
-    setCurrentId('b');
+    setCurrentId('b'); flush();
     assert.equal(panel.workspaceOpen(), true);
     assert.equal(panel.workspaceRequest(), null, 'do not carry a file request to another session');
     panel.dispose(); layout = loadLayout(); panel = mount();
     assert.equal(panel.workspaceOpen(), true, 'reopening chat restores global open preference');
     panel.setWorkspaceOpen(false);
-    setCurrentId('a');
+    setCurrentId('a'); flush();
     assert.equal(panel.workspaceOpen(), false);
     panel.dispose(); layout = loadLayout(); panel = mount();
     assert.equal(panel.workspaceOpen(), false, 'closed preference survives remount too');
-    layout.setWorkspaceLayout({open:true,widthRatio:.6,minimap:false,softWrap:false});
+    layout.setWorkspaceLayout({open:true,widthRatio:.6,minimap:false,softWrap:false}); flush();
     assert.equal(panel.workspaceOpen(), true, 'appearance settings update the open chat immediately');
     assert.equal(loadLayout().workspaceLayout.widthRatio, .6);
-    layout.setWorkspaceLayout(layout.defaultWorkspaceLayout);
+    layout.setWorkspaceLayout(layout.defaultWorkspaceLayout); flush();
     assert.equal(panel.workspaceOpen(), false);
     assert.equal(loadLayout().workspaceLayout.widthRatio, null);
     assert.equal(loadLayout().workspaceLayout.minimap, true);
@@ -69,17 +69,17 @@ test("多 stage 同链反复切换复用导航列表，新增阶段后更新，�
       assert.equal(first.length, 200);
       const initialScans = scans;
       for (let i = 0; i < 1000; i++) {
-        setCurrentId(`s${i % 200}`);
+        setCurrentId(`s${i % 200}`); flush();
         assert.equal(stages(), first);
       }
       assert.equal(scans, initialScans);
-      setThreads([...initial, { id: "new", parentThreadId: "s199", createdAt: 200 }]);
+      setThreads([...initial, { id: "new", parentThreadId: "s199", createdAt: 200 }]); flush();
       assert.equal(stages().length, 201);
-      setThreads([{ id: "s199", parentThreadId: "missing", createdAt: 0 }]);
+      setThreads([{ id: "s199", parentThreadId: "missing", createdAt: 0 }]); flush();
       assert.equal(stages().length, 1);
-      setThreads([{ id: "s199", parentThreadId: "b", createdAt: 0 }, { id: "b", parentThreadId: "s199", createdAt: 1 }]);
+      setThreads([{ id: "s199", parentThreadId: "b", createdAt: 0 }, { id: "b", parentThreadId: "s199", createdAt: 1 }]); flush();
       assert.equal(stages().length, 2);
-      setCurrentId("missing");
+      setCurrentId("missing"); flush();
       assert.deepEqual(stages(), []);
     } finally { dispose(); }
   });
@@ -89,16 +89,16 @@ test("队列镜像移除旧 key，清空或挂起后整条链结束", () => {
   const [state, setState] = createStore({ promptQueued: {} });
   const source = store.slice(store.indexOf("export function setPromptQueuedThreads("), store.indexOf("const historyLoads ="));
   const update = new Function("state", "setState", "reconcile", `${js(source.replace("export ", ""))}; return setPromptQueuedThreads;`)(state, setState, reconcile);
-  update(new Set(["child"]));
+  update(new Set(["child"])); flush();
   const active = () => taskChains({
     threads: [{ id: "root" }, { id: "child", parentThreadId: "root" }],
     isRunning: () => false,
     queuedThreads: Object.keys(state.promptQueued),
   }).active;
   assert.equal(active().size, 2);
-  update(new Set(["other"]));
+  update(new Set(["other"])); flush();
   assert.deepEqual(Object.keys(state.promptQueued), ["other"]);
-  update(new Set());
+  update(new Set()); flush();
   assert.equal(active().size, 0);
   assert.deepEqual(Object.keys(state.promptQueued), []);
 });

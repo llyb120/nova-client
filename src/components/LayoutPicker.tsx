@@ -39,7 +39,7 @@ export function LayoutPicker(props: { threadId: string | null; anchorUp?: boolea
 
   return (
     <div class="layout-picker" ref={root}>
-      <button type="button" class="pill layout-picker-btn" classList={{ on: on() }} aria-expanded={open()} aria-haspopup="menu"
+      <button type="button" class={["pill layout-picker-btn", { on: on() }]} aria-expanded={open() ? "true" : "false"} aria-haspopup="menu"
         title={tid() ? "本会话的看板" : "为新会话选择看板"} onClick={toggle}>
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
           <rect x="1.7" y="2.2" width="12.6" height="11.6" rx="2" /><path d="M1.7 6h12.6M6.2 6v7.8" />
@@ -47,7 +47,7 @@ export function LayoutPicker(props: { threadId: string | null; anchorUp?: boolea
         <span class="pill-text">{label()}</span>
       </button>
       <Show when={open()}>
-        <div class="layout-popover" role="menu" classList={{ down: props.anchorUp === false }}>
+        <div class={["layout-popover", { down: props.anchorUp === false }]} role="menu">
           <Show when={tid() && layouts().length > 0}>
             <div class="layout-pop-head">本会话的看板</div>
             <For each={layouts()}>
@@ -62,7 +62,7 @@ export function LayoutPicker(props: { threadId: string | null; anchorUp?: boolea
           </Show>
           <div class="layout-pop-head">{tid() ? "添加看板" : "看板（新会话创建后自动添加）"}</div>
           <Show when={!tid()}>
-            <button type="button" role="menuitemradio" aria-checked={!pendingPreset()} class="layout-pop-item" classList={{ active: !pendingPreset() }}
+            <button type="button" role="menuitemradio" aria-checked={!pendingPreset() ? "true" : "false"} class={["layout-pop-item", { active: !pendingPreset() }]}
               onClick={() => { setPendingPreset(null); close(); }}>
               <span class="layout-pop-check">{!pendingPreset() ? "✓" : ""}</span>
               <span class="layout-pop-name">不使用看板</span>
@@ -71,7 +71,7 @@ export function LayoutPicker(props: { threadId: string | null; anchorUp?: boolea
           <Show when={presets().length > 0} fallback={<div class="layout-pop-empty">还没有看板预设，到会话侧栏「看板 → 配置」设计一个</div>}>
             <For each={presets()}>
               {(p) => (
-                <button type="button" role="menuitem" class="layout-pop-item" classList={{ active: !tid() && p.id === pendingPreset() }}
+                <button type="button" role="menuitem" class={["layout-pop-item", { active: !tid() && p.id === pendingPreset() }]}
                   onClick={() => { if (tid()) add(p.id); else { setPendingPreset(p.id); close(); } }}>
                   <span class="layout-pop-check">{tid() ? "＋" : p.id === pendingPreset() ? "✓" : ""}</span>
                   <span class="layout-pop-name">{p.name}</span>

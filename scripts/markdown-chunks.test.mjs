@@ -9,7 +9,7 @@ import { homedir } from 'node:os';
 import { createServer } from 'node:http';
 import { build } from 'esbuild';
 import { transformAsync } from '@babel/core';
-import solid from 'babel-preset-solid';
+import solid from '@solidjs/babel-plugin';
 import { chromium } from 'playwright-core';
 import { Marked } from 'marked';
 
@@ -44,12 +44,12 @@ for (const tail of ['```ts\na\n\nb\n```\n', '7. a\n\n   b\n\n8. c\n', '[late][x]
   }
 }
 
-const fixture = await transformAsync(`import {render} from 'solid-js/web'; import {createSignal} from 'solid-js';
+const fixture = await transformAsync(`import {render} from '@solidjs/web'; import {createSignal} from 'solid-js';
     import {Markdown} from './src/components/Markdown';
     const [text,setText]=createSignal(''); const [live,setLive]=createSignal(false);
     window.load=(value,stream=false)=>{setLive(stream);setText(value)};
     render(()=><div class="html-transcript" style="height:600px;overflow:auto;width:800px;overflow-anchor:none"><div class="html-turn"><Markdown text={text()} virtual live={live()} markFiles /></div></div>,document.body);`,
-  {filename:'markdown-check.tsx',configFile:false,babelrc:false,presets:[[solid,{generate:'dom'}]],parserOpts:{plugins:['jsx','typescript']}});
+  {filename:'markdown-check.tsx',configFile:false,babelrc:false,plugins:[[solid,{generate:'dom'}]],parserOpts:{plugins:['jsx','typescript']}});
 const bundle = await build({
   stdin: { contents: fixture.code, resolveDir: process.cwd(), sourcefile: 'markdown-check.tsx', loader: 'ts' },
   bundle: true, write: false, format: 'esm', platform: 'browser', conditions: ['browser'], outdir: '/tmp/markdown-check',
@@ -63,7 +63,7 @@ const bundle = await build({
     builder.onLoad({ filter: /\.tsx$/ }, async ({path}) => {
       const source = revision && path.endsWith('/components/LongMarkdown.tsx')
         ? execFileSync('git', ['show', `${revision}:src/components/LongMarkdown.tsx`], {encoding:'utf8'}) : await readFile(path, 'utf8');
-      const output = await transformAsync(source, {filename:path,configFile:false,babelrc:false,presets:[[solid,{generate:'dom'}]],parserOpts:{plugins:['jsx','typescript']}});
+      const output = await transformAsync(source, {filename:path,configFile:false,babelrc:false,plugins:[[solid,{generate:'dom'}]],parserOpts:{plugins:['jsx','typescript']}});
       return {contents:output.code,loader:'ts'};
     });
   }}],

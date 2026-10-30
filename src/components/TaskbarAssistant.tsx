@@ -2,8 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
-import { createEffect, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
-import { createStore, reconcile } from "solid-js/store";
+import { createEffect, createMemo, createSignal, flush, For, onCleanup, onSettled, Show, untrack } from "solid-js";
+import { createStore, reconcile } from "solid-js";
 import { fileToAttachment } from "./ImageAttachmentStrip";
 import { titleOf, type Capsule } from "./ThoughtCapsules";
 import "./TaskbarAssistant.css";
@@ -48,21 +48,22 @@ const draftStore = <T,>(run: (store: IDBObjectStore) => IDBRequest<T>, mode: IDB
 /** 会话动态 for the 会话 tab: the user's own running / recently finished sessions. */
 export function TaskbarSessions(props: { active: boolean }) {
   const [sessions, setSessions] = createStore<Session[]>([]);
+  const isActive = createMemo(() => props.active);
   const [error, setError] = createSignal("");
   const refresh = async () => {
-    if (!props.active) return;
+    if (!isActive()) return;
     try {
       const current = await invoke<Session[]>("taskbar_assistant_sessions");
       const rank = (session: Session) => session.kind === "running" || session.kind === "waiting" ? 0 : 1;
-      setSessions(reconcile([...current].sort((a, b) => rank(a) - rank(b) || b.updatedAt - a.updatedAt), { key: "threadId" }));
+      setSessions(reconcile([...current].sort((a, b) => rank(a) - rank(b) || b.updatedAt - a.updatedAt), "threadId"));
       setError("");
     } catch (e) { setError(String(e)); }
   };
-  createEffect(() => {
-    if (!props.active) return;
-    untrack(() => void refresh());
+  createEffect(isActive, active => {
+    if (!active) return;
+    void refresh();
     const timer = window.setInterval(() => void refresh(), 3000);
-    onCleanup(() => clearInterval(timer));
+    return () => clearInterval(timer);
   });
   const open = (threadId: string) => void invoke("taskbar_bubble_open", { threadId }).catch((e) => setError(String(e)));
   return (
@@ -85,6 +86,7 @@ export function TaskbarSessions(props: { active: boolean }) {
 
 export default function TaskbarAssistant(props: { active: boolean; shown: boolean; quick: boolean; focusRequest: number }) {
   const [messages, setMessages] = createStore<Message[]>([]);
+  const isActive = createMemo(() => props.active);
   const [text, setText] = createSignal("");
   const [sending, setSending] = createSignal(false);
   const [backendBusy, setBackendBusy] = createSignal(false);
@@ -136,9 +138,9 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
   const persist = (key: string, value: unknown) => {
     if (restored) draftStore((s) => s.put(value, key), "readwrite").catch((error) => setSendError(`草稿未能保存到本机：${String(error)}`));
   };
-  createEffect(() => persist("text", text()));
-  createEffect(() => persist("uploads", uploads()));
-  createEffect(() => persist("picked", picked()));
+  createEffect(text, value => persist("text", value));
+  createEffect(uploads, value => persist("uploads", value));
+  createEffect(picked, value => persist("picked", value));
   /** Closing the panel on the quick tab files the draft as 星尘 (text and each attachment separately) and keeps no draft.
    * Closing on any other tab keeps the draft as is. */
   const stash = async () => {
@@ -159,8 +161,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
     finally { setSending(false); }
   };
   let wasShown = false;
-  createEffect(() => {
-    const shown = props.shown;
+  createEffect(() => props.shown, shown => {
     if (wasShown && !shown && untrack(() => props.quick)) void stash();
     wasShown = shown;
   });
@@ -193,13 +194,13 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
     const ids = new Set(incoming.map((message) => message.id));
     const retained = messages.filter((message) => !ids.has(message.id));
     ++messageRevision;
-    setMessages(reconcile(older ? [...incoming, ...retained] : [...retained, ...incoming], { key: "id" }));
+    setMessages(reconcile(older ? [...incoming, ...retained] : [...retained, ...incoming], "id"));
     queueMicrotask(restoreView);
   };
 
   const refresh = async () => {
     // The first page also loads while hidden, so the first click opens on ready history.
-    if (disposed || (!props.active && initialized)) return;
+    if (disposed || (!isActive() && initialized)) return;
     if (refreshing || paging()) { refreshAgain = true; return; }
     refreshing = true;
     refreshAgain = false;
@@ -293,24 +294,24 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
     void invoke("taskbar_bubble_open", { threadId }).catch((error) => setSendError(String(error)));
   };
 
-  createEffect(() => {
-    if (!props.active) return;
+  createEffect(isActive, active => {
+    if (!active) return;
     queueMicrotask(restoreView);
-    untrack(() => void refresh());
+    void refresh();
     const timer = window.setInterval(() => void refresh(), 3000);
-    onCleanup(() => clearInterval(timer));
+    return () => clearInterval(timer);
   });
-  createEffect(() => {
-    const request = props.focusRequest;
-    if (!props.shown || !request || request === focusedRequest) return;
+  createEffect(() => [props.focusRequest, props.shown] as const, ([request, shown]) => {
+    if (!shown || !request || request === focusedRequest) return;
     focusedRequest = request;
     // Parent increments only after successful native placement of a click-opened panel.
     const focus = () => input.focus({ preventScroll: true });
     focus();
     // The first native activation can reach the WebView after this; focus again once it does.
     if (!document.hasFocus()) window.addEventListener("focus", focus, { once: true });
+    return () => window.removeEventListener("focus", focus);
   });
-  onMount(() => {
+  onSettled(() => {
     void Promise.all(["text", "uploads", "picked"].map((key) => draftStore((s) => s.get(key))))
       .then(([savedText, savedUploads, savedPicked]) => {
         if (disposed) return;
@@ -318,6 +319,8 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
         if (typeof savedText === "string" && !text()) setText(savedText);
         if (Array.isArray(savedUploads) && !uploads().length) setUploads(savedUploads as Upload[]);
         if (Array.isArray(savedPicked) && !picked().length) setPicked(savedPicked as Capsule[]);
+        // Commit restored fields before persisting; reads otherwise still see the empty draft.
+        flush();
         // Only after a successful read: never overwrite a saved draft we could not load.
         restored = true;
         persist("text", text()); persist("uploads", uploads()); persist("picked", picked());
@@ -337,19 +340,19 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
     window.addEventListener("keydown", redirect);
     const dismiss = (event: PointerEvent) => { if (menu() && !compose.contains(event.target as Node)) setMenu(""); };
     window.addEventListener("pointerdown", dismiss);
-    onCleanup(() => {
+    return () => {
       disposed = true;
       window.removeEventListener("keydown", redirect);
       window.removeEventListener("pointerdown", dismiss);
       resize.disconnect();
       void off.then((unlisten) => unlisten()).catch(() => {});
-    });
+    };
   });
 
   return (<>
     <section id="tb-pane-assistant" role="tabpanel" aria-labelledby="tb-tab-assistant" class="ta" hidden={!props.active}>
       <div class="ta-chat">
-        <div class="ta-history" ref={history} role="log" aria-label="助理聊天记录" aria-live="polite" tabIndex={0} onScroll={() => {
+        <div class="ta-history" ref={history} role="log" aria-label="助理聊天记录" aria-live="polite" tabindex={0} onScroll={() => {
           if (!history.clientHeight) return;
           const previousTop = view.top;
           view = readView();
@@ -367,7 +370,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
                 <article class={`ta-message ${message.role}`} data-message-id={message.id} aria-label={message.role === "user" ? "你" : "Nova 助理"}>
                   <span class="ta-avatar" aria-hidden="true">{message.role === "user" ? "我" : "N"}</span>
                   <div class="ta-message-content">
-                    <div class="ta-bubble" classList={{ typing: !message.text, md: message.role === "assistant" && !!message.text }}>
+                    <div class={["ta-bubble", { typing: !message.text, md: message.role === "assistant" && !!message.text }]}>
                       <Show when={message.text} keyed fallback={<>{message.status === "thinking" ? "正在思考中" : "会话正在输入中"}<span class="ta-dots" aria-hidden="true"><i /><i /><i /></span></>}>
                         {(text) => message.role === "assistant" ? <div class="ta-md" innerHTML={markdown(text)} onClick={openLink} /> : text}
                       </Show>
@@ -412,7 +415,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
             </For>
           </div>
         </Show>
-        <button type="button" class="ta-plus" classList={{ open: !!menu() }} title="添加图片、文件或星尘" aria-label="添加附件" aria-expanded={!!menu()} onClick={() => setMenu(menu() ? "" : "menu")}>
+        <button type="button" class={["ta-plus", { open: !!menu() }]} title="添加图片、文件或星尘" aria-label="添加附件" aria-expanded={!!menu() ? "true" : "false"} onClick={() => setMenu(menu() ? "" : "menu")}>
           <svg viewBox="0 0 12 12" width="13" height="13" aria-hidden="true"><path d="M6 2v8M2 6h8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
         </button>
         <Show when={menu() === "menu"}>
@@ -426,7 +429,7 @@ export default function TaskbarAssistant(props: { active: boolean; shown: boolea
           <div class="ta-menu ta-capsule-menu" role="listbox" aria-multiselectable="true" aria-label="选择星尘">
             <For each={capsules()} fallback={<div class="ta-empty">还没有星尘，可以拖入文字或文件收集</div>}>
               {(capsule) => (
-                <button type="button" role="option" aria-selected={picked().some((c) => c.id === capsule.id)} onClick={() => toggleCapsule(capsule)}>
+                <button type="button" role="option" aria-selected={picked().some((c) => c.id === capsule.id) ? "true" : "false"} onClick={() => toggleCapsule(capsule)}>
                   <span class="ta-check" aria-hidden="true" />{titleOf(capsule)}
                 </button>
               )}

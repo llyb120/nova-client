@@ -1,5 +1,5 @@
 import { message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, deep, For, onCleanup, onSettled, Show, untrack } from "solid-js";
 
 import { api } from "../ipc";
 import { latestFireStage } from "../threadDisplay";
@@ -51,7 +51,7 @@ const AUTO_MODE_KEY = "fd:newThreadAutoMode";
 
 /** codex 风格草稿首页：输入任务 + 选择项目/模型/模式，回车即开干 */
 export function HomeView() {
-  const sessionSeed = takePendingNewSessionSeed();
+  const sessionSeed = untrack(takePendingNewSessionSeed);
   const initialDraft = takeSessionDraft(null);
   const [text, setText] = createSignal(initialDraft?.text ?? "");
   const [quote, setQuote] = createSignal(sessionSeed?.quote ?? "");
@@ -59,17 +59,17 @@ export function HomeView() {
   const [slashStart, setSlashStart] = createSignal<number | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = createSignal(0);
   const attach = createImageAttachments({ enableFileDrop: true });
-  attach.set(initialDraft?.images ?? []);
+  onSettled(() => { attach.set(initialDraft?.images ?? []); });
   const noteFlow = createNoteFlow();
   const [cwd, setCwd] = createSignal(
     sessionSeed && !sessionSeed.roam ? sessionSeed.cwd : "",
   );
-  createEffect(() => setHomeTerminalCwd(cwd()));
+  createEffect(cwd, value => { setHomeTerminalCwd(value); });
   const [agentKind, setAgentKind] = createSignal<AgentKind>(
     sessionSeed?.agentKind ?? lastUsed.agentKind(),
   );
   // 默认沿用上一次使用的模型；模式固定 Build（Plan 仅由 /plan 启动）。
-  const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(agentKind()));
+  const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(untrack(agentKind)));
   const [mode, setMode] = createSignal("build");
   const [busy, setBusy] = createSignal(false);
   // 自动模式：按提示词自动选择项目目录与场景模型；场景模型配置只在此模式下用于新会话。
@@ -108,10 +108,7 @@ export function HomeView() {
     textareaRef.style.height = Math.min(textareaRef.scrollHeight, 220) + "px";
   };
 
-  createEffect(() => {
-    text();
-    queueMicrotask(resizeInput);
-  });
+  createEffect(text, () => queueMicrotask(resizeInput));
 
   const updateSlashState = (el = textareaRef, allowOpen = false) => {
     if (!el) return;
@@ -142,14 +139,12 @@ export function HomeView() {
   const [historyOpen, setHistoryOpen] = createSignal(false);
   const [activeHistoryIndex, setActiveHistoryIndex] = createSignal(0);
 
-  createEffect(() => {
-    const count = promptHistory().length;
-    if (activeHistoryIndex() >= count) setActiveHistoryIndex(Math.max(0, count - 1));
-    if (count === 0 && historyOpen()) setHistoryOpen(false);
+  createEffect(() => [promptHistory().length, activeHistoryIndex(), historyOpen()] as const, ([count, index, open]) => {
+    if (index >= count) setActiveHistoryIndex(Math.max(0, count - 1));
+    if (count === 0 && open) setHistoryOpen(false);
   });
 
-  createEffect(() => {
-    activeHistoryIndex();
+  createEffect(activeHistoryIndex, () => {
     historyMenuRef
       ?.querySelector(".prompt-history-item.active")
       ?.scrollIntoView({ block: "nearest" });
@@ -157,28 +152,29 @@ export function HomeView() {
 
   // 首页历史菜单与 slash 菜单一样向上展开，并限制在输入框上方的空间内。
   createEffect(() => {
-    if (!historyOpen()) return;
+    if (!historyOpen()) return false;
     void promptHistory().length;
+    return true;
+  }, open => {
+    if (!open) return;
     const sync = () => fitSlashMenuHeight(historyMenuRef, { maxHeight: 300 });
     const frame = requestAnimationFrame(sync);
     const host = textareaRef?.closest(".composer, .home-composer");
     const ro = host instanceof HTMLElement ? new ResizeObserver(sync) : undefined;
     if (host instanceof HTMLElement) ro?.observe(host);
     window.addEventListener("resize", sync);
-    onCleanup(() => {
+    return () => {
       cancelAnimationFrame(frame);
       ro?.disconnect();
       window.removeEventListener("resize", sync);
-    });
+    };
   });
 
-  createEffect(() => {
-    const count = slashSuggestions().length;
-    if (activeSlashIndex() >= count) setActiveSlashIndex(Math.max(0, count - 1));
+  createEffect(() => [slashSuggestions().length, activeSlashIndex()] as const, ([count, index]) => {
+    if (index >= count) setActiveSlashIndex(Math.max(0, count - 1));
   });
 
-  createEffect(() => {
-    activeSlashIndex();
+  createEffect(activeSlashIndex, () => {
     slashMenuRef
       ?.querySelector(".slash-item.active")
       ?.scrollIntoView({ block: "nearest" });
@@ -186,19 +182,22 @@ export function HomeView() {
 
   // Slash menu opens upward; clamp height to space above the composer.
   createEffect(() => {
-    if (slashQuery() === null) return;
+    if (slashQuery() === null) return false;
     void slashSuggestions().length;
+    return true;
+  }, open => {
+    if (!open) return;
     const sync = () => fitSlashMenuHeight(slashMenuRef);
     const frame = requestAnimationFrame(sync);
     const host = textareaRef?.closest(".composer, .home-composer");
     const ro = host instanceof HTMLElement ? new ResizeObserver(sync) : undefined;
     if (host instanceof HTMLElement) ro?.observe(host);
     window.addEventListener("resize", sync);
-    onCleanup(() => {
+    return () => {
       cancelAnimationFrame(frame);
       ro?.disconnect();
       window.removeEventListener("resize", sync);
-    });
+    };
   });
 
   const pickModel = (v: string) => {
@@ -253,24 +252,26 @@ export function HomeView() {
     if (choices.length === 0) return;
     const current = model();
     const resolved = resolveAvailableModel(agentKind(), current);
-    if (resolved !== current) setModel(resolved);
-  });
+    return resolved !== current ? resolved : undefined;
+  }, resolved => { if (resolved !== undefined) setModel(resolved); });
 
   // 漫游：拉取对端模型；到达后采用对端当前模型，并把后端/模式收敛到可用项。
   // 只在切换对端或对端配置确实变化时同步，避免覆盖用户随后在选择器里的手动选择。
   createEffect(() => {
     const t = roamPeerToken();
+    const pm = t ? state.peerModels[t] : undefined;
+    return { t, pm: pm ? deep(pm) : undefined, kind: agentKind(), selected: model() };
+  }, ({ t, pm, kind, selected }) => {
     if (!t) {
       lastRoamModelSyncKey = "";
       return;
     }
     ensurePeerModels(t);
-    const pm = state.peerModels[t];
-    if (!pm || !isSupportedAgentKind(agentKind())) return;
+    if (!pm || !isSupportedAgentKind(kind)) return;
     const backends = pm.backends.filter(isSupportedAgentKind);
-    const backend = backends.find((kind) => kind === agentKind()) ?? backends[0];
+    const backend = backends.find((candidate) => candidate === kind) ?? backends[0];
     if (!backend) return;
-    if (backend !== agentKind()) setAgentKind(backend);
+    if (backend !== kind) setAgentKind(backend);
 
     const source = pm.options[backend] ?? null;
     const models = modelChoices(backend, source);
@@ -282,24 +283,24 @@ export function HomeView() {
       let nextModel = models.find((item) => item.value)?.value ?? models[0]?.value ?? "";
       if (
         preferSeedModelOnRoamSync &&
-        model() &&
-        models.some((item) => item.value === model())
+        selected &&
+        models.some((item) => item.value === selected)
       ) {
-        nextModel = model();
+        nextModel = selected;
         preferSeedModelOnRoamSync = false;
       } else if (remoteModel && models.some((item) => item.value === remoteModel)) {
         nextModel = remoteModel;
       }
       setModel(nextModel);
-    } else if (!models.some((item) => item.value === model())) {
+    } else if (!models.some((item) => item.value === selected)) {
       setModel(models.find((item) => item.value)?.value ?? models[0]?.value ?? "");
     }
     setMode("build");
   });
 
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
-  createEffect(() => {
-    if (!usesPeerModels()) void ensureModelOptions(agentKind());
+  createEffect(() => usesPeerModels() ? null : agentKind(), kind => {
+    if (kind) void ensureModelOptions(kind);
   });
 
   // worktree 是否可用：漫游（对方仓库交给 host 校验）或本地当前目录是 git 仓库
@@ -307,19 +308,16 @@ export function HomeView() {
 
   // 本地会话：判断当前目录是否 git 仓库（决定 worktree 开关可用性）。
   // 漫游目录在对方机器上，无法本地判断，统一按可用处理、交由 host 校验。
-  createEffect(() => {
-    const dir = cwd();
-    if (usesPeerModels() || !dir) {
+  createEffect(() => [cwd(), usesPeerModels()] as const, ([dir, peer]) => {
+    if (peer || !dir) {
       setCwdIsRepo(false);
       return;
     }
     let stale = false;
-    onCleanup(() => {
-      stale = true;
-    });
     void api.isGitRepo(dir).then((ok) => {
       if (!stale) setCwdIsRepo(ok);
     });
+    return () => { stale = true; };
   });
 
   const selectProject = (p: string) => {
@@ -409,7 +407,7 @@ export function HomeView() {
     ensureScratchProject();
   };
 
-  onMount(() => {
+  onSettled(() => {
     if (!sessionSeed) {
       void restoreLastProject();
       return;
@@ -431,8 +429,8 @@ export function HomeView() {
     else void restoreLastProject();
   });
   // 快捷键/侧栏「新会话」后聚焦首页输入框（含已在首页、组件未重挂载的情况）。
-  createEffect(() => {
-    if (state.homeComposerFocusAt <= 0) return;
+  createEffect(() => state.homeComposerFocusAt, at => {
+    if (at <= 0) return;
     // 星尘「带入新会话」落在已挂载的首页时，把草稿并入当前输入。
     const draft = takeSessionDraft(null);
     if (draft) untrack(() => {
@@ -575,8 +573,8 @@ export function HomeView() {
   createEffect(() => {
     if (!showWorktreeDialog() || !roaming()) return;
     const target = roam();
-    if (!target) return;
-    const data = state.peerBranches[peerBranchKey(target.peer.token, target.folder)];
+    return target ? state.peerBranches[peerBranchKey(target.peer.token, target.folder)] : undefined;
+  }, data => {
     if (data) {
       setBranchList(data);
       if (!branchQuery().trim()) setBranchQuery(data.current || "");
@@ -800,8 +798,7 @@ export function HomeView() {
         </header>
 
         <div
-          class="home-composer"
-          classList={{ "is-dragging": attach.dragging() }}
+          class={["home-composer", { "is-dragging": attach.dragging() }]}
         >
           <noteFlow.Notes />
           <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
@@ -834,7 +831,7 @@ export function HomeView() {
                   {(item, index) => (
                     <button
                       type="button"
-                      classList={{ "slash-item": true, active: index() === activeSlashIndex() }}
+                      class={{ "slash-item": true, active: index() === activeSlashIndex() }}
                       onMouseEnter={() => setActiveSlashIndex(index())}
                       onMouseDown={(e) => {
                         e.preventDefault();
@@ -857,7 +854,7 @@ export function HomeView() {
                 {(item, index) => (
                   <button
                     type="button"
-                    classList={{ "prompt-history-item": true, active: index() === activeHistoryIndex() }}
+                    class={{ "prompt-history-item": true, active: index() === activeHistoryIndex() }}
                     onMouseEnter={() => setActiveHistoryIndex(index())}
                     onMouseDown={(e) => {
                       e.preventDefault();
@@ -1055,8 +1052,7 @@ export function HomeView() {
                         {(b) => (
                           <button
                             type="button"
-                            class="wt-combo-item"
-                            classList={{ active: b === branchQuery().trim() }}
+                            class={["wt-combo-item", { active: b === branchQuery().trim() }]}
                             onMouseDown={(e) => {
                               e.preventDefault();
                               setBranchQuery(b);

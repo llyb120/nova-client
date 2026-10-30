@@ -1,4 +1,4 @@
-import { createEffect, onCleanup, onMount, untrack } from "solid-js";
+import { createEffect, onCleanup, onSettled, untrack } from "solid-js";
 import type { Marked } from "marked";
 import { chunkMarkdown, markdownTokenText, type MarkdownChunk } from "../markdownChunks";
 import "./LongMarkdown.css";
@@ -181,9 +181,7 @@ export function LongMarkdown(props: {
 
   // The shared Markdown stream animation can tick every frame. Only lex its
   // unfinished tail at most every 80ms; completion/edit flushes synchronously.
-  createEffect(() => {
-    const text = props.text, live = props.live;
-    props.markFiles;
+  createEffect(() => [props.text, props.live, props.markFiles] as const, ([text, live]) => {
     if (!ready) return;
     if (!live || !text.replace(/\r\n?/g, "\n").startsWith(model.source)) {
       clearTimeout(timer); timer = undefined;
@@ -250,7 +248,7 @@ export function LongMarkdown(props: {
     entries.forEach(entry => observer!.observe(entry.element));
   }
 
-  onMount(() => {
+  onSettled(() => {
     root = host.closest<HTMLElement>(".html-transcript");
     sizes = new ResizeObserver(changes => {
       // Scroll may precede RO (including a late image load). Capture its NEW

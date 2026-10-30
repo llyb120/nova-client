@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, For, onSettled, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { jianpuFocus, setFocusRouteId, setJianpuFocus } from "../knowledgeGraph";
@@ -27,9 +27,11 @@ function describe(step: Step) {
  *  Plain signals, not createResource: a resource read here suspends the App-level <Suspense> and blanks the whole page. */
 function Shot(props: { id: string; name: string }) {
   const [src, setSrc] = createSignal("");
-  createEffect(on(() => [props.id, props.name] as const, ([id, name]) => {
-    void invoke<string>("jianpu_image", { id, name }).then(setSrc, () => setSrc(""));
-  }));
+  createEffect(() => [props.id, props.name] as const, ([id, name]) => {
+    let active = true;
+    void invoke<string>("jianpu_image", { id, name }).then(value => { if (active) setSrc(value); }, () => { if (active) setSrc(""); });
+    return () => { active = false; };
+  });
   return <Show when={src()}><img class="jianpu-shot" src={src()} alt={`点击截图 ${props.name}`} loading="lazy" /></Show>;
 }
 
@@ -45,24 +47,23 @@ export default function JianpuView() {
     void invoke<Detail>("jianpu_get", { id }).then(d => { if (selected() === id) setDetail(d); }, () => setDetail(null));
   };
   void refetch();
-  createEffect(on(selected, reloadDetail));
+  createEffect(selected, () => { reloadDetail(); });
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
   const [recording, setRecording] = createSignal(false);
 
-  createEffect(() => {
-    const focus = jianpuFocus();
+  createEffect(() => [jianpuFocus(), selected(), list()[0]?.id] as const, ([focus, current, first]) => {
     if (focus) { setSelected(focus); setJianpuFocus(""); }
-    else if (!selected() && list().length) setSelected(list()[0].id);
+    else if (!current && first) setSelected(first);
   });
-  onMount(() => {
+  onSettled(() => {
     void invoke<{ recording: boolean }>("jianpu_status").then(s => setRecording(s.recording)).catch(() => {});
     const off = listen<{ recording: boolean }>("jianpu:changed", event => {
       setRecording(event.payload.recording);
       void refetch();
       reloadDetail();
     });
-    onCleanup(() => void off.then(fn => fn()));
+    return () => { void off.then(fn => fn()); };
   });
 
   const act = async (work: () => Promise<unknown>) => {
@@ -85,7 +86,7 @@ export default function JianpuView() {
         <Show when={state.settings?.knowledgeGraphEnabled}>
           <button class="btn" onClick={() => setView("knowledge")}>← 知识图谱</button>
         </Show>
-        <button class="btn" classList={{ "jianpu-rec": recording() }} disabled={busy()} onClick={() => void act(() => invoke("jianpu_toggle"))}>
+        <button class={["btn", { "jianpu-rec": recording() }]} disabled={busy()} onClick={() => void act(() => invoke("jianpu_toggle"))}>
           {recording() ? "■ 停止录制" : "● 开始录制"}
         </button>
       </div>
@@ -94,7 +95,7 @@ export default function JianpuView() {
     <div class="jianpu-body">
       <aside class="jianpu-list">
         <For each={list()} fallback={<p class="jianpu-empty">还没有剑谱。在任意应用里按 {state.settings?.jianpuShortcut || "Alt+R"}，或在 Butterfly 面板「星海」里点「剑谱录制」开始，演示完再按一次停止。</p>}>
-          {item => <button class="jianpu-item" classList={{ active: selected() === item.id }} onClick={() => setSelected(item.id)}>
+          {item => <button class={["jianpu-item", { active: selected() === item.id }]} onClick={() => setSelected(item.id)}>
             <strong>{item.apps.join("、") || "未录到应用"}</strong>
             <small>{new Date(item.startedAt).toLocaleString()} · {item.steps} 步 · <span class={`jianpu-state ${item.state}`}>{STATE[item.state]}</span></small>
           </button>}

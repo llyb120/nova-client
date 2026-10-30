@@ -44,7 +44,7 @@ assert.ok(deps, 'Missing dependencies: set TEST_NODE_MODULES to an existing node
 const require = createRequire(path.join(deps, '__transcript_test__.cjs'));
 const { build } = require('esbuild');
 const { transformAsync } = require('@babel/core');
-const solidPreset = require('babel-preset-solid');
+const solidPlugin = require('@solidjs/babel-plugin');
 const { chromium } = require('playwright-core');
 const limits = { rows: 80, elements: 3000, frameP95Ms: 50, frameMaxMs: 250, anchorPx: 4 };
 
@@ -67,7 +67,7 @@ async function executable() {
 
 function fixture() {
   return `
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
 import { createSignal, createEffect } from 'solid-js';
 import { HtmlTranscript as Transcript } from './src/components/HtmlTranscript';
 import { state, setState, toggleExpanded } from './src/store';
@@ -117,7 +117,7 @@ function replace(groups,kind='session',loading=false){
   // openThread clears expansion before committing a new snapshot; do not invent transcript ownership.
   for(const key of Object.keys(state.expanded))toggleExpanded(key,false);
   const id=kind+'-'+ ++serial;
-  setState('currentId',id);
+  setState(s => { s.currentId = id; });
   setSession({id,groups,running:false,loading});
   enableBottomFollow();
 }
@@ -333,7 +333,7 @@ window.test={
   }
 };
 render(()=>{
-  createEffect(()=>{session();scheduleBottomPin();});
+  createEffect(session,scheduleBottomPin);
   window.addEventListener('keydown',event=>{
     if(event.altKey||event.ctrlKey||event.metaKey||handle?.hasFocusedInput())return;
     const up=['ArrowUp','PageUp','Home'].includes(event.key)||(event.key===' '&&event.shiftKey);
@@ -352,7 +352,7 @@ render(()=>{
 
 async function solid(source, filename) {
   const result = await transformAsync(source, { filename, babelrc: false, configFile: false,
-    presets: [[solidPreset, { generate: 'dom', hydratable: false }]], parserOpts: { plugins: ['jsx', 'typescript'] } });
+    plugins: [[solidPlugin, { generate: 'dom', hydratable: false }]], parserOpts: { plugins: ['jsx', 'typescript'] } });
   return result.code;
 }
 
@@ -598,7 +598,7 @@ async function run(browser, port, report) {
         await refs.nth(2).evaluate((el, [x, y]) => el.dispatchEvent(new MouseEvent('contextmenu', { clientX: x, clientY: y, button: 2, bubbles: true, cancelable: true })), [x, y]);
         return page.locator('.ctx-menu').evaluate(el => {
           const r = el.getBoundingClientRect(), hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-          return { body: el.parentElement?.parentElement === document.body, topmost: el.contains(hit), left: r.left, top: r.top, right: r.right, bottom: r.bottom, w: innerWidth, h: innerHeight };
+          return { body: el.parentElement === document.body || el.parentElement?.parentElement === document.body, topmost: el.contains(hit), left: r.left, top: r.top, right: r.right, bottom: r.bottom, w: innerWidth, h: innerHeight };
         });
       };
       const box = await refs.nth(2).boundingBox();

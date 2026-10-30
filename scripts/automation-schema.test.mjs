@@ -436,10 +436,11 @@ test('employee refreshes coalesce in flight without dropping the last update', a
   const js = ts.transpileModule(code,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
   const pending = [], snapshots = [], errors = [];
   let failure = '';
-  const {refresh,dispose} = new Function('call','setStore','reconcile','setNow','setFailed','peer','showToast','failed','batch',
+  const store = {};
+  const {refresh,dispose} = new Function('call','setStore','reconcile','setNow','setFailed','peer','showToast','failed',
     `${js}\nreturn {refresh:refetch,dispose:()=>{disposed=true;}};`)(
       ()=>new Promise((resolve,reject)=>pending.push({resolve,reject})),
-      (_,snap)=>snapshots.push(snap),v=>v,()=>{},v=>{failure=v;},false,v=>errors.push(v),()=>failure,fn=>fn());
+      update=>{update(store);snapshots.push(structuredClone(store.snap));},value=>target=>{Object.assign(target,value);},()=>{},v=>{failure=v;},false,v=>errors.push(v),()=>failure);
   const first = refresh();
   await Promise.all(Array.from({length:5},()=>refresh()));
   assert.equal(pending.length,1,'polls and change events share the current request');

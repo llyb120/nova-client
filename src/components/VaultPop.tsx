@@ -1,4 +1,4 @@
-import { createSignal, For, onMount, Show } from "solid-js";
+import { createSignal, For, onSettled, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { showToast } from "../store";
 
@@ -12,7 +12,7 @@ export default function VaultPop() {
   const [items, setItems] = createSignal<Item[]>([]);
   const [draft, setDraft] = createSignal<Draft | null>(null);
   const refresh = () => invoke<Item[]>("vault_list").then(setItems, (e) => showToast(String(e)));
-  onMount(() => void refresh());
+  onSettled(() => { void refresh(); });
   const patch = (p: Partial<Draft>) => setDraft((d) => d && { ...d, ...p });
   const save = async () => {
     const d = draft();
@@ -61,9 +61,9 @@ export default function VaultPop() {
             <form class="vault-form" onSubmit={(ev) => { ev.preventDefault(); void save(); }}>
               <h3>{d().id ? "编辑凭据" : "新增凭据"}</h3>
               <label class="employee-field">使用条件
-                <textarea rows={2} value={d().condition} maxLength={500} required placeholder="什么情况下员工才可以用，如：登录 TAPD 时" onInput={(ev) => patch({ condition: ev.currentTarget.value })} /></label>
+                <textarea rows={2} value={d().condition} maxlength={500} required placeholder="什么情况下员工才可以用，如：登录 TAPD 时" onInput={(ev) => patch({ condition: ev.currentTarget.value })} /></label>
               <label class="employee-field">凭据内容{d().id ? "（留空不改）" : ""}
-                <textarea rows={5} value={d().content} maxLength={16000} required={!d().id} autocomplete="off" spellcheck={false} placeholder="账号密码、API Key、Token、私钥等，支持多行" onInput={(ev) => patch({ content: ev.currentTarget.value })} /></label>
+                <textarea rows={5} value={d().content} maxlength={16000} required={!d().id} autocomplete="off" spellcheck="false" placeholder="账号密码、API Key、Token、私钥等，支持多行" onInput={(ev) => patch({ content: ev.currentTarget.value })} /></label>
               <label class="employee-field employee-public">
                 <input type="checkbox" checked={d().share} onChange={(ev) => patch({ share: ev.currentTarget.checked })} /> 允许加密发给远程员工
               </label>

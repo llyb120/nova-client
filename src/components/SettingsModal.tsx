@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog";
 import * as QRCode from "qrcode";
-import { createEffect, createMemo, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onSettled, Show, snapshot, untrack } from "solid-js";
 import { api } from "../ipc";
 import AppearanceLayoutSettings from './AppearanceLayoutSettings';
 import {
@@ -117,7 +117,7 @@ function ShortcutKeyCapture(props: {
   return (
     <button
       type="button"
-      classList={{
+      class={{
         "btn secondary session-shortcut-keys": true,
         recording: recording(),
       }}
@@ -184,7 +184,7 @@ const ONBOARDING_STEPS: { title: string; tabs: SettingsTab[] }[] = [
 ];
 
 export function SettingsModal(props: { onClose: () => void; initialTab?: SettingsTab; onboarding?: boolean }) {
-  const s = state.settings;
+  const s = untrack(() => snapshot(state.settings));
   const [step, setStep] = createSignal(0);
   const [chromeDep, setChromeDep] = createSignal<Awaited<ReturnType<typeof api.chromeDependencyStatus>> | null>(null);
   const [chromeDepBusy, setChromeDepBusy] = createSignal(false);
@@ -212,7 +212,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   };
   const visibleTabs = () =>
     props.onboarding ? TABS.filter((t) => ONBOARDING_STEPS[step()].tabs.includes(t.id)) : TABS;
-  const [tab, setTab] = createSignal<SettingsTab>(props.onboarding ? "lyra" : props.initialTab ?? "general");
+  const [tab, setTab] = createSignal<SettingsTab>(untrack(() => props.onboarding ? "lyra" : props.initialTab ?? "general"));
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
   const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
@@ -513,7 +513,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [updateChannel, setUpdateChannel] = createSignal<Settings["updateChannel"]>(
     s?.updateChannel ?? "release",
   );
-  onMount(() => void getVersion().then(setVersion));
+  onSettled(() => { void getVersion().then(setVersion); });
   const changeUpdateChannel = (channel: Settings["updateChannel"]) => {
     if (channel === updateChannel()) return;
     // 这里只修改设置草稿；取消弹窗不会切换通道，也不会触发下载。
@@ -578,13 +578,13 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     ),
   });
 
-  createEffect(() => {
-    if (tab() !== "team") return;
+  createEffect(tab, selected => {
+    if (selected !== "team") return;
     void loadRoamingFolders();
   });
 
-  createEffect(() => {
-    if (tab() === "instructions") void loadGlobalInstructions();
+  createEffect(tab, selected => {
+    if (selected === "instructions") void loadGlobalInstructions();
   });
 
   // 会话批量管理
@@ -644,8 +644,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     }
   };
   // 进入 Worktree 页时拉取一次列表
-  createEffect(() => {
-    if (tab() === "worktree") void refreshWorktrees();
+  createEffect(tab, selected => {
+    if (selected === "worktree") void refreshWorktrees();
   });
   const pickWorktreeDir = async () => {
     const dir = await openDialog({ directory: true, title: "选择 worktree 根目录" });
@@ -682,8 +682,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       setSkillsLoading(false);
     }
   };
-  createEffect(() => {
-    if (tab() === "skills") void refreshSkills();
+  createEffect(tab, selected => {
+    if (selected === "skills") void refreshSkills();
   });
 
   const installSkillPaths = async (paths: string[]) => {
@@ -766,7 +766,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   };
 
   // 设置弹层打开期间屏蔽聊天区拖放；Skills 页接管 zip/文件夹拖入
-  onMount(() => {
+  onSettled(() => {
     setFileDropBlocked(true);
     let cancelled = false;
     let unlisten: (() => void) | undefined;
@@ -796,11 +796,11 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     } catch {
       setSkillsDragging(false);
     }
-    onCleanup(() => {
+    return () => {
       cancelled = true;
       unlisten?.();
       setFileDropBlocked(false);
-    });
+    };
   });
 
   let saveLyraConfig: (() => Promise<void>) | undefined;
@@ -857,7 +857,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       await saveLyraConfig?.();
       await api.setSettings(settings);
       // 后端不再推送连接状态；Lyra 开关即连接状态（与 get_status 的 agent_enabled 一致）。
-      setState({ settings, connected: settings.lyraEnabled !== false });
+      setState(s => { s.settings = settings; s.connected = settings.lyraEnabled !== false; });
       // 只有设置成功持久化后才确认通道切换；检查与下载在后台进行，不阻塞保存或关闭弹窗。
       if (updateChannelChanged) {
         void checkAndStageUpdate().catch((error) =>
@@ -867,7 +867,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       if (roamingFoldersLoaded) {
         const folders = await api.setRoamingFolders(roamingFolders());
         setRoamingFolders(folders);
-        setState("roamingFolders", folders);
+        setState(s => { s.roamingFolders = folders; });
       }
       if (globalInstructionsLoaded && globalInstructionsDirty()) {
         await syncGlobalInstructions();
@@ -933,11 +933,11 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
             {(t, i) => (
               <>
                 <Show when={i() === 0 || visibleTabs()[i() - 1].group !== t.group}>
-                  <div class="settings-tab-group" classList={{ gap: !t.group }}>{t.group}</div>
+                  <div class={["settings-tab-group", { gap: !t.group }]}>{t.group}</div>
                 </Show>
                 <button
                   type="button"
-                  classList={{ "settings-tab": true, active: navTab(tab()) === t.id }}
+                  class={{ "settings-tab": true, active: navTab(tab()) === t.id }}
                   aria-current={navTab(tab()) === t.id ? "page" : undefined}
                   onClick={() => setTab(t.id)}
                 >
@@ -963,8 +963,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <button
                     type="button"
                     role="tab"
-                    aria-selected={tab() === t.id}
-                    classList={{ "theme-seg-btn": true, active: tab() === t.id }}
+                    aria-selected={tab() === t.id ? "true" : "false"}
+                    class={{ "theme-seg-btn": true, active: tab() === t.id }}
                     onClick={() => setTab(t.id)}
                   >
                     {t.name}
@@ -1071,7 +1071,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                     <span class="field-label">{scene.label}</span>
                     <span class="field-hint">{scene.hint}</span>
                     <div class="share-list">
-                      <Index each={sceneModels()[scene.key]}>
+                      <For keyed={false} each={sceneModels()[scene.key]}>
                         {(target, index) => (
                           <div class="share-row stage-model-row">
                             <span style={{ width: "28px", "flex-shrink": 0 }}>{index + 1}</span>
@@ -1093,7 +1093,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                             </button>
                           </div>
                         )}
-                      </Index>
+                      </For>
                       <Show when={sceneModels()[scene.key].length === 0}>
                         <div class="share-empty">尚未配置，至少需要一个模型。</div>
                       </Show>
@@ -1225,7 +1225,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                       <span>目标</span>
                       <span />
                     </div>
-                    <Index each={sessionShortcuts()}>
+                    <For keyed={false} each={sessionShortcuts()}>
                       {(item, index) => {
                         const modelTarget = () =>
                           item().action === "selectModel" ? parseModelTarget(item().target) : null;
@@ -1342,7 +1342,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                           </div>
                         );
                       }}
-                    </Index>
+                    </For>
                   </div>
                 </Show>
               </div>
@@ -1647,7 +1647,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               <span class="field-hint">
                 类似 skill 的渐进披露：各后端只预载「触发条件」和正文文件路径，条件命中时 Agent 再读取并遵循对应提示词。随「保存并同步」一起写入。
               </span>
-              <Index each={promptTriggers()}>
+              <For keyed={false} each={promptTriggers()}>
                 {(trigger, index) => (
                   <div class="wt-row">
                     <div class="wt-row-main">
@@ -1679,7 +1679,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                     />
                   </div>
                 )}
-              </Index>
+              </For>
               <div class="global-agent-actions">
                 <button
                   type="button"
@@ -1756,7 +1756,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               <div class="theme-seg">
                 <button
                   type="button"
-                  classList={{ "theme-seg-btn": true, active: state.theme === "ink-light" }}
+                  class={{ "theme-seg-btn": true, active: state.theme === "ink-light" }}
                   onClick={() => setTheme("ink-light")}
                 >
                   <span class="theme-swatch light" />
@@ -1764,7 +1764,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 </button>
                 <button
                   type="button"
-                  classList={{ "theme-seg-btn": true, active: state.theme === "ink-dark" }}
+                  class={{ "theme-seg-btn": true, active: state.theme === "ink-dark" }}
                   onClick={() => setTheme("ink-dark")}
                 >
                   <span class="theme-swatch dark" />
@@ -1878,7 +1878,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   fallback={<div class="sel-empty">当前没有可共享的本地项目。</div>}
                 >
                   <div class="share-list">
-                    <Index each={roamingFolders()}>
+                    <For keyed={false} each={roamingFolders()}>
                       {(folder, index) => (
                         <div class="share-row" title={folder()}>
                           <ProjectPicker
@@ -1898,7 +1898,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                           </button>
                         </div>
                       )}
-                    </Index>
+                    </For>
                     <Show when={roamingFolders().length === 0}>
                       <div class="share-empty">尚未共享任何项目，用下方选择器添加一行。</div>
                     </Show>
@@ -2047,7 +2047,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
             </div>
 
             <div
-              classList={{
+              class={{
                 "skills-drop": true,
                 "is-dragging": skillsDragging(),
                 busy: skillsBusy(),
@@ -2119,7 +2119,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 </span>
                 <div class="session-shortcut-list">
                   {/* Index 按索引追踪：输入时仅更新对应值，不重建行 DOM，避免输入框失焦。 */}
-                  <Index each={customEnvVars()}>
+                  <For keyed={false} each={customEnvVars()}>
                     {(item, index) => (
                       <div class="session-shortcut-row env-var-row">
                         <input
@@ -2159,7 +2159,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                         </button>
                       </div>
                     )}
-                  </Index>
+                  </For>
                 </div>
                 <button
                   type="button"
@@ -2227,8 +2227,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <button
                     type="button"
                     role="radio"
-                    aria-checked={updateChannel() === "release"}
-                    classList={{ active: updateChannel() === "release" }}
+                    aria-checked={updateChannel() === "release" ? "true" : "false"}
+                    class={{ active: updateChannel() === "release" }}
                     disabled={checking()}
                     onClick={() => void changeUpdateChannel("release")}
                   >
@@ -2238,8 +2238,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <button
                     type="button"
                     role="radio"
-                    aria-checked={updateChannel() === "develop"}
-                    classList={{ active: updateChannel() === "develop" }}
+                    aria-checked={updateChannel() === "develop" ? "true" : "false"}
+                    class={{ active: updateChannel() === "develop" }}
                     disabled={checking()}
                     onClick={() => void changeUpdateChannel("develop")}
                   >

@@ -1,9 +1,9 @@
-import { createEffect, createSignal, onCleanup, Show } from "solid-js";
+import { createEffect, createSignal, onCleanup, Show, untrack } from "solid-js";
 
 export function TypewriterText(props: { text: string; class?: string; title?: string; animate?: boolean }) {
-  const [displayed, setDisplayed] = createSignal(props.text);
+  let previous = untrack(() => props.text);
+  const [displayed, setDisplayed] = createSignal(previous);
   const [typing, setTyping] = createSignal(false);
-  let previous = props.text;
   let timer: number | undefined;
 
   const stop = () => {
@@ -14,12 +14,11 @@ export function TypewriterText(props: { text: string; class?: string; title?: st
     setTyping(false);
   };
 
-  createEffect(() => {
-    const next = props.text;
+  createEffect(() => [props.text, props.animate] as const, ([next, animate]) => {
     if (next === previous) return;
     previous = next;
     stop();
-    if (!props.animate) {
+    if (!animate) {
       setDisplayed(next);
       return;
     }
@@ -38,7 +37,7 @@ export function TypewriterText(props: { text: string; class?: string; title?: st
     }, 34);
   });
 
-  onCleanup(stop);
+  onCleanup(() => window.clearInterval(timer));
 
   return (
     <span

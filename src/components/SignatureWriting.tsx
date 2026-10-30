@@ -1,4 +1,4 @@
-import { createMemo, createSignal, createUniqueId, For, onMount } from "solid-js";
+import { createMemo, createSignal, createUniqueId, For, onSettled } from "solid-js";
 import { signatureFrame, signaturePaths } from "./signaturePaths";
 import { signatureProgress } from "./signatureOverlay";
 
@@ -7,7 +7,7 @@ export function SignatureWriting(props: { username: string }) {
   const gradient = createUniqueId();
   const paths: SVGPathElement[] = [];
   const [lengths, setLengths] = createSignal<number[]>([]);
-  onMount(() => setLengths(paths.map((path) => path.getTotalLength())));
+  onSettled(() => { setLengths(paths.map((path) => path.getTotalLength())); });
   const frame = createMemo(() => signatureFrame(lengths(), signatureProgress() ?? 1));
 
   return (

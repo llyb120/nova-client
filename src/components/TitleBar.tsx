@@ -1,6 +1,6 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { createSignal, onCleanup, onMount, Show, type JSX } from "solid-js";
-import { Portal } from "solid-js/web";
+import { createSignal, onCleanup, onSettled, Show } from "solid-js";
+import { Portal, type JSX } from "@solidjs/web";
 import { sidebarLayout } from "../sidebarLayout";
 import { IconX } from "./icons";
 
@@ -18,7 +18,7 @@ export { titlebarSide, titlebarTabs, titlebarView };
 export function TitleBarPortal(props: { children: JSX.Element }) {
   const revision = ++titlebarRevision;
   let staging: HTMLDivElement | undefined;
-  onMount(() => {
+  onSettled(() => {
     const host = titlebarHost;
     if (!host) return;
     // 新页头先在下屏暂存区渲染，等到真实 DOM 存在才替换旧页头，切页不再闪空白。
@@ -31,22 +31,21 @@ export function TitleBarPortal(props: { children: JSX.Element }) {
       host.replaceChildren(...moved);
     };
     // 页面卸载后页头已被搬进标题栏，Portal 清理管不到；不清掉会残留到没有页头的页面（如新建会话），连带展开的弹层。
-    onCleanup(() => moved.forEach(node => { if (node.parentNode === host) node.remove(); }));
     if (document.fonts.status === "loaded") commit();
     else void document.fonts.ready.then(commit);
+    return () => moved.forEach(node => { if (node.parentNode === host) node.remove(); });
   });
   onCleanup(() => { staging = undefined; });
-  const view = titlebarView();
-  return view
-    ? <Portal mount={view} ref={element => { staging = element; }}>{props.children}</Portal>
-    : props.children;
+  return <Show when={titlebarView()} fallback={props.children}>
+    {view => <Portal mount={view()}><div ref={staging}>{props.children}</div></Portal>}
+  </Show>;
 }
 
 /** 自定义标题栏：左列承接侧栏品牌行（Sidebar Portal），右侧承接当前会话头部（ChatView Portal）。 */
 export function TitleBar() {
   const [maximized, setMaximized] = createSignal(false);
 
-  onMount(() => {
+  onSettled(() => {
     let active = true;
     const syncMaximized = () => {
       void appWindow.isMaximized().then(value => {
@@ -55,10 +54,10 @@ export function TitleBar() {
     };
     syncMaximized();
     const unlisten = appWindow.onResized(syncMaximized);
-    onCleanup(() => {
+    return () => {
       active = false;
       void unlisten.then(remove => remove());
-    });
+    };
   });
 
   const toggleMaximize = async () => {
@@ -89,17 +88,17 @@ export function TitleBar() {
     void toggleMaximize();
   };
   let titlebarElement: HTMLElement | undefined;
-  onMount(() => {
+  onSettled(() => {
     titlebarElement?.addEventListener("mousedown", handleDown, true);
     titlebarElement?.addEventListener("mousemove", handleMove, true);
     titlebarElement?.addEventListener("dblclick", handleDoubleClick);
     window.addEventListener("mouseup", handleUp, true);
-    onCleanup(() => {
+    return () => {
       titlebarElement?.removeEventListener("mousedown", handleDown, true);
       titlebarElement?.removeEventListener("mousemove", handleMove, true);
       titlebarElement?.removeEventListener("dblclick", handleDoubleClick);
       window.removeEventListener("mouseup", handleUp, true);
-    });
+    };
   });
 
   return (
@@ -107,7 +106,7 @@ export function TitleBar() {
       ref={titlebarElement}
       class="window-titlebar"
     >
-      <div ref={setTitlebarSide} class="titlebar-side" classList={{ collapsed: sidebarLayout.collapsed }} />
+      <div ref={setTitlebarSide} class={["titlebar-side", { collapsed: sidebarLayout.collapsed }]} />
       <div class="titlebar-main">
         <div ref={setTitlebarTabs} class="titlebar-tabs" />
         <div ref={titlebarHost} class="titlebar-view" data-tauri-drag-region />

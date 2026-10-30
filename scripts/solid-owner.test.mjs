@@ -11,5 +11,5 @@ test("dynamic list callbacks do not create unowned Solid computations", () => {
 });
 
 test("Solid dev HMR is disabled with the app's disabled Vite HMR", () => {
-  assert.match(vite, /solid\(\{\s*hot:\s*false\s*\}\)/);
+  assert.match(vite, /solid\(\{\s*refresh:\s*false\s*\}\)/);
 });

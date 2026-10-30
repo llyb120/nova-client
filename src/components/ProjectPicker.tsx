@@ -1,6 +1,6 @@
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
-import { Portal } from "solid-js/web";
+import { Portal } from "@solidjs/web";
 import { api } from "../ipc";
 import { refreshProjects, roamingPeers, state } from "../store";
 import type { Peer, ProjectEntry } from "../types";
@@ -159,15 +159,15 @@ export function ProjectPicker(props: {
     }
   };
 
-  createEffect(() => {
-    if (!usePortal() || !opened()) return;
+  createEffect(() => usePortal() && opened(), active => {
+    if (!active) return;
     const onReflow = () => computePlacement();
     window.addEventListener("scroll", onReflow, true);
     window.addEventListener("resize", onReflow);
-    onCleanup(() => {
+    return () => {
       window.removeEventListener("scroll", onReflow, true);
       window.removeEventListener("resize", onReflow);
-    });
+    };
   });
 
   const onDocClick = (e: MouseEvent) => {

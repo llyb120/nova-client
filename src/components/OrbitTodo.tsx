@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
-import { createStore, reconcile } from "solid-js/store";
+import { createEffect, createMemo, createSignal, For, onSettled, Show } from "solid-js";
+import { createStore, reconcile } from "solid-js";
 import "./OrbitTodo.css";
 
 type Item = { id: string; text: string; done: boolean; star: boolean; createdAt: number; doneAt: number };
@@ -31,14 +31,14 @@ export default function OrbitTodo(props: { active: boolean }) {
   let input: HTMLInputElement | undefined;
   let disposed = false;
 
-  const refresh = () => invoke<Item[]>("orbit_list").then((list) => { if (!disposed) { setItems(reconcile(list, { key: "id" })); setError(""); } }, (e) => setError(String(e)));
+  const refresh = () => invoke<Item[]>("orbit_list").then((list) => { if (!disposed) { setItems(reconcile(list, "id")); setError(""); } }, (e) => setError(String(e)));
   const run = (job: Promise<unknown>) => job.then(refresh, (e) => { setError(String(e)); void refresh(); });
-  onMount(() => {
+  onSettled(() => {
     void refresh();
     const off = listen("orbit:changed", () => void refresh());
-    onCleanup(() => { disposed = true; void off.then((fn) => fn()); });
+    return () => { disposed = true; void off.then((fn) => fn()); };
   });
-  createEffect(on(() => props.active, (active) => { if (active) { void refresh(); queueMicrotask(() => input?.focus()); } }));
+  createEffect(() => props.active, (active) => { if (active) { void refresh(); queueMicrotask(() => input?.focus()); } });
 
   const pending = createMemo(() => items.filter((i) => !i.done).sort((a, b) => Number(b.star) - Number(a.star)));
   const finished = createMemo(() => items.filter((i) => i.done).sort((a, b) => b.doneAt - a.doneAt));
@@ -54,12 +54,12 @@ export default function OrbitTodo(props: { active: boolean }) {
   const toggle = (item: Item) => {
     // 先在界面上翻转，手感更跟手；失败时 run 会重新同步。
     const done = !item.done; // item 是 store 代理，setItems 后再读会拿到翻转后的值
-    setItems((i) => i.id === item.id, { done, doneAt: done ? Date.now() : 0 });
+    setItems(draft => { const target = draft.find(i => i.id === item.id); if (target) Object.assign(target, { done, doneAt: done ? Date.now() : 0 }); });
     void run(invoke("orbit_done", { id: item.id, done }));
   };
   const star = (item: Item) => {
     const next = !item.star;
-    setItems((i) => i.id === item.id, "star", next);
+    setItems(draft => { const target = draft.find(i => i.id === item.id); if (target) target.star = next; });
     void run(invoke("orbit_edit", { id: item.id, patch: { star: next } }));
   };
   const commit = () => {
@@ -79,14 +79,14 @@ export default function OrbitTodo(props: { active: boolean }) {
       </div>
       <form class="ob-add" onSubmit={(e) => { e.preventDefault(); add(); }}>
         {svg(PLUS, 16)}
-        <input ref={input} value={draft()} maxLength={500} placeholder="添加一件事，回车保存" aria-label="添加待办" autocomplete="off"
+        <input ref={input} value={draft()} maxlength={500} placeholder="添加一件事，回车保存" aria-label="添加待办" autocomplete="off"
           onInput={(e) => setDraft(e.currentTarget.value)} />
         <button type="submit" disabled={!draft().trim()} aria-label="添加">添加</button>
       </form>
       <div class="ob-bar">
         <div class="ob-seg" role="tablist" aria-label="筛选">
           <For each={FILTERS}>{([key, label]) => (
-            <button type="button" role="tab" aria-selected={filter() === key} classList={{ on: filter() === key }} onClick={() => setFilter(key)}>
+            <button type="button" role="tab" aria-selected={filter() === key ? "true" : "false"} class={{ on: filter() === key }} onClick={() => setFilter(key)}>
               {label}<Show when={key === "todo" && pending().length}><em>{pending().length}</em></Show>
             </button>
           )}</For>
@@ -105,20 +105,20 @@ export default function OrbitTodo(props: { active: boolean }) {
             <small>{items.length ? "" : "在上面写下第一件事，回车即可"}</small>
           </li>
         }>{(item) => (
-          <li class="ob-item" classList={{ done: item.done, starred: item.star }}>
-            <button type="button" class="ob-check" role="checkbox" aria-checked={item.done} aria-label={item.done ? `重新打开：${item.text}` : `完成：${item.text}`} onClick={() => toggle(item)}>
+          <li class={["ob-item", { done: item.done, starred: item.star }]}>
+            <button type="button" class="ob-check" role="checkbox" aria-checked={item.done ? "true" : "false"} aria-label={item.done ? `重新打开：${item.text}` : `完成：${item.text}`} onClick={() => toggle(item)}>
               <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M7.8 12.4l3 3 5.4-6" /></svg>
             </button>
             <Show when={editing()?.id === item.id} fallback={
               <span class="ob-text" title="点击修改" onClick={() => setEditing({ id: item.id, text: item.text })}>{item.text}</span>
             }>
-              <input class="ob-edit" value={editing()!.text} maxLength={500} aria-label="修改内容" ref={(el) => queueMicrotask(() => { el.focus(); el.select(); })}
+              <input class="ob-edit" value={editing()!.text} maxlength={500} aria-label="修改内容" ref={(el) => queueMicrotask(() => { el.focus(); el.select(); })}
                 onInput={(e) => setEditing({ id: item.id, text: e.currentTarget.value })} onBlur={commit}
                 onKeyDown={(e) => { if (e.key === "Enter" && !e.isComposing) commit(); else if (e.key === "Escape") setEditing(null); }} />
             </Show>
             <span class="ob-time">{ago(item.done ? item.doneAt : item.createdAt)}</span>
             <span class="ob-tools">
-              <button type="button" class="ob-star" classList={{ on: item.star }} aria-pressed={item.star} title={item.star ? "取消标星" : "标星置顶"} aria-label="标星" onClick={() => star(item)}>{svg(STAR)}</button>
+              <button type="button" class={["ob-star", { on: item.star }]} aria-pressed={item.star ? "true" : "false"} title={item.star ? "取消标星" : "标星置顶"} aria-label="标星" onClick={() => star(item)}>{svg(STAR)}</button>
               <button type="button" class="ob-del" title="删除" aria-label={`删除：${item.text}`} onClick={() => void run(invoke("orbit_remove", { id: item.id }))}>{svg(TRASH)}</button>
             </span>
           </li>

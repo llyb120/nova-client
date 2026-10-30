@@ -1,4 +1,4 @@
-import { batch, createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { flush, createEffect, createMemo, createSignal, For, onCleanup, onSettled, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
@@ -134,10 +134,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
   const locked = () => generating() || loadingImages() || running();
   const publishable = createMemo(() => !!active()?.draft && !same(active()?.draft, active()?.published));
   const savedBrowserMatch = createMemo(() => active()?.draft?.browser?.match.join("\n") ?? "");
-  createEffect(() => {
-    activeId();
-    setBrowserMatch(savedBrowserMatch());
-  });
+  createEffect(() => [activeId(), savedBrowserMatch()] as const, ([, match]) => { setBrowserMatch(match); });
   const publishLabel = () => {
     const saved = active();
     if (saved?.published && !publishable()) return `已在星海 v${liveVersion(saved) ?? "?"}`;
@@ -148,27 +145,25 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
   const designerConfigured = () => {
     try { return sceneModel("coding").agentKind === "lyra"; } catch { return false; }
   };
-  createEffect(() => {
-    const name = doc()?.name;
-    if (props.runtimeAppId && name) void getCurrentWindow().setTitle(name).catch(e => setError(errorText(e)));
+  createEffect(() => props.runtimeAppId ? doc()?.name : undefined, name => {
+    if (name) void getCurrentWindow().setTitle(name).catch(e => setError(errorText(e)));
   });
   let appliedSize = "";
-  createEffect(() => {
+  createEffect(() => props.runtimeAppId ? doc()?.window : undefined, size => {
     // Resize only when the published size changes, keeping manual resizes across re-launches.
-    const size = doc()?.window;
-    if (!props.runtimeAppId || !size || JSON.stringify(size) === appliedSize) return;
+    if (!size || JSON.stringify(size) === appliedSize) return;
     appliedSize = JSON.stringify(size);
     void getCurrentWindow().setSize(new LogicalSize(size.width, size.height)).catch(e => setError(errorText(e)));
   });
-  createEffect(() => {
-    if (active()?.run?.status !== "running") return;
-    for (const request of permissions()) {
-      if (request.questions?.length || pendingPermissions.has(request.requestKey)) continue;
-      const option = request.options.find(item => item.kind === "allow_once");
-      if (!option) continue;
+  createEffect(() => active()?.run?.status === "running" ? permissions().map(request => ({
+    key: request.requestKey,
+    option: request.questions?.length ? undefined : request.options.find(item => item.kind === "allow_once"),
+  })) : [], requests => {
+    for (const { key, option } of requests) {
+      if (!option || pendingPermissions.has(key)) continue;
       // Direct execution applies only to this app's active run, never global permissions.
-      pendingPermissions.add(request.requestKey);
-      void api.respondPermission(request.requestKey, option.optionId).catch(e => {
+      pendingPermissions.add(key);
+      void api.respondPermission(key, option.optionId).catch(e => {
         if (!disposed) setError(`无法继续执行：${errorText(e)}`);
       });
     }
@@ -181,7 +176,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
     const raw = JSON.stringify(next);
     localStorage.setItem(STORAGE, raw);
     storedVersion = raw;
-    setApps(next);
+    flush(() => setApps(next));
     if (!props.runtimeAppId) void syncBrowserTriggers().catch(() => {});
   }
   /** Adopt what other windows wrote (runtime receipts, sibling apps) before writing. With `design`,
@@ -193,8 +188,8 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
     if (!Array.isArray(latest) || (id && !latest.some(app => app.id === id))) throw new Error("应用已在其他窗口移除，本次修改未写入。");
     const designOf = (app?: SavedApp) => JSON.stringify(app && [app.draft, app.published, app.publishedVersion, app.versions, app.history, app.messages]);
     if (id && design && designOf(latest.find(app => app.id === id)) !== designOf(apps().find(app => app.id === id))) throw new Error("这个应用已在其他窗口修改，请重新打开观星台后再改，避免覆盖新版本。");
-    setApps(latest);
     storedVersion = raw;
+    flush(() => setApps(latest));
   }
   function update(id: string, patch: Partial<SavedApp>) {
     // Merge into the latest library: runtime receipts never block design edits and vice versa.
@@ -229,7 +224,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
     if (locked()) return;
     const app = apps().find(item => item.id === id);
     if (!app) return;
-    batch(() => {
+    flush(() => {
       setActiveId(id);
       setMode(usePublished && app.published ? "run" : "design");
       setInstruction("");
@@ -264,7 +259,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
   const [teamBusy, setTeamBusy] = createSignal(false);
   const myToken = () => state.settings?.relayToken ?? "";
   const sharedEntry = (saved?: SavedApp) => saved?.teamId ? teamApps().find(item => item.id === saved.teamId && item.authorToken === myToken()) : undefined;
-  createEffect(() => { if (!props.runtimeAppId) void refreshTeam(); });
+  createEffect(() => props.runtimeAppId, id => { if (!id) void refreshTeam(); });
   async function refreshTeam() {
     if (!state.relay.enabled) { setTeamApps([]); return; }
     try { setTeamApps((await api.teamMiniApps()).apps ?? []); setTeamNote(""); } catch (e) { setTeamNote(`团队应用库不可用：${errorText(e)}`); }
@@ -311,13 +306,12 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       }
     } catch (e) { setError(errorText(e)); }
   }
-  onMount(() => {
+  onSettled(() => {
     try {
       const raw = localStorage.getItem(STORAGE);
       const saved = readLibrary(raw);
       storedVersion = raw;
-      setApps(saved);
-      setStorageReady(true);
+      flush(() => { setApps(saved); setStorageReady(true); });
       if (props.runtimeAppId) {
         const runtime = saved.find(app => app.id === props.runtimeAppId);
         if (!runtime?.published) throw new Error("此应用不存在或尚未发布。");
@@ -342,7 +336,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
           const latest = library.find(app => app.id === props.runtimeAppId);
           if (!latest?.published || same(latest.published, active()?.published)) return;
           storedVersion = event.newValue;
-          setApps(library);
+          flush(() => setApps(library));
           choose(latest.id, true);
         } catch { /* Keep the current copy; the next launch revalidates and reports the library. */ }
       };
@@ -359,7 +353,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       void listen("relay:miniapps", () => void refreshTeam()).then(remove => disposed ? remove() : unlisten.push(remove));
     }
     const timer = window.setInterval(() => { void pollRun(); void pollDiagnosis(); }, 1500);
-    onCleanup(() => { disposed = true; window.clearInterval(timer); window.removeEventListener("nova:miniapps-open", consumeOpen); unlisten.forEach(remove => remove()); });
+    return () => { disposed = true; window.clearInterval(timer); window.removeEventListener("nova:miniapps-open", consumeOpen); unlisten.forEach(remove => remove()); };
   });
 
   /** A fresh launch replaces page/drop context; page identity is available to every action,
@@ -442,7 +436,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
     if (!saved || !next || locked()) return;
     try {
       update(saved.id, { draft: next, history: saved.draft ? [...saved.history.slice(-4), saved.draft] : saved.history });
-      batch(() => {
+      flush(() => {
         if (mode() === "run") setMode("design");
         resetPreview(next, true, saved.draft);
         setDiagResult(result => result && { ...result, app: null, summary: undefined });
@@ -584,7 +578,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
     if (!saved || locked() || props.runtimeAppId || same(saved.draft, version.app)) return;
     try {
       update(saved.id, { draft: version.app, history: saved.draft ? [...saved.history.slice(-4), saved.draft] : saved.history });
-      batch(() => {
+      flush(() => {
         if (mode() === "run") setMode("design");
         resetPreview(version.app, true, saved.draft);
       });
@@ -612,13 +606,13 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       persist(next);
       if (activeId() !== id) return;
       if (next.length) choose(next[0].id);
-      else batch(() => { setActiveId(""); setMode("design"); setInstruction(""); setDesignImages([]); setLogs([]); setLastThread(""); resetPreview(null); });
+      else flush(() => { setActiveId(""); setMode("design"); setInstruction(""); setDesignImages([]); setLogs([]); setLastThread(""); resetPreview(null); });
     } catch (e) { setError(errorText(e)); }
   }
   function switchMode(next: "design" | "try" | "run") {
     const saved = active();
     if (locked() || props.runtimeAppId || (next === "run" && !saved?.published)) return;
-    batch(() => {
+    flush(() => {
       setSelectedIds([]);
       // Design and trial share the draft; the quick version is a separate document.
       if ((mode() === "run") !== (next === "run")) resetPreview(next === "run" ? saved?.published : saved?.draft);
@@ -669,9 +663,9 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
     for (const block of page()?.blocks ?? []) {
       if (!block.optionsActionId || !block.autoLoad) continue;
       const key = optionsKey(block);
-      if (key && optionLoads()[block.id]?.key !== key) { requestOptions(block); break; }
+      if (key && optionLoads()[block.id]?.key !== key) return block;
     }
-  });
+  }, block => { if (block) requestOptions(block); });
   function assertLoadedInputs(action: MiniAction) {
     const inputs = action.kind === "command" ? action.inputs ?? [] : [...(action.prompt ?? action.value ?? "").matchAll(/\{\{\s*([\w-]+)\s*\}\}/g)].map(match => match[1]);
     for (const block of doc()?.pages.flatMap(p => p.blocks) ?? []) {
@@ -890,7 +884,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       case "heading": return <h2>{renderText(block.text || block.label)}</h2>;
       case "text": return <p class="mini-copy">{renderText(block.text || block.label)}</p>;
       case "button": return <button class="mini-action" disabled={locked()} onClick={() => activate(block.actionId!)}>{renderText(block.label)}<span aria-hidden="true">↗</span></button>;
-      case "result": return <section class="mini-result"><header><h3>{renderText(block.label)}</h3><Show when={mode() !== "design" && values()[block.id]}><button type="button" class="mini-copy-result" onClick={() => void copyResult(block.id)}>{copied() === block.id ? "已复制" : "复制"}</button></Show></header><div classList={{ empty: !values()[block.id] }}>{values()[block.id] || renderText(block.text) || "执行结果会显示在这里"}</div></section>;
+      case "result": return <section class="mini-result"><header><h3>{renderText(block.label)}</h3><Show when={mode() !== "design" && values()[block.id]}><button type="button" class="mini-copy-result" onClick={() => void copyResult(block.id)}>{copied() === block.id ? "已复制" : "复制"}</button></Show></header><div class={{ empty: !values()[block.id] }}>{values()[block.id] || renderText(block.text) || "执行结果会显示在这里"}</div></section>;
       case "select": return <div class="mini-field mini-select-field"><span>{renderText(block.label)}<Show when={block.required}><b aria-label="必填"> *</b></Show></span>
         <Show when={block.searchable || block.optionsActionId} fallback={<select id={fieldId} aria-label={block.label} value={values()[block.id] ?? ""} required={block.required} disabled={mode() === "design" || locked()} onChange={event => setValues(v => ({ ...v, [block.id]: event.currentTarget.value }))}><option value="">{block.placeholder || "请选择"}</option><For each={block.options}>{option => <option value={option}>{option}</option>}</For></select>}>
           <div inert={mode() === "design" || locked()}><SearchSelect value={availableOptions(block).includes(values()[block.id]) ? values()[block.id] : ""} options={availableOptions(block).map(value => ({ value, label: value }))} prefix={block.label} title={block.label} defaultLabel={block.placeholder || "请选择"} allowDefault searchable={block.searchable !== false} wide portal onOpen={() => { const load = optionLoads()[block.id]; if (block.optionsActionId && !(load?.status === "ready" && load.key === optionsKey(block))) requestOptions(block, true); }} onChange={value => { if (value === "" || availableOptions(block).includes(value)) setValues(v => ({ ...v, [block.id]: value })); }} /></div>
@@ -898,7 +892,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
         <Show when={block.optionsActionId && mode() !== "design"}><small class="mini-options-status" role="status">{optionLoads()[block.id]?.key !== optionsKey(block) ? "数据源参数已变化，打开下拉重新加载" : optionLoads()[block.id]?.status === "ready" ? `${availableOptions(block).length} 个选项 · 搜索仅在结果中筛选` : optionLoads()[block.id]?.status === "running" ? "正在执行数据源脚本…" : optionLoads()[block.id]?.error || "打开下拉，确认数据源脚本后加载选项"}</small></Show>
       </div>;
       default: return <label class="mini-field" for={fieldId}><span>{renderText(block.label)}<Show when={block.required}><b aria-label="必填"> *</b></Show></span>
-        <Show when={block.type === "textarea"} fallback={<input id={fieldId} value={values()[block.id] ?? ""} placeholder={renderText(block.placeholder)} required={block.required} maxLength={16000} readOnly={mode() === "design" || locked()} onInput={event => setValues(v => ({ ...v, [block.id]: event.currentTarget.value }))} />}><textarea id={fieldId} rows={5} value={values()[block.id] ?? ""} placeholder={renderText(block.placeholder)} required={block.required} maxLength={16000} readOnly={mode() === "design" || locked()} onInput={event => setValues(v => ({ ...v, [block.id]: event.currentTarget.value }))} /></Show>
+        <Show when={block.type === "textarea"} fallback={<input id={fieldId} value={values()[block.id] ?? ""} placeholder={renderText(block.placeholder)} required={block.required} maxlength={16000} readonly={mode() === "design" || locked()} onInput={event => setValues(v => ({ ...v, [block.id]: event.currentTarget.value }))} />}><textarea id={fieldId} rows={5} value={values()[block.id] ?? ""} placeholder={renderText(block.placeholder)} required={block.required} maxlength={16000} readonly={mode() === "design" || locked()} onInput={event => setValues(v => ({ ...v, [block.id]: event.currentTarget.value }))} /></Show>
       </label>;
     }
   }
@@ -921,9 +915,9 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
     </details>}</Show>;
   }
 
-  return <main class="mini-studio" classList={{ "mini-runtime": !!props.runtimeAppId }}>
+  return <main class={["mini-studio", { "mini-runtime": !!props.runtimeAppId }]}>
     <Show when={!props.runtimeAppId}><TitleBarPortal><header class="mini-topbar">
-      <Show when={active()}>{saved => <div class="mini-current"><strong title={appName(saved())}>{appName(saved())}</strong><span class="mini-chip" classList={{ live: !!saved().published }}>{appStatus(saved())}</span></div>}</Show>
+      <Show when={active()}>{saved => <div class="mini-current"><strong title={appName(saved())}>{appName(saved())}</strong><span class={["mini-chip", { live: !!saved().published }]}>{appStatus(saved())}</span></div>}</Show>
       <div class="mini-top-actions">
         <button disabled={!active()?.history.length || locked() || mode() === "run"} onClick={undo}>撤销</button>
         <button disabled={!doc() || locked()} onClick={test}>检查</button>
@@ -936,8 +930,8 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       <Show when={!props.runtimeAppId}><aside class="mini-library" aria-label="应用库">
         <div class="mini-section-label">我的应用 <span>{apps().length}</span></div>
         <button class="mini-new-app" disabled={locked() || !storageReady()} onClick={() => create()}>＋ 新应用</button>
-        <ul class="mini-app-list"><For each={apps()}>{item => <li class="mini-app-item" classList={{ active: item.id === activeId() }}>
-          <button class="mini-app-open" disabled={locked()} aria-current={item.id === activeId() ? "true" : undefined} onClick={() => { if (item.id !== activeId()) choose(item.id); }}><span class={`mini-app-dot mini-accent-${(item.draft ?? item.published)?.accent ?? "indigo"}`} aria-hidden="true">✦</span><span class="mini-app-meta"><strong>{appName(item)}</strong><small classList={{ live: !!item.published }}>{appStatus(item)}</small></span></button>
+        <ul class="mini-app-list"><For each={apps()}>{item => <li class={["mini-app-item", { active: item.id === activeId() }]}>
+          <button class="mini-app-open" disabled={locked()} aria-current={item.id === activeId() ? "true" : undefined} onClick={() => { if (item.id !== activeId()) choose(item.id); }}><span class={`mini-app-dot mini-accent-${(item.draft ?? item.published)?.accent ?? "indigo"}`} aria-hidden="true">✦</span><span class="mini-app-meta"><strong>{appName(item)}</strong><small class={{ live: !!item.published }}>{appStatus(item)}</small></span></button>
           <button class="mini-app-remove" title="删除应用" aria-label={`删除 ${appName(item)}`} disabled={locked()} onClick={() => removeApp(item.id)}>×</button>
         </li>}</For></ul>
         <Show when={storageReady() && !apps().length}><p class="mini-library-empty">还没有应用。在右侧描述一个想法，或先体验示例。</p></Show>
@@ -951,16 +945,16 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       </aside></Show>
       <section class="mini-canvas">
         <Show when={!props.runtimeAppId}><div class="mini-canvas-toolbar"><div class="mini-segment" role="group" aria-label="工作台模式">
-          <button classList={{ active: mode() === "design" }} aria-pressed={mode() === "design"} disabled={locked()} onClick={() => switchMode("design")}>设计</button>
-          <button classList={{ active: mode() === "try" }} aria-pressed={mode() === "try"} disabled={!active()?.draft || locked()} onClick={() => switchMode("try")}>试用草稿</button>
-          <button classList={{ active: mode() === "run" }} aria-pressed={mode() === "run"} disabled={!active()?.published || locked()} title="运行星海当前的版本" onClick={() => switchMode("run")}>星海版{active()?.published ? ` v${liveVersion(active()) ?? "?"}` : ""}</button>
-        </div><span class="mini-mode-hint">{mode() === "design" ? "Ctrl / ⌘ + 点击多选，再说怎么改" : mode() === "run" ? "与星海打开的版本一致 · 动作直接执行" : "动作直接执行 · 可随时停止"}</span><button class="mini-size" aria-label="切换窄屏预览" aria-pressed={narrow()} onClick={() => setNarrow(!narrow())}>{narrow() ? "宽屏" : "窄屏"}</button></div></Show>
-        <Show when={doc() && (!props.runtimeAppId || doc()!.pages.length > 1)}><nav class="mini-page-tabs" aria-label="页面"><For each={doc()?.pages}>{(item, index) => <button class="mini-page-tab" classList={{ active: item.id === page()?.id }} aria-current={item.id === page()?.id ? "page" : undefined} disabled={locked()} onClick={() => setPageId(item.id)}><span class="mini-page-number">{String(index() + 1).padStart(2, "0")}</span>{item.title}</button>}</For>
+          <button class={{ active: mode() === "design" }} aria-pressed={mode() === "design" ? "true" : "false"} disabled={locked()} onClick={() => switchMode("design")}>设计</button>
+          <button class={{ active: mode() === "try" }} aria-pressed={mode() === "try" ? "true" : "false"} disabled={!active()?.draft || locked()} onClick={() => switchMode("try")}>试用草稿</button>
+          <button class={{ active: mode() === "run" }} aria-pressed={mode() === "run" ? "true" : "false"} disabled={!active()?.published || locked()} title="运行星海当前的版本" onClick={() => switchMode("run")}>星海版{active()?.published ? ` v${liveVersion(active()) ?? "?"}` : ""}</button>
+        </div><span class="mini-mode-hint">{mode() === "design" ? "Ctrl / ⌘ + 点击多选，再说怎么改" : mode() === "run" ? "与星海打开的版本一致 · 动作直接执行" : "动作直接执行 · 可随时停止"}</span><button class="mini-size" aria-label="切换窄屏预览" aria-pressed={narrow() ? "true" : "false"} onClick={() => setNarrow(!narrow())}>{narrow() ? "宽屏" : "窄屏"}</button></div></Show>
+        <Show when={doc() && (!props.runtimeAppId || doc()!.pages.length > 1)}><nav class="mini-page-tabs" aria-label="页面"><For each={doc()?.pages}>{(item, index) => <button class={["mini-page-tab", { active: item.id === page()?.id }]} aria-current={item.id === page()?.id ? "page" : undefined} disabled={locked()} onClick={() => setPageId(item.id)}><span class="mini-page-number">{String(index() + 1).padStart(2, "0")}</span>{item.title}</button>}</For>
           <Show when={!props.runtimeAppId && mode() === "design"}><button class="mini-add-page" disabled={locked()} onClick={() => describe("增加一个页面，用来……")}>＋ 页面</button></Show></nav></Show>
         <Show when={doc()} fallback={<Show when={!props.runtimeAppId}><div class="mini-empty"><div class="mini-empty-symbol" aria-hidden="true">✦</div><span class="mini-eyebrow">YOUR EVERYDAY, SIMPLIFIED</span><h1>每一颗星，<br />都是灵光一闪</h1><p>描述你想实现的功能，<br />与 Nova 一起，让日常更从容。</p><div class="mini-example-prompts"><For each={examples}>{text => <button disabled={locked()} onClick={() => describe(text)}>{text}<span aria-hidden="true">↗</span></button>}</For></div><button class="mini-demo-link" disabled={locked() || !storageReady()} onClick={() => create(DEMO_APP)}>先体验一个多页面示例 →</button></div></Show>}>
-          <div class="mini-preview-scroll"><article class={`mini-preview mini-accent-${doc()?.accent ?? "indigo"}`} classList={{ narrow: narrow(), designing: mode() === "design" }} style={{ "max-width": !props.runtimeAppId && !narrow() && doc()?.window ? `${doc()!.window!.width}px` : undefined }}>
+          <div class="mini-preview-scroll"><article class={[`mini-preview mini-accent-${doc()?.accent ?? "indigo"}`, { narrow: narrow(), designing: mode() === "design" }]} style={{ "max-width": !props.runtimeAppId && !narrow() && doc()?.window ? `${doc()!.window!.width}px` : undefined }}>
             <header class="mini-app-heading"><span class="mini-app-icon" aria-hidden="true">✦</span><div><small>{renderText(doc()?.name)}</small><h1>{renderText(page()?.title)}</h1><Show when={page()?.description}><p>{renderText(page()?.description)}</p></Show></div></header>
-            <div class="mini-blocks" classList={{ columns: page()?.layout === "two-column" }}><For each={page()?.blocks}>{block => <div class="mini-block" style={previewStyle(block)} classList={{ selected: mode() === "design" && selectedIds().includes(block.id), wide: block.style?.width === "full" || (!block.style?.width && ["heading", "text", "result"].includes(block.type)) }} tabindex={mode() === "design" ? 0 : undefined} role={mode() === "design" ? "button" : undefined} aria-label={mode() === "design" ? `选择 ${block.label}` : undefined} aria-pressed={mode() === "design" ? selectedIds().includes(block.id) : undefined} onClick={event => { if (mode() !== "design") return; event.preventDefault(); event.stopPropagation(); selectBlock(block.id, event.ctrlKey || event.metaKey); }} onKeyDown={event => { if (mode() === "design" && ["Enter", " "].includes(event.key)) { event.preventDefault(); selectBlock(block.id, event.ctrlKey || event.metaKey); } }}>
+            <div class={["mini-blocks", { columns: page()?.layout === "two-column" }]}><For each={page()?.blocks}>{block => <div class={["mini-block", { selected: mode() === "design" && selectedIds().includes(block.id), wide: block.style?.width === "full" || (!block.style?.width && ["heading", "text", "result"].includes(block.type)) }]} style={previewStyle(block)} tabindex={mode() === "design" ? 0 : undefined} role={mode() === "design" ? "button" : undefined} aria-label={mode() === "design" ? `选择 ${block.label}` : undefined} aria-pressed={mode() === "design" ? (selectedIds().includes(block.id) ? "true" : "false") : undefined} onClick={event => { if (mode() !== "design") return; event.preventDefault(); event.stopPropagation(); selectBlock(block.id, event.ctrlKey || event.metaKey); }} onKeyDown={event => { if (mode() === "design" && ["Enter", " "].includes(event.key)) { event.preventDefault(); selectBlock(block.id, event.ctrlKey || event.metaKey); } }}>
               {blockView(block)}<Show when={mode() === "design" && selectedIds().includes(block.id)}><span class="mini-selection-tag">正在修改 · {block.label}</span></Show>
             </div>}</For></div>
             <Show when={!props.runtimeAppId}><footer class="mini-preview-footer">由 Nova 驱动 <span>·</span> {mode() === "design" ? "设计模式不会执行操作" : "本地动作 / 确定脚本 / Nova 场景模型"}
@@ -975,7 +969,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
         <Show when={props.runtimeAppId && running()}><div class="mini-run-status" role="status"><span>正在执行「{active()?.run?.name}」…</span><button onClick={() => void cancelRun()}>停止</button></div></Show>
         <Show when={props.runtimeAppId}><For each={permissions().filter(req => req.questions?.length || !req.options.some(option => option.kind === "allow_once"))}>{req => <PermissionCard req={req} />}</For></Show>
         <Show when={!props.runtimeAppId && (logs().length || running() || checks().length || lastThread())}><section class="mini-debug" aria-label="调试与测试">
-          <header><strong><span classList={{ "mini-live-dot": running() }} />{running() ? active()?.run?.commandId ? "脚本正在执行" : "Nova 正在执行" : "调试记录"}</strong><div><Show when={lastThread()}><button onClick={() => void showThread()}>查看执行会话 ↗</button></Show><Show when={running()}><button onClick={() => void cancelRun()}>停止执行</button></Show><Show when={checks().length}><button onClick={() => setShowChecks(!showChecks())}>{showChecks() ? "收起检查" : "查看检查"}</button></Show></div></header>
+          <header><strong><span class={{ "mini-live-dot": running() }} />{running() ? active()?.run?.commandId ? "脚本正在执行" : "Nova 正在执行" : "调试记录"}</strong><div><Show when={lastThread()}><button onClick={() => void showThread()}>查看执行会话 ↗</button></Show><Show when={running()}><button onClick={() => void cancelRun()}>停止执行</button></Show><Show when={checks().length}><button onClick={() => setShowChecks(!showChecks())}>{showChecks() ? "收起检查" : "查看检查"}</button></Show></div></header>
           <Show when={logs().length}><p class="mini-log" aria-live="polite">{logs()[logs().length - 1]}</p></Show>
           <Show when={showChecks()}><ul class="mini-checks"><For each={checks()}>{check => <li class={`mini-check-${check.status}`}><span>{check.status === "pass" ? "✓" : check.status === "fail" ? "×" : "○"}</span><div><strong>{check.name}</strong><p>{check.detail}</p></div></li>}</For></ul><p class="mini-test-note">仅检查可运行性和潜在破坏性操作，不执行脚本或 AI，也不限制发布。安全扫描可能遗漏风险；运行时使用当前账号权限。</p></Show>
           <Show when={active()?.run?.commandId && active()?.run?.output}><details class="mini-command-output"><summary>上次脚本输出</summary><pre>{active()?.run?.output}</pre></details></Show>
@@ -984,16 +978,16 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       </section>
       <Show when={!props.runtimeAppId}><aside class="mini-copilot">
         <div class="mini-side-tabs" role="tablist" aria-label="应用面板">
-          <button role="tab" id="mini-tab-chat" aria-controls="mini-pane-chat" aria-selected={side() === "chat"} classList={{ active: side() === "chat" }} onClick={() => setSide("chat")}><span aria-hidden="true">✦</span>设计会话</button>
-          <button role="tab" id="mini-tab-diagnosis" aria-controls="mini-pane-diagnosis" aria-selected={side() === "diagnosis"} classList={{ active: side() === "diagnosis" }} onClick={() => setSide("diagnosis")}>诊断<Show when={diagRunning()}><span class="mini-live-dot" /></Show></button>
-          <button role="tab" id="mini-tab-versions" aria-controls="mini-pane-versions" aria-selected={side() === "versions"} classList={{ active: side() === "versions" }} onClick={() => setSide("versions")}>版本<span class="mini-count">{versionsOf(active()).length}</span></button>
-          <button role="tab" id="mini-tab-browser" aria-controls="mini-pane-browser" aria-selected={side() === "browser"} classList={{ active: side() === "browser" }} onClick={() => setSide("browser")}>网页激活</button>
+          <button role="tab" id="mini-tab-chat" aria-controls="mini-pane-chat" aria-selected={side() === "chat" ? "true" : "false"} class={{ active: side() === "chat" }} onClick={() => setSide("chat")}><span aria-hidden="true">✦</span>设计会话</button>
+          <button role="tab" id="mini-tab-diagnosis" aria-controls="mini-pane-diagnosis" aria-selected={side() === "diagnosis" ? "true" : "false"} class={{ active: side() === "diagnosis" }} onClick={() => setSide("diagnosis")}>诊断<Show when={diagRunning()}><span class="mini-live-dot" /></Show></button>
+          <button role="tab" id="mini-tab-versions" aria-controls="mini-pane-versions" aria-selected={side() === "versions" ? "true" : "false"} class={{ active: side() === "versions" }} onClick={() => setSide("versions")}>版本<span class="mini-count">{versionsOf(active()).length}</span></button>
+          <button role="tab" id="mini-tab-browser" aria-controls="mini-pane-browser" aria-selected={side() === "browser" ? "true" : "false"} class={{ active: side() === "browser" }} onClick={() => setSide("browser")}>网页激活</button>
         </div>
         <div id="mini-pane-browser" role="tabpanel" aria-labelledby="mini-tab-browser" class="mini-browser-config" hidden={side() !== "browser"}>
           <p class="mini-versions-intro">在匹配的网页显示应用浮动图标，点击打开应用。需要 Nova 正在运行，且 Chrome 已安装并连接 Nova 扩展。</p>
           <label for="mini-browser-match">激活网址（每行一个）</label>
           <p id="mini-browser-help" class="mini-browser-help">支持 http://、https:// 或 *:// 开头的完整网址；* 匹配任意字符（包括查询参数）。最多 20 条，留空并保存可取消网页激活。保存到草稿后，需发布才会生效。</p>
-          <textarea id="mini-browser-match" rows={7} maxLength={42000} aria-describedby="mini-browser-help" value={browserMatch()} disabled={!active()?.draft || locked() || mode() === "run"} placeholder={"https://github.com/*/pull/*\nhttps://example.com/work/*"} onInput={event => setBrowserMatch(event.currentTarget.value)} />
+          <textarea id="mini-browser-match" rows={7} maxlength={42000} aria-describedby="mini-browser-help" value={browserMatch()} disabled={!active()?.draft || locked() || mode() === "run"} placeholder={"https://github.com/*/pull/*\nhttps://example.com/work/*"} onInput={event => setBrowserMatch(event.currentTarget.value)} />
           <button class="mini-primary" disabled={!active()?.draft || !storageReady() || locked() || mode() === "run"} onClick={saveBrowserConfig}>保存到草稿</button>
           <Show when={mode() === "run"}><p class="mini-browser-help">当前查看星海版，请切到「设计」或「试用草稿」后配置。</p></Show>
           <Show when={!active()?.draft}><p class="mini-browser-help">请先选择一个已有应用，或生成应用后再配置。</p></Show>
@@ -1001,7 +995,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
         <div id="mini-pane-diagnosis" role="tabpanel" aria-labelledby="mini-tab-diagnosis" class="mini-diagnosis" hidden={side() !== "diagnosis"}>
           <p class="mini-versions-intro">诊断在独立会话中进行（编码场景模型），可以实际运行脚本、复现问题，最后给出修复版供你确认；不会写入设计会话，也不会自动改草稿。默认不执行提交、删除、发送等有副作用的操作。</p>
           <label class="sr-only" for="mini-diagnosis-problem">描述遇到的问题</label>
-          <textarea id="mini-diagnosis-problem" rows={4} maxLength={4000} value={diagProblem()} disabled={diagRunning() || !active()?.draft} placeholder="描述遇到的问题，例如：打开后没有任何反应 / 结果不对。留空则检查最近一次运行和各动作能否触发。" onInput={event => setDiagProblem(event.currentTarget.value)} />
+          <textarea id="mini-diagnosis-problem" rows={4} maxlength={4000} value={diagProblem()} disabled={diagRunning() || !active()?.draft} placeholder="描述遇到的问题，例如：打开后没有任何反应 / 结果不对。留空则检查最近一次运行和各动作能否触发。" onInput={event => setDiagProblem(event.currentTarget.value)} />
           <div class="mini-diagnosis-actions">
             <button class="mini-primary" disabled={diagRunning() || !active()?.draft || !storageReady()} onClick={() => void diagnose()}>{diagRunning() ? "诊断中…" : active()?.diagnosis ? "继续诊断" : "开始诊断"}</button>
             <Show when={active()?.diagnosis}>{diag => <><button onClick={() => void openThread(diag().threadId).catch(e => setDiagNote(errorText(e)))}>打开诊断会话 ↗</button><button disabled={diagRunning()} onClick={newDiagnosis}>新诊断</button></>}</Show>
@@ -1017,7 +1011,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
             <ol class="mini-version-list"><For each={[...versionsOf(active())].reverse()}>{item => {
               const live = () => item.version === liveVersion(active());
               const current = () => same(item.app, active()?.draft);
-              return <li classList={{ live: live() }}>
+              return <li class={{ live: live() }}>
                 <div class="mini-version-head"><strong>v{item.version}</strong><Show when={live()}><span class="mini-chip live">在星海</span></Show><Show when={current()}><span class="mini-chip">= 当前草稿</span></Show><time>{formatTime(item.at)}</time></div>
                 <small>{item.app.name} · {item.app.pages.length} 页 · {item.app.actions.length} 个动作</small>
                 <div class="mini-version-actions"><button disabled={live() || locked()} onClick={() => pinVersion(item)}>设为星海</button><button disabled={current() || locked()} onClick={() => restoreVersion(item)}>恢复为草稿</button></div>
@@ -1031,7 +1025,7 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
         <Show when={selected().length}><div class="mini-context"><div><span>已选 {selected().length} 个控件</span><button aria-label="清空选择" disabled={locked()} onClick={() => setSelectedIds([])}>×</button></div><ul class="mini-selected-list"><For each={selected()}>{block => <li><div><strong>{block.label}</strong><small>{block.pageTitle} · {block.type}</small><BehaviorDetails block={block} /></div><button aria-label={`取消选择 ${block.label}`} disabled={locked()} onClick={() => setSelectedIds(ids => ids.filter(id => id !== block.id))}>×</button></li>}</For></ul></div></Show>
         <div class="mini-composer">
           <label class="sr-only" for="mini-instruction">用自然语言描述应用或修改</label>
-          <textarea ref={editor} id="mini-instruction" aria-describedby="mini-composer-help" value={instruction()} disabled={locked() || mode() === "run"} maxLength={12000} placeholder={selected().length ? selected().length === 1 ? `告诉 Nova「${selected()[0].label}」要怎么改、做什么…` : `告诉 Nova 这 ${selected().length} 个控件要一起怎么改…` : "例如：做一个日报助手，有首页和编辑页；也可以粘贴图片，告诉 Nova 参考哪里…"} onInput={event => setInstruction(event.currentTarget.value)} onPaste={pasteDesignImages} onKeyDown={designKeyDown} />
+          <textarea ref={editor} id="mini-instruction" aria-describedby="mini-composer-help" value={instruction()} disabled={locked() || mode() === "run"} maxlength={12000} placeholder={selected().length ? selected().length === 1 ? `告诉 Nova「${selected()[0].label}」要怎么改、做什么…` : `告诉 Nova 这 ${selected().length} 个控件要一起怎么改…` : "例如：做一个日报助手，有首页和编辑页；也可以粘贴图片，告诉 Nova 参考哪里…"} onInput={event => setInstruction(event.currentTarget.value)} onPaste={pasteDesignImages} onKeyDown={designKeyDown} />
           <Show when={designImages().length}><fieldset class="mini-image-attachments" disabled={locked() || mode() === "run"} aria-label="待发送的参考图片"><ImageAttachmentStrip images={designImages()} onRemove={removeDesignImage} /></fieldset></Show>
           <input ref={imagePicker} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden disabled={locked() || mode() === "run"} onChange={event => { const files = [...(event.currentTarget.files ?? [])]; event.currentTarget.value = ""; void addDesignImages(files); }} />
           <div class="mini-composer-actions"><button class="mini-add-image" title="添加参考图片：PNG、JPEG、GIF、WebP，最多 4 张，每张 5 MiB" disabled={locked() || mode() === "run" || designImages().length >= 4} onClick={() => imagePicker?.click()}>{loadingImages() ? "读取图片中…" : "＋ 添加图片"}</button><button class="mini-primary" disabled={(!instruction().trim() && !designImages().length) || locked() || !storageReady() || mode() === "run"} onClick={() => void generate()}>{generating() ? "设计中…" : doc() ? "修改应用 ↑" : "生成应用 ↑"}</button></div>

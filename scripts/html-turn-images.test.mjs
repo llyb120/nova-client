@@ -6,15 +6,15 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { build, transform } from 'esbuild';
 import { transformAsync } from '@babel/core';
-import solid from 'babel-preset-solid';
+import solid from '@solidjs/babel-plugin';
 import { chromium } from 'playwright-core';
 
 const origin = 'https://image-fixture.test';
 const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600"><rect width="800" height="600" fill="green"/></svg>';
 const bundle = await build({
   stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
-    import { createSignal } from 'solid-js';
-    import { render } from 'solid-js/web';
+    import { createSignal, flush } from 'solid-js';
+    import { render } from '@solidjs/web';
     import { HtmlTurn } from './src/components/HtmlTurn';
     import { HtmlTranscript } from './src/components/HtmlTranscript';
     import { warmImages } from './src/components/ImageAttachmentStrip';
@@ -39,7 +39,7 @@ const bundle = await build({
     const [group, setGroup] = createSignal({ user: { id: 1, type: 'user', text: '', ts: 0, images: [inline] }, body: [] });
     const disposeTurn = render(() => HtmlTurn({ get group() { return group(); }, threadId: 'thread', running: false, preview: false, onReturnToCurrent() {} }), document.getElementById('root'));
     window.test = { inline, uri, requests,
-      replace(image, id = 1) { setGroup(g => ({ ...g, user: { ...g.user, id, images: [image] } })); },
+      replace(image, id = 1) { flush(() => setGroup(g => ({ ...g, user: { ...g.user, id, images: [image] } }))); },
       image: () => document.querySelector('.ht-bubble-images img'),
       mountTranscript() {
         disposeTurn(); window.Image = NativeImage;
@@ -99,7 +99,7 @@ const bundle = await build({
     }[args.path] }));
     build.onLoad({ filter: /\.tsx$/ }, async args => {
       const stripped = await transform(await readFile(args.path, 'utf8'), { loader: 'tsx', jsx: 'preserve' });
-      const output = await transformAsync(stripped.code, { filename: args.path, babelrc: false, configFile: false, presets: [[solid, { generate: 'dom', hydratable: false }]] });
+      const output = await transformAsync(stripped.code, { filename: args.path, babelrc: false, configFile: false, plugins: [[solid, { generate: 'dom', hydratable: false }]] });
       return { contents: output.code, loader: 'js' };
     });
   } }],

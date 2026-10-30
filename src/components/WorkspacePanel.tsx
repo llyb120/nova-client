@@ -1,6 +1,6 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { batch, createEffect, createMemo, createSignal, ErrorBoundary, For, lazy, Match, onCleanup, onMount, Show, Suspense, Switch, untrack } from "solid-js";
+import { flush, createEffect, createMemo, createSignal, Errored, For, lazy, Match, onCleanup, onSettled, Show, Loading, Switch, untrack } from "solid-js";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
 import { EditorView } from "@codemirror/view";
@@ -86,16 +86,15 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const [search, setSearch] = createSignal<Listing>();
   const [searching, setSearching] = createSignal(false);
   const [searchError, setSearchError] = createSignal('');
-  createEffect(() => {
-    const query = filter().trim();
-    if (!browse() || !query) { setSearch(undefined); setSearching(false); return; }
+  createEffect(() => [filter().trim(), browse()] as const, ([query, browsing]) => {
+    if (!browsing || !query) { setSearch(undefined); setSearching(false); return; }
     let disposed = false;
     setSearch(undefined); setSearching(true); setSearchError('');
     const timer = setTimeout(() => {
       void api.searchWorkspaceFiles(threadId, query).then(result => { if (!disposed) setSearch(result); },
         error => { if (!disposed) setSearchError(String(error)); }).finally(() => { if (!disposed) setSearching(false); });
     }, 250);
-    onCleanup(() => { disposed = true; clearTimeout(timer); });
+    return () => { disposed = true; clearTimeout(timer); };
   });
   const [width, setWidth] = createSignal(480);
   const [dragging, setDragging] = createSignal(false);
@@ -122,7 +121,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   window.addEventListener("keydown", onEscape);
   onCleanup(() => window.removeEventListener("keydown", onEscape));
   let picker!: HTMLDivElement;
-  onMount(() => {
+  onSettled(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     try {
@@ -142,17 +141,19 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         }
       }).then(remove => { if (disposed) remove(); else unlisten = remove; }).catch(() => setDragging(false));
     } catch { setDragging(false); }
-    onCleanup(() => { disposed = true; unlisten?.(); });
+    return () => { disposed = true; unlisten?.(); };
   });
-  onMount(() => {
-    const restoreWidth = () => {
-      const available = panel.parentElement!.clientWidth;
-      setWidth(Math.min(available * .7, Math.max(300, workspaceLayout.widthRatio === null ? 480 : available * workspaceLayout.widthRatio)));
-    };
-    createEffect(restoreWidth);
+  const restoreWidth = () => {
+    if (!panel?.parentElement) return;
+    const available = panel.parentElement.clientWidth;
+    setWidth(Math.min(available * .7, Math.max(300, workspaceLayout.widthRatio === null ? 480 : available * workspaceLayout.widthRatio)));
+  };
+  createEffect(() => workspaceLayout.widthRatio, restoreWidth);
+  onSettled(() => {
+    restoreWidth();
     const observer = new ResizeObserver(restoreWidth);
     observer.observe(panel.parentElement!);
-    onCleanup(() => observer.disconnect());
+    return () => observer.disconnect();
   });
   onCleanup(() => {
     request++; cancelAnimationFrame(frame);
@@ -166,7 +167,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     const actions = panel.querySelector<HTMLDetailsElement>('.workspace-actions[open]');
     if (actions && !actions.contains(event.target as Node)) actions.open = false;
   };
-  onMount(() => document.addEventListener('pointerdown', dismissActions));
+  onSettled(() => document.addEventListener('pointerdown', dismissActions));
   onCleanup(() => document.removeEventListener('pointerdown', dismissActions));
   const report = (action: Promise<unknown>) => { void action.catch(e => setError(String(e))); };
   const refreshArtifacts = () => {
@@ -182,13 +183,13 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     }));
   };
   // Restore artifacts when the history snapshot arrives, without subscribing to text deltas.
-  createEffect(() => { state.items; state.items.length; state.loadingThread; if (!state.running[props.threadId]) refreshArtifacts(); });
-  refreshArtifacts();
+  createEffect(() => [state.items, state.items.length, state.loadingThread, state.running[props.threadId]] as const, ([, , , running]) => {
+    if (!running) refreshArtifacts();
+  });
+  onSettled(refreshArtifacts);
   // Artifact discovery needs old tool bodies too, not only the visible transcript page.
-  createEffect(() => {
-    if (!state.loadingThread && state.currentId === props.threadId) {
-      untrack(() => { void ensureHistoryItems().then(refreshArtifacts).catch(e => setError(String(e))); });
-    }
+  createEffect(() => !state.loadingThread && state.currentId === props.threadId, ready => {
+    if (ready) void ensureHistoryItems().then(refreshArtifacts).catch(e => setError(String(e)));
   });
   const snapshot = () => {
     const file = preview();
@@ -200,7 +201,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     } : tab));
   };
   const activate = (tab: FileTab) => {
-    batch(() => {
+    flush(() => {
       setPreview(tab.file); setOriginal(tab.original); setDraft(tab.draft); setEditing(tab.editing);
       setSource(tab.source); setSaved(tab.saved); setError(tab.error); setLoading(false);
     });
@@ -358,28 +359,27 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     const [listing, setListing] = createSignal<Listing>();
     const [failure, setFailure] = createSignal('');
     const [retry, setRetry] = createSignal(0);
-    createEffect(() => {
-      treeRevision(); retry();
+    createEffect(() => [treeRevision(), retry(), props.path] as const, ([, , path]) => {
       let disposed = false;
-      onCleanup(() => { disposed = true; });
       setListing(undefined); setFailure('');
-      let pending = directories.get(props.path);
+      let pending = directories.get(path);
       if (!pending) {
-        pending = api.listWorkspaceDirectory(threadId, props.path);
-        directories.set(props.path, pending);
+        pending = api.listWorkspaceDirectory(threadId, path);
+        directories.set(path, pending);
         // ponytail: Cache metadata for 64 directories; older collapsed branches reload on demand.
         if (directories.size > 64) directories.delete(directories.keys().next().value!);
       }
       void pending.then(result => { if (!disposed) setListing(result); }, error => {
-        if (directories.get(props.path) === pending) directories.delete(props.path);
+        if (directories.get(path) === pending) directories.delete(path);
         if (!disposed) setFailure(String(error));
       });
+      return () => { disposed = true; };
     });
     return <div role="group">
       <Show when={listing()} fallback={<p role="status">{failure() || '正在读取目录…'}<Show when={failure()}><button onClick={() => setRetry(v => v + 1)}>重试</button></Show></p>}>{result => <>
         <For each={result().entries.filter(entry => entry.directory || entry.name.toLowerCase().includes(filter().toLowerCase()))}>{entry => <>
-          <button class="workspace-file" role="treeitem" aria-level={props.depth + 1} aria-expanded={entry.directory ? expanded().has(entry.path) : undefined}
-            aria-selected={!entry.directory && preview()?.path === (aliases.get(entry.path) ?? entry.path)}
+          <button class="workspace-file" role="treeitem" aria-level={props.depth + 1} aria-expanded={entry.directory ? (expanded().has(entry.path) ? "true" : "false") : undefined}
+            aria-selected={!entry.directory && preview()?.path === (aliases.get(entry.path) ?? entry.path) ? "true" : "false"}
             style={{ 'padding-left': `${8 + props.depth * 16}px` }} title={entry.path} onContextMenu={e => menu.open(e, entry.path)}
             onKeyDown={e => {
               if (entry.directory && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
@@ -396,7 +396,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       </>}</Show>
     </div>;
   }
-  createEffect(() => { const target = props.request; if (target) untrack(() => { setMode("files"); void open(target.path, false, target.line); }); });
+  createEffect(() => props.request, target => { if (target) { setMode("files"); void open(target.path, false, target.line); } });
   const markdown = createMemo(() => {
     const file = preview();
     if (file?.kind !== "markdown" || source() || editing()) return "";
@@ -430,7 +430,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     const tab = remembered.tabs.find(tab => tab.file.path === remembered.activePath);
     if (tab) activate(tab);
   }
-  return <aside ref={panel} class="workspace-panel" classList={{ 'is-dragging': dragging() }} style={{ width: `${width()}px` }} aria-label="产物、项目文件与终端"
+  return <aside ref={panel} class={["workspace-panel", { 'is-dragging': dragging() }]} style={{ width: `${width()}px` }} aria-label="产物、项目文件与终端"
     onKeyDown={e => { if (mode() !== "terminal" && mode() !== "layout" && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
     <div class="workspace-resize" role="separator" aria-label="调整文件面板宽度" aria-orientation="vertical" tabindex="0"
       aria-valuenow={width()} onKeyDown={e => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); resize(width() + (e.key === "ArrowLeft" ? 24 : -24)); } }}
@@ -441,15 +441,15 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         cancelAnimationFrame(frame); frame = requestAnimationFrame(() => resize(value));
       }} />
     <nav class="workspace-toolbar workspace-modes" aria-label="文件来源">
-      <button aria-pressed={mode() === "layout"} title="本会话的看板：根据会话内容自动更新" onClick={() => { setMode("layout"); setBrowse(false); }}>看板</button>
-      <button class="workspace-picker-toggle" aria-pressed={mode() === "files"} onClick={() => { setMode("files"); setBrowse(true); }}>文件</button>
-      <button aria-pressed={mode() === "artifacts"} onClick={() => { setMode("artifacts"); setBrowse(false); refreshArtifacts(); }}>产物 · {artifacts().length}</button>
-      <button aria-pressed={mode() === "git"} onClick={() => { setMode("git"); setBrowse(false); }}>Git 变动</button>
-      <button aria-pressed={mode() === "terminal"} title="终端 (Ctrl+`)" onClick={() => { setMode("terminal"); setBrowse(false); }}>终端</button>
+      <button aria-pressed={mode() === "layout" ? "true" : "false"} title="本会话的看板：根据会话内容自动更新" onClick={() => { setMode("layout"); setBrowse(false); }}>看板</button>
+      <button class="workspace-picker-toggle" aria-pressed={mode() === "files" ? "true" : "false"} onClick={() => { setMode("files"); setBrowse(true); }}>文件</button>
+      <button aria-pressed={mode() === "artifacts" ? "true" : "false"} onClick={() => { setMode("artifacts"); setBrowse(false); refreshArtifacts(); }}>产物 · {artifacts().length}</button>
+      <button aria-pressed={mode() === "git" ? "true" : "false"} onClick={() => { setMode("git"); setBrowse(false); }}>Git 变动</button>
+      <button aria-pressed={mode() === "terminal" ? "true" : "false"} title="终端 (Ctrl+`)" onClick={() => { setMode("terminal"); setBrowse(false); }}>终端</button>
       <button class="workspace-panel-close" aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={async () => { if (await commitSheet()) props.onClose(); }}><IconX size={14} /></button>
     </nav>
     <Show when={mode() === "layout"}><LayoutPanel threadId={threadId} /></Show>
-    <Show when={mode() === "terminal"}><Suspense fallback={<p role="status">正在加载终端…</p>}><WorkspaceTerminal threadId={threadId} cwd={state.cwd} /></Suspense></Show>
+    <Show when={mode() === "terminal"}><Loading fallback={<p role="status">正在加载终端…</p>}><WorkspaceTerminal threadId={threadId} cwd={state.cwd} /></Loading></Show>
     <header class="workspace-toolbar workspace-tabbar" style={{ display: mode() === "terminal" || mode() === "layout" ? "none" : undefined }}>
       <span class="workspace-open-label">已打开</span>
       <div class="workspace-tabs" role="tablist" aria-label="已打开文件" onWheel={e => {
@@ -468,8 +468,8 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         selectTab(all[next].file.path);
         queueMicrotask(() => panel.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.focus());
       }}>
-        <For each={tabs()}>{tab => <div class="workspace-tab" classList={{ active: preview()?.path === tab.file.path }} onContextMenu={e => menu.open(e, tab.file.path)}>
-          <button role="tab" aria-selected={preview()?.path === tab.file.path} tabindex={preview()?.path === tab.file.path ? 0 : -1}
+        <For each={tabs()}>{tab => <div class={["workspace-tab", { active: preview()?.path === tab.file.path }]} onContextMenu={e => menu.open(e, tab.file.path)}>
+          <button role="tab" aria-selected={preview()?.path === tab.file.path ? "true" : "false"} tabindex={preview()?.path === tab.file.path ? 0 : -1}
             title={tab.file.path} onClick={() => selectTab(tab.file.path)}>
             <FileIcon path={tab.file.path} /><span>{label(tab.file.path)}</span>
             <span class="workspace-dirty">{(preview()?.path === tab.file.path ? dirty() : tab.draft !== normalized(tab.original)) ? '●' : ''}</span>
@@ -482,11 +482,11 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     <Show when={mode() === "git"}><WorkspaceGit threadId={threadId} onOpen={(path, line) => { setMode("files"); void open(path, false, line); }} /></Show>
     <div class="workspace-file-view" style={{ display: mode() === "git" || mode() === "terminal" || mode() === "layout" ? "none" : undefined }}>
     <div class="workspace-toolbar workspace-location" onContextMenu={e => menu.open(e, preview()?.path ?? state.cwd)}>
-      <button class="workspace-picker-toggle workspace-breadcrumb" aria-label="切换目录栏" aria-expanded={mode() === "files" && browse()} title={preview()?.path ?? state.cwd} onClick={() => { if (mode() !== "files") { setMode("files"); setBrowse(true); } else setBrowse(v => !v); }}>
+      <button class="workspace-picker-toggle workspace-breadcrumb" aria-label="切换目录栏" aria-expanded={mode() === "files" && browse() ? "true" : "false"} title={preview()?.path ?? state.cwd} onClick={() => { if (mode() !== "files") { setMode("files"); setBrowse(true); } else setBrowse(v => !v); }}>
         <IconFolder size={16} /><span class="workspace-breadcrumb-text">{preview()?.path ?? state.cwd}</span><IconChevron size={14} open={mode() === "files" && browse()} />
       </button>
       <Show when={preview()?.text != null}>
-        <button aria-pressed={editing()} onClick={() => { setSource(false); setEditing(v => !v); }}>{editing() ? '预览' : '编辑'}</button>
+        <button aria-pressed={editing() ? "true" : "false"} onClick={() => { setSource(false); setEditing(v => !v); }}>{editing() ? '预览' : '编辑'}</button>
         <button disabled={!dirty() || saving()} onClick={() => void save()} title="保存 (Ctrl/Cmd+S)">{saving() ? '保存中' : saved() ? '已保存' : '保存'}</button>
       </Show>
       <Show when={preview()?.kind === "spreadsheet"}>
@@ -529,7 +529,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
           <div class="workspace-search-results" aria-label="文件搜索结果">
             <Show when={searching()}><p role="status">正在搜索项目…</p></Show>
             <Show when={searchError()}><p role="alert">{searchError()}</p></Show>
-            <For each={search()?.entries}>{entry => <button class="workspace-file" aria-pressed={preview()?.path === (aliases.get(entry.path) ?? entry.path)} title={entry.path} onClick={() => void open(entry.path)} onContextMenu={e => menu.open(e, entry.path)}><FileIcon path={entry.path} /><span>{entry.name}</span><small>{entry.path}</small></button>}</For>
+            <For each={search()?.entries}>{entry => <button class="workspace-file" aria-pressed={preview()?.path === (aliases.get(entry.path) ?? entry.path) ? "true" : "false"} title={entry.path} onClick={() => void open(entry.path)} onContextMenu={e => menu.open(e, entry.path)}><FileIcon path={entry.path} /><span>{entry.name}</span><small>{entry.path}</small></button>}</For>
             <Show when={search() && !search()!.entries.length}><p>没有匹配的文件</p></Show>
             <Show when={search()?.truncated}><p>已显示部分结果，请使用更精确的文件名</p></Show>
           </div>
@@ -566,11 +566,11 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
           }} /></Match>
           <Match when={file.kind === "html" && !source()}><iframe title={label(file.path)} sandbox="allow-scripts" referrerpolicy="no-referrer" srcdoc={`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; form-action 'none';">${draft()}`} /></Match>
           <Match when={file.kind === "spreadsheet"}>
-            <ErrorBoundary fallback={error => <p role="alert">表格加载失败：{String(error)}，请刷新重试或使用系统打开。</p>}>
-              <Suspense fallback={<p role="status">正在加载表格编辑器…</p>}><WorkspaceSheet text={draft()} readOnly={saving()}
+            <Errored fallback={error => <p role="alert">表格加载失败：{String(error())}，请刷新重试或使用系统打开。</p>}>
+              <Loading fallback={<p role="status">正在加载表格编辑器…</p>}><WorkspaceSheet text={draft()} readOnly={saving()}
                 onReady={text => { if (!dirty()) { setOriginal(text); setDraft(text); } }}
-                onChange={text => { if (preview() === file) changeDraft(text); }} onEditor={editor => { sheetEditor = editor; }} /></Suspense>
-            </ErrorBoundary>
+                onChange={text => { if (preview() === file) changeDraft(text); }} onEditor={editor => { sheetEditor = editor; }} /></Loading>
+            </Errored>
           </Match>
           <Match when={file.text !== null}><WorkspaceCode path={file.path} text={draft()} readOnly onChange={changeDraft} onView={view => { codeView = view; }} /></Match>
         </Switch>

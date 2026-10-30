@@ -127,8 +127,12 @@ export function dropQueuedPromptsMatching(
   }
 }
 
+const inFlight = new Set<string>();
+
 export async function dispatchQueuedPrompt(item: QueuedPrompt, steerNow = false) {
-  if (dispatchingQueueIds().has(item.id)) return;
+  if (inFlight.has(item.id)) return;
+  // 同步锁不依赖下一次响应式 flush，防止同一帧内重复投递。
+  inFlight.add(item.id);
   // 用户主动发送或恢复队列后，允许后续条目在回合结束后继续自动投递。
   releasePromptQueue(item.threadId);
   setFailedQueueIds((ids) => {
@@ -154,6 +158,7 @@ export async function dispatchQueuedPrompt(item: QueuedPrompt, steerNow = false)
     console.error("发送排队提示词失败", error);
     setFailedQueueIds((ids) => new Set(ids).add(item.id));
   } finally {
+    inFlight.delete(item.id);
     setDispatchingQueueIds((ids) => {
       const next = new Set(ids);
       next.delete(item.id);
@@ -176,14 +181,15 @@ function startPromptQueueDispatcher() {
       for (const item of queuedPrompts()) {
         if (!held.has(item.threadId) && !failed.has(item.id)) ids.add(item.threadId);
       }
-      setPromptQueuedThreads(ids);
-    });
+      return ids;
+    }, setPromptQueuedThreads);
     createEffect(() => {
       const items = queuedPrompts();
       const held = queueHeldThreadIds();
       const dispatching = dispatchingQueueIds();
       const failed = failedQueueIds();
       const seenThreads = new Set<string>();
+      const ready: QueuedPrompt[] = [];
 
       for (const item of items) {
         if (seenThreads.has(item.threadId)) continue;
@@ -201,8 +207,11 @@ function startPromptQueueDispatcher() {
         // 失败的条目允许跳过，避免后续队列永久卡住。
         if (failed.has(item.id)) continue;
         seenThreads.add(item.threadId);
-        void dispatchQueuedPrompt(item);
+        ready.push(item);
       }
+      return ready;
+    }, ready => {
+      for (const item of ready) void dispatchQueuedPrompt(item);
     });
   });
 }

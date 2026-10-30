@@ -51,8 +51,18 @@ function mount(t, items, overrides = {}, props = {}) {
       let value = initial;
       return [() => value, next => (value = typeof next === 'function' ? next(value) : next)];
     },
-    batch: fn => fn(), createMemo: fn => fn, createEffect: fn => effects.push(fn),
-    onMount: fn => mounts.push(fn), onCleanup: fn => cleanups.push(fn),
+    flush: fn => fn?.(), createMemo: fn => fn,
+    createEffect(compute, apply) {
+      let previous, cleanup;
+      effects.push(() => {
+        if (typeof cleanup === 'function') cleanup();
+        const value = compute(previous);
+        cleanup = apply(value, previous);
+        previous = value;
+      });
+      cleanups.push(() => { if (typeof cleanup === 'function') cleanup(); });
+    },
+    onSettled: fn => mounts.push(fn), onCleanup: fn => cleanups.push(fn),
     window: { addEventListener() {}, removeEventListener() {}, setInterval: () => 1, clearInterval() {}, setTimeout, clearTimeout },
     state: { permissions: [], settings: {} },
     sceneModel: () => ({ agentKind: 'lyra', model: 'mock-model' }),
@@ -68,6 +78,7 @@ function mount(t, items, overrides = {}, props = {}) {
       sendPrompt: unexpected, respondPermission: unexpected,
       listThreads: unexpected, getThreadView: unexpected, cancelTurn: unexpected, ...overrides.api },
   };
+  dependencies.state.relay ??= { enabled: false };
   // Record even caught failures, so an attempted AI fallback cannot pass silently.
   for (const [target, names] of [[dependencies, ['invoke', 'sceneModel', 'sendPromptTo', 'openThread', 'refreshThreads']], [dependencies.api, Object.keys(dependencies.api)]]) {
     for (const name of names) {
@@ -83,7 +94,7 @@ function mount(t, items, overrides = {}, props = {}) {
   // Never run effects inside component construction (later bindings may be in TDZ).
   // Signal changes are explicit: tests flush after the state transition under test.
   const flushEffects = () => effects.forEach(fn => fn());
-  mounts.forEach(fn => fn());
+  mounts.forEach(fn => { const cleanup = fn(); if (typeof cleanup === 'function') cleanups.push(cleanup); });
   flushEffects();
   t.after(() => cleanups.reverse().forEach(fn => fn()));
   return { ...view, calls, titles, flushEffects, storage: dependencies.localStorage,
@@ -104,9 +115,9 @@ async function startAction(view) {
 
 test('runtime DOM gates omit the workbench shell and confirmation UI, retaining app content and stop controls', () => {
   assert.doesNotMatch(source, /\b(?:Confirmation|confirmAction|setConfirmAction)\b/);
-  assert.match(source, /classList=\{\{ "mini-runtime": !!props\.runtimeAppId \}\}/);
+  assert.match(source, /class=\{\["mini-studio", \{ "mini-runtime": !!props\.runtimeAppId \}\]\}/);
   for (const name of ['mini-topbar', 'mini-library', 'mini-canvas-toolbar', 'mini-copilot', 'mini-preview-footer', 'mini-empty']) {
-    assert.match(source, new RegExp(`<Show when=\\{!props\\.runtimeAppId\\}>\\s*<(?:header|div|aside|footer) class="${name}"`), `${name} must be outside runtime DOM`);
+    assert.match(source, new RegExp(`<Show when=\\{!props\\.runtimeAppId\\}>\\s*(?:<TitleBarPortal>\\s*)?<(?:header|div|aside|footer) class="${name}"`), `${name} must be outside runtime DOM`);
   }
   assert.match(source, /<Show when=\{!props\.runtimeAppId && [^\n]*<section class="mini-debug"/);
   assert.match(source, /<Show when=\{!props\.runtimeAppId && mode\(\) === "design"\}><button class="mini-add-page"/);
@@ -678,7 +689,7 @@ test('runtime Nova activation dispatches published actions through api.sendPromp
     },
     api: {
       createThread: async (...args) => {
-        assert.deepEqual(args, ['mock-dir', 'lyra', 'runtime-model', 'build', null, false, false, null, null, null, null, 'lightweight']);
+        assert.deepEqual(args, ['mock-dir', 'lyra', 'runtime-model', 'build', null, false, false, null, null, null, 'lightweight']);
         return { id: 'mock-thread' };
       },
       sendPrompt: async (threadId, prompt, attachments) => {

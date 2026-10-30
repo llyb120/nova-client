@@ -1,7 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { Portal } from "solid-js/web";
+import { createMemo, createSignal, For, onCleanup, onSettled, Show } from "solid-js";
+import { Portal } from "@solidjs/web";
 import { titlebarSide, titlebarTabs } from "./TitleBar";
 import { api } from "../ipc";
 import { chainGroupAnchor, latestFireStage } from "../threadDisplay";
@@ -97,7 +97,7 @@ export function Sidebar(props: {
   let updateCheckTimer: number | undefined;
   let updateCheckClick = 0;
 
-  onMount(() => void getVersion().then(setVersion));
+  onSettled(() => { void getVersion().then(setVersion); });
   onCleanup(() => {
     updateCheckClick += 1;
     if (updateCheckTimer !== undefined) window.clearTimeout(updateCheckTimer);
@@ -429,14 +429,13 @@ export function Sidebar(props: {
     const updatedAt = () => Math.max(...chainThreads().map((thread) => thread.updatedAt));
     return (
       <div
-        class="thread-item"
-        classList={{
+        class={["thread-item", {
           active: active(),
           "history-time": !!props.historyProject,
           child: !!props.child,
           parent: (props.childCount ?? 0) > 0,
           starred: !!(t.starred || props.mergedChild?.starred),
-        }}
+        }]}
         onPointerDown={() => markThreadSwitchPointerDown()}
         onClick={() =>
           void openHistoryThread(
@@ -546,8 +545,7 @@ export function Sidebar(props: {
 
   return (
     <div
-      class="sidebar-shell"
-      classList={{ collapsed: collapsed(), "is-open": sidebarOpen() }}
+      class={["sidebar-shell", { collapsed: collapsed(), "is-open": sidebarOpen() }]}
       onPointerLeave={() => { cancelHover(); setHovered(false); }}
     >
       <Show when={collapsed()}>
@@ -563,7 +561,7 @@ export function Sidebar(props: {
             title="固定展开侧边栏"
             aria-label="固定展开侧边栏"
             aria-controls="main-sidebar"
-            aria-expanded={sidebarOpen()}
+            aria-expanded={sidebarOpen() ? "true" : "false"}
             onClick={() => {
               cancelHover();
               setCollapsed(false);
@@ -577,18 +575,17 @@ export function Sidebar(props: {
           <button class="sidebar-rail-list"
             title={`会话列表（悬停展开）\n运行中：${chainInfo().rootCount}\n已完成未读：${completedUnreadCount()}`}
             aria-label="会话列表" aria-controls="main-sidebar"
-            aria-expanded={sidebarOpen()} onClick={() => { cancelHover(); setHovered(true); }}>
+            aria-expanded={sidebarOpen() ? "true" : "false"} onClick={() => { cancelHover(); setHovered(true); }}>
             <IconFolder size={18} />
             <Show when={railCount() > 0}>
-              <span class="sidebar-rail-count"
-                classList={{ running: chainInfo().rootCount > 0, unread: completedUnreadCount() > 0 }}
+              <span class={["sidebar-rail-count", { running: chainInfo().rootCount > 0, unread: completedUnreadCount() > 0 }]}
                 aria-label={`运行中：${chainInfo().rootCount}，已完成未读：${completedUnreadCount()}`}>
                 <span class="sidebar-rail-count-number">{railCount() > 99 ? "99+" : railCount()}</span>
               </span>
             </Show>
           </button>
           <button type="button" title="观星台" aria-label="观星台"
-            classList={{ active: state.view === "miniapps" }} aria-current={state.view === "miniapps" ? "page" : undefined}
+            class={{ active: state.view === "miniapps" }} aria-current={state.view === "miniapps" ? "page" : undefined}
             onClick={() => switchView("miniapps")}>
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true">
               <path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z" />
@@ -624,18 +621,18 @@ export function Sidebar(props: {
         <Show when={titlebarTabs()} keyed>{(mount) => <Portal mount={mount}>
         <nav class="mode-seg secondary" aria-label="主区域">
           <Show when={state.settings?.knowledgeGraphEnabled}>
-            <button type="button" class="mode-seg-btn" classList={{ active: state.view === "knowledge" || state.view === "jianpu" }}
+            <button type="button" class={["mode-seg-btn", { active: state.view === "knowledge" || state.view === "jianpu" }]}
               aria-current={state.view === "knowledge" || state.view === "jianpu" ? "page" : undefined}
               onClick={() => switchView("knowledge")} title="查看操作路径与下一步分支">
               <span aria-hidden="true"><IconClue size={15} /></span>知识图谱
             </button>
           </Show>
-          <button type="button" class="mode-seg-btn" classList={{ active: state.view === "employee" }}
+          <button type="button" class={["mode-seg-btn", { active: state.view === "employee" }]}
             aria-current={state.view === "employee" ? "page" : undefined}
             onClick={() => switchView("employee")} title="数字员工：空闲时按职责自动干活">
             <span aria-hidden="true"><IconUsers size={15} /></span>数字员工
           </button>
-          <button type="button" class="mode-seg-btn" classList={{ active: state.view === "miniapps" }}
+          <button type="button" class={["mode-seg-btn", { active: state.view === "miniapps" }]}
             aria-current={state.view === "miniapps" ? "page" : undefined}
             onClick={() => switchView("miniapps")} title="观星台：创建和打开应用">
             <span aria-hidden="true"><IconStar size={15} /></span>观星台
@@ -737,7 +734,7 @@ export function Sidebar(props: {
             title={collapsed() ? "固定展开侧边栏" : "收起为图标栏"}
             aria-label={collapsed() ? "固定展开侧边栏" : "收起侧边栏"}
             aria-controls="main-sidebar"
-            aria-expanded={sidebarOpen()}
+            aria-expanded={sidebarOpen() ? "true" : "false"}
             onClick={() => {
               cancelHover();
               setCollapsed(!collapsed());
@@ -812,7 +809,7 @@ export function Sidebar(props: {
                       <button
                         type="button"
                         class="group-project-toggle"
-                        aria-expanded={!projectCollapsed()}
+                        aria-expanded={!projectCollapsed() ? "true" : "false"}
                         aria-label={`${projectCollapsed() ? "展开" : "收起"}项目 ${groupName(cwd)}`}
                         onClick={() => toggleProject(cwd)}
                       >
@@ -854,9 +851,8 @@ export function Sidebar(props: {
                       <Show when={collapsible()}>
                         <button
                           type="button"
-                          class="thread-group-toggle"
-                          classList={{ expanded: expanded() }}
-                          aria-expanded={expanded()}
+                          class={["thread-group-toggle", { expanded: expanded() }]}
+                          aria-expanded={expanded() ? "true" : "false"}
                           aria-label={
                             expanded()
                               ? "收起会话"
@@ -951,8 +947,7 @@ export function Sidebar(props: {
                 <For each={mergeBranches()}>
                   {(b) => (
                     <button
-                      class="merge-branch"
-                      classList={{ on: mergeTarget() === b }}
+                      class={["merge-branch", { on: mergeTarget() === b }]}
                       disabled={merging()}
                       onClick={() => setMergeTarget(b)}
                     >

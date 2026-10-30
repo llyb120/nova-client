@@ -1,4 +1,4 @@
-import { createEffect, createSignal, lazy, onCleanup, onMount, Show, Suspense } from "solid-js";
+import { createEffect, createSignal, lazy, onSettled, Show, Loading } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
 import { AchievementsModal } from "./components/AchievementsModal";
 import { ChatView } from "./components/ChatView";
@@ -54,7 +54,7 @@ function AppToast() {
 
 function AppToastChip(props: { text: string }) {
   let el: HTMLDivElement | undefined;
-  onMount(() => {
+  onSettled(() => {
     if (!el) return;
     // 发送方随后才会清空输入框/附件/引用，首页居中布局随之收缩下移；
     // 先隐藏，等下一帧布局稳定后再测量定位，避免贴着「收缩前」的输入框。
@@ -101,11 +101,12 @@ export default function App() {
   const [showAchievements, setShowAchievements] = createSignal(false);
   const [showUpdate, setShowUpdate] = createSignal(false);
   const [showInbox, setShowInbox] = createSignal(false);
-  createEffect(() => {
-    if (state.view === "knowledge" && !state.settings?.knowledgeGraphEnabled) setView("home");
-  });
+  createEffect(
+    () => state.view === "knowledge" && !state.settings?.knowledgeGraphEnabled,
+    disabled => { if (disabled) setView("home"); },
+  );
 
-  onMount(() => {
+  onSettled(() => {
     setShortcutRecordingActive(false);
     void initStore();
     initLayoutEvents();
@@ -132,10 +133,10 @@ export default function App() {
       if (view === "miniapps") window.dispatchEvent(new Event("nova:miniapps-open"));
     })
       .then(remove => { if (disposed) remove(); else unlistens.push(remove); });
-    onCleanup(() => {
+    return () => {
       disposed = true;
       for (const unlisten of unlistens) unlisten();
-    });
+    };
   });
 
   // 「打开未读消息」在应用聚焦时的按键处理；全局注册（Rust 侧）覆盖最小化/失焦场景。
@@ -150,13 +151,13 @@ export default function App() {
   });
 
   // 空闲时后端请求更新（update:prompt）→ 自动弹出更新对话框，由用户选择是否现在更新。
-  createEffect(() => {
-    if (state.updatePromptAt > 0) setShowUpdate(true);
+  createEffect(() => state.updatePromptAt, at => {
+    if (at > 0) setShowUpdate(true);
   });
 
   // 漫游召回的快照到达 → 自动弹出收件箱，用户直接选项目接收
-  createEffect(() => {
-    if (state.inboxPromptAt > 0) setShowInbox(true);
+  createEffect(() => state.inboxPromptAt, at => {
+    if (at > 0) setShowInbox(true);
   });
 
   return (
@@ -179,23 +180,23 @@ export default function App() {
             <Show when={state.view === "employee"} fallback={
               <Show when={state.view === "jianpu"} fallback={
                 <Show when={state.view === "miniapps"} fallback={<HomeView />}>
-                  <Suspense><MiniAppsView /></Suspense>
+                  <Loading><MiniAppsView /></Loading>
                 </Show>
               }>
-                <Suspense><JianpuView /></Suspense>
+                <Loading><JianpuView /></Loading>
               </Show>
             }>
-              <Suspense><EmployeeView /></Suspense>
+              <Loading><EmployeeView /></Loading>
             </Show>
           }>
-            <Suspense><KnowledgeGraphView /></Suspense>
+            <Loading><KnowledgeGraphView /></Loading>
           </Show>
         }
       >
         <ChatView />
       </Show>
       <Show when={homeTerminal.open()}>
-        <Suspense><HomeTerminalPanel onClose={homeTerminal.close} /></Suspense>
+        <Loading><HomeTerminalPanel onClose={homeTerminal.close} /></Loading>
       </Show>
       </div>
       <Show when={showSettings() || scenesMissing()}>

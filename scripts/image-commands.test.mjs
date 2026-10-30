@@ -110,17 +110,14 @@ test("new-thread send failures restore the draft, stop running and show the actu
       state, isSupportedAgentKind, normalizeAgentKind, PENDING_THREAD_PREFIX: "pending-",
       optimisticHandoffs: new Map(),
       reconcile: (v) => v, bumpChatScrollToBottom: noop,
-      setState: (...args) => {
-        if (typeof args[0] === "object") Object.assign(state, args[0]);
-        else if (args.length === 3) state[args[0]][args[1]] = args[2];
-        else state[args[0]] = args[1];
-      },
+      setState: update => update(state),
+      flush: fn => fn(),
       api: { createThread: async () => {
         if (stage === "create") throw "create failed";
         return { id: "created", items: [], cwd: "D:/repo", agentKind: "lyra" };
       } },
-      threadEffort: noop, rememberThreadSnapshot: noop,
-      lastUsed: { setMode: noop }, reportActivity: noop,
+      threadEffort: noop, rememberThreadSnapshot: noop, applyPendingPreset: noop,
+      lastUsed: { setMode: noop, setReasoningEffort: noop }, reportActivity: noop,
       sendPromptTo: async () => {
         if (stage === "switched") state.currentId = "another-thread";
         throw "尚未配置图片服务，请先使用 /setup-image";

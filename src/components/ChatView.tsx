@@ -1,6 +1,6 @@
 import { confirm, message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, For, lazy, onCleanup, onMount, Show, Suspense, untrack } from "solid-js";
-import { Portal } from "solid-js/web";
+import { createEffect, createMemo, createSignal, flush, For, lazy, onCleanup, onSettled, Show, Loading, untrack } from "solid-js";
+import { Portal } from "@solidjs/web";
 import { titlebarView, TitleBarPortal } from "./TitleBar";
 import { api } from "../ipc";
 import { workspaceLayout, setWorkspaceLayout } from "../workspaceLayout";
@@ -46,7 +46,7 @@ export function ChatView() {
   const workspaceOpen = () => workspaceLayout.open;
   const setWorkspaceOpen = (open: boolean) => setWorkspaceLayout({ open });
   const [workspaceRequest, setWorkspaceRequest] = createSignal<{ path: string; line?: number } | null>(null);
-  createEffect(() => { state.currentId; setWorkspaceRequest(null); });
+  createEffect(() => state.currentId, () => { setWorkspaceRequest(null); });
   const previewFile = (event: Event) => {
     if (isSubagent()) return;
     const detail = (event as CustomEvent<string | { path: string; line?: number }>).detail;
@@ -55,7 +55,7 @@ export function ChatView() {
     setWorkspaceRequest(target);
     setWorkspaceLayout({ open: true, mode: "files" });
   };
-  onMount(() => window.addEventListener("nova:preview-file", previewFile));
+  onSettled(() => window.addEventListener("nova:preview-file", previewFile));
   onCleanup(() => window.removeEventListener("nova:preview-file", previewFile));
   let transcriptRef: HtmlTranscriptHandle | undefined;
   const [transcriptReady, setTranscriptReady] = createSignal(false);
@@ -79,8 +79,7 @@ export function ChatView() {
   let previewTimer: ReturnType<typeof setTimeout> | undefined;
   const displayedItems = () => previewItems() ?? (state.items as Item[]);
   const groups = createMemo<ReturnType<typeof groupItems>>(
-    (prev) => groupItems(displayedItems(), prev),
-    [],
+    (prev = []) => groupItems(displayedItems(), prev),
   );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
   const timeStops = createMemo(() => {
@@ -186,10 +185,9 @@ export function ChatView() {
     tokenRollDoneTimer = undefined;
     setTokensRolling(false);
   };
-  createEffect(() => {
+  createEffect(totalTokens, rawTarget => {
     // 用量来自多个异步来源（实时估算、provider 校正、Turn 落库接替）。
     // 任一来源切换都不应让计数器进入负区间；同时防御异常的非有限值。
-    const rawTarget = totalTokens();
     const target = Number.isFinite(rawTarget) ? Math.max(0, Math.round(rawTarget)) : 0;
     const current = untrack(shownTokens);
     const from = Number.isFinite(current) ? Math.max(0, current) : 0;
@@ -229,10 +227,9 @@ export function ChatView() {
     const last = state.items[len - 1];
     if (last && "text" in last) void (last as { text: string }).text.length;
     void permissions().length;
-    scheduleBottomPin();
-  });
+  }, scheduleBottomPin);
 
-  onMount(() => {
+  onSettled(() => {
     const scrollUpKeys = new Set(["ArrowUp", "PageUp", "Home"]);
     const scrollDownKeys = new Set(["ArrowDown", "PageDown", "End"]);
     const handleScrollKey = (event: KeyboardEvent) => {
@@ -247,37 +244,35 @@ export function ChatView() {
       else if (!isAtBottom()) cancelBottomFollow();
     };
     window.addEventListener("keydown", handleScrollKey, true);
-    onCleanup(() => window.removeEventListener("keydown", handleScrollKey, true));
+    return () => window.removeEventListener("keydown", handleScrollKey, true);
   });
 
   // 切换会话时从底部开始；后续尺寸变化由 ResizeObserver 持续对齐。
-  createEffect((prevId: string | null | undefined) => {
-    const id = state.currentId;
+  createEffect(() => state.currentId, (id, prevId) => {
     if (id !== prevId) {
       enableBottomFollow();
       setActiveTimeIndex(latestTimeIndex());
     }
-    return id;
-  }, undefined);
+  });
 
   // 会话搜索点击命中：等目标会话加载完成后退出吸底，滚到命中消息并高亮。
   createEffect(() => {
     const hit = searchReveal();
-    if (!hit || !transcriptReady() || hit.threadId !== state.currentId || state.loadingThread || previewItems()) return;
+    return hit && transcriptReady() && hit.threadId === state.currentId && !state.loadingThread && !previewItems() ? hit : null;
+  }, hit => {
+    if (!hit) return;
     setSearchReveal(null);
     cancelBottomFollow();
     untrack(() => transcriptRef?.revealMatch(hit.itemId, hit.query));
   });
 
   // 会话加载和新增轮次后，让“现在”刻度跟随最新用户轮次；回看过去时不抢走光标。
-  createEffect(() => {
-    const latest = latestTimeIndex();
-    if (stickToBottom()) setActiveTimeIndex(latest);
+  createEffect(() => [latestTimeIndex(), stickToBottom()] as const, ([latest, following]) => {
+    if (following) setActiveTimeIndex(latest);
   });
 
   // 主动发送新提示词时重新进入吸底，无动画直接显示最新内容。
-  createEffect(() => {
-    const tick = chatScrollToBottomSignal();
+  createEffect(chatScrollToBottomSignal, tick => {
     if (tick === 0) return;
     enableBottomFollow();
   });
@@ -292,28 +287,24 @@ export function ChatView() {
   let observedTimeMachineThread: string | null = null;
   let observedTimeMachineChange = timeMachineChangedSignal();
 
-  createEffect(() => {
-    const threadId = state.currentId;
-    const change = timeMachineChangedSignal();
+  createEffect(() => [state.currentId, timeMachineChangedSignal(), timeMachineExpanded()] as const, ([threadId, change, expanded]) => {
     const changedCurrentTimeline =
       threadId !== null && threadId === observedTimeMachineThread && change !== observedTimeMachineChange;
     observedTimeMachineThread = threadId;
     observedTimeMachineChange = change;
-    if (changedCurrentTimeline && !timeMachineExpanded()) {
+    if (changedCurrentTimeline && !expanded) {
       // 收起时世界线不可见，用卡扣里的表针转动提示历史编辑已生成新分支。
       setTimeMachineHintTurn((turn) => turn + 1);
     }
   });
 
 
-  createEffect(() => {
-    const threadId = state.currentId;
-    void timeMachineChangedSignal();
+  createEffect(() => [state.currentId, timeMachineChangedSignal(), isSubagent()] as const, ([threadId, , subagent]) => {
     setTimeline(null);
     setPreviewItems(null);
     setPreviewCheckpointId(null);
     setTimeMachineEditTarget(null);
-    if (!threadId || isSubagent()) return;
+    if (!threadId || subagent) return;
     void api.getTimeMachineTimeline(threadId).then((value) => {
       if (state.currentId === threadId) setTimeline(value);
     }).catch(() => {});
@@ -448,11 +439,11 @@ export function ChatView() {
     if (!meta || starUpdating()) return;
     const starred = !meta.starred;
     setStarUpdating(true);
-    setState("threads", (thread) => thread.id === meta.id, "starred", starred);
+    setState(s => { const thread = s.threads.find(thread => thread.id === meta.id); if (thread) thread.starred = starred; });
     try {
       await api.setThreadStarred(meta.id, starred);
     } catch (error) {
-      setState("threads", (thread) => thread.id === meta.id, "starred", !starred);
+      setState(s => { const thread = s.threads.find(thread => thread.id === meta.id); if (thread) thread.starred = !starred; });
       void message(String(error), { kind: "error" });
     } finally {
       setStarUpdating(false);
@@ -477,17 +468,17 @@ export function ChatView() {
   const closeFork = () => {
     if (!forkBusy()) setForkSourceId(null);
   };
-  createEffect(() => {
-    if (!forkSourceId()) return;
+  createEffect(forkSourceId, id => {
+    if (!id) return;
     // Esc 只关闭弹窗，不能落入 Composer 的全局停止执行快捷键。
     setShortcutCaptureActive(true);
-    onCleanup(() => setShortcutCaptureActive(false));
+    return () => setShortcutCaptureActive(false);
   });
   const submitFork = async () => {
     const sourceId = forkSourceId();
     const title = forkTitle().trim();
     if (!sourceId || !title || forkBusy()) return;
-    setForkBusy(true);
+    flush(() => setForkBusy(true));
     setForkError("");
     try {
       // 创建已成功时，刷新失败后的重试只打开同一副本，不重复 fork。
@@ -505,6 +496,17 @@ export function ChatView() {
     } finally {
       setForkBusy(false);
     }
+  };
+
+  const mountForkDialog = () => {
+    let dialog!: HTMLDialogElement;
+    onSettled(() => {
+      // 原生模态框负责 Tab 焦点约束及关闭后的焦点归还。
+      dialog.showModal();
+      dialog.querySelector("input")?.select();
+      return () => dialog.close();
+    });
+    return (element: HTMLDialogElement) => { dialog = element; };
   };
 
   // worktree 会话的 cwd 是 uuid 工作目录，展示时用源仓库路径更直观
@@ -845,7 +847,7 @@ export function ChatView() {
     const title = draft().trim();
     if (!id || isSubagent() || !title || title === state.title) return;
     await api.renameThread(id, title);
-    setState("title", title);
+    setState(s => { if (s.currentId === id) s.title = title; });
   };
 
   return (
@@ -885,10 +887,9 @@ export function ChatView() {
         <Show when={canStar()}>
           <button
             type="button"
-            class="chat-star"
-            classList={{ starred: !!currentMeta()?.starred }}
+            class={["chat-star", { starred: !!currentMeta()?.starred }]}
             title={currentMeta()?.starred ? "取消星标" : "加星标并在项目内置顶"}
-            aria-pressed={!!currentMeta()?.starred}
+            aria-pressed={!!currentMeta()?.starred ? "true" : "false"}
             onClick={() => void toggleStar()}
           >
             <IconStar size={15} filled={!!currentMeta()?.starred} />
@@ -934,11 +935,10 @@ export function ChatView() {
         </div>
         <div class="chat-actions">
         <span
-          class="chat-tokens"
-          classList={{
+          class={["chat-tokens", {
             "chat-tokens-empty": totalTokens() === 0,
             "chat-tokens-rolling": tokensRolling(),
-          }}
+          }]}
           title={totalTokensTitle()}
         >
           {fmtTokens(shownTokens())} tokens
@@ -989,11 +989,10 @@ export function ChatView() {
         <Show when={showTimeMachine() && !workspaceOpen()}>
           <button
             type="button"
-            class="chat-time-machine-btn"
-            classList={{ active: timeMachineExpanded() }}
+            class={["chat-time-machine-btn", { active: timeMachineExpanded() }]}
             title={timeMachineExpanded() ? "收起世界线" : "展开世界线"}
             aria-label={timeMachineExpanded() ? "收起世界线" : "展开世界线"}
-            aria-expanded={timeMachineExpanded()}
+            aria-expanded={timeMachineExpanded() ? "true" : "false"}
             onClick={() => setTimeMachineExpanded(!timeMachineExpanded())}
           >
             <span class="repo-time-toggle-clock" aria-hidden="true">
@@ -1007,8 +1006,7 @@ export function ChatView() {
         <Show when={!!state.currentId && !isSubagent() && roamingRole() !== "guest"}>
           <button
             type="button"
-            class="chat-files-btn"
-            classList={{ active: workspaceOpen() }}
+            class={["chat-files-btn", { active: workspaceOpen() }]}
             title="文件与产物"
             aria-label="文件与产物"
             onClick={() => setWorkspaceOpen(!workspaceOpen())}
@@ -1027,15 +1025,7 @@ export function ChatView() {
             aria-describedby="fork-dialog-description"
             aria-modal="true"
             style={{ width: "100%", height: "100%", "max-width": "none", "max-height": "none", margin: "0", padding: "0", border: "0", color: "var(--text)" }}
-            ref={(dialog) => {
-              queueMicrotask(() => {
-                if (!dialog.isConnected) return;
-                // 原生模态框负责 Tab 焦点约束及关闭后的焦点归还。
-                dialog.showModal();
-                dialog.querySelector("input")?.select();
-              });
-              onCleanup(() => dialog.close());
-            }}
+            ref={mountForkDialog()}
             onCancel={(event) => { event.preventDefault(); closeFork(); }}
             onMouseDown={(event) => { if (event.target === event.currentTarget) closeFork(); }}
             onKeyDown={(event) => {
@@ -1045,7 +1035,7 @@ export function ChatView() {
             <form
               class="modal"
               style={{ width: "460px", "max-width": "calc(100vw - 32px)" }}
-              aria-busy={forkBusy()}
+              aria-busy={forkBusy() ? "true" : "false"}
               onSubmit={(event) => { event.preventDefault(); void submitFork(); }}
             >
               <div class="modal-head"><span id="fork-dialog-title">Fork 会话 · 命名副本</span></div>
@@ -1061,7 +1051,7 @@ export function ChatView() {
                     autofocus
                     required
                     value={forkTitle()}
-                    readOnly={forkBusy() || !!forkedId()}
+                    readonly={forkBusy() || !!forkedId()}
                     onInput={(event) => setForkTitle(event.currentTarget.value)}
                   />
                 </label>
@@ -1144,11 +1134,10 @@ export function ChatView() {
 
       <Show when={showTimeMachine() && !workspaceOpen()}>
         <aside
-          class="repo-time-machine"
-          classList={{ collapsed: !timeMachineExpanded(), expanded: timeMachineExpanded() }}
+          class={["repo-time-machine", { collapsed: !timeMachineExpanded(), expanded: timeMachineExpanded() }]}
           aria-label="会话与工作目录分支时间线"
         >
-          <div class="repo-time-machine-label" aria-hidden={!timeMachineExpanded()}>
+          <div class="repo-time-machine-label" aria-hidden={!timeMachineExpanded() ? "true" : "false"}>
             <button
               type="button"
               class="repo-time-notes"
@@ -1183,7 +1172,7 @@ export function ChatView() {
                 <For each={timelineGraph().edges}>
                   {(edge) => (
                     <path
-                      classList={{ current: edge.current }}
+                      class={{ current: edge.current }}
                       d={`M ${edge.from.x} ${edge.from.y} C ${edge.from.x} ${edge.from.y + 16}, ${edge.to.x} ${edge.to.y - 16}, ${edge.to.x} ${edge.to.y}`}
                     />
                   )}
@@ -1193,8 +1182,7 @@ export function ChatView() {
                 {(node) => (
                   <button
                     type="button"
-                    class="repo-time-node"
-                    classList={{
+                    class={["repo-time-node", {
                       active: node.current,
                       selected: node.id === timeline()?.currentCheckpointId,
                       previewing: node.id === previewCheckpointId(),
@@ -1203,7 +1191,7 @@ export function ChatView() {
                       "off-current-path": !node.onCurrentPath,
                       "outcome-success": (node.checkpoint ?? node.previewCheckpoint)?.outcome === "success",
                       "outcome-failure": (node.checkpoint ?? node.previewCheckpoint)?.outcome === "failure",
-                    }}
+                    }]}
                     style={{ left: `${node.x}px`, top: `${node.y}px` }}
                     title={node.title}
                     disabled={!!restoringCheckpoint()}
@@ -1231,8 +1219,7 @@ export function ChatView() {
               </For>
               <button
                 type="button"
-                class="repo-time-now"
-                classList={{ active: stickToBottom() && !previewItems() }}
+                class={["repo-time-now", { active: stickToBottom() && !previewItems() }]}
                 title="回到当前时间线的最新消息"
                 onClick={returnToCurrentTimeline}
               >
@@ -1281,8 +1268,7 @@ export function ChatView() {
             {(thread, index) => (
               <button
                 type="button"
-                class="stage-rail-item"
-                classList={{ active: thread.id === (pendingStageId() ?? state.currentId), unread: stageUnread(thread) > 0, subagent: thread.subagent }}
+                class={["stage-rail-item", { active: thread.id === (pendingStageId() ?? state.currentId), unread: stageUnread(thread) > 0, subagent: thread.subagent }]}
                 title={thread.title}
                 onPointerDown={() => markThreadSwitchPointerDown()}
                 onClick={() => {
@@ -1308,7 +1294,7 @@ export function ChatView() {
       {/* 文件/产物侧栏排在 Stage 导航右边：聊天 → 世界线 → Stage → 侧边栏。 */}
       <Show when={!isSubagent() && workspaceOpen() && roamingRole() !== "guest"}>
         <Show keyed when={state.currentId}>
-          {id => <Suspense fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceLayout.mode === "terminal" ? null : workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Suspense>}
+          {id => <Loading fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceLayout.mode === "terminal" ? null : workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Loading>}
         </Show>
       </Show>
       <Portal>

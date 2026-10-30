@@ -5,22 +5,22 @@ import { homedir } from 'node:os';
 import { createServer } from 'node:http';
 import { build } from 'esbuild';
 import { transformAsync } from '@babel/core';
-import solid from 'babel-preset-solid';
+import solid from '@solidjs/babel-plugin';
 import { chromium } from 'playwright-core';
 
-const fixture = `import {render} from 'solid-js/web'; import {createSignal,Show} from 'solid-js';
+const fixture = `import {render} from '@solidjs/web'; import {createSignal,Show} from 'solid-js';
 import {HtmlPromptText} from './src/components/HtmlPromptText';
 const [text,setText]=createSignal(''), [shown,setShown]=createSignal(true);
 const raf=window.requestAnimationFrame.bind(window);window.slices=[];window.requestAnimationFrame=cb=>raf(time=>{const start=performance.now();try{cb(time)}finally{window.slices.push({duration:performance.now()-start,name:cb.name||cb.toString().slice(0,80)})}});
 window.load=value=>{setShown(true);setText(value)};window.unmount=()=>setShown(false);
 render(()=><div id="scroll"><div class="ht-user-column"><div class="ht-bubble-wrap"><div class="ht-user-bubble"><Show when={shown()}><HtmlPromptText text={text()} /></Show></div></div></div></div>,document.body);
 window.frames=[];let last=performance.now();window.resetFrames=()=>{window.frames=[];window.slices=[];last=performance.now();window.started=last};const tick=()=>{const now=performance.now();window.frames.push(now-last);last=now;requestAnimationFrame(tick)};requestAnimationFrame(tick);`;
-const compiledFixture=await transformAsync(fixture,{filename:'prompt-text-check.tsx',configFile:false,babelrc:false,presets:[[solid,{generate:'dom'}]],parserOpts:{plugins:['jsx','typescript']}});
+const compiledFixture=await transformAsync(fixture,{filename:'prompt-text-check.tsx',configFile:false,babelrc:false,plugins:[[solid,{generate:'dom'}]],parserOpts:{plugins:['jsx','typescript']}});
 const bundle = await build({
   stdin:{contents:compiledFixture.code,resolveDir:process.cwd(),sourcefile:'prompt-text-check.tsx',loader:'ts'},
   bundle:true,write:false,format:'esm',platform:'browser',conditions:['browser'],jsx:'preserve',
   plugins:[{name:'solid',setup(builder){builder.onLoad({filter:/\.tsx$/},async({path})=>({
-    contents:(await transformAsync(await readFile(path,'utf8'),{filename:path,configFile:false,babelrc:false,presets:[[solid,{generate:'dom'}]],parserOpts:{plugins:['jsx','typescript']}})).code,loader:'ts'
+    contents:(await transformAsync(await readFile(path,'utf8'),{filename:path,configFile:false,babelrc:false,plugins:[[solid,{generate:'dom'}]],parserOpts:{plugins:['jsx','typescript']}})).code,loader:'ts'
   }));}}]
 });
 const final = bundle;

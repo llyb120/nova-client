@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onSettled, Show } from "solid-js";
 import { api } from "../ipc";
 import { state } from "../store";
 import { workspaceDiffRows, type DiffRow } from "../workspaceDiff";
@@ -31,26 +31,25 @@ export default function WorkspaceGit(props: { threadId: string; onOpen: (path: s
     } catch (e) { if (token === request) { setStatus(undefined); setSelection(undefined); setError(String(e)); } }
     finally { if (token === request) setBusy(false); }
   };
-  createEffect(() => { state.running[props.threadId]; void refresh(); });
-  onMount(() => { window.addEventListener("focus", refresh); });
+  createEffect(() => [props.threadId, state.running[props.threadId]], () => { void refresh(); });
+  onSettled(() => { window.addEventListener("focus", refresh); });
   onCleanup(() => { ++request; window.removeEventListener("focus", refresh); });
-  createEffect(() => {
-    const chosen = selection(); revision();
+  createEffect(() => [selection(), revision(), expandAll(), props.threadId] as const, ([chosen, , expanded, threadId]) => {
     setPatch(""); setImages(undefined); setLoadingDiff(false);
     if (!chosen) return;
     let disposed = false;
-    onCleanup(() => { disposed = true; });
     setLoadingDiff(true); setError("");
     const failed = (error: unknown) => { if (!disposed) setError(String(error)); };
     const done = () => { if (!disposed) setLoadingDiff(false); };
     if (IMAGE_PATH.test(chosen.path)) {
-      void api.workspaceGitImage(props.threadId, chosen.path, chosen.staged)
+      void api.workspaceGitImage(threadId, chosen.path, chosen.staged)
         .then(pair => { if (!disposed) setImages(pair); }, failed).finally(done);
-      return;
+      return () => { disposed = true; };
     }
-    void api.workspaceGitDiff(props.threadId, chosen.path, chosen.staged, expandAll()).then(text => {
+    void api.workspaceGitDiff(threadId, chosen.path, chosen.staged, expanded).then(text => {
       if (!disposed) setPatch(text);
     }, failed).finally(done);
+    return () => { disposed = true; };
   });
   const groups = createMemo(() => workspaceDiffRows(patch()));
   const stats = createMemo(() => {
@@ -63,11 +62,11 @@ export default function WorkspaceGit(props: { threadId: string; onOpen: (path: s
   </div>;
   const Group = (p: { rows: DiffRow[] }) => {
     const [expanded, setExpanded] = createSignal(false);
-    createEffect(() => setExpanded(expandAll()));
+    createEffect(expandAll, value => { setExpanded(value); });
     const foldable = () => p.rows[0].kind === "context" && p.rows.length > 8;
     return <Show when={foldable()} fallback={<For each={p.rows}>{row => <Row row={row} />}</For>}>
       <For each={p.rows.slice(0, 3)}>{row => <Row row={row} />}</For>
-      <button class="workspace-diff-fold" aria-expanded={expanded()} onClick={() => setExpanded(v => !v)}>{expanded() ? "折叠" : "展开"} {p.rows.length - 6} 行未变动内容</button>
+      <button class="workspace-diff-fold" aria-expanded={expanded() ? "true" : "false"} onClick={() => setExpanded(v => !v)}>{expanded() ? "折叠" : "展开"} {p.rows.length - 6} 行未变动内容</button>
       <Show when={expanded()}><For each={p.rows.slice(3, -3)}>{row => <Row row={row} />}</For></Show>
       <For each={p.rows.slice(-3)}>{row => <Row row={row} />}</For>
     </Show>;
@@ -81,7 +80,7 @@ export default function WorkspaceGit(props: { threadId: string; onOpen: (path: s
       <For each={[false, true]}>{staged => {
         const files = () => status()?.files.filter(file => (staged ? file.index !== " " && file.index !== "?" : file.worktree !== " ") && file.path.toLowerCase().includes(filter().toLowerCase())) ?? [];
         return <details open><summary>{staged ? "已暂存" : "未暂存（含未跟踪）"} · {files().length}</summary>
-          <For each={files()}>{file => <button class="workspace-file" aria-pressed={selection()?.path === file.path && selection()?.staged === staged} title={file.oldPath ? `${file.oldPath} → ${file.path}` : file.path} onClick={() => setSelection({ path: file.path, staged })}>
+          <For each={files()}>{file => <button class="workspace-file" aria-pressed={selection()?.path === file.path && selection()?.staged === staged ? "true" : "false"} title={file.oldPath ? `${file.oldPath} → ${file.path}` : file.path} onClick={() => setSelection({ path: file.path, staged })}>
             <strong>{staged ? file.index : file.worktree}</strong><span>{file.path}</span>
           </button>}</For>
         </details>;
@@ -91,7 +90,7 @@ export default function WorkspaceGit(props: { threadId: string; onOpen: (path: s
     <Show when={selection()}>{chosen => <>
       <div class="workspace-toolbar workspace-diff-toolbar"><span title={chosen().path}>{chosen().path} · {chosen().staged ? "已暂存" : "未暂存"}</span>
         <Show when={!images()}><span class="workspace-diff-count">+{stats().add} −{stats().del}</span>
-          <button aria-pressed={expandAll()} onClick={() => setExpandAll(v => !v)}>{expandAll() ? "折叠未变动" : "展开全部"}</button></Show>
+          <button aria-pressed={expandAll() ? "true" : "false"} onClick={() => setExpandAll(v => !v)}>{expandAll() ? "折叠未变动" : "展开全部"}</button></Show>
         <button onClick={() => props.onOpen(`${status()!.repo}/${chosen().path}`)}>打开文件</button>
       </div>
       <Show when={loadingDiff()} fallback={<Show when={images()} fallback={<div class="workspace-diff" aria-label="文件差异"><For each={groups()}>{rows => <Group rows={rows} />}</For><Show when={!patch()}><p>没有文本差异</p></Show></div>}>{pair =>

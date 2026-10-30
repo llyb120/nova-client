@@ -1,4 +1,4 @@
-import { createStore } from 'solid-js/store';
+import { createStore } from 'solid-js';
 
 export const defaultSidebarLayout = { collapsed: false, collapsedProjects: [] as string[] };
 const key = 'fd:sidebarLayout';
@@ -16,7 +16,9 @@ try {
 } catch { /* 存储不可用或损坏时使用默认布局。 */ }
 export const [sidebarLayout, updateSidebarLayout] = createStore(initial);
 export function setSidebarLayout(patch: Partial<typeof defaultSidebarLayout>) {
-  const next = validated({ ...sidebarLayout, ...patch });
-  updateSidebarLayout(next);
-  try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* 本次窗口内仍然生效。 */ }
+  updateSidebarLayout(draft => {
+    const next = validated({ ...draft, ...patch });
+    Object.assign(draft, next);
+    try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* 本次窗口内仍然生效。 */ }
+  });
 }

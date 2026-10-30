@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { access, readdir } from 'node:fs/promises';
 import { createServer } from 'vite';
-import solid from 'vite-plugin-solid';
+import solid from '@solidjs/vite-plugin';
 import { chromium } from 'playwright-core';
 
 // Real Solid lifecycle/scroll/IME checks, with only the IPC boundary mocked. No test framework.
 const entry = `
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
 import TaskbarBubble from '/src/components/TaskbarBubble.tsx';
 document.documentElement.classList.add('bubble-mode');
 window.calls = []; window.events = {}; window.hover = true; window.card = 'first'; window.failSend = false;
@@ -15,6 +15,7 @@ window.emit = name => (window.events[name] || []).forEach(fn => fn({payload:null
 window.ipc = async (command, args = {}) => {
   window.calls.push([command, args]);
   if (command === 'taskbar_bubble') return {cards:[{key:window.card,live:true,kind:'running',threadId:window.card,title:window.card,text:'最新步骤',body:''}],permissions:[],light:true,panel:window.hover};
+  if (command === 'orbit_list') return [];
   if (command === 'taskbar_bubble_place') return true;
   if (command === 'taskbar_assistant_history') {
     if (window.delayHistory) await new Promise(resolve => { window.resolveHistory = resolve; });
@@ -40,8 +41,8 @@ try {
   server = await createServer({
     configFile: false,
     logLevel: 'error',
-    optimizeDeps: { noDiscovery: true, include: ['solid-js', 'solid-js/web', 'solid-js/store', 'dompurify', 'marked'] },
-    plugins: [solid(), {
+    optimizeDeps: { noDiscovery: true, include: ['solid-js', '@solidjs/web', 'dompurify', 'marked'] },
+    plugins: [solid({ refresh: false }), {
       name: 'taskbar-check',
       enforce: 'pre',
       resolveId(id) {
@@ -53,7 +54,7 @@ try {
       },
       load(id) {
         if (id === '\0check-core') return 'export const invoke = (...args) => window.ipc(...args); export const convertFileSrc = path => path;';
-        if (id === '\0check-capsules') return 'export const captureCapsule = async () => {}; export default function ThoughtCapsules() { return null; }';
+        if (id === '\0check-capsules') return 'export const titleOf = capsule => capsule.text ?? ""; export const captureCapsule = async () => {}; export default function ThoughtCapsules() { return null; }';
         if (id === '\0check-event') return 'export const listen = async (name, fn) => { (window.events[name] ||= []).push(fn); return () => window.events[name].splice(window.events[name].indexOf(fn),1); };';
         if (id === '/__taskbar_check.tsx') return entry;
       },
@@ -78,7 +79,7 @@ try {
   const page = await browser.newPage({ viewport: { width: 560, height: 640 } });
   page.setDefaultTimeout(5000);
   const errors = [];
-  page.on('pageerror', error => { errors.push(error.message); console.error(error.message); });
+  page.on('pageerror', error => { errors.push(error.message); console.error(error.stack); });
   page.on('console', message => { if (message.type() === 'error') console.error(message.text()); });
   await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/__taskbar_check`);
   await page.waitForSelector('[data-message-id="m74"]');
@@ -92,7 +93,7 @@ try {
   const node = await input.elementHandle();
   await input.fill('保留草稿');
   assert.equal(await page.evaluate(() => window.calls.some(([cmd]) => cmd === 'taskbar_bubble_activate')), true);
-  await page.getByRole('tab', { name: '快捷', exact: true }).click();
+  await page.getByRole('tab', { name: '星海', exact: true }).click();
   await page.getByRole('button', { name: '知识图谱' }).waitFor();
   await page.getByRole('tab', { name: '会话', exact: true }).click();
   await page.getByRole('button', { name: '打开会话', exact: true }).waitFor();
@@ -142,7 +143,7 @@ try {
   await input.press('Enter');
   assert.equal(await page.evaluate(() => window.calls.filter(([cmd]) => cmd === 'taskbar_assistant_send').length), 1, 'busy dispatch cannot duplicate');
   await page.evaluate(() => { window.delaySend = false; window.resolveSend(); });
-  await page.waitForSelector('.ta-bubble:text-is("已安排")');
+  await page.getByText('已安排', { exact: true }).waitFor();
   assert.equal(await input.inputValue(), '下一条草稿', 'completed dispatch preserves newer draft');
   assert.equal(await page.evaluate(() => window.calls.some(([cmd]) => cmd === 'taskbar_bubble_reply')), false);
   await page.evaluate(() => { window.failSend = true; });
@@ -161,7 +162,7 @@ try {
   assert.equal(await page.evaluate(() => { const ids = [...document.querySelectorAll('.ta-message')].map(el => el.dataset.messageId); return ids.length === new Set(ids).size; }), true);
   assert.equal(await input.inputValue(), '下一条草稿');
   // Any tab: the compose box stays visible and stray typing lands in it.
-  await page.getByRole('tab', { name: '快捷', exact: true }).click();
+  await page.getByRole('tab', { name: '星海', exact: true }).click();
   assert.equal(await input.isVisible(), true, 'assistant input is available on every tab');
   await page.keyboard.type('x');
   assert.equal(await input.inputValue(), '下一条草稿x', 'typing outside a field goes to the assistant');

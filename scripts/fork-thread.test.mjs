@@ -4,8 +4,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
-import { createEffect, createMemo, createRoot, createSignal, onCleanup } from "solid-js/dist/solid.js";
-import { createStore } from "solid-js/store/dist/store.js";
+import { createEffect, createMemo, createRoot, createSignal, createStore, flush, onCleanup } from "@solidjs/signals";
 
 const read = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
 const chat = read("../src/components/ChatView.tsx");
@@ -44,19 +43,20 @@ function mount(t, { fork = async () => ({ id: "copy-stage" }), refresh = async (
   } } });
   let keydown, toggles = 0;
   const shortcuts = load("../src/sessionShortcuts.ts", {
-    "solid-js": { onMount: (fn) => fn(), onCleanup: () => {} },
+    "solid-js": { onSettled: (fn) => fn() },
     "./store": { state, ALL_AGENT_KINDS: [] },
     "./ipc": { api },
   }, { HTMLElement: class {}, window: { addEventListener: (_, fn) => { keydown = fn; } } });
   shortcuts.mountSessionShortcuts({ allowedActions: ["toggleTerminal"], onToggleTerminal: () => { toggles++; } });
   const ui = createRoot((dispose) => {
     t.after(dispose);
-    return new Function("createSignal", "createMemo", "createEffect", "onCleanup", "state", "currentMeta", "api", "refreshThreads", "openThread", "setShortcutCaptureActive", `${logic}
+    return new Function("createSignal", "createMemo", "createEffect", "flush", "onCleanup", "state", "currentMeta", "api", "refreshThreads", "openThread", "setShortcutCaptureActive", `${logic}
       return { startFork, closeFork, submitFork, forkSourceId, forkTitle, setForkTitle, forkBusy, forkError, forkedId, forkUnavailable };`
-    )(createSignal, createMemo, createEffect, onCleanup, state, () => state.threads.find((thread) => thread.id === state.currentId), api,
+    )(createSignal, createMemo, createEffect, flush, onCleanup, state, () => state.threads.find((thread) => thread.id === state.currentId), api,
       async () => { calls.push(["refresh"]); await refresh(); },
       async (id) => { calls.push(["open", id]); }, shortcuts.setShortcutCaptureActive);
   });
+  flush();
   return { ...ui, state, setState, calls, toggles: () => toggles,
     shortcut: () => keydown({ key: "`", code: "Backquote", ctrlKey: true, altKey: false, shiftKey: false, metaKey: false, target: null, preventDefault() {}, stopPropagation() {} }),
   };
@@ -66,10 +66,10 @@ test("fork IPC uses frozen Stage id and root default title; running/subagent rec
   let resolve;
   const ui = mount(t, { fork: () => new Promise((done) => { resolve = done; }) });
   const original = JSON.stringify(ui.state.threads);
-  ui.startFork();
+  ui.startFork(); flush();
   assert.equal(ui.forkTitle(), "整链根标题 (fork)");
   ui.setForkTitle("  独立副本  ");
-  ui.setState("currentId", "other");
+  ui.setState(s => { s.currentId = "other"; }); flush();
   ui.startFork();
   const pending = ui.submitFork();
   ui.closeFork();
@@ -93,10 +93,10 @@ test("blank names do not submit; rejection keeps dialog/input; refresh retry doe
     refresh: async () => { if (rejectRefresh) throw new Error("列表刷新失败"); },
   });
   ui.startFork();
-  ui.setForkTitle(" \t ");
+  ui.setForkTitle(" \t "); flush();
   await ui.submitFork();
   assert.deepEqual(ui.calls, []);
-  ui.setForkTitle("保留输入");
+  ui.setForkTitle("保留输入"); flush();
   await ui.submitFork();
   assert.equal(ui.forkSourceId(), "stage");
   assert.equal(ui.forkTitle(), "保留输入");
@@ -117,16 +117,16 @@ test("blank names do not submit; rejection keeps dialog/input; refresh retry doe
 test("roaming nodes are blocked; the open fork modal pauses session shortcuts", (t) => {
   const ui = mount(t);
   for (const patch of [{ roamingRole: "guest" }, { roamingRole: "host" }]) {
-    ui.setState("threads", 1, patch);
+    ui.setState(s => { Object.assign(s.threads[1], patch); }); flush();
     assert.equal(ui.forkUnavailable(), true);
     ui.startFork();
     assert.equal(ui.forkSourceId(), null);
   }
-  ui.setState("threads", 1, { roamingRole: null });
-  ui.startFork();
+  ui.setState(s => { s.threads[1].roamingRole = null; }); flush();
+  ui.startFork(); flush();
   ui.shortcut();
   assert.equal(ui.toggles(), 0);
-  ui.closeFork();
+  ui.closeFork(); flush();
   assert.equal(ui.forkSourceId(), null);
   ui.shortcut();
   assert.equal(ui.toggles(), 1, "normal session shortcuts are restored after closing");
@@ -135,10 +135,14 @@ test("roaming nodes are blocked; the open fork modal pauses session shortcuts", 
 test("dialog contracts: native modal focus, name input, Enter/IME, Escape/cancel, scope disclosure", () => {
   const dialog = between("      <Show when={forkSourceId()}>", "      <Show when={!isSubagent() && showShare()");
   for (const pattern of [/<Portal>/, /<dialog/, /aria-labelledby="fork-dialog-title"/, /aria-describedby="fork-dialog-description"/,
-    /dialog\.showModal\(\)/, /onCleanup\(\(\) => dialog\.close\(\)\)/, /autofocus/, /<form/, /onSubmit=.*submitFork\(\)/,
+    /ref={mountForkDialog\(\)}/, /autofocus/, /<form/, /onSubmit=.*submitFork\(\)/,
     /onCancel=.*preventDefault\(\); closeFork\(\)/, /event\.key === "Enter" && event\.isComposing/,
     /type="button".*onClick={closeFork}>取消/, /type="submit".*disabled={forkBusy\(\) \|\| !forkTitle\(\)\.trim\(\)}/,
     /role="alert"/, /全部 Stage/, /原会话和正在运行的任务不受影响/, /同一工作目录，不复制文件/]) assert.match(dialog, pattern);
+  const mountDialog = between("  const mountForkDialog =", "  // worktree 会话的 cwd");
+  assert.match(mountDialog, /onSettled\(/);
+  assert.match(mountDialog, /dialog\.showModal\(\)/);
+  assert.match(mountDialog, /return \(\) => dialog\.close\(\)/);
   const button = between("        <Show when={currentMeta()}>", "        <Show when={state.relay.connected && state.currentId && roamingRole()");
   assert.match(button, /disabled={forkUnavailable\(\)}/);
   assert.match(button, /onClick={startFork}/);

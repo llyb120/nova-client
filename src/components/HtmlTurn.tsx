@@ -1,4 +1,4 @@
-import { For, Index, Match, Show, Switch, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
+import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { fileUriPath } from "../ipc";
 import { createHtmlPromptImage } from "../createHtmlPromptImage";
 import { processLiveLines, processSegments, processSummary, splitTurnBody } from "../processDisplay";
@@ -60,7 +60,7 @@ export function HtmlTurn(props: HtmlTurnProps) {
     catch (error) { if (generation === loadGeneration) setLoadError(String(error)); }
     finally { if (generation === loadGeneration) setLoading(false); }
   };
-  createEffect(on(() => `${props.threadId}:${deferredIds().join(",")}`, () => { void load(); }));
+  createEffect(() => `${props.threadId}:${deferredIds().join(",")}`, () => { void load(); });
   const turnLabel = () => {
     const turn = props.group.turn;
     if (!turn) return "";
@@ -71,7 +71,7 @@ export function HtmlTurn(props: HtmlTurnProps) {
 
   return <section class="html-turn" aria-label="对话轮次">
     <Show when={!deferredIds().length || deferredHidden()} fallback={
-      <div class="ht-history" data-history-loading aria-busy={loading()}>
+      <div class="ht-history" data-history-loading aria-busy={loading() ? "true" : "false"}>
         <For each={deferredIds()}>{id => <span data-item-id={id} />}</For>
         <button type="button" disabled={loading() || !props.loadItems} onClick={() => void load()}>
           {loadError() ? "历史内容加载失败，点击重试" : "正在加载历史内容…（点击重试）"}
@@ -91,14 +91,14 @@ export function HtmlTurn(props: HtmlTurnProps) {
         <div class="ht-model">实际模型：{props.group.turn!.actualModel}</div>
       </Show>
       <Show when={foldedTurn()}>
-        <button type="button" class="ht-fold ht-turn-fold" title={turnTokenTitle(props.group.turn)} aria-expanded={turnOpen()}
+        <button type="button" class="ht-fold ht-turn-fold" title={turnTokenTitle(props.group.turn)} aria-expanded={turnOpen() ? "true" : "false"}
           onClick={() => { props.onBrowseDetail?.(); toggleExpanded(turnKey(), !turnOpen()); }}>
           <span>{turnLabel()}</span><IconChevron size={12} open={turnOpen()} />
         </button>
       </Show>
       {/* A closed finished process mounts no item/Markdown/tool bodies. */}
       <Show when={!foldedTurn() || turnOpen()}>
-        <div classList={{ "ht-turn-process": foldedTurn() }}>
+        <div class={{ "ht-turn-process": foldedTurn() }}>
           <HtmlProcess items={body().process} live={active()} onBrowseDetail={props.onBrowseDetail} onFileMenu={fileMenu.open} />
         </div>
       </Show>
@@ -117,9 +117,10 @@ function HtmlUser(props: DetailProps & { item: UserItem; running: boolean; readO
   const attachments = createImageAttachments();
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
   onCleanup(() => clearTimeout(copyTimer));
-  createEffect(on(() => `${props.threadId}:${props.item.id}`, () => {
+  createEffect(() => `${props.threadId}:${props.item.id}`, (_, previous) => {
+    if (previous === undefined) return;
     setEditing(false); setDraft(""); setError(""); setCopied(false); clearTimeout(copyTimer); attachments.clear();
-  }, { defer: true }));
+  });
   const sysKey = () => `user-sys-${props.item.id}`;
   const textKey = () => `user-text-${props.item.id}`;
   const typed = createMemo(() => promptDisplayOf(props.item.text));
@@ -153,7 +154,7 @@ function HtmlUser(props: DetailProps & { item: UserItem; running: boolean; readO
         <div class="ht-user-column">
           <div class="ht-bubble-wrap">
             <div class="ht-user-actions">
-              <button type="button" title="复制完整提示词" aria-label="复制完整提示词" classList={{ copied: copied() }} onClick={() => void copy()}>
+              <button type="button" title="复制完整提示词" aria-label="复制完整提示词" class={{ copied: copied() }} onClick={() => void copy()}>
                 <Show when={copied()} fallback={<IconCopy size={13} />}><IconCheck size={13} /></Show>
               </button>
               <Show when={canEdit()}>
@@ -163,7 +164,7 @@ function HtmlUser(props: DetailProps & { item: UserItem; running: boolean; readO
             </div>
             <div class="ht-user-bubble">
               <Show when={!!props.item.images?.length}>
-                <For each={[props.item.id]}>{() => <div class="ht-bubble-images"><Index each={props.item.images}>{image => {
+                <For each={[props.item.id]}>{() => <div class="ht-bubble-images"><For keyed={false} each={props.item.images}>{image => {
                   const path = () => image().uri ? fileUriPath(image().uri!) : "";
                   const name = () => image().name || "图片附件";
                   return <Show when={image().mimeType.startsWith("image/")} fallback={
@@ -182,25 +183,25 @@ function HtmlUser(props: DetailProps & { item: UserItem; running: boolean; readO
                         const img = e.currentTarget;
                         if (img.currentSrc === shown().src && img.complete && !img.naturalWidth) setFailed(shown());
                       }}
-                      classList={{ "ht-clickable": !!path(), "ht-image-broken": broken() }} role={path() ? "button" : undefined} tabIndex={path() ? 0 : undefined}
+                      class={{ "ht-clickable": !!path(), "ht-image-broken": broken() }} role={path() ? "button" : undefined} tabindex={path() ? 0 : undefined}
                       onClick={() => { if (path()) openWorkspaceFile(path()); }}
                       onKeyDown={e => { if (path() && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openWorkspaceFile(path()); } }}
                       onContextMenu={e => { if (path()) props.onFileMenu(e, path()); }} />;
                   }}</Show>;
-                }}</Index></div>}</For>
+                }}</For></div>}</For>
               </Show>
               <HtmlPromptText text={text()} />
             </div>
           </div>
           <Show when={typed() !== undefined}>
-            <button type="button" class="ht-fold ht-user-fold" aria-expanded={isExpanded(sysKey())}
+            <button type="button" class="ht-fold ht-user-fold" aria-expanded={isExpanded(sysKey()) ? "true" : "false"}
               onClick={() => { props.onBrowseDetail?.(); toggleExpanded(sysKey()); }}>
               <span>{isExpanded(sysKey()) ? "收起系统修改内容" : "该提示词经过系统修改，展开查看完整内容"}</span><IconChevron size={12} open={isExpanded(sysKey())} />
             </button>
           </Show>
           <Show when={long()}>
             <div class="ht-long-prompt">
-              <button type="button" class="ht-fold ht-user-fold" aria-expanded={isExpanded(textKey())}
+              <button type="button" class="ht-fold ht-user-fold" aria-expanded={isExpanded(textKey()) ? "true" : "false"}
                 onClick={() => { props.onBrowseDetail?.(); toggleExpanded(textKey()); }}>
                 <span>{isExpanded(textKey()) ? "收起长提示词" : `展开完整提示词（${fmtTokens(source().length)} 字符）`}</span><IconChevron size={12} open={isExpanded(textKey())} />
               </button>
@@ -249,7 +250,7 @@ function HtmlProcess(props: DetailProps & { items: Item[]; live: boolean }) {
         onBrowseDetail={props.onBrowseDetail} onFileMenu={props.onFileMenu} />
     }>
       <div class="ht-process-segment">
-        <button type="button" class="ht-fold ht-process-fold" aria-expanded={isExpanded(key())}
+        <button type="button" class="ht-fold ht-process-fold" aria-expanded={isExpanded(key()) ? "true" : "false"}
           onClick={() => { props.onBrowseDetail?.(); toggleExpanded(key()); }}>
           <Show when={live()} fallback={
             <span class="ht-process-line" title={lines()[0]}><span>{lines()[0]}</span><IconChevron size={12} open={isExpanded(key())} /></span>
@@ -283,16 +284,16 @@ function HtmlItem(props: DetailProps & { item: Item; active: boolean }) {
   const thoughtOpen = () => isExpanded(thoughtKey(), props.active);
   return <Switch>
     <Match when={props.item.type === "assistant" && !!text().trim() && text().trim() !== "None"}>
-      <div class="ht-assistant" classList={{ "ht-large-markdown": text().length > 32_768 }} data-item-id={props.item.id}><Markdown text={text()} markFiles live={props.active} virtual /></div>
+      <div class={["ht-assistant", { "ht-large-markdown": text().length > 32_768 }]} data-item-id={props.item.id}><Markdown text={text()} markFiles live={props.active} virtual /></div>
     </Match>
     <Match when={props.item.type === "thought" && !!text().trim() && text().trim() !== "None"}>
       <div class="ht-thought" data-item-id={props.item.id}>
         <Show when={text() !== "思考中…"} fallback={<div class="ht-thinking" role="status">● 思考中…</div>}>
-          <button type="button" class="ht-fold ht-thought-fold" aria-expanded={thoughtOpen()}
+          <button type="button" class="ht-fold ht-thought-fold" aria-expanded={thoughtOpen() ? "true" : "false"}
             onClick={() => { props.onBrowseDetail?.(); toggleExpanded(thoughtKey(), !thoughtOpen()); }}>
             <IconChevron size={12} open={thoughtOpen()} /><span>思考过程</span>
           </button>
-          <Show when={thoughtOpen()}><div class="ht-thought-body" classList={{ "ht-large-markdown": text().length > 32_768 }}><Markdown text={text()} markFiles live={props.active} virtual /></div></Show>
+          <Show when={thoughtOpen()}><div class={["ht-thought-body", { "ht-large-markdown": text().length > 32_768 }]}><Markdown text={text()} markFiles live={props.active} virtual /></div></Show>
         </Show>
       </div>
     </Match>
@@ -329,11 +330,11 @@ function HtmlTool(props: DetailProps & { item: ToolItem; active: boolean }) {
   const hasBody = () => !!(props.item.content.length || props.item.locations.length || props.item.rawInput !== undefined || props.item.rawOutput !== undefined);
   const title = () => displayToolTitle(stripAnsi(props.item.title || props.item.kind));
   const [now, setNow] = createSignal(Date.now());
-  createEffect(() => {
-    if (!busy()) return;
+  createEffect(busy, active => {
+    if (!active) return;
     setNow(Date.now());
     const timer = setInterval(() => setNow(Date.now()), 100);
-    onCleanup(() => clearInterval(timer));
+    return () => clearInterval(timer);
   });
   const duration = () => {
     const output = props.item.rawOutput;
@@ -344,10 +345,10 @@ function HtmlTool(props: DetailProps & { item: ToolItem; active: boolean }) {
     return ms < 1000 ? `${Math.round(ms)}ms` : ms < 60_000 ? `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s` : fmtDuration(ms);
   };
   return <div class="ht-tool" data-item-id={props.item.id} data-status={props.item.status}>
-    <button type="button" class="ht-tool-line" aria-expanded={hasBody() ? open() : undefined} aria-disabled={!hasBody()}
+    <button type="button" class="ht-tool-line" aria-expanded={hasBody() ? (open() ? "true" : "false") : undefined} aria-disabled={!hasBody() ? "true" : "false"}
       title={title()} onClick={() => { if (hasBody()) { props.onBrowseDetail?.(); toggleExpanded(key(), !open()); } }}>
       <span class="ht-tool-icon">{toolIcon(props.item.kind)}</span><span class="ht-tool-title">{title()}</span>
-      <Show when={busy() || duration()}><span class="ht-tool-duration" classList={{ busy: busy() }}>{duration()}</span></Show>
+      <Show when={busy() || duration()}><span class={["ht-tool-duration", { busy: busy() }]}>{duration()}</span></Show>
       <Show when={busy()}><span class="ht-spinner" role="status" aria-label="进行中" /></Show>
       <Show when={props.item.status === "failed"}><span class="ht-failed" role="img" aria-label="失败" /></Show>
       <Show when={hasBody()}><IconChevron size={12} open={open()} /></Show>
@@ -362,7 +363,7 @@ function HtmlTool(props: DetailProps & { item: ToolItem; active: boolean }) {
             </button>
           </Show>}</For></div>
         </Show>
-        <Index each={props.item.content}>{content => {
+        <For keyed={false} each={props.item.content}>{content => {
           // Content has no IDs; keep its positional DOM/scroll when streaming replaces a content object.
           const diff = () => content() as { path: string; oldText?: string | null; newText: string };
           const text = createMemo(() => contentText(content()));
@@ -376,15 +377,15 @@ function HtmlTool(props: DetailProps & { item: ToolItem; active: boolean }) {
               <div class="ht-diff">
                 <button type="button" class="ht-diff-path" title={`在侧栏中打开 ${diff().path}`}
                   onClick={() => openWorkspaceFile(diff().path)} onContextMenu={e => props.onFileMenu(e, diff().path)}>{pathLabel()}</button>
-                <pre class="ht-tool-output" tabIndex={0}>{(diff().oldText ?? "").slice(0, 200) + "\n→\n" + diff().newText.slice(0, 200)}</pre>
+                <pre class="ht-tool-output" tabindex={0}>{(diff().oldText ?? "").slice(0, 200) + "\n→\n" + diff().newText.slice(0, 200)}</pre>
               </div>
             </Match>
-            <Match when={!!text()}><pre class="ht-tool-output" tabIndex={0}>{text()}</pre></Match>
+            <Match when={!!text()}><pre class="ht-tool-output" tabindex={0}>{text()}</pre></Match>
           </Switch>;
-        }}</Index>
+        }}</For>
         <Show when={!props.item.locations.some(loc => !!loc.path) && !props.item.content.some(content => content.type === "diff" || !!contentText(content))}>
           <Show when={rawPreview(props.item.rawInput) || rawPreview(props.item.rawOutput)}>{preview =>
-            <pre class="ht-tool-output ht-raw-output" tabIndex={0}>{preview()}</pre>
+            <pre class="ht-tool-output ht-raw-output" tabindex={0}>{preview()}</pre>
           }</Show>
         </Show>
       </div>

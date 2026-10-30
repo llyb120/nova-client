@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onSettled, Show } from "solid-js";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { layoutApi, layoutState, layoutSrcdoc, loadLayouts } from "../layoutStore";
 import "./LayoutPanel.css";
@@ -20,7 +20,7 @@ export default function LayoutPresetsView() {
   const [error, setError] = createSignal("");
   let frame: HTMLIFrameElement | undefined;
 
-  onMount(() => void loadLayouts(""));
+  onSettled(() => { void loadLayouts(""); });
   const selected = createMemo(() => layoutState.presets.find((p) => p.id === selectedId()));
 
   const post = () => {
@@ -31,9 +31,9 @@ export default function LayoutPresetsView() {
       setError("测试数据不是合法 JSON");
     }
   };
-  createEffect(() => { sample(); post(); });
+  createEffect(sample, post);
   // 预览默认用设计会话给的 mock 数据，可在「数据结构与测试数据」里改。
-  createEffect(on(() => selected()?.mock, (mock) => setSample(JSON.stringify(mock ?? {}, null, 2))));
+  createEffect(() => JSON.stringify(selected()?.mock ?? {}, null, 2), value => { setSample(value); });
   const onMessage = (event: MessageEvent) => {
     if (event.source === frame?.contentWindow && event.data?.type === "nova-layout-ready") post();
   };
@@ -74,11 +74,11 @@ export default function LayoutPresetsView() {
   return (
     <main class="layout-presets">
       <aside class="layout-presets-list">
-        <button type="button" class="layout-presets-new" classList={{ active: selectedId() === null }} onClick={() => select(null)}>＋ 新建预设</button>
+        <button type="button" class={["layout-presets-new", { active: selectedId() === null }]} onClick={() => select(null)}>＋ 新建预设</button>
         <div class="layout-presets-cards">
           <For each={layoutState.presets} fallback={<div class="layout-presets-hint">还没有预设。<br />描述一个看板，让设计会话帮你做出来。</div>}>
             {(preset) => (
-              <button type="button" class="layout-card" classList={{ active: preset.id === selectedId() }} onClick={() => select(preset.id)}>
+              <button type="button" class={["layout-card", { active: preset.id === selectedId() }]} onClick={() => select(preset.id)}>
                 <div class="layout-card-thumb">
                   <Show when={preset.html} fallback={<span class="layout-spinner" />}>
                     <iframe tabindex="-1" aria-hidden="true" title={preset.name} sandbox="allow-scripts" referrerpolicy="no-referrer" srcdoc={layoutSrcdoc(preset.html, preset.mock)} />

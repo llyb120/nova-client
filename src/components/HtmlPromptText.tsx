@@ -174,8 +174,8 @@ export function HtmlPromptText(props: { text: string }) {
     });
   }
 
-  createEffect(() => {
-    source = props.text;
+  createEffect(() => props.text, text => {
+    source = text;
     prepare();
     if (!observer) {
       observer = new ResizeObserver(entries => {

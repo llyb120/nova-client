@@ -1,7 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createSignal, For, onCleanup, onSettled, Show } from "solid-js";
 import { api, fileUriPath } from "../ipc";
 import type { PromptImage } from "../types";
 import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
@@ -151,7 +151,7 @@ export function createImageAttachments(
     if (next.length > 0) add(next);
   };
 
-  onMount(() => {
+  onSettled(() => {
     if (!options.enableFileDrop) return;
     let cancelled = false;
     let unlisten: (() => void) | undefined;
@@ -185,10 +185,10 @@ export function createImageAttachments(
     } catch {
       setDragging(false);
     }
-    onCleanup(() => {
+    return () => {
       cancelled = true;
       unlisten?.();
-    });
+    };
   });
 
   const remove = (index: number) =>
@@ -226,7 +226,7 @@ export function ImageAttachmentStrip(props: {
       <div class="image-strip">
         <For each={props.images}>
           {(image, index) => (
-            <div classList={{ "image-chip": true, "file-chip": !image.mimeType.startsWith("image/") }} title={image.name}>
+            <div class={{ "image-chip": true, "file-chip": !image.mimeType.startsWith("image/") }} title={image.name}>
               <Show
                 when={image.mimeType.startsWith("image/")}
                 fallback={
@@ -239,7 +239,7 @@ export function ImageAttachmentStrip(props: {
                 <img
                   src={attachmentPreviewSrc(image)}
                   alt={image.name}
-                  draggable={false}
+                  draggable="false"
                 />
               </Show>
               <button
