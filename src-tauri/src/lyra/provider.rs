@@ -489,11 +489,22 @@ fn request_input_budget(value: &Value) -> u64 {
 }
 
 fn budget_output_tokens(body: &mut Value, model: &ResolvedModel, field: &str) {
+    // 0 表示窗口未知，不能当成只剩 16 tokens。
+    if model.context_window == 0 { return; }
     let requested = body[field].as_u64().unwrap_or(model.max_output_tokens);
     let available = model.context_window
         .saturating_sub(request_input_budget(body))
         .saturating_sub(8192);
     body[field] = json!(requested.min(available).max(16));
+}
+
+fn ensure_output_budget(body: &Value, model: &ResolvedModel, field: &str) -> Result<(), String> {
+    let requested = model.extra_options.get(field).and_then(Value::as_u64).unwrap_or(model.max_output_tokens);
+    // 尊重显式的小输出上限，只拦截被上下文挤占的预算；订阅端点可能不发送此字段。
+    if let Some(available) = body[field].as_u64().filter(|n| *n < requested.clamp(16, 1024)) {
+        return Err(format!("context_length_exceeded: 上下文挤占输出预算（仅剩 {available} tokens），需先释放上下文"));
+    }
+    Ok(())
 }
 
 pub(super) fn completions_body(
@@ -1767,39 +1778,20 @@ async fn stream_chat_once(
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
     if model.api != "openai-responses" { response_state::reset(session_id); }
+    let (body, field) = match model.api.as_str() {
+        "codebuddy" | "devin" | "openai-completions" =>
+            (completions_body(model, system_prompt, messages, tools, thinking_level, session_id), model.max_tokens_field),
+        "openai-responses" => (responses_body(model, system_prompt, messages, tools, thinking_level, session_id), "max_output_tokens"),
+        "anthropic-messages" => (anthropic_body(model, system_prompt, messages, tools, thinking_level), "max_tokens"),
+        other => return Err(format!("Lyra 暂不支持协议 {other}")),
+    };
+    ensure_output_budget(&body, model, field)?;
     match model.api.as_str() {
-        "codebuddy" => {
-            let body = completions_body(model, system_prompt, messages, tools, thinking_level, session_id);
-            super::codebuddy_provider::stream(&native_transport_model(model), api_key, body, session_id, cancel, on_event).await
-        }
-        "devin" => {
-            let body = completions_body(model, system_prompt, messages, tools, thinking_level, session_id);
-            super::devin_provider::stream(&native_transport_model(model), api_key, body, cancel, on_event).await
-        }
-        "openai-completions" => {
-            let body = completions_body(
-                model,
-                system_prompt,
-                messages,
-                tools,
-                thinking_level,
-                session_id,
-            );
-            stream_completions(http, model, api_key, body, session_id, cancel, on_event).await
-        }
-        "openai-responses" => {
-            let body = responses_body(
-                model,
-                system_prompt,
-                messages,
-                tools,
-                thinking_level,
-                session_id,
-            );
-            stream_responses(http, model, api_key, body, session_id, cancel, on_event).await
-        }
+        "codebuddy" => super::codebuddy_provider::stream(&native_transport_model(model), api_key, body, session_id, cancel, on_event).await,
+        "devin" => super::devin_provider::stream(&native_transport_model(model), api_key, body, cancel, on_event).await,
+        "openai-completions" => stream_completions(http, model, api_key, body, session_id, cancel, on_event).await,
+        "openai-responses" => stream_responses(http, model, api_key, body, session_id, cancel, on_event).await,
         "anthropic-messages" => {
-            let body = anthropic_body(model, system_prompt, messages, tools, thinking_level);
             match stream_anthropic(http, model, api_key, body, session_id, cancel, on_event).await {
                 // 签名绑定原会话前缀：工具列表/系统提示变化或子 agent fork 后会被 400 拒绝。
                 // 400 发生在流开始前，去掉签名（思考降级为文本）重发一次即可。
@@ -2773,10 +2765,11 @@ mod tests {
             assert_eq!(result.usage["output"], 5);
             if expected == "error" {
                 let error = result.error_message.unwrap();
-                // length 时输出预算被挤占，走上下文收缩而非原样重试。
-                let squeezed = finish == "length";
-                assert_eq!(crate::lyra::prompt::is_retryable_provider_error(&error), !squeezed, "{error}");
-                assert_eq!(crate::lyra::prompt::is_context_window_error(&error), squeezed, "{error}");
+                // length 单独降低思考预算；仅凭终止原因不能判断输入超限。
+                let exhausted = finish == "length";
+                assert_eq!(crate::lyra::prompt::is_retryable_provider_error(&error), !exhausted, "{error}");
+                assert_eq!(crate::lyra::prompt::is_output_length_error(&error), exhausted, "{error}");
+                assert!(!crate::lyra::prompt::is_context_window_error(&error), "{error}");
                 assert!(!is_retryable_stream_error(&error), "retry only at turn level");
             } else {
                 assert!(result.error_message.is_none());
@@ -2870,6 +2863,34 @@ mod tests {
         let small = anthropic_body(&model, "sys", &messages, &[], Some("high"));
         assert_eq!(small["max_tokens"], 16);
         assert!(small.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn output_budget_preflight_rejects_squeezed_requests_before_transport() {
+        for (api, field) in [("openai-completions", "max_completion_tokens"), ("openai-responses", "max_output_tokens"),
+            ("anthropic-messages", "max_tokens"), ("codebuddy", "max_completion_tokens"), ("devin", "max_completion_tokens")] {
+            let mut model = test_model(api);
+            model.base_url = "http://127.0.0.1:1".into();
+            model.context_window = 100;
+            let error = stream_chat_once(&reqwest::Client::new(), &model, "key", None, "sys", &[], &[], None,
+                &Arc::new(AtomicBool::new(false)), &mut |_| {}).await.unwrap_err();
+            assert!(crate::lyra::prompt::is_context_window_error(&error), "{api}: {error}");
+            assert!(error.contains("输出预算"), "{api}: {error}");
+            // 小额度是用户主动设置时不拒绝；窗口未知也不擅自压到 16。
+            model.extra_options.insert(field.into(), json!(32));
+            assert!(ensure_output_budget(&json!({field:32}), &model, field).is_ok());
+            model.extra_options.clear();
+            model.context_window = 0;
+            let mut body = json!({field:model.max_output_tokens});
+            budget_output_tokens(&mut body, &model, field);
+            assert_eq!(body[field], model.max_output_tokens);
+            assert!(ensure_output_budget(&body, &model, field).is_ok());
+        }
+        let mut model = test_model("openai-responses");
+        model.local_auth = Some("codex".into());
+        let body = responses_body(&model, "sys", &[], &[], None, None);
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(ensure_output_budget(&body, &model, "max_output_tokens").is_ok());
     }
 
     pub(super) fn test_model(api: &str) -> ResolvedModel {
