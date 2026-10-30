@@ -1242,17 +1242,18 @@ function DutyCard(props: { duty: Duty; due: number; task: boolean; now: number; 
         <span class="employee-tag">{!duty.enabled ? "已停用" : `职责 · ${rule()}`}</span>
         <Show when={from(duty.owner)}>{(n) => <span class="employee-tag">来自 {n()}</span>}</Show>
         <button type="button" class="employee-text-button employee-duty-edit" onClick={() => setEditing(true)}>编辑</button>
-        <details class="employee-more">
+        <details class="employee-more employee-duty-menu">
           <summary aria-label={`更多操作：${flat(duty.text).slice(0, 40)}`}>⋯</summary>
           <div>
-            <button type="button" disabled={duty.manual} title="清除自动触发规则，不停止已有任务"
-              onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; void props.act("duty_manual", duty.id); }}>设为不定时（不自动触发）</button>
-            <label class="employee-interval" title="每天固定时刻，多个用逗号分隔，如 09:00,14:30；留空取消">每天几点<input type="text" placeholder="如 09:00"
-              value={times().join(",")} aria-label="每天触发时刻"
-              onChange={(ev) => void props.run("employee_do", { action: "duty_times", id: duty.id, text: ev.currentTarget.value })} /></label>
-            <label class="employee-interval" title="留空或 0：不按间隔；填入数字：每次任务结束后等待固定分钟数（与每天时刻二选一）">执行间隔（分钟）<input type="number" min="0" max="10080" placeholder="自动"
-              value={duty.everyMinutes || ""} aria-label="执行间隔（分钟）"
-              onChange={(ev) => void props.run("employee_do", { action: "duty_every", id: duty.id, text: ev.currentTarget.value })} /></label>
+            <div class="employee-duty-menu-head"><strong>触发设置</strong><small>更改后自动生效</small></div>
+            <div class="employee-duty-schedule">
+              <label class="employee-interval" title="每天固定时刻，多个用逗号分隔，如 09:00,14:30；留空取消">每天几点<input type="text" placeholder="如 09:00"
+                value={times().join(",")} aria-label="每天触发时刻"
+                onChange={(ev) => void props.run("employee_do", { action: "duty_times", id: duty.id, text: ev.currentTarget.value })} /></label>
+              <label class="employee-interval" title="留空或 0：不按间隔；填入数字：每次任务结束后等待固定分钟数（与每天时刻二选一）">执行间隔（分钟）<input type="number" min="0" max="10080" placeholder="自动"
+                value={duty.everyMinutes || ""} aria-label="执行间隔（分钟）"
+                onChange={(ev) => void props.run("employee_do", { action: "duty_every", id: duty.id, text: ev.currentTarget.value })} /></label>
+            </div>
             <fieldset class="employee-events" title="订阅的事件一发生就触发一次，可与定时并存">
               <legend>事件触发</legend>
               <For each={EVENTS}>{([key, label]) => (
@@ -1261,8 +1262,12 @@ function DutyCard(props: { duty: Duty; due: number; task: boolean; now: number; 
                     text: (ev.currentTarget.checked ? [...events(), key] : events().filter((k) => k !== key)).join(",") })} /> {label}</label>
               )}</For>
             </fieldset>
-            <button type="button" onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; void props.act("duty_run", duty.id); }}>立即执行</button>
-            <button type="button" onClick={() => void props.act("duty_delete", duty.id)}>删除</button>
+            <div class="employee-duty-menu-actions">
+              <button type="button" disabled={duty.manual} title="清除自动触发规则，不停止已有任务" aria-label="设为不定时（不自动触发）"
+                onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; void props.act("duty_manual", duty.id); }}>关闭自动触发</button>
+              <button type="button" class="employee-duty-run" onClick={(ev) => { ev.currentTarget.closest("details")!.open = false; void props.act("duty_run", duty.id); }}>立即执行</button>
+            </div>
+            <button type="button" class="employee-duty-delete" onClick={() => void props.act("duty_delete", duty.id)}>删除</button>
           </div>
         </details>
       </div>
