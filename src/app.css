@@ -246,6 +246,22 @@ button {
   min-width: 0;
 }
 .titlebar-drag-space { flex: 1; align-self: stretch; }
+/* 视图切换 tab：Portal 多包一层 div，用 contents 让按钮组直接参与标题栏布局。 */
+.titlebar-tabs {
+  display: flex;
+  align-items: center;
+  flex: none;
+  align-self: stretch;
+  padding-left: 8px;
+}
+.titlebar-tabs > div { display: contents; }
+.titlebar-tabs .mode-seg-btn {
+  flex: none;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
 /* Portal 会多包一层 div，用 contents 让会话头部直接参与标题栏的布局。 */
 .titlebar-view {
   position: relative;
@@ -656,13 +672,7 @@ button {
   filter: brightness(0.96);
 }
 
-/* 两层视图切换 */
-.mode-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 18px;
-}
+/* 视图切换（Portal 到标题栏 .titlebar-tabs 中） */
 .mode-seg {
   display: flex;
   gap: 4px;

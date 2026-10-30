@@ -2,7 +2,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
-import { titlebarSide } from "./TitleBar";
+import { titlebarSide, titlebarTabs } from "./TitleBar";
 import { api } from "../ipc";
 import { chainGroupAnchor, latestFireStage } from "../threadDisplay";
 import type { ThreadMeta, Worktree } from "../types";
@@ -610,6 +610,25 @@ export function Sidebar(props: {
       }}
     >
       <div class="sidebar-head">
+        <Show when={titlebarTabs()} keyed>{(mount) => <Portal mount={mount}>
+        <div class="mode-seg secondary" role="tablist" aria-label="主区域">
+          <Show when={state.settings?.knowledgeGraphEnabled}>
+            <button class="mode-seg-btn" classList={{ active: state.view === "knowledge" || state.view === "jianpu" }}
+              onClick={() => switchView("knowledge")} title="查看操作路径与下一步分支">
+              知识图谱
+            </button>
+          </Show>
+          <button class="mode-seg-btn" classList={{ active: state.view === "employee" }}
+            onClick={() => switchView("employee")} title="数字员工：空闲时按职责自动干活">
+            数字员工
+          </button>
+          <button type="button" class="mode-seg-btn" classList={{ active: state.view === "miniapps" }}
+            aria-current={state.view === "miniapps" ? "page" : undefined}
+            onClick={() => switchView("miniapps")} title="观星台：创建和打开应用">
+            观星台
+          </button>
+        </div>
+        </Portal>}</Show>
         <Show when={titlebarSide()} keyed>{(mount) => <Portal mount={mount}>
         <div class="brand">
           <IconNovaMark size={20} class="brand-icon" />
@@ -721,25 +740,6 @@ export function Sidebar(props: {
           <IconPlus size={15} />
           新对话
         </button>
-        <div class="mode-stack" role="tablist" aria-label="主区域">
-          <div class="mode-seg secondary">
-            <Show when={state.settings?.knowledgeGraphEnabled}>
-              <button class="mode-seg-btn" classList={{ active: state.view === "knowledge" || state.view === "jianpu" }}
-                onClick={() => switchView("knowledge")} title="查看操作路径与下一步分支">
-                知识图谱
-              </button>
-            </Show>
-            <button class="mode-seg-btn" classList={{ active: state.view === "employee" }}
-              onClick={() => switchView("employee")} title="数字员工：空闲时按职责自动干活">
-              数字员工
-            </button>
-            <button type="button" class="mode-seg-btn" classList={{ active: state.view === "miniapps" }}
-              aria-current={state.view === "miniapps" ? "page" : undefined}
-              onClick={() => switchView("miniapps")} title="观星台：创建和打开应用">
-              观星台
-            </button>
-          </div>
-        </div>
       </div>
 
       <Show when={searchOpen()}>
