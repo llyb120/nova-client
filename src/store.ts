@@ -1,8 +1,7 @@
 import { nextRunningThread } from "./nextRunningThread";
 import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
-import { batch, createSignal } from "solid-js";
-import { createStore, produce, reconcile, unwrap } from "solid-js/store";
+import { createSignal, createStore, flush, onFlush, reconcile, snapshot } from "solid-js";
 import { LruMap } from "./lruMap";
 import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
@@ -95,7 +94,7 @@ export function toggleModelFavorite(id: string) {
   const settings = state.settings;
   if (!settings) return;
   const updated = { ...settings, modelFavorites: next };
-  setState("settings", updated);
+  setState(s => { s.settings = updated; });
   void api.setSettings(updated).catch(() => {
     // settings.json 落盘失败时仍保留本次 localStorage 写入，不打断选择模型。
   });
@@ -228,7 +227,7 @@ function persistThemeToBackend(theme: ThemePref) {
   const s = state.settings;
   if (!s || s.theme === theme) return;
   const next = { ...s, theme };
-  setState("settings", next);
+  setState(s => { s.settings = next; });
   void api.setSettings(next).catch(() => {
     // 落盘失败仅丢失跨重启持久化，localStorage 兜底，不打断使用
   });
@@ -238,7 +237,7 @@ function persistThemeToBackend(theme: ThemePref) {
 export function setTheme(theme: ThemePref) {
   localStorage.setItem(THEME_KEY, theme);
   applyThemeToDom(theme);
-  setState("theme", theme);
+  setState(s => { s.theme = theme; });
   persistThemeToBackend(theme);
 }
 
@@ -259,11 +258,11 @@ export const [searchReveal, setSearchReveal] = createSignal<{ threadId: string; 
 
 export function toggleExpanded(key: number | string, value?: boolean) {
   const k = String(key);
-  setState("expanded", k, value ?? !state.expanded[k]);
+  setState(s => { s.expanded[k] = value ?? !s.expanded[k]; });
 }
 
 function resetExpanded(): void {
-  setState("expanded", reconcile({}));
+  setState(s => { s.expanded = {}; });
 }
 
 /** 可选模型列表（来自各后端）。
@@ -328,7 +327,7 @@ export const [lyraConfigDefaultModel, setLyraConfigDefaultModel] = createSignal(
 
 /** store 的对象赋值是浅合并，占位里的 pending 不会被后来的真实列表冲掉，必须显式复位。 */
 function setModelOptions(agentKind: AgentKind, opts: ModelOptions | null) {
-  setState("modelOptions", agentKind, opts && { pending: false, ...opts });
+  setState(s => { s.modelOptions[agentKind] = opts && { pending: false, ...opts }; });
 }
 
 export async function ensureModelOptions(agentKind: AgentKind) {
@@ -395,12 +394,12 @@ export async function refreshThreads() {
   if (request !== refreshThreadsRequest) return;
   // 按 id reconcile 而非整体替换：保留未变线程的对象身份，
   // 避免 <For> 重建整个列表 DOM 导致侧边栏滚动位置被重置
-  setState("threads", reconcile(threads, { key: "id" }));
+  setState(s => { reconcile(threads, "id")(s.threads); });
   // 重启后从会话文件恢复未读点：只在本地还没记过这个会话时采纳后端计数，
   // 避免刷新期间并行发出的旧快照把刚清零的未读又顶回来。
   for (const t of threads) {
     if (t.unreadTurns > 0 && state.unreadTurns[t.id] === undefined) {
-      setState("unreadTurns", t.id, t.unreadTurns);
+      setState(s => { s.unreadTurns[t.id] = t.unreadTurns; });
     }
   }
   const running: Record<string, boolean> = {};
@@ -421,7 +420,7 @@ export async function refreshThreads() {
         ? !!state.running[t.id]
         : t.running;
   }
-  setState("running", running);
+  setState(s => { Object.assign(s.running, running); });
   // 完整 transcript 只在 WebView 中保留少量 LRU 快照。旧实现会在启动和每次刷新时
   // 把所有会话补齐进 JS，运行过的长会话越多，内存与 GC 停顿越明显，最终连点击和发送都会卡。
   const ids = new Set(threads.map((thread) => thread.id));
@@ -433,7 +432,8 @@ export async function refreshThreads() {
 }
 
 export async function refreshProjects() {
-  setState("projects", await api.listProjects());
+  const projects = await api.listProjects();
+  setState(s => { s.projects = projects; });
 }
 
 function normalizePeers(raw: { peers: Peer[] } | Peer[]): Peer[] {
@@ -450,7 +450,8 @@ function normalizePeers(raw: { peers: Peer[] } | Peer[]): Peer[] {
 
 export async function refreshRelayStatus() {
   try {
-    setState("relay", await api.getRelayStatus());
+    const relay = await api.getRelayStatus();
+    setState(s => { s.relay = relay; });
   } catch {
     // 中转站不可用时静默
   }
@@ -458,7 +459,8 @@ export async function refreshRelayStatus() {
 
 export async function refreshInbox() {
   try {
-    setState("inbox", await api.getRelayInbox());
+    const inbox = await api.getRelayInbox();
+    setState(s => { s.inbox = inbox; });
   } catch {
     // 忽略
   }
@@ -512,12 +514,12 @@ function loadSeenAchievementIds(): string[] {
 
 export async function refreshAchievements(reloadImages = false) {
   if (!state.settings?.relayToken?.trim()) {
-    setState({
+    setState(s => { Object.assign(s, {
       achievements: [],
       achievementsLoaded: true,
       achievementsError: "",
       unseenAchievementIds: [],
-    });
+    }); });
     return;
   }
   if (reloadImages) {
@@ -527,7 +529,7 @@ export async function refreshAchievements(reloadImages = false) {
   try {
     const list = await api.listAchievements();
     const seen = new Set(loadSeenAchievementIds());
-    setState({
+    setState(s => { Object.assign(s, {
       achievements: list.map((achievement) => ({
         ...achievement,
         imageUrl: achievement.imageUrl
@@ -537,14 +539,14 @@ export async function refreshAchievements(reloadImages = false) {
       achievementsLoaded: true,
       achievementsError: "",
       unseenAchievementIds: list.filter((a) => !seen.has(a.id)).map((a) => a.id),
-    });
+    }); });
   } catch (error) {
-    setState({
+    setState(s => { Object.assign(s, {
       achievements: [],
       achievementsLoaded: true,
       achievementsError: String(error),
       unseenAchievementIds: [],
-    });
+    }); });
   }
 }
 
@@ -554,19 +556,20 @@ export function markAchievementsSeen() {
   const seen = new Set(loadSeenAchievementIds());
   for (const achievement of state.achievements) seen.add(achievement.id);
   localStorage.setItem(SEEN_ACHIEVEMENTS_KEY, JSON.stringify([...seen]));
-  setState("unseenAchievementIds", []);
+  setState(s => { s.unseenAchievementIds = []; });
 }
 
 export async function refreshRoamingFolders() {
   try {
-    setState("roamingFolders", await api.listRoamingFolders());
+    const folders = await api.listRoamingFolders();
+    setState(s => { s.roamingFolders = folders; });
   } catch {
     // 忽略
   }
 }
 
 export function setView(view: AppStore["view"]) {
-  setState("view", view);
+  setState(s => { s.view = view; });
 }
 
 /** 打开新会话页；若当前在会话中，把工作目录与模型带给 HomeView。 */
@@ -590,19 +593,19 @@ export function openNewSession(quote = "") {
       seed.roam = { peerToken: state.roamingPeer, folder: state.cwd };
       seed.cwd = state.cwd;
     }
-    setState("pendingNewSessionSeed", seed);
+    setState(s => { s.pendingNewSessionSeed = seed; });
   } else {
-    setState("pendingNewSessionSeed", null);
+    setState(s => { s.pendingNewSessionSeed = null; });
   }
   closeThread();
   setView("home");
-  setState("homeComposerFocusAt", Date.now());
+  setState(s => { s.homeComposerFocusAt = Date.now(); });
 }
 
 /** HomeView 挂载时取走一次继承种子。 */
 export function takePendingNewSessionSeed(): PendingNewSessionSeed | null {
   const seed = state.pendingNewSessionSeed;
-  if (seed) setState("pendingNewSessionSeed", null);
+  if (seed) queueMicrotask(() => setState(s => { s.pendingNewSessionSeed = null; }));
   return seed;
 }
 
@@ -655,20 +658,20 @@ export async function checkAndStageUpdate(): Promise<string> {
   const info = await api.checkUpdate();
   if (!info.hasUpdate) return "已是最新版本";
   if (info.staged) {
-    setState("update", info);
+    setState(s => { s.update = info; });
     return "新版本已就绪，可重启更新";
   }
-  setState("updateProgress", null);
-  setState("updateStaging", true);
+  setState(s => { s.updateProgress = null; });
+  setState(s => { s.updateStaging = true; });
   try {
     const res = await api.downloadStagedUpdate();
     if (res.ready) {
-      setState("update", { ...info, staged: true });
+      setState(s => { s.update = { ...info, staged: true }; });
       return "新版本已下载好，可重启更新";
     }
     return "已是最新版本";
   } finally {
-    setState("updateStaging", false);
+    setState(s => { s.updateStaging = false; });
   }
 }
 
@@ -732,22 +735,24 @@ export async function createRoamingThread(
     worktreeBase.trim() || null,
   );
   rememberThreadSnapshot(t);
-  setState("expanded", reconcile({}));
-  setState({
-    currentId: t.id,
-    items: t.items,
-    plan: (t.plan as PlanEntry[] | null) ?? null,
-    proposedPlan: null,
-    cwd: t.cwd,
-    title: t.title,
-    agentKind: t.agentKind,
-    model: t.model ?? "",
-    mode: t.mode ?? "",
-    reasoningEffort: t.reasoningEffort ?? "",
-    roamingPeer: peer.token,
-    loadingThread: false,
-  });
-  setState("running", t.id, false);
+  flush(() => setState(s => {
+    Object.assign(s, {
+      expanded: {},
+      currentId: t.id,
+      items: t.items,
+      plan: (t.plan as PlanEntry[] | null) ?? null,
+      proposedPlan: null,
+      cwd: t.cwd,
+      title: t.title,
+      agentKind: t.agentKind,
+      model: t.model ?? "",
+      mode: t.mode ?? "",
+      reasoningEffort: t.reasoningEffort ?? "",
+      roamingPeer: peer.token,
+      loadingThread: false,
+    });
+    s.running[t.id] = false;
+  }));
   reportActivity(true);
   void refreshThreads();
   void ensureModelOptions(t.agentKind);
@@ -764,7 +769,7 @@ export async function respondRoamRequest(
   try {
     await api.respondRoamRequest(reqId, accept, changes);
   } finally {
-    setState("incomingRoams", (prev) => prev.filter((r) => r.reqId !== reqId));
+    setState(s => { s.incomingRoams = s.incomingRoams.filter(r => r.reqId !== reqId); });
   }
 }
 
@@ -800,35 +805,32 @@ function rememberCurrentThreadSnapshot() {
     model: state.model || null,
     mode: state.mode || null,
     reasoningEffort: state.reasoningEffort || null,
-    // Solid store 的 raw 数组本就驻留内存；保留引用即可，切换时不深拷贝整段 transcript。
-    items: unwrap(state.items),
-    plan: state.plan ? unwrap(state.plan) : null,
+    // snapshot 保留未修改子树的身份，避免切换时深拷贝整段 transcript。
+    items: snapshot(state.items),
+    plan: state.plan ? snapshot(state.plan) : null,
   });
 }
 
 function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileItems = false) {
-  batch(() => {
-    const agentKind = thread.agentKind;
-    if (reconcileItems) {
-      setState("items", reconcile(thread.items, { key: "id" }));
-    }
-    setState({
+  flush(() => setState(s => {
+    if (reconcileItems) reconcile(thread.items, "id")(s.items);
+    else s.items = thread.items;
+    Object.assign(s, {
       currentId: thread.id,
-      ...(!reconcileItems ? { items: thread.items } : {}),
       plan: (thread.plan as PlanEntry[] | null) ?? null,
       proposedPlan: recoverProposedPlan(thread),
       cwd: thread.cwd,
       title: thread.title,
-      agentKind,
+      agentKind: thread.agentKind,
       model: thread.model ?? "",
       mode: thread.mode ?? "",
       reasoningEffort: thread.reasoningEffort ?? "",
       roamingPeer: thread.roamingRole === "guest" ? thread.roamingPeer ?? null : null,
       loadingThread,
-      // 运行中切回会话时恢复此前收到的 usage；结束会话仍以 Turn 项的最终值为准。
-      liveUsage: state.running[thread.id] ? (liveUsageByThread.get(thread.id) ?? null) : null,
+      // 会话交接之后的同步读取必须看到新快照。
+      liveUsage: s.running[thread.id] ? (liveUsageByThread.get(thread.id) ?? null) : null,
     });
-  });
+  }));
 }
 
 /** Plan 模式且已结束的会话：从最后一轮助手正文恢复「实施此计划」按钮 */
@@ -856,7 +858,7 @@ export function markThreadSwitchStart() {
     const wait = Math.round(switchTraceStart - switchPointerDownAt);
     switchPointerDownAt = 0;
     if (wait >= 150) {
-      setState("logs", (logs) => [...logs, `[切换卡顿] 点击→开始切换 等待 ${wait}ms（主线程被占）`]);
+      setState(s => { s.logs.push(`[切换卡顿] 点击→开始切换 等待 ${wait}ms（主线程被占）`); });
     }
   }
 }
@@ -864,7 +866,7 @@ function traceThreadSwitch(id: string, phase: string) {
   if (!switchTraceStart) return;
   const ms = Math.round(performance.now() - switchTraceStart);
   if (ms < 150) return; // 150ms 内不算卡，不刷日志
-  setState("logs", (logs) => [...logs, `[切换卡顿] ${phase} +${ms}ms (会话 ${id.slice(0, 8)})`]);
+  setState(s => { s.logs.push(`[切换卡顿] ${phase} +${ms}ms (会话 ${id.slice(0, 8)})`); });
 }
 /** 布局落地后收尾：写一行总耗时并清零，避免后续无关操作重复打点。 */
 export function traceThreadSwitchLayoutDone(threadId: string | null, groupCount: number) {
@@ -872,10 +874,7 @@ export function traceThreadSwitchLayoutDone(threadId: string | null, groupCount:
   const ms = Math.round(performance.now() - switchTraceStart);
   switchTraceStart = 0;
   if (ms < 150) return;
-  setState("logs", (logs) => [
-    ...logs,
-    `[切换卡顿] 布局+绘制落地 总${ms}ms (${groupCount} 组, 会话 ${threadId.slice(0, 8)})`,
-  ]);
+  setState(s => { s.logs.push(`[切换卡顿] 布局+绘制落地 总${ms}ms (${groupCount} 组, 会话 ${threadId.slice(0, 8)})`); });
 }
 
 /**
@@ -883,7 +882,7 @@ export function traceThreadSwitchLayoutDone(threadId: string | null, groupCount:
  * 因此每次计数变化都写回会话文件，启动时由 refreshThreads 从后端快照恢复。
  */
 export function setUnreadTurns(id: string, count: number) {
-  setState("unreadTurns", id, count);
+  setState(s => { s.unreadTurns[id] = count; });
   void api.setThreadUnread(id, count).catch(() => {
     // 落盘失败只丢跨重启持久化，本次窗口内的未读点仍按内存状态展示。
   });
@@ -896,7 +895,7 @@ export function setPromptQueuedThreads(ids: ReadonlySet<string>) {
   const next: Record<string, boolean> = {};
   for (const id of ids) next[id] = true;
   // Solid 的对象 setter 默认合并；必须删除旧 key，否则清空/挂起队列后仍被视为待发。
-  setState("promptQueued", reconcile(next));
+  setState(s => { reconcile(next)(s.promptQueued); });
 }
 
 const historyLoads = new Map<string, Promise<void>>();
@@ -907,7 +906,7 @@ export async function ensureHistoryItems(ids?: number[]) {
   if (!id) return;
   const request = openThreadRequest;
   const wanted = ids ? new Set(ids) : undefined;
-  const deferred = unwrap(state.items).filter(item => item.deferred && (!wanted || wanted.has(item.id)));
+  const deferred = snapshot(state.items).filter(item => item.deferred && (!wanted || wanted.has(item.id)));
   for (let offset = 0; offset < deferred.length; offset += 256) {
     if (state.currentId !== id || request !== openThreadRequest) return;
     const page = deferred.slice(offset, offset + 256);
@@ -925,8 +924,8 @@ export async function ensureHistoryItems(ids?: number[]) {
           await openThread(id);
           return;
         }
-        batch(() => {
-          const current = unwrap(state.items);
+        flush(() => {
+          const current = snapshot(state.items);
           const positions = new Map(current.map((item, index) => [item.id, index]));
           const replacements = new Map<number, Item>();
           for (const item of loaded) {
@@ -935,7 +934,7 @@ export async function ensureHistoryItems(ids?: number[]) {
             replacements.set(item.id, item);
           }
           // Replace identity so closed group caches/layouts invalidate, too.
-          if (replacements.size) setState("items", current.map(item => replacements.get(item.id) ?? item));
+          if (replacements.size) setState(s => { s.items = current.map(item => replacements.get(item.id) ?? item); });
         });
         rememberCurrentThreadSnapshot();
       })().finally(() => historyLoads.delete(key));
@@ -964,7 +963,7 @@ export async function openThread(id: string) {
   const cached = getThreadSnapshot(id);
   const commitSnapshot = (thread: Thread, loadingThread: boolean, reconcileItems = false) => {
     discardPendingStreamUpdates();
-    batch(() => {
+    flush(() => {
       resetExpanded();
       showThreadSnapshot(thread, loadingThread, reconcileItems);
     });
@@ -975,9 +974,9 @@ export async function openThread(id: string) {
   if (switching && !cached) {
     const meta = state.threads.find((thread) => thread.id === id);
     discardPendingStreamUpdates();
-    batch(() => {
+    flush(() => {
       resetExpanded();
-      setState({
+      setState(s => { Object.assign(s, {
         currentId: id,
         items: [],
         plan: null,
@@ -990,8 +989,8 @@ export async function openThread(id: string) {
         reasoningEffort: "",
         roamingPeer: null,
         loadingThread: true,
-        liveUsage: state.running[id] ? (liveUsageByThread.get(id) ?? null) : null,
-      });
+        liveUsage: s.running[id] ? (liveUsageByThread.get(id) ?? null) : null,
+      }); });
     });
   }
 
@@ -1031,7 +1030,7 @@ export async function openThread(id: string) {
       if (request !== openThreadRequest || state.currentId !== id) return;
     }
     // IPC 返回途中收到的终态可能比快照更新，冷加载不能丢，暖加载不能被旧快照覆盖。
-    batch(() => {
+    flush(() => {
       for (const item of toolUpdates.items.values()) applyOp({ t: "upsert", item });
       for (const itemId of toolUpdates.removed) applyOp({ t: "remove", itemId });
     });
@@ -1043,7 +1042,7 @@ export async function openThread(id: string) {
       const items = await api.getThreadItems(id, [...versions.keys()]);
       if (request !== openThreadRequest || state.currentId !== id) return;
       const byId = new Map(items.map(item => [item.id, item]));
-      batch(() => {
+      flush(() => {
         for (const [itemId, version] of versions) {
           if (toolUpdates.deltaVersions.get(itemId) !== version) continue;
           toolUpdates.deltaVersions.delete(itemId);
@@ -1056,7 +1055,7 @@ export async function openThread(id: string) {
     if (roamingPeer) ensurePeerModels(roamingPeer);
     else void ensureModelOptions(agentKind);
   } catch {
-    if (state.currentId === id) setState({ loadingThread: false });
+    if (state.currentId === id) setState(s => { s.loadingThread = false; });
   } finally {
     if (snapshotToolUpdates === toolUpdates) snapshotToolUpdates = undefined;
   }
@@ -1068,7 +1067,7 @@ export function closeThread() {
   discardPendingStreamUpdates();
   resetExpanded();
   const agentKind = lastUsed.agentKind();
-  setState({
+  flush(() => setState(s => { Object.assign(s, {
     currentId: null,
     items: [],
     plan: null,
@@ -1081,7 +1080,7 @@ export function closeThread() {
     reasoningEffort: lastUsed.reasoningEffort(agentKind),
     roamingPeer: null,
     liveUsage: null,
-  });
+  }); }));
   reportActivity(true);
 }
 
@@ -1113,21 +1112,23 @@ export async function createThread(
   const storedAgentKind = t.agentKind;
   lastUsed.setMode(storedAgentKind, t.mode ?? "");
   lastUsed.setReasoningEffort(storedAgentKind, t.reasoningEffort ?? "");
-  setState("expanded", reconcile({}));
-  setState({
-    currentId: t.id,
-    items: t.items,
-    plan: (t.plan as PlanEntry[] | null) ?? null,
-    proposedPlan: null,
-    cwd: t.cwd,
-    title: t.title,
-    agentKind: storedAgentKind,
-    model: t.model ?? "",
-    mode: t.mode ?? "",
-    reasoningEffort: t.reasoningEffort ?? "",
-    loadingThread: false,
-  });
-  setState("running", t.id, false);
+  flush(() => setState(s => {
+    Object.assign(s, {
+      expanded: {},
+      currentId: t.id,
+      items: t.items,
+      plan: (t.plan as PlanEntry[] | null) ?? null,
+      proposedPlan: null,
+      cwd: t.cwd,
+      title: t.title,
+      agentKind: storedAgentKind,
+      model: t.model ?? "",
+      mode: t.mode ?? "",
+      reasoningEffort: t.reasoningEffort ?? "",
+      loadingThread: false,
+    });
+    s.running[t.id] = false;
+  }));
   reportActivity(true);
   void refreshThreads();
   void refreshProjects();
@@ -1236,8 +1237,8 @@ export function createThreadOptimistic(
 ): void {
   if (!isSupportedAgentKind(agentKind)) throw new Error(`不支持的后端：${agentKind || "未指定"}，迁移未完成`);
   const pendingId = PENDING_THREAD_PREFIX + crypto.randomUUID();
-  setState("expanded", reconcile({}));
-  setState({
+  setState(s => { Object.assign(s, {
+    expanded: {},
     currentId: pendingId,
     items: [],
     plan: null,
@@ -1249,15 +1250,15 @@ export function createThreadOptimistic(
     mode,
     reasoningEffort,
     loadingThread: false,
-  });
+  }); });
   // 用户消息立即上屏，与 deliverPrompt 的乐观项同一约定（负 id 临时项）。
-  setState("items", 0, {
+  setState(s => { s.items[0] = {
     type: "user",
     id: -Date.now(),
     text,
     images,
     ts: Date.now(),
-  } as Item);
+  } as Item; });
   bumpChatScrollToBottom();
   void (async () => {
     let createdId: string | null = null;
@@ -1284,20 +1285,22 @@ export function createThreadOptimistic(
       // 用户可能已切走：仅在仍停留在该占位会话时才接管界面。
       if (state.currentId === pendingId) {
         optimisticHandoffs.set(t.id, pendingId);
-        setState({
-          currentId: t.id,
-          items: t.items,
-          plan: (t.plan as PlanEntry[] | null) ?? null,
-          proposedPlan: null,
-          cwd: t.cwd,
-          title: t.title,
-          agentKind: storedAgentKind,
-          model: t.model ?? "",
-          mode: t.mode ?? "",
-          reasoningEffort: t.reasoningEffort ?? "",
-          loadingThread: false,
-        });
-        setState("running", t.id, true);
+        flush(() => setState(s => {
+          Object.assign(s, {
+            currentId: t.id,
+            items: t.items,
+            plan: (t.plan as PlanEntry[] | null) ?? null,
+            proposedPlan: null,
+            cwd: t.cwd,
+            title: t.title,
+            agentKind: storedAgentKind,
+            model: t.model ?? "",
+            mode: t.mode ?? "",
+            reasoningEffort: t.reasoningEffort ?? "",
+            loadingThread: false,
+          });
+          s.running[t.id] = true;
+        }));
         reportActivity(true);
         await sendPromptTo(t.id, text, images);
       } else {
@@ -1310,13 +1313,14 @@ export function createThreadOptimistic(
       void ensureModelOptions(storedAgentKind);
     } catch (error) {
       if (createdId) {
-        setState("running", createdId, false);
+        const id = createdId;
+        setState(s => { s.running[id] = false; });
         optimisticRunningThreads.delete(createdId);
       }
       if (state.currentId === pendingId || (createdId && state.currentId === createdId)) {
         rememberPromptDraft(text, images);
-        setState("items", []);
-        setState("currentId", null);
+        setState(s => { s.items = []; });
+        setState(s => { s.currentId = null; });
         setView("home");
       }
       showToast(`${createdId ? "消息发送失败" : "会话创建失败"}：${String(error)}`);
@@ -1396,7 +1400,7 @@ export async function setThreadModel(model: string) {
   const id = state.currentId;
   if (!id || isSubagentThread(id)) return;
   await assertThreadBackend(id);
-  setState("model", model);
+  setState(s => { s.model = model; });
   try {
     await api.setThreadModel(id, model || null);
   } catch (error) {
@@ -1431,7 +1435,7 @@ function syncThreadAgentFromMeta(meta: ThreadMeta) {
   const agentKind = meta.agentKind;
   if (agentKind === state.agentKind && (meta.model ?? "") === state.model) return;
   const switched = agentKind !== state.agentKind;
-  setState({ agentKind, model: meta.model ?? "" });
+  setState(s => { s.agentKind = agentKind; s.model = meta.model ?? ""; });
   if (switched) {
     void ensureModelOptions(agentKind);
     void refreshSlashCommands(agentKind);
@@ -1442,7 +1446,7 @@ export async function setThreadMode(mode: string) {
   const id = state.currentId;
   if (!id || isSubagentThread(id)) return;
   await assertThreadBackend(id);
-  setState("mode", mode);
+  setState(s => { s.mode = mode; });
   lastUsed.setMode(state.agentKind, mode);
   await api.setThreadMode(id, mode || null);
 }
@@ -1451,13 +1455,13 @@ export async function setThreadMode(mode: string) {
 export async function implementProposedPlan() {
   const plan = state.proposedPlan;
   if (!plan || !state.currentId || isSubagentThread()) return;
-  setState("proposedPlan", null);
+  setState(s => { s.proposedPlan = null; });
   await setThreadMode("build");
   await sendPrompt(`请按以下计划开始实施：\n\n${plan}`);
 }
 
 export function dismissProposedPlan() {
-  setState("proposedPlan", null);
+  setState(s => { s.proposedPlan = null; });
 }
 
 export async function deleteThread(id: string) {
@@ -1534,13 +1538,13 @@ async function startStageThread(
   rememberThreadSnapshot(thread);
   await refreshThreads();
   await openThread(thread.id);
-  setState("running", thread.id, true);
+  setState(s => { s.running[thread.id] = true; });
   // Stage 使用自己的任务生成标题，不沿用来源会话名；失败时保留上面的提示词兜底标题。
   void api.generateThreadTitle(thread.id, prompt.slice(0, 1200)).catch(() => {});
   try {
     await api.sendPrompt(thread.id, prompt);
   } catch (error) {
-    setState("running", thread.id, false);
+    setState(s => { s.running[thread.id] = false; });
     throw error;
   }
 }
@@ -1670,13 +1674,13 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
   // applyUpsert 收到真实 user item 后会移除这个负 id 临时项。
   const optimisticId = state.currentId === threadId ? -Date.now() : null;
   if (optimisticId !== null) {
-    setState("items", state.items.length, {
+    setState(s => { s.items.push({
       type: "user",
       id: optimisticId,
       text,
       images,
       ts: Date.now(),
-    } as Item);
+    } as Item); });
     bumpChatScrollToBottom();
   }
 
@@ -1684,16 +1688,16 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
   // 本轮正常结束时会重新进入自动验收，而不是退化成不受跟踪的普通会话。
   const resumedFireStep = resumeFireRelay(threadId);
   const currentMode = state.currentId === threadId ? state.mode : "";
-  setState("proposedPlan", null);
+  setState(s => { s.proposedPlan = null; });
   optimisticRunningThreads.add(threadId);
-  setState("running", threadId, true);
+  setState(s => { s.running[threadId] = true; });
   try {
     // ThreadMeta 不持久化 mode：非当前会话按未知处理，无条件在后端置为 build。
     // 一律 Build：含历史 Plan 会话、以及后端原生 bypass/agent 等。
     if ((currentMode || "").toLowerCase() !== "build") {
       await api.setThreadMode(threadId, "build");
       if (state.currentId === threadId) {
-        setState("mode", "build");
+        setState(s => { s.mode = "build"; });
         lastUsed.setMode(state.agentKind, "build");
       }
     }
@@ -1707,14 +1711,14 @@ async function deliverPrompt(threadId: string, text: string, images: PromptImage
   } catch (e) {
     optimisticRunningThreads.delete(threadId);
     if (optimisticId !== null && state.currentId === threadId) {
-      setState("items", (items) => items.filter((item) => item.id !== optimisticId));
+      setState(s => { s.items = s.items.filter(item => item.id !== optimisticId); });
     }
     if (resumedFireStep && fireRelaySteps.get(threadId) === resumedFireStep) {
       fireRelaySteps.delete(threadId);
       suspendedFireRelaySteps.set(threadId, resumedFireStep);
       persistFireRelayState();
     }
-    setState("running", threadId, false);
+    setState(s => { s.running[threadId] = false; });
     throw e;
   }
 }
@@ -1910,7 +1914,7 @@ async function createFireThread(
   await refreshThreads();
   // 用户正在看这条 Fire 链时才切到新阶段；看别的会话时后台继续跑。
   if (isViewingFireChain(step.rootId)) await openThread(thread.id);
-  setState("running", thread.id, true);
+  setState(s => { s.running[thread.id] = true; });
   await api.sendPrompt(thread.id, prompt);
   return thread.id;
 }
@@ -2002,7 +2006,7 @@ export async function startFireRelay(
   if (state.running[rootId]) throw new Error("请等待当前会话结束后再启动 /fire");
   // Fire 始终执行而不是规划；根会话和后续所有阶段都强制使用 Build。
   await api.setThreadMode(rootId, "build");
-  if (state.currentId === rootId) setState("mode", "build");
+  if (state.currentId === rootId) setState(s => { s.mode = "build"; });
   await api.renameThread(rootId, `[Fire] 目标 · ${trimmed.slice(0, 28)}`);
   suspendedFireRelaySteps.delete(rootId);
   completedFireRoots.delete(rootId);
@@ -2020,8 +2024,8 @@ export async function startFireRelay(
   await refreshThreads();
   // 远程或其它非 Composer 入口启动时，用户可能正在看别的会话；必须发到 rootId。
   if (state.currentId === rootId) bumpChatScrollToBottom();
-  setState("proposedPlan", null);
-  setState("running", rootId, true);
+  setState(s => { s.proposedPlan = null; });
+  setState(s => { s.running[rootId] = true; });
   try {
     const prompt = fireWorkPrompt(trimmed);
     rememberPromptDisplay(prompt, typed);
@@ -2032,7 +2036,7 @@ export async function startFireRelay(
       suspendedFireRelaySteps.set(rootId, rootStep);
       persistFireRelayState();
     }
-    setState("running", rootId, false);
+    setState(s => { s.running[rootId] = false; });
     throw e;
   }
 }
@@ -2158,16 +2162,12 @@ export async function editUserMessage(itemId: number, text: string, images: Prom
   const retained = targetIndex < 0 ? state.items : state.items.slice(0, targetIndex);
   // 临时 id 只存在于前端；后端 restore 完成、发出真实 user item 后由快照/事件替换。
   const optimisticId = -Date.now();
-  setState({
-    items: [
-      ...retained,
-      { type: "user", id: optimisticId, text, images, ts: Date.now() } as Item,
-    ],
-    plan: null,
-    proposedPlan: null,
+  setState(s => {
+    s.items = [...retained, { type: "user", id: optimisticId, text, images, ts: Date.now() } as Item];
+    s.plan = s.proposedPlan = null;
+    s.expanded = {};
+    s.running[id] = true;
   });
-  setState("expanded", reconcile({}));
-  setState("running", id, true);
   // 先置 running 再解挂：停止留下的 hold 否则会挡住本轮结束后的队列自动投递。
   // 必须在 running=true 之后释放，避免解挂瞬间把仍停留在队列里的条目立刻发出。
   // 动态导入避免 store ↔ promptQueue 循环依赖。
@@ -2184,7 +2184,7 @@ export async function editUserMessage(itemId: number, text: string, images: Prom
       break;
     } catch (e) {
       if (attempt >= 10) {
-        setState("running", id, false);
+        setState(s => { s.running[id] = false; });
         if (state.currentId === id) await openThread(id);
         throw e;
       }
@@ -2201,17 +2201,14 @@ export async function cancelTurn(stopReason?: string, deleteWork = false) {
   await api.cancelTurn(id, stopReason, deleteWork);
   // 部分后端的取消调用会先返回，结束事件稍后才到；主动释放前端忙碌态，
   // 避免停止成功后历史消息仍被 running 门控，必须切换会话才能编辑。
-  setState("running", id, false);
+  setState(s => { s.running[id] = false; });
 }
 
 export async function respondPermission(requestKey: string, optionId: string) {
   try {
     await api.respondPermission(requestKey, optionId);
   } finally {
-    setState(
-      "permissions",
-      state.permissions.filter((p) => p.requestKey !== requestKey),
-    );
+    setState(s => { s.permissions = s.permissions.filter(p => p.requestKey !== requestKey); });
   }
 }
 
@@ -2308,20 +2305,17 @@ function flushPendingDeltas() {
   lastDeltaFlush = performance.now();
   const deltas = Array.from(pendingDeltas.entries());
   pendingDeltas.clear();
-  setState(
-    "items",
-    produce((items) => {
-      for (const [itemId, text] of deltas) {
-        for (let i = items.length - 1; i >= 0; i--) {
-          const it = items[i];
-          if (it.id === itemId && "text" in it) {
-            (it as { text: string }).text += text;
-            break;
-          }
+  setState(s => {
+    for (const [itemId, text] of deltas) {
+      for (let i = s.items.length - 1; i >= 0; i--) {
+        const it = s.items[i];
+        if (it.id === itemId && "text" in it) {
+          it.text += text;
+          break;
         }
       }
-    }),
-  );
+    }
+  });
 }
 
 function queueDelta(op: Extract<UpdateOp, { t: "delta" }>) {
@@ -2338,50 +2332,53 @@ function projectLiveImages(item: Item) {
   const id = state.currentId;
   if (!id) return;
   const request = openThreadRequest;
-  const original = unwrap(state.items).find(current => current.id === item.id);
+  const original = snapshot(state.items).find(current => current.id === item.id);
   if (!original) return;
   const ticket = {};
   imageProjectionTickets.set(original, ticket);
   if (item.type !== "user" || !item.images?.some(image => image.mimeType.startsWith("image/") && image.data)) return;
   void api.getThreadItems(id, [item.id]).then(([projected]) => {
     if (state.currentId !== id || request !== openThreadRequest || projected?.type !== "user") return;
-    const current = unwrap(state.items);
+    const current = snapshot(state.items);
     const index = current.findIndex(value => value.id === item.id);
     if (index < 0 || current[index] !== original || imageProjectionTickets.get(original) !== ticket) return;
-    setState("items", current.map((value, i) => i === index ? projected : value));
+    flush(() => setState(s => { s.items = current.map((value, i) => i === index ? projected : value); }));
     rememberCurrentThreadSnapshot();
   }).catch(error => console.error("Image display projection failed", error));
 }
 
 function applyUpsert(item: Item) {
-  // Turn 落库意味着本轮用量已有终值，清掉进行中的实时值，防止短暂双计。
-  if (item.type === "turn") {
-    if (state.currentId) liveUsageByThread.delete(state.currentId);
-    if (state.liveUsage) setState("liveUsage", null);
-  }
+  setState(s => {
+    // Read the draft so multiple events in one batch see the preceding updates.
+    if (item.type === "turn") {
+      if (s.currentId) liveUsageByThread.delete(s.currentId);
+      s.liveUsage = null;
+    }
+    if (item.type === "user") {
+      const optimistic = s.items.findIndex(current => current.type === "user" && current.id < 0);
+      if (optimistic >= 0) s.items.splice(optimistic, 1);
+    }
+    const idx = s.items.findIndex(current => current.id === item.id);
+    // 完整快照只统计新增输出；工具参数属于模型输出，工具结果/日志不属于。
+    if (s.currentId && s.running[s.currentId]) {
+      const outputLength = (value: Item | undefined): number => {
+        if (value?.type === "assistant" || value?.type === "thought") {
+          return value.text === "思考中…" ? 0 : value.text.length;
+        }
+        if (value?.type !== "tool" || value.rawInput == null) return 0;
+        return (typeof value.rawInput === "string" ? value.rawInput : JSON.stringify(value.rawInput))?.length ?? 0;
+      };
+      const previous = idx >= 0 ? s.items[idx] : undefined;
+      const added = Math.max(0, outputLength(item) - outputLength(previous));
+      if (added) trackDeltaRate(s.currentId, added);
+    }
+    if (idx >= 0) reconcile(item)(s.items[idx]);
+    else s.items.push(item);
+  });
   if (item.type === "user") {
-    const optimistic = state.items.findIndex(
-      (current) => current.type === "user" && current.id < 0,
-    );
-    if (optimistic >= 0) setState("items", (items) => items.filter((_, i) => i !== optimistic));
+    const threadId = state.currentId;
+    onFlush(() => { if (state.currentId === threadId) projectLiveImages(item); });
   }
-  const idx = state.items.findIndex((current) => current.id === item.id);
-  // 完整快照只统计新增输出；工具参数属于模型输出，工具结果/日志不属于。
-  if (state.currentId && state.running[state.currentId]) {
-    const outputLength = (value: Item | undefined): number => {
-      if (value?.type === "assistant" || value?.type === "thought") {
-        return value.text === "思考中…" ? 0 : value.text.length;
-      }
-      if (value?.type !== "tool" || value.rawInput == null) return 0;
-      return (typeof value.rawInput === "string" ? value.rawInput : JSON.stringify(value.rawInput))?.length ?? 0;
-    };
-    const previous = idx >= 0 ? state.items[idx] : undefined;
-    const added = Math.max(0, outputLength(item) - outputLength(previous));
-    if (added) trackDeltaRate(state.currentId, added);
-  }
-  if (idx >= 0) setState("items", idx, reconcile(item));
-  else setState("items", state.items.length, item);
-  if (item.type === "user") projectLiveImages(item);
 }
 
 function flushPendingToolUpserts() {
@@ -2393,7 +2390,7 @@ function flushPendingToolUpserts() {
   lastToolUpdateFlush = performance.now();
   const items = Array.from(pendingToolItems.values());
   pendingToolItems.clear();
-  batch(() => {
+  flush(() => {
     for (const item of items) applyUpsert(item);
   });
 }
@@ -2406,32 +2403,34 @@ function queueToolItem(item: Extract<Item, { type: "tool" }>) {
 }
 
 function flushPendingStreamUpdates() {
-  flushPendingDeltas();
-  flushPendingToolUpserts();
+  flush(() => {
+    flushPendingDeltas();
+    flushPendingToolUpserts();
+  });
 }
 
 function applyOp(op: UpdateOp) {
   if (op.t === "usage") {
     // 本轮进行中的实时累计用量；按会话缓存，切换回来无需等待下一次工具/usage 事件。
     if (state.currentId) liveUsageByThread.set(state.currentId, op.usage);
-    setState("liveUsage", op.usage);
+    setState(s => { s.liveUsage = op.usage; });
     return;
   }
   if (op.t === "plan") {
     flushPendingStreamUpdates();
-    setState("plan", op.plan);
+    setState(s => { s.plan = op.plan; });
     return;
   }
   if (op.t === "proposed_plan") {
     flushPendingStreamUpdates();
-    setState("proposedPlan", op.text);
+    setState(s => { s.proposedPlan = op.text; });
     return;
   }
   if (op.t === "mode") {
     flushPendingStreamUpdates();
     // 后端偶发上报原生 id（bypass/agent/plan…），一律归一成 Build
     const mode = normalizeUnifiedMode(op.mode) ?? "build";
-    setState("mode", mode);
+    setState(s => { s.mode = mode; });
     lastUsed.setMode(state.agentKind, mode);
     return;
   }
@@ -2441,10 +2440,7 @@ function applyOp(op: UpdateOp) {
   }
   if (op.t === "remove") {
     flushPendingStreamUpdates();
-    setState(
-      "items",
-      state.items.filter((item) => item.id !== op.itemId),
-    );
+    setState(s => { s.items = s.items.filter(item => item.id !== op.itemId); });
     return;
   }
   // upsert
@@ -2500,7 +2496,7 @@ export async function refreshSlashCommands(agentKind: AgentKind) {
   try {
     const commands = await api.getSlashCommands(agentKind);
     const list = normalizeSlashCommands(commands);
-    setState("slashCommands", agentKind, list);
+    setState(s => { s.slashCommands[agentKind] = list; });
   } catch (err) {
     console.warn(`拉取 ${agentKind} 斜杠命令失败`, err);
   }
@@ -2557,7 +2553,7 @@ export async function initStore() {
     if (isThemePref(resolvedSettings.theme) && resolvedSettings.theme !== state.theme) {
       setTheme(resolvedSettings.theme);
     }
-    setState({ settings: resolvedSettings, agentKind: initialAgent });
+    setState(s => { s.settings = resolvedSettings; s.agentKind = initialAgent; });
     void ensureModelOptions(initialAgent);
     return { settings: resolvedSettings, initialAgent };
   }).catch((error: unknown) => {
@@ -2609,7 +2605,7 @@ export async function initStore() {
         applyOp(op);
       };
       if (ops.length > 1) {
-        batch(() => {
+        flush(() => {
           for (const op of ops) apply(op);
         });
       } else if (ops[0]) {
@@ -2621,8 +2617,8 @@ export async function initStore() {
       const { threadId, cwd } = e.payload;
       const cached = threadSnapshots.peek(threadId);
       if (cached) rememberThreadSnapshot({ ...cached, cwd });
-      setState("threads", (thread) => thread.id === threadId, "cwd", cwd);
-      if (state.currentId === threadId) setState("cwd", cwd);
+      setState(s => { for (const thread of s.threads) if (thread.id === threadId) thread.cwd = cwd; });
+      if (state.currentId === threadId) setState(s => { s.cwd = cwd; });
     }),
 
     listen<TurnEvent>("acp:turn", (e) => {
@@ -2630,7 +2626,7 @@ export async function initStore() {
       const wasRunning = !!state.running[threadId];
       runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
       optimisticRunningThreads.delete(threadId);
-      setState("running", threadId, e.payload.running);
+      setState(s => { s.running[threadId] = e.payload.running; });
       if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
         staleThreadSnapshots.add(threadId);
       }
@@ -2639,7 +2635,7 @@ export async function initStore() {
         if (!wasRunning) {
           liveUsageByThread.delete(threadId);
           clearDeltaRate(threadId);
-          if (threadId === state.currentId) setState("liveUsage", null);
+          if (threadId === state.currentId) setState(s => { s.liveUsage = null; });
         }
         // 非 store.sendPrompt 入口（远程、后台重发等）开始 turn 时，重新挂上 Fire 跟踪。
         resumeFireRelay(e.payload.threadId);
@@ -2654,7 +2650,7 @@ export async function initStore() {
         // 轮次结束的兜底清理：正常路径下 Turn upsert 已清零，这里覆盖异常收尾。
         liveUsageByThread.delete(threadId);
         clearDeltaRate(threadId);
-        if (threadId === state.currentId) setState("liveUsage", null);
+        if (threadId === state.currentId) setState(s => { s.liveUsage = null; });
         if (pendingSetupConfigRefresh.delete(threadId)) {
           void api.refreshLyraConfig().catch((error) =>
             console.error("Refresh Lyra config after /setup failed", error),
@@ -2708,7 +2704,7 @@ export async function initStore() {
         const { threadId, text, images = [], restored } = e.payload;
         // 编辑时已显示乐观消息；统一发送入口会重新创建，先移除旧项避免重复。
         if (restored && state.currentId === threadId) {
-          setState("items", items => items.filter(item => item.id >= 0));
+          setState(s => { s.items = s.items.filter(item => item.id >= 0); });
         }
         void (async () => {
           let target = threadId;
@@ -2719,7 +2715,7 @@ export async function initStore() {
           }
           await sendPromptTo(target, text, images);
         })().catch((error) => {
-          if (restored && threadId) setState("running", threadId, false);
+          if (restored && threadId) setState(s => { s.running[threadId] = false; });
           showToast(`${restored ? "编辑后重新发送" : "消息发送"}失败：${String(error)}`);
           console.error("Prompt dispatch failed", error);
         });
@@ -2727,60 +2723,52 @@ export async function initStore() {
     ),
 
     listen<PermissionRequest>("acp:permission", (e) => {
-      setState("permissions", state.permissions.length, e.payload);
+      setState(s => { s.permissions.push(e.payload); });
     }),
 
     listen<{ requestKey: string }>("acp:permission-resolved", (e) => {
-      setState(
-        "permissions",
-        state.permissions.filter((p) => p.requestKey !== e.payload.requestKey),
-      );
+      setState(s => { s.permissions = s.permissions.filter(p => p.requestKey !== e.payload.requestKey); });
     }),
 
     // 后端可用性只用于设置页的 CLI 缺失提示；选择器是否展示完全由启用开关决定。
     listen<{ availability: Record<string, boolean> }>("backends:availability", (e) => {
-      setState("backendAvailability", reconcile(e.payload.availability ?? {}));
+      setState(s => { reconcile(e.payload.availability ?? {})(s.backendAvailability); });
     }),
 
     listen<string>("acp:log", (e) => {
-      setState(
-        "logs",
-        produce((logs) => {
-          logs.push(e.payload);
-          if (logs.length > 500) logs.splice(0, logs.length - 500);
-        }),
-      );
+      setState(s => {
+        s.logs.push(e.payload);
+        if (s.logs.length > 500) s.logs.splice(0, s.logs.length - 500);
+      });
     }),
 
     // 自动更新：检测 + 静默下载暂存改由后端 tokio 定时器负责（每 10 分钟，不只启动时），
     // 避免 WebView 计时器在窗口最小化/隐藏时被节流，导致「只有启动才检测、角标不出现」。
     // 前端只负责响应事件并展示角标。
     listen<UpdateProgress>("update:progress", (e) => {
-      setState("updateProgress", e.payload);
+      setState(s => { s.updateProgress = e.payload; });
     }),
     // 后端暂存就绪 → 显示左上角「可更新」角标，并填充更新弹窗信息
     listen<UpdateInfo>("update:available", (e) => {
-      setState("update", { ...e.payload, staged: true });
-      setState("updateStaging", false);
+      setState(s => { s.update = { ...e.payload, staged: true }; s.updateStaging = false; });
     }),
     // 空闲（无会话/无任务）+ 新版本已下载好 → 后端主动请求弹窗，让用户选择是否现在更新
     listen<UpdateInfo>("update:prompt", (e) => {
-      setState("update", { ...e.payload, staged: true });
-      setState("updateStaging", false);
-      setState("updatePromptAt", Date.now());
+      setState(s => { s.update = { ...e.payload, staged: true }; s.updateStaging = false; });
+      setState(s => { s.updatePromptAt = Date.now(); });
     }),
 
     listen<{ threadId: string }>("threads:title-generated", (e) => {
       const id = e.payload.threadId;
-      setState("titleTyping", id, true);
+      setState(s => { s.titleTyping[id] = true; });
       window.setTimeout(() => {
-        setState("titleTyping", id, false);
+        setState(s => { s.titleTyping[id] = false; });
       }, 3000);
     }),
 
     // 自动模式失败的模型被后端降到场景末尾：同步本地设置，避免之后保存设置时回写旧顺序。
     listen<SceneModels>("settings:scene-models", (event) => {
-      if (state.settings) setState("settings", "sceneModels", event.payload);
+      if (state.settings) setState(s => { if (s.settings) s.settings.sceneModels = event.payload; });
     }),
 
     listen("threads:changed", () => {
@@ -2791,7 +2779,7 @@ export async function initStore() {
         if (!id) return;
         const meta = state.threads.find((t) => t.id === id);
         if (!meta) return;
-        if (meta.title !== state.title) setState("title", meta.title);
+        if (meta.title !== state.title) setState(s => { s.title = meta.title; });
         syncThreadAgentFromMeta(meta);
       });
       // 项目列表由后端合并会话目录生成，会话增删后同步刷新
@@ -2816,17 +2804,17 @@ export async function initStore() {
       void api.getThread(id).then((t) => {
         if (state.currentId !== id) return;
         flushPendingStreamUpdates();
-        setState("items", reconcile(t.items, { key: "id" }));
-        setState({
-          plan: (t.plan as PlanEntry[] | null) ?? null,
-          title: t.title,
+        setState(s => { reconcile(t.items, "id")(s.items); });
+        setState(s => {
+          s.plan = (t.plan as PlanEntry[] | null) ?? null;
+          s.title = t.title;
         });
       });
     }),
 
     // 团队/漫游中转站事件
     listen<RelayStatus>("relay:status", (e) => {
-      setState("relay", e.payload);
+      setState(s => { Object.assign(s.relay, e.payload); });
       if (e.payload.connected) {
         void refreshInbox();
         // 重连后强制校准：离线期间对端可能已调整共享模型，旧 peerModels 不能继续复用。
@@ -2834,7 +2822,7 @@ export async function initStore() {
       }
     }),
     listen<{ peers: Peer[] } | Peer[]>("relay:peers", (e) => {
-      setState("peers", normalizePeers(e.payload));
+      setState(s => { s.peers = normalizePeers(e.payload); });
       // 名单变化（有人上线/重连）即强制刷新，避免继续复用该成员断线前的旧模型列表。
       preloadPeerModels(true);
     }),
@@ -2848,10 +2836,10 @@ export async function initStore() {
       (e) => {
         const { peer, backends, options } = e.payload;
         if (!peer) return;
-        setState("peerModels", peer, {
+        setState(s => { s.peerModels[peer] = {
           backends: Array.isArray(backends) ? backends : [],
           options: options ?? {},
-        });
+        }; });
       },
     ),
     // 漫游：对端回传某目录的本地分支列表，按「token+目录」缓存供 worktree 下拉使用
@@ -2860,18 +2848,18 @@ export async function initStore() {
       (e) => {
         const { peer, folder, current, branches } = e.payload;
         if (!peer) return;
-        setState("peerBranches", peerBranchKey(peer, folder), {
+        setState(s => { s.peerBranches[peerBranchKey(peer, folder)] = {
           current: current ?? "",
           branches: Array.isArray(branches) ? branches : [],
-        });
+        }; });
       },
     ),
     listen<IncomingShare[]>("relay:inbox", (e) => {
       // 漫游召回的快照到达时自动弹出收件箱，用户直接选项目接收
       const known = new Set(state.inbox.map((s) => s.id));
       const hasNewRecall = e.payload.some((s) => s.recall && !known.has(s.id));
-      setState("inbox", e.payload);
-      if (hasNewRecall) setState("inboxPromptAt", Date.now());
+      setState(s => { s.inbox = e.payload; });
+      if (hasNewRecall) setState(s => { s.inboxPromptAt = Date.now(); });
     }),
     // 本地 worktree 后台创建就绪：切到 worktree 的 cwd 已由后端回写，这里补发暂存的首条提示词
     listen<{ threadId: string }>("acp:worktree-ready", (e) => {
@@ -2879,7 +2867,7 @@ export async function initStore() {
       void refreshThreads();
       if (state.currentId === id) {
         void api.getThread(id).then((t) => {
-          if (state.currentId === id) setState("cwd", t.cwd);
+          if (state.currentId === id) setState(s => { s.cwd = t.cwd; });
         });
       }
       flushWorktreePrompt(id);
@@ -2891,17 +2879,17 @@ export async function initStore() {
     }),
     // host 侧：收到漫游请求，入队等本机用户在弹框里确认
     listen<IncomingRoamRequest>("relay:roam-request", (e) => {
-      setState("incomingRoams", (prev) => [
-        ...prev.filter((r) => r.reqId !== e.payload.reqId),
+      setState(s => { s.incomingRoams = [
+        ...s.incomingRoams.filter(r => r.reqId !== e.payload.reqId),
         e.payload,
-      ]);
+      ]; });
     }),
   ]);
   // 启动即反映「已暂存好」的更新，让角标立刻出现（新版本的下载交给后端静默处理）
   void api
     .checkUpdate()
     .then((info) => {
-      if (info.hasUpdate && info.staged) setState("update", { ...info, staged: true });
+      if (info.hasUpdate && info.staged) setState(s => { s.update = { ...info, staged: true }; });
     })
     .catch(() => {
       // 网络不可用等场景静默失败，后端定时器会按周期重试
@@ -2918,7 +2906,7 @@ export async function initStore() {
   void api
     .getBackendAvailability()
     .then((a) => {
-      if (Object.keys(a).length > 0) setState("backendAvailability", reconcile(a));
+      if (Object.keys(a).length > 0) setState(s => { reconcile(a)(s.backendAvailability); });
     })
     .catch(() => {
       // 拉取失败按「全部可用」处理，不影响使用
@@ -2936,7 +2924,7 @@ export async function initStore() {
   void api
     .getRelayPeers()
     .then((peers) => {
-      setState("peers", normalizePeers(peers));
+      setState(s => { s.peers = normalizePeers(peers); });
       preloadPeerModels();
     })
     .catch(() => {});
@@ -2953,7 +2941,7 @@ export async function initStore() {
   void api
     .getStatus()
     .then((status) => {
-      setState({ connected: status.connected, agent: status.agent });
+      setState(s => { s.connected = status.connected; s.agent = status.agent; });
       const warnings = [...new Set([...modelMigrationWarnings, ...(status.migrationWarnings ?? [])])];
       if (warnings.length) showToast(`模型迁移提示：${warnings.join("；")}`, 10_000);
     })
@@ -2961,7 +2949,7 @@ export async function initStore() {
       // Status failure must not hide local migration errors.
       if (modelMigrationWarnings.length) showToast(modelMigrationWarnings.join("；"), 10_000);
     });
-  void api.getLogs().then((logs) => setState("logs", logs)).catch(() => {});
+  void api.getLogs().then((logs) => setState(s => { s.logs = logs; })).catch(() => {});
   // 其他后端在用户切换或打开模型选择器时按需加载。
   void refreshSlashCommands(initialAgent);
 

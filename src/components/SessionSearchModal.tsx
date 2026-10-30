@@ -1,4 +1,5 @@
-import { createSignal, For, onCleanup, Show, type JSX } from "solid-js";
+import { createSignal, For, onCleanup, Show } from "solid-js";
+import type { JSX } from "@solidjs/web";
 import { api } from "../ipc";
 import { setSearchReveal, state } from "../store";
 import { agentLabel, agentShort } from "../utils";

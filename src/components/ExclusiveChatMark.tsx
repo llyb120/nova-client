@@ -40,11 +40,10 @@ export function ExclusiveChatMark(props: { token: string }) {
     <Show when={identity()}>
       {(value) => (
           <div
-            class="composer-engraved-watermark"
-            classList={{
+            class={["composer-engraved-watermark", {
               "awaiting-signature": !signatureVisible(),
               signing: signatureProgress() !== null,
-            }}
+            }]}
             aria-hidden="true"
           >
             <span class="composer-engraved-mark engraved-number-mark">

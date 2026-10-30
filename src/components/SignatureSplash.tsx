@@ -1,5 +1,5 @@
-import { onCleanup, onMount, Show } from "solid-js";
-import { Portal } from "solid-js/web";
+import { onCleanup, onSettled, Show } from "solid-js";
+import { Portal } from "@solidjs/web";
 import { api } from "../ipc";
 import { restoreSettled } from "../store";
 import {
@@ -79,7 +79,7 @@ export function SignatureSplash() {
     locate(60);
   };
 
-  onMount(() => {
+  onSettled(() => {
     void api
       .signaturePending()
       .then((value) => {

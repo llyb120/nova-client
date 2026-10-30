@@ -1,5 +1,5 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
-import { Portal } from "solid-js/web";
+import { Portal } from "@solidjs/web";
 import { modelFavoriteIds, toggleModelFavorite } from "../store";
 import { IconCheck, IconChevron, IconEye, IconStar } from "./icons";
 
@@ -325,11 +325,7 @@ export function SearchSelect(props: {
     }, HOVER_INTENT_MS);
   };
   onCleanup(cancelGroupIntent);
-  createEffect(() => {
-    opened();
-    query();
-    cancelGroupIntent();
-  });
+  createEffect(() => [opened(), query()], cancelGroupIntent);
 
   /** 直接选模型时沿用该模型上次选的强度（仍在档位里才用），没有记录才用默认 */
   const pickModel = (o: SelectOption) => {
@@ -422,15 +418,18 @@ export function SearchSelect(props: {
 
   // portal 模式：浮层脱离 overflow 容器用 fixed 定位，需随滚动/缩放实时重算坐标
   createEffect(() => {
-    if (!usePortal() || !opened()) return;
+    if (!usePortal() || !opened()) return false;
     void props.options.length;
+    return true;
+  }, active => {
+    if (!active) return;
     const onReflow = () => computePlacement();
     window.addEventListener("scroll", onReflow, true);
     window.addEventListener("resize", onReflow);
-    onCleanup(() => {
+    return () => {
       window.removeEventListener("scroll", onReflow, true);
       window.removeEventListener("resize", onReflow);
-    });
+    };
   });
 
   let popRef: HTMLDivElement | undefined;

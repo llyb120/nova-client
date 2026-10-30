@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { access, readFile } from 'node:fs/promises';
 import { build } from 'esbuild';
 import { transformAsync } from '@babel/core';
-import solid from 'babel-preset-solid';
+import solid from '@solidjs/babel-plugin';
 import { chromium } from 'playwright-core';
 
 const task = (id, text, extra = {}) => ({ id, text, confirm: false, createdAt: 1, ...extra });
@@ -20,12 +20,12 @@ const snapshot = {
       task('t101', '旧版目标步骤', { parent: 't100', status: 'failed', finishedAt: 1 })] },
   status: 'duty', tasks: [], parallel: 4, nextCheckAt: 0, dues: {}, idleSupported: true,
 };
-const compiled = await transformAsync(`import {render} from 'solid-js/web';
+const compiled = await transformAsync(`import {render} from '@solidjs/web';
   import EmployeeView from './src/components/EmployeeView';
   window.snapshot = ${JSON.stringify(snapshot)}; window.calls = []; window.urls = [];
   render(() => <EmployeeView />, document.body);`, {
   filename: 'employee-links-check.tsx', configFile: false, babelrc: false,
-  presets: [[solid, { generate: 'dom' }]], parserOpts: { plugins: ['jsx', 'typescript'] },
+  plugins: [[solid, { generate: 'dom' }]], parserOpts: { plugins: ['jsx', 'typescript'] },
 });
 const mocks = {
   store: 'export const state={settings:{relayToken:""},peers:[],currentId:null}; export const openThread=()=>{throw Error("unexpected session navigation")}; export const showToast=text=>window.toast=text;',
@@ -45,7 +45,7 @@ const bundle = await build({
     builder.onLoad({ filter: /.*/, namespace: 'mock' }, ({ path }) => ({ contents: mocks[path], loader: 'js' }));
     builder.onLoad({ filter: /\.tsx$/ }, async ({ path }) => {
       const result = await transformAsync(await readFile(path, 'utf8'), { filename: path, configFile: false, babelrc: false,
-        presets: [[solid, { generate: 'dom' }]], parserOpts: { plugins: ['jsx', 'typescript'] } });
+        plugins: [[solid, { generate: 'dom' }]], parserOpts: { plugins: ['jsx', 'typescript'] } });
       return { contents: result.code, loader: 'ts' };
     });
   } }],

@@ -1,4 +1,4 @@
-import { onCleanup, onMount } from "solid-js";
+import { onSettled } from "solid-js";
 import { backdropPixelRatio, paintCanvasBackdrop, readBackdropTheme, STAR_MAP_UPDATE_MS } from "../canvasTranscript/base";
 
 /**
@@ -7,7 +7,7 @@ import { backdropPixelRatio, paintCanvasBackdrop, readBackdropTheme, STAR_MAP_UP
  */
 export function SkyBackdrop() {
   let canvasEl!: HTMLCanvasElement;
-  onMount(() => {
+  onSettled(() => {
     let resizeTimer: number | undefined;
     let disposed = false;
     const paint = () => {
@@ -47,14 +47,14 @@ export function SkyBackdrop() {
     const starMapTimer = window.setInterval(() => {
       if (!document.hidden) paint();
     }, STAR_MAP_UPDATE_MS);
-    onCleanup(() => {
+    return () => {
       disposed = true;
       if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
       window.removeEventListener("resize", onResize);
       document.removeEventListener("visibilitychange", paint);
       mo.disconnect();
       window.clearInterval(starMapTimer);
-    });
+    };
   });
 
   return (

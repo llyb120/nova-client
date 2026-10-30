@@ -1,4 +1,4 @@
-import { createSignal, onMount, Show } from 'solid-js';
+import { createSignal, onSettled, Show } from 'solid-js';
 import { api } from '../ipc';
 import { defaultWorkspaceLayout, setWorkspaceLayout, workspaceLayout } from '../workspaceLayout';
 
@@ -12,7 +12,7 @@ export default function AppearanceLayoutSettings() {
     const layout = await api.getWindowLayout();
     setWindowLayout(layout); setWidth(layout.width); setHeight(layout.height);
   };
-  onMount(() => { void refresh().catch(error => setError(String(error))); });
+  onSettled(() => { void refresh().catch(error => setError(String(error))); });
   const apply = async (patch: Parameters<typeof api.setWindowLayout>[0]) => {
     setBusy(true); setError('');
     try {

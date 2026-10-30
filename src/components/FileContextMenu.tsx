@@ -1,7 +1,7 @@
 import { message } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { createSignal, onCleanup, onMount, Show } from "solid-js";
-import { Portal } from "solid-js/web";
+import { createSignal, onCleanup, onSettled, Show } from "solid-js";
+import { Portal } from "@solidjs/web";
 import { api } from "../ipc";
 import { state } from "../store";
 import { IconCopy, IconFolder } from "./icons";
@@ -65,7 +65,7 @@ export function createFileContextMenu() {
   const Menu = () => (
     <Show when={menu()} keyed>{entry => {
       let element!: HTMLDivElement;
-      onMount(() => {
+      onSettled(() => {
         const { width, height } = element.getBoundingClientRect();
         element.style.left = `${Math.max(0, Math.min(entry.x, window.innerWidth - width))}px`;
         element.style.top = `${Math.max(0, Math.min(entry.y, window.innerHeight - height))}px`;

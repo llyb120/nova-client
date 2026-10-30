@@ -1,5 +1,5 @@
 import { defineConfig } from "vite";
-import solid from "vite-plugin-solid";
+import solid from "@solidjs/vite-plugin";
 
 // Univer 文档自动断词字典（~4MB，按语言动态 import）换成空模块：loadPattern 拿不到字典会直接 return，
 // 内联的 en-us 仍可用；表格不用断词，文档断词默认关闭。
@@ -12,7 +12,7 @@ const univerHyphenStub = {
 };
 
 export default defineConfig({
-  plugins: [univerHyphenStub, solid({ hot: false })],
+  plugins: [univerHyphenStub, solid({ refresh: false })],
   clearScreen: false,
   server: {
     host: "127.0.0.1",

@@ -9,8 +9,8 @@ const code = transformSync(source.slice(source.indexOf('const historyLoads ='), 
 function fixture(items, getThreadItems) {
   const state = {currentId:'one',items};
   let reopened=0, remembered=0;
-  const deps = {state,api:{getThreadItems},unwrap:value=>value,batch:fn=>fn(),setTimeout,
-    setState:(key,value)=>{state[key]=value;},rememberCurrentThreadSnapshot:()=>remembered++,
+  const deps = {state,api:{getThreadItems},snapshot:value=>value,flush:fn=>fn(),setTimeout,
+    setState:update=>{update(state);},rememberCurrentThreadSnapshot:()=>remembered++,
     staleThreadSnapshots:new Set(),openThread:async()=>reopened++};
   const runtime = new Function(...Object.keys(deps), `let openThreadRequest=1; ${code}
     return {load:ensureHistoryItems,switch:()=>{openThreadRequest++;state.currentId='two';}};`)(...Object.values(deps));
@@ -69,8 +69,8 @@ test('live screenshots release frontend Base64 without waiting for a conversatio
   const state={currentId:'one',items:[original]};
   const code=transformSync(source.slice(source.indexOf('const imageProjectionTickets ='),source.indexOf('function applyUpsert(')),{loader:'ts'}).code;
   let remembered=0;
-  const project=new Function('state','api','unwrap','setState','rememberCurrentThreadSnapshot',`let openThreadRequest=1;${code};return projectLiveImages;`)(
-    state,{getThreadItems:()=>pending.promise},value=>value,(key,value)=>{state[key]=value;},()=>remembered++);
+  const project=new Function('state','api','snapshot','setState','rememberCurrentThreadSnapshot','flush',`let openThreadRequest=1;${code};return projectLiveImages;`)(
+    state,{getThreadItems:()=>pending.promise},value=>value,update=>{update(state);},()=>remembered++,fn=>fn());
   project(original);
   pending.resolve([{...original,images:[{mimeType:'image/png',uri:'file:///C:/persistent.png'}]}]);
   await pending.promise; await Promise.resolve();

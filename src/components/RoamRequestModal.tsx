@@ -22,8 +22,7 @@ export function RoamRequestModal() {
   const [durationMinutes, setDurationMinutes] = createSignal(60);
   const [branches, setBranches] = createSignal<BranchList | null>(null);
 
-  createEffect(() => {
-    const req = current();
+  createEffect(current, req => {
     if (!req) return;
     setPrompt(req.prompt ?? "");
     setFolder(req.folder);

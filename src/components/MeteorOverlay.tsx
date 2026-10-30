@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { batch, createMemo, createSignal, Index, onCleanup, onMount, Show } from "solid-js";
+import { flush, createMemo, createSignal, For, onSettled, Show } from "solid-js";
 import { METEOR_MAX_ANNOTATIONS, METEOR_MAX_TEXT, meteorMonitor, meteorRegion, meteorRequest, type MeteorAnnotation, type MeteorPoint, type MeteorRegion } from "../meteorSelection";
 import "./MeteorOverlay.css";
 
@@ -192,7 +192,7 @@ export default function MeteorOverlay() {
     }
     abortSelection();
     panelObserver?.disconnect();
-    batch(() => {
+    flush(() => {
       setReady(false);
       setContext(value);
       setAnnotations([]);
@@ -278,7 +278,7 @@ export default function MeteorOverlay() {
     queueMicrotask(() => input?.focus({ preventScroll: true }));
   };
 
-  onMount(() => {
+  onSettled(() => {
     const resize = () => setViewport({ width: window.innerWidth, height: window.innerHeight });
     const keydown = (event: KeyboardEvent) => {
       if (event.isComposing) return;
@@ -295,13 +295,6 @@ export default function MeteorOverlay() {
     };
     window.addEventListener("resize", resize);
     window.addEventListener("keydown", keydown);
-    onCleanup(() => {
-      disposed = true;
-      panelObserver?.disconnect();
-      unlistenOpen?.();
-      window.removeEventListener("resize", resize);
-      window.removeEventListener("keydown", keydown);
-    });
     void (async () => {
       let receivedOpen = false;
       const unlisten = await listen<MeteorContext>("meteor:open", (event) => {
@@ -316,18 +309,24 @@ export default function MeteorOverlay() {
     })().catch((cause) => {
       if (!disposed && !ready()) setError(`无法读取屏幕布局：${String(cause)}`);
     });
+    return () => {
+      disposed = true;
+      panelObserver?.disconnect();
+      unlistenOpen?.();
+      window.removeEventListener("resize", resize);
+      window.removeEventListener("keydown", keydown);
+    };
   });
 
   return (
-    <main class="meteor-overlay" aria-label="Meteor 屏幕标注" aria-busy={busy()}>
+    <main class="meteor-overlay" aria-label="Meteor 屏幕标注" aria-busy={busy() ? "true" : "false"}>
       <div
         ref={surface}
-        class="meteor-surface"
-        classList={{ "meteor-surface--selectable": canAdd() }}
+        class={["meteor-surface", { "meteor-surface--selectable": canAdd() }]}
         role="button"
-        tabIndex={0}
+        tabindex={0}
         aria-label="单击添加操作要求，拖动框选屏幕区域，或按 Enter 在屏幕中央添加要求"
-        aria-disabled={!ready() || locked()}
+        aria-disabled={!ready() || locked() ? "true" : "false"}
         onPointerDown={pointerDown}
         onPointerMove={pointerMove}
         onPointerUp={pointerUp}
@@ -335,19 +334,18 @@ export default function MeteorOverlay() {
         onLostPointerCapture={abortSelection}
         onContextMenu={(event) => event.preventDefault()}
       >
-        <Index each={annotations()}>{(item, index) => (
-          <div class={item().region.width === 0 ? "meteor-point" : "meteor-region"}
-            classList={{ "meteor-mark--active": activeIndex() === index }} style={regionStyle(item().region)} aria-hidden="true" />
-        )}</Index>
+        <For keyed={false} each={annotations()}>{(item, index) => (
+          <div class={[item().region.width === 0 ? "meteor-point" : "meteor-region", { "meteor-mark--active": activeIndex() === index }]} style={regionStyle(item().region)} aria-hidden="true" />
+        )}</For>
         <Show when={draftRegion()}>{(region) => (
           <div class={region().width === 0 ? "meteor-point" : "meteor-region"} style={regionStyle(region())} aria-hidden="true" />
         )}</Show>
       </div>
-      <Index each={annotations()}>{(item, index) => (
-        <button type="button" class="meteor-marker" classList={{ "meteor-marker--active": activeIndex() === index }}
+      <For keyed={false} each={annotations()}>{(item, index) => (
+        <button type="button" class={["meteor-marker", { "meteor-marker--active": activeIndex() === index }]}
           style={{ left: `clamp(4px, ${item().region.x / (context()?.width ?? 1) * 100}%, calc(100% - 30px))`, top: `clamp(4px, ${item().region.y / (context()?.height ?? 1) * 100}%, calc(100% - 30px))` }}
           aria-label={`选择屏幕标注 ${index + 1}`} disabled={locked() || dragging()} onClick={() => selectAnnotation(index)}>{index + 1}</button>
-      )}</Index>
+      )}</For>
 
       <Show when={paste() && ready()}>
         <form class="meteor-note" ref={attachPanel} style={pasteStyle()} onSubmit={(event) => { event.preventDefault(); void submitPaste(); }}>
@@ -365,7 +363,7 @@ export default function MeteorOverlay() {
             }}
             placeholder="留空则根据剪贴板和当前输入框自动推断。例如：翻译成英文 / 只粘贴手机号 / 在浏览器里搜索它"
             rows={3}
-            maxLength={METEOR_MAX_TEXT}
+            maxlength={METEOR_MAX_TEXT}
             disabled={locked()}
           />
           <Show when={error()}><p class="meteor-error" role="alert">{error()}</p></Show>
@@ -387,12 +385,12 @@ export default function MeteorOverlay() {
       </header>
       <Show when={annotations().length > 0}>
         <nav class="meteor-annotations" style={listStyle()} aria-label="全部标注">
-          <Index each={annotations()}>{(item, index) => (
-            <button type="button" aria-label={`编辑标注 ${index + 1}`} aria-pressed={activeIndex() === index}
+          <For keyed={false} each={annotations()}>{(item, index) => (
+            <button type="button" aria-label={`编辑标注 ${index + 1}`} aria-pressed={activeIndex() === index ? "true" : "false"}
               disabled={locked() || dragging()} onClick={() => selectAnnotation(index)} title={item().text || "参考区域"}>
               <b>{index + 1}</b><span>{item().text.trim() || "参考区域"}</span>
             </button>
-          )}</Index>
+          )}</For>
         </nav>
       </Show>
 
@@ -411,7 +409,7 @@ export default function MeteorOverlay() {
             aria-describedby="meteor-reference"
           />
           <p id="meteor-reference">实时标注仅指示大致范围；提交时截取并保留所有屏幕的完整截图，连同全部标注{context()?.clipboard ? "与最近剪贴板" : ""}一次提交。未填说明的标注仅作参考。</p>
-          <p classList={{ "meteor-error": textLength() > METEOR_MAX_TEXT }}>{textLength()} / 16000 字 · 最多 20 条标注</p>
+          <p class={{ "meteor-error": textLength() > METEOR_MAX_TEXT }}>{textLength()} / 16000 字 · 最多 20 条标注</p>
           <Show when={error()}><p class="meteor-error" role="alert">{error()}</p></Show>
           <div class="meteor-note-actions">
             <span>{active()?.region.width === 0 ? "已标注位置" : `已框选 ${active()?.region.width} × ${active()?.region.height} px`}</span>

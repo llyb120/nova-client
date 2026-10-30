@@ -5,7 +5,7 @@ import ts from "typescript";
 // Execute the component's actual hover logic with deterministic timers and rectangles.
 const source = readFileSync(new URL("../src/components/SearchSelect.tsx", import.meta.url), "utf8");
 const start = source.indexOf("  const HOVER_INTENT_MS =");
-const end = source.indexOf("  createEffect(() => {", start);
+const end = source.indexOf("  createEffect(", start);
 assert.ok(start >= 0 && end > start, "hover logic extraction boundary changed");
 const { outputText } = ts.transpileModule(`${source.slice(start, end)}
 modelsRef = { getBoundingClientRect: () => ({ left: 200, top: 0, bottom: 320, width: 180 }) };
@@ -128,5 +128,5 @@ assert.equal((source.match(/ref=\{modelsRef\} class="sel-list sel-models" onMous
 assert.match(source, /onMouseEnter=\{\(\) => chooseBackend\(b.id\)\}/);
 assert.match(source, /ref=\{effortRef\} class="sel-list sel-efforts" onMouseEnter=\{cancelIntent\}/);
 assert.match(source, /onMouseDown=\{cancelGroupIntent\}/);
-assert.match(source, /createEffect\(\(\) => \{\s*opened\(\);\s*query\(\);\s*cancelGroupIntent\(\);/);
+assert.match(source, /createEffect\(\(\) => \[opened\(\), query\(\)\], cancelGroupIntent\)/);
 console.log("SearchSelect vendor hover and existing model protection checks passed");

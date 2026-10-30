@@ -3,28 +3,27 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import ts from "typescript";
-import { batch, createComputed, createRoot, createSignal } from "solid-js/dist/solid.js";
+import { createEffect, createRoot, createSignal, createStore, flush, onFlush, reconcile } from "@solidjs/signals";
 
 const source = readFileSync(new URL("../src/store.ts", import.meta.url), "utf8");
 const rates = source.slice(source.indexOf("const RATE_WINDOW_MS"), source.indexOf("function clearDeltaRate"));
 const clear = source.slice(source.indexOf("function clearDeltaRate"), source.indexOf("function clearDeltaRate") + source.slice(source.indexOf("function clearDeltaRate")).indexOf("\n}") + 2);
 const upsert = source.slice(source.indexOf("function applyUpsert"), source.indexOf("function applyUpsert") + source.slice(source.indexOf("function applyUpsert")).indexOf("\n}") + 2);
 let now = 0;
-const state = { currentId: "a", running: { a: true }, items: [] };
+const [state, setState] = createStore({ currentId: "a", running: { a: true }, items: [] });
 const context = vm.createContext({
   performance: { now: () => now }, state,
-  createSignal,
-  reconcile: (value) => value,
-  setState: (_key, index, value) => { state.items[index] = value; },
+  createSignal, reconcile, setState, onFlush,
 });
 vm.runInContext(ts.transpile(`${rates}\n${clear}\n${upsert}`.replace(/export /g, ""), { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), context);
-const run = (code) => vm.runInContext(code, context);
+const run = (code) => flush(() => vm.runInContext(code, context));
 const item = (text) => run(`applyUpsert({ type: "assistant", id: 1, text: ${JSON.stringify(text)} })`);
 let displayed = -1;
 const dispose = createRoot((dispose) => {
-  createComputed(() => { displayed = run('getOutputRate("a")'); });
+  createEffect(() => vm.runInContext('getOutputRate("a")', context), value => { displayed = value; });
   return dispose;
 });
+flush();
 assert.equal(displayed, 0);
 item("a".repeat(200));
 now = 500;
@@ -37,7 +36,7 @@ run('trackDeltaRate("a", 0)');
 assert.equal(displayed, 100, "brief empty window does not erase a burst");
 assert.equal(run('rateWindows.get("a").chars'), 0, "duplicate snapshot adds no output");
 run('trackDeltaRate("a", 200)');
-state.items[0].text += "b".repeat(200); // flushed delta
+flush(() => setState(s => { s.items[0].text += "b".repeat(200); })); // flushed delta
 item(state.items[0].text);
 now = 1500;
 run('trackDeltaRate("a", 0)');
@@ -81,18 +80,13 @@ const timer = init.body.statements.find((node) => ts.isExpressionStatement(node)
 assert.ok(listener && timer);
 for (const backend of ["lyra", "snapshot"]) {
   let receive, tick;
-  const view = { currentId: backend, running: { [backend]: true }, items: [], loadingThread: false };
+  const [view, setView] = createStore({ currentId: backend, running: { [backend]: true }, items: [], loadingThread: false });
   const runtime = vm.createContext({
-    performance: { now: () => now }, state: view, createSignal, batch,
-    reconcile: (value) => value, produce: (update) => update,
-    setState: (key, index, value) => {
-      if (typeof index === "function") index(view[key]);
-      else if (value !== undefined) view[key][index] = value;
-      else view[key] = index;
-    },
+    performance: { now: () => now }, state: view, createSignal, flush, onFlush,
+    reconcile, setState: setView,
     window: { setTimeout: () => 1, clearTimeout() {} },
-    setInterval: (callback) => { tick = callback; },
-    listen: async (_event, callback) => { receive = callback; },
+    setInterval: (callback) => { tick = () => flush(callback); },
+    listen: async (_event, callback) => { receive = event => flush(() => callback(event)); },
     liveUsageByThread: new Map(), threadSnapshots: new Map(), staleThreadSnapshots: new Set(),
     snapshotToolUpdates: undefined,
   });
@@ -101,7 +95,7 @@ for (const backend of ["lyra", "snapshot"]) {
   await vm.runInContext(ts.transpile(code.replace(/export /g, ""), { target: ts.ScriptTarget.ES2022 }), runtime);
   let visibleRate = 0;
   const stop = createRoot((stop) => {
-    createComputed(() => { visibleRate = vm.runInContext(`getOutputRate("${backend}")`, runtime); });
+    createEffect(() => vm.runInContext(`getOutputRate("${backend}")`, runtime), value => { visibleRate = value; });
     return stop;
   });
   now = 10_000;
@@ -134,6 +128,12 @@ for (const backend of ["lyra", "snapshot"]) {
   now += 2000;
   tick();
   assert.equal(visibleRate, 0, `${backend}: tool results add no generated tokens`);
+  receive({ payload: { threadId: backend, ops: [
+    { t: "upsert", item: { type: "assistant", id: 3, text: "first" } },
+    { t: "upsert", item: { type: "assistant", id: 3, text: "first and second" } },
+  ] } });
+  assert.equal(view.items.filter(item => item.id === 3).length, 1, 'batched upserts read the latest draft, not committed state');
+  assert.equal(view.items.find(item => item.id === 3).text, 'first and second');
   stop();
 }
 console.log("output rate checks passed");

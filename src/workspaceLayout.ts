@@ -1,5 +1,4 @@
-import { createEffect, createSignal, on } from "solid-js";
-import { createStore } from 'solid-js/store';
+import { createEffect, createSignal, createStore } from "solid-js";
 
 export type WorkspaceMode = 'layout' | 'files' | 'artifacts' | 'git' | 'terminal';
 export const defaultWorkspaceLayout = { open: false, widthRatio: null as number | null, minimap: true, softWrap: true, mode: 'files' as WorkspaceMode };
@@ -23,9 +22,11 @@ try {
 } catch { /* 存储不可用或损坏时使用默认布局。 */ }
 export const [workspaceLayout, updateWorkspaceLayout] = createStore(initial);
 export function setWorkspaceLayout(patch: Partial<typeof defaultWorkspaceLayout>) {
-  const next = validated({ ...workspaceLayout, ...patch });
-  updateWorkspaceLayout(next);
-  try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* 本次窗口内仍然生效。 */ }
+  updateWorkspaceLayout(draft => {
+    const next = validated({ ...draft, ...patch });
+    Object.assign(draft, next);
+    try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* 本次窗口内仍然生效。 */ }
+  });
 }
 
 export const [homeTerminalCwd, setHomeTerminalCwd] = createSignal("");
@@ -44,7 +45,7 @@ export function createHomeTerminalState(context: () => {
     return !currentId && view !== "knowledge";
   };
   // Track navigation/new-session requests only, never the opened signal.
-  createEffect(on(context, () => setOpened(false)));
+  createEffect(context, () => { setOpened(false); });
   return {
     open: () => available() && opened(),
     toggle: () => { if (available()) setOpened(value => !value); },

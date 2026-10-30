@@ -1,5 +1,5 @@
 /* @refresh reload */
-import { render } from "solid-js/web";
+import { render } from "@solidjs/web";
 // The prewarmed overlay must not load main-window CSS, fonts, session listeners or prompt queues.
 if (new URLSearchParams(window.location.search).get("meteor") === "1") {
   document.documentElement.classList.add("meteor-mode");
@@ -30,7 +30,7 @@ if (new URLSearchParams(window.location.search).get("meteor") === "1") {
     import("@fontsource-variable/inter"), import("@fontsource-variable/jetbrains-mono"),
   ]);
   initTheme();
-  // HomeView reads lastUsed when constructed, before App.onMount/initStore.
+  // HomeView reads lastUsed when constructed, before App.onSettled/initStore.
   await migrateLocalModelSelections();
   render(() => <App />, document.getElementById("root")!);
 }

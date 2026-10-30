@@ -2,8 +2,9 @@ import DOMPurify from "dompurify";
 import { Marked } from "marked";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
-import { createStore, reconcile } from "solid-js/store";
+import { createMemo, createSignal, For, onCleanup, onSettled, Show } from "solid-js";
+import type { JSX } from "@solidjs/web";
+import { createStore, reconcile } from "solid-js";
 import type { PermissionRequest } from "../types";
 import { agentLabel, stripAnsi } from "../utils";
 import TaskbarAssistant, { TaskbarSessions } from "./TaskbarAssistant";
@@ -68,13 +69,13 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
       setMiniApps([]);
     }
   };
-  onMount(() => {
+  onSettled(() => {
     const onStorage = (event: StorageEvent) => {
       if (!event.key || event.key === "nova:miniapps:v1") loadMiniApps();
     };
     window.addEventListener("storage", onStorage);
     loadMiniApps();
-    onCleanup(() => window.removeEventListener("storage", onStorage));
+    return () => window.removeEventListener("storage", onStorage);
   });
   const run = async (action: string) => {
     setError("");
@@ -92,9 +93,9 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
   const [dropHint, setDropHint] = createSignal<{ name: string; outside: boolean } | null>(null);
   // A right click cancels: seen here while the pointer is captured, and by the native ripple tracker outside.
   const cancelDrag = () => { if (drag?.moved) { drag.cancelled = true; setDropHint(null); } };
-  onMount(() => {
+  onSettled(() => {
     const off = listen("taskbar-bubble:drag-cancel", cancelDrag);
-    onCleanup(() => void off.then(remove => remove()));
+    return () => { void off.then(remove => remove()); };
   });
   const outsideCard = (event: PointerEvent) => {
     const r = card!.getBoundingClientRect();
@@ -137,7 +138,7 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
       <nav class="tb-tabs" role="tablist" aria-label="蝴蝶面板" aria-orientation="vertical">
         <For each={TABS}>
           {([id, label, d]) => (
-            <button id={`tb-tab-${id}`} role="tab" aria-controls={`tb-pane-${id}`} aria-selected={props.tab === id} tabIndex={props.tab === id ? 0 : -1} classList={{ active: props.tab === id, rec: id === "quick" && rec() }} onClick={() => props.setTab(id)} onKeyDown={(event) => {
+            <button id={`tb-tab-${id}`} role="tab" aria-controls={`tb-pane-${id}`} aria-selected={props.tab === id ? "true" : "false"} tabindex={props.tab === id ? 0 : -1} class={{ active: props.tab === id, rec: id === "quick" && rec() }} onClick={() => props.setTab(id)} onKeyDown={(event) => {
               if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
               event.preventDefault();
               const index = TABS.findIndex(([tab]) => tab === id);
@@ -173,7 +174,7 @@ function Panel(props: { card?: Card; data: PanelData; tab: Tab; setTab: (tab: Ta
           <div class="tb-grid">
             <For each={tiles}>
               {(t) => (
-                <button class="tb-tile" classList={{ hot: t.hot() }} onClick={() => void run(t.action)}>
+                <button class={["tb-tile", { hot: t.hot() }]} onClick={() => void run(t.action)}>
                   {icon(t.icon())}
                   <span>{t.label()}</span>
                 </button>
@@ -295,8 +296,7 @@ function Ask(props: { req: Permission; onDone: () => void }) {
                 <For each={q.options}>
                   {(o) => (
                     <button
-                      class="tb-choice"
-                      classList={{ selected: picked()[i()]?.includes(o.label) }}
+                      class={["tb-choice", { selected: picked()[i()]?.includes(o.label) }]}
                       onClick={() => pick(i(), o.label, Boolean(q.multiple))}
                     >
                       <span>{o.label}</span>
@@ -454,7 +454,7 @@ export default function TaskbarBubble() {
     if (next.captureError) setCaptureError(next.captureError);
     fresh = false;
     // Keyed: a refresh updates the current card in place.
-    setCards(reconcile(next.cards, { key: "key" }));
+    setCards(reconcile(next.cards, "key"));
     // Keep in-progress answers: only rebuild cards when the set of requests changes.
     const keys = (list: Permission[]) => list.map((p) => p.requestKey).join("\n");
     if (keys(next.permissions) !== keys(permissions())) setPermissions(next.permissions);
@@ -482,7 +482,7 @@ export default function TaskbarBubble() {
     if (!permissions().length && live) dismiss(live);
   };
 
-  onMount(() => {
+  onSettled(() => {
     const observer = new ResizeObserver(() => void place());
     observer.observe(shell);
     const keys = (e: KeyboardEvent) => e.key === "Escape" && hide();
@@ -504,19 +504,19 @@ export default function TaskbarBubble() {
         setActive(false);
         setDragging(false);
         setCaptureError("");
-        setCards([]);
+        setCards(s => { s.length = 0; });
       }),
     ];
     // Listen before the first place(): a click landing in between is then either seen by
     // place() or delivered as an open event, never lost.
     void Promise.all(offs).then(() => open());
-    onCleanup(() => {
+    return () => {
       ++revision;
       observer.disconnect();
       window.removeEventListener("keydown", keys);
       clearInterval(timer);
       offs.forEach((p) => void p.then((off) => off()));
-    });
+    };
   });
 
   return (
@@ -618,13 +618,13 @@ export function TaskbarAsk() {
     await new Promise(requestAnimationFrame);
     place();
   };
-  onMount(() => {
+  onSettled(() => {
     const observer = new ResizeObserver(place);
     observer.observe(shell);
     const off = listen("taskbar-ask:refresh", () => void load());
     const timer = window.setInterval(() => void load(), 1000);
     void load();
-    onCleanup(() => { observer.disconnect(); clearInterval(timer); void off.then((f) => f()); });
+    return () => { observer.disconnect(); clearInterval(timer); void off.then((f) => f()); };
   });
   return (
     <div class="tb-ask-shell" ref={shell}>

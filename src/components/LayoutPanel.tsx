@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, lazy, onCleanup, Show, Suspense } from "solid-js";
+import { createEffect, createMemo, createSignal, For, lazy, onCleanup, Show, Loading } from "solid-js";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   layoutApi, layoutRefreshing, layoutState, layoutSrcdoc, layoutTabOpen, loadLayouts, presetsOpen, setPresetsOpen, showLayouts,
@@ -13,14 +13,13 @@ const LayoutPresetsView = lazy(() => import("./LayoutPresetsView"));
  * 会话里新增了看板（选择预设）时自动打开侧栏的看板页。
  */
 export function LayoutBack(props: { threadId: string }) {
-  createEffect(() => void loadLayouts(props.threadId));
+  createEffect(() => props.threadId, id => { void loadLayouts(id); });
   const count = () => layoutState.byThread[props.threadId]?.layouts.length ?? 0;
   let seen: number | undefined;
-  createEffect(() => {
-    const n = count();
+  createEffect(() => [count(), !!layoutState.byThread[props.threadId]] as const, ([n, loaded]) => {
     // 首次载入只记录，不自动打开；之后增加才打开。
     if (seen !== undefined && n > seen) showLayouts();
-    if (layoutState.byThread[props.threadId]) seen = n;
+    if (loaded) seen = n;
   });
   return (
     <Show when={count() > 0 && !layoutTabOpen()}>
@@ -39,7 +38,7 @@ export function LayoutPanel(props: { threadId: string }) {
   const layouts = () => info()?.layouts ?? [];
   const presets = () => layoutState.presets.filter((p) => p.html);
 
-  createEffect(() => void loadLayouts(props.threadId));
+  createEffect(() => props.threadId, id => { void loadLayouts(id); });
 
   const act = (run: () => Promise<unknown>) => void run().catch(() => {});
 
@@ -48,7 +47,7 @@ export function LayoutPanel(props: { threadId: string }) {
   const onVisibility = () => setPageVisible(!document.hidden);
   document.addEventListener("visibilitychange", onVisibility);
   onCleanup(() => document.removeEventListener("visibilitychange", onVisibility));
-  createEffect(() => act(() => layoutApi.viewing(pageVisible() && !presetsOpen() ? props.threadId : null)));
+  createEffect(() => pageVisible() && !presetsOpen() ? props.threadId : null, id => act(() => layoutApi.viewing(id)));
   onCleanup(() => act(() => layoutApi.viewing(null)));
 
   return (
@@ -56,7 +55,7 @@ export function LayoutPanel(props: { threadId: string }) {
         <div class="layout-bar">
           <Show when={!presetsOpen()} fallback={<span class="layout-bar-title">看板配置</span>}>
             <div class="layout-add">
-              <button type="button" class="layout-icon-btn" title="添加看板" aria-expanded={menu()} onClick={() => setMenu(!menu())}>＋ 添加看板</button>
+              <button type="button" class="layout-icon-btn" title="添加看板" aria-expanded={menu() ? "true" : "false"} onClick={() => setMenu(!menu())}>＋ 添加看板</button>
               <Show when={menu()}>
                 <div class="layout-menu" onMouseLeave={() => setMenu(false)}>
                   <For each={presets()} fallback={<div class="layout-menu-head">还没有预设，先在「配置」里设计一个</div>}>
@@ -71,13 +70,13 @@ export function LayoutPanel(props: { threadId: string }) {
           <Show when={!presetsOpen() && layoutRefreshing(props.threadId)}>
             <span class="layout-refreshing" role="status"><span class="layout-spinner small" />正在根据会话更新…</span>
           </Show>
-          <button type="button" class="layout-icon-btn" classList={{ on: presetsOpen() }} aria-pressed={presetsOpen()}
+          <button type="button" class={["layout-icon-btn", { on: presetsOpen() }]} aria-pressed={presetsOpen() ? "true" : "false"}
             title={presetsOpen() ? "返回本会话的看板" : "设计和管理看板预设"} onClick={() => setPresetsOpen(!presetsOpen())}>
             {presetsOpen() ? "← 返回" : "⚙ 配置"}
           </button>
         </div>
         <Show when={presetsOpen()}>
-          <Suspense><LayoutPresetsView /></Suspense>
+          <Loading><LayoutPresetsView /></Loading>
         </Show>
         <div class="layout-cols" style={{ display: presetsOpen() ? "none" : undefined }}>
           <For each={layouts()} fallback={
@@ -105,7 +104,7 @@ function LayoutColumn(props: { threadId: string; layout: LayoutItem }) {
   // 数据变化时直接推送，页面每次就绪时再无条件推送一次（推给未加载完的文档只会被丢弃）。
   const srcdoc = createMemo(() => layoutSrcdoc(props.layout.html));
   const post = () => frame?.contentWindow?.postMessage({ type: "nova-layout-data", data: JSON.parse(JSON.stringify(props.layout.data)) }, "*");
-  createEffect(post);
+  createEffect(() => JSON.stringify(props.layout.data), post);
   const postTheme = () => frame?.contentWindow?.postMessage({ type: "nova-layout-theme", theme: themePayload() }, "*");
   const onMessage = (event: MessageEvent) => {
     if (event.source === frame?.contentWindow && event.data?.type === "nova-layout-ready") { postTheme(); post(); }
@@ -119,7 +118,7 @@ function LayoutColumn(props: { threadId: string; layout: LayoutItem }) {
   };
 
   return (
-    <div class="layout-col" classList={{ refreshing: layoutRefreshing(props.threadId) }} aria-busy={layoutRefreshing(props.threadId)}>
+    <div class={["layout-col", { refreshing: layoutRefreshing(props.threadId) }]} aria-busy={layoutRefreshing(props.threadId) ? "true" : "false"}>
       <div class="layout-col-head">
         <Show when={renaming()} fallback={
           <span class="layout-col-name" title="双击重命名" onDblClick={() => setRenaming(true)}>{props.layout.name}</span>
@@ -133,7 +132,7 @@ function LayoutColumn(props: { threadId: string; layout: LayoutItem }) {
             onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") setRenaming(false); }} />
         </Show>
         <div class="layout-add">
-          <button type="button" class="layout-icon-btn" aria-label="看板操作" aria-expanded={more()} onClick={() => setMore(!more())}>⋯</button>
+          <button type="button" class="layout-icon-btn" aria-label="看板操作" aria-expanded={more() ? "true" : "false"} onClick={() => setMore(!more())}>⋯</button>
           <Show when={more()}>
             <div class="layout-menu right" onMouseLeave={() => setMore(false)}>
               <button type="button" onClick={() => { setMore(false); setRenaming(true); }}>重命名</button>

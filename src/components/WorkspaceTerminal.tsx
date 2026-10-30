@@ -1,4 +1,4 @@
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createSignal, For, onSettled, Show, untrack } from "solid-js";
 import { attachTerminal, closeTerminalTab, createTerminalTab, getTerminalGroup, type TerminalTab } from "../terminalSessions";
 import { IconX } from "./icons";
 import "@xterm/xterm/css/xterm.css";
@@ -6,11 +6,11 @@ import "./WorkspaceTerminal.css";
 
 function TerminalSurface(props: { tab: TerminalTab }) {
   let host!: HTMLDivElement;
-  onMount(() => onCleanup(attachTerminal(props.tab, host)));
+  onSettled(() => attachTerminal(props.tab, host));
   return <div ref={host} class="workspace-terminal-surface" role="tabpanel" aria-label={props.tab.title()} />;
 }
 export default function WorkspaceTerminal(props: { threadId?: string; cwd: string }) {
-  const group = getTerminalGroup(props.threadId ? `thread:${props.threadId}` : "home");
+  const group = untrack(() => getTerminalGroup(props.threadId ? `thread:${props.threadId}` : "home"));
   const [error, setError] = createSignal("");
   const active = () => group.tabs().find(tab => tab.id === group.activeId());
   const statusLabel = () => {
@@ -26,7 +26,7 @@ export default function WorkspaceTerminal(props: { threadId?: string; cwd: strin
     catch (error) { setError(String(error)); }
   };
   const close = (tab: TerminalTab) => { void closeTerminalTab(group, tab).catch(error => setError(String(error))); };
-  onMount(() => { if (!group.tabs().length) add(); });
+  onSettled(() => { if (!group.tabs().length) add(); });
   return <section class="workspace-terminal" aria-label="交互式终端">
     <div class="workspace-toolbar">
       <div class="workspace-tabs" role="tablist" aria-label="终端标签页" onKeyDown={event => {
@@ -38,8 +38,8 @@ export default function WorkspaceTerminal(props: { threadId?: string; cwd: strin
           : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
         group.setActiveId(tabs[next].id);
       }}>
-        <For each={group.tabs()}>{tab => <div class="workspace-tab" classList={{ active: tab.id === group.activeId() }}>
-          <button role="tab" aria-selected={tab.id === group.activeId()} tabindex={tab.id === group.activeId() ? 0 : -1}
+        <For each={group.tabs()}>{tab => <div class={["workspace-tab", { active: tab.id === group.activeId() }]}>
+          <button role="tab" aria-selected={tab.id === group.activeId() ? "true" : "false"} tabindex={tab.id === group.activeId() ? 0 : -1}
             title={`${tab.title()} · ${tab.cwd}`} onClick={() => group.setActiveId(tab.id)}>
             <span>{tab.title()}</span>
           </button>

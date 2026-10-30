@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onSettled, Show, untrack } from "solid-js";
 import { rememberPromptDraft, takePromptDraft, saveSessionDraft, takeSessionDraft } from "../promptDraft";
 import {
   promptHistory as globalPromptHistory,
@@ -45,7 +45,7 @@ import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
 
 export function Composer() {
-  let draftThreadId = state.currentId;
+  let draftThreadId = untrack(() => state.currentId);
   const initialDraft = takeSessionDraft(draftThreadId);
   const [text, setText] = createSignal(initialDraft?.text ?? "");
   const [cursor, setCursor] = createSignal(0);
@@ -77,10 +77,7 @@ export function Composer() {
     if (resizeFrame === undefined) resizeFrame = requestAnimationFrame(flushInputResize);
   };
 
-  createEffect(() => {
-    text();
-    resizeInput();
-  });
+  createEffect(text, resizeInput);
 
   const insertShortcutText = (snippet: string, mayFocus: boolean): boolean => {
     if (!textareaRef) return false;
@@ -109,13 +106,13 @@ export function Composer() {
   });
 
   const attach = createImageAttachments({ enableFileDrop: true });
-  attach.set(initialDraft?.images ?? []);
+  onSettled(() => { attach.set(initialDraft?.images ?? []); });
 
   const running = () => !!(state.currentId && state.running[state.currentId]);
   // 自动模式场景切换只改本轮会话模型、不落线程配置；选择器跟随最近一轮实际使用的模型（含轮次结束后），
   // 直到用户手动选择或开始新一轮。
   const [picked, setPicked] = createSignal(false);
-  createEffect(() => { state.currentId; running(); setPicked(false); });
+  createEffect(() => [state.currentId, running()], () => { setPicked(false); });
   const shownModel = () => {
     const live = picked() ? "" : liveModel(state.items);
     return !live || state.model === live || state.model.startsWith(`${live}/`) ? state.model : live;
@@ -135,11 +132,11 @@ export function Composer() {
     }
     return null;
   });
-  createEffect(() => {
-    if (runStartTs() === null) return;
+  createEffect(runStartTs, started => {
+    if (started === null) return;
     setRunClock(Date.now());
     const timer = window.setInterval(() => setRunClock(Date.now()), 1_000);
-    onCleanup(() => window.clearInterval(timer));
+    return () => window.clearInterval(timer);
   });
   const runElapsed = () => {
     const startedAt = runStartTs();
@@ -184,12 +181,12 @@ export function Composer() {
   };
   const guestModelSource = (k: AgentKind) => guestModels()?.options[k] ?? null;
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
-  createEffect(() => {
-    if (!usesPeerModels()) void ensureModelOptions(state.agentKind);
+  createEffect(() => usesPeerModels() ? null : state.agentKind, kind => {
+    if (kind) void ensureModelOptions(kind);
   });
   // 漫游 guest：确保已拉取对端模型列表
-  createEffect(() => {
-    if (usesPeerModels() && state.roamingPeer) ensurePeerModels(state.roamingPeer);
+  createEffect(() => usesPeerModels() ? state.roamingPeer : null, peer => {
+    if (peer) ensurePeerModels(peer);
   });
   const updateSlashState = (el = textareaRef, allowOpen = false) => {
     if (!el) return;
@@ -218,19 +215,17 @@ export function Composer() {
     return getSlashSuggestions(state.agentKind, state.slashCommands[state.agentKind], query);
   });
 
-  createEffect(() => {
-    const count = slashSuggestions().length;
-    if (activeSlashIndex() >= count) setActiveSlashIndex(Math.max(0, count - 1));
+  createEffect(() => [slashSuggestions().length, activeSlashIndex()] as const, ([count, index]) => {
+    if (index >= count) setActiveSlashIndex(Math.max(0, count - 1));
   });
 
-  createEffect(() => {
-    const count = globalPromptHistory().length;
-    if (activeHistoryIndex() >= count) setActiveHistoryIndex(Math.max(0, count - 1));
-    if (count === 0 && historyOpen()) setHistoryOpen(false);
+  createEffect(() => [globalPromptHistory().length, activeHistoryIndex(), historyOpen()] as const, ([count, index, open]) => {
+    if (index >= count) setActiveHistoryIndex(Math.max(0, count - 1));
+    if (count === 0 && open) setHistoryOpen(false);
   });
 
   // 打开已有会话时，把后端保存的用户输入并入全局历史，供新会话页使用。
-  createEffect(on(
+  createEffect(
     () => [state.currentId, state.loadingThread] as const,
     ([currentId, loadingThread]) => {
       // 缓存未命中时 currentId 会先于快照切换；等快照提交后只扫描一次，
@@ -242,17 +237,15 @@ export function Composer() {
         }
       }
     },
-  ));
+  );
 
-  createEffect(() => {
-    activeSlashIndex();
+  createEffect(activeSlashIndex, () => {
     slashMenuRef
       ?.querySelector(".slash-item.active")
       ?.scrollIntoView({ block: "nearest" });
   });
 
-  createEffect(() => {
-    activeHistoryIndex();
+  createEffect(activeHistoryIndex, () => {
     historyMenuRef
       ?.querySelector(".prompt-history-item.active")
       ?.scrollIntoView({ block: "nearest" });
@@ -265,6 +258,10 @@ export function Composer() {
     if (!slashOpen && !historyIsOpen) return;
     void slashSuggestions().length;
     void globalPromptHistory().length;
+    return { slashOpen, historyIsOpen };
+  }, menus => {
+    if (!menus) return;
+    const { slashOpen, historyIsOpen } = menus;
     const sync = () => {
       if (slashOpen) fitSlashMenuHeight(slashMenuRef);
       if (historyIsOpen) fitSlashMenuHeight(historyMenuRef, { maxHeight: 300 });
@@ -274,29 +271,27 @@ export function Composer() {
     const ro = host instanceof HTMLElement ? new ResizeObserver(sync) : undefined;
     if (host instanceof HTMLElement) ro?.observe(host);
     window.addEventListener("resize", sync);
-    onCleanup(() => {
+    return () => {
       cancelAnimationFrame(frame);
       ro?.disconnect();
       window.removeEventListener("resize", sync);
-    });
+    };
   });
 
   createEffect(
-    on(
-      () => state.currentId,
-      (currentId, previousId) => {
-        if (!currentId || previousId === undefined || currentId === previousId) return;
-        saveSessionDraft(draftThreadId, text(), attach.images());
-        rememberPromptDraft(text(), attach.images());
-        draftThreadId = currentId;
-        const draft = takeSessionDraft(currentId);
-        setText(draft?.text ?? "");
-        setCursor(draft?.text.length ?? 0);
-        setSlashStart(null);
-        setHistoryOpen(false);
-        attach.set(draft?.images ?? []);
-      },
-    ),
+    () => state.currentId,
+    (currentId, previousId) => {
+      if (!currentId || previousId === undefined || currentId === previousId) return;
+      saveSessionDraft(draftThreadId, text(), attach.images());
+      rememberPromptDraft(text(), attach.images());
+      draftThreadId = currentId;
+      const draft = takeSessionDraft(currentId);
+      setText(draft?.text ?? "");
+      setCursor(draft?.text.length ?? 0);
+      setSlashStart(null);
+      setHistoryOpen(false);
+      attach.set(draft?.images ?? []);
+    },
   );
 
   onCleanup(() => {
@@ -536,8 +531,7 @@ export function Composer() {
           <For each={currentQueuedPrompts()}>
             {(item, index) => (
               <div
-                class="prompt-queue-item"
-                classList={{ failed: failedQueueIds().has(item.id) }}
+                class={["prompt-queue-item", { failed: failedQueueIds().has(item.id) }]}
               >
                 <span class="prompt-queue-index">{index() + 1}</span>
                 <span class="prompt-queue-text" title={item.text}>{item.text || "附件"}</span>
@@ -573,8 +567,7 @@ export function Composer() {
         </div>
       </Show>
     <div
-      class="composer"
-      classList={{ "is-dragging": attach.dragging() }}
+      class={["composer", { "is-dragging": attach.dragging() }]}
     >
       <noteFlow.Notes />
       <ImageAttachmentStrip images={attach.images()} onRemove={attach.remove} />
@@ -591,7 +584,7 @@ export function Composer() {
               {(item, index) => (
                 <button
                   type="button"
-                  classList={{ "slash-item": true, active: index() === activeSlashIndex() }}
+                  class={{ "slash-item": true, active: index() === activeSlashIndex() }}
                   onMouseEnter={() => setActiveSlashIndex(index())}
                   onMouseDown={(e) => {
                     e.preventDefault();
@@ -614,7 +607,7 @@ export function Composer() {
             {(item, index) => (
               <button
                 type="button"
-                classList={{ "prompt-history-item": true, active: index() === activeHistoryIndex() }}
+                class={{ "prompt-history-item": true, active: index() === activeHistoryIndex() }}
                 onMouseEnter={() => setActiveHistoryIndex(index())}
                 onMouseDown={(e) => {
                   e.preventDefault();
@@ -678,7 +671,7 @@ export function Composer() {
           </span>
         </Show>
         <div class="composer-actions">
-          <span class="composer-stop-slot" classList={{ hidden: !running() }}>
+          <span class={["composer-stop-slot", { hidden: !running() }]}>
             <button
               class="composer-btn stop"
               onClick={requestStop}

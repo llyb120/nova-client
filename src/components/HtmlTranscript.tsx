@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createSignal, onCleanup, onMount, untrack } from "solid-js";
+import { For, Show, createEffect, createSignal, flush, onCleanup, onSettled, untrack } from "solid-js";
 import { optimisticHandoffs, toggleExpanded, traceThreadSwitchLayoutDone } from "../store";
 import { promptDisplayOf } from "../promptDisplay";
 import { processSegments, splitTurnBody } from "../processDisplay";
@@ -72,7 +72,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   let keepBottom = true;
   let lastTop = 0;
   let expectedTop: number | undefined;
-  let threadId = props.threadId;
+  let threadId = untrack(() => props.threadId);
   let previous: Group[] = [];
   let jump: number | null = null;
   let focused: number | null = null;
@@ -199,7 +199,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     unmeasured.clear();
     for (const [index, height] of measurements) if (height > 0 && rows.has(index)) changed = heights.set(index, height) || changed;
     measurements.clear();
-    if (changed) setRevision(value => value + 1);
+    if (changed) flush(() => setRevision(value => value + 1));
     if (jump !== null) {
       setTop(offset(jump) - 20);
       if (rows.has(jump)) jump = null;
@@ -231,7 +231,9 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       firstLayoutQueued = false;
       if (disposed || generation !== imageGeneration) return;
       cancelAnimationFrame(frame);
-      layout();
+      // Solid 2 batches DOM updates: mount rows before measuring and capturing the image gate.
+      flush();
+      flush(layout);
       // Cold images and history still hydrating must contribute their real content before the first
       // content frame; otherwise a switch paints placeholders, then jumps. Only this initial window is
       // awaited (later rows never extend it), and a failed/slow load cannot block a session indefinitely.
@@ -279,6 +281,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   }
 
   function scrollToGroup(index: number) {
+    flush();
     if (!Number.isInteger(index) || !props.groups[index]) return;
     releaseSearch();
     keepBottom = false;
@@ -290,6 +293,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   }
 
   function revealMatch(itemId: number, query: string) {
+    flush();
     const index = props.groups.findIndex(g => g.user?.id === itemId || g.body.some(it => it.id === itemId));
     const group = props.groups[index];
     if (!group || !query) return;
@@ -356,9 +360,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     return value === undefined ? null : Number(value);
   };
 
-  createEffect(() => {
-    const groups = props.groups;
-    const id = props.threadId;
+  createEffect(() => [props.groups, props.threadId] as const, ([groups, id]) => {
     const handoff = !!id && !!threadId && optimisticHandoffs.get(id) === threadId;
     const firstContent = (id !== threadId && !handoff) || (!previous.length && groups.length > 0);
     if (id !== threadId && !handoff) {
@@ -403,7 +405,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     });
   });
 
-  onMount(() => {
+  onSettled(() => {
     observer = new ResizeObserver(entries => {
       let viewportChanged = false;
       for (const entry of entries) {
@@ -430,7 +432,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
         for (const [index, row] of rows) heights.set(index, measurements.get(index) ?? row.getBoundingClientRect().height);
         measurements.clear();
         unmeasured.clear();
-        setRevision(value => value + 1);
+        flush(() => setRevision(value => value + 1));
         if (!keepBottom) setTop(offset(anchor) + Math.min(inset, heights.get(anchor) - 1));
         viewportChanged = true;
       }
@@ -496,13 +498,13 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     });
     updateWindow(host.scrollTop);
     initialLayout();
-    onCleanup(() => {
+    return () => {
       document.removeEventListener("selectionchange", selectionChanged);
       document.removeEventListener("focusin", focusChanged);
       host.removeEventListener("click", browseDetail, true);
       host.removeEventListener("wheel", wheel);
       host.removeEventListener("markdown-anchor", markdownAnchor);
-    });
+    };
   });
 
   onCleanup(() => {
@@ -516,8 +518,12 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   });
 
   function Row(rowProps: { index: number }) {
+    const rowThreadId = untrack(() => props.threadId);
+    const loadItems = untrack(() => props.loadItems);
+    // A switching row can see the next session's props before its old scope is disposed.
+    const loadRowItems = loadItems && ((ids: number[]) => rowThreadId === props.threadId ? loadItems(ids) : Promise.resolve());
     let element!: HTMLDivElement;
-    onMount(() => {
+    onSettled(() => {
       rows.set(rowProps.index, element);
       rowIndices.set(element, rowProps.index);
       unmeasured.add(rowProps.index);
@@ -544,7 +550,7 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       style={{ transform: `translateY(${(revision(), offset(rowProps.index))}px)` }}>
       <Show when={props.groups[rowProps.index]}>
         <HtmlTurn group={props.groups[rowProps.index]} running={props.running} readOnly={props.readOnly}
-          preview={props.preview} threadId={props.threadId} loadItems={props.loadItems}
+          preview={props.preview} threadId={props.threadId} loadItems={loadRowItems}
           onReturnToCurrent={props.onReturnToCurrent}
           onBrowseDetail={() => { if (keepBottom) return; keepBottom = false; props.onBrowseDetail?.(); schedule(); }} />
       </Show>
@@ -553,9 +559,9 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
 
   return <div ref={host} class="html-transcript" tabindex="0" role="region" aria-label="会话记录" onScroll={onScroll}>
     <Show when={windowLoading()}><div class="html-transcript-loading" role="status">正在加载会话…</div></Show>
-    <div ref={space} class="html-transcript-space" aria-busy={windowLoading()}
+    <div ref={space} class="html-transcript-space" aria-busy={windowLoading() ? "true" : "false"}
       style={{ height: `${(revision(), heights.total + TOP + BOTTOM)}px`, visibility: windowLoading() ? "hidden" : undefined }}>
-      <Show when={props.groups.length} fallback={<div class="html-transcript-empty" role="status" aria-busy={props.loading}>{props.loading ? "正在加载会话…" : props.emptyHint}</div>}>
+      <Show when={props.groups.length} fallback={<div class="html-transcript-empty" role="status" aria-busy={props.loading ? "true" : "false"}>{props.loading ? "正在加载会话…" : props.emptyHint}</div>}>
         <Show when={session()} keyed><For each={visible()}>{index => <Row index={index} />}</For></Show>
       </Show>
     </div>

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { transformSync } from "esbuild";
-import { createEffect, createRoot, createSignal, on, onCleanup } from "solid-js/dist/solid.js";
+import { createEffect, createRoot, createSignal, flush, onCleanup, untrack } from "@solidjs/signals";
 
 const read = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
 const module = { exports: {} };
@@ -36,7 +36,7 @@ test("Composer restores on switch and remount, clears sent drafts, and saves und
   const start = source.lastIndexOf("  createEffect(", source.indexOf("saveSessionDraft(draftThreadId"));
   const lifecycle = source.slice(start, source.indexOf("  const currentQueuedPrompts"));
   const mount = new Function("state", "api", `
-    const { createEffect, createSignal, on, onCleanup, saveSessionDraft, takeSessionDraft, rememberPromptDraft } = api;
+    const { createEffect, createSignal, untrack, onCleanup, saveSessionDraft, takeSessionDraft, rememberPromptDraft } = api;
     ${init}
     const [images, set] = createSignal(initialDraft?.images ?? []);
     const attach = { images, set };
@@ -46,28 +46,29 @@ test("Composer restores on switch and remount, clears sent drafts, and saves und
   `);
   const [currentId, setCurrentId] = createSignal("first");
   const state = { get currentId() { return currentId(); } };
-  const api = { ...drafts, createEffect, createSignal, on, onCleanup };
+  const api = { ...drafts, createEffect, createSignal, untrack, onCleanup };
   let composer, dispose;
   createRoot((cleanup) => { dispose = cleanup; composer = mount(state, api); });
+  flush();
   composer.setText("first draft");
   composer.attach.set([{ name: "file.txt", mimeType: "text/plain", data: "xyz" }]);
-  setCurrentId("second");
+  setCurrentId("second"); flush();
   assert.equal(composer.text(), "");
   composer.setText("second draft");
-  setCurrentId("first");
+  setCurrentId("first"); flush();
   assert.equal(composer.text(), "first draft");
   assert.equal(composer.attach.images()[0].name, "file.txt");
   composer.setText("");
   composer.attach.set([]);
-  setCurrentId("second");
+  setCurrentId("second"); flush();
   assert.equal(composer.text(), "second draft");
-  setCurrentId("first");
+  setCurrentId("first"); flush();
   assert.equal(composer.text(), "");
   composer.setText("survives unmount");
-  setCurrentId(null);
+  setCurrentId(null); flush();
   dispose();
   assert.equal(drafts.takeSessionDraft(null), null);
-  setCurrentId("first");
+  setCurrentId("first"); flush();
   createRoot((cleanup) => { dispose = cleanup; composer = mount(state, api); });
   assert.equal(composer.text(), "survives unmount");
   dispose();

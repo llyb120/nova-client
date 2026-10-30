@@ -1,4 +1,4 @@
-import { createSignal, For, onMount, Show } from "solid-js";
+import { createSignal, For, onSettled, Show } from "solid-js";
 import { markAchievementsSeen, refreshAchievements, state } from "../store";
 import { AchievementBadge } from "./AchievementBadge";
 import { IconTrophy, IconX } from "./icons";
@@ -16,7 +16,7 @@ export function AchievementsModal(props: { onClose: () => void }) {
     }
   };
 
-  onMount(() => {
+  onSettled(() => {
     markAchievementsSeen();
     if (!state.achievementsLoaded) {
       void refreshAchievements().then(() => {

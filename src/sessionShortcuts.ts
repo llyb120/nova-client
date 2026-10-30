@@ -1,4 +1,4 @@
-import { onCleanup, onMount } from "solid-js";
+import { onSettled } from "solid-js";
 import { api } from "./ipc";
 import { ALL_AGENT_KINDS, state } from "./store";
 import type { AgentKind, SessionShortcut, SessionShortcutAction } from "./types";
@@ -227,8 +227,8 @@ export function mountSessionShortcuts(options: {
     }
   };
 
-  onMount(() => {
+  onSettled(() => {
     window.addEventListener("keydown", onKeyDown, true);
-    onCleanup(() => window.removeEventListener("keydown", onKeyDown, true));
+    return () => window.removeEventListener("keydown", onKeyDown, true);
   });
 }

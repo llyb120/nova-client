@@ -1,5 +1,4 @@
-import { createSignal, untrack } from "solid-js";
-import { createStore, reconcile } from "solid-js/store";
+import { createSignal, createStore, reconcile, untrack } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
@@ -43,8 +42,14 @@ async function fetchState(threadId: string) {
     const got = await cmd<ThreadLayouts & { presets: LayoutPreset[] }>("get", { threadId });
     // 较早发出的读取若晚于数据事件返回，会把看板数据回退成旧值，只认最新一次。
     if (seq !== fetchSeq[threadId]) return;
-    if (threadId) setLayoutState("byThread", threadId, reconcile({ active: got.active, layouts: got.layouts }));
-    setLayoutState("presets", reconcile(got.presets));
+    setLayoutState(draft => {
+      if (threadId) {
+        const next = { active: got.active, layouts: got.layouts };
+        if (draft.byThread[threadId]) reconcile(next)(draft.byThread[threadId]);
+        else draft.byThread[threadId] = next;
+      }
+      reconcile(got.presets)(draft.presets);
+    });
   } catch {
     // 布局是增强能力，读取失败不打扰会话。
   }
@@ -85,8 +90,11 @@ export function initLayoutEvents() {
       const index = layoutState.byThread[threadId]?.layouts.findIndex((l) => l.id === layoutId) ?? -1;
       if (index < 0) return void fetchState(threadId);
       fetchSeq[threadId] = (fetchSeq[threadId] ?? 0) + 1; // 作废还在路上的旧读取
-      setLayoutState("byThread", threadId, "layouts", index, "data", reconcile(data ?? {}));
-      if (active) setLayoutState("byThread", threadId, "active", active);
+      setLayoutState(draft => {
+        const thread = draft.byThread[threadId];
+        reconcile(data ?? {})(thread.layouts[index].data);
+        if (active) thread.active = active;
+      });
     } else if (kind === "presets") {
       void fetchState("");
     } else if (threadId) {

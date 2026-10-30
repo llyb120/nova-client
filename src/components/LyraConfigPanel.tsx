@@ -1,6 +1,6 @@
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { createMemo, createSignal, For, Index, onCleanup, onMount, Show } from "solid-js";
-import { createStore, produce, reconcile, unwrap } from "solid-js/store";
+import { createMemo, createSignal, flush, For, onCleanup, onSettled, Show } from "solid-js";
+import { createStore, reconcile, snapshot } from "solid-js";
 import { api } from "../ipc";
 import {
   APIS,
@@ -63,8 +63,8 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () 
       setWaiting(false);
     }
   };
-  onMount(async () => {
-    if (!(await check()) && props.autoStart && WEB_LOGIN.has(props.preset)) void login();
+  onSettled(() => {
+    void check().then(ok => { if (!ok && props.autoStart && WEB_LOGIN.has(props.preset)) void login(); });
   });
   return (
     <div class="lyra-fetch">
@@ -116,7 +116,7 @@ function KvEditor(props: {
       <span class="field-label">{props.title}</span>
       <span class="field-hint">{props.hint}</span>
       <div class="session-shortcut-list">
-        <Index each={props.rows}>
+        <For keyed={false} each={props.rows}>
           {(row, i) => (
             <div class="session-shortcut-row env-var-row">
               <input
@@ -138,7 +138,7 @@ function KvEditor(props: {
               </button>
             </div>
           )}
-        </Index>
+        </For>
       </div>
       <button
         type="button"
@@ -185,7 +185,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
     try {
       raw = await api.getLyraConfig();
       const next = draftFromConfig(raw);
-      setDraft(next);
+      flush(() => setDraft(reconcile(next)));
       setMcpEditing(false);
       setMcpJsonMode(!!mcpError());
       setLoaded(true);
@@ -196,7 +196,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
       setError(`${String(e)}（请修正 config.jsonc 后重新加载）`);
     }
   };
-  onMount(() => {
+  onSettled(() => {
     void load();
     api.getLyraPresets().then(setPresets, () => {});
   });
@@ -216,18 +216,18 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
   };
 
   const edit = (fn: (d: LyraDraft) => void) => {
-    setDraft(produce(fn));
+    setDraft(fn);
     setDirty(true);
   };
 
   props.onSaver(async () => {
     if (!loaded()) return;
     // 底部统一保存也提交正在编辑的单项，不能静默丢掉未点「完成编辑」的输入。
-    if (mcpEditing()) commitMcpEditor();
+    if (mcpEditing()) flush(commitMcpEditor);
     if (!dirty()) return;
     const invalid = validate(draft.providers, presets());
     if (invalid) throw new Error(`Lyra 配置：${invalid}`);
-    const config = configFromDraft(raw, unwrap(draft));
+    const config = configFromDraft(raw, snapshot(draft));
     await api.saveLyraConfig(config);
     raw = config;
     setDirty(false);
@@ -237,14 +237,15 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
   const [fetched, setFetched] = createStore<Record<string, { busy?: boolean; error?: string; models?: Record<string, any> }>>({});
   const fetchModels = async (p: ProviderDraft) => {
     const id = p.id.trim();
-    if (!id) return setFetched("", { error: "请先填写 Provider ID" });
-    setFetched(id, { busy: true, error: undefined });
+    if (!id) return setFetched(s => { s[""] = { error: "请先填写 Provider ID" }; });
+    setFetched(s => { Object.assign(s[id] ??= {}, { busy: true, error: undefined }); });
     try {
-      setFetched(id, { models: await api.fetchLyraModels(id, serializeProvider(unwrap(p))) });
+      const models = await api.fetchLyraModels(id, serializeProvider(snapshot(p)));
+      setFetched(s => { (s[id] ??= {}).models = models; });
     } catch (e) {
-      setFetched(id, { error: String(e) });
+      setFetched(s => { (s[id] ??= {}).error = String(e); });
     } finally {
-      setFetched(id, "busy", false);
+      setFetched(s => { (s[id] ??= {}).busy = false; });
     }
   };
 
@@ -321,10 +322,10 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
     delete servers[name];
     edit((d) => { d.mcpServers = JSON.stringify(servers, null, 2); });
   };
-  const setMcpOptional = (key: string, value: string, numeric = false) => setMcpDraft("server", produce((server) => {
-    if (value === "") delete server[key];
-    else server[key] = numeric ? Number(value) : value;
-  }));
+  const setMcpOptional = (key: string, value: string, numeric = false) => setMcpDraft(s => {
+    if (value === "") delete s.server[key];
+    else s.server[key] = numeric ? Number(value) : value;
+  });
 
   return (
     <section class="lyra-config" ref={root}>
@@ -469,7 +470,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                         );
                       })()}
                     </Show>
-                    <Index each={p().models}>
+                    <For keyed={false} each={p().models}>
                       {(m, mi) => {
                         const setM = (fn: (m: ModelDraft) => void) => setP((x) => fn(x.models[mi]));
                         const initiallyOpen = !m().id;
@@ -530,7 +531,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                           </details>
                         );
                       }}
-                    </Index>
+                    </For>
                   </section>
                   <details class="lyra-advanced" open={advancedInitiallyOpen || !p().preset}>
                     <summary>高级设置<span class="field-hint">ID、协议、代理 · {p().headers.length + p().fields.length} 项自定义配置</span></summary>
@@ -594,7 +595,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                 <span class="field-label">mcpServers JSON</span>
                 <textarea id="lyra-mcp-json" class="field-input" rows={14} spellcheck={false} autocomplete="off"
                   style={{ "font-family": "monospace", resize: "vertical" }}
-                  aria-describedby="lyra-mcp-hint lyra-mcp-error" aria-invalid={!!mcpError()}
+                  aria-describedby="lyra-mcp-hint lyra-mcp-error" aria-invalid={mcpError() ? "true" : "false"}
                   value={draft.mcpServers} onInput={(e) => edit((d) => { d.mcpServers = e.currentTarget.value; })} />
               </label>
               <span id="lyra-mcp-error" class="field-hint lyra-error" role="status" aria-live="polite">{mcpError()}</span>
@@ -611,11 +612,11 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                   <div class="backend-fields">
                     <label class="backend-field">
                       <span class="field-label">服务器名称</span>
-                      <input class="field-input" placeholder="如 filesystem（字母、数字、._-）" value={mcpDraft.name} onInput={(e) => setMcpDraft("name", e.currentTarget.value)} />
+                      <input class="field-input" placeholder="如 filesystem（字母、数字、._-）" value={mcpDraft.name} onInput={(e) => setMcpDraft(s => { s.name = e.currentTarget.value; })} />
                     </label>
                     <label class="backend-field">
                       <span class="field-label">连接方式</span>
-                      <select class="field-input" value={mcpDraft.transport} onChange={(e) => setMcpDraft("transport", e.currentTarget.value as "stdio" | "http")}>
+                      <select class="field-input" value={mcpDraft.transport} onChange={(e) => setMcpDraft(s => { s.transport = e.currentTarget.value as "stdio" | "http"; })}>
                         <option value="stdio">本地命令（stdio）</option><option value="http">远程地址（Streamable HTTP）</option>
                       </select>
                     </label>
@@ -623,32 +624,32 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                   <Show when={mcpDraft.transport === "stdio"} fallback={
                     <>
                       <label class="field"><span class="field-label">服务地址</span>
-                        <input class="field-input" type="url" placeholder="https://example.com/mcp" value={mcpDraft.server.url ?? ""} onInput={(e) => setMcpDraft("server", "url", e.currentTarget.value)} />
+                        <input class="field-input" type="url" placeholder="https://example.com/mcp" value={mcpDraft.server.url ?? ""} onInput={(e) => setMcpDraft(s => { s.server.url = e.currentTarget.value; })} />
                         <span class="field-hint">非本机地址必须使用 HTTPS；不支持旧 SSE 入口或 OAuth。</span>
                       </label>
-                      <KvEditor title="请求头" hint="支持 {env:NAME} 环境变量引用，例如 Authorization。" rows={mcpDraft.headers} keyPlaceholder="Header 名" valuePlaceholder="值或 {env:NAME}" onChange={(fn) => setMcpDraft("headers", produce(fn))} />
+                      <KvEditor title="请求头" hint="支持 {env:NAME} 环境变量引用，例如 Authorization。" rows={mcpDraft.headers} keyPlaceholder="Header 名" valuePlaceholder="值或 {env:NAME}" onChange={(fn) => setMcpDraft(s => { fn(s.headers); })} />
                     </>
                   }>
                     <label class="field"><span class="field-label">启动命令</span>
-                      <input class="field-input" placeholder="如 npx 或可执行文件的完整路径" value={mcpDraft.server.command ?? ""} onInput={(e) => setMcpDraft("server", "command", e.currentTarget.value)} />
+                      <input class="field-input" placeholder="如 npx 或可执行文件的完整路径" value={mcpDraft.server.command ?? ""} onInput={(e) => setMcpDraft(s => { s.server.command = e.currentTarget.value; })} />
                       <span class="field-hint">只填程序名或路径，参数在下方逐个添加，无需给带空格的路径加引号。</span>
                     </label>
                     <div class="field">
                       <span class="field-label">启动参数</span>
-                      <Index each={mcpDraft.server.args ?? []}>{(arg, i) => (
+                      <For keyed={false} each={mcpDraft.server.args ?? []}>{(arg, i) => (
                         <div class="session-shortcut-row">
-                          <input class="field-input" aria-label={`参数 ${i + 1}`} value={arg()} onInput={(e) => setMcpDraft("server", "args", i, e.currentTarget.value)} />
-                          <button type="button" class="btn secondary" aria-label={`删除参数 ${i + 1}`} onClick={() => setMcpDraft("server", "args", produce((args: string[]) => { args.splice(i, 1); }))}>删除</button>
+                          <input class="field-input" aria-label={`参数 ${i + 1}`} value={arg()} onInput={(e) => setMcpDraft(s => { s.server.args[i] = e.currentTarget.value; })} />
+                          <button type="button" class="btn secondary" aria-label={`删除参数 ${i + 1}`} onClick={() => setMcpDraft(s => { s.server.args.splice(i, 1); })}>删除</button>
                         </div>
-                      )}</Index>
-                      <button type="button" class="btn secondary" onClick={() => setMcpDraft("server", "args", [...(mcpDraft.server.args ?? []), ""])}>添加参数</button>
+                      )}</For>
+                      <button type="button" class="btn secondary" onClick={() => setMcpDraft(s => { (s.server.args ??= []).push(""); })}>添加参数</button>
                     </div>
                     <label class="field"><span class="field-label">工作目录（可选）</span>
                       <input class="field-input" placeholder="绝对路径；留空使用会话初始目录" value={mcpDraft.server.cwd ?? ""} onInput={(e) => setMcpOptional("cwd", e.currentTarget.value)} />
                     </label>
-                    <KvEditor title="环境变量" hint="值支持 {env:NAME} 引用；不会在保存时展开。" rows={mcpDraft.env} keyPlaceholder="变量名" valuePlaceholder="值或 {env:NAME}" onChange={(fn) => setMcpDraft("env", produce(fn))} />
+                    <KvEditor title="环境变量" hint="值支持 {env:NAME} 引用；不会在保存时展开。" rows={mcpDraft.env} keyPlaceholder="变量名" valuePlaceholder="值或 {env:NAME}" onChange={(fn) => setMcpDraft(s => { fn(s.env); })} />
                   </Show>
-                  <label class="backend-switch"><input type="checkbox" checked={mcpDraft.server.enabled} onChange={(e) => setMcpDraft("server", "enabled", e.currentTarget.checked)} /><span>启用此服务器</span></label>
+                  <label class="backend-switch"><input type="checkbox" checked={mcpDraft.server.enabled} onChange={(e) => setMcpDraft(s => { s.server.enabled = e.currentTarget.checked; })} /><span>启用此服务器</span></label>
                   <details class="lyra-advanced">
                     <summary>高级选项：超时与只读工具授权</summary>
                     <div class="lyra-detail-body">
@@ -661,7 +662,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                         </label>
                       </div>
                       <label class="field"><span class="field-label">允许只读会话调用的工具</span>
-                        <textarea class="field-input" rows={3} placeholder="每行一个精确工具名；留空不授权" value={(mcpDraft.server.readOnlyTools ?? []).join("\n")} onInput={(e) => setMcpDraft("server", "readOnlyTools", e.currentTarget.value === "" ? [] : e.currentTarget.value.split("\n"))} />
+                        <textarea class="field-input" rows={3} placeholder="每行一个精确工具名；留空不授权" value={(mcpDraft.server.readOnlyTools ?? []).join("\n")} onInput={(e) => setMcpDraft(s => { s.server.readOnlyTools = e.currentTarget.value === "" ? [] : e.currentTarget.value.split("\n"); })} />
                         <span class="field-hint">最多 64 个工具。不信任服务器 annotations 自动授权；这不是沙箱，也不保证工具只读。</span>
                       </label>
                     </div>

@@ -238,7 +238,7 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
   const fileMenu = createFileContextMenu();
   // 组件挂载时的内容属于已有快照（包括切换到仍在运行的会话），直接显示；
   // 只有同一实例后续收到的追加 delta 才进入预缓冲动画。
-  const [shown, setShown] = createSignal(props.text);
+  const [shown, setShown] = createSignal(untrack(() => props.text));
   const windowed = createMemo(() => !!props.virtual && shown().length > LONG_MARKDOWN_THRESHOLD);
   let revealRaf = 0;
   let lastTickAt = performance.now();
@@ -277,10 +277,9 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
     revealRaf = requestAnimationFrame(tick);
   };
 
-  createEffect(() => {
-    const target = props.text;
+  createEffect(() => [props.text, props.live] as const, ([target, live]) => {
     const cur = untrack(shown);
-    if (!props.live || !target.startsWith(cur)) {
+    if (!live || !target.startsWith(cur)) {
       // 历史消息、流结束、编辑或重同步均立即同步，不残留预缓冲动画。
       stopTick();
       if (target !== cur) setShown(target);
@@ -294,15 +293,14 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
   //（tail effect 只订阅 shown，shown 追平时 tail 未必重跑），必须立即
   // 用完整文本走非流式路径补齐尾部。shown 同步与补尾必须原子完成，
   // 否则中间帧会读到未追平的 shown 切片。
-  createEffect(() => {
-    const target = props.text;
-    if (props.live || windowed()) return;
+  createEffect(() => [props.text, props.live, windowed(), props.markFiles] as const, ([target, live, virtual, markFiles]) => {
+    if (live || virtual) return;
     const cur = untrack(shown);
     if (!target.startsWith(cur) || target !== cur) {
       stopTick();
       if (target !== cur) setShown(target);
       const tail = target.slice(stableSrc.length);
-      setTailHtml(cachedRenderMarkdown(tail, !!props.markFiles));
+      setTailHtml(cachedRenderMarkdown(tail, !!markFiles));
     }
   });
 
@@ -313,9 +311,8 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
   let stableRef: HTMLDivElement | undefined;
   const [tailHtml, setTailHtml] = createSignal("");
 
-  createEffect(() => {
-    if (windowed()) { stableSrc = ""; return; }
-    const full = shown();
+  createEffect(() => [windowed(), shown(), props.live, props.markFiles] as const, ([virtual, full, live, markFiles]) => {
+    if (virtual) { stableSrc = ""; return; }
     if (!full.startsWith(stableSrc)) {
       // 非纯追加更新（编辑消息 / 漫游重同步 / 组件被复用切换内容）：重置增量状态全量重渲
       stableSrc = "";
@@ -327,14 +324,14 @@ export function Markdown(props: { text: string; markFiles?: boolean; live?: bool
       const chunk = tail.slice(0, cut);
       stableSrc += chunk;
       // 稳定前缀只处理一次，可以在固化时完成较重的文件引用标记。
-      stableRef.insertAdjacentHTML("beforeend", cachedRenderMarkdown(chunk, !!props.markFiles));
+      stableRef.insertAdjacentHTML("beforeend", cachedRenderMarkdown(chunk, !!markFiles));
       tail = tail.slice(cut);
     }
     // 流式尾部每 33ms 更新：此时跳过 template/TreeWalker 扫描，结束后 effect 会自动补齐。
     setTailHtml(
-      props.live
+      live
         ? renderMarkdown(tail, false)
-        : cachedRenderMarkdown(tail, !!props.markFiles),
+        : cachedRenderMarkdown(tail, !!markFiles),
     );
   });
 

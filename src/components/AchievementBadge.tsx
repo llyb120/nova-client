@@ -9,10 +9,7 @@ export function AchievementBadge(props: {
   isNew?: boolean;
 }) {
   const [failed, setFailed] = createSignal(false);
-  createEffect(() => {
-    props.achievement.imageUrl;
-    setFailed(false);
-  });
+  createEffect(() => props.achievement.imageUrl, () => { setFailed(false); });
   const src = () => {
     if (failed()) return undefined;
     const remote = props.achievement.imageUrl?.trim();
@@ -20,8 +17,7 @@ export function AchievementBadge(props: {
   };
   return (
     <article
-      class={`achv-card achv-${props.achievement.icon || props.achievement.id}`}
-      classList={{ "achv-new": props.isNew === true }}
+      class={[`achv-card achv-${props.achievement.icon || props.achievement.id}`, { "achv-new": props.isNew === true }]}
       style={{ "--i": props.index ?? 0 }}
     >
       <div class="achv-badge-wrap" aria-hidden="true">

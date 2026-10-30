@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { build, transform } from 'esbuild';
 import { transformAsync } from '@babel/core';
-import solid from 'babel-preset-solid';
+import solid from '@solidjs/babel-plugin';
 
 const result = await build({
   stdin: {
     contents: `export { HtmlTurn } from './src/components/HtmlTurn';
       export { state } from './src/store';
-      export { renderToString } from 'solid-js/web';`,
+      export { renderToString } from '@solidjs/web';`,
     resolveDir: process.cwd(), loader: 'ts',
   },
   bundle: true, write: false, format: 'esm', platform: 'node', loader: { '.css': 'empty' },
@@ -34,7 +34,7 @@ const result = await build({
       build.onLoad({ filter: /\.tsx$/ }, async args => {
         const source = await readFile(args.path, 'utf8');
         const stripped = await transform(source, { loader: 'tsx', jsx: 'preserve', target: 'esnext' });
-        const output = await transformAsync(stripped.code, { filename: args.path, configFile: false, babelrc: false, presets: [[solid, { generate: 'ssr', hydratable: false }]] });
+        const output = await transformAsync(stripped.code, { filename: args.path, configFile: false, babelrc: false, plugins: [[solid, { generate: 'ssr', hydratable: false }]] });
         return { contents: output.code, loader: 'js' };
       });
     },
@@ -43,7 +43,9 @@ const result = await build({
 const { HtmlTurn, state, renderToString } = await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
 const render = (group, expanded = {}, options = {}) => {
   state.expanded = expanded;
-  return renderToString(() => HtmlTurn({ group, running: false, preview: false, threadId: 'thread', onReturnToCurrent() {}, ...options }));
+  // Solid 2 encodes static non-ASCII text as numeric entities; compare displayed text, not that encoding.
+  return renderToString(() => HtmlTurn({ group, running: false, preview: false, threadId: 'thread', onReturnToCurrent() {}, ...options }))
+    .replace(/&#(\d+);/g, (entity, code) => Number(code) > 127 ? String.fromCodePoint(Number(code)) : entity);
 };
 const user = { id: 1, type: 'user', text: 'hello', ts: 0 };
 const thought = { id: 2, type: 'thought', text: 'private reasoning', ts: 0 };
@@ -125,8 +127,8 @@ assert.match(css, /\.html-turn\s*\{[^}]*margin: 0;/);
 assert.match(css, /\.ht-tool-output\s*\{[^}]*max-height: 320px;[^}]*overflow: auto;/);
 assert.match(css, /content-visibility: auto;/);
 assert.match(css, /\.ht-live-preview\s*\{[^}]*justify-content: flex-end;[^}]*max-height: 48px;[^}]*overflow: hidden;/);
-assert.match(source, /<Index each=\{props.item.content\}/, 'streaming tool-content replacements keep scroll/focus');
-assert.match(source, /<Index each=\{props.item.images\}/, 'attachment projections retain their image slots');
+assert.match(source, /<For keyed=\{false\} each=\{props.item.content\}/, 'streaming tool-content replacements keep scroll/focus');
+assert.match(source, /<For keyed=\{false\} each=\{props.item.images\}/, 'attachment projections retain their image slots');
 assert.match(source, /createHtmlPromptImage\(image\)/);
 assert.match(source, /src=\{shown\(\)\.src\} width=\{shown\(\)\.width\} height=\{shown\(\)\.height\}/);
 assert.match(source, /img\.currentSrc === shown\(\)\.src && img\.complete && !img\.naturalWidth/, 'ignore stale image errors');

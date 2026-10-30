@@ -1,4 +1,4 @@
-import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { createEffect, createSignal, onCleanup, onSettled } from "solid-js";
 import { basicSetup } from "codemirror";
 import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -88,7 +88,7 @@ export default function WorkspaceCode(props: {
   const access = new Compartment();
   const language = new Compartment();
   const wrapping = new Compartment();
-  onMount(() => {
+  onSettled(() => {
     view = new EditorView({
       parent: host,
       state: EditorState.create({ doc: props.text, extensions: [
@@ -109,22 +109,20 @@ export default function WorkspaceCode(props: {
     const theme = new MutationObserver(() => scheduleMap(true));
     theme.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     scheduleMap(true);
-    onCleanup(() => { resize.disconnect(); theme.disconnect(); view?.scrollDOM.removeEventListener('scroll', scroll); });
     const support = LanguageDescription.matchFilename(languages, props.path.split(/[\\/]/).pop() ?? props.path);
     if (support) void support.load().then(extension => {
       if (!disposed) view?.dispatch({ effects: language.reconfigure(extension) });
     }).catch(error => console.warn("文件语法加载失败", error));
+    return () => { resize.disconnect(); theme.disconnect(); view?.scrollDOM.removeEventListener('scroll', scroll); };
   });
-  createEffect(() => {
-    const readOnly = props.readOnly;
+  createEffect(() => props.readOnly, readOnly => {
     view?.dispatch({ effects: access.reconfigure(EditorState.readOnly.of(readOnly)) });
   });
-  createEffect(() => {
-    const wrap = workspaceLayout.softWrap;
+  createEffect(() => workspaceLayout.softWrap, wrap => {
     view?.dispatch({ effects: wrapping.reconfigure(wrap ? EditorView.lineWrapping : []) });
   });
   onCleanup(() => { disposed = true; cancelAnimationFrame(frame); props.onView(undefined); view?.destroy(); });
-  return <div class="workspace-code" classList={{ 'workspace-code-nowrap': !workspaceLayout.softWrap }}>
+  return <div class={["workspace-code", { 'workspace-code-nowrap': !workspaceLayout.softWrap }]}>
     <div ref={host} class="workspace-code-editor" />
     <div ref={map} class="workspace-minimap" style={{ display: workspaceLayout.minimap && overflows() ? undefined : 'none' }} role="slider" aria-label="代码缩略图" aria-orientation="vertical" aria-valuemin="1" aria-valuemax="1" aria-valuenow="1" tabindex="0"
       onPointerDown={event => { event.preventDefault(); map.focus(); map.setPointerCapture(event.pointerId); jumpAtPointer(event); }}

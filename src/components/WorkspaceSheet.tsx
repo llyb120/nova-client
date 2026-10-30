@@ -1,4 +1,4 @@
-import { createEffect, onCleanup, onMount } from 'solid-js';
+import { createEffect, onSettled } from 'solid-js';
 import { createUniver, LocaleType } from '@univerjs/presets';
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core';
 import zhCN from '@univerjs/preset-sheets-core/locales/zh-CN';
@@ -8,7 +8,8 @@ import type { IWorkbookData } from '@univerjs/core';
 export type SheetEditor = { flush: () => Promise<void> };
 export default function WorkspaceSheet(props: { text: string; readOnly: boolean; onReady?: (text: string) => void; onChange: (text: string) => void; onEditor: (editor?: SheetEditor) => void }) {
   let host!: HTMLDivElement;
-  onMount(() => {
+  createEffect(() => props.readOnly, readOnly => { host.inert = readOnly; });
+  onSettled(() => {
     const { univer, univerAPI } = createUniver({
       locale: LocaleType.ZH_CN, locales: { [LocaleType.ZH_CN]: zhCN },
       presets: [UniverSheetsCorePreset({ container: host, header: true, toolbar: true, ribbonType: 'simple', disableAutoFocus: true })],
@@ -22,8 +23,7 @@ export default function WorkspaceSheet(props: { text: string; readOnly: boolean;
     };
     const listener = univerAPI.onCommandExecuted(command => { if (command.type === 2) snapshot(); });
     props.onEditor({ flush: async () => { await workbook.endEditingAsync(true); snapshot(); } });
-    createEffect(() => { host.inert = props.readOnly; });
-    onCleanup(() => { props.onEditor(undefined); listener.dispose(); univer.dispose(); });
+    return () => { props.onEditor(undefined); listener.dispose(); univer.dispose(); };
   });
   return <div class="workspace-sheet-host" ref={host} aria-label="Excel 表格编辑器" onKeyDown={e => {
     // 避免表格编辑快捷键触发外层会话快捷键；保存继续交给文件面板。

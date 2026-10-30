@@ -66,13 +66,13 @@ export function createNoteFlow(running?: () => boolean): NoteFlow {
     trySpawnNote();
   };
 
-  createEffect(() => {
-    if (!running?.()) return;
+  createEffect(() => running?.(), active => {
+    if (!active) return;
     runningNoteTimer = window.setInterval(trySpawnNote, MIN_SPAWN_GAP);
-    onCleanup(() => {
+    return () => {
       window.clearInterval(runningNoteTimer);
       runningNoteTimer = undefined;
-    });
+    };
   });
 
   onCleanup(() => {
@@ -83,8 +83,7 @@ export function createNoteFlow(running?: () => boolean): NoteFlow {
 
   const Notes: Component = () => (
     <div
-      class="composer-notes"
-      classList={{ active: active() }}
+      class={["composer-notes", { active: active() }]}
       aria-hidden="true"
     >
       <For each={flowNotes()}>
