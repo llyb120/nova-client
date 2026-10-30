@@ -898,7 +898,7 @@ async fn coordinate(
 ) -> Result<Value, String> {
     if !observation.screenshot {
         return Err(
-            "坐标操作需要截图：请 screenshot，或使用 DOM frame/ref；inspect 不能授权坐标操作"
+            "当前观察没有可用截图，不能授权坐标操作：请 screenshot 或 inspect（省略 visual=none），也可按 DOM frame/ref 操作"
                 .into(),
         );
     }
@@ -973,7 +973,7 @@ async fn snapshot(
     let scope=args["scope"].as_str().unwrap_or("all");
     if !matches!(scope,"all"|"viewport") {return Err("scope 必须为 all 或 viewport".into());}
     let mut observation = observe(app,scope).await?;
-    let auto_visual=!with_image && args["visual"]!="none" && observation.pages["pages"].as_array().is_some_and(|pages|pages.iter().any(|p|p["visualSuggested"]==true));
+    let auto_visual=!with_image && args["visual"]!="none";
     let with_image=with_image || auto_visual;
     let dir = SHOT_OWNER.try_with(|owner| crate::jianlai::shot_folder(owner, "browser-shots"))
         .unwrap_or_else(|_| state_dir(app).join("browser-shots"));
@@ -988,13 +988,14 @@ async fn snapshot(
     let base = previous.filter(|_| args["__delta"] == true).map(|p| &p.pages);
     let mut result = inline_summary(&observation.pages, args, base);
     result["snapshotId"] = json!(observation.id);
-    result["visualReason"] = if auto_visual {json!("页面有大面积 Canvas，自动附可操作视口截图；图内控件不可由 DOM 枚举")} else {Value::Null};
+    result["visualReason"] = if auto_visual {json!("默认附当前视口截图，辅助 DOM 判断布局、遮挡和绘制内容；visual=none 可关闭")} else {Value::Null};
     result["documentPath"] = json!(document_path);
     if with_image {
+        let capture = async {
         // expandScroll output is meant to be read/shared: keep original pixels unless asked otherwise.
         let keep_original=args["expandScroll"]==true;
         let edge=args["maxEdge"].as_u64().unwrap_or(if keep_original {0} else {1600});
-        observation.full_page = !auto_visual && region.is_none() && (args["fullPage"] != false || target.is_some());
+        observation.full_page = !auto_visual && region.is_none() && (args["fullPage"] == true || keep_original);
         let mut images = Vec::new();
         let mut document = None;
         let mut expanded = None;
@@ -1052,12 +1053,15 @@ async fn snapshot(
                 observation.full_page = false;
                 result["fullPageFallback"] = json!(format!("文档 {width}x{height} CSS像素超出整页截图安全上限，已改为视口截图；屏外内容请滚动后再截或读 DOM"));
             } else {
-                document = Some((left, top, width, height));
+                document = Some((left, top, width, height, dpr));
             }
         }
-        if let Some((left, top, width, height)) = document {
-            let columns = (width / 2048.).ceil() as u64;
-            let rows = (height / 4096.).ceil() as u64;
+        if let Some((left, top, width, height, dpr)) = document {
+            // Bound native-resolution tiles before local downsampling, including high-DPI screens.
+            let tile_width = (2048. / dpr.max(1.)).floor().max(1.);
+            let tile_height = (4096. / dpr.max(1.)).floor().max(1.);
+            let columns = (width / tile_width).ceil() as u64;
+            let rows = (height / tile_height).ceil() as u64;
             let total = columns.checked_mul(rows).ok_or("文档尺寸过大")?;
             let offset = args["tileOffset"].as_u64().unwrap_or(0);
             if offset >= total {
@@ -1068,10 +1072,10 @@ async fn snapshot(
             let label = active_label(app)?;
             let tag = label.rsplit(':').next().unwrap_or(&label);
             for tile in offset..end {
-                let (dx, dy) = ((tile % columns) as f64 * 2048., (tile / columns) as f64 * 4096.);
-                let (x, y, w, h) = (left + dx, top + dy, (width - dx).min(2048.), (height - dy).min(4096.));
-                let scale=if edge==0 {1.} else {(edge as f64/w.max(h)).min(1.)};
-                let shot=cdp(app,"Page.captureScreenshot",json!({"format":"webp","quality":100,"fromSurface":true,"captureBeyondViewport":true,"clip":{"x":x,"y":y,"width":w,"height":h,"scale":scale}}),None,None).await?;
+                let (dx, dy) = ((tile % columns) as f64 * tile_width, (tile / columns) as f64 * tile_height);
+                let (x, y, w, h) = (left + dx, top + dy, (width - dx).min(tile_width), (height - dy).min(tile_height));
+                // clip.scale changes Chromium's render scale; resize the captured pixels locally instead.
+                let shot=cdp(app,"Page.captureScreenshot",json!({"format":"webp","quality":100,"fromSurface":true,"captureBeyondViewport":true,"clip":{"x":x,"y":y,"width":w,"height":h,"scale":1}}),None,None).await?;
                 let data=shot["data"].as_str().ok_or("截图为空")?;
                 if !keep_original {
                     let path = dir.join(format!("{}-{tile}.webp", observation.id));
@@ -1133,9 +1137,16 @@ async fn snapshot(
         result["images"] = json!(images);
         result["fullPage"] = json!(observation.full_page);
         observation.screenshot = true;
+        Ok::<(), String>(())
+        }.await;
+        if let Err(error) = capture {
+            if !auto_visual { return Err(error); }
+            // Optional visual feedback must not discard a usable DOM observation.
+            result["screenshotError"] = json!(error);
+        }
     }
     observation.captured = std::time::Instant::now();
-    if let Some(ids) = carry_screenshot(&mut observation, previous) {
+    if let Some(ids) = carry_screenshot(&mut observation, previous.filter(|_| result["screenshotError"].is_null())) {
         result["reusableImageIds"] = json!(ids);
     }
     app.state::<BrowserState>()
@@ -1517,13 +1528,13 @@ async fn control_session(
             if let Some(args)=feedback_args.as_object_mut() {for key in ["ref","frame","region"] {args.remove(key);} }
             if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
             // Occlusion cannot be explained by an unchanged DOM delta; show the blocker.
-            let visual=args["feedback"]=="screenshot" || (args["feedback"].is_null() && observation.screenshot)
+            let visual=args["feedback"]=="screenshot"
                 || failure.as_deref().is_some_and(|reason| reason.contains("目标被遮挡"));
             // Feedback failure must never turn a completed mutation into a retryable action failure.
             // A script retires input snapshots, not the comparison baseline. Fresh document/stamp/geometry
             // checks in deliver_screenshot still refuse reuse after navigation or viewport changes.
             match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,
-                if script.is_none() || visual { Some(&observation) } else { None })).await {
+                if script.is_none() || visual || feedback_args["visual"] != "none" { Some(&observation) } else { None })).await {
                 Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
                 Ok(Err(error)) => result["observationError"] = json!(error),
                 Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
@@ -1570,7 +1581,7 @@ async fn control_session(
             if let Ok(value)=&mut result {value["status"]=json!("needs_review");value["inputReleaseErrors"]=json!(cleanup_errors);}
         }
     }
-    if operation == "screenshot" && (args["fullPage"] != false || args["expandScroll"] == true) {
+    if operation == "screenshot" && (args["fullPage"] == true || args["expandScroll"] == true) {
         let captured = state
             .observations
             .lock()
@@ -1957,7 +1968,7 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
         if let Some(target) = opened_tab_target(&value).map(str::to_owned) {
             let mode = if args["feedback"] == "screenshot" { "screenshot" } else { "inspect" };
             let mut observe_args = args.clone();
-            if mode == "inspect" { observe_args["visual"] = json!("none"); }
+            if args["feedback"] == "inspect" { observe_args["visual"] = json!("none"); }
             let observed = observe_tab(app, root, &thread_id, &target, &observe_args, mode, Duration::from_secs(8)).await;
             value.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default());
             value["tabTag"] = json!(target);

@@ -23,7 +23,7 @@ child.stderr.on('data', d => { stderr += d; });
 child.on('error', error => { spawnError = error; });
 const sockets = [];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-let browser;
+let browser, fixture;
 async function until(fn, label) {
   for (let i = 0; i < 150; i++) {
     if (spawnError) throw spawnError;
@@ -60,7 +60,9 @@ try {
   browser=await chromium.launch({executablePath:process.env.TEST_BROWSER,headless:true,args:['--no-sandbox']});
   const context=await browser.newContext({viewport:{width:900,height:700}});
   const page=await context.newPage();
-  await page.goto('data:text/html,'+encodeURIComponent('<!doctype html><meta charset="utf-8"><title>Chrome fixture</title><label>订单号<input></label><button onclick="document.querySelector(\'output\').textContent=document.querySelector(\'input\').value">查询</button><output></output>'));
+  fixture=createServer((_,res)=>{res.setHeader('Content-Type','text/html; charset=utf-8');res.end('<!doctype html><meta charset="utf-8"><title>Chrome fixture</title><label>订单号<input></label><button onclick="document.querySelector(\'output\').textContent=document.querySelector(\'input\').value">查询</button><output></output>');});
+  await new Promise(r=>fixture.listen(0,'127.0.0.1',r));
+  await page.goto(`http://127.0.0.1:${fixture.address().port}/`);
   const cdp=await context.newCDPSession(page);
   const chromeUi=(operation,args={})=>invoke('chrome_browser_ui',{operation,args});
   const connection=await chromeUi('connect');
@@ -70,6 +72,8 @@ try {
   const abort=new AbortController();
   const tag='C1-smoketest';
   const chromeCaptures=[];
+  const guardFailures=[];
+  let failNextCapture=false;
   const post=async(route,body)=>{
     const response=await fetch(config.origin+route,{method:'POST',headers:{'Content-Type':'application/json',Origin:`chrome-extension://${connection.extensionId}`,Authorization:`Bearer ${config.token}`},body:JSON.stringify({clientId:'12345678-1234-4234-8234-123456789abc',...body}),signal:abort.signal});
     assert.equal(response.status,200);return response.json();
@@ -90,6 +94,7 @@ try {
             chromeCaptures.push(command.args.params);
             assert.equal(command.args.params.format,'webp');
             assert.equal(command.args.params.quality,100,'Chrome WebP capture must be lossless');
+            if(failNextCapture){failNextCapture=false;throw Error('fixture capture unavailable');}
           }
           result=await cdp.send(command.args.method,command.args.params);
           if(command.args.method==='Page.captureScreenshot') {
@@ -135,6 +140,8 @@ try {
     const input=full.pages[0].items.find(i=>i.name==='订单号');assert(input);
     const changed=await chromeUi('act',{tabTag:tag,snapshotId:chromeObs.snapshotId,action:{action:'fill',frame:0,ref:input.ref,text:'Chrome桥接验证'}});
     assert.equal(changed.status,'executed');assert.ok(changed.snapshotId);
+    assert.ok(changed.images?.length,'default DOM action feedback must also include a viewport image');
+    assert.equal(changed.fullPage,false);
     assert.equal(await page.evaluate(()=>document.querySelector('input').value),'Chrome桥接验证');
     // A popup appearing after observation must refuse input and show enough context to recover.
     const button=full.pages[0].items.find(i=>i.name==='查询');assert(button);
@@ -147,6 +154,36 @@ try {
     const dismissal=JSON.parse(await readFile(blocked.documentPath,'utf8')).pages[0].items.find(i=>i.name==='Dismiss suggestions');
     const recovered=await chromeUi('act',{tabTag:tag,snapshotId:blocked.snapshotId,feedback:'inspect',action:{action:'click',ref:dismissal.ref}});
     assert.equal(recovered.status,'executed');assert.equal(await page.locator('#blocker').count(),0);
+    assert.equal(recovered.images,undefined,'explicit feedback=inspect stays DOM-only');
+    // All ordinary observations use the existing surface, not a temporary page zoom/resize.
+    await page.evaluate(()=>{window.captureResizes=0;addEventListener('resize',()=>window.captureResizes++);});
+    const size=await page.evaluate(()=>[innerWidth,innerHeight,devicePixelRatio,visualViewport.scale,scrollX,scrollY]);
+    const nav=await chromeUi('tabs',{query:'Fixture'});
+    assert.ok(nav.images?.length,'unique tab lookup returns DOM plus viewport');
+    const defaultShot=await chromeUi('screenshot',{tabTag:tag,maxEdge:320});
+    assert.equal(defaultShot.fullPage,false);assert.equal(defaultShot.images.length,1);
+    assert.equal(defaultShot.images[0].pixelWidth,320);
+    const inspect=await chromeUi('inspect',{tabTag:tag,maxEdge:320});
+    assert.ok(inspect.pages[0].elements);assert.equal(inspect.fullPage,false);
+    assert.equal(inspect.images[0].unchanged,true);assert.equal(inspect.images[0].path,defaultShot.images[0].path);
+    const beforeDom=chromeCaptures.length;
+    const domOnly=await chromeUi('inspect',{tabTag:tag,visual:'none'});
+    assert.equal(chromeCaptures.length,beforeDom);assert.equal(domOnly.images,undefined);
+    const visualOff=await chromeUi('act',{tabTag:tag,snapshotId:domOnly.snapshotId,visual:'none',action:{action:'wait',ms:0}});
+    assert.equal(chromeCaptures.length,beforeDom);assert.equal(visualOff.images,undefined);
+    const evaluated=await chromeUi('evaluate',{tabTag:tag,snapshotId:visualOff.snapshotId,expression:'1'});
+    assert.equal(evaluated.value,1);assert.ok(evaluated.images?.length,'default script feedback includes an image');
+    const run=await chromeUi('run',{tabTag:tag,snapshotId:evaluated.snapshotId,plan:{task:'Fill the fixture order number',steps:[{action:'fill',name:'订单号',text:'run viewport'}]}});
+    assert.equal(run.altairRun.status,'completed',JSON.stringify(run));assert.ok(run.images?.length,'run hands back DOM plus one viewport image');
+    assert.deepEqual(await page.evaluate(()=>[innerWidth,innerHeight,devicePixelRatio,visualViewport.scale,scrollX,scrollY]),size);
+    assert.equal(await page.evaluate(()=>window.captureResizes),0,'ordinary observations must not resize the page');
+    failNextCapture=true;
+    const fallback=await chromeUi('inspect',{tabTag:tag});
+    assert.ok(fallback.snapshotId);assert.ok(fallback.pages[0].elements);
+    assert.match(fallback.screenshotError,/fixture capture unavailable/);
+    assert.equal(fallback.reusableImageIds,undefined,'failed visual refresh must not authorize stale images');
+    failNextCapture=true;
+    await assert.rejects(chromeUi('screenshot',{tabTag:tag}),/fixture capture unavailable/,'explicit screenshot failures must remain errors');
     // A batch owns focus only when it clicked/filled that exact node. An old snapshot
     // ID is harmless for those live refs; focus theft and partial batches still stop.
     await page.setContent('<input id="first" aria-label="First"><input id="second" aria-label="Second"><output></output>');
@@ -225,7 +262,7 @@ try {
         const image=shot.images[0], count=chromeCaptures.length;
         const clicked=await chromeUi('act',{tabTag:tag,snapshotId:shot.snapshotId,imageId:image.imageId,feedback:'screenshot',action:{action:'click_at',x:(340-image.x)*image.pixelWidth/image.width,y:(220-image.y)*image.pixelHeight/image.height}});
         assert.equal(clicked.status,'executed',JSON.stringify(clicked));
-        assert.equal(chromeCaptures.length-count,2,'one preflight and one feedback; DOM hover does not need a second screenshot');
+        if(chromeCaptures.length-count!==2)guardFailures.push({message:'expected one preflight and one feedback capture',deviceScaleFactor,options,actual:chromeCaptures.length-count});
       }
     }
     await cdp.send('Emulation.clearDeviceMetricsOverride');
@@ -235,31 +272,44 @@ try {
     const stale=await chromeUi('screenshot',{tabTag:tag,fullPage:false});
     await page.evaluate(()=>{document.querySelector('#hover-option').style.background='black';});
     const refused=await chromeUi('act',{tabTag:tag,snapshotId:stale.snapshotId,action:{action:'click_at',x:340,y:220}});
-    assert.equal(refused.status,'not_executed');assert.match(refused.reason,/画面已变化/);
-    assert.equal(await page.evaluate(()=>window.optionClicked),6,'pre-existing visual changes still block input');
-    // Default full-page screenshots deliver complete images per document tile and reuse unchanged ones.
+    const optionClicks=await page.evaluate(()=>window.optionClicked);
+    if(refused.status!=='not_executed'||!/画面已变化/.test(refused.reason)||optionClicks!==6)
+      guardFailures.push({message:'pre-existing visual changes must block input',status:refused.status,reason:refused.reason,optionClicks});
+    // Full-page screenshots are explicit; default screenshots of long pages still stay in the viewport.
     await page.evaluate(()=>{
       document.body.style.cssText='margin:0;height:5000px;background:white';
       document.body.innerHTML='<div id="delta-top" style="position:absolute;left:64px;top:64px;width:64px;height:32px"></div><div id="delta-bottom" style="position:absolute;left:128px;top:4400px;width:32px;height:32px"></div>';
       scrollTo(0,0);
     });
-    const fullKey=await chromeUi('screenshot',{tabTag:tag,maxEdge:0});
+    const longViewport=await chromeUi('screenshot',{tabTag:tag});
+    assert.equal(longViewport.fullPage,false);assert.equal(longViewport.images.length,1);
+    assert.equal(longViewport.images[0].height,await page.evaluate(()=>innerHeight));
+    const fullKey=await chromeUi('screenshot',{tabTag:tag,fullPage:true});
     assert.equal(fullKey.fullPage,true);
     assert.equal(fullKey.totalTiles,2);
     assert(fullKey.images.every(i=>i.path && !i.unchanged && i.frameStream.includes(':document:')));
     await page.evaluate(()=>{document.querySelector('#delta-top').style.background='black';document.querySelector('#delta-bottom').style.background='black';});
-    const fullChanged=await chromeUi('screenshot',{tabTag:tag,maxEdge:0});
+    const fullChanged=await chromeUi('screenshot',{tabTag:tag,fullPage:true});
     assert.equal(fullChanged.totalTiles,2);assert.equal(fullChanged.nextTile,null);assert.equal(fullChanged.screenshotComplete,true);
     assert(fullChanged.images.length===2 && fullChanged.images.every(i=>i.path && !i.unchanged),JSON.stringify(fullChanged));
-    const fullSame=await chromeUi('screenshot',{tabTag:tag,maxEdge:0});
+    const fullSame=await chromeUi('screenshot',{tabTag:tag,fullPage:true});
     assert(fullSame.images.every(i=>i.unchanged===true && i.path));
     assert.equal(fullSame.screenshotComplete,true);    // Script feedback consumes its input snapshot but retains a safe pixel-comparison baseline.
     const viewKey=await chromeUi('screenshot',{tabTag:tag,fullPage:false,maxEdge:0});
-    const viewDelta=await chromeUi('evaluate',{tabTag:tag,snapshotId:viewKey.snapshotId,feedback:'screenshot',maxEdge:0,
+    const viewDelta=await chromeUi('evaluate',{tabTag:tag,snapshotId:viewKey.snapshotId,maxEdge:0,
       expression:'document.querySelector("#delta-top").style.background="red"; true'});
     assert.equal(viewDelta.status,'executed');
     assert.equal(viewDelta.images[0].frameStream,viewKey.images[0].frameStream);
     assert(viewDelta.images[0].path && !viewDelta.images[0].unchanged,JSON.stringify(viewDelta));
+    const scriptSame=await chromeUi('evaluate',{tabTag:tag,snapshotId:viewDelta.snapshotId,maxEdge:0,expression:'1'});
+    assert.equal(scriptSame.images[0].unchanged,true);
+    assert.equal(scriptSame.images[0].path,viewDelta.images[0].path,'default script feedback also reuses unchanged frames');
+    // Native-resolution full-page tiles stay bounded at high DPR and still resize only locally.
+    await cdp.send('Emulation.setDeviceMetricsOverride',{width:900,height:700,deviceScaleFactor:2,mobile:false});
+    const highDpi=await chromeUi('screenshot',{tabTag:tag,fullPage:true,maxEdge:320});
+    assert.equal(highDpi.totalTiles,3);assert.equal(highDpi.screenshotComplete,true);
+    assert(highDpi.images.every(image=>Math.max(image.pixelWidth,image.pixelHeight)<=320 && image.height<=2048));
+    await cdp.send('Emulation.clearDeviceMetricsOverride');
     // expandScroll: an inner viewport-sized scroller (TAPD-like table) is captured in full, then restored.
     await page.evaluate(()=>{document.documentElement.style.overflow='hidden';document.body.style.cssText='';document.body.innerHTML='<div id="pane" style="position:fixed;top:40px;left:0;right:0;bottom:0;overflow:auto"><div style="height:3000px">rows</div></div>';});
     const viewportHeight=await page.evaluate(()=>innerHeight);
@@ -275,12 +325,16 @@ try {
     assert.equal(region.scrollExpanded?.complete,true,JSON.stringify(region.scrollExpanded));
     assert.equal(region.images[0].y,40);assert.ok(region.documentSize.height>=3000,JSON.stringify(region.documentSize));
     assert.equal(await page.evaluate(()=>innerHeight),viewportHeight,'viewport override must be cleared');
+    assert.ok(chromeCaptures.every(params=>!params.clip || params.clip.scale===1),'even explicit full-page captures must downsample locally, never change render scale');
     if(pollingError)throw pollingError;
+    console.log('PASS default DOM+viewport, DOM-only opt-out, capture failure fallback, viewport size/scale stability, local resizing, explicit full-page/DPR tiling and expandScroll restoration');
+    assert.deepEqual(guardFailures,[],'pixel guard regressions collected without hiding screenshot coverage');
     await writeFile(join(output,'coordinate-report.json'),JSON.stringify({passed:true,modelCalls:0,coordinateHover:true,localCrop:true,stalePixels:true,chromeCaptures,profile},null,2));
     console.log('PASS compiled Chrome bridge/inspect parameter isolation/screenshot crop validation/evaluate annotations, readback, stale snapshots, partial failure and Promise timeout/DOM/images/coordinate guards; no sidebar browser');
   }finally{abort.abort();await polling.catch(()=>{});}
 } finally {
   await browser?.close();
+  if(fixture)await new Promise(r=>fixture.close(r));
   for (const socket of sockets) socket.close();
   if (child.exitCode === null && child.pid) spawnSync('taskkill',['/PID',String(child.pid),'/T','/F'],{windowsHide:true,stdio:'ignore'});
   await writeFile(join(output,'stderr.txt'),stderr);

@@ -19,7 +19,9 @@
 
 常用调用：`inspect(tabTag)`、`act(tabTag,snapshotId,action或actions)`、`run(tabTag,plan)`。`act` 缺少/失效的快照只返回新观察，不执行原动作；`run` 可在缺少/失效快照时先观察再决策。`run` 只按主模型给出的 steps 连续执行。
 
-支持整页 DOM、iframe、滚动区域、整页分片截图、点击、填写、键盘、滚动、拖动、等待、多标签和导航。act 返回最新观察供验证并继续。基础操作无需辅助模型，不使用 Playwright。切换 Nova 会话保留 Chrome 页面。
+支持整页 DOM、iframe、滚动区域、整页分片截图、点击、填写、键盘、滚动、拖动、等待、多标签和导航。inspect、导航观察和 act/evaluate 默认同时返回 DOM 与当前视口图，优先用 DOM 定位，图片辅助判断布局、遮挡和 Canvas；`visual=none` 或动作 `feedback=inspect` 可只读 DOM。截图失败时自动附图降级为 DOM 并报告 `screenshotError`。基础操作无需辅助模型，不使用 Playwright。切换 Nova 会话保留 Chrome 页面。
+
+`screenshot` 默认只截当前视口，不改变页面缩放或视口尺寸，裁剪和缩图在本地完成。`fullPage=true` 显式请求整页分片；`expandScroll=true` 显式展开内部滚动区并恢复，这两种长图仍可能短暂改变布局。普通截图复用剑来的完整图交付与未变化帧复用，模型每条帧流保留最近两张不同内容的图。
 
 需要停止操作时使用 chrome 的 stop 操作。断线、超时不自动重放操作，应先观察确认结果。
 
@@ -73,7 +75,7 @@ Windows 集成脚本 `node scripts/native-browser-smoke.mjs src-tauri/target/deb
 
 共享操作引擎增加 `scope=viewport` 快路径、带原节点/所属行校验的稳定定位、悬停后复核及 `fill` 焦点和实际值校验。`act` 可传互斥的 `action` 或 1–16 项 `actions`；只合批已确认、不依赖中间画面判断的步骤。
 
-Canvas 观察包含显示尺寸和绘图尺寸；大面积 Canvas 的 `inspect` 默认自动附可操作视口图。小目标可按 `frame/ref` 或 `region` 裁剪。传回 `imageId` 后坐标以对应 PNG 的实际像素为准，服务端处理缩放和偏移；拖动、右键/双击、横向滚动以及落点附近画面变化检查共用原生 CDP 路径。没有新增生产 Playwright、辅助模型或扩展权限。
+Canvas 观察包含显示尺寸和绘图尺寸；普通页面与 Canvas 的 `inspect` 都默认附可操作视口图。小目标可按 `frame/ref` 或 `region` 裁剪。传回 `imageId` 后坐标以对应图片的实际像素为准，服务端处理缩放和偏移；拖动、右键/双击、横向滚动以及落点附近画面变化检查共用原生 CDP 路径。没有新增生产 Playwright、辅助模型或扩展权限。
 
 接口例子、失败恢复和明确的测试范围见 [精准交互说明](automation-precision.md)。本轮浏览器层测试不等于 Rust/Tauri、真实扩展及 WebGL 桌面流程已经验收。
 

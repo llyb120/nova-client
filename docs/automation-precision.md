@@ -41,11 +41,13 @@ DOM 操作优先使用当前观察中的 `frame/ref`，不按相同文本重新�
 
 示例中的占位 ID 必须替换成最新返回值，不能复用演示坐标或旧快照。提交、删除、导航及弹窗变化后需要新的观察与必要的用户授权，不把可能改变页面的动作盲目合批。工具可返回 `completedActions`、`inputAttempted`、`actionTimingsMs`、`basedOnSnapshotId`，区分“未发送输入”和“可能已执行部分动作”。
 
-`feedback=none` 省略正常动作后的观察，但不会产生新的操作授权。默认复用一次动作反馈；原观察含图时继续附视口图，不必再单独截图。显式 `feedback=inspect` 不自动附图。观察失败不改变原输入的执行状态。超时、取消及释放失败均不自动重放点击；只做已按下输入的尽力释放。
+`evaluate` 的 `feedback=none` 省略正常执行后的观察，但不会产生新的操作授权；`act` 的 `feedback=none` 仍返回 DOM 和新 snapshotId。默认动作反馈包含 DOM 与当前视口图，不必再单独截图。显式 `feedback=inspect` 或 `visual=none` 不自动附图；被遮挡时仍附图解释阻挡。观察失败不改变原输入的执行状态。超时、取消及释放失败均不自动重放点击；只做已按下输入的尽力释放。
 
 ## Canvas：图片不是 DOM，坐标必须来自返回的图片
 
-观察会列出 Canvas 的引用、CSS 显示矩形和 backing-store 尺寸，不把 Canvas 内绘制的按钮谎称为 DOM 按钮。可见、可命中的 Canvas 区域达到视口面积约 15% 时，`inspect` 默认自动附可操作的视口截图，减少“DOM 没内容 → 再截全页”的往返。小 Canvas 可主动截图；`visual=none` 关闭自动附图。
+观察会列出 Canvas 的引用、CSS 显示矩形和 backing-store 尺寸，不把 Canvas 内绘制的按钮谎称为 DOM 按钮。`inspect` 默认对所有页面附可操作的视口截图，结合 DOM 判断布局、遮挡和绘制内容；`visual=none` 关闭自动附图。自动截图失败保留可用 DOM 并返回 `screenshotError`。
+
+`screenshot` 默认当前视口，不调整页面缩放或视口尺寸，裁剪和缩图均在本地完成。仅显式 `fullPage=true` 或 `expandScroll=true` 进入长图路径；整页可能短暂重排布局，展开滚动区会临时加高视口后恢复。整页分片按 DPR 限制原生像素预算，不通过 CDP clip.scale 缩放页面。
 
 较小的绘制目标可先对已观察到的 Canvas 做局部截图：
 

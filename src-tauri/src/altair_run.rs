@@ -990,10 +990,14 @@ pub(crate) async fn browser(root: &Path, args: &Value, owner: &str, tool: &str) 
     } else { Value::Null };
     let handoff = outcome.is_err();
     let opened_tabs = latest["openedTabs"].as_array().is_some_and(|tabs| !tabs.is_empty());
-    if handoff && !opened_tabs {
-        // Preserve new-tab evidence, including ambiguous candidates without an observation.
-        // Otherwise hand back with fresh evidence for the current target.
-        match execute_browser(root, &run.inspect_args(), owner, tool).await {
+    let visual = args["visual"] != "none" && !matches!(args["feedback"].as_str(), Some("inspect" | "none"));
+    if (handoff && !opened_tabs) || (visual && latest["snapshotId"].is_string()
+        && !latest["images"].as_array().is_some_and(|images| !images.is_empty())) {
+        // Keep internal DOM checks cheap; attach one viewport image when handing back to the model.
+        // Ambiguous new tabs have no snapshot and must not be guessed or activated here.
+        let mut inspect = run.inspect_args();
+        if visual { inspect["visual"] = json!("auto"); }
+        match execute_browser(root, &inspect, owner, tool).await {
             Ok(observed) => latest.as_object_mut().unwrap().extend(observed.as_object().cloned().unwrap_or_default()),
             Err(error) => latest["observationError"] = json!(error),
         }
