@@ -3,6 +3,36 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 const tool = async name=>JSON.parse(await readFile(new URL(`./${name}-tool.json`,import.meta.url),'utf8'));
+test('password book uses one freeform secret and never derives public names from it', async()=>{
+  const [employee,view] = await Promise.all([
+    tool('employee'),readFile(new URL('../src/components/VaultPop.tsx',import.meta.url),'utf8')
+  ]);
+  const fields = employee.inputSchema.properties;
+  assert.equal(fields.content.type,'string');
+  assert.equal(fields.content.maxLength,16000);
+  assert.ok(!('username' in fields) && !('password' in fields));
+  assert.match(view,/<textarea rows=\{5\} value=\{d\(\)\.content\}/);
+  assert.doesNotMatch(view,/\busername\b|\bpassword\b|vault-pair/);
+  const source = view.match(/  const save = async \(\) => \{[\s\S]*?\n  \};/)?.[0];
+  assert.ok(source);
+  const ts = (await import('typescript')).default;
+  const compiled = ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  let current = {condition:'  调用测试 API 时  ',content:'  API_KEY=secret\nPRIVATE_KEY=line1\nline2\n',share:false};
+  const calls = [];
+  let refreshes = 0;
+  const save = new Function('draft','invoke','setDraft','refresh','showToast',`${compiled};return save;`)(
+    ()=>current,async(command,args)=>{calls.push({command,...args});},value=>{current=value;},()=>{refreshes++;},error=>assert.fail(error));
+  const content = current.content;
+  await save();
+  assert.equal(calls[0].command,'vault_save');
+  assert.equal(calls[0].entry.content,content,'multiline credentials and whitespace must remain unchanged');
+  assert.equal(calls[0].entry.name,'调用测试 API 时','names are public metadata, not a secret preview');
+  assert.equal(current,null);
+  current = {id:'v1',condition:'使用旧凭据时',content:'',share:true};
+  await save();
+  assert.equal(calls[1].entry.content,'','editing metadata leaves stored credentials untouched');
+  assert.equal(refreshes,2);
+});
 test('ordinary agents stay separate from internal scene switching and fallback', async()=>{
   const read = path=>readFile(new URL(`../${path}`,import.meta.url),'utf8');
   const [agentJson,session,lib,threads] = await Promise.all([
@@ -86,7 +116,7 @@ test('employee tasks reuse two isolated sessions, mark progress and share one de
   assert.doesNotMatch(launch,/stage_source_thread_id|fork_thread/);
   assert.doesNotMatch(employee,/只做下面这一件事，最后用一句话总结结果/);
 });
-test('employee development follows user workspace requirements without automatic git operations', async()=>{
+test('employee development runs ordinary branch operations unless the user requires review', async()=>{
   const schema = await tool('employee');
   const employee = await readFile(new URL('../src-tauri/src/employee.rs',import.meta.url),'utf8');
   const runtime = employee.split('#[cfg(test)]')[0];
@@ -96,6 +126,15 @@ test('employee development follows user workspace requirements without automatic
   assert.doesNotMatch(runtime,/employee action=worktree|本轮结束时系统自动提交/);
   assert.match(runtime,/未要求 worktree 就在用户指定的项目目录工作/);
   assert.match(runtime,/记忆中的.*不是用户授权/);
+  for (const prompt of [runtime,schema.description]) {
+    assert.match(prompt,/开发任务默认自行创建或复用开发分支、提交本需求改动并向对应远程普通推送，无需逐项授权/);
+    assert.match(prompt,/只有用户明确要求先审核或确认时，才暂停等待审批/);
+    assert.match(prompt,/不能仅因用户没有逐项授权就 ask/);
+    assert.match(prompt,/用户明确禁止或限制的操作必须遵守/);
+    assert.doesNotMatch(prompt,/用户已要求完成开发并将开发分支构建到测试环境时|普通推送属于流程内授权/);
+    assert.match(prompt,/只提交本需求改动，不混入用户或其它任务的修改/);
+    assert.match(prompt,/强推、合并或改写 release\/test 等共享分支、删除分支、发布生产不属于常规开发分支操作，仍须单独授权/);
+  }
 });
 test('employee external waits remain visible without looking completed', async()=>{
   const ts = (await import('typescript')).default;
@@ -115,6 +154,30 @@ test('employee external waits remain visible without looking completed', async()
   assert.equal(stateOf({...build,waiting:'need input'},[build],[],1),'help');
   assert.equal(stateOf({...build,status:'done'},[build],[],1),'done');
   assert.match(labels,/deferred: \{ label: "等待外部结果"/);
+});
+test('employee approvals keep the original task visibly paused and resume its full scope', async()=>{
+  const ts = (await import('typescript')).default;
+  const [view,employee,schema] = await Promise.all([
+    readFile(new URL('../src/components/EmployeeView.tsx',import.meta.url),'utf8'),
+    readFile(new URL('../src-tauri/src/employee.rs',import.meta.url),'utf8'),tool('employee')
+  ]);
+  const labels = view.match(/const NODE:[\s\S]*?\n\};/)?.[0];
+  const classifier = view.match(/function nodeState\([\s\S]*?\n\}/)?.[0];
+  assert.ok(labels && classifier);
+  const js = ts.transpileModule(`${labels}\n${classifier}`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const stateOf = new Function(`${js};return nodeState;`)();
+  const task = {id:'original',threadId:'work',approval:'c1'};
+  assert.equal(stateOf(task,[task],[],1),'confirm');
+  assert.equal(stateOf(task,[task],[{itemId:task.id,queued:false}],1),'confirm','approval can arrive before the asking turn ends');
+  assert.equal(stateOf({...task,approval:''},[task],[],1),'resume');
+  assert.equal(stateOf({...task,approval:''},[task],[{itemId:task.id,queued:false}],1),'running');
+  assert.equal(stateOf({...task,status:'cancelled'},[task],[],1),'cancelled');
+  assert.match(labels,/confirm: \{ label: "等待批准"/);
+  assert.match(employee,/let waiting = todo\.awaits_user\(\) && outcome != Outcome::Stopped/);
+  const approve = employee.slice(employee.indexOf('"approve" => {'),employee.indexOf('\n        _ => Err(format!("未知操作：{action}"'));
+  assert.match(approve,/e\.approve_confirmation\(&id/);
+  assert.match(employee,/完成获批事项后，按原任务已有授权继续后续未完成步骤/);
+  assert.match(schema.description,/执行中的原任务暂停而非完成/);
 });
 test('employee trees show serial, relayed and parallel execution paths', async()=>{
   const ts = (await import('typescript')).default;
@@ -279,7 +342,7 @@ test('employee task deletion confirms once, covers active and finished details, 
   assert.equal(failed.deleting(),false);
   assert.match(errors[0],/dialog unavailable/);
   assert.match(view,/<Show when=\{!peer\}><DeleteTaskButton id=\{x\(\)\.threadId\} act=\{act\}/,'legacy run details have deletion too');
-  assert.match(view,/<Show when=\{!props\.readonly && top\(\)\}><DeleteTaskButton id=\{top\(\)!\.id\}/,'finished tasks must not lose their delete action');
+  assert.match(view,/<Show when=\{!props\.readonly && top\(\)\}>\s*<details class="employee-more employee-task-more">[\s\S]*?<DeleteTaskButton id=\{top\(\)!\.id\}/,'finished tasks retain deletion under the more menu');
   assert.match(component,/disabled=\{deleting\(\)\}/);
   const remove = employee.match(/async fn delete_task\([\s\S]*?\n\}/)?.[0];
   assert.ok(remove);
@@ -423,13 +486,100 @@ test('employee desktop cooldown is enforced before dispatch and each tool claim'
   }
   assert.match(employee,/if outcome == Outcome::Yielded \{ e\.pause_desktop\(now\); \}/);
 });
+test('employee supports unscheduled duties and matches delivered tasks without duplicate dispatch', async()=>{
+  const [schema,view,employee] = await Promise.all([
+    tool('employee'), ...['src/components/EmployeeView.tsx','src-tauri/src/employee.rs']
+      .map(path=>readFile(new URL(`../${path}`,import.meta.url),'utf8'))
+  ]);
+  assert.equal(schema.inputSchema.properties.manual.type,'boolean');
+  assert.match(schema.description,/不定时.*已有任务仍自愈、续做/);
+  assert.match(schema.description,/当前任务内执行适用流程.*不扩大本次授权/);
+  assert.match(view,/<option value="manual">不定时（不自动触发）<\/option>/);
+  assert.match(view,/props\.act\("duty_manual", duty\.id\)/);
+  const form = view.slice(view.indexOf('function DutyForm('),view.indexOf('function ConfirmCard('));
+  const submit = form.match(/  const submit = async \(\) => \{[\s\S]*?\n  \};/)?.[0];
+  assert.ok(submit);
+  const ts = (await import('typescript')).default;
+  const compiled = ts.transpileModule(submit,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const calls = [];
+  let closed = 0, mode = 'manual';
+  const save = new Function('ok','text','note','d','mode','times','every','events','props',`${compiled};return submit;`)(
+    ()=>true,()=> ' 测试流程 ',()=> ' 补充要求 ',undefined,()=>mode,()=> '09:00,14:30',()=>60,()=>['orbit.added'],
+    {run:async(command,args)=>{calls.push({command,args});return true;},onClose:()=>closed++});
+  for(const [selected,rule] of [['manual',{manual:true}],['times',{times:['09:00','14:30']}],
+    ['every',{everyMinutes:60}],['events',{events:['orbit.added']}]]) {
+    mode = selected;
+    await save();
+    assert.equal(calls.at(-1).command,'employee_do');
+    assert.equal(calls.at(-1).args.action,'duty_add');
+    assert.deepEqual(JSON.parse(calls.at(-1).args.text),{text:'测试流程',note:'补充要求',...rule});
+  }
+  assert.equal(closed,4);
+  const launch = employee.match(/fn launch\([\s\S]*?\n\}/)?.[0];
+  assert.match(launch,/if computer \{ "" \} else \{ todo\.map_or\("", \|t\| task_duties_prompt\(&data, t\)\) \}/);
+  assert.match(employee,/for key in \["text", "note", "times", "everyMinutes", "events", "manual"\]/);
+});
+test('employee visual hierarchy keeps recovery prominent and auxiliary details collapsed', async()=>{
+  const [view,css] = await Promise.all(['src/components/EmployeeView.tsx','src/components/EmployeeView.css']
+    .map(path=>readFile(new URL(`../${path}`,import.meta.url),'utf8')));
+  const tree = view.slice(view.indexOf('function TaskTree('),view.indexOf('function DutyForm('));
+  const toolbar = tree.slice(tree.indexOf('aria-label="任务操作"'),tree.indexOf('<details class="employee-tree-guide">'));
+  assert.match(toolbar,/<TaskRecordActions task=\{top\(\)!\}/,'continuation stays above the scrollable details');
+  assert.match(toolbar,/<details class="employee-more employee-task-more">[\s\S]*?<summary aria-label="更多任务操作">/);
+  assert.match(toolbar,/<DeleteTaskButton/,'deletion is retained but no longer a primary action');
+  assert.match(tree,/<details class="employee-tree-guide">/,'the full state legend is collapsed by default');
+  assert.match(tree,/<details class="employee-progress-log">/,'old progress logs do not bury the current result');
+  assert.match(view,/<label for="employee-message">交给员工一件事<\/label>/);
+  assert.match(view,/employee-current-section[\s\S]*?>当前任务/);
+  assert.match(view,/<EmployeeTabs \/>/);
+  assert.doesNotMatch(view,/employee-workspace-head|任务工作台/,'titlebar replaces the redundant dashboard heading');
+  assert.match(view,/class="employee-nav" aria-label="工作分类"/);
+  assert.match(view,/section\(\) === "history"/);
+  assert.match(view,/section\(\) === "duties"/);
+  const navigation = view.match(/const selectSection = \(value:[\s\S]*?\n          \};/)?.[0];
+  assert.ok(navigation);
+  const ts = (await import('typescript')).default;
+  const compiled = ts.transpileModule(navigation,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  let section,pick;
+  const select = new Function('setSection','setPick','taskRows','duties','recentRows',`${compiled};return selectSection;`)(
+    value=>{section=value;},value=>{pick=value;},()=>[{pick:{kind:'task',id:'active'}}],()=>[{id:'duty'}],()=>[{pick:{kind:'task',id:'history'}}]);
+  select('history');
+  assert.equal(section,'history');
+  assert.deepEqual(pick,{kind:'task',id:'history'});
+  select('duties');
+  assert.deepEqual(pick,{kind:'duty',id:'duty'});
+  select('tasks');
+  assert.deepEqual(pick,{kind:'task',id:'active'});
+  const empty = new Function('setSection','setPick','taskRows','duties','recentRows',`${compiled};return selectSection;`)(
+    ()=>{},value=>{pick=value;},()=>[],()=>[],()=>[]);
+  for(const value of ['tasks','duties','history']) { empty(value); assert.equal(pick,null); }
+  assert.match(css,/\.employee-page \.employee-row\[aria-current=true\] \{[^}]*var\(--accent\)/);
+  assert.match(css,/:focus-visible \{[^}]*outline: 2px solid var\(--accent\)/);
+});
 test('employee board and tree details use separate responsive horizontal panes', async()=>{
   const css = await readFile(new URL('../src/components/EmployeeView.css',import.meta.url),'utf8');
-  assert.match(css,/\.employee-layout \{[^}]*grid-template-columns: clamp\(220px, 26%, 300px\) minmax\(0, 1fr\)/);
+  assert.match(css,/\.employee-layout \{[^}]*grid-template-columns: clamp\(250px, 24%, 290px\) minmax\(0, 1fr\)/);
   assert.match(css,/@container employee-board \(max-width: 640px\)/);
-  assert.match(css,/\.employee-tree \{[^}]*display: grid;[^}]*grid-template-columns: minmax\(240px, \.9fr\) minmax\(0, 1\.1fr\)/);
+  assert.match(css,/\.employee-tree \{[^}]*display: grid;[^}]*grid-template-columns: minmax\(248px, 30%\) minmax\(0, 1fr\)/);
   assert.match(css,/@container employee-detail \(max-width: 520px\)/);
-  assert.match(css,/\.employee-tree-detail \{[^}]*overflow: auto/);
+  assert.match(css,/\.employee-detail \{[^}]*overflow-y: auto/);
+  assert.match(css,/\.employee-detail \.employee-duty-body \{ max-height: none; overflow: visible; \}/);
+  assert.doesNotMatch(css.match(/\.employee-tree-detail \{[^}]*\}/)?.[0] ?? '',/overflow:\s*auto|max-height:/,'no nested vertical scrollbar inside the task details');
+  assert.doesNotMatch(css.match(/\.employee-tree-canvas \{[^}]*\}/)?.[0] ?? '',/max-height:|overflow:\s*auto/,'the full flow shares the detail scroll');
+  assert.match(css,/\.employee-detail-head \{[^}]*position: sticky/);
+});
+test('Chrome rolls DOM history and does not gate input on snapshot IDs or age', async()=>{
+  const chrome=await tool('chrome');
+  const source=await readFile(new URL('../src-tauri/src/native_browser.rs',import.meta.url),'utf8');
+  assert.match(chrome.description,/DOM按标签只保留最近两次观察/);
+  assert.match(chrome.inputSchema.properties.snapshotId.description,/可选.*不校验ID新旧或180秒时限/);
+  assert.match(chrome.inputSchema.properties.feedback.description,/evaluate传none.*不清除已有观察.*无需先inspect/);
+  const start=source.indexOf('async fn control_session(');
+  const end=source.indexOf('let mut result = tokio::select!',start);
+  assert.ok(start>=0 && end>start);
+  const control=source.slice(start,end);
+  assert.doesNotMatch(control,/snapshotIdNote|refs_in\(|captured\.elapsed\(\)|__delta|observations\.lock\(\)\.unwrap\(\)\.(remove|retain)/);
+  assert.doesNotMatch(source,/snapshotId 不是该标签最新观察或观察已过期|截图已过期：/);
 });
 test('Chrome retains image coordinates, fast scope and bounded batch schemas',async()=>{
   const chrome=await tool('chrome');

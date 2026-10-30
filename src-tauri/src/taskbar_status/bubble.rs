@@ -505,10 +505,12 @@ pub(super) fn payload(app: &AppHandle) -> Value {
         let settled = matches!(status.kind, Kind::Done | Kind::Error);
         if WANTED.load(Ordering::Acquire) {
             let thread = status.thread.as_deref().and_then(|id| store.get(id));
-            let (title, body) = thread.map(|t| (t.title.clone(), latest_reply(&t.items).1)).unwrap_or_default();
+            let (title, body) = status.employee.as_ref().map(|t| (t.title.clone(), t.body.clone()))
+                .unwrap_or_else(|| thread.map(|t| (t.title.clone(), latest_reply(&t.items).1)).unwrap_or_default());
             *SHOWN.lock().unwrap() = thread.filter(|_| settled).map(|t| (t.id.clone(), t.updated_at));
-            // Keyed by thread: a half-typed reply never carries over to another thread's card.
-            let key = format!("live:{}", status.thread.as_deref().unwrap_or(""));
+            // Employee handoffs keep one card; ordinary conversations remain keyed by thread.
+            let key = status.employee.as_ref().map(|t| format!("live:employee:{}", t.id))
+                .unwrap_or_else(|| format!("live:{}", status.thread.as_deref().unwrap_or("")));
             cards.push(json!({ "key": key, "live": true, "kind": name(status.kind), "text": if status.kind == Kind::Idle { "新会话 · 临时目录" } else { &status.text }, "trailing": status.trailing,
                 "threadId": status.thread, "title": title, "body": body }));
         }

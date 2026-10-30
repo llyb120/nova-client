@@ -3,6 +3,8 @@
 
 pub(crate) mod assistant;
 pub(crate) mod capsules;
+#[cfg(any(windows, test))]
+mod employee;
 #[cfg(windows)]
 mod drop_target;
 #[cfg(windows)]
@@ -148,6 +150,14 @@ pub(crate) fn alert_help(app: &tauri::AppHandle) {
     if !crate::server::is_headless() { windows::on_app(|app| ask::alert(app, true)); }
 }
 
+/// Refresh the task projection only after employee data is saved, not on every chip frame.
+pub(crate) fn employee_changed(data: &crate::employee::Employee) {
+    #[cfg(windows)]
+    employee::changed(data);
+    #[cfg(not(windows))]
+    let _ = data;
+}
+
 pub(crate) fn bounds() -> Option<Rect> {
     #[cfg(windows)]
     return windows::bounds();
@@ -283,13 +293,14 @@ pub(crate) struct Status {
     pub trailing: String,
     pub detail: String,
     pub thread: Option<String>,
+    employee: Option<employee::Task>,
 }
 
 #[cfg(any(windows, test))]
 impl Status {
     fn new(kind: Kind, text: String, trailing: String, detail: &[&str], thread: Option<String>) -> Self {
         let detail = detail.iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join("\n");
-        Self { kind, text, trailing, detail, thread }
+        Self { kind, text, trailing, detail, thread, employee: None }
     }
 
     /// Accessible name / window text.
@@ -318,44 +329,56 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
     }
     // ponytail: scan thread headers once per refresh, not transcripts; if histories grow large,
     // replace this with a running-id index maintained by the shared runtime.
+    let tasks = employee::snapshot();
     let store = state.store.lock().ok()?;
-    let running: Vec<_> = store.threads.iter().filter(|t| crate::is_running(&state, t)).collect();
-    if let Some(thread) = running.iter().max_by_key(|t| t.updated_at) {
+    let entries: Vec<_> = employee::entries(&store.threads, &tasks).collect();
+    let running: Vec<_> = entries.iter().filter(|(t, task)| task.is_some_and(|t| t.active()) || crate::is_running(&state, t)).collect();
+    if let Some((thread, task)) = running.iter().max_by_key(|(t, _)| (crate::is_running(&state, t), t.updated_at)) {
+        let working = crate::is_running(&state, thread);
         let turn = || thread.items.iter().rev().take_while(|item| !matches!(item, Item::User { .. } | Item::Turn { .. }));
-        let activity = match desktop {
+        let activity = if !working {
+            task.map(|t| t.text.clone()).unwrap_or_else(|| "等待续做".into())
+        } else { match desktop {
             Some(activity) => format!("剑来 · {activity}"),
-            None => turn().find_map(|item| match item {
+            None => task.and_then(|t| conclusion(&t.body)).or_else(|| turn().find_map(|item| match item {
                 Item::Tool { call, .. } if matches!(call.status.as_str(), "pending" | "in_progress") => Some(tool_label(call)),
                 _ => None,
-            }).unwrap_or_else(|| match turn().next() {
+            })).unwrap_or_else(|| match turn().next() {
                 Some(Item::Thought { .. }) => "正在思考",
                 Some(Item::Assistant { .. }) => "正在回复",
                 _ => "正在处理",
             }.into()),
-        };
-        let started = thread.items.iter().rev().find_map(|item| match item { Item::User { ts, .. } => Some(*ts), _ => None });
+        }};
+        let started = task.map(|t| t.created_at).or_else(|| thread.items.iter().rev().find_map(|item| match item { Item::User { ts, .. } => Some(*ts), _ => None }));
         let text = if running.len() > 1 { format!("{} 项 · {activity}", running.len()) } else { activity.clone() };
         let trailing = started.map(|t| elapsed(now - t)).unwrap_or_default();
-        return Some(Status::new(Kind::Running, text, trailing, &[&thread.title, &activity, "单击打开助理 · 双击打开 Nova"], Some(thread.id.clone())));
+        let title = task.map_or(thread.title.as_str(), |t| t.title.as_str());
+        let target = task.map_or(thread.id.as_str(), |t| t.thread.as_str());
+        let mut status = Status::new(if working { Kind::Running } else { Kind::Waiting }, text, trailing, &[title, &activity, "单击打开助理 · 双击打开 Nova"], Some(target.into()));
+        status.employee = task.cloned();
+        return Some(status);
     }
     if let Some(activity) = desktop {
         return Some(Status::new(Kind::Running, format!("剑来 · {activity}"), String::new(), &["Nova 正在操作桌面"], None));
     }
-    let candidates: Vec<_> = store.threads.iter().filter(|t| !t.items.is_empty())
-        .map(|t| (t.id.as_str(), t.updated_at, t.unread_turns, t.taskbar_seen_at)).collect();
-    let Some(thread) = pick(&candidates, shown).and_then(|id| store.threads.iter().find(|t| t.id == id)) else {
+    let candidates: Vec<_> = entries.iter().filter(|(t, task)| !t.items.is_empty() && !task.is_some_and(|t| t.active()))
+        .map(|(t, _)| (t.id.as_str(), t.updated_at, t.unread_turns, t.taskbar_seen_at)).collect();
+    let Some((thread, task)) = pick(&candidates, shown).and_then(|id| entries.iter().find(|(t, _)| t.id == id)) else {
         return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "单击向助理发消息 · 双击打开 Nova"], None));
     };
-    // The last turn's final reply (or error) is the conclusion.
-    let (kind, body) = thread.items.iter().rev()
+    // Employee conclusions come only from the archived task, never a step's final reply.
+    let (kind, body) = task.map(|t| (t.kind, t.body.as_str())).unwrap_or_else(|| thread.items.iter().rev()
         .take_while(|item| !matches!(item, Item::User { .. }))
         .find_map(|item| match item {
             Item::Assistant { text, .. } if conclusion(text).is_some() => Some((Kind::Done, text.as_str())),
             Item::System { text, level, .. } if level == "error" => Some((Kind::Error, text.as_str())),
             _ => None,
-        }).unwrap_or((Kind::Done, ""));
+        }).unwrap_or((Kind::Done, "")));
     let text = conclusion(body).unwrap_or_else(|| if kind == Kind::Error { "任务出错" } else { "已完成" }.into());
-    Some(Status::new(kind, text, ago(now - thread.updated_at), &[&thread.title, &excerpt(body, 240), "单击打开助理 · 双击打开会话"], Some(thread.id.clone())))
+    let title = task.map_or(thread.title.as_str(), |t| t.title.as_str());
+    let mut status = Status::new(kind, text, ago(now - thread.updated_at), &[title, &excerpt(body, 240), "单击打开助理 · 双击打开会话"], Some(thread.id.clone()));
+    status.employee = task.cloned();
+    Some(status)
 }
 
 /// Non-empty lines with common markdown decoration removed.
