@@ -6,8 +6,8 @@
 use crate::lyra::config::Resolved;
 use crate::lyra::context::{ContextWindow, Receipt, Trigger, SUMMARY_OUTPUT_MAX_TOKENS};
 use crate::lyra::history::{now_ms, user_message, History};
-use crate::lyra::prompt::{is_context_window_error, is_retryable_provider_error, ShellConfig};
-use crate::lyra::provider::{drop_old_tool_images, is_payload_too_large, is_retryable_stream_error, stream_chat, StreamEvent};
+use crate::lyra::prompt::{is_context_window_error, is_output_length_error, is_retryable_provider_error, ShellConfig};
+use crate::lyra::provider::{drop_old_tool_images, is_payload_too_large, is_retryable_stream_error, output_recovery_model, stream_chat, StreamEvent};
 
 use crate::lyra::tools::{execute, Tool, ToolOutcome};
 use futures_util::{stream::FuturesUnordered, StreamExt};
@@ -73,6 +73,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Sink<'a> = &'a mut (dyn FnMut(TurnEvent) + Send);
 
 const MAX_RETRIES: usize = 5;
+const OUTPUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 const CANCELLED_TEXT: &str = "已取消";
 
 /// 参数完整即可提前派发的只读工具。
@@ -282,6 +283,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
         let turn_start = s.last_user_index().unwrap_or(0);
         let mut retries = 0;
         let mut overflow_recovered = false;
+        let mut output_recovery = None;
         loop {
             if s.cancelled.load(Ordering::SeqCst) {
                 return s.cancel();
@@ -317,11 +319,12 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 let allowed: Vec<&str> = s.tools.iter().map(|tool| tool.name).collect();
                 let early = &mut early;
                 let on_event = &mut *on_event;
-                stream_chat(
+                let model = output_recovery.as_ref().unwrap_or(&s.model);
+                let request = async { stream_chat(
                     &http,
-                    &s.model.model,
-                    &s.model.api_key,
-                    s.model.thinking_level.as_deref(),
+                    &model.model,
+                    &model.api_key,
+                    model.thinking_level.as_deref(),
                     &s.system_prompt,
                     &messages,
                     &s.tools,
@@ -346,8 +349,13 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                         }
                         _ => {}
                     },
-                )
-                .await
+                ).await };
+                if output_recovery.is_some() {
+                    tokio::time::timeout(OUTPUT_RECOVERY_TIMEOUT, request).await
+                        .unwrap_or_else(|_| Err("输出耗尽恢复超过 120 秒，已停止本次恢复".into()))
+                } else {
+                    request.await
+                }
             };
             if let Ok(result) = &result {
                 if !result.usage.is_null() {
@@ -367,18 +375,27 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                     }
                     // 其他工具的图片平时原样保留以护住缓存；请求体超限时先把更早的图换成路径并写回上下文，
                     // 后续请求沿用；没有可省的图时再交给压缩。
-                    if is_payload_too_large(&error) && s.context.rewrite_view(s.history.items(), drop_old_tool_images) {
+                    if output_recovery.is_none() && is_payload_too_large(&error) && s.context.rewrite_view(s.history.items(), drop_old_tool_images) {
                         crate::lyra::provider::reset_response_state(&s.session_id);
                         on_event(TurnEvent::Retry { attempt: retries + 1, error, context_recovery: true });
                         continue;
                     }
-                    if is_context_window_error(&error) && !overflow_recovered {
+                    if is_output_length_error(&error) && output_recovery.is_none() {
+                        if let Some(model) = output_recovery_model(&s.model) {
+                            let level = model.thinking_level.as_deref().unwrap_or("low");
+                            on_event(TurnEvent::Retry { attempt: retries + 1,
+                                error: format!("{error}；临时调整思考强度为 {level}，最多恢复一次"), context_recovery: false });
+                            output_recovery = Some(model);
+                            continue;
+                        }
+                    }
+                    if output_recovery.is_none() && is_context_window_error(&error) && !overflow_recovered {
                         overflow_recovered = true;
                         if compact(s, Trigger::Overflow, on_event).await.is_some_and(|r| r.status == "applied") {
                             on_event(TurnEvent::Retry { attempt: retries + 1, error, context_recovery: true });
                             continue;
                         }
-                    } else if retries < MAX_RETRIES
+                    } else if output_recovery.is_none() && retries < MAX_RETRIES
                         && (is_retryable_provider_error(&error) || is_retryable_stream_error(&error))
                     {
                         retries += 1;
@@ -389,6 +406,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                     if crate::lyra::scene::fallback(s) {
                         retries = 0;
                         overflow_recovered = false;
+                        output_recovery = None;
                         on_event(TurnEvent::Retry { attempt: 0, error, context_recovery: false });
                         continue;
                     }
@@ -398,6 +416,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 }
             };
             retries = 0;
+            output_recovery = None;
             s.context.record_usage(&messages, &result.usage);
 
             let mut content = result.content;
@@ -1064,6 +1083,77 @@ pub(crate) mod tests {
         assert!(results[0]["content"].to_string().contains("old"));
         assert!(results[2]["content"].to_string().contains("new"));
         assert_eq!(s.cwd, next);
+    }
+
+    fn exhausted_reply() -> Option<Vec<Value>> {
+        Some(vec![json!({"choices":[{"delta":{"reasoning_content":"Still planning"},"finish_reason":"length"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})])
+    }
+
+    #[tokio::test]
+    async fn output_recovery_is_bounded_cancellable_and_needs_no_foldable_history() {
+        for (second, succeed, cancel) in [(text_reply("done"), true, false), (exhausted_reply(), false, false),
+            (None, false, false), (exhausted_reply(), false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (url, bodies) = capturing_server(vec![exhausted_reply(), second]).await;
+            let mut s = test_session(url, dir.path().into());
+            s.model.model.reasoning = true;
+            s.model.model.supports_reasoning_effort = true;
+            s.model.thinking_level = Some("high".into());
+            let cancelled = s.cancelled.clone();
+            let mut retries = 0;
+            let mut usage = Vec::new();
+            let outcome = tokio::time::timeout(Duration::from_secs(5), run_turn(&mut s, Some(user_message("go", &[])), &mut |event| match event {
+                TurnEvent::Retry { context_recovery, error, .. } => {
+                    assert!(!context_recovery && error.contains("最多恢复一次"));
+                    retries += 1;
+                    if cancel { cancelled.store(true, Ordering::SeqCst); }
+                }
+                TurnEvent::MessageEnd { usage: u } => usage.push(u),
+                TurnEvent::Compacted(_) => panic!("output exhaustion must not discard history"),
+                _ => {}
+            })).await.unwrap();
+            assert_eq!(retries, 1);
+            assert_eq!(outcome.cancelled, cancel);
+            assert_eq!(outcome.error.is_some(), !succeed && !cancel, "{outcome:?}");
+            assert_eq!(bodies.lock().unwrap().len(), if cancel { 1 } else { 2 });
+            assert_eq!(s.history.items().len(), if succeed { 2 } else { 1 }, "failed thinking must not enter history");
+            assert_eq!(usage[0]["output"], 5, "failed attempt usage is still reported");
+            assert_eq!(s.model.thinking_level.as_deref(), Some("high"));
+        }
+    }
+
+    #[tokio::test]
+    async fn output_recovery_does_not_replay_tools_and_restores_level_after_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old").unwrap();
+        let call = |id: &str, name: &str, args: Value| Some(vec![json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":id,"function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})]);
+        let (url, bodies) = capturing_server(vec![
+            call("edit-once", "edit", json!({"path":"a.txt","edits":[{"oldText":"old","newText":"new"}]})),
+            exhausted_reply(), call("budget", "context_budget", json!({})), text_reply("done")
+        ]).await;
+        let mut s = test_session(url, dir.path().into());
+        s.model.model.reasoning = true;
+        s.model.model.supports_reasoning_effort = true;
+        s.model.thinking_level = Some("high".into());
+        s.read_only = false;
+        s.shell = Some(crate::lyra::prompt::detect_shell());
+        s.tools.extend(crate::lyra::tools::tool_set(false, false, false));
+        let mut ended = Vec::new();
+        let outcome = run_turn(&mut s, Some(user_message("go", &[])), &mut |event| {
+            if let TurnEvent::ToolEnd { id, outcome } = event {
+                assert_eq!(outcome["isError"], false, "{outcome}");
+                ended.push(id);
+            }
+        }).await;
+        assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+        assert_eq!(ended, ["edit-once", "budget"]);
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "new");
+        let bodies: Vec<Value> = bodies.lock().unwrap().iter().map(|b| serde_json::from_str(b).unwrap()).collect();
+        assert_eq!(bodies.iter().map(|b| b["reasoning_effort"].as_str().unwrap()).collect::<Vec<_>>(), ["high", "high", "low", "high"]);
+        assert_eq!(bodies[1]["messages"], bodies[2]["messages"], "retry only the failed request without failed thinking");
+        assert_eq!(s.model.thinking_level.as_deref(), Some("high"));
     }
 
     #[tokio::test]

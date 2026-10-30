@@ -3,7 +3,7 @@
 //! prompt_cache_retention / 会话亲和头）。
 
 use crate::http_stream::SseDecoder;
-use crate::lyra::config::ResolvedModel;
+use crate::lyra::config::{Resolved, ResolvedModel};
 use crate::lyra::prompt::{clamp_prompt_cache_key, clamp_tool_output_text};
 use crate::lyra::tools::Tool;
 use base64::Engine;
@@ -505,6 +505,45 @@ fn ensure_output_budget(body: &Value, model: &ResolvedModel, field: &str) -> Res
         return Err(format!("context_length_exceeded: 上下文挤占输出预算（仅剩 {available} tokens），需先释放上下文"));
     }
     Ok(())
+}
+
+/// 只调整恢复请求的副本，不改用户配置或成功工具往返后的思考档位。
+pub(super) fn output_recovery_model(resolved: &Resolved) -> Option<Resolved> {
+    let model = &resolved.model;
+    if !model.reasoning || matches!(resolved.thinking_level.as_deref(), Some("off" | "none")) { return None; }
+    let native_toggle = model.api == "anthropic-messages" || matches!(model.thinking_format.as_deref(),
+        Some("deepseek" | "zai" | "moonshot" | "minimax" | "volcengine" | "qwen" | "openrouter"));
+    let level = if model.supports_thinking_toggle && native_toggle {
+        "off"
+    } else if model.supports_reasoning_effort || model.api == "openai-responses"
+        || (model.api == "anthropic-messages" && model.thinking_format.as_deref() != Some("minimax")) {
+        if matches!(resolved.thinking_level.as_deref(), Some("low" | "minimal")) { return None; }
+        "low"
+    } else { return None; };
+    let mut recovery = resolved.clone();
+    recovery.thinking_level = Some(level.into());
+    let options = &mut recovery.model.extra_options;
+    if level == "off" {
+        options.remove("reasoning_effort");
+        options.remove("thinking_budget");
+    } else if let Some(n) = options.get("thinking_budget").and_then(Value::as_u64) {
+        options.insert("thinking_budget".into(), json!(n.min(1024)));
+    }
+    // 手写 budget/effort 也不能盖过恢复档位，其它厂商选项原样保留。
+    for key in ["thinking", "reasoning", "output_config"] {
+        if let Some(fields) = options.get_mut(key).and_then(Value::as_object_mut) {
+            if level == "off" { fields.remove("effort"); }
+            else {
+                if fields.contains_key("effort") { fields.insert("effort".into(), json!("low")); }
+                for budget in ["budget_tokens", "max_tokens"] {
+                    if let Some(n) = fields.get(budget).and_then(Value::as_u64) {
+                        fields.insert(budget.into(), json!(n.min(1024)));
+                    }
+                }
+            }
+        }
+    }
+    Some(recovery)
 }
 
 pub(super) fn completions_body(
@@ -2891,6 +2930,53 @@ mod tests {
         let body = responses_body(&model, "sys", &[], &[], None, None);
         assert!(body.get("max_output_tokens").is_none());
         assert!(ensure_output_budget(&body, &model, "max_output_tokens").is_ok());
+    }
+
+    #[test]
+    fn output_recovery_respects_protocol_capabilities_and_preserves_configuration() {
+        for (api, format, toggle, effort, expected) in [
+            ("openai-completions", None, true, true, Some("low")),
+            ("openai-responses", None, false, true, Some("low")),
+            ("openai-completions", Some("deepseek"), true, false, Some("off")),
+            ("openai-completions", Some("openrouter"), true, true, Some("off")),
+            ("anthropic-messages", Some("anthropic"), true, true, Some("off")),
+            ("anthropic-messages", Some("anthropic"), false, true, Some("low")),
+            ("anthropic-messages", Some("minimax"), false, false, None),
+            ("openai-completions", Some("moonshot"), false, false, None),
+        ] {
+            let mut model = test_model(api);
+            model.thinking_format = format.map(str::to_string);
+            model.supports_thinking_toggle = toggle;
+            model.supports_reasoning_effort = effort;
+            model.extra_options = serde_json::from_value(json!({"thinking":{"type":"enabled","budget_tokens":16000},
+                "reasoning":{"effort":"high","max_tokens":16000},"output_config":{"effort":"high"},"thinking_budget":16000,"custom":"kept"})).unwrap();
+            let resolved = Resolved { model, api_key: "key".into(), thinking_level: Some("high".into()) };
+            let recovery = output_recovery_model(&resolved);
+            assert_eq!(recovery.as_ref().and_then(|m| m.thinking_level.as_deref()), expected, "{api} {format:?}");
+            if let Some(recovery) = recovery {
+                let level = recovery.thinking_level.as_deref();
+                let body = match api {
+                    "anthropic-messages" => anthropic_body(&recovery.model, "sys", &[], &[], level),
+                    "openai-responses" => responses_body(&recovery.model, "sys", &[], &[], level, None),
+                    _ => completions_body(&recovery.model, "sys", &[], &[], level, None),
+                };
+                assert_eq!(body["custom"], "kept");
+                assert_eq!(body.get("thinking_budget").and_then(Value::as_u64), if expected == Some("off") { None } else { Some(1024) });
+                if expected == Some("off") {
+                    if format == Some("openrouter") { assert_eq!(body["reasoning"]["enabled"], false); }
+                    else { assert_eq!(body["thinking"]["type"], "disabled"); }
+                } else if api == "anthropic-messages" {
+                    assert_eq!(body["thinking"]["budget_tokens"], 1024);
+                    assert_eq!(body["output_config"]["effort"], "low");
+                } else if api == "openai-responses" { assert_eq!(body["reasoning"]["effort"], "low"); }
+                else { assert_eq!(body["reasoning_effort"], "low"); }
+            }
+            assert_eq!(resolved.thinking_level.as_deref(), Some("high"));
+            assert_eq!(resolved.model.extra_options["thinking"]["budget_tokens"], 16000);
+            let mut disabled = resolved.clone();
+            disabled.thinking_level = Some("off".into());
+            assert!(output_recovery_model(&disabled).is_none());
+        }
     }
 
     pub(super) fn test_model(api: &str) -> ResolvedModel {
