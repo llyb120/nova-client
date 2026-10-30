@@ -51,7 +51,39 @@ impl History {
             messages[..split].to_vec()
         };
         out.extend_from_slice(&messages[split..]);
-        repair_interrupted_tool_pairs(&out)
+        let mut out = repair_interrupted_tool_pairs(&out);
+        trim_browser_dom(&mut out);
+        out
+    }
+}
+
+/// Only the model projection rolls off old DOM; canonical history and documentPath stay intact.
+fn trim_browser_dom(messages: &mut [Value]) {
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    for message in messages.iter_mut().rev() {
+        if message["role"] != "toolResult" || message["toolName"] != "chrome" { continue; }
+        let Some(parts) = message["content"].as_array_mut() else { continue; };
+        let mut omitted = false;
+        for part in parts.iter_mut().filter(|p| p["type"] == "text") {
+            let Some(text) = part["text"].as_str() else { continue; };
+            // ACP tags the first text part before provider normalization.
+            let tagged = text.split_once("] ").filter(|(tag, _)| tag.strip_prefix("[m")
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())));
+            let (prefix, body) = tagged.map_or(("", text), |(tag, body)| (&text[..tag.len() + 2], body));
+            let Ok(mut result) = serde_json::from_str::<Value>(body) else { continue; };
+            let Some(tab) = result["tabTag"].as_str().filter(|s| !s.is_empty()) else { continue; };
+            if !result["pages"].as_array().is_some_and(|p| !p.is_empty()) { continue; }
+            let count = seen.entry(tab.to_owned()).or_default();
+            *count += 1;
+            if *count <= 2 { continue; }
+            result.as_object_mut().unwrap().remove("pages");
+            result["domOmitted"] = json!("该标签仅保留最近两次 DOM；旧观察正文已省略，完整记录见 documentPath。");
+            part["text"] = json!(format!("{prefix}{result}"));
+            omitted = true;
+        }
+        if omitted {
+            if let Some(details) = message["details"].as_object_mut() { details.remove("pages"); }
+        }
     }
 }
 
@@ -302,6 +334,53 @@ pub fn repair_interrupted_tool_pairs(messages: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_keeps_two_dom_observations_per_tab_without_losing_action_results() {
+        let observed = |tab: &str, id: &str| json!({"tabTag":tab,"snapshotId":id,"documentPath":format!("{id}.json"),
+            "pages":[{"elements":format!("{id}.1 button Save"),"text":"old DOM","tables":[[1]]}],
+            "status":"needs_review","reason":"partial input","completedActions":1,"value":{"count":7},
+            "images":[{"imageId":id,"path":format!("{id}.webp"),"frameStream":format!("{tab}:viewport")} ]});
+        let results = vec![
+            ("chrome", observed("C1", "old")),
+            ("chrome", observed("C2", "other-tab")),
+            ("jianlai", observed("C1", "other-tool")),
+            ("chrome", observed("C1", "middle")),
+            ("chrome", json!({"tabTag":"C1","status":"executed","value":"readback"})),
+            ("chrome", observed("C1", "new")),
+            ("chrome", json!({"pages":[{"text":"unbound"}]})),
+            ("chrome", json!(["not an observation"])),
+        ];
+        let mut canonical = Vec::new();
+        for (i, (tool, result)) in results.iter().enumerate() {
+            canonical.push(json!({"role":"assistant","content":[{"type":"toolCall","id":i.to_string(),"name":tool,"arguments":{}}]}));
+            canonical.push(json!({"role":"toolResult","toolCallId":i.to_string(),"toolName":tool,
+                "content":[{"type":"text","text":result.to_string()}],"details":result}));
+        }
+        let before = canonical.clone();
+        let projected = History::for_prompt(&canonical, 0, false);
+        assert_eq!(canonical, before);
+        assert_eq!(projected.len(), canonical.len());
+        let old: Value = serde_json::from_str(projected[1]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(old.get("pages").is_none() && old["domOmitted"].is_string());
+        for key in ["tabTag","snapshotId","documentPath","status","reason","completedActions","value","images"] {
+            assert_eq!(old[key], results[0].1[key], "{key}");
+        }
+        assert!(projected[1]["details"].get("pages").is_none());
+        assert_eq!(projected[1]["details"]["images"], canonical[1]["details"]["images"]);
+        assert_eq!(projected[2..], canonical[2..], "other tabs/tools, latest two DOMs and script values stay intact");
+        assert_eq!(History::for_prompt(&projected, 0, false), projected);
+        let mut tagged = canonical.clone();
+        for i in (1..tagged.len()).step_by(2) {
+            tagged[i]["content"][0]["text"] = json!(format!("[m{i:05}] {}", tagged[i]["content"][0]["text"].as_str().unwrap()));
+        }
+        let tagged_view = History::for_prompt(&tagged, 0, false);
+        assert_eq!(tagged_view[1]["content"][0]["text"], format!("[m00001] {old}"));
+        assert_eq!(tagged_view[2..], tagged[2..]);
+        let mut malformed = canonical.clone();
+        malformed[1]["content"][0]["text"] = json!("not JSON");
+        assert_eq!(History::for_prompt(&malformed, 0, false), malformed);
+    }
 
     #[test]
     fn removes_orphaned_completed_tool_pairs() {

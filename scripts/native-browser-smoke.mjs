@@ -140,6 +140,8 @@ try {
     const input=full.pages[0].items.find(i=>i.name==='订单号');assert(input);
     const changed=await chromeUi('act',{tabTag:tag,snapshotId:chromeObs.snapshotId,action:{action:'fill',frame:0,ref:input.ref,text:'Chrome桥接验证'}});
     assert.equal(changed.status,'executed');assert.ok(changed.snapshotId);
+    assert.ok(changed.pages.every(p=>!p.delta),'rolling DOM must return self-contained summaries');
+    assert.ok(changed.pages[0].elements.includes('查询'),'unchanged targets remain in the latest DOM');
     assert.ok(changed.images?.length,'default DOM action feedback must also include a viewport image');
     assert.equal(changed.fullPage,false);
     assert.equal(await page.evaluate(()=>document.querySelector('input').value),'Chrome桥接验证');
@@ -184,8 +186,7 @@ try {
     assert.equal(fallback.reusableImageIds,undefined,'failed visual refresh must not authorize stale images');
     failNextCapture=true;
     await assert.rejects(chromeUi('screenshot',{tabTag:tag}),/fixture capture unavailable/,'explicit screenshot failures must remain errors');
-    // A batch owns focus only when it clicked/filled that exact node. An old snapshot
-    // ID is harmless for those live refs; focus theft and partial batches still stop.
+    // Snapshot IDs do not gate input; focus theft and partial batches still stop.
     await page.setContent('<input id="first" aria-label="First"><input id="second" aria-label="Second"><output></output>');
     await page.evaluate(()=>{
       window.clicks=0;window.enters=0;
@@ -201,12 +202,12 @@ try {
     assert.equal(typed.status,'executed',JSON.stringify(typed));
     assert.equal(typed.completedActions,3);assert.equal(await page.locator('#second').inputValue(),'one batch');
     const staleKeys=await chromeUi('act',{tabTag:tag,snapshotId:beforeFocus.snapshotId,action:{action:'press',key:'Enter'}});
-    assert.equal(staleKeys.status,'not_executed');assert.equal(staleKeys.inputAttempted,false);
+    assert.equal(staleKeys.status,'executed');assert.equal(staleKeys.completedActions,1);
     const staleDom=await chromeUi('act',{tabTag:tag,snapshotId:beforeFocus.snapshotId,feedback:'inspect',actions:[
       {action:'fill',ref:second.ref,text:'same live node'},{action:'press',key:'Enter'}]});
     assert.equal(staleDom.status,'executed',JSON.stringify(staleDom));assert.equal(staleDom.completedActions,2);
     assert.equal(await page.locator('#second').inputValue(),'same live node');
-    assert.equal(await page.evaluate(()=>window.enters),2,'stale snapshot recovery must not replay Enter');
+    assert.equal(await page.evaluate(()=>window.enters),3,'each requested Enter executes once, even with an old snapshot ID');
     await page.evaluate(()=>{document.querySelector('#second').onclick=()=>{window.clicks++;setTimeout(()=>document.querySelector('#first').focus(),100);};});
     const stolen=await chromeUi('act',{tabTag:tag,snapshotId:staleDom.snapshotId,feedback:'inspect',actions:[
       {action:'click',ref:second.ref},{action:'wait',ms:250},{action:'type',text:'must not leak'}]});
@@ -217,7 +218,7 @@ try {
     const stolenKey=await chromeUi('act',{tabTag:tag,snapshotId:stolen.snapshotId,actions:[
       {action:'click',ref:second.ref},{action:'wait',ms:250},{action:'press',key:'Enter'}]});
     assert.equal(stolenKey.status,'needs_review');assert.equal(stolenKey.completedActions,2);assert.match(stolenKey.reason,/焦点/);
-    assert.equal(await page.evaluate(()=>window.enters),2);
+    assert.equal(await page.evaluate(()=>window.enters),3);
     await page.evaluate(()=>{const e=document.querySelector('#second');e.replaceWith(e.cloneNode(true));});
     const replaced=await chromeUi('act',{tabTag:tag,snapshotId:stolen.snapshotId,action:{action:'fill',ref:second.ref,text:'wrong node'}});
     assert.equal(replaced.status,'not_executed');assert.equal(replaced.inputAttempted,false);assert.match(replaced.reason,/失效/);
@@ -231,21 +232,25 @@ try {
     assert.equal(await page.locator('#second').inputValue(),'coordinate focus');
     const script=`(() => { const n=document.createElement('aside'); n.className='nova-req-annot'; n.textContent='待确认'; document.body.append(n); return {count:document.querySelectorAll('.nova-req-annot').length}; })()`;
     const missing=await chromeUi('evaluate',{tabTag:tag,expression:script});
-    assert.equal(missing.status,'not_executed');assert.ok(missing.snapshotId);
-    assert.equal(await page.locator('.nova-req-annot').count(),0);
+    assert.equal(missing.status,'executed');assert.ok(missing.snapshotId);
+    assert.equal(await page.locator('.nova-req-annot').count(),1);
     const annotated=await chromeUi('evaluate',{tabTag:tag,snapshotId:missing.snapshotId,expression:script,feedback:'screenshot'});
-    assert.equal(annotated.status,'executed',JSON.stringify(annotated));assert.deepEqual(annotated.value,{count:1});
+    assert.equal(annotated.status,'executed',JSON.stringify(annotated));assert.deepEqual(annotated.value,{count:2});
     assert.ok(annotated.images.length);assert.ok(annotated.snapshotId);
     const reused=await chromeUi('evaluate',{tabTag:tag,snapshotId:missing.snapshotId,expression:script});
-    assert.equal(reused.status,'not_executed');assert.equal(await page.locator('.nova-req-annot').count(),1);
+    assert.equal(reused.status,'executed');assert.equal(await page.locator('.nova-req-annot').count(),3);
     const failed=await chromeUi('evaluate',{tabTag:tag,snapshotId:reused.snapshotId,expression:'document.querySelector(".nova-req-annot").dataset.checked="yes"; throw Error("partial script")'});
     assert.equal(failed.status,'needs_review');assert.match(failed.reason,/partial script/);
-    assert.equal(await page.locator('.nova-req-annot').getAttribute('data-checked'),'yes');assert.ok(failed.snapshotId);
-    const readback=await chromeUi('evaluate',{tabTag:tag,snapshotId:failed.snapshotId,expression:'Promise.resolve(document.querySelectorAll(".nova-req-annot").length)',feedback:'none'});
-    assert.equal(readback.value,1);assert.equal(readback.snapshotId,undefined);
-    const consumed=await chromeUi('evaluate',{tabTag:tag,snapshotId:failed.snapshotId,expression:script});
-    assert.equal(consumed.status,'not_executed');assert.equal(await page.locator('.nova-req-annot').count(),1);
-    const waiting=await chromeUi('evaluate',{tabTag:tag,snapshotId:consumed.snapshotId,expression:'new Promise(resolve => setTimeout(() => resolve(1), 6000))'});
+    assert.equal(await page.locator('.nova-req-annot').first().getAttribute('data-checked'),'yes');assert.ok(failed.snapshotId);
+    const capturesBeforeReadback=chromeCaptures.length;
+    for(let i=0;i<3;i++) {
+      const readback=await chromeUi('evaluate',{tabTag:tag,snapshotId:failed.snapshotId,expression:'Promise.resolve(document.querySelectorAll(".nova-req-annot").length)',feedback:'none'});
+      assert.equal(readback.status,'executed');assert.equal(readback.value,3);assert.equal(readback.snapshotId,undefined);
+    }
+    assert.equal(chromeCaptures.length,capturesBeforeReadback,'evaluate none must not force an observation round-trip');
+    const continued=await chromeUi('act',{tabTag:tag,snapshotId:failed.snapshotId,feedback:'inspect',action:{action:'press',key:'Escape'}});
+    assert.equal(continued.status,'executed');assert.equal(continued.completedActions,1);
+    const waiting=await chromeUi('evaluate',{tabTag:tag,snapshotId:continued.snapshotId,expression:'new Promise(resolve => setTimeout(() => resolve(1), 6000))'});
     assert.equal(waiting.status,'needs_review');assert.match(waiting.reason,/5秒超时.*可能仍在运行/);
     assert.equal(waiting.inputAttempted,true);
     const screenshot=await chromeUi('screenshot',{tabTag:tag,fullPage:false});
@@ -294,7 +299,8 @@ try {
     assert(fullChanged.images.length===2 && fullChanged.images.every(i=>i.path && !i.unchanged),JSON.stringify(fullChanged));
     const fullSame=await chromeUi('screenshot',{tabTag:tag,fullPage:true});
     assert(fullSame.images.every(i=>i.unchanged===true && i.path));
-    assert.equal(fullSame.screenshotComplete,true);    // Script feedback consumes its input snapshot but retains a safe pixel-comparison baseline.
+    assert.equal(fullSame.screenshotComplete,true);
+    // Script feedback retains its pixel-comparison baseline.
     const viewKey=await chromeUi('screenshot',{tabTag:tag,fullPage:false,maxEdge:0});
     const viewDelta=await chromeUi('evaluate',{tabTag:tag,snapshotId:viewKey.snapshotId,maxEdge:0,
       expression:'document.querySelector("#delta-top").style.background="red"; true'});

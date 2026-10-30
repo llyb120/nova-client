@@ -3,7 +3,7 @@ use crate::AppState;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -538,22 +538,6 @@ fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String
     values.into_iter().map(|value| { let action=parse_action(&value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()))?; validate_action(&action)?; Ok(action) }).collect()
 }
 
-/// Live refs are revalidated before input. Keyboard steps may follow an explicitly targeted field.
-fn refs_in(observation:&Observation, actions:&[Action]) -> bool {
-    let (mut has_ref, mut field_focus) = (false, false);
-    actions.iter().all(|action| match action {
-        Action::Click{r#ref,..}|Action::Fill{r#ref,..}|Action::Scroll{r#ref:Some(r#ref),..} => {
-            let item=observation.pages["pages"].as_array().and_then(|pages| pages.iter().filter_map(|p|p["items"].as_array()).flatten().find(|i|i["ref"].as_str()==Some(r#ref.as_str())));
-            has_ref=true;
-            if matches!(action,Action::Click{..}|Action::Fill{..}) {field_focus=item.is_some_and(|i|i["editable"]==true);}
-            item.is_some()
-        },
-        Action::Type{..}|Action::Press{..} => field_focus,
-        Action::Wait{..} => true,
-        _ => false,
-    }) && has_ref
-}
-
 fn preflight(observation:&Observation, action:&mut Action, image_id:Option<&str>) -> Result<(),String> {
     match action {
         Action::Click{frame,r#ref,..}|Action::Fill{frame,r#ref,..}|Action::Scroll{frame,r#ref:Some(r#ref),..}=>{
@@ -902,12 +886,6 @@ async fn coordinate(
                 .into(),
         );
     }
-    if observation.captured.elapsed() > Duration::from_secs(180) {
-        return Err(format!(
-            "截图已过期：已过去 {} 秒，有效期180秒；请 screenshot，不是 DOM 动画错误",
-            observation.captured.elapsed().as_secs()
-        ));
-    }
     let (x,y)=image_point(observation,x,y,image_id)?;
     evaluate(
         app,
@@ -961,7 +939,6 @@ async fn snapshot(
     let mut target=None;
     if let Some(reference)=reference {
         let previous=app.state::<BrowserState>().observations.lock().unwrap().get(&active_label(app)?).cloned().ok_or("目标裁剪需要最新 inspect/screenshot")?;
-        if args["snapshotId"].as_str()!=Some(&previous.id) { return Err("目标裁剪 snapshotId 已失效".into()); }
         if args["expandScroll"]==true {
             if args["frame"].as_u64().unwrap_or(0)!=0 {return Err("expandScroll 按 ref 截取仅支持主框架 frame=0".into());}
             target=Some(reference);
@@ -984,9 +961,8 @@ async fn snapshot(
         serde_json::to_vec(&observation.pages).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    // The private __delta flag is set only by act feedback: diff against the pre-action observation.
-    let base = previous.filter(|_| args["__delta"] == true).map(|p| &p.pages);
-    let mut result = inline_summary(&observation.pages, args, base);
+    // Each reply is self-contained: older DOM observations roll out of the model context.
+    let mut result = inline_summary(&observation.pages, args);
     result["snapshotId"] = json!(observation.id);
     result["visualReason"] = if auto_visual {json!("默认附当前视口截图，辅助 DOM 判断布局、遮挡和绘制内容；visual=none 可关闭")} else {Value::Null};
     result["documentPath"] = json!(document_path);
@@ -1159,9 +1135,7 @@ async fn snapshot(
 
 // Only the tool reply is compacted: stored observations (Altair, preflight, coordinates) and
 // documentPath keep the full DOM. Do not use Lyra's output fallback here: it also cuts names/rows.
-// `base` (act feedback only) is the pre-action observation: pages of the same document then reply
-// with what changed only (+new/~changed/-gone elements, new text lines); refs are stable per document.
-fn inline_summary(pages: &Value, args: &Value, base: Option<&Value>) -> Value {
+fn inline_summary(pages: &Value, args: &Value) -> Value {
     let mut result = pages.clone();
     if let Some(object) = result.as_object_mut() { object.remove("domCoordinates"); }
     let mut remaining_items = args["maxItems"].as_u64().unwrap_or(60).clamp(1, 2000) as usize;
@@ -1182,48 +1156,12 @@ fn inline_summary(pages: &Value, args: &Value, base: Option<&Value>) -> Value {
     let lines = |text: &Value| -> HashSet<String> { text.as_str().unwrap_or_default().lines().map(str::to_owned).collect() };
     if let Some(pages) = result["pages"].as_array_mut() {
         for page in pages {
-            let before = base.and_then(|b| b["pages"].as_array()?.iter()
-                .find(|p| p["document"].is_string() && p["document"] == page["document"]));
             if let Some(object) = page.as_object_mut() {
                 for key in ["document", "version", "stamp", "timingsMs", "scannedRoots"] { object.remove(key); }
             }
             if let Some(coverage) = page["coverage"].as_object_mut() { coverage.remove("note"); coverage.remove("scope"); }
             let mut trimmed = false;
-            let items = page["items"].as_array().cloned().unwrap_or_default();
-            let mut gone = Vec::new();
-            // (mark, item): "" full listing, "+" new, "~" changed since `before`.
-            let mut listed: Vec<(&str, Value)> = match before {
-                None => items.into_iter().map(|item| ("", item)).collect(),
-                Some(before) => {
-                    let old: HashMap<&str, &Value> = before["items"].as_array().into_iter().flatten()
-                        .filter_map(|i| Some((i["ref"].as_str()?, i))).collect();
-                    let current: HashSet<String> = items.iter().filter_map(|i| i["ref"].as_str().map(str::to_owned)).collect();
-                    gone = old.iter().filter(|(r, _)| !current.contains(**r)).map(|(_, i)| (*i).clone()).collect();
-                    let unchanged = items.len();
-                    let changed: Vec<(&str, Value)> = items.into_iter().filter_map(|item| match item["ref"].as_str().and_then(|r| old.get(r)) {
-                        None => Some(("+", item)),
-                        Some(o) if item_state(o) != item_state(&item) || (item["inView"] == true && o["inView"] != true) => Some(("~", item)),
-                        Some(_) => None,
-                    }).collect();
-                    page["delta"] = json!(true);
-                    page["unchangedItems"] = json!(unchanged - changed.len());
-                    let old_text = lines(&before["text"]);
-                    let fresh: String = page["text"].as_str().unwrap_or_default().lines()
-                        .filter(|l| !l.trim().is_empty() && !old_text.contains(*l)).collect::<Vec<_>>().join("\n");
-                    page["text"] = json!(fresh);
-                    if let Some(object) = page.as_object_mut() { object.remove("visibleText"); }
-                    if let Some(tables) = page["tables"].as_array_mut() {
-                        let old = before["tables"].as_array().cloned().unwrap_or_default();
-                        tables.retain(|t| !old.contains(t));
-                    }
-                    if let Some(headings) = page["headings"].as_array_mut() {
-                        let old = before["headings"].as_array().cloned().unwrap_or_default();
-                        headings.retain(|h| !old.contains(h));
-                    }
-                    if page["canvases"] == before["canvases"] { if let Some(o) = page.as_object_mut() { o.remove("canvases"); } }
-                    changed
-                }
-            };
+            let mut listed = page["items"].as_array().cloned().unwrap_or_default();
             let original_text = page["text"].as_str().unwrap_or_default().to_string();
             let mut text: String = around_query(&original_text).chars().take(remaining_text).collect();
             remaining_text -= text.chars().count();
@@ -1241,7 +1179,7 @@ fn inline_summary(pages: &Value, args: &Value, base: Option<&Value>) -> Value {
                 if text.lines().all(|l| l.trim().is_empty() || shown.contains(l)) { text.clear(); }
             }
             page["text"] = json!(text);
-            listed.retain(|(_, item)| query.is_empty() || format!("{} {} {}", item["name"], item["region"], item["href"])
+            listed.retain(|item| query.is_empty() || format!("{} {} {}", item["name"], item["region"], item["href"])
                 .to_lowercase().contains(&query));
             // Preserve observed order: an obscured first result must not become the last result.
             let total = listed.len();
@@ -1250,16 +1188,14 @@ fn inline_summary(pages: &Value, args: &Value, base: Option<&Value>) -> Value {
             trimmed |= total > listed.len();
             let mut out = Vec::new();
             let mut last_region = String::new();
-            for (mark, item) in &listed {
+            for item in &listed {
                 // ponytail: region previews are 120 chars, printed once per run of same-region elements; query/documentPath recover the rest.
                 let mut region = item["region"].clone();
                 trimmed |= truncate_inline_text(&mut region, 120);
                 let region = region.as_str().unwrap_or_default().to_string();
                 if region != last_region { out.push(format!("@ {}", if region.is_empty() { "-" } else { &region })); last_region = region; }
-                out.push(item_line(item, mark));
+                out.push(item_line(item));
             }
-            for item in gone.iter().take(10) { out.push(format!("- {} {} {}", str_of(&item["ref"]), str_of(&item["role"]), json!(str_of(&item["name"])))); }
-            if gone.len() > 10 { out.push(format!("- …另有{}个元素消失", gone.len() - 10)); }
             // 有 query 时表格只留命中行；表头与行都未命中的表整张省略（documentPath 仍是全量）。
             if let Some(tables) = page.get_mut("tables").and_then(Value::as_array_mut).filter(|_| !query.is_empty()) {
                 let before = tables.to_vec();
@@ -1290,18 +1226,9 @@ fn inline_summary(pages: &Value, args: &Value, base: Option<&Value>) -> Value {
 
 fn str_of(value: &Value) -> &str { value.as_str().unwrap_or_default() }
 
-/// What an element looks like to the model, without geometry: equal states mean "unchanged".
-fn item_state(item: &Value) -> Value {
-    let mut state = item.clone();
-    if let Some(object) = state.as_object_mut() {
-        for key in ["ref", "nodeId", "point", "viewportRect", "documentRect", "inView", "tabIndex"] { object.remove(key); }
-    }
-    state
-}
-
-/// One element per line: `[mark]ref role "name" key=value… flags`. Geometry is kept only where
+/// One element per line: `ref role "name" key=value… flags`. Geometry is kept only where
 /// coordinates are the interface (Canvas, scroll containers); DOM actions bind by frame/ref.
-fn item_line(item: &Value, mark: &str) -> String {
+fn item_line(item: &Value) -> String {
     let token = |value: &Value| match value.as_str() {
         Some(s) if !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '=' | '\\')) => s.to_string(),
         Some(s) => json!(s).to_string(),
@@ -1309,7 +1236,7 @@ fn item_line(item: &Value, mark: &str) -> String {
     };
     let rect = |r: &Value| format!("{},{},{},{}", r["x"].as_f64().unwrap_or(0.).round(), r["y"].as_f64().unwrap_or(0.).round(),
         r["width"].as_f64().unwrap_or(0.).round(), r["height"].as_f64().unwrap_or(0.).round());
-    let mut line = format!("{mark}{} {} {}", str_of(&item["ref"]), str_of(&item["role"]), json!(str_of(&item["name"])));
+    let mut line = format!("{} {} {}", str_of(&item["ref"]), str_of(&item["role"]), json!(str_of(&item["name"])));
     for (key, label) in [("value", "value"), ("dateValue", "date"), ("selected", "selected"), ("expanded", "expanded"), ("haspopup", "popup"),
         ("sort", "sort"), ("href", "href"), ("icon", "icon"), ("columnKey", "key"), ("fieldContext", "field"), ("blockedBy", "blockedBy")] {
         let value = &item[key];
@@ -1347,11 +1274,11 @@ fn truncate_inline_text(value: &mut Value, max_chars: usize) -> bool {
 fn carry_screenshot(observation: &mut Observation, previous: Option<&Observation>) -> Option<Vec<String>> {
     let stamp = &observation.pages["pages"][0]["stamp"];
     let previous = previous.filter(|p| !observation.screenshot && p.screenshot && stamp.is_string()
-        && p.pages["pages"][0]["stamp"] == *stamp && p.captured.elapsed() <= Duration::from_secs(180))?;
+        && p.pages["pages"][0]["stamp"] == *stamp)?;
     observation.screenshot = true;
     observation.full_page = previous.full_page;
     observation.images = previous.images.clone();
-    // Age stays the image's, so the 180s coordinate expiry is not extended by DOM refreshes.
+    // Keep the image's capture time rather than the DOM refresh time.
     observation.captured = previous.captured;
     Some(observation.images.iter().map(|i| i.id.clone()).collect())
 }
@@ -1391,19 +1318,8 @@ async fn control_session(
         if !matches!(operation,"act"|"evaluate") {return Ok(snapshot(app,operation=="screenshot",args,current.as_ref()).await?.1);}
         let script = if operation == "evaluate" { Some(evaluation_args(args)?) } else { None };
         let mut actions=if script.is_some() { Vec::new() } else { parse_actions(args, 16)? };
-        let live_refs=script.is_none() && current.as_ref().is_some_and(|o|refs_in(o,&actions));
-        let with_image=current.as_ref().is_some_and(|o|o.screenshot) || actions.iter().any(|a|matches!(a,Action::ClickAt{..}|Action::Move{..}|Action::Drag{..}|Action::ScrollAt{..}));
-        let Some(observation)=current.clone().filter(|o|live_refs || (args["snapshotId"].as_str()==Some(&o.id) && o.captured.elapsed()<=Duration::from_secs(180))) else {
-            // Nothing was sent; attach a fresh observation so the model re-decides in this round-trip.
-            let mut observe_args=args.clone();
-            if let Some(a)=observe_args.as_object_mut() {for key in ["ref","frame","region"] {a.remove(key);}}
-            observe_args["fullPage"]=json!(false);
-            if with_image {observe_args["scope"]=json!("viewport");}
-            let mut fresh=snapshot(app,with_image,&observe_args,current.as_ref()).await?.1;
-            fresh["status"]=json!("not_executed");fresh["completedActions"]=json!(0);fresh["inputAttempted"]=json!(false);
-            fresh["reason"]=json!("snapshotId 不是该标签最新观察或观察已过期，本批次未执行；已附当前观察，用新的 snapshotId/ref/imageId 重新决策，不要重放");
-            return Ok(fresh);
-        };
+        // snapshotId is provenance, not an input lock; use this owner's bound tab directly.
+        let observation=current.ok_or("该标签尚无观察，请先 inspect 获取 frame/ref 或截图坐标")?;
         // Static validation for the WHOLE batch; revalidate the live node/focus
         // before every individual input. Never retarget by matching its label.
         for action in &mut actions {
@@ -1423,15 +1339,11 @@ async fn control_session(
         // Background tabs throttle animation/timer sampling, making stable DOM targets time out as "moving".
         // Activate the explicitly bound tab before live checks; stale geometry/identity is still checked by apply.
         crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
-        state.observations.lock().unwrap().remove(&s.active_tab);
         let mut failure=None;
         let mut action_timings=Vec::new();
         let clipboard=crate::clipboard::sequence();
         let mut script_value = None;
         if let Some((expression, index)) = script {
-            // A script can change any DOM state; retire every owner's observation of this tab before dispatch.
-            let suffix = format!(":{}", s.active_tab.rsplit(':').next().unwrap());
-            state.observations.lock().unwrap().retain(|key, _| !key.ends_with(&suffix));
             let frame = &observation.frames[index];
             let page = &observation.pages["pages"][index];
             let expression = format!("__novaWebview.evaluate({},{},{})", json!(expression), page["document"], page["url"]);
@@ -1483,9 +1395,6 @@ async fn control_session(
             "reason":failure,"inputAttempted":progress.attempted,"completedActions":progress.completed,"actionTimingsMs":action_timings,"basedOnSnapshotId":observation.id,"verification":"unverified"});
         if let Some(value) = script_value { result["value"] = value; }
         result["actionMs"] = json!(started.elapsed().as_millis());
-        if args["snapshotId"].as_str()!=Some(&observation.id) {
-            result["snapshotIdNote"]=json!(format!("传入的 snapshotId 不是最新观察（最新为 {}）；本批 ref 均属最新观察，已按 ref 执行。snapshotId 取工具返回的顶层 snapshotId，不是 ref", observation.id));
-        }
         result.as_object_mut().unwrap().retain(|key, v| key == "value" || !v.is_null());
         completed_action = Some(result.clone());
         // A click/Enter often starts a navigation; feeding back the old DOM costs the model another
@@ -1524,15 +1433,13 @@ async fn control_session(
         if opened.is_empty() && (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
             let mut feedback_args = args.clone();
             feedback_args["fullPage"] = json!(false);
-            feedback_args["__delta"] = json!(failure.is_none() && script.is_none());
             if let Some(args)=feedback_args.as_object_mut() {for key in ["ref","frame","region"] {args.remove(key);} }
             if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
-            // Occlusion cannot be explained by an unchanged DOM delta; show the blocker.
+            // Show the actual blocker when DOM text cannot explain an occluded target.
             let visual=args["feedback"]=="screenshot"
                 || failure.as_deref().is_some_and(|reason| reason.contains("目标被遮挡"));
             // Feedback failure must never turn a completed mutation into a retryable action failure.
-            // A script retires input snapshots, not the comparison baseline. Fresh document/stamp/geometry
-            // checks in deliver_screenshot still refuse reuse after navigation or viewport changes.
+            // Fresh document/stamp/geometry checks still refuse image reuse after navigation or viewport changes.
             match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,
                 if script.is_none() || visual || feedback_args["visual"] != "none" { Some(&observation) } else { None })).await {
                 Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
@@ -1716,9 +1623,7 @@ pub(crate) fn altair_observation(root: &Path, args: &Value, owner: &str, tool: &
     let key = altair_observation_key(root, args, owner, tool)?;
     let state = app.state::<BrowserState>();
     let observations = state.observations.lock().unwrap();
-    let observation = observations.get(&key)
-        .filter(|o| args["snapshotId"].as_str() == Some(&o.id) && o.captured.elapsed() <= Duration::from_secs(180))
-        .ok_or("观察已失效，交回主模型重新观察")?;
+    let observation = observations.get(&key).ok_or("该标签尚无观察，请先 inspect")?;
     Ok(observation.pages.clone())
 }
 
@@ -1760,8 +1665,7 @@ fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashM
     let prefix = format!("chrome:{owner}:");
     let mut matches = observations.iter().filter_map(|(key, observation)| {
         let tag = key.strip_prefix(&prefix).filter(|tag| valid_tag(tag))?;
-        (observation.captured.elapsed() <= Duration::from_secs(180)
-            && args.get("snapshotId").is_none_or(|id| id.as_str() == Some(&observation.id)))
+        args.get("snapshotId").is_none_or(|id| id.as_str() == Some(&observation.id))
             .then_some(tag)
     });
     let tag = matches.next().filter(|_| matches.next().is_none()).ok_or(
@@ -1803,7 +1707,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
 }
 
 async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
-    // An act consumes its input snapshot; always return a real observation, never mint a stale ID.
+    // Actions return their resulting DOM; evaluate feedback=none keeps the existing observation.
     let mut args = args.clone();
     if args["operation"] == "act" && args["feedback"] == "none" { args["feedback"] = json!("inspect"); }
     let args = &args;
@@ -2088,6 +1992,7 @@ fn state_dir(app: &AppHandle) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn popup_feedback_follows_only_one_new_active_child() {
@@ -2113,7 +2018,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_summary_lists_compact_elements_and_act_deltas() {
+    fn inline_summary_keeps_self_contained_compact_elements() {
         let item = |n: usize, name: &str| json!({"ref":format!("d.{n}"),"nodeId":format!("doc:{n}"),"role":"input","tag":"input",
             "name":name,"fieldContext":"日期 [field 2/2]","region":"Filters panel","inView":n < 50,"editable":true,"disabled":false,
             "selected":false,"sort":"descending","column":{"table":0,"index":2,"name":"Units","group":"M Science"},
@@ -2125,7 +2030,7 @@ mod tests {
             "coverage":{"scope":"all","note":"boilerplate","lazyImages":0}});
         let full = json!({"coverageGaps":[],"domCoordinates":"boilerplate","pages":[page((0..60).map(|n| item(n, &format!("Search {n}"))).collect(), "Visible line")]});
         let original = full.to_string();
-        let summary = inline_summary(&full, &json!({"maxItems":61}), None);
+        let summary = inline_summary(&full, &json!({"maxItems":61}));
         assert_eq!(full.to_string(), original, "Altair and documentPath must retain the full observation");
         let p = &summary["pages"][0];
         let elements = p["elements"].as_str().unwrap();
@@ -2139,54 +2044,42 @@ mod tests {
         assert_eq!(p["tables"], json!([table]));
         assert!(summary.to_string().len() < original.len() / 2, "compact lines must shrink the reply: {} vs {}", summary.to_string().len(), original.len());
 
-        let searched = inline_summary(&full, &json!({"query":"needle","maxItems":1}), None);
+        let searched = inline_summary(&full, &json!({"query":"needle","maxItems":1}));
         assert_eq!(searched["pages"][0]["matchingItems"], 0);
         assert_eq!(searched["pages"][0]["tables"][0]["rows"], json!([["needle row","9"]]));
-        let limited = inline_summary(&full, &json!({"maxItems":5}), None);
+        let limited = inline_summary(&full, &json!({"maxItems":5}));
         assert_eq!(limited["pages"][0]["inlineTruncated"], true);
         assert_eq!(limited["pages"][0]["matchingItems"], 60);
 
         let mut first = item(51, "Intelligence");
         first["blockedBy"] = json!("Search suggestions");
         let ordered = json!({"pages":[page(vec![first, item(1, "Intelligence")], "Results")]});
-        let first_only = inline_summary(&ordered, &json!({"query":"Intelligence","maxItems":1}), None);
+        let first_only = inline_summary(&ordered, &json!({"query":"Intelligence","maxItems":1}));
         let first_line = first_only["pages"][0]["elements"].as_str().unwrap();
         assert!(first_line.contains("d.51 ") && !first_line.contains("d.1 "), "truncation must retain the first result even when it is blocked or offscreen");
 
-        // After an act: same document → only changed elements, new text and changed tables.
-        let mut after_items: Vec<Value> = (1..60).map(|n| item(n, &format!("Search {n}"))).collect();
-        after_items[0]["value"] = json!("2027-01-01");
-        after_items[1]["point"] = json!({"x":1,"y":1}); // geometry only: unchanged
-        after_items[55]["inView"] = json!(true); // scrolled into view
-        after_items.push(item(99, "Apply"));
-        let after = json!({"pages":[page(after_items, "Visible line\nSaved 3 rows")]});
-        let delta = inline_summary(&after, &json!({}), Some(&full));
-        let p = &delta["pages"][0];
-        let lines: Vec<&str> = p["elements"].as_str().unwrap().lines().filter(|l| !l.starts_with('@')).collect();
-        assert_eq!(lines.len(), 4, "{lines:?}");
-        assert!(lines[0].starts_with("~d.1 ") && lines[0].contains("value=2027-01-01"));
-        assert!(lines.iter().any(|l| l.starts_with("~d.56 ")) && lines.iter().any(|l| l.starts_with("+d.99 input \"Apply\"")));
-        assert_eq!(lines[3], r#"- d.0 input "Search 0""#);
-        assert_eq!(p["delta"], true);
-        assert_eq!(p["unchangedItems"], 57);
-        assert_eq!(p["text"], "Saved 3 rows");
-        assert!(p.get("visibleText").is_none());
-        assert_eq!(p["tables"], json!([]));
-        assert_eq!(p["headings"], json!([]));
-        // Another document (navigation) is never diffed.
-        let mut navigated = after.clone();
-        navigated["pages"][0]["document"] = json!("other");
-        assert!(inline_summary(&navigated, &json!({}), Some(&full))["pages"][0].get("delta").is_none());
+        // Feedback must not depend on an older DOM that can roll out of context.
+        let mut after = full.clone();
+        after["pages"][0]["items"][0]["value"] = json!("2027-01-01");
+        let feedback = inline_summary(&after, &json!({}));
+        let p = &feedback["pages"][0];
+        assert_eq!(p["matchingItems"], 60);
+        assert!(p["elements"].as_str().unwrap().contains("value=2027-01-01"));
+        assert!(p["elements"].as_str().unwrap().contains("d.59 "));
+        assert!(p.get("delta").is_none());
+        assert_eq!(p["visibleText"], "Visible line");
+        assert_eq!(p["tables"], summary["pages"][0]["tables"]);
+        assert_eq!(p["headings"], summary["pages"][0]["headings"]);
     }
 
     #[test]
     fn item_line_keeps_coordinate_geometry_for_canvas_and_scroll_only() {
         let canvas = json!({"ref":"f.1","role":"canvas","name":"","inView":true,"canvas":{"width":1000,"height":800},
             "point":{"x":5,"y":5},"viewportRect":{"x":0.4,"y":10,"width":500,"height":400}});
-        assert_eq!(item_line(&canvas, ""), r#"f.1 canvas "" canvas=1000x800 rect=0,10,500,400"#);
+        assert_eq!(item_line(&canvas), r#"f.1 canvas "" canvas=1000x800 rect=0,10,500,400"#);
         let pane = json!({"ref":"f.2","role":"div","name":"list","inView":true,"scroll":{"top":10,"height":900,"pointX":null},
             "viewportRect":{"x":0,"y":0,"width":200,"height":300},"blockedBy":"Cookie banner"});
-        assert_eq!(item_line(&pane, "~"), r#"~f.2 div "list" blockedBy="Cookie banner" scroll={"top":10,"height":900} rect=0,0,200,300"#);
+        assert_eq!(item_line(&pane), format!(r#"f.2 div "list" blockedBy="Cookie banner" scroll={} rect=0,0,200,300"#, json!({"top":10,"height":900})));
     }
 
     #[test]
@@ -2198,7 +2091,7 @@ mod tests {
         assert!(truncate_inline_text(&mut text, 0));
         assert_eq!(text, "");
         let small = json!({"pages":[{"text":"ok","visibleText":"ok","items":[],"headings":[],"truncated":false}]});
-        let summarize = |v: &Value| inline_summary(v, &json!({}), None);
+        let summarize = |v: &Value| inline_summary(v, &json!({}));
         assert_eq!(summarize(&small)["pages"][0]["inlineTruncated"], false);
         for (key, value) in [("visibleText", json!("界".repeat(3001))),
             ("headings", json!(vec![json!({"text":"heading"});21])),
@@ -2232,7 +2125,8 @@ mod tests {
         let observed = |id: &str, stamp: Value, shot: bool| Observation { frames: Vec::new(), id: id.into(),
             pages: json!({"pages":[{"stamp":stamp}]}), captured: std::time::Instant::now(), screenshot: shot, full_page: false,
             images: if shot { vec![ScreenshotImage { id: format!("{id}-0"), path: "a.png".into(), x: 0., y: 0., width: 10., height: 10., pixels: (10, 10), delivered: None }] } else { Vec::new() } };
-        let shot = observed("old", json!("[\"u\",0]"), true);
+        let mut shot = observed("old", json!("[\"u\",0]"), true);
+        shot.captured -= Duration::from_secs(181);
         let mut same = observed("new", json!("[\"u\",0]"), false);
         assert_eq!(carry_screenshot(&mut same, Some(&shot)), Some(vec!["old-0".to_string()]));
         assert!(same.screenshot && same.captured == shot.captured && same.images[0].id == "old-0");
@@ -2304,23 +2198,6 @@ mod tests {
         assert!(matches!(click, Action::Click { frame: 1, .. }));
         let mut fake = parse_action(r#"{"action":"click","frame":0,"ref":"c:1"}"#).unwrap();
         assert!(preflight(&observation, &mut fake, None).is_err());
-        // Keyboard actions need a preceding explicit field target to reuse an old snapshot.
-        let act = |json: &str| vec![parse_action(json).unwrap()];
-        assert!(refs_in(&observation, &act(r#"{"action":"click","frame":0,"ref":"b:51"}"#)));
-        assert!(!refs_in(&observation, &act(r#"{"action":"click","frame":0,"ref":"c:1"}"#)));
-        assert!(!refs_in(&observation, &act(r#"{"action":"press","key":"Enter"}"#)));
-        assert!(!refs_in(&observation, &[]));
-        let batch=|text:&str| parse_actions(&serde_json::from_str::<Value>(text).unwrap(),16).unwrap();
-        for good in [
-            r#"{"actions":[{"action":"click","ref":"b:51"},{"action":"type","text":"query"},{"action":"press","key":"Enter"}]}"#,
-            r#"{"actions":[{"action":"fill","ref":"b:51","text":"query"},{"action":"wait","ms":10},{"action":"press","key":"Enter"}]}"#,
-        ] {assert!(refs_in(&observation,&batch(good)),"{good}");}
-        for bad in [
-            r#"{"actions":[{"action":"type","text":"query"},{"action":"click","ref":"b:51"}]}"#,
-            r#"{"actions":[{"action":"click","ref":"a:1"},{"action":"press","key":"Enter"}]}"#,
-            r#"{"actions":[{"action":"click","ref":"b:51"},{"action":"click_at","x":10,"y":10}]}"#,
-            r#"{"actions":[{"action":"wait","ms":10}]}"#,
-        ] {assert!(!refs_in(&observation,&batch(bad)),"{bad}");}
     }
 
     #[test]
@@ -2468,9 +2345,13 @@ mod tests {
         let explicit = json!({"operation":"inspect","tabTag":"C3-explicit"});
         assert_eq!(chrome_args(&explicit, "owner", &observations).unwrap(), explicit);
         observations.get_mut("chrome:owner:C1-test").unwrap().captured -= Duration::from_secs(181);
-        assert!(chrome_args(&act, "owner", &observations).is_err());
+        assert_eq!(chrome_args(&act, "owner", &observations).unwrap()["tabTag"], "C1-test");
         observations.remove("chrome:owner:C2-test");
-        assert!(chrome_args(&inspect, "owner", &observations).is_err());
+        assert_eq!(chrome_args(&inspect, "owner", &observations).unwrap()["tabTag"], "C1-test");
+        for snapshot in [json!("stale"), Value::Null] {
+            let explicit = json!({"operation":"act","tabTag":"C1-test","snapshotId":snapshot});
+            assert_eq!(chrome_args(&explicit, "owner", &observations).unwrap(), explicit);
+        }
         for operation in ["connect", "status", "tabs", "open", "new_tab", "downloads", "experience_search"] {
             let args = json!({"operation":operation});
             assert_eq!(chrome_args(&args, "owner", &observations).unwrap(), args);
