@@ -27,6 +27,7 @@ import {
   IconBell,
   IconBroadcast,
   IconCheck,
+  IconClue,
   IconChevron,
   IconChevronLeft,
   IconDownload,
@@ -38,9 +39,11 @@ import {
   IconNovaMark,
   IconPlus,
   IconSearch,
+  IconStar,
   IconTerminal,
   IconTrash,
   IconTrophy,
+  IconUsers,
   IconX,
 } from "./icons";
 import { TypewriterText } from "./TypewriterText";
@@ -271,6 +274,14 @@ export function Sidebar(props: {
   };
 
   const [deletingGroup, setDeletingGroup] = createSignal<string | null>(null);
+  const toggleProject = (cwd: string) => {
+    const paths = sidebarLayout.collapsedProjects;
+    setSidebarLayout({
+      collapsedProjects: paths.includes(cwd)
+        ? paths.filter((path) => path !== cwd)
+        : [...paths, cwd],
+    });
+  };
   const [expandedGroups, setExpandedGroups] = createSignal<Set<string>>(new Set());
   const toggleGroup = (cwd: string) => {
     setExpandedGroups((current) => {
@@ -611,23 +622,25 @@ export function Sidebar(props: {
     >
       <div class="sidebar-head">
         <Show when={titlebarTabs()} keyed>{(mount) => <Portal mount={mount}>
-        <div class="mode-seg secondary" role="tablist" aria-label="主区域">
+        <nav class="mode-seg secondary" aria-label="主区域">
           <Show when={state.settings?.knowledgeGraphEnabled}>
-            <button class="mode-seg-btn" classList={{ active: state.view === "knowledge" || state.view === "jianpu" }}
+            <button type="button" class="mode-seg-btn" classList={{ active: state.view === "knowledge" || state.view === "jianpu" }}
+              aria-current={state.view === "knowledge" || state.view === "jianpu" ? "page" : undefined}
               onClick={() => switchView("knowledge")} title="查看操作路径与下一步分支">
-              知识图谱
+              <span aria-hidden="true"><IconClue size={15} /></span>知识图谱
             </button>
           </Show>
-          <button class="mode-seg-btn" classList={{ active: state.view === "employee" }}
+          <button type="button" class="mode-seg-btn" classList={{ active: state.view === "employee" }}
+            aria-current={state.view === "employee" ? "page" : undefined}
             onClick={() => switchView("employee")} title="数字员工：空闲时按职责自动干活">
-            数字员工
+            <span aria-hidden="true"><IconUsers size={15} /></span>数字员工
           </button>
           <button type="button" class="mode-seg-btn" classList={{ active: state.view === "miniapps" }}
             aria-current={state.view === "miniapps" ? "page" : undefined}
             onClick={() => switchView("miniapps")} title="观星台：创建和打开应用">
-            观星台
+            <span aria-hidden="true"><IconStar size={15} /></span>观星台
           </button>
-        </div>
+        </nav>
         </Portal>}</Show>
         <Show when={titlebarSide()} keyed>{(mount) => <Portal mount={mount}>
         <div class="brand">
@@ -770,6 +783,7 @@ export function Sidebar(props: {
                 const isRemote = !!guestThread;
                 const peerName = guestThread?.roamingPeerName ?? "";
                 const rows = () => threadTreeRows(threads);
+                const projectCollapsed = () => sidebarLayout.collapsedProjects.includes(cwd);
                 const expanded = () => expandedGroups().has(cwd);
                 const collapsible = () => rows().length > COLLAPSED_THREAD_LIMIT;
                 const visibleRows = () =>
@@ -795,13 +809,22 @@ export function Sidebar(props: {
                         });
                       }}
                     >
-                      {isRemote ? <IconBroadcast size={12} /> : <IconFolder size={12} />}
-                      <span class="group-name">{groupName(cwd)}</span>
-                      <Show when={isRemote}>
-                        <span class="group-roam" title={`在 ${peerName} 的机器上执行`}>
-                          @{peerName}
-                        </span>
-                      </Show>
+                      <button
+                        type="button"
+                        class="group-project-toggle"
+                        aria-expanded={!projectCollapsed()}
+                        aria-label={`${projectCollapsed() ? "展开" : "收起"}项目 ${groupName(cwd)}`}
+                        onClick={() => toggleProject(cwd)}
+                      >
+                        {isRemote ? <IconBroadcast size={12} /> : <IconFolder size={12} />}
+                        <span class="group-name">{groupName(cwd)}</span>
+                        <Show when={isRemote}>
+                          <span class="group-roam" title={`在 ${peerName} 的机器上执行`}>
+                            @{peerName}
+                          </span>
+                        </Show>
+                        <IconChevron size={12} open={!projectCollapsed()} />
+                      </button>
                       <button
                         class="group-delete"
                         title="删除该文件夹里的会话"
@@ -817,36 +840,38 @@ export function Sidebar(props: {
                         <IconTrash size={12} />
                       </button>
                     </div>
-                    <For each={visibleRows()}>
-                      {(row) => (
-                        <ThreadRow
-                          thread={row.thread}
-                          child={row.child}
-                          childCount={row.childCount}
-                          mergedChild={row.mergedChild}
-                        />
-                      )}
-                    </For>
-                    <Show when={collapsible()}>
-                      <button
-                        type="button"
-                        class="thread-group-toggle"
-                        classList={{ expanded: expanded() }}
-                        aria-expanded={expanded()}
-                        aria-label={
-                          expanded()
-                            ? "收起会话"
-                            : `展开其余 ${rows().length - COLLAPSED_THREAD_LIMIT} 个会话`
-                        }
-                        title={
-                          expanded()
-                            ? `收起到最近 ${COLLAPSED_THREAD_LIMIT} 个会话`
-                            : `展开其余 ${rows().length - COLLAPSED_THREAD_LIMIT} 个会话`
-                        }
-                        onClick={() => toggleGroup(cwd)}
-                      >
-                        <IconChevron size={14} open />
-                      </button>
+                    <Show when={!projectCollapsed()}>
+                      <For each={visibleRows()}>
+                        {(row) => (
+                          <ThreadRow
+                            thread={row.thread}
+                            child={row.child}
+                            childCount={row.childCount}
+                            mergedChild={row.mergedChild}
+                          />
+                        )}
+                      </For>
+                      <Show when={collapsible()}>
+                        <button
+                          type="button"
+                          class="thread-group-toggle"
+                          classList={{ expanded: expanded() }}
+                          aria-expanded={expanded()}
+                          aria-label={
+                            expanded()
+                              ? "收起会话"
+                              : `展开其余 ${rows().length - COLLAPSED_THREAD_LIMIT} 个会话`
+                          }
+                          title={
+                            expanded()
+                              ? `收起到最近 ${COLLAPSED_THREAD_LIMIT} 个会话`
+                              : `展开其余 ${rows().length - COLLAPSED_THREAD_LIMIT} 个会话`
+                          }
+                          onClick={() => toggleGroup(cwd)}
+                        >
+                          <IconChevron size={14} open />
+                        </button>
+                      </Show>
                     </Show>
                   </div>
                 );

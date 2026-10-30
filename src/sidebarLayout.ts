@@ -1,9 +1,14 @@
 import { createStore } from 'solid-js/store';
 
-export const defaultSidebarLayout = { collapsed: false };
+export const defaultSidebarLayout = { collapsed: false, collapsedProjects: [] as string[] };
 const key = 'fd:sidebarLayout';
 function validated(value: Partial<typeof defaultSidebarLayout>): typeof defaultSidebarLayout {
-  return { collapsed: value.collapsed === true };
+  return {
+    collapsed: value.collapsed === true,
+    collapsedProjects: Array.isArray(value.collapsedProjects)
+      ? value.collapsedProjects.filter((path): path is string => typeof path === 'string')
+      : [],
+  };
 }
 let initial = defaultSidebarLayout;
 try {

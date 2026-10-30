@@ -8,10 +8,11 @@ const appWindow = getCurrentWindow();
 
 // Portal 挂载点用 ref 信号而非 getElementById：首次渲染时标题栏尚未接入文档，按 id 查询会落空。
 const [titlebarSide, setTitlebarSide] = createSignal<HTMLElement>();
+const [titlebarTabs, setTitlebarTabs] = createSignal<HTMLElement>();
 const [titlebarView, setTitlebarView] = createSignal<HTMLElement>();
 let titlebarHost: HTMLDivElement | undefined;
 let titlebarRevision = 0;
-export { titlebarSide, titlebarView };
+export { titlebarSide, titlebarTabs, titlebarView };
 
 /** 各页面只迁移原有顶栏；独立应用窗口没有主标题栏时不挂载。 */
 export function TitleBarPortal(props: { children: JSX.Element }) {
@@ -108,6 +109,7 @@ export function TitleBar() {
     >
       <div ref={setTitlebarSide} class="titlebar-side" classList={{ collapsed: sidebarLayout.collapsed }} />
       <div class="titlebar-main">
+        <div ref={setTitlebarTabs} class="titlebar-tabs" />
         <div ref={titlebarHost} class="titlebar-view" data-tauri-drag-region />
         <div ref={setTitlebarView} class="titlebar-staging" aria-hidden="true" inert />
         <div class="titlebar-window-controls">

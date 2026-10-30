@@ -255,12 +255,66 @@ button {
   padding-left: 8px;
 }
 .titlebar-tabs > div { display: contents; }
+.titlebar-tabs .mode-seg {
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
 .titlebar-tabs .mode-seg-btn {
+  position: relative;
   flex: none;
-  height: 28px;
-  padding: 0 10px;
-  font-size: 12px;
+  gap: 6px;
+  height: 30px;
+  padding: 0 13px;
+  border: 0;
+  border-top: 1px solid var(--border-strong);
+  border-radius: 0;
+  clip-path: polygon(0 0, calc(100% - 7px) 0, 100% 7px, 100% 100%, 7px 100%, 0 calc(100% - 7px));
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
   white-space: nowrap;
+  color: var(--text);
+  background: var(--bg-active);
+  box-shadow: none;
+  transition: background-color 0.15s, color 0.15s;
+}
+.titlebar-tabs .mode-seg-btn::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 5px;
+  bottom: 8px;
+  width: 2px;
+  background: var(--accent);
+  pointer-events: none;
+}
+.titlebar-tabs .mode-seg-btn > span {
+  display: inline-flex;
+  color: var(--accent);
+}
+.titlebar-tabs .mode-seg-btn:hover {
+  background: color-mix(in srgb, var(--bg-active) 82%, var(--accent));
+}
+.titlebar-tabs .mode-seg-btn.active {
+  color: var(--bg);
+  font-weight: 600;
+  background: var(--text);
+  border-top-color: var(--text);
+  box-shadow: none;
+}
+.titlebar-tabs .mode-seg-btn.active::before { background: var(--bg); }
+.titlebar-tabs .mode-seg-btn.active > span { color: inherit; }
+/* 焦点框放在切角内部，避免被 clip-path 裁掉。 */
+.titlebar-tabs .mode-seg-btn:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: -4px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .titlebar-tabs .mode-seg-btn { transition: none; }
 }
 /* Portal 会多包一层 div，用 contents 让会话头部直接参与标题栏的布局。 */
 .titlebar-view {
@@ -817,6 +871,21 @@ button {
   color: var(--text-muted);
   text-transform: none;
 }
+.group-project-toggle {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  gap: 6px;
+  text-align: left;
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  border-radius: 5px;
+}
+.group-project-toggle:hover { color: var(--text); }
+.group-project-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .group-label svg {
   flex-shrink: 0;
 }

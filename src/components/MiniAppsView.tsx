@@ -923,7 +923,6 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
 
   return <main class="mini-studio" classList={{ "mini-runtime": !!props.runtimeAppId }}>
     <Show when={!props.runtimeAppId}><TitleBarPortal><header class="mini-topbar">
-      <div class="mini-brand"><span class="mini-mark" aria-hidden="true">✦</span><div><strong>观星台</strong><small>每一颗星，都是灵光一闪</small></div><span class="mini-beta">预览版</span></div>
       <Show when={active()}>{saved => <div class="mini-current"><strong title={appName(saved())}>{appName(saved())}</strong><span class="mini-chip" classList={{ live: !!saved().published }}>{appStatus(saved())}</span></div>}</Show>
       <div class="mini-top-actions">
         <button disabled={!active()?.history.length || locked() || mode() === "run"} onClick={undo}>撤销</button>
