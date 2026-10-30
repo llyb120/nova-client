@@ -540,6 +540,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             if ponytail.is_empty() { "、‘无风险’声明" } else { "" },
             if ponytail.is_empty() { "" } else { "结尾按 ponytail 规则用一两行写明跳过或未检查的内容及用户须知的风险；与本条冲突时以 ponytail 为准。" }
         ),
+        "回复中的图片使用 Markdown 内联展示：`![图片说明](<图片地址>)`，不要放在代码块里，也不要只给普通文件链接。本地图片使用已确认存在的绝对路径（Windows 用正斜杠）；网络图片使用完整的 http(s) URL；地址用尖括号包裹以兼容空格。优先沿用工具返回的图片 Markdown，不编造图片路径或 URL。".into(),
         ponytail,
         "完成修改后按需验证：改动小、影响明确时做成本最低的检查即可，影响面大或不确定时再按需扩大到受影响单元及直接使用方；禁止遍历或列出完整仓库、无依据扩大范围。最终回复只需说明验证是否通过，不列具体命令和逐项过程；仅当验证失败、无法验证或结果存在关键限制时补充原因与影响。".into(),
         match &options.shell {
@@ -613,6 +614,7 @@ mod tests {
         assert!(prompt.contains("减少模型往返") && prompt.contains("_after:[2]"));
         assert!(!prompt.contains("你是 Lyra") && !prompt.contains("exec_command"));
         assert!(prompt.contains("‘无风险’声明") && !prompt.contains("Ponytail"));
+        assert!(prompt.contains("![图片说明](<图片地址>)") && prompt.contains("绝对路径"));
         let prompt = build_system_prompt(&SystemPromptOptions { ponytail: true, ..options });
         assert!(!prompt.contains("‘无风险’声明") && prompt.contains("以 ponytail 为准"));
     }
