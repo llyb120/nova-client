@@ -48,11 +48,15 @@ impl Routing {
         }
     }
 
+    /// 请求模型 ID 不含档位，界面必须使用场景配置的完整选择值。
+    pub fn selection(&self) -> Option<&str> {
+        self.names.iter().find(|(scene, _)| *scene == self.active)
+            .and_then(|(_, names)| names.get(self.attempt)).map(String::as_str)
+    }
+
     fn selected(&self) {
-        if let Some(hook) = &self.on_selected {
-            if let Some(name) = self.names.iter().find(|(scene, _)| *scene == self.active).and_then(|(_, names)| names.get(self.attempt)) {
-                hook(self.active, name);
-            }
+        if let (Some(hook), Some(name)) = (&self.on_selected, self.selection()) {
+            hook(self.active, name);
         }
     }
 
@@ -260,6 +264,53 @@ mod tests {
     fn call(id: &str, name: &str, args: Value) -> Option<Vec<Value>> {
         Some(vec![json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":id,
             "function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})])
+    }
+
+    #[tokio::test]
+    async fn scene_model_labels_keep_effort_on_switch_fallback_and_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = json!({"scene":"coding","message":"修复问题","resume":"继续独立任务"});
+        let (url, bodies) = capturing_server(vec![
+            call("code", TOOL, args.clone()), text_reply("编码完成"), text_reply("独立任务完成"),
+            text_reply("备用档位完成"), text_reply("独立任务完成"),
+        ]).await;
+        let config = json!({"provider":{"p":{
+            "api":"openai-completions",
+            "options":{"baseURL":url,"apiKey":"k","reasoningEffort":"low"},
+            "models":{"m":{"reasoning":true},"code":{"variants":{
+                "high":{"reasoningEffort":"high"},"medium":{"reasoningEffort":"medium"}
+            }}}
+        }}});
+        let env = HashMap::new();
+        let mut s = test_session(String::new(), dir.path().into());
+        s.model = config::resolve_model(&config, Some("p/m"), &env).unwrap();
+        let routing = Routing::new(Scene::Lightweight, vec![
+            (Scene::Lightweight, vec!["p/m".into()]),
+            (Scene::Coding, vec!["p/code/variant/high".into(), "p/code/variant/medium".into()]),
+        ], &config, &env, s.system_prompt.clone(), s.tools.clone());
+        routing.install(&mut s);
+        let mut requested_models = Vec::new();
+        for fail in [false, true] {
+            if fail {
+                assert!(!switch(&mut s, &args).is_error);
+                s.model.model.api = "invalid-test-api".into();
+            }
+            let outcome = run_turn(&mut s, Some(user_message("执行任务", &[])), &mut |event| {
+                if let TurnEvent::MessageStart { model } = event { requested_models.push(model); }
+            }).await;
+            assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+            assert_eq!(s.scenes.as_ref().unwrap().selection(), Some("p/m"));
+            assert_eq!(s.model.thinking_level.as_deref(), Some("low"));
+        }
+        assert_eq!(requested_models, [
+            "p/m", "p/code/variant/high", "p/m",
+            "p/code/variant/high", "p/code/variant/medium", "p/m",
+        ]);
+        let bodies: Vec<Value> = bodies.lock().unwrap().iter().map(|body| serde_json::from_str(body).unwrap()).collect();
+        assert_eq!(bodies.iter().map(|body| body["model"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["m", "code", "m", "code", "m"]);
+        assert_eq!(bodies.iter().map(|body| body["reasoning_effort"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["low", "high", "low", "medium", "low"]);
     }
 
     #[tokio::test]

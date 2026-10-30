@@ -304,7 +304,10 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
             }
             let messages = s.context.prompt_view(s.history.items());
 
-            on_event(TurnEvent::MessageStart { model: format!("{}/{}", s.model.model.provider, s.model.model.id) });
+            let model = s.scenes.as_ref().and_then(|routing| routing.selection())
+                .filter(|model| !model.is_empty()).map(str::to_owned)
+                .unwrap_or_else(|| format!("{}/{}", s.model.model.provider, s.model.model.id));
+            on_event(TurnEvent::MessageStart { model });
             let mut early: Vec<(String, String, Value, tokio::task::JoinHandle<ToolOutcome>)> = Vec::new();
             let result = {
                 let http = s.http();
