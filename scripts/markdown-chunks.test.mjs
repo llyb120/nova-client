@@ -84,11 +84,71 @@ try {
   const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto(`http://127.0.0.1:${server.address().port}`);
   await page.waitForFunction(()=>window.load);
-  const source = padding.repeat(75) + '\n\nhidden alpha **bold** omega\n\n```ts\nconsole.log("copy")\n```\n\n`src/check.ts`\n\n<script>window.BAD=true</script>\n\nend-marker';
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=';
+  const inlineImage = `![图片预览](data:image/png;base64,${png})`;
+  await page.route(/^(?:http:\/\/asset\.localhost|https:\/\/image-fixture\.test)\//, route => route.fulfill({ contentType: 'image/png', body: Buffer.from(png, 'base64') }));
+  await page.evaluate(() => {
+    window.__TAURI_INTERNALS__ = { convertFileSrc: path => `http://asset.localhost/${encodeURIComponent(path)}` };
+  });
+  for (const [href, path] of [
+    ['D:/My Images/猫.png', 'D:/My Images/猫.png'],
+    ['/tmp/图片.png', '/tmp/图片.png'],
+    ['https://image-fixture.test/photo.png', null],
+    [`data:image/png;base64,${png}`, null],
+  ]) {
+    await page.evaluate(text => window.load(text), `![图片预览](<${href}>)`);
+    const img = page.locator('.markdown img');
+    assert.equal(await img.getAttribute('src'), path ? `http://asset.localhost/${encodeURIComponent(path)}` : href);
+    assert.equal(await img.getAttribute('data-image-path'), path);
+    assert.equal(await img.getAttribute('alt'), '图片预览');
+    await page.waitForFunction(() => document.querySelector('.markdown img')?.naturalWidth > 0);
+  }
+  for (const href of ['javascript:alert(1)', 'file://secret', '//remote/test.png']) {
+    await page.evaluate(text => window.load(text), `![禁止加载](<${href}>)`);
+    assert.equal(await page.locator('.markdown img').count(), 0, 'Unsafe image URLs must not render');
+  }
+  await page.evaluate(text => window.load(text.slice(0, -1), true), inlineImage);
+  await page.evaluate(text => window.load(text, true), inlineImage);
+  await page.waitForFunction(() => document.querySelector('.markdown img')?.naturalWidth > 0);
+  await page.evaluate(text => window.load(text), inlineImage);
+  assert.equal(await page.locator('.markdown img').count(), 1, 'Completion must preserve the streamed image');
+  const quotedBold = '因为**“显示名称”不等于内部的 Provider ID**。';
+  const quotedText = '“显示名称”不等于内部的 Provider ID';
+  const emphasisCases = [
+    [quotedBold, [quotedText]],
+    ['这是**“重点”**内容', ['“重点”']],
+    ['**“重点”**内容', ['“重点”']],
+    ['这是**「重点」**内容', ['「重点」']],
+    ['これは**「重要」**です', ['「重要」']],
+    ['这是***“重点”***内容', ['“重点”']],
+    ['这是**“重点”**和**「下一项」**内容', ['“重点”', '「下一项」']],
+    ['普通 **bold** 和**中文**内容', ['bold', '中文']],
+    [String.raw`因为\*\*“名称”\*\*内容`, []],
+    ['`' + quotedBold + '`', [], [quotedBold]],
+    ['```md\n' + quotedBold + '\n```', [], [quotedBold + '\n']],
+    ['abc**"bold"**def', []],
+    ['因为**“未闭合', []],
+    ['因为** 空白**内容', []],
+    ['这是**“`code` 与 [链接](https://example.org/a**b**c)”**内容', ['“code 与 链接”'], ['code']],
+  ];
+  for (const [text, strong, codes = []] of emphasisCases) {
+    await page.evaluate(text=>window.load(text), text);
+    assert.deepEqual(await page.locator('.markdown strong').allTextContents(), strong, text);
+    assert.deepEqual(await page.locator('.markdown code').allTextContents(), codes, text);
+  }
+  assert.equal(await page.locator('.markdown a').getAttribute('href'), 'https://example.org/a**b**c');
+  await page.evaluate(text=>window.load(text.slice(0, -2), true), quotedBold);
+  await page.evaluate(text=>window.load(text, true), quotedBold);
+  await page.waitForFunction(text=>document.querySelector('.markdown strong')?.textContent===text, quotedText);
+  await page.evaluate(text=>window.load(text), quotedBold);
+  assert.equal(await page.locator('.markdown strong').textContent(), quotedText, 'Completion must preserve streamed bold');
+  const source = inlineImage + '\n\n' + quotedBold + '\n\n这是**“重点”**内容\n\n' + padding.repeat(75) + '\n\nhidden alpha **bold** omega\n\n```ts\nconsole.log("copy")\n```\n\n`src/check.ts`\n\n<script>window.BAD=true</script>\n\nend-marker';
   // Raw HTML is separately tested for safety/indivisibility, not used in bounded fixture.
   const bounded = source.replace('<script>window.BAD=true</script>', 'safe');
   await page.evaluate(text=>window.load(text),bounded);
   await page.waitForFunction(()=>document.querySelector('[data-markdown-chunk] p'));
+  await page.waitForFunction(()=>document.querySelector('[data-markdown-chunk="0"] img')?.naturalWidth > 0);
+  assert.deepEqual((await page.locator('[data-markdown-chunk="0"] strong').allTextContents()).slice(0, 2), [quotedText, '“重点”'], 'Virtual chunks must use the same emphasis rules');
   assert.ok(await page.locator('.markdown *').count()<1000,'Single 300k reply must have bounded DOM');
   await page.waitForTimeout(100);
   const emptyFrames=await page.evaluate(async()=>{

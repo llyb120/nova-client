@@ -1,5 +1,5 @@
 import DOMPurify from "dompurify";
-import { Marked } from "marked";
+import { Marked, Tokenizer } from "marked";
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, onCleanup, Show, untrack } from "solid-js";
 import { LONG_MARKDOWN_THRESHOLD, type MarkdownChunk } from "../markdownChunks";
@@ -13,6 +13,24 @@ import { createFileContextMenu } from "./FileContextMenu";
 
 const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const marked = new Marked({ gfm: true, breaks: true });
+const CJK_CHAR_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+// CJK 紧贴带标点的粗体时放宽边界；仅调整分隔符判断，不改动原文或代码。
+marked.use({
+  tokenizer: {
+    emStrong(src, maskedSrc, prevChar) {
+      if (!src.startsWith("**") || !CJK_CHAR_RE.test(prevChar ?? "")) return false;
+      return Tokenizer.prototype.emStrong.call(this, src, maskedSrc, "") ?? false;
+    },
+  },
+  hooks: {
+    emStrongMask(src) {
+      return src.replace(
+        /(?![*_\\])[\p{P}\p{S}](?=\*{2,}[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}])/gu,
+        (char) => "a".repeat(char.length),
+      );
+    },
+  },
+});
 marked.use({ renderer: {
   link({ href, tokens }) {
     const file = linkedFile(href);
