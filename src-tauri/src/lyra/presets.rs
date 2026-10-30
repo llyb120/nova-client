@@ -213,6 +213,7 @@ const PRESETS: &[Preset] = &[
     preset("codebuddy", "CodeBuddy（本地 API）", "", false),
     preset("workbuddy", "WorkBuddy（本地 API）", "", false),
     preset("commandcode", "Command Code", "https://api.commandcode.ai/provider/v1", false),
+    preset("opendesign", "OpenDesign", "https://amr-link.open-design.ai/v1", false),
     preset("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1", true),
     preset("opencode-go", "OpenCode Go", "https://opencode.ai/zen/go/v1", true),
     preset("deepseek", "DeepSeek", "https://api.deepseek.com", true),
@@ -724,8 +725,12 @@ fn convert(list: &Value, meta: Option<&Value>, catalog: Option<&Value>, preset_i
         if let Some(name) = entry["name"].as_str().or_else(|| info.and_then(|i| i["name"].as_str())) {
             model["name"] = json!(name);
         }
-        let context = entry["context_length"].as_u64().or_else(|| info.and_then(|i| i.pointer("/limit/context")).and_then(Value::as_u64));
+        let metadata = if preset_id == "opendesign" { &entry["metadata"] } else { &null };
+        let context = entry["context_length"].as_u64()
+            .or_else(|| metadata["context_limit"].as_u64().filter(|n| *n > 0))
+            .or_else(|| info.and_then(|i| i.pointer("/limit/context")).and_then(Value::as_u64));
         let output = entry.pointer("/top_provider/max_completion_tokens").and_then(Value::as_u64)
+            .or_else(|| metadata["output_budget"].as_u64().filter(|n| *n > 0))
             .or_else(|| info.and_then(|i| i.pointer("/limit/output")).and_then(Value::as_u64));
         let mut limit = json!({});
         if let Some(context) = context.filter(|n| *n > 0) {
@@ -1523,6 +1528,45 @@ env_key = "TEST_KEY"
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn opendesign_preset_uses_cloud_api_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = json!({ "provider": {
+            "od": { "preset": "opendesign", "options": { "apiKey": "test-key" } }
+        }});
+        expand(&mut config, root.path());
+        let provider = &config["provider"]["od"];
+        assert_eq!(provider["name"], "OpenDesign");
+        assert_eq!(provider["api"], "openai-completions");
+        assert_eq!(provider["options"], json!({
+            "baseURL": "https://amr-link.open-design.ai/v1", "apiKey": "test-key"
+        }));
+        assert!(list().as_array().unwrap().contains(&json!({
+            "id": "opendesign", "name": "OpenDesign",
+            "baseURL": "https://amr-link.open-design.ai/v1", "local": false
+        })));
+    }
+
+    #[test]
+    fn opendesign_models_use_live_limits_without_changing_protocol() {
+        let mut list = json!({ "data": [{ "id": "m",
+            "architecture": { "input_modalities": ["text", "image"] },
+            "metadata": { "context_limit": 1_000_000, "output_budget": 32_000 }
+        }] });
+        let catalog = json!({ "anthropic": { "npm": "@ai-sdk/anthropic", "models": {
+            "m": { "limit": { "context": 200_000, "output": 64_000 } }
+        } } });
+        let models = convert(&list, None, Some(&catalog), "opendesign");
+        assert_eq!(models["m"]["limit"], json!({ "context": 1_000_000, "output": 32_000 }));
+        assert_eq!(models["m"]["modalities"]["input"], json!(["text", "image"]));
+        assert!(models["m"].get("api").is_none());
+        assert_eq!(convert(&list, None, Some(&catalog), "openai-compatible")["m"]["limit"],
+            json!({ "context": 200_000, "output": 64_000 }));
+        list["data"][0]["metadata"] = json!({ "context_limit": 0, "output_budget": "invalid" });
+        assert_eq!(convert(&list, None, Some(&catalog), "opendesign")["m"]["limit"],
+            json!({ "context": 200_000, "output": 64_000 }));
+    }
+
     #[tokio::test]
     async fn compatible_presets_fill_reasoning_without_changing_protocol() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1548,7 +1592,7 @@ env_key = "TEST_KEY"
             { "id": "Google/Gemini-Test" },
             { "id": "unknown" },
         ] });
-        for preset_id in ["commandcode", "openai-compatible"] {
+        for preset_id in ["commandcode", "opendesign", "openai-compatible"] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let body = list.to_string();
