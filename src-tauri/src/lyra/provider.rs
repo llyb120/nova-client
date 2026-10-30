@@ -17,6 +17,9 @@ mod response_state;
 #[cfg(test)]
 #[path = "response_state_tests.rs"]
 mod response_state_tests;
+#[cfg(test)]
+#[path = "stream_recovery_tests.rs"]
+mod stream_recovery_tests;
 
 /// Optional integration hook for explicit session reset/close or cancellation between requests.
 /// In-flight leases are invalidated too; history-prefix checks handle ordinary compaction.
@@ -911,19 +914,28 @@ async fn post_stream(
     Ok(response)
 }
 
-/// 逐行读取 SSE，回调每个 data 负载；[DONE] 或取消时结束。返回是否被取消。
+enum SseProgress {
+    Continue,
+    // Completions 的 finish_reason 后仍可能有 usage；仅允许恢复随后的传输失败。
+    Recoverable,
+    Done,
+}
+
+/// 逐行读取 SSE；协议终止事件 / [DONE] 或取消时结束。返回是否被取消。
 async fn read_sse(
     response: &mut reqwest::Response,
     cancel: &Arc<AtomicBool>,
     require_done: bool,
-    mut on_data: impl FnMut(&str) -> Result<(), String>,
+    mut on_data: impl FnMut(&str) -> Result<SseProgress, String>,
 ) -> Result<bool, String> {
     let mut decoder = SseDecoder::new();
     let mut total = 0;
+    let mut recoverable = false;
     loop {
         let chunk = tokio::select! {
             result = tokio::time::timeout(SSE_IDLE_TIMEOUT, response.chunk()) => {
                 match result {
+                    Ok(Err(_)) | Err(_) if recoverable => return Ok(cancel.load(Ordering::SeqCst)),
                     Ok(result) => result.map_err(|e| format!("读取响应流失败：{e}"))?,
                     Err(_) => return Err(format!(
                         "provider SSE 连续 {}s 无数据",
@@ -955,9 +967,13 @@ async fn read_sse(
         };
         for data in events {
             if data == "[DONE]" {
-                return Ok(false);
+                return Ok(cancel.load(Ordering::SeqCst));
             }
-            on_data(&data)?;
+            match on_data(&data)? {
+                SseProgress::Done => return Ok(cancel.load(Ordering::SeqCst)),
+                SseProgress::Recoverable => recoverable = true,
+                SseProgress::Continue => { if !data.is_empty() { recoverable = false; } }
+            }
         }
         if finished {
             if require_done { return Err("CodeBuddy 响应中断：缺少 [DONE]".into()); }
@@ -1169,6 +1185,17 @@ fn map_finish_reason(
     }
 }
 
+fn completions_progress(strict: bool, reason: Option<&str>, calls: &[ToolCallAccum]) -> SseProgress {
+    if !strict && matches!(reason, Some("stop" | "tool_calls"))
+        && (reason != Some("tool_calls") || !calls.is_empty())
+        && calls.iter().all(|call| !call.id.is_empty() && !call.name.is_empty()
+            && serde_json::from_str::<Value>(&call.arguments).is_ok_and(|args| args.is_object())) {
+        SseProgress::Recoverable
+    } else {
+        SseProgress::Continue
+    }
+}
+
 pub(super) async fn stream_completions(
     http: &reqwest::Client,
     model: &ResolvedModel,
@@ -1190,10 +1217,10 @@ pub(super) async fn stream_completions(
     let mut finish_reason: Option<String> = None;
     let mut reasoning_details = Vec::new();
     let cancelled = read_sse(&mut response, cancel, strict, |data| {
-        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
+        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(SseProgress::Continue); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             if strict { return Err("CodeBuddy 流 JSON 无效".into()); }
-            return Ok(());
+            return Ok(SseProgress::Continue);
         };
         if strict {
             if !value["error"].is_null() || value.get("code").is_some_and(|code| code != 0) {
@@ -1242,7 +1269,7 @@ pub(super) async fn stream_completions(
                 .pointer("/choices/0/finish_reason")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            return Ok(());
+            return Ok(completions_progress(strict, finish_reason.as_deref(), &calls));
         }
         if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
             result.usage = completions_usage(usage);
@@ -1302,7 +1329,7 @@ pub(super) async fn stream_completions(
                 .unwrap_or("provider stream error");
             return Err(format!("provider 错误：{message}"));
         }
-        Ok(())
+        Ok(completions_progress(strict, finish_reason.as_deref(), &calls))
     })
     .await?;
     if !reasoning_details.is_empty() {
@@ -1502,7 +1529,7 @@ async fn stream_responses_once(
     let mut authoritative_output = false;
     let mut completed_items = std::collections::BTreeMap::new();
     let cancelled = read_responses_data(&mut response, cancel, |data| {
-        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
+        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(SseProgress::Continue); }
         let value: Value = serde_json::from_str(data).map_err(|_| "provider stream error: invalid Responses JSON")?;
         let kind = value
             .get("type")
@@ -1512,7 +1539,6 @@ async fn stream_responses_once(
             || kind.starts_with("response.reasoning") || matches!(kind, "response.text.delta" | "response.refusal.delta") {
             meta.generated = true;
         }
-        if terminal { return Err("provider stream error: event after Responses terminal".into()); }
         match kind {
             "response.output_text.delta" | "response.text.delta" | "response.refusal.delta" => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
@@ -1619,7 +1645,7 @@ async fn stream_responses_once(
                 }
             }
         }
-        Ok(())
+        Ok(if terminal { SseProgress::Done } else { SseProgress::Continue })
     })
     .await?;
     if cancelled || cancel.load(Ordering::SeqCst) {
@@ -1669,7 +1695,7 @@ async fn stream_responses_once(
 async fn read_responses_data(
     response: &mut reqwest::Response,
     cancel: &Arc<AtomicBool>,
-    mut on_data: impl FnMut(&str) -> Result<(), String>,
+    mut on_data: impl FnMut(&str) -> Result<SseProgress, String>,
 ) -> Result<bool, String> {
     if !response.headers().get("content-type").and_then(|h| h.to_str().ok())
         .is_some_and(|h| h.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json")) {
@@ -2457,9 +2483,9 @@ async fn stream_anthropic(
     let mut initial_inputs: HashMap<u64, Value> = HashMap::new();
     let mut stop_reason: Option<String> = None;
     let cancelled = read_sse(&mut response, cancel, false, |data| {
-        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(()); }
+        if data.is_empty() { on_event(StreamEvent::Activity); return Ok(SseProgress::Continue); }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
-            return Ok(());
+            return Ok(SseProgress::Continue);
         };
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
@@ -2573,6 +2599,16 @@ async fn stream_anthropic(
                     anthropic_usage(usage, &mut result.usage);
                 }
             }
+            Some("message_stop") => {
+                if stop_reason.as_deref().is_none_or(str::is_empty) || !blocks.is_empty()
+                    || result.content.iter().any(|part| part["type"] == "toolCall"
+                        && (!part["id"].as_str().is_some_and(|s| !s.is_empty())
+                            || !part["name"].as_str().is_some_and(|s| !s.is_empty())
+                            || !part["arguments"].is_object() || part["arguments"].get("__invalidJson").is_some())) {
+                    return Err("provider stream error: Anthropic 结束状态或工具调用不完整".into());
+                }
+                return Ok(SseProgress::Done);
+            }
             Some("error") => {
                 let message = value
                     .pointer("/error/message")
@@ -2582,7 +2618,7 @@ async fn stream_anthropic(
             }
             _ => {}
         }
-        Ok(())
+        Ok(SseProgress::Continue)
     })
     .await?;
 
@@ -3376,7 +3412,7 @@ mod tests {
         read_sse(&mut response, &Arc::new(AtomicBool::new(false)), false, |data| {
             assert!(data.is_empty(), "注释心跳不能变成模型内容");
             activity += 1;
-            Ok(())
+            Ok(SseProgress::Continue)
         }).await.unwrap();
         server.join().unwrap();
         assert!(activity > 0);
