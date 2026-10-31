@@ -209,6 +209,19 @@ window.test={
     replace([g],'rich');
     for(const key of ['turn-106','process-102','thought-102','tool-103','tool-104'])toggleExpanded(key,true);
   },
+  foldImages(mode){
+    const target=mode==='bottom'?7:4;
+    const image={name:'fold.svg',mimeType:'image/svg+xml',data:btoa('<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60"><rect width="120" height="60" fill="#41609a"/></svg>')};
+    const groups=Array.from({length:8},(_,i)=>({
+      user:{type:'user',id:i*10+1,ts:0,text:'fold-images-'+i,images:[image]},
+      body:[...(i===target?[{type:'tool',id:i*10+2,ts:0,title:'Fold image tool',kind:'read',status:'completed',toolCallId:'fold-images',locations:[],content:[{type:'content',content:{type:'text',text:'tool output line\\n'.repeat(40)}}]}]:[]),
+        {type:'assistant',id:i*10+3,ts:0,text:'![fold image]('+location.origin+'/img-fold.svg)\\n\\nfold-image-end-'+i}],
+      turn:{type:'turn',id:i*10+4,ts:0,durationMs:1000,stopReason:'end'},
+    }));
+    replace(groups,'fold-images');
+    for(const key of ['turn-'+(target*10+4),'process-'+(target*10+2)])toggleExpanded(key,true);
+    return target;
+  },
   inline(){const g=group(0);g.body=[{type:'assistant',id:2,ts:0,text:'Search alpha **bold** omega tail'}];replace([g],'inline');},
   tall(){const groups=Array.from({length:60},(_,i)=>group(i));groups[30]={...groups[30],body:[{type:'assistant',id:92,ts:0,text:Array.from({length:700},(_,i)=>'tall-line-'+i+' stable reading anchor').join('\\n\\n')}]};replace(groups,'tall');},
   firstPaint(){paintedFrames=[];replace(Array.from({length:2000},(_,i)=>group(i)),'first-paint');captureFrames=8;},
@@ -615,6 +628,55 @@ async function run(browser, port, report) {
     await page.evaluate(() => window.test.finishCold());
     await waitText('cold-ready-0');
     await waitBottom();
+    });
+
+    for (const mode of ['browse', 'bottom']) await check(`tool-fold-images-${mode}`, async () => {
+      const index = await page.evaluate(mode => window.test.foldImages(mode), mode);
+      await waitText('fold-image-end-' + index);
+      if (mode === 'browse') await page.evaluate(index => window.test.jump(index), index);
+      await settle();
+      await page.locator(`[data-group-index="${index}"] img`).evaluateAll(images => Promise.all(images.map(image => image.decode())));
+      await settle();
+      const log = [];
+      report.scenarios.push({ name: `tool-fold-images-${mode}`, frames: log });
+      for (const selector of ['.ht-tool-line', '.ht-process-fold', '.ht-turn-fold']) {
+        for (let toggle = 0; toggle < 4; toggle++) {
+          const result = await page.evaluate(async ({ index, selector }) => {
+            const root = document.querySelector('.html-transcript');
+            const row = root.querySelector(`[data-group-index="${index}"]`);
+            const button = row.querySelector(selector);
+            const images = [...row.querySelectorAll('img')];
+            const before = button.getBoundingClientRect().top - root.getBoundingClientRect().top;
+            const expanded = button.getAttribute('aria-expanded');
+            const frames = [];
+            // rAF + task samples the geometry that was just painted, not only the final settled state.
+            const sample = async () => {
+              await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+              const coverage = window.test.scrollCoverage();
+              frames.push({ top: coverage.top, max: coverage.max, gap: coverage.maxGapPx, overlap: coverage.maxOverlapPx,
+                offset: button.getBoundingClientRect().top - root.getBoundingClientRect().top,
+                hidden: getComputedStyle(root.querySelector('.html-transcript-space')).visibility === 'hidden',
+                sameImages: images.every(image => image.isConnected && image.complete && image.naturalWidth > 0),
+                imageTops: images.map(image => image.getBoundingClientRect().top - root.getBoundingClientRect().top) });
+            };
+            const first = sample();
+            button.click();
+            await first;
+            for (let i = 0; i < 4; i++) await sample();
+            return { before, expanded, after: button.getAttribute('aria-expanded'), frames };
+          }, { index, selector });
+          log.push({ selector, toggle, ...result });
+          assert.notEqual(result.after, result.expanded, 'Fixture must actually toggle the detail');
+          for (const frame of result.frames) {
+            const label = `${mode}/${selector}/${toggle}: ${JSON.stringify(result.frames)}`;
+            assert.ok(!frame.hidden && frame.sameImages, `Unrelated images were hidden or remounted: ${label}`);
+            assert.ok(frame.gap <= 2 && frame.overlap <= 2, `Fold painted stale row positions: ${label}`);
+            if (mode === 'bottom') assert.ok(frame.max - frame.top <= 2, `Fold painted before bottom correction: ${label}`);
+            else assert.ok(Math.abs(frame.offset - result.before) <= limits.anchorPx, `Fold moved the reading anchor: ${label}`);
+            assert.ok(frame.imageTops.every((top, i) => Math.abs(top - result.frames.at(-1).imageTops[i]) <= 2), `Images moved after the first fold frame: ${label}`);
+          }
+        }
+      }
     });
 
     // Fold/unfold and search in content that starts outside the collapsed preview.
