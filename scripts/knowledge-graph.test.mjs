@@ -59,8 +59,8 @@ assert.deepEqual(buildKnowledgeGraph([]), { nodes: [], edges: [], routes: [], st
 let server, browser;
 try {
   await writeFile(name + '.html', '<div id="root"></div><script type="module" src="/' + name + '.tsx"></script>');
-  await writeFile(name + '.tsx', "import { render } from 'solid-js/web'; import View from './src/components/KnowledgeGraphView'; import './src/app.css'; render(() => <div style={{display:'flex',height:'100vh'}}><View /></div>, document.getElementById('root'));");
-  server = await createServer({ server: { host: '127.0.0.1', port: 5189, strictPort: false } });
+  await writeFile(name + '.tsx', "import { render } from '@solidjs/web'; import View from './src/components/KnowledgeGraphView'; import './src/app.css'; render(() => <div style={{display:'flex',height:'100vh'}}><View /></div>, document.getElementById('root'));");
+  server = await createServer({ optimizeDeps: { noDiscovery: true, include: ['solid-js', '@solidjs/web'] }, cacheDir: `node_modules/.vite-${name}`, server: { host: '127.0.0.1', port: 5189, strictPort: false } });
   await server.listen();
   let executablePath;
   for (const path of [process.env.TEST_BROWSER, 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', '/usr/bin/chromium'].filter(Boolean)) {
@@ -71,7 +71,7 @@ try {
   page.setDefaultTimeout(10000); page.setDefaultNavigationTimeout(60000);
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   await page.addInitScript(data => {
-    window.__TAURI_INTERNALS__ = { invoke: async command => {
+    window.__TAURI_INTERNALS__ = { metadata: { currentWindow: { label: 'main' } }, invoke: async command => {
       if (command !== 'knowledge_graph') throw Error('Unexpected command: ' + command);
       if (window.failRead) throw Error('经验库忙');
       return window.empty ? [] : data;
@@ -132,5 +132,5 @@ try {
   console.log('Knowledge graph passed: all sources/starts/depths, convergence, cycles, self-loops, evidence, 4200 nodes, search, full-graph navigation, errors/retry.');
 } finally {
   await browser?.close(); await server?.close();
-  await Promise.all([rm(name + '.html', { force: true }), rm(name + '.tsx', { force: true })]);
+  await Promise.all([rm(name + '.html', { force: true }), rm(name + '.tsx', { force: true }), rm(`node_modules/.vite-${name}`, { recursive: true, force: true })]);
 }

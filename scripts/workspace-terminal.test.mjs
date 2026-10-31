@@ -53,7 +53,8 @@ async function assertStableTabsDuringOutput(id) {
 try {
   await writeFile(`${name}.html`,`<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
+import { flush } from 'solid-js';
 import { createSignal, Show } from 'solid-js';
 import WorkspacePanel from './src/components/WorkspacePanel';
 import { getTerminalGroup, terminalApi, closeTerminalTab } from './src/terminalSessions';
@@ -81,17 +82,17 @@ terminalApi.resize=async(id,cols,rows)=>{
 terminalApi.ack=async(id,bytes)=>{acknowledged.push({id,bytes});};
 terminalApi.close=async id=>{closed.push(id);};
 api.listWorkspaceDirectory=async()=>({entries:[],truncated:false});
-setState({currentId:'a',cwd:'/project/a',theme:'ink-light',items:[]});
+flush(() => setState(s => { Object.assign(s, {currentId:'a',cwd:'/project/a',theme:'ink-light',items:[]}); }));
 setWorkspaceLayout({open:true,mode:'terminal'});
 const [thread,setThread]=createSignal('a');
 const group=()=>getTerminalGroup('thread:'+thread());
 const active=()=>group().tabs().find(tab=>tab.id===group().activeId());
 window.termTest={created,closed,writes,resized,acknowledged,
  id:()=>active()?.id,status:()=>active()?.status(),tab:id=>group().tabs().find(tab=>tab.id===id),
- setTheme:theme=>{setState('theme',theme);document.documentElement.dataset.theme=theme;},
+ setTheme:theme=>{setState(s => { s.theme = theme; });document.documentElement.dataset.theme=theme;},
  buffer:()=>{const b=active().terminal.buffer.active;return Array.from({length:b.length},(_,i)=>b.getLine(i)?.translateToString(true)??'').join('\\n');},
  send:(id,event)=>channels.get(id).onmessage(event),
- switch:id=>{setState({currentId:id,cwd:'/project/'+id});setThread(id);},
+ switch:id=>{setState(s => { Object.assign(s, {currentId:id,cwd:'/project/'+id}); });setThread(id);},
  defer:()=>{deferred=true;},fail:()=>{fail=true;},resolve:id=>{pending.get(id)();pending.delete(id);},
  paste:text=>active().terminal.paste(text),
  gateResize:()=>{gatedResize=true;},hasResizeGate:id=>resizeGates.has(id),
@@ -181,6 +182,8 @@ render(()=><Fixture/>,document.getElementById('root')!);
   assert.equal(await page.evaluate(id=>window.termTest.closed.includes(id),pending),false);
   await page.evaluate(id=>window.termTest.resolve(id),pending);
   await page.waitForFunction(id=>window.termTest.closed.includes(id),pending);
+  await page.waitForFunction(() => document.querySelector('[role="tab"][aria-selected="true"]')?.textContent === '终端 1');
+  assert.equal(await page.locator('.workspace-terminal .workspace-empty').count(), 0, 'closing an active tab selects a surviving tab, never the removed ID');
   await page.evaluate(()=>window.termTest.defer());
   await page.getByRole('button',{name:'新建终端',exact:true}).click();
   await page.waitForFunction(()=>window.termTest.created.length===5);

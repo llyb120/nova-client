@@ -25,7 +25,7 @@ const compiled = await transformAsync(`import {render} from '@solidjs/web';
   window.snapshot = ${JSON.stringify(snapshot)}; window.calls = []; window.urls = [];
   render(() => <EmployeeView />, document.body);`, {
   filename: 'employee-links-check.tsx', configFile: false, babelrc: false,
-  plugins: [[solid, { generate: 'dom' }]], parserOpts: { plugins: ['jsx', 'typescript'] },
+  plugins: [[solid, { generate: 'dom', dev: true }]], parserOpts: { plugins: ['jsx', 'typescript'] },
 });
 const mocks = {
   store: 'export const state={settings:{relayToken:""},peers:[],currentId:null}; export const openThread=()=>{throw Error("unexpected session navigation")}; export const showToast=text=>window.toast=text;',
@@ -39,13 +39,13 @@ const mocks = {
 };
 const bundle = await build({
   stdin: { contents: compiled.code, resolveDir: process.cwd(), sourcefile: 'employee-links-check.tsx', loader: 'ts' },
-  bundle: true, write: false, format: 'esm', platform: 'browser', conditions: ['browser'], outdir: '/tmp/employee-links-check',
+  bundle: true, write: false, format: 'esm', platform: 'browser', conditions: ['browser', 'development'], outdir: '/tmp/employee-links-check',
   plugins: [{ name: 'employee-fixture', setup(builder) {
     builder.onResolve({ filter: /^\.\.?\/(?:.*\/)?(store|ipc|TitleBar|VaultPop|FileContextMenu)$|^@tauri-apps\// }, ({ path }) => ({ path: path.startsWith('@') ? path : path.split('/').at(-1), namespace: 'mock' }));
     builder.onLoad({ filter: /.*/, namespace: 'mock' }, ({ path }) => ({ contents: mocks[path], loader: 'js' }));
     builder.onLoad({ filter: /\.tsx$/ }, async ({ path }) => {
       const result = await transformAsync(await readFile(path, 'utf8'), { filename: path, configFile: false, babelrc: false,
-        plugins: [[solid, { generate: 'dom' }]], parserOpts: { plugins: ['jsx', 'typescript'] } });
+        plugins: [[solid, { generate: 'dom', dev: true }]], parserOpts: { plugins: ['jsx', 'typescript'] } });
       return { contents: result.code, loader: 'ts' };
     });
   } }],

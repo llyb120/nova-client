@@ -11,18 +11,19 @@ let server, browser;
 try {
   await writeFile(`${name}.html`, `<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
-    import { render } from 'solid-js/web';
+    import { render } from '@solidjs/web';
+    import { flush } from 'solid-js';
     import { Sidebar } from './src/components/Sidebar';
     import { setState } from './src/store';
     import { setSidebarLayout } from './src/sidebarLayout';
     import './src/app.css';
     window.setSidebarState = setState;
     window.setSidebarLayout = setSidebarLayout;
-    setState('threads', Array.from({ length: 8 }, (_, index) => ({
+    flush(() => setState(s => { s.threads = Array.from({ length: 8 }, (_, index) => ({
       id: 'thread-' + index, title: 'thread-' + index,
       cwd: index < 7 ? '${cwd}' : '${otherCwd}', agentKind: 'codex',
       createdAt: 1, updatedAt: 1, running: false, starred: false, unreadTurns: 0,
-    })));
+    })); }));
     render(() => <div class="app"><Sidebar onOpenSettings={() => {}}
       onOpenAchievements={() => {}} onOpenUpdate={() => {}} onOpenInbox={() => {}} />
       <main style={{ flex: 1 }}>主区域</main></div>, document.getElementById('root'));
@@ -79,10 +80,10 @@ try {
   await page.evaluate(() => window.setSidebarLayout({ collapsed: true }));
   assert.deepEqual(await stored(), { collapsed: true, collapsedProjects: [otherCwd] });
   await page.evaluate(() => window.setSidebarLayout({ collapsed: false }));
-  await page.evaluate(() => window.setSidebarState('settings', { historyDisplayMode: 'time' }));
+  await page.evaluate(() => window.setSidebarState(s => { s.settings = { ...s.settings, historyDisplayMode: 'time' }; }));
   assert.equal(await groups.count(), 0);
   assert.equal(await page.locator('.thread-list .thread-item').count(), 8, 'time view ignores project folds');
-  await page.evaluate(() => window.setSidebarState('settings', { historyDisplayMode: 'project' }));
+  await page.evaluate(() => window.setSidebarState(s => { s.settings = { ...s.settings, historyDisplayMode: 'project' }; }));
   assert.equal(await second.locator('.thread-item').count(), 0, 'returning to projects preserves their state');
 
   await page.evaluate(key => localStorage.setItem(key, JSON.stringify({ collapsed: false })), key);

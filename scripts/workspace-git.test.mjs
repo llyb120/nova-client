@@ -8,7 +8,7 @@ let server, browser;
 try {
   await fs.writeFile(`${name}.html`, `<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await fs.writeFile(`${name}.tsx`, `
-    import { render } from 'solid-js/web';
+    import { render } from '@solidjs/web';
     import WorkspaceGit from './src/components/WorkspaceGit';
     import { api } from './src/ipc';
     window.calls = [];

@@ -9,7 +9,8 @@ let server, browser;
 try {
   await writeFile(`${name}.html`, `<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
+import { flush } from 'solid-js';
 import { createSignal, Show } from 'solid-js';
 import { api } from './src/ipc';
 import { setState } from './src/store';
@@ -30,7 +31,7 @@ window.showLayoutSettings = () => {
 };
 window.testLayout = () => ({...workspaceLayout});
 window.testCode = () => EditorView.findFromDOM(document.querySelector('.cm-editor'));
-window.loadHistory = () => setState('items', [{type:'tool',id:2,ts:0,status:'completed',kind:'edit',locations:[{path:'generated.ts'}],content:[]}]);
+window.loadHistory = () => setState(s => { s.items = [{type:'tool',id:2,ts:0,status:'completed',kind:'edit',locations:[{path:'generated.ts'}],content:[]}]; });
 api.workspaceGitStatus = async () => ({repo:'D:/demo',files:[{path:'src/main.ts',oldPath:null,index:'M',worktree:'M'},{path:'new.ts',oldPath:null,index:'?',worktree:'?'},{path:'app-icon.png',oldPath:null,index:'M',worktree:'M'}]});
 api.workspaceGitImage = async (_id, path, staged) => ({before:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', after:staged ? null : 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='});
 api.workspaceGitDiff = async (_id, path, staged) => 'diff --git a/' + path + ' b/' + path + '\\n@@ -1,22 +1,22 @@\\n' + Array.from({length:20}, (_, i) => ' context ' + i).join('\\n') + '\\n-old\\n+' + (staged ? 'staged' : 'unstaged') + '\\n-long "' + 'x'.repeat(300) + '";\\n';
@@ -65,7 +66,7 @@ api.listWorkspaceDirectory = async (_id, path) => { directories.push(path); retu
  { name:'image.png',path:'image.png',directory:false },
 ], truncated:false }; };
 api.saveWorkspaceFile = async (_id, _path, original, text) => { if (original !== disk) throw Error('文件已被外部修改'); disk = text; };
-setState({ currentId:'check', cwd:'D:/demo', items:[{type:'assistant',id:1,ts:0,text:'[readme](README.md)'}] });
+flush(() => setState(s => { Object.assign(s, { currentId:'check', cwd:'D:/demo', items:[{type:'assistant',id:1,ts:0,text:'[readme](README.md)'}] }); }));
 const [visible, setVisible] = createSignal(true);
 const [fileRequest, setFileRequest] = createSignal(null);
 window.addEventListener('nova:preview-file', event => { setFileRequest(event.detail); setVisible(true); });

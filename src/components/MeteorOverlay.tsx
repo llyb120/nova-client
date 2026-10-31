@@ -123,10 +123,11 @@ export default function MeteorOverlay() {
   const deleteAnnotation = () => {
     const index = activeIndex();
     if (locked() || index === null) return;
-    setAnnotations((items) => items.filter((_, i) => i !== index));
-    setActiveIndex(annotations().length ? Math.min(index, annotations().length - 1) : null);
+    const remaining = annotations().filter((_, i) => i !== index);
+    setAnnotations(remaining);
+    setActiveIndex(remaining.length ? Math.min(index, remaining.length - 1) : null);
     setError("");
-    if (active()) focusInput(); else surface.focus();
+    if (remaining.length) focusInput(); else surface.focus();
   };
   const selectCenter = () => {
     const image = context();

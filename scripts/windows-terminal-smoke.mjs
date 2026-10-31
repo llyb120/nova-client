@@ -84,7 +84,7 @@ try {
       settings.terminalShell = config.shell;
       settings.terminalArgs = config.args;
       await window.__TAURI__.core.invoke('set_settings', { settings });
-      window.nativeTerminalSmoke.store.setState('settings', settings);
+      window.nativeTerminalSmoke.store.setState(s => { s.settings = settings; });
       window.nativeTerminalSmoke.layout.setWorkspaceLayout({ open: false, mode: 'terminal' });
     }, shell), `${shell.name}: saving settings timed out`);
     await page.keyboard.press('Control+Backquote');

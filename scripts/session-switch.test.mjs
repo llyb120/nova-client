@@ -57,32 +57,56 @@ test("空闲子 Agent 重新打开时校准快照，显示后台追加的排队�
 test("多 stage 同链反复切换复用导航列表，新增阶段后更新，断链和成环不挂起", () => {
   const chat = readFileSync(new URL("../src/components/ChatView.tsx", import.meta.url), "utf8");
   const source = chat.slice(chat.indexOf("  const stageIndex ="), chat.indexOf("  const isStageTitle ="));
-  createRoot((dispose) => {
-    try {
-      const initial = Array.from({ length: 200 }, (_, i) => ({ id: `s${i}`, parentThreadId: i ? `s${i - 1}` : null, createdAt: i }));
-      const [threads, setThreads] = createSignal(initial);
-      const [currentId, setCurrentId] = createSignal("s0");
-      let scans = 0;
-      const state = { get threads() { scans++; return threads(); }, get currentId() { return currentId(); } };
-      const stages = new Function("state", "createMemo", `${js(source)}; return stageThreads;`)(state, createMemo);
-      const first = stages();
-      assert.equal(first.length, 200);
-      const initialScans = scans;
-      for (let i = 0; i < 1000; i++) {
-        setCurrentId(`s${i % 200}`); flush();
-        assert.equal(stages(), first);
-      }
-      assert.equal(scans, initialScans);
-      setThreads([...initial, { id: "new", parentThreadId: "s199", createdAt: 200 }]); flush();
-      assert.equal(stages().length, 201);
-      setThreads([{ id: "s199", parentThreadId: "missing", createdAt: 0 }]); flush();
-      assert.equal(stages().length, 1);
-      setThreads([{ id: "s199", parentThreadId: "b", createdAt: 0 }, { id: "b", parentThreadId: "s199", createdAt: 1 }]); flush();
-      assert.equal(stages().length, 2);
-      setCurrentId("missing"); flush();
-      assert.deepEqual(stages(), []);
-    } finally { dispose(); }
+  const initial = Array.from({ length: 200 }, (_, i) => ({ id: `s${i}`, parentThreadId: i ? `s${i - 1}` : null, createdAt: i }));
+  const [threads, setThreads] = createSignal(initial);
+  const [currentId, setCurrentId] = createSignal("s0");
+  let scans = 0, dispose;
+  const state = { get threads() { scans++; return threads(); }, get currentId() { return currentId(); } };
+  const stages = createRoot(cleanup => {
+    dispose = cleanup;
+    return new Function("state", "createMemo", `${js(source)}; return stageThreads;`)(state, createMemo);
   });
+  try {
+    const first = stages();
+    assert.equal(first.length, 200);
+    const initialScans = scans;
+    for (let i = 0; i < 1000; i++) {
+      setCurrentId(`s${i % 200}`); flush();
+      assert.equal(stages(), first);
+    }
+    assert.equal(scans, initialScans);
+    setThreads([...initial, { id: "new", parentThreadId: "s199", createdAt: 200 }]); flush();
+    assert.equal(stages().length, 201);
+    setThreads([{ id: "s199", parentThreadId: "missing", createdAt: 0 }]); flush();
+    assert.equal(stages().length, 1);
+    setThreads([{ id: "s199", parentThreadId: "b", createdAt: 0 }, { id: "b", parentThreadId: "s199", createdAt: 1 }]); flush();
+    assert.equal(stages().length, 2);
+    setCurrentId("missing"); flush();
+    assert.deepEqual(stages(), []);
+  } finally { dispose(); }
+});
+
+test("search reveal waits for bottom-follow state to commit and ignores a departed session", async t => {
+  const chat = readFileSync(new URL("../src/components/ChatView.tsx", import.meta.url), "utf8");
+  const from = chat.indexOf("  // 会话搜索点击命中：");
+  const source = chat.slice(from, chat.indexOf("  // 会话加载和新增轮次", from));
+  const [hit, setHit] = createSignal(null);
+  const [following, setFollowing] = createSignal(true);
+  const [id, setId] = createSignal('a');
+  const calls = [];
+  createRoot(dispose => {
+    t.after(dispose);
+    new Function('createEffect', 'searchReveal', 'setSearchReveal', 'state', 'transcriptReady', 'previewItems', 'cancelBottomFollow', 'transcriptRef', source)(
+      createEffect, hit, setHit, { get currentId() { return id(); }, loadingThread: false }, () => true, () => null,
+      () => { setFollowing(false); }, { revealMatch(...args) { assert.equal(following(), false); calls.push(args); } });
+  });
+  flush(() => setHit({ threadId: 'a', itemId: 42, query: 'target' }));
+  await new Promise(setImmediate);
+  assert.deepEqual(calls, [[42, 'target']]);
+  flush(() => setHit({ threadId: 'a', itemId: 43, query: 'stale' }));
+  flush(() => setId('b'));
+  await new Promise(setImmediate);
+  assert.deepEqual(calls, [[42, 'target']]);
 });
 
 test("队列镜像移除旧 key，清空或挂起后整条链结束", () => {

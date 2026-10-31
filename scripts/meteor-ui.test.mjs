@@ -12,7 +12,8 @@ const viewport = { width: 1000, height: 720 };
 let server, browser;
 try {
   await writeFile(entryFiles[0], `<div id="root"></div><script type="module" src="/src/index.tsx"></script>`);
-  server = await createServer({ root, server: { host: "127.0.0.1", port: 15000 + process.pid % 1000, strictPort: false, hmr: false }, logLevel: "error" });
+  server = await createServer({ root, optimizeDeps: { noDiscovery: true, include: ['solid-js', '@solidjs/web'] },
+    cacheDir: `node_modules/.vite-${name}`, server: { host: "127.0.0.1", port: 15000 + process.pid % 1000, strictPort: false, hmr: false }, logLevel: "error" });
   await server.listen();
   const address = server.httpServer.address();
   assert.ok(address && typeof address !== "string");
@@ -250,6 +251,21 @@ try {
   ]);
   await page.evaluate(() => window.meteorTest.finishSubmission());
 
+  await open();
+  await page.mouse.click(400, 300);
+  await textarea.fill("保留的标注");
+  await page.mouse.click(700, 180);
+  await textarea.fill("删除的末项");
+  await page.getByRole("button", { name: "删除此标注", exact: true }).click();
+  await focused();
+  assert.equal(await textarea.inputValue(), "保留的标注", "deleting the last of several notes selects the previous note");
+  await page.getByRole("button", { name: "删除此标注", exact: true }).click();
+  await page.waitForFunction(() => document.activeElement?.classList.contains("meteor-surface"));
+  assert.equal(await page.locator(".meteor-marker").count(), 0, "deleting the final note clears selection and restores surface focus");
+  await page.mouse.click(500, 400);
+  await focused();
+  assert.equal(await textarea.inputValue(), "", "a fresh note remains editable after deleting all notes");
+
   const inside = async (selector, screen) => {
     await settleLayout();
     const rect = await page.locator(selector).boundingBox();
@@ -393,4 +409,5 @@ try {
   await browser?.close();
   await server?.close();
   await Promise.all(entryFiles.map(path => rm(path, { force: true })));
+  await rm(new URL(`../node_modules/.vite-${name}`, import.meta.url), { recursive: true, force: true });
 }
