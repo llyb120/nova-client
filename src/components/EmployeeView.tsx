@@ -9,7 +9,6 @@ import type { Peer, PlanEntry } from "../types";
 import { Markdown } from "./Markdown";
 import "./EmployeeView.css";
 import { TitleBarPortal } from "./TitleBar";
-import VaultPop from "./VaultPop";
 
 /** 交代的人；token 为空是员工所在机器的用户。 */
 type Owner = { token: string; name: string };
@@ -396,7 +395,6 @@ function EmployeeBoard(props: { peer?: Peer; onBack?: () => void }) {
                       </Show>
                     </div>
                   </details>
-                  <Show when={!peer}><VaultPop /></Show>
                   <Show when={!peer}>
                   <details class="employee-pop employee-settings">
                     <summary>值班设置</summary>

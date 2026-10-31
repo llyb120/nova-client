@@ -1,5 +1,5 @@
 //! 密码本：`~/.nova/vault.json` 保存自由文本凭据（账号密码、密钥等），每条都带“使用条件”。
-//! 凭据落盘时用本机随机密钥（`vault.key`）AES-256-GCM 加密，员工读文件也只看到密文，只能经 `employee` 工具的 vault_* 取用。
+//! 凭据落盘时用本机随机密钥（`vault.key`）AES-256-GCM 加密，模型读文件也只看到密文，只能经密码本工具按条件取用。
 //! 远程员工要本机密码本里的凭据时，用 X25519 密钥协商加密传输（中转站只见密文）；收到的凭据只作为临时条目存放，任务结束即删。
 //! shortcut: 密钥文件与密文同在 ~/.nova，防的是误读与误传而非本机恶意程序；要更强再换系统凭据库（DPAPI / Keychain）。
 //! shortcut: 密钥协商没有身份认证，信任中转站不换公钥；要防恶意中转站就得带外核对指纹。
@@ -202,6 +202,38 @@ pub(crate) fn get(id: &str, purpose: &str) -> Result<Value, String> {
     })
 }
 
+// ---------- Lyra 普通会话的只读工具 ----------
+
+pub(crate) fn tool_definition() -> Value {
+    json!({
+        "description": "本机密码本，可存账号密码、API Key、Token、私钥等自由文本凭据。需要凭据时先用 action=list 查看条目（不含内容），每条的 condition 是使用条件，当前这件事符合才用 action=get（text 写清用途）取出 content。凭据只用于当前授权操作，不写进回复、记忆或备注。此工具不能增删改凭据；需要变更时请用户在「设置 → 密码本」操作。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["list", "get"] },
+                "id": { "type": "string", "description": "get 必填：list 返回的条目 id" },
+                "text": { "type": "string", "minLength": 1, "maxLength": 8000, "description": "get 必填：这次取用的用途" }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
+pub(crate) fn execute_tool(args: &Value) -> Result<Value, String> {
+    let text = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty());
+    match args["action"].as_str() {
+        Some("list") => Ok(json!({"entries": list()?, "tip": "condition 是使用条件：当前这件事符合才可 get；列表里不含凭据内容"})),
+        Some("get") => {
+            let id = text("id").ok_or("缺少 id：先 list 查看密码本")?;
+            let purpose = text("text").ok_or("缺少 text：写明这次取用的用途")?;
+            if purpose.chars().count() > 8000 { return Err("text 太长（最多 8000 字）".into()); }
+            get(id, purpose)
+        }
+        _ => Err("action 应为 list 或 get；增删改请用户在「设置 → 密码本」操作".into()),
+    }
+}
+
 // ---------- 跨机传输 ----------
 
 /// 请求方：为一次请求（待办 id）生成临时密钥对，私钥加密存本机，返回公钥（base64）发给对方。
@@ -314,6 +346,17 @@ mod tests {
         let legacy: Entry = serde_json::from_value(json!({"username": "alice", "secret": encrypt(&key, b"vault", b" p ").unwrap()})).unwrap();
         assert_eq!(decrypt_content(&legacy, &key).unwrap(), "账号：alice\n密码： p ");
         assert!(decrypt_content(&e, &[8u8; 32]).is_err());
+    }
+
+    #[test]
+    fn ordinary_lyra_vault_tool_is_read_only_and_requires_a_purpose() {
+        let definition = tool_definition();
+        let schema = &definition["inputSchema"];
+        assert_eq!(schema["properties"]["action"]["enum"], json!(["list", "get"]));
+        assert!(schema["properties"].get("content").is_none());
+        assert!(execute_tool(&json!({"action": "save"})).unwrap_err().contains("设置"));
+        assert!(execute_tool(&json!({"action": "get", "id": "v1"})).unwrap_err().contains("用途"));
+        assert!(execute_tool(&json!({"action": "get", "text": "测试"})).unwrap_err().contains("id"));
     }
 
     #[test]

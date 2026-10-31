@@ -95,6 +95,8 @@ pub fn tool_set(
         tools.push(Tool { name: "jianlai", description: desktop["description"].as_str().unwrap().into(), parameters: schema(desktop["inputSchema"].clone()) });
         let employee = crate::employee::tool_definition();
         tools.push(Tool { name: "employee", description: employee["description"].as_str().unwrap().into(), parameters: schema(employee["inputSchema"].clone()) });
+        let vault = crate::vault::tool_definition();
+        tools.push(Tool { name: "vault", description: vault["description"].as_str().unwrap().into(), parameters: schema(vault["inputSchema"].clone()) });
         let chrome = crate::chrome_browser::tool_definition();
         tools.push(Tool { name: "chrome", description: chrome["description"].as_str().unwrap().into(), parameters: schema(chrome["inputSchema"].clone()) });
         for definition in crate::image_generation::tool_definitions() {
@@ -649,6 +651,13 @@ async fn execute_inner(
                 Err(error) => ToolOutcome::error(error),
             }
         }
+        "vault" => {
+            if shell.is_none() { return ToolOutcome::error("当前为只读模式，密码本工具不可用"); }
+            match crate::vault::execute_tool(args) {
+                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
         "layout_submit" => match crate::layout::execute(name, args, owner) {
             Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
             Err(error) => ToolOutcome::error(error),
@@ -859,6 +868,14 @@ mod tool_tests {
             assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
         }
+    }
+
+    #[test]
+    fn ordinary_lyra_exposes_the_read_only_vault_tool() {
+        let tools = tool_set(false, false, false);
+        let vault = tools.iter().find(|tool| tool.name == "vault").unwrap();
+        assert_eq!(vault.parameters["properties"]["action"]["enum"], json!(["list", "get"]));
+        assert!(tool_set(true, false, false).iter().all(|tool| tool.name != "vault"));
     }
 
     #[test]

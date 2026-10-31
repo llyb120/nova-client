@@ -7,10 +7,9 @@ test('password book uses one freeform secret and never derives public names from
   const [employee,view] = await Promise.all([
     tool('employee'),readFile(new URL('../src/components/VaultPop.tsx',import.meta.url),'utf8')
   ]);
-  const fields = employee.inputSchema.properties;
-  assert.equal(fields.content.type,'string');
-  assert.equal(fields.content.maxLength,16000);
-  assert.ok(!('username' in fields) && !('password' in fields));
+  const actions = employee.inputSchema.properties.action.enum;
+  assert.ok(actions.includes('vault_list') && actions.includes('vault_get'));
+  assert.ok(!actions.includes('vault_save') && !actions.includes('vault_delete'), 'models manage credentials only in settings');
   assert.match(view,/<textarea rows=\{5\} value=\{d\(\)\.content\}/);
   assert.doesNotMatch(view,/\busername\b|\bpassword\b|vault-pair/);
   const source = view.match(/  const save = async \(\) => \{[\s\S]*?\n  \};/)?.[0];
@@ -32,6 +31,13 @@ test('password book uses one freeform secret and never derives public names from
   await save();
   assert.equal(calls[1].entry.content,'','editing metadata leaves stored credentials untouched');
   assert.equal(refreshes,2);
+});
+test('password book is configured in settings instead of the employee header', async()=>{
+  const read = path=>readFile(new URL(`../src/components/${path}`,import.meta.url),'utf8');
+  const [settings,employee] = await Promise.all(['SettingsModal.tsx','EmployeeView.tsx'].map(read));
+  assert.match(settings,/\{ id: "vault", name: "密码本", group: "常规" \}/);
+  assert.match(settings,/<Show when=\{tab\(\) === "vault"\}>\s*<VaultPop \/>/);
+  assert.doesNotMatch(employee,/VaultPop/);
 });
 test('ordinary agents stay separate from internal scene switching and fallback', async()=>{
   const read = path=>readFile(new URL(`../${path}`,import.meta.url),'utf8');

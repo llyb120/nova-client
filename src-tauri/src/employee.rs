@@ -2166,7 +2166,6 @@ fn authorize(caller: &Caller, action: &str, args: &Value) -> Result<(), String> 
         (_, "list") | (Caller::User, _) => Ok(()),
         (Caller::Stale, _) => Err("本任务已结束，不能再改员工数据；系统会在合适时机续做".into()),
         (_, "ask" | "remember" | "forget" | "vault_list" | "vault_get" | "orbit_list" | "orbit_add" | "orbit_done") | (Caller::Task { .. }, "help" | "defer" | "progress" | "relay" | "vault_request" | "vault_send") => Ok(()),
-        (_, "vault_save" | "vault_delete") => Err("密码本只有用户能增改，需要新凭据就在总结里提醒用户".into()),
         (Caller::Sub, _) => Err("你是派出去干活的子会话，只需把结果交回上游，不要改职责或待办".into()),
         (Caller::Task { .. }, "add") if args["kind"] == "todo" => Ok(()),
         (Caller::Task { item, duty }, "update") => {
@@ -2520,8 +2519,6 @@ pub(crate) fn execute_tool(args: &Value, owner: &str) -> Result<Value, String> {
         "orbit_done" => crate::orbit::set_done(&id()?, args["done"].as_bool().unwrap_or(true), false),
         "vault_list" => Ok(json!({"entries": crate::vault::list()?, "tip": "condition 是使用条件：当前这件事符合才可 vault_get；列表里不含凭据内容"})),
         "vault_get" => crate::vault::get(&id()?, &text().map_err(|_| "缺少 text：写明这次取用的用途")?),
-        "vault_save" => crate::vault::save(args),
-        "vault_delete" => crate::vault::delete(&id()?).map(|_| json!({"ok": true})),
         // 响应方：把密码本里允许共享的条目用对方公钥加密发回，中转站与回复里都不出现明文。
         "vault_send" => {
             let Caller::Task { item, .. } = caller(owner) else { return Err("只有执行任务的会话能发送凭据".into()) };
@@ -2575,7 +2572,7 @@ pub(crate) fn execute_tool(args: &Value, owner: &str) -> Result<Value, String> {
         }),
         // 旧会话可能缓存了已移除的动作：明确告知现在的做法。
         "context" | "worktree" => Err("这个动作已移除：编码用 switch_scene，电脑操作用 relay scene=computer 切到独立会话；进度用 action=progress 标记。未执行任何操作。".into()),
-        _ => Err("action 应为 list/add/update/done/ask/help/defer/progress/relay/remember/forget/vault_list/vault_get/vault_save/vault_delete/vault_request/vault_send/orbit_list/orbit_add/orbit_done".into()),
+        _ => Err("action 应为 list/add/update/done/ask/help/defer/progress/relay/remember/forget/vault_list/vault_get/vault_request/vault_send/orbit_list/orbit_add/orbit_done".into()),
     }
 }
 

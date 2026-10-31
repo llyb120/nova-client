@@ -22,6 +22,7 @@ import { ModelPicker } from "./ConfigSelects";
 import { IconPlus, IconX } from "./icons";
 import { LyraConfigPanel } from "./LyraConfigPanel";
 import { ProjectPicker } from "./ProjectPicker";
+import VaultPop from "./VaultPop";
 import {
   encodeModelTarget,
   encodeRoamTarget,
@@ -136,6 +137,7 @@ function ShortcutKeyCapture(props: {
 
 export type SettingsTab =
   | "general"
+  | "vault"
   | "scenes"
   | "meteor"
   | "jianlai"
@@ -158,6 +160,7 @@ const TABS: { id: SettingsTab; name: string; group: string }[] = [
   { id: "scenes", name: "场景模型", group: "模型与 Agent" },
   { id: "general", name: "通用", group: "常规" },
   { id: "appearance", name: "外观", group: "常规" },
+  { id: "vault", name: "密码本", group: "常规" },
   { id: "meteor", name: "Meteor", group: "工具与协作" },
   { id: "jianlai", name: "剑来", group: "工具与协作" },
   { id: "worktree", name: "Worktree", group: "工具与协作" },
@@ -1382,6 +1385,11 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 </span>
               </div>
             </section>
+          </Show>
+
+          {/* ===== 密码本 ===== */}
+          <Show when={tab() === "vault"}>
+            <VaultPop />
           </Show>
 
           {/* ===== 高级 ===== */}
