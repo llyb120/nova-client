@@ -6,6 +6,7 @@
 
 use super::*;
 use std::collections::HashSet;
+use std::future::Future;
 
 /// 末尾这么多个单元不可压缩（正在进行的工作）。
 const PRESERVE_UNITS: usize = 2;
@@ -636,9 +637,15 @@ impl ContextWindow {
         Ok(out)
     }
 
-    /// 兜底（取代旧折叠，仅在逼近/超出窗口时）：先把旧的长工具结果换成头尾草图，不够再把最老的
-    /// 一段已完成单元机械压成块。模型主动 compress 才是常态路径。
-    pub(super) fn acp_emergency(&mut self, canonical: &[Value], trigger: Trigger) -> Receipt {
+    /// 兜底（取代旧折叠，仅在逼近/超出窗口时）：先把旧的长工具结果换成头尾草图，还不够就把最老的
+    /// 一段已完成单元压成块。对齐 billion-context 的 preflight：块摘要优先交给 `summarize`（独立
+    /// 无工具的摘要请求，失败/超时/空摘要则退回机械轮廓，即官方的 deterministicDigest 定位）。
+    /// 模型主动 compress 才是常态路径。
+    pub(super) async fn acp_emergency<F, Fut>(&mut self, canonical: &[Value], trigger: Trigger, summarize: F) -> Receipt
+    where
+        F: FnOnce(String, String) -> Fut,
+        Fut: Future<Output = Result<String, String>>,
+    {
         if self.window == 0 {
             return self.receipt("noop", trigger, "no context window declared");
         }
@@ -679,6 +686,7 @@ impl ContextWindow {
         self.state.acp.truncated.sort_unstable();
 
         let mut folded = 0;
+        let mut llm = false;
         if freed < need {
             let mut stretch: Vec<&Unit> = Vec::new();
             for u in units.iter().filter(|u| u.start < limit) {
@@ -691,9 +699,21 @@ impl ContextWindow {
             }
             if let (Some(first), Some(last)) = (stretch.first(), stretch.last()) {
                 let (s, e) = (first.start, last.end - 1);
+                // 先让摘要模型写这段（preflight）；它不可用再用机械轮廓。
+                let summary = match self.summarize_fold(&canonical[s..=e], summarize).await {
+                    Ok(text) if !text.trim().is_empty() => {
+                        llm = true;
+                        text.trim().to_string()
+                    }
+                    outcome => {
+                        let cause = outcome.err().unwrap_or_else(|| "empty summary".into());
+                        eprintln!("lyra: emergency summary unavailable ({cause}); folded mechanically");
+                        mechanical_summary(&canonical[s..=e])
+                    }
+                };
                 let block = Block {
                     id: self.state.acp.next_id + 1, start: s, end: e, hash: hash_values(&canonical[s..=e]),
-                    summary: mechanical_summary(&canonical[s..=e]), active: true, mechanical: true, tier: 1, at: now_ms(), ..Block::default()
+                    summary, active: true, mechanical: !llm, tier: 1, at: now_ms(), ..Block::default()
                 };
                 self.commit_block(block);
                 folded = e - s + 1;
@@ -709,7 +729,7 @@ impl ContextWindow {
         receipt.result_tokens = after;
         receipt.saved_tokens = used.saturating_sub(after);
         receipt.folded_messages = folded;
-        receipt.degraded = folded > 0;
+        receipt.degraded = folded > 0 && !llm;
         self.state.last_receipt = Some(receipt.clone());
         self.save();
         receipt
@@ -847,16 +867,30 @@ mod tests {
         assert_eq!(c.window(), 64_000);
     }
 
-    #[test]
-    fn emergency_truncates_then_mechanically_compresses() {
+    /// summarize 不可用时 emergency 回退机械轮廓（deterministicDigest 定位）。
+    #[tokio::test]
+    async fn emergency_truncates_then_mechanically_compresses() {
         let canon = convo();
         let mut c = ctx(3_000);
         let before = c.prompt_tokens(&c.prompt_view(&canon));
         assert!(c.should_compact(&canon));
-        let receipt = c.acp_emergency(&canon, Trigger::Auto);
+        let receipt = c.acp_emergency(&canon, Trigger::Auto, |_sys, _t| async { Err("no summarizer".to_string()) }).await;
         assert_eq!(receipt.status, "applied", "{receipt:?}");
-        assert!(receipt.degraded, "truncation alone cannot free this much");
+        assert!(receipt.degraded, "summarizer failed → mechanical fold counts as degraded");
+        assert!(c.state.acp.blocks.last().is_some_and(|b| b.mechanical));
         assert!(c.prompt_tokens(&c.prompt_view(&canon)) < before / 2);
+    }
+
+    /// preflight：模型不调 compress 且截断不够时，emergency 自己发一次摘要请求写成正常块。
+    #[tokio::test]
+    async fn emergency_uses_llm_summary_before_folding() {
+        let canon = convo();
+        let mut c = ctx(3_000);
+        let receipt = c.acp_emergency(&canon, Trigger::Auto, |_sys, _t| async { Ok(SUMMARY.to_string()) }).await;
+        assert_eq!(receipt.status, "applied", "{receipt:?}");
+        let block = c.state.acp.blocks.last().expect("a fold happened");
+        assert!(!block.mechanical && block.summary.contains("off-by-one"));
+        assert!(!receipt.degraded, "LLM-summarized fold is not degraded");
     }
 
     #[test]

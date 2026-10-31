@@ -501,7 +501,7 @@ impl ContextWindow {
         Fut: Future<Output = Result<String, String>>,
     {
         if self.acp_enabled {
-            return Ok(self.acp_emergency(canonical, trigger));
+            return Ok(self.acp_emergency(canonical, trigger, summarize).await);
         }
         if self.window == 0 {
             return Ok(self.receipt("noop", trigger, "no context window declared"));
