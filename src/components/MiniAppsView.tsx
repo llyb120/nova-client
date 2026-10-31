@@ -307,20 +307,25 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
     } catch (e) { setError(errorText(e)); }
   }
   onSettled(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE);
-      const saved = readLibrary(raw);
-      storedVersion = raw;
-      flush(() => { setApps(saved); setStorageReady(true); });
-      if (props.runtimeAppId) {
-        const runtime = saved.find(app => app.id === props.runtimeAppId);
-        if (!runtime?.published) throw new Error("此应用不存在或尚未发布。");
-        choose(runtime.id, true);
-      } else {
-        if (saved.length) choose(saved[0].id);
-        consumeOpen();
-      }
-    } catch (e) { setError(`无法读取本地应用：${errorText(e)}`); }
+    // Library selection needs committed state; flush cannot reenter onSettled's drain.
+    queueMicrotask(() => {
+      if (disposed) return;
+      try {
+        const raw = localStorage.getItem(STORAGE);
+        const saved = readLibrary(raw);
+        storedVersion = raw;
+        flush(() => { setApps(saved); setStorageReady(true); });
+        if (props.runtimeAppId) {
+          const runtime = saved.find(app => app.id === props.runtimeAppId);
+          if (!runtime?.published) throw new Error("此应用不存在或尚未发布。");
+          choose(runtime.id, true);
+        } else {
+          if (saved.length) choose(saved[0].id);
+          consumeOpen();
+        }
+      } catch (e) { setError(`无法读取本地应用：${errorText(e)}`); }
+      if (props.runtimeAppId) void takeLaunch();
+    });
     const unlisten: Array<() => void> = [];
     if (props.runtimeAppId) {
       void listen<PermissionRequest>("acp:permission", event => {
@@ -343,7 +348,6 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       window.addEventListener("storage", onStorage);
       unlisten.push(() => window.removeEventListener("storage", onStorage));
       void listen("miniapp:launch", () => void takeLaunch()).then(remove => disposed ? remove() : unlisten.push(remove));
-      void takeLaunch();
       // Closing the app window stops its run; external changes already made are not rolled back.
       void getCurrentWindow().onCloseRequested(async () => {
         if (active()?.run?.status === "running") await Promise.race([cancelRun(), new Promise(resolve => window.setTimeout(resolve, 2000))]);
@@ -665,7 +669,12 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       const key = optionsKey(block);
       if (key && optionLoads()[block.id]?.key !== key) return block;
     }
-  }, block => { if (block) requestOptions(block); });
+  }, block => {
+    if (!block) return;
+    let cancelled = false;
+    queueMicrotask(() => { if (!cancelled && !disposed) requestOptions(block); });
+    return () => { cancelled = true; };
+  });
   function assertLoadedInputs(action: MiniAction) {
     const inputs = action.kind === "command" ? action.inputs ?? [] : [...(action.prompt ?? action.value ?? "").matchAll(/\{\{\s*([\w-]+)\s*\}\}/g)].map(match => match[1]);
     for (const block of doc()?.pages.flatMap(p => p.blocks) ?? []) {

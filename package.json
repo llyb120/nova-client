@@ -22,7 +22,7 @@
     "eval:context-invoke": "node scripts/ctx-invoke.eval.mjs",
     "test:terminal": "node scripts/terminal-shortcuts.test.mjs && node scripts/workspace-terminal.test.mjs",
     "test:chat-html": "node scripts/transcript-heights.test.mjs && node scripts/html-turn.test.mjs && node scripts/html-prompt-image.test.mjs && node scripts/html-turn-images.test.mjs && node scripts/html-prompt-text.test.mjs && node scripts/markdown-chunks.test.mjs && node scripts/html-transcript.test.mjs",
-    "test:solid": "node --test scripts/solid-owner.test.mjs scripts/session-switch.test.mjs scripts/fork-thread.test.mjs scripts/prompt-draft.test.mjs scripts/prompt-queue.test.mjs scripts/history-loading.test.mjs scripts/output-rate.test.mjs scripts/html-prompt-image.test.mjs scripts/miniapps-runtime.test.mjs scripts/image-commands.test.mjs scripts/tool-completion-switch.test.mjs scripts/titlebar-portal.test.mjs",
+    "test:solid": "node --test scripts/solid-owner.test.mjs scripts/session-switch.test.mjs scripts/fork-thread.test.mjs scripts/prompt-draft.test.mjs scripts/prompt-queue.test.mjs scripts/history-loading.test.mjs scripts/output-rate.test.mjs scripts/html-prompt-image.test.mjs scripts/miniapps-runtime.test.mjs scripts/image-commands.test.mjs scripts/tool-completion-switch.test.mjs scripts/titlebar-portal.test.mjs && node --conditions=development --test --test-name-pattern=\"real Solid lifecycle\" scripts/miniapps-runtime.test.mjs",
     "test:chat-scroll": "node scripts/html-transcript.test.mjs --renderer=html --only=scroll-hotpath"
   },
   "devDependencies": {
