@@ -190,8 +190,8 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     const anchor = readingAnchor?.index ?? at(host.scrollTop + 32);
     const anchorOffset = readingAnchor?.inset ?? host.scrollTop - offset(anchor);
     let changed = false;
-    // ResizeObserver supplies measured sizes. Only a newly mounted row without an
-    // observer delivery needs a synchronous first measurement; scrolling never remeasures it.
+    // ResizeObserver supplies measured sizes. Newly mounted or toggled rows need
+    // a pre-paint measurement; ordinary scrolling never remeasures them.
     for (const index of unmeasured) {
       const row = rows.get(index);
       if (row && !measurements.has(index)) measurements.set(index, row.getBoundingClientRect().height);
@@ -343,10 +343,17 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
 
   function browseDetail(event: MouseEvent) {
     const button = (event.target as Element).closest<HTMLElement>("button[aria-expanded]");
-    if (!button || keepBottom) return; // 吸底时展开/折叠详情继续贴底
-    keepBottom = false;
-    detailAnchor = { element: button, offset: button.getBoundingClientRect().top - host.getBoundingClientRect().top };
-    props.onBrowseDetail?.();
+    if (!button) return;
+    if (!keepBottom) {
+      detailAnchor = { element: button, offset: button.getBoundingClientRect().top - host.getBoundingClientRect().top };
+      props.onBrowseDetail?.();
+    }
+    // Measure after the click's DOM update, not one frame after ResizeObserver reports it.
+    const index = rowIndex(button);
+    if (index !== null) {
+      unmeasured.add(index);
+      measurements.delete(index);
+    }
     schedule();
   }
 
