@@ -1336,129 +1336,146 @@ async fn control_session(
             Some(crate::chrome_browser::request(app, "tabs", json!({})).await?)
         } else { None };
         let mut opened = Vec::new();
-        // Background tabs throttle animation/timer sampling, making stable DOM targets time out as "moving".
-        // Activate the explicitly bound tab before live checks; stale geometry/identity is still checked by apply.
-        crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
-        let mut failure=None;
-        let mut action_timings=Vec::new();
-        let clipboard=crate::clipboard::sequence();
-        let mut script_value = None;
-        if let Some((expression, index)) = script {
-            let frame = &observation.frames[index];
-            let page = &observation.pages["pages"][index];
-            let expression = format!("__novaWebview.evaluate({},{},{})", json!(expression), page["document"], page["url"]);
-            progress.attempted = true;
-            // CDP timeout stops synchronous JS, not an awaited Promise. Bound our wait too; async effects may continue.
-            let reply = tokio::time::timeout(Duration::from_secs(5), cdp(app, "Runtime.evaluate", json!({"expression":expression,"contextId":frame.context,
-                "returnByValue":true,"awaitPromise":true,"timeout":5000}), frame.session.as_deref(), Some(s.cancel.clone())))
-                .await.map_err(|_| "脚本等待5秒超时，可能已部分执行且异步脚本可能仍在运行；先观察确认，不要重放")??;
-            if reply.get("exceptionDetails").is_some() {
-                failure = Some(reply["exceptionDetails"]["exception"]["description"].as_str()
-                    .or(reply["exceptionDetails"]["text"].as_str()).unwrap_or("脚本执行失败，请观察确认，不要重放").to_string());
-            } else {
-                let outcome = &reply["result"]["value"];
-                if outcome["status"] == "executed" {
-                    progress.completed = 1;
-                    script_value = Some(outcome["value"].clone());
+        let mut attempted_retry = false;
+        // Background tabs throttle requestAnimationFrame (~1Hz), so prepare()/coordinate()/settle()
+        // time out as "目标正在移动"/"被遮挡" without ever painting. Try in the background first;
+        // only when a stability preflight fails before any real input was sent, activate the tab once
+        // and retry — never replay after input may have been dispatched.
+        let background_throttled = |e: &str| e.contains("目标正在移动") || e.contains("被遮挡")
+            || e.contains("有界等待后仍不可安全操作") || e.contains("尚未就绪");
+        loop {
+            let mut failure=None;
+            let mut action_timings=Vec::new();
+            let clipboard=crate::clipboard::sequence();
+            let mut script_value = None;
+            if let Some((expression, index)) = &script {
+                let frame = &observation.frames[*index];
+                let page = &observation.pages["pages"][*index];
+                let expression = format!("__novaWebview.evaluate({},{},{})", json!(expression), page["document"], page["url"]);
+                progress.attempted = true;
+                // CDP timeout stops synchronous JS, not an awaited Promise. Bound our wait too; async effects may continue.
+                let reply = tokio::time::timeout(Duration::from_secs(5), cdp(app, "Runtime.evaluate", json!({"expression":expression,"contextId":frame.context,
+                    "returnByValue":true,"awaitPromise":true,"timeout":5000}), frame.session.as_deref(), Some(s.cancel.clone())))
+                    .await.map_err(|_| "脚本等待5秒超时，可能已部分执行且异步脚本可能仍在运行；先观察确认，不要重放")??;
+                if reply.get("exceptionDetails").is_some() {
+                    failure = Some(reply["exceptionDetails"]["exception"]["description"].as_str()
+                        .or(reply["exceptionDetails"]["text"].as_str()).unwrap_or("脚本执行失败，请观察确认，不要重放").to_string());
                 } else {
-                    progress.attempted = outcome["status"] != "not_executed";
-                    failure = Some(outcome["reason"].as_str().unwrap_or("脚本结果未知，请观察确认，不要重放").to_string());
+                    let outcome = &reply["result"]["value"];
+                    if outcome["status"] == "executed" {
+                        progress.completed = 1;
+                        script_value = Some(outcome["value"].clone());
+                    } else {
+                        progress.attempted = outcome["status"] != "not_executed";
+                        failure = Some(outcome["reason"].as_str().unwrap_or("脚本结果未知，请观察确认，不要重放").to_string());
+                    }
                 }
             }
-        }
-        for (index, action) in actions.iter().enumerate() {
-            let began=std::time::Instant::now();
-            let applied=apply(app,&s,&observation,action,args["imageId"].as_str(),&mut progress,root).await;
-            action_timings.push(began.elapsed().as_millis());
-            match applied {
-                Ok(())=>progress.completed+=1,
-                Err(error)=>{failure=Some(error);break;},
+            for (index, action) in actions.iter().enumerate() {
+                let began=std::time::Instant::now();
+                let applied=apply(app,&s,&observation,action,args["imageId"].as_str(),&mut progress,root).await;
+                action_timings.push(began.elapsed().as_millis());
+                match applied {
+                    Ok(())=>progress.completed+=1,
+                    Err(error)=>{failure=Some(error);break;},
+                }
+                if index + 1 < actions.len() {
+                    if let Some(before) = &before_tabs {
+                        match crate::chrome_browser::request(app, "tabs", json!({})).await {
+                            Ok(after) => opened = opened_tabs(before, &after, source_tag),
+                            Err(error) => { failure = Some(format!("动作后标签查询失败，余下动作未执行：{error}")); break; }
+                        }
+                        if !opened.is_empty() {
+                            failure = Some("动作已打开新标签页或窗口，余下动作未执行".into());
+                            break;
+                        }
+                    }
+                }
             }
-            if index + 1 < actions.len() {
+            // Retry only a clean preflight failure on a background tab; any dispatched input is final.
+            let throttled = matches!(&failure, Some(e) if background_throttled(e));
+            if !attempted_retry && throttled && !progress.attempted && !s.cancel.load(Ordering::SeqCst) {
+                attempted_retry = true;
+                crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
+                continue;
+            }
+            let failure = failure;
+            let action_timings = action_timings;
+            let clipboard = clipboard;
+            let script_value = script_value;
+            let mut result=json!({"status":if failure.is_none(){"executed"}else if progress.attempted{"needs_review"}else{"not_executed"},
+                "scrollFeedback":progress.scroll_feedback,
+                "canReobserve":failure.is_some() && progress.dom_preflight && progress.completed==0,
+                // The failing action itself sent no input (DOM preflight); earlier batch actions did complete.
+                "failedAtPreflight":failure.is_some() && progress.dom_preflight,
+                "reason":failure,"inputAttempted":progress.attempted,"completedActions":progress.completed,"actionTimingsMs":action_timings,"basedOnSnapshotId":observation.id,"verification":"unverified"});
+            if let Some(value) = script_value { result["value"] = value; }
+            result["actionMs"] = json!(started.elapsed().as_millis());
+            result.as_object_mut().unwrap().retain(|key, v| key == "value" || !v.is_null());
+            completed_action = Some(result.clone());
+            // A click/Enter often starts a navigation; feeding back the old DOM costs the model another
+            // inspect round-trip. Wait (bounded) for the tab to finish loading before observing.
+            if failure.is_none() && settle_ms > 0 && args["feedback"] != "none" && !s.cancel.load(Ordering::SeqCst)
+                && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::ClickAt{..} | Action::Press{..})) {
+                let tag = s.active_tab.rsplit(':').next().unwrap_or_default();
+                result["settle"] = wait_for_tab_load(app, tag, Duration::from_millis(settle_ms)).await;
+                // Loaded is not rendered: SPAs patch the DOM after their XHR. Wait for the DOM to go quiet
+                // so the feedback shows the result instead of costing the model another observe round-trip.
+                let budget = settle_ms.saturating_sub(result["settle"]["waitedMs"].as_u64().unwrap_or(0)).min(1000);
+                if result["settle"]["status"] == "complete" && budget >= 100 {
+                    // A navigation replaced the document (and our world): nothing to wait for there.
+                    if let Ok(quiet) = evaluate(app, &observation.frames[0], format!("__novaWebview.settle(250,{budget})")).await { result["settle"]["dom"] = quiet; }
+                }
+                completed_action = Some(result.clone());
+            }
+            if progress.attempted && !s.cancel.load(Ordering::SeqCst) {
                 if let Some(before) = &before_tabs {
                     match crate::chrome_browser::request(app, "tabs", json!({})).await {
-                        Ok(after) => opened = opened_tabs(before, &after, source_tag),
-                        Err(error) => { failure = Some(format!("动作后标签查询失败，余下动作未执行：{error}")); break; }
-                    }
-                    if !opened.is_empty() {
-                        failure = Some("动作已打开新标签页或窗口，余下动作未执行".into());
-                        break;
+                        Ok(after) => {
+                            let latest = opened_tabs(before, &after, source_tag);
+                            if !latest.is_empty() { opened = latest; }
+                        }
+                        Err(error) => result["tabDiscoveryError"] = json!(error),
                     }
                 }
             }
-        }
-        let mut result=json!({"status":if failure.is_none(){"executed"}else if progress.attempted{"needs_review"}else{"not_executed"},
-            "scrollFeedback":progress.scroll_feedback,
-            "canReobserve":failure.is_some() && progress.dom_preflight && progress.completed==0,
-            // The failing action itself sent no input (DOM preflight); earlier batch actions did complete.
-            "failedAtPreflight":failure.is_some() && progress.dom_preflight,
-            "reason":failure,"inputAttempted":progress.attempted,"completedActions":progress.completed,"actionTimingsMs":action_timings,"basedOnSnapshotId":observation.id,"verification":"unverified"});
-        if let Some(value) = script_value { result["value"] = value; }
-        result["actionMs"] = json!(started.elapsed().as_millis());
-        result.as_object_mut().unwrap().retain(|key, v| key == "value" || !v.is_null());
-        completed_action = Some(result.clone());
-        // A click/Enter often starts a navigation; feeding back the old DOM costs the model another
-        // inspect round-trip. Wait (bounded) for the tab to finish loading before observing.
-        if failure.is_none() && settle_ms > 0 && args["feedback"] != "none" && !s.cancel.load(Ordering::SeqCst)
-            && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::ClickAt{..} | Action::Press{..})) {
-            let tag = s.active_tab.rsplit(':').next().unwrap_or_default();
-            result["settle"] = wait_for_tab_load(app, tag, Duration::from_millis(settle_ms)).await;
-            // Loaded is not rendered: SPAs patch the DOM after their XHR. Wait for the DOM to go quiet
-            // so the feedback shows the result instead of costing the model another observe round-trip.
-            let budget = settle_ms.saturating_sub(result["settle"]["waitedMs"].as_u64().unwrap_or(0)).min(1000);
-            if result["settle"]["status"] == "complete" && budget >= 100 {
-                // A navigation replaced the document (and our world): nothing to wait for there.
-                if let Ok(quiet) = evaluate(app, &observation.frames[0], format!("__novaWebview.settle(250,{budget})")).await { result["settle"]["dom"] = quiet; }
+            if !opened.is_empty() {
+                result["openedTabs"] = json!(opened);
+                result["sourceTabTag"] = json!(source_tag);
+                completed_action = Some(result.clone());
             }
-            completed_action = Some(result.clone());
-        }
-        if progress.attempted && !s.cancel.load(Ordering::SeqCst) {
-            if let Some(before) = &before_tabs {
-                match crate::chrome_browser::request(app, "tabs", json!({})).await {
-                    Ok(after) => {
-                        let latest = opened_tabs(before, &after, source_tag);
-                        if !latest.is_empty() { opened = latest; }
-                    }
-                    Err(error) => result["tabDiscoveryError"] = json!(error),
+            // Capturing the source would reactivate it over the popup. Observe a proven new target
+            // after releasing this session's gate; ambiguous targets return only the new-tab inventory.
+            if opened.is_empty() && (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
+                let mut feedback_args = args.clone();
+                feedback_args["fullPage"] = json!(false);
+                if let Some(args)=feedback_args.as_object_mut() {for key in ["ref","frame","region"] {args.remove(key);} }
+                if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
+                // Show the actual blocker when DOM text cannot explain an occluded target.
+                let visual=args["feedback"]=="screenshot"
+                    || failure.as_deref().is_some_and(|reason| reason.contains("目标被遮挡"));
+                // Feedback failure must never turn a completed mutation into a retryable action failure.
+                // Fresh document/stamp/geometry checks still refuse image reuse after navigation or viewport changes.
+                match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,
+                    if script.is_none() || visual || feedback_args["visual"] != "none" { Some(&observation) } else { None })).await {
+                    Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
+                    Ok(Err(error)) => result["observationError"] = json!(error),
+                    Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
                 }
             }
-        }
-        if !opened.is_empty() {
-            result["openedTabs"] = json!(opened);
-            result["sourceTabTag"] = json!(source_tag);
-            completed_action = Some(result.clone());
-        }
-        // Capturing the source would reactivate it over the popup. Observe a proven new target
-        // after releasing this session's gate; ambiguous targets return only the new-tab inventory.
-        if opened.is_empty() && (args["feedback"] != "none" || failure.is_some()) && !s.cancel.load(Ordering::SeqCst) {
-            let mut feedback_args = args.clone();
-            feedback_args["fullPage"] = json!(false);
-            if let Some(args)=feedback_args.as_object_mut() {for key in ["ref","frame","region"] {args.remove(key);} }
-            if args["feedback"]=="inspect" {feedback_args["visual"]=json!("none");}
-            // Show the actual blocker when DOM text cannot explain an occluded target.
-            let visual=args["feedback"]=="screenshot"
-                || failure.as_deref().is_some_and(|reason| reason.contains("目标被遮挡"));
-            // Feedback failure must never turn a completed mutation into a retryable action failure.
-            // Fresh document/stamp/geometry checks still refuse image reuse after navigation or viewport changes.
-            match tokio::time::timeout(Duration::from_secs(10), snapshot(app,visual,&feedback_args,
-                if script.is_none() || visual || feedback_args["visual"] != "none" { Some(&observation) } else { None })).await {
-                Ok(Ok((_, feedback))) => result.as_object_mut().unwrap().extend(feedback.as_object().unwrap().clone()),
-                Ok(Err(error)) => result["observationError"] = json!(error),
-                Err(_) => result["observationError"] = json!("动作后观察10秒超时；动作状态如上，请观察确认，不要重放"),
+            // Read after feedback so pages that write the clipboard asynchronously have finished.
+            if let Some(copied)=crate::clipboard::copied_since(clipboard) {result["clipboard"]=copied;}
+            // Altair runs save their own verified route; everything else feeds the turn's auto trail.
+            if script.is_none() && !crate::altair_run::executing_browser_action() {
+                let before = &observation.pages["pages"][0];
+                let after = if result["pages"][0]["url"].is_string() { &result["pages"][0] } else { before };
+                crate::tool_experience::record("chrome", &s.thread_id,
+                    before["url"].as_str().unwrap_or_default(), after["url"].as_str().unwrap_or_default(),
+                    after["title"].as_str().unwrap_or_default(),
+                    actions[..progress.completed].iter().filter_map(|a| trail_step(&observation.pages, a)).collect());
             }
+            return Ok(result);
         }
-        // Read after feedback so pages that write the clipboard asynchronously have finished.
-        if let Some(copied)=crate::clipboard::copied_since(clipboard) {result["clipboard"]=copied;}
-        // Altair runs save their own verified route; everything else feeds the turn's auto trail.
-        if script.is_none() && !crate::altair_run::executing_browser_action() {
-            let before = &observation.pages["pages"][0];
-            let after = if result["pages"][0]["url"].is_string() { &result["pages"][0] } else { before };
-            crate::tool_experience::record("chrome", &s.thread_id,
-                before["url"].as_str().unwrap_or_default(), after["url"].as_str().unwrap_or_default(),
-                after["title"].as_str().unwrap_or_default(),
-                actions[..progress.completed].iter().filter_map(|a| trail_step(&observation.pages, a)).collect());
-        }
-        Ok(result)
     });
     let mut result = tokio::select! {
         r=tokio::time::timeout(Duration::from_secs(15),task)=>r.map_err(|_|"浏览器操作15秒超时；已发送的脚本/动作可能仍在执行，请重新观察确认结果".to_string()).and_then(|r|r),
