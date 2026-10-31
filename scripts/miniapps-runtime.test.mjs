@@ -8,6 +8,7 @@ import { stripTypeScriptTypes } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { setImmediate as settle } from 'node:timers/promises';
 import * as model from '../src/miniapps.ts';
+import * as nativeSignals from '@solidjs/signals';
 
 const source = readFileSync(new URL('../src/components/MiniAppsView.tsx', import.meta.url), 'utf8');
 const start = source.indexOf('const STORAGE =');
@@ -38,8 +39,8 @@ const run = (patch = {}) => ({ threadId: 'mock-thread', target: 'report', name: 
 const answer = text => ({ type: 'assistant', text });
 const turn = (stopReason = 'end_turn') => ({ type: 'turn', stopReason });
 
-function mount(t, items, overrides = {}, props = {}) {
-  const mounts = [], effects = [], cleanups = [], calls = [], titles = [];
+function mount(t, items, overrides = {}, props = {}, reactivity) {
+  const mounts = [], effects = [], cleanups = [], microtasks = [], calls = [], titles = [];
   const listeners = new Map();
   const storage = new Map([[KEY, JSON.stringify(items)]]);
   const unexpected = async () => { throw new Error('Unexpected IPC call'); };
@@ -63,6 +64,8 @@ function mount(t, items, overrides = {}, props = {}) {
       cleanups.push(() => { if (typeof cleanup === 'function') cleanup(); });
     },
     onSettled: fn => mounts.push(fn), onCleanup: fn => cleanups.push(fn),
+    queueMicrotask: fn => microtasks.push(fn),
+    ...(reactivity && { ...reactivity, queueMicrotask }),
     window: { addEventListener() {}, removeEventListener() {}, setInterval: () => 1, clearInterval() {}, setTimeout, clearTimeout },
     state: { permissions: [], settings: {} },
     sceneModel: () => ({ agentKind: 'lyra', model: 'mock-model' }),
@@ -90,17 +93,98 @@ function mount(t, items, overrides = {}, props = {}) {
       };
     }
   }
-  const view = new Function(...Object.keys(dependencies), compiled)(...Object.values(dependencies));
+  const construct = () => new Function(...Object.keys(dependencies), compiled)(...Object.values(dependencies));
+  let dispose = () => cleanups.reverse().forEach(fn => fn());
+  const view = reactivity ? reactivity.createRoot(cleanup => { dispose = cleanup; return construct(); }) : construct();
   // Never run effects inside component construction (later bindings may be in TDZ).
-  // Signal changes are explicit: tests flush after the state transition under test.
-  const flushEffects = () => effects.forEach(fn => fn());
+  // Most business fixtures use explicit signals; regression cases use the real scheduler/lifecycle.
+  const flushEffects = reactivity ? reactivity.flush : () => {
+    while (microtasks.length) microtasks.shift()();
+    effects.forEach(fn => fn());
+    while (microtasks.length) microtasks.shift()();
+  };
   mounts.forEach(fn => { const cleanup = fn(); if (typeof cleanup === 'function') cleanups.push(cleanup); });
   flushEffects();
-  t.after(() => cleanups.reverse().forEach(fn => fn()));
-  return { ...view, calls, titles, flushEffects, storage: dependencies.localStorage,
+  t.after(dispose);
+  return { ...view, calls, titles, flushEffects, dispose, storage: dependencies.localStorage,
     emit: (event, payload) => listeners.get(event)?.({ payload }),
     persisted: () => JSON.parse(dependencies.localStorage.getItem(KEY)) };
 }
+
+test('real Solid lifecycle loads the saved library without a nested flush or storage writes', async t => {
+  const entry = saved();
+  const view = mount(t, [entry], {}, {}, nativeSignals);
+  await settle();
+  assert.equal(view.error(), '', 'mount must not misreport a scheduler error as damaged local data');
+  assert.equal(view.activeId(), entry.id);
+  assert.deepEqual(view.doc(), entry.draft);
+  assert.deepEqual(view.persisted(), [entry]);
+  assert.deepEqual(view.calls, []);
+});
+
+test('real Solid lifecycle starts runtime auto-load once outside the effect continuation', async t => {
+  const draft = optionsApp(), entry = saved({ draft, published: clone(draft) });
+  const view = mount(t, [entry], { invoke: async (command, { runId }) => {
+    assert.equal(command, 'miniapp_command_start');
+    return { runId, status: 'running', output: '', stdout: '', truncated: false };
+  } }, { runtimeAppId: entry.id }, nativeSignals);
+  await settle();
+  assert.equal(view.error(), '');
+  assert.equal(view.activeId(), entry.id);
+  assert.equal(view.optionLoads().item?.status, 'running');
+  assert.equal(view.persisted()[0].run?.status, 'running');
+  assert.deepEqual(view.calls, ['miniapp_command_start']);
+  view.flushEffects();
+  await settle();
+  assert.deepEqual(view.calls, ['miniapp_command_start'], 'reactive reruns must not dispatch again');
+});
+
+test('real Solid lifecycle cancels stale auto-load when leaving trial mode', async t => {
+  const draft = optionsApp();
+  const view = mount(t, [saved({ draft })], {}, {}, nativeSignals);
+  await settle();
+  view.switchMode('try');
+  view.switchMode('design');
+  await settle();
+  assert.equal(view.error(), '');
+  assert.deepEqual(view.calls, []);
+  assert.equal(view.persisted()[0].run, undefined);
+});
+
+test('real Solid lifecycle preserves unreadable storage and cancels initialization after disposal', async t => {
+  const corrupt = '{invalid library';
+  const broken = mount(t, [], { localStorage: {
+    getItem: () => corrupt,
+    setItem: () => assert.fail('unreadable library must never be overwritten'),
+  } }, {}, nativeSignals);
+  await settle();
+  assert.match(broken.error(), /无法读取本地应用/);
+  assert.doesNotMatch(broken.error(), /flush|onSettled/);
+  assert.equal(broken.storage.getItem(KEY), corrupt);
+
+  const removed = mount(t, [], { localStorage: {
+    getItem: () => assert.fail('disposed view must not initialize later'),
+    setItem: () => assert.fail('disposed view must not write storage'),
+  } }, {}, nativeSignals);
+  removed.dispose();
+  await settle();
+  assert.equal(removed.activeId(), '');
+  assert.deepEqual(removed.calls, []);
+});
+
+test('real Solid lifecycle consumes a new-app request only after library hydration', async t => {
+  const request = new Map([['nova:miniapps:open', JSON.stringify({ create: true })]]);
+  const view = mount(t, [], { sessionStorage: {
+    getItem: key => request.get(key) ?? null,
+    removeItem: key => request.delete(key),
+  } }, {}, nativeSignals);
+  await settle();
+  assert.equal(view.error(), '');
+  assert.equal(view.apps().length, 1);
+  assert.equal(view.activeId(), view.persisted()[0].id);
+  assert.equal(request.size, 0);
+  assert.deepEqual(view.calls, []);
+});
 
 async function startAction(view) {
   view.switchMode('try');
