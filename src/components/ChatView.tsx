@@ -263,7 +263,12 @@ export function ChatView() {
     if (!hit) return;
     setSearchReveal(null);
     cancelBottomFollow();
-    untrack(() => transcriptRef?.revealMatch(hit.itemId, hit.query));
+    const transcript = transcriptRef;
+    queueMicrotask(() => {
+      if (transcript === transcriptRef && state.currentId === hit.threadId && !state.loadingThread && !previewItems()) {
+        transcript?.revealMatch(hit.itemId, hit.query);
+      }
+    });
   });
 
   // 会话加载和新增轮次后，让“现在”刻度跟随最新用户轮次；回看过去时不抢走光标。

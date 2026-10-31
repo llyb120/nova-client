@@ -9,7 +9,8 @@ let server, browser;
 try {
   await writeFile(`${name}.html`, `<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
+import { flush } from 'solid-js';
 import { createSignal } from 'solid-js';
 import WorkspacePanel from './src/components/WorkspacePanel';
 import { api } from './src/ipc';
@@ -25,7 +26,7 @@ api.previewWorkspaceFile = async (_, path) => path.endsWith('.zip')
 api.openInExplorer = async path => { window.revealedPath = path; };
 const [request, setRequest] = createSignal(null);
 window.openTestFile = path => setRequest({path});
-setState({currentId:'explorer-check',cwd:'/project',items:[]});
+flush(() => setState(s => { Object.assign(s, {currentId:'explorer-check',cwd:'/project',items:[]}); }));
 setWorkspaceLayout({open:true,mode:'files',widthRatio:.65});
 render(() => <div style="display:flex;height:100vh;width:100vw"><main style="flex:1;min-width:0">Chat</main><WorkspacePanel threadId="explorer-check" request={request()} onClose={() => {}} /></div>,document.getElementById('root')!);
 `);

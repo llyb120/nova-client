@@ -11,7 +11,7 @@ try {
   await mkdir(screenshots, { recursive: true });
   await writeFile(`${name}.html`, `<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
 import { api } from './src/ipc';
 import { LyraConfigPanel } from './src/components/LyraConfigPanel';
 import '@fontsource-variable/inter';

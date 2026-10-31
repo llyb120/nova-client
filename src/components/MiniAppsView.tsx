@@ -374,7 +374,11 @@ export default function MiniAppsView(props: { runtimeAppId?: string } = {}) {
       const config = launch.url !== undefined ? doc()?.browser : undefined;
       const actionId = config?.actionId ?? doc()?.autoRun;
       if (config) setValues(v => ({ ...v, ...(config.urlField ? { [config.urlField]: launch.url! } : {}), ...(config.titleField ? { [config.titleField]: launch.title ?? "" } : {}) }));
-      if (actionId) activate(actionId);
+      if (actionId) {
+        // The action reads page context and bound fields synchronously, before its first await.
+        flush();
+        activate(actionId);
+      }
     } catch (e) { if (!disposed) setError(errorText(e)); }
   }
   async function diagnose() {

@@ -19,7 +19,7 @@ import { installScrollProbe, scrollHotpath } from './transcript-scroll-perf.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const args = process.argv.slice(2);
-assert.ok(args.every(arg => arg === '--build-only' || /^(--output|--only|--revision)=.+$/.test(arg)), 'Options: --build-only --output=PATH --only=PREFIX,... --revision=HEAD');
+assert.ok(args.every(arg => arg === '--build-only' || arg === '--solid-dev' || /^(--output|--only|--revision)=.+$/.test(arg)), 'Options: --build-only --solid-dev --output=PATH --only=PREFIX,... --revision=HEAD');
 const selectedChecks = args.find(arg => arg.startsWith('--only='))?.slice('--only='.length).split(',') ?? [];
 const buildOnly = args.includes('--build-only');
 const outputArg = args.find(arg => arg.startsWith('--output='))?.slice('--output='.length);
@@ -45,6 +45,7 @@ const require = createRequire(path.join(deps, '__transcript_test__.cjs'));
 const { build } = require('esbuild');
 const { transformAsync } = require('@babel/core');
 const solidPlugin = require('@solidjs/babel-plugin');
+const solidDev = process.argv.includes('--solid-dev');
 const { chromium } = require('playwright-core');
 const limits = { rows: 80, elements: 3000, frameP95Ms: 50, frameMaxMs: 250, anchorPx: 4 };
 
@@ -352,7 +353,7 @@ render(()=>{
 
 async function solid(source, filename) {
   const result = await transformAsync(source, { filename, babelrc: false, configFile: false,
-    plugins: [[solidPlugin, { generate: 'dom', hydratable: false }]], parserOpts: { plugins: ['jsx', 'typescript'] } });
+    plugins: [[solidPlugin, { generate: 'dom', hydratable: false, dev: solidDev }]], parserOpts: { plugins: ['jsx', 'typescript'] } });
   return result.code;
 }
 
@@ -360,7 +361,7 @@ async function bundle() {
   const outdir = path.join(output, '.bundle');
   return build({ absWorkingDir: sourceRoot, stdin: { contents: await solid(fixture(), path.join(sourceRoot, 'fixture.tsx')), resolveDir: sourceRoot, sourcefile: 'fixture.tsx', loader: 'ts' },
     bundle: true, write: false, outdir, entryNames: 'bundle', platform: 'browser', format: 'esm', target: 'es2022',
-    conditions: ['browser'], nodePaths: [deps], define: { 'import.meta.env.DEV': 'false', 'import.meta.env.PROD': 'true' },
+    conditions: solidDev ? ['browser', 'development'] : ['browser'], nodePaths: [deps], define: { 'import.meta.env.DEV': String(solidDev), 'import.meta.env.PROD': String(!solidDev) },
     loader: { '.woff2': 'file', '.woff': 'file', '.ttf': 'file', '.svg': 'file', '.png': 'file', '.webp': 'file' },
     plugins: [{ name: 'solid', setup(builder) {
       builder.onLoad({ filter: /\.[jt]sx$/ }, async ({ path: filename }) => ({ contents: await solid(await readFile(filename, 'utf8'), filename), loader: 'ts' }));
@@ -397,6 +398,9 @@ async function run(browser, port, report) {
   report.checks = [];
   page.setDefaultTimeout(10000);
   page.on('pageerror', error => errors.push(error.message));
+  page.on('console', message => {
+    if (/\[(?:FLUSH_IN_EFFECT_CALLBACK|PRIMITIVE_IN_EFFECT_CALLBACK|REACTIVE_WRITE_IN_OWNED_SCOPE)\]/.test(message.text())) errors.push(message.text());
+  });
   const waitText = text => page.waitForFunction(text => window.test?.text().includes(text), text, { timeout: 15000 });
   const stats = () => page.evaluate(() => window.test.stats());
   const settle = () => page.evaluate(async () => { for (let i = 0; i < 8; i++) await new Promise(requestAnimationFrame); });

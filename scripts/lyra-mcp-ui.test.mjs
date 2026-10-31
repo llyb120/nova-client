@@ -13,7 +13,7 @@ try {
   await writeFile(`${name}.html`, `<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
 import { createSignal } from 'solid-js';
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
 import { api } from './src/ipc';
 import { LyraConfigPanel } from './src/components/LyraConfigPanel';
 import './src/app.css';
@@ -68,7 +68,7 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
       throw Error('Unexpected IPC: ' + command);
     } };
   });
-  await page.goto(`http://127.0.0.1:${port}/${name}.html`, { waitUntil: "domcontentloaded" });
+  await page.goto(`http://127.0.0.1:${port}/${name}.html`, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.locator(".lyra-providers-head").waitFor();
   assert.equal(await page.locator(".lyra-config [role=tablist]").count(), 0, "no nested MCP tabs");
   await page.getByRole("tab", { name: "MCP", exact: true }).click();

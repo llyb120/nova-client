@@ -140,8 +140,9 @@ export async function closeTerminalTab(group: TerminalGroup, tab: TerminalTab): 
   if (tab.disposed) return;
   tab.disposed = true;
   const tabs = group.tabs(), index = tabs.indexOf(tab);
-  group.setTabs(tabs.filter(item => item !== tab));
-  if (group.activeId() === tab.id) group.setActiveId(group.tabs()[Math.min(index, group.tabs().length - 1)]?.id ?? "");
+  const remaining = tabs.filter(item => !item.disposed);
+  group.setTabs(remaining);
+  if (!remaining.some(item => item.id === group.activeId())) group.setActiveId(remaining[Math.min(index, remaining.length - 1)]?.id ?? "");
   tab.terminal.dispose(); tab.host.remove();
   if (tab.ready) {
     // Close during spawn must not orphan a process that has not appeared yet.

@@ -21,7 +21,8 @@ try {
   assert.doesNotMatch(app, /!state\.currentId && workspaceLayout\.open/);
   await writeFile(`${fixture}.html`, '<div id="root"></div><script type="module" src="/' + fixture + '.tsx"></script>');
   await writeFile(`${fixture}.tsx`, `
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
+import { flush } from 'solid-js';
 import { Show } from 'solid-js';
 import HomeTerminalPanel from './src/components/HomeTerminalPanel';
 import WorkspacePanel from './src/components/WorkspacePanel';
@@ -40,7 +41,7 @@ terminalApi.write=async(id,data)=>{writes.push({id,data});};
 terminalApi.resize=async()=>{};terminalApi.ack=async()=>{};
 api.listWorkspaceDirectory=async()=>({entries:[],truncated:false});
 api.reportActivity=async()=>{};
-setState({currentId:null,view:'home',homeComposerFocusAt:0,items:[],cwd:'/project/chat'});
+flush(() => setState(s => { Object.assign(s, {currentId:null,view:'home',homeComposerFocusAt:0,items:[],cwd:'/project/chat'}); }));
 setTheme('ink-light');setHomeTerminalCwd('/project/home');
 function Fixture(){
   const home=createHomeTerminalState(()=>({currentId:state.currentId,view:state.view,homeComposerFocusAt:state.homeComposerFocusAt}));
@@ -52,7 +53,7 @@ function Fixture(){
   }});
   window.homeTest={created,closed,writes,home,group,active,layout:()=>({...workspaceLayout}),
     theme:setTheme,newSession:openNewSession,
-    route:(id,view='home')=>setState({currentId:id,view}),
+    route:(id,view='home')=>setState(s=>{Object.assign(s,{currentId:id,view});}),
     write:text=>new Promise(resolve=>active().terminal.write(text,resolve)),
   };
   return <div style="display:flex;width:100vw;height:100vh">

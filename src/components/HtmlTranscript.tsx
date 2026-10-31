@@ -405,7 +405,10 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       if (host) {
         if (keepBottom) setTop(maxScroll());
         updateWindow(host.scrollTop, true);
-        if (match?.pending) revealMatch(match.itemId, match.query);
+        const pending = match;
+        if (pending?.pending) queueMicrotask(() => {
+          if (!disposed && match === pending && pending.pending) revealMatch(pending.itemId, pending.query);
+        });
       }
       if (firstContent) initialLayout();
       else schedule();

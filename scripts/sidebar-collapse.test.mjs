@@ -8,7 +8,7 @@ let server, browser;
 try {
   await writeFile(`${name}.html`, `<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
-    import { render } from 'solid-js/web';
+    import { render } from '@solidjs/web';
     import { Sidebar } from './src/components/Sidebar';
     import { setState } from './src/store';
     window.setSidebarState = setState;
@@ -25,7 +25,7 @@ try {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.addInitScript(() => {
-    window.__TAURI_INTERNALS__ = { invoke: async command => command === 'plugin:app|version' ? '0.1.624' : null };
+    window.__TAURI_INTERNALS__ = { metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } }, invoke: async command => command === 'plugin:app|version' ? '0.1.624' : null };
   });
   await page.goto(`${server.resolvedUrls.local[0]}${name}.html`, { waitUntil: 'domcontentloaded', timeout: 90000 });
   const sidebar = page.locator('#main-sidebar');
@@ -36,14 +36,14 @@ try {
   const pinnedLeft = await contentLeft();
   assert.ok(pinnedLeft >= 248);
   await page.evaluate(() => {
-    window.setSidebarState('settings', { relayToken: 'me' });
-    window.setSidebarState('relay', { enabled: true, connected: true });
-    window.setSidebarState('peers', [
+    window.setSidebarState(s => { s.settings = { ...s.settings, relayToken: 'me' }; });
+    window.setSidebarState(s => { Object.assign(s.relay, { enabled: true, connected: true }); });
+    window.setSidebarState(s => { s.peers = [
       { token: 'teammate', name: 'a.long.teammate.name.to.check.ellipsis', online: true, version: '0.1.623' },
       { token: 'me', name: 'bin.ge', online: true, version: '0.1.1' },
       { token: 'legacy', name: 'legacy', online: true },
       { token: 'offline', name: 'offline', online: false, version: '0.1.622' },
-    ]);
+    ]; });
   });
   const relay = page.getByRole('button', { name: '在线成员', exact: true });
   const popup = page.locator('.relay-pop');
@@ -80,10 +80,10 @@ try {
   await page.evaluate(() => {
     const thread = (id, parentThreadId) => ({ id, parentThreadId, title: id, cwd: 'D:/project',
       agentKind: 'codex', createdAt: 1, updatedAt: 1, running: false, starred: false, unreadTurns: 0 });
-    window.setSidebarState('threads', [thread('root'), thread('child', 'root'), thread('done'),
-      { ...thread('legacy'), experienceThread: true }]);
-    window.setSidebarState('running', { root: true, child: true });
-    window.setSidebarState('unreadTurns', { root: 4, child: 2, done: 3, legacy: 5, deleted: 8 });
+    window.setSidebarState(s => { s.threads = [thread('root'), thread('child', 'root'), thread('done'),
+      { ...thread('legacy'), experienceThread: true }]; });
+    window.setSidebarState(s => { s.running = { root: true, child: true }; });
+    window.setSidebarState(s => { s.unreadTurns = { root: 4, child: 2, done: 3, legacy: 5, deleted: 8 }; });
   });
   assert.equal(await rail.locator('.sidebar-rail-count').count(), 1, 'running and unread share one badge');
   assert.equal(await runningBadge.textContent(), '4', 'one running chain plus three completed unread turns');
@@ -96,24 +96,23 @@ try {
   });
   assert.equal(numberStyle.background, 'none');
   assert.equal(numberStyle.color, 'rgb(255, 255, 255)');
-  await page.evaluate(() => window.setSidebarState('unreadTurns', 'done', 0));
+  await page.evaluate(() => window.setSidebarState(s => { s.unreadTurns.done = 0; }));
   assert.equal(await runningBadge.textContent(), '1');
   assert.equal(await unreadBadge.count(), 0);
   assert.equal(await runningBadge.evaluate(el => getComputedStyle(el).backgroundImage), 'none');
   assert.equal(await runningBadge.locator('.sidebar-rail-count-number').evaluate(el => getComputedStyle(el).color), 'rgb(255, 255, 255)');
-  await page.evaluate(() => window.setSidebarState('unreadTurns', 'done', 3));
-  await page.evaluate(() => window.setSidebarState('running', { root: false, child: false }));
+  await page.evaluate(() => window.setSidebarState(s => { s.unreadTurns.done = 3; }));
+  await page.evaluate(() => window.setSidebarState(s => { s.running = { root: false, child: false }; }));
   assert.equal(await runningBadge.count(), 0);
   assert.equal(await unreadBadge.textContent(), '9', 'completion moves unread turns into the badge');
   assert.equal(await unreadBadge.evaluate(el => getComputedStyle(el).backgroundImage), 'none');
-  await page.evaluate(() => window.setSidebarState('unreadTurns', { root: 0, child: 0, done: 120 }));
+  await page.evaluate(() => window.setSidebarState(s => { Object.assign(s.unreadTurns, { root: 0, child: 0, done: 120 }); }));
   assert.equal(await unreadBadge.textContent(), '99+');
   assert.equal(await unreadBadge.getAttribute('aria-label'), '运行中：0，已完成未读：120');
-  await page.evaluate(() => window.setSidebarState('currentId', 'done'));
+  await page.evaluate(() => window.setSidebarState(s => { s.currentId = 'done'; }));
   assert.equal(await unreadBadge.count(), 0, 'currently read conversation is excluded');
   await page.evaluate(() => {
-    window.setSidebarState('currentId', null);
-    window.setSidebarState('threads', []);
+    window.setSidebarState(s => { s.currentId = null; s.threads = []; });
   });
   assert.equal(await rail.getByRole('button', { name: '工作流', exact: true }).count(), 0);
   assert.equal(await sidebar.isVisible(), false, 'routine icon actions do not force the full sidebar open');

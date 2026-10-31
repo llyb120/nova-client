@@ -7,7 +7,8 @@ let server, browser;
 try {
   await writeFile(`${name}.html`, `<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
-import { render } from 'solid-js/web';
+import { render } from '@solidjs/web';
+import { flush } from 'solid-js';
 import { createSignal, Show } from 'solid-js';
 import { HtmlTranscript } from './src/components/HtmlTranscript';
 import WorkspacePanel from './src/components/WorkspacePanel';
@@ -19,12 +20,12 @@ let timer, maxGap=0, frames=0, previous=0, commits=0;
 const history=Array.from({length:160},(_,i)=>({user:{type:'user',id:10+i*3,ts:0,text:'历史问题 '+i},body:[{type:'assistant',id:11+i*3,ts:0,text:('历史回答 '+i+' 包含说明和源代码路径 src/main.ts。').repeat(80)}],turn:{type:'turn',id:12+i*3,ts:0,durationMs:1000,stopReason:'end'}}));
 function tick(now) {if(previous) maxGap=Math.max(maxGap,now-previous); previous=now;frames++;requestAnimationFrame(tick);}
 requestAnimationFrame(tick);
-setState({currentId:'perf',cwd:'D:/demo',items:[],running:{perf:true}});
+flush(() => setState(s => { Object.assign(s, {currentId:'perf',cwd:'D:/demo',items:[],running:{perf:true}}); }));
 window.run=(show) => {
  clearInterval(timer);setOpen(show);maxGap=0;frames=0;previous=0;commits=0;
  let n=0;
  const text=('这里是流式输出的过程内容，包含代码路径 src/main.ts 和日志记录。').repeat(500);
- timer=setInterval(()=>{n++; const item={type:'thought',id:2,ts:0,text:text+'继续输出 '+n};setState('items',[item]);setGroups([...history,{body:[item]}]);},30);
+ timer=setInterval(()=>{n++; const item={type:'thought',id:2,ts:0,text:text+'继续输出 '+n};setState(s => { s.items = [item]; });setGroups([...history,{body:[item]}]);},30);
 };
 window.metrics=()=>({maxGap,frames,commits,width:document.querySelector('.html-transcript').clientWidth});
 window.stop=()=>clearInterval(timer);

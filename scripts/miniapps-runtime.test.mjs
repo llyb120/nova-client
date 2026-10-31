@@ -139,6 +139,36 @@ test('real Solid lifecycle starts runtime auto-load once outside the effect cont
   assert.deepEqual(view.calls, ['miniapp_command_start'], 'reactive reruns must not dispatch again');
 });
 
+test('real Solid lifecycle auto-launch uses the new page context and bound fields', async t => {
+  for (const kind of ['nova', 'command']) await t.test(kind, async t => {
+    const app = kind === 'nova' ? clone(model.DEMO_APP) : optionsApp();
+    const field = kind === 'nova' ? 'tasks' : 'catalog';
+    const actionId = kind === 'nova' ? 'draft' : app.actions[0].id;
+    app.browser = { match: ['https://example.com/*'], urlField: field, actionId };
+    for (const page of app.pages) for (const block of page.blocks) delete block.autoLoad;
+    const entry = saved({ published: app });
+    const launch = { url: 'https://example.com/new', title: 'New launch', tabTag: 'C2-source' };
+    const sent = [];
+    const view = mount(t, [entry], {
+      launch: () => launch,
+      invoke: async (command, args) => {
+        if (command === 'miniapp_scene_model') return { agentKind: 'lyra', model: 'runtime-model' };
+        assert.equal(command, 'miniapp_command_start');
+        sent.push(args.inputs);
+        return { runId: args.runId, status: 'running', stdout: '', output: '' };
+      },
+      api: { sendPrompt: async (_, prompt) => { sent.push(prompt); } },
+    }, { runtimeAppId: entry.id }, nativeSignals);
+    await settle();
+    assert.equal(view.error(), '');
+    assert.equal(sent.length, 1);
+    if (kind === 'nova') {
+      assert.ok(sent[0].includes(JSON.stringify(launch)), 'automatic Nova action must not use the previous launch context');
+      assert.ok(sent[0].includes(JSON.stringify(view.values())), 'prompt uses committed bound fields');
+    } else assert.equal(sent[0][field], launch.url, 'command inputs use this launch, not the saved default');
+  });
+});
+
 test('real Solid lifecycle cancels stale auto-load when leaving trial mode', async t => {
   const draft = optionsApp();
   const view = mount(t, [saved({ draft })], {}, {}, nativeSignals);
