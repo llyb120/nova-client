@@ -1,7 +1,7 @@
 //! server 侧远程会话客户端。
 //!
-//! 通过普通 HTTP `/v2/remote/sync` 上行；`/v2/remote/events` 作为远控命令主 SSE，
-//! `/v2/events` 冗余分流。上下行并行，长连接不阻塞状态上传。
+//! 优先复用 relay `/v2/ws` 上行与命令推送；旧服务器回退 HTTP `/v2/remote/sync`
+//! + `/v2/remote/events`，主 SSE 冗余分流。上下行并行，长连接不阻塞状态上传。
 //! 网页端刚打开（bootstrap state）时服务端会 refreshRequested，唤醒桌面补发。
 //! 每个运行会话独立维护基线：首包快照，中间与收尾只发变化条目（约 400ms 一拍）。
 //! 服务端会回传当前查看会话的轻量校验点；发现缺包或修订错位时只补对应会话。
@@ -201,12 +201,17 @@ struct ServerResponse {
 struct RemoteTransport {
     cfg: RemoteConfig,
     http: reqwest::Client,
+    socket: Arc<crate::relay_socket::RelaySocket>,
     incoming_tx: mpsc::UnboundedSender<Result<ServerResponse, String>>,
     incoming: Arc<Mutex<mpsc::UnboundedReceiver<Result<ServerResponse, String>>>>,
 }
 
 impl RemoteTransport {
     async fn sync(&self, body: Value) -> Result<ServerResponse, String> {
+        if let Some(result) = self.socket.request(&self.cfg.server, &self.cfg.token,
+            json!({"version":2, "op":"remote.sync", "data": &body})).await {
+            return parse_remote_response(result?);
+        }
         let raw = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
         let mut request = self
             .http
@@ -249,12 +254,13 @@ impl RemoteTransport {
             self.cfg.clone(),
             self.http.clone(),
             self.incoming_tx.clone(),
+            self.socket.clone(),
         ))
     }
 }
 
-/// 主 `/v2/events` SSE 的远控分流订阅者。独立 `/v2/remote/events` 是远控命令的
-/// 可靠主通道；这里保留分流作为迁移期冗余，command id 会过滤重复命令。
+/// relay WS/主 SSE 的远控事件订阅者。WS 接通时关闭辅助 SSE；
+/// 旧服务端保留两条 SSE 冗余，command id 会过滤重复命令。
 static MAIN_SSE_SUBSCRIBERS: OnceLock<
     StdMutex<Vec<mpsc::UnboundedSender<Result<ServerResponse, String>>>>,
 > = OnceLock::new();
@@ -268,7 +274,7 @@ pub(crate) fn publish_main_sse(value: Value) {
         .retain(|subscriber| subscriber.send(response.clone()).is_ok());
 }
 
-fn start_transport(cfg: RemoteConfig) -> RemoteTransport {
+fn start_transport(cfg: RemoteConfig, socket: Arc<crate::relay_socket::RelaySocket>) -> RemoteTransport {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .tcp_keepalive(Duration::from_secs(20));
@@ -287,6 +293,7 @@ fn start_transport(cfg: RemoteConfig) -> RemoteTransport {
     RemoteTransport {
         cfg,
         http,
+        socket,
         incoming_tx,
         incoming: Arc::new(Mutex::new(incoming_rx)),
     }
@@ -296,10 +303,23 @@ async fn remote_sse_loop(
     cfg: RemoteConfig,
     http: reqwest::Client,
     incoming: mpsc::UnboundedSender<Result<ServerResponse, String>>,
+    socket: Arc<crate::relay_socket::RelaySocket>,
 ) {
     let mut backoff = Duration::from_secs(1);
+    let mut changes = socket.subscribe();
     loop {
-        let result = remote_sse_once(&cfg, &http, &incoming, &mut backoff).await;
+        // WS 承载同样的 remote.device 帧；接通后撤掉辅助 SSE，不保留重复长连接。
+        changes.borrow_and_update();
+        if socket.connected(&cfg.server, &cfg.token) {
+            tokio::select! {
+                _ = incoming.closed() => return,
+                _ = changes.changed() => continue,
+            }
+        }
+        let result = tokio::select! {
+            result = remote_sse_once(&cfg, &http, &incoming, &mut backoff) => result,
+            _ = changes.changed() => continue,
+        };
         if incoming.is_closed() {
             return;
         }
@@ -368,7 +388,7 @@ fn parse_remote_response(value: Value) -> Result<ServerResponse, String> {
         return Err(value
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("远控 HTTP/SSE 协议错误")
+            .unwrap_or("远控协议错误")
             .to_string());
     }
     let payload = if matches!(
@@ -473,7 +493,8 @@ async fn run(app: AppHandle) {
                 task.abort();
             }
             pull_generation = pull_generation.wrapping_add(1);
-            let next_transport = start_transport(cfg.clone());
+            let socket = app.state::<AppState>().relay.socket.clone();
+            let next_transport = start_transport(cfg.clone(), socket);
             command_sse_task = Some(next_transport.start_command_sse());
             transport = Some(next_transport);
             last_cfg = Some(cfg.clone());
@@ -924,6 +945,53 @@ async fn pull(transport: &RemoteTransport) -> Result<ServerResponse, String> {
 
 async fn sync(transport: &RemoteTransport, value: &Value) -> Result<ServerResponse, String> {
     transport.sync(value.clone()).await
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{WebSocketStream, tungstenite::{Message, protocol::Role}};
+
+    #[tokio::test]
+    async fn websocket_remote_sync_and_push_need_no_http_or_auxiliary_sse() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let socket = crate::relay_socket::RelaySocket::new();
+        let transport = start_transport(RemoteConfig { server: base.clone(), token: "test".into(), name: "test".into(), proxy: String::new(), device_id: "test-device".into() }, socket.clone());
+        let (client, server) = tokio::io::duplex(16384);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut ws = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+            ws.send(Message::Text(json!({"version":2,"op":"ready"}).to_string().into())).await.unwrap();
+            let message = ws.next().await.unwrap().unwrap();
+            let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_eq!(frame["op"], "remote.sync");
+            assert_eq!(frame["data"]["revision"], 1);
+            ws.send(Message::Text(json!({"version":2,"op":"ack", "requestId":frame["requestId"], "response":{"revision":1,"commands":[]}}).to_string().into())).await.unwrap();
+            ws.send(Message::Text(json!({"version":2,"op":"remote.device", "response":{"revision":1,"requestedThreadIds":["thread-1"],"commands":[]}}).to_string().into())).await.unwrap();
+            let _ = stop_rx.await;
+        });
+        let runner = tokio::spawn(async move {
+            let ws = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+            socket.run(ws, &base, "test", |frame| {
+                if frame["op"] == "remote.device" { publish_main_sse(frame); }
+            }, || { let _ = ready_tx.send(()); }).await
+        });
+        ready_rx.await.unwrap();
+        let auxiliary = transport.start_command_sse();
+        let response = timeout(Duration::from_secs(3), transport.sync(json!({"kind":"full","revision":1}))).await.unwrap().unwrap();
+        assert_eq!(response.revision, 1);
+        let pushed = timeout(Duration::from_secs(3), transport.pull()).await.unwrap().unwrap();
+        assert_eq!(pushed.requested_thread_ids, vec!["thread-1"]);
+        assert!(timeout(Duration::from_millis(100), listener.accept()).await.is_err(), "WS active: must not open HTTP/SSE connection");
+        auxiliary.abort();
+        let _ = auxiliary.await;
+        stop_tx.send(()).unwrap();
+        peer.await.unwrap();
+        assert!(runner.await.unwrap().is_err());
+    }
 }
 
 fn eligible(t: &Thread) -> bool {

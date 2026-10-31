@@ -161,15 +161,16 @@ pub struct RelayManager {
     pub app: AppHandle,
     config_dir: PathBuf,
     http: reqwest::Client,
+    pub(crate) socket: Arc<crate::relay_socket::RelaySocket>,
     device_id: String,
     connected: AtomicBool,
-    /// v2 SSE 下行是否已经就绪。
+    /// v2 WS 或兼容 SSE 下行是否已经就绪。
     protocol_v2: AtomicBool,
     /// 本次客户端进程的协议纪元，配合 messageId 识别重试和进程重启。
     epoch: String,
     /// 最近一次 v2 服务端纪元；服务端重启后游标自动归零重放。
     server_epoch: StdMutex<String>,
-    /// SSE 恢复通知；HTTP 上行在下行重新注册在线状态后继续发送。
+    /// 下行恢复通知；重新注册在线状态后继续发送。
     v2_ready: Notify,
     last_seq: AtomicI64,
     last_persist: StdMutex<Instant>,
@@ -224,6 +225,7 @@ impl RelayManager {
             app,
             config_dir,
             http,
+            socket: crate::relay_socket::RelaySocket::new(),
             device_id,
             connected: AtomicBool::new(false),
             protocol_v2: AtomicBool::new(false),
@@ -281,7 +283,7 @@ impl RelayManager {
                 }
             }
         });
-        // guest 看门狗：进行中的漫游会话每隔几秒重同步一次，自愈中途卡顿/丢失/卡 loading
+        // guest 看门狗只低频兜底；缺包和断线恢复仍立即补同步。
         let snapper = mgr.clone();
         tauri::async_runtime::spawn(async move {
             loop {
@@ -398,13 +400,16 @@ impl RelayManager {
 
     async fn run_loop(self: Arc<Self>) {
         let mut backoff = Duration::from_secs(1);
+        // 旧服务器每次配置/连接管理器重启只探测一次，不在重连时反复请求不存在的路由。
+        let mut legacy = false;
         loop {
             let Some((server, token, name)) = self.cfg() else {
                 self.set_connected(false);
                 return; // 未配置：等设置变更后由 restart 重新拉起
             };
             // 连上后先上报漫游目录
-            let result = self.connect_once(&server, &token, &name).await;
+            let result = self.connect_once(&server, &token, &name, &mut legacy).await;
+            self.clear_v2();
             // connect_once 只有在收到成功响应头后才会置 connected=true。只要本轮曾经
             // 连上过，后续断线就应从 1s 重新退避；否则启动阶段的历史失败会让一条已稳定
             // 很久的连接断开后仍等待最多 30s，叠加读侧断线检测后看起来像没有重连。
@@ -436,11 +441,24 @@ impl RelayManager {
         self.protocol_v2.store(false, Ordering::SeqCst);
     }
 
-    async fn connect_once(&self, server: &str, token: &str, name: &str) -> Result<(), String> {
+    async fn connect_once(&self, server: &str, token: &str, name: &str, legacy: &mut bool) -> Result<(), String> {
         self.clear_v2();
         let since = self.last_seq.load(Ordering::SeqCst);
         let previous_epoch = self.server_epoch.lock().unwrap().clone();
         let url = sse_url(server, since, &previous_epoch)?;
+        if !*legacy {
+            let request = self.http.get(format!("{}/v2/ws?since={since}&serverEpoch={}", server.trim_end_matches('/'), urlencode(&previous_epoch)))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-Relay-Name-Encoded", urlencode(name))
+                .header("X-Relay-Groups-Encoded", urlencode(&self.groups_csv()))
+                .header("X-Relay-Device", &self.device_id)
+                .header("X-Relay-Version", self.app.package_info().version.to_string());
+            if let Some(socket) = crate::relay_socket::upgrade(request).await? {
+                return self.socket.run(socket, server, token, |frame| self.on_v2_frame(frame), || self.connection_ready("WebSocket")).await;
+            }
+            *legacy = true;
+            self.log("[relay] 服务端未提供 /v2/ws，回退 HTTP + SSE".into());
+        }
         let request = self
             .http
             .get(url)
@@ -463,14 +481,7 @@ impl RelayManager {
             return Err(format!("v2 SSE 返回 HTTP {}", response.status()));
         }
 
-        self.protocol_v2.store(true, Ordering::SeqCst);
-        self.v2_ready.notify_waiters();
-        self.set_connected(true);
-        self.log("[relay] 已通过 v2 HTTP + SSE 连接中转站".into());
-        self.publish_folders();
-        self.rebuild_hosted();
-        self.resync_guest_threads();
-        crate::employee::resend_help();
+        self.connection_ready("HTTP + SSE");
 
         let mut decoder = SseDecoder::new();
         let result = loop {
@@ -502,6 +513,17 @@ impl RelayManager {
         result
     }
 
+    fn connection_ready(&self, transport: &str) {
+        self.protocol_v2.store(true, Ordering::SeqCst);
+        self.v2_ready.notify_waiters();
+        self.set_connected(true);
+        self.log(format!("[relay] 已通过 v2 {transport} 连接中转站"));
+        self.publish_folders();
+        self.rebuild_hosted();
+        self.resync_guest_threads();
+        crate::employee::resend_help();
+    }
+
     fn consume_v2_sse_events(&self, events: Vec<String>) -> Result<(), String> {
         for event in events {
             self.on_v2_frame(decode_sse_json(&event)?);
@@ -510,8 +532,7 @@ impl RelayManager {
     }
 
     fn on_v2_frame(&self, frame: Value) {
-        // 主 SSE 同时承载低频远控命令。remote.rs 忙时会按需开启辅助 SSE；
-        // command id 与 revision 去重使主/辅切换窗口内的重复事件安全。
+        // WS 和兼容主 SSE 共用远控事件；command id/revision 去重保护传输切换窗口。
         if matches!(frame["op"].as_str(), Some("device" | "remote.device")) {
             crate::remote::publish_main_sse(frame);
             return;
@@ -710,6 +731,9 @@ impl RelayManager {
             "type": kind,
             "data": data,
         });
+        if let Some(result) = self.socket.request(&server, &token, frame.clone()).await {
+            return result;
+        }
         let encoded = serde_json::to_vec(&frame).map_err(|e| e.to_string())?;
         let mut request = self
             .http
@@ -2438,17 +2462,17 @@ impl RelayManager {
             }
             set.iter().cloned().collect()
         };
-        // 只补救「卡住」的会话：运行中但已数秒没收到任何 host 事件。健康轮次里
-        // 增量持续到达，不会触发，避免多余的快照流量与重渲染。
+        // 模型思考/长命令的短暂静默不是缺包；静默 30s 才兜底，未恢复时最多每 60s 请求一次。
         let now = Instant::now();
         let stale: Vec<String> = {
             let act = self.guest_activity.lock().unwrap();
+            let mut requested = self.last_resync.lock().unwrap();
             running
                 .into_iter()
                 .filter(|id| {
-                    act.get(id)
-                        .map(|t| now.duration_since(*t) >= Duration::from_secs(4))
-                        .unwrap_or(true)
+                    if !quiet_resync_due(now, act.get(id).copied(), requested.get(id).copied()) { return false; }
+                    requested.insert(id.clone(), now);
+                    true
                 })
                 .collect()
         };
@@ -3120,11 +3144,18 @@ pub(crate) fn gzip_json(value: &Value) -> Result<Vec<u8>, String> {
     enc.finish().map_err(|e| e.to_string())
 }
 
+fn quiet_resync_due(now: Instant, activity: Option<Instant>, requested: Option<Instant>) -> bool {
+    activity.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(30))
+        && requested.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(60))
+}
+
 /// 流式增量的最小发送间隔。
 const OUT_WINDOW: Duration = Duration::from_millis(150);
 
 /// 追加一条 op；与上一条同 itemId 的 delta 直接拼接文本（apply 是纯追加，结果等价）。
 fn push_op(ops: &mut Vec<Value>, op: Value) {
+    // upsert 是完整替换，重复状态可省；delta 是追加，即使文本相同也不能丢。
+    if op["t"] == "upsert" && ops.last() == Some(&op) { return; }
     if let (Some(last), Some(text)) = (ops.last_mut(), op["text"].as_str()) {
         if op["t"] == "delta" && last["t"] == "delta" && last["itemId"] == op["itemId"] {
             if let Some(prev) = last["text"].as_str() {
@@ -3222,6 +3253,10 @@ pub fn resolve_relay_server(raw: &str) -> String {
     let s = raw.trim().trim_end_matches('/');
     if s.is_empty() {
         crate::settings::DEFAULT_RELAY_SERVER.to_string()
+    } else if let Some(rest) = s.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else if let Some(rest) = s.strip_prefix("wss://") {
+        format!("https://{rest}")
     } else {
         s.to_string()
     }
@@ -3431,6 +3466,31 @@ mod tests {
             assert!(requested_agent_kind(agent).is_err(), "accepted {agent:?}");
         }
         assert_eq!(requested_agent_kind(" lyra ").unwrap(), AgentKind::Lyra);
+    }
+
+    #[test]
+    fn quiet_watchdog_is_bounded_and_updates_are_lossless() {
+        let now = Instant::now();
+        assert!(!quiet_resync_due(now, Some(now - Duration::from_secs(4)), None));
+        assert!(quiet_resync_due(now, Some(now - Duration::from_secs(30)), None));
+        assert!(!quiet_resync_due(now, None, Some(now - Duration::from_secs(59))));
+        assert!(quiet_resync_due(now, None, Some(now - Duration::from_secs(60))));
+        let op = json!({"t":"upsert", "item":{"id":"x", "status":"in_progress"}});
+        let mut ops = vec![op.clone()];
+        push_op(&mut ops, op);
+        assert_eq!(ops.len(), 1);
+        push_op(&mut ops, json!({"t":"delta", "itemId":"x", "text":"a"}));
+        push_op(&mut ops, json!({"t":"delta", "itemId":"x", "text":"a"}));
+        assert_eq!(ops[1]["text"], "aa");
+        push_op(&mut ops, json!({"t":"upsert", "item":{"id":"x", "status":"completed"}}));
+        assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn websocket_addresses_keep_http_endpoints_usable() {
+        assert_eq!(resolve_relay_server(" ws://localhost:8320/base/ "), "http://localhost:8320/base");
+        assert_eq!(resolve_relay_server("wss://example.com"), "https://example.com");
+        assert_eq!(resolve_relay_server("https://example.com"), "https://example.com");
     }
 
     #[test]

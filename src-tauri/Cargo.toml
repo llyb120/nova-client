@@ -28,7 +28,9 @@ xcap = "0.9.8"
 # Reuse xcap's image crate for compact screenshots and Windows clipboard DIB decoding.
 image = { version = "0.25", default-features = false, features = ["jpeg", "bmp", "png", "webp"] }
 flate2 = "1"
-futures-util = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
+# HTTP upgrade reuses reqwest's TLS/proxy stack; tungstenite handles RFC 6455 framing.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "native-tls", "blocking", "system-proxy", "socks", "stream", "multipart"] }
 hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }

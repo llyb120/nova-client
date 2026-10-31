@@ -1,7 +1,9 @@
 # Nova Headless Server
 
 Nova Server 在没有桌面环境的 Linux 主机上运行完整 Nova 后端，并通过现有中转服务接受
-Nova Web 的远程控制。服务器只发起出站 HTTPS 连接（普通 HTTP 上行 + SSE 下行），无需开放 Nova 入站端口。
+Nova Web 的远程控制。服务器只发起出站连接：优先通过 `/v2/ws` 复用一条 WebSocket 收发团队消息和远控状态，旧中转站自动回退 HTTP + SSE，无需开放 Nova 入站端口。
+
+中转站地址仍填写 `http://` / `https://` 基址（也接受 `ws://` / `wss://` 基址，不含 `/v2/ws`）；分别使用 WS / WSS。文件、模型服务等普通 HTTP 接口保留。反向代理需允许 `/v2/ws` 的 HTTP/1.1 Upgrade，并将读取超时设为大于 45 秒。公网必须使用 HTTPS/WSS，明文 WS 只适合受保护的测试网络。
 
 ## 依赖
 

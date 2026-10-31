@@ -30,6 +30,7 @@ mod meteor;
 mod nova_tools_native;
 mod path_env;
 mod relay;
+mod relay_socket;
 mod remote;
 mod server;
 pub(crate) mod settings;
