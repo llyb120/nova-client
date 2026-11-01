@@ -484,6 +484,14 @@ pub fn ponytail_prompt(enabled: bool, level: &str) -> String {
     format!("{PONYTAIL_RULES}\n\n{PONYTAIL_LEVELS}\n\nActive level: {level}.")
 }
 
+pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str) -> std::borrow::Cow<'a, str> {
+    if model_id.to_ascii_lowercase().contains("deepseek") {
+        format!("{system_prompt}\n\n切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有").into()
+    } else {
+        system_prompt.into()
+    }
+}
+
 /// 稳定段在前、动态段在后，配合 session 级 prompt_cache_key 最大化前缀缓存命中。
 pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     let polaris = options.fast_context;
@@ -622,6 +630,18 @@ mod tests {
         assert!(prompt.contains("![图片说明](<图片地址>)") && prompt.contains("绝对路径"));
         let prompt = build_system_prompt(&SystemPromptOptions { ponytail: true, ..options });
         assert!(!prompt.contains("‘无风险’声明") && prompt.contains("以 ponytail 为准"));
+    }
+
+    #[test]
+    fn model_system_prompt_only_enhances_deepseek_ids() {
+        let base = "original system prompt";
+        let enhanced = format!("{base}\n\n切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有");
+        for id in ["deepseek-chat", "deepseek-reasoner", "DeepSeek-V3.2", "deepseek-ai/DeepSeek-R1", "vendor/deepseek-v4-flash"] {
+            assert_eq!(model_system_prompt(base, id), enhanced, "{id}");
+        }
+        for id in ["", "gpt-4.1", "claude-sonnet-4", "glm-5", "kimi-k2.5"] {
+            assert!(matches!(model_system_prompt(base, id), std::borrow::Cow::Borrowed(prompt) if prompt == base), "{id}");
+        }
     }
 
     #[test]

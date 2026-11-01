@@ -4,7 +4,7 @@
 
 use crate::http_stream::SseDecoder;
 use crate::lyra::config::{Resolved, ResolvedModel};
-use crate::lyra::prompt::{clamp_prompt_cache_key, clamp_tool_output_text};
+use crate::lyra::prompt::{clamp_prompt_cache_key, clamp_tool_output_text, model_system_prompt};
 use crate::lyra::tools::Tool;
 use base64::Engine;
 use serde_json::{json, Map, Value};
@@ -1842,6 +1842,8 @@ async fn stream_chat_once(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
+    let system_prompt = model_system_prompt(system_prompt, &model.id);
+    let system_prompt = system_prompt.as_ref();
     if model.api != "openai-responses" { response_state::reset(session_id); }
     let (body, field) = match model.api.as_str() {
         "codebuddy" | "devin" | "openai-completions" =>
