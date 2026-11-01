@@ -1,15 +1,19 @@
 # Lyra 运行时：计数、续接、命令、子任务与 MCP
 
+## 历史回放
+
+对齐 Codex 的普通请求路径：新用户轮次只追加历史，不主动剥离已完成轮次的 reasoning、推理签名或原生工具调用 ID，避免改写已发送前缀。缺失工具结果仍补中断占位，孤儿结果仍清理；ACP/legacy 显式折叠及旧浏览器观察裁剪规则不变。最终的协议序列化仍由 provider 负责（例如 `store:false` 不回传未存储的 item `id`，但保留加密 reasoning 状态和 `call_id`）。
+
 ## Token 预算
 
 `context_budget` 返回 JSON 分项：system、tools、messagesText、toolArguments、toolResults、reasoning、images、other、overhead，以及校准差额、输出预留、协议余量和上次服务端 usage。
 
-- 以服务端实际 usage 为准：上次请求实测的 prompt tokens（缓存输入不重复累加）作为锚点，当前视图仍以该次已发送消息开头时，只对之后新增的消息做本地估算；折叠或去 reasoning 改写前缀后回退为校准后的整体估算（`anchoredToActualUsage` 标明）。
+- 以服务端实际 usage 为准：上次请求实测的 prompt tokens（缓存输入不重复累加）作为锚点，当前视图仍以该次已发送消息开头时，只对之后新增的消息做本地估算；折叠或回滚改写前缀后回退为校准后的整体估算（`anchoredToActualUsage` 标明）。
 - 本地估算为字符启发式（ASCII 约 4 字符/token，其它字符约 1 token），不内置 BPE 词表；`options.tokenizer` 已废弃并被忽略（仍不外发）。图片、协议封装与未知内容为占位估算，`promptExact:false`。
 - 请求预算与折叠使用规范化后的消息视图，输出预留取模型配置（封顶窗口 25%）。固定提示已耗尽窗口时报告 `inputBudgetExhausted`，需缩短固定提示，不反复无效自动折叠。
 - JSON BPE 计数不是服务端模型输入序列化的精确计数；图片、音频等载荷不能按 base64 长度当作 token（图片统一按每张 1600 估算）。
 - 输出预留取 `min(max_output_tokens, 窗口×25%)`，输出上限接近窗口时自动折叠仍可用；provider 报溢出时的恢复折叠不受本地预算限制。
-- 校准系数只随词表/去 reasoning 策略作废，系统提示变化（日期、cwd、技能）不清空校准。
+- 校准系数只随计数/请求规范化口径变化作废，系统提示变化（日期、cwd、技能）不清空校准。
 - 计数按消息内容缓存，历史只追加时每次往返只对新消息做 BPE；出站 max_tokens 预算对未确认词表的模型（如 Claude）额外乘 1.25 保守系数。
 
 ## Responses 原生续接

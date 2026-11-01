@@ -250,10 +250,6 @@ impl Session {
             .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"))
     }
 
-    fn strips_reasoning(&self) -> bool {
-        self.model.model.api.starts_with("openai") || self.model.model.api == "azure-openai-responses"
-    }
-
     fn cancel(&mut self) -> TurnOutcome {
         crate::lyra::provider::reset_response_state(&self.session_id);
         self.mcp.get_mut().close();
@@ -280,7 +276,6 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
         if let Some(input) = input {
             s.history.record(input);
         }
-        let turn_start = s.last_user_index().unwrap_or(0);
         let mut retries = 0;
         let mut overflow_recovered = false;
         let mut output_recovery = None;
@@ -300,7 +295,6 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                         "maxItems":64, "description":"可选：必须先成功完成的本轮工具调用序号（从1开始，仅限更早调用）。省略表示独立，可自动并发。参数已知的依赖步骤可同轮提交；依赖失败则本项跳过。界面/agent/MCP结果须模型确认，不能作为自动后继的前置。不传给实际工具。"}));
                 }
             }
-            s.context.set_prompt_policy(turn_start, s.strips_reasoning());
             if s.context.should_compact(s.history.items()) {
                 compact(s, Trigger::Auto, on_event).await;
             }

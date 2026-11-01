@@ -41,17 +41,9 @@ impl History {
         }
     }
 
-    /// 发给 provider 的规范化视图：`completed_before` 之前的轮次视为已完成，
-    /// OpenAI 系列去掉其 reasoning；最后统一修复工具配对。
-    pub fn for_prompt(messages: &[Value], completed_before: usize, strip_reasoning: bool) -> Vec<Value> {
-        let split = completed_before.min(messages.len());
-        let mut out = if strip_reasoning {
-            strip_completed_openai_reasoning(&messages[..split])
-        } else {
-            messages[..split].to_vec()
-        };
-        out.extend_from_slice(&messages[split..]);
-        let mut out = repair_interrupted_tool_pairs(&out);
+    /// 对齐 Codex：保留 reasoning、签名和原生 ID，只修复工具配对并裁剪旧 DOM。
+    pub fn for_prompt(messages: &[Value]) -> Vec<Value> {
+        let mut out = repair_interrupted_tool_pairs(messages);
         trim_browser_dom(&mut out);
         out
     }
@@ -144,123 +136,6 @@ pub fn text_content(content: &Value) -> String {
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// 已完成的 OpenAI 轮次不需要重放 reasoning；Responses 工具调用去掉 item-id 后缀，
-/// 保留与工具结果配对的 call id。只用于完成的轮次，中断轨迹保持原样。
-pub fn strip_completed_openai_reasoning(messages: &[Value]) -> Vec<Value> {
-    let normalized: Vec<Value> = messages
-        .iter()
-        .map(|message| {
-            if message.get("role").and_then(Value::as_str) != Some("assistant") {
-                return message.clone();
-            }
-            let Some(content) = message.get("content").and_then(Value::as_array) else {
-                return message.clone();
-            };
-            let mut changed = false;
-            let mut next = Vec::with_capacity(content.len());
-            for block in content {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("thinking") => changed = true,
-                    Some("toolCall") => {
-                        let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
-                        if id.contains('|') {
-                            changed = true;
-                            let mut block = block.clone();
-                            block["id"] = json!(id.split('|').next().unwrap_or(id));
-                            next.push(block);
-                        } else {
-                            next.push(block.clone());
-                        }
-                    }
-                    _ => next.push(block.clone()),
-                }
-            }
-            if !changed {
-                return message.clone();
-            }
-            let mut message = message.clone();
-            message["content"] = Value::Array(next);
-            message
-        })
-        .collect();
-    sanitize_completed_tool_pairs(&normalized)
-}
-
-/// Provider 要求 completed assistant toolCall 与 toolResult 完整配对。旧会话可能因强杀、
-/// 早期 bridge bug 或 call-id 后缀迁移留下孤儿。这里只清理已完成历史；pending 活动轨迹
-/// 不调用本函数，仍逐字保留供恢复。
-pub fn sanitize_completed_tool_pairs(messages: &[Value]) -> Vec<Value> {
-    let result_ids = messages
-        .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) == Some("toolResult"))
-        .filter_map(|message| message.get("toolCallId").and_then(Value::as_str))
-        .map(|id| id.split('|').next().unwrap_or(id).to_string())
-        .collect::<std::collections::HashSet<_>>();
-    let call_ids = messages
-        .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
-        .flat_map(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
-        .filter_map(|part| part.get("id").and_then(Value::as_str))
-        .map(|id| id.split('|').next().unwrap_or(id).to_string())
-        .collect::<std::collections::HashSet<_>>();
-
-    messages
-        .iter()
-        .filter_map(
-            |message| match message.get("role").and_then(Value::as_str) {
-                Some("assistant") => {
-                    let Some(content) = message.get("content").and_then(Value::as_array) else {
-                        return Some(message.clone());
-                    };
-                    let next = content
-                        .iter()
-                        .filter_map(|part| {
-                            if part.get("type").and_then(Value::as_str) != Some("toolCall") {
-                                return Some(part.clone());
-                            }
-                            let id = part
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .map(|id| id.split('|').next().unwrap_or(id))?;
-                            if !result_ids.contains(id) {
-                                return None;
-                            }
-                            let mut part = part.clone();
-                            part["id"] = json!(id);
-                            Some(part)
-                        })
-                        .collect::<Vec<_>>();
-                    if next.is_empty() {
-                        None
-                    } else {
-                        let mut message = message.clone();
-                        message["content"] = Value::Array(next);
-                        Some(message)
-                    }
-                }
-                Some("toolResult") => message
-                    .get("toolCallId")
-                    .and_then(Value::as_str)
-                    .map(|id| id.split('|').next().unwrap_or(id))
-                    .filter(|id| call_ids.contains(*id))
-                    .map(|id| {
-                        let mut message = message.clone();
-                        message["toolCallId"] = json!(id);
-                        message
-                    }),
-                _ => Some(message.clone()),
-            },
-        )
-        .collect()
 }
 
 /// 中断轨迹不能删除活动 toolCall；为旧 checkpoint 中缺失的结果补一个明确的中断占位，
@@ -358,7 +233,7 @@ mod tests {
                 "content":[{"type":"text","text":result.to_string()}],"details":result}));
         }
         let before = canonical.clone();
-        let projected = History::for_prompt(&canonical, 0, false);
+        let projected = History::for_prompt(&canonical);
         assert_eq!(canonical, before);
         assert_eq!(projected.len(), canonical.len());
         let old: Value = serde_json::from_str(projected[1]["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -369,21 +244,39 @@ mod tests {
         assert!(projected[1]["details"].get("pages").is_none());
         assert_eq!(projected[1]["details"]["images"], canonical[1]["details"]["images"]);
         assert_eq!(projected[2..], canonical[2..], "other tabs/tools, latest two DOMs and script values stay intact");
-        assert_eq!(History::for_prompt(&projected, 0, false), projected);
+        assert_eq!(History::for_prompt(&projected), projected);
         let mut tagged = canonical.clone();
         for i in (1..tagged.len()).step_by(2) {
             tagged[i]["content"][0]["text"] = json!(format!("[m{i:05}] {}", tagged[i]["content"][0]["text"].as_str().unwrap()));
         }
-        let tagged_view = History::for_prompt(&tagged, 0, false);
+        let tagged_view = History::for_prompt(&tagged);
         assert_eq!(tagged_view[1]["content"][0]["text"], format!("[m00001] {old}"));
         assert_eq!(tagged_view[2..], tagged[2..]);
         let mut malformed = canonical.clone();
         malformed[1]["content"][0]["text"] = json!("not JSON");
-        assert_eq!(History::for_prompt(&malformed, 0, false), malformed);
+        assert_eq!(History::for_prompt(&malformed), malformed);
     }
 
     #[test]
-    fn removes_orphaned_completed_tool_pairs() {
+    fn prompt_preserves_reasoning_and_native_ids_across_user_turns() {
+        let mut messages = vec![
+            user_message("read a", &[]),
+            json!({ "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "reasoning", "thinkingSignature": "opaque",
+                  "reasoningDetails": [{ "type": "reasoning.encrypted", "data": "encrypted" }] },
+                { "type": "toolCall", "id": "call_1|fc_1", "name": "read", "arguments": { "path": "a" } }
+            ] }),
+            json!({ "role": "toolResult", "toolCallId": "call_1|fc_1", "content": [{ "type": "text", "text": "ok" }] }),
+        ];
+        let previous = History::for_prompt(&messages);
+        messages.push(user_message("next turn", &[]));
+        let prompt = History::for_prompt(&messages);
+        assert_eq!(prompt, messages, "request normalization must not rewrite reasoning or native IDs");
+        assert_eq!(&prompt[..previous.len()], previous, "a new user turn only appends to the previous prefix");
+    }
+
+    #[test]
+    fn prompt_repairs_tool_pairs_without_rewriting_native_ids() {
         let messages = vec![
             json!({ "role": "assistant", "content": [
                 { "type": "text", "text": "keep" },
@@ -393,11 +286,13 @@ mod tests {
             json!({ "role": "toolResult", "toolCallId": "paired|fc_1", "content": [{ "type": "text", "text": "ok" }] }),
             json!({ "role": "toolResult", "toolCallId": "result-only", "content": [{ "type": "text", "text": "bad" }] }),
         ];
-        let out = strip_completed_openai_reasoning(&messages);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0]["content"].as_array().unwrap().len(), 2);
-        assert_eq!(out[0]["content"][1]["id"], "paired");
-        assert_eq!(out[1]["toolCallId"], "paired");
+        let out = History::for_prompt(&messages);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], messages[0]);
+        assert_eq!(out[1]["toolCallId"], "orphan|fc_2");
+        assert_eq!(out[1]["isError"], true);
+        assert_eq!(out[2], messages[1]);
+        assert_eq!(History::for_prompt(&out), out, "repair is idempotent");
     }
 
     #[test]

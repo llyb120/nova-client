@@ -106,7 +106,7 @@ struct State {
     projection: Option<Projection>,
     /// provider 实测 prompt tokens / 本地估算，校准后续估算。
     calibration: f64,
-    /// 估算口径（计数方法 + 去 reasoning 策略）变化时校准作废；不改变投影版本。
+    /// 估算口径（计数方法 + 请求规范化）变化时校准作废；不改变投影版本。
     accounting_key: String,
     last_actual_usage: Option<Value>,
     /// 上次 provider 实测对应的已发送前缀；当前视图仍以它开头时以实测为准，只估算新增部分。
@@ -141,8 +141,6 @@ pub struct ContextWindow {
     counter: TokenCounter,
     fixed: TokenBreakdown,
     reserved_output: u64,
-    completed_before: usize,
-    strip_reasoning: bool,
     accounting_key: String,
     path: Option<PathBuf>,
     state: State,
@@ -166,8 +164,8 @@ impl ContextWindow {
     pub fn ephemeral(window: u64, overhead: u64) -> Self {
         let counter = TokenCounter::default();
         let fixed = TokenBreakdown { overhead, ..TokenBreakdown::default() };
-        let accounting_key = hash_values(&[counter.metadata(), json!(false)]);
-        Self { window, counter, fixed, reserved_output: 0, completed_before: 0, strip_reasoning: false, accounting_key, path: None, state: State::default(), acp_enabled: false }
+        let accounting_key = hash_values(&[counter.metadata()]);
+        Self { window, counter, fixed, reserved_output: 0, accounting_key, path: None, state: State::default(), acp_enabled: false }
     }
 
     /// tools 应传实际工具定义 JSON，而非已编码的 JSON 字符串。替代旧 overhead，不重复累计。
@@ -178,30 +176,18 @@ impl ContextWindow {
             overhead: if system.is_empty() { 3 } else { 7 }, // 回复前缀 + system 消息封装，仍是估算。
             ..TokenBreakdown::default()
         };
-        self.accounting_key = hash_values(&[counter.metadata(), json!(self.strip_reasoning)]);
+        self.accounting_key = hash_values(&[counter.metadata()]);
         self.counter = counter;
         self.reserved_output = reserved_output;
     }
 
-    /// 每轮折叠检查前设置；completed_before 是规范历史下标，不是投影后的下标。
-    pub fn set_prompt_policy(&mut self, completed_before: usize, strip_reasoning: bool) {
-        self.completed_before = completed_before;
-        self.strip_reasoning = strip_reasoning;
-        self.accounting_key = hash_values(&[self.counter.metadata(), json!(strip_reasoning)]);
-    }
-
-    fn normalize_prompt(&self, messages: &[Value], completed_before: usize) -> Vec<Value> {
-        coalesce_user_runs(History::for_prompt(messages, completed_before, self.strip_reasoning))
+    fn normalize_prompt(&self, messages: &[Value]) -> Vec<Value> {
+        coalesce_user_runs(History::for_prompt(messages))
     }
 
     /// 折叠预算与实际发送共用此视图；record_usage 必须接收该请求的同一份 messages。
     pub fn prompt_view(&self, canonical: &[Value]) -> Vec<Value> {
-        if self.acp_enabled {
-            let (view, map) = self.acp_view(canonical);
-            return self.normalize_prompt(&view, map.get(self.completed_before).copied().unwrap_or(0));
-        }
-        let completed = self.view_index(canonical, self.completed_before).unwrap_or(0);
-        self.normalize_prompt(&self.view(canonical), completed)
+        self.normalize_prompt(&self.view(canonical))
     }
 
     fn save(&mut self) {
@@ -452,7 +438,7 @@ impl ContextWindow {
             "contextWindow": self.window,
             "automaticCompaction": self.window > 0 && !self.input_budget_exhausted(),
             "inputBudgetExhausted": self.input_budget_exhausted(),
-            "promptNormalization": { "completedBefore": self.completed_before, "stripReasoning": self.strip_reasoning },
+            "promptNormalization": { "stripReasoning": false },
             "foldTrigger": trigger,
             "remainingBeforeCompaction": if self.window > 0 { Some(trigger.saturating_sub(used)) } else { None },
             "breakdown": parts,
@@ -521,8 +507,7 @@ impl ContextWindow {
                 return Ok(self.receipt("noop", trigger, "view unchanged since the last fold"));
             }
         }
-        let completed = self.view_index(canonical, self.completed_before).unwrap_or(0);
-        let source = self.prompt_tokens(&self.normalize_prompt(&visible, completed));
+        let source = self.prompt_tokens(&self.normalize_prompt(&visible));
         if trigger == Trigger::Auto && source < self.trigger_tokens() {
             return Ok(self.receipt("noop", trigger, "below trigger"));
         }
@@ -565,7 +550,7 @@ impl ContextWindow {
             }
         };
         let entries = build_fold_index(region, &keep, origin);
-        let fixed_prefix = self.prompt_tokens(&self.normalize_prompt(&visible[..head], completed));
+        let fixed_prefix = self.prompt_tokens(&self.normalize_prompt(&visible[..head]));
         if fixed_prefix >= self.trigger_tokens() {
             return Ok(self.receipt("noop", trigger, "fixed prefix alone exceeds the trigger"));
         }
@@ -599,8 +584,7 @@ impl ContextWindow {
         let covered = prior_covered + start.saturating_sub(body_len);
         let mut candidate = body.clone();
         candidate.extend_from_slice(&canonical[covered..]);
-        let completed = self.completed_before.checked_sub(covered).map_or(0, |i| body.len() + i);
-        let result = self.prompt_tokens(&self.normalize_prompt(&candidate, completed));
+        let result = self.prompt_tokens(&self.normalize_prompt(&candidate));
         if let Err(reason) = self.accept(result, source, fixed_prefix, trigger == Trigger::Manual, must_free) {
             let mut receipt = self.receipt("rejected", trigger, reason);
             receipt.input_hash = input_hash;
@@ -1454,7 +1438,7 @@ mod tests {
         next.push(user("next turn"));
         let tail = ctx.token_breakdown(&next).total() - raw;
         assert_eq!(ctx.prompt_tokens(&next), raw * 3 + tail * 3);
-        // 前缀被改写（折叠/去 reasoning）时锚点失效，回退为校准后的整体估算。
+        // 前缀被改写（折叠/回滚）时锚点失效，回退为校准后的整体估算。
         assert_eq!(ctx.prompt_tokens(&next[1..]), ctx.token_breakdown(&next[1..]).total() * 3);
         // 系统提示变化只调整固定开销差额，不丢弃实测。
         ctx.configure_tokens(counter.clone(), "系统 system 加长了", &tools, 512);
@@ -1468,16 +1452,15 @@ mod tests {
         let counter = TokenCounter::default();
         assert_eq!(counter.count_messages(&[unknown_media("tiny")]).total(), counter.count_messages(&[unknown_media(&"abc".repeat(10000))]).total());
         assert_eq!(counter.count_messages(&[unknown_media("data")]).unknown_part_count, 1);
-        // 折叠预算与校准基线必须是同一份去 reasoning/修复配对/合并 user 后的视图。
+        // 折叠预算与校准基线必须是同一份保留 reasoning/修复配对/合并 user 后的视图。
         let canonical = vec![user("old"), json!({ "role": "assistant", "content": [
             { "type": "thinking", "thinking": "private reasoning" }, { "type": "text", "text": "answer" }
         ] }), user("next"), user("steer")];
         let mut ctx = ContextWindow::ephemeral(4096, 0);
-        ctx.configure_tokens(counter, "system", &Value::Null, 512);
-        ctx.set_prompt_policy(2, true);
+        ctx.configure_tokens(counter.clone(), "system", &Value::Null, 512);
         let sent = ctx.prompt_view(&canonical);
-        assert_eq!(sent, coalesce_user_runs(History::for_prompt(&canonical, 2, true)));
-        assert_eq!(ctx.token_breakdown(&sent).reasoning, 0);
+        assert_eq!(sent, coalesce_user_runs(History::for_prompt(&canonical)));
+        assert_eq!(ctx.token_breakdown(&sent).reasoning, counter.count_text("private reasoning"));
         assert_eq!(sent.len(), 3);
         let raw = ctx.prompt_tokens(&sent);
         ctx.record_usage(&sent, &json!({ "input": raw - 3, "cacheRead": 2, "cacheWrite": 1, "output": 9, "reasoning": 5 }));
@@ -1485,7 +1468,7 @@ mod tests {
         assert_eq!(report["uncalibratedPromptTokens"], raw);
         assert_eq!(report["lastActualUsage"]["localUncalibratedPromptTokens"], raw);
         assert_eq!(report["calibrationFactor"], 1.0);
-        // 系统提示变化不使校准作废；只有词表/去 reasoning 策略变化才作废。
+        // 系统提示变化不使校准作废；只有计数/请求规范化口径变化才作废。
         ctx.calibrate(&sent, raw * 2);
         ctx.configure_tokens(TokenCounter::default(), "system prompt changed: 2030-01-01 /tmp", &Value::Null, 512);
         assert_eq!(ctx.calibration(), ctx.state.calibration);
@@ -1503,6 +1486,28 @@ mod tests {
         // 只有固定提示本身占满窗口才算耗尽。
         let exhausted = ContextWindow::ephemeral(4096, 4000);
         assert!(exhausted.input_budget_exhausted() && !exhausted.should_compact(&canonical));
+    }
+
+    #[test]
+    fn new_user_turn_preserves_reasoning_prefix_and_usage_anchor() {
+        for acp in [false, true] {
+            let mut ctx = ContextWindow::ephemeral(4096, 0);
+            if acp { ctx.enable_acp(); }
+            let mut canonical = vec![user("first"), json!({ "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "reasoning to replay", "thinkingSignature": "opaque" },
+                { "type": "text", "text": "answer" }
+            ] })];
+            let before = ctx.prompt_view(&canonical);
+            ctx.record_usage(&before, &json!({ "input": 100, "cacheRead": 20 }));
+            canonical.push(user("next"));
+            let after = ctx.prompt_view(&canonical);
+            assert_eq!(&after[..before.len()], before, "acp={acp}: new turns only extend the prefix");
+            assert_eq!(after[1], canonical[1], "reasoning and its signature remain intact");
+            let report: Value = serde_json::from_str(&ctx.budget_report(&canonical)).unwrap();
+            assert_eq!(report["anchoredToActualUsage"], true);
+            assert_eq!(report["promptNormalization"]["stripReasoning"], false);
+            assert!(report["breakdown"]["reasoning"].as_u64().unwrap() > 0);
+        }
     }
 
     #[tokio::test]
@@ -1579,7 +1584,6 @@ mod tests {
         let overflow = exhausted.compact(&canonical, None, Trigger::Overflow, |_, _| async { Err("offline".to_string()) }).await.unwrap();
         assert_ne!(overflow.reason, rejected.reason, "{overflow:?}");
         let mut ctx = ContextWindow::load(&root, "s", 20_000, 500);
-        ctx.set_prompt_policy(canonical.len() - 2, true);
         assert!(ctx.should_compact(&canonical));
         let source_tokens = ctx.prompt_tokens(&ctx.prompt_view(&canonical));
         let receipt = ctx

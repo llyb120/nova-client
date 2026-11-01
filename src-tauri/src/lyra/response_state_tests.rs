@@ -296,45 +296,60 @@ async fn dropped_inflight_future_cannot_leave_a_reusable_checkpoint() {
 }
 
 #[tokio::test]
-async fn run_turn_reconciles_tools_once_and_resets_after_completed_reasoning_is_stripped() {
+async fn run_turn_preserves_reasoning_across_user_turns_and_dispatches_tools_once() {
     use crate::lyra::{history::user_message, turn::{run_turn, tests::test_session, TurnEvent}};
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a"), "fixture contents").unwrap();
-    let item = tool_item();
-    let reasoning = json!({"type":"reasoning","id":"rs_first","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"thinking"}]});
-    let tools = sse(&[
-        json!({"type":"response.output_item.added","output_index":1,"item":item}),
-        json!({"type":"response.output_item.done","output_index":1,"item":item}),
-        json!({"type":"response.output_item.done","output_index":1,"item":item}),
-        json!({"type":"response.completed","response":{"id":"turn_tools","status":"completed","output":[reasoning,item]}}),
-    ]);
-    let (url, server) = server(vec![(200, tools), (200, sse(&[text_response("turn_end")])), (200, sse(&[text_response("next_turn")]))]).await;
-    let mut session = test_session(url.clone(), dir.path().into());
-    session.model.model = configured(url);
-    session.model.api_key = "fixture-key".into();
-    session.session_id = "e2e-reasoning".into();
-    session.tools.push(Tool { name: "read", description: "Read file".into(), parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) });
-    let mut ended = Vec::new();
-    let first = run_turn(&mut session, Some(user_message("read a", &[])), &mut |e| {
-        if let TurnEvent::ToolEnd { id, .. } = e { ended.push(id); }
-    }).await;
-    assert!(first.error.is_none() && !first.cancelled, "{first:?}");
-    assert_eq!(ended, ["call_1|fc_1"]);
-    let results: Vec<_> = session.history.items().iter().filter(|m| m["role"] == "toolResult").collect();
-    assert_eq!(results.len(), 1);
-    assert!(results[0]["content"].to_string().contains("fixture contents"));
-    assert!(session.history.items().iter().any(|m| m["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"] == "thinking"))));
-    let next = run_turn(&mut session, Some(user_message("next", &[])), &mut |_| {}).await;
-    assert!(next.error.is_none() && !next.cancelled, "{next:?}");
-    let requests = server.await.unwrap();
-    assert_eq!(requests[1]["previous_response_id"], "turn_tools");
-    assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
-    assert_eq!(requests[1]["input"][0]["type"], "function_call_output");
-    assert!(requests[2].get("previous_response_id").is_none());
-    assert!(requests[2]["input"].as_array().unwrap().len() > 1);
-    assert!(!requests[2]["input"].as_array().unwrap().iter().any(|p| p["type"] == "reasoning"));
-    let replay_call = requests[2]["input"].as_array().unwrap().iter().find(|p| p["type"] == "function_call").unwrap();
-    assert!(replay_call.get("id").is_none(), "for_prompt strips completed tool item IDs");
+    for stored in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "fixture contents").unwrap();
+        let item = tool_item();
+        let reasoning = json!({"type":"reasoning","id":"rs_first","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"thinking"}]});
+        let tools = sse(&[
+            json!({"type":"response.output_item.added","output_index":1,"item":item}),
+            json!({"type":"response.output_item.done","output_index":1,"item":item}),
+            json!({"type":"response.output_item.done","output_index":1,"item":item}),
+            json!({"type":"response.completed","response":{"id":"turn_tools","status":"completed","output":[reasoning,item]}}),
+        ]);
+        let (url, server) = server(vec![(200, tools), (200, sse(&[text_response("turn_end")])), (200, sse(&[text_response("next_turn")]))]).await;
+        let mut session = test_session(url.clone(), dir.path().into());
+        session.model.model = configured(url);
+        session.model.model.extra_options.insert("store".into(), json!(stored));
+        session.model.api_key = "fixture-key".into();
+        session.session_id = format!("e2e-reasoning-{stored}");
+        session.tools.push(Tool { name: "read", description: "Read file".into(), parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) });
+        let mut ended = Vec::new();
+        let first = run_turn(&mut session, Some(user_message("read a", &[])), &mut |e| {
+            if let TurnEvent::ToolEnd { id, .. } = e { ended.push(id); }
+        }).await;
+        assert!(first.error.is_none() && !first.cancelled, "{first:?}");
+        assert_eq!(ended, ["call_1|fc_1"]);
+        let results: Vec<_> = session.history.items().iter().filter(|m| m["role"] == "toolResult").collect();
+        assert_eq!(results.len(), 1);
+        assert!(results[0]["content"].to_string().contains("fixture contents"));
+        assert!(session.history.items().iter().any(|m| m["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"] == "thinking"))));
+        let next = run_turn(&mut session, Some(user_message("next", &[])), &mut |_| {}).await;
+        assert!(next.error.is_none() && !next.cancelled, "{next:?}");
+        let requests = server.await.unwrap();
+        if stored {
+            assert_eq!(requests[1]["previous_response_id"], "turn_tools");
+            assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+            assert_eq!(requests[1]["input"][0]["type"], "function_call_output");
+            assert_eq!(requests[2]["previous_response_id"], "turn_end");
+            assert_eq!(requests[2]["input"].as_array().unwrap().len(), 1);
+            assert_eq!(requests[2]["input"][0]["content"][0]["text"], "next");
+        } else {
+            assert!(requests[2].get("previous_response_id").is_none());
+            let input = requests[2]["input"].as_array().unwrap();
+            let replay_reasoning = input.iter().find(|p| p["type"] == "reasoning").unwrap();
+            let mut expected_reasoning = reasoning.clone();
+            expected_reasoning.as_object_mut().unwrap().remove("id");
+            assert_eq!(replay_reasoning, &expected_reasoning);
+            let replay_call = input.iter().find(|p| p["type"] == "function_call").unwrap();
+            assert_eq!(replay_call["call_id"], "call_1");
+            assert!(replay_call.get("id").is_none(), "store=false omits upstream item IDs, not reasoning state");
+            let prefix = requests[1]["input"].as_array().unwrap();
+            assert_eq!(&input[..prefix.len()], prefix, "full replay preserves the previous input prefix");
+        }
+    }
 }
 
 #[tokio::test]
