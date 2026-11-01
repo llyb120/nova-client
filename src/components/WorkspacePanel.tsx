@@ -260,7 +260,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const closeTab = async (path: string) => {
     if (saving()) return;
     if (!(await commitSheet())) return;
-    snapshot();
+    flush(snapshot);
     const tab = tabs().find(tab => tab.file.path === path);
     if (!tab) return;
     if (tab.draft !== normalized(tab.original)) { setClosing(path); return; }
