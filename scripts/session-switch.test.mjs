@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { transformSync } from "esbuild";
-import { createEffect, createMemo, createRoot, createSignal, createStore, flush, reconcile } from "@solidjs/signals";
+import { createEffect, createMemo, createRoot, createSignal, createStore, flush, onFlush, reconcile } from "@solidjs/signals";
 import { taskChains } from "../src/taskChains.ts";
 
 const store = readFileSync(new URL("../src/store.ts", import.meta.url), "utf8");
@@ -125,6 +125,113 @@ test("队列镜像移除旧 key，清空或挂起后整条链结束", () => {
   update(new Set()); flush();
   assert.equal(active().size, 0);
   assert.deepEqual(Object.keys(state.promptQueued), []);
+});
+
+test("关闭文件标签前提交编辑快照，未保存内容必须确认且保存失败不丢草稿", async t => {
+  const workspace = readFileSync(new URL("../src/components/WorkspacePanel.tsx", import.meta.url), "utf8");
+  const actions = workspace.slice(workspace.indexOf("  const snapshot ="), workspace.indexOf("  const revealLine ="));
+  const mount = (options = {}) => {
+    const writes = [];
+    const api = { saveWorkspaceFile: async (...args) => {
+      writes.push(args);
+      if (options.saveError) throw Error("save failed");
+    } };
+    return { writes, ...new Function("createSignal", "flush", "api", "options", `
+      const initial = (options.ids ?? ["a"]).map(path => ({ file: { path, kind: "text", text: "original" }, original: "original", draft: "original" }));
+      const current = initial[0], props = { threadId: "thread" };
+      const [tabs, setTabs] = createSignal(initial), [preview, setPreview] = createSignal(current.file);
+      const [draft, setDraft] = createSignal(options.clean ? "original" : "edited");
+      const [original, setOriginal] = createSignal("original"), [closing, setClosing] = createSignal();
+      const [editing, setEditing] = createSignal(true), [source, setSource] = createSignal(false);
+      const [saved, setSaved] = createSignal(false), [error, setError] = createSignal("");
+      const [saving, setSaving] = createSignal(false), [artifacts, setArtifacts] = createSignal([]);
+      const setLoading = () => {}, mode = () => "files", setMode = () => {};
+      const panel = { querySelector: () => null }, codeView = undefined;
+      const drafts = new Map(options.clean ? [] : [["a", { text: "edited" }]]);
+      const draftKey = path => path, normalized = text => text.replace(/\\r\\n/g, "\\n"), commitSheet = async () => true;
+      let request = 0;
+      ${js(actions)}
+      return { closeTab, resolveClose, tabs, preview, closing, drafts, error };
+    `)(createSignal, flush, api, options) };
+  };
+  await t.test("dirty active tab asks before closing; discard only happens after confirmation", async () => {
+    const panel = mount();
+    await panel.closeTab("a"); flush();
+    assert.equal(panel.closing(), "a");
+    assert.equal(panel.tabs()[0].draft, "edited");
+    assert.equal(panel.drafts.has("a"), true);
+    await panel.resolveClose(false); flush();
+    assert.equal(panel.tabs().length, 0);
+    assert.equal(panel.drafts.has("a"), false);
+  });
+  await t.test("confirmed save writes the current edit before closing", async () => {
+    const panel = mount();
+    await panel.closeTab("a"); flush();
+    await panel.resolveClose(true); flush();
+    assert.deepEqual(panel.writes, [["thread", "a", "original", "edited"]]);
+    assert.equal(panel.tabs().length, 0);
+  });
+  await t.test("failed save keeps the tab and recovery buffer", async () => {
+    const panel = mount({ saveError: true });
+    await panel.closeTab("a"); flush();
+    await panel.resolveClose(true); flush();
+    assert.equal(panel.tabs()[0].draft, "edited");
+    assert.equal(panel.drafts.has("a"), true);
+    assert.match(panel.error(), /save failed/);
+  });
+  await t.test("closing a clean inactive tab preserves the active edit", async () => {
+    const panel = mount({ ids: ["a", "b"] });
+    await panel.closeTab("b"); flush();
+    assert.deepEqual(panel.tabs().map(tab => tab.file.path), ["a"]);
+    assert.equal(panel.tabs()[0].draft, "edited");
+    assert.equal(panel.drafts.has("a"), true);
+    assert.equal(panel.closing(), undefined);
+  });
+  await t.test("clean active tab closes without a confirmation", async () => {
+    const panel = mount({ clean: true, ids: ["a", "b"] });
+    await panel.closeTab("a"); flush();
+    assert.deepEqual(panel.tabs().map(tab => tab.file.path), ["b"]);
+    assert.equal(panel.preview().path, "b");
+    assert.equal(panel.closing(), undefined);
+  });
+});
+
+test("中转模型预加载等待连接及成员状态提交，覆盖事件与初始化", async t => {
+  const ensure = store.slice(store.indexOf("export function ensurePeerModels("), store.indexOf("/** worktree「基于分支」"));
+  const preload = store.slice(store.indexOf("export function preloadPeerModels("), store.indexOf("/** 检查更新"));
+  const handlers = store.slice(store.indexOf('    listen<RelayStatus>("relay:status"'), store.indexOf("    // 漫游：对端回传其可选模型"));
+  const initialStart = store.lastIndexOf("  void api", store.indexOf("    .getRelayPeers()"));
+  const initial = store.slice(initialStart, store.indexOf("  void refreshInbox();", initialStart));
+  const actions = js(`${ensure}\n${preload}\nconst subscriptions = [${handlers}];\nconst loadInitialPeers = () => { ${initial} };`.replace(/export /g, ""));
+  const peer = { token: "peer", online: true };
+  const mount = (connected, peers, cached = {}) => {
+    const [state, setState] = createStore({ relay: { connected }, peers, settings: { relayToken: "self" }, peerModels: cached });
+    const calls = [], events = new Map();
+    const api = { requestPeerModels: async token => { calls.push(token); }, getRelayPeers: async () => [peer] };
+    const actionsForState = new Function("state", "setState", "api", "onFlush", "listen", "normalizePeers", "refreshInbox", `${actions}; return { preloadPeerModels, loadInitialPeers };`)(
+      state, setState, api, onFlush, (name, handler) => events.set(name, handler), raw => Array.isArray(raw) ? raw : raw.peers, async () => {});
+    return { calls, events, ...actionsForState };
+  };
+  const settle = () => new Promise(setImmediate);
+  await t.test("reconnect refreshes even a cached online peer", async () => {
+    const relay = mount(false, [peer], { peer: {} });
+    relay.events.get("relay:status")({ payload: { connected: true } });
+    await settle();
+    assert.deepEqual(relay.calls, ["peer"]);
+  });
+  await t.test("presence uses the new peers, skips self/offline and preserves force semantics", async () => {
+    const relay = mount(true, [{ token: "departed", online: true }], { peer: {} });
+    relay.events.get("relay:peers")({ payload: { peers: [peer, { token: "self", online: true }, { token: "offline", online: false }] } });
+    await settle();
+    assert.deepEqual(relay.calls, ["peer"]);
+    relay.preloadPeerModels(); await settle();
+    assert.deepEqual(relay.calls, ["peer"], "normal preloading still reuses the cache");
+  });
+  await t.test("startup preloads newly loaded peers without waiting for the timer", async () => {
+    const relay = mount(true, []);
+    relay.loadInitialPeers(); await settle();
+    assert.deepEqual(relay.calls, ["peer"]);
+  });
 });
 
 test("侧栏链索引只构建一次，重复查询不扫描历史，成环也能结束", () => {

@@ -646,11 +646,13 @@ export function ensurePeerBranches(token: string, folder: string) {
  * force=true 会强制刷新已缓存的列表（用于定期更新，保持与对端后端配置同步）。
  */
 export function preloadPeerModels(force = false) {
-  if (!state.relay.connected) return;
-  const me = state.settings?.relayToken ?? "";
-  for (const p of state.peers) {
-    if (p.online && p.token && p.token !== me) ensurePeerModels(p.token, force);
-  }
+  onFlush(() => {
+    if (!state.relay.connected) return;
+    const me = state.settings?.relayToken ?? "";
+    for (const p of state.peers) {
+      if (p.online && p.token && p.token !== me) ensurePeerModels(p.token, force);
+    }
+  });
 }
 
 /** 检查更新并静默下载暂存；返回给用户看的提示文案 */
