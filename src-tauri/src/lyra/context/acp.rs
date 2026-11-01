@@ -37,7 +37,7 @@ pub const GUIDE: &str = r#"
 Context management (ACP): Nova never summarizes your history behind your back; you decide when and what to compress.
 - User messages and tool results start with a ref like [m00012]. A compressed section shows up as <acp-block id="b3">.
 - When a <context-budget> notice arrives (or acp_status shows pressure), call `compress` on FINISHED work: ranges[].startRef/endRef are the first/last refs of the span; put earlier block ids (bN) in a range to fold old summaries into a bigger one. Never compress work still in progress; the last few messages are protected.
-- You write the summary, and it replaces the originals: keep every path, identifier, number, command + outcome, decision and its reason, error + fix, and open TODO you will still need. Be terse (bullets), never invent. User messages inside a range are kept verbatim automatically.
+- You write the summary, and it replaces the originals: keep every path, identifier, number, command + outcome, decision and its reason, error + fix, and open TODO you will still need. Be terse (bullets), never invent. Write it in the language the user is using. User messages inside a range are kept verbatim automatically.
 - `decompress` restores a block's originals, `search_context` greps summaries and the stored originals, `acp_status` shows usage and compressible ranges. Compression is cheap and reversible; waiting until the window is full is not."#;
 
 #[derive(Serialize, Deserialize, Default, Clone)]

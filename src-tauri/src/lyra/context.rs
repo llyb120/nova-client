@@ -63,7 +63,7 @@ Problems hit and how they were resolved (or not), so the same dead ends are not 
 ## Pending & next step
 What is still in progress or unstarted, and the single most concrete next action to take.
 
-Rules: be terse — bullet points and fragments, not prose. Preserve identifiers, paths, and numbers exactly. Do NOT invent anything not present in the messages; if something is unknown, leave it out rather than guessing."#;
+Rules: be terse — bullet points and fragments, not prose. Preserve identifiers, paths, and numbers exactly. Write the summary in the SAME language the user is using in the conversation (e.g. 中文 if the user writes in Chinese). Do NOT invent anything not present in the messages; if something is unknown, leave it out rather than guessing."#;
 
 /// 触发原因：Auto 仅在超过阈值时折叠；Overflow（provider 报超长）与 Manual 强制折叠。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
