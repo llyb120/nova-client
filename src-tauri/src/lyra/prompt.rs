@@ -484,8 +484,9 @@ pub fn ponytail_prompt(enabled: bool, level: &str) -> String {
     format!("{PONYTAIL_RULES}\n\n{PONYTAIL_LEVELS}\n\nActive level: {level}.")
 }
 
-pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str) -> std::borrow::Cow<'a, str> {
-    if model_id.to_ascii_lowercase().contains("deepseek") {
+pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_level: Option<&str>) -> std::borrow::Cow<'a, str> {
+    let model_id = model_id.to_ascii_lowercase();
+    if thinking_level == Some("max") && model_id.contains("deepseek") && model_id.contains("flash") {
         format!("{system_prompt}\n\n切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有").into()
     } else {
         system_prompt.into()
@@ -633,14 +634,17 @@ mod tests {
     }
 
     #[test]
-    fn model_system_prompt_only_enhances_deepseek_ids() {
+    fn model_system_prompt_only_enhances_deepseek_flash_at_max() {
         let base = "original system prompt";
         let enhanced = format!("{base}\n\n切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有");
-        for id in ["deepseek-chat", "deepseek-reasoner", "DeepSeek-V3.2", "deepseek-ai/DeepSeek-R1", "vendor/deepseek-v4-flash"] {
-            assert_eq!(model_system_prompt(base, id), enhanced, "{id}");
+        for id in ["deepseek-v4-flash", "DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4-Flash", "vendor/deepseek-v4-flash-fast"] {
+            assert_eq!(model_system_prompt(base, id, Some("max")), enhanced, "{id}");
+            for level in [None, Some(""), Some("off"), Some("none"), Some("minimal"), Some("low"), Some("medium"), Some("high"), Some("xhigh")] {
+                assert!(matches!(model_system_prompt(base, id, level), std::borrow::Cow::Borrowed(prompt) if prompt == base), "{id}: {level:?}");
+            }
         }
-        for id in ["", "gpt-4.1", "claude-sonnet-4", "glm-5", "kimi-k2.5"] {
-            assert!(matches!(model_system_prompt(base, id), std::borrow::Cow::Borrowed(prompt) if prompt == base), "{id}");
+        for id in ["", "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro", "gemini-2.5-flash", "gpt-4.1", "claude-sonnet-4", "glm-5", "kimi-k2.5"] {
+            assert!(matches!(model_system_prompt(base, id, Some("max")), std::borrow::Cow::Borrowed(prompt) if prompt == base), "{id}");
         }
     }
 

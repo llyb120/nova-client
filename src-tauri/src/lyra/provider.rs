@@ -1842,7 +1842,7 @@ async fn stream_chat_once(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
-    let system_prompt = model_system_prompt(system_prompt, &model.id);
+    let system_prompt = model_system_prompt(system_prompt, &model.id, thinking_level);
     let system_prompt = system_prompt.as_ref();
     if model.api != "openai-responses" { response_state::reset(session_id); }
     let (body, field) = match model.api.as_str() {
