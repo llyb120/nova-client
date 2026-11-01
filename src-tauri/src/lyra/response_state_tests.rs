@@ -49,6 +49,40 @@ async fn server(replies: Vec<(u16, String)>) -> (String, tokio::task::JoinHandle
     });
     (url, task)
 }
+#[tokio::test]
+async fn niubi_sends_max_with_boost_while_plain_max_stays_unchanged() {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    for api in ["openai-completions", "openai-responses", "anthropic-messages"] {
+        let (url, captured) = server(vec![(400, "{\"error\":\"fixture\"}".into()); 2]).await;
+        let config = json!({"provider":{"custom":{
+            "api":api,"options":{"baseURL":url,"thinkingFormat":if api == "anthropic-messages" { "anthropic" } else { "deepseek" }},
+            "models":{"vendor/DEEPSEEK-V4-FLASH":{"variants":{"max":{"reasoningEffort":"max"}}}}
+        }}});
+        for effort in ["max", "niubi"] {
+            let resolved = crate::lyra::config::resolve_model(&config,
+                Some(&format!("custom/vendor/DEEPSEEK-V4-FLASH/variant/{effort}")), &HashMap::new()).unwrap();
+            let result = stream_chat(&client, &resolved.model, "fixture-key", resolved.thinking_level.as_deref(),
+                "sys", &[user("hello")], &[], None, &cancel, &mut |_| {}).await;
+            assert!(result.unwrap_err().contains("400"));
+        }
+        let bodies = captured.await.unwrap();
+        let (prompt_path, effort_path) = match api {
+            "openai-completions" => ("/messages/0/content", "/reasoning_effort"),
+            "openai-responses" => ("/instructions", "/reasoning/effort"),
+            _ => ("/system/0/text", "/output_config/effort"),
+        };
+        assert_eq!(bodies[0].pointer(prompt_path).unwrap(), "sys");
+        assert_eq!(bodies[0].pointer(effort_path).unwrap(), "max");
+        assert_eq!(bodies[1].pointer(effort_path).unwrap(), "max");
+        assert_eq!(bodies[1].pointer(prompt_path).unwrap(),
+            "sys\n\n切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有");
+        let mut boosted = bodies[1].clone();
+        *boosted.pointer_mut(prompt_path).unwrap() = json!("sys");
+        assert_eq!(boosted, bodies[0], "{api}: only the prompt should differ from max");
+    }
+}
+
 fn configured(url: String) -> ResolvedModel {
     let mut model = test_model("openai-responses");
     model.base_url = url;

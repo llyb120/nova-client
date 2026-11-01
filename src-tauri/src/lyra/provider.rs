@@ -1844,6 +1844,8 @@ async fn stream_chat_once(
 ) -> Result<StreamResult, String> {
     let system_prompt = model_system_prompt(system_prompt, &model.id, thinking_level);
     let system_prompt = system_prompt.as_ref();
+    // niubi 是客户端档位，上游仍使用标准 max。
+    let thinking_level = if thinking_level == Some("niubi") { Some("max") } else { thinking_level };
     if model.api != "openai-responses" { response_state::reset(session_id); }
     let (body, field) = match model.api.as_str() {
         "codebuddy" | "devin" | "openai-completions" =>

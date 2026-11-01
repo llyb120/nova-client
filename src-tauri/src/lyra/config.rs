@@ -130,8 +130,14 @@ fn variant_label(variant: &str) -> String {
         "high" => "High".into(),
         "xhigh" => "XHigh".into(),
         "max" => "Max".into(),
+        "niubi" => "牛逼".into(),
         other => other.into(),
     }
+}
+
+pub(super) fn is_deepseek_flash(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.contains("deepseek") && id.contains("flash")
 }
 
 fn is_model_config(value: &Value) -> bool {
@@ -256,6 +262,13 @@ pub fn model_options(config: &Value) -> Vec<Value> {
                         "_meta": meta,
                     }));
                 }
+            }
+            if is_deepseek_flash(&model_id) && model.pointer("/variants/niubi").is_none() {
+                out.push(json!({
+                    "value": format!("{value}/variant/niubi"),
+                    "name": format!("{name} · 牛逼"),
+                    "_meta": meta,
+                }));
             }
         }
     }
@@ -417,7 +430,8 @@ pub fn resolve_model(
         .ok_or_else(|| format!("Lyra provider 不存在：{provider_id}"))?;
     let model = model_by_id(provider, model_id)
         .ok_or_else(|| format!("Lyra model 不存在：{base_selection}"))?;
-    if let Some(variant) = variant {
+    let boosted = variant == Some("niubi") && is_deepseek_flash(model_id);
+    if let Some(variant) = variant.filter(|_| !boosted) {
         if model
             .get("variants")
             .and_then(|variants| variants.get(variant))
@@ -463,7 +477,7 @@ pub fn resolve_model(
         .and_then(|name| {
             model
                 .get("variants")
-                .and_then(|variants| variants.get(name))
+                .and_then(|variants| variants.get(if boosted { "max" } else { name }))
         })
         .cloned()
         .unwrap_or(Value::Null);
@@ -502,16 +516,14 @@ pub fn resolve_model(
         "temperature",
     );
     let top_p = sampling_number(&variant_options, model, provider, "topP", "top_p");
-    let thinking_level = variant.and_then(|name| {
-        model
-            .get("variants")
-            .and_then(|variants| variants.get(name))
-            .and_then(|variant| variant.get("reasoningEffort"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    }).or_else(|| model.pointer("/options/reasoningEffort").or_else(|| provider.pointer("/options/reasoningEffort"))
-        .and_then(Value::as_str).map(str::to_string));
-    let reasoning = model
+    let thinking_level = if boosted {
+        Some("niubi".into())
+    } else {
+        variant_options.get("reasoningEffort").and_then(Value::as_str).map(str::to_string)
+            .or_else(|| model.pointer("/options/reasoningEffort").or_else(|| provider.pointer("/options/reasoningEffort"))
+                .and_then(Value::as_str).map(str::to_string))
+    };
+    let reasoning = boosted || model
         .get("reasoning")
         .and_then(Value::as_bool)
         .unwrap_or_else(|| {
@@ -689,6 +701,50 @@ mod tests {
             resolve_model(&config, Some("custom/gpt/variant/medium"), &HashMap::new()).unwrap();
         assert_eq!(variant.model.temperature, Some(0.2));
         assert_eq!(variant.model.top_p, Some(0.95));
+    }
+
+    #[test]
+    fn niubi_variant_is_only_added_for_deepseek_flash_and_preserves_max() {
+        for provider_id in ["custom", "deepseek"] {
+            for (id, eligible) in [
+                ("deepseek-v4-flash", true), ("vendor/DEEPSEEK-V4-FLASH-fast", true),
+                ("deepseek-v4-pro", false), ("deepseek-chat", false), ("gemini-flash", false), ("gpt-4.1", false),
+            ] {
+                let base = format!("{provider_id}/{id}");
+                let mut config = json!({"model":base,"provider":{}});
+                config["provider"][provider_id] = json!({
+                    "api":"openai-completions",
+                    "options":{"baseURL":"https://relay.example/v1","apiKey":"key"},
+                    "models":{(id):{"name":"Test Model","options":{"reasoningEffort":"max"},"variants":{
+                        "high":{"reasoningEffort":"high"}, "max":{"reasoningEffort":"max","temperature":0.4}
+                    }}}
+                });
+                let selection = format!("{base}/variant/niubi");
+                let options = model_options(&config);
+                let boosts: Vec<_> = options.iter().filter(|option| option["value"] == selection).collect();
+                assert_eq!(boosts.len(), usize::from(eligible), "{base}");
+                assert_eq!(default_model(&config).unwrap(), format!("{base}/variant/max"));
+                let max = resolve_model(&config, Some(&format!("{base}/variant/max")), &HashMap::new()).unwrap();
+                assert_eq!(max.thinking_level.as_deref(), Some("max"));
+                let boost = resolve_model(&config, Some(&selection), &HashMap::new());
+                if eligible {
+                    assert!(boosts[0]["name"].as_str().unwrap().ends_with(" · 牛逼"));
+                    let boost = boost.unwrap();
+                    assert_eq!(boost.thinking_level.as_deref(), Some("niubi"));
+                    assert_eq!(boost.model, max.model);
+                    assert_eq!(boost.model.temperature, Some(0.4));
+                } else {
+                    assert!(boost.unwrap_err().contains("不支持思考强度"));
+                }
+            }
+        }
+        let config = json!({"model":"p/deepseek-flash","provider":{"p":{
+            "api":"openai-completions","options":{"baseURL":"https://relay.example/v1"}, "models":{"deepseek-flash":{}}
+        }}});
+        assert_eq!(default_model(&config).unwrap(), "p/deepseek-flash");
+        let boost = resolve_model(&config, Some("p/deepseek-flash/variant/niubi"), &HashMap::new()).unwrap();
+        assert_eq!(boost.thinking_level.as_deref(), Some("niubi"));
+        assert!(boost.model.reasoning);
     }
 
     #[test]
