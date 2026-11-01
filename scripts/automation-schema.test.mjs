@@ -597,6 +597,21 @@ test('Chrome rolls DOM history and does not gate input on snapshot IDs or age', 
   assert.doesNotMatch(control,/snapshotIdNote|refs_in\(|captured\.elapsed\(\)|__delta|observations\.lock\(\)\.unwrap\(\)\.(remove|retain)/);
   assert.doesNotMatch(source,/snapshotId 不是该标签最新观察或观察已过期|截图已过期：/);
 });
+test('Chrome activates only once after a stability failure before any action completes or input is sent', async()=>{
+  const source = await readFile(new URL('../src-tauri/src/native_browser.rs',import.meta.url),'utf8');
+  const start = source.indexOf('async fn control_session(');
+  const end = source.indexOf('let mut result = tokio::select!',start);
+  assert.ok(start >= 0 && end > start);
+  const control = source.slice(start,end);
+  const guard = 'if !attempted_retry && throttled && !progress.attempted && progress.completed == 0 && !s.cancel.load(Ordering::SeqCst)';
+  assert.ok(control.includes(guard), 'never replay completed waits or possibly dispatched input');
+  const retry = control.slice(control.indexOf(guard),control.indexOf('let failure = failure;'));
+  assert.match(retry,/attempted_retry = true;[\s\S]*"select_tab"[\s\S]*continue;/);
+  assert.equal(control.match(/"select_tab"/g)?.length,1, 'no unconditional activation before actions');
+  assert.ok(control.indexOf('apply(app,') < control.indexOf(guard), 'try the bound tab before considering activation');
+  assert.match(control,/let mut attempted_retry = false;/);
+  assert.match(control,/let throttled = matches!\(&failure, Some\(e\) if background_throttled\(e\)\);/);
+});
 test('Chrome retains image coordinates, fast scope and bounded batch schemas',async()=>{
   const chrome=await tool('chrome');
   for(const name of ['action','imageId','scope','region','visual','maxEdge']) assert(chrome.inputSchema.properties[name]);

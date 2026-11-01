@@ -1394,7 +1394,7 @@ async fn control_session(
             }
             // Retry only a clean preflight failure on a background tab; any dispatched input is final.
             let throttled = matches!(&failure, Some(e) if background_throttled(e));
-            if !attempted_retry && throttled && !progress.attempted && !s.cancel.load(Ordering::SeqCst) {
+            if !attempted_retry && throttled && !progress.attempted && progress.completed == 0 && !s.cancel.load(Ordering::SeqCst) {
                 attempted_retry = true;
                 crate::chrome_browser::request(app,"select_tab",json!({"tabTag":s.active_tab.rsplit(':').next().ok_or("缺少 Chrome tabTag")?})).await?;
                 continue;
