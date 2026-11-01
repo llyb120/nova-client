@@ -220,7 +220,8 @@ fn catalog_models(catalog: &Catalog) -> Map<String, Value> {
                 "output": variant["max_output_tokens"].as_u64().unwrap_or(128000).min(128000) },
             // 目录不含模态信息；Devin 后端统一接收图片，缺省会被当成纯文本模型而丢掉截图。
             "modalities": { "input": ["text", "image"] },
-            "options": { "supportsReasoningEffort": false, "supportsThinkingToggle": false }
+            "options": { "supportsReasoningEffort": false, "supportsThinkingToggle": false,
+                "requiresReasoningContentOnAssistantMessages": true }
         }));
     }
     models
@@ -282,12 +283,15 @@ fn envelope(payload: &[u8], flags: u8) -> Vec<u8> {
     let mut out = vec![flags]; out.extend_from_slice(&(payload.len() as u32).to_be_bytes()); out.extend_from_slice(payload); out
 }
 
-fn encode_request(body: &Value, key: &str, version: &str) -> Result<Vec<u8>, String> {
+fn encode_request(body: &Value, key: &str, _version: &str) -> Result<Vec<u8>, String> {
+    let version = "3000.11.228"; // ponytail: match real devin-cli version so upstream treats us as that client class
     let mut out = Vec::new(); let mut metadata = Vec::new();
-    let platform = if cfg!(windows) { "win32" } else if cfg!(target_os = "macos") { "darwin" } else { "linux" };
-    for (field, value) in [(1,"nova-openai"), (2,version), (3,key), (4,"en"), (5,platform), (7,version), (12,"chisel"), (28,"chisel")] {
+    let platform = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "darwin" } else { "linux" };
+    for (field, value) in [(1,"devin-cli"), (2,version), (3,key), (4,"en"), (5,platform), (7,version), (12,"chisel"), (28,"chisel")] {
         bytes(&mut metadata, field, value);
     }
+    // ponytail: f30 observed as opaque 5-byte blob in real CLI metadata (hex 0304060708), unknown semantics; aligned for parity.
+    bytes(&mut metadata, 30, &[3,4,6,7,8]);
     bytes(&mut out, 1, metadata);
     let mut systems = Vec::new();
     for message in body["messages"].as_array().ok_or("Devin 请求缺少 messages")? {
@@ -315,6 +319,7 @@ fn encode_request(body: &Value, key: &str, version: &str) -> Result<Vec<u8>, Str
         } else if let Some(text) = message["content"].as_str() { texts.push(text.to_string()); }
         if matches!(role, "system" | "developer") { systems.push(texts.join("\n")); continue; }
         bytes(&mut msg, 3, texts.join("\n"));
+        if let Some(thinking) = message["reasoning_content"].as_str().filter(|s| !s.is_empty()) { bytes(&mut msg, 5, thinking); }
         if let Some(calls) = message["tool_calls"].as_array() {
             for call in calls {
                 let mut tool = Vec::new();

@@ -98,6 +98,7 @@ async function imageBytes(source, signal, redirects = 0) {
 }
 
 export async function encodeRequest(body, credentials, version, signal) {
+  version = "3000.11.228"; // ponytail: match real devin-cli version so upstream treats us as that client class
   const f = field, messages = [], systems = [];
   for (const message of body.messages) {
     const text = [], images = [];
@@ -110,6 +111,7 @@ export async function encodeRequest(body, credentials, version, signal) {
     }
     if (["system", "developer"].includes(message.role)) { systems.push(text.join("\n")); continue; }
     messages.push(f(3, proto(f(1, randomUUID()), f(2, { user: 1, assistant: 2, tool: 4 }[message.role]), f(3, text.join("\n")),
+      ...(message.reasoning_content ? [f(5, message.reasoning_content)] : []),
       ...(message.tool_calls || []).map(call => f(6, proto(f(1, call.id), f(2, call.function.name), f(3, call.function.arguments)))),
       ...(message.tool_call_id ? [f(7, message.tool_call_id)] : []), ...images)));
   }
@@ -120,7 +122,8 @@ export async function encodeRequest(body, credentials, version, signal) {
     systems.push("For this turn, you must invoke one of the provided functions. Do not answer without a function call.");
   }
   if (body.parallel_tool_calls === false) systems.push("Invoke at most one function in this turn.");
-  const metadata = proto(f(1, "nova-openai"), f(2, version), f(3, credentials.key), f(4, "en"), f(5, process.platform), f(7, version), f(12, "chisel"), f(28, "chisel"));
+    // ponytail: f30 observed as opaque 5-byte blob in real CLI metadata (hex 0304060708), unknown semantics; aligned for parity.
+  const metadata = proto(f(1, "devin-cli"), f(2, version), f(3, credentials.key), f(4, "en"), f(5, process.platform === "win32" ? "windows" : process.platform), f(7, version), f(12, "chisel"), f(28, "chisel"), f(30, Buffer.from([3,4,6,7,8])));
   return proto(f(1, metadata), f(2, systems.join("\n\n")), ...messages, f(7, 5),
     f(8, proto(f(1, 1), f(2, body.max_completion_tokens ?? body.max_tokens ?? 128000), f(3, 400), f(5, body.temperature ?? 1, 1), f(7, 40), f(8, body.top_p ?? 0.95, 1))),
     ...tools.map(({ function: tool }) => f(10, proto(f(1, tool.name), f(2, tool.description || ""), f(3, JSON.stringify(tool.parameters || { type: "object", properties: {} }))))),

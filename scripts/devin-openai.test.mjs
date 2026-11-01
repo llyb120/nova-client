@@ -42,7 +42,7 @@ if (process.argv.includes("--fake-cli")) {
         if (mode==="unknown-stop") send(f(5,99));
         if (mode==="inspect") {
           const options=decode(value(fields,8));
-          text(JSON.stringify({model,system:string(fields,2),roles:messages.map(m=>value(m,2)),toolId:string(messages.find(m=>value(m,2)===4)||[],7),
+          text(JSON.stringify({model,system:string(fields,2),roles:messages.map(m=>value(m,2)),toolId:string(messages.find(m=>value(m,2)===4)||[],7),thinking:messages.map(m=>string(m,5)),
             image:messages.some(m=>value(m,10)),temperature:value(options,5).readDoubleLE(),top_p:value(options,8).readDoubleLE(),max_tokens:value(options,2),tools:tools.map(tool=>string(tool,1))}));
         } else if (mode==="structured") { text("Do not leak this preamble");call("__nova_structured_response",'{"result":{"city":"上海"}}'); }
         else if (["tool","parallel","bad-args"].includes(mode)) {
@@ -87,10 +87,11 @@ if (process.argv.includes("--fake-cli")) {
       for (const extra of [{tools:{}},{reasoning:"high"},{store:1},{text:[]}]) assert.equal((await responses({input:"hello",...extra})).status,400);
     });
     await t.test("native roles, images, model/effort and generation parameters",async()=>{
-      const messages=[{role:"system",content:"SYSTEM"},{role:"user",content:"weather"},{role:"assistant",content:null,tool_calls:[{id:"old-call",type:"function",function:{name:"get_weather",arguments:'{"city":"上海"}'}}]},{role:"tool",tool_call_id:"old-call",content:"sunny"},{role:"user",content:[{type:"image_url",image_url:{url:"data:image/png;base64,YQ=="}},{type:"text",text:"inspect"}]}];
+      const messages=[{role:"system",content:"SYSTEM"},{role:"user",content:"weather"},{role:"assistant",content:null,reasoning_content:"thinking here",tool_calls:[{id:"old-call",type:"function",function:{name:"get_weather",arguments:'{"city":"上海"}'}}]},{role:"tool",tool_call_id:"old-call",content:"sunny"},{role:"user",content:[{type:"image_url",image_url:{url:"data:image/png;base64,YQ=="}},{type:"text",text:"inspect"}]}];
       const r=await post("inspect",{model:"devin",reasoning_effort:"high",messages,tools,temperature:0.3,top_p:0.8,max_tokens:96});assert.equal(r.status,200);
       const result=await r.json(),details=JSON.parse(result.choices[0].message.content);
       assert.deepEqual(details.roles,[1,2,4,1]);assert.equal(details.system,"SYSTEM");assert.equal(details.toolId,"old-call");assert.equal(details.model,"test-model-high");assert.equal(details.image,true);assert.equal(details.temperature,0.3);assert.equal(details.top_p,0.8);assert.equal(details.max_tokens,96);
+      assert.deepEqual(details.thinking,["","thinking here","",""]);
       assert.deepEqual(details.tools,["get_weather"]);assert.equal(result.usage.total_tokens,28);assert.equal(result.usage.prompt_tokens_details.cached_tokens,5);
       assert.equal(await readFile(join(config,"devin/credentials.toml"),"utf8"),credentialText);
       for(const image of ["file:///secret","https://127.0.0.1/image.png","https://[::1]/x","data:image/png;base64,!!"]){assert.equal((await post([{type:"image_url",image_url:{url:image}}])).status,400);}
