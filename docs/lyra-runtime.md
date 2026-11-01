@@ -4,6 +4,14 @@
 
 对齐 Codex 的普通请求路径：新用户轮次只追加历史，不主动剥离已完成轮次的 reasoning、推理签名或原生工具调用 ID，避免改写已发送前缀。缺失工具结果仍补中断占位，孤儿结果仍清理；ACP/legacy 显式折叠及旧浏览器观察裁剪规则不变。最终的协议序列化仍由 provider 负责（例如 `store:false` 不回传未存储的 item `id`，但保留加密 reasoning 状态和 `call_id`）。
 
+## ACP 决策保真
+
+只在模型主动 `compress` 或现有应急/legacy 摘要路径中提纯，不逐个 thinking 块追加改写调用，也不改变触发阈值。摘要及多层归并需保留有来源的决定与理由、否决方案及原因/重试条件、未决风险、验证范围和下一步定位；没有的类别不补写。计划、尝试和助手自述不能升级成工具已确认的完成结果。
+
+独立摘要请求现在也读取非 redacted 的可见 `thinking` 文本（含 provider 已提供的可见推理摘要），单列为推敲而非执行证据；同一转写也用于原文搜索和召回。它不解析或发送 `thinkingSignature`、加密载荷或 `reasoningDetails`，不重建不可见推理。可见推理会交给已配置的摘要模型，沿用已有输入预算、缩短和失败降级路径；未折叠区间、规范历史及原生签名保持不变。
+
+这些是输入补全和摘要指引，不是语义无损保证。超预算省略或摘要失败仍可能丢失细节，原文继续保留以便搜索/恢复；实际折叠仍可能改变缓存前缀。
+
 ## Token 预算
 
 `context_budget` 返回 JSON 分项：system、tools、messagesText、toolArguments、toolResults、reasoning、images、other、overhead，以及校准差额、输出预留、协议余量和上次服务端 usage。
