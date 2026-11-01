@@ -171,6 +171,5 @@ assert.deepEqual(partial.snapshot(), partialBefore);
 const entry = readFileSync(new URL('./index.tsx', import.meta.url), 'utf8');
 assert.ok(entry.indexOf('await migrateLocalModelSelections()') < entry.indexOf('render(() => <App />'));
 const store = readFileSync(new URL('./store.ts', import.meta.url), 'utf8');
-assert.match(store, /localModelMigration \?\?=/, 'initStore shares bootstrap batch');
-assert.match(store, /status\.migrationWarnings/);
-console.log('Local model selection migration: batching, exact provenance, effort, favorites, warnings, save failures and bootstrap ordering passed.');
+assert.match(store, /localModelMigration \?\?=/);
+console.log('Local model selection migration: batching, exact provenance, effort, favorites, save failures and bootstrap ordering passed.');

@@ -558,7 +558,6 @@ export interface RevertResult {
 export interface Status {
   connected: boolean;
   agent: { name?: string; title?: string; version?: string } | null;
-  migrationWarnings?: string[];
 }
 
 /** 更新检查结果 */

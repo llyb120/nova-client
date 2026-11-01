@@ -72,16 +72,12 @@ function readModelFavorites(): string[] {
 export const [modelFavoriteIds, setModelFavoriteIds] = createSignal(readModelFavorites());
 
 let localModelMigration: Promise<void> | undefined;
-let modelMigrationWarnings: string[] = [];
 let localModelMigrationFailed = false;
 /** Main-window bootstrap awaits this before HomeView reads lastUsed. */
 export function migrateLocalModelSelections(): Promise<void> {
+  // 迁移结果只用于落盘，不再弹提示：未迁移的选择留在原存储里，等用户自己重选。
   return localModelMigration ??= migrateStoredModelSelections(localStorage, api.migrateModelSelections)
-    .then(warnings => { modelMigrationWarnings = warnings; })
-    .catch(error => {
-      localModelMigrationFailed = true;
-      modelMigrationWarnings = [`本地模型选择迁移失败：${String(error)}`];
-    })
+    .catch(() => { localModelMigrationFailed = true; })
     .then(() => { setModelFavoriteIds(readModelFavorites()); });
 }
 
@@ -2511,7 +2507,6 @@ export async function initStore() {
   if (initialized) return;
   initialized = true;
   await migrateLocalModelSelections();
-  if (modelMigrationWarnings.length) showToast(modelMigrationWarnings.join("；"), 10_000);
   // 无新消息也结算采样窗口：首块及时显示，工具执行/等待期间归零。
   setInterval(() => {
     for (const threadId of rateWindows.keys()) {
@@ -2942,15 +2937,8 @@ export async function initStore() {
   // 的关键路径阻塞 settings/团队状态/会话列表。
   void api
     .getStatus()
-    .then((status) => {
-      setState(s => { s.connected = status.connected; s.agent = status.agent; });
-      const warnings = [...new Set([...modelMigrationWarnings, ...(status.migrationWarnings ?? [])])];
-      if (warnings.length) showToast(`模型迁移提示：${warnings.join("；")}`, 10_000);
-    })
-    .catch(() => {
-      // Status failure must not hide local migration errors.
-      if (modelMigrationWarnings.length) showToast(modelMigrationWarnings.join("；"), 10_000);
-    });
+    .then((status) => setState(s => { s.connected = status.connected; s.agent = status.agent; }))
+    .catch(() => {});
   void api.getLogs().then((logs) => setState(s => { s.logs = logs; })).catch(() => {});
   // 其他后端在用户切换或打开模型选择器时按需加载。
   void refreshSlashCommands(initialAgent);
