@@ -2567,6 +2567,7 @@ export async function initStore() {
       for (const op of ops) {
         if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
         else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text.length);
+        else if (op.t === "upsert" && op.item.type === "user") setUnreadTurns(e.payload.threadId, 0);
       }
       if (e.payload.threadId !== state.currentId) {
         if (threadSnapshots.has(e.payload.threadId)) staleThreadSnapshots.add(e.payload.threadId);

@@ -726,6 +726,7 @@ impl Thread {
             images,
         };
         self.items.push(item.clone());
+        self.unread_turns = 0;
         self.updated_at = now_ms();
         item
     }
@@ -739,6 +740,7 @@ impl Thread {
             images,
         };
         self.items.push(item.clone());
+        self.unread_turns = 0;
         self.updated_at = now_ms();
         item
     }
@@ -1966,6 +1968,30 @@ mod tests {
     }
 
     #[test]
+    fn sending_prompts_clears_and_persists_unread_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ThreadStore::load(dir.path().to_path_buf());
+        for local in [false, true] {
+            let mut thread = Thread::new("project".into(), AgentKind::Lyra, None, None, None, false);
+            thread.unread_turns = 3;
+            if local {
+                thread.push_user_local(String::new(), vec![PromptImage {
+                    name: "image.png".into(), mime_type: "image/png".into(),
+                    data: Some("YWJj".into()), uri: None, size: Some(3),
+                }]);
+            } else {
+                thread.push_user("follow-up".into(), Vec::new());
+            }
+            assert_eq!(thread.unread_turns, 0);
+            store.threads.push(thread);
+        }
+        store.save_now();
+        let reloaded = ThreadStore::load(dir.path().to_path_buf());
+        assert_eq!(reloaded.threads.len(), 2);
+        assert!(reloaded.threads.iter().all(|thread| thread.unread_turns == 0));
+    }
+
+    #[test]
     fn fork_thread_copies_entire_stage_tree_without_changing_source() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = ThreadStore::load(dir.path().to_path_buf());
@@ -1973,13 +1999,13 @@ mod tests {
         root.title = "original".into();
         root.acp_session_id = Some("original-provider".into());
         root.pending_stage_context = Some("stale context".into());
-        root.unread_turns = 3;
         root.plan = Some(serde_json::json!([{ "step": "test", "status": "pending" }]));
         for i in 0..140 {
             root.push_user(format!("history {i}"), vec![PromptImage {
                 name: "attachment".into(), mime_type: "image/png".into(), data: Some("YWJj".into()), uri: None, size: Some(3),
             }]);
         }
+        root.unread_turns = 3;
         let mut stage = root.clone();
         stage.id = "stage".into();
         stage.title = "stage title".into();
