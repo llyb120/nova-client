@@ -122,25 +122,34 @@ test('employee tasks reuse two isolated sessions, mark progress and share one de
   assert.doesNotMatch(launch,/stage_source_thread_id|fork_thread/);
   assert.doesNotMatch(employee,/只做下面这一件事，最后用一句话总结结果/);
 });
+test('employee tool keeps task-only development policy out of ordinary sessions', async()=>{
+  const { description } = await tool('employee');
+  assert.match(description,/员工执行流程仅适用于调度器启动的数字员工任务/);
+  assert.match(description,/不改变普通会话的开发流程、分支选择或提交推送授权/);
+  assert.match(description,/员工自主执行策略由任务启动时单独注入/);
+  assert.doesNotMatch(description,/开发任务默认|常规开发分支操作|默认自主规则|无需逐项授权|开发目录与 Git 操作/);
+});
 test('employee development runs ordinary branch operations unless the user requires review', async()=>{
   const schema = await tool('employee');
   const employee = await readFile(new URL('../src-tauri/src/employee.rs',import.meta.url),'utf8');
   const runtime = employee.split('#[cfg(test)]')[0];
+  const rules = runtime.match(/const RULES: &str = "[\s\S]*?";/)?.[0];
+  assert.ok(rules);
   assert.ok(!schema.inputSchema.properties.action.enum.includes('worktree'));
-  assert.match(schema.description,/只有用户明确要求时才用常规 Git 工具创建或复用 worktree/);
   assert.doesNotMatch(runtime,/crate::gitwt::|fn (?:ensure_worktree|sync_worktree|commit_worktree|remove_worktrees|git_ident)\(/);
   assert.doesNotMatch(runtime,/employee action=worktree|本轮结束时系统自动提交/);
-  assert.match(runtime,/未要求 worktree 就在用户指定的项目目录工作/);
-  assert.match(runtime,/记忆中的.*不是用户授权/);
-  for (const prompt of [runtime,schema.description]) {
-    assert.match(prompt,/开发任务默认自行创建或复用开发分支、提交本需求改动并向对应远程普通推送，无需逐项授权/);
-    assert.match(prompt,/只有用户明确要求先审核或确认时，才暂停等待审批/);
-    assert.match(prompt,/不能仅因用户没有逐项授权就 ask/);
-    assert.match(prompt,/用户明确禁止或限制的操作必须遵守/);
-    assert.doesNotMatch(prompt,/用户已要求完成开发并将开发分支构建到测试环境时|普通推送属于流程内授权/);
-    assert.match(prompt,/只提交本需求改动，不混入用户或其它任务的修改/);
-    assert.match(prompt,/强推、合并或改写 release\/test 等共享分支、删除分支、发布生产不属于常规开发分支操作，仍须单独授权/);
-  }
+  assert.match(rules,/未要求 worktree 就在用户指定的项目目录工作/);
+  assert.match(rules,/用户明确要求 worktree 时才用常规 Git 工具/);
+  assert.match(rules,/记忆中的.*不是用户授权/);
+  assert.match(rules,/开发任务默认自行创建或复用开发分支、提交本需求改动并向对应远程普通推送，无需逐项授权/);
+  assert.match(rules,/只有用户明确要求先审核或确认时，才暂停等待审批/);
+  assert.match(rules,/不能仅因用户没有逐项授权就 ask/);
+  assert.match(rules,/常规开发分支操作按下方默认自主规则执行/);
+  assert.match(rules,/用户明确禁止或限制的操作必须遵守/);
+  assert.doesNotMatch(rules,/用户已要求完成开发并将开发分支构建到测试环境时|普通推送属于流程内授权/);
+  assert.match(rules,/只提交本需求改动，不混入用户或其它任务的修改/);
+  assert.match(rules,/强推、合并或改写 release\/test 等共享分支、删除分支、发布生产不属于常规开发分支操作，仍须单独授权/);
+  assert.match(runtime,/format!\("\{RULES\}\{memory\}\{head\}\{prompt\}"\)/);
 });
 test('employee external waits remain visible without looking completed', async()=>{
   const ts = (await import('typescript')).default;
