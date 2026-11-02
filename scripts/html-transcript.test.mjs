@@ -307,6 +307,13 @@ window.test={
   jump(index){cancelBottomFollow();handle.scrollToGroup(index);}, bottom(){enableBottomFollow();pinBottom();},
   scroll(delta){handle.scrollBy(delta);}, search(id,query){cancelBottomFollow();handle.revealMatch(id,query);},
   expanded(id){return !!state.expanded['user-text-'+id];},
+  loadThought(text){
+    replace([{body:[{type:'thought',id:2,ts:0,text}]}],'thought-preview');
+    setSession(s=>({...s,running:true}));
+  },
+  appendThought(delta){
+    setSession(s=>({...s,groups:s.groups.map(g=>({...g,body:g.body.map(item=>({...item,text:item.text+delta}))}))}));
+  },
   startStream(){
     stop();streamTicks=0;
     setSession(s=>({...s,running:true,groups:s.groups.map((g,i)=>i===s.groups.length-1?{...g,turn:undefined}:g)}));
@@ -436,6 +443,39 @@ async function run(browser, port, report) {
     if (selectedChecks.some(prefix => prefix.startsWith('scroll-hotpath'))) {
       await check('scroll-hotpath', () => scrollHotpath({ page, context, output, report, check, settle }));
     }
+    await check('streaming-thought-fold', async () => {
+      for (const text of ['thinking preview', 'first line\nthinking preview']) {
+        await page.evaluate(text => window.test.loadThought(text), text);
+        await waitText('thinking preview');
+        await settle();
+        const fold = page.locator('.ht-process-fold');
+        for (const [selector, delta, expanded] of [
+          ['.ht-live-line', ' delta', true],
+          ['.ht-live-chevron svg', ' delta', false],
+          ['.ht-live-chevron svg', '\nnew thinking line', true],
+          ['.ht-live-line', '\nnext thinking line', false],
+        ]) {
+          const box = await fold.locator(selector).last().boundingBox();
+          assert.ok(box, `${selector} must be visible`);
+          await page.mouse.move(box.x + Math.min(10, box.width / 2), box.y + box.height / 2);
+          await page.mouse.down();
+          // Deliver a stream delta between the native press and release, not a synthetic click.
+          await page.evaluate(delta => window.test.appendThought(delta), delta);
+          await settle();
+          await page.mouse.up();
+          await settle();
+          assert.equal(await fold.getAttribute('aria-expanded'), String(expanded),
+            `one click on ${selector} must toggle despite a stream delta (${JSON.stringify(delta)})`);
+        }
+        await fold.focus();
+        await page.keyboard.press('Enter');
+        await settle();
+        assert.equal(await fold.getAttribute('aria-expanded'), 'true', 'keyboard expansion still works');
+        await page.keyboard.press('Space');
+        await settle();
+        assert.equal(await fold.getAttribute('aria-expanded'), 'false', 'keyboard collapse still works');
+      }
+    });
     for (const theme of ['ink-dark', 'ink-light']) for (const width of [1280, 980]) {
       await check(`visual-${theme}-${width}`, async () => {
         await page.setViewportSize({ width, height: 800 });

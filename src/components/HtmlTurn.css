@@ -80,7 +80,8 @@
 .ht-process-line > svg { flex: none; color: var(--canvas-text-faint, var(--text-faint)); }
 .ht-live-preview { display: flex; flex-direction: column; justify-content: flex-end; max-height: 48px; overflow: hidden; text-align: left; }
 /* The fold is W+8 with 16px padding, so subtract 32 here to obtain Canvas's W-40. */
-.ht-live-lines { display: block; flex: none; width: calc(100% - 32px); min-width: 1px; }
+/* Stream deltas replace line/chevron nodes; hit the stable preview parent so clicks survive. */
+.ht-live-lines { display: block; flex: none; width: calc(100% - 32px); min-width: 1px; pointer-events: none; }
 .ht-live-line { display: block; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/24px var(--sans); }
 .ht-live-chevron { display: inline-block; position: relative; width: 0; height: 0; vertical-align: baseline; }
 .ht-live-chevron svg { position: absolute; left: 6px; bottom: -1px; color: var(--canvas-text-faint, var(--text-faint)); }
