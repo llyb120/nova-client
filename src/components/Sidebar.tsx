@@ -1,6 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
-import { createMemo, createSignal, For, onCleanup, onSettled, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onSettled, Show } from "solid-js";
 import { Portal } from "@solidjs/web";
 import { titlebarSide, titlebarTabs } from "./TitleBar";
 import { api } from "../ipc";
@@ -94,6 +94,19 @@ export function Sidebar(props: {
   const [keyboardFocus, setKeyboardFocus] = createSignal(false);
   const sidebarOpen = () => !collapsed() || hovered() || keyboardFocus() || !!menu() || !!tmenu() || !!mergeFor();
   const [version, setVersion] = createSignal("");
+  const [versionButton, setVersionButton] = createSignal<HTMLButtonElement>();
+  createEffect(versionButton, button => {
+    const spacer = button?.closest(".brand")?.querySelector(".brand-spacer");
+    if (!button || !spacer) return;
+    // 只使用 spacer 的空白，显隐不参与布局，避免临界宽度反复切换。
+    const sync = () => button.classList.toggle("is-inline",
+      button.getBoundingClientRect().right <= spacer.getBoundingClientRect().right);
+    const observer = new ResizeObserver(sync);
+    observer.observe(spacer);
+    observer.observe(button);
+    sync();
+    return () => observer.disconnect();
+  });
   let updateCheckTimer: number | undefined;
   let updateCheckClick = 0;
 
@@ -648,6 +661,7 @@ export function Sidebar(props: {
               <button
                 type="button"
                 class="brand-version"
+                ref={setVersionButton}
                 title="点击静默检查更新"
                 onClick={checkUpdateSilently}
               >

@@ -222,14 +222,13 @@ button {
   padding: 0;
   font-size: 9px;
   opacity: 0;
-  visibility: hidden;
   pointer-events: none;
   transition: opacity 0.15s;
 }
+.titlebar-side .brand-version.is-inline,
 .titlebar-side .brand-text:hover .brand-version,
 .titlebar-side .brand-version:focus-visible {
   opacity: .72;
-  visibility: visible;
   pointer-events: auto;
 }
 .titlebar-side .sidebar-head-toggle { width: 24px; height: 24px; }
