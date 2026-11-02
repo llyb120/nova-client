@@ -244,8 +244,9 @@ pub(super) fn turn_event_sink<'a>(
             emit(&json!({ "type": "timing", "phase": "provider_turn", "elapsedMs": 0 }));
             current_text.clear();
             current_thinking.clear();
-            // 快照刷新可能清掉 liveUsage；只重发真实累计用量，不估算 token。
+            // 新请求尚未有真实速率；0 让前端回到流式估算，后续真实 usage 再校准。
             if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
+                total_usage["outputTokensPerSec"] = json!(0);
                 emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
             }
         }
@@ -295,6 +296,11 @@ pub(super) fn turn_event_sink<'a>(
                 .iter()
                 .map(|key| usage.get(key).and_then(Value::as_u64).unwrap_or(0))
                 .sum();
+            let output = usage.get("output").and_then(Value::as_u64).unwrap_or(0);
+            let generation_ms = usage.get("generationMs").and_then(Value::as_u64).unwrap_or(0);
+            if output > 0 && generation_ms > 0 {
+                total_usage["outputTokensPerSec"] = json!(output as f64 * 1000.0 / generation_ms as f64);
+            }
             merge_usage(total_usage, &usage);
             total_usage["contextTokens"] = json!(context_tokens);
             emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
@@ -936,7 +942,7 @@ mod tests {
         sink(TurnEvent::MessageEnd { usage: json!({"input":10,"output":2}) });
         sink(TurnEvent::MessageStart { model: "provider/light".into() });
         sink(TurnEvent::TextDelta("next".into()));
-        sink(TurnEvent::MessageEnd { usage: json!({"input":20,"output":3}) });
+        sink(TurnEvent::MessageEnd { usage: json!({"input":20,"output":3,"generationMs":1000}) });
         drop(sink);
         let events = events.lock().unwrap();
         let model_items: Vec<_> = events.iter().filter(|e| e["type"] == "item" && e["item"]["type"] == "system").collect();
@@ -955,6 +961,7 @@ mod tests {
         assert_eq!(usage["input"], 30);
         assert_eq!(usage["output"], 5);
         assert_eq!(usage["contextTokens"], 20);
+        assert_eq!(usage["outputTokensPerSec"], 3.0);
     }
 
     #[test]

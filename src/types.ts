@@ -586,6 +586,8 @@ export interface LiveUsage {
   /** 最后一次模型请求实际携带的上下文；不同于当前轮次累计输入。 */
   contextTokens?: number | null;
   outputTokens?: number | null;
+  /** 当前模型请求的服务端真实输出速率；仅在 usage 上报时更新。 */
+  outputTokensPerSec?: number | null;
   cacheReadTokens?: number | null;
   cacheWriteTokens?: number | null;
 }

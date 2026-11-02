@@ -2212,42 +2212,59 @@ export async function respondPermission(requestKey: string, optionId: string) {
 
 const pendingDeltas = new Map<number, string>();
 
-/* ponytail: 参照 Claude Code 2.0.76 spinner，以输出字符数 / 4 估算；
-   包含回答、思考和工具参数。中文/tokenizer 及未推送的参数流会有偏差，
-   精确速率需要 provider 提供逐块 token 计数。 */
+/* ponytail: 流式接口不提供逐块 token 数，只能按文本估算；CJK 通常每字约 1 token，
+   英文等仍按 4 字符约 1 token。真实总量以最终 usage 为准。 */
 const RATE_WINDOW_MS = 500;
-const rateWindows = new Map<string, { chars: number; since: number; tokensPerSec: number }>();
+function estimateOutputTokens(text: string): number {
+  const cjk = text.match(/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]/g)?.length ?? 0;
+  return cjk + (text.length - cjk) / 4;
+}
+const rateWindows = new Map<string, { tokens: number; since: number; tokensPerSec: number }>();
 const rateUpdatedAt = new Map<string, number>();
+const reportedOutputRates = new Map<string, number>();
 export const [outputRates, setOutputRates] = createSignal<Record<string, number>>({});
 
-function trackDeltaRate(threadId: string, chars: number) {
+function trackDeltaRate(threadId: string, text: string) {
+  const reported = reportedOutputRates.get(threadId);
+  if (reported !== undefined) return;
   const now = performance.now();
-  if (chars > 0) rateUpdatedAt.set(threadId, now);
+  if (text) rateUpdatedAt.set(threadId, now);
   let w = rateWindows.get(threadId);
   if (!w) {
-    w = { chars: 0, since: now, tokensPerSec: 0 };
+    w = { tokens: 0, since: now, tokensPerSec: 0 };
     rateWindows.set(threadId, w);
   }
   if (now - w.since >= RATE_WINDOW_MS) {
-    const inst = w.chars / 4 / ((now - w.since) / 1000);
+    const inst = w.tokens / ((now - w.since) / 1000);
     // 短段输出之间的空窗口保留上次采样，真正停顿才归零。
     // 归零也必须写 signal，不能在 getter 中用非响应式时钟临时返回 0。
-    if (w.chars > 0) {
+    if (w.tokens > 0) {
       w.tokensPerSec = w.tokensPerSec ? w.tokensPerSec * 0.4 + inst * 0.6 : inst;
     } else if (now - (rateUpdatedAt.get(threadId) ?? now) >= 1_500) {
       w.tokensPerSec = 0;
     }
-    w.chars = 0;
+    w.tokens = 0;
     w.since = now;
     const rounded = Math.round(w.tokensPerSec);
     setOutputRates((rates) =>
       rates[threadId] === rounded ? rates : { ...rates, [threadId]: rounded },
     );
   }
-  w.chars += chars;
+  w.tokens += estimateOutputTokens(text);
 }
 
-/* 实时输出速度（tok/s）：共享采样器负责发布速度及停顿归零。 */
+function publishReportedOutputRate(threadId: string, usage: LiveUsage) {
+  const rate = usage.outputTokensPerSec;
+  if (rate == null || !Number.isFinite(rate) || rate < 0) return;
+  reportedOutputRates.delete(threadId);
+  rateWindows.delete(threadId);
+  rateUpdatedAt.delete(threadId);
+  if (rate > 0) reportedOutputRates.set(threadId, rate);
+  const rounded = Math.round(rate);
+  setOutputRates(rates => rates[threadId] === rounded ? rates : { ...rates, [threadId]: rounded });
+}
+
+/* 实时输出速度（tok/s）：usage 到达前估算，之后采用服务端 token / 模型请求耗时。 */
 export function getOutputRate(threadId: string | null | undefined): number {
   const rates = outputRates();
   if (!threadId) return 0;
@@ -2255,8 +2272,9 @@ export function getOutputRate(threadId: string | null | undefined): number {
 }
 
 function clearDeltaRate(threadId: string) {
+  reportedOutputRates.delete(threadId);
   rateUpdatedAt.delete(threadId);
-  if (!rateWindows.delete(threadId)) return;
+  rateWindows.delete(threadId);
   setOutputRates((rates) => {
     if (!(threadId in rates)) return rates;
     const { [threadId]: _dropped, ...rest } = rates;
@@ -2359,15 +2377,16 @@ function applyUpsert(item: Item) {
     const idx = s.items.findIndex(current => current.id === item.id);
     // 完整快照只统计新增输出；工具参数属于模型输出，工具结果/日志不属于。
     if (s.currentId && s.running[s.currentId]) {
-      const outputLength = (value: Item | undefined): number => {
+      const outputText = (value: Item | undefined): string => {
         if (value?.type === "assistant" || value?.type === "thought") {
-          return value.text === "思考中…" ? 0 : value.text.length;
+          return value.text === "思考中…" ? "" : value.text;
         }
-        if (value?.type !== "tool" || value.rawInput == null) return 0;
-        return (typeof value.rawInput === "string" ? value.rawInput : JSON.stringify(value.rawInput))?.length ?? 0;
+        if (value?.type !== "tool" || value.rawInput == null) return "";
+        return typeof value.rawInput === "string" ? value.rawInput : JSON.stringify(value.rawInput) ?? "";
       };
-      const previous = idx >= 0 ? s.items[idx] : undefined;
-      const added = Math.max(0, outputLength(item) - outputLength(previous));
+      const previousText = outputText(idx >= 0 ? s.items[idx] : undefined);
+      const text = outputText(item);
+      const added = text.startsWith(previousText) ? text.slice(previousText.length) : "";
       if (added) trackDeltaRate(s.currentId, added);
     }
     if (idx >= 0) reconcile(item)(s.items[idx]);
@@ -2510,7 +2529,7 @@ export async function initStore() {
   // 无新消息也结算采样窗口：首块及时显示，工具执行/等待期间归零。
   setInterval(() => {
     for (const threadId of rateWindows.keys()) {
-      if (state.running[threadId]) trackDeltaRate(threadId, 0);
+      if (state.running[threadId]) trackDeltaRate(threadId, "");
       else clearDeltaRate(threadId);
     }
   }, RATE_WINDOW_MS);
@@ -2565,8 +2584,11 @@ export async function initStore() {
       const ops = e.payload.ops ?? (e.payload.op ? [e.payload.op] : []);
       // 后台会话的 usage 也要保留；否则切回运行中的会话会先显示 0，直到下一次上报。
       for (const op of ops) {
-        if (op.t === "usage") liveUsageByThread.set(e.payload.threadId, op.usage);
-        else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text.length);
+        if (op.t === "usage") {
+          liveUsageByThread.set(e.payload.threadId, op.usage);
+          publishReportedOutputRate(e.payload.threadId, op.usage);
+        }
+        else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text);
         else if (op.t === "upsert" && op.item.type === "user") setUnreadTurns(e.payload.threadId, 0);
       }
       if (e.payload.threadId !== state.currentId) {

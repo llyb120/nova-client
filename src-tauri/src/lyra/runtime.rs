@@ -1020,6 +1020,9 @@ fn normalize_usage(usage: Option<&Value>) -> Option<Value> {
     if let Some(value) = usage.get("contextTokens").and_then(Value::as_u64) {
         normalized["contextTokens"] = value.into();
     }
+    if let Some(value) = usage.get("outputTokensPerSec").and_then(Value::as_f64).filter(|value| value.is_finite() && *value >= 0.0) {
+        normalized["outputTokensPerSec"] = value.into();
+    }
     Some(normalized)
 }
 

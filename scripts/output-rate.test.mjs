@@ -16,7 +16,7 @@ const context = vm.createContext({
   createSignal, reconcile, setState, onFlush,
 });
 vm.runInContext(ts.transpile(`${rates}\n${clear}\n${upsert}`.replace(/export /g, ""), { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), context);
-const run = (code) => flush(() => vm.runInContext(code, context));
+const run = (code) => flush(() => vm.runInContext(code.replace(/trackDeltaRate\("([^"]+)", (\d+)\)/g, 'trackDeltaRate("$1", "a".repeat($2))'), context));
 const item = (text) => run(`applyUpsert({ type: "assistant", id: 1, text: ${JSON.stringify(text)} })`);
 let displayed = -1;
 const dispose = createRoot((dispose) => {
@@ -34,7 +34,7 @@ item("a".repeat(200));
 now = 1000;
 run('trackDeltaRate("a", 0)');
 assert.equal(displayed, 100, "brief empty window does not erase a burst");
-assert.equal(run('rateWindows.get("a").chars'), 0, "duplicate snapshot adds no output");
+assert.equal(run('rateWindows.get("a").tokens'), 0, "duplicate snapshot adds no output");
 run('trackDeltaRate("a", 200)');
 flush(() => setState(s => { s.items[0].text += "b".repeat(200); })); // flushed delta
 item(state.items[0].text);
@@ -63,6 +63,10 @@ assert.equal(displayed, 100, "delayed first sample is not hidden by a getter tim
 now = 6500;
 run('trackDeltaRate("a", 0)');
 assert.equal(displayed, 0);
+run('trackDeltaRate("a", "中".repeat(100))');
+now = 7000;
+run('trackDeltaRate("a", 0)');
+assert.equal(displayed, 200, "CJK estimates one token per character, not one per four");
 dispose();
 
 // Replay the actual acp:update listener and stream batching, not just the sampler.
@@ -113,21 +117,53 @@ for (const backend of ["lyra", "snapshot"]) {
   tick();
   assert.equal(visibleRate, 0, `${backend}: final snapshot is not counted twice`);
   assert.equal(view.items[0].text.length, 200);
-  // Tool arguments are generated output (Claude Code's input_json_delta);
-  // tool results and repeated completion snapshots must not become token speed.
+  // Thinking uses the same delta path. Once provider usage arrives, its exact
+  // output tokens / request duration replace (not average with) text estimates.
+  now += 500;
+  receive({ payload: { threadId: backend, op: { t: "delta", itemId: 4, text: "思考".repeat(50) } } });
+  now += 500;
+  tick();
+  assert.equal(visibleRate, 200, `${backend}: pure Thinking delta contributes output speed`);
+  receive({ payload: { threadId: backend, op: { t: "usage", usage: { outputTokensPerSec: 72.6 } } } });
+  assert.equal(visibleRate, 73, `${backend}: provider token rate replaces the estimate`);
+  now += 500;
+  receive({ payload: { threadId: backend, op: { t: "delta", itemId: 4, text: "不能覆盖真实速率" } } });
+  tick();
+  assert.equal(visibleRate, 73, `${backend}: estimates do not overwrite a reported rate`);
+  receive({ payload: { threadId: backend, op: { t: "usage", usage: { outputTokensPerSec: 0 } } } });
+  assert.equal(visibleRate, 0, `${backend}: next model request resets the previous rate`);
+  now += 500;
+  receive({ payload: { threadId: backend, op: { t: "delta", itemId: 5, text: "下一段思考".repeat(20) } } });
+  now += 500;
+  tick();
+  assert.equal(visibleRate, 200, `${backend}: Thinking estimation resumes until the next real usage`);
+  receive({ payload: { threadId: backend, op: { t: "usage", usage: { outputTokensPerSec: 48 } } } });
+  // A real rate belongs to its completed request; late tool snapshots must not
+  // replace it with character estimates or be counted a second time.
   now = 20_000;
   const tool = { type: "tool", id: 2, status: "in_progress", rawInput: "x".repeat(200), content: [] };
   receive({ payload: { threadId: backend, op: { t: "upsert", item: tool } } });
   vm.runInContext("flushPendingStreamUpdates()", runtime);
   now += 500;
   tick();
-  assert.equal(visibleRate, 100, `${backend}: 200 new argument chars / 4 / 0.5s = 100 tok/s`);
+  assert.equal(visibleRate, 48, `${backend}: tool snapshots do not overwrite the provider rate`);
   receive({ payload: { threadId: backend, op: { t: "upsert", item: {
     ...tool, status: "completed", rawOutput: "log".repeat(100_000),
   } } } });
   now += 2000;
   tick();
-  assert.equal(visibleRate, 0, `${backend}: tool results add no generated tokens`);
+  assert.equal(visibleRate, 48, `${backend}: tool results add no generated tokens`);
+  receive({ payload: { threadId: backend, op: { t: "usage", usage: { outputTokensPerSec: 0 } } } });
+  now += 250;
+  receive({ payload: { threadId: backend, op: { t: "upsert", item: { ...tool, id: 6, status: "in_progress" } } } });
+  vm.runInContext("flushPendingStreamUpdates()", runtime);
+  now += 500;
+  tick();
+  assert.equal(visibleRate, 100, `${backend}: without a reported rate, 200 argument chars / 4 / 0.5s = 100 tok/s`);
+  receive({ payload: { threadId: backend, op: { t: "usage", usage: { outputTokensPerSec: 48 } } } });
+  now += 2000;
+  tick();
+  assert.equal(visibleRate, 48, `${backend}: tool waiting does not dilute the reported request rate`);
   receive({ payload: { threadId: backend, ops: [
     { t: "upsert", item: { type: "assistant", id: 3, text: "first" } },
     { t: "upsert", item: { type: "assistant", id: 3, text: "first and second" } },

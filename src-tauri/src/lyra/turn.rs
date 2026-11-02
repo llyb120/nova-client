@@ -305,6 +305,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 .filter(|model| !model.is_empty()).map(str::to_owned)
                 .unwrap_or_else(|| format!("{}/{}", s.model.model.provider, s.model.model.id));
             on_event(TurnEvent::MessageStart { model });
+            let request_started = std::time::Instant::now();
             let mut early: Vec<(String, String, Value, tokio::task::JoinHandle<ToolOutcome>)> = Vec::new();
             let result = {
                 let http = s.http();
@@ -354,7 +355,9 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
             };
             if let Ok(result) = &result {
                 if !result.usage.is_null() {
-                    on_event(TurnEvent::MessageEnd { usage: result.usage.clone() });
+                    let mut usage = result.usage.clone();
+                    usage["generationMs"] = json!(request_started.elapsed().as_millis() as u64);
+                    on_event(TurnEvent::MessageEnd { usage });
                 }
             }
             let result = match result {
