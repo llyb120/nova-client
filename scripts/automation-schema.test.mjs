@@ -629,6 +629,36 @@ test('Chrome retains image coordinates, fast scope and bounded batch schemas',as
   assert.match(chrome.inputSchema.properties.fullPage.description,/images\[\]\.unchanged=true.*复用已交付的同一文件.*本次snapshotId\/imageId.*不代表动作失败.*不重放输入或循环截图/);
   assert.doesNotMatch(await readFile(new URL('../src-tauri/src/native_browser.rs',import.meta.url),'utf8'),/"(?:deltaNotice|unchangedNotice)"/);
 });
+test('Chrome schemas stay Gemini-compatible without changing nullable refs or image limits', async()=>{
+  const chrome = await tool('chrome');
+  const { AjvJsonSchemaValidator } = await import('@modelcontextprotocol/sdk/validation/ajv');
+  const validate = new AjvJsonSchemaValidator().getValidator(chrome.inputSchema);
+  // Devin/Gemini needs scalar nullable refs and self-contained numeric alternatives.
+  for (const action of [chrome.inputSchema.properties.action, chrome.inputSchema.properties.actions.items]) {
+    assert.deepEqual(action.properties.ref, { type: 'string', nullable: true });
+  }
+  for (const ref of [undefined, null, 'target']) {
+    const action = { action: 'wait', ms: 0, ...(ref === undefined ? {} : { ref }) };
+    for (const fields of [{ action }, { actions: [action] }]) {
+      assert.equal(validate({ operation: 'act', ...fields }).valid, true, JSON.stringify(fields));
+    }
+  }
+  for (const ref of [42, true, {}]) {
+    for (const fields of [{ action: { action: 'wait', ref } }, { actions: [{ action: 'wait', ref }] }]) {
+      assert.equal(validate({ operation: 'act', ...fields }).valid, false, JSON.stringify(fields));
+    }
+  }
+  assert.equal(chrome.inputSchema.properties.maxEdge.type, undefined, 'keep the integer types inside the alternatives');
+  const alternatives = chrome.inputSchema.properties.maxEdge.anyOf;
+  assert.deepEqual(alternatives, [{ type: 'integer', enum: [0] }, { type: 'integer', minimum: 320, maximum: 3840 }]);
+  for (const maxEdge of [0, 320, 3840]) {
+    assert.equal(validate({ operation: 'screenshot', maxEdge }).valid, true, String(maxEdge));
+  }
+  for (const maxEdge of [-1, 1, 319, 3841, 320.5, '320', null]) {
+    assert.equal(validate({ operation: 'screenshot', maxEdge }).valid, false, String(maxEdge));
+  }
+});
+
 test('short lookahead is available without experience and Chrome exposes a pre-action guard', async()=>{
   const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));
   for (const tool of [chrome,jianlai]) {

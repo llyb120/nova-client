@@ -422,10 +422,8 @@
             "minimum": 0
           },
           "ref": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string",
+            "nullable": true
           },
           "selector": {
             "type": "string",
@@ -590,10 +588,8 @@
               "minimum": 0
             },
             "ref": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string",
+              "nullable": true
             },
             "selector": {
               "type": "string",
@@ -738,10 +734,9 @@
         "description": "仅screenshot按坐标裁剪时提供完整x/y/width/height（视口CSS像素）。与ref互斥；inspect和不裁剪时省略，勿填占位矩形"
       },
       "maxEdge": {
-        "type": "integer",
         "anyOf": [
-          { "const": 0 },
-          { "minimum": 320, "maximum": 3840 }
+          { "type": "integer", "enum": [0] },
+          { "type": "integer", "minimum": 320, "maximum": 3840 }
         ],
         "description": "截图长边：0为原始精度，或320–3840；默认1600，expandScroll默认0（无损WebP）。可坐标操作的视口图和整页分片不超过模型视觉上限（长边1568、约115万像素），返回图即模型所见"
       },
