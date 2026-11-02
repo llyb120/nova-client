@@ -284,6 +284,8 @@ window.test={
     const count={short:3,images:40}[kind]??2000,frames=[];
     const groups=Array.from({length:count},(_,i)=>group(i,kind));
     if(kind==='images')for(const [i,g] of groups.slice(-6).entries())g.body=[{...g.body[0],text:'image answer '+i+'\\n\\n![chart '+i+']('+location.origin+'/img-'+i+'.svg)\\n\\nimage-end-'+i}];
+    if(kind==='dense')for(const g of groups)g.body=[{...g.body[0],text:'short answer'}];
+    if(kind==='markdown'){const g=groups.at(-1);g.body=[{...g.body[0],text:('long **Markdown** paragraph 中文 '+ 'readable content '.repeat(20)+'\\n\\n').repeat(3000)+'markdown-tail'}];}
     // The last turn exceeds the 128-item history tail: its process items arrive deferred, like getThreadView;
     // the previous turn's answer is deferred too and is visible above it.
     if(kind==='deferred'){const g=groups.at(-1),prev=groups.at(-2);g.body=[{type:'thought',id:900001,ts:0,text:'',deferred:true},{type:'tool',id:900002,ts:0,title:'fixture tool',kind:'execute',status:'completed',toolCallId:'tail-tool',content:[],locations:[],deferred:true},...g.body];prev.body=[{...prev.body[0],text:'',deferred:true}];}
@@ -295,6 +297,7 @@ window.test={
       const c=this.scrollCoverage();
       frames.push({hidden:getComputedStyle(space).visibility==='hidden',status:root.querySelector('[role=status]')?.textContent||'',placeholder:!!root.querySelector('[data-history-loading]'),
         top:Math.round(c.top),max:Math.round(c.max),rows:(c.rowRects||[]).map(r=>r.index),gap:Math.round(c.maxGapPx??0),overlap:Math.round(c.maxOverlapPx??0),
+        example:c.example||'',emptyChunks:c.emptyChunks||[],
         stale:[...root.querySelectorAll('.ht-user-text')].some(el=>!el.textContent.startsWith(kind+'-'))});
     }
     return frames;
@@ -571,7 +574,7 @@ async function run(browser, port, report) {
       // no stale rows, no history placeholders swapping in place, no cold image growth after reveal.
       await page.evaluate(() => window.test.load(2000)); await waitText('answer-end-1999'); await waitBottom(); await settle();
       const log = report.switchFrames = {};
-      for (const [n, [from, to]] of [['long','next'],['next','short'],['short','long'],['long','images'],['images','long'],['long','images'],['images','deferred']].entries()) {
+      for (const [n, [from, to]] of [['long','next'],['next','short'],['short','long'],['long','images'],['images','long'],['long','images'],['images','deferred'],['deferred','dense'],['dense','markdown'],['markdown','long'],['long','markdown']].entries()) {
         const frames = await page.evaluate(kind => window.test.switchFrames(kind), to);
         log[`${n}:${from}->${to}`] = frames;
         const shown = frames.filter(f => !f.hidden);
@@ -580,9 +583,10 @@ async function run(browser, port, report) {
         for (const f of frames) assert.ok(!f.stale, `${from}->${to}: stale session text painted ${JSON.stringify(frames)}`);
         for (const f of shown) {
           assert.ok(!f.placeholder, `${from}->${to}: history placeholder painted ${JSON.stringify(frames)}`);
+          assert.equal(f.emptyChunks.length, 0, `${from}->${to}: empty Markdown painted ${JSON.stringify(frames)}`);
           assert.ok(f.max - f.top <= 2 && f.gap <= 2 && f.overlap <= 2, `${from}->${to}: unpinned or broken frame ${JSON.stringify(frames)}`);
         }
-        assert.ok(shown.every(f => JSON.stringify(f.rows) === JSON.stringify(shown[0].rows) && f.top === shown[0].top), `${from}->${to}: geometry moved after reveal ${JSON.stringify(frames)}`);
+        assert.ok(shown.every(f => JSON.stringify(f.rows) === JSON.stringify(shown[0].rows) && f.top === shown[0].top && f.example === shown[0].example), `${from}->${to}: geometry moved after reveal ${JSON.stringify(frames)}`);
         await settle();
       }
     });
@@ -616,8 +620,13 @@ async function run(browser, port, report) {
     });
 
     await check('session-switch-race', async () => {
-    // Queue an old layout, then replace the thread before its asynchronous work settles.
-    await page.evaluate(() => window.test.switchRace());
+    // Replace the thread while the previous session's virtual Markdown gate is still settling.
+    await page.evaluate(async () => {
+      const switching = window.test.switchFrames('markdown');
+      await new Promise(requestAnimationFrame);
+      window.test.switchRace();
+      await switching;
+    });
     await waitText('replacement-0');
     await settle();
     assert.equal((await stats()).active, 0, 'Old session work replaced the new session');

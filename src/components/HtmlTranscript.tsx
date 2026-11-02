@@ -250,14 +250,16 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
         }
         return images.length > 0 || live.some(row => row.querySelector('[data-history-loading][aria-busy="true"]'));
       };
-      if (!waiting()) return;
+      const hasVirtualMarkdown = () => gated.some(row => row.isConnected && row.querySelector('[data-markdown-virtual]'));
+      if (!waiting() && !hasVirtualMarkdown()) return;
       setWindowLoading(true);
-      let finished = false;
+      let finished = false, settleFrame = 0, stableFrames = 0, previousHeight = -1, previousTop = -1;
       const finish = () => {
         if (finished || disposed || generation !== imageGeneration) return;
         finished = true;
         gateCheck = null;
         clearTimeout(imageTimeout);
+        cancelAnimationFrame(settleFrame);
         cancelAnimationFrame(frame);
         // decode resolves before ResizeObserver's delivery. Measure just this
         // initial window once so its first visible frame has final sizes.
@@ -265,9 +267,27 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
         layout();
         setWindowLoading(false);
       };
-      // Hydration re-renders rows and schedules layout(), which re-checks the gate.
-      gateCheck = () => { if (generation === imageGeneration && !waiting()) finish(); };
+      const settleMarkdown = () => {
+        settleFrame = 0;
+        if (finished || disposed || generation !== imageGeneration) return;
+        cancelAnimationFrame(frame);
+        for (const index of rows.keys()) { unmeasured.add(index); measurements.delete(index); }
+        layout();
+        const top = host.scrollTop, height = heights.total;
+        stableFrames = top === previousTop && height === previousHeight ? stableFrames + 1 : 0;
+        previousTop = top;
+        previousHeight = height;
+        if (!waiting() && stableFrames >= 2) finish();
+      };
+      // Virtual Markdown replaces estimates after IntersectionObserver delivery; wait for
+      // two unchanged frames, not just mounted rows, before revealing the initial window.
+      gateCheck = () => {
+        if (generation !== imageGeneration || waiting()) { stableFrames = 0; return; }
+        if (!hasVirtualMarkdown()) finish();
+        else if (!settleFrame) settleFrame = requestAnimationFrame(settleMarkdown);
+      };
       imageTimeout = setTimeout(finish, 10_000);
+      gateCheck();
     });
   }
 
