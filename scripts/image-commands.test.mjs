@@ -46,11 +46,24 @@ test("image commands are available to every backend and keep credentials out of 
 });
 
 test("local image URLs handle Windows paths and spaces; unsupported schemes stay disabled", () => {
-  const image = exportsOf(read("../src/transcriptImage.ts"), { "@tauri-apps/api/core": { convertFileSrc: (path) => `asset:${path}` } });
+  const image = exportsOf(read("../src/transcriptImage.ts"), { "@tauri-apps/api/core": { convertFileSrc: (path) => `asset:${path}` }, "./store": { state: { cwd: "" } } });
   assert.equal(image.transcriptImageSrc("D:/My Images/cat.png"), "asset:D:/My Images/cat.png");
   assert.equal(image.localImagePath(String.raw`\\?\D:\My Images\cat.png`), "D:/My Images/cat.png");
   assert.equal(image.transcriptImageSrc("/tmp/cat.png"), "asset:/tmp/cat.png");
   for (const href of ["javascript:alert(1)", "file://secret", "relative.png", "//remote/test.png"]) assert.equal(image.transcriptImageSrc(href), "");
+});
+
+test("local image paths with literal or malformed percent escapes do not abort rendering", () => {
+  const image = exportsOf(read("../src/transcriptImage.ts"), {
+    "@tauri-apps/api/core": { convertFileSrc: (path) => `asset:${path}` },
+    "./store": { state: { cwd: "D:/project" } },
+  });
+  for (const path of ["D:/images/100%.png", "D:/images/%E4.png", "D:/images/%ZZ.png"]) {
+    assert.equal(image.transcriptImageSrc(path), `asset:${path}`);
+  }
+  assert.equal(image.transcriptImageSrc("./images/100%.png"), "asset:D:/project/images/100%.png");
+  assert.equal(image.transcriptImageSrc("file:///D:/My%20Images/cat.png"), "asset:D:/My Images/cat.png");
+  assert.equal(image.transcriptImageSrc("https://example.com/100%.png"), "https://example.com/100%.png");
 });
 
 test("generate-image forwards reference attachments and includes their paths in the request instructions", async () => {

@@ -5,8 +5,9 @@ import { state } from "./store";
 export function localImagePath(href: string): string | null {
   // Strip file:// protocol; ignore other URL schemes entirely.
   if (/^(?:https?|data|javascript|mailto|tel):/i.test(href)) return null;
-  let path = decodeURIComponent(href)
-    .replace(/^file:\/\/(?:localhost\/)?/i, "")
+  let path = href;
+  try { path = decodeURIComponent(href); } catch { /* 原始文件名可含未转义的 %，此时按字面路径处理。 */ }
+  path = path.replace(/^file:\/\/(?:localhost\/)?/i, "")
     .replace(/^\\\\\?\\/, "")
     .replace(/\\/g, "/")
     // file:///X:/path leaves a leading slash before the drive letter.
