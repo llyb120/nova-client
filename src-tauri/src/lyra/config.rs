@@ -124,6 +124,7 @@ pub struct Resolved {
 
 fn variant_label(variant: &str) -> String {
     match variant {
+        "none" => "None".into(),
         "minimal" => "Minimal".into(),
         "low" => "Low".into(),
         "medium" => "Medium".into(),
@@ -214,18 +215,14 @@ pub fn model_options(config: &Value) -> Vec<Value> {
             if !filter.is_empty() && !filter.iter().any(|k| model_id.to_lowercase().contains(k) || model.get("name").and_then(Value::as_str).is_some_and(|n| n.to_lowercase().contains(k))) {
                 continue;
             }
-            let value = format!("{provider_id}/{model_id}");
-            let name = format!(
-                "{} / {}",
-                provider
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(provider_id),
-                model
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&model_id)
-            );
+            let model_name = model.get("name").and_then(Value::as_str).unwrap_or(&model_id);
+            let native_variant = if provider["api"] == "devin" {
+                super::devin_provider::model_variant(&model_id, model_name)
+            } else { None };
+            let value = format!("{provider_id}/{}", native_variant.as_ref().map_or(model_id.as_str(), |(base, _, _)| base));
+            let name = format!("{} / {}",
+                provider.get("name").and_then(Value::as_str).unwrap_or(provider_id),
+                native_variant.as_ref().map_or(model_name, |(_, name, _)| name));
             let supports_images = model
                 .pointer("/modalities/input")
                 .and_then(Value::as_array)
@@ -242,8 +239,8 @@ pub fn model_options(config: &Value) -> Vec<Value> {
                     .or_else(|| provider.pointer("/options/reasoningEffort"))
                     .and_then(Value::as_str).unwrap_or(""),
             });
-            let variants: Vec<(&String, &Value)> = model
-                .get("variants")
+            let native_variants = native_variant.as_ref().map(|(_, _, effort)| json!({(effort): {}}));
+            let variants: Vec<(&String, &Value)> = native_variants.as_ref().or_else(|| model.get("variants"))
                 .and_then(Value::as_object)
                 .map(|v| v.iter().collect())
                 .unwrap_or_default();
@@ -263,7 +260,8 @@ pub fn model_options(config: &Value) -> Vec<Value> {
                     }));
                 }
             }
-            if is_deepseek_flash(&model_id) && model.pointer("/variants/niubi").is_none() {
+            if is_deepseek_flash(&model_id) && model.pointer("/variants/niubi").is_none()
+                && native_variant.as_ref().is_none_or(|(_, _, effort)| effort == "max") {
                 out.push(json!({
                     "value": format!("{value}/variant/niubi"),
                     "name": format!("{name} · 牛逼"),
@@ -286,6 +284,18 @@ pub fn default_model(config: &Value) -> Result<String, String> {
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    if let Some(current) = selection.clone() {
+        let (base, effort) = current.rsplit_once("/variant/").map_or((current.as_str(), None), |(base, effort)| (base, Some(effort)));
+        if let Some((provider_id, id)) = base.split_once('/') {
+            if let Some(provider) = config.get("provider").and_then(|p| p.get(provider_id)).filter(|p| p["api"] == "devin") {
+                if let Some((base, _, level)) = model_by_id(provider, id).and_then(|m|
+                    super::devin_provider::model_variant(id, m["name"].as_str().unwrap_or(id))) {
+                    let canonical = format!("{provider_id}/{base}/variant/{}", effort.unwrap_or(&level));
+                    if has(&canonical) { selection = Some(canonical); }
+                }
+            }
+        }
+    }
     if let Some(current) = selection.clone() {
         if !has(&current) {
             // 兼容旧配置：model 无 variant 后缀时按 options.reasoningEffort 补全。
@@ -428,10 +438,23 @@ pub fn resolve_model(
         .get("provider")
         .and_then(|providers| providers.get(provider_id))
         .ok_or_else(|| format!("Lyra provider 不存在：{provider_id}"))?;
-    let model = model_by_id(provider, model_id)
+    let configured_model = model_by_id(provider, model_id);
+    let native_selection = if provider["api"] == "devin"
+        && (configured_model.is_none() || variant.is_some())
+        && !variant.is_some_and(|v| configured_model.is_some_and(|m| m["variants"].get(v).is_some())) {
+        let base = configured_model.and_then(|m| super::devin_provider::model_variant(model_id,
+            m["name"].as_str().unwrap_or(model_id))).map(|(base, _, _)| base).unwrap_or_else(|| model_id.to_string());
+        let effort = variant.map(|v| if v == "niubi" && is_deepseek_flash(&base) { "max" } else { v });
+        model_entries(provider).into_iter().find_map(|(id, model)| {
+            let (candidate, _, level) = super::devin_provider::model_variant(&id, model["name"].as_str().unwrap_or(&id))?;
+            (candidate == base && effort.is_none_or(|e| e == level)).then_some((id, model, level))
+        })
+    } else { None };
+    let model = native_selection.as_ref().map(|(_, model, _)| *model).or(configured_model)
         .ok_or_else(|| format!("Lyra model 不存在：{base_selection}"))?;
+    let model_id = native_selection.as_ref().map_or(model_id, |(id, _, _)| id.as_str());
     let boosted = variant == Some("niubi") && is_deepseek_flash(model_id);
-    if let Some(variant) = variant.filter(|_| !boosted) {
+    if let Some(variant) = variant.filter(|_| !boosted && native_selection.is_none()) {
         if model
             .get("variants")
             .and_then(|variants| variants.get(variant))
@@ -473,13 +496,10 @@ pub fn resolve_model(
             "Lyra 暂不支持协议 {api}（仅 openai-completions / openai-responses / anthropic-messages / devin / codebuddy）"
         ));
     }
-    let variant_options = variant
-        .and_then(|name| {
-            model
-                .get("variants")
-                .and_then(|variants| variants.get(if boosted { "max" } else { name }))
-        })
-        .cloned()
+    let variant_options = native_selection.as_ref().map(|(_, _, effort)| json!({"reasoningEffort": effort}))
+        .or_else(|| variant.and_then(|name| {
+            model.get("variants").and_then(|variants| variants.get(if boosted { "max" } else { name }))
+        }).cloned())
         .unwrap_or(Value::Null);
     let service_tier = variant_options
         .get("serviceTier")
@@ -523,7 +543,7 @@ pub fn resolve_model(
             .or_else(|| model.pointer("/options/reasoningEffort").or_else(|| provider.pointer("/options/reasoningEffort"))
                 .and_then(Value::as_str).map(str::to_string))
     };
-    let reasoning = boosted || model
+    let reasoning = boosted || native_selection.is_some() || model
         .get("reasoning")
         .and_then(Value::as_bool)
         .unwrap_or_else(|| {

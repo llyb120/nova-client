@@ -209,6 +209,25 @@ fn snapshot() -> Catalog {
     Catalog { families: parsed["families"].as_array().cloned().unwrap_or_default(), version: SNAPSHOT_VERSION.into(), loaded: Instant::now() }
 }
 
+/// 强度折进选择器，速度/上下文后缀仍属于不同模型；原始 UID 留在目录中兼容旧会话。
+pub(super) fn model_variant(id: &str, label: &str) -> Option<(String, String, String)> {
+    static LABEL: OnceLock<regex::Regex> = OnceLock::new();
+    let label_parts = LABEL.get_or_init(|| regex::Regex::new(
+        r"^(.*?) (No Thinking|None|Minimal|Low|Medium|High|XHigh|Max)(?: Thinking)?( (?:Fast|Lightning|1M))?$"
+    ).unwrap()).captures(label);
+    let suffix = ["-priority", "-fast", "-lightning", "-1m"].into_iter().find(|s| id.ends_with(s)).unwrap_or("");
+    let stem = id.strip_suffix(suffix).unwrap_or(id);
+    let id_parts = stem.rsplit_once('-').filter(|(_, effort)| matches!(*effort,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"));
+    let effort = id_parts.map(|(_, effort)| effort.to_string()).or_else(|| label_parts.as_ref().map(|parts| {
+        if &parts[2] == "No Thinking" { "none".into() } else { parts[2].to_ascii_lowercase() }
+    }))?;
+    let base = id_parts.map(|(base, _)| format!("{base}{suffix}")).unwrap_or_else(|| id.to_string());
+    let name = label_parts.as_ref().map(|parts| format!("{}{}", &parts[1], parts.get(3).map_or("", |m| m.as_str())))
+        .unwrap_or_else(|| if label == id { base.clone() } else { label.to_string() });
+    Some((base, name, effort))
+}
+
 fn catalog_models(catalog: &Catalog) -> Map<String, Value> {
     let mut models = Map::new();
     for variant in catalog.families.iter().filter_map(|f| f["variants"].as_array()).flatten() {
@@ -257,13 +276,15 @@ fn resolve_model(catalog: &Catalog, requested: &str, effort: Option<&str>) -> Re
         if !matches!(effort, "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
             return Err("Devin 思考档位无效，请选择对应模型 ID".into());
         }
-        let suffix = if id.ends_with("-priority") { "-priority" } else { "" };
-        let base = id.strip_suffix("-priority").unwrap_or(&id);
-        let (name, previous) = base.rsplit_once('-').ok_or("Devin 模型不支持切换思考档位")?;
-        if !matches!(previous, "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
-            return Err("Devin 模型不支持切换思考档位，请选择对应模型 ID".into());
-        }
-        id = format!("{name}-{effort}{suffix}");
+        let variants: Vec<_> = catalog.families.iter().filter_map(|f| f["variants"].as_array()).flatten().collect();
+        let variant = variants.iter().find(|v| v["model_uid"] == id).ok_or("Devin 模型不存在，请刷新模型列表")?;
+        let (base, _, _) = model_variant(&id, variant["label"].as_str().unwrap_or(&id))
+            .ok_or("Devin 模型不支持切换思考档位，请选择对应模型 ID")?;
+        id = variants.iter().find_map(|v| {
+            let uid = v["model_uid"].as_str()?;
+            let (candidate, _, level) = model_variant(uid, v["label"].as_str().unwrap_or(uid))?;
+            (candidate == base && level == effort).then(|| uid.to_string())
+        }).ok_or_else(|| format!("Devin 模型或档位不存在：{base}/{effort}，请刷新模型列表"))?;
     }
     if !exists(&id) { return Err(format!("Devin 模型或档位不存在：{id}，请刷新模型列表")); }
     Ok(id)
@@ -674,6 +695,71 @@ mod tests {
         assert!(catalog_models(&catalog).contains_key("claude-opus-4-8-high"));
         assert!(!catalog_models(&catalog).contains_key("adaptive"));
         assert!(resolve_model(&catalog, "adaptive", None).unwrap_err().contains("自动路由"));
+        for (id, effort, expected) in [
+            ("claude-opus-5-5-low-fast", "max", "claude-opus-5-5-max-fast"),
+            ("swe-2-high-lightning", "medium", "swe-2-medium-lightning"),
+            ("glm-5-2-1m", "max", "glm-5-2-max-1m"),
+            ("glm-5-2-max-1m", "high", "glm-5-2-1m"),
+            ("swe-1-7-medium", "max", "swe-1-7"),
+        ] { assert_eq!(resolve_model(&catalog, id, Some(effort)).unwrap(), expected); }
+    }
+
+    #[test]
+    fn bundled_choices_fold_efforts_and_restore_every_native_uid() {
+        use super::super::config;
+        let catalog = snapshot();
+        let models = catalog_models(&catalog);
+        let mut config = json!({"provider":{"devin":{"name":"Devin","api":"devin",
+            "options":{"baseURL":"https://example.invalid","supportsReasoningEffort":false,"supportsThinkingToggle":false},
+            "models":models}}});
+        let options = config::model_options(&config);
+        let values: std::collections::HashSet<_> = options.iter().map(|o| o["value"].as_str().unwrap()).collect();
+        assert_eq!(values.len(), options.len(), "native variants and boosts must not be duplicated");
+        assert!(options.iter().any(|o| o["name"] == "Devin / Claude Opus 5.5 Fast · Max"));
+        assert!(options.iter().any(|o| o["name"] == "Devin / DeepSeek V4.1 Flash · None"));
+        assert_eq!(options.iter().filter(|o| o["name"].as_str().unwrap().ends_with(" · 牛逼")).count(), 2);
+        for (id, model) in &models {
+            let legacy = format!("devin/{id}");
+            let choice = model_variant(id, model["name"].as_str().unwrap()).map(|(base, _, effort)|
+                format!("devin/{base}/variant/{effort}")).unwrap_or_else(|| legacy.clone());
+            assert!(values.contains(choice.as_str()), "{choice}");
+            let resolved = config::resolve_model(&config, Some(&choice), &HashMap::new()).unwrap();
+            assert_eq!(&resolved.model.id, id, "{choice}");
+            assert_eq!(resolved.model.context_window, model["limit"]["context"].as_u64().unwrap());
+            assert_eq!(&config::resolve_model(&config, Some(&legacy), &HashMap::new()).unwrap().model.id, id);
+            config["model"] = json!(legacy);
+            assert_eq!(config::default_model(&config).unwrap(), choice, "legacy defaults must keep their model and effort");
+        }
+        for choice in ["devin/deepseek-v4-flash/variant/low", "devin/claude-opus-5-5-fast/variant/none"] {
+            assert!(config::resolve_model(&config, Some(choice), &HashMap::new()).is_err(), "{choice}");
+        }
+    }
+
+    #[test]
+    fn native_niubi_uses_max_uid_and_only_boosts_the_prompt() {
+        use super::super::{config, prompt};
+        let config = json!({"provider":{"devin":{"api":"devin","options":{"baseURL":"https://example.invalid"},
+            "models":catalog_models(&snapshot())}}});
+        for (base, uid) in [("deepseek-v4-flash", "deepseek-v4-flash-max"),
+            ("deepseek-v4-1-flash-1017", "deepseek-v4-1-flash-1017-max")] {
+            let max = config::resolve_model(&config, Some(&format!("devin/{base}/variant/max")), &HashMap::new()).unwrap();
+            let boost = config::resolve_model(&config, Some(&format!("devin/{base}/variant/niubi")), &HashMap::new()).unwrap();
+            assert_eq!(boost.model, max.model);
+            assert_eq!(boost.model.id, uid);
+            assert_eq!(boost.thinking_level.as_deref(), Some("niubi"));
+            for resolved in [max, boost] {
+                let system = prompt::model_system_prompt("sys", &resolved.model.id, resolved.thinking_level.as_deref());
+                let body = provider::completions_body(&resolved.model, &system, &[], &[], Some("max"), None);
+                assert!(body.get("reasoning_effort").is_none(), "native effort is encoded in the UID");
+                let wire = encode_request(&body, "fixture-key", SNAPSHOT_VERSION).unwrap();
+                let fields = decode(&wire[5..]).unwrap();
+                assert_eq!(value(&fields, 21).text().unwrap(), uid);
+                let actual_prompt = value(&fields, 2).text().unwrap();
+                if resolved.thinking_level.as_deref() == Some("niubi") {
+                    assert!(actual_prompt.starts_with("sys\n\n") && actual_prompt.contains("你的用量是unlimited的"));
+                } else { assert_eq!(actual_prompt, "sys"); }
+            }
+        }
     }
 
     #[test]
