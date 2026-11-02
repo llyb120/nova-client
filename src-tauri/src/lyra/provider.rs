@@ -803,6 +803,10 @@ fn responses_body(
     if let Some(top_p) = model.top_p {
         body["top_p"] = json!(top_p);
     }
+    // xAI Responses 将 Grok 输出预算限制为 128000，即使模型目录标称更高。
+    if model.id.to_ascii_lowercase().contains("grok") {
+        body["max_output_tokens"] = json!(body["max_output_tokens"].as_u64().unwrap_or(model.max_output_tokens).min(128_000));
+    }
     budget_output_tokens(&mut body, model, "max_output_tokens");
     if model.local_auth.as_deref() == Some("codex") {
         // ChatGPT 的 Codex 接口不是付费 Responses API，不接受这些通用参数。
@@ -2916,6 +2920,17 @@ mod tests {
             assert!(!text.contains(&dropped));
         }
     }
+    #[test]
+    fn grok_responses_output_is_capped_at_128000() {
+        let mut model = test_model("openai-responses");
+        model.id = "grok-4.5".into();
+        model.context_window = 500_000;
+        model.max_output_tokens = 500_000;
+        assert_eq!(responses_body(&model, "sys", &[], &[], None, None)["max_output_tokens"], 128_000);
+        model.extra_options.insert("max_output_tokens".into(), json!(500_000));
+        assert_eq!(responses_body(&model, "sys", &[], &[], None, None)["max_output_tokens"], 128_000);
+    }
+
     #[test]
     fn output_budget_reserves_context_for_growing_tool_history() {
         let mut model = test_model("openai-completions");
