@@ -462,16 +462,24 @@ fn request_input_budget(value: &Value) -> u64 {
     // Count serialized wire content (including schemas/JSON escaping).
     let counter = super::tokens::TokenCounter;
     use super::tokens::IMAGE_TOKENS;
-    fn remove_image_payloads(value: &mut Value) -> u64 {
+    fn remove_transport_payloads(value: &mut Value) -> u64 {
         match value {
-            Value::Array(items) => items.iter_mut().map(remove_image_payloads).sum(),
+            Value::Array(items) => items.iter_mut().map(remove_transport_payloads).sum(),
             Value::Object(fields) => {
-                if matches!(fields.get("type").and_then(Value::as_str), Some("image" | "image_url" | "input_image")) {
-                    for key in ["source", "image_url", "data"] { fields.remove(key); }
-                    // Vision costs depend on resolution/tiling, not base64 bytes.
-                    return IMAGE_TOKENS;
+                match fields.get("type").and_then(Value::as_str) {
+                    Some("image" | "image_url" | "input_image") => {
+                        for key in ["source", "image_url", "data"] { fields.remove(key); }
+                        // Vision costs depend on resolution/tiling, not base64 bytes.
+                        return IMAGE_TOKENS;
+                    }
+                    // Opaque replay bytes are not tokenizer text; readable reasoning is still counted.
+                    // shortcut: hidden reasoning cost is unknown, use provider-native token counting when available.
+                    Some("reasoning") => { fields.remove("encrypted_content"); }
+                    Some("thinking") => { fields.remove("signature"); }
+                    Some("redacted_thinking") => { fields.remove("data"); }
+                    _ => {}
                 }
-                fields.values_mut().map(remove_image_payloads).sum()
+                fields.values_mut().map(remove_transport_payloads).sum()
             }
             _ => 0,
         }
@@ -485,7 +493,7 @@ fn request_input_budget(value: &Value) -> u64 {
     };
     let raw: u64 = pieces.into_iter().map(|piece| {
         let mut piece = piece.clone();
-        let images = remove_image_payloads(&mut piece);
+        let images = remove_transport_payloads(&mut piece);
         counter.count_json(&piece).saturating_add(images)
     }).sum();
     (raw as f64 * UNKNOWN_TOKENIZER_MARGIN).ceil() as u64
@@ -2942,6 +2950,33 @@ mod tests {
         let small = anthropic_body(&model, "sys", &messages, &[], Some("high"));
         assert_eq!(small["max_tokens"], 16);
         assert!(small.get("thinking").is_none());
+    }
+
+    #[test]
+    fn output_budget_excludes_opaque_replay_bytes_without_changing_the_wire_body() {
+        let mut model = test_model("openai-responses");
+        model.context_window = 32_000;
+        model.max_output_tokens = 4096;
+        let opaque = "opaque-replay-state".repeat(60_000);
+        for block in [
+            json!({"type":"reasoning","encrypted_content":opaque,"summary":[{"type":"summary_text","text":"visible reasoning"}]}),
+            json!({"type":"thinking","thinking":"visible reasoning","signature":opaque}),
+            json!({"type":"redacted_thinking","data":opaque}),
+        ] {
+            let mut body = json!({"input":[block],"max_output_tokens":4096});
+            let original = body.clone();
+            let estimate = request_input_budget(&body);
+            assert!(estimate < 1000, "opaque transport bytes inflated the budget: {estimate}");
+            assert_eq!(body, original);
+            budget_output_tokens(&mut body, &model, "max_output_tokens");
+            assert_eq!(body["max_output_tokens"], 4096);
+            assert!(ensure_output_budget(&body, &model, "max_output_tokens").is_ok());
+            assert_eq!(body["input"], original["input"], "replay state must remain byte-identical on the wire");
+            body["input"][0]["text"] = json!("readable thinking ".repeat(4000));
+            assert!(request_input_budget(&body) > estimate + 10_000, "readable reasoning still consumes context");
+        }
+        let user_text = json!({"messages":[{"role":"user","content":opaque}]});
+        assert!(request_input_budget(&user_text) > 100_000, "ordinary text must not be exempted");
     }
 
     #[tokio::test]
