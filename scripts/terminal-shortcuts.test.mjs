@@ -31,7 +31,7 @@ assert.equal(selected.length,2);
 const code = ts.transpile(selected.map(node => node.getText(ast).replace(/^export /,'')).join('\n'));
 async function navigate(state) {
   const opened=[];
-  await vm.runInNewContext(`${code}\nopenNextUnreadThread()`,{state:{threads,currentId:null,running:{},unreadTurns:{},...state},nextRunningThread,isPendingThreadId:id=>id.startsWith('pending:'),latestFireStage:display.latestFireStage,setView:()=>{},openThread:async id=>opened.push(id)});
+  await vm.runInNewContext(`${code}\nopenNextUnreadThread()`,{state:{threads,currentId:null,running:{},unreadTurns:{},...state},nextRunningThread,isPendingThreadId:id=>id.startsWith('pending:'),latestFireStage:display.latestFireStage,setView:()=>{},openThread:async id=>opened.push(id)}, { timeout: 1000 });
   return opened;
 }
 assert.deepEqual(await navigate({running:{a:true},unreadTurns:{b:1}}),['b']);
@@ -40,6 +40,15 @@ assert.deepEqual(await navigate({running:{a:true}}),['a']);
 assert.deepEqual(await navigate({}),[]);
 assert.deepEqual(await navigate({threads:[thread('pending:new')],running:{'pending:new':true}}),[]);
 assert.deepEqual(await navigate({threads:chain,currentId:'root',running:{other:true,stage2:true},unreadTurns:{stage1:2}}),['stage1']);
+// A cyclic current chain must not hang while looking for an unrelated unread root.
+for (const ancestors of [
+  [thread('x', { parentThreadId: 'x' })],
+  [thread('x', { parentThreadId: 'y' }), thread('y', { parentThreadId: 'x' })],
+  [thread('x', { parentThreadId: 'missing' })],
+]) {
+  assert.deepEqual(await navigate({ threads: [...chain, ...ancestors], currentId: 'x', unreadTurns: { stage1: 1 } }), ['stage1']);
+}
+assert.deepEqual(await navigate({ threads: chain, currentId: 'stage2', unreadTurns: { stage1: 1, other: 1 } }), ['other']);
 let handler,stops=0,toggles=0;
 class Element { constructor(terminal=false) { this.terminal=terminal; this.tagName='TEXTAREA'; } closest() { return this.terminal?this:null; } }
 const state={settings:{sessionShortcuts:[]}};

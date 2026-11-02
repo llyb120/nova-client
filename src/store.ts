@@ -1198,8 +1198,10 @@ export async function openNextUnreadThread(): Promise<void> {
   // 当前打开的会话在某条未读链上时取下一组，循环轮转；否则从第一组开始
   const currentIndex = unreadRoots.findIndex((root) => {
     let node = state.threads.find((t) => t.id === state.currentId);
-    while (node) {
+    const seen = new Set<string>();
+    while (node && !seen.has(node.id)) {
       if (node.id === root.id) return true;
+      seen.add(node.id);
       node = state.threads.find((t) => t.id === node?.parentThreadId);
     }
     return false;
