@@ -28,6 +28,7 @@ import {
   ensureModelOptions,
   ensurePeerModels,
   getOutputRate,
+  modelChoices,
   pickThreadModel,
   refreshSlashCommands,
   sendPrompt,
@@ -38,6 +39,7 @@ import {
 import { isSupportedAgentKind, type AgentKind, type PromptImage } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects } from "./ConfigSelects";
+import { fmtTokens } from "./TurnGroup";
 import { IconFile, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { createNoteFlow } from "./NoteFlow";
@@ -151,6 +153,20 @@ export function Composer() {
   };
   // 共享采样器定时刷新，停顿时也会归零。
   const tokenSpeed = () => getOutputRate(state.currentId);
+  const contextUsage = createMemo(() => {
+    const latestTurn = state.items.findLast(item => item.type === "turn" && item.contextTokens != null);
+    const used = state.liveUsage?.contextTokens ?? (latestTurn?.type === "turn" ? latestTurn.contextTokens : null);
+    if (used == null) return null;
+    // 实际模型会带显示档位后缀，模型上限仍按列表里的基础模型读取。
+    const model = shownModel().split(" · ")[0];
+    const source = usesPeerModels() ? guestModelSource(state.agentKind) : undefined;
+    const choice = modelChoices(state.agentKind, source).find(item =>
+      item.value === model || (!model && !!item.value));
+    const limit = choice?._meta?.contextWindow;
+    return typeof limit === "number" && limit > 0 ? { used, limit } : null;
+  });
+  const formatContextTokens = (value: number) =>
+    new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
   const noteFlow = createNoteFlow(running);
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
@@ -660,6 +676,13 @@ export function Composer() {
           disabled={running()}
         />
         <LayoutPicker threadId={state.currentId} />
+        <Show when={contextUsage()}>
+          {usage => (
+            <span class="composer-run-stats" title={`上下文 ${fmtTokens(usage().used)} / ${fmtTokens(usage().limit)} tokens（最近一次模型请求）`}>
+              {formatContextTokens(usage().used)}/{formatContextTokens(usage().limit)}
+            </span>
+          )}
+        </Show>
         <Show when={running()}>
           <span class="composer-run-stats" title={`本轮已运行 ${runElapsed()}`}>
             <span class="composer-run-dot" aria-hidden="true" />
