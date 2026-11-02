@@ -153,18 +153,6 @@ export function Composer() {
   };
   // 共享采样器定时刷新，停顿时也会归零。
   const tokenSpeed = () => getOutputRate(state.currentId);
-  const contextUsage = createMemo(() => {
-    const latestTurn = state.items.findLast(item => item.type === "turn" && item.contextTokens != null);
-    const used = state.liveUsage?.contextTokens ?? (latestTurn?.type === "turn" ? latestTurn.contextTokens : null);
-    if (used == null) return null;
-    // 实际模型会带显示档位后缀，模型上限仍按列表里的基础模型读取。
-    const model = shownModel().split(" · ")[0];
-    const source = usesPeerModels() ? guestModelSource(state.agentKind) : undefined;
-    const choice = modelChoices(state.agentKind, source).find(item =>
-      item.value === model || (!model && !!item.value));
-    const limit = choice?._meta?.contextWindow;
-    return typeof limit === "number" && limit > 0 ? { used, limit } : null;
-  });
   const formatContextTokens = (value: number) =>
     new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
   const noteFlow = createNoteFlow(running);
@@ -196,6 +184,19 @@ export function Composer() {
     return usesPeerModels() && t ? state.peerModels[t] : undefined;
   };
   const guestModelSource = (k: AgentKind) => guestModels()?.options[k] ?? null;
+  // createMemo 会立即求值，必须在本地/漫游模型依赖初始化后创建。
+  const contextUsage = createMemo(() => {
+    const latestTurn = state.items.findLast(item => item.type === "turn" && item.contextTokens != null);
+    const used = state.liveUsage?.contextTokens ?? (latestTurn?.type === "turn" ? latestTurn.contextTokens : null);
+    if (used == null) return null;
+    // 实际模型会带显示档位后缀，模型上限仍按列表里的基础模型读取。
+    const model = shownModel().split(" · ")[0];
+    const source = usesPeerModels() ? guestModelSource(state.agentKind) : undefined;
+    const choice = modelChoices(state.agentKind, source).find(item =>
+      item.value === model || (!model && !!item.value));
+    const limit = choice?._meta?.contextWindow;
+    return typeof limit === "number" && limit > 0 ? { used, limit } : null;
+  });
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => usesPeerModels() ? null : state.agentKind, kind => {
     if (kind) void ensureModelOptions(kind);
@@ -676,17 +677,20 @@ export function Composer() {
           disabled={running()}
         />
         <LayoutPicker threadId={state.currentId} />
-        <Show when={contextUsage()}>
-          {usage => (
-            <span class="composer-run-stats" title={`上下文 ${fmtTokens(usage().used)} / ${fmtTokens(usage().limit)} tokens（最近一次模型请求）`}>
-              {formatContextTokens(usage().used)}/{formatContextTokens(usage().limit)}
-            </span>
-          )}
-        </Show>
         <Show when={running()}>
           <span class="composer-run-stats" title={`本轮已运行 ${runElapsed()}`}>
             <span class="composer-run-dot" aria-hidden="true" />
             <span>{runElapsed()}</span>
+            <Show when={contextUsage()}>
+              {usage => (
+                <>
+                  <span class="composer-run-sep">·</span>
+                  <span title={`上下文 ${fmtTokens(usage().used)} / ${fmtTokens(usage().limit)} tokens（最近一次模型请求）`}>
+                    {formatContextTokens(usage().used)}/{formatContextTokens(usage().limit)}
+                  </span>
+                </>
+              )}
+            </Show>
             <span class="composer-run-sep">·</span>
             <span title="实时输出速度：优先采用服务端 output tokens / 模型请求耗时（含 Thinking）；首次用量上报前为文本估算，不含工具执行等待。">
               ≈{tokenSpeed()} tok/s

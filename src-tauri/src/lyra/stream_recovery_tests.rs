@@ -37,6 +37,10 @@ fn completed(api: &str, tool: bool) -> Vec<Value> {
 
 // Acknowledge each body segment before breaking the transport, so the test does not depend on TCP coalescing.
 async fn invoke(api: &str, segments: Vec<String>, tail: &str, cancel_on_text: bool) -> Result<StreamResult, String> {
+    invoke_stream(api, segments, tail, cancel_on_text, false).await
+}
+
+async fn invoke_stream(api: &str, segments: Vec<String>, tail: &str, cancel_on_text: bool, shared_entry: bool) -> Result<StreamResult, String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (activity, mut received) = tokio::sync::mpsc::unbounded_channel();
@@ -92,10 +96,14 @@ async fn invoke(api: &str, segments: Vec<String>, tail: &str, cancel_on_text: bo
         if cancel_on_text && matches!(event, StreamEvent::TextDelta(_)) { cancel.store(true, Ordering::SeqCst); }
     };
     let request = async {
-        match api {
-            "openai-responses" => stream_responses(&http, &model, "", json!({}), None, &cancel, &mut on_event).await,
-            "anthropic-messages" => stream_anthropic(&http, &model, "", json!({}), None, &cancel, &mut on_event).await,
-            _ => stream_completions(&http, &model, "", json!({}), None, &cancel, &mut on_event).await,
+        if shared_entry {
+            stream_chat(&http, &model, "", None, "sys", &[], &[], None, &cancel, &mut on_event).await
+        } else {
+            match api {
+                "openai-responses" => stream_responses(&http, &model, "", json!({}), None, &cancel, &mut on_event).await,
+                "anthropic-messages" => stream_anthropic(&http, &model, "", json!({}), None, &cancel, &mut on_event).await,
+                _ => stream_completions(&http, &model, "", json!({}), None, &cancel, &mut on_event).await,
+            }
         }
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(3), request).await;
@@ -199,4 +207,105 @@ async fn codebuddy_keeps_strict_done_requirement() {
     }
     let result = invoke("codebuddy", vec![format!("{events}data: [DONE]\n\n")], "normal", false).await.unwrap();
     assert_eq!(result.stop_reason, "stop");
+}
+
+#[test]
+fn repetition_guard_handles_chunk_boundaries_unicode_and_bounded_memory() {
+    for pattern in ["```\n".to_string(), "思考中。\n".into(), "x".repeat(MAX_REPETITION_PERIOD - 1) + "y"] {
+        let repeated = format!("planning\n{}", pattern.repeat(REPETITION_WINDOW * 3 / pattern.len()));
+        for chunk_size in [1, 37, REPETITION_WINDOW * 2] {
+            let mut guard = RepetitionGuard::default();
+            // Split by characters here; the detector itself retains bytes, not UTF-8 strings.
+            let chars: Vec<_> = repeated.chars().collect();
+            assert!(chars.chunks(chunk_size).any(|chunk| guard.push(&chunk.iter().collect::<String>())));
+            assert!(guard.tail.len() <= REPETITION_WINDOW);
+        }
+    }
+    let mut guard = RepetitionGuard::default();
+    assert!(!guard.push(&"a".repeat(REPETITION_WINDOW - 1)));
+    assert!(guard.push("a"));
+}
+
+#[test]
+fn repetition_guard_allows_normal_long_code_and_short_repetition() {
+    let code: String = (0..800).map(|i| format!("## Step {i}\n```rust\nlet v{i} = {i};\n```\n")).collect();
+    let mut guard = RepetitionGuard::default();
+    for chunk in code.as_bytes().chunks(37) {
+        assert!(!guard.push(std::str::from_utf8(chunk).unwrap()));
+        assert!(guard.tail.len() <= REPETITION_WINDOW);
+    }
+    assert!(!guard.push(&"```\n".repeat(32)));
+}
+
+fn output_delta(api: &str, thinking: bool, text: &str) -> Value {
+    match api {
+        "openai-responses" => json!({"type":if thinking { "response.reasoning_summary_text.delta" } else { "response.output_text.delta" },"delta":text}),
+        "anthropic-messages" => json!({"type":"content_block_delta","index":0,"delta":if thinking {
+            json!({"type":"thinking_delta","thinking":text})
+        } else { json!({"type":"text_delta","text":text}) }}),
+        _ => json!({"choices":[{"delta":if thinking { json!({"reasoning_content":text}) } else { json!({"content":text}) },"finish_reason":null}]}),
+    }
+}
+
+#[tokio::test]
+async fn normal_long_output_and_separate_channels_are_not_rejected() {
+    let thinking: String = (0..800).map(|i| format!("第 {i} 步：检查不同的输入和输出。\n")).collect();
+    let code: String = (0..800).map(|i| format!("```rust\nlet v{i} = {i};\n```\n")).collect();
+    let short_repeat = "```\n".repeat(REPETITION_WINDOW / 8);
+    for (thinking, text) in [(thinking, code), (short_repeat.clone(), short_repeat)] {
+        let api = "openai-completions";
+        let mut events = vec![output_delta(api, true, &thinking), output_delta(api, false, &text)];
+        events.extend(completed(api, false));
+        let result = invoke_stream(api, vec![sse(&events)], "normal", false, true).await.unwrap();
+        assert_eq!(result.stop_reason, "stop");
+        assert_eq!(result.content[0]["thinking"], thinking);
+        assert_eq!(result.content[1]["text"], text + "ok");
+    }
+}
+
+#[tokio::test]
+async fn repetitive_text_and_thinking_stop_without_waiting_for_a_terminal() {
+    for api in ["openai-responses", "anthropic-messages", "openai-completions"] {
+        for thinking in [false, true] {
+            let mut events = Vec::new();
+            if api == "anthropic-messages" {
+                events.push(json!({"type":"content_block_start","index":0,"content_block":if thinking {
+                    json!({"type":"thinking","thinking":""})
+                } else { json!({"type":"text","text":""}) }}));
+            }
+            events.push(output_delta(api, thinking, "planning\n"));
+            let repeated = "```\n".repeat(REPETITION_WINDOW / 2);
+            for chunk in repeated.as_bytes().chunks(509) {
+                events.push(output_delta(api, thinking, std::str::from_utf8(chunk).unwrap()));
+            }
+            let error = invoke_stream(api, vec![sse(&events)], "hold", false, true).await.unwrap_err();
+            assert_eq!(error, REPETITIVE_OUTPUT_ERROR, "{api}, thinking={thinking}");
+            assert!(!is_retryable_stream_error(&error));
+            assert!(!crate::lyra::prompt::is_retryable_provider_error(&error));
+        }
+    }
+}
+
+#[tokio::test]
+async fn repetition_wins_over_a_success_terminal_and_suppresses_late_tools() {
+    use crate::lyra::turn::tests::capturing_server;
+    for api in ["openai-responses", "anthropic-messages", "openai-completions"] {
+        let mut events = Vec::new();
+        if api == "anthropic-messages" {
+            events.push(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}));
+        }
+        events.push(output_delta(api, false, &"```\n".repeat(REPETITION_WINDOW / 4)));
+        events.extend(completed(api, true));
+        let (url, _) = capturing_server(vec![Some(events)]).await;
+        let mut model = test_model(api);
+        model.base_url = url;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut observed = Vec::new();
+        let error = stream_chat(&http, &model, "", None, "sys", &[], &[], None, &cancel,
+            &mut |event| observed.push(event)).await.unwrap_err();
+        assert_eq!(error, REPETITIVE_OUTPUT_ERROR, "{api}");
+        assert!(!cancel.load(Ordering::SeqCst), "must not turn a generation failure into user cancellation");
+        assert!(observed.iter().all(|event| matches!(event, StreamEvent::Activity)), "must suppress the offending delta and later events: {observed:?}");
+    }
 }

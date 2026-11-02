@@ -2,12 +2,49 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { transformSync } from "esbuild";
+import ts from "typescript";
 import { createEffect, createMemo, createRoot, createSignal, createStore, flush, onFlush, reconcile } from "@solidjs/signals";
 import { taskChains } from "../src/taskChains.ts";
 
 const store = readFileSync(new URL("../src/store.ts", import.meta.url), "utf8");
 const sidebar = readFileSync(new URL("../src/components/Sidebar.tsx", import.meta.url), "utf8");
 const js = (source) => transformSync(source, { loader: "ts", target: "esnext" }).code;
+
+test("Composer 带上下文用量重新挂载时先初始化模型依赖，保留本地和漫游用量更新", () => {
+  const file = ts.createSourceFile("Composer.tsx", readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const component = file.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "Composer");
+  const names = new Set(["contextUsage", "isGuest", "usesPeerModels", "guestModels", "guestModelSource"]);
+  // Keep source declaration order: evaluating the memo before its dependencies caused REACTIVITY_HALTED.
+  const declarations = component.body.statements.filter(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(declaration => names.has(declaration.name.getText(file))));
+  assert.equal(declarations.length, names.size);
+  const mount = new Function("createMemo", "state", "shownModel", "modelChoices", `${js(declarations.map(node => node.getText(file)).join("\n"))}; return contextUsage;`);
+  const options = limit => ({ configOptions: [{ id: "model", options: [{ value: "model", _meta: { contextWindow: limit } }] }] });
+  for (const guest of [false, true]) for (const used of [null, 0, 128000]) {
+    const [state, setState] = createStore({
+      currentId: "thread", agentKind: "lyra", roamingPeer: guest ? "peer" : null,
+      threads: [{ id: "thread", roamingRole: guest ? "guest" : null }],
+      items: [{ type: "turn", contextTokens: used }], liveUsage: null,
+      modelOptions: { lyra: options(1000000) }, peerModels: { peer: { options: { lyra: options(2000000) } } },
+    });
+    const limit = guest ? 2000000 : 1000000;
+    for (let visit = 0; visit < 2; visit++) {
+      let dispose;
+      try {
+        const usage = createRoot(cleanup => {
+          dispose = cleanup;
+          return mount(createMemo, state, () => "model", (kind, source) =>
+            (source === undefined ? state.modelOptions[kind] : source)?.configOptions[0].options ?? []);
+        });
+        assert.deepEqual(usage(), used === null ? null : { used, limit });
+        setState(s => { s.liveUsage = { contextTokens: 256000 }; }); flush();
+        assert.deepEqual(usage(), { used: 256000, limit });
+        setState(s => { s.liveUsage = null; }); flush();
+        assert.deepEqual(usage(), used === null ? null : { used, limit });
+      } finally { dispose?.(); }
+    }
+  }
+});
 
 test("文件面板开关跨会话保持，重新挂载恢复全局偏好", () => {
   const chat = readFileSync(new URL("../src/components/ChatView.tsx", import.meta.url), "utf8");

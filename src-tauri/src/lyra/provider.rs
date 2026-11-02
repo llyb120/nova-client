@@ -69,6 +69,31 @@ impl StreamResult {
     }
 }
 
+pub(crate) const REPETITIVE_OUTPUT_ERROR: &str = "检测到模型输出长段机械重复，已停止本轮；请切换模型或从异常输出前分叉后继续。";
+// Require 8 KiB and at least 32 exact cycles; ordinary fences and short repeats should pass.
+const REPETITION_WINDOW: usize = 8192;
+const MAX_REPETITION_PERIOD: usize = REPETITION_WINDOW / 32;
+
+#[derive(Default)]
+struct RepetitionGuard {
+    tail: Vec<u8>,
+}
+
+impl RepetitionGuard {
+    fn push(&mut self, delta: &str) -> bool {
+        for chunk in delta.as_bytes().chunks(REPETITION_WINDOW) {
+            self.tail.extend_from_slice(chunk);
+            if self.tail.len() < REPETITION_WINDOW { continue; }
+            self.tail.drain(..self.tail.len() - REPETITION_WINDOW);
+            // shortcut: exact loops up to 256 bytes only; extend if longer or near-repeated loops occur.
+            if (1..=MAX_REPETITION_PERIOD).any(|period| self.tail[period..] == self.tail[..REPETITION_WINDOW - period]) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 // PI Responses IDs contain call_id|item_id; other protocols forbid '|'.
 // Use the entire ID to retain uniqueness, identically on calls and results.
 fn replay_tool_id(id: &str) -> String {
@@ -2018,19 +2043,29 @@ pub async fn stream_chat(
         local_http = local_api_client();
         &local_http
     } else { http };
-    let result = stream_chat_once(
-        http,
-        model,
-        api_key,
-        thinking_level,
-        system_prompt,
-        messages,
-        tools,
-        session_id,
-        cancel,
-        on_event,
-    )
-    .await;
+    let mut text_guard = RepetitionGuard::default();
+    let mut thinking_guard = RepetitionGuard::default();
+    let mut repetitive = false;
+    let repetition = tokio::sync::Notify::new();
+    let result = {
+        let mut guarded = |event| {
+            if repetitive { return; }
+            repetitive = match &event {
+                StreamEvent::TextDelta(delta) => text_guard.push(delta),
+                StreamEvent::ThinkingDelta(delta) => thinking_guard.push(delta),
+                _ => false,
+            };
+            if repetitive { repetition.notify_one(); } else { on_event(event); }
+        };
+        tokio::select! {
+            biased;
+            _ = repetition.notified() => Err(REPETITIVE_OUTPUT_ERROR.into()),
+            result = stream_chat_once(http, model, api_key, thinking_level, system_prompt,
+                messages, tools, session_id, cancel, &mut guarded) => result,
+        }
+    };
+    // 同一网络块可能同时含重复输出和成功终态，不能让后者覆盖熔断。
+    let result = if repetitive { Err(REPETITIVE_OUTPUT_ERROR.into()) } else { result };
     if result.as_ref().map_or(true, |result| matches!(result.stop_reason.as_str(), "aborted" | "error" | "length")) {
         response_state::reset(session_id);
     }

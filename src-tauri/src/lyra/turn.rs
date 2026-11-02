@@ -7,7 +7,7 @@ use crate::lyra::config::Resolved;
 use crate::lyra::context::{ContextWindow, Receipt, Trigger, SUMMARY_OUTPUT_MAX_TOKENS};
 use crate::lyra::history::{now_ms, user_message, History};
 use crate::lyra::prompt::{is_context_window_error, is_output_length_error, is_retryable_provider_error, ShellConfig};
-use crate::lyra::provider::{drop_old_tool_images, is_payload_too_large, is_retryable_stream_error, output_recovery_model, stream_chat, StreamEvent};
+use crate::lyra::provider::{drop_old_tool_images, is_payload_too_large, is_retryable_stream_error, output_recovery_model, stream_chat, StreamEvent, REPETITIVE_OUTPUT_ERROR};
 
 use crate::lyra::tools::{execute, Tool, ToolOutcome};
 use futures_util::{stream::FuturesUnordered, StreamExt};
@@ -410,7 +410,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                         tokio::time::sleep(backoff(retries)).await;
                         continue;
                     }
-                    if crate::lyra::scene::fallback(s) {
+                    if error != REPETITIVE_OUTPUT_ERROR && crate::lyra::scene::fallback(s) {
                         retries = 0;
                         context_recoveries = 0;
                         output_recovery = None;

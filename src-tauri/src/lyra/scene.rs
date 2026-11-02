@@ -493,6 +493,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scene_repetitive_thinking_stops_without_retry_or_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let repeated = Some(vec![json!({"choices":[{"delta":{"reasoning_content":"```\n".repeat(4096)},"finish_reason":"stop"}]})]);
+        let (url, bodies) = capturing_server(vec![repeated, text_reply("next")]).await;
+        let mut s = test_session(url, dir.path().into());
+        s.session_id = "scene-repetitive-thinking".into();
+        install(&mut s);
+        let mut backup = s.model.clone();
+        backup.model.id = "backup".into();
+        s.scenes.as_mut().unwrap().targets.push((Scene::Lightweight, vec![Ok(backup)]));
+        let mut events = Vec::new();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3),
+            run_turn(&mut s, Some(user_message("go", &[])), &mut |e| events.push(e))).await.unwrap();
+        assert_eq!(outcome.error.as_deref(), Some(crate::lyra::provider::REPETITIVE_OUTPUT_ERROR));
+        assert!(!outcome.cancelled && !s.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+        assert!(events.iter().all(|e| !matches!(e, TurnEvent::Retry { .. } | TurnEvent::ToolStart { .. })));
+        assert!(s.history.items().iter().all(|m| m["role"] != "assistant"), "must not feed degenerate output back into the model");
+        let outcome = run_turn(&mut s, Some(user_message("try again", &[])), &mut |_| {}).await;
+        assert!(outcome.error.is_none(), "manual continuation must remain possible: {outcome:?}");
+        let models: Vec<_> = bodies.lock().unwrap().iter().map(|body| serde_json::from_str::<Value>(body).unwrap()["model"].clone()).collect();
+        assert_eq!(models, [json!("m"), json!("m")]);
+    }
+
+    #[tokio::test]
     async fn scene_switch_is_serial_and_never_grants_plan_mode_writes() {
         let dir = tempfile::tempdir().unwrap();
         let mut mixed = call("switch", TOOL, json!({"scene":"coding","message":"task"})).unwrap();
