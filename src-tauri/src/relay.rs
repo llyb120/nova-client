@@ -1,6 +1,6 @@
 //! 团队分享 + 漫游模式的中转客户端。
 //!
-//! 连接关系：v2 普通 HTTP 上行 + SSE 下行。
+//! 连接关系：优先 v2 WebSocket；确认旧服务器不支持时才回退 HTTP 上行 + SSE 下行。
 //! 身份用永久 token 区分（设置里配置）。
 //!
 //! 三种能力：
@@ -443,6 +443,7 @@ impl RelayManager {
 
     async fn connect_once(&self, server: &str, token: &str, name: &str, legacy: &mut bool) -> Result<(), String> {
         self.clear_v2();
+        self.socket.set_legacy(server, token, *legacy);
         let since = self.last_seq.load(Ordering::SeqCst);
         let previous_epoch = self.server_epoch.lock().unwrap().clone();
         let url = sse_url(server, since, &previous_epoch)?;
@@ -457,6 +458,7 @@ impl RelayManager {
                 return self.socket.run(socket, server, token, |frame| self.on_v2_frame(frame), || self.connection_ready("WebSocket")).await;
             }
             *legacy = true;
+            self.socket.set_legacy(server, token, true);
             self.log("[relay] 服务端未提供 /v2/ws，回退 HTTP + SSE".into());
         }
         let request = self

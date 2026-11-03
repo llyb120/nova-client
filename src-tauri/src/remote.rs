@@ -308,9 +308,9 @@ async fn remote_sse_loop(
     let mut backoff = Duration::from_secs(1);
     let mut changes = socket.subscribe();
     loop {
-        // WS 承载同样的 remote.device 帧；接通后撤掉辅助 SSE，不保留重复长连接。
+        // 未确认旧协议前等待主 WS（包括重连），不能自行另开 HTTP/SSE 通道。
         changes.borrow_and_update();
-        if socket.connected(&cfg.server, &cfg.token) {
+        if !socket.legacy(&cfg.server, &cfg.token) {
             tokio::select! {
                 _ = incoming.closed() => return,
                 _ = changes.changed() => continue,
@@ -959,6 +959,9 @@ mod transport_tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let socket = crate::relay_socket::RelaySocket::new();
         let transport = start_transport(RemoteConfig { server: base.clone(), token: "test".into(), name: "test".into(), proxy: String::new(), device_id: "test-device".into() }, socket.clone());
+        let auxiliary = transport.start_command_sse();
+        assert!(transport.sync(json!({"kind":"full","revision":1})).await.is_err());
+        assert!(timeout(Duration::from_millis(100), listener.accept()).await.is_err(), "WS pending: must not open HTTP/SSE connection");
         let (client, server) = tokio::io::duplex(16384);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -980,17 +983,52 @@ mod transport_tests {
             }, || { let _ = ready_tx.send(()); }).await
         });
         ready_rx.await.unwrap();
-        let auxiliary = transport.start_command_sse();
         let response = timeout(Duration::from_secs(3), transport.sync(json!({"kind":"full","revision":1}))).await.unwrap().unwrap();
         assert_eq!(response.revision, 1);
         let pushed = timeout(Duration::from_secs(3), transport.pull()).await.unwrap().unwrap();
         assert_eq!(pushed.requested_thread_ids, vec!["thread-1"]);
         assert!(timeout(Duration::from_millis(100), listener.accept()).await.is_err(), "WS active: must not open HTTP/SSE connection");
-        auxiliary.abort();
-        let _ = auxiliary.await;
         stop_tx.send(()).unwrap();
         peer.await.unwrap();
         assert!(runner.await.unwrap().is_err());
+        assert!(transport.sync(json!({"kind":"full","revision":2})).await.is_err());
+        assert!(timeout(Duration::from_millis(100), listener.accept()).await.is_err(), "WS reconnecting: must not open HTTP/SSE connection");
+        auxiliary.abort();
+        let _ = auxiliary.await;
+    }
+
+    #[tokio::test]
+    async fn confirmed_legacy_server_keeps_http_remote_sync() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let socket = crate::relay_socket::RelaySocket::new();
+        socket.set_legacy(&base, "test", true);
+        let mut transport = start_transport(RemoteConfig { server: base, token: "test".into(), name: "test".into(), proxy: String::new(), device_id: "test-device".into() }, socket);
+        transport.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+                assert!(headers.len() < 4096);
+            }
+            assert!(headers.starts_with(b"POST /v2/remote/sync HTTP/1.1\r\n"));
+            let headers = String::from_utf8(headers).unwrap();
+            let length: usize = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+            }).unwrap();
+            assert!(length < 1024);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["revision"], 1);
+            let body = r#"{"revision":1,"commands":[]}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let response = timeout(Duration::from_secs(3), transport.sync(json!({"revision":1}))).await.unwrap().unwrap();
+        assert_eq!(response.revision, 1);
+        peer.await.unwrap();
     }
 }
 

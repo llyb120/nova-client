@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tokio_tungstenite::{tungstenite::{handshake::{derive_accept_key, client::generate_key}, protocol::{Message, Role, WebSocketConfig}}, WebSocketStream};
+use tokio_tungstenite::{tungstenite::{client::IntoClientRequest, handshake::{derive_accept_key, client::generate_key}, protocol::{Message, Role, WebSocketConfig}, Error as WsError}, WebSocketStream};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -20,26 +20,45 @@ struct Connection { server: String, token: String, sender: mpsc::Sender<Request>
 
 pub struct RelaySocket {
     connection: Mutex<Option<Connection>>,
+    legacy: Mutex<Option<(String, String)>>,
     changes: watch::Sender<()>,
 }
 
 impl RelaySocket {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { connection: Mutex::new(None), changes: watch::channel(()).0 })
+        Arc::new(Self { connection: Mutex::new(None), legacy: Mutex::new(None), changes: watch::channel(()).0 })
     }
 
     pub fn subscribe(&self) -> watch::Receiver<()> { self.changes.subscribe() }
 
+    #[cfg(test)]
     pub fn connected(&self, server: &str, token: &str) -> bool {
         self.connection.lock().unwrap().as_ref()
             .is_some_and(|c| c.server == server && c.token == token && !c.sender.is_closed())
     }
 
-    /// None means no matching connection, so legacy HTTP may be used. An attempted WS call
-    /// returns Some(Err) on failure: never replay it over HTTP with a new business identity.
+    pub fn legacy(&self, server: &str, token: &str) -> bool {
+        self.legacy.lock().unwrap().as_ref().is_some_and(|(s, t)| s == server && t == token)
+    }
+
+    pub fn set_legacy(&self, server: &str, token: &str, enabled: bool) {
+        let next = enabled.then(|| (server.to_string(), token.to_string()));
+        let mut legacy = self.legacy.lock().unwrap();
+        if *legacy != next {
+            *legacy = next;
+            self.changes.send_replace(());
+        }
+    }
+
+    /// None permits HTTP only after an explicit legacy downgrade. A missing/reconnecting WS
+    /// returns Some(Err): never replay an unconfirmed WS call over HTTP.
     pub async fn request(&self, server: &str, token: &str, mut frame: Value) -> Option<Result<Value, String>> {
         let sender = self.connection.lock().unwrap().as_ref()
-            .filter(|c| c.server == server && c.token == token).map(|c| c.sender.clone())?;
+            .filter(|c| c.server == server && c.token == token).map(|c| c.sender.clone());
+        let Some(sender) = sender else {
+            return if self.legacy(server, token) { None }
+                else { Some(Err("中转站 WebSocket 未就绪，本次未发送".into())) };
+        };
         frame["requestId"] = Value::String(uuid::Uuid::new_v4().to_string());
         let (reply, result) = oneshot::channel();
         Some(timeout(REQUEST_TIMEOUT, async {
@@ -55,6 +74,7 @@ impl RelaySocket {
             .ok_or("WS 在 ready 前关闭")?.map_err(|e| e.to_string())?;
         let ready = decode_message(first)?;
         if ready["op"] != "ready" || ready["version"] != 2 { return Err("无效的 WS ready".into()); }
+        self.set_legacy(server, token, false);
         on_event(ready);
         let (sender, mut requests) = mpsc::channel::<Request>(MAX_PENDING);
         let _guard = ConnectionGuard { owner: self, sender: sender.clone() };
@@ -137,14 +157,25 @@ fn decode_message(message: Message) -> Result<Value, String> {
     }
 }
 
-/// Use reqwest upgrade so HTTP proxies, TLS certificate checks and system proxy settings
-/// remain identical to the existing HTTP/SSE stack. Only explicit unsupported statuses fall back.
+/// Keep reqwest's system proxy and TLS validation; tunnel plain WS through HTTP proxies
+/// because forwarding Upgrade as an ordinary HTTP request can strip the upgrade headers.
 pub async fn upgrade(request: reqwest::RequestBuilder) -> Result<Option<WebSocketStream<reqwest::Upgraded>>, String> {
     let key = generate_key();
-    let response = timeout(WRITE_TIMEOUT, request.version(reqwest::Version::HTTP_11)
+    let (client, request) = request.version(reqwest::Version::HTTP_11)
         .header("Connection", "Upgrade").header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13").header("Sec-WebSocket-Key", &key)
-        .header("Accept-Encoding", "identity").send()).await
+        .header("Accept-Encoding", "identity").build_split();
+    let request = request.map_err(|e| e.to_string())?;
+    let uri = request.url().as_str().parse().map_err(|e| format!("无效的 WS 地址：{e}"))?;
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(SSE_MAX_EVENT_BYTES);
+    config.max_frame_size = Some(SSE_MAX_EVENT_BYTES);
+    if request.url().scheme() == "http"
+        && hyper_util::client::proxy::matcher::Matcher::from_system().intercept(&uri)
+            .is_some_and(|proxy| matches!(proxy.uri().scheme_str(), Some("http" | "https"))) {
+        return upgrade_via_proxy(client, request, config).await;
+    }
+    let response = timeout(WRITE_TIMEOUT, client.execute(request)).await
         .map_err(|_| "建立 WS 超时")?.map_err(|e| e.to_string())?;
     if matches!(response.status().as_u16(), 404 | 405 | 426 | 501) { return Ok(None); }
     if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS { return Err(format!("WS 握手返回 HTTP {}", response.status())); }
@@ -155,10 +186,26 @@ pub async fn upgrade(request: reqwest::RequestBuilder) -> Result<Option<WebSocke
         return Err("WS 握手校验失败".into());
     }
     let stream = response.upgrade().await.map_err(|e| e.to_string())?;
-    let mut config = WebSocketConfig::default();
-    config.max_message_size = Some(SSE_MAX_EVENT_BYTES);
-    config.max_frame_size = Some(SSE_MAX_EVENT_BYTES);
     Ok(Some(WebSocketStream::from_raw_socket(stream, Role::Client, Some(config)).await))
+}
+
+async fn upgrade_via_proxy(client: reqwest::Client, request: reqwest::Request, config: WebSocketConfig) -> Result<Option<WebSocketStream<reqwest::Upgraded>>, String> {
+    // The relay Authorization header belongs inside the tunnel, never on CONNECT.
+    let response = timeout(WRITE_TIMEOUT, client.request(reqwest::Method::CONNECT, request.url().origin().ascii_serialization())
+        .version(reqwest::Version::HTTP_11).send()).await
+        .map_err(|_| "WS 代理 CONNECT 超时")?.map_err(|e| e.to_string())?;
+    if !response.status().is_success() { return Err(format!("WS 代理 CONNECT 返回 HTTP {}", response.status())); }
+    let stream = response.upgrade().await.map_err(|e| e.to_string())?;
+    let mut url = request.url().clone();
+    url.set_scheme("ws").map_err(|_| "无效的 WS 地址")?;
+    let mut handshake = url.as_str().into_client_request().map_err(|e| e.to_string())?;
+    handshake.headers_mut().extend(request.headers().clone());
+    match timeout(WRITE_TIMEOUT, tokio_tungstenite::client_async_with_config(handshake, stream, Some(config))).await
+        .map_err(|_| "WS 代理隧道握手超时")? {
+        Ok((socket, _)) => Ok(Some(socket)),
+        Err(WsError::Http(response)) if matches!(response.status().as_u16(), 404 | 405 | 426 | 501) => Ok(None),
+        Err(error) => Err(format!("WS 代理隧道握手失败：{error}")),
+    }
 }
 
 #[cfg(test)]
@@ -174,6 +221,49 @@ mod tests {
             Message::Binary(bytes) => serde_json::from_reader(flate2::read::GzDecoder::new(&bytes[..])).unwrap(),
             _ => panic!("unexpected message"),
         }
+    }
+
+    #[tokio::test]
+    async fn http_fallback_requires_explicit_matching_legacy_server() {
+        let socket = RelaySocket::new();
+        assert!(socket.request("server", "token", json!({})).await.unwrap().is_err());
+        socket.set_legacy("server", "token", true);
+        assert!(socket.request("server", "token", json!({})).await.is_none());
+        assert!(socket.request("other-server", "token", json!({})).await.unwrap().is_err());
+        assert!(socket.request("server", "other-token", json!({})).await.unwrap().is_err());
+        socket.set_legacy("server", "token", false);
+        assert!(socket.request("server", "token", json!({})).await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn http_proxy_tunnels_upgrade_without_sending_relay_auth_on_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+                assert!(headers.len() < 4096);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            assert!(headers.starts_with("CONNECT relay.invalid:8320 HTTP/1.1\r\n"));
+            assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+            stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(stream, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                assert_eq!(request.uri(), "/v2/ws?since=7");
+                assert_eq!(request.headers()["Authorization"], "Bearer test");
+                assert_eq!(request.headers()["X-Relay-Device"], "test-device");
+                Ok(response)
+            }).await.unwrap();
+            ws.send(Message::Text(json!({"version":2,"op":"ready"}).to_string().into())).await.unwrap();
+        });
+        let client = reqwest::Client::builder().proxy(reqwest::Proxy::http(proxy).unwrap()).build().unwrap();
+        let request = client.get("http://relay.invalid:8320/v2/ws?since=7")
+            .bearer_auth("test").header("X-Relay-Device", "test-device").build().unwrap();
+        let mut ws = timeout(Duration::from_secs(3), upgrade_via_proxy(client, request, WebSocketConfig::default())).await.unwrap().unwrap().unwrap();
+        assert_eq!(decode_message(ws.next().await.unwrap().unwrap()).unwrap()["op"], "ready");
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -213,7 +303,7 @@ mod tests {
             socket.run(stream, &base, "test", |event| { events_tx.send(event).unwrap(); }, || { let _ = ready_tx.send(()); }).await
         }) };
         ready_rx.await.unwrap();
-        assert!(socket.request(&base, "other-token", json!({})).await.is_none());
+        assert!(socket.request(&base, "other-token", json!({})).await.unwrap().is_err());
         let first = json!({"version":2,"op":"send", "data":"one"});
         let second = json!({"version":2,"op":"remote.sync", "data":"中文".repeat(1024)});
         let (a, b) = tokio::join!(socket.request(&base, "test", first.clone()), socket.request(&base, "test", second.clone()));
