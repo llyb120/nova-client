@@ -46,6 +46,27 @@ test("Composer 带上下文用量重新挂载时先初始化模型依赖，保�
   }
 });
 
+test("Composer 回复结束后保留上下文用量，仅在运行中显示计时和速度", () => {
+  const file = ts.createSourceFile("Composer.tsx", readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let stats;
+  const visit = node => {
+    if (ts.isJsxElement(node) && node.openingElement.attributes.properties.some(attr => attr.getText(file) === 'class="composer-run-stats"')) stats = node.parent;
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.ok(stats);
+  const code = transformSync(`const view = ${stats.getText(file)};`, { loader: "tsx", jsxFactory: "h", jsxFragment: "Fragment", target: "esnext" }).code;
+  const render = new Function("h", "Show", "Fragment", "running", "contextUsage", "runElapsed", "tokenSpeed", "fmtTokens", "formatContextTokens", `${code}; return view;`);
+  const h = (tag, props, ...children) => typeof tag === "function" ? tag({ ...props, children }) : children.join("");
+  const Show = ({ when, children }) => when ? children.map(child => typeof child === "function" ? child(() => when) : child).join("") : "";
+  for (const running of [true, false]) for (const used of [null, 0, 128000]) {
+    const usage = used === null ? null : { used, limit: 1000000 };
+    const context = usage ? `${used}/1000000` : "";
+    const text = render(h, Show, "fragment", () => running, () => usage, () => "1:23", () => 35, String, String);
+    assert.equal(text, running ? `1:23·${context ? `${context}·` : ""}≈35 tok/s` : context);
+  }
+});
+
 test("文件面板开关跨会话保持，重新挂载恢复全局偏好", () => {
   const chat = readFileSync(new URL("../src/components/ChatView.tsx", import.meta.url), "utf8");
   const source = chat.slice(chat.indexOf("  const workspaceOpen ="), chat.indexOf("  const previewFile ="));

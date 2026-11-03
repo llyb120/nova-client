@@ -677,24 +677,28 @@ export function Composer() {
           disabled={running()}
         />
         <LayoutPicker threadId={state.currentId} />
-        <Show when={running()}>
-          <span class="composer-run-stats" title={`本轮已运行 ${runElapsed()}`}>
-            <span class="composer-run-dot" aria-hidden="true" />
-            <span>{runElapsed()}</span>
+        <Show when={running() || contextUsage()}>
+          <span class="composer-run-stats">
+            <Show when={running()}>
+              <span class="composer-run-dot" aria-hidden="true" />
+              <span title={`本轮已运行 ${runElapsed()}`}>{runElapsed()}</span>
+            </Show>
             <Show when={contextUsage()}>
               {usage => (
                 <>
-                  <span class="composer-run-sep">·</span>
+                  <Show when={running()}><span class="composer-run-sep">·</span></Show>
                   <span title={`上下文 ${fmtTokens(usage().used)} / ${fmtTokens(usage().limit)} tokens（最近一次模型请求）`}>
                     {formatContextTokens(usage().used)}/{formatContextTokens(usage().limit)}
                   </span>
                 </>
               )}
             </Show>
-            <span class="composer-run-sep">·</span>
-            <span title="实时输出速度：优先采用服务端 output tokens / 模型请求耗时（含 Thinking）；首次用量上报前为文本估算，不含工具执行等待。">
-              ≈{tokenSpeed()} tok/s
-            </span>
+            <Show when={running()}>
+              <span class="composer-run-sep">·</span>
+              <span title="实时输出速度：优先采用服务端 output tokens / 模型请求耗时（含 Thinking）；首次用量上报前为文本估算，不含工具执行等待。">
+                ≈{tokenSpeed()} tok/s
+              </span>
+            </Show>
           </span>
         </Show>
         <div class="composer-actions">
