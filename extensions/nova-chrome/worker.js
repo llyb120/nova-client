@@ -1,6 +1,6 @@
 // Only Nova's authenticated loopback receiver supplies commands. Never infer a target from the active tab.
 let model, loading;
-const loops = new Set(), connections = new Set();
+const loops = new Set(), connections = new Set(), reconnects = new Map();
 // Paired instances (origin -> authenticated post), available before the first long poll returns.
 const instances = new Map();
 // ponytail: serialize individual browser commands across instances; use per-tab queues if contention grows.
@@ -264,6 +264,7 @@ function loop() {
 const newer = (a, b) => { const [x, y] = [a, b].map(v => v.split('.').map(Number)); for (let i = 0; i < 4; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); return false; };
 async function connect(origin, attempt = 0) {
   if (loops.has(origin)) return;
+  clearTimeout(reconnects.get(origin)); reconnects.delete(origin);
   loops.add(origin);
   try {
     await ready(); await inventory();
@@ -279,6 +280,7 @@ async function connect(origin, attempt = 0) {
       if (!response.ok) throw Object.assign(Error(`连接被拒绝 HTTP ${response.status}；检查是否连接了另一个 Chrome 实例`),{conflict:response.status===409});
       connections.add(origin);
       const {command, version} = await response.json();
+      attempt = 0;
       // Nova rewrites the unpacked files on update; every browser profile reloads itself once per target version.
       if (version && newer(version, chrome.runtime.getManifest().version) && (await chrome.storage.local.get('reloadedFor')).reloadedFor !== version) {
         await chrome.storage.local.set({reloadedFor: version});
@@ -295,9 +297,9 @@ async function connect(origin, attempt = 0) {
       if(!delivered.ok)throw Error(`结果回传失败 HTTP ${delivered.status}；不重放操作`);
     }
   } catch (error) {
-    // Reloading the extension clears session storage, so Nova sees a new clientId and keeps
-    // the old one for 45s: retry for ~60s instead of waiting for alarms. Never replay a command.
-    if (error?.conflict && attempt < 12) setTimeout(() => void connect(origin, attempt + 1), 5000);
+    // Reconnect transport after ordinary failures too; never resend an executed command.
+    if (attempt < 12) reconnects.set(origin, setTimeout(() => void connect(origin, attempt + 1),
+      error?.conflict ? 5000 : Math.min(500 * 2 ** attempt, 5000)));
   } finally { connections.delete(origin); instances.delete(origin); loops.delete(origin); }
 }
 chrome.debugger.onEvent.addListener((source,method,params)=>{

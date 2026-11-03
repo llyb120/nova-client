@@ -1,4 +1,8 @@
-import {test} from 'node:test';
+import {test,afterEach} from 'node:test';
+const timers=new Set();
+const setTimeout=(fn,ms,...args)=>{const timer=globalThis.setTimeout(fn,ms,...args);timers.add(timer);return timer;};
+const clearTimeout=timer=>{timers.delete(timer);globalThis.clearTimeout(timer);};
+afterEach(async()=>{await new Promise(resolve=>setImmediate(resolve));for(const timer of timers)globalThis.clearTimeout(timer);timers.clear();});
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {runInNewContext} from 'node:vm';
@@ -27,9 +31,9 @@ test('native downloads expose progress, interruption and completion without tab 
   const schema=JSON.parse(await readFile(new URL('../../scripts/chrome-tool.json',import.meta.url),'utf8'));
   assert.ok(schema.inputSchema.properties.operation.enum.includes('downloads'));
   assert.ok(schema.inputSchema.properties.operation.enum.includes('devtools'));
-  assert.match(schema.description,/jianlai.*F12/);
+  assert.match(schema.inputSchema.properties.devtools.description,/jianlai.*F12/);
   assert.equal(schema.inputSchema.properties.downloadId.type,'string');
-  assert.match(schema.description,/只有state=complete才算完成/);
+  assert.match(done.notice,/state=complete/);
 });
 
 test('screenshots reveal a minimized window or background tab instead of hanging',async()=>{
@@ -257,6 +261,35 @@ test('multiple Nova instances route replies independently, serialize commands an
   assert.equal(replies.filter(value=>value.port===47653).length,1,'failed delivery is never replayed');
 });
 
+test('ordinary poll and reply failures reconnect automatically without replaying input',async()=>{
+  const event=()=>({addListener(){}}), delays=[];
+  let pairs=0,polls=0,replies=0,inputs=0;
+  const chrome={extension:{isAllowedIncognitoAccess:async()=>false},
+    storage:{session:{get:async()=>({}),set:async()=>{}}},
+    tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event(),onUpdated:event()},
+    debugger:{attach:async()=>{},sendCommand:async()=>{inputs++;return {};},onDetach:event(),onEvent:event()},
+    runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,clearTimeout,setTimeout:(fn,ms)=>{
+    if(ms===500){delays.push(ms);return setTimeout(fn,1);}return setTimeout(fn,ms);
+  },fetch:async(url)=>{
+    const endpoint=new URL(url);
+    if(endpoint.port!=='47653')return new Promise(()=>{});
+    if(endpoint.pathname==='/pair'){pairs++;return {ok:true,json:async()=>({token:'t'.repeat(32)})};}
+    if(endpoint.pathname==='/reply'){replies++;throw Error('reply connection lost');}
+    polls++;
+    if(polls===1)throw Error('poll connection lost');
+    if(polls>2)return new Promise(()=>{});
+    const [tab]=await scope.api.inventory();
+    return {ok:true,json:async()=>({command:{id:'once',operation:'cdp',args:{tabTag:tab.tag,method:'Input.insertText',params:{text:'once'}},expiresAt:Date.now()+3000}})};
+  }};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={inventory};',scope);
+  for(let i=0;i<100 && polls<3;i++)await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(pairs,3,'both ordinary failures recover without an alarm or manual reconnect');
+  assert.equal(inputs,1,'losing a reply must not resend browser input');
+  assert.equal(replies,1);
+  assert.deepEqual(delays,[500,500],'a successful poll resets reconnect backoff');
+});
+
 test('after a reload Nova still holds the old clientId: retry soon instead of waiting for the alarm',async()=>{
   const event=()=>({addListener(){}});let polls=0;
   const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>[],onRemoved:event(),onReplaced:event(),onUpdated:event()},
@@ -285,7 +318,7 @@ test('incognito permission, window isolation and tab filtering',async()=>{
   runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={execute};',scope);
   const run=(operation,args={})=>scope.api.execute({operation,args,expiresAt:Date.now()+3000});
   assert.equal((await run('status')).incognitoAllowed,false);
-  assert.equal((await run('reload')).reloading,true);
+  assert.equal((await run('reload',{extension:true})).reloading,true);
   assert.equal(reloads,0,'reply first, reload after');
   await new Promise(resolve=>setTimeout(resolve,400));
   assert.equal(reloads,1);
