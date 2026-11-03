@@ -24,7 +24,7 @@ api.previewWorkspaceFile = async (_, path) => path.endsWith('.zip')
   ? {path,kind:'external',text:null,size:78000}
   : {path:file.path,kind:'markdown',text:'# Explorer preview',size:18};
 api.openInExplorer = async path => { window.revealedPath = path; };
-const [request, setRequest] = createSignal(null);
+const [request, setRequest] = createSignal({path:file.path});
 window.openTestFile = path => setRequest({path});
 flush(() => setState(s => { Object.assign(s, {currentId:'explorer-check',cwd:'/project',items:[]}); }));
 setWorkspaceLayout({open:true,mode:'files',widthRatio:.65});
@@ -37,7 +37,10 @@ render(() => <div style="display:flex;height:100vh;width:100vw"><main style="fle
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto(`${server.resolvedUrls.local[0]}${name}.html`);
+  await page.getByRole('heading', { name: 'Explorer preview' }).waitFor();
   const tree = page.getByRole('tree', { name: '项目文件树' });
+  assert.equal(await tree.count(), 0, 'opening a preview does not expand the file list by default');
+  await page.getByRole('button', { name: '文件', exact: true }).click();
   await tree.getByRole('treeitem', { name: 'docs', exact: true }).click();
   await tree.getByRole('treeitem', { name: 'readme.md' }).click();
   await page.getByRole('heading', { name: 'Explorer preview' }).waitFor();
@@ -73,6 +76,9 @@ render(() => <div style="display:flex;height:100vh;width:100vw"><main style="fle
   assert.equal(await tree.getByRole('treeitem').count(), 1);
   await page.getByRole('button', { name: '切换目录栏' }).click();
   assert.equal(await picker.count(), 0);
+  await page.evaluate(() => window.openTestFile('/project/docs/readme.md'));
+  await page.getByRole('heading', { name: 'Explorer preview' }).waitFor();
+  assert.equal(await picker.count(), 0, 'another preview request keeps the file list collapsed');
   await page.getByRole('button', { name: '打开文件', exact: true }).click();
   assert.equal(await picker.isVisible(), true);
   if (process.env.TEST_SCREENSHOT) {

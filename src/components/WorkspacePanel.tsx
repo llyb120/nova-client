@@ -69,7 +69,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const [draft, setDraft] = createSignal("");
   const [original, setOriginal] = createSignal("");
   const [saving, setSaving] = createSignal(false);
-  const [browse, setBrowse] = createSignal(remembered?.browse ?? true);
+  const [browse, setBrowse] = createSignal(remembered?.browse ?? false);
   const [treeWidth, setTreeWidth] = createSignal(38);
   const [saved, setSaved] = createSignal(false);
   const [closing, setClosing] = createSignal<string>();
