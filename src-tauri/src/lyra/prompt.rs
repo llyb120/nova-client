@@ -158,6 +158,7 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "provider finish_reason",
     "provider stop_reason",
     "provider returned no actionable output",
+    "codebuddy 工具 json 参数无效，未执行工具",
     "error decoding response body",
     "idle timeout",
     "sse 连续",
@@ -708,6 +709,18 @@ mod tests {
             "provider stream idle timeout: 90s 无增量事件"
         ));
         assert!(!is_retryable_provider_error("invalid api key"));
+    }
+
+    #[test]
+    fn retries_only_undispatched_codebuddy_json_errors() {
+        assert!(is_retryable_provider_error(
+            "Lyra provider 请求失败：CodeBuddy 工具 JSON 参数无效，未执行工具"
+        ));
+        for error in ["CodeBuddy 工具名称无效，未执行工具", "CodeBuddy 工具参数快照冲突，未执行工具",
+            "CodeBuddy 工具参数缺失，未执行工具", "CodeBuddy 当前模型不支持工具调用",
+            "Devin 工具参数不是完整 JSON 对象，未执行工具"] {
+            assert!(!is_retryable_provider_error(error), "{error}");
+        }
     }
 
 

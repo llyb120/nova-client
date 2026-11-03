@@ -448,6 +448,17 @@ mod tests {
         let wrapped = tool(0,Some("a"),"re",&serde_json::to_string("{\"path\":\"a\"}").unwrap())
             + &tool(0,Some("later-id"),"ad","")
             + &tool(1,Some("b"),"read","{\"path\":\"b\"}");
+        let nested = tool(0,Some("a"),"read",r#"{"meta":"#)
+            + &tool(0,None,"",r#"{"meta":"safe"}"#)
+            + &tool(0,None,"",r#", "path":"a"}"#)
+            + &tool(1,Some("b"),"read",r#"{"path":"b"}"#);
+        let snapshot = |path: &str| delta(json!({"tool_calls":[{"index":0,"function":{"arguments":{"path":path}}}]}));
+        let snapshots = tool(0,Some("a"),"read",r#"{"path":"#)
+            + &tool(0,None,"",r#"{"path":"a"}"#)
+            + &tool(0,None,"",r#"{"path":"a"}"#)
+            + &snapshot("a")
+            + &tool(1,Some("b"),"read",r#"{"path":"b"}"#);
+        let conflict = tool(0,Some("a"),"read",r#"{"path":"a"}"#) + &snapshot("other");
         for (wire, good, effort, summary) in [
             (success.clone(),true,None,None),
             (success.clone(),true,Some("high"),None),
@@ -455,8 +466,12 @@ mod tests {
             (success,true,Some("high"),Some("detailed")),
             (delta(json!({"reasoning_content":"思考"}))+&repeated+&ending+&usage+"data: [DONE]\r\n\r\n",true,None,None),
             (delta(json!({"reasoning_content":"思考"}))+&wrapped+&ending+&usage+"data: [DONE]\r\n\r\n",true,None,None),
+            (delta(json!({"reasoning_content":"思考"}))+&nested+&ending+&usage+"data: [DONE]\r\n\r\n",true,None,None),
+            (delta(json!({"reasoning_content":"思考"}))+&snapshots+&ending+&usage+"data: [DONE]\r\n\r\n",true,None,None),
+            (conflict+&ending+"data: [DONE]\r\n\r\n",false,None,None),
             (calls.clone()+&ending,false,None,None),
             (tool(0,Some("a"),"read","{")+&ending+"data: [DONE]\r\n\r\n",false,None,None),
+            (tool(0,Some("a"),"read",r#"{"path":"a"}"#)+&tool(1,Some("b"),"read","{")+&ending+"data: [DONE]\r\n\r\n",false,None,None),
             (sse(json!({"error":{"message":"upstream-secret"}}))+"data: [DONE]\r\n\r\n",false,None,None),
             ("data: malformed\r\n\r\ndata: [DONE]\r\n\r\n".into(),false,None,None),
         ] {
@@ -503,7 +518,9 @@ mod tests {
                 assert_ne!(calls[0]["id"], calls[1]["id"]);
                 assert_eq!(events.iter().filter(|e|matches!(e,StreamEvent::ToolCallDone{..})).count(),2);
             } else {
-                assert!(!result.unwrap_err().contains("upstream-secret"));
+                let error = result.unwrap_err();
+                assert!(!error.contains("upstream-secret"));
+                if error.contains("工具 JSON 参数无效") { assert!(super::super::prompt::is_retryable_provider_error(&error)); }
                 assert!(!events.iter().any(|e|matches!(e,StreamEvent::ToolCallDone{..})));
             }
             let captured = server.join().unwrap(); assert_eq!(captured["model"],"test"); assert_eq!(captured["max_tokens"],1024);

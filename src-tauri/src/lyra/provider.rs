@@ -1065,10 +1065,12 @@ pub(super) fn push_delta(
     }
 }
 
+#[derive(Default)]
 struct ToolCallAccum {
     id: String,
     name: String,
     arguments: String,
+    argument_deltas: String,
 }
 
 /// 只解开可证明的重复封装，不补全缺失字段或截断的 JSON。
@@ -1088,10 +1090,19 @@ pub(super) fn parse_native_tool_arguments(raw: &str) -> Option<Value> {
     (second == first).then_some(first)
 }
 
+// 快照兼容不能覆盖合法增量；两种合并都有效但结果不同时拒绝猜测。
+fn parse_codebuddy_arguments(call: &ToolCallAccum) -> Option<Value> {
+    match (parse_native_tool_arguments(&call.argument_deltas), parse_native_tool_arguments(&call.arguments)) {
+        (Some(deltas), Some(snapshot)) if deltas != snapshot => None,
+        (Some(arguments), _) | (_, Some(arguments)) => Some(arguments),
+        _ => None,
+    }
+}
+
 /// CodeBuddy 的 index 才是分片的稳定键；ID、完整名称/参数快照可能在后续帧重复。
 fn merge_codebuddy_call(calls: &mut Vec<ToolCallAccum>, index: usize, call: &Value, tools: &[Value]) -> Result<(), String> {
     if index >= 4096 { return Err("provider tool index 无效".into()); }
-    while calls.len() <= index { calls.push(ToolCallAccum { id: String::new(), name: String::new(), arguments: String::new() }); }
+    while calls.len() <= index { calls.push(ToolCallAccum::default()); }
     let accum = &mut calls[index];
     if accum.id.is_empty() {
         if let Some(id) = call.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) { accum.id = id.into(); }
@@ -1107,14 +1118,16 @@ fn merge_codebuddy_call(calls: &mut Vec<ToolCallAccum>, index: usize, call: &Val
     }
     match call.pointer("/function/arguments") {
         Some(Value::String(delta)) if !delta.is_empty() => {
+            accum.argument_deltas.push_str(delta);
             if accum.arguments.is_empty() || delta.starts_with(&accum.arguments) { accum.arguments = delta.clone(); }
             else if accum.arguments != *delta { accum.arguments.push_str(delta); }
         }
         Some(value @ Value::Object(_)) => {
-            if !accum.arguments.is_empty() && parse_native_tool_arguments(&accum.arguments).is_none() {
+            if !accum.arguments.is_empty() && parse_codebuddy_arguments(accum).as_ref() != Some(value) {
                 return Err("CodeBuddy 工具参数快照冲突，未执行工具".into());
             }
             accum.arguments = value.to_string();
+            accum.argument_deltas = accum.arguments.clone();
         }
         None | Some(Value::Null) | Some(Value::String(_)) => {}
         _ => return Err("CodeBuddy 工具参数格式无效，未执行工具".into()),
@@ -1131,7 +1144,7 @@ fn codebuddy_arguments(call: &ToolCallAccum, tools: &[Value]) -> Result<Value, S
         }
         return Ok(json!({}));
     }
-    parse_native_tool_arguments(&call.arguments).ok_or_else(|| "CodeBuddy 工具 JSON 参数无效，未执行工具".into())
+    parse_codebuddy_arguments(call).ok_or_else(|| "CodeBuddy 工具 JSON 参数无效，未执行工具".into())
 }
 
 fn completions_usage(usage: &Value) -> Value {
@@ -1296,6 +1309,7 @@ pub(super) async fn stream_completions(
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .into(),
+                        ..Default::default()
                     });
                 }
             }
@@ -1333,11 +1347,7 @@ pub(super) async fn stream_completions(
                         }
                     }
                     while calls.len() <= index {
-                        calls.push(ToolCallAccum {
-                            id: String::new(),
-                            name: String::new(),
-                            arguments: String::new(),
-                        });
+                        calls.push(ToolCallAccum::default());
                     }
                     if strict { merge_codebuddy_call(&mut calls, index, call, &supplied_tools)?; continue; }
                     let accum = &mut calls[index];
@@ -1613,6 +1623,7 @@ async fn stream_responses_once(
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .into(),
+                        ..Default::default()
                     });
                     call_indices.insert(value.get("output_index").and_then(Value::as_u64).unwrap_or(0), calls.len() - 1);
                 }
@@ -2712,6 +2723,25 @@ mod tests {
     use super::*;
     use crate::lyra::config::ResolvedModel;
     use serde_json::Map;
+
+    #[test]
+    fn codebuddy_preserves_argument_deltas_at_every_split_and_rejects_ambiguity() {
+        let arguments = r#"{"meta":{"meta":"safe"},"path":"a"}"#;
+        let expected: Value = serde_json::from_str(arguments).unwrap();
+        let tools = [json!({"function":{"name":"read","parameters":{"type":"object"}}})];
+        for first in 1..arguments.len() {
+            for second in first + 1..arguments.len() {
+                let mut calls = Vec::new();
+                for part in [&arguments[..first], &arguments[first..second], &arguments[second..]] {
+                    merge_codebuddy_call(&mut calls, 0, &json!({"function":{"name":"read","arguments":part}}), &tools).unwrap();
+                }
+                assert_eq!(codebuddy_arguments(&calls[0], &tools).unwrap(), expected, "splits: {first}, {second}");
+            }
+        }
+        let ambiguous = ToolCallAccum { arguments: r#"{"path":"a"}"#.into(),
+            argument_deltas: r#"{"path":"b"}"#.into(), ..Default::default() };
+        assert!(parse_codebuddy_arguments(&ambiguous).is_none());
+    }
 
     #[test]
     fn tool_payloads_preserve_optional_automation_arguments() {
