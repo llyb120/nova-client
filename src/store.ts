@@ -576,13 +576,16 @@ export function openNewSession(quote = "") {
     // worktree 会话的 state.cwd 已指向 worktree 工作目录，新会话应留在同一 worktree；
     // 只有 cwd 缺失时才回退到源仓库（后端也会按已知 worktree 目录补齐标注）。
     const cwd = state.cwd || meta?.worktree?.repo || "";
+    // 临时目录不复用：否则多次「新会话」会把互不相关的任务堆在同一个临时目录里。
+    const freshScratch = isScratch(cwd);
     const seed: PendingNewSessionSeed = {
-      cwd,
+      cwd: freshScratch ? "" : cwd,
       agentKind: state.agentKind,
       model: state.model,
       mode: state.mode,
       reasoningEffort: state.reasoningEffort,
       roam: null,
+      freshScratch,
       quote: quote.trim(),
     };
     if (meta?.roamingRole === "guest" && state.roamingPeer) {

@@ -320,6 +320,8 @@ export interface PendingNewSessionSeed {
   mode: string;
   reasoningEffort: string;
   roam: { peerToken: string; folder: string } | null;
+  /** 源会话在临时目录里：新会话另建一个临时目录，不继承源目录。 */
+  freshScratch: boolean;
   /** 快捷键触发时，聊天记录中选中的引用文本。 */
   quote: string;
 }

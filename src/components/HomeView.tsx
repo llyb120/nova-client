@@ -425,6 +425,11 @@ export function HomeView() {
       void restoreLastProject();
       return;
     }
+    if (sessionSeed.freshScratch) {
+      // 源会话在临时目录里：不复用它的目录，直接开一个新的临时目录。
+      ensureScratchProject();
+      return;
+    }
     if (sessionSeed.cwd) selectProject(sessionSeed.cwd);
     else void restoreLastProject();
   });
