@@ -1,6 +1,6 @@
 // CDP isolated world: references are never recovered by text or a page-supplied selector.
 (() => {
-  if (globalThis.__novaWebview?.apiVersion === 26) return;
+  if (globalThis.__novaWebview?.apiVersion === 29) return;
   const compact = (text, max = 160) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
   // Icon-only controls (sort carets, filter funnels, close ×) carry their meaning in class names.
   const iconHint = e => {
@@ -40,13 +40,14 @@
       if (cache?.has(scope)) return cache.get(scope);
       const key=['id','data-id','data-key','data-row-key','aria-rowindex','aria-label'].map(a=>scope.getAttribute(a)||'').join('|');
       const text=compact(scope.matches('ul,ol') ? `${scope.previousElementSibling?.innerText||''} ${scope.innerText}` : scope.innerText,300), row=scope.matches('tr,[role=row],[role=listitem],li');
-      // A row's text identifies its record. A form's transient validation/status
-      // text must not invalidate every other field in a safe fill batch.
+      // Stable scope keys and form headings retain business identity without coupling buttons to countdown text.
       const heading=compact(scope.querySelector('legend,h1,h2,h3,[role=heading]')?.textContent,200);
-      const info={region:key.replace(/\|/g,'') ? key+' '+text : text,identity:[scope.tagName,key,row?text:heading].join('|')};
+      const info={region:key.replace(/\|/g,'') ? key+' '+text : text,
+        identity:row?[scope.tagName,key,text].join('|'):key.replace(/\|/g,'')?[scope.tagName,key].join('|'):'',
+        fieldIdentity:[scope.tagName,key,row?text:heading].join('|')};
       cache?.set(scope,info);return info;
     }
-    return {region:'',identity:''};
+    return {region:'',identity:'',fieldIdentity:''};
   };
   const fieldContext = e => {
     // ponytail: six ancestors, single fields or a two-date range; other compound forms need real labels.
@@ -63,8 +64,10 @@
     }
     return '';
   };
-  const fingerprint = (e, name=label(e), context=contextInfo(e).identity) => JSON.stringify([e.tagName, name, ...['id','name','type','role','href','data-testid','aria-controls','aria-sort','data-column-key','data-field'].map(a => e.getAttribute(a)), context,
-    e.type!=='password' && e.matches('input,textarea,select,[contenteditable=true]') ? fieldContext(e) : '']);
+  // Stable nodes tolerate changing button text, not a changed destination, record or field purpose.
+  const fingerprint = (e, name=label(e), context=contextInfo(e)) => JSON.stringify([e.tagName,
+    ...['id','name','type','role','href','formaction','form','target','download','data-testid','aria-controls','aria-sort','data-column-key','data-field','data-id','data-key','data-action'].map(a => e.getAttribute(a)), context.identity,
+    e.matches('input,textarea,select,[contenteditable=true]') ? [name,e.type!=='password'?fieldContext(e):'',context.fieldIdentity] : '']);
   const disabled = e => !!e.disabled || e.matches(':disabled') || ancestors(e).some(p => p.inert || p.getAttribute('aria-disabled') === 'true');
   const editable = (e, isDisabled=disabled(e)) => (e.matches('textarea,input:not([type]),input[type=text],input[type=search],input[type=email],input[type=url],input[type=tel],input[type=number],input[type=password]') || e.isContentEditable)
     && !e.readOnly && !ancestors(e).some(p=>p.getAttribute('aria-readonly')==='true') && !isDisabled;
@@ -93,8 +96,37 @@
     if(key!==layoutKey) {layoutKey=key;revision++;}
   };
 
-  const identities = new WeakMap(); let nextIdentity = 0;
-  const identity = e => { if (!e) return null; if (!identities.has(e)) identities.set(e, ++nextIdentity); return identities.get(e); };
+  const identities = new WeakMap(), idNumbers = new WeakMap(); let nextIdentity = 0;
+  const generatedId = id => /\d{3,}|[0-9a-f]{8,}|^:r|^(ember|ext-|yui_|gwt-|mui-|rc[-_]|el-id-|headlessui-|radix-|react-select-|downshift-)|[-_:]\d+$/i.test(id);
+  const stableId = e => {
+    const id=e.getAttribute?.('id');
+    if (!id || id.length>100 || generatedId(id)) return '';
+    try { return e.getRootNode().querySelectorAll('#'+CSS.escape(id)).length===1 ? id : ''; } catch { return ''; }
+  };
+  const identity = e => {
+    if (!e) return null;
+    if (identities.has(e)) return identities.get(e);
+    const id=stableId(e), root=e.getRootNode();
+    let n;
+    if (id) {
+      let ids=idNumbers.get(root); if (!ids) idNumbers.set(root,ids=new Map());
+      const previous=ids.get(id), owner=previous?.owner.deref(), key=fingerprint(e);
+      if (previous && !owner?.isConnected && previous.key===key) n=previous.n;
+      n ??= ++nextIdentity;
+      ids.set(id,{n,key,owner:new WeakRef(e)});
+    } else n=++nextIdentity;
+    identities.set(e,n); return n;
+  };
+  const entry = e => ({e,n:identity(e),id:stableId(e),root:e.getRootNode(),fingerprint:fingerprint(e)});
+  const reattach = entry => {
+    if (!entry.id) return false;
+    const found=entry.root.querySelectorAll('#'+CSS.escape(entry.id));
+    const e=found.length===1 ? found[0] : null;
+    if (!e?.isConnected || fingerprint(e)!==entry.fingerprint || (identities.has(e) && identities.get(e)!==entry.n)) return false;
+    identities.set(e,entry.n); entry.e=e;
+    idNumbers.get(entry.root)?.set(entry.id,{n:entry.n,key:entry.fingerprint,owner:new WeakRef(e)});
+    return true;
+  };
   const active = () => { let e = document.activeElement; while (e?.shadowRoot?.activeElement) e = e.shadowRoot.activeElement; return e; };
   const hitAt = (x, y) => {
     let hit = document.elementFromPoint(x, y);
@@ -148,11 +180,12 @@
   });
   const entryFor = ref => {
     const entry = entries.get(ref);
-    if (!entry || !entry.e.isConnected || fingerprint(entry.e) !== entry.fingerprint) {revision++;throw Error('目标引用已失效（节点、名称或所属行已变化），请重新观察');}
+    const changedHit = entry?.coordinate && (!entry.e.isConnected || label(entry.e)!==entry.name);
+    if (!entry || changedHit || (!entry.e.isConnected && !reattach(entry)) || (entry.id && stableId(entry.e)!==entry.id) || fingerprint(entry.e) !== entry.fingerprint) {revision++;throw Error('目标引用已失效（节点、目标语义或所属行已变化），请重新观察');}
     return entry;
   };
   const api = {
-    apiVersion: 26,
+    apiVersion: 29,
     stamp,
     async evaluate(expression, expectedDocument, expectedUrl) {
       // Check and start in the same JS turn: navigation must never redirect a script to a new document.
@@ -302,7 +335,7 @@
         let cached=semanticCache.get(e);
         if(!cached || cached.revision!==revision) {
           const name=label(e,labels()),context=contextInfo(e,contextCache),region=context.region;
-          const nextFingerprint=fingerprint(e,name,context.identity);
+          const nextFingerprint=fingerprint(e,name,context);
           // Re-observing a recycled row must not make its old ref valid for a different record.
           if (cached && cached.fingerprint!==nextFingerprint) identities.delete(e);
           cached={revision,name,region,fingerprint:nextFingerprint};
@@ -310,7 +343,7 @@
         }
         const {name,region}=cached;
         const ref=`${documentId.slice(0,6)}.${identity(e)}`;
-        entries.set(ref,{e,fingerprint:cached.fingerprint});
+        entries.set(ref,{...entry(e),fingerprint:cached.fingerprint});
         // Most targets in a long document are offscreen. Keep their references
         // and geometry without probing client rects / hit-testing them twice.
         const candidates=inView ? points(e,true) : [], p=candidates.find(p=>receives(e,p.x,p.y));
@@ -420,7 +453,7 @@
       let previous,stableFrames=0,scrolled=false,reason='目标正在移动';
       do {
         if(ref)entryFor(ref);
-        if (disabled(e)) reason='目标不可用';
+        if (mode!=='hover' && disabled(e)) reason='目标不可用';
         else {
           const p=wheel?wheelPoint(e,mode==='scroll_x'?'x':'y'):clickable(e),r=rect(e);
           // Measure this target, not ancestor animation metadata (which can run forever without moving it).
@@ -449,7 +482,7 @@
     },
     verifyPoint(ref,x,y,expectedRect,mode='click') {
       const e=entryFor(ref).e;
-      if (disabled(e) || !sameRect(rect(e),expectedRect) || !receives(e,x,y)) throw Error('目标在鼠标定位后改变或被遮挡，请重新观察');
+      if ((mode!=='hover' && disabled(e)) || !sameRect(rect(e),expectedRect) || !receives(e,x,y)) throw Error('目标在鼠标定位后改变或被遮挡，请重新观察');
       if (mode==='fill' && !editable(e)) throw Error('目标不是可填写字段或只读');
       return true;
     },
@@ -471,7 +504,7 @@
       if (e && !ancestors(e).some(node=>node.matches('canvas,iframe,frame,video,img,svg'))) {
         const target=ancestors(e).find(node=>node.matches('button,a[href],input,select,textarea,[role=button],[role=option],[role=menuitem],li'))||e;
         const ref=`${version}:coordinate:${identity(target)}`;
-        entries.set(ref,{e:target,fingerprint:fingerprint(target)});
+        entries.set(ref,{...entry(target),coordinate:true,name:label(target)});
         hoverTarget={ref,rect:rect(target)};
       }
       return {x,y,stamp:stamp(),pageX:x+scrollX,pageY:y+scrollY,identity:identity(e),editable:!!e&&editable(e),password:e?.type==='password',canvas:e?.tagName==='CANVAS',hit:e?{tag:e.tagName.toLowerCase(),name:label(e)}:null,hoverTarget};

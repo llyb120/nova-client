@@ -166,6 +166,7 @@ pub(crate) fn init(app: &AppHandle) {
 fn bridge(app: &AppHandle) -> Arc<ChromeBridge> {
     app.state::<Arc<ChromeBridge>>().inner().clone()
 }
+#[cfg(test)]
 pub(crate) fn tool_definition() -> Value {
     serde_json::from_str(include_str!("../../scripts/chrome-tool.json"))
         .expect("chrome tool schema")

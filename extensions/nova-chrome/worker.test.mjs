@@ -49,7 +49,7 @@ test('screenshots reveal a minimized window or background tab instead of hanging
     '\nglobalThis.run=async method=>execute({operation:"cdp",args:{tabTag:(await inventory())[0].tag,method},expiresAt:Date.now()+3000});',scope);
   assert.equal((await scope.run('Page.captureScreenshot')).data,'png');
   // JSON compare: objects created inside the vm context have a different prototype.
-  assert.equal(JSON.stringify(calls),JSON.stringify([['window',5,{state:'normal'}],['tab',11,{active:true}],['cdp','Page.captureScreenshot']]));
+  assert.equal(JSON.stringify(calls),JSON.stringify([['cdp','Runtime.evaluate'],['window',5,{state:'normal'}],['tab',11,{active:true}],['cdp','Page.captureScreenshot']]));
   calls.length=0;await scope.run('Page.captureScreenshot');await scope.run('Runtime.evaluate');
   assert.equal(JSON.stringify(calls),JSON.stringify([['cdp','Page.captureScreenshot'],['cdp','Runtime.evaluate']]),'visible tabs and other commands are left alone');
 });
@@ -102,7 +102,7 @@ test('a stuck debugger command times out, polling resumes and late results are n
     extension:{isAllowedIncognitoAccess:async()=>false},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
     tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event(),onUpdated:event()},
-    debugger:{attach:async()=>{},sendCommand:()=>{calls++;return new Promise(resolve=>{finishCommand=resolve;});},onDetach:event(),onEvent:event()},
+    debugger:{attach:async()=>{},sendCommand:(_target,_method,params)=>{if(params?.silent)return Promise.resolve({});calls++;return new Promise(resolve=>{finishCommand=resolve;});},onDetach:event(),onEvent:event()},
     runtime:{id:'test',onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()},
   };
   const scope={chrome,crypto:webcrypto,URL,AbortSignal,setTimeout,clearTimeout,fetch:async(url,options)=>{
@@ -267,7 +267,7 @@ test('ordinary poll and reply failures reconnect automatically without replaying
   const chrome={extension:{isAllowedIncognitoAccess:async()=>false},
     storage:{session:{get:async()=>({}),set:async()=>{}}},
     tabs:{query:async()=>[{id:11,url:'https://example.com',active:true}],get:async()=>({id:11}),onRemoved:event(),onReplaced:event(),onUpdated:event()},
-    debugger:{attach:async()=>{},sendCommand:async()=>{inputs++;return {};},onDetach:event(),onEvent:event()},
+    debugger:{attach:async()=>{},sendCommand:async(_target,method)=>{if(method==='Input.insertText')inputs++;return {};},onDetach:event(),onEvent:event()},
     runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
   const scope={chrome,crypto:webcrypto,URL,AbortSignal,clearTimeout,setTimeout:(fn,ms)=>{
     if(ms===500){delays.push(ms);return setTimeout(fn,1);}return setTimeout(fn,ms);
@@ -288,6 +288,27 @@ test('ordinary poll and reply failures reconnect automatically without replaying
   assert.equal(inputs,1,'losing a reply must not resend browser input');
   assert.equal(replies,1);
   assert.deepEqual(delays,[500,500],'a successful poll resets reconnect backoff');
+});
+
+test('attach settles viewport once, delays idle detach and never inputs after an expired settle',async()=>{
+  for(const expire of [false,true]) {
+    const event=()=>({addListener(){}}),delays=[];let settles=0,inputs=0;
+    const tab={id:11,windowId:5,groupId:1,url:'https://example.com',active:true};
+    const command={operation:'cdp',args:{method:'Input.insertText',params:{text:'once'}},expiresAt:Date.now()+3000};
+    const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},
+      tabs:{query:async()=>[tab],get:async()=>tab,onRemoved:event(),onReplaced:event(),onUpdated:event()},
+      debugger:{attach:async()=>{},sendCommand:async(_target,method,params)=>{
+        if(method==='Runtime.evaluate' && params?.silent){settles++;assert.match(params.expression,/addEventListener\('resize'/);assert.match(params.expression,/1500/);if(expire)command.expiresAt=0;}
+        else if(method==='Input.insertText')inputs++;
+        return {};
+      },onDetach:event(),onEvent:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+    const scope={chrome,crypto:webcrypto,URL,AbortSignal,clearTimeout,setTimeout:(fn,ms)=>{delays.push(ms);return setTimeout(fn,ms);},fetch:()=>new Promise(()=>{})};
+    runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={execute,inventory};',scope);
+    command.args.tabTag=(await scope.api.inventory())[0].tag;
+    if(expire)await assert.rejects(scope.api.execute(command),/过期/);
+    else {await scope.api.execute(command);await scope.api.execute(command);}
+    assert.equal(settles,1);assert.equal(inputs,expire?0:2);assert(delays.includes(300000));
+  }
 });
 
 test('hung Chrome calls release the poll loop without late input or duplicate replies',async()=>{

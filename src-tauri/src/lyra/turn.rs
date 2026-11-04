@@ -85,8 +85,8 @@ fn early_safe(name: &str) -> bool {
 const MAX_CONCURRENT_TOOLS: usize = 4;
 
 fn tool_barrier(name: &str) -> bool {
-    !matches!(name, "read" | "polaris" | "edit" | "write" | "bash"
-        | "chrome" | "jianlai" | "generate_image" | "edit_image" | "context_budget" | "spawn_agent")
+    !crate::chrome_tools::is_tool(name) && !crate::jianlai_tools::is_tool(name) && !matches!(name, "read" | "polaris" | "edit" | "write" | "bash"
+        | "generate_image" | "edit_image" | "context_budget" | "spawn_agent")
 }
 
 /// 使用文件系统身份而非路径字符串，兼容相对路径、大小写、符号链接和硬链接。
@@ -158,7 +158,7 @@ fn tool_dependencies(args: &Value, index: usize) -> Result<Vec<usize>, String> {
 
 /// 操作同一块屏幕的工具跨 agent 互斥。
 fn screen_tool(name: &str) -> bool {
-    matches!(name, "jianlai" | "chrome")
+    crate::jianlai_tools::is_tool(name) || crate::chrome_tools::is_tool(name)
 }
 
 fn screen_lock() -> &'static tokio::sync::Mutex<()> {
@@ -925,6 +925,13 @@ pub(crate) mod tests {
         let call = |name: &str, args| (String::new(), name.to_string(), args);
         let conflict = |left, right| tools_conflict(cwd, &left, &right);
         assert!(conflict(call("chrome", json!({})), call("jianlai", json!({}))));
+        for tool in crate::chrome_tools::definitions().iter().chain(crate::jianlai_tools::definitions()) {
+            let name = tool["name"].as_str().unwrap();
+            assert!(screen_tool(name)); assert!(!tool_barrier(name));
+            assert!(conflict(call(name,json!({})),call("jianlai",json!({}))));
+            assert!(conflict(call(name,json!({})),call("chrome_act",json!({}))));
+            assert!(conflict(call(name,json!({})),call("jianlai_act",json!({}))));
+        }
         assert!(conflict(call("bash", json!({"_after":[1]})), call("bash", json!({}))));
         assert!(!conflict(call("bash", json!({"command":"a"})), call("chrome", json!({}))));
         assert!(!conflict(call("write_stdin", json!({"session_id":"a"})), call("write_stdin", json!({"session_id":"b"}))));

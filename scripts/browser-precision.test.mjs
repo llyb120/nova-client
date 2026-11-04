@@ -155,6 +155,43 @@ try {
     assert.equal(replaced.items[1].nodeId,first.items[1].nodeId);
     assert.notEqual(replaced.items[0].ref,first.items[0].ref);
   });
+  await run('stable unique IDs survive replacement without weakening semantic boundaries',async()=>{
+    const obs=await fixture('<section><h1>Countdown 10</h1><button id="confirm">Confirm 10</button><a id="details" href="/first">Details</a></section>');
+    const button=target(obs,'Confirm 10'),link=target(obs,'Details');
+    await page.evaluate(()=>{document.querySelector('h1').textContent='Countdown 9';document.querySelector('button').textContent='Confirm 9';});
+    await call('prepare',button.ref);
+    await page.evaluate(()=>{const e=document.querySelector('button');e.replaceWith(e.cloneNode(true));});
+    await call('prepare',button.ref);
+    const next=await call('observe',randomUUID());
+    assert.equal(target(next,'Confirm 9').ref,button.ref);
+    await page.evaluate(()=>document.querySelector('a').href='/other-record');
+    await assert.rejects(call('prepare',link.ref),/引用已失效/);
+    const changed=await call('observe',randomUUID());
+    assert.notEqual(target(changed,'Details').ref,link.ref);
+    await page.evaluate(()=>document.body.insertAdjacentHTML('beforeend','<button id="confirm">Duplicate</button>'));
+    await assert.rejects(call('prepare',button.ref),/引用已失效/);
+    for(const id of ['generated-123','react-select-input']) {
+      const initial=await fixture(`<button id="${id}">Generated</button>`);
+      await page.evaluate(()=>{const e=document.querySelector('button');e.replaceWith(e.cloneNode(true));});
+      await assert.rejects(call('prepare',target(initial,'Generated').ref),/引用已失效/);
+    }
+    const row=await fixture('<table><tr data-row-key="a"><td>Alpha</td><td><button id="delete-record">Delete</button></td></tr></table>');
+    await page.evaluate(()=>{document.querySelector('tr').dataset.rowKey='b';const e=document.querySelector('button');e.replaceWith(e.cloneNode(true));});
+    await assert.rejects(call('prepare',target(row,'Delete').ref),/引用已失效/);
+    const shadow=await fixture('<div id="host"></div><button id="shared">Outside</button>');
+    await page.evaluate(()=>{document.querySelector('#host').attachShadow({mode:'open'}).innerHTML='<button id="shared">Inside</button>';});
+    const roots=await call('observe',randomUUID());
+    assert.notEqual(target(roots,'Inside').ref,target(roots,'Outside').ref);
+  });
+  await run('hover targets disabled controls without clicking or granting click permission',async()=>{
+    const obs=await fixture('<button disabled title="No access">Blocked</button>');
+    const item=target(obs,'Blocked'),p=await call('prepare',item.ref,'hover');
+    await cdp.send('Input.dispatchMouseEvent',{type:'mouseMoved',x:p.x,y:p.y});
+    assert.equal(await call('verifyPoint',item.ref,p.x,p.y,p.rect,'hover'),true);
+    await assert.rejects(call('prepare',item.ref,'click'),/不可用/);
+    await page.evaluate(()=>document.body.insertAdjacentHTML('beforeend','<div style="position:fixed;inset:0;z-index:99"></div>'));
+    await assert.rejects(call('prepare',item.ref,'hover'),/遮挡/);
+  });
   await run('settle waits until SPA-style mutations go quiet, bounded',async()=>{
     await fixture('<div id="x">0</div>');
     await page.evaluate(()=>{let n=0;const t=setInterval(()=>{document.getElementById('x').textContent=++n;if(n>=5)clearInterval(t);},60);});
@@ -221,7 +258,7 @@ try {
     assert.equal((await fixture('<table aria-rowcount="0" style="width:100px;height:10px"></table>')).tables[0].totalRows,0);
     await evaluate('Object.defineProperty(globalThis,"__novaWebview",{value:{apiVersion:7},configurable:true}); true');
     await evaluate(engine);
-    assert.equal(await evaluate('__novaWebview.apiVersion'),26,'Existing Chrome worlds must upgrade to current DOM hints');
+    assert.equal(await evaluate('__novaWebview.apiVersion'),29,'Existing Chrome worlds must upgrade to current DOM hints');
     assert.equal((await call('observe',randomUUID())).tables[0].totalRows,0);
   });
   await run('native and ARIA checkboxes expose role and current selection',async()=>{

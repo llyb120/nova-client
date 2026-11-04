@@ -2,11 +2,23 @@
 
 支持按任务检索、成功后提炼和复用反馈的本机[操作经验](tool-experiences.md)：`experience_search` / `experience_save` / `experience_feedback`。
 
-系统级桌面工具，和 `chrome` 并存；浏览器网页操作仅用 `chrome`。通过 Enigo 注入原生鼠标键盘事件，通过 XCap 获取程序窗口和显示器截图；不使用 Playwright、DOM 或辅助模型。
+系统级桌面工具，和 `chrome_*` 并存；浏览器网页操作仅用 `chrome_*`。通过 Enigo 注入原生鼠标键盘事件，通过 XCap 获取程序窗口和显示器截图；不使用 Playwright、DOM 或辅助模型。
+
+## 模型侧窄工具
+
+公开接口拆为 **8 个工具**：`jianlai_windows`、`jianlai_screenshot`、`jianlai_activate`、`jianlai_act`、`jianlai_recall`、`jianlai_experience_search`、`jianlai_experience_save`、`jianlai_experience_feedback`。原 `run(actions)` 与 `act` 相同，合并到 `jianlai_act`，不另设重复入口。普通会话不新增权限裁剪，原只读模式与桌面配置不变；数字员工接口和流程不变。
+
+所有入口仍调用同一个剑来执行器，共享屏幕锁、会话快照、前后台模式、焦点和像素校验。新旧工具历史共用 `jianlai` 图片流，每个显示器仍只保留最近两张；滚动中间图及局部图不混入该流。下面的 windows/screenshot/act 等简称指相应 `jianlai_*` 工具；内部旧 operation 协议保留，不再重复暴露给模型。
+
+`jianlai_screenshot` 的 `capture.kind` 显式选择：`desktop` 全部显示器、`monitor` 指定 monitorId、`window` 按 windowId 定位、`image_region` 按最新 snapshotId/imageId 的图片像素裁剪、`window_region` / `monitor_region` 按所选目标原始像素裁剪。`background` 和 `maxEdge` 放顶层，普通模式的 window 仍截所在显示器整屏，不裁窗口。
+
+`nextCall` 返回 `{tool, arguments}`，可以按指定窄工具调用。`jianlai_act` 的 snapshotId 可省略或留空：执行器直接绑定本会话最新同模式、未过期未消费的快照，不要求模型补一次 ID，也不因此重拍。没有可用观察时返回 `not_executed/observation_required`，先观察画面而不是填写 ID。ID 只能标记来源，不能证明屏幕没变；时效、所有权、焦点、显示器布局、落点像素及前后台模式仍检查。显式提供旧 ID 时不会悄悄换成新 ID；补参提示的 `nextArguments` 不含待重放动作，必须根据最新图重新决策。
+
+Chrome 与剑来共用独立的 `automation_schema` 参数校验模块；公共约束和 `anyOf` 分支同时生效，分支匹配不能绕过动作数量、字段类型或未知字段检查。
 
 - `windows`：列出程序名称、窗口标题、PID、windowId、尺寸及monitorId；1x1等辅助窗口不适合交互。普通模式 `observe:true` 时，windowId或query唯一命中只定位窗口所在显示器并截整屏，不裁窗口；指定query无匹配或有歧义时只返回候选信息，未指定目标时返回所有显示器。
 - `screenshot`：普通模式传windowId时截窗口当前所在显示器的整屏，不裁窗口；不传windowId/monitorId时返回全部显示器独立图片（最多16屏），每屏独立帧流；monitorId可只选一屏，不能同时传windowId。默认长边最多1600像素；`maxEdge: 0` 使用原分辨率，否则允许640–3840。显式 `background:true` 的独立模式见下文。
-- `act`：传 snapshotId、imageId 和 actions（1–16项）。普通模式默认 `feedback=screenshot` 返回所选图片对应显示器的整屏，`feedback=desktop` 返回所有显示器；均不追随前台窗口，不裁窗口，窗口外菜单已包含在整屏中。返回imageId/坐标范围可能变化，下一步必须使用对应新图坐标。`feedback: "none"` 可省略截图，但下次操作前必须重新截图。
+- `act`：传 actions（1–16项），snapshotId可省略；多图时用imageId选定依据。普通模式默认 `feedback=screenshot` 返回所选图片对应显示器的整屏，`feedback=desktop` 返回所有显示器；均不追随前台窗口，不裁窗口，窗口外菜单已包含在整屏中。返回imageId/坐标范围可能变化，下一步必须使用对应新图坐标。`feedback: "none"` 可省略截图，但下次操作前必须重新截图。
 - 点击、双击、移动、拖拽、Unicode文本输入、组合键、双轴滚动和有界等待均为真实系统输入。坐标以**实际返回的图片像素**为准，服务端同步映射缩放、负坐标屏幕和Retina坐标；act继承快照的maxEdge。
 - `wait.ms` 仅允许0–2000，默认250。整批预校验：`actions[1].ms=8000，允许范围为 0–2000；本批次尚未执行` 意味着前面的点击也没执行。
 - `recall(imagePath)` 回看本会话历史结果的图片，不创建可操作快照，也不改变当前快照。旧图仅用于阅读，操作必须绑定当前观察。
@@ -14,10 +26,11 @@
 
 示例：
 
-```json
-{"operation":"windows"}
-{"operation":"screenshot","windowId":123}
-{"operation":"act","snapshotId":"上次返回值","imageId":"返回图片的imageId","actions":[{"action":"click","x":180,"y":90},{"action":"type","text":"你好"}]}
+```js
+jianlai_windows({query:"编辑器",observe:true})
+jianlai_screenshot({capture:{kind:"window",windowId:123}})
+jianlai_screenshot({capture:{kind:"image_region",snapshotId:"最新快照",imageId:"对应图片",region:{x:0,y:0,width:200,height:100}},maxEdge:1200})
+jianlai_act({imageId:"对应图片",actions:[{action:"click",x:180,y:90},{action:"type",text:"你好"}]})
 ```
 
 普通模式指针操作按当前整屏图片的可见像素定位，不区分窗口前后台，不因焦点隐式activate，也不能操作被遮挡内容；截图不会激活窗口。type/press要求焦点与观察一致，不一致拒绝输入，不自动切回或恢复。Windows上确需切窗时显式activate(windowId)，随后用返回的新图重新观察；系统拒绝激活时不继续发送按键，不盲目循环切窗或猜应用热键，同一路径连续失败两次应报告阻碍。用户指定剑来时，整个桌面任务只用剑来鼠标键盘与截图，禁止shell、COM、PowerShell、P/Invoke、UIAutomation及终端脚本操控应用。显示器布局、落点像素或键盘目标校验失败时拒绝相应输入。快照180秒过期、仅消费一次，并绑定当前Nova会话。全局锁防止剑来并行操作同一桌面。批量动作只用于已确定的连续步骤；需要根据画面判断时拆分调用。批次内焦点改变且仍有后续键盘输入时停止并返回新图，不把剩余按键送进未知窗口。用户同时移动窗口/输入仍可能产生竞态，请操作时避免争用桌面。
@@ -87,7 +100,7 @@ NovaDev对xcap、image、image-webp、png及压缩依赖启用优化编译；分
 
 ## 验证
 
-`cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai` 验证坐标、按键与参数边界。
+`node --test scripts/jianlai-tools.test.mjs scripts/chrome-tools.test.mjs` 验证窄 schema；`cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai` 验证接口映射、恢复提示、坐标、按键与参数边界。普通测试不注入真实输入，带 `--ignored` 的硬件测试须单独授权。
 
 `cargo test --manifest-path src-tauri/Cargo.toml --lib jianlai::tests::desktop_smoke -- --ignored` 在真实桌面验证截图→鼠标移动→截图及拒绝重放（只移动指针，不点击或输入）。将测试名换成 `jianlai::tests::pointer_reaches_each_monitor` 可在Windows以Per-Monitor V2 DPI感知验证所有显示器的边缘、中心及负坐标落点（瞬移与真实输入路径点两种方式），结束时恢复指针，不产生截图。两项都只在空闲的测试桌面手动执行。
 
@@ -109,7 +122,7 @@ Windows的press字母/数字按虚拟键发送，Ctrl+A与Ctrl+a等价；大小�
 
 `screenshot`可显式传`region:{x,y,width,height}`裁剪；普通模式`regionSpace=source`以所选显示器原始图片originalWidth/originalHeight像素为准，即使通过windowId选屏也不是窗口内坐标。先裁剪再按maxEdge缩放，返回图可直接用局部图片坐标act，工具负责偏移、缩放与负屏幕坐标映射，不手加region偏移。act的screenshot反馈恢复所选显示器整屏，desktop反馈取所有显示器，必须按对应新图重新定位。局部截图不读取DOM、UIAutomation或其它语义控件接口。
 
-缺少或误用旧snapshotId时，若本会话、同模式的最新快照未过期且未作废，act返回not_executed、snapshotPreserved和nextArguments，不重新截图、不延长快照寿命。使用已有最新图重新决策剩余动作，不重放已执行动作；下一次输入仍按动作类型检查显示器布局、落点像素和键盘焦点。没有可用快照或确实失效时才获取新观察。另一会话持有的快照仍拒绝访问，不覆盖它。只允许最新截图操作，查看其它窗口会替换当前快照；旧图回看使用recall。
+省略snapshotId时直接绑定本会话同模式的可用观察，不补参、不延长快照寿命。显式误用旧snapshotId时，若最新快照未过期且未作废，act返回not_executed、snapshotPreserved和nextArguments，不重新截图、不延长快照寿命。使用已有最新图重新决策剩余动作，不重放已执行动作；下一次输入仍按动作类型检查显示器布局、落点像素和键盘焦点。没有可用快照或确实失效时才获取新观察。另一会话持有的快照仍拒绝访问，不覆盖它。只允许最新截图操作，查看其它窗口会替换当前快照；旧图回看使用recall。
 
 窄输入栏或地址看不清时先局部截图；一次误点后不要继续猜坐标。联系人以完整地址和已提交标签核实，红色错误标签不算成功；下拉列表变化后重新定位。正文在确认焦点后整段输入，误输入先确定内容和选区，不靠盲目Backspace试错。用户要求只准备草稿时，禁止发送和发送快捷键。
 
@@ -139,7 +152,7 @@ Windows 用显式 activate(windowId) 激活 windows 返回的窗口并取得所�
 - **提示**：录制中屏幕边缘是暖金色慢呼吸光效 + 左上角「剑谱录制中」，开始时从触发处荡开一圈水波，指针换成琥珀描边的奶油色箭头 + 右下录制圆点；剑来是天蓝光效 + 剑形指针。两者互斥：录制中剑来拿输入闸门直接失败（`not_executed`），剑来正在操作时不能开始录制。光效窗口排除在截图外。
 - **录什么**：低级键盘/鼠标钩子只监听不拦截。鼠标按下时截所在窗口（找不到窗口截所在显示器），红圈标出落点，长边 1280 存 JPEG；按下/抬起配成点击、双击、右键、拖拽；连续同向滚动合并；打字按原文合并（退格删字），输入停顿 400ms 或一段输入结束时用 UI Automation 读焦点输入框内容记为 `value`（输入法输入只能靠它拿到中文原文）；修饰键组合记为按键。在 Chrome 窗口里点击时，用 UI Automation 读地址栏，把页面地址记到该步 `url`。带 INJECTED 标记的输入（剑来注入）和落在 Nova 自己窗口上的操作不录，停止录制的那一下快捷键也去掉。
 - **存哪里**：Nova 配置目录 `jianpu/<id>/`（`recording.json` + 截图）。打字内容（包括密码）按原文明文保存，不自动清理、不漫游；删除剑谱不影响已存进图谱的路径。
-- **学习**：剑谱页点「交给 AI 学习」，用 Meteor 的执行后端/模型在临时目录开新会话，提示词只含步骤 JSON 和截图目录，模型按需 read 截图（不把图片塞进提示词）。模型按应用拆分、去掉试错，必须输入指定内容的原文写进步骤，会变的内容只写方法，然后 `experience_save` 带 `experience.recordingId` 直接存图谱：桌面应用用 jianlai（scope 须是剑谱里出现过的 app），带 `url` 的 Chrome 网页步骤用 chrome（scope 须是剑谱里出现过的网站 origin，步骤按网页控件写），recordingId 代替 180 秒内观察的来源校验，标记 `source=demo` / `verification=user_demonstrated`。
+- **学习**：剑谱页点「交给 AI 学习」，用 Meteor 的执行后端/模型在临时目录开新会话，提示词只含步骤 JSON 和截图目录，模型按需 read 截图（不把图片塞进提示词）。模型按应用拆分、去掉试错，必须输入指定内容的原文写进步骤，会变的内容只写方法，然后用 `jianlai_experience_save` / `chrome_experience_save`，在顶层传 `recordingId` 直接存图谱：桌面应用的 scope 须是剑谱里出现过的 app，带 `url` 的 Chrome 网页步骤的 scope 须是录制中出现过的网站 origin，步骤按网页控件写，recordingId 代替 180 秒内观察的来源校验，标记 `source=demo` / `verification=user_demonstrated`。
 - **查看**：知识图谱页右上角「剑谱」按钮进入剑谱页，按时间线查看每一步的截图、应用、原文输入，以及生成的图谱路径；知识图谱的路径详情有「查看剑谱」回链。
 
 已知上限：截图在按下后由后台线程截取，菜单在按下时就弹出的应用会拍到已变化的画面；UIA 读值是异步的，回车即发送并清空的输入框可能读不到 `value`（仍保留按键文字）；ToUnicodeEx 用不改内核键盘状态的标志（Win10 1607+），更早系统上死键组合可能被打断。

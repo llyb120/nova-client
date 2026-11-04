@@ -82,7 +82,7 @@ impl Routing {
 
     fn tools_for(&self, model: &Resolved) -> Vec<Tool> {
         let desktop = model.model.supports_images && (self.active == Scene::Computer || self.model(Scene::Computer, 0).is_ok_and(|(_, target)| same_model(model, &target)));
-        let mut tools: Vec<_> = self.tools.iter().filter(|tool| desktop || !matches!(tool.name, "jianlai" | "chrome")).cloned().collect();
+        let mut tools: Vec<_> = self.tools.iter().filter(|tool| desktop || (!crate::jianlai_tools::is_tool(tool.name) && !crate::chrome_tools::is_tool(tool.name))).cloned().collect();
         let available: Vec<_> = self.available().into_iter().filter(|scene| !self.model(*scene, 0).is_ok_and(|(_, target)| same_model(model, &target))).collect();
         if !available.is_empty() {
             tools.push(Tool {

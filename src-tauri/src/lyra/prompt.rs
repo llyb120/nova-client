@@ -503,7 +503,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             "- change_working_directory: 切换后续工具根目录，并在 Nova 中切换或创建对应项目",
         ),
         Some("- read: 读取单个文件（图片直接返回图像）"),
-        (!read_only && options.desktop).then_some("- jianlai（剑来）: 仅在必须操作图形界面时用真实鼠标键盘与截图操作电脑；本地文件/图片用 read，命令能拿到的用 bash，Chrome 网页用 chrome"),
+        (!read_only && options.desktop).then_some("- jianlai_*（剑来）: 仅在必须操作图形界面时用真实鼠标键盘与截图操作电脑；本地文件/图片用 read，命令能拿到的用 bash，Chrome 网页用 chrome_*"),
         if read_only {
             None
         } else {
@@ -546,6 +546,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
             )
         },
         if options.auto_change_project { "需要切换仓库或子目录作为后续工具根目录时，使用 change_working_directory；成功后 Nova 会切换到已有项目，项目不存在则自动创建。该工具必须单独调用并等待成功，不能与依赖新目录的工具并行。" } else { "" }.into(),
+        if !read_only && options.desktop { format!("{}\n{}", crate::chrome_tools::RULES, crate::jianlai_tools::RULES) } else { String::new() },
         "先理解再修改，保持改动聚焦。".into(),
         "减少模型往返、真正并发：\n- 每轮先找出所有参数已知的工作，一次提交尽可能多的工具调用（运行时最多同时执行 4 项）；只有下一步参数依赖未知结果或工具要求单独调用时才回模型决定，不猜参数、不扩大授权、不为凑批次造工作。\n- 互不依赖的调用分别发出（如多个独立路径同轮并行 read），不要用分号或 && 合成一条串行命令冒充并行。\n- 有顺序要求的步骤也同轮提交，用可选 _after:[序号] 声明必须先成功的本轮调用（从 1 计数，只能引用更早项）；前置失败会跳过后继，无关分支继续。例：第1项长任务、第2项短任务、第3项依赖第2项，则只给第3项 _after:[2]，它在第2项完成后立即启动。\n- 命令或 edit 会改文件时，依赖其结果的读取、验证或后续 edit 必须显式 _after 它；共用输出目录、数据库或其他资源的操作不算独立。\n- 界面工具和 MCP 工具的返回不等于业务成功，不要用 _after 自动推进其后继，先回读结果确认；已确定的连续界面步骤用界面工具的 run 操作。\n- 失败只处理失败分支，不重放成功项。".into(),
         // ponytail 开启时其“末尾写跳过项与风险”优先，汇报规则不再禁止这类声明。

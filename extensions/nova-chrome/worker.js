@@ -104,7 +104,9 @@ const checkUrl = value => {
 };
 // Visible marker: tabs under debugger control sit in a blue "Nova" tab group; idle tabs detach so Chrome's debugging bar goes away.
 // ponytail: tabs with an active devtools recording never idle-detach (detaching would drop the log); idle timers die with the worker.
-const IDLE_DETACH_MS = 30000;
+// The debugger bar resizes the viewport; avoid detaching during normal model thinking time.
+const IDLE_DETACH_MS = 300000;
+const ATTACH_RESIZE_MS = 800, ATTACH_QUIET_MS = 150, ATTACH_SETTLE_CAP_MS = 1500;
 const grouped = new Set(), idle = new Map();
 async function mark(command, tab) {
   if (tab.groupId !== -1 || grouped.has(tab.id)) return;
@@ -148,6 +150,15 @@ async function attach(command, tab) {
   await debuggerCall(command,()=>chrome.debugger.attach({tabId:tab.id},'1.3'));
   checkDeadline(command); attached.add(tab.id);
   await mark(command, tab);
+  await settleViewport(command, tab);
+  checkDeadline(command);
+}
+async function settleViewport(command, tab) {
+  const expression=`new Promise(done=>{let timer;const finish=()=>{clearTimeout(timer);clearTimeout(cap);removeEventListener('resize',resized);done([innerWidth,innerHeight])};`+
+    `const resized=()=>{clearTimeout(timer);timer=setTimeout(finish,${ATTACH_QUIET_MS})};const cap=setTimeout(finish,${ATTACH_SETTLE_CAP_MS});`+
+    `addEventListener('resize',resized);timer=setTimeout(finish,${ATTACH_RESIZE_MS})})`;
+  // A crashed/paused page is reported by the requested command; expiration still stops all subsequent input.
+  await debuggerCall(command,()=>chrome.debugger.sendCommand({tabId:tab.id},'Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true,silent:true})).catch(()=>{});
 }
 async function execute(command) {
   const {operation, args} = command;
