@@ -45,6 +45,7 @@ async function devtoolsData(command, tab) {
   if (!Number.isInteger(limit) || limit < 1 || limit > DEVTOOLS_LIMIT) throw Error(`devtools.limit 必须为 1–${DEVTOOLS_LIMIT} 的整数`);
   for (const key of ['query','level','requestId']) if (options[key] !== undefined && typeof options[key] !== 'string') throw Error(`devtools.${key} 必须为字符串`);
   await attach(command, tab);
+  checkDeadline(command);
   let log = devtools.get(tab.id);
   if (!log) {
     // Runtime.enable replays console history V8 already holds; network has no history before enable.
@@ -105,11 +106,13 @@ const checkUrl = value => {
 // ponytail: tabs with an active devtools recording never idle-detach (detaching would drop the log); idle timers die with the worker.
 const IDLE_DETACH_MS = 30000;
 const grouped = new Set(), idle = new Map();
-async function mark(tab) {
+async function mark(command, tab) {
   if (tab.groupId !== -1 || grouped.has(tab.id)) return;
   try {
     const [group] = await chrome.tabGroups.query({windowId:tab.windowId,title:'Nova'});
+    checkDeadline(command);
     const groupId = await chrome.tabs.group(group ? {tabIds:tab.id,groupId:group.id} : {tabIds:tab.id,createProperties:{windowId:tab.windowId}});
+    checkDeadline(command);
     if (!group) await chrome.tabGroups.update(groupId,{title:'Nova',color:'blue'});
     grouped.add(tab.id);
   } catch { /* Popup windows cannot be grouped; control still works. */ }
@@ -123,9 +126,13 @@ async function detach(tabId) {
   forget(tabId);
   if (was) await chrome.debugger.detach({tabId}).catch(()=>{});
 }
+// Promise.race cannot cancel Chrome APIs: recheck after waits, before starting another side effect.
+function checkDeadline(command) {
+  if (!(command.expiresAt > Date.now())) throw Error('命令已过期，停止后续操作；此前操作可能已执行，请先观察，不要重放');
+}
 async function debuggerCall(command, invoke) {
+  checkDeadline(command);
   const remaining = Math.min(10000, command.expiresAt - Date.now());
-  if (!(remaining > 0)) throw Error('命令已过期，未执行');
   let timer;
   try {
     return await Promise.race([
@@ -138,12 +145,13 @@ async function attach(command, tab) {
   clearTimeout(idle.get(tab.id));
   idle.set(tab.id,setTimeout(()=>{ if(!devtools.has(tab.id)) void detach(tab.id); },IDLE_DETACH_MS));
   if (attached.has(tab.id)) return;
-  await debuggerCall(command,()=>chrome.debugger.attach({tabId:tab.id},'1.3')); attached.add(tab.id);
-  await mark(tab);
+  await debuggerCall(command,()=>chrome.debugger.attach({tabId:tab.id},'1.3'));
+  checkDeadline(command); attached.add(tab.id);
+  await mark(command, tab);
 }
 async function execute(command) {
   const {operation, args} = command;
-  if (Date.now() > command.expiresAt) throw Error('命令已过期，未执行');
+  checkDeadline(command);
   if (operation === 'downloads') {
     if (!chrome.downloads) throw Error('下载查询需要 Nova Chrome 0.1.6，请更新并重新加载扩展');
     const query = {orderBy:['-startTime'],limit:100};
@@ -165,7 +173,7 @@ async function execute(command) {
   }
   if (operation === 'status') return {incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess(),version:chrome.runtime.getManifest?.().version};
   // Nova 已把新文件写入加载目录；先回传结果再重载，重载后以新 clientId 自动重连。
-  if (operation === 'reload' && args.extension === true) { setTimeout(()=>chrome.runtime.reload(),300); return {reloading:true}; }
+  if (operation === 'reload' && args.extension === true) { setTimeout(()=>{if(command.expiresAt > Date.now())chrome.runtime.reload();},300); return {reloading:true}; }
   if (operation === 'tabs') return {tabs:(await inventory()).filter(tab=>args.incognito === undefined || tab.incognito === args.incognito),incognitoAllowed:await chrome.extension.isAllowedIncognitoAccess()};
   if (operation === 'open' || operation === 'new_tab') {
     if (args.incognito !== undefined && typeof args.incognito !== 'boolean') throw Error('incognito必须为boolean');
@@ -173,11 +181,13 @@ async function execute(command) {
     let tab;
     if (args.incognito === true) {
       if (!await chrome.extension.isAllowedIncognitoAccess()) throw Error('请在 chrome://extensions 中打开 Nova Chrome 详情，开启“允许在无痕模式下运行”，然后重试；未创建普通窗口');
+      checkDeadline(command);
       const created = await chrome.windows.create({url,incognito:true});
       [tab] = created.tabs || await chrome.tabs.query({windowId:created.id});
     } else {
       // Bind a normal window explicitly: the last focused window may be incognito.
       const normal = (await chrome.windows.getAll({windowTypes:['normal']})).find(w=>!w.incognito);
+      checkDeadline(command);
       if (normal) tab = await chrome.tabs.create({url,windowId:normal.id});
       else { const created = await chrome.windows.create({url,incognito:false}); [tab] = created.tabs || await chrome.tabs.query({windowId:created.id}); }
     }
@@ -186,9 +196,10 @@ async function execute(command) {
     return {tabTag:model.tabs[tab.id].tag,tabs:await inventory()};
   }
   const tab = await resolveTag(args.tabTag);
+  checkDeadline(command);
   switch (operation) {
-    case 'select_tab': await chrome.tabs.update(tab.id,{active:true}); await chrome.windows.update(tab.windowId,{focused:true}); break;
-    case 'close_tab': await detach(tab.id); await chrome.tabs.remove(tab.id); delete model.tabs[tab.id]; await save(); break;
+    case 'select_tab': await chrome.tabs.update(tab.id,{active:true}); checkDeadline(command); await chrome.windows.update(tab.windowId,{focused:true}); break;
+    case 'close_tab': await detach(tab.id); checkDeadline(command); await chrome.tabs.remove(tab.id); delete model.tabs[tab.id]; await save(); break;
     case 'goto': await chrome.tabs.update(tab.id,{url:checkUrl(args.url)}); break;
     case 'back': await chrome.tabs.goBack(tab.id); break;
     case 'forward': await chrome.tabs.goForward(tab.id); break;
@@ -199,7 +210,7 @@ async function execute(command) {
       await attach(command, tab);
       // Recheck the tab after the asynchronous attach.
       await resolveTag(args.tabTag);
-      if (Date.now() > command.expiresAt) throw Error('命令已过期，未执行');
+      checkDeadline(command);
       // Extension debugger sessions are auto-attach-only: direct target discovery/attach is forbidden.
       if(args.method==='Target.getTargets') {
         const params={autoAttach:true,waitForDebuggerOnStart:false,flatten:true};
@@ -215,7 +226,10 @@ async function execute(command) {
       }
       if(args.method==='Page.captureScreenshot') {
         // A minimized window or background tab never paints: the capture would hang until timeout.
-        if((await chrome.windows.get(tab.windowId)).state==='minimized')await chrome.windows.update(tab.windowId,{state:'normal'});
+        const win = await chrome.windows.get(tab.windowId);
+        checkDeadline(command);
+        if(win.state==='minimized')await chrome.windows.update(tab.windowId,{state:'normal'});
+        checkDeadline(command);
         if(!tab.active)await chrome.tabs.update(tab.id,{active:true});
       }
       if(args.method==='Target.attachToTarget') {
@@ -276,6 +290,8 @@ async function connect(origin, attempt = 0) {
     const post = (path,body) => fetch(`${config.origin}${path}`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${config.token}`},body:JSON.stringify({...body,clientId:model.clientId}),signal:AbortSignal.timeout(25000)});
     instances.set(origin, post);
     for (;;) {
+      // An extension API call per long poll resets the MV3 worker's idle timer.
+      await Promise.resolve(chrome.runtime.getPlatformInfo?.()).catch(()=>{});
       const response = await post('/poll',{});
       if (!response.ok) throw Object.assign(Error(`连接被拒绝 HTTP ${response.status}；检查是否连接了另一个 Chrome 实例`),{conflict:response.status===409});
       connections.add(origin);
@@ -288,7 +304,13 @@ async function connect(origin, attempt = 0) {
       }
       if (!command) continue;
       let reply;
-      const result = commands.then(()=>execute(command));
+      // Expiring a queued command must not release another instance's still-running command.
+      const result = commands.then(()=>{
+        let deadline;
+        return Promise.race([execute(command), new Promise((_, reject)=>{
+          deadline = setTimeout(()=>reject(Error('Chrome 未在时限内完成该命令；结果可能已执行，请先观察，不要重放动作')), Math.max(0, command.expiresAt - Date.now()) + 500);
+        })]).finally(()=>clearTimeout(deadline));
+      });
       commands = result.catch(()=>{});
       try { reply={id:command.id,result:await result}; }
       catch(error){reply={id:command.id,error:String(error?.message || error)};}
@@ -298,7 +320,7 @@ async function connect(origin, attempt = 0) {
     }
   } catch (error) {
     // Reconnect transport after ordinary failures too; never resend an executed command.
-    if (attempt < 12) reconnects.set(origin, setTimeout(() => void connect(origin, attempt + 1),
+    reconnects.set(origin, setTimeout(() => void connect(origin, Math.min(attempt + 1, 4)),
       error?.conflict ? 5000 : Math.min(500 * 2 ** attempt, 5000)));
   } finally { connections.delete(origin); instances.delete(origin); loops.delete(origin); }
 }

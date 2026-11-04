@@ -225,8 +225,9 @@ try {
     assert.equal(await page.locator('#second').inputValue(),'same live node');
     const fieldShot=await chromeUi('screenshot',{tabTag:tag,fullPage:false,maxEdge:0});
     const fieldRect=await page.locator('#second').boundingBox();
+    const fieldImage=fieldShot.images[0];
     const coordinateType=await chromeUi('act',{tabTag:tag,snapshotId:fieldShot.snapshotId,feedback:'inspect',actions:[
-      {action:'click_at',x:fieldRect.x+fieldRect.width/2,y:fieldRect.y+fieldRect.height/2},
+      {action:'click_at',x:(fieldRect.x+fieldRect.width/2-fieldImage.x)*fieldImage.pixelWidth/fieldImage.width,y:(fieldRect.y+fieldRect.height/2-fieldImage.y)*fieldImage.pixelHeight/fieldImage.height},
       {action:'press',key:'Ctrl+A'},{action:'type',text:'coordinate focus'}]});
     assert.equal(coordinateType.status,'executed',JSON.stringify(coordinateType));
     assert.equal(await page.locator('#second').inputValue(),'coordinate focus');

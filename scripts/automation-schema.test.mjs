@@ -618,6 +618,9 @@ test('Chrome retains image coordinates, fast scope and bounded batch schemas',as
   const withoutDescriptions=value=>JSON.parse(JSON.stringify(value,(key,value)=>key==='description'?undefined:value));
   assert.deepEqual(withoutDescriptions(chrome.inputSchema.properties.actions.items),withoutDescriptions(chrome.inputSchema.properties.action));
   assert.equal(chrome.inputSchema.properties.actions.maxItems,16);
+  assert.match(chrome.description,/imageId可选，不因未附截图或旧imageId拦截/);
+  assert.match(chrome.inputSchema.properties.action.description,/省略或未匹配时使用当前观察的第一张图，无图时按视口CSS像素/);
+  assert.match(chrome.inputSchema.properties.imageId.description,/只读展开长图仍不可用于坐标操作/);
   assert.equal(chrome.inputSchema.properties.incognito.type,"boolean");
   assert.equal(chrome.inputSchema.properties.actions.items.properties.duration_ms.maximum,1500);
   assert.match(chrome.inputSchema.properties.fullPage.description,/每次返回完整图.*32×32.*阈值16.*复用已交付的同一文件/);

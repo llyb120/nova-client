@@ -459,7 +459,7 @@ fn parse_action(text: &str) -> Result<Action, String> {
         .trim();
     let text = text.strip_suffix("```").unwrap_or(text).trim();
     let value = serde_json::from_str::<Value>(text).map(normalize_action);
-    value.and_then(serde_json::from_value).map_err(|e| format!("动作 JSON 无效：{e}。DOM 点击用 action={{\"action\":\"click\",\"frame\":0,\"ref\":\"最新引用\"}}；图片坐标点击用 action={{\"action\":\"click_at\",\"x\":100,\"y\":100}}，imageId 放在工具顶层且与 snapshotId 来自同次截图；按键仅用 action={{\"action\":\"press\",\"key\":\"Enter\"}}，不传 frame/ref。"))
+    value.and_then(serde_json::from_value).map_err(|e| format!("动作 JSON 无效：{e}。DOM 点击用 action={{\"action\":\"click\",\"frame\":0,\"ref\":\"最新引用\"}}；图片坐标点击用 action={{\"action\":\"click_at\",\"x\":100,\"y\":100}}，imageId 放在工具顶层（可选）；按键仅用 action={{\"action\":\"press\",\"key\":\"Enter\"}}，不传 frame/ref。"))
 }
 
 /// Repairs the common harmless slips of weaker models instead of bouncing the call: a missing
@@ -550,13 +550,10 @@ fn preflight(observation:&Observation, action:&mut Action, image_id:Option<&str>
         Action::Upload{frame,..} if observation.frames.get(*frame).is_none()=>return Err("upload.frame 不在当前观察中".into()),
         Action::Scroll{frame,..} if *frame!=0=>return Err("子框架滚动需要明确 ref".into()),
         Action::ClickAt{x,y,..}|Action::Move{x,y}|Action::Drag{x,y,..}|Action::ScrollAt{x,y,..}=>{
-            if !observation.screenshot {return Err(format!("坐标操作需要截图：当前 snapshotId={} 没有图片。调用 screenshot 后同时使用它返回的新 snapshotId 和 imageId；不要将旧 imageId 与新 DOM 快照混用。", observation.id));}
-            let (cx,cy)=image_point(observation,*x,*y,image_id)?;
-            if !observation.images.iter().any(|image|cx>=image.x&&cy>=image.y&&cx<image.x+image.width&&cy<image.y+image.height) {return Err("坐标不在返回的图片中".into());}
+            image_point(observation,*x,*y,image_id)?;
             if let Action::Drag{to_x,to_y,..}=action {
                 if observation.full_page {return Err("拖动需要 fullPage=false 的视口截图".into());}
-                let (tx,ty)=image_point(observation,*to_x,*to_y,image_id)?;
-                if !observation.images.iter().any(|image|tx>=image.x&&ty>=image.y&&tx<image.x+image.width&&ty<image.y+image.height) {return Err("拖动终点不在图片中".into());}
+                image_point(observation,*to_x,*to_y,image_id)?;
             }
         }
         _=>(),
@@ -868,10 +865,19 @@ async fn apply(
 }
 
 fn image_point(observation: &Observation, x:f64, y:f64, image_id:Option<&str>) -> Result<(f64,f64),String> {
-    match image_id {
-        Some(id)=>observation.images.iter().find(|image| image.id==id).ok_or("imageId 不属于当前快照")?.point(x,y),
-        None=>Ok((x,y)), // Backwards-compatible CSS coordinates; new clients should supply imageId.
+    if let Some(image) = observation.images.iter().find(|image| Some(image.id.as_str()) == image_id)
+        .or_else(|| observation.images.first()) {
+        return image.point(x,y);
     }
+    // Expanded-layout screenshots deliberately have no actionable images; never fall back to CSS for them.
+    if observation.screenshot { return Err("展开长图仅供阅读，不能用于坐标操作".into()); }
+    let viewport = &observation.pages["pages"][0]["viewport"];
+    let width = viewport["width"].as_f64().filter(|v| v.is_finite() && *v > 0.).ok_or("无效视口宽度")?;
+    let height = viewport["height"].as_f64().filter(|v| v.is_finite() && *v > 0.).ok_or("无效视口高度")?;
+    if !x.is_finite() || !y.is_finite() || x < 0. || y < 0. || x >= width || y >= height {
+        return Err("坐标超出当前视口".into());
+    }
+    Ok((x,y))
 }
 async fn coordinate(
     app: &AppHandle,
@@ -880,12 +886,6 @@ async fn coordinate(
     y: f64,
     image_id: Option<&str>,
 ) -> Result<Value, String> {
-    if !observation.screenshot {
-        return Err(
-            "当前观察没有可用截图，不能授权坐标操作：请 screenshot 或 inspect（省略 visual=none），也可按 DOM frame/ref 操作"
-                .into(),
-        );
-    }
     let (x,y)=image_point(observation,x,y,image_id)?;
     evaluate(
         app,
@@ -2215,6 +2215,52 @@ mod tests {
         assert!(matches!(click, Action::Click { frame: 1, .. }));
         let mut fake = parse_action(r#"{"action":"click","frame":0,"ref":"c:1"}"#).unwrap();
         assert!(preflight(&observation, &mut fake, None).is_err());
+    }
+
+    #[test]
+    fn coordinate_fallback_preserves_mapping_bounds_and_read_only_exports() {
+        let mut observation = Observation { frames: Vec::new(), id: "s".into(),
+            pages: json!({"pages":[{"viewport":{"width":800,"height":600}}]}),
+            captured: std::time::Instant::now(), screenshot: false, full_page: false, images: Vec::new() };
+        let actions = || parse_actions(&json!({"actions":[
+            {"action":"click_at","x":20,"y":30}, {"action":"move","x":20,"y":30},
+            {"action":"scroll_at","x":20,"y":30,"delta":120},
+            {"action":"drag","x":20,"y":30,"to_x":40,"to_y":50}
+        ]}),16).unwrap();
+        for id in [None, Some("old-image")] {
+            assert_eq!(image_point(&observation,20.,30.,id).unwrap(),(20.,30.));
+            for mut action in actions() { preflight(&observation,&mut action,id).unwrap(); }
+            for (x,y) in [(800.,1.), (1.,600.), (-1.,0.), (f64::NAN,0.), (f64::INFINITY,0.)] {
+                assert!(image_point(&observation,x,y,id).is_err());
+            }
+            let mut drag = parse_action(r#"{"action":"drag","x":1,"y":1,"to_x":2,"to_y":600}"#).unwrap();
+            assert!(preflight(&observation,&mut drag,id).is_err());
+        }
+        observation.screenshot = true;
+        observation.full_page = true;
+        // A captured expanded layout has no actionable images, unlike a DOM-only observation.
+        for id in [None, Some("old-image"), Some("expanded")] {
+            for mut action in actions() {
+                assert!(preflight(&observation,&mut action,id).unwrap_err().contains("仅供阅读"));
+            }
+        }
+        let first = ScreenshotImage { id:"current".into(), path:"unused.png".into(), x:100., y:200.,
+            width:400., height:300., pixels:(200,150), delivered:None };
+        observation.images = vec![first.clone(), ScreenshotImage { id:"second".into(), x:500., ..first }];
+        for id in [None, Some("old-image"), Some("current"), Some("second")] {
+            let x = if id == Some("second") {520.} else {120.};
+            assert_eq!(image_point(&observation,10.,20.,id).unwrap(),(x,240.));
+            assert!(image_point(&observation,200.,0.,id).is_err());
+            for mut action in actions() {
+                let result = preflight(&observation,&mut action,id);
+                if matches!(action,Action::Drag{..}) { assert!(result.is_err()); } else { result.unwrap(); }
+            }
+        }
+        observation.screenshot = false;
+        observation.full_page = false;
+        observation.images.clear();
+        observation.pages = json!({"pages":[{}]});
+        assert!(image_point(&observation,1.,1.,None).is_err(), "missing viewport is not unbounded CSS space");
     }
 
     #[test]

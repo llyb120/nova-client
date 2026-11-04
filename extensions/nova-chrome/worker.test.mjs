@@ -290,6 +290,127 @@ test('ordinary poll and reply failures reconnect automatically without replaying
   assert.deepEqual(delays,[500,500],'a successful poll resets reconnect backoff');
 });
 
+test('hung Chrome calls release the poll loop without late input or duplicate replies',async()=>{
+  for(const hung of ['get','update']) {
+    const event=()=>({addListener(){}}), replies=[];
+    let polls=0,inputs=0,keepalive=0,release;
+    const tab={id:11,url:'about:blank',active:true};
+    const stalled=()=>new Promise(resolve=>{release=()=>resolve(tab);});
+    const chrome={extension:{isAllowedIncognitoAccess:async()=>false},
+      storage:{session:{get:async()=>({}),set:async()=>{}}},
+      tabs:{query:async()=>[tab],get:()=>hung==='get'?stalled():Promise.resolve(tab),update:()=>{inputs++;return stalled();},onRemoved:event(),onReplaced:event(),onUpdated:event()},
+      debugger:{onDetach:event(),onEvent:event()},runtime:{getPlatformInfo:async()=>{keepalive++;},onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+    const scope={chrome,crypto:webcrypto,URL,AbortSignal,clearTimeout,setTimeout,fetch:async(url,init)=>{
+      const endpoint=new URL(url);
+      if(endpoint.port!=='47653')return new Promise(()=>{});
+      if(endpoint.pathname==='/pair')return {ok:true,json:async()=>({token:'t'.repeat(32)})};
+      if(endpoint.pathname==='/reply'){replies.push(JSON.parse(init.body));return {ok:true};}
+      if(++polls>2)return new Promise(()=>{});
+      const [tab]=await scope.api.inventory();
+      const command=polls===1
+        ? {id:'hung',operation:'goto',args:{tabTag:tab.tag,url:'https://example.com/'},expiresAt:Date.now()+50}
+        : {id:'next',operation:'tabs',args:{},expiresAt:Date.now()+3000};
+      return {ok:true,json:async()=>({command})};
+    }};
+    runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={inventory};',scope);
+    for(let i=0;i<400 && polls<3;i++)await new Promise(resolve=>setTimeout(resolve,5));
+    assert.equal(polls,3,'a hung API must not block the next command');
+    assert.deepEqual(replies.map(reply=>reply.id),['hung','next']);
+    assert.match(replies[0].error,/时限/);
+    assert.equal(replies[1].error,undefined);
+    assert.equal(keepalive,3,'every poll keeps the service worker alive');
+    release();
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(inputs,hung==='get'?0:1,'late completion must not start or replay input');
+    assert.equal(replies.length,2,'late results never produce another reply');
+  }
+});
+
+test('an expired queued command cannot release another instance before its deadline',async()=>{
+  const event=()=>({addListener(){}}), inputs=[],replies=[],polled=new Set();
+  let releaseGet,started;
+  const waiting=new Promise(resolve=>{started=resolve;});
+  const tab={id:11,url:'about:blank',active:true};
+  const chrome={extension:{isAllowedIncognitoAccess:async()=>false},
+    storage:{session:{get:async()=>({}),set:async()=>{}}},
+    tabs:{query:async()=>[tab],get:()=>releaseGet?Promise.resolve(tab):new Promise(resolve=>{releaseGet=()=>resolve(tab);started();}),update:async(_id,args)=>{inputs.push(args.url);},onRemoved:event(),onReplaced:event(),onUpdated:event()},
+    debugger:{onDetach:event(),onEvent:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,clearTimeout,setTimeout,fetch:async(url,init)=>{
+    const endpoint=new URL(url),port=Number(endpoint.port);
+    if(port>47655)return new Promise(()=>{});
+    if(endpoint.pathname==='/pair')return {ok:true,json:async()=>({token:'t'.repeat(32)})};
+    if(endpoint.pathname==='/reply'){replies.push(JSON.parse(init.body));return {ok:true};}
+    if(polled.has(port))return new Promise(()=>{});
+    polled.add(port);
+    if(port!==47653)await waiting;
+    if(port===47655)await new Promise(resolve=>setTimeout(resolve,650));
+    const [tab]=await scope.api.inventory();
+    return {ok:true,json:async()=>({command:{id:String(port),operation:port===47654?'status':'goto',
+      args:{tabTag:tab.tag,url:`https://example.com/${port}`},expiresAt:Date.now()+(port===47654?50:3000)}})};
+  }};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8')+'\nglobalThis.api={inventory};',scope);
+  await waiting;
+  await new Promise(resolve=>setTimeout(resolve,750));
+  assert.deepEqual(inputs,[],'a short-lived waiter must not let a third instance overtake the active command');
+  releaseGet();
+  for(let i=0;i<100 && replies.length<3;i++)await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(replies.length,3);
+  assert.deepEqual(inputs,['https://example.com/47653','https://example.com/47655']);
+  assert.match(replies.find(reply=>reply.id==='47654').error,/过期/);
+});
+
+test('expired waits cannot start the next browser side effect',async()=>{
+  const source=await readFile(new URL('./worker.js',import.meta.url),'utf8');
+  const cases=[
+    {operation:'goto',expire:'tabs.get',blocked:'tabs.update'},
+    {operation:'open',expire:'windows.getAll',blocked:'tabs.create'},
+    {operation:'open',args:{incognito:true},expire:'permission',blocked:'windows.create'},
+    {operation:'select_tab',expire:'tabs.update',blocked:'windows.update'},
+    {operation:'close_tab',attached:true,expire:'debugger.detach',blocked:'tabs.remove'},
+    {operation:'cdp',expire:'debugger.attach',blocked:'tabs.group'},
+    {operation:'cdp',expire:'tabGroups.query',blocked:'tabs.group'},
+    {operation:'cdp',expire:'tabs.group',blocked:'tabGroups.update'},
+    {operation:'cdp',attached:true,args:{method:'Page.captureScreenshot'},expire:'windows.get',blocked:'windows.update'},
+    {operation:'cdp',attached:true,args:{method:'Page.captureScreenshot'},expire:'windows.update',blocked:'tabs.update'},
+  ];
+  for(const scenario of cases) {
+    const event=()=>({addListener(){}}), calls=[];
+    const command={operation:scenario.operation,args:{url:'https://example.com/',method:'Input.insertText',...scenario.args},expiresAt:Date.now()+3000};
+    const tab={id:11,windowId:5,groupId:-1,active:false,url:'about:blank'};
+    const call=(name,value)=>async()=>{calls.push(name);if(name===scenario.expire)command.expiresAt=0;return value;};
+    const chrome={extension:{isAllowedIncognitoAccess:call('permission',true)},
+      storage:{session:{get:async()=>({}),set:async()=>{}}},
+      tabs:{query:async()=>[tab],get:call('tabs.get',tab),update:call('tabs.update',tab),create:call('tabs.create',tab),remove:call('tabs.remove'),group:call('tabs.group',1),ungroup:async()=>{},onRemoved:event(),onReplaced:event(),onUpdated:event()},
+      windows:{getAll:call('windows.getAll',[{id:5}]),create:call('windows.create',{tabs:[tab]}),get:call('windows.get',{state:'minimized'}),update:call('windows.update')},
+      tabGroups:{query:call('tabGroups.query',[]),update:call('tabGroups.update')},
+      debugger:{attach:call('debugger.attach'),detach:call('debugger.detach'),sendCommand:call('debugger.sendCommand',{}),onDetach:event(),onEvent:event()},
+      runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+    const scope={chrome,crypto:webcrypto,URL,AbortSignal,clearTimeout,setTimeout,fetch:()=>new Promise(()=>{})};
+    runInNewContext(source+'\nglobalThis.api={inventory,execute,attached};',scope);
+    command.args.tabTag=(await scope.api.inventory())[0].tag;
+    if(scenario.attached)scope.api.attached.add(tab.id);
+    await assert.rejects(scope.api.execute(command),/过期/,JSON.stringify(scenario));
+    assert(calls.includes(scenario.expire),JSON.stringify(scenario));
+    assert(!calls.includes(scenario.blocked),`late side effect: ${JSON.stringify(scenario)}`);
+    assert(!calls.includes('debugger.sendCommand'),'no late CDP input');
+  }
+});
+
+test('ordinary failures keep reconnecting past twelve attempts with capped backoff',async()=>{
+  const event=()=>({addListener(){}}), delays=[];let pairs=0;
+  const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>[],onRemoved:event(),onReplaced:event(),onUpdated:event()},
+    debugger:{onEvent:event(),onDetach:event()},runtime:{onMessage:event(),onInstalled:event(),onStartup:event()},alarms:{onAlarm:event()}};
+  const scope={chrome,crypto:webcrypto,URL,AbortSignal,clearTimeout,setTimeout:(fn,ms)=>{delays.push(ms);return setTimeout(fn,1);},fetch:async(url)=>{
+    if(new URL(url).port!=='47653')return new Promise(()=>{});
+    if(++pairs>15)return new Promise(()=>{});
+    throw Error('offline');
+  }};
+  runInNewContext(await readFile(new URL('./worker.js',import.meta.url),'utf8'),scope);
+  for(let i=0;i<200 && pairs<16;i++)await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(pairs,16);
+  assert.deepEqual(delays,[500,1000,2000,4000,...Array(11).fill(5000)]);
+});
+
 test('after a reload Nova still holds the old clientId: retry soon instead of waiting for the alarm',async()=>{
   const event=()=>({addListener(){}});let polls=0;
   const chrome={storage:{session:{get:async()=>({}),set:async()=>{}}},tabs:{query:async()=>[],onRemoved:event(),onReplaced:event(),onUpdated:event()},

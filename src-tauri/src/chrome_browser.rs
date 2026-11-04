@@ -16,7 +16,14 @@ use tokio::{
 };
 
 const EXTENSION_ID: &str = "mdicifjlbgnkkdkcbfdnebeghhlamjbm";
-type Pending = HashMap<String, oneshot::Sender<Result<Value, String>>>;
+const PICKUP_WAIT: Duration = Duration::from_secs(30);
+struct PendingRequest {
+    reply: oneshot::Sender<Result<Value, String>>,
+    picked: Option<oneshot::Sender<tokio::time::Instant>>,
+    pickup_by: tokio::time::Instant,
+    budget: Duration,
+}
+type Pending = HashMap<String, PendingRequest>;
 pub(crate) struct ChromeBridge {
     start: tokio::sync::Mutex<()>,
     config: Mutex<Option<(u16, String, PathBuf)>>,
@@ -82,11 +89,16 @@ impl ChromeBridge {
     fn take(&self, client: &str) -> Option<Value> {
         let mut queues = self.queues.lock().unwrap();
         let queue = queues.get_mut(client)?;
-        while let Some(command) = queue.pop_front() {
-            if command["id"].as_str().is_some_and(|id| self.pending.lock().unwrap().contains_key(id))
-                && command["expiresAt"].as_i64().unwrap_or(0) > chrono::Utc::now().timestamp_millis()
-            {
-                return Some(command);
+        while let Some(mut command) = queue.pop_front() {
+            let mut pending = self.pending.lock().unwrap();
+            let Some(call) = command["id"].as_str().and_then(|id| pending.get_mut(id)) else { continue };
+            let taken = tokio::time::Instant::now();
+            if taken >= call.pickup_by || call.reply.is_closed() { continue; }
+            if let Some(picked) = call.picked.take() {
+                if picked.send(taken).is_ok() {
+                    command["expiresAt"] = json!(chrono::Utc::now().timestamp_millis() + call.budget.as_millis() as i64);
+                    return Some(command);
+                }
             }
         }
         None
@@ -94,22 +106,38 @@ impl ChromeBridge {
     async fn request_to(self: &Arc<Self>, client: &str, operation: &str, args: Value) -> Result<Value, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (send, receive) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id.clone(), send);
+        let (picked, mut pickup) = oneshot::channel();
+        let pickup_by = tokio::time::Instant::now() + PICKUP_WAIT;
+        let budget = Duration::from_secs(if matches!(operation, "cdp" | "devtools") { 10 } else { 3 });
+        self.pending.lock().unwrap().insert(id.clone(), PendingRequest {
+            reply: send, picked: Some(picked), pickup_by, budget,
+        });
         let _pending = PendingCall(self.clone(), id.clone());
-        // A busy renderer can delay CDP while processing a large SPA; this is a
-        // deadline, not a sleep, and commands are still sent exactly once.
-        let timeout = Duration::from_secs(if matches!(operation, "cdp" | "devtools") { 10 } else { 3 });
-        let expires = chrono::Utc::now().timestamp_millis() + timeout.as_millis() as i64;
         {
             let mut queues = self.queues.lock().unwrap();
             let queue = queues.entry(client.to_string()).or_default();
             if queue.len() >= 128 {
                 return Err("Chrome 命令队列已满".into());
             }
-            queue.push_back(json!({"id":id,"operation":operation,"args":args,"expiresAt":expires}));
+            queue.push_back(json!({"id":id,"operation":operation,"args":args}));
         }
         self.queued.notify_waiters();
-        tokio::time::timeout(timeout, receive)
+        let taken = match tokio::time::timeout_at(pickup_by, &mut pickup).await {
+            Ok(value) => value,
+            Err(_) => {
+                // Withdrawal and pickup share the lock: "not executed" must exclude a concurrent poll.
+                {
+                    let mut pending = self.pending.lock().unwrap();
+                    if pending.get(&id).is_some_and(|call| call.picked.is_some()) {
+                        pending.remove(&id);
+                        return Err("Chrome 扩展未取走命令，本步未执行，可以重试；持续出现请确认 Nova Chrome 已启用".into());
+                    }
+                }
+                pickup.await
+            }
+        }.map_err(|_| "Chrome 连接中断，请重新观察")?;
+        // Allow the worker's deadline error (+500ms) to arrive without reducing its execution budget.
+        tokio::time::timeout_at(taken + budget + Duration::from_secs(1), receive)
             .await
             .map_err(|_| "Chrome 响应超时；结果可能已执行，请先观察，不要重放动作")?
             .map_err(|_| "Chrome 连接中断，请重新观察")?
@@ -406,7 +434,7 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<ChromeBridge>) -> R
             .as_str()
             .and_then(|id| state.pending.lock().unwrap().remove(id));
         if let Some(sender) = sender {
-            let _ = sender.send(if let Some(error) = body["error"].as_str() {
+            let _ = sender.reply.send(if let Some(error) = body["error"].as_str() {
                 Err(error.into())
             } else {
                 Ok(body["result"].clone())
@@ -572,8 +600,50 @@ mod tests {
         };
         assert!(command["expiresAt"].as_i64().unwrap() - chrono::Utc::now().timestamp_millis() > 8000);
         tokio::time::sleep(Duration::from_millis(3100)).await;
-        state.pending.lock().unwrap().remove(command["id"].as_str().unwrap()).unwrap().send(Ok(json!({"ok":true}))).unwrap();
+        state.pending.lock().unwrap().remove(command["id"].as_str().unwrap()).unwrap().reply.send(Ok(json!({"ok":true}))).unwrap();
         assert_eq!(request.await.unwrap().unwrap()["ok"], true);
+        assert!(state.take("test").is_none());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn pickup_wait_does_not_consume_execution_budget() {
+        let state = Arc::new(ChromeBridge::new());
+        let shared = state.clone();
+        let request = tokio::spawn(async move { shared.request_to("test", "tabs", json!({})).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(28)).await;
+        assert!(!request.is_finished());
+        let command = state.take("test").unwrap();
+        assert!(command["expiresAt"].as_i64().unwrap() - chrono::Utc::now().timestamp_millis() > 2500);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(!request.is_finished(), "worker timeout reply still has delivery grace");
+        state.pending.lock().unwrap().remove(command["id"].as_str().unwrap()).unwrap().reply.send(Ok(json!({"ok":true}))).unwrap();
+        assert_eq!(request.await.unwrap().unwrap()["ok"], true);
+        assert!(state.take("test").is_none());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn unpicked_timeout_withdraws_command_before_allowing_retry() {
+        let state = Arc::new(ChromeBridge::new());
+        let shared = state.clone();
+        let request = tokio::spawn(async move { shared.request_to("test", "goto", json!({})).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(PICKUP_WAIT).await;
+        assert!(state.take("test").is_none(), "a poll at the deadline must not take expired input");
+        assert!(request.await.unwrap().unwrap_err().contains("本步未执行"));
+        assert!(state.pending.lock().unwrap().is_empty());
+        assert!(state.take("test").is_none());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn picked_timeout_never_claims_input_was_not_executed() {
+        let state = Arc::new(ChromeBridge::new());
+        let shared = state.clone();
+        let request = tokio::spawn(async move { shared.request_to("test", "goto", json!({})).await });
+        tokio::task::yield_now().await;
+        assert!(state.take("test").is_some());
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(request.await.unwrap().unwrap_err().contains("可能已执行"));
+        assert!(state.pending.lock().unwrap().is_empty());
         assert!(state.take("test").is_none());
     }
     #[test]
