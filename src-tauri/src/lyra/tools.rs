@@ -91,14 +91,16 @@ pub fn tool_set(
         })),
     });
     if !read_only {
-        let desktop = crate::jianlai::tool_definition();
-        tools.push(Tool { name: "jianlai", description: desktop["description"].as_str().unwrap().into(), parameters: schema(desktop["inputSchema"].clone()) });
+        for desktop in crate::jianlai_tools::definitions() {
+            tools.push(Tool { name: desktop["name"].as_str().unwrap(), description: desktop["description"].as_str().unwrap().into(), parameters: schema(desktop["parameters"].clone()) });
+        }
         let employee = crate::employee::tool_definition();
         tools.push(Tool { name: "employee", description: employee["description"].as_str().unwrap().into(), parameters: schema(employee["inputSchema"].clone()) });
         let vault = crate::vault::tool_definition();
         tools.push(Tool { name: "vault", description: vault["description"].as_str().unwrap().into(), parameters: schema(vault["inputSchema"].clone()) });
-        let chrome = crate::chrome_browser::tool_definition();
-        tools.push(Tool { name: "chrome", description: chrome["description"].as_str().unwrap().into(), parameters: schema(chrome["inputSchema"].clone()) });
+        for chrome in crate::chrome_tools::definitions() {
+            tools.push(Tool { name: chrome["name"].as_str().unwrap(), description: chrome["description"].as_str().unwrap().into(), parameters: schema(chrome["parameters"].clone()) });
+        }
         for definition in crate::image_generation::tool_definitions() {
             tools.push(Tool {
                 name: if definition["name"] == "edit_image" { "edit_image" } else { "generate_image" },
@@ -263,7 +265,8 @@ fn compact_browser_result(value: &Value, max_bytes: usize) -> String {
             let mut fallback = json!({"contextCompacted":true,"evidenceOmitted":true,
                 "nextRead":"Read archivedToolOutput/documentPath before judging task completion."});
             for key in ["status","snapshotId","basedOnSnapshotId","documentPath","archivedToolOutput",
-                "images","coordinateSpace","tabTag","browserId","completedActions","verification","vision","steps","altairRun"] {
+                "images","coordinateSpace","tabTag","browserId","completedActions","verification","vision","steps","altairRun",
+                "reason","inputAttempted","error","nextCall","nextArguments","nextTool"] {
                 if let Some(value) = compact.get(key) { fallback[key] = value.clone(); }
             }
             return fallback.to_string();
@@ -289,7 +292,7 @@ pub(super) fn govern(
     }
     let (mut governed, archive_path, original_bytes) =
         govern_tool_text(&text, max_bytes, archive_dir, call_id, name);
-    if matches!(name, "chrome" | "jianlai") {
+    if crate::chrome_tools::is_tool(name) || crate::jianlai_tools::is_tool(name) {
         if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
             if value.is_object() {
                 value["archivedToolOutput"] = json!(archive_path);
@@ -630,17 +633,22 @@ async fn execute_inner(
     progress: Option<&(dyn Fn(String) + Send + Sync)>,
 ) -> ToolOutcome {
     match name {
-        "chrome" => {
+        name if crate::chrome_tools::is_tool(name) => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，Chrome 控制不可用"); }
-            match crate::native_browser::execute_chrome(root, args, owner).await {
+            let args = match crate::chrome_tools::arguments(name, args) { Ok(args) => args, Err(error) => return ToolOutcome::error(error) };
+            match crate::native_browser::execute_chrome(root, &args, owner).await {
                 Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
                 Err(error) => ToolOutcome::error(error),
             }
         }
-        "jianlai" => {
+        name if crate::jianlai_tools::is_tool(name) => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，剑来不可用"); }
-            match crate::jianlai::execute(root, args, owner).await {
-                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
+            let args = match crate::jianlai_tools::arguments(name, args) { Ok(args) => args, Err(error) => return ToolOutcome::error(error) };
+            match crate::jianlai::execute(root, &args, owner).await {
+                Ok(value) => {
+                    let value = if name == "jianlai" { value } else { crate::jianlai_tools::result(value, &args) };
+                    ToolOutcome::text(value.to_string()).with_details(value)
+                },
                 Err(error) => ToolOutcome::error(error),
             }
         }
@@ -840,18 +848,37 @@ mod tool_tests {
     async fn image_tools_work_without_polaris_and_are_blocked_in_read_only_mode() {
         for read_only in [false, true] {
             let tools = tool_set(read_only, false, false);
-            for name in ["generate_image", "edit_image", "jianlai", "chrome"] {
+            for name in ["generate_image", "edit_image"] {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
-            assert!(tools.iter().all(|tool| tool.name != "webview"));
+            assert_eq!(tools.iter().filter(|tool| crate::chrome_tools::is_tool(tool.name)).count(), if read_only { 0 } else { 14 });
+            assert_eq!(tools.iter().filter(|tool| crate::jianlai_tools::is_tool(tool.name)).count(), if read_only { 0 } else { 8 });
+            assert!(tools.iter().all(|tool| !matches!(tool.name, "webview" | "chrome" | "jianlai")));
         }
         let root = tempfile::tempdir().unwrap();
+        for tool in crate::chrome_tools::definitions().iter().chain(crate::jianlai_tools::definitions()) {
+            let result = super::execute_inner(root.path(),tool["name"].as_str().unwrap(),&json!({}),None,None,"test",None).await;
+            assert!(result.is_error && result.content[0]["text"].as_str().unwrap().contains("只读"));
+        }
+        let invalid = super::execute_inner(root.path(),"chrome_act",&json!({"tabTag":"C1","actions":[{"action":"click","ref":"r","x":0}]}),Some(&crate::lyra::prompt::detect_shell()),None,"test",None).await;
+        assert!(invalid.is_error && invalid.content[0]["text"].as_str().unwrap().contains("不接受字段 x"));
+        let invalid = super::execute_inner(root.path(),"jianlai_act",&json!({"actions":[{"action":"wait","x":0}]}),Some(&crate::lyra::prompt::detect_shell()),None,"test",None).await;
+        assert!(invalid.is_error && invalid.content[0]["text"].as_str().unwrap().contains("不接受字段 x"));
         let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, "test", None).await;
         assert!(result.is_error);
         assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
         let removed = super::execute_inner(root.path(), "webview", &json!({}), Some(&crate::lyra::prompt::detect_shell()), None, "test", None).await;
         assert!(removed.is_error);
         assert_eq!(removed.content[0]["text"], "未知工具：webview");
+    }
+
+    #[test]
+    fn jianlai_compaction_preserves_recovery_hints_and_input_receipts() {
+        let value = json!({"status":"not_executed","completedActions":0,"inputAttempted":false,
+            "nextTool":"jianlai_act","nextArguments":{"snapshotId":"s","imageId":"i"},
+            "nextCall":{"tool":"jianlai_activate","arguments":{"windowId":42}},"opaque":"x".repeat(10000)});
+        let compact: serde_json::Value = serde_json::from_str(&super::compact_browser_result(&value,1024)).unwrap();
+        for key in ["status","completedActions","inputAttempted","nextTool","nextArguments","nextCall"] { assert_eq!(compact[key],value[key]); }
     }
 
     #[tokio::test]

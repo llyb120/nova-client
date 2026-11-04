@@ -86,7 +86,7 @@ try {
         let result;
         if(command.operation==='tabs')result={tabs:[{tag,allowed:true,controllable:true,title:'Fixture',url:page.url()}]};
         else if(command.operation==='status')result={incognitoAllowed:false};
-        else if(command.operation==='select_tab'){assert.equal(command.args.tabTag,tag);result={tabTag:tag};}
+        else if(command.operation==='select_tab'){assert.equal(command.args.tabTag,tag);result={tabTag:tag,tabs:[{tag,title:'stale navigation title'}]};}
         else {
           assert.equal(command.args.tabTag,tag);assert.equal(command.operation,'cdp');
           assert(command.args.sessionId == null,'fixture has no cross-process iframe');
@@ -147,6 +147,15 @@ try {
     assert.equal(await page.evaluate(()=>document.querySelector('input').value),'Chrome桥接验证');
     // A popup appearing after observation must refuse input and show enough context to recover.
     const button=full.pages[0].items.find(i=>i.name==='查询');assert(button);
+    await page.evaluate(()=>document.querySelector('button').addEventListener('mouseenter',()=>document.querySelector('button').dataset.hovered='true'));
+    const hovered=await chromeUi('act',{tabTag:tag,visual:'none',maxTextChars:0,action:{action:'hover',ref:button.ref}});
+    assert.equal(hovered.status,'executed',JSON.stringify(hovered));
+    assert.equal(await page.locator('button').getAttribute('data-hovered'),'true');
+    assert.equal(await page.locator('output').textContent(),'','hover must never click');
+    assert.equal(hovered.pages[0].text,'');assert.equal(hovered.pages[0].visibleText,'');
+    const selected=await chromeUi('select_tab',{tabTag:tag,visual:'none'});
+    assert.equal(selected.load.status,'complete');assert.equal(selected.load.readyState,'complete');
+    assert.equal(selected.tabs[0].title,'Fixture','navigation returns the final tab inventory, not the pre-navigation title');
     await page.evaluate(()=>document.body.insertAdjacentHTML('beforeend','<div id="blocker" role="dialog" style="position:fixed;inset:0;background:white;z-index:99999">Search suggestions<button onclick="this.parentElement.remove()">Dismiss suggestions</button></div>'));
     const blocked=await chromeUi('act',{tabTag:tag,snapshotId:changed.snapshotId,feedback:'inspect',action:{action:'click',ref:button.ref}});
     assert.equal(blocked.status,'not_executed');assert.equal(blocked.inputAttempted,false);

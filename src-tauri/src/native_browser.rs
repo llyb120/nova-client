@@ -426,6 +426,10 @@ enum Action {
         #[serde(default)] button: Option<String>,
         #[serde(default)] click_count: Option<u8>,
     },
+    Hover {
+        frame: usize,
+        r#ref: String,
+    },
     Fill {
         frame: usize,
         r#ref: String,
@@ -468,7 +472,7 @@ fn normalize_action(mut value: Value) -> Value {
     let Some(map) = value.as_object_mut() else { return value };
     if !map.contains_key("action") { if let Some(kind) = map.remove("type").filter(Value::is_string) { map.insert("action".into(), kind); } }
     match map.get("action").and_then(Value::as_str).unwrap_or_default() {
-        "click" | "fill" | "scroll" | "upload" => { map.entry("frame").or_insert(json!(0)); }
+        "click" | "hover" | "fill" | "scroll" | "upload" => { map.entry("frame").or_insert(json!(0)); }
         "press" | "wait" | "type" | "move" | "click_at" | "drag" | "scroll_at" => { map.remove("frame"); map.remove("ref"); }
         _ => {}
     }
@@ -540,7 +544,7 @@ fn parse_actions(args: &Value, max_actions: usize) -> Result<Vec<Action>, String
 
 fn preflight(observation:&Observation, action:&mut Action, image_id:Option<&str>) -> Result<(),String> {
     match action {
-        Action::Click{frame,r#ref,..}|Action::Fill{frame,r#ref,..}|Action::Scroll{frame,r#ref:Some(r#ref),..}=>{
+        Action::Click{frame,r#ref,..}|Action::Hover{frame,r#ref}|Action::Fill{frame,r#ref,..}|Action::Scroll{frame,r#ref:Some(r#ref),..}=>{
             let has=|f:usize| observation.pages["pages"][f]["items"].as_array().is_some_and(|items|items.iter().any(|item|item["ref"].as_str()==Some(r#ref.as_str())));
             if !has(*frame) {
                 // ref 带文档前缀、跨 frame 唯一：模型常照示例填 frame 0，按 ref 实际所在 frame 纠正。
@@ -791,9 +795,9 @@ async fn apply(
             check(app,s)?; progress.attempted=true;
             cdp(app,"Input.insertText",json!({"text":text}),None,Some(s.cancel.clone())).await?;
         }
-        Action::Click{frame,r#ref,..} | Action::Fill{frame,r#ref,..} => {
+        Action::Click{frame,r#ref,..} | Action::Hover{frame,r#ref} | Action::Fill{frame,r#ref,..} => {
             progress.dom_preflight=true;
-            let mode=if matches!(action,Action::Fill{..}) {"fill"} else {"click"};
+            let mode=match action { Action::Fill{..} => "fill", Action::Hover{..} => "hover", _ => "click" };
             let p=point(app,observation,*frame,r#ref,mode).await?;
             // Hover is real input, then validate the same target again before pressing.
             progress.attempted=true;
@@ -806,6 +810,7 @@ async fn apply(
                 }
             }
             progress.dom_preflight=false;
+            if matches!(action,Action::Hover{..}) { return check(app,s); }
             if let Action::Fill{text,..}=action {
                 mouse(app,s,&p,"left",1,progress).await?;
                 require_focus(app,observation,*frame,r#ref).await?;
@@ -1139,7 +1144,7 @@ fn inline_summary(pages: &Value, args: &Value) -> Value {
     let mut result = pages.clone();
     if let Some(object) = result.as_object_mut() { object.remove("domCoordinates"); }
     let mut remaining_items = args["maxItems"].as_u64().unwrap_or(60).clamp(1, 2000) as usize;
-    let mut remaining_text = args["maxTextChars"].as_u64().unwrap_or(3000).clamp(100, 100000) as usize;
+    let mut remaining_text = args["maxTextChars"].as_u64().unwrap_or(3000).min(100000) as usize;
     // Separate, global budgets: viewport evidence must not disappear behind a long document prefix.
     let mut remaining_visible = remaining_text;
     let mut remaining_headings = 20;
@@ -1416,9 +1421,10 @@ async fn control_session(
             // A click/Enter often starts a navigation; feeding back the old DOM costs the model another
             // inspect round-trip. Wait (bounded) for the tab to finish loading before observing.
             if failure.is_none() && settle_ms > 0 && args["feedback"] != "none" && !s.cancel.load(Ordering::SeqCst)
-                && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::ClickAt{..} | Action::Press{..})) {
+                && actions.iter().any(|a| matches!(a, Action::Click{..} | Action::Hover{..} | Action::ClickAt{..} | Action::Press{..})) {
                 let tag = s.active_tab.rsplit(':').next().unwrap_or_default();
                 result["settle"] = wait_for_tab_load(app, tag, Duration::from_millis(settle_ms)).await;
+                result["settle"].as_object_mut().unwrap().remove("tabs");
                 // Loaded is not rendered: SPAs patch the DOM after their XHR. Wait for the DOM to go quiet
                 // so the feedback shows the result instead of costing the model another observe round-trip.
                 let budget = settle_ms.saturating_sub(result["settle"]["waitedMs"].as_u64().unwrap_or(0)).min(1000);
@@ -1944,27 +1950,40 @@ fn opened_tab_target(result: &Value) -> Option<&str> {
 
 /// Poll the extension's tab inventory until the tab finished loading (status complete, no
 /// pendingUrl). Bounded: a page that never settles still returns so the caller observes what is
-/// there; older extensions without `loading` report complete immediately.
+/// there; document readiness is checked even if an older extension omits `loading`.
+fn navigation_ready(tab: &Value, ready_state: Option<&str>) -> bool {
+    tab["loading"] != true && ready_state == Some("complete")
+}
+
 async fn wait_for_tab_load(app: &AppHandle, tag: &str, budget: Duration) -> Value {
     let started = std::time::Instant::now();
-    // Let the navigation commit before trusting the previous page's "complete".
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    let mut state = json!({"status":"unknown"});
-    loop {
-        match crate::chrome_browser::request(app, "tabs", json!({})).await {
-            Ok(value) => {
-                let Some(tab) = value["tabs"].as_array().and_then(|tabs| tabs.iter().find(|t| t["tag"] == tag)).cloned() else {
-                    state = json!({"status":"closed"});
-                    break;
-                };
-                let loading = tab["loading"] == true;
-                state = json!({"status": if loading {"loading"} else {"complete"}, "url": tab["url"], "title": tab["title"]});
-                if !loading { break; }
+    let mut state = json!({"status":"loading"});
+    // Let navigation commit before trusting the previous document's complete state.
+    tokio::time::sleep(Duration::from_millis(120).min(budget)).await;
+    while started.elapsed() < budget {
+        let reply = tokio::time::timeout(budget.saturating_sub(started.elapsed()), crate::chrome_browser::request(app, "tabs", json!({}))).await;
+        let tabs = match reply {
+            Ok(Ok(value)) => value["tabs"].clone(),
+            Ok(Err(error)) => { state["status"] = json!("unknown"); state["error"] = json!(error); break; }
+            Err(_) => break,
+        };
+        let tab = tabs.as_array().and_then(|tabs| tabs.iter().find(|t| t["tag"] == tag)).cloned();
+        state["tabs"] = tabs;
+        let Some(tab) = tab else { state["status"] = json!("closed"); break; };
+        state["url"] = tab["url"].clone(); state["title"] = tab["title"].clone();
+        if tab["loading"] != true {
+            let ready = tokio::time::timeout(budget.saturating_sub(started.elapsed()), crate::chrome_browser::request(app, "cdp",
+                json!({"tabTag":tag,"method":"Runtime.evaluate","params":{"expression":"document.readyState","returnByValue":true,"silent":true}}))).await;
+            match ready {
+                Ok(Ok(value)) => {
+                    state["readyState"] = value["result"]["value"].clone();
+                    if navigation_ready(&tab, state["readyState"].as_str()) { state["status"] = json!("complete"); break; }
+                }
+                Ok(Err(error)) => { state["status"] = json!("unknown"); state["error"] = json!(error); break; }
+                Err(_) => break,
             }
-            Err(error) => { state = json!({"status":"unknown","error":error}); break; }
         }
-        if started.elapsed() >= budget { break; }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(100).min(budget.saturating_sub(started.elapsed()))).await;
     }
     state["waitedMs"] = json!(started.elapsed().as_millis());
     state
@@ -1975,7 +1994,13 @@ async fn wait_for_tab_load(app: &AppHandle, tag: &str, budget: Duration) -> Valu
 /// failure is reported alongside the completed operation, never as an operation failure.
 async fn observe_tab(app: &AppHandle, root: &Path, thread_id: &str, tag: &str, args: &Value, mode: &str, budget: Duration) -> Value {
     let started = std::time::Instant::now();
-    let mut result = json!({"load": wait_for_tab_load(app, tag, budget).await});
+    let wait = Duration::from_millis(args["settleMs"].as_u64().unwrap_or(4000).min(5000)).min(budget);
+    let mut load = wait_for_tab_load(app, tag, wait).await;
+    let tabs = load.as_object_mut().unwrap().remove("tabs");
+    let mut result = json!({"load":load});
+    if matches!(args["operation"].as_str(), Some("open" | "new_tab" | "goto" | "select_tab" | "back" | "forward" | "reload")) {
+        if let Some(tabs) = tabs { result["tabs"] = tabs; }
+    }
     if result["load"]["status"] == "closed" {
         result["observationError"] = json!("标签已关闭，无法观察");
         return result;
@@ -2215,6 +2240,24 @@ mod tests {
         assert!(matches!(click, Action::Click { frame: 1, .. }));
         let mut fake = parse_action(r#"{"action":"click","frame":0,"ref":"c:1"}"#).unwrap();
         assert!(preflight(&observation, &mut fake, None).is_err());
+    }
+
+    #[test]
+    fn chrome_hover_empty_text_and_navigation_readiness() {
+        let mut observation = Observation { frames: vec![Frame { id:"main".into(), parent:None, context:1, session:None }],
+            id:"s".into(), pages:json!({"pages":[{"items":[{"ref":"target","name":"Help"}],"text":"body","visibleText":"body","headings":[]}]}),
+            captured:std::time::Instant::now(), screenshot:false, full_page:false, images:vec![] };
+        let mut hover = parse_action(r#"{"action":"hover","ref":"target"}"#).unwrap();
+        validate_action(&hover).unwrap(); preflight(&observation,&mut hover,None).unwrap();
+        assert!(parse_action(r#"{"action":"hover","ref":"target","x":1}"#).is_err());
+        let summary = inline_summary(&observation.pages,&json!({"maxTextChars":0}));
+        assert_eq!(summary["pages"][0]["text"], ""); assert_eq!(summary["pages"][0]["visibleText"], "");
+        assert!(summary["pages"][0]["elements"].as_str().unwrap().contains("target"));
+        observation.pages["pages"][0]["items"] = json!([]);
+        assert!(preflight(&observation,&mut hover,None).is_err());
+        assert!(navigation_ready(&json!({"loading":false}),Some("complete")));
+        for ready in [None,Some("interactive"),Some("loading")] { assert!(!navigation_ready(&json!({"loading":false}),ready)); }
+        assert!(!navigation_ready(&json!({"loading":true}),Some("complete")));
     }
 
     #[test]

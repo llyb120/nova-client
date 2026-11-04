@@ -53,7 +53,7 @@ impl History {
 fn trim_browser_dom(messages: &mut [Value]) {
     let mut seen = std::collections::HashMap::<String, usize>::new();
     for message in messages.iter_mut().rev() {
-        if message["role"] != "toolResult" || message["toolName"] != "chrome" { continue; }
+        if message["role"] != "toolResult" || !message["toolName"].as_str().is_some_and(crate::chrome_tools::is_tool) { continue; }
         let Some(parts) = message["content"].as_array_mut() else { continue; };
         let mut omitted = false;
         for part in parts.iter_mut().filter(|p| p["type"] == "text") {
@@ -218,11 +218,11 @@ mod tests {
             "images":[{"imageId":id,"path":format!("{id}.webp"),"frameStream":format!("{tab}:viewport")} ]});
         let results = vec![
             ("chrome", observed("C1", "old")),
-            ("chrome", observed("C2", "other-tab")),
+            ("chrome_inspect", observed("C2", "other-tab")),
             ("jianlai", observed("C1", "other-tool")),
-            ("chrome", observed("C1", "middle")),
-            ("chrome", json!({"tabTag":"C1","status":"executed","value":"readback"})),
-            ("chrome", observed("C1", "new")),
+            ("chrome_inspect", observed("C1", "middle")),
+            ("chrome_evaluate", json!({"tabTag":"C1","status":"executed","value":"readback"})),
+            ("chrome_act", observed("C1", "new")),
             ("chrome", json!({"pages":[{"text":"unbound"}]})),
             ("chrome", json!(["not an observation"])),
         ];

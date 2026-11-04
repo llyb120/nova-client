@@ -161,6 +161,7 @@ pub(super) const KEEP_FRAMES: usize = 2;
 /// Chrome/webview/剑来截图的 (toolName, frameStream)：流按工具隔离，缺少流标记或带 frame 的只读中间图不参与。
 pub(super) fn frame_of<'a>(message: &'a Value, image: &'a Value) -> Option<(&'a str, &'a str)> {
     let tool = message["toolName"].as_str()?;
+    let tool = if crate::chrome_tools::is_tool(tool) { "chrome" } else if crate::jianlai_tools::is_tool(tool) { "jianlai" } else { tool };
     if message["role"] != "toolResult" || !matches!(tool, "chrome" | "webview" | "jianlai") || image.get("frame").is_some() { return None; }
     Some((tool, image["frameStream"].as_str()?))
 }
@@ -2745,8 +2746,9 @@ mod tests {
 
     #[test]
     fn tool_payloads_preserve_optional_automation_arguments() {
-        let schemas = [("chrome", crate::chrome_browser::tool_definition()),
-            ("jianlai", serde_json::from_str::<Value>(include_str!("../../../scripts/jianlai-tool.json")).unwrap())];
+        let mut schemas = vec![("chrome", crate::chrome_browser::tool_definition()),
+            ("jianlai", crate::jianlai::tool_definition())];
+        schemas.extend(crate::chrome_tools::definitions().iter().chain(crate::jianlai_tools::definitions()).map(|tool| (tool["name"].as_str().unwrap(), json!({"description":tool["description"],"inputSchema":tool["parameters"]}))));
         let tools = schemas.iter().map(|(name, schema)| Tool {
             name,
             description: schema["description"].as_str().unwrap().into(),
@@ -2942,6 +2944,28 @@ mod tests {
             let text=output.to_string();
             for expected in ["snap-0","1600","719","NEVER rescale","call-shot"] { assert!(text.contains(expected),"{expected}: {text}"); }
         }
+    }
+
+    #[test]
+    fn chrome_split_tools_share_image_history_with_legacy_calls() {
+        let messages: Vec<_> = ["chrome", "chrome_inspect", "chrome_act", "chrome_screenshot"].into_iter().enumerate().map(|(i,name)|
+            json!({"role":"toolResult","toolName":name,"content":[],"details":{"images":[{"frameStream":"C1:viewport","path":format!("{i}.png")} ]}})).collect();
+        assert_eq!(tool_image_embeds(&messages),vec![vec![Embed::Omit],vec![Embed::Omit],vec![Embed::Image],vec![Embed::Image]]);
+        for message in &messages { assert_eq!(frame_of(message,&message["details"]["images"][0]),Some(("chrome","C1:viewport"))); }
+    }
+
+    #[test]
+    fn jianlai_split_tools_share_per_monitor_history_and_keep_read_only_frames_out() {
+        let message = |name: &str, path: &str, stream: &str| json!({"role":"toolResult","toolName":name,"content":[],
+            "details":{"images":[{"frameStream":stream,"path":path}]}});
+        let messages = vec![message("jianlai","old","monitor-1"), message("jianlai_screenshot","other","monitor-2"),
+            message("jianlai_windows","middle","monitor-1"),message("jianlai_act","latest","monitor-1"),
+            message("chrome_inspect","chrome","monitor-1")];
+        assert_eq!(tool_image_embeds(&messages),vec![vec![Embed::Omit],vec![Embed::Image],vec![Embed::Image],vec![Embed::Image],vec![Embed::Image]]);
+        assert_eq!(frame_of(&messages[3],&messages[3]["details"]["images"][0]),Some(("jianlai","monitor-1")));
+        assert!(frame_of(&messages[3],&json!({"frame":0,"frameStream":"monitor-1","path":"intermediate"})).is_none());
+        assert!(frame_of(&messages[3],&json!({"path":"crop"})).is_none());
+        assert!(drop_old_tool_images(&messages).is_none());
     }
 
     #[test]

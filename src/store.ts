@@ -2131,8 +2131,8 @@ export async function installChromeExtensionWithJianlai(status: { chromePath: st
   const id = await createThread(await api.scratchDir(), agentKind, model, "build", "");
   await sendPromptTo(id, [
     `请为 Google Chrome 安装 Nova 自带的 Chrome 扩展（目标版本 ${version}）。速度优先：已确定的动作尽量合批，不为经验搜索、保存或反馈增加任何检查。`,
-    `0. 先用 chrome 工具的 status 检测：若 connected 为 true、incognitoAllowed 为 true，且 version 等于 ${version}（若返回 extensions 列表，其中每个浏览器的 version 也都等于它），则已是最新，用一句话汇报并立即结束，不要用剑来。否则记下不符合的项（未连接/过期/未允许无痕/哪些浏览器），继续下面的步骤；status 报错或无法连接也视为未安装。`,
-    `以下用剑来（jianlai）操作桌面，直接使用 act 自动反馈，不额外截图：`,
+    `0. 先用 chrome_connection（command=status）检测：若 connected 为 true、incognitoAllowed 为 true，且 version 等于 ${version}（若返回 extensions 列表，其中每个浏览器的 version 也都等于它），则已是最新，用一句话汇报并立即结束，不要用剑来。否则记下不符合的项（未连接/过期/未允许无痕/哪些浏览器），继续下面的步骤；status 报错或无法连接也视为未安装。`,
+    `以下用剑来（jianlai_*）操作桌面，直接使用 jianlai_act 自动反馈，不额外截图：`,
     `1. 打开 Chrome${status.chromePath ? `（路径：${status.chromePath}）` : ""}，在地址栏输入 chrome://extensions 并回车。chrome:// 页面无法用 chrome 工具操作，全程用剑来。`,
     "2. 若右上角「开发者模式」未开启，先开启。",
     `3. 若列表中已有 Nova Chrome（ID ${status.extensionId}），先确认其来源路径是否为下述目录：是则点重新加载按钮；不是（旧位置或损坏）则先「移除」再加载；列表中没有则点击「加载已解压的扩展程序」，在文件夹选择对话框中选择目录：${status.extensionDir}`,

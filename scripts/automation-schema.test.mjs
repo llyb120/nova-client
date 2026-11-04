@@ -692,8 +692,8 @@ test('Chrome and Jianlai run only executes pre-confirmed steps', async()=>{
   assert.doesNotMatch(jianlai.description,/Unicode/);
   assert.match(typing,/clipboard\.text.*相等就不重输/);
   assert.match(typing,/未核验前不发送/);
-  assert.match(jianlai.inputSchema.properties.snapshotId.description,/act\/run必填/);
-  assert.match(jianlai.inputSchema.properties.snapshotId.description,/漏snapshotId只返回补参提示/);
+  assert.match(jianlai.inputSchema.properties.snapshotId.description,/可选.*省略.*本会话.*同模式/);
+  assert.match(jianlai.inputSchema.properties.snapshotId.description,/不因漏填ID要求补参/);
   assert.match(jianlai.inputSchema.properties.snapshotId.description,/纯wait不依赖快照/);
   assert(jianlai.description.length<650,'Keep operation-specific instructions beside their parameters');
   assert.match(jianlai.description,/已满足就立即汇报并结束/);

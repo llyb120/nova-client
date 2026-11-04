@@ -85,6 +85,7 @@ pub(crate) fn lease_input(tool: &'static str) -> Result<InputLease> {
     if tool == "jianlai" { crate::agent_glow::hold(); }
     Ok(InputLease(id))
 }
+#[cfg(test)]
 pub(crate) fn tool_definition() -> Value {
     serde_json::from_str(include_str!("../../scripts/jianlai-tool.json")).unwrap()
 }
@@ -160,6 +161,16 @@ struct Request {
     observe: Option<bool>,
     background: Option<bool>,
 }
+
+fn bind_input_snapshot<'a>(requested: &mut Option<String>, snapshot: Option<&'a Snapshot>, owner: &str, background: bool) -> Option<&'a Snapshot> {
+    let current = snapshot.filter(|snap| snap.owner == owner && snap.background == background
+        && snap.invalidated.is_none() && snap.taken.elapsed() <= Duration::from_secs(180));
+    if requested.as_deref().is_none_or(|id| id.trim().is_empty()) {
+        *requested = current.map(|snap| snap.id.clone());
+    }
+    current
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Action {
@@ -1112,7 +1123,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
         }
     }
     let is_act = args["operation"] == "act";
-    let request: Request = match serde_json::from_value(args) {
+    let mut request: Request = match serde_json::from_value(args) {
         Ok(request) => request,
         Err(e) if is_act => return Ok(json!({"status":"not_executed","completedActions":0,
             "error":format!("参数无效：{e}；本批次尚未执行。动作项只接受 action/x/y/toX/toY/button/text/key/delta/axis/ms/glide，action 取 click/double_click/move/drag/scroll/type/press/wait")})),
@@ -1293,17 +1304,18 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     "剑来 Linux 输入当前仅支持 X11；Wayland 不会静默使用 XWayland 操作".into(),
                 );
             }
-            let missing_snapshot = request.snapshot_id.as_deref().is_none_or(|id| id.trim().is_empty());
-            let current = state.as_ref().filter(|snap| snap.owner == owner && snap.background == bg
-                && snap.invalidated.is_none() && snap.taken.elapsed() <= Duration::from_secs(180));
+            let current = bind_input_snapshot(&mut request.snapshot_id, state.as_ref(), &owner, bg);
+            let missing_snapshot = request.snapshot_id.is_none();
             if missing_snapshot || current.is_some_and(|snap| Some(&snap.id) != request.snapshot_id.as_ref()) {
                 // Reject, never replay. Keep the latest usable observation instead of rotating IDs/images
                 // on every parameter error; check_target still validates it before any subsequent input.
-                let mut result = json!({"status":"not_executed","completedActions":0,"required":["snapshotId"]});
+                let mut result = json!({"status":"not_executed","completedActions":0,"inputAttempted":false});
                 if missing_snapshot {
-                    result["errorCode"] = json!("missing_snapshot_id");
-                    result["error"] = json!("act 缺少 snapshotId（不是快照过期）；未执行、未重新截图。请原样填写上次观察返回的 snapshotId 后提交动作。");
+                    result["required"] = json!(["observation"]);
+                    result["errorCode"] = json!("observation_required");
+                    result["error"] = json!("没有本会话同模式的可用观察；本批次未执行。先观察目标画面再决策，不需要补填 snapshotId。");
                 } else {
+                    result["required"] = json!(["snapshotId"]);
                     result["errorCode"] = json!("stale_snapshot_id");
                     result["error"] = json!("旧snapshotId不可用于输入；最新快照仍可用，未执行、未重新截图。请核对最新图及completedActions，不要重放已执行动作。");
                 }
@@ -1315,7 +1327,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     if snap.shots.len() == 1 { result["nextArguments"]["imageId"] = json!(snap.shots[0].image_id); }
                     result["next"] = json!("使用已有最新图片和 nextArguments 修正参数，重新决策剩余 actions；不要重放已执行动作。若上下文中已看不到该图，先用 recall 回看或重新 screenshot，不要凭记忆操作。");
                 } else {
-                    result["next"] = json!("当前没有本会话未失效的同模式快照；先 windows(observe:true) 或 screenshot 获取 snapshotId，不要继续省略它。");
+                    result["next"] = json!("当前没有本会话未失效的同模式观察；先 windows(observe:true) 或 screenshot 看目标画面，再决策剩余动作。snapshotId 可省略。");
                 }
                 return Ok(result);
             }
@@ -2087,6 +2099,28 @@ mod tests {
     }
 
     #[test]
+    fn omitted_snapshot_binds_only_the_owned_live_mode_without_refreshing_it() {
+        let mut snap = Snapshot {id:"current".into(),owner:"owner".into(),taken:Instant::now(),window:None,max_edge:1600,
+            foreground:None,shots:vec![],invalidated:None,background:false,delivered:vec![]};
+        let taken = snap.taken;
+        for mut id in [None,Some(String::new()),Some("  ".into())] {
+            assert!(bind_input_snapshot(&mut id,Some(&snap),"owner",false).is_some());
+            assert_eq!(id.as_deref(),Some("current")); assert_eq!(snap.taken,taken);
+        }
+        let mut explicit = Some("old".into());
+        assert!(bind_input_snapshot(&mut explicit,Some(&snap),"owner",false).is_some());
+        assert_eq!(explicit.as_deref(),Some("old"),"an explicit different basis is never silently replaced");
+        for (owner,background,invalidated,expired) in [("other",false,false,false),("owner",true,false,false),
+            ("owner",false,true,false),("owner",false,false,true)] {
+            snap.invalidated=invalidated.then(||"consumed".into());
+            snap.taken=if expired {taken-Duration::from_secs(181)} else {taken};
+            let mut id=None;
+            assert!(bind_input_snapshot(&mut id,Some(&snap),owner,background).is_none()); assert!(id.is_none());
+        }
+        let mut id=None; assert!(bind_input_snapshot(&mut id,None,"owner",false).is_none());
+    }
+
+    #[test]
     fn invalid_wait_rejects_whole_batch_before_input() {
         let shot = Shot { overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
@@ -2098,17 +2132,16 @@ mod tests {
         assert_eq!(DESKTOP.lock().unwrap().as_ref().unwrap().id, "validation");
         let original_taken = DESKTOP.lock().unwrap().as_ref().unwrap().taken;
         for request in [
-            json!({"operation":"act","imageId":"monitor-1","actions":[{"action":"click","x":1,"y":1}]}),
-            json!({"operation":"act","snapshotId":"","actions":[{"action":"click","x":1,"y":1}]}),
-            json!({"actions":[{"action":"click","x":1,"y":1}]}),
+            json!({"operation":"act","imageId":"monitor-1","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":8000}]}),
+            json!({"operation":"act","snapshotId":"","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":8000}]}),
+            json!({"actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":8000}]}),
         ] {
+            // Invalid wait proves the omitted ID reached batch validation without injecting real input.
             let result = run("validation".into(), request).unwrap();
-            assert_eq!(result["errorCode"], "missing_snapshot_id");
+            assert!(result["error"].as_str().unwrap().contains("actions[1].ms=8000"));
             assert_eq!(result["status"], "not_executed");
             assert_eq!(result["completedActions"], 0);
-            assert_eq!(result["snapshotId"], "validation");
-            assert_eq!(result["nextArguments"], json!({"operation":"act","snapshotId":"validation","imageId":"monitor-1"}));
-            assert!(result.get("images").is_none(), "missing parameters must not generate a new screenshot");
+            assert!(result.get("images").is_none(), "binding the current observation must not generate a new screenshot");
             let state = DESKTOP.lock().unwrap();
             assert_eq!(state.as_ref().unwrap().id, "validation");
             assert_eq!(state.as_ref().unwrap().taken, original_taken);
@@ -2136,6 +2169,8 @@ mod tests {
                 snap.background = background;
             }
             let result = run(owner.into(), json!({"operation":"act","actions":[{"action":"click","x":1,"y":1}]})).unwrap();
+            assert_eq!(result["errorCode"], "observation_required");
+            assert_eq!(result["inputAttempted"], false);
             assert_eq!(result["completedActions"], 0);
             assert!(result.get("snapshotId").is_none());
             assert!(result.get("nextArguments").is_none());
