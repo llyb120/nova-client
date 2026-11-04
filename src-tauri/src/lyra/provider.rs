@@ -353,6 +353,10 @@ fn completions_messages(
                         })
                     })
                     .collect();
+                // 思考字段不能替代正文或工具调用；中断后可能只留下思考块。
+                if tool_calls.is_empty() && text.trim_start().is_empty() {
+                    continue;
+                }
                 let mut item = Map::new();
                 item.insert("role".into(), json!("assistant"));
                 item.insert(
@@ -3398,6 +3402,49 @@ mod tests {
                 }
             }
             assert_eq!(message, original);
+        }
+    }
+
+    #[test]
+    fn completions_messages_skip_empty_assistants_without_changing_history() {
+        for requires_reasoning in [false, true] {
+            let mut model = test_model("openai-completions");
+            model.requires_reasoning_content = requires_reasoning;
+            let messages = vec![
+                json!({"role":"user","content":"任务"}),
+                json!({"role":"assistant"}),
+                json!({"role":"assistant","content":null}),
+                json!({"role":"assistant","content":[]}),
+                json!({"role":"assistant","content":[{"type":"text","text":""},{"type":"text","text":""}]}),
+                json!({"role":"assistant","content":[{"type":"text","text":" \n\t"}]}),
+                json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,
+                    "content":[{"type":"thinking","thinking":"中断的思考"}]}),
+                json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,
+                    "content":[{"type":"thinking","thinking":"先读文件"},{"type":"text","text":"  我来读一下  "}]}),
+                json!({"role":"assistant","content":[{"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"a.rs"}}]}),
+                json!({"role":"toolResult","toolCallId":"call-1","content":[{"type":"text","text":"文件内容"}]}),
+                json!({"role":"user","content":"继续"}),
+            ];
+            let original = messages.clone();
+            let out = completions_messages("sys", &messages, &model);
+            assert_eq!(out.len(), 6);
+            assert_eq!(out[0], json!({"role":"system","content":"sys"}));
+            assert_eq!(out[1], json!({"role":"user","content":[{"type":"text","text":"任务"}]}));
+            assert_eq!(out[2]["content"], "  我来读一下  ");
+            assert_eq!(out[3]["role"], "assistant");
+            assert!(out[3]["content"].is_null());
+            assert_eq!(out[3]["tool_calls"], json!([{"id":"call-1","type":"function",
+                "function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]));
+            assert_eq!(out[4], json!({"role":"tool","tool_call_id":"call-1","content":"文件内容"}));
+            assert_eq!(out[5], json!({"role":"user","content":[{"type":"text","text":"继续"}]}));
+            if requires_reasoning {
+                assert_eq!(out[2]["reasoning_content"], "先读文件");
+                assert_eq!(out[3]["reasoning_content"], "");
+            } else {
+                assert!(out[2].get("reasoning_content").is_none());
+                assert!(out[3].get("reasoning_content").is_none());
+            }
+            assert_eq!(messages, original);
         }
     }
 
