@@ -152,7 +152,7 @@
 .mini-message { margin-top: 20px; padding: 12px; border-radius: 9px; background: var(--bg-input); font-size: 14px; line-height: 1.9; }
 .mini-message.user { background: var(--accent-dim); }
 .mini-message small { color: var(--text-muted); font-size: 12px; }
-.mini-message p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mini-message p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
 .mini-generating { display: flex; gap: 8px; align-items: center; margin-top: 20px; font-size: 13px; color: var(--accent); line-height: 1.7; }
 .mini-context { margin: 0 16px 10px; border-left: 2px solid var(--accent); background: var(--accent-dim); border-radius: 0 6px 6px 0; padding: 9px 12px; }
 .mini-context > div { display: flex; justify-content: space-between; color: var(--text-muted); font-size: 12px; }
