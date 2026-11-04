@@ -131,7 +131,10 @@ fn variant_label(variant: &str) -> String {
         "high" => "High".into(),
         "xhigh" => "XHigh".into(),
         "max" => "Max".into(),
-        "niubi" => "牛逼".into(),
+        "niu-n" => "牛N".into(),
+        "niu-l" => "牛L".into(),
+        "niu-h" => "牛H".into(),
+        "niu-m" => "牛M".into(),
         other => other.into(),
     }
 }
@@ -139,6 +142,16 @@ fn variant_label(variant: &str) -> String {
 pub(super) fn is_deepseek_flash(model_id: &str) -> bool {
     let id = model_id.to_ascii_lowercase();
     id.contains("deepseek") && id.contains("flash")
+}
+
+pub(super) fn boosted_effort(level: &str) -> Option<&'static str> {
+    match level {
+        "niu-n" => Some("none"),
+        "niu-l" => Some("low"),
+        "niu-h" => Some("high"),
+        "niu-m" | "niubi" => Some("max"), // 兼容旧会话保存的档位。
+        _ => None,
+    }
 }
 
 fn is_model_config(value: &Value) -> bool {
@@ -248,6 +261,7 @@ pub fn model_options(config: &Value) -> Vec<Value> {
                 out.push(json!({ "value": value, "name": name, "_meta": meta }));
             } else {
                 for (variant, variant_config) in variants {
+                    if is_deepseek_flash(&model_id) && boosted_effort(variant).is_some() { continue; }
                     let label = variant_config
                         .get("name")
                         .and_then(Value::as_str)
@@ -260,13 +274,15 @@ pub fn model_options(config: &Value) -> Vec<Value> {
                     }));
                 }
             }
-            if is_deepseek_flash(&model_id) && model.pointer("/variants/niubi").is_none()
-                && native_variant.as_ref().is_none_or(|(_, _, effort)| effort == "max") {
-                out.push(json!({
-                    "value": format!("{value}/variant/niubi"),
-                    "name": format!("{name} · 牛逼"),
-                    "_meta": meta,
-                }));
+            if is_deepseek_flash(&model_id) {
+                for variant in ["niu-n", "niu-l", "niu-h", "niu-m"] {
+                    if native_variant.as_ref().is_some_and(|(_, _, effort)| Some(effort.as_str()) != boosted_effort(variant)) { continue; }
+                    out.push(json!({
+                        "value": format!("{value}/variant/{variant}"),
+                        "name": format!("{name} · {}", variant_label(variant)),
+                        "_meta": meta,
+                    }));
+                }
             }
         }
     }
@@ -444,7 +460,7 @@ pub fn resolve_model(
         && !variant.is_some_and(|v| configured_model.is_some_and(|m| m["variants"].get(v).is_some())) {
         let base = configured_model.and_then(|m| super::devin_provider::model_variant(model_id,
             m["name"].as_str().unwrap_or(model_id))).map(|(base, _, _)| base).unwrap_or_else(|| model_id.to_string());
-        let effort = variant.map(|v| if v == "niubi" && is_deepseek_flash(&base) { "max" } else { v });
+        let effort = variant.map(|v| if is_deepseek_flash(&base) { boosted_effort(v).unwrap_or(v) } else { v });
         model_entries(provider).into_iter().find_map(|(id, model)| {
             let (candidate, _, level) = super::devin_provider::model_variant(&id, model["name"].as_str().unwrap_or(&id))?;
             (candidate == base && effort.is_none_or(|e| e == level)).then_some((id, model, level))
@@ -453,7 +469,7 @@ pub fn resolve_model(
     let model = native_selection.as_ref().map(|(_, model, _)| *model).or(configured_model)
         .ok_or_else(|| format!("Lyra model 不存在：{base_selection}"))?;
     let model_id = native_selection.as_ref().map_or(model_id, |(id, _, _)| id.as_str());
-    let boosted = variant == Some("niubi") && is_deepseek_flash(model_id);
+    let boosted = variant.and_then(boosted_effort).is_some() && is_deepseek_flash(model_id);
     if let Some(variant) = variant.filter(|_| !boosted && native_selection.is_none()) {
         if model
             .get("variants")
@@ -498,7 +514,7 @@ pub fn resolve_model(
     }
     let variant_options = native_selection.as_ref().map(|(_, _, effort)| json!({"reasoningEffort": effort}))
         .or_else(|| variant.and_then(|name| {
-            model.get("variants").and_then(|variants| variants.get(if boosted { "max" } else { name }))
+            model.get("variants").and_then(|variants| variants.get(if boosted { boosted_effort(name).unwrap() } else { name }))
         }).cloned())
         .unwrap_or(Value::Null);
     let service_tier = variant_options
@@ -537,7 +553,7 @@ pub fn resolve_model(
     );
     let top_p = sampling_number(&variant_options, model, provider, "topP", "top_p");
     let thinking_level = if boosted {
-        Some("niubi".into())
+        variant.map(str::to_string)
     } else {
         variant_options.get("reasoningEffort").and_then(Value::as_str).map(str::to_string)
             .or_else(|| model.pointer("/options/reasoningEffort").or_else(|| provider.pointer("/options/reasoningEffort"))
@@ -742,13 +758,19 @@ mod tests {
                 let selection = format!("{base}/variant/niubi");
                 let options = model_options(&config);
                 let boosts: Vec<_> = options.iter().filter(|option| option["value"] == selection).collect();
-                assert_eq!(boosts.len(), usize::from(eligible), "{base}");
+                assert!(boosts.is_empty(), "legacy mode must not appear: {base}");
+                for (variant, label) in [("niu-n", "牛N"), ("niu-l", "牛L"), ("niu-h", "牛H"), ("niu-m", "牛M")] {
+                    let choice = format!("{base}/variant/{variant}");
+                    assert_eq!(options.iter().filter(|o| o["value"] == choice && o["name"].as_str().unwrap().ends_with(label)).count(), usize::from(eligible));
+                    let resolved = resolve_model(&config, Some(&choice), &HashMap::new());
+                    if eligible { assert_eq!(resolved.unwrap().thinking_level.as_deref(), Some(variant)); }
+                    else { assert!(resolved.is_err()); }
+                }
                 assert_eq!(default_model(&config).unwrap(), format!("{base}/variant/max"));
                 let max = resolve_model(&config, Some(&format!("{base}/variant/max")), &HashMap::new()).unwrap();
                 assert_eq!(max.thinking_level.as_deref(), Some("max"));
                 let boost = resolve_model(&config, Some(&selection), &HashMap::new());
                 if eligible {
-                    assert!(boosts[0]["name"].as_str().unwrap().ends_with(" · 牛逼"));
                     let boost = boost.unwrap();
                     assert_eq!(boost.thinking_level.as_deref(), Some("niubi"));
                     assert_eq!(boost.model, max.model);

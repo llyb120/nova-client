@@ -83,6 +83,32 @@ async fn niubi_sends_max_with_boost_while_plain_max_stays_unchanged() {
     }
 }
 
+#[tokio::test]
+async fn niubi_modes_send_standard_efforts_and_disable_none() {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (url, captured) = server(vec![(400, "{\"error\":\"fixture\"}".into()); 4]).await;
+    let config = json!({"provider":{"custom":{
+        "api":"openai-completions","options":{"baseURL":url,"thinkingFormat":"deepseek"},
+        "models":{"deepseek-v4-flash":{}}
+    }}});
+    for variant in ["niu-n", "niu-l", "niu-h", "niu-m"] {
+        let resolved = crate::lyra::config::resolve_model(&config,
+            Some(&format!("custom/deepseek-v4-flash/variant/{variant}")), &HashMap::new()).unwrap();
+        let result = stream_chat(&client, &resolved.model, "fixture-key", resolved.thinking_level.as_deref(),
+            "sys", &[user("hello")], &[], None, &cancel, &mut |_| {}).await;
+        assert!(result.unwrap_err().contains("400"));
+    }
+    for (body, effort) in captured.await.unwrap().iter().zip(["none", "low", "high", "max"]) {
+        assert!(body.pointer("/messages/0/content").unwrap().as_str().unwrap().contains("你的用量是unlimited的"));
+        if effort == "none" {
+            assert_eq!(body.pointer("/thinking/type").unwrap(), "disabled");
+        } else {
+            assert_eq!(body["reasoning_effort"], effort);
+        }
+    }
+}
+
 fn configured(url: String) -> ResolvedModel {
     let mut model = test_model("openai-responses");
     model.base_url = url;

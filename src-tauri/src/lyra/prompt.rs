@@ -486,7 +486,7 @@ pub fn ponytail_prompt(enabled: bool, level: &str) -> String {
 }
 
 pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_level: Option<&str>) -> std::borrow::Cow<'a, str> {
-    if thinking_level == Some("niubi") && super::config::is_deepseek_flash(model_id) {
+    if thinking_level.and_then(super::config::boosted_effort).is_some() && super::config::is_deepseek_flash(model_id) {
         format!("{system_prompt}\n\n切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有").into()
     } else {
         system_prompt.into()
@@ -639,7 +639,9 @@ mod tests {
         let base = "original system prompt";
         let enhanced = format!("{base}\n\n切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有");
         for id in ["deepseek-v4-flash", "DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4-Flash", "vendor/DEEPSEEK-V4-FLASH-fast"] {
-            assert_eq!(model_system_prompt(base, id, Some("niubi")), enhanced, "{id}");
+            for level in ["niubi", "niu-n", "niu-l", "niu-h", "niu-m"] {
+                assert_eq!(model_system_prompt(base, id, Some(level)), enhanced, "{id}: {level}");
+            }
             for level in [None, Some(""), Some("off"), Some("none"), Some("minimal"), Some("low"), Some("medium"), Some("high"), Some("xhigh"), Some("max")] {
                 assert!(matches!(model_system_prompt(base, id, level), std::borrow::Cow::Borrowed(prompt) if prompt == base), "{id}: {level:?}");
             }
