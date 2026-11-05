@@ -16,7 +16,7 @@ use tokio::io::AsyncReadExt;
 
 const LIMIT: usize = 32 * 1024 * 1024;
 const RPC: &str = "/exa.api_server_pb.ApiServerService/GetChatMessage";
-/// ponytail: 离线快照不会自动更新；Devin 上新模型后用 `devin models list --format json` 重新生成。
+/// ponytail: 模型和限额来自 `devin models list --format json`；supports_images 来自 ACP session/new 的 cognition.ai/supportsImages。
 const SNAPSHOT_VERSION: &str = "3000.11.228";
 const SNAPSHOT: &str = include_str!("devin_models.json");
 /// 在 Nova 里网页登录得到的凭据（与 CLI credentials.toml 同格式），位于 ~/.nova。
@@ -196,12 +196,24 @@ async fn catalog(options: &Value, force: bool) -> Result<Catalog, String> {
 async fn cli_catalog(binary: &str) -> Result<Catalog, String> {
     let parsed: Value = serde_json::from_slice(&cli(binary, &["models", "list", "--format", "json"]).await?)
         .map_err(|_| "Devin 模型目录不是有效 JSON")?;
-    let families = parsed["families"].as_array().filter(|v| !v.is_empty()).ok_or("Devin 模型目录缺少 families")?
+    let mut families: Vec<Value> = parsed["families"].as_array().filter(|v| !v.is_empty()).ok_or("Devin 模型目录缺少 families")?
         .iter().filter(|family| family["slug"] != "fusion").cloned().collect();
+    inherit_image_capabilities(&mut families);
     let version = cli(binary, &["version"]).await?;
     let version = regex::Regex::new(r"\d+\.\d+\.\d+").unwrap().find(&String::from_utf8_lossy(&version))
         .ok_or("无法解析 Devin CLI 版本")?.as_str().to_string();
     Ok(Catalog { families, version, loaded: Instant::now() })
+}
+
+fn inherit_image_capabilities(families: &mut [Value]) {
+    let bundled = snapshot();
+    for family in families {
+        let Some(supports_images) = bundled.families.iter().find(|candidate| candidate["slug"] == family["slug"])
+            .and_then(|candidate| candidate["variants"][0]["supports_images"].as_bool()) else { continue };
+        for variant in family["variants"].as_array_mut().into_iter().flatten() {
+            if variant.get("supports_images").is_none() { variant["supports_images"] = json!(supports_images); }
+        }
+    }
 }
 
 fn snapshot() -> Catalog {
@@ -237,8 +249,8 @@ fn catalog_models(catalog: &Catalog) -> Map<String, Value> {
             "name": variant["label"].as_str().unwrap_or(id),
             "limit": { "context": variant["max_context_tokens"].as_u64().unwrap_or(128000),
                 "output": variant["max_output_tokens"].as_u64().unwrap_or(128000).min(128000) },
-            // 目录不含模态信息；Devin 后端统一接收图片，缺省会被当成纯文本模型而丢掉截图。
-            "modalities": { "input": ["text", "image"] },
+            // CLI models list 不含模态；快照记录 ACP 能力，未知模型保守按纯文本处理。
+            "modalities": { "input": if variant["supports_images"] == true { vec!["text", "image"] } else { vec!["text"] } },
             "options": { "supportsReasoningEffort": false, "supportsThinkingToggle": false,
                 "requiresReasoningContentOnAssistantMessages": true }
         }));
@@ -765,11 +777,26 @@ mod tests {
     #[test]
     fn catalog_aliases_limits_and_priority_effort() {
         let catalog = Catalog { loaded: Instant::now(), version: "1.2.3".into(), families: vec![json!({"slug":"gpt","aliases":["alias"],"variants":[
-            {"model_uid":"gpt-low-priority","max_context_tokens":272000,"max_output_tokens":200000}, {"model_uid":"gpt-high-priority"}]})] };
+            {"model_uid":"gpt-low-priority","max_context_tokens":272000,"max_output_tokens":200000,"supports_images":false},
+            {"model_uid":"gpt-high-priority","supports_images":true}]})] };
         assert_eq!(resolve_model(&catalog,"alias",Some("high")).unwrap(), "gpt-high-priority");
         assert!(resolve_model(&catalog,"gpt",Some("max")).is_err());
         assert_eq!(catalog_models(&catalog)["gpt-low-priority"]["limit"]["output"],128000);
-        assert_eq!(catalog_models(&catalog)["gpt-low-priority"]["modalities"]["input"], json!(["text","image"]));
+        assert_eq!(catalog_models(&catalog)["gpt-low-priority"]["modalities"]["input"], json!(["text"]));
+        assert_eq!(catalog_models(&catalog)["gpt-high-priority"]["modalities"]["input"], json!(["text","image"]));
+    }
+
+    #[test]
+    fn cli_models_inherit_acp_image_capabilities_without_overriding_explicit_values() {
+        let mut families = vec![
+            json!({"slug":"swe-2-flash","variants":[{"model_uid":"swe-2-flash-new"}]}),
+            json!({"slug":"glm-5.3-flash","variants":[{"model_uid":"glm-5-3-flash-new"}]}),
+            json!({"slug":"claude-opus-5.5","variants":[{"model_uid":"claude-opus-5-5-new","supports_images":false}]}),
+        ];
+        inherit_image_capabilities(&mut families);
+        assert_eq!(families[0]["variants"][0]["supports_images"], false);
+        assert_eq!(families[1]["variants"][0]["supports_images"], true);
+        assert_eq!(families[2]["variants"][0]["supports_images"], false);
     }
 
     #[test]
