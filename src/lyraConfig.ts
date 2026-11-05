@@ -4,6 +4,7 @@
 // Lyra 跟随系统代理：旧配置里的 options.proxy 不展示，保存时丢弃。
 
 export type Kv = { key: string; value: string };
+export type ContextRuleDraft = { keyword: string; context: string };
 export type ModelDraft = {
   id: string;
   name: string;
@@ -25,6 +26,7 @@ export type ProviderDraft = {
   apiKey: string;
   /** 模型关键词过滤（逗号分隔），空表示不过滤。 */
   modelFilter: string;
+  contextRules: ContextRuleDraft[];
   headers: Kv[];
   fields: Kv[];
   models: ModelDraft[];
@@ -70,6 +72,41 @@ export const passesFilter = (p: { modelFilter: string }, id: string, name?: stri
 export const hasVariants = (raw: Record<string, any>) =>
   isObject(raw.variants) && Object.keys(raw.variants).length > 0;
 
+export function parseContextTokens(text: string): number | null {
+  const match = /^(\d+)(k)?$/i.exec(text.trim());
+  const tokens = match ? Number(match[1]) * (match[2] ? 1000 : 1) : NaN;
+  return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : null;
+}
+
+function serializeContextRules(rules: ContextRuleDraft[]) {
+  return rules.map((rule, index) => {
+    const keyword = rule.keyword.trim();
+    if (!keyword) throw new Error(`上下文规则 ${index + 1} 的关键词不能为空`);
+    const context = parseContextTokens(rule.context);
+    if (context === null) throw new Error(`上下文规则 ${index + 1} 请输入正整数或 k 单位，如 100000 / 100k`);
+    return { keyword, context };
+  });
+}
+
+export function contextPreview(p: ProviderDraft, id: string, name?: string, catalogContext = 200_000): string {
+  const manual = p.models.find((m) => m.id.trim() === id);
+  const explicit = Number(manual?.context);
+  const format = (tokens: number) => `${tokens % 1000 === 0 ? `${tokens / 1000}k` : tokens.toLocaleString()} tokens`;
+  if (Number.isFinite(explicit) && explicit > 0) return `${format(Math.floor(explicit))}（手动设置）`;
+  // 普通预设的手填模型整体覆盖目录；本地预设按字段合并。
+  const inheritsCatalog = !manual || isLocalPreset(p.preset);
+  const modelName = manual?.name.trim() || (inheritsCatalog ? name : "") || id;
+  const rule = p.contextRules.find(({ keyword }) => {
+    const word = keyword.trim().toLowerCase();
+    return word && (id.toLowerCase().includes(word) || modelName.toLowerCase().includes(word));
+  });
+  if (rule) {
+    const context = parseContextTokens(rule.context);
+    return context === null ? "上下文规则值无效" : `${format(context)}（规则：${rule.keyword.trim()}）`;
+  }
+  return `${format(inheritsCatalog ? catalogContext : 200_000)}（模型目录／默认）`;
+}
+
 export function modelDraft(id: string, raw: Record<string, any>): ModelDraft {
   const options = isObject(raw.options) ? raw.options : {};
   return {
@@ -87,6 +124,13 @@ export function modelDraft(id: string, raw: Record<string, any>): ModelDraft {
 
 export function providerDraft(id: string, raw: Record<string, any>): ProviderDraft {
   const options = isObject(raw.options) ? raw.options : {};
+  if (raw.contextRules !== undefined && !Array.isArray(raw.contextRules)) throw new Error(`Provider ${id} 的 contextRules 必须是数组`);
+  const contextRules = (raw.contextRules ?? []).map((rule: unknown, index: number) => {
+    if (!isObject(rule) || typeof rule.keyword !== "string" || typeof rule.context !== "number" || Object.keys(rule).some((key) => !["keyword", "context"].includes(key))) {
+      throw new Error(`Provider ${id} 的上下文规则 ${index + 1} 须只包含 keyword 字符串和 context 数字`);
+    }
+    return { keyword: rule.keyword, context: String(rule.context) };
+  });
   // 旧导入项接入统一预设，保留 ID、已选模型和用户覆盖项。
   const legacy = !raw.preset && ["local-codex", "local-claude-code"].find((prefix) =>
     (id === prefix || new RegExp(`^${prefix}-[0-9]+$`).test(id)) &&
@@ -99,6 +143,7 @@ export function providerDraft(id: string, raw: Record<string, any>): ProviderDra
     baseURL: options.baseURL ?? options.baseUrl ?? "",
     apiKey: options.apiKey ?? "",
     modelFilter: Array.isArray(raw.modelFilter) ? raw.modelFilter.join(", ") : "",
+    contextRules,
     headers: toKv(options.headers),
     fields: fieldsOf(options, OPTION_KEYS),
     models: Object.entries(isObject(raw.models) ? raw.models : {}).map(([mid, m]) =>
@@ -144,6 +189,7 @@ export function serializeProvider(p: ProviderDraft) {
   setOrDelete(out, "name", p.name.trim());
   setOrDelete(out, "api", p.api);
   setOrDelete(out, "modelFilter", splitFilter(p.modelFilter).length ? splitFilter(p.modelFilter) : "");
+  setOrDelete(out, "contextRules", p.contextRules.length ? serializeContextRules(p.contextRules) : "");
   const options: Record<string, any> = { ...fromKv(p.fields, false), baseURL: p.baseURL.trim() };
   // 预设的 Base URL 留空即用默认值，不写空串。
   if (p.preset) setOrDelete(options, "baseURL", options.baseURL);
@@ -166,6 +212,7 @@ export function validate(providers: ProviderDraft[], presets: Preset[]): string 
     const preset = presets.find((x) => x.id === p.preset);
     if (!p.baseURL.trim() && !preset?.baseURL && !preset?.local) return `Provider ${id} 缺少 Base URL`;
     if (!p.api && !p.raw.npm && !preset) return `Provider ${id} 需要选择协议`;
+    try { serializeContextRules(p.contextRules); } catch (e) { return `Provider ${id}：${(e as Error).message}`; }
     const models = new Set<string>();
     for (const m of p.models) {
       const mid = m.id.trim();

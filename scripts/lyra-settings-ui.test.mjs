@@ -50,7 +50,7 @@ window.testCalls = () => calls;
 render(() => <div class="modal-backdrop"><div class="modal settings-modal">
   <div class="modal-head">设置</div>
   <div class="settings-tabs"><button class="settings-tab active">Lyra</button></div>
-  <div class="modal-body"><LyraConfigPanel onSaver={save => { window.testSave = save; }} /></div>
+  <div class="modal-body"><LyraConfigPanel section="providers" onSaver={save => { window.testSave = save; }} /></div>
   <div class="modal-foot"><button class="btn primary" onClick={() => window.testSave()}>保存</button></div>
 </div></div>, document.getElementById('root')!);
 `);
@@ -88,7 +88,7 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
   assert.equal(await primary.evaluate(el => el.open), true, "first provider is immediately usable");
   assert.equal(await providers.nth(1).evaluate(el => el.open), false, "other providers stay compact");
   assert.equal(await primary.locator("details.lyra-model").first().evaluate(el => el.open), false);
-  const advanced = primary.locator("details.lyra-advanced").filter({ has: page.getByLabel("代理", { exact: true }) });
+  const advanced = primary.locator("details.lyra-advanced").filter({ has: page.getByLabel("ID", { exact: true }) });
   assert.equal(await advanced.evaluate(el => el.open), false, "advanced fields start collapsed");
   await page.evaluate(() => document.fonts.ready);
   for (const theme of ["ink-dark", "ink-light"]) {
@@ -101,18 +101,37 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
 
   await primary.getByLabel("API Key", { exact: true }).fill("sk-edited");
   await advanced.locator(":scope > summary").press("Enter");
-  await advanced.getByLabel("代理", { exact: true }).fill("http://127.0.0.1:7890");
+  const rules = advanced.getByRole("region", { name: "模型上下文规则", exact: true });
+  await rules.getByRole("button", { name: "添加规则", exact: true }).click();
+  await rules.getByLabel("上下文规则 1 关键词", { exact: true }).fill("gpt");
+  await rules.getByLabel("上下文规则 1 窗口", { exact: true }).fill("100k");
   await advanced.locator(":scope > summary").click();
   await primary.locator(":scope > summary").click();
   await primary.locator(":scope > summary").press("Enter");
   assert.equal(await primary.getByLabel("API Key", { exact: true }).inputValue(), "sk-edited");
   await advanced.locator(":scope > summary").click();
-  assert.equal(await advanced.getByLabel("代理", { exact: true }).inputValue(), "http://127.0.0.1:7890");
+  assert.equal(await rules.getByLabel("上下文规则 1 窗口", { exact: true }).inputValue(), "100k");
   await advanced.locator(":scope > summary").click();
   const firstModel = primary.locator("details.lyra-model").first();
   await firstModel.locator(":scope > summary").click();
   await firstModel.getByLabel("上下文窗口", { exact: true }).fill("256000");
+  assert.match(await firstModel.textContent(), /256k tokens（手动设置）/);
   await firstModel.locator(":scope > summary").click();
+  await advanced.locator(":scope > summary").click();
+  await rules.getByRole("button", { name: "添加规则", exact: true }).click();
+  await rules.getByLabel("上下文规则 2 关键词", { exact: true }).fill("sonnet");
+  await rules.getByLabel("上下文规则 2 窗口", { exact: true }).fill("100K");
+  const secondModel = primary.locator("details.lyra-model").nth(1);
+  await secondModel.locator(":scope > summary").click();
+  assert.match(await secondModel.textContent(), /100k tokens（规则：sonnet）/);
+  await rules.getByRole("button", { name: "上移上下文规则 2", exact: true }).click();
+  assert.equal(await rules.getByLabel("上下文规则 1 关键词", { exact: true }).inputValue(), "sonnet");
+  await rules.getByRole("button", { name: "下移上下文规则 1", exact: true }).click();
+  assert.equal(await rules.getByLabel("上下文规则 1 关键词", { exact: true }).inputValue(), "gpt");
+  await rules.getByRole("button", { name: "添加规则", exact: true }).click();
+  await rules.getByRole("button", { name: "删除上下文规则 3", exact: true }).click();
+  assert.equal(await rules.getByRole("textbox").count(), 4);
+  await rules.screenshot({ path: `${screenshots}/context-rules.png`, animations: "disabled" });
   await primary.getByRole("button", { name: "获取模型", exact: true }).click();
   assert.equal(await page.locator(".lyra-default-model").count(), 0, "default model card is removed");
   assert.equal(await page.evaluate(() => window.testCalls().fetched[0].provider.options.apiKey), "sk-edited");
@@ -125,7 +144,7 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
   assert.equal(await primary.locator("details.lyra-model").count(), 2);
   for (const presetId of ["local-codex", "devin", "codebuddy", "workbuddy"]) {
     await page.getByLabel("添加 Provider", { exact: true }).selectOption(presetId);
-    const addedProvider = providers.last();
+    const addedProvider = providers.first();
     assert.equal(await addedProvider.evaluate(el => el.open), true, "new provider opens for editing");
     assert.equal(await addedProvider.getByLabel("API Key", { exact: true }).count(), 0, "local credentials need no key");
     await addedProvider.getByRole("combobox").first().selectOption("");
@@ -134,7 +153,7 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
   }
   await page.waitForFunction(() => document.querySelectorAll("details.lyra-provider").length === 2);
   await page.getByLabel("添加 Provider", { exact: true }).selectOption("manual");
-  const manual = providers.last();
+  const manual = providers.first();
   const manualAdvanced = manual.locator("details.lyra-advanced").filter({ has: page.getByLabel("ID", { exact: true }) });
   assert.equal(await manualAdvanced.evaluate(el => el.open), true, "new manual provider exposes its required ID");
   await manualAdvanced.getByLabel("ID", { exact: true }).fill("manual-test");
@@ -147,7 +166,8 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
   const saved = await page.evaluate(() => window.testCalls().saved[0]);
   assert.equal(saved.$schema, "keep-this-schema");
   assert.equal(saved.model, "primary/gpt-5", "provider edits preserve the configured default model");
-  assert.deepEqual(saved.provider.primary.options, { apiKey: "sk-edited", proxy: "http://127.0.0.1:7890", headers: { "X-Project": "nova" }, temperature: 0.7 });
+  assert.deepEqual(saved.provider.primary.options, { apiKey: "sk-edited", headers: { "X-Project": "nova" }, temperature: 0.7 });
+  assert.deepEqual(saved.provider.primary.contextRules, [{ keyword: "gpt", context: 100000 }, { keyword: "sonnet", context: 100000 }]);
   assert.equal(saved.provider.primary.models["gpt-5"].limit.context, 256000);
   assert.deepEqual(saved.provider.primary.models["gpt-5"].variants, { high: { reasoningEffort: "high" } });
   assert.deepEqual(Object.keys(saved.provider), ["primary", "local-codex"]);
@@ -165,6 +185,7 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
     .map(el => ({ class: el.className, client: el.clientWidth, scroll: el.scrollWidth })));
   assert.deepEqual(overflow, [], "expanded form does not overflow on narrow windows");
   await page.screenshot({ path: `${screenshots}/narrow-expanded.png`, fullPage: true, animations: "disabled" });
+  await rules.screenshot({ path: `${screenshots}/narrow-context-rules.png`, animations: "disabled" });
   await page.locator("details.lyra-file-settings").getByRole("button", { name: "从文件重新加载", exact: true }).click();
   await page.waitForFunction(() => window.testCalls().refresh === 1);
   assert.deepEqual(errors, []);

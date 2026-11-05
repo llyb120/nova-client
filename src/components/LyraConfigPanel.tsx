@@ -5,10 +5,12 @@ import { api } from "../ipc";
 import {
   APIS,
   configFromDraft,
+  contextPreview,
   draftFromConfig,
   hasVariants,
   isLocalPreset,
   modelDraft,
+  parseContextTokens,
   parseMcpServers,
   providerDraft,
   serializeProvider,
@@ -463,7 +465,9 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                             <Show when={names().length}>
                               <details class="lyra-model-catalog">
                                 <summary>查看模型列表</summary>
-                                <div class="lyra-model-names"><For each={names()}>{(name) => <span>{name}</span>}</For></div>
+                                <div class="lyra-model-names"><For each={Object.entries(result()?.models ?? {})}>{([id, model]) => (
+                                  <span>{model?.name || id}<small class="field-hint" style={{ display: "block" }}>上下文：{contextPreview(p(), id, model?.name, model?.limit?.context)}</small></span>
+                                )}</For></div>
                               </details>
                             </Show>
                           </div>
@@ -502,7 +506,8 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                                 </label>
                                 <label class="backend-field">
                                   <span class="field-label">上下文窗口</span>
-                                  <input class="field-input" inputmode="numeric" placeholder="128000" value={m().context} onInput={(e) => setM((x) => (x.context = e.currentTarget.value))} />
+                                  <input class="field-input" aria-label="上下文窗口" inputmode="numeric" placeholder="128000" value={m().context} onInput={(e) => setM((x) => (x.context = e.currentTarget.value))} />
+                                  <span class="field-hint">生效：{contextPreview(p(), m().id.trim(), m().name, fetched[p().id.trim()]?.models?.[m().id.trim()]?.limit?.context)}</span>
                                 </label>
                                 <label class="backend-field">
                                   <span class="field-label">最大输出</span>
@@ -534,7 +539,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                     </For>
                   </section>
                   <details class="lyra-advanced" open={advancedInitiallyOpen || !p().preset}>
-                    <summary>高级设置<span class="field-hint">ID、协议、代理 · {p().headers.length + p().fields.length} 项自定义配置</span></summary>
+                    <summary>高级设置<span class="field-hint">ID、协议、上下文规则 · {p().contextRules.length} 条规则 · {p().headers.length + p().fields.length} 项自定义配置</span></summary>
                     <div class="lyra-detail-body">
                       <div class="backend-fields">
                         <label class="backend-field">
@@ -564,6 +569,33 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                           <input class="field-input" placeholder="如 claude, gpt-5；留空不过滤" value={p().modelFilter} onInput={(e) => setP((x) => (x.modelFilter = e.currentTarget.value))} />
                         </label>
                       </div>
+                      <section class="lyra-context-rules" aria-label="模型上下文规则">
+                        <h4>模型上下文规则</h4>
+                        <p class="field-hint">模型 ID 或显示名称包含关键词时生效，不分大小写；从上到下第一条命中生效。模型手填上下文优先于规则，规则优先于模型目录／默认值。仅影响当前 Provider 的 Nova 上下文预算，不改变服务端上限。</p>
+                        <div class="lyra-context-rule-list">
+                          <For keyed={false} each={p().contextRules}>{(rule, ri) => (
+                            <div class="lyra-context-rule">
+                              <label class="backend-field">
+                                <span class="field-label">模型 ID 或名称包含</span>
+                                <input class="field-input" aria-label={`上下文规则 ${ri + 1} 关键词`} placeholder="如 haiku" value={rule().keyword} onInput={(e) => setP((x) => (x.contextRules[ri].keyword = e.currentTarget.value))} />
+                              </label>
+                              <label class="backend-field">
+                                <span class="field-label">上下文窗口</span>
+                                <input class="field-input" aria-label={`上下文规则 ${ri + 1} 窗口`} placeholder="如 100k 或 100000" value={rule().context} aria-invalid={rule().context.trim() && parseContextTokens(rule().context) === null ? "true" : "false"} onInput={(e) => setP((x) => (x.contextRules[ri].context = e.currentTarget.value))} />
+                              </label>
+                              <div class="lyra-context-rule-footer">
+                                <span class="field-hint">{parseContextTokens(rule().context)?.toLocaleString() ?? "请输入正整数或 k 单位"} {parseContextTokens(rule().context) === null ? "" : "tokens"}</span>
+                                <div class="lyra-context-rule-actions">
+                                <button type="button" class="btn secondary" aria-label={`上移上下文规则 ${ri + 1}`} disabled={ri === 0} onClick={() => setP((x) => { [x.contextRules[ri - 1], x.contextRules[ri]] = [x.contextRules[ri], x.contextRules[ri - 1]]; })}>上移</button>
+                                <button type="button" class="btn secondary" aria-label={`下移上下文规则 ${ri + 1}`} disabled={ri === p().contextRules.length - 1} onClick={() => setP((x) => { [x.contextRules[ri], x.contextRules[ri + 1]] = [x.contextRules[ri + 1], x.contextRules[ri]]; })}>下移</button>
+                                  <button type="button" class="btn secondary" aria-label={`删除上下文规则 ${ri + 1}`} onClick={() => setP((x) => void x.contextRules.splice(ri, 1))}>删除</button>
+                                </div>
+                              </div>
+                            </div>
+                          )}</For>
+                        </div>
+                        <button type="button" class="btn secondary" onClick={() => setP((x) => void x.contextRules.push({ keyword: "", context: "" }))}>添加规则</button>
+                      </section>
                       <KvEditor title="自定义请求头" hint={HEADER_HINT} rows={p().headers} keyPlaceholder="Header 名，如 X-Api-Version" valuePlaceholder="值" onChange={(fn) => setP((x) => fn(x.headers))} />
                       <KvEditor title="自定义字段" hint={`${FIELD_HINT} ${ACCOUNTING_HINT}`} rows={p().fields} keyPlaceholder="字段名，如 temperature" valuePlaceholder="值，如 0.7" onChange={(fn) => setP((x) => fn(x.fields))} />
                     </div>

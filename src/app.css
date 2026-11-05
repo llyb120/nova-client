@@ -6480,9 +6480,19 @@ button:focus-visible {
 }
 .lyra-empty { display: grid; gap: 8px; padding: 24px; border: 1px dashed var(--border-light); border-radius: var(--r-md); }
 .lyra-config .lyra-error { color: var(--red); }
+.lyra-context-rules { display: grid; gap: 12px; min-width: 0; }
+.lyra-context-rules h4, .lyra-context-rules p { margin: 0; }
+.lyra-context-rule-list { display: grid; gap: 10px; }
+.lyra-context-rule { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg-input); }
+.lyra-context-rule .backend-field { min-width: 0; }
+.lyra-context-rule-footer { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.lyra-context-rule-actions { display: flex; gap: 6px; margin-left: auto; }
+.lyra-context-rule-actions .btn { min-height: 28px; padding: 4px 10px; }
+.lyra-context-rules > .btn { justify-self: start; }
 @media (max-width: 600px) {
   .lyra-config .backend-fields,
-  .lyra-config .env-var-row { grid-template-columns: minmax(0, 1fr); }
+  .lyra-config .env-var-row,
+  .lyra-config .lyra-context-rule { grid-template-columns: minmax(0, 1fr); }
   .lyra-provider > summary { padding: 14px; }
   .lyra-provider-body { padding: 14px; }
   .lyra-provider-meta { display: none; }

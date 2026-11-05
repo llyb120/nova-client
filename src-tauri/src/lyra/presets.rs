@@ -365,15 +365,18 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
     let cache = read_cache(nova_root);
     let env = super::config::process_env();
     for (id, provider) in providers.iter_mut() {
-        let Some(preset) = preset_of(provider) else { continue };
+        let explicit = provider["models"].as_object().cloned().unwrap_or_default();
+        let Some(preset) = preset_of(provider) else {
+            super::config::apply_context_rules(provider, &explicit);
+            continue;
+        };
         if let Some(source) = local_source(preset.id) {
-            let explicit = provider["models"].as_object().cloned().unwrap_or_default();
             match resolve_local(provider, source, &env, nova_root) {
                 Ok(mut local) => {
                     let mut models = cache[id.as_str()]["models"].as_object().cloned().unwrap_or_default();
                     merge_local_models(&mut models, local["models"].as_object().unwrap());
                     if local["localAuth"] == "claude-code" {
-                        let mut explicit = explicit;
+                        let mut explicit = explicit.clone();
                         for (id, model) in &mut explicit {
                             if claude_alias_family(id).is_some() {
                                 if let Some(model) = model.as_object_mut() { model.remove("localModel"); }
@@ -394,6 +397,7 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
                         }
                     }
                     local["models"] = json!(models);
+                    super::config::apply_context_rules(&mut local, &explicit);
                     *provider = local;
                 }
                 Err(error) => {
@@ -413,10 +417,9 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
             options["baseURL"] = json!(preset.base_url);
         }
         let mut models = cache.pointer(&format!("/{id}/models")).and_then(Value::as_object).cloned().unwrap_or_default();
-        if let Some(explicit) = object.get("models").and_then(Value::as_object) {
-            models.extend(explicit.clone());
-        }
+        models.extend(explicit.clone());
         object.insert("models".into(), Value::Object(models));
+        super::config::apply_context_rules(provider, &explicit);
     }
 }
 
@@ -1199,7 +1202,10 @@ mod tests {
             for key in ["HOME", "USERPROFILE", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "NOVA_DATA_DIR"] {
                 child.env(key, root.path());
             }
-            if let Some(system_root) = std::env::var_os("SystemRoot") { child.env("SystemRoot", system_root); }
+            // Windows 运行时 DLL 依赖 Cargo 注入的 PATH，隔离凭据时仍需保留。
+            for key in ["SystemRoot", "PATH"] {
+                if let Some(value) = std::env::var_os(key) { child.env(key, value); }
+            }
             assert!(child.status().unwrap().success());
             return;
         }
@@ -1217,6 +1223,13 @@ mod tests {
             let mut config = json!({"provider":{"local":{"preset":format!("local-{source}"),
                 "models":{"m":{"variants":{"high":{"reasoningEffort":"high"}},"limit":{"output":2048}}}
             }}});
+            let mut ruled = config.clone();
+            ruled["provider"]["local"]["contextRules"] = json!([{ "keyword": "M", "context": 100000 }]);
+            expand(&mut ruled, &root);
+            let selected = super::super::config::resolve_model(&ruled, Some("local/m/variant/high"), &Default::default()).unwrap();
+            assert_eq!(selected.model.context_window, 100000, "{source}: rule overrides cached context");
+            assert_eq!(selected.model.max_output_tokens, 2048);
+            assert!(selected.model.supports_images);
             expand(&mut config, &root);
             let model = &config["provider"]["local"]["models"]["m"];
             assert_eq!(model["limit"], json!({"context":200000,"output":2048}), "{source}");
@@ -1526,6 +1539,56 @@ env_key = "TEST_KEY"
         assert_eq!(cc["models"], json!({ "a": {}, "b": { "name": "mine" } }));
         assert_eq!(config["provider"]["plain"]["models"], json!({ "m": {} }));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn context_rules_override_catalog_but_preserve_manual_limits_and_cache() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alkaid")).unwrap();
+        let cache = json!({ "cc": { "models": {
+            "vendor/HAIKU-new": { "limit": { "context": 400000, "output": 32000 }, "variants": { "high": {} } },
+            "alias": { "name": "Claude Haiku", "limit": { "context": 200000 } },
+            "haiku-manual": { "limit": { "context": 200000 } },
+            "other": { "limit": { "context": 300000 } }
+        } } });
+        let cache_text = cache.to_string();
+        std::fs::write(cache_path(root.path()), &cache_text).unwrap();
+        let raw = json!({ "provider": {
+            "cc": { "preset": "commandcode", "contextRules": [
+                { "keyword": " HAIKU ", "context": 100000 },
+                { "keyword": "claude", "context": 150000 }
+            ], "models": { "haiku-manual": { "limit": { "context": 64000, "output": 2048 } } } },
+            "plain": { "api": "openai-completions", "options": { "baseURL": "http://x" },
+                "contextRules": [{ "keyword": "haiku", "context": 80000 }],
+                "models": { "vendor": { "haiku": {} }, "haiku-explicit": { "limit": { "context": 120000 } } } },
+            "untouched": { "models": { "haiku": { "limit": { "context": 250000 } } } }
+        } });
+        let mut config = raw.clone();
+        super::super::config::validate_context_rules(&config).unwrap();
+        expand(&mut config, root.path());
+        let cc = &config["provider"]["cc"]["models"];
+        assert_eq!(cc["vendor/HAIKU-new"]["limit"]["context"], 100000);
+        assert_eq!(cc["vendor/HAIKU-new"]["limit"]["output"], 32000);
+        assert_eq!(cc["alias"]["limit"]["context"], 100000);
+        assert_eq!(cc["haiku-manual"]["limit"]["context"], 64000);
+        assert_eq!(cc["haiku-manual"]["limit"]["output"], 2048);
+        assert_eq!(cc["other"]["limit"]["context"], 300000);
+        assert_eq!(config["provider"]["plain"]["models"]["vendor"]["haiku"]["limit"]["context"], 80000);
+        assert_eq!(config["provider"]["plain"]["models"]["haiku-explicit"]["limit"]["context"], 120000);
+        assert_eq!(config["provider"]["untouched"], raw["provider"]["untouched"]);
+        let resolved = super::super::config::resolve_model(&config, Some("cc/vendor/HAIKU-new/variant/high"), &Default::default()).unwrap();
+        assert_eq!(resolved.model.context_window, 100000);
+        assert!(super::super::config::model_options(&config).iter().any(|option|
+            option["value"] == "cc/vendor/HAIKU-new/variant/high" && option["_meta"]["contextWindow"] == 100000));
+        let mut reordered = raw.clone();
+        reordered["provider"]["cc"]["contextRules"].as_array_mut().unwrap().reverse();
+        expand(&mut reordered, root.path());
+        assert_eq!(reordered["provider"]["cc"]["models"]["alias"]["limit"]["context"], 150000);
+        let mut removed = raw.clone();
+        removed["provider"]["cc"].as_object_mut().unwrap().remove("contextRules");
+        expand(&mut removed, root.path());
+        assert_eq!(removed["provider"]["cc"]["models"]["vendor/HAIKU-new"]["limit"]["context"], 400000);
+        assert_eq!(std::fs::read_to_string(cache_path(root.path())).unwrap(), cache_text);
     }
 
     #[test]

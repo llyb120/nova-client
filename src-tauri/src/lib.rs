@@ -3243,6 +3243,7 @@ fn save_lyra_config(state: State<'_, AppState>, config: Value) -> Result<(), Str
         return Err("Lyra 配置缺少 provider".into());
     }
     lyra::mcp::validate_config(&config)?;
+    lyra::config::validate_context_rules(&config)?;
     let dir = lyra::config::nova_root().join("alkaid");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 Lyra 配置目录失败：{e}"))?;
     let path = dir.join("config.jsonc");

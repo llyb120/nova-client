@@ -403,6 +403,7 @@ pub(crate) fn load_config(data_dir: &Path) -> Result<Value, String> {
     {
         return Err("Lyra 配置缺少 provider".into());
     }
+    crate::lyra::config::validate_context_rules(&config)?;
     *config_cache().lock().unwrap() = Some(CachedConfig {
         path,
         mtime,

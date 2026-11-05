@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { configFromDraft, draftFromConfig, parseMcpServers, providerDraft, validate } from "../src/lyraConfig.ts";
+import { configFromDraft, contextPreview, draftFromConfig, parseContextTokens, parseMcpServers, providerDraft, serializeProvider, validate } from "../src/lyraConfig.ts";
 
 const raw = {
   $schema: "x",
@@ -245,4 +245,45 @@ assert.equal(optionsSaved.provider.p.models.m.options.responsesContinuation, "of
 assert.equal(optionsSaved.provider.p.models.m.options.tokenizer, "cl100k_base");
 assert.equal(optionsSaved.provider.p.options.responsesContinuation, "auto");
 assert.equal(Object.hasOwn(optionsSaved, "mcpServers"), false);
+// 上下文规则：k 为十进制 tokens，顺序与手填优先级保持一致，不改原始配置。
+for (const [text, tokens] of [["100k", 100000], [" 100K ", 100000], ["100000", 100000], ["1", 1]] as const) {
+  assert.equal(parseContextTokens(text), tokens);
+}
+for (const text of ["", " ", "0", "0k", "-1", "1.5", "1e5", "Infinity", "100kb", "9007199254740992", "9007199254741k"]) {
+  assert.equal(parseContextTokens(text), null, text);
+}
+const ruleRaw = { provider: { p: {
+  api: "openai-completions", options: { baseURL: "https://example.test/v1" }, extra: "keep",
+  contextRules: [{ keyword: "haiku", context: 100000 }, { keyword: "claude", context: 200000 }],
+  models: { alias: { name: "Claude HAIKU" }, "haiku-manual": { limit: { context: 64000 } } },
+} } };
+const ruleBefore = JSON.stringify(ruleRaw);
+const ruleDraft = draftFromConfig(ruleRaw);
+const ruleProvider = ruleDraft.providers[0];
+assert.equal(validate(ruleDraft.providers, []), null);
+assert.deepEqual(configFromDraft(ruleRaw, ruleDraft), ruleRaw);
+ruleProvider.contextRules[0].context = "100k";
+assert.equal(serializeProvider(ruleProvider).contextRules[0].context, 100000);
+assert.equal(contextPreview(ruleProvider, "alias"), "100k tokens（规则：haiku）");
+assert.equal(contextPreview(ruleProvider, "vendor/HAIKU-new", "Other", 400000), "100k tokens（规则：haiku）");
+assert.equal(contextPreview(ruleProvider, "haiku-manual"), "64k tokens（手动设置）");
+assert.equal(contextPreview(ruleProvider, "other", "Other", 400000), "400k tokens（模型目录／默认）");
+ruleProvider.contextRules.reverse();
+assert.equal(contextPreview(ruleProvider, "alias"), "200k tokens（规则：claude）");
+assert.deepEqual(serializeProvider(ruleProvider).contextRules.map((r: { keyword: string }) => r.keyword), ["claude", "haiku"]);
+ruleProvider.contextRules = [];
+assert.equal(Object.hasOwn(serializeProvider(ruleProvider), "contextRules"), false);
+assert.equal(contextPreview(ruleProvider, "alias", "", 400000), "200k tokens（模型目录／默认）");
+ruleProvider.preset = "local-codex";
+assert.equal(contextPreview(ruleProvider, "alias", "", 400000), "400k tokens（模型目录／默认）");
+ruleProvider.preset = "";
+for (const rule of [{ keyword: " ", context: "100k" }, { keyword: "haiku", context: "0" }, { keyword: "haiku", context: "bad" }]) {
+  ruleProvider.contextRules = [rule];
+  assert.match(validate([ruleProvider], []) ?? "", /上下文规则/);
+  assert.throws(() => serializeProvider(ruleProvider), /上下文规则/);
+}
+for (const contextRules of [null, {}, "bad", [null], [{ keyword: 1, context: 100000 }], [{ keyword: "haiku", context: "100k" }], [{ keyword: "haiku", context: 100000, unknown: true }]]) {
+  assert.throws(() => providerDraft("p", { contextRules }), /上下文规则|contextRules/);
+}
+assert.equal(JSON.stringify(ruleRaw), ruleBefore);
 console.log("ok");

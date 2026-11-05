@@ -216,6 +216,52 @@ fn model_filter(provider: &Value) -> Vec<String> {
         .filter_map(Value::as_str).map(|k| k.trim().to_lowercase()).filter(|k| !k.is_empty()).collect()
 }
 
+pub(crate) fn validate_context_rules(config: &Value) -> Result<(), String> {
+    let Some(providers) = config.get("provider").and_then(Value::as_object) else { return Ok(()) };
+    for (id, provider) in providers {
+        let Some(rules) = provider.get("contextRules") else { continue };
+        let rules = rules.as_array().ok_or_else(|| format!("Provider {id} 的 contextRules 必须是数组"))?;
+        for (index, rule) in rules.iter().enumerate() {
+            if !rule.as_object().is_some_and(|r| r.keys().all(|key| matches!(key.as_str(), "keyword" | "context")))
+                || !rule["keyword"].as_str().is_some_and(|s| !s.trim().is_empty())
+                || !rule["context"].as_u64().is_some_and(|n| n > 0 && n <= 9_007_199_254_740_991)
+            {
+                return Err(format!("Provider {id} 的上下文规则 {} 须只包含非空 keyword 和正整数 context（tokens）", index + 1));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 只改运行时展开的模型，不写回目录缓存；手填上下文始终优先。
+pub(super) fn apply_context_rules(provider: &mut Value, explicit: &Map<String, Value>) {
+    let Some(rules) = provider.get("contextRules").and_then(Value::as_array).filter(|r| !r.is_empty()).cloned() else { return };
+    let explicit = json!({ "models": explicit });
+    fn apply(models: &mut Value, prefix: &str, explicit: &Value, rules: &[Value]) {
+        let Some(models) = models.as_object_mut() else { return };
+        for (id, model) in models {
+            let id = if prefix.is_empty() { id.clone() } else { format!("{prefix}/{id}") };
+            if !is_model_config(model) {
+                apply(model, &id, explicit, rules);
+                continue;
+            }
+            if model_by_id(explicit, &id).and_then(|m| m.pointer("/limit/context")).and_then(Value::as_u64).is_some_and(|n| n > 0) {
+                continue;
+            }
+            let id = id.to_lowercase();
+            let name = model["name"].as_str().unwrap_or("").to_lowercase();
+            if let Some(rule) = rules.iter().find(|rule| rule["keyword"].as_str().is_some_and(|word| {
+                let word = word.trim().to_lowercase();
+                !word.is_empty() && (id.contains(&word) || name.contains(&word))
+            })) {
+                if !model["limit"].is_object() { model["limit"] = json!({}); }
+                model["limit"]["context"] = rule["context"].clone();
+            }
+        }
+    }
+    if let Some(models) = provider.get_mut("models") { apply(models, "", &explicit, &rules); }
+}
+
 /// 模型选择器枚举，与 alkaidModelOptions 输出保持一致。
 pub fn model_options(config: &Value) -> Vec<Value> {
     let mut out = Vec::new();
@@ -839,6 +885,27 @@ mod tests {
         assert!(model_options(&inherited).iter().all(|option| {
             option["_meta"]["nova.ai/defaultReasoningEffort"] == ""
         }));
+    }
+
+    #[test]
+    fn context_rules_validate_before_loading_or_saving() {
+        for rules in [
+            json!(null), json!({}), json!("haiku"), json!([null]), json!([{}]),
+            json!([{ "keyword": " ", "context": 100000 }]),
+            json!([{ "keyword": 1, "context": 100000 }]),
+            json!([{ "keyword": "haiku", "context": "100k" }]),
+            json!([{ "keyword": "haiku", "context": 0 }]),
+            json!([{ "keyword": "haiku", "context": -1 }]),
+            json!([{ "keyword": "haiku", "context": 1.5 }]),
+            json!([{ "keyword": "haiku", "context": 9_007_199_254_740_992_u64 }]),
+            json!([{ "keyword": "haiku", "context": 100000, "unknown": true }]),
+        ] {
+            assert!(validate_context_rules(&json!({ "provider": { "p": { "contextRules": rules } } })).is_err());
+        }
+        for rules in [json!([]), json!([{ "keyword": " HAIKU ", "context": 100000 }]), json!([{ "keyword": "x", "context": 1 }])] {
+            assert!(validate_context_rules(&json!({ "provider": { "p": { "contextRules": rules } } })).is_ok());
+        }
+        assert!(validate_context_rules(&json!({ "provider": { "p": {} } })).is_ok());
     }
 
     #[test]
