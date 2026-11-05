@@ -1,5 +1,5 @@
 //! Native Devin inference. The CLI supplies its catalog/version; Rust owns HTTP and streaming.
-//! Without a usable CLI the bundled catalog snapshot (devin_models.json, CLI 3000.11.205) is used.
+//! Without a usable CLI the bundled catalog snapshot (devin_models.json, CLI 3000.11.228) is used.
 //! ponytail: private Connect/Protobuf fields verified against CLI 3000.11.205;
 //! re-run the protocol checks and live tool round trip when Devin changes its wire format.
 use super::config::ResolvedModel;
@@ -17,7 +17,7 @@ use tokio::io::AsyncReadExt;
 const LIMIT: usize = 32 * 1024 * 1024;
 const RPC: &str = "/exa.api_server_pb.ApiServerService/GetChatMessage";
 /// ponytail: 离线快照不会自动更新；Devin 上新模型后用 `devin models list --format json` 重新生成。
-const SNAPSHOT_VERSION: &str = "3000.11.205";
+const SNAPSHOT_VERSION: &str = "3000.11.228";
 const SNAPSHOT: &str = include_str!("devin_models.json");
 /// 在 Nova 里网页登录得到的凭据（与 CLI credentials.toml 同格式），位于 ~/.nova。
 const LOGIN_FILE: &str = "devin-login.toml";
