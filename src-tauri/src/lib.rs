@@ -46,7 +46,6 @@ mod threads;
 mod thread_storage;
 mod time_machine;
 mod updater;
-mod workbuddy;
 mod workspace_files;
 mod workspace_terminal;
 #[cfg(windows)]

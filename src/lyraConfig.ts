@@ -20,6 +20,7 @@ export type ProviderDraft = {
   id: string;
   /** 自适应预设（见后端 lyra/presets.rs），为空表示手动配置。 */
   preset: string;
+  buddySource: "codebuddy" | "workbuddy";
   name: string;
   api: string;
   baseURL: string;
@@ -137,7 +138,8 @@ export function providerDraft(id: string, raw: Record<string, any>): ProviderDra
     raw.name === (prefix === "local-codex" ? "本地 Codex" : "本地 Claude Code"));
   return {
     id,
-    preset: typeof raw.preset === "string" ? raw.preset : legacy || "",
+    preset: raw.preset === "workbuddy" ? "codebuddy" : typeof raw.preset === "string" ? raw.preset : legacy || "",
+    buddySource: raw.preset === "workbuddy" || options.codebuddySource === "workbuddy" ? "workbuddy" : "codebuddy",
     name: raw.name ?? "",
     api: raw.api ?? "",
     baseURL: options.baseURL ?? options.baseUrl ?? "",
@@ -145,7 +147,7 @@ export function providerDraft(id: string, raw: Record<string, any>): ProviderDra
     modelFilter: Array.isArray(raw.modelFilter) ? raw.modelFilter.join(", ") : "",
     contextRules,
     headers: toKv(options.headers),
-    fields: fieldsOf(options, OPTION_KEYS),
+    fields: fieldsOf(options, raw.preset === "codebuddy" || raw.preset === "workbuddy" ? [...OPTION_KEYS, "codebuddySource"] : OPTION_KEYS),
     models: Object.entries(isObject(raw.models) ? raw.models : {}).map(([mid, m]) =>
       modelDraft(mid, isObject(m) ? m : {}),
     ),
@@ -194,6 +196,7 @@ export function serializeProvider(p: ProviderDraft) {
   // 预设的 Base URL 留空即用默认值，不写空串。
   if (p.preset) setOrDelete(options, "baseURL", options.baseURL);
   setOrDelete(options, "apiKey", isLocalPreset(p.preset) ? "" : p.apiKey.trim());
+  if (p.preset === "codebuddy") setOrDelete(options, "codebuddySource", p.buddySource === "workbuddy" ? "workbuddy" : "");
   out.options = { ...options, ...withHeaders(p.headers) };
   const models = Object.fromEntries(p.models.map((m) => [m.id.trim(), serializeModel(m)]));
   // 预设的模型自动拉取，手写模型只用于补充/覆盖，没有就不写。

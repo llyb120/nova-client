@@ -24,7 +24,7 @@
 
 Token 分项计数、Responses 续接、持久命令、子 agent 恢复和 MCP 配置见 [Lyra 运行时](lyra-runtime.md)。
 
-- Devin / CodeBuddy / WorkBuddy（本地 API）由 Rust 直接请求上游，无需填写 API Key、安装 Node 或手动启动代理。自动读取本机登录、模型目录，网络跟随系统代理，支持工具往返、流式输出及输入补全；WorkBuddy 加密登录通过其桌面版自带运行时读取。见 [Devin](devin-openai-api.md) / [CodeBuddy、WorkBuddy](codebuddy-openai-api.md)。
+- Devin 和 CodeBuddy / WorkBuddy 由 Rust 原生直连上游，无需填写 API Key、安装 Node 或手动启动代理，支持工具往返、流式输出及输入补全。CodeBuddy / WorkBuddy 合并为一个预设入口，登录时选择通道；统一使用 Nova 内登录，不再读取 CLI/桌面端认证、配置或安装包。两者账号独立，旧用户若只在 CLI/桌面端登录需在 Nova 登录一次，旧 `workbuddy` 配置和模型引用保留兼容。Devin 仍可复用本机登录。见 [Devin](devin-openai-api.md) / [CodeBuddy、WorkBuddy](codebuddy-openai-api.md)。
 - 本地 Codex / Claude Code 统一作为 Lyra provider 使用，不再提供独立 Agent 后端。优先读取 CLI 用户级自定义 API（地址、Key、认证头）；未配置 API 时，由 Lyra 内置转发读取本机订阅登录，无需 Node 或手动启动反代服务。显式自定义地址即使没有 Key 也不回退订阅，避免把订阅凭据发送到第三方。
 - 订阅模式使用固定官方上游、不跟随重定向，凭据仅在请求时读取，不写入 Lyra 配置或模型缓存；网络跟随系统代理。支持 Codex `auth.json`、Claude Code `CLAUDE_CODE_OAUTH_TOKEN` / `.credentials.json` 及 macOS 对应 keychain；不执行 `apiKeyHelper`，不支持云平台认证或 Codex 的非 macOS keyring/内存登录。令牌由原 CLI 管理，过期时需先在 CLI 刷新登录；Lyra 不竞争轮换 refresh token。
 - 获取模型时，Codex 订阅读取账号 Codex 目录，自定义 API 与 Claude Code 读取完整 `/models`（支持 Anthropic 分页），再合并本地模型与思考参数。Claude 订阅的 `sonnet` / `opus` / `haiku` 等别名由目录中的实际模型解析，首次使用别名前需要获取模型；失败保留旧缓存。对话、工具往返和补全共用订阅转发路径。

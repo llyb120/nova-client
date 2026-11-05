@@ -253,8 +253,8 @@ export function createDevinServer({ apiKey, binary = "devin", prefixArgs = [], e
       active.add(controller); timer = setTimeout(() => controller.abort(failure(504, `${label} request timed out.`, "timeout")), timeoutMs);
       if (req.method === "GET") {
         const families = await models(controller.signal);
-        const defaultModel = buddy ? (await buddy.credentials()).defaultModel || families[0]?.slug : undefined;
-        const variants = new Map([[source, { ...families.find(family => family.slug === defaultModel)?.variants[0], label: `${label} (CLI default)` }], ...families.flatMap(family => (family.variants || []).map(variant => [variant.model_uid, variant]))]);
+        const defaultModel = buddy ? await buddy.resolveModel(source, undefined, controller.signal) : undefined;
+        const variants = new Map([[source, { ...families.find(family => family.slug === defaultModel)?.variants[0], label: `${label} (${source === "devin" ? "CLI default" : "default"})` }], ...families.flatMap(family => (family.variants || []).map(variant => [variant.model_uid, variant]))]);
         return json(res, 200, { object: "list", data: [...variants].map(([id, variant]) => ({
           id, object: "model", created: 0, owned_by: source, name: variant.label || id,
           context_length: variant.max_context_tokens,

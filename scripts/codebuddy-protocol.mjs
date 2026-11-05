@@ -1,70 +1,29 @@
-import { readFile, access, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { failure, LIMIT } from "./devin-protocol.mjs";
 
 const authError = message => failure(503, message, "codebuddy_auth_error");
-async function jsonFile(path, optional = false) {
+async function jsonFile(path) {
   try { return JSON.parse(await readFile(path, "utf8")); }
-  catch (error) { if (optional && error.code === "ENOENT") return {}; throw authError("Cannot read CodeBuddy configuration or login."); }
+  catch { throw authError("Cannot read login. Sign in via Nova's Lyra settings."); }
 }
 
 export function createCodeBuddyClient(env = process.env, source = "codebuddy") {
   const workbuddy = source === "workbuddy", label = workbuddy ? "WorkBuddy" : "CodeBuddy";
   const home = env.USERPROFILE || env.HOME || homedir();
-  const configDir = env[workbuddy ? "WORKBUDDY_CONFIG_DIR" : "CODEBUDDY_CONFIG_DIR"] || join(home, `.${source}`);
-  const dataDir = process.platform === "win32" ? join(home, "AppData/Local") : process.platform === "darwin" ? join(home, "Library/Application Support") : join(home, ".local/share");
-  const authPath = env[`NOVA_${source.toUpperCase()}_AUTH_FILE`] || join(dataDir, `CodeBuddyExtension/Data/Public/auth/${workbuddy ? "workbuddy-desktop" : "Tencent-Cloud.coding-copilot"}.info`);
-  let catalog, catalogTime = 0, catalogIdentity, packageInfo, unlocked;
-  async function installed() {
-    if (packageInfo) return packageInfo;
-    if (workbuddy) {
-      const exe = env.WORKBUDDY_EXE || join(env.LOCALAPPDATA || join(home, "AppData/Local"), "Programs/WorkBuddy/WorkBuddy.exe");
-      const root = env.NOVA_WORKBUDDY_PACKAGE || join(dirname(exe), "resources/app.asar.unpacked/cli");
-      const product = await jsonFile(join(root, "product.json"));
-      if (product.authentication?.id !== "workbuddy-desktop") throw authError("Select WorkBuddy's bundled CLI, not the global CodeBuddy package.");
-      return packageInfo = { root, exe, version: product.genieVersion || "5.8.2" };
-    }
-    const roots = [env.NOVA_CODEBUDDY_PACKAGE, env.APPDATA && join(env.APPDATA, "npm/node_modules/@tencent-ai/codebuddy-code"),
-      ...(env.PATH || env.Path || "").split(delimiter).filter(Boolean).flatMap(path => [join(path, "node_modules/@tencent-ai/codebuddy-code"), join(path, "../lib/node_modules/@tencent-ai/codebuddy-code")])].filter(Boolean);
-    for (const root of new Set(roots)) {
-      try {
-        const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
-        if (pkg.name === "@tencent-ai/codebuddy-code") return packageInfo = { root, version: pkg.version };
-      } catch { /* Native installations can use the cloud catalog without npm metadata. */ }
-    }
-    // ponytail: native installs lack package metadata; update this protocol version when CLI headers change.
-    return packageInfo = { version: "2.169.0" };
-  }
+  const prefix = source.toUpperCase();
+  const authPath = join(env.NOVA_DATA_DIR || join(home, ".nova"), `${source}-login.json`);
+  // shortcut: fixed verified protocol versions; update when upstream header requirements change.
+  const version = workbuddy ? "5.8.2" : "2.169.0";
+  let catalog, catalogTime = 0, catalogIdentity;
   async function credentials() {
-    const settings = await jsonFile(join(configDir, "settings.json"), true), vars = { ...env, ...settings.env };
-    const explicitKey = workbuddy ? env.WORKBUDDY_AUTH_TOKEN || env.WORKBUDDY_API_KEY || settings.env?.CODEBUDDY_AUTH_TOKEN || settings.env?.CODEBUDDY_API_KEY : vars.CODEBUDDY_AUTH_TOKEN || vars.CODEBUDDY_API_KEY;
-    let session = {};
-    if (!explicitKey) {
-      try { await access(`${authPath}.logged-out`); throw authError("CodeBuddy is logged out. Sign in with CodeBuddy CLI first."); }
-      catch (error) { if (error.code !== "ENOENT") throw error; }
-      session = await jsonFile(authPath);
-    }
-    let key = explicitKey || session.auth?.accessToken;
-    const { version, exe } = await installed();
-    if (workbuddy && key && typeof key === "object") {
-      const identity = JSON.stringify([key, exe, (await stat(exe)).mtimeMs]);
-      if (unlocked?.identity !== identity) {
-        const script = await readFile(new URL("./workbuddy-login.cjs", import.meta.url), "utf8");
-        let result;
-        try { result = await promisify(execFile)(exe, ["-e", script, "--", "--nova-workbuddy-login", authPath], { env: { ...env, ELECTRON_RUN_AS_NODE: "1" }, windowsHide: true, timeout: 15000, maxBuffer: 65536 }); }
-        catch { throw authError("Cannot unlock WorkBuddy login. Open WorkBuddy and sign in again."); }
-        const login = JSON.parse(result.stdout);
-        if (JSON.stringify(login.envelope) !== JSON.stringify(key)) throw authError("WorkBuddy login changed while reading it. Retry the request.");
-        unlocked = { identity, key: login.accessToken };
-      }
-      key = unlocked.key;
-    }
-    if (typeof key !== "string" || !key.trim()) throw authError("CodeBuddy login is missing or encrypted. Use a supported CLI login or CODEBUDDY_AUTH_TOKEN.");
-    if (!explicitKey && session.auth?.expiresAt <= Date.now()) throw authError(`${label} login has expired. Sign in again, then retry.`);
+    const explicitKey = env[`${prefix}_AUTH_TOKEN`] || env[`${prefix}_API_KEY`];
+    const session = explicitKey ? {} : await jsonFile(authPath);
+    const key = explicitKey || session.auth?.accessToken;
+    if (typeof key !== "string" || !key.trim()) throw authError(`${label} login is missing or invalid. Sign in via Nova's Lyra settings.`);
+    if (!explicitKey && session.auth?.expiresAt <= Date.now()) throw authError(`${label} login has expired. Sign in via Nova's Lyra settings, then retry.`);
     const endpoint = env[`NOVA_${source.toUpperCase()}_ENDPOINT`] || (session.auth?.domain ? `https://${session.auth.domain}` : workbuddy ? "https://www.workbuddy.cn" : "https://www.codebuddy.ai");
     let url;
     try { url = new URL(endpoint); } catch { throw authError("Invalid CodeBuddy endpoint."); }
@@ -73,7 +32,7 @@ export function createCodeBuddyClient(env = process.env, source = "codebuddy") {
       "X-Product": label, "X-Agent-Intent": "craft", "X-Agent-Runtime": "local-agent", "Content-Type": "application/json" };
     if (session.account?.uid) headers["X-User-Id"] = session.account.uid;
     if (session.account?.enterpriseId) headers["X-Enterprise-Id"] = session.account.enterpriseId;
-    return { url: url.origin, headers, defaultModel: env[`${source.toUpperCase()}_MODEL`] || settings.model, identity: `${url.origin}:${key}:${session.account?.uid || ""}:${session.account?.enterpriseId || ""}` };
+    return { url: url.origin, headers, defaultModel: env[`${prefix}_MODEL`], identity: `${url.origin}:${key}:${session.account?.uid || ""}:${session.account?.enterpriseId || ""}` };
   }
   async function models(signal) {
     const auth = await credentials();
@@ -82,15 +41,8 @@ export function createCodeBuddyClient(env = process.env, source = "codebuddy") {
     if (!response.ok) throw failure([401, 403, 429].includes(response.status) ? response.status : 502, `CodeBuddy model catalog returned HTTP ${response.status}.`, "codebuddy_models_error");
     const config = await response.json();
     if (config.code !== 0 || !Array.isArray(config.data?.models)) throw failure(502, "Invalid CodeBuddy model catalog.", "codebuddy_models_error");
-    const { root } = await installed();
-    let defaults = [];
-    if (root) {
-      const base = await jsonFile(join(root, "product.json"), true);
-      const regional = auth.url.includes("copilot.tencent.com") || auth.url.includes("codebuddy.cn") ? await jsonFile(join(root, "product.internal.json"), true) : {};
-      defaults = [...(base.models || []), ...(regional.models || [])];
-    }
     const merged = new Map();
-    for (const model of [...defaults, ...config.data.models]) if (typeof model.id === "string") merged.set(model.id, { ...merged.get(model.id), ...model });
+    for (const model of config.data.models) if (typeof model.id === "string") merged.set(model.id, { ...merged.get(model.id), ...model });
     const allowed = config.data.agents?.find(agent => agent.name === "cli")?.models;
     const ids = Array.isArray(allowed) ? allowed : config.data.models.map(model => model.id);
     catalog = ids.filter(id => typeof id === "string").map(id => {
@@ -103,7 +55,7 @@ export function createCodeBuddyClient(env = process.env, source = "codebuddy") {
   }
   async function resolveModel(requested, effort, signal) {
     const families = await models(signal), auth = await credentials();
-    const id = requested === source ? auth.defaultModel || families[0]?.slug : requested;
+    const id = requested === source ? families.find(family => family.slug === auth.defaultModel)?.slug || families[0]?.slug : requested;
     const model = families.find(family => family.slug === id)?.variants[0].model;
     if (!model) throw failure(400, "Unknown CodeBuddy model. Refresh /v1/models.", "model_not_found");
     if (effort && model.reasoning?.supportedEfforts && !(effort === "none" && model.reasoning.canDisableThinking) && !model.reasoning.supportedEfforts.includes(effort)) throw failure(400, "This CodeBuddy model does not support the requested reasoning effort.");

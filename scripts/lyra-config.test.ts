@@ -68,13 +68,26 @@ assert.equal(savedImport.provider["local-claude-code"].options.headers.Authoriza
 assert.equal(savedImport.model, imported.model);
 assert.deepEqual(savedImport.provider["local-claude-code"].models.custom.variants, imported.provider["local-claude-code"].models.custom.variants);
 
-// 本地 provider 无需手填地址/协议/Key；凭证跟随 CLI，不能把旧导入的 Key 固化回去。
+// 本地 provider 无需手填地址/协议/Key；凭证跟随对应登录，不能把旧导入的 Key 固化回去。
 for (const id of ["local-codex", "local-claude-code", "devin", "codebuddy", "workbuddy"]) {
   const provider = providerDraft(id, { preset: id, options: { apiKey: "old-key" } });
-  assert.equal(validate([provider], [{ id, name: id, baseURL: "", local: true }]), null);
+  const preset = id === "workbuddy" ? "codebuddy" : id;
+  assert.equal(validate([provider], [{ id: preset, name: preset, baseURL: "", local: true }]), null);
   const config = configFromDraft({}, { model: "", providers: [provider], mcpServers: "{}" });
-  assert.deepEqual(config.provider[id], { preset: id, options: {} });
+  assert.deepEqual(config.provider[id], { preset, options: id === "workbuddy" ? { codebuddySource: "workbuddy" } : {} });
 }
+const legacyBuddy = { model: "workbuddy/workbuddy", provider: { workbuddy: { preset: "workbuddy", models: { workbuddy: { name: "旧模型" } }, options: { temperature: 0.5 } } } };
+const buddyDraft = draftFromConfig(legacyBuddy);
+assert.equal(buddyDraft.providers[0].preset, "codebuddy");
+assert.equal(buddyDraft.providers[0].buddySource, "workbuddy");
+const buddySaved = configFromDraft(legacyBuddy, buddyDraft);
+assert.equal(buddySaved.model, legacyBuddy.model);
+assert.deepEqual(buddySaved.provider.workbuddy.models, legacyBuddy.provider.workbuddy.models);
+assert.deepEqual(buddySaved.provider.workbuddy.options, { temperature: 0.5, codebuddySource: "workbuddy" });
+assert.equal(draftFromConfig(buddySaved).providers[0].buddySource, "workbuddy");
+buddyDraft.providers[0].buddySource = "codebuddy";
+assert.equal(configFromDraft(legacyBuddy, buddyDraft).provider.workbuddy.options.codebuddySource, undefined);
+
 assert.equal(providerDraft("local-codex-2", { name: "本地 Codex" }).preset, "local-codex");
 assert.equal(providerDraft("local-codex", { name: "我自己的网关" }).preset, "");
 // MCP 是顶层独立配置；编辑/删除 provider 不得删除 MCP 或未知字段。

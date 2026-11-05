@@ -1,26 +1,24 @@
 # CodeBuddy / WorkBuddy → OpenAI 兼容接口
 
-Lyra 的 Rust provider 直接调用 CodeBuddy CLI 使用的 `/v2/chat/completions` 模型接口，复用本机登录和现有 Rust SSE 处理，工具交给 Lyra 执行，没有新增依赖。Nova 已移除 CodeBuddy / WorkBuddy 独立 agent 后端，但保留这些 Lyra provider，以及下方供其他客户端使用和协议验证的可选 Node.js 兼容服务。
+Lyra 的 Rust provider 原生直连 CodeBuddy / WorkBuddy 的 `/v2/chat/completions` 模型接口，使用 Nova 内登录和现有 Rust SSE 处理，工具交给 Lyra 执行，没有新增依赖。无论本机是否安装 CLI 或桌面端，都使用同一路径。下方可选 Node.js 兼容服务供其他客户端使用和协议验证。
 
-WorkBuddy 复用同一传输，但使用 WorkBuddy 内置 CLI 的产品配置、独立登录和账号模型列表，不混用全局 CodeBuddy 凭据。
+两者共用传输，但登录站点、会话和账号模型列表独立，不混用凭据。不再读取 CLI/桌面端登录、设置或安装包，也不会启动桌面程序解密 token。
 
 ## 在 Lyra 使用
 
-更新并启动 Nova，在「设置 → Lyra → 添加 Provider」选择 **CodeBuddy（本地 API）**，保存并获取模型。无需填写 API Key、地址或启动命令。Nova 自动使用 `codebuddy` 原生协议，不启动 Node 代理或监听本地端口。输入补全和标题生成也使用同一 Rust provider。
+更新并启动 Nova，在「设置 → Lyra → 添加 Provider」选择唯一的 **CodeBuddy / WorkBuddy** 入口，再选择登录通道（CodeBuddy 国内站、CodeBuddy 国际站或 WorkBuddy），在浏览器完成登录后保存并获取模型。无需安装 CLI、填写 API Key 或启动命令；Nova 使用 `codebuddy` 原生传输直连上游，不启动 Node 代理或监听本地端口。输入补全和标题生成也使用同一 Rust provider。
 
-模型列表取自当前账号的云端配置，并按 CLI 的可用模型筛选；安装包只补充模型能力，不增加云端列表外的模型。`codebuddy` 别名使用 CLI 设置中的默认模型，未设置时使用列表首项。登录变更会在后续请求自动读取。
+模型及能力均取自当前账号的云端配置，仍遵守服务端 `agents.cli.models` 可用范围；这是云端通道限制，不依赖本机 CLI。`codebuddy` / `workbuddy` 别名默认使用列表首项，可通过对应的 `CODEBUDDY_MODEL` / `WORKBUDDY_MODEL` 环境变量指定；指定模型已失效时回退到首项，不再令整份列表获取失败。显式选择不可用的模型 ID 仍会报错，不静默替换。
 
-原生回归检查：`cargo test --manifest-path src-tauri/Cargo.toml --lib lyra`。覆盖登录切换/注销、云端模型筛选、交错并行工具、流截断和补全提前结束。必须思考的模型为补全预留最多 2048 tokens 的总输出预算，收到足够正文后提前结束。
+原生回归检查：`cargo test --manifest-path src-tauri/Cargo.toml --lib lyra`。覆盖 Nova 登录隔离、旧 CLI 配置无效化、默认模型回退、云端模型筛选、交错并行工具、流截断和补全提前结束。必须思考的模型为补全预留最多 2048 tokens 的总输出预算，收到足够正文后提前结束。
 
-### WorkBuddy
+### 从旧版升级
 
-先安装并登录 WorkBuddy 桌面版，在 Lyra 中选择 **WorkBuddy（本地 API）**，保存并获取模型，无需填写密钥。模型别名为 `workbuddy`，跟随 WorkBuddy 设置中的默认模型。网络跟随系统代理，输入补全和标题也走 Rust provider。
+以前仅在 CLI 或 WorkBuddy 桌面版登录的用户，需要在 Nova 的对应登录通道重新登录一次；已有 Nova 登录可继续使用。不会删除或修改原 CLI/桌面端的配置与凭据。旧 `workbuddy` 预设仍可加载，设置页保存时归一为 `preset: "codebuddy"` 和 `options.codebuddySource: "workbuddy"`，保留原 Provider ID、模型和会话引用；不会合并或删除用户已有的多个配置实例。
 
-已适配 Windows WorkBuddy 5.8.2 的加密登录。读取时短暂调用 WorkBuddy 自带运行时解密凭据；推理和 SSE 仍由 Rust 直接处理，无需另装 Node、启动本地代理或保持 WorkBuddy 窗口打开。不修改登录文件，不保存解密后的 token；注销、登录切换和过期都会在后续请求检查。其它平台和新的加密格式尚未验证。
+旧的 `CODEBUDDY_CONFIG_DIR` / `WORKBUDDY_CONFIG_DIR`、`NOVA_CODEBUDDY_AUTH_FILE` / `NOVA_WORKBUDDY_AUTH_FILE`、`NOVA_CODEBUDDY_PACKAGE` / `NOVA_WORKBUDDY_PACKAGE` 和 `WORKBUDDY_EXE` 不再影响这些 provider。模型能力不再由本机安装包补齐；云端缺失的能力采用保守默认值。
 
-独立服务启动：`npm run workbuddy:api`。Base URL 为 `http://127.0.0.1:8789/v1`，模型选 `workbuddy` 或 `/v1/models` 中的 ID；本地服务密钥自动生成并保存在 `~/.nova/alkaid/workbuddy-api.json`。启动配置与 CodeBuddy 相同，将 `NOVA_CODEBUDDY_` 前缀换成 `NOVA_WORKBUDDY_`。
-
-默认设置目录是 `~/.workbuddy`，Windows 登录文件是 `%USERPROFILE%/AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`。可用 `WORKBUDDY_EXE`、`WORKBUDDY_CONFIG_DIR`、`NOVA_WORKBUDDY_PACKAGE`、`NOVA_WORKBUDDY_AUTH_FILE` 和 `NOVA_WORKBUDDY_ENDPOINT` 指定安装、设置与认证位置；默认模型可用 `WORKBUDDY_MODEL` 覆盖。显式认证支持 `WORKBUDDY_AUTH_TOKEN` / `WORKBUDDY_API_KEY` 或 WorkBuddy 自身设置中的 `env.CODEBUDDY_AUTH_TOKEN` / `env.CODEBUDDY_API_KEY`，忽略继承的全局 CodeBuddy 密钥。
+WorkBuddy 独立服务启动：`npm run workbuddy:api`。Base URL 为 `http://127.0.0.1:8789/v1`，模型选 `workbuddy` 或 `/v1/models` 中的 ID；本地服务密钥保存在 `~/.nova/alkaid/workbuddy-api.json`。启动配置与 CodeBuddy 相同，将 `NOVA_CODEBUDDY_` 前缀换成 `NOVA_WORKBUDDY_`。
 
 ## 提供给其他客户端
 
@@ -43,15 +41,15 @@ npm run codebuddy:api
 - JSON 对象／JSON Schema（沿用适配器的结构化工具和本地校验）
 - Responses 工具事件与 `previous_response_id`（进程内保存，一小时到期；重启后不保留）
 
-不包含音视频、嵌入、文件上传、OpenAI 托管工具及后台任务。各模型支持的能力不同，不能视为完整 OpenAI API。当前验证环境：Node.js 24.19、CodeBuddy CLI 2.169.0；真实验证了文本、工具往返、Responses SSE 和图片，回归检查还覆盖并行参数、结构化输出、截断、注销和取消。
+不包含音视频、嵌入、文件上传、OpenAI 托管工具及后台任务。各模型支持的能力不同，不能视为完整 OpenAI API。回归检查使用本机模拟上游，覆盖文本、图片、工具往返、Responses SSE、并行参数、结构化输出、截断、登录隔离和取消；不代表当前账号和线上服务的实测结果。
 
 ## 认证与诊断
 
-Windows 默认读取 `%USERPROFILE%/AppData/Local/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info`；macOS 使用 `~/Library/Application Support/CodeBuddyExtension`，Linux 使用 `~/.local/share/CodeBuddyExtension` 下相同的 `Data/Public/auth` 文件。
+会话分别保存在 Nova 数据目录的 `codebuddy-login.json` / `workbuddy-login.json`。Rust provider 在请求时读取，快过期时通过 refresh token 续期；独立 Node 服务只读取该会话，过期后需要回到 Nova 刷新登录。Node 服务默认读取 `~/.nova`，可用 `NOVA_DATA_DIR` 指定 Nova 数据目录。
 
-读取 CLI 的 `~/.codebuddy/settings.json` 和现有 `CODEBUDDY_AUTH_TOKEN`／`CODEBUDDY_API_KEY` 环境变量，不修改或复制登录文件。当前支持普通 CLI 凭据；加密凭据、自定义企业认证存储、复杂产品配置覆盖尚未适配。登录过期时会提示打开 CodeBuddy CLI 刷新，不在适配器内轮换 refresh token。
+显式认证仍支持各自的 `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_API_KEY` 或 `WORKBUDDY_AUTH_TOKEN` / `WORKBUDDY_API_KEY` 环境变量，不读取 CLI 设置里的 `env`，也不跨产品回退。显式 token 的更新由提供者负责。
 
-诊断时可用 `NOVA_CODEBUDDY_AUTH_FILE` 指定凭据文件、`CODEBUDDY_CONFIG_DIR` 指定设置目录、`NOVA_CODEBUDDY_PACKAGE` 指定安装包目录；`NOVA_CODEBUDDY_ENDPOINT` 仅支持 HTTPS origin（本机测试允许 HTTP 回环地址）。原生安装找不到 npm 版本元数据时暂用已验证的 2.169.0 协议版本。
+`NOVA_CODEBUDDY_ENDPOINT` / `NOVA_WORKBUDDY_ENDPOINT` 仅支持 HTTPS origin（本机测试允许 HTTP 回环地址）。请求头使用固定已验证的 CodeBuddy 2.169.0 / WorkBuddy 5.8.2 协议版本，与本机安装版本无关。
 
 ```powershell
 npm run test:codebuddy-api

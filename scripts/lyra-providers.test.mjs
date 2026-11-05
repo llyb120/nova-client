@@ -5,7 +5,7 @@ import { test } from "node:test";
 const source = path => readFileSync(new URL(`../src-tauri/src/lyra/${path}.rs`, import.meta.url), "utf8");
 
 // Keep the native provider wiring when removing standalone ACP backends.
-// Protocol and encrypted-login behavior is covered by the API adapter tests.
+// Protocol and Nova-login isolation are covered by the API adapter tests.
 test("Lyra retains native Devin, CodeBuddy and WorkBuddy providers", () => {
   const modules = source("mod"), presets = source("presets"), transport = source("provider");
   for (const name of ["devin", "codebuddy"]) {
@@ -20,6 +20,6 @@ test("Lyra retains native Devin, CodeBuddy and WorkBuddy providers", () => {
   }
   assert.match(presets, /local_provider::load\(/);
   assert.match(source("local_provider"), /fn load\(/);
-  assert.match(source("codebuddy_provider"), /include_str!\("\.\.\/\.\.\/\.\.\/scripts\/workbuddy-login\.cjs"\)/);
-  assert.match(readFileSync(new URL("./workbuddy-login.cjs", import.meta.url), "utf8"), /exports\.decodeWorkBuddyToken/);
+  assert.doesNotMatch(source("codebuddy_provider"), /workbuddy_token|std::process::Command|crate::workbuddy::|include_str!/);
+  assert.doesNotMatch(readFileSync(new URL("./codebuddy-protocol.mjs", import.meta.url), "utf8"), /execFile|node:child_process|product\.json|settings\.json/);
 });

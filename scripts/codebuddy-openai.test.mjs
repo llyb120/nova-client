@@ -3,39 +3,18 @@ import { test } from "node:test";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
-import { createHash, createCipheriv, randomBytes } from "node:crypto";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { createDevinServer } from "./devin-openai.mjs";
-import { decodeWorkBuddyToken } from "./workbuddy-login.cjs";
-
-const buildSecret = "fake WorkBuddy build key";
-function sealWorkBuddyToken(value) {
-  const key = createHash("sha256").update(buildSecret).digest(), keyId = createHash("sha256").update(key).digest("hex").slice(0,16), nonce = randomBytes(12);
-  const u32 = value => { const b=Buffer.alloc(4);b.writeUInt32BE(value);return b; };
-  const text = value => Buffer.concat([u32(Buffer.byteLength(value)),Buffer.from(value)]);
-  const cipher = createCipheriv("aes-256-gcm",key,nonce);
-  cipher.setAAD(Buffer.concat([Buffer.from("WB-AAD\0"),Buffer.from([1]),text("WBEV1"),text("sym-v1"),u32(1),text(keyId),Buffer.from([2,0,0])]));
-  const ciphertext = Buffer.concat([cipher.update(value),cipher.final()]);
-  return {$wbEncrypted:1,envelope:Buffer.from(JSON.stringify({suite:1,keyId,nonce:nonce.toString("base64"),ciphertext:ciphertext.toString("base64"),authTag:cipher.getAuthTag().toString("base64")})).toString("base64")};
-}
-test("WorkBuddy encrypted login rejects a wrong key, modified ciphertext and unknown framing",()=>{
-  const value=sealWorkBuddyToken("private token");
-  assert.equal(decodeWorkBuddyToken(value,buildSecret),"private token");
-  assert.throws(()=>decodeWorkBuddyToken(value,"wrong key"));
-  const sealed=JSON.parse(Buffer.from(value.envelope,"base64"));sealed.authTag=Buffer.alloc(16).toString("base64");
-  assert.throws(()=>decodeWorkBuddyToken({...value,envelope:Buffer.from(JSON.stringify(sealed)).toString("base64")},buildSecret));
-  assert.throws(()=>decodeWorkBuddyToken({...value,scheme:"asym-v1"},buildSecret));
-});
 
 for (const source of ["codebuddy", "workbuddy"]) test(`${source} native model adapter`, { timeout: 30000 }, async t => {
   const label = source === "workbuddy" ? "WorkBuddy" : "CodeBuddy";
-  const root = await mkdtemp(join(tmpdir(), "nova-codebuddy-api-")), authFile = join(root, "auth.info");
+  const root = await mkdtemp(join(tmpdir(), "nova-codebuddy-api-")), authFile = join(root, `${source}-login.json`);
   const auth = { auth: { accessToken: "upstream-secret", expiresAt: Date.now() + 60000 }, account: { uid: "test-user" } };
-  const saveAuth = () => writeFile(authFile,JSON.stringify(source === "workbuddy" ? {...auth,auth:{...auth.auth,accessToken:sealWorkBuddyToken(auth.auth.accessToken)}} : auth));
+  const saveAuth = () => writeFile(authFile, JSON.stringify(auth));
   await saveAuth();
-  await writeFile(join(root, "settings.json"), JSON.stringify({ model: "test-model" }));
+  await writeFile(join(root, "settings.json"), JSON.stringify({ model: "retired-cli-model", env: { CODEBUDDY_AUTH_TOKEN: "wrong-cli-account" } }));
   let last, expectedKey = auth.auth.accessToken, cancelled = 0;
   const upstream = createServer(async (req, res) => {
     try {
@@ -78,14 +57,13 @@ for (const source of ["codebuddy", "workbuddy"]) test(`${source} native model ad
     } catch { res.destroy(); }
   });
   upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
-  const prefix=source.toUpperCase(), env = { ...process.env, [`NOVA_${prefix}_AUTH_FILE`]: authFile, [`${prefix}_CONFIG_DIR`]: root, [`NOVA_${prefix}_ENDPOINT`]: `http://127.0.0.1:${upstream.address().port}` };
+  const prefix=source.toUpperCase(), env = { ...process.env, NOVA_DATA_DIR: root, [`NOVA_${prefix}_AUTH_FILE`]: join(root, "cli-auth.info"), [`${prefix}_CONFIG_DIR`]: root, [`NOVA_${prefix}_ENDPOINT`]: `http://127.0.0.1:${upstream.address().port}` };
   for (const key of ["CODEBUDDY_AUTH_TOKEN", "CODEBUDDY_API_KEY", "CODEBUDDY_MODEL", "WORKBUDDY_AUTH_TOKEN", "WORKBUDDY_API_KEY", "WORKBUDDY_MODEL"]) delete env[key];
-  if(source === "workbuddy") {
-    await writeFile(join(root,"product.json"),JSON.stringify({authentication:{id:"workbuddy-desktop"},genieVersion:"5.8.2"}));
-    const preload=join(root,"fake-workbuddy.cjs");
-    await writeFile(preload,`process._linkedBinding = () => ({loggerGet: () => ${JSON.stringify(JSON.stringify({atRestSecretKey:buildSecret}))}});`);
-    Object.assign(env,{NOVA_WORKBUDDY_PACKAGE:root,WORKBUDDY_EXE:process.execPath,NODE_OPTIONS:`--require ${JSON.stringify(preload)}`,CODEBUDDY_AUTH_TOKEN:"must-not-use-CodeBuddy-login"});
-  }
+  if (source === "workbuddy") Object.assign(env, { CODEBUDDY_AUTH_TOKEN: "wrong-account", CODEBUDDY_MODEL: "wrong-model" });
+  await writeFile(env[`NOVA_${prefix}_AUTH_FILE`], JSON.stringify({ auth: { accessToken: "wrong-cli-account" } }));
+  await writeFile(join(root, "package.json"), JSON.stringify({ name: "@tencent-ai/codebuddy-code", version: "999.0.0" }));
+  await writeFile(join(root, "product.json"), "invalid json");
+  Object.assign(env, { [`NOVA_${prefix}_PACKAGE`]: root, [`${prefix}_MODEL`]: "retired-override", WORKBUDDY_EXE: join(root, "missing.exe") });
   const server = createDevinServer({ source, apiKey: "local-key", env, timeoutMs: 1500 });
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   const base = `http://127.0.0.1:${server.address().port}/v1`, headers = { authorization: "Bearer local-key", "content-type": "application/json" };
@@ -95,10 +73,11 @@ for (const source of ["codebuddy", "workbuddy"]) test(`${source} native model ad
   const events = wire => wire.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
   t.after(async () => { server.shutdown(); upstream.close(); upstream.closeAllConnections(); if (resolve(root).startsWith(resolve(tmpdir()) + sep)) await rm(root, { recursive: true, force: true, maxRetries: 3 }); });
 
-  await t.test("automatic credentials, CLI catalog and real usage", async () => {
+  await t.test("automatic credentials, cloud catalog and real usage", async () => {
     assert.equal((await fetch(`${base}/models`)).status, 401);
     const list = await (await fetch(`${base}/models`, { headers })).json();
     assert.deepEqual(list.data.map(m => m.id), [source, "test-model"]);
+    assert.equal(list.data[0].context_length, 96000);
     assert.equal(list.data[1].context_length, 96000);
     assert.deepEqual(list.data[1].architecture.input_modalities, ["text", "image"]);
     const result = await (await post("hello", { max_tokens: 1 })).json();
@@ -107,6 +86,13 @@ for (const source of ["codebuddy", "workbuddy"]) test(`${source} native model ad
     assert.equal((await post("hello", { model: "hidden-model" })).status, 400);
     assert.equal((await post("hello", { reasoning_effort: "max" })).status, 400);
     assert.equal((await post("hello", { max_tokens: 1025 })).status, 400);
+  });
+  await t.test("CLI changes and installation state never affect the proxy", async () => {
+    await writeFile(`${env[`NOVA_${prefix}_AUTH_FILE`]}.logged-out`, "yes");
+    await writeFile(join(root, "settings.json"), "invalid json");
+    assert.equal((await post("hello")).status, 200);
+    await rm(join(root, "package.json"));
+    assert.equal((await post("hello")).status, 200);
   });
   await t.test("images and generation parameters reach native API", async () => {
     const content = [{ type: "image_url", image_url: { url: "data:image/png;base64,YQ==", detail: "high" } }, { type: "text", text: "image" }];
@@ -152,12 +138,14 @@ for (const source of ["codebuddy", "workbuddy"]) test(`${source} native model ad
     await result.body.getReader().read(); abort.abort();
     await new Promise(resolve => setTimeout(resolve, 80)); assert.equal(cancelled, 2);
   });
-  await t.test("login changes and logout are observed without overwriting CLI state", async () => {
+  await t.test("login changes and removal are observed without overwriting login state", async () => {
     auth.auth.accessToken = expectedKey = "rotated-secret"; await saveAuth();
     const before = await readFile(authFile,"utf8");
     assert.equal((await post("hello")).status, 200);
     assert.equal(await readFile(authFile,"utf8"),before);
-    await writeFile(`${authFile}.logged-out`, "yes"); assert.equal((await post("hello")).status, 503);
+    auth.auth.expiresAt = 1; await saveAuth(); assert.equal((await post("hello")).status, 503);
+    await rm(authFile);
+    assert.equal((await post("hello")).status, 503);
   });
   await t.test("managed adapter starts without a key or connection file and exits with owner", async () => {
     const child = spawn(process.execPath, ["scripts/devin-openai.mjs", `--${source}`, "--managed"], { env: { ...env, NOVA_DATA_DIR: root }, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });

@@ -210,8 +210,7 @@ const PRESETS: &[Preset] = &[
     preset("local-codex", "本地 Codex", "", false),
     preset("local-claude-code", "本地 Claude Code", "", false),
     preset("devin", "Devin（本地 API）", "", false),
-    preset("codebuddy", "CodeBuddy（本地 API）", "", false),
-    preset("workbuddy", "WorkBuddy（本地 API）", "", false),
+    preset("codebuddy", "CodeBuddy / WorkBuddy", "", false),
     preset("commandcode", "Command Code", "https://api.commandcode.ai/provider/v1", false),
     preset("opendesign", "OpenDesign", "https://amr-link.open-design.ai/v1", false),
     preset("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1", true),
@@ -243,7 +242,7 @@ pub(crate) fn list() -> Value {
     PRESETS.iter().map(|p| json!({ "id": p.id, "name": p.name, "baseURL": p.base_url, "local": local_source(p.id).is_some() })).collect()
 }
 
-/// 本地登录型预设当前是否可用（CLI 登录或 Nova 内登录任一有效）；错误即不可用原因。
+/// 登录型预设当前是否可用；CodeBuddy / WorkBuddy 仅用 Nova 登录，其它预设可复用 CLI。
 pub(crate) fn login_status(preset: &str, nova_root: &Path) -> Result<(), String> {
     let source = local_source(preset).ok_or("该服务商不需要登录")?;
     resolve_local(&json!({}), source, &super::config::process_env(), nova_root).map(|_| ())
@@ -281,6 +280,8 @@ fn local_source(preset: &str) -> Option<&str> {
 }
 
 fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap<String, String>, nova_root: &Path) -> Result<Value, String> {
+    // 旧 workbuddy 预设仍可加载；新配置统一到 codebuddy，通过现有 source 字段选择登录通道。
+    let source = if source == "codebuddy" && (provider["preset"] == "workbuddy" || provider["options"]["codebuddySource"] == "workbuddy") { "workbuddy" } else { source };
     let mut local = if source == "server-support" {
         let settings = crate::settings::Settings::load(&nova_root.to_path_buf());
         let server = crate::relay::resolve_relay_server(&settings.relay_server);
@@ -313,6 +314,7 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
             if let Some(explicit) = explicit.get("headers").and_then(Value::as_object) { headers.extend(explicit.clone()); }
         }
     }
+    if matches!(source, "codebuddy" | "workbuddy") { options.insert("codebuddySource".into(), json!(source)); }
     options.insert("headers".into(), json!(headers));
     let models = local["models"].clone();
     if let Some(explicit) = provider.as_object() {
@@ -342,6 +344,7 @@ const DEFAULT_API: &str = "openai-completions";
 
 fn preset_of(provider: &Value) -> Option<&'static Preset> {
     let id = provider.get("preset")?.as_str()?;
+    let id = if id == "workbuddy" { "codebuddy" } else { id };
     PRESETS.iter().find(|preset| preset.id == id)
 }
 
@@ -1243,6 +1246,27 @@ mod tests {
             assert!(selected.model.supports_images);
             assert_eq!(selected.thinking_level.as_deref(), Some("high"));
         }
+    }
+
+    #[test]
+    fn buddy_preset_is_unified_and_legacy_workbuddy_keeps_its_login() {
+        let list = super::list();
+        assert_eq!(list.as_array().unwrap().iter().filter(|p| p["id"] == "codebuddy").count(), 1);
+        assert!(!list.as_array().unwrap().iter().any(|p| p["id"] == "workbuddy"));
+        assert_eq!(list.as_array().unwrap().iter().find(|p| p["id"] == "codebuddy").unwrap()["name"], "CodeBuddy / WorkBuddy");
+        let dir = tempfile::tempdir().unwrap();
+        let env = std::collections::HashMap::from([("CODEBUDDY_AUTH_TOKEN".into(), "cb-key".into()), ("WORKBUDDY_AUTH_TOKEN".into(), "wb-key".into())]);
+        for raw in [json!({"preset":"workbuddy"}), json!({"preset":"codebuddy","options":{"codebuddySource":"workbuddy"}})] {
+            let preset = preset_of(&raw).unwrap();
+            let local = resolve_local(&raw, local_source(preset.id).unwrap(), &env, dir.path()).unwrap();
+            assert_eq!(local["api"], "codebuddy");
+            assert_eq!(local["options"]["apiKey"], "wb-key");
+            assert_eq!(local["options"]["codebuddySource"], "workbuddy");
+            assert_eq!(local["options"]["headers"]["X-Product"], "WorkBuddy");
+            assert_eq!(local["options"]["baseURL"], "https://www.workbuddy.cn/v2");
+        }
+        let local = resolve_local(&json!({"preset":"codebuddy"}), "codebuddy", &env, dir.path()).unwrap();
+        assert_eq!(local["options"]["apiKey"], "cb-key");
     }
 
     #[test]
