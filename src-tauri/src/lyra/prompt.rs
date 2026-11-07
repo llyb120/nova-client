@@ -155,6 +155,9 @@ const RETRYABLE_FRAGMENTS: &[&str] = &[
     "safe to retry",
     "stream ended before a terminal response event",
     "stream ended without finish_reason",
+    // OpenDesign 等网关在长思考流被掐断时回 error.message，明确要求重试。
+    "upstream_stream_interrupted",
+    "response was interrupted",
     "provider finish_reason",
     "provider stop_reason",
     "provider returned no actionable output",
@@ -704,6 +707,9 @@ mod tests {
         ));
         assert!(is_retryable_provider_error(
             "读取响应流失败：error decoding response body"
+        ));
+        assert!(is_retryable_provider_error(
+            "Lyra provider 请求失败：provider 错误：[code=upstream_stream_interrupted] The response was interrupted. Please retry."
         ));
         assert!(is_retryable_provider_error("provider SSE 连续 90s 无数据"));
         assert!(is_retryable_provider_error("provider finish_reason: other"));

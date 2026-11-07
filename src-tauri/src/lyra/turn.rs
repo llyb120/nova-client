@@ -1,7 +1,7 @@
 //! Codex 式 turn 循环：规范历史 → 上下文视图 → 流式请求 → 工具派发 → 追加结果，直到模型不再调用工具
 //! 且没有待消化的 steer。只读工具在参数完整时（`ToolCallDone`）即提前派发；同轮独立工具自动并发，
-//! 同一文件的读写、会话状态和共享屏幕保留顺序，副作用之后不再提前派发。provider 失败最多重试 5 次（指数退避 +
-//! 抖动），上下文超限按出站预算有界恢复，只有实际腾出空间才继续。失败的 assistant 占位从不入史，重试无需回滚。
+//! 同一文件的读写、会话状态和共享屏幕保留顺序，副作用之后不再提前派发。provider 失败最多重试 3 次（指数退避 +
+//! 抖动，总退避时长与原 5 次一致），上下文超限按出站预算有界恢复，只有实际腾出空间才继续。失败的 assistant 占位从不入史，重试无需回滚。
 
 use crate::lyra::config::Resolved;
 use crate::lyra::context::{ContextWindow, Receipt, Trigger, SUMMARY_OUTPUT_MAX_TOKENS};
@@ -72,7 +72,9 @@ pub struct Session {
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Sink<'a> = &'a mut (dyn FnMut(TurnEvent) + Send);
 
-const MAX_RETRIES: usize = 5;
+const MAX_RETRIES: usize = 3;
+// 退避总时长保持原 5 次（200+400+800+1600+3200≈6.2s）：886×(1+2+4)≈6.2s。
+const BACKOFF_BASE_MS: u64 = 886;
 const MAX_CONTEXT_RECOVERIES: usize = 16;
 const OUTPUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 const CANCELLED_TEXT: &str = "已取消";
@@ -230,7 +232,7 @@ pub fn text_outcome(text: impl Into<String>, is_error: bool) -> ToolOutcome {
 
 // ponytail: 抖动取系统时钟纳秒，不为此引入随机数依赖。
 fn backoff(attempt: usize) -> Duration {
-    let base = 200u64 << (attempt.saturating_sub(1)).min(6);
+    let base = BACKOFF_BASE_MS << (attempt.saturating_sub(1)).min(6);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -1094,6 +1096,13 @@ pub(crate) mod tests {
         assert!(results[0]["content"].to_string().contains("old"));
         assert!(results[2]["content"].to_string().contains("new"));
         assert_eq!(s.cwd, next);
+    }
+
+    #[test]
+    fn retry_backoff_keeps_the_original_total_across_fewer_attempts() {
+        let total: u64 = (1..=MAX_RETRIES).map(|attempt| backoff(attempt).as_millis() as u64).sum();
+        // 原 5 次（200+400+800+1600+3200≈6.2s），抖动 ±10%。
+        assert!((5_500..=7_000).contains(&total), "{total}ms");
     }
 
     #[tokio::test]
