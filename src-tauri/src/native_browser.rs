@@ -987,7 +987,12 @@ async fn snapshot(
         let capture = async {
         // expandScroll output is meant to be read/shared: keep original pixels unless asked otherwise.
         let keep_original=args["expandScroll"]==true;
-        let edge=args["maxEdge"].as_u64().unwrap_or(if keep_original {0} else {1600});
+        // Land exactly on the model's vision cap: a second ~2% downscale in deliver_screenshot costs
+        // half a second per frame and blurs the very pixels the model reads coordinates from.
+        let cap = { let v=observation.pages["pages"][0]["viewport"].clone();
+            let (vw,vh)=(v["width"].as_f64().unwrap_or(0.),v["height"].as_f64().unwrap_or(0.));
+            if vw>0. && vh>0. { (vw.max(vh)*crate::lyra::bridge::vision_scale(vw,vh)).round() as u64 } else { 1600 } };
+        let edge=args["maxEdge"].as_u64().unwrap_or(if keep_original {0} else {cap.max(320)});
         observation.full_page = !auto_visual && region.is_none() && (args["fullPage"] == true || keep_original);
         let mut images = Vec::new();
         let mut document = None;
