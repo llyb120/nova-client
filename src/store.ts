@@ -813,6 +813,8 @@ function rememberCurrentThreadSnapshot() {
 }
 
 function showThreadSnapshot(thread: Thread, loadingThread: boolean, reconcileItems = false) {
+  // 快照即权威：序号基线重置，否则恢复推流后的第一条会被误判为跳号。
+  streamSeqByThread.delete(thread.id);
   flush(() => setState(s => {
     if (reconcileItems) reconcile(thread.items, "id")(s.items);
     else s.items = thread.items;
@@ -2477,6 +2479,60 @@ function applyOp(op: UpdateOp) {
   applyUpsert(op.item);
 }
 
+/**
+ * 轮次收尾后的兜底校准：推流被门控、加载窗口内被丢弃、或某条增量事件没落地时，
+ * 界面会留下一直转圈的工具卡和缺失的结论，而 running 收尾事件照样到达。
+ * 收尾时取一次后端快照补齐，等价于用户手动重新点开一次会话。
+ */
+async function resyncFinishedTurn(threadId: string) {
+  if (threadId !== state.currentId || state.loadingThread) {
+    // 不在前台或正在加载：打开会话时拿到的快照已经盖住这段，不必再排队。
+    lostStreamOps.delete(threadId);
+    return;
+  }
+  lostStreamOps.delete(threadId);
+  const request = openThreadRequest;
+  try {
+    const thread = await api.getThreadView(threadId);
+    if (
+      request !== openThreadRequest ||
+      state.currentId !== threadId ||
+      state.running[threadId]
+    ) return;
+    // 快照晚于这些增量落库，直接丢弃未刷出的批次，避免旧值盖回新快照。
+    discardPendingStreamUpdates();
+    rememberThreadSnapshot(thread);
+    showThreadSnapshot(thread, false, true);
+  } catch (error) {
+    console.error("Turn end resync failed", error);
+  }
+}
+
+// 每个会话的推流序号基线；与后端的 stream_seq 对不上说明中间丢了增量。
+const streamSeqByThread = new Map<string, number>();
+// 本轮已经漏过增量的会话：轮次收尾事件即使先到，也要补一次快照。
+const lostStreamOps = new Set<string>();
+let streamResyncTimer: number | undefined;
+
+/** 推流序号跳号：不猜丢的是哪一条，轮次结束后补一次快照（不等用户手动重开会话）。 */
+function noteStreamSeq(threadId: string, seq: number) {
+  const last = streamSeqByThread.get(threadId);
+  streamSeqByThread.set(threadId, seq);
+  if (last === undefined || seq <= last + 1 || lostStreamOps.has(threadId)) return;
+  lostStreamOps.add(threadId);
+  setState(s => {
+    s.logs.push(`[推流] 会话 ${threadId.slice(0, 8)} 跳过 ${seq - last - 1} 条增量，本轮收尾时补快照`);
+    if (s.logs.length > 500) s.logs.splice(0, s.logs.length - 500);
+  });
+  if (threadId !== state.currentId || state.running[threadId]) return;
+  // 与收尾校准合并：同一次丢包产生的多条跳号只取一次快照。
+  if (streamResyncTimer !== undefined) return;
+  streamResyncTimer = window.setTimeout(() => {
+    streamResyncTimer = undefined;
+    if (state.currentId) void resyncFinishedTurn(state.currentId);
+  }, 300);
+}
+
 let initialized = false;
 
 type OptionsEvent =
@@ -2585,8 +2641,11 @@ export async function initStore() {
   });
   // 各监听互不依赖：并发注册，全部就绪后再读取会话快照，避免遗漏状态事件。
   await Promise.all([
-    listen<{ threadId: string; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
+    listen<{ threadId: string; seq?: number; op?: UpdateOp; ops?: UpdateOp[] }>("acp:update", (e) => {
       const ops = e.payload.ops ?? (e.payload.op ? [e.payload.op] : []);
+      // 跳号说明中间有增量没到（被门控或丢失）；acp:turn 不走这条通道，
+      // 所以界面可能停在转圈的工具卡和缺失的结论上，需要主动补快照。
+      if (typeof e.payload.seq === "number") noteStreamSeq(e.payload.threadId, e.payload.seq);
       // 后台会话的 usage 也要保留；否则切回运行中的会话会先显示 0，直到下一次上报。
       for (const op of ops) {
         if (op.t === "usage") {
@@ -2705,6 +2764,18 @@ export async function initStore() {
         ) {
           // 后台 restore 被取消或自动重发失败：清掉尚未落库的乐观消息。
           void openThread(e.payload.threadId);
+        } else if (wasRunning) {
+          // 收尾包（工具完成 + Turn 项）已经落到界面上就不必再拉快照：正常每轮零额外 IPC。
+          // 只有序号跳号，或当前会话没收到收尾项（含后端 error 收尾）才补一次对账。
+          if (
+            threadId === state.currentId &&
+            !lostStreamOps.has(threadId) &&
+            state.items.at(-1)?.type === "turn"
+          ) {
+            lostStreamOps.delete(threadId);
+          } else {
+            void resyncFinishedTurn(threadId);
+          }
         }
       }
     }),

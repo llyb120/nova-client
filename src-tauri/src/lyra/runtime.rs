@@ -50,6 +50,8 @@ pub struct LyraRuntime {
     config_generation: AtomicU64,
     next_run_epoch: AtomicU64,
     run_epochs: Mutex<HashMap<String, u64>>,
+    /// 每个会话的推流序号：被门控（非前台会话）的增量也占用序号，前端据此发现漏条并补快照。
+    stream_seq: Mutex<HashMap<String, u64>>,
 }
 
 impl LyraRuntime {
@@ -66,6 +68,7 @@ impl LyraRuntime {
             config_generation: AtomicU64::new(0),
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
+            stream_seq: Mutex::new(HashMap::new()),
         })
     }
 
@@ -977,6 +980,13 @@ impl LyraRuntime {
     }
 
     fn emit_op(&self, thread_id: &str, op: Value) -> Result<(), tauri::Error> {
+        // 序号先于门控自增：被挡下的增量也占号，恢复推流时前端能看出跳号并补一次快照。
+        let seq = {
+            let mut seqs = self.stream_seq.lock().unwrap();
+            let next = seqs.entry(thread_id.to_string()).or_insert(0);
+            *next += 1;
+            *next
+        };
         // 同 acp.rs：只给前台正在查看的会话推流。后台会话的高频增量（delta/upsert/usage）
         // 广播到 WebView 只会被前端按 threadId 丢弃，却仍跨 IPC 全量反序列化，多会话并发
         // 时把 WebView2 渲染进程拖垮。增量已落库，切回时经 get_thread 快照补齐。
@@ -992,8 +1002,10 @@ impl LyraRuntime {
                 return Ok(());
             }
         }
-        self.app
-            .emit(EV_UPDATE, json!({ "threadId": thread_id, "op": op }))
+        self.app.emit(
+            EV_UPDATE,
+            json!({ "threadId": thread_id, "seq": seq, "op": op }),
+        )
     }
 }
 
